@@ -5,6 +5,39 @@ def step(name, conclusion, start, end):
     return {"name": name, "conclusion": conclusion, "started_at": start, "completed_at": end}
 
 
+def test_checkout_identity_excludes_tooling_and_unscoped_hashes():
+    job = {
+        "steps": [
+            step("Checkout build tooling", "success", "2026-10-16T00:00:00Z", "2026-10-16T00:01:00Z"),
+            step("Checkout", "success", "2026-10-16T00:02:00Z", "2026-10-16T00:03:00Z")
+        ]
+    }
+    log = ("2026-10-16T00:00:30Z [command]/usr/bin/git log -1 --format=%H\n"
+           f"2026-10-16T00:00:30Z {'a' * 40}\n"
+           "2026-10-16T00:02:30Z [command]/usr/bin/git log -1 --format=%H\n"
+           f"2026-10-16T00:02:30.1234567Z {'b' * 40}\n"
+           f"2026-10-16T00:04:00Z {'c' * 40}\n")
+    assert lg.checkout_sha(job, log) == "b" * 40
+    assert lg.checkout_sha(job, log.split("2026-10-16T00:02:30Z")[0]) is None
+
+
+def test_exact_failure_evidence_keeps_parameters_and_verdict_kind():
+    job = {
+        "name": "mi350 / mi350-tlx-test", "steps":
+        [step("Run TLX core tests", "failure", "2026-10-16T00:00:00Z", "2026-10-16T01:00:00Z")]
+    }
+    log = ("2026-10-16T00:01:00Z FAILED x.py::test_boundary_graph[False] - AssertionError: bitwise\n"
+           "2026-10-16T00:01:01Z FAILED x.py::test_boundary_graph[True] - AssertionError: bitwise\n"
+           "2026-10-16T00:01:02Z ERROR x.py::test_fixture\n")
+    lg.attach_failures(job, log)
+    evidence = job["steps"][0]["test_failures"]
+    assert [item["id"] for item in evidence
+            ] == ["x.py::test_boundary_graph[False]", "x.py::test_boundary_graph[True]", "x.py::test_fixture"]
+    assert [item["kind"] for item in evidence] == ["failed", "failed", "error"]
+    lg.attach_failures(job, "2026-10-16T00:01:00Z Timeout\n")
+    assert job["steps"][0]["test_failures"] == []
+
+
 def test_short_summary_lines_are_parsed_and_normalized():
     log = ("2026-10-17T09:46:11.5522510Z FAILED a.py::t[x] - E: boom\n"
            "2026-10-17T09:46:11.6000000Z ERROR b.py::u\n"

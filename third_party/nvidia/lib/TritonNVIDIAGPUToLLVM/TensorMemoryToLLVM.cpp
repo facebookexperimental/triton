@@ -17,6 +17,7 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <bit>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -686,15 +687,15 @@ createBlockedScalesSMEMDescriptor(ConversionPatternRewriter &rewriter,
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   static_assert(sizeof(NVIDIA::SMEMDescriptor) == 8,
                 "Descriptor size should be 64 bits.");
-  NVIDIA::SMEMDescriptor desc;
-  desc.descriptor = 1ULL << 46;
+  NVIDIA::SMEMDescriptor desc =
+      std::bit_cast<NVIDIA::SMEMDescriptor>(1ULL << 46);
   desc.swizzlingMode = 0;                    // No swizzling for now
   desc.leadDimensionBaseOffset = 16 >> 4;    // 16 bytes
   desc.strideDimensionBaseOffset = 128 >> 4; // 8 x 16 bytes
   // See matrix-descriptor-encode(x) function in the ptx doc.
   // matrix-descriptor-encode(addr) = (addr & 0x3FFFF) >> 4
   auto smemAddr = b.ptrtoint(i64_ty, baseSrc);
-  return b.add(b.int_val(64, desc.descriptor),
+  return b.add(b.int_val(64, std::bit_cast<uint64_t>(desc)),
                b.lshr(b.shl(smemAddr, b.int_val(64, 46)), b.int_val(64, 50)));
 }
 

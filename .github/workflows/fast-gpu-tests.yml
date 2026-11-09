@@ -1,0 +1,159 @@
+name: Fast Triton correctness
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fast-correctness-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  select:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.select.outputs.build }}
+      h100: ${{ steps.select.outputs.h100 }}
+      b200: ${{ steps.select.outputs.b200 }}
+      mi350: ${{ steps.select.outputs.mi350 }}
+      cpu: ${{ steps.select.outputs.cpu }}
+      h100_plan: ${{ steps.select.outputs.h100_plan }}
+      b200_plan: ${{ steps.select.outputs.b200_plan }}
+      mi350_plan: ${{ steps.select.outputs.mi350_plan }}
+      cpu_plan: ${{ steps.select.outputs.cpu_plan }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Select affected fast suites
+        id: select
+        run: python3 .github/scripts/fast_tests.py select
+
+  build:
+    needs: select
+    if: needs.select.outputs.build == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ github.sha }}
+
+  h100:
+    needs: [select, build]
+    if: needs.select.outputs.h100 == 'true'
+    uses: ./.github/workflows/_fast-gpu-tests.yml
+    with:
+      platform: h100
+      plan: ${{ needs.select.outputs.h100_plan }}
+      wheel_url: ${{ needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+
+  b200:
+    needs: [select, build]
+    if: needs.select.outputs.b200 == 'true'
+    uses: ./.github/workflows/_fast-gpu-tests.yml
+    with:
+      platform: b200
+      plan: ${{ needs.select.outputs.b200_plan }}
+      wheel_url: ${{ needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+
+  mi350:
+    needs: [select, build]
+    if: needs.select.outputs.mi350 == 'true'
+    uses: ./.github/workflows/_fast-gpu-tests.yml
+    with:
+      platform: mi350
+      plan: ${{ needs.select.outputs.mi350_plan }}
+      wheel_url: ${{ needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+
+  cpu:
+    name: CPU fast correctness
+    needs: [select, build]
+    if: needs.select.outputs.cpu == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+      - name: Set up CPU environment
+        run: |
+          uv venv "${RUNNER_TEMP}/fast-venv" --python 3.12
+          export VIRTUAL_ENV="${RUNNER_TEMP}/fast-venv" PATH="${RUNNER_TEMP}/fast-venv/bin:${PATH}"
+          uv pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install numpy pytest expecttest
+          echo "VIRTUAL_ENV=${VIRTUAL_ENV}" >> "${GITHUB_ENV}"
+          echo "${VIRTUAL_ENV}/bin" >> "${GITHUB_PATH}"
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ needs.build.outputs.wheel_url }}
+          wheel-filename: ${{ needs.build.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      - name: Run fast correctness tests
+        env:
+          FAST_TARGETS: ${{ needs.select.outputs.cpu_plan }}
+        run: python .github/scripts/fast_tests.py run --platform cpu --junit /tmp/fast-cpu.xml
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-cpu-test-results
+          path: |
+            /tmp/fast-cpu.xml
+            /tmp/fast-cpu.selection.json
+          if-no-files-found: ignore
+
+  result:
+    name: Fast correctness
+    needs: [select, build, h100, b200, mi350, cpu]
+    if: always() && github.repository_owner == 'facebookexperimental'
+    runs-on: ubuntu-latest
+    env:
+      NEEDS: ${{ toJSON(needs) }}
+    steps:
+      - name: Require selected fast suites to pass
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          needs = json.loads(os.environ['NEEDS'])
+          if needs['select']['result'] != 'success':
+              raise SystemExit('Fast suite selection did not succeed')
+          for job in ('build', 'h100', 'b200', 'mi350', 'cpu'):
+              if needs['select']['outputs'][job] == 'true' and needs[job]['result'] != 'success':
+                  raise SystemExit(f"{job}: {needs[job]['result']}")
+          selected = [key for key in ('h100', 'b200', 'mi350', 'cpu') if needs['select']['outputs'][key] == 'true']
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Selected workers passed; cross-platform coverage verification follows.\n' if selected else 'No fast tests required for these paths.\n')
+          PY
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - name: Download execution evidence
+        if: needs.select.outputs.build == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fast-*-test-results
+          path: ${{ runner.temp }}/fast-evidence
+      - name: Verify touched-test coverage across platforms
+        if: needs.select.outputs.build == 'true'
+        run: python3 .github/scripts/fast_tests.py verify --evidence "${RUNNER_TEMP}/fast-evidence"

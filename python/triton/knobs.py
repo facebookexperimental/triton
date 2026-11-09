@@ -596,8 +596,12 @@ class runtime_knobs(base_knobs):
 class language_knobs(base_knobs):
     fp32_default: env_opt_str = env_opt_str("TRITON_F32_DEFAULT")
     default_fp_fusion: env_bool = env_bool("TRITON_DEFAULT_FP_FUSION", True)
+    force_disable_fp_fusion: env_bool = env_bool("TRITON_FORCE_DISABLE_FP_FUSION")
     strict_reduction_ordering: env_bool = env_bool("TRITON_STRICT_REDUCTION_ORDERING")
     allow_npot: env_bool = env_bool("TRITON_ALLOW_NPOT")
+
+    def fp_fusion_enabled(self, requested: Optional[bool]) -> bool:
+        return not self.force_disable_fp_fusion and (self.default_fp_fusion if requested is None else requested)
 
 
 class nvidia_knobs(base_knobs):

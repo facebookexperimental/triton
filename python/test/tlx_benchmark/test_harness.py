@@ -551,6 +551,64 @@ def test_amd_devices_get_the_rocr_uuid_of_their_pci_bus(monkeypatch):
     assert denoise_mod.select_device("auto").uuid == "GPU-46c1d72dcdc11989"
 
 
+def test_amd_identity_and_least_used_selection_survive_missing_management_tools(tmp_path, monkeypatch):
+    from _harness import denoise
+
+    nodes, pci = tmp_path / "nodes", tmp_path / "pci"
+    for ordinal, bus, unique_id, used in [(2, 0x88, 0x46c1d72dcdc11989, 808349696),
+                                          (5, 0x08, 0xbe8bd961d1e61412, 30000000000)]:
+        node = nodes / str(ordinal)
+        node.mkdir(parents=True)
+        props = {
+            "simd_count": 1024, "vendor_id": 0x1002, "device_id": 0x75a0, "unique_id": unique_id, "location_id":
+            bus << 8, "domain": 0
+        }
+        (node / "properties").write_text("".join(f"{k} {v}\n" for k, v in props.items()))
+        device = pci / f"0000:{bus:02x}:00.0"
+        device.mkdir(parents=True)
+        (device / "mem_info_vram_used").write_text(str(used))
+    monkeypatch.setattr(denoise, "_KFD_NODES", str(nodes), raising=False)
+    monkeypatch.setattr(denoise, "_PCI_DEVICES", str(pci))
+    monkeypatch.setattr(denoise, "_smi", lambda args: None)
+    monkeypatch.setattr(denoise, "_rocm", lambda args: None)
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", os.environ.get("ROCR_VISIBLE_DEVICES", ""))
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    selected = denoise.select_device()
+    assert selected.uuid == "GPU-46c1d72dcdc11989"
+    assert selected.pci_bus == "0000:88:00.0"
+    assert selected.arch == "gfx950"
+    assert selected.memory_used_mib == pytest.approx(808349696 / 1024 / 1024)
+    assert selected.pin()
+    assert os.environ["ROCR_VISIBLE_DEVICES"] == selected.uuid
+
+
+def test_required_benchmark_gpu_cannot_be_an_empty_success(monkeypatch):
+    from _harness import denoise
+
+    monkeypatch.setattr(denoise, "list_devices", lambda: [])
+    with pytest.raises(RuntimeError, match="No benchmark GPU discovered"):
+        denoise.select_device()
+
+
+@pytest.mark.parametrize("mapped_index", [None, 6])
+def test_fallback_inventory_governs_only_its_pci_matched_gpu(monkeypatch, mapped_index):
+    from _harness import denoise
+
+    calls = []
+    bus = None if mapped_index is None else f"device,PCI Bus\ncard{mapped_index},0000:88:00.0"
+    monkeypatch.setattr(denoise, "_rocm", lambda args: bus)
+    monkeypatch.setattr(denoise.Governor, "_sudo", lambda self, args: calls.append(args) or True)
+    device = denoise.Device(denoise.AMD, 1, "MI350X", uuid="GPU-46c1d72dcdc11989", pci_bus="0000:88:00.0")
+    with denoise.Governor(device) as governor:
+        if mapped_index is None:
+            assert "management GPU mapping unavailable" in " ".join(governor.skipped)
+    if mapped_index is None:
+        assert calls == []
+    else:
+        assert [args[2] for args in calls] == [str(mapped_index)] * 4
+
+
 def test_sampler_join_does_not_shadow_thread_internals():
     from _harness.denoise import _Sampler
 
@@ -572,6 +630,8 @@ def test_arch_matches_the_part():
     assert Device(NVIDIA, 0, "NVIDIA GB200").arch == "sm100"
     assert Device(AMD, 0, "MI350X").arch == "gfx950"
     assert Device(AMD, 0, "MI355X").arch == "gfx950"
+    assert Device(AMD, 0, "MI450X").arch == "gfx1250"
+    assert Device(AMD, 0, "MI455X").arch == "gfx1250"
 
 
 def test_amd_numa_node_resolves_through_pci_not_the_drm_index(tmp_path, monkeypatch):
@@ -806,6 +866,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes": {
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_1", ),
+            "gfx1250": ("gfx1250_1", ),
         },
         "triton.tlx.ops.kernels.flash_attn_varlen._shapes": {
             "gfx950": ("gfx950_1", ),
@@ -871,6 +932,7 @@ def test_flash_attn_mxfp8_gfx950_benchmark_supports_backward(monkeypatch):
 
     assert directions("gfx950") == {"fwd", "bwd"}
     assert directions("sm100") == {"fwd", "bwd"}
+    assert directions("gfx1250") == {"fwd"}
 
 
 def test_hstu_cross_attn_benchmark_times_inference_shapes_forward_only(monkeypatch):
@@ -1677,6 +1739,7 @@ def test_amd_arch_uses_rocr_agent_without_product_name(monkeypatch, uuid):
     monkeypatch.setattr(denoise, "vendor", lambda: denoise.AMD)
     monkeypatch.setattr(denoise, "_rocm", lambda args: _ROCM_SMI_VRAM_BUS if "--showbus" in args else None)
     monkeypatch.setattr(denoise, "_amd_name", lambda index: "AMD Radeon Graphics")
+    monkeypatch.setattr(denoise, "_amd_sysfs_devices", lambda: [])
     monkeypatch.setattr(
         denoise, "_rocminfo", lambda: f"""Agent 1
   Name: gfx1250

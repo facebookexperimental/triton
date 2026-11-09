@@ -243,6 +243,20 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="mm_mxfp6",
+        arch="sm100",
+        variant="ws_mxfp6",
+        impl="triton.tlx.ops.kernels.mm_mxfp6.sm100:mm_mxfp6",
+        dtypes=frozenset({"uint8"}),
+        # Row strides are 128-aligned by the M/N/K contract; only the bases vary.
+        accepts=lambda d: all(ptr % (32 if i in (0, 2) else 16) == 0 for i, ptr in enumerate(d["base_ptrs"])),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    # No gfx950 mm_mxfp6 entry yet: the decompose backend in
+    # kernels/mm_mxfp6/gfx950.py is not numerically correct at this
+    # revision, so MI350 callers get UnsupportedOp instead of silent
+    # wrong results. Register it once the fixing diff lands.
+    OpSpec(
         op="grouped_gemm_mxfp8",
         arch="sm100",
         variant="ws_persistent_mxfp8",
@@ -435,6 +449,17 @@ CATALOG: tuple[OpSpec, ...] = (
         (d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) > 0 and d["N_CTX"] % 256 == 0 and d["N_CTX"] * 128 < 2**31),
         requires=frozenset(),
         supports_backward=True,
+    ),
+    OpSpec(
+        op="flash_attn_mxfp8",
+        arch="gfx1250",
+        variant="wmma_tdm_mxfp8",
+        impl="triton.tlx.ops.kernels.flash_attn_mxfp8.gfx1250:flash_attn_mxfp8",
+        invariant_vocab=_ATTN_DIMS,
+        dtypes=_BF16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128 and d.get("N_CTX", 0) % 256 == 0,
+        requires=frozenset(),
+        supports_backward=False,
     ),
     OpSpec(
         op="flash_attn_varlen",

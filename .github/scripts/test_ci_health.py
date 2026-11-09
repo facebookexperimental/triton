@@ -1,5 +1,10 @@
 import base64
 import json
+import re
+from pathlib import Path
+
+import pytest
+import yaml
 
 import ci_health as ch
 
@@ -81,6 +86,296 @@ def collect(tmp_path, runs, jobs=JOBS, since="2026-10-12T00:00:00Z", now=NOW, lo
     return state, api, text
 
 
+def workflow_test_jobs(workflow="gpu-tests.yml"):
+    root = Path(__file__).resolve().parents[2]
+    parent = yaml.load((root / ".github/workflows" / workflow).read_text(), Loader=yaml.BaseLoader)
+    found = []
+    for key, job in parent["jobs"].items():
+        if "uses" in job:
+            children = yaml.load((root / job["uses"]).read_text(), Loader=yaml.BaseLoader)["jobs"]
+            platforms = job.get("strategy", {}).get("matrix", {}).get("platform", [None])
+            candidates = []
+            for platform in platforms:
+                prefix = f"{key} ({platform})" if platform else key
+                for name, child in children.items():
+                    name = child.get("name", name)
+                    if platform:
+                        name = name.replace("${{ inputs.platform }}", platform)
+                    candidates.append((f"{prefix} / {name}", child))
+        else:
+            candidates = [(job.get("name", key), job)]
+        for name, child in candidates:
+            if child.get("if") in ("${{ false }}", "false"):
+                continue
+            tests = [
+                step["name"]
+                for step in child.get("steps", [])
+                if step.get("name", "").startswith("Run ") or step.get("uses") == "./.github/actions/run-selected-tests"
+                or "run_selected_tests.py" in step.get("run", "") or "check-triton-lit-tests" in step.get("run", "")
+                or re.search(r"(?m)^\s*(?:python\S*\s+-m\s+)?pytest\b", step.get("run", ""))
+            ]
+            if tests:
+                found.append((name, child["runs-on"], tests))
+    return found
+
+
+@pytest.mark.parametrize("name,label,steps", workflow_test_jobs())
+def test_workflow_test_jobs_reach_dashboard_health(tmp_path, name, label, steps):
+    rules = ch.rules
+    platform = rules.test_platform_of({"wf": "gpu-tests.yml"}, {"name": name})
+    assert platform is not None, f"Dashboard does not recognize test job {name}"
+    for step in steps:
+        assert rules.group_of(step) is not None, f"Dashboard does not recognize test step {name}: {step}"
+    test_steps = [{
+        "name": step, "conclusion": "failure", "number": i + 1, "started_at": f"2026-10-12T01:01:{i * 10:02d}Z",
+        "completed_at": f"2026-10-12T01:01:{i * 10 + 9:02d}Z"
+    } for i, step in enumerate(steps)]
+    j = gh_job(20, name, "failure", test_steps)
+    j["labels"] = [label]
+    text = "".join(
+        f"2026-10-12T01:01:{i * 10 + 5:02d}Z FAILED test_contract.py::test_signal_{i} - AssertionError: signal\n"
+        for i in range(len(steps)))
+    collect(
+        tmp_path,
+        {"gpu-tests.yml": [gh_run(1, "2026-10-12T01:00:00Z", conclusion="failure", event="push", head_branch="main")]},
+        {1: [j]}, logs={20: text})
+    stored = ch.load_runs(str(tmp_path))[1]
+    assert rules.run_outcome(stored) == "test"
+    view = rules.main_view([stored], NOW)
+    assert len(view["gpus"][platform]["new"]) == len(steps)
+    assert view["pushes"][0]["cells"][platform] == "new"
+    assert len(view["steps"][platform]) == len(steps)
+    assert all(row["cells"] == ["new"] for row in view["steps"][platform])
+    assert {item["step"] for item in view["gpus"][platform]["new"]} == set(steps)
+    assert rules.gpu_minutes(stored) == (0 if platform == "CPU" else 5)
+    pr = rules.pr_view([{**stored, "event": "pull_request", "pr": 1}], NOW, rules.main_view([], NOW))[0]
+    assert pr["result"] == "tests" and pr["n_failed"] == len(steps)
+    assert platform in pr["gpus"]
+    out = tmp_path / "site"
+    ch.render(str(tmp_path), str(out), bench_dir=str(tmp_path / "bench"))
+    data = json.loads((out / "data.json").read_text())
+    assert data["branches"]["main"]["main"]["gpus"][platform]["new"]
+    assert "CPU compiler tests" in (out / "index.html").read_text()
+
+
+@pytest.mark.parametrize("workflow", ["gpu-tests-nightly.yml", "nightly-tlx-ops-bench.yml"])
+def test_nightly_workflow_jobs_are_visible_to_dashboard(workflow):
+    jobs = workflow_test_jobs(workflow)
+    assert jobs
+    for name, _, steps in jobs:
+        platform = ch.rules.test_platform_of({"wf": workflow}, {"name": name})
+        assert platform in ch.rules.GPUS, f"Dashboard does not recognize {workflow}: {name}"
+        assert all(ch.rules.group_of(step) for step in steps), (workflow, name, steps)
+
+
+def test_compiler_workflow_job_reaches_lit_dashboard():
+    jobs = workflow_test_jobs(ch.rules.LIT_WF)
+    assert len(jobs) == 1
+    name, _, steps = jobs[0]
+    assert name == ch.rules.LIT_JOB and steps
+    j = gh_job(1, name, "failure", [{"name": steps[0], "conclusion": "failure", "failures": [{"id": "lit-test"}]}])
+    assert ch.rules.lit_result({"jobs": [j]}) == ("fail", [{"id": "lit-test"}])
+
+
+def test_lit_cache_preserves_compiler_and_full_test_coverage():
+    import shlex
+    root = Path(__file__).resolve().parents[2]
+    workflow = yaml.load((root / ".github/workflows/compiler.yml").read_text(), Loader=yaml.BaseLoader)
+    job = workflow["jobs"]["lit-tests"]
+    steps = {step["name"]: step for step in job["steps"]}
+    run = steps["Build and run LIT tests"]["run"]
+    configure = shlex.split(run)
+    assert "-DTRITON_CODEGEN_BACKENDS=nvidia;amd;cpu" in configure
+    assert "-DTRITON_BUILD_UT=OFF" in configure
+    assert "-DLLVM_EXTERNAL_LIT=$(which lit)" in configure
+    assert not any(arg.startswith(("-DCMAKE_C_COMPILER=", "-DCMAKE_CXX_COMPILER=")) for arg in configure)
+    assert not {"CC", "CXX"} & job.get("env", {}).keys()
+    assert "ninja -C build check-triton-lit-tests" in run
+    assert "set -o pipefail" in run
+    assert job["env"]["CCACHE_DIR"].endswith("/triton-lit-ccache")
+    assert steps["Restore LIT ccache"]["with"]["path"] == steps["Save LIT ccache"]["with"][
+        "path"] == "${{ env.CCACHE_DIR }}"
+
+
+def test_fast_workflow_preserves_dashboard_and_gpu_usage_contract(tmp_path):
+    workflow = ch.rules.FAST_WF
+    workers = workflow_test_jobs(workflow)
+    assert len(workers) == 4
+    for name, label, steps in workers:
+        platform = ch.rules.test_platform_of({"wf": workflow}, {"name": name})
+        assert platform in ch.rules.TEST_PLATFORMS
+        assert all(ch.rules.group_of(step) for step in steps)
+        item = gh_job(1, name, "failure", [{
+            "name": steps[0], "conclusion": "failure", "number": 1, "started_at": "2026-10-12T01:01:00Z",
+            "completed_at": "2026-10-12T01:04:00Z"
+        }])
+        item["labels"] = ["ubuntu-latest" if platform == "CPU" else platform]
+        stored = ch._record(gh_run(1, "2026-10-12T01:00:00Z", conclusion="failure", event="push", head_branch="main"),
+                            workflow)
+        stored["jobs"] = ch._jobs([{"jobs": [item]}])
+        ch._attach_failures(stored["jobs"],
+                            fake_text({1: "2026-10-12T01:02:00Z FAILED smoke.py::test_required - AssertionError: x"}),
+                            workflow)
+        assert ch.rules.run_outcome(stored) == "test"
+        assert ch.rules.gpu_minutes(stored) == (0 if platform == "CPU" else 5)
+        assert ch.rules.main_view([stored], NOW) == ch.rules.main_view([], NOW)
+        assert ch.rules.pr_view([stored], NOW, ch.rules.main_view([], NOW)) == []
+
+
+def test_dashboard_contract_runs_when_its_inputs_change():
+    root = Path(__file__).resolve().parents[2]
+    workflow = yaml.load((root / ".github/workflows/ci-health.yml").read_text(), Loader=yaml.BaseLoader)
+    paths = workflow["on"]["pull_request"]["paths"]
+    import fnmatch
+    inputs = [
+        ".github/workflows/gpu-tests.yml", ".github/scripts/gpu_test_selection.py", ".github/gpu-test-suites.json",
+        ".github/actions/run-selected-tests/action.yml", ".github/scripts/test_gpu_ci.py",
+        ".github/scripts/test_kernel_test_selection.py", ".github/scripts/wheel_cache.py"
+    ]
+    inputs += [
+        ".github/workflows/" + name for name in (*ch.rules.GPU_WORKFLOWS, *ch.rules.GPU_RUN_WORKFLOWS, ch.rules.LIT_WF,
+                                                 "tritonbench.yml", "_tlx-ops-bench.yml")
+    ]
+    for path in inputs:
+        assert any(fnmatch.fnmatch(path, pattern) for pattern in paths), f"CI does not test dashboard changes to {path}"
+
+
+def test_selector_output_remains_readable_by_dashboard(tmp_path):
+    import os
+    import sys
+    from gpu_test_selection import REPO_ROOT
+    event, output = tmp_path / "event.json", tmp_path / "outputs"
+    event.write_text("{}")
+    proc = subprocess.run(
+        [sys.executable, str(REPO_ROOT / ".github/scripts/gpu_test_selection.py")], cwd=REPO_ROOT, env=os.environ | {
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(output),
+            "GITHUB_STEP_SUMMARY": str(tmp_path / "summary")
+        }, capture_output=True, text=True, check=True)
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    selected = ch.logs.parse_selection(proc.stdout)
+    assert selected is not None, "Dashboard cannot parse the selector's real output"
+    for key in ("h100", "b200", "mi350", "build", "cpu"):
+        assert selected[key] == (outputs[key] == "true")
+    assert selected["fallback"] is False
+
+
+def source_log(sha):
+    return ("2026-10-12T01:01:30Z [command]/usr/bin/git log -1 --format=%H\n"
+            f"2026-10-12T01:01:30Z {sha}\n")
+
+
+def checkout_job(jid, name):
+    return gh_job(
+        jid, name, steps=[{
+            "name": "Checkout", "conclusion": "success", "started_at": "2026-10-12T01:01:00Z", "completed_at":
+            "2026-10-12T01:02:00Z"
+        }])
+
+
+def test_collect_uses_same_attempt_checkout_evidence_for_both_workflows(tmp_path):
+    sha = "a46d2568f456948b74a7e8da5823cca07c3ac370"
+    raw = gh_run(1, "2026-10-12T01:00:00Z", pull_requests=[{"number": 4855}], run_attempt=1)
+    fast = {**raw, "id": 2}
+    jobs = {
+        1: [checkout_job(10, "select"), checkout_job(11, "build / build")], 2:
+        [checkout_job(20, "select"), checkout_job(21, "build / build")]
+    }
+    _, api, text = collect(tmp_path, {"gpu-tests.yml": [raw], ch.rules.FAST_WF: [fast]}, jobs,
+                           logs={jid: source_log(sha)
+                                 for jid in [10, 11, 20, 21]})
+    records = ch.load_runs(str(tmp_path))
+    for item in records.values():
+        assert item["pr"] == 4855 and item["tested_sha"] == sha and item["run_attempt"] == 1
+        assert {e["job"] for e in item["tested_sha_provenance"]} == {"select", "build / build"}
+    assert len(text.calls) == len(set(text.calls)) == 4
+    assert all("filter=latest" in call for call in api.calls if "/jobs?" in call)
+
+
+@pytest.mark.parametrize("only_failed", [True, False])
+def test_collect_refreshes_changed_attempt_without_erasing_history(tmp_path, only_failed):
+    sha = "ab" * 20
+    first = gh_run(1, "2026-10-12T01:00:00Z", conclusion="failure", run_attempt=1, pull_requests=[{"number": 4855}])
+    jobs = {
+        1:
+        [checkout_job(10, "select"),
+         checkout_job(11, "build / build"),
+         gh_job(12, "b200 / b200-tlx-test", "failure")]
+    }
+    logs = {
+        10: source_log(sha), 11: source_log(sha), 12:
+        "2026-10-12T01:02:00Z FAILED boundary.py::test_bitwise[False] - AssertionError: bitwise"
+    }
+    collect(tmp_path, {"gpu-tests.yml": [first]}, jobs, logs=logs)
+    retry = {**first, "run_attempt": 2, "conclusion": "success", "updated_at": "2026-10-12T04:00:00Z"}
+    prior_jobs = jobs[1]
+    jobs[1] = [checkout_job(20, "select"), checkout_job(21, "build / build"), gh_job(22, "b200 / b200-tlx-test")]
+    for item in jobs[1]:
+        item["run_attempt"] = 2
+    jobs[1][2]["steps"].insert(0, checkout_job(22, "worker")["steps"][0])
+    jobs[1] = prior_jobs + (jobs[1][2:] if only_failed else jobs[1])
+    _, api, _ = collect(
+        tmp_path, {"gpu-tests.yml": [retry]}, jobs, since=None, now="2026-10-12T05:00:00Z",
+        logs={10: source_log(sha), 11: source_log(sha), 20: source_log(sha), 21: source_log(sha), 22: source_log(sha)})
+    stored = ch.load_runs(str(tmp_path))[1]
+    assert stored["run_attempt"] == 2 and stored["conclusion"] == "success" and stored["tested_sha"] == sha
+    assert stored["attempts"][0]["run_attempt"] == 1 and stored["attempts"][0]["conclusion"] == "failure"
+    assert stored["attempts"][0]["jobs"][2]["steps"][0]["test_failures"][0]["id"].endswith("[False]")
+    assert any("filter=all" in call for call in api.calls if "/jobs?" in call)
+    assert len(stored["jobs"]) == 3 and stored["jobs"][2]["id"] == 22
+    assert any("created=>=2026-10-05T05:00:00Z" in call for call in api.calls if "/gpu-tests.yml/" in call)
+    _, api, _ = collect(tmp_path, {"gpu-tests.yml": [retry]}, jobs, since=None, now="2026-10-12T06:00:00Z")
+    assert not any("/jobs?" in call for call in api.calls)
+    assert len(ch.load_runs(str(tmp_path))[1]["attempts"]) == 1
+
+
+@pytest.mark.parametrize("wf", ["gpu-tests.yml", ch.rules.LIT_WF, ch.rules.BENCH_WF])
+def test_collect_preserves_completed_push_history_on_rerun(tmp_path, wf):
+    first = gh_run(1, "2026-10-12T01:00:00Z", event="push", run_attempt=1, head_branch="main")
+    collect(tmp_path, {wf: [first]})
+    original = ch.load_runs(str(tmp_path))[1]
+    retry = {**first, "run_attempt": 2, "conclusion": "failure"}
+    _, api, text = collect(tmp_path, {wf: [retry]}, since=None)
+    assert ch.load_runs(str(tmp_path))[1] == original
+    assert not any("/jobs?" in call for call in api.calls) and text.calls == []
+
+
+@pytest.mark.parametrize("readable", [True, False])
+def test_collect_enriches_recent_legacy_pr_once_with_cached_jobs(tmp_path, readable):
+    sha = "ab" * 20
+    raw = gh_run(1, "2026-10-12T01:00:00Z", conclusion="failure", pull_requests=[{"number": 4855}])
+    jobs = {
+        1: [
+            checkout_job(10, "select"),
+            checkout_job(11, "build / build"),
+            gh_job(12, "mi350 / mi350-tlx-test", "failure")
+        ]
+    }
+    logs = {
+        10: source_log(sha), 11: source_log(sha), 12:
+        "2026-10-12T01:02:00Z FAILED x.py::test_bitwise[False] - AssertionError: bitwise"
+    }
+    collect(tmp_path, {"gpu-tests.yml": [raw]}, jobs, logs=logs)
+    records = ch.load_runs(str(tmp_path))
+    legacy = records[1]
+    for key in ["tested_sha", "tested_sha_provenance", "provenance_version", "run_attempt"]:
+        legacy.pop(key, None)
+    for job in legacy["jobs"]:
+        job.pop("run_attempt", None)
+        for step in job["steps"]:
+            step.pop("test_failures", None)
+    prior = ch.rules.pr_view([legacy], NOW, ch.rules.main_view([], NOW))
+    ch.save_runs(str(tmp_path), records)
+    _, api, text = collect(tmp_path, {"gpu-tests.yml": [raw]}, jobs, since=None, logs=logs if readable else {})
+    updated = ch.load_runs(str(tmp_path))[1]
+    assert updated["provenance_version"] == 1
+    assert updated["tested_sha"] == (sha if readable else None)
+    assert ch.rules.pr_view([updated], NOW, ch.rules.main_view([], NOW)) == prior
+    assert not any("/jobs?" in call for call in api.calls)
+    assert len(text.calls) == 3
+    _, _, text = collect(tmp_path, {"gpu-tests.yml": [raw]}, jobs, since=None, logs=logs)
+    assert text.calls == []
+
+
 def test_collect_stores_completed_runs_with_jobs_and_keeps_cursor_at_running(tmp_path):
     runs = {
         "gpu-tests.yml": [gh_run(1, "2026-10-12T01:00:00Z"),
@@ -105,7 +400,7 @@ def test_collect_lists_gpu_nightly_and_lit_push_runs_only(tmp_path):
     assert {c.split("/workflows/")[1].split("/")[0]
             for c in listed} == {
                 "gpu-tests.yml", "gpu-tests-nightly.yml", "nightly-tlx-ops-bench.yml", "nightly-fbtriton.yml",
-                "compiler.yml"
+                "compiler.yml", "fast-gpu-tests.yml"
             }
     assert [c for c in listed if "/compiler.yml/" in c][0].endswith("&event=push&per_page=100")
 

@@ -3,6 +3,7 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
+#include "Utility.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
@@ -497,6 +498,18 @@ public:
 
     auto dstLL = triton::gpu::toLinearLayout(dstTy);
     LinearLayout sharedLL = triton::gpu::toLinearLayoutIgnoringPadding(srcTy);
+    // A mixed-radix read is one radix-2 read per odd register value o,
+    // starting at LDS element slabOffsets[o].
+    SmallVector<int32_t> slabOffsets = {0};
+    std::optional<LinearLayout> slabCvt;
+    if (!dstLL.isRadix2()) {
+      std::string reason;
+      FailureOr<LinearLayout> cvt =
+          LLVM::AMD::splitDirectToLdsCopy(dstLL, sharedLL, slabOffsets, reason);
+      if (isPackedTransposed || failed(cvt))
+        return failure();
+      slabCvt = *cvt;
+    }
 
     if constexpr (isPackedTransposed) {
       // Perform factorization and address routing in logical fp4 coordinates.
@@ -528,7 +541,7 @@ public:
       dstLL = LinearLayout::identity1D(2, kReg, *dstPackedDim) * dstLL;
     }
 
-    auto cvtDstLL = dstLL.invertAndCompose(sharedLL);
+    auto cvtDstLL = slabCvt ? *slabCvt : dstLL.invertAndCompose(sharedLL);
     auto kBlock = StringAttr::get(ctx, "block");
     auto maybeSublayout = cvtDstLL.quotient({kBlock});
     if (!maybeSublayout)
@@ -543,7 +556,12 @@ public:
     auto paddingShifts = getPaddedSharedShifts(srcTy.getEncoding(),
                                                srcTy.getElementTypeBitWidth(),
                                                /*offsetInBytes=*/true);
+    if (llvm::any_of(slabOffsets, [&](int32_t offset) {
+          return offset & maskSpanAffineOffset;
+        }))
+      return failure();
 
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
     for (const auto &ldsParams : ldsParamsVec) {
       if (triton::gpu::isPaddedEncoding(srcTy.getEncoding()) &&
           triton::gpu::getMinInterval(srcTy.getEncoding()) <
@@ -552,10 +570,23 @@ public:
       }
 
       SmallVector<Value> values;
-      auto result = lowerDsReadTr(
-          op, ldsParams, loc, cvtDstLL, logicalBitWidth, values, smemBases,
-          affineOffset, maskSpanAffineOffset, paddingShifts, llvmElemTy,
-          coordinateGroups, rewriter, targetInfo);
+      LogicalResult result = success();
+      for (int32_t slabOffset : slabOffsets) {
+        SmallVector<Value> bases = smemBases;
+        if (slabOffset != 0)
+          for (Value &base : bases)
+            base = b.gep(base.getType(), i8_ty, base,
+                         b.i32_val(applyPadding(slabOffset * bitWidth / 8,
+                                                paddingShifts)));
+        SmallVector<Value> slabValues;
+        result = lowerDsReadTr(op, ldsParams, loc, cvtDstLL, logicalBitWidth,
+                               slabValues, bases, affineOffset,
+                               maskSpanAffineOffset, paddingShifts, llvmElemTy,
+                               coordinateGroups, rewriter, targetInfo);
+        if (failed(result))
+          break;
+        llvm::append_range(values, slabValues);
+      }
       if (failed(result))
         continue;
 
@@ -2119,6 +2150,9 @@ public:
     auto aTy = cast<RankedTensorType>(op.getA().getType());
     auto bTy = cast<RankedTensorType>(op.getB().getType());
     auto accTy = cast<RankedTensorType>(op.getAcc().getType());
+    bool packedScales = cast<RankedTensorType>(op.getAScale().getType())
+                            .getElementType()
+                            .isInteger(32);
     auto mfma = cast<triton::gpu::AMDMfmaEncodingAttr>(accTy.getEncoding());
     if (failed(verifyMfmaVersionMatchesTarget(op, mfma,
                                               targetInfo.getISAFamily())))
@@ -2167,6 +2201,11 @@ public:
     auto packScales = [&](Value value, RankedTensorType ty,
                           int64_t repNonK) -> FailureOr<SmallVector<Value>> {
       SmallVector<Value> elems = unpackTensorElements(loc, value, rewriter, ty);
+      if (packedScales) {
+        if (elems.size() != 1)
+          return failure();
+        return elems;
+      }
       if (elems.size() != static_cast<size_t>(repNonK * steps))
         return failure();
       SmallVector<Value> scales;
@@ -2230,13 +2269,18 @@ public:
         for (int64_t m = 0; m < repM; ++m) {
           Value operandA = (*maybeA)[m * steps + step];
           Value operandB = (*maybeB)[n * steps + step];
-          Value scaleA = (*maybeAScale)[m * steps + step];
-          Value scaleB = (*maybeBScale)[n * steps + step];
+          Value scaleA = (*maybeAScale)[packedScales ? 0 : m * steps + step];
+          Value scaleB = (*maybeBScale)[packedScales ? 0 : n * steps + step];
+          int32_t opSelA =
+              packedScales ? op.getAScaleSelectorAttr().getInt() + 2 * step : 0;
+          int32_t opSelB =
+              packedScales ? op.getBScaleSelectorAttr().getInt() + 2 * step : 0;
           int32_t cbsz = matrixFormatCode(op.getAFormat());
           int32_t blgp = matrixFormatCode(op.getBFormat());
           if (mfma.getIsTransposed()) {
             std::swap(operandA, operandB);
             std::swap(scaleA, scaleB);
+            std::swap(opSelA, opSelB);
             std::swap(cbsz, blgp);
           }
           OperationState loweredOp(loc, intrinsicName);
@@ -2253,8 +2297,8 @@ public:
                                  ROCDL::MatrixFormatAttr::get(
                                      rewriter.getContext(),
                                      static_cast<ROCDL::MatrixFormat>(blgp)));
-          loweredOp.addAttribute("opselA", rewriter.getI32IntegerAttr(0));
-          loweredOp.addAttribute("opselB", rewriter.getI32IntegerAttr(0));
+          loweredOp.addAttribute("opselA", rewriter.getI32IntegerAttr(opSelA));
+          loweredOp.addAttribute("opselB", rewriter.getI32IntegerAttr(opSelB));
           updated[m * repN + n] = rewriter.create(loweredOp)->getResult(0);
         }
       }
@@ -2332,6 +2376,108 @@ public:
 private:
   const AMD::TargetInfo &targetInfo;
 };
+
+} // namespace
+
+void mlir::triton::AMD::finalizeScheduledMfmaLowering(
+    const ScheduledMfmaLoweringState &state) {
+  SmallVector<std::pair<Operation *, int>> needsDrain;
+  DenseMap<Operation *, std::unique_ptr<MfmaMemoryForwarding>> memoryForwarding;
+  DenseMap<Operation *, int> functionWaitStates;
+  DenseMap<Operation *, bool> functionNeedsDrain;
+  // Shared commits take the largest requirement among their reaching roots.
+  // Transient-only handoffs have no persistent result pin and keep their
+  // original delay. This deliberately also strengthens persistent commits
+  // whose outputs have only native consumers or no consumers.
+  DenseMap<Operation *, int> commitWaitStates = state.commitWaitStates;
+  auto isNativeInstruction = [](StringRef name) {
+    // These lower to native instructions on the supported targets. Exp2 is
+    // also emitted as a direct LLVM call by the elementwise conversion.
+    return llvm::is_contained(
+        {"llvm.amdgcn.perm", "llvm.amdgcn.permlane16.swap",
+         "llvm.amdgcn.permlane32.swap", "llvm.amdgcn.readfirstlane",
+         "llvm.amdgcn.ds.permute", "llvm.amdgcn.ds.bpermute",
+         "llvm.amdgcn.raw.ptr.buffer.atomic.fadd", "llvm.amdgcn.wave.barrier",
+         "llvm.amdgcn.exp2.f32", "llvm.exp2.f32"},
+        name);
+  };
+  for (auto [pin, requiredWait] : state.resultPins) {
+    auto function = pin->getParentOfType<LLVM::LLVMFuncOp>();
+    bool crossesCallBoundary = !function;
+    if (function) {
+      auto entry = functionNeedsDrain.try_emplace(function);
+      bool &needsFunctionDrain = entry.first->second;
+      if (entry.second) {
+        // Callable helpers must complete before returning. Kernels have no
+        // symbol uses and external linkage at this conversion stage.
+        needsFunctionDrain = function.getLinkage() != LLVM::Linkage::External ||
+                             !SymbolTable::symbolKnownUseEmpty(
+                                 function, function->getParentOp());
+        function.walk([&](Operation *op) {
+          // Coroutine intrinsics can introduce calls or helper functions in
+          // LLVM's later coroutine lowering despite having dedicated MLIR ops.
+          if (isa<LLVM::InvokeOp>(op) ||
+              op->getName().getStringRef().starts_with("llvm.intr.coro."))
+            needsFunctionDrain = true;
+          if (auto call = dyn_cast<LLVM::CallOp>(op)) {
+            auto callee = call.getCallee();
+            if (!callee || !isNativeInstruction(*callee))
+              needsFunctionDrain = true;
+          }
+          if (auto call = dyn_cast<LLVM::CallIntrinsicOp>(op)) {
+            // Unknown intrinsics may lower to calls (including some amdgcn
+            // intrinsics), so keep their boundary covered conservatively.
+            if (!isNativeInstruction(call.getIntrin()))
+              needsFunctionDrain = true;
+          }
+        });
+      }
+      crossesCallBoundary = needsFunctionDrain;
+      int &waitStates = functionWaitStates[function];
+      waitStates = std::max(waitStates, requiredWait);
+    }
+    // A call can reuse registers even without consuming the MFMA result. Keep
+    // its full destination tuple live until completion on either side of a
+    // call/return, including when LLVM moves otherwise independent operations.
+    if (crossesCallBoundary ||
+        needsOpaqueConsumerDrain(pin, requiredWait, commitWaitStates,
+                                 memoryForwarding))
+      needsDrain.emplace_back(pin, requiredWait);
+  }
+
+  // A dead destination can be reused by an unrelated inline-assembly output
+  // while its native MFMA is still in flight. SSA consumer analysis cannot see
+  // that physical-register WAW hazard (or a reused source's WAR hazard).
+  // Keep completion inside the opaque instruction sequence: pure assembly can
+  // move across other operations during LLVM optimization. Function scope also
+  // covers backedges and values or partial fragments eliminated later by LLVM.
+  // Empty register pins and compiler-owned commits emit no register writes.
+  // The latter retain their separately modeled completion contract.
+  for (auto [function, waitStates] : functionWaitStates) {
+    std::string completion = mfmaWaitStateAsm(waitStates) + "\n";
+    function->walk([&](LLVM::InlineAsmOp assembly) {
+      if (assembly.getAsmString().empty() ||
+          commitWaitStates.contains(assembly))
+        return;
+      assembly.setAsmString(completion + assembly.getAsmString().str());
+    });
+  }
+
+  // Analyze every root before changing result pins: otherwise an upgraded pin
+  // could appear to be an opaque consumer of a different root. Commits remain
+  // recognizable by their map entries while their delays are strengthened.
+  for (auto [pin, requiredWait] : needsDrain)
+    cast<LLVM::InlineAsmOp>(pin).setAsmString(mfmaWaitStateAsm(requiredWait));
+
+  // Consumer analysis and opaque/call guards are unchanged. Only now can an
+  // explicitly anchored second boundary share the finalized first delay.
+  for (auto [op, waitStates] : commitWaitStates) {
+    auto second = cast<LLVM::InlineAsmOp>(op);
+    auto first = getAnchoringCommit(second, commitWaitStates);
+    if (first && commitWaitStates.lookup(first) >= waitStates)
+      second.setAsmString("");
+  }
+}
 
 /// Encodes the waitcnt value for AMDGPU architectures.
 ///
@@ -2450,108 +2596,6 @@ struct MemoryCounterWaitOpConversion
 private:
   const AMD::TargetInfo &targetInfo;
 };
-
-} // namespace
-
-void mlir::triton::AMD::finalizeScheduledMfmaLowering(
-    const ScheduledMfmaLoweringState &state) {
-  SmallVector<std::pair<Operation *, int>> needsDrain;
-  DenseMap<Operation *, std::unique_ptr<MfmaMemoryForwarding>> memoryForwarding;
-  DenseMap<Operation *, int> functionWaitStates;
-  DenseMap<Operation *, bool> functionNeedsDrain;
-  // Shared commits take the largest requirement among their reaching roots.
-  // Transient-only handoffs have no persistent result pin and keep their
-  // original delay. This deliberately also strengthens persistent commits
-  // whose outputs have only native consumers or no consumers.
-  DenseMap<Operation *, int> commitWaitStates = state.commitWaitStates;
-  auto isNativeInstruction = [](StringRef name) {
-    // These lower to native instructions on the supported targets. Exp2 is
-    // also emitted as a direct LLVM call by the elementwise conversion.
-    return llvm::is_contained(
-        {"llvm.amdgcn.perm", "llvm.amdgcn.permlane16.swap",
-         "llvm.amdgcn.permlane32.swap", "llvm.amdgcn.readfirstlane",
-         "llvm.amdgcn.ds.permute", "llvm.amdgcn.ds.bpermute",
-         "llvm.amdgcn.raw.ptr.buffer.atomic.fadd", "llvm.amdgcn.wave.barrier",
-         "llvm.amdgcn.exp2.f32", "llvm.exp2.f32"},
-        name);
-  };
-  for (auto [pin, requiredWait] : state.resultPins) {
-    auto function = pin->getParentOfType<LLVM::LLVMFuncOp>();
-    bool crossesCallBoundary = !function;
-    if (function) {
-      auto entry = functionNeedsDrain.try_emplace(function);
-      bool &needsFunctionDrain = entry.first->second;
-      if (entry.second) {
-        // Callable helpers must complete before returning. Kernels have no
-        // symbol uses and external linkage at this conversion stage.
-        needsFunctionDrain = function.getLinkage() != LLVM::Linkage::External ||
-                             !SymbolTable::symbolKnownUseEmpty(
-                                 function, function->getParentOp());
-        function.walk([&](Operation *op) {
-          // Coroutine intrinsics can introduce calls or helper functions in
-          // LLVM's later coroutine lowering despite having dedicated MLIR ops.
-          if (isa<LLVM::InvokeOp>(op) ||
-              op->getName().getStringRef().starts_with("llvm.intr.coro."))
-            needsFunctionDrain = true;
-          if (auto call = dyn_cast<LLVM::CallOp>(op)) {
-            auto callee = call.getCallee();
-            if (!callee || !isNativeInstruction(*callee))
-              needsFunctionDrain = true;
-          }
-          if (auto call = dyn_cast<LLVM::CallIntrinsicOp>(op)) {
-            // Unknown intrinsics may lower to calls (including some amdgcn
-            // intrinsics), so keep their boundary covered conservatively.
-            if (!isNativeInstruction(call.getIntrin()))
-              needsFunctionDrain = true;
-          }
-        });
-      }
-      crossesCallBoundary = needsFunctionDrain;
-      int &waitStates = functionWaitStates[function];
-      waitStates = std::max(waitStates, requiredWait);
-    }
-    // A call can reuse registers even without consuming the MFMA result. Keep
-    // its full destination tuple live until completion on either side of a
-    // call/return, including when LLVM moves otherwise independent operations.
-    if (crossesCallBoundary ||
-        needsOpaqueConsumerDrain(pin, requiredWait, commitWaitStates,
-                                 memoryForwarding))
-      needsDrain.emplace_back(pin, requiredWait);
-  }
-
-  // A dead destination can be reused by an unrelated inline-assembly output
-  // while its native MFMA is still in flight. SSA consumer analysis cannot see
-  // that physical-register WAW hazard (or a reused source's WAR hazard).
-  // Keep completion inside the opaque instruction sequence: pure assembly can
-  // move across other operations during LLVM optimization. Function scope also
-  // covers backedges and values or partial fragments eliminated later by LLVM.
-  // Empty register pins and compiler-owned commits emit no register writes.
-  // The latter retain their separately modeled completion contract.
-  for (auto [function, waitStates] : functionWaitStates) {
-    std::string completion = mfmaWaitStateAsm(waitStates) + "\n";
-    function->walk([&](LLVM::InlineAsmOp assembly) {
-      if (assembly.getAsmString().empty() ||
-          commitWaitStates.contains(assembly))
-        return;
-      assembly.setAsmString(completion + assembly.getAsmString().str());
-    });
-  }
-
-  // Analyze every root before changing result pins: otherwise an upgraded pin
-  // could appear to be an opaque consumer of a different root. Commits remain
-  // recognizable by their map entries while their delays are strengthened.
-  for (auto [pin, requiredWait] : needsDrain)
-    cast<LLVM::InlineAsmOp>(pin).setAsmString(mfmaWaitStateAsm(requiredWait));
-
-  // Consumer analysis and opaque/call guards are unchanged. Only now can an
-  // explicitly anchored second boundary share the finalized first delay.
-  for (auto [op, waitStates] : commitWaitStates) {
-    auto second = cast<LLVM::InlineAsmOp>(op);
-    auto first = getAnchoringCommit(second, commitWaitStates);
-    if (first && commitWaitStates.lookup(first) >= waitStates)
-      second.setAsmString("");
-  }
-}
 
 void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,

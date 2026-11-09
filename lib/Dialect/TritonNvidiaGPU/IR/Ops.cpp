@@ -31,6 +31,7 @@
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -292,6 +293,14 @@ LogicalResult MapToRemoteBufferOp::verify() {
     return emitOpError() << "Invalid memory space for remote MemDesc: "
                          << remoteType;
   }
+  return success();
+}
+
+static LogicalResult verifyTcgen05Target(Operation *op) {
+  auto targetInfo =
+      TargetInfoBase::fromModuleOp(op->getParentOfType<ModuleOp>());
+  if (targetInfo && !targetInfo->supportsTcgen05())
+    return op->emitOpError("requires tcgen05 support");
   return success();
 }
 
@@ -1706,6 +1715,8 @@ static LogicalResult verifyNpotMMAv5Tile(Operation *op, Tcgen05Kind kind,
 }
 
 LogicalResult TCGen5MMAOp::verify() {
+  if (failed(verifyTcgen05Target(getOperation())))
+    return failure();
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
   }
@@ -1986,6 +1997,8 @@ LogicalResult TCGen5CommitOp::canonicalize(TCGen5CommitOp op,
 }
 
 LogicalResult TCGen5CommitOp::verify() {
+  if (failed(verifyTcgen05Target(getOperation())))
+    return failure();
   auto numDescs = getDescs().size();
   if (numDescs > 4)
     return emitOpError("expected 0 to 4 descriptors, got ") << numDescs;
@@ -2096,6 +2109,8 @@ static LogicalResult verifyScaledLHSOperand(Operation *op, Type elementType,
 }
 
 LogicalResult TCGen5MMAScaledOp::verify() {
+  if (failed(verifyTcgen05Target(getOperation())))
+    return failure();
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
   }
@@ -2402,6 +2417,11 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
 
 bool TCGen5MMAScaledOp::isAsync() { return getIsAsync(); }
 
+// -- TMEMWaitOp --
+LogicalResult TMEMWaitOp::verify() {
+  return verifyTcgen05Target(getOperation());
+}
+
 // -- TMEMStoreOp --
 static LogicalResult verifyTMEMOperand(Operation *op, RankedTensorType type,
                                        MemDescType memdesc, StringRef regName) {
@@ -2458,6 +2478,8 @@ LogicalResult TMEMStoreOp::canonicalize(TMEMStoreOp op,
 }
 
 LogicalResult TMEMStoreOp::verify() {
+  if (failed(verifyTcgen05Target(getOperation())))
+    return failure();
   if (!isa<triton::nvidia_gpu::TensorMemoryEncodingAttr,
            TensorMemoryScalesEncodingAttr, triton::tlx::DummyTMEMLayoutAttr>(
           getDst().getType().getEncoding()))
@@ -2482,6 +2504,8 @@ Type TMEMStoreOp::getPredicateOperandTypeLike() { return getPred().getType(); }
 
 // -- TMEMLoadOp --
 LogicalResult TMEMLoadOp::verify() {
+  if (failed(verifyTcgen05Target(getOperation())))
+    return failure();
   if (!isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(
           getSrc().getType().getMemorySpace()))
     return emitOpError("source must be a tensor memory buffer.");
@@ -2529,6 +2553,8 @@ LogicalResult TMEMLoadOp::verify() {
 
 // -- TMEMAllocOp --
 LogicalResult TMEMAllocOp::verify() {
+  if (failed(verifyTcgen05Target(getOperation())))
+    return failure();
   // Accept TensorMemoryEncodingAttr, TensorMemoryScalesEncodingAttr,
   // or DummyTMEMLayoutAttr (placeholder for deferred layout resolution)
   if (!isa<TensorMemoryEncodingAttr, TensorMemoryScalesEncodingAttr,
@@ -2582,6 +2608,8 @@ LogicalResult TMEMShiftOp::verify() {
 }
 
 LogicalResult TMEMCopyOp::verify() {
+  if (failed(verifyTcgen05Target(getOperation())))
+    return failure();
   if (!isa<triton::gpu::SharedMemorySpaceAttr>(
           getSrc().getType().getMemorySpace()))
     return emitOpError("The source must be a shared memory buffer");
@@ -2688,6 +2716,8 @@ LogicalResult TMEMCopyOp::verify() {
 
 // -- TMEMSubSliceOp --
 LogicalResult TMEMSubSliceOp::verify() {
+  if (failed(verifyTcgen05Target(getOperation())))
+    return failure();
   auto srcTy = cast<triton::gpu::MemDescType>(getSrc().getType());
   auto dstTy = cast<triton::gpu::MemDescType>(getResult().getType());
 

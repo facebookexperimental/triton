@@ -79,27 +79,35 @@ def _quantize_store(x, Y, S, head, n, N: tl.constexpr, D: tl.constexpr, SEQUENCE
 
 @triton.jit
 def _quantize_backward(Q, K, V, DO, QDK, KDQ, VB, DO8, DODV, QDKS, KDQS, VS, DOS, DODVS, N: tl.constexpr,
-                       D: tl.constexpr, BLOCK_N: tl.constexpr, TRANSPOSE_STORAGE: tl.constexpr = False):
+                       D: tl.constexpr, BLOCK_N: tl.constexpr, TRANSPOSE_STORAGE: tl.constexpr = False,
+                       NEED_DQ: tl.constexpr = True, NEED_DK: tl.constexpr = True, NEED_DV: tl.constexpr = True):
     head = tl.program_id(1).to(tl.int64)
     n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     d = tl.arange(0, D)
     offset = (head * N + n[:, None]) * D + d[None, :]
     mask = n[:, None] < N
-    q = tl.load(Q + offset, mask, 0).to(tl.float32)
-    _quantize_store(q, QDK, QDKS, head, n, N, D, True, BLOCK_N, TRANSPOSE_STORAGE)
-    k = tl.load(K + offset, mask, 0).to(tl.float32)
-    _quantize_store(k, KDQ, KDQS, head, n, N, D, True, BLOCK_N, TRANSPOSE_STORAGE)
-    v = tl.load(V + offset, mask, 0).to(tl.float32)
-    _quantize_store(v, VB, VS, head, n, N, D, False, BLOCK_N)
-    do = tl.load(DO + offset, mask, 0).to(tl.float32)
-    _quantize_store(do, DO8, DOS, head, n, N, D, False, BLOCK_N)
-    _quantize_store(do, DODV, DODVS, head, n, N, D, True, BLOCK_N, TRANSPOSE_STORAGE)
+    if NEED_DK:
+        q = tl.load(Q + offset, mask, 0).to(tl.float32)
+        _quantize_store(q, QDK, QDKS, head, n, N, D, True, BLOCK_N, TRANSPOSE_STORAGE)
+    if NEED_DQ:
+        k = tl.load(K + offset, mask, 0).to(tl.float32)
+        _quantize_store(k, KDQ, KDQS, head, n, N, D, True, BLOCK_N, TRANSPOSE_STORAGE)
+    if NEED_DQ or NEED_DK:
+        v = tl.load(V + offset, mask, 0).to(tl.float32)
+        _quantize_store(v, VB, VS, head, n, N, D, False, BLOCK_N)
+    if NEED_DQ or NEED_DK or NEED_DV:
+        do = tl.load(DO + offset, mask, 0).to(tl.float32)
+        if NEED_DQ or NEED_DK:
+            _quantize_store(do, DO8, DOS, head, n, N, D, False, BLOCK_N)
+        if NEED_DV:
+            _quantize_store(do, DODV, DODVS, head, n, N, D, True, BLOCK_N, TRANSPOSE_STORAGE)
 
 
-def quantize_backward_operands(q, k, v, do, *, transpose_storage=False):
-    """Quantize all backward-only operands in one launch.
+def quantize_backward_operands(q, k, v, do, *, transpose_storage=False, needs_input_grad=(True, True, True)):
+    """Quantize operands for the requested gradients in one launch.
 
     Return (payload, scale) pairs for Q_dK, K_dQ, V, dO, dO_dV, respectively.
+    Unused operands return (None, None).
     Q/K/V and contiguous dO are the BF16 master tensors, not FP8 payloads.
     """
     tensors = (q, k, v, do)
@@ -107,17 +115,24 @@ def quantize_backward_operands(q, k, v, do, *, transpose_storage=False):
             or any(x.shape != q.shape or x.device != q.device or x.dtype != torch.bfloat16 or not x.is_contiguous()
                    for x in tensors)):
         raise ValueError("backward quantization requires contiguous, same-device BF16 [B,H,N,128], N % 32 == 0")
+    need_dq, need_dk, need_dv = needs_input_grad
+    required = (need_dk, need_dq, need_dq or need_dk, need_dq or need_dk, need_dv)
+    if not any(required):
+        return ((None, None), ) * 5
     b, h, n, d = q.shape
     with torch.cuda.device(q.device):
         payloads = []
-        for sequence in (True, True, False, False, True):
+        scales = []
+        for needed, sequence in zip(required, (True, True, False, False, True)):
+            if not needed:
+                payloads.append(None)
+                scales.append(None)
+                continue
             transposed = sequence and transpose_storage
             payload = torch.empty((b, h, d, n) if transposed else q.shape, device=q.device, dtype=torch.float8_e4m3fn)
             payloads.append(payload.transpose(-1, -2) if transposed else payload)
-        scales = [
-            torch.empty((b, h, d, n // 32) if sequence else (b, h, n, d // 32), device=q.device, dtype=torch.uint8)
-            for sequence in (True, True, False, False, True)
-        ]
+            scales.append(
+                torch.empty((b, h, d, n // 32) if sequence else (b, h, n, d // 32), device=q.device, dtype=torch.uint8))
         _quantize_backward[(triton.cdiv(n, 32), b * h)](q, k, v, do, *payloads, *scales, n, d, 32, transpose_storage,
-                                                        num_warps=4)
+                                                        NEED_DQ=need_dq, NEED_DK=need_dk, NEED_DV=need_dv, num_warps=4)
     return tuple(zip(payloads, scales))

@@ -21,7 +21,7 @@
 Stored run record, one JSON object per line in the month of created_at; a later
 line for the same id replaces an earlier one:
   {id, wf, event, status, conclusion, created_at, head_sha, title, url, branch, pr, author,
-   select: {h100, b200, mi350, build, fallback} | null (gpu-tests.yml only),
+   select: {h100, b200, mi350, build, cpu?, fallback} | null (gpu-tests.yml only),
    jobs: [{name, conclusion, created_at, started_at, completed_at, labels,
            steps: [{name, conclusion, started_at, completed_at,
                     failures?: [{id, msg}], slowest?: [{id, s}]}]}] | null until the run completes}
@@ -42,6 +42,7 @@ bump.json, rewritten whole by each collection:
 """
 import argparse
 import base64
+import copy
 import datetime as dt
 import functools
 import glob
@@ -70,7 +71,8 @@ STUCK_DAYS = 7
 #: Workflows collected. Since #3875, gpu-tests.yml calls mi350/b200/h100.yml as reusable workflows;
 #: gpu-tests-nightly.yml runs the slow suites (TritonBench) once a day.
 #: compiler.yml runs LIT on every PR too; only its push runs are collected.
-COLLECT = ("gpu-tests.yml", "gpu-tests-nightly.yml", rules.BENCH_WF, "nightly-fbtriton.yml", rules.LIT_WF)
+COLLECT = ("gpu-tests.yml", "gpu-tests-nightly.yml", rules.BENCH_WF, "nightly-fbtriton.yml", rules.LIT_WF,
+           rules.FAST_WF)
 FORK = "facebookexperimental/llvm-project"
 #: Fork branch each tracked branch's cmake/meta-llvm-info.json follows, as in meta-llvm-update.yml.
 FORK_BRANCHES = {"main": "triton_beta", "release/3.8.x": "triton_3.8.x"}
@@ -142,14 +144,16 @@ def _record(run, wf):
         "id": run["id"], "wf": wf, "event": run["event"], "status": run["status"], "conclusion": run["conclusion"],
         "created_at": run["created_at"], "head_sha": run.get("head_sha"), "title": run.get("display_title", ""), "url":
         run.get("html_url", ""), "branch": run.get("head_branch"), "pr": None, "author": None, "jobs": None, "base":
-        ((run.get("pull_requests") or [{}])[0].get("base") or {}).get("ref")
+        ((run.get("pull_requests") or [{}])[0].get("base") or {}).get("ref"), "run_attempt": run.get("run_attempt", 1),
+        "updated_at": run.get("updated_at") or run["created_at"], "tested_sha": None, "tested_sha_provenance": []
     }
 
 
 def _jobs(pages):
     return [{
         "id":
-        j.get("id"), "name":
+        j.get("id"), "run_attempt":
+        j.get("run_attempt", 1), "name":
         j["name"], "conclusion":
         j["conclusion"], "created_at":
         j.get("created_at"), "started_at":
@@ -177,7 +181,7 @@ def _pr_and_author(run, api):
                 return run["pull_requests"][0]["number"], author
             owner = ((run.get("head_repository") or {}).get("owner") or {}).get("login")
             found = api(f"repos/{REPO}/pulls?head={owner}:{run.get('head_branch')}&state=all")[0]
-            return (found[0]["number"] if found else None), author
+            return (found[0]["number"] if len(found) == 1 else None), author
     except (subprocess.CalledProcessError, KeyError, IndexError, TypeError):
         pass
     return None, None
@@ -185,7 +189,7 @@ def _pr_and_author(run, api):
 
 def _attach_failures(jobs, text, wf="gpu-tests.yml"):
     for j in jobs:
-        if j["conclusion"] != "failure" or rules.gpu_of({"wf": wf}, j) is None:
+        if j["conclusion"] != "failure" or rules.test_platform_of({"wf": wf}, j) is None:
             continue
         try:
             logs.attach_failures(j, text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"), wf != rules.BENCH_WF)
@@ -223,6 +227,38 @@ def _selection(jobs, text):
             except subprocess.CalledProcessError:
                 return None
     return None
+
+
+def _tested_revision(run, jobs, text):
+    """Require source checkout evidence from the selector and the shared wheel build."""
+    run["provenance_version"] = 1
+    run["run_attempt"] = run.get("run_attempt", 1)
+    evidence = []
+    restarted = [
+        job for _, job in rules._test_jobs(run | {"jobs": jobs})
+        if run["run_attempt"] > 1 and job.get("run_attempt") == run["run_attempt"] and job["conclusion"] in ("success",
+                                                                                                             "failure")
+    ]
+    required = [
+        job for job in jobs
+        if job["name"] in ("select", "build", "build / build") and job["conclusion"] in ("success", "failure")
+    ]
+    for job in [*required, *restarted]:
+        try:
+            sha = logs.checkout_sha(job, text(f"repos/{REPO}/actions/jobs/{job['id']}/logs"))
+        except subprocess.CalledProcessError:
+            sha = None
+        if sha:
+            evidence.append({
+                "sha": sha, "job": job["name"], "job_id": job["id"], "run_attempt": run["run_attempt"], "job_attempt":
+                job.get("run_attempt", 1), "source": "source checkout log", "url": f"{run['url']}/job/{job['id']}"
+            })
+    run["tested_sha_provenance"] = evidence
+    shas = {item["sha"] for item in evidence}
+    has_select = any(item["job"] == "select" for item in evidence)
+    has_build = any(item["job"].startswith("build") for item in evidence)
+    run["tested_sha"] = (next(iter(shas)) if has_select and has_build and len(shas) == 1
+                         and len(evidence) == len(required) + len(restarted) else None)
 
 
 def _q(ref):
@@ -335,36 +371,88 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get):
         since = (rules.iso(rules.t(state["cursor"]) - dt.timedelta(hours=1))
                  if state.get("cursor") else rules.iso(rules.t(now) - dt.timedelta(days=BACKFILL_DAYS)))
     runs = load_runs(data_dir)
-    raw = {}
+    enrich = set()
+    recent = rules.iso(rules.t(now) - dt.timedelta(days=7))
     for wf in COLLECT:
         event = "&event=push" if wf == rules.LIT_WF else ""
-        for page in api(f"repos/{REPO}/actions/workflows/{wf}/runs?created=>={since}{event}&per_page=100"):
+        # Reruns keep their original created_at. Re-list only the comparison window;
+        # unchanged completed attempts still need no jobs or logs.
+        listed_since = min(since, rules.iso(rules.t(now) - dt.timedelta(days=7))) if wf in ("gpu-tests.yml",
+                                                                                            rules.FAST_WF) else since
+        for page in api(f"repos/{REPO}/actions/workflows/{wf}/runs?created=>={listed_since}{event}&per_page=100"):
             for run in page["workflow_runs"]:
                 old = runs.get(run["id"])
+                same_attempt = old and old.get("run_attempt", 1) == run.get("run_attempt", 1)
+                comparison = wf in ("gpu-tests.yml", rules.FAST_WF) and run["event"] == "pull_request"
                 if old and old["status"] == "completed" and old["jobs"] is not None:
-                    continue
-                runs[run["id"]] = _record(run, wf)
-                raw[run["id"]] = run
-    todo = sorted((r for r in runs.values() if r["status"] == "completed" and r["jobs"] is None),
+                    if not comparison:
+                        continue
+                    if same_attempt:
+                        if old.get("provenance_version") or run["created_at"] < recent:
+                            continue
+                        # Enrich recent legacy PR records once, using their cached jobs.
+                        old["run_attempt"] = run.get("run_attempt", 1)
+                        old["pr"], old["author"] = _pr_and_author(run, api)
+                        enrich.add(run["id"])
+                        continue
+                record = _record(run, wf)
+                if comparison:
+                    history = list((old or {}).get("attempts", []))
+                    if old and not same_attempt and old.get("jobs") is not None:
+                        history.append({k: v for k, v in old.items() if k != "attempts"})
+                    history = [
+                        item for item in history
+                        if item["created_at"] >= rules.iso(rules.t(now) - dt.timedelta(days=30))
+                    ]
+                    if history:
+                        record["attempts"] = history
+                if wf == "gpu-tests.yml" or comparison:
+                    record["pr"], record["author"] = _pr_and_author(run, api)
+                runs[run["id"]] = record
+    todo = sorted((r for r in runs.values() if r["status"] == "completed" and (r["jobs"] is None or r["id"] in enrich)),
                   key=lambda r: r["created_at"])
     unfetched = []
     for i, r in enumerate(todo):
         if i % 50 == 0 and _remaining(api) < RATE_FLOOR:
             unfetched = todo[i:]
             break
-        jobs = _jobs(api(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100&filter=latest"))
-        # Failures and durations can need the same job log: fetch it once.
+        legacy = r["id"] in enrich
+        if legacy:
+            jobs = r["jobs"]
+        else:
+            rerun = r["wf"] in ("gpu-tests.yml", rules.FAST_WF) and r["event"] == "pull_request" and r.get(
+                "run_attempt", 1) > 1
+            jobs = _jobs(
+                api(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100&filter={'all' if rerun else 'latest'}"))
+            if rerun:
+                # A failed-jobs-only rerun retains successful jobs from older attempts.
+                latest = {}
+                for job in jobs:
+                    previous = latest.get(job["name"])
+                    if previous is None or (job["run_attempt"], job["id"]) > (previous["run_attempt"], previous["id"]):
+                        latest[job["name"]] = job
+                jobs = list(latest.values())
+        # Failures, selection and revision evidence can need the same log: fetch it once.
         log = functools.lru_cache(maxsize=None)(text)
-        if r["wf"] in rules.GPU_RUN_WORKFLOWS:
-            _attach_failures(jobs, log, r["wf"])
-        if rules.slow_test_run(r):
-            _attach_durations(jobs, log)
-        if r["wf"] == rules.LIT_WF:
-            _attach_lit_failures(jobs, text)
-        if r["wf"] == "gpu-tests.yml":
-            r["select"] = _selection(jobs, text)
-            if r["id"] in raw:
-                r["pr"], r["author"] = _pr_and_author(raw[r["id"]], api)
+        if legacy:
+            # Keep the full-only PR view's existing normalized failures unchanged.
+            evidence_jobs = copy.deepcopy(jobs)
+            _attach_failures(evidence_jobs, log, r["wf"])
+            for job, evidence_job in zip(jobs, evidence_jobs):
+                for step, evidence_step in zip(job["steps"], evidence_job["steps"]):
+                    if "test_failures" in evidence_step:
+                        step["test_failures"] = evidence_step["test_failures"]
+        else:
+            if r["wf"] in rules.GPU_RUN_WORKFLOWS:
+                _attach_failures(jobs, log, r["wf"])
+            if rules.slow_test_run(r):
+                _attach_durations(jobs, log)
+            if r["wf"] == rules.LIT_WF:
+                _attach_lit_failures(jobs, log)
+            if r["wf"] == "gpu-tests.yml":
+                r["select"] = _selection(jobs, log)
+        if r["wf"] in ("gpu-tests.yml", rules.FAST_WF) and r["event"] == "pull_request":
+            _tested_revision(r, jobs, log)
         r["jobs"] = jobs
     # A run still not completed after STUCK_DAYS (a nightly stuck in "pending") no longer holds the cursor back.
     stuck = rules.iso(rules.t(now) - dt.timedelta(days=STUCK_DAYS))

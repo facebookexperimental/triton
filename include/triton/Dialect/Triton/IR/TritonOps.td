@@ -165,6 +165,27 @@ def TT_PreciseDivFOp
   let assemblyFormat = "$x `,` $y attr-dict `:` type($x)";
 }
 
+def TT_ApproxDivFOp
+    : TT_Op<"approx_divf", [Elementwise, SameOperandsAndResultType, Pure]> {
+  let summary = "Approximate division for 32-bit floating point types";
+
+  let description = [{
+        Divides x by y with approximate accuracy. On NVIDIA, this lowers to
+        div.approx.f32, with a maximum error of 2 ULP for denominators whose
+        magnitude is in [2^-126, 2^126]. Results outside this range may differ
+        from full-range division. On AMD, this lowers to llvm.amdgcn.fdiv.fast,
+        with a maximum error of 2.5 ULP and no support for denormal inputs or
+        results.
+    }];
+
+  let arguments = (ins AnyTypeOf<[F32, RankedTensorOf<[F32]>]>:$x,
+      AnyTypeOf<[F32, RankedTensorOf<[F32]>]>:$y);
+
+  let results = (outs AnyTypeOf<[F32, RankedTensorOf<[F32]>]>:$result);
+
+  let assemblyFormat = "$x `,` $y attr-dict `:` type($x)";
+}
+
 def TT_MulhiUIOp
     : TT_Op<"mulhiui", [Elementwise, SameOperandsAndResultType, Pure]> {
   let summary = "Most significant N bits of the 2N-bit product of two integers";
@@ -409,6 +430,8 @@ def TT_AtomicRMWOp
             [AtomicOpInterface, SameOperandsAndResultShape,
              SameOperandsAndResultEncoding,
              DeclareOpInterfaceMethods<PredicatedOpInterface>,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>,
              TypesMatchWith<"ptr type matches value type", "val", "ptr",
                             "getPointerTypeSameShape($_self)">,
              TypesMatchWith<
@@ -442,6 +465,8 @@ def TT_AtomicCASOp
     : TT_Op<"atomic_cas",
             [AtomicOpInterface, SameOperandsAndResultShape,
              SameOperandsAndResultEncoding,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>,
              TypesMatchWith<"ptr type matches cmp type", "cmp", "ptr",
                             "getPointerTypeSameShape($_self)">,
              TypesMatchWith<"ptr type matches value type", "val", "ptr",
@@ -702,6 +727,7 @@ def TT_GetNumProgramsOp : TT_Op<"get_num_programs", [Pure]> {
 def TT_DotOp
     : TT_Op<"dot", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>,
                     DeclareOpInterfaceMethods<DotOpInterface>,
+                    MixedRadixLayoutTrait,
                     TypesMatchWith<"result's type matches accumulator's type",
                                    "d", "c", "$_self">]> {
   let summary = "dot";
@@ -741,6 +767,7 @@ def TT_DotScaledOp
             [Pure, AttrSizedOperandSegments,
              DeclareOpInterfaceMethods<DotOpInterface, ["verifyDims",
                                                         "verifyOutputDims"]>,
+             MixedRadixLayoutTrait,
              TypesMatchWith<"result's type matches accumulator's type", "d",
                             "c", "$_self">]> {
   let summary = "dot_scaled";
@@ -832,7 +859,9 @@ def TT_ReduceReturnOp : TT_Op<"reduce.return", [HasParent<"ReduceOp">, Pure,
 def TT_ScanOp
     : TT_Op<"scan", [Pure, SameOperandsAndResultEncoding,
                      SameOperandsAndResultShape, SingleBlock,
-                     DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+                     DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                     DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                         ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "Associative scan using generic combination algorithm";
   let arguments = (ins Variadic<TT_Tensor>:$srcs, I32Attr:$axis,
       BoolAttr:$reverse, OptionalAttr<StrAttr>:$reduction_ordering);
@@ -847,6 +876,11 @@ def TT_ScanOp
   let extraClassDeclaration = [{
       llvm::SmallVector<RankedTensorType> getInputTypes();
       llvm::SmallVector<Type> getElementTypes();
+      // Per dim, the extent a thread's contiguous registers, then its lanes and
+      // warps cover when they step through it as a blocked layout's do, else
+      // std::nullopt.
+      static std::optional<llvm::SmallVector<unsigned>>
+      getBlockedTile(const ::mlir::triton::LinearLayout &layout);
     }];
 }
 
@@ -972,7 +1006,8 @@ def TT_HistogramOp
                           TypesMatchWith<"mask type matches src type", "src",
                                          "mask", "getI1SameShape($_self)",
                                          "($_op.getOperands().size() <= 1) || "
-                                         "std::equal_to<>()">]> {
+                                         "std::equal_to<>()">,
+                          MixedRadixLayoutTrait]> {
   let summary = "return a histogram of the inputs.";
   let description = [{
     Return the histogram of the input tensor. The number of bins is equal to

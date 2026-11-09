@@ -163,6 +163,7 @@ def TTG_AsyncCopyGlobalToLocalOp
              [GlobalToLocalCopyTrait,
               AttrSizedOperandSegments,
               DeclareOpInterfaceMethods<PredicatedOpInterface>,
+              MixedRadixLayoutTrait,
               OptionalTypesMatchWith<"infer mask type from src type", "src",
                                      "mask", "getI1SameShape($_self)">,
               OptionalTypesMatchWith<"infer other type from src type", "src",
@@ -472,7 +473,8 @@ def TTG_MemDescReinterpretOp
   let hasVerifier = 1;
 }
 
-def TTG_LocalLoadOp : TTG_Op<"local_load", [LocalLoadTrait]> {
+def TTG_LocalLoadOp
+    : TTG_Op<"local_load", [LocalLoadTrait, MixedRadixLayoutTrait]> {
   let summary = "Load a buffer from local memory into a distributed tensor";
 
   let description = [{
@@ -715,7 +717,9 @@ def TTG_PredicateStageOp
                        "$stage attr-dict `:` type($iv) `->` type($result)";
 }
 
-def TTG_MaskOp : TTG_Op<"mask", [SingleBlock]> {
+// The pipeliner resolves a mask into its body before lowering, and each body
+// op is checked on its own, so a mask only forwards values.
+def TTG_MaskOp : TTG_Op<"mask", [SingleBlock, MixedRadixLayoutTrait]> {
   let summary = "mask op for pipelining";
   let arguments = (ins I1:$pred);
   let results = (outs Variadic<AnyType>:$result);
@@ -723,7 +727,8 @@ def TTG_MaskOp : TTG_Op<"mask", [SingleBlock]> {
 }
 
 def TTG_MaskReturnOp : TTG_Op<"mask.return", [HasParent<"MaskOp">, Pure,
-                                              Terminator, ReturnLike]> {
+                                              Terminator, ReturnLike,
+                                              MixedRadixLayoutTrait]> {
   let summary = "terminator for mask operator";
   let arguments = (ins Variadic<AnyType>:$result);
   let assemblyFormat = "$result attr-dict `:` type($result)";

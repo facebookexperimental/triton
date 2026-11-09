@@ -40,6 +40,9 @@ jobs:
     timeout-minutes: 120
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+    env:
+      CCACHE_DIR: /tmp/triton-lit-ccache
+      CCACHE_MAXSIZE: 2G
 
     steps:
       - name: Checkout
@@ -80,10 +83,25 @@ jobs:
           mv "${DIR}" llvm-install
           rm "${TARBALL}"
 
+      - name: Install ccache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache
+
+      - name: Restore LIT ccache
+        id: restore-ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-lit-gcc-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: |
+            ccache-lit-gcc-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Build and run LIT tests
         id: lit
         run: |
           set -o pipefail
+          ccache --zero-stats
           python3 -m pip install cmake ninja lit
           LLVM="$GITHUB_WORKSPACE/llvm-install"
           cmake -G Ninja -B build \
@@ -107,6 +125,17 @@ jobs:
           failed: ${{ steps.lit.outcome == 'failure' }}
           bucket: compiler-lit
           lit-log: /tmp/lit.log
+
+      - name: Report LIT ccache statistics
+        if: always() && steps.lit.outcome != 'skipped'
+        run: ccache --show-stats
+
+      - name: Save LIT ccache
+        if: always() && steps.lit.outcome == 'success' && steps.restore-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.restore-ccache.outputs.cache-primary-key }}
 
   # File and close failure issues; ci-issues.yml decides which runs file.
   issues-compiler-lit:

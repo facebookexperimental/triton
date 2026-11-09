@@ -112,19 +112,16 @@ def min_dot_size(target: GPUTarget):
     return check_dot_compatibility
 
 
-def get_ptxas_for_arch(arch: int) -> knobs.NvidiaTool:
-    if arch < 90:
-        return knobs.nvidia.ptxas
-    # The ptxas-blackwell name is misleading; keep it until legacy ptxas is removed.
-    return knobs.nvidia.ptxas_blackwell
+def get_ptxas(arch: int) -> knobs.NvidiaTool:
+    return knobs.nvidia.ptxas_blackwell if arch >= 100 else knobs.nvidia.ptxas
 
 
 @functools.lru_cache()
-def get_ptxas_version_for_arch(arch: int = 80):
+def get_ptxas_version(arch: int = 80):
     mock_ver = knobs.nvidia.mock_ptx_version
     if mock_ver is not None:
         return mock_ver  # This is not really a version of ptxas, but it is good enough for testing
-    version = subprocess.check_output([get_ptxas_for_arch(arch).path, "--version"],
+    version = subprocess.check_output([get_ptxas(arch).path, "--version"],
                                       env=knobs.nvidia.get_tool_env()).decode("utf-8")
     return version
 
@@ -156,7 +153,7 @@ def ptx_get_version(cuda_version: str) -> int:
 def get_ptx_version_from_options(options, arch: int):
     ptx_version = options.ptx_version
     if ptx_version is None:
-        cuda_version = get_ptxas_for_arch(arch).version
+        cuda_version = get_ptxas(arch).version
         ptx_version = ptx_get_version(cuda_version)
     return ptx_version
 
@@ -259,6 +256,7 @@ class CUDAOptions:
         None  # filename of a user-defined IR (*.{ttir|ttgir|llir|ptx})
     )
     enable_fp_fusion: bool = True
+    sched4reg: bool = False
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
     launch_cluster: bool = False  # Blackwell cluster launcher
@@ -444,8 +442,7 @@ class CUDABackend(BaseBackend):
             if capability >= 90:
                 args["deprecated_fp8_dot_operand_dtypes"] = ("fp8e4b15", )
 
-        if "enable_fp_fusion" not in args:
-            args["enable_fp_fusion"] = knobs.language.default_fp_fusion
+        args["enable_fp_fusion"] = knobs.language.fp_fusion_enabled(args.get("enable_fp_fusion"))
 
         if is_enabled(args, "gsan"):
             from triton.runtime.driver import driver
@@ -969,7 +966,7 @@ class CUDABackend(BaseBackend):
         dump_enabled = pm.enable_debug()
         emuTF32 = capability // 10 >= 8
         if knobs.language.allow_npot:
-            passes.ttir.add_npot_pad(pm, opt.num_warps, 32, opt.num_ctas)
+            passes.ttir.add_npot_pad(pm, opt.num_warps, 32, opt.num_ctas, f"cuda:{capability}")
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         nvidia.passes.hopper.add_form_multi_cta_collectives(pm, capability, knobs.nvidia.use_meta_ws)
         nvidia.passes.hopper.add_lower_cluster_reduce_to_ttgir(pm)
@@ -1523,7 +1520,7 @@ class CUDABackend(BaseBackend):
         return self._ptxas_compile(src, opt, capability)
 
     def _ptxas_compile(self, src, opt, capability, apply_controls=None):
-        ptxas = get_ptxas_for_arch(self.target.arch).path
+        ptxas = get_ptxas(self.target.arch).path
         with (
                 tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".ptx") as fsrc,
                 tempfile.NamedTemporaryFile(delete=False, mode="r", suffix=".log") as flog,
@@ -1566,7 +1563,7 @@ class CUDABackend(BaseBackend):
                 try:
                     from triton.magnon.consume import acf_args_for
 
-                    ptx_extra_options += acf_args_for(src, arch, get_ptxas_for_arch(self.target.arch).version)
+                    ptx_extra_options += acf_args_for(src, arch, get_ptxas(self.target.arch).version)
                 except Exception:
                     pass
 
@@ -1642,7 +1639,7 @@ please share the reproducer above with Triton project.
             from triton.magnon import store
             from triton.magnon.consume import acf_args_for
             arch = sm_arch_from_capability(self.target.arch)
-            ver = get_ptxas_for_arch(self.target.arch).version
+            ver = get_ptxas(self.target.arch).version
             sha = store.ptx_sha256(ptx)
             # Reuse the assembled ACF cubin from the (separate) ACF store if present -- skips re-running
             # ptxas --apply-controls on every process. Version-tagged: the cached cubin is only valid for
@@ -1689,5 +1686,5 @@ please share the reproducer above with Triton project.
 
     @functools.lru_cache()
     def hash(self):
-        version = get_ptxas_version_for_arch(self.target.arch)
+        version = get_ptxas_version(self.target.arch)
         return f"{version}-{self.target.arch}"

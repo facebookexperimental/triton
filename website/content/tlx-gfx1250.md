@@ -6,8 +6,14 @@ and prefetch. Hardware tags follow [TLX](tlx.html).
 
 ## Supported `tlx.ops`
 
-No `tlx.ops` catalog entries target gfx1250 yet. The closest coverage is
-the tutorial `third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/`, which
+One blessed implementation per op from `ops/_catalog.py`, with the columns
+of the [gfx950 table](tlx-gfx950.html).
+
+| Op | Variant | Impl | Dtypes | Requires | Backward | What it does |
+|---|---|---|---|---|---|---|
+| `flash_attn_mxfp8` | wmma_tdm_mxfp8 | `flash_attn_mxfp8/gfx1250.py:flash_attn_mxfp8` | bfloat16 | — | no | MXFP8 attention forward, D128: E4M3 Q/K/V + E8M0 scales, both WMMAs scaled; TDM loads into LDS, softmax and WMMA stages ping-ponged across warp groups; persistent non-causal and causal kernels. |
+
+The tutorial `third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/` also
 exercises fused TDM loads/stores, TDM prefetch, and WMMA in grouped GEMM.
 See its [README](third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
 
