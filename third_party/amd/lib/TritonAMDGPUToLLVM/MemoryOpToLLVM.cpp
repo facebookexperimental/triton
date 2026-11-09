@@ -3,6 +3,7 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
+#include "Utility.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
@@ -497,6 +498,18 @@ public:
 
     auto dstLL = triton::gpu::toLinearLayout(dstTy);
     LinearLayout sharedLL = triton::gpu::toLinearLayoutIgnoringPadding(srcTy);
+    // A mixed-radix read is one radix-2 read per odd register value o,
+    // starting at LDS element slabOffsets[o].
+    SmallVector<int32_t> slabOffsets = {0};
+    std::optional<LinearLayout> slabCvt;
+    if (!dstLL.isRadix2()) {
+      std::string reason;
+      FailureOr<LinearLayout> cvt =
+          LLVM::AMD::splitDirectToLdsCopy(dstLL, sharedLL, slabOffsets, reason);
+      if (isPackedTransposed || failed(cvt))
+        return failure();
+      slabCvt = *cvt;
+    }
 
     if constexpr (isPackedTransposed) {
       // Perform factorization and address routing in logical fp4 coordinates.
@@ -528,7 +541,7 @@ public:
       dstLL = LinearLayout::identity1D(2, kReg, *dstPackedDim) * dstLL;
     }
 
-    auto cvtDstLL = dstLL.invertAndCompose(sharedLL);
+    auto cvtDstLL = slabCvt ? *slabCvt : dstLL.invertAndCompose(sharedLL);
     auto kBlock = StringAttr::get(ctx, "block");
     auto maybeSublayout = cvtDstLL.quotient({kBlock});
     if (!maybeSublayout)
@@ -543,7 +556,12 @@ public:
     auto paddingShifts = getPaddedSharedShifts(srcTy.getEncoding(),
                                                srcTy.getElementTypeBitWidth(),
                                                /*offsetInBytes=*/true);
+    if (llvm::any_of(slabOffsets, [&](int32_t offset) {
+          return offset & maskSpanAffineOffset;
+        }))
+      return failure();
 
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
     for (const auto &ldsParams : ldsParamsVec) {
       if (triton::gpu::isPaddedEncoding(srcTy.getEncoding()) &&
           triton::gpu::getMinInterval(srcTy.getEncoding()) <
@@ -552,10 +570,23 @@ public:
       }
 
       SmallVector<Value> values;
-      auto result = lowerDsReadTr(
-          op, ldsParams, loc, cvtDstLL, logicalBitWidth, values, smemBases,
-          affineOffset, maskSpanAffineOffset, paddingShifts, llvmElemTy,
-          coordinateGroups, rewriter, targetInfo);
+      LogicalResult result = success();
+      for (int32_t slabOffset : slabOffsets) {
+        SmallVector<Value> bases = smemBases;
+        if (slabOffset != 0)
+          for (Value &base : bases)
+            base = b.gep(base.getType(), i8_ty, base,
+                         b.i32_val(applyPadding(slabOffset * bitWidth / 8,
+                                                paddingShifts)));
+        SmallVector<Value> slabValues;
+        result = lowerDsReadTr(op, ldsParams, loc, cvtDstLL, logicalBitWidth,
+                               slabValues, bases, affineOffset,
+                               maskSpanAffineOffset, paddingShifts, llvmElemTy,
+                               coordinateGroups, rewriter, targetInfo);
+        if (failed(result))
+          break;
+        llvm::append_range(values, slabValues);
+      }
       if (failed(result))
         continue;
 
