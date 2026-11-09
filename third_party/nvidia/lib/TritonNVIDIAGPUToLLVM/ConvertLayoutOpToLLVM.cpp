@@ -109,7 +109,7 @@ struct ConvertLayoutOpSwizzlingConversion
           loc, rewriter, srcLayout, dstLayout, newInVals, i8ElemTy, smemBase,
           sourceOp, numTiles, tilesPerRound);
       for (auto &v : outVals) {
-        v = b.trunc(llvmElemTy, v);
+        v = b.trunc(llvmElemTy, v, LLVM::IntegerOverflowFlags::nuw);
       }
       return outVals;
     }
