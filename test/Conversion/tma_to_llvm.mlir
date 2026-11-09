@@ -15,12 +15,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 tt.func @tma_gather_simple(%arg0: !tt.tensordesc<1x128xbf16, #shared1>, %arg1: !ttg.memdesc<1xi64, #shared, #smem, mutable>, %arg2: tensor<32xi32, #ttg.slice<{dim = 0, parent = #blocked}>>, %arg3: i32, %arg4: !ttg.memdesc<32x128xbf16, #shared1, #smem, mutable>, %arg5: i1) {
   // There are 32 indices distributed to 4 warps, so each warp as 8 indices.
 
-  // CHECK: [[BAR:%.*]] = extractvalue {{.*}} %1, 0
-  // CHECK: [[BASE_PTR:%.*]] = extractvalue {{.*}} %4, 0
-
   // CHECK: [[TIDX:%.*]] = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
   // CHECK: [[WIDX:%.*]] = lshr i32 [[TIDX]], 5
   // CHECK: [[WARP_ID:%.*]] = tail call i32 @llvm.nvvm.shfl.sync.idx.i32(i32 -1, i32 [[WIDX]],
+
+  // CHECK: [[BAR:%.*]] = extractvalue {{.*}} %1, 0
+  // CHECK: [[BASE_PTR:%.*]] = extractvalue {{.*}} %4, 0
 
   // CHECK: [[ELECT:%.*]] = tail call { i32, i1 } @llvm.nvvm.elect.sync
   // CHECK: [[ELECT_PRED:%.*]] = extractvalue { i32, i1 } [[ELECT]], 1
