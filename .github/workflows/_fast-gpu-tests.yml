@@ -35,7 +35,7 @@ jobs:
           venv: ${{ inputs.platform != 'mi350' && '/workspace/uv_venvs/meta-triton' || '' }}
           backend: ${{ inputs.platform == 'mi350' && 'rocm' || 'cuda' }}
           arch: gfx950
-          packages: numpy pytest expecttest
+          packages: numpy pytest pytest-xdist expecttest
       - name: Check GPU linker cache
         if: inputs.platform == 'h100'
         run: sudo ldconfig
@@ -43,16 +43,24 @@ jobs:
         timeout-minutes: 4
         run: timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
       - name: Install torchao
-        if: inputs.platform != 'mi350'
         uses: ./.github/actions/install-torchao
         with:
           platform: ${{ inputs.platform }}
+          defer-verification: "true"
+      - name: Install CUDA headers for AOTInductor
+        if: inputs.platform == 'h100'
+        run: |
+          CUDA_TOOLKIT=$(uv pip show cuda-toolkit | sed -n 's/^Version: //p')
+          uv pip install "cuda-toolkit[crt]==${CUDA_TOOLKIT}"
+          echo "CUDA_HOME=$(python -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent.parent / "nvidia" / "cu13")')" >> "${GITHUB_ENV}"
       - name: Install prebuilt Triton
         uses: ./.github/actions/install-prebuilt-triton
         with:
           wheel-url: ${{ inputs.wheel_url }}
           wheel-filename: ${{ inputs.wheel_filename }}
           wheel-sha256: ${{ inputs.wheel_sha256 }}
+      - name: Verify torchao after Triton installation
+        run: python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Run fast correctness tests
         env:
           PLATFORM: ${{ inputs.platform }}
@@ -63,5 +71,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fast-${{ inputs.platform }}-test-results
-          path: /tmp/fast-correctness.xml
+          path: |
+            /tmp/fast-correctness.xml
+            /tmp/fast-correctness.selection.json
           if-no-files-found: ignore

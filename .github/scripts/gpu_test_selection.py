@@ -252,8 +252,9 @@ def test_file_affected(
     test_rel: str,
     matchers: KernelMatchers,
     op_pattern: re.Pattern[str] | None,
+    imports=None,
 ) -> bool:
-    imports = collect_imports(source)
+    imports = collect_imports(source) if imports is None else imports
     if matchers.prefixes:
         for module, _names in imports:
             if module and module_matches(module, matchers.prefixes):

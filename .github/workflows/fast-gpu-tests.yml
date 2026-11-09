@@ -115,7 +115,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fast-cpu-test-results
-          path: /tmp/fast-cpu.xml
+          path: |
+            /tmp/fast-cpu.xml
+            /tmp/fast-cpu.selection.json
           if-no-files-found: ignore
 
   result:
@@ -123,6 +125,8 @@ jobs:
     needs: [select, build, h100, b200, mi350, cpu]
     if: always() && github.repository_owner == 'facebookexperimental'
     runs-on: ubuntu-latest
+    env:
+      NEEDS: ${{ toJSON(needs) }}
     steps:
       - name: Require selected fast suites to pass
         env:
@@ -139,5 +143,17 @@ jobs:
                   raise SystemExit(f"{job}: {needs[job]['result']}")
           selected = [key for key in ('h100', 'b200', 'mi350', 'cpu') if needs['select']['outputs'][key] == 'true']
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write('All selected fast suites passed.\n' if selected else 'No fast tests required for these paths.\n')
+              summary.write('Selected workers passed; cross-platform coverage verification follows.\n' if selected else 'No fast tests required for these paths.\n')
           PY
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - name: Download execution evidence
+        if: needs.select.outputs.build == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fast-*-test-results
+          path: ${{ runner.temp }}/fast-evidence
+      - name: Verify touched-test coverage across platforms
+        if: needs.select.outputs.build == 'true'
+        run: python3 .github/scripts/fast_tests.py verify --evidence "${RUNNER_TEMP}/fast-evidence"

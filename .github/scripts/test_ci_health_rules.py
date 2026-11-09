@@ -1,4 +1,5 @@
 import ci_health_rules as r
+import pytest
 
 CORE, CODEGEN = "Run TLX core tests", "Run device-agnostic TLX codegen tests"
 
@@ -57,6 +58,124 @@ def main(runs, asof=stamp(23)):
 
 def items(view, gpu, kind):
     return {(i["id"], i["first_sha"][:2]) for i in view["gpus"][gpu][kind]}
+
+
+def comparison_run(h, wf="gpu-tests.yml", tested_sha="ab" * 20, pr=4855, **kw):
+    fast = wf == r.FAST_WF
+    worker = job("mi350 / correctness" if fast else "mi350 / mi350-tlx-test",
+                 step("Run fast correctness tests" if fast else CORE, "success"), label="linux-mi350")
+    aggregate = job("Fast correctness" if fast else r.SUMMARY_JOB, label="ubuntu-latest")
+    item = run(h, [build_ok(), worker, aggregate], event="pull_request", wf=wf, pr=pr, **kw)
+    item.update(tested_sha=tested_sha, run_attempt=1, updated_at=stamp(h))
+    return item
+
+
+def fail_comparison(item, kind="failed"):
+    worker = item["jobs"][1]
+    worker["conclusion"] = item["conclusion"] = item["jobs"][-1]["conclusion"] = "failure"
+    test = worker["steps"][0]
+    test["conclusion"] = "failure"
+    test["test_failures"] = [{
+        "id": "test_flash_attn_mxfp8_shared_fp8_boundary_graph[False]", "kind": kind, "msg":
+        "AssertionError: bitwise equality", "t": stamp(3)
+    }]
+    return item
+
+
+def test_fast_full_pairs_only_the_same_pr_and_actual_checkout():
+    fast = comparison_run(1, r.FAST_WF)
+    full = fail_comparison(comparison_run(2))
+    v = r.fast_full_view([fast, full], stamp(23))
+    assert v["counts"]["test"] == v["comparable"] == v["candidate_prs"] == 1
+    assert v["rate"] == 1
+    row = v["records"][0]
+    assert row["sha"] == "ab" * 20 and row["gaps"][0]["failures"][0]["platform"] == "MI350"
+    assert row["gaps"][0]["failures"][0]["id"].endswith("[False]")
+    assert row["gaps"][0]["fast"]["url"] == "u1/attempts/1"
+    assert row["gaps"][0]["full"]["url"] == "u2/attempts/1"
+    other_pr = {**full, "pr": 4856, "head_sha": fast["head_sha"]}
+    assert r.fast_full_view([fast, other_pr], stamp(23))["comparable"] == 0
+
+
+@pytest.mark.parametrize("sha,expected", [(None, "unverified_version"), ("cd" * 20, "missing_pair")])
+def test_fast_full_head_match_does_not_verify_checkout(sha, expected):
+    fast = comparison_run(1, r.FAST_WF, tested_sha=sha)
+    full = fail_comparison(comparison_run(2, tested_sha=None if sha is None else "ab" * 20))
+    fast["head_sha"] = full["head_sha"] = "ef" * 20
+    v = r.fast_full_view([fast, full], stamp(23))
+    assert v["comparable"] == v["counts"]["test"] == 0 and v["rate"] is None
+    assert v["counts"][expected] > 0
+
+
+@pytest.mark.parametrize("state", ["pending", "cancelled", "build", "setup", "unknown", "error"])
+def test_fast_full_non_test_outcomes_are_not_candidates(state):
+    fast, full = comparison_run(1, r.FAST_WF), comparison_run(2)
+    if state == "pending":
+        full.update(status="in_progress", conclusion=None, jobs=None)
+    elif state == "cancelled":
+        full["conclusion"] = "cancelled"
+    elif state == "build":
+        full["jobs"][0]["conclusion"] = "failure"
+        full["jobs"][0]["steps"][0]["conclusion"] = "failure"
+        full["conclusion"] = full["jobs"][-1]["conclusion"] = "failure"
+    elif state == "setup":
+        full["jobs"][1] = job("mi350 / mi350-tlx-test", step("Install prebuilt Triton", "failure"),
+                              step(CORE, "skipped"))
+        full["conclusion"] = full["jobs"][-1]["conclusion"] = "failure"
+    else:
+        fail_comparison(full, "error")
+        if state == "unknown":
+            full["jobs"][1]["steps"][0].pop("test_failures")
+    v = r.fast_full_view([fast, full], stamp(23))
+    assert v["counts"]["test"] == 0 and not v["records"][0]["gaps"]
+    assert v["counts"]["execution_error" if state == "error" else state] == 1
+    assert v["comparable"] == 0 and v["rate"] is None
+
+
+def test_fast_full_denominator_requires_full_test_verdict():
+    fast, full = comparison_run(1, r.FAST_WF), fail_comparison(comparison_run(2))
+    other_fast, setup = comparison_run(3, r.FAST_WF, tested_sha="cd" * 20), comparison_run(4, tested_sha="cd" * 20)
+    setup["jobs"][1] = job("mi350 / mi350-tlx-test", step("Install prebuilt Triton", "failure"))
+    setup["conclusion"] = setup["jobs"][-1]["conclusion"] = "failure"
+    v = r.fast_full_view([fast, full, other_fast, setup], stamp(23))
+    assert v["counts"]["test"] == v["counts"]["setup"] == 1
+    assert v["comparable"] == 1 and v["rate"] == 1
+
+
+def test_fast_full_skipped_fast_work_is_not_a_validated_pass():
+    fast = comparison_run(1, r.FAST_WF)
+    fast["jobs"][1]["conclusion"] = fast["jobs"][1]["steps"][0]["conclusion"] = "skipped"
+    v = r.fast_full_view([fast, fail_comparison(comparison_run(2))], stamp(23))
+    assert v["counts"]["not_required"] == 1 and v["counts"]["test"] == v["comparable"] == 0
+
+
+def test_fast_full_retains_historical_gap_and_latest_retry_resolution():
+    fast, failed = comparison_run(1, r.FAST_WF), fail_comparison(comparison_run(2))
+    retry = comparison_run(2)
+    retry.update(run_attempt=2, updated_at=stamp(20), attempts=[failed])
+    v = r.fast_full_view([fast, retry, retry], stamp(23))
+    assert v["counts"]["test"] == v["comparable"] == v["candidate_prs"] == 1
+    assert v["full_attempts"] == 2 and v["fast_attempts"] == 1 and len(v["records"]) == 1
+    row = v["records"][0]
+    assert row["latest"] == "passed" and row["gaps"][0]["full"]["attempt"] == 1 and row["full"]["attempt"] == 2
+    next_fast, next_full = comparison_run(5, r.FAST_WF, tested_sha="cd" * 20), comparison_run(6, tested_sha="cd" * 20)
+    v = r.fast_full_view([fast, retry, next_fast, next_full], stamp(23))
+    assert v["counts"]["test"] == v["counts"]["passed"] == v["candidate_prs"] == 1
+    assert v["comparable"] == 2 and v["rate"] == 0.5
+    historical = next(row for row in v["records"] if row["gaps"])
+    assert historical["latest_pr_result"] == "passed" and historical["latest_pr_full"]["id"] == next_full["id"]
+
+
+def test_fast_full_window_and_full_only_health_remain_distinct():
+    fast, full = comparison_run(1, r.FAST_WF), fail_comparison(comparison_run(2))
+    v = r.page_data([fast, full], stamp(23), {})["branches"]["main"]
+    assert v["fast_full"]["counts"]["test"] == 1
+    assert v["main"] == r.main_view([full], stamp(23))
+    assert v["pr"] == r.pr_view([full], stamp(23), v["main"])
+    v = r.fast_full_view([fast, full], "2026-10-20T00:00:00Z")
+    assert v["counts"]["test"] == 0 and len(v["records"]) == 1
+    assert sum(d["counts"]["test"] for d in v["trend"]) == 1
+    assert r.fast_full_view([fast, full], "2026-11-20T00:00:00Z")["records"] == []
 
 
 def test_mi350_core_step_keeps_its_name_before_the_rename():
@@ -450,7 +569,9 @@ def test_failed_select_is_an_anomaly():
 def test_page_data_has_one_section_per_tab():
     data = r.page_data([push(1, tlx())], stamp(23), {})
     assert set(data) == {"asof", "branches", "occupancy"}
-    assert all(set(v) == {"main", "lit", "nightly", "pr", "ops", "usage", "bump"} for v in data["branches"].values())
+    assert all(
+        set(v) == {"main", "lit", "nightly", "pr", "fast_full", "ops", "usage", "bump"}
+        for v in data["branches"].values())
 
 
 def test_every_test_step_in_the_gpu_workflows_maps_to_a_group():
