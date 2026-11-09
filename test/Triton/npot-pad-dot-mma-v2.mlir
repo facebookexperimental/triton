@@ -104,15 +104,31 @@ tt.func @chain_96x128(%pq: !tt.ptr<f16>) {
 
 // -----
 
+// K's power-of-two part, 32, holds whole k16 operand tiles.
 // CHECK-LABEL: @dot_k96
-// CHECK: tt.dot {{.*}} : tensor<128x128xf16> * tensor<128x128xf16>
+// CHECK: tt.dot {{.*}} : tensor<128x96xf16> * tensor<96x128xf16>
 tt.func @dot_k96(%pa: !tt.ptr<f16>) {
   %sa = tt.splat %pa : !tt.ptr<f16> -> tensor<128x96x!tt.ptr<f16>>
   %a = tt.load %sa : tensor<128x96x!tt.ptr<f16>>
   %b = arith.constant dense<1.0> : tensor<96x128xf16>
   %c = arith.constant dense<0.0> : tensor<128x128xf32>
-  // expected-remark @+1 {{NPOT K is not yet supported on mma.sync}}
   %d = tt.dot %a, %b, %c : tensor<128x96xf16> * tensor<96x128xf16> -> tensor<128x128xf32>
+  tt.return
+}
+
+// -----
+
+// Loaded as fp8, f16 operands take k32 tiles, which 48's 16 can't hold.
+// CHECK-LABEL: @dot_k48_fp8
+// CHECK: tt.dot {{.*}} : tensor<128x64xf16> * tensor<64x128xf16>
+tt.func @dot_k48_fp8(%pa: !tt.ptr<f8E4M3FN>) {
+  %sa = tt.splat %pa : !tt.ptr<f8E4M3FN> -> tensor<128x48x!tt.ptr<f8E4M3FN>>
+  %a8 = tt.load %sa : tensor<128x48x!tt.ptr<f8E4M3FN>>
+  %a = tt.fp_to_fp %a8 : tensor<128x48xf8E4M3FN> -> tensor<128x48xf16>
+  %b = arith.constant dense<1.0> : tensor<48x128xf16>
+  %c = arith.constant dense<0.0> : tensor<128x128xf32>
+  // expected-remark @+1 {{NPOT dot is not yet supported on mma.sync with K 48, whose power-of-two part 16 is less than k32}}
+  %d = tt.dot %a, %b, %c : tensor<128x48xf16> * tensor<48x128xf16> -> tensor<128x128xf32>
   tt.return
 }
 
