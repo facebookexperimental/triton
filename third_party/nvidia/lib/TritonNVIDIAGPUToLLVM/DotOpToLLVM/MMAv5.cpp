@@ -545,6 +545,7 @@ struct DotConversion {
   int numBitsPerElementA;
   int numBitsPerElementB;
   StringRef kind;
+  ttng::Tcgen05Kind tcgen05Kind;
   GetInstOperandsFn getInstOperands;
 };
 
@@ -626,6 +627,12 @@ convertDotImpl(const LLVMTypeConverter &typeConverter,
   unsigned mmaSizeM = tensorMemAttr.getBlockM();
   // Account for subslices
   unsigned mmaSizeN = std::min<unsigned>(tensorMemAttr.getBlockN(), N);
+  // An NPOT N is issued in the tiles its verifier admitted.
+  if (!llvm::isPowerOf2_32(N))
+    mmaSizeN = ttng::getTcgen05InstrN(
+        op.tcgen05Kind, aInTmem, ttng::getMmaOperandSmemAttrs(bTensorTy),
+        twoCTAs, mmaSizeM, tensorMemAttr.getBlockN(), N,
+        bTensorTy.getElementTypeBitWidth());
   // Checked in the verifier
   assert(mmaSizeN <= 256 &&
          "The maximum size of an MMA instruction is 128x256");
@@ -861,6 +868,7 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
 
   dot.numBitsPerElementA = aTensorTy.getElementTypeBitWidth();
   dot.numBitsPerElementB = bTensorTy.getElementTypeBitWidth();
+  dot.tcgen05Kind = *ttng::getTcgen05Kind(srcElementTy);
 
   dot.getInstOperands = [&](const DotConversion::InstDesc &desc, int, int,
                             int) -> MMAInstOperands {
@@ -969,6 +977,7 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
   unsigned mmaSizeN = tensorMemAttr.getBlockN();
 
   dot.blockK = blockK; // K is not split across CTAs
+  dot.tcgen05Kind = ttng::Tcgen05Kind::BlockScaled;
 
   bool hasFp4PaddedOperand = isFp4Padded(aTensorTy) || isFp4Padded(bTensorTy);
 
