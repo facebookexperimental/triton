@@ -117,3 +117,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+// Manual K=96 FP6: a single 16x16x128 step lowers natively; each lane's
+// 32 codes are packed into 24 bytes (vector<6xi32> operands).
+// CHECK-LABEL: mfma_scaled_fp6_k96
+#linear = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp = [[0, 0], [16, 0]], block = []}>
+#linear1 = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp = [[16, 0], [0, 0]], block = []}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 128], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @mfma_scaled_fp6_k96(%arg0: tensor<32x128xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>, %arg1: tensor<32x4xi8, #linear>, %arg2: tensor<128x32xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>, %arg3: tensor<32x4xi8, #linear1>, %arg4: tensor<32x32xf32, #mma>) {
+    // CHECK: rocdl.mfma.scale.f32.16x16x128.f8f6f4
+    // CHECK-SAME: fp6_e3m2, fp6_e2m3
+    %dots = tt.dot_scaled %arg0 scale %arg1, %arg2 scale %arg3, %arg4 lhs = e2m3 rhs = e3m2 {fastMath = false} : tensor<32x128xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>, tensor<32x4xi8, #linear> * tensor<128x32xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>, tensor<32x4xi8, #linear1> -> tensor<32x32xf32, #mma>
+    tt.return
+  }
+}

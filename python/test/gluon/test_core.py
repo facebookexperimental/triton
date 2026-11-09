@@ -25,7 +25,7 @@ from triton._internal_testing import (
     is_hopper,
 )
 from triton.compiler import max_shared_mem
-from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor, fp8e8m0_to_float32
+from triton.tools.mxfp import MXFP4Tensor, MXFP6Tensor, MXScaleTensor, fp8e8m0_to_float32
 from triton.experimental import gluon
 from triton.experimental.gluon import language as ttgl
 from triton.experimental.gluon.language.nvidia.ampere import async_copy, mma_v2
@@ -2419,6 +2419,64 @@ def test_amd_mfma_scaled(M, N, K, a_type, b_type, cd_regclass, has_scale, device
 
     assert 'v_mfma_scale_f32_16x16x128_f8f6f4' in compiled.asm['amdgcn']
     _check_cd_regclass_pins(compiled.asm['llir'], cd_regclass)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires CDNA4")
+def test_amd_mfma_scaled_fp6(device='cuda'):
+    # Manual K=96 (one 16x16x128 step) lowers natively; wider FP6 decomposes.
+    M, N, K = 32, 32, 128
+
+    @gluon.jit
+    def kernel(out_ptr, a_ptr, b_ptr, a_scale_ptr, b_scale_ptr,
+               M: ttgl.constexpr, N: ttgl.constexpr, K: ttgl.constexpr):
+        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True,
+                                                             warps_per_cta=[2, 2])
+        a_load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [8, 8], [4, 1], [1, 0])
+        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=16)
+        a_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(a_layout, [M, K // 32])
+        b_load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [32, 2], [4, 1], [1, 0])
+        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=16)
+        b_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(b_layout, [N, K // 32])
+
+        a_offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, a_load_layout))[:, None]
+        a_offs_k = ttgl.arange(0, K, layout=ttgl.SliceLayout(0, a_load_layout))[None, :]
+        a = ttgl.amd.cdna4.buffer_load(a_ptr, a_offs_m * K + a_offs_k)
+        a = ttgl.convert_layout(a, a_layout)
+        b_offs_k = ttgl.arange(0, K, layout=ttgl.SliceLayout(1, b_load_layout))[:, None]
+        b_offs_n = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, b_load_layout))[None, :]
+        b = ttgl.amd.cdna4.buffer_load(b_ptr, b_offs_k * N + b_offs_n)
+        b = ttgl.convert_layout(b, b_layout)
+        a_scale_offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, a_scale_layout))[:, None]
+        a_scale_offs_k = ttgl.arange(0, K // 32, layout=ttgl.SliceLayout(0, a_scale_layout))[None, :]
+        a_scale = ttgl.amd.cdna4.buffer_load(a_scale_ptr, a_scale_offs_m * (K // 32) + a_scale_offs_k)
+        b_scale_offs_n = ttgl.arange(0, N, layout=ttgl.SliceLayout(1, b_scale_layout))[:, None]
+        b_scale_offs_k = ttgl.arange(0, K // 32, layout=ttgl.SliceLayout(0, b_scale_layout))[None, :]
+        b_scale = ttgl.amd.cdna4.buffer_load(b_scale_ptr, b_scale_offs_n * (K // 32) + b_scale_offs_k)
+        zero = ttgl.zeros([M, N], dtype=ttgl.float32, layout=mfma_layout)
+        c = ttgl.amd.cdna4.mfma_scaled(a, a_scale, "e2m3", b, b_scale, "e3m2", zero)
+        c = c.to(ttgl.bfloat16)
+        out_offs_m = ttgl.arange(0, M)[:, None]
+        out_offs_n = ttgl.arange(0, N)[None, :]
+        ttgl.amd.cdna4.buffer_store(c, out_ptr, out_offs_m * N + out_offs_n)
+
+    torch.manual_seed(0)
+    a_mx = MXFP6Tensor(size=(M, K), device=device, e=2).random()
+    # No padding: operands carry one code per byte; the ScaledMFMA
+    # lowering dense-packs each lane's 32 codes into 24 bytes.
+    a = a_mx.data
+    # B operand for the kernel is [K, N]: transpose its codes.
+    b_codes = MXFP6Tensor(size=(N, K), device=device, e=3).random()
+    b = b_codes.data.T.contiguous()
+    b_ref_t = b_codes.to(torch.float32)
+    a_scale_mx = MXScaleTensor(size=(M, K // 32)).random(1 / 32, 32)
+    b_scale_mx = MXScaleTensor(size=(N, K // 32)).random(1 / 32, 32)
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    compiled = kernel[(1, )](out, a, b, a_scale_mx.data.to(device), b_scale_mx.data.to(device), M, N, K, num_warps=4)
+    a_ref = a_mx.to(torch.float32) * a_scale_mx.to(torch.float32).repeat_interleave(32, dim=1).to(device)
+    b_ref = b_ref_t * b_scale_mx.to(torch.float32).repeat_interleave(32, dim=1).to(device)
+    torch.testing.assert_close(out.float(), a_ref @ b_ref.T, rtol=2e-2, atol=5.0)
+    assert 'v_mfma_scale_f32_16x16x128_f8f6f4' in compiled.asm['amdgcn']
+    assert 'v_mfma_f32_16x16x32_bf16' not in compiled.asm['amdgcn']
 
 
 def test_math_fast_expf():
