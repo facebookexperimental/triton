@@ -10,7 +10,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %a = arith.constant dense<1.0> : tensor<32x32xf8E4M3FN, #bl>
     %b = arith.constant dense<1.0> : tensor<32x96xf8E4M3FN, #p>
     %c = arith.constant dense<0.0> : tensor<32x96xf32, #p>
-    // expected-error @+2 {{NPOT dot is not yet supported on hip:gfx950}}
+    // expected-error @+2 {{NPOT dot_scaled is not yet supported on MFMA at an NPOT M or N}}
     // expected-error @+1 {{failed to legalize operation 'tt.dot_scaled' that was explicitly marked illegal}}
     %d = tt.dot_scaled %a, %b, %c lhs = e4m3 rhs = e4m3 {fastMath = false} : tensor<32x32xf8E4M3FN, #bl> * tensor<32x96xf8E4M3FN, #p> -> tensor<32x96xf32, #p>
     tt.return
