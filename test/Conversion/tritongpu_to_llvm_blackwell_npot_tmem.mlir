@@ -138,3 +138,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// 96 MN rows of scales move as three 32-row chunks at scale columns 0, 1 and
+// 2; the next 4-byte K word starts 4 columns on, as in the 128-row cover.
+#s = #ttg.linear<{register = [[0, 1], [0, 2], [0, 0], [0, 0], [0, 4], [32, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[0, 0], [0, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [96, 8]}>
+#scales = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", ttg.tensor_memory_size = 128 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @st_scales_96x8_4w
+  // CHECK: tcgen05.st.sync.aligned.32x32b.x1.b32 [$1 + 0]
+  // CHECK: tcgen05.st.sync.aligned.32x32b.x1.b32 [$1 + 4]
+  // CHECK: tcgen05.st.sync.aligned.32x32b.x1.b32 [$1 + 1]
+  // CHECK: tcgen05.st.sync.aligned.32x32b.x1.b32 [$1 + 5]
+  // CHECK: tcgen05.st.sync.aligned.32x32b.x1.b32 [$1 + 2]
+  // CHECK: tcgen05.st.sync.aligned.32x32b.x1.b32 [$1 + 6]
+  // CHECK-NOT: tcgen05.st
+  tt.func public @st_scales_96x8_4w() {
+    %true = arith.constant true
+    %s = arith.constant dense<1> : tensor<96x8xi8, #s>
+    %sm = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<96x8xi8, #scales, #ttng.tensor_memory, mutable, 128x8>
+    ttng.tmem_store %s, %sm, %true : tensor<96x8xi8, #s> -> !ttg.memdesc<96x8xi8, #scales, #ttng.tensor_memory, mutable, 128x8>
+    tt.return
+  }
+}

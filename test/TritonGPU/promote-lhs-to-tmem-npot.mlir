@@ -1,4 +1,4 @@
-// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -tritongpu-promote-lhs-to-tmem | FileCheck %s
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -tritongpu-promote-lhs-to-tmem | FileCheck %s
 
 // An NPOT K A goes to tensor memory in blocks of its pow2 alloc shape.
 #tl = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 96]}>
@@ -60,6 +60,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %t1 = ttng.tc_gen5_mma %p_sh, %v, %o[%t], %true, %true : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory>, !ttg.memdesc<128x64xf16, #shared, #ttg.shared_memory>, !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable>
       scf.yield %t1 : !ttg.async.token
     }
+    tt.return
+  }
+}
+
+// -----
+
+// A K=96 step on sm_103a reads A from shared memory, so A stays there.
+#tl = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 48]}>
+#a = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+#b = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 8}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#scales = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @keep_k96
+  // CHECK: %[[A:.*]] = ttg.local_alloc
+  // CHECK-NOT: ttng.tmem_alloc
+  // CHECK: ttng.tc_gen5_mma_scaled %[[A]],
+  tt.func public @keep_k96(%b: !ttg.memdesc<48x128xi8, #b, #ttg.shared_memory>, %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, %s: !ttg.memdesc<128x6xf8E4M3FN, #scales, #ttng.tensor_memory, 128x8>) {
+    %true = arith.constant true
+    %a = arith.constant dense<1> : tensor<128x48xi8, #tl>
+    %a_sh = ttg.local_alloc %a : (tensor<128x48xi8, #tl>) -> !ttg.memdesc<128x48xi8, #a, #ttg.shared_memory>
+    ttng.tc_gen5_mma_scaled %a_sh, %b, %c, %s, %s, %true, %true lhs = e2m1 rhs = e2m1 : !ttg.memdesc<128x48xi8, #a, #ttg.shared_memory>, !ttg.memdesc<48x128xi8, #b, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x6xf8E4M3FN, #scales, #ttng.tensor_memory, 128x8>, !ttg.memdesc<128x6xf8E4M3FN, #scales, #ttng.tensor_memory, 128x8>
     tt.return
   }
 }
