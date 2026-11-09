@@ -122,3 +122,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     tt.return
   }
 }
+
+// -----
+
+// A multibuffered dense NPOT tile: each 128x96 page is allocated as exactly
+// 128x96 elements, so its pages are exact and disjoint.
+#nv = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+// REGION: remark: Buffers: [0, 24576]
+// REGION-NEXT: test.region_name = "dpage0"
+// REGION: remark: Buffers: [24576, 24576]
+// REGION-NEXT: test.region_name = "dpage1"
+// CHECK-LABEL: dpage0 vs dpage0
+// CHECK: dpage0 vs dpage1: alias=false
+// CHECK: dpage0 vs dpages: alias=true, lhs_contains_rhs=false, rhs_contains_lhs=true
+// CHECK: dpage1 vs dpages: alias=true, lhs_contains_rhs=false, rhs_contains_lhs=true
+// OFF: shape must have power-of-2 and non-zero dimensions; got 3, 128, 96
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 73728 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @dense_pages() {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %buf = ttg.local_alloc {allocation.offset = 0 : i32, test.region_name = "dpages"} : () -> !ttg.memdesc<3x128x96xf16, #nv, #smem, mutable>
+    %p0 = ttg.memdesc_index %buf[%c0] : !ttg.memdesc<3x128x96xf16, #nv, #smem, mutable> -> !ttg.memdesc<128x96xf16, #nv, #smem, mutable>
+    %p1 = ttg.memdesc_index %buf[%c1] : !ttg.memdesc<3x128x96xf16, #nv, #smem, mutable> -> !ttg.memdesc<128x96xf16, #nv, #smem, mutable>
+    %0 = ttg.local_load %p0 {test.region_name = "dpage0"} : !ttg.memdesc<128x96xf16, #nv, #smem, mutable> -> tensor<128x96xf16>
+    %1 = ttg.local_load %p1 {test.region_name = "dpage1"} : !ttg.memdesc<128x96xf16, #nv, #smem, mutable> -> tensor<128x96xf16>
+    tt.return
+  }
+}
