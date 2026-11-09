@@ -33,6 +33,30 @@ def amd_packed_dot2(lhs, rhs, acc, input_dtype: tl.constexpr, _semantic=None):
 
 
 @tl.builtin
+def amd_concat(sources, shape, _semantic=None):
+    """Concatenate register fragments without cross-thread movement."""
+    sources = tuple(sources)
+    assert sources, "sources must not be empty"
+    assert all(isinstance(source, tl.tensor) for source in sources), "every source must be a tensor"
+    shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
+    source_shape = [tl._unwrap_if_constexpr(dim) for dim in sources[0].shape]
+    assert len(shape) == len(source_shape), f"shape must have rank {len(source_shape)}, got {len(shape)}"
+    assert all(isinstance(dim, int) and dim > 0 for dim in shape), "shape must contain positive constexpr integers"
+    assert all(
+        list(source.shape) == list(sources[0].shape) and source.dtype == sources[0].dtype
+        for source in sources[1:]), "sources must have identical shapes and dtypes"
+    source_elements = 1
+    result_elements = 1
+    for source_dim, result_dim in zip(source_shape, shape):
+        assert result_dim % source_dim == 0, "every result dimension must be a multiple of the source dimension"
+        source_elements *= source_dim
+        result_elements *= result_dim
+    assert result_elements == len(sources) * source_elements, "result shape must contain every source exactly once"
+    handle = _semantic.builder.create_amd_concat([source.handle for source in sources], shape)
+    return tl.tensor(handle, tl.block_type(sources[0].dtype, shape))
+
+
+@tl.builtin
 def extract_slice(source, shape, offsets, _semantic=None):
     """Extract an aligned register slice without cross-thread movement.
 

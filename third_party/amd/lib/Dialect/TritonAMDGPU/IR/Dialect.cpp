@@ -1101,6 +1101,14 @@ LogicalResult ConcatOp::verify() {
     return emitError()
            << "Element types of sources and destination must match.";
 
+  auto srcEncoding = srcType.getEncoding();
+  auto dstEncoding = dstType.getEncoding();
+  if (!srcEncoding != !dstEncoding)
+    return emitError(
+        "sources and result must both have an encoding, or neither");
+  if (!srcEncoding)
+    return success();
+
   auto linearLayoutSrc = triton::gpu::toLinearLayout(srcType);
   auto linearLayoutDst = triton::gpu::toLinearLayout(dstType);
   auto ctx = srcType.getContext();
