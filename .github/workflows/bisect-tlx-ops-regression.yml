@@ -351,9 +351,9 @@ jobs:
                   measurements[role] = json.loads(path.read_text())
               elif os.environ[f'{role.upper()}_BUILD'] == 'failure':
                   measurements[role] = {'status': 'build_failed'}
-          pathlib.Path('measurements.json').write_text(json.dumps(measurements))
+          pathlib.Path('evidence/measurements.json').write_text(json.dumps(measurements))
           subprocess.run(['python3', 'tooling/.github/scripts/tlx_ops_bench_bisect_round.py', 'advance',
-                          '--state', 'evidence/prepared.json', '--measurements', 'measurements.json',
+                          '--state', 'evidence/prepared.json', '--measurements', 'evidence/measurements.json',
                           '--out', 'evidence/state.json'], check=True)
           PY
       - name: Report completed cases
@@ -391,7 +391,7 @@ jobs:
           path: |
             evidence/state.json
             evidence/inputs.json
-            measurements.json
+            evidence/measurements.json
       - name: Dispatch the next round without holding a GPU runner
         env:
           GH_TOKEN: ${{ github.token }}
