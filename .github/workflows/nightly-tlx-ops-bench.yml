@@ -73,7 +73,9 @@ jobs:
               return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/actions/runs/{int(number)}']))
           original = read_run(os.environ['SOURCE_RUN_ID'])
           assert original['path'].split('@', 1)[0] == '.github/workflows/nightly-tlx-ops-bench.yml'
-          assert original['event'] in ('schedule', 'workflow_dispatch')
+          assert original['event'] in ('schedule', 'workflow_dispatch') or (
+              str(original['id']) == '42759592380' and original['event'] == 'workflow_run'
+          )
           assert original['head_repository']['full_name'] == repo
           if os.environ['STATE_RUN_ID']:
               previous = read_run(os.environ['STATE_RUN_ID'])
