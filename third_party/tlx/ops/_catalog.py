@@ -289,6 +289,16 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="moe",
+        arch="gfx950",
+        variant="heuristic",
+        impl="triton.tlx.ops.kernels.moe.gfx950:moe",
+        dtypes=_BF16,
+        # Tiles have no K/N tail; 256-wide N tiles fall back to 128 when they do not divide I or H.
+        accepts=lambda d: all(d[dim] > 0 and d[dim] % 128 == 0 for dim in ("K", "I", "H")),
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="mm_torchtlx",
         arch="sm90",
         variant="inductor_hopper_gemm_ws",
