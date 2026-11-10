@@ -1,4 +1,5 @@
 import os
+import re
 import pytest
 import shutil
 import sys
@@ -198,6 +199,55 @@ def test_amd_codegen_options_restored(option, capfd, fresh_knobs):
     options[option] = False
     compiler.compile_amdgpu(source, compiler.amd.get_target_triple("gfx942"), "gfx942", "", **options)
     assert not capfd.readouterr().err
+
+
+def test_amd_codegen_explicit_flag_values_restored(fresh_knobs):
+    compiler = pytest.importorskip("triton.backends.amd.compiler")
+    try:
+        compiler._load_amd_codegen(compiler.get_amd_codegen_path())
+    except OSError:
+        pytest.skip("AMD code-generation library is unavailable")
+
+    source = '''
+declare i32 @llvm.amdgcn.workitem.id.x()
+declare <16 x float> @llvm.amdgcn.mfma.scale.f32.32x32x64.f8f6f4.v8i32.v8i32(
+    <8 x i32>, <8 x i32>, <16 x float>, i32 immarg, i32 immarg, i32 immarg, i32, i32 immarg, i32)
+
+define amdgpu_kernel void @mfma_kernel(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %out) {
+  %lane = call i32 @llvm.amdgcn.workitem.id.x()
+  %a_ptr = getelementptr <8 x i32>, ptr addrspace(1) %a, i32 %lane
+  %b_ptr = getelementptr <8 x i32>, ptr addrspace(1) %b, i32 %lane
+  %a_value = load <8 x i32>, ptr addrspace(1) %a_ptr, align 8
+  %b_value = load <8 x i32>, ptr addrspace(1) %b_ptr, align 8
+  %seed = call <16 x float> asm sideeffect "", "=a,0"(<16 x float> zeroinitializer)
+  %result = call <16 x float> @llvm.amdgcn.mfma.scale.f32.32x32x64.f8f6f4.v8i32.v8i32(
+      <8 x i32> %a_value, <8 x i32> %b_value, <16 x float> %seed,
+      i32 0, i32 0, i32 0, i32 127, i32 0, i32 127)
+  %committed = call <16 x float> asm sideeffect "", "=a,0"(<16 x float> %result)
+  %out_ptr = getelementptr <16 x float>, ptr addrspace(1) %out, i32 %lane
+  store <16 x float> %committed, ptr addrspace(1) %out_ptr, align 16
+  ret void
+}
+'''
+
+    def emit(flags):
+        return compiler.compile_amdgpu(source, compiler.amd.get_target_triple("gfx950"), "gfx950", "", flags=flags,
+                                       enable_fp_fusion=True, disable_optimization=False, canonicalize_gep=False,
+                                       disabled_passes="", dump_ir=False, enable_timing=False)
+
+    baseline = emit([])
+    flag = "amdgpu-mfma-vgpr-form"
+    opcode = "v_mfma_scale_f32_32x32x64_f8f6f4"
+    assert opcode in baseline
+    for value in (flag, f"{flag}=true"):
+        assert emit([value]) == baseline
+    agpr = emit([f"{flag}=false"])
+    assert opcode in agpr
+    baseline_vgprs = re.search(r"\.amdhsa_next_free_vgpr\s+(\d+)", baseline)
+    agpr_vgprs = re.search(r"\.amdhsa_next_free_vgpr\s+(\d+)", agpr)
+    assert baseline_vgprs is not None and agpr_vgprs is not None
+    assert int(agpr_vgprs.group(1)) < int(baseline_vgprs.group(1))
+    assert emit([]) == baseline
 
 
 def test_amd_codegen_reports_invalid_llvm_ir(fresh_knobs):
