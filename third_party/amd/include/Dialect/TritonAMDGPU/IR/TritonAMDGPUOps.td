@@ -1189,11 +1189,10 @@ def ScheduledMfmaScaledOp : TT_AMDGPU_Op<"scheduled_mfma_scaled"> {
     without extracting it first. A two-step K128 chain reuses the word and
     adds two to each selector for its second K64 instruction.
 
-    Only the transient contract is supported today: `accumulator_role` must
-    be "transient", `resident_operand` must be "none", and
-    `accumulator_register_class` must be "auto"; persistent scaled chains
-    and their register pinning are not modeled yet. Completion is
-    represented separately by `mfma_commit`, as in `scheduled_mfma`:
+    Packed-storage I8 operands use the transient contract. Typed FP8 dot
+    operands also support persistent accumulator chains and explicit AGPR or
+    VGPR placement, matching `scheduled_mfma`. Completion is represented
+    separately by `mfma_commit`:
     `mfma_commit` accepts the scaled 16x16x128 and 32x32x64 accumulator
     layouts (and live scaled i8 dot operands) and applies the modeled
     scaled drain wait at the boundary.

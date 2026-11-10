@@ -2150,6 +2150,9 @@ public:
     auto aTy = cast<RankedTensorType>(op.getA().getType());
     auto bTy = cast<RankedTensorType>(op.getB().getType());
     auto accTy = cast<RankedTensorType>(op.getAcc().getType());
+    if (!aTy.getElementType().isInteger(8))
+      return rewriter.notifyMatchFailure(
+          op, "typed operands use the scaled-dot scheduled lowering");
     bool packedScales = cast<RankedTensorType>(op.getAScale().getType())
                             .getElementType()
                             .isInteger(32);

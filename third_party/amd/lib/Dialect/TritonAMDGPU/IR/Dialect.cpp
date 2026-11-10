@@ -1705,6 +1705,8 @@ LogicalResult ScheduledMfmaOp::verify() {
   return success();
 }
 
+static LogicalResult verifyTypedScheduledMfmaScaled(ScheduledMfmaScaledOp op);
+
 LogicalResult ScheduledMfmaScaledOp::verify() {
   namespace ttg = mlir::triton::gpu;
 
@@ -1744,6 +1746,10 @@ LogicalResult ScheduledMfmaScaledOp::verify() {
   } else if (aSelector || bSelector) {
     return emitOpError("i8 scales do not accept packed byte selectors");
   }
+  auto aTy = getA().getType();
+  auto bTy = getB().getType();
+  if (!aTy.getElementType().isInteger(8) || !bTy.getElementType().isInteger(8))
+    return verifyTypedScheduledMfmaScaled(*this);
   if (getAccumulatorRole() != "transient")
     return emitOpError(
         "accumulator_role must be \"transient\": persistent scaled MFMA "
@@ -1756,8 +1762,6 @@ LogicalResult ScheduledMfmaScaledOp::verify() {
         "accumulator_register_class must be \"auto\" for scaled scheduled "
         "MFMA");
 
-  auto aTy = getA().getType();
-  auto bTy = getB().getType();
   auto accTy = getAcc().getType();
   auto resultTy = getResult().getType();
   int64_t rank = accTy.getRank();
@@ -1913,6 +1917,115 @@ LogicalResult ScheduledMfmaScaledOp::verify() {
                        "steps)")
            << "\nExpected layout: " << expectedBScale.toString()
            << "\nGot layout: " << actualBScale.toString();
+  return success();
+}
+
+static LogicalResult verifyTypedScheduledMfmaScaled(ScheduledMfmaScaledOp op) {
+  namespace ttg = mlir::triton::gpu;
+
+  if (failed(verifyWaveUniformExecution(op.getOperation())))
+    return failure();
+  FailureOr<unsigned> targetVersion =
+      getScheduledMfmaVersion(op.getOperation());
+  if (failed(targetVersion))
+    return failure();
+
+  auto aTy = op.getA().getType();
+  auto bTy = op.getB().getType();
+  auto accTy = op.getAcc().getType();
+  int64_t rank = accTy.getRank();
+  if ((rank != 2 && rank != 3) || aTy.getRank() != rank ||
+      bTy.getRank() != rank || op.getAScale().getType().getRank() != rank ||
+      op.getBScale().getType().getRank() != rank)
+    return op.emitOpError(
+        "requires data, scales, and accumulator of matching rank 2 or 3");
+  if (!accTy.getElementType().isF32() || op.getResult().getType() != accTy)
+    return op.emitOpError(
+        "requires an F32 accumulator and matching result type");
+  auto aScaleTy = op.getAScale().getType();
+  auto bScaleTy = op.getBScale().getType();
+  auto validScaleType = [](Type type) {
+    return type.isInteger(8) || type.isInteger(32);
+  };
+  if (!validScaleType(aScaleTy.getElementType()) ||
+      !validScaleType(bScaleTy.getElementType()))
+    return op.emitOpError("requires I8 or packed I32 microscale tensors");
+  bool packedScales = aScaleTy.getElementType().isInteger(32);
+  if (packedScales != bScaleTy.getElementType().isInteger(32))
+    return op.emitOpError("requires matching scale packing");
+  auto aSelector = op.getAScaleSelectorAttr();
+  auto bSelector = op.getBScaleSelectorAttr();
+  if (packedScales) {
+    for (RankedTensorType type : {aScaleTy, bScaleTy}) {
+      Attribute encoding = unwrapTlxWrappers(type.getEncoding());
+      if (!isa_and_nonnull<ttg::LinearEncodingTrait>(encoding))
+        return op.emitOpError("packed I32 scales require linear layouts");
+      auto resolved = RankedTensorType::get(type.getShape(),
+                                            type.getElementType(), encoding);
+      if (ttg::getTotalElemsPerThread(resolved) != 1)
+        return op.emitOpError("packed I32 scales require one dword per lane");
+    }
+  }
+  if (aTy.getShape()[rank - 2] != accTy.getShape()[rank - 2] ||
+      bTy.getShape()[rank - 1] != accTy.getShape()[rank - 1] ||
+      aTy.getShape()[rank - 1] != bTy.getShape()[rank - 2])
+    return op.emitOpError(
+        "operand and accumulator matrix shapes are inconsistent");
+
+  auto mfma = dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(
+      unwrapTlxWrappers(accTy.getEncoding()));
+  if (!mfma || mfma.getRank() != rank || mfma.getVersion() != 4 ||
+      !mfma.hasUnitTilesPerWarp() || mfma.getElementBitWidth() != 32)
+    return op.emitOpError(
+        "requires a CDNA4 F32 MFMA accumulator with unit tiles per wave");
+  if (*targetVersion != 0 && *targetVersion != 4)
+    return op.emitOpError("requires a CDNA4 target");
+  ArrayRef<unsigned> instr = mfma.getInstrShape();
+  if (instr != ArrayRef<unsigned>({32, 32, 64}) &&
+      instr != ArrayRef<unsigned>({16, 16, 128}))
+    return op.emitOpError(
+        "requires a native scaled 32x32x64 or 16x16x128 MFMA layout");
+
+  if (packedScales) {
+    auto isFp8 = [](StringRef format) {
+      return format == "e4m3" || format == "e5m2";
+    };
+    auto resolvedC =
+        RankedTensorType::get(accTy.getShape(), accTy.getElementType(), mfma);
+    int64_t kFragments = aTy.getShape().back() / 64;
+    int64_t maxBaseSelector = kFragments == 2 ? 1 : 3;
+    if (instr != ArrayRef<unsigned>({32, 32, 64}) || !isFp8(op.getAFormat()) ||
+        !isFp8(op.getBFormat()) || (kFragments != 1 && kFragments != 2) ||
+        bTy.getShape()[rank - 2] != 64 * kFragments ||
+        aSelector.getInt() > maxBaseSelector ||
+        bSelector.getInt() > maxBaseSelector ||
+        ttg::getTotalElemsPerThread(resolvedC) != 16)
+      return op.emitOpError(
+          "packed I32 scales require one or two FP8 32x32x64 MFMA K "
+          "fragments per wave with selectors addressable in one dword");
+  }
+
+  auto aDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+      unwrapTlxWrappers(aTy.getEncoding()));
+  auto bDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+      unwrapTlxWrappers(bTy.getEncoding()));
+  if (!aDot || aDot.getOpIdx() != 0 || aDot.getParent() != mfma ||
+      aDot.getKWidth() != 16)
+    return op.emitOpError(
+        "operand A must use the matching opIdx=0, kWidth=16 dot layout");
+  if (!bDot || bDot.getOpIdx() != 1 || bDot.getParent() != mfma ||
+      bDot.getKWidth() != 16)
+    return op.emitOpError(
+        "operand B must use the matching opIdx=1, kWidth=16 dot layout");
+  if (op.getAccumulatorRole() != "transient" &&
+      op.getAccumulatorRole() != "persistent")
+    return op.emitOpError(
+        "accumulator_role must be \"transient\" or \"persistent\"");
+  if (op.getAccumulatorRegisterClass() != "auto" &&
+      op.getAccumulatorRegisterClass() != "agpr" &&
+      op.getAccumulatorRegisterClass() != "vgpr")
+    return op.emitOpError("accumulator_register_class must be \"auto\", "
+                          "\"agpr\", or \"vgpr\"");
   return success();
 }
 
