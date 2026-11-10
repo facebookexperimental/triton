@@ -1,171 +1,60 @@
-name: Verify H100 varlen attention recovery
+name: H100 measured result summaries
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  prepare:
+  summary:
     runs-on: ubuntu-latest
-    outputs:
-      before: ${{ steps.spec.outputs.before }}
-      after: ${{ steps.spec.outputs.after }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Validate the recovery pair and preserve the benchmark
-        id: spec
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-          import subprocess
-          before = '3a048730c50b60f25813ac993aa1be7632983fdc'
-          after = '02c860a6a4de34279b76a90dc16c97b054f61db1'
-          subprocess.run(['git', 'merge-base', '--is-ancestor', before, after], check=True)
-          subprocess.run(['git', 'merge-base', '--is-ancestor', after, 'origin/main'], check=True)
-          assert subprocess.check_output(['git', 'rev-parse', after + '^'], text=True).strip() == before
-          spec = {'op': 'flash_attn_varlen', 'direction': 'fwd', 'platform': 'h100', 'space': 'heuristic',
-                  'key': 'flash_attn_varlen/sm90/bfloat16/8x2160x2160x2x128xFalsex1024x1024',
-                  'good_sha': before, 'bad_sha': after}
-          evidence = pathlib.Path('evidence')
-          evidence.mkdir()
-          (evidence / 'prepared.json').write_text(json.dumps({'spec': spec}))
-          with (evidence / 'benchmark.tar').open('wb') as out:
-              subprocess.run(['git', 'archive', after, 'python/test/tlx_benchmark'], stdout=out, check=True)
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              out.write(f'before={before}\nafter={after}\n')
-          PY
-      - uses: actions/upload-artifact@v4
-        with:
-          name: recovery-spec
-          path: evidence/*
-
-  before-wheel:
-    needs: prepare
-    permissions:
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/build.yml
-    with:
-      ref: ${{ needs.prepare.outputs.before }}
-      build_id: recovery-before
-
-  after-wheel:
-    needs: prepare
-    permissions:
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/build.yml
-    with:
-      ref: ${{ needs.prepare.outputs.after }}
-      build_id: recovery-after
-
-  measure:
-    needs: [prepare, before-wheel, after-wheel]
-    runs-on: linux-gcp-h100
-    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.workflow_sha }}
           path: tooling
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - name: Download the completed recovery test specification
+        uses: actions/download-artifact@v4
         with:
           name: recovery-spec
-          path: evidence
-      - name: Verify wheel identities and unpack the fixed benchmark
-        env:
-          BEFORE: ${{ needs.before-wheel.outputs.commit }}
-          AFTER: ${{ needs.after-wheel.outputs.commit }}
+          path: recovery
+          run-id: 42787309659
+          github-token: ${{ github.token }}
+      - name: Download the completed recovery measurements
+        uses: actions/download-artifact@v4
+        with:
+          name: recovery-measurements
+          path: recovery
+          run-id: 42787309659
+          github-token: ${{ github.token }}
+      - name: Download the completed bisect specification
+        uses: actions/download-artifact@v4
+        with:
+          name: perf-bisect-prepared
+          path: bisect
+          run-id: 42781020562
+          github-token: ${{ github.token }}
+      - name: Download the completed bisect result
+        uses: actions/download-artifact@v4
+        with:
+          name: perf-bisect-state
+          path: bisect
+          run-id: 42781020562
+          github-token: ${{ github.token }}
+      - name: Write the existing measured results to the Actions summary
         run: |
           python3 - <<'PY'
           import json
           import os
           import pathlib
-          import subprocess
-          spec = json.loads(pathlib.Path('evidence/prepared.json').read_text())['spec']
-          assert spec['good_sha'] == os.environ['BEFORE']
-          assert spec['bad_sha'] == os.environ['AFTER']
-          harness = pathlib.Path(os.environ['RUNNER_TEMP']) / 'recovery-harness'
-          harness.mkdir()
-          subprocess.run(['tar', '-xf', 'evidence/benchmark.tar', '-C', str(harness)], check=True)
+          recovery = pathlib.Path('recovery')
+          (recovery / 'measurements.json').write_text(json.dumps({role: json.loads((recovery / f'{role}.json').read_text()) for role in ('good', 'bad')}))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('These summaries use artifacts from completed GPU runs. This run performed no builds or GPU measurements.\n\n')
+              summary.write('[Original recovery run](https://github.com/facebookexperimental/triton/actions/runs/42787309659) and [original bisect run](https://github.com/facebookexperimental/triton/actions/runs/42781020562).\n\n')
           PY
-      - uses: ./tooling/.github/actions/setup-test-env
-        with:
-          backend: cuda
-          torch: torch==2.14.0
-          torch-index-url: https://download.pytorch.org/whl/cu130
-          packages: numpy pytest torchao
-          rocm-lib-path: ''
-      - run: sudo ldconfig
-      - name: Install wheel before the recovery bundle
-        uses: ./tooling/.github/actions/install-prebuilt-triton
-        with:
-          wheel-url: ${{ needs.before-wheel.outputs.wheel_url }}
-          wheel-filename: ${{ needs.before-wheel.outputs.wheel_filename }}
-          wheel-sha256: ${{ needs.before-wheel.outputs.wheel_sha256 }}
-      - name: Measure before recovery
-        run: |
-          python tooling/.github/scripts/tlx_ops_bench_measure_round.py --prepared evidence/prepared.json --role good --source tooling --harness "${RUNNER_TEMP}/recovery-harness/python/test/tlx_benchmark" --output measurements
-          rm -f "${RUNNER_TEMP}"/prebuilt-wheel/*.whl
-      - name: Install wheel after the recovery bundle
-        uses: ./tooling/.github/actions/install-prebuilt-triton
-        with:
-          wheel-url: ${{ needs.after-wheel.outputs.wheel_url }}
-          wheel-filename: ${{ needs.after-wheel.outputs.wheel_filename }}
-          wheel-sha256: ${{ needs.after-wheel.outputs.wheel_sha256 }}
-      - name: Measure after recovery
-        run: |
-          python tooling/.github/scripts/tlx_ops_bench_measure_round.py --prepared evidence/prepared.json --role bad --source tooling --harness "${RUNNER_TEMP}/recovery-harness/python/test/tlx_benchmark" --output measurements
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: recovery-measurements
-          path: measurements/*.json
-          if-no-files-found: error
-
-  report:
-    needs: measure
-    if: always() && !cancelled() && needs.measure.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: recovery-measurements
-          path: evidence
-      - name: Append the paired recovery measurements to issue 4887
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-          import subprocess
-          before = json.loads(pathlib.Path('evidence/good.json').read_text())
-          after = json.loads(pathlib.Path('evidence/bad.json').read_text())
-          assert before['status'] == after['status'] == 'ok'
-          assert before['gpu_uuid'] == after['gpu_uuid'] and before['gpu_uuid']
-          baseline = 330.69093014942086
-          recovered = before['tflops'] < 0.9 * baseline and after['tflops'] >= 0.9 * baseline
-          run_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
-          verdict = 'Paired H100 measurement confirms recovery across PR #4639.' if recovered else 'The paired test did not establish recovery across PR #4639.'
-          gain = 100 * (after['tflops'] / before['tflops'] - 1)
-          lines = [verdict, f'[Measured run and evidence]({run_url}).',
-                   f"Before the bundle: {before['tflops']:.2f} TFLOP/s. After: {after['tflops']:.2f} TFLOP/s. Change: {gain:+.1f}%.",
-                   'Both wheels ran the same BF16 varlen-attention case on one H100 GPU, with two accepted low-CV measurements per wheel.',
-                   '[Recovery bundle PR #4639](https://github.com/facebookexperimental/triton/pull/4639) is commit [02c860a6](https://github.com/facebookexperimental/triton/commit/02c860a6a4de34279b76a90dc16c97b054f61db1). The before wheel is its immediate parent. This comparison does not isolate one upstream patch within the bundle.']
-          subprocess.run(['gh', 'api', 'repos/facebookexperimental/triton/issues/4887/comments', '--method', 'POST', '--input', '-'],
-                         input=json.dumps({'body': '\n\n'.join(lines)}), text=True, check=True)
-          PY
+          python3 tooling/.github/scripts/tlx_ops_bench_bisect_summary.py --prepared recovery/prepared.json --measurements recovery/measurements.json --recovery-baseline 330.69093014942086
+          python3 tooling/.github/scripts/tlx_ops_bench_bisect_summary.py --prepared bisect/prepared.json --state bisect/state.json --measurements bisect/measurements.json
