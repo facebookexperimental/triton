@@ -140,10 +140,28 @@ jobs:
       contents: read
       issues: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: tooling
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: recovery-spec
+          path: evidence
       - uses: actions/download-artifact@v4
         with:
           name: recovery-measurements
           path: evidence
+      - name: Write the Actions recovery summary
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          evidence = pathlib.Path('evidence')
+          (evidence / 'measurements.json').write_text(json.dumps({role: json.loads((evidence / f'{role}.json').read_text()) for role in ('good', 'bad')}))
+          PY
+          python3 tooling/.github/scripts/tlx_ops_bench_bisect_summary.py --prepared evidence/prepared.json --measurements evidence/measurements.json --recovery-baseline 330.69093014942086
       - name: Append the paired recovery measurements to issue 4887
         env:
           GH_TOKEN: ${{ github.token }}
