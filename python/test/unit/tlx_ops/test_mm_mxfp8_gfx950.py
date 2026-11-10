@@ -114,15 +114,6 @@ def test_mm_mxfp8_gfx950_default_space_and_blocked_parity():
     assert torch.equal(natural_out, blocked_out)
 
 
-def test_mm_mxfp8_gfx950_square_config_and_unaligned_fallback():
-    from triton.tlx.ops.kernels.mm_mxfp8.gfx950 import _pick_regular_config
-
-    assert _pick_regular_config(1024, 1024, 1024, quad_safe=True) == (64, 64, 3, 4, False)
-    assert _pick_regular_config(2048, 2048, 2048, quad_safe=True) == (64, 128, 2, 4, False)
-    assert _pick_regular_config(4096, 4096, 4096, quad_safe=True) == (256, 256, 1, 8, True)
-    assert _pick_regular_config(4096, 4096, 4096, quad_safe=False) == (128, 128, 2, 4, False)
-
-
 def test_mm_mxfp8_gfx950_rejects_invalid_scales_and_output():
     from triton.tlx.ops import InvalidInput, mm_mxfp8
 
@@ -147,3 +138,137 @@ def test_mm_mxfp8_gfx950_unaligned_operand_uses_generic_fallback():
     assert unaligned_a.data_ptr() % 16 != 0
     out = mm_mxfp8(unaligned_a, a_scale, b, b_scale, space="heuristic")
     _check_sample(out, (unaligned_a, a_scale, b, b_scale), scale_bytes)
+
+
+def _mfma_preshuffled(scale, repeat):
+    rows, groups = scale.shape
+    logical_row_chunk = repeat * 32
+    physical_row_chunk = ((repeat + 1) // 2) * 64
+    padded_rows = (rows + logical_row_chunk - 1) // logical_row_chunk * physical_row_chunk
+    padded = torch.full((padded_rows, groups), 127, dtype=torch.uint8, device=scale.device)
+    logical_rows = torch.arange(rows, device=scale.device)
+    physical_rows = (logical_rows // logical_row_chunk * physical_row_chunk + logical_rows % logical_row_chunk)
+    padded[physical_rows] = scale
+    return (padded.view(padded_rows // 64, 2, 32, groups // 4, 2, 2).permute(0, 3, 5, 2, 4,
+                                                                             1).contiguous().view(padded_rows, groups))
+
+
+@pytest.mark.parametrize(
+    "shape,a_repeat,b_repeat",
+    [
+        ((1024, 36864, 1024), 2, 3),
+        ((1024, 6144, 67584), 4, 3),
+        ((2048, 1024, 24576), 2, 4),
+    ],
+)
+def test_mm_mxfp8_gfx950_mfma_preshuffled_scales_are_bitwise_equal(shape, a_repeat, b_repeat):
+    from triton.tlx.ops import mm_mxfp8
+
+    blocked_inputs, _ = _inputs(*shape, sf_layout="cublas_blocked")
+    expected = mm_mxfp8(*blocked_inputs, sf_layout="cublas_blocked")
+    natural_inputs, scale_bytes = _inputs(*shape, sf_layout="natural")
+    a, _, b, _ = natural_inputs
+    scale_a, scale_b = scale_bytes
+    actual = mm_mxfp8(
+        a,
+        _mfma_preshuffled(scale_a, a_repeat),
+        b,
+        _mfma_preshuffled(scale_b, b_repeat),
+        sf_layout="mfma_preshuffled",
+    )
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "shape,a_repeat,b_repeat",
+    [
+        ((85, 22464, 1024), 2, 1),
+        ((85, 3584, 25600), 2, 1),
+        ((85, 3072, 18048), 2, 1),
+        ((2048, 22464, 1024), 2, 3),
+        ((2048, 15360, 3584), 4, 3),
+        ((2048, 3584, 25600), 4, 3),
+        ((2048, 3072, 18048), 4, 3),
+        ((1024, 8192, 3072), 2, 2),
+        ((2048, 3072, 15360), 4, 3),
+        ((1024, 6144, 22656), 4, 3),
+        ((2048, 6144, 22656), 4, 3),
+        ((2048, 3072, 12416), 2, 3),
+        ((2048, 32768, 6144), 4, 4),
+    ],
+)
+def test_mm_mxfp8_gfx950_production_preshuffled_scales(shape, a_repeat, b_repeat):
+    from triton.tlx.ops import mm_mxfp8
+
+    inputs, scale_bytes = _inputs(*shape, sf_layout="natural")
+    a, _, b, _ = inputs
+    scale_a, scale_b = scale_bytes
+    out = mm_mxfp8(
+        a,
+        _mfma_preshuffled(scale_a, a_repeat),
+        b,
+        _mfma_preshuffled(scale_b, b_repeat),
+        sf_layout="mfma_preshuffled",
+    )
+    for cols in (slice(0, 128), slice(-128, None)):
+        reference = _reference_slice(inputs, scale_bytes, slice(None), cols)
+        torch.testing.assert_close(out[:, cols].float(), reference, rtol=0.03, atol=0.5)
+
+
+def test_mm_mxfp8_gfx950_long_k_split12():
+    from triton.tlx.ops import mm_mxfp8
+
+    inputs, scale_bytes = _inputs(1024, 1024, 159744, sf_layout="cublas_blocked")
+    out = mm_mxfp8(*inputs, sf_layout="cublas_blocked")
+    _check_sample(out, inputs, scale_bytes)
+
+
+def test_mm_mxfp8_gfx950_compact_blocked_route():
+    from triton.tlx.ops import mm_mxfp8
+
+    inputs, scale_bytes = _inputs(1024, 36864, 1024, sf_layout="cublas_blocked")
+    out = mm_mxfp8(*inputs, sf_layout="cublas_blocked")
+    _check_sample(out, inputs, scale_bytes)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1024, 32768, 6144),
+        (2048, 8192, 3072),
+    ],
+)
+def test_mm_mxfp8_gfx950_balanced_route(shape):
+    from triton.tlx.ops import mm_mxfp8
+
+    inputs, scale_bytes = _inputs(*shape, sf_layout="cublas_blocked")
+    out = mm_mxfp8(*inputs, sf_layout="cublas_blocked")
+    _check_sample(out, inputs, scale_bytes)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (85, 23040, 1792),
+        (85, 22464, 1024),
+        (128, 23040, 1792),
+        (128, 22464, 1024),
+        (85, 3584, 25600),
+        (128, 3584, 25600),
+        (85, 3072, 18048),
+        (128, 15360, 3584),
+        (2048, 23040, 1792),
+        (2048, 22464, 1024),
+        (2048, 14976, 1024),
+        (2048, 3584, 25600),
+    ],
+)
+@pytest.mark.parametrize("sf_layout", ["natural", "cublas_blocked"])
+def test_mm_mxfp8_gfx950_production_scale_contracts(shape, sf_layout):
+    from triton.tlx.ops import mm_mxfp8
+
+    inputs, scale_bytes = _inputs(*shape, sf_layout=sf_layout)
+    out = mm_mxfp8(*inputs, sf_layout=sf_layout)
+    for cols in (slice(0, 128), slice(-128, None)):
+        reference = _reference_slice(inputs, scale_bytes, slice(None), cols)
+        torch.testing.assert_close(out[:, cols].float(), reference, rtol=0.03, atol=0.5)

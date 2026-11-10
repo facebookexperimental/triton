@@ -230,6 +230,7 @@ CATALOG: tuple[OpSpec, ...] = (
         # Row strides are 128-aligned by the M/N/K contract; only the bases vary.
         accepts=lambda d: all(ptr % 16 == 0 for ptr in d["base_ptrs"]),
         requires=frozenset({"tma", "tmem"}),
+        default_space="full",
     ),
     OpSpec(
         op="mm_mxfp8",

@@ -142,7 +142,7 @@ import inspect
 import sys
 from triton.tlx import ops
 assert 'triton.tlx.ops.kernels.mm_mxfp8.sm100' not in sys.modules
-assert str(inspect.signature(ops.mm_mxfp8)) == "(a, a_scale, b, b_scale, *, out=None, sf_layout='natural', space='full')"
+assert str(inspect.signature(ops.mm_mxfp8)) == "(a, a_scale, b, b_scale, *, out=None, sf_layout='natural', space=None)"
 assert 'mm_mxfp8' in ops.__all__
 """
     subprocess.run([sys.executable, "-c", script], check=True)
