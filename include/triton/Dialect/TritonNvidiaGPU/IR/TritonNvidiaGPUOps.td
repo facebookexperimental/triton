@@ -1221,7 +1221,8 @@ def TTNG_TCGen5MMAOp
       TTG_MemDescType:$d, Optional<TTG_AsyncToken>:$acc_dep, I1:$useD, I1:$pred,
       Variadic<TTG_MemDescType>:$barriers, Variadic<I1>:$barrier_preds,
       UnitAttr:$is_async, UnitAttr:$two_ctas, UnitAttr:$multicast,
-      UnitAttr:$is_unsigned);
+      UnitAttr:$is_unsigned, OptionalAttr<TT_ScaleDotElemTypeAttr>:$a_type,
+      OptionalAttr<TT_ScaleDotElemTypeAttr>:$b_type);
   let results = (outs Optional<TTG_AsyncToken>:$token);
 
   let builders = [OpBuilder<(ins "Type":$token, "Value":$a, "Value":$b,
@@ -1229,7 +1230,9 @@ def TTNG_TCGen5MMAOp
       CArg<"bool", "false">:$two_ctas, CArg<"bool", "false">:$multicast,
       CArg<"ValueRange", "{}">:$barriers,
       CArg<"ValueRange", "{}">:$barrier_preds, CArg<"bool", "false">:$is_async,
-      CArg<"bool", "false">:$is_unsigned)>];
+      CArg<"bool", "false">:$is_unsigned,
+      CArg<"::mlir::triton::ScaleDotElemTypeAttr", "{}">:$a_type,
+      CArg<"::mlir::triton::ScaleDotElemTypeAttr", "{}">:$b_type)>];
 
   let assemblyFormat = [{
     $a `,` $b `,` $d `` custom<Token>($acc_dep, type($token)) `,` $useD`,`
@@ -1238,6 +1241,10 @@ def TTNG_TCGen5MMAOp
     qualified(type($d)) (`,` qualified(type($barriers))^)?
   }];
 
+  let extraClassDeclaration = [{
+    Type getAElementType();
+    Type getBElementType();
+  }];
   let hasVerifier = 1;
 }
 

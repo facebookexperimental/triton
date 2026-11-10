@@ -5294,8 +5294,7 @@ static void swapTransposedLocalAllocs(triton::FuncOp &funcOp) {
     auto nonTransposedEncoding = ttg::NVMMASharedEncodingAttr::get(
         encoding.getContext(), encoding.getSwizzlingByteWidth(),
         /*transposed=*/false, encoding.getElementBitWidth(),
-        encoding.getFp4Padded(), encoding.getCGALayout(),
-        encoding.getFp6Padded());
+        encoding.getPadding(), encoding.getCGALayout());
 
     // New alloc type: non-transposed encoding.
     auto newAllocType = ttg::MemDescType::get(

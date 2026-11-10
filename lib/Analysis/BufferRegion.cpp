@@ -594,7 +594,7 @@ unsigned getMemDescSize(ttg::MemDescType ty) {
            elSize;
   }
 
-  auto allocation = ttg::toLinearLayout(allocShape, encoding);
+  auto allocation = ttg::toLinearLayoutIgnoringPadding(allocShape, encoding);
   auto view = allocation.pseudoinvert();
   auto logicalDims = llvm::to_vector(view.getInDimNames());
   bool npotView = hasNpotLayoutExtent(shape);
