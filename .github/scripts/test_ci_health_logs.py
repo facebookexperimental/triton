@@ -1,21 +1,24 @@
 import ci_health_logs as lg
+import pytest
 
 
 def step(name, conclusion, start, end):
     return {"name": name, "conclusion": conclusion, "started_at": start, "completed_at": end}
 
 
-def test_checkout_identity_excludes_tooling_and_unscoped_hashes():
+@pytest.mark.parametrize('quoted', [False, True])
+def test_checkout_identity_excludes_tooling_and_unscoped_hashes(quoted):
+    q = "'" if quoted else ""
     job = {
         "steps": [
             step("Checkout build tooling", "success", "2026-10-16T00:00:00Z", "2026-10-16T00:01:00Z"),
             step("Checkout", "success", "2026-10-16T00:02:00Z", "2026-10-16T00:03:00Z")
         ]
     }
-    log = ("2026-10-16T00:00:30Z [command]/usr/bin/git log -1 --format=%H\n"
-           f"2026-10-16T00:00:30Z {'a' * 40}\n"
-           "2026-10-16T00:02:30Z [command]/usr/bin/git log -1 --format=%H\n"
-           f"2026-10-16T00:02:30.1234567Z {'b' * 40}\n"
+    log = (f"2026-10-16T00:00:30Z [command]/usr/bin/git log -1 --format={q}%H{q}\n"
+           f"2026-10-16T00:00:30Z {q}{'a' * 40}{q}\n"
+           f"2026-10-16T00:02:30Z [command]/usr/bin/git log -1 --format={q}%H{q}\n"
+           f"2026-10-16T00:02:30.1234567Z {q}{'b' * 40}{q}\n"
            f"2026-10-16T00:04:00Z {'c' * 40}\n")
     assert lg.checkout_sha(job, log) == "b" * 40
     assert lg.checkout_sha(job, log.split("2026-10-16T00:02:30Z")[0]) is None

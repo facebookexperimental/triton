@@ -157,3 +157,18 @@ jobs:
       - name: Verify touched-test coverage across platforms
         if: needs.select.outputs.build == 'true'
         run: python3 .github/scripts/fast_tests.py verify --evidence "${RUNNER_TEMP}/fast-evidence"
+
+  full:
+    needs: [build, result]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.result.result == 'success' }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      issues: write
+    uses: ./.github/workflows/gpu-tests.yml
+    with:
+      commit: ${{ needs.build.outputs.commit }}
+      wheel_url: ${{ needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
