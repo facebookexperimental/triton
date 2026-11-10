@@ -2295,21 +2295,6 @@ Attribute NvidiaMmaEncodingAttr::parse(AsmParser &parser, Type type) {
       instrShape);
 }
 
-LogicalResult NvidiaMmaEncodingAttr::verify(
-    function_ref<InFlightDiagnostic()> emitError, unsigned versionMajor,
-    unsigned versionMinor, ArrayRef<unsigned> warpsPerCTA,
-    CGAEncodingAttr CGALayout, ArrayRef<unsigned> instrShape) {
-  if (versionMajor == 1) {
-    return emitError()
-           << "Volta (versionMajor = 1) is deprecated and no longer supported";
-  }
-  if (versionMajor != 2 && versionMajor != 3) {
-    return emitError() << "versionMajor must be 2 (Ampere) or 3 (Hopper), got "
-                       << versionMajor;
-  }
-  return success();
-}
-
 void NvidiaMmaEncodingAttr::print(AsmPrinter &printer) const {
   printer << "<{"
           << "versionMajor = " << getVersionMajor()
@@ -2336,6 +2321,16 @@ NvidiaMmaEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                               unsigned versionMajor, unsigned,
                               ArrayRef<unsigned> warpsPerCTA, CGAEncodingAttr,
                               ArrayRef<unsigned> instrShape) {
+  // Upstream #11969: Volta (versionMajor = 1) is deprecated and no longer
+  // supported; only Ampere (2) and Hopper (3) are accepted.
+  if (versionMajor == 1) {
+    return emitError()
+           << "Volta (versionMajor = 1) is deprecated and no longer supported";
+  }
+  if (versionMajor != 2 && versionMajor != 3) {
+    return emitError() << "versionMajor must be 2 (Ampere) or 3 (Hopper), got "
+                       << versionMajor;
+  }
   // toLinearLayout turns the instruction M and N into identity1D repeat
   // counts, which must be powers of two.
   if (instrShape.size() < 2)
