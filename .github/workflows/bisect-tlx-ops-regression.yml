@@ -34,7 +34,6 @@ jobs:
       issues: read
     outputs:
       ready: ${{ steps.plan.outputs.ready }}
-      bad_sha: ${{ steps.plan.outputs.bad_sha }}
     steps:
       - name: Verify the evidence producer
         env:
@@ -85,7 +84,7 @@ jobs:
           if specs:
               assert len({s['bad_sha'] for s in specs}) == 1
               with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-                  out.write(f"ready=true\nbad_sha={specs[0]['bad_sha']}\n")
+                  out.write("ready=true\n")
           PY
       - uses: actions/upload-artifact@v4
         if: steps.plan.outputs.ready == 'true'
@@ -104,23 +103,43 @@ jobs:
       - name: Checkout bisect tooling
         uses: actions/checkout@v4
         with:
+          ref: main
           path: tooling
-      - name: Checkout candidate source and pinned benchmark
+          persist-credentials: false
+      - name: Checkout main history for candidate builds
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.bad_sha }}
+          ref: main
           path: candidate
           fetch-depth: 0
-          submodules: recursive
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: perf-bisect-specs
           path: evidence
-      - name: Preserve the benchmark outside the bisected checkout
+      - name: Validate main commits and preserve the benchmark
         run: |
-          mkdir -p "${RUNNER_TEMP}/perf-bisect-harness"
-          git -C candidate archive HEAD python/test/tlx_benchmark \
-            | tar -x -C "${RUNNER_TEMP}/perf-bisect-harness"
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+
+          specs = json.loads(pathlib.Path('evidence/specs.json').read_text())
+          for spec in specs:
+              good, bad = spec['good_sha'], spec['bad_sha']
+              assert re.fullmatch(r'[0-9a-f]{40}', good) and re.fullmatch(r'[0-9a-f]{40}', bad)
+              subprocess.run(['git', '-C', 'candidate', 'merge-base', '--is-ancestor', good, bad], check=True)
+              subprocess.run(['git', '-C', 'candidate', 'merge-base', '--is-ancestor', bad, 'origin/main'], check=True)
+          assert len({spec['bad_sha'] for spec in specs}) == 1
+          archive = pathlib.Path(os.environ['RUNNER_TEMP']) / 'perf-bisect-benchmark.tar'
+          harness = pathlib.Path(os.environ['RUNNER_TEMP']) / 'perf-bisect-harness'
+          harness.mkdir()
+          with archive.open('wb') as out:
+              subprocess.run(['git', '-C', 'candidate', 'archive', specs[0]['bad_sha'], 'python/test/tlx_benchmark'], stdout=out, check=True)
+          subprocess.run(['tar', '-xf', str(archive), '-C', str(harness)], check=True)
+          PY
       - name: Set up fixed test environment
         uses: ./tooling/.github/actions/setup-test-env
         with:

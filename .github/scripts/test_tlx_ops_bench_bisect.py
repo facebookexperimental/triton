@@ -70,3 +70,19 @@ def test_a_step_builds_without_the_repository_git_bisect_exports(tmp_path, monke
         json.dumps({"source": str(tmp_path), "gpu_uuid": "GPU-x", "cutoff": 1, "log": str(tmp_path / "log")}))
     assert bisect.step_main(str(spec)) == bisect.SKIP
     assert seen == {"git_dir": None}
+
+
+def test_candidate_code_has_private_caches_and_no_action_credentials(tmp_path, monkeypatch):
+    credentials = ("ACTIONS_RUNTIME_TOKEN", "ACTIONS_RUNTIME_URL", "ACTIONS_CACHE_URL", "ACTIONS_RESULTS_URL",
+                   "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL", "GH_TOKEN", "GITHUB_TOKEN",
+                   "GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT", "GITHUB_STATE", "GITHUB_STEP_SUMMARY")
+    for key in credentials:
+        monkeypatch.setenv(key, "credential")
+    monkeypatch.setenv("TRITON_HOME", "/shared/triton")
+    monkeypatch.setenv("UV_CACHE_DIR", "/shared/uv")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    bisect.isolate_environment(tmp_path)
+    assert all(key not in os.environ for key in credentials)
+    assert os.environ["TRITON_HOME"] == str(tmp_path / "triton-home")
+    assert os.environ["UV_CACHE_DIR"] == str(tmp_path / "uv-cache")
+    assert os.environ["TMPDIR"] == str(tmp_path / "tmp")

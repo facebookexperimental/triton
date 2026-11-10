@@ -251,6 +251,18 @@ def load_spec(path):
     return spec
 
 
+def isolate_environment(work):
+    os.environ["TRITON_HOME"] = str(work / "triton-home")
+    os.environ["UV_CACHE_DIR"] = str(work / "uv-cache")
+    temporary = work / "tmp"
+    temporary.mkdir(exist_ok=True)
+    os.environ["TMPDIR"] = str(temporary)
+    for name in ("ACTIONS_RUNTIME_TOKEN", "ACTIONS_RUNTIME_URL", "ACTIONS_CACHE_URL", "ACTIONS_RESULTS_URL",
+                 "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL", "GH_TOKEN", "GITHUB_TOKEN",
+                 "GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT", "GITHUB_STATE", "GITHUB_STEP_SUMMARY"):
+        os.environ.pop(name, None)
+
+
 def bisect(args, result, deadline):
     spec = load_spec(args.spec)
     result.update({
@@ -275,6 +287,7 @@ def bisect(args, result, deadline):
         "key": spec["key"], "direction": spec["direction"], "space": spec.get("space"), "log":
         str(work / "steps.jsonl"), "path": str(work / "step.json")
     }
+    isolate_environment(work)
     Path(step["path"]).write_text(json.dumps(step))
     endpoints = {}
     for name, sha in (("good", good), ("bad", bad)):
