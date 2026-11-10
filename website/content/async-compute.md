@@ -183,10 +183,32 @@ the register allocator still chooses physical registers.
 | `tlx.amd_register_resident` | gfx950 | Require every tensor group to be allocatable together in native register tuples. |
 
 Related operations are `tlx.extract_slice`, which selects an aligned register
-fragment without cross-thread movement; `tlx.rematerialized_range`, which
-recreates inexpensive coordinates near a use; and `tlx.amd_sched_barrier`,
-which prevents selected AMD instruction classes from crossing a source
-boundary. None of these operations is a workgroup barrier or memory fence.
+fragment without cross-thread movement; `tlx.amd_concat`, which assembles
+compatible register fragments without cross-thread movement;
+`tlx.rematerialized_range`, which recreates inexpensive coordinates near a
+use; and `tlx.amd_sched_barrier`, which prevents selected AMD instruction
+classes from crossing a source boundary. None of these operations is a
+workgroup barrier or memory fence.
+
+### `tlx.amd_concat`
+
+```python
+combined = tlx.amd_concat((fragment_0, fragment_1), [128, 128])
+```
+
+Assembles equally shaped register fragments into the requested logical shape.
+Sources fill the destination as a row-major grid of source tiles, with the
+last logical dimension varying fastest. All sources must have identical
+shapes, dtypes, and compatible distributed layouts. Every destination extent
+must be a multiple of the corresponding source extent, and the destination
+must contain each source exactly once.
+
+The source and destination layouts must assign corresponding values to the
+same CTA, wave, and lane. Under that contract, `amd_concat` only changes the
+logical register-fragment view: it does not move values across threads. Use it
+instead of a generic concatenation when native fragments already satisfy that
+physical-layout contract. Incompatible layouts are rejected during
+compilation rather than repaired with cross-lane permutations.
 
 ### `tlx.amd_dot`
 
