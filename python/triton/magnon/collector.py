@@ -29,7 +29,6 @@ import os
 import pickle
 import re
 
-from triton.backends.nvidia.compiler import get_ptxas
 from triton.runtime.jit import _compile_iq_state, _compile_iq_suppress_competition
 
 from . import ptx_launch
@@ -116,7 +115,10 @@ def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
             if isinstance(path, tuple) and len(path) == 1 and path[0] < len(names):
                 constexpr_names.add(names[path[0]])
 
-        ptxas = get_ptxas(kernel.metadata.target.arch)
+        # Imported here so a backend API change fails open inside this try, not at import time.
+        from triton.backends.nvidia.compiler import get_ptxas_for_arch
+
+        ptxas = get_ptxas_for_arch(kernel.metadata.target.arch)
         blobs = {}
         spec = ptx_launch.build_spec(ptx, kernel.metadata, tuple(grid),
                                      _ordered_args(bound_args, constexpr_names, blobs), ptxas.path, ptxas.version)
