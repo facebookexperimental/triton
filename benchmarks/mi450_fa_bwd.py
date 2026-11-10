@@ -282,10 +282,10 @@ def inspect_assembly(assembly):
 
 
 def compile_kernel(config, artifacts, shape, *, compile_options=None, constants_overrides=None, kernel_fn=None,
-                   signature_overrides=None, compiler_options_fn=None):
+                   signature_overrides=None, compiler_options_fn=None, causal=False):
     kernel_fn = _delayed_bwd_kernel if kernel_fn is None else kernel_fn
     compiler_options_fn = (
-        lambda c: _compiler_options(c, shape[3])) if compiler_options_fn is None else compiler_options_fn
+        lambda c: _compiler_options(c, shape[3], causal)) if compiler_options_fn is None else compiler_options_fn
     constants = dict(HQ=shape[1], HK=shape[2], N=shape[3], SM_SCALE=128**-0.5, BM=config.block_m, BN=config.block_n,
                      NW=config.num_warps, TDM=config.use_tdm, STAGES=config.stages, DELAYED=config.delayed,
                      UNROLL=config.unroll, FRAGMENT_FENCES=config.fragment_fences,
@@ -305,21 +305,22 @@ def compile_kernel(config, artifacts, shape, *, compile_options=None, constants_
         if name in kernel_fn.arg_names:
             constants[name] = getattr(config, field, default)
     if "DQ_SLICES" in kernel_fn.arg_names:
-        constants["DQ_SLICES"] = max(1, shape[3] // config.block_n // 16) if config.cluster_dq else 1
+        constants["DQ_SLICES"] = _dq_slices(config, shape[3], causal)
     for name, field in (("OCC1", "occ1"), ("OCC1_K_BANDS", "occ1_k_bands"), ("OCC1_PREFETCH", "occ1_prefetch"),
                         ("OCC1_SCHED", "occ1_sched"), ("PHASE_IGLP", "phase_iglp"), ("OCC1_DQ_FIRST", "occ1_dq_first"),
                         ("OCC1_LOAD_AFTER_DK", "occ1_load_after_dk"), ("OCC1_PAD_K", "occ1_pad_k")):
         if name in kernel_fn.arg_names:
             constants[name] = getattr(config, field)
     if "CAUSAL" in kernel_fn.arg_names:
-        constants["CAUSAL"] = False
-    # Mirror the fa_backward launch: split dK/dV stores and the tail-split
-    # partition change the epilogue and the pointer signature.
+        constants["CAUSAL"] = causal
+    # Mirror fa_backward and allocate_workspace: split dK/dV stores and the
+    # tail-split partition change the epilogue and the pointer signature, and
+    # OCC1 keeps one FP32 dK/dV partial per Q split for packed dQ and causal.
     b, hq, hk, n = shape
     tail_splits = getattr(config, "tail_splits", 1)
     tail_base, tail_owners = _tail_partition(config, b, hk, n)
     if "SPLIT_KV_STORES" in kernel_fn.arg_names:
-        constants["SPLIT_KV_STORES"] = config.occ1 and config.packed_dq and config.q_splits > 1
+        constants["SPLIT_KV_STORES"] = config.occ1 and (config.packed_dq or causal) and config.q_splits > 1
     if "TAIL_SPLITS" in kernel_fn.arg_names:
         constants.update(TAIL_SPLITS=tail_splits, TAIL_BASE=tail_base, TAIL_OWNERS=tail_owners)
         if tail_splits == 1:
@@ -342,11 +343,12 @@ def compile_kernel(config, artifacts, shape, *, compile_options=None, constants_
     if tail_splits > 1:
         partial_bytes = tail_splits * tail_owners * config.block_n * 128 * 4
     else:
-        partial_bytes = ke * 4 * (config.q_splits if config.occ1 and config.packed_dq else 1)
+        partial_bytes = ke * 4 * (config.q_splits if config.occ1 and (config.packed_dq or causal) else 1)
     split = config.q_splits > 1 or tail_splits > 1
     sizes = dict(Q=qe * 2, K=ke * 2, V=ke * 2, DO=qe * 2, LSE=b * hq * n * 4, Delta=b * hq * n * 4,
-                 DQA=qe * (2 if config.packed_dq else 4) * _dq_slices(config, n), DK=partial_bytes if split else ke * 2,
-                 DV=partial_bytes if split else ke * 2, TAIL_DK=ke * 2, TAIL_DV=ke * 2)
+                 DQA=qe * (2 if config.packed_dq else 4) * _dq_slices(config, n, causal),
+                 DK=partial_bytes if split else ke * 2, DV=partial_bytes if split else ke * 2, TAIL_DK=ke * 2,
+                 TAIL_DV=ke * 2)
     for name in signature:
         if sizes.get(name, 2**31) <= 2**31 - 1:
             attrs[(kernel_fn.arg_names.index(name), )].append(("tt.pointer_range", 32))
@@ -522,13 +524,8 @@ def main():
 
     if args.mode == "compile":
         emit({
-            "mode":
-            "compile", "shape":
-            shape, "config":
-            dataclasses.asdict(config), **compile_kernel(
-                config, args.artifacts, shape, constants_overrides=dict(CAUSAL=True, DQ_SLICES=_dq_slices(
-                    config, shape[3], True)) if args.causal else None, compiler_options_fn=lambda c: _compiler_options(
-                    c, shape[3], args.causal))
+            "mode": "compile", "shape": shape, "config": dataclasses.asdict(config),
+            **compile_kernel(config, args.artifacts, shape, causal=args.causal)
         })
         return
     if not os.environ.get("GPU_LOCK_HELD"):
