@@ -12,6 +12,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/AxisInfo.h"
+#include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -19,9 +20,11 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FormatVariadic.h"
 
 #define DEBUG_TYPE "ttg-utility"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -103,9 +106,31 @@ bool containsPinnedEncoding(Attribute encoding) {
   return pinned;
 }
 
-SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
-                                                const ArrayRef<int64_t> &shape,
-                                                Type eltType, int numWarps) {
+bool hasMmaV3WarpgroupsOnN(ArrayRef<int64_t> shape, int numWarps) {
+  int64_t split = numWarps / 4;
+  return triton::tools::isNpotAllowed() && split > 1 &&
+         !llvm::isPowerOf2_64(shape[0]) && shape[0] % (64 * split) != 0;
+}
+
+std::optional<std::string>
+getWarpPlacementUnsupportedReason(ArrayRef<int64_t> shape,
+                                  ArrayRef<unsigned> warps,
+                                  ArrayRef<unsigned> instrShape) {
+  for (auto [dim, size] : llvm::enumerate(shape)) {
+    int64_t twoPart = LinearLayout::twoPartOf(static_cast<int32_t>(size));
+    if (twoPart % (warps[dim] * LinearLayout::twoPartOf(instrShape[dim])) != 0)
+      return llvm::formatv("NPOT dot is not yet supported with {0} warps of "
+                           "{1} on dim {2}, whose power-of-two part is {3}",
+                           warps[dim], instrShape[dim], dim, twoPart)
+          .str();
+  }
+  return std::nullopt;
+}
+
+SmallVector<unsigned, 3>
+mmaVersionToInstrShape(int version, const ArrayRef<int64_t> &shape,
+                       Type eltType, int numWarps,
+                       function_ref<bool(unsigned)> isLegalN) {
   if (version == 1)
     return {16, 16};
   else if (version == 2) {
@@ -139,12 +164,16 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
     unsigned m = 16;
     unsigned mWarps = std::max<unsigned>(shape[0] / m, 1);
     unsigned nWarps = std::max<unsigned>(numWarps / mWarps, 1);
+    if (hasMmaV3WarpgroupsOnN(shape, numWarps))
+      nWarps = numWarps / 4;
     unsigned maxN = std::max<unsigned>(shape[1] / nWarps, 8);
     for (auto n : validN) {
-      if (shape[1] % n == 0 && n <= maxN) {
+      if (shape[1] % n == 0 && n <= maxN && (!isLegalN || isLegalN(n))) {
         return {m, n, k};
       }
     }
+    if (isLegalN)
+      return mmaVersionToInstrShape(version, shape, eltType, numWarps);
 
     assert(false && "type not supported");
     return {0, 0, 0};
@@ -163,22 +192,10 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
   }
 }
 
-SmallVector<unsigned, 4>
-getOrderFromContiguity(const SmallVector<int64_t> &arr) {
-  SmallVector<unsigned, 4> ret(arr.size());
-  std::iota(ret.begin(), ret.end(), 0);
-  std::reverse(ret.begin(), ret.end());
-  std::stable_sort(ret.begin(), ret.end(),
-                   [&](unsigned x, unsigned y) { return arr[x] > arr[y]; });
-  return ret;
-}
-
 Value getMemAccessPtr(Operation *op) {
   if (auto ld = dyn_cast<triton::LoadOp>(op))
     return ld.getPtr();
-  if (auto atomic = dyn_cast<triton::AtomicRMWOp>(op))
-    return atomic.getPtr();
-  if (auto atomic = dyn_cast<triton::AtomicCASOp>(op))
+  if (auto atomic = dyn_cast<triton::AtomicOpInterface>(op))
     return atomic.getPtr();
   if (auto copy = dyn_cast<triton::gpu::AsyncCopyGlobalToLocalOp>(op))
     return copy.getSrc();
@@ -196,7 +213,13 @@ unsigned getElementBitWidth(RankedTensorType type) {
 }
 
 static std::optional<unsigned>
-getAtomicWriteElementsPerThreadCap(Operation *op) {
+getAtomicElementsPerThreadCap(Operation *op, unsigned bitWidth) {
+  auto moduleOp = op->getParentOfType<ModuleOp>();
+  if (isa<triton::AtomicLoadOp, triton::AtomicStoreOp>(op)) {
+    auto targetInfo = TargetInfoBase::fromModuleOp(moduleOp);
+    return targetInfo ? targetInfo->getMaxAtomicLoadStoreVectorSize(bitWidth)
+                      : 1;
+  }
   if (isa<triton::AtomicCASOp>(op))
     return 1;
 
@@ -208,8 +231,6 @@ getAtomicWriteElementsPerThreadCap(Operation *op) {
   if (elemTy.isInteger() || elemTy.isF64())
     return 1;
 
-  auto moduleOp = op->getParentOfType<ModuleOp>();
-
   if (moduleOp && getAMDArch(moduleOp)) {
     unsigned elemBitwidth = elemTy.getIntOrFloatBitWidth();
     return std::max(1u, 32u / elemBitwidth);
@@ -218,10 +239,8 @@ getAtomicWriteElementsPerThreadCap(Operation *op) {
   if (atomicRmw.getAtomicRmwOp() != RMWOp::FADD)
     return std::nullopt;
 
-  auto targetAttr =
-      moduleOp ? moduleOp->getAttrOfType<StringAttr>(ttg::AttrTargetName)
-               : nullptr;
-  if (!targetAttr || !targetAttr.getValue().starts_with("cuda:"))
+  auto targetInfo = TargetInfoBase::fromModuleOp(moduleOp);
+  if (!targetInfo || !targetInfo->isCuda())
     return std::nullopt;
 
   int computeCapability = getNVIDIAComputeCapability(moduleOp);
@@ -239,15 +258,12 @@ static unsigned getMaxElementsPerThread(Operation *op, unsigned maxVecBits) {
   Value val = getMemAccessPtr(op);
   auto ty = cast<RankedTensorType>(val.getType());
   unsigned elemNumBits = getElementBitWidth(ty);
-  unsigned maxElementsPerThread = maxVecBits / elemNumBits;
   // Some atomic lowerings are narrower than a plain store. TTGIR currently
   // exposes the target architecture but not the PTX version, so we only cap
   // cases that are unambiguous from the available target metadata and the
   // current backend lowering.
-  if (auto atomicCap = getAtomicWriteElementsPerThreadCap(op)) {
-    maxElementsPerThread = std::min(maxElementsPerThread, *atomicCap);
-  }
-  return maxElementsPerThread;
+  return getAtomicElementsPerThreadCap(op, elemNumBits)
+      .value_or(maxVecBits / elemNumBits);
 }
 
 static bool hasDotOperandLayoutUser(Operation *op) {
@@ -447,7 +463,7 @@ std::string GraphDumper::emitEdge(const std::string &srcId,
 
 std::string GraphDumper::emitValueNode(Value value) const {
   NodeInfo info = onValue(value);
-  if (info.find("label") == info.end()) {
+  if (!info.contains("label")) {
     std::string shapeStr = getShapeStr(value.getType());
     if (auto arg = mlir::dyn_cast<BlockArgument>(value))
       info["label"] =
@@ -460,7 +476,7 @@ std::string GraphDumper::emitValueNode(Value value) const {
 
 std::string GraphDumper::emitOperationNode(Operation *op) const {
   NodeInfo info = onOperation(op);
-  if (info.find("label") == info.end())
+  if (!info.contains("label"))
     info["label"] = op->getName().getStringRef().str();
   return emitNode(getUniqueId(op), info);
 }
@@ -705,12 +721,23 @@ static bool isSingleValue(Value value) {
   return true;
 }
 
-Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
-  if (isa<triton::ScanOp>(op)) {
-    // Scan only supports blocked encoding at the moment.
-    if (!isa<triton::gpu::BlockedEncodingAttr>(encoding))
+// Besides Blocked, tt.scan lowers in place the mixed-radix layouts it allows;
+// any other layout keeps its convert.
+static bool isScanEncoding(triton::ScanOp scan, Attribute encoding) {
+  if (isa<triton::gpu::BlockedEncodingAttr>(encoding))
+    return true;
+  auto type = cast<RankedTensorType>(scan.getOperand(0).getType())
+                  .cloneWithEncoding(encoding);
+  return !triton::gpu::isRadix2Encoding(encoding) &&
+         triton::gpu::hasExactLayoutAt(type) &&
+         !scan.getMixedRadixUnsupportedReason(
+             triton::gpu::toLinearLayout(type));
+}
+
+static Attribute inferSrcEncodingAtAnyShape(Operation *op, Attribute encoding) {
+  if (auto scan = dyn_cast<triton::ScanOp>(op))
+    if (!isScanEncoding(scan, encoding))
       return {};
-  }
 
   if (isa<triton::gpu::CastFpOpInterface>(op))
     return {};
@@ -718,7 +745,7 @@ Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
   if (op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>() ||
       op->hasTrait<mlir::OpTrait::SameLoadStoreOperandsAndResultEncoding>() ||
       op->hasTrait<mlir::OpTrait::Elementwise>() ||
-      isa<scf::WhileOp, scf::YieldOp, scf::ConditionOp,
+      isa<triton::BroadcastOp, scf::WhileOp, scf::YieldOp, scf::ConditionOp,
           nvidia_gpu::WarpGroupDotWaitOp>(op)) {
     return encoding;
   }
@@ -743,19 +770,18 @@ Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
   return {};
 }
 
-Attribute inferDstEncoding(Operation *op, Attribute encoding) {
-  if (isa<triton::ScanOp>(op)) {
-    if (!isa<triton::gpu::BlockedEncodingAttr>(encoding))
+static Attribute inferDstEncodingAtAnyShape(Operation *op, Attribute encoding) {
+  if (auto scan = dyn_cast<triton::ScanOp>(op))
+    if (!isScanEncoding(scan, encoding))
       return {};
-  }
   if (isa<triton::gpu::CastFpOpInterface>(op))
     return {};
 
   if (op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>() ||
       op->hasTrait<mlir::OpTrait::SameLoadStoreOperandsAndResultEncoding>() ||
       op->hasTrait<mlir::OpTrait::Elementwise>() ||
-      isa<scf::WhileOp, scf::ForOp, scf::YieldOp, scf::ConditionOp,
-          nvidia_gpu::WarpGroupDotWaitOp>(op))
+      isa<triton::BroadcastOp, scf::WhileOp, scf::ForOp, scf::YieldOp,
+          scf::ConditionOp, nvidia_gpu::WarpGroupDotWaitOp>(op))
     return encoding;
   if (auto reduceOp = dyn_cast<triton::ReduceOp>(op))
     return inferDstEncoding(reduceOp, encoding);
@@ -775,6 +801,33 @@ Attribute inferDstEncoding(Operation *op, Attribute encoding) {
     return inferDstEncoding(fp4ToFp, encoding);
 
   return {};
+}
+
+// RLC can carry a mixed-radix encoding through a reduce onto another extent,
+// e.g. a broadcast, where it isn't exact. Inferring none there keeps the
+// convert.
+static Attribute ifExactLayoutAt(Operation *op, Attribute encoding,
+                                 ValueRange values) {
+  if (!encoding || isa<scf::WhileOp, scf::ForOp, scf::YieldOp, scf::ConditionOp,
+                       nvidia_gpu::WarpGroupDotWaitOp>(op))
+    return encoding;
+  for (Value value : values)
+    if (auto type = dyn_cast<RankedTensorType>(value.getType()))
+      if (!triton::gpu::hasExactLayoutAt(type.cloneWithEncoding(encoding)))
+        return {};
+  return encoding;
+}
+
+Attribute inferSrcEncoding(Operation *op, Attribute encoding) {
+  Attribute srcEncoding = inferSrcEncodingAtAnyShape(op, encoding);
+  if (auto gather = dyn_cast<triton::GatherOp>(op))
+    return ifExactLayoutAt(op, srcEncoding, gather.getIndices());
+  return ifExactLayoutAt(op, srcEncoding, op->getOperands());
+}
+
+Attribute inferDstEncoding(Operation *op, Attribute encoding) {
+  return ifExactLayoutAt(op, inferDstEncodingAtAnyShape(op, encoding),
+                         op->getResults());
 }
 
 bool isExpensiveLoadOrStore(Operation *op) {
@@ -811,28 +864,32 @@ bool isExpensiveLocalLoad(Operation *op) {
   return true;
 }
 
-bool canUseResultEncoding(Operation *op, Attribute targetEncoding) {
+std::optional<SmallVector<OpOperand *>>
+canUseResultEncoding(Operation *op, Attribute targetEncoding) {
   if (auto convert = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
     if (mlir::isa<triton::gpu::NvidiaMmaEncodingAttr>(targetEncoding)) {
       auto srcEncoding = convert.getSrc().getType().getEncoding();
       if (targetEncoding != srcEncoding)
-        return false;
+        return std::nullopt;
+      return SmallVector<OpOperand *>{&convert.getSrcMutable()};
     }
-    return true;
+    return SmallVector<OpOperand *>{};
   }
 
   if (auto reshape = dyn_cast<triton::ReshapeOp>(op)) {
     auto reshapeDstType = reshape.getType();
     RankedTensorType newDstType =
         reshapeDstType.cloneWithEncoding(targetEncoding);
-    return reshape.getAllowReorder() && !reshape.getEfficientLayout() &&
-           !triton::gpu::isExpensiveView(reshape.getSrc().getType(),
-                                         newDstType);
+    if (!reshape.getAllowReorder() || reshape.getEfficientLayout() ||
+        triton::gpu::isExpensiveView(reshape.getSrc().getType(), newDstType))
+      return std::nullopt;
+    return SmallVector<OpOperand *>{&reshape.getSrcMutable()};
   }
-  return isa<triton::gpu::ConvertLayoutOp, arith::ConstantOp,
-             triton::MakeRangeOp, triton::SplatOp, triton::HistogramOp,
-             triton::gpu::LocalAllocOp, triton::gpu::LocalLoadOp,
-             triton::gpu::LocalStoreOp>(op);
+  if (isa<arith::ConstantOp, triton::MakeRangeOp, triton::SplatOp,
+          triton::HistogramOp, triton::gpu::LocalAllocOp,
+          triton::gpu::LocalLoadOp, triton::gpu::LocalStoreOp>(op))
+    return SmallVector<OpOperand *>{};
+  return std::nullopt;
 }
 
 bool canBeRematerialized(Operation *op) {
@@ -850,7 +907,7 @@ bool canBeRematerialized(Operation *op) {
     return !isExpensiveLoadOrStore(op);
   if (isa<ttg::LocalLoadOp>(op))
     return !isExpensiveLocalLoad(op);
-  if (isa<AtomicRMWOp, AtomicCASOp, DotOpInterface>(op))
+  if (isa<AtomicOpInterface, DotOpInterface>(op))
     return false;
   if (auto gather = dyn_cast<GatherOp>(op))
     return !gather.getEfficientLayout();
@@ -1302,8 +1359,17 @@ LogicalResult getConvertBackwardSlice(
         enqueue(definingOp->getOpOperand(0), encoding);
         continue;
       }
-      if (canUseResultEncoding(definingOp, encoding))
+      if (auto fixedOperands = canUseResultEncoding(definingOp, encoding)) {
+        // Another path through the slice must preserve these operand layouts.
+        for (OpOperand *operand : *fixedOperands) {
+          Value src = operand->get();
+          auto srcEncoding =
+              cast<RankedTensorType>(src.getType()).getEncoding();
+          if (failed(updateLayout(src, srcEncoding)))
+            return failure();
+        }
         continue;
+      }
       if (stopPropagation && stopPropagation(definingOp))
         continue;
       if (auto gather = dyn_cast<GatherOp>(definingOp)) {

@@ -574,14 +574,17 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
     # Upstream #11365 ([AMD][LAYOUTS] refine segment computation for DS_READ_B128)
     # retuned getSharedLdStTiles() for CDNA4 at vecBitwidth 128, producing 55
     # s_waitcnt here with unchanged barrier/LDS/mfma structure.
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) in (53, 55, 68)
+    # The LLVM 18f9e623 roll in this diff reschedules waits to 51 here.
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) in (53, 55, 68, 51)
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     assert tuple(map(tuple, compiled.metadata.llvm_fn_attrs)) == _A4W4_8WAVE_LLVM_FN_ATTRS
     assert '"amdgpu-post-sched-strategy"="nop"' in compiled.asm["llir"]
-    assert ".private_segment_fixed_size: 16" in amdgcn or ".private_segment_fixed_size: 20" in amdgcn or ".private_segment_fixed_size: 12" in amdgcn or ".private_segment_fixed_size: 204" in amdgcn
+    # The LLVM 18f9e623 roll in this diff spills further here (private 28,
+    # 6 VGPR spills) with unchanged barrier/LDS/mfma structure.
+    assert ".private_segment_fixed_size: 16" in amdgcn or ".private_segment_fixed_size: 20" in amdgcn or ".private_segment_fixed_size: 12" in amdgcn or ".private_segment_fixed_size: 204" in amdgcn or ".private_segment_fixed_size: 28" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
-    assert ".vgpr_spill_count: 3" in amdgcn or ".vgpr_spill_count: 4" in amdgcn or ".vgpr_spill_count: 2" in amdgcn or ".vgpr_spill_count: 62" in amdgcn
+    assert ".vgpr_spill_count: 3" in amdgcn or ".vgpr_spill_count: 4" in amdgcn or ".vgpr_spill_count: 2" in amdgcn or ".vgpr_spill_count: 62" in amdgcn or ".vgpr_spill_count: 6" in amdgcn
     assert ".agpr_count" not in amdgcn or ".agpr_count:     0" in amdgcn
 
     unrelated = compile_for_gfx950(
@@ -607,13 +610,13 @@ def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
     # s_waitcnt/spill goldens: see test_a4w4_inter_wave_256tile_codegen_gfx950.
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) in (53, 55, 68)
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) in (53, 55, 68, 51)
     assert "s_trap" not in amdgcn
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
-    assert ".private_segment_fixed_size: 16" in amdgcn or ".private_segment_fixed_size: 20" in amdgcn or ".private_segment_fixed_size: 12" in amdgcn or ".private_segment_fixed_size: 204" in amdgcn
+    assert ".private_segment_fixed_size: 16" in amdgcn or ".private_segment_fixed_size: 20" in amdgcn or ".private_segment_fixed_size: 12" in amdgcn or ".private_segment_fixed_size: 204" in amdgcn or ".private_segment_fixed_size: 28" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
-    assert ".vgpr_spill_count: 3" in amdgcn or ".vgpr_spill_count: 4" in amdgcn or ".vgpr_spill_count: 2" in amdgcn or ".vgpr_spill_count: 62" in amdgcn
+    assert ".vgpr_spill_count: 3" in amdgcn or ".vgpr_spill_count: 4" in amdgcn or ".vgpr_spill_count: 2" in amdgcn or ".vgpr_spill_count: 62" in amdgcn or ".vgpr_spill_count: 6" in amdgcn
 
 
 def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_cache):
@@ -636,8 +639,10 @@ def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_c
     # Spill/private goldens admit d26ff26 values; see test_a4w4_inter_wave_256tile_codegen_gfx950.
     # CodeGen built on the Meta LLVM fork core (a6533ab0, based on 1df311a6)
     # spills one VGPR here (private 8).
-    assert ".private_segment_fixed_size: 0" in amdgcn or ".private_segment_fixed_size: 8" in amdgcn or ".private_segment_fixed_size: 16" in amdgcn or ".private_segment_fixed_size: 136" in amdgcn
-    assert ".vgpr_spill_count: 0" in amdgcn or ".vgpr_spill_count: 1" in amdgcn or ".vgpr_spill_count: 3" in amdgcn or ".vgpr_spill_count: 40" in amdgcn
+    # The LLVM 18f9e623 roll in this diff spills further here (private 20,
+    # 4 VGPR spills).
+    assert ".private_segment_fixed_size: 0" in amdgcn or ".private_segment_fixed_size: 8" in amdgcn or ".private_segment_fixed_size: 16" in amdgcn or ".private_segment_fixed_size: 136" in amdgcn or ".private_segment_fixed_size: 20" in amdgcn
+    assert ".vgpr_spill_count: 0" in amdgcn or ".vgpr_spill_count: 1" in amdgcn or ".vgpr_spill_count: 3" in amdgcn or ".vgpr_spill_count: 40" in amdgcn or ".vgpr_spill_count: 4" in amdgcn
 
 
 def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache):
@@ -666,8 +671,10 @@ def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache)
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     # Spill/private goldens admit post-CodeGen-switch values; see test_a4w4_inter_wave_256tile_codegen_gfx950.
-    assert ".private_segment_fixed_size: 0" in amdgcn or ".private_segment_fixed_size: 160" in amdgcn
+    # The LLVM 18f9e623 roll in this diff spills further here (private 32,
+    # 7 VGPR spills).
+    assert ".private_segment_fixed_size: 0" in amdgcn or ".private_segment_fixed_size: 160" in amdgcn or ".private_segment_fixed_size: 32" in amdgcn
     # Upstream #11365 retiled CDNA4 vec128 LDS traffic, shifting SGPR allocation 53 -> 55.
     assert ".sgpr_count:     53" in amdgcn or ".sgpr_count:     55" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
-    assert ".vgpr_spill_count: 0" in amdgcn or ".vgpr_spill_count: 46" in amdgcn
+    assert ".vgpr_spill_count: 0" in amdgcn or ".vgpr_spill_count: 46" in amdgcn or ".vgpr_spill_count: 7" in amdgcn

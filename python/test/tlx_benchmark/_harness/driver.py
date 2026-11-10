@@ -200,6 +200,11 @@ def default_json(bench, suites=None) -> str:
     return f"/tmp/tlx_benchmark/{bench.OP}.{arch()}{suite_suffix}.json"
 
 
+def missing_focus_default(bench, *, synthetic=False, suites=None) -> bool:
+    registry = bench.SHAPE_SUITES
+    return not synthetic and suites is None and registry is not None and arch() not in registry.defaults
+
+
 def _selected_suite_names(bench, suites=None) -> tuple[str, ...]:
     registry = bench.SHAPE_SUITES
     return () if registry is None else registry.selected_suite_names(arch(), suites)
@@ -300,6 +305,19 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     return result
 
 
+def _gpu_usable() -> bool:
+    """Whether this process's GPU context still works. A sticky device error, such
+    as an illegal memory access, breaks it for good: every later GPU call fails
+    with the same error."""
+    import torch
+
+    try:
+        torch.ones(1, device="cuda").sum().item()
+        return True
+    except torch.AcceleratorError:
+        return False
+
+
 def _errored(case: Case, exc: Exception) -> Result:
     result = Result(case=case, status=Status.ERROR)
     result.notes.append(f"{type(exc).__name__}: {exc}")
@@ -371,7 +389,7 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
     results = []
     sampled = set()
     with stable(device_index()) as info:
-        for case in cases:
+        for i, case in enumerate(cases):
             cold = cold_mode == "all" or (cold_mode == "first" and case.direction not in sampled)
             if cold:
                 sampled.add(case.direction)
@@ -379,6 +397,11 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
                 results.append(run_case(bench, case, space=space, cold=cold, latency_mode=latency_mode))
             except Exception as exc:  # a broken case must not hide the others
                 results.append(_errored(case, exc))
+                if not _gpu_usable():
+                    # Every later case would fail with this case's error; report it once.
+                    results[-1].notes.append(
+                        f"{len(cases) - i - 1} later cases not run: this case broke the GPU context")
+                    break
     # The autotune space is part of what a number means: a heuristic-space
     # latency and a full-space latency for the same shape differ by 4x, so two
     # artifacts are only comparable when this matches. Same for the reference --
@@ -460,6 +483,9 @@ def main(bench, argv=None) -> int:
         print(f"device: gpu{device.index} {device.name} "
               f"({'least used' if args.device == 'auto' else 'requested'}, "
               f"{device.memory_used_mib:.0f} MiB in use)")
+    if missing_focus_default(bench, synthetic=args.synthetic, suites=args.suite):
+        print(f"{bench.OP} has no focus inputs configured for {arch()}; nothing measured")
+        return 0
     try:
         if not args.synthetic:
             _selected_suite_names(bench, args.suite)

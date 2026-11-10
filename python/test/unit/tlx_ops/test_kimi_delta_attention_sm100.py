@@ -99,6 +99,71 @@ def test_kimi_delta_attention_fwd(dtype):
     torch.testing.assert_close(out, ref, atol=precision * ref.abs().max().item(), rtol=precision)
 
 
+def _recurrent_reference(q, k, v, g, beta, cu_seqlens, scale):
+    # Token-by-token delta rule in fp32: S <- diag(e^g) S; S += beta k (v - S^T k)^T.
+    # It never exponentiates a cumulative gate, so it is valid for any decay.
+    qf, kf, vf = (x[0].float() for x in (q, k, v))
+    gf = g[0].to(torch.bfloat16).float()
+    betaf = beta[0].float()
+    _, H, D = qf.shape
+    out = torch.empty_like(vf)
+    for sid in range(cu_seqlens.numel() - 1):
+        state = torch.zeros((H, D, D), device=q.device, dtype=torch.float32)
+        for t in range(int(cu_seqlens[sid]), int(cu_seqlens[sid + 1])):
+            state = torch.exp(gf[t])[:, :, None] * state
+            u = vf[t] - torch.einsum("hk,hkv->hv", kf[t], state)
+            state = state + betaf[t][:, None, None] * kf[t][:, :, None] * u[:, None, :]
+            out[t] = scale * torch.einsum("hk,hkv->hv", qf[t], state)
+    return out.unsqueeze(0)
+
+
+def _stress_inputs(case, dtype):
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    h, d = 2, 128
+    # Two sequences, both ending in a partial chunk.
+    cu_seqlens = torch.tensor([0, 300, 300 + 517], device="cuda", dtype=torch.int64)
+    total = int(cu_seqlens[-1])
+
+    def rn(*shape):
+        return torch.randn(*shape, generator=gen, device="cuda", dtype=torch.float32)
+
+    q = F.normalize(rn(1, total, h, d), dim=-1)
+    k = F.normalize(rn(1, total, h, d), dim=-1)
+    v = rn(1, total, h, d)
+    beta = torch.sigmoid(rn(1, total, h))
+    if case == "const2":
+        g = torch.full((1, total, h, d), -2.0, device="cuda")
+    elif case == "const5":
+        g = torch.full((1, total, h, d), -5.0, device="cuda")
+    elif case == "bounded5":
+        # FLA's lower-bound gate: g = -5 * sigmoid(.), g in (-5, 0).
+        g = -5.0 * torch.sigmoid(rn(1, total, h, d))
+    else:
+        assert case == "correlated"
+        # Near-parallel keys (cos ~0.9) with beta ~1 and slow decay make
+        # ||A|| >> 1, where a truncated Neumann inverse breaks down.
+        k = F.normalize(rn(1, 1, h, d) + 0.3 * rn(1, total, h, d), dim=-1)
+        beta = torch.sigmoid(rn(1, total, h) + 4.0)
+        g = -0.05 * F.softplus(rn(1, total, h, d))
+    return q.to(dtype), k.to(dtype), v.to(dtype), g, beta, cu_seqlens
+
+
+@pytest.mark.parametrize("case", ["const2", "const5", "bounded5", "correlated"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
+def test_kimi_delta_attention_fwd_stress(case, dtype):
+    from triton.tlx.ops.kernels.kda.sm100 import kimi_delta_attention_ws
+
+    q, k, v, g, beta, cu_seqlens = _stress_inputs(case, dtype)
+    out, _ = kimi_delta_attention_ws(q, k, v, g, beta, scale=1.0, cu_seqlens=cu_seqlens)
+
+    assert torch.isfinite(out).all()
+    ref = _recurrent_reference(q, k, v, g, beta, cu_seqlens, scale=1.0).to(out.dtype)
+    # Near-collinear keys with beta ~ 1 make (I + A) ill-conditioned, so bf16
+    # rounding of the inverse is amplified; the bound still rules out overflow.
+    precision = 2e-2 if case == "correlated" else REL_PRECISION[dtype]
+    torch.testing.assert_close(out, ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
 def test_kimi_delta_attention_bwd(dtype):
     from triton.tlx.ops import kimi_delta_attention as tlx_kda

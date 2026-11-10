@@ -3,8 +3,11 @@
 
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TargetFeatures.h"
+#include <optional>
 
 namespace mlir::triton::NVIDIA {
+
+void registerTargetInfo();
 
 class TargetInfo : public mlir::triton::TargetInfoBase {
 public:
@@ -23,6 +26,15 @@ public:
   Value getGlobalTimer(RewriterBase &rewriter, Location loc) const override;
 
   StringRef getAtomicSyncScope(MemSyncScope scope) const override;
+
+  unsigned getMaxAtomicLoadStoreVectorSize(unsigned bitWidth) const override;
+
+  Value loadRelaxed(RewriterBase &rewriter, Location loc, Value ptr,
+                    Type valueTy, Value pred,
+                    MemSyncScope scope) const override;
+
+  void storeRelaxed(RewriterBase &rewriter, Location loc, Value ptr,
+                    Value value, Value pred, MemSyncScope scope) const override;
 
   void barrier(Location loc, RewriterBase &rewriter,
                triton::gpu::AddrSpace targets) const override;
@@ -61,6 +73,9 @@ public:
   bool supportBitwidth32Elementwise() const override {
     return targetFeatures.supportBitwidth32Elementwise();
   }
+  bool supportsTcgen05() const override {
+    return targetFeatures.supportsTcgen05();
+  }
 
   Value shuffleXor(RewriterBase &rewriter, Location loc, Value val,
                    int i) const override;
@@ -79,10 +94,10 @@ public:
 
   bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
                   triton::ReduceOp op, unsigned numLaneToReduce,
-                  unsigned interleave) const override;
+                  unsigned interleave,
+                  std::optional<unsigned> broadcastLaneIdMask =
+                      std::nullopt) const override;
   unsigned getReductionTreeArity(Operation *combinerOp) const override;
-
-  std::string getMulhiFuncName(Type resultElementTy) const override;
 
   void printf(RewriterBase &rewriter, Value formatStrStart,
               int formatStrByteCount, ValueRange args,

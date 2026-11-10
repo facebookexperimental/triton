@@ -18,8 +18,8 @@ module.exports = async ({github, context, jobName, platform}) => {
     const {data} = await github.rest.actions.listWorkflowRuns({
       ...repo,
       workflow_id,
-      branch : "main",
-      event : "schedule",
+      branch : current.head_branch,
+      event : current.event,
       status : gpu ? "completed" : "success",
       per_page : 30,
     });

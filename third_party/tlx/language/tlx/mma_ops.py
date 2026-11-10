@@ -5,6 +5,58 @@ from .utility import cuda_parse_arch
 
 
 @tl.builtin
+def amd_packed_dot2(lhs, rhs, acc, input_dtype: tl.constexpr, _semantic=None):
+    """Compute one FP32 dot product from each pair of packed FP16 or BF16 inputs.
+
+    Every ``uint32`` element of ``lhs`` and ``rhs`` contains two values
+    of ``input_dtype``, which must be ``tl.float16`` or ``tl.bfloat16``.
+    The result is ``lhs[0] * rhs[0] + lhs[1] * rhs[1] + acc`` in FP32.
+    Inputs, accumulator, and result have the same tensor shape and layout.
+
+    This emits the matching LLVM AMDGPU fdot2 intrinsic rather than inline
+    assembly, so the backend retains the DOT dependency and hazard semantics.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_packed_dot2 is only supported on AMD (HIP) backends")
+    arch = _semantic.builder.options.arch.split(":", 1)[0]
+    assert arch == "gfx950", f"tlx.amd_packed_dot2 currently requires gfx950, got arch={arch}"
+    input_dtype = tl._unwrap_if_constexpr(input_dtype)
+    assert input_dtype in (tl.float16, tl.bfloat16), f"input_dtype must be tl.float16 or tl.bfloat16, got {input_dtype}"
+    for name, value in (("lhs", lhs), ("rhs", rhs), ("acc", acc)):
+        assert isinstance(value, tl.tensor) and value.type.is_block(), f"{name} must be a distributed tensor"
+    assert lhs.dtype == tl.uint32 and rhs.dtype == tl.uint32, "lhs and rhs must contain packed input pairs as uint32"
+    assert acc.dtype == tl.float32, "acc must be an FP32 tensor"
+    assert lhs.shape == rhs.shape == acc.shape, "lhs, rhs, and acc must have the same shape"
+    handle = _semantic.builder.create_amd_packed_dot2(lhs.handle, rhs.handle, acc.handle,
+                                                      input_dtype.to_ir(_semantic.builder))
+    return tl.tensor(handle, tl.block_type(tl.float32, lhs.shape))
+
+
+@tl.builtin
+def amd_concat(sources, shape, _semantic=None):
+    """Concatenate register fragments without cross-thread movement."""
+    sources = tuple(sources)
+    assert sources, "sources must not be empty"
+    assert all(isinstance(source, tl.tensor) for source in sources), "every source must be a tensor"
+    shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
+    source_shape = [tl._unwrap_if_constexpr(dim) for dim in sources[0].shape]
+    assert len(shape) == len(source_shape), f"shape must have rank {len(source_shape)}, got {len(shape)}"
+    assert all(isinstance(dim, int) and dim > 0 for dim in shape), "shape must contain positive constexpr integers"
+    assert all(
+        list(source.shape) == list(sources[0].shape) and source.dtype == sources[0].dtype
+        for source in sources[1:]), "sources must have identical shapes and dtypes"
+    source_elements = 1
+    result_elements = 1
+    for source_dim, result_dim in zip(source_shape, shape):
+        assert result_dim % source_dim == 0, "every result dimension must be a multiple of the source dimension"
+        source_elements *= source_dim
+        result_elements *= result_dim
+    assert result_elements == len(sources) * source_elements, "result shape must contain every source exactly once"
+    handle = _semantic.builder.create_amd_concat([source.handle for source in sources], shape)
+    return tl.tensor(handle, tl.block_type(sources[0].dtype, shape))
+
+
+@tl.builtin
 def extract_slice(source, shape, offsets, _semantic=None):
     """Extract an aligned register slice without cross-thread movement.
 
@@ -331,6 +383,82 @@ def amd_scheduled_mfma(
 
 
 @tl.builtin
+def amd_scheduled_mfma_scaled(
+    a,
+    b,
+    acc,
+    a_scale,
+    b_scale,
+    a_format: tl.constexpr,
+    b_format: tl.constexpr,
+    accumulator_role: tl.constexpr = "transient",
+    accumulator_register_class: tl.constexpr = None,
+    initialize: tl.constexpr = False,
+    a_scale_selector: tl.constexpr = None,
+    b_scale_selector: tl.constexpr = None,
+    _semantic=None,
+):
+    """Update native CDNA4 scaled-MFMA fragments.
+
+    Scaled twin of :func:`amd_scheduled_mfma` for microscaling formats. ``a``
+    and ``b`` may be typed FP8 tensors in matching opIdx 0/1 dot-operand
+    layouts with ``kWidth`` 16, or i8 tensors with logical-value shapes (per
+    lane, the first 24 of every 32 K-ordered values are dense-packed code bytes
+    (32/24/16 per step for FP8/FP6/FP4) and the rest zero padding) in opIdx 0/1
+    dot-operand layouts with ``kWidth`` 8 under an ``amd_mfma_layout`` with
+    instruction shape 16x16x128 or 32x32x64, and
+    ``a_scale``/``b_scale`` are either i8 E8M0 tensors in MFMA scale-layout
+    order or packed i32 words with explicit byte selectors. Typed FP8 operands
+    support transient or persistent accumulator chains and explicit AGPR or
+    VGPR placement. Lowers to native ``v_mfma_scale_f32_*_f8f6f4`` ROCDL
+    intrinsics in K-major, N-major, M-minor order with one SSA chain per output
+    fragment.
+    """
+    a_format = tl._unwrap_if_constexpr(a_format)
+    b_format = tl._unwrap_if_constexpr(b_format)
+    initialize = tl._unwrap_if_constexpr(initialize)
+    accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
+    accumulator_register_class = tl._unwrap_if_constexpr(accumulator_register_class)
+    a_scale_selector = tl._unwrap_if_constexpr(a_scale_selector)
+    b_scale_selector = tl._unwrap_if_constexpr(b_scale_selector)
+    _formats = ("e4m3", "e5m2", "e2m3", "e3m2", "e2m1")
+    assert a_format in _formats, f"a_format must be one of {_formats}, got {a_format!r}"
+    assert b_format in _formats, f"b_format must be one of {_formats}, got {b_format!r}"
+    assert isinstance(initialize, bool), "initialize must be a constexpr bool"
+    assert accumulator_role in ("transient", "persistent"), \
+        'accumulator_role must be "transient" or "persistent"'
+    assert accumulator_register_class in (None, "agpr", "vgpr"), \
+        'accumulator_register_class must be None, "agpr", or "vgpr"'
+    packed_scales = a_scale.dtype in (tl.int32, tl.uint32)
+    assert packed_scales == (b_scale.dtype in (tl.int32, tl.uint32)), \
+        "scale operands must use matching packing"
+    if packed_scales:
+        selectors = (a_scale_selector, b_scale_selector)
+        assert all(isinstance(selector, int) and not isinstance(selector, bool)
+                   and 0 <= selector <= 3 for selector in selectors), \
+            "packed i32 scales require selectors in [0, 3]"
+    else:
+        assert a_scale_selector is None and b_scale_selector is None, \
+            "i8 scales do not accept packed byte selectors"
+    handle = _semantic.builder.create_amd_scheduled_mfma_scaled(
+        a.handle,
+        b.handle,
+        acc.handle,
+        a_scale.handle,
+        b_scale.handle,
+        a_format,
+        b_format,
+        "none",
+        accumulator_role,
+        "auto" if accumulator_register_class is None else accumulator_register_class,
+        initialize,
+        -1 if a_scale_selector is None else a_scale_selector,
+        -1 if b_scale_selector is None else b_scale_selector,
+    )
+    return tl.tensor(handle, acc.type)
+
+
+@tl.builtin
 def amd_mfma_commit(value, preserve=None, _semantic=None):
     """Apply an MFMA completion boundary and return every value unchanged.
 
@@ -418,7 +546,8 @@ def release_layout(x, relaxed: tl.constexpr = False, _semantic=None):
     return tl.tensor(handle, x.type)
 
 
-def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False):
+def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False,
+                                 fp6Padded: bool = False):
     assert isinstance(x.type.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
     if isinstance(x.type.layout, tlx.shared_linear_layout_encoding):
         return _builder.create_require_layout(x.handle, x.type.layout.to_ir(_builder))
@@ -443,6 +572,7 @@ def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builde
         layout.numCTAOrder,
         layout.fp4Padded,
         layout.swizzled,
+        fp6Padded,
     )
     return _builder.create_require_layout(x.handle, layout_handle)
 
@@ -552,6 +682,8 @@ def dot_scaled(
             raise ValueError(f"tiles_per_warp requires {rank} entries, got {len(tiles_per_warp)}")
         if any(tile <= 0 for tile in tiles_per_warp):
             raise ValueError("tiles_per_warp entries must be positive")
+        if any(tile & (tile - 1) for tile in tiles_per_warp):
+            raise ValueError("tiles_per_warp entries must be powers of two")
         result.handle.set_attr(
             "amdg.wmma_tiles_per_warp",
             _semantic.builder.make_i32_array_attr(tiles_per_warp),
@@ -725,8 +857,12 @@ def async_dot_scaled(
         shape.
 
     A_format : str
-        Element format string for operand A: "e2m1" for packed FP4, or "e4m3"
-        and "e5m2" for FP8.
+        Element format string for operand A: "e2m1" for packed FP4, "e2m3"
+        and "e3m2" for packed FP6, or "e4m3" and "e5m2" for FP8.
+        FP6 in shared memory uses 16 packed values followed by four padding
+        bytes per 16-byte container. TMA inserts this padding when loading
+        dense global FP6; barrier byte counts exclude the padding. FP6 in
+        tensor memory uses one value in the low six bits of each byte.
 
     B_scale : tlx.buffered_tensor
         Scaling factors for operand B, same semantics as A_scale.
@@ -763,7 +899,7 @@ def async_dot_scaled(
     version = 5 if cuda_compute_capability >= 100 else 3
     assert version == 5, "async_dot_scaled is only available on Blackwell"
 
-    supported_formats = {"e2m1", "e4m3", "e5m2"}
+    supported_formats = {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}
     A_format = tl._unwrap_if_constexpr(A_format)
     B_format = tl._unwrap_if_constexpr(B_format)
     assert A_format in supported_formats, f"Unsupported A_format: {A_format}"
@@ -798,14 +934,16 @@ def async_dot_scaled(
     is_mixed_precision = A_format != B_format
     if A.type.storage == tlx.storage_kind.smem:
         A_fp4Padded = is_A_fp4 and is_mixed_precision
-        A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder, fp4Padded=A_fp4Padded)
+        A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder, fp4Padded=A_fp4Padded, fp6Padded=A_format
+                                                in ("e2m3", "e3m2"))
     else:
         assert a_is_tmem, "A must be in SMEM or TMEM"
         A_handle = require_tmem_layout(A, 1, a_cta_mode, _semantic.builder)
 
     # Require layout for B (always SMEM)
     B_fp4Padded = is_B_fp4 and is_mixed_precision
-    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder, fp4Padded=B_fp4Padded)
+    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder, fp4Padded=B_fp4Padded, fp6Padded=B_format
+                                            in ("e2m3", "e3m2"))
 
     # Handle scale tensors - can be in SMEM or TMEM (auto-detected from storage type)
     assert isinstance(A_scale, tlx.buffered_tensor), "A_scale must be a buffered tensor"

@@ -195,7 +195,9 @@ def buffer_atomic_add(
     adjacency width used to select packed atomics; values greater than one
     also anchor the selected layout so later optimization cannot invalidate
     that promise. FP16 and BF16 atomics require width two, including a mask
-    that is uniform across each adjacent pair.
+    that is uniform across each adjacent pair. ``scope="cluster"`` opts into
+    gfx1250 shader-engine scope: the caller must launch every workgroup
+    updating the same location in one cluster.
     """
     _verify_buffer_ops(ptr, offsets, mask)
 
@@ -220,7 +222,9 @@ def buffer_atomic_add(
 
     atomic_op = ir.ATOMIC_OP.FADD if value.dtype.is_floating() else ir.ATOMIC_OP.ADD
     semantic = _semantic._str_to_sem(sem)
-    sync_scope = _semantic._str_to_scope(scope)
+    scope = tl._unwrap_if_constexpr(scope)
+    cluster_scope = scope == "cluster"
+    sync_scope = _semantic._str_to_scope("gpu" if cluster_scope else scope)
     handle = _semantic.builder.create_buffer_atomic_rmw(
         atomic_op,
         ptr.handle,
@@ -230,6 +234,7 @@ def buffer_atomic_add(
         sync_scope,
         mask.handle if mask is not None else None,
         contiguity,
+        cluster_scope,
     )
     if contiguity > 1:
         # Lowering trusts this width as a per-thread adjacency guarantee.
@@ -905,22 +910,36 @@ def subslice(
     local_allocated_buffer: tlx.buffered_tensor,
     offset: int,
     size: int,
+    dim: int = -1,
     _semantic=None,
 ) -> tlx.buffered_tensor:
     """
-    Returns a subslice of the buffer (in TMEM). The source has to be 128xN and the slicing is
-    along the innermost dimension.
+    Returns a subslice of the buffer (in TMEM). The source has to be 128xN or 64xN. The slicing is
+    along the innermost dimension by default; dim=0 slices the rows (TMEM lanes) of a 2D buffer.
+
+    A row slice is how a task of fewer than 4 warps addresses TMEM: warp w of a warpgroup can only
+    access lanes [32 * (w % 4), 32 * (w % 4) + 32), so such a task may only load or store the rows
+    held in the lanes of its own warps (for example, a 2-warp task starting at warp 4k + 2 owns rows
+    64-127 of a 128xN buffer, or rows 32-63 of a 64xN buffer). Warp i of the task accesses the
+    rows of lane quadrant i of the slice; pin the task with `warp_group_start_id` so that this is
+    its own quadrant, and pass the register layout to `local_load` or `local_store` explicitly (`layout=`).
 
     :param local_allocated_buffer: the source buffer
     :param offset: the start offset of the subslice, in terms of number of elements
     :param size: the size of the subslice, in terms of number of elements
+    :param dim: the sliced dimension: -1 (innermost, default) or 0 (rows of a 2D buffer)
     """
     # this is for TMEM subslice
+    dim = tl._unwrap_if_constexpr(dim)
+    offset = tl._unwrap_if_constexpr(offset)
+    size = tl._unwrap_if_constexpr(size)
     assert local_allocated_buffer.type.storage == tlx.storage_kind.tmem, "subslice is only supported for tmem"
     assert isinstance(local_allocated_buffer.type, tl.block_type), "subslice src is not block type"
-    subslice_shape = [dim for dim in local_allocated_buffer.type.shape[:-1]] + [size]
+    shape = list(local_allocated_buffer.type.shape)
+    assert dim in (-1, len(shape) - 1) or (dim == 0 and len(shape) == 2), "subslice dim must be -1 or 0 (2D rows)"
+    subslice_shape = shape[:-1] + [size] if dim in (-1, len(shape) - 1) else [size] + shape[1:]
     return tlx.buffered_tensor(
-        _semantic.builder.create_tmem_subslice(local_allocated_buffer.handle, offset, size),
+        _semantic.builder.create_tmem_subslice(local_allocated_buffer.handle, offset, size, dim),
         local_allocated_buffer.type.element_ty,
         subslice_shape,
         local_allocated_buffer.type.num,
@@ -1259,18 +1278,29 @@ def local_scatter(
 def local_store(
     dst: tlx.buffered_tensor,
     src: tl.tensor,
+    layout=None,
     _semantic=None,
 ) -> tl.tensor:
     """
     Store a distributed tensor into a buffer in local or tensor memory.
+
+    ``layout`` (optional, tensor memory only) pins the register layout the value
+    is stored from, written as a ``tlx.layout(...)`` (Shape:Stride) as for
+    ``local_load``. A task of 1 or 2 warps storing into a row slice must pass it.
     """
     storage = dst.type.storage
+    layout = tl._unwrap_if_constexpr(layout)
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
-        tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, dst)
-        src_handle = _semantic.builder.create_require_layout(src.handle, tmem_compatible_layout_encoding)
+        if layout is not None:
+            enc = layout.to_ir(_semantic.builder, dst.type.shape, dst.type.element_ty)
+            src_handle = _semantic.builder.create_require_layout(src.handle, enc, pin=True)
+        else:
+            tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, dst)
+            src_handle = _semantic.builder.create_require_layout(src.handle, tmem_compatible_layout_encoding)
         return tl.tensor(_semantic.builder.create_tmem_store(dst.handle, src_handle), tl.void)
 
+    assert layout is None, "local_store only takes a layout for tensor memory"
     return tl.tensor(_semantic.builder.create_local_store(dst.handle, src.handle), tl.void)
 
 
@@ -1879,7 +1909,8 @@ def async_amd_descriptor_load(
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
     layout = result.type.layout
-    if (not getattr(layout, "_tlx_default", False) and not isinstance(layout, tlx.padded_shared_layout_encoding)):
+    if (not getattr(layout, "_tlx_default", False)
+            and not isinstance(layout, (tlx.padded_shared_layout_encoding, tlx.partitioned_shared_layout_encoding))):
         expected_layout = _amd_tdm_descriptor_layout(desc)
         if not _layouts_match(layout, expected_layout):
             warnings.warn(
@@ -1941,8 +1972,10 @@ def async_amd_descriptor_load_fused(
     must select at most five recipients on gfx1250, including when its value
     is computed at runtime. Each recipient must issue the same source request
     to the same LDS offset.
-    The caller must synchronize accesses to destination shared memory across
-    recipient CTAs.
+    Only CTAs which issue matching requests receive a combined load. Late
+    requests are serviced separately after timeout, so cluster synchronization
+    is optional and only improves sharing. Each CTA must still synchronize its
+    local shared-memory accesses and wait for its own load completion.
     Omit the masks to infer multicast from distributed tensor layouts.
     """
     arch = _semantic.builder.options.arch
@@ -2251,6 +2284,7 @@ def async_store(
     dst_global_ptr: tl.tensor,
     src_smem: tlx.buffered_tensor,
     size: tl.tensor,
+    store_reduce: str = "",
     _semantic=None,
 ) -> None:
     """
@@ -2259,32 +2293,76 @@ def async_store(
     cp.async.bulk.commit_group / cp.async.bulk.wait_group (use
     async_descriptor_store_wait to wait).
 
+    With `store_reduce`, the source elements are instead reduced into global
+    memory with cp.reduce.async.bulk, the non-tensor (no tensor map) form of a
+    TMA reduce. The source and destination element types must match and pick
+    the PTX type, which must be one of:
+
+    - "add": .u32, .s32, .u64, .f32, .f64, .f16, .bf16 (int64 also uses .u64,
+      since the bits are the same; .f16/.bf16 add is emitted with .noftz)
+    - "min", "max": .u32, .s32, .u64, .s64, .f16, .bf16
+    - "and", "or", "xor": .b32, .b64
+    - "inc", "dec": .u32
+
     The predicate (threadIdx.x == 0) is auto-generated in the LLVM lowering.
 
     Args:
         dst_global_ptr: Pointer to destination in global memory.
         src_smem: Shared memory buffer.
         size: Number of bytes to copy (must be a multiple of 16).
+        store_reduce: "" for a plain copy (default), or "add", "min", "max",
+            "and", "or", "xor", "inc", or "dec". Integer MIN/MAX use the
+            element type's signedness.
     """
+    store_reduce = tl._unwrap_if_constexpr(store_reduce)
+    reduce_kind_map = {
+        "add": ir.DESCRIPTOR_REDUCE_KIND.ADD,
+        "min": ir.DESCRIPTOR_REDUCE_KIND.MIN,
+        "max": ir.DESCRIPTOR_REDUCE_KIND.MAX,
+        "and": ir.DESCRIPTOR_REDUCE_KIND.AND,
+        "or": ir.DESCRIPTOR_REDUCE_KIND.OR,
+        "xor": ir.DESCRIPTOR_REDUCE_KIND.XOR,
+        "inc": ir.DESCRIPTOR_REDUCE_KIND.INC,
+        "dec": ir.DESCRIPTOR_REDUCE_KIND.DEC,
+    }
+    assert store_reduce == "" or store_reduce in reduce_kind_map, (
+        f"store_reduce must be '', 'add', 'min', 'max', 'and', 'or', 'xor', 'inc', or 'dec', got {store_reduce!r}")
+    reduce_kind = ir.DESCRIPTOR_REDUCE_KIND.NONE
+    reduce_signed = False
+    if store_reduce:
+        dst_dtype = dst_global_ptr.dtype.element_ty
+        assert src_smem.dtype == dst_dtype, (
+            f"async_store reduction source and destination types must match, got {src_smem.dtype} and {dst_dtype}")
+        reduce_kind = reduce_kind_map[store_reduce]
+        reduce_signed = dst_dtype.is_int_signed()
     if isinstance(size, tl.constexpr):
         size_handle = _semantic._convert_elem_to_ir_value(size.value, require_i64=False)
     elif isinstance(size, tl.tensor):
         size_handle = size.handle
     else:
         size_handle = _semantic._convert_elem_to_ir_value(size, require_i64=False)
-    _semantic.builder.create_async_store(src_smem.handle, dst_global_ptr.handle, size_handle)
+    _semantic.builder.create_async_store(src_smem.handle, dst_global_ptr.handle, size_handle, reduce_kind,
+                                         reduce_signed)
 
 
 @tl.builtin
 def async_descriptor_store_wait(
     pendings: tl.constexpr,
+    read_only: tl.constexpr = False,
     _semantic=None,
 ) -> None:
     """
     Wait for completion of prior asynchronous TMA store operations.
+
+    With ``read_only=True``, only wait until the stores have finished reading
+    their shared-memory sources (``cp.async.bulk.wait_group.read``), not until
+    their writes are visible in global memory. That is enough before the source
+    buffer is written again.
     """
     pendings = tl._unwrap_if_constexpr(pendings)
-    _semantic.builder.create_async_TMA_store_wait(pendings)
+    read_only = tl._unwrap_if_constexpr(read_only)
+    assert isinstance(read_only, bool), f"read_only must be a constexpr bool, got {type(read_only).__name__}"
+    _semantic.builder.create_async_TMA_store_wait(pendings, read_only)
 
 
 @tl.builtin

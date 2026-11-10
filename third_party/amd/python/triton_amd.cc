@@ -5,6 +5,7 @@
 #include "amd/include/hipblas_instance.h"
 #include "amd/include/hipblas_types.h"
 #include "amd/lib/Target/MFMASchedule/MFMASchedule.h"
+#include "dylib_utils.h"
 #include "lib/TritonAMDGPUToLLVM/TargetInfo.h"
 #include "lld/Common/Driver.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -72,6 +73,8 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
     pm.addPass(
         createConvertTritonAMDGPUToLLVMPass(arch, ftz, enableTreeReduction));
   });
+  ADD_PASS_OPTION_WRAPPER_1("add_membar", createTritonAMDGPUMembar,
+                            const std::string &);
   m.def("add_builtin_func_to_llvmir",
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertBuiltinFuncToLLVMPass(arch, ftz));
@@ -383,7 +386,9 @@ static std::optional<std::string> lldInvoke(const char *inPath,
 }
 
 void init_triton_amd(py::module_ &m) {
+  mlir::triton::AMD::registerTargetInfo();
   m.doc() = "Python bindings to the AMD Triton backend";
+  init_triton_amd_loader(m);
 
   auto passes = m.def_submodule("passes");
   auto ttgpuir_m = passes.def_submodule("ttgpuir");
@@ -405,6 +410,7 @@ void init_triton_amd(py::module_ &m) {
     // registry.insert<mlir::ROCDL::ROCDLDialect>();
     mlir::registerROCDLDialectTranslation(registry);
     mlir::triton::AMD::registerSchedulingBarrierExternalModel(registry);
+    mlir::triton::amdgpu::registerNpotTargetLegality(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });
@@ -640,7 +646,9 @@ void init_triton_amd(py::module_ &m) {
                                .attr("find_libraries")("hipblaslt");
           auto path = libraries.attr("__getitem__")(0);
           auto pathString = path.attr("__str__")();
-          const char *pathChars = PyUnicode_AsUTF8(pathString.ptr());
+          Py_ssize_t name_size;
+          const char *pathChars =
+              PyUnicode_AsUTF8AndSize(pathString.ptr(), &name_size);
           if (pathChars == nullptr)
             throw py::python_error();
           hipblasLtPath = pathChars;

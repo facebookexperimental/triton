@@ -1,7 +1,7 @@
 """sm100 L1 correctness for ``tlx.ops.mm``.
 
-Runs the hardware-agnostic synthetic list plus every MM focus suite. L2 perf
-selects only the running host's configured default.
+Runs the hardware-agnostic synthetic list plus the sm100 focus suite. L2 perf
+uses the same running-host default.
 
 A shape the op declines is reported as a skip with the reason, never as a
 pass.

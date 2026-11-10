@@ -132,6 +132,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      issues: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -155,6 +157,30 @@ jobs:
                  --notes "Per-night tlx.ops perf summaries behind the /bench/ dashboard." \
             || gh release view tlx-ops-bench >/dev/null
           gh release upload tlx-ops-bench "${SUMMARY}" --clobber
+      - name: Detect historical throughput regressions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          DATE="${VERSION##*.dev}"
+          gh release download tlx-ops-bench --pattern '*.${{ inputs.platform }}.json' --dir history
+          python3 .github/scripts/tlx_ops_bench_regressions.py history \
+            --platform '${{ inputs.platform }}' --date "${DATE}" --out regressions.json --file-issues
+      - name: Upload regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlx-ops-regressions-${{ inputs.platform }}-${{ inputs.version }}
+          path: regressions.json
+          if-no-files-found: ignore
+      - name: Queue performance bisect jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 .github/scripts/tlx_ops_bench_regressions.py regressions.json --queue-bisects \
+            --artifact-name "tlx-ops-regressions-${{ inputs.platform }}-${VERSION}"
 
   report:
     needs: bench

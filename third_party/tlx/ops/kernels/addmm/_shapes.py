@@ -181,9 +181,17 @@ FOCUS_SUITES = (
 )
 
 DEFAULT_SUITES = {
+    "sm90": ("sm90_all", ),
     "gfx942": ("gfx942_all", ),
     "gfx950": ("gfx950_all", ),
 }
+FOCUS_SUITES = (*FOCUS_SUITES,
+                FocusSuite(
+                    name="sm90_all",
+                    op="addmm",
+                    shapes=tuple(
+                        dict.fromkeys((*SYNTHETIC, *(shape for suite in FOCUS_SUITES for shape in suite.shapes)))),
+                ))
 FOCUS = FocusRegistry("addmm", FOCUS_SUITES, DEFAULT_SUITES)
 CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 

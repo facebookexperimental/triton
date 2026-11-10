@@ -3,6 +3,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
@@ -10,6 +11,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Tools/LinearLayout.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -39,17 +41,62 @@ void LoadOp::getEffects(
 namespace mlir {
 namespace triton {
 
+LogicalResult
+verifyCacheModifier(CacheModifier modifier, CachePolicyOperation operation,
+                    function_ref<InFlightDiagnostic()> emitError) {
+  bool isSupported = false;
+  switch (operation) {
+  case CachePolicyOperation::Load:
+    isSupported =
+        modifier == CacheModifier::NONE || modifier == CacheModifier::CA ||
+        modifier == CacheModifier::CG || modifier == CacheModifier::CS ||
+        modifier == CacheModifier::CV;
+    break;
+  case CachePolicyOperation::Store:
+    isSupported =
+        modifier == CacheModifier::NONE || modifier == CacheModifier::WB ||
+        modifier == CacheModifier::CG || modifier == CacheModifier::CS ||
+        modifier == CacheModifier::WT;
+    break;
+  }
+  if (isSupported)
+    return success();
+  return emitError() << "cache modifier '" << stringifyCacheModifier(modifier)
+                     << "' is not supported for "
+                     << (operation == CachePolicyOperation::Load ? "loads"
+                                                                 : "stores");
+}
+
+LogicalResult verifyCachePolicy(Operation *op, Attribute cachePolicy,
+                                CachePolicyOperation operation) {
+  if (!cachePolicy)
+    return success();
+  Dialect &dialect = cachePolicy.getDialect();
+  auto *interface = dyn_cast<DialectCachePolicyInterface>(&dialect);
+  if (!interface)
+    return op->emitOpError("unsupported cache policy attribute ")
+           << cachePolicy;
+  return interface->verifyCachePolicy(cachePolicy, operation, [&]() {
+    return op->emitOpError("invalid cache policy: ");
+  });
+}
+
 //-- LoadOp --
 void LoadOp::build(OpBuilder &builder, OperationState &state, Value ptr,
-                   CacheModifier cache, EvictionPolicy evict, bool isVolatile) {
-  LoadOp::build(builder, state, ptr, /*mask=*/{}, /*other=*/{}, cache, evict,
-                isVolatile);
+                   bool isVolatile) {
+  LoadOp::build(builder, state, ptr, /*mask=*/{}, /*other=*/{},
+                /*cachePolicy=*/{}, isVolatile);
 }
 
 void LoadOp::build(OpBuilder &builder, OperationState &state, Value ptr,
-                   Value mask, CacheModifier cache, EvictionPolicy evict,
-                   bool isVolatile) {
-  LoadOp::build(builder, state, ptr, mask, /*other=*/{}, cache, evict,
+                   Value mask, bool isVolatile) {
+  LoadOp::build(builder, state, ptr, mask, /*other=*/{},
+                /*cachePolicy=*/{}, isVolatile);
+}
+
+void LoadOp::build(OpBuilder &builder, OperationState &state, Value ptr,
+                   Value mask, Value other, bool isVolatile) {
+  LoadOp::build(builder, state, ptr, mask, other, /*cachePolicy=*/{},
                 isVolatile);
 }
 
@@ -58,6 +105,11 @@ Value LoadOp::getPredicateOperand() { return getMask(); }
 void LoadOp::setPredicateOperand(Value pred) { getMaskMutable().assign(pred); }
 
 Type LoadOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
+
+LogicalResult LoadOp::verify() {
+  return verifyCachePolicy(*this, getCachePolicyAttr(),
+                           CachePolicyOperation::Load);
+}
 
 // load(ptr, splat(1), ...)        -> load(ptr, ...)
 // load(ptr, splat(0), other, ...) -> other
@@ -71,29 +123,16 @@ struct CanonicalizeMaskedLoadPattern : public OpRewritePattern<LoadOp> {
     if (!mask)
       return failure();
 
-    auto constantMask = mask.getDefiningOp<arith::ConstantOp>();
-    if (!constantMask)
-      return failure();
-
-    auto splatMask = mlir::dyn_cast<SplatElementsAttr>(constantMask.getValue());
-    if (!splatMask)
-      return failure();
-
-    if (splatMask.getSplatValue<IntegerAttr>().getValue() == true) {
-      // mask = splat(1)
+    if (matchPattern(mask, m_One())) {
       rewriter.replaceOpWithNewOp<LoadOp>(
           loadOp, loadOp.getType(), loadOp.getPtr(), Value(), Value(),
-          loadOp.getCache(), loadOp.getEvict(), loadOp.getIsVolatile());
-    } else {
-      // mask = splat(0)
-
-      // If there's no "other", the value is "undef".  Perhaps we want to
-      // optimize it in the future.x
-      auto otherVal = loadOp.getOther();
-      if (!otherVal)
-        return failure();
-      rewriter.replaceOp(loadOp, otherVal);
+          loadOp.getCachePolicyAttr(), loadOp.getIsVolatile());
+      return success();
     }
+    // Without "other", a false-masked load produces an undefined value.
+    if (!matchPattern(mask, m_Zero()) || !loadOp.getOther())
+      return failure();
+    rewriter.replaceOp(loadOp, loadOp.getOther());
     return success();
   }
 };
@@ -105,8 +144,15 @@ void LoadOp::getCanonicalizationPatterns(RewritePatternSet &results,
 
 //-- StoreOp --
 void StoreOp::build(OpBuilder &builder, OperationState &state, Value ptr,
-                    Value value, CacheModifier cache, EvictionPolicy evict) {
-  return StoreOp::build(builder, state, ptr, value, /*mask=*/{}, cache, evict);
+                    Value value) {
+  StoreOp::build(builder, state, ptr, value, /*mask=*/{},
+                 /*cachePolicy=*/{});
+}
+
+void StoreOp::build(OpBuilder &builder, OperationState &state, Value ptr,
+                    Value value, Value mask, bool ignoreCTA) {
+  StoreOp::build(builder, state, ptr, value, mask, /*cachePolicy=*/{},
+                 ignoreCTA);
 }
 
 Value StoreOp::getPredicateOperand() { return getMask(); }
@@ -114,6 +160,11 @@ Value StoreOp::getPredicateOperand() { return getMask(); }
 void StoreOp::setPredicateOperand(Value pred) { getMaskMutable().assign(pred); }
 
 Type StoreOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
+
+LogicalResult StoreOp::verify() {
+  return verifyCachePolicy(*this, getCachePolicyAttr(),
+                           CachePolicyOperation::Store);
+}
 
 // store(ptr, value, splat(1), ...) -> store(ptr, value, ...)
 // store(ptr, value, splat(0), ...) -> [none]
@@ -123,27 +174,14 @@ struct CanonicalizeMaskedStorePattern : public OpRewritePattern<StoreOp> {
 
   LogicalResult matchAndRewrite(StoreOp storeOp,
                                 PatternRewriter &rewriter) const override {
+    if (succeeded(eraseIfPredicateIsFalse(storeOp, rewriter)))
+      return success();
     auto mask = storeOp.getMask();
-    if (!mask)
+    if (!mask || !matchPattern(mask, m_One()))
       return failure();
-
-    auto constantMask = mask.getDefiningOp<arith::ConstantOp>();
-    if (!constantMask)
-      return failure();
-
-    auto splatMask = mlir::dyn_cast<SplatElementsAttr>(constantMask.getValue());
-    if (!splatMask)
-      return failure();
-
-    if (splatMask.getSplatValue<IntegerAttr>().getValue() == true) {
-      // mask = splat(1)
-      rewriter.replaceOpWithNewOp<StoreOp>(
-          storeOp, storeOp.getPtr(), storeOp.getValue(), storeOp.getCache(),
-          storeOp.getEvict());
-    } else {
-      // mask = splat(0)
-      rewriter.eraseOp(storeOp);
-    }
+    rewriter.replaceOpWithNewOp<StoreOp>(
+        storeOp, storeOp.getPtr(), storeOp.getValue(), Value(),
+        storeOp.getCachePolicyAttr(), storeOp.getIgnoreCta());
     return success();
   }
 };
@@ -155,6 +193,71 @@ void AtomicRMWOp::setPredicateOperand(Value pred) {
 }
 
 Type AtomicRMWOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
+
+Value AtomicLoadOp::getPredicateOperand() { return getMask(); }
+
+void AtomicLoadOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+
+Type AtomicLoadOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
+
+Value AtomicStoreOp::getPredicateOperand() { return getMask(); }
+
+void AtomicStoreOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+
+Type AtomicStoreOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
+
+LogicalResult AtomicStoreOp::canonicalize(AtomicStoreOp op,
+                                          PatternRewriter &rewriter) {
+  return eraseIfPredicateIsFalse(op, rewriter);
+}
+
+static LogicalResult verifyAtomicLoadStoreType(Operation *op, Type ptrTy) {
+  Type elementTy = getElementTypeOrSelf(getPointeeType(ptrTy));
+  if (!elementTy.isIntOrFloat())
+    return op->emitOpError("only supports integer and floating-point elements");
+  if (elementTy.getIntOrFloatBitWidth() < 8)
+    return op->emitOpError("does not support sub-byte elements");
+  return success();
+}
+
+LogicalResult AtomicLoadOp::verify() {
+  if (getSem() != MemSemantic::ACQUIRE && getSem() != MemSemantic::RELAXED)
+    return emitOpError("only supports acquire and relaxed semantics");
+  return verifyAtomicLoadStoreType(getOperation(), getPtr().getType());
+}
+
+LogicalResult AtomicStoreOp::verify() {
+  if (getSem() != MemSemantic::RELEASE && getSem() != MemSemantic::RELAXED)
+    return emitOpError("only supports release and relaxed semantics");
+  return verifyAtomicLoadStoreType(getOperation(), getPtr().getType());
+}
+
+// A used result with duplicates is broadcast back through pow2-only
+// shared-memory algebra.
+static std::optional<std::string>
+getAtomicMixedRadixUnsupportedReason(Operation *op,
+                                     const LinearLayout &layout) {
+  if (!op->getResult(0).use_empty() &&
+      llvm::any_of(layout.getFreeVariableMasks(),
+                   [](auto mask) { return mask.second != 0; }))
+    return "NPOT mixed-radix layout with broadcast elements is not yet "
+           "supported on an atomic whose result is used";
+  return std::nullopt;
+}
+
+std::optional<std::string>
+AtomicRMWOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getAtomicMixedRadixUnsupportedReason(*this, layout);
+}
+
+std::optional<std::string>
+AtomicCASOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getAtomicMixedRadixUnsupportedReason(*this, layout);
+}
 
 LogicalResult AtomicPollOp::verify() {
   if (getSem() != MemSemantic::ACQUIRE && getSem() != MemSemantic::RELAXED)
@@ -307,6 +410,59 @@ LogicalResult DotOp::verify() {
                                                      bEncoding);
 }
 
+// The NpotTargetLegality whose prefix matches `target`, or nullptr.
+static const NpotTargetLegality *lookupNpotTargetLegality(MLIRContext *ctx,
+                                                          StringRef target) {
+  for (Dialect *dialect : ctx->getLoadedDialects()) {
+    auto *legality = dyn_cast<NpotTargetLegality>(dialect);
+    if (legality && target.split(':').first == legality->getTargetPrefix())
+      return legality;
+  }
+  return nullptr;
+}
+
+std::optional<std::string>
+getNpotDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
+                            StringRef target, int numWarps, int nonKDim) {
+  if (auto *legality = lookupNpotTargetLegality(dot->getContext(), target))
+    return legality->getDotUnsupportedReason(dot, layout, target, numWarps,
+                                             nonKDim);
+  return std::string("NPOT dot is not yet supported without an MMA target");
+}
+
+std::optional<std::string>
+getNpotDotSlowReason(Operation *dot, ArrayRef<NpotDotOperandAccess> operands,
+                     int numWarps, int threadsPerWarp, int nonKDim,
+                     StringRef target) {
+  if (auto *legality = lookupNpotTargetLegality(dot->getContext(), target))
+    return legality->getDotSlowReason(dot, operands, numWarps, threadsPerWarp,
+                                      nonKDim, target);
+  return std::nullopt;
+}
+
+StringRef getModuleTarget(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  auto target = mod ? mod->getAttrOfType<StringAttr>("ttg.target") : nullptr;
+  return target ? target.getValue() : StringRef();
+}
+
+std::optional<std::string>
+getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout) {
+  StringRef target = getModuleTarget(copy);
+  if (auto *legality = lookupNpotTargetLegality(copy->getContext(), target))
+    return legality->getAsyncCopyUnsupportedReason(copy, layout, target);
+  return std::string("NPOT async copy is not yet supported without a target");
+}
+
+std::optional<std::string>
+getNpotDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
+                                   StringRef target) {
+  if (auto *legality = lookupNpotTargetLegality(op->getContext(), target))
+    return legality->getDescriptorUnsupportedReason(op, layout, target);
+  return std::string(
+      "NPOT tensor descriptor is not yet supported without a target");
+}
+
 //-- DotScaledOp --
 bool DotScaledOp::verifyDims() {
   auto aShape = this->getA().getType().getShape();
@@ -318,9 +474,23 @@ bool DotScaledOp::verifyDims() {
     if (this->getLhsKPack())
       aKdim *= 2;
   }
+  if (isMXFP6ScaleType(this->getAElemType())) {
+    // fp6 shapes count logical values; global storage is dense,
+    // consumed in groups of 16 values (12 bytes).
+    if (this->getLhsKPack()) {
+      if (aKdim % 16 != 0)
+        return false;
+    }
+  }
   if (this->getBElemType() == ScaleDotElemType::E2M1) {
     if (this->getRhsKPack())
       bKdim *= 2;
+  }
+  if (isMXFP6ScaleType(this->getBElemType())) {
+    if (this->getRhsKPack()) {
+      if (bKdim % 16 != 0)
+        return false;
+    }
   }
 
   return aKdim == bKdim;
@@ -353,10 +523,29 @@ LogicalResult DotScaledOp::verify() {
   if (rank < 2)
     return this->emitError("operands must be at least 2D");
 
+  // fp6 has no non-K-packed representation (unlike e2m1, which can pack
+  // along M/N): dense packing exists only along K, so reject it here
+  // rather than failing obscurely in lowering.
+  if (isMXFP6ScaleType(this->getAElemType()) && !this->getLhsKPack())
+    return this->emitError("fp6 lhs operand must be packed along K "
+                           "(lhs_k_pack must be true)");
+  if (isMXFP6ScaleType(this->getBElemType()) && !this->getRhsKPack())
+    return this->emitError("fp6 rhs operand must be packed along K "
+                           "(rhs_k_pack must be true)");
+
   auto k = aShape[rank - 1];
   if (this->getAElemType() == ScaleDotElemType::E2M1) {
     if (this->getLhsKPack())
       k *= 2;
+  }
+  if (isMXFP6ScaleType(this->getAElemType())) {
+    // fp6 shapes count logical values; global storage is dense,
+    // consumed in groups of 16 values (12 bytes).
+    if (this->getLhsKPack()) {
+      if (k % 16 != 0)
+        return this->emitError("logical K dim must be a multiple of 16 for "
+                               "fp6 (groups of 16 values / 12 bytes)");
+    }
   }
   auto cShape = this->getC().getType().getShape();
   int64_t mDim = cShape[cShape.size() - 2];
@@ -411,15 +600,31 @@ LogicalResult deduceScaleFactor(ArrayRef<int64_t> lhsShape,
                                  std::optional<ArrayRef<int64_t>> scaleShape,
                                  int opIdx, ScaleDotElemType format,
                                  bool kPack) -> int32_t {
+    if (isMXFP6ScaleType(format) && !kPack) {
+      errMsg = "fp6 operands must be packed along K (kPack must be true)";
+      return 0;
+    }
     if (!scaleShape)
       return 0;
     if (llvm::product_of(*scaleShape) == 1)
       return 0;
 
-    int64_t unpackFactor = (format == ScaleDotElemType::E2M1 && kPack) ? 2 : 1;
     int64_t kdim = operandShape[opIdx == 0 ? operandShape.size() - 1
-                                           : operandShape.size() - 2] *
-                   unpackFactor;
+                                           : operandShape.size() - 2];
+    if (format == ScaleDotElemType::E2M1 && kPack) {
+      kdim *= 2;
+    } else if (isMXFP6ScaleType(format) && kPack) {
+      // fp6 shapes count logical values; global storage is dense,
+      // consumed in groups of 16 values (12 bytes).
+      if (kdim % 16 != 0) {
+        std::ostringstream oss;
+        oss << "logical K dim " << kdim
+            << " must be a multiple of 16 for fp6 (groups of 16 values / "
+               "12 bytes)";
+        errMsg = oss.str();
+        return 0;
+      }
+    }
     int32_t scaleFactor = kdim / (*scaleShape)[scaleShape->size() - 1];
     if (scaleFactor != 16 && scaleFactor != 32) {
       std::ostringstream oss;
@@ -708,6 +913,15 @@ bool ReduceOp::hasDefinedOrdering() {
   return attr && attr.getValue() != "unordered";
 }
 
+std::optional<std::string>
+ReduceOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  auto ordering = getReductionOrderingAttr();
+  if (ordering && ordering.getValue() == "inner_tree")
+    return "NPOT mixed-radix layout is not yet supported on an inner_tree "
+           "reduce";
+  return std::nullopt;
+}
+
 //-- ScanOp --
 void ScanOp::build(OpBuilder &builder, OperationState &state,
                    ValueRange operands, int axis, bool reverse,
@@ -748,6 +962,58 @@ llvm::SmallVector<RankedTensorType> ScanOp::getInputTypes() {
 
 llvm::SmallVector<Type> ScanOp::getElementTypes() {
   return getElementTypesImpl(this->getOperands());
+}
+
+// Walks bases: LinearEncodingAttr's per-dim counts lose the order checked here.
+std::optional<SmallVector<unsigned>>
+ScanOp::getBlockedTile(const LinearLayout &layout) {
+  // A general offset table hides its digits' steps from the bases.
+  if (!layout.hasOddPartForm())
+    return std::nullopt;
+  MLIRContext *ctx = layout.getOutDimNames().begin()->getContext();
+  auto kReg = StringAttr::get(ctx, "register");
+  LinearLayout ll = layout.removeZeroBasesAlongDim(kReg);
+  auto nonZero = [](int32_t b) { return b != 0; };
+  SmallVector<unsigned> tile(ll.getNumOutDims(), 1);
+  // A thread's contiguous run, as LinearEncodingAttr::getContigPerThread.
+  const auto &regs = ll.getBases().lookup(kReg);
+  int runDim = -1;
+  for (const auto &basis :
+       ArrayRef(regs).take_front(ll.getNumLeadingRadix2Digits(kReg))) {
+    unsigned dim = llvm::find_if(basis, nonZero) - basis.begin();
+    if (llvm::count_if(basis, nonZero) != 1 || basis[dim] != tile[dim] ||
+        (int(dim) != runDim && tile[dim] != 1))
+      break;
+    runDim = dim;
+    tile[dim] *= 2;
+  }
+  for (const char *inDim : {"lane", "warp"}) {
+    SmallVector<int> last(tile.size(), -1);
+    const auto &bases = ll.getBases().lookup(StringAttr::get(ctx, inDim));
+    for (auto [pos, basis] : llvm::enumerate(bases)) {
+      auto count = llvm::count_if(basis, nonZero);
+      if (count == 0)
+        continue;
+      unsigned dim = llvm::find_if(basis, nonZero) - basis.begin();
+      if (count != 1 || basis[dim] != tile[dim] ||
+          (last[dim] >= 0 && last[dim] + 1 != int(pos)))
+        return std::nullopt;
+      last[dim] = pos;
+      tile[dim] *= 2;
+    }
+  }
+  return tile;
+}
+
+std::optional<std::string>
+ScanOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  auto ordering = getReductionOrderingAttr();
+  if (ordering && ordering.getValue() == "inner_tree")
+    return "NPOT mixed-radix layout is not yet supported on an inner_tree scan";
+  if (!getBlockedTile(layout))
+    return "NPOT mixed-radix layout is not yet supported on a scan whose lanes "
+           "or warps are not blocked";
+  return std::nullopt;
 }
 
 //-- MapElementwiseOp
@@ -892,10 +1158,8 @@ LogicalResult ExpandDimsOp::canonicalize(ExpandDimsOp op,
       Dialect &dialect = srcEnc.getDialect();
       auto inferLayoutInterface = cast<DialectInferLayoutInterface>(&dialect);
       if (failed(inferLayoutInterface->inferExpandDimsOpEncoding(
-              srcEnc, op.getAxis(), newExpandEnc, op.getLoc()))) {
-        return emitOptionalError(op.getLoc(),
-                                 "failed to infer layout for ExpandDimsOp");
-      }
+              srcEnc, op.getAxis(), newExpandEnc, std::nullopt)))
+        return failure();
     }
 
     auto newExpandTy = RankedTensorType::get(
@@ -965,6 +1229,28 @@ void ReshapeOp::build(OpBuilder &builder, OperationState &state,
   build(builder, state, dstTy, src, allowReorder);
 }
 
+// The reshape verifier's layout rule; the reshape(reshape) fold asks it too.
+static LogicalResult verifyReshapeEncoding(RankedTensorType srcTy,
+                                           RankedTensorType dstTy,
+                                           bool allowReorder,
+                                           std::optional<Location> loc) {
+  Attribute srcEnc = srcTy.getEncoding();
+  Attribute dstEnc = dstTy.getEncoding();
+  if (!srcEnc || !dstEnc || encodingContainsTlxPlaceholder(srcEnc) ||
+      encodingContainsTlxPlaceholder(dstEnc))
+    return success();
+  Attribute inferredDstEnc = dstEnc;
+  auto layoutInterface =
+      cast<DialectInferLayoutInterface>(&srcEnc.getDialect());
+  auto result = layoutInterface->inferReshapeOpEncoding(
+      srcTy.getShape(), srcEnc, dstTy.getShape(), inferredDstEnc, allowReorder,
+      loc);
+  if (failed(result))
+    return failure();
+  return layoutInterface->verifyLayoutsAreEqual(dstTy.getShape(),
+                                                inferredDstEnc, dstEnc, loc);
+}
+
 LogicalResult ReshapeOp::canonicalize(ReshapeOp op, PatternRewriter &rewriter) {
   if (op.getEfficientLayout())
     return failure();
@@ -988,6 +1274,11 @@ LogicalResult ReshapeOp::canonicalize(ReshapeOp op, PatternRewriter &rewriter) {
     // Allow reorder if either reshape allowed it
     const bool allowReorder =
         (op.getAllowReorder() || parentReshape.getAllowReorder());
+    // Keep both reshapes when the merged one would fail the verifier.
+    if (failed(verifyReshapeEncoding(parentReshape.getSrc().getType(),
+                                     op.getType(), allowReorder,
+                                     /*loc=*/std::nullopt)))
+      return failure();
     rewriter.replaceOpWithNewOp<ReshapeOp>(op, op.getType(),
                                            parentReshape.getSrc(), allowReorder,
                                            op.getEfficientLayout());
@@ -1043,16 +1334,7 @@ LogicalResult ReshapeOp::verify() {
   // inferred dst encoding is the same as the given dst encoding. We pass the
   // current dst encoding as a hint so that allowReorder reshapes are guaranteed
   // to produce the current encoding iff it is valid.
-  Attribute inferredDstEnc = dstEnc;
-  auto layoutInterface =
-      cast<DialectInferLayoutInterface>(&srcEnc.getDialect());
-  auto result = layoutInterface->inferReshapeOpEncoding(
-      srcTy.getShape(), srcEnc, dstTy.getShape(), inferredDstEnc,
-      getAllowReorder(), getLoc());
-  if (failed(result))
-    return failure();
-  return layoutInterface->verifyLayoutsAreEqual(
-      dstTy.getShape(), inferredDstEnc, dstEnc, getLoc());
+  return verifyReshapeEncoding(srcTy, dstTy, getAllowReorder(), getLoc());
 }
 
 //-- FpToFpOp --
@@ -1296,6 +1578,15 @@ LogicalResult BroadcastOp::verify() {
              << i << " between source and result.  "
              << "Broadcast requires the source dimension to be 1.";
     }
+  }
+  auto srcEncoding = srcTensorType.getEncoding();
+  if (srcEncoding && resultTensorType.getEncoding()) {
+    auto interface =
+        cast<DialectInferLayoutInterface>(&srcEncoding.getDialect());
+    if (failed(interface->verifyBroadcastOpEncoding(srcTensorType,
+                                                    resultTensorType)))
+      return emitOpError("requires matching source and result layouts up to "
+                         "broadcasting");
   }
   return success();
 }
@@ -1817,12 +2108,24 @@ LogicalResult SplitOp::fold(FoldAdaptor adaptor,
 
 // -- ElementwiseInlineAsmOp --
 void ElementwiseInlineAsmOp::getEffects(
-    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
-        &effects) {
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   if (getPure())
     return;
-  effects.emplace_back(MemoryEffects::Write::get());
   effects.emplace_back(MemoryEffects::Read::get());
+  effects.emplace_back(MemoryEffects::Write::get());
+  for (OpOperand &operand : getOperation()->getOpOperands())
+    if (auto *interface = dyn_cast<DialectInlineAsmInterface>(
+            &operand.get().getType().getDialect()))
+      interface->getOperandEffects(operand, effects);
+}
+
+LogicalResult verifyInlineAsmOperands(Operation *op, bool isPure) {
+  for (OpOperand &operand : op->getOpOperands())
+    if (auto *interface = dyn_cast<DialectInlineAsmInterface>(
+            &operand.get().getType().getDialect()))
+      if (failed(interface->verifyOperand(operand, isPure)))
+        return failure();
+  return success();
 }
 
 Speculation::Speculatability ElementwiseInlineAsmOp::getSpeculatability() {
@@ -1832,17 +2135,31 @@ Speculation::Speculatability ElementwiseInlineAsmOp::getSpeculatability() {
 }
 
 LogicalResult ElementwiseInlineAsmOp::verify() {
-  if (getNumOperands() >= 1) {
-    auto tensorType = dyn_cast<RankedTensorType>(getOperand(0).getType());
-    size_t numInputElems = tensorType ? tensorType.getNumElements() : 0;
-    if (numInputElems % this->getPackedElement() != 0) {
+  if (getPackedElement() <= 0)
+    return emitOpError("packed_element must be positive");
+  RankedTensorType tensorType;
+  for (Type type : llvm::concat<Type>(getOperandTypes(), getResultTypes())) {
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    if (!tensor)
+      continue;
+    if (tensorType && tensor.getShape() != tensorType.getShape())
+      return emitOpError("requires matching tensor shapes");
+    if (tensorType) {
+      Attribute encodingA = unwrapTlxWrappers(tensor.getEncoding());
+      Attribute encodingB = unwrapTlxWrappers(tensorType.getEncoding());
+      if (encodingA && encodingB && encodingA != encodingB)
+        return emitOpError("requires matching tensor encodings");
+    }
+    tensorType = tensor;
+    size_t numInputElems = tensor.getNumElements();
+    if (numInputElems % getPackedElement() != 0) {
       return emitError("number of input elements ")
              << numInputElems
              << " must be a multiple of the op's packed_element attribute, "
              << getPackedElement();
     }
   }
-  return success();
+  return verifyInlineAsmOperands(*this, getPure());
 }
 
 // -- ExternElementwiseOp --
@@ -2026,6 +2343,36 @@ LogicalResult DescriptorStoreOp::verify() {
 LogicalResult DescriptorReduceOp::verify() {
   return verifyDescriptorLoadStoreOp(*this, getDesc().getType(),
                                      getSrc().getType());
+}
+
+std::optional<std::string>
+DescriptorLoadOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorStoreOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorReduceOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorGatherOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string> DescriptorScatterOp::getMixedRadixUnsupportedReason(
+    const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
 }
 
 } // namespace triton

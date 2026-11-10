@@ -7,6 +7,7 @@
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 
 namespace mlir {
@@ -174,6 +175,8 @@ public:
   unsigned getNumOperands() { return scanOp.getNumOperands(); }
   SmallVector<Type> getElementTypes() { return srcElementTypes; }
   SmallVector<unsigned> getOrder() { return order; }
+  // The source register of each blocked index; empty for a Blocked source.
+  ArrayRef<unsigned> getBlockedToSrc() { return blockedToSrc; }
   Region &getCombineOp();
 
 private:
@@ -183,6 +186,7 @@ private:
   llvm::ArrayRef<int64_t> srcShape;
   SmallVector<Type> srcElementTypes;
   SmallVector<unsigned> order;
+  SmallVector<unsigned> blockedToSrc;
 };
 
 // Helper class for lowering `tt.gather` operations. This class shares lowering
@@ -202,41 +206,138 @@ private:
   RankedTensorType dstTy;
 };
 
-// This struct represents the factorization of a warp-local layout conversion
-// into three components: a register-only permutation, a lane-only permutation,
-// and a set of swaps between lane and register basis vectors. Algebraically, it
-// represents the factorization P = P_mixed \circ P_lane \circ P_reg. It is used
-// to aid in the implementation of the layout conversion using warp-shuffles.
+// For permutation cases, this struct represents the factorization of a
+// warp-local layout conversion into three components: a register-only
+// permutation, a lane-only permutation, and a set of swaps between lane and
+// register basis vectors. Algebraically, it represents the factorization
+// P = P_mixed \circ P_lane \circ P_reg. It is used to aid in the implementation
+// of the layout conversion using warp-shuffles.
 //
-// `pReg` and `pLane` are square layouts each with only one input and output
-// dimension. `mixedTranspositions` holds pairs of integers (i, j)
-// corresponding to the transposition (r_i l_j) of the i-th register basis
-// vector with the j-th lane basis vector along with 16-bit selectors for byte
-// permute instructions (where each of the four nybbles is in the range [0, 7]).
+// `pReg` is a square permutation of the padded registers. `shuffleMap` maps
+// register/lane/warp/block coordinates to source lanes for the shuffle stage.
+// `mixedTranspositions` holds the register bit and source/destination lane bits
+// for each exchange, along with 16-bit selectors for byte permute instructions
+// (where each of the four nybbles is in the range [0, 7]). A lane bit of -1
+// denotes a constant-zero predicate for a one-sided exchange.
 // `nPack` gives the number of basis vectors that can be used for register
 // packing while ensuring packed elements arrive at the same destination lane.
 struct DecomposedWarpConversion {
   struct TranspositionInfo {
-    std::pair<int, int> transposition;
+    int regBit;
+    int srcLane;
+    int dstLane;
     uint16_t topPreSel = 0x3210;
     uint16_t botPreSel = 0x7654;
     uint16_t topPostSel = 0x3210;
     uint16_t botPostSel = 0x7654;
   };
 
-  triton::LinearLayout pReg, pLane;
+  triton::LinearLayout pReg, shuffleMap;
   SmallVector<TranspositionInfo> mixedTranspositions;
   int nPack;
 };
 
-// Produces a decomposition of a permutation describing a warp-local layout
-// conversion as described in `DecomposedWarpConversion` above.
+enum class MixedRadixConversionTransfer {
+  Register,
+  Warp,
+  Shared,
+};
+
+// Register digits both layouts share, each alone setting its out dim's odd
+// part or one binary bit. A Shared transfer loops over them, as the pow2 path
+// loops over reps, moving one tile per value.
+struct MixedRadixSharedTiling {
+  SmallVector<int32_t> sourceDigits;
+  SmallVector<int32_t> destinationDigits;
+  triton::LinearLayout sourceTile;
+  triton::LinearLayout destinationTile;
+};
+
+// The odd tiles of a Shared transfer: each NPOT out dim's odd part peeled off
+// both layouts. nullopt unless that leaves pow2 tile layouts.
+std::optional<MixedRadixSharedTiling>
+getMixedRadixSharedTiles(const triton::LinearLayout &src,
+                         const triton::LinearLayout &dst);
+
+// Elements per shared access on `dim` when it is a tile's fastest dim.
+int32_t getMixedRadixSharedRunLength(const triton::LinearLayout &layout,
+                                     int32_t dim, unsigned bitwidth);
+
+// The odd tiles of a Shared transfer that transposes: each side has a vector
+// but no dim keeps one on both, so a single shared order leaves a side scalar.
+std::optional<MixedRadixSharedTiling>
+getMixedRadixTransposeTiles(const triton::LinearLayout &src,
+                            const triton::LinearLayout &dst, unsigned bitwidth);
+
+// The pow2 padding of a mixed-radix `layout`: each digit of odd radix r becomes
+// ceil(log2 r) binary digits, so each out dim pads to its next power of two.
+triton::LinearLayout padMixedRadixLayout(const triton::LinearLayout &layout);
+
+// Built only by the factories, so no plan is default or partial: unsupported
+// (`unsupportedReason` only), shared (Shared transfer) or factored (Register or
+// Warp transfer, with the register/lane permutation factors).
+struct MixedRadixConversionPlan {
+  static MixedRadixConversionPlan unsupported(std::string unsupportedReason);
+  static MixedRadixConversionPlan
+  shared(triton::MixedRadixConversionScope scope,
+         llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks);
+  // Register transfer and scope when `map.laneMap` is the identity,
+  // otherwise Warp.
+  static MixedRadixConversionPlan
+  factored(llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+           triton::MixedRadixConversionInputMap map);
+
+  std::optional<MixedRadixConversionTransfer> transfer;
+  std::optional<triton::MixedRadixConversionScope> scope;
+  std::optional<std::string> unsupportedReason;
+  llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks;
+  // pReg takes a source register to its destination register in
+  // destinationRegisterOrder's input order; shuffleMap takes a destination
+  // lane to its source lane.
+  std::optional<DecomposedWarpConversion> warpFactors;
+  std::optional<triton::ColumnAction> destinationRegisterOrder;
+  // Set by getMixedRadixConversionPlan, which knows the element bitwidth.
+  std::optional<MixedRadixSharedTiling> sharedTiling;
+
+  bool supported() const { return !unsupportedReason.has_value(); }
+
+private:
+  MixedRadixConversionPlan(
+      std::optional<MixedRadixConversionTransfer> transfer,
+      std::optional<triton::MixedRadixConversionScope> scope,
+      std::optional<std::string> unsupportedReason,
+      llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+      std::optional<DecomposedWarpConversion> warpFactors,
+      std::optional<triton::ColumnAction> destinationRegisterOrder);
+};
+
+// Plan a mixed-radix conversion in closed form. A failed preflight gives a
+// unsupported plan; a register/lane map gives a factored plan, else a shared
+// one.
+MixedRadixConversionPlan
+planMixedRadixLayoutConversion(const triton::LinearLayout &srcLayout,
+                               const triton::LinearLayout &dstLayout,
+                               ArrayRef<int64_t> logicalShape);
+
+// The plan of a convert with a mixed-radix layout on either side, else nullopt.
+std::optional<MixedRadixConversionPlan>
+getMixedRadixConversionPlan(RankedTensorType srcTy, RankedTensorType dstTy);
+
+// Scratch bytes of a convert with a mixed-radix layout, else nullopt: one tile
+// (the whole tensor if untiled) for a Shared plan, 0 for the other plans.
+std::optional<unsigned>
+getMixedRadixConversionScratchBytes(triton::gpu::ConvertLayoutOp op);
+
+// Produces a warp-local decomposition.
 //
-// This function handles cases where the numbers of register and lane basis
-// vectors differ between the two layouts. This is done by padding the smaller
+// For permutation cases, the numbers of register and lane basis vectors may
+// differ between the two layouts. This is handled by padding the smaller
 // dimension(s) with zero vectors, ensuring that the layout conversion can be
-// represented as a permutation. The layouts must not contain broadcasted
-// register bases.
+// represented as a permutation.
+//
+// Supports permutation layouts with warp/CTA-dependent lane selection. Source
+// registers must not depend on warp/CTA coordinates.
+// The layouts must not contain broadcasted register bases.
 DecomposedWarpConversion
 getWarpLayoutConvertDecomposition(const triton::LinearLayout &srcLayout,
                                   const triton::LinearLayout &dstLayout,
@@ -273,7 +374,8 @@ unsigned getNumScratchElements(ArrayRef<unsigned> shape);
 
 bool supportWMMA(triton::DotOp op);
 
-bool supportMMA(triton::DotOp op, int version);
+bool supportMMA(triton::DotOp op, int version,
+                std::optional<int> knownNumWarps = std::nullopt);
 
 bool supportMMA(triton::DotOpInterface op, int version);
 
@@ -318,10 +420,16 @@ bool hasOpOfAnyTypeInForwardSlice(Operation *liveOp) {
   return false;
 }
 
+// A mixed-radix conversion answers from its plan.
+bool isCvtDimSync(RankedTensorType srcTy, RankedTensorType dstTy,
+                  StringAttr dim);
+
 bool isCvtDimSync(const triton::LinearLayout &srcLayout,
                   const triton::LinearLayout &dstLayout, StringAttr dim);
 
 namespace triton {
+
+bool canUseWarpBallotHistogram(HistogramOp op);
 
 struct BarrierStages {
   // Stages are independent: for example, a release atomic with scratch has
@@ -339,6 +447,10 @@ struct BarrierStages {
 // broadcast barrier at that scope supplies the post-atomic rendezvous itself.
 BarrierStages getAtomicBarrierStages(MemSemantic semantic,
                                      bool hasResultBarrier);
+
+// Lane bits to clear when shuffling an atomic result from its issuing lane.
+// Returns nullopt when broadcasting the result requires shared memory.
+std::optional<int32_t> getAtomicResultShuffleMask(Value result);
 
 // Whether distributing an atomic result requires communication between CTAs.
 bool atomicResultHasCTABroadcast(Operation *op);

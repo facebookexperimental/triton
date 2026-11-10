@@ -63,11 +63,37 @@ CGAEncodingAttr updateCGALayoutForShape(CGAEncodingAttr cgaLayout,
   return CGAEncodingAttr::get(ctx, std::move(ll));
 }
 
+bool isPartitionedEncodingCompatibleWithShape(
+    PartitionedSharedEncodingAttr encoding, ArrayRef<int64_t> shape) {
+  auto pieceLayout = cast<LayoutEncodingTrait>(encoding.getPartitionLayout());
+  unsigned dim = encoding.getPartitionDim();
+  return pieceLayout.getRank() == shape.size() && dim < shape.size() &&
+         shape[dim] % encoding.getNumLogicalPieces() == 0;
+}
+
 SharedEncodingTrait updateEncodingForShape(Operation *op,
                                            SharedEncodingTrait encoding,
                                            RankedTensorType tensorType) {
   auto ctx = encoding.getContext();
   auto cgaLayout = getCGALayout(encoding);
+  if (auto partitioned = dyn_cast<PartitionedSharedEncodingAttr>(encoding)) {
+    // Descriptors get partitioned encodings only from allocations whose
+    // layout fits the descriptor's shape; descriptor layout selection skips
+    // the rest and the TDM verifier reports them.
+    assert(isPartitionedEncodingCompatibleWithShape(partitioned,
+                                                    tensorType.getShape()) &&
+           "tensor descriptor shape does not fit its shared memory partitions");
+    auto pieceShape = llvm::to_vector(tensorType.getShape());
+    unsigned dim = partitioned.getPartitionDim();
+    pieceShape[dim] /= partitioned.getNumLogicalPieces();
+    auto pieceType =
+        RankedTensorType::get(pieceShape, tensorType.getElementType());
+    auto pieceEncoding =
+        updateEncodingForShape(op, partitioned.getPartitionLayout(), pieceType);
+    return PartitionedSharedEncodingAttr::get(
+        ctx, partitioned.getNumPartitions(), partitioned.getNumGroups(), dim,
+        pieceEncoding);
+  }
   if (auto nvmmaEnc = dyn_cast<NVMMASharedEncodingAttr>(encoding)) {
     auto existingCga = nvmmaEnc.getCGALayout();
     if (!existingCga)
@@ -76,7 +102,8 @@ SharedEncodingTrait updateEncodingForShape(Operation *op,
     auto newCgaEnc = updateCGALayoutForShape(cgaLayout, tensorType.getShape());
     return NVMMASharedEncodingAttr::get(
         ctx, nvmmaEnc.getSwizzlingByteWidth(), nvmmaEnc.getTransposed(),
-        nvmmaEnc.getElementBitWidth(), nvmmaEnc.getFp4Padded(), newCgaEnc);
+        nvmmaEnc.getElementBitWidth(), nvmmaEnc.getFp4Padded(), newCgaEnc,
+        nvmmaEnc.getFp6Padded());
   }
   if (auto swizEnc = dyn_cast<SwizzledSharedEncodingAttr>(encoding)) {
     auto existingCga = swizEnc.getCGALayout();

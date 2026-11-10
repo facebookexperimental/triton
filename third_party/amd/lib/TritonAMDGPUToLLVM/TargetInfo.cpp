@@ -1,15 +1,21 @@
 #include "TargetInfo.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
-#include "TritonAMDGPUToLLVM/GCNAsmFormat.h"
 #include "Utility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
 using mlir::LLVM::AMD::DppCtrl;
 using mlir::triton::amdgpu::ISAFamily;
 namespace mlir::triton::AMD {
+
+void registerTargetInfo() {
+  TargetInfoBase::registerFactory("hip", [](ModuleOp moduleOp) {
+    return std::make_unique<TargetInfo>(getAMDArch(moduleOp));
+  });
+}
 
 namespace {
 template <typename T>
@@ -174,8 +180,8 @@ Value TargetInfo::rematerializeDistributedCoordinate(RewriterBase &rewriter,
   auto inlineAsm = LLVM::InlineAsmOp::create(
       rewriter, loc, coordinate.getType(), ValueRange{coordinate}, "", "=v,0",
       /*has_side_effects=*/true,
-      /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-      operandAttrs);
+      /*is_align_stack=*/false, LLVM::TailCallKind::None, /*convergent=*/false,
+      asmDialect, operandAttrs);
   return inlineAsm->getResult(0);
 }
 
@@ -215,6 +221,37 @@ StringRef TargetInfo::getAtomicSyncScope(MemSyncScope scope) const {
   llvm_unreachable("unknown memory synchronization scope");
 }
 
+Value TargetInfo::loadRelaxed(RewriterBase &rewriter, Location loc, Value ptr,
+                              Type valueTy, Value pred,
+                              MemSyncScope scope) const {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto results =
+      emitPredicated(rewriter, loc, pred, ValueRange{b.undef(valueTy)}, [&] {
+        unsigned alignment = valueTy.getIntOrFloatBitWidth() / 8;
+        Value loaded = LLVM::LoadOp::create(
+            rewriter, loc, valueTy, ptr, alignment, /*isVolatile=*/false,
+            /*isNonTemporal=*/false, /*isInvariant=*/false,
+            /*isInvariantGroup=*/false, LLVM::AtomicOrdering::monotonic,
+            getAtomicSyncScope(scope));
+        return SmallVector<Value>{loaded};
+      });
+  return results.front();
+}
+
+void TargetInfo::storeRelaxed(RewriterBase &rewriter, Location loc, Value ptr,
+                              Value value, Value pred,
+                              MemSyncScope scope) const {
+  emitPredicated(rewriter, loc, pred, ValueRange{}, [&] {
+    unsigned alignment = value.getType().getIntOrFloatBitWidth() / 8;
+    LLVM::StoreOp::create(rewriter, loc, value, ptr, alignment,
+                          /*isVolatile=*/false, /*isNonTemporal=*/false,
+                          /*isInvariantGroup=*/false,
+                          LLVM::AtomicOrdering::monotonic,
+                          getAtomicSyncScope(scope));
+    return SmallVector<Value>{};
+  });
+}
+
 void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
                          triton::gpu::AddrSpace targets) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -228,8 +265,17 @@ void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter,
 }
 
 void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {
-  LLVM::createLLVMIntrinsicCallOp(rewriter, loc, "llvm.amdgcn.wave.barrier", {},
-                                  {});
+  Attribute localMMRA =
+      rewriter.getAttr<LLVM::MMRATagAttr>("amdgpu-synchronize-as", "local");
+  auto emitFence = [&](LLVM::AtomicOrdering ordering) {
+    auto fence = LLVM::FenceOp::create(rewriter, loc, ordering,
+                                       /*syncscope=*/"wavefront");
+    fence->setDiscardableAttr(LLVM::LLVMDialect::getMmraAttrName(), localMMRA);
+  };
+
+  emitFence(LLVM::AtomicOrdering::release);
+  ROCDL::WaveBarrierOp::create(rewriter, loc);
+  emitFence(LLVM::AtomicOrdering::acquire);
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
@@ -242,6 +288,12 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   if (barrierPtr.has_value()) {
     llvm::report_fatal_error("AMDGPU does not support barrier-based "
                              "synchronization for remote stores");
+  }
+  if (isa<LLVM::LLVMPointerType>(getElementTypeOrSelf(val.getType()))) {
+    Type storeTy = i64_ty;
+    if (auto vecTy = dyn_cast<VectorType>(val.getType()))
+      storeTy = vecTy.clone(i64_ty);
+    val = TritonLLVMOpBuilder(loc, rewriter).ptrtoint(storeTy, val);
   }
   mlir::LLVM::AMD::llStore(rewriter, loc, ptr, val, pred);
 }
@@ -260,6 +312,14 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
   if (ctaId) {
     llvm::report_fatal_error(
         "AMDGPU does not support cross-CTA shared memory transfers");
+  }
+  if (isa<LLVM::LLVMPointerType>(getElementTypeOrSelf(elemTy))) {
+    Type loadTy = i64_ty;
+    if (auto vecTy = dyn_cast<VectorType>(elemTy))
+      loadTy = vecTy.clone(i64_ty);
+    Value result =
+        loadDShared(rewriter, loc, ptr, ctaId, loadTy, pred, localLoadOp);
+    return TritonLLVMOpBuilder(loc, rewriter).inttoptr(elemTy, result);
   }
   Value falseVal = LLVM::ConstantOp::create(rewriter, loc, elemTy,
                                             rewriter.getZeroAttr(elemTy));
@@ -337,7 +397,8 @@ static inline Value truncAndCastFromInt(RewriterBase &rewriter, Location loc,
   Value toVal = val;
 
   if (originalBits < fromBits) {
-    toVal = b.trunc(int_ty(originalBits), toVal);
+    toVal =
+        b.trunc(int_ty(originalBits), toVal, LLVM::IntegerOverflowFlags::nsw);
   }
 
   if (!valType.isIntOrIndex()) {
@@ -589,10 +650,10 @@ bool TargetInfo::warpReduceInnerTree(RewriterBase &rewriter, Location loc,
   return true;
 }
 
-bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
-                            SmallVector<Value> &acc, triton::ReduceOp op,
-                            unsigned numLaneToReduce,
-                            unsigned interleave) const {
+bool TargetInfo::warpReduce(
+    RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
+    triton::ReduceOp op, unsigned numLaneToReduce, unsigned interleave,
+    std::optional<unsigned> /*broadcastLaneIdMask*/) const {
   // A defined reduction ordering (currently only "inner_tree") requires a
   // fixed, layout-invariant reduction tree so the result is bitwise-identical
   // across num_warps / BLOCK_SIZE. Emit it via the dedicated count-up path; the
@@ -689,12 +750,6 @@ void TargetInfo::printfImpl(Value formatStrStart, int formatStrByteCount,
   }
 }
 
-std::string TargetInfo::getMulhiFuncName(Type resultElementTy) const {
-  std::string funcName =
-      resultElementTy.isInteger(32) ? "__ockl_mul_hi_u32" : "__ockl_mul_hi_u64";
-  return funcName;
-}
-
 void TargetInfo::printf(RewriterBase &rewriter, Value formatStrStart,
                         int formatStrByteCount, ValueRange args,
                         ArrayRef<bool> isSigned) const {
@@ -750,7 +805,7 @@ void TargetInfo::assertFail(RewriterBase &rewriter, Location loc,
       rewriter, loc, LLVM::LLVMVoidType::get(ctx), /*operands=*/ValueRange{},
       "s_trap 2", /*constraints=*/"",
       /*has_side_effects=*/true, /*is_align_stack=*/false,
-      LLVM::TailCallKind::None,
+      LLVM::TailCallKind::None, /*convergent=*/false,
       LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT),
       /*operand_attrs=*/ArrayAttr::get(ctx, {}));
 }
@@ -837,8 +892,9 @@ bool TargetInfo::supportsBufferAtomicFadd(mlir::Type elementType) const {
   return targetFeatures.supportsBufferAtomicFadd(elementType);
 }
 
-int32_t TargetInfo::getBufferAtomicCachePolicy(bool hasUsers) const {
-  return targetFeatures.getBufferAtomicCachePolicy(hasUsers);
+int32_t TargetInfo::getBufferAtomicCachePolicy(bool hasUsers,
+                                               bool clusterScope) const {
+  return targetFeatures.getBufferAtomicCachePolicy(hasUsers, clusterScope);
 }
 
 bool TargetInfo::supportsWaveId() const {
@@ -859,12 +915,6 @@ bool TargetInfo::supportsHwScaledUpcast() const {
 
 bool TargetInfo::supportsHwScaledDowncast() const {
   return targetFeatures.supportsHwScaledDowncast();
-}
-
-void TargetInfo::localLoadOpAnnotation(triton::gpu::LocalLoadOp localLoadOp,
-                                       Operation *llLoadOp) const {
-  if (requiresAliasInfoForAsyncOps())
-    AMD::addLocalLoadNoAliasScope(localLoadOp, cast<LLVM::LoadOp>(llLoadOp));
 }
 
 bool TargetInfo::supportDppBroadcast() const {

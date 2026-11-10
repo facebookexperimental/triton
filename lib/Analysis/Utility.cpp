@@ -27,20 +27,23 @@ namespace mlir {
 using namespace triton;
 using namespace triton::gpu;
 
+// A non-binary digit of `layout` keeps its mixed-radix dim at the layout's
+// size.
 static SmallVector<std::pair<StringAttr, int32_t>>
-inferOutDims(const LinearLayout::BasesT &bases,
-             ArrayRef<StringAttr> outDimNames) {
+inferOutDims(const LinearLayout &layout, const LinearLayout::BasesT &bases) {
   SmallVector<std::pair<StringAttr, int32_t>> outDims;
-  outDims.reserve(outDimNames.size());
-  for (StringAttr outDim : outDimNames)
+  for (StringAttr outDim : layout.getOutDimNames())
     outDims.emplace_back(outDim, 1);
 
-  for (const auto &entry : bases) {
-    const auto &inDimBases = entry.second;
-    for (const auto &basis : inDimBases) {
-      for (int i = 0; i < basis.size(); i++)
-        outDims[i].second =
-            std::max<int32_t>(outDims[i].second, llvm::NextPowerOf2(basis[i]));
+  for (const auto &[inDim, inDimBases] : bases) {
+    for (auto [digit, basis] : llvm::enumerate(inDimBases)) {
+      bool binary = layout.getInputRadix(inDim, digit) == 2;
+      for (int i = 0; i < basis.size(); i++) {
+        int32_t size = binary || basis[i] == 0
+                           ? llvm::NextPowerOf2(basis[i])
+                           : layout.getOutDimSize(outDims[i].first);
+        outDims[i].second = std::max<int32_t>(outDims[i].second, size);
+      }
     }
   }
   return outDims;
@@ -75,6 +78,13 @@ unsigned ReduceOpHelper::getThreadOffsetOnReductionAxis() {
     offset *= 2;
   }
   return offset;
+}
+
+bool triton::canUseWarpBallotHistogram(HistogramOp op) {
+  int numBins = op.getType().getNumElements();
+  // Limit ballot and reduction overhead relative to shared-memory atomics.
+  return !hasCrossCTAScratch(op) && numBins <= 2 &&
+         numBins * gpu::lookupNumWarps(op) <= 4;
 }
 
 // Cases where distributed shared memory is not required in ConvertLayout:
@@ -422,8 +432,9 @@ LinearLayout ReduceOpHelper::getInterLayout(const LinearLayout &layout,
       std::swap(laneBases[zeroLaneBases[laneIdx]], blockBases[idx]);
       ++laneIdx;
     }
-    auto outDims = inferOutDims(bases, to_vector(layout.getOutDimNames()));
-    return LinearLayout(std::move(bases), std::move(outDims),
+    auto outDims = inferOutDims(layout, bases);
+    return LinearLayout(std::move(bases), layout.getInputRadices(),
+                        std::move(outDims),
                         /*requireSurjective=*/layout.isSurjective());
   }
 
@@ -444,8 +455,9 @@ LinearLayout ReduceOpHelper::getInterLayout(const LinearLayout &layout,
       std::swap(laneBases[laneIdx], blockBases[idx]);
       ++laneIdx;
     }
-    auto outDims = inferOutDims(bases, to_vector(layout.getOutDimNames()));
-    return LinearLayout(std::move(bases), std::move(outDims),
+    auto outDims = inferOutDims(layout, bases);
+    return LinearLayout(std::move(bases), layout.getInputRadices(),
+                        std::move(outDims),
                         /*requireSurjective=*/layout.isSurjective());
   }
 
@@ -469,8 +481,9 @@ LinearLayout ReduceOpHelper::getInterLayout(const LinearLayout &layout,
       break;
   }
 
-  auto outDims = inferOutDims(bases, to_vector(layout.getOutDimNames()));
-  return LinearLayout(std::move(bases), std::move(outDims),
+  auto outDims = inferOutDims(layout, bases);
+  return LinearLayout(std::move(bases), layout.getInputRadices(),
+                      std::move(outDims),
                       /*requireSurjective=*/layout.isSurjective());
 }
 
@@ -494,9 +507,9 @@ ReduceOpHelper::zeroBasesAlongDimAndReorder(const LinearLayout &layout,
   auto bases = layout.getBases();
   for (auto &basis : bases[dim])
     basis[axis] = 0;
-  auto outDims = inferOutDims(bases, to_vector(layout.getOutDimNames()));
-  return LinearLayout(std::move(bases), std::move(outDims),
-                      /*requireSurjective=*/false);
+  auto outDims = inferOutDims(layout, bases);
+  return LinearLayout(std::move(bases), layout.getInputRadices(),
+                      std::move(outDims), /*requireSurjective=*/false);
 }
 
 ColumnAction ReduceOpHelper::moveAxisBasesToFront(const LinearLayout &layout,
@@ -515,7 +528,46 @@ ColumnAction ReduceOpHelper::moveAxisBasesToFront(const LinearLayout &layout,
   std::stable_partition(
       permutation.begin() + isVectorized, permutation.end(),
       [&](size_t i) { return axisBases & (uint64_t{1} << i); });
-  return ColumnAction(permutation, kReg, numBases);
+  return ColumnAction(permutation, kReg, numBases,
+                      layout.getInputRadices(kReg));
+}
+
+// The scan indexes registers as a blocked layout does: elements, then blocks,
+// each in `order`. Map each blocked index to its mixed-radix source register,
+// or return empty if ScanOp::getBlockedTile rejects the layout.
+static SmallVector<unsigned> computeBlockedToSrc(LinearEncodingAttr encoding,
+                                                 ArrayRef<int64_t> shape,
+                                                 ArrayRef<unsigned> order) {
+  const LinearLayout &ll = encoding.getLinearLayout();
+  std::optional<SmallVector<unsigned>> tile = ScanOp::getBlockedTile(ll);
+  if (!tile)
+    return {};
+  auto kReg = StringAttr::get(encoding.getContext(), "register");
+  SmallVector<unsigned> contig = encoding.getContigPerThread();
+  unsigned numElems = product(contig);
+  unsigned numRegs = ll.getInDimSize(kReg);
+  SmallVector<unsigned> blockedToSrc(numRegs, numRegs);
+  for (unsigned reg = 0; reg < numRegs; ++reg) {
+    SmallVector<std::pair<StringAttr, int32_t>> ins;
+    for (StringAttr inDim : ll.getInDimNames())
+      ins.push_back({inDim, inDim == kReg ? reg : 0});
+    auto coords = ll.apply(ins);
+    unsigned elem = 0, block = 0, elemStride = 1, blockStride = 1;
+    for (unsigned dim : order) {
+      unsigned coord = coords[dim].second, extent = (*tile)[dim];
+      if (coord % extent >= contig[dim])
+        return {};
+      elem += coord % extent * elemStride;
+      block += coord / extent * blockStride;
+      elemStride *= contig[dim];
+      blockStride *= ceil<unsigned>(shape[dim], extent);
+    }
+    unsigned index = elem + numElems * block;
+    if (index >= numRegs || blockedToSrc[index] != numRegs)
+      return {};
+    blockedToSrc[index] = reg;
+  }
+  return blockedToSrc;
 }
 
 ScanLoweringHelper::ScanLoweringHelper(triton::ScanOp op) : scanOp(op) {
@@ -541,6 +593,8 @@ ScanLoweringHelper::ScanLoweringHelper(triton::ScanOp op) : scanOp(op) {
   } else {
     order = srcEncoding.getOrder();
   }
+  if (srcEncoding.getLinearLayout().hasNonPow2OutDim())
+    blockedToSrc = computeBlockedToSrc(srcEncoding, srcShape, order);
 
   for (const auto &t : op.getInputTypes()) {
     if (t.getShape() != srcShape) {
@@ -595,6 +649,7 @@ unsigned ScanLoweringHelper::getAxisNumBlocks() {
 }
 
 unsigned ScanLoweringHelper::getNonAxisNumBlocks() {
+  auto shapePerCTA = getShapePerCTA(getEncoding(), getShape());
   auto contigPerThread = getEncoding().getContigPerThread();
   auto threadsPerWarp = getEncoding().getThreadsPerWarp();
   auto warpsPerCTA = getEncoding().getWarpsPerCTA();
@@ -605,8 +660,8 @@ unsigned ScanLoweringHelper::getNonAxisNumBlocks() {
     if (i == axis)
       continue;
     numBlocks *=
-        ceil<unsigned>(getShape()[i], (contigPerThread[i] * threadsPerWarp[i] *
-                                       warpsPerCTA[i]));
+        ceil<unsigned>(shapePerCTA[i], (contigPerThread[i] * threadsPerWarp[i] *
+                                        warpsPerCTA[i]));
   }
   return numBlocks;
 }
@@ -614,9 +669,10 @@ unsigned ScanLoweringHelper::getNonAxisNumBlocks() {
 bool ScanLoweringHelper::isSupported() {
   // TODO: Support the following cases:
   // 1. Scan on non-blocking encodings
-  if (!isa<BlockedEncodingAttr>(legacyEncoding))
+  if (!isa<BlockedEncodingAttr>(legacyEncoding) && blockedToSrc.empty())
     return false;
-  return true;
+  // Partial results are only combined within each CTA.
+  return getCTASplitNum(srcEncoding)[getAxis()] == 1;
 }
 
 unsigned ScanLoweringHelper::getScratchSizeInElems() {
@@ -643,10 +699,10 @@ unsigned ScanLoweringHelper::getScratchSizeInBytes() {
   return elementSizeInBytes * getScratchSizeInElems();
 }
 
-static SmallVector<DecomposedWarpConversion::TranspositionInfo>
-getTranspositionSelectors(SmallVector<std::pair<int, int>> &mixedTranspositions,
-                          std::vector<std::vector<int32_t>> &regBases,
-                          int bitwidth);
+static void computeTranspositionSelectors(
+    SmallVector<DecomposedWarpConversion::TranspositionInfo>
+        &mixedTranspositions,
+    std::vector<std::vector<int32_t>> &regBases, int nPack);
 
 DecomposedWarpConversion
 getWarpLayoutConvertDecomposition(const LinearLayout &srcLayout,
@@ -660,7 +716,7 @@ getWarpLayoutConvertDecomposition(const LinearLayout &srcLayout,
   // matrix with zero columns possibly inserted. A layout conversion can be
   // viewed as a map P': H_src -> H_dst which factors ll_src = ll_dst \circ P'.
   //
-  // For a conversion not needing data movement between different warps, we
+  // For permutation cases not needing data movement between different warps, we
   // choose the following representation, where P is a permutation matrix and
   // K_1 and K_2 are (possibly trivial) spaces meant to ensure equally sized
   // lane and register dimensions between layouts:
@@ -679,7 +735,7 @@ getWarpLayoutConvertDecomposition(const LinearLayout &srcLayout,
   // subsequences of consecutive lane bits from cycles involving both bit types.
   // Further explanation of this method is below.
   //
-  // The decomposition is performed in three stages. First, we compute the
+  // For permutations, the decomposition has three stages. First, we compute the
   // permutation matrix `P` by using `invertAndCompose` to generate a skeleton
   // and then fill in any zero columns. Second, we walk the cycles of `P` to
   // factor out mixed transpositions to build `mixedTranspositions`, `pReg`, and
@@ -697,6 +753,11 @@ getWarpLayoutConvertDecomposition(const LinearLayout &srcLayout,
   auto *ctx = srcLayout.getInDimNames().begin()->getContext();
   StringAttr kReg = StringAttr::get(ctx, "register");
   StringAttr kLane = StringAttr::get(ctx, "lane");
+  StringAttr kWarp = StringAttr::get(ctx, "warp");
+  StringAttr kBlock = StringAttr::get(ctx, "block");
+  auto conversion = dstLayout.invertAndCompose(srcLayout);
+  uint32_t ownerLaneMask =
+      getOutputBasisMask(conversion, {kWarp, kBlock}, kLane);
 
   // Determine the target sizes of the register and lane dimensions for padding.
   int nSrcRegBases = srcLayout.getInDimSizeLog2(kReg);
@@ -712,6 +773,16 @@ getWarpLayoutConvertDecomposition(const LinearLayout &srcLayout,
   auto T = dstLayout.sublayout(inDimNames, outDimNames);
   S = S.resizeInDim(kReg, 1 << nRegBases).resizeInDim(kLane, 1 << nLaneBases);
   T = T.resizeInDim(kReg, 1 << nRegBases).resizeInDim(kLane, 1 << nLaneBases);
+
+  // Project out source lane bits selected by warp/CTA coordinates.
+  if (ownerLaneMask) {
+    auto bases = S.getBases();
+    for (auto [bit, basis] : llvm::enumerate(bases[kLane]))
+      if (ownerLaneMask & (uint32_t{1} << bit))
+        std::fill(basis.begin(), basis.end(), 0);
+    S = LinearLayout(std::move(bases), S.getOutDims(),
+                     /*requireSurjective=*/false);
+  }
 
   // We compute T^transpose \circ S, which serves as a skeleton for `P`, then
   // fill in zero columns, prioritizing producing fixed points. As we only need
@@ -744,16 +815,17 @@ getWarpLayoutConvertDecomposition(const LinearLayout &srcLayout,
     pBases[inDim][srcIdx][dstDimIdx] = 1 << dstIdx;
   }
 
-  // We walk the cycles of `P` to build the bases for `pReg` and `pLane` while
-  // factoring out mixed transpositions from cycles that include both register
-  // and lane basis vectors. `pReg` and `pLane` themselves only have one input
-  // and output dimension each.
-  LinearLayout::BasesT pRegBases, pLaneBases;
+  // Walk the cycles of `P`, building the register permutation and inverse
+  // lane map while factoring out mixed register/lane transpositions.
+  LinearLayout::BasesT pRegBases;
+  auto shuffleBases =
+      conversion.sublayout({kReg, kLane, kWarp, kBlock}, kLane).getBases();
   auto &regBases = pRegBases[kReg];
-  auto &laneBases = pLaneBases[kLane];
+  auto &laneBases = shuffleBases[kLane];
   regBases.resize(nRegBases, {0});
-  laneBases.resize(nLaneBases, {0});
-  SmallVector<std::pair<int, int>> mixedTranspositions;
+  shuffleBases[kReg].assign(nRegBases, {0});
+  laneBases.assign(nLaneBases, {0});
+  SmallVector<DecomposedWarpConversion::TranspositionInfo> mixedTranspositions;
 
   llvm::BitVector visited(nRegBases + nLaneBases, false);
   auto flatIdx = [&](StringAttr dim, int32_t index) {
@@ -782,12 +854,9 @@ getWarpLayoutConvertDecomposition(const LinearLayout &srcLayout,
       // indicates a contiguous subsequence of lane basis vectors. Note that the
       // transposition does not commute with the other two cycles.
       //
-      // The following variables are used to track the start and end points of
-      // such subsequences.
+      // Track the start of each lane subsequence.
       int32_t /*r_m*/ regStartIdx = -1;
       int32_t /*l_j*/ laneStartIdx = -1;
-      int32_t /*l_k*/ laneEndIdx = -1;
-      int32_t /*r_i*/ regEndIdx = -1;
 
       do {
         // Determine the next basis vector in the current cycle.
@@ -801,29 +870,26 @@ getWarpLayoutConvertDecomposition(const LinearLayout &srcLayout,
             nextIdx = llvm::Log2_32(nextVal);
           }
         }
-        // Set a `pReg` or `pLane` vector, or mark an r->l or l->r transition.
+        // Record a register edge, an inverse lane edge, or a mixed transition.
         if (currDim == kReg && nextDim == kReg) {
           regBases[currIdx][0] = 1 << nextIdx;
         } else if (currDim == kLane && nextDim == kLane) {
-          laneBases[currIdx][0] = 1 << nextIdx;
+          laneBases[nextIdx][0] = (1u << currIdx) & ~ownerLaneMask;
         } else if (currDim == kReg && nextDim == kLane) {
           regStartIdx = currIdx;
           laneStartIdx = nextIdx;
         } else {
-          regEndIdx = nextIdx;
-          laneEndIdx = currIdx;
-        }
-        // If a subsequence of the form (.. r_m l_j .. l_k r_i ..) has been
-        // found, perform the prescribed factorization.
-        if (regEndIdx >= 0) {
+          // Factor (.. r_m l_j .. l_k r_i ..) at this l_k -> r_i edge.
           // Assign r_m to map to r_i as in (.. r_m r_i ..).
-          regBases[regStartIdx][0] = 1 << regEndIdx;
-          // Assign l_k to map to l_j as in (l_j .. l_k).
-          laneBases[laneEndIdx][0] = 1 << laneStartIdx;
-          // Record (r_i l_j) as a factor.
-          mixedTranspositions.emplace_back(regEndIdx, laneStartIdx);
-          // Reset the auxiliary variables.
-          regStartIdx = laneStartIdx = laneEndIdx = regEndIdx = -1;
+          regBases[regStartIdx][0] = 1 << nextIdx;
+          // Padded endpoints need no lane predicate when warp/CTA selects
+          // source lanes. Omit their artificial closing edge as well.
+          int srcLane = ownerLaneMask && nextIdx >= nDstRegBases ? -1 : currIdx;
+          int dstLane =
+              ownerLaneMask && regStartIdx >= nSrcRegBases ? -1 : laneStartIdx;
+          if (srcLane >= 0 && dstLane >= 0)
+            laneBases[dstLane][0] = 1 << srcLane;
+          mixedTranspositions.push_back({nextIdx, srcLane, dstLane});
         }
 
         currDim = nextDim;
@@ -837,33 +903,354 @@ getWarpLayoutConvertDecomposition(const LinearLayout &srcLayout,
   int m = mixedTranspositions.size();
   int nPackPrelim = llvm::Log2_32(std::clamp(32 / bitwidth, 1, 4));
   int nPack = std::min(nPackPrelim, nRegBases - m);
-  auto processedTranspos =
-      getTranspositionSelectors(mixedTranspositions, regBases, nPack);
+  computeTranspositionSelectors(mixedTranspositions, regBases, nPack);
 
   auto pReg = LinearLayout(std::move(pRegBases), {{kReg, 1 << nRegBases}},
                            /*requireSurjective=*/true);
-  auto pLane = LinearLayout(std::move(pLaneBases), {{kLane, 1 << nLaneBases}},
-                            /*requireSurjective=*/true);
-  return {std::move(pReg), std::move(pLane), std::move(processedTranspos),
-          nPack};
+  for (const auto &t : mixedTranspositions)
+    if (t.srcLane >= 0)
+      shuffleBases[kReg][t.regBit][0] ^= 1u << t.srcLane;
+  auto shuffleMap =
+      LinearLayout(std::move(shuffleBases), {{kLane, 1 << nLaneBases}},
+                   /*requireSurjective=*/false);
+  return {std::move(pReg), std::move(shuffleMap),
+          std::move(mixedTranspositions), nPack};
 }
 
-static SmallVector<DecomposedWarpConversion::TranspositionInfo>
-getTranspositionSelectors(SmallVector<std::pair<int, int>> &mixedTranspositions,
-                          std::vector<std::vector<int32_t>> &regBases,
-                          int nPack) {
+MixedRadixConversionPlan::MixedRadixConversionPlan(
+    std::optional<MixedRadixConversionTransfer> transfer,
+    std::optional<MixedRadixConversionScope> scope,
+    std::optional<std::string> unsupportedReason,
+    llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+    std::optional<DecomposedWarpConversion> warpFactors,
+    std::optional<ColumnAction> destinationRegisterOrder)
+    : transfer(transfer), scope(scope),
+      unsupportedReason(std::move(unsupportedReason)),
+      sourceFreeVariableMasks(std::move(sourceFreeVariableMasks)),
+      warpFactors(std::move(warpFactors)),
+      destinationRegisterOrder(std::move(destinationRegisterOrder)) {}
+
+MixedRadixConversionPlan
+MixedRadixConversionPlan::unsupported(std::string unsupportedReason) {
+  return MixedRadixConversionPlan(std::nullopt, std::nullopt,
+                                  std::move(unsupportedReason), {},
+                                  std::nullopt, std::nullopt);
+}
+
+MixedRadixConversionPlan MixedRadixConversionPlan::shared(
+    MixedRadixConversionScope scope,
+    llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks) {
+  return MixedRadixConversionPlan(
+      MixedRadixConversionTransfer::Shared, scope, std::nullopt,
+      std::move(sourceFreeVariableMasks), std::nullopt, std::nullopt);
+}
+
+MixedRadixConversionPlan MixedRadixConversionPlan::factored(
+    llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+    MixedRadixConversionInputMap map) {
+  bool laneIdentity = squareSublayoutIsIdentity(
+      map.laneMap, to_vector(map.laneMap.getInDimNames()));
+  // shuffleMap reads each destination lane from its source lane: the inverse
+  // lane permutation, with no register, warp or block terms.
+  auto *ctx = map.laneMap.getInDimNames().begin()->getContext();
+  StringAttr kReg = StringAttr::get(ctx, "register");
+  StringAttr kLane = StringAttr::get(ctx, "lane");
+  LinearLayout::BasesT shuffleBases;
+  shuffleBases[kReg].assign(
+      llvm::Log2_32_Ceil(map.registerMap.getInDimSize(kReg)), {0});
+  shuffleBases[kLane] = map.laneMap.invert().getBases().lookup(kLane);
+  shuffleBases[StringAttr::get(ctx, "warp")];
+  shuffleBases[StringAttr::get(ctx, "block")];
+  LinearLayout shuffleMap(std::move(shuffleBases),
+                          {{kLane, map.laneMap.getInDimSize(kLane)}},
+                          /*requireSurjective=*/false);
+  return MixedRadixConversionPlan(
+      laneIdentity ? MixedRadixConversionTransfer::Register
+                   : MixedRadixConversionTransfer::Warp,
+      laneIdentity ? MixedRadixConversionScope::Register
+                   : MixedRadixConversionScope::Warp,
+      std::nullopt, std::move(sourceFreeVariableMasks),
+      DecomposedWarpConversion{std::move(map.registerMap),
+                               std::move(shuffleMap),
+                               /*mixedTranspositions=*/{}, /*nPack=*/0},
+      std::move(map.registerOrder));
+}
+
+// The register digit that alone sets `outDim`'s odd part (`bit` 0) or binary
+// `bit` in `layout`, with a unit basis on `outDim` only; -1 if there is none.
+// Like the pow2 reps, it keeps the leading digits that vectorize `outDim`.
+static int32_t findTileDigit(const LinearLayout &layout, StringAttr outDim,
+                             int32_t bit) {
+  if (!layout.hasOddPartForm())
+    return -1;
+  bool odd = bit == 0;
+  int32_t size = layout.getOutDimSize(outDim);
+  int32_t twoPart = LinearLayout::twoPartOf(size);
+  auto kReg = StringAttr::get(outDim.getContext(), "register");
+  int32_t run = 0;
+  while (run < layout.getNumLeadingRadix2Digits(kReg) &&
+         layout.getBasis(kReg, run, outDim) == 1 << run)
+    ++run;
+  int32_t found = -1;
+  for (StringAttr inDim : layout.getInDimNames()) {
+    ArrayRef<int32_t> radices = layout.getInputRadices(inDim);
+    for (int32_t pos = 0, e = radices.size(); pos < e; ++pos) {
+      auto part = layout.getBasisContribution(inDim, pos, outDim);
+      if (odd ? part.odd == 0 : (part.binary & bit) == 0)
+        continue;
+      bool unit =
+          odd ? part.binary == 0 && part.odd == 1 &&
+                    radices[pos] == size / twoPart
+              : part.binary == bit && part.odd == 0 && radices[pos] == 2;
+      if (found >= 0 || inDim != kReg || pos < run || !unit ||
+          llvm::count(layout.getBasis(inDim, pos), 0) + 1 !=
+              int64_t(layout.getNumOutDims()))
+        return -1;
+      found = pos;
+    }
+  }
+  return found;
+}
+
+// `layout` without register digit `pos`, with `outDim` cut to `size` and its
+// binary bits above `bit` (if nonzero) moved down over it.
+static std::optional<LinearLayout> dropTileDigit(const LinearLayout &layout,
+                                                 int32_t pos, StringAttr outDim,
+                                                 int32_t size, int32_t bit) {
+  auto outDims = layout.getOutDims();
+  int32_t outIndex = layout.getOutDimIndex(outDim);
+  outDims[outIndex].second = size;
+  LinearLayout::BasesT bases;
+  LinearLayout::RadicesT radices;
+  for (StringAttr inDim : layout.getInDimNames()) {
+    auto &inBases = bases[inDim];
+    auto &inRadices = radices[inDim];
+    for (auto [digit, radix] : llvm::enumerate(layout.getInputRadices(inDim))) {
+      if (inDim == "register" && int32_t(digit) == pos)
+        continue;
+      auto basis = to_vector(layout.getBasis(inDim, digit));
+      auto part = layout.getBasisContribution(inDim, digit, outDim);
+      int32_t binary =
+          bit ? (part.binary & (bit - 1)) | (part.binary >> 1 & ~(bit - 1))
+              : part.binary;
+      basis[outIndex] = binary + LinearLayout::twoPartOf(size) * part.odd;
+      inBases.emplace_back(basis.begin(), basis.end());
+      inRadices.push_back(radix);
+    }
+  }
+  return LinearLayout::tryCreate(std::move(bases), std::move(radices), outDims,
+                                 /*requireSurjective=*/false);
+}
+
+LinearLayout padMixedRadixLayout(const LinearLayout &layout) {
+  auto outDims = layout.getOutDims();
+  for (auto &[outDim, size] : outDims)
+    size = llvm::PowerOf2Ceil(size);
+  LinearLayout::BasesT bases;
+  for (StringAttr inDim : layout.getInDimNames()) {
+    auto &inBases = bases[inDim];
+    for (auto [digit, radix] : llvm::enumerate(layout.getInputRadices(inDim))) {
+      auto basis = to_vector(layout.getBasis(inDim, digit));
+      if (radix == 2) {
+        inBases.emplace_back(basis.begin(), basis.end());
+        continue;
+      }
+      for (int32_t bit = 1; bit < radix; bit *= 2) {
+        auto &padded = inBases.emplace_back(basis.size(), 0);
+        for (auto [i, outDim] : llvm::enumerate(layout.getOutDimNames()))
+          if (basis[i] != 0)
+            padded[i] =
+                LinearLayout::twoPartOf(layout.getOutDimSize(outDim)) * bit;
+      }
+    }
+  }
+  return LinearLayout(std::move(bases), outDims, /*requireSurjective=*/false);
+}
+
+// The register digit positions of `layout`.
+static SmallVector<int32_t> registerDigits(const LinearLayout &layout) {
+  auto kReg =
+      StringAttr::get(layout.getInDimNames().begin()->getContext(), "register");
+  return to_vector(
+      llvm::seq<int32_t>(0, int32_t(layout.getInputRadices(kReg).size())));
+}
+
+// Peels the digit that alone sets `outDim`'s `bit` (its odd part if 0) off both
+// tiles, recording its original positions; false if a tile has none.
+static bool peelTileDigit(MixedRadixSharedTiling &tiling,
+                          SmallVector<int32_t> &srcPositions,
+                          SmallVector<int32_t> &dstPositions, StringAttr outDim,
+                          int32_t bit) {
+  int32_t s = findTileDigit(tiling.sourceTile, outDim, bit);
+  int32_t d = findTileDigit(tiling.destinationTile, outDim, bit);
+  if (s < 0 || d < 0)
+    return false;
+  int32_t size = tiling.sourceTile.getOutDimSize(outDim);
+  size = bit ? size / 2 : LinearLayout::twoPartOf(size);
+  auto srcTile = dropTileDigit(tiling.sourceTile, s, outDim, size, bit);
+  auto dstTile = dropTileDigit(tiling.destinationTile, d, outDim, size, bit);
+  if (!srcTile || !dstTile)
+    return false;
+  tiling.sourceDigits.push_back(srcPositions[s]);
+  tiling.destinationDigits.push_back(dstPositions[d]);
+  srcPositions.erase(srcPositions.begin() + s);
+  dstPositions.erase(dstPositions.begin() + d);
+  tiling.sourceTile = std::move(*srcTile);
+  tiling.destinationTile = std::move(*dstTile);
+  return true;
+}
+
+std::optional<MixedRadixSharedTiling>
+getMixedRadixSharedTiles(const LinearLayout &src, const LinearLayout &dst) {
+  auto kReg =
+      StringAttr::get(src.getInDimNames().begin()->getContext(), "register");
+  if (src.getOutDims() != dst.getOutDims() || !src.hasInDim(kReg) ||
+      !dst.hasInDim(kReg))
+    return std::nullopt;
+  MixedRadixSharedTiling tiles{{}, {}, src, dst};
+  auto srcPositions = registerDigits(src), dstPositions = registerDigits(dst);
+  for (auto [outDim, size] : src.getOutDims())
+    if (!llvm::isPowerOf2_32(size) &&
+        !peelTileDigit(tiles, srcPositions, dstPositions, outDim, /*bit=*/0))
+      return std::nullopt;
+  if (tiles.sourceDigits.empty() || !tiles.sourceTile.isRadix2() ||
+      !tiles.destinationTile.isRadix2())
+    return std::nullopt;
+  return tiles;
+}
+
+int32_t getMixedRadixSharedRunLength(const LinearLayout &layout, int32_t dim,
+                                     unsigned bitwidth) {
+  auto kOffset =
+      StringAttr::get(layout.getInDimNames().begin()->getContext(), "offset");
+  auto toOffset = LinearLayout::empty();
+  for (auto [i, outDim] : llvm::enumerate(layout.getOutDimNames())) {
+    int32_t size = llvm::PowerOf2Ceil(layout.getOutDimSize(outDim));
+    toOffset *= static_cast<int32_t>(i) == dim
+                    ? LinearLayout::identity1D(size, outDim, kOffset)
+                    : LinearLayout::zeros1D(size, outDim, kOffset);
+  }
+  return getMixedRadixSharedRun(layout, toOffset, bitwidth);
+}
+
+std::optional<MixedRadixSharedTiling>
+getMixedRadixTransposeTiles(const LinearLayout &src, const LinearLayout &dst,
+                            unsigned bitwidth) {
+  auto tiles = getMixedRadixSharedTiles(src, dst);
+  if (!tiles)
+    return std::nullopt;
+  bool srcVector = false, dstVector = false;
+  for (int32_t dim = 0; dim < src.getNumOutDims(); ++dim) {
+    int32_t srcRun = getMixedRadixSharedRunLength(src, dim, bitwidth);
+    int32_t dstRun = getMixedRadixSharedRunLength(dst, dim, bitwidth);
+    if (srcRun > 1 && dstRun > 1)
+      return std::nullopt;
+    srcVector |= srcRun > 1;
+    dstVector |= dstRun > 1;
+  }
+  if (!srcVector || !dstVector)
+    return std::nullopt;
+  return tiles;
+}
+
+// The shared register digits of a Shared transfer, peeled in order until the
+// tile fits the scratch the pow2 path takes on the pow2 alloc shape; nullopt
+// when none is.
+static std::optional<MixedRadixSharedTiling>
+tileMixedRadixSharedTransfer(const LinearLayout &src, const LinearLayout &dst,
+                             int bitwidth) {
+  auto inDims = to_vector(src.getInDimNames());
+  auto kReg = llvm::find(inDims, "register");
+  if (src.getOutDims() != dst.getOutDims() || kReg == inDims.end() ||
+      !dst.hasInDim(*kReg))
+    return std::nullopt;
+  MixedRadixSharedTiling tiling{{}, {}, src, dst};
+  int64_t budget = getNumScratchElemsSwizzledCvt(
+      padMixedRadixLayout(src), padMixedRadixLayout(dst), bitwidth);
+  auto overBudget = [&] {
+    return product(to_vector(tiling.sourceTile.getOutDimSizes())) > budget;
+  };
+  auto srcPositions = registerDigits(src), dstPositions = registerDigits(dst);
+  for (bool changed = true; changed && overBudget();) {
+    changed = false;
+    for (StringAttr outDim : src.getOutDimNames()) {
+      // The odd part, then each binary bit from the top; a peel moves only the
+      // bits above it, which were already tried.
+      int32_t size = tiling.sourceTile.getOutDimSize(outDim);
+      SmallVector<int32_t> bits{0};
+      for (int32_t bit = LinearLayout::twoPartOf(size) / 2; bit > 0; bit /= 2)
+        bits.push_back(bit);
+      for (int32_t bit : bits) {
+        if (!overBudget())
+          break;
+        changed |=
+            peelTileDigit(tiling, srcPositions, dstPositions, outDim, bit);
+      }
+    }
+  }
+  if (tiling.sourceDigits.empty())
+    return std::nullopt;
+  return tiling;
+}
+
+MixedRadixConversionPlan
+planMixedRadixLayoutConversion(const LinearLayout &srcLayout,
+                               const LinearLayout &dstLayout,
+                               ArrayRef<int64_t> logicalShape) {
+  using Plan = MixedRadixConversionPlan;
+  auto dst =
+      alignMixedRadixConversionOutDims(srcLayout, dstLayout, logicalShape);
+  if (!dst)
+    return Plan::unsupported("NPOT mixed-radix conversion with mismatched or "
+                             "non-standard out dims is not yet supported");
+  auto reject = [](StringRef what, StringRef role) {
+    return Plan::unsupported(("NPOT mixed-radix conversion with " + what +
+                              " in the " + role +
+                              " layout is not yet supported")
+                                 .str());
+  };
+  using Role = std::pair<const LinearLayout *, StringRef>;
+  for (auto [layout, role] :
+       {Role{&srcLayout, "source"}, Role{&*dst, "destination"}}) {
+    if (!hasMixedRadixConversionInputDims(*layout))
+      return reject("a non-singleton block input", role);
+    // getFreeVariableMasks needs radix-2 or mixed-radix layouts.
+    if (!layout->isRadix2() && !layout->hasNonPow2OutDim())
+      return reject("non-radix-2 digits on power-of-two outputs", role);
+    if (!coversAllLogicalOutputs(*layout, logicalShape))
+      return reject("incomplete logical output coverage", role);
+  }
+  auto hasRegisterAndLane = [](const LinearLayout &layout) {
+    auto inDims = to_vector(layout.getInDimNames());
+    return llvm::is_contained(inDims, "register") &&
+           llvm::is_contained(inDims, "lane");
+  };
+  if (!hasRegisterAndLane(srcLayout) || !hasRegisterAndLane(*dst))
+    return Plan::unsupported(
+        "NPOT mixed-radix conversion without register and lane "
+        "input dimensions is not yet supported");
+
+  auto masks = srcLayout.getFreeVariableMasks();
+  // The map moves only registers and lanes, so it also sets the scope, even
+  // when both layouts are replicated across warps.
+  if (auto map = mapMixedRadixConversionInputs(*dst, srcLayout))
+    return Plan::factored(std::move(masks), std::move(*map));
+  return Plan::shared(
+      classifyMixedRadixConversionScope(srcLayout, *dst, logicalShape),
+      std::move(masks));
+}
+
+static void computeTranspositionSelectors(
+    SmallVector<DecomposedWarpConversion::TranspositionInfo>
+        &mixedTranspositions,
+    std::vector<std::vector<int32_t>> &regBases, int nPack) {
   // When possible, we fuse permutations of 'low' register bits together
   // with a mixed transposition, resulting in byte permute instructions instead
   // of `select` instructions. After processing, no low register bits appear in
-  // the returned list of mixed transpositions.
+  // the mixed transpositions.
 
-  SmallVector<DecomposedWarpConversion::TranspositionInfo> ret;
-  ret.reserve(mixedTranspositions.size());
-  if (nPack == 0) {
-    for (auto &t : mixedTranspositions)
-      ret.push_back(DecomposedWarpConversion::TranspositionInfo{t});
-    return ret;
-  }
+  if (nPack == 0)
+    return;
   // This algorithm performs further algebraic processing.
   //
   // Suppose nPack > 0 and for simplicity that P is a cycle. We are given an
@@ -932,8 +1319,8 @@ getTranspositionSelectors(SmallVector<std::pair<int, int>> &mixedTranspositions,
   };
 
   llvm::SmallSet<int32_t, 6> pairedRegBits;
-  for (auto [rBit, lBit] : mixedTranspositions)
-    pairedRegBits.insert(rBit);
+  for (const auto &t : mixedTranspositions)
+    pairedRegBits.insert(t.regBit);
 
   // A low bit in a mixed transposition must be replaced by a high bit. The
   // choice of high bit can affect instruction count. If the first high bit
@@ -941,8 +1328,8 @@ getTranspositionSelectors(SmallVector<std::pair<int, int>> &mixedTranspositions,
   // choice. We reorder the transpositions to guarantee this during processing.
   // This also guarantees the correct ordering for the lowering algorithm.
   auto next = [&](int b) { return llvm::Log2_32(regBases[b][0]); };
-  auto nextHighFree = [&](auto p) {
-    int curr = p.first;
+  auto nextHighFree = [&](const auto &t) {
+    int curr = t.regBit;
     do {
       if (curr >= nPack)
         return true;
@@ -983,9 +1370,8 @@ getTranspositionSelectors(SmallVector<std::pair<int, int>> &mixedTranspositions,
     return potentialPartner;
   };
 
-  for (auto p : mixedTranspositions) {
-    int rBit = p.first;
-    int lBit = p.second;
+  for (auto &info : mixedTranspositions) {
+    int rBit = info.regBit;
     SmallVector<int> cycle;
     int currBit = rBit;
     do {
@@ -1040,18 +1426,16 @@ getTranspositionSelectors(SmallVector<std::pair<int, int>> &mixedTranspositions,
     auto [topPreSel, botPreSel] = generateSelectors(head, tail, preShufLoBits);
     regBases[tail][0] = 1 << head;
 
-    DecomposedWarpConversion::TranspositionInfo info;
-    info.transposition = {partnerBit, lBit};
+    info.regBit = partnerBit;
     info.topPreSel = topPreSel;
     info.botPreSel = botPreSel;
     info.topPostSel = topPostSel;
     info.botPostSel = botPostSel;
-
-    ret.push_back(info);
   }
-  if (nPack == 2 && regBases[0][0] == 2 && regBases[1][0] == 1 && ret.size()) {
+  if (nPack == 2 && regBases[0][0] == 2 && regBases[1][0] == 1 &&
+      !mixedTranspositions.empty()) {
     // If (r0 r1) remains in pReg, fold it into a mixed transposition.
-    auto &t = ret.front();
+    auto &t = mixedTranspositions.front();
     for (int lowBit : {0, 1, 0}) {
       t.topPreSel = permuteSelector(t.topPreSel, lowBit);
       t.botPreSel = permuteSelector(t.botPreSel, lowBit);
@@ -1059,7 +1443,6 @@ getTranspositionSelectors(SmallVector<std::pair<int, int>> &mixedTranspositions,
     regBases[0][0] = 1;
     regBases[1][0] = 2;
   }
-  return ret;
 }
 
 SmallVector<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>>
@@ -1101,7 +1484,7 @@ getReshapeDecomposition(ArrayRef<int64_t> srcShape,
 }
 
 unsigned ScanLoweringHelper::getAxisElementStride() {
-  auto order = getOrder();
+  auto order = getEncoding().getOrder();
   unsigned stride = 1;
   for (unsigned dim : order) {
     if (dim == getAxis())
@@ -1122,6 +1505,7 @@ unsigned ScanLoweringHelper::getAxisThreadStride() {
 
 unsigned ScanLoweringHelper::getAxisBlockStride() {
   auto order = getOrder();
+  auto shapePerCTA = getShapePerCTA(getEncoding(), getShape());
   unsigned stride = 1;
   auto contigPerThread = getEncoding().getContigPerThread();
   auto threadsPerWarp = getEncoding().getThreadsPerWarp();
@@ -1129,9 +1513,9 @@ unsigned ScanLoweringHelper::getAxisBlockStride() {
   for (unsigned dim : order) {
     if (dim == getAxis())
       return stride;
-    stride *= ceil<unsigned int>(getShape()[dim], contigPerThread[dim] *
-                                                      threadsPerWarp[dim] *
-                                                      warpsPerCTA[dim]);
+    stride *= ceil<unsigned int>(shapePerCTA[dim], contigPerThread[dim] *
+                                                       threadsPerWarp[dim] *
+                                                       warpsPerCTA[dim]);
   }
   llvm_unreachable("Axis not found in order");
 }
@@ -1159,6 +1543,10 @@ bool GatherLoweringHelper::isWarpLocal() {
   RankedTensorType idxType = gatherOp.getIndices().getType();
   LinearLayout srcLayout = toLinearLayout(srcType);
   LinearLayout idxLayout = toLinearLayout(idxType);
+  // The warp-local emitter inverts the layouts, which mixed-radix digits do
+  // not support; the shared-memory path addresses each element.
+  if (!srcLayout.isRadix2() || !idxLayout.isRadix2())
+    return false;
 
   Builder b(gatherOp.getContext());
   StringAttr kBlock = b.getStringAttr("block");
@@ -1221,34 +1609,8 @@ unsigned getNumScratchElements(ArrayRef<unsigned> shape) {
   return product<unsigned>(shape);
 }
 
-// NPOT K must align to the 32-byte MMA K granule.
-static bool isNpotMmaKAligned(int64_t k, Type elementType) {
-  if (llvm::isPowerOf2_64(k))
-    return true;
-  int64_t bitwidth = elementType.getIntOrFloatBitWidth();
-  return (k * bitwidth) % 256 == 0;
-}
-
-static bool isMmaOutputShapeSupported(ArrayRef<int64_t> shape, int version) {
-  assert(shape.size() >= 2 && "MMA output must have M and N dimensions");
-  int64_t m = shape[shape.size() - 2];
-  int64_t n = shape[shape.size() - 1];
-
-  if (version == 2) {
-    return llvm::none_of(shape, [](int64_t dim) {
-      return dim > 0 && !llvm::isPowerOf2_64(dim);
-    });
-  }
-  if (version == 3) {
-    int64_t mAlignment = llvm::isPowerOf2_64(m) ? 64 : 16;
-    return m % mAlignment == 0 && n % 8 == 0;
-  }
-  assert(version == 5 && "unexpected MMA version with output constraints");
-  bool mOk = llvm::isPowerOf2_64(m) ? m % 64 == 0 : m <= 128 && m % 16 == 0;
-  return mOk && llvm::isPowerOf2_64(n) && n % 8 == 0;
-}
-
-bool supportMMA(triton::DotOp op, int version) {
+bool supportMMA(triton::DotOp op, int version,
+                std::optional<int> knownNumWarps) {
   // Refer to mma section for the data type supported by Volta and Hopper
   // Tensor Core in
   // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-884-f16
@@ -1263,8 +1625,12 @@ bool supportMMA(triton::DotOp op, int version) {
     RankedTensorType typeA = op.getA().getType();
     int k = typeA.getShape().back();
     auto retType = op.getType();
-    auto retShapePerCTA = getShapePerCTA(retType);
-    int numWarps = lookupNumWarps(op);
+    // The target dot-legality query asks before layouts and ttg.num-warps
+    // exist, on one CTA.
+    auto retShapePerCTA = retType.getEncoding() ? getShapePerCTA(retType)
+                                                : to_vector(retType.getShape());
+    auto rank = retShapePerCTA.size();
+    int numWarps = knownNumWarps ? *knownNumWarps : lookupNumWarps(op);
     // Allow int8 * int8 -> int32 for MMAv5, reject other integer combinations
     if (aElemTy.isInteger() || bElemTy.isInteger() ||
         retType.getElementType().isInteger()) {
@@ -1281,12 +1647,8 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
-    // BlockedToMMAv5 puts A (MxK) in an NVMMA shared memdesc, and only the
-    // leading dimension of a shared memdesc may be non-power-of-two
-    // (MemDescType::verify), so an NPOT K has no legal A operand.
-    if (!llvm::isPowerOf2_64(k))
-      return false;
-    if (!isMmaOutputShapeSupported(retShapePerCTA, version))
+    if (!(retShapePerCTA[rank - 2] % 64 == 0 &&
+          retShapePerCTA[rank - 1] % 8 == 0))
       return false;
     if (aElemTy.isF64() || bElemTy.isF64() ||
         retType.getElementType().isF64()) {
@@ -1304,16 +1666,17 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
-    if (!isNpotMmaKAligned(k, aElemTy))
-      return false;
-    auto retShapePerCTA = getShapePerCTA(retType);
+    // The target dot-legality query asks before layouts and ttg.num-warps
+    // exist, on one CTA.
+    auto retShapePerCTA = retType.getEncoding() ? getShapePerCTA(retType)
+                                                : to_vector(retType.getShape());
     auto rank = retShapePerCTA.size();
-    int numWarps = lookupNumWarps(op);
+    int numWarps = knownNumWarps ? *knownNumWarps : lookupNumWarps(op);
     // TODO(Keren): for now, fallback to MMAv2 if handling batch matmul.
     if (rank == 3)
       return false;
-    if (!(numWarps % 4 == 0 &&
-          isMmaOutputShapeSupported(retShapePerCTA, version) &&
+    if (!(numWarps % 4 == 0 && retShapePerCTA[rank - 2] % 64 == 0 &&
+          retShapePerCTA[rank - 1] % 8 == 0 &&
           (llvm::isa<Float8E5M2Type, Float8E4M3FNType>(aElemTy) ||
            aElemTy.isInteger(8) || aElemTy.isF16() || aElemTy.isBF16() ||
            aElemTy.isF32()))) {
@@ -1325,12 +1688,6 @@ bool supportMMA(triton::DotOp op, int version) {
         cast<RankedTensorType>(op.getType()).getElementType().isF32()) {
       return false;
     }
-  }
-  if (version == 2) {
-    int64_t k = op.getA().getType().getShape().back();
-    if (!isNpotMmaKAligned(k, aElemTy) ||
-        !isMmaOutputShapeSupported(getShapePerCTA(op.getType()), version))
-      return false;
   }
   if (aElemTy.isF32() && bElemTy.isF32()) {
     assert(op.getInputPrecision() == InputPrecision::TF32);
@@ -1366,6 +1723,15 @@ static bool npotMmaConversion(RankedTensorType srcTy, RankedTensorType dstTy) {
   if (!hasNpotShape(srcTy) && !hasNpotShape(dstTy)) {
     return false;
   }
+  // Identical MMA layouts alias no bases, so the convert is a no-op, as at
+  // pow2.
+  if (isa<triton::gpu::NvidiaMmaEncodingAttr>(srcTy.getEncoding()) &&
+      isa<triton::gpu::NvidiaMmaEncodingAttr>(dstTy.getEncoding()) &&
+      triton::gpu::hasExactNpotLayout(srcTy) &&
+      triton::gpu::hasExactNpotLayout(dstTy) &&
+      toLinearLayout(srcTy) == toLinearLayout(dstTy)) {
+    return false;
+  }
   auto hasMmaFamily = [](Attribute enc) {
     if (isa<triton::gpu::NvidiaMmaEncodingAttr>(enc)) {
       return true;
@@ -1378,11 +1744,43 @@ static bool npotMmaConversion(RankedTensorType srcTy, RankedTensorType dstTy) {
   return hasMmaFamily(srcTy.getEncoding()) || hasMmaFamily(dstTy.getEncoding());
 }
 
+std::optional<MixedRadixConversionPlan>
+getMixedRadixConversionPlan(RankedTensorType srcTy, RankedTensorType dstTy) {
+  if (!hasNpotShape(srcTy) && !hasNpotShape(dstTy))
+    return std::nullopt;
+  // The LLVM struct holds only the unique register values.
+  auto kReg = StringAttr::get(srcTy.getContext(), "register");
+  auto src = toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
+  auto dst = toLinearLayout(dstTy).removeZeroBasesAlongDim(kReg);
+  auto plan = planMixedRadixLayoutConversion(src, dst, dstTy.getShape());
+  if (plan.transfer == MixedRadixConversionTransfer::Shared)
+    plan.sharedTiling =
+        tileMixedRadixSharedTransfer(src, dst, getBitwidth(srcTy));
+  return plan;
+}
+
+std::optional<unsigned>
+getMixedRadixConversionScratchBytes(ConvertLayoutOp op) {
+  auto srcTy = op.getSrc().getType();
+  auto plan = getMixedRadixConversionPlan(srcTy, op.getType());
+  if (!plan)
+    return std::nullopt;
+  if (plan->transfer != MixedRadixConversionTransfer::Shared)
+    return 0;
+  int64_t elements = product(srcTy.getShape());
+  if (plan->sharedTiling)
+    elements =
+        product(to_vector(plan->sharedTiling->sourceTile.getOutDimSizes()));
+  return elements * getBitwidth(srcTy) / 8;
+}
+
 bool cvtReordersRegisters(RankedTensorType srcTy, RankedTensorType dstTy) {
   // Modular MMA conversions can alias bases; use shared memory.
   if (npotMmaConversion(srcTy, dstTy)) {
     return false;
   }
+  if (auto plan = getMixedRadixConversionPlan(srcTy, dstTy))
+    return plan->transfer == MixedRadixConversionTransfer::Register;
   auto layout = minimalCvtLayout(srcTy, dstTy);
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
@@ -1395,18 +1793,26 @@ bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
   if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
     return false;
   }
-  auto layout = minimalCvtLayout(srcTy, dstTy);
+  if (cvtReordersRegisters(srcTy, dstTy))
+    return false;
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
-  auto kLane = StringAttr::get(ctx, "lane");
-  if (to_vector(layout.getOutDimNames()) ==
-      SmallVector<StringAttr, 2>{kRegister, kLane}) {
-    auto srcLayout = toLinearLayout(srcTy).removeZeroBasesAlongDim(kRegister);
-    auto dstLayout = toLinearLayout(dstTy).removeZeroBasesAlongDim(kRegister);
-    auto factors = getWarpLayoutConvertDecomposition(srcLayout, dstLayout, 32);
-    return (factors.mixedTranspositions.size() < 2);
+  auto srcLayout = toLinearLayout(srcTy).removeZeroBasesAlongDim(kRegister);
+  auto dstLayout = toLinearLayout(dstTy).removeZeroBasesAlongDim(kRegister);
+  bool canShuffle = isPermutationMatrixLayout(srcLayout) &&
+                    isPermutationMatrixLayout(dstLayout);
+  if (canShuffle) {
+    auto kWarp = StringAttr::get(ctx, "warp");
+    auto kBlock = StringAttr::get(ctx, "block");
+    auto conversion =
+        invertAndComposeLocal(srcLayout, dstLayout, {kWarp, kBlock});
+    canShuffle = conversion.isIdentityOnOutDim(kWarp) &&
+                 conversion.isIdentityOnOutDim(kBlock) &&
+                 conversion.sublayoutIsZero({kWarp, kBlock}, kRegister);
   }
-  return false;
+  return canShuffle &&
+         getWarpLayoutConvertDecomposition(srcLayout, dstLayout, 32)
+                 .mixedTranspositions.size() < 2;
 }
 
 bool cvtNeedsWarpShuffle(triton::gpu::ConvertLayoutOp op) {
@@ -1418,18 +1824,29 @@ bool cvtNeedsWarpShuffle(triton::gpu::ConvertLayoutOp op) {
   if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
     return false;
   }
-  auto layout = minimalCvtLayout(srcTy, dstTy);
+  bool forceWarpShuffle = false;
+  if (!forceWarpShuffle && cvtReordersRegisters(srcTy, dstTy))
+    return false;
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
-  auto kLane = StringAttr::get(ctx, "lane");
-  if (to_vector(layout.getOutDimNames()) ==
-      SmallVector<StringAttr, 2>{kRegister, kLane}) {
-    auto srcLayout = toLinearLayout(srcTy).removeZeroBasesAlongDim(kRegister);
-    auto dstLayout = toLinearLayout(dstTy).removeZeroBasesAlongDim(kRegister);
-    auto factors = getWarpLayoutConvertDecomposition(srcLayout, dstLayout, 32);
-    return (factors.mixedTranspositions.size() < 2);
+  auto srcLayout = toLinearLayout(srcTy).removeZeroBasesAlongDim(kRegister);
+  auto dstLayout = toLinearLayout(dstTy).removeZeroBasesAlongDim(kRegister);
+  bool canShuffle = isPermutationMatrixLayout(srcLayout) &&
+                    isPermutationMatrixLayout(dstLayout);
+  if (canShuffle) {
+    auto kWarp = StringAttr::get(ctx, "warp");
+    auto kBlock = StringAttr::get(ctx, "block");
+    auto conversion =
+        invertAndComposeLocal(srcLayout, dstLayout, {kWarp, kBlock});
+    canShuffle = conversion.isIdentityOnOutDim(kWarp) &&
+                 conversion.isIdentityOnOutDim(kBlock) &&
+                 conversion.sublayoutIsZero({kWarp, kBlock}, kRegister);
   }
-  return false;
+  assert((!forceWarpShuffle || canShuffle) &&
+         "force_warp_shuffle requires a supported shuffle decomposition");
+  return canShuffle &&
+         getWarpLayoutConvertDecomposition(srcLayout, dstLayout, 32)
+                 .mixedTranspositions.size() < 2;
 }
 
 bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy) {
@@ -1441,6 +1858,8 @@ bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy) {
       return true;
     }
   }
+  if (auto plan = getMixedRadixConversionPlan(srcTy, dstTy))
+    return plan->transfer == MixedRadixConversionTransfer::Shared;
   return !cvtReordersRegisters(srcTy, dstTy) &&
          !cvtNeedsWarpShuffle(srcTy, dstTy);
 }
@@ -1456,6 +1875,8 @@ bool cvtNeedsSharedMemory(triton::gpu::ConvertLayoutOp op) {
       return true;
     }
   }
+  if (auto plan = getMixedRadixConversionPlan(srcTy, dstTy))
+    return plan->transfer == MixedRadixConversionTransfer::Shared;
   return !cvtReordersRegisters(srcTy, dstTy) && !cvtNeedsWarpShuffle(op);
 }
 
@@ -1480,8 +1901,15 @@ bool isCvtDimSync(const triton::LinearLayout &srcLayout,
            srcLayout.getFreeVariableMasks()[dim] == 0 &&
            dstLayout.getFreeVariableMasks()[dim] == 0;
   }
-  return invertAndComposeBlockLocal(srcLayout, dstLayout)
+  return invertAndComposeLocal(srcLayout, dstLayout, {kBlock})
       .isIdentityOnOutDim(kBlock);
+}
+
+bool isCvtDimSync(RankedTensorType srcTy, RankedTensorType dstTy,
+                  StringAttr dim) {
+  if (auto plan = getMixedRadixConversionPlan(srcTy, dstTy))
+    return plan->scope != MixedRadixConversionScope::Block || dim == "block";
+  return isCvtDimSync(toLinearLayout(srcTy), toLinearLayout(dstTy), dim);
 }
 
 namespace triton {
@@ -1496,6 +1924,30 @@ BarrierStages getAtomicBarrierStages(MemSemantic semantic,
                             semantic == MemSemantic::ACQUIRE_RELEASE);
   stages.betweenMemoryEffects = hasResultBarrier;
   return stages;
+}
+
+std::optional<int32_t> getAtomicResultShuffleMask(Value result) {
+  if (result.use_empty())
+    return 0;
+
+  int32_t laneMask, warpMask, blockMask;
+  if (auto tensorTy = dyn_cast<RankedTensorType>(result.getType())) {
+    auto masks = gpu::toLinearLayout(tensorTy).getFreeVariableMasks();
+    auto *ctx = result.getContext();
+    laneMask = masks.lookup(StringAttr::get(ctx, "lane"));
+    warpMask = masks.lookup(StringAttr::get(ctx, "warp"));
+    blockMask = masks.lookup(StringAttr::get(ctx, "block"));
+  } else {
+    auto *op = result.getDefiningOp();
+    laneMask = gpu::TritonGPUDialect::getThreadsPerWarp(
+                   op->getParentOfType<ModuleOp>()) -
+               1;
+    warpMask = gpu::lookupNumWarps(op) - 1;
+    blockMask = gpu::lookupNumCTAs(op) - 1;
+  }
+  if (warpMask || blockMask)
+    return std::nullopt;
+  return laneMask;
 }
 
 bool atomicResultHasCTABroadcast(Operation *op) {
@@ -1529,11 +1981,12 @@ bool needsClusterBarrier(Operation *op) {
     return true;
   if (auto cvt = dyn_cast<gpu::ConvertLayoutOp>(op)) {
     auto kBlock = StringAttr::get(op->getContext(), "block");
-    return !isCvtDimSync(gpu::toLinearLayout(cvt.getSrc().getType()),
-                         gpu::toLinearLayout(cvt.getType()), kBlock);
+    return !isCvtDimSync(cvt.getSrc().getType(), cvt.getType(), kBlock);
   }
   if (auto reduce = dyn_cast<ReduceOp>(op))
     return !ReduceOpHelper(reduce).isReduceWithinCTA();
+  if (isa<HistogramOp>(op))
+    return hasCrossCTAScratch(op);
   return atomicNeedsClusterBarrier(op);
 }
 

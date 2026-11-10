@@ -78,7 +78,7 @@ bool filterAsyncLocalLoadsDependencies(Operation *op1, Operation *op2,
 
   // Check if operations access the same buffer
   bool sameBuffer = llvm::any_of(
-      op1BufferIds, [&](auto id) { return op2BufferIds.count(id); });
+      op1BufferIds, [&](auto id) { return op2BufferIds.contains(id); });
 
   if (!sameBuffer)
     return false;
@@ -126,15 +126,14 @@ bool filterWarpLocalScratchReuse(Operation *op1, Operation *op2,
     return false;
   auto srcLayout = triton::gpu::toLinearLayout(srcTy);
   auto dstLayout = triton::gpu::toLinearLayout(dstTy);
-  if (srcLayout.isModular() || dstLayout.isModular() ||
-      !srcLayout.isInjective() || !dstLayout.isInjective())
+  if (!srcLayout.isInjective() || !dstLayout.isInjective())
     return false;
   // Equal types can select different lowerings through forceWarpShuffle.
   // Both operations must actually use the shared-memory scratch image.
   if (!mlir::cvtNeedsSharedMemory(first) || !mlir::cvtNeedsSharedMemory(second))
     return false;
   auto warp = StringAttr::get(op1->getContext(), "warp");
-  return mlir::isCvtDimSync(srcLayout, dstLayout, warp);
+  return mlir::isCvtDimSync(srcTy, dstTy, warp);
 }
 
 bool filterLDSMemoryBarriersDependencies(Operation *op1, Operation *op2) {

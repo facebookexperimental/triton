@@ -18,7 +18,15 @@ import zipfile
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import meta_llvm
+else:
+    try:
+        import meta_llvm
+    except ImportError:  # run as a package (e.g. setup.py imports python.build_helpers)
+        from python import meta_llvm
 
 
 def get_base_dir():
@@ -83,9 +91,10 @@ def find_therock_rocm_include_dir() -> Optional[str]:
     """
     rocm_sdk = Path(sys.executable).with_name("rocm-sdk")
     if not rocm_sdk.is_file():
-        rocm_sdk = shutil.which("rocm-sdk")
-    if rocm_sdk is None:
-        return None
+        found_sdk = shutil.which("rocm-sdk")
+        if found_sdk is None:
+            return None
+        rocm_sdk = Path(found_sdk)
     try:
         # Run the caller venv's rocm-sdk entry point in isolated mode so pip's
         # temporary PEP 517 import path cannot shadow its installed packages.
@@ -408,8 +417,8 @@ def get_llvm_system_suffix(helper_args: BuildHelperArgs):
             system_suffix = "ubuntu-arm64"
         elif arch == "x64":
             vglibc = tuple(map(int, platform.libc_ver()[1].split(".")))
-            vglibc = vglibc[0] * 100 + vglibc[1]
-            if vglibc > 228:
+            vglibc_num = vglibc[0] * 100 + vglibc[1]
+            if vglibc_num > 228:
                 # Ubuntu 24 LTS (v2.39)
                 # Ubuntu 22 LTS (v2.35)
                 # Ubuntu 20 LTS (v2.31)
@@ -431,68 +440,27 @@ def get_llvm_system_suffix(helper_args: BuildHelperArgs):
     return system_suffix
 
 
-OAI_LLVM_RELEASE_BASE_URL = "https://oaitriton.blob.core.windows.net/public/llvm-builds"
-
-
-def has_meta_llvm_info(base_dir: Optional[str] = None) -> bool:
-    return os.path.exists(os.path.join(base_dir or get_base_dir(), "cmake", "meta-llvm-info.json"))
-
-
-def load_llvm_info(base_dir: Optional[str] = None) -> dict:
-    # cmake/llvm-info.json and cmake/llvm-build-info.json are OAI's pins and
-    # stay untouched so upstream cherry-picks apply cleanly.
-    # cmake/meta-llvm-info.json, when present, names the Meta LLVM fork build
-    # and must sit on the core revision OAI builds: llvm-build-info.json, which
-    # llvm-info.json trails until OAI publishes that revision's bundles.
-    cmake_dir = os.path.join(base_dir or get_base_dir(), "cmake")
-    with open(os.path.join(cmake_dir, "llvm-info.json"), "r") as llvm_info_file:
-        oai_info = json.load(llvm_info_file)
-    if not has_meta_llvm_info(base_dir):
-        return {**oai_info, "release_base_url": OAI_LLVM_RELEASE_BASE_URL}
-    oai_hash = oai_info["llvm_hash"]
-    build_info_path = os.path.join(cmake_dir, "llvm-build-info.json")
-    if os.path.exists(build_info_path):
-        with open(build_info_path, "r") as build_info_file:
-            oai_hash = json.load(build_info_file)["llvm_hash"]
-    with open(os.path.join(cmake_dir, "meta-llvm-info.json"), "r") as meta_info_file:
-        meta_info = json.load(meta_info_file)
-    if meta_info["based_on_oai_llvm_hash"] != oai_hash:
-        raise RuntimeError(f"cmake/meta-llvm-info.json is based on OAI LLVM {meta_info['based_on_oai_llvm_hash'][:12]} "
-                           f"but OAI pins {oai_hash[:12]}; rebuild the Meta LLVM on the new OAI pin")
-    return meta_info
-
-
-def llvm_package_for_suffix(system_suffix: str, base_dir: Optional[str] = None) -> Package:
-    llvm_info = load_llvm_info(base_dir)
-    sha256sums = llvm_info["sha256sum"]
-    if system_suffix not in sha256sums:
-        raise RuntimeError(f"LLVM pre-compiled image is not available for {system_suffix} "
-                           f"(published: {', '.join(sorted(sha256sums))}); set LLVM_SYSPATH to a local LLVM build")
-    name = f"llvm-{llvm_info['llvm_hash'][:8]}-{system_suffix}-{llvm_info['build_number']}"
-    return Package(
-        "llvm",
-        name,
-        f"{llvm_info['release_base_url'].rstrip('/')}/{name}.tar.gz",
-        "LLVM_INCLUDE_DIRS",
-        "LLVM_LIBRARY_DIR",
-        "LLVM_SYSPATH",
-        # Stable symlink that doesn't include the revision.
-        sym_name=f"llvm-{system_suffix}",
-        sha256sum=sha256sums[system_suffix],
-    )
-
-
 def get_llvm_package_info(helper_args: BuildHelperArgs):
+    if meta_llvm.enabled(get_base_dir()):
+        return meta_llvm.llvm_package(helper_args)
     system_suffix = get_llvm_system_suffix(helper_args)
     if system_suffix is None:
         return Package("llvm", "LLVM-C.lib", "", "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
-    try:
-        return llvm_package_for_suffix(system_suffix)
-    except RuntimeError as error:
-        if helper_args.llvm_syspath is None:
-            raise
-        print(f"{error}. Proceeding with LLVM_SYSPATH={helper_args.llvm_syspath}.")
-        return Package("llvm", "LLVM-C.lib", "", "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
+    archive = get_llvm_archive(system_suffix)
+    name = archive.filename.removesuffix(".tar.gz")
+    # Create a stable symlink that doesn't include revision
+    sym_name = f"llvm-{system_suffix}"
+
+    return Package(
+        "llvm",
+        name,
+        archive.url,
+        "LLVM_INCLUDE_DIRS",
+        "LLVM_LIBRARY_DIR",
+        "LLVM_SYSPATH",
+        sym_name=sym_name,
+        sha256sum=archive.sha256sum,
+    )
 
 
 def get_amd_codegen_package_info(helper_args: BuildHelperArgs):
@@ -507,15 +475,19 @@ def get_amd_codegen_package_info(helper_args: BuildHelperArgs):
     revision = amd_llvm_info["llvm_hash"][:8]
     build_number = amd_llvm_info["build_number"]
     name = f"amd-codegen-{revision}-{system_suffix}-{build_number}"
-    url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
+    archive = DependencyArchive(
+        f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz",
+        f"triton-llvm/{name}.tar.gz",
+        amd_llvm_info.get("sha256sum", {}).get(system_suffix),
+    )
     return Package(
         "amd",
         name,
-        url,
+        archive.url,
         "",
         "",
         "",
-        sha256sum=amd_llvm_info.get("sha256sum", {}).get(system_suffix),
+        sha256sum=archive.sha256sum,
     )
 
 
@@ -543,13 +515,7 @@ def _get_thirdparty_package_cmake_vars(package: Package, helper_args: BuildHelpe
     if helper_args.offline_build and not input_defined:
         raise RuntimeError(f"Requested an offline build but {package.syspath_var_name} is not set")
     if not helper_args.offline_build and not input_defined and not input_compatible:
-        _download_and_extract(
-            package.url,
-            package_root_dir,
-            package.name,
-            helper_args.archives_path,
-            package.sha256sum,
-        )
+        _download_and_extract(package.url, package_root_dir, package.name, helper_args.archives_path, package.sha256sum)
         # write version url to package_dir
         with open(os.path.join(package_dir, "version.txt"), "w") as file:
             file.write(package.url)
@@ -626,19 +592,15 @@ def download_codegen_llvm(backend: str, llvm_info: dict, helper_args: BuildHelpe
     if not os.path.isfile(llvm_config):
         if helper_args.offline_build:
             raise RuntimeError(f"Requested an offline build but {backend} bootstrap LLVM is missing from {llvm_path}")
-        url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
-        _download_and_extract(url, package_root, name, helper_args.archives_path, checksum)
+        archive = get_llvm_archive(system_suffix, {**bootstrap, "llvm_hash": llvm_info["llvm_hash"]})
+        _download_and_extract(archive.url, package_root, name, helper_args.archives_path, archive.sha256sum)
     if not os.path.isfile(llvm_config):
         raise RuntimeError(f"Cannot find independently pinned {backend} LLVM configuration at {llvm_config}")
     return llvm_path
 
 
-def build_amd_codegen(amd_llvm_info: dict, helper_args: BuildHelperArgs, llvm_path: Optional[str] = None):
-    # A caller-provided LLVM (the Meta core bundle) links with the host
-    # compiler, as libtriton does; its clang may not find a matching libstdc++.
-    use_sdk_compilers = llvm_path is None
-    if llvm_path is None:
-        llvm_path = download_codegen_llvm("amd", amd_llvm_info, helper_args)
+def build_amd_codegen(amd_llvm_info: dict, helper_args: BuildHelperArgs):
+    llvm_path = download_codegen_llvm("amd", amd_llvm_info, helper_args)
     revision = f'{amd_llvm_info["llvm_hash"]}-{amd_llvm_info["build_number"]}'
     system_suffix = get_llvm_system_suffix(helper_args)
     source_path = os.path.join(get_base_dir(), "third_party", "amd", "backend", "codegen")
@@ -660,7 +622,10 @@ def build_amd_codegen(amd_llvm_info: dict, helper_args: BuildHelperArgs, llvm_pa
         f"-DTRITON_AMD_LLVM_REVISION={revision}",
         "-DCMAKE_BUILD_TYPE=Release",
     ]
-    if sys.platform != "win32" and use_sdk_compilers:
+    ninja_path = shutil.which("ninja")
+    if ninja_path is not None:
+        command.append(f"-DCMAKE_MAKE_PROGRAM={ninja_path}")
+    if sys.platform != "win32":
         clang = os.path.join(llvm_path, "bin", "clang")
         clangxx = os.path.join(llvm_path, "bin", "clang++")
         if os.path.isfile(clang) and os.path.isfile(clangxx):
@@ -685,27 +650,13 @@ def build_amd_codegen(amd_llvm_info: dict, helper_args: BuildHelperArgs, llvm_pa
     return os.path.join(install_path, "lib", amd_codegen_library_name())
 
 
-def build_and_copy_meta_amd_codegen(helper_args: BuildHelperArgs, library: str):
-    # The Meta LLVM fork carries AMDGPU fixes that OAI's codegen artifact lacks.
-    # Build against the core Meta LLVM, as fbsource does, until Meta pins its
-    # own AMD codegen LLVM.
-    core_llvm = _get_thirdparty_package_cmake_vars(get_llvm_package_info(helper_args), helper_args)
-    source_path = build_amd_codegen(load_llvm_info(), helper_args, llvm_path=core_llvm["LLVM_SYSPATH"])
-    if not os.path.isfile(source_path):
-        raise RuntimeError(f"Cannot find AMD code generation at {source_path}; set TRITON_AMD_CODEGEN_PATH")
-    destination_path = os.path.join(get_base_dir(), "third_party", "amd", "backend", "lib", library)
-    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-    print(f"copy {source_path} to {destination_path} ...")
-    shutil.copy2(source_path, destination_path)
-
-
 def download_and_copy_amd_codegen(helper_args: BuildHelperArgs):
     if helper_args.amd_codegen_path is not None:
         return
 
     library = amd_codegen_library_name()
-    if has_meta_llvm_info():
-        return build_and_copy_meta_amd_codegen(helper_args, library)
+    if meta_llvm.enabled(get_base_dir()):
+        return meta_llvm.copy_amd_codegen(helper_args, library)
     amd_llvm_info_path = os.path.join(get_base_dir(), "cmake", "amd-llvm-info.json")
     with open(amd_llvm_info_path, "r") as amd_llvm_info_file:
         amd_llvm_info = json.load(amd_llvm_info_file)
@@ -759,9 +710,9 @@ def download_and_copy(name, src_func, dst_path, override_path, version, url_func
     download = not os.path.exists(src_path)
     if os.path.exists(dst_path) and system == "Linux" and shutil.which(dst_path) is not None:
         curr_version = subprocess.check_output([dst_path, "--version"]).decode("utf-8").strip()
-        curr_version = re.search(r"V([.|\d]+)", curr_version)
-        assert curr_version is not None, f"No version information for {dst_path}"
-        download = download or curr_version.group(1) != version
+        version_match = re.search(r"V([.|\d]+)", curr_version)
+        assert version_match is not None, f"No version information for {dst_path}"
+        download = download or version_match.group(1) != version
     if download:
         _download_and_extract(url, tmp_path, name, helper_args.archives_path)
     os.makedirs(os.path.split(dst_path)[0], exist_ok=True)
@@ -784,8 +735,9 @@ class NvidiaToolchainPackage:
 
     def archive(self, system, arch):
         filename = f"{self.component}-{system}-{arch}-{self.version}-archive.tar.xz"
-        url = f"https://developer.download.nvidia.com/compute/cuda/redist/{self.component}/{system}-{arch}/{filename}"
-        return DependencyArchive(url, f"oaiartifacts/wheels/triton_wheel/nvidia/{filename}")
+        path = f"{self.component}/{system}-{arch}/{filename}"
+        url = f"https://developer.download.nvidia.com/compute/cuda/redist/{path}"
+        return DependencyArchive(url, f"nvidia-cuda-redist/{path}")
 
 
 def get_nvidia_toolchain_packages():
@@ -873,6 +825,7 @@ def get_nvidia_toolchain_packages():
 
 def download_and_copy_dependencies(helper_args: BuildHelperArgs):
     download_and_copy_amd_codegen(helper_args)
+
     for package in get_nvidia_toolchain_packages():
         download_and_copy(
             name=package.name,

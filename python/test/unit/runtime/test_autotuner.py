@@ -1041,19 +1041,27 @@ def test_generate_wave_quant_candidates_appends_npot_and_noop():
     assert npot, "expected wave-quant NPOT candidates for a bad tail"
 
 
-def test_npot_runtime_error_prunable_gating():
-    pow2_cfg = triton.Config(kwargs={'BLOCK_M': 128})
-    npot_cfg = _autotuner._clone_config(pow2_cfg, BLOCK_M=96)
-    # A pow2 config must re-raise even a device error (never be masked).
-    assert _autotuner._npot_runtime_error_prunable(pow2_cfg, RuntimeError("Triton Error [CUDA]: out of memory"),
-                                                   allow_npot=True) is False
-    # An NPOT config under the flag is prunable on a device failure -- case-insensitively and across
-    # both backends (CUDA and HIP).
-    for msg in ("Triton Error [CUDA]: misaligned address", "Triton Error [HIP]: out of memory range.", "Out Of Memory",
-                "an illegal memory access was encountered"):
-        assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError(msg), allow_npot=True) is True
-    # Flag off, or a non-device RuntimeError -> re-raise.
-    assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError("Triton Error [CUDA]: x"),
-                                                   allow_npot=False) is False
-    assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError("invalid config value"),
-                                                   allow_npot=True) is False
+def _autotune_with_failing_block(fail_block):
+    # A real compile failure: the reshape needs BLOCK to be a multiple of 64, which only 128 is.
+    @triton.autotune(configs=[triton.Config({'BLOCK': fail_block}),
+                              triton.Config({'BLOCK': 128})], key=['n'], do_bench=do_bench)
+    @triton.jit
+    def _kernel(x_ptr, n, BLOCK: tl.constexpr):
+        offs = tl.arange(0, BLOCK)
+        x = tl.reshape(tl.load(x_ptr + offs, mask=offs < n), (BLOCK // 64, 64))
+        tl.store(x_ptr + offs, tl.reshape(x, (BLOCK, )), mask=offs < n)
+
+    return _kernel
+
+
+def test_autotune_skips_npot_config_that_fails_to_compile(fresh_knobs, device):
+    fresh_knobs.language.allow_npot = True
+    kernel = _autotune_with_failing_block(96)
+    kernel[(1, )](torch.randn(128, device=device), 128)
+    assert kernel.best_config.kwargs['BLOCK'] == 128
+
+
+def test_autotune_raises_when_pow2_config_fails_to_compile(fresh_knobs, device):
+    fresh_knobs.language.allow_npot = True
+    with pytest.raises(triton.CompilationError):
+        _autotune_with_failing_block(32)[(1, )](torch.randn(128, device=device), 128)

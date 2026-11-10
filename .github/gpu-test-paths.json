@@ -33,11 +33,17 @@
     ".github/workflows/gpu-tests.yml",
     ".github/workflows/build.yml",
     ".github/actions/install-prebuilt-triton/**",
-    ".github/actions/select-kernel-tests/**",
     ".github/scripts/kernel_test_selection.py",
     ".github/scripts/wheel_cache.py",
     ".github/workflows/h100.yml",
-    ".github/actions/install-torchao/**"
+    ".github/actions/install-torchao/**",
+    ".github/scripts/gpu_test_selection.py",
+    ".github/gpu-test-paths.json",
+    ".github/gpu-test-suites.json",
+    ".github/scripts/run_selected_tests.py",
+    ".github/actions/run-selected-tests/**",
+    ".github/actions/run-tlx-core-tests/**",
+    ".github/actions/run-tlx-correctness-tests/**"
   ],
   "b200": [
     "**",
@@ -69,11 +75,17 @@
     ".github/workflows/gpu-tests.yml",
     ".github/workflows/build.yml",
     ".github/actions/install-prebuilt-triton/**",
-    ".github/actions/select-kernel-tests/**",
     ".github/scripts/kernel_test_selection.py",
     ".github/scripts/wheel_cache.py",
     ".github/workflows/b200.yml",
-    ".github/actions/install-torchao/**"
+    ".github/actions/install-torchao/**",
+    ".github/scripts/gpu_test_selection.py",
+    ".github/gpu-test-paths.json",
+    ".github/gpu-test-suites.json",
+    ".github/scripts/run_selected_tests.py",
+    ".github/actions/run-selected-tests/**",
+    ".github/actions/run-tlx-core-tests/**",
+    ".github/actions/run-tlx-correctness-tests/**"
   ],
   "mi350": [
     "**",
@@ -110,10 +122,16 @@
     ".github/workflows/gpu-tests.yml",
     ".github/workflows/build.yml",
     ".github/actions/install-prebuilt-triton/**",
-    ".github/actions/select-kernel-tests/**",
     ".github/scripts/kernel_test_selection.py",
     ".github/scripts/wheel_cache.py",
     ".github/workflows/mi350.yml",
-    ".github/actions/setup-test-env/**"
+    ".github/actions/setup-test-env/**",
+    ".github/scripts/gpu_test_selection.py",
+    ".github/gpu-test-paths.json",
+    ".github/gpu-test-suites.json",
+    ".github/scripts/run_selected_tests.py",
+    ".github/actions/run-selected-tests/**",
+    ".github/actions/run-tlx-core-tests/**",
+    ".github/actions/run-tlx-correctness-tests/**"
   ]
 }

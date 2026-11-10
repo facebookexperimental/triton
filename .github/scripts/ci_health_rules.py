@@ -13,6 +13,8 @@ page_data() builds the data.json the page renders, one section per tab:
   nightly  the nightly release and the bench dashboard's perf events.
   pr       the latest run of each PR in the last 24 h, tagged by whose it is.
   ops      GPU hours, job durations and setup failures.
+  usage    GPU hours per day by activity (L1, L2, TritonBench, other tests, setup) and trigger.
+The runner occupancy (busy, idle and waiting per 15 minutes) is shared by every branch, so it sits beside them.
   bump     is the branch's Meta LLVM pin current, what a newer fork release
            would add, the open bump issues, and the pin's recent changes.
 No I/O.
@@ -20,6 +22,7 @@ No I/O.
 import collections
 import datetime as dt
 import re
+import zoneinfo
 
 #: The reusable workflows gpu-tests.yml calls, one per GPU. Their step names define the test steps.
 GPU_WORKFLOWS = ("mi350.yml", "b200.yml", "h100.yml")
@@ -33,11 +36,12 @@ BUMP_PREFIX = "scratch/meta-llvm-bump/"
 
 #: Step name -> test group. A step with a group is a test step; any other step is setup.
 GROUPS = [
+    (r"^Run fast correctness tests$", "Fast correctness"),
     (r"^Run TLX (core|unit) tests$", "TLX core"),  # MI350 called it "unit" until its rename
     (r"^Run TLX tutorial correctness tests$", "Tutorial correctness"),
-    (r"^Run device-agnostic TLX codegen tests$", "TLX codegen"),
+    (r"^Run (device-agnostic TLX codegen|codegen) tests$", "TLX codegen"),
     (r"^Run TritonBench", "TritonBench"),
-    (r"^Run Gluon tests", "Gluon"),
+    (r"^Run Gluon (frontend )?tests", "Gluon"),
     (r"^Run runtime unit tests$", "Runtime"),
     (r"^Run host-default TLX L2 perf$", "TLX perf"),
     (r"^Run TorchTLX", "TorchTLX"),
@@ -56,8 +60,9 @@ JOB_GROUPS = [
 #: A failed step matching this is an infrastructure failure, not a test result.
 INFRA_STEP = re.compile(
     r"set up job|checkout|download prebuilt|install triton|upload wheel|build wheel|setup tritonbench|"
-    r"authenticate|azure|aws|restore ccache|tune nvidia|fail if the build job|select kernel-affected|"
-    r"set up test environment|install prebuilt triton|resolve tritonbench ref|install tritonbench dependencies", re.I)
+    r"authenticate|azure|aws|restore ccache|tune nvidia|check amd gpu|fail if the build job|"
+    r"select kernel-affected|set up test environment|set up CPU environment|set up Python|check GPU|"
+    r"install prebuilt triton|resolve tritonbench ref|install tritonbench dependencies", re.I)
 
 
 def group_of(step):
@@ -92,6 +97,8 @@ def gpu_job(j):
 
 GPU_PREFIX = {"h100": "H100", "b200": "B200", "mi350": "MI350"}
 GPUS = ("H100", "B200", "MI350")
+TEST_PLATFORMS = (*GPUS, "CPU")
+CPU_JOB = "Compiler tests on CPU"
 #: Shared jobs of gpu-tests.yml that every GPU job needs: their failure is a build failure, not a setup failure.
 BUILD_JOBS = ("build", "select")
 #: How many pushes the Main tab's grid and setup counts look back.
@@ -112,14 +119,72 @@ SLOW_TOP = 10
 OUTCOMES = ("passed", "test", "build", "setup", "cancelled")
 #: A job that ran on no push for this long is retired (disabled or removed), and its failures no longer count.
 RETIRE_DAYS = 7
+#: Usage tab activities, in stacking order. A test group maps to one in ACTIVITY (else "Other tests"); a step with no
+#: group, and job time outside any step, is setup.
+ACTIVITIES = ("L1", "TritonBench", "Other tests", "L2", "Setup & overhead")
+ACTIVITY = {"TLX core": "L1", "TritonBench": "TritonBench", "TLX perf": "L2", "TLX ops bench": "L2"}
+#: Usage tab triggers, with their labels; any other event counts as "nightly & manual".
+USAGE_TRIGGERS = {"pull_request": "PR", "push": "push", "schedule": "scheduled"}
+#: Runner limit per GPU label over time (UTC, from that instant on), where it is known. B200 moved to an 8-runner
+#: scale set on 2026-10-27; before that its limit was not configured knowingly and held at the most jobs ever seen at
+#: once. A GPU without an entry uses the most jobs seen at once in the window.
+RUNNER_POOLS = {
+    "B200": [("2026-09-30T00:00:00Z", 6), ("2026-10-01T00:00:00Z", 5), ("2026-10-06T00:00:00Z", 4),
+             ("2026-10-06T06:22:00Z", 3), ("2026-10-27T02:54:00Z", 8)]
+}
+#: The occupancy grid's time zone and cell width. Most of the team works in Pacific time.
+OCC_TZ = zoneinfo.ZoneInfo("America/Los_Angeles")
+OCC_CELL_MIN = 15
+#: A queued job counts as waiting only after this many minutes: starting a runner normally takes a minute or two.
+WAIT_GRACE_MIN = 2
 
 #: Workflows whose runs hold GPU jobs.
 #: The TLX ops perf bench, run on each GPU after every nightly release ("b200 / bench").
 BENCH_WF = "nightly-tlx-ops-bench.yml"
-GPU_RUN_WORKFLOWS = ("gpu-tests.yml", "gpu-tests-nightly.yml", BENCH_WF)
+FAST_WF = "fast-gpu-tests.yml"
+GPU_RUN_WORKFLOWS = ("gpu-tests.yml", "gpu-tests-nightly.yml", BENCH_WF, FAST_WF)
 #: Compiler LIT Tests: one job builds Triton and runs lit; it triggers on pushes to main only.
 LIT_WF = "compiler.yml"
 LIT_JOB = "LIT Tests"
+
+
+def job_name(name):
+    return name.removeprefix("full / ")
+
+
+def stage_runs(run):
+    """Views of one physical PR run. Resource accounting keeps the physical record."""
+    if run.get("wf") != FAST_WF or run.get("event") != "pull_request" or run.get("jobs") is None:
+        return [run]
+    full = [j for j in run["jobs"] if j["name"].startswith("full / ")]
+    fast_jobs = [j for j in run["jobs"] if not j["name"].startswith("full / ") and j["name"] != "full"]
+    build = [j for j in fast_jobs if j["name"] in ("build", "build / build")]
+    views = []
+    for wf, jobs, aggregate in ((FAST_WF, fast_jobs, "Fast correctness"), ("gpu-tests.yml",
+                                                                           [{**j, "name": job_name(j["name"])}
+                                                                            for j in full] + build, SUMMARY_JOB)):
+        if wf == "gpu-tests.yml" and not full:
+            continue
+        end = next((j for j in jobs if j["name"] == aggregate), None)
+        verdict = (end or {}).get("conclusion")
+        if not verdict and run.get("status") == "completed":
+            verdict = "cancelled" if run.get("conclusion") == "cancelled" else "skipped"
+        updated = (end or {}).get("completed_at") or run.get("updated_at") or run["created_at"]
+        identity = run.get("stage_provenance", {}).get(wf, {})
+        views.append({
+            **run, "wf": wf, "jobs": jobs, "status": "completed" if verdict else "in_progress", "conclusion": verdict,
+            "updated_at": updated, "attempts": [], "stage": wf, "stage_job": (end or {}).get("id"), "select":
+            run.get("full_select") if wf == "gpu-tests.yml" else run.get("select"), "tested_sha":
+            identity.get("sha", run.get("tested_sha")), "tested_sha_provenance":
+            identity.get("evidence", run.get("tested_sha_provenance", []))
+        })
+    return views
+
+
+def comparison_runs(runs):
+    for run in runs:
+        for attempt in [*run.get("attempts", []), run]:
+            yield from stage_runs({**attempt, "attempts": []})
 
 
 def gpu_of(run, job):
@@ -127,7 +192,7 @@ def gpu_of(run, job):
     GPU, or a matrix value as in "tritonbench (h100) / ..." in gpu-tests-nightly.yml."""
     if run.get("wf") not in GPU_RUN_WORKFLOWS:
         return None
-    prefix, sep, _ = job["name"].partition(" / ")
+    prefix, sep, _ = job_name(job["name"]).partition(" / ")
     if not sep:
         return None
     m = re.fullmatch(r"[\w-]+ \((\w+)\)", prefix)
@@ -135,11 +200,24 @@ def gpu_of(run, job):
 
 
 def job_key(name):
-    return name.split(" / ", 1)[-1]
+    return job_name(name).split(" / ", 1)[-1]
 
 
 def _gpu_jobs(run):
     return [(gpu_of(run, j), j) for j in run.get("jobs") or [] if gpu_of(run, j) and gpu_job(j)]
+
+
+def test_platform_of(run, job):
+    if ((run.get("wf") == "gpu-tests.yml" and job["name"] == CPU_JOB)
+            or (run.get("wf") == FAST_WF and job["name"] in ("CPU fast correctness", "full / " + CPU_JOB))):
+        return "CPU"
+    return gpu_of(run, job)
+
+
+def _test_jobs(run):
+    return [(test_platform_of(run, job), job)
+            for job in run.get("jobs") or []
+            if test_platform_of(run, job) and (test_platform_of(run, job) == "CPU" or gpu_job(job))]
 
 
 def gpu_minutes(run):
@@ -188,7 +266,7 @@ def run_outcome(run):
         return "passed"
     if _build_failure(run):
         return "build"
-    for _, j in _gpu_jobs(run):
+    for _, j in _test_jobs(run):
         if any(group_of(s["name"]) and s["conclusion"] == "failure" for s in j["steps"]):
             return "test"
     return "setup"
@@ -254,7 +332,7 @@ def _history(pushes):
     state, last, names, seen, units = {}, {}, {}, collections.defaultdict(dict), collections.defaultdict(dict)
     blame = collections.defaultdict(lambda: collections.defaultdict(set))
     for i, run in enumerate(pushes):
-        for gpu, j in _gpu_jobs(run):
+        for gpu, j in _test_jobs(run):
             for s in j["steps"]:
                 res = step_result(j, s)
                 if res is None:
@@ -287,7 +365,7 @@ def _sched_result(runs, sha, unit, test_id):
     for run in runs:
         if run.get("wf") != "gpu-tests.yml" or run["event"] != "schedule" or run.get("head_sha") != sha:
             continue
-        for g, j in _gpu_jobs(run):
+        for g, j in _test_jobs(run):
             if g != gpu or job_key(j["name"]) != key:
                 continue
             for s in j["steps"]:
@@ -312,12 +390,12 @@ def main_view(runs, asof, branch="main"):
     retire = iso(t(asof) - dt.timedelta(days=RETIRE_DAYS))
     latest_steps = {}
     for run in pushes:
-        for gpu, j in _gpu_jobs(run):
+        for gpu, j in _test_jobs(run):
             if j["conclusion"] in RAN and run["created_at"] >= retire:
                 latest_steps[(gpu, job_key(j["name"]))] = {group_of(s["name"]) for s in j["steps"]} - {None}
     gpus = {}
-    for gpu in GPUS:
-        ran = [r for r in pushes if any(g == gpu and j["conclusion"] in RAN for g, j in _gpu_jobs(r))]
+    for gpu in TEST_PLATFORMS:
+        ran = [r for r in pushes if any(g == gpu and j["conclusion"] in RAN for g, j in _test_jobs(r))]
         out = {"verdict": "none", "new": [], "known": [], **(_commit(ran[-1]) if ran else {})}
         for unit, fails in state.items():
             if unit[0] != gpu or unit[2] not in latest_steps.get(unit[:2], ()):
@@ -345,8 +423,8 @@ def main_view(runs, asof, branch="main"):
     for i in range(max(0, len(pushes) - PUSH_GRID), len(pushes)):
         run, cells = pushes[i], {}
         broken = _build_failure(run)
-        for gpu in GPUS:
-            jobs = [j for g, j in _gpu_jobs(run) if g == gpu and j["conclusion"] in RAN]
+        for gpu in TEST_PLATFORMS:
+            jobs = [j for g, j in _test_jobs(run) if g == gpu and j["conclusion"] in RAN]
             st = seen[i].get(gpu, set())
             if broken or not jobs:
                 # skip: path selection did not pick this GPU, so nothing it tests changed.
@@ -365,7 +443,7 @@ def main_view(runs, asof, branch="main"):
             gpu: since(set().union(*(v
                                      for u, v in blame[i].items()
                                      if u[0] == gpu)))
-            for gpu in GPUS
+            for gpu in TEST_PLATFORMS
             if cells[gpu] == "known"
         }
         grid.append({
@@ -373,13 +451,15 @@ def main_view(runs, asof, branch="main"):
         })
 
     # Push runs still in progress have no result yet; they show as running so a missing cell is never ambiguous.
-    grid += [{**_commit(r), "title": r.get("title", ""), "url": r.get("url"), "cells": {g: "running"
-                                                                                        for g in GPUS}}
+    grid += [{
+        **_commit(r), "title": r.get("title", ""), "url": r.get("url"), "cells": {g: "running"
+                                                                                  for g in TEST_PLATFORMS}
+    }
              for r in _running(runs, "gpu-tests.yml", branch, asof)]
     steps = _step_grid(pushes, max(0, len(pushes) - PUSH_GRID), units, blame, since)
     setup = [{
         "sha": r.get("head_sha") or "", "t": r["created_at"], "gpu": g, "job": job_key(j["name"]), "step": setup_step(j)
-    } for r in pushes[-SETUP_WINDOW:] for g, j in _gpu_jobs(r) if setup_step(j)]
+    } for r in pushes[-SETUP_WINDOW:] for g, j in _test_jobs(r) if setup_step(j)]
     build = None
     if pushes and _build_failure(pushes[-1]):
         build = {**_commit(pushes[-1]), "step": _build_failure(pushes[-1])}
@@ -468,13 +548,13 @@ def _step_grid(pushes, start, units, blame, since):
     na (the job or the step did not run). Groups that never ran in the grid get no row. since maps a known cell's
     column to the push(es) its failures started at."""
     out = {}
-    for gpu in GPUS:
+    for gpu in TEST_PLATFORMS:
         rows, names, starts = {}, {}, {}
         for col, i in enumerate(range(start, len(pushes))):
             run = pushes[i]
             if _build_failure(run):
                 continue
-            for g, j in _gpu_jobs(run):
+            for g, j in _test_jobs(run):
                 if g != gpu or j["conclusion"] not in RAN:
                     continue
                 key, setup, failed_before = job_key(j["name"]), setup_step(j), False
@@ -509,16 +589,16 @@ def pr_view(runs, asof, main, branch="main"):
     since = iso(t(asof) - dt.timedelta(hours=24))
     on_main = {(i["gpu"], i["job"], i["id"]) for g in main["gpus"].values() for i in g["new"] + g["known"]}
     latest = {}
-    for run in runs:
+    for run in comparison_runs(runs):
         if run.get("wf") != "gpu-tests.yml" or run["event"] != "pull_request" or not (since <= run["created_at"] <=
                                                                                       asof):
             continue
         key = run.get("pr") or ("branch", run.get("branch"))
-        if key not in latest or run["created_at"] > latest[key]["created_at"]:
+        if key not in latest or _attempt_order(run) > _attempt_order(latest[key]):
             latest[key] = run
     out = []
     for run in sorted(latest.values(), key=lambda r: r["created_at"], reverse=True):
-        jobs = _gpu_jobs(run)
+        jobs = _test_jobs(run)
         fails = {(g, job_key(j["name"]), f["id"]) for g, j in jobs for s in j["steps"] for f in s.get("failures") or []}
         outcome = run_outcome(run)
         row = {
@@ -526,7 +606,8 @@ def pr_view(runs, asof, main, branch="main"):
             "branch": run.get("branch"), "t": run["created_at"], "gpus":
             sorted({g
                     for g, j in jobs
-                    if j["conclusion"] in RAN}, key=GPUS.index), "n_failed": len(fails), "whose": None, "note": ""
+                    if j["conclusion"] in RAN},
+                   key=TEST_PLATFORMS.index), "n_failed": len(fails), "whose": None, "note": ""
         }
         if outcome is None:
             row["result"] = "running"
@@ -544,6 +625,184 @@ def pr_view(runs, asof, main, branch="main"):
             row["result"] = outcome
         out.append(row)
     return out
+
+
+FAST_FULL_KINDS = ("passed", "test", "build", "setup", "execution_error", "unknown", "pending", "cancelled",
+                   "missing_pair", "unverified_version", "not_required", "fast_not_passed")
+
+
+def _aggregate(run, name):
+    return next((j for j in run.get("jobs") or [] if j["name"] == name), None)
+
+
+def fast_result(run):
+    """A green aggregate validates tests only when a selected worker actually ran them."""
+    if run.get("wf") == FAST_WF and run.get("event") == "pull_request":
+        run = stage_runs(run)[0]
+    if run.get("status") != "completed" or run.get("jobs") is None:
+        return "pending"
+    if run.get("conclusion") == "cancelled":
+        return "cancelled"
+    aggregate = _aggregate(run, "Fast correctness")
+    if not aggregate or aggregate["conclusion"] != "success" or run_outcome(run) != "passed":
+        return "fast_not_passed"
+    workers = _test_jobs(run)
+    if any(s["name"] == "Run fast correctness tests" and s["conclusion"] == "success"
+           for _, j in workers
+           for s in j["steps"]):
+        return "passed"
+    if workers and all(j["conclusion"] == "skipped" for _, j in workers):
+        return "not_required"
+    return "unknown"
+
+
+def full_result(run):
+    """The full aggregate with an identified pytest failure, or a non-test outcome."""
+    if run.get("status") != "completed" or run.get("jobs") is None:
+        return "pending"
+    outcome = run_outcome(run)
+    if outcome in ("cancelled", "build"):
+        return outcome
+    aggregate = _aggregate(run, SUMMARY_JOB) or _aggregate(run, "teststatus")
+    if not aggregate:
+        return "unknown"
+    jobs = _test_jobs(run)
+    if aggregate["conclusion"] == "success" and outcome == "passed":
+        return "passed" if any(step_result(j, s) == "pass" for _, j in jobs for s in j["steps"]) else "not_required"
+    if aggregate["conclusion"] != "failure":
+        return "unknown"
+    if any(
+            group_of(s["name"]) and s["conclusion"] == "failure" and any(f["kind"] == "failed"
+                                                                         for f in s.get("test_failures", []))
+            for _, j in jobs
+            for s in j["steps"]):
+        return "test"
+    if any(f["kind"] == "error" for f in _comparison_failures(run)):
+        return "execution_error"
+    if any(setup_step(j) and INFRA_STEP.search(setup_step(j)) for _, j in jobs):
+        return "setup"
+    return "unknown"
+
+
+def _attempt_order(run):
+    return (run["created_at"], run["id"], run.get("run_attempt", 1))
+
+
+def _comparison_run(run):
+    attempt = run.get("run_attempt", 1)
+    return {
+        "id":
+        run["id"], "attempt":
+        attempt, "t":
+        run["created_at"], "updated_at":
+        run.get("updated_at") or run["created_at"], "url":
+        (f"{run.get('url', '')}/job/{run['stage_job']}"
+         if run.get("stage_job") else f"{run.get('url', '')}/attempts/{attempt}"), "provenance":
+        run.get("tested_sha_provenance", [])
+    }
+
+
+def _comparison_failures(run):
+    return [{**f, "platform": platform, "job": job_key(j["name"]), "step": s["name"]}
+            for platform, j in _test_jobs(run)
+            for s in j["steps"] if group_of(s["name"]) for f in s.get("test_failures", [])]
+
+
+def fast_full_view(runs, asof):
+    """One record per PR and tested revision, with historical gaps and the latest retry result.
+
+    Missing checkout evidence groups only unverified observations by PR tip. Those
+    observations never pair with verified revisions or enter the denominator.
+    """
+    lo = iso(t(asof) - dt.timedelta(days=30))
+    attempts = {}
+    for run in comparison_runs(runs):
+        if run.get("wf") not in (FAST_WF, "gpu-tests.yml") or run["event"] != "pull_request":
+            continue
+        for item in [*run.get("attempts", []), run]:
+            if lo <= item["created_at"] <= asof and (item.get("updated_at") or item["created_at"]) <= asof:
+                attempts[(item["wf"], item["id"], item.get("run_attempt", 1))] = item
+    groups = collections.defaultdict(lambda: {FAST_WF: [], "gpu-tests.yml": []})
+    for item in sorted(attempts.values(), key=_attempt_order):
+        sha = item.get("tested_sha")
+        verified = bool(item.get("pr") and sha and re.fullmatch(r"[0-9a-f]{40}", sha))
+        key = (item.get("pr"), "verified" if verified else "unverified", sha if verified else item.get("head_sha"))
+        # Unknown PR identity must never join another run, even at the same tip.
+        if not item.get("pr"):
+            key += (item["id"], )
+        groups[key][item["wf"]].append(item)
+    rows = []
+    for key, workflows in groups.items():
+        fasts, fulls = workflows[FAST_WF], workflows["gpu-tests.yml"]
+        fast, full = (fasts[-1] if fasts else None), (fulls[-1] if fulls else None)
+        fresult, result = fast_result(fast) if fast else None, full_result(full) if full else None
+        passing = [item for item in fasts if fast_result(item) == "passed"]
+        completed = [item for item in fulls if full_result(item) in ("passed", "test")]
+        verified = key[1] == "verified"
+        comparable = verified and bool(passing and completed)
+        gaps = []
+        if verified and passing:
+            for item in fulls:
+                if full_result(item) != "test":
+                    continue
+                before = [candidate for candidate in passing if _attempt_order(candidate) <= _attempt_order(item)]
+                paired_fast = before[-1] if before else passing[0]
+                gaps.append({
+                    "fast": _comparison_run(paired_fast), "full": _comparison_run(item), "failures":
+                    _comparison_failures(item)
+                })
+        if fresult in ("not_required", "fast_not_passed", "unknown", "cancelled", "pending"):
+            latest = fresult
+        elif not fast or not full:
+            latest = "missing_pair"
+        elif result in ("pending", "cancelled", "not_required"):
+            latest = result
+        elif not verified:
+            latest = "unverified_version"
+        else:
+            latest = result
+        # Historical evidence is counted once per revision. A retry can resolve
+        # its latest state without deleting the original candidate.
+        kind = "test" if gaps else latest
+        sample = fast or full
+        rows.append({
+            "pr": key[0], "sha": key[2] if verified else None, "head_sha": sample.get("head_sha"), "verified": verified,
+            "t": min(item["created_at"] for item in fasts + fulls), "kind": kind, "latest": latest, "comparable":
+            comparable, "fast": _comparison_run(fast) if fast else None, "full":
+            _comparison_run(full) if full else None, "fast_attempts": len(fasts), "full_attempts": len(fulls), "gaps":
+            gaps, "failures": _comparison_failures(full) if full else []
+        })
+    latest_pr = {}
+    for item in sorted(attempts.values(), key=_attempt_order):
+        if item["wf"] == "gpu-tests.yml" and item.get("pr"):
+            latest_pr[item["pr"]] = item
+    for row in rows:
+        latest = latest_pr.get(row["pr"])
+        row["latest_pr_full"] = _comparison_run(latest) if latest else None
+        row["latest_pr_result"] = full_result(latest) if latest else None
+    rows.sort(key=lambda item: (item["t"], item["pr"] or 0, item["sha"] or item["head_sha"] or ""), reverse=True)
+
+    def counts(items):
+        kinds = collections.Counter(item["kind"] for item in items)
+        n = sum(item["comparable"] for item in items)
+        candidates = [item for item in items if item["gaps"]]
+        return {
+            "counts": {kind: kinds[kind]
+                       for kind in FAST_FULL_KINDS}, "revisions": sum(item["verified"] for item in items),
+            "observations": len(items), "unverified_observations": sum(not item["verified"] for item in items),
+            "unique_prs": len({item["pr"]
+                               for item in items
+                               if item["pr"]}), "candidate_prs": len({item["pr"]
+                                                                      for item in candidates}), "comparable": n, "rate":
+            round(len(candidates) / n, 4) if n else None, "fast_attempts": sum(item["fast_attempts"] for item in items),
+            "full_attempts": sum(item["full_attempts"] for item in items)
+        }
+
+    week = iso(t(asof) - dt.timedelta(days=7))
+    return {
+        "days": 7, "retention_days": 30, **counts([item for item in rows if item["t"] >= week]), "records": rows,
+        "trend": [{"day": day, **counts([item for item in rows if item["t"][:10] == day])} for day in ops_days(t(asof))]
+    }
 
 
 def nightly_view(runs, asof, bench):
@@ -695,9 +954,9 @@ def concurrency_view(runs, asof):
     running, waiting = {g: [] for g in GPUS}, {g: [] for g in GPUS}
     recent = iso(now - dt.timedelta(hours=OPS_HOURS))
     horizon = min([
-        t(r["created_at"])
-        for r in runs
-        if r.get("wf") in GPU_RUN_WORKFLOWS and r.get("jobs") is None and recent <= r["created_at"] <= asof
+        t(r["created_at"]) for r in runs if r.get("wf") in GPU_RUN_WORKFLOWS and recent <= r["created_at"] <= asof and
+        (r.get("jobs") is None or any(not j.get("completed_at") and j.get("conclusion") != "skipped"
+                                      for j in r["jobs"]))
     ] + [now])
     for r in runs:
         if r.get("wf") not in GPU_RUN_WORKFLOWS or r["created_at"] > asof:
@@ -940,6 +1199,134 @@ def select_view(runs, asof):
     return {"days": [{"day": d, "triggers": by_day[d]} for d in days], "anomalies": anomalies}
 
 
+def activity_of(step_name):
+    g = group_of(step_name)
+    return "Setup & overhead" if g is None else ACTIVITY.get(g, "Other tests")
+
+
+def usage_view(runs, asof):
+    """GPU hours per day over OPS_DAYS, per GPU, by activity and by trigger. A job's hours count on the UTC day it
+    started; its steps go to their activities, clipped to the job, and time outside any step to setup. A step with no
+    end time ran until the next step started, or until the job ended."""
+    days = ops_days(t(asof))
+    act = {g: {d: dict.fromkeys(ACTIVITIES, 0.0) for d in days} for g in GPUS}
+    trig = {g: {d: collections.Counter() for d in days} for g in GPUS}
+    for r in runs:
+        if r.get("wf") not in GPU_RUN_WORKFLOWS or r["created_at"] > asof or not r.get("jobs"):
+            continue
+        for g, j in _gpu_jobs(r):
+            d = (j.get("started_at") or "")[:10]
+            if not _ran(j) or d not in act[g]:
+                continue
+            ja, jb = t(j["started_at"]), t(j["completed_at"])
+            total, counted = mins(j["started_at"], j["completed_at"]), 0.0
+            starts = [s.get("started_at") for s in j["steps"]]
+            for k, s in enumerate(j["steps"]):
+                if not s.get("started_at"):
+                    continue
+                end = s.get("completed_at") or next((x for x in starts[k + 1:] if x), None) or j["completed_at"]
+                m = max(0.0, (min(t(end), jb) - max(t(s["started_at"]), ja)).total_seconds() / 60)
+                act[g][d][activity_of(s["name"])] += m
+                counted += m
+            act[g][d]["Setup & overhead"] += max(0.0, total - counted)
+            trig[g][d][USAGE_TRIGGERS.get(r["event"], "nightly & manual")] += total
+    return {
+        "days": [{"day": d, **{g: {k: round(v / 60, 2)
+                                   for k, v in act[g][d].items()}
+                               for g in GPUS}}
+                 for d in days],
+        "triggers": [{"day": d, **{g: {k: round(v / 60, 2)
+                                       for k, v in trig[g][d].items()}
+                                   for g in GPUS}}
+                     for d in days],
+    }
+
+
+def _pool_at(gpu, minute_ts, observed):
+    steps = RUNNER_POOLS.get(gpu)
+    if not steps:
+        return observed
+    n = steps[0][1]
+    for since, size in steps:
+        if t(since) <= minute_ts:
+            n = size
+    return n
+
+
+def occupancy_view(runs, asof):
+    """Runner occupancy per GPU in OCC_CELL_MIN-minute cells over OPS_DAYS, from midnight (OCC_TZ) of the first day.
+    Per cell: the most jobs running, exact busy runner-minutes, idle minutes (no job running), minutes with every
+    runner busy, runner capacity (pool minutes), and minutes and job-minutes of waiting with every runner busy (full)
+    or not (part). A job waits from WAIT_GRACE_MIN after it was queued until it started. Every branch and trigger
+    counts, since they share the runners. As in concurrency_view, cells stop where the oldest recent run without
+    stored jobs began."""
+    now = t(asof)
+    first = now.astimezone(OCC_TZ).date() - dt.timedelta(days=OPS_DAYS - 1)
+    lo = dt.datetime.combine(first, dt.time(), OCC_TZ).astimezone(dt.timezone.utc)
+    recent = iso(now - dt.timedelta(hours=OPS_HOURS))
+    hi = min([
+        t(r["created_at"]) for r in runs if r.get("wf") in GPU_RUN_WORKFLOWS and recent <= r["created_at"] <= asof and
+        (r.get("jobs") is None or any(not j.get("completed_at") and j.get("conclusion") != "skipped"
+                                      for j in r["jobs"]))
+    ] + [now])
+    n = max(0, int((hi - lo).total_seconds() // 60))
+    n -= n % OCC_CELL_MIN
+    spans = {g: [] for g in GPUS}
+    for r in runs:
+        if r.get("wf") not in GPU_RUN_WORKFLOWS or r["created_at"] > asof:
+            continue
+        for g, j in _gpu_jobs(r):
+            if _ran(j):
+                spans[g].append((t(j.get("created_at") or j["started_at"]), t(j["started_at"]), t(j["completed_at"])))
+    minute = lambda x: int((x - lo).total_seconds() // 60)
+
+    def most_at_once(intervals):
+        """Per minute, the most intervals open at any moment of it, so a job shorter than a minute still counts."""
+        out, c, prev = [0] * n, 0, lo
+        for x, d in sorted([(a, 1) for a, b in intervals if a < b] + [(b, -1) for a, b in intervals if a < b],
+                           key=lambda e: (e[0], e[1])):
+            if c and x > prev:
+                for i in range(max(0, minute(prev)), min(n, -(-int((x - lo).total_seconds()) // 60))):
+                    out[i] = max(out[i], c)
+            c, prev = c + d, x
+        return out
+
+    out = {"t0": iso(lo), "cell_min": OCC_CELL_MIN, "tz": OCC_TZ.key, "gpus": {}}
+    cells = n // OCC_CELL_MIN
+    width = OCC_CELL_MIN * 60
+    for g in GPUS:
+        run = most_at_once([(a, b) for q, a, b in spans[g]])
+        wait = most_at_once([(q + dt.timedelta(minutes=WAIT_GRACE_MIN), a) for q, a, b in spans[g]])
+        busy = [0.0] * cells
+        for q, a, b in spans[g]:
+            # Exact busy seconds per cell, so busy hours equal the jobs' runner time.
+            x, end = max(a, lo), min(b, lo + dt.timedelta(minutes=n))
+            while x < end:
+                k = int((x - lo).total_seconds() // width)
+                y = min(end, lo + dt.timedelta(seconds=width * (k + 1)))
+                busy[k] += (y - x).total_seconds()
+                x = y
+        observed = max(run, default=0)
+        pool = [_pool_at(g, lo + dt.timedelta(minutes=i), observed) for i in range(n)]
+        c = collections.defaultdict(list)
+        for k in range(cells):
+            m = range(k * OCC_CELL_MIN, (k + 1) * OCC_CELL_MIN)
+            full = [i for i in m if wait[i] and run[i] >= pool[i]]
+            part = [i for i in m if wait[i] and run[i] < pool[i]]
+            c["run"].append(max(run[i] for i in m))
+            c["busy"].append(round(busy[k] / 60, 2))
+            c["idle"].append(sum(1 for i in m if run[i] == 0))
+            c["fullm"].append(sum(1 for i in m if run[i] >= pool[i]))
+            c["pool"].append(max(pool[i] for i in m))
+            c["cap"].append(sum(pool[i] for i in m))
+            c["wfull"].append(len(full))
+            c["wpart"].append(len(part))
+            c["jfull"].append(sum(wait[i] for i in full))
+            c["jpart"].append(sum(wait[i] for i in part))
+        out["gpus"][g] = {"pool_known": g in RUNNER_POOLS, **c}
+    return out
+
+
 def bump_view(line):
     """The Meta LLVM tab of one tracked branch, from its bump.json entry (None before the first snapshot).
     status: current (pins the newest fork release), new (a newer release is not pinned yet) or unknown."""
@@ -959,7 +1346,8 @@ def page_data(runs, asof, bench, bump=None):
         # The bench dashboard's perf events come from main's nightly bench.
         branches[b] = {
             "main": main, "lit": lit_view(rs, asof, b), "nightly": nightly_view(rs, asof, bench if b == "main" else {}),
-            "pr": pr_view(rs, asof, main, b), "ops": {**ops_view(rs, asof), "concurrency": concurrency}, "bump":
-            bump_view(((bump or {}).get("lines") or {}).get(b))
+            "pr": pr_view(rs, asof, main, b), "fast_full": fast_full_view(rs, asof), "ops":
+            {**ops_view(rs, asof), "concurrency": concurrency}, "usage": usage_view(rs, asof), "bump": bump_view(
+                 ((bump or {}).get("lines") or {}).get(b))
         }
-    return {"asof": asof, "branches": branches}
+    return {"asof": asof, "branches": branches, "occupancy": occupancy_view(runs, asof)}

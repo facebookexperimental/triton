@@ -39,14 +39,60 @@ def _launch_options(options):
         if field.name in _NON_LAUNCH_OPTIONS:
             continue
         value = getattr(options, field.name, None)
-        # Non-scalars are target capability lists (fp8 dtypes, dot precisions),
-        # not tuning knobs, and are not JSON round-trippable as kwargs.
-        if not isinstance(value, (bool, int, float, str)):
+        # Integer tuples are cluster shapes (ctas_per_cga, cluster_dims): drop
+        # those and a 2-CTA kernel replays as 1-CTA. The other non-scalars are
+        # target capability lists (fp8 dtypes, dot precisions), not tuning knobs.
+        is_shape = isinstance(value, tuple) and len(value) > 0 and all(
+            isinstance(v, int) and not isinstance(v, bool) for v in value)
+        if not (is_shape or isinstance(value, (bool, int, float, str))):
             continue
         if field.default is not dataclasses.MISSING and value == field.default:
             continue
-        captured[field.name] = value
+        captured[field.name] = list(value) if is_shape else value
     return captured
+
+
+def _changed_knobs():
+    """The backend knobs this compile ran under, where they differ from default.
+
+    AutoWS kernels compile inside `triton.knobs.nvidia.scope()` overrides such
+    as use_meta_ws, so recompiling the source without them builds a different
+    kernel than the one that was dumped.
+    """
+    from triton import knobs
+
+    captured = {}
+    for section in ("nvidia", "amd"):
+        group = getattr(knobs, section, None)
+        if group is None:
+            continue
+        changed = {}
+        for name, descriptor in group.knob_descriptors.items():
+            if not hasattr(descriptor, "default"):
+                continue
+            value = getattr(group, name)
+            if isinstance(value, (bool, int, float, str)) and value != descriptor.default:
+                changed[name] = value
+        if changed:
+            captured[section] = changed
+    return captured
+
+
+def _kernel_origin(fn):
+    """Where the source kernel lives, so a replay can import it back."""
+    if fn is None:
+        return {}
+    import inspect
+
+    origin = {"name": fn.__name__, "module": fn.__module__}
+    try:
+        # None when the source is not on disk, e.g. inside a zip-packaged PAR.
+        source_file = inspect.getsourcefile(fn)
+    except TypeError:
+        source_file = None
+    if source_file:
+        origin["file"] = source_file
+    return origin
 
 
 def _ensure_dump_dir():
@@ -179,7 +225,7 @@ def _dtype_str(dtype):
     return str(dtype).replace("torch.", "")
 
 
-def capture_kernel_args(bound_args, signature, constexprs, _params=None, options=None):
+def capture_kernel_args(bound_args, signature, constexprs, _params=None, options=None, fn=None):
     """Serialize kernel call argument metadata to *_kernel_args.json*.
 
     Parameters
@@ -197,6 +243,9 @@ def capture_kernel_args(bound_args, signature, constexprs, _params=None, options
     options : Any
         The backend options object for this compile, used to record the launch
         tuning (num_warps, num_stages, ...) that the argument list cannot carry.
+    fn : Callable
+        The Python function behind the JITFunction, recorded so a replay can
+        load the source kernel again.
     """
     import torch
 
@@ -272,6 +321,8 @@ def capture_kernel_args(bound_args, signature, constexprs, _params=None, options
         "args": args_list,
         "constexprs": constexpr_map,
         "launch_options": _launch_options(options),
+        "knobs": _changed_knobs(),
+        "kernel": _kernel_origin(fn),
     }
 
     json_path = os.path.join(dump_dir, "_kernel_args.json")
@@ -401,6 +452,8 @@ def generate_standalone_test(dump_dir, kernel_name, _source_origin=None, _metada
         "    # the generated kernel recompiles at the backend defaults and the",
         "    # timing below describes a different kernel than the source ran.",
         "    launch_opts = meta.get('launch_options', {})",
+        "    # Cluster shapes travel through JSON as lists.",
+        "    launch_opts = {k: tuple(v) if isinstance(v, list) else v for k, v in launch_opts.items()}",
         "",
         "    # Allocator for Triton scratch memory",
         "    triton.set_allocator(lambda s, a, _: torch.empty(s, dtype=torch.int8, device=DEVICE))",

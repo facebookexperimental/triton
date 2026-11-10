@@ -1,4 +1,5 @@
 import ci_health_rules as r
+import pytest
 
 CORE, CODEGEN = "Run TLX core tests", "Run device-agnostic TLX codegen tests"
 
@@ -57,6 +58,186 @@ def main(runs, asof=stamp(23)):
 
 def items(view, gpu, kind):
     return {(i["id"], i["first_sha"][:2]) for i in view["gpus"][gpu][kind]}
+
+
+def comparison_run(h, wf="gpu-tests.yml", tested_sha="ab" * 20, pr=4855, **kw):
+    fast = wf == r.FAST_WF
+    worker = job("mi350 / correctness" if fast else "mi350 / mi350-tlx-test",
+                 step("Run fast correctness tests" if fast else CORE, "success"), label="linux-mi350")
+    aggregate = job("Fast correctness" if fast else r.SUMMARY_JOB, label="ubuntu-latest")
+    item = run(h, [build_ok(), worker, aggregate], event="pull_request", wf=wf, pr=pr, **kw)
+    item.update(tested_sha=tested_sha, run_attempt=1, updated_at=stamp(h))
+    return item
+
+
+def fail_comparison(item, kind="failed"):
+    worker = item["jobs"][1]
+    worker["conclusion"] = item["conclusion"] = item["jobs"][-1]["conclusion"] = "failure"
+    test = worker["steps"][0]
+    test["conclusion"] = "failure"
+    test["test_failures"] = [{
+        "id": "test_flash_attn_mxfp8_shared_fp8_boundary_graph[False]", "kind": kind, "msg":
+        "AssertionError: bitwise equality", "t": stamp(3)
+    }]
+    return item
+
+
+def test_ordered_parent_exposes_fast_pass_before_full_and_retains_failure():
+    fast = comparison_run(1, r.FAST_WF)
+    fast['jobs'][-1]['completed_at'] = stamp(2)
+    full = comparison_run(1)
+    parent = {**fast, 'status': 'in_progress', 'conclusion': None, 'updated_at': stamp(8)}
+    pending = [{**j, 'name': 'full / ' + j['name'], 'conclusion': None, 'completed_at': None} for j in full['jobs'][1:]]
+    parent['jobs'] = fast['jobs'] + pending
+    assert r.fast_result(parent) == 'passed'
+    projected = list(r.comparison_runs([parent]))
+    assert projected[0]['updated_at'] == stamp(2)
+    view = r.fast_full_view([parent], stamp(9))
+    assert view['counts']['pending'] == 1 and view['fast_attempts'] == view['full_attempts'] == 1
+    assert view['comparable'] == 0
+    failed = fail_comparison(full)
+    parent.update(status='completed', conclusion='failure', updated_at=stamp(10))
+    parent['jobs'] = fast['jobs'] + [{**j, 'name': 'full / ' + j['name']} for j in failed['jobs'][1:]]
+    assert r.fast_result(parent) == 'passed'
+    view = r.fast_full_view([parent], stamp(11))
+    assert view['counts']['test'] == view['comparable'] == 1 and view['rate'] == 1
+    assert view['records'][0]['gaps'][0]['fast']['id'] == view['records'][0]['gaps'][0]['full']['id'] == 1
+    assert r.pr_view([parent], stamp(11), r.main_view([], stamp(11)))[0]['result'] == 'test'
+    failed_snapshot = {**parent}
+    retry_full = comparison_run(1)
+    parent['attempts'] = [failed_snapshot]
+    parent['run_attempt'] = 2
+    parent['jobs'] = fast['jobs'] + [{**j, 'name': 'full / ' + j['name']} for j in retry_full['jobs'][1:]]
+    parent['conclusion'] = 'success'
+    assert r.pr_view([parent], stamp(11), r.main_view([], stamp(11)))[0]['result'] == 'passed'
+    assert r.fast_full_view([parent], stamp(11))['counts']['test'] == 1
+
+
+def test_ordered_cancellation_preserves_only_completed_fast_signal():
+    fast = comparison_run(1, r.FAST_WF)
+    cancelled = {**fast, 'status': 'completed', 'conclusion': 'cancelled', 'jobs': fast['jobs'][:-1]}
+    assert r.fast_result(cancelled) == 'cancelled'
+    cancelled['jobs'] = fast['jobs']
+    assert r.fast_result(cancelled) == 'passed'
+
+
+def test_partial_physical_jobs_do_not_report_known_idle_time():
+    parent = comparison_run(1, r.FAST_WF)
+    parent.update(status='in_progress', conclusion=None)
+    parent['jobs'][1].update(conclusion=None, completed_at=None)
+    occupancy = r.occupancy_view([parent], stamp(3))
+    last = r.concurrency_view([parent], stamp(3))['hours'][-1]
+    assert last['MI350']['peak'] is None
+    end = r.t(occupancy['t0']) + r.dt.timedelta(minutes=len(occupancy['gpus']['MI350']['run']) * r.OCC_CELL_MIN)
+    assert end <= r.t(parent['created_at'])
+
+
+def test_ordered_resources_count_physical_jobs_once_and_exclude_cpu():
+    fast, full = comparison_run(1, r.FAST_WF), comparison_run(1)
+    parent = {**fast, 'jobs': fast['jobs'] + [{**j, 'name': 'full / ' + j['name']} for j in full['jobs'][1:]]}
+    parent['jobs'].append(job('full / Compiler tests on CPU', step(CODEGEN, 'success'), label='ubuntu-latest'))
+    assert r.gpu_minutes(parent) == r.gpu_minutes(fast) + r.gpu_minutes(full) == 20
+    assert [g for g, _ in r._test_jobs(parent)] == ['MI350', 'MI350', 'CPU']
+    assert r.job_key('full / mi350 / mi350-tlx-test') == 'mi350-tlx-test'
+    views = list(r.comparison_runs([parent]))
+    assert len(views) == 2 and all(v['id'] == parent['id'] for v in views)
+    assert r.fast_full_view([parent, parent], stamp(11))['comparable'] == 1
+
+
+def test_fast_full_pairs_only_the_same_pr_and_actual_checkout():
+    fast = comparison_run(1, r.FAST_WF)
+    full = fail_comparison(comparison_run(2))
+    v = r.fast_full_view([fast, full], stamp(23))
+    assert v["counts"]["test"] == v["comparable"] == v["candidate_prs"] == 1
+    assert v["rate"] == 1
+    row = v["records"][0]
+    assert row["sha"] == "ab" * 20 and row["gaps"][0]["failures"][0]["platform"] == "MI350"
+    assert row["gaps"][0]["failures"][0]["id"].endswith("[False]")
+    assert row["gaps"][0]["fast"]["url"] == "u1/attempts/1"
+    assert row["gaps"][0]["full"]["url"] == "u2/attempts/1"
+    other_pr = {**full, "pr": 4856, "head_sha": fast["head_sha"]}
+    assert r.fast_full_view([fast, other_pr], stamp(23))["comparable"] == 0
+
+
+@pytest.mark.parametrize("sha,expected", [(None, "unverified_version"), ("cd" * 20, "missing_pair")])
+def test_fast_full_head_match_does_not_verify_checkout(sha, expected):
+    fast = comparison_run(1, r.FAST_WF, tested_sha=sha)
+    full = fail_comparison(comparison_run(2, tested_sha=None if sha is None else "ab" * 20))
+    fast["head_sha"] = full["head_sha"] = "ef" * 20
+    v = r.fast_full_view([fast, full], stamp(23))
+    assert v["comparable"] == v["counts"]["test"] == 0 and v["rate"] is None
+    assert v["counts"][expected] > 0
+
+
+@pytest.mark.parametrize("state", ["pending", "cancelled", "build", "setup", "unknown", "error"])
+def test_fast_full_non_test_outcomes_are_not_candidates(state):
+    fast, full = comparison_run(1, r.FAST_WF), comparison_run(2)
+    if state == "pending":
+        full.update(status="in_progress", conclusion=None, jobs=None)
+    elif state == "cancelled":
+        full["conclusion"] = "cancelled"
+    elif state == "build":
+        full["jobs"][0]["conclusion"] = "failure"
+        full["jobs"][0]["steps"][0]["conclusion"] = "failure"
+        full["conclusion"] = full["jobs"][-1]["conclusion"] = "failure"
+    elif state == "setup":
+        full["jobs"][1] = job("mi350 / mi350-tlx-test", step("Install prebuilt Triton", "failure"),
+                              step(CORE, "skipped"))
+        full["conclusion"] = full["jobs"][-1]["conclusion"] = "failure"
+    else:
+        fail_comparison(full, "error")
+        if state == "unknown":
+            full["jobs"][1]["steps"][0].pop("test_failures")
+    v = r.fast_full_view([fast, full], stamp(23))
+    assert v["counts"]["test"] == 0 and not v["records"][0]["gaps"]
+    assert v["counts"]["execution_error" if state == "error" else state] == 1
+    assert v["comparable"] == 0 and v["rate"] is None
+
+
+def test_fast_full_denominator_requires_full_test_verdict():
+    fast, full = comparison_run(1, r.FAST_WF), fail_comparison(comparison_run(2))
+    other_fast, setup = comparison_run(3, r.FAST_WF, tested_sha="cd" * 20), comparison_run(4, tested_sha="cd" * 20)
+    setup["jobs"][1] = job("mi350 / mi350-tlx-test", step("Install prebuilt Triton", "failure"))
+    setup["conclusion"] = setup["jobs"][-1]["conclusion"] = "failure"
+    v = r.fast_full_view([fast, full, other_fast, setup], stamp(23))
+    assert v["counts"]["test"] == v["counts"]["setup"] == 1
+    assert v["comparable"] == 1 and v["rate"] == 1
+
+
+def test_fast_full_skipped_fast_work_is_not_a_validated_pass():
+    fast = comparison_run(1, r.FAST_WF)
+    fast["jobs"][1]["conclusion"] = fast["jobs"][1]["steps"][0]["conclusion"] = "skipped"
+    v = r.fast_full_view([fast, fail_comparison(comparison_run(2))], stamp(23))
+    assert v["counts"]["not_required"] == 1 and v["counts"]["test"] == v["comparable"] == 0
+
+
+def test_fast_full_retains_historical_gap_and_latest_retry_resolution():
+    fast, failed = comparison_run(1, r.FAST_WF), fail_comparison(comparison_run(2))
+    retry = comparison_run(2)
+    retry.update(run_attempt=2, updated_at=stamp(20), attempts=[failed])
+    v = r.fast_full_view([fast, retry, retry], stamp(23))
+    assert v["counts"]["test"] == v["comparable"] == v["candidate_prs"] == 1
+    assert v["full_attempts"] == 2 and v["fast_attempts"] == 1 and len(v["records"]) == 1
+    row = v["records"][0]
+    assert row["latest"] == "passed" and row["gaps"][0]["full"]["attempt"] == 1 and row["full"]["attempt"] == 2
+    next_fast, next_full = comparison_run(5, r.FAST_WF, tested_sha="cd" * 20), comparison_run(6, tested_sha="cd" * 20)
+    v = r.fast_full_view([fast, retry, next_fast, next_full], stamp(23))
+    assert v["counts"]["test"] == v["counts"]["passed"] == v["candidate_prs"] == 1
+    assert v["comparable"] == 2 and v["rate"] == 0.5
+    historical = next(row for row in v["records"] if row["gaps"])
+    assert historical["latest_pr_result"] == "passed" and historical["latest_pr_full"]["id"] == next_full["id"]
+
+
+def test_fast_full_window_and_full_only_health_remain_distinct():
+    fast, full = comparison_run(1, r.FAST_WF), fail_comparison(comparison_run(2))
+    v = r.page_data([fast, full], stamp(23), {})["branches"]["main"]
+    assert v["fast_full"]["counts"]["test"] == 1
+    assert v["main"] == r.main_view([full], stamp(23))
+    assert v["pr"] == r.pr_view([full], stamp(23), v["main"])
+    v = r.fast_full_view([fast, full], "2026-10-20T00:00:00Z")
+    assert v["counts"]["test"] == 0 and len(v["records"]) == 1
+    assert sum(d["counts"]["test"] for d in v["trend"]) == 1
+    assert r.fast_full_view([fast, full], "2026-11-20T00:00:00Z")["records"] == []
 
 
 def test_mi350_core_step_keeps_its_name_before_the_rename():
@@ -449,8 +630,10 @@ def test_failed_select_is_an_anomaly():
 
 def test_page_data_has_one_section_per_tab():
     data = r.page_data([push(1, tlx())], stamp(23), {})
-    assert set(data) == {"asof", "branches"}
-    assert all(set(v) == {"main", "lit", "nightly", "pr", "ops", "bump"} for v in data["branches"].values())
+    assert set(data) == {"asof", "branches", "occupancy"}
+    assert all(
+        set(v) == {"main", "lit", "nightly", "pr", "fast_full", "ops", "usage", "bump"}
+        for v in data["branches"].values())
 
 
 def test_every_test_step_in_the_gpu_workflows_maps_to_a_group():
@@ -669,3 +852,33 @@ def test_job_durations_and_slow_tests_follow_the_range():
     assert j7["n"] == 1 and j7["p90_prev"] is not None  # the 10-day-old run is in the 7 days before
     (j14, ) = v["jobs"]["14"]
     assert j14["n"] == 2 and j14["p90_prev"] is None
+
+
+def test_usage_counts_each_job_minute_once():
+    """Activity hours add up to the jobs' runner time: a step goes to one activity, and time outside steps to setup."""
+    j = tlx()
+    j["completed_at"] = "2026-10-12T00:30:00Z"
+    j["steps"] = [
+        {"name": "Checkout", "conclusion": "success", "started_at": stamp(0), "completed_at": "2026-10-12T00:05:00Z"},
+        {
+            "name": CORE, "conclusion": "success", "started_at": "2026-10-12T00:06:00Z", "completed_at":
+            "2026-10-12T00:24:00Z"
+        },
+    ]
+    day = {x["day"]: x for x in r.usage_view([push(0, j)], stamp(23))["days"]}["2026-10-12"]["B200"]
+    assert day["L1"] == 0.3 and day["Setup & overhead"] == 0.2 and sum(day.values()) == 0.5
+
+
+def test_occupancy_calls_waiting_capacity_bound_only_when_every_runner_is_busy():
+    # MI350's pool is the most jobs seen at once (2). A job queued behind both waits with the pool full; one queued
+    # at 11:00 that started at 11:20 waited while every runner was free.
+    runs = [
+        push(1, span("mi350", 10, 0, 10, 30), span("mi350", 10, 0, 10, 30), span("mi350", 10, 30, 10, 40, created_m=0)),
+        push(2, span("mi350", 11, 20, 11, 30, created_m=0))
+    ]
+    o = r.occupancy_view(runs, stamp(23))
+    g, t0 = o["gpus"]["MI350"], r.t(o["t0"])
+    cell = lambda h, m: int((r.t(f"2026-10-12T{h:02d}:{m:02d}:00Z") - t0).total_seconds() // 900)
+    assert g["pool"][cell(10, 0)] == 2
+    assert (g["wfull"][cell(10, 0)], g["wpart"][cell(10, 0)]) == (13, 0)
+    assert (g["wfull"][cell(11, 0)], g["wpart"][cell(11, 0)]) == (0, 13)

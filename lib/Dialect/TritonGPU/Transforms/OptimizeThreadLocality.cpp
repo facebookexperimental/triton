@@ -134,6 +134,11 @@ static LogicalResult setOptimizedGatherLayout(GatherOp op, RewriterBase &b) {
   unsigned rank = srcType.getRank();
   if (rank == 1)
     return failure();
+  // The blocked layout below tiles power-of-two dims only.
+  auto isNpotDim = [](int64_t d) { return !llvm::isPowerOf2_64(d); };
+  if (llvm::any_of(srcType.getShape(), isNpotDim) ||
+      llvm::any_of(idxType.getShape(), isNpotDim))
+    return failure();
   SmallVector<unsigned> threadsPerWarp(rank);
   SmallVector<unsigned> warpsPerCTA(rank);
   SmallVector<unsigned> order;
@@ -289,7 +294,7 @@ class TritonGPUOptimizeThreadLocalityPass
       if (!reduce->hasOneUse())
         return;
       Operation *user = *(reduce->getUsers().begin());
-      if (!user->hasOneUse())
+      if (user->getNumOperands() != 2 || !user->hasOneUse())
         return;
       OpOperand &yieldOpOperand = *(user->getUses().begin());
       auto yieldOp = dyn_cast<scf::YieldOp>(yieldOpOperand.getOwner());
@@ -306,6 +311,12 @@ class TritonGPUOptimizeThreadLocalityPass
       auto oldAccum = forOp.getInitArgs()[argNum];
       auto cstOp = oldAccum.getDefiningOp<arith::ConstantOp>();
       if (!cstOp)
+        return;
+      // The rewrite re-homes the accumulator into a thread-local partial that
+      // is only merged back after the loop, so an in-loop use of the
+      // accumulator other than the update would observe the partial state
+      // instead of the running value.
+      if (!forOp.getRegionIterArgs()[argNum].hasOneUse())
         return;
       reduceOps.insert(reduce);
     });
@@ -338,15 +349,13 @@ class TritonGPUOptimizeThreadLocalityPass
       auto blockArg = dyn_cast<BlockArgument>(accumOperand);
       auto blockArgNum = blockArg.getArgNumber();
       auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
+      auto *initOperand = forOp.getTiedLoopInit(blockArg);
+      if (!initOperand)
+        continue;
+      auto loopResult = forOp.getTiedLoopResult(initOperand);
+      auto resultIndex = loopResult.getResultNumber();
       // get oldAccum
-      auto oldAccum =
-          forOp.getInitArgs()[blockArgNum - forOp.getNumInductionVars()];
-      // get old loop user
-      Value loopResult =
-          forOp.getResult(blockArgNum - forOp.getNumInductionVars());
-      assert(loopResult.hasOneUse());
-      OpOperand &loopUse = *(loopResult.getUses().begin());
-      Operation *loopUser = loopUse.getOwner();
+      auto oldAccum = initOperand->get();
       // get old loop yield
       auto oldYield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
       // create newAccum initialization
@@ -373,8 +382,8 @@ class TritonGPUOptimizeThreadLocalityPass
       // incorporate the original accumulator value into the final result
       auto finalOp = incorporateOriginalAccumulatorValue(builder, oldUpdate,
                                                          cvtLayout, oldAccum);
-      // Replace the old loop user with the final result
-      loopUser->setOperand(loopUse.getOperandNumber(), finalOp->getResult(0));
+      // Replace all uses of the old loop result with the final result.
+      newLoop.getResult(resultIndex).replaceAllUsesWith(finalOp->getResult(0));
 
       // cleanup
       oldYield.erase();

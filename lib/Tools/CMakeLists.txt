@@ -2,8 +2,8 @@ add_triton_library(TritonTools
   GenericSwizzling.cpp
   LayoutUtils.cpp
   LinearLayout.cpp
+  LinearLayoutMixedRadix.cpp
   LLVMOptions.cpp
-  ModularArithmetic.cpp
   PluginUtils.cpp
   TimeTrace.cpp
 

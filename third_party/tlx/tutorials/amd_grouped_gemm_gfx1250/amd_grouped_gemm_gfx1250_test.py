@@ -551,7 +551,13 @@ def _grouped_gemm_tdm_impl(
     tl.static_assert(CLUSTER_SIZE == 1 or HYBRID_TILE_PREFETCH, "clustering requires the square within-group hybrid")
     CROSS_GROUP_PREFETCH: tl.constexpr = OPTIMIZE_CROSS_TILE and not HYBRID_TILE_PREFETCH
     OPTIMIZE_ALIAS_C: tl.constexpr = C_STAGING_MODE == 0 and BLOCK_M == 256 and BLOCK_N == 256 and NUM_BUFFERS == 2
-    LIMIT_DOT_LIFETIME: tl.constexpr = OPTIMIZE_CROSS_TILE or OPTIMIZE_ALIAS_C
+    # Cross-tile prefetch with dedicated C staging also bounds operand
+    # lifetimes. Otherwise the scheduler may hoist each K block's TDM refill and
+    # its workgroup barrier ahead of most of the block's dots, then read LDS
+    # operands far ahead of their dots, which raises register pressure and
+    # slows the 128x256 tile.
+    LIMIT_DOT_LIFETIME: tl.constexpr = (OPTIMIZE_CROSS_TILE or OPTIMIZE_ALIAS_C
+                                        or (CROSS_TILE_PREFETCH and C_STAGING_MODE == 1))
     DIRECT_LOAD_OFFSETS: tl.constexpr = OPTIMIZE_CROSS_TILE and L2_PREFETCH_DISTANCE == 0
     K_BLOCKS_PER_LOOP: tl.constexpr = 1 if CROSS_GROUP_PREFETCH else NUM_BUFFERS
     NUM_SUBTILES: tl.constexpr = 4

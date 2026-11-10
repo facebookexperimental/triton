@@ -17,13 +17,16 @@ import argparse
 import ast
 import collections
 import glob
+import html
 import json
+import math
 import os
 import re
 import statistics
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 
 REPO = os.environ.get("GITHUB_REPOSITORY", "facebookexperimental/triton")
 TAG = "tlx-ops-bench"
@@ -111,6 +114,15 @@ def summarize(args):
         ops[op] = {
             "ref": env.get("ref"), "space": env.get("space"), "cold_compile": env.get("cold_compile"), "cases": cases
         }
+    bench_ops = {f"test_op_perf[{script.removesuffix('.py')}]": op for op, script in BENCH_SCRIPT.items()}
+    for path in sorted(glob.glob(os.path.join(args.dir, "**", "*.xml"), recursive=True)):
+        for test in ET.parse(path).iter("testcase"):
+            op = bench_ops.get(test.get("name"))
+            skipped = test.find("skipped")
+            if op is not None and skipped is not None:
+                ops.setdefault(
+                    op,
+                    {"ref": None, "space": None, "cold_compile": None, "reason": skipped.get("message"), "cases": []})
     date = re.search(r"\.dev(\d{8})", args.version)
     gpu = env.get("gpu") or {}
     torch_version = env.get("torch") or ""
@@ -368,6 +380,101 @@ def events(nights):
     return out
 
 
+def overview_data(runs):
+    platforms = []
+    positive = lambda x: isinstance(x, (int, float)) and math.isfinite(x) and x > 0
+    for platform, nights in sorted(runs.items()):
+        latest = max(nights, key=lambda n: n["date"])
+        rows = []
+        for name, op in sorted(latest["ops"].items()):
+            groups = collections.defaultdict(list)
+            for case in op["cases"]:
+                groups[case["direction"]].append(case)
+            for direction, cases in sorted(groups.items()) if groups else [("", [])]:
+                compared = [
+                    c for c in cases if op.get("ref") and c["status"] in MEASURED and all(
+                        positive(c.get(k)) for k in ("speedup", "tlx_tflops", "ref_tflops"))
+                ]
+                rows.append({
+                    "op":
+                    name, "direction":
+                    direction, "reference":
+                    op.get("ref"), "cases":
+                    len(cases), "compared":
+                    len(compared), "errors":
+                    sum(c["status"] == "error" for c in cases), "noisy":
+                    sum(c["status"] == "noisy" for c in compared), "speedup":
+                    math.exp(math.fsum(math.log(c["speedup"]) for c in compared) / len(compared)) if compared else None,
+                    "reason":
+                    op.get("reason")
+                })
+        platforms.append({
+            "platform": platform, "date": latest["date"], "version": latest.get("version"), "sha": latest["sha"],
+            "source": f"https://github.com/{REPO}/releases/download/{TAG}/{latest['date']}.{platform}.json", "rows":
+            rows
+        })
+    return platforms
+
+
+def overview_svg(platforms):
+    row_height, header_height = 38, 84
+    height = max(140, 86 + sum(header_height + row_height * len(p["rows"]) for p in platforms))
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="{height}" viewBox="0 0 1080 {height}" role="img" aria-labelledby="title desc">',
+        '<title id="title">Latest published TLX benchmark comparisons</title>',
+        '<desc id="desc">Geometric mean speedup for each operation and direction on each platform. Compared cases exclude errors and missing references. Noisy measurements are included. Dashed line is reference parity.</desc>',
+        f'<rect width="1080" height="{height}" fill="#fff"/>',
+        '<style>text{font-family:system-ui,sans-serif;fill:#374151;font-size:12px}.heading{font-size:16px;font-weight:600}.value{font-weight:600;fill:#6d28d9}</style>'
+    ]
+
+    def text(x, y, value, cls="", title=None):
+        tip = f"<title>{html.escape(title)}</title>" if title else ""
+        parts.append(f'<text x="{x}" y="{y}" class="{cls}">{tip}{html.escape(str(value))}</text>')
+
+    def label(value, limit):
+        return value if len(value) <= limit else value[:limit - 1] + "…"
+
+    max_speedup = max([1.0] + [r["speedup"] for p in platforms for r in p["rows"] if r["speedup"] is not None]) * 1.05
+    bar_x, bar_width = 788, 218
+    parity_x = bar_x + bar_width / max_speedup
+    text(20, 28, "TLX operation performance", "heading")
+    text(20, 51, "Geomean of measured per-case speedups. Compared / cases excludes errors and missing references.")
+    text(
+        20, 71,
+        "Noisy measurements are included. Each platform uses its latest published night, with no historical fallback.")
+    y = 86
+    for p in platforms:
+        date = p["date"]
+        text(20, y + 23, f"{p['platform'].upper()} · {date[:4]}-{date[4:6]}-{date[6:]}", "heading")
+        text(340, y + 23, f"{p['version'] or ''} · {p['sha'][:12]}")
+        for x, heading in [(20, "Operation / direction"), (300, "Reference"), (650, "Compared / cases"),
+                           (788, "Geomean speedup")]:
+            text(x, y + 51, heading)
+        y += header_height
+        for row in p["rows"]:
+            parts.append(f'<path d="M20 {y - 17} H1060" stroke="#e5e7eb"/>')
+            operation = " ".join(filter(None, [row["op"], row["direction"]]))
+            text(20, y + 5, label(operation, 36), title=operation)
+            reference = row["reference"] or "No reference"
+            text(300, y + 5, label(reference, 43), title=reference)
+            text(650, y + 5, f"{row['compared']} / {row['cases']}",
+                 title=f"{row['errors']} errors; {row['noisy']} noisy comparisons")
+            if row["speedup"] is not None:
+                width = bar_width * row["speedup"] / max_speedup
+                parts.append(f'<rect x="{bar_x}" y="{y - 11}" width="{bar_width}" height="20" rx="4" fill="#f3effc"/>')
+                parts.append(f'<rect x="{bar_x}" y="{y - 11}" width="{width:.3f}" height="20" rx="4" fill="#6d28d9"/>')
+                parts.append(f'<path d="M{parity_x:.3f} {y - 14} V{y + 12}" stroke="#374151" stroke-dasharray="2 3"/>')
+                text(1018, y + 5, f"{row['speedup']:.2f}×", "value")
+            else:
+                reason = row["reason"] or ("No reference" if not row["reference"] else "No valid comparisons")
+                text(788, y + 5, label(reason, 36), title=reason)
+            y += row_height
+    if not platforms:
+        text(20, 109, "No published benchmark results.")
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
 def page_data(runs):
     """The page's data, compacted: each case's description once per op, then per night only the numbers.
 
@@ -382,7 +489,8 @@ def page_data(runs):
         for night in nights:
             for name, op in night["ops"].items():
                 entry = ops.setdefault(name, {"cases": []})
-                entry.update(ref=op.get("ref"), space=op.get("space"), cold=op.get("cold_compile"))
+                entry.update(ref=op.get("ref"), space=op.get("space"), cold=op.get("cold_compile"),
+                             reason=op.get("reason"))
                 index = catalog.setdefault(name, {})
                 for c in op["cases"]:
                     if c["key"] not in index:
@@ -403,17 +511,22 @@ def page_data(runs):
         meta = {k: latest.get(k) for k in PLATFORM_FIELDS}
         latest_ops = {name: ops[name] for name in latest["ops"]}
         platforms[platform] = {**meta, "ops": latest_ops, "nights": encoded, "events": events(nights)}
-    return {"repo": REPO, "tag": TAG, "threshold": EVENT_THRESHOLD, "platforms": platforms}
+    return {
+        "repo": REPO, "tag": TAG, "threshold": EVENT_THRESHOLD, "platforms": platforms, "overview": overview_data(runs)
+    }
 
 
 def render(args):
     runs = read_summaries(args.source) if args.source else load_summaries()
-    data = json.dumps(page_data(runs), separators=(",", ":")).replace("</", "<\\/")
+    payload = page_data(runs)
+    data = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
     with open(TEMPLATE) as fh:
         page = fh.read()
     if page.count("/*__DATA__*/null") != 1:
         raise SystemExit(f"{TEMPLATE} must contain the /*__DATA__*/null placeholder exactly once")
     os.makedirs(args.outdir, exist_ok=True)
+    with open(os.path.join(args.outdir, "tlx_ops_bench_overview.svg"), "w") as fh:
+        fh.write(overview_svg(payload["overview"]))
     out = os.path.join(args.outdir, "index.html")
     with open(out, "w") as fh:
         fh.write(page.replace("/*__DATA__*/null", data))

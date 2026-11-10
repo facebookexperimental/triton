@@ -135,7 +135,7 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
             "non-warp-pipeline scf.execute_region inside pipelined_for body");
       ++numClusters;
     } else if (isWarpPipelineIgnorableBarrier(&op)) {
-      if (existingBarrierMap.count(numClusters))
+      if (existingBarrierMap.contains(numClusters))
         return op.emitError("multiple pre-existing barriers between pipeline "
                             "stages; insert a dummy stage instead");
       existingBarrierMap[numClusters] = &op;
@@ -150,7 +150,8 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
   if (numClusters < 2)
     return forOp.emitError(
         "pipelined_for body must contain at least two pipeline stages");
-  if (existingBarrierMap.count(0) && existingBarrierMap.count(numClusters))
+  if (existingBarrierMap.contains(0) &&
+      existingBarrierMap.contains(numClusters))
     return forOp.emitError("pipelined_for body has both top-of-loop and "
                            "bottom-of-loop pre-existing barriers");
   return success();
@@ -442,9 +443,8 @@ private:
 
     // Normally, we don't expect a pipelined loop begins with a barrier
     // but sometimes required by memory prefetching pattern.
-    auto topBar = existingBarrierMap.find(0);
     auto bottomBar = existingBarrierMap.find(numClusters);
-    bool hasTopBarrier = topBar != existingBarrierMap.end();
+    bool hasTopBarrier = existingBarrierMap.contains(0);
     bool hasBottomBarrier = bottomBar != existingBarrierMap.end();
     if (bottomBar != existingBarrierMap.end()) {
       // validatePipelinedForBody guarantees we cannot have both top and
@@ -1044,7 +1044,7 @@ public:
   void runOnOperation() override {
     ModuleOp m = getOperation();
     // Reject before the ModuleAllocation below, as the allocation passes do.
-    if (failed(mlir::triton::gpu::verifyNpotModularOpsSupported(m)))
+    if (failed(mlir::triton::gpu::verifyNpotTypesSupported(m)))
       return signalPassFailure();
 
     mlir::triton::AMD::TargetInfo targetInfo(gfxArch.getValue());

@@ -25,6 +25,12 @@ COOPERATIVE_CONFIGS = (
     (256, 128, 3, 3),
     (128, 128, 6, 5),
     (128, 64, 8, 2),
+    # 64-row tiles: one consumer warpgroup.
+    (64, 64, 8, 1),
+    (64, 128, 6, 1),
+    (64, 256, 4, 1),
+    (64, 64, 8, 3),
+    (64, 128, 6, 2),
 )
 
 
@@ -161,6 +167,153 @@ def test_full_space_prune_fills_the_gpu(M, N, K):
         assert kw["SPLIT_K"] == 1 or work <= num_sms
     best = max(sm90._mn_tiles(M, N, c.kwargs["BM"], c.kwargs["BN"]) * c.kwargs["SPLIT_K"] for c in configs)
     assert best > num_sms // 2
+
+
+# Sub-wave merge-net shapes: 128x128 tiles leave SMs idle, so the full space
+# offers single-consumer 64-row tiles (BK 128) next to split-K and lets
+# autotune choose (704x512x8192: 64x64 whole-K 23.6 us, 128x128 split-K 24.5,
+# cuBLAS 28.9; 608x512x20992: split-K 46.2, 64x64 56.9, cuBLAS 43.6).
+@pytest.mark.parametrize("M, N, K", [(608, 512, 20992), (704, 512, 8192), (706, 288, 2048), (706, 128, 3536)])
+def test_prune_offers_64_row_tiles_on_sub_wave_shapes(M, N, K):
+    configs = sm90._prune_full_configs(sm90.CONFIGS(), {"M": M, "N": N, "K": K})
+    small = [c.kwargs for c in configs if c.kwargs["BM"] == 64]
+    assert small and all(kw["NUM_MMA_GROUPS"] == 1 and kw["BK"] == 128 for kw in small)
+    assert any(kw["SPLIT_K"] == 1 for kw in small)
+
+
+def test_prune_drops_64_row_tiles_on_full_shapes():
+    configs = sm90._prune_full_configs(sm90.CONFIGS(), {"M": 4096, "N": 4096, "K": 4096})
+    assert configs and all(c.kwargs["BM"] != 64 for c in configs)
+
+
+@pytest.mark.parametrize("M, N, K", [(608, 512, 4096), (704, 1024, 2048)])
+def test_full_space_on_sub_wave_shapes(M, N, K):
+    from triton.tlx.ops import mm as tlx_mm
+
+    a, b = _inputs(M=M, N=N, K=K)
+    sm90._tuned.cache_clear()
+    _assert_close(tlx_mm(a, b, space="full"), torch.matmul(a, b))
+
+
+@pytest.mark.parametrize("block_n, num_stages, split_k", [(64, 6, 1), (64, 5, 3), (128, 4, 1), (128, 3, 2)])
+def test_single_consumer_bk128_config(block_n, num_stages, split_k):
+    from triton.tlx.ops import mm as tlx_mm
+
+    # The 64-row tiles the full space offers: one consumer warpgroup, BK 128.
+    a, b = _inputs(M=706, N=520, K=128 * (7 if split_k == 1 else 41))
+    conf = sm90._config(64, block_n, num_stages, 1, split_k, block_k=128)
+    original = sm90.CONFIGS
+    sm90.CONFIGS = lambda: [conf]
+    sm90._FORCE_PATH = "ws"
+    sm90._tuned.cache_clear()
+    try:
+        actual = tlx_mm(a, b, space="full")
+    finally:
+        sm90.CONFIGS = original
+        sm90._FORCE_PATH = None
+        sm90._tuned.cache_clear()
+    _assert_close(actual, torch.matmul(a, b))
+
+
+@pytest.mark.parametrize("M, N, K, group_size_m", [(706, 2560, 2560, 8), (706, 2560, 20992, 8),
+                                                   (706, 512, 20992, 1),  # split-K
+                                                   (706, 512, 512, 1),  # N <= 512
+                                                   ])
+def test_heuristic_tile_order_matches_full_space(M, N, K, group_size_m):
+    # The sub-wave heuristic tile follows the full-space prune: row-major order
+    # only for N <= 512 or split-K, grouped order otherwise.
+    kw = sm90.heuristic_config(M, N, K)[0].kwargs
+    assert kw["GROUP_SIZE_M"] == group_size_m
+    full = sm90._prune_full_configs(sm90.CONFIGS(), {"M": M, "N": N, "K": K})
+    assert any(c.kwargs["GROUP_SIZE_M"] == group_size_m and c.kwargs["SPLIT_K"] == kw["SPLIT_K"] for c in full)
+
+
+@pytest.mark.parametrize("M, N, K, b_row_major, tile", [
+    # Non-power-of-two tiles for a K-major B (measured best on H100).
+    (706, 3072, 12288, False, (128, 192, 1)),
+    (706, 6144, 3072, False, (128, 192, 1)),
+    # ... but not where a power-of-two tile ties it.
+    (706, 2048, 7072, False, (128, 128, 1)),
+    (706, 20992, 512, False, (128, 256, 1)),
+    (706, 8192, 2560, False, (128, 192, 1)),
+    # ... never for a row-major B.
+    (706, 8192, 2560, True, (128, 128, 1)),
+    # A narrow whole-K tile over a split one when both fill the GPU alike.
+    (706, 1280, 2560, True, (128, 64, 1)),
+    (706, 288, 2048, True, (128, 64, 4)),
+    (706, 256, 20992, True, (128, 128, 11)),
+    (706, 2560, 20992, True, (128, 128, 1)),
+])
+def test_sub_wave_heuristic_picks(M, N, K, b_row_major, tile):
+    kw = sm90.heuristic_config(M, N, K, b_row_major)[0].kwargs
+    assert (kw["BM"], kw["BN"], kw["SPLIT_K"]) == tile
+    assert sm90._fits_smem(kw["BM"], kw["BN"], kw["NUM_STAGES"], kw["SPLIT_K"])
+
+
+@pytest.mark.parametrize("M, N, K", [(38400, 256, 640), (81920, 256, 704), (2252800, 256, 256)])
+def test_tall_narrow_n_takes_128x128(M, N, K):
+    """Past two waves of the wide tile, a tall product with N <= 256 runs
+    128x128 in both spaces: the heuristic picks it and the full-space prune
+    keeps it."""
+    kw = sm90.heuristic_config(M, N, K)[0].kwargs
+    assert (kw["BM"], kw["BN"], kw["SPLIT_K"], kw["GROUP_SIZE_M"]) == (128, 128, 1, 1)
+    full = sm90._prune_full_configs(sm90.CONFIGS(), {"M": M, "N": N, "K": K})
+    assert any((c.kwargs["BM"], c.kwargs["BN"]) == (128, 128) for c in full)
+    # A wider N still prefers the wide tile.
+    kw = sm90.heuristic_config(M, 1024, K)[0].kwargs
+    assert (kw["BM"], kw["BN"]) in ((256, 128), (128, 256))
+
+
+@pytest.mark.parametrize("M, N, K, tile", [
+    # Few-tile, K up to 1024: 64x64 tiles, deep K step within two waves.
+    (600, 128, 576, (64, 64, 128)),
+    (706, 512, 1024, (64, 64, 128)),
+    (600, 2048, 576, (64, 64, 64)),
+    # Past three waves of 64x64 tiles, or past K = 1024, or skinny M: not small-K.
+    (2048, 1024, 768, None),
+    (706, 256, 1536, None),
+    (32, 512, 768, None),
+])
+def test_few_tile_small_k_heuristic(M, N, K, tile):
+    assert sm90._use_small_k(M, N, K, "heuristic") == (tile is not None)
+    assert sm90._use_small_k(M, N, K, "smoke") is False
+    if tile is not None:
+        kw = sm90._small_k_heuristic_config(M, N, K)[0].kwargs
+        assert (kw["BM"], kw["BN"], kw["BK"]) == tile
+        # The full space times the small-K kernel against WS there too.
+        assert sm90._small_k_candidate(M, N, K, "full")
+
+
+def test_few_tile_small_k_is_correct():
+    from triton.tlx.ops import addmm as tlx_addmm
+    from triton.tlx.ops import mm as tlx_mm
+
+    torch.manual_seed(0)
+    for M, N, K in ((600, 128, 576), (600, 2048, 576)):
+        a = _operand(M, K, True)
+        b = _operand(K, N, False)
+        bias = torch.randn(N, device="cuda", dtype=torch.float16)
+        _assert_close(tlx_mm(a, b, space="heuristic"), torch.matmul(a, b))
+        torch.testing.assert_close(tlx_addmm(bias, a, b, space="heuristic"), torch.addmm(bias, a, b), atol=5e-2,
+                                   rtol=5e-2)
+
+
+def test_small_k_space_has_deep_k_64x64():
+    tiles = {
+        sm90._small_k_tile(c)
+        for c in sm90._prune_small_k_configs(sm90._small_k_configs(), {"M": 600, "N": 128, "K": 576})
+    }
+    assert (64, 64, 128, 4, 3) in tiles
+
+
+@pytest.mark.parametrize("M, N, K, tile", [
+    (706, 256, 256, (64, 64)),
+    (706, 3536, 128, (64, 128)),
+    (8192, 8192, 128, (128, 128)),
+])
+def test_small_k_heuristic_fills_two_waves(M, N, K, tile):
+    kw = sm90._small_k_heuristic_config(M, N, K)[0].kwargs
+    assert (kw["BM"], kw["BN"]) == tile
 
 
 def test_split_k_is_deterministic():
@@ -355,7 +508,7 @@ def test_small_k_split_k_config(monkeypatch, M, tile, split_k, a_row_major, b_ro
     sm90._tuned_small_k.cache_clear()
     try:
         actual = tlx_mm(a, b, space="full")
-        assert sm90._tuned_small_k("full", None).best_config.kwargs["SPLIT_K"] == split_k
+        assert sm90._tuned_small_k("full", None, False, dtype=a.dtype).best_config.kwargs["SPLIT_K"] == split_k
     finally:
         sm90._tuned_small_k.cache_clear()
     _assert_close(actual, torch.matmul(a, b))
@@ -370,7 +523,7 @@ def test_small_k_split_k_is_deterministic(monkeypatch):
     sm90._tuned_small_k.cache_clear()
     try:
         first = tlx_mm(a, b, space="full")
-        assert sm90._tuned_small_k("full", None).best_config.kwargs["SPLIT_K"] == 2
+        assert sm90._tuned_small_k("full", None, False, dtype=a.dtype).best_config.kwargs["SPLIT_K"] == 2
         for _ in range(3):
             assert torch.equal(tlx_mm(a, b, space="full"), first)
     finally:
@@ -394,7 +547,10 @@ def test_small_k_prune_splits_only_past_small_k():
     (7, 4992, 128, {"ws", "small_k"}),
     (7, 4096, 4096, {"ws", "small_k"}),
     (706, 3536, 128, {"ws", "small_k"}),
-    (706, 2560, 2560, {"ws"}),
+    # One wave of 128x128 tiles (120 on 132 SMs): the small-K kernel competes.
+    (706, 2560, 2560, {"ws", "small_k"}),
+    # Past one wave with K > 1024: WS only.
+    (706, 6144, 2560, {"ws"}),
 ])
 def test_full_space_selects_fastest_candidate(monkeypatch, M, N, K, candidates):
     from triton.tlx.ops import mm as tlx_mm
@@ -444,10 +600,10 @@ def test_npot_config_not_reused_across_b_layouts(monkeypatch):
         a = _operand(M, K, True)
         b_col = _operand(K, N, False)
         _assert_close(tlx_mm(a, b_col, space="full"), torch.matmul(a, b_col))
-        assert sm90._tuned("full", None, False).best_config.kwargs["BN"] == 192
+        assert sm90._tuned("full", None, False, dtype=a.dtype).best_config.kwargs["BN"] == 192
         b_row = b_col.contiguous()
         _assert_close(tlx_mm(a, b_row, space="full"), torch.matmul(a, b_row))
-        assert sm90._tuned("full", None, False).best_config.kwargs["BN"] == 128
+        assert sm90._tuned("full", None, False, dtype=a.dtype).best_config.kwargs["BN"] == 128
     finally:
         sm90._tuned.cache_clear()
 
@@ -466,7 +622,7 @@ def test_npot_block_n_config(block_n, a_row_major):
     num_stages = {c.kwargs["BN"]: c.kwargs["NUM_STAGES"] for c in sm90._npot_configs()}[block_n]
     with _pinned_full_config(128, block_n, num_stages):
         actual = tlx_mm(a, b, space="full")
-        assert sm90._tuned("full", None, False).best_config.kwargs["BN"] == block_n
+        assert sm90._tuned("full", None, False, dtype=a.dtype).best_config.kwargs["BN"] == block_n
 
     _assert_close(actual, torch.matmul(a, b))
 

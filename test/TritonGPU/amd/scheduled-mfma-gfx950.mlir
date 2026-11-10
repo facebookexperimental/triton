@@ -1,7 +1,7 @@
-// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --verify-diagnostics | FileCheck %s
-// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --canonicalize --cse --verify-diagnostics | FileCheck %s --check-prefix=OPERAND-CSE
-// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --canonicalize --cse --triton-amdgpu-finalize-scheduled-mfma-operands --triton-amdgpu-finalize-scheduled-mfma-operands --verify-diagnostics | FileCheck %s --check-prefix=OPERAND-FINAL --implicit-check-not=ttg.amdg.scheduled_mfma_operand_pin
-// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --canonicalize --cse --triton-amdgpu-finalize-scheduled-mfma-operands --verify-diagnostics | FileCheck %s --check-prefix=LOAD-ORIGIN --implicit-check-not=ttg.amdg.scheduled_mfma_operand_pin
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --triton-amdgpu-membar="gfx-arch=gfx950" --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --verify-diagnostics | FileCheck %s
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --triton-amdgpu-membar="gfx-arch=gfx950" --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --canonicalize --cse --verify-diagnostics | FileCheck %s --check-prefix=OPERAND-CSE
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --triton-amdgpu-membar="gfx-arch=gfx950" --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --canonicalize --cse --triton-amdgpu-finalize-scheduled-mfma-operands --triton-amdgpu-finalize-scheduled-mfma-operands --verify-diagnostics | FileCheck %s --check-prefix=OPERAND-FINAL --implicit-check-not=ttg.amdg.scheduled_mfma_operand_pin
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --triton-amdgpu-membar="gfx-arch=gfx950" --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --canonicalize --cse --triton-amdgpu-finalize-scheduled-mfma-operands --verify-diagnostics | FileCheck %s --check-prefix=LOAD-ORIGIN --implicit-check-not=ttg.amdg.scheduled_mfma_operand_pin
 
 // On CDNA4 `auto` resolves a persistent accumulator to AGPRs, so the unsafe
 // commit is reachable through the default path with no explicit register class
@@ -498,7 +498,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     %undef = llvm.mlir.undef : vector<1xf32>
     %vector = llvm.insertelement %x, %undef[%index : i32] : vector<1xf32>
     %slot = llvm.alloca %one x f32 : (i32) -> !llvm.ptr<5>
-    llvm.intr.masked.store %vector, %slot, %mask {alignment = 4 : i32} : vector<1xf32>, vector<1xi1> into !llvm.ptr<5>
+    llvm.intr.masked.store (%vector, %slot, %mask), alignment(4) : vector<1xf32>, vector<1xi1> into !llvm.ptr<5>
     %reloaded = llvm.load %slot : !llvm.ptr<5> -> f32
     %out = llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0", "=v,v" %reloaded : (f32) -> f32
     tt.return

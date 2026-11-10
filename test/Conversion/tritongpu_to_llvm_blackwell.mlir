@@ -1,6 +1,6 @@
-// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-tmem-barrier-insertion --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' -cse | FileCheck %s --check-prefixes=CHECK,SM100
-// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-tmem-barrier-insertion --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=88' -cse | FileCheck %s --check-prefix=PTX88
-// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-tmem-barrier-insertion --convert-triton-gpu-to-llvm='compute-capability=103 ptx-version=88' -cse | FileCheck %s --check-prefix=SM103
+// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-tmem-barrier-insertion --triton-nvidia-gpu-membar='compute-capability=100' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' -cse | FileCheck %s --check-prefixes=CHECK,SM100
+// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-tmem-barrier-insertion --triton-nvidia-gpu-membar='compute-capability=100' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=88' -cse | FileCheck %s --check-prefix=PTX88
+// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-tmem-barrier-insertion --triton-nvidia-gpu-membar='compute-capability=103' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=103 ptx-version=88' -cse | FileCheck %s --check-prefix=SM103
 
 #mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], instrShape = [16, 256, 32]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
@@ -2008,6 +2008,71 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttng.tw
       !ttg.memdesc<256x128xf32, #d, #ttng.tensor_memory, mutable>,
       !ttg.memdesc<256x32xi8, #sa, #ttng.tensor_memory>,
       !ttg.memdesc<128x32xi8, #sb, #ttng.tensor_memory>
+    tt.return
+  }
+}
+
+// -----
+
+#fp6_a = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8, fp6Padded = true}>
+#fp6_b = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 8, fp6Padded = true}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#scales = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @tc_gen5_mma_scaled_fp6_smem
+  // CHECK: %[[FOUR:.*]] = llvm.mlir.constant(4 : i32)
+  // CHECK: %[[A_BASE:.*]] = llvm.lshr {{.*}}, %[[FOUR]]
+  // CHECK: %[[B_BASE:.*]] = llvm.lshr {{.*}}, %[[FOUR]]
+  // CHECK: tcgen05.mma.cta_group::1.kind::mxf8f6f4
+  // CHECK: %[[TWO:.*]] = llvm.mlir.constant(2 : i32)
+  // CHECK: llvm.add %[[A_BASE]], %[[TWO]]
+  // CHECK: llvm.add %[[B_BASE]], %[[TWO]]
+  // CHECK: tcgen05.mma.cta_group::1.kind::mxf8f6f4
+  // CHECK: llvm.add %[[A_BASE]], %[[FOUR]]
+  // CHECK: llvm.add %[[B_BASE]], %[[FOUR]]
+  // CHECK: tcgen05.mma.cta_group::1.kind::mxf8f6f4
+  // CHECK: %[[SIX:.*]] = llvm.mlir.constant(6 : i32)
+  // CHECK: llvm.add %[[A_BASE]], %[[SIX]]
+  // CHECK: llvm.add %[[B_BASE]], %[[SIX]]
+  // CHECK: tcgen05.mma.cta_group::1.kind::mxf8f6f4
+  // PTX88-LABEL: @tc_gen5_mma_scaled_fp6_smem
+  // PTX88-COUNT-4: tcgen05.mma.cta_group::1.kind::mxf8f6f4
+  tt.func @tc_gen5_mma_scaled_fp6_smem(
+      %a: !ttg.memdesc<128x128xi8, #fp6_a, #ttg.shared_memory>,
+      %b: !ttg.memdesc<128x128xi8, #fp6_b, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %sa: !ttg.memdesc<128x4xi8, #scales, #ttng.tensor_memory>,
+      %sb: !ttg.memdesc<128x4xi8, #scales, #ttng.tensor_memory>,
+      %use: i1, %pred: i1) {
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %sa, %sb, %use, %pred lhs = e2m3 rhs = e3m2 :
+      !ttg.memdesc<128x128xi8, #fp6_a, #ttg.shared_memory>,
+      !ttg.memdesc<128x128xi8, #fp6_b, #ttg.shared_memory>,
+      !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      !ttg.memdesc<128x4xi8, #scales, #ttng.tensor_memory>,
+      !ttg.memdesc<128x4xi8, #scales, #ttng.tensor_memory>
+    tt.return
+  }
+
+  // CHECK-LABEL: @tc_gen5_mma_scaled_fp6_tmem
+  // CHECK: tcgen05.mma{{.*}}[ $1 + 0 ]
+  // CHECK: tcgen05.mma{{.*}}[ $1 + 8 ]
+  // CHECK: tcgen05.mma{{.*}}[ $1 + 16 ]
+  // CHECK: tcgen05.mma{{.*}}[ $1 + 24 ]
+  // PTX88-LABEL: @tc_gen5_mma_scaled_fp6_tmem
+  // PTX88-COUNT-4: tcgen05.mma.cta_group::1.kind::mxf8f6f4
+  tt.func @tc_gen5_mma_scaled_fp6_tmem(
+      %a: !ttg.memdesc<128x128xi8, #tmem, #ttng.tensor_memory>,
+      %b: !ttg.memdesc<128x128xi8, #fp6_b, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %sa: !ttg.memdesc<128x4xi8, #scales, #ttng.tensor_memory>,
+      %sb: !ttg.memdesc<128x4xi8, #scales, #ttng.tensor_memory>,
+      %use: i1, %pred: i1) {
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %sa, %sb, %use, %pred lhs = e2m3 rhs = e3m2 :
+      !ttg.memdesc<128x128xi8, #tmem, #ttng.tensor_memory>,
+      !ttg.memdesc<128x128xi8, #fp6_b, #ttg.shared_memory>,
+      !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      !ttg.memdesc<128x4xi8, #scales, #ttng.tensor_memory>,
+      !ttg.memdesc<128x4xi8, #scales, #ttng.tensor_memory>
     tt.return
   }
 }

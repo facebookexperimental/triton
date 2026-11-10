@@ -17,28 +17,37 @@ pytestmark = pytest.mark.skipif(not is_hip(), reason="MIR tests require AMD/HIP 
 
 
 def verify_mir_content(mir_content, kernel_name):
+    import re
+
     # Verify basic MIR format
     assert len(mir_content) > 0, f"MIR for {kernel_name} should not be empty"
     assert mir_content.strip().startswith("---"), f"MIR for {kernel_name} should start with YAML document marker"
     assert "name:" in mir_content, f"MIR for {kernel_name} should contain function names"
     assert "body:" in mir_content, f"MIR for {kernel_name} should contain machine basic blocks"
 
-    # Verify presence of Scheduling Units (SU)
-    import re
-    su_pattern = r'SU\(\d+\):'
-    su_matches = re.findall(su_pattern, mir_content)
-    assert len(su_matches) > 0, \
-        f"Scheduling DAG for {kernel_name} should contain Scheduling Units (SU)"
+    # The scheduling DAG is emitted after this marker as a (bb, position)-keyed
+    # edge list, one section per scheduling region:
+    # `region <bb> <region-index-within-bb>` / `node <pos> <def-reg|-> <opcode>` /
+    # `edge <src-pos> <dst-pos> <Type> <latency> [<reg>]`.
+    assert "========== SCHEDULING DAG ==========" in mir_content, \
+        f"MIR for {kernel_name} should contain the scheduling DAG section"
+    dag_section = mir_content.split("========== SCHEDULING DAG ==========", 1)[1]
 
-    # Verify scheduling DAG structure with specific patterns
-    assert "# preds left" in mir_content, \
-        f"Scheduling DAG for {kernel_name} should contain predecessor info"
-    assert "# succs left" in mir_content, \
-        f"Scheduling DAG for {kernel_name} should contain successor info"
+    assert re.search(r'^region \d+ \d+$', dag_section, re.MULTILINE), \
+        f"Scheduling DAG for {kernel_name} should contain region headers"
+    assert re.search(r'^node \d+ \S+ \S+', dag_section, re.MULTILINE), \
+        f"Scheduling DAG for {kernel_name} should contain node entries"
+    edges = re.findall(r'^edge \d+ \d+ (Data|Anti|Output|Memory|Barrier)\b', dag_section, re.MULTILINE)
+    assert len(edges) > 0, \
+        f"Scheduling DAG for {kernel_name} should contain typed dependency edges"
 
-    # Verify no sched DAG from post-RA scheduler
+    # Artificial/Cluster edges are dropped (not real ordering constraints).
+    assert "Artificial" not in dag_section and "Cluster" not in dag_section, \
+        f"Scheduling DAG for {kernel_name} should not contain Artificial/Cluster edges"
+
+    # The DAG is built from the pre-RA MIR, so no post-RA physical-reg renaming.
     assert "renamable" not in mir_content, \
-        f"Scheduling DAG for {kernel_name} should not contain entries from post-RA scheduler"
+        f"MIR for {kernel_name} should not contain entries from post-RA scheduler"
 
 
 def test_mir_dump_pipeline(tmp_path, monkeypatch):

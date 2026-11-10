@@ -182,6 +182,23 @@ struct TritonExpandDimsPattern
     Attribute _argEncoding = argType.getEncoding();
     if (!_argEncoding)
       return failure();
+    // A mixed-radix result keeps the converter's layout and the operand takes
+    // its slice, as below.
+    auto mixedRadixTy =
+        cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+    if (!triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding())) {
+      auto sliceTy =
+          argType.cloneWithEncoding(triton::gpu::SliceEncodingAttr::get(
+              getContext(), op.getAxis(),
+              cast<triton::gpu::DistributedEncodingTrait>(
+                  mixedRadixTy.getEncoding())));
+      auto src = triton::gpu::ConvertLayoutOp::create(
+          rewriter, op.getLoc(), sliceTy, adaptor.getSrc());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::ExpandDimsOp>(
+                        op, src, adaptor.getAxis()),
+                    adaptor.getAttributes());
+      return success();
+    }
     auto argEncoding = cast<triton::gpu::BlockedEncodingAttr>(_argEncoding);
     // return shape
     auto retShape = argType.getShape().vec();
@@ -236,6 +253,22 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
     RankedTensorType origType = op.getType();
     auto origShape = origType.getShape();
     auto typeConverter = getTypeConverter<TritonGPUTypeConverter>();
+    // A mixed-radix dot (NPOT M, N or K) keeps the converter's layouts: only an
+    // MMA has an NPOT operand layout, and accelerate-matmul picks it.
+    auto mixedRadixTy =
+        cast<RankedTensorType>(typeConverter->convertType(origType));
+    if (!triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding()) ||
+        !triton::gpu::isRadix2Encoding(
+            cast<RankedTensorType>(adaptor.getA().getType()).getEncoding())) {
+      Value c = triton::gpu::ConvertLayoutOp::create(
+          rewriter, op.getLoc(), mixedRadixTy, adaptor.getC());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::DotOp>(
+                        op, mixedRadixTy, adaptor.getA(), adaptor.getB(), c,
+                        adaptor.getInputPrecision(),
+                        adaptor.getMaxNumImpreciseAcc(), op.getTwoCtas()),
+                    adaptor.getAttributes());
+      return success();
+    }
     int numWarps = typeConverter->getNumWarps();
     int threadsPerWarp = typeConverter->getThreadsPerWarp();
     int numCTAs = typeConverter->getNumCTAs();
@@ -395,7 +428,11 @@ struct TritonBroadcastPattern
     : public OpConversionPattern<triton::BroadcastOp> {
   using OpConversionPattern::OpConversionPattern;
 
-  // This creates a tensor with the new shape but the argument's layout
+  // This creates a tensor with the new shape but the argument's layout.
+  // Upstream #11759 allows the result encoding to differ from the source; when
+  // the original result carries its own encoding (e.g. a TLX-forged
+  // no_verify_layout pin), preserve it instead of forcing the source encoding
+  // so downstream encoding-uniform consumers see the layout they expect.
   LogicalResult
   matchAndRewrite(BroadcastOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -403,11 +440,58 @@ struct TritonBroadcastPattern
     auto srcEncoding = srcType.getEncoding();
     if (!srcEncoding)
       return failure();
-    Type retType = op.getType().cloneWithEncoding(srcEncoding);
-    // Type retType = this->getTypeConverter()->convertType(op.getType());
-    addNamedAttrs(rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
-                      op, retType, adaptor.getOperands()),
-                  adaptor.getAttributes());
+    // A mixed-radix result takes the converter's layout, and so does the
+    // operand.
+    auto mixedRadixTy =
+        cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+    if (!triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding())) {
+      auto src = triton::gpu::ConvertLayoutOp::create(
+          rewriter, op.getLoc(),
+          srcType.cloneWithEncoding(mixedRadixTy.getEncoding()),
+          adaptor.getSrc());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
+                        op, mixedRadixTy, src),
+                    adaptor.getAttributes());
+      return success();
+    }
+    auto origResultType = cast<RankedTensorType>(op.getType());
+    Attribute resultEncoding = origResultType.getEncoding();
+    // Byte-identical fast path: no result encoding or already matching.
+    if (!resultEncoding || resultEncoding == srcEncoding) {
+      Type retType = op.getType().cloneWithEncoding(srcEncoding);
+      // Type retType = this->getTypeConverter()->convertType(op.getType());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
+                        op, retType, adaptor.getOperands()),
+                    adaptor.getAttributes());
+      return success();
+    }
+    // Preserve E2 on the result. Target materialization only bridges
+    // desired-vs-remapped operand types; it does not reconcile an op's operand
+    // encoding with its result encoding. Free (projection-equal) pairs stay
+    // convert-free: the broadcast itself carries the layout change and passes
+    // verification. Non-free pairs broadcast uniformly in E1, then convert the
+    // result E1->E2 at the result shape, so E2 always meets its own shape.
+    // ConvertLayoutOp accepts TLX wrapper encodings (its verifier only checks
+    // forceWarpShuffle).
+    auto retType = origResultType.cloneWithEncoding(resultEncoding);
+    auto *iface = srcEncoding.getDialect()
+                      .getRegisteredInterface<DialectInferLayoutInterface>();
+    bool isFree = false;
+    if (iface && succeeded(iface->verifyBroadcastOpEncoding(srcType, retType)))
+      isFree = true;
+    if (isFree) {
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
+                        op, retType, adaptor.getOperands()),
+                    adaptor.getAttributes());
+      return success();
+    }
+    auto tmpType = origResultType.cloneWithEncoding(srcEncoding);
+    auto bcast = triton::BroadcastOp::create(rewriter, op.getLoc(), tmpType,
+                                             adaptor.getOperands());
+    addNamedAttrs(bcast, adaptor.getAttributes());
+    auto cvt = triton::gpu::ConvertLayoutOp::create(rewriter, op.getLoc(),
+                                                    retType, bcast.getResult());
+    rewriter.replaceOp(op, cvt.getResult());
     return success();
   }
 };
@@ -580,6 +664,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::ClampFOp>,
       GenericOpPattern<triton::PreciseSqrtOp>,
       GenericOpPattern<triton::PreciseDivFOp>,
+      GenericOpPattern<triton::ApproxDivFOp>,
       GenericOpPattern<triton::MulhiUIOp>,
       GenericOpPattern<triton::ElementwiseInlineAsmOp>,
       TritonReducePattern,
@@ -603,7 +688,9 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::ExternElementwiseOp>,
       GenericOpPattern<triton::PrintOp>,
       GenericOpPattern<triton::AssertOp>,
+      GenericOpPattern<triton::AtomicLoadOp>,
       GenericOpPattern<triton::AtomicPollOp>,
+      GenericOpPattern<triton::AtomicStoreOp>,
       GenericOpPattern<triton::AtomicCASOp>,
       GenericOpPattern<triton::AtomicRMWOp>,
       GenericOpPattern<triton::DescriptorLoadOp>,
@@ -653,6 +740,12 @@ void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
       typeConverter, context);
   patterns.add<GenericOpPattern<triton::amdgpu::AssumeUniformOp>>(typeConverter,
                                                                   context);
+  target.addDynamicallyLegalOp<triton::amdgpu::PackedDot2Op>(
+      [&typeConverter](triton::amdgpu::PackedDot2Op op) {
+        return typeConverter.isLegal(op.getOperation());
+      });
+  patterns.add<GenericOpPattern<triton::amdgpu::PackedDot2Op>>(
+      typeConverter, context);
   target.addDynamicallyLegalOp<triton::amdgpu::ScaledDowncastFp8Op>(
       [&typeConverter](triton::amdgpu::ScaledDowncastFp8Op op) {
         return typeConverter.isLegal(op.getOperation());

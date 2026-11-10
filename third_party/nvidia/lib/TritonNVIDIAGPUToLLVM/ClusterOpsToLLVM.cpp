@@ -28,6 +28,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "tlx/dialect/include/IR/Dialect.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -167,51 +168,19 @@ LogicalResult lowerClusterSyncForAllWarps(Operation *op,
                                           ConversionPatternRewriter &rewriter,
                                           EmitFn emit) {
   auto loc = op->getLoc();
-  auto mod = op->getParentOfType<ModuleOp>();
-  if (!mod)
-    return rewriter.notifyMatchFailure(op, "expected parent module");
-
-  // Emit the cluster sync directly (no warp_specialize wrapping) when either:
-  //  (a) it is already inside a warp_specialize region (e.g. the user placed
-  //      cluster_barrier() inside each async_task so every warp group
-  //      participates). The warp split already happened, so every warp of the
-  //      current region executes it; wrapping again would form an illegal
-  //      nested ttg.warp_specialize. OR
-  //  (b) this operation carries the designated bootstrap marker -- the
-  //      entry-block cluster sync inserted by maybeInsertClusterSync. For that
-  //      sync, ConvertWarpSpecializeToLLVM already emits the non-default warps'
-  //      "@!isDefault barrier.cluster.arrive" at WS entry. Wrapping here too
-  //      would double-count worker participation: the extra worker arrive
-  //      imbalances the cluster barrier (deadlock) and adds a spurious worker
-  //      wait.
-  if (op->getParentOfType<triton::gpu::WarpSpecializeOp>() ||
-      mlir::triton::tlx::isClusterSyncBootstrap(op)) {
-    rewriter.setInsertionPoint(op);
-    emit(rewriter);
-    rewriter.eraseOp(op);
-    return success();
-  }
-
-  auto defaultNumWarps = triton::gpu::maybeLookupNumWarps(op);
-  if (!defaultNumWarps)
-    return rewriter.notifyMatchFailure(op, "missing contextual num-warps");
-  int totalNumWarps = *defaultNumWarps;
-  if (auto totalNumWarpsAttr =
-          mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps"))
-    totalNumWarps = totalNumWarpsAttr.getInt();
-  int workerNumWarps = totalNumWarps - *defaultNumWarps;
-  if (workerNumWarps < 0)
-    return rewriter.notifyMatchFailure(op, "invalid total/default num-warps");
+  FailureOr<int> workerNumWarps = NVIDIA::getClusterSyncDispatchWarps(op);
+  if (failed(workerNumWarps))
+    return rewriter.notifyMatchFailure(op, "invalid contextual num-warps");
 
   rewriter.setInsertionPoint(op);
-  if (workerNumWarps == 0) {
+  if (*workerNumWarps == 0) {
     emit(rewriter);
     rewriter.eraseOp(op);
     return success();
   }
 
   SmallVector<int32_t> partitionNumWarps;
-  for (int remainingWarps = workerNumWarps; remainingWarps > 0;) {
+  for (int remainingWarps = *workerNumWarps; remainingWarps > 0;) {
     int32_t partitionWarps =
         llvm::bit_floor(static_cast<uint32_t>(remainingWarps));
     partitionNumWarps.push_back(partitionWarps);
@@ -221,7 +190,7 @@ LogicalResult lowerClusterSyncForAllWarps(Operation *op,
   auto wsOp = triton::gpu::WarpSpecializeOp::create(rewriter, loc, TypeRange{},
                                                     partitionNumWarps);
   SmallVector<int32_t> startIds;
-  int startId = *defaultNumWarps;
+  int startId = *triton::gpu::maybeLookupNumWarps(op);
   for (int32_t partitionWarps : partitionNumWarps) {
     startIds.push_back(startId);
     startId += partitionWarps;
@@ -469,6 +438,60 @@ struct InitializeWSClusterBarriers
 };
 
 } // namespace
+
+FailureOr<int>
+mlir::triton::NVIDIA::getClusterSyncDispatchWarps(Operation *op) {
+  // Emit the cluster sync directly (no warp_specialize wrapping) when either:
+  //  (a) it is already inside a warp_specialize region (e.g. the user placed
+  //      cluster_barrier() inside each async_task so every warp group
+  //      participates). The warp split already happened, so every warp of the
+  //      current region executes it; wrapping again would form an illegal
+  //      nested ttg.warp_specialize. OR
+  //  (b) this operation carries the designated bootstrap marker -- the
+  //      entry-block cluster sync inserted by maybeInsertClusterSync. For that
+  //      sync, ConvertWarpSpecializeToLLVM already emits the non-default warps'
+  //      "@!isDefault barrier.cluster.arrive" at WS entry. Wrapping here too
+  //      would double-count worker participation: the extra worker arrive
+  //      imbalances the cluster barrier (deadlock) and adds a spurious worker
+  //      wait.
+  if (op->getParentOfType<triton::gpu::WarpSpecializeOp>() ||
+      mlir::triton::tlx::isClusterSyncBootstrap(op))
+    return 0;
+
+  auto defaultNumWarps = triton::gpu::maybeLookupNumWarps(op);
+  if (!defaultNumWarps)
+    return failure();
+  int totalNumWarps = *defaultNumWarps;
+  if (auto mod = op->getParentOfType<ModuleOp>())
+    if (auto totalNumWarpsAttr =
+            mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps"))
+      totalNumWarps = totalNumWarpsAttr.getInt();
+  int workerNumWarps = totalNumWarps - *defaultNumWarps;
+  if (workerNumWarps < 0)
+    return failure();
+  return workerNumWarps;
+}
+
+bool mlir::triton::NVIDIA::needsSyntheticWarpSpecialize(ModuleOp mod) {
+  return mod
+      .walk([](Operation *op) {
+        if (isa<triton::nvidia_gpu::ClusterArriveOp,
+                triton::nvidia_gpu::ClusterWaitOp,
+                triton::nvidia_gpu::ClusterBarrierOp>(op)) {
+          FailureOr<int> workerNumWarps = getClusterSyncDispatchWarps(op);
+          if (succeeded(workerNumWarps) && *workerNumWarps > 0)
+            return WalkResult::interrupt();
+        }
+        // runClusterBarrierMbarAllocator backs these with mbarriers that
+        // InitializeWSClusterBarriers initializes behind an all-warp
+        // rendezvous in a synthetic region at kernel entry.
+        if (op->getParentOfType<triton::gpu::WarpSpecializeOp>() &&
+            triton::nvidia_gpu::needsClusterBarrier(op))
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      })
+      .wasInterrupted();
+}
 
 void mlir::triton::NVIDIA::populateClusterOpsToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,

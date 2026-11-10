@@ -1864,7 +1864,7 @@ DenseMap<Channel *, Value> createBufferForAllocs(
   for (auto &item : channelsGroupedByProducers) {
     auto &channels = item.second;
     for (auto c : channels) {
-      assert(!visited.count(c));
+      assert(!visited.contains(c));
       visited.insert(c);
     }
   }
@@ -1887,8 +1887,7 @@ DenseMap<Channel *, Value> createBufferForAllocs(
     }
   }
   for (auto *channelInOrder : orderedChannels) {
-    if (channelsGroupedByProducers.find(channelInOrder) ==
-        channelsGroupedByProducers.end())
+    if (!channelsGroupedByProducers.contains(channelInOrder))
       continue;
     auto &channels = channelsGroupedByProducers[channelInOrder];
     auto *channel = channels.front();
@@ -2846,7 +2845,7 @@ void insertAsyncComm(
     auto producerBlock = frontSrcOp->getBlock();
     Operation *headProducer = nullptr;
     for (auto &op : producerBlock->getOperations()) {
-      if (producerOps.count(&op)) {
+      if (producerOps.contains(&op)) {
         headProducer = &op;
         break;
       }
@@ -2854,7 +2853,7 @@ void insertAsyncComm(
     // Find tail producer
     Operation *tailProducer = nullptr;
     for (auto &op : reverse(producerBlock->getOperations())) {
-      if (producerOps.count(&op)) {
+      if (producerOps.contains(&op)) {
         tailProducer = &op;
         break;
       }
@@ -2876,14 +2875,14 @@ void insertAsyncComm(
     auto consumerBlock = frontDstOp->getBlock();
     Operation *headConsumer = nullptr;
     for (auto &op : consumerBlock->getOperations()) {
-      if (consumerOps.count(&op)) {
+      if (consumerOps.contains(&op)) {
         headConsumer = &op;
         break;
       }
     }
     Operation *tailConsumer = nullptr;
     for (auto &op : reverse(consumerBlock->getOperations())) {
-      if (consumerOps.count(&op)) {
+      if (consumerOps.contains(&op)) {
         tailConsumer = &op;
         break;
       }
@@ -3888,7 +3887,7 @@ void insertAsyncComm(
     for (auto &consumerTaskId : masterChannel->relation.second) {
       // Set up consumer release and producer acquire for channel where consumer
       // is MMAv5.
-      if (commChannel.consumerBarriers.count(consumerTaskId)) {
+      if (commChannel.consumerBarriers.contains(consumerTaskId)) {
         // filter with consumerTaskId
         DenseSet<Operation *> filteredOps;
         for (auto *tCon : actualConsumerOps) {
@@ -5295,7 +5294,8 @@ static void swapTransposedLocalAllocs(triton::FuncOp &funcOp) {
     auto nonTransposedEncoding = ttg::NVMMASharedEncodingAttr::get(
         encoding.getContext(), encoding.getSwizzlingByteWidth(),
         /*transposed=*/false, encoding.getElementBitWidth(),
-        encoding.getFp4Padded(), encoding.getCGALayout());
+        encoding.getFp4Padded(), encoding.getCGALayout(),
+        encoding.getFp6Padded());
 
     // New alloc type: non-transposed encoding.
     auto newAllocType = ttg::MemDescType::get(

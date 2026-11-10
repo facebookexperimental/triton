@@ -1,4 +1,4 @@
-// RUN:  triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch="gfx1250" | FileCheck %s --check-prefix=GFX1250
+// RUN:  triton-opt %s -split-input-file --allocate-amdgpu-shared-memory="arch=gfx1250" --convert-triton-amdgpu-to-llvm=gfx-arch="gfx1250" | FileCheck %s --check-prefix=GFX1250
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 8], [0, 16]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 4]], warp = [[16, 0]], block = []}>
 #mma = #ttg.amd_wmma<{version = 3, ctaLayout = {warp = [[1, 0]]}, isTranspose = true, instrShape = [16, 16, 32]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 32 : i32} {
@@ -10,6 +10,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.thr
     // GFX1250-NOT: llvm.call_intrinsic "llvm.amdgcn.permlane16.swap"
     %0 = ttg.convert_layout %arg0 : tensor<32x32xf16, #mma> -> tensor<32x32xf16, #linear>
     tt.return
+  }
+}
+
+// -----
+
+#noncontiguous = #ttg.generic_linear<{register = [[0, 1]], lane = [[0, 2], [0, 4], [1, 0], [2, 0], [4, 0]], warp = [], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // GFX1250-LABEL: generic_linear_noncontiguous_fp32_to_bf16
+  tt.func @generic_linear_noncontiguous_fp32_to_bf16(%arg0: tensor<8x8xf32, #noncontiguous>) -> tensor<8x8xbf16, #noncontiguous> {
+    // GFX1250-NOT: llvm.call_intrinsic "llvm.amdgcn.perm"
+    // GFX1250-COUNT-2: llvm.trunc {{.*}} : i32 to i16
+    // GFX1250-NOT: llvm.trunc
+    // GFX1250-NOT: llvm.call_intrinsic "llvm.amdgcn.perm"
+    %0 = tt.fp_to_fp %arg0, rounding = rtz : tensor<8x8xf32, #noncontiguous> -> tensor<8x8xbf16, #noncontiguous>
+    tt.return %0 : tensor<8x8xbf16, #noncontiguous>
+  }
+}
+
+// -----
+
+#partition_aware = #ttg.generic_linear<{register = [[0, 1], [0, 2], [0, 8], [0, 16], [0, 32], [16, 0], [0, 128]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 4]], warp = [[64, 64], [32, 0], [64, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // GFX1250-LABEL: generic_linear_fp32_to_fp8
+  tt.func @generic_linear_fp32_to_fp8(%arg0: tensor<128x256xf32, #partition_aware>) -> tensor<128x256xf8E4M3FN, #partition_aware> {
+    // GFX1250-COUNT-16: rocdl.cvt.scalef32.pk8.fp8.f32
+    %0 = tt.fp_to_fp %arg0, rounding = rtne : tensor<128x256xf32, #partition_aware> -> tensor<128x256xf8E4M3FN, #partition_aware>
+    tt.return %0 : tensor<128x256xf8E4M3FN, #partition_aware>
   }
 }
 
@@ -176,5 +203,92 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     // GFX1250: llvm.fsub {{.*}} : vector<2xbf16>
     %0 = arith.subf %arg0, %arg1 : tensor<64xbf16, #blocked>
     tt.return %0 : tensor<64xbf16, #blocked>
+  }
+}
+
+// -----
+
+#blocked8 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [8], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 12 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // The eight-warp helper uses the caller's precomputed offset.
+  // GFX1250-LABEL: llvm.func internal @outlined_indices_8
+  // GFX1250: [[WAVE:%.*]] = rocdl.wave.id : i32
+  // GFX1250: [[OFFSET:%.*]] = llvm.mlir.constant(4 : i32) : i32
+  // GFX1250: [[REL:%.*]] = llvm.sub [[WAVE]], [[OFFSET]] : i32
+  // GFX1250: [[MASK:%.*]] = llvm.mlir.constant(7 : i32) : i32
+  // GFX1250: llvm.and [[REL]], [[MASK]] : i32
+  tt.func private @outlined_indices_8() -> tensor<256xi32, #blocked8> attributes {noinline = true, "ttg.num-warps" = 8 : i32, "ttg.warp-id-offset" = 4 : i32} {
+    %range = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32, #blocked8>
+    tt.return %range : tensor<256xi32, #blocked8>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#inner = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [32, 128]}>
+#partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #inner}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "hip:gfx1250", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // GFX1250-LABEL: @dynamic_subslice_partitioned_load
+  tt.func @dynamic_subslice_partitioned_load(%x: tensor<64x128xf16, #blocked>, %row: i32) -> tensor<32x128xf16, #blocked> {
+    %zero = arith.constant 0 : i32
+    %buffer = ttg.local_alloc %x : (tensor<64x128xf16, #blocked>) -> !ttg.memdesc<64x128xf16, #partitioned, #smem, mutable>
+    // The two pieces have distinct 64 KiB physical partitions. Runtime
+    // logical offsets rotate these bases before the local load selects one.
+    // GFX1250: llvm.mlir.constant(65536 : i32)
+    // GFX1250: llvm.insertelement {{.*}} vector<2x!llvm.ptr<3>>
+    // GFX1250: llvm.extractelement {{.*}} vector<2x!llvm.ptr<3>>
+    // GFX1250-NOT: ttg.memdesc_dynamic_subslice
+    %view = ttg.memdesc_dynamic_subslice %buffer[%row, %zero] : !ttg.memdesc<64x128xf16, #partitioned, #smem, mutable> -> !ttg.memdesc<32x128xf16, #partitioned, #smem, mutable, 64x128>
+    %value = ttg.local_load %view : !ttg.memdesc<32x128xf16, #partitioned, #smem, mutable, 64x128> -> tensor<32x128xf16, #blocked>
+    tt.return %value : tensor<32x128xf16, #blocked>
+  }
+}
+
+// -----
+
+#inner = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [64, 128]}>
+#partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #inner}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "hip:gfx1250", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // A runtime stage advances each partition by one padded piece: 8192
+  // elements plus 8 padding elements per 128.
+  // GFX1250-LABEL: @dynamic_subslice_partitioned_padded_stage
+  // GFX1250: [[STRIDE:%.*]] = llvm.mlir.constant(8192 : i32)
+  // GFX1250: [[OFF:%.*]] = llvm.mul %arg0, [[STRIDE]]
+  // GFX1250: [[SHR:%.*]] = llvm.lshr [[OFF]]
+  // GFX1250: [[PAD:%.*]] = llvm.shl [[SHR]]
+  // GFX1250: [[PADS:%.*]] = llvm.add {{.*}}, [[PAD]]
+  // GFX1250: [[PADDED:%.*]] = llvm.add [[OFF]], [[PADS]]
+  // GFX1250: llvm.getelementptr {{.*}}{{\[}}[[PADDED]]{{\]}}
+  // GFX1250: llvm.getelementptr {{.*}}{{\[}}[[PADDED]]{{\]}}
+  tt.func @dynamic_subslice_partitioned_padded_stage(%stage: i32) -> !ttg.memdesc<1x128x128xf16, #partitioned, #smem, mutable, 2x128x128> {
+    %zero = arith.constant 0 : i32
+    %buffer = ttg.local_alloc : () -> !ttg.memdesc<2x128x128xf16, #partitioned, #smem, mutable>
+    %view = ttg.memdesc_dynamic_subslice %buffer[%stage, %zero, %zero] : !ttg.memdesc<2x128x128xf16, #partitioned, #smem, mutable> -> !ttg.memdesc<1x128x128xf16, #partitioned, #smem, mutable, 2x128x128>
+    tt.return %view : !ttg.memdesc<1x128x128xf16, #partitioned, #smem, mutable, 2x128x128>
+  }
+}
+
+// -----
+
+#inner_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[1, 0], [0, 0]]}>
+#partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #inner_shared}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // A broadcast CTA basis makes the layout non-square. The runtime row still
+  // selects a 2-row piece per CTA, whose partition rotates the bases.
+  // GFX1250-LABEL: dynamic_subslice_partitioned_clustered
+  // GFX1250: [[PIECE:%.*]] = llvm.mlir.constant(2 : i32)
+  // GFX1250: [[INDEX:%.*]] = llvm.udiv %arg0, [[PIECE]]
+  // GFX1250: [[NPART:%.*]] = llvm.mlir.constant(2 : i32)
+  // GFX1250: llvm.urem [[INDEX]], [[NPART]]
+  // GFX1250-COUNT-2: llvm.extractelement {{.*}} vector<2x!llvm.ptr<3>>
+  tt.func private @dynamic_subslice_partitioned_clustered(%row: i32) -> !ttg.memdesc<2x16xf16, #partitioned, #smem, mutable, 16x16> {
+    %zero = arith.constant 0 : i32
+    %parent = ttg.local_alloc : () -> !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable>
+    %view = ttg.memdesc_dynamic_subslice %parent[%row, %zero] : !ttg.memdesc<16x16xf16, #partitioned, #smem, mutable> -> !ttg.memdesc<2x16xf16, #partitioned, #smem, mutable, 16x16>
+    tt.return %view : !ttg.memdesc<2x16xf16, #partitioned, #smem, mutable, 16x16>
   }
 }

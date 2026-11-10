@@ -1,9 +1,12 @@
 """L1 correctness for ``tlx.ops.flash_attn_varlen`` on Hopper. Forward only."""
 
+import contextvars
+import functools
 import itertools
 
 import pytest
 import torch
+import triton
 from triton._internal_testing import is_hopper
 from triton.tlx.ops.kernels.flash_attn_varlen._shapes import CORRECTNESS_SHAPES, is_cross_attention, lengths, seqlens
 
@@ -254,18 +257,73 @@ def test_flash_attn_varlen_contiguous_but_unaligned_base():
     torch.testing.assert_close(out.float(), _reference(q, k, v, cu, cu, False, 128**-0.5), **TOLERANCE[torch.float16])
 
 
-def test_flash_attn_varlen_k_and_v_may_be_one_tensor():
-    """Ranking models attend with the same history as keys and values."""
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("heads,kv_heads", [(2, 2), (4, 2)])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_flash_attn_varlen_k_and_v_may_be_one_tensor(causal, heads, kv_heads, head_dim):
+    """Ranking models attend with the same history as keys and values; one tile then serves as both."""
     from triton.tlx.ops import flash_attn_varlen
 
     torch.manual_seed(20)
-    lens_q, lens_k = [600, 400], [1000, 300]
-    q = torch.randn(sum(lens_q), 2, 128, device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn(sum(lens_k), 2, 128, device="cuda", dtype=torch.bfloat16)
+    lens_q, lens_k = [600, 400, 0, 129], [1000, 300, 50, 1]
+    q = torch.randn(sum(lens_q), heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(sum(lens_k), kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     cu_q, cu_k = _cu(lens_q), _cu(lens_k)
-    out = flash_attn_varlen(q, kv, kv, cu_q, cu_k, 600, 1000)
-    torch.testing.assert_close(out.float(), _reference(q, kv, kv, cu_q, cu_k, False, 128**-0.5),
+    out = flash_attn_varlen(q, kv, kv, cu_q, cu_k, 600, 1000, causal=causal)
+    torch.testing.assert_close(out.float(), _reference(q, kv, kv, cu_q, cu_k, causal, head_dim**-0.5),
                                **TOLERANCE[torch.bfloat16])
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_varlen_more_sequences_than_the_schedule_sorts(causal):
+    """Past `MAX_SORTED_SEQS` the schedule keeps index order; empty and tied sequences are fine either way."""
+    from triton.tlx.ops.kernels.flash_attn_varlen.sm90 import MAX_SORTED_SEQS
+
+    gen = torch.Generator().manual_seed(21)
+    for batch in (MAX_SORTED_SEQS, MAX_SORTED_SEQS + 7):
+        lens_q = torch.randint(0, 300, (batch, ), generator=gen).tolist()
+        lens_k = [
+            300 if i % 3 == 0 else n for i, n in enumerate(torch.randint(0, 500, (batch, ), generator=gen).tolist())
+        ]
+        _check(lens_q, lens_k, causal, dtype=torch.float16)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_varlen_int64_output_offsets(causal):
+    """Output element offsets past 2**31, stored by both the TMA path (full tiles) and the masked path (the rest)."""
+    from triton.tlx.ops import flash_attn_varlen
+
+    torch.manual_seed(20)
+    heads, kv_heads = 32, 4
+    lengths = [128, 100, 37, 200] * 1128
+    cu = _cu(lengths)
+    qkv = torch.randn(sum(lengths), heads + 2 * kv_heads, 128, device="cuda", dtype=torch.float16)
+    q, k, v = qkv[:, :heads], qkv[:, heads:heads + kv_heads], qkv[:, heads + kv_heads:]
+    out = flash_attn_varlen(q, k, v, cu, cu, max(lengths), max(lengths), causal=causal)
+    # The output is contiguous, 32 * 128 elements per token, and passes 2**31 at token 524288, which a 37-token
+    # sequence holds; the last sequence has 200 tokens, so its rows from 192 on take the masked path.
+    tokens = torch.tensor([0, 524288, sum(lengths) - 1], device="cuda", dtype=torch.int32)
+    for b in (torch.searchsorted(cu, tokens, right=True) - 1).tolist():
+        b0, b1 = cu[b].item(), cu[b + 1].item()
+        local = _cu([b1 - b0])
+        ref = _reference(q[b0:b1], k[b0:b1], v[b0:b1], local, local, causal, 128**-0.5)
+        torch.testing.assert_close(out[b0:b1].float(), ref, **TOLERANCE[torch.float16])
+
+
+def test_flash_attn_varlen_needs_i64_offsets():
+    """The output's int64 choice counts the masked rows of the last tile and takes int64 for a symbolic size."""
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+    from triton.tlx.ops.kernels.flash_attn_varlen.sm90 import BLOCK_M, _needs_i64_offsets
+
+    for heads, head_dim in ((32, 128), (8, 64)):
+        row = heads * head_dim
+        # The most tokens whose rows, masked ones included, stay below 2**31 elements; with one more token only the
+        # masked rows of the last tile pass it.
+        last = (1 << 31) // row - BLOCK_M + 1
+        assert not _needs_i64_offsets(last, row, BLOCK_M)
+        assert _needs_i64_offsets(last + 1, row, BLOCK_M)
+    # Comparing an unbacked size raises, so this also checks that no guard is taken.
+    assert _needs_i64_offsets(ShapeEnv().create_unbacked_symint(), 32 * 128, BLOCK_M)
 
 
 def test_flash_attn_varlen_rejects_invalid_inputs():
@@ -290,3 +348,167 @@ def test_flash_attn_varlen_rejects_invalid_inputs():
         operands[position] = q.clone().requires_grad_()
         with pytest.raises(UnsupportedBackward):
             flash_attn_varlen(*operands, cu, cu, 100, 100)
+
+
+@functools.cache
+def _traceable_op():
+    from triton.tlx.ops.kernels.flash_attn_varlen.sm90 import flash_attn_varlen
+
+    @torch.library.triton_op("tlx_ops_test::varlen_sm90", mutates_args=())
+    def varlen_sm90(q: torch.Tensor, kv: torch.Tensor, cu_q: torch.Tensor, cu_k: torch.Tensor, max_seqlen_q: int,
+                    scale: float) -> torch.Tensor:
+        return flash_attn_varlen(q, kv, kv, cu_q, cu_k, max_seqlen_q, scale, False)
+
+    return torch.ops.tlx_ops_test.varlen_sm90
+
+
+def test_flash_attn_varlen_traces_for_export_and_compile():
+    """The launch has no host-only step, so export keeps it as one op and Inductor compiles it."""
+    torch.manual_seed(20)
+    op = _traceable_op()
+    lens_q, lens_k = [300, 200, 128, 450], [900, 1500, 700, 1100]
+    q = torch.randn(sum(lens_q), 2, 128, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(sum(lens_k), 2, 128, device="cuda", dtype=torch.bfloat16)
+    cu_q, cu_k = _cu(lens_q), _cu(lens_k)
+
+    def attend(q, kv, cu_q, cu_k):
+        return op(q, kv, cu_q, cu_k, max(lens_q), 16.0)
+
+    eager = attend(q, kv, cu_q, cu_k)
+    ref = _reference(q, kv, kv, cu_q, cu_k, False, 16.0)
+    torch.testing.assert_close(eager.float(), ref, **TOLERANCE[torch.bfloat16])
+
+    class Wrapper(torch.nn.Module):
+
+        def forward(self, q, kv, cu_q, cu_k):
+            return attend(q, kv, cu_q, cu_k)
+
+    graph = torch.export.export(Wrapper(), (q, kv, cu_q, cu_k)).graph
+    assert any("varlen_sm90" in str(node.target) for node in graph.nodes if node.op == "call_function")
+    torch.testing.assert_close(torch.compile(attend, fullgraph=True)(q, kv, cu_q, cu_k), eager)
+
+
+@pytest.mark.skip(reason="Re-enable when the H100 CI PyTorch wheel includes pytorch#201258 (D125369038).")
+def test_flash_attn_varlen_aoti_package_matches_eager(tmp_path):
+    """AOTInductor with the autotune settings production lowering uses; full tiles keep the in-kernel TMA store."""
+    torch.manual_seed(20)
+    op = _traceable_op()
+    lens_q, lens_k = [300, 200, 128, 450], [900, 1500, 700, 1100]
+    q = torch.randn(sum(lens_q), 2, 128, device="cuda", dtype=torch.float16)
+    kv = torch.randn(sum(lens_k), 2, 128, device="cuda", dtype=torch.float16)
+    cu_q, cu_k = _cu(lens_q), _cu(lens_k)
+
+    class Wrapper(torch.nn.Module):
+
+        def forward(self, q, kv, cu_q, cu_k):
+            return op(q, kv, cu_q, cu_k, max(lens_q), 11.313708498984761)
+
+    eager = Wrapper()(q, kv, cu_q, cu_k)
+    exported = torch.export.export(Wrapper(), (q, kv, cu_q, cu_k))
+    with torch._inductor.config.patch({
+            "triton.autotune_at_compile_time": True,
+            "triton.autotune_with_sample_inputs": True,
+    }):
+        package = torch._inductor.aoti_compile_and_package(exported, package_path=str(tmp_path / "varlen.pt2"))
+    compiled = torch._inductor.aoti_load_package(package)
+    torch.testing.assert_close(compiled(q, kv, cu_q, cu_k), eager)
+
+
+def test_flash_attn_varlen_compiles_with_dynamic_shapes():
+    """Reuse one compiled graph across token counts, batch sizes, and maximum query lengths."""
+    from torch._dynamo.testing import CompileCounterWithBackend
+
+    torch.manual_seed(20)
+    op = _traceable_op()
+
+    def attend(q, kv, cu_q, cu_k, max_seqlen_q):
+        return op(q, kv, cu_q, cu_k, max_seqlen_q, 128**-0.5)
+
+    counter = CompileCounterWithBackend("inductor")
+    compiled = torch.compile(attend, backend=counter, fullgraph=True, dynamic=True)
+    for lens_q, lens_k in [([200, 300], [400, 500]), ([65, 129, 257], [200, 400, 350])]:
+        q = torch.randn(sum(lens_q), 2, 128, device="cuda", dtype=torch.float16)
+        kv = torch.randn(sum(lens_k), 2, 128, device="cuda", dtype=torch.float16)
+        for tensor in (q, kv):
+            torch._dynamo.mark_static(tensor, 1)
+            torch._dynamo.mark_static(tensor, 2)
+        cu_q, cu_k = _cu(lens_q), _cu(lens_k)
+        eager = attend(q, kv, cu_q, cu_k, max(lens_q))
+        ref = _reference(q, kv, kv, cu_q, cu_k, False, 128**-0.5)
+        torch.testing.assert_close(eager.float(), ref, **TOLERANCE[torch.float16])
+        torch.testing.assert_close(compiled(q, kv, cu_q, cu_k, max(lens_q)), eager)
+    assert counter.frame_count == 1
+
+
+@pytest.mark.skip(reason="Re-enable when the H100 CI PyTorch wheel includes pytorch#202409 (D127915035).")
+def test_flash_attn_varlen_compiles_with_unaligned_base():
+    """A compiled launch whose example inputs already sit off a 16-byte boundary; Inductor does not realign them."""
+    torch.manual_seed(20)
+    op = _traceable_op()
+    lens = [60, 40]
+    cu = _cu(lens)
+
+    def unaligned(tokens):
+        flat = torch.randn(tokens * 2 * 128 + 1, device="cuda", dtype=torch.float16)
+        x = flat[1:].view(tokens, 2, 128)
+        assert x.is_contiguous() and x.data_ptr() % 16 != 0
+        return x
+
+    q, kv = unaligned(sum(lens)), unaligned(sum(lens))
+
+    def attend(q, kv, cu_q, cu_k):
+        return op(q, kv, cu_q, cu_k, max(lens), 128**-0.5)
+
+    eager = attend(q, kv, cu, cu)
+    torch.testing.assert_close(eager.float(), _reference(q, kv, kv, cu, cu, False, 128**-0.5),
+                               **TOLERANCE[torch.float16])
+    torch.testing.assert_close(torch.compile(attend, fullgraph=True)(q, kv, cu, cu), eager)
+
+
+def test_flash_attn_varlen_needs_no_triton_allocator():
+    """The in-kernel output descriptor lives in a buffer the launch allocates, so no Triton allocator is used or set."""
+    from triton.runtime import _allocation
+    from triton.tlx.ops import flash_attn_varlen
+
+    lens = [200, 300]
+    cu = _cu(lens)
+    q = torch.randn(sum(lens), 2, 128, device="cuda", dtype=torch.float16)
+
+    def without_allocator():
+        out = flash_attn_varlen(q, q, q, cu, cu, max(lens), max(lens))
+        return out, _allocation._allocator.get()
+
+    out, after = contextvars.Context().run(without_allocator)
+    assert isinstance(after, _allocation.NullAllocator)
+    torch.testing.assert_close(out.float(), _reference(q, q, q, cu, cu, False, 128**-0.5), **TOLERANCE[torch.float16])
+
+    calls = []
+
+    def counting(size, align, stream):
+        calls.append(size)
+        return torch.empty(size, dtype=torch.int8, device="cuda")
+
+    def with_allocator():
+        triton.set_allocator(counting)
+        flash_attn_varlen(q, q, q, cu, cu, max(lens), max(lens))
+
+    contextvars.Context().run(with_allocator)
+    assert not calls
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_flash_attn_varlen_backend_on_non_current_device():
+    """The backend selects its input device for both scratch allocation and kernel launch."""
+    from triton.tlx.ops.kernels.flash_attn_varlen.sm90 import flash_attn_varlen
+
+    current = torch.cuda.current_device()
+    device = torch.device("cuda", (current + 1) % torch.cuda.device_count())
+    lens = [65, 129]
+    with torch.cuda.device(device):
+        q = torch.randn(sum(lens), 2, 128, device=device, dtype=torch.float16)
+        cu = _cu(lens)
+        ref = _reference(q, q, q, cu, cu, False, 128**-0.5)
+
+    out = contextvars.Context().run(flash_attn_varlen, q, q, q, cu, cu, max(lens), 128**-0.5, False)
+    assert out.device == device and torch.cuda.current_device() == current
+    torch.testing.assert_close(out.float(), ref, **TOLERANCE[torch.float16])

@@ -4,11 +4,12 @@ name: CI Health
 # compiler.yml (LIT), runs of nightly-fbtriton.yml, and each tracked
 # branch's Meta LLVM pin, into the
 # 'ci-health' release, for the /ci/ dashboard
-# that pages.yml renders after each successful collection. Never deploys. On
-# pull requests it only runs the dashboard's tests.
+# that pages.yml renders after each successful collection. Never deploys. It also
+# opens an issue when a GPU runner pool stops picking up jobs (runner_health.py).
+# On pull requests it only runs the tests.
 on:
   schedule:
-    - cron: '17 * * * *'
+    - cron: '2,17,32,47 * * * *'
   workflow_dispatch:
     inputs:
       since:
@@ -20,17 +21,41 @@ on:
       - '.github/scripts/ci_health_rules.py'
       - '.github/scripts/ci_health_logs.py'
       - '.github/scripts/ci_health_dashboard.html'
+      - '.github/scripts/runner_health.py'
       - '.github/scripts/test_ci_health.py'
       - '.github/scripts/test_ci_health_rules.py'
       - '.github/scripts/test_ci_health_logs.py'
+      - '.github/scripts/test_runner_health.py'
+      - '.github/scripts/test_gpu_ci.py'
+      - '.github/scripts/test_kernel_test_selection.py'
+      - '.github/scripts/wheel_cache.py'
+      - '.github/scripts/gpu_test_selection.py'
+      - '.github/scripts/fast_tests.py'
+      - '.github/fast-test-suites.json'
+      - '.github/workflows/fast-gpu-tests.yml'
+      - '.github/workflows/_fast-gpu-tests.yml'
+      - '.github/gpu-test-paths.json'
+      - '.github/gpu-test-suites.json'
+      - '.github/scripts/run_selected_tests.py'
+      - '.github/actions/run-selected-tests/action.yml'
       - '.github/scripts/meta_llvm_bump.py'
+      - '.github/scripts/test_meta_llvm_bump.py'
       - '.github/workflows/ci-health.yml'
       - '.github/workflows/gpu-tests.yml'
+      - '.github/workflows/gpu-tests-nightly.yml'
+      - '.github/workflows/nightly-tlx-ops-bench.yml'
+      - '.github/workflows/tritonbench.yml'
+      - '.github/workflows/compiler.yml'
       - '.github/workflows/nightly-fbtriton.yml'
       - '.github/workflows/mi350.yml'
       - '.github/workflows/b200.yml'
       - '.github/workflows/h100.yml'
       - '.github/workflows/_tlx-ops-bench.yml'
+      - '.github/workflows/bisect-tlx-ops-regression.yml'
+      - '.github/scripts/tlx_ops_bench*.py'
+      - '.github/scripts/test_tlx_ops_bench*.py'
+      - '.github/scripts/failure_issues.py'
+      - '.github/scripts/test_failure_issues.py'
 
 permissions:
   contents: read
@@ -49,11 +74,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python3 -m pip install pytest
+      - run: python3 -m pip install pytest PyYAML boto3
       # Also checks that every test step in the GPU workflows maps to a dashboard group.
       - name: Run dashboard tests
         working-directory: .github/scripts
-        run: python3 -m pytest -q test_ci_health.py test_ci_health_rules.py test_ci_health_logs.py
+        run: python3 -m pytest -s --tb=short test_ci_health.py test_ci_health_rules.py test_ci_health_logs.py test_runner_health.py test_meta_llvm_bump.py test_gpu_ci.py test_kernel_test_selection.py
+      - name: Run throughput regression tests
+        working-directory: .github/scripts
+        run: python3 -m pytest -s --tb=short test_tlx_ops_bench_regressions.py test_tlx_ops_bench_bisect_round.py test_tlx_ops_bench_bisect.py test_tlx_ops_bench_dashboard.py test_failure_issues.py
 
   collect:
     if: github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental'
@@ -86,3 +114,19 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC2046
           gh release upload ci-health data/state.json $(cat data/changed.txt) --clobber
+
+  runners:
+    if: github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read     # list queued and running jobs
+      issues: write     # open and close runner pool issues
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+      - name: Check GPU runner pools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/runner_health.py

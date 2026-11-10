@@ -2981,6 +2981,51 @@ def test_masked_unaligned_vector_load_correctness_gfx950(device):
 
 
 @triton.jit
+def _amd_packed_dot2_correctness_kernel(
+    lhs_ptr,
+    rhs_ptr,
+    acc_ptr,
+    output_ptr,
+    N: tl.constexpr,
+    INPUT_DTYPE: tl.constexpr,
+):
+    offsets = tl.arange(0, N)
+    lhs = tl.load(lhs_ptr + offsets).to(tl.uint32)
+    rhs = tl.load(rhs_ptr + offsets).to(tl.uint32)
+    acc = tl.load(acc_ptr + offsets)
+    result = tlx.amd_packed_dot2(lhs, rhs, acc, input_dtype=INPUT_DTYPE)
+    tl.store(output_ptr + offsets, result)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("dtype,input_dtype", [(torch.float16, tl.float16), (torch.bfloat16, tl.bfloat16)])
+def test_amd_packed_dot2_correctness_gfx950(device, dtype, input_dtype):
+    lhs = torch.tensor(
+        [[16.0, 1 / 16], [-16.0, 1 / 16], [2.0, -3.0], [0.5, 4.0]],
+        device=device,
+        dtype=dtype,
+    )
+    rhs = torch.tensor(
+        [[1.0, 2.0], [1.0, 2.0], [-4.0, 5.0], [8.0, -0.5]],
+        device=device,
+        dtype=dtype,
+    )
+    acc = torch.tensor([0.25, -0.25, 7.0, -2.0], device=device)
+    output = torch.empty_like(acc)
+    _amd_packed_dot2_correctness_kernel[(1, )](
+        lhs.view(torch.int32),
+        rhs.view(torch.int32),
+        acc,
+        output,
+        N=lhs.shape[0],
+        INPUT_DTYPE=input_dtype,
+        num_warps=1,
+    )
+    expected = (lhs.float() * rhs.float()).sum(dim=1) + acc
+    torch.testing.assert_close(output, expected, atol=0.0, rtol=0.0)
+
+
+@triton.jit
 def _amd_scaled_downcast_fp8_rounding_kernel(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     values = tl.load(X + offsets, offsets < N, 0.0)
@@ -3192,3 +3237,68 @@ def test_amd_scheduled_mfma_single_subtile_mapping_gfx950(initialize):
         selected += initial[16:32, 0:16]
     expected[16:32, 0:16] = selected
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@triton.jit
+def _stoch_round_kernel_gfx950(x_ptr, rbits_ptr, y_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offsets)
+    rbits = tl.load(rbits_ptr + offsets)
+    y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)
+    tl.store(y_ptr + offsets, y)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "dst_dtype, expected_inst",
+    [
+        ("float8_e5m2", "v_cvt_sr_bf8_f32"),
+        ("float8_e4m3fn", "v_cvt_sr_fp8_f32"),
+        ("float16", "v_cvt_sr_f16_f32"),
+        ("bfloat16", "v_cvt_sr_bf16_f32"),
+    ],
+)
+def test_stoch_round_gfx950(dst_dtype, expected_inst):
+    dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float8_e5m2": torch.float8_e5m2,
+        "float8_e4m3fn": torch.float8_e4m3fn,
+    }
+    dst_dtype_torch = dtype_map[dst_dtype]
+
+    SIZE = 256
+    a = torch.randn([SIZE], dtype=torch.float32, device="cuda")
+    rbits = ((torch.arange(SIZE, device="cuda", dtype=torch.int64) * 2654435761) % 2**32).to(torch.int32)
+    b = torch.empty([SIZE], dtype=torch.float32, device="cuda").to(dst_dtype_torch)
+    kernel = _stoch_round_kernel_gfx950[(1, )](a, rbits, b, BLOCK_SIZE=SIZE, num_warps=1)
+    assert expected_inst in kernel.asm["amdgcn"]
+
+    a_f32 = a.float()
+    b_back = b.float()
+    assert not torch.isnan(b_back).any(), "Stochastic rounding produced NaN"
+    assert not torch.isinf(b_back).any(), "Stochastic rounding produced Inf"
+
+    exact_mask = b_back == a_f32
+    if exact_mask.any():
+        b_ref = a_f32.to(dst_dtype_torch)
+        assert torch.equal(b[exact_mask], b_ref[exact_mask])
+
+    needs_rounding = ~exact_mask
+    if needs_rounding.any():
+        # Stochastic rounding returns one of the two representable neighbors
+        # of the source, so the error must stay below one ulp of the
+        # destination at the source magnitude.
+        mantissa_bits = {"float8_e5m2": 2, "float8_e4m3fn": 3, "float16": 10, "bfloat16": 7}[dst_dtype]
+        min_step = {
+            "float8_e5m2": 2.0**-16,
+            "float8_e4m3fn": 2.0**-9,
+            "float16": 2.0**-24,
+            "bfloat16": 2.0**-133,
+        }[dst_dtype]
+        exponent = torch.floor(torch.log2(torch.abs(a_f32[needs_rounding]).clamp(min=1e-30)))
+        ulp = torch.ldexp(torch.ones_like(exponent), (exponent - mantissa_bits).to(torch.int32))
+        ulp = torch.maximum(ulp, torch.tensor(min_step, device=ulp.device, dtype=ulp.dtype))
+        diff = torch.abs(b_back[needs_rounding] - a_f32[needs_rounding])
+        assert (diff <= ulp).all(), (f"Stochastic rounding error exceeds one ulp: max diff = {diff.max()}, "
+                                     f"max ulp = {ulp.max()}")

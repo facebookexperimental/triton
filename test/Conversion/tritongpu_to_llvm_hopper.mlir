@@ -282,6 +282,20 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // -----
 
+// CHECK-LABEL: clamp_bfloat16
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @clamp_bfloat16(%x : bf16, %limit : bf16) {
+    %neg_limit = arith.negf %limit : bf16
+    // CHECK: nvvm.fmin.xorsign.abs.bf16
+    %0 = tt.clampf %x, %neg_limit, %limit, propagateNan = none : bf16
+    // CHECK: nvvm.fmin.nan.xorsign.abs.bf16
+    %1 = tt.clampf %x, %neg_limit, %limit, propagateNan = all : bf16
+    tt.return
+  }
+}
+
+// -----
+
 // CHECK-LABEL: clamp_scalar
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @clamp_scalar(%x : f32, %limit : f32) {
@@ -738,4 +752,33 @@ tt.func @warpgroup_dot_wait_local_does_not_synchronize_warpgroups(%arg0: tensor<
   tt.return
 }
 
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @bf16_to_fp16
+  // CHECK: llvm.fpext {{.*}} : bf16 to f32
+  // CHECK: llvm.call_intrinsic "llvm.fptrunc.round"
+  // CHECK: llvm.fpext {{.*}} : bf16 to f32
+  // CHECK: llvm.call_intrinsic "llvm.fptrunc.round"
+  // CHECK: llvm.return
+  tt.func private @bf16_to_fp16(%arg: tensor<128xbf16, #blocked>) -> (tensor<128xf16, #blocked>, tensor<128xf16, #blocked>) {
+    %rn = tt.fp_to_fp %arg : tensor<128xbf16, #blocked> -> tensor<128xf16, #blocked>
+    %rz = tt.fp_to_fp %arg, rounding = rtz : tensor<128xbf16, #blocked> -> tensor<128xf16, #blocked>
+    tt.return %rn, %rz : tensor<128xf16, #blocked>, tensor<128xf16, #blocked>
+  }
+
+  // CHECK-LABEL: @fp16_to_bf16
+  // CHECK: llvm.fpext {{.*}} : f16 to f32
+  // CHECK: llvm.call_intrinsic "llvm.fptrunc.round"
+  // CHECK: llvm.fpext {{.*}} : f16 to f32
+  // CHECK: llvm.call_intrinsic "llvm.fptrunc.round"
+  // CHECK: llvm.return
+  tt.func private @fp16_to_bf16(%arg: tensor<128xf16, #blocked>) -> (tensor<128xbf16, #blocked>, tensor<128xbf16, #blocked>) {
+    %rn = tt.fp_to_fp %arg : tensor<128xf16, #blocked> -> tensor<128xbf16, #blocked>
+    %rz = tt.fp_to_fp %arg, rounding = rtz : tensor<128xf16, #blocked> -> tensor<128xbf16, #blocked>
+    tt.return %rn, %rz : tensor<128xbf16, #blocked>, tensor<128xbf16, #blocked>
+  }
 }

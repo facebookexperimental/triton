@@ -11,6 +11,34 @@ module {
 
 // -----
 
+// twoCTAs with omitted/empty CGALayout is valid in fbtriton (single-CTA
+// degenerate: ctas_per_cga with num_ctas==1 keeps an empty block axis), so
+// these parse cleanly instead of erroring as upstream #11894 expects. Kept as
+// no-abort regressions for #11815: an unguarded getBasis would crash here.
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1, twoCTAs = true>
+
+// -----
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1, CGALayout = [], twoCTAs = true>
+
+// -----
+
+// expected-error @below {{twoCTAs layout with a CTA shard requires the first CGALayout block basis to be [1, 0]}}
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1, CGALayout = [[0, 1]], twoCTAs = true>
+
+// -----
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  tt.func @tcgen05_unsupported_target() {
+    // expected-error @below {{'ttng.tmem_alloc' op requires tcgen05 support}}
+    %0 = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory>
+    tt.return
+  }
+}
+
+// -----
+
 // A descriptor's logical K must cover complete MMA instructions, even if its
 // backing allocation is larger.
 #shared_a = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
@@ -149,6 +177,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// expected-error @below {{cache modifier cannot be combined with an L1 eviction priority}}
+#invalid_cache_policy = #ttng.cache_policy<cache_modifier = cg, l1 = no_allocate>
 
 // -----
 
@@ -1618,7 +1651,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   tt.func public @tmem_subslice_row_too_small() {
     %md = ttng.tmem_alloc : () -> !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    // expected-error @+1 {{the tensor shape must be at least 128x128. Got 64, 128}}
+    // expected-error @+1 {{A row slice must cover a power of two of at least 32 rows of a single-CTA 128-row block}}
     %sub = ttng.tmem_subslice %md {offset = 0 : i32, dim = 0 : i32} : !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<64x128xf32, #tmem, #ttng.tensor_memory, mutable, 256x128>
     tt.return
   }
@@ -1631,6 +1664,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   tt.func public @tmem_subslice_row_offset_exceed(%md: !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>) {
     // expected-error @+1 {{The split offset may not exceed the source shape}}
     %sub = ttng.tmem_subslice %md {offset = 256 : i32, dim = 0 : i32} : !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 256x128>
+    tt.return
+  }
+}
+
+// -----
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, colStride = 1, ctaMode = twocta_rhs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func public @tmem_subslice_row_two_cta_m64(%md: !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>) {
+    // expected-error @+1 {{A row slice must cover a power of two of at least 16 rows of a single-CTA 64-row block}}
+    %sub = ttng.tmem_subslice %md {offset = 0 : i32, dim = 0 : i32} : !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<32x64xf32, #tmem, #ttng.tensor_memory, mutable, 64x64>
     tt.return
   }
 }
@@ -2200,6 +2244,297 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %view = ttg.memdesc_subslice %alloc [1] : !ttg.memdesc<2xi64, #shared, #smem> -> !ttg.memdesc<1xi64, #shared, #smem, 2>
     // expected-error @below {{barrier must have a contiguous shared-memory layout without subviews}}
     ttng.init_barrier %view, 1 : !ttg.memdesc<1xi64, #shared, #smem, 2>
+    tt.return
+  }
+}
+
+// -----
+
+#cluster_reduce_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_composite_tensor_combiner(%partial: tensor<128xf32, #cluster_reduce_blocked>) -> tensor<128xf32, #cluster_reduce_blocked> {
+    // expected-error @+1 {{tensor combine region must contain exactly one binary add, max, or min operation}}
+    %result = "ttng.cluster_reduce"(%partial) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      %scaled = arith.mulf %sum, %rhs : f32
+      "ttng.cluster_reduce.return"(%scaled) : (f32) -> ()
+    }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (tensor<128xf32, #cluster_reduce_blocked>) -> tensor<128xf32, #cluster_reduce_blocked>
+    tt.return %result : tensor<128xf32, #cluster_reduce_blocked>
+  }
+}
+
+// -----
+
+#cluster_placement_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_conditional_placement(%partial: tensor<128xf32, #cluster_placement_blocked>, %condition: i1) -> tensor<128xf32, #cluster_placement_blocked> {
+    %result = scf.if %condition -> tensor<128xf32, #cluster_placement_blocked> {
+      // expected-error @+1 {{must be in the function entry block or one directly nested scf.for}}
+      %reduced = "ttng.cluster_reduce"(%partial) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (tensor<128xf32, #cluster_placement_blocked>) -> tensor<128xf32, #cluster_placement_blocked>
+      scf.yield %reduced : tensor<128xf32, #cluster_placement_blocked>
+    } else {
+      scf.yield %partial : tensor<128xf32, #cluster_placement_blocked>
+    }
+    tt.return %result : tensor<128xf32, #cluster_placement_blocked>
+  }
+}
+
+// -----
+
+#cluster_loop_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_rank_dependent_loop(%partial: tensor<128xf32, #cluster_loop_blocked>) -> tensor<128xf32, #cluster_loop_blocked> {
+    %pid = tt.get_program_id x : i32
+    %lower = arith.index_cast %pid : i32 to index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %result = scf.for %i = %lower to %c4 step %c1 iter_args(%acc = %partial) -> tensor<128xf32, #cluster_loop_blocked> {
+      // expected-error @+1 {{loop bounds and step must not depend on cluster rank}}
+      %reduced = "ttng.cluster_reduce"(%acc) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (tensor<128xf32, #cluster_loop_blocked>) -> tensor<128xf32, #cluster_loop_blocked>
+      scf.yield %reduced : tensor<128xf32, #cluster_loop_blocked>
+    }
+    tt.return %result : tensor<128xf32, #cluster_loop_blocked>
+  }
+}
+
+// -----
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_group_size(%partial: f32) -> f32 {
+    // expected-error @+1 {{group_size must be 2 or 4}}
+    %result = "ttng.cluster_reduce"(%partial) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+    }) {cluster_axis = 0 : i32, group_size = 3 : i32} : (f32) -> f32
+    tt.return %result : f32
+  }
+}
+
+// -----
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_group_mismatch(%partial: f32) -> f32 {
+    // expected-error @+1 {{requires a one-dimensional physical cluster matching cluster_axis and group_size; got (2, 1, 1)}}
+    %result = "ttng.cluster_reduce"(%partial) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+    }) {cluster_axis = 0 : i32, group_size = 4 : i32} : (f32) -> f32
+    tt.return %result : f32
+  }
+}
+
+// -----
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_non_f32(%partial: i32) -> i32 {
+    // expected-error @+1 {{requires scalar f32 or non-empty, positive-rank, statically shaped f32 tensors}}
+    %result = "ttng.cluster_reduce"(%partial) ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %sum = arith.addf %lhs, %rhs : f32
+      "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+    }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (i32) -> i32
+    tt.return %result : i32
+  }
+}
+
+// -----
+
+#cluster_reduce_k2_tensor = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @cluster_reduce_rejects_k2_tensor(%a: tensor<32xf32, #cluster_reduce_k2_tensor>, %b: tensor<32xf32, #cluster_reduce_k2_tensor>) -> (tensor<32xf32, #cluster_reduce_k2_tensor>, tensor<32xf32, #cluster_reduce_k2_tensor>) {
+    // expected-error @+1 {{two-component reductions require scalar f32 state}}
+    %result:2 = "ttng.cluster_reduce"(%a, %b) ({
+    ^bb0(%lhs_a: f32, %lhs_b: f32, %rhs_a: f32, %rhs_b: f32):
+      %sum_a = arith.addf %lhs_a, %rhs_a : f32
+      %sum_b = arith.addf %lhs_b, %rhs_b : f32
+      "ttng.cluster_reduce.return"(%sum_a, %sum_b) : (f32, f32) -> ()
+    }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (tensor<32xf32, #cluster_reduce_k2_tensor>, tensor<32xf32, #cluster_reduce_k2_tensor>) -> (tensor<32xf32, #cluster_reduce_k2_tensor>, tensor<32xf32, #cluster_reduce_k2_tensor>)
+    tt.return %result#0, %result#1 : tensor<32xf32, #cluster_reduce_k2_tensor>, tensor<32xf32, #cluster_reduce_k2_tensor>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_while_collective_bound(%input: f32) {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    %bound = scf.while (%k = %c0) : (i32) -> i32 {
+      %cond = arith.cmpi slt, %k, %rank : i32
+      scf.condition(%cond) %k : i32
+    } do {
+    ^bb0(%k: i32):
+      %next = arith.addi %k, %c1 : i32
+      scf.yield %next : i32
+    }
+    scf.for %i = %c0 to %bound step %c1 : i32 {
+      // expected-error @+1 {{loop bounds and step must not depend on cluster rank}}
+      %v = "ttng.cluster_reduce"(%input) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (f32) -> f32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_execute_region_collective_bound(%input: f32) {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    %bound = scf.execute_region -> i32 {
+      scf.yield %rank : i32
+    }
+    scf.for %i = %c0 to %bound step %c1 : i32 {
+      // expected-error @+1 {{loop bounds and step must not depend on cluster rank}}
+      %v = "ttng.cluster_reduce"(%input) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (f32) -> f32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_index_switch_collective_bound(%input: f32) {
+    %pid = tt.get_program_id x : i32
+    %c2 = arith.constant 2 : i32
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %rank = arith.remsi %pid, %c2 : i32
+    %selector = arith.constant 0 : index
+    %bound = scf.index_switch %selector -> i32
+    case 0 {
+      scf.yield %rank : i32
+    }
+    default {
+      scf.yield %c0 : i32
+    }
+    scf.for %i = %c0 to %bound step %c1 : i32 {
+      // expected-error @+1 {{loop bounds and step must not depend on cluster rank}}
+      %v = "ttng.cluster_reduce"(%input) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (f32) -> f32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func private @reject_private_helper(%input: f32, %n: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %rank = nvg.cluster_id
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      // expected-error @+1 {{must be contained in a kernel tt.func}}
+      %v = "ttng.cluster_reduce"(%input) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (f32) -> f32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_cluster_rank_bound(%input: f32, %n: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %rank = nvg.cluster_id
+    scf.for %i = %c0 to %rank step %c1 : i32 {
+      // expected-error @+1 {{loop bounds and step must not depend on cluster rank}}
+      %v = "ttng.cluster_reduce"(%input) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (f32) -> f32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func private @return_cluster_rank() -> i32 {
+    %rank = nvg.cluster_id
+    tt.return %rank : i32
+  }
+  tt.func public @reject_call_bound(%input: f32, %n: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %bound = tt.call @return_cluster_rank() : () -> i32
+    scf.for %i = %c0 to %bound step %c1 : i32 {
+      // expected-error @+1 {{loop bounds and step must not depend on cluster rank}}
+      %v = "ttng.cluster_reduce"(%input) ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        "ttng.cluster_reduce.return"(%sum) : (f32) -> ()
+      }) {cluster_axis = 0 : i32, group_size = 2 : i32} : (f32) -> f32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_store_reduce_rejects_type_mismatch(%dst: !tt.ptr<f16>, %size: i32) {
+    %src = ttg.local_alloc : () -> !ttg.memdesc<128xf32, #shared, #smem, mutable>
+    // expected-error @below {{reduction source and destination element types must match, got 'f32' and 'f16'}}
+    ttng.async_store %src, %dst, %size {store_reduce = 1 : i32} : !ttg.memdesc<128xf32, #shared, #smem, mutable>, !tt.ptr<f16>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_store_reduce_rejects_unsupported_kind(%dst: !tt.ptr<f32>, %size: i32) {
+    %src = ttg.local_alloc : () -> !ttg.memdesc<128xf32, #shared, #smem, mutable>
+    // expected-error @below {{unsupported reduce kind max for element type 'f32'}}
+    ttng.async_store %src, %dst, %size {store_reduce = 3 : i32} : !ttg.memdesc<128xf32, #shared, #smem, mutable>, !tt.ptr<f32>
     tt.return
   }
 }

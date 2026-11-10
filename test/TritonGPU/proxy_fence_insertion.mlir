@@ -34,6 +34,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 
+  // CHECK-LABEL: inline_asm_no_proxy_effects
+  tt.func @inline_asm_no_proxy_effects(%desc: !tt.tensordesc<64x64xf32, #shared>, %buffer: !ttg.memdesc<64x64xf32, #shared, #smem, mutable>, %bar: !ttg.memdesc<1xi64, #shared1, #smem, mutable>) {
+    %c0 = arith.constant 0 : i32
+    %true = arith.constant true
+    // CHECK: ttg.inline_asm
+    // CHECK-NEXT: ttng.async_tma_copy_global_to_local
+    ttg.inline_asm "// opaque descriptor" {constraints = "r", pure = false} %buffer : (!ttg.memdesc<64x64xf32, #shared, #smem, mutable>) -> ()
+    ttng.async_tma_copy_global_to_local %desc[%c0, %c0] %buffer, %bar, %true : !tt.tensordesc<64x64xf32, #shared>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
+    tt.return
+  }
+
   // CHECK-LABEL: no_fence_for_disjoint_allocations
   tt.func @no_fence_for_disjoint_allocations(%desc: !tt.tensordesc<64x64xf32, #shared>, %bar: !ttg.memdesc<1xi64, #shared1, #smem, mutable>) {
     %c0 = arith.constant 0 : i32
@@ -1820,6 +1831,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
     ttng.async_tma_copy_global_to_local %desc[%c0] %page, %bar, %true : !tt.tensordesc<64xi32, #shared>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<64xi32, #shared, #smem, mutable>
     ttng.wait_barrier %bar, %c0, %true deps %page : !ttg.memdesc<1xi64, #barrier, #smem, mutable>, !ttg.memdesc<64xi32, #shared, #smem, mutable>
     ttng.inval_barrier %bar : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// The non-tensor bulk store/reduce reads its source through the async proxy,
+// so a generic write to that buffer needs a proxy fence before it.
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @async_store_reduce_after_local_store
+  tt.func @async_store_reduce_after_local_store(%dst: !tt.ptr<f32>, %data: tensor<512xf32, #blocked>) {
+    %size = arith.constant 2048 : i32
+    %buf = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<512xf32, #shared, #smem, mutable>
+    ttg.local_store %data, %buf : tensor<512xf32, #blocked> -> !ttg.memdesc<512xf32, #shared, #smem, mutable>
+    // CHECK: ttg.local_store
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = false}
+    // CHECK-NEXT: ttng.async_store
+    ttng.async_store %buf, %dst, %size {store_reduce = 1 : i32} : !ttg.memdesc<512xf32, #shared, #smem, mutable>, !tt.ptr<f32>
     tt.return
   }
 }

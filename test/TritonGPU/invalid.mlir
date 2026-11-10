@@ -487,6 +487,15 @@ tt.func public @memdesc_reinterpret_oversized_shared_linear(%arg0: !ttg.memdesc<
 
 // -----
 
+#shared_linear_rows = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [1, 0], [2, 0]]}, alignment = 16>
+#smem = #ttg.shared_memory
+// expected-error @+1 {{shared linear encoding needs power-of-two layout dimensions}}
+tt.func public @shared_linear_npot_rows(%arg0: !ttg.memdesc<3x4xf16, #shared_linear_rows, #smem>) {
+    tt.return
+}
+
+// -----
+
 #shared_split = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[1, 0]]}>
 #shared_broadcast = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 0]]}>
 #smem = #ttg.shared_memory
@@ -1208,5 +1217,150 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32}
       ttg.predicate_yield %init : tensor<64xf32, #carried>
     } : (tensor<64xi1, #predicate>, tensor<64xf32, #carried>) -> tensor<64xf32, #carried>
     tt.return %result : tensor<64xf32, #carried>
+  }
+}
+
+// -----
+
+// A reshaped partitioned view must keep its pieces: four 32-row pieces of a
+// 128-row view cannot be described along a single dimension of [2, 64, 128].
+#piece_inv = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [32, 128]}>
+#piece_inv3 = #ttg.padded_shared<[256:+16] {order = [2, 1, 0], shape = [2, 16, 128]}>
+#part_inv = #ttg.partitioned_shared<{numPartitions = 4, numGroups = 1, partitionDim = 0, partitionLayout = #piece_inv}>
+#part_inv3 = #ttg.partitioned_shared<{numPartitions = 4, numGroups = 1, partitionDim = 1, partitionLayout = #piece_inv3}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @memdesc_reshape_partitioned_unsupported(%d : !ttg.memdesc<128x128xi8, #part_inv, #smem, mutable>) {
+    // expected-error @+1 {{cannot infer the encoding of a reshaped}}
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<128x128xi8, #part_inv, #smem, mutable> -> !ttg.memdesc<2x64x128xi8, #part_inv3, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [1, 1], instrShape = [8, 8]}>
+#a = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>
+#b = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  tt.func @mma_fp64_large_k_replicated_lanes(%a: tensor<8x4xf64, #a>, %b: tensor<4x8xf64, #b>) {
+    %c = arith.constant dense<0.0> : tensor<8x8xf64, #mma>
+    // expected-error@+1 {{MMA operand layout requires K >= 4 * kWidth}}
+    %d = tt.dot %a, %b, %c : tensor<8x4xf64, #a> * tensor<4x8xf64, #b> -> tensor<8x8xf64, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [1, 1], instrShape = [16, 8]}>
+#a = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#b = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  tt.func @mma_fp32_large_k_replicated_lanes(%a: tensor<16x16xf32, #a>, %b: tensor<16x8xf32, #b>) {
+    %c = arith.constant dense<0.0> : tensor<16x8xf32, #mma>
+    // expected-error@+1 {{MMA operand layout requires K >= 4 * kWidth}}
+    %d = tt.dot %a, %b, %c, inputPrecision = tf32 : tensor<16x16xf32, #a> * tensor<16x8xf32, #b> -> tensor<16x8xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#shared_inner = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #shared_inner}>
+#smem = #ttg.shared_memory
+tt.func @inline_asm_partitioned_descriptor(%mem: !ttg.memdesc<128x16xf16, #partitioned, #smem, mutable>) {
+  // expected-error @+1 {{inline assembly requires memory descriptors with a single base}}
+  ttg.inline_asm "" {constraints = "r", pure = false} %mem : (!ttg.memdesc<128x16xf16, #partitioned, #smem, mutable>) -> ()
+  tt.return
+}
+
+// -----
+
+// The result must use the inferred partitioned encoding: folding a group-major
+// view gives four 32-row groups, not two 64-row groups.
+#piece_groups = #ttg.padded_shared<[256:+16] {order = [2, 1, 0], shape = [4, 32, 128]}>
+#piece_wrong = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [64, 128]}>
+#part_groups = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 1, partitionLayout = #piece_groups}>
+#part_wrong = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #piece_wrong}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @memdesc_reshape_partitioned_wrong_result(%d : !ttg.memdesc<4x64x128xi8, #part_groups, #smem, mutable>) {
+    // expected-error @+1 {{expected result type}}
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<4x64x128xi8, #part_groups, #smem, mutable> -> !ttg.memdesc<256x128xi8, #part_wrong, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared_inner = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #shared_inner}>
+#smem = #ttg.shared_memory
+tt.func @elementwise_asm_partitioned_descriptor(%mem: !ttg.memdesc<128x16xf16, #partitioned, #smem, mutable>) {
+  // expected-error @+1 {{inline assembly requires memory descriptors with a single base}}
+  %value = tt.elementwise_inline_asm "mov.u32 $0, 0;" {constraints = "=r,r", pure = false, packed_element = 1 : i32} %mem : !ttg.memdesc<128x16xf16, #partitioned, #smem, mutable> -> i32
+  tt.return
+}
+
+// -----
+
+// Partitioned reshapes are inferred from power-of-two layouts only; an NPOT
+// leading dimension is rejected instead of being misread.
+#piece_npot = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#part_npot = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #piece_npot}>
+#dst_npot = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [2, 1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32} {
+  tt.func @memdesc_reshape_partitioned_npot(%d : !ttg.memdesc<192x128xi8, #part_npot, #smem, mutable>) {
+    // expected-error @+1 {{cannot infer the encoding of a reshaped}}
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<192x128xi8, #part_npot, #smem, mutable> -> !ttg.memdesc<192x2x64xi8, #dst_npot, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+!desc = !ttg.memdesc<128xi32, #shared, #ttg.shared_memory, mutable>
+tt.func @pure_inline_asm_shared_descriptor(%offset: i32, %mem: !desc) {
+  // expected-error @+1 {{requires pure=false for memory descriptor operands}}
+  %value = ttg.inline_asm "add.u32 $0, $1, $2;" {constraints = "=r,r,r", pure = true} %offset, %mem : (i32, !desc) -> i32
+  tt.return
+}
+
+// -----
+
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 32, colStride = 1>
+!desc = !ttg.memdesc<128x32xi32, #tmem, #ttng.tensor_memory, mutable>
+tt.func @pure_elementwise_asm_tensor_descriptor(%offset: i32, %mem: !desc) {
+  // expected-error @+1 {{requires pure=false for memory descriptor operands}}
+  %value = tt.elementwise_inline_asm "add.u32 $0, $1, $2;" {constraints = "=r,r,r", pure = true, packed_element = 1 : i32} %offset, %mem : i32, !desc -> i32
+  tt.return
+}
+
+// -----
+
+#src = #ttg.linear<{register = [], lane = [[1, 0], [0, 0], [0, 0], [0, 0], [0, 0]], warp = [[0, 0], [0, 0]], block = []}>
+#dst = #ttg.linear<{register = [[1, 0], [0, 1]], lane = [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]], warp = [[0, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @broadcast_requires_lane_movement(%arg: tensor<2x1xi32, #src>) {
+    // expected-error @+1 {{requires matching source and result layouts up to broadcasting}}
+    %result = tt.broadcast %arg : tensor<2x1xi32, #src> -> tensor<2x2xi32, #dst>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[1, 0], [2, 0]], lane = [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]], warp = [[0, 0], [0, 0]], block = []}>
+#dst = #ttg.linear<{register = [[2, 0], [0, 1], [1, 0]], lane = [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]], warp = [[0, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // Register permutations require an explicit layout conversion.
+  tt.func @broadcast_requires_register_permutation(%arg: tensor<4x1xi32, #src>) {
+    // expected-error @+1 {{requires matching source and result layouts up to broadcasting}}
+    %result = tt.broadcast %arg : tensor<4x1xi32, #src> -> tensor<4x2xi32, #dst>
+    tt.return
   }
 }

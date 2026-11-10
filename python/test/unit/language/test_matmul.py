@@ -3,7 +3,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from test_mxfp import MXFP4Tensor, MXScaleTensor
+from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor, fp8e8m0_to_float32
 import re
 from triton._internal_testing import is_compile_warmup, is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_cdna, is_hip_gfx1250, is_rubin, is_blackwell
 
@@ -88,6 +88,25 @@ def matmul_kernel(  #
         offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         output_ptrs = output_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         tl.store(output_ptrs, accumulator)
+
+
+@pytest.mark.skipif(not is_hip_cdna3(), reason="requires CDNA3 block pingpong")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("block_k", [32, 64])
+@pytest.mark.parametrize("num_stages", [1, 2])
+def test_matmul_pingpong_packed_k_slices(dtype, block_k, num_stages, device):
+    # The two-cluster K=32 schedule slices packed operands into K=16 dots.
+    # Later dots must retain the accumulator produced by preceding slices.
+    torch.manual_seed(23)
+    m, n, k = 256, 256, 256
+    a = torch.randn((m, k), device=device, dtype=dtype)
+    b = torch.randn((n, k), device=device, dtype=dtype).T
+    out = torch.empty((m, n), device=device, dtype=torch.float32)
+    matmul_kernel[(1, )](a, b, out, m, n, k, *a.stride(), *b.stride(), *out.stride(), BLOCK_M=m, BLOCK_N=n,
+                         BLOCK_K=block_k, NUM_STAGES=num_stages, num_warps=8, num_stages=num_stages, kpack=2,
+                         matrix_instr_nonkdim=16)
+    reference = a.float() @ b.float()
+    torch.testing.assert_close(out, reference, atol=1e-2, rtol=8e-3)
 
 
 @triton.jit
@@ -470,14 +489,6 @@ def mxfp_matmul(  #
     tl.store(output_ptrs, accumulator, mask=c_mask)
 
 
-def fp8e8m0_to_float32(scale):
-    scale = scale.view(torch.uint8)
-    scale = scale.to(torch.int32)
-    scale = scale << 23
-    scale = scale.view(torch.float32)
-    return scale
-
-
 @pytest.mark.interpreter
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 256), (128, 256, 256), (128, 128, 128), (2, 4, 64)])
 @pytest.mark.parametrize(
@@ -829,11 +840,6 @@ def test_preshuffle_scale_mxfp_cdna4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, DTYPE_A
         scales_shuffled = scales_shuffled.view(sm // 32, sn * 32)
         return scales_shuffled
 
-    def e8m0_to_f32(x):
-        x_f32 = 2**((x - 127).to(torch.float32))
-        x_f32[x_f32 == 128] = float("nan")
-        return x_f32
-
     def run_torch(x, w, x_scales, w_scales, dtype):
         # First convert the x and w inputs to f32.
         SCALE_GROUP_SIZE = 32
@@ -841,12 +847,10 @@ def test_preshuffle_scale_mxfp_cdna4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, DTYPE_A
         w_f32 = w.to(torch.float32)
         # Next convert the e8m0 scales to f32.
         if x_scales is not None:
-            x_scales = x_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1).to(torch.float32)
-            x_scales_f32 = e8m0_to_f32(x_scales)
+            x_scales_f32 = fp8e8m0_to_float32(x_scales).repeat_interleave(SCALE_GROUP_SIZE, dim=1)
             x_f32 = x_f32 * x_scales_f32
         if w_scales is not None:
-            w_scales = w_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1).to(torch.float32)
-            w_scales_f32 = e8m0_to_f32(w_scales)
+            w_scales_f32 = fp8e8m0_to_float32(w_scales).repeat_interleave(SCALE_GROUP_SIZE, dim=1)
             w_f32 = w_f32 * w_scales_f32
         return torch.mm(x_f32, w_f32.T).to(dtype)
 
@@ -1918,3 +1922,43 @@ def test_nvfp4_ue5m3_matmul(scale_byte):
     torch.testing.assert_close(ref, out, atol=1e-3 * ref.abs().max().item(), rtol=1e-3)
     # Native UE5M3 MMA is Rubin-only; other Blackwell targets decompose.
     assert ("kind::mxf4nvf4.block_scale.block16" in kernel.asm["ptx"]) == is_rubin()
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_warp_specialized_matmul_auxiliary_output(device, fresh_compilation_knobs):
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    fresh_compilation_knobs.compilation.instrumentation_mode = "consan"
+
+    @triton.jit
+    def kernel(A, B, C, X, Y, K: tl.constexpr):
+        rows = tl.arange(0, 128)[:, None]
+        cols = tl.arange(0, 64)[None, :]
+        acc = tl.full((128, 128), 0, tl.float32)
+        aux = tl.full((128, 64), 0, tl.float32)
+        for k in tl.range(K // 64, warp_specialize=True):
+            a = A.load([0, k * 64])
+            b = B.load([k * 64, 0])
+            aux += tl.load(X + rows * K + cols + k * 64).to(tl.float32)
+            acc = tl.dot(a, b, acc)
+        C.store([0, 0], acc.to(tl.float16))
+        # Its shared-memory staging store must follow the MMA completion wait.
+        Y.store([0, 0], aux)
+
+    torch.manual_seed(0)
+    a = torch.randn((128, 1024), device=device, dtype=torch.float16) * 0.1
+    b = torch.randn((1024, 128), device=device, dtype=torch.float16) * 0.1
+    x = torch.randn_like(a)
+    c = torch.empty((128, 128), device=device, dtype=torch.float16)
+    y = torch.empty((128, 64), device=device, dtype=torch.float32)
+    a_desc, b_desc, c_desc, y_desc = [
+        TensorDescriptor.from_tensor(tensor, block)
+        for tensor, block in [(a, [128, 64]), (b, [64, 128]), (c, [128, 128]), (y, [128, 64])]
+    ]
+    compiled = kernel[(1, )](a_desc, b_desc, c_desc, x, y_desc, 1024, num_stages=3, num_warps=4)
+    if is_compile_warmup():
+        return
+    torch.cuda.synchronize()
+    assert "ttg.warp_specialize" in compiled.asm["ttgir"]
+    torch.testing.assert_close(c, a @ b, atol=0.01, rtol=0.01)
+    torch.testing.assert_close(y, x.float().reshape(128, 16, 64).sum(1), atol=0.001, rtol=0.001)

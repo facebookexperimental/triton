@@ -1,5 +1,37 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+tt.func @atomic_load_i1(%ptr: !tt.ptr<i1>) {
+  // expected-error @+1 {{does not support sub-byte elements}}
+  %value = tt.atomic_load acquire, gpu, %ptr : (!tt.ptr<i1>) -> i1
+  tt.return
+}
+
+// -----
+
+tt.func @atomic_store_i1(%ptr: !tt.ptr<i1>, %value: i1) {
+  // expected-error @+1 {{does not support sub-byte elements}}
+  tt.atomic_store release, gpu, %ptr, %value : !tt.ptr<i1>
+  tt.return
+}
+
+// -----
+
+tt.func @atomic_load_tensor_i1(%ptr: tensor<32x!tt.ptr<i1>>) {
+  // expected-error @+1 {{does not support sub-byte elements}}
+  %value = tt.atomic_load acquire, gpu, %ptr : (tensor<32x!tt.ptr<i1>>) -> tensor<32xi1>
+  tt.return
+}
+
+// -----
+
+tt.func @atomic_store_tensor_i1(%ptr: tensor<32x!tt.ptr<i1>>, %value: tensor<32xi1>) {
+  // expected-error @+1 {{does not support sub-byte elements}}
+  tt.atomic_store release, gpu, %ptr, %value : tensor<32x!tt.ptr<i1>>
+  tt.return
+}
+
+// -----
+
 tt.func @atomic_poll_mismatched_result(%ptr: tensor<32x!tt.ptr<i32>>, %expected: tensor<32xi32>) {
   // expected-error @+1 {{result type matches expected shape}}
   %matched = tt.atomic_poll acquire, gpu, %ptr, %expected : tensor<32x!tt.ptr<i32>>, tensor<32xi32> -> i1
@@ -24,6 +56,38 @@ tt.func @invalid_scan_ordering(%x: tensor<32xf32>) {
     tt.scan.return %sum : f32
   }) {axis = 0 : i32, reverse = false, reduction_ordering = "invalid"}
      : (tensor<32xf32>) -> tensor<32xf32>
+  tt.return
+}
+
+// -----
+
+tt.func @load_with_store_cache_modifier(%ptr: !tt.ptr<f32>) {
+  // expected-error @+1 {{'tt.load' op invalid cache policy: cache modifier 'wb' is not supported for loads}}
+  %value = tt.load %ptr {cachePolicy = #tt.cache_policy<cache_modifier = wb, eviction_policy = evict_normal>} : !tt.ptr<f32>
+  tt.return
+}
+
+// -----
+
+tt.func @store_with_load_cache_modifier(%ptr: !tt.ptr<f32>, %value: f32) {
+  // expected-error @+1 {{'tt.store' op invalid cache policy: cache modifier 'ca' is not supported for stores}}
+  tt.store %ptr, %value {cachePolicy = #tt.cache_policy<cache_modifier = ca, eviction_policy = evict_normal>} : !tt.ptr<f32>
+  tt.return
+}
+
+// -----
+
+tt.func @load_with_nvidia_store_cache_modifier(%ptr: !tt.ptr<f32>) {
+  // expected-error @+1 {{'tt.load' op invalid cache policy: cache modifier 'wt' is not supported for loads}}
+  %value = tt.load %ptr {cachePolicy = #ttng.cache_policy<cache_modifier = wt>} : !tt.ptr<f32>
+  tt.return
+}
+
+// -----
+
+tt.func @store_with_nvidia_load_cache_modifier(%ptr: !tt.ptr<f32>, %value: f32) {
+  // expected-error @+1 {{'tt.store' op invalid cache policy: cache modifier 'cv' is not supported for stores}}
+  tt.store %ptr, %value {cachePolicy = #ttng.cache_policy<cache_modifier = cv>} : !tt.ptr<f32>
   tt.return
 }
 
@@ -280,6 +344,15 @@ tt.func public @fn(%arg0: f32) {
     %a, %b = tt.split %arg0 : f32 -> f16
     tt.return
 }
+
+// -----
+
+tt.func public @split_result_type_mismatch(%arg0: tensor<32x2xf32>) {
+    // expected-error @+1 {{outLHS and outRHS types match}}
+    %parts:2 = "tt.split"(%arg0) : (tensor<32x2xf32>) -> (tensor<32xf32>, tensor<32xf16>)
+    tt.return
+}
+
 // -----
 
 tt.func public @fn(%arg0: tensor<2xf32>) {
@@ -613,6 +686,34 @@ module {
     // expected-error @below {{scale factor must be 16 or 32. Got 1}}
     %result = tt.dot_scaled %a scale %a_scale, %b scale %b_scale, %cst lhs = e4m3 rhs = e4m3 {fastMath = true} : tensor<128x128xf8E4M3FN>, tensor<128x128xi8>  * tensor<128x128xf8E4M3FN>, tensor<128x4xi8>-> tensor<128x128xf32>
     tt.return %result : tensor<128x128xf32>
+  }
+}
+
+// -----
+
+module {
+  tt.func @dot_scaled_fp6_lhs_non_kpack(
+    %a: tensor<16x32xi8>, %sa: tensor<16x1xi8>,
+    %b: tensor<32x16xi8>, %sb: tensor<16x1xi8>,
+    %c: tensor<16x16xf32>) -> tensor<16x16xf32> {
+    // expected-error @below {{fp6 lhs operand must be packed along K (lhs_k_pack must be true)}}
+    %d = tt.dot_scaled %a scale %sa, %b scale %sb, %c lhs = e2m3 rhs = e3m2 {fastMath = false, lhs_k_pack = false} :
+        tensor<16x32xi8>, tensor<16x1xi8> * tensor<32x16xi8>, tensor<16x1xi8> -> tensor<16x16xf32>
+    tt.return %d : tensor<16x16xf32>
+  }
+}
+
+// -----
+
+module {
+  tt.func @dot_scaled_fp6_rhs_non_kpack(
+    %a: tensor<16x32xi8>, %sa: tensor<16x1xi8>,
+    %b: tensor<32x16xi8>, %sb: tensor<16x1xi8>,
+    %c: tensor<16x16xf32>) -> tensor<16x16xf32> {
+    // expected-error @below {{fp6 rhs operand must be packed along K (rhs_k_pack must be true)}}
+    %d = tt.dot_scaled %a scale %sa, %b scale %sb, %c lhs = e2m3 rhs = e3m2 {fastMath = false, rhs_k_pack = false} :
+        tensor<16x32xi8>, tensor<16x1xi8> * tensor<32x16xi8>, tensor<16x1xi8> -> tensor<16x16xf32>
+    tt.return %d : tensor<16x16xf32>
   }
 }
 

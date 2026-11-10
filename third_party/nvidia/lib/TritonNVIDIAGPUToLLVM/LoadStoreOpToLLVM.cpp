@@ -20,9 +20,11 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallString.h"
 
 #include <cassert>
 
@@ -90,30 +92,69 @@ Value emitRedundantThreadPredicate(
   return pred;
 }
 
-Value createCachePolicy(triton::EvictionPolicy opEvict,
-                        ConversionPatternRewriter &rewriter, Location loc,
-                        int computeCapability) {
+struct CachePolicy {
+  triton::CacheModifier modifier = triton::CacheModifier::NONE;
+  triton::EvictionPolicy legacy = triton::EvictionPolicy::NORMAL;
+  ttng::CachePolicyAttr detailed;
+};
+
+FailureOr<Value> createCachePolicy(CachePolicy cachePolicy,
+                                   ConversionPatternRewriter &rewriter,
+                                   Location loc, int computeCapability,
+                                   Operation *op) {
   // Emit createpolicy.fractional.L2::policy.b64 xx 1.0
   PTXBuilder ptxBuilder;
-  const bool hasL2EvictPolicy =
-      opEvict == triton::EvictionPolicy::EVICT_FIRST ||
-      opEvict == triton::EvictionPolicy::EVICT_LAST;
+  const bool hasLegacyL2EvictPolicy =
+      cachePolicy.legacy == triton::EvictionPolicy::EVICT_FIRST ||
+      cachePolicy.legacy == triton::EvictionPolicy::EVICT_LAST;
+  StringRef primary;
+  StringRef secondary;
+  FloatAttr fraction;
+  if (cachePolicy.detailed) {
+    auto primaryPriority = cachePolicy.detailed.getL2Primary();
+    if (primaryPriority != ttng::CacheEvictionPriority::NONE)
+      primary = ttng::stringifyCacheEvictionPriority(primaryPriority);
+    auto secondaryPriority = cachePolicy.detailed.getL2Secondary();
+    if (secondaryPriority != ttng::CacheEvictionPriority::NONE)
+      secondary = ttng::stringifyCacheEvictionPriority(secondaryPriority);
+    fraction = cachePolicy.detailed.getL2Fraction();
+  }
+  const bool hasDetailedL2Policy = !primary.empty();
   Value policyRet;
 
   const bool hardwareSupport = computeCapability >= 80;
+  if (hasDetailedL2Policy && !hardwareSupport) {
+    op->emitOpError("fractional L2 cache policy requires compute capability "
+                    "80 or newer");
+    return failure();
+  }
 
-  if (hasL2EvictPolicy && hardwareSupport) {
-    auto &policy =
-        ptxBuilder.create("createpolicy.fractional")
-            ->o("L2::evict_first",
-                opEvict == triton::EvictionPolicy::EVICT_FIRST)
-            .o("L2::evict_last", opEvict == triton::EvictionPolicy::EVICT_LAST)
-            .b(64);
+  if ((hasLegacyL2EvictPolicy || hasDetailedL2Policy) && hardwareSupport) {
+    if (!hasDetailedL2Policy) {
+      primary = cachePolicy.legacy == triton::EvictionPolicy::EVICT_FIRST
+                    ? "evict_first"
+                    : "evict_last";
+    }
+    auto &policy = ptxBuilder.create("createpolicy.fractional")
+                       ->o("L2::evict_normal", primary == "evict_normal")
+                       .o("L2::evict_unchanged", primary == "evict_unchanged")
+                       .o("L2::evict_first", primary == "evict_first")
+                       .o("L2::evict_last", primary == "evict_last")
+                       .o("L2::evict_first", secondary == "evict_first")
+                       .b(64);
 
     const std::string writeConstraint = "=l";
     // prepare asm operands
     auto *dstOpr = ptxBuilder.newOperand(writeConstraint, /*init=*/true);
-    std::string fractionStr = "1.0";
+    SmallString<16> fractionBuffer;
+    if (fraction)
+      fraction.getValue().toString(fractionBuffer);
+    else
+      fractionBuffer = "1.0";
+    std::string fractionStr = fractionBuffer.str().str();
+    // PTX requires a floating-point literal, even for integral fractions.
+    if (fractionStr.find_first_of(".eE") == std::string::npos)
+      fractionStr += ".0";
     auto *fractionOpr = ptxBuilder.newConstantOperand(fractionStr);
     policy(dstOpr, fractionOpr);
 
@@ -123,6 +164,58 @@ Value createCachePolicy(triton::EvictionPolicy opEvict,
   }
 
   return policyRet;
+}
+
+StringRef getL1EvictionPriority(CachePolicy cachePolicy) {
+  if (cachePolicy.detailed) {
+    auto l1 = cachePolicy.detailed.getL1();
+    if (l1 != ttng::CacheEvictionPriority::NONE)
+      return ttng::stringifyCacheEvictionPriority(l1);
+    return {};
+  }
+  if (cachePolicy.legacy == triton::EvictionPolicy::EVICT_FIRST)
+    return "evict_first";
+  if (cachePolicy.legacy == triton::EvictionPolicy::EVICT_LAST)
+    return "evict_last";
+  return {};
+}
+
+FailureOr<CachePolicy> getCachePolicy(Operation *op, Attribute attr) {
+  CachePolicy cachePolicy;
+  if (!attr)
+    return cachePolicy;
+  if (auto policy = dyn_cast<ttng::CachePolicyAttr>(attr)) {
+    cachePolicy.detailed = policy;
+    cachePolicy.modifier = policy.getCacheModifier();
+    return cachePolicy;
+  }
+  if (auto policy = dyn_cast<triton::CachePolicyAttr>(attr)) {
+    cachePolicy.modifier = policy.getCacheModifier();
+    cachePolicy.legacy = policy.getEvictionPolicy();
+    return cachePolicy;
+  }
+  op->emitOpError("unsupported NVIDIA cache policy attribute ") << attr;
+  return failure();
+}
+
+LogicalResult verifyDetailedCachePolicySupport(Operation *op,
+                                               CachePolicy policy,
+                                               int computeCapability,
+                                               bool supportsPrefetch = true) {
+  const bool hasDetailedL1 =
+      policy.detailed &&
+      policy.detailed.getL1() != ttng::CacheEvictionPriority::NONE;
+  if (hasDetailedL1 && computeCapability < 70)
+    return op->emitOpError(
+        "L1 eviction priority requires compute capability 70 or newer");
+  IntegerAttr l2PrefetchSize =
+      policy.detailed ? policy.detailed.getL2PrefetchSize() : IntegerAttr();
+  if (!supportsPrefetch && l2PrefetchSize)
+    return op->emitOpError("L2 prefetch size is only supported on loads");
+  if (l2PrefetchSize && computeCapability < 75)
+    return op->emitOpError(
+        "L2 prefetch size requires compute capability 75 or newer");
+  return success();
 }
 
 // Contains some helper functions for both Load and Store conversions.
@@ -149,8 +242,7 @@ struct LoadStoreConversionBase {
         targetInfo.getPtxVersion() >= 88) {
       maxVecBits = 256;
     }
-    unsigned vec = std::min<unsigned>(maxVecBits / pointeeBitWidth, contiguity);
-    return clampVecSizeForNpot(vec, tensorTy);
+    return std::min<unsigned>(maxVecBits / pointeeBitWidth, contiguity);
   }
 
   unsigned getMaskAlignment(Value mask) const {
@@ -190,6 +282,12 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
   LogicalResult
   matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    auto cachePolicy = getCachePolicy(op, op.getCachePolicyAttr());
+    if (failed(cachePolicy))
+      return failure();
+    if (failed(verifyDetailedCachePolicySupport(op, *cachePolicy,
+                                                computeCapability)))
+      return failure();
     auto ctx = getContext();
     auto loc = op->getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -265,8 +363,17 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
     SmallVector<Value> loadedVals;
     // The L2 cache policy register is loop-invariant; create it once instead of
     // re-emitting an identical createpolicy per vectorized load.
-    Value l2PolicyReg =
-        createCachePolicy(op.getEvict(), rewriter, loc, computeCapability);
+    FailureOr<Value> l2Policy =
+        createCachePolicy(*cachePolicy, rewriter, loc, computeCapability, op);
+    if (failed(l2Policy))
+      return failure();
+    Value l2PolicyReg = *l2Policy;
+    StringRef l1Policy = getL1EvictionPriority(*cachePolicy);
+    auto l2PrefetchSizeAttr = cachePolicy->detailed
+                                  ? cachePolicy->detailed.getL2PrefetchSize()
+                                  : IntegerAttr();
+    int64_t l2PrefetchSize =
+        l2PrefetchSizeAttr ? l2PrefetchSizeAttr.getInt() : 0;
     for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
       // TODO: optimization when ptr is GEP with constant offset
       const size_t runStart = vecStart - vecStart % scalarizedContiguousRun;
@@ -340,20 +447,25 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
           ptxBuilder.newAddrOperand(ptrElems[runStart], "l", in_off);
 
       // Define the instruction opcode
-      auto &ld = ptxBuilder.create("ld")
-                     ->o("volatile", op.getIsVolatile())
-                     .global()
-                     .o("ca", op.getCache() == triton::CacheModifier::CA)
-                     .o("cg", op.getCache() == triton::CacheModifier::CG)
-                     .o("cs", op.getCache() == triton::CacheModifier::CS)
-                     .o("cv", op.getCache() == triton::CacheModifier::CV)
-                     .o("L1::evict_first",
-                        op.getEvict() == triton::EvictionPolicy::EVICT_FIRST)
-                     .o("L1::evict_last",
-                        op.getEvict() == triton::EvictionPolicy::EVICT_LAST)
-                     .o("L2::cache_hint", l2PolicyReg != Value())
-                     .v(nWords)
-                     .b(width);
+      auto &ld =
+          ptxBuilder.create("ld")
+              ->o("volatile", op.getIsVolatile())
+              .global()
+              .o("ca", cachePolicy->modifier == triton::CacheModifier::CA)
+              .o("cg", cachePolicy->modifier == triton::CacheModifier::CG)
+              .o("cs", cachePolicy->modifier == triton::CacheModifier::CS)
+              .o("cv", cachePolicy->modifier == triton::CacheModifier::CV)
+              .o("L1::evict_normal", l1Policy == "evict_normal")
+              .o("L1::evict_unchanged", l1Policy == "evict_unchanged")
+              .o("L1::evict_first", l1Policy == "evict_first")
+              .o("L1::evict_last", l1Policy == "evict_last")
+              .o("L1::no_allocate", l1Policy == "no_allocate")
+              .o("L2::64B", l2PrefetchSize == 64)
+              .o("L2::128B", l2PrefetchSize == 128)
+              .o("L2::256B", l2PrefetchSize == 256)
+              .o("L2::cache_hint", l2PolicyReg != Value())
+              .v(nWords)
+              .b(width);
 
       PTXBuilder::Operand *evictOpr = nullptr;
       if (l2PolicyReg)
@@ -416,6 +528,13 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
   LogicalResult
   matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    auto cachePolicy = getCachePolicy(op, op.getCachePolicyAttr());
+    if (failed(cachePolicy))
+      return failure();
+    if (failed(verifyDetailedCachePolicySupport(op, *cachePolicy,
+                                                computeCapability,
+                                                /*supportsPrefetch=*/false)))
+      return failure();
     Value ptr = op.getPtr();
     Value value = op.getValue();
 
@@ -474,8 +593,12 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     const int numVecs = elemsPerThread / vec;
     // The L2 cache policy register is loop-invariant; create it once instead of
     // re-emitting an identical createpolicy per vectorized store.
-    Value l2PolicyReg =
-        createCachePolicy(op.getEvict(), rewriter, loc, computeCapability);
+    FailureOr<Value> l2Policy =
+        createCachePolicy(*cachePolicy, rewriter, loc, computeCapability, op);
+    if (failed(l2Policy))
+      return failure();
+    Value l2PolicyReg = *l2Policy;
+    StringRef l1Policy = getL1EvictionPriority(*cachePolicy);
     for (size_t vecStart = 0; vecStart < elemsPerThread; vecStart += vec) {
       // TODO: optimization when ptr is AddPtr with constant offset
       const size_t runStart = vecStart - vecStart % scalarizedContiguousRun;
@@ -487,9 +610,6 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
       const size_t nWords = std::max<size_t>(1, totalWidth / width);
       const size_t wordNElems = width / valueElemNBits;
       assert(wordNElems * nWords * numVecs == elemsPerThread);
-
-      // TODO(Superjomn) Add cache policy fields to StoreOp.
-      // TODO(Superjomn) Deal with cache policy here.
 
       Type valArgTy = IntegerType::get(ctx, width);
       auto wordTy = vec_ty(valueElemTy, wordNElems);
@@ -531,14 +651,15 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
       auto &ptxStoreInstr =
           ptxBuilder.create("st")
               ->global()
-              .o("wb", op.getCache() == triton::CacheModifier::WB)
-              .o("cg", op.getCache() == triton::CacheModifier::CG)
-              .o("cs", op.getCache() == triton::CacheModifier::CS)
-              .o("wt", op.getCache() == triton::CacheModifier::WT)
-              .o("L1::evict_first",
-                 op.getEvict() == triton::EvictionPolicy::EVICT_FIRST)
-              .o("L1::evict_last",
-                 op.getEvict() == triton::EvictionPolicy::EVICT_LAST)
+              .o("wb", cachePolicy->modifier == triton::CacheModifier::WB)
+              .o("cg", cachePolicy->modifier == triton::CacheModifier::CG)
+              .o("cs", cachePolicy->modifier == triton::CacheModifier::CS)
+              .o("wt", cachePolicy->modifier == triton::CacheModifier::WT)
+              .o("L1::evict_normal", l1Policy == "evict_normal")
+              .o("L1::evict_unchanged", l1Policy == "evict_unchanged")
+              .o("L1::evict_first", l1Policy == "evict_first")
+              .o("L1::evict_last", l1Policy == "evict_last")
+              .o("L1::no_allocate", l1Policy == "no_allocate")
               .o("L2::cache_hint", l2PolicyReg != Value())
               .v(nWords)
               .b(width);
@@ -608,22 +729,11 @@ struct AtomicCASOpConversion
                                            casCmp, casVal, op.getSem(),
                                            op.getScope(), threadPred);
 
-      if (tensorTy) {
-        resultVals[i] = old;
-      } else {
-        if (op.getResult().use_empty()) {
-          rewriter.eraseOp(op);
-          return success();
-        }
-        Value ret = broadcastScalarAtomicResult(op, valueElemTy, old, rewriter,
-                                                b, threadPred, targetInfo);
-        rewriter.replaceOp(op, {ret});
-        return success();
-      }
+      resultVals[i] = old;
     }
 
-    finalizeTensorAtomicResults(op, tensorTy, rewriter, resultVals, valueElemTy,
-                                b, threadPred, targetInfo, getTypeConverter());
+    finalizeAtomicResults(op, rewriter, resultVals, valueElemTy, b, threadPred,
+                          targetInfo, getTypeConverter());
     return success();
   }
 };
@@ -736,7 +846,8 @@ public:
     unsigned vec, vecOrig;
     int numElems, packed;
     if (tensorTy) {
-      vec = getVectorSize(ptr);
+      // Atomics support at most 128 bits, including on Blackwell.
+      vec = std::min<unsigned>(getVectorSize(ptr), 128 / valueElemNBits);
       if (llMask) {
         vec = std::min<unsigned>(vec, getMaskAlignment(op.getMask()));
       }
@@ -767,6 +878,7 @@ public:
     auto freeVarMasks = getFreeVariableMasks(ptr.getType());
     Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
                                                     targetInfo, op);
+    Value resultPred = threadPred;
 
     auto packedTy = vec_ty(valueElemTy, packed);
     SmallVector<Value> resultVals(elemsPerThread);
@@ -780,7 +892,7 @@ public:
              triton::nvgpu::MemSyncScope::SYSTEM}};
     const bool doPTXLDPromotion = !useRed && isPromotableToNVPTXLD(op) &&
                                   vec == 1 && packed == 1 &&
-                                  ScopeMap.count(op.getScope());
+                                  ScopeMap.contains(op.getScope());
 
     for (size_t i = 0; i < elemsPerThread; i += vec * packed) {
       Value rmwPtr = ptrElements[i];
@@ -798,18 +910,15 @@ public:
                 : triton::nvgpu::MemSemantic::RELAXED,
             ScopeMap[op.getScope()]);
 
-        if (op.getResult().use_empty()) {
-          rewriter.eraseOp(op);
-          return success();
-        }
-        Value ret = broadcastScalarAtomicResult(op, valueElemTy, loadAcquireOp,
-                                                rewriter, b, pred, targetInfo);
-        rewriter.replaceOp(op, {ret});
+        resultVals[i] = loadAcquireOp;
+        finalizeAtomicResults(op, rewriter, resultVals, valueElemTy, b, pred,
+                              targetInfo, getTypeConverter());
         return success();
       }
 
       // Let LLVM handle compare+swap loop; branch-based pred should be fine
       if (valueElemTy.isBF16() && getNVIDIAComputeCapability(moduleOp) < 90) {
+        assert(vec == 1 && packed == 1);
         // Lower atomic bin-op and sem to LLVM
         auto llvmAtomicBinOp = matchAtomicOp(atomicRmwAttr);
         auto llvmAtomicMemOrdering = getMemoryOrdering(op.getSem());
@@ -828,13 +937,6 @@ public:
 
         // Enter into predicate block
         rewriter.setInsertionPointToEnd(curBlock);
-        bool doesAtomicNeedMEM = !op.getResult().use_empty();
-
-        // Setup for SMEM Sync case
-        Value atomPtr = tensorTy || !doesAtomicNeedMEM
-                            ? nullptr
-                            : LLVM::getSharedMemoryBase(
-                                  loc, rewriter, targetInfo, op.getOperation());
         LLVM::CondBrOp::create(rewriter, loc, pred, atomicBlock, endBlock,
                                undefVal);
 
@@ -845,62 +947,9 @@ public:
                                       valElements[i], *llvmAtomicMemOrdering,
                                       StringRef("device"))
                 .getResult();
-        // Handle the 2 bf16 case
-        if (packed == 2 && valueElemNBits == 16) {
-          Value atom2 = LLVM::AtomicRMWOp::create(
-                            rewriter, loc, *llvmAtomicBinOp, ptrElements[i + 1],
-                            valElements[i + 1], *llvmAtomicMemOrdering,
-                            StringRef("device"))
-                            .getResult();
-          auto vecTy = vec_ty(valueElemTy, vec);
-          auto tmp =
-              b.insert_element(vecTy, b.undef(vecTy), atom, b.i32_val(0));
-          atom = b.insert_element(vecTy, tmp, atom2, b.i32_val(1)).getResult();
-        }
-
-        if (tensorTy) {
-          // Return from predicated block
-          LLVM::BrOp::create(rewriter, loc, atom, endBlock);
-
-          // Recover values from predicated block
-          rewriter.setInsertionPointToStart(endBlock);
-          Value ret = endBlock->getArgument(0);
-          if (vec > 1) {
-            for (unsigned ii = 0; ii < vec; ++ii) {
-              resultVals[i + ii] = b.extract_val(valueElemTy, ret, ii);
-            }
-          } else if (packed > 1) {
-            for (unsigned ii = 0; ii < packed; ++ii) {
-              resultVals[i + ii] =
-                  b.extract_element(valueElemTy, ret, b.i32_val(ii));
-            }
-          } else {
-            resultVals[i] = ret;
-          }
-        } else {
-          if (!doesAtomicNeedMEM) {
-            LLVM::BrOp::create(rewriter, loc, atom, endBlock);
-            rewriter.eraseOp(op);
-            // if type isn't a tensor and there is no need to write to SMEM then
-            // we are done here
-            return success();
-          }
-
-          // Commit values from predicated block to SMEM and return from
-          // predicate block
-          // Note: there is no need to use the BlockArgument here because
-          //       the value is recovered from SMEM in the !tensorTy case
-          b.store(atom, atomPtr);
-          LLVM::BrOp::create(rewriter, loc, atom, endBlock);
-
-          // Recover values from predicated block (from SMEM)
-          rewriter.setInsertionPointToStart(endBlock);
-          b.barrier(ttg::AddrSpace::Local);
-
-          Value ret = b.load(valueElemTy, atomPtr);
-          rewriter.replaceOp(op, {ret});
-          return success();
-        }
+        LLVM::BrOp::create(rewriter, loc, atom, endBlock);
+        rewriter.setInsertionPointToStart(endBlock);
+        resultVals[i] = endBlock->getArgument(0);
         continue;
       }
 
@@ -932,22 +981,16 @@ public:
           resultVals[i] = ret;
         }
       } else {
-        if (op.getResult().use_empty()) {
-          rewriter.eraseOp(op);
-          return success();
-        }
-        Value ret = broadcastScalarAtomicResult(op, valueElemTy, *old, rewriter,
-                                                b, pred, targetInfo);
-        rewriter.replaceOp(op, {ret});
-        return success();
+        resultVals[i] = *old;
+        resultPred = pred;
       }
     }
     if (useRed) {
       rewriter.eraseOp(op);
       return success();
     }
-    finalizeTensorAtomicResults(op, tensorTy, rewriter, resultVals, valueElemTy,
-                                b, threadPred, targetInfo, getTypeConverter());
+    finalizeAtomicResults(op, rewriter, resultVals, valueElemTy, b, resultPred,
+                          targetInfo, getTypeConverter());
     return success();
   }
 };
@@ -965,6 +1008,20 @@ struct AsyncCopyGlobalToLocalOpConversion
   LogicalResult
   matchAndRewrite(triton::gpu::AsyncCopyGlobalToLocalOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    int computeCapability = targetInfo.getComputeCapability();
+    auto cachePolicy = getCachePolicy(op, op.getCachePolicyAttr());
+    if (failed(cachePolicy))
+      return failure();
+    if (failed(verifyDetailedCachePolicySupport(op, *cachePolicy,
+                                                computeCapability)))
+      return failure();
+    // The target's NpotTargetLegality rejects mixed-radix copies it can't
+    // lower.
+    if (FailureOr<LinearLayout> ll = triton::gpu::getExactNpotOperandLayout(op);
+        succeeded(ll))
+      if (std::optional<std::string> reason =
+              triton::getNpotAsyncCopyUnsupportedReason(op, *ll))
+        return op.emitError(*reason);
     auto ctx = getContext();
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -1005,10 +1062,13 @@ struct AsyncCopyGlobalToLocalOpConversion
       Value tid = getThreadId(rewriter, loc);
       Value pred = b.icmp_eq(tid, b.i32_val(0));
 
-      // Emit cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes
+      // The `.shared::cluster` destination (PTX 8.0) rather than `.shared::cta`
+      // (PTX 8.6), so ptxas 12.4 accepts it; a CTA's own shared address is a
+      // valid shared::cluster address.
       ::mlir::triton::PTXBuilder ptxBuilder;
       auto &bulkCopy = *ptxBuilder.create<>(
-          "@$0 cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
+          "@$0 "
+          "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
           "[$1], [$2], $3, [$4];");
       bulkCopy({ptxBuilder.newOperand(pred, "b"),
                 ptxBuilder.newOperand(dstBase, "r"),
@@ -1089,6 +1149,15 @@ struct AsyncCopyGlobalToLocalOpConversion
     maxVec = std::max(maxVec, op.getContiguity());
     // The maximum vector size is 128 bits on NVIDIA GPUs.
     maxVec = std::min(maxVec, 128 / resElemTy.getIntOrFloatBitWidth());
+    // A mixed-radix layout's odd digits add rather than XOR, so it doesn't
+    // compose with the shared layout: copy each run that is contiguous there.
+    std::optional<LinearLayout> toOffset;
+    if (!srcLayout.isRadix2()) {
+      toOffset = ttg::toLinearLayout(dstTy).pseudoinvert();
+      maxVec = std::min<unsigned>(
+          maxVec, ttg::getMixedRadixSharedRun(
+                      srcLayout, *toOffset, resElemTy.getIntOrFloatBitWidth()));
+    }
 
     int vecBytes = maxVec * resElemTy.getIntOrFloatBitWidth() / 8;
     if (vecBytes < 4) {
@@ -1106,20 +1175,41 @@ struct AsyncCopyGlobalToLocalOpConversion
     Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
                                                     targetInfo, op);
 
-    auto emitCpAsync = [&b, threadPred, ptrTy, hasMask = bool(llMask)](
-                           RewriterBase &rewriter, Location loc,
-                           ArrayRef<Value> vals, Value shmemAddr, int startIdx,
-                           VectorType vecTy,
-                           Value ctaId) -> SmallVector<Value> {
+    Value l2PolicyReg;
+    // Older ptxas versions miscompile cp.async with a fractional L2 policy.
+    // PTX 9.4 is a proxy for the fixed CUDA 13.4 toolchain.
+    if (targetInfo.getPtxVersion() >= 94) {
+      FailureOr<Value> l2Policy =
+          createCachePolicy(*cachePolicy, rewriter, loc, computeCapability, op);
+      if (failed(l2Policy))
+        return failure();
+      l2PolicyReg = *l2Policy;
+    }
+    auto l2PrefetchSizeAttr = cachePolicy->detailed
+                                  ? cachePolicy->detailed.getL2PrefetchSize()
+                                  : IntegerAttr();
+    int64_t l2PrefetchSize =
+        l2PrefetchSizeAttr ? l2PrefetchSizeAttr.getInt() : 0;
+
+    auto emitCpAsync = [&b, threadPred, ptrTy, l2PolicyReg, l2PrefetchSize,
+                        cacheModifier = cachePolicy->modifier,
+                        hasMask =
+                            bool(llMask)](RewriterBase &rewriter, Location loc,
+                                          ArrayRef<Value> vals, Value shmemAddr,
+                                          int startIdx, VectorType vecTy,
+                                          Value ctaId) -> SmallVector<Value> {
       assert(!ctaId && "cp.async does not support cross-cta loads");
       assert(isa<VectorType>(vecTy));
       auto *ctx = rewriter.getContext();
       auto elemTy = vecTy.getElementType();
       auto nBytes = vecTy.getNumElements() * elemTy.getIntOrFloatBitWidth() / 8;
       assert(nBytes == 16 || nBytes == 8 || nBytes == 4);
-      // Tune CG and CA.
+      // Prefer CG for 16-byte copies unless CA was explicitly requested.
+      // Smaller copies must use CA because CG only supports 16-byte transfers.
       CacheModifier srcCacheModifier =
-          nBytes == 16 ? CacheModifier::CG : CacheModifier::CA;
+          nBytes == 16 && cacheModifier != CacheModifier::CA
+              ? CacheModifier::CG
+              : CacheModifier::CA;
 
       auto structElem = vals[startIdx];
       auto srcElem = b.extract_val(ptrTy, structElem, 0);
@@ -1128,23 +1218,32 @@ struct AsyncCopyGlobalToLocalOpConversion
       PTXBuilder ptxBuilder;
       auto &copyAsyncOp =
           *ptxBuilder.create<PTXCpAsyncLoadInstr>(srcCacheModifier);
+      copyAsyncOp.o("L2::64B", l2PrefetchSize == 64)
+          .o("L2::128B", l2PrefetchSize == 128)
+          .o("L2::256B", l2PrefetchSize == 256)
+          .o("L2::cache_hint", l2PolicyReg != Value());
       auto *dstOperand = ptxBuilder.newAddrOperand(shmemAddr, "r");
       auto *srcOperand = ptxBuilder.newAddrOperand(srcElem, "l");
       auto *copySize = ptxBuilder.newConstantOperand(nBytes);
       auto *srcSize = copySize;
       if (hasMask) {
-        // We don't use predicate in this case, setting src-size to 0
-        // if there's any mask. cp.async will automatically fill the
-        // remaining slots with 0 if cp-size > src-size.
+        // We avoid predicating on the copy mask because it pessimizes ptxas.
+        // A masked copy still writes zeros to its shared-memory destination.
         // XXX(Keren): Always assume other = 0 for now.
         // When 'other != 0' is supported, we will need to fold the
         // op.getMask() and redundantDataMask() into the same predicate, the
         // way it is done for LoadOp.
-        auto selectOp = b.select(maskElem, b.i32_val(nBytes), b.i32_val(0));
-        srcSize = ptxBuilder.newOperand(selectOp, "r");
+        auto ignoreSrc = b.xor_(maskElem, b.true_val());
+        srcSize = ptxBuilder.newOperand(ignoreSrc, "b");
       }
-      copyAsyncOp(dstOperand, srcOperand, copySize, srcSize)
-          .maybePredicate(threadPred);
+      if (l2PolicyReg) {
+        auto *policyOperand = ptxBuilder.newOperand(l2PolicyReg, "l");
+        copyAsyncOp(dstOperand, srcOperand, copySize, srcSize, policyOperand)
+            .maybePredicate(threadPred);
+      } else {
+        copyAsyncOp(dstOperand, srcOperand, copySize, srcSize)
+            .maybePredicate(threadPred);
+      }
       ptxBuilder.launch(rewriter, loc, void_ty(ctx));
       return {};
     };
@@ -1152,16 +1251,19 @@ struct AsyncCopyGlobalToLocalOpConversion
     // %dst
     auto smemObj =
         getSharedMemoryObjectFromStruct(loc, llDst, resElemTy, rewriter);
-    auto smemLayout = ttg::toLinearLayout(dstTy);
-    if (srcLayout.isModular()) {
-      auto allocShape = ttg::getAllocationShapePerCTA(dstTy);
-      smemLayout = ttg::toLinearLayout(allocShape, dstTy.getEncoding());
-      SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
-      for (auto dim : srcLayout.getOutDimNames())
-        paddedOutDims.push_back({dim, smemLayout.getOutDimSize(dim)});
-      srcLayout = LinearLayout(srcLayout.getBases(), paddedOutDims,
-                               /*requireSurjective=*/false);
+    if (toOffset) {
+      auto smemPtrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
+      ttg::forEachMixedRadixSharedRun(
+          loc, rewriter, srcLayout, *toOffset, maxVec,
+          [&](int32_t reg, Value offset, auto) {
+            emitCpAsync(rewriter, loc, vals,
+                        b.gep(smemPtrTy, resElemTy, smemObj.getBase(), offset),
+                        reg, vec_ty(resElemTy, maxVec), Value());
+          });
+      rewriter.replaceOp(op, b.i32_val(0));
+      return success();
     }
+    auto smemLayout = ttg::toLinearLayout(dstTy);
     auto cvt = srcLayout.invertAndCompose(smemLayout);
     if (!cvt.isTrivialOver({str_attr("block")})) {
       return emitError(loc,
@@ -1196,9 +1298,31 @@ static LinearLayout getMsgToPackedOffsetLayout(ttg::MemDescType ty,
   auto outDimNames = standardOutDimNames(ctx, rank);
   LinearLayout msgToOffset;
   for (int dim = 0; dim < rank; ++dim) {
-    msgToOffset *=
-        LinearLayout::strided1D(shapePerCTA[dim] / blockShape[dim],
-                                blockShape[dim], kMsg, outDimNames[dim]);
+    int64_t box = blockShape[dim];
+    int32_t numMsgs = shapePerCTA[dim] / box;
+    int32_t twoPart = LinearLayout::twoPartOf(numMsgs);
+    // getNpotTMAUnsupportedReason allows an NPOT box only as the whole extent,
+    // and an odd message count as one more mixed-radix digit of stride
+    // twoPart * box.
+    if (llvm::isPowerOf2_64(box)) {
+      msgToOffset *=
+          LinearLayout::strided1D(twoPart, box, kMsg, outDimNames[dim]);
+    } else {
+      LinearLayout::BasesT oneMsg;
+      oneMsg[kMsg] = {};
+      msgToOffset *= LinearLayout(std::move(oneMsg), LinearLayout::RadicesT(),
+                                  {{outDimNames[dim], box}},
+                                  /*requireSurjective=*/false);
+    }
+    if (numMsgs != twoPart) {
+      LinearLayout::BasesT bases;
+      bases[kMsg] = {{1}};
+      LinearLayout::RadicesT radices;
+      radices[kMsg] = {numMsgs / twoPart};
+      msgToOffset *= LinearLayout(std::move(bases), std::move(radices),
+                                  {{outDimNames[dim], numMsgs / twoPart}},
+                                  /*requireSurjective=*/true);
+    }
   }
   auto cgaLayout = getCGALayout(ty.getEncoding());
   // The memdesc shape rank may exceed the encoding's CGALayout rank (the
@@ -1234,6 +1358,21 @@ getMsgToUnpackedOffsetLayout(const LinearLayout &packedLayout,
   return unpackLayout * packedLayout;
 }
 
+// A mixed-radix plan's odd message-index digit adds rather than XORs, so it
+// doesn't compose with the shared layout: `msgToShared` is then the layout's
+// inverse, applied to the message's coordinates.
+static SmallVector<std::pair<StringAttr, Value>>
+applyMsgToShared(Location loc, RewriterBase &rewriter,
+                 const LinearLayout &msgToShared,
+                 const LinearLayout *mixedRadixPlan, Value msg, Value ctaId) {
+  auto ctx = rewriter.getContext();
+  SmallVector<std::pair<StringAttr, Value>> ins = {{str_attr("msg"), msg},
+                                                   {str_attr("block"), ctaId}};
+  if (mixedRadixPlan)
+    ins = applyLinearLayout(loc, rewriter, *mixedRadixPlan, ins);
+  return applyLinearLayout(loc, rewriter, msgToShared, ins);
+}
+
 struct AsyncTMACopyGlobalToLocalOpConversion
     : public ConvertOpToLLVMPattern<
           triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp> {
@@ -1262,8 +1401,13 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
     // Create L2 cache policy register if eviction policy is specified
-    Value l2PolicyReg =
-        createCachePolicy(op.getEvict(), rewriter, loc, computeCapability);
+    CachePolicy policy;
+    policy.legacy = op.getEvict();
+    FailureOr<Value> l2Policy =
+        createCachePolicy(policy, rewriter, loc, computeCapability, op);
+    if (failed(l2Policy))
+      return failure();
+    Value l2PolicyReg = *l2Policy;
 
     ttg::MemDescType dstTy = op.getResult().getType();
     Type llvmElemTy = typeConverter->convertType(dstTy.getElementType());
@@ -1292,15 +1436,18 @@ struct AsyncTMACopyGlobalToLocalOpConversion
 
     int rank = op.getCoord().size();
 
+    auto ctx = op.getContext();
+    auto kBlock = str_attr("block");
     auto msgToPackedOffset = getMsgToPackedOffsetLayout(smemTy, tmaMode);
     auto smemLayout = ttg::toLinearLayout(smemTy);
+    bool mixedRadixPlan = !msgToPackedOffset.isRadix2();
     auto msgToShared =
-        invertAndComposeBlockLocal(smemLayout, msgToPackedOffset);
+        mixedRadixPlan
+            ? smemLayout.pseudoinvert()
+            : invertAndComposeLocal(smemLayout, msgToPackedOffset, {kBlock});
     auto msgToOffset = getMsgToUnpackedOffsetLayout(msgToPackedOffset, smemTy);
 
-    auto ctx = op.getContext();
     auto kMsg = str_attr("msg");
-    auto kBlock = str_attr("block");
     auto kOffset = str_attr("offset");
     const auto numCopies = msgToOffset.getInDimSize(kMsg);
     auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
@@ -1350,8 +1497,9 @@ struct AsyncTMACopyGlobalToLocalOpConversion
           b.and_(pred, b.icmp_ult(id, b.i32_val(numWarpsToCopy * warpSize)));
       ::mlir::triton::PTXBuilder ptxBuilderTMA;
       Value copyIdxVal = b.add(warpID, b.i32_val(copyIdx));
-      auto sharedAddress = applyLinearLayout(
-          loc, rewriter, msgToShared, {{kMsg, copyIdxVal}, {kBlock, ctaId}});
+      auto sharedAddress = applyMsgToShared(
+          loc, rewriter, msgToShared,
+          mixedRadixPlan ? &msgToPackedOffset : nullptr, copyIdxVal, ctaId);
       Value shMemOffset;
       Value layoutBlock;
       for (auto [name, value] : sharedAddress) {
@@ -1481,8 +1629,13 @@ struct AsyncTMAPrefetchOpConversion
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
-    Value l2PolicyReg =
-        createCachePolicy(op.getEvict(), rewriter, loc, computeCapability);
+    CachePolicy policy;
+    policy.legacy = op.getEvict();
+    FailureOr<Value> l2Policy =
+        createCachePolicy(policy, rewriter, loc, computeCapability, op);
+    if (failed(l2Policy))
+      return failure();
+    Value l2PolicyReg = *l2Policy;
 
     int rank = op.getCoord().size();
     Value pred = adaptor.getPred();
@@ -1607,7 +1760,10 @@ convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
   auto msgToPackedOffset =
       getMsgToPackedOffsetLayout(srcTy, ttg::TMAMode::Tiled);
   auto smemLayout = ttg::toLinearLayout(srcTy);
-  auto msgToShared = msgToPackedOffset.invertAndCompose(smemLayout);
+  bool mixedRadixPlan = !msgToPackedOffset.isRadix2();
+  auto msgToShared = mixedRadixPlan
+                         ? smemLayout.pseudoinvert()
+                         : msgToPackedOffset.invertAndCompose(smemLayout);
   auto msgToOffset = getMsgToUnpackedOffsetLayout(msgToPackedOffset, srcTy);
 
   auto ctx = op->getContext();
@@ -1635,8 +1791,9 @@ convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
     Type elemPtrTy = ptr_ty(rewriter.getContext(), 3);
     Value copyIdxVal = b.add(warpID, b.i32_val(copyIdx));
     Value shMemOffset =
-        applyLinearLayout(loc, rewriter, msgToShared,
-                          {{kMsg, copyIdxVal}, {kBlock, ctaId}})[0]
+        applyMsgToShared(loc, rewriter, msgToShared,
+                         mixedRadixPlan ? &msgToPackedOffset : nullptr,
+                         copyIdxVal, ctaId)[0]
             .second;
     Value shMemPtr = b.gep(elemPtrTy, llvmElemTy, dstBase, shMemOffset);
     SmallVector<PTXBuilder::Operand *> operands = {
@@ -1696,8 +1853,13 @@ struct AsyncTMACopyLocalToGlobalOpConversion
     auto loc = op->getLoc();
 
     // Create L2 cache policy register if eviction policy is specified
-    Value l2PolicyReg =
-        createCachePolicy(op.getEvict(), rewriter, loc, computeCapability);
+    CachePolicy policy;
+    policy.legacy = op.getEvict();
+    FailureOr<Value> l2Policy =
+        createCachePolicy(policy, rewriter, loc, computeCapability, op);
+    if (failed(l2Policy))
+      return failure();
+    Value l2PolicyReg = *l2Policy;
 
     std::ostringstream tmaInst;
     auto rank = op.getCoord().size();
@@ -1740,8 +1902,13 @@ struct AsyncTMAReduceOpConversion
     auto loc = op->getLoc();
 
     // Create L2 cache policy register if eviction policy is specified
-    Value l2PolicyReg =
-        createCachePolicy(op.getEvict(), rewriter, loc, computeCapability);
+    CachePolicy policy;
+    policy.legacy = op.getEvict();
+    FailureOr<Value> l2Policy =
+        createCachePolicy(policy, rewriter, loc, computeCapability, op);
+    if (failed(l2Policy))
+      return failure();
+    Value l2PolicyReg = *l2Policy;
 
     std::ostringstream tmaInst;
     auto rank = op.getCoord().size();
@@ -1850,10 +2017,12 @@ static LogicalResult iterateGatherScatterIndices(
   // `xCoordsLayout` maps the register ID into dim0. Tile dim1 by adding a new
   // dimension representing the TMA message ID.
   assert(innerBlockSize % numMessagesPerRow == 0);
-  assert(llvm::isPowerOf2_32(numMessagesPerRow));
   unsigned msgSize = innerBlockSize / numMessagesPerRow;
-  LinearLayout msgToCol =
-      LinearLayout::strided1D(numMessagesPerRow, msgSize, kMsg, kDim1);
+  // An NPOT row is whole boxes (getNpotTMAUnsupportedReason) of the pow2 alloc
+  // shape that the shared layout spans, so plan the pow2 alloc shape's messages
+  // and issue the first numMessagesPerRow.
+  LinearLayout msgToCol = LinearLayout::strided1D(
+      llvm::PowerOf2Ceil(numMessagesPerRow), msgSize, kMsg, kDim1);
   LinearLayout msgToOffset =
       getMsgToPackedOffsetLayout(smemType, ttg::TMAMode::Tiled);
   LinearLayout msgLayout = xCoordsLayout * msgToCol;
@@ -1862,7 +2031,7 @@ static LogicalResult iterateGatherScatterIndices(
     basis.back() = msgToOffset.getBasis(kBlock, bit, kDim1);
   auto msgOutDims = msgLayout.getOutDims();
   msgOutDims[msgLayout.getOutDimIndex(kDim1)].second =
-      smemType.getShape().back();
+      llvm::PowerOf2Ceil(smemType.getShape().back());
   msgLayout = LinearLayout(std::move(msgBases), msgOutDims,
                            /*requireSurjective=*/false);
 
@@ -1872,7 +2041,7 @@ static LogicalResult iterateGatherScatterIndices(
   // of the 0th element of row 4 will not be at the start of the segment.
   LinearLayout sharedLayout = getUnswizzledLayout(smemType);
   LinearLayout msgToShared =
-      invertAndComposeBlockLocal(sharedLayout, msgLayout);
+      invertAndComposeLocal(sharedLayout, msgLayout, {kBlock});
 
   // If there are too few rows, warps will have redundant data.
   auto freeVars = xCoordsLayout.getFreeVariableMasks();
@@ -2184,10 +2353,22 @@ struct AsyncStoreOpConversion
     Value pred = b.icmp_eq(tid, b.i32_val(0));
 
     // @pred cp.async.bulk.global.shared::cta.bulk_group [$1], [$2], $3;
+    // or, for a reduction (no tensor map):
+    // @pred cp.reduce.async.bulk.global.shared::cta.bulk_group.<op>.<type> ...
+    std::string inst = "@$0 cp.async.bulk.global.shared::cta.bulk_group";
+    auto kind = op.getStoreReduce();
+    if (kind != triton::DescriptorReduceKind::NONE) {
+      FailureOr<std::string> ptxType =
+          triton::nvidia_gpu::AsyncStoreOp::getReducePtxType(
+              kind, srcTy.getElementType(), op.getStoreReduceSigned());
+      if (failed(ptxType))
+        return op.emitOpError("unsupported bulk reduction");
+      inst = "@$0 cp.reduce.async.bulk.global.shared::cta.bulk_group." +
+             stringifyDescriptorReduceKind(kind).str() + "." + *ptxType;
+    }
+    inst += " [$1], [$2], $3;";
     ::mlir::triton::PTXBuilder ptxBuilder;
-    auto &bulkCopy =
-        *ptxBuilder.create<>("@$0 cp.async.bulk.global.shared::cta.bulk_group "
-                             "[$1], [$2], $3;");
+    auto &bulkCopy = *ptxBuilder.create<>(inst);
     bulkCopy(
         {ptxBuilder.newOperand(pred, "b"), ptxBuilder.newOperand(dstPtr, "l"),
          ptxBuilder.newOperand(srcBase, "r"), ptxBuilder.newOperand(size, "r")},

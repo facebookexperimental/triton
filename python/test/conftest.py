@@ -14,6 +14,10 @@ def pytest_configure(config):
         config.option.instafail = True
 
 
+# Set once a test leaves this process's GPU context unusable (see _gpu_cleanup).
+_gpu_context_broken = False
+
+
 @pytest.fixture(autouse=True)
 def _gpu_cleanup():
     """Clean up GPU memory between tests to prevent accumulation in bundle mode.
@@ -22,17 +26,30 @@ def _gpu_cleanup():
     cleanup, GPU memory from compiled Triton kernels and torch tensors
     accumulates across tests, leading to OOM. This fixture ensures each test
     starts with a clean GPU state.
+
+    It also checks that the GPU context still works. A sticky device error,
+    such as an illegal memory access or a device-side assertion, makes every
+    later GPU call in the process fail, so later tests would fail with it too.
     """
+    global _gpu_context_broken
     yield
     gc.collect()
     if torch.cuda.is_available():
         try:
             torch.cuda.empty_cache()
+            torch.ones(1, device="cuda").sum().item()
         except torch.AcceleratorError:
-            # CUDA context may be in an error state after tests that
-            # intentionally trigger device-side assertions (e.g. py_debug_test).
-            # Silently skip cleanup — the next test will reset the context.
-            pass
+            _gpu_context_broken = True
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    yield
+    if _gpu_context_broken and os.environ.get("PYTEST_XDIST_WORKER"):
+        # The context cannot recover in this process. Exiting now, before the
+        # worker reports this test complete, makes pytest-xdist report it as
+        # having crashed the worker and run the remaining tests in a new one.
+        os._exit(1)
 
 
 def pytest_addoption(parser):

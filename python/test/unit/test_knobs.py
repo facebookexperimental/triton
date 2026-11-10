@@ -1,4 +1,5 @@
 import os
+import re
 import pytest
 import shutil
 import sys
@@ -8,6 +9,8 @@ from triton._C.libtriton import get_cache_invalidating_env_vars  # type: ignore[
 from triton._internal_testing import is_hip
 
 from pathlib import Path
+
+from triton.backends.compiler import GPUTarget
 
 
 def test_knobs_utils(fresh_knobs) -> None:
@@ -72,15 +75,16 @@ def test_knobs_utils(fresh_knobs) -> None:
 
 
 # Beta enables expert scheduling on gfx1250 by default; upstream does not.
-@pytest.mark.parametrize(("arch", "enable_fp_fusion", "disable_opt", "expected_flags", "disable_optimization"), [
-    ("gfx90a", True, None, [], False),
-    ("gfx942", False, "1", ["amdgpu-use-amdgpu-trackers"], True),
-    ("gfx950", True, "disable-lsr", ["amdgpu-use-amdgpu-trackers"], False),
-    ("gfx1250", True, "0", ["amdgpu-expert-scheduling-mode"], False),
-])
-def test_amd_codegen_options(arch, enable_fp_fusion, disable_opt, expected_flags, disable_optimization, fresh_knobs,
-                             monkeypatch):
-    from triton.backends.compiler import GPUTarget
+@pytest.mark.parametrize(
+    ("arch", "enable_fp_fusion", "disable_opt", "expected_flags", "disable_optimization", "extra_options"), [
+        ("gfx90a", True, None, [], False, {}),
+        ("gfx942", False, "1", ["amdgpu-use-amdgpu-trackers"], True, {}),
+        ("gfx950", True, "disable-lsr", ["amdgpu-use-amdgpu-trackers"], False, {}),
+        ("gfx1250", True, "0", ["amdgpu-anti-hints-for-va-vdst", "amdgpu-expert-scheduling-mode"], False, {}),
+        ("gfx1250", True, "0", ["amdgpu-expert-scheduling-mode"], False, {"va_vdst_anti_hints": False}),
+    ])
+def test_amd_codegen_options(arch, enable_fp_fusion, disable_opt, expected_flags, disable_optimization, extra_options,
+                             fresh_knobs, monkeypatch):
     from triton.backends.amd import compiler
 
     calls = []
@@ -97,7 +101,7 @@ def test_amd_codegen_options(arch, enable_fp_fusion, disable_opt, expected_flags
 
     warp_size = 32 if arch == "gfx1250" else 64
     backend = compiler.HIPBackend(GPUTarget("hip", arch, warp_size))
-    options = compiler.HIPOptions(arch=arch, enable_fp_fusion=enable_fp_fusion)
+    options = compiler.HIPOptions(arch=arch, enable_fp_fusion=enable_fp_fusion, **extra_options)
     source = "define amdgpu_kernel void @test_kernel() { ret void }"
     metadata = {}
     assembly = backend.make_amdgcn(source, metadata, options)
@@ -129,7 +133,6 @@ def test_amd_codegen_path_override(fresh_knobs, monkeypatch):
 
 
 def test_amd_codegen_revision_invalidates_backend_hash(fresh_knobs, monkeypatch):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     monkeypatch.setattr(compiler, "get_amd_codegen_revision", lambda: "first-revision-1")
@@ -144,7 +147,6 @@ def test_amd_codegen_revision_invalidates_backend_hash(fresh_knobs, monkeypatch)
 
 
 def test_amd_codegen_inlines_functions_from_bitcode(fresh_knobs, monkeypatch):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     source = '''
@@ -198,8 +200,56 @@ def test_amd_codegen_options_restored(option, capfd, fresh_knobs):
     assert not capfd.readouterr().err
 
 
+def test_amd_codegen_explicit_flag_values_restored(fresh_knobs):
+    compiler = pytest.importorskip("triton.backends.amd.compiler")
+    try:
+        compiler._load_amd_codegen(compiler.get_amd_codegen_path())
+    except OSError:
+        pytest.skip("AMD code-generation library is unavailable")
+
+    source = '''
+declare i32 @llvm.amdgcn.workitem.id.x()
+declare <16 x float> @llvm.amdgcn.mfma.scale.f32.32x32x64.f8f6f4.v8i32.v8i32(
+    <8 x i32>, <8 x i32>, <16 x float>, i32 immarg, i32 immarg, i32 immarg, i32, i32 immarg, i32)
+
+define amdgpu_kernel void @mfma_kernel(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %out) {
+  %lane = call i32 @llvm.amdgcn.workitem.id.x()
+  %a_ptr = getelementptr <8 x i32>, ptr addrspace(1) %a, i32 %lane
+  %b_ptr = getelementptr <8 x i32>, ptr addrspace(1) %b, i32 %lane
+  %a_value = load <8 x i32>, ptr addrspace(1) %a_ptr, align 8
+  %b_value = load <8 x i32>, ptr addrspace(1) %b_ptr, align 8
+  %seed = call <16 x float> asm sideeffect "", "=a,0"(<16 x float> zeroinitializer)
+  %result = call <16 x float> @llvm.amdgcn.mfma.scale.f32.32x32x64.f8f6f4.v8i32.v8i32(
+      <8 x i32> %a_value, <8 x i32> %b_value, <16 x float> %seed,
+      i32 0, i32 0, i32 0, i32 127, i32 0, i32 127)
+  %committed = call <16 x float> asm sideeffect "", "=a,0"(<16 x float> %result)
+  %out_ptr = getelementptr <16 x float>, ptr addrspace(1) %out, i32 %lane
+  store <16 x float> %committed, ptr addrspace(1) %out_ptr, align 16
+  ret void
+}
+'''
+
+    def emit(flags):
+        return compiler.compile_amdgpu(source, compiler.amd.get_target_triple("gfx950"), "gfx950", "", flags=flags,
+                                       enable_fp_fusion=True, disable_optimization=False, canonicalize_gep=False,
+                                       disabled_passes="", dump_ir=False, enable_timing=False)
+
+    baseline = emit([])
+    flag = "amdgpu-mfma-vgpr-form"
+    opcode = "v_mfma_scale_f32_32x32x64_f8f6f4"
+    assert opcode in baseline
+    for value in (flag, f"{flag}=true"):
+        assert emit([value]) == baseline
+    agpr = emit([f"{flag}=false"])
+    assert opcode in agpr
+    baseline_vgprs = re.search(r"\.amdhsa_next_free_vgpr\s+(\d+)", baseline)
+    agpr_vgprs = re.search(r"\.amdhsa_next_free_vgpr\s+(\d+)", agpr)
+    assert baseline_vgprs is not None and agpr_vgprs is not None
+    assert int(agpr_vgprs.group(1)) < int(baseline_vgprs.group(1))
+    assert emit([]) == baseline
+
+
 def test_amd_codegen_reports_invalid_llvm_ir(fresh_knobs):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     source = "define amdgpu_kernel void @invalid_kernel() { invalid }"
@@ -209,7 +259,6 @@ def test_amd_codegen_reports_invalid_llvm_ir(fresh_knobs):
 
 
 def test_amd_codegen_assembles_object_with_private_llvm(fresh_knobs):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     source = '''
@@ -228,12 +277,13 @@ define amdgpu_kernel void @object_kernel() {
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_amd_codegen_respects_mir_dump_knob(enabled, fresh_knobs, monkeypatch, tmp_path):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     events = []
-    monkeypatch.setattr(compiler.llvm, "translate_to_mir", lambda *args: events.append("mir"))
-    monkeypatch.setattr(compiler.llvm, "dump_sched_dag", lambda *args: events.append("dag"))
+    # One call, not two: translate_to_mir dumps the MIR and, from that same
+    # MachineFunction, the scheduling DAG appended after the marker. The knob
+    # gates that single call.
+    monkeypatch.setattr(compiler, "translate_to_mir", lambda *args: events.append("mir"))
     monkeypatch.setattr(compiler, "compile_amdgpu", lambda *args, **kwargs: "s_endpgm")
     backend = compiler.HIPBackend(GPUTarget("hip", "gfx942", 64))
     source = "define amdgpu_kernel void @test_kernel() { ret void }"
@@ -245,11 +295,10 @@ def test_amd_codegen_respects_mir_dump_knob(enabled, fresh_knobs, monkeypatch, t
             fresh_knobs.amd.dump_mir = None
         backend.make_amdgcn(source, {}, compiler.HIPOptions(arch="gfx942"))
 
-    assert events == (["mir", "dag"] if enabled else [])
+    assert events == (["mir"] if enabled else [])
 
 
 def test_amd_codegen_preserves_mir_replacement(fresh_knobs, monkeypatch):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     replacement_calls = []
@@ -258,7 +307,7 @@ def test_amd_codegen_preserves_mir_replacement(fresh_knobs, monkeypatch):
         replacement_calls.append((path, args))
         return ".text\n.globl test_kernel\ntest_kernel:\n  s_endpgm\n"
 
-    monkeypatch.setattr(compiler.llvm, "translate_mir_to_asm", replace_mir)
+    monkeypatch.setattr(compiler, "translate_mir_to_asm", replace_mir)
     monkeypatch.setattr(compiler, "compile_amdgpu", lambda *args, **kwargs: pytest.fail("MIR replacement bypassed"))
     backend = compiler.HIPBackend(GPUTarget("hip", "gfx942", 64))
     source = "define amdgpu_kernel void @test_kernel() { ret void }"
@@ -363,6 +412,7 @@ def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
     assert not fresh_knobs.runtime.debug
     # bool defaulting to True
     assert fresh_knobs.language.default_fp_fusion
+    assert not fresh_knobs.language.force_disable_fp_fusion
     # str defaulting to None
     assert fresh_knobs.compilation.use_ir_loc is None
     # str defaulting to not None
@@ -373,6 +423,7 @@ def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
     assert len(fresh_knobs.build.backend_dirs) == 0
 
     monkeypatch.setenv("TRITON_DEFAULT_FP_FUSION", falsey)
+    monkeypatch.setenv("TRITON_FORCE_DISABLE_FP_FUSION", truthy)
     monkeypatch.setenv("TRITON_DEBUG", truthy)
     monkeypatch.setenv("USE_IR_LOC", "ttir")
     monkeypatch.setenv("TRITON_CACHE_DIR", "/tmp/triton_cache")
@@ -384,6 +435,7 @@ def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
     triton.knobs.refresh_knobs()
     assert fresh_knobs.runtime.debug
     assert not fresh_knobs.language.default_fp_fusion
+    assert fresh_knobs.language.force_disable_fp_fusion
     assert fresh_knobs.compilation.use_ir_loc == "ttir"
     assert fresh_knobs.cache.home_dir == "/tmp/triton_home"
     assert fresh_knobs.cache.dir == "/tmp/triton_cache"
@@ -398,7 +450,6 @@ def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
 
 
 def _register_pressure_scheduler_kernel():
-    from triton.backends.compiler import GPUTarget
     from triton.backends.nvidia import compiler
 
     compiler.llvm.init_targets()
@@ -408,7 +459,7 @@ def _register_pressure_scheduler_kernel():
     for lane in range(32):
         arithmetic.extend([
             f"  %seed{lane} = add i32 %seed, {lane + 1}",
-            f"  %high{lane} = mul i32 %seed{lane}, -766435501",
+            f"  %high{lane} = call i32 @llvm.umulh.i32(i32 %seed{lane}, i32 -766435501)",
             f"  %low{lane} = mul i32 %seed{lane}, -845247145",
             f"  %value{lane} = xor i32 %high{lane}, %low{lane}",
         ])
@@ -418,6 +469,7 @@ def _register_pressure_scheduler_kernel():
         ])
 
     source = ('target triple = "nvptx64-nvidia-cuda"\n'
+              'declare i32 @llvm.umulh.i32(i32, i32)\n'
               'define ptx_kernel void @scheduler_kernel(ptr addrspace(1) %out, i32 %seed) {\n' +
               "\n".join(arithmetic + stores) + "\n  ret void\n}\n")
     return backend, source
@@ -439,7 +491,6 @@ def test_nvidia_register_pressure_scheduler_hook(link_hip_first, fresh_triton_ca
 
 
 def _nvidia_short_pointer_kernel():
-    from triton.backends.compiler import GPUTarget
     from triton.backends.nvidia import compiler
 
     compiler.llvm.init_targets()
@@ -459,8 +510,7 @@ define ptx_kernel void @short_pointer_kernel(ptr addrspace(1) %out, i64 %offset)
 
 @pytest.mark.skipif(is_hip(), reason="NVPTX code generation is unavailable on AMD")
 @pytest.mark.parametrize("link_hip_first", [False, True])
-def test_nvidia_short_pointer_option(link_hip_first, fresh_triton_cache):
-    from triton.backends.compiler import GPUTarget
+def test_nvidia_short_pointer_abi(link_hip_first, fresh_triton_cache):
 
     if link_hip_first:
         # HIP linking resets every LLVM command-line option.
@@ -473,6 +523,7 @@ def test_nvidia_short_pointer_option(link_hip_first, fresh_triton_cache):
     compiled = triton.compile(triton.compiler.ASTSource(empty_kernel, {}), target=GPUTarget("cuda", 90, 32))
     data_layout = next(line for line in compiled.asm["llir"].splitlines() if line.startswith("target datalayout"))
     assert "p3:32:32" in data_layout
+    assert "p5:32:32" in data_layout
 
     backend, source = _nvidia_short_pointer_kernel()
     options = backend.parse_options({"ptx_version": 80})
@@ -482,7 +533,6 @@ def test_nvidia_short_pointer_option(link_hip_first, fresh_triton_cache):
 
 
 def _compile_empty_hip_kernel(arch, warp_size):
-    from triton.backends.compiler import GPUTarget
 
     @triton.jit
     def empty_kernel():
@@ -512,7 +562,6 @@ def _amd_scheduler_kernel():
 
 
 def test_amd_llvm_options_concurrent():
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     compiler.llvm.init_targets()

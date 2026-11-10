@@ -16,12 +16,24 @@ the column coordinate.
 - Tiles are claimed dynamically: the producer takes the next tile index from a
   global atomic counter, two key blocks before it finishes issuing the current
   tile, and hands it to the consumers through a small shared memory ring. Programs
-  that draw short key lengths therefore take more tiles. A tile whose first row
-  is past its sequence's end is never handed out.
+  that draw short key lengths therefore take more tiles.
+- A one-program kernel launched first writes the schedule: sequences ranked
+  longest key side first, and the first tile of each rank. Claim ``t`` maps to
+  its tile by a binary search over those first tiles, so the longest tiles go
+  out first and the last wave is made of short ones. Only tiles that hold query
+  rows are scheduled. The same kernel zeroes the claim counter.
+- When K and V are one tensor, as when a ranking model passes the same history
+  as both, each key block is loaded once and serves as K for QK and as V for PV.
+- Key blocks that every row of a tile sees run in a loop without the score mask.
 - A key block that straddles a sequence end reads the next sequence's rows;
   those scores are masked to ``-inf`` before the softmax, so they weigh 0.
 - The last query tile of a sequence is written with a row mask, because a TMA
   store would spill into the next sequence's rows.
+- The output is a single pointer argument. Full tiles are stored through a TMA
+  descriptor that the kernel builds from that pointer, so a traced launch, where
+  Inductor copies each mutated argument separately, keeps the TMA store. The
+  descriptor is written to a slot of a small buffer the launch passes in rather
+  than to Triton's global scratch, so no launch path needs a Triton allocator.
 """
 
 import functools
@@ -30,6 +42,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from torch._library.triton import wrap_triton
 from torch._subclasses.fake_tensor import FakeTensor
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -43,6 +56,15 @@ CONSUMER_REGISTERS = 240
 LOG2E = 1.4426950408889634
 NUM_TILE_BUFFERS = 3
 CLAIM_AHEAD = 2
+TMA_STORE = True
+# Sequences per launch that the schedule ranks by key length; a larger batch keeps index order.
+MAX_SORTED_SEQS = 32
+
+
+@tl.core.builtin
+def _descriptor_slots(ptr, num, _semantic=None):
+    """``num`` 128-byte tensor descriptor slots starting at ``ptr``, indexed like ``tlx.allocate_tensor_descriptor``."""
+    return tlx.tensor_descriptor_ptr(ptr.handle, tl.core._unwrap_if_constexpr(num), 128)
 
 
 @triton.jit
@@ -60,6 +82,59 @@ def _tile_info(tile_idx, CuQ, CuK, H, kv_group, num_m_blocks, BLOCK_M: tl.conste
     if CAUSAL:
         hi = tl.maximum(tl.minimum(k_len, (m_block + 1) * BLOCK_M + k_len - q_len), 0)
     return off_h, off_h // kv_group, q_start, q_len, k_start, k_len, m_block, tl.cdiv(hi, BLOCK_N)
+
+
+@triton.jit
+def _schedule(CuQ, CuK, Sched, batch, H, BLOCK_M: tl.constexpr, MAX_SORTED: tl.constexpr):
+    """Fill ``Sched`` with [tile counter, tile count, sequence of each rank, first tile of each rank].
+
+    Ranks put the longest key side first (ties in index order), so the persistent programs claim the longest tiles
+    first and the last wave is made of short ones. Only tiles that hold query rows are counted.
+    """
+    tl.store(Sched, 0)
+    seq = Sched + 2
+    first = Sched + 2 + batch
+    if batch <= MAX_SORTED:
+        i = tl.arange(0, MAX_SORTED)
+        ok = i < batch
+        q_len = tl.load(CuQ + i + 1, mask=ok, other=0) - tl.load(CuQ + i, mask=ok, other=0)
+        k_len = tl.where(ok, tl.load(CuK + i + 1, mask=ok, other=0) - tl.load(CuK + i, mask=ok, other=0), -1)
+        tiles = H * tl.cdiv(q_len, BLOCK_M)
+        # ahead[i, j]: sequence j is ranked before sequence i.
+        ahead = (k_len[None, :] > k_len[:, None]) | ((k_len[None, :] == k_len[:, None]) & (i[None, :] < i[:, None]))
+        rank = tl.sum(ahead.to(tl.int32), 1)
+        tl.store(seq + rank, i, mask=ok)
+        tl.store(first + rank, tl.sum(tl.where(ahead, tiles[None, :], 0), 1), mask=ok)
+        tl.store(Sched + 1, tl.sum(tiles, 0))
+    else:
+        total = 0
+        for c in range(0, batch, MAX_SORTED):
+            i = c + tl.arange(0, MAX_SORTED)
+            ok = i < batch
+            tiles = H * tl.cdiv(tl.load(CuQ + i + 1, mask=ok, other=0) - tl.load(CuQ + i, mask=ok, other=0), BLOCK_M)
+            tl.store(seq + i, i, mask=ok)
+            tl.store(first + i, total + tl.cumsum(tiles, 0) - tiles, mask=ok)
+            total += tl.sum(tiles, 0)
+        tl.store(Sched + 1, total)
+
+
+@triton.jit
+def _physical_tile(t, Sched, CuQ, batch, H, num_m_blocks, BLOCK_M: tl.constexpr):
+    """The ``_tile_info`` index of the ``t``-th scheduled tile; its rank is found by binary search over first tiles."""
+    first = Sched + 2 + batch
+    step = 1
+    while step * 2 <= batch:
+        step *= 2
+    r = 0
+    while step > 0:
+        cand = r + step
+        start = tl.load(first + cand, mask=cand < batch, other=t + 1)
+        r = tl.where(start <= t, cand, r)
+        step = step // 2
+    b = tl.load(Sched + 2 + r)
+    local = t - tl.load(first + r)
+    m_blocks = tl.cdiv(tl.load(CuQ + b + 1) - tl.load(CuQ + b), BLOCK_M)
+    return (b * H + local // m_blocks) * num_m_blocks + local % m_blocks
 
 
 @triton.jit
@@ -86,6 +161,46 @@ def _softmax_step(qk, m_i, l_i, qk_scale):
 
 
 @triton.jit
+def _kv_block(blk, accum_cnt_kv, acc, m_i, l_i, p, q_tile, k_tiles, v_tiles, k_fulls, k_empties, v_fulls, v_empties,
+              k_len, offs_m, causal_off, full_cols, qk_scale, p_dtype: tl.constexpr, cid: tl.constexpr,
+              NUM_BUFFERS: tl.constexpr, BLOCK_N: tl.constexpr, CAUSAL: tl.constexpr, SERIALIZE_QK: tl.constexpr,
+              KV_SAME: tl.constexpr, APPLY_MASK: tl.constexpr):
+    """QK of key block ``blk`` overlapped with PV of block ``blk - 1``, then the softmax update of ``blk``."""
+    k_buf_id, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
+    tlx.barrier_wait(k_fulls[k_buf_id], k_phase)
+    k_tile = tlx.local_trans(k_tiles[k_buf_id])
+    if SERIALIZE_QK:
+        if cid == 0:
+            tlx.named_barrier_wait(9, 256)
+        else:
+            tlx.named_barrier_wait(10, 256)
+    qk = tlx.async_dot(q_tile, k_tile)
+    if SERIALIZE_QK:
+        if cid == 0:
+            tlx.named_barrier_arrive(10, 256)
+        else:
+            tlx.named_barrier_arrive(9, 256)
+
+    # pv of the previous block overlaps this block's qk
+    v_buf_id, v_phase = get_bufidx_phase(accum_cnt_kv - 1, NUM_BUFFERS)
+    if not KV_SAME:
+        tlx.barrier_wait(v_fulls[v_buf_id], v_phase)
+    acc = tlx.async_dot(p.to(p_dtype), v_tiles[v_buf_id], acc)
+
+    qk = tlx.async_dot_wait(1, qk)
+    if APPLY_MASK:
+        qk = _mask_scores(qk, blk * BLOCK_N, k_len, offs_m, causal_off, full_cols, BLOCK_N, CAUSAL)
+    if not KV_SAME:
+        tlx.barrier_arrive(k_empties[k_buf_id], 1)
+    m_i, l_i, p, alpha = _softmax_step(qk, m_i, l_i, qk_scale)
+
+    acc = tlx.async_dot_wait(0, acc)
+    tlx.barrier_arrive(v_empties[v_buf_id], 1)
+    acc = acc * alpha[:, None]
+    return acc, m_i, l_i, p, accum_cnt_kv + 1
+
+
+@triton.jit
 def _publish_tile(tile_idx, tile_id_smem, tile_fulls, tile_empties, accum_cnt, NUM_TILE_BUFFERS: tl.constexpr):
     buf, phase = get_bufidx_phase(accum_cnt, NUM_TILE_BUFFERS)
     tlx.barrier_wait(tile_empties[buf], phase ^ 1)
@@ -107,28 +222,32 @@ def _flash_attn_varlen_fwd(
     desc_q,
     desc_k,
     desc_v,
-    desc_o,
     Out,
+    DescSlots,
     CuQ,
     CuK,
-    Counter,
+    Sched,
+    tokens_q,
     stride_ot,
     stride_oh,
     qk_scale,
     H,
     kv_group,
     num_m_blocks,
-    total_tiles,
+    batch,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
+    TMA_STORE: tl.constexpr,
+    KV_SAME: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
     NUM_TILE_BUFFERS: tl.constexpr,
     CLAIM_AHEAD: tl.constexpr,
     NUM_MMA_WARPS: tl.constexpr,
     NUM_MMA_GROUPS: tl.constexpr,
     CONSUMER_REGISTERS: tl.constexpr,
+    USE_I64_O_OFFSETS: tl.constexpr,
 ):
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     # Pingpong: the consumers alternate QK issue so the tensor core is never contended.
@@ -142,7 +261,6 @@ def _flash_attn_varlen_fwd(
 
     q_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_q), NUM_MMA_GROUPS)
     k_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS)
-    v_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS)
 
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=1)
     q_empties = tlx.alloc_warp_barrier(
@@ -150,18 +268,25 @@ def _flash_attn_varlen_fwd(
         num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS,
         num_arrivals=1,
     )
+    k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
     k_empties = tlx.alloc_warp_barrier(
         num_barriers=NUM_BUFFERS,
         num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS,
         num_arrivals=NUM_MMA_GROUPS,
     )
-    k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
-    v_empties = tlx.alloc_warp_barrier(
-        num_barriers=NUM_BUFFERS,
-        num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS,
-        num_arrivals=NUM_MMA_GROUPS,
-    )
-    v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
+    if KV_SAME:
+        # One tile serves as K for QK and as V for PV; it is released after PV.
+        v_tiles = k_tiles
+        v_empties = k_empties
+        v_fulls = k_fulls
+    else:
+        v_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS)
+        v_empties = tlx.alloc_warp_barrier(
+            num_barriers=NUM_BUFFERS,
+            num_warps=NUM_MMA_WARPS // NUM_MMA_GROUPS,
+            num_arrivals=NUM_MMA_GROUPS,
+        )
+        v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
     tile_id_smem = tlx.local_alloc((1, ), tl.int32, NUM_TILE_BUFFERS)
     tile_fulls = tlx.alloc_barriers(num_barriers=NUM_TILE_BUFFERS, arrive_count=1)
     tile_empties = tlx.alloc_warp_barrier(
@@ -176,15 +301,16 @@ def _flash_attn_varlen_fwd(
             accum_cnt_kv = 0
             accum_cnt_q = 0
             accum_cnt_tile = 0
+            total_tiles = tl.load(Sched + 1)
             tile_idx = prog_id
             while tile_idx < total_tiles:
+                phys_idx = _physical_tile(tile_idx, Sched, CuQ, batch, H, num_m_blocks, BLOCK_M)
                 off_h, off_kh, q_start, q_len, k_start, k_len, m_block, n_kv = _tile_info(
-                    tile_idx, CuQ, CuK, H, kv_group, num_m_blocks, BLOCK_M, BLOCK_N, CAUSAL)
-                if m_block * BLOCK_M < q_len:
-                    _publish_tile(tile_idx, tile_id_smem, tile_fulls, tile_empties, accum_cnt_tile, NUM_TILE_BUFFERS)
-                    accum_cnt_tile += 1
+                    phys_idx, CuQ, CuK, H, kv_group, num_m_blocks, BLOCK_M, BLOCK_N, CAUSAL)
+                _publish_tile(phys_idx, tile_id_smem, tile_fulls, tile_empties, accum_cnt_tile, NUM_TILE_BUFFERS)
+                accum_cnt_tile += 1
                 next_tile = -1
-                if m_block * BLOCK_M < q_len and n_kv > 0:
+                if n_kv > 0:
                     q_phase = accum_cnt_q & 1
                     for cid in tl.static_range(NUM_MMA_GROUPS):
                         tlx.barrier_wait(q_empties[cid], q_phase ^ 1)
@@ -196,20 +322,22 @@ def _flash_attn_varlen_fwd(
                             q_fulls[cid],
                         )
                     for blk in range(0, n_kv):
-                        if blk == tl.maximum(n_kv - CLAIM_AHEAD, 0):
-                            next_tile = num_progs + tl.atomic_add(Counter, 1, sem="relaxed")
                         buf, phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
                         kv_row = k_start + blk * BLOCK_N
                         tlx.barrier_wait(k_empties[buf], phase ^ 1)
                         tlx.barrier_expect_bytes(k_fulls[buf], K_BYTES)
                         tlx.async_descriptor_load(desc_k, k_tiles[buf], [kv_row, off_kh * HEAD_DIM], k_fulls[buf])
-                        tlx.barrier_wait(v_empties[buf], phase ^ 1)
-                        tlx.barrier_expect_bytes(v_fulls[buf], V_BYTES)
-                        tlx.async_descriptor_load(desc_v, v_tiles[buf], [kv_row, off_kh * HEAD_DIM], v_fulls[buf])
+                        if not KV_SAME:
+                            tlx.barrier_wait(v_empties[buf], phase ^ 1)
+                            tlx.barrier_expect_bytes(v_fulls[buf], V_BYTES)
+                            tlx.async_descriptor_load(desc_v, v_tiles[buf], [kv_row, off_kh * HEAD_DIM], v_fulls[buf])
+                        # Claim after this block's loads are issued, so the atomic's latency does not delay them.
+                        if blk == tl.maximum(n_kv - CLAIM_AHEAD, 0):
+                            next_tile = num_progs + tl.atomic_add(Sched, 1, sem="relaxed")
                         accum_cnt_kv += 1
                     accum_cnt_q += 1
                 if next_tile < 0:
-                    next_tile = num_progs + tl.atomic_add(Counter, 1, sem="relaxed")
+                    next_tile = num_progs + tl.atomic_add(Sched, 1, sem="relaxed")
                 tile_idx = next_tile
             _publish_tile(-1, tile_id_smem, tile_fulls, tile_empties, accum_cnt_tile, NUM_TILE_BUFFERS)
 
@@ -223,6 +351,10 @@ def _flash_attn_varlen_fwd(
             accum_cnt_q = 0
             accum_cnt_tile = 0
             cid: tl.constexpr = tlx.async_task_replica_id()
+            if TMA_STORE:
+                slots = _descriptor_slots(DescSlots + prog_id * NUM_MMA_GROUPS * 128, NUM_MMA_GROUPS)
+                desc_o = tlx.make_tensor_descriptor(slots[cid], Out, shape=[tokens_q, H * HEAD_DIM],
+                                                    strides=[stride_ot, 1], block_shape=[BLOCK_M_SPLIT, HEAD_DIM])
 
             # Bootstrap the pingpong sequence once before the persistent tile loop.
             if SERIALIZE_QK and cid == 1:
@@ -234,8 +366,12 @@ def _flash_attn_varlen_fwd(
                 off_h, off_kh, q_start, q_len, k_start, k_len, m_block, n_kv = _tile_info(
                     tile_idx, CuQ, CuK, H, kv_group, num_m_blocks, BLOCK_M, BLOCK_N, CAUSAL)
                 offs_m = m_block * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
-                o_ptrs = (Out + (q_start + offs_m)[:, None] * stride_ot + off_h * stride_oh +
-                          tl.arange(0, HEAD_DIM)[None, :])
+                row0 = q_start + m_block * BLOCK_M + cid * BLOCK_M_SPLIT
+                # The launcher sets USE_I64_O_OFFSETS when the output's element offsets reach 2**31, where int32 wraps.
+                if USE_I64_O_OFFSETS:
+                    row0 = tl.cast(row0, tl.int64)
+                o_base = Out + row0 * stride_ot + off_h * stride_oh
+                o_ptrs = o_base + tl.arange(0, BLOCK_M_SPLIT)[:, None] * stride_ot + tl.arange(0, HEAD_DIM)[None, :]
                 row_ok = (offs_m < q_len)[:, None]
                 if n_kv == 0:
                     zeros = tl.zeros([BLOCK_M_SPLIT, HEAD_DIM], dtype=Out.dtype.element_ty)
@@ -270,47 +406,36 @@ def _flash_attn_varlen_fwd(
                             tlx.named_barrier_arrive(9, 256)
                     qk = tlx.async_dot_wait(0, qk)
                     qk = _mask_scores(qk, 0, k_len, offs_m, causal_off, full_cols, BLOCK_N, CAUSAL)
-                    tlx.barrier_arrive(k_empties[k_buf_id], 1)
+                    if not KV_SAME:
+                        tlx.barrier_arrive(k_empties[k_buf_id], 1)
                     # A single key block has finished its last QK read of Q.
                     if n_kv == 1:
                         tlx.barrier_arrive(q_empties[cid], 1)
                     m_i, l_i, p, alpha = _softmax_step(qk, m_i, l_i, qk_scale)
                     accum_cnt_kv += 1
 
-                    for blk in range(1, n_kv):
-                        k_buf_id, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS)
-                        tlx.barrier_wait(k_fulls[k_buf_id], k_phase)
-                        k_tile = tlx.local_trans(k_tiles[k_buf_id])
-                        if SERIALIZE_QK:
-                            if cid == 0:
-                                tlx.named_barrier_wait(9, 256)
-                            else:
-                                tlx.named_barrier_wait(10, 256)
-                        qk = tlx.async_dot(q_tiles[cid], k_tile)
-                        if SERIALIZE_QK:
-                            if cid == 0:
-                                tlx.named_barrier_arrive(10, 256)
-                            else:
-                                tlx.named_barrier_arrive(9, 256)
-
-                        # pv of the previous block overlaps this block's qk
-                        v_buf_id, v_phase = get_bufidx_phase(accum_cnt_kv - 1, NUM_BUFFERS)
-                        tlx.barrier_wait(v_fulls[v_buf_id], v_phase)
-                        acc = tlx.async_dot(p.to(tlx.dtype_of(desc_k)), v_tiles[v_buf_id], acc)
-
-                        qk = tlx.async_dot_wait(1, qk)
-                        qk = _mask_scores(qk, blk * BLOCK_N, k_len, offs_m, causal_off, full_cols, BLOCK_N, CAUSAL)
-                        tlx.barrier_arrive(k_empties[k_buf_id], 1)
-                        m_i, l_i, p, alpha = _softmax_step(qk, m_i, l_i, qk_scale)
-
-                        acc = tlx.async_dot_wait(0, acc)
-                        tlx.barrier_arrive(v_empties[v_buf_id], 1)
-                        acc = acc * alpha[:, None]
-                        accum_cnt_kv += 1
+                    # Key blocks that every row sees run without the mask; the rest (at most the last, or the causal
+                    # diagonal) apply it.
+                    n_full = tl.maximum(full_cols // BLOCK_N, 1)
+                    for blk in range(1, n_full):
+                        acc, m_i, l_i, p, accum_cnt_kv = _kv_block(blk, accum_cnt_kv, acc, m_i, l_i, p, q_tiles[cid],
+                                                                   k_tiles, v_tiles, k_fulls, k_empties, v_fulls,
+                                                                   v_empties, k_len,
+                                                                   offs_m, causal_off, full_cols, qk_scale,
+                                                                   tlx.dtype_of(desc_k), cid, NUM_BUFFERS, BLOCK_N,
+                                                                   CAUSAL, SERIALIZE_QK, KV_SAME, False)
+                    for blk in range(n_full, n_kv):
+                        acc, m_i, l_i, p, accum_cnt_kv = _kv_block(blk, accum_cnt_kv, acc, m_i, l_i, p, q_tiles[cid],
+                                                                   k_tiles, v_tiles, k_fulls, k_empties, v_fulls,
+                                                                   v_empties, k_len,
+                                                                   offs_m, causal_off, full_cols, qk_scale,
+                                                                   tlx.dtype_of(desc_k), cid, NUM_BUFFERS, BLOCK_N,
+                                                                   CAUSAL, SERIALIZE_QK, KV_SAME, True)
 
                     # pv of the last block
                     v_buf_id, v_phase = get_bufidx_phase(accum_cnt_kv - 1, NUM_BUFFERS)
-                    tlx.barrier_wait(v_fulls[v_buf_id], v_phase)
+                    if not KV_SAME:
+                        tlx.barrier_wait(v_fulls[v_buf_id], v_phase)
                     acc = tlx.async_dot(p.to(tlx.dtype_of(desc_k)), v_tiles[v_buf_id], acc)
                     acc = tlx.async_dot_wait(1, acc)
                     if n_kv != 1:
@@ -322,7 +447,7 @@ def _flash_attn_varlen_fwd(
                     # A row that sees no key has l_i = 0 and writes 0.
                     inv_l = 1.0 / tl.where(l_i == 0.0, 1.0, l_i)
                     o_tile = (acc * inv_l[:, None]).to(Out.dtype.element_ty)
-                    if m_block * BLOCK_M + (cid + 1) * BLOCK_M_SPLIT <= q_len:
+                    if TMA_STORE and m_block * BLOCK_M + (cid + 1) * BLOCK_M_SPLIT <= q_len:
                         desc_o.store([q_start + m_block * BLOCK_M + cid * BLOCK_M_SPLIT, off_h * HEAD_DIM], o_tile)
                     else:
                         tl.store(o_ptrs, o_tile, mask=row_ok)
@@ -335,23 +460,59 @@ def _num_sms(device):
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+def _has_address(x):
+    try:
+        x.data_ptr()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _unaligned(x):
+    if _has_address(x):
+        return x.data_ptr() % 16 != 0
+    # A traced tensor has no address, but its storage offset still places it. Inductor realigns a misaligned
+    # runtime input only when the traced one was aligned, so an unaligned traced input must be copied here.
+    return (x.storage_offset() * x.element_size()) % 16 != 0
+
+
+def _same_tensor(k, v):
+    """Whether ``k`` and ``v`` are one tensor, as when a caller passes the same history as keys and values."""
+    if k is v:
+        return True
+    return (_has_address(k) and _has_address(v) and k.data_ptr() == v.data_ptr() and k.shape == v.shape
+            and k.stride() == v.stride())
+
+
 def _rows(x):
     """``x`` as a TMA-addressable ``(tokens, heads * head_dim)`` matrix: heads dense in a row, rows 16-byte aligned."""
     tokens, heads, head_dim = x.shape
     if (heads > 1 and x.stride(1) != head_dim) or x.stride(2) != 1 or (x.stride(0) * x.element_size()) % 16 != 0:
         x = x.contiguous()
-    if x.data_ptr() % 16 != 0:
+    if _unaligned(x):
         # `contiguous()` returns a contiguous input as is, so only a copy moves the base.
         x = x.clone()
-    return x
+    return x.view(tokens, heads * head_dim)
 
 
-def _descriptor(x, rows):
-    return TensorDescriptor(x, [x.shape[0], x.shape[1] * x.shape[2]], [x.stride(0), 1], [rows, x.shape[2]])
+def _needs_i64_offsets(tokens, row_stride, block):
+    """Whether an element offset the masked output store forms can reach 2**31.
+
+    The store addresses whole ``block``-row tiles, so the masked rows of a sequence's last tile, up to ``block - 1``
+    past the last token, count. A symbolic size, traced by ``torch.compile`` with dynamic shapes or by export, takes
+    int64 instead of a guard on the token count.
+    """
+    limit = (tokens + block - 1) * row_stride
+    return not isinstance(limit, int) or limit > 1 << 31
 
 
 def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scale, causal):
-    """Launch the forward; inputs are validated by ``tlx.ops.flash_attn_varlen``."""
+    """Launch the forward; inputs are validated by ``tlx.ops.flash_attn_varlen``.
+
+    The launch goes through ``wrap_triton`` and every host descriptor is built with ``from_tensor`` over a 2-D view,
+    so ``torch.compile`` and AOTInductor can trace it. The output descriptor is built inside the kernel from the
+    output pointer, in a descriptor slot this launch allocates, so it needs no Triton allocator.
+    """
     if isinstance(q, FakeTensor):
         return torch.empty_like(q)
     tokens_q, heads, head_dim = q.shape
@@ -367,18 +528,27 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scal
     if k.shape[0] == 0:
         return out.zero_()
     block_n = 128
-    num_buffers = 3 if head_dim == 64 and not causal else 2
-    desc_q = _descriptor(_rows(q), BLOCK_M // NUM_MMA_GROUPS)
-    desc_k = _descriptor(_rows(k), block_n)
-    desc_v = _descriptor(_rows(v), block_n)
-    desc_o = _descriptor(out, BLOCK_M // NUM_MMA_GROUPS)
-    grid = (min(total_tiles, _num_sms(q.device)), )
-    counter = torch.zeros(1, device=q.device, dtype=torch.int32)
-    _flash_attn_varlen_fwd[grid](desc_q,
-                                 desc_k, desc_v, desc_o, out, cu_seqlens_q, cu_seqlens_k, counter, out.stride(0),
-                                 out.stride(1), sm_scale * LOG2E, heads, heads // kv_heads, num_m_blocks, total_tiles,
-                                 HEAD_DIM=head_dim, BLOCK_M=BLOCK_M, BLOCK_N=block_n, CAUSAL=causal,
-                                 NUM_BUFFERS=num_buffers, NUM_TILE_BUFFERS=NUM_TILE_BUFFERS, CLAIM_AHEAD=CLAIM_AHEAD,
-                                 NUM_MMA_WARPS=NUM_MMA_WARPS, NUM_MMA_GROUPS=NUM_MMA_GROUPS,
-                                 CONSUMER_REGISTERS=CONSUMER_REGISTERS, num_warps=4, num_stages=1)
+    kv_same = _same_tensor(k, v)
+    # A shared K/V tile frees the V buffers, so it takes one more stage than separate K and V.
+    num_buffers = 3 if (head_dim == 64 and not causal) or kv_same else 2
+    split = BLOCK_M // NUM_MMA_GROUPS
+    out_rows = out.view(tokens_q, heads * head_dim)
+    use_i64 = _needs_i64_offsets(tokens_q, out_rows.stride(0), BLOCK_M)
+    desc_q = TensorDescriptor.from_tensor(_rows(q), [split, head_dim])
+    desc_k = TensorDescriptor.from_tensor(_rows(k), [block_n, head_dim])
+    desc_v = desc_k if kv_same else TensorDescriptor.from_tensor(_rows(v), [block_n, head_dim])
+    sched = torch.empty(2 + 2 * batch, device=q.device, dtype=torch.int32)
+    # AOTI captures the build device's SM count. On smaller GPUs, queued CTAs own their first tiles until scheduled.
+    num_sms = _num_sms(q.device)
+    desc_slots = torch.empty(num_sms * NUM_MMA_GROUPS * 128, device=q.device, dtype=torch.int8)
+    kernel = wrap_triton(_flash_attn_varlen_fwd)[(num_sms, )]
+    with torch.cuda.device(q.device):
+        wrap_triton(_schedule)[(1, )](cu_seqlens_q, cu_seqlens_k, sched, batch, heads, BLOCK_M=BLOCK_M,
+                                      MAX_SORTED=MAX_SORTED_SEQS, num_warps=1)
+        kernel(desc_q, desc_k, desc_v, out_rows, desc_slots, cu_seqlens_q, cu_seqlens_k, sched, tokens_q,
+               out_rows.stride(0), head_dim, sm_scale * LOG2E, heads, heads // kv_heads, num_m_blocks, batch,
+               HEAD_DIM=head_dim, BLOCK_M=BLOCK_M, BLOCK_N=block_n, CAUSAL=causal, TMA_STORE=TMA_STORE, KV_SAME=kv_same,
+               NUM_BUFFERS=num_buffers, NUM_TILE_BUFFERS=NUM_TILE_BUFFERS, CLAIM_AHEAD=CLAIM_AHEAD,
+               NUM_MMA_WARPS=NUM_MMA_WARPS, NUM_MMA_GROUPS=NUM_MMA_GROUPS, CONSUMER_REGISTERS=CONSUMER_REGISTERS,
+               USE_I64_O_OFFSETS=use_i64, num_warps=4, num_stages=1)
     return out

@@ -21,6 +21,7 @@ from .. import knobs
 from .driver import driver
 from . import _async_compile
 from .._utils import find_paths_if, get_iterable_path, type_canonicalisation_dict, is_namedtuple
+from ..magnon.flags import collect_enabled as _compile_iq_collect_enabled
 from .cache import get_cache_key
 from triton._C.libtriton import get_cache_invalidating_env_vars, native_specialize_impl, native_fast_dispatch, native_fast_dispatch_insert
 try:
@@ -1219,7 +1220,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             if os.environ.get("TRITON_DUMP_TLX_BENCHMARK"):
                 try:
                     from triton.tools.tlx_benchmark_gen import capture_kernel_args
-                    capture_kernel_args(bound_args, signature, constexprs, self.params, options)
+                    capture_kernel_args(bound_args, signature, constexprs, self.params, options, fn=self.fn)
                 except Exception:
                     pass
 
@@ -1229,7 +1230,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             # compile_iq: dump a collection task for the offline ACF factory.
             # Gated by TRITON_COMPILE_IQ_COLLECT; fires on the compile (cache-miss) path
             # where signature/constexprs are in scope. Never affects the user run.
-            if os.environ.get("TRITON_COMPILE_IQ_COLLECT"):
+            if _compile_iq_collect_enabled():
                 try:
                     from triton.magnon.collector import capture as _ciq_capture
                     _ck = kernel.result() if hasattr(kernel, "result") else kernel

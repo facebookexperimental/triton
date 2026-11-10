@@ -178,14 +178,55 @@ class TLXInductorChoices(InductorChoices):
         kwarg_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> list[KernelTemplateChoice]:
         if config.triton.tlx_mode == "force":
-            # In force mode, keep only TLX templates
-            return [
+            tlx_choices = [
                 c for uid, gen in template_choices.items() if "tlx_" in uid for c in gen
             ]
+            if tlx_choices:
+                return tlx_choices
 
         return super()._finalize_template_configs(
             template_choices, kernel_inputs, templates, op_name, kwarg_overrides
         )
+
+    _GFX942_PERSISTENT_INNER_RNUMEL = 4096
+
+    @staticmethod
+    def _gfx942_persistent_override(features, cooperative_reduction: bool) -> bool:
+        from torch._inductor.runtime.hints import ReductionHint
+        from torch._inductor.virtualized import V
+
+        from .registry import _is_gfx942
+
+        if not (
+            tlx_config.gfx942_persistent_inner_reductions
+            and config.triton.tlx_mode is not None
+            and config.triton.persistent_reductions
+            and not cooperative_reduction
+            and features.get_reduction_hint() == ReductionHint.INNER
+            and _is_gfx942()
+            and V.graph.sizevars.statically_known_leq(
+                features.reduction_numel,
+                TLXInductorChoices._GFX942_PERSISTENT_INNER_RNUMEL,
+            )
+        ):
+            return False
+        rblock = features.strict_reduction_rblock()
+        if rblock is not None and not features.has_strict_multirow_reduction():
+            return V.graph.sizevars.statically_known_geq(rblock, features.reduction_numel)
+        return True
+
+    @staticmethod
+    def persistent_only_by_tlx(features, cooperative_reduction: bool) -> bool:
+        """Persistent because of the gfx942 override, where Inductor alone would loop."""
+        return TLXInductorChoices._gfx942_persistent_override(
+            features, cooperative_reduction
+        ) and not InductorChoices.should_use_persistent_reduction(features, cooperative_reduction)
+
+    @staticmethod
+    def should_use_persistent_reduction(features, cooperative_reduction: bool) -> bool:
+        if TLXInductorChoices._gfx942_persistent_override(features, cooperative_reduction):
+            return True
+        return InductorChoices.should_use_persistent_reduction(features, cooperative_reduction)
 
     def customize_fused_kernel_name(self, fused_name: str, src_code: str) -> str:
         from .fusion import maybe_add_tlx_prefix
