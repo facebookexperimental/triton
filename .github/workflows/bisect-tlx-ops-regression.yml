@@ -1,0 +1,221 @@
+name: Bisect TLX throughput regression
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Benchmark workflow run containing regression evidence
+        required: true
+        type: string
+      artifact_name:
+        description: Regression evidence artifact from that run
+        required: true
+        type: string
+      platform:
+        description: Platform to bisect
+        required: true
+        type: choice
+        options: [b200, h100, mi350]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tlx-perf-bisect-${{ inputs.platform }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'facebookexperimental/triton'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      issues: read
+    outputs:
+      ready: ${{ steps.plan.outputs.ready }}
+      bad_sha: ${{ steps.plan.outputs.bad_sha }}
+    steps:
+      - name: Verify the evidence producer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          run = json.loads(subprocess.check_output(['gh', 'api', f"repos/{repo}/actions/runs/{os.environ['SOURCE_RUN_ID']}"]))
+          assert run['path'].split('@', 1)[0] == '.github/workflows/nightly-tlx-ops-bench.yml'
+          assert run['event'] in ('workflow_dispatch', 'workflow_run')
+          assert run['head_repository']['full_name'] == repo
+          PY
+      - name: Download detected regressions
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: evidence
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+      - name: Select open issues and their representative cases
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          alerts = json.loads(pathlib.Path('evidence/regressions.json').read_text())
+          specs = []
+          for alert in alerts:
+              number = alert.get('bisect_issue')
+              if not number or alert['platform'] != os.environ['PLATFORM']:
+                  continue
+              issue = json.loads(subprocess.check_output(['gh', 'api', f"repos/{repo}/issues/{number}"]))
+              if issue['state'] == 'open':
+                  specs.append({'issue_number': number, **alert['bisect']})
+          pathlib.Path('specs.json').write_text(json.dumps(specs))
+          if specs:
+              assert len({s['bad_sha'] for s in specs}) == 1
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+                  out.write(f"ready=true\nbad_sha={specs[0]['bad_sha']}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.ready == 'true'
+        with:
+          name: perf-bisect-specs
+          path: specs.json
+
+  bisect:
+    needs: prepare
+    if: needs.prepare.outputs.ready == 'true'
+    runs-on: ${{ fromJSON('{"b200":"nvidia-dgx-b200","h100":"linux-gcp-h100","mi350":"linux-fb-triton-mi350-1"}')[inputs.platform] }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout bisect tooling
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+      - name: Checkout candidate source and pinned benchmark
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.bad_sha }}
+          path: candidate
+          fetch-depth: 0
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          name: perf-bisect-specs
+          path: evidence
+      - name: Preserve the benchmark outside the bisected checkout
+        run: |
+          mkdir -p "${RUNNER_TEMP}/perf-bisect-harness"
+          git -C candidate archive HEAD python/test/tlx_benchmark \
+            | tar -x -C "${RUNNER_TEMP}/perf-bisect-harness"
+      - name: Set up fixed test environment
+        uses: ./tooling/.github/actions/setup-test-env
+        with:
+          backend: ${{ inputs.platform == 'mi350' && 'rocm' || 'cuda' }}
+          arch: ${{ inputs.platform == 'mi350' && 'gfx950' || '' }}
+          torch: torch==2.14.0
+          torch-index-url: ${{ inputs.platform == 'mi350' && 'https://download.pytorch.org/whl/rocm7.2' || 'https://download.pytorch.org/whl/cu130' }}
+          packages: numpy pytest torchao
+          rocm-lib-path: ""
+      - name: Refresh CUDA linker cache
+        if: inputs.platform != 'mi350'
+        run: sudo ldconfig
+      - name: Verify endpoints and bisect each representative case
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import time
+
+          specs = json.loads(pathlib.Path('evidence/specs.json').read_text())
+          deadline = time.monotonic() + 300 * 60
+          output = pathlib.Path('results')
+          output.mkdir()
+          for i, spec in enumerate(specs):
+              number = spec['issue_number']
+              path = output / f'spec-{number}.json'
+              path.write_text(json.dumps(spec))
+              result = output / f'result-{number}.json'
+              budget = max(1, (deadline - time.monotonic()) / (len(specs) - i))
+              subprocess.run([
+                  sys.executable, 'tooling/.github/scripts/tlx_ops_bench_bisect.py',
+                  '--source', str(pathlib.Path('candidate').resolve()),
+                  '--harness', str(pathlib.Path(os.environ['RUNNER_TEMP']) / 'perf-bisect-harness/python/test/tlx_benchmark'),
+                  '--spec', str(path), '--out', str(result), '--timeout-minutes', str(budget / 60)
+              ])
+              if not result.exists():
+                  result.write_text(json.dumps({'status': 'inconclusive', 'reason': 'Worker produced no result.'}))
+              data = json.loads(result.read_text())
+              data['issue_number'] = number
+              result.write_text(json.dumps(data, indent=2))
+              subprocess.run(['git', '-C', 'candidate', 'bisect', 'reset'])
+              subprocess.run(['git', '-C', 'candidate', 'reset', '--hard'], check=True)
+              subprocess.run(['git', '-C', 'candidate', 'clean', '-ffdx'], check=True)
+          PY
+      - name: Upload bisect results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-bisect-results
+          path: results/result-*.json
+          if-no-files-found: ignore
+
+  report:
+    needs: [prepare, bisect]
+    if: always() && needs.prepare.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: perf-bisect-specs
+          path: evidence
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: perf-bisect-results
+          path: evidence
+      - name: Report measured results on the issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          run_url = f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          for spec in json.loads(pathlib.Path('evidence/specs.json').read_text()):
+              number = spec['issue_number']
+              path = pathlib.Path(f'evidence/result-{number}.json')
+              result = json.loads(path.read_text()) if path.exists() else {'status': 'inconclusive', 'reason': 'Job did not produce a result.'}
+              lines = [f"Performance bisection result: {result['status']}. [Run and evidence]({run_url}).",
+                       f"Case: `{spec['key']}`."]
+              if result.get('first_bad_sha'):
+                  sha = result['first_bad_sha']
+                  lines.append(f"First bad commit for the measured case: https://github.com/{repo}/commit/{sha}")
+              if result.get('reason'):
+                  lines.append(result['reason'])
+              subprocess.run(['gh', 'api', f"repos/{repo}/issues/{number}/comments", '--method', 'POST', '--input', '-'],
+                             input=json.dumps({'body': '\n\n'.join(lines)}), text=True, check=True)
+          PY

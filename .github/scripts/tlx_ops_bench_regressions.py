@@ -11,7 +11,7 @@ import re
 import statistics
 
 from failure_issues import gh
-from tlx_ops_bench_dashboard import commits, read_summaries, suspects
+from tlx_ops_bench_dashboard import read_summaries
 
 BASELINE_SAMPLES = 3
 MAX_AGE_DAYS = 14
@@ -49,11 +49,13 @@ def comparison(case, history, night, trusted):
     if len(baseline) < BASELINE_SAMPLES:
         return None
     value = statistics.median(h["case"]["tlx_tflops"] for h in baseline)
+    good = next(h for h in reversed(baseline) if h["case"]["tlx_tflops"] >= value)
     return {
         "key": case["key"], "params": case["params"], "dtype": case["dtype"], "baseline": value, "current":
         case["tlx_tflops"], "ratio": case["tlx_tflops"] / value, "baseline_dates": [h["date"] for h in baseline],
-        "baseline_sha": baseline[0]["sha"], "reference_before": baseline[-1]["case"].get("ref_tflops"), "reference_now":
-        case.get("ref_tflops"), "previous_environment": baseline[-1]["environment"]
+        "baseline_sha": baseline[0]["sha"], "good_sha": good["sha"], "good_date": good["date"], "reference_before":
+        baseline[-1]["case"].get("ref_tflops"), "reference_now": case.get("ref_tflops"), "previous_environment":
+        baseline[-1]["environment"]
     }
 
 
@@ -121,8 +123,10 @@ def detect(nights):
                     alerts.append({
                         "platform": night["platform"], "op": op, "direction": direction, "date": night["date"], "sha":
                         night["sha"], "reasons": reasons, "median_ratio": median, "compared": len(rows),
-                        "reported_cases": sum(c["direction"] == direction for c in result["cases"]),
-                        "confirmation_date": prev["date"] if confirmed else None, "environment":
+                        "reported_cases": sum(c["direction"] == direction
+                                              for c in result["cases"]), "space": result.get("space"), "required_ratio":
+                        CASE_RATIO if severe[direction] or noisy[direction] else COHORT_RATIO, "confirmation_date":
+                        prev["date"] if confirmed else None, "environment":
                         {k: night.get(k)
                          for k in ("gpu", "driver", "torch", "runtime", "governed", "timing")
                          }, "cases": sorted(affected.values(), key=lambda r: r["ratio"])
@@ -136,19 +140,16 @@ def issue_title(alert):
     return f"[perf-regression] {alert['platform']} / {alert['op']} / {alert['direction']}"
 
 
-def add_suspects(alert):
-    oldest = min(alert["cases"], key=lambda c: c["baseline_dates"][0])
-    sha = oldest["baseline_sha"]
-    found = commits(sha, alert["sha"])
+def bisect_spec(alert):
+    case = min(alert["cases"], key=lambda c: c["ratio"])
     return {
-        **alert, "suspect_base": sha, "history_available": found is not None, "suspect_commits":
-        suspects(found or [], alert["op"], alert["platform"], None)
+        "op": alert["op"], "direction": alert["direction"], "key": case["key"], "platform": alert["platform"],
+        "good_sha": case["good_sha"], "bad_sha": alert["sha"], "required_ratio": alert["required_ratio"], "space":
+        alert["space"]
     }
 
 
 def issue_body(alert, repo, run_url):
-    if "suspect_commits" not in alert:
-        alert = add_suspects(alert)
     date = alert["date"]
     base = f"https://github.com/{repo}/releases/download/tlx-ops-bench"
     dates = sorted({d for c in alert["cases"] for d in c["baseline_dates"]})
@@ -181,32 +182,12 @@ def issue_body(alert, repo, run_url):
         if before.get(key) != value
     ]
     lines.extend(changes or ["- No recorded environment changes."])
-    sha = alert["suspect_base"]
+    spec = bisect_spec(alert)
     lines.extend([
-        "", "## Suspect commits", "",
-        "Candidates ranked by affected code area, then newest first. This is not confirmed blame. The range starts at the oldest measurement used in the affected cases' median baselines.",
-        ""
-    ])
-    candidates = alert["suspect_commits"]
-    if not alert["history_available"]:
-        lines.append("Commit history is unavailable; use the comparison link below to investigate.")
-    elif not candidates:
-        lines.append(
-            "No commits in this range touch the operation, its compiler or its benchmark tooling according to file-based ranking."
-        )
-    else:
-        for candidate in candidates[:10]:
-            title = candidate["title"].replace("[", "\\[").replace("]", "\\]")
-            link = f"https://github.com/{repo}/commit/{candidate['sha']}"
-            pr = f" · [PR {candidate['pr']}](https://github.com/{repo}/pull/{candidate['pr']})" if candidate[
-                "pr"] else ""
-            lines.append(f"- [{candidate['sha']}: {title}]({link}){pr} · {candidate['area']}")
-        if len(candidates) > 10:
-            lines.append(
-                f"\n{len(candidates) - 10} additional ranked candidates are in the regression evidence artifact; the comparison below contains the full commit range."
-            )
-    lines.extend([
-        "", f"Candidate commit range, not confirmed blame: https://github.com/{repo}/compare/{sha}...{alert['sha']}",
+        "", f"[Suspect commit range](https://github.com/{repo}/compare/{spec['good_sha']}...{spec['bad_sha']})", "",
+        "## Performance bisection", "",
+        f"Reproducer: `{spec['key']}`. One bisect job checks the worst affected case for this operation and direction.",
+        "The job remeasures both endpoints on the same GPU before bisecting. Missing cases, build errors, incorrect output and unreliable measurements are inconclusive, not performance failures.",
         "",
         "This is a historical throughput regression, separate from the existing absolute 0.9x reference floor. Root cause and recovery require investigation."
     ])
@@ -228,19 +209,40 @@ def file_issues(alerts, repo, run_url, api=gh):
             "POST", f"repos/{repo}/issues",
             {"title": title, "body": issue_body(alert, repo, run_url), "labels": ["nightly", "perf-regression"]})
         titles.add(title)
+        alert["bisect_issue"] = issue["number"]
+        alert["bisect"] = bisect_spec(alert)
         created.append(issue["html_url"])
         print(f"Filed {issue['html_url']}")
     return created
 
 
+def queue_bisects(alerts, repo, run_id, artifact_name, api=gh):
+    platforms = sorted({alert["platform"] for alert in alerts if alert.get("bisect_issue")})
+    for platform in platforms:
+        inputs = {"source_run_id": str(run_id), "artifact_name": artifact_name, "platform": platform}
+        api("POST", f"repos/{repo}/actions/workflows/bisect-tlx-ops-regression.yml/dispatches",
+            {"ref": "main", "inputs": inputs})
+        print(f"Queued performance bisect batch for {platform}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory")
-    parser.add_argument("--platform", required=True)
-    parser.add_argument("--date", required=True)
-    parser.add_argument("--out", required=True)
+    parser.add_argument("--platform")
+    parser.add_argument("--date")
+    parser.add_argument("--out")
     parser.add_argument("--file-issues", action="store_true")
+    parser.add_argument("--queue-bisects", action="store_true")
+    parser.add_argument("--artifact-name")
     args = parser.parse_args()
+    if args.queue_bisects:
+        if not args.artifact_name:
+            parser.error("--artifact-name is required for bisection")
+        queue_bisects(json.loads(Path(args.directory).read_text()), os.environ["GITHUB_REPOSITORY"],
+                      os.environ["GITHUB_RUN_ID"], args.artifact_name)
+        return
+    if not (args.platform and args.date and args.out):
+        parser.error("--platform, --date and --out are required for detection")
     nights = read_summaries(args.directory).get(args.platform, [])
     if not any(n["date"] == args.date for n in nights):
         raise SystemExit(f"Missing current summary: {args.date}.{args.platform}.json")
@@ -248,13 +250,15 @@ def main():
     if args.date != max(n["date"] for n in nights):
         print("Historical dispatch; no current alerts.")
         alerts = []
-    alerts = [add_suspects(alert) for alert in alerts]
     Path(args.out).write_text(json.dumps(alerts, indent=2))
     print(f"{args.platform} {args.date}: {len(alerts)} regression cohort(s)")
     if args.file_issues and alerts:
         repo = os.environ["GITHUB_REPOSITORY"]
         run_url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
-        file_issues(alerts, repo, run_url)
+        try:
+            file_issues(alerts, repo, run_url)
+        finally:
+            Path(args.out).write_text(json.dumps(alerts, indent=2))
 
 
 if __name__ == "__main__":

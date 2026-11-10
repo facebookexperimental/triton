@@ -133,10 +133,9 @@ jobs:
     permissions:
       contents: write
       issues: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: tlx-ops-bench-${{ inputs.platform }}-${{ inputs.version }}
@@ -175,6 +174,13 @@ jobs:
           name: tlx-ops-regressions-${{ inputs.platform }}-${{ inputs.version }}
           path: regressions.json
           if-no-files-found: ignore
+      - name: Queue performance bisect jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 .github/scripts/tlx_ops_bench_regressions.py regressions.json --queue-bisects \
+            --artifact-name "tlx-ops-regressions-${{ inputs.platform }}-${VERSION}"
 
   report:
     needs: bench

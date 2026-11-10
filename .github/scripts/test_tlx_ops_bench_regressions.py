@@ -94,39 +94,37 @@ def test_issue_filing_lists_unindexed_issues_and_deduplicates_without_closing():
 
     def create(method, path, fields=None, paginate=False):
         calls.append((method, path, fields))
-        return [] if method == "GET" else {"html_url": "https://github.com/o/r/issues/1"}
+        return [] if method == "GET" else {"html_url": "https://github.com/o/r/issues/1", "number": 1}
 
     assert regressions.file_issues([alert, alert], "o/r", "run", create) == ["https://github.com/o/r/issues/1"]
     assert [c[0] for c in calls] == ["GET", "POST"]
     assert calls[1][2]["labels"] == ["nightly", "perf-regression"]
-    assert "not confirmed blame" in calls[1][2]["body"]
+    assert "Suspect commit range" in calls[1][2]["body"]
+    assert alert["bisect_issue"] == 1
 
 
-def test_suspect_commits_include_relevant_dependency_changes_without_claiming_causation(monkeypatch):
+def test_bisect_uses_a_good_baseline_not_the_already_regressed_previous_night():
+    alert = regressions.detect(history() + [night("20261104", 85), night("20261105", 85)])[0]
+    spec = regressions.bisect_spec(alert)
+    assert spec["good_sha"] == "20261103" * 5
+    assert spec["bad_sha"] == "20261105" * 5
+    assert spec["required_ratio"] == regressions.COHORT_RATIO
+    assert "ranked" not in regressions.issue_body(alert, "o/r", "run")
+
+
+def test_only_new_regression_issues_queue_one_representative_bisect_job():
     alert = regressions.detect(history() + [night("20261104", 30)])[0]
-    alert["cases"][1]["baseline_dates"][0] = "20261031"
-    alert["cases"][1]["baseline_sha"] = "oldest"
-    found = [{"sha": "nvidia", "title": "NVIDIA change", "pr": 1, "files": ["third_party/nvidia/lib/foo.cpp"]},
-             {"sha": "llvm", "title": "AMD codegen LLVM repin", "pr": 2, "files": ["cmake/meta-amd-llvm-info.json"]}, {
-                 "sha": "kernel", "title": "MXFP8 backward change", "pr": 3, "files":
-                 ["third_party/tlx/ops/kernels/flash_attn_mxfp8/gfx950_bwd_shared.py"]
-             }, {"sha": "docs", "title": "Documentation", "pr": None, "files": ["README.md"]}]
-    ranges = []
-
-    def commits(base, head):
-        ranges.append((base, head))
-        return found
-
-    monkeypatch.setattr(regressions, "commits", commits)
-    enriched = regressions.add_suspects(alert)
-    assert ranges == [("oldest", alert["sha"])]
-    assert [c["sha"] for c in enriched["suspect_commits"]] == ["kernel", "llvm"]
-    body = regressions.issue_body(enriched, "o/r", "run")
-    assert "https://github.com/o/r/commit/kernel" in body
-    assert "https://github.com/o/r/pull/2" in body and "AMD codegen LLVM repin" in body
-    assert "This is not confirmed blame" in body
-    monkeypatch.setattr(regressions, "commits", lambda base, head: None)
-    assert "Commit history is unavailable" in regressions.issue_body(alert, "o/r", "run")
+    calls = []
+    api = lambda method, path, fields=None: calls.append((method, path, fields))
+    regressions.queue_bisects([alert], "o/r", 20, "evidence", api)
+    assert calls == []
+    alert.update(bisect_issue=1, bisect=regressions.bisect_spec(alert))
+    other = {**alert, "bisect_issue": 2}
+    regressions.queue_bisects([alert, other], "o/r", 20, "evidence", api)
+    assert len(calls) == 1
+    assert calls[0] == ("POST", "repos/o/r/actions/workflows/bisect-tlx-ops-regression.yml/dispatches", {
+        "ref": "main", "inputs": {"source_run_id": "20", "artifact_name": "evidence", "platform": "mi350"}
+    })
 
 
 def test_local_replay_cannot_write_issues_without_explicit_opt_in(monkeypatch, tmp_path):

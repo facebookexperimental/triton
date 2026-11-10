@@ -56,11 +56,6 @@ def test_file_rank_drops_other_ops_arches_and_backends():
     assert dash.file_rank("third_party/amd/lib/foo.cpp", "mm", "b200") is None
     assert dash.file_rank("third_party/nvidia/lib/foo.cpp", "mm", "b200") == 5
     assert dash.file_rank("lib/Analysis/Alias.cpp", "mm", "b200") == 6
-    assert dash.file_rank("cmake/meta-amd-llvm-info.json", "flash_attn_mxfp8", "mi350") == 2.5
-    assert dash.file_rank("cmake/meta-amd-llvm-info.json", "flash_attn_mxfp8", "b200") is None
-    assert dash.file_rank("cmake/llvm-info.json", "flash_attn_mxfp8", "mi350") == 2.5
-    assert dash.file_rank("third_party/tlx/ops/kernels/flash_attn_mxfp8/gfx1250.py", "flash_attn_mxfp8",
-                          "mi350") is None
 
 
 def test_file_rank_covers_the_shared_kernel_files():
