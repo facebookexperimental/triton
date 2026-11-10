@@ -1367,10 +1367,6 @@ class CUDABackend(BaseBackend):
                     and any(mode in opt.instrumentation_mode for mode in ["consan", "fpsan"])):
                 ptx_extra_options += ["--opt-level", "1"]
 
-            # Add --regAllocOptLevel=2 to work around ptxas 13.x bug
-            major, _ = map(int, ptxas_tool.version.split("."))
-            reg_alloc = ["--regAllocOptLevel=2"] if major >= 13 else []
-
             # compile_iq Stage-3 consumption (gated, default off; fail-open): if the PTX hash hits
             # the ACF store, append --apply-controls (version check + lookup live in the helper).
             if os.environ.get("TRITON_COMPILE_IQ_APPLY"):
@@ -1387,7 +1383,6 @@ class CUDABackend(BaseBackend):
                 *fmad,
                 "-v",
                 *disable_opt,
-                *reg_alloc,
                 *ptx_extra_options,
                 f"--gpu-name={arch}",
                 fsrc.name,
