@@ -1,0 +1,187 @@
+{
+  "date": "2026-11-05",
+  "timezone": "America/Los_Angeles",
+  "status": "Qualitative forecast; no profiling or benchmark run",
+  "ordering": "Presentation order, not a measured time ranking",
+  "kernel_source": "third_party/tlx/tutorials/amd_pa_decode_fp8.py",
+  "kernel_sha256": "41ea52ba51bb357785de0dfbfb90734192b6abcff10a9913ca48d7f10e1cd6e7",
+  "scale_contract": "Separate FP32 dequantization multiplier per K/V head; unequal head scales required for target validation",
+  "payload_calculations": {
+    "formula_bytes": "2 * L * 8192 * 1",
+    "kv_width_each": 8192,
+    "element_bytes": 1,
+    "K_unit_assumption": 1024,
+    "scope": "One request; unmasked K+V payload read once; excludes metadata/output/scales. Not measured physical HBM traffic.",
+    "points": [
+      {
+        "L": 2304,
+        "bytes": 37748736,
+        "MiB": 36.0
+      },
+      {
+        "L": 131072,
+        "bytes": 2147483648,
+        "MiB": 2048.0
+      },
+      {
+        "L": 262144,
+        "bytes": 4294967296,
+        "MiB": 4096.0
+      }
+    ]
+  },
+  "hypotheses": [
+    {
+      "label": "KV payload bandwidth",
+      "workload": "T=1; long contexts",
+      "optimization_lines": [
+        "Coalesced/vectorized packed reads;",
+        "enough concurrent KV partitions."
+      ],
+      "evidence_or_hypothesis": "Predicted: long unmasked cache scans are sensitive to effective bandwidth.",
+      "source_lines": [
+        108,
+        111,
+        113,
+        115
+      ],
+      "validation_signals": [
+        "effective memory bandwidth",
+        "cache hit/miss traffic",
+        "unprofiled kernel latency"
+      ],
+      "measured_latency_us": null,
+      "measured_speedup": null
+    },
+    {
+      "label": "Repeated KV loads",
+      "workload": "GQA; queries sharing a cache",
+      "optimization_lines": [
+        "Tile query heads/tokens together;",
+        "reuse K/V within the KV-head group."
+      ],
+      "evidence_or_hypothesis": "Observed grid is one program per token/query head/split; HBM amplification depends on caches.",
+      "source_lines": [
+        79,
+        80,
+        81,
+        83
+      ],
+      "validation_signals": [
+        "memory transactions",
+        "L2 traffic",
+        "latency across GQA factors"
+      ],
+      "measured_latency_us": null,
+      "measured_speedup": null
+    },
+    {
+      "label": "FP32 vector arithmetic",
+      "workload": "Useful GQA / multi-query tiles",
+      "optimization_lines": [
+        "WMMA QK/PV with an accuracy gate;",
+        "retain a vector path for underfilled tiles."
+      ],
+      "evidence_or_hypothesis": "Observed FP32 conversion, multiplies and reductions; native FP8 WMMA is not used.",
+      "source_lines": [
+        123,
+        124,
+        126,
+        132
+      ],
+      "validation_signals": [
+        "matrix instruction issue",
+        "VALU/reduction time",
+        "numerical error",
+        "register use"
+      ],
+      "measured_latency_us": null,
+      "measured_speedup": null
+    },
+    {
+      "label": "Serialized movement / LDS",
+      "workload": "All; strongly layout dependent",
+      "optimization_lines": [
+        "Vectorize packed V, trim LDS round trips;",
+        "prefetch/double-buffer with occupancy checks."
+      ],
+      "evidence_or_hypothesis": "Observed one buffer each, synchronous V staging and immediate K wait before compute.",
+      "source_lines": [
+        103,
+        104,
+        118,
+        119,
+        120,
+        122
+      ],
+      "validation_signals": [
+        "ATT wait/idle",
+        "LDS bank conflicts",
+        "VGPR and scratch",
+        "latency"
+      ],
+      "measured_latency_us": null,
+      "measured_speedup": null
+    },
+    {
+      "label": "Split / launch / allocation",
+      "workload": "Short cases; small effective context",
+      "optimization_lines": [
+        "Tune splits by batch/head parallelism;",
+        "one-split direct output; reusable workspace."
+      ],
+      "evidence_or_hypothesis": "Observed length-only default split policy, per-call allocations and unconditional merge launch.",
+      "source_lines": [
+        219,
+        222,
+        223,
+        224,
+        254
+      ],
+      "validation_signals": [
+        "caller latency",
+        "kernel latency",
+        "workspace bytes",
+        "split count"
+      ],
+      "measured_latency_us": null,
+      "measured_speedup": null
+    },
+    {
+      "label": "Empty splits under SWA",
+      "workload": "Window much shorter than context",
+      "optimization_lines": [
+        "Partition the active window;",
+        "reduce empty CTAs and merge work."
+      ],
+      "evidence_or_hypothesis": "Observed partitioning over full context before window intersection.",
+      "source_lines": [
+        86,
+        87,
+        88,
+        91,
+        92,
+        135,
+        137
+      ],
+      "validation_signals": [
+        "empty/active CTAs",
+        "merge cost",
+        "window-size latency",
+        "correct masking"
+      ],
+      "measured_latency_us": null,
+      "measured_speedup": null
+    }
+  ],
+  "numerical_risks": [
+    "BF16 Q requantization changes input contract",
+    "BF16/FP8 probability casts affect PV accuracy",
+    "WMMA tiling can be underfilled for a single MHA query",
+    "Larger tiles/buffering can reduce occupancy or spill"
+  ],
+  "references": [
+    "https://princeton-nlp.github.io/flash-decoding/",
+    "https://arxiv.org/abs/2307.08691"
+  ]
+}

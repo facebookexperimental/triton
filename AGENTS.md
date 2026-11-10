@@ -1,5 +1,25 @@
 # Working on Triton
 
+## FP8 KV decode experiment records
+
+For work on `third_party/tlx/tutorials/amd_pa_decode_fp8.py`, maintain
+`experiments/fp8-kv-decode/FP8_KV_DECODE_ATTN.md`. Before each experiment, record the
+date (America/Los_Angeles), hypothesis, reasoning, change, expected benefit,
+and validation/comparison plan. Afterwards record the actual outcome,
+including failed attempts, measurements, environment/source identifiers,
+and artifact links. Never infer speedups from test-suite duration. At each
+major step, save a comparison chart and its source data under that directory;
+clearly distinguish source capabilities, correctness, and measured performance.
+Keep reference revisions pinned and preserve earlier result snapshots.
+The user has confirmed that undisclosed head mappings, T/mask semantics, and
+SWA window details are unknown. Hongtao's guidance is to use the existing
+tutorial's physical 5D cache layout. Continue exploratory work with explicit,
+configurable synthetic cases; do not require those hidden details to proceed
+or present assumed cases as exact model acceptance.
+Per-head K/V scales are a confirmed requirement: separate scales indexed by
+KV head, shared across that head's tokens/pages. Validate with unequal head
+scales. Scalar-only references are restricted controls, not full-contract baselines.
+
 ## Vendored code
 - `third_party/cpu` is vendored from [triton-lang/triton-cpu](https://github.com/triton-lang/triton-cpu), not developed in-tree. See `third_party/cpu/README.md` for the sync/port procedure.
 

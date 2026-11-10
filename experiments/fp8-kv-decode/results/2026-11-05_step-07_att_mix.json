@@ -1,0 +1,66 @@
+[
+  {
+    "label": "Baseline GQA L2304 S4",
+    "source": "results/2026-11-05_optimization/att_baseline_unified_sdk/stats_ui_output_agent_6729_dispatch_38.csv",
+    "stall_cycles": 28119.0,
+    "latency_cycles": 36697.0,
+    "groups": {
+      "other": 721.0,
+      "s_wait_kmcnt": 2023.0,
+      "s_wait_loadcnt": 7193.0,
+      "s_wait_xcnt": 66.0,
+      "s_wait_dscnt": 17056.0,
+      "s_barrier": 1060.0,
+      "v_permlane": 0.0
+    }
+  },
+  {
+    "label": "Final GQA L2304 S36",
+    "source": "results/2026-11-05_optimization/att_final_gqa/stats_ui_output_agent_50946_dispatch_38.csv",
+    "stall_cycles": 2146.0,
+    "latency_cycles": 3338.0,
+    "groups": {
+      "other": 20.0,
+      "s_wait_kmcnt": 947.0,
+      "s_wait_loadcnt": 288.0,
+      "s_wait_dscnt": 573.0,
+      "s_barrier": 76.0,
+      "v_wmma": 0.0,
+      "v_permlane": 0.0,
+      "s_wait_tensorcnt": 93.0,
+      "s_wait_xcnt": 149.0
+    }
+  },
+  {
+    "label": "Final MHA L2304 S9",
+    "source": "results/2026-11-05_optimization/att_final_mha/stats_ui_output_agent_4460_dispatch_38.csv",
+    "stall_cycles": 6789.0,
+    "latency_cycles": 14749.0,
+    "groups": {
+      "other": 1330.0,
+      "s_wait_kmcnt": 1535.0,
+      "s_wait_xcnt": 612.0,
+      "s_wait_loadcnt": 340.0,
+      "s_wait_dscnt": 644.0,
+      "s_wait_tensorcnt": 1375.0,
+      "v_permlane": 596.0,
+      "v_wmma": 357.0
+    }
+  },
+  {
+    "label": "Final GQA L256K S256",
+    "source": "results/2026-11-05_optimization/att_final_long/stats_ui_output_agent_5432_dispatch_43.csv",
+    "stall_cycles": 17523.0,
+    "latency_cycles": 44087.0,
+    "groups": {
+      "other": 5329.0,
+      "s_wait_kmcnt": 3447.0,
+      "s_wait_xcnt": 1243.0,
+      "s_wait_loadcnt": 568.0,
+      "s_wait_dscnt": 2173.0,
+      "s_wait_tensorcnt": 936.0,
+      "v_permlane": 2917.0,
+      "v_wmma": 910.0
+    }
+  }
+]

@@ -197,6 +197,21 @@ context in K/V, using `q_len = extend_len` and
 `kv_len = prefix_len + extend_len` for each request.  Causal cross-attention
 and causal GQA are rejected by the current specialization.
 
+## gfx1250 FP8 KV decode
+
+[`amd_pa_decode_fp8.py`](amd_pa_decode_fp8.py) adds decode attention for plain
+E4M3FN KV caches with separate per-KV-head FP32 scales, BF16 or FP8 Q, and BF16
+output. It supports paged 5D caches, grouped query heads, causal attention and
+sliding windows on gfx1250. The optimized tutorial uses packed TDM transfers
+and WMMA; the independent baseline remains available for comparisons.
+
+See the [layout, scale, masking and workspace contract](amd_pa_decode_fp8.rst)
+and the [benchmark report](../../../experiments/fp8-kv-decode/OPTIMIZATION_2026-11-09.md).
+
+```bash
+pytest -s --tb=short third_party/tlx/tutorials/testing/test_correctness.py -k fp8_kv_decode
+```
+
 ## gfx1250 TDM kernels
 
 The gfx1250 tutorials use TDM descriptor transfers and WMMA, including fused

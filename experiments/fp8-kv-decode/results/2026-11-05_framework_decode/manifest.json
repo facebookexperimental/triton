@@ -1,0 +1,82 @@
+{
+  "reference_revisions": {
+    "aiter": "796ff6a35588058516bcaf13129bd0f0b22fb9ae",
+    "vllm": "86fdabec0c82d0470c160aa4df7602ac22c207e6",
+    "sglang": "9b6c796151f836907fbf93265984006ecfd6a790",
+    "tokenspeed": "23791cea04c42d5b6c50980914ccca5a5c4eeb9e"
+  },
+  "runtime": "source-built TLX 3.9.0+fb / Torch 2.12.0+rocm10.1.0",
+  "image": "rocm/sgl-dev:v0.5.23-rocm101-mi45x-20261101",
+  "container": "adkankar-tlx-opt-20261105",
+  "gpu": "CUDA_VISIBLE_DEVICES=0; gfx1250 96-CU DPX 144GiB",
+  "timing": "Three function warmups; graph capture; three replay warmups; GPU events across repeated invocations. p95 is across graph batch means. Packing, reference-oracle setup and compilation excluded. Repeated same-input cache protocol, clocks not locked.",
+  "numerical_gate": {
+    "atol": 0.0005,
+    "rtol": 0.01
+  },
+  "contract": "Plain E4M3FN, per-KV-head K and V FP32 dequant multipliers; per-query-head Q scales for FP8 Q; BF16 output",
+  "source_sha256": {
+    "third_party/tlx/tutorials/amd_pa_decode_fp8.py": "5ee6be387715005f5abbde38b9d67f93349a074fc50c43a7dc8604d725209e67",
+    "third_party/tlx/tutorials/amd_pa_decode_fp8_optimized.py": "b08a518032b13a745e8311841dd93f3924fc03877b2125300484ecdfe450a4f2",
+    "experiments/fp8-kv-decode/bench_decode.py": "c41b6e42f342591416c09e9cc5943b2c772d2d3a6568cce6b1161500b6e4940d",
+    "experiments/fp8-kv-decode/compare_framework_decode.py": "81c4cb6299d57953837e1639c00f9c7776af4598aecdc41c4033930e3d65a2a5",
+    "experiments/fp8-kv-decode/report_framework_decode.py": "9259d87fb3b12cf78b85ed15232f8bd85a2760a9a65ad5d1b6f6d17de6df7f95"
+  },
+  "tlx_unchanged": true,
+  "previous_harness_snapshot": "snapshots/2026-11-05_before_vllm3d_bench_decode.py",
+  "previous_manifest": "results/2026-11-05_optimization/manifest.json",
+  "harness_phases": {
+    "sweep": "2D/stock3D/split/tile/fullTD tuning; prior FP8-Q guards",
+    "final": "extends sweep with KV-only TD; independent repeats",
+    "fp8_validated": "extends two final unit cases after scalar-Q-scale folding; fresh repeats",
+    "framework_routes": "extends eight final shared cases with AITER operator; fresh repeats"
+  },
+  "report_sources": [
+    "final/summary.json",
+    "fp8_validated/summary.json",
+    "framework_routes/summary.json"
+  ],
+  "framework_audit": "framework_route_audit.json",
+  "seed": 182,
+  "selected_cases": 18,
+  "tuning_splits": [
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256
+  ],
+  "tuning_tiles": [
+    32,
+    64,
+    128
+  ],
+  "verification": "Three fresh order-rotated rounds; 15 graph batches x20 replays; median of round medians",
+  "limits": [
+    "Standalone source kernels with shared compiler; not full framework serving",
+    "Scalar/unit scale controls restricted",
+    "Launch-tuned references change host launcher configuration only",
+    "Unmodified optional full-TD MHA fails compiler; KV-only variant separately tested",
+    "No eligible external full-FP8 MHA under project gate/build",
+    "Clocks unlocked; warm repeated inputs",
+    "Exact model head mappings and window undisclosed"
+  ],
+  "hash_scope": "Current reproducible harness after all follow-ups. Historical phase differences are described in harness_phases; original step06 harness is preserved separately.",
+  "selected_verification": {
+    "cases": 18,
+    "configurations": 66,
+    "rounds_per_configuration": 3,
+    "passing_invocations": 198,
+    "failed_invocations": 0
+  },
+  "reference_source_sha256": {
+    "vllm/vllm/v1/attention/ops/triton_unified_attention.py": "4f376e7a028866d3bff3c28839d0f9ea2e09257d1bfb2e0e666e2fd623bc2ff7",
+    "vllm/vllm/v1/attention/ops/triton_decode_attention.py": "11c037446f84359ca2dcdeea6d76f4633aa2b9afad86c30f511ef838d4c4b9ad",
+    "sglang/python/sglang/kernels/ops/attention/decode_attention.py": "f705c2ca71316516dbc0d7af6db12868f76b3eed2232a4c5ff2320a39e11db05",
+    "sglang/python/sglang/kernels/ops/attention/score_mod.py": "127e2e6466bbfac3c2189cc4f2a9d7751fd819b30d25de65378d66ae63bbafa6",
+    "aiter/aiter/ops/triton/attention/unified_attention.py": "295b6b69136b83d36e1f99972fcf79ee327d259676625b8229b433403ab4eed9",
+    "aiter/aiter/ops/triton/gluon/pa_decode_gluon.py": "390688d418289ea2e18dc29bdfcc9fbfc07d332553253fa6e5eb8ea80ba28c23"
+  }
+}

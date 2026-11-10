@@ -1,0 +1,48 @@
+{
+  "core": {
+    "gqa64_l2304": {
+      "tlx_auto": 3.8559000939130783,
+      "aiter_unified": 4.544249922037125,
+      "tlx_frozen": 3.869900107383728
+    },
+    "mha64_l2304": {
+      "tlx_auto": 8.502200245857239,
+      "aiter_unified": 13.902899622917175,
+      "tlx_frozen": 10.235050320625305
+    },
+    "mha128_l2304": {
+      "tlx_auto": 8.448199927806854,
+      "aiter_unified": 12.201999872922897,
+      "tlx_frozen": 15.423600375652313
+    }
+  },
+  "comparisons": {
+    "tlx_faster": 31,
+    "within_3_percent": 4,
+    "aiter_faster": 5
+  },
+  "tlx_cases_passed": 80,
+  "regressions_over_3_percent": [],
+  "aiter_failed_case_names": [
+    "gqa64_w37",
+    "gqa64_fp8_unit",
+    "mha64_w37",
+    "mha64_fp8_unit",
+    "gqa128_w37",
+    "gqa128_fp8_unit",
+    "mha128_w37",
+    "mha128_fp8_unit"
+  ],
+  "framework_verification_runs": 45,
+  "strict_tests": {
+    "name": "pytest",
+    "errors": "0",
+    "failures": "0",
+    "skipped": "8",
+    "tests": "747",
+    "time": "119.068",
+    "timestamp": "2026-11-10T01:59:43.335211+00:00",
+    "hostname": "1af8bab45b52"
+  },
+  "final_utc": "2026-11-10T02:03:23.122632+00:00"
+}

@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="679" viewBox="0 0 1280 679" role="img" aria-labelledby="title desc">
+<title id="title">Dense MHA: packed-cache movement experiments</title>
+<desc id="desc">MHA128/128 D64 L2304 T1. S4/S12/S18 as named; compare each experiment with its recorded control.</desc>
+<rect width="1280" height="679" fill="#f8fafc"/>
+<g font-family="Arial, Helvetica, sans-serif">
+<text x="24" y="36" font-size="25" fill="#0f172a" font-weight="bold">Dense MHA: packed-cache movement experiments</text>
+<text x="24" y="66" font-size="14" fill="#0f172a" font-weight="normal">MHA128/128 D64 L2304 T1. S4/S12/S18 as named; compare each experiment with its recorded control.</text>
+<text x="24" y="92" font-size="14" fill="#0f172a" font-weight="normal">gfx1250 DPX / 96 CUs | E4M3 | numerical gate: atol=5e-4, rtol=1e-2</text>
+<text x="24" y="119" font-size="13" fill="#92400e" font-weight="normal">Orange: failed numerical gate; latency shown for diagnosis and ineligible for performance wins.</text>
+<text x="24" y="155" font-size="15" fill="#0f172a" font-weight="bold">tdm_mha_s4</text>
+<text x="36" y="199" font-size="15" fill="#0f172a" font-weight="normal">tlx_matrix_tdm_pipe</text>
+<rect x="260" y="181" width="541.67" height="25" fill="#15803d" rx="3"/>
+<text x="970" y="199" font-size="15" fill="#0f172a" font-weight="bold">25.59 us</text>
+<text x="1080" y="199" font-size="13" fill="#0f172a" font-weight="normal">max error 0.00017</text>
+<text x="36" y="236" font-size="15" fill="#0f172a" font-weight="normal">tlx_matrix_tdm</text>
+<rect x="260" y="218" width="700.00" height="25" fill="#15803d" rx="3"/>
+<text x="970" y="236" font-size="15" fill="#0f172a" font-weight="bold">33.07 us</text>
+<text x="1080" y="236" font-size="13" fill="#0f172a" font-weight="normal">max error 0.00017</text>
+<text x="36" y="273" font-size="15" fill="#0f172a" font-weight="normal">tlx_vector</text>
+<rect x="260" y="255" width="515.91" height="25" fill="#15803d" rx="3"/>
+<text x="970" y="273" font-size="15" fill="#0f172a" font-weight="bold">24.37 us</text>
+<text x="1080" y="273" font-size="13" fill="#0f172a" font-weight="normal">max error 0.00016</text>
+<text x="24" y="292" font-size="15" fill="#0f172a" font-weight="bold">flat_mha_s4</text>
+<text x="36" y="336" font-size="15" fill="#0f172a" font-weight="normal">tlx_matrix_tdm_flat</text>
+<rect x="260" y="318" width="518.45" height="25" fill="#15803d" rx="3"/>
+<text x="970" y="336" font-size="15" fill="#0f172a" font-weight="bold">24.49 us</text>
+<text x="1080" y="336" font-size="13" fill="#0f172a" font-weight="normal">max error 0.00017</text>
+<text x="24" y="355" font-size="15" fill="#0f172a" font-weight="bold">vpage_mha_s12</text>
+<text x="36" y="399" font-size="15" fill="#0f172a" font-weight="normal">tlx_vector_page</text>
+<rect x="260" y="381" width="396.89" height="25" fill="#15803d" rx="3"/>
+<text x="970" y="399" font-size="15" fill="#0f172a" font-weight="bold">18.75 us</text>
+<text x="1080" y="399" font-size="13" fill="#0f172a" font-weight="normal">max error 0.00016</text>
+<text x="24" y="418" font-size="15" fill="#0f172a" font-weight="bold">warps_mha_w1_s12</text>
+<text x="36" y="462" font-size="15" fill="#0f172a" font-weight="normal">tlx_matrix_tdm_flat</text>
+<rect x="260" y="444" width="349.28" height="25" fill="#15803d" rx="3"/>
+<text x="970" y="462" font-size="15" fill="#0f172a" font-weight="bold">16.50 us</text>
+<text x="1080" y="462" font-size="13" fill="#0f172a" font-weight="normal">max error 0.00016</text>
+<text x="36" y="499" font-size="15" fill="#0f172a" font-weight="normal">tlx_vector_page</text>
+<rect x="260" y="481" width="402.23" height="25" fill="#15803d" rx="3"/>
+<text x="970" y="499" font-size="15" fill="#0f172a" font-weight="bold">19.00 us</text>
+<text x="1080" y="499" font-size="13" fill="#0f172a" font-weight="normal">max error 0.00016</text>
+<text x="36" y="536" font-size="15" fill="#0f172a" font-weight="normal">tlx_matrix</text>
+<rect x="260" y="518" width="551.16" height="25" fill="#15803d" rx="3"/>
+<text x="970" y="536" font-size="15" fill="#0f172a" font-weight="bold">26.04 us</text>
+<text x="1080" y="536" font-size="13" fill="#0f172a" font-weight="normal">max error 0.00016</text>
+<text x="24" y="555" font-size="15" fill="#0f172a" font-weight="bold">dualqk_mha_first</text>
+<text x="36" y="599" font-size="15" fill="#0f172a" font-weight="normal">tlx_matrix_dualqk</text>
+<rect x="260" y="581" width="561.32" height="25" fill="#15803d" rx="3"/>
+<text x="970" y="599" font-size="15" fill="#0f172a" font-weight="bold">26.52 us</text>
+<text x="1080" y="599" font-size="13" fill="#0f172a" font-weight="normal">max error 0.00016</text>
+<text x="36" y="636" font-size="15" fill="#0f172a" font-weight="normal">tlx_matrix_tdm_flat</text>
+<rect x="260" y="618" width="344.03" height="25" fill="#15803d" rx="3"/>
+<text x="970" y="636" font-size="15" fill="#0f172a" font-weight="bold">16.25 us</text>
+<text x="1080" y="636" font-size="13" fill="#0f172a" font-weight="normal">max error 0.00016</text>
+</g></svg>

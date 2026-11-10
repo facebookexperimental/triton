@@ -1,0 +1,11 @@
+source,backend,status,median_us,p95_batch_mean_us,caller_median_us,max_abs_error
+results/2026-11-05_optimization/latest/gqa_fp8_unit.json,tlx_auto,pass,4.050000011920929,4.210099950432777,61.288,0.00011725351214408875
+results/2026-11-05_optimization/latest/gqa_fp8_unit.json,aiter_unified,failed_accuracy,4.878399893641472,5.182600021362305,141.835,0.0014246944338083267
+results/2026-11-05_optimization/latest/gqa_fp8_unit.json,aiter_dense,failed_accuracy,17.824900150299072,18.084999918937683,105.746,0.0015740729868412018
+results/2026-11-05_optimization/latest/gqa_fp8_unit.json,tokenspeed,failed_accuracy,6.875400245189667,7.231499999761581,69.157,0.0017918352968990803
+results/2026-11-05_optimization/latest/gqa_fp8_unit.json,vllm_unified,failed_accuracy,25.580701231956482,25.72070062160492,95.806,0.0016259574331343174
+results/2026-11-05_optimization/latest/mha_fp8_unit.json,tlx_auto,pass,10.00090017914772,10.453200340270996,66.548,0.00012592971324920654
+results/2026-11-05_optimization/latest/mha_fp8_unit.json,aiter_unified,failed_accuracy,13.826799392700195,14.251099526882172,141.315,0.0017202142626047134
+results/2026-11-05_optimization/latest/mha_fp8_unit.json,aiter_dense,failed_accuracy,32.964399456977844,33.16450119018555,126.355,0.0018561957404017448
+results/2026-11-05_optimization/latest/mha_fp8_unit.json,tokenspeed,failed_accuracy,29.310500621795654,29.58270013332367,78.987,0.0038781259208917618
+results/2026-11-05_optimization/latest/mha_fp8_unit.json,vllm_unified,failed_accuracy,34.38510000705719,34.813299775123596,107.086,0.0017278341110795736

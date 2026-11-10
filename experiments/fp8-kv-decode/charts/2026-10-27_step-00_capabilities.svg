@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1205" height="687" viewBox="0 0 1205 687" role="img" aria-labelledby="title desc">
+<title id="title">FP8 KV decode reference capabilities</title>
+<desc id="desc">Pinned source inspection; only TLX has been executed in this work.</desc>
+<rect width="1205" height="687" fill="#f8fafc"/>
+<g font-family="Arial, Helvetica, sans-serif">
+<text x="28" y="38" font-size="26" fill="#0f172a" font-weight="bold">FP8 KV decode: reference comparison</text>
+<text x="28" y="65" font-size="15" fill="#0f172a" font-weight="normal">2026-10-27 | gfx1250 target | source capabilities, not a performance ranking</text>
+<text x="28" y="91" font-size="16" fill="#92400e" font-weight="bold">Kernel latency / speedup: UNMEASURED for every candidate</text>
+<text x="254" y="140" font-size="14" fill="#0f172a" font-weight="bold">BF16 Q / FP8 KV</text>
+<text x="409" y="140" font-size="14" fill="#0f172a" font-weight="bold">Full FP8 QKV</text>
+<text x="564" y="140" font-size="14" fill="#0f172a" font-weight="bold">KV scales</text>
+<text x="719" y="140" font-size="14" fill="#0f172a" font-weight="bold">Cache layout</text>
+<text x="874" y="140" font-size="14" fill="#0f172a" font-weight="bold">Sliding window</text>
+<text x="1029" y="140" font-size="14" fill="#0f172a" font-weight="bold">Local GPU check</text>
+<text x="28" y="181" font-size="17" fill="#0f172a" font-weight="bold">TLX prototype</text>
+<text x="28" y="202" font-size="13" fill="#475569" font-weight="normal">step-01 snapshot</text>
+<rect x="245" y="158" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="254" y="189" font-size="14" fill="#166534" font-weight="normal">Yes</text>
+<rect x="400" y="158" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="409" y="189" font-size="14" fill="#166534" font-weight="normal">Yes</text>
+<rect x="555" y="158" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="564" y="189" font-size="14" fill="#166534" font-weight="normal">Per KV head</text>
+<rect x="710" y="158" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="719" y="189" font-size="14" fill="#166534" font-weight="normal">Packed 5D</text>
+<rect x="865" y="158" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="874" y="189" font-size="14" fill="#166534" font-weight="normal">Yes</text>
+<rect x="1020" y="158" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="1029" y="189" font-size="14" fill="#166534" font-weight="normal">27 checks pass</text>
+<text x="28" y="245" font-size="17" fill="#0f172a" font-weight="bold">AITER unified</text>
+<text x="28" y="266" font-size="13" fill="#475569" font-weight="normal">1dd826c4</text>
+<rect x="245" y="222" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="254" y="253" font-size="14" fill="#166534" font-weight="normal">Decode path</text>
+<rect x="400" y="222" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="409" y="253" font-size="14" fill="#166534" font-weight="normal">Yes</text>
+<rect x="555" y="222" width="149" height="52" rx="5" fill="#fef3c7"/>
+<text x="564" y="253" font-size="14" fill="#92400e" font-weight="normal">Scalar</text>
+<rect x="710" y="222" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="719" y="253" font-size="14" fill="#166534" font-weight="normal">Paged / shuffled</text>
+<rect x="865" y="222" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="874" y="253" font-size="14" fill="#166534" font-weight="normal">Yes</text>
+<rect x="1020" y="222" width="149" height="52" rx="5" fill="#e2e8f0"/>
+<text x="1029" y="253" font-size="14" fill="#475569" font-weight="normal">Not run</text>
+<text x="28" y="309" font-size="17" fill="#0f172a" font-weight="bold">TokenSpeed decode</text>
+<text x="28" y="330" font-size="13" fill="#475569" font-weight="normal">6fb2852d</text>
+<rect x="245" y="286" width="149" height="52" rx="5" fill="#fee2e2"/>
+<text x="254" y="317" font-size="14" fill="#991b1b" font-weight="normal">Rejected</text>
+<rect x="400" y="286" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="409" y="317" font-size="14" fill="#166534" font-weight="normal">Yes</text>
+<rect x="555" y="286" width="149" height="52" rx="5" fill="#fef3c7"/>
+<text x="564" y="317" font-size="14" fill="#92400e" font-weight="normal">No scale args</text>
+<rect x="710" y="286" width="149" height="52" rx="5" fill="#fef3c7"/>
+<text x="719" y="317" font-size="14" fill="#92400e" font-weight="normal">Paged 4D</text>
+<rect x="865" y="286" width="149" height="52" rx="5" fill="#fee2e2"/>
+<text x="874" y="317" font-size="14" fill="#991b1b" font-weight="normal">Rejected</text>
+<rect x="1020" y="286" width="149" height="52" rx="5" fill="#e2e8f0"/>
+<text x="1029" y="317" font-size="14" fill="#475569" font-weight="normal">Not run</text>
+<text x="28" y="373" font-size="17" fill="#0f172a" font-weight="bold">AITER dense MHA</text>
+<text x="28" y="394" font-size="13" fill="#475569" font-weight="normal">1dd826c4</text>
+<rect x="245" y="350" width="149" height="52" rx="5" fill="#fee2e2"/>
+<text x="254" y="381" font-size="14" fill="#991b1b" font-weight="normal">Rejected</text>
+<rect x="400" y="350" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="409" y="381" font-size="14" fill="#166534" font-weight="normal">Yes</text>
+<rect x="555" y="350" width="149" height="52" rx="5" fill="#fef3c7"/>
+<text x="564" y="381" font-size="14" fill="#92400e" font-weight="normal">Scalar</text>
+<rect x="710" y="350" width="149" height="52" rx="5" fill="#fef3c7"/>
+<text x="719" y="381" font-size="14" fill="#92400e" font-weight="normal">Dense 4D</text>
+<rect x="865" y="350" width="149" height="52" rx="5" fill="#fee2e2"/>
+<text x="874" y="381" font-size="14" fill="#991b1b" font-weight="normal">No window API</text>
+<rect x="1020" y="350" width="149" height="52" rx="5" fill="#e2e8f0"/>
+<text x="1029" y="381" font-size="14" fill="#475569" font-weight="normal">Not run</text>
+<text x="28" y="437" font-size="17" fill="#0f172a" font-weight="bold">vLLM unified</text>
+<text x="28" y="458" font-size="13" fill="#475569" font-weight="normal">0855defd</text>
+<rect x="245" y="414" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="254" y="445" font-size="14" fill="#166534" font-weight="normal">Yes</text>
+<rect x="400" y="414" width="149" height="52" rx="5" fill="#fef3c7"/>
+<text x="409" y="445" font-size="14" fill="#92400e" font-weight="normal">Separate path</text>
+<rect x="555" y="414" width="149" height="52" rx="5" fill="#fef3c7"/>
+<text x="564" y="445" font-size="14" fill="#92400e" font-weight="normal">Token + head</text>
+<rect x="710" y="414" width="149" height="52" rx="5" fill="#fef3c7"/>
+<text x="719" y="445" font-size="14" fill="#92400e" font-weight="normal">Paged 4D</text>
+<rect x="865" y="414" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="874" y="445" font-size="14" fill="#166534" font-weight="normal">Yes</text>
+<rect x="1020" y="414" width="149" height="52" rx="5" fill="#e2e8f0"/>
+<text x="1029" y="445" font-size="14" fill="#475569" font-weight="normal">Not run</text>
+<text x="28" y="501" font-size="17" fill="#0f172a" font-weight="bold">SGLang decode</text>
+<text x="28" y="522" font-size="13" fill="#475569" font-weight="normal">010eb729</text>
+<rect x="245" y="478" width="149" height="52" rx="5" fill="#dcfce7"/>
+<text x="254" y="509" font-size="14" fill="#166534" font-weight="normal">Yes</text>
+<rect x="400" y="478" width="149" height="52" rx="5" fill="#e2e8f0"/>
+<text x="409" y="509" font-size="14" fill="#475569" font-weight="normal">Unverified</text>
+<rect x="555" y="478" width="149" height="52" rx="5" fill="#fef3c7"/>
+<text x="564" y="509" font-size="14" fill="#92400e" font-weight="normal">Scalar</text>
+<rect x="710" y="478" width="149" height="52" rx="5" fill="#fef3c7"/>
+<text x="719" y="509" font-size="14" fill="#92400e" font-weight="normal">Paged 3D/4D</text>
+<rect x="865" y="478" width="149" height="52" rx="5" fill="#fef3c7"/>
+<text x="874" y="509" font-size="14" fill="#92400e" font-weight="normal">Adapter needed</text>
+<rect x="1020" y="478" width="149" height="52" rx="5" fill="#e2e8f0"/>
+<text x="1029" y="509" font-size="14" fill="#475569" font-weight="normal">Not run</text>
+<rect x="28" y="550" width="13" height="13" fill="#dcfce7"/>
+<text x="47" y="562" font-size="12" fill="#166534" font-weight="normal">Supported / validated as labeled</text>
+<rect x="323" y="550" width="13" height="13" fill="#fef3c7"/>
+<text x="342" y="562" font-size="12" fill="#92400e" font-weight="normal">Restricted or adapter required</text>
+<rect x="618" y="550" width="13" height="13" fill="#fee2e2"/>
+<text x="637" y="562" font-size="12" fill="#991b1b" font-weight="normal">Unsupported at this interface</text>
+<rect x="913" y="550" width="13" height="13" fill="#e2e8f0"/>
+<text x="932" y="562" font-size="12" fill="#475569" font-weight="normal">Unverified / not run</text>
+<text x="28" y="595" font-size="14" fill="#475569" font-weight="normal">Source capability is not measured correctness or performance on this host.</text>
+<text x="28" y="618" font-size="14" fill="#475569" font-weight="normal">AITER gfx1250 Gluon 3D requires shuffled KV; 2D has different dtype/feature gates.</text>
+<text x="28" y="641" font-size="14" fill="#475569" font-weight="normal">TokenSpeed comparison: full-FP8, unit scales, q_len=1, no sliding window.</text>
+<text x="28" y="664" font-size="14" fill="#475569" font-weight="normal">Token-head scale broadcasting and all layout adapters remain unvalidated. All kernel latency cells are unmeasured.</text>
+</g></svg>

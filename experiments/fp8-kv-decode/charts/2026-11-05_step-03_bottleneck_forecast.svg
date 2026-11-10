@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1305" height="713" viewBox="0 0 1305 713" role="img" aria-labelledby="title desc">
+<title id="title">FP8 KV decode bottleneck forecast</title>
+<desc id="desc">Qualitative predictions only; no measured speedups or kernel latency.</desc>
+<rect width="1305" height="713" fill="#f8fafc"/>
+<g font-family="Arial, Helvetica, sans-serif">
+<text x="28" y="38" font-size="25" fill="#0f172a" font-weight="bold">FP8 KV decode: expected bottlenecks and optimization directions</text>
+<text x="28" y="67" font-size="16" fill="#92400e" font-weight="normal">2026-11-05 | Forecast from source inspection; not a measured ranking</text>
+<text x="28" y="94" font-size="15" fill="#0f172a" font-weight="normal">Per-head K/V scales are required. No native FP8 WMMA or GQA load sharing in the prototype yet.</text>
+<text x="28" y="140" font-size="16" fill="#0f172a" font-weight="bold">Potential limitation</text>
+<text x="330" y="140" font-size="16" fill="#0f172a" font-weight="bold">Most relevant workloads</text>
+<text x="700" y="140" font-size="16" fill="#0f172a" font-weight="bold">Optimization to test</text>
+<rect x="20" y="160" width="1260" height="62" rx="5" fill="#e2e8f0"/>
+<text x="28" y="186" font-size="16" fill="#0f172a" font-weight="bold">KV payload bandwidth</text>
+<text x="330" y="186" font-size="15" fill="#0f172a" font-weight="normal">T=1; long contexts</text>
+<text x="700" y="184" font-size="15" fill="#0f172a" font-weight="normal">Coalesced/vectorized packed reads;</text>
+<text x="700" y="206" font-size="15" fill="#0f172a" font-weight="normal">enough concurrent KV partitions.</text>
+<rect x="20" y="230" width="1260" height="62" rx="5" fill="#e2e8f0"/>
+<text x="28" y="256" font-size="16" fill="#0f172a" font-weight="bold">Repeated KV loads</text>
+<text x="330" y="256" font-size="15" fill="#0f172a" font-weight="normal">GQA; queries sharing a cache</text>
+<text x="700" y="254" font-size="15" fill="#0f172a" font-weight="normal">Tile query heads/tokens together;</text>
+<text x="700" y="276" font-size="15" fill="#0f172a" font-weight="normal">reuse K/V within the KV-head group.</text>
+<rect x="20" y="300" width="1260" height="62" rx="5" fill="#e2e8f0"/>
+<text x="28" y="326" font-size="16" fill="#0f172a" font-weight="bold">FP32 vector arithmetic</text>
+<text x="330" y="326" font-size="15" fill="#0f172a" font-weight="normal">Useful GQA / multi-query tiles</text>
+<text x="700" y="324" font-size="15" fill="#0f172a" font-weight="normal">WMMA QK/PV with an accuracy gate;</text>
+<text x="700" y="346" font-size="15" fill="#0f172a" font-weight="normal">retain a vector path for underfilled tiles.</text>
+<rect x="20" y="370" width="1260" height="62" rx="5" fill="#e2e8f0"/>
+<text x="28" y="396" font-size="16" fill="#0f172a" font-weight="bold">Serialized movement / LDS</text>
+<text x="330" y="396" font-size="15" fill="#0f172a" font-weight="normal">All; strongly layout dependent</text>
+<text x="700" y="394" font-size="15" fill="#0f172a" font-weight="normal">Vectorize packed V, trim LDS round trips;</text>
+<text x="700" y="416" font-size="15" fill="#0f172a" font-weight="normal">prefetch/double-buffer with occupancy checks.</text>
+<rect x="20" y="440" width="1260" height="62" rx="5" fill="#e2e8f0"/>
+<text x="28" y="466" font-size="16" fill="#0f172a" font-weight="bold">Split / launch / allocation</text>
+<text x="330" y="466" font-size="15" fill="#0f172a" font-weight="normal">Short cases; small effective context</text>
+<text x="700" y="464" font-size="15" fill="#0f172a" font-weight="normal">Tune splits by batch/head parallelism;</text>
+<text x="700" y="486" font-size="15" fill="#0f172a" font-weight="normal">one-split direct output; reusable workspace.</text>
+<rect x="20" y="510" width="1260" height="62" rx="5" fill="#e2e8f0"/>
+<text x="28" y="536" font-size="16" fill="#0f172a" font-weight="bold">Empty splits under SWA</text>
+<text x="330" y="536" font-size="15" fill="#0f172a" font-weight="normal">Window much shorter than context</text>
+<text x="700" y="534" font-size="15" fill="#0f172a" font-weight="normal">Partition the active window;</text>
+<text x="700" y="556" font-size="15" fill="#0f172a" font-weight="normal">reduce empty CTAs and merge work.</text>
+<text x="28" y="608" font-size="15" fill="#475569" font-weight="normal">Calculated K+V payload at width 8192: 36 MiB (L=2304), 2 GiB (128K), 4 GiB (256K).</text>
+<text x="28" y="633" font-size="15" fill="#475569" font-weight="normal">These are payload calculations, not measured HBM traffic or latency. Cache reuse and SWA affect reads.</text>
+<text x="28" y="658" font-size="15" fill="#475569" font-weight="normal">Scale placement is already hoisted; FP8 matrix arithmetic additionally needs a probability-range accuracy check.</text>
+<text x="28" y="683" font-size="15" fill="#475569" font-weight="normal">Validate mechanisms with ATT/PMC; establish wins with matched unprofiled timing and numerical checks.</text>
+</g></svg>

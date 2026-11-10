@@ -1,0 +1,137 @@
+{
+  "start": {
+    "start_utc": "2026-11-09 22:50:52 UTC",
+    "target_end_utc": "2026-11-10 00:50:52 UTC",
+    "gpu": 2,
+    "reason": "GPU0 active; GPU2 idle same96CU gfx1250 agent class",
+    "frozen_sha256": {
+      "amd_pa_decode_fp8_optimized.py": "b08a518032b13a745e8311841dd93f3924fc03877b2125300484ecdfe450a4f2",
+      "amd_pa_decode_fp8.py": "5ee6be387715005f5abbde38b9d67f93349a074fc50c43a7dc8604d725209e67"
+    }
+  },
+  "phase": "final comparisons after host reboot; frozen/current repeated together",
+  "reference_revisions": {
+    "aiter": "796ff6a35588058516bcaf13129bd0f0b22fb9ae",
+    "vllm": "86fdabec0c82d0470c160aa4df7602ac22c207e6",
+    "sglang": "9b6c796151f836907fbf93265984006ecfd6a790",
+    "tokenspeed": "23791cea04c42d5b6c50980914ccca5a5c4eeb9e"
+  },
+  "reference_source_sha256": {
+    "vllm/vllm/v1/attention/ops/triton_unified_attention.py": "4f376e7a028866d3bff3c28839d0f9ea2e09257d1bfb2e0e666e2fd623bc2ff7",
+    "vllm/vllm/v1/attention/ops/triton_decode_attention.py": "11c037446f84359ca2dcdeea6d76f4633aa2b9afad86c30f511ef838d4c4b9ad",
+    "sglang/python/sglang/kernels/ops/attention/decode_attention.py": "f705c2ca71316516dbc0d7af6db12868f76b3eed2232a4c5ff2320a39e11db05",
+    "sglang/python/sglang/kernels/ops/attention/score_mod.py": "127e2e6466bbfac3c2189cc4f2a9d7751fd819b30d25de65378d66ae63bbafa6",
+    "aiter/aiter/ops/triton/attention/unified_attention.py": "295b6b69136b83d36e1f99972fcf79ee327d259676625b8229b433403ab4eed9",
+    "aiter/aiter/ops/triton/gluon/pa_decode_gluon.py": "390688d418289ea2e18dc29bdfcc9fbfc07d332553253fa6e5eb8ea80ba28c23"
+  },
+  "original_prototype_AST_unchanged": {
+    "_decode_fp8_partitions": true,
+    "_decode_fp8_merge": true
+  },
+  "source_sha256": {
+    "third_party/tlx/tutorials/amd_pa_decode_fp8.py": "71fdb0aa5806a0421306a084e1b7871d506c66dee5749b1ecb1ad3f637c176dc",
+    "third_party/tlx/tutorials/amd_pa_decode_fp8_optimized.py": "7c573b3288e66ef7c2d1b61764982053931f729260ad883a1638742dc8160d6b",
+    "experiments/fp8-kv-decode/bench_decode.py": "f9a7cacc91e2d2204fc5cc75215ba9d070269c19777fed7b2cfbdf6d1bea0f13",
+    "experiments/fp8-kv-decode/audit_decode.py": "6be8b68357a75e9ebe9567437a9ae15b21342c001ab2e1933940f96b1c72a5e9",
+    "experiments/fp8-kv-decode/explore_decode.py": "e72920a68e45c905436421084e74187f9bb95b51efae0837e17f60b680361efc",
+    "experiments/fp8-kv-decode/compare_framework_decode.py": "5efad48bd5a43da07565437c6fce96712e79e5a6dd3c0e250d33690a518f63e2",
+    "experiments/fp8-kv-decode/report_optimization.py": "e274a1e6a29347788efc3a0977ea9307ce05e565489b0901941b57c8888332e1",
+    "experiments/fp8-kv-decode/summarize_audit.py": "10257266a2bd586736cca6e163bed3504fa29a3ab16e25d6af9d524c0c09c0fc"
+  },
+  "accuracy": {
+    "atol": 0.0005,
+    "rtol": 0.01,
+    "oracle": "FP32 on actual quantized inputs",
+    "final": "correctness_final_v2.xml",
+    "prior_post_restart_passed": 739,
+    "prior_post_restart_skipped": 8,
+    "passed": 739,
+    "skipped": 8
+  },
+  "contract": "E4M3FN KV, arbitrary separate per-KV-head FP32 descales, BF16/FP8 Q, BF16 output before projection",
+  "runtime": {
+    "torch": "2.12.0+rocm10.1.0",
+    "triton": "3.9.0+fb",
+    "compiler_changes": false,
+    "gpu": 2,
+    "arch": "gfx1250",
+    "cus": 96,
+    "memory_mib": 147456,
+    "pci": [
+      2,
+      4,
+      0
+    ],
+    "clocks_locked": false
+  },
+  "timing": {
+    "rounds": 3,
+    "samples_per_round": 15,
+    "invocations_per_sample": 20,
+    "scope": "GPU event graph batch means; includes split/merge; excludes packing/quantization/compilation/oracle",
+    "warm_cache": true
+  },
+  "limits": [
+    "Finite synthetic matrix; undisclosed exact model mapping/T-mask/SWA-window",
+    "AITER scalar shared/unit controls only",
+    "ATT sampled cycles are not utilization; no usable PMC counters",
+    "Short-window retries lack completed nonzero instruction statistics"
+  ],
+  "source_snapshots": [
+    "frozen",
+    "step14_source",
+    "pre075",
+    "pre077",
+    "final_source"
+  ],
+  "final_matrix": "repeated_final_v2.json",
+  "final_framework_controls": "framework_final_v2/summary.json",
+  "final_summary": {
+    "core": {
+      "gqa64_l2304": {
+        "tlx_auto": 3.8559000939130783,
+        "aiter_unified": 4.544249922037125,
+        "tlx_frozen": 3.869900107383728
+      },
+      "mha64_l2304": {
+        "tlx_auto": 8.502200245857239,
+        "aiter_unified": 13.902899622917175,
+        "tlx_frozen": 10.235050320625305
+      },
+      "mha128_l2304": {
+        "tlx_auto": 8.448199927806854,
+        "aiter_unified": 12.201999872922897,
+        "tlx_frozen": 15.423600375652313
+      }
+    },
+    "comparisons": {
+      "tlx_faster": 31,
+      "within_3_percent": 4,
+      "aiter_faster": 5
+    },
+    "tlx_cases_passed": 80,
+    "regressions_over_3_percent": [],
+    "aiter_failed_case_names": [
+      "gqa64_w37",
+      "gqa64_fp8_unit",
+      "mha64_w37",
+      "mha64_fp8_unit",
+      "gqa128_w37",
+      "gqa128_fp8_unit",
+      "mha128_w37",
+      "mha128_fp8_unit"
+    ],
+    "framework_verification_runs": 45,
+    "strict_tests": {
+      "name": "pytest",
+      "errors": "0",
+      "failures": "0",
+      "skipped": "8",
+      "tests": "747",
+      "time": "119.068",
+      "timestamp": "2026-11-10T01:59:43.335211+00:00",
+      "hostname": "1af8bab45b52"
+    },
+    "final_utc": "2026-11-10T02:03:23.122632+00:00"
+  }
+}

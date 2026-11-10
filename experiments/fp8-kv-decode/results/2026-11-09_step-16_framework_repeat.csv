@@ -1,0 +1,13 @@
+case,heads,kv_heads,dim,length,window,scales,fp8_q,family,backend,splits,block_n,median_us,min_us,max_us,raw_file
+gqa2304_shared,16,2,64,2304,0,shared,False,tlx,tlx_auto,16,64,3.8318999111652374,3.811899945139885,3.853899985551834,results/2026-11-09_optimization/framework_final_v2/gqa2304_shared_verification.json
+gqa2304_shared,16,2,64,2304,0,shared,False,vllm_native,vllm_unified_3d,256,64,5.606750026345253,5.598749965429306,5.608800053596497,results/2026-11-09_optimization/framework_final_v2/gqa2304_shared_verification.json
+gqa2304_shared,16,2,64,2304,0,shared,False,sglang_native,sglang,32,64,9.37265008687973,9.342650324106216,9.380649775266647,results/2026-11-09_optimization/framework_final_v2/gqa2304_shared_verification.json
+gqa2304_shared,16,2,64,2304,0,shared,False,aiter_shared_operator,aiter_unified,16,64,4.552249982953072,4.544249922037125,4.582250118255615,results/2026-11-09_optimization/framework_final_v2/gqa2304_shared_verification.json
+mha2304_shared,128,128,64,2304,0,shared,False,tlx,tlx_auto,16,64,8.646299690008163,8.63030031323433,8.652299642562866,results/2026-11-09_optimization/framework_final_v2/mha2304_shared_verification.json
+mha2304_shared,128,128,64,2304,0,shared,False,vllm_native,vllm_unified_kvtd3d,16,64,26.839250326156616,26.78920030593872,26.843249797821045,results/2026-11-09_optimization/framework_final_v2/mha2304_shared_verification.json
+mha2304_shared,128,128,64,2304,0,shared,False,sglang_native,sglang,32,64,44.75409984588623,44.75409984588623,44.78614926338196,results/2026-11-09_optimization/framework_final_v2/mha2304_shared_verification.json
+mha2304_shared,128,128,64,2304,0,shared,False,aiter_shared_operator,aiter_unified,16,64,14.066949486732483,14.02290016412735,14.078949391841888,results/2026-11-09_optimization/framework_final_v2/mha2304_shared_verification.json
+d128_shared,64,64,128,2304,0,shared,False,tlx,tlx_auto,16,64,8.262050151824951,8.258099853992462,8.268050104379654,results/2026-11-09_optimization/framework_final_v2/d128_shared_verification.json
+d128_shared,64,64,128,2304,0,shared,False,vllm_native,vllm_unified_kvtd3d,16,64,23.077400028705597,23.063400387763977,23.085400462150574,results/2026-11-09_optimization/framework_final_v2/d128_shared_verification.json
+d128_shared,64,64,128,2304,0,shared,False,sglang_native,sglang,32,64,57.5003981590271,57.484400272369385,57.51444697380066,results/2026-11-09_optimization/framework_final_v2/d128_shared_verification.json
+d128_shared,64,64,128,2304,0,shared,False,aiter_shared_operator,aiter_unified,16,64,12.226049602031708,12.224049866199493,12.240049988031387,results/2026-11-09_optimization/framework_final_v2/d128_shared_verification.json

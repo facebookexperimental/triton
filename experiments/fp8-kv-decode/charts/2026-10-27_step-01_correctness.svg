@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="480" viewBox="0 0 1080 480" role="img" aria-labelledby="title desc">
+<title id="title">TLX FP8 decode correctness milestones</title>
+<desc id="desc">Initial suite: 17/17. Expanded suite: 27/27. No performance measurements.</desc>
+<rect width="1080" height="480" fill="#f8fafc"/>
+<g font-family="Arial, Helvetica, sans-serif">
+<text x="28" y="38" font-size="26" fill="#0f172a" font-weight="bold">TLX gfx1250 correctness milestones</text>
+<text x="28" y="68" font-size="16" fill="#0f172a" font-weight="normal">2026-10-27 | Independent FP32 attention over quantized inputs</text>
+<text x="28" y="96" font-size="16" fill="#92400e" font-weight="normal">Different suite sizes. These bars show test coverage, not kernel speed.</text>
+<text x="28" y="168" font-size="17" fill="#0f172a" font-weight="bold">Initial correctness suite</text>
+<text x="28" y="192" font-size="13" fill="#475569" font-weight="normal">Earlier source not retained</text>
+<rect x="285" y="145" width="377.77777777777777" height="45" rx="5" fill="#e2e8f0"/>
+<rect x="285" y="145" width="377.77777777777777" height="45" rx="5" fill="#15803d"/>
+<text x="677.7777777777778" y="174" font-size="17" fill="#166534" font-weight="bold">17/17 passed</text>
+<text x="28" y="273" font-size="17" fill="#0f172a" font-weight="bold">Expanded correctness suite</text>
+<text x="28" y="297" font-size="13" fill="#475569" font-weight="normal">Frozen step-01 source patch</text>
+<rect x="285" y="250" width="600.0" height="45" rx="5" fill="#e2e8f0"/>
+<rect x="285" y="250" width="600.0" height="45" rx="5" fill="#15803d"/>
+<text x="900.0" y="279" font-size="17" fill="#166534" font-weight="bold">27/27 passed</text>
+<text x="28" y="385" font-size="15" fill="#0f172a" font-weight="normal">Expanded suite: BF16/FP8 Q, distinct head scales, shuffled pages, GQA, SWA, empty/tail cases,</text>
+<text x="28" y="410" font-size="15" fill="#0f172a" font-weight="normal">split merge, T=8..8192, 8192-wide dense view and 128K/256K contexts (selected head counts).</text>
+<text x="28" y="450" font-size="15" fill="#475569" font-weight="normal">All external references: source reviewed only. Kernel latency and speedup remain unmeasured.</text>
+</g></svg>

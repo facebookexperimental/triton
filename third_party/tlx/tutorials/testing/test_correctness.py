@@ -91,6 +91,20 @@ if is_hopper_or_newer():
         attention as _hopper_fa_ws_pipelined_pingpong,
     )
 
+# Re-export the parametrized tutorial tests through the normal correctness entry.
+# Plain imports also let the kernel-only CI selector see both implementations;
+# it cannot follow the tutorial's lazy importlib load of its sibling file.
+if is_hip_gfx1250():
+    import triton.language.extra.tlx.tutorials.amd_pa_decode_fp8 as _fp8_decode_tests
+    import triton.language.extra.tlx.tutorials.amd_pa_decode_fp8_optimized  # noqa: F401
+
+    test_fp8_kv_decode = _fp8_decode_tests.test_fp8_kv_decode
+    test_fp8_kv_decode_validation = _fp8_decode_tests.test_fp8_kv_decode_validation
+    test_fp8_kv_decode_query_sweep = _fp8_decode_tests.test_fp8_kv_decode_query_sweep
+    test_fp8_kv_decode_tile_sizes = _fp8_decode_tests.test_fp8_kv_decode_tile_sizes
+    test_fp8_kv_decode_peaked_and_workspace = _fp8_decode_tests.test_fp8_kv_decode_peaked_and_workspace
+    test_fp8_kv_decode_tiny_probability_mass = _fp8_decode_tests.test_fp8_kv_decode_tiny_probability_mass
+
 if is_hip():
     from triton.language.extra.tlx.tutorials.amd_fa_pipelined import (
         attention as _amd_fa_pipelined, )

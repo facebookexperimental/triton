@@ -1,0 +1,10 @@
+{
+  "start_utc": "2026-11-09 22:50:52 UTC",
+  "target_end_utc": "2026-11-10 00:50:52 UTC",
+  "gpu": 2,
+  "reason": "GPU0 active; GPU2 idle same96CU gfx1250 agent class",
+  "frozen_sha256": {
+    "amd_pa_decode_fp8_optimized.py": "b08a518032b13a745e8311841dd93f3924fc03877b2125300484ecdfe450a4f2",
+    "amd_pa_decode_fp8.py": "5ee6be387715005f5abbde38b9d67f93349a074fc50c43a7dc8604d725209e67"
+  }
+}

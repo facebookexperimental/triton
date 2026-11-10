@@ -1,0 +1,43 @@
+{
+  "cases": [
+    {
+      "case": "gqa2304_shared",
+      "heads": 16,
+      "kv_heads": 2,
+      "dim": 64,
+      "length": 2304,
+      "window": 0,
+      "scales": "shared",
+      "fp8_q": false
+    },
+    {
+      "case": "mha2304_shared",
+      "heads": 128,
+      "kv_heads": 128,
+      "dim": 64,
+      "length": 2304,
+      "window": 0,
+      "scales": "shared",
+      "fp8_q": false
+    },
+    {
+      "case": "d128_shared",
+      "heads": 64,
+      "kv_heads": 64,
+      "dim": 128,
+      "length": 2304,
+      "window": 0,
+      "scales": "shared",
+      "fp8_q": false
+    }
+  ],
+  "reference_root": "/references/current",
+  "torch": "2.12.0+rocm10.1.0",
+  "triton": "3.9.0+fb",
+  "seed": 182,
+  "timing": "GPU graph batch means; packing/compilation excluded; numerical gate unchanged",
+  "selection": "Prior passing tuning selections; three fresh order-rotated rounds; no new tuning",
+  "extend_from": "experiments/fp8-kv-decode/results/2026-11-05_framework_decode/framework_routes",
+  "repeat_only": true,
+  "production_vllm": "16 segments; threshold128/KV-heads; FP32 scratch; TD disabled by default on ROCm"
+}

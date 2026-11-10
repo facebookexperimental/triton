@@ -1,0 +1,46 @@
+{
+  "prepared_utc": "2026-11-10T21:20:28.944302+00:00",
+  "branch": "adkankar/gfx1250-fp8-kv-decode",
+  "push_remote": "origin",
+  "push_repository": "adityakankariya/tlx_triton",
+  "proposed_base": "facebookexperimental/triton:main",
+  "proposed_commit_subject": "[Feat] [AMD] attention: Add FP8 KV decode with per-head scales for gfx1250",
+  "proposed_author": {
+    "name": "Aditya Kankariya",
+    "email": "19803485+adityakankariya@users.noreply.github.com"
+  },
+  "verified_github_login": "adityakankariya",
+  "fork_permission": "ADMIN",
+  "kernel_equivalence": {
+    "amd_pa_decode_fp8.py": {
+      "measured_sha256": "71fdb0aa5806a0421306a084e1b7871d506c66dee5749b1ecb1ad3f637c176dc",
+      "prepared_sha256": "9eadbcd9230d2f4fab333afe49cad6b15ab7db1de7f50f640e52da0da7f62d88",
+      "all_function_ASTs_equal": true
+    },
+    "amd_pa_decode_fp8_optimized.py": {
+      "measured_sha256": "7c573b3288e66ef7c2d1b61764982053931f729260ad883a1638742dc8160d6b",
+      "prepared_sha256": "aea5b18890a1feebc541bf183688e80161c74836a873c64b4050d56298a69704",
+      "all_function_ASTs_equal": true
+    }
+  },
+  "experiment_script_AST_matches": 18,
+  "unchanged_JSON_values_checked": 35,
+  "whitespace_only_SVG_checks": 29,
+  "historical_GPU_validation": {
+    "passed": 739,
+    "skipped": 8,
+    "benchmark_cases": 80,
+    "jit_snapshot": "results/2026-11-09_optimization/final_source"
+  },
+  "fresh_GPU_rerun": "No completed result; GPU driver/device became unavailable and container stopped before the test command produced output. Do not label historical validation as a fresh run.",
+  "CI_selector_check": {
+    "amd_pa_decode_fp8.py": "all correctness tests selected",
+    "amd_pa_decode_fp8_optimized.py": "all correctness tests selected"
+  },
+  "pre_commit": "All applicable hooks passed; yaml-expansion hook skipped because no workflow YAML changed.",
+  "archive_file_count": 1072,
+  "archive_sha256": "8305c793fd2747de4dbc74f50824fa4c4e4ff82d2bfeb2419f65591a4b422e7f",
+  "archive_bytes": 4977534,
+  "no_commit_or_push_yet": true,
+  "CSV_line_endings": "Git normalizes research CSV to LF through .gitattributes; archive retains original bytes."
+}
