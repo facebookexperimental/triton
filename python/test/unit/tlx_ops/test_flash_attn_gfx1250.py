@@ -10,16 +10,24 @@ from triton.tlx.ops.kernels.flash_attn import gfx1250 as _gfx1250_attention
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("BATCH,H,SEQLEN_Q,SEQLEN_K", [(1, 8, 1024, 1024), (2, 4, 1024, 1024), (1, 16, 2048, 2048),
-                                                       (1, 2, 896, 896), (1, 1, 640, 640), (1, 8, 2048, 2048),
-                                                       (1, 2, 4096, 4096),  # underfilled long-K grids
-                                                       (1, 2, 63, 65),  # one partial key tile
-                                                       (1, 2, 128, 128),  # one full key tile
-                                                       (1, 2, 129, 129),  # two key tiles with partial Q/K boundaries
-                                                       (2, 2, 129, 257),  # partial Q and K tiles, independent lengths
-                                                       (1, 2, 897, 897),  # final K tile contains a single valid row
-                                                       (2, 3, 129, 65537),  # long-K fallback across batches/heads
-                                                       ])
+@pytest.mark.parametrize("BATCH,H,SEQLEN_Q,SEQLEN_K", [
+    (1, 8, 1024, 1024),
+    (2, 4, 1024, 1024),
+    (1, 16, 2048, 2048),
+    (1, 2, 896, 896),
+    (1, 1, 640, 640),
+    (1, 8, 2048, 2048),
+    (1, 2, 4096, 4096),  # underfilled long-K grids
+    (1, 2, 63, 65),  # one partial key tile
+    (1, 2, 128, 128),  # one full key tile
+    (1, 2, 129, 129),  # two key tiles with partial Q/K boundaries
+    (2, 2, 129, 257),  # partial Q and K tiles, independent lengths
+    (1, 2, 897, 897),  # final K tile contains a single valid row
+    (8, 32, 1, 4096),
+    (8, 32, 33, 4096),
+    (2, 3, 129, 65537),  # long-K fallback across batches/heads
+    (1, 32, 65537, 65537),
+])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gfx1250_attn_fwd_tdm_pipelined(BATCH, H, SEQLEN_Q, SEQLEN_K, dtype):
     _check_attention(BATCH, H, SEQLEN_Q, SEQLEN_K, dtype)
@@ -33,6 +41,7 @@ def _check_attention(BATCH, H, SEQLEN_Q, SEQLEN_K, dtype):
     v = torch.randn_like(k)
     sm_scale = 1.0 / (D**0.5)
     out = flash_attn(q, k, v, sm_scale=sm_scale)
+    assert out.dtype == dtype
     assert torch.isfinite(out).all()
     # Avoid a quadratic reference allocation for long attention, but check every
     # output element for finiteness and sample both sides of tile boundaries.
@@ -59,7 +68,7 @@ def _check_attention(BATCH, H, SEQLEN_Q, SEQLEN_K, dtype):
 @pytest.mark.parametrize("seqlen_k,block_m,block_n", [(512, None, None), (1025, None, None), (1025, 128, 64),
                                                       (1025, 256, 64), (65537, None, None)])
 @pytest.mark.parametrize("recovery_case", ["exp_overflow", "probability_overflow", "common_offset"])
-def test_gfx1250_attn_fwd_tdm_pipelined_recovery(dtype, seqlen_k, block_m, block_n, recovery_case):
+def test_gfx1250_attn_fwd_tdm_pipelined_recovery(dtype, seqlen_k, block_m, block_n, recovery_case, monkeypatch):
     torch.manual_seed(1)
     device = triton.runtime.driver.active.get_active_torch_device()
     heads = 32 if seqlen_k >= 65536 else 2
@@ -67,14 +76,19 @@ def test_gfx1250_attn_fwd_tdm_pipelined_recovery(dtype, seqlen_k, block_m, block
     k = torch.randn((1, heads, seqlen_k, 128), device=device, dtype=dtype)
     v = torch.randn_like(k).abs().add_(0.25)
     scale = 128**-0.5
+    if block_m is not None:
+        selected = next(config for config in _gfx1250_attention._CONFIGS
+                        if (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"]) == (block_m, block_n))
+        monkeypatch.setattr(_gfx1250_attention, "heuristic_config", lambda *args: selected)
     # Mix safe and unsafe heads so replaying the wrong tile cannot repair all
     # outputs accidentally through a different permutation of workgroups.
     q_bad = q[:, -1:] if heads >= 32 else q
     k_bad = k[:, -1:] if heads >= 32 else k
-    _gfx1250_attention.attn_fwd_tdm_pipelined(q, k, v, scale, BLOCK_M=block_m, BLOCK_N=block_n)
+    flash_attn(q, k, v, sm_scale=scale)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out = _gfx1250_attention.attn_fwd_tdm_pipelined(q, k, v, scale, BLOCK_M=block_m, BLOCK_N=block_n)
+        out = flash_attn(q, k, v, sm_scale=scale)
+    assert out.dtype == dtype
 
     # Reuse one graph across ordinary -> unsafe -> ordinary inputs. The
     # numerical decision must be recomputed on the device for every replay.
@@ -138,7 +152,7 @@ def test_gfx1250_attn_fwd_tdm_pipelined_strides(dtype, layout, seqlen_k, block_m
     scale = dim**-0.5
     ref = ((q.double() @ k.double().transpose(-1, -2)) * scale).softmax(-1) @ v.double()
     # A partial query tile must preserve storage on both sides of the output.
-    storage = torch.full((q.numel() + 512, ), -12345.0, device=device)
+    storage = torch.full((q.numel() + 512, ), -123.0, device=device, dtype=dtype)
     out = storage[256:-256].view(q.shape)
     grid = (batch, heads, triton.cdiv(sq, block_m))
 
@@ -160,8 +174,8 @@ def test_gfx1250_attn_fwd_tdm_pipelined_strides(dtype, layout, seqlen_k, block_m
         tolerance = 0.005 if dtype == torch.bfloat16 else 0.0008
         torch.testing.assert_close(out.double(), ref, atol=tolerance, rtol=tolerance)
         assert (out.double() - ref).square().mean().sqrt() < tolerance * ref.square().mean().sqrt()
-        assert (storage[:256] == -12345.0).all()
-        assert (storage[-256:] == -12345.0).all()
+        assert (storage[:256] == -123.0).all()
+        assert (storage[-256:] == -123.0).all()
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -222,6 +236,23 @@ def test_flash_attn_public_rejects_unsupported(invalid):
         q.requires_grad_()
     with pytest.raises(UnsupportedBackward if invalid == "backward" else InvalidInput):
         flash_attn(q, k, v, **kwargs)
+
+
+@pytest.mark.parametrize("batch,heads,seqlen_q,seqlen_k,expected", [
+    (8, 32, 1, 4096, (32, 128)),
+    (8, 32, 32, 4096, (32, 128)),
+    (8, 32, 33, 4096, (64, 128)),
+    (8, 32, 64, 4096, (64, 128)),
+    (8, 32, 65, 4096, (128, 64)),
+    (8, 32, 256, 4096, (256, 64)),
+    (8, 32, 1, 128, (32, 128)),
+    (1, 1, 32, 128, (32, 128)),
+    (1, 1, 33, 4096, (32, 128)),
+])
+def test_flash_attn_heuristic_respects_query_length(batch, heads, seqlen_q, seqlen_k, expected):
+    config = _gfx1250_attention.heuristic_config(batch, heads, seqlen_q, seqlen_k, 256)
+    assert (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"]) == expected
+    assert config in _gfx1250_attention._prune_configs(_gfx1250_attention._CONFIGS, {"SEQLEN_Q": seqlen_q})
 
 
 @pytest.mark.parametrize("arch,expected_space", [("gfx1250", "heuristic"), ("gfx950", "full"), ("sm90", "full"),

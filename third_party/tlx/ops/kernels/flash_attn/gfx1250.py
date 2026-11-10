@@ -404,6 +404,9 @@ _autotuned_attention = triton.autotune(
 
 def heuristic_config(batch, heads, seqlen_q, seqlen_k, compute_units):
     m, n = _select_tile_sizes(batch, heads, seqlen_q, seqlen_k, 128, compute_units)
+    max_rows = max(32, triton.next_power_of_2(seqlen_q))
+    if m > max_rows:
+        m, n = max_rows, 128
     return next(config for config in _CONFIGS if (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"]) == (m, n))
 
 
