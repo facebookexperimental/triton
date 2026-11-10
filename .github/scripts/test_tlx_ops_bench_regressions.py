@@ -98,7 +98,7 @@ def test_issue_filing_lists_unindexed_issues_and_deduplicates_without_closing():
 
     assert regressions.file_issues([alert, alert], "o/r", "run", create) == ["https://github.com/o/r/issues/1"]
     assert [c[0] for c in calls] == ["GET", "POST"]
-    assert calls[1][2]["labels"] == ["nightly"]
+    assert calls[1][2]["labels"] == ["nightly", "perf-regression"]
     assert "not confirmed blame" in calls[1][2]["body"]
 
 

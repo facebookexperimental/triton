@@ -189,8 +189,9 @@ def file_issues(alerts, repo, run_url, api=gh):
         if title in titles:
             print(f"Already tracked: {title}")
             continue
-        issue = api("POST", f"repos/{repo}/issues",
-                    {"title": title, "body": issue_body(alert, repo, run_url), "labels": ["nightly"]})
+        issue = api(
+            "POST", f"repos/{repo}/issues",
+            {"title": title, "body": issue_body(alert, repo, run_url), "labels": ["nightly", "perf-regression"]})
         titles.add(title)
         created.append(issue["html_url"])
         print(f"Filed {issue['html_url']}")
