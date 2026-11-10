@@ -6,9 +6,9 @@ on:
       platform:
         description: Platform to bisect
         required: true
-        default: mi350
+        default: h100
         type: choice
-        options: [mi350]
+        options: [h100]
 
 permissions:
   contents: read
@@ -28,7 +28,7 @@ jobs:
     outputs:
       ready: ${{ steps.plan.outputs.ready }}
     steps:
-      - name: Prepare one real October 13-14 MM regression
+      - name: Prepare one real November 3-4 H100 attention regression
         run: |
           mkdir evidence
           python3 - <<'PY'
@@ -36,14 +36,14 @@ jobs:
           import pathlib
 
           spec = {
-              'op': 'mm', 'direction': 'fwd',
-              'key': 'mm/gfx950/float16/4096x4096x2048x2048_1x4096_1',
-              'platform': 'mi350', 'space': 'heuristic', 'required_ratio': 0.5,
-              'good_sha': '032bd40b9a62e16f59410e76eb3dad1aa1e7dedb',
-              'bad_sha': '8db2e2ee26ab166c7a3b30d334e4c0b93d157e16'
+              'op': 'flash_attn_varlen', 'direction': 'fwd',
+              'key': 'flash_attn_varlen/sm90/bfloat16/8x2160x2160x2x128xFalsex1024x1024',
+              'platform': 'h100', 'space': 'heuristic', 'required_ratio': 0.9,
+              'good_sha': '391d131cc0da79272af6131f70e480f1d9423b8d',
+              'bad_sha': '361492e542b33dc471733f7df7166d5d0983aa1d'
           }
           pathlib.Path('evidence/regressions.json').write_text(json.dumps([
-              {'platform': 'mi350', 'bisect_issue': 4881, 'bisect': spec}
+              {'platform': 'h100', 'bisect_issue': 4881, 'bisect': spec}
           ]))
           PY
       - name: Select open issues and their representative cases
@@ -91,7 +91,7 @@ jobs:
       - name: Checkout bisect tooling
         uses: actions/checkout@v4
         with:
-          ref: wychi/bench-bisect-workflow-test
+          ref: wychi/bench-bisect-h100-test
           path: tooling
           persist-credentials: false
       - name: Checkout main history for candidate builds
