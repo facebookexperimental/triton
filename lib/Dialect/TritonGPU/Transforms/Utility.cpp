@@ -291,6 +291,10 @@ unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
   unsigned maxMultiple = std::max(maxMultipleBytes / elemNumBytes, 1u);
   unsigned maxContig =
       std::min(valInfo.getContiguity(order[0]), shapePerCTA[order[0]]);
+  // A contiguous run (e.g. from a tt.contiguity hint) need not be a power of
+  // two and must hold whole vectors, so use its largest power-of-two factor.
+  // A hint of 0 gives no run to vectorize.
+  maxContig = maxContig ? 1u << llvm::countr_zero(maxContig) : 1u;
   unsigned alignment = std::min(maxMultiple, maxContig);
   // Some targets implement byte-aligned global vector loads in hardware, so no
   // residual element-alignment proof is required. Axis analysis must still
