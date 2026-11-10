@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import statistics
+from urllib.parse import urlencode
 
 from failure_issues import gh
 from tlx_ops_bench_dashboard import read_summaries
@@ -151,8 +152,9 @@ def bisect_spec(alert):
 
 def issue_body(alert, repo, run_url):
     date = alert["date"]
-    base = f"https://github.com/{repo}/releases/download/tlx-ops-bench"
-    dates = sorted({d for c in alert["cases"] for d in c["baseline_dates"]})
+    filters = urlencode(
+        {"tab": "trending", "platform": alert["platform"], "op": alert["op"], "dir": alert["direction"]})
+    dashboard = f"https://facebookexperimental.github.io/triton/bench/#{filters}"
     losses = [100 * (1 - case["ratio"]) for case in alert["cases"]]
     loss = f"{min(losses):.1f}% to {max(losses):.1f}%" if len(losses) > 1 else f"{losses[0]:.1f}%"
     direction = {"fwd": "forward", "bwd": "backward"}.get(alert["direction"], alert["direction"])
@@ -161,7 +163,7 @@ def issue_body(alert, repo, run_url):
         f"{alert['platform'].upper()} `{alert['op']}` {direction} throughput fell {loss} across {len(losses)} cases on {day(date).isoformat()}.",
         "", "Detection: " + "; ".join(alert["reasons"]) + ".",
         f"Compared {alert['compared']} reliable cases out of {alert['reported_cases']} reported. The cause is not established.",
-        "", "## Affected cases", "", "Throughput is in TFLOP/s.", "",
+        "", f"[View benchmark dashboard]({dashboard})", "", "## Affected cases", "", "Throughput is in TFLOP/s.", "",
         "| Input | TLX baseline | TLX now | Loss | Reference before | Reference now |",
         "| --- | ---: | ---: | ---: | ---: | ---: |"
     ]
@@ -176,7 +178,8 @@ def issue_body(alert, repo, run_url):
             f"| {inputs} | {c['baseline']:.2f} | {c['current']:.2f} | {(1 - c['ratio']) * 100:.1f}% | {fmt(c['reference_before'])} | {fmt(c['reference_now'])} |"
         )
     if len(alert["cases"]) > 50:
-        lines.append(f"\n{len(alert['cases']) - 50} additional affected cases are in the source summary.")
+        lines.append(
+            f"\n{len(alert['cases']) - 50} additional affected cases can be viewed in the benchmark dashboard.")
     if alert["confirmation_date"]:
         lines.append(f"\nThe operation/direction also crossed the median threshold on {alert['confirmation_date']}.")
     lines.extend(["", "## Environment changes", ""])
@@ -211,13 +214,7 @@ def issue_body(alert, repo, run_url):
         f"Reproducer: `{spec['key']}`. One bisect job checks the worst affected case for this operation and direction.",
         "The job remeasures both endpoints on the same GPU before bisecting. Missing cases, build errors, incorrect output and unreliable measurements are inconclusive, not performance failures.",
         "",
-        "This is a historical throughput regression, separate from the existing absolute 0.9x reference floor. Root cause and recovery require investigation.",
-        "", "<details>", "<summary>Measurement evidence</summary>", "",
-        f"[Current results]({base}/{date}.{alert['platform']}.json) · [Benchmark run]({run_url}) · [Measured commit](https://github.com/{repo}/commit/{alert['sha']})",
-        "", "Baseline results: " + " · ".join(f"[{day(d).isoformat()}]({base}/{d}.{alert['platform']}.json)"
-                                              for d in dates), "",
-        "The baseline is each case's median from three prior reliable measurements within 14 days, using the same timing mode and replicate count. Errors and missing measurements are excluded. Noisy cases use valid measurements and require two severe observations.",
-        "", "</details>"
+        "This is a historical throughput regression, separate from the existing absolute 0.9x reference floor. Root cause and recovery require investigation."
     ])
     return "\n".join(lines)
 
