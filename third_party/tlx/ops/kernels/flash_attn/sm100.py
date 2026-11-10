@@ -3789,7 +3789,7 @@ _SPACE = "full"
 @functools.lru_cache(maxsize=None)
 def _tuned_fwd(space):
     return triton.autotune(
-        configs={"full": CONFIGS, "smoke": SMOKE_CONFIGS}[space](),
+        configs={"heuristic": SMOKE_CONFIGS, "full": CONFIGS, "smoke": SMOKE_CONFIGS}[space](),
         key=["N_CTX", "HEAD_DIM", "STAGE"],
         prune_configs_by={"early_config_prune": prune_configs_by_hdim},
     )(_attn_fwd_ws)
@@ -3804,7 +3804,7 @@ def _bwd_reset_dq_accum(nargs, reset_only=False):
 @functools.lru_cache(maxsize=None)
 def _tuned_bwd(space):
     return triton.autotune(
-        configs={"full": BWD_CONFIGS_FULL, "smoke": BWD_CONFIGS_SMOKE}[space](),
+        configs={"heuristic": BWD_CONFIGS_SMOKE, "full": BWD_CONFIGS_FULL, "smoke": BWD_CONFIGS_SMOKE}[space](),
         key=["N_CTX", "HEAD_DIM"],
         pre_hook=_bwd_reset_dq_accum,
     )(_attn_bwd_ws)
@@ -3813,8 +3813,8 @@ def _tuned_bwd(space):
 def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
     """Fused attention over ``(Z, H, N_CTX, HEAD_DIM)``. Differentiable."""
     global _SPACE
-    if space not in ("full", "smoke"):
-        raise ValueError(f"space must be 'full' or 'smoke', got {space!r}")
+    if space not in ("heuristic", "full", "smoke"):
+        raise ValueError(f"space must be 'heuristic', 'full' or 'smoke', got {space!r}")
     if sm_scale is None:
         sm_scale = q.shape[-1]**-0.5
     _SPACE = space

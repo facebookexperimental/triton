@@ -1,9 +1,49 @@
 # TLX op perf suite
 
+## Shared tritonbench harness
+
+Install `tabulate` and `packaging` alongside torch and Triton, then run:
+
+```bash
+python python/test/tlx_benchmark/install_tritonbench.py
+```
+
+The installer pins OSS tritonbench at `6394394849c41c23699f757b4cc2712d35ad4d86`
+and applies `tritonbench.patch`, the pending fbsource consolidation changes.
+It uses `pip --no-deps`; do not run tritonbench's `install.py`.
+For local development, `--source /path/to/tritonbench` installs the modified checkout.
+Once these changes are exported upstream, replace the base pin with that commit
+and remove the patch.
+
+`mm`, `addmm`, `flash_attn`, `mm_torchtlx`, and `addmm_torchtlx` run the existing
+tritonbench providers in process. Their policy is heuristic space, GPU events,
+100 warmup iterations and 500 actual samples. Speedup is reference p50 latency
+divided by TLX p50 latency. The reference for TorchTLX is now eager ATen.
+Either provider's raw or filtered latency CV above 3% produces `noisy` before a
+speed verdict; a noisy row under the speedup floor still notes that speedup. Latency p50/p90/p99 and raw/filtered CV are recorded in `extra`;
+existing throughput fields retain their units and the JSON schema stays at 4.
+The dashboard marks the change from mean throughput to p50 latency, and any change of reference.
+NVIDIA `flash_attn` has no tuned heuristic yet: at `heuristic`, sm90 runs its single
+per-head-dim config and sm100 tunes the `smoke` subset.
+
+`--cudagraph` records events inside captured calls, keeping graph replay overhead and cache clearing outside the measured intervals.
+Runtimes without timed external graph events (including fbcode ROCm 7.0) instead time each graph replay; `timing_scope=graph_replay` records that GPU graph dispatch is included. Eager runs report `timing_scope=kernel`.
+Cold compile is a synchronized provider setup plus first call in a fresh cache;
+`--cold-compile all|first|none` controls its frequency (default `all` for migrated providers). Host submission cost is
+recorded separately and never added to or subtracted from GPU latency.
+`denoise.sh` governs both migrated and legacy benches. CLI runs restart under
+it before CUDA initializes; `TLX_DENOISED=1` identifies an already wrapped run.
+
+The remaining operators use the **legacy harness**, identified in their report
+and artifact. This includes norm, HSTU, varlen attention, KDA, bmm and fusion
+benches with no matching OSS provider. Their existing op spaces and timing
+implementation remain applicable. The older sections below describe that path.
+
+
 Performance and compile-time guardrails for the blessed `tlx.ops` catalog.
 Correctness lives in `python/test/unit/tlx_ops/`; this suite assumes it passes.
 
-Depends on `torch` and `triton` only. No dependency on `tritonbench`
+Legacy providers depend on `torch` and `triton`; migrated providers also require the pinned tritonbench package.
 
 ## Running
 

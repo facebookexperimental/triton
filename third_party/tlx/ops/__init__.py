@@ -33,7 +33,10 @@ accumulates tens of GB of autotune workspaces; at "heuristic" the same call is
 under a second. Pass `space="heuristic"` explicitly for a fast first call. The
 gfx950 implementation currently provides only `"heuristic"`.
 
-Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
+`flash_attn` on gfx950 defaults to "heuristic". On NVIDIA it defaults to "full"
+and accepts "heuristic": sm90 runs its single per-head-dim config, and sm100
+tunes the "smoke" subset until it has a real `heuristic_config`.
+Ops with no heuristic yet -- flash_attn_mxfp8, hstu_attn,
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can offer a
@@ -824,7 +827,7 @@ def addmm_mul_add_launch(bias, a, b, x0, res=None, *, out):
     return fn(bias, a, b, x0, res, out=out)
 
 
-def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
+def flash_attn(q, k, v, causal=False, sm_scale=None, *, space=None):
     """Fused attention over `(Z, H, N_CTX, HEAD_DIM)` fp16/bf16. Differentiable.
 
     `sm_scale` defaults to `HEAD_DIM ** -0.5`.
@@ -832,9 +835,10 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise InvalidInput("tlx.ops.flash_attn expects rank-4 Q/K/V tensors")
     space_name, invariance = _normalize_space_arg("flash_attn", space)
-    if space_name not in ("full", "smoke"):
-        raise InvalidInput(f"tlx.ops.flash_attn does not provide space={space_name!r}")
     fn, spec = impl_for("flash_attn", device=q.device)
+    space_name = space_name or spec.default_space
+    if space_name not in ("heuristic", "full", "smoke"):
+        raise InvalidInput(f"tlx.ops.flash_attn does not provide space={space_name!r}")
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
     check_backward(spec, q, k, v)
     _check_enforced("flash_attn", spec, invariance)

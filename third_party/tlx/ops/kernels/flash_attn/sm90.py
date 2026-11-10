@@ -1489,9 +1489,9 @@ def _apply_attention(q, k, v, sm_scale, causal, config):
 
 def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
     """Fused D64/D128 attention over ``(Z, H, N_CTX, HEAD_DIM)``."""
-    # SM90 uses one head-dimension-specific configuration in both spaces.
-    if space not in ("full", "smoke"):
-        raise ValueError(f"space must be 'full' or 'smoke', got {space!r}")
+    # SM90 uses one head-dimension-specific configuration in every space.
+    if space not in ("heuristic", "full", "smoke"):
+        raise ValueError(f"space must be 'heuristic', 'full' or 'smoke', got {space!r}")
     if sm_scale is None:
         sm_scale = q.shape[-1]**-0.5
     return _apply_attention(q, k, v, sm_scale, causal, None)

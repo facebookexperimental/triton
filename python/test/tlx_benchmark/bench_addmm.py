@@ -14,11 +14,11 @@ import sys
 
 import torch
 from triton.tlx.ops.kernels.addmm._shapes import FOCUS as SHAPE_SUITES
-from triton.tlx.ops.kernels.addmm._shapes import SYNTHETIC, flops, inputs, label
+from triton.tlx.ops.kernels.addmm._shapes import SYNTHETIC, label
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from _harness import Case, Prepared, close_enough, driver  # noqa: E402
+from _harness import Case, driver  # noqa: E402
 
 OP = "addmm"
 REF_NAME = "torch.addmm"
@@ -43,25 +43,6 @@ def cases(synthetic: bool = False, suites=None) -> list[Case]:
             label=label(*entry),
         ) for entry in shapes(synthetic, suites)
     ]
-
-
-def prepare(case: Case, space: str) -> Prepared:
-    from triton.tlx.ops import addmm as tlx_addmm
-
-    M, N, K, a_strides, b_strides, bias_strides = case.shape
-    dtype = getattr(torch, case.dtype)
-    bias, a, b = inputs((M, N, K, a_strides, b_strides, bias_strides, case.dtype), dtype)
-    tlx_out = torch.empty((M, N), device="cuda", dtype=dtype)
-    ref_out = torch.empty_like(tlx_out)
-
-    tlx_fn = lambda: tlx_addmm(bias, a, b, out=tlx_out, space=space)  # noqa: E731
-    ref_fn = lambda: torch.addmm(bias, a, b, out=ref_out)  # noqa: E731
-    return Prepared(
-        tlx_fn=tlx_fn,
-        ref_fn=ref_fn,
-        flop_count=flops(M, N, K),
-        check=lambda: close_enough(tlx_fn(), ref_fn(), REL_PRECISION),
-    )
 
 
 supported, default_json, run, main = driver.bind(sys.modules[__name__])

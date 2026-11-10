@@ -383,6 +383,7 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset({"tma"}),
         supports_backward=True,
+        default_space="full",
     ),
     OpSpec(
         op="flash_attn",
@@ -394,6 +395,7 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset({"tma", "tmem"}),
         supports_backward=True,
+        default_space="full",
     ),
     OpSpec(
         op="flash_attn",

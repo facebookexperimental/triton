@@ -78,17 +78,18 @@ def table(results: Sequence[Result], extra_columns: Sequence[tuple] = ()) -> str
     ]
     for r in results:
         cells = "".join(f" {_fmt_extra(r, key):>{w}}" for (_, key), w in zip(extra_columns, extra_widths))
-        lines.append(f"{r.case.input:<{width}} "
-                     f"{_tf(_stat(r.ref, 'mean'))} {_tf(_stat(r.tlx, 'mean'))} "
-                     f"{(f'{r.speedup:.3f}x' if r.speedup else '-'):>8} "
-                     f"{_fmt_compile(r):>8} "
-                     f"{_fmt_samples(r):>8} "
-                     f"{_fmt_cv(r):>6} "
-                     f"{_tf(_stat(r.tlx, 'p50'))} "
-                     f"{_tf(_stat(r.tlx, 'p95'))} "
-                     f"{_tf(_stat(r.tlx, 'p99'))} "
-                     f"{_fmt_us(r.ref_host_us):>10} {_fmt_us(r.tlx_host_us):>10}{cells}  "
-                     f"{_MARK[r.status]:<6}  {_fmt_config(r)}")
+        lines.append(
+            f"{r.case.input:<{width}} "
+            f"{_tf(_stat(r.ref, 'p50' if r.extra.get('statistic') == 'p50_latency' else 'mean'))} {_tf(_stat(r.tlx, 'p50' if r.extra.get('statistic') == 'p50_latency' else 'mean'))} "
+            f"{(f'{r.speedup:.3f}x' if r.speedup else '-'):>8} "
+            f"{_fmt_compile(r):>8} "
+            f"{_fmt_samples(r):>8} "
+            f"{_fmt_cv(r):>6} "
+            f"{_tf(_stat(r.tlx, 'p50'))} "
+            f"{_tf(_stat(r.tlx, 'p95'))} "
+            f"{_tf(_stat(r.tlx, 'p99'))} "
+            f"{_fmt_us(r.ref_host_us):>10} {_fmt_us(r.tlx_host_us):>10}{cells}  "
+            f"{_MARK[r.status]:<6}  {_fmt_config(r)}")
     return "\n".join(lines)
 
 
@@ -139,10 +140,10 @@ def tables(results: Sequence[Result], extra_columns: Sequence[tuple] = ()) -> st
 
 def render(results: Sequence[Result], env: dict, json_path: Optional[str] = None,
            extra_columns: Sequence[tuple] = ()) -> str:
-    out = [
-        "Kernel throughput: GPU events, cold cache. CPU submission is a separate diagnostic.",
-        tables(results, extra_columns), ""
-    ]
+    scope = " GPU graph dispatch is included." if "graph_replay" in env.get("timing_scope", []) else ""
+    out = [("tritonbench: GPU events, p50 latency, cold cache." +
+            scope if env.get("harness") == "tritonbench" else "Legacy harness: GPU events, cold cache."),
+           tables(results, extra_columns), ""]
     if json_path:
         out.append(f"artifact: {write_json(results, env, json_path)}")
     out.append(summary(results))

@@ -27,13 +27,14 @@ import argparse
 import contextlib
 import dataclasses
 import functools
+import os
 from typing import Any, Callable, Iterable, Optional
 
 from . import report as report_mod
 from . import verdict
 from .compile import COLD_COMPILE_CAP_S, cold_compile
 from .contract import Case, Result, Status
-from .denoise import Governor, capture_env, list_devices, select_device, stable
+from .denoise import capture_env, ensure_denoised, list_devices, select_device, stable
 from .measure import DEFAULT_REPLICATES, LATENCY_MODES, host_overhead_us, measure
 
 
@@ -328,7 +329,7 @@ def resolve_space(bench, space: Optional[str]) -> str:
     """`None` means "whatever this op's own default is".
 
     Ops do not share one: `mm` has a `heuristic_config` and defaults to it,
-    while `flash_attn`/`hstu_attn_dev`/`kimi_delta_attention` have none and
+    while `hstu_attn_dev`/`kimi_delta_attention` have none and
     their kernels accept only "full" or "smoke" -- passing a global default of
     "heuristic" to those is a KeyError, not a slow path.
     """
@@ -373,7 +374,7 @@ def _head_per_direction(cases, head: int):
 
 
 def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=None, cold_compile_mode=None,
-        directions=None, latency_mode="gpu_events"):
+        directions=None, latency_mode="gpu_events", cudagraph=False):
     if synthetic and suites:
         raise ValueError("--synthetic and --suite cannot be used together")
     space = resolve_space(bench, space)
@@ -386,6 +387,26 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
         cases = [c for c in cases if c.direction in directions]
     if head:
         cases = _head_per_direction(cases, head)
+    from . import tritonbench as tb
+
+    if bench.OP in tb.PROVIDERS:
+        if space != "heuristic":
+            raise ValueError("migrated L2 benches use --space heuristic")
+        results = tb.run(bench, cases, bench.shapes(synthetic, suites), cold_mode, cudagraph=cudagraph)
+        env.update(space="heuristic", ref=tb.PROVIDERS[bench.OP][1], cold_compile=cold_mode, latency_mode="gpu_events",
+                   requested_latency_mode=latency_mode, cache_policy="cold_cache_per_call", statistic="p50_latency",
+                   harness="tritonbench", cudagraph=cudagraph, replicates=1, tritonbench=tb.installation(),
+                   warmup_iters=100, sample_count=500, shapes="synthetic" if synthetic else "focus",
+                   shape_suites=list(_selected_suite_names(bench, suites)),
+                   governed={"applied": ["denoise.sh"] if os.environ.get("TLX_DENOISED") else []})
+        env["timing_scope"] = sorted(
+            {r.extra["tlx_latency"]["timing_scope"]
+             for r in results
+             if "tlx_latency" in r.extra})
+        return results, env
+
+    if cudagraph:
+        raise ValueError("--cudagraph requires a migrated tritonbench provider")
     results = []
     sampled = set()
     with stable(device_index()) as info:
@@ -407,6 +428,7 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
     # artifacts are only comparable when this matches. Same for the reference --
     # not every op races torch, and a ratio against a Triton kernel is not the
     # same claim as a ratio against a vendor library.
+    env["harness"] = "legacy"
     env["space"] = space
     env["ref"] = getattr(bench, "REF_NAME", "")
     env["cold_compile"] = cold_mode
@@ -454,6 +476,7 @@ def main(bench, argv=None) -> int:
         "--cold-compile", choices=COLD_COMPILE_MODES, default=None, dest="cold_compile",
         help=f"how often to time a first call on a fresh cache (default {resolve_cold_compile(bench, None)}); "
         "'all' is per case, 'first' samples one case per direction, 'none' skips it")
+    parser.add_argument("--cudagraph", action="store_true", help="Measure kernel latency inside a CUDA graph")
     parser.add_argument("--json", default=None,
                         help="machine-readable artifact (default /tmp/tlx_benchmark/<op>.<arch>[.<suites>].json)")
     args = parser.parse_args(argv)
@@ -494,14 +517,10 @@ def main(bench, argv=None) -> int:
 
     # Governing is unconditional: a number taken on an ungoverned machine is not
     # comparable to anything, so there is no switch to take one.
-    with Governor(device) as governor:
-        for step in governor.applied:
-            print(f"  denoise: {step}")
-        for step in governor.skipped:
-            print(f"  denoise: SKIPPED {step}")
-        results, env = run(bench, space=args.space, head=args.head, synthetic=args.synthetic, governor=governor,
-                           suites=args.suite, cold_compile_mode=args.cold_compile, directions=directions,
-                           latency_mode=args.latency_mode)
+    ensure_denoised(device, argv)
+    results, env = run(bench, space=args.space, head=args.head, synthetic=args.synthetic, suites=args.suite,
+                       cold_compile_mode=args.cold_compile, directions=directions, latency_mode=args.latency_mode,
+                       cudagraph=args.cudagraph)
     if not results:
         # An empty focus list is legitimate -- an arch may have no capture yet --
         # but a silent zero-row table reads like a pass. Say what was empty.

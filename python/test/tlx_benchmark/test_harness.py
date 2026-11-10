@@ -275,14 +275,15 @@ def test_wrong_answer_outranks_every_perf_claim():
     assert "49.9%" in r.notes[0]
 
 
-def test_pip_outranks_noisy_so_a_slow_shape_is_never_hidden_by_jitter():
+def test_noisy_prevents_a_speed_verdict_on_a_slow_shape():
     from _harness import verdict
 
     r = verdict.judge(_case(), _stat(cv=0.10, mean=1.0), _stat(mean=10.0), correct=True)
-    assert r.status is Status.PIP
+    assert r.status is Status.NOISY
     assert r.speedup < MIN_SPEEDUP
     # The softness of the number is still reported, just not as the verdict.
     assert any("CV" in n for n in r.notes)
+    assert any("under the" in n and "floor" in n for n in r.notes)
 
 
 def test_noisy_decides_only_among_cases_that_are_otherwise_fine():
@@ -598,15 +599,14 @@ def test_fallback_inventory_governs_only_its_pci_matched_gpu(monkeypatch, mapped
     calls = []
     bus = None if mapped_index is None else f"device,PCI Bus\ncard{mapped_index},0000:88:00.0"
     monkeypatch.setattr(denoise, "_rocm", lambda args: bus)
-    monkeypatch.setattr(denoise.Governor, "_sudo", lambda self, args: calls.append(args) or True)
+    monkeypatch.setattr(denoise.os, "execve", lambda path, args, env: calls.append(env))
+    monkeypatch.delenv("TLX_DENOISED", raising=False)
     device = denoise.Device(denoise.AMD, 1, "MI350X", uuid="GPU-46c1d72dcdc11989", pci_bus="0000:88:00.0")
-    with denoise.Governor(device) as governor:
-        if mapped_index is None:
-            assert "management GPU mapping unavailable" in " ".join(governor.skipped)
+    denoise.ensure_denoised(device, [])
     if mapped_index is None:
         assert calls == []
     else:
-        assert [args[2] for args in calls] == [str(mapped_index)] * 4
+        assert [env["HIP_VISIBLE_DEVICES"] for env in calls] == [str(mapped_index)]
 
 
 def test_sampler_join_does_not_shadow_thread_internals():
@@ -676,21 +676,24 @@ def test_auto_selection_picks_the_least_used_gpu(monkeypatch):
         denoise_mod.select_device("9")
 
 
-def test_governor_is_inert_without_a_device():
-    from _harness.denoise import Governor
+def test_denoise_does_not_restart_without_a_device():
+    from _harness.denoise import ensure_denoised
 
-    with Governor(None) as g:
-        pass
-    assert g.applied == []
-    assert g.skipped and "no GPU" in g.skipped[0]
+    ensure_denoised(None)
 
 
-def test_governor_can_be_disabled():
-    from _harness.denoise import Governor, NVIDIA, Device
+def test_denoise_does_not_restart_when_already_wrapped(monkeypatch):
+    from _harness.denoise import ensure_denoised, NVIDIA, Device
 
-    with Governor(Device(NVIDIA, 0, "NVIDIA B200"), enable=False) as g:
-        pass
-    assert g.applied == []
+    monkeypatch.setenv("TLX_DENOISED", "1")
+    ensure_denoised(Device(NVIDIA, 0, "NVIDIA B200"))
+
+
+def test_reference_noise_prevents_a_speed_verdict():
+    from _harness import verdict
+
+    r = verdict.judge(_case(), _stat(mean=1), _stat(cv=.10, mean=10))
+    assert r.status is Status.NOISY
 
 
 # --------------------------------------------------------------------------
@@ -889,7 +892,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         },
         "triton.tlx.ops.kernels.swiglu_ffn._shapes": {"sm90": ("sm90_1", )},
     }
-    pattern = re.compile(r"^(?:sm|gfx)\d+_(?:[1-9]\d*|all)$")
+    pattern = re.compile(r"^(?:sm|gfx)\d+_(?:[1-9]\d*|all|baseline|addmm)$")
     for module_name, defaults in expected.items():
         registry = importlib.import_module(module_name).FOCUS
         assert dict(registry.defaults) == defaults
@@ -993,9 +996,11 @@ def test_every_bench_module_satisfies_the_adapter_contract(module_name):
     import importlib
 
     bench = importlib.import_module(module_name)
-    for name in ("OP", "REF_NAME", "EXTRA_COLUMNS", "SHAPE_SUITES", "cases", "prepare", "supported", "default_json",
-                 "run", "main"):
+    for name in ("OP", "REF_NAME", "EXTRA_COLUMNS", "SHAPE_SUITES", "cases", "supported", "default_json", "run",
+                 "main"):
         assert hasattr(bench, name), f"{module_name} is missing {name}"
+    from _harness.tritonbench import PROVIDERS
+    assert hasattr(bench, "shapes" if bench.OP in PROVIDERS else "prepare")
     assert all(len(col) == 2 for col in bench.EXTRA_COLUMNS)
     # An op with no reference must say so rather than leave it implicit.
     assert isinstance(bench.REF_NAME, str)
@@ -1052,9 +1057,38 @@ def test_space_resolves_to_each_ops_own_default():
     # mm has a heuristic_config; the attention ops do not, and their kernels
     # accept only "full"/"smoke" -- a shared "heuristic" default is a KeyError.
     assert driver.resolve_space(importlib.import_module("bench_mm"), None) == "heuristic"
-    assert driver.resolve_space(importlib.import_module("bench_flash_attn"), None) == "full"
+    assert driver.resolve_space(importlib.import_module("bench_flash_attn"), None) == "heuristic"
     # An explicit choice still wins.
     assert driver.resolve_space(importlib.import_module("bench_mm"), "full") == "full"
+
+
+def test_flash_attn_default_space_is_accepted_on_every_arch():
+    from triton.tlx.ops._catalog import CATALOG
+
+    defaults = {s.arch: s.default_space for s in CATALOG if s.op == "flash_attn"}
+    assert defaults == {"sm90": "full", "sm100": "full", "gfx950": "heuristic"}
+
+
+@pytest.mark.parametrize("arch", ("sm90", "sm100"))
+def test_nvidia_flash_attn_accepts_the_l2_heuristic_space(arch, monkeypatch):
+    import importlib
+
+    impl = importlib.import_module(f"triton.tlx.ops.kernels.flash_attn.{arch}")
+    monkeypatch.setattr(impl, "_SPACE", getattr(impl, "_SPACE", None), raising=False)
+
+    class Reached(Exception):
+        pass
+
+    class Tensor:
+
+        @property
+        def shape(self):
+            raise Reached
+
+    with pytest.raises(Reached):
+        impl.flash_attn(Tensor(), Tensor(), Tensor(), space="heuristic")
+    with pytest.raises(ValueError, match="space must be"):
+        impl.flash_attn(Tensor(), Tensor(), Tensor(), space="unknown")
 
 
 def test_bind_returns_the_four_entry_points_bound_to_the_module():
@@ -1260,7 +1294,9 @@ def test_mm_still_times_every_case_and_the_full_space_ops_do_not():
     # mm's cold pass is under a second at heuristic space, so sampling it would
     # drop information for no saving.
     assert driver.resolve_cold_compile(importlib.import_module("bench_mm"), None) == "all"
-    for name in ("bench_flash_attn", "bench_hstu_attn", "bench_kda"):
+    for name in ("bench_flash_attn", "bench_torchtlx_mm", "bench_torchtlx_addmm"):
+        assert driver.resolve_cold_compile(importlib.import_module(name), None) == "all"
+    for name in ("bench_hstu_attn", "bench_kda"):
         assert driver.resolve_cold_compile(importlib.import_module(name), None) == "first"
 
 
@@ -1705,3 +1741,80 @@ def test_a_case_that_breaks_the_gpu_is_reported_once_and_ends_the_run(monkeypatc
     # An ordinary error leaves the GPU usable, so the remaining cases still run.
     results = _run_with_failure(monkeypatch, gpu_usable_after=True)
     assert [r.status for r in results] == [Status.OK, Status.OK, Status.ERROR, Status.OK, Status.OK]
+
+
+def test_migrated_artifact_keeps_throughput_units_and_p50_speedup():
+    pytest.importorskip("tritonbench.utils.tlx_l2", reason="needs the tritonbench installed by install_tritonbench.py")
+    from tritonbench.components.do_bench import Latency
+    from tritonbench.utils.triton_op import BenchmarkOperatorMetrics
+    from _harness.tritonbench import result
+
+    ref = BenchmarkOperatorMetrics(latency=Latency([1., 1., 1.], remove_outliers=False))
+    tlx = BenchmarkOperatorMetrics(latency=Latency([2., 2., 2.], remove_outliers=False), accuracy=True)
+    row = result(_case(), {"ref": ref, "tlx": tlx}, "ref", "tlx", 10**12)
+    assert row.speedup == .5
+    assert row.tlx.unit == "tflops"
+    assert row.tlx.p50 == 500
+    assert row.extra["tlx_latency"]["p50_ms"] == 2
+    assert row.to_dict()["case"]["key"] == _case().key
+    assert artifact([row], {})["schema_version"] == SCHEMA_VERSION
+
+
+def test_raw_outlier_is_noisy_even_if_filtered_latency_is_steady():
+    pytest.importorskip("tritonbench.utils.tlx_l2", reason="needs the tritonbench installed by install_tritonbench.py")
+    from tritonbench.components.do_bench import Latency
+    from tritonbench.utils.triton_op import BenchmarkOperatorMetrics
+    from _harness.tritonbench import result
+
+    ref = BenchmarkOperatorMetrics(latency=Latency([1.] * 100))
+    tlx = BenchmarkOperatorMetrics(latency=Latency([2.] * 99 + [100.]), accuracy=True)
+    row = result(_case(), {"ref": ref, "tlx": tlx}, "ref", "tlx", 10**12)
+    assert tlx.latency.cv == 0
+    assert row.status is Status.NOISY
+    assert row.extra["tlx_latency"]["n_raw"] == 100
+    assert row.extra["tlx_latency"]["n_kept"] == 99
+
+
+def test_latency_scaling_applies_to_raw_and_filtered_samples():
+    pytest.importorskip("tritonbench.utils.tlx_l2", reason="needs the tritonbench installed by install_tritonbench.py")
+    from tritonbench.components.do_bench import Latency
+
+    latency = Latency([1., 2., 3.], remove_outliers=False)
+    latency.scale(2)
+    assert latency.raw_times == latency.times == [.5, 1., 1.5]
+
+
+@pytest.mark.parametrize("change", ({"statistic": "p50_latency"}, {"ref": "aten_matmul"}))
+def test_dashboard_does_not_report_a_policy_change_as_a_regression(monkeypatch, change):
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[3] / ".github/scripts/tlx_ops_bench_dashboard.py"
+    spec = importlib.util.spec_from_file_location("tlx_dashboard", path)
+    dashboard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dashboard)
+    monkeypatch.setattr(dashboard, "commits", lambda *args: [])
+    nights = [
+        {
+            "date": "20261104", "platform": "mi350", "sha": "a" * 40, "ops":
+            {"mm": {"cases": [{"key": "mm/fwd/shape", "status": "ok", "tlx_tflops": 100}]}}
+        },
+        {
+            "date": "20261105", "platform": "mi350", "sha": "b" * 40, "ops":
+            {"mm": {**change, "cases": [{"key": "mm/fwd/shape", "status": "ok", "tlx_tflops": 60}]}}
+        },
+    ]
+    event = dashboard.events(nights)[1]
+    assert not event["perf"]
+    assert "mm" in event["breaks"]
+
+
+def test_latency_preserves_graph_timing_scope():
+    pytest.importorskip("tritonbench.utils.tlx_l2", reason="needs the tritonbench installed by install_tritonbench.py")
+    from tritonbench.components.do_bench.gpu_events import _EventSamples
+    from tritonbench.components.do_bench.run import Latency
+    from tritonbench.utils.tlx_l2 import latency_stats
+
+    latency = Latency(_EventSamples([1.0, 1.1, 1.2], "graph_replay"))
+    latency.scale(2)
+    assert latency_stats(latency)["timing_scope"] == "graph_replay"

@@ -709,7 +709,7 @@ def test_flash_attn_gfx950_rejects_unknown_space():
 
     q, k, v = _qkv(64, requires_grad=False)
     with pytest.raises(InvalidInput, match="does not provide space"):
-        flash_attn(q, k, v, space="heuristic")
+        flash_attn(q, k, v, space="unknown")
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
