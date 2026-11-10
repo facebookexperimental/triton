@@ -120,11 +120,11 @@ from ._normalization import (
 )
 
 __all__ = [
-    "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "addmm",
-    "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen", "rmsnorm_cat",
-    "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
-    "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp",
-    "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
+    "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen",
+    "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention",
+    "kda_paged_prefill", "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward",
+    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -687,6 +687,83 @@ def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms
         num_sms=num_sms,
         sf_layout=sf_layout,
     )
+
+
+# The local-expert histogram and the [next_pow2(topk), next_pow2(H)] fp32 finalize tile live in registers. 2**16
+# elements fit 4 warps without spilling; 2**17 is a whole gfx950 CU register file and spills at any warp count.
+_MOE_MAX_LOCAL_EXPERTS = 512
+_MOE_MAX_FINALIZE_TILE = 1 << 16
+
+
+def moe(x, topk_weights, topk_ids, w13, w2, *, expert_start=0, post_norm_weight=None, post_norm_eps=1e-6,
+        post_norm_gain=0.0, out=None, space=None):
+    """Routed SiLU-gated mixture of experts over precomputed top-k routing. Forward only, bf16.
+
+    For each token ``t`` returns ``sum_k topk_weights[t, k] * f(y_k)`` where, for local expert
+    ``e = topk_ids[t, k] - expert_start``, ``y_k = (silu(x[t] @ w13[e, :I].T) * (x[t] @ w13[e, I:].T)) @ w2[e].T``.
+    ``f`` is the identity, or with ``post_norm_weight`` an RMSNorm without affine of
+    ``bf16((post_norm_weight + post_norm_gain) * y_k)``. Routes whose id falls outside
+    ``[expert_start, expert_start + E)`` belong to other expert-parallel ranks and contribute zero.
+
+    Shapes: ``x (T, K)``, ``topk_weights``/``topk_ids (T, topk)``, ``w13 (E, 2I, K)``, ``w2 (E, H, I)``,
+    ``post_norm_weight (H,)``; returns or fills ``out (T, H)``. ``K``, ``I`` and ``H`` must be positive multiples
+    of 128, ``E <= 512`` and ``next_pow2(topk) * next_pow2(H) <= 2**16``. Ids are never read on the host, so
+    the call is graph-capturable.
+    Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    tensors = (x, topk_weights, topk_ids, w13, w2)
+    if not all(isinstance(t, torch.Tensor) for t in tensors):
+        raise InvalidInput("tlx.ops.moe expects tensor x, topk_weights, topk_ids, w13 and w2")
+    if x.ndim != 2 or topk_ids.ndim != 2 or w13.ndim != 3 or w2.ndim != 3:
+        raise InvalidInput("tlx.ops.moe expects x (T, K), topk_ids (T, topk), w13 (E, 2I, K) and w2 (E, H, I); got "
+                           f"{[tuple(t.shape) for t in (x, topk_ids, w13, w2)]}")
+    T, K = x.shape
+    E, two_i, w13_k = w13.shape
+    I = two_i // 2
+    H = w2.shape[1]
+    if (topk_weights.shape != topk_ids.shape or topk_ids.shape[0] != T or two_i % 2 or w13_k != K
+            or w2.shape != (E, H, I)):
+        raise InvalidInput("tlx.ops.moe shape mismatch: x=%s topk_weights=%s topk_ids=%s w13=%s w2=%s" %
+                           tuple(tuple(t.shape) for t in tensors))
+    if any(t.dtype != x.dtype for t in (w13, w2)):
+        raise InvalidInput("tlx.ops.moe expects x, w13 and w2 to share a dtype")
+    if topk_ids.dtype not in (torch.int32, torch.int64) or not topk_weights.dtype.is_floating_point:
+        raise InvalidInput("tlx.ops.moe expects integer topk_ids and floating-point topk_weights; got "
+                           f"{topk_ids.dtype} and {topk_weights.dtype}")
+    topk = topk_ids.shape[1]
+    tile = (1 << (topk - 1).bit_length()) * (1 << (H - 1).bit_length()) if topk >= 1 and H >= 1 else 0
+    if not 1 <= tile <= _MOE_MAX_FINALIZE_TILE or not 1 <= E <= _MOE_MAX_LOCAL_EXPERTS:
+        raise InvalidInput(f"tlx.ops.moe supports next_pow2(topk) * next_pow2(H) <= {_MOE_MAX_FINALIZE_TILE} and "
+                           f"1 <= E <= {_MOE_MAX_LOCAL_EXPERTS} local experts; got topk={topk}, H={H}, E={E}")
+    if not isinstance(expert_start, int) or expert_start < 0:
+        raise InvalidInput(f"tlx.ops.moe expects a non-negative int expert_start; got {expert_start!r}")
+    extra = []
+    if post_norm_weight is not None:
+        if (not isinstance(post_norm_weight, torch.Tensor) or post_norm_weight.shape != (H, )
+                or not post_norm_weight.dtype.is_floating_point):
+            raise InvalidInput(f"tlx.ops.moe expects a floating-point post_norm_weight of shape ({H},)")
+        extra.append(post_norm_weight)
+    if out is not None:
+        if (not isinstance(out, torch.Tensor) or out.shape != (T, H) or out.dtype != torch.bfloat16
+                or not out.is_contiguous()):
+            raise InvalidInput(f"tlx.ops.moe expects a contiguous bf16 out of shape ({T}, {H})")
+        if any(torch._C._overlaps(out, t) for t in (*tensors, *extra)):
+            raise InvalidInput("tlx.ops.moe out must not alias an input")
+        extra.append(out)
+    if any(t.device != x.device for t in (*tensors, *extra)):
+        raise InvalidInput("tlx.ops.moe expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("moe", space)
+    _check_single_config_space("moe", space_name)
+    fn, spec = impl_for("moe", device=x.device)
+    check_inputs(spec, dtype=x.dtype, K=K, I=I, H=H)
+    check_backward(spec, *tensors, *extra)
+    _check_enforced("moe", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, topk_weights, topk_ids, w13, w2, expert_start, post_norm_weight, post_norm_eps, post_norm_gain,
+                  out)
 
 
 def addmm(input, a, b, *, out=None, space=None):
