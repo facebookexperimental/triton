@@ -1,4 +1,5 @@
 import json
+import os
 
 import tlx_ops_bench_bisect as bisect
 
@@ -57,3 +58,15 @@ def test_a_crashing_step_skips(tmp_path):
     spec.write_text(json.dumps({"source": str(tmp_path / "missing"), "log": str(tmp_path / "log")}))
     assert bisect.step_main(str(spec)) == bisect.SKIP
     assert bisect.step_main(str(tmp_path / "absent.json")) == bisect.SKIP
+
+
+def test_a_step_builds_without_the_repository_git_bisect_exports(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / ".git" / "worktrees" / "source"))
+    seen = {}
+    monkeypatch.setattr(bisect, "git", lambda *args: "a" * 40)
+    monkeypatch.setattr(bisect, "evaluate", lambda step: seen.update(git_dir=os.environ.get("GIT_DIR")) or {})
+    spec = tmp_path / "step.json"
+    spec.write_text(
+        json.dumps({"source": str(tmp_path), "gpu_uuid": "GPU-x", "cutoff": 1, "log": str(tmp_path / "log")}))
+    assert bisect.step_main(str(spec)) == bisect.SKIP
+    assert seen == {"git_dir": None}

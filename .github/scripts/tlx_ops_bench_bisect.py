@@ -29,6 +29,7 @@ MAX_JOBS = "8"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 FIRST_BAD = re.compile(r"^([0-9a-f]{40}) is the first bad commit", re.M)
 SELF = Path(__file__).resolve()
+GIT_REPO_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_PREFIX")
 
 
 def bench_modules(harness):
@@ -219,6 +220,10 @@ def measure_case(step):
 
 def step_main(path):
     """One `git bisect run` step. Any failure exits 125 so it can never be counted as bad."""
+    # In a worktree, git bisect run exports GIT_DIR; builds that run git (FetchContent clones) would then target
+    # the bisected repository instead of their own checkouts.
+    for name in GIT_REPO_ENV:
+        os.environ.pop(name, None)
     try:
         step = json.loads(Path(path).read_text())
         if not step.get("gpu_uuid"):
