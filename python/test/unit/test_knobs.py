@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import pytest
@@ -9,6 +10,9 @@ from triton._C.libtriton import get_cache_invalidating_env_vars  # type: ignore[
 from triton._internal_testing import is_hip
 
 from pathlib import Path
+
+from triton.backends import backends
+from triton.backends.compiler import GPUTarget
 
 
 def test_knobs_utils(fresh_knobs) -> None:
@@ -839,6 +843,40 @@ def test_nvidia_tool_env_hook(fresh_knobs, tmp_path, monkeypatch):
     # `probe` is lru_cached per path and the cache is process-wide; don't leave
     # entries behind that were resolved under this test's hook.
     triton.knobs.NvidiaTool.probe.cache_clear()
+
+
+@pytest.mark.parametrize("version,expected", [("12.8", False), ("12.8.1", False), ("13.0", True), ("13.0.1", True),
+                                              ("13.3", True), ("13.3.0", True), ("14.0", True)])
+@pytest.mark.parametrize("arch", [80, 100])
+@pytest.mark.parametrize("ptx_version", [None, 80])
+@pytest.mark.skipif("nvidia" not in backends, reason="Requires the NVIDIA backend")
+def test_ptxas_reg_alloc_version(fresh_knobs, tmp_path, monkeypatch, version, expected, arch, ptx_version):
+    command_path = tmp_path / "command.json"
+    tool = _fake_tool(
+        tmp_path / "ptxas", 'import json\n'
+        'from pathlib import Path\n'
+        'if "--version" in sys.argv:\n'
+        f'    print("Cuda compilation tools, release {version}")\n'
+        'else:\n'
+        f'    Path({str(command_path)!r}).write_text(json.dumps(sys.argv))\n'
+        '    Path(sys.argv[sys.argv.index("-o") + 1]).write_bytes(b"cubin")')
+    other_version = "12.8" if expected else "13.3"
+    other_tool = _fake_tool(tmp_path / "other-ptxas", f'print("Cuda compilation tools, release {other_version}")')
+    monkeypatch.delenv("TRITON_COMPILE_IQ_APPLY", raising=False)
+    with fresh_knobs.nvidia.scope():
+        fresh_knobs.nvidia.ptxas = str(tool if arch < 100 else other_tool)
+        fresh_knobs.nvidia.ptxas_blackwell = str(tool if arch >= 100 else other_tool)
+        fresh_knobs.nvidia.disable_ptxas_opt = False
+        backend = backends["nvidia"].compiler(GPUTarget("cuda", arch, 32))
+        options = backend.parse_options(
+            {"enable_fp_fusion": False, "ptx_options": "--warn-on-spills", "ptx_version": ptx_version})
+        assert backend.make_cubin("// PTX", {}, options, arch) == b"cubin"
+
+    command = json.loads(command_path.read_text())
+    assert command[0] == str(tool)
+    assert command.count("--regAllocOptLevel=2") == int(expected)
+    assert "--fmad=false" in command
+    assert "--warn-on-spills" in command
 
 
 def test_opt_bool(fresh_knobs_including_libraries, monkeypatch):
