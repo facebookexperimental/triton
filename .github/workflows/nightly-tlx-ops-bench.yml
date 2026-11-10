@@ -1,382 +1,150 @@
-name: Bisect TLX throughput regression
+name: Verify H100 varlen attention recovery
 
 on:
   workflow_dispatch:
-    inputs:
-      source_run_id:
-        description: Benchmark workflow run containing regression evidence
-        required: true
-        default: '42765214195'
-        type: string
-      artifact_name:
-        description: Regression evidence artifact from that run
-        required: true
-        default: historical-h100-fixture
-        type: string
-      platform:
-        description: Platform to bisect
-        required: true
-        default: h100
-        type: choice
-        options: [h100]
-      state_run_id:
-        description: Previous bisect round, empty for the first round
-        required: false
-        default: ''
-        type: string
 
 permissions:
   contents: read
 
-concurrency:
-  group: tlx-perf-bisect-${{ inputs.platform }}
-  cancel-in-progress: false
-
 jobs:
   prepare:
-    if: github.repository == 'facebookexperimental/triton'
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: read
-      issues: read
     outputs:
-      ready: ${{ steps.plan.outputs.ready }}
-      good: ${{ steps.plan.outputs.good }}
-      bad: ${{ steps.plan.outputs.bad }}
-      candidate: ${{ steps.plan.outputs.candidate }}
+      before: ${{ steps.spec.outputs.before }}
+      after: ${{ steps.spec.outputs.after }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.workflow_sha }}
-          path: tooling
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
           ref: main
-          path: source
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify the evidence producer
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-          STATE_RUN_ID: ${{ inputs.state_run_id }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import subprocess
-
-          repo = os.environ['GITHUB_REPOSITORY']
-          def read_run(number):
-              return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/actions/runs/{int(number)}']))
-          original = read_run(os.environ['SOURCE_RUN_ID'])
-          assert original['path'].split('@', 1)[0] == '.github/workflows/nightly-tlx-ops-bench.yml'
-          assert original['event'] in ('schedule', 'workflow_dispatch')
-          assert original['head_repository']['full_name'] == repo
-          if os.environ['STATE_RUN_ID']:
-              previous = read_run(os.environ['STATE_RUN_ID'])
-              path = os.environ['GITHUB_WORKFLOW_REF'].split('@', 1)[0].split('/', 2)[2]
-              assert previous['path'].split('@', 1)[0] == path
-              assert previous['event'] == 'workflow_dispatch'
-              assert previous['head_repository']['full_name'] == repo
-              assert previous['head_branch'] == os.environ['GITHUB_REF_NAME']
-          PY
-      - name: Prepare the real November 3-4 H100 case
-        if: inputs.state_run_id == ''
-        run: |
-          python3 - <<'PY'
-          import json
-          import pathlib
-          evidence = pathlib.Path('evidence')
-          evidence.mkdir(exist_ok=True)
-          spec = {
-              'op': 'flash_attn_varlen', 'direction': 'fwd',
-              'key': 'flash_attn_varlen/sm90/bfloat16/8x2160x2160x2x128xFalsex1024x1024',
-              'platform': 'h100', 'space': 'heuristic', 'required_ratio': 0.9,
-              'good_sha': '391d131cc0da79272af6131f70e480f1d9423b8d',
-              'bad_sha': '361492e542b33dc471733f7df7166d5d0983aa1d'
-          }
-          (evidence / 'regressions.json').write_text(json.dumps([
-              {'platform': 'h100', 'bisect_issue': 4881, 'bisect': spec}
-          ]))
-          PY
-      - name: Download previous round state
-        if: inputs.state_run_id != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: perf-bisect-state
-          path: evidence
-          run-id: ${{ inputs.state_run_id }}
-          github-token: ${{ github.token }}
-      - name: Recover the first validation round's artifact layout
-        if: inputs.state_run_id == '42772071178'
-        run: |
-          cp evidence/evidence/state.json evidence/state.json
-          cp evidence/evidence/inputs.json evidence/inputs.json
-      - name: Select the next main-history commit
-        id: plan
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PLATFORM: ${{ inputs.platform }}
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-          ARTIFACT_NAME: ${{ inputs.artifact_name }}
-          STATE_RUN_ID: ${{ inputs.state_run_id }}
+      - name: Validate the recovery pair and preserve the benchmark
+        id: spec
         run: |
           python3 - <<'PY'
           import json
           import os
           import pathlib
           import subprocess
-          import time
-
-          repo = os.environ['GITHUB_REPOSITORY']
+          before = '3a048730c50b60f25813ac993aa1be7632983fdc'
+          after = '02c860a6a4de34279b76a90dc16c97b054f61db1'
+          subprocess.run(['git', 'merge-base', '--is-ancestor', before, after], check=True)
+          subprocess.run(['git', 'merge-base', '--is-ancestor', after, 'origin/main'], check=True)
+          assert subprocess.check_output(['git', 'rev-parse', after + '^'], text=True).strip() == before
+          spec = {'op': 'flash_attn_varlen', 'direction': 'fwd', 'platform': 'h100', 'space': 'heuristic',
+                  'key': 'flash_attn_varlen/sm90/bfloat16/8x2160x2160x2x128xFalsex1024x1024',
+                  'good_sha': before, 'bad_sha': after}
           evidence = pathlib.Path('evidence')
-          context = {'source_run_id': os.environ['SOURCE_RUN_ID'], 'artifact_name': os.environ['ARTIFACT_NAME'],
-                     'platform': os.environ['PLATFORM']}
-          if os.environ['STATE_RUN_ID']:
-              previous = json.loads((evidence / 'inputs.json').read_text())
-              assert all(previous[key] == value for key, value in context.items())
-              context = previous
-          else:
-              specs = []
-              for alert in json.loads((evidence / 'regressions.json').read_text()):
-                  number = alert.get('bisect_issue')
-                  if not number or alert['platform'] != context['platform']:
-                      continue
-                  number = int(number)
-                  issue = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/issues/{number}']))
-                  if issue['state'] == 'open':
-                      specs.append({'issue_number': number, **alert['bisect']})
-              (evidence / 'state.json').write_text(json.dumps({'specs': specs}))
-              context.update(started_at=time.time(), reported=0)
-          state = json.loads((evidence / 'state.json').read_text())
-          if time.time() - context['started_at'] > 300 * 60:
-              for spec in state['specs'][state.get('index', 0):]:
-                  state.setdefault('results', []).append({**spec, 'status': 'inconclusive',
-                                                         'reason': 'Five-hour bisection budget expired.'})
-              state['index'] = len(state['specs'])
-              (evidence / 'state.json').write_text(json.dumps(state))
-          (evidence / 'inputs.json').write_text(json.dumps(context))
-          subprocess.run(['python3', 'tooling/.github/scripts/tlx_ops_bench_bisect_round.py', 'prepare',
-                          '--state', str(evidence / 'state.json'), '--source', 'source',
-                          '--out', str(evidence / 'prepared.json')], check=True)
-          prepared = json.loads((evidence / 'prepared.json').read_text())
+          evidence.mkdir()
+          (evidence / 'prepared.json').write_text(json.dumps({'spec': spec}))
+          with (evidence / 'benchmark.tar').open('wb') as out:
+              subprocess.run(['git', 'archive', after, 'python/test/tlx_benchmark'], stdout=out, check=True)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              out.write(f"ready={str(prepared['needs_measurement']).lower()}\n")
-              if prepared['needs_measurement']:
-                  out.write(f"good={prepared['spec']['good_sha']}\nbad={prepared['spec']['bad_sha']}\n")
-                  out.write(f"candidate={prepared['candidate_sha'] or ''}\n")
+              out.write(f'before={before}\nafter={after}\n')
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: perf-bisect-prepared
-          path: |
-            evidence/prepared.json
-            evidence/inputs.json
+          name: recovery-spec
+          path: evidence/*
 
-  good-wheel:
+  before-wheel:
     needs: prepare
-    if: needs.prepare.outputs.ready == 'true'
     permissions:
       contents: read
       id-token: write
     uses: ./.github/workflows/build.yml
     with:
-      ref: ${{ needs.prepare.outputs.good }}
-      build_id: perf-good
+      ref: ${{ needs.prepare.outputs.before }}
+      build_id: recovery-before
 
-  bad-wheel:
+  after-wheel:
     needs: prepare
-    if: needs.prepare.outputs.ready == 'true'
     permissions:
       contents: read
       id-token: write
     uses: ./.github/workflows/build.yml
     with:
-      ref: ${{ needs.prepare.outputs.bad }}
-      build_id: perf-bad
-
-  candidate-wheel:
-    needs: prepare
-    if: needs.prepare.outputs.ready == 'true' && needs.prepare.outputs.candidate != ''
-    permissions:
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/build.yml
-    with:
-      ref: ${{ needs.prepare.outputs.candidate }}
-      build_id: perf-candidate
+      ref: ${{ needs.prepare.outputs.after }}
+      build_id: recovery-after
 
   measure:
-    needs: [prepare, good-wheel, bad-wheel, candidate-wheel]
-    if: always() && needs.prepare.outputs.ready == 'true' && needs.good-wheel.result == 'success' && needs.bad-wheel.result == 'success'
-    runs-on: ${{ fromJSON('{"b200":"nvidia-dgx-b200","h100":"linux-gcp-h100","mi350":"linux-fb-triton-mi350-1"}')[inputs.platform] }}
-    timeout-minutes: 45
-    permissions:
-      contents: read
+    needs: [prepare, before-wheel, after-wheel]
+    runs-on: linux-gcp-h100
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.workflow_sha }}
           path: tooling
           persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-          path: source
-          fetch-depth: 0
-          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: perf-bisect-prepared
+          name: recovery-spec
           path: evidence
-      - name: Verify wheel commits and preserve the benchmark
+      - name: Verify wheel identities and unpack the fixed benchmark
         env:
-          GOOD_COMMIT: ${{ needs.good-wheel.outputs.commit }}
-          BAD_COMMIT: ${{ needs.bad-wheel.outputs.commit }}
-          CANDIDATE_COMMIT: ${{ needs.candidate-wheel.outputs.commit }}
-          CANDIDATE_STATUS: ${{ needs.candidate-wheel.result }}
+          BEFORE: ${{ needs.before-wheel.outputs.commit }}
+          AFTER: ${{ needs.after-wheel.outputs.commit }}
         run: |
           python3 - <<'PY'
           import json
           import os
           import pathlib
-          import re
           import subprocess
-
-          prepared = json.loads(pathlib.Path('evidence/prepared.json').read_text())
-          spec = prepared['spec']
-          assert os.environ['GOOD_COMMIT'] == spec['good_sha']
-          assert os.environ['BAD_COMMIT'] == spec['bad_sha']
-          if os.environ['CANDIDATE_STATUS'] == 'success':
-              assert os.environ['CANDIDATE_COMMIT'] == prepared['candidate_sha']
-          for sha in prepared['commits']:
-              assert re.fullmatch(r'[0-9a-f]{40}', sha)
-              subprocess.run(['git', '-C', 'source', 'merge-base', '--is-ancestor', sha, 'origin/main'], check=True)
-          harness = pathlib.Path(os.environ['RUNNER_TEMP']) / 'perf-bisect-harness'
+          spec = json.loads(pathlib.Path('evidence/prepared.json').read_text())['spec']
+          assert spec['good_sha'] == os.environ['BEFORE']
+          assert spec['bad_sha'] == os.environ['AFTER']
+          harness = pathlib.Path(os.environ['RUNNER_TEMP']) / 'recovery-harness'
           harness.mkdir()
-          archive = harness.parent / 'perf-bisect-benchmark.tar'
-          with archive.open('wb') as out:
-              subprocess.run(['git', '-C', 'source', 'archive', spec['bad_sha'], 'python/test/tlx_benchmark'], stdout=out, check=True)
-          subprocess.run(['tar', '-xf', str(archive), '-C', str(harness)], check=True)
+          subprocess.run(['tar', '-xf', 'evidence/benchmark.tar', '-C', str(harness)], check=True)
           PY
       - uses: ./tooling/.github/actions/setup-test-env
         with:
-          backend: ${{ inputs.platform == 'mi350' && 'rocm' || 'cuda' }}
-          arch: ${{ inputs.platform == 'mi350' && 'gfx950' || '' }}
+          backend: cuda
           torch: torch==2.14.0
-          torch-index-url: ${{ inputs.platform == 'mi350' && 'https://download.pytorch.org/whl/rocm7.2' || 'https://download.pytorch.org/whl/cu130' }}
+          torch-index-url: https://download.pytorch.org/whl/cu130
           packages: numpy pytest torchao
           rocm-lib-path: ''
-      - name: Refresh CUDA linker cache
-        if: inputs.platform != 'mi350'
-        run: sudo ldconfig
-      - name: Install good endpoint wheel
+      - run: sudo ldconfig
+      - name: Install wheel before the recovery bundle
         uses: ./tooling/.github/actions/install-prebuilt-triton
         with:
-          wheel-url: ${{ needs.good-wheel.outputs.wheel_url }}
-          wheel-filename: ${{ needs.good-wheel.outputs.wheel_filename }}
-          wheel-sha256: ${{ needs.good-wheel.outputs.wheel_sha256 }}
-      - name: Measure good endpoint
+          wheel-url: ${{ needs.before-wheel.outputs.wheel_url }}
+          wheel-filename: ${{ needs.before-wheel.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.before-wheel.outputs.wheel_sha256 }}
+      - name: Measure before recovery
         run: |
-          python tooling/.github/scripts/tlx_ops_bench_measure_round.py --prepared evidence/prepared.json --role good --source source --harness "${RUNNER_TEMP}/perf-bisect-harness/python/test/tlx_benchmark" --output measurements
+          python tooling/.github/scripts/tlx_ops_bench_measure_round.py --prepared evidence/prepared.json --role good --source tooling --harness "${RUNNER_TEMP}/recovery-harness/python/test/tlx_benchmark" --output measurements
           rm -f "${RUNNER_TEMP}"/prebuilt-wheel/*.whl
-      - name: Install bad endpoint wheel
+      - name: Install wheel after the recovery bundle
         uses: ./tooling/.github/actions/install-prebuilt-triton
         with:
-          wheel-url: ${{ needs.bad-wheel.outputs.wheel_url }}
-          wheel-filename: ${{ needs.bad-wheel.outputs.wheel_filename }}
-          wheel-sha256: ${{ needs.bad-wheel.outputs.wheel_sha256 }}
-      - name: Measure bad endpoint
-        id: endpoints
+          wheel-url: ${{ needs.after-wheel.outputs.wheel_url }}
+          wheel-filename: ${{ needs.after-wheel.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.after-wheel.outputs.wheel_sha256 }}
+      - name: Measure after recovery
         run: |
-          python tooling/.github/scripts/tlx_ops_bench_measure_round.py --prepared evidence/prepared.json --role bad --source source --harness "${RUNNER_TEMP}/perf-bisect-harness/python/test/tlx_benchmark" --output measurements
-          rm -f "${RUNNER_TEMP}"/prebuilt-wheel/*.whl
-          python - <<'PY'
-          import json
-          import os
-          import pathlib
-          import sys
-          sys.path.insert(0, 'tooling/.github/scripts')
-          from tlx_ops_bench_bisect import check_endpoints
-          spec = json.loads(pathlib.Path('evidence/prepared.json').read_text())['spec']
-          good = json.loads(pathlib.Path('measurements/good.json').read_text())
-          bad = json.loads(pathlib.Path('measurements/bad.json').read_text())
-          cutoff, reason = check_endpoints(good, bad, spec['required_ratio'])
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              out.write(f"reproduced={str(cutoff is not None).lower()}\n")
-          if reason:
-              print(reason)
-          PY
-      - name: Install candidate wheel
-        if: steps.endpoints.outputs.reproduced == 'true' && needs.candidate-wheel.result == 'success'
-        uses: ./tooling/.github/actions/install-prebuilt-triton
-        with:
-          wheel-url: ${{ needs.candidate-wheel.outputs.wheel_url }}
-          wheel-filename: ${{ needs.candidate-wheel.outputs.wheel_filename }}
-          wheel-sha256: ${{ needs.candidate-wheel.outputs.wheel_sha256 }}
-      - name: Measure candidate
-        if: steps.endpoints.outputs.reproduced == 'true' && needs.candidate-wheel.result == 'success'
-        run: |
-          python tooling/.github/scripts/tlx_ops_bench_measure_round.py --prepared evidence/prepared.json --role candidate --source source --harness "${RUNNER_TEMP}/perf-bisect-harness/python/test/tlx_benchmark" --output measurements
+          python tooling/.github/scripts/tlx_ops_bench_measure_round.py --prepared evidence/prepared.json --role bad --source tooling --harness "${RUNNER_TEMP}/recovery-harness/python/test/tlx_benchmark" --output measurements
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: perf-bisect-measurements
+          name: recovery-measurements
           path: measurements/*.json
-          if-no-files-found: ignore
+          if-no-files-found: error
 
-  advance:
-    needs: [prepare, good-wheel, bad-wheel, candidate-wheel, measure]
-    if: always() && !cancelled() && needs.prepare.result == 'success'
+  report:
+    needs: measure
+    if: always() && !cancelled() && needs.measure.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: write
       issues: write
-      pull-requests: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: tooling
-          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: perf-bisect-prepared
+          name: recovery-measurements
           path: evidence
-      - uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: perf-bisect-measurements
-          path: measurements
-      - name: Classify the round and persist the next state
-        env:
-          GOOD_BUILD: ${{ needs.good-wheel.result }}
-          BAD_BUILD: ${{ needs.bad-wheel.result }}
-          CANDIDATE_BUILD: ${{ needs.candidate-wheel.result }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-          import subprocess
-
-          measurements = {}
-          for role in ('good', 'bad', 'candidate'):
-              path = pathlib.Path(f'measurements/{role}.json')
-              if path.exists():
-                  measurements[role] = json.loads(path.read_text())
-              elif os.environ[f'{role.upper()}_BUILD'] == 'failure':
-                  measurements[role] = {'status': 'build_failed'}
-          pathlib.Path('evidence/measurements.json').write_text(json.dumps(measurements))
-          subprocess.run(['python3', 'tooling/.github/scripts/tlx_ops_bench_bisect_round.py', 'advance',
-                          '--state', 'evidence/prepared.json', '--measurements', 'evidence/measurements.json',
-                          '--out', 'evidence/state.json'], check=True)
-          PY
-      - name: Report completed cases
+      - name: Append the paired recovery measurements to issue 4887
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -385,52 +153,19 @@ jobs:
           import os
           import pathlib
           import subprocess
-
-          repo = os.environ['GITHUB_REPOSITORY']
-          run_url = f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
-          state = json.loads(pathlib.Path('evidence/state.json').read_text())
-          context_path = pathlib.Path('evidence/inputs.json')
-          context = json.loads(context_path.read_text())
-          for result in state['results'][context['reported']:]:
-              number = int(result['issue_number'])
-              lines = [f"Performance bisection result: {result['status']}. [Run and evidence]({run_url}).",
-                       f"Case: `{result['key']}`."]
-              if result.get('first_bad_sha'):
-                  sha = result['first_bad_sha']
-                  lines.append(f"First bad commit for the measured case: https://github.com/{repo}/commit/{sha}")
-              if result.get('reason'):
-                  lines.append(result['reason'])
-              subprocess.run(['gh', 'api', f'repos/{repo}/issues/{number}/comments', '--method', 'POST', '--input', '-'],
-                             input=json.dumps({'body': '\n\n'.join(lines)}), text=True, check=True)
-              context['reported'] += 1
-              context_path.write_text(json.dumps(context))
-          PY
-      - uses: actions/upload-artifact@v4
-        with:
-          name: perf-bisect-state
-          path: |
-            evidence/state.json
-            evidence/inputs.json
-            evidence/measurements.json
-      - name: Dispatch the next round without holding a GPU runner
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-          import subprocess
-
-          state = json.loads(pathlib.Path('evidence/state.json').read_text())
-          if state['index'] >= len(state['specs']):
-              print('All cases have a result.')
-          else:
-              context = json.loads(pathlib.Path('evidence/inputs.json').read_text())
-              inputs = {key: context[key] for key in ('source_run_id', 'artifact_name', 'platform')}
-              inputs['state_run_id'] = os.environ['GITHUB_RUN_ID']
-              workflow = os.environ['GITHUB_WORKFLOW_REF'].split('@', 1)[0].rsplit('/', 1)[-1]
-              repo = os.environ['GITHUB_REPOSITORY']
-              subprocess.run(['gh', 'api', f'repos/{repo}/actions/workflows/{workflow}/dispatches', '--method', 'POST', '--input', '-'],
-                             input=json.dumps({'ref': os.environ['GITHUB_REF_NAME'], 'inputs': inputs}), text=True, check=True)
+          before = json.loads(pathlib.Path('evidence/good.json').read_text())
+          after = json.loads(pathlib.Path('evidence/bad.json').read_text())
+          assert before['status'] == after['status'] == 'ok'
+          assert before['gpu_uuid'] == after['gpu_uuid'] and before['gpu_uuid']
+          baseline = 330.69093014942086
+          recovered = before['tflops'] < 0.9 * baseline and after['tflops'] >= 0.9 * baseline
+          run_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          verdict = 'Paired H100 measurement confirms recovery across PR #4639.' if recovered else 'The paired test did not establish recovery across PR #4639.'
+          gain = 100 * (after['tflops'] / before['tflops'] - 1)
+          lines = [verdict, f'[Measured run and evidence]({run_url}).',
+                   f"Before the bundle: {before['tflops']:.2f} TFLOP/s. After: {after['tflops']:.2f} TFLOP/s. Change: {gain:+.1f}%.",
+                   'Both wheels ran the same BF16 varlen-attention case on one H100 GPU, with two accepted low-CV measurements per wheel.',
+                   '[Recovery bundle PR #4639](https://github.com/facebookexperimental/triton/pull/4639) is commit [02c860a6](https://github.com/facebookexperimental/triton/commit/02c860a6a4de34279b76a90dc16c97b054f61db1). The before wheel is its immediate parent. This comparison does not isolate one upstream patch within the bundle.']
+          subprocess.run(['gh', 'api', 'repos/facebookexperimental/triton/issues/4887/comments', '--method', 'POST', '--input', '-'],
+                         input=json.dumps({'body': '\n\n'.join(lines)}), text=True, check=True)
           PY
