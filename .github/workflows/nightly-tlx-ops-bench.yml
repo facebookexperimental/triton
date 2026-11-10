@@ -137,6 +137,12 @@ jobs:
           torch-index-url: ${{ inputs.platform == 'mi350' && 'https://download.pytorch.org/whl/rocm7.2' || 'https://download.pytorch.org/whl/cu130' }}
           packages: numpy pytest torchao
           rocm-lib-path: ""
+      - name: Ensure C++ build compiler
+        run: |
+          if ! command -v c++ >/dev/null && ! command -v g++ >/dev/null && ! command -v clang++ >/dev/null; then
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++
+          fi
       - name: Refresh CUDA linker cache
         if: inputs.platform != 'mi350'
         run: sudo ldconfig
@@ -190,6 +196,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      pull-requests: write
     steps:
       - uses: actions/download-artifact@v4
         with:
