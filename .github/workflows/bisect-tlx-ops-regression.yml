@@ -49,7 +49,7 @@ jobs:
           repo = os.environ['GITHUB_REPOSITORY']
           run = json.loads(subprocess.check_output(['gh', 'api', f"repos/{repo}/actions/runs/{os.environ['SOURCE_RUN_ID']}"]))
           assert run['path'].split('@', 1)[0] == '.github/workflows/nightly-tlx-ops-bench.yml'
-          assert run['event'] in ('workflow_dispatch', 'workflow_run')
+          assert run['event'] in ('schedule', 'workflow_dispatch')
           assert run['head_repository']['full_name'] == repo
           PY
       - name: Download detected regressions
