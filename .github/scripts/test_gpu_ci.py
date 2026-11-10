@@ -683,6 +683,7 @@ def test_fast_shared_unknown_and_manual_changes_retain_critical_coverage(paths, 
     '<testsuite><testcase classname="tests.smoke" name="test_other"/></testsuite>',
     '<testsuite><testcase classname="tests.smoke" name="test_required"><skipped/></testcase></testsuite>',
     '<testsuite><testcase classname="tests.smoke" name="test_required"><failure/></testcase></testsuite>',
+    '<testsuite><testcase classname="tests.smoke" name="test_required"><error/></testcase></testsuite>',
 ])
 def test_fast_suite_requires_executed_passing_evidence(tmp_path, content):
     from fast_tests import verify_evidence
@@ -808,6 +809,31 @@ class TestNested:
     verify_manifests([manifest])
 
 
+def test_fast_failures_and_claimed_pass_integrity_still_block_coverage_warnings(tmp_path):
+    import copy
+    from fast_tests import verify_manifests
+    result, manifest = fast_fixture_run(
+        tmp_path, '''def test_baseline():
+    assert True
+def test_touched():
+    assert True
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+    function = "test_sample.py::test_touched"
+    passing_platform = manifest | {"platform": "h100"}
+    for problem in ("failed", "wrong_node", "missing_selected"):
+        broken = copy.deepcopy(manifest)
+        broken["unmapped"].append("unmapped_kernel.py")
+        if problem == "failed":
+            broken["functions"][function]["status"] = "failed"
+        elif problem == "wrong_node":
+            broken["functions"][function]["passed"] = broken["baseline"][0]
+        else:
+            broken["selected"].remove(broken["functions"][function]["passed"])
+        with pytest.raises(ValueError):
+            verify_manifests([broken, passing_platform])
+
+
 def test_fast_failure_cannot_be_replaced_by_a_passing_parameter(tmp_path):
     result, manifest = fast_fixture_run(
         tmp_path, '''import pytest
@@ -861,8 +887,8 @@ def test_touched(value):
     pytest.skip("required runtime dependency unavailable")
 ''' % cases)
     assert result.returncode == 0, result.stdout + result.stderr
-    with pytest.raises(ValueError):
-        verify_manifests([manifest])
+    gaps = verify_manifests([manifest])
+    assert [gap["target"] for gap in gaps] == ["test_sample.py::test_touched"]
     assert "test_sample.py::test_touched" not in manifest["selected"]
     summary = (tmp_path / "summary.md").read_text()
     assert "test_sample.py::test_touched[0] | touched | skipped |" in summary
@@ -883,12 +909,13 @@ def test_touched(value):
          str(tmp_path)],
         env=os.environ | {"NEEDS": json.dumps(needs), "GITHUB_STEP_SUMMARY": str(tmp_path / "aggregate.md")},
         capture_output=True, text=True)
-    assert verified.returncode != 0
-    assert "Aggregate fast correctness coverage failed" in (tmp_path / "aggregate.md").read_text()
+    assert verified.returncode == 0, verified.stdout + verified.stderr
+    assert "Fast correctness coverage warnings" in (tmp_path / "aggregate.md").read_text()
+    assert "coverage_gaps" in verified.stdout and "::warning::" in verified.stdout
     assert "test_touched" in (tmp_path / "aggregate.md").read_text()
 
 
-def test_fast_platform_exclusions_require_actual_coverage_elsewhere(tmp_path):
+def test_fast_platform_coverage_gaps_are_advisory_and_clear_with_a_pass(tmp_path):
     from fast_tests import verify_manifests
     source = '''import os
 import pytest
@@ -900,10 +927,12 @@ def test_touched():
     for supported in ("no", "yes"):
         result, manifest = fast_fixture_run(tmp_path, source, {"SUPPORTED": supported}, separate_baseline=True)
         assert result.returncode == 0, result.stdout + result.stderr
+        manifest["platform"] = "h100" if supported == "no" else "b200"
         manifests.append(manifest)
-    with pytest.raises(ValueError, match="lack passing coverage"):
-        verify_manifests(manifests[:1])
-    verify_manifests(manifests)
+    gaps = verify_manifests(manifests[:1])
+    assert gaps and gaps[0]["target"] == "test_sample.py"
+    assert "requires supported hardware" in gaps[0]["details"][0]["reason"]
+    assert not verify_manifests(manifests)
 
 
 @pytest.mark.parametrize("test_body", [
@@ -917,5 +946,6 @@ def test_fast_collection_cannot_silently_remove_a_touched_function(tmp_path, tes
 ''')
     result, manifest = fast_fixture_run(tmp_path, "def test_baseline():\n    assert True\n" + test_body)
     assert result.returncode == 0, result.stdout + result.stderr
-    with pytest.raises(ValueError, match="test_touched"):
-        verify_manifests([manifest])
+    gaps = verify_manifests([manifest])
+    assert gaps and gaps[0]["details"][0]["status"] == "missing"
+    assert "test_touched" in gaps[0]["target"]
