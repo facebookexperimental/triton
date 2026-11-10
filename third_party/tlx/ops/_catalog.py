@@ -250,6 +250,18 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="mm_mxfp8",
+        arch="gfx1250",
+        variant="persistent_tdm",
+        impl="triton.tlx.ops.kernels.mm_mxfp8.gfx1250:mm_mxfp8",
+        invariant_vocab=_GEMM_DIMS,
+        dtypes=frozenset({"float8_e4m3fn"}),
+        # TDM descriptors need 16-byte-aligned bases; row strides follow from
+        # the K contract.
+        accepts=lambda d: all(ptr % 16 == 0 for ptr in d["base_ptrs"]),
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="mm_mxfp6",
         arch="sm100",
         variant="ws_mxfp6",
@@ -292,6 +304,18 @@ CATALOG: tuple[OpSpec, ...] = (
         impl="triton.tlx.ops.kernels.grouped_gemm.gfx950:grouped_gemm",
         invariant_vocab=_GROUPED_GEMM_DIMS,
         dtypes=frozenset({"float16"}),
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="grouped_gemm",
+        arch="gfx1250",
+        variant="persistent_tdm",
+        impl="triton.tlx.ops.kernels.grouped_gemm.gfx1250:grouped_gemm",
+        invariant_vocab=_GROUPED_GEMM_DIMS,
+        dtypes=frozenset({"float16"}),
+        # TDM descriptors need 16-byte-aligned bases; canonical row strides
+        # and common N/K are checked by the implementation.
+        accepts=lambda d: all(ptr % 16 == 0 for ptr in d["base_ptrs"]),
         requires=frozenset(),
     ),
     OpSpec(

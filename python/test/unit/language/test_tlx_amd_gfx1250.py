@@ -1756,7 +1756,9 @@ def test_grouped_gemm_interface_multicast_launch(cluster_size, monkeypatch):
     cpu_b = [torch.randn((n, k), dtype=torch.float16) for _ in range(2)]
     a, b = [x.cuda() for x in cpu_a], [x.cuda().T for x in cpu_b]
     config = {} if cluster_size is None else dict(CLUSTER_SIZE=cluster_size)
-    monkeypatch.setattr(_gfx1250_grouped, "_active_num_cus", lambda device: 16)
+    # The host interface lives in the tlx.ops module the tutorial imports.
+    from triton.tlx.ops.kernels.grouped_gemm import gfx1250 as grouped_ops
+    monkeypatch.setattr(grouped_ops, "_active_num_cus", lambda device: 16)
     *launch_args, outputs = _gfx1250_grouped._make_grouped_gemm_args(a, b, config)
     assert launch_args[-1]["CLUSTER_SIZE"] == (4 if cluster_size is None else cluster_size)
     assert launch_args[-1]["NUM_SM"] == 16
