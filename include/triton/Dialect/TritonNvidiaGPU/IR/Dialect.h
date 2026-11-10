@@ -111,6 +111,28 @@ std::optional<std::string>
 getTcgen05IllegalShapeReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
                              bool twoCTAs, unsigned m, unsigned n);
 
+// The tcgen05 kind that issues an MMA on `t` operands.
+std::optional<Tcgen05Kind> getTcgen05Kind(Type t);
+
+// The K of one tcgen05.mma: 32 bytes, 64 for 8-bit operands with 2x fp8 at
+// blockM=128 when 64 divides `k`, or 96 for FP4 with K=96 when 96 divides it.
+unsigned getTcgen05InstrK(unsigned bitwidth, unsigned blockM, int64_t k,
+                          bool supports2xFp8, bool supportsK96 = false);
+
+// Why an NPOT per-CTA accumulator tile can't be issued as tcgen05 tiles of
+// blockM x min(blockN, N) x instruction K, or nullopt if it can. NPOT M, NPOT N
+// at blockM=64 and the block-scaled NPOT N that
+// getNpotTMemScalesUnsupportedReason rejects aren't lowered.
+std::optional<std::string> getNpotMMAv5TileUnsupportedReason(
+    Tcgen05Kind kind, bool aInTmem, bool bMNMajor, bool twoCTAs,
+    unsigned blockM, unsigned blockN, ArrayRef<int64_t> ctaShape, int64_t k,
+    unsigned bitwidth, bool supportsK96 = false);
+
+// Why TMA can't copy NPOT tile `ty` as whole getTMABlockShape boxes, or nullopt
+// if it can. An all-pow2 tile always can.
+std::optional<std::string> getNpotTMAUnsupportedReason(gpu::MemDescType ty,
+                                                       gpu::TMAMode mode);
+
 // Returns the required ordering of repeated TMEM scale blocks for one
 // tcgen05 scaled-MMA operand.
 TensorMemoryScalesBlockRepOrder getTensorMemoryScalesBlockRepOrder(

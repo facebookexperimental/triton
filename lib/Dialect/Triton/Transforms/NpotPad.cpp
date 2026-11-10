@@ -1,4 +1,5 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
@@ -11,7 +12,9 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/EquivalenceClasses.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MathExtras.h"
 
 namespace mlir::triton {
@@ -133,10 +136,11 @@ SmallVector<Value> npotValues(Operation *op) {
 }
 
 // Padding needs a mask to keep a pad lane's side effect from landing. An atomic
-// without a predicate can't be masked, so selection keeps its connected
-// component exact where it can.
+// without a predicate can't be masked, nor can a TMA store's box, so selection
+// keeps its connected component exact where it can.
 static bool hasPaddedLowering(Operation *op) {
-  return !(isa<AtomicOpInterface>(op) && !isa<PredicatedOpInterface>(op));
+  return !(isa<AtomicOpInterface>(op) && !isa<PredicatedOpInterface>(op)) &&
+         !isa<DescriptorStoreLikeOpInterface>(op);
 }
 
 // Groups the NPOT tensors connected through their ops (a connected component
@@ -148,7 +152,8 @@ static bool hasPaddedLowering(Operation *op) {
 class ExactComponents {
 public:
   ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp, int numCTAs,
-                  StringRef target);
+                  StringRef target, int nonKDim, int numStages,
+                  bool useAsyncCopy);
   bool contains(Value v) const {
     return !paddedComponents.contains(components.getLeaderValue(v));
   }
@@ -163,7 +168,8 @@ private:
 };
 
 ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
-                                 int numCTAs, StringRef target) {
+                                 int numCTAs, StringRef target, int nonKDim,
+                                 int numStages, bool useAsyncCopy) {
   mod.walk([&](Operation *op) {
     SmallVector<Value> values = npotValues(op);
     for (Value v : values)
@@ -228,6 +234,8 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
   // mixed-radix and Blocked layouts to sum; false if v cannot take a
   // mixed-radix layout.
   auto addTotalInDimSizes = [&](Value v, std::pair<int64_t, int64_t> &sum) {
+    if (auto desc = dyn_cast<TensorDescType>(v.getType()))
+      return !desc.getSharedLayout();
     auto type = dyn_cast<RankedTensorType>(v.getType());
     if (!type || type.getEncoding())
       return false;
@@ -247,14 +255,14 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
   // Vector first, per the spec: a load or store must keep the vector AxisInfo
   // proves for its padded pointer along the dim Coalesce vectorizes.
   std::optional<ModuleAxisInfoAnalysis> axisInfo;
-  auto keepsVector = [&](Operation *op) {
+  auto losesVector = [&](Operation *op) -> std::optional<std::string> {
     Value ptr =
         llvm::TypeSwitch<Operation *, Value>(op)
             .Case<LoadOp, StoreOp>([](auto access) { return access.getPtr(); })
             .Default(Value());
     auto type = ptr ? dyn_cast<RankedTensorType>(ptr.getType()) : nullptr;
     if (!type || !isNpot(type.getShape()))
-      return true;
+      return std::nullopt;
     if (!axisInfo)
       axisInfo.emplace(mod);
     const AxisInfo &info = *axisInfo->getAxisInfo(ptr);
@@ -264,16 +272,60 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
                                             order[0], threads);
     unsigned vector =
         getAxisInfoVector(info, type, type.getShape(), order[0], threads);
-    return gpu::getMixedRadixVector(ctx, type.getShape(), vector, order,
-                                    numWarps, threadsPerWarp) >= pow2Vector;
+    unsigned exactVector = gpu::getMixedRadixVector(
+        ctx, type.getShape(), vector, order, numWarps, threadsPerWarp);
+    if (exactVector >= pow2Vector)
+      return std::nullopt;
+    return llvm::formatv("NPOT {0} pads: its exact vector is {1} elements, {2} "
+                         "on the pow2 tile",
+                         op->getName(), exactVector, pow2Vector)
+        .str();
   };
-  // A mixed-radix op's NPOT dim may be on any operand, e.g. a dot's B. A dot's
-  // reason depends on the target, so it remarks why its connected component
-  // pads.
-  auto rejects = [&](Operation *op) {
+  // The pipeliner copies a dot's operands to LDS in the order and vector
+  // Coalesce gives their loads: the last dim fastest and 128 bits unless
+  // AxisInfo proves otherwise. Only loads in a multi-stage loop are copied.
+  auto slowDot = [&](Operation *op) -> std::optional<std::string> {
+    auto dot = dyn_cast<DotOpInterface>(op);
+    if (!dot)
+      return std::nullopt;
+    SmallVector<NpotDotOperandAccess, 2> operands;
+    for (Value operand : {dot.getA(), dot.getB()}) {
+      auto type = cast<RankedTensorType>(operand.getType());
+      NpotDotOperandAccess &access = operands.emplace_back();
+      access.order =
+          llvm::to_vector(llvm::reverse(llvm::seq<unsigned>(type.getRank())));
+      access.vector = std::max(128u / type.getElementTypeBitWidth(), 1u);
+      access.asyncStages = 0;
+      auto load = operand.getDefiningOp<LoadOp>();
+      if (!load)
+        continue;
+      if (auto forOp = load->getParentOfType<scf::ForOp>()) {
+        IntegerAttr stages =
+            TritonDialect::getLoaded(forOp)->getNumStagesAttrHelper().getAttr(
+                forOp);
+        int64_t loopStages = stages ? stages.getInt() : numStages;
+        if (useAsyncCopy && loopStages > 1)
+          access.asyncStages = loopStages;
+      }
+      if (!axisInfo)
+        axisInfo.emplace(mod);
+      const AxisInfo &info = *axisInfo->getAxisInfo(load.getPtr());
+      access.order =
+          llvm::to_vector(getOrderFromContiguity(info.getContiguity()));
+      access.vector = getAxisInfoVector(info, load.getPtr().getType(),
+                                        type.getShape(), access.order[0],
+                                        int64_t(numWarps) * threadsPerWarp);
+    }
+    return getNpotDotSlowReason(op, operands, numWarps, threadsPerWarp, nonKDim,
+                                target);
+  };
+  // A mixed-radix op's NPOT dim may be on any operand, e.g. a dot's B.
+  auto rejects = [&](Operation *op) -> std::optional<std::string> {
     auto mixedRadix = dyn_cast<MixedRadixLayoutOpInterface>(op);
     RankedTensorType type;
     for (Type t : op->getOperandTypes()) {
+      if (auto desc = dyn_cast<TensorDescType>(t))
+        t = desc.getBlockType();
       type = mixedRadix || isa<DotOpInterface>(op)
                  ? dyn_cast<RankedTensorType>(t)
                  : nullptr;
@@ -286,43 +338,76 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
       exact = gpu::getMixedRadixEncoding(ctx, type.getShape(), numWarps,
                                          threadsPerWarp, numCTAs);
     if (failed(exact))
-      return false;
+      return std::nullopt;
+    if (isa<DescriptorOpInterface>(op))
+      return getNpotDescriptorUnsupportedReason(op, exact->getLinearLayout(),
+                                                target);
     if (!isa<DotOpInterface>(op))
-      return mixedRadix.getMixedRadixUnsupportedReason(exact->getLinearLayout())
-          .has_value();
-    std::optional<std::string> reason = getNpotDotUnsupportedReason(
-        op, exact->getLinearLayout(), target, numWarps);
-    if (reason)
-      op->emitRemark(*reason);
-    return reason.has_value();
+      return mixedRadix.getMixedRadixUnsupportedReason(
+          exact->getLinearLayout());
+    return getNpotDotUnsupportedReason(op, exact->getLinearLayout(), target,
+                                       numWarps, nonKDim);
+  };
+  // A dot or a descriptor remarks its target reason; else a padded connected
+  // component with a dot remarks the first reason it pads, once.
+  using Reasons = llvm::MapVector<Value, std::pair<Operation *, std::string>>;
+  Reasons padReasons, slowReasons;
+  auto pad = [&](Value leader, Operation *op, std::string reason) {
+    paddedComponents.insert(leader);
+    padReasons.try_emplace(leader, op, std::move(reason));
   };
   DenseMap<Value, std::pair<int64_t, int64_t>> totalInDimSizes;
-  DenseSet<Value> seen, slower, unpaddable;
+  DenseMap<Value, Operation *> firstOps;
+  DenseSet<Value> seen, dots, remarked, unpaddable;
   mod.walk([&](Operation *op) {
     SmallVector<Value> values = npotValues(op);
     if (values.empty())
       return;
     Value leader = components.getLeaderValue(values.front());
-    if (!gpu::isMixedRadixLayoutOp(op->getName()) || rejects(op))
-      paddedComponents.insert(leader);
-    else if (!keepsVector(op))
-      slower.insert(leader);
+    firstOps.try_emplace(leader, op);
+    if (isa<DotOpInterface>(op))
+      dots.insert(leader);
+    if (!gpu::isMixedRadixLayoutOp(op->getName())) {
+      pad(leader, op,
+          llvm::formatv("NPOT mixed-radix layout is not yet supported on {0}",
+                        op->getName()));
+    } else if (std::optional<std::string> reason = rejects(op)) {
+      if (isa<DotOpInterface, DescriptorOpInterface>(op)) {
+        op->emitRemark(*reason);
+        remarked.insert(leader);
+      }
+      pad(leader, op, *reason);
+    } else if (std::optional<std::string> reason = losesVector(op)) {
+      slowReasons.try_emplace(leader, op, *reason);
+    } else if (std::optional<std::string> reason = slowDot(op)) {
+      slowReasons.try_emplace(leader, op, *reason);
+    }
     if (!hasPaddedLowering(op))
       unpaddable.insert(leader);
     for (Value v : values)
       if (seen.insert(v).second &&
           !addTotalInDimSizes(v, totalInDimSizes[leader]))
-        paddedComponents.insert(leader);
+        pad(leader, op,
+            llvm::formatv(
+                "NPOT mixed-radix layout is not yet supported for {0}",
+                v.getType()));
   });
   // Summed over the connected component: a thin index value may take a larger
   // total in-dim size than its padded layout while the tile it addresses takes
   // less.
   for (auto &[leader, sum] : totalInDimSizes)
     if (sum.first >= sum.second)
-      slower.insert(leader);
-  for (Value leader : slower)
+      slowReasons.try_emplace(
+          leader, firstOps.lookup(leader),
+          llvm::formatv("NPOT tensors pad: their mixed-radix layouts take {0} "
+                        "registers x lanes x warps, their pow2 layouts {1}",
+                        sum.first, sum.second));
+  for (auto &[leader, reason] : slowReasons)
     if (!unpaddable.contains(leader))
-      paddedComponents.insert(leader);
+      pad(leader, reason.first, reason.second);
+  for (auto &[leader, reason] : padReasons)
+    if (dots.contains(leader) && !remarked.contains(leader))
+      reason.first->emitRemark(reason.second);
 }
 
 class Padder {
@@ -336,6 +421,7 @@ private:
   void fill(OpOperand &operand, RankedTensorType orig, TypedAttr value);
   void padLanes(Operation *op, RankedTensorType orig, unsigned axis,
                 ArrayRef<TypedAttr> identities);
+  void storeThroughPointers(DescriptorStoreOp store, RankedTensorType orig);
 
   SmallVector<std::function<void()>> fixups;
   DenseMap<std::pair<Region *, Type>, Value> liveCache;
@@ -436,6 +522,52 @@ void Padder::padLanes(Operation *op, RankedTensorType orig, unsigned axis,
   }
 }
 
+// A pad lane, or a coordinate outside the descriptor's shape (which TMA would
+// clip), stores nothing.
+void Padder::storeThroughPointers(DescriptorStoreOp store,
+                                  RankedTensorType orig) {
+  auto desc = store.getDesc().getDefiningOp<MakeTensorDescOp>();
+  OpBuilder b(store);
+  Location loc = store.getLoc();
+  RankedTensorType type = store.getSrc().getType();
+  int rank = type.getRank();
+  auto grow = [&](Value row, int d) -> Value {
+    for (int k = 0; k < rank; ++k)
+      if (k != d)
+        row = ExpandDimsOp::create(b, loc, row, k);
+    auto to = cast<RankedTensorType>(row.getType()).clone(type.getShape());
+    return row.getType() == to ? row : BroadcastOp::create(b, loc, to, row);
+  };
+  Value ptr = SplatOp::create(b, loc, type.clone(desc.getBase().getType()),
+                              desc.getBase());
+  Value mask = live(store, orig);
+  for (auto [d, index] : llvm::enumerate(store.getIndices())) {
+    auto rowTy = RankedTensorType::get({type.getDimSize(d)}, b.getI32Type());
+    auto row64Ty = rowTy.clone(b.getI64Type());
+    Value c = arith::AddIOp::create(
+        b, loc, MakeRangeOp::create(b, loc, rowTy, 0, type.getDimSize(d)),
+        SplatOp::create(b, loc, rowTy, index));
+    Value zero = arith::ConstantOp::create(
+        b, loc, DenseElementsAttr::get(rowTy, b.getI32IntegerAttr(0)));
+    Value in = arith::AndIOp::create(
+        b, loc,
+        arith::CmpIOp::create(b, loc, arith::CmpIPredicate::sge, c, zero),
+        arith::CmpIOp::create(
+            b, loc, arith::CmpIPredicate::slt, c,
+            SplatOp::create(b, loc, rowTy, desc.getShape()[d])));
+    in = grow(in, d);
+    mask = mask ? arith::AndIOp::create(b, loc, mask, in).getResult() : in;
+    Value offset = arith::MulIOp::create(
+        b, loc, arith::ExtSIOp::create(b, loc, row64Ty, c),
+        SplatOp::create(b, loc, row64Ty, desc.getStrides()[d]));
+    ptr = AddPtrOp::create(b, loc, ptr.getType(), ptr, grow(offset, d));
+  }
+  StoreOp::create(b, loc, ptr, store.getSrc(), mask);
+  store.erase();
+  if (desc->use_empty())
+    desc.erase();
+}
+
 // A result that combines only its own pair of block args (k and n+k) is
 // independent of the others, so each source pads with its own identity. Empty
 // unless every result has one.
@@ -528,11 +660,24 @@ LogicalResult Padder::accept(Operation *op) {
   if (!llvm::any_of(types, touchesNpot))
     return success();
   if (llvm::any_of(types, [](Type type) {
-        auto tensor = dyn_cast<RankedTensorType>(type);
+        auto desc = dyn_cast<TensorDescType>(type);
+        auto tensor = desc && !desc.getSharedLayout()
+                          ? desc.getBlockType()
+                          : dyn_cast<RankedTensorType>(type);
         return touchesNpot(type) && !(tensor && !tensor.getEncoding());
       }))
     return op->emitOpError("on an NPOT pointer-to-tensor, descriptor, memory "
                            "descriptor or encoded tensor is unsupported");
+  // A padded TMA box would write its pad lanes in bounds, so the store moves to
+  // pointers.
+  if (auto store = dyn_cast<DescriptorStoreOp>(op);
+      store && store.getReduceKind() == DescriptorReduceKind::NONE &&
+      store.getDesc().getDefiningOp<MakeTensorDescOp>()) {
+    RankedTensorType orig = store.getSrc().getType();
+    fixups.push_back(
+        [this, store, orig] { storeThroughPointers(store, orig); });
+    return success();
+  }
   if (!hasPaddedLowering(op))
     return op->emitOpError("on an NPOT tensor is unsupported");
 
@@ -545,6 +690,10 @@ LogicalResult Padder::accept(Operation *op) {
   }
   if (isa<SplatOp, BroadcastOp, ExpandDimsOp, TransOp, JoinOp, SplitOp,
           RegionBranchOpInterface, RegionBranchTerminatorOpInterface>(op))
+    return success();
+  // A padded box reads past the tile only into pad lanes, and TMA fills the
+  // part out of bounds.
+  if (isa<MakeTensorDescOp, DescriptorLoadOp, DescriptorGatherOp>(op))
     return success();
   if (auto range = dyn_cast<MakeRangeOp>(op)) {
     int64_t end =
@@ -661,9 +810,14 @@ LogicalResult Padder::accept(Operation *op) {
 
 void Padder::apply(ModuleOp mod, const ExactComponents &exact) {
   auto retype = [&](Value value) {
-    if (auto type = dyn_cast<RankedTensorType>(value.getType());
-        type && isNpot(type.getShape()) && !exact.contains(value))
+    if (!touchesNpot(value.getType()) || exact.contains(value))
+      return;
+    if (auto type = dyn_cast<RankedTensorType>(value.getType()))
       value.setType(padded(type));
+    else if (auto desc = dyn_cast<TensorDescType>(value.getType()))
+      value.setType(TensorDescType::get(padded(desc.getBlockType()).getShape(),
+                                        desc.getElementType(),
+                                        desc.getSharedLayout()));
   };
   mod.walk([&](Operation *op) {
     llvm::for_each(op->getResults(), retype);
@@ -683,7 +837,8 @@ struct NpotPadPass : impl::TritonNpotPadBase<NpotPadPass> {
   // Checks every op before changing any, so an error leaves the IR unchanged.
   void runOnOperation() override {
     ModuleOp mod = getOperation();
-    ExactComponents exact(mod, numWarps, threadsPerWarp, numCTAs, target);
+    ExactComponents exact(mod, numWarps, threadsPerWarp, numCTAs, target,
+                          matrixInstructionSize, numStages, useAsyncCopy);
     Padder padder;
     if (mod.walk([&](Operation *op) {
              return WalkResult(exact.contains(op) ? success()

@@ -221,7 +221,7 @@ def _attach_lit_failures(jobs, text):
 
 def _selection(jobs, text):
     for j in jobs:
-        if j["name"] == "select" and j["conclusion"] in ("success", "failure"):
+        if rules.job_name(j["name"]) == "select" and j["conclusion"] in ("success", "failure"):
             try:
                 return logs.parse_selection(text(f"repos/{REPO}/actions/jobs/{j['id']}/logs"))
             except subprocess.CalledProcessError:
@@ -230,35 +230,40 @@ def _selection(jobs, text):
 
 
 def _tested_revision(run, jobs, text):
-    """Require source checkout evidence from the selector and the shared wheel build."""
+    """Verify each stage against its selector and the one shared wheel producer."""
     run["provenance_version"] = 1
     run["run_attempt"] = run.get("run_attempt", 1)
-    evidence = []
-    restarted = [
-        job for _, job in rules._test_jobs(run | {"jobs": jobs})
-        if run["run_attempt"] > 1 and job.get("run_attempt") == run["run_attempt"] and job["conclusion"] in ("success",
-                                                                                                             "failure")
-    ]
-    required = [
-        job for job in jobs
-        if job["name"] in ("select", "build", "build / build") and job["conclusion"] in ("success", "failure")
-    ]
-    for job in [*required, *restarted]:
-        try:
-            sha = logs.checkout_sha(job, text(f"repos/{REPO}/actions/jobs/{job['id']}/logs"))
-        except subprocess.CalledProcessError:
-            sha = None
-        if sha:
-            evidence.append({
-                "sha": sha, "job": job["name"], "job_id": job["id"], "run_attempt": run["run_attempt"], "job_attempt":
-                job.get("run_attempt", 1), "source": "source checkout log", "url": f"{run['url']}/job/{job['id']}"
-            })
-    run["tested_sha_provenance"] = evidence
-    shas = {item["sha"] for item in evidence}
-    has_select = any(item["job"] == "select" for item in evidence)
-    has_build = any(item["job"].startswith("build") for item in evidence)
-    run["tested_sha"] = (next(iter(shas)) if has_select and has_build and len(shas) == 1
-                         and len(evidence) == len(required) + len(restarted) else None)
+    stages = {}
+    for view in rules.stage_runs(run | {"jobs": jobs}):
+        evidence = []
+        restarted = [
+            job for _, job in rules._test_jobs(view)
+            if run["run_attempt"] > 1 and job.get("run_attempt") == run["run_attempt"] and job["conclusion"] in (
+                "success", "failure")
+        ]
+        required = [
+            job for job in view["jobs"]
+            if job["name"] in ("select", "build", "build / build") and job["conclusion"] in ("success", "failure")
+        ]
+        for job in [*required, *restarted]:
+            try:
+                sha = logs.checkout_sha(job, text(f"repos/{REPO}/actions/jobs/{job['id']}/logs"))
+            except subprocess.CalledProcessError:
+                sha = None
+            if sha:
+                evidence.append({
+                    "sha": sha, "job": job["name"], "job_id": job["id"], "run_attempt": run["run_attempt"],
+                    "job_attempt": job.get("run_attempt",
+                                           1), "source": "source checkout log", "url": f"{run['url']}/job/{job['id']}"
+                })
+        shas = {item["sha"] for item in evidence}
+        complete = (any(item["job"] == "select" for item in evidence)
+                    and any(item["job"].startswith("build") for item in evidence)
+                    and len(evidence) == len(required) + len(restarted) and len(shas) == 1)
+        stages[view["wf"]] = {"sha": next(iter(shas)) if complete else None, "evidence": evidence}
+    run["stage_provenance"] = stages
+    identity = stages[run["wf"]]
+    run["tested_sha"], run["tested_sha_provenance"] = identity["sha"], identity["evidence"]
 
 
 def _q(ref):
@@ -409,8 +414,10 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get):
                 if wf == "gpu-tests.yml" or comparison:
                     record["pr"], record["author"] = _pr_and_author(run, api)
                 runs[run["id"]] = record
-    todo = sorted((r for r in runs.values() if r["status"] == "completed" and (r["jobs"] is None or r["id"] in enrich)),
-                  key=lambda r: r["created_at"])
+    todo = sorted(
+        (r for r in runs.values() if (r["status"] == "completed" and (r["jobs"] is None or r["id"] in enrich)) or (
+            r["wf"] == rules.FAST_WF and r["event"] == "pull_request" and r["status"] != "completed")),
+        key=lambda r: r["created_at"])
     unfetched = []
     for i, r in enumerate(todo):
         if i % 50 == 0 and _remaining(api) < RATE_FLOOR:
@@ -451,6 +458,8 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get):
                 _attach_lit_failures(jobs, log)
             if r["wf"] == "gpu-tests.yml":
                 r["select"] = _selection(jobs, log)
+        if r["wf"] == rules.FAST_WF and r["event"] == "pull_request":
+            r["full_select"] = _selection([job for job in jobs if job["name"].startswith("full / ")], log)
         if r["wf"] in ("gpu-tests.yml", rules.FAST_WF) and r["event"] == "pull_request":
             _tested_revision(r, jobs, log)
         r["jobs"] = jobs

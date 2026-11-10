@@ -416,6 +416,8 @@ def _get_codegen_flags(options):
         flags.append("greedy-regclass-priority-trumps-globalness")
     if options.disable_unclustered_high_rp_reschedule:
         flags.append("amdgpu-disable-unclustered-high-rp-reschedule")
+    if options.mfma_vgpr_form is not None:
+        flags.append(f"amdgpu-mfma-vgpr-form={str(options.mfma_vgpr_form).lower()}")
     return flags
 
 
@@ -485,6 +487,7 @@ class HIPOptions:
     reverse_local_assignment: bool = False
     sink_insts_to_avoid_spills: bool = False
     regclass_priority_trumps_globalness: bool = False
+    mfma_vgpr_form: bool | None = None
     # Keep the pre-RA scheduler from replacing a pressure-sensitive schedule
     # with the generic unclustered high-RP strategy. This is cache-keyed and
     # per kernel so unrelated kernels retain the default pressure policy.
@@ -514,6 +517,8 @@ class HIPOptions:
 
         if type(self.enable_wmma_queuing) is not bool:
             raise ValueError("enable_wmma_queuing must be a bool")
+        if self.mfma_vgpr_form is not None and type(self.mfma_vgpr_form) is not bool:
+            raise ValueError("mfma_vgpr_form must be a bool or None")
         if self.enable_wmma_queuing and self.arch != "gfx1250":
             raise ValueError("enable_wmma_queuing requires an AMD gfx1250 target")
         if type(self.va_vdst_anti_hints) is not bool:
@@ -769,7 +774,9 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         if knobs.language.allow_npot:
-            passes.ttir.add_npot_pad(pm, options.num_warps, options.warp_size, options.num_ctas, f"hip:{options.arch}")
+            passes.ttir.add_npot_pad(pm, options.num_warps, options.warp_size, options.num_ctas, f"hip:{options.arch}",
+                                     options.matrix_instr_nonkdim, options.num_stages,
+                                     is_async_copy_enabled(options.arch))
         passes.ttir.add_convert_to_ttgpuir(
             pm,
             f"hip:{options.arch}",

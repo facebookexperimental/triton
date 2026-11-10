@@ -29,6 +29,7 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
 from triton.backends.amd import compiler as amd_compiler
 from triton.tlx.ops.kernels.flash_attn import gfx950 as _amd_fa_cluster_module
+from triton.tlx.ops.kernels.mm_mxfp8 import gfx950 as _amd_mm_mxfp8
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_tdm_pipelined import (
     mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
@@ -777,6 +778,44 @@ def compile_for_target(fn, signature, constexprs, target, attrs=None):
 def compile_for_gfx950(fn, signature, constexprs, attrs=None):
     """Compile a TLX kernel for gfx950 and return the compiled object."""
     return compile_for_target(fn, signature, constexprs, GFX950, attrs=attrs)
+
+
+@triton.jit
+def _mxfp8_gfx950_copy_layout_kernel(A, C, COPY: tl.constexpr, ROWS: tl.constexpr):
+    bases: tl.constexpr = [
+        [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [2, 16], [4, 32], [8, 64], [16, 0]
+    ] + ([[32, 0]] if ROWS >= 64 else []) + ([[64, 0]] if ROWS >= 128 else []) + ([[128, 0]] if ROWS >= 256 else [])
+    shared: tl.constexpr = tlx.shared_linear_layout_encoding([[0, pair[0], pair[1]] for pair in bases], [],
+                                                             alignment=16)
+    buf = tlx.local_alloc((1, ROWS, 128), tlx.dtype_of(A), 1, layout=shared)
+    COPY(A, 0, 1, buf[0], ROWS, ROWS - 3, 256)
+    tlx.async_load_commit_group()
+    tlx.async_load_wait_group(0)
+    tlx.workgroup_barrier()
+    values = tlx.local_load(buf[0])
+    rows = tl.arange(0, ROWS)
+    cols = tl.arange(0, 128)
+    tl.store(C + (rows[:, None] * 128 + cols[None, :])[None, :, :], values)
+
+
+@pytest.mark.parametrize("copy", [
+    _amd_mm_mxfp8._n256x192_fly_layout_copy,
+    _amd_mm_mxfp8._ns4_fly_layout_copy,
+    _amd_mm_mxfp8._n256x256_fly_layout_copy,
+])
+@pytest.mark.parametrize("rows", [32, 64, 128, 256])
+def test_mxfp8_gfx950_copy_layout_verifies(copy, rows, tmp_path):
+    source = ASTSource(_mxfp8_gfx950_copy_layout_kernel, signature={"A": "*fp8e4nv", "C": "*fp8e4nv"},
+                       constexprs={"COPY": copy, "ROWS": rows}, attrs={(0, ): [("tt.divisibility", 16)]})
+    compiled = triton_compile(source, target=GFX950, options={"num_warps": 4})
+    backend = triton.compiler.compiler.make_backend(GFX950)
+    context = ir.context()
+    ir.load_dialects(context)
+    backend.load_dialects(context)
+    path = tmp_path / "copy.ttir"
+    path.write_text(compiled.asm["ttir"])
+    assert ir.parse_mlir_module(str(path), context).verify()
+    assert "buffer_load_dwordx4" in compiled.asm["amdgcn"]
 
 
 def compile_for_gfx942(fn, signature, constexprs):

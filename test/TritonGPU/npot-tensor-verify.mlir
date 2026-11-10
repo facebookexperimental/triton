@@ -373,8 +373,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func @mixed_radix_pow2_alloc_view(%d: !ttg.memdesc<128x96xf16, #s8, #smem, mutable, 128x128>) {
-    // expected-error @+1 {{NPOT mixed-radix access to a padded, partitioned or partial buffer is not yet supported}}
+    // expected-error @+1 {{NPOT mixed-radix access to a view with an NPOT subslice extent is not yet supported}}
     %v = ttg.local_load %d : !ttg.memdesc<128x96xf16, #s8, #smem, mutable, 128x128> -> tensor<128x96xf16, #p>
+    tt.return
+  }
+}
+
+// -----
+
+// An MMAv2 layout at an NPOT shape is an exact mixed-radix layout, so its dot
+// verifies.
+#mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [2, 2], instrShape = [16, 8]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mma_v2_128x96() {
+    %a = arith.constant dense<1.0> : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
+    %b = arith.constant dense<1.0> : tensor<64x96xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>
+    %c = arith.constant dense<0.0> : tensor<128x96xf32, #mma>
+    %d = tt.dot %a, %b, %c : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * tensor<64x96xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>> -> tensor<128x96xf32, #mma>
+    // Control: the pow2 dot verifies.
+    %b2 = arith.constant dense<1.0> : tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>
+    %c2 = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
+    %d2 = tt.dot %a, %b2, %c2 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>> -> tensor<128x128xf32, #mma>
     tt.return
   }
 }

@@ -37,9 +37,9 @@ Ops with no heuristic yet -- flash_attn on sm90/sm100/gfx950, flash_attn_mxfp8, 
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can offer a
-fast first call. `mm_mxfp8` and `mm_mxfp6` have heuristics but default to "full" because
-their tuned configs are measurably faster; pass `space="heuristic"` for a fast
-first call.
+fast first call. `mm_mxfp8` defaults to "full" on sm100 because its tuned configs are measurably
+faster; gfx950 uses "heuristic". Pass `space="heuristic"` for a fast first call.
+`mm_mxfp6` also defaults to "full" because its tuned configs are measurably faster.
 `hstu_cross_attn` on gfx950 defaults to "curated": at head dims 64 and 128 it
 tunes eight forward configs picked from its 144-config "full" grid, which come
 within a few percent of it; other head dims tune the whole grid.
@@ -288,8 +288,23 @@ def _check_mm_mxfp8_scales(a_scale, b_scale, *, M, N, K, sf_layout):
                                f"a_scale={expected_a}, b_scale={expected_b}; got "
                                f"a_scale={tuple(a_scale.shape)}, b_scale={tuple(b_scale.shape)}")
         return
+    if sf_layout == "mfma_preshuffled":
+        expected_a = ((M + 127) // 128) * 128 * (K // 32)
+        expected_b = (2 * N * (K // 32) if M <= 128 and N % 32 == 0 and K % 128 == 0 else
+                      ((N + 127) // 128) * 128 * (K // 32) if (M, N, K) in {
+                          (1024, 1024, 24576),
+                          (1024, 8192, 3072),
+                          (2048, 1024, 24576),
+                          (2048, 32768, 6144),
+                      } else ((N + 95) // 96) * 128 * (K // 32))
+        if a_scale.numel() != expected_a or b_scale.numel() != expected_b:
+            raise InvalidInput("tlx.ops.mm_mxfp8 mfma_preshuffled scales must contain exactly "
+                               f"{expected_a} a-scale and {expected_b} b-scale bytes; "
+                               f"got {a_scale.numel()} and {b_scale.numel()}")
+        return
     if sf_layout != "cublas_blocked":
-        raise InvalidInput("tlx.ops.mm_mxfp8 sf_layout must be 'natural' or 'cublas_blocked'; "
+        raise InvalidInput("tlx.ops.mm_mxfp8 sf_layout must be 'natural', 'cublas_blocked', "
+                           "or 'mfma_preshuffled'; "
                            f"got {sf_layout!r}")
     # Each 128x4 atom includes padded rows when M or N is ragged.
     expected_a = ((M + 127) // 128) * 128 * (K // 32)
@@ -300,7 +315,7 @@ def _check_mm_mxfp8_scales(a_scale, b_scale, *, M, N, K, sf_layout):
                            f"got {a_scale.numel()} and {b_scale.numel()}")
 
 
-def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
+def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space=None):
     """``a @ b.T`` over pre-quantized MXFP8 inputs, returning BF16 ``[M, N]``.
 
     ``a`` is contiguous E4M3 ``[M, K]`` and ``b`` is contiguous E4M3 ``[N, K]``
@@ -309,13 +324,18 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     Each run of 32 values along K has one E8M0 scale. ``sf_layout="natural"``
     takes ``[M, K // 32]`` and ``[N, K // 32]`` scales; ``"cublas_blocked"``
     takes the swizzled byte layout returned by torchao's
-    ``MXTensor.to_mx(..., is_swizzled_scales=True)``. A supplied ``out`` is
-    returned by identity. Forward-only.
+    ``MXTensor.to_mx(..., is_swizzled_scales=True)`` and pads its final M atom
+    to 128 rows. ``"mfma_preshuffled"`` accepts the packed XDL32 scale layout
+    used by supported shape-selected FlyDSL configs: repeat-2 A / repeat-3 B
+    for 128x192 tiles, repeat-4 A / repeat-3 B for 256x192 tiles, and repeat-2
+    A / repeat-4 B for 128x256 tiles. Each 96-row B chunk in a 192-wide tile
+    occupies 128 physical rows. A supplied ``out`` is returned by identity.
+    Forward-only.
 
-    ``space`` defaults to "full". On sm100 this autotunes a pruned space on
-    first use, while on gfx950 the current implementation has one shape-picked
-    schedule and treats "full" like "heuristic". A ``Space`` is also accepted;
-    its invariance request is validated but not enforced yet.
+    ``space=None`` uses "full" on sm100 (autotuning) and "heuristic" on gfx950.
+    "heuristic" launches one shape-picked config without autotuning; gfx950
+    provides only this space. A ``Space`` is also accepted; its invariance
+    request is validated but not enforced yet.
     """
     import torch
 
@@ -339,7 +359,9 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
         raise InvalidInput("tlx.ops.mm_mxfp8 expects E4M3 a and b; "
                            f"got a.dtype={a.dtype}, b.dtype={b.dtype}")
-    if a_scale.dtype != torch.float8_e8m0fnu or b_scale.dtype != torch.float8_e8m0fnu:
+    valid_scale_dtypes = ((torch.uint8, torch.float8_e8m0fnu) if sf_layout == "mfma_preshuffled" else
+                          (torch.float8_e8m0fnu, ))
+    if a_scale.dtype not in valid_scale_dtypes or b_scale.dtype not in valid_scale_dtypes:
         raise InvalidInput("tlx.ops.mm_mxfp8 expects E8M0 a_scale and b_scale; "
                            f"got a_scale.dtype={a_scale.dtype}, b_scale.dtype={b_scale.dtype}")
     if not all(tensor.is_contiguous() for tensor in tensors):
@@ -357,10 +379,12 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
         if any(torch._C._overlaps(out, tensor) for tensor in tensors):
             raise InvalidInput("tlx.ops.mm_mxfp8 out must not overlap any input")
     space_name, invariance = _normalize_space_arg("mm_mxfp8", space)
-    if space_name not in ("heuristic", "full"):
+    if space_name is not None and space_name not in ("heuristic", "full"):
         raise InvalidInput(f"tlx.ops.mm_mxfp8 does not provide space={space_name!r}")
 
     fn, spec = impl_for("mm_mxfp8", device=a.device)
+    if space_name is None:
+        space_name = spec.default_space
     tma_tensors = tensors if out is None else (*tensors, out)
     check_inputs(spec, dtype=a.dtype, base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors))
     check_backward(spec, *tensors, out)

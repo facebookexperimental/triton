@@ -198,8 +198,8 @@ bool isGenericLinearEncoding(Attribute attr);
 bool isRadix2Encoding(Attribute layout);
 
 // Whether the encoding of `type`, or the parent of its slices, is exact at its
-// shape. Only a mixed-radix layout can fail: each out size and its pow2 alloc
-// shape must divide.
+// shape: a radix-2 linear layout iff the shape is pow2, a mixed-radix layout
+// iff each out size and its pow2 alloc shape divide.
 bool hasExactLayoutAt(RankedTensorType type);
 
 // Whether `type` has an NPOT shape and an exact mixed-radix layout.
@@ -211,6 +211,16 @@ bool hasExactNpotLayout(RankedTensorType type);
 // only on these ops, and the NPOT pad pass keeps a connected component's shape
 // only if all its ops are.
 bool isMixedRadixLayoutOp(OperationName op);
+
+// Under TRITON_ALLOW_NPOT, whether an MMAv3 instrShape's N may be NPOT: its odd
+// part repeats in registers, which is wgmma's order only while one warpgroup
+// spans N.
+bool isMmaV3NpotNLegal(ArrayRef<unsigned> warpsPerCTA,
+                       ArrayRef<unsigned> instrShape);
+
+// Whether wgmma's k atoms sit on K's power-of-two part, as its warps do on M
+// and N; otherwise an NPOT K's last atom reads past K.
+bool isMmaV3NpotKLegal(int64_t k, unsigned atomK);
 
 // Why the verifier rejects an exact mixed-radix layout among `types` on an op
 // named `name`, if it does; a pass can ask before creating the op.
