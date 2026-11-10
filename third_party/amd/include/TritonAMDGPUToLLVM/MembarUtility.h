@@ -3,6 +3,7 @@
 
 #include "mlir/IR/Operation.h"
 #include "triton/Analysis/Allocation.h"
+#include "triton/Analysis/Membar.h"
 
 namespace mlir {
 class DialectRegistry;
@@ -36,6 +37,22 @@ MembarScratchSync getWarpLocalScratchSync();
 // ttg.barrier that a tlx.workgroup_barrier interposes. Attaching via a dialect
 // extension keeps the core Membar analysis free of any ROCDL dependency.
 void registerSchedulingBarrierExternalModel(DialectRegistry &registry);
+
+// Membar with the AMD split workgroup barrier: the signal/wait pair
+// synchronizes shared-memory accesses issued before the signal with those
+// after the wait. By convention the window between them holds no
+// shared-memory access, so Membar never needs a barrier inside it.
+class AMDMembarAnalysis : public MembarAnalysis {
+public:
+  AMDMembarAnalysis(Allocation &allocation, MembarFilterFn filter,
+                    MembarScratchSync scratchSync,
+                    triton::BufferRegionAnalysis &regions)
+      : MembarAnalysis(allocation, std::move(filter), std::move(scratchSync),
+                       regions) {}
+
+protected:
+  triton::BarrierStages getBarrierStages(Operation *op) override;
+};
 } // namespace mlir::triton::AMD
 
 #endif

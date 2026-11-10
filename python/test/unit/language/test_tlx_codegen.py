@@ -6932,6 +6932,52 @@ def test_async_amd_desc_load_pred_compiles_gfx1250(device):
     assert "async_tdm_copy_global_to_local" in ttgir
 
 
+@triton.jit
+def _amd_split_workgroup_barrier_kernel(x_ptr, y_ptr, BAR: tl.constexpr, COUNT: tl.constexpr):
+    offsets = tl.arange(0, 128)
+    x = tl.load(x_ptr + offsets)
+    buf = tlx.local_alloc((128, ), tl.float32, 1)
+    tlx.local_store(buf[0], x)
+    tlx.named_barrier_arrive(BAR, COUNT)
+    # Register-only work between the two halves of the barrier.
+    scaled = x * 3.0
+    tlx.named_barrier_wait(BAR, COUNT)
+    # Membar orders every shared-memory RAW; the split barrier must cover it.
+    y = tlx.local_load(buf[0])
+    tl.store(y_ptr + offsets, y + scaled)
+
+
+def test_amd_split_workgroup_barrier_compiles_gfx1250():
+    compiled = compile_for_gfx1250(
+        _amd_split_workgroup_barrier_kernel,
+        signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+        constexprs={"BAR": 0, "COUNT": 128},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count("amdg.workgroup_barrier_signal") == 1
+    assert ttgir.count("amdg.workgroup_barrier_wait") == 1
+    # The pair orders the LDS store before the load, so Membar adds no other
+    # workgroup barrier: the kernel has exactly one signal and one wait.
+    asm = compiled.asm["amdgcn"]
+    assert len(re.findall(r"^\s+s_barrier_signal -1\b", asm, re.MULTILINE)) == 1
+    assert len(re.findall(r"^\s+s_barrier_wait -1\b", asm, re.MULTILINE)) == 1
+    signal = asm.index("s_barrier_signal -1")
+    assert asm.index("ds_store", 0) < signal < asm.index("s_barrier_wait -1") < asm.index("ds_load", signal)
+
+
+@pytest.mark.parametrize("bar,count,match", [
+    (1, 128, "only support the workgroup barrier"),
+    (0, 64, "must be the workgroup size"),
+])
+def test_amd_split_workgroup_barrier_rejects_named_barriers(bar, count, match):
+    with pytest.raises(CompilationError, match=match):
+        compile_for_gfx1250(
+            _amd_split_workgroup_barrier_kernel,
+            signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+            constexprs={"BAR": bar, "COUNT": count},
+        )
+
+
 def test_async_amd_desc_store_compiles_gfx1250(device):
     """async_amd_descriptor_store produces TDM store ops in TTGIR."""
     compiled = compile_for_gfx1250(

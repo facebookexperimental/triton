@@ -40,7 +40,7 @@ struct TritonAMDGPUMembar
 
     ModuleMembarAnalysis membarPass(allocation, AMD::membarFilter,
                                     AMD::getWarpLocalScratchSync());
-    membarPass.run();
+    membarPass.run<AMD::AMDMembarAnalysis>();
   }
 };
 
