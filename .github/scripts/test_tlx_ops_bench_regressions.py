@@ -102,6 +102,33 @@ def test_issue_filing_lists_unindexed_issues_and_deduplicates_without_closing():
     assert "not confirmed blame" in calls[1][2]["body"]
 
 
+def test_suspect_commits_include_relevant_dependency_changes_without_claiming_causation(monkeypatch):
+    alert = regressions.detect(history() + [night("20261104", 30)])[0]
+    alert["cases"][1]["baseline_dates"][0] = "20261031"
+    alert["cases"][1]["baseline_sha"] = "oldest"
+    found = [{"sha": "nvidia", "title": "NVIDIA change", "pr": 1, "files": ["third_party/nvidia/lib/foo.cpp"]},
+             {"sha": "llvm", "title": "AMD codegen LLVM repin", "pr": 2, "files": ["cmake/meta-amd-llvm-info.json"]}, {
+                 "sha": "kernel", "title": "MXFP8 backward change", "pr": 3, "files":
+                 ["third_party/tlx/ops/kernels/flash_attn_mxfp8/gfx950_bwd_shared.py"]
+             }, {"sha": "docs", "title": "Documentation", "pr": None, "files": ["README.md"]}]
+    ranges = []
+
+    def commits(base, head):
+        ranges.append((base, head))
+        return found
+
+    monkeypatch.setattr(regressions, "commits", commits)
+    enriched = regressions.add_suspects(alert)
+    assert ranges == [("oldest", alert["sha"])]
+    assert [c["sha"] for c in enriched["suspect_commits"]] == ["kernel", "llvm"]
+    body = regressions.issue_body(enriched, "o/r", "run")
+    assert "https://github.com/o/r/commit/kernel" in body
+    assert "https://github.com/o/r/pull/2" in body and "AMD codegen LLVM repin" in body
+    assert "This is not confirmed blame" in body
+    monkeypatch.setattr(regressions, "commits", lambda base, head: None)
+    assert "Commit history is unavailable" in regressions.issue_body(alert, "o/r", "run")
+
+
 def test_local_replay_cannot_write_issues_without_explicit_opt_in(monkeypatch, tmp_path):
     for n in history() + [night("20261104", 30)]:
         (tmp_path / f"{n['date']}.mi350.json").write_text(json.dumps(n))

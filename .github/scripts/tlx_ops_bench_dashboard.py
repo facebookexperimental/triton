@@ -56,7 +56,7 @@ PLATFORM_TARGET = {
     "b200": ("sm100", "third_party/nvidia/"), "h100": ("sm90", "third_party/nvidia/"), "mi350":
     ("gfx950", "third_party/amd/")
 }
-ARCH_TAGS = ("sm90", "sm100", "gfx942", "gfx950")
+ARCH_TAGS = ("sm90", "sm100", "gfx942", "gfx950", "gfx1250")
 #: Each op's kernel directory under third_party/tlx/ops/kernels/.
 KERNEL_DIR = {
     "mm": "mm", "addmm": "addmm", "bmm": "bmm", "flash_attn": "flash_attn", "flash_attn_mxfp8": "flash_attn_mxfp8",
@@ -66,7 +66,10 @@ KERNEL_DIR = {
 DISPATCH = ("third_party/tlx/ops/__init__.py", "third_party/tlx/ops/_catalog.py",
             "third_party/tlx/ops/kernels/__init__.py", "third_party/tlx/language/tlx/hw/target.py")
 #: A suspect's area by rank, most specific first.
-AREA = {1: "kernel", 2: "shapes", 3: "dispatch", 4: "harness", 5: "compiler", 6: "compiler (common)", 7: "tlx lang"}
+AREA = {
+    1: "kernel", 2: "shapes", 2.5: "compiler dependency", 3: "dispatch", 4: "harness", 5: "compiler", 6:
+    "compiler (common)", 7: "tlx lang"
+}
 MEASURED = ("ok", "noisy", "pip")
 
 
@@ -227,6 +230,10 @@ def file_rank(path, op, platform):
         harness = path.startswith("python/test/tlx_benchmark/_harness/") or name in (BENCH_SCRIPT.get(op),
                                                                                      "conftest.py")
         return 4 if harness else None
+    if path in ("cmake/amd-llvm-info.json", "cmake/meta-amd-llvm-info.json"):
+        return 2.5 if platform == "mi350" else None
+    if path in ("cmake/llvm-info.json", "cmake/llvm-hash.txt", "cmake/meta-llvm-info.json", "python/meta_llvm.py"):
+        return 2.5
     if path.startswith(("third_party/nvidia/", "third_party/amd/")):
         return 5 if path.startswith(backend) else None
     if path.startswith(("lib/", "include/", "python/src/", "python/triton/compiler", "python/triton/language",

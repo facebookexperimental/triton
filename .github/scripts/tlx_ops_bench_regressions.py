@@ -11,7 +11,7 @@ import re
 import statistics
 
 from failure_issues import gh
-from tlx_ops_bench_dashboard import read_summaries
+from tlx_ops_bench_dashboard import commits, read_summaries, suspects
 
 BASELINE_SAMPLES = 3
 MAX_AGE_DAYS = 14
@@ -136,7 +136,19 @@ def issue_title(alert):
     return f"[perf-regression] {alert['platform']} / {alert['op']} / {alert['direction']}"
 
 
+def add_suspects(alert):
+    oldest = min(alert["cases"], key=lambda c: c["baseline_dates"][0])
+    sha = oldest["baseline_sha"]
+    found = commits(sha, alert["sha"])
+    return {
+        **alert, "suspect_base": sha, "history_available": found is not None, "suspect_commits":
+        suspects(found or [], alert["op"], alert["platform"], None)
+    }
+
+
 def issue_body(alert, repo, run_url):
+    if "suspect_commits" not in alert:
+        alert = add_suspects(alert)
     date = alert["date"]
     base = f"https://github.com/{repo}/releases/download/tlx-ops-bench"
     dates = sorted({d for c in alert["cases"] for d in c["baseline_dates"]})
@@ -169,7 +181,30 @@ def issue_body(alert, repo, run_url):
         if before.get(key) != value
     ]
     lines.extend(changes or ["- No recorded environment changes."])
-    sha = alert["cases"][0]["baseline_sha"]
+    sha = alert["suspect_base"]
+    lines.extend([
+        "", "## Suspect commits", "",
+        "Candidates ranked by affected code area, then newest first. This is not confirmed blame. The range starts at the oldest measurement used in the affected cases' median baselines.",
+        ""
+    ])
+    candidates = alert["suspect_commits"]
+    if not alert["history_available"]:
+        lines.append("Commit history is unavailable; use the comparison link below to investigate.")
+    elif not candidates:
+        lines.append(
+            "No commits in this range touch the operation, its compiler or its benchmark tooling according to file-based ranking."
+        )
+    else:
+        for candidate in candidates[:10]:
+            title = candidate["title"].replace("[", "\\[").replace("]", "\\]")
+            link = f"https://github.com/{repo}/commit/{candidate['sha']}"
+            pr = f" · [PR {candidate['pr']}](https://github.com/{repo}/pull/{candidate['pr']})" if candidate[
+                "pr"] else ""
+            lines.append(f"- [{candidate['sha']}: {title}]({link}){pr} · {candidate['area']}")
+        if len(candidates) > 10:
+            lines.append(
+                f"\n{len(candidates) - 10} additional ranked candidates are in the regression evidence artifact; the comparison below contains the full commit range."
+            )
     lines.extend([
         "", f"Candidate commit range, not confirmed blame: https://github.com/{repo}/compare/{sha}...{alert['sha']}",
         "",
@@ -213,6 +248,7 @@ def main():
     if args.date != max(n["date"] for n in nights):
         print("Historical dispatch; no current alerts.")
         alerts = []
+    alerts = [add_suspects(alert) for alert in alerts]
     Path(args.out).write_text(json.dumps(alerts, indent=2))
     print(f"{args.platform} {args.date}: {len(alerts)} regression cohort(s)")
     if args.file_issues and alerts:
