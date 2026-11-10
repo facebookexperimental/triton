@@ -96,6 +96,22 @@ def test_the_graph_is_followed_through_a_merged_side_branch(tmp_path):
     assert prepared["results"][0]["first_bad_sha"] == side[1]
 
 
+def test_a_branch_forked_before_the_good_endpoint_can_validate_its_merge_base(tmp_path):
+    repo = tmp_path / "r"
+    main = new_repo(repo, 3)
+    git(repo, "checkout", "-q", "-b", "side", main[0])
+    side = [commit(repo, f"s{i}") for i in range(3)]
+    git(repo, "checkout", "-q", "main")
+    good = commit(repo, "known good")
+    git(repo, "merge", "--no-ff", "-q", "side", "-m", "merge")
+    bad = commit(repo, "known bad")
+    git(repo, "update-ref", "refs/remotes/origin/main", bad)
+    prepared, measured = drive(repo, [spec(good, bad)], culprit_after(repo, side[1]))
+    result = prepared["results"][0]
+    assert result["status"] == "conclusive" and result["first_bad_sha"] == side[1]
+    assert main[0] in result["observations"] and result["observations"][main[0]] == rounds.GOOD
+
+
 def test_adjacent_endpoints_conclude_without_a_candidate_once_they_reproduce(tmp_path):
     shas = new_repo(tmp_path / "r", 6)
     prepared = rounds.prepare({"specs": [spec(shas[4], shas[5])]}, tmp_path / "r")

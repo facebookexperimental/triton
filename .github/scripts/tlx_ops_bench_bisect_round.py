@@ -9,12 +9,11 @@ import re
 import subprocess
 import tempfile
 
-from tlx_ops_bench_bisect import BAD, FIRST_BAD, GOOD, SHA, SKIP, check_endpoints, classify
+from tlx_ops_bench_bisect import BAD, GOOD, SHA, SKIP, check_endpoints, classify
 
 DEFAULT_MAX_ROUNDS = 16
 STATE_FIELDS = ("specs", "index", "observations", "results", "round", "max_rounds", "verified", "log")
 SPEC_FIELDS = ("op", "direction", "key", "platform", "good_sha", "bad_sha", "required_ratio")
-ONLY_SKIPPED = re.compile(r"only 'skip'ped commits left to test")
 REVISIONS_LEFT = re.compile(r"Bisecting: (\d+) revisions? left to test after this \(roughly (\d+) steps?\)")
 GIT_ENV = {**os.environ, "LC_ALL": "C", "LANG": "C", "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"}
 
@@ -75,8 +74,13 @@ def narrow(source, spec, observations):
         if sha in (good, bad):
             raise Invalid(f"endpoint {sha} was recorded as an observation")
         require_commit(source, sha)
-        if not is_ancestor(source, sha, bad) or is_ancestor(source, sha, good):
+        if not is_ancestor(source, sha, bad):
             raise Invalid(f"observed commit {sha} is outside the good..bad range")
+        if is_ancestor(source, sha, good):
+            if code != GOOD:
+                raise Invalid(f"merge-base check {sha} did not establish a good branch base")
+            goods.append(sha)
+            continue
         {GOOD: goods, BAD: bads, SKIP: skips}[code].append(sha)
     boundary = [b for b in bads if all(is_ancestor(source, b, other) for other in bads)]
     if len(boundary) != 1:
@@ -98,20 +102,24 @@ def replay(source, boundary, goods, skips):
         if skips:
             step = git(repo, "bisect", "skip", *skips, check=False)
         output = step.stdout + step.stderr
-        found = FIRST_BAD.search(output)
-        if found:
-            if step.returncode:
-                raise RuntimeError(f"git bisect failed while naming a commit: {output.strip()}")
-            if found[1] != boundary:
-                raise RuntimeError(f"git named {found[1]} as the first bad commit but the bad boundary is {boundary}")
+        remaining = git(repo, "rev-list", boundary, "--not", *goods, "--").stdout.split()
+        anchored = [good for good in goods if is_ancestor(repo, good, boundary)]
+        bases = [
+            base for good in goods if good not in anchored
+            for base in git(repo, "merge-base", "--all", boundary, good).stdout.split()
+        ]
+        verified_bases = all(any(is_ancestor(repo, base, good) for good in anchored) for base in bases)
+        if step.returncode == 0 and remaining == [boundary] and verified_bases:
             return {"kind": "first_bad", "sha": boundary}
-        if ONLY_SKIPPED.search(output):
-            tail = output.split("could be any of:", 1)[-1]
-            return {"kind": "skipped_only", "commits": re.findall(r"^[0-9a-f]{40}$", tail, re.M)}
+        if step.returncode in (
+                0, 2) and len(remaining) > 1 and verified_bases and set(remaining) <= set(skips) | {boundary}:
+            return {"kind": "skipped_only", "commits": sorted(remaining)}
+        if step.returncode:
+            raise RuntimeError(f"git bisect failed (exit {step.returncode}): {output.strip()}")
         head = git(repo, "rev-parse", "--verify", "-q", "BISECT_HEAD", check=False)
         sha = head.stdout.strip()
-        if head.returncode or not SHA.fullmatch(sha):
-            raise RuntimeError(f"git bisect gave no candidate (exit {step.returncode}): {output.strip()}")
+        if head.returncode or not SHA.fullmatch(sha) or not is_ancestor(repo, sha, boundary):
+            raise RuntimeError(f"git bisect gave no in-range candidate: {output.strip()}")
         left = REVISIONS_LEFT.search(output)
         return {
             "kind": "candidate", "sha": sha, "revisions_left": int(left[1]) if left else None, "steps_left":
