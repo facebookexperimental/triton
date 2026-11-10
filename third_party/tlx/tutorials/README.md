@@ -205,8 +205,7 @@ output. It supports paged 5D caches, grouped query heads, causal attention and
 sliding windows on gfx1250. The optimized tutorial uses packed TDM transfers
 and WMMA; the independent baseline remains available for comparisons.
 
-See the [layout, scale, masking and workspace contract](amd_pa_decode_fp8.rst)
-and the [benchmark report](../../../experiments/fp8-kv-decode/OPTIMIZATION_2026-11-09.md).
+See the [layout, scale, masking and workspace contract](amd_pa_decode_fp8.rst).
 
 ```bash
 pytest -s --tb=short third_party/tlx/tutorials/testing/test_correctness.py -k fp8_kv_decode

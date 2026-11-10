@@ -1,5 +1,0 @@
-backend,median_us,min_round_us,max_round_us,max_abs_error,source_file
-tlx_frozen,8.977766831715902,8.964433272679647,8.984466393788656,0.00012561678886413574,experiments/fp8-kv-decode/results/2026-11-09_optimization/d128_page128_layout_paired.json
-tlx_frozen_launch,9.975600242614746,9.960933526357016,9.984933336575827,0.00012561678886413574,experiments/fp8-kv-decode/results/2026-11-09_optimization/d128_page128_layout_paired.json
-tlx_matrix_tdm_flat,9.01376704374949,8.985766768455505,9.024433294932047,0.00012561678886413574,experiments/fp8-kv-decode/results/2026-11-09_optimization/d128_page128_layout_paired.json
-aiter_unified,9.195199608802795,9.148500363032023,9.207233786582947,0.0002671144902706146,experiments/fp8-kv-decode/results/2026-11-09_optimization/d128_page128_layout_paired.json

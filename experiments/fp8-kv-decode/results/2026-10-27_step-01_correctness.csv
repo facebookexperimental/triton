@@ -1,3 +1,0 @@
-date,stage,passed,total,failed,pytest_wall_seconds,source_status,evidence
-2026-10-27,Initial correctness suite,17,17,0,4.83,Earlier source not retained,2026-10-27_initial17_pytest.txt
-2026-10-27,Expanded correctness suite,27,27,0,6.33,Frozen step-01 source patch,2026-10-27_expanded27_pytest.txt

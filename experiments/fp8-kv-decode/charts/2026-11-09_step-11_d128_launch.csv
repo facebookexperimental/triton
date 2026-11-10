@@ -1,4 +1,0 @@
-backend,median_us,min_round_us,max_round_us,max_abs_error,source_file
-tlx_frozen,15.072799722353617,15.04609982172648,15.132799744606018,0.00014485418796539307,experiments/fp8-kv-decode/results/2026-11-09_optimization/d128_policy_paired.json
-tlx_matrix_tdm_flat,8.85236660639445,8.806999524434408,8.861733476320902,0.00014485418796539307,experiments/fp8-kv-decode/results/2026-11-09_optimization/d128_policy_paired.json
-aiter_unified,12.10729976495107,12.095300356547037,12.162033716837565,0.00041185319423675537,experiments/fp8-kv-decode/results/2026-11-09_optimization/d128_policy_paired.json

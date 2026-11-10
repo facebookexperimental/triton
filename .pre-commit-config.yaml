@@ -11,8 +11,6 @@ repos:
       - id: check-toml
       - id: check-ast
       - id: check-added-large-files
-        # Complete timing samples and the explicitly named compressed history.
-        exclude: ^experiments/fp8-kv-decode/(results/2026-11-09_optimization/repeated_final_v2\.json|history/portable-evidence-2026-11-09\.tar\.gz)$
       - id: check-merge-conflict
       - id: check-executables-have-shebangs
       - id: check-shebang-scripts-are-executable
@@ -35,8 +33,6 @@ repos:
     hooks:
       - id: yapf
         args: ["-p", "-i"]
-        # Dated source snapshots must keep their measured content hashes.
-        exclude: ^experiments/fp8-kv-decode/(results|snapshots)/
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v19.1.6

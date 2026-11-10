@@ -1,5 +1,0 @@
-# Generated evidence is available for inspection without dominating code review.
-charts/** linguist-generated=true
-results/** linguist-generated=true
-history/** linguist-generated=true
-*.csv text eol=lf

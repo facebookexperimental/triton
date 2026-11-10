@@ -1,9 +1,10 @@
 FP8 KV decode on gfx1250 (preliminary)
 ====================================
 
-``amd_pa_decode_fp8.py`` establishes a plain E4M3FN cache contract for the
-MI450X-MC work. It is separate from the existing gfx950 BF16/FP16 decode
-operator. It does not change production dispatch or require compiler changes.
+``amd_pa_decode_fp8.py`` implements plain E4M3FN KV decode with per-head
+scales. It is separate from the existing BF16/FP16 decode operator and does
+not change production dispatch or require compiler changes. Output projection
+is outside this tutorial.
 
 Layout and scales
 -----------------
@@ -37,26 +38,6 @@ entries and lengths must be valid; the launcher does not copy metadata to the
 host to inspect its values. Unreferenced blocks are never accessed. The packed-page path may fetch unused
 slots inside an allocated page; invalid columns are masked and invalid V values
 are zeroed before PV, so poisoned tail slots cannot affect the result.
-
-Mapping the preliminary workload table
--------------------------------------
-
-The dense ``[T,8192]`` view needs an explicit head interpretation. For example,
-128 heads of dimension 64 produce that width. The folded ``[1,16,64]`` example
-has width 1024 and represents a different head configuration. The launcher
-therefore accepts explicit head axes rather than inferring a model from 8192.
-
-``T`` can mean independent requests (use ``batch=T, query_length=1``) or query
-rows over one context (use ``batch=1, query_length=T``). The latter supports
-right-aligned causal queries, or a dense noncausal sweep with ``causal=False``.
-In particular, the supplied T-sweep reaches 8192 while L remains 2304, so it
-cannot be interpreted as 8192 appended causal tokens without more context.
-The embedded T-sweep tests explicitly choose noncausal queries over a shared
-cache; they do not settle the model's intended masking semantics.
-
-The output is the attention result before an output projection. The factorized
-``[T,1024] x [1024,8192]`` O column does not supply projection weights or an
-unambiguous contract, so that GEMM is outside this preliminary kernel.
 
 Usage
 -----
@@ -122,8 +103,6 @@ Implementation and validation
 
 The fast paths retain separate per-KV-head K/V scales and per-query-head Q
 scales. No dequantized global cache or output-projection GEMM is introduced.
-Rejected descriptor layouts, deeper buffering and mixed-precision experiments
-are preserved in the experiment snapshots and Markdown log.
 
 Run correctness only::
 
@@ -137,13 +116,4 @@ and the T-sweep on the folded 16-head configuration. Unused tail slots contain
 NaNs to expose accidental reads. These are correctness checks, not performance
 measurements or evidence for every combination in the workload table.
 
-The current optimization environment is an isolated
-``rocm/sgl-dev:v0.5.23-rocm101-mi45x-20261101`` container with Torch
-2.12.0+rocm10.1.0 and this checkout's source-built TLX 3.9 runtime. The agent
-exposes gfx1250, 96 CUs and 144 GiB (DPX/NPS2). Earlier correctness snapshots
-used fbtriton3.7.4; cross-compiler calibration is excluded from speedup claims.
-
-Reference adapters, numerical gates, graph timing, exact pins, ATT captures,
-raw results and saved comparison charts live in
-``experiments/fp8-kv-decode/``. See ``FP8_KV_DECODE_ATTN.md`` and ``REPRODUCE.md``.
-A standard Triton wheel without TLX cannot execute this file.
+A standard Triton wheel without TLX cannot execute this tutorial.
