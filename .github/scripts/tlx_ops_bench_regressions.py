@@ -156,11 +156,7 @@ def issue_body(alert, repo, run_url):
     lines = [
         f"Measured TLX throughput regressed on {alert['platform'].upper()} for `{alert['op']}` {alert['direction']} in {date}.",
         "", "\n".join(f"- {reason}." for reason in alert["reasons"]), "",
-        f"{alert['compared']} reliable cases compared out of {alert['reported_cases']} reported cases.",
-        "Baseline: per-case median of the last three reliable measurements within 14 days, using the same timing mode and replicate count. Errors and missing measurements are excluded. The noisy fallback uses three valid measurements, including noisy samples, and requires two severe observations.",
-        "", f"Current summary: {base}/{date}.{alert['platform']}.json", f"Workflow run: {run_url}",
-        f"Measured commit: https://github.com/{repo}/commit/{alert['sha']}", "", "Baseline summaries:",
-        *[f"- {base}/{d}.{alert['platform']}.json" for d in dates], "",
+        f"{alert['compared']} reliable cases compared out of {alert['reported_cases']} reported cases.", "",
         "| Case | Baseline TLX TF/s | Current TLX TF/s | Change | Previous reference TF/s | Current reference TF/s |",
         "| --- | ---: | ---: | ---: | ---: | ---: |"
     ]
@@ -189,7 +185,13 @@ def issue_body(alert, repo, run_url):
         f"Reproducer: `{spec['key']}`. One bisect job checks the worst affected case for this operation and direction.",
         "The job remeasures both endpoints on the same GPU before bisecting. Missing cases, build errors, incorrect output and unreliable measurements are inconclusive, not performance failures.",
         "",
-        "This is a historical throughput regression, separate from the existing absolute 0.9x reference floor. Root cause and recovery require investigation."
+        "This is a historical throughput regression, separate from the existing absolute 0.9x reference floor. Root cause and recovery require investigation.",
+        "", "<details>", "<summary>Measurement evidence</summary>", "",
+        f"[Current results]({base}/{date}.{alert['platform']}.json) · [Benchmark run]({run_url}) · [Measured commit](https://github.com/{repo}/commit/{alert['sha']})",
+        "", "Baseline results: " + " · ".join(f"[{day(d).isoformat()}]({base}/{d}.{alert['platform']}.json)"
+                                              for d in dates), "",
+        "The baseline is each case's median from three prior reliable measurements within 14 days, using the same timing mode and replicate count. Errors and missing measurements are excluded. Noisy cases use valid measurements and require two severe observations.",
+        "", "</details>"
     ])
     return "\n".join(lines)
 
