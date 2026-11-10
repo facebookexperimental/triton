@@ -24,7 +24,8 @@ import time
 GOOD, BAD, SKIP = 0, 1, 125
 MAX_CV = 0.03
 VALID_RUNS = 2
-MAX_ATTEMPTS = 4
+# On MI350 the fast flash_attn_mxfp8 bwd build exceeded the CV limit in 6 of 8 runs; extra runs are cheap after tuning.
+MAX_ATTEMPTS = 8
 MAX_JOBS = "8"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 FIRST_BAD = re.compile(r"^([0-9a-f]{40}) is the first bad commit", re.M)
@@ -197,7 +198,7 @@ def measure_case(step):
     bench, case = matches[0]
     space = driver.resolve_space(bench, step.get("space"))
     runs = []
-    with Governor(device), stable(driver.device_index()):
+    with Governor(device) as governor, stable(driver.device_index()):
         for _ in range(MAX_ATTEMPTS):
             try:
                 result = driver.run_case(bench, case, space=space, cold=False)
@@ -214,7 +215,7 @@ def measure_case(step):
                 break
     return {
         **summarize_runs(runs), "device": device.name, "gpu_uuid": device.uuid, "space": space, "triton":
-        triton.__file__
+        triton.__file__, "governor": {"applied": governor.applied, "skipped": governor.skipped}
     }
 
 

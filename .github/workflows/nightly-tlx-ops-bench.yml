@@ -1,164 +1,228 @@
-name: Nightly TLX.ops Bench
-# Runs the tlx.ops perf suite (python/test/tlx_benchmark) on B200, H100 and
-# MI350 for the commit each published nightly selects, which already passed the
-# correctness checks the nightly is gated on. It installs the wheel build.yml
-# makes for that commit: usually the cached one its GPU tests ran on, rebuilt
-# from the same commit if the cache has expired or the build recipe changed.
+name: Bisect TLX throughput regression
+
 on:
-  schedule:
-    - cron: '0 7,8 * * *'
   workflow_dispatch:
     inputs:
-      version:
-        description: "fbtriton nightly version, e.g. 3.8.0.dev20260923 (blank = latest published)"
-        required: false
-        default: ""
-      sha:
-        description: "Commit that version was built from (required when version is set)"
-        required: false
-        default: ""
+      platform:
+        description: Platform to bisect
+        required: true
+        default: mi350
+        type: choice
+        options: [mi350]
 
 permissions:
   contents: read
 
 concurrency:
-  group: nightly-tlx-ops-bench
+  group: tlx-perf-bisect-${{ inputs.platform }}
   cancel-in-progress: false
 
 jobs:
-  resolve:
-    # A schedule selects the latest published wheel; dispatches still require a main commit.
-    if: >-
-      github.repository_owner == 'facebookexperimental' &&
-      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+  prepare:
+    if: github.repository == 'facebookexperimental/triton'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       actions: read
+      issues: read
     outputs:
-      version: ${{ steps.pick.outputs.version }}
-      sha: ${{ steps.pick.outputs.sha }}
+      ready: ${{ steps.plan.outputs.ready }}
     steps:
-      - name: Checkout main
+      - name: Prepare one real October 13-14 MM regression
+        run: |
+          mkdir evidence
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          spec = {
+              'op': 'mm', 'direction': 'fwd',
+              'key': 'mm/gfx950/float16/4096x4096x2048x2048_1x4096_1',
+              'platform': 'mi350', 'space': 'heuristic', 'required_ratio': 0.5,
+              'good_sha': '032bd40b9a62e16f59410e76eb3dad1aa1e7dedb',
+              'bad_sha': '8db2e2ee26ab166c7a3b30d334e4c0b93d157e16'
+          }
+          pathlib.Path('evidence/regressions.json').write_text(json.dumps([
+              {'platform': 'mi350', 'bisect_issue': 4881, 'bisect': spec}
+          ]))
+          PY
+      - name: Select open issues and their representative cases
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          alerts = json.loads(pathlib.Path('evidence/regressions.json').read_text())
+          specs = []
+          for alert in alerts:
+              number = alert.get('bisect_issue')
+              if not number or alert['platform'] != os.environ['PLATFORM']:
+                  continue
+              issue = json.loads(subprocess.check_output(['gh', 'api', f"repos/{repo}/issues/{number}"]))
+              if issue['state'] == 'open':
+                  specs.append({'issue_number': number, **alert['bisect']})
+          pathlib.Path('specs.json').write_text(json.dumps(specs))
+          if specs:
+              assert len({s['bad_sha'] for s in specs}) == 1
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+                  out.write("ready=true\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.ready == 'true'
+        with:
+          name: perf-bisect-specs
+          path: specs.json
+
+  bisect:
+    needs: prepare
+    if: needs.prepare.outputs.ready == 'true'
+    runs-on: ${{ fromJSON('{"b200":"nvidia-dgx-b200","h100":"linux-gcp-h100","mi350":"linux-fb-triton-mi350-1"}')[inputs.platform] }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout bisect tooling
+        uses: actions/checkout@v4
+        with:
+          ref: wychi/bench-bisect-workflow-test
+          path: tooling
+          persist-credentials: false
+      - name: Checkout main history for candidate builds
         uses: actions/checkout@v4
         with:
           ref: main
+          path: candidate
           fetch-depth: 0
-      - name: Pick the wheel to bench
-        id: pick
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_SHA: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: perf-bisect-specs
+          path: evidence
+      - name: Validate main commits and preserve the benchmark
         run: |
-          set -euo pipefail
-          if [[ "${EVENT_NAME}" == schedule ]]; then
-            MIDNIGHT=$(python3 -c 'import datetime; from zoneinfo import ZoneInfo; print(int(datetime.datetime.now(ZoneInfo("America/Los_Angeles")).hour in (0, 1)))')
-            [[ "${MIDNIGHT}" == 1 ]] || { echo "Outside the Pacific midnight window; nothing to bench."; exit 0; }
-          fi
-          if [[ -n "${INPUT_VERSION}" ]]; then
-            [[ -n "${INPUT_SHA}" ]] || { echo "sha is required when version is set"; exit 1; }
-            VERSION="${INPUT_VERSION}"
-            SHA="${INPUT_SHA}"
-          else
-            gh release download nightly --pattern latest.json --output latest.json
-            VERSION=$(jq -r .version latest.json)
-            SHA=$(jq -r .commit latest.json)
-          fi
-          # Whatever its source (latest.json or a dispatch input), only a main commit is ever checked out downstream.
-          [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "not a full commit sha: ${SHA}"; exit 1; }
-          [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}$ ]] || { echo "not a nightly version: ${VERSION}"; exit 1; }
-          git merge-base --is-ancestor "${SHA}" origin/main || { echo "${SHA} is not on main"; exit 1; }
-          if [[ "${EVENT_NAME}" == schedule ]]; then
-            DATE="${VERSION##*.dev}"
-            COMPLETE=$(gh release view tlx-ops-bench --json assets --jq '.assets[].name' \
-              | python3 -c 'import sys; date=sys.argv[1]; names=set(sys.stdin.read().splitlines()); print(int(all(f"{date}.{p}.json" in names for p in ("b200", "h100", "mi350"))))' "${DATE}")
-            [[ "${COMPLETE}" != 1 ]] || { echo "${VERSION} already has all platform summaries; nothing to bench."; exit 0; }
-          fi
-          echo "Benching ${VERSION} (${SHA})"
-          {
-            echo "version=${VERSION}"
-            echo "sha=${SHA}"
-          } >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
 
-  build:
-    needs: resolve
-    if: needs.resolve.outputs.version != ''
-    permissions:
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/build.yml
-    with:
-      ref: ${{ needs.resolve.outputs.sha }}
+          specs = json.loads(pathlib.Path('evidence/specs.json').read_text())
+          for spec in specs:
+              good, bad = spec['good_sha'], spec['bad_sha']
+              assert re.fullmatch(r'[0-9a-f]{40}', good) and re.fullmatch(r'[0-9a-f]{40}', bad)
+              subprocess.run(['git', '-C', 'candidate', 'merge-base', '--is-ancestor', good, bad], check=True)
+              subprocess.run(['git', '-C', 'candidate', 'merge-base', '--is-ancestor', bad, 'origin/main'], check=True)
+          assert len({spec['bad_sha'] for spec in specs}) == 1
+          archive = pathlib.Path(os.environ['RUNNER_TEMP']) / 'perf-bisect-benchmark.tar'
+          harness = pathlib.Path(os.environ['RUNNER_TEMP']) / 'perf-bisect-harness'
+          harness.mkdir()
+          with archive.open('wb') as out:
+              subprocess.run(['git', '-C', 'candidate', 'archive', specs[0]['bad_sha'], 'python/test/tlx_benchmark'], stdout=out, check=True)
+          subprocess.run(['tar', '-xf', str(archive), '-C', str(harness)], check=True)
+          PY
+      - name: Set up fixed test environment
+        uses: ./tooling/.github/actions/setup-test-env
+        with:
+          backend: ${{ inputs.platform == 'mi350' && 'rocm' || 'cuda' }}
+          arch: ${{ inputs.platform == 'mi350' && 'gfx950' || '' }}
+          torch: torch==2.14.0
+          torch-index-url: ${{ inputs.platform == 'mi350' && 'https://download.pytorch.org/whl/rocm7.2' || 'https://download.pytorch.org/whl/cu130' }}
+          packages: numpy pytest torchao
+          rocm-lib-path: ""
+      - name: Refresh CUDA linker cache
+        if: inputs.platform != 'mi350'
+        run: sudo ldconfig
+      - name: Verify endpoints and bisect each representative case
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+          import time
 
-  b200:
-    needs: [resolve, build]
-    if: needs.resolve.outputs.version != ''
-    permissions:
-      id-token: write
-      contents: write   # publish: the dashboard's release
-      issues: write
-      actions: write
-    uses: ./.github/workflows/_tlx-ops-bench.yml
-    with:
-      platform: b200
-      runner: nvidia-dgx-b200
-      torch_index: https://download.pytorch.org/whl/cu130
-      version: ${{ needs.resolve.outputs.version }}
-      sha: ${{ needs.resolve.outputs.sha }}
-      wheel_url: ${{ needs.build.outputs.wheel_url }}
-      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
-      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+          specs = json.loads(pathlib.Path('evidence/specs.json').read_text())
+          deadline = time.monotonic() + 300 * 60
+          output = pathlib.Path('results')
+          output.mkdir()
+          for i, spec in enumerate(specs):
+              number = spec['issue_number']
+              path = output / f'spec-{number}.json'
+              path.write_text(json.dumps(spec))
+              result = output / f'result-{number}.json'
+              budget = max(1, (deadline - time.monotonic()) / (len(specs) - i))
+              subprocess.run([
+                  sys.executable, 'tooling/.github/scripts/tlx_ops_bench_bisect.py',
+                  '--source', str(pathlib.Path('candidate').resolve()),
+                  '--harness', str(pathlib.Path(os.environ['RUNNER_TEMP']) / 'perf-bisect-harness/python/test/tlx_benchmark'),
+                  '--spec', str(path), '--out', str(result), '--timeout-minutes', str(budget / 60)
+              ])
+              if not result.exists():
+                  result.write_text(json.dumps({'status': 'inconclusive', 'reason': 'Worker produced no result.'}))
+              data = json.loads(result.read_text())
+              data['issue_number'] = number
+              result.write_text(json.dumps(data, indent=2))
+              subprocess.run(['git', '-C', 'candidate', 'bisect', 'reset'])
+              subprocess.run(['git', '-C', 'candidate', 'reset', '--hard'], check=True)
+              subprocess.run(['git', '-C', 'candidate', 'clean', '-ffdx'], check=True)
+          PY
+      - name: Upload bisect results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-bisect-results
+          path: results/result-*.json
+          if-no-files-found: ignore
 
-  h100:
-    needs: [resolve, build]
-    if: needs.resolve.outputs.version != ''
-    permissions:
-      id-token: write
-      contents: write   # publish: the dashboard's release
-      issues: write
-      actions: write
-    uses: ./.github/workflows/_tlx-ops-bench.yml
-    with:
-      platform: h100
-      runner: linux-gcp-h100
-      torch_index: https://download.pytorch.org/whl/cu130
-      version: ${{ needs.resolve.outputs.version }}
-      sha: ${{ needs.resolve.outputs.sha }}
-      wheel_url: ${{ needs.build.outputs.wheel_url }}
-      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
-      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
-
-  mi350:
-    needs: [resolve, build]
-    if: needs.resolve.outputs.version != ''
-    permissions:
-      id-token: write
-      contents: write   # publish: the dashboard's release
-      issues: write
-      actions: write
-    uses: ./.github/workflows/_tlx-ops-bench.yml
-    with:
-      platform: mi350
-      runner: linux-fb-triton-mi350-1
-      torch_index: https://download.pytorch.org/whl/rocm7.2
-      version: ${{ needs.resolve.outputs.version }}
-      sha: ${{ needs.resolve.outputs.sha }}
-      wheel_url: ${{ needs.build.outputs.wheel_url }}
-      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
-      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
-
-  prune:
-    needs: [resolve, b200, h100, mi350]
-    if: always() && needs.resolve.outputs.version != ''
+  report:
+    needs: [prepare, bisect]
+    if: always() && needs.prepare.outputs.ready == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      issues: write
     steps:
-      - uses: actions/checkout@v4
-      - name: Keep the last 60 nights on the tlx-ops-bench release
+      - uses: actions/download-artifact@v4
+        with:
+          name: perf-bisect-specs
+          path: evidence
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: perf-bisect-results
+          path: evidence
+      - name: Report measured results on the issues
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/tlx_ops_bench_dashboard.py prune 60
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          run_url = f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          for spec in json.loads(pathlib.Path('evidence/specs.json').read_text()):
+              number = spec['issue_number']
+              path = pathlib.Path(f'evidence/result-{number}.json')
+              result = json.loads(path.read_text()) if path.exists() else {'status': 'inconclusive', 'reason': 'Job did not produce a result.'}
+              lines = [f"Performance bisection result: {result['status']}. [Run and evidence]({run_url}).",
+                       f"Case: `{spec['key']}`."]
+              if result.get('first_bad_sha'):
+                  sha = result['first_bad_sha']
+                  lines.append(f"First bad commit for the measured case: https://github.com/{repo}/commit/{sha}")
+              if result.get('reason'):
+                  lines.append(result['reason'])
+              subprocess.run(['gh', 'api', f"repos/{repo}/issues/{number}/comments", '--method', 'POST', '--input', '-'],
+                             input=json.dumps({'body': '\n\n'.join(lines)}), text=True, check=True)
+          PY
