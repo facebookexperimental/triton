@@ -52,6 +52,12 @@ _HSTU_DIMS = frozenset({"B", "LQ", "LKV", "H", "D"})
 _KDA_DIMS = frozenset({"T", "H", "D"})
 _ROW_DIMS = frozenset({"T", "D"})
 
+
+def _linear_rowscale_accepts(d):
+    # TMA needs 16-byte rows (K, N multiples of 8); x and the weight ring share one CTA's shared memory.
+    return 0 < d["K"] <= 512 and d["K"] % 8 == 0 and d["N"] > 0 and d["N"] % 8 == 0
+
+
 _NORM_MODULES = {
     'sm100': ['layernorm', 'layernorm_add', 'rmsnorm', 'norm_fwd', 'norm_bwd', 'norm_backward_from_normalized'],
     '_softmax': ['softmax', 'softmax_fwd', 'softmax_bwd'], '_fp4': [
@@ -492,6 +498,27 @@ CATALOG: tuple[OpSpec, ...] = (
         # The warp-specialized kernel reads the projection weights by TMA: their data must start on a 16-byte boundary.
         accepts=lambda d: d.get("D") in (128, 256) and d.get("HEAD_DIM") in
         (64, 128) and all(ptr % 16 == 0 for ptr in d.get("base_ptrs", ())),
+        supports_backward=False,
+    ),
+    OpSpec(
+        op="linear_rowscale",
+        arch="sm90",
+        variant="tlx_ws_pingpong_x_stationary",
+        impl="triton.tlx.ops.kernels.fused.linear_rowscale.sm90:linear_rowscale",
+        invariant_vocab=_GEMM_DIMS,
+        dtypes=_FP16,
+        accepts=_linear_rowscale_accepts,
+        requires=frozenset({"tma"}),
+        supports_backward=False,
+    ),
+    OpSpec(
+        op="linear_rowscale_launch",
+        arch="sm90",
+        variant="tlx_ws_pingpong_x_stationary",
+        impl="triton.tlx.ops.kernels.fused.linear_rowscale.sm90:linear_rowscale_launch",
+        dtypes=_FP16,
+        accepts=_linear_rowscale_accepts,
+        requires=frozenset({"tma"}),
         supports_backward=False,
     ),
     OpSpec(
