@@ -153,30 +153,56 @@ def issue_body(alert, repo, run_url):
     date = alert["date"]
     base = f"https://github.com/{repo}/releases/download/tlx-ops-bench"
     dates = sorted({d for c in alert["cases"] for d in c["baseline_dates"]})
+    losses = [100 * (1 - case["ratio"]) for case in alert["cases"]]
+    loss = f"{min(losses):.1f}% to {max(losses):.1f}%" if len(losses) > 1 else f"{losses[0]:.1f}%"
+    direction = {"fwd": "forward", "bwd": "backward"}.get(alert["direction"], alert["direction"])
     lines = [
-        f"Measured TLX throughput regressed on {alert['platform'].upper()} for `{alert['op']}` {alert['direction']} in {date}.",
-        "", "\n".join(f"- {reason}." for reason in alert["reasons"]), "",
-        f"{alert['compared']} reliable cases compared out of {alert['reported_cases']} reported cases.", "",
-        "| Case | Baseline TLX TF/s | Current TLX TF/s | Change | Previous reference TF/s | Current reference TF/s |",
+        "## Regression", "",
+        f"{alert['platform'].upper()} `{alert['op']}` {direction} throughput fell {loss} across {len(losses)} cases on {day(date).isoformat()}.",
+        "", "Detection: " + "; ".join(alert["reasons"]) + ".",
+        f"Compared {alert['compared']} reliable cases out of {alert['reported_cases']} reported. The cause is not established.",
+        "", "## Affected cases", "", "Throughput is in TFLOP/s.", "",
+        "| Input | TLX baseline | TLX now | Loss | Reference before | Reference now |",
         "| --- | ---: | ---: | ---: | ---: | ---: |"
     ]
     fmt = lambda v: f"{v:.2f}" if v is not None else "not available"
-    for c in alert["cases"][:50]:
-        key = c["key"].replace("|", "\\|").replace("`", "")
+    labels = [" · ".join([c["dtype"], *(f"{k}={v}" for k, v in c["params"].items())]) for c in alert["cases"]]
+    counts = collections.Counter(labels)
+    for c, inputs in zip(alert["cases"][:50], labels[:50]):
+        if counts[inputs] > 1:
+            inputs += f" · case={c['key'].split('/', 3)[-1]}"
+        inputs = inputs.replace("|", "\\|").replace("`", "")
         lines.append(
-            f"| `{key}` | {c['baseline']:.2f} | {c['current']:.2f} | {(c['ratio'] - 1) * 100:.1f}% | {fmt(c['reference_before'])} | {fmt(c['reference_now'])} |"
+            f"| {inputs} | {c['baseline']:.2f} | {c['current']:.2f} | {(1 - c['ratio']) * 100:.1f}% | {fmt(c['reference_before'])} | {fmt(c['reference_now'])} |"
         )
     if len(alert["cases"]) > 50:
         lines.append(f"\n{len(alert['cases']) - 50} additional affected cases are in the source summary.")
     if alert["confirmation_date"]:
         lines.append(f"\nThe operation/direction also crossed the median threshold on {alert['confirmation_date']}.")
-    lines.extend(["", "Environment changes, not established causes:"])
+    lines.extend(["", "## Environment changes", ""])
     before = alert["cases"][0]["previous_environment"]
-    changes = [
-        f"- {key}: `{json.dumps(before.get(key))}` -> `{json.dumps(value)}`"
-        for key, value in alert["environment"].items()
-        if before.get(key) != value
-    ]
+
+    def environment_value(value):
+        if isinstance(value, list):
+            return ", ".join(map(str, value)) or "none"
+        if isinstance(value, dict):
+            return ", ".join(f"{k}={v}" for k, v in value.items())
+        return str(value) if value is not None else "not recorded"
+
+    changes = []
+    for key, value in alert["environment"].items():
+        previous = before.get(key)
+        if previous == value:
+            continue
+        if isinstance(previous, list) and isinstance(value, list):
+            removed = [x for x in previous if x not in value]
+            added = [x for x in value if x not in previous]
+            if removed:
+                changes.append(f"- {key}: removed {environment_value(removed)}.")
+            if added:
+                changes.append(f"- {key}: added {environment_value(added)}.")
+        else:
+            changes.append(f"- {key}: before {environment_value(previous)}; now {environment_value(value)}.")
     lines.extend(changes or ["- No recorded environment changes."])
     spec = bisect_spec(alert)
     lines.extend([
