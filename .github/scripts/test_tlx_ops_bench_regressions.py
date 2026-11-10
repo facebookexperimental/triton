@@ -97,9 +97,11 @@ def test_issue_filing_lists_unindexed_issues_and_deduplicates_without_closing():
         return [] if method == "GET" else {"html_url": "https://github.com/o/r/issues/1", "number": 1}
 
     assert regressions.file_issues([alert, alert], "o/r", "run", create) == ["https://github.com/o/r/issues/1"]
-    assert [c[0] for c in calls] == ["GET", "POST"]
-    assert calls[1][2]["labels"] == ["nightly", "perf-regression"]
-    assert "Suspect commit range" in calls[1][2]["body"]
+    assert [c[:2] for c in calls[:2]] == [("GET", "repos/o/r/issues?state=open&per_page=100"),
+                                          ("GET", "repos/o/r/issues?state=all&labels=perf-regression&per_page=100")]
+    assert [c[0] for c in calls] == ["GET", "GET", "POST"]
+    assert calls[2][2]["labels"] == ["nightly", "perf-regression"]
+    assert "Suspect commit range" in calls[2][2]["body"]
     assert alert["bisect_issue"] == 1
 
 
@@ -145,3 +147,82 @@ def test_local_replay_cannot_write_issues_without_explicit_opt_in(monkeypatch, t
          str(output), "--file-issues"])
     regressions.main()
     assert json.loads(output.read_text()) == []
+
+
+def nights_of(values, mode="gpu_events", start=1):
+    """Consecutive nights of one fwd mm cohort; each entry maps case key to TFLOP/s."""
+    out = []
+    for i, by_key in enumerate(values, start):
+        date = f"202610{i:02d}"
+        cases = [{
+            "key": key, "params": {"N": key}, "dtype": "bf16", "direction": "fwd", "status": "ok", "tlx_tflops": value,
+            "ref_tflops": 20, "notes": []
+        } for key, value in by_key.items()]
+        out.append({
+            "schema": 2, "platform": "mi350", "date": date, "sha": date * 5, "timing":
+            {"latency_mode": mode, "replicates": 1}, "ops": {"mm": {"cases": cases}}
+        })
+    return out
+
+
+@pytest.mark.parametrize("prior_status,statuses,detectors", [
+    ("ok", ("ok", "ok"), ["recent", "historical-best"]),
+    ("ok", ("ok", "noisy"), ["recent"]),
+    ("ok", ("noisy", "noisy", "ok"), ["recent"]),
+    ("noisy", ("noisy", "noisy", "ok", "ok"), ["recent"]),
+])
+def test_one_episode_is_filed_once_across_detectors_and_after_a_person_closes_it(prior_status, statuses, detectors):
+    baseline = history()
+    for case in baseline[-1]["ops"]["flash_attn_mxfp8"]["cases"]:
+        case["status"] = prior_status
+    alerts = regressions.detect_all(
+        baseline + [night(f"202611{day:02d}", 30, status=status) for day, status in enumerate(statuses, 4)])
+    first, second = alerts[0], alerts[-1]
+    assert second["detectors"] == detectors
+    assert second["episodes"] == first["episodes"] and all(
+        e.endswith("|gpu_events,1|20261104") for e in first["episodes"])
+    posts = []
+
+    def api(method, path, fields=None, paginate=False):
+        if method == "POST":
+            posts.append(fields)
+            return {"html_url": "https://github.com/o/r/issues/1", "number": 1}
+        if "state=all" in path and posts:
+            return [{"number": 1, "state": "closed", "title": posts[0]["title"], "body": posts[0]["body"]}]
+        return []
+
+    regressions.file_issues([first], "o/r", "run", api)
+    regressions.file_issues([second], "o/r", "run", api)
+    assert len(posts) == 1 and second["tracked_by"] == [1]
+
+
+def test_historical_best_reports_a_lasting_loss_in_one_stable_case_but_not_in_a_flapping_case():
+    steady = {k: 100 for k in "bcde"}
+    flapping = [100, 130, 100, 130, 100, 80, 80]
+    stable = [100, 100, 100, 100, 100, 80, 80]
+    alerts = regressions.detect_all(nights_of([{"a": a, "f": f, **steady} for a, f in zip(stable, flapping)]))
+    assert [(a["date"], a["detectors"], [c["key"]
+                                         for c in a["cases"]])
+            for a in alerts] == [("20261007", ["historical-best"], ["a"])]
+
+
+def test_historical_best_skips_missing_nights_but_never_crosses_a_timing_mode():
+    gaps = [night("20261104", status="error"), night("20261105", keys=())]
+    low = [night("20261106", 80), night("20261107", 80)]
+    assert [a["date"] for a in regressions.detect_best(history() + gaps + low)] == ["20261107"]
+    other_mode = [night("20261106", 80, mode="wallclock"), night("20261107", 80, mode="wallclock")]
+    assert regressions.detect_best(history() + gaps + other_mode) == []
+    old_mode = [night(f"202610{d:02d}", v, mode="wallclock") for d, v in zip(range(20, 25), [100, 130, 100, 130, 100])]
+    assert [a["date"] for a in regressions.detect_best(old_mode + history() + low)] == ["20261107"]
+
+
+def test_one_fast_night_cannot_raise_the_historical_best():
+    tracked = regressions.track_best(nights_of([{"a": v} for v in [100, 100, 200, 100, 100, 88]]))
+    assert tracked[("mm", "fwd", "a")]["20261006"]["best"] == 100
+
+
+def test_bisect_from_the_nearest_good_night_can_still_reproduce_the_loss():
+    alert = regressions.detect_best(nights_of([{"a": v} for v in [100, 100, 100, 92, 92, 84, 84]]))[0]
+    spec = regressions.bisect_spec(alert)
+    assert (spec["good_sha"], spec["bad_sha"]) == ("20261005" * 5, "20261007" * 5)
+    assert 84 / 92 <= spec["required_ratio"] < 1
