@@ -36,6 +36,36 @@ def test_severe_throughput_loss_crosses_empty_nights_without_using_the_reference
     assert regressions.detect(history() + [stable]) == []
 
 
+@pytest.mark.parametrize("value,status,notes,expected", [
+    (70, "ok", [], 1),
+    (70, "pip", ["speedup below the reference floor"], 1),
+    (70.01, "ok", [], 0),
+    (60, "noisy", [], 0),
+    (60, "pip", ["CV 5.0% is also over the 3% limit"], 0),
+])
+def test_one_stable_reliable_case_losing_thirty_percent_alerts_without_cohort_confirmation(
+        value, status, notes, expected):
+    current = night("20261104", keys=("a", "b", "c", "d", "e"))
+    baseline = [night(f"202611{day:02d}", keys=("a", "b", "c", "d", "e")) for day in range(1, 4)]
+    current["ops"]["flash_attn_mxfp8"]["cases"][0].update(tlx_tflops=value, status=status, notes=notes)
+    alerts = regressions.detect(baseline + [current])
+    assert len(alerts) == expected
+    if expected:
+        assert [c["key"] for c in alerts[0]["cases"]] == ["a"]
+        assert alerts[0]["confirmation_date"] is None
+        assert regressions.bisect_spec(alerts[0])["required_ratio"] == 0.7
+    else:
+        again = copy.deepcopy(current)
+        again["date"] = "20261105"
+        assert regressions.detect(baseline + [current, again]) == []
+
+
+def test_an_unstable_baseline_cannot_trigger_a_thirty_percent_single_night_alert():
+    baseline = [night(f"202611{day:02d}", value) for day, value in enumerate((100, 160, 100), 1)]
+    assert regressions.detect(baseline + [night("20261104", 70)]) == []
+    assert len(regressions.detect(baseline + [night("20261104", 50)])) == 1
+
+
 def test_moderate_loss_needs_two_observations_and_is_not_diluted_by_forward():
     nights = history() + [night("20261104", 85), night("20261109", 85)]
     for n in nights:

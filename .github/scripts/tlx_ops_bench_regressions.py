@@ -16,7 +16,8 @@ from tlx_ops_bench_dashboard import read_summaries
 
 BASELINE_SAMPLES = 3
 MAX_AGE_DAYS = 14
-CASE_RATIO = 0.50
+CASE_RATIO = 0.70
+NOISY_CASE_RATIO = 0.50
 COHORT_RATIO = 0.90
 MIN_COHORT_CASES = 3
 BEST_RATIO = 0.85
@@ -59,10 +60,20 @@ def comparison(case, history, night, trusted):
     value = statistics.median(h["case"]["tlx_tflops"] for h in baseline)
     good = next(h for h in reversed(baseline) if h["case"]["tlx_tflops"] >= value)
     return {
-        "key": case["key"], "params": case["params"], "dtype": case["dtype"], "baseline": value, "current":
-        case["tlx_tflops"], "ratio": case["tlx_tflops"] / value, "baseline_dates": [h["date"] for h in baseline],
-        "baseline_sha": baseline[0]["sha"], "good_sha": good["sha"], "good_date": good["date"], "reference_before":
-        baseline[-1]["case"].get("ref_tflops"), "reference_now": case.get("ref_tflops"), "previous_environment":
+        "key":
+        case["key"], "params":
+        case["params"], "dtype":
+        case["dtype"], "baseline":
+        value, "current":
+        case["tlx_tflops"], "ratio":
+        case["tlx_tflops"] / value, "baseline_stable":
+        max(h["case"]["tlx_tflops"] for h in baseline) <= SWING * min(h["case"]["tlx_tflops"] for h in baseline),
+        "baseline_dates": [h["date"] for h in baseline], "baseline_sha":
+        baseline[0]["sha"], "good_sha":
+        good["sha"], "good_date":
+        good["date"], "reference_before":
+        baseline[-1]["case"].get("ref_tflops"), "reference_now":
+        case.get("ref_tflops"), "previous_environment":
         baseline[-1]["environment"]
     }
 
@@ -92,11 +103,12 @@ def detect(nights):
                     broad["recent_onset"] = prev["row"]["recent_onset"] if carried else night["date"]
                 if clean:
                     cohorts[direction].append(clean)
-                    if clean["ratio"] <= CASE_RATIO:
+                    if clean["ratio"] <= CASE_RATIO and (clean["ratio"] <= NOISY_CASE_RATIO
+                                                         or clean["baseline_stable"]):
                         severe[direction].append(clean)
-                if broad and not trusted and broad["ratio"] <= CASE_RATIO and prev:
+                if broad and not trusted and broad["ratio"] <= NOISY_CASE_RATIO and prev:
                     if prev["regime"] == regime(night) and (day(night["date"]) - day(
-                            prev["date"])).days <= MAX_AGE_DAYS and prev["row"]["ratio"] <= CASE_RATIO:
+                            prev["date"])).days <= MAX_AGE_DAYS and prev["row"]["ratio"] <= NOISY_CASE_RATIO:
                         noisy[direction].append(broad)
                 if broad:
                     previous_case[identity] = {"date": night["date"], "regime": regime(night), "row": broad}
@@ -123,7 +135,8 @@ def detect(nights):
                 reasons = []
                 affected = {}
                 if severe[direction]:
-                    reasons.append("at least 50% throughput loss in a reliable case")
+                    reasons.append(
+                        "at least 30% throughput loss in a reliable case; losses below 50% require a stable baseline")
                     affected.update((r["key"], r) for r in severe[direction])
                 if confirmed:
                     reasons.append("at least 10% median throughput loss on two evaluated nights")
@@ -133,15 +146,23 @@ def detect(nights):
                     affected.update((r["key"], r) for r in noisy[direction])
                 if reasons:
                     alerts.append({
-                        "platform": night["platform"], "op": op, "direction": direction, "date": night["date"], "sha":
-                        night["sha"], "reasons": reasons, "median_ratio": median, "compared": len(rows),
-                        "reported_cases": sum(c["direction"] == direction
-                                              for c in result["cases"]), "space": result.get("space"), "required_ratio":
-                        CASE_RATIO if severe[direction] or noisy[direction] else COHORT_RATIO, "confirmation_date":
+                        "platform":
+                        night["platform"], "op":
+                        op, "direction":
+                        direction, "date":
+                        night["date"], "sha":
+                        night["sha"], "reasons":
+                        reasons, "median_ratio":
+                        median, "compared":
+                        len(rows), "reported_cases":
+                        sum(c["direction"] == direction for c in result["cases"]), "space":
+                        result.get("space"), "required_ratio":
+                        CASE_RATIO if severe[direction] else NOISY_CASE_RATIO if noisy[direction] else COHORT_RATIO,
+                        "confirmation_date":
                         prev["date"] if confirmed else None, "environment":
                         {k: night.get(k)
-                         for k in ("gpu", "driver", "torch", "runtime", "governed", "timing")
-                         }, "cases": sorted(affected.values(), key=lambda r: r["ratio"])
+                         for k in ("gpu", "driver", "torch", "runtime", "governed", "timing")}, "cases":
+                        sorted(affected.values(), key=lambda r: r["ratio"])
                     })
                 if len(rows) >= MIN_COHORT_CASES:
                     previous_cohort[cohort] = {"date": night["date"], "regime": regime(night), "rows": rows}
