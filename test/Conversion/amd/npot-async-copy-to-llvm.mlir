@@ -82,7 +82,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @misaligned_slab(%ptr: !tt.ptr<f32>, %d: !ttg.memdesc<192xf32, #pad, #smem, mutable, 256>) {
     %offsets = arith.constant dense<0> : tensor<192xi32, #p>
-    // expected-error @+1 {{NPOT async copy is not supported on hip:gfx950: a slab starts at LDS byte 260, which is not 16-byte aligned}}
+    // expected-error @+2 {{NPOT async copy is not supported on hip:gfx950: a slab starts at LDS byte 260, which is not 16-byte aligned}}
+    // expected-error @+1 {{failed to legalize operation 'amdg.buffer_load_to_local' that was explicitly marked illegal}}
     %t = amdg.buffer_load_to_local %ptr[%offsets] into %d : !tt.ptr<f32>[tensor<192xi32, #p>] -> <192xf32, #pad, #smem, mutable, 256>
     tt.return
   }
