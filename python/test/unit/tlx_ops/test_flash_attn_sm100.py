@@ -80,6 +80,17 @@ def test_flash_attn_bwd(Z, H, N_CTX, HEAD_DIM, causal, dtype_name):
         _assert_close(got, want, dtype)
 
 
+@pytest.mark.parametrize("N_CTX", [512, 768, 1280])
+def test_flash_attn_fwd_2cta_grid(N_CTX):
+    """A 2-CTA cluster covers 2 * BLOCK_M rows; the grid must launch one cluster per such tile."""
+    from triton.tlx.ops.kernels.flash_attn import sm100
+
+    config = next(c for c in sm100.configs if c.kwargs.get("NUM_CTAS", 1) == 2).kwargs
+    q, k, v = _qkv(2, 4, N_CTX, 128, torch.bfloat16)
+    out = sm100.attention(q, k, v, 128**-0.5, False, config=dict(config))
+    _assert_close(out, _sdpa(q, k, v, False), torch.bfloat16)
+
+
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("N_CTX", [384, 640])
 def test_flash_attn_partial_last_m_block(N_CTX, causal):
