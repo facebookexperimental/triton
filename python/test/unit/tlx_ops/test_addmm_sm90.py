@@ -345,6 +345,59 @@ def test_addmm_direct_routing():
     assert (kw["BLOCK_M"], kw["BLOCK_N"], kw["BLOCK_K"]) == (64, 128, 32)
 
 
+@pytest.mark.parametrize(
+    "m,n,k,tile",
+    [
+        (440, 4096, 1093, (64, 128, 32)),
+        (902, 4096, 1091, (64, 128, 32)),
+        (256, 192, 259, (64, 128, 32)),
+        (3072, 128, 44536, (128, 64, 32)),
+        (1023, 4096, 1093, (64, 128, 32)),
+        (1024, 128, 513, (128, 64, 32)),
+        (3072, 127, 44535, (128, 64, 32)),
+        (440, 4096, 1088, (128, 128, 32)),
+        (902, 4096, 1088, (128, 128, 32)),
+        (256, 192, 256, (128, 32, 32)),
+        (3072, 128, 44544, (128, 128, 32)),
+        (1024, 4096, 1093, (128, 256, 64)),
+        (3072, 129, 44536, (128, 128, 32)),
+        (1024, 128, 512, (128, 128, 32)),
+        (64, 4096, 1093, (64, 128, 32)),
+        (3072, 64, 44536, (128, 64, 32)),
+    ],
+)
+def test_addmm_direct_heuristic_unaligned_k(m, n, k, tile):
+    cfg = sm90.heuristic_config(m, n, k)[0]
+    kw = cfg.kwargs
+    assert (kw["BLOCK_M"], kw["BLOCK_N"], kw["BLOCK_K"]) == tile
+    assert kw["GROUP_M"] == 8
+    assert (cfg.num_warps, cfg.num_stages) == ((8, 3) if tile == (128, 256, 64) else (4, 4))
+    assert any(c.kwargs == kw and c.num_warps == cfg.num_warps and c.num_stages == cfg.num_stages
+               for c in sm90._direct_configs())
+
+
+@pytest.mark.parametrize("m,n,k", [(440, 4096, 1093), (902, 4096, 1091), (256, 192, 259), (3072, 128, 44536)])
+@pytest.mark.parametrize("bias_2d", [False, True])
+@pytest.mark.parametrize("b_col_major", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_addmm_unaligned_k_heuristic(m, n, k, bias_2d, b_col_major, dtype):
+    from triton.tlx.ops import addmm as tlx_addmm
+
+    torch.manual_seed(m + n + k)
+    a = _operand(m, k, True, dtype)
+    b = _operand(k, n, not b_col_major, dtype)
+    bias = _bias("mn" if bias_2d else "1d", m, n, dtype)
+    out = torch.empty((m, n), device="cuda", dtype=dtype)
+    assert not sm90._tma_eligible(a, b, out, n, k)
+    actual = tlx_addmm(bias, a, b, out=out, space="heuristic")
+    assert actual is out
+    # Use an FP32 reference for the fused dot-and-bias epilogue.
+    expected = torch.addmm(bias.float(), a.float(), b.float()).to(dtype)
+    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+    del bias, a, b, out, actual, expected
+    torch.cuda.empty_cache()
+
+
 # --- GEMM path shared with tlx.ops.mm ----------------------------------------
 
 
