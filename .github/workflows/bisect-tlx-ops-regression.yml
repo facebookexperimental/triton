@@ -356,6 +356,9 @@ jobs:
                           '--state', 'evidence/prepared.json', '--measurements', 'evidence/measurements.json',
                           '--out', 'evidence/state.json'], check=True)
           PY
+      - name: Write the Actions result summary
+        run: |
+          python3 tooling/.github/scripts/tlx_ops_bench_bisect_summary.py --prepared evidence/prepared.json --state evidence/state.json --measurements evidence/measurements.json
       - name: Report completed cases
         env:
           GH_TOKEN: ${{ github.token }}
