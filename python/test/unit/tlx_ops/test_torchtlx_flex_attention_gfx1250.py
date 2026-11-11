@@ -1,5 +1,6 @@
 """L1 for the gfx1250 FlexAttention template and device-side recovery."""
 from pathlib import Path
+import re
 
 import pytest
 import torch
@@ -23,6 +24,21 @@ def runner(monkeypatch):
         yield benchmark
 
 
+@pytest.fixture
+def unmodified_subgraphs():
+    from torch._inductor import ir
+    from torch._inductor.virtualized import ops
+
+    device = torch.device("cpu")
+    score_layout = ir.FixedLayout(device, torch.bfloat16, [])
+    mask_layout = ir.FixedLayout(device, torch.bool, [])
+    score = ir.ComputedBuffer(name=None, layout=score_layout, data=ir.InputBuffer(name="score", layout=score_layout))
+    mask = ir.ComputedBuffer(
+        name=None, layout=mask_layout, data=ir.Pointwise(device=device, dtype=torch.bool,
+                                                         inner_fn=lambda _: ops.constant(True, torch.bool), ranges=[]))
+    return [score, mask]
+
+
 def _reference(q, k, v, score_mod=None, mask_mod=None):
     if q.shape[1] != k.shape[1]:
         k = k.repeat_interleave(q.shape[1] // k.shape[1], 1)
@@ -40,7 +56,8 @@ def _reference(q, k, v, score_mod=None, mask_mod=None):
     return output, scores.logsumexp(-1), scores.amax(-1)
 
 
-def _compile(tensors, score_mod=None, mask_mod=None, aux=False, block_size=128, kernel_options=None):
+def _compile(tensors, score_mod=None, mask_mod=None, aux=False, block_size=128, kernel_options=None,
+             expected_fixed_reference=None):
     q, k, v = tensors
     block_mask = None
     if mask_mod is None and q.shape[0] != k.shape[0]:
@@ -60,6 +77,9 @@ def _compile(tensors, score_mod=None, mask_mod=None, aux=False, block_size=128, 
         compiled = torch.compile(fn, fullgraph=True)
         output, code = run_and_get_code(compiled, q, k, v)
         assert "tlx.async_amd_descriptor_load" in "\n".join(code)
+        if expected_fixed_reference is not None:
+            flags = re.findall(r"USE_FIXED_REFERENCE\s*:\s*tl\.constexpr\s*=\s*(True|False)", "\n".join(code))
+            assert flags and all(flag == str(expected_fixed_reference) for flag in flags)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = compiled(q, k, v)
@@ -97,6 +117,24 @@ def test_flex_cross_attention_modifications(runner, dtype, case):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("case", ["dense", "sliding_window", "alibi"])
+def test_flex_fixed_reference_policy(runner, dtype, case):
+    torch.manual_seed(7)
+    tensors = [torch.randn((1, 1, 4096, 128), device="cuda", dtype=dtype) for _ in range(3)]
+    score_mod = (lambda s, b, h, m, n: s + (n - m) / 8) if case == "alibi" else None
+    mask_mod = (lambda b, h, m, n: (m >= n) & (m - n <= 1000)) if case == "sliding_window" else None
+    expected, lse, _ = _reference(*tensors, score_mod, mask_mod)
+    graph, (output, aux), keepalive = _compile(tensors, score_mod, mask_mod,
+                                               kernel_options={"fwd_BLOCK_M": 128, "fwd_BLOCK_N":
+                                                               64}, expected_fixed_reference=case == "dense")
+    graph.replay()
+    assert output.dtype == dtype
+    tolerance = .005 if dtype == torch.bfloat16 else .0008
+    assert (output.double() - expected).square().mean().sqrt() < tolerance * expected.square().mean().sqrt()
+    torch.testing.assert_close(aux.lse.double(), lse, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("offset", [0, 1])
 def test_flex_recovery_graph_replay(runner, dtype, offset):
     torch.manual_seed(1)
@@ -107,7 +145,7 @@ def test_flex_recovery_graph_replay(runner, dtype, offset):
 
     q, k, v = make(129), make(1025), make(1025)
     v.abs_().add_(.25)
-    graph, (output, aux), keepalive = _compile((q, k, v))
+    graph, (output, aux), keepalive = _compile((q, k, v), expected_fixed_reference=True)
     for mode in ("ordinary", "exp_overflow", "probability_overflow", "common_offset", "ordinary"):
         if mode == "ordinary":
             q.normal_()
@@ -227,9 +265,10 @@ def test_flex_large_outer_stride(runner, dtype, axis):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_flex_short_query(runner, dtype):
-    q = torch.randn((1, 2, 2, 128), device="cuda", dtype=dtype)
-    k = torch.randn((1, 2, 65, 128), device="cuda", dtype=dtype)
+@pytest.mark.parametrize("batch,heads,query_length,key_length", [(1, 2, 2, 65), (8, 32, 33, 1025), (8, 32, 64, 1025)])
+def test_flex_short_query(runner, dtype, batch, heads, query_length, key_length):
+    q = torch.randn((batch, heads, query_length, 128), device="cuda", dtype=dtype)
+    k = torch.randn((batch, heads, key_length, 128), device="cuda", dtype=dtype)
     v = torch.randn_like(k)
     expected, lse, _ = _reference(q, k, v)
     graph, (output, aux), keepalive = _compile((q, k, v), kernel_options={"FORCE_USE_FLEX_ATTENTION": True})
@@ -240,9 +279,13 @@ def test_flex_short_query(runner, dtype):
 
 
 @pytest.mark.parametrize("mode", ["allow", "force"])
-@pytest.mark.parametrize("case", ["fp16", "bf16", "fp32", "mixed", "head_dim", "stride", "invalid_tile"])
+@pytest.mark.parametrize(
+    "case", ["fp16", "bf16", "fp32", "mixed", "head_dim", "stride", "zero_stride", "unknown_stride", "invalid_tile"])
 def test_flex_dispatch_preserves_unsupported_choices(monkeypatch, mode, case):
+    import sympy
     from types import SimpleNamespace
+    from torch._inductor.sizevars import SizeVarAllocator
+    from torch._inductor.virtualized import V
     from triton.language.extra.tlx.inductor import flex_attention_templates as templates
 
     dtype = {"fp16": torch.float16, "fp32": torch.float32}.get(case, torch.bfloat16)
@@ -253,16 +296,21 @@ def test_flex_dispatch_preserves_unsupported_choices(monkeypatch, mode, case):
         tensors[2] = tensors[2][..., :64]
     elif case == "stride":
         tensors[0] = torch.empty((1, 2, 129, 256), dtype=dtype)[..., ::2]
+    elif case == "zero_stride":
+        tensors[0] = torch.empty((1, 2, 1, 128), dtype=dtype).expand(1, 2, 129, 128)
     nodes = [
         SimpleNamespace(get_size=lambda t=t: list(t.shape), get_stride=lambda t=t: list(t.stride()),
                         get_dtype=lambda t=t: t.dtype) for t in tensors
     ]
+    if case == "unknown_stride":
+        nodes[0].get_stride = lambda: (sympy.Symbol("stride", integer=True), 129 * 128, 128, 1)
     monkeypatch.setattr(templates, "current_target", lambda: SimpleNamespace(is_gfx1250=True, num_cus=256))
     template = SimpleNamespace(maybe_append_choice=lambda choices, **kw: choices.append(kw))
     monkeypatch.setattr(templates, "gfx1250_flex_attention_template", template)
     choices = ["stock"]
     options = {"fwd_BLOCK_M": 16} if case == "invalid_tile" else {"fwd_BLOCK_M": 32, "fwd_BLOCK_N": 64}
-    with config.patch({"triton.tlx_mode": mode, "max_autotune": False}):
+    with V.set_graph_handler(SimpleNamespace(sizevars=SizeVarAllocator())), config.patch(
+        {"triton.tlx_mode": mode, "max_autotune": False}):
         templates.append_tlx_flex(choices, [], nodes + [object() for _ in range(6)], [], object(), options, 128, 128)
     if case in ("fp16", "bf16"):
         assert len(choices) == (1 if mode == "force" else 2)
@@ -271,21 +319,55 @@ def test_flex_dispatch_preserves_unsupported_choices(monkeypatch, mode, case):
         assert choices == ["stock"]
 
 
-@pytest.mark.parametrize("hint_method", ["optimization_hint", "size_hint"])
-@pytest.mark.parametrize("dynamic_k", [False, True])
-@pytest.mark.parametrize("sequence", [1024, 4096])
-def test_flex_dynamic_batch_dispatch(monkeypatch, hint_method, dynamic_k, sequence):
+@pytest.mark.parametrize("dynamic_batch", [False, True])
+@pytest.mark.parametrize("query_length,expected", [(1, (32, 128)), (32, (32, 128)), (33, (64, 128)), (64, (64, 128)),
+                                                   (65, (128, 64))])
+def test_flex_short_query_dispatch(monkeypatch, unmodified_subgraphs, dynamic_batch, query_length, expected):
     import sympy
     from types import SimpleNamespace
+    from torch._inductor.sizevars import SizeVarAllocator
+    from torch._inductor.virtualized import V
+    from triton.language.extra.tlx.inductor import flex_attention_templates as templates
+
+    batch_symbol = sympy.Symbol("batch", positive=True, integer=True)
+    batch = batch_symbol if dynamic_batch else 8
+    shapes = ((batch, 32, query_length, 128), (batch, 32, 1025, 128))
+    nodes = [
+        SimpleNamespace(get_size=lambda s=s: s, get_stride=lambda s=s: (32 * s[2] * 128, s[2] * 128, 128, 1),
+                        get_dtype=lambda: torch.bfloat16) for s in (shapes[0], shapes[1], shapes[1])
+    ]
+    sizevars = SimpleNamespace(optimization_hint=lambda size, fallback: int(8 if size == batch_symbol else size),
+                               statically_known_gt=SizeVarAllocator().statically_known_gt)
+    monkeypatch.setattr(templates, "current_target", lambda: SimpleNamespace(is_gfx1250=True, num_cus=256))
+    template = SimpleNamespace(maybe_append_choice=lambda choices, **kw: choices.append(kw))
+    monkeypatch.setattr(templates, "gfx1250_flex_attention_template", template)
+    choices = ["stock"]
+    with V.set_graph_handler(SimpleNamespace(sizevars=sizevars)), config.patch(
+        {"triton.tlx_mode": "force", "max_autotune": False}):
+        templates.append_tlx_flex(choices, [], nodes + [object() for _ in range(6)], unmodified_subgraphs, object(), {},
+                                  2**30, 2**30)
+    assert len(choices) == 1 and choices[0] != "stock"
+    assert (choices[0]["BLOCK_M"], choices[0]["BLOCK_N"]) == expected
+
+
+@pytest.mark.parametrize("hint_method", ["optimization_hint", "size_hint"])
+@pytest.mark.parametrize("dynamic_q", [False, True])
+@pytest.mark.parametrize("dynamic_k", [False, True])
+@pytest.mark.parametrize("sequence", [1024, 4096])
+def test_flex_dynamic_shape_dispatch(monkeypatch, unmodified_subgraphs, hint_method, dynamic_q, dynamic_k, sequence):
+    import sympy
+    from types import SimpleNamespace
+    from torch._inductor.sizevars import SizeVarAllocator
     from torch._inductor.virtualized import V
     from triton.language.extra.tlx.inductor import flex_attention_templates as templates
 
     batch, length = sympy.symbols("batch length", positive=True, integer=True)
     hints = {batch: 4, length: sequence}
-    sizevars = SimpleNamespace(**{hint_method: lambda size, fallback: int(hints.get(size, size))})
-    shapes = ((batch, 16, sequence, 128), (batch, 16, length if dynamic_k else sequence, 128))
+    sizevars = SimpleNamespace(**{hint_method: lambda size, fallback: int(hints.get(size, size))},
+                               statically_known_gt=SizeVarAllocator().statically_known_gt)
+    shapes = ((batch, 16, length if dynamic_q else sequence, 128), (batch, 16, length if dynamic_k else sequence, 128))
     nodes = [
-        SimpleNamespace(get_size=lambda s=s: s, get_stride=lambda: (16 * 4096 * 128, 4096 * 128, 128, 1),
+        SimpleNamespace(get_size=lambda s=s: s, get_stride=lambda s=s: (16 * s[2] * 128, s[2] * 128, 128, 1),
                         get_dtype=lambda: torch.bfloat16) for s in (shapes[0], shapes[1], shapes[1])
     ]
     monkeypatch.setattr(templates, "current_target", lambda: SimpleNamespace(is_gfx1250=True, num_cus=256))
@@ -293,31 +375,70 @@ def test_flex_dynamic_batch_dispatch(monkeypatch, hint_method, dynamic_k, sequen
     monkeypatch.setattr(templates, "gfx1250_flex_attention_template", template)
     choices = []
     with V.set_graph_handler(SimpleNamespace(sizevars=sizevars)), config.patch({"triton.tlx_mode": "force"}):
-        templates.append_tlx_flex(choices, [], nodes + [object() for _ in range(6)], [], object(), {}, 2**30, 2**30)
+        templates.append_tlx_flex(choices, [], nodes + [object() for _ in range(6)], unmodified_subgraphs, object(), {},
+                                  2**30, 2**30)
     assert (choices[0]["BLOCK_M"], choices[0]["BLOCK_N"]) == (256, 64)
     assert choices[0]["USE_FIXED_REFERENCE"] == (not dynamic_k)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_flex_dynamic_batch_reuses_graph(runner, dtype):
+@pytest.mark.parametrize("query_length,heads,batches", [(257, 4, (2, 3)), (33, 32, (8, 9)), (64, 32, (8, 9))])
+def test_flex_dynamic_batch_reuses_graph(runner, dtype, query_length, heads, batches):
     from torch._dynamo.testing import CompileCounterWithBackend
 
     def fn(q, k, v):
-        return flex_attention(q, k, v, return_aux=AuxRequest(lse=True))
+        return flex_attention(q, k, v, return_aux=AuxRequest(lse=True),
+                              kernel_options={"FORCE_USE_FLEX_ATTENTION": True})
 
     torch._dynamo.reset()
     counter = CompileCounterWithBackend("inductor")
     compiled = torch.compile(fn, backend=counter, fullgraph=True)
     with config.patch({"triton.tlx_mode": "force", "max_autotune": False}):
-        for batch in (2, 3):
-            tensors = [torch.randn((batch, 4, length, 128), device="cuda", dtype=dtype) for length in (257, 1025, 1025)]
+        for batch in batches:
+            tensors = [
+                torch.randn((batch, heads, length, 128), device="cuda", dtype=dtype)
+                for length in (query_length, 1025, 1025)
+            ]
             for tensor in tensors:
                 torch._dynamo.mark_dynamic(tensor, 0)
-            if batch == 2:
+            if batch == batches[0]:
                 (output, aux), code = run_and_get_code(compiled, *tensors)
                 assert "tlx.async_amd_descriptor_load" in "\n".join(code)
             else:
                 output, aux = compiled(*tensors)
+            expected, lse, _ = _reference(*tensors)
+            tolerance = .005 if dtype == torch.bfloat16 else .0008
+            assert (output.double() - expected).square().mean().sqrt() < tolerance * expected.square().mean().sqrt()
+            torch.testing.assert_close(aux.lse.double(), lse, atol=1e-4, rtol=1e-4)
+    assert counter.frame_count == 1
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dynamic_length", ["q", "k", "both"])
+def test_flex_dynamic_lengths_reuse_graph(runner, dtype, dynamic_length):
+    from torch._dynamo.testing import CompileCounterWithBackend
+
+    def fn(q, k, v):
+        return flex_attention(q, k, v, return_aux=AuxRequest(lse=True),
+                              kernel_options={"FORCE_USE_FLEX_ATTENTION": True})
+
+    torch._dynamo.reset()
+    counter = CompileCounterWithBackend("inductor")
+    compiled = torch.compile(fn, backend=counter, fullgraph=True)
+    with config.patch({"triton.tlx_mode": "force", "max_autotune": False}):
+        for step in (0, 1):
+            sq = 257 + 128 * step if dynamic_length in ("q", "both") else 257
+            sk = 1025 + 512 * step if dynamic_length in ("k", "both") else 1025
+            tensors = [torch.randn((2, 4, length, 128), device="cuda", dtype=dtype) for length in (sq, sk, sk)]
+            for index, tensor in enumerate(tensors):
+                if dynamic_length == "both" or (dynamic_length == "q") == (index == 0):
+                    torch._dynamo.mark_dynamic(tensor, 2)
+            if step == 0:
+                (output, aux), code = run_and_get_code(compiled, *tensors)
+                assert "tlx.async_amd_descriptor_load" in "\n".join(code)
+            else:
+                output, aux = compiled(*tensors)
+            assert output.dtype == dtype
             expected, lse, _ = _reference(*tensors)
             tolerance = .005 if dtype == torch.bfloat16 else .0008
             assert (output.double() - expected).square().mean().sqrt() < tolerance * expected.square().mean().sqrt()

@@ -453,6 +453,19 @@ def _append_tlx_flex_amd(
                 append(conf.block_m, conf.block_n, num_warps=min(8, max(1, conf.block_m // 32)))
 
 
+def _gfx1250_fixed_reference_eligible(subgraphs):
+    from torch._inductor.ir import ComputedBuffer, InputBuffer
+    from torch._inductor.lowering import get_constant_value
+
+    if len(subgraphs) != 2 or not all(isinstance(graph, ComputedBuffer) for graph in subgraphs):
+        return False
+    score, mask = subgraphs
+    if not isinstance(score.data, InputBuffer) or score.data.get_name() != "score":
+        return False
+    constant = get_constant_value(mask.data)
+    return constant is not None and constant.value is True
+
+
 def _append_tlx_flex_gfx1250(choices, configs, input_nodes, subgraphs, layout, original_kernel_options,
                              sparse_q_block_size, sparse_kv_block_size, query, mutated_inputs):
     import sympy
@@ -466,7 +479,7 @@ def _append_tlx_flex_gfx1250(choices, configs, input_nodes, subgraphs, layout, o
         return
     if any(t.get_dtype() != query.get_dtype() or t.get_size()[-1] != 128 or t.get_stride()[-1] != 1 for t in tensors):
         return
-    if any(not isinstance(stride, (int, sympy.Integer)) or stride <= 0 for t in tensors for stride in t.get_stride()):
+    if any(not V.graph.sizevars.statically_known_gt(stride, 0) for t in tensors for stride in t.get_stride()):
         return
     base = original_kernel_options.copy()
     for name in list(base):
@@ -478,7 +491,8 @@ def _append_tlx_flex_gfx1250(choices, configs, input_nodes, subgraphs, layout, o
     batch, heads, sq, _ = query.get_size()
     sk = input_nodes[1].get_size()[2]
     static_shape = all(isinstance(size, (int, sympy.Integer)) for size in (batch, heads, sq, sk))
-    base["USE_FIXED_REFERENCE"] = isinstance(sk, (int, sympy.Integer)) and sk >= 512
+    base["USE_FIXED_REFERENCE"] = (isinstance(sk, (int, sympy.Integer)) and sk >= 512
+                                   and _gfx1250_fixed_reference_eligible(subgraphs))
     if static_shape:
         hints = tuple(map(int, (batch, heads, sq, sk)))
     else:
@@ -486,8 +500,6 @@ def _append_tlx_flex_gfx1250(choices, configs, input_nodes, subgraphs, layout, o
         hint = getattr(sizevars, "optimization_hint", None) or sizevars.size_hint
         hints = tuple(hint(size, fallback=1) for size in (batch, heads, sq, sk))
     preferred = heuristic_config(*hints, current_target().num_cus)
-    if hints[2] <= 32:
-        preferred = _CONFIGS[0]
     candidates = [preferred, *_CONFIGS] if config.max_autotune else [preferred]
     seen = set()
     for candidate in candidates:
