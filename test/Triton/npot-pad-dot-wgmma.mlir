@@ -273,3 +273,34 @@ tt.func @dot_128x128_trans_b(%pb: !tt.ptr<f16>, %n: i32, %k: i32, %s: i64) {
   %d = tt.dot %a, %b, %c : tensor<128x64xf16> * tensor<64x128xf16> -> tensor<128x128xf32>
   tt.return
 }
+
+// -----
+
+// The dot's result isn't loaded, so its C^T store predicates off duplicate
+// threads and keeps 8-element vectors: the dot stays exact.
+// W8-LABEL: @dot_128x104_trans_b_store
+// W8: tt.dot {{.*}} -> tensor<128x104xf32>
+tt.func @dot_128x104_trans_b_store(%pb: !tt.ptr<f16>, %pc: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %n: i32, %k: i32, %s: i64) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i64
+  %a = arith.constant dense<1.0> : tensor<128x64xf16>
+  %db = tt.make_tensor_descriptor %pb, [%n, %k], [%s, %c1] : !tt.ptr<f16>, !tt.tensordesc<104x64xf16>
+  %bt = tt.descriptor_load %db[%c0, %c0] : !tt.tensordesc<104x64xf16> -> tensor<104x64xf16>
+  %b = tt.trans %bt {order = array<i32: 1, 0>} : tensor<104x64xf16> -> tensor<64x104xf16>
+  %c = arith.constant dense<0.0> : tensor<128x104xf32>
+  %d = tt.dot %a, %b, %c : tensor<128x64xf16> * tensor<64x104xf16> -> tensor<128x104xf32>
+  %h = arith.truncf %d : tensor<128x104xf32> to tensor<128x104xf16>
+  %r = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
+  %r1 = tt.expand_dims %r {axis = 1 : i32} : tensor<128xi32> -> tensor<128x1xi32>
+  %rb = tt.broadcast %r1 : tensor<128x1xi32> -> tensor<128x104xi32>
+  %m = tt.make_range {end = 104 : i32, start = 0 : i32} : tensor<104xi32>
+  %m1 = tt.expand_dims %m {axis = 0 : i32} : tensor<104xi32> -> tensor<1x104xi32>
+  %stride = arith.constant dense<2560> : tensor<1x104xi32>
+  %col = arith.muli %m1, %stride : tensor<1x104xi32>
+  %cb = tt.broadcast %col : tensor<1x104xi32> -> tensor<128x104xi32>
+  %off = arith.addi %rb, %cb : tensor<128x104xi32>
+  %sc = tt.splat %pc : !tt.ptr<f16> -> tensor<128x104x!tt.ptr<f16>>
+  %ptr = tt.addptr %sc, %off : tensor<128x104x!tt.ptr<f16>>, tensor<128x104xi32>
+  tt.store %ptr, %h : tensor<128x104x!tt.ptr<f16>>
+  tt.return
+}
