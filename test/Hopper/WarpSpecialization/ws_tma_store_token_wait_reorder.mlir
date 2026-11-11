@@ -29,6 +29,38 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+// Production persistent FA has the dQ reduction loop nested inside the loop
+// carrying tt.merge_epilogue_to_computation. The inner loop must still
+// materialize TLX's wait_group(1) rotation and a final wait_group(0) drain.
+// CHECK-LABEL: nested_dq_loop_inherits_merged_epilogue
+// CHECK: scf.for
+// CHECK: scf.for
+// CHECK-NEXT: ttng.async_tma_store_wait {{.*}}pendings = 1 : i32
+// CHECK-NEXT: ttg.local_store
+// CHECK-NEXT: {{.*}} = ttng.async_tma_reduce{{.*}}
+// CHECK-NEXT: }
+// CHECK-NEXT: ttng.async_tma_store_wait {{.*}}pendings = 0 : i32
+  tt.func public @nested_dq_loop_inherits_merged_epilogue(
+      %desc: !tt.tensordesc<64x32xf32, #shared>,
+      %src: tensor<64x32xf32>,
+      %lb: index, %ub: index, %step: index, %i: i32,
+      %buf: !ttg.memdesc<64x32xf32, #shared, #smem, mutable>) {
+    scf.for %outer = %lb to %ub step %step {
+      scf.for %inner = %lb to %ub step %step {
+        ttg.local_store %src, %buf {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : tensor<64x32xf32> -> !ttg.memdesc<64x32xf32, #shared, #smem, mutable>
+        %tok = ttng.async_tma_reduce add, %desc[%i, %i] %buf {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !tt.tensordesc<64x32xf32, #shared>, !ttg.memdesc<64x32xf32, #shared, #smem, mutable> -> !ttg.async.token
+        ttng.async_tma_store_token_wait %tok {"can_rotate_by_buffer_count" = 2 : i32, "planned_pending_count" = 1 : i32, "loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !ttg.async.token
+      } {"tt.scheduled_max_stage" = 1 : i32}
+    } {"tt.merge_epilogue_to_computation"}
+    tt.return
+  }
+}
+
+// -----
+
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
