@@ -1,6 +1,6 @@
-// RUN: TRITON_ENABLE_AMD_MODULO=1 triton-opt %s -split-input-file \
+// RUN: env TRITON_ENABLE_AMD_MODULO=1 triton-opt %s -split-input-file \
 // RUN:   -tritonamdgpu-dot-decompose-and-schedule 2>&1 | FileCheck %s
-// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s -split-input-file \
+// RUN: env TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s -split-input-file \
 // RUN:   -tritonamdgpu-dot-decompose-and-schedule=mode=modulo 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=RETRY
 //

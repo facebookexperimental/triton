@@ -1,4 +1,5 @@
-// RUN: (triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-test-pipeline-lower-loop 2>&1 || true) | FileCheck %s
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-test-pipeline-lower-loop > %t 2>&1 || :
+// RUN: FileCheck %s --input-file=%t
 
 // The diagnostic below is emitted via `op.emitError()` in LowerLoops.cpp,
 // which in an assert-enabled build is immediately followed by an assert that

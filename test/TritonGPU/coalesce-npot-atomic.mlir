@@ -1,4 +1,4 @@
-// RUN: TRITON_ALLOW_NPOT=1 triton-opt %s -tritongpu-coalesce -verify-diagnostics
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -tritongpu-coalesce -verify-diagnostics
 
 // A modular layout may map multiple physical slots to one logical element.
 // Atomics must reject until lowering predicates one canonical representative;

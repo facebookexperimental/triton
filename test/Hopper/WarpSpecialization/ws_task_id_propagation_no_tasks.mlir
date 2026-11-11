@@ -1,4 +1,4 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta '--nvgpu-warp-specialization=capability=90 num-stages=3 smem-budget=200000' | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta '--nvgpu-warp-specialization=capability=90 num-stages=3 smem-budget=200000' | FileCheck %s
 
 // A while with no partition anchors has no task union. It must pass through
 // task propagation without materializing an unknown task attribute.
