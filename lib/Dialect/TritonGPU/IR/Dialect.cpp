@@ -1159,7 +1159,8 @@ getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
 
 unsigned getMixedRadixVector(MLIRContext *context, ArrayRef<int64_t> shape,
                              unsigned vector, ArrayRef<unsigned> order,
-                             int numWarps, int threadsPerWarp) {
+                             int numWarps, int threadsPerWarp,
+                             bool predicated) {
   assert(llvm::isPowerOf2_32(vector) && "vector must be a power of two");
   auto kRegister = StringAttr::get(context, "register");
   auto registers =
@@ -1175,7 +1176,8 @@ unsigned getMixedRadixVector(MLIRContext *context, ArrayRef<int64_t> shape,
   std::optional<int32_t> allowed = registers(1, {});
   if (!allowed)
     return vector;
-  while (vector > 1 && registers(vector, order) > allowed)
+  while (vector > 1 && (predicated ? !registers(vector, order)
+                                   : registers(vector, order) > allowed))
     vector /= 2;
   return vector;
 }
