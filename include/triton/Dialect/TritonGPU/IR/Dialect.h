@@ -515,8 +515,8 @@ getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
 // The widest pow2 vector up to the pow2 `vector` along order[0] whose
 // mixed-radix layout of `shape` holds no more registers than the converter's
 // layout (no vector); `vector` unchanged if `shape` has no mixed-radix layout.
-// A global store predicates off duplicate threads, so with `predicated` it
-// takes any vector whose layout exists.
+// A global store or global-to-shared async copy predicates off duplicate
+// threads, so with `predicated` it takes any vector whose layout exists.
 unsigned getMixedRadixVector(MLIRContext *context, ArrayRef<int64_t> shape,
                              unsigned vector, ArrayRef<unsigned> order,
                              int numWarps, int threadsPerWarp,
