@@ -143,6 +143,10 @@ static bool hasPaddedLowering(Operation *op) {
          !isa<DescriptorStoreLikeOpInterface>(op);
 }
 
+static bool hasFileLoc(Operation *op) {
+  return bool(op->getLoc()->findInstanceOf<FileLineColLoc>());
+}
+
 // Groups the NPOT tensors connected through their ops (a connected component
 // of the def-use graph). A connected component keeps its shape iff its ops
 // lower a mixed-radix layout without an unsupported reason and, unless one has
@@ -348,7 +352,7 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
                                        numWarps, nonKDim);
   };
   // A dot or a descriptor remarks its target reason; else a padded connected
-  // component with a dot remarks the first reason it pads, once.
+  // component remarks the first reason it pads, once.
   using Reasons = llvm::MapVector<Value, std::pair<Operation *, std::string>>;
   Reasons padReasons, slowReasons;
   auto pad = [&](Value leader, Operation *op, std::string reason) {
@@ -362,15 +366,17 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
   };
   llvm::MapVector<Value, Accesses> accesses;
   DenseMap<Value, Operation *> firstOps;
-  DenseSet<Value> seen, dots, remarked, unpaddable;
+  DenseSet<Value> seen, remarked, unpaddable;
   mod.walk([&](Operation *op) {
     SmallVector<Value> values = npotValues(op);
     if (values.empty())
       return;
     Value leader = components.getLeaderValue(values.front());
-    firstOps.try_emplace(leader, op);
-    if (isa<DotOpInterface>(op))
-      dots.insert(leader);
+    // Hoisted constants have no source line, so the first op with one anchors
+    // the total-size remark.
+    auto [first, inserted] = firstOps.try_emplace(leader, op);
+    if (!inserted && !hasFileLoc(first->second) && hasFileLoc(op))
+      first->second = op;
     if (!gpu::isMixedRadixLayoutOp(op->getName())) {
       pad(leader, op,
           llvm::formatv("NPOT mixed-radix layout is not yet supported on {0}",
@@ -420,7 +426,7 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
     if (!unpaddable.contains(leader))
       pad(leader, reason.first, reason.second);
   for (auto &[leader, reason] : padReasons)
-    if (dots.contains(leader) && !remarked.contains(leader))
+    if (!remarked.contains(leader))
       reason.first->emitRemark(reason.second);
 }
 
