@@ -13,6 +13,14 @@ def smid(_semantic=None):
                                        _semantic=_semantic)
 
 
+@core.extern
+def f32_to_e2m1x2_satfinite(hi, lo, _semantic=None):
+    """Round two float32 values to finite E2M1, with hi in the high nibble."""
+    return core.extern_elementwise("", "", [hi, lo, False], {
+        (core.float32, core.float32, core.int1): ("llvm.nvvm.ff.to.e2m1x2.rn.satfinite", core.uint16),
+    }, is_pure=True, _semantic=_semantic)
+
+
 @core.builtin
 def num_threads(_semantic=None):
     return core.constexpr(_semantic.builder.options.num_warps * 32)

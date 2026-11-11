@@ -4,7 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from kernel_test_selection import (
+from gpu_test_selection import (
     CORRECTNESS_REL,
     KernelMatchers,
     classify,

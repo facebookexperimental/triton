@@ -13,6 +13,7 @@ graft unittest
 include CMakeLists.txt
 include Makefile
 include python/build_helpers.py
+include python/meta_llvm.py
 include python/requirements.txt
 include python/test-requirements.txt
 global-exclude __pycache__

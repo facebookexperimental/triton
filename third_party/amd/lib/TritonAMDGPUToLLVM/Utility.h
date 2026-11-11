@@ -2,7 +2,6 @@
 #define TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_UTILITY_H_
 
 #include "TargetInfo.h"
-#include "TritonAMDGPUToLLVM/GCNAsmFormat.h"
 
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
@@ -13,6 +12,10 @@
 #include <cstdint>
 
 namespace mlir::LLVM::AMD {
+
+// Decode the target-independent compatibility payload accepted by Triton
+// memory operations. Target-specific cache policy attributes are rejected.
+FailureOr<triton::CacheModifier> getCacheModifier(Attribute cachePolicy);
 
 // Here is a partial definition of DppCtrl enums. For the complete definition,
 // please check:
@@ -56,8 +59,9 @@ Value llGetPid(Location loc, RewriterBase &rewriter, ModuleOp moduleOp,
 Value emitCtaMulticastMask(RewriterBase &rewriter, Location loc, Value blockId,
                            const LinearLayout &cvt, unsigned maxMaskPopcount);
 
-std::pair<bool, bool>
-getCacheModifierFlagsForLoadStore(const triton::CacheModifier &cm, MemoryOp op);
+std::pair<bool, bool> getCacheModifierFlagsForLoadStore(
+    const triton::CacheModifier &cm, MemoryOp op,
+    triton::EvictionPolicy evict = triton::EvictionPolicy::NORMAL);
 
 // Loads from shared or global memory with predication.
 // `otherElems` is used to mask out the elements that are not loaded
@@ -67,6 +71,7 @@ getCacheModifierFlagsForLoadStore(const triton::CacheModifier &cm, MemoryOp op);
 Value llLoad(RewriterBase &rewriter, Location loc, Value ptr, Type elemTy,
              Value pred, Value falseVal, Value multicastMask,
              triton::CacheModifier cm = triton::CacheModifier::NONE,
+             triton::EvictionPolicy evict = triton::EvictionPolicy::NORMAL,
              bool isVolatile = false, bool forceNoAliasAsyncLoads = false);
 
 // Stores to shared or global memory with predication.
@@ -75,6 +80,7 @@ Value llLoad(RewriterBase &rewriter, Location loc, Value ptr, Type elemTy,
 // avoid conservative waits. See `addLocalLoadNoAliasScope` for more details
 void llStore(RewriterBase &rewriter, Location loc, Value ptr, Value val,
              Value pred, triton::CacheModifier cm = triton::CacheModifier::NONE,
+             triton::EvictionPolicy evict = triton::EvictionPolicy::NORMAL,
              bool forceNoAliasAsyncLoads = false);
 
 // Get cache modifier information for creating load or store instruction
@@ -82,7 +88,8 @@ void llStore(RewriterBase &rewriter, Location loc, Value ptr, Value val,
 std::pair<bool, bool> getCacheModifierFlagsForLoadStore(LLVM::CallOp);
 // Get the cachepolicy value for a cache modifier
 int32_t
-getCtrlBitsForCacheModifierOnTarget(triton::CacheModifier, bool,
+getCtrlBitsForCacheModifierOnTarget(triton::CacheModifier,
+                                    triton::EvictionPolicy, bool,
                                     const mlir::triton::AMD::TargetInfo &);
 
 // Return a tensor of pointers with the same type of `basePtr` and the same
@@ -117,14 +124,41 @@ bool canCoalesceWriteIntoSharedMemory(MLIRContext *ctx,
                                       const LinearLayout &srcToSharedLayout,
                                       unsigned threadsPerWarp);
 
+// Splits a direct-to-LDS copy of |srcLayout| into |sharedLayout| into one
+// radix-2 copy per odd register value o, written from element
+// |slabOffsets|[o]; returns that copy's register-to-offset layout.
+FailureOr<LinearLayout> splitDirectToLdsCopy(
+    const LinearLayout &srcLayout, const LinearLayout &sharedLayout,
+    SmallVectorImpl<int32_t> &slabOffsets, std::string &reason);
+
+// Returns why a mixed-radix |srcLayout| cannot be loaded directly into
+// |dstEnc|, else sets |vectorSize| as canLoadDirectToLDS does.
+std::optional<std::string> getNpotDirectToLdsUnsupportedReason(
+    const triton::AMD::TargetInfo &targetInfo, const LinearLayout &srcLayout,
+    unsigned elemBitWidth, Attribute dstEnc, ArrayRef<int64_t> dstAllocShape,
+    unsigned &vectorSize);
+
+// The vector sizes the pointers/offsets and the mask each allow. Zero means
+// unknown, in which case no attribution is made.
+struct DirectToLdsVecInfo {
+  unsigned fromPtr = 0;
+  unsigned fromMask = 0;
+
+  bool maskIsLimiting() const { return fromPtr != 0 && fromMask < fromPtr; }
+};
+
 // Returns true if we can load directly from global |srcTy| to shared memory
 // |dstEnc| for the given target.
 // This function expects the caller to pass in |vectorSize| as the vector size
 // reading from global memory, after factoring in axis information and alignment
 // hints. It will be updated to factor in shared memory |dstEnc| constraints.
+// On failure |*failureReason|, if non-null, is set to an explanation of the
+// check that failed and how to satisfy it.
 bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
                         RankedTensorType srcTy, Attribute dstEnc,
-                        ArrayRef<int64_t> dstAllocShape, unsigned &vectorSize);
+                        ArrayRef<int64_t> dstAllocShape, unsigned &vectorSize,
+                        DirectToLdsVecInfo vecInfo = {},
+                        std::string *failureReason = nullptr);
 
 // Check if the result of this tl.dot is used as opA or opB of another tl.dot.
 bool isChainDotHead(mlir::triton::DotOpInterface dotOp, unsigned opIdx = 0);
@@ -139,12 +173,9 @@ Value convertF8ToF32_SW(RewriterBase &rewriter, Location loc, Value fp8Val,
 
 // Software implementation of converting an 8-element vector of MXFP4 elements
 // to a wider type: BF16 or FP16 for target before CDNA4.
-// for CDNA3, we have optimized sequence that can combine scale during the
-// conversion
 SmallVector<Value> upcast8xMxfp4_SW(RewriterBase &rewriter, Operation *op,
                                     bool toFp16, Value packedVec,
-                                    mlir::triton::amdgpu::ISAFamily isaFamily,
-                                    Value scale = nullptr);
+                                    mlir::triton::amdgpu::ISAFamily isaFamily);
 
 template <typename ConvertOp>
 SmallVector<Value, 4>

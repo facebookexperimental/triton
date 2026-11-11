@@ -482,8 +482,22 @@ LogicalResult Pingponger::genLocalSlice(OpBuilder &builder, Value v,
   // Each slice cannot be smaller than the smallest supported mfma width.
   if (sliceWidth < 16)
     return failure();
+  int64_t sliceKWidth = kWidth;
+  auto arch = getAMDArch(forOp->getParentOfType<ModuleOp>());
+  if (arch && arch->split(':').first == "gfx942") {
+    // A K slice must not retain a layout whose minimal K tile is wider than
+    // the slice. Otherwise the layout duplicates operands, and the small-K
+    // correction in MFMA lowering also scales the incoming accumulator of the
+    // chained dot. Limit this packing correction to the validated gfx942 path.
+    auto mfmaEncoding = cast<ttg::AMDMfmaEncodingAttr>(dotEncoding);
+    int64_t layoutK = mfmaEncoding.getInstrShapeForOperand(kWidth, opIdx)[kIdx];
+    sliceKWidth = std::min<int64_t>(kWidth, kWidth * sliceWidth / layoutK);
+    if (sliceKWidth <
+        std::max<int64_t>(32 / elementType.getIntOrFloatBitWidth(), 1))
+      return failure();
+  }
   auto dotOperandEnc = ttg::DotOperandEncodingAttr::get(
-      builder.getContext(), opIdx, dotEncoding, kWidth);
+      builder.getContext(), opIdx, dotEncoding, sliceKWidth);
   auto subviewDescType = ttg::MemDescType::get(
       shape, elementType, type.getEncoding(), type.getMemorySpace(),
       type.getMutableMemory(), type.getAllocShape());
@@ -652,13 +666,9 @@ LogicalResult Pingponger::transformTwoPPClusters(OpBuilder &builder,
   appendOp(
       ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   appendOp(gLoadOps[1]);
-  // The first cluster just fits into the two cluster pingpong and cannot
-  // include wait of the local_load inserted by the ttg.barrier, using s.barrier
-  // instead. backend will schedule the local memory fences later in the dot0
-  // cluster.
-  appendOp(ROCDL::SBarrierOp::create(builder, loc));
-  appendOp(
-      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
+  // Ensure all local loads complete before the other warp group can overwrite
+  // the shared-memory buffer for the next iteration.
+  appendClusterBarrier(builder, loc);
 
   // dot0 (1/2)
   appendOpWithPrio(builder, dotSliceOps[0], loc);

@@ -22,7 +22,7 @@ def _has_hopper():
 pytestmark = pytest.mark.skipif(not _has_hopper(), reason="Requires Hopper or newer (sm90+)")
 
 # (shape, block_shape, elem_size_bytes, host_tma_dtype)
-# host_tma_dtype: CUtensorMapDataType — 6=FLOAT16, 7=FLOAT32, 4=INT32, 5=INT64
+# host_tma_dtype: CUtensorMapDataType — 6=FLOAT16, 7=FLOAT32, 3=INT32, 5=INT64
 _CASES = [
     ((1024, ), (256, ), 4, 7),
     ((256, 512), (64, 64), 2, 6),

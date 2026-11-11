@@ -47,9 +47,7 @@ lowerTMALoad(Operation *op, RankedTensorType tensorType, Value desc,
   Value barrierAlloc =
       gpu::LocalAllocOp::create(rewriter, loc, barrierMemDescType);
   InitBarrierOp::create(rewriter, loc, barrierAlloc, 1);
-  auto shapePerCTA = getShapePerCTA(encoding, tensorType.getShape());
-  int sizeInBytes = product(shapePerCTA) *
-                    tensorType.getElementType().getIntOrFloatBitWidth() / 8;
+  int sizeInBytes = getDescriptorLoadBytes(op, tensorType, desc);
   Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
   triton::nvidia_gpu::BarrierExpectOp::create(rewriter, loc, barrierAlloc,
                                               sizeInBytes, pred);

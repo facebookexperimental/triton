@@ -19,7 +19,7 @@
 //
 // CHECK: remark: loc("dq"): reuse barrier: channel {{[0-9]+}} waits on channel {{[0-9]+}} (intra-iteration)
 // CHECK-NEXT: {{.*}}note: loc("dq"): see current operation: nvws.producer_acquire
-// CHECK-SAME: constraints = {WSBarrier = {dstTask = 3 : i32}}
+// CHECK-SAME: constraints = {WSBarrier = {dstTask = 3 : i32, guardedBufferIds = array<i32: 8>}}
 // CHECK: nvws.producer_acquire {{.*}}%dq_{{[0-9]+}}, %dq_{{[0-9]+}}
 // CHECK: nvws.producer_acquire {{.*}}%dpT_{{[0-9]+}}, %dpT_{{[0-9]+}}
 // CHECK: %dpT_{{[0-9]+}} = ttng.tc_gen5_mma

@@ -12,7 +12,9 @@ struct MembarScratchSync;
 namespace mlir::triton::AMD {
 
 // Filter function used in the AMDGPU backend to remove dependencies that do
-// not require a workgroup barrier. AsyncWait synchronization only filters the
+// not require a workgroup barrier. Two GlobalToLocalCopyTrait ops do not need
+// an ordinary workgroup barrier between them: async synchronization governs
+// their completion. AsyncWait synchronization only filters the
 // producer-to-consumer RAW edge from an async LDS write to its LocalLoad. It
 // does not filter the consumer-to-producer WAR edge when that LDS slice is
 // refilled: every workgroup consumer must release a cooperatively owned slice

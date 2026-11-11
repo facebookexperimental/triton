@@ -1,4 +1,4 @@
-// RUN: triton-opt -split-input-file --allocate-shared-memory-nv --convert-triton-gpu-to-llvm --verify-diagnostics %s | FileCheck %s
+// RUN: triton-opt -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm --verify-diagnostics %s | FileCheck %s
 
 // Verify that 2-CTA kernels can combine entry-block cross-CTA barriers with
 // local AutoWS pipeline barriers. Only entry-block barrier initialization should

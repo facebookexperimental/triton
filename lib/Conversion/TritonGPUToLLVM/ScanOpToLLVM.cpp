@@ -301,6 +301,9 @@ static void AddPartialReduceOneWarp(SmallVector<SmallVector<Value>> &srcValues,
               rewriter, loc, srcValues[srcIndex][i], laneIdLast);
       }
     } else if (numScanBlocks > 1) {
+      // The rest of the chunk needs the total of the previous blocks, not the
+      // value that already includes this chunk.
+      lastElement = accumulator;
       accumulator = srcValues[srcIndex];
     }
     for (unsigned i = 1; i < scanElementsPerThreads; ++i) {
@@ -685,6 +688,10 @@ ScanOpConversion::emitFastScan(triton::ScanOp op, triton::ScanOpAdaptor adaptor,
   unsigned nElems = triton::gpu::getUniqueElemsPerThread(
       cast<RankedTensorType>(op.getOperands()[0].getType()));
   auto srcValues = unpackInputs(loc, op, adaptor, rewriter, nElems);
+  ArrayRef<unsigned> blockedToSrc = helper.getBlockedToSrc();
+  if (!blockedToSrc.empty())
+    srcValues = llvm::map_to_vector(
+        blockedToSrc, [&](unsigned src) { return srcValues[src]; });
 
   auto ordering = op.getReductionOrderingAttr();
   bool innerTree = ordering && ordering.getValue() == "inner_tree";
@@ -772,6 +779,12 @@ ScanOpConversion::emitFastScan(triton::ScanOp op, triton::ScanOpAdaptor adaptor,
         flipSrcValues(loc, op, rewriter, targetInfo, srcValues, iWarpSize);
   }
 
+  if (!blockedToSrc.empty()) {
+    SmallVector<SmallVector<Value>> srcOrder(srcValues.size());
+    for (auto [blocked, src] : llvm::enumerate(blockedToSrc))
+      srcOrder[src] = srcValues[blocked];
+    srcValues = std::move(srcOrder);
+  }
   auto valuesTransposed = transpose(srcValues);
   for (unsigned i = 0; i < op.getNumOperands(); ++i) {
     results[i] =

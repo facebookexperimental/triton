@@ -6,6 +6,7 @@ include "mlir/IR/OpBase.td"
 def Proton_Dialect : Dialect {
   let name = "proton";
   let cppNamespace = "::mlir::triton::proton";
+  let useStrictPropertiesInAssemblyFormat = 0;
 
   let description = [{
     Proton Dialect provides core ops for building third-party compiler-based

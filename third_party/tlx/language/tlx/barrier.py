@@ -1,7 +1,7 @@
 import triton.language.core as tl
 from . import types as tlx
 from .mem_ops import remote_view
-from .utility import is_hip
+from .utility import cuda_parse_arch, is_hip
 
 
 def _physical_num_ctas(_semantic):
@@ -46,6 +46,32 @@ def cluster_barrier(_semantic=None):
         _semantic.builder.create_amd_cluster_barrier()
     else:
         _semantic.builder.create_cluster_barrier()
+
+
+@tl.builtin
+def amd_cluster_arrive(_semantic=None):
+    """Signal the AMD cluster barrier without waiting.
+
+    This does not synchronize the workgroup or fence its memory accesses.
+    Pair each arrival with :func:`amd_cluster_wait` before another arrival.
+    All threads and all CTAs in the cluster must execute the same sequence.
+    Independent computation can execute between arrival and wait.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_cluster_arrive is only supported on AMD (HIP) backends")
+    _semantic.builder.create_amd_cluster_arrive()
+
+
+@tl.builtin
+def amd_cluster_wait(_semantic=None):
+    """Wait for the preceding :func:`amd_cluster_arrive` on AMD.
+
+    This does not replace workgroup synchronization or memory completion
+    waits. Use :func:`cluster_barrier` for a full cluster synchronization.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_cluster_wait is only supported on AMD (HIP) backends")
+    _semantic.builder.create_amd_cluster_wait()
 
 
 @tl.builtin
@@ -94,6 +120,8 @@ def alloc_barriers(
         num_barriers: tl.constexpr,
         arrive_count: tl.constexpr = tl.constexpr(1),
         _semantic=None,
+        *,
+        scope: tl.constexpr = tl.constexpr("cta"),
 ) -> tlx.mbarrier:
     """
     Allocates a buffer in shared memory and initializes mbarriers with arrive counts.
@@ -101,7 +129,24 @@ def alloc_barriers(
     Input:
     - `num_barriers`: The number of barriers to allocate.
     - `arrive_count`: The number of threads that need to arrive at the barrier before it can be released.
+    - `scope`: Compile-time initialization scope, "cta" (default) or "cluster".
+      On NVIDIA sm90+, "cluster" requests compiler-owned initialization fencing
+      and a cluster rendezvous. With multiple physical CTAs, if any entry
+      barrier has cluster scope, all eligible entry barrier initializations
+      (including CTA scope) are batched
+      before TMEM allocation, followed by one fence and rendezvous. Allocate
+      these barriers unconditionally at kernel entry, before use. This does not
+      change arrival counts, storage layout, or launch dimensions, and does not
+      synchronize later pipeline phases.
+      A single physical CTA needs no cluster rendezvous. The default preserves
+      existing behavior, including legacy compiler-inserted synchronization.
     """
+
+    scope = tl._unwrap_if_constexpr(scope)
+    assert isinstance(scope, str) and scope in ("cta", "cluster"), "scope must be 'cta' or 'cluster'"
+    if scope == "cluster":
+        assert _semantic.builder.options.backend_name == "cuda", "cluster barrier scope requires NVIDIA sm90+"
+        assert cuda_parse_arch(_semantic.builder.options.arch) >= 90, "cluster barrier scope requires NVIDIA sm90+"
 
     layout, layout_handle = _make_mbarrier_layout_handle(_semantic)
     return tlx.mbarrier(
@@ -110,6 +155,7 @@ def alloc_barriers(
             arrive_count.value,
             layout_handle,
             _semantic.builder.options.num_ctas,
+            scope == "cluster",
         ),
         num_barriers,
         layout,
@@ -341,6 +387,30 @@ def amd_sched_barrier(mask: tl.constexpr = 0, _semantic=None):
     assert isinstance(mask, int), f"mask must be a constexpr integer, got {type(mask).__name__}"
     assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
     _semantic.builder.create_amd_sched_barrier(mask)
+
+
+@tl.builtin
+def amd_sched_group_barrier(mask: tl.constexpr, size: tl.constexpr, sync_id: tl.constexpr = 0, _semantic=None):
+    """Constrain the relative order of AMD instruction groups.
+
+    Markers with the same ``sync_id`` describe a sequence of groups. Each
+    group contains up to ``size`` instructions matching the LLVM AMDGPU
+    scheduling-class ``mask``; for example, 0x8 selects MFMA/WMMA and 0x100
+    selects LDS reads. Data dependencies still take precedence.
+
+    This emits ``llvm.amdgcn.sched.group.barrier`` and adds no runtime fence
+    or synchronization between waves. Do not combine it with ``amd_iglp_opt``
+    in the same scheduling region.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_sched_group_barrier is only supported on AMD (HIP) backends")
+    mask, size, sync_id = (tl._unwrap_if_constexpr(value) for value in (mask, size, sync_id))
+    for name, value in (("mask", mask), ("size", size), ("sync_id", sync_id)):
+        assert isinstance(value, int) and not isinstance(value, bool), f"{name} must be a constexpr integer"
+    assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
+    assert 0 <= size < 1 << 31, "size must be a non-negative signed 32-bit integer"
+    assert 0 <= sync_id < 1 << 31, "sync_id must be a non-negative signed 32-bit integer"
+    _semantic.builder.create_amd_sched_group_barrier(mask, size, sync_id)
 
 
 @tl.builtin

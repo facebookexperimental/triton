@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 780" role="img" aria-labelledby="title description" style="background:var(--widget-background,#ffffff)">
+  <title id="title">TLX cluster barrier initialization region</title>
+  <desc id="description">For multiple physical CTAs, all eligible entry initializations precede one initialization release fence and relaxed cluster arrive/wait, followed by TMEM setup and barrier consumers. The covered-init set prevents duplicate initialization synchronization. Worker header participation and bootstrap tags prevent duplicate WS arrivals. Application data-ready, completion, proxy ordering, and lifetime handshakes remain separate.</desc>
+  <rect width="1000" height="780" fill="var(--widget-background,#ffffff)"/>
+  <g font-family="DejaVu Sans, sans-serif" fill="var(--widget-foreground,#111827)">
+    <text x="30" y="42" font-size="25" font-weight="bold">TLX Cluster Barrier Initialization</text>
+    <text x="30" y="72" font-size="16">Explicit scope declares initialization ownership independently of consumers.</text>
+    <rect x="24" y="104" width="580" height="358" rx="8" fill="var(--widget-surface,#f3f4f6)" stroke="var(--widget-accent,#2563eb)" stroke-width="2" stroke-dasharray="7 5"/>
+    <text x="46" y="134" font-size="18" font-weight="bold">Compiler-owned entry prologue</text>
+    <text x="46" y="157" font-size="14">Unconditional, eligible entry init only; multiple physical CTAs</text>
+    <rect x="48" y="178" width="530" height="66" rx="5" fill="var(--widget-background,#ffffff)" stroke="var(--widget-border,#94a3b8)"/>
+    <text x="313" y="204" font-size="18" text-anchor="middle">All eligible entry mbarrier.init operations</text>
+    <text x="313" y="227" font-size="14" text-anchor="middle">Includes CTA/default scope; safe dependencies hoisted</text>
+    <rect x="48" y="278" width="530" height="66" rx="5" fill="var(--widget-background,#ffffff)" stroke="var(--widget-border,#94a3b8)"/>
+    <text x="313" y="304" font-size="18" text-anchor="middle">One initialization release fence</text>
+    <text x="313" y="327" font-size="14" text-anchor="middle">fence.mbarrier_init.release.cluster</text>
+    <rect x="48" y="378" width="530" height="66" rx="5" fill="var(--widget-background,#ffffff)" stroke="var(--widget-border,#94a3b8)"/>
+    <text x="313" y="404" font-size="18" text-anchor="middle">One relaxed cluster arrive / wait sequence</text>
+    <text x="313" y="427" font-size="14" text-anchor="middle">Remote use cannot precede the owner's initialization</text>
+    <rect x="48" y="502" width="530" height="66" rx="5" fill="var(--widget-surface,#f3f4f6)" stroke="var(--widget-border,#94a3b8)"/>
+    <text x="313" y="528" font-size="18" text-anchor="middle">TMEM allocation / setup</text>
+    <text x="313" y="551" font-size="14" text-anchor="middle">Entry transformation precedes allocation analysis</text>
+    <rect x="48" y="608" width="530" height="66" rx="5" fill="var(--widget-surface,#f3f4f6)" stroke="var(--widget-border,#94a3b8)"/>
+    <text x="313" y="634" font-size="18" text-anchor="middle">Barrier consumers and application pipeline</text>
+    <text x="313" y="657" font-size="14" text-anchor="middle">Consumers may execute inside loops or WS tasks</text>
+    <g stroke="var(--widget-muted,#64748b)" stroke-width="2">
+      <line x1="313" y1="246" x2="313" y2="267"/>
+      <line x1="313" y1="346" x2="313" y2="367"/>
+      <line x1="313" y1="446" x2="313" y2="491"/>
+      <line x1="313" y1="570" x2="313" y2="597"/>
+    </g>
+    <g fill="var(--widget-muted,#64748b)">
+      <polygon points="307,265 319,265 313,275"/>
+      <polygon points="307,365 319,365 313,375"/>
+      <polygon points="307,489 319,489 313,499"/>
+      <polygon points="307,595 319,595 313,605"/>
+    </g>
+    <rect x="632" y="104" width="342" height="194" rx="6" fill="var(--widget-surface,#f3f4f6)" stroke="var(--widget-border,#94a3b8)"/>
+    <text x="651" y="135" font-size="18" font-weight="bold">Upstream-derived integration</text>
+    <text x="651" y="165" font-size="15">Reuse existing NVIDIA IR / lowering.</text>
+    <text x="651" y="195" font-size="15">Pass the exact coveredInitOps set</text>
+    <text x="651" y="218" font-size="15">to later initialization analysis.</text>
+    <text x="651" y="248" font-size="15">Skip only this protected batch;</text>
+    <text x="651" y="271" font-size="15">other initialization stays active.</text>
+    <rect x="632" y="324" width="342" height="194" rx="6" fill="var(--widget-surface,#f3f4f6)" stroke="var(--widget-border,#94a3b8)"/>
+    <text x="651" y="355" font-size="18" font-weight="bold">WS bootstrap participation</text>
+    <text x="651" y="385" font-size="15">Workers arrive once in the header.</text>
+    <text x="651" y="415" font-size="15">Default warps run init / fence /</text>
+    <text x="651" y="438" font-size="15">arrive / wait; no extra worker wait.</text>
+    <text x="651" y="468" font-size="15">Bootstrap tags bypass ordinary</text>
+    <text x="651" y="491" font-size="15">synthetic WS wrapping.</text>
+    <rect x="632" y="544" width="342" height="130" rx="6" fill="var(--widget-surface,#f3f4f6)" stroke="var(--widget-border,#94a3b8)"/>
+    <text x="651" y="575" font-size="18" font-weight="bold">Application still owns</text>
+    <text x="651" y="605" font-size="15">Data-ready / expected-byte publication,</text>
+    <text x="651" y="628" font-size="15">completion, proxy ordering, and</text>
+    <text x="651" y="651" font-size="15">remote shared-memory lifetime.</text>
+    <text x="30" y="720" font-size="15">A single physical CTA needs no cluster rendezvous. Scope does not change storage or launch dimensions.</text>
+    <text x="30" y="749" font-size="15">Initialization is not a later pipeline-phase or asynchronous completion synchronization point.</text>
+  </g>
+</svg>

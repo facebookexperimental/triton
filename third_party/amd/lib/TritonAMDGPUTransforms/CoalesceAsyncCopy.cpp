@@ -54,11 +54,13 @@ decomposeAsyncCopyToSync(ttg::AsyncCopyGlobalToLocalOp copyOp,
   // Synchronous global load into registers.
   Value loaded;
   if (mask)
-    loaded = triton::LoadOp::create(rewriter, loc, src, mask, copyOp.getCache(),
-                                    copyOp.getEvict(), copyOp.getIsVolatile());
+    loaded = triton::LoadOp::create(rewriter, loc, src, mask, Value(),
+                                    copyOp.getCachePolicyAttr(),
+                                    copyOp.getIsVolatile());
   else
-    loaded = triton::LoadOp::create(rewriter, loc, src, copyOp.getCache(),
-                                    copyOp.getEvict(), copyOp.getIsVolatile());
+    loaded = triton::LoadOp::create(rewriter, loc, src, Value(), Value(),
+                                    copyOp.getCachePolicyAttr(),
+                                    copyOp.getIsVolatile());
 
   // Preserve `other` (the fill value for masked-out lanes); a masked tt.load
   // leaves those lanes undefined, so select them explicitly.
@@ -94,6 +96,18 @@ decomposeAsyncCopyToSync(ttg::AsyncCopyGlobalToLocalOp copyOp,
   rewriter.eraseOp(copyOp);
   return success();
 }
+
+struct DecomposeVolatileAsyncCopy
+    : public OpRewritePattern<ttg::AsyncCopyGlobalToLocalOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ttg::AsyncCopyGlobalToLocalOp copyOp,
+                                PatternRewriter &rewriter) const override {
+    if (!copyOp.getIsVolatile())
+      return rewriter.notifyMatchFailure(copyOp, "not a volatile copy");
+    return decomposeAsyncCopyToSync(copyOp, rewriter);
+  }
+};
 
 // Retarget the simple local_alloc -> memdesc_index* view graph used by explicit
 // TLX async loads.  Changing the shared order is semantics-preserving: memdesc
@@ -417,11 +431,18 @@ public:
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
+    MLIRContext *context = &getContext();
+
+    RewritePatternSet volatilePatterns(context);
+    volatilePatterns.add<DecomposeVolatileAsyncCopy>(context);
+    if (applyPatternsGreedily(m, std::move(volatilePatterns)).failed())
+      return signalPassFailure();
+
     triton::AMD::TargetInfo targetInfo(gfxArch);
 
     if (!llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4},
                             targetInfo.getISAFamily()))
-      return; // This pass is CDNA3 and CDNA4 specific.
+      return; // Coalescing below is CDNA3 and CDNA4 specific.
 
     if (!useAsyncCopy) {
       bool hasAsyncCopy = m->walk([](ttg::AsyncCopyGlobalToLocalOp) {
@@ -431,7 +452,6 @@ public:
         return;
     }
 
-    MLIRContext *context = &getContext();
     mlir::RewritePatternSet patterns(context);
 
     // Precompute the contiguity of all AsyncCopy ops based on the src and

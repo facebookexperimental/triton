@@ -83,7 +83,7 @@ export TORCHINDUCTOR_COMPILE_THREADS=1
 
 set -- "${ARGS[@]+"${ARGS[@]}"}"
 if [ "$PERF" = 1 ]; then
-  exec "$PY" -m pytest -p no:cacheprovider "$BENCH" -k "$PERF_FILTER" "$@" -v
+  exec "$PY" -m pytest -p no:cacheprovider --import-mode=importlib "$BENCH" -k "$PERF_FILTER" "$@" -v
 fi
 
 # Keep the architecture-specific GPU suite in a fresh CUDA process. Fatal
