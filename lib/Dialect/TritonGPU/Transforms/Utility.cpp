@@ -245,6 +245,33 @@ bool isView(Operation *op) {
   return isa<ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp>(op);
 }
 
+bool isMemDescView(Operation *op) {
+  return op && op->hasTrait<OpTrait::MemDescViewTrait>() &&
+         !isa<ttng::MapToRemoteBufferOp>(op);
+}
+
+Value getMemDescRoot(Value v) {
+  while (Operation *def = v.getDefiningOp()) {
+    if (!isMemDescView(def))
+      break;
+    v = def->getOperand(0);
+  }
+  return v;
+}
+
+ttg::MemDescIndexOp getMemDescBufferIndex(Value v) {
+  while (Operation *def = v.getDefiningOp()) {
+    // Checked before isMemDescView: memdesc_index carries MemDescViewTrait
+    // too, and crossing it would lose the buffer array being looked for.
+    if (auto idxOp = dyn_cast<ttg::MemDescIndexOp>(def))
+      return idxOp;
+    if (!isMemDescView(def))
+      break;
+    v = def->getOperand(0);
+  }
+  return {};
+}
+
 bool isNoop(Operation *op) {
   if (isa<ReshapeOp, TransOp>(op))
     return true;

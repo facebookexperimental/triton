@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=2 smem-budget=232448" | FileCheck %s
+// RUN: sed -e '/^    scf.for %%start_n = %%c0_i32 to %%seq_len_kv step %%c64_i32/c\    %%outer = scf.while (%%start_n_arg = %%c0_i32) : (i32) -> i32 {\n      %%outer_keep = arith.cmpi slt, %%start_n_arg, %%seq_len_kv : i32\n      scf.condition(%%outer_keep) %%start_n_arg : i32\n    } do {\n    ^bb0(%%start_n: i32):' -e '/^    } loc(#loc61)/c\      %%next_start_n = arith.addi %%start_n, %%c64_i32 : i32\n      scf.yield %%next_start_n : i32\n    } loc(#loc61)' %s | triton-opt - --nvgpu-warp-specialization="capability=100 num-stages=2 smem-budget=232448" | FileCheck %s --check-prefix=WHILE
 
 // HSTU cross-attention backward reduce_dq (meta warp specialization).
 //
@@ -27,6 +28,17 @@
 // CHECK-SAME:   %true
 // CHECK-SAME:   opndB,smem,1,8
 // CHECK-SAME:   opndD,tmem,1,11
+
+// The same release rule is required when the producer is carried by a
+// persistent scf.while rather than an scf.for.
+// WHILE-LABEL: @_hstu_attn_bwd_redq
+// WHILE:      arith.addi
+// WHILE:      [[WHILE_LAST:%[0-9]+]] = arith.cmpi sge
+// WHILE:      ttng.tc_gen5_mma
+// WHILE-SAME:   {{\[}}[[WHILE_LAST]]{{\]}}
+// WHILE-SAME:   %true
+// WHILE-SAME:   opndB,smem,1,8
+// WHILE-SAME:   opndD,tmem,1,11
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
