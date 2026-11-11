@@ -494,6 +494,8 @@ def profiler_regression_diagnostics(
             baseline_evaluation
         ) and _benchmark_uses_native_profiler(evaluation):
             continue
+        if _same_selected_heuristic_config(baseline_evaluation, evaluation):
+            continue
         diagnostic = native_profiler_regression_diagnostic(
             baseline_evaluation.profile,
             evaluation.profile,
@@ -501,6 +503,13 @@ def profiler_regression_diagnostics(
         if diagnostic:
             diagnostics.append(f"{evaluation.case_id}: {diagnostic}")
     return "; ".join(diagnostics)
+
+
+def _same_selected_heuristic_config(baseline: CaseEvaluation, candidate: CaseEvaluation) -> bool:
+    # Tuning candidates edit only heuristic_config, so an unchanged selection launches the same kernel;
+    # measured on gfx942, its rocprofv3 run-to-run noise exceeds the 1% gate.
+    selected = baseline.profile.get("heuristic_config")
+    return bool(selected) and selected == candidate.profile.get("heuristic_config")
 
 
 def _benchmark_uses_native_profiler(evaluation: CaseEvaluation) -> bool:

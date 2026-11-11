@@ -9,6 +9,8 @@
 #include <string>
 
 namespace mlir::triton::AMD {
+void registerTargetInfo();
+
 class TargetInfo : public mlir::triton::TargetInfoBase {
 public:
   explicit TargetInfo(std::optional<StringRef> arch) : targetFeatures(arch) {}
@@ -42,6 +44,13 @@ public:
   Value getGlobalTimer(RewriterBase &rewriter, Location loc) const override;
 
   StringRef getAtomicSyncScope(MemSyncScope scope) const override;
+
+  Value loadRelaxed(RewriterBase &rewriter, Location loc, Value ptr,
+                    Type valueTy, Value pred,
+                    MemSyncScope scope) const override;
+
+  void storeRelaxed(RewriterBase &rewriter, Location loc, Value ptr,
+                    Value value, Value pred, MemSyncScope scope) const override;
 
   void barrier(Location loc, RewriterBase &rewriter,
                triton::gpu::AddrSpace targets) const override;
@@ -85,9 +94,9 @@ public:
 
   bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
                   triton::ReduceOp op, unsigned numLaneToReduce,
-                  unsigned interleave) const override;
-
-  std::string getMulhiFuncName(Type resultElementTy) const override;
+                  unsigned interleave,
+                  std::optional<unsigned> broadcastLaneIdMask =
+                      std::nullopt) const override;
 
   void printf(RewriterBase &rewriter, Value formatStrStart,
               int formatStrByteCount, ValueRange args,
@@ -143,21 +152,20 @@ public:
   // type restrictions for BUFFER_ATOMIC_ADD_{F32,F64} and
   // BUFFER_ATOMIC_PK_ADD_{F16,BF16}:
   //   - CDNA3 (gfx942): no BUFFER_ATOMIC_PK_ADD_BF16
+  //   - RDNA3: BUFFER_ATOMIC_ADD_F32 only
   //   - RDNA4: no BUFFER_ATOMIC_ADD_F64
   //   - CDNA4, GFX1250: all float types supported (GFX1250 adds PK_ADD_BF16)
   bool supportsBufferAtomicFadd(mlir::Type elementType) const;
   // Returns the cache policy (cpol) immediate for buffer atomic instructions.
   // When hasUsers is true, sets SC0/TH_ATOMIC_RETURN to return pre-op value.
-  // On gfx1250, also sets SCOPE_DEV for device-wide visibility.
-  int32_t getBufferAtomicCachePolicy(bool hasUsers) const;
+  // On gfx1250, defaults to SCOPE_DEV; clusterScope opts into SCOPE_SE.
+  int32_t getBufferAtomicCachePolicy(bool hasUsers, bool clusterScope) const;
 
   bool supportsWaveId() const;
   bool supportsPermlaneSwap() const;
   bool supportsCvtPkScalePk8() const;
   bool supportsHwScaledUpcast() const;
-
-  void localLoadOpAnnotation(triton::gpu::LocalLoadOp localLoadOp,
-                             Operation *llLoadOp) const override;
+  bool supportsHwScaledDowncast() const;
 
   // Returns the hardware-specific tiles for shared memory loads and stores.
   // The returned pair is in the format {LoadTile, StoreTile}.

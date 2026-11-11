@@ -55,6 +55,29 @@ triton::gpu::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
     triton::gpu::TensorOrMemDesc srcTy, ArrayRef<unsigned> sharedOrder,
     bool useAsyncCopy, unsigned warpSize);
 
+namespace mlir::triton::AMD {
+class TargetInfo;
+} // namespace mlir::triton::AMD
+
+// The shared memory order the pipeliner gives a load of `srcTy`.
+SmallVector<unsigned>
+getLoadSharedOrder(triton::gpu::TensorOrMemDesc srcTy,
+                   const triton::AMD::TargetInfo &targetInfo,
+                   bool useAsyncCopy);
+
+// The shared encoding the pipeliner gives a load of `srcTy` in `order` that
+// feeds `dotOpEnc`.
+triton::gpu::SharedEncodingTrait getDotOperandSharedEncoding(
+    const triton::amdgpu::TargetFeatures &targetFeatures,
+    triton::gpu::TensorOrMemDesc srcTy, ArrayRef<unsigned> order,
+    triton::gpu::DotOperandEncodingAttr dotOpEnc, bool canUseAsyncCopy);
+
+// Whether the pipeliner's direct-to-LDS copy of pointer tensor `srcTy` into
+// `sharedEnc` lowers.
+bool canLoadDirectToLdsInPipeline(RankedTensorType srcTy,
+                                  triton::gpu::SharedEncodingTrait sharedEnc,
+                                  const triton::AMD::TargetInfo &targetInfo);
+
 triton::gpu::SharedEncodingTrait
 getEncodingFromDescriptor(Operation *op, RankedTensorType tensorType,
                           Value desc);

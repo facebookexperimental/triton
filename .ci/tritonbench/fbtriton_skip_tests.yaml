@@ -127,3 +127,18 @@ jsd:
   report: true
   disabled_devices:
     - hip
+# limit the test ops to save CI resources
+bf16xint16_gemm:
+cross_entropy:
+gdn_fwd_h:
+geglu:
+int4_gemm:
+inductor_softmax_fused:
+softmax:
+sum:
+vector_add:
+moe_fused_mul_sum:
+mamba2_chunk_scan:
+mamba2_chunk_state:
+low_mem_dropout:
+kl_div:

@@ -16,7 +16,14 @@ struct EncodingInfo;
 CGAEncodingAttr updateCGALayoutForShape(CGAEncodingAttr cgaLayout,
                                         ArrayRef<int64_t> shape);
 
-/// Update shared encoding given a new shape
+/// Whether a tile of the given shape splits into whole pieces of a
+/// partitioned shared encoding.
+bool isPartitionedEncodingCompatibleWithShape(
+    PartitionedSharedEncodingAttr encoding, ArrayRef<int64_t> shape);
+
+/// Update shared encoding given a new shape. A partitioned encoding must be
+/// compatible with the new shape (see
+/// isPartitionedEncodingCompatibleWithShape).
 SharedEncodingTrait updateEncodingForShape(Operation *op,
                                            SharedEncodingTrait encoding,
                                            RankedTensorType tensorType);

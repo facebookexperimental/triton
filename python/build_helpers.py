@@ -18,7 +18,15 @@ import zipfile
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import meta_llvm
+else:
+    try:
+        import meta_llvm
+    except ImportError:  # run as a package (e.g. setup.py imports python.build_helpers)
+        from python import meta_llvm
 
 
 def get_base_dir():
@@ -72,6 +80,42 @@ def _normalize_optional(value: str) -> Optional[str]:
 # Taken from https://github.com/pytorch/pytorch/blob/master/tools/setup_helpers/env.py
 def check_env_flag(name: str, default: str = "") -> bool:
     return os.getenv(name, default).upper() in ["ON", "1", "YES", "TRUE", "Y"]
+
+
+def find_therock_rocm_include_dir() -> Optional[str]:
+    """Find the ROCm include directory from a TheRock Python installation.
+
+    `rocm-sdk path --root` is the public CLI for locating the expanded devel
+    package. It also initializes that package on first use, so callers do not
+    need to run `rocm-sdk init` separately.
+    """
+    rocm_sdk = Path(sys.executable).with_name("rocm-sdk")
+    if not rocm_sdk.is_file():
+        found_sdk = shutil.which("rocm-sdk")
+        if found_sdk is None:
+            return None
+        rocm_sdk = Path(found_sdk)
+    try:
+        # Run the caller venv's rocm-sdk entry point in isolated mode so pip's
+        # temporary PEP 517 import path cannot shadow its installed packages.
+        root = subprocess.check_output(
+            [sys.executable, "-I", str(rocm_sdk), "path", "--root"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    if not root:
+        return None
+
+    include_dir = Path(root) / "include"
+    required_headers = [
+        include_dir / "hip" / "hip_runtime.h",
+        include_dir / "rocprofiler-sdk" / "fwd.h",
+    ]
+    if not all(header.is_file() for header in required_headers):
+        return None
+    return str(include_dir)
 
 
 def _normalize_optional_path(value: str) -> Optional[str]:
@@ -286,6 +330,32 @@ def update_symlink(link_path, source_path):
 # --- third party packages -----
 
 
+@dataclass(frozen=True)
+class DependencyArchive:
+    source_url: str
+    mirror_path: str
+    sha256sum: Optional[str] = None
+
+    @property
+    def filename(self):
+        return self.mirror_path.rsplit("/", 1)[-1]
+
+    @property
+    def url(self):
+        # Prefer OAI-internal blobstore, if available. Never fall back to public
+        # storage after a mirror failure.
+        base = os.environ.get("OAIARTIFACTS_BASE_URL", "").rstrip("/")
+        if not base:
+            return self.source_url
+        parsed = urllib.parse.urlsplit(base)
+        if (parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username is not None
+                or parsed.password is not None or parsed.query or parsed.fragment
+                or not parsed.path.endswith("/oaiartifacts")):
+            raise ValueError("OAIARTIFACTS_BASE_URL must be an HTTP(S) URL ending in /oaiartifacts")
+        base = base.removesuffix("/oaiartifacts")
+        return f"{base}/{self.mirror_path}"
+
+
 @dataclass
 class Package:
     package: str
@@ -298,12 +368,28 @@ class Package:
     sha256sum: Optional[str] = None
 
 
-def get_json_package_info():
+def get_json_archive():
     json_version_path = os.path.join(get_base_dir(), "cmake", "json-version.txt")
     with open(json_version_path, "r") as json_version_file:
         version = json_version_file.read().strip()
-    url = f"https://github.com/nlohmann/json/releases/download/{version}/include.zip"
-    return Package("json", "", url, "JSON_INCLUDE_DIR", "", "JSON_SYSPATH")
+    return DependencyArchive(f"https://github.com/nlohmann/json/releases/download/{version}/include.zip",
+                             f"oaiartifacts/wheels/triton_wheel/json/json-{version}-include.zip")
+
+
+def get_json_package_info():
+    return Package("json", "", get_json_archive().url, "JSON_INCLUDE_DIR", "", "JSON_SYSPATH")
+
+
+def get_llvm_archive(system_suffix, llvm_info=None):
+    if llvm_info is None:
+        llvm_info_path = os.path.join(get_base_dir(), "cmake", "llvm-info.json")
+        with open(llvm_info_path, "r") as llvm_info_file:
+            llvm_info = json.load(llvm_info_file)
+    rev = llvm_info["llvm_hash"][:8]
+    build_number = llvm_info["build_number"]
+    filename = f"llvm-{rev}-{system_suffix}-{build_number}.tar.gz"
+    return DependencyArchive(f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{filename}",
+                             f"triton-llvm/{filename}", llvm_info["sha256sum"][system_suffix])
 
 
 def is_linux_os(os_id):
@@ -331,8 +417,8 @@ def get_llvm_system_suffix(helper_args: BuildHelperArgs):
             system_suffix = "ubuntu-arm64"
         elif arch == "x64":
             vglibc = tuple(map(int, platform.libc_ver()[1].split(".")))
-            vglibc = vglibc[0] * 100 + vglibc[1]
-            if vglibc > 228:
+            vglibc_num = vglibc[0] * 100 + vglibc[1]
+            if vglibc_num > 228:
                 # Ubuntu 24 LTS (v2.39)
                 # Ubuntu 22 LTS (v2.35)
                 # Ubuntu 20 LTS (v2.31)
@@ -355,28 +441,25 @@ def get_llvm_system_suffix(helper_args: BuildHelperArgs):
 
 
 def get_llvm_package_info(helper_args: BuildHelperArgs):
+    if meta_llvm.enabled(get_base_dir()):
+        return meta_llvm.llvm_package(helper_args)
     system_suffix = get_llvm_system_suffix(helper_args)
     if system_suffix is None:
         return Package("llvm", "LLVM-C.lib", "", "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
-    llvm_info_path = os.path.join(get_base_dir(), "cmake", "llvm-info.json")
-    with open(llvm_info_path, "r") as llvm_info_file:
-        llvm_info = json.load(llvm_info_file)
-    rev = llvm_info["llvm_hash"][:8]
-    build_number = llvm_info["build_number"]
-    name = f"llvm-{rev}-{system_suffix}-{build_number}"
+    archive = get_llvm_archive(system_suffix)
+    name = archive.filename.removesuffix(".tar.gz")
     # Create a stable symlink that doesn't include revision
     sym_name = f"llvm-{system_suffix}"
-    url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
-    sha256sum = llvm_info["sha256sum"][system_suffix]
+
     return Package(
         "llvm",
         name,
-        url,
+        archive.url,
         "LLVM_INCLUDE_DIRS",
         "LLVM_LIBRARY_DIR",
         "LLVM_SYSPATH",
         sym_name=sym_name,
-        sha256sum=sha256sum,
+        sha256sum=archive.sha256sum,
     )
 
 
@@ -392,15 +475,19 @@ def get_amd_codegen_package_info(helper_args: BuildHelperArgs):
     revision = amd_llvm_info["llvm_hash"][:8]
     build_number = amd_llvm_info["build_number"]
     name = f"amd-codegen-{revision}-{system_suffix}-{build_number}"
-    url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
+    archive = DependencyArchive(
+        f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz",
+        f"triton-llvm/{name}.tar.gz",
+        amd_llvm_info.get("sha256sum", {}).get(system_suffix),
+    )
     return Package(
         "amd",
         name,
-        url,
+        archive.url,
         "",
         "",
         "",
-        sha256sum=amd_llvm_info.get("sha256sum", {}).get(system_suffix),
+        sha256sum=archive.sha256sum,
     )
 
 
@@ -428,13 +515,7 @@ def _get_thirdparty_package_cmake_vars(package: Package, helper_args: BuildHelpe
     if helper_args.offline_build and not input_defined:
         raise RuntimeError(f"Requested an offline build but {package.syspath_var_name} is not set")
     if not helper_args.offline_build and not input_defined and not input_compatible:
-        _download_and_extract(
-            package.url,
-            package_root_dir,
-            package.name,
-            helper_args.archives_path,
-            package.sha256sum,
-        )
+        _download_and_extract(package.url, package_root_dir, package.name, helper_args.archives_path, package.sha256sum)
         # write version url to package_dir
         with open(os.path.join(package_dir, "version.txt"), "w") as file:
             file.write(package.url)
@@ -511,8 +592,8 @@ def download_codegen_llvm(backend: str, llvm_info: dict, helper_args: BuildHelpe
     if not os.path.isfile(llvm_config):
         if helper_args.offline_build:
             raise RuntimeError(f"Requested an offline build but {backend} bootstrap LLVM is missing from {llvm_path}")
-        url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
-        _download_and_extract(url, package_root, name, helper_args.archives_path, checksum)
+        archive = get_llvm_archive(system_suffix, {**bootstrap, "llvm_hash": llvm_info["llvm_hash"]})
+        _download_and_extract(archive.url, package_root, name, helper_args.archives_path, archive.sha256sum)
     if not os.path.isfile(llvm_config):
         raise RuntimeError(f"Cannot find independently pinned {backend} LLVM configuration at {llvm_config}")
     return llvm_path
@@ -541,6 +622,9 @@ def build_amd_codegen(amd_llvm_info: dict, helper_args: BuildHelperArgs):
         f"-DTRITON_AMD_LLVM_REVISION={revision}",
         "-DCMAKE_BUILD_TYPE=Release",
     ]
+    ninja_path = shutil.which("ninja")
+    if ninja_path is not None:
+        command.append(f"-DCMAKE_MAKE_PROGRAM={ninja_path}")
     if sys.platform != "win32":
         clang = os.path.join(llvm_path, "bin", "clang")
         clangxx = os.path.join(llvm_path, "bin", "clang++")
@@ -571,6 +655,8 @@ def download_and_copy_amd_codegen(helper_args: BuildHelperArgs):
         return
 
     library = amd_codegen_library_name()
+    if meta_llvm.enabled(get_base_dir()):
+        return meta_llvm.copy_amd_codegen(helper_args, library)
     amd_llvm_info_path = os.path.join(get_base_dir(), "cmake", "amd-llvm-info.json")
     with open(amd_llvm_info_path, "r") as amd_llvm_info_file:
         amd_llvm_info = json.load(amd_llvm_info_file)
@@ -624,9 +710,9 @@ def download_and_copy(name, src_func, dst_path, override_path, version, url_func
     download = not os.path.exists(src_path)
     if os.path.exists(dst_path) and system == "Linux" and shutil.which(dst_path) is not None:
         curr_version = subprocess.check_output([dst_path, "--version"]).decode("utf-8").strip()
-        curr_version = re.search(r"V([.|\d]+)", curr_version)
-        assert curr_version is not None, f"No version information for {dst_path}"
-        download = download or curr_version.group(1) != version
+        version_match = re.search(r"V([.|\d]+)", curr_version)
+        assert version_match is not None, f"No version information for {dst_path}"
+        download = download or version_match.group(1) != version
     if download:
         _download_and_extract(url, tmp_path, name, helper_args.archives_path)
     os.makedirs(os.path.split(dst_path)[0], exist_ok=True)
@@ -638,109 +724,119 @@ def download_and_copy(name, src_func, dst_path, override_path, version, url_func
         shutil.copy(src_path, dst_path)
 
 
-def download_and_copy_dependencies(helper_args: BuildHelperArgs):
-    download_and_copy_amd_codegen(helper_args)
+@dataclass(frozen=True)
+class NvidiaToolchainPackage:
+    name: str
+    component: str
+    version: str
+    src_path: str
+    dst_path: str
+    override_attr: str
+
+    def archive(self, system, arch):
+        filename = f"{self.component}-{system}-{arch}-{self.version}-archive.tar.xz"
+        path = f"{self.component}/{system}-{arch}/{filename}"
+        url = f"https://developer.download.nvidia.com/compute/cuda/redist/{path}"
+        return DependencyArchive(url, f"nvidia-cuda-redist/{path}")
+
+
+def get_nvidia_toolchain_packages():
     nvidia_version_path = os.path.join(get_base_dir(), "cmake", "nvidia-toolchain-version.json")
     with open(nvidia_version_path, "r") as nvidia_version_file:
-        # parse this json file to get the version of the nvidia toolchain
-        nvidia_toolchain_version = json.load(nvidia_version_file)
+        versions = json.load(nvidia_version_file)
+    exe = sysconfig.get_config_var("EXE")
+    crt = "cuda_crt" if int(versions["cudacrt"].split(".")[0]) >= 13 else "cuda_nvcc"
+    return [
+        NvidiaToolchainPackage(
+            name="nvcc",
+            component="cuda_nvcc",
+            version=versions["ptxas"],
+            src_path=f"bin/ptxas{exe}",
+            dst_path="bin/ptxas",
+            override_attr="ptxas_path",
+        ),
+        # Blackwell needs a separate ptxas because this version has Hopper bugs.
+        NvidiaToolchainPackage(
+            name="nvcc-blackwell",
+            component="cuda_nvcc",
+            version=versions["ptxas-blackwell"],
+            src_path=f"bin/ptxas{exe}",
+            dst_path="bin/ptxas-blackwell",
+            override_attr="ptxas_blackwell_path",
+        ),
+        NvidiaToolchainPackage(
+            name="cuobjdump",
+            component="cuda_cuobjdump",
+            version=versions["cuobjdump"],
+            src_path=f"bin/cuobjdump{exe}",
+            dst_path="bin/cuobjdump",
+            override_attr="cuobjdump_path",
+        ),
+        NvidiaToolchainPackage(
+            name="nvdisasm",
+            component="cuda_nvdisasm",
+            version=versions["nvdisasm"],
+            src_path=f"bin/nvdisasm{exe}",
+            dst_path="bin/nvdisasm",
+            override_attr="nvdisasm_path",
+        ),
+        NvidiaToolchainPackage(
+            name="nvcc-crt",
+            component=crt,
+            version=versions["cudacrt"],
+            src_path="include",
+            dst_path="include",
+            override_attr="cudacrt_path",
+        ),
+        NvidiaToolchainPackage(
+            name="cudart",
+            component="cuda_cudart",
+            version=versions["cudart"],
+            src_path="include",
+            dst_path="include",
+            override_attr="cudart_path",
+        ),
+        NvidiaToolchainPackage(
+            name="cupti",
+            component="cuda_cupti",
+            version=versions["cupti"],
+            src_path="include",
+            dst_path="include",
+            override_attr="cupti_include_path",
+        ),
+        NvidiaToolchainPackage(
+            name="cupti",
+            component="cuda_cupti",
+            version=versions["cupti"],
+            src_path="lib",
+            dst_path="lib/cupti",
+            override_attr="cupti_lib_path",
+        ),
+        NvidiaToolchainPackage(
+            name="cupti-blackwell",
+            component="cuda_cupti",
+            version=versions["cupti-blackwell"],
+            src_path="lib",
+            dst_path="lib/cupti-blackwell",
+            override_attr="cupti_lib_blackwell_path",
+        ),
+    ]
 
-    exe_extension = sysconfig.get_config_var("EXE")
-    download_and_copy(
-        name="nvcc",
-        src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas{exe_extension}",
-        dst_path="bin/ptxas",
-        override_path=helper_args.ptxas_path,
-        version=nvidia_toolchain_version["ptxas"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
 
-    # We download a separate ptxas for blackwell, since there are some bugs when using it for hopper
-    download_and_copy(
-        name="nvcc-blackwell",
-        src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas{exe_extension}",
-        dst_path="bin/ptxas-blackwell",
-        override_path=helper_args.ptxas_blackwell_path,
-        version=nvidia_toolchain_version["ptxas-blackwell"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    download_and_copy(
-        name="cuobjdump",
-        src_func=lambda system, arch, version:
-        f"cuda_cuobjdump-{system}-{arch}-{version}-archive/bin/cuobjdump{exe_extension}",
-        dst_path="bin/cuobjdump",
-        override_path=helper_args.cuobjdump_path,
-        version=nvidia_toolchain_version["cuobjdump"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cuobjdump/{system}-{arch}/cuda_cuobjdump-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    download_and_copy(
-        name="nvdisasm",
-        src_func=lambda system, arch, version:
-        f"cuda_nvdisasm-{system}-{arch}-{version}-archive/bin/nvdisasm{exe_extension}",
-        dst_path="bin/nvdisasm",
-        override_path=helper_args.nvdisasm_path,
-        version=nvidia_toolchain_version["nvdisasm"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvdisasm/{system}-{arch}/cuda_nvdisasm-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    crt = "crt" if int(nvidia_toolchain_version["cudacrt"].split(".")[0]) >= 13 else "nvcc"
-    download_and_copy(
-        name="nvcc-crt",
-        src_func=lambda system, arch, version: f"cuda_{crt}-{system}-{arch}-{version}-archive/include",
-        dst_path="include",
-        override_path=helper_args.cudacrt_path,
-        version=nvidia_toolchain_version["cudacrt"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_{crt}/{system}-{arch}/cuda_{crt}-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    download_and_copy(
-        name="cudart",
-        src_func=lambda system, arch, version: f"cuda_cudart-{system}-{arch}-{version}-archive/include",
-        dst_path="include",
-        override_path=helper_args.cudart_path,
-        version=nvidia_toolchain_version["cudart"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/{system}-{arch}/cuda_cudart-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    download_and_copy(
-        name="cupti",
-        src_func=lambda system, arch, version: f"cuda_cupti-{system}-{arch}-{version}-archive/include",
-        dst_path="include",
-        override_path=helper_args.cupti_include_path,
-        version=nvidia_toolchain_version["cupti"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cupti/{system}-{arch}/cuda_cupti-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    download_and_copy(
-        name="cupti",
-        src_func=lambda system, arch, version: f"cuda_cupti-{system}-{arch}-{version}-archive/lib",
-        dst_path="lib/cupti",
-        override_path=helper_args.cupti_lib_path,
-        version=nvidia_toolchain_version["cupti"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cupti/{system}-{arch}/cuda_cupti-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
-    download_and_copy(
-        name="cupti-blackwell",
-        src_func=lambda system, arch, version: f"cuda_cupti-{system}-{arch}-{version}-archive/lib",
-        dst_path="lib/cupti-blackwell",
-        override_path=helper_args.cupti_lib_blackwell_path,
-        version=nvidia_toolchain_version["cupti-blackwell"],
-        url_func=lambda system, arch, version:
-        f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cupti/{system}-{arch}/cuda_cupti-{system}-{arch}-{version}-archive.tar.xz",
-        helper_args=helper_args,
-    )
+def download_and_copy_dependencies(helper_args: BuildHelperArgs):
+    download_and_copy_amd_codegen(helper_args)
+
+    for package in get_nvidia_toolchain_packages():
+        download_and_copy(
+            name=package.name,
+            src_func=lambda system, arch, version, package=package:
+            f"{package.archive(system, arch).filename.removesuffix('.tar.xz')}/{package.src_path}",
+            dst_path=package.dst_path,
+            override_path=getattr(helper_args, package.override_attr),
+            version=package.version,
+            url_func=lambda system, arch, version, package=package: package.archive(system, arch).url,
+            helper_args=helper_args,
+        )
 
 
 def add_common_args(parser: argparse.ArgumentParser):

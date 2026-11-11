@@ -1,10 +1,9 @@
 #include "TritonAMDGPUToLLVM/Passes.h"
 
-#include "AsyncUtility.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TargetInfo.h"
-#include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/TypeConverter.h"
+#include "TritonAMDGPUTransforms/SchedulingAttributes.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
@@ -16,12 +15,12 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "third_party/amd/include/Analysis/AMDGPUAllocation.h"
 #include "third_party/amd/include/Analysis/AxisInfoExt.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/Allocation.h"
-#include "triton/Analysis/Membar.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
@@ -34,6 +33,7 @@
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTTRITONAMDGPUTOLLVM
+#define GEN_PASS_DEF_FINALIZESCHEDULEDMFMAOPERANDS
 #include "TritonAMDGPUToLLVM/Passes.h.inc"
 } // namespace mlir::triton
 
@@ -56,6 +56,15 @@ static void materializeDeferredSchedGroupBarriers(ModuleOp mod) {
   unsigned nextSyncId = 1;
   mod.walk([&](triton::FuncOp func) {
     for (Block &block : func.getBody()) {
+      // Explicit intra-wave regions already carry their complete user-chosen
+      // scheduling-group program. Do not overlay the automatic whole-block
+      // planner when both features are enabled for the same kernel.
+      if (llvm::any_of(block.without_terminator(), [](Operation &op) {
+            return isa<ROCDL::SchedGroupBarrier>(op) &&
+                   op.hasAttr(triton::AMD::kIntraWavePipelineWindowAttr);
+          }))
+        continue;
+
       SmallVector<Operation *> boundaries;
       for (Operation &op : block.without_terminator())
         if (isa<triton::gpu::BarrierOp>(op))
@@ -206,6 +215,7 @@ public:
     addIllegalDialect<triton::instrument::TritonInstrumentDialect>();
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
+    addIllegalOp<triton::amdgpu::BufferLoadToLocalOp>();
     // Warp specialization is lowered later.
     addLegalOp<triton::gpu::WarpSpecializeOp>();
     addLegalOp<triton::gpu::WarpYieldOp>();
@@ -219,6 +229,7 @@ public:
     // must fail the conversion instead of leaving the op behind. The rest of
     // the dialect stays unmarked: some of it is lowered later.
     addIllegalOp<triton::amdgpu::ScheduledMfmaOp>();
+    addIllegalOp<triton::amdgpu::ScheduledMfmaScaledOp>();
     addIllegalOp<triton::amdgpu::MfmaCommitOp>();
   }
 };
@@ -265,6 +276,80 @@ static LogicalResult validateFinalWarpPredicateLayouts(ModuleOp mod) {
   return failure(result.wasInterrupted());
 }
 
+// Only order operands forwarded entirely from LDS reads. In particular, a
+// computed or register-resident operand must not acquire this ordering merely
+// because part of its backward slice contains a load.
+static bool isLocalLoadDerived(Value operand) {
+  DenseSet<Value> visited;
+  DenseMap<Value, SmallVector<Value>> dependents;
+  SmallVector<Value> worklist{operand};
+  SmallVector<Value> loadRoots;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    if (!isa<RankedTensorType>(value.getType()))
+      return false;
+    if (value.getDefiningOp<triton::gpu::LocalLoadOp>()) {
+      // The descriptor, indices, and synchronization token do not contribute
+      // tensor elements, so the local load itself is the terminal root.
+      loadRoots.push_back(value);
+      continue;
+    }
+
+    SmallVector<Value> sources;
+    if (auto arg = dyn_cast<BlockArgument>(value)) {
+      Block *block = arg.getOwner();
+      // Region entry arguments need their own forwarding semantics. The AMD
+      // pipeline lowers SCF to CFG before this pass; unsupported regions and
+      // function arguments conservatively retain pure operand pins.
+      if (block->isEntryBlock() || block->hasNoPredecessors())
+        return false;
+      for (auto pred = block->pred_begin(), end = block->pred_end();
+           pred != end; ++pred) {
+        auto branch = dyn_cast<BranchOpInterface>((*pred)->getTerminator());
+        if (!branch)
+          return false;
+        // Inspect every edge, including distinct edges from the same block.
+        SuccessorOperands incoming =
+            branch.getSuccessorOperands(pred.getSuccessorIndex());
+        unsigned index = arg.getArgNumber();
+        if (index >= incoming.size() || incoming.isOperandProduced(index))
+          return false;
+        sources.push_back(incoming[index]);
+      }
+    } else {
+      Operation *def = value.getDefiningOp();
+      if (!def ||
+          !isa<triton::gpu::ConvertLayoutOp, triton::ReshapeOp, triton::TransOp,
+               triton::ExpandDimsOp, triton::BroadcastOp, triton::SplitOp,
+               triton::amdgpu::ExtractSliceOp>(def))
+        return false;
+      // These operations only rearrange, duplicate, or select source elements.
+      sources.push_back(def->getOperand(0));
+    }
+    for (Value source : sources) {
+      dependents[source].push_back(value);
+      worklist.push_back(source);
+    }
+  }
+
+  // A visited cycle alone is not proof of a load origin. Remove every value
+  // reachable forward from a load; any remaining forwarding cycle is rootless.
+  // This accepts loop-carried values only when all their sources are supported
+  // and each value reaches a load through an initialization or backedge.
+  worklist = std::move(loadRoots);
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.erase(value))
+      continue;
+    auto it = dependents.find(value);
+    if (it != dependents.end())
+      llvm::append_range(worklist, it->second);
+  }
+  return visited.empty();
+}
+
 struct ConvertTritonAMDGPUToLLVM
     : public triton::impl::ConvertTritonAMDGPUToLLVMBase<
           ConvertTritonAMDGPUToLLVM> {
@@ -299,6 +384,30 @@ struct ConvertTritonAMDGPUToLLVM
       return signalPassFailure();
     }
 
+    // A failed conversion pattern alone does not fail partial conversion for
+    // AMD ops with unknown legality. Reject unsupported cluster scope before
+    // conversion so no buffer atomic can silently remain unlowered.
+    if (targetInfo.getISAFamily() != triton::amdgpu::ISAFamily::GFX1250) {
+      WalkResult result = mod.walk([](triton::amdgpu::BufferAtomicRMWOp op) {
+        if (!op.getClusterScope())
+          return WalkResult::advance();
+        op.emitOpError("cluster_scope requires gfx1250");
+        return WalkResult::interrupt();
+      });
+      if (result.wasInterrupted())
+        return signalPassFailure();
+    }
+
+    // Function/CFG conversion can replace block arguments with materialization
+    // casts, so classify the original tensor graph before the first conversion.
+    AMD::ScheduledMfmaLoweringState scheduledMfmaState;
+    mod.walk([&](triton::amdgpu::ScheduledMfmaOp op) {
+      if (op.getAccumulatorRole() == "persistent" &&
+          op.getResidentOperand() == "none" && isLocalLoadDerived(op.getA()) &&
+          isLocalLoadDerived(op.getB()))
+        scheduledMfmaState.operandOrderEligibleOps.insert(op.getOperation());
+    });
+
     mlir::LowerToLLVMOptions option(context);
     option.overrideIndexBitwidth(32);
 
@@ -312,15 +421,7 @@ struct ConvertTritonAMDGPUToLLVM
     ModuleAllocation allocation(mod, allocationFn,
                                 targetInfo.getSharedMemoryPartitionSize());
 
-    if (targetInfo.requiresAliasInfoForAsyncOps())
-      AMD::annotateLocalLoadsSyncedViaAsyncWait(mod);
-
-    ModuleMembarAnalysis membarPass(allocation, AMD::membarFilter,
-                                    AMD::getWarpLocalScratchSync());
-    membarPass.run();
     materializeDeferredSchedGroupBarriers(mod);
-    AMD::inferScheduledMfmaHazards(mod, targetInfo);
-
     // Lower functions
     {
       TritonLLVMFunctionConversionTarget funcTarget(*context);
@@ -395,7 +496,7 @@ struct ConvertTritonAMDGPUToLLVM
         enableTreeReduction);
     populatePatterns7(mlir::triton::populateScanOpToLLVMPatterns,
                       commonBenefit);
-    populatePatterns5(mlir::triton::populateViewOpToLLVMPatterns,
+    populatePatterns7(mlir::triton::populateViewOpToLLVMPatterns,
                       commonBenefit);
     AMD::populateHistogramOpToLLVMPatterns(typeConverter, patterns, targetInfo,
                                            AMDBenefit);
@@ -406,10 +507,11 @@ struct ConvertTritonAMDGPUToLLVM
 
     auto coordinateGroups = std::make_shared<DistributedCoordinateGroups>();
     AMD::populateMemoryOpToLLVMPatterns(typeConverter, patterns, targetInfo,
-                                        AMDBenefit, coordinateGroups);
-    mlir::triton::populateMemoryOpToLLVMPatterns(typeConverter, targetInfo,
-                                                 patterns, commonBenefit,
-                                                 std::move(coordinateGroups));
+                                        AMDBenefit, coordinateGroups,
+                                        scheduledMfmaState);
+    mlir::triton::populateMemoryOpToLLVMPatterns(
+        typeConverter, targetInfo, patterns, axisInfoAnalysis, commonBenefit,
+        std::move(coordinateGroups));
     mlir::triton::populateMakeRangeOpToLLVMPattern(typeConverter, targetInfo,
                                                    patterns, commonBenefit);
     mlir::triton::populateAssertOpToLLVMPattern(typeConverter, patterns,
@@ -458,6 +560,7 @@ struct ConvertTritonAMDGPUToLLVM
       return signalPassFailure();
     }
 
+    AMD::finalizeScheduledMfmaLowering(scheduledMfmaState);
     AMD::adjustModeRegister(mod, targetInfo);
     fixUpLoopAnnotation(mod);
 
@@ -486,6 +589,49 @@ private:
   }
 };
 
+struct FinalizeScheduledMfmaOperands
+    : public triton::impl::FinalizeScheduledMfmaOperandsBase<
+          FinalizeScheduledMfmaOperands> {
+  void runOnOperation() override {
+    SmallVector<LLVM::InlineAsmOp> operandPins;
+    WalkResult result = getOperation().walk([&](Operation *op) {
+      Attribute marker =
+          op->getAttr(triton::AMD::kScheduledMfmaOperandPinAttrName);
+      if (!marker)
+        return WalkResult::advance();
+
+      auto pin = dyn_cast<LLVM::InlineAsmOp>(op);
+      if (!isa<UnitAttr>(marker) || !pin || pin.getHasSideEffects() ||
+          !pin.getAsmString().empty() || pin->getNumOperands() != 1 ||
+          pin->getNumResults() != 1 ||
+          (pin.getConstraints() != "=v,0" && pin.getConstraints() != "=a,0")) {
+        op->emitError("expected a pure empty tied register-class pin marked "
+                      "with a unit attribute");
+        return WalkResult::interrupt();
+      }
+      auto type = dyn_cast<VectorType>(pin->getResult(0).getType());
+      if (!type || type.getRank() != 1 || type.isScalable() ||
+          !type.getElementType().isInteger(32) ||
+          pin->getOperand(0).getType() != type) {
+        op->emitError("expected matching fixed vector<i32> operand and result "
+                      "types for a scheduled MFMA operand pin");
+        return WalkResult::interrupt();
+      }
+      operandPins.push_back(pin);
+      return WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+      return signalPassFailure();
+
+    // Validate every marker before mutation. Removing it also makes this pass
+    // idempotent without treating unrelated side-effecting asm as operand pins.
+    for (LLVM::InlineAsmOp pin : operandPins) {
+      pin.setHasSideEffects(true);
+      pin->removeAttr(triton::AMD::kScheduledMfmaOperandPinAttrName);
+    }
+  }
+};
+
 } // namespace
 
 namespace mlir::triton {
@@ -500,6 +646,11 @@ createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz,
                                     bool enableTreeReduction) {
   return std::make_unique<ConvertTritonAMDGPUToLLVM>(gfxArch, ftz,
                                                      enableTreeReduction);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createFinalizeScheduledMfmaOperandsPass() {
+  return std::make_unique<FinalizeScheduledMfmaOperands>();
 }
 
 } // namespace mlir::triton

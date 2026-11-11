@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -20,6 +21,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
@@ -643,7 +645,8 @@ private:
       for (int idx : group)
         groupValues.push_back(srcValues[idx]);
 
-      auto vectorizeKind = enableTreeReduction
+      // Packing pairs neighbours, so an odd group stays scalar.
+      auto vectorizeKind = enableTreeReduction && groupValues.size() % 2 == 0
                                ? helper.getInThreadVectorizeOpKind(
                                      groupValues.size(),
                                      targetInfo.supportBitwidth16Elementwise(),
@@ -723,8 +726,9 @@ private:
     }
 
     ReduceOpHelper helper(op);
+    // Packing pairs registers 2k and 2k+1, so digit 0 must have radix 2.
     auto vectorizeKind =
-        enableTreeReduction
+        enableTreeReduction && layout.getInputRadix(kReg, 0) == 2
             ? helper.getInThreadVectorizeOpKind(
                   axisPack, targetInfo.supportBitwidth16Elementwise(),
                   targetInfo.supportBitwidth32Elementwise())
@@ -758,9 +762,13 @@ private:
     Region &combineRegion =
         vectorCombineRegion ? *vectorCombineRegion : op.getCombineOp();
 
-    Operation &combinerOp = combineRegion.front().front();
+    Operation *combinerOp = vectorCombineRegion
+                                ? &vectorCombineRegion->front().front()
+                                : op.getSingleCombiner();
     unsigned arity =
-        enableTreeReduction ? targetInfo.getReductionTreeArity(&combinerOp) : 1;
+        !enableTreeReduction
+            ? 1
+            : (combinerOp ? targetInfo.getReductionTreeArity(combinerOp) : 2);
     // Chunk only long scalar fadd folds: several register-contiguous spans can
     // otherwise form a high-pressure dependency chain. With one or two spans,
     // there is no repeated cross-span fold to break. Keep other combiners flat
@@ -828,9 +836,14 @@ private:
     auto kLane = str_attr("lane");
     const auto &laneBases = layout.getBases().lookup(kLane);
     unsigned reduceLaneIdMask = 0;
+    unsigned broadcastLaneIdMask = 0;
     for (unsigned bit = 0; bit < laneBases.size(); ++bit) {
-      if (laneBases[bit][op.getAxis()] != 0)
+      if (laneBases[bit][op.getAxis()] != 0) {
         reduceLaneIdMask |= 1u << bit;
+      } else if (llvm::all_of(laneBases[bit],
+                              [](int32_t x) { return x == 0; })) {
+        broadcastLaneIdMask |= 1u << bit;
+      }
     }
     if (reduceLaneIdMask == 0)
       return {std::move(layout), std::move(accs)};
@@ -840,7 +853,8 @@ private:
       for (unsigned i = 0; i < op.getNumOperands(); ++i)
         acc[i] = accs[i][reg];
 
-      warpReduceLaneMask(rewriter, op, acc, reduceLaneIdMask);
+      warpReduceLaneMask(rewriter, op, acc, reduceLaneIdMask,
+                         broadcastLaneIdMask);
 
       for (unsigned i = 0; i < op.getNumOperands(); ++i)
         accs[i][reg] = acc[i];
@@ -853,7 +867,8 @@ private:
 
   void warpReduceLaneMask(ConversionPatternRewriter &rewriter,
                           triton::ReduceOp op, SmallVector<Value> &acc,
-                          unsigned reduceLaneIdMask) const {
+                          unsigned reduceLaneIdMask,
+                          unsigned broadcastLaneIdMask) const {
     auto moduleOp = op->getParentOfType<ModuleOp>();
     unsigned warpSize =
         triton::gpu::TritonGPUDialect::getThreadsPerWarp(moduleOp);
@@ -868,7 +883,8 @@ private:
     // case. Non-contiguous lane distributions require one XOR shuffle per
     // participating lane-id bit.
     if (reduceLaneIdMask == contiguousMask) {
-      warpReduce(rewriter, op.getLoc(), acc, op, 1u << numBits, 1u << firstBit);
+      warpReduce(rewriter, op.getLoc(), acc, op, 1u << numBits, 1u << firstBit,
+                 /*pred=*/Value(), broadcastLaneIdMask);
       return;
     }
 
@@ -891,9 +907,10 @@ private:
   void warpReduce(ConversionPatternRewriter &rewriter, Location loc,
                   SmallVector<Value> &acc, triton::ReduceOp op,
                   unsigned numLaneToReduce, unsigned interleave,
-                  Value pred = {}) const {
-    auto success = targetInfo.warpReduce(rewriter, loc, acc, op,
-                                         numLaneToReduce, interleave);
+                  Value pred = {},
+                  std::optional<unsigned> broadcastMask = std::nullopt) const {
+    auto success = targetInfo.warpReduce(
+        rewriter, loc, acc, op, numLaneToReduce, interleave, broadcastMask);
     if (success)
       return;
 
@@ -1084,10 +1101,13 @@ private:
     Value laneId = b.urem(threadId, warpSize);
     Value zero = b.i32_val(0);
 
-    unsigned elemsPerThread = std::max<unsigned>(elems / numThreads, 1);
+    unsigned elemsPerThread = llvm::divideCeil(elems, numThreads);
     Value threadIsNeeded = b.icmp_slt(threadId, b.i32_val(elems));
     Value readOffset = threadId;
     for (unsigned round = 0; round < elemsPerThread; ++round) {
+      // An NPOT scratch ends in a partial round.
+      if (round > 0 && round == elemsPerThread - 1 && elems % numThreads)
+        threadIsNeeded = b.icmp_slt(readOffset, b.i32_val(elems));
       SmallVector<Value> acc(op.getNumOperands());
       for (unsigned i = 0; i < op.getNumOperands(); ++i) {
         auto elemTy = getElementType(op, i);

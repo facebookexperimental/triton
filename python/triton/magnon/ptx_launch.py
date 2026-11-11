@@ -110,6 +110,51 @@ def parse_entry(ptx: str):
     return name, [_param_kind(p) for p in params]
 
 
+def _specialize_ordered_args(ordered_args):
+    """Apply the frontend's param specialization to the bound-order args: drop constexprs and
+    equal_to_1 integer scalars (bool -> int, kept), and return the surviving
+    ("tensor" | "tensordesc" | "scalar", ...) entries in order -- the ones that map onto real kernel
+    params. Shared by build_spec (PTX-driven) and build_spec_from_schema (schema-driven) so the two
+    apply identical specialization."""
+    survivors = []
+    for a in ordered_args:
+        if a[0] == "constexpr":
+            continue
+        if a[0] in ("tensor", "tensordesc"):
+            survivors.append(a)
+        elif a[0] == "scalar":
+            v = a[1]
+            if isinstance(v, bool):
+                survivors.append(("scalar", int(v)))
+            elif isinstance(v, int) and v == 1:
+                continue
+            else:
+                survivors.append(("scalar", v))
+        else:
+            raise NotImplementedError(f"unsupported arg kind {a[0]!r}")
+    return survivors
+
+
+def _is_pointer_type(ty: str) -> bool:
+    """True if a Triton signature type string denotes a global pointer (e.g. '*fp16', '*i8')."""
+    return ty.startswith("*")
+
+
+def _scalar_kind_from_type(ty: str) -> str:
+    """Map a Triton scalar signature type ('i32', 'i64', 'fp32', 'fp64', ...) to a launch-arg kind,
+    matching what _param_kind derives from the PTX param for the same argument."""
+    t = ty.lstrip("*")
+    if t in ("i64", "u64"):
+        return "i64"
+    if t in ("fp64", "f64"):
+        return "f64"
+    if t in ("fp32", "f32"):
+        return "f32"
+    if t and t[0] in ("i", "u"):  # i1/i8/i16/i32/u32/... ride a 32-bit slot
+        return "i32"
+    raise NotImplementedError(f"unsupported scalar schema type {ty!r}")
+
+
 def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str, ptxas_version: str = "") -> dict:
     """Build the source-free launch spec from a compiled kernel + its (bound-order) call args.
 
@@ -175,22 +220,7 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str, ptxas_version
         return idx
 
     # Specialize: drop constexprs and equal_to_1 int scalars (what Triton removes from kernel params).
-    survivors = []
-    for a in ordered_args:
-        if a[0] == "constexpr":
-            continue
-        if a[0] in ("tensor", "tensordesc"):
-            survivors.append(a)
-        elif a[0] == "scalar":
-            v = a[1]
-            if isinstance(v, bool):
-                survivors.append(("scalar", int(v)))
-            elif isinstance(v, int) and v == 1:
-                continue
-            else:
-                survivors.append(("scalar", v))
-        else:
-            raise NotImplementedError(f"unsupported arg kind {a[0]!r}")
+    survivors = _specialize_ordered_args(ordered_args)
 
     args, tensordescs, ki, tdmi = [], [], 0, 0
 
@@ -267,6 +297,93 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str, ptxas_version
         spec["cluster"] = cluster
     if tensordescs:
         spec["tensordescs"] = tensordescs
+    return spec
+
+
+def build_spec_from_schema(schema: dict, ptx: str, grid, ordered_args, ptxas: str) -> dict:
+    """PROTOTYPE alternative to build_spec: source the post-specialization param list from the
+    compiler's Level 0 launch-metadata schema (``kernel.asm["launch_metadata"]``, see the nvidia
+    backend's make_launch_metadata) instead of parsing the PTX .entry and re-deriving specialization.
+    Produces the IDENTICAL spec.json shape as build_spec, so the factory replay path is unchanged.
+
+    Why: build_spec re-implements the frontend's specialization + PTX-param ABI, so the kernel arg
+    list lives in two places and can silently drift. The schema is the compiler's own source of
+    truth -- it carries the entry name, num_warps/num_ctas, shared, cluster_dims, scratch sizes, and
+    the args[] list (Triton types, constants already dropped). This maps captured runtime VALUES
+    (tensor allocations, scalar values from ordered_args) onto schema["args"] 1:1, so no PTX param
+    parsing is needed.
+
+    Scope (prototype): tensor + scalar params only. tensordesc/TMA args raise NotImplementedError --
+    the Level 0 schema lists a descriptor as ONE arg and does not carry the flattened
+    [tensormap, *shape, *strides] leaf kinds (that flattening lives in expand_signature / the Level 1
+    C launcher), so full TMA coverage needs PTX or Level 1, not Level 0 alone. ``arch`` is still read
+    from the PTX .target, which the schema does not carry."""
+    num_ctas = int(schema.get("num_ctas") or 1)
+    cluster = [int(c) for c in (schema.get("cluster_dims") or [1, 1, 1])]
+    gss = int(schema.get("global_scratch_size") or 0)
+    pss = int(schema.get("profile_scratch_size") or 0)
+    num_warps = int(schema.get("num_warps") or 1)
+    shared = int(schema.get("shared_mem") or 0)
+    schema_args = schema.get("args") or []
+
+    if gss or pss:
+        raise NotImplementedError(f"non-null scratch (global={gss} profile={pss})")
+    if num_ctas != 1:
+        raise NotImplementedError(f"multi-CTA via num_ctas>1 (num_ctas={num_ctas})")
+    cluster_size = 1
+    for c in cluster:
+        cluster_size *= c
+
+    survivors = _specialize_ordered_args(ordered_args)
+    if len(survivors) != len(schema_args):
+        raise NotImplementedError(
+            f"schema/args parity: {len(schema_args)} schema params != {len(survivors)} runtime args")
+
+    tensors = []
+    _id2idx = {}
+
+    def _tensor_idx(info):
+        key = info.get("id")
+        if key is not None and key in _id2idx:
+            return _id2idx[key]
+        idx = len(tensors)
+        entry = {"shape": list(info["shape"]), "dtype": info["dtype"], "strides": list(info["strides"])}
+        if "pickle_sha256" in info:
+            entry["pickle_sha256"] = info["pickle_sha256"]
+        tensors.append(entry)
+        if key is not None:
+            _id2idx[key] = idx
+        return idx
+
+    args = []
+    for sarg, s in zip(schema_args, survivors, strict=True):
+        ty = str(sarg.get("type", ""))
+        if s[0] == "tensordesc":
+            raise NotImplementedError("tensordesc/TMA: Level 0 schema lacks flattened leaf kinds (needs PTX/Level 1)")
+        if s[0] == "tensor":
+            if not _is_pointer_type(ty):
+                raise NotImplementedError(f"tensor arg mapped to non-pointer schema type {ty!r}")
+            args.append({"t": _tensor_idx(s[1])})
+        else:  # scalar
+            k = _scalar_kind_from_type(ty)
+            args.append({k: int(s[1]) if k in ("i32", "i64") else float(s[1])})
+    args += [{"null": True}, {"null": True}]  # global_scratch, profile_scratch
+
+    g = [int(grid[0]), int(grid[1]) if len(grid) > 1 else 1, int(grid[2]) if len(grid) > 2 else 1]
+    if cluster_size != 1 and any(gd % cd != 0 for gd, cd in zip(g, cluster, strict=True)):
+        raise NotImplementedError(f"grid {g} not divisible by cluster {cluster}")
+    spec = {
+        "entry": schema.get("entry_name") or "",
+        "arch": parse_arch(ptx),
+        "shared": shared,
+        "block": [num_warps * 32, 1, 1],
+        "grid": g,
+        "ptxas": ptxas,
+        "tensors": tensors,
+        "args": args,
+    }
+    if cluster_size != 1:
+        spec["cluster"] = cluster
     return spec
 
 

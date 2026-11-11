@@ -349,3 +349,22 @@ tt.func @async_copy_with_mismatching_order_and_unsupported_vec_width(%input: ten
   tt.return
 }
 }
+
+// -----
+
+// Volatile async copies cannot use direct-to-LDS buffer intrinsics, so they
+// are decomposed into a synchronous volatile tt.load plus a local_store.
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+// CHECK-LABEL: async_copy_volatile_decomposed
+tt.func @async_copy_volatile_decomposed(%input: tensor<1024x!tt.ptr<f32>, #blocked>,
+    %view: !ttg.memdesc<1024xf32, #shared, #smem, mutable>) {
+  // CHECK: %{{.*}} = tt.load %{{.*}} {isVolatile = true}
+  // CHECK: ttg.local_store %{{.*}}, %{{.*}}
+  // CHECK-NOT: ttg.async_copy_global_to_local
+  %token = ttg.async_copy_global_to_local %input, %view {isVolatile = true} : tensor<1024x!tt.ptr<f32>, #blocked> -> <1024xf32, #shared, #smem, mutable>
+  tt.return
+}
+}

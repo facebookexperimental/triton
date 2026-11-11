@@ -19,6 +19,7 @@ using namespace mlir::triton;
 namespace mlir {
 namespace triton {
 #define GEN_PASS_DEF_ALLOCATESHAREDMEMORYNV
+#define GEN_PASS_DEF_SETMINIMUMSHAREDMEMORY
 #include "TritonNVIDIAGPUToLLVM/Passes.h.inc"
 } // namespace triton
 } // namespace mlir
@@ -34,6 +35,8 @@ struct AllocateSharedMemoryNv
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+    if (failed(mlir::triton::gpu::verifyNpotTypesSupported(mod)))
+      return signalPassFailure();
     mlir::triton::NVIDIA::TargetInfo targetInfo(computeCapability, ptxVersion);
     ModuleAllocation allocation(
         mod, mlir::triton::nvidia_gpu::getNvidiaAllocationAnalysisScratchSizeFn(
@@ -44,19 +47,37 @@ struct AllocateSharedMemoryNv
     mlir::triton::gpu::addSharedMemoryAnnotations(mod);
   }
 };
+
+struct SetMinimumSharedMemory
+    : public mlir::triton::impl::SetMinimumSharedMemoryBase<
+          SetMinimumSharedMemory> {
+  using SetMinimumSharedMemoryBase::SetMinimumSharedMemoryBase;
+
+  void runOnOperation() override {
+    ModuleOp mod = getOperation();
+    if (minimumSize < 0) {
+      mod.emitError("minimum shared memory size must be non-negative");
+      return signalPassFailure();
+    }
+    auto sharedAttr = mod->getAttrOfType<IntegerAttr>("ttg.shared");
+    int64_t sharedSize = sharedAttr ? sharedAttr.getInt() : 0;
+    if (sharedSize < minimumSize)
+      mod->setAttr("ttg.shared",
+                   IntegerAttr::get(IntegerType::get(mod.getContext(), 32),
+                                    minimumSize));
+  }
+};
 } // namespace
 
 namespace mlir::triton::nvidia_gpu {
 
-static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
-                                              RankedTensorType dstTy,
-                                              TargetInfoBase &targetInfo) {
-  auto *ctx = srcTy.getContext();
-  auto srcLayout = triton::gpu::toLinearLayout(srcTy);
-  auto dstLayout = triton::gpu::toLinearLayout(dstTy);
+static unsigned
+getNumScratchElemsSwizzledCvt(LinearLayout srcLayout, LinearLayout dstLayout,
+                              int32_t bitwidth, int32_t nBlocks,
+                              const TargetInfoBase &targetInfo) {
+  auto *ctx = srcLayout.getInDimNames().begin()->getContext();
   srcLayout = actionRemoveBroadcastedRegs(srcLayout).apply(srcLayout);
   dstLayout = actionRemoveBroadcastedRegs(dstLayout).apply(dstLayout);
-  auto bitwidth = getBitwidth(srcTy);
   auto kBlock = StringAttr::get(ctx, "block");
   bool crossCTA =
       !dstLayout.invertAndCompose(srcLayout).isTrivialOver({kBlock});
@@ -67,8 +88,42 @@ static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
   auto reps = smem.getInDimSize(StringAttr::get(ctx, "reps"));
   // The smem has the same CGA layout as srcLayout, so use that instead.
   // Remove the number of elements duplicated in the CGA layout.
-  auto nBlocks = product(triton::gpu::getCTASplitNum(srcTy.getEncoding()));
-  return smem.getTotalOutDimSizeProduct() / (reps * nBlocks);
+  return smem.getTotalOutDimSize() / (reps * nBlocks);
+}
+
+static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
+                                              RankedTensorType dstTy,
+                                              TargetInfoBase &targetInfo) {
+  return getNumScratchElemsSwizzledCvt(
+      triton::gpu::toLinearLayout(srcTy), triton::gpu::toLinearLayout(dstTy),
+      getBitwidth(srcTy),
+      product(triton::gpu::getCTASplitNum(srcTy.getEncoding())), targetInfo);
+}
+
+std::optional<MixedRadixTileTransfer>
+getMixedRadixTileTransfer(RankedTensorType srcTy, RankedTensorType dstTy,
+                          const TargetInfoBase &targetInfo) {
+  auto plan = getMixedRadixConversionPlan(srcTy, dstTy);
+  if (!plan || plan->transfer != MixedRadixConversionTransfer::Shared)
+    return std::nullopt;
+  auto kReg = StringAttr::get(srcTy.getContext(), "register");
+  auto src = triton::gpu::toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
+  auto dst = triton::gpu::toLinearLayout(dstTy).removeZeroBasesAlongDim(kReg);
+  auto tiles = getMixedRadixSharedTiles(src, dst);
+  if (!tiles)
+    return std::nullopt;
+  int32_t numTiles =
+      src.getInDimSize(kReg) / tiles->sourceTile.getInDimSize(kReg);
+  auto bitwidth = getBitwidth(srcTy);
+  int32_t nBlocks = product(triton::gpu::getCTASplitNum(srcTy.getEncoding()));
+  unsigned elems = getNumScratchElemsSwizzledCvt(
+      tiles->sourceTile, tiles->destinationTile, bitwidth, nBlocks, targetInfo);
+  unsigned paddedElems = getNumScratchElemsSwizzledCvt(
+      padMixedRadixLayout(src), padMixedRadixLayout(dst), bitwidth, nBlocks,
+      targetInfo);
+  int32_t tilesPerRound = std::clamp<int32_t>(paddedElems / elems, 1, numTiles);
+  return MixedRadixTileTransfer{std::move(*tiles), numTiles, tilesPerRound,
+                                tilesPerRound * elems * bitwidth / 8};
 }
 
 std::function<unsigned(Operation *)>
@@ -77,15 +132,10 @@ getNvidiaAllocationAnalysisScratchSizeFn(TargetInfoBase &targetInfo) {
     if (auto cvtOp = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
       auto srcTy = cvtOp.getSrc().getType();
       auto dstTy = cvtOp.getType();
-      if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
-        // Use modular physical-cover sizing.
-        if (!cvtNeedsSharedMemory(cvtOp)) {
-          return 0;
-        }
-        auto elems = mlir::triton::getNumScratchElemsSwizzledCvt(srcTy, dstTy);
-        // Modular sub-byte values occupy one byte in shared memory.
-        return elems * std::max<unsigned>(getBitwidth(srcTy), 8) / 8;
-      }
+      if (auto tiles = getMixedRadixTileTransfer(srcTy, dstTy, targetInfo))
+        return tiles->scratchBytes;
+      if (auto bytes = getMixedRadixConversionScratchBytes(cvtOp))
+        return *bytes;
       if (!cvtNeedsSharedMemory(cvtOp))
         return 0;
       // In cuda we always swizzle

@@ -24,6 +24,7 @@
 #include "TargetInfo.h"
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
+#include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -113,6 +114,11 @@ static scf::ExecuteRegionOp getPipelineStage(Operation *op) {
   return isPipelineStage(exec) ? exec : nullptr;
 }
 
+static scf::ExecuteRegionOp getFlatPipelineStage(Operation *op) {
+  auto exec = getPipelineStage(op);
+  return exec && exec->hasAttr("triton.warp_pipeline.flat") ? exec : nullptr;
+}
+
 // Validate the body of a `pipelined_for` loop.  After WarpPipeliner the body
 // must consist of: a sequence of pipeline-stage execute_regions, optional
 // pre-existing barrier/wait ops between (or before/after) those stages, and
@@ -129,7 +135,7 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
             "non-warp-pipeline scf.execute_region inside pipelined_for body");
       ++numClusters;
     } else if (isWarpPipelineIgnorableBarrier(&op)) {
-      if (existingBarrierMap.count(numClusters))
+      if (existingBarrierMap.contains(numClusters))
         return op.emitError("multiple pre-existing barriers between pipeline "
                             "stages; insert a dummy stage instead");
       existingBarrierMap[numClusters] = &op;
@@ -144,7 +150,8 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
   if (numClusters < 2)
     return forOp.emitError(
         "pipelined_for body must contain at least two pipeline stages");
-  if (existingBarrierMap.count(0) && existingBarrierMap.count(numClusters))
+  if (existingBarrierMap.contains(0) &&
+      existingBarrierMap.contains(numClusters))
     return forOp.emitError("pipelined_for body has both top-of-loop and "
                            "bottom-of-loop pre-existing barriers");
   return success();
@@ -210,6 +217,15 @@ static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
   const int N = clusterInfo.size();
   const int maxDist = circular ? N : N - 1;
 
+  // A descriptor can change between iterations. Preserve same-iteration
+  // disjointness proofs only for pairs that do not wrap around the loop.
+  SmallVector<BlockInfo> previousIterationInfo;
+  if (circular) {
+    previousIterationInfo.assign(clusterInfo.begin(), clusterInfo.end());
+    for (BlockInfo &info : previousIterationInfo)
+      info.invalidateIterationInfo();
+  }
+
   // Modular wrap; a no-op in linear mode where indices stay in range.
   auto wrap = [&](int i) -> int { return circular ? (i % N + N) % N : i; };
 
@@ -236,7 +252,9 @@ static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
       const int barrierLoc = (dist == 1) ? dst : wrap(dst - 1);
       if (isCovered(src, barrierLoc))
         continue;
-      if (!clusterInfo[src].isIntersected(
+      const BlockInfo &sourceInfo =
+          src + dist >= N ? previousIterationInfo[src] : clusterInfo[src];
+      if (!sourceInfo.isIntersected(
               clusterInfo[dst], mlir::triton::AMD::membarFilter, allocation))
         continue;
       bars[barrierLoc] = true;
@@ -425,9 +443,8 @@ private:
 
     // Normally, we don't expect a pipelined loop begins with a barrier
     // but sometimes required by memory prefetching pattern.
-    auto topBar = existingBarrierMap.find(0);
     auto bottomBar = existingBarrierMap.find(numClusters);
-    bool hasTopBarrier = topBar != existingBarrierMap.end();
+    bool hasTopBarrier = existingBarrierMap.contains(0);
     bool hasBottomBarrier = bottomBar != existingBarrierMap.end();
     if (bottomBar != existingBarrierMap.end()) {
       // validatePipelinedForBody guarantees we cannot have both top and
@@ -655,18 +672,25 @@ static void processUnrolledPipelineRegions(ModuleOp m,
     if (!allocation)
       return;
 
-    // NOTE: We only iterate the function's top-level blocks; flat-pipeline
-    // execute_regions inside nested non-loop regions (e.g. scf.if bodies)
-    // are not collected.  WarpPipeliner's flat-pipeline frontend has the
-    // same scope, so the two stay in sync.
-    for (Block &block : funcOp.getBody()) {
+    // Flat pipelines can be nested in an enclosing persistent loop when their
+    // original owner loop was fully unrolled. The explicit flat attribute
+    // distinguishes those stages from stages owned by a pipelined_for loop.
+    SmallVector<Block *> blocks;
+    funcOp.walk([&](Block *block) { blocks.push_back(block); });
+    for (Block *block : blocks) {
       // Collect contiguous sequences of flat warp-pipeline execute_regions,
       // splitting at any non-ignorable, non-pipeline op.
       SmallVector<SmallVector<scf::ExecuteRegionOp>> sequences;
       SmallVector<scf::ExecuteRegionOp> current;
 
-      for (auto &op : block) {
-        if (auto exec = getPipelineStage(&op)) {
+      bool isFunctionBody = block->getParentOp() == funcOp;
+      for (auto &op : *block) {
+        auto exec = getPipelineStage(&op);
+        // Before flat stages were explicitly tagged, the frontend only
+        // produced them in the function body. Keep accepting that legacy
+        // form there; nested stages must carry the flat tag so stages owned
+        // by pipelined_for are not converted twice.
+        if (exec && (isFunctionBody || getFlatPipelineStage(&op))) {
           current.push_back(exec);
           continue;
         }
@@ -1019,6 +1043,9 @@ public:
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
+    // Reject before the ModuleAllocation below, as the allocation passes do.
+    if (failed(mlir::triton::gpu::verifyNpotTypesSupported(m)))
+      return signalPassFailure();
 
     mlir::triton::AMD::TargetInfo targetInfo(gfxArch.getValue());
     size_t partitionSize = targetInfo.getSharedMemoryPartitionSize();

@@ -1,0 +1,103 @@
+name: Install prebuilt Triton
+description: >
+  Fetch the wheel the build job produced and install it into the active venv
+  (see setup-test-env). Fork PRs read it from the run's GitHub artifacts;
+  everything else reads it from S3 as 16 parallel byte ranges, since a single
+  S3 stream sometimes runs at ~1 MB/s (6.5 min for the wheel).
+inputs:
+  wheel-url:
+    description: "needs.<build job>.outputs.wheel_url"
+    required: false
+    default: ""
+  wheel-filename:
+    description: "needs.<build job>.outputs.wheel_filename"
+    required: false
+    default: ""
+  wheel-sha256:
+    description: Expected SHA256 of the wheel, when provided by the build
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Download prebuilt Triton wheel from GitHub artifacts
+      if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+      uses: actions/download-artifact@v4
+      with:
+        name: run_${{ github.run_id }}
+        path: ${{ runner.temp }}/prebuilt-wheel
+    - name: Download prebuilt Triton wheel from S3
+      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      shell: bash
+      env:
+        WHEEL_URL: ${{ inputs.wheel-url }}
+        WHEEL_FILENAME: ${{ inputs.wheel-filename }}
+      run: |
+        set -euo pipefail
+        OUT="${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}"
+        mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
+        T0=$(date +%s.%N)
+        SIZE=$(curl --fail --silent --head --location --retry 3 "${WHEEL_URL}" \
+          | awk 'tolower($1)=="content-length:" {n=$2} END {print n+0}')
+        # On mi350 runners an S3 stream sometimes stalls at a few KB/s without
+        # erroring, so --retry never fires and one range holds the download
+        # for over an hour. Healthy ranges stay above ~180 KB/s even at peak
+        # hours, so the first three attempts abort below 50 KB/s for 30s and
+        # retry on a new connection; the last attempt runs unbounded.
+        fetch() {  # fetch <output> [byte-range]
+          local out=$1 attempt
+          local range=()
+          [ -n "${2:-}" ] && range=(--range "$2")
+          for attempt in 1 2 3; do
+            curl --fail --silent --show-error --location \
+              --speed-limit 51200 --speed-time 30 \
+              "${range[@]}" --output "${out}" "${WHEEL_URL}" && return 0
+            echo "${out##*/}: attempt ${attempt} failed or stalled; retrying" >&2
+          done
+          curl --fail --silent --show-error --location --retry 3 \
+            "${range[@]}" --output "${out}" "${WHEEL_URL}"
+        }
+        PARTS=16
+        if [ "${SIZE}" -lt $((PARTS * 1048576)) ]; then
+          fetch "${OUT}"
+        else
+          CHUNK=$(( (SIZE + PARTS - 1) / PARTS ))
+          pids=()
+          for i in $(seq 0 $((PARTS - 1))); do
+            start=$((i * CHUNK)); end=$((start + CHUNK - 1))
+            [ "${end}" -ge "${SIZE}" ] && end=$((SIZE - 1))
+            fetch "${OUT}.part${i}" "${start}-${end}" &
+            pids+=($!)
+          done
+          for p in "${pids[@]}"; do wait "${p}"; done
+          for i in $(seq 0 $((PARTS - 1))); do cat "${OUT}.part${i}"; done > "${OUT}"
+          rm -f "${OUT}".part*
+        fi
+        [ "$(stat -c %s "${OUT}")" -eq "${SIZE}" ] || [ "${SIZE}" -eq 0 ]
+        python -m zipfile -t "${OUT}" > /dev/null
+        awk -v b="$(stat -c %s "${OUT}")" -v t0="${T0}" -v t1="$(date +%s.%N)" -v f="${OUT##*/}" \
+          'BEGIN {t = t1 - t0; printf "downloaded %s: %d bytes in %.1fs (%.1f MB/s)\n", f, b, t, b / t / 1e6}'
+    - name: Verify prebuilt Triton wheel
+      if: inputs.wheel-sha256 != ''
+      shell: bash
+      env:
+        WHEEL_FILENAME: ${{ inputs.wheel-filename }}
+        WHEEL_SHA256: ${{ inputs.wheel-sha256 }}
+      run: |
+        printf '%s  %s\n' "${WHEEL_SHA256}" "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" | sha256sum --check
+    - name: Install Triton
+      shell: bash
+      run: |
+        uv pip uninstall triton
+        uv pip install --force-reinstall --no-deps "${RUNNER_TEMP}"/prebuilt-wheel/*.whl
+        # The wheel is the `fbtriton` distribution. Fail if any other
+        # distribution also provides `triton` (torch's or a dependency's), whose
+        # files could shadow it. Install this action after the job's other
+        # dependencies so the wheel's files are the last written.
+        python - <<'PY'
+        import importlib.metadata as md
+
+        owners = md.packages_distributions().get("triton")
+        assert owners == ["fbtriton"], f"`triton` is provided by {owners}, expected only fbtriton"
+        print(f"triton package from fbtriton {md.version('fbtriton')}")
+        PY

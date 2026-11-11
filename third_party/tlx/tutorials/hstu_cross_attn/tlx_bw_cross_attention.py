@@ -1255,7 +1255,6 @@ def _get_bw_pipeline_2kv_configs() -> List[triton.Config]:
         "AUTOTUNE_MAX_SEQ_LEN",
         "DimQ",
         "DimV",
-        "SHARED_KV",
     ],
 )
 @triton.jit

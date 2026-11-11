@@ -9,8 +9,8 @@ from triton.experimental.gluon.language._semantic import _check, _compute_tmem_r
 
 from . import tma
 from . import clc
-from ..hopper import async_store, fence_async_shared, mbarrier
-from ..ampere import async_copy, mma_v2
+from ..hopper import async_store, cluster, fence_async_shared, mbarrier
+from ..ampere import CachePolicy, FractionalEvictionPolicy, async_copy, mma_v2
 
 from triton._C.libtriton import ir
 import triton._C.libtriton.gluon_ir as gluon_ir
@@ -19,11 +19,14 @@ if TYPE_CHECKING:
     from ..._semantic import GluonSemantic
 
 __all__ = [
+    "CachePolicy",
+    "FractionalEvictionPolicy",
     "add2",
     "allocate_tensor_memory",
     "async_copy",
     "async_store",
     "clc",
+    "cluster",
     "fence_async_shared",
     "fma2",
     "mbarrier",
@@ -43,33 +46,38 @@ __all__ = [
 
 def _packed_arith(operation, operands, dtype, semantic):
     """Build packed arithmetic with inferred result types and FP4 layouts."""
-    operands = tuple(semantic.to_tensor(operand) for operand in operands)
-    _check(any(isinstance(operand.type, ttgl.distributed_type) for operand in operands),
+    operands = tuple(_unwrap_if_constexpr(operand) for operand in operands)
+    operand_types = tuple(operand.type if isinstance(operand, ttgl.tensor) else semantic.to_tensor_type(operand)
+                          for operand in operands)
+    _check(any(isinstance(ty, ttgl.distributed_type) for ty in operand_types),
            lambda: "packed arithmetic requires at least one distributed tensor operand")
     floating = [
-        operand for operand in operands
-        if isinstance(operand.type, ttgl.distributed_type) and operand.dtype.is_floating()
+        operand for operand, ty in zip(operands, operand_types)
+        if isinstance(ty, ttgl.distributed_type) and ty.scalar.is_floating()
     ]
     reference = max(floating, key=lambda operand: operand.numel.value, default=None)
     dtype = _unwrap_if_constexpr(dtype)
 
     if reference is None:
         _check(dtype is not None, lambda: "packed FP4 operands require an explicit result dtype")
-        shape = list(operands[0].type.shape)
+        shape = list(operand_types[0].shape)
         shape[-1] *= 2
     else:
         shape = reference.type.shape
         if dtype is None:
-            addend = operands[-1]
-            dtype = addend.dtype if operation in ("add", "sub", "fma") and addend.dtype.is_fp8() else reference.dtype
-            for operand in operands:
-                if not operand.dtype.is_floating() or (dtype.is_fp8() and operand.dtype.is_fp8()):
+            addend_dtype = operand_types[-1].scalar
+            dtype = addend_dtype if operation in ("add", "sub", "fma") and addend_dtype.is_fp8() else reference.dtype
+            for operand, ty in zip(operands, operand_types):
+                if not ty.scalar.is_floating() or (dtype.is_fp8() and ty.scalar.is_fp8()):
                     continue
-                dtype = semantic.computation_type_impl(dtype, False, operand.dtype, not operand.type.is_block(), False)
+                dtype = semantic.computation_type_impl(dtype, False, ty.scalar, not isinstance(operand, ttgl.tensor),
+                                                       False)
 
     _check(isinstance(dtype, ttgl.dtype), lambda: f"expected 'dtype' to be a dtype but got {dtype}")
     normalized = []
     for operand in operands:
+        if not isinstance(operand, ttgl.tensor):
+            operand = semantic.scalar_constant(operand, dtype)
         is_packed_fp4 = (isinstance(operand.type, ttgl.distributed_type) and operand.dtype.is_int()
                          and operand.dtype.primitive_bitwidth == 8 and operand.type.shape != shape)
         if not is_packed_fp4:
@@ -217,7 +225,9 @@ class _TensorMemoryLinearLayout:
         raise RuntimeError("TensorMemoryLinearLayout is print-only; IR materialization is unsupported")
 
     def mangle(self):
-        return f"TMLL_{self.shape}_TMLL"
+        rows = "_".join("~".join(map(str, b)) for b in self.rows)
+        cols = "_".join("~".join(map(str, b)) for b in self.cols)
+        return f"TMLL_{rows}_{cols}_{self.shape}_TMLL"
 
     def __hash__(self):
         return hash((tuple(map(tuple, self.rows)), tuple(map(tuple, self.cols)), tuple(self.shape)))
@@ -608,8 +618,8 @@ def tcgen05_mma_scaled(a, b, acc, a_scale, b_scale, a_type, b_type, *, use_acc=T
         acc (tensor_memory_descriptor): Accumulator value in tensor memory (mutated).
         a_scale (tensor): Scale factor for operand A.
         b_scale (tensor): Scale factor for operand B.
-        a_type (str): Type of operand A. One of {"e2m1", "e4m3", "e5m2"}.
-        b_type (str): Type of operand B. One of {"e2m1", "e4m3", "e5m2"}.
+        a_type (str): Type of operand A. One of {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}.
+        b_type (str): Type of operand B. One of {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}.
         use_acc (bool): Whether to use the initial value of the accumulator. Defaults to True.
         pred (bool): Scalar predicate. Operation is skipped if predicate is False. Defaults to True.
         multicast (bool): Whether tcgen05 commit should multicast across a CTA cluster. Defaults to False.
@@ -632,7 +642,7 @@ def tcgen05_mma_scaled(a, b, acc, a_scale, b_scale, a_type, b_type, *, use_acc=T
         else:
             mbarrier_preds = _semantic._convert_to_ir_values(mbarrier_preds, require_i64=False)
 
-    allowed_formats = {"e2m1", "e4m3", "e5m2"}
+    allowed_formats = {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}
     assert a_type.value in allowed_formats, f"Unsupported lhs_format: {a_type.value}"
     assert b_type.value in allowed_formats, f"Unsupported rhs_format: {b_type.value}"
     a_type = _semantic._str_to_fp_type(a_type.value)

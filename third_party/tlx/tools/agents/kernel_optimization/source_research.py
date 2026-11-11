@@ -133,9 +133,9 @@ def _parse_research_output(
     findings = _bounded_string_array(
         payload["findings"], "findings", max_items=_MAX_FINDINGS
     )
-    limitations = _bounded_string_array(
+    limitations = list(_bounded_string_array(
         payload["limitations"], "limitations", max_items=_MAX_LIMITATIONS
-    )
+    ))
     raw_inspected_paths = payload["inspected_paths"]
     if not isinstance(raw_inspected_paths, list):
         raise ValueError("research field 'inspected_paths' must be an array")
@@ -188,7 +188,11 @@ def _parse_research_output(
         if not actual_text:
             raise ValueError("research excerpt line range is empty")
         if len(actual_text) > _MAX_ITEM_TEXT:
-            raise ValueError("research excerpt source text exceeds the item limit")
+            if len(limitations) < _MAX_LIMITATIONS:
+                limitations.append(
+                    f"Omitted oversized excerpt {relative_path}:{start_line}-{end_line}"
+                )
+            continue
         excerpts.append(
             SourceExcerpt(
                 path=relative_path,
@@ -212,7 +216,7 @@ def _parse_research_output(
         findings=findings,
         excerpts=tuple(excerpts),
         inspected_paths=tuple(dict.fromkeys(inspected_paths)),
-        limitations=limitations,
+        limitations=tuple(limitations),
         collection_duration_seconds=duration_seconds,
     )
 

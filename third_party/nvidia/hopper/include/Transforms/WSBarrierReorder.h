@@ -4,6 +4,7 @@
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -42,6 +43,80 @@ inline bool hasOrderedWSBarrierInfo(DictionaryAttr wsBarrier) {
   auto maxRegionId = wsBarrier.getAs<IntegerAttr>("maxRegionId");
   return parentId && parentId.getInt() >= 0 && minRegionId &&
          minRegionId.getInt() >= 0 && maxRegionId && maxRegionId.getInt() >= 0;
+}
+
+// Resolve the planner `buffer.id` carried by a buffer value, looking through
+// effect-free single-operand view ops (subslice/subview/reinterpret) to the
+// stamped allocating op. Returns nullopt when the id cannot be resolved (e.g.
+// block arguments); callers treat that as unknown.
+inline std::optional<int> getBufferIdForValue(Value buffer) {
+  Operation *op = buffer.getDefiningOp();
+  // Stop at anything with memory effects: a copy materializes a different
+  // buffer, so its source's id must not be attributed to it.
+  while (op && !op->getAttrOfType<IntegerAttr>("buffer.id")) {
+    if (!isMemoryEffectFree(op) || op->getNumOperands() != 1 ||
+        op->getNumResults() != 1)
+      return std::nullopt;
+    Value src = op->getOperand(0);
+    if (!isa<triton::gpu::MemDescType>(src.getType()) ||
+        !isa<triton::gpu::MemDescType>(op->getResult(0).getType()))
+      return std::nullopt;
+    op = src.getDefiningOp();
+  }
+  if (!op)
+    return std::nullopt;
+  return (int)op->getAttrOfType<IntegerAttr>("buffer.id").getInt();
+}
+
+// True when an operation touching only buffer `bufferId` is provably
+// unaffected by the arrive barrier's signal: the barrier orders accesses to
+// its guarded buffers, and a disjoint buffer shares no storage with them.
+// Missing data on either side is conservative (false).
+inline bool
+isDisjointFromGuardedBuffers(std::optional<int> bufferId,
+                             std::optional<DictionaryAttr> arriveConstraints) {
+  if (!bufferId)
+    return false;
+  auto wsBarrier = getWSBarrierConstraints(arriveConstraints);
+  if (!wsBarrier)
+    return false;
+  auto guarded = wsBarrier.getAs<DenseI32ArrayAttr>("guardedBufferIds");
+  if (!guarded)
+    return false;
+  for (int id : guarded.asArrayRef())
+    if (id == *bufferId)
+      return false;
+  return true;
+}
+
+// Buffer ids touched by a memory op: planner ids stamped on the op itself
+// (alloc results) plus ids reachable from its memdesc operands through views
+// to their allocating ops. Empty when nothing resolves (unknown).
+inline DenseSet<int> getBufferIdsForMemoryOp(Operation *op) {
+  DenseSet<int> ids;
+  if (auto idAttr = op->getAttrOfType<IntegerAttr>("buffer.id"))
+    ids.insert((int)idAttr.getInt());
+  for (Value operand : op->getOperands())
+    if (isa<triton::gpu::MemDescType>(operand.getType()))
+      if (auto id = getBufferIdForValue(operand))
+        ids.insert(*id);
+  return ids;
+}
+
+// True when a memory op provably touches none of the barrier's guarded
+// buffers. Unknown ids on either side are conservative (false).
+inline bool isMemoryOpDisjointFromGuardedSet(Operation *op,
+                                             DictionaryAttr wsBarrier) {
+  auto guarded = wsBarrier.getAs<DenseI32ArrayAttr>("guardedBufferIds");
+  if (!guarded)
+    return false;
+  auto ids = getBufferIdsForMemoryOp(op);
+  if (ids.empty())
+    return false;
+  for (int id : guarded.asArrayRef())
+    if (ids.contains(id))
+      return false;
+  return true;
 }
 
 // Check if two WS barriers can be safely swapped by verifying their
@@ -261,10 +336,15 @@ buildBarrierToMemoryOpMap(Block &block) {
     if (auto arrive = dyn_cast<ArriveBarrierOp>(&op)) {
       if (!hasWSBarrierConstraints(arrive.getConstraints()))
         continue;
+      auto wsBarrier = getWSBarrierConstraints(arrive.getConstraints());
       for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
         if (isNamedBarrierOp(cur))
           break;
         if (isMemoryOp(cur)) {
+          // Skip memory ops the arrive provably does not guard: mapping them
+          // would drag the barrier back across ops that legally sank past it.
+          if (isMemoryOpDisjointFromGuardedSet(cur, wsBarrier))
+            continue;
           map[arrive] = cur;
           break;
         }
@@ -285,26 +365,91 @@ buildBarrierToMemoryOpMap(Block &block) {
   return map;
 }
 
+// Record each op's position in the block before any reordering, so that
+// optimizeWSBarrierLocations can tell which ops a barrier originally guarded.
+inline DenseMap<Operation *, unsigned> buildOriginalBlockOrder(Block &block) {
+  DenseMap<Operation *, unsigned> order;
+  unsigned idx = 0;
+  for (auto &op : block)
+    order[&op] = idx++;
+  return order;
+}
+
 // After tmem_load sinking, relocate WS barriers back to optimal positions
 // relative to their associated memory ops. Arrives go right after their memory
 // op, or after later same-block operand definitions required by SSA. Waits go
 // right before their memory op. Skips moves that would break SSA dominance.
+//
+// The associated memory op is only the nearest one when the map was built, and
+// sinking can reorder the other ops the barrier guards. So a wait moving down
+// stops at the first op on the same buffer that originally followed it, and an
+// arrive moving up stops at the last op on the same buffer that originally
+// preceded it. Otherwise, when a subtile is read twice and the two reads sink
+// by different amounts, one read ends up outside the wait/arrive pair. "Same
+// buffer" compares memdesc roots, so every slot and view of one allocation
+// counts. When the memory op has no memdesc operand, any side-effecting op
+// counts. Ops with regions, and ops missing from `originalOrder`, are treated
+// as guarded.
 inline void optimizeWSBarrierLocations(
-    const DenseMap<Operation *, Operation *> &barrierToMemOp) {
+    const DenseMap<Operation *, Operation *> &barrierToMemOp,
+    const DenseMap<Operation *, unsigned> &originalOrder) {
+  auto memDescRoots = [](Operation *op) {
+    DenseSet<Value> roots;
+    for (Value operand : op->getOperands())
+      if (isa<triton::gpu::MemDescType>(operand.getType()))
+        roots.insert(mlir::getMemDescRoot(operand));
+    return roots;
+  };
+  auto touchesBuffer = [&](Operation *op, const DenseSet<Value> &roots) {
+    if (roots.empty() || op->getNumRegions() != 0)
+      return true;
+    return llvm::any_of(memDescRoots(op),
+                        [&](Value root) { return roots.contains(root); });
+  };
+  auto isGuarded = [&](Operation *op, Operation *barrier, bool isWait,
+                       const DenseSet<Value> &roots) {
+    if (isMemoryEffectFree(op) || !touchesBuffer(op, roots))
+      return false;
+    auto it = originalOrder.find(op);
+    if (it == originalOrder.end())
+      return true;
+    unsigned barrierPos = originalOrder.lookup(barrier);
+    return isWait ? it->second > barrierPos : it->second < barrierPos;
+  };
   for (auto [barrier, memOp] : barrierToMemOp) {
     if (barrier->getBlock() != memOp->getBlock())
       continue;
+    DenseSet<Value> roots = memDescRoots(memOp);
     if (auto arrive = dyn_cast<ArriveBarrierOp>(barrier)) {
       Operation *anchor = getArriveAnchorAfterOperands(arrive, memOp);
+      if (anchor->isBeforeInBlock(barrier)) {
+        for (auto *cur = barrier->getPrevNode(); cur != anchor;
+             cur = cur->getPrevNode()) {
+          if (isGuarded(cur, barrier, /*isWait=*/false, roots)) {
+            anchor = cur;
+            break;
+          }
+        }
+      }
       if (barrier->getPrevNode() != anchor) {
         Operation *target = anchor->getNextNode();
         if (!wouldBreakOperandDominance(barrier, target))
           barrier->moveAfter(anchor);
       }
     } else {
-      if (barrier->getNextNode() != memOp) {
-        if (!wouldBreakOperandDominance(barrier, memOp))
-          barrier->moveBefore(memOp);
+      Operation *target = memOp;
+      if (barrier->isBeforeInBlock(memOp)) {
+        for (auto *cur = barrier->getNextNode(); cur != memOp;
+             cur = cur->getNextNode()) {
+          if (isGuarded(cur, barrier, /*isWait=*/true, roots)) {
+            target = cur;
+            break;
+          }
+        }
+      }
+      if (barrier->getNextNode() != target) {
+        if (!wouldBreakOperandDominance(barrier, target))
+          barrier->moveBefore(target);
       }
     }
   }

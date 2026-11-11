@@ -1,6 +1,6 @@
 // RUN: triton-opt --split-input-file %s | FileCheck %s
 // RUN: triton-opt --split-input-file --allocate-shared-memory-nv --tritongpu-allocate-warp-groups --convert-triton-gpu-to-llvm=compute-capability=90 --convert-nv-gpu-to-llvm %s | FileCheck %s --check-prefix=CHECK-LLVM
-// RUN: triton-opt --split-input-file --triton-nvidia-gpu-plan-cta --mlir-print-local-scope %s | FileCheck %s --check-prefix=CHECK-CTA
+// RUN: triton-opt --split-input-file --triton-nvidia-gpu-assign-cga-layouts --tritongpu-remove-layout-conversions --triton-nvidia-gpu-optimize-cta-locality --tritongpu-remove-layout-conversions --mlir-print-local-scope %s | FileCheck %s --check-prefix=CHECK-CTA
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -16,6 +16,38 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     // CHECK-LLVM-SAME: cp.async.bulk.global.shared::cta.bulk_group
     // CHECK-LLVM: nvvm.cp.async.bulk.commit.group
     ttng.async_store %src, %dst, %size : !ttg.memdesc<1024xi8, #shared, #smem, mutable>, !tt.ptr<i8>
+    tt.return
+  }
+}
+
+// -----
+
+// Test async_store reductions: cp.reduce.async.bulk without a tensor map. The
+// element type picks the PTX type; f16/bf16 ADD uses .noftz and integer MIN/MAX
+// follow store_reduce_signed.
+
+#shared_r = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem_r = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: async_store_reduce
+  // CHECK-LLVM-LABEL: llvm.func @async_store_reduce
+  tt.func @async_store_reduce(%f32: !tt.ptr<f32>, %bf16: !tt.ptr<bf16>, %i32: !tt.ptr<i32>, %size: i32) {
+    %src_f32 = ttg.local_alloc : () -> !ttg.memdesc<128xf32, #shared_r, #smem_r, mutable>
+    %src_bf16 = ttg.local_alloc : () -> !ttg.memdesc<128xbf16, #shared_r, #smem_r, mutable>
+    %src_i32 = ttg.local_alloc : () -> !ttg.memdesc<128xi32, #shared_r, #smem_r, mutable>
+    // CHECK: ttng.async_store {{.*}} {store_reduce = 1 : i32}
+    // CHECK-LLVM: cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$1], [$2], $3;
+    // CHECK-LLVM: nvvm.cp.async.bulk.commit.group
+    ttng.async_store %src_f32, %f32, %size {store_reduce = 1 : i32} : !ttg.memdesc<128xf32, #shared_r, #smem_r, mutable>, !tt.ptr<f32>
+    // CHECK-LLVM: cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.bf16
+    ttng.async_store %src_bf16, %bf16, %size {store_reduce = 1 : i32} : !ttg.memdesc<128xbf16, #shared_r, #smem_r, mutable>, !tt.ptr<bf16>
+    // CHECK-LLVM: cp.reduce.async.bulk.global.shared::cta.bulk_group.min.s32
+    ttng.async_store %src_i32, %i32, %size {store_reduce = 2 : i32, store_reduce_signed = true} : !ttg.memdesc<128xi32, #shared_r, #smem_r, mutable>, !tt.ptr<i32>
+    // CHECK-LLVM: cp.reduce.async.bulk.global.shared::cta.bulk_group.max.u32
+    ttng.async_store %src_i32, %i32, %size {store_reduce = 3 : i32} : !ttg.memdesc<128xi32, #shared_r, #smem_r, mutable>, !tt.ptr<i32>
+    // CHECK-LLVM: cp.reduce.async.bulk.global.shared::cta.bulk_group.xor.b32
+    ttng.async_store %src_i32, %i32, %size {store_reduce = 8 : i32} : !ttg.memdesc<128xi32, #shared_r, #smem_r, mutable>, !tt.ptr<i32>
     tt.return
   }
 }
@@ -50,18 +82,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 
 // -----
 
-// Test PlanCTA with tt.store inside a warp_specialize partition with 1 warp.
-// PlanCTA must use per-op numWarps (1 for partition0), not function-level
-// numWarps (4). Without the fix, the store layout would get warpsPerCTA=[4],
-// which is incorrect for a 1-warp partition.
+// Test the CTA layout pipeline with tt.store inside a warp_specialize
+// partition with 1 warp. Layout assignment must use per-op numWarps
+// (1 for partition0), not function-level numWarps (4). Otherwise the store
+// layout would get warpsPerCTA=[4], which is incorrect for a 1-warp partition.
 
 #blocked2 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CGALayout = [[1]]}>
 #blocked_ws = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0], CGALayout = [[1]]}>
 
 
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-CTA-LABEL: store_ws_plan_cta
-  tt.func @store_ws_plan_cta(%ptr: !tt.ptr<f32>) {
+  // CHECK-CTA-LABEL: store_ws_cga_layouts
+  tt.func @store_ws_cga_layouts(%ptr: !tt.ptr<f32>) {
     ttg.warp_specialize(%ptr)
     default {
       // Default partition (4 warps): store with warpsPerCTA=[4]

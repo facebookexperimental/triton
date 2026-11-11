@@ -1,4 +1,5 @@
 add_triton_library(TritonNvidiaGPUTransforms
+  ToCLC.cpp
   ClusterBarrierMbarAllocator.cpp
   ClusterBarrierInsertion.cpp
   CheckMatmulTwoCTAs.cpp
@@ -7,11 +8,15 @@ add_triton_library(TritonNvidiaGPUTransforms
   FenceInsertion.cpp
   FuseTMemLoadReduce.cpp
   GenerateSubtiledRegion.cpp
+  HoistMBarrierLifecycle.cpp
   InterleaveTMem.cpp
+  MBarrierUtilities.cpp
+  MMACollectorReuse.cpp
   MMALowering.cpp
+  OptimizeCTALocality.cpp
   OptimizeDescriptorEncoding.cpp
   OptimizeTMemLayouts.cpp
-  PlanCTA.cpp
+  AssignCGALayouts.cpp
   PromoteLHSToTMem.cpp
   PromoteLoadToTMA.cpp
   PromoteMBarrierToNamedBarrier.cpp
