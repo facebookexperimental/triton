@@ -1,5 +1,6 @@
 // RUN: triton-opt %s -split-input-file --tritongpu-allocate-warp-groups | FileCheck %s
 // RUN: triton-opt %s -split-input-file --tritongpu-allocate-warp-groups="instrumented=1" | FileCheck %s --check-prefix=INSTRUMENTED
+// RUN: triton-opt %s -split-input-file --tritongpu-allocate-warp-groups -verify-diagnostics | FileCheck %s
 
 // CHECK: module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 4 : i32}
 module attributes {"ttg.num-warps" = 4 : i32} {
@@ -145,6 +146,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.maxnreg = 128 : i32} {
 // CHECK-LABEL: tt.func @fixed_default_registers
 tt.func @fixed_default_registers() {
   // CHECK: actualRegisters = array<i32: 80, 24>
+  // expected-warning @below {{ttg.maxnreg is inconsistent with fully specified partition register counts}}
   ttg.warp_specialize() attributes {defaultRequestedRegisters = 80 : i32, requestedRegisters = array<i32: 24>}
   default {
     ttg.warp_yield
@@ -292,6 +294,137 @@ tt.func @padding_register_floor() {
     ttg.warp_return
   }
   partition1() num_warps(1) {
+    ttg.warp_return
+  } : () -> ()
+  tt.return
+}
+
+}
+
+// -----
+
+// With no user ttg.maxnreg and every partition (default included) requesting
+// registers explicitly, the launch allocation is the requested total spread
+// over all threads: 24 registers on each of the 256 threads (4 default warps,
+// 1 + 1 partition warps, and 2 padding warps), so ttg.maxnreg is 24 instead of
+// the whole 64K register file.
+// CHECK: module attributes {ttg.maxnreg = 24 : i32
+module attributes {"ttg.num-warps" = 4 : i32} {
+
+// CHECK-LABEL: tt.func @computed_maxnreg_all_explicit
+tt.func @computed_maxnreg_all_explicit() {
+  // CHECK: actualRegisters = array<i32: 24, 24, 24, 24>
+  ttg.warp_specialize() attributes {defaultRequestedRegisters = 24 : i32, requestedRegisters = array<i32: 24, 24>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(1) {
+    ttg.warp_return
+  }
+  partition1() num_warps(1) {
+    ttg.warp_return
+  } : () -> ()
+  tt.return
+}
+
+}
+
+// -----
+
+// The computed launch allocation is the per-thread average of the requested
+// total, rounded up to a multiple of 8: (80 * 128 + 24 * 128) / 256 = 52,
+// rounded up to 56. The default partition still receives its full 80 registers
+// dynamically via setmaxnreg.
+// CHECK: module attributes {ttg.maxnreg = 56 : i32
+module attributes {"ttg.num-warps" = 4 : i32} {
+
+// CHECK-LABEL: tt.func @computed_maxnreg_default_heavy
+tt.func @computed_maxnreg_default_heavy() {
+  // CHECK: actualRegisters = array<i32: 80, 24>
+  ttg.warp_specialize() attributes {defaultRequestedRegisters = 80 : i32, requestedRegisters = array<i32: 24>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    ttg.warp_return
+  } : () -> ()
+  tt.return
+}
+
+}
+
+// -----
+
+// With two warp-specialize ops the launch allocation is the max over both
+// ops, not the last one processed: the first op needs 80 registers per
+// thread and the second needs 24, so the module launches at 80.
+// CHECK: module attributes {ttg.maxnreg = 80 : i32
+module attributes {"ttg.num-warps" = 4 : i32} {
+
+// CHECK-LABEL: tt.func @computed_maxnreg_two_ws_ops
+tt.func @computed_maxnreg_two_ws_ops() {
+  // CHECK: actualRegisters = array<i32: 80, 80>
+  ttg.warp_specialize() attributes {defaultRequestedRegisters = 80 : i32, requestedRegisters = array<i32: 80>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    ttg.warp_return
+  } : () -> ()
+  // CHECK: actualRegisters = array<i32: 24, 24>
+  ttg.warp_specialize() attributes {defaultRequestedRegisters = 24 : i32, requestedRegisters = array<i32: 24>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    ttg.warp_return
+  } : () -> ()
+  tt.return
+}
+
+}
+
+// -----
+
+// Requests averaging above the whole register file per thread cannot be
+// met (200 registers on each of 384 threads exceeds the 168/thread file
+// limit), so allocation bails instead of writing an unsatisfiable launch
+// maxnreg.
+// CHECK: module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 12 : i32}
+module attributes {"ttg.num-warps" = 4 : i32} {
+
+// CHECK-LABEL: tt.func @oversubscribed_explicit_bails
+tt.func @oversubscribed_explicit_bails() {
+  // CHECK: ttg.warp_specialize()
+  // CHECK-NOT: actualRegisters
+  // CHECK: tt.return
+  ttg.warp_specialize() attributes {defaultRequestedRegisters = 200 : i32, requestedRegisters = array<i32: 200>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(8) {
+    ttg.warp_return
+  } : () -> ()
+  tt.return
+}
+
+}
+
+// -----
+
+// A user-provided ttg.maxnreg that matches the computed launch allocation
+// (56, as above) is consistent and must not warn.
+// CHECK: module attributes {ttg.maxnreg = 56 : i32
+module attributes {"ttg.num-warps" = 4 : i32, ttg.maxnreg = 56 : i32} {
+
+// CHECK-LABEL: tt.func @user_maxnreg_matches_computed
+tt.func @user_maxnreg_matches_computed() {
+  // CHECK: actualRegisters = array<i32: 80, 24>
+  ttg.warp_specialize() attributes {defaultRequestedRegisters = 80 : i32, requestedRegisters = array<i32: 24>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
     ttg.warp_return
   } : () -> ()
   tt.return

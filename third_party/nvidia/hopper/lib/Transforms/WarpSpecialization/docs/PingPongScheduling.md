@@ -3,8 +3,8 @@
 Ping-pong scheduling enforces mutual exclusion around "expensive" GPU
 operations across warp partitions. When two consumer partitions both execute
 expensive ops on shared hardware resources (tensor cores on Hopper, SFU on
-Blackwell), they alternate execution via named barrier synchronization rather
-than competing simultaneously.
+Blackwell), they alternate execution via mbarrier synchronization rather than
+competing simultaneously.
 
 ## Pipeline Integration
 
@@ -37,16 +37,17 @@ Expensive ops are further classified as:
   asm): memory-effect-free, so the boundary extends forward to the next op
   with memory effects.
 
-## Named Barrier Allocation
+## Barrier Allocation
 
-Ping-pong uses the shared compiler named-barrier pool. IDs 0 and 1 are fixed
-for the default warp group and switch loop, and ID 2 is fixed for the first
-worker partition. Additional worker partitions reserve IDs from the pool
-before optional optimizations. User and existing compiler IDs are then
-removed, and each ping-pong region atomically requests two remaining IDs.
+Each ping-pong region allocates a two-element mbarrier group in shared memory.
+Both barriers are initialized with one arrival credit, threaded into the two
+warp-specialization partitions, invalidated, and deallocated after the
+specialized region. Wait phases are derived from the normalized, linearized
+iteration count of the enclosing loops.
 
-If the pool is exhausted, or if a dynamic user ID prevents the compiler from
-proving which IDs are free, the region is silently skipped.
+The disabled-by-default mbarrier-to-named-barrier pass may later promote the
+whole pair when two compiler IDs are available. If promotion is disabled or
+the pool is exhausted, PingPong remains correct using the original mbarriers.
 
 ## `doPingPongPrep` Algorithm
 
@@ -90,8 +91,8 @@ After code partitioning, walk `WarpSpecializeOp` regions and insert barriers.
 
 ### Step 1: Discover Regions
 
-Scan partition regions for ops with `pingpong_id` attributes. Allocate a barrier
-pair for each region.
+Scan partition regions for ops with `pingpong_id` attributes. Allocate and
+initialize an mbarrier pair for each region.
 
 ### Step 2: Compute Boundaries
 
@@ -134,5 +135,7 @@ pump — it allows the pong partition's first `wait(pongBarrier)` to proceed
 immediately, since pong goes first by definition. Without this, pong would
 deadlock on the first iteration.
 
-The concrete ops inserted are `NamedBarrierArriveOp` and `NamedBarrierWaitOp`,
-with the thread count set to `(numWarps_ping + numWarps_pong) * 32`.
+The concrete ops inserted are `ArriveBarrierOp` and `WaitBarrierOp`. Each
+arrival is a leader arrival with count one. When promotion is enabled, the pair
+is rewritten atomically to `NamedBarrierArriveOp` and `NamedBarrierWaitOp`, with
+the participant count derived from both partitions.

@@ -235,7 +235,7 @@ import inspect
 import sys
 from triton.tlx import ops
 assert 'triton.tlx.ops.kernels.grouped_gemm_mxfp8.sm100' not in sys.modules
-assert str(inspect.signature(ops.grouped_gemm_mxfp8)) == "(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms=None, sf_layout='natural')"
+assert str(inspect.signature(ops.grouped_gemm_mxfp8)) == "(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms=None, sf_layout='natural', space=None)"
 assert 'grouped_gemm_mxfp8' in ops.__all__
 """
     subprocess.run([sys.executable, "-c", script], check=True)

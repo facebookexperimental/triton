@@ -1,0 +1,59 @@
+name: Meta LLVM build requests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - cmake/meta-llvm-build-info.json
+      - cmake/meta-amd-llvm-build-info.json
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Build requests to run from the manifests
+        type: choice
+        default: all
+        options: [all, core, amd]
+      publish:
+        description: Publish immutable GitHub Release assets
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  select:
+    runs-on: 32-core-ubuntu
+    outputs:
+      requests: ${{ steps.requests.outputs.requests }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select build requests
+        id: requests
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          KIND: ${{ inputs.kind }}
+        run: python3 .github/scripts/select_meta_llvm_builds.py
+
+  build:
+    name: Build requested ${{ matrix.request.kind }} SDK
+    needs: select
+    if: needs.select.outputs.requests != '[]'
+    permissions:
+      contents: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        request: ${{ fromJSON(needs.select.outputs.requests) }}
+    uses: ./.github/workflows/meta-llvm-build.yml
+    with:
+      kind: ${{ matrix.request.kind }}
+      llvm_sha: ${{ matrix.request.llvm_sha }}
+      build_number: ${{ matrix.request.build_number }}
+      publish: ${{ github.event_name == 'push' || inputs.publish }}

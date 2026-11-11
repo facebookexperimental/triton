@@ -34,6 +34,11 @@
 <a href="utilities.html">Other operations</a>
 <a href="kernels.html">Tutorial kernels</a>
 <a href="tlx-ops.html">High-performance kernels</a>
+<a href="tlx-sm90.html">TLX on sm90 (Hopper)</a>
+<a href="tlx-sm100.html">TLX on sm100 (Blackwell)</a>
+<a href="tlx-gfx942.html">TLX on gfx942 (MI300)</a>
+<a href="tlx-gfx950.html">TLX on gfx950 (MI350)</a>
+<a href="tlx-gfx1250.html">TLX on gfx1250 (RDNA4)</a>
 <a href="testing.html">Testing</a>
 <a href="resources.html">Further reading</a></nav>
     </aside>
@@ -127,20 +132,30 @@
    # TMA atomic reduce-add with L2 evict_first hint
    tlx.async_descriptor_store(desc_c, c_buf[0], [offs_m, offs_n],
                               eviction_policy=&quot;evict_first&quot;, store_reduce=&quot;add&quot;)</code></pre>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier)</code> <strong>[sm90+]</strong></div></div>
-<p>Store a distributed tensor into a buffer in the remote shared memory of a cluster asynchronously. Signals the provided mbarrier when the store completes.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier, store_reduce=&quot;&quot;)</code> <strong>[NVIDIA sm90+]</strong></div></div>
+<p>Asynchronously store a register-source distributed tensor into cluster shared memory, or atomically reduce it with <code>store_reduce=&quot;add&quot;</code>, <code>&quot;min&quot;</code>, <code>&quot;max&quot;</code>, <code>&quot;and&quot;</code>, <code>&quot;or&quot;</code>, <code>&quot;xor&quot;</code>, <code>&quot;inc&quot;</code>, or <code>&quot;dec&quot;</code>. The default <code>store_reduce=&quot;&quot;</code> preserves the regular store behavior. ADD, MIN, MAX, AND, OR, and XOR support <code>int32</code> and <code>uint32</code>; INC and DEC support only <code>uint32</code>. Source/destination shapes and element types must match, and the destination must be mutable.</p>
+<p>MIN/MAX use signed comparisons for <code>int32</code> and unsigned comparisons for <code>uint32</code>. For INC/DEC, each source value is a bound <code>b</code>, not an amount to add or subtract: <code>inc(old, b)</code> returns zero when <code>old &gt;= b</code>, otherwise <code>old + 1</code>; <code>dec(old, b)</code> returns <code>b</code> when <code>old == 0</code> or <code>old &gt; b</code>, otherwise <code>old - 1</code>.</p>
+<p>Reductions require a cluster containing at least two physical CTAs, configured through either <code>num_ctas</code> or <code>ctas_per_cga</code>. A physical two-CTA launch with logical <code>num_ctas=1</code> is supported. <code>remote_cta_rank</code> may name a peer CTA or the executing CTA itself; destination and completion barrier are mapped to the same rank.</p>
+<p>Regular stores use <code>st.async</code>; reductions use scalar <code>red.async.relaxed.cluster.shared::cluster.mbarrier::complete_tx::bytes.&lt;op&gt;.&lt;type&gt;</code>. ADD uses <code>.add.u32</code> for both signed and unsigned inputs because their 32-bit sums have the same bit-level result. MIN/MAX use <code>.s32</code> or <code>.u32</code>; bitwise operations use <code>.b32</code>; INC/DEC use <code>.u32</code>. These instructions use the <strong>generic proxy</strong>, not the async proxy: asynchronous completion alone does not require <code>fence(&quot;async_shared_cluster&quot;)</code>.</p>
+<p>Each executed reduction completes <strong>4 bytes per unique logical element</strong> on the receiving mbarrier, without an additional arrival. Allocate barriers with <code>scope=&quot;cluster&quot;</code> for compiler-owned initialization visibility; this does not replace application-owned destination initialization, expected-byte registration, data-ready synchronization, completion waits, or storage lifetime protection. Expected-byte registration can follow transaction completion, but barrier initialization must precede remote use. Wait on the receiving barrier before consuming the result. Keep every participating CTA's destination and barrier storage alive until all remote operations finish, including a final cluster rendezvous before exit or storage reuse.</p>
 <p><strong>Parameters:</strong></p>
 <div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>dst</code>: The destination buffer in local shared memory (will be internally mapped to the remote CTA)</div></div>
-<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>src</code>: The source distributed tensor to store</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>src</code>: The register-source distributed tensor; for INC/DEC, each element is a bound</div></div>
 <div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>remote_cta_rank</code>: The rank (unique ID) of the remote CTA within the cluster</div></div>
-<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>barrier</code>: mbarrier to signal when the store completes</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>barrier</code>: Mutable local shared-memory mbarrier mapped to the same CTA as <code>dst</code> for completion</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>store_reduce</code>: <code>&quot;&quot;</code> for a regular store, or <code>&quot;add&quot;</code>, <code>&quot;min&quot;</code>, <code>&quot;max&quot;</code>, <code>&quot;and&quot;</code>, <code>&quot;or&quot;</code>, <code>&quot;xor&quot;</code>, <code>&quot;inc&quot;</code>, or <code>&quot;dec&quot;</code> for a 32-bit integer reduction</div></div>
 <p><strong>Example:</strong></p>
 <pre><code class="language-python">   # Allocate shared memory buffer and barrier
    buffer = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
-   barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+   barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1, scope=&quot;cluster&quot;)
 
    # Store to remote CTA&#x27;s shared memory
-   tlx.async_remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1, barrier=barrier[0])</code></pre>
+   tlx.async_remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1, barrier=barrier[0])
+
+   # Integer register-source reduction after initialization, expected-byte
+   # registration, and a cluster rendezvous (int_buffer matches src_i32).
+   tlx.async_remote_shmem_store(int_buffer[0], src_i32, remote_cta_rank=1,
+                                barrier=barrier[0], store_reduce=&quot;add&quot;)</code></pre>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.remote_shmem_copy(dst, src, remote_cta_rank)</code> <strong>[sm90+]</strong></div></div>
 <p>Store a local shared memory buffer into a buffer in the remote shared memory of a cluster asynchronously.</p>
 <p><strong>Parameters:</strong></p>
@@ -223,17 +238,18 @@
    # Reinterpret for use with TMA
    a_desc = tlx.reinterpret_tensor_descriptor(desc_ptr=desc_ptrs[0], block_shape=[128, 64], dtype=tl.float16)
    tlx.async_descriptor_load(a_desc, buffer, offsets=[offs_m, offs_k], barrier=mbar)</code></pre>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)</code> <strong>[sm90+, gfx950]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)</code> <strong>[sm90+, gfx942+]</strong></div></div>
 <p>Load a chunk of data from global memory into a local memory buffer asynchronously.</p>
 <p>The operation returns a token object which can be used to track the completion of the operation.</p>
-<p><strong>MI350X caveat:</strong> When <code>mask</code> is provided, callers should also provide <code>other</code>—typically <code>0.0</code> for numerical kernels. Elements for which <code>mask=True</code> are copied from global memory into the destination local buffer. For elements where <code>mask=False</code>, <code>other</code> is written only if it is provided. Otherwise, the corresponding LDS locations retain unspecified, potentially stale contents from an earlier use of the buffer.</p>
-<p>For example, in FlashAttention, when the sequence length is not a multiple of <code>BLOCK_N</code>, the final <code>V</code> tile contains masked-out rows. If <code>other</code> is omitted, those rows may contain unspecified values, including bit patterns representing NaN or infinity. These values can propagate through the subsequent matrix multiplication and produce incorrect output. Use <code>other=0.0</code> for such padded tiles.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_load_commit_group(tokens)</code> <strong>[sm90+, gfx950]</strong></div></div>
+<p>On AMD, the non-bulk path uses target-specific direct-to-LDS lowering or a synchronous fallback when the copy cannot be issued directly. Direct transfers require 32 bits per lane on gfx942, 32 or 128 bits on gfx950, or 32, 64, or 128 bits on gfx1250. A supported API does not guarantee a hardware-asynchronous transfer. The <code>bulk=True</code> path is NVIDIA-specific; use TDM descriptor loads on gfx1250 for descriptor-based transfers. See the <a href="https://github.com/facebookexperimental/triton/blob/main/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp" target="_blank" rel="noreferrer">AMD copy lowering</a>.</p>
+<p><strong>Masked copies:</strong> The TLX frontend defaults <code>other</code> to <code>0.0</code> when <code>mask</code> is provided and <code>other</code> is omitted. Pass another <code>other</code> value explicitly if the masked-out elements need a different fill. This applies to the non-bulk copy path; bulk mode does not accept <code>mask</code> or <code>other</code>. See the <a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/language/tlx/mem_ops.py" target="_blank" rel="noreferrer">frontend implementation</a>.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_load_commit_group(tokens)</code> <strong>[sm90+, gfx942+]</strong></div></div>
 <p>Commits all prior initiated but uncommitted async_load ops an async group. Optionally, each token represents a tracked async load operation.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_load_wait_group(pendings, tokens)</code> <strong>[sm90+, gfx950]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_load_wait_group(pendings, tokens)</code> <strong>[sm90+, gfx942+]</strong></div></div>
 <p>Wait for completion of prior asynchronous copy operations. The <code>pendings</code> argument indicates the number of in-flight operations not completed. Optionally, each token represents a tracked async commit group operation.</p>
 <h2 id="tlx-buffer-load-to-local"><code>tlx.buffer_load_to_local</code></h2>
-<p>Async load from global memory directly into shared (local) memory, bypassing registers. This is useful for producer warps that prefetch data into shared memory for other warps to consume.</p>
+<p><strong>[gfx942, gfx950]</strong></p>
+<p>Async load from global memory directly into shared (local) memory, bypassing registers. This is useful for producer warps that prefetch data into shared memory for other warps to consume. Unlike pointer-based <code>async_load</code>, this explicit buffer operation is rejected on gfx1250 by the <a href="https://github.com/facebookexperimental/triton/blob/main/third_party/amd/lib/Dialect/TritonAMDGPU/IR/Dialect.cpp" target="_blank" rel="noreferrer">target verifier</a>; use the TDM path there.</p>
 <pre><code class="language-python">token = tlx.buffer_load_to_local(
     dest,
     ptr,
@@ -247,7 +263,7 @@
 <p><strong>Returns</strong>: A <code>tlx.async_token</code> that can be used with <code>tlx.async_load_wait_group()</code> to synchronize on the completion of the transfer.</p>
 <p>Lowers to <code>amdg.buffer_load_to_local</code>, which is eventually lowered to <code>rocdl.raw.ptr.buffer.load.async.lds</code> — a single hardware instruction that moves data from global memory to LDS without going through VGPRs.</p>
 <p><strong>Requirements.</strong> The direct-to-LDS copy has the following hardware constraints:</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Vector width.</strong> Each thread's load must reach a supported direct-to-LDS width (<strong>32 or 128 bits</strong>). If it can only be vectorized to a smaller width, it cannot be lowered.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Vector width.</strong> Each thread's load must reach <strong>32 bits on gfx942</strong>, or <strong>32 or 128 bits on gfx950</strong>. If it can only be vectorized to a smaller width, it cannot be lowered. These widths come from the <a href="https://github.com/facebookexperimental/triton/blob/main/third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp" target="_blank" rel="noreferrer">target feature checks</a>.</div></div>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Provable pointer/offset alignment.</strong> The compiler must be able to *prove* the alignment that vector width needs.</div></div>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Mask alignment.</strong> If <code>mask</code> is given it must be aligned to the vector width: each group of (vector width) consecutive mask values must be identical. The copy transfers each lane's whole vector in one transaction, so a mask whose <code>True</code>/<code>False</code> boundary cannot be proven vector-aligned (e.g. <code>offs &lt; K</code> for a runtime <code>K</code>) forces per-element vectorization and cannot lower.</div></div>
 <p><code>contiguity=N</code> is an opt-in correctness contract, not a speculative hint. It promises that each per-thread group of <code>N</code> offsets is numerically consecutive and suitably aligned, and that <code>mask</code> and <code>other</code>, when present, are uniform within each group. <code>N</code> must be a positive power of two and divide the number of elements owned by each thread. A false promise can change the values loaded.</p>

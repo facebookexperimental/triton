@@ -25,6 +25,7 @@ from ..optimizer.agent import CandidateProvider
 from ..policy_source import frozen_source_digest
 from .benchmark_environment import canonical_arch
 from .harness import SubprocessHarness
+from .optimization_suites import GFX942_MM_OPTIMIZATION_SUITES
 from .orchestrator import KernelOptimizer
 from .policy import is_acceptable_winner
 from .vcs import commit_winner, prepare_auto_commit
@@ -40,8 +41,14 @@ def infer_kernel_path(repository: Path, op: str, arch: str) -> Path:
 
 
 def production_cases(op: str, suite: str) -> tuple[InputCase, ...]:
-    shapes = importlib.import_module(f"triton.tlx.ops.kernels.{op}._shapes")
-    entries = shapes.FOCUS.resolved_shapes(suite)
+    optimization_entries = (
+        GFX942_MM_OPTIMIZATION_SUITES.get(suite) if op == "mm" else None
+    )
+    if optimization_entries is None:
+        shapes = importlib.import_module(f"triton.tlx.ops.kernels.{op}._shapes")
+        entries = shapes.FOCUS.resolved_shapes(suite)
+    else:
+        entries = optimization_entries
     cases = []
     for entry in entries:
         parameters = dict(entry._asdict())
@@ -67,6 +74,7 @@ def run_tuning(
     commit_message: str | None,
     vcs: str,
     initial_source: str | None = None,
+    device_environments: tuple[dict[str, str], ...] = (),
 ) -> tuple[int, dict[str, Any]]:
     kernel_path = infer_kernel_path(repository, op, arch)
     original_source = initial_source if initial_source is not None else kernel_path.read_text()
@@ -82,6 +90,46 @@ def run_tuning(
     # Kept in the API for CLI compatibility. Tuning treats the existing full
     # space as its fixed oracle and edits only the dispatch decision tree.
     del search_rounds
+
+    oracle_target = _phase_target(
+        target,
+        phase="full",
+        source=original_source,
+        editable_symbols=(),
+        guidance="Measure the fixed full configuration space.",
+    )
+    oracle_path = output_dir / "full_space_oracle.json"
+    if device_environments:
+        oracle_target = replace(
+            oracle_target,
+            environment={
+                **oracle_target.environment,
+                "TLX_AGENT_DEVICE_POOL": json.dumps(device_environments),
+                "TLX_AGENT_CHECKPOINT_DIR": str((output_dir / "oracle_cases").resolve()),
+            },
+        )
+    print(f"[tlx-agent] measuring full-space oracle for {len(cases)} shapes", flush=True)
+    oracle = SubprocessHarness(
+        harness_path,
+        None,  # type: ignore[arg-type] -- full-space measurement has no aggregate timeout.
+    ).evaluate(
+        original_source,
+        cases,
+        oracle_target,
+        budget.benchmark_repetitions,
+        profile=False,
+    )
+    oracle_path.write_text(json.dumps(to_json_value(oracle), indent=2, sort_keys=True) + "\n")
+    failed = [
+        f"{case.case_id}: {case.verification.diagnostics or 'no timing'}"
+        for case in oracle.cases
+        if not case.verification.passed or case.timing is None
+    ]
+    if failed:
+        raise RuntimeError(
+            "full-space oracle failed for:\n  " + "\n  ".join(failed)
+        )
+    print(f"[tlx-agent] saved full-space oracle to {oracle_path}", flush=True)
 
     heuristic_target = _phase_target(
         target,
@@ -105,6 +153,18 @@ def run_tuning(
             "progressive": True,
         },
     )
+    heuristic_target = replace(
+        heuristic_target,
+        environment={
+            **heuristic_target.environment,
+            "TLX_AGENT_FULL_SPACE_ORACLE": str(oracle_path.resolve()),
+            **(
+                {"TLX_AGENT_DEVICE_POOL": json.dumps(device_environments)}
+                if device_environments
+                else {}
+            ),
+        },
+    )
     heuristic_budget = replace(budget, max_rounds=heuristic_rounds, min_speedup=1.0)
     heuristic_request = KernelOptimizationRequest(
         kernel_source=original_source,
@@ -121,6 +181,8 @@ def run_tuning(
     final_source = heuristic_result.best_kernel
     output_dir.joinpath("best_kernel.py").write_text(final_source)
     summary = _parity_summary(heuristic_result.final, cases)
+    recall_before = _recall_summary(heuristic_result.baseline)
+    recall_after = _recall_summary(heuristic_result.final)
     summary.update({
         "success": passed,
         "task": "tuning",
@@ -131,6 +193,9 @@ def run_tuning(
         "winner_experiment_id": heuristic_result.winner_experiment_id,
         "heuristic_speedup": heuristic_result.final.aggregate_speedup,
         "best_kernel": str(output_dir / "best_kernel.py"),
+        "full_space_oracle": str(oracle_path),
+        "recall_before": recall_before,
+        "recall_after": recall_after,
         "result": str(output_dir / "result.json"),
     })
     output_dir.joinpath("summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
@@ -212,6 +277,34 @@ def _parity_summary(
     }
 
 
+def _recall_summary(performance: PerformanceSummary) -> dict[str, int | float]:
+    matches = 0
+    unresolved = 0
+    for evaluation in performance.cases:
+        metrics = evaluation.verification.metrics
+        heuristic = _config_signature(metrics.get("heuristic_config"))
+        # Empty: the harness cannot name the selected config (e.g. non-register paths), so it is not a miss.
+        if not heuristic:
+            unresolved += 1
+            continue
+        full = _config_signature(metrics.get("full_best_config"))
+        matches += heuristic == full
+    total = len(performance.cases) - unresolved
+    return {
+        "matched_shapes": matches,
+        "total_shapes": total,
+        "unresolved_shapes": unresolved,
+        "rate": matches / total if total else 0.0,
+    }
+
+
+def _config_signature(config: Any) -> tuple[str, ...]:
+    if not config:
+        return ()
+    specification = str(config).split(": ", 1)[-1]
+    return tuple(sorted(specification.split()))
+
+
 def _maximum_full_config_count(performance: PerformanceSummary) -> int:
     return max(
         (int(evaluation.verification.metrics.get("full_config_count", 0)) for evaluation in performance.cases),
@@ -252,6 +345,7 @@ def _tuning_target(op: str, arch: str) -> KernelTarget:
         backend = "cuda"
     else:
         raise SystemExit(f"cannot infer GPU backend from --arch {arch!r}")
+    is_amd_mm = backend == "hip" and op == "mm"
     return KernelTarget(
         backend=backend,
         architecture=architecture,
@@ -259,7 +353,18 @@ def _tuning_target(op: str, arch: str) -> KernelTarget:
         environment={"TLX_AGENT_OP": op},
         optimization_guidance=(
             f"Tune the production {architecture} tlx.ops.{op} implementation from measured evidence. "
-            "Preserve correctness, public entry points, and every incumbent configuration."),
+            "Preserve correctness, public entry points, and every incumbent configuration. "
+            "Use the per-case roofline (binding limiter and fraction of its ceiling) with "
+            "native-profiler and ATT evidence to identify the bottleneck, and cite the measured "
+            "headroom behind each optimization direction. "
+            "After two rejected parameter-only hypotheses, use profiler evidence and repository "
+            "research to propose a structural kernel hypothesis."),
+        optimization_skills=(("optimize-amd-gemm", ) if is_amd_mm else ()),
+        evaluation_policy={
+            "require_native_profiler": architecture == "gfx942" and op == "mm",
+            "require_roofline": architecture == "gfx942" and op == "mm",
+            "parameter_hypothesis_limit": 2,
+        },
         supported_experiment_kinds=(ExperimentKind.PROMOTABLE, ExperimentKind.HUMAN_REVIEW),
     )
 

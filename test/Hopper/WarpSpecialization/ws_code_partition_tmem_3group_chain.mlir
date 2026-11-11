@@ -12,7 +12,7 @@
 // CHECK-NOT: no unique dependency-chain order
 // CHECK: remark: loc("dq"): reuse barrier: channel {{[0-9]+}} waits on channel {{[0-9]+}} (intra-iteration)
 // CHECK-NEXT: {{.*}}note: loc("dq"): see current operation: nvws.producer_acquire
-// CHECK-SAME: constraints = {WSBarrier = {dstTask = 3 : i32}}
+// CHECK-SAME: constraints = {WSBarrier = {dstTask = 3 : i32, guardedBufferIds = array<i32: 8>}}
 // CHECK: nvws.producer_acquire {{.*}}%dq_{{[0-9]+}}, %dq_{{[0-9]+}}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

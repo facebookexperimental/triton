@@ -47,8 +47,11 @@ SmallVector<AsyncOp> castAsyncOpAttrs(ArrayAttr opAttrs) {
 } // namespace semaphore
 
 Operation *createAlloc(OpBuilder &builder, Location loc,
-                       MemDescType memDescType, Value src) {
+                       MemDescType memDescType, Value src,
+                       std::optional<int32_t> alignment) {
   if (isa<SharedMemorySpaceAttr>(memDescType.getMemorySpace())) {
+    if (alignment)
+      return LocalAllocOp::create(builder, loc, memDescType, src, *alignment);
     return LocalAllocOp::create(builder, loc, memDescType, src);
   } else {
     assert(isa<TensorMemorySpaceAttr>(memDescType.getMemorySpace()));
@@ -91,10 +94,10 @@ MemDescType getArefMultiBufferedType(MemDescType bufTy, int depth) {
                                /*mutableMemory*/ true);
 }
 
-scf::ForOp getOuterWSLoop(scf::ForOp innerFor) {
-  auto wsLoop = innerFor;
+LoopLikeOpInterface getOuterWSLoop(LoopLikeOpInterface loop) {
+  auto wsLoop = loop;
   while (wsLoop && !wsLoop->hasAttr(triton::kWarpSpecializeAttrName)) {
-    wsLoop = wsLoop->getParentOfType<scf::ForOp>();
+    wsLoop = wsLoop->getParentOfType<LoopLikeOpInterface>();
   }
   return wsLoop;
 }

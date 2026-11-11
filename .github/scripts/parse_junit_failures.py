@@ -146,6 +146,23 @@ def build_missing_junit_item(missing_paths, workflow, job):
     }
 
 
+def build_gpu_unhealthy_item(workflow, job):
+    """Build the job-level item for a runner whose GPU failed the health check before any test ran."""
+    norm = "gpu-unhealthy"
+    return {
+        "normalized_failure_id": norm,
+        "raw_failure_ids": "",
+        "issue_title": f"[nightly] {workflow} / {job} / {norm}",
+        "job_name": job,
+        "summary": "The runner's GPU failed the health check in the Tune Nvidia GPU step; no test ran.",
+        "repro": "",
+        # No test ran -> reconcile must not close.
+        "fallback": True,
+        "external_dep": True,
+        "external_dep_reason": "GPU unresponsive on the runner (runner infra)",
+    }
+
+
 def parse_budget(spec):
     """Parse a ``--budget`` pair, ``<junit-xml-path>=<timeout-minutes>``."""
     path, sep, minutes = spec.rpartition("=")
@@ -250,6 +267,11 @@ def main():
         help="Stable bucket id for the fallback item emitted when --failed is set.",
     )
     parser.add_argument(
+        "--gpu-unhealthy",
+        action="store_true",
+        help="The GPU health check failed: report the runner instead of parsing test output.",
+    )
+    parser.add_argument(
         "--budget",
         action="append",
         default=[],
@@ -265,15 +287,18 @@ def main():
     )
     args = parser.parse_args()
 
-    failures, missing_paths = collect_failures(args.junit)
-    items = build_items(failures, args.workflow, args.job)
-    if not items and missing_paths:
-        items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
-    if not items and args.failed:
-        items.append(build_bucket_item(args.bucket, args.workflow, args.job))
-    # Appended after the fallback guards: a slow-step item must not suppress the
-    # job-level fallback that a genuine failure needs.
-    items += build_slow_items([parse_budget(b) for b in args.budget], args.slow_threshold, args.workflow, args.job)
+    if args.gpu_unhealthy:
+        items = [build_gpu_unhealthy_item(args.workflow, args.job)]
+    else:
+        failures, missing_paths = collect_failures(args.junit)
+        items = build_items(failures, args.workflow, args.job)
+        if not items and missing_paths:
+            items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
+        if not items and args.failed:
+            items.append(build_bucket_item(args.bucket, args.workflow, args.job))
+        # Appended after the fallback guards: a slow-step item must not suppress the
+        # job-level fallback that a genuine failure needs.
+        items += build_slow_items([parse_budget(b) for b in args.budget], args.slow_threshold, args.workflow, args.job)
     payload = json.dumps(items)
 
     # TODO(scuba): in a follow-up, also emit a metrics row per failure

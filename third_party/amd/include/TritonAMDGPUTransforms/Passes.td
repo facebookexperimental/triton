@@ -42,7 +42,8 @@ def TritonAMDGPUAccelerateMatmul
     (e.g., AMD matrix cores)
   }];
 
-  let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect"];
+  let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect",
+                           "mlir::math::MathDialect"];
 
   let options =
       [Option<"gfxArch", "gfx-arch", "std::string", /*default=*/"std::string{}",
@@ -86,6 +87,10 @@ def TritonAMDGPUSinkLayoutConversions
   let description = [{
     This pass sinks layout conversions after the last dealloc but before the first use in their block.
     This helps to avoid unnecessary shared memory allocation.
+    It also moves conversions between amdg.cond_barrier(p) and a following
+    amdg.cond_barrier(~p) in the same block after the closing barrier, where both
+    warp groups are back in phase. Barriers whose predicates are not provably
+    complementary are left alone.
   }];
 
   let dependentDialects = [];
@@ -386,6 +391,35 @@ def TritonAMDGPUConvertToTensorOps
   }];
 }
 
+def TritonAMDGPUPreserveWarpPipelineOwners
+    : Pass<"tritonamdgpu-preserve-warp-pipeline-owners", "mlir::ModuleOp"> {
+  let summary = "Preserve warp-pipeline loop ownership across loop folding";
+
+  let description = [{
+    Add internal begin/end markers around loops that directly own warp-pipeline
+    stage borders.  The markers survive loop folding and unrolling, allowing
+    the late warp-pipeline pass to recover the original owner scope.  Stage
+    borders on statically single-trip loops are removed because phase-shifting
+    one iteration cannot overlap loop iterations.
+  }];
+
+  let dependentDialects = ["mlir::ROCDL::ROCDLDialect"];
+}
+
+def TritonAMDGPUNormalizeWarpPipeline
+    : Pass<"tritonamdgpu-normalize-warp-pipeline", "mlir::ModuleOp"> {
+  let summary = "Place compiler-generated inputs inside warp-pipeline stages";
+
+  let description = [{
+    Run after layout propagation and loop unrolling, before warp-pipeline
+    stage construction. Keep operations inside explicit begin/end markers in
+    their stages. Assign operations outside those markers to the latest stage
+    that dominates every use. Move only pure scalar operations and layout
+    conversions that need no shared memory. Keep operand order and stay in the
+    same block and owner scope. Report an error if no legal stage exists.
+  }];
+}
+
 def TritonAMDGPUWarpPipeline
     : Pass<"tritonamdgpu-warp-pipeline", "mlir::ModuleOp"> {
   let summary = "partition and pipeline";
@@ -448,8 +482,7 @@ def TritonAMDGPUDotDecomposeAndSchedule
 
 def TritonAMDGPUSchedGroupBarrierScheduler
     : Pass<"tritonamdgpu-sched-group-barrier-scheduler", "mlir::ModuleOp"> {
-  let summary =
-      "Price TTGIR operations for AMD sched_group_barrier scheduling";
+  let summary = "Price TTGIR operations for AMD sched_group_barrier scheduling";
 
   let description = [{
     Runs at the end of the AMD TTGIR pipeline, after transformations that can
@@ -463,18 +496,40 @@ def TritonAMDGPUSchedGroupBarrierScheduler
     region.
   }];
 
-  let options = [
-    Option<"mfmaPerDwordx4", "mfma-per-dwordx4", "unsigned", /*default=*/"4",
-           "MFMA cover for a 128-bit VMEM read; narrower reads scale down.">,
-    Option<"requiredRegionCount", "required-region-count", "unsigned",
-           /*default=*/"0",
-           "Schedule only blocks with this many Membar-delimited regions; "
-           "zero accepts any region count.">,
+  let options =
+      [Option<"mfmaPerDwordx4", "mfma-per-dwordx4", "unsigned", /*default=*/"4",
+              "MFMA cover for a 128-bit VMEM read; narrower reads scale down.">,
+       Option<"requiredRegionCount", "required-region-count", "unsigned",
+              /*default=*/"0",
+              "Schedule only blocks with this many Membar-delimited regions; "
+              "zero accepts any region count.">,
   ];
 
   let dependentDialects = ["mlir::triton::TritonDialect",
                            "mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::amdgpu::TritonAMDGPUDialect"];
+}
+
+def TritonAMDGPUIntraWavePipeline
+    : Pass<"tritonamdgpu-intra-wave-pipeline", "mlir::ModuleOp"> {
+  let summary =
+      "Lower explicit TLX intra-wave regions to AMD scheduling groups";
+
+  let description = [{
+    Consumes either one unpaired mixed region or two adjacent regions with the
+    same explicit pair emitted by
+    tlx.warp_pipeline_stage(scope="intra_wave"). The source defines the
+    complete memory/compute cover set; this pass validates or partitions the
+    window, derives the machine-instruction counts represented by its TTGIR
+    operations, and emits sched_group_barrier constraints. It does not split
+    or phase-shift warp groups and does not add operations from outside the
+    explicit regions.
+  }];
+
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect",
+                           "mlir::ROCDL::ROCDLDialect"];
 }
 
 #endif
