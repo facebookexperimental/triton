@@ -312,9 +312,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   // DATAPART-LABEL: @while_data_partition
-  // DATAPART: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>
+  // Each partition's sliced load stays with its own dot (load, dot, load, dot):
+  // serializeDataPartitionedOps groups the clones per partition instead of
+  // interleaving both loads ahead of both dots.
   // DATAPART: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>
   // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
+  // DATAPART: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>
   // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
   tt.func public @while_data_partition(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>, %out: !tt.ptr<f32>, %arg2: i32) {
     %true = arith.constant {async_task_id = array<i32: 0, 1, 2>} true
@@ -353,8 +356,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   // DATAPART-LABEL: @while_descriptor_data_partition
   // DATAPART: scf.while
-  // DATAPART: tt.descriptor_load {{.*}} : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16
+  // The second slice's offset advance is still materialized, now hoisted ahead
+  // of both sliced descriptor loads rather than sitting between them.
   // DATAPART: arith.addi %{{.*}}, %{{.*}} : i32
+  // DATAPART: tt.descriptor_load {{.*}} : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16
   // DATAPART: tt.descriptor_load {{.*}} : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16
   // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
   // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
@@ -450,13 +455,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // registers; the data-partition mechanics are identical for tc_gen5_mma.)
   // DATAPART-LABEL: @while_clc_data_partition
   // DATAPART: scf.while
-  // DATAPART: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>
-  // DATAPART: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>
-  // The two consumer warp groups each get an M/2 = 64 slice of the accumulator.
-  // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
-  // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
-  // The CLC advance (loop-carried valid producer, task 0) is left intact.
+  // The CLC advance (loop-carried valid producer, task 0) is left intact. It
+  // carries no partition id, so it now precedes the per-partition chains.
   // DATAPART: ttng.clc_advance
+  // The two consumer warp groups each get an M/2 = 64 slice of the accumulator,
+  // each slice's load emitted with its own dot.
+  // DATAPART: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>
+  // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
+  // DATAPART: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>
+  // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
   tt.func public @while_clc_data_partition(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>, %out: !tt.ptr<f32>) {
     %true = arith.constant {async_task_id = array<i32: 0, 1, 2>} true
     %acc_init = arith.constant {async_task_id = array<i32: 1, 2>} dense<0.000000e+00> : tensor<128x256xf32, #mma>
