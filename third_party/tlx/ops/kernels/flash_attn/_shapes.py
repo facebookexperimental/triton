@@ -56,6 +56,15 @@ FOCUS_SUITES = (
         ),
     ),
     FocusSuite(
+        name="sm100_d256_batch1024",
+        op="flash_attn",
+        shapes=(
+            FlashAttentionShape(1024, 1, 200, 256, False, "bf16"),
+            FlashAttentionShape(1024, 1, 400, 256, False, "bf16"),
+            FlashAttentionShape(1024, 1, 600, 256, False, "bf16"),
+        ),
+    ),
+    FocusSuite(
         name="gfx950_1",
         op="flash_attn",
         shapes=(
