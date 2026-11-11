@@ -6,6 +6,7 @@ include "mlir/IR/OpBase.td"
 def Gluon_Dialect : Dialect {
   let name = "gluon";
   let cppNamespace = "::mlir::triton::gluon";
+  let useStrictPropertiesInAssemblyFormat = 0;
   let description = [{
     Gluon dialect.
   }];

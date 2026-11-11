@@ -29,12 +29,6 @@ namespace tt = mlir::triton;
 constexpr llvm::StringLiteral kAtomicBroadcastCopiesAttrName =
     "ttg.atomic_broadcast_copies";
 
-// Set on a ConsumerReleaseOp whose consumers read the buffer with a generic
-// SMEM load (local_load). Token lowering fences such a release when the
-// producer refills the buffer through the async proxy (TMA).
-constexpr llvm::StringLiteral kGenericSmemReadsAttrName =
-    "ttg.ws_generic_smem_reads";
-
 // Strip every warp-specialization metadata attribute that AutoWS stamps on
 // ops/loops. Every graceful-reject path must call this so the downstream
 // tritongpu-pipeline pass sees a plain, compilable non-WS kernel; a leftover WS
@@ -137,16 +131,11 @@ public:
 
   Operation *allocOp;
 
-  // Producer op (ttg.local_store / async_tma_copy / the in-body template store
-  // of a ttng.subtiled_region), resolved and cached in createAllocChannel at
-  // channel-creation time, before any buffer rewriting. getSrcOp() returns this
-  // when set. Caching is required for subtiled-region producers: when a
-  // *sibling* channel that shares the same template store is lowered,
-  // insertAsyncComm rewires the in-body store and removes the shared per-tile
-  // buffer position, so a later alloc-walk in getSrcOp() would find nothing and
-  // return null (SIGSEGV at the getSrcOp()->getBlock() deref). The template op
-  // itself survives, so the cached pointer stays valid. Null for direct
-  // alloc-with-src producers.
+  // In-body template producer for a ttng.subtiled_region, resolved and cached
+  // at channel-creation time. When a sibling channel sharing the template is
+  // lowered, an alloc-user walk can no longer find it, but the template op
+  // itself survives. Ordinary producers must not be cached: TMA lowering may
+  // erase them, and getSrcOp() must instead discover their live replacement.
   Operation *cachedSrcOp = nullptr;
 
   // For a collapsed both-endpoints-subtiled channel, the per-tile staging

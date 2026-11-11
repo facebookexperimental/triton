@@ -10,6 +10,8 @@
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
+#include "nvidia/lib/TritonNVIDIAGPUToLLVM/Allocation.h"
+#include "nvidia/lib/TritonNVIDIAGPUToLLVM/TargetInfo.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -2404,6 +2406,7 @@ static unsigned allocateSmemBuffersViaSearch(
   // output-store staging is single-store, instead of deferring the whole
   // kernel.
   bool needsFallback = !allocToAnnotation.empty();
+  Operation *unalignedTMALoadSlot = nullptr;
   funcOp->walk([&](Operation *op) {
     if (isa<ttng::SubtiledRegionOp>(op))
       needsFallback = true;
@@ -2420,10 +2423,23 @@ static unsigned allocateSmemBuffersViaSearch(
       // A TMA landing buffer that is not a multiple of 128 bytes must stay
       // single-buffered (see isUnalignedTMALoadSlot); the search does not
       // model that cap.
-      if (isUnalignedTMALoadSlot(alloc, getSmemAllocSizeBytes(alloc), channels))
+      if (!unalignedTMALoadSlot &&
+          isUnalignedTMALoadSlot(alloc, getSmemAllocSizeBytes(alloc),
+                                 channels)) {
+        unalignedTMALoadSlot = alloc;
         needsFallback = true;
+      }
     }
   });
+  // This disables the search for the whole kernel, not just this buffer, so
+  // say so instead of changing the plan quietly.
+  if (unalignedTMALoadSlot)
+    unalignedTMALoadSlot->emitRemark()
+        << "SMEM plan-search: TMA landing buffer \""
+        << getLocName(unalignedTMALoadSlot) << "\" ("
+        << getSmemAllocSizeBytes(cast<ttg::LocalAllocOp>(unalignedTMALoadSlot))
+        << "B) is not a multiple of its TMA alignment and stays "
+           "single-buffered; using the heuristic planner for this kernel";
   if (needsFallback) {
     LDBG("SMEM plan-search: unmodeled feature present, falling back to "
          "heuristic");
@@ -5589,7 +5605,72 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
   return true;
 }
 
-// Reserve a conservative allowance for barriers, captures, and tensor-map
+// Op scratch (layout conversions, reductions, ...) is placed by
+// AllocateSharedMemoryNv after planning, and the planned buffers are live from
+// function entry through the warp_specialize. Reserve one slot sized to the
+// largest single op scratch, skipping scratch after the last WS loop (the
+// planned buffers are dead by then). This is an approximation: it over-reserves
+// when a later pass shrinks or drops the op (TMemSplitLoadPattern subtiling,
+// tritongpu-optimize-partition-warps), and under-reserves when several
+// partitions have scratch, since scratch in different warp_specialize regions
+// interferes. An under-reservation fails at launch and Inductor falls back to
+// num_stages=1.
+// TODO: size it exactly, with helpers shared with TMemSplitLoadPattern,
+// tritongpu-optimize-partition-warps, canonicalization and
+// AllocateSharedMemoryNv.
+static uint64_t estimateOpScratchBytes(triton::FuncOp funcOp) {
+  // Size it with the same function AllocateSharedMemoryNv uses (the generic
+  // one, which over-sizes layout conversions, only for IR without a CUDA
+  // target).
+  auto mod = funcOp->getParentOfType<ModuleOp>();
+  auto target = mod->getAttrOfType<StringAttr>(ttg::AttrTargetName);
+  std::optional<triton::NVIDIA::TargetInfo> targetInfo;
+  triton::AllocationAnalysisScratchSizeFn scratchSizeFn =
+      triton::defaultAllocationAnalysisScratchSizeFn;
+  if (target && target.getValue().starts_with("cuda:")) {
+    targetInfo.emplace(getNVIDIAComputeCapability(mod));
+    scratchSizeFn = ttng::getNvidiaAllocationAnalysisScratchSizeFn(*targetInfo);
+  }
+
+  auto topLevelAncestor = [&](Operation *op) {
+    while (op->getParentOp() != funcOp.getOperation())
+      op = op->getParentOp();
+    return op;
+  };
+  Operation *lastWSAnchor = nullptr;
+  funcOp->walk([&](LoopLikeOpInterface loop) {
+    if (!loop->hasAttr(tt::kWarpSpecializeAttrName))
+      return;
+    Operation *anchor = topLevelAncestor(loop);
+    if (!lastWSAnchor || lastWSAnchor->isBeforeInBlock(anchor))
+      lastWSAnchor = anchor;
+  });
+  if (!lastWSAnchor)
+    return 0;
+
+  uint64_t peak = 0;
+  funcOp->walk([&](Operation *op) {
+    // Tensor-map scratch is reserved separately.
+    if (isa<ttng::TensormapCreateOp>(op))
+      return;
+    // Canonicalization folds a conversion into local_store/local_alloc users.
+    if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(op);
+        cvt && !cvt->use_empty() &&
+        llvm::all_of(cvt->getUsers(), [](Operation *user) {
+          return isa<ttg::LocalStoreOp, ttg::LocalAllocOp>(user);
+        }))
+      return;
+    uint64_t bytes = scratchSizeFn(op);
+    if (bytes <= peak || lastWSAnchor->isBeforeInBlock(topLevelAncestor(op)))
+      return;
+    peak = bytes;
+    LDBG("auxiliary op scratch: " << bytes << " bytes for " << *op);
+  });
+  LDBG("auxiliary op scratch: reserving " << peak << " bytes");
+  return peak;
+}
+
+// Reserve a conservative allowance for barriers, captures, tensor-map and op
 // scratch created after SMEM planning.
 static unsigned estimateAuxiliarySmemBytes(
     triton::FuncOp funcOp,
@@ -5632,10 +5713,12 @@ static unsigned estimateAuxiliarySmemBytes(
     tensorMapScratchBytes += tensorMapBytesPerOp;
   });
 
+  uint64_t opScratchBytes = estimateOpScratchBytes(funcOp);
+
   uint64_t totalBytes = numBarrierSlots * barrierBytesPerSlot *
                             triton::gpu::lookupNumCTAs(funcOp) +
                         numBarrierArrays * barrierCaptureBytesPerArray +
-                        captureBytes + tensorMapScratchBytes;
+                        captureBytes + tensorMapScratchBytes + opScratchBytes;
   return static_cast<unsigned>(
       std::min<uint64_t>(totalBytes, std::numeric_limits<unsigned>::max()));
 }
@@ -5788,6 +5871,20 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
     LLVM_DEBUG(funcOp.dump());
     LLVM_DEBUG(planner.dumpBuffers());
   }
+
+  // Phase 4 keeps unaligned TMA landing buffers single-buffered, but a floor or
+  // annotation (or the original algorithm) can still give one several copies;
+  // every odd copy is then misaligned. Say so at compile time.
+  funcOp->walk([&](ttg::LocalAllocOp alloc) {
+    auto copies = alloc->getAttrOfType<IntegerAttr>("buffer.copy");
+    if (copies && copies.getInt() > 1 &&
+        isUnalignedTMALoadSlot(alloc, getSmemAllocSizeBytes(alloc), channels))
+      alloc.emitWarning()
+          << "TMA landing buffer \"" << getLocName(alloc) << "\" ("
+          << getSmemAllocSizeBytes(alloc) << "B) has " << copies.getInt()
+          << " copies but is not a multiple of its TMA alignment; copies "
+             "after the first are misaligned";
+  });
 
   // Dump combined key ops + channel graph (side by side visualization)
   // Note: Placed before MemoryPlannerTmem to visualize state even if TMEM

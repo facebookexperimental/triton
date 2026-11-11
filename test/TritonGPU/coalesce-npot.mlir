@@ -1,107 +1,109 @@
-// The coalesce pass factors an NPOT contiguous dim into a VALID blocked encoding
-// whose threadsPerWarp is pow2 and tiles the warp (product == 64); the NPOT
-// remainder is carried by the tensor shape (the modular LinearLayout). Without
-// the fix the factorization is threadsPerWarp = [10, 6] (= 60) / [1, 48] etc. --
-// a non-pow2 factor that does not tile the 64-lane warp and is rejected by
-// BlockedEncodingAttr::verify. warpSize is 64 (CDNA).
-//
-// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -tritongpu-coalesce | FileCheck %s
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -convert-triton-to-tritongpu='target=cuda:90 num-warps=4' -tritongpu-coalesce -tritongpu-remove-layout-conversions -allocate-shared-memory-nv=compute-capability=90 -convert-triton-gpu-to-llvm=compute-capability=90 | FileCheck %s --check-prefix=W4
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -convert-triton-to-tritongpu='target=cuda:90 num-warps=1' -tritongpu-coalesce -tritongpu-remove-layout-conversions -allocate-shared-memory-nv=compute-capability=90 -convert-triton-gpu-to-llvm=compute-capability=90 | FileCheck %s --check-prefix=W1
 
-// N=48 contiguous, 8 elems/thread (dot A-operand style). This is the exact case
-// that produced the invalid threadsPerWarp = [10, 6]: the NPOT lane factor
-// (48/8 = 6) floors to a pow2 (4), the rest of the warp fills the strided dim
-// (64/4 = 16), so threadsPerWarp = [16, 4] tiles the warp and sizePerThread = 8
-// carries the vectorized load.
-#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK: [[$COALESCED:#.*]] = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
-  // CHECK-LABEL: @npot_load_48_vec8
-  tt.func public @npot_load_48_vec8(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}) {
-    %0 = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
-    %1 = tt.make_range {end = 48 : i32, start = 0 : i32} : tensor<48xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
-    %2 = tt.expand_dims %0 {axis = 1 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<64x1xi32, #blocked>
-    %3 = tt.expand_dims %1 {axis = 0 : i32} : tensor<48xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x48xi32, #blocked>
-    %c48 = arith.constant dense<48> : tensor<64x1xi32, #blocked>
-    %4 = arith.muli %2, %c48 : tensor<64x1xi32, #blocked>
-    %5 = tt.broadcast %4 : tensor<64x1xi32, #blocked> -> tensor<64x48xi32, #blocked>
-    %6 = tt.broadcast %3 : tensor<1x48xi32, #blocked> -> tensor<64x48xi32, #blocked>
-    %7 = arith.addi %5, %6 : tensor<64x48xi32, #blocked>
-    %8 = tt.splat %arg0 : !tt.ptr<f16> -> tensor<64x48x!tt.ptr<f16>, #blocked>
-    %9 = tt.addptr %8, %7 : tensor<64x48x!tt.ptr<f16>, #blocked>, tensor<64x48xi32, #blocked>
-    // CHECK: tt.load {{.*}} : tensor<64x48x!tt.ptr<f16>, [[$COALESCED]]>
-    %10 = tt.load %9 : tensor<64x48x!tt.ptr<f16>, #blocked>
-    tt.return
-  }
+// A mixed-radix load takes its power-of-two control's vector: the [96, 64] tile
+// at four warps and 384 at one warp both load v4, as [128, 64] and 512 do.
+// W4-LABEL: @copy_96x64
+// W4-COUNT-12: llvm.inline_asm {{.*}}ld.global.v4.b32
+// W4-NOT: llvm.load {{.*}} !llvm.ptr<1>
+// W4: llvm.return
+tt.func @copy_96x64(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
+  %r = tt.make_range {end = 6144 : i32, start = 0 : i32} : tensor<6144xi32>
+  %i = tt.reshape %r : tensor<6144xi32> -> tensor<96x64xi32>
+  %sp = tt.splat %src : !tt.ptr<f32> -> tensor<96x64x!tt.ptr<f32>>
+  %p = tt.addptr %sp, %i : tensor<96x64x!tt.ptr<f32>>, tensor<96x64xi32>
+  %x = tt.load %p : tensor<96x64x!tt.ptr<f32>>
+  %dp = tt.splat %dst : !tt.ptr<f32> -> tensor<96x64x!tt.ptr<f32>>
+  %q = tt.addptr %dp, %i : tensor<96x64x!tt.ptr<f32>>, tensor<96x64xi32>
+  tt.store %q, %x : tensor<96x64x!tt.ptr<f32>>
+  tt.return
 }
 
 // -----
 
-// N=48 contiguous, 1 elem/thread. The NPOT lane factor (48) floors to a pow2
-// (32) and the strided dim takes the remaining 2 lanes: threadsPerWarp = [2, 32].
-#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK: [[$COALESCED:#.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
-  // CHECK-LABEL: @npot_load_48
-  tt.func public @npot_load_48(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: tensor<64x48xi32, #blocked>) {
-    %0 = tt.splat %arg0 : !tt.ptr<f16> -> tensor<64x48x!tt.ptr<f16>, #blocked>
-    %1 = tt.addptr %0, %arg1 : tensor<64x48x!tt.ptr<f16>, #blocked>, tensor<64x48xi32, #blocked>
-    // CHECK: tt.load {{.*}} : tensor<64x48x!tt.ptr<f16>, [[$COALESCED]]>
-    %2 = tt.load %1 : tensor<64x48x!tt.ptr<f16>, #blocked>
-    tt.return
-  }
+// W4-LABEL: @copy_128x64
+// W4-COUNT-16: llvm.inline_asm {{.*}}ld.global.v4.b32
+// W4-NOT: llvm.load {{.*}} !llvm.ptr<1>
+// W4: llvm.return
+tt.func @copy_128x64(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
+  %r = tt.make_range {end = 8192 : i32, start = 0 : i32} : tensor<8192xi32>
+  %i = tt.reshape %r : tensor<8192xi32> -> tensor<128x64xi32>
+  %sp = tt.splat %src : !tt.ptr<f32> -> tensor<128x64x!tt.ptr<f32>>
+  %p = tt.addptr %sp, %i : tensor<128x64x!tt.ptr<f32>>, tensor<128x64xi32>
+  %x = tt.load %p : tensor<128x64x!tt.ptr<f32>>
+  %dp = tt.splat %dst : !tt.ptr<f32> -> tensor<128x64x!tt.ptr<f32>>
+  %q = tt.addptr %dp, %i : tensor<128x64x!tt.ptr<f32>>, tensor<128x64xi32>
+  tt.store %q, %x : tensor<128x64x!tt.ptr<f32>>
+  tt.return
 }
 
 // -----
 
-// N=192 = 3 * 64 is a multiple of the warp size, so the whole warp already tiles
-// the contiguous dim (threadsPerWarp = [1, 64]); flooring is a no-op and the
-// remaining warps spread over both dims. This case worked before the fix.
-#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK: [[$COALESCED:#.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [2, 2], order = [1, 0]}>
-  // CHECK-LABEL: @npot_load_192
-  tt.func public @npot_load_192(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: tensor<64x192xi32, #blocked>) {
-    %0 = tt.splat %arg0 : !tt.ptr<f16> -> tensor<64x192x!tt.ptr<f16>, #blocked>
-    %1 = tt.addptr %0, %arg1 : tensor<64x192x!tt.ptr<f16>, #blocked>, tensor<64x192xi32, #blocked>
-    // CHECK: tt.load {{.*}} : tensor<64x192x!tt.ptr<f16>, [[$COALESCED]]>
-    %2 = tt.load %1 : tensor<64x192x!tt.ptr<f16>, #blocked>
-    tt.return
-  }
+// W1-LABEL: @copy_384
+// W1-COUNT-3: llvm.inline_asm {{.*}}ld.global.v4.b32
+// W1-NOT: llvm.load {{.*}} !llvm.ptr<1>
+// W1: llvm.return
+// A loaded value stores in its load's layout, through no shared memory.
+// W4-LABEL: @copy_384
+// W4-NOT: !llvm.ptr<3>
+// W4-COUNT-3: llvm.inline_asm {{.*}}"st.global.b32
+// W4: llvm.return
+tt.func @copy_384(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
+  %r = tt.make_range {end = 384 : i32, start = 0 : i32} : tensor<384xi32>
+  %sp = tt.splat %src : !tt.ptr<f32> -> tensor<384x!tt.ptr<f32>>
+  %p = tt.addptr %sp, %r : tensor<384x!tt.ptr<f32>>, tensor<384xi32>
+  %x = tt.load %p : tensor<384x!tt.ptr<f32>>
+  %dp = tt.splat %dst : !tt.ptr<f32> -> tensor<384x!tt.ptr<f32>>
+  %q = tt.addptr %dp, %r : tensor<384x!tt.ptr<f32>>, tensor<384xi32>
+  tt.store %q, %x : tensor<384x!tt.ptr<f32>>
+  tt.return
 }
 
 // -----
 
-// pow2 path is unchanged under the flag: a [64, 64] load with a fully-tiling
-// input encoding stays [1, 64] (the coalesce convert is a no-op). flooring a
-// pow2 factor is identity, so the pow2 factorization is byte-identical whether
-// the flag is on or off (see coalesce.mlir for the flag-off pow2 suite).
-#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK: [[$POW2LAYOUT:#.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
-  // CHECK-LABEL: @pow2_load_64
-  tt.func public @pow2_load_64(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: tensor<64x64xi32, #blocked>) {
-    %0 = tt.splat %arg0 : !tt.ptr<f16> -> tensor<64x64x!tt.ptr<f16>, #blocked>
-    %1 = tt.addptr %0, %arg1 : tensor<64x64x!tt.ptr<f16>, #blocked>, tensor<64x64xi32, #blocked>
-    // CHECK: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>, [[$POW2LAYOUT]]>
-    %2 = tt.load %1 : tensor<64x64x!tt.ptr<f16>, #blocked>
-    tt.return
-  }
+// W1-LABEL: @copy_512
+// W1-COUNT-4: llvm.inline_asm {{.*}}ld.global.v4.b32
+// W1-NOT: llvm.load {{.*}} !llvm.ptr<1>
+// W1: llvm.return
+tt.func @copy_512(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
+  %r = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32>
+  %sp = tt.splat %src : !tt.ptr<f32> -> tensor<512x!tt.ptr<f32>>
+  %p = tt.addptr %sp, %r : tensor<512x!tt.ptr<f32>>, tensor<512xi32>
+  %x = tt.load %p : tensor<512x!tt.ptr<f32>>
+  %dp = tt.splat %dst : !tt.ptr<f32> -> tensor<512x!tt.ptr<f32>>
+  %q = tt.addptr %dp, %r : tensor<512x!tt.ptr<f32>>, tensor<512xi32>
+  tt.store %q, %x : tensor<512x!tt.ptr<f32>>
+  tt.return
 }
 
 // -----
 
-// Account for the threads actually assigned after flooring. Dividing by the
-// pre-floor factor (5) would leave only 51 apparent threads for dim1, floor its
-// warp factor to 2, and spill 2 warps into the size-1 dim0. Those warps would
-// duplicate work. The 4 assigned threads leave 64 for dim1, which uses all 4
-// warps there.
-#blocked = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 1, 64], warpsPerCTA = [1, 4, 1], order = [2, 1, 0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK: [[$RANK3:#.*]] = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 16, 4], warpsPerCTA = [1, 4, 1], order = [2, 1, 0]}>
-  // CHECK-LABEL: @npot_rank3_uses_assigned_threads
-  tt.func public @npot_rank3_uses_assigned_threads(%arg0: tensor<1x64x5x!tt.ptr<f16>, #blocked> {tt.contiguity = dense<[1, 1, 1]> : tensor<3xi32>}) {
-    // CHECK: tt.load {{.*}} : tensor<1x64x5x!tt.ptr<f16>, [[$RANK3]]>
-    %0 = tt.load %arg0 : tensor<1x64x5x!tt.ptr<f16>, #blocked>
-    tt.return
-  }
+// A store predicates off duplicate threads, so one whose value isn't loaded
+// takes the 2-element vector a replicated warp allows.
+// W4-LABEL: @store_384_iota
+// W4-COUNT-3: llvm.inline_asm {{.*}}"@$3 st.global.v2.b32
+// W4: llvm.return
+tt.func @store_384_iota(%dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
+  %r = tt.make_range {end = 384 : i32, start = 0 : i32} : tensor<384xi32>
+  %x = arith.sitofp %r : tensor<384xi32> to tensor<384xf32>
+  %dp = tt.splat %dst : !tt.ptr<f32> -> tensor<384x!tt.ptr<f32>>
+  %q = tt.addptr %dp, %r : tensor<384x!tt.ptr<f32>>, tensor<384xi32>
+  tt.store %q, %x : tensor<384x!tt.ptr<f32>>
+  tt.return
+}
+
+// -----
+
+// Pow2 control: 512 at four warps stores v4 by the unchanged rule.
+// W4-LABEL: @store_512_iota
+// W4-COUNT-1: llvm.inline_asm {{.*}}st.global.v4.b32
+// W4-NOT: st.global
+// W4: llvm.return
+tt.func @store_512_iota(%dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
+  %r = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32>
+  %x = arith.sitofp %r : tensor<512xi32> to tensor<512xf32>
+  %dp = tt.splat %dst : !tt.ptr<f32> -> tensor<512x!tt.ptr<f32>>
+  %q = tt.addptr %dp, %r : tensor<512x!tt.ptr<f32>>, tensor<512xi32>
+  tt.store %q, %x : tensor<512x!tt.ptr<f32>>
+  tt.return
 }

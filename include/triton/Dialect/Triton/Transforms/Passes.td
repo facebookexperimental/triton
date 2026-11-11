@@ -188,4 +188,50 @@ def CudaWarnings : Pass<"test-cuda-warnings", "mlir::ModuleOp"> {
   ];
 }
 
+def TritonNpotPad : Pass<"triton-npot-pad", "mlir::ModuleOp"> {
+  let summary = "Pad NPOT tensors to the next power of two";
+  let description = [{
+    Runs only under TRITON_ALLOW_NPOT, just before ConvertTritonToTritonGPU.
+    It finds the NPOT tensors connected through their ops (a connected component
+    of the def-use graph). A connected component keeps its shape when every
+    op in it lowers a mixed-radix layout and every value's mixed-radix layout,
+    the one ConvertTritonToTritonGPU gives it under the same options, keeps its
+    padded shape's global vector and wastes less total in-dim size (registers x
+    lanes x warps) than the default Blocked layout of its padded shape. In every
+    other connected component, each tensor dim that is not a power of two is
+    widened to the next power of two, and pad lanes are kept away from memory
+    and from live results. An op the pass cannot pad fails to compile with an
+    error and leaves the IR unchanged. A connected component holding
+    tt.atomic_cas, which has no padded lowering, keeps its shape whenever every
+    op in it lowers a mixed-radix layout. A dot asks the target's dialect
+    whether it can be exact and remarks why not.
+  }];
+
+  // TTNG holds cuda's NpotTargetLegality; the AMD backend loads its own.
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::arith::ArithDialect"
+  ];
+
+  let options = [
+    Option<"numWarps", "num-warps", "int32_t", /*default*/"4",
+           "number of warps">,
+    Option<"threadsPerWarp", "threads-per-warp", "int32_t", /*default*/"32",
+           "number of threads per warp">,
+    Option<"numCTAs", "num-ctas", "int32_t", /*default*/"1",
+           "number of ctas in a cga">,
+    Option<"target", "target", "std::string", /*default*/"\"\"",
+           "the ttg.target ConvertTritonToTritonGPU will set">,
+    Option<"matrixInstructionSize", "matrix-instruction-size", "int32_t",
+           /*default*/"0",
+           "the MMA M/N size the target's dot pass enforces, 0 if none">,
+    Option<"numStages", "num-stages", "int32_t", /*default*/"1",
+           "the pipeliner's stage count for loops without tt.num_stages">,
+    Option<"useAsyncCopy", "use-async-copy", "bool", /*default*/"false",
+           "whether the target's pipeliner may copy loads to shared memory">
+  ];
+}
+
 #endif

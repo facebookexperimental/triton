@@ -34,6 +34,8 @@ constexpr static char AttrTLXEnablePairedCTAMMAName[] =
     "tlx.enable_paired_cta_mma";
 constexpr static char AttrClusterSyncKernelInitName[] =
     "tlx.cluster_sync_kernel_init";
+constexpr static char AttrClusterSyncBootstrapName[] =
+    "tlx.cluster_sync_bootstrap";
 constexpr static char AttrClusterSyncKernelCleanupName[] =
     "tlx.cluster_sync_kernel_cleanup";
 constexpr static char AttrUserPostWsSyncName[] = "tlx.user_post_ws_sync";
@@ -63,6 +65,11 @@ Attribute unwrapUserLayout(Attribute layout);
 
 bool hasClusterSyncKernelInit(Operation *op);
 void setClusterSyncKernelInitOnMod(Operation *op, bool value);
+
+// Only these operations use the complementary worker-header arrival.
+// The module marker must not exempt ordinary later cluster synchronizations.
+bool isClusterSyncBootstrap(Operation *op);
+void setClusterSyncBootstrap(Operation *op);
 
 bool hasClusterSyncKernelCleanup(Operation *op);
 void setClusterSyncKernelCleanupOnMod(Operation *op, bool value);

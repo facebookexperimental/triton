@@ -108,6 +108,7 @@ from triton.language.extra.tlx.inductor.gfx950_addmm_warppipe_core import (
         BLOCK_N,
         BLOCK_K,
         NUM_BUFFERS,
+        DRAIN_PIPELINE={{ TLX_REDUCTION_EPILOGUE }},
     )
 {% else %}
     acc = gfx950_addmm_compute_register(
@@ -132,5 +133,5 @@ from triton.language.extra.tlx.inductor.gfx950_addmm_warppipe_core import (
     ws_off = split_id * (M * N) + idx_m * N + idx_n
     tl.store(split_k_ws + ws_off, acc, mask=mask)
 {% else %}
-    {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"), prefetched_epilogue="gemm_drain")}}
+    {{reduction_store_output(("idx_m", "idx_n"), "acc", "mask", partial_index="pid_n", partial_columns="BLOCK_N", val_shape=("BLOCK_M", "BLOCK_N"), prefetched_epilogue="gemm_drain")}}
 {% endif %}

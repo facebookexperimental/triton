@@ -1,12 +1,17 @@
 """Tests for TLX warp-pipeline support (tlx.warp_pipeline_stage)."""
 
+import re
+
 import pytest
 import torch
 
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton._internal_testing import is_hip
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.amd.cdna4 import async_copy
+from triton._internal_testing import is_hip, is_hip_cdna4
 
 # --- Runtime test: simple GEMM with warp pipeline ---
 
@@ -262,6 +267,136 @@ def test_warp_pipeline_lowering():
     asm = kernel.asm["amdgcn"]
     assert "s_barrier" in asm, "Expected s_barrier from warp pipeline lowering"
     assert "s_setprio" in asm, "Expected s_setprio from warp pipeline priority hints"
+
+
+@triton.jit
+def _warp_pipeline_fa_pv(p, v, acc, alpha, MMA: tl.constexpr, DOT0: tl.constexpr, DOT1: tl.constexpr):
+    p = tlx.require_layout(p, DOT0)
+    v = tlx.require_layout(v, DOT1)
+    acc = tlx.require_layout(acc, MMA)
+    acc = acc * alpha[:, None]
+    return tlx.release_layout(tl.dot(p, v, acc), relaxed=True)
+
+
+@triton.jit
+def _fa_warp_pipeline_kernel(Q, K, V, O, N: tl.constexpr, CAUSAL: tl.constexpr):
+    BM: tl.constexpr = 256
+    BN: tl.constexpr = 64
+    D: tl.constexpr = 64
+    mma: tl.constexpr = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, 8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, 8)
+    # Keep 32 rows per wave; only register order changes at the MFMA boundary.
+    carry: tl.constexpr = tlx.layout(shape=((32, 2, 8), (4, 8)), stride=((64, 8, 2048), (16, 1)))
+    m = tl.program_id(0) * BM + tl.arange(0, BM)
+    n = tl.arange(0, BN)
+    d = tl.arange(0, D)
+    q = tlx.require_layout(tl.load(Q + m[:, None] * D + d[None, :]), dot0)
+    kb = tlx.local_alloc((BN, D), Q.dtype.element_ty, 4)
+    vb = tlx.local_alloc((BN, D), Q.dtype.element_ty, 4)
+    for initial in tl.static_range(3):
+        offsets = (initial * BN + n[:, None]) * D + d[None, :]
+        kt = tlx.async_load(K + offsets, tlx.local_view(kb, initial))
+        vt = tlx.async_load(V + offsets, tlx.local_view(vb, initial))
+        tlx.async_load_commit_group([kt, vt])
+    acc = tlx.require_layout(tl.zeros((BM, D), tl.float32), carry)
+    row_max = tl.full((BM, ), float('-inf'), tl.float32)
+    row_sum = tl.zeros((BM, ), tl.float32)
+    for tile in range(N // BN):
+        dot_acc = tlx.require_layout(tlx.release_layout(acc, relaxed=True), mma)
+        ready = tlx.async_load_wait_group(2)
+        with tlx.warp_pipeline_stage("qk"):
+            k = tlx.local_load(tlx.local_trans(tlx.local_view(kb, tile % 4)), token=ready, layout=dot1)
+            scores = tl.dot(q, k, tlx.zeros((BM, BN), tl.float32, layout=mma))
+            scores = tlx.release_layout(scores, relaxed=True) * (1.4426950408889634 / tl.sqrt(float(D)))
+        with tlx.warp_pipeline_stage("softmax"):
+            if CAUSAL:
+                scores = tl.where(m[:, None] >= tile * BN + n[None, :], scores, float('-inf'))
+            next_max = tl.maximum(row_max, tl.max(scores, 1))
+            alpha = tl.exp2(row_max - next_max)
+            p = tl.exp2(scores - next_max[:, None])
+            row_sum = row_sum * alpha + tl.sum(p, 1)
+            row_max = next_max
+        with tlx.warp_pipeline_stage("value"):
+            v = tlx.local_load(tlx.local_view(vb, tile % 4), token=ready, layout=dot1)
+        with tlx.warp_pipeline_stage("pv", priority=1):
+            acc = _warp_pipeline_fa_pv(p.to(q.dtype), v, dot_acc, alpha, mma, dot0, dot1)
+            acc = tlx.require_layout(acc, carry)
+            # Final prefetches wrap within the input allocation and are not consumed.
+            future = ((tile + 3) % (N // BN)) * BN + n
+            offsets = future[:, None] * D + d[None, :]
+            kt = tlx.async_load(K + offsets, tlx.local_view(kb, (tile + 3) % 4))
+            vt = tlx.async_load(V + offsets, tlx.local_view(vb, (tile + 3) % 4))
+            tlx.async_load_commit_group([kt, vt])
+    tlx.async_load_wait_group(0)
+    tl.store(O + m[:, None] * D + d[None, :], acc / row_sum[:, None])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("n", [256, 512])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fa_warp_pipeline_layout_inputs(causal, n, dtype):
+    """Place the accumulator conversion in its consuming PV stage."""
+    torch.manual_seed(42)
+    d = 64
+    q, k, v = [torch.randn((n, d), device="cuda", dtype=dtype) for _ in range(3)]
+    out = torch.empty_like(q)
+    compiled = _fa_warp_pipeline_kernel[(n // 256, )](q, k, v, out, n, causal, num_warps=8, num_stages=1)
+    scores = q.float() @ k.float().T / d**0.5
+    if causal:
+        mask = torch.arange(n, device="cuda")[:, None] < torch.arange(n, device="cuda")[None, :]
+        scores.masked_fill_(mask, float('-inf'))
+    expected = torch.softmax(scores, dim=-1) @ v.float()
+    tolerance = 2e-3 if dtype == torch.float16 else 2e-2
+    torch.testing.assert_close(out.float(), expected, atol=tolerance, rtol=tolerance)
+    ttgir = compiled.asm['ttgir']
+    stages = dict((label, body) for body, label in re.findall(
+        r'scf.execute_region[^\n]*\n(.*?)\n      }[^\n]*triton.warp_pipeline.stage = "([^"]+)"', ttgir, re.DOTALL))
+    assert set(stages) == {"qk", "softmax", "value", "pv"}
+    assert "ttg.convert_layout" not in stages["qk"]
+    assert re.match(r'\s*%[^=]+ = ttg.convert_layout', stages["pv"])
+    assert 'triton.warp_pipeline.pipelined_for' in compiled.asm['ttgir']
+    assert 's_setprio' in compiled.asm['amdgcn']
+
+
+@gluon.jit
+def _warp_pipeline_unroll_kernel(X, Y, TILES: gl.constexpr, UNROLL: gl.constexpr):
+    layout: gl.constexpr = gl.BlockedLayout([1], [64], [8], [0])
+    offsets = gl.arange(0, 512, layout=layout)
+    buffers = gl.allocate_shared_memory(gl.float32, [2, 512], gl.SwizzledSharedLayout(1, 1, 1, [0]))
+    async_copy.global_load_to_shared(buffers.index(0), X + offsets)
+    async_copy.commit_group()
+    for tile in tl.range(0, TILES, loop_unroll_factor=UNROLL):
+        async_copy.wait_group(0)
+        with gl.amd.warp_pipeline_stage("load"):
+            value = async_copy.load_shared_relaxed(buffers.index(tile % 2), layout)
+        with gl.amd.warp_pipeline_stage("store", priority=1):
+            gl.store(Y + tile * 512 + offsets, value + tile)
+            future = (tile + 1) % TILES
+            async_copy.global_load_to_shared(buffers.index((tile + 1) % 2), X + future * 512 + offsets)
+            async_copy.commit_group()
+    async_copy.wait_group(0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+@pytest.mark.parametrize("unroll", [2, 4])
+def test_warp_pipeline_unroll_stage_inputs(unroll):
+    """Move index arithmetic from loop unrolling past the next async wait."""
+    torch.manual_seed(42)
+    x = torch.randn((8, 512), device="cuda", dtype=torch.float32)
+    out = torch.empty_like(x)
+    compiled = _warp_pipeline_unroll_kernel[(1, )](x, out, 8, unroll, num_warps=8)
+    expected = x + torch.arange(8, device="cuda")[:, None]
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count('triton.warp_pipeline.stage = "load"') == unroll
+    assert ttgir.count('triton.warp_pipeline.stage = "store"') == unroll
+    assert re.search(
+        r'ttg.async_wait[^\n]*\n[^\n]*scf.execute_region[^\n]*\n[^\n]*arith.constant[^\n]*'
+        r'\n[^\n]*arith.muli[^\n]*\n[^\n]*arith.addi', ttgir)
+    assert 'triton.warp_pipeline.pipelined_for' in ttgir
+    assert 's_setprio' in compiled.asm['amdgcn']
 
 
 # --- Validation tests ---

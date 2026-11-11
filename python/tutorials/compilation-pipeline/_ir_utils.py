@@ -138,8 +138,10 @@ def diff(ck_a, ck_b, name, grep=None, label_a="A", label_b="B", limit=80):
 # on-disk kernel cache so the passes actually re-run and dump.
 # --------------------------------------------------------------------------- #
 
-# e.g. "// -----// IR Dump Before Coalesce (tritongpu-coalesce) ... //----- //"
-_PASS_HDR = re.compile(r"^// -----// IR Dump (Before|After)\s+(\S+)(?:\s+\(([^)]*)\))?")
+# Matches both header formats, capturing the class name and the CLI argument:
+#   "// -----// IR Dump Before Coalesce (tritongpu-coalesce) ... //----- //"
+#   "// -----// IR Dump Before TritonGPUCoalesce: tritongpu-coalesce{max-vec-bits=128} ... //----- //"
+_PASS_HDR = re.compile(r"^// -----// IR Dump (Before|After)\s+([^\s:]+):?(?:\s+\(?([\w.-]+))?")
 
 
 @contextlib.contextmanager

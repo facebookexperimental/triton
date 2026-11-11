@@ -38,6 +38,7 @@ from .errors import (
 )
 
 from triton.language.extra.tlx.compiler.dispatch import TLX_WITH_DISPATCH
+from triton.language.extra.tlx.compiler.code_generator import visit_withWarpPipelineStage
 
 WITH_DISPATCH = {}  # central registry for all 'with' handlers
 
@@ -431,6 +432,7 @@ class CodeGenerator(ast.NodeVisitor):
         self.noinline = noinline
         self.caller_context = caller_context
         self.scf_stack = []
+        self._loop_carry_discovery_depth = 0
         self.ret_type = None
         # SSA-construction
         # name => language.tensor
@@ -556,13 +558,25 @@ class CodeGenerator(ast.NodeVisitor):
         self.builder.restore_insertion_point(ip)
         self.builder.set_loc(loc)
 
+    @contextlib.contextmanager
+    def _discovering_loop_carries(self):
+        # Nested loops need result placeholders, not a second complete body,
+        # while generating IR that an enclosing _find_carries will discard.
+        # This gives depth + 1 innermost-body visits instead of 2**depth.
+        self._loop_carry_discovery_depth += 1
+        try:
+            yield
+        finally:
+            self._loop_carry_discovery_depth -= 1
+
     def _find_carries(self, node, liveins, ignore: set[str] = set()):
         # create loop body block
         block = self.builder.create_block()
         self.builder.set_insertion_point_to_start(block)
         # dry visit loop body
         self.scf_stack.append(node)
-        self.visit_compound_statement(node.body)
+        with self._discovering_loop_carries():
+            self.visit_compound_statement(node.body)
         self.scf_stack.pop()
         block.erase()
 
@@ -635,7 +649,9 @@ class CodeGenerator(ast.NodeVisitor):
 
         results = []
         for item in items:
-            self.set_value(comp.target.id, item)
+            if isinstance(comp.target, ast.Tuple):
+                item = self._sanitize_target_value(comp.target, item, sanitize_leaf=False)
+            self.assignTarget(comp.target, item)
             # Apply the comprehension's `if` filters (the conditions are constexpr).
             if all(self.visit(cond) for cond in comp.ifs):
                 results.append(self.visit(node.elt))
@@ -734,7 +750,7 @@ class CodeGenerator(ast.NodeVisitor):
             raise self._unsupported(
                 node, "nested function definitions are not allowed inside a @triton.jit kernel. "
                 "Move the helper function to module level and decorate it with @triton.jit.")
-        arg_names, kwarg_names = self.visit(node.args)
+        arg_names = self.visit(node.args)
         # initialize defaults
         for i, default_value in enumerate(node.args.defaults[::-1]):
             arg_node = node.args.args[-i - 1]
@@ -782,8 +798,9 @@ class CodeGenerator(ast.NodeVisitor):
             arg_names += [self.visit(arg)]
         if node.vararg is not None:
             arg_names += [self.visit(node.vararg)]
-        kwarg_names = self.visit(node.kwarg)
-        return arg_names, kwarg_names
+        # Keyword-only parameters use the same ordered IR argument list.
+        arg_names += [self.visit(arg) for arg in node.kwonlyargs]
+        return arg_names
 
     def visit_arg(self, node):
         ast.NodeVisitor.generic_visit(self, node)
@@ -829,8 +846,8 @@ class CodeGenerator(ast.NodeVisitor):
         assert isinstance(target, ast.Name)
         self.set_value(self.visit(target), value)
 
-    def visit_Assign(self, node):
-        # construct values to assign
+    def _sanitize_target_value(self, target, value, sanitize_leaf=True):
+
         def _sanitize_value(value):
             if isinstance(value, language.tuple):
                 return _apply_to_tuple_values(value, _sanitize_value)
@@ -840,36 +857,38 @@ class CodeGenerator(ast.NodeVisitor):
                 value = self.semantic.to_tensor(value)
             return value
 
-        def _sanitize_target_value(target, value):
-            if isinstance(target, ast.Tuple) and isinstance(value, language.tuple):
-                if any(isinstance(elt, ast.Starred) for elt in target.elts):
-                    raise NotImplementedError("starred assignment targets are not supported")
-                num_targets, num_values = len(target.elts), len(value.values)
-                if num_targets != num_values:
-                    # Match CPython's errors for mismatched unpacking.
-                    if num_values > num_targets:
-                        message = f"too many values to unpack (expected {num_targets})"
-                    else:
-                        message = f"not enough values to unpack (expected {num_targets}, got {num_values})"
-                    raise ValueError(message)
-                vals = [_sanitize_target_value(elt, val) for elt, val in zip(target.elts, value.values)]
-                vals = [constexpr(val) if val is None else val for val in vals]
-                types = [val.type for val in vals]
-                return language.tuple(vals, language.tuple_type(types, value.type.fields))
-            if isinstance(target, ast.Name):
-                annotation = self.pending_annotations.pop(target.id, None)
-                if annotation == constexpr:
-                    return normalize_value(value)
-            return _sanitize_value(value)
+        if isinstance(target, ast.Tuple):
+            if not isinstance(value, language.tuple):
+                raise TypeError("cannot unpack non-iterable value")
+            if any(isinstance(elt, ast.Starred) for elt in target.elts):
+                raise NotImplementedError("starred assignment targets are not supported")
+            num_targets, num_values = len(target.elts), len(value.values)
+            if num_targets != num_values:
+                # Match CPython's errors for mismatched unpacking.
+                if num_values > num_targets:
+                    message = f"too many values to unpack (expected {num_targets})"
+                else:
+                    message = f"not enough values to unpack (expected {num_targets}, got {num_values})"
+                raise ValueError(message)
+            vals = [self._sanitize_target_value(elt, val, sanitize_leaf) for elt, val in zip(target.elts, value.values)]
+            vals = [constexpr(val) if val is None else val for val in vals]
+            types = [val.type for val in vals]
+            return language.tuple(vals, language.tuple_type(types, value.type.fields))
+        if isinstance(target, ast.Name):
+            annotation = self.pending_annotations.pop(target.id, None)
+            if annotation == constexpr:
+                return normalize_value(value)
+        return _sanitize_value(value) if sanitize_leaf else value
 
+    def visit_Assign(self, node):
         targets = [node.target] if isinstance(node, ast.AnnAssign) else node.targets
         assert len(targets) == 1
         target = targets[0]
         if isinstance(target, ast.Name):
             with self._name_loc_prefix(target.id):
-                values = _sanitize_target_value(target, self.visit(node.value))
+                values = self._sanitize_target_value(target, self.visit(node.value))
         else:
-            values = _sanitize_target_value(target, self.visit(node.value))
+            values = self._sanitize_target_value(target, self.visit(node.value))
         self.assignTarget(target, values)
 
     def visit_AugAssign(self, node):
@@ -1238,18 +1257,25 @@ class CodeGenerator(ast.NodeVisitor):
         pass
 
     def visit_Compare(self, node):
-        if not (len(node.comparators) == 1 and len(node.ops) == 1):
-            raise self._unsupported(node, "simultaneous multiple comparison is not supported")
-        lhs = self.visit(node.left)
-        rhs = self.visit(node.comparators[0])
-        lhs_value = _unwrap_if_constexpr(lhs)
-        rhs_value = _unwrap_if_constexpr(rhs)
-        if type(node.ops[0]) is ast.Is:
-            return constexpr(lhs_value is rhs_value)
-        if type(node.ops[0]) is ast.IsNot:
-            return constexpr(lhs_value is not rhs_value)
-        operator = self._get_operator(node, node.ops[0], "comparison")
-        return self._apply_binary_method(node, operator, lhs, rhs)
+
+        def comparisons():
+            lhs = self.visit(node.left)
+            for op, comparator in zip(node.ops, node.comparators):
+                rhs = self.visit(comparator)
+                if isinstance(op, ast.Is):
+                    yield constexpr(_unwrap_if_constexpr(lhs) is _unwrap_if_constexpr(rhs))
+                elif isinstance(op, ast.IsNot):
+                    yield constexpr(_unwrap_if_constexpr(lhs) is not _unwrap_if_constexpr(rhs))
+                else:
+                    operator = self._get_operator(node, op, "comparison")
+                    yield self._apply_binary_method(node, operator, lhs, rhs)
+                # Reuse the middle operand without evaluating its side effects again.
+                lhs = rhs
+
+        values = comparisons()
+        if len(node.ops) == 1:
+            return next(values)
+        return self._apply_boolean_values(node, self._operators[ast.And], values)
 
     def visit_UnaryOp(self, node):
         operand = self.visit(node.operand)
@@ -1299,8 +1325,15 @@ class CodeGenerator(ast.NodeVisitor):
         # and it will require non-trivial changes in TLX dispatcher for async_task
         # which will be done later
         if isinstance(context, ast.Call):
+            # Gluon semantics imports this module. Resolve its context manager
+            # after module initialization to avoid an import cycle.
+            from triton.experimental.gluon.language.amd import warp_pipeline_stage as gluon_warp_pipeline_stage
+
             withitemClass = self.visit(context.func)
             handler = WITH_DISPATCH.get(withitemClass)
+            if withitemClass is gluon_warp_pipeline_stage:
+                # Both frontends emit the same AMD stage border markers.
+                handler = visit_withWarpPipelineStage
             if handler:
                 return handler(self, node)
         return self.visit_compound_statement(node.body)
@@ -1362,6 +1395,8 @@ class CodeGenerator(ast.NodeVisitor):
             if isinstance(cond, language.condition):
                 self._apply_loop_options(while_op, cond)
                 cond = cond.condition
+            if _is_triton_tensor(cond):
+                cond = cond.to(language.int1, _semantic=self.semantic)
             self.builder.set_insertion_point_to_end(before_block)
             # create ConditionOp: e.g., scf.condition(%cond) %arg0, %arg1, ...
             self.builder.create_condition_op(cond.handle, block_args)
@@ -1379,7 +1414,11 @@ class CodeGenerator(ast.NodeVisitor):
                 self.local_defs[name] = val
                 self._maybe_set_loc_to_name(val, name)
             self.scf_stack.append(node)
-            self.visit_compound_statement(node.body)
+            # An enclosing carry-discovery pass discards this loop. Its result
+            # types and identities suffice; yield the body arguments instead
+            # of recursively generating the body a second time.
+            if not self._loop_carry_discovery_depth:
+                self.visit_compound_statement(node.body)
             self.scf_stack.pop()
 
             yield_handles = flatten_values_to_ir(self.lscope[name] for name in names)
@@ -1503,7 +1542,10 @@ class CodeGenerator(ast.NodeVisitor):
             for name, val in zip(names, block_args):
                 self._maybe_set_loc_to_name(val, name)
                 self.set_value(name, val)
-            self.visit_compound_statement(node.body)
+            # See visit_While: only the enclosing dry run observes this loop's
+            # results. The final lowering still generates the real body.
+            if not self._loop_carry_discovery_depth:
+                self.visit_compound_statement(node.body)
             self.scf_stack.pop()
             yield_handles = flatten_values_to_ir(self.lscope[name] for name in names)
 
@@ -1558,7 +1600,7 @@ class CodeGenerator(ast.NodeVisitor):
         args = [args[name] for name in fn.arg_names]
 
         def normalize_arg(arg):
-            if isinstance(arg, language.tuple):
+            if isinstance(arg, (builtins.tuple, language.tuple)):
                 return _apply_to_tuple_values(arg, normalize_arg)
             if not isinstance(arg, base_value) or isinstance(arg, JITCallable):
                 return language.core.constexpr(arg)
@@ -1684,7 +1726,7 @@ class CodeGenerator(ast.NodeVisitor):
     def visit_Call(self, node):
         fn = _unwrap_if_constexpr(self.visit(node.func))
         if not isinstance(fn, BoundJITMethod):
-            static_implementation = self.statically_implemented_functions.get(fn)
+            static_implementation = self._get_static_implementation(fn)
             if static_implementation is not None:
                 return static_implementation(self, node)
 
@@ -1709,14 +1751,15 @@ class CodeGenerator(ast.NodeVisitor):
 
     def visit_BoolOp(self, node: ast.BoolOp):
         operator = self._get_operator(node, node.op, "boolean")
-        method_name = operator[0]
+        values = (self.visit(subnode) for subnode in node.values)
+        return self._apply_boolean_values(node, operator, values, warn_non_scalar=True)
 
+    def _apply_boolean_values(self, node, operator, values, warn_non_scalar=False):
+        method_name = operator[0]
         nontrivial_values = []
 
-        for subnode in node.values:
-            # we visit the values in order, executing their side-effects
-            # and possibly early-exiting:
-            value = self.visit(subnode)
+        # Consume values lazily so compile-time short-circuiting skips side effects.
+        for value in values:
             if not _is_dynamic_boolean_operand(value):
                 # this is a constexpr, so we might be able to short-circuit:
                 bv = bool(value)
@@ -1729,7 +1772,7 @@ class CodeGenerator(ast.NodeVisitor):
                 # otherwise, our constexpr has no effect on the output of the
                 # expression so we do not append it to nontrivial_values.
             else:
-                if _is_triton_tensor(value) and value.type.is_block():
+                if warn_non_scalar and _is_triton_tensor(value) and value.type.is_block():
                     lineno = getattr(node, "lineno", None)
                     if lineno is not None:
                         lineno += self.begin_line
@@ -1878,15 +1921,29 @@ class CodeGenerator(ast.NodeVisitor):
 
         return ret
 
-    from ..experimental.gluon import language as ttgl
-
     statically_implemented_functions: Dict[object, Callable[[ast.Call], Any]] = {
         language.core.static_assert: execute_static_assert,
         language.core.static_print: static_executor(print),
-        ttgl.static_assert: execute_static_assert,
-        ttgl.static_print: static_executor(print),
         int: static_executor(int),
         len: static_executor(len),
+    }
+
+    def _get_static_implementation(self, fn):
+        impl = self.statically_implemented_functions.get(fn)
+        # Only Gluon kernels look up Gluon builtins, so plain Triton compiles
+        # never import Gluon.
+        if impl is None and self.is_gluon:
+            impl = _gluon_static_implementations().get(fn)
+        return impl
+
+
+@functools.cache
+def _gluon_static_implementations() -> Dict[object, Callable[[ast.Call], Any]]:
+    from ..experimental.gluon import language as ttgl
+
+    return {
+        ttgl.static_assert: CodeGenerator.execute_static_assert,
+        ttgl.static_print: CodeGenerator.static_executor(print),
     }
 
 

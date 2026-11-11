@@ -96,7 +96,9 @@ def test_profile_mode(tmp_path: pathlib.Path):
         try:
             proton.start(str(temp_file0.with_suffix("")), mode="pcsampling")
         except Exception as e:
-            assert "unsupported mode: pcsampling" in str(e)
+            message = str(e)
+            pc_sampling_unavailable = ("PC sampling mode requested but rocprofiler-sdk could not configure it")
+            assert ("unsupported mode: pcsampling" in message or pc_sampling_unavailable in message)
         finally:
             proton.finalize()
     else:
@@ -420,6 +422,11 @@ def test_throw(tmp_path: pathlib.Path):
 
 @pytest.mark.parametrize("disable", [True, False])
 def test_profile_disable(disable, fresh_knobs, tmp_path: pathlib.Path):
+    try:
+        from triton.backends.nvidia.driver import libcuda_dirs
+        libcuda_dirs()
+    except (AssertionError, OSError):
+        pytest.skip("requires libcuda (unavailable on this worker)")
     fresh_knobs.proton.disable = disable
     temp_file = tmp_path / "test_profile_disable.hatchet"
     proton.start(str(temp_file.with_suffix("")))

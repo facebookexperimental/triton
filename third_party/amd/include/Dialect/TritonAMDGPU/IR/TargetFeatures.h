@@ -79,13 +79,15 @@ public:
 
   bool supportsBufferAtomicRMW() const;
   bool supportsBufferAtomicFadd(Type elementType) const;
-  int32_t getBufferAtomicCachePolicy(bool hasUsers) const;
+  bool supportsBufferAtomicFMinMax(Type elementType) const;
+  int32_t getBufferAtomicCachePolicy(bool hasUsers, bool clusterScope) const;
 
   bool supportMaximumMinimum() const;
   bool supportDppBroadcast() const;
   bool supportsPermlaneSwap() const;
   bool supportsCvtPkScalePk8() const;
   bool supportsHwScaledUpcast() const;
+  bool supportsHwScaledDowncast() const;
 
   bool supportBitwidth16Elementwise() const;
   bool supportBitwidth32Elementwise() const;

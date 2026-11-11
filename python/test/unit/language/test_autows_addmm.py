@@ -566,8 +566,9 @@ def test_autows_addmm_tma_bias_subtiled_epilogue():
         triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
         num_tiles = triton.cdiv(M, BLOCK_M) * (N // BLOCK_N)
         ref_out = (A.double() @ B.double().T + bias.double()).to(torch.bfloat16)
-        # The race is timing dependent, so run the kernel a few times.
-        for _ in range(3):
+        # The race is timing dependent, so run the kernel several times. The
+        # deterministic gate is ws_lower_token_tma_consumer_release_fence.mlir.
+        for _ in range(20):
             C = torch.full((M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
             kernel = addmm_kernel_tma_bias_subtiled_ws[(min(NUM_SMS,
                                                             num_tiles), )](bias, A, B, C, M, N, K, BLOCK_M, BLOCK_N,

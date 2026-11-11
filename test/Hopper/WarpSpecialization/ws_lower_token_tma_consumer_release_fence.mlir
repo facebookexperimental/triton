@@ -5,13 +5,16 @@
 // The load partition refills the slot with the next TMA load (async proxy), so
 // the release must be preceded by a proxy fence; without it the TMA write can
 // land before the local_load is performed and the epilogue adds the bias of a
-// later tile.
+// later tile. Token lowering marks that release and ProxyFenceInsertion
+// places the fence (see proxy_fence_insertion.mlir); the MMA operand
+// releases are read through the async proxy and stay unmarked.
 
 // CHECK-LABEL: @kernel
+// CHECK-NOT: ttng.fence_generic_reads
 // CHECK: ttg.local_load {{.*}} -> tensor<128xbf16
 // CHECK-NEXT: ttg.memdesc_index
-// CHECK-NEXT: ttng.fence_async_shared
-// CHECK-NEXT: ttng.arrive_barrier
+// CHECK-NEXT: ttng.arrive_barrier {{.*}}ttng.fence_generic_reads
+// CHECK-NOT: ttng.fence_generic_reads
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [8, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
@@ -22,7 +25,7 @@
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0], [0, 128]], block = []}>
 #linear1 = #ttg.linear<{register = [[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [0, 0, 16], [0, 0, 32], [0, 0, 64]], lane = [[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [16, 0, 0]], warp = [[32, 0, 0], [64, 0, 0], [0, 1, 0]], block = []}>
 #linear2 = #ttg.linear<{register = [[0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [0, 16, 0], [0, 32, 0], [0, 64, 0]], lane = [[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [16, 0, 0]], warp = [[32, 0, 0], [64, 0, 0], [0, 0, 1]], block = []}>
-#loc = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":14:1)
+#loc = loc("repro_c.py":14:1)
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 16, rank = 1}>
 #shared2 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
@@ -125,46 +128,46 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return loc(#loc)
   } loc(#loc)
 } loc(#loc)
-#loc1 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":30:20)
+#loc1 = loc("repro_c.py":30:20)
 #loc2 = loc(unknown)
-#loc3 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":24:5)
-#loc4 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":20:5)
-#loc5 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":18:16)
-#loc6 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":17:17)
-#loc7 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":19:17)
-#loc8 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":23:17)
-#loc9 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":42:49)
-#loc10 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":42:32)
-#loc11 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":8:16)
-#loc12 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":25:24)
-#loc13 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":9:19)
-#loc14 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":10:19)
-#loc15 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":10:15)
-#loc16 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":11:27)
-#loc17 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":11:12)
-#loc18 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":11:48)
-#loc19 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":11:47)
-#loc20 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":28:30)
-#loc21 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":28:17)
-#loc22 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":29:30)
-#loc23 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":29:17)
-#loc24 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":30:30)
-#loc25 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":31:9)
-#loc26 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":32:24)
-#loc27 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":33:26)
-#loc28 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":33:15)
-#loc29 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":34:18)
-#loc30 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":35:19)
-#loc31 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":43:29)
-#loc32 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":40:33)
-#loc33 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":40:24)
-#loc34 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":43:13)
-#loc35 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":43:52)
-#loc36 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":43:51)
-#loc37 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":38:18)
-#loc38 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":42:44)
-#loc39 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":42:43)
-#loc40 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_c.py":42:24)
+#loc3 = loc("repro_c.py":24:5)
+#loc4 = loc("repro_c.py":20:5)
+#loc5 = loc("repro_c.py":18:16)
+#loc6 = loc("repro_c.py":17:17)
+#loc7 = loc("repro_c.py":19:17)
+#loc8 = loc("repro_c.py":23:17)
+#loc9 = loc("repro_c.py":42:49)
+#loc10 = loc("repro_c.py":42:32)
+#loc11 = loc("repro_c.py":8:16)
+#loc12 = loc("repro_c.py":25:24)
+#loc13 = loc("repro_c.py":9:19)
+#loc14 = loc("repro_c.py":10:19)
+#loc15 = loc("repro_c.py":10:15)
+#loc16 = loc("repro_c.py":11:27)
+#loc17 = loc("repro_c.py":11:12)
+#loc18 = loc("repro_c.py":11:48)
+#loc19 = loc("repro_c.py":11:47)
+#loc20 = loc("repro_c.py":28:30)
+#loc21 = loc("repro_c.py":28:17)
+#loc22 = loc("repro_c.py":29:30)
+#loc23 = loc("repro_c.py":29:17)
+#loc24 = loc("repro_c.py":30:30)
+#loc25 = loc("repro_c.py":31:9)
+#loc26 = loc("repro_c.py":32:24)
+#loc27 = loc("repro_c.py":33:26)
+#loc28 = loc("repro_c.py":33:15)
+#loc29 = loc("repro_c.py":34:18)
+#loc30 = loc("repro_c.py":35:19)
+#loc31 = loc("repro_c.py":43:29)
+#loc32 = loc("repro_c.py":40:33)
+#loc33 = loc("repro_c.py":40:24)
+#loc34 = loc("repro_c.py":43:13)
+#loc35 = loc("repro_c.py":43:52)
+#loc36 = loc("repro_c.py":43:51)
+#loc37 = loc("repro_c.py":38:18)
+#loc38 = loc("repro_c.py":42:44)
+#loc39 = loc("repro_c.py":42:43)
+#loc40 = loc("repro_c.py":42:24)
 #loc53 = loc("acc"(#loc1))
 #loc54 = loc("grid_m"(#loc4))
 #loc55 = loc("out_desc"(#loc5))

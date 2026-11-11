@@ -39,6 +39,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
+
+// An explicit downstream scale layout must take precedence over TMEMCopyOp's
+// default scale-layout inference.
+
+#rhs_source_linear = #ttg.shared_linear<{offset = [[0, 0, 0, 0, 1], [0, 0, 0, 0, 2], [0, 0, 0, 0, 4], [0, 0, 0, 0, 8], [0, 0, 0, 0, 16], [0, 0, 0, 0, 32], [0, 0, 0, 0, 64], [0, 0, 0, 0, 128], [0, 0, 0, 1, 0]], block = []}, alignment = 128>
+// CHECK-DAG: #[[$RHS_TMEM_SCALES:.*]] = #ttng.tensor_memory_scales_encoding<ctaMode = twocta_rhs>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory
+#dummy_tmem_layout = #tlx.dummy_tmem_layout<>
+#rhs_scales_encoding = #ttng.tensor_memory_scales_encoding<ctaMode = twocta_rhs>
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tmem_copy_prefers_explicit_rhs_scale_layout
+  tt.func public @tmem_copy_prefers_explicit_rhs_scale_layout() {
+    %c0_i32 = arith.constant 0 : i32
+    %scale_smem = ttg.local_alloc : () -> !ttg.memdesc<1x1x1x2x256xf8E4M3FN, #rhs_source_linear, #smem, mutable>
+    // CHECK: ttng.tmem_alloc : () -> !ttg.memdesc<2x128x4xi8, #[[$RHS_TMEM_SCALES]], #ttng.tensor_memory, mutable>
+    %scale_tmem = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x4xi8, #dummy_tmem_layout, #tmem, mutable>
+    %copy_view = ttg.memdesc_index %scale_tmem[%c0_i32] : !ttg.memdesc<2x128x4xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x4xi8, #dummy_tmem_layout, #tmem, mutable>
+    %require_view = ttg.memdesc_index %scale_tmem[%c0_i32] : !ttg.memdesc<2x128x4xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x4xi8, #dummy_tmem_layout, #tmem, mutable>
+    ttng.tmem_copy %scale_smem, %copy_view : !ttg.memdesc<1x1x1x2x256xf8E4M3FN, #rhs_source_linear, #smem, mutable>, !ttg.memdesc<128x4xi8, #dummy_tmem_layout, #tmem, mutable>
+    %scale_req = tlx.require_layout %require_view : !ttg.memdesc<128x4xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x4xi8, #rhs_scales_encoding, #tmem, mutable>
+    tt.return
+  }
+}
+
+// -----
 // Layout conversions that communicate between waves must surround rather than
 // execute inside a warp_predicate region. The carried values use the body's
 // native MFMA/row layouts, while the op's externally visible values retain

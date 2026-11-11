@@ -5,6 +5,58 @@ from .utility import cuda_parse_arch
 
 
 @tl.builtin
+def amd_packed_dot2(lhs, rhs, acc, input_dtype: tl.constexpr, _semantic=None):
+    """Compute one FP32 dot product from each pair of packed FP16 or BF16 inputs.
+
+    Every ``uint32`` element of ``lhs`` and ``rhs`` contains two values
+    of ``input_dtype``, which must be ``tl.float16`` or ``tl.bfloat16``.
+    The result is ``lhs[0] * rhs[0] + lhs[1] * rhs[1] + acc`` in FP32.
+    Inputs, accumulator, and result have the same tensor shape and layout.
+
+    This emits the matching LLVM AMDGPU fdot2 intrinsic rather than inline
+    assembly, so the backend retains the DOT dependency and hazard semantics.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_packed_dot2 is only supported on AMD (HIP) backends")
+    arch = _semantic.builder.options.arch.split(":", 1)[0]
+    assert arch == "gfx950", f"tlx.amd_packed_dot2 currently requires gfx950, got arch={arch}"
+    input_dtype = tl._unwrap_if_constexpr(input_dtype)
+    assert input_dtype in (tl.float16, tl.bfloat16), f"input_dtype must be tl.float16 or tl.bfloat16, got {input_dtype}"
+    for name, value in (("lhs", lhs), ("rhs", rhs), ("acc", acc)):
+        assert isinstance(value, tl.tensor) and value.type.is_block(), f"{name} must be a distributed tensor"
+    assert lhs.dtype == tl.uint32 and rhs.dtype == tl.uint32, "lhs and rhs must contain packed input pairs as uint32"
+    assert acc.dtype == tl.float32, "acc must be an FP32 tensor"
+    assert lhs.shape == rhs.shape == acc.shape, "lhs, rhs, and acc must have the same shape"
+    handle = _semantic.builder.create_amd_packed_dot2(lhs.handle, rhs.handle, acc.handle,
+                                                      input_dtype.to_ir(_semantic.builder))
+    return tl.tensor(handle, tl.block_type(tl.float32, lhs.shape))
+
+
+@tl.builtin
+def amd_concat(sources, shape, _semantic=None):
+    """Concatenate register fragments without cross-thread movement."""
+    sources = tuple(sources)
+    assert sources, "sources must not be empty"
+    assert all(isinstance(source, tl.tensor) for source in sources), "every source must be a tensor"
+    shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
+    source_shape = [tl._unwrap_if_constexpr(dim) for dim in sources[0].shape]
+    assert len(shape) == len(source_shape), f"shape must have rank {len(source_shape)}, got {len(shape)}"
+    assert all(isinstance(dim, int) and dim > 0 for dim in shape), "shape must contain positive constexpr integers"
+    assert all(
+        list(source.shape) == list(sources[0].shape) and source.dtype == sources[0].dtype
+        for source in sources[1:]), "sources must have identical shapes and dtypes"
+    source_elements = 1
+    result_elements = 1
+    for source_dim, result_dim in zip(source_shape, shape):
+        assert result_dim % source_dim == 0, "every result dimension must be a multiple of the source dimension"
+        source_elements *= source_dim
+        result_elements *= result_dim
+    assert result_elements == len(sources) * source_elements, "result shape must contain every source exactly once"
+    handle = _semantic.builder.create_amd_concat([source.handle for source in sources], shape)
+    return tl.tensor(handle, tl.block_type(sources[0].dtype, shape))
+
+
+@tl.builtin
 def extract_slice(source, shape, offsets, _semantic=None):
     """Extract an aligned register slice without cross-thread movement.
 
@@ -131,6 +183,106 @@ def amd_register_class_anchor(
 
 
 @tl.builtin
+def amd_dot(
+    a,
+    b,
+    acc,
+    register_class: tl.constexpr = None,
+    mfma_order: tl.constexpr = "auto",
+    accumulator_role: tl.constexpr = "transient",
+    resident_operand: tl.constexpr = None,
+    initialize: tl.constexpr = False,
+    _semantic=None,
+):
+    """The AMD dot: ``acc + a @ b`` with register placement, MFMA order and
+    accumulator lifetime as separate options.
+
+    ``register_class`` (``None``, ``"agpr"`` or ``"vgpr"``) is the register
+    file requested for the MFMA accumulator input (C) and result (D);
+    ``None`` leaves the choice to LLVM. ``mfma_order`` selects how the product
+    is lowered. ``accumulator_role`` (``"transient"``, the default, or
+    ``"persistent"``) is the accumulator's lifetime contract: phase-local, or
+    carried across phases.
+
+    ``mfma_order="auto"`` (default) is one logical ``tt.dot``, lowered by the
+    AMD backend to LLVM-visible MFMA intrinsics whose order the compiler owns:
+    LLVM's schedulers, or the backend's MFMA scheduler when the kernel is
+    compiled with ``schedule_hint="mfma-schedule"`` on gfx950. Every element
+    type ``tl.dot`` accepts is accepted, and with no ``register_class`` the
+    call is identical to ``tl.dot``. A register class is recorded on the dot
+    as ``amdg.cd_regclass`` (``"a"`` or ``"v"``); the MFMA lowering then wraps
+    each tile's accumulator in an empty inline asm with a tied ``"=a,0"`` /
+    ``"=v,0"`` constraint, right before the tile's first MFMA and right after
+    its last. No instruction is emitted. This is the mechanism of Gluon's
+    ``gl.amd.cdna3.mfma(..., cd_regclass=...)``. The pins sit next to their
+    own MFMAs, tile by tile, which is what lets LLVM drop the AGPR/VGPR copies
+    around a large accumulator; anchoring the whole accumulator at one source
+    point with :func:`amd_register_class_anchor` does not. A logical dot is
+    phase-local by construction, so this order takes ``accumulator_role=
+    "transient"`` only, and ``resident_operand`` and ``initialize`` do not
+    apply. ``register_class`` is AMD-only and currently verified on gfx950.
+
+    ``mfma_order="explicit"`` keeps the source order of the native MFMA
+    fragment chains: one SSA chain per output fragment, updated in K-major,
+    N-major, M-minor order, lowered to native ROCDL MFMA intrinsics. This is
+    the lowering of :func:`amd_scheduled_mfma`, which is this call under its
+    original name; see it for the full contract. ``accumulator_role`` selects
+    the chain's lifetime; a persistent chain pins its accumulator in the
+    ``register_class`` (``None`` is ``auto``, AGPRs) with side-effecting
+    inline asm and gets completion waits where its results reach opaque
+    consumers. ``resident_operand`` (``0`` or ``1``) selects the left or right
+    input for AGPR placement on the persistent path, ``"unconstrained"`` leaves
+    input placement to LLVM, and ``initialize=True``
+    starts every chain from zero, ignoring ``acc``. The inputs must be
+    matching BF16 or F16 dot operands with ``kWidth`` 4 or 8 and ``acc`` an
+    F32 accumulator in the corresponding unit-tile MFMA layout;
+    :func:`amd_mfma_commit` applies to the results as usual.
+
+    ``a`` and ``b`` are the dot operands, ``acc`` the F32 accumulator.
+    """
+    register_class = tl._unwrap_if_constexpr(register_class)
+    mfma_order = tl._unwrap_if_constexpr(mfma_order)
+    accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
+    resident_operand = tl._unwrap_if_constexpr(resident_operand)
+    initialize = tl._unwrap_if_constexpr(initialize)
+    assert isinstance(a, tl.tensor) and isinstance(b, tl.tensor), "a and b must be distributed tensors"
+    assert isinstance(acc, tl.tensor) and acc.type.is_block(), "acc must be a distributed tensor"
+    assert register_class in (None, "agpr",
+                              "vgpr"), f'register_class must be None, "agpr", or "vgpr", got {register_class!r}'
+    assert mfma_order in ("auto", "explicit"), f'mfma_order must be "auto" or "explicit", got {mfma_order!r}'
+    assert accumulator_role in ("transient",
+                                "persistent"), ('accumulator_role must be either "transient" or "persistent"')
+    assert resident_operand is None or resident_operand == "unconstrained" or (
+        isinstance(resident_operand, int) and not isinstance(resident_operand, bool)
+        and resident_operand in (0, 1)), 'resident_operand must be None, 0, 1, or "unconstrained"'
+    assert isinstance(initialize, bool), "initialize must be a constexpr bool"
+    if mfma_order == "explicit":
+        resident_role = {None: "none", 0: "lhs", 1: "rhs", "unconstrained": "unconstrained"}[resident_operand]
+        accumulator_class = "auto" if register_class is None else register_class
+        handle = _semantic.builder.create_amd_scheduled_mfma(
+            a.handle,
+            b.handle,
+            acc.handle,
+            resident_role,
+            accumulator_role,
+            accumulator_class,
+            initialize,
+        )
+        return tl.tensor(handle, acc.type)
+    assert accumulator_role == "transient", (
+        'mfma_order="auto" is a logical dot, phase-local by construction: it carries no persistent-chain '
+        'contract. Pin the accumulator with register_class, or use mfma_order="explicit".')
+    assert resident_operand is None and initialize is False, (
+        'resident_operand and initialize apply to mfma_order="explicit" only')
+    result = _semantic.dot(a, b, acc, input_precision=None, max_num_imprecise_acc=None, out_dtype=acc.dtype)
+    if register_class is not None:
+        assert _semantic.builder.options.backend_name == "hip", "register_class is only supported on AMD targets"
+        cd_regclass = {"agpr": "a", "vgpr": "v"}[register_class]
+        result.handle.set_attr("amdg.cd_regclass", _semantic.builder.get_string_attr(cd_regclass))
+    return result
+
+
+@tl.builtin
 def amd_scheduled_mfma(
     a,
     b,
@@ -141,77 +293,167 @@ def amd_scheduled_mfma(
     initialize: tl.constexpr = False,
     _semantic=None,
 ):
-    """Update native CDNA3/CDNA4 MFMA fragments in explicit source order.
+    """Update native CDNA3/CDNA4 MFMA fragments with explicit lifetime contracts.
 
-    Unlike ``tl.dot``, which represents one logical matrix product and carries
-    no accumulator-lifetime or register-class contract, this operation exposes
-    independent native fragment chains in source order.
+    This is :func:`amd_dot` with ``mfma_order="explicit"`` under its original
+    name (``accumulator_register_class`` is ``amd_dot``'s ``register_class``);
+    both spellings lower identically. Unlike ``tl.dot``, which represents one
+    logical matrix product and carries no accumulator-lifetime or
+    register-class contract, this operation exposes independent native
+    fragment chains in source order.
 
-    With ``initialize=False``, the operation computes ``acc + a @ b`` over
-    the supplied output tile. It keeps one SSA chain per native output fragment and
-    creates updates in K-major, N-major, M-minor order. LLVM may reschedule
-    independent updates on the transient intrinsic path. With
-    ``initialize=True``, the first native K update of every output fragment
-    starts from zero, ignoring the supplied accumulator values.
+    With ``initialize=False``, computes ``acc + a @ b`` over native fragments.
+    The operation keeps one SSA chain per output fragment and creates updates
+    in K-major, N-major, M-minor order. LLVM determines the final instruction
+    schedule. With ``initialize=True``, the first native K update starts from
+    zero and the result is ``a @ b``; the supplied accumulator value is ignored.
 
     To interleave work between output subtiles, slice the corresponding input
     panels and use separate accumulator tensors and calls. Commit those chains
     before joining the subtiles for a consumer of the full output tile.
 
     ``accumulator_role`` changes lowering, not the numerical operation.
-    ``"transient"`` describes a phase-local chain and uses LLVM-visible MFMA
-    intrinsics. ``"persistent"`` describes a chain carried across phases and
-    uses register-constrained inline assembly. Because LLVM cannot model an
-    MFMA hidden in inline assembly, that path adds target-specific input and
-    result wait padding. On the persistent path,
-    ``resident_operand=0`` or ``1`` selects the left or right input for AGPR
-    placement, and ``accumulator_register_class`` may select ``"agpr"`` or
-    ``"vgpr"``. Persistent ``auto`` selects AGPRs. The transient intrinsic path
-    does not apply these class constraints and leaves physical placement to
-    LLVM; use :func:`amd_register_resident` for a hard source residency point.
+    ``"transient"`` describes a phase-local chain; ``"persistent"`` describes a
+    chain carried across phases. Both roles use native ROCDL MFMA intrinsics,
+    exposing arithmetic latency and hazards to LLVM.
 
-    On gfx950, the compiler recognizes eligible persistent AGPR or VGPR
-    accumulator chains ending at a matching ``amd_mfma_commit`` boundary.
-    After scheduling and physical register assignment, it repairs source,
-    accumulator, and EXEC hazards and inserts any required waits before
-    physical-register reads or overwrites of outstanding results. Unproven
-    persistent chains and those on other supported targets retain conservative
-    waits.
+    A persistent chain has two guarantees that a transient chain does not:
 
-    CDNA3 rejects AGPR accumulators, so a persistent chain on gfx942 must pass
-    ``accumulator_register_class="vgpr"``. The inputs must be matching BF16 or
-    F16 dot operands with ``kWidth`` 4 or 8, and the accumulator must be F32
-    with the corresponding unit-tile MFMA layout. The logical K dimension must
-    be a positive multiple of both the native instruction K and the dot-operand
-    layout's K tile. On CDNA3, ``kWidth=8`` makes the operand tile span two
-    native K fragments. All tensors must have the
-    same rank, either two or three. Rank-three tensors have matching leading
-    batch dimensions distributed over waves, with one batch per wave. All active
-    lanes of a wave must execute the operation uniformly.
+    * Lifetime and storage. The accumulator keeps one register class across
+      phases. ``accumulator_register_class`` may select ``"agpr"`` or
+      ``"vgpr"``, and persistent ``auto`` selects AGPRs. Accumulator tuples are
+      pinned after all K updates; nonconstant input accumulators are also
+      pinned before the updates when ``initialize`` is false. These
+      side-effecting pins constrain compiler-side ordering.
+    * Self-completion. Each result pin records the MFMA result hazard. Kernel
+      chains with only native consumers and no calls retain empty pins that
+      provide no hardware wait. If a persistent result reaches opaque inline
+      assembly or an unmodeled escape, including through potentially aliasing
+      memory reloads, without a sufficient explicit commit, affected result
+      pins include a target-specific completion wait. Non-kernel helpers and
+      functions with remaining calls conservatively complete every persistent
+      result at its pin, including unused fragments.
+
+    ``resident_operand`` is a separate operand-placement control, which only
+    the persistent path applies. It does not change either guarantee above.
+    ``None`` constrains both inputs to VGPRs. ``0`` or ``1`` constrains the
+    left or right input to AGPRs and the other input to VGPRs.
+    ``"unconstrained"`` adds no input constraints and leaves input placement
+    to LLVM. An input constraint consumes its operand, so constraining an
+    operand loaded from shared memory makes LLVM wait for that load at the
+    constraint instead of at the MFMA.
+
+    Functions containing persistent MFMAs also prefix nonempty opaque inline
+    assembly with the largest required completion delay in that function. This
+    includes pure assembly and writers unrelated to the result: register reuse
+    can otherwise overlap an MFMA's in-flight accesses after a result becomes
+    dead or partially unused. Keeping the delay inside the assembly preserves
+    it through LLVM scheduling. Empty register pins and compiler-owned commits
+    retain their separate handling. These conservative rules may add redundant
+    waits around opaque code; MFMA arithmetic remains native, and the waits are
+    not memory fences.
+
+    The transient path does not apply these class constraints and leaves
+    physical placement to LLVM; use :func:`amd_register_resident` for a hard
+    source residency point. Use :func:`amd_mfma_commit` for explicit completion
+    boundaries with live dependencies.
+
+    CDNA3 retains its VGPR-only accumulator contract, so a persistent chain on
+    gfx942 must pass ``accumulator_register_class="vgpr"``. The inputs must be
+    matching BF16 or F16 dot operands with ``kWidth`` 4 or 8, and the accumulator
+    must be F32 with the corresponding unit-tile MFMA layout. The logical K
+    dimension must be a positive multiple of both the native instruction K and
+    the dot-operand layout's K tile. On CDNA3, ``kWidth=8`` makes the operand tile
+    span two native K fragments. All tensors must have the same rank, either two
+    or three. Rank-three tensors have matching leading batch dimensions
+    distributed over waves, with one batch per wave. All active lanes of a wave
+    must execute the operation uniformly.
     """
-    resident_operand = tl._unwrap_if_constexpr(resident_operand)
+    return amd_dot(
+        a,
+        b,
+        acc,
+        register_class=accumulator_register_class,
+        mfma_order="explicit",
+        accumulator_role=accumulator_role,
+        resident_operand=resident_operand,
+        initialize=initialize,
+        _semantic=_semantic,
+    )
+
+
+@tl.builtin
+def amd_scheduled_mfma_scaled(
+    a,
+    b,
+    acc,
+    a_scale,
+    b_scale,
+    a_format: tl.constexpr,
+    b_format: tl.constexpr,
+    accumulator_role: tl.constexpr = "transient",
+    accumulator_register_class: tl.constexpr = None,
+    initialize: tl.constexpr = False,
+    a_scale_selector: tl.constexpr = None,
+    b_scale_selector: tl.constexpr = None,
+    _semantic=None,
+):
+    """Update native CDNA4 scaled-MFMA fragments.
+
+    Scaled twin of :func:`amd_scheduled_mfma` for microscaling formats. ``a``
+    and ``b`` may be typed FP8 tensors in matching opIdx 0/1 dot-operand
+    layouts with ``kWidth`` 16, or i8 tensors with logical-value shapes (per
+    lane, the first 24 of every 32 K-ordered values are dense-packed code bytes
+    (32/24/16 per step for FP8/FP6/FP4) and the rest zero padding) in opIdx 0/1
+    dot-operand layouts with ``kWidth`` 8 under an ``amd_mfma_layout`` with
+    instruction shape 16x16x128 or 32x32x64, and
+    ``a_scale``/``b_scale`` are either i8 E8M0 tensors in MFMA scale-layout
+    order or packed i32 words with explicit byte selectors. Typed FP8 operands
+    support transient or persistent accumulator chains and explicit AGPR or
+    VGPR placement. Lowers to native ``v_mfma_scale_f32_*_f8f6f4`` ROCDL
+    intrinsics in K-major, N-major, M-minor order with one SSA chain per output
+    fragment.
+    """
+    a_format = tl._unwrap_if_constexpr(a_format)
+    b_format = tl._unwrap_if_constexpr(b_format)
+    initialize = tl._unwrap_if_constexpr(initialize)
     accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
     accumulator_register_class = tl._unwrap_if_constexpr(accumulator_register_class)
-    initialize = tl._unwrap_if_constexpr(initialize)
-    assert isinstance(a, tl.tensor) and isinstance(b, tl.tensor), ("a and b must be distributed tensors")
-    assert isinstance(acc, tl.tensor), "acc must be a distributed tensor"
-    assert resident_operand is None or (isinstance(resident_operand, int) and not isinstance(resident_operand, bool)
-                                        and resident_operand in (0, 1)), "resident_operand must be None, 0, or 1"
-    assert accumulator_role in ("transient",
-                                "persistent"), ('accumulator_role must be either "transient" or "persistent"')
-    assert accumulator_register_class in (None, "agpr",
-                                          "vgpr"), ("accumulator_register_class must be None, \"agpr\", or \"vgpr\"")
+    a_scale_selector = tl._unwrap_if_constexpr(a_scale_selector)
+    b_scale_selector = tl._unwrap_if_constexpr(b_scale_selector)
+    _formats = ("e4m3", "e5m2", "e2m3", "e3m2", "e2m1")
+    assert a_format in _formats, f"a_format must be one of {_formats}, got {a_format!r}"
+    assert b_format in _formats, f"b_format must be one of {_formats}, got {b_format!r}"
     assert isinstance(initialize, bool), "initialize must be a constexpr bool"
-    resident_role = {None: "none", 0: "lhs", 1: "rhs"}[resident_operand]
-    accumulator_class = ("auto" if accumulator_register_class is None else accumulator_register_class)
-    handle = _semantic.builder.create_amd_scheduled_mfma(
+    assert accumulator_role in ("transient", "persistent"), \
+        'accumulator_role must be "transient" or "persistent"'
+    assert accumulator_register_class in (None, "agpr", "vgpr"), \
+        'accumulator_register_class must be None, "agpr", or "vgpr"'
+    packed_scales = a_scale.dtype in (tl.int32, tl.uint32)
+    assert packed_scales == (b_scale.dtype in (tl.int32, tl.uint32)), \
+        "scale operands must use matching packing"
+    if packed_scales:
+        selectors = (a_scale_selector, b_scale_selector)
+        assert all(isinstance(selector, int) and not isinstance(selector, bool)
+                   and 0 <= selector <= 3 for selector in selectors), \
+            "packed i32 scales require selectors in [0, 3]"
+    else:
+        assert a_scale_selector is None and b_scale_selector is None, \
+            "i8 scales do not accept packed byte selectors"
+    handle = _semantic.builder.create_amd_scheduled_mfma_scaled(
         a.handle,
         b.handle,
         acc.handle,
-        resident_role,
+        a_scale.handle,
+        b_scale.handle,
+        a_format,
+        b_format,
+        "none",
         accumulator_role,
-        accumulator_class,
+        "auto" if accumulator_register_class is None else accumulator_register_class,
         initialize,
+        -1 if a_scale_selector is None else a_scale_selector,
+        -1 if b_scale_selector is None else b_scale_selector,
     )
     return tl.tensor(handle, acc.type)
 
@@ -304,7 +546,8 @@ def release_layout(x, relaxed: tl.constexpr = False, _semantic=None):
     return tl.tensor(handle, x.type)
 
 
-def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False):
+def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False,
+                                 fp6Padded: bool = False):
     assert isinstance(x.type.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
     if isinstance(x.type.layout, tlx.shared_linear_layout_encoding):
         return _builder.create_require_layout(x.handle, x.type.layout.to_ir(_builder))
@@ -329,6 +572,7 @@ def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builde
         layout.numCTAOrder,
         layout.fp4Padded,
         layout.swizzled,
+        fp6Padded,
     )
     return _builder.create_require_layout(x.handle, layout_handle)
 
@@ -357,13 +601,15 @@ def require_tmem_layout(src: tlx.buffered_tensor, col_stride: int, cta_mode: int
     return src.handle
 
 
-def require_tmem_scales_layout(src: tlx.buffered_tensor, _builder=None):
-    """
-    Require tensor memory scales layout for a TMEM tensor.
-    """
+def require_tmem_scales_layout(
+    src: tlx.buffered_tensor,
+    cta_mode: int = tlx.TMemCTAMode.DEFAULT,
+    _builder=None,
+):
+    """Require the requested tensor-memory scale layout for a TMEM tensor."""
     assert isinstance(
         src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.tmem, ("input must be a TMEM tensor")
-    layout = tlx.tensor_memory_scales_layout_encoding.make_default()
+    layout = tlx.tensor_memory_scales_layout_encoding.make_default(cta_mode)
     layout_handle = layout.to_ir(_builder)
     return _builder.create_require_layout(src.handle, layout_handle)
 
@@ -436,6 +682,8 @@ def dot_scaled(
             raise ValueError(f"tiles_per_warp requires {rank} entries, got {len(tiles_per_warp)}")
         if any(tile <= 0 for tile in tiles_per_warp):
             raise ValueError("tiles_per_warp entries must be positive")
+        if any(tile & (tile - 1) for tile in tiles_per_warp):
+            raise ValueError("tiles_per_warp entries must be powers of two")
         result.handle.set_attr(
             "amdg.wmma_tiles_per_warp",
             _semantic.builder.make_i32_array_attr(tiles_per_warp),
@@ -609,8 +857,12 @@ def async_dot_scaled(
         shape.
 
     A_format : str
-        Element format string for operand A: "e2m1" for packed FP4, or "e4m3"
-        and "e5m2" for FP8.
+        Element format string for operand A: "e2m1" for packed FP4, "e2m3"
+        and "e3m2" for packed FP6, or "e4m3" and "e5m2" for FP8.
+        FP6 in shared memory uses 16 packed values followed by four padding
+        bytes per 16-byte container. TMA inserts this padding when loading
+        dense global FP6; barrier byte counts exclude the padding. FP6 in
+        tensor memory uses one value in the low six bits of each byte.
 
     B_scale : tlx.buffered_tensor
         Scaling factors for operand B, same semantics as A_scale.
@@ -647,26 +899,26 @@ def async_dot_scaled(
     version = 5 if cuda_compute_capability >= 100 else 3
     assert version == 5, "async_dot_scaled is only available on Blackwell"
 
-    M, K, N = A.shape[0], A.shape[1], B.shape[1]
-    # Blackwell block-scaled tcgen05.mma (PTX ISA 9.3, Table 42): the per-CTA
-    # instruction shape is fixed to M=128 with N a multiple of 8 in [8, 256]. K is
-    # only lower-bounded because the lowering splits the K blocks across instructions.
-    assert M == 128, f"M must be 128 for the scaled MMA, but got {M}"
-    assert K >= 16, "K must be at least 16"
-    assert 8 <= N <= 256 and N % 8 == 0, f"N must be a multiple of 8 in [8, 256], but got {N}"
-
-    assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
-    assert isinstance(B, tlx.buffered_tensor), "input must be a buffered tensor"
-    assert B.type.storage == tlx.storage_kind.smem, "input must be a shared memory tensor"
-
-    # Handle input formats
-    supported_formats = {"e2m1", "e4m3", "e5m2"}
+    supported_formats = {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}
     A_format = tl._unwrap_if_constexpr(A_format)
     B_format = tl._unwrap_if_constexpr(B_format)
     assert A_format in supported_formats, f"Unsupported A_format: {A_format}"
     assert B_format in supported_formats, f"Unsupported B_format: {B_format}"
     A_type = _semantic._str_to_fp_type(A_format)
     B_type = _semantic._str_to_fp_type(B_format)
+
+    M, K, N = A.shape[0], A.shape[1], B.shape[1]
+    # PTX ISA 9.4 Table 50 supports aggregate M=128 for cta_group::2. TLX
+    # represents each CTA's half as M=64 with a TwoCTA_RHS accumulator.
+    is_two_cta_m64 = M == 64 and two_ctas and acc.type.layout.blockM == 64
+    assert M == 128 or is_two_cta_m64, (f"M must be 128, or 64 with a matching two-CTA accumulator, but got {M}")
+    if not is_two_cta_m64:
+        assert K >= 16, "K must be at least 16"
+        assert 8 <= N <= 256 and N % 8 == 0, f"N must be a multiple of 8 in [8, 256], but got {N}"
+
+    assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
+    assert isinstance(B, tlx.buffered_tensor), "input must be a buffered tensor"
+    assert B.type.storage == tlx.storage_kind.smem, "input must be a shared memory tensor"
 
     a_is_tmem = A.type.storage == tlx.storage_kind.tmem
     a_cta_mode = tlx.TMemCTAMode.DEFAULT
@@ -682,27 +934,30 @@ def async_dot_scaled(
     is_mixed_precision = A_format != B_format
     if A.type.storage == tlx.storage_kind.smem:
         A_fp4Padded = is_A_fp4 and is_mixed_precision
-        A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder, fp4Padded=A_fp4Padded)
+        A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder, fp4Padded=A_fp4Padded, fp6Padded=A_format
+                                                in ("e2m3", "e3m2"))
     else:
         assert a_is_tmem, "A must be in SMEM or TMEM"
         A_handle = require_tmem_layout(A, 1, a_cta_mode, _semantic.builder)
 
     # Require layout for B (always SMEM)
     B_fp4Padded = is_B_fp4 and is_mixed_precision
-    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder, fp4Padded=B_fp4Padded)
+    B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder, fp4Padded=B_fp4Padded, fp6Padded=B_format
+                                            in ("e2m3", "e3m2"))
 
     # Handle scale tensors - can be in SMEM or TMEM (auto-detected from storage type)
     assert isinstance(A_scale, tlx.buffered_tensor), "A_scale must be a buffered tensor"
     assert isinstance(B_scale, tlx.buffered_tensor), "B_scale must be a buffered tensor"
 
     if A_scale.type.storage == tlx.storage_kind.tmem:
-        A_scale_handle = require_tmem_scales_layout(A_scale, _semantic.builder)
+        A_scale_handle = require_tmem_scales_layout(A_scale, _builder=_semantic.builder)
     else:
         assert A_scale.type.storage == tlx.storage_kind.smem, "A_scale must be in SMEM or TMEM"
         A_scale_handle = require_nv_mma_shared_layout(A_scale, False, _semantic.builder)
 
     if B_scale.type.storage == tlx.storage_kind.tmem:
-        B_scale_handle = require_tmem_scales_layout(B_scale, _semantic.builder)
+        b_scale_cta_mode = tlx.TMemCTAMode.TwoCTA_RHS if is_two_cta_m64 else tlx.TMemCTAMode.DEFAULT
+        B_scale_handle = require_tmem_scales_layout(B_scale, b_scale_cta_mode, _semantic.builder)
     else:
         assert B_scale.type.storage == tlx.storage_kind.smem, "B_scale must be in SMEM or TMEM"
         B_scale_handle = require_nv_mma_shared_layout(B_scale, False, _semantic.builder)

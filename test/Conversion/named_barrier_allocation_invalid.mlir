@@ -1,4 +1,4 @@
-// RUN: not triton-opt %s -split-input-file --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=84' 2>&1 | FileCheck %s
+// RUN: not triton-opt %s -split-input-file --triton-nvidia-gpu-membar='compute-capability=90 ptx-version=84' --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=84' 2>&1 | FileCheck %s
 
 // Two partitions: the reserved partition ID covers only the first, so the
 // second must be drawn from the pool -- which a dynamic user ID makes unsafe.
