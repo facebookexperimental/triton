@@ -212,7 +212,14 @@ the monolithic pipeline.
 
 **Test pass**: `nvgpu-test-annotate-tma-store-waits` (`NVGPUTestAnnotateTMAStoreWaitsPass`)
 
-This pass walks `scf.for` loops and inspects every `TMAStoreTokenWaitOp`.
+This pass inspects every `TMAStoreTokenWaitOp` enclosed by an `scf.for` loop
+or an `scf.while` loop containing a CLC scheduler operation. Atomic dynamic-
+persistent loops are deliberately excluded even though they use the same SCF
+operation: their next iteration may represent unrelated work, so rotating an
+epilogue wait across that boundary can race staging-buffer reuse.
+The pass marks CLC loops with `ttg.clc_persistent` before code partitioning so
+the per-partition loop clones remain identifiable after the CLC operations are
+isolated in the scheduler partition.
 For each wait, it traces the token back to the defining
 TMA store-like op (`AsyncTMACopyLocalToGlobalOp` or `AsyncTMAReduceOp`),
 then looks at the SMEM buffer used by that store:
@@ -268,6 +275,14 @@ queue-wide rather than descriptor- or allocation-specific, so the final wait
 for one output (for example dV) may cross independent preparation for the next
 output (dK) and stop at dK's staging write. The last wait in the block remains
 the final drain.
+
+CLC epilogues are straight-line regions inside the persistent scheduler's
+`scf.while`. Their annotated waits retain `planned_pending_count = K - 1`, so
+the K-slot staging ring overlaps stores across scheduler iterations. Because
+the loop can terminate with stores still pending, the pass emits one
+queue-wide `wait_group(0)` after the `scf.while` for every issuing async task.
+This is the CLC counterpart of the post-`scf.for` drain used by merged
+epilogues.
 
 For annotated operations, merged epilogue loops
 (`tt.merge_epilogue_to_computation`) serialize the

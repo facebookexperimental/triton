@@ -29,6 +29,77 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+// CLC keeps planned waits in the while body and drains the issuing task after
+// the persistent scheduler exits.
+// CHECK-LABEL: clc_while_rotation_and_drain
+// CHECK: scf.while
+// CHECK: %[[TOK0:.*]] = ttng.async_tma_copy_local_to_global
+// CHECK: ttng.async_tma_store_token_wait %[[TOK0]]
+// CHECK-SAME: planned_pending_count = 1
+// CHECK-NEXT: ttg.local_store
+// CHECK: %[[TOK1:.*]] = ttng.async_tma_copy_local_to_global
+// CHECK-NEXT: ttng.async_tma_store_token_wait %[[TOK1]]
+// CHECK-SAME: planned_pending_count = 1
+// CHECK: scf.yield
+// CHECK: ttng.async_tma_store_wait {async_task_id = array<i32: 3>, pendings = 0 : i32}
+  tt.func public @clc_while_rotation_and_drain(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %src0: tensor<128x64xf16>, %src1: tensor<128x64xf16>,
+      %buf0: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %buf1: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, %i: i32) {
+    %true = arith.constant true
+    %false = arith.constant false
+    scf.while (%valid = %true) : (i1) -> () {
+      scf.condition(%valid)
+    } do {
+      ttg.local_store %src0, %buf0 : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %tok0 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf0 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %tok0 {async_task_id = array<i32: 3>, can_rotate_by_buffer_count = 2 : i32, planned_pending_count = 1 : i32} : !ttg.async.token
+      ttg.local_store %src1, %buf1 : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %tok1 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf1 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %tok1 {async_task_id = array<i32: 3>, can_rotate_by_buffer_count = 2 : i32, planned_pending_count = 1 : i32} : !ttg.async.token
+      scf.yield %false : i1
+    } attributes {ttg.clc_persistent}
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+// Dynamic-persistent loops must not acquire a CLC queue drain even if stale
+// rotation metadata reaches this pass.
+// CHECK-LABEL: dynamic_while_does_not_drain
+// CHECK: scf.while
+// CHECK: ttng.async_tma_store_token_wait
+// CHECK: scf.yield
+// CHECK-NEXT: }
+// CHECK-NEXT: tt.return
+  tt.func public @dynamic_while_does_not_drain(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %src: tensor<128x64xf16>,
+      %buf: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, %i: i32) {
+    %true = arith.constant true
+    %false = arith.constant false
+    scf.while (%valid = %true) : (i1) -> () {
+      scf.condition(%valid)
+    } do {
+      ttg.local_store %src, %buf : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %tok = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %tok {async_task_id = array<i32: 3>, can_rotate_by_buffer_count = 2 : i32, planned_pending_count = 1 : i32} : !ttg.async.token
+      scf.yield %false : i1
+    }
+    tt.return
+  }
+}
+
+// -----
+
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
