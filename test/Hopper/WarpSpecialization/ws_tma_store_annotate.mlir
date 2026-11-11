@@ -7,6 +7,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-LABEL: triple_buffer
 // CHECK: ttng.async_tma_store_token_wait
 // CHECK-SAME: can_rotate_by_buffer_count = 3
+// CHECK-NOT: planned_pending_count
   tt.func public @triple_buffer(
       %desc: !tt.tensordesc<128x64xf16, #shared>,
       %src: tensor<128x64xf16>,
@@ -31,6 +32,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-LABEL: single_buffer
 // CHECK: ttng.async_tma_store_token_wait
 // CHECK-SAME: can_rotate_by_buffer_count = 1
+// CHECK-NOT: planned_pending_count
   tt.func public @single_buffer(
       %desc: !tt.tensordesc<128x64xf16, #shared>,
       %src: tensor<128x64xf16>,
