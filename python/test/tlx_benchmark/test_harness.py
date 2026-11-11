@@ -832,6 +832,7 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.kda._shapes",
         "triton.tlx.ops.kernels.kda._prefill_shapes",
         "triton.tlx.ops.kernels.kda._decode_shapes",
+        "triton.tlx.ops.kernels.fused.linear_rowscale._shapes",
         "triton.tlx.ops.kernels.mla_window_attn._shapes",
         "triton.tlx.ops.kernels.mm._shapes",
         "triton.tlx.ops.kernels.swiglu_ffn._shapes",
@@ -879,6 +880,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.kda._shapes": {"sm100": ("sm100_1", )},
         "triton.tlx.ops.kernels.kda._prefill_shapes": {"gfx950": ("gfx950_1", )},
         "triton.tlx.ops.kernels.kda._decode_shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.fused.linear_rowscale._shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.mla_window_attn._shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.norm._cat_shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.mm._shapes": {
@@ -981,6 +983,7 @@ BENCH_MODULES = (
     "bench_kda",
     "bench_kda_decode",
     "bench_kda_prefill",
+    "bench_linear_rowscale",
     "bench_mla_window_attn",
     "bench_mm",
     "bench_rmsnorm_cat",

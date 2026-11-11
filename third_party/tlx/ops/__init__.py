@@ -122,9 +122,10 @@ from ._normalization import (
 __all__ = [
     "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
     "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen",
-    "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention",
-    "kda_paged_prefill", "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward",
-    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev",
+    "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp", "UnsupportedBackward",
+    "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -1082,6 +1083,60 @@ def mla_window_attn(x, cu_seqlens, norm_weight, q_proj, kv_proj, gate_proj, *, n
     with torch.cuda.device(x.device):
         return fn(x, cu_seqlens, norm_weight, tuple(q_proj), tuple(kv_proj), tuple(gate_proj), num_heads,
                   tuple(window_size), float(norm_eps), float(lora_eps))
+
+
+def linear_rowscale(x, weight, bias=None, row_scale=None, *, space=None):
+    """Linear layer with an optional per-row output scale, forward only.
+
+    Returns ``((x @ weight.T + bias) * row_scale[:, None]).to(x.dtype)`` for ``x`` of shape ``(M, K)``, ``weight`` of
+    shape ``(N, K)`` (``nn.Linear`` layout), an optional ``bias`` of ``N`` elements in ``x``'s dtype and an optional
+    FP32 ``row_scale`` of ``M`` elements, accumulated in FP32 and rounded once. FP16 or BF16, ``K <= 512`` and ``K``,
+    ``N`` multiples of 8. The kernel reads ``x`` and ``weight`` through TMA; one that TMA cannot address in place
+    (column stride not 1, row stride or base not 16-byte aligned) is copied first. A row's result does not depend on
+    ``M`` or on the other rows. The op has one launch configuration, so ``space`` only selects bitwise-invariance
+    checking. For ``torch.compile`` and AOTInductor, launch the kernel through :func:`linear_rowscale_launch` from a
+    ``torch.library.triton_op``.
+    """
+    import torch
+    if x.ndim != 2 or weight.ndim != 2 or weight.shape[1] != x.shape[1]:
+        raise InvalidInput("tlx.ops.linear_rowscale expects x of shape (M, K) and weight of shape (N, K); got "
+                           f"{tuple(x.shape)} and {tuple(weight.shape)}")
+    M, K = x.shape
+    N = weight.shape[0]
+    if weight.dtype != x.dtype or (bias is not None and bias.dtype != x.dtype):
+        raise InvalidInput("tlx.ops.linear_rowscale expects weight and bias in x's dtype")
+    if bias is not None and bias.numel() != N:
+        raise InvalidInput(f"tlx.ops.linear_rowscale expects a bias of {N} elements; got {tuple(bias.shape)}")
+    if row_scale is not None and (row_scale.numel() != M or row_scale.dtype != torch.float32):
+        raise InvalidInput(f"tlx.ops.linear_rowscale expects an FP32 row_scale of {M} elements; got "
+                           f"{tuple(row_scale.shape)} {row_scale.dtype}")
+    if any(t is not None and t.device != x.device for t in (weight, bias, row_scale)):
+        raise InvalidInput("tlx.ops.linear_rowscale expects all tensors on one device")
+    space_name, invariance = _normalize_space_arg("linear_rowscale", space)
+    _check_single_config_space("linear_rowscale", space_name)
+    fn, spec = impl_for("linear_rowscale", device=x.device)
+    check_inputs(spec, dtype=x.dtype, M=M, N=N, K=K)
+    check_backward(spec, x, weight, bias, row_scale)
+    _check_enforced("linear_rowscale", spec, invariance)
+    return fn(x, weight, None if bias is None else bias.reshape(N), None if row_scale is None else row_scale.reshape(M))
+
+
+def linear_rowscale_launch(x, weight, bias=None, row_scale=None, *, out):
+    """The launch of ``linear_rowscale`` as ``(kernel, grid, args, kwargs)``.
+
+    For callers that must launch the Triton kernel themselves, e.g. a ``torch.library.triton_op`` that runs
+    ``wrap_triton(kernel)[grid](*args, **kwargs)`` so that AOTInductor compiles it into the exported artifact. Same
+    operands and result as ``linear_rowscale``, written to the ``(M, N)`` ``out``; ``bias`` is ``(N,)`` and
+    ``row_scale`` ``(M,)``, both contiguous. Nothing is copied: ``x``, ``weight`` and ``out`` must have a unit column
+    stride and a 16-byte-aligned base and row stride, or ``InvalidInput`` is raised. Works on fake tensors with a
+    symbolic M.
+    """
+    if x.ndim != 2 or weight.ndim != 2:
+        raise InvalidInput("tlx.ops.linear_rowscale_launch expects two-dimensional x and weight")
+    fn, spec = impl_for("linear_rowscale_launch", device=x.device)
+    check_inputs(spec, dtype=x.dtype, N=weight.shape[0], K=x.shape[1])
+    check_backward(spec, x, weight, bias, row_scale)
+    return fn(x, weight, bias, row_scale, out=out)
 
 
 def swiglu_ffn(x, norm_weight, w1, w2, w3, *, eps=1e-5, space=None):
