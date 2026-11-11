@@ -23,6 +23,18 @@ void populateClusterOpsToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                       PatternBenefit benefit,
                                       const NVIDIA::TargetInfo &targetInfo);
 
+// Returns how many worker warps lowering the cluster arrive, wait, or barrier
+// `op` dispatches through a synthetic ttg.warp_specialize region so that they
+// join the cluster-wide barrier, or 0 if `op` is emitted in place. Fails if the
+// warp counts in the context of `op` are missing or inconsistent.
+FailureOr<int> getClusterSyncDispatchWarps(Operation *op);
+
+// Returns true if lowering `mod` adds ttg.warp_specialize regions beyond the
+// ones it already contains: one per cluster sync that worker warps must join,
+// and one at kernel entry to initialize the mbarriers backing cluster barriers
+// inside warp_specialize regions.
+bool needsSyntheticWarpSpecialize(ModuleOp mod);
+
 void populateConvertLayoutOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                            const TargetInfo &targetInfo,
                                            RewritePatternSet &patterns,
@@ -31,6 +43,7 @@ void populateConvertLayoutOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
 void populateMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                     const TargetInfo &targetInfo,
                                     RewritePatternSet &patterns,
+                                    ModuleAxisInfoAnalysis &axisInfoAnalysis,
                                     PatternBenefit benefit);
 
 void populateConvertLayoutOpToLLVMOptimizedPatterns(
@@ -48,6 +61,7 @@ void populateElementwiseOpToLLVMPatterns(
 
 void populateFp4ToFpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                    RewritePatternSet &patterns,
+                                   const TargetInfo &targetInfo,
                                    PatternBenefit benefit);
 
 void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,

@@ -68,7 +68,11 @@ This pass runs during TTGIR→LLVM conversion.
 2. **Skip if there are no requests.** If no `ttg.warp_specialize` has register
    requests, it stops here.
 3. **Pick the per-thread starting budget** `maxnreg`. This is `ttg.maxnreg` if
-   the user set it. Otherwise it is
+   the user set it. Otherwise, if every partition including the default region
+   requests registers explicitly (TLX only; AutoWS never sets the default
+   region's request), it is the requested total `sum(num_warps × registers)`
+   spread over all threads, rounded up to a multiple of 8 and clamped to
+   `[24, floor(65536 / (totalWarps × 32))]`. Otherwise it is
    `floor(65536 / (totalWarps × 32))`, rounded down to a multiple of 8.
 4. **Pool** = `maxnreg × totalWarps × 32`.
 5. **Fixed requests.** Each 4-warp group's request is the maximum request
@@ -85,7 +89,8 @@ This pass runs during TTGIR→LLVM conversion.
    remainder is negative, or if the even share is below 24 (below 32 for a
    default region containing assert/print).
 8. **Record.** On success it writes `actualRegisters` (default region first)
-   and sets `ttg.maxnreg` to the starting budget. That means `ttg.maxnreg` is
+   and sets `ttg.maxnreg` to the starting budget (the maximum over all
+   `ttg.warp_specialize` ops). That means `ttg.maxnreg` is
    now present even when the user did not set it.
 
 The pool is computed from `maxnreg` and is not checked against the hardware's

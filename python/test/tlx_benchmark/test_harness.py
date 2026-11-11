@@ -12,8 +12,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _harness import (COLD_COMPILE_CAP_S, DEFAULT_REPLICATES, DEFAULT_WARMUP_ITERS, MAX_CLOCK_IDR, MAX_CV,
                       MAX_REPLICATE_DEVIATION, MIN_TOTAL_SAMPLES, MIN_SPEEDUP, SCHEMA_VERSION, Case, ClockTrace,
                       CompileStat, GpuState, Result, Status, artifact, decode_event_reasons, fresh_triton_cache,
-                      parse_cpulist, reject_outliers_iqr, relative_interdecile_range, resolve_warmup_and_rep, summarize,
-                      to_tflops)
+                      parse_cpulist, reject_outliers_iqr, relative_interdecile_range, require_schema,
+                      resolve_warmup_and_rep, summarize, to_tflops)
 
 # --------------------------------------------------------------------------
 # measure: sizing the window
@@ -209,6 +209,15 @@ def test_artifact_is_json_serializable_and_versioned():
     # Schema 2: the throughput lives in the Stat and only there.
     assert doc["results"][0]["tlx"]["unit"] == "tflops"
     assert "tlx_tflops" not in doc["results"][0]
+
+
+def test_require_schema_rejects_other_versions():
+    doc = artifact([], env={})
+    assert require_schema(doc) is doc
+    with pytest.raises(ValueError, match="schema_version 3"):
+        require_schema({**doc, "schema_version": 3})
+    with pytest.raises(ValueError, match="schema_version None"):
+        require_schema({"results": []})
 
 
 def test_report_groups_notes_after_the_table(tmp_path):
@@ -488,7 +497,116 @@ def test_visibility_variable_follows_the_vendor():
     from _harness.denoise import AMD, NVIDIA, Device
 
     assert Device(NVIDIA, 2, "NVIDIA B200").visibility_env == "CUDA_VISIBLE_DEVICES"
-    assert Device(AMD, 2, "MI350X").visibility_env == "HIP_VISIBLE_DEVICES"
+    assert Device(AMD, 2, "MI350X").visibility_env == "ROCR_VISIBLE_DEVICES"
+
+
+def test_pin_by_uuid_never_by_smi_index(monkeypatch):
+    from _harness.denoise import AMD, NVIDIA, Device
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+    assert Device(NVIDIA, 2, "NVIDIA B200", uuid="GPU-abc").pin()
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "GPU-abc"
+
+    # denoise.sh exports HIP_VISIBLE_DEVICES=4; HIP would apply it on top of the
+    # ROCR pin and see no GPU at all.
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "4")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+    assert not Device(AMD, 2, "MI350X").pin()
+    assert Device(AMD, 2, "MI350X", uuid="GPU-46c1d72dcdc11989").pin()
+    assert os.environ["ROCR_VISIBLE_DEVICES"] == "GPU-46c1d72dcdc11989"
+    assert "HIP_VISIBLE_DEVICES" not in os.environ and "CUDA_VISIBLE_DEVICES" not in os.environ
+
+
+# rocminfo lists GPU agents in a different order from rocm-smi's cards, as on a
+# real MI350 host, so matching by position instead of PCI bus picks the wrong GPU.
+_ROCM_SMI_VRAM_BUS = """device,PCI Bus,VRAM Total Memory (B),VRAM Total Used Memory (B)
+card0,0000:08:00.0,309220868096,30000000000
+card1,0000:88:00.0,309220868096,808349696
+"""
+_ROCMINFO = """Agent 1
+  Uuid:                    CPU-XX
+  Device Type:             CPU
+Agent 2
+  Uuid:                    GPU-46c1d72dcdc11989
+  Device Type:             GPU
+  BDFID:                   34816
+Agent 3
+  Uuid:                    GPU-be8bd961d1e61412
+  Device Type:             GPU
+  BDFID:                   2048
+"""
+
+
+def test_amd_devices_get_the_rocr_uuid_of_their_pci_bus(monkeypatch):
+    import _harness.denoise as denoise_mod
+
+    monkeypatch.setattr(denoise_mod, "vendor", lambda: denoise_mod.AMD)
+    monkeypatch.setattr(denoise_mod, "_rocm", lambda args: _ROCM_SMI_VRAM_BUS if "--showbus" in args else None)
+    monkeypatch.setattr(denoise_mod, "_rocminfo", lambda: _ROCMINFO)
+    monkeypatch.setattr(denoise_mod, "_amd_name", lambda index: "MI350X")
+
+    card0, card1 = denoise_mod.list_devices()
+    assert [(d.index, d.uuid) for d in (card0, card1)] == [(0, "GPU-be8bd961d1e61412"), (1, "GPU-46c1d72dcdc11989")]
+    assert denoise_mod.select_device("auto").uuid == "GPU-46c1d72dcdc11989"
+
+
+def test_amd_identity_and_least_used_selection_survive_missing_management_tools(tmp_path, monkeypatch):
+    from _harness import denoise
+
+    nodes, pci = tmp_path / "nodes", tmp_path / "pci"
+    for ordinal, bus, unique_id, used in [(2, 0x88, 0x46c1d72dcdc11989, 808349696),
+                                          (5, 0x08, 0xbe8bd961d1e61412, 30000000000)]:
+        node = nodes / str(ordinal)
+        node.mkdir(parents=True)
+        props = {
+            "simd_count": 1024, "vendor_id": 0x1002, "device_id": 0x75a0, "unique_id": unique_id, "location_id":
+            bus << 8, "domain": 0
+        }
+        (node / "properties").write_text("".join(f"{k} {v}\n" for k, v in props.items()))
+        device = pci / f"0000:{bus:02x}:00.0"
+        device.mkdir(parents=True)
+        (device / "mem_info_vram_used").write_text(str(used))
+    monkeypatch.setattr(denoise, "_KFD_NODES", str(nodes), raising=False)
+    monkeypatch.setattr(denoise, "_PCI_DEVICES", str(pci))
+    monkeypatch.setattr(denoise, "_smi", lambda args: None)
+    monkeypatch.setattr(denoise, "_rocm", lambda args: None)
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", os.environ.get("ROCR_VISIBLE_DEVICES", ""))
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    selected = denoise.select_device()
+    assert selected.uuid == "GPU-46c1d72dcdc11989"
+    assert selected.pci_bus == "0000:88:00.0"
+    assert selected.arch == "gfx950"
+    assert selected.memory_used_mib == pytest.approx(808349696 / 1024 / 1024)
+    assert selected.pin()
+    assert os.environ["ROCR_VISIBLE_DEVICES"] == selected.uuid
+
+
+def test_required_benchmark_gpu_cannot_be_an_empty_success(monkeypatch):
+    from _harness import denoise
+
+    monkeypatch.setattr(denoise, "list_devices", lambda: [])
+    with pytest.raises(RuntimeError, match="No benchmark GPU discovered"):
+        denoise.select_device()
+
+
+@pytest.mark.parametrize("mapped_index", [None, 6])
+def test_fallback_inventory_governs_only_its_pci_matched_gpu(monkeypatch, mapped_index):
+    from _harness import denoise
+
+    calls = []
+    bus = None if mapped_index is None else f"device,PCI Bus\ncard{mapped_index},0000:88:00.0"
+    monkeypatch.setattr(denoise, "_rocm", lambda args: bus)
+    monkeypatch.setattr(denoise.Governor, "_sudo", lambda self, args: calls.append(args) or True)
+    device = denoise.Device(denoise.AMD, 1, "MI350X", uuid="GPU-46c1d72dcdc11989", pci_bus="0000:88:00.0")
+    with denoise.Governor(device) as governor:
+        if mapped_index is None:
+            assert "management GPU mapping unavailable" in " ".join(governor.skipped)
+    if mapped_index is None:
+        assert calls == []
+    else:
+        assert [args[2] for args in calls] == [str(mapped_index)] * 4
 
 
 def test_sampler_join_does_not_shadow_thread_internals():
@@ -505,12 +623,15 @@ def test_arch_matches_the_part():
     from _harness.denoise import AMD, NVIDIA, Device
 
     assert Device(NVIDIA, 0, "NVIDIA B200").arch == "sm100"
+    assert Device(NVIDIA, 0, "NVIDIA H100 80GB HBM3").arch == "sm90"
     assert Device(AMD, 0, "MI300X").arch == "gfx942"
     # "GB200" contains "B200"; both map to sm100, but the longer key must win so
     # the table stays correct if they ever diverge.
     assert Device(NVIDIA, 0, "NVIDIA GB200").arch == "sm100"
     assert Device(AMD, 0, "MI350X").arch == "gfx950"
     assert Device(AMD, 0, "MI355X").arch == "gfx950"
+    assert Device(AMD, 0, "MI450X").arch == "gfx1250"
+    assert Device(AMD, 0, "MI455X").arch == "gfx1250"
 
 
 def test_amd_numa_node_resolves_through_pci_not_the_drm_index(tmp_path, monkeypatch):
@@ -701,6 +822,7 @@ def test_focus_suite_can_union_other_suites():
     "module_name",
     [
         "triton.tlx.ops.kernels.addmm._shapes",
+        "triton.tlx.ops.kernels.fused.addmm_mul_add._shapes",
         "triton.tlx.ops.kernels.bmm._shapes",
         "triton.tlx.ops.kernels.flash_attn._shapes",
         "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes",
@@ -710,7 +832,10 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.kda._shapes",
         "triton.tlx.ops.kernels.kda._prefill_shapes",
         "triton.tlx.ops.kernels.kda._decode_shapes",
+        "triton.tlx.ops.kernels.fused.linear_rowscale._shapes",
+        "triton.tlx.ops.kernels.mla_window_attn._shapes",
         "triton.tlx.ops.kernels.mm._shapes",
+        "triton.tlx.ops.kernels.swiglu_ffn._shapes",
     ],
 )
 def test_operator_shape_modules_expose_the_l1_union(module_name):
@@ -727,9 +852,11 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
 
     expected = {
         "triton.tlx.ops.kernels.addmm._shapes": {
-            "gfx942": ("gfx942_1", ),
+            "sm90": ("sm90_all", ),
+            "gfx942": ("gfx942_all", ),
             "gfx950": ("gfx950_all", ),
         },
+        "triton.tlx.ops.kernels.fused.addmm_mul_add._shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.flash_attn._shapes": {
             "sm90": ("sm90_1", ),
@@ -739,8 +866,12 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes": {
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_1", ),
+            "gfx1250": ("gfx1250_1", ),
         },
-        "triton.tlx.ops.kernels.flash_attn_varlen._shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.flash_attn_varlen._shapes": {
+            "gfx950": ("gfx950_1", ),
+            "sm90": ("sm90_all", ),
+        },
         "triton.tlx.ops.kernels.hstu_attn._shapes": {
             "sm100": ("sm100_1", ),
             "gfx950": (),
@@ -749,25 +880,33 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.kda._shapes": {"sm100": ("sm100_1", )},
         "triton.tlx.ops.kernels.kda._prefill_shapes": {"gfx950": ("gfx950_1", )},
         "triton.tlx.ops.kernels.kda._decode_shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.fused.linear_rowscale._shapes": {"sm90": ("sm90_1", )},
+        "triton.tlx.ops.kernels.mla_window_attn._shapes": {"sm90": ("sm90_1", )},
+        "triton.tlx.ops.kernels.norm._cat_shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.mm._shapes": {
+            "sm90": ("sm90_baseline", "sm90_1"),
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_all", ),
             "gfx942": ("gfx942_all", ),
         },
+        "triton.tlx.ops.kernels.swiglu_ffn._shapes": {"sm90": ("sm90_1", )},
     }
     pattern = re.compile(r"^(?:sm|gfx)\d+_(?:[1-9]\d*|all)$")
     for module_name, defaults in expected.items():
         registry = importlib.import_module(module_name).FOCUS
         assert dict(registry.defaults) == defaults
-        assert all(pattern.fullmatch(suite.name) for suite in registry.suites)
+        assert all(suite.name == "sm90_baseline" or (module_name == "triton.tlx.ops.kernels.mm._shapes"
+                                                     and suite.name == "gfx950_addmm") or pattern.fullmatch(suite.name)
+                   for suite in registry.suites)
 
     mm = importlib.import_module("triton.tlx.ops.kernels.mm._shapes").FOCUS
     assert mm.suite("gfx942_2").includes == ("gfx950_2", )
     assert mm.resolved_shapes("gfx942_2") == mm.resolved_shapes("gfx950_2")
     assert mm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2")
-    assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3")
+    assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_addmm", "gfx950_4")
 
     addmm = importlib.import_module("triton.tlx.ops.kernels.addmm._shapes").FOCUS
+    assert addmm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2", "gfx942_3")
     assert addmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_4")
 
     bmm = importlib.import_module("triton.tlx.ops.kernels.bmm._shapes").FOCUS
@@ -776,11 +915,14 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
     flash_attn = importlib.import_module("triton.tlx.ops.kernels.flash_attn._shapes").FOCUS
     assert flash_attn.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
 
+    flash_attn_varlen = importlib.import_module("triton.tlx.ops.kernels.flash_attn_varlen._shapes").FOCUS
+    assert flash_attn_varlen.suite("sm90_all").includes == ("sm90_1", "sm90_2", "sm90_3")
+
     hstu_cross_attn = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn._shapes").FOCUS
     assert hstu_cross_attn.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2")
 
 
-def test_flash_attn_mxfp8_gfx950_benchmark_is_forward_only(monkeypatch):
+def test_flash_attn_mxfp8_gfx950_benchmark_supports_backward(monkeypatch):
     import importlib
 
     bench = importlib.import_module("bench_flash_attn_mxfp8")
@@ -789,8 +931,23 @@ def test_flash_attn_mxfp8_gfx950_benchmark_is_forward_only(monkeypatch):
         monkeypatch.setattr(bench.driver, "arch", lambda: arch)
         return {case.direction for case in bench.cases(synthetic=True)}
 
-    assert directions("gfx950") == {"fwd"}
+    assert directions("gfx950") == {"fwd", "bwd"}
     assert directions("sm100") == {"fwd", "bwd"}
+    assert directions("gfx1250") == {"fwd"}
+
+
+def test_hstu_cross_attn_benchmark_times_inference_shapes_forward_only(monkeypatch):
+    import importlib
+
+    bench = importlib.import_module("bench_hstu_cross_attn")
+    monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
+    inference = set(bench.SHAPE_SUITES.resolved_shapes("gfx950_1"))
+    directions = {}
+    for case in bench.cases():
+        directions.setdefault(case.shape, set()).add(case.direction)
+
+    assert {d for shape, ds in directions.items() if shape in inference for d in ds} == {"fwd"}
+    assert all(ds == {"fwd", "bwd"} for shape, ds in directions.items() if shape not in inference)
 
 
 def test_focus_suite_selection_rejects_unknown_names():
@@ -816,15 +973,21 @@ def test_focus_suite_op_mismatch_is_rejected_explicitly():
 
 BENCH_MODULES = (
     "bench_addmm",
+    "bench_addmm_mul_add",
     "bench_flash_attn",
     "bench_flash_attn_mxfp8",
     "bench_flash_attn_varlen",
+    "bench_flash_attn_varlen_ragged",
     "bench_hstu_attn",
     "bench_hstu_cross_attn",
     "bench_kda",
     "bench_kda_decode",
     "bench_kda_prefill",
+    "bench_linear_rowscale",
+    "bench_mla_window_attn",
     "bench_mm",
+    "bench_rmsnorm_cat",
+    "bench_swiglu_ffn",
 )
 
 
@@ -1219,10 +1382,10 @@ def test_arch_follows_the_selected_device_not_physical_gpu_zero(unpinned_driver,
     monkeypatch.setattr(
         unpinned_driver, "list_devices",
         lambda: [Device(NVIDIA, 0, "NVIDIA H100"), Device(NVIDIA, 1, "NVIDIA B200")])
-    # Unpinned falls back to the first device, i.e. what torch calls cuda:0.
-    # H100 is not in ARCH_BY_PART, so that answer is None -- and None is exactly
-    # what the old code would have reported for a run pinned to the B200.
-    assert unpinned_driver.arch() is None
+    # Unpinned falls back to the first device, i.e. what torch calls cuda:0 --
+    # and GPU 0's sm90 is exactly what the old code would have reported for a
+    # run pinned to the B200.
+    assert unpinned_driver.arch() == "sm90"
 
     unpinned_driver.select(Device(NVIDIA, 1, "NVIDIA B200"))
     assert unpinned_driver.arch() == "sm100"
@@ -1254,12 +1417,12 @@ def test_no_gpu_stays_distinguishable_from_an_unset_pin(unpinned_driver, monkeyp
 # --------------------------------------------------------------------------
 
 
-def test_wallclock_is_the_default_and_the_documented_vocabulary():
+def test_gpu_events_is_the_default_and_the_documented_vocabulary():
     from _harness import LATENCY_MODES
     from _harness.measure import measure
 
     assert LATENCY_MODES == ("wallclock", "gpu_events")
-    assert "wallclock" == inspect.signature(measure).parameters["mode"].default
+    assert "gpu_events" == inspect.signature(measure).parameters["mode"].default
 
 
 def test_an_unknown_latency_mode_is_rejected():
@@ -1267,3 +1430,281 @@ def test_an_unknown_latency_mode_is_rejected():
 
     with pytest.raises(ValueError, match="mode must be one of"):
         measure(lambda: None, mode="profiler")
+
+
+class _LaunchQueue:
+    """A stream held by the gate, with a bounded launch queue.
+
+    The gate holds the GPU until the host blocks on a full queue (or
+    synchronizes). From then on a GPU-bound call keeps `capacity` operations
+    queued, so the GPU stays that far behind the host; a host-bound call lets
+    the GPU finish everything queued before each new operation arrives. A call
+    that synchronizes drains the queue outright. `elapsed_time` returns the
+    index of the gated run that recorded the event, so tests can tell which
+    run a sample came from.
+    """
+
+    def __init__(self, capacity, host_bound):
+        self.capacity, self.host_bound = capacity, host_bound
+        self.queued = self.done = self.run = 0
+        self.released = False
+        self.gates = []
+
+    def enqueue(self):
+        self.queued += 1
+        if not self.released and self.queued - 1 > self.capacity:
+            self.released = True
+        if self.released:
+            behind = self.queued - 1 if self.host_bound else self.queued - self.capacity
+            self.done = max(self.done, behind)
+
+    def host_sync(self):
+        self.released, self.done = True, self.queued
+
+    def synchronize(self):
+        self.queued = self.done = 0
+        self.released = False
+
+
+def _fake_launch_queue(monkeypatch, capacity=1024, host_bound=False):
+    import types
+    import torch
+    import importlib
+
+    timing = importlib.import_module("_harness.measure")
+    q = _LaunchQueue(capacity, host_bound)
+    elapsed = []
+
+    class Event:
+
+        def __init__(self, **kwargs):
+            self.pos = None
+
+        def record(self):
+            q.enqueue()
+            self.pos, self.run = q.queued, q.run
+
+        def query(self):
+            return q.released and q.done >= self.pos
+
+        def elapsed_time(self, end):
+            elapsed.append(self.run)
+            return float(self.run)
+
+    def sleep(cycles):
+        q.run += 1
+        q.gates.append(cycles)
+        q.enqueue()
+
+    active = types.SimpleNamespace(
+        get_device_interface=lambda: types.SimpleNamespace(Event=Event, synchronize=q.synchronize),
+        get_empty_cache_for_benchmark=lambda: "cache",
+        clear_cache=lambda cache: q.enqueue(),
+    )
+    monkeypatch.setattr(triton.runtime.driver, "_active", active)
+    monkeypatch.setattr(torch.cuda, "_sleep", sleep)
+    return timing, q, elapsed
+
+
+def test_gpu_events_times_a_gpu_bound_call_in_one_continuous_run(monkeypatch):
+    # clear + start + kernel + end is four operations per call, so 500 calls
+    # need 2000 against a 1024-deep queue (B200: 250 calls queue, 300 do not).
+    # The host blocks once the queue fills, but the GPU never catches up with
+    # it, so every sample is gap-free and the run is not split: the GPU sees
+    # the same back-to-back load as earlier versions of the harness.
+    timing, q, _ = _fake_launch_queue(monkeypatch)
+    notes = []
+    assert len(timing._gpu_event_samples(q.enqueue, 500, notes=notes)) == 500
+    assert q.gates == [timing._GATE_CYCLES]
+    assert notes == []
+
+
+def test_gpu_events_retries_the_continuous_run_after_a_one_off_host_stall(monkeypatch):
+    # A descheduled host thread lets the GPU drain the queue once. That says
+    # nothing about the call, so it must not switch a GPU-bound case to
+    # batches, which would change its load pattern and its numbers.
+    timing, q, _ = _fake_launch_queue(monkeypatch)
+    stalled = []
+
+    def call():
+        q.enqueue()
+        if not stalled:
+            stalled.append(True)
+            q.host_sync()
+
+    notes = []
+    samples = timing._gpu_event_samples(call, 500, notes=notes)
+    assert samples == [2.0] * 500  # all from the second continuous run
+    assert q.gates == [timing._GATE_CYCLES, timing._GATE_CYCLES * timing._GATE_GROWTH]
+    assert notes == []
+
+
+def test_gpu_events_falls_back_to_batches_when_the_host_falls_behind(monkeypatch):
+    timing, q, _ = _fake_launch_queue(monkeypatch, host_bound=True)
+    notes = []
+    samples = timing._gpu_event_samples(q.enqueue, 500, notes=notes)
+    assert len(samples) == 500
+    assert {1.0, 2.0}.isdisjoint(samples)  # nothing from the continuous runs that fell behind
+    assert len(q.gates) == timing._CONTINUOUS_ATTEMPTS + 500 // timing._GATE_BATCH
+    # Batches change the load pattern, so the result must say so.
+    assert len(notes) == 1 and "batches" in notes[0]
+
+
+def test_gpu_events_shrinks_batches_for_host_bound_multi_kernel_calls(monkeypatch):
+    timing, q, _ = _fake_launch_queue(monkeypatch, host_bound=True)
+
+    def backward():  # 20 launches per call, like an attention backward
+        for _ in range(20):
+            q.enqueue()
+
+    assert len(timing._gpu_event_samples(backward, 500)) == 500
+    g, grow = timing._GATE_CYCLES, timing._GATE_GROWTH
+    # Two continuous runs, then batches of 100 and 50 overflow the queue; 25
+    # fit. The gate grows with each failed batch and resets after a clean one.
+    assert q.gates[:6] == [g, g * grow, g, g * grow, g * grow**2, g]
+
+
+def test_gpu_events_certifies_no_samples_from_a_call_that_syncs_the_host(monkeypatch):
+    timing, q, elapsed = _fake_launch_queue(monkeypatch)
+
+    def syncs():  # e.g. a wrapper that calls .tolist() on a tensor the timed stream writes
+        q.enqueue()
+        q.host_sync()
+
+    with pytest.raises(RuntimeError, match="could not certify"):
+        timing._gpu_event_samples(syncs, 500)
+    assert elapsed == []
+    assert len(q.gates) == timing._CONTINUOUS_ATTEMPTS + timing._GATE_MAX_ATTEMPTS
+
+
+def test_measure_passes_the_batch_fallback_note_to_its_caller(monkeypatch):
+    timing, q, _ = _fake_launch_queue(monkeypatch, host_bound=True)
+    notes = []
+    timing.measure(q.enqueue, flop_count=1e9, mode="gpu_events", notes=notes)
+    assert len(notes) == 1 and "batches" in notes[0]
+
+
+def test_run_case_names_the_provider_that_fell_back_to_batches(monkeypatch):
+    import types
+    import torch
+    from _harness import driver
+
+    tlx_fn, ref_fn = lambda: None, lambda: None
+    prep = driver.Prepared(tlx_fn=tlx_fn, ref_fn=ref_fn, flop_count=1_000_000, check=lambda: (True, ""))
+    bench = types.SimpleNamespace(prepare=lambda *args: prep)
+
+    def measure(fn, *, notes, **kwargs):
+        if fn is tlx_fn:
+            notes.append("timed in batches")
+        return _stat(mean=2.0 if fn is tlx_fn else 1.0)
+
+    monkeypatch.setattr(driver, "measure", measure)
+    monkeypatch.setattr(driver, "host_overhead_us", lambda fn: 1.0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    result = driver.run_case(bench, _case(), space="full", cold=False)
+    # After the verdict's notes, which lead the nightly failure summary.
+    assert result.notes == ["speedup 2.000x", "tlx: timed in batches"]
+
+
+@pytest.mark.parametrize("legacy_mode", ["gpu_events", "wallclock"])
+@pytest.mark.parametrize("has_reference", [False, True])
+def test_run_case_uses_only_gpu_timing_and_keeps_cpu_diagnostics(monkeypatch, legacy_mode, has_reference):
+    import types
+    import torch
+    from _harness import driver, report
+
+    tlx_fn, ref_fn = lambda: None, lambda: None
+    prep = driver.Prepared(tlx_fn=tlx_fn, ref_fn=ref_fn if has_reference else None, flop_count=1_000_000, check=lambda:
+                           (True, ""))
+    bench = types.SimpleNamespace(prepare=lambda *args: prep)
+    modes = []
+
+    def measure(fn, *, mode, **kwargs):
+        modes.append(mode)
+        return _stat(mean=2.0 if fn is tlx_fn else 1.0)
+
+    monkeypatch.setattr(driver, "measure", measure)
+    monkeypatch.setattr(driver, "host_overhead_us", lambda fn: 80.0 if fn is tlx_fn else 16.0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    result = driver.run_case(bench, _case(), space="full", cold=False, latency_mode=legacy_mode)
+    assert result.status is Status.OK
+    assert result.tlx.mean == 2.0
+    assert result.tlx_host_us == 80.0
+    if has_reference:
+        assert result.speedup == 2.0
+        assert result.ref_host_us == 16.0
+        assert modes == ["gpu_events", "gpu_events"]
+    else:
+        assert result.ref is result.ref_host_us is None
+        assert modes == ["gpu_events"]
+    doc = result.to_dict()
+    assert "tlx_eager" not in doc and "ref_eager" not in doc
+    rendered = report.table([result])
+    assert "eager" not in rendered and "CPU us" in rendered
+    assert "80.00" in rendered
+
+
+@pytest.mark.parametrize("factor,expected", [(1.0, True), (2.0, False), (0.0, False), (float("nan"), False)])
+def test_mxfp8_backward_check_validates_magnitude_and_finiteness(factor, expected):
+    import torch
+    from bench_flash_attn_mxfp8 import _backward_close_enough
+
+    inputs = tuple(torch.ones(4, requires_grad=True) for _ in range(3))
+    reference = sum(inputs)
+    actual = inputs[0] * factor + inputs[1] + inputs[2]
+    passed, message = _backward_close_enough(actual, reference, inputs, torch.ones_like(reference))
+    assert passed is expected
+    assert not message if passed else "dQ" in message
+
+
+def test_mxfp8_backward_check_accepts_zero_gradients():
+    import torch
+    from bench_flash_attn_mxfp8 import _backward_close_enough
+
+    inputs = tuple(torch.ones(4, requires_grad=True) for _ in range(3))
+    actual = sum(inputs) * 0
+    reference = sum(inputs) * 0
+    assert _backward_close_enough(actual, reference, inputs, torch.ones_like(reference)) == (True, "")
+
+
+def test_mxfp8_backward_check_rejects_nonfinite_reference():
+    import torch
+    from bench_flash_attn_mxfp8 import _backward_close_enough
+
+    inputs = tuple(torch.ones(4, requires_grad=True) for _ in range(3))
+    actual = sum(inputs)
+    reference = inputs[0] * float("nan") + inputs[1] + inputs[2]
+    passed, message = _backward_close_enough(actual, reference, inputs, torch.ones_like(reference))
+    assert not passed
+    assert "reference contains nonfinite" in message
+
+
+def _run_with_failure(monkeypatch, gpu_usable_after):
+    """Run five cases where the third raises; returns the results."""
+    from _harness import driver
+
+    def fake_run_case(_bench, case, *, space, cold=True, latency_mode="wallclock"):
+        if case.shape == (2, ):
+            raise RuntimeError("CUDA error: unspecified launch failure")
+        return Result(case=case, status=Status.OK)
+
+    monkeypatch.setattr(driver, "run_case", fake_run_case)
+    monkeypatch.setattr(driver, "_gpu_usable", lambda: gpu_usable_after)
+    monkeypatch.setattr(driver, "capture_env", lambda *a, **k: {})
+    monkeypatch.setattr(driver, "stable", __import__("contextlib").contextmanager(lambda *a, **k: iter([{}])))
+    results, _ = driver.run(_FakeBench(directions=("fwd", ), n=5), space="full")
+    return results
+
+
+def test_a_case_that_breaks_the_gpu_is_reported_once_and_ends_the_run(monkeypatch):
+    # After a sticky device error every later case would fail with it; they are
+    # not reported as failures of their own.
+    results = _run_with_failure(monkeypatch, gpu_usable_after=False)
+    assert [r.status for r in results] == [Status.OK, Status.OK, Status.ERROR]
+    assert results[-1].notes[-1] == "2 later cases not run: this case broke the GPU context"
+
+    # An ordinary error leaves the GPU usable, so the remaining cases still run.
+    results = _run_with_failure(monkeypatch, gpu_usable_after=True)
+    assert [r.status for r in results] == [Status.OK, Status.OK, Status.ERROR, Status.OK, Status.OK]

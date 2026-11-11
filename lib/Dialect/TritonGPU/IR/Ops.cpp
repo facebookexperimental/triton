@@ -45,6 +45,28 @@ static void printOffsets(mlir::OpAsmPrinter &p, mlir::Operation *op,
 
 namespace mlir::triton::gpu {
 
+void InlineAsmOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  if (getPure())
+    return;
+  effects.emplace_back(MemoryEffects::Read::get());
+  effects.emplace_back(MemoryEffects::Write::get());
+}
+
+Speculation::Speculatability InlineAsmOp::getSpeculatability() {
+  return getPure() ? Speculation::Speculatable : Speculation::NotSpeculatable;
+}
+
+LogicalResult InlineAsmOp::verify() {
+  for (Type type : llvm::concat<Type>(getOperandTypes(), getResultTypes())) {
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    if (tensor &&
+        !isa_and_present<DistributedEncodingTrait>(tensor.getEncoding()))
+      return emitOpError("requires explicit distributed tensor layouts");
+  }
+  return verifyInlineAsmOperands(*this, getPure());
+}
+
 namespace {
 
 template <typename T> bool hasEncoding(Value value) {
@@ -291,7 +313,8 @@ struct CanonicalizeConvertAsyncRemoteShmemStore
     if (!convert)
       return failure();
     rewriter.replaceOpWithNewOp<triton::gpu::AsyncRemoteShmemStoreOp>(
-        op, convert.getSrc(), op.getDst(), op.getCtaRank(), op.getBarrier());
+        op, convert.getSrc(), op.getDst(), op.getCtaRank(), op.getBarrier(),
+        op.getStoreReduce(), op.getStoreReduceSigned());
     return mlir::success();
   }
 };
@@ -395,9 +418,10 @@ struct CanonicalizeConvertFromConvert
       // We insert at the point of the original op as there could be ops with
       // memory side-effects between the LocalLoad op and the ConvertLayout op.
       rewriter.setInsertionPoint(arg);
-      auto replacement = rewriter.replaceOpWithNewOp<LocalLoadOp>(
-          op, op->getResult(0).getType(), sharedLoad.getSrc(),
-          sharedLoad.getToken());
+      auto replacement = LocalLoadOp::create(
+          rewriter, sharedLoad.getLoc(), op->getResult(0).getType(),
+          sharedLoad.getSrc(), sharedLoad.getToken());
+      rewriter.replaceOp(op, replacement);
       // Preserve backend optimization metadata such as
       // ttg.amdg.syncedViaAsyncWait. Dropping it here makes the replacement
       // load conservatively wait for unrelated async LDS writes.
@@ -407,16 +431,6 @@ struct CanonicalizeConvertFromConvert
         replacement->setAttr("tlx.rematerialize_coordinates",
                              rewriter.getUnitAttr());
 
-      return success();
-    }
-
-    // cvt(cat) -> cat
-    if (auto cat = dyn_cast<CatOp>(arg)) {
-      if (!isLegalCatEncoding(cat, op.getType().getEncoding()))
-        return failure();
-
-      rewriter.replaceOpWithNewOp<CatOp>(op, op->getResult(0).getType(),
-                                         cat.getOperands());
       return success();
     }
 
@@ -469,6 +483,13 @@ LogicalResult ConvertLayoutOp::verify() {
   if (!getForceWarpShuffle())
     return success();
 
+  if (auto plan = getMixedRadixConversionPlan(getSrc().getType(), getType())) {
+    if (plan->transfer == MixedRadixConversionTransfer::Shared)
+      return emitOpError(
+          "NPOT mixed-radix conversion through shared memory is not "
+          "yet supported with force_warp_shuffle");
+    return success();
+  }
   auto conversion = minimalCvtLayout(getSrc().getType(), getType());
   auto dims = conversion.getInDimNames();
   auto warp = StringAttr::get(getContext(), "warp");
@@ -654,7 +675,94 @@ LogicalResult MemDescReshapeOp::verify() {
   if (failed(inferReturnTypes(getContext(), getLoc(), srcType,
                               dstType.getShape(), expectedTy)))
     return failure();
-  return OpTrait::impl::verifyEquivalentMemDescType(expectedTy, dstType);
+  if (failed(OpTrait::impl::verifyEquivalentMemDescType(expectedTy, dstType)))
+    return emitError("expected result type ") << expectedTy;
+  return success();
+}
+
+// Infer the encoding of a reshaped partitioned view. Reshape the view's
+// (offset, partition) -> element mapping, then read the partition structure
+// back from it: the partition bases step along one dimension by the piece
+// size, and the remaining pieces along that dimension form the groups,
+// addressed by the top offset bits. The other offset bits describe
+// one piece. Padding depends only on the offset within a partition, so a padded
+// piece keeps its intervals; other pieces become shared-linear layouts.
+static LogicalResult
+inferPartitionedReshapeEncoding(ArrayRef<int64_t> srcShape,
+                                PartitionedSharedEncodingAttr enc,
+                                ArrayRef<int64_t> dstShape, Attribute &dstEnc) {
+  auto *ctx = enc.getContext();
+  // Reading pieces and groups back from basis bits assumes power-of-two
+  // shapes. NPOT views have modular layouts, whose bases add instead of XOR.
+  if (getNumCTAs(enc) != 1 || !llvm::all_of(srcShape, llvm::isPowerOf2_64) ||
+      !llvm::all_of(dstShape, llvm::isPowerOf2_64))
+    return failure();
+  LinearLayout dstLL = reshapeLayout(
+      ctx, toLinearLayoutIgnoringPadding(srcShape, enc), dstShape);
+  auto kOffset = StringAttr::get(ctx, "offset");
+  auto kBlock = StringAttr::get(ctx, "block");
+  auto kPartition = StringAttr::get(ctx, "partition");
+  if (!dstLL.hasInDim(kPartition))
+    return failure();
+
+  // The first partition basis is the start of partition 1's first piece,
+  // which gives the partition dimension and the piece size. The final layout
+  // comparison checks the remaining bases.
+  const auto &partitionBases = dstLL.getBases().lookup(kPartition);
+  if (partitionBases.empty())
+    return failure();
+  ArrayRef<int32_t> firstBasis = partitionBases.front();
+  auto nonZero = [](int32_t v) { return v != 0; };
+  if (llvm::count_if(firstBasis, nonZero) != 1)
+    return failure();
+  unsigned partitionDim =
+      llvm::find_if(firstBasis, nonZero) - firstBasis.begin();
+  int64_t pieceSize = firstBasis[partitionDim];
+  if (!llvm::isPowerOf2_64(pieceSize))
+    return failure();
+  unsigned numPartitions = enc.getNumPartitions();
+  int64_t numPieces = dstShape[partitionDim] / pieceSize;
+  if (numPieces % numPartitions != 0)
+    return failure();
+  unsigned numGroups = numPieces / numPartitions;
+
+  // The top offset bits select the group; the rest address one piece.
+  auto pieceOffsetBases = dstLL.getBases().lookup(kOffset);
+  unsigned groupBits = llvm::Log2_32(numGroups);
+  if (pieceOffsetBases.size() < groupBits)
+    return failure();
+  pieceOffsetBases.resize(pieceOffsetBases.size() - groupBits);
+  SmallVector<int64_t> pieceShape(dstShape);
+  pieceShape[partitionDim] = pieceSize;
+  SmallVector<std::pair<StringAttr, int32_t>> pieceOutDims;
+  for (auto [name, size] :
+       llvm::zip_equal(standardOutDimNames(ctx, dstShape.size()), pieceShape))
+    pieceOutDims.emplace_back(name, size);
+  LinearLayout::BasesT pieceBases;
+  pieceBases[kOffset] = std::move(pieceOffsetBases);
+  pieceBases[kBlock] = dstLL.hasInDim(kBlock)
+                           ? dstLL.getBases().lookup(kBlock)
+                           : std::vector<std::vector<int32_t>>{};
+  auto pieceLL = LinearLayout::tryCreate(std::move(pieceBases), pieceOutDims,
+                                         /*requireSurjective=*/true);
+  if (!pieceLL)
+    return failure();
+
+  SharedEncodingTrait pieceEnc;
+  if (auto padded =
+          dyn_cast<PaddedSharedEncodingAttr>(enc.getPartitionLayout()))
+    pieceEnc = PaddedSharedEncodingAttr::get(ctx, padded.getIntervals(),
+                                             padded.getPaddings(), *pieceLL);
+  else
+    pieceEnc = SharedLinearEncodingAttr::get(
+        ctx, *pieceLL,
+        cast<SharedEncodingTrait>(enc.getPartitionLayout()).getAlignment());
+  auto candidate = PartitionedSharedEncodingAttr::get(
+      ctx, numPartitions, numGroups, partitionDim, pieceEnc);
+  if (toLinearLayoutIgnoringPadding(dstShape, candidate) != dstLL)
+    return failure();
+  dstEnc = candidate;
+  return success();
 }
 
 static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
@@ -677,7 +785,7 @@ static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
         auto candidateEncoding = NVMMASharedEncodingAttr::get(
             ctx, mmaEncoding.getSwizzlingByteWidth(),
             mmaEncoding.getTransposed(), mmaEncoding.getElementBitWidth(),
-            mmaEncoding.getFp4Padded(), CGALayout);
+            mmaEncoding.getFp4Padded(), CGALayout, mmaEncoding.getFp6Padded());
         auto srcLL = toLinearLayout(srcShape, srcEnc);
         auto dstLL = toLinearLayout(dstShape, candidateEncoding);
         if (reshapeLayout(ctx, srcLL, dstShape) == dstLL) {
@@ -686,6 +794,11 @@ static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
         }
       }
     }
+  } else if (auto partitioned =
+                 dyn_cast<PartitionedSharedEncodingAttr>(srcEnc)) {
+    // The generic shared-linear fallback would drop the partition bases.
+    return inferPartitionedReshapeEncoding(srcShape, partitioned, dstShape,
+                                           dstEnc);
   } else if (auto padded = dyn_cast<PaddedSharedEncodingAttr>(srcEnc)) {
     LinearLayout ll = padded.getLinearComponent();
     LinearLayout dst = reshapeLayout(ctx, ll, dstShape);
@@ -717,9 +830,14 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
 
   Attribute dstEncoding;
   if (Attribute srcEnc = srcTy.getEncoding()) {
+    if (!llvm::equal(getNpotPow2AllocShape(srcTy.getShape()),
+                     srcTy.getShape()) ||
+        !llvm::equal(getNpotPow2AllocShape(dstShape), dstShape))
+      return emitOptionalError(loc, "NPOT reshape is not yet supported");
     if (failed(inferMemDescReshapeOpEncoding(srcTy.getShape(), srcEnc, dstShape,
                                              dstEncoding)))
-      return failure();
+      return emitOptionalError(loc, "cannot infer the encoding of a reshaped ",
+                               srcEnc, " shared memory view");
   }
 
   SmallVector<int64_t> dstAllocShape =
@@ -734,6 +852,8 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
 }
 
 LogicalResult MemDescReinterpretOp::verify() {
+  if (failed(verifyNpotPow2AllocViewOperands(*this)))
+    return failure();
   auto srcTy = getSrc().getType();
   auto dstTy = getType();
 
@@ -976,7 +1096,7 @@ LogicalResult verifyMemoryOpTypes(Operation *op, ShapedType srcTy,
 }
 
 LogicalResult verifyAllocOp(Operation *op, Value src, MemDescType dstTy) {
-  if (dstTy.getShape() != dstTy.getAllocShape())
+  if (dstTy.getShape() != dstTy.getAllocShape() && !isNpotPow2AllocView(dstTy))
     return op->emitOpError("result shape and its alloc shape must match");
 
   if (!src) {
@@ -1008,8 +1128,6 @@ static LogicalResult verifySharedMemoryRank(Operation *op,
 LogicalResult LocalAllocOp::verify() {
   if (!isa<SharedMemorySpaceAttr>(getType().getMemorySpace()))
     return emitOpError("should create a buffer of shared memory");
-  if (getIntOrFloatOrPtrBitWidth(getType().getElementType()) % 8 != 0)
-    return emitOpError("element type bit width must be a multiple of 8");
   if (getSrc() && failed(verifySharedMemoryRank(*this, getSrc().getType(),
                                                 getType(), "source")))
     return failure();
@@ -1026,11 +1144,118 @@ LogicalResult LocalStoreOp::verify() {
   return verifyMemoryOpTypes(*this, getSrc().getType(), getDst().getType());
 }
 
+void AsyncRemoteShmemStoreOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  bool isReduce = getStoreReduce() != DescriptorReduceKind::NONE;
+  auto dstKind = SharedKindAttr::get(
+      getContext(), isReduce ? SharedKind::Generic : SharedKind::Async);
+  if (isReduce)
+    effects.emplace_back(MemoryEffects::Read::get(), &getDstMutable(), dstKind,
+                         SharedMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getDstMutable(), dstKind,
+                       SharedMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getBarrierMutable(),
+                       SharedKindAttr::get(getContext(), SharedKind::Barrier),
+                       SharedMemory::get());
+}
+
+LogicalResult AsyncRemoteShmemStoreOp::verify() {
+  if (getStoreReduce() == DescriptorReduceKind::NONE)
+    return success();
+  switch (getStoreReduce()) {
+  case DescriptorReduceKind::ADD:
+  case DescriptorReduceKind::MIN:
+  case DescriptorReduceKind::MAX:
+  case DescriptorReduceKind::AND:
+  case DescriptorReduceKind::OR:
+  case DescriptorReduceKind::XOR:
+    break;
+  case DescriptorReduceKind::INC:
+  case DescriptorReduceKind::DEC:
+    if (getStoreReduceSigned())
+      return emitOpError(
+          "INC/DEC supports only unsigned 32-bit integer elements");
+    break;
+  default:
+    return emitOpError(
+        "store_reduce must be NONE, ADD, MIN, MAX, AND, OR, XOR, "
+        "INC, or DEC");
+  }
+
+  auto srcTy = getSrc().getType();
+  auto dstTy = getDst().getType();
+  auto barrierTy = getBarrier().getType();
+  if (!srcTy.getElementType().isInteger(32))
+    return emitOpError("reduction supports only 32-bit integer elements");
+  if (failed(verifyMemoryOpTypes(*this, srcTy, dstTy)))
+    return failure();
+  if (!isa<SharedMemorySpaceAttr>(dstTy.getMemorySpace()))
+    return emitOpError("reduction destination must be local shared memory");
+  if (!dstTy.getMutableMemory())
+    return emitOpError("cannot reduce into immutable memory");
+  if (!isa<SharedMemorySpaceAttr>(barrierTy.getMemorySpace()) ||
+      !barrierTy.getMutableMemory() ||
+      !barrierTy.getElementType().isInteger(64) || barrierTy.getRank() != 1 ||
+      barrierTy.getDimSize(0) < 1)
+    return emitOpError(
+        "reduction barrier must be a mutable local shared-memory "
+        "descriptor of Nxi64 type");
+
+  // Layouts may still be unresolved during frontend construction.
+  if (auto module = (*this)->getParentOfType<ModuleOp>()) {
+    // Physical cluster dimensions are attached after the layout-free TTIR
+    // passes. Its logical num_ctas=1 alone does not describe the launch.
+    bool hasClusterContext =
+        module->hasAttr(AttrTargetName) || module->hasAttr(AttrClusterDimX) ||
+        module->hasAttr(AttrClusterDimY) || module->hasAttr(AttrClusterDimZ);
+    if (hasClusterContext && lookupPhysicalNumCTAs(getOperation()) <= 1)
+      return emitOpError(
+          "reduction requires at least two physical CTAs in the cluster");
+    if (barrierTy.getDimSize(0) > lookupNumCTAs(getOperation()))
+      return emitOpError(
+          "reduction barrier must have N <= logical number of CTAs");
+    if (auto target = module->getAttrOfType<StringAttr>(AttrTargetName)) {
+      StringRef targetName = target.getValue();
+      int capability = 0;
+      if (!targetName.consume_front("cuda:") ||
+          targetName.getAsInteger(10, capability) || capability < 90)
+        return emitOpError("reduction requires an NVIDIA SM90+ target");
+    }
+  }
+  return success();
+}
+
+// Mixed-radix lowerings address runs through the buffer's pow2 alloc layout, so
+// it must have no padding or partitions. A local_load XORs in a view's origin,
+// which adds only on pow2 subslice extents; an async copy runs from the base.
+static std::optional<std::string>
+getMixedRadixBufferUnsupportedReason(MemDescType type, bool pow2Views) {
+  Attribute enc = type.getEncoding();
+  auto shape = dropPipeliningDim(type.getShape(), enc);
+  auto allocShape = dropPipeliningDim(type.getAllocShape(), enc);
+  if (isa<PaddedSharedEncodingAttr, PartitionedSharedEncodingAttr>(enc) ||
+      (shape != allocShape && !pow2Views))
+    return std::string("NPOT mixed-radix access to a padded, partitioned or "
+                       "partial buffer is not yet supported");
+  for (auto [size, allocSize] : llvm::zip_equal(shape, allocShape))
+    if (size != allocSize && !llvm::isPowerOf2_64(size))
+      return std::string(
+          "NPOT mixed-radix access to a view with an NPOT subslice "
+          "extent is not yet supported");
+  return std::nullopt;
+}
+
 // LocalLoadOp
 LogicalResult LocalLoadOp::verify() {
   if (failed(verifySharedMemoryRank(*this, getType(), getSrc().getType(),
                                     "result")))
     return failure();
+  if (hasExactNpotLayout(getType()))
+    if (std::optional<std::string> reason =
+            getMixedRadixBufferUnsupportedReason(getSrc().getType(),
+                                                 /*pow2Views=*/true))
+      return emitError(*reason);
   return verifyMemoryOpTypes(*this, getSrc().getType(), getType());
 }
 
@@ -1228,6 +1453,11 @@ LogicalResult AsyncCopyGlobalToLocalOp::verify() {
       return emitOpError("non-bulk mode requires src to be a ranked tensor of "
                          "pointers");
   }
+  if (succeeded(getExactNpotOperandLayout(*this)))
+    if (std::optional<std::string> reason =
+            getMixedRadixBufferUnsupportedReason(getResult().getType(),
+                                                 /*pow2Views=*/false))
+      return emitError(*reason);
   return success();
 }
 
@@ -1269,8 +1499,10 @@ LogicalResult MemDescIndexOp::verify() {
     return emitError("result shape must equal to srcShape[1:]");
   }
 
-  if (dropPipeliningDim(srcTy.getAllocShape(), srcTy.getEncoding()) !=
-      layoutShape) {
+  auto layoutAllocShape =
+      dropPipeliningDim(srcTy.getAllocShape(), srcTy.getEncoding());
+  bool hasPow2AllocView = isNpotPow2AllocView(srcTy);
+  if (layoutAllocShape != layoutShape && !hasPow2AllocView) {
     return emitError(
         "We only support memdesc_index of a multibuffer-prefix subview");
   }
@@ -1285,7 +1517,8 @@ LogicalResult MemDescIndexOp::verify() {
     return emitError("src and dst must have the same type of encoding");
   }
 
-  if (dstTy.getAllocShape() != dstTy.getShape()) {
+  if (dstTy.getAllocShape() !=
+      (hasPow2AllocView ? layoutAllocShape : dstTy.getShape())) {
     return emitError("alloc shape must match shape for the result");
   }
 
@@ -1440,11 +1673,6 @@ LogicalResult MemDescDynamicSubsliceOp::verify() {
   Attribute srcEnc = srcTy.getEncoding();
   if (!isa<SharedEncodingTrait>(srcEnc))
     return emitError("source and result must use a shared-memory encoding");
-  Attribute concreteSrcEnc = triton::unwrapTlxWrappers(srcEnc);
-  if (isa<PartitionedSharedEncodingAttr>(concreteSrcEnc))
-    return emitError(
-        "dynamic subslices do not support partitioned shared encodings");
-
   bool slicesAnyDimension = false;
   for (int dim = 0; dim < srcTy.getRank(); ++dim) {
     int64_t srcSize = srcTy.getDimSize(dim);

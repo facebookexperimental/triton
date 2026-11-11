@@ -787,4 +787,50 @@ tt.func @wait_not_moved_past_duplicate_subtile_load(
   // TARGETED:     ttng.tmem_load
   tt.return
 }
+
+// A tmem_load may sink past an arrive barrier whose guarded set provably
+// excludes the load's buffer, even with an overlapping channel graph and no
+// ordered-region metadata. The trailing wait pins the arrive in place so the
+// load (not the arrive) is what moves. Holds in both barrier-reorder modes:
+// disjointness is a proof about this pair, not normalization.
+// CHECK-LABEL: @tmem_load_sinks_past_disjoint_guarded_arrive
+// TARGETED-LABEL: @tmem_load_sinks_past_disjoint_guarded_arrive
+tt.func @tmem_load_sinks_past_disjoint_guarded_arrive(
+    %bar: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %bar2: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %phase: i32) {
+  %alloc = ttng.tmem_alloc {buffer.id = 6 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %s0 = ttng.tmem_subslice %alloc {offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
+  // CHECK: ttng.arrive_barrier
+  // CHECK-NEXT: ttng.tmem_load
+  // CHECK-NEXT: ttng.wait_barrier
+  // With normalization disabled, waits never block sinking, so the load
+  // crosses the wait as well.
+  // TARGETED: ttng.arrive_barrier
+  // TARGETED-NEXT: ttng.wait_barrier
+  // TARGETED-NEXT: ttng.tmem_load
+  %v0 = ttng.tmem_load %s0 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #linear64>
+  ttng.arrive_barrier %bar, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2>, guardedBufferIds = array<i32: 0>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %bar2, %phase : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  "user"(%v0) : (tensor<128x64xf32, #linear64>) -> ()
+  tt.return
+}
+
+// ... but not past an arrive that guards its own buffer: the load carries
+// the arrive as its own and the pair stays put.
+// CHECK-LABEL: @tmem_load_blocked_by_guarded_arrive
+// TARGETED-LABEL: @tmem_load_blocked_by_guarded_arrive
+tt.func @tmem_load_blocked_by_guarded_arrive(
+    %bar: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>) {
+  %alloc = ttng.tmem_alloc {buffer.id = 6 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %s0 = ttng.tmem_subslice %alloc {offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
+  // CHECK: ttng.tmem_load
+  // CHECK-NEXT: ttng.arrive_barrier
+  // TARGETED: ttng.tmem_load
+  // TARGETED-NEXT: ttng.arrive_barrier
+  %v0 = ttng.tmem_load %s0 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #linear64>
+  ttng.arrive_barrier %bar, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2>, guardedBufferIds = array<i32: 6>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  "user"(%v0) : (tensor<128x64xf32, #linear64>) -> ()
+  tt.return
+}
 }

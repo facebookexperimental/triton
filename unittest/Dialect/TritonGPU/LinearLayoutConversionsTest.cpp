@@ -1,15 +1,19 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 
 #include "mlir/AsmParser/AsmParser.h"
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/StrUtil.h"
+#include "unittest/Util/ScopedAllowNpot.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/Signals.h"
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <set>
 
 namespace mlir {
 std::ostream &operator<<(std::ostream &os, StringAttr str) {
@@ -179,27 +183,267 @@ TEST_F(LinearLayoutConversionsTest, SimpleBlocked) {
                           {S("dim0")}));
 }
 
-TEST_F(LinearLayoutConversionsTest, NpotFmaDotUsesModularIdentity) {
-  auto parent =
-      blocked({1, 1}, {1, 32}, {1, 4}, {1, 1}, {1, 1}, {1, 0}, {1, 0});
-  auto encoding = dot(parent, /*idx=*/0, /*kWidth=*/0);
-  auto layout = toLinearLayout({16, 96}, encoding);
-  auto pow2Cover = toLinearLayout({16, 128}, encoding);
-  auto expected =
-      LinearLayout(pow2Cover.getBases(), {{S("dim0"), 16}, {S("dim1"), 96}},
-                   /*requireSurjective=*/true);
-  EXPECT_EQ(layout, expected);
+TEST_F(LinearLayoutConversionsTest, NpotMemoryLayoutsUsePow2AllocShape) {
+  ScopedAllowNpot npot;
+  // A shared layout of an NPOT shape is built on its pow2 alloc shape.
+  auto swizzled = shared(4, 2, 4, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  LinearLayout padded = toLinearLayout({128, 64}, swizzled);
+  EXPECT_EQ(toLinearLayout({96, 64}, swizzled), padded);
+  // An NPOT subview of a shared_linear allocation keeps that pow2 alloc shape.
+  auto sharedLinear =
+      SharedLinearEncodingAttr::get(&ctx, padded, /*layoutAlignment=*/16);
+  EXPECT_EQ(toLinearLayout({96, 64}, sharedLinear), padded);
 }
 
-TEST_F(LinearLayoutConversionsTest, NpotMfmaUsesModularIdentity) {
-  auto encoding = mfma(/*version=*/4, /*warps=*/{4, 1},
-                       /*instrShape=*/{32, 32, 16}, /*isTransposed=*/false);
-  auto layout = toLinearLayout({128, 96}, encoding);
-  auto pow2Cover = toLinearLayout({128, 128}, encoding);
-  auto expected =
-      LinearLayout(pow2Cover.getBases(), {{S("dim0"), 128}, {S("dim1"), 96}},
-                   /*requireSurjective=*/true);
-  EXPECT_EQ(layout, expected);
+// Whether the tile's layout maps exactly offsets [0, R*C) onto the tile.
+static bool isDenseOnTile(Attribute enc, ArrayRef<int64_t> tile) {
+  MLIRContext *ctx = enc.getContext();
+  auto kOffset = StringAttr::get(ctx, "offset");
+  auto kBlock = StringAttr::get(ctx, "block");
+  auto kDim0 = StringAttr::get(ctx, "dim0");
+  LinearLayout ll = toLinearLayout(tile, enc);
+  int64_t exact = tile[0] * tile[1];
+  std::set<std::pair<int32_t, int32_t>> seen;
+  for (int32_t o = 0; o < ll.getInDimSize(kOffset); ++o) {
+    int32_t d[2];
+    for (auto [dim, value] : ll.apply({{kOffset, o}, {kBlock, 0}}))
+      d[dim == kDim0 ? 0 : 1] = value;
+    if ((d[0] < tile[0] && d[1] < tile[1]) != (o < exact))
+      return false;
+    seen.insert({d[0], d[1]});
+  }
+  return int64_t(seen.size()) == ll.getInDimSize(kOffset);
+}
+
+TEST_F(LinearLayoutConversionsTest, NpotDenseSharedAllocMatchesCover) {
+  ScopedAllowNpot npot;
+  auto nvmma = [&](unsigned swizzle, unsigned bits, bool transposed = false) {
+    return nvmmaShared(swizzle, transposed, bits, {1, 1}, {1, 1}, {1, 0},
+                       {1, 0});
+  };
+  std::pair<Attribute, SmallVector<int64_t>> dense[] = {
+      {nvmma(32, 16), {128, 96}},
+      {nvmma(64, 16), {128, 96}},
+      {nvmma(64, 16), {128, 160}},
+      {nvmma(32, 16), {128, 192}},
+      {nvmma(64, 16), {128, 192}},
+      {nvmma(128, 16), {128, 192}},
+      {nvmma(64, 8), {128, 192}},
+      {nvmma(128, 16), {96, 64}},
+      {nvmma(64, 16, /*transposed=*/true), {96, 128}},
+      {shared(8, 1, 8, {1, 1}, {1, 1}, {1, 0}, {1, 0}), {96, 64}},
+  };
+  for (auto [i, entry] : llvm::enumerate(dense)) {
+    SCOPED_TRACE(i);
+    auto &[enc, tile] = entry;
+    EXPECT_TRUE(succeeded(getNpotDenseSharedLayout(enc, tile)));
+    EXPECT_TRUE(isDenseOnTile(enc, tile));
+  }
+
+  // Rejected tiles give a reason; one of them has a cover that is not dense.
+  std::tuple<Attribute, SmallVector<int64_t>, StringRef> kept[] = {
+      {nvmma(64, 16), {4, 96}, "fewer than 8 rows"},
+      {nvmma(128, 16), {128, 96}, "not a whole number of panels"},
+      {nvmma(128, 16), {100, 128}, "not a multiple of 8"},
+      {nvmmaShared(128, false, 8, {1, 1}, {1, 1}, {1, 0}, {1, 0},
+                   /*fp4Padded=*/true),
+       {128, 48},
+       "padded FP4"},
+      {shared(8, 1, 8, {1, 1}, {1, 1}, {1, 0}, {1, 0}),
+       {128, 96},
+       "wider than the pow2 part"},
+  };
+  for (auto [i, entry] : llvm::enumerate(kept)) {
+    SCOPED_TRACE(i);
+    auto &[enc, tile, why] = entry;
+    std::string reason;
+    EXPECT_TRUE(failed(getNpotDenseSharedLayout(enc, tile, &reason)));
+    EXPECT_THAT(reason, ::testing::HasSubstr(why.str()));
+  }
+  EXPECT_FALSE(isDenseOnTile(nvmma(128, 16), {128, 96}));
+}
+
+TEST_F(LinearLayoutConversionsTest, NpotRowsAcrossPanelsKeepCoverPanels) {
+  // Panel p of an R-row tile starts at p * R * W and holds what panel p of
+  // the cover holds.
+  ScopedAllowNpot npot;
+  auto nvmma = [&](unsigned swizzle, unsigned bits) {
+    return nvmmaShared(swizzle, false, bits, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  };
+  std::tuple<Attribute, SmallVector<int64_t>, int32_t> cases[] = {
+      {nvmma(128, 16), {96, 128}, 64},
+      {nvmma(128, 16), {96, 256}, 64},
+      {nvmma(64, 16), {96, 192}, 32},
+      {nvmma(128, 8), {160, 256}, 128},
+  };
+  for (auto [i, entry] : llvm::enumerate(cases)) {
+    SCOPED_TRACE(i);
+    auto &[enc, tile, width] = entry;
+    EXPECT_TRUE(isDenseOnTile(enc, tile));
+    LinearLayout exact = toLinearLayout(tile, enc);
+    LinearLayout cover = toLinearLayout({int64_t(llvm::PowerOf2Ceil(tile[0])),
+                                         int64_t(llvm::PowerOf2Ceil(tile[1]))},
+                                        enc);
+    int32_t panel = tile[0] * width;
+    int32_t coverPanel = cover.getOutDimSize(S("dim0")) * width;
+    int mismatches = 0;
+    for (int32_t o = 0; o < tile[0] * tile[1]; ++o) {
+      int32_t coverOffset = o / panel * coverPanel + o % panel;
+      mismatches += exact.apply({{S("offset"), o}, {S("block"), 0}}) !=
+                    cover.apply({{S("offset"), coverOffset}, {S("block"), 0}});
+    }
+    EXPECT_EQ(mismatches, 0);
+  }
+}
+
+// Worst-case number of 8 rows that share a bank group when each row reads the
+// same logical 16-byte chunk of an fp16 tile.
+static int bankConflictDegree(Attribute enc, ArrayRef<int64_t> tile,
+                              int groups) {
+  MLIRContext *ctx = enc.getContext();
+  auto kDim0 = StringAttr::get(ctx, "dim0");
+  auto kDim1 = StringAttr::get(ctx, "dim1");
+  LinearLayout inverse = toLinearLayout(tile, enc).invert();
+  int degree = 0;
+  for (int32_t col = 0; col < tile[1]; col += 8) {
+    SmallVector<int> hits(groups);
+    for (int32_t row = 0; row < 8; ++row) {
+      int32_t offset = 0;
+      for (auto [dim, value] : inverse.apply({{kDim0, row}, {kDim1, col}}))
+        offset += dim.str() == "offset" ? value : 0;
+      degree = std::max(degree, ++hits[offset * 2 / 16 % groups]);
+    }
+  }
+  return degree;
+}
+
+TEST_F(LinearLayoutConversionsTest, SwizzledNpotPanelBankConflicts) {
+  // Today's N=96 cover against a 32-column panel, with maxPhase narrowed to
+  // fit and with two rows per phase, for ldmatrix x4 (8 bank groups) and
+  // ds_read_b128 (16 bank groups).
+  auto cover = shared(8, 1, 8, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  auto narrowed = shared(8, 1, 4, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  auto paired = shared(8, 2, 4, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  EXPECT_EQ(bankConflictDegree(cover, {128, 128}, 8), 1);
+  EXPECT_EQ(bankConflictDegree(cover, {128, 128}, 16), 1);
+  EXPECT_EQ(bankConflictDegree(narrowed, {128, 32}, 8), 2);
+  EXPECT_EQ(bankConflictDegree(narrowed, {128, 32}, 16), 2);
+  EXPECT_EQ(bankConflictDegree(paired, {128, 32}, 8), 1);
+  EXPECT_EQ(bankConflictDegree(paired, {128, 32}, 16), 1);
+}
+
+// Whether offsets [0, R*C) cover the tile once, panel p at p * R * width.
+static bool isPanelMajorOnTile(const LinearLayout &ll, ArrayRef<int64_t> tile,
+                               int64_t width) {
+  MLIRContext *ctx = ll.getInDimNames().begin()->getContext();
+  auto kOffset = StringAttr::get(ctx, "offset");
+  auto kBlock = StringAttr::get(ctx, "block");
+  auto kDim0 = StringAttr::get(ctx, "dim0");
+  std::set<std::pair<int32_t, int32_t>> seen;
+  for (int32_t o = 0; o < tile[0] * tile[1]; ++o) {
+    int32_t d[2];
+    for (auto [dim, value] : ll.apply({{kOffset, o}, {kBlock, 0}}))
+      d[dim == kDim0 ? 0 : 1] = value;
+    if (d[0] >= tile[0] || d[1] / width != o / (tile[0] * width))
+      return false;
+    seen.insert({d[0], d[1]});
+  }
+  return int64_t(seen.size()) == tile[0] * tile[1];
+}
+
+// A padded encoding that is row-major within width-wide panels, with the odd
+// panel digit outermost or innermost.
+static PaddedSharedEncodingAttr paddedPanels(MLIRContext *ctx,
+                                             ArrayRef<int64_t> tile,
+                                             int32_t width, bool outermost) {
+  auto kOffset = StringAttr::get(ctx, "offset");
+  auto kBlock = StringAttr::get(ctx, "block");
+  LinearLayout::BasesT bases;
+  LinearLayout::RadicesT radices;
+  auto add = [&](int32_t radix, int32_t row, int32_t col) {
+    bases[kOffset].push_back({row, col});
+    radices[kOffset].push_back(radix);
+  };
+  for (int32_t col = 1; col < width; col *= 2)
+    add(2, 0, col);
+  if (!outermost)
+    add(tile[1] / width, 0, width);
+  for (int32_t row = 1; row < tile[0]; row *= 2)
+    add(2, row, 0);
+  if (outermost)
+    add(tile[1] / width, 0, width);
+  bases[kBlock] = {};
+  radices[kBlock] = {};
+  LinearLayout ll(std::move(bases), std::move(radices),
+                  {{StringAttr::get(ctx, "dim0"), int32_t(tile[0])},
+                   {StringAttr::get(ctx, "dim1"), int32_t(tile[1])}},
+                  /*requireSurjective=*/true);
+  return PaddedSharedEncodingAttr::getChecked(
+      mlir::detail::getDefaultDiagnosticEmitFn(ctx), ctx, {512u}, {8u}, ll);
+}
+
+TEST_F(LinearLayoutConversionsTest, NpotContiguousDimAllocatesWholePanels) {
+  // K96, K192 and N160 tiles: C = q * W is q panels of W = twoPart(C).
+  ScopedAllowNpot npot;
+  auto swizzled = shared(8, 2, 4, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  auto rotating = AMDRotatingShared(8, 2, 4, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  std::pair<SmallVector<int64_t>, int64_t> tiles[] = {
+      {{128, 96}, 32}, {{128, 192}, 64}, {{64, 160}, 32}};
+  for (auto [i, entry] : llvm::enumerate(tiles)) {
+    SCOPED_TRACE(i);
+    auto &[tile, width] = entry;
+    auto padded = paddedPanels(&ctx, tile, width, /*outermost=*/true);
+    ASSERT_TRUE(padded);
+    for (Attribute enc :
+         {Attribute(swizzled), Attribute(rotating), Attribute(padded)}) {
+      auto ll = getNpotDenseSharedLayout(enc, tile);
+      ASSERT_TRUE(succeeded(ll));
+      EXPECT_TRUE(isPanelMajorOnTile(*ll, tile, width));
+    }
+  }
+  // NPOT rows across panels become a digit below the panels.
+  for (Attribute enc : {Attribute(swizzled), Attribute(rotating)}) {
+    auto ll = getNpotDenseSharedLayout(enc, {96, 96});
+    ASSERT_TRUE(succeeded(ll));
+    EXPECT_TRUE(isPanelMajorOnTile(*ll, {96, 96}, 32));
+  }
+
+  // A 64-column swizzle spans two panels; a rotation over 32 rows exceeds a
+  // 16-row group, while the swizzle's 8-row period fits; padding must not
+  // split an odd digit's stride.
+  auto halfPeriod = shared(4, 2, 4, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  EXPECT_TRUE(succeeded(getNpotDenseSharedLayout(halfPeriod, {48, 96})));
+  std::tuple<Attribute, SmallVector<int64_t>, StringRef> kept[] = {
+      {shared(8, 1, 8, {1, 1}, {1, 1}, {1, 0}, {1, 0}),
+       {128, 96},
+       "wider than the pow2 part"},
+      {AMDRotatingShared(8, 1, 8, {1, 1}, {1, 1}, {1, 0}, {1, 0}),
+       {128, 96},
+       "wider than the pow2 part"},
+      {AMDRotatingShared(4, 2, 4, {1, 1}, {1, 1}, {1, 0}, {1, 0}),
+       {48, 96},
+       "period exceeds"},
+      {paddedPanels(&ctx, {128, 96}, 32, /*outermost=*/false),
+       {128, 96},
+       "padding interval"},
+  };
+  for (auto [i, entry] : llvm::enumerate(kept)) {
+    SCOPED_TRACE(i);
+    auto &[enc, tile, why] = entry;
+    std::string reason;
+    EXPECT_TRUE(failed(getNpotDenseSharedLayout(enc, tile, &reason)));
+    EXPECT_THAT(reason, ::testing::HasSubstr(why.str()));
+  }
+}
+
+TEST_F(LinearLayoutConversionsTest, Sm80N96SwizzledUses64BytePanels) {
+  // An fp16 N=96 operand in 64-byte panels, conflict-free for ldmatrix x4.
+  ScopedAllowNpot npot;
+  auto paired = shared(8, 2, 4, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  auto ll = getNpotDenseSharedLayout(paired, {64, 96});
+  ASSERT_TRUE(succeeded(ll));
+  EXPECT_TRUE(isPanelMajorOnTile(*ll, {64, 96}, 32));
+  EXPECT_EQ(bankConflictDegree(paired, {64, 96}, 8), 1);
 }
 
 TEST_F(LinearLayoutConversionsTest, CTADuplication) {
@@ -407,7 +651,7 @@ TEST_F(LinearLayoutConversionsTest, Blocked4D) {
                                    {3, 2, 1, 0}));
   EXPECT_EQ(ll, LinearLayout(
                     {
-                        {S("register"), {{0, 0, 0, 0}, {0, 0, 0, 0}}},
+                        {S("register"), {}},
                         {S("lane"),
                          {{0, 0, 0, 0},
                           {0, 0, 0, 0},
@@ -580,6 +824,218 @@ TEST_F(LinearLayoutConversionsTest, MMAv2_Small3D) {
                     {S("block"), {{0, 0, 0}, {0, 64, 0}, {0, 0, 0}, {0, 0, 0}}},
                 },
                 {S("dim0"), S("dim1"), S("dim2")}));
+}
+
+// Each NPOT dim repeats its odd part in registers after its binary repeats,
+// in rep order: N's for wgmma's accumulator, M's for an A in registers.
+TEST_F(LinearLayoutConversionsTest, MMAv3_NpotMixedRadix) {
+  auto mixedRadix = [&](std::vector<std::vector<int32_t>> regs,
+                        std::vector<int32_t> regRadices,
+                        std::vector<std::vector<int32_t>> lanes,
+                        std::vector<std::vector<int32_t>> warps, int32_t dim0,
+                        int32_t dim1) {
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regs);
+    bases[S("lane")] = std::move(lanes);
+    bases[S("warp")] = warps;
+    bases[S("block")] = {};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    radices[S("lane")] = {2, 2, 2, 2, 2};
+    radices[S("warp")] = std::vector<int32_t>(warps.size(), 2);
+    radices[S("block")] = {};
+    return LinearLayout(std::move(bases), std::move(radices),
+                        {{S("dim0"), dim0}, {S("dim1"), dim1}},
+                        /*requireSurjective=*/true);
+  };
+  auto aRegs = dot(mma(3, 0, {16, 128, 16}, {4, 1}), 0, 2);
+  LinearLayout pow2 = aRegs.toLinearLayout({128, 64});
+  ScopedAllowNpot npot;
+  auto acc = mma(3, 0, {16, 96, 16}, {4, 1});
+  std::vector<std::vector<int32_t>> lanes = {
+      {0, 2}, {0, 4}, {1, 0}, {2, 0}, {4, 0}};
+  EXPECT_EQ(toLinearLayout({128, 96}, acc),
+            mixedRadix({{0, 1}, {8, 0}, {0, 8}, {0, 16}, {0, 32}, {64, 0}},
+                       {2, 2, 2, 2, 3, 2}, lanes, {{16, 0}, {32, 0}}, 128, 96));
+  // A repeats over K first, then over M's odd part.
+  EXPECT_EQ(toLinearLayout({192, 64}, aRegs),
+            mixedRadix({{0, 1}, {8, 0}, {0, 8}, {0, 16}, {0, 32}, {64, 0}},
+                       {2, 2, 2, 2, 2, 3}, lanes, {{16, 0}, {32, 0}}, 192, 64));
+  // N=192's two-part is below instrN 128's tile, which keeps the registers that
+  // fit, so it is instrN 192's layout.
+  EXPECT_EQ(toLinearLayout({64, 192}, mma(3, 0, {16, 128, 16}, {4, 1})),
+            toLinearLayout({64, 192}, mma(3, 0, {16, 192, 16}, {4, 1})));
+  // M's two-part is below the 8-warp tile, and broadcasting warps on M would
+  // repeat rows, so the layout keeps its pow2 alloc shape.
+  EXPECT_EQ(toLinearLayout({192, 128}, mma(3, 0, {16, 128, 16}, {8, 1}))
+                .getOutDimSize(S("dim0")),
+            256);
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(aRegs.toLinearLayout({128, 64}), pow2);
+}
+
+TEST_F(LinearLayoutConversionsTest, MMAv2_NpotWarpsOnTwoPart) {
+  EXPECT_EQ(getMmaV2WarpsPerCTA({96, 32}, 8), SmallVector<unsigned>({4, 2}));
+  ScopedAllowNpot npot;
+  // M's two-part 32 holds 2 warps of 16 rows, so the rest go on N.
+  EXPECT_EQ(getMmaV2WarpsPerCTA({96, 32}, 8), SmallVector<unsigned>({2, 4}));
+  // Control: a pow2 shape keeps its split.
+  EXPECT_EQ(getMmaV2WarpsPerCTA({128, 128}, 8), SmallVector<unsigned>({2, 4}));
+}
+
+// Each NPOT dim repeats its odd part in registers after its binary repeats,
+// in rep order, as the MMAv2 lowering indexes them.
+TEST_F(LinearLayoutConversionsTest, MMAv2_NpotMixedRadix) {
+  auto mixedRadix = [&](std::vector<std::vector<int32_t>> regs,
+                        std::vector<int32_t> regRadices,
+                        std::vector<std::vector<int32_t>> lanes,
+                        std::vector<std::vector<int32_t>> warps, int32_t dim0,
+                        int32_t dim1) {
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regs);
+    bases[S("lane")] = std::move(lanes);
+    bases[S("warp")] = warps;
+    bases[S("block")] = {};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    radices[S("lane")] = {2, 2, 2, 2, 2};
+    radices[S("warp")] = std::vector<int32_t>(warps.size(), 2);
+    radices[S("block")] = {};
+    return LinearLayout(std::move(bases), std::move(radices),
+                        {{S("dim0"), dim0}, {S("dim1"), dim1}},
+                        /*requireSurjective=*/true);
+  };
+  auto acc = mma(2, 0, {16, 8}, {2, 2});
+  LinearLayout pow2 = acc.toLinearLayout({128, 128});
+  ScopedAllowNpot npot;
+  std::vector<std::vector<int32_t>> accLanes = {
+      {0, 2}, {0, 4}, {1, 0}, {2, 0}, {4, 0}};
+  EXPECT_EQ(toLinearLayout({128, 96}, acc),
+            mixedRadix({{0, 1}, {8, 0}, {0, 16}, {0, 32}, {32, 0}, {64, 0}},
+                       {2, 2, 2, 3, 2, 2}, accLanes, {{0, 8}, {16, 0}}, 128,
+                       96));
+  EXPECT_EQ(toLinearLayout({48, 96}, mma(2, 0, {16, 8}, {1, 4})),
+            mixedRadix({{0, 1}, {8, 0}, {0, 32}, {16, 0}}, {2, 2, 3, 3},
+                       accLanes, {{0, 8}, {0, 16}}, 48, 96));
+  // B repeats over K first, then over N's two-part and odd part.
+  EXPECT_EQ(toLinearLayout({64, 96}, dot(acc, 1, 2)),
+            mixedRadix({{1, 0}, {8, 0}, {16, 0}, {32, 0}, {0, 16}, {0, 32}},
+                       {2, 2, 2, 2, 2, 3},
+                       {{2, 0}, {4, 0}, {0, 1}, {0, 2}, {0, 4}},
+                       {{0, 8}, {0, 0}}, 64, 96));
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(acc.toLinearLayout({128, 128}), pow2);
+}
+
+// An MFMA operand's NPOT K repeats its odd part in registers after the binary
+// K repeats, so the K rep index stays linear.
+TEST_F(LinearLayoutConversionsTest, MFMA_NpotMixedRadixK) {
+  auto mixedRadix = [&](std::vector<std::vector<int32_t>> regs,
+                        std::vector<std::vector<int32_t>> lanes,
+                        std::vector<std::vector<int32_t>> warps, int32_t dim0,
+                        int32_t dim1) {
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regs);
+    bases[S("lane")] = std::move(lanes);
+    bases[S("warp")] = std::move(warps);
+    bases[S("block")] = {};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = {2, 2, 2, 2, 3};
+    radices[S("lane")] = {2, 2, 2, 2, 2, 2};
+    radices[S("warp")] = {2, 2};
+    radices[S("block")] = {};
+    return LinearLayout(std::move(bases), std::move(radices),
+                        {{S("dim0"), dim0}, {S("dim1"), dim1}},
+                        /*requireSurjective=*/true);
+  };
+  auto mfma32 = mfma(4, {2, 2}, {32, 32, 16}, /*isTransposed=*/true);
+  auto a = mfmaDotOp(mfma32, 0, 8), b = mfmaDotOp(mfma32, 1, 8);
+  LinearLayout pow2 = toLinearLayout({64, 128}, a);
+  ScopedAllowNpot npot;
+  EXPECT_EQ(toLinearLayout({64, 96}, a),
+            mixedRadix({{0, 1}, {0, 2}, {0, 4}, {0, 16}, {0, 32}},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 8}},
+                       {{0, 0}, {32, 0}}, 64, 96));
+  EXPECT_EQ(toLinearLayout({96, 64}, b),
+            mixedRadix({{1, 0}, {2, 0}, {4, 0}, {16, 0}, {32, 0}},
+                       {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {8, 0}},
+                       {{0, 32}, {0, 0}}, 96, 64));
+  // K=48's two-part 16 is below mfma16's 32-wide K tile: pow2 alloc shape.
+  auto mfma16 = mfma(4, {2, 2}, {16, 16, 32}, /*isTransposed=*/true);
+  EXPECT_EQ(toLinearLayout({64, 48}, mfmaDotOp(mfma16, 0, 8))
+                .getOutDimSize(S("dim1")),
+            64);
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(toLinearLayout({64, 128}, a), pow2);
+}
+
+// An MFMA result's or operand's NPOT N repeats its odd part in registers
+// after its binary repeats, so its first 32 columns keep the pow2 layout.
+TEST_F(LinearLayoutConversionsTest, MFMA_NpotMixedRadixN) {
+  LinearLayout::BasesT bases;
+  bases[S("register")] = {{1}};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {5};
+  LinearLayout odd(std::move(bases), std::move(radices), {{S("dim1"), 5}},
+                   /*requireSurjective=*/true);
+  auto mfma32 = mfma(4, {4, 1}, {32, 32, 16}, /*isTransposed=*/true);
+  auto b = mfmaDotOp(mfma32, 1, 8);
+  LinearLayout pow2B = toLinearLayout({64, 32}, b);
+  LinearLayout pow2C = toLinearLayout({128, 32}, mfma32);
+  ScopedAllowNpot npot;
+  EXPECT_EQ(toLinearLayout({64, 160}, b), pow2B * odd);
+  EXPECT_EQ(toLinearLayout({128, 160}, mfma32), pow2C * odd);
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(toLinearLayout({64, 32}, b), pow2B);
+  EXPECT_EQ(toLinearLayout({128, 32}, mfma32), pow2C);
+}
+
+// An NPOT scale K puts its odd part in the last K register digit, and lanes
+// past its two-part broadcast: a zero K tail MFMA k reads registers 2k, 2k + 1.
+TEST_F(LinearLayoutConversionsTest, ScaledMfmaScale_NpotK) {
+  auto mixedRadix = [&](std::vector<std::vector<int32_t>> regs,
+                        std::vector<int32_t> regRadices,
+                        std::vector<std::vector<int32_t>> lanes,
+                        std::vector<std::vector<int32_t>> warps, int32_t dim1) {
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regs);
+    bases[S("lane")] = std::move(lanes);
+    bases[S("warp")] = std::move(warps);
+    bases[S("block")] = {};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    radices[S("lane")] = {2, 2, 2, 2, 2, 2};
+    radices[S("warp")] = {2, 2};
+    radices[S("block")] = {};
+    return LinearLayout(std::move(bases), std::move(radices),
+                        {{S("dim0"), 128}, {S("dim1"), dim1}},
+                        /*requireSurjective=*/true);
+  };
+  auto scale = [&](int opIdx, int64_t k, unsigned mDim) {
+    return chooseScaledMfmaScaleLayout(&ctx, opIdx, {128, k}, mDim, {1, 1},
+                                       {2, 2});
+  };
+  LinearLayout pow2 = scale(0, 4, 32);
+  ScopedAllowNpot npot;
+  EXPECT_EQ(scale(0, 3, 32),
+            mixedRadix({{0, 1}, {64, 0}}, {3, 2},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 0}},
+                       {{0, 0}, {32, 0}}, 3));
+  EXPECT_EQ(scale(1, 3, 32),
+            mixedRadix({{0, 1}, {64, 0}}, {3, 2},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 0}},
+                       {{32, 0}, {0, 0}}, 3));
+  EXPECT_EQ(scale(0, 6, 16),
+            mixedRadix({{0, 2}, {32, 0}, {64, 0}}, {3, 2, 2},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 1}, {0, 0}},
+                       {{0, 0}, {16, 0}}, 6));
+  // When the MFMA K divides K, MFMA k reads register k.
+  EXPECT_EQ(scale(0, 6, 32),
+            mixedRadix({{0, 2}, {64, 0}}, {3, 2},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 1}},
+                       {{0, 0}, {32, 0}}, 6));
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(scale(0, 4, 32), pow2);
 }
 
 TEST_F(LinearLayoutConversionsTest, MMAv3_64x16) {
@@ -2717,8 +3173,14 @@ TEST_F(LinearLayoutConversionsTest, SliceOfBlocked) {
                          {S("dim0")}));
 }
 
-TEST_F(LinearLayoutConversionsTest, SliceOfBlockedPreservesNpotSize) {
+TEST_F(LinearLayoutConversionsTest, SliceOfBlockedUsesNpotPow2AllocShape) {
   auto parent = blocked({1, 4}, {4, 8}, {4, 1}, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+#ifndef NDEBUG
+  // Without the flag an NPOT extent still aborts.
+  EXPECT_DEATH(toLinearLayout({48}, slice(parent, 0)),
+               "desiredSize % actualSize == 0");
+#endif
+  ScopedAllowNpot npot;
   auto layout = toLinearLayout({48}, slice(parent, 0));
 
   EXPECT_EQ(layout,
@@ -2726,8 +3188,7 @@ TEST_F(LinearLayoutConversionsTest, SliceOfBlockedPreservesNpotSize) {
                           {S("lane"), {{4}, {8}, {16}, {0}, {0}}},
                           {S("warp"), {{0}, {0}}},
                           {S("block"), {}}},
-                         {{S("dim0"), 48}}, /*requireSurjective=*/true));
-  EXPECT_TRUE(layout.isModular());
+                         {{S("dim0"), 64}}, /*requireSurjective=*/true));
 }
 
 TEST_F(LinearLayoutConversionsTest, SliceWithShape1) {
@@ -3632,6 +4093,79 @@ TEST_F(LinearLayoutConversionsTest,
           << dim0 << ", " << dim1 << "] with " << swizzleBytes << "B swizzle";
     }
   }
+}
+
+// A dot-operand parent may be any MmaEncodingTrait, including out-of-tree
+// layouts unknown to core. No such layout exists in-tree, so attach the
+// interface to a placeholder attribute (a test-only stand-in) and check both
+// seams. testExtMmaSentinel is what the stand-in returns, so the test can
+// confirm dispatch reached it.
+static LinearLayout testExtMmaSentinel(MLIRContext *ctx) {
+  auto S = [&](StringRef s) { return StringAttr::get(ctx, s); };
+  return LinearLayout(
+      {
+          {S("register"), {}},
+          {S("lane"), {{1}, {2}}},
+          {S("warp"), {}},
+          {S("block"), {}},
+      },
+      {S("dim0")});
+}
+
+// Test-only stand-in: MmaEncodingTrait attached to a placeholder attribute.
+struct TestExtMmaModel
+    : public MmaEncodingTrait::ExternalModel<TestExtMmaModel, StringAttr> {
+  SmallVector<unsigned> getRepOrderForOperand(Attribute attr, int opIdx) const {
+    return {0};
+  }
+  LinearLayout dotOperandToLinearLayout(Attribute attr, Attribute dotOp,
+                                        ArrayRef<int64_t> shape) const {
+    return testExtMmaSentinel(attr.getContext());
+  }
+};
+
+TEST_F(LinearLayoutConversionsTest, OutOfTreeMmaDotOperandExtensionPoint) {
+  StringAttr::attachInterface<TestExtMmaModel>(ctx);
+  Attribute parent = S("test_out_of_tree_mma");
+  ASSERT_TRUE(isa<MmaEncodingTrait>(parent));
+
+  // verify accepts an unknown MmaEncodingTrait parent.
+  auto emitError = [&]() {
+    return mlir::emitError(mlir::UnknownLoc::get(&ctx));
+  };
+  EXPECT_TRUE(succeeded(DotOperandEncodingAttr::verify(emitError, /*opIdx=*/0,
+                                                       parent, /*kWidth=*/0)));
+
+  // toLinearLayout dispatches through the interface, not a hardcoded type.
+  auto dotOperand = dot(parent, /*idx=*/0, /*kWidth=*/0);
+  EXPECT_EQ(dotOperand.toLinearLayout({4}), testExtMmaSentinel(&ctx));
+}
+
+// A shared layout may be any SharedEncodingTrait, including out-of-tree layouts
+// unknown to core. No such layout exists in-tree, so attach the interface to a
+// placeholder attribute (a test-only stand-in) and check the dispatch reaches
+// it. testExtSharedSentinel is what the stand-in returns.
+static LinearLayout testExtSharedSentinel(MLIRContext *ctx) {
+  auto S = [&](StringRef s) { return StringAttr::get(ctx, s); };
+  return LinearLayout::identity1D(4, S("offset"), S("dim0"));
+}
+
+// Test-only stand-in: SharedEncodingTrait attached to a placeholder attribute.
+struct TestExtSharedModel
+    : public SharedEncodingTrait::ExternalModel<TestExtSharedModel,
+                                                StringAttr> {
+  LinearLayout toLinearLayout(Attribute attr, ArrayRef<int64_t> shape) const {
+    return testExtSharedSentinel(attr.getContext());
+  }
+};
+
+TEST_F(LinearLayoutConversionsTest, OutOfTreeSharedEncodingExtensionPoint) {
+  StringAttr::attachInterface<TestExtSharedModel>(ctx);
+  Attribute layout = S("test_out_of_tree_shared");
+  ASSERT_TRUE(isa<SharedEncodingTrait>(layout));
+
+  // toLinearLayout dispatches through the interface, not a hardcoded type.
+  EXPECT_EQ(toLinearLayout({4}, layout), testExtSharedSentinel(&ctx));
 }
 
 } // anonymous namespace

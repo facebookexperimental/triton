@@ -29,8 +29,12 @@
 #include <numeric>
 
 #include "mlir/IR/DialectImplementation.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Dialect/Triton/IR/Interfaces.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -39,6 +43,8 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
+
+#include <cmath>
 
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.cpp.inc"
 
@@ -49,6 +55,45 @@ using namespace mlir::triton::nvidia_gpu;
 namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
+
+LogicalResult
+CachePolicyAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                        triton::CacheModifier cacheModifier,
+                        CacheEvictionPriority l1, CacheEvictionPriority primary,
+                        CacheEvictionPriority secondary, FloatAttr fraction,
+                        IntegerAttr prefetchSize) {
+  using Priority = CacheEvictionPriority;
+  if (cacheModifier != triton::CacheModifier::NONE && l1 != Priority::NONE)
+    return emitError()
+           << "cache modifier cannot be combined with an L1 eviction priority";
+
+  if (primary == Priority::NO_ALLOCATE)
+    return emitError() << "invalid L2 primary eviction priority '"
+                       << stringifyCacheEvictionPriority(primary) << "'";
+
+  if (primary != Priority::NONE) {
+    if (secondary == Priority::NONE || !fraction)
+      return emitError() << "L2 policy requires l2_secondary and l2_fraction";
+    if (secondary != Priority::EVICT_FIRST &&
+        secondary != Priority::EVICT_UNCHANGED)
+      return emitError() << "invalid L2 secondary eviction priority '"
+                         << stringifyCacheEvictionPriority(secondary) << "'";
+    double value = fraction.getValueAsDouble();
+    if (!fraction.getType().isF32() || !std::isfinite(value) || value <= 0.0 ||
+        value > 1.0)
+      return emitError() << "L2 fraction must be a finite f32 in (0, 1]";
+  } else if (secondary != Priority::NONE || fraction) {
+    return emitError() << "l2_secondary and l2_fraction require l2_primary";
+  }
+
+  if (prefetchSize) {
+    int64_t size = prefetchSize.getInt();
+    if (!prefetchSize.getType().isInteger(32) ||
+        (size != 64 && size != 128 && size != 256))
+      return emitError() << "L2 prefetch size must be 64, 128, or 256";
+  }
+  return success();
+}
 
 namespace {
 
@@ -136,7 +181,7 @@ uint32_t getTMemSubSliceOffset(MemDescType memDescType, int32_t offset,
 }
 
 LinearLayout getTileLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
-                           bool withWarp) {
+                           bool withWarp, int numWarpBases) {
   auto str_attr = [&](StringRef str) { return StringAttr::get(ctx, str); };
   auto kReg = str_attr("register");
   auto kLane = str_attr("lane");
@@ -173,8 +218,9 @@ LinearLayout getTileLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
   if (withWarp) {
     auto nCol = tile.getOutDimSize(kCol);
     auto bases = tile.getBases();
-    bases[kWarp].push_back({32, 0});
-    bases[kWarp].push_back({64, 0});
+    auto &warpBases = bases[kWarp];
+    for (int i = 0; i < numWarpBases; ++i)
+      warpBases.push_back({32 << i, 0});
     tile = LinearLayout(std::move(bases), {{kRow, 128}, {kCol, nCol}}, false);
   }
   return tile;
@@ -339,6 +385,27 @@ getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
          "numWarps must be a power of 2 and >= 4");
   assert(atom != TMemAccessAtom::I16x32bx2 &&
          "This layout is inferred sometimes for the 32x32b atom");
+  // NPOT N (or scale MN): the pow2 chunk's layout times the odd part as the
+  // outermost register digit, the form computeTMemLdStEncodingInfo lowers.
+  auto shape = memType.getShape().take_back(2);
+  FailureOr<gpu::MemDescType> chunkTy = failure();
+  if (!llvm::all_of(shape, llvm::isPowerOf2_64))
+    chunkTy = getNpotTMemChunkType(memType);
+  if (succeeded(chunkTy)) {
+    auto chunk = getDistributedLayoutForTmemLdSt(*chunkTy, atom, numWarps);
+    if (!chunk)
+      return std::nullopt;
+    auto kReg = StringAttr::get(memType.getContext(), "register");
+    int d = chunkTy->getShape()[0] == shape[0] ? 1 : 0;
+    int32_t odd = shape[d] / chunkTy->getShape()[d];
+    LinearLayout::BasesT bases;
+    bases[kReg] = {{1}};
+    LinearLayout::RadicesT radices;
+    radices[kReg] = {odd};
+    auto dims = to_vector(chunk->getOutDimNames());
+    return *chunk * LinearLayout(std::move(bases), std::move(radices),
+                                 {{dims[d], odd}}, /*requireSurjective=*/true);
+  }
   auto ll = toLinearLayout(memType);
   auto bitwidth = memType.getElementTypeBitWidth();
   return getDistributedLayoutForTmemLdSt(ll, atom, numWarps, bitwidth);
@@ -390,7 +457,8 @@ getTmemLoadLayoutSplitLongM(RankedTensorType tensorType, MemDescType memType,
       std::swap(bases[kWarp][2], bases[kLane][4]);
       return LinearEncodingAttr::get(
           tensorType.getContext(),
-          LinearLayout(std::move(bases), ret.getOutDims(), ret.isSurjective()));
+          LinearLayout(std::move(bases), ret.getInputRadices(),
+                       ret.getOutDims(), ret.isSurjective()));
     }
   }
   return std::nullopt;
@@ -581,6 +649,26 @@ TensorDescIm2ColType::verify(function_ref<InFlightDiagnostic()> emitError,
 
 namespace {
 //===----------------------------------------------------------------------===//
+// Cache Policy Interface
+//===----------------------------------------------------------------------===//
+class TritonNvidiaGPUCachePolicyInterface
+    : public triton::DialectCachePolicyInterface {
+public:
+  using DialectCachePolicyInterface::DialectCachePolicyInterface;
+
+  LogicalResult verifyCachePolicy(
+      Attribute cachePolicy, triton::CachePolicyOperation operation,
+      function_ref<InFlightDiagnostic()> emitError) const override {
+    auto policy = dyn_cast<CachePolicyAttr>(cachePolicy);
+    if (!policy)
+      return emitError() << "unsupported NVIDIA cache policy attribute "
+                         << cachePolicy;
+    return triton::verifyCacheModifier(policy.getCacheModifier(), operation,
+                                       emitError);
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Verify Tensor/MemDesc Layout Interface
 //===----------------------------------------------------------------------===//
 class TritonNvidiaGPUVerifyTensorLayoutInterface
@@ -634,6 +722,53 @@ public:
     return OpAsmDialectInterface::getAlias(attr, os);
   }
 };
+
+struct DivFByConstant : public OpRewritePattern<arith::DivFOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::DivFOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!isa<Float32Type, RankedTensorType>(op.getType()) ||
+        !getElementTypeOrSelf(op.getType()).isF32())
+      return failure();
+
+    auto targetInfo =
+        triton::TargetInfoBase::fromModuleOp(op->getParentOfType<ModuleOp>());
+    if (!targetInfo || !targetInfo->isCuda())
+      return failure();
+
+    // This range keeps both the denominator and its reciprocal normal.
+    auto inRange = [](APFloat value) {
+      value.clearSign();
+      return value >= APFloat(0x1p-126f) && value <= APFloat(0x1p126f);
+    };
+    APFloat denominator(0.0f);
+    DenseFPElementsAttr denominators;
+    Value divisor = op.getRhs();
+    if (matchPattern(op.getRhs(), m_ConstantFloat(&denominator))) {
+      if (!inRange(denominator))
+        return failure();
+      if (isa<RankedTensorType>(op.getType()))
+        divisor = arith::ConstantOp::create(
+            rewriter, op.getLoc(),
+            rewriter.getFloatAttr(rewriter.getF32Type(), denominator));
+    } else if (!matchPattern(op.getRhs(), m_Constant(&denominators)) ||
+               !llvm::all_of(denominators.getValues<APFloat>(), inRange)) {
+      return failure();
+    }
+
+    auto one = arith::ConstantOp::create(
+        rewriter, op.getLoc(), rewriter.getOneAttr(divisor.getType()));
+    Value reciprocal = triton::ApproxDivFOp::create(
+        rewriter, op.getLoc(), divisor.getType(), one, divisor);
+    if (reciprocal.getType() != op.getType())
+      reciprocal = triton::SplatOp::create(rewriter, op.getLoc(), op.getType(),
+                                           reciprocal);
+    rewriter.replaceOpWithNewOp<arith::MulFOp>(op, op.getLhs(), reciprocal);
+    return success();
+  }
+};
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -651,9 +786,15 @@ void TritonNvidiaGPUDialect::initialize() {
 #define GET_TYPEDEF_LIST
 #include "triton/Dialect/TritonNvidiaGPU/IR/Types.cpp.inc"
       >();
+  addInterfaces<TritonNvidiaGPUCachePolicyInterface>();
   addInterfaces<TritonNvidiaGPUVerifyTensorLayoutInterface>();
   addInterfaces<TritonGPUOpAsmInterface>();
   addInterfaces<TritonInlinerInterface>();
+}
+
+void TritonNvidiaGPUDialect::getCanonicalizationPatterns(
+    RewritePatternSet &patterns) const {
+  patterns.add<DivFByConstant>(getContext());
 }
 
 // verify TritonNvidiaGPU ops

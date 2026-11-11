@@ -418,6 +418,40 @@ def test_gluon_warp_specialized_event(tmp_path: pathlib.Path):
         assert start["ts"] <= end["ts"]
 
 
+@pytest.mark.skipif(not supports_ws(), reason="requires warp specialization")
+def test_gluon_warp_specialized_dynamic_event(tmp_path: pathlib.Path):
+
+    @gluon.jit
+    def default_partition(iterations):
+        event = pl.allocate_event("dynamic_warp_specialized")
+        # The dynamic loop makes Proton's segment part of warp specialization's CFG.
+        for _ in range(iterations):
+            pl.start_event(event)
+            pl.end_event(event)
+
+    @gluon.jit
+    def empty_partition():
+        pass
+
+    @gluon.jit(do_not_specialize=["iterations"])
+    def kernel(iterations):
+        gl.warp_specialize([
+            (default_partition, (iterations, )),
+            (empty_partition, ()),
+        ], [4], [24])
+
+    trace_path = tmp_path / "warp_specialized_dynamic_event.chrome_trace"
+    proton.start(str(trace_path.with_suffix("")), backend="instrumentation", data="trace")
+    kernel[(1, )](2, num_warps=4)
+    proton.finalize()
+
+    with trace_path.open("rb") as f:
+        events = json.load(f)["traceEvents"]
+    async_events = [event for event in events if event["name"] == "dynamic_warp_specialized"]
+    assert async_events
+    assert all(event["ph"] == "X" for event in async_events)
+
+
 def test_select_ids(tmp_path: pathlib.Path):
     from contextlib import contextmanager
 
@@ -528,6 +562,62 @@ def test_no_scope_zero_scratch(tmp_path: pathlib.Path):
         add_kernel[(1, 1, 1)](x, y, output, size, BLOCK_SIZE=1024, num_warps=4)
         # Header is still built even though there is no profile-scratch payload.
         assert proton.hooks.InstrumentationHook.host_buffer is not None
+
+
+def test_host_buffer_survives_uninstrumented_kernel(tmp_path: pathlib.Path):
+    from contextlib import contextmanager
+
+    # A session that launches an instrumented (scoped) kernel followed by an
+    # uninstrumented one (no scopes, profile_scratch_size == 0, e.g. an
+    # auxiliary reduction trailing the profiled kernel). The trailing kernel
+    # must not clobber the valid host_buffer snapshot: block_num/total_unit
+    # must still describe the scoped kernel. Complements
+    # test_no_scope_zero_scratch, which covers the single-kernel case.
+    @contextmanager
+    def instrumentation(file_path):
+        proton.hooks.InstrumentationHook.enable_host_buffer = True
+        proton.start(str(file_path.with_suffix("")), backend="instrumentation")
+        try:
+            yield
+        finally:
+            proton.hooks.InstrumentationHook.enable_host_buffer = False
+            proton.finalize()
+
+    @triton.jit
+    def scoped_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        with pl.scope("load0"):
+            x = tl.load(x_ptr + offsets, mask=mask)
+        tl.store(output_ptr + offsets, x, mask=mask)
+
+    @triton.jit
+    def plain_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask)
+        tl.store(output_ptr + offsets, x, mask=mask)
+
+    size = 256
+    x = torch.rand(size, device="cuda")
+    out0 = torch.empty_like(x)
+    out1 = torch.empty_like(x)
+    temp_file = tmp_path / "test_host_buffer_survives_uninstrumented_kernel.hatchet"
+
+    def header_u32(buf, off):
+        return int.from_bytes(buf[off:off + 4].numpy().tobytes(), "little")
+
+    with instrumentation(temp_file):
+        scoped_kernel[(1, 1, 1)](x, out0, size, BLOCK_SIZE=1024, num_warps=8)
+        plain_kernel[(1, 1, 1)](x, out1, size, BLOCK_SIZE=1024, num_warps=4)
+        host_buffer = proton.hooks.InstrumentationHook.host_buffer
+        assert host_buffer is not None
+        # The snapshot must still describe the scoped kernel (8 warps with
+        # profiling data), not the trailing plain kernel (4 warps, no data).
+        assert header_u32(host_buffer, 28) == 8  # total_unit
+        assert header_u32(host_buffer, 24) > 0  # block_num
 
 
 @pytest.mark.parametrize("hook", ["triton", None])

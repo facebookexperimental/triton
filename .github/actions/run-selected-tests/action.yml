@@ -1,0 +1,26 @@
+name: Run selected tests
+description: Execute the CPU planner's explicit test files and expression.
+inputs:
+  suite:
+    description: JSON suite from the CPU planner
+    required: true
+  workers:
+    required: false
+    default: "1"
+  junit:
+    required: true
+  setup-script:
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TEST_SUITE: ${{ inputs.suite }}
+        WORKERS: ${{ inputs.workers }}
+        JUNIT: ${{ inputs.junit }}
+        SETUP_SCRIPT: ${{ inputs.setup-script }}
+      run: |
+        [ -z "${SETUP_SCRIPT}" ] || . "${SETUP_SCRIPT}"
+        python .github/scripts/run_selected_tests.py --workers "${WORKERS}" --junit "${JUNIT}"

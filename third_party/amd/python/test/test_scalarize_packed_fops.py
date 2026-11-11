@@ -29,9 +29,15 @@ def _packed_op_feeds_wide_store(bb, match, wide_store):
     if not dest:
         return False
     lo, hi = sorted((int(dest.group(1)), int(dest.group(2))))
+
+    def lane_referenced(store_line, lane):
+        if re.search(rf"v(?:\[)?{lane}\b", store_line):
+            return True
+        # 64-bit wide stores take the pair as one v[lo:hi] range operand.
+        return any(int(rlo) <= lane <= int(rhi) for rlo, rhi in re.findall(r"v\[(\d+):(\d+)\]", store_line))
+
     for store_line in bb.splitlines():
-        if wide_store.search(store_line) and all(
-                re.search(rf"v(?:\[)?{lane}\b", store_line) for lane in range(lo, hi + 1)):
+        if wide_store.search(store_line) and all(lane_referenced(store_line, lane) for lane in range(lo, hi + 1)):
             return True
     return False
 
@@ -48,7 +54,7 @@ def test_check_not_scalarize():
         bbs = list(re.split(r"^\d+:\s+; preds = %.*?$", func_body, flags=re.MULTILINE))
         assert len(bbs) > 1, "didn't split func body correctly"
         found_colliding_packed_fop = False
-        packed_fop = re.compile(r"= f(add|sub|mul) <")
+        packed_fop = re.compile(r"= f(add|sub|mul)(?:\s+[a-z]+)* <")
         for bb in bbs:
             if ("mfma" in bb or "wmma" in bb) and packed_fop.search(bb):
                 found_colliding_packed_fop = True
@@ -89,7 +95,7 @@ def test_check_scalarized():
         bbs = list(re.split(r"^\d+:\s+; preds = %.*?$", func_body, flags=re.MULTILINE))
         assert len(bbs) > 1, "didn't split func body correctly"
         found_mfma = False
-        packed_fop = re.compile(r"= f(add|sub|mul) <")
+        packed_fop = re.compile(r"= f(add|sub|mul)(?:\s+[a-z]+)* <")
         for bb in bbs:
             if "mfma" in bb or "wmma" in bb:
                 assert not packed_fop.search(bb)

@@ -84,6 +84,9 @@ public:
     // We zero out the bases that are constant
     auto kReg = StringAttr::get(ctx, "register");
     auto ll = toLinearLayout(rtType);
+    // pseudoinvert needs radix-2 inputs and power-of-two outputs.
+    if (ll.hasNonPow2OutDim())
+      return resultVals;
     ll = ll.removeZeroBasesAlongDim(kReg);
     auto dims = to_vector(ll.getOutDimNames());
     auto llReg = ll.sublayout({kReg}, dims);

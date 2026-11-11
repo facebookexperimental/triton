@@ -178,6 +178,12 @@ def TLXDumpLayout : Pass<"tlx-dump-layout", "mlir::ModuleOp"> {
     layout string. It is meant to run at the end of the TTGIR pipeline so that
     the reported layouts are final. Each `tlx::DumpLayoutOp` is erased after its
     layout is printed.
+
+    It also emits a remark for every `ttg.convert_layout` that exchanges data
+    through shared memory, with both layouts in CuTe notation. When a
+    `ttg.local_load` produces the converted value, or feeds the same
+    elementwise op, a note on that load names the layout to load it in so the
+    conversion goes away (as a `tlx.layout(...)` when representable).
   }];
 
   let dependentDialects = [

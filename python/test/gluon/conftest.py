@@ -34,9 +34,10 @@ _VERSION_SKEW_FILES = {
     "test_lowerings.py",
     "test_consan.py",
 }
+collect_ignore = sorted(_VERSION_SKEW_FILES)
 
 # Individual frontend/layout cases that don't pass on the pinned build:
-#  - nv_tma_descriptor_{load,store} and amd mfma/wmma_scaled/warp_pipeline emit IR that
+#  - nv_tma_descriptor_{load,store} and amd mfma/wmma_scaled emit IR that
 #    legitimately differs per parametrized target, so a single `assert_expected_inline`
 #    golden cannot match every param (needs per-target goldens / upstream test change);
 #  - amd_mbarrier hits a `create_lds_barrier_wait` pybind signature mismatch (needs a
@@ -47,20 +48,15 @@ _KNOWN_FAIL_SUBSTRINGS = (
     "test_frontend.py::test_nv_tma_descriptor_store_kernel[",
     "test_frontend.py::test_amd_mfma[",
     "test_frontend.py::test_amd_wmma_scaled_scalar[",
-    "test_frontend.py::test_amd_warp_pipeline[",
     "test_frontend.py::test_amd_mbarrier[",
     "test_layout_format_view.py::test_format_view_kernel",
 )
 
-_SKEW_REASON = (
-    "fbtriton: Gluon frontend pinned older than these upstream-synced tests "
-    "(pointer load/store distributed-layout support missing). Unskip after the "
-    "Gluon frontend re-sync -- TODO(gluon-ci)."
-)
-_KNOWN_FAIL_REASON = (
-    "fbtriton: known-failing on the pinned Gluon build (per-target golden / "
-    "create_lds_barrier_wait binding / block_type layout skew) -- TODO(gluon-ci)."
-)
+_SKEW_REASON = ("fbtriton: Gluon frontend pinned older than these upstream-synced tests "
+                "(pointer load/store distributed-layout support missing). Unskip after the "
+                "Gluon frontend re-sync -- TODO(gluon-ci).")
+_KNOWN_FAIL_REASON = ("fbtriton: known-failing on the pinned Gluon build (per-target golden / "
+                      "create_lds_barrier_wait binding / block_type layout skew) -- TODO(gluon-ci).")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -69,6 +65,13 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         filename = item.path.name
         if filename in _VERSION_SKEW_FILES:
+            # Exemption: test_standard_scan (upstream #12007) exercises only core
+            # scan ops (cumsum/cumprod) through the pinned frontend, so it may pass
+            # where pointer-layout tests cannot. Exempted so touched-file coverage
+            # can run. TODO(gluon-ci): revisit after the frontend re-sync.
+            if filename == "test_lowerings.py" and getattr(
+                    item, "originalname", item.name) == "test_standard_scan":
+                continue
             item.add_marker(skew)
             continue
         if any(sub in item.nodeid for sub in _KNOWN_FAIL_SUBSTRINGS):

@@ -143,56 +143,6 @@ LinearLayout buildReps(MLIRContext *ctx, const LinearLayout &src,
   return smemReps;
 }
 
-SmallVector<int32_t> computeSegment(ArrayRef<int32_t> bankSrc,
-                                    ArrayRef<int32_t> bankDst,
-                                    ArrayRef<int32_t> blockBases, int32_t dim,
-                                    int32_t lenSegment) {
-  llvm::SmallDenseSet<int32_t> setSrc(bankSrc.begin(), bankSrc.end());
-  llvm::SmallDenseSet<int32_t> setDst(bankDst.begin(), bankDst.end());
-  setSrc.insert(blockBases.begin(), blockBases.end());
-  setDst.insert(blockBases.begin(), blockBases.end());
-  // Remove the 0 as it's not a basis
-  setSrc.erase(0);
-  setDst.erase(0);
-
-  SmallVector<int32_t> segment;
-  for (int32_t b = 0; b < dim; ++b)
-    if (!setSrc.contains(1 << b) && !setDst.contains(1 << b))
-      segment.push_back(1 << b);
-  if (segment.size() >= lenSegment) {
-    segment.resize(lenSegment);
-    return segment;
-  }
-
-  // A and B are the difference sets
-  SmallVector<int32_t> A, B;
-  for (int32_t v : setSrc)
-    if (!setDst.contains(v))
-      A.push_back(v);
-  for (int32_t v : setDst)
-    if (!setSrc.contains(v))
-      B.push_back(v);
-  if (A.size() > B.size()) {
-    std::swap(A, B);
-  }
-  llvm::sort(A);
-  llvm::sort(B);
-  // A is the smaller set now
-  auto logBankConflicts = std::min<int32_t>(
-      std::max<int32_t>(0, lenSegment - A.size() - segment.size()), A.size());
-  // Conflict-free
-  for (int i = logBankConflicts; i < A.size(); ++i)
-    segment.push_back(A[i] ^ B[i]);
-  // Write conflicts
-  segment.append(A.begin(), A.begin() + logBankConflicts);
-  // Read conflicts
-  segment.append(B.begin(), B.begin() + logBankConflicts);
-
-  if (segment.size() > lenSegment)
-    segment.resize(lenSegment);
-  return segment;
-}
-
 SmallVector<int32_t> complementBasis(ArrayRef<int32_t> basis, int32_t dim) {
   const int32_t nRows = basis.size();
   auto mat = std::make_unique<uint64_t[]>(nRows);
@@ -242,6 +192,51 @@ SmallVector<int32_t> intersectionBasis(ArrayRef<int32_t> b1,
   }
 }
 
+SmallVector<int32_t> computeSegment(ArrayRef<int32_t> bankSrc,
+                                    ArrayRef<int32_t> bankDst,
+                                    ArrayRef<int32_t> blockBases, int32_t dim,
+                                    int32_t lenSegment) {
+
+  SmallVector<int32_t> srcPhase(bankSrc.begin(), bankSrc.end());
+  srcPhase.append(blockBases.begin(), blockBases.end());
+  SmallVector<int32_t> dstPhase(bankDst.begin(), bankDst.end());
+  dstPhase.append(blockBases.begin(), blockBases.end());
+
+  SmallVector<int32_t> joint(srcPhase.begin(), srcPhase.end());
+  joint.append(dstPhase.begin(), dstPhase.end());
+  auto segment = complementBasis(joint, dim);
+  if (segment.size() >= lenSegment) {
+    segment.resize(lenSegment);
+    return segment;
+  }
+
+  auto intersection = intersectionBasis(srcPhase, dstPhase, dim);
+  auto complement = complementBasis(intersection, dim);
+
+  // A and B are the difference sets
+  auto A = intersectionBasis(complement, srcPhase, dim);
+  auto B = intersectionBasis(complement, dstPhase, dim);
+  if (A.size() > B.size()) {
+    std::swap(A, B);
+  }
+  llvm::sort(A);
+  llvm::sort(B);
+  // A is the smaller set now
+  auto logBankConflicts = std::min<int32_t>(
+      std::max<int32_t>(0, lenSegment - A.size() - segment.size()), A.size());
+  // Conflict-free
+  for (int i = logBankConflicts; i < A.size(); ++i)
+    segment.push_back(A[i] ^ B[i]);
+  // Write conflicts
+  segment.append(A.begin(), A.begin() + logBankConflicts);
+  // Read conflicts
+  segment.append(B.begin(), B.begin() + logBankConflicts);
+
+  if (segment.size() > lenSegment)
+    segment.resize(lenSegment);
+  return segment;
+}
+
 } // namespace
 
 namespace mlir::triton::gpu {
@@ -258,7 +253,7 @@ std::pair<int, int> bankConflicts(ArrayRef<int32_t> tileSrc,
   auto segment = StringAttr::get(ctx, "segment");
   auto segmentBases = flatten(smemFlat, segment);
 
-  int32_t rank = smem.getTotalOutDimSizeBits();
+  int32_t rank = smem.getTotalOutDimSizeLog2();
   // compute conflicts
   int write = 1 << intersectionBasis(segmentBases, tileSrc, rank).size();
   int read = 1 << intersectionBasis(segmentBases, tileDst, rank).size();
@@ -274,6 +269,21 @@ SmallVector<int32_t> LocalMemOpTile::getLaneAddr(ArrayRef<int32_t> lane) const {
   return ret;
 }
 
+SmallVector<int32_t> LocalMemOpTile::getLaneMask(ArrayRef<int32_t> lane) const {
+  SmallVector<int32_t> ret;
+  ret.reserve(laneMask.size());
+  for (int32_t mask : laneMask) {
+    int32_t basis = 0;
+    for (auto [idx, laneBasis] : llvm::enumerate(lane)) {
+      if (mask & (1 << idx)) {
+        basis ^= laneBasis;
+      }
+    }
+    ret.push_back(basis);
+  }
+  return ret;
+}
+
 SmallVector<int32_t> getLaneTile(const LocalMemOpTile &tile,
                                  ArrayRef<int32_t> lane, int32_t vecSize,
                                  int32_t bitwidth, int32_t numBanks) {
@@ -281,13 +291,12 @@ SmallVector<int32_t> getLaneTile(const LocalMemOpTile &tile,
   auto log2Bank = llvm::Log2_32(numBanks);
   auto log2Phase = std::max<int32_t>(0, log2Vec + lane.size() - log2Bank);
   SmallVector<int32_t> res;
-  if (!tile.laneAddr.empty()) {
-    // The laneAddr field explicitly defines the lane basis indices for
-    // load/store instructions with non-sequential lane IDs within a single
-    // phase, like ds_read_b128.
-    res = tile.getLaneAddr(lane);
+  if (!tile.laneMask.empty()) {
+    // laneMask encodes the phase subspace when it is not spanned by plain lane
+    // bases, like ds_read_b128.
+    res = tile.getLaneMask(lane);
   } else {
-    // If laneAddr is empty, we fall back to the standard assumption for
+    // If laneMask is empty, we fall back to the standard assumption for
     // regular loads/stores: lane IDs are sequential within a single phase.
     res = to_vector(lane.drop_back(log2Phase));
   }
@@ -358,7 +367,7 @@ static std::optional<SmallVector<int32_t>> optimalSwizzlingTile(
   auto *ctx = a.getInDimNames().begin()->getContext();
   auto kReg = StringAttr::get(ctx, "register");
   auto kLane = StringAttr::get(ctx, "lane");
-  auto dim = a.getTotalOutDimSizeBits();
+  auto dim = a.getTotalOutDimSizeLog2();
   // map from b to a
   LinearLayout cvt = b.invertAndCompose(a);
 
@@ -432,7 +441,7 @@ LinearLayout optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
   assert(src.getNumOutDims() == 1 && dst.getNumOutDims() == 1 &&
          "src and dst must have a single output dimension");
 
-  const int32_t dim = src.getTotalOutDimSizeBits();
+  const int32_t dim = src.getTotalOutDimSizeLog2();
   auto *ctx = src.getInDimNames().begin()->getContext();
   auto kReg = StringAttr::get(ctx, "register");
 
@@ -498,52 +507,6 @@ LinearLayout optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
   return basis1D.reshapeOuts(outDims);
 }
 
-// Swizzle pow2 dimensions and map NPOT dimensions to segment.
-static LinearLayout
-optimalSwizzlingLdStMixed(const LinearLayout &src, const LinearLayout &dst,
-                          int32_t bitwidth, int32_t numBanks,
-                          LocalMemOpTile srcTile, LocalMemOpTile dstTile) {
-  auto *ctx = src.getInDimNames().begin()->getContext();
-  auto S = [ctx](StringRef str) { return StringAttr::get(ctx, str); };
-  auto kSeg = S("segment");
-
-  SmallVector<StringAttr> pow2Dims, npotDims;
-  for (auto outDim : src.getOutDimNames()) {
-    if (src.isOutDimModular(outDim))
-      npotDims.push_back(outDim);
-    else
-      pow2Dims.push_back(outDim);
-  }
-
-  // NPOT inputs are pow2-padded; outputs remain modular.
-  LinearLayout npotPart = LinearLayout::empty();
-  for (auto npotDim : npotDims) {
-    int32_t N = src.getOutDimSize(npotDim);
-    npotPart *= LinearLayout::modularIdentity1D(N, kSeg, npotDim);
-  }
-
-  if (pow2Dims.empty()) {
-    auto kVec = S("vector"), kBank = S("bank"), kReps = S("reps");
-    auto segBases = npotPart.getBases().lookup(kSeg);
-    return LinearLayout(
-        {{kVec, {}}, {kBank, {}}, {kSeg, segBases}, {kReps, {}}},
-        npotPart.getOutDims(), /*requireSurjective=*/true);
-  }
-
-  auto inDims = llvm::to_vector(src.getInDimNames());
-  auto srcPow2 = src.sublayout(inDims, pow2Dims);
-  auto dstPow2 = dst.sublayout(inDims, pow2Dims);
-  srcPow2 = actionRemoveBroadcastedRegs(srcPow2).apply(srcPow2);
-  dstPow2 = actionRemoveBroadcastedRegs(dstPow2).apply(dstPow2);
-
-  auto smemPow2 = optimalSwizzlingLdSt(srcPow2, dstPow2, bitwidth, numBanks,
-                                       srcTile, dstTile);
-
-  // NPOT segment bases are disjoint from pow2 vector/bank bases. Output
-  // projection preserves the lane-basis indices used by srcTile/dstTile.
-  return smemPow2 * npotPart;
-}
-
 std::pair<SmallVector<int32_t>, std::optional<bool>>
 getVecBasisLdSt(const LinearLayout &srcFlat, const LinearLayout &dstFlat,
                 int32_t bitwidth) {
@@ -555,7 +518,7 @@ getVecBasisLdSt(const LinearLayout &srcFlat, const LinearLayout &dstFlat,
   auto blockSrc = srcFlat.getBases().contains(kBlock) ? flatten(srcFlat, kBlock)
                                                       : SmallVector<int32_t>{};
 
-  auto dim = srcFlat.getTotalOutDimSizeBits();
+  auto dim = srcFlat.getTotalOutDimSizeLog2();
   SmallVector<int32_t> vbasis = intersectionBasis(regSrc, regDst, dim);
   // Restrict the vectorisation to the maximum we can use
   auto maxVecBases = llvm::Log2_32(128 / bitwidth);
@@ -649,10 +612,6 @@ LinearLayout optimalSwizzlingLdSt(const LinearLayout &src,
                                   const LinearLayout &dst, int32_t bitwidth,
                                   int32_t numBanks, LocalMemOpTile srcTile,
                                   LocalMemOpTile dstTile) {
-  if (src.isModular())
-    return optimalSwizzlingLdStMixed(src, dst, bitwidth, numBanks, srcTile,
-                                     dstTile);
-
   auto *ctx = src.getInDimNames().begin()->getContext();
   auto kReg = StringAttr::get(ctx, "register");
   auto kLane = StringAttr::get(ctx, "lane");

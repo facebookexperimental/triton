@@ -1,183 +1,36 @@
 name: Meta Triton B200 Tests
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - '**'
-      - '!**/*.md'
-      - '!docs/**'
-      - '!website/**'
-      - '!test/**'
-      - '!third_party/amd/**'
-      - '!third_party/tlx/tutorials/gfx9_gemm/**'
-      - '!third_party/amd/python/test/**'
-      - '!python/test/unit/language/test_tlx_*_gfx942.py'
-      - '!python/test/unit/language/test_tlx_*_gfx950.py'
-      - '!python/test/unit/language/test_tlx_*_gfx1250.py'
-      - '!python/test/unit/language/test_tlx_*_hip.py'
-      - '!python/test/unit/tlx_ops/*_gfx950.py'
-      - '!python/test/unit/tlx_ops/*_gfx942.py'
-      - '!python/test/unit/tlx_ops/*_gfx1250.py'
-      - '!python/test/unit/tlx_ops/*_hip.py'
-      - '!python/test/unit/tlx_ops/*_sm90.py'
-      - '!python/test/unit/language/test_tlx_*_sm90.py'
-      - '!third_party/tlx/ops/kernels/**/gfx*.py'
-      - '!third_party/tlx/ops/kernels/**/sm90*.py'
-      # Agent instructions and skills do not affect generated code.
-      - '!.agents/**'
-      - '!.claude/**'
-      - '!.llms/**'
-      - '!AGENTS.md'
-      - '!third_party/tlx/tools/agents/skills/**'
-  pull_request:
-    paths:
-      - '**'
-      - '!**/*.md'
-      - '!docs/**'
-      - '!website/**'
-      - '!test/**'
-      - '!third_party/amd/**'
-      - '!third_party/tlx/tutorials/gfx9_gemm/**'
-      - '!third_party/amd/python/test/**'
-      - '!python/test/unit/language/test_tlx_*_gfx942.py'
-      - '!python/test/unit/language/test_tlx_*_gfx950.py'
-      - '!python/test/unit/language/test_tlx_*_gfx1250.py'
-      - '!python/test/unit/language/test_tlx_*_hip.py'
-      - '!python/test/unit/tlx_ops/*_gfx950.py'
-      - '!python/test/unit/tlx_ops/*_gfx942.py'
-      - '!python/test/unit/tlx_ops/*_gfx1250.py'
-      - '!python/test/unit/tlx_ops/*_hip.py'
-      - '!python/test/unit/tlx_ops/*_sm90.py'
-      - '!python/test/unit/language/test_tlx_*_sm90.py'
-      - '!third_party/tlx/ops/kernels/**/gfx*.py'
-      - '!third_party/tlx/ops/kernels/**/sm90*.py'
-      # Agent instructions and skills do not affect generated code.
-      - '!.agents/**'
-      - '!.claude/**'
-      - '!.llms/**'
-      - '!AGENTS.md'
-      - '!third_party/tlx/tools/agents/skills/**'
-  schedule:
-    - cron: '30 */6 * * *'
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit used to build the wheel
+        required: true
+        type: string
+      plan:
+        description: Explicit test work selected by the CPU planner
+        required: true
+        type: string
+      wheel_url:
+        required: true
+        type: string
+      wheel_filename:
+        required: true
+        type: string
+      wheel_sha256:
+        required: true
+        type: string
 
 env:
+  # Scopes the issue titles. Off main it names the branch, as ci-issues.yml does.
+  GPU_WORKFLOW_NAME: Meta Triton B200 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
   MAX_JOBS: 32
   TORCHINDUCTOR_TLX_MODE: "off"
   CCACHE_DIR: /tmp/fbtriton-ccache
   CCACHE_MAXSIZE: 2G
 
 jobs:
-  b200-build:
-    if: github.repository_owner == 'facebookexperimental'
-    permissions:
-      id-token: write
-      contents: read
-    uses: ./.github/workflows/build.yml
-    with:
-      ref: ${{ github.sha }}
-
-  b200-tritonbench-test:
-    needs: b200-build
-    if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
-    runs-on: nvidia-dgx-b200
-    env:
-      CONDA_ENV: meta-triton
-      SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 180
-    permissions:
-      id-token: write
-      contents: read
-      actions: read
-    outputs:
-      failures: ${{ steps.collect.outputs.failures }}
-    steps:
-      - name: Fail if the build job did not succeed
-        if: needs.b200-build.result != 'success'
-        run: |
-          echo "b200-build result: ${{ needs.b200-build.result }}"
-          exit 1
-      - name: Checkout
-        uses: actions/checkout@v3
-      - name: Tune Nvidia GPU
-        run: |
-          sudo nvidia-smi -pm 1
-          sudo ldconfig
-          nvidia-smi
-      - name: Download prebuilt Triton wheel from GitHub artifacts
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        uses: actions/download-artifact@v4
-        with:
-          name: run_${{ github.run_id }}
-          path: ${{ runner.temp }}/prebuilt-wheel
-      - name: Download prebuilt Triton wheel from S3
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          WHEEL_URL: ${{ needs.b200-build.outputs.wheel_url }}
-          WHEEL_FILENAME: ${{ needs.b200-build.outputs.wheel_filename }}
-        run: |
-          mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
-          curl --fail --location --retry 3 \
-            --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
-      - name: Install Triton
-        run: |
-          . "${SETUP_SCRIPT}"
-          uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
-      - name: Install torchao
-        timeout-minutes: 10
-        run: |
-          . "${SETUP_SCRIPT}"
-          uv pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128
-          python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
-      - name: Export TritonBench env
-        run: |
-          . "${SETUP_SCRIPT}"
-          set -x
-          TRITONBENCH_TRITON_COMMIT_HASH=$(git rev-parse --verify HEAD)
-          TRITONBENCH_TRITON_REPO=$(git config --get remote.origin.url | sed -E 's|.*github.com[:/](.+)\.git|\1|')
-          TRITONBENCH_TRITON_COMMIT=${GITHUB_REF_NAME}
-          TRITONBENCH_INSTALL_DIR=${PWD}
-          cat <<EOF >> "${SETUP_SCRIPT}"
-          if [ \${CONDA_ENV} == "${CONDA_ENV}" ] ; then
-              export TRITONBENCH_TRITON_COMMIT_HASH="${TRITONBENCH_TRITON_COMMIT_HASH}"
-              export TRITONBENCH_TRITON_REPO="${TRITONBENCH_TRITON_REPO}"
-              export TRITONBENCH_TRITON_COMMIT="${TRITONBENCH_TRITON_COMMIT}"
-              export TRITONBENCH_TRITON_INSTALL_DIR="${TRITONBENCH_INSTALL_DIR}"
-          fi
-          EOF
-      - name: Checkout TritonBench (Optional)
-        if: github.event_name == 'pull_request'
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          PR_BODY_FILE="$(mktemp)"
-          printf '%s' "${PR_BODY}" > "${PR_BODY_FILE}"
-          bash ./.ci/tritonbench/checkout.sh "${PR_BODY_FILE}"
-      - name: Select kernel-affected tests
-        id: select
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/select-kernel-tests
-      - name: Run TritonBench tests on B200 GPU
-        id: tritonbench
-        if: ${{ steps.select.outputs.run_tritonbench != 'false' }}
-        env:
-          TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
-        run: |
-          . "${SETUP_SCRIPT}"
-          export TRITONBENCH_ROOT="${TRITONBENCH_ROOT:-/workspace/tritonbench}"
-          bash ./.ci/tritonbench/test-gpu.sh
-      - name: Collect nightly failure (TritonBench)
-        id: collect
-        if: always() && github.event_name == 'schedule' && failure()
-        run: |
-          BUCKET="b200-tritonbench"
-          TITLE="[nightly] ${GITHUB_WORKFLOW} / b200-tritonbench-test / ${BUCKET}"
-          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"b200-tritonbench-test","summary":"TritonBench tests failed on B200 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
-          echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
-
   b200-tlx-test:
-    needs: b200-build
-    if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    if: ${{ !cancelled() && github.repository_owner == 'facebookexperimental' && (fromJSON(inputs.plan).core.files[0] != null || fromJSON(inputs.plan).correctness.files[0] != null || fromJSON(inputs.plan).codegen.files[0] != null) }}
     runs-on: nvidia-dgx-b200
     env:
       CONDA_ENV: meta-triton
@@ -190,121 +43,82 @@ jobs:
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
     steps:
-      - name: Fail if the build job did not succeed
-        if: needs.b200-build.result != 'success'
-        run: |
-          echo "b200-build result: ${{ needs.b200-build.result }}"
-          exit 1
       - name: Checkout
         uses: actions/checkout@v3
-      - name: Tune Nvidia GPU
-        run: |
-          sudo nvidia-smi -pm 1
-          sudo ldconfig
-          nvidia-smi
-      - name: Download prebuilt Triton wheel from GitHub artifacts
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        uses: actions/download-artifact@v4
         with:
-          name: run_${{ github.run_id }}
-          path: ${{ runner.temp }}/prebuilt-wheel
-      - name: Download prebuilt Triton wheel from S3
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          WHEEL_URL: ${{ needs.b200-build.outputs.wheel_url }}
-          WHEEL_FILENAME: ${{ needs.b200-build.outputs.wheel_filename }}
+          ref: ${{ inputs.ref }}
+      - name: Tune Nvidia GPU
+        id: gpu_health
+        # Also a health check: a runner whose GPU stopped responding fails here instead of hanging a later step.
+        timeout-minutes: 6
         run: |
-          mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
-          curl --fail --location --retry 3 \
-            --write-out 'downloaded %{size_download} bytes in %{time_total}s (%{speed_download} B/s)\n' \
-            --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
-      - name: Install Triton
+          timeout 60 sudo nvidia-smi -pm 1
+          sudo ldconfig
+          timeout 60 nvidia-smi
+          . "${SETUP_SCRIPT}"
+          timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
+      - name: Install test dependencies
         run: |
           . "${SETUP_SCRIPT}"
-          uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
-          uv pip install pytest
+          uv pip install pytest pytest-xdist
       - name: Install torchao
         timeout-minutes: 10
-        run: |
-          . "${SETUP_SCRIPT}"
-          uv pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128
-          python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
-      - name: Select kernel-affected tests
-        id: select
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/select-kernel-tests
+        uses: ./.github/actions/install-torchao
+        with:
+          platform: b200
+          setup-script: ${{ env.SETUP_SCRIPT }}
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        env:
+          # Activate the runner environment in each composite-action shell.
+          BASH_ENV: ${{ env.SETUP_SCRIPT }}
+        with:
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
       - name: Run TLX core tests
         id: run_core_tests
+        if: fromJSON(inputs.plan).core.files[0] != null
         timeout-minutes: 90
-        run: |
-          . "${SETUP_SCRIPT}"
-          shopt -s nullglob
-          FILES=(
-            python/test/unit/language/test_tlx_*_any.py
-            python/test/unit/language/test_tlx_*sm90up*.py
-            python/test/unit/language/test_tlx_*sm100*.py
-            python/test/unit/tlx_ops/test_*_sm100.py
-          )
-          # TorchTLX depends on floating PyTorch Inductor APIs and runs in the
-          # separate b200-torchtlx-test job below, not this pinned-PyTorch job.
-          TLX_FILES=()
-          for file in "${FILES[@]}"; do
-            [[ "${file}" == */test_torchtlx_* ]] || TLX_FILES+=("${file}")
-          done
-          FILES=("${TLX_FILES[@]}")
-          [ ${#FILES[@]} -gt 0 ] || { echo "no TLX core test files matched"; exit 1; }
-          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ]; then
-            mapfile -t FILES < <(printf '%s\n' "${FILES[@]}" | grep -Fxf /tmp/affected.txt || true)
-            echo "kernel-only PR: ${#FILES[@]} TLX core file(s) touch the changed kernel(s)"
-            [ ${#FILES[@]} -gt 0 ] || { echo "no affected TLX core tests; skipping"; exit 0; }
-          fi
-          echo "b200 collects:" "${FILES[@]}"
-          # Log runner size and the pod's memory peak, pass or fail.
-          trap 'echo "runner: nproc=$(nproc) memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null) memory.peak_mib=$(( $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0) / 1048576 ))"' EXIT
-          PYTHONPATH="${GITHUB_WORKSPACE}/python/test/unit/tlx_ops${PYTHONPATH:+:${PYTHONPATH}}" python -m pytest "${FILES[@]}" --import-mode=importlib -v --durations=25 --junitxml=/tmp/tlx-core.xml
+        uses: ./.github/actions/run-selected-tests
+        with:
+          suite: ${{ toJSON(fromJSON(inputs.plan).core) }}
+          workers: "4"
+          junit: /tmp/tlx-core.xml
+          setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
+        if: fromJSON(inputs.plan).correctness.files[0] != null
         timeout-minutes: 30
-        run: |
-          . "${SETUP_SCRIPT}"
-          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ]; then
-            MODE="${{ steps.select.outputs.correctness_mode }}"
-            if [ "$MODE" = "skip" ]; then
-              echo "kernel-only PR: no tutorial correctness tests touch the changed kernel(s); skipping"
-              exit 0
-            fi
-            if [ "$MODE" = "filtered" ]; then
-              echo "kernel-only PR: correctness filter: ${{ steps.select.outputs.correctness_k }}"
-              python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -k "${{ steps.select.outputs.correctness_k }}" -v --junitxml=/tmp/tlx-correctness.xml
-              exit 0
-            fi
-          fi
-          python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
+        uses: ./.github/actions/run-selected-tests
+        with:
+          suite: ${{ toJSON(fromJSON(inputs.plan).correctness) }}
+          workers: "4"
+          junit: /tmp/tlx-correctness.xml
+          setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Run device-agnostic TLX codegen tests
         id: run_codegen_tests
+        if: fromJSON(inputs.plan).codegen.files[0] != null
         timeout-minutes: 30
-        run: |
-          . "${SETUP_SCRIPT}"
-          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ] && ! grep -qxF "python/test/unit/language/test_tlx_codegen.py" /tmp/affected.txt; then
-            echo "kernel-only PR: codegen tests do not touch the changed kernel(s); skipping"
-            exit 0
-          fi
-          python -m pytest python/test/unit/language/test_tlx_codegen.py --import-mode=importlib -v --junitxml=/tmp/tlx-codegen.xml
-      - name: Collect nightly failures (TLX)
+        uses: ./.github/actions/run-selected-tests
+        with:
+          suite: ${{ toJSON(fromJSON(inputs.plan).codegen) }}
+          workers: "1"
+          junit: /tmp/tlx-codegen.xml
+          setup-script: ${{ env.SETUP_SCRIPT }}
+      - name: Parse test failures (TLX)
         id: parse
-        if: always() && github.event_name == 'schedule'
-        run: |
-          . "${SETUP_SCRIPT}"
-          FAILED_FLAG=""
-          if [[ "${{ steps.run_core_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" || "${{ steps.run_codegen_tests.outcome }}" != "success" ]]; then
-            FAILED_FLAG="--failed --bucket b200-tlx-job-failed"
-          fi
-          python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-core.xml /tmp/tlx-correctness.xml /tmp/tlx-codegen.xml \
-            --budget /tmp/tlx-core.xml=90 --budget /tmp/tlx-correctness.xml=30 --budget /tmp/tlx-codegen.xml=30 \
-            --workflow "${GITHUB_WORKFLOW}" \
-            --job "b200-tlx-test" \
-            ${FAILED_FLAG}
+        if: always()
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ env.GPU_WORKFLOW_NAME }}
+          job: b200-tlx-test
+          failed: ${{ job.status != 'success' }}
+          bucket: b200-tlx-job-failed
+          junit: ${{ fromJSON(inputs.plan).core.files[0] != null && '/tmp/tlx-core.xml' || '' }} ${{ fromJSON(inputs.plan).correctness.files[0] != null && '/tmp/tlx-correctness.xml' || '' }} ${{ fromJSON(inputs.plan).codegen.files[0] != null && '/tmp/tlx-codegen.xml' || '' }}
+          budget: /tmp/tlx-core.xml=90 /tmp/tlx-correctness.xml=30 /tmp/tlx-codegen.xml=30
+          gpu-unhealthy: ${{ steps.gpu_health.outcome == 'failure' }}
+          setup-script: ${{ env.SETUP_SCRIPT }}
 
   b200-torchtlx-test:
     # Temporarily disabled because the TorchTLX environment is brittle.
@@ -324,11 +138,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.ref }}
       - name: Tune Nvidia GPU
+        id: gpu_health
+        # Also a health check: a runner whose GPU stopped responding fails here instead of hanging a later step.
+        timeout-minutes: 6
         run: |
-          sudo nvidia-smi -pm 1
+          timeout 60 sudo nvidia-smi -pm 1
           sudo ldconfig
-          nvidia-smi
+          timeout 60 nvidia-smi
+          . "${SETUP_SCRIPT}"
+          timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
       - name: Create isolated TorchTLX environment
         run: |
           set -eux
@@ -396,25 +217,21 @@ jobs:
           name: b200-torchtlx-mm-perf
           path: /tmp/mm_torchtlx.json
           if-no-files-found: ignore
-      - name: Collect nightly failures (TorchTLX)
+      - name: Parse test failures (TorchTLX)
         id: parse
-        if: always() && github.event_name == 'schedule'
-        run: |
-          . "${SETUP_SCRIPT}"
-          FAILED_FLAG=""
-          if [[ "${{ steps.run_torchtlx_tests.outcome }}" != "success" || \
-                "${{ steps.run_torchtlx_perf.outcome }}" != "success" ]]; then
-            FAILED_FLAG="--failed --bucket b200-torchtlx-job-failed"
-          fi
-          python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/torchtlx.xml /tmp/torchtlx_perf.xml \
-            --workflow "${GITHUB_WORKFLOW}" \
-            --job "b200-torchtlx-test" \
-            ${FAILED_FLAG}
+        if: always()
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ env.GPU_WORKFLOW_NAME }}
+          job: b200-torchtlx-test
+          failed: ${{ steps.run_torchtlx_tests.outcome != 'success' || steps.run_torchtlx_perf.outcome != 'success' }}
+          bucket: b200-torchtlx-job-failed
+          junit: /tmp/torchtlx.xml /tmp/torchtlx_perf.xml
+          gpu-unhealthy: ${{ steps.gpu_health.outcome == 'failure' }}
+          setup-script: ${{ env.SETUP_SCRIPT }}
 
   b200-gluon-test:
-    needs: b200-build
-    if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    if: ${{ !cancelled() && github.repository_owner == 'facebookexperimental' && (fromJSON(inputs.plan).gluon.files[0] != null) }}
     runs-on: nvidia-dgx-b200
     env:
       CONDA_ENV: meta-triton
@@ -427,233 +244,102 @@ jobs:
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
     steps:
-      - name: Fail if the build job did not succeed
-        if: needs.b200-build.result != 'success'
-        run: |
-          echo "b200-build result: ${{ needs.b200-build.result }}"
-          exit 1
       - name: Checkout
         uses: actions/checkout@v3
-      - name: Tune Nvidia GPU
-        run: |
-          sudo nvidia-smi -pm 1
-          sudo ldconfig
-          nvidia-smi
-      - name: Download prebuilt Triton wheel from GitHub artifacts
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        uses: actions/download-artifact@v4
         with:
-          name: run_${{ github.run_id }}
-          path: ${{ runner.temp }}/prebuilt-wheel
-      - name: Download prebuilt Triton wheel from S3
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          WHEEL_URL: ${{ needs.b200-build.outputs.wheel_url }}
-          WHEEL_FILENAME: ${{ needs.b200-build.outputs.wheel_filename }}
+          ref: ${{ inputs.ref }}
+      - name: Tune Nvidia GPU
+        id: gpu_health
+        # Also a health check: a runner whose GPU stopped responding fails here instead of hanging a later step.
+        timeout-minutes: 6
         run: |
-          mkdir -p "${RUNNER_TEMP}/prebuilt-wheel"
-          curl --fail --location --retry 3 \
-            --output "${RUNNER_TEMP}/prebuilt-wheel/${WHEEL_FILENAME}" "${WHEEL_URL}"
-      - name: Install Triton
+          timeout 60 sudo nvidia-smi -pm 1
+          sudo ldconfig
+          timeout 60 nvidia-smi
+          . "${SETUP_SCRIPT}"
+          timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
+      - name: Install test dependencies
         run: |
           . "${SETUP_SCRIPT}"
-          uv pip install --force-reinstall --no-deps ${RUNNER_TEMP}/prebuilt-wheel/*.whl
           uv pip install pytest expecttest
-      - name: Select kernel-affected tests
-        id: select
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/select-kernel-tests
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        env:
+          # Activate the runner environment in each composite-action shell.
+          BASH_ENV: ${{ env.SETUP_SCRIPT }}
+        with:
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
       - name: Run Gluon tests (python/test/gluon)
         id: run_gluon
+        if: fromJSON(inputs.plan).gluon.files[0] != null
         timeout-minutes: 50
-        run: |
-          . "${SETUP_SCRIPT}"
-          if [ "${{ steps.select.outputs.kernel_only }}" = "true" ] && ! grep -q "^python/test/gluon/" /tmp/affected.txt; then
-            echo "kernel-only PR: no Gluon tests touch the changed kernel(s); skipping"
-            exit 0
-          fi
-          python -m pytest python/test/gluon/ --import-mode=importlib -v --junitxml=/tmp/gluon.xml
-      - name: Collect nightly failures (Gluon)
+        uses: ./.github/actions/run-selected-tests
+        with:
+          suite: ${{ toJSON(fromJSON(inputs.plan).gluon) }}
+          workers: "1"
+          junit: /tmp/gluon.xml
+          setup-script: ${{ env.SETUP_SCRIPT }}
+      - name: Parse test failures (Gluon)
         id: parse
-        if: always() && github.event_name == 'schedule'
-        run: |
-          . "${SETUP_SCRIPT}"
-          FAILED_FLAG=""
-          if [[ "${{ steps.run_gluon.outcome }}" != "success" ]]; then
-            FAILED_FLAG="--failed --bucket b200-gluon-job-failed"
-          fi
-          python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/gluon.xml \
-            --budget /tmp/gluon.xml=50 \
-            --workflow "${GITHUB_WORKFLOW}" \
-            --job "b200-gluon-test" \
-            ${FAILED_FLAG}
+        if: always()
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ env.GPU_WORKFLOW_NAME }}
+          job: b200-gluon-test
+          failed: ${{ job.status != 'success' }}
+          bucket: b200-gluon-job-failed
+          junit: /tmp/gluon.xml
+          budget: /tmp/gluon.xml=50
+          gpu-unhealthy: ${{ steps.gpu_health.outcome == 'failure' }}
+          setup-script: ${{ env.SETUP_SCRIPT }}
 
-  report-b200-tritonbench:
-    needs: b200-tritonbench-test
-    if: always() && github.event_name == 'schedule' && needs.b200-tritonbench-test.outputs.failures != '' && needs.b200-tritonbench-test.outputs.failures != '[]'
-    permissions:
-      contents: read
-      issues: write
-      actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        item: ${{ fromJSON(needs.b200-tritonbench-test.outputs.failures) }}
-    uses: ./.github/workflows/report-nightly-failure.yml
-    with:
-      issue_title: ${{ matrix.item.issue_title }}
-      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
-      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
-      job_name: ${{ matrix.item.job_name }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
-      event_name: ${{ github.event_name }}
-      run_attempt: ${{ github.run_attempt }}
-      summary: ${{ matrix.item.summary }}
-      repro: ${{ matrix.item.repro }}
-      external_dep: ${{ matrix.item.external_dep }}
-      external_dep_reason: ${{ matrix.item.external_dep_reason }}
-      platform: b200
-
-  report-b200-tlx:
+  # File and close failure issues; ci-issues.yml decides which runs file.
+  issues-b200-tlx:
     needs: b200-tlx-test
-    if: always() && github.event_name == 'schedule' && needs.b200-tlx-test.outputs.failures != '' && needs.b200-tlx-test.outputs.failures != '[]'
+    if: always()
     permissions:
       contents: read
       issues: write
       actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        item: ${{ fromJSON(needs.b200-tlx-test.outputs.failures) }}
-    uses: ./.github/workflows/report-nightly-failure.yml
+    uses: ./.github/workflows/ci-issues.yml
     with:
-      issue_title: ${{ matrix.item.issue_title }}
-      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
-      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
-      job_name: ${{ matrix.item.job_name }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
-      event_name: ${{ github.event_name }}
-      run_attempt: ${{ github.run_attempt }}
-      summary: ${{ matrix.item.summary }}
-      repro: ${{ matrix.item.repro }}
-      external_dep: ${{ matrix.item.external_dep }}
-      external_dep_reason: ${{ matrix.item.external_dep_reason }}
-      platform: b200
-
-  report-b200-torchtlx:
-    needs: b200-torchtlx-test
-    if: always() && github.event_name == 'schedule' && needs.b200-torchtlx-test.outputs.failures != '' && needs.b200-torchtlx-test.outputs.failures != '[]'
-    permissions:
-      contents: read
-      issues: write
-      actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        item: ${{ fromJSON(needs.b200-torchtlx-test.outputs.failures) }}
-    uses: ./.github/workflows/report-nightly-failure.yml
-    with:
-      issue_title: ${{ matrix.item.issue_title }}
-      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
-      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
-      job_name: ${{ matrix.item.job_name }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
-      event_name: ${{ github.event_name }}
-      run_attempt: ${{ github.run_attempt }}
-      summary: ${{ matrix.item.summary }}
-      repro: ${{ matrix.item.repro }}
-
-  report-b200-gluon:
-    needs: b200-gluon-test
-    if: always() && github.event_name == 'schedule' && needs.b200-gluon-test.outputs.failures != '' && needs.b200-gluon-test.outputs.failures != '[]'
-    permissions:
-      contents: read
-      issues: write
-      actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        item: ${{ fromJSON(needs.b200-gluon-test.outputs.failures) }}
-    uses: ./.github/workflows/report-nightly-failure.yml
-    with:
-      issue_title: ${{ matrix.item.issue_title }}
-      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
-      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
-      job_name: ${{ matrix.item.job_name }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
-      event_name: ${{ github.event_name }}
-      run_attempt: ${{ github.run_attempt }}
-      summary: ${{ matrix.item.summary }}
-      repro: ${{ matrix.item.repro }}
-      external_dep: ${{ matrix.item.external_dep }}
-      external_dep_reason: ${{ matrix.item.external_dep_reason }}
-      platform: b200
-
-  reconcile-b200-tritonbench:
-    needs: b200-tritonbench-test
-    if: always() && github.event_name == 'schedule' && (needs.b200-tritonbench-test.result == 'success' || needs.b200-tritonbench-test.result == 'failure')
-    permissions:
-      contents: read
-      issues: write
-    uses: ./.github/workflows/reconcile-nightly-issues.yml
-    with:
-      workflow_name: ${{ github.workflow }}
-      job_name: b200-tritonbench-test
-      failures: ${{ needs.b200-tritonbench-test.outputs.failures }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-  reconcile-b200-tlx:
-    needs: b200-tlx-test
-    if: always() && github.event_name == 'schedule' && (needs.b200-tlx-test.result == 'success' || needs.b200-tlx-test.result == 'failure')
-    permissions:
-      contents: read
-      issues: write
-    uses: ./.github/workflows/reconcile-nightly-issues.yml
-    with:
-      workflow_name: ${{ github.workflow }}
-      job_name: b200-tlx-test
+      workflow: Meta Triton B200 Tests
+      job: b200-tlx-test
+      result: ${{ needs.b200-tlx-test.result }}
       failures: ${{ needs.b200-tlx-test.outputs.failures }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
+      platform: b200
 
-  reconcile-b200-torchtlx:
+  issues-b200-torchtlx:
     needs: b200-torchtlx-test
-    if: always() && github.event_name == 'schedule' && (needs.b200-torchtlx-test.result == 'success' || needs.b200-torchtlx-test.result == 'failure')
+    if: always()
     permissions:
       contents: read
       issues: write
-    uses: ./.github/workflows/reconcile-nightly-issues.yml
+      actions: read
+    uses: ./.github/workflows/ci-issues.yml
     with:
-      workflow_name: ${{ github.workflow }}
-      job_name: b200-torchtlx-test
+      workflow: Meta Triton B200 Tests
+      job: b200-torchtlx-test
+      result: ${{ needs.b200-torchtlx-test.result }}
       failures: ${{ needs.b200-torchtlx-test.outputs.failures }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
+      platform: b200
 
-  reconcile-b200-gluon:
+  issues-b200-gluon:
     needs: b200-gluon-test
-    if: always() && github.event_name == 'schedule' && (needs.b200-gluon-test.result == 'success' || needs.b200-gluon-test.result == 'failure')
+    if: always()
     permissions:
       contents: read
       issues: write
-    uses: ./.github/workflows/reconcile-nightly-issues.yml
+      actions: read
+    uses: ./.github/workflows/ci-issues.yml
     with:
-      workflow_name: ${{ github.workflow }}
-      job_name: b200-gluon-test
+      workflow: Meta Triton B200 Tests
+      job: b200-gluon-test
+      result: ${{ needs.b200-gluon-test.result }}
       failures: ${{ needs.b200-gluon-test.outputs.failures }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'pull_request' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+      sha: ${{ inputs.ref }}
+      platform: b200

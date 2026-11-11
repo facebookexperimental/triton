@@ -13,11 +13,11 @@ import triton
 import triton.language as tl
 
 from triton._internal_testing import is_cuda
+from triton._C.libtriton.gsan_testing import shadow_granularity
 from triton.experimental.gsan import _stream_sync, symmetric_memory
 from triton.experimental.gsan._testing_utils import (
     shadow_cell_from_address,
     shadow_tensor_for,
-    SHADOW_GRANULARITY_BYTES,
 )
 
 pytestmark = [
@@ -271,9 +271,10 @@ def _run_multi_node_simulated_symmetric_memory_checks(rank: int, world_size: int
     hdl.barrier(channel=0)
     assert torch.all(buf == (prev + 101)).item()
 
-    outgoing_shadow_offset = rank * SHADOW_GRANULARITY_BYTES
-    incoming_shadow_offset = prev * SHADOW_GRANULARITY_BYTES
-    untouched_shadow_offset = (world_size + rank) * SHADOW_GRANULARITY_BYTES
+    outgoing_shadow_offset = rank * shadow_granularity(peer_buf.data_ptr())
+    granularity = shadow_granularity(buf.data_ptr())
+    incoming_shadow_offset = prev * granularity
+    untouched_shadow_offset = (world_size + rank) * granularity
     incoming_shadow_before = shadow_cell_from_address(buf.data_ptr() + incoming_shadow_offset,
                                                       device_index=device_index)
     untouched_shadow_before = shadow_cell_from_address(buf.data_ptr() + untouched_shadow_offset,

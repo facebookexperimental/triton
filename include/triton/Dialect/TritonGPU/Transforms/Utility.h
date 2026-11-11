@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <functional>
 #include <numeric>
+#include <optional>
+#include <string>
 #include <utility>
 
 namespace mlir {
@@ -41,15 +43,23 @@ bool haveEquivalentWarpSpecializeLoopNests(ArrayRef<scf::ForOp> lhs,
 // Version = 1: <m, n>
 // Version = 2: <1, m, n>
 // Version = 3: <m, n, k>
-SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
-                                                const ArrayRef<int64_t> &shape,
-                                                Type type, int numWarps);
+// For version 3, isLegalN (if set) picks the largest n the operands can be
+// tiled by, falling back to the unfiltered pick when there is none.
+SmallVector<unsigned, 3>
+mmaVersionToInstrShape(int version, const ArrayRef<int64_t> &shape, Type type,
+                       int numWarps,
+                       function_ref<bool(unsigned)> isLegalN = nullptr);
 
-// Gets the order of a tensor from its contiguity. Places the dimensions with
-// the largest contiguity as the inner most dimension. If the contiguity is
-// all ones, returns the order {dim - 1, dim - 2, ..., 0}
-SmallVector<unsigned, 4>
-getOrderFromContiguity(const SmallVector<int64_t> &contiguity);
+// Under TRITON_ALLOW_NPOT, whether MMAv3's warpgroups go on N: splitting an
+// NPOT M would leave a warpgroup a share that is not a multiple of 64.
+bool hasMmaV3WarpgroupsOnN(ArrayRef<int64_t> shape, int numWarps);
+
+// Why `warps` of `instrShape` can't sit on each dim's power-of-two part, as
+// the mixed-radix layout puts them, or std::nullopt.
+std::optional<std::string>
+getWarpPlacementUnsupportedReason(ArrayRef<int64_t> shape,
+                                  ArrayRef<unsigned> warps,
+                                  ArrayRef<unsigned> instrShape);
 
 // Return the operand used to access the memory in the operation
 Value getMemAccessPtr(Operation *op);
@@ -99,15 +109,6 @@ inline bool npotSafeForLinearLayout(Attribute encoding) {
     return true;
   }
   return false;
-}
-
-// Whether both layouts support modular conversion.
-inline bool npotCvtSafe(RankedTensorType srcTy, RankedTensorType dstTy) {
-  if (!hasNpotShape(srcTy) && !hasNpotShape(dstTy)) {
-    return true;
-  }
-  return npotSafeForLinearLayout(srcTy.getEncoding()) &&
-         npotSafeForLinearLayout(dstTy.getEncoding());
 }
 
 // Returns whether the op is a "view op", i.e. doesn't move any data
@@ -216,8 +217,10 @@ bool isExpensiveLocalLoad(Operation *op);
 // Return true if an operation may be cloned by layout rematerialization.
 bool canBeRematerialized(Operation *op);
 
-// Return true if the op can use the target encoding for its result.
-bool canUseResultEncoding(Operation *op, Attribute targetEncoding);
+// Return the operands whose layouts must remain fixed for the op to use the
+// target result encoding, or nullopt if the encoding is incompatible.
+std::optional<SmallVector<OpOperand *>>
+canUseResultEncoding(Operation *op, Attribute targetEncoding);
 
 // Replace ForOp with a new ForOp with extra operands. The YieldOp is not
 // updated and needs to be updated separately for the loop to be correct.
@@ -239,6 +242,9 @@ scf::WhileOp replaceWhileOpWithNewSignature(OpBuilder &rewriter,
                                             scf::WhileOp loop,
                                             ValueRange newIterOperands,
                                             TypeRange newResultTypes);
+[[nodiscard]] scf::WhileOp addIterArgsToLoop(OpBuilder &rewriter,
+                                             scf::WhileOp loop,
+                                             ValueRange newIterOperands);
 
 // Replace IfOp with a new IfOp with extra results operands. The YieldOp is not
 // updated and needs to be updated separately for the bodies to be correct.
@@ -481,10 +487,6 @@ bool comesFromLoadOrBlockArg(Value v);
 // For structured control flow ops, returns the values associated with the
 // `resultIdx`th result.
 SmallVector<Value> getTiedArgs(Operation *op, int resultIdx);
-
-// Verifies the provided memory descriptor type used for barrier allocation
-LogicalResult verifyBarrierType(Operation *op,
-                                mlir::triton::gpu::MemDescType barrierType);
 
 // Get a boolean if the Value is an arith::ConstantOp
 std::optional<bool> getBoolFromConstant(Value cst);

@@ -1,0 +1,44 @@
+{
+  "h100": [
+    "python/test/unit/language/test_tlx_warp_specialization_sm90up.py::test_async_tasks_constexpr_guard",
+    "python/test/unit/language/test_tlx_warp_specialization_sm90up.py::test_store_ws",
+    "python/test/unit/tlx_ops/test_mm_sm90.py::test_smoke_space_is_registered_and_runs",
+    "python/test/unit/tlx_ops/test_mm_sm90.py::test_out",
+    "python/test/unit/tlx_ops/test_flash_attn_varlen_sm90.py::test_flash_attn_varlen_contiguous_but_unaligned_base",
+    "python/test/unit/tlx_ops/test_flash_attn_varlen_sm90.py::test_flash_attn_varlen_traces_for_export_and_compile",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_hopper_gemm_pipelined",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_hopper_gemm_ws",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_hopper_fa_ws_pipelined_pingpong",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_hopper_fa_ws_pipelined_pingpong_bwd"
+  ],
+  "b200": [
+    "python/test/unit/language/test_tlx_warp_specialization_sm90up.py::test_async_tasks_constexpr_guard",
+    "python/test/unit/language/test_tlx_warp_specialization_sm90up.py::test_store_ws",
+    "python/test/unit/tlx_ops/test_mm_sm100.py::test_kernel_legacy_positional_launch_matches_reference",
+    "python/test/unit/tlx_ops/test_mm_sm100.py::test_npot_block_n_matches_reference",
+    "python/test/unit/tlx_ops/test_flash_attn_sm100.py::test_flash_attn_partial_last_m_block",
+    "python/test/unit/tlx_ops/test_flash_attn_sm100.py::test_flash_attn_bwd_bf16_accuracy",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_blackwell_gemm_clc",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_blackwell_gemm_pipelined",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_blackwell_gemm_2cta",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_blackwell_fa_ws",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_blackwell_fa_ws_persistent",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_blackwell_fa_clc",
+    "third_party/tlx/tutorials/testing/test_correctness_autows.py::test_autows_fa_2cta_non_causal",
+    "third_party/tlx/tutorials/testing/test_correctness_autows.py::test_autows_fa_2cta_persistent_multi_iteration"
+  ],
+  "mi350": [
+    "python/test/unit/tlx_ops/test_mm_gfx950.py::test_mm_register_fallback",
+    "python/test/unit/tlx_ops/test_mm_gfx950.py::test_mm_bf16_odd_k_production_shape",
+    "python/test/unit/tlx_ops/test_flash_attn_gfx950.py::test_flash_attn_gfx950_forward_and_backward",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_amd_gemm_warp_pipeline",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_amd_gemm_pipelined",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_amd_fa_persistent",
+    "third_party/tlx/tutorials/testing/test_correctness.py::test_amd_fa_persistent_cross_attention"
+  ],
+  "cpu": [
+    "python/test/gluon/test_frontend.py::test_reduce",
+    "python/test/unit/language/test_tlx_codegen.py::test_clc_response_type_mangle",
+    "python/test/unit/language/test_tlx_codegen.py::test_type_mangles_distinguish_unequal_types"
+  ]
+}

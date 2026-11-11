@@ -1,0 +1,52 @@
+"""Compute Sanitizer log shapes shared by the tests."""
+
+# Real compute-sanitizer output shapes, taken from CUTracer's parser fixtures
+# (python/tests/example_inputs/racecheck_*.txt in facebookexperimental/CUTracer).
+RACECHECK_HAZARD = """\
+========= COMPUTE-SANITIZER
+========= Error: Race reported between Write access at kernel_a+0x100 in kernels.py:42
+child process output may be interleaved
+=========     and Read access at kernel_a+0x200 in kernels.py:57 [3 hazards]
+=========     and Read access at kernel_a+0x240 in kernels.py:58 [5 hazards]
+=========
+========= Warning: Maximum number of hazards reached.
+=========
+========= Warning: Race reported between Read access at kernel_b+0x300 in other.py:9
+=========     and Write access at kernel_b+0x340 in other.py:12 [2 hazards]
+=========
+1 failed, 1 warning in 12.34s
+========= Target application returned an error
+========= RACECHECK SUMMARY: 7 hazards displayed (6 errors, 1 warning)
+"""
+RACECHECK_CLEAN = """\
+========= COMPUTE-SANITIZER
+7 passed in 5.01s
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
+"""
+SYNCCHECK_ERROR = """\
+========= COMPUTE-SANITIZER
+========= Barrier error detected. Missing wait.
+=========     at _attn_fwd_ws+0x1a40 in sm100.py:812
+=========
+========= ERROR SUMMARY: 1 error
+"""
+SYNCCHECK_CLEAN = "========= COMPUTE-SANITIZER\n========= ERROR SUMMARY: 0 errors\n"
+# memcheck on the B200 runner (tlx.ops flash-attention forward): Triton's
+# launcher probing cuFuncSetAttribute, which the test survives.
+MEMCHECK_API_ONLY = """\
+========= COMPUTE-SANITIZER
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuFuncSetAttribute.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: loadBinary [0x6f43] in cuda_utils.cpython-312-x86_64-linux-gnu.so
+=========
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuFuncSetAttribute.
+=========     Saved host backtrace up to driver entry point at error
+=========
+========= ERROR SUMMARY: 2 errors
+"""
+MEMCHECK_MIXED = MEMCHECK_API_ONLY.replace(
+    "========= ERROR SUMMARY: 2 errors",
+    "========= Invalid __global__ read of size 4 bytes\n"
+    "=========     at kernel+0x10 in k.py:3\n"
+    "========= ERROR SUMMARY: 3 errors",
+)

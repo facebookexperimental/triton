@@ -34,14 +34,16 @@ int64_t getDescriptorLoadBytes(Operation *op, RankedTensorType tensorType,
                                Value desc) {
   auto encoding = getEncodingFromDescriptor(op, tensorType, desc);
   auto shapePerCTA = ttg::getShapePerCTA(encoding, tensorType.getShape());
-  return product(shapePerCTA) *
-         getIntOrFloatOrPtrBitWidth(tensorType.getElementType()) / 8;
+  int64_t bytes = product(shapePerCTA) *
+                  getIntOrFloatOrPtrBitWidth(tensorType.getElementType()) / 8;
+  return isFp6Padded(encoding) ? bytes * 3 / 4 : bytes;
 }
 
 int64_t getDescriptorLoadBytes(ttg::MemDescType memDescType) {
   auto shapePerCTA = ttg::getShapePerCTA(memDescType);
-  return product(shapePerCTA) *
-         getIntOrFloatOrPtrBitWidth(memDescType.getElementType()) / 8;
+  int64_t bytes = product(shapePerCTA) *
+                  getIntOrFloatOrPtrBitWidth(memDescType.getElementType()) / 8;
+  return isFp6Padded(memDescType.getEncoding()) ? bytes * 3 / 4 : bytes;
 }
 
 Value sextI16ToI32Indices(Value indices, OpBuilder &builder, Location loc) {
@@ -80,6 +82,10 @@ FailureOr<int> getTMASwizzleMode(Location loc, tt::TensorDescInterface ty) {
                              "supports 128-byte swizzling, but got "
                           << swizzleBytes;
   }
+
+  if (isFp6Padded(encoding) && swizzleBytes != 128)
+    return emitError(loc)
+           << "fp6 padded TMA operands require 128-byte swizzling";
 
   int32_t swizzleMode = 0;
   if (swizzleBytes == 128) {
@@ -120,6 +126,8 @@ FailureOr<int> getTMAElementType(Location loc, tt::TensorDescInterface ty) {
 
   if (fp4Padded)
     return TMA_B4X16_P64;
+  if (isFp6Padded(encoding))
+    return TMA_B6X16_P32;
 
   auto elemTy = ty.getElementType();
   if (elemTy.isBF16()) {

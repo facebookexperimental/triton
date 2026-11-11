@@ -3,9 +3,19 @@
 #include <gtest/gtest.h>
 
 #include "mlir/AsmParser/AsmParser.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/PatternMatch.h"
+// Utility.h has global using-directives.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wheader-hygiene"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#pragma clang diagnostic pop
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
+#include "unittest/Tools/MixedRadixLayouts.h"
+#include "unittest/Util/ScopedAllowNpot.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Signals.h"
 
 template <typename T> static std::string stringifyLLVMType(const T &t) {
@@ -120,7 +130,6 @@ protected:
 /*static*/ MLIRContext InferLayoutTest::ctx;
 
 void testReshape(RankedTensorType srcTy, RankedTensorType dstTy,
-                 std::optional<BlockedEncodingAttr> expectedDstEnc,
                  DialectInferLayoutInterface *inferLayout,
                  bool longErrors = true) {
 
@@ -210,13 +219,8 @@ TEST_P(InferReshapeOpEncodingTest, DoIt) {
   if (!dst)
     FAIL() << "Could not parse destination type: " << dstTyStr;
 
-  std::optional<BlockedEncodingAttr> expectedDstEnc;
-  if (auto dstEnc = cast<RankedTensorType>(dst).getEncoding()) {
-    expectedDstEnc = cast<BlockedEncodingAttr>(dstEnc);
-  }
-
   testReshape(cast<RankedTensorType>(src), cast<RankedTensorType>(dst),
-              expectedDstEnc, inferLayout, /*longErrors=*/true);
+              inferLayout, /*longErrors=*/true);
 }
 
 // A testcase of {a, b, c} means:
@@ -290,7 +294,7 @@ INSTANTIATE_TEST_SUITE_P(
          R"(T<16x2xf32, #B<{spt=[1,2], tpw=[32,1], wpc=[2,1], ord=[1,0]}>>)"},
 
         {R"(T<2x1x2xf32, #B<{spt=[2,1,1], tpw=[2,1,2], wpc=[4,1,8], ord=[2,1,0]}>>)",
-         R"(T<2x2xf32,   #B<{spt=[2,1],   tpw=[2,2],   wpc=[4,8],   ord=[1,0]}>>)"},
+         R"(T<2x2xf32, #ttg.slice<{dim = 1, parent = #B<{spt=[2,1,1], tpw=[2,1,2], wpc=[4,1,8], ord=[2,1,0]}>}>>)"},
     })));
 
 class Fp4ToFpOpTest : public ::testing::Test {
@@ -565,6 +569,290 @@ TEST_F(LinearEncodingTest, DistributedEncodingToLinearEncoding) {
         }
       }
     }
+  }
+}
+
+// Evaluates the integer ops applyLinearLayout emits; block argument i is
+// args[i].
+static uint32_t evalLowered(Value v, ArrayRef<uint32_t> args) {
+  if (auto arg = dyn_cast<BlockArgument>(v))
+    return args[arg.getArgNumber()];
+  Operation *op = v.getDefiningOp();
+  if (auto constant = dyn_cast<LLVM::ConstantOp>(op))
+    return cast<IntegerAttr>(constant.getValue()).getInt();
+  if (auto select = dyn_cast<LLVM::SelectOp>(op))
+    return evalLowered(select.getCondition(), args)
+               ? evalLowered(select.getTrueValue(), args)
+               : evalLowered(select.getFalseValue(), args);
+  uint32_t x = evalLowered(op->getOperand(0), args);
+  uint32_t y = evalLowered(op->getOperand(1), args);
+  return llvm::TypeSwitch<Operation *, uint32_t>(op)
+      .Case([&](LLVM::ICmpOp cmp) {
+        EXPECT_EQ(cmp.getPredicate(), LLVM::ICmpPredicate::eq);
+        return uint32_t(x == y);
+      })
+      .Case([&](LLVM::AndOp) { return x & y; })
+      .Case([&](LLVM::OrOp) { return x | y; })
+      .Case([&](LLVM::XOrOp) { return x ^ y; })
+      .Case([&](LLVM::ShlOp) { return x << y; })
+      .Case([&](LLVM::LShrOp) { return x >> y; })
+      .Case([&](LLVM::UDivOp) { return x / y; })
+      .Case([&](LLVM::URemOp) { return x % y; })
+      .Case([&](LLVM::AddOp) { return x + y; })
+      .Case([&](LLVM::MulOp) { return x * y; })
+      .Default([&](Operation *) {
+        ADD_FAILURE() << "unexpected " << op->getName().getStringRef().str();
+        return 0u;
+      });
+}
+
+// The lowered apply() matches the host apply() on every input. In the
+// mixed-radix layout dim0 = 12 and the radix-3 digit adds 2 to the odd part, so
+// the sum wraps; the radix-2 control takes the shift-concatenated path.
+TEST_F(LinearEncodingTest, LoweredApplyMatchesHostOnMixedRadix) {
+  ctx.getOrLoadDialect<LLVM::LLVMDialect>();
+  auto s = [&](StringRef name) { return StringAttr::get(&ctx, name); };
+  auto reg = s("register"), lane = s("lane");
+  LinearLayout::BasesT bases;
+  bases[reg] = {{0, 0}, {1, 0}};
+  bases[lane] = {{2, 0}, {0, 1}};
+  LinearLayout::RadicesT radices;
+  radices[reg] = {3, 2};
+  radices[lane] = {2, 2};
+  SmallVector<std::pair<StringAttr, int32_t>> outDims = {{s("dim0"), 4},
+                                                         {s("dim1"), 2}};
+  LinearLayout mixed(bases, radices, outDims, /*requireSurjective=*/true);
+  LinearLayout radix2(bases, outDims, /*requireSurjective=*/true);
+  bases[reg][0] = {8, 0};
+  outDims[0].second = 12;
+  LinearLayout mixedRadix(bases, radices, outDims, /*requireSurjective=*/true);
+  Location loc = UnknownLoc::get(&ctx);
+  Type i32 = IntegerType::get(&ctx, 32);
+  for (const LinearLayout &layout : {mixed, mixedRadix, radix2}) {
+    OwningOpRef<ModuleOp> module = ModuleOp::create(loc);
+    IRRewriter rewriter(&ctx);
+    rewriter.setInsertionPointToStart(module->getBody());
+    auto fn = LLVM::LLVMFuncOp::create(
+        rewriter, loc, "apply", LLVM::LLVMFunctionType::get(i32, {i32, i32}));
+    Block *entry = fn.addEntryBlock(rewriter);
+    rewriter.setInsertionPointToStart(entry);
+    auto lowered = applyLinearLayout(
+        loc, rewriter, layout,
+        {{reg, entry->getArgument(0)}, {lane, entry->getArgument(1)}});
+    for (uint32_t r = 0; r < layout.getInDimSize(reg); ++r) {
+      for (uint32_t l = 0; l < 4; ++l) {
+        auto expected = layout.apply({{reg, r}, {lane, l}});
+        for (auto [got, want] : llvm::zip_equal(lowered, expected))
+          EXPECT_EQ(evalLowered(got.second, {r, l}), want.second)
+              << "register " << r << " lane " << l << layout;
+      }
+    }
+  }
+}
+
+// The padding table P(off) = off + 4 * (off / 64) is affine in its digits,
+// so it lowers to one mul per table digit next to the binary digits' selects.
+TEST_F(LinearEncodingTest, LoweredApplyAddsAffineTable) {
+  ctx.getOrLoadDialect<LLVM::LLVMDialect>();
+  auto off = StringAttr::get(&ctx, "offset");
+  LinearLayout::BasesT bases;
+  LinearLayout::RadicesT radices;
+  llvm::MapVector<StringAttr, SmallVector<std::pair<StringAttr, int32_t>>>
+      digits;
+  llvm::MapVector<StringAttr, std::vector<int32_t>> offsets;
+  for (int32_t i = 0; i < 13; ++i) {
+    bases[off].push_back({i < 6 ? 1 << i : 0});
+    radices[off].push_back(2);
+    if (i >= 6)
+      digits[off].push_back({off, i});
+  }
+  for (int32_t hi = 0; hi < 128; ++hi)
+    offsets[off].push_back(68 * hi);
+  LinearLayout padded(bases, radices, {{off, 8704}}, digits, offsets,
+                      /*requireSurjective=*/false);
+  Location loc = UnknownLoc::get(&ctx);
+  Type i32 = IntegerType::get(&ctx, 32);
+  OwningOpRef<ModuleOp> module = ModuleOp::create(loc);
+  IRRewriter rewriter(&ctx);
+  rewriter.setInsertionPointToStart(module->getBody());
+  auto fn = LLVM::LLVMFuncOp::create(rewriter, loc, "apply",
+                                     LLVM::LLVMFunctionType::get(i32, {i32}));
+  Block *entry = fn.addEntryBlock(rewriter);
+  rewriter.setInsertionPointToStart(entry);
+  auto lowered =
+      applyLinearLayout(loc, rewriter, padded, {{off, entry->getArgument(0)}});
+  for (uint32_t x = 0; x < 8192; ++x)
+    EXPECT_EQ(evalLowered(lowered[0].second, {x}), x + 4 * (x / 64));
+  int32_t selects = 0, muls = 0;
+  fn.walk([&](Operation *op) {
+    selects += isa<LLVM::SelectOp>(op);
+    muls += isa<LLVM::MulOp>(op);
+  });
+  EXPECT_EQ(selects, 6);
+  EXPECT_EQ(muls, 7);
+}
+
+// Register counts multiply digit radices, and a run ends at the odd digit.
+TEST_F(LinearEncodingTest, MixedRadixCountsUseRadices) {
+  auto s = [&](StringRef name) { return StringAttr::get(&ctx, name); };
+  LinearLayout::BasesT bases;
+  bases[s("register")] = {{1, 0}, {2, 0}};
+  bases[s("lane")] = {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}};
+  bases[s("warp")] = {{0, 32}};
+  bases[s("block")] = {};
+  LinearLayout::RadicesT radices;
+  radices[s("register")] = {2, 3};
+  radices[s("lane")] = {2, 2, 2, 2, 2};
+  radices[s("warp")] = {2};
+  radices[s("block")] = {};
+  LinearLayout layout(bases, radices, {{s("dim0"), 6}, {s("dim1"), 64}},
+                      /*requireSurjective=*/true);
+  auto linear = LinearEncodingAttr::get(&ctx, layout);
+  EXPECT_EQ(linear.getContigPerThread(), SmallVector<unsigned>({2, 1}));
+  // The interface getSizePerThread() asserts in getCGALayout on a mixed-radix
+  // layout.
+  EXPECT_EQ(LinearEncodingTrait::getSizePerThread(layout, {1, 1}),
+            SmallVector<unsigned>({6, 1}));
+  auto pow2 = LinearLayout::identity1D(4, s("register"), s("dim0")) *
+              LinearLayout::identity1D(32, s("lane"), s("dim1")) *
+              LinearLayout::identity1D(2, s("warp"), s("dim0"));
+  EXPECT_EQ(LinearEncodingTrait::getSizePerThread(pow2, {1, 1}),
+            SmallVector<unsigned>({4, 1}));
+}
+
+// A 3x32 -> 96 reshape keeps every register only as the regrouped source.
+TEST_F(LinearEncodingTest, NpotReshapeKeepsRegisters) {
+  auto S = [&](StringRef name) { return StringAttr::get(&ctx, name); };
+  auto withWarpBlock = [&](LinearLayout ll) {
+    return ll * LinearLayout::identity1D(1, S("warp"), S("dim0")) *
+           LinearLayout::identity1D(1, S("block"), S("dim0"));
+  };
+  auto linear = [&](LinearLayout ll) {
+    return LinearEncodingAttr::get(&ctx, withWarpBlock(std::move(ll)));
+  };
+  auto flatLayout = [&](std::vector<std::vector<int32_t>> regBases,
+                        std::vector<int32_t> regRadices,
+                        std::vector<std::vector<int32_t>> laneBases) {
+    int32_t size = 32;
+    for (int32_t radix : regRadices)
+      size *= radix;
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regBases);
+    bases[S("lane")] = std::move(laneBases);
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    radices[S("lane")] = {2, 2, 2, 2, 2};
+    return linear(LinearLayout(std::move(bases), std::move(radices),
+                               {{S("dim0"), size}},
+                               /*requireSurjective=*/true));
+  };
+  auto *inferLayout =
+      ctx.getOrLoadDialect<TritonGPUDialect>()
+          ->getRegisteredInterface<DialectInferLayoutInterface>();
+  Attribute src = linear(exactIdentity1D(3, S("register"), S("dim0")) *
+                         LinearLayout::identity1D(32, S("lane"), S("dim1")));
+  Attribute inferred;
+  ASSERT_TRUE(succeeded(inferLayout->inferReshapeOpEncoding(
+      {3, 32}, src, {96}, inferred, /*allowReorder=*/false, std::nullopt)));
+  Attribute flat = flatLayout({{32}}, {3}, {{1}, {2}, {4}, {8}, {16}});
+  EXPECT_EQ(inferred, flat);
+  EXPECT_FALSE(isExpensiveView({3, 32}, src, {96}, flat));
+  // Same counts and masks, lanes swapped: cheap for pow2, not for NPOT.
+  Attribute swapped = flatLayout({{32}}, {3}, {{2}, {1}, {4}, {8}, {16}});
+  EXPECT_TRUE(isExpensiveView({3, 32}, src, {96}, swapped));
+  Attribute pow2 =
+      linear(LinearLayout::identity1D(4, S("register"), S("dim0")) *
+             LinearLayout::identity1D(32, S("lane"), S("dim1")));
+  EXPECT_FALSE(isExpensiveView(
+      {4, 32}, pow2, {128},
+      flatLayout({{32}, {64}}, {2, 2}, {{2}, {1}, {4}, {8}, {16}})));
+  // A regroup wins over a given result; 3x32 -> 32x3 has none, so a given
+  // result is kept and inference without one fails.
+  Attribute given = swapped;
+  ASSERT_TRUE(succeeded(inferLayout->inferReshapeOpEncoding(
+      {3, 32}, src, {96}, given, /*allowReorder=*/false, std::nullopt)));
+  EXPECT_EQ(given, flat);
+  LinearLayout::BasesT bases;
+  bases[S("register")] = {{0, 1}};
+  bases[S("lane")] = {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {3};
+  radices[S("lane")] = {2, 2, 2, 2, 2};
+  Attribute moved = linear(LinearLayout(std::move(bases), std::move(radices),
+                                        {{S("dim0"), 32}, {S("dim1"), 3}},
+                                        /*requireSurjective=*/true));
+  given = moved;
+  ASSERT_TRUE(succeeded(inferLayout->inferReshapeOpEncoding(
+      {3, 32}, src, {32, 3}, given, /*allowReorder=*/false, std::nullopt)));
+  EXPECT_EQ(given, moved);
+  std::string error;
+  ScopedDiagnosticHandler handler(
+      &ctx, [&](Diagnostic &diag) { error = diag.str(); });
+  Attribute none;
+  EXPECT_TRUE(failed(inferLayout->inferReshapeOpEncoding(
+      {3, 32}, src, {32, 3}, none, /*allowReorder=*/false,
+      UnknownLoc::get(&ctx))));
+  EXPECT_EQ(error, "inferring a result layout for an NPOT reshape that "
+                   "moves elements between threads is not yet supported");
+}
+
+// Each NPOT dim, in dim order, adds one odd register digit to the blocked
+// default of the power-of-two parts.
+TEST_F(LinearEncodingTest, MixedRadixEncoding) {
+  auto S = [&](StringRef name) { return StringAttr::get(&ctx, name); };
+  ScopedAllowNpot npot;
+  auto mixedRadix = getMixedRadixEncoding(&ctx, {3, 96}, /*numWarps=*/4,
+                                          /*threadsPerWarp=*/32, /*numCTAs=*/1);
+  ASSERT_TRUE(succeeded(mixedRadix));
+  LinearLayout::BasesT bases;
+  bases[S("register")] = {{1, 0}, {0, 32}};
+  bases[S("lane")] = {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}};
+  bases[S("warp")] = {{0, 0}, {0, 0}};
+  bases[S("block")] = {};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {3, 3};
+  radices[S("lane")] = {2, 2, 2, 2, 2};
+  radices[S("warp")] = {2, 2};
+  radices[S("block")] = {};
+  EXPECT_EQ(mixedRadix->getLinearLayout(),
+            LinearLayout(bases, radices, {{S("dim0"), 3}, {S("dim1"), 96}},
+                         /*requireSurjective=*/false));
+  // Control: a power-of-two shape keeps the blocked default.
+  EXPECT_TRUE(failed(getMixedRadixEncoding(&ctx, {4, 32}, 4, 32, 1)));
+  // The verifier rejects a mixed-radix layout across CTAs.
+  EXPECT_TRUE(failed(getMixedRadixEncoding(&ctx, {3, 96}, 4, 32, 2)));
+  ScopedAllowNpot unset(nullptr);
+  EXPECT_TRUE(failed(getMixedRadixEncoding(&ctx, {3, 96}, 4, 32, 1)));
+}
+
+// The pad pass compares the widest vector first: `request` is the padded
+// side's f32 vector, kept only if the mixed-radix layout needs no more
+// registers. On a tie it compares the total in-dim size (registers x lanes x
+// warps) of both sides.
+TEST_F(LinearEncodingTest, MixedRadixTotalInDimSize) {
+  ScopedAllowNpot npot;
+  struct Case {
+    SmallVector<int64_t> shape;
+    int numWarps;
+    unsigned request, vector;
+    int32_t exact, padded;
+  };
+  for (const Case &c :
+       {Case{{384}, 1, 4, 4, 384, 512}, Case{{96}, 1, 4, 1, 96, 128}}) {
+    auto pow2 = llvm::map_to_vector(c.shape, [](int64_t size) {
+      return static_cast<int64_t>(llvm::PowerOf2Ceil(size));
+    });
+    unsigned vector =
+        getMixedRadixVector(&ctx, c.shape, c.request, {}, c.numWarps, 32);
+    EXPECT_EQ(vector, c.vector);
+    auto mixedRadix =
+        getMixedRadixEncoding(&ctx, c.shape, c.numWarps, 32, 1, vector);
+    ASSERT_TRUE(succeeded(mixedRadix));
+    EXPECT_EQ(mixedRadix->getLinearLayout().getTotalInDimSize(), c.exact);
+    EXPECT_EQ(getDefaultBlockedEncoding(&ctx, pow2, c.numWarps, 32, 1)
+                  .toLinearLayout(pow2)
+                  .getTotalInDimSize(),
+              c.padded);
   }
 }
 } // namespace

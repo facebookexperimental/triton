@@ -55,6 +55,11 @@ LinearLayout toLinearLayout(TensorOrMemDesc type);
 // with the allocShape as the shape, otherwise the layout will be incorrect!
 LinearLayout toLinearLayout(ArrayRef<int64_t> shape, Attribute layout);
 
+// Under TRITON_ALLOW_NPOT, `shape` with every NPOT extent rounded up to a power
+// of two; NPOT layouts are built on this pow2 alloc shape. Without the flag,
+// `shape`.
+SmallVector<int64_t> getNpotPow2AllocShape(ArrayRef<int64_t> shape);
+
 // Returns true if the layouts differ only in the order of their register
 // basis vectors. Reordering those vectors changes the order of values within a
 // thread, but not the set of tensor elements owned by each lane/warp/block.
@@ -146,6 +151,9 @@ LinearLayout chooseScaledMfmaScaleLayout(MLIRContext *ctx, int dotOperandIdx,
                                          ArrayRef<unsigned> tilesPerWarp,
                                          ArrayRef<unsigned> warpsPerCTA);
 
+// Create LinearLayout for scale in scaled wmma. `ctaLayout` and `cgaLayout`
+// describe the dot operand itself, i.e. they are given in the operand's
+// dimension order (will be transposed for scale b)
 LinearLayout chooseScaledWmmaScaleLayout(
     MLIRContext *ctx, int dotOperandIdx, ArrayRef<int64_t> dotOperandShape,
     unsigned wmmaMDim, unsigned wmmaNDim, bool isTransposed,

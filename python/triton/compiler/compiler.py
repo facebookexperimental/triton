@@ -15,6 +15,7 @@ from .. import __version__, knobs
 from .._C.libtriton import get_cache_invalidating_env_vars, ir
 from ..backends import backends
 from ..backends.compiler import BaseBackend, GPUTarget, Language
+from ..magnon.flags import apply_enabled as _compile_iq_apply_enabled, collect_enabled as _compile_iq_collect_enabled
 from ..runtime.autotuner import OutOfResources
 from ..runtime.cache import (
     get_cache_key,
@@ -46,7 +47,7 @@ arg_type_pattern = {
 
 
 def _target_supports_triton_dispatcher(target) -> bool:
-    return getattr(target, "backend", None) == "cuda"
+    return getattr(target, "backend", None) in ("cuda", "hip")
 
 
 def convert_type_repr(x):
@@ -84,7 +85,10 @@ class ASTSource:
     def hash(self):
         sorted_sig = [v for k, v in sorted(self.signature.items())]
         get_key = lambda x: x.cache_key if hasattr(x, 'cache_key') else str(x)
-        constants_key = '-'.join([get_key(v) for k, v in sorted(self.constants.items())])
+        # Optional constexprs can have the same values at different argument
+        # positions. Include their paths so omitted defaults cannot alias a
+        # different specialization in the cache.
+        constants_key = repr([(k, get_key(v)) for k, v in sorted(self.constants.items())])
         key = f"{self.fn.cache_key}-{str(self.attrs)}-{sorted_sig}-{constants_key}"
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
@@ -106,7 +110,7 @@ class IRSource:
         self.path = path
         path = Path(path)
         self.ext = path.suffix[1:]
-        self.language = Language.TRITON
+        self.language = Language.GLUON if self.ext == "glir" else Language.TRITON
         self.src = path.read_text(encoding="utf-8")
         ir.load_dialects(context)
         backend.load_dialects(context)
@@ -128,14 +132,14 @@ class IRSource:
             self.signature = {k: ty for k, ty in enumerate(func_ty)}
 
     def hash(self):
-        return hashlib.sha256(self.src.encode("utf-8")).hexdigest()
+        return hashlib.sha256(f"{self.ext}-{self.src}".encode("utf-8")).hexdigest()
 
     def make_ir(self, target: GPUTarget, options, codegen_fns, module_map, context):
         self.module.context = context
         return self.module
 
     def parse_options(self):
-        if self.ext == "ttgir":
+        if self.ext in ("glir", "ttgir"):
             num_warps = self.module.get_int_attr("ttg.num-warps")
             assert num_warps is not None, "Unable to parse ttg.num-warps attribute"
             options = {'num_warps': num_warps}
@@ -156,7 +160,7 @@ def max_shared_mem(device):
 
 
 def parse(full_name, ext, context):
-    if ext == "ttir" or ext == "ttgir" or ext == "ttcir" or ext == "tttcir":
+    if ext == "ttir" or ext == "glir" or ext == "ttgir" or ext == "ttcir" or ext == "tttcir":
         module = ir.parse_mlir_module(full_name, context)
         module.context = context
         return module
@@ -481,7 +485,7 @@ def _maybe_apply_compile_iq(compiled_kernel):
 
     NO-ACF SASS in compilation cache is never overwritten
     """
-    if not os.environ.get("TRITON_COMPILE_IQ_APPLY"):
+    if not _compile_iq_apply_enabled():
         return compiled_kernel
     try:
         backend = make_backend(compiled_kernel.metadata.target)
@@ -609,9 +613,9 @@ class CompiledKernel:
             # Used by external runtimes such as NativeRT.
             self.asm["launcher.so"] = run.launcher_bytes
         self._run = run
-        # compile_iq: dump a collection task on the first launch through `run`. Gated by
-        # TRITON_COMPILE_IQ_COLLECT; reaches kernels that bypass the JITFunction.run hook.
-        if os.environ.get("TRITON_COMPILE_IQ_COLLECT"):
+        # compile_iq: collect a task / resolve a pending ACF on the first launch through `run`. Gated
+        # by TRITON_COMPILE_IQ_COLLECT / _APPLY; reaches kernels that bypass the JITFunction.run hooks.
+        if _compile_iq_collect_enabled() or _compile_iq_apply_enabled():
             from triton.magnon.collector import wrap_launcher
             self._run = wrap_launcher(self, run)
         # not enough shared memory to run the kernel
@@ -632,7 +636,7 @@ class CompiledKernel:
         self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = utils.load_binary(
             self.name, self.kernel, self.metadata.shared, device)
         self._module_pid = os.getpid()
-        warp_size = active_driver.get_current_target().warp_size
+        warp_size = self.metadata.warp_size
         if self.metadata.num_warps * warp_size > self.n_max_threads:
             raise_(OutOfResources(self.metadata.num_warps * warp_size, self.n_max_threads, "threads"))
         if knobs.runtime.kernel_load_end_hook is not None:
@@ -648,10 +652,13 @@ class CompiledKernel:
         self._dispatcher = None
         self._dispatch_arg_indices = None
         self._num_kernel_args = None
-        if (knobs.nvidia.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
+        if (knobs.runtime.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
                 and "launch_metadata" in self.asm):
             try:
-                from triton.backends.nvidia.triton_dispatcher_factory import make_triton_dispatcher
+                if self.metadata.target.backend == "hip":
+                    from triton.backends.amd.triton_dispatcher_factory import make_triton_dispatcher
+                else:
+                    from triton.backends.nvidia.triton_dispatcher_factory import make_triton_dispatcher
                 schema = json.loads(self.asm["launch_metadata"])
                 # Build both values before assigning to self so that a failure
                 # in either step leaves both attributes as None (atomic assignment).
@@ -755,8 +762,34 @@ class CompiledKernel:
     def __getitem__(self, grid):
         self._init_handles()
 
+        if self.metadata.target.backend == "hip":
+            grid_tuple = tuple(grid) + (1, ) * (3 - len(grid))
+
+            def runner(*args, stream=None):
+                if stream is None:
+                    device = driver.active.get_current_device()
+                    stream = driver.active.get_current_stream(device)
+                dispatcher = self._dispatcher
+                if (knobs.runtime.use_triton_dispatcher and dispatcher is not None
+                        and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook
+                        and len(args) == len(self.src.signature)):
+                    dispatcher(*grid_tuple, stream, *(args[index] for index in self._dispatch_arg_indices))
+                else:
+                    launch_metadata = self.launch_metadata(grid_tuple, stream, *args)
+                    self.run(*grid_tuple, stream, self.function, self.packed_metadata, launch_metadata,
+                             knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *args)
+
+            if knobs.runtime.use_triton_dispatcher and self._dispatcher is None:
+                warnings.warn(
+                    f"[Triton] TRITON_USE_C_DISPATCHER=1 but CompiledKernel '{self.name}' has no C dispatcher, "
+                    f"falling back to Python runner",
+                    stacklevel=2,
+                )
+            return runner
+
         dispatcher = getattr(self, '_dispatcher', None)
-        if dispatcher is not None and not callable(grid):
+        if (knobs.runtime.use_triton_dispatcher and dispatcher is not None and not callable(grid)
+                and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook):
             # Try to create a _TritonJITRunner for maximum speed
             try:
                 from triton.backends.nvidia.triton_dispatcher_factory import _load_module
@@ -806,7 +839,7 @@ class CompiledKernel:
             self.run(grid[0], grid[1], grid[2], stream, self.function, self.packed_metadata, launch_metadata,
                      knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *args)
 
-        if (knobs.nvidia.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
+        if (knobs.runtime.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
                 and dispatcher is None):
             warnings.warn(
                 f"[Triton] TRITON_USE_C_DISPATCHER=1 but CompiledKernel '{self.name}' has no C dispatcher, "
