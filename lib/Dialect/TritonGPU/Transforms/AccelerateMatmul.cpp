@@ -2,6 +2,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Value.h"
@@ -381,7 +382,28 @@ static Value createTmemScaleOperand(Value tensor, Attribute tmemEncoding,
                        getNpotPow2AllocShape(tensorType.getShape()));
   auto tmemLayout = nvidia_gpu::getDefaultLayoutForTmemLdSt(tmemType, numWarps);
   auto stagedType = tensorType.cloneWithEncoding(tmemLayout);
-  Value converted = ConvertLayoutOp::create(rewriter, loc, stagedType, tensor);
+  // An NPOT MN load can't take a 4-scale vector without extra registers, so
+  // it loads 1 byte and misses cp.async; load it in the TMEM row word layout.
+  Value converted, src = tensor;
+  if (auto cvt = tensor.getDefiningOp<ConvertLayoutOp>();
+      cvt && cvt->hasOneUse())
+    src = cvt.getSrc();
+  auto load = src.getDefiningOp<LoadOp>();
+  if (load && load->hasOneUse() &&
+      !llvm::isPowerOf2_64(tensorType.getShape()[0])) {
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPoint(load);
+    IRMapping map;
+    for (Value v : load->getOperands())
+      if (auto ty = dyn_cast<RankedTensorType>(v.getType()))
+        map.map(v,
+                ConvertLayoutOp::create(rewriter, load.getLoc(),
+                                        ty.cloneWithEncoding(tmemLayout), v));
+    converted = rewriter.clone(*load, map)->getResult(0);
+    converted.setType(stagedType);
+  } else {
+    converted = ConvertLayoutOp::create(rewriter, loc, stagedType, tensor);
+  }
   return triton::nvidia_gpu::TMEMAllocOp::create(rewriter, loc, tmemType,
                                                  /*token=*/Type(), converted);
 }
