@@ -454,6 +454,38 @@ getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout) {
   return std::string("NPOT async copy is not yet supported without a target");
 }
 
+bool npotStoreTakesPredicatedVector(Operation *op) {
+  auto store = dyn_cast<StoreOp>(op);
+  if (!store)
+    return false;
+  SmallVector<Value> work{store.getValue()};
+  DenseSet<Value> seen;
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    // A value forwarded along control flow comes from what is forwarded.
+    auto arg = dyn_cast<BlockArgument>(v);
+    Operation *def = arg ? arg.getOwner()->getParentOp() : v.getDefiningOp();
+    if (auto branch = dyn_cast_or_null<RegionBranchOpInterface>(def)) {
+      RegionBranchInverseSuccessorMapping forwarded;
+      branch.getSuccessorInputOperandMapping(forwarded);
+      for (OpOperand *operand : forwarded.lookup(v))
+        work.push_back(operand->get());
+      continue;
+    }
+    if (!def || arg)
+      continue;
+    if (isa<LoadOp>(def))
+      return false;
+    if (def->hasTrait<OpTrait::Elementwise>() ||
+        def->hasTrait<OpTrait::SameOperandsAndResultShape>() ||
+        def->hasTrait<OpTrait::SameOperandsAndResultType>())
+      llvm::append_range(work, def->getOperands());
+  }
+  return true;
+}
+
 std::optional<std::string>
 getNpotDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
                                    StringRef target) {

@@ -259,6 +259,8 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
   // A load or store takes numel / vector accesses (bytes / vector bytes):
   // exact at its NPOT numel and vector, padded at the pow2 numel and the vector
   // AxisInfo proves for its padded pointer along the dim Coalesce vectorizes.
+  // A store predicates off duplicate threads, so Coalesce gives it the vector
+  // by the predicated rule.
   std::optional<ModuleAxisInfoAnalysis> axisInfo;
   auto vectorAccesses =
       [&](Operation *op) -> std::optional<std::pair<int64_t, int64_t>> {
@@ -279,7 +281,8 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
     unsigned vector =
         getAxisInfoVector(info, type, type.getShape(), order[0], threads);
     unsigned exactVector = gpu::getMixedRadixVector(
-        ctx, type.getShape(), vector, order, numWarps, threadsPerWarp);
+        ctx, type.getShape(), vector, order, numWarps, threadsPerWarp,
+        npotStoreTakesPredicatedVector(op));
     return std::make_pair(
         llvm::divideCeil(type.getNumElements(), exactVector),
         llvm::divideCeil(padded(type).getNumElements(), pow2Vector));
