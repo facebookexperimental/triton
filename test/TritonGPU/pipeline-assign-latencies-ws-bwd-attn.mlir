@@ -103,12 +103,12 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %65 = ttng.tc_gen5_mma %result_18, %39, %result_5[%arg49], %arg45, %true : !ttg.memdesc<128x128xbf16, #tmem1, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %66 = ttg.local_alloc %64 : (tensor<128x128xbf16, #blocked>) -> !ttg.memdesc<128x128xbf16, #shared2, #smem>
       %67 = ttg.memdesc_trans %66 {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared2, #smem> -> !ttg.memdesc<128x128xbf16, #shared, #smem>
-      // dq MMA is not assigned a latency because its inputs aren't pipelineable
-      // and the output is a tmem_load
-      // CHECK: ttng.tc_gen5_mma
-      // CHECK-NOT: tt.self_latency
-      // CHECK-SAME: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-      %68 = ttng.tc_gen5_mma %67, %19, %result_7[%arg50], %false, %true : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      // dq's result is transferred to another AutoWS partition. The opndD
+      // channel owns completion and accumulator reuse, so a private
+      // self-latency pipeline would be redundant even though the generic MMA
+      // pipelining heuristic declines this op.
+      // CHECK: ttng.tc_gen5_mma {{.*}}tt.self_latency = 0 : i32
+      %68 = ttng.tc_gen5_mma %67, %19, %result_7[%arg50], %false, %true {tt.autows = "{\22channels\22: [\22opndD,tmem,1,5\22]}"} : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %result_19, %token_20 = ttng.tmem_load %result_7[%68] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
       %69 = arith.mulf %result_19, %cst : tensor<128x128xf32, #blocked>
       %70 = ttg.convert_layout %69 : tensor<128x128xf32, #blocked> -> tensor<128x128xf32, #blocked1>

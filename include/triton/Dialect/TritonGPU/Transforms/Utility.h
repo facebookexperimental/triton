@@ -103,6 +103,24 @@ inline bool npotCvtSafe(RankedTensorType srcTy, RankedTensorType dstTy) {
 // Returns whether the op is a "view op", i.e. doesn't move any data
 bool isView(Operation *op);
 
+// Returns whether `op` reinterprets a memdesc without changing the underlying
+// allocation, i.e. carries MemDescViewTrait. Using the trait rather than an
+// `isa<>` list keeps the answer from drifting as view ops are added.
+// `ttng.map_to_remote_buffer` also carries the trait but names another CTA's
+// copy of the buffer, so it is excluded: a walker asking "which allocation is
+// this" must not cross a CTA boundary.
+bool isMemDescView(Operation *op);
+
+// Walks `v` back through memdesc view ops to the value they ultimately view.
+// Different slots and views of one multi-buffered allocation share a root.
+Value getMemDescRoot(Value v);
+
+// Returns the nearest `ttg.memdesc_index` selecting `v`'s buffer, looking
+// through the other view ops. Null when `v` is not a view into a buffer array.
+// Unlike getMemDescRoot this stops at the index instead of crossing it, because
+// callers use it to recover the buffer array itself (e.g. its depth).
+triton::gpu::MemDescIndexOp getMemDescBufferIndex(Value v);
+
 // Returns whether the op is a "noop op", i.e. has one input and one output
 // and lowers to llvm as the identity function (returns the input)
 bool isNoop(Operation *op);
