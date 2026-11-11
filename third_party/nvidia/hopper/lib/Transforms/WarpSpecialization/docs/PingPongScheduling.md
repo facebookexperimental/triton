@@ -25,7 +25,7 @@ Identification is architecture-dependent (`CriticalRegionManager::isExpensiveOp`
 | Architecture | Expensive Ops | Rationale |
 |-------------|--------------|-----------|
 | Hopper (SM90) | `WarpGroupDotOp` (wgmma) | Shared tensor core resources |
-| Blackwell (SM100) | `math::ExpOp`, `math::Exp2Op` (rank > 1 tensors only) | SFU bottleneck for large tensors |
+| Blackwell (SM100) | `math::{Exp,Exp2,Sin,Cos,Tanh,Sqrt,Rsqrt}Op`, pure `tt.elementwise_inline_asm` containing an SFU `.approx` mnemonic (`sin`/`cos`/`ex2`/`lg2`/`tanh`/`rcp`/`rsqrt`/`sqrt`/`div`) and no barrier/memory/control/collective ops (rank > 1 tensors only) | SFU bottleneck for large tensors |
 
 Expensive ops are further classified as:
 - **NonReorderable** (e.g., `WarpGroupDotOp`): has memory effects, so the
@@ -33,8 +33,9 @@ Expensive ops are further classified as:
   SMEM-operand read) marks the op's own boundary; it must **not** be treated as
   an intervening memory effect when deciding whether two expensive ops can be
   grouped (see Step 1), otherwise consecutive WGMMAs never group.
-- **PureArithmetic** (e.g., `math::ExpOp`): memory-effect-free, so the
-  boundary extends forward to the next op with memory effects.
+- **PureArithmetic** (e.g., `math::ExpOp`, pure SFU `.approx` inline
+  asm): memory-effect-free, so the boundary extends forward to the next op
+  with memory effects.
 
 ## Named Barrier Allocation
 
