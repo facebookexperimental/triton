@@ -10,8 +10,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %src: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
       %i: i32) {
     %tok = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-    // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
-    ttng.async_tma_store_token_wait %tok : !ttg.async.token
+    // Explicit planner metadata takes precedence over reconstructing program
+    // order after software-pipeline schedule serialization.
+    // CHECK: ttng.async_tma_store_wait {pendings = 2 : i32}
+    ttng.async_tma_store_token_wait %tok {planned_pending_count = 2 : i32} : !ttg.async.token
     tt.return
   }
 }
