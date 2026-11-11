@@ -1,8 +1,19 @@
 # GPU CI
 
 `workflows/gpu-tests.yml` selects platforms, calls `build.yml` once, then passes
-the same wheel URL and SHA256 to `h100.yml`, `b200.yml`, and `mi350.yml`. Build and
-test checkouts use the same exact commit, including the merge commit for PRs.
+the same wheel URL and SHA256 to `h100.yml`, `b200.yml`, `mi350.yml`, and
+`gfx1250.yml`. Build and test checkouts use the same exact commit, including
+the merge commit for PRs.
+`gfx1250.yml` is the exception to the GPU-runner rule: MI450 (gfx1250) has no
+physical runner in the fleet, so it runs on a GitHub-hosted CPU runner
+(`ubuntu-latest`) in the ROCm container and executes kernels under the
+roc-jitsu functional emulator (`mirage`), following upstream Triton's
+`integration-tests-amd-rocjitsu` job in triton-lang/triton. Its container gets
+no GPU devices, and because the runner labels contain `ubuntu`, the CI health
+dashboard's GPU-hour accounting ignores it; nightly failure issues still file
+through `ci-issues.yml` with bisection disabled. Compile-only gfx1250 tests
+live in `test_tlx_codegen_gfx1250.py` and run in that lane without `mirage`;
+only the runtime tests in `test_tlx_amd_gfx1250.py` run under the emulator.
 The GPU workflows are reusable test workflows; trigger the parent to run them.
 `workflows/gpu-tests-nightly.yml` runs suites too slow for PRs and pushes once a
 day and on demand: it builds the same wheel and runs TritonBench on H100, B200
