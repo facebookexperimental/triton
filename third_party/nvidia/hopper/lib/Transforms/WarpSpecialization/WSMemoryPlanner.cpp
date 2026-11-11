@@ -930,7 +930,7 @@ static std::optional<unsigned> getChannelAnnotationOperandIdx(StringRef name) {
     return 0;
   if (name == "opndB")
     return 1;
-  if (name == "opndD")
+  if (name == tt::kAutoWSOperandDTag)
     return 2;
   // In TCGen5MMAScaledOp, acc_dep is operand 3, so scales are operands 4/5.
   if (name == "opndAScale" || name == "opndA_scale")
@@ -952,9 +952,9 @@ parseChannelAnnotations(Operation *parentOp) {
   std::map<unsigned, std::pair<unsigned, Operation *>> bufferIdToInfo;
 
   parentOp->walk([&](Operation *op) {
-    if (!op->hasAttr("tt.autows"))
+    if (!op->hasAttr(tt::kAutoWSAnnotationAttrName))
       return;
-    auto attr = op->getAttrOfType<StringAttr>("tt.autows");
+    auto attr = op->getAttrOfType<StringAttr>(tt::kAutoWSAnnotationAttrName);
     if (!attr)
       return;
     auto parsed = llvm::json::parse(attr.getValue());
@@ -965,7 +965,7 @@ parseChannelAnnotations(Operation *parentOp) {
     auto *obj = parsed->getAsObject();
     if (!obj)
       return;
-    auto *channelsArr = obj->getArray("channels");
+    auto *channelsArr = obj->getArray(tt::kAutoWSChannelsKey);
     if (!channelsArr)
       return;
     for (auto &elem : *channelsArr) {
@@ -1042,7 +1042,8 @@ parseChannelAnnotations(Operation *parentOp) {
       }
 
       // Check for operand D annotated as SMEM (always TMEM).
-      if (ann.operand == "opndD" && ann.memType != "tmem") {
+      if (StringRef(ann.operand) == tt::kAutoWSOperandDTag &&
+          ann.memType != "tmem") {
         LDBG("WARNING: opndD must be tmem, got '" << ann.memType
                                                   << "' — correcting to tmem");
         ann.memType = "tmem";
@@ -1349,6 +1350,19 @@ static unsigned getSmemAllocSizeBytes(ttg::LocalAllocOp alloc) {
   }
   return static_cast<unsigned>(numElems * allocType.getElementTypeBitWidth() /
                                8);
+}
+
+/// Copy i of a multi-buffered alloc starts at base + i * size. A TMA landing
+/// buffer must start at its encoding's alignment (128 bytes, or the swizzle
+/// period for a swizzled layout), so one whose size is not a multiple of that
+/// (e.g. a 1-D bias tile of 32 bf16 = 64 bytes) must stay single-buffered:
+/// every odd copy would fault with a misaligned address or land in the wrong
+/// swizzle phase.
+static bool isUnalignedTMALoadSlot(Operation *allocOp, unsigned sizeBytes,
+                                   SmallVector<Channel *> &channels) {
+  auto alloc = cast<ttg::LocalAllocOp>(allocOp);
+  return sizeBytes % alloc.getAlignmentOrDefault() != 0 &&
+         isSmemTMAChannel(allocOp, channels);
 }
 
 /// Compute total SMEM usage in bytes across all WSBuffers.
@@ -1870,10 +1884,17 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
     // Pick the target with the lowest order (earliest last consumer).
     // Tiebreak: within the same linearOrder, prefer the target whose last
     // consumer appears earlier in program order (its SMEM is free sooner).
-    bool isBetter = false;
-    if (effectiveOrder < bestOrder.linearOrder) {
+    // Seed an unknown-order search only for TMA store staging.  Its consumers
+    // are outside the pipelined inner loop and therefore intentionally have no
+    // loop.stage; the code partitioner supplies the cross-tile WAR edge needed
+    // by allocation.reuseTarget.  Ordinary buffers still require a known
+    // order: allowing them through this fallback can create unsynchronized
+    // reuse chains and make the planner under-count their physical storage.
+    bool isBetter = best == nullptr &&
+                    (effectiveOrder != INT_MAX || candidate.tmaStaging != 0);
+    if (!isBetter && effectiveOrder < bestOrder.linearOrder) {
       isBetter = true;
-    } else if (effectiveOrder == bestOrder.linearOrder &&
+    } else if (!isBetter && effectiveOrder == bestOrder.linearOrder &&
                bestOrder.linearOrder != INT_MAX && order.lastOp &&
                bestOrder.lastOp &&
                order.lastOp->getBlock() == bestOrder.lastOp->getBlock() &&
@@ -2191,6 +2212,11 @@ static unsigned allocateSmemBuffersViaSearch(
           ++storeUsers;
       if (storeUsers > 1)
         needsFallback = true; // subtiled staging (K|S) unmodeled
+      // A TMA landing buffer that is not a multiple of 128 bytes must stay
+      // single-buffered (see isUnalignedTMALoadSlot); the search does not
+      // model that cap.
+      if (isUnalignedTMALoadSlot(alloc, getSmemAllocSizeBytes(alloc), channels))
+        needsFallback = true;
     }
   });
   if (needsFallback) {
@@ -2534,11 +2560,22 @@ static unsigned allocateSmemBuffers(
                         WSBufferPriority::P1_InnermostNonTMA}) {
     // Collect candidate indices at this priority.
     SmallVector<unsigned> candidateIndices;
+    // Candidates before dropping unaligned TMA landing buffers. Grouping is
+    // decided on this count so that dropping such a buffer never turns a
+    // three-buffer set into the two-buffer circular reuse group.
+    unsigned numCandidates = 0;
     for (unsigned i = 0; i < wsBuffers.size(); ++i) {
-      if (wsBuffers[i].isPinned)
+      if (wsBuffers[i].isPinned || wsBuffers[i].priority != priority)
         continue;
-      if (wsBuffers[i].priority == priority)
-        candidateIndices.push_back(i);
+      ++numCandidates;
+      if (isUnalignedTMALoadSlot(wsBuffers[i].allocOp, wsBuffers[i].sizeBytes,
+                                 channels)) {
+        LDBG("Phase 4: WSBuffer["
+             << wsBuffers[i].bufferId << "] is a TMA landing buffer of "
+             << wsBuffers[i].sizeBytes << " bytes; keeping its copy count");
+        continue;
+      }
+      candidateIndices.push_back(i);
     }
     if (candidateIndices.empty())
       continue;
@@ -2557,7 +2594,8 @@ static unsigned allocateSmemBuffers(
 
     // Step 0: Decide grouping upfront.
     bool isReuseGroup = false;
-    if (smemCircularReuse && candidateIndices.size() == 2) {
+    if (smemCircularReuse && numCandidates == 2 &&
+        candidateIndices.size() == 2) {
       isReuseGroup = true;
       auto &bufA = wsBuffers[candidateIndices[0]];
       auto &bufB = wsBuffers[candidateIndices[1]];
@@ -3599,6 +3637,28 @@ public:
           if (hasLoopCarriedAccToken(alloc, forOp)) {
             hasLoopCarriedMMA = true;
             break;
+          }
+          // A per-iteration accumulator (MMA directly in the loop body,
+          // not loop-carried, e.g. k_tiles == 1) needs a slot per in-flight
+          // iteration too, since the loop scheduler can put its init and its
+          // epilogue load in different stages; createBufferForAllocs already
+          // rotates these by the loop's accumCnt. Only accept accumulators
+          // whose value is dead across iterations: a tmem_store in the body
+          // writes them before any other access in the body.
+          auto mma = dyn_cast<ttng::MMAv5OpInterface>(user);
+          if (mma && user->getParentOp() == forOp.getOperation() &&
+              mma.getAccumulator() == alloc.getResult()) {
+            Block *body = forOp.getBody();
+            Operation *first = nullptr;
+            for (auto *other : alloc.getResult().getUsers()) {
+              Operation *anc = body->findAncestorOpInBlock(*other);
+              if (anc && (!first || anc->isBeforeInBlock(first)))
+                first = anc;
+            }
+            if (first && isa<ttng::TMEMStoreOp>(first)) {
+              hasLoopCarriedMMA = true;
+              break;
+            }
           }
         }
       }
