@@ -311,3 +311,84 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
     tt.return
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
+                   ttg.target = "hip:gfx950",
+                   "ttg.threads-per-warp" = 64 : i32} {
+  // A masked strided load (contiguity 1, but a different address per element)
+  // is not a per-thread broadcast, so it keeps its own width even next to a
+  // related relaxed load.
+  // CHECK-DAG: #[[$STRIDED_NARROW:.*]] = #ttg.blocked<{sizePerThread = [1]
+  // CHECK-DAG: #[[$STRIDED_WIDE:.*]] = #ttg.blocked<{sizePerThread = [4]
+  // CHECK-LABEL: @masked_strided_load_gfx950
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f16>, #[[$STRIDED_WIDE]]>
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f16>, #[[$STRIDED_NARROW]]>
+  tt.func @masked_strided_load_gfx950(
+      %input: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %strided: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %output: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %unaligned: i32,
+      %mask: tensor<1024xi1, #blocked>) {
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %offset = tt.splat %unaligned : i32 -> tensor<1024xi32, #blocked>
+    %inputIndices = arith.addi %range, %offset : tensor<1024xi32, #blocked>
+    %inputBases = tt.splat %input : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %inputPtrs = tt.addptr %inputBases, %inputIndices : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    %relaxed = tt.load %inputPtrs : tensor<1024x!tt.ptr<f16>, #blocked>
+    %c2 = arith.constant dense<2> : tensor<1024xi32, #blocked>
+    %stridedIndices = arith.muli %range, %c2 : tensor<1024xi32, #blocked>
+    %stridedBases = tt.splat %strided : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %stridedPtrs = tt.addptr %stridedBases, %stridedIndices : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    %other = arith.constant dense<0.0> : tensor<1024xf16, #blocked>
+    %gathered = tt.load %stridedPtrs, %mask, %other : tensor<1024x!tt.ptr<f16>, #blocked>
+    %sum = arith.addf %relaxed, %gathered : tensor<1024xf16, #blocked>
+    %outputBases = tt.splat %output : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %outputPtrs = tt.addptr %outputBases, %range : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    tt.store %outputPtrs, %sum : tensor<1024x!tt.ptr<f16>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
+                   ttg.target = "hip:gfx950",
+                   "ttg.threads-per-warp" = 64 : i32} {
+  // A masked load whose address changes every 2 elements (constancy 2) is not
+  // constant across a 4-wide per-thread chunk, so it keeps its own width.
+  // CHECK-DAG: #[[$SHORT_NARROW:.*]] = #ttg.blocked<{sizePerThread = [1]
+  // CHECK-DAG: #[[$SHORT_WIDE:.*]] = #ttg.blocked<{sizePerThread = [4]
+  // CHECK-LABEL: @masked_short_broadcast_load_gfx950
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f16>, #[[$SHORT_WIDE]]>
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f16>, #[[$SHORT_NARROW]]>
+  tt.func @masked_short_broadcast_load_gfx950(
+      %input: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %strided: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %output: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %unaligned: i32,
+      %mask: tensor<1024xi1, #blocked>) {
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %offset = tt.splat %unaligned : i32 -> tensor<1024xi32, #blocked>
+    %inputIndices = arith.addi %range, %offset : tensor<1024xi32, #blocked>
+    %inputBases = tt.splat %input : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %inputPtrs = tt.addptr %inputBases, %inputIndices : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    %relaxed = tt.load %inputPtrs : tensor<1024x!tt.ptr<f16>, #blocked>
+    %c2 = arith.constant dense<2> : tensor<1024xi32, #blocked>
+    %stridedIndices = arith.divsi %range, %c2 : tensor<1024xi32, #blocked>
+    %stridedBases = tt.splat %strided : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %stridedPtrs = tt.addptr %stridedBases, %stridedIndices : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    %other = arith.constant dense<0.0> : tensor<1024xf16, #blocked>
+    %gathered = tt.load %stridedPtrs, %mask, %other : tensor<1024x!tt.ptr<f16>, #blocked>
+    %sum = arith.addf %relaxed, %gathered : tensor<1024xf16, #blocked>
+    %outputBases = tt.splat %output : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %outputPtrs = tt.addptr %outputBases, %range : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    tt.store %outputPtrs, %sum : tensor<1024x!tt.ptr<f16>, #blocked>
+    tt.return
+  }
+}

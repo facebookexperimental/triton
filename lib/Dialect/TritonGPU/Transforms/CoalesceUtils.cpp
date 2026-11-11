@@ -81,19 +81,21 @@ buildCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
   LDBG("perThread: " << perThread);
 
   auto load = dyn_cast<triton::LoadOp>(op);
-  // Lowering never vectorizes a load beyond its pointer's contiguity. When the
-  // op's own width is already limited by contiguity (e.g. a broadcast index
-  // load), sharing the related ops' wider layout cannot widen its transaction,
-  // and clamping would only add convert_layouts.
-  auto widthLimitedByAlignment = [&]() {
-    unsigned opContig = std::min<unsigned>(
-        axisInfoAnalysis.getAxisInfo(ptr)->getContiguity(order[0]),
-        shapePerCTA[order[0]]);
-    return opPerThread < opContig;
+  // A load whose pointer is constant across each thread's elements in the
+  // wider layout (e.g. a broadcast index load, one index per row) issues the
+  // same scalar transaction either way, so it can share the related ops'
+  // layout instead of being split off behind convert_layouts. Other masked or
+  // volatile loads keep their own safe width.
+  auto keepsOwnWidth = [&]() {
+    AxisInfo &info = *axisInfoAnalysis.getAxisInfo(ptr);
+    unsigned opContig =
+        std::min<unsigned>(info.getContiguity(order[0]), shapePerCTA[order[0]]);
+    bool broadcastPerThread =
+        opContig <= opPerThread && info.getConstancy(order[0]) >= perThread;
+    return !broadcastPerThread;
   };
-  if (!load ||
-      (hasRelatedUnalignedVectorizedLoad &&
-       (load.getIsVolatile() || load.getMask()) && widthLimitedByAlignment())) {
+  if (!load || (hasRelatedUnalignedVectorizedLoad &&
+                (load.getIsVolatile() || load.getMask()) && keepsOwnWidth())) {
     // For ops that can result in a global memory write, we should enforce
     // that each thread handles at most maxVecBits bits, which is the widest
     // available vectorized store op; otherwise, the store will have "gaps"
