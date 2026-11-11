@@ -305,6 +305,21 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="prepare_custom_all_reduce",
+        arch="gfx950",
+        variant="symmetric_memory",
+        impl="triton.tlx.ops.kernels.custom_all_reduce.gfx950:prepare_custom_all_reduce",
+        # The signal pad holds one flag slot per (program, peer); aiter's kernels cover 2, 4 and 8 ranks.
+        accepts=lambda d: d["WORLD"] in (2, 4, 8),
+    ),
+    OpSpec(
+        op="custom_all_reduce",
+        arch="gfx950",
+        variant="one_or_two_stage",
+        impl="triton.tlx.ops.kernels.custom_all_reduce.gfx950:custom_all_reduce",
+        dtypes=frozenset({"float16", "bfloat16", "float32"}),
+    ),
+    OpSpec(
         op="mm_torchtlx",
         arch="sm90",
         variant="inductor_hopper_gemm_ws",

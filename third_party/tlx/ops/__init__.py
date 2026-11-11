@@ -55,6 +55,10 @@ Prepare the immutable sequence plan once, then reuse it for backward calls;
 this explicit API accepts inputs requiring gradients but does not build an
 autograd graph for higher-order derivatives.
 
+`prepare_custom_all_reduce` and `custom_all_reduce` sum a tensor across the
+ranks of a single-node process group through peer memory. Prepare the
+symmetric workspace once per group (a collective call), then reuse the plan.
+
 `space=` also accepts a `Space`, which bundles the search-space name with a
 `BitwiseInvarianceSpec` naming the logical dims that may vary across calls
 while overlapping outputs stay bitwise identical. Unknown dim names raise
@@ -124,8 +128,8 @@ __all__ = [
     "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen",
     "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev",
     "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
-    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp", "UnsupportedBackward",
-    "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "prepare_custom_all_reduce",
+    "custom_all_reduce", "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -765,6 +769,81 @@ def moe(x, topk_weights, topk_ids, w13, w2, *, expert_start=0, post_norm_weight=
     with torch.cuda.device(x.device):
         return fn(x, topk_weights, topk_ids, w13, w2, expert_start, post_norm_weight, post_norm_eps, post_norm_gain,
                   out)
+
+
+def prepare_custom_all_reduce(group=None, *, max_bytes=8 * 1024 * 1024, max_spin=1 << 26, space=None):
+    """Allocate the symmetric workspace for :func:`custom_all_reduce` on one process group.
+
+    Collective: every rank of ``group`` (default: the world group) must call it with the same ``max_bytes``,
+    after ``torch.cuda.set_device`` and ``torch.distributed.init_process_group``. The group must span 2, 4 or 8
+    GPUs in one xGMI domain. The workspace holds a ``max_bytes`` input staging area, a ``max_bytes`` scratch
+    area and a small signal pad, mapped into every peer through ``torch.distributed._symmetric_memory``.
+    Call it once outside CUDA graph capture, then reuse the returned plan for every all-reduce on the group.
+    ``max_spin`` bounds each barrier wait; a timeout sets the plan's error flag (``plan.check()`` raises)
+    instead of hanging the GPU.
+    Only ``space="heuristic"`` is provided.
+    """
+    import torch
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        raise InvalidInput("tlx.ops.prepare_custom_all_reduce needs an initialized torch.distributed process group")
+    group = group or dist.group.WORLD
+    if not isinstance(max_bytes, int) or max_bytes <= 0 or max_bytes % 16:
+        raise InvalidInput(f"tlx.ops.prepare_custom_all_reduce expects a positive max_bytes multiple of 16; "
+                           f"got {max_bytes!r}")
+    if not isinstance(max_spin, int) or max_spin <= 0:
+        raise InvalidInput(f"tlx.ops.prepare_custom_all_reduce expects a positive int max_spin; got {max_spin!r}")
+    device = torch.device("cuda", torch.cuda.current_device())
+    space_name, invariance = _normalize_space_arg("prepare_custom_all_reduce", space)
+    _check_single_config_space("prepare_custom_all_reduce", space_name)
+    fn, spec = impl_for("prepare_custom_all_reduce", device=device)
+    check_inputs(spec, WORLD=dist.get_world_size(group))
+    _check_enforced("prepare_custom_all_reduce", spec, invariance)
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            raise InvalidInput("tlx.ops.prepare_custom_all_reduce must run outside CUDA graph capture")
+        return fn(group, max_bytes, max_spin)
+
+
+def custom_all_reduce(x, plan, *, out=None, method=None, space=None):
+    """Sum ``x`` over the plan's process group and return the result (out of place). Forward only.
+
+    ``plan`` comes from :func:`prepare_custom_all_reduce`. ``x`` must be contiguous fp16, bf16 or fp32 on the
+    plan's device and at most ``plan.max_bytes`` bytes; every rank passes the same shape and dtype. ``x`` is
+    copied into the plan's staging area, so it may be any tensor. ``method`` is ``"1stage"`` (every rank reads
+    every input and reduces in rank order, so all ranks get bitwise-identical output), ``"2stage"``
+    (reduce-scatter, then all-gather) or ``None``, which picks by size as aiter does: one stage below 80 KB at 8
+    ranks and 160 KB at 4, always at 2. Both methods are bitwise identical across ranks. Returns or fills ``out``,
+    which must match ``x`` and must not alias it. The call issues no host synchronization and is
+    graph-capturable; capture and replay it on every rank in the same order.
+    Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    if not isinstance(x, torch.Tensor) or not x.is_cuda or not x.is_contiguous():
+        raise InvalidInput("tlx.ops.custom_all_reduce expects a contiguous CUDA tensor x")
+    if out is not None:
+        if (not isinstance(out, torch.Tensor) or out.shape != x.shape or out.dtype != x.dtype or out.device != x.device
+                or not out.is_contiguous()):
+            raise InvalidInput(f"tlx.ops.custom_all_reduce expects a contiguous out matching x "
+                               f"({tuple(x.shape)}, {x.dtype}, {x.device})")
+        if torch._C._overlaps(out, x):
+            raise InvalidInput("tlx.ops.custom_all_reduce out must not alias x")
+    if method not in (None, "1stage", "2stage"):
+        raise InvalidInput(f"tlx.ops.custom_all_reduce expects method None, '1stage' or '2stage'; got {method!r}")
+
+    space_name, invariance = _normalize_space_arg("custom_all_reduce", space)
+    _check_single_config_space("custom_all_reduce", space_name)
+    fn, spec = impl_for("custom_all_reduce", device=x.device)
+    check_inputs(spec, dtype=x.dtype)
+    check_backward(spec, x)
+    _check_enforced("custom_all_reduce", spec, invariance)
+    with torch.cuda.device(x.device):
+        try:
+            return fn(x, plan, out, method)
+        except (TypeError, ValueError) as error:
+            raise InvalidInput(f"tlx.ops.custom_all_reduce: {error}") from error
 
 
 def addmm(input, a, b, *, out=None, space=None):
