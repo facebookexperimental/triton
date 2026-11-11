@@ -58,7 +58,19 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
         %v_j_load_18 = ttg.local_alloc %v_j_load : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared2, #smem>
         %permute = ttg.local_alloc %k_j_load : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared2, #smem>
         %permute_19 = ttg.memdesc_trans %permute {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared2, #smem> -> !ttg.memdesc<128x128xbf16, #shared3, #smem>
-        // CHECK-COUNT-2: ttng.tc_gen5_mma
+        // Data partition 0 must complete its qK/correction/PV chain before
+        // data partition 1 begins. Interleaving the two independent correction
+        // chains doubles their live ranges and spills both accumulator halves.
+        // CHECK: ttng.tc_gen5_mma
+        // CHECK: ttng.tmem_load
+        // CHECK: ttng.tmem_load
+        // CHECK: ttng.tmem_store
+        // CHECK: ttng.tc_gen5_mma
+        // CHECK: ttng.tc_gen5_mma
+        // CHECK: ttng.tmem_load
+        // CHECK: ttng.tmem_load
+        // CHECK: ttng.tmem_store
+        // CHECK: ttng.tc_gen5_mma
         %qk_20 = ttng.tc_gen5_mma %q_i_load_5, %permute_19, %qk[%qk_16], %false, %true : !ttg.memdesc<256x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xbf16, #shared3, #smem>, !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
         %qk_21, %qk_22 = ttng.tmem_load %qk[%qk_20] : !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<256x128xf32, #blocked>
         %amax = "tt.reduce"(%qk_21) <{axis = 1 : i32}> ({
@@ -98,7 +110,6 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
         %v_13 = arith.truncf %v_10 : tensor<256x128xf32, #blocked> to tensor<256x128xbf16, #blocked>
         %acc_33 = ttng.tmem_alloc %v_13 : (tensor<256x128xbf16, #blocked>) -> !ttg.memdesc<256x128xbf16, #tmem1, #ttng.tensor_memory>
         %acc_34 = ttng.tmem_store %inline_triton_result_3_32, %acc[%acc_27], %true : tensor<256x128xf32, #blocked> -> !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
-        // CHECK-COUNT-2: ttng.tc_gen5_mma
         %acc_35 = ttng.tc_gen5_mma %acc_33, %v_j_load_18, %acc[%acc_34], %true, %true : !ttg.memdesc<256x128xbf16, #tmem1, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared2, #smem>, !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
         %v_14 = arith.mulf %arg8, %v_12 : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
         %v_3 = arith.addf %v_14, %l_ij : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
