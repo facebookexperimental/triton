@@ -45,6 +45,80 @@ inline bool hasOrderedWSBarrierInfo(DictionaryAttr wsBarrier) {
          minRegionId.getInt() >= 0 && maxRegionId && maxRegionId.getInt() >= 0;
 }
 
+// Resolve the planner `buffer.id` carried by a buffer value, looking through
+// effect-free single-operand view ops (subslice/subview/reinterpret) to the
+// stamped allocating op. Returns nullopt when the id cannot be resolved (e.g.
+// block arguments); callers treat that as unknown.
+inline std::optional<int> getBufferIdForValue(Value buffer) {
+  Operation *op = buffer.getDefiningOp();
+  // Stop at anything with memory effects: a copy materializes a different
+  // buffer, so its source's id must not be attributed to it.
+  while (op && !op->getAttrOfType<IntegerAttr>("buffer.id")) {
+    if (!isMemoryEffectFree(op) || op->getNumOperands() != 1 ||
+        op->getNumResults() != 1)
+      return std::nullopt;
+    Value src = op->getOperand(0);
+    if (!isa<triton::gpu::MemDescType>(src.getType()) ||
+        !isa<triton::gpu::MemDescType>(op->getResult(0).getType()))
+      return std::nullopt;
+    op = src.getDefiningOp();
+  }
+  if (!op)
+    return std::nullopt;
+  return (int)op->getAttrOfType<IntegerAttr>("buffer.id").getInt();
+}
+
+// True when an operation touching only buffer `bufferId` is provably
+// unaffected by the arrive barrier's signal: the barrier orders accesses to
+// its guarded buffers, and a disjoint buffer shares no storage with them.
+// Missing data on either side is conservative (false).
+inline bool
+isDisjointFromGuardedBuffers(std::optional<int> bufferId,
+                             std::optional<DictionaryAttr> arriveConstraints) {
+  if (!bufferId)
+    return false;
+  auto wsBarrier = getWSBarrierConstraints(arriveConstraints);
+  if (!wsBarrier)
+    return false;
+  auto guarded = wsBarrier.getAs<DenseI32ArrayAttr>("guardedBufferIds");
+  if (!guarded)
+    return false;
+  for (int id : guarded.asArrayRef())
+    if (id == *bufferId)
+      return false;
+  return true;
+}
+
+// Buffer ids touched by a memory op: planner ids stamped on the op itself
+// (alloc results) plus ids reachable from its memdesc operands through views
+// to their allocating ops. Empty when nothing resolves (unknown).
+inline DenseSet<int> getBufferIdsForMemoryOp(Operation *op) {
+  DenseSet<int> ids;
+  if (auto idAttr = op->getAttrOfType<IntegerAttr>("buffer.id"))
+    ids.insert((int)idAttr.getInt());
+  for (Value operand : op->getOperands())
+    if (isa<triton::gpu::MemDescType>(operand.getType()))
+      if (auto id = getBufferIdForValue(operand))
+        ids.insert(*id);
+  return ids;
+}
+
+// True when a memory op provably touches none of the barrier's guarded
+// buffers. Unknown ids on either side are conservative (false).
+inline bool isMemoryOpDisjointFromGuardedSet(Operation *op,
+                                             DictionaryAttr wsBarrier) {
+  auto guarded = wsBarrier.getAs<DenseI32ArrayAttr>("guardedBufferIds");
+  if (!guarded)
+    return false;
+  auto ids = getBufferIdsForMemoryOp(op);
+  if (ids.empty())
+    return false;
+  for (int id : guarded.asArrayRef())
+    if (ids.contains(id))
+      return false;
+  return true;
+}
+
 // Check if two WS barriers can be safely swapped by verifying their
 // channelGraph sets are disjoint. Returns false if either barrier lacks
 // a WSBarrier constraint or channelGraph constraint (conservative).
@@ -262,10 +336,15 @@ buildBarrierToMemoryOpMap(Block &block) {
     if (auto arrive = dyn_cast<ArriveBarrierOp>(&op)) {
       if (!hasWSBarrierConstraints(arrive.getConstraints()))
         continue;
+      auto wsBarrier = getWSBarrierConstraints(arrive.getConstraints());
       for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
         if (isNamedBarrierOp(cur))
           break;
         if (isMemoryOp(cur)) {
+          // Skip memory ops the arrive provably does not guard: mapping them
+          // would drag the barrier back across ops that legally sank past it.
+          if (isMemoryOpDisjointFromGuardedSet(cur, wsBarrier))
+            continue;
           map[arrive] = cur;
           break;
         }

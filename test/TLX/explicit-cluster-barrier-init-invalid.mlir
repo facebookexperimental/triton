@@ -1,6 +1,6 @@
-// RUN: triton-opt -split-input-file --convert-triton-gpu-to-llvm=compute-capability=90 --verify-diagnostics %s
-// RUN: triton-opt -split-input-file --convert-triton-gpu-to-llvm=compute-capability=100 --verify-diagnostics %s
-// RUN: sed '/expected-error/d' %s | not triton-opt -split-input-file --convert-triton-gpu-to-llvm=compute-capability=80 2>&1 | FileCheck %s --check-prefix=SM80
+// RUN: triton-opt -split-input-file --triton-nvidia-gpu-membar=compute-capability=90 --convert-triton-gpu-to-llvm=compute-capability=90 --verify-diagnostics %s
+// RUN: triton-opt -split-input-file --triton-nvidia-gpu-membar=compute-capability=100 --convert-triton-gpu-to-llvm=compute-capability=100 --verify-diagnostics %s
+// RUN: sed '/expected-error/d' %s | not triton-opt -split-input-file --triton-nvidia-gpu-membar=compute-capability=80 --convert-triton-gpu-to-llvm=compute-capability=80 2>&1 | FileCheck %s --check-prefix=SM80
 
 // Strip SM90+ diagnostic annotations only from the SM80 input so diagnostic
 // verification cannot report them as missing. Architecture rejection

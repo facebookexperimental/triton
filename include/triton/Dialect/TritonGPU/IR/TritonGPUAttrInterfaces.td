@@ -28,13 +28,17 @@ def SharedEncodingTrait : AttrInterface<"SharedEncodingTrait"> {
   let description = [{
     Common trait describing shared memory.
   }];
-  let methods = [InterfaceMethod<"Return the default alignment for the layout.",
-                                 "int32_t", "getAlignment", (ins), [{}],
-                                 [{ return 16; }]>,
+  let methods = [
+    InterfaceMethod<"Return the default alignment for the layout.",
+                    "int32_t", "getAlignment", (ins), [{}], [{ return 16; }]>,
+    InterfaceMethod<"Convert to LinearLayout.",
+                    "LinearLayout",
+                    "toLinearLayout",
+                    (ins "ArrayRef<int64_t>":$shape)>,
   ];
 }
-def DeclareSharedEncodingMethods
-    : DeclareAttrInterfaceMethods<SharedEncodingTrait, ["getAlignment"]>;
+def DeclareSharedEncodingMethods : DeclareAttrInterfaceMethods<
+  SharedEncodingTrait, ["getAlignment", "toLinearLayout"]>;
 
 // Marker interface for encodings that the user pinned explicitly and that
 // layout passes must treat as fixed (e.g. an anchor in
@@ -94,6 +98,12 @@ We call each individual tile "rep".
                      }]>,
        InterfaceMethod<"Convert to LinearLayout.", "LinearLayout",
                        "toLinearLayout", (ins "ArrayRef<int64_t>":$shape)>,
+       InterfaceMethod<"Whether toLinearLayout builds an exact mixed-radix "
+                       "layout at an NPOT shape. Encodings implement it once "
+                       "they do.",
+                       "bool", "hasMixedRadixLayout", (ins),
+                       /*methodBody=*/"",
+                       /*defaultImplementation=*/"return false;">,
   ];
 }
 
@@ -245,11 +255,21 @@ def DeclareLinearEncodingMethods
 
 def MmaEncodingTrait : AttrInterface<"MmaEncodingTrait"> {
   let cppNamespace = "::mlir::triton::gpu";
-  let methods = [InterfaceMethod<
-                     "Get the order of reps (tiles of this layout that tile "
-                     "the whole tensor). The fastest-changing axis first",
-                     "SmallVector<unsigned>", "getRepOrderForOperand",
-                     (ins "int":$opIdx)>,
+  let methods = [
+    InterfaceMethod<"Get the order of reps (tiles of this layout that tile the whole tensor). The fastest-changing axis first",
+                    "SmallVector<unsigned>",
+                    "getRepOrderForOperand",
+                    (ins "int":$opIdx)>,
+    InterfaceMethod<"Convert a dot operand whose parent is this MMA layout to a LinearLayout.",
+                    "LinearLayout",
+                    "dotOperandToLinearLayout",
+                    (ins "::mlir::Attribute":$dotOp,
+                         "ArrayRef<int64_t>":$shape),
+                    /*methodBody=*/[{}],
+                    /*defaultImplementation=*/[{
+                      llvm::report_fatal_error(
+                          "this MMA layout is not a valid dot-operand parent");
+                    }]>,
   ];
 }
 

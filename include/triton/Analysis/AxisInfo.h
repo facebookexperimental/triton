@@ -2,6 +2,7 @@
 #define TRITON_ANALYSIS_AXISINFO_H
 
 #include "mlir/Analysis/DataFlow/SparseAnalysis.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "mlir/Support/LLVM.h"
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <utility>
 
 namespace mlir::triton {
 
@@ -30,9 +32,9 @@ public:
       : AxisInfo(contiguity, divisibility, constancy, std::nullopt) {}
 
   AxisInfo(ArrayRef<int64_t> contiguity, ArrayRef<int64_t> divisibility,
-           ArrayRef<int64_t> constancy, std::optional<int64_t> constantValue)
+           ArrayRef<int64_t> constancy, std::optional<APInt> constantValue)
       : contiguity(contiguity), divisibility(divisibility),
-        constancy(constancy), constantValue(constantValue) {
+        constancy(constancy), constantValue(std::move(constantValue)) {
     assert(divisibility.size() == contiguity.size());
     assert(constancy.size() == contiguity.size());
     int64_t globalDivisibility = getGlobalDivisibility();
@@ -121,7 +123,7 @@ public:
 
   int getRank() const { return contiguity.size(); }
 
-  std::optional<int64_t> getConstantValue() const { return constantValue; }
+  const std::optional<APInt> &getConstantValue() const { return constantValue; }
 
   static void initPessimisticStateFromFunc(int argNumber,
                                            FunctionOpInterface funcOp,
@@ -134,10 +136,15 @@ public:
   bool operator==(const AxisInfo &other) const {
     return contiguity == other.contiguity &&
            divisibility == other.divisibility && constancy == other.constancy &&
-           constantValue == other.constantValue;
+           ((!constantValue && !other.constantValue) ||
+            (constantValue && other.constantValue &&
+             constantValue->getBitWidth() ==
+                 other.constantValue->getBitWidth() &&
+             *constantValue == *other.constantValue));
   }
 
   static AxisInfo getPessimisticValueState(Value value);
+  static AxisInfo getConstantValueState(Type type, APInt value);
 
   // The gcd of both arguments for each dimension
   static AxisInfo join(const AxisInfo &lhs, const AxisInfo &rhs);
@@ -163,9 +170,16 @@ private:
   DimVectorT divisibility;
   DimVectorT constancy;
 
-  // The constant value of the lattice if we can infer it.
-  std::optional<int64_t> constantValue;
+  // Exact fixed-width integer scalar or splat bits, if known.
+  std::optional<APInt> constantValue;
 };
+
+// The widest pow2 vector AxisInfo proves along dim for a pointer of this
+// shape: divisibility x contiguity x bits, capped at maxBits and elements per
+// thread. Target caps such as gfx950 unaligned loads aren't modelled.
+unsigned getAxisInfoVector(const AxisInfo &info, Type ptrType,
+                           ArrayRef<int64_t> shape, unsigned dim,
+                           int64_t threads, unsigned maxBits = 128);
 
 class AxisInfoVisitor {
 public:
@@ -312,5 +326,13 @@ private:
   void update(CallOpInterface callOp, FunctionOpInterface funcOp);
 };
 } // namespace mlir::triton
+
+namespace mlir {
+// Gets the order of a tensor from its contiguity. Places the dimensions with
+// the largest contiguity as the inner most dimension. If the contiguity is
+// all ones, returns the order {dim - 1, dim - 2, ..., 0}
+SmallVector<unsigned, 4>
+getOrderFromContiguity(const SmallVector<int64_t> &contiguity);
+} // namespace mlir
 
 #endif

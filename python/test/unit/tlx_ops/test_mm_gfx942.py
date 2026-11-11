@@ -11,11 +11,81 @@ import pytest
 import torch
 import triton
 from triton._internal_testing import is_hip_cdna3
-from mm_test_utils import run_mm_case, shapes
+from triton.tlx.ops import BitwiseInvarianceSpec
+from mm_test_utils import run_mm_case, run_mm_invariance_case, shapes
 
 pytestmark = pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942")
 
 ARCH = "gfx942"
+
+
+@pytest.mark.parametrize("m,n,k", [(2048, 1536, 8192), (1000, 777, 3001)])
+@pytest.mark.parametrize("bias", [False, True])
+def test_stream_k_matches_reference_and_is_deterministic(m, n, k, bias):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    torch.manual_seed(m + n + k)
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.float16).t()
+    c = torch.randn((n, ), device="cuda", dtype=torch.float16) if bias else None
+    config = gfx942._config(256, 128, 64, 8, 8)
+    first = gfx942._launch_streamk(a, b, c, torch.empty((m, n), device="cuda", dtype=torch.float16), config)
+    second = gfx942._launch_streamk(a, b, c, torch.empty((m, n), device="cuda", dtype=torch.float16), config)
+    expected = torch.mm(a, b) if c is None else torch.addmm(c, a, b)
+    torch.testing.assert_close(first, expected, atol=0.05, rtol=0.05)
+    assert torch.equal(first, second)
+
+
+def test_planner_uses_stream_k_only_without_invariance():
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    assert gfx942._fill_plan(2032, 2560, 18688, allow_split=True).kwargs.get("STREAM_K")
+    assert not gfx942._fill_plan(2032, 2560, 18688, allow_split=False).kwargs.get("STREAM_K")
+
+
+@pytest.mark.parametrize("m", [4178, 4942])
+@pytest.mark.parametrize("n", [256, 512, 1280, 2560])
+def test_deep_k_batch_boundaries(m, n):
+    import triton.tlx.ops as ops
+
+    k = 18688
+    torch.manual_seed(m + n + k)
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.float16).t()
+    out = torch.empty((m, n), device="cuda", dtype=torch.float16)
+    expected = torch.mm(a, b)
+    for _ in range(3):
+        assert ops.mm(a, b, out=out, space="heuristic") is out
+        torch.testing.assert_close(out, expected, atol=0.05, rtol=0.05)
+
+
+@pytest.mark.parametrize("space", ["heuristic", "full"])
+def test_global_split_k_disabled_uses_direct_path(monkeypatch, space):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    m, n, k = 4178, 256, 18688
+    a = torch.empty((m, k), device="cuda", dtype=torch.float16)
+    b = torch.empty((n, k), device="cuda", dtype=torch.float16).t()
+    out = torch.empty((m, n), device="cuda", dtype=torch.float16)
+    assert gfx942.heuristic_config(m, n, k)[0].kwargs["SPLIT_K"] > 1
+    monkeypatch.setattr(gfx942, "ENABLE_GLOBAL_SPLIT_K", False)
+    assert "SPLIT_K" not in gfx942.heuristic_config(m, n, k)[0].kwargs
+    assert all(
+        config.kwargs.get("SPLIT_K", 1) == 1
+        for config in gfx942._candidate_configs((m, n, k), enable_global_split_k=True))
+    assert not gfx942._precheck_global_split_k(a, b, None, out)
+
+    class DirectPathReached(Exception):
+        pass
+
+    def tuned(requested_space, shape, enable_local_split_u, fixed_split_k=None):
+        assert requested_space == space
+        assert shape == (m, n, k)
+        raise DirectPathReached
+
+    monkeypatch.setattr(gfx942, "_tuned", tuned)
+    with pytest.raises(DirectPathReached):
+        gfx942._gemm(a, b, out=out, space=space)
 
 
 def test_gfx942_wide_heuristic_config():
@@ -42,7 +112,7 @@ def test_space_reaches_requested_autotuner(monkeypatch, space):
     class AutotunerReached(Exception):
         pass
 
-    def tuned(requested_space, shape, enable_local_split_u):
+    def tuned(requested_space, shape, enable_local_split_u, fixed_split_k=None):
         assert requested_space == space
         assert shape == (819200, 1024, 192)
         assert not enable_local_split_u
@@ -76,6 +146,33 @@ def test_full_space_adds_local_split_u_candidate(shape):
     assert local_configs[0].kwargs["BLOCK_N"] == plan.tile_n
     assert local_configs[0].kwargs["BLOCK_K"] == plan.wave_k
     assert local_configs[0].num_warps == plan.local_split_u
+
+
+def test_heuristic_space_prunes_measured_local_split_u(monkeypatch):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    shape = (7, 8192, 2048)
+    out = object()
+    monkeypatch.setattr(gfx942, "_validate_operands", lambda *args: shape)
+    monkeypatch.setattr(gfx942, "_precheck_local_split_u", lambda *args: True)
+
+    def launch(*args):
+        raise AssertionError("measured LocalSplitU plan must be pruned under a fixed schedule")
+
+    monkeypatch.setattr(gfx942, "_launch_local_split_u", launch)
+
+    class AutotunerReached(Exception):
+        pass
+
+    def tuned(requested_space, shape_arg, enable_local_split_u, fixed_split_k=None):
+        assert requested_space == "heuristic"
+        assert shape_arg == shape
+        assert not enable_local_split_u
+        raise AutotunerReached
+
+    monkeypatch.setattr(gfx942, "_tuned", tuned)
+    with pytest.raises(AutotunerReached):
+        gfx942._gemm(object(), object(), out=out, space="heuristic", invariance=BitwiseInvarianceSpec.dims("M"))
 
 
 def test_heuristic_space_launches_local_split_u_directly(monkeypatch):
@@ -139,7 +236,7 @@ def test_unaligned_row_base_vectorizes():
     assert "buffer_load_dwordx4" in compiled.asm["amdgcn"], "expected 16-byte VMEM load"
 
 
-@pytest.mark.parametrize("K", [513, 527, 528, 529])
+@pytest.mark.parametrize("K", [64, 65, 70, 127, 129, 255, 513, 527, 528, 529])
 @pytest.mark.parametrize("block_k", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("add_bias", [False, True])
@@ -190,3 +287,122 @@ def test_mm_small_k_tail(K, block_k, dtype, add_bias):
 @pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", shapes())
 def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     run_mm_case(ARCH, M, N, K, a_strides, b_strides, dtype_name)
+
+
+_INVARIANCE_SPECS = [
+    BitwiseInvarianceSpec.dims("M"),
+    BitwiseInvarianceSpec.dims("K"),
+    BitwiseInvarianceSpec.all(),
+]
+
+
+@pytest.mark.parametrize("space", ["heuristic", "full"])
+@pytest.mark.parametrize("shape", [(4178, 256, 18688), (1024, 6144, 20480)])
+@pytest.mark.parametrize("spec", [None, BitwiseInvarianceSpec(), *_INVARIANCE_SPECS])
+def test_global_split_k_respects_invariance(monkeypatch, space, shape, spec):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    out = object()
+    fixed = spec is not None and spec.needs_bitwise()
+    monkeypatch.setattr(gfx942, "_validate_operands", lambda *args: shape)
+    monkeypatch.setattr(gfx942, "_precheck_global_split_k", lambda *args: True)
+    monkeypatch.setattr(gfx942, "_precheck_local_split_u", lambda *args: False)
+    monkeypatch.setattr(gfx942, "_fill_plan", lambda *args, **kwargs: None)
+
+    def launch(a, b, bias, target, requested_space):
+        assert not fixed, "global split-K must be pruned under a fixed schedule"
+        assert target is out
+        assert requested_space == space
+        return target
+
+    class DirectPathReached(Exception):
+        pass
+
+    def tuned(requested_space, requested_shape, enable_local_split_u, fixed_split_k=None):
+        assert fixed
+        assert fixed_split_k == 1
+        assert requested_space == space
+        assert requested_shape == shape
+        assert not enable_local_split_u
+        raise DirectPathReached
+
+    monkeypatch.setattr(gfx942, "_launch_global_split_k", launch)
+    monkeypatch.setattr(gfx942, "_tuned", tuned)
+    if fixed:
+        with pytest.raises(DirectPathReached):
+            gfx942._gemm(object(), object(), out=out, space=space, invariance=spec)
+    else:
+        assert gfx942._gemm(object(), object(), out=out, space=space, invariance=spec) is out
+
+
+@pytest.mark.parametrize("space", ["heuristic", "full"])
+def test_fixed_space_uses_shape_independent_reduction_schedule(space):
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    shape = (1024, 6144, 20480)
+    kernel = gfx942._tuned(space, shape, False, 1)
+    assert kernel is not gfx942._tuned(space, shape, False)
+    (config, ) = kernel.configs
+    assert config.kwargs.get("SPLIT_K", 1) == 1
+    assert config.kwargs["kpack"] == 1
+    assert config.num_stages == 1
+    for varied_shape in [(512, 6144, 20480), (1024, 3072, 20480), (1024, 6144, 20544)]:
+        (varied_config, ) = gfx942._tuned(space, varied_shape, False, 1).configs
+        assert varied_config.kwargs == config.kwargs
+        assert varied_config.num_warps == config.num_warps
+        assert varied_config.num_stages == config.num_stages
+
+
+_INVARIANCE_SHAPES = [
+    # LocalSplitU shape: the spec prunes the measured LSU plan.
+    (7, 8192, 2048, (2048, 1), (8192, 1), "fp16"),
+    (1024, 1024, 1024, (1024, 1), (1024, 1), "bf16"),
+    # Global split-K shapes: fixed schedules must keep the K reduction sequential.
+    (4178, 256, 18688, (18688, 1), (1, 18688), "fp16"),
+    (1024, 6144, 20480, (20480, 1), (1, 20480), "bf16"),
+]
+
+
+@pytest.mark.parametrize("spec", _INVARIANCE_SPECS)
+@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", _INVARIANCE_SHAPES)
+def test_mm_invariance(spec, M, N, K, a_strides, b_strides, dtype_name):
+    """A non-empty spec gives exact per-dimension equality."""
+    run_mm_invariance_case(ARCH, M, N, K, a_strides, b_strides, dtype_name, spec)
+
+
+def test_full_space_fixed_prunes_lsu_and_separates_cache(monkeypatch):
+    """Full space under a fixed schedule excludes LSU and keys the cache on it."""
+    from types import SimpleNamespace
+
+    from triton.tlx.ops.kernels.mm import gfx942
+
+    shape = (7, 8192, 2048)
+    out = object()
+    monkeypatch.setattr(gfx942, "_validate_operands", lambda *args: shape)
+    monkeypatch.setattr(gfx942, "_precheck_local_split_u", lambda *args: True)
+    monkeypatch.setattr(gfx942, "_full_config_key", lambda a, b: "key")
+    monkeypatch.setattr(
+        gfx942, "_launch_local_split_u", lambda *args:
+        (_ for _ in ()).throw(AssertionError("LSU winner must not be reused under a fixed schedule")))
+
+    lsu_config = SimpleNamespace(kwargs={"USE_LOCAL_SPLIT_U": True}, num_warps=4, num_stages=2)
+
+    class FakeKernel:
+
+        def __init__(self):
+            self._tlx_fast_configs = {("key", False, (0, 0), None): (lsu_config, True)}
+            self.best_config = lsu_config
+
+        def __getitem__(self, grid):
+            raise AssertionError("fixed full-space call must not reuse the unconstrained LSU winner")
+
+    seen = {}
+
+    def tuned(requested_space, shape_arg, enable_local_split_u, fixed_split_k=None):
+        seen["enable"] = enable_local_split_u
+        return FakeKernel()
+
+    monkeypatch.setattr(gfx942, "_tuned", tuned)
+    with pytest.raises(AssertionError, match="must not reuse"):
+        gfx942._gemm(object(), object(), out=out, space="full", invariance=BitwiseInvarianceSpec.dims("M"))
+    assert seen["enable"] is False

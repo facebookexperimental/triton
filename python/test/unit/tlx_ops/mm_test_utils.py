@@ -36,6 +36,65 @@ def _reference_mm(a, b, arch):
     return ref
 
 
+def run_mm_invariance_case(
+    arch,
+    M,
+    N,
+    K,
+    a_strides,
+    b_strides,
+    dtype_name,
+    spec,
+):
+    """Check per-dimension bitwise invariance under `spec` + torch-closeness.
+
+    Each dim named by `spec` is varied in turn: M and N by slicing the
+    operands, K by appending a zero-padded tail (mathematically a no-op
+    that must not change the reduction schedule). `all()` covers every
+    dimension. Unlike `run_mm_case`, declined shapes fail loudly: the spec
+    must work on every listed shape.
+    """
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_name]
+    from triton.tlx.ops import Space, mm as tlx_mm
+
+    a = operand(M, K, a_strides, dtype)
+    b = operand(K, N, b_strides, dtype)
+    _assert_strides(a, a_strides)
+    _assert_strides(b, b_strides)
+
+    dims = {"M", "N", "K"} if spec.all_dims else set(spec.invariant_dims)
+    space = Space("heuristic", invariance=spec)
+    full = tlx_mm(a, b, space=space)
+
+    if "M" in dims:
+        sub = max(M // 2, 1)
+        rerun = tlx_mm(a[:sub], b, space=space)
+        assert torch.equal(full[:sub], rerun), (f"mm({M}x{N}x{K}, {dtype}) with {spec} is not "
+                                                "batch invariant: rows differ between full-M and sliced runs")
+    if "N" in dims:
+        sub_n = max(N // 2, 1)
+        # A strided slice is neither row- nor column-major, which the op
+        # legitimately rejects; materialize the same columns contiguously.
+        rerun = tlx_mm(a, b[:, :sub_n].contiguous(), space=space)
+        assert torch.equal(full[:, :sub_n], rerun), (f"mm({M}x{N}x{K}, {dtype}) with {spec} is not "
+                                                     "column invariant: columns differ between full-N and sliced runs")
+    if "K" in dims:
+        pad = 64
+        a_pad = torch.zeros((M, K + pad), device=a.device, dtype=dtype)
+        a_pad[:, :K] = a
+        b_pad = torch.zeros((K + pad, N), device=b.device, dtype=dtype)
+        b_pad[:K, :] = b
+        rerun = tlx_mm(a_pad, b_pad, space=space)
+        assert torch.equal(full, rerun), (f"mm({M}x{N}x{K}, {dtype}) with {spec} is not "
+                                          "reduction invariant: outputs differ with zero-padded K tail")
+
+    ref = _reference_mm(a, b, arch)
+    precision = REL_PRECISION[dtype]
+    torch.testing.assert_close(full, ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+    torch.cuda.empty_cache()
+
+
 def run_mm_case(
     arch,
     M,

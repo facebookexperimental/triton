@@ -14,7 +14,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
-#include "triton/Tools/Sys/GetEnv.h"
 
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 
@@ -25,6 +24,7 @@ using namespace mlir::triton::gpu;
 using TranspositionInfo = DecomposedWarpConversion::TranspositionInfo;
 
 constexpr int kPtrBitWidth = 64;
+
 struct ConvertLayoutOpConversion
     : public ConvertOpToLLVMPattern<ConvertLayoutOp> {
   const TargetInfoBase &targetInfo;
@@ -44,71 +44,31 @@ struct ConvertLayoutOpConversion
     auto srcTy = op.getSrc().getType();
     auto dstTy = op.getType();
 
-    auto kBlock = str_attr("block");
-    auto kWarp = str_attr("warp");
-    auto kLane = str_attr("lane");
     auto kRegister = str_attr("register");
 
+    if (auto plan = getMixedRadixConversionPlan(srcTy, dstTy))
+      return lowerMixedRadixConversion(op, *plan, adaptor, rewriter);
     auto srcLayout = toLinearLayout(srcTy).removeZeroBasesAlongDim(kRegister);
     auto dstLayout = toLinearLayout(dstTy).removeZeroBasesAlongDim(kRegister);
     LinearLayout conversion = minimalCvtLayout(srcLayout, dstLayout);
 
-    auto dims = conversion.getInDimNames();
-    auto srcEnc = cast<RankedTensorType>(srcTy).getEncoding();
-    auto dstEnc = cast<RankedTensorType>(dstTy).getEncoding();
-    if ((isGenericLinearEncoding(srcEnc) || isGenericLinearEncoding(dstEnc)) &&
-        llvm::range_size(dims) > 1)
-      return op.emitError("ConvertLayoutOp  supports GenericLinearEncoding "
-                          " only when the conversion is transfer between "
-                          "values in the same thread.");
     assert(to_vector(conversion.getInDimNames()) ==
            to_vector(conversion.getOutDimNames()));
-    if (llvm::is_contained(dims, kBlock) || llvm::is_contained(dims, kWarp)) {
-      // Transfer between values in the same CTA, or across CTAs. We move values
-      // through (distributed) shared memory.
-      transferSwizzlingLocalMem(op, adaptor.getSrc(), srcLayout, dstLayout,
-                                rewriter);
-      return success();
-    } else if (llvm::is_contained(dims, kLane)) {
-      // Case 3. Transfer between values in the same warp, in which case we try
-      //         to move values using warp shuffles, though if the pattern is
-      //         expensive enough we fall back to using shared memory
-      if (cvtNeedsWarpShuffle(op))
-        return transferWithinWarp(op, srcLayout, dstLayout, adaptor, rewriter);
-
-      transferSwizzlingLocalMem(op, adaptor.getSrc(), srcLayout, dstLayout,
-                                rewriter);
-      return success();
-    } else if (llvm::is_contained(dims, kRegister)) {
-      // Case 4. Transfer between values in the same thread, in which case we
-      //         simply reorder the elements of adaptor.getSrc().
-      return transferWithinThread(op, conversion, adaptor, rewriter);
-    } else {
-      // Cast 5. The two layouts are equivalent. We should probably remove
-      // these in RemoveLayoutConversion.
-      //
-      // NPOT: minimalCvtLayout's quotient uses squareSublayoutIsIdentity (pure
-      // GF(2), basis == 1<<b), which false-positives on modular register dims
-      // and collapses two different ADD-mod-N maps to a no-op -> scramble. If
-      // either side is modular and they are not truly equal, route the real
-      // remap through transferWithinThread. pow2 unaffected (isModular() is
-      // false).
-      if (srcLayout.isModular() || dstLayout.isModular()) {
-        static const bool allowNpot =
-            ::mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
-        if (allowNpot && srcLayout != dstLayout) {
-          // Rebuild the register remap without the quotient; lane/warp/block
-          // are identity at Case 5, so the register sublayout is the full
-          // conversion.
-          LinearLayout fullConversion = dstLayout.invertAndCompose(srcLayout);
-          LinearLayout regConversion =
-              fullConversion.sublayout({kRegister}, {kRegister});
-          return transferWithinThread(op, regConversion, adaptor, rewriter);
-        }
-      }
+    if (conversion.getNumInDims() == 0) {
+      assert(adaptor.getSrc().getType() ==
+             getTypeConverter()->convertType(dstTy));
       rewriter.replaceOp(op, adaptor.getSrc());
       return success();
     }
+    if (conversion.getNumInDims() == 1)
+      return transferWithinThread(op, conversion, adaptor, rewriter);
+
+    if (cvtNeedsWarpShuffle(op))
+      return transferWithinWarp(op, srcLayout, dstLayout, adaptor, rewriter);
+
+    transferSwizzlingLocalMem(op, adaptor.getSrc(), srcLayout, dstLayout,
+                              rewriter);
+    return success();
   }
 
   LogicalResult
@@ -136,111 +96,35 @@ struct ConvertLayoutOpConversion
     return success();
   }
 
-  SmallVector<Value> transferWithinBlockModular(
-      Location loc, ConversionPatternRewriter &rewriter,
-      const LinearLayout &srcLayout, const LinearLayout &dstLayout,
-      ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
-      std::optional<std::pair<Value, Value>> distributedCoordinates) const {
-    auto *ctx = rewriter.getContext();
-    auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto kReg = str_attr("register");
-    auto kLane = str_attr("lane");
-    auto kWarp = str_attr("warp");
-
-    auto hasSupportedInputs = [&](const LinearLayout &layout) {
-      return llvm::all_of(layout.getInDimNames(), [&](StringAttr dim) {
-        return dim == kReg || dim == kLane || dim == kWarp;
-      });
-    };
-    // The caller removes block before entering this helper.
-    assert(hasSupportedInputs(srcLayout) && hasSupportedInputs(dstLayout) &&
-           "modular shared transfer expects register/lane/warp inputs");
-    assert(srcLayout.isSurjective() && dstLayout.isSurjective() &&
-           "modular shared transfer requires complete logical covers");
-    assert(to_vector(srcLayout.getOutDimNames()) ==
-               to_vector(dstLayout.getOutDimNames()) &&
-           "source and destination must cover the same logical dimensions");
-    for (auto dim : srcLayout.getOutDimNames())
-      assert(srcLayout.getOutDimSize(dim) == dstLayout.getOutDimSize(dim) &&
-             "source and destination logical dimensions must have equal size");
-
-    std::pair<Value, Value> coordinates = distributedCoordinates
-                                              ? *distributedCoordinates
-                                              : getLaneAndWarpId(rewriter, loc);
-    Value laneId = coordinates.first;
-    Value warpId = coordinates.second;
-    auto elemPtrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
-    smemBase = b.bitcast(smemBase, elemPtrTy);
-
-    auto getIndices = [&](const LinearLayout &layout, int32_t reg) {
-      SmallVector<std::pair<StringAttr, Value>> indices;
-      for (auto dim : layout.getInDimNames()) {
-        if (dim == kReg)
-          indices.push_back({dim, b.i32_val(reg)});
-        else if (dim == kLane)
-          indices.push_back({dim, laneId});
-        else if (dim == kWarp)
-          indices.push_back({dim, warpId});
-        else
-          llvm_unreachable("unsupported modular conversion input dimension");
-      }
-      return indices;
-    };
-
-    auto getOffset = [&](const LinearLayout &layout,
-                         ArrayRef<std::pair<StringAttr, Value>> indices) {
-      auto logical = applyLinearLayout(loc, rewriter, layout, indices);
-      SmallVector<Value> coords;
-      SmallVector<unsigned> shape;
-      for (auto &[dim, value] : logical) {
-        coords.push_back(value);
-        shape.push_back(layout.getOutDimSize(dim));
-      }
-      return LLVM::linearize(rewriter, loc, coords, shape);
-    };
-
-    // Select one pre-modulo representative per logical coordinate.
-    auto isCanonical = [&](const LinearLayout &layout,
-                           ArrayRef<std::pair<StringAttr, Value>> indices) {
-      Value canonical = b.true_val();
-      for (auto dim : layout.getOutDimNames()) {
-        if (!layout.isOutDimModular(dim))
-          continue;
-        Value raw = b.i32_val(0);
-        for (auto [inDim, index] : indices) {
-          for (int32_t bit = 0; bit < layout.getInDimSizeLog2(inDim); ++bit) {
-            int32_t basis = layout.getBasis(inDim, bit, dim);
-            if (basis == 0)
-              continue;
-            Value set =
-                b.icmp_ne(b.and_(index, b.i32_val(1u << bit)), b.i32_val(0));
-            raw = b.add(raw, b.select(set, b.i32_val(basis), b.i32_val(0)));
-          }
-        }
-        canonical = b.and_(
-            canonical, b.icmp_ult(raw, b.i32_val(layout.getOutDimSize(dim))));
-      }
-      return canonical;
-    };
-
-    for (auto [reg, value] : llvm::enumerate(inVals)) {
-      auto indices = getIndices(srcLayout, reg);
-      Value offset = getOffset(srcLayout, indices);
-      Value canonical = isCanonical(srcLayout, indices);
-      Value ptr = b.gep(elemPtrTy, llvmElemTy, smemBase, offset);
-      targetInfo.storeShared(rewriter, loc, ptr, value, canonical);
+  LogicalResult lowerMixedRadixConversion(
+      ConvertLayoutOp op, const MixedRadixConversionPlan &plan,
+      OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const {
+    assert(plan.supported() && "the verifier rejects unsupported plans");
+    auto loc = op.getLoc();
+    auto kRegister = StringAttr::get(op.getContext(), "register");
+    auto dstTy = op.getType();
+    auto srcLayout = toLinearLayout(op.getSrc().getType())
+                         .removeZeroBasesAlongDim(kRegister);
+    auto dstLayout = toLinearLayout(dstTy).removeZeroBasesAlongDim(kRegister);
+    if (plan.transfer == MixedRadixConversionTransfer::Shared) {
+      transferSwizzlingLocalMem(op, adaptor.getSrc(), srcLayout, dstLayout,
+                                rewriter, &plan);
+      return success();
     }
-    targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
-
-    // Every destination offset has a canonical source store.
-    SmallVector<Value> outVals;
-    outVals.reserve(dstLayout.getInDimSize(kReg));
-    for (int32_t reg = 0; reg < dstLayout.getInDimSize(kReg); ++reg) {
-      Value offset = getOffset(dstLayout, getIndices(dstLayout, reg));
-      Value ptr = b.gep(elemPtrTy, llvmElemTy, smemBase, offset);
-      outVals.push_back(b.load(llvmElemTy, ptr));
-    }
-    return outVals;
+    if (plan.transfer == MixedRadixConversionTransfer::Warp)
+      return transferWithinWarp(op, srcLayout, dstLayout, adaptor, rewriter,
+                                &plan);
+    auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
+    SmallVector<Value> outVals(inVals.size());
+    for (auto [i, value] : llvm::enumerate(inVals))
+      outVals[plan.warpFactors->pReg.apply({{kRegister, int32_t(i)}})
+                  .front()
+                  .second] = value;
+    rewriter.replaceOp(op, packUniqueTensorElements(
+                               loc, getTypeConverter(),
+                               plan.destinationRegisterOrder->apply(outVals),
+                               rewriter, dstTy));
+    return success();
   }
 
   SmallVector<Value> transferSwizzlingLocalMemImpl(
@@ -248,7 +132,8 @@ struct ConvertLayoutOpConversion
       const LinearLayout &srcLayout, const LinearLayout &dstLayout,
       ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
       Operation *sourceOp,
-      std::optional<std::pair<Value, Value>> distributedCoordinates) const {
+      std::optional<std::pair<Value, Value>> distributedCoordinates,
+      const MixedRadixConversionPlan *plan) const {
     auto *ctx = rewriter.getContext();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     // We handle transformations recursively as they all need a preprocessing
@@ -262,7 +147,7 @@ struct ConvertLayoutOpConversion
       }));
       auto outVals = transferSwizzlingLocalMemImpl(
           loc, rewriter, srcLayout, dstLayout, newInVals, llvmElemTyPtr,
-          smemBase, sourceOp, distributedCoordinates);
+          smemBase, sourceOp, distributedCoordinates, plan);
       for (auto &v : outVals) {
         v = b.inttoptr(llvmElemTy, v);
       }
@@ -277,11 +162,35 @@ struct ConvertLayoutOpConversion
           inVals, [&](Value v) { return b.zext(i8ElemTy, v).getResult(); }));
       auto outVals = transferSwizzlingLocalMemImpl(
           loc, rewriter, srcLayout, dstLayout, newInVals, i8ElemTy, smemBase,
-          sourceOp, distributedCoordinates);
+          sourceOp, distributedCoordinates, plan);
       for (auto &v : outVals) {
-        v = b.trunc(llvmElemTy, v);
+        v = b.trunc(llvmElemTy, v, LLVM::IntegerOverflowFlags::nuw);
       }
       return outVals;
+    }
+
+    // The owner predicate handles broadcast source registers. A transpose
+    // moves its odd tiles on the swizzled pow2 path, which keeps a vector on
+    // both sides.
+    if (plan) {
+      bool blockScope = plan->scope == triton::MixedRadixConversionScope::Block;
+      if (auto tiles = getMixedRadixTransposeTiles(
+              srcLayout, dstLayout, llvmElemTy.getIntOrFloatBitWidth()))
+        return transferMixedRadixThroughSharedMemory(
+            loc, rewriter, targetInfo, srcLayout, dstLayout, inVals, llvmElemTy,
+            smemBase, plan->sourceFreeVariableMasks, blockScope,
+            distributedCoordinates, &*tiles,
+            [&](const LinearLayout &src, const LinearLayout &dst,
+                ArrayRef<Value> vals) {
+              return transferSwizzlingLocalMemImpl(
+                  loc, rewriter, src, dst, vals, llvmElemTy, smemBase, sourceOp,
+                  distributedCoordinates, /*plan=*/nullptr);
+            });
+      return transferMixedRadixThroughSharedMemory(
+          loc, rewriter, targetInfo, srcLayout, dstLayout, inVals, llvmElemTy,
+          smemBase, plan->sourceFreeVariableMasks, blockScope,
+          distributedCoordinates,
+          plan->sharedTiling ? &*plan->sharedTiling : nullptr);
     }
 
     // Remove broadcasting in src
@@ -289,9 +198,9 @@ struct ConvertLayoutOpConversion
     if (!removeBroadcastSrc.isIdentity()) {
       auto prmtSrc = removeBroadcastSrc.apply(srcLayout);
       auto newInVals = removeBroadcastSrc.apply(inVals);
-      return transferSwizzlingLocalMemImpl(loc, rewriter, prmtSrc, dstLayout,
-                                           newInVals, llvmElemTy, smemBase,
-                                           sourceOp, distributedCoordinates);
+      return transferSwizzlingLocalMemImpl(
+          loc, rewriter, prmtSrc, dstLayout, newInVals, llvmElemTy, smemBase,
+          sourceOp, distributedCoordinates, /*plan=*/nullptr);
     }
 
     // Remove broadcasting in dst
@@ -300,17 +209,12 @@ struct ConvertLayoutOpConversion
       auto prmtDst = removeBroadcastDst.apply(dstLayout);
       auto outVals = transferSwizzlingLocalMemImpl(
           loc, rewriter, srcLayout, prmtDst, inVals, llvmElemTy, smemBase,
-          sourceOp, distributedCoordinates);
+          sourceOp, distributedCoordinates, /*plan=*/nullptr);
       return broadcastAs(outVals, dstLayout);
     }
 
     // At this point we have a type that's at least 8-bit
     // and we don't have broadcasting in the registers
-    if (srcLayout.isModular() || dstLayout.isModular())
-      return transferWithinBlockModular(loc, rewriter, srcLayout, dstLayout,
-                                        inVals, llvmElemTy, smemBase,
-                                        distributedCoordinates);
-
     auto bitwidth = llvmElemTy.getIntOrFloatBitWidth();
     int numBanks = targetInfo.getSharedMemoryBanks();
     int32_t vecBitwidth =
@@ -328,7 +232,7 @@ struct ConvertLayoutOpConversion
     auto reps = LinearLayout::identity1D(nReps, kReg, kReps);
 
     auto totalStoreCvt = srcLayout.invertAndCompose(smem);
-    auto totalLoadCvt = invertAndComposeBlockLocal(smem, dstLayout);
+    auto totalLoadCvt = invertAndComposeLocal(smem, dstLayout, {kBlock});
 
     // The permutation exists by construction of the reps dimension in
     // optimalSwizzling
@@ -403,10 +307,10 @@ struct ConvertLayoutOpConversion
     return outVals;
   }
 
-  void transferSwizzlingLocalMem(ConvertLayoutOp op, Value src,
-                                 const LinearLayout &srcLayout,
-                                 const LinearLayout &dstLayout,
-                                 ConversionPatternRewriter &rewriter) const {
+  void transferSwizzlingLocalMem(
+      ConvertLayoutOp op, Value src, const LinearLayout &srcLayout,
+      const LinearLayout &dstLayout, ConversionPatternRewriter &rewriter,
+      const MixedRadixConversionPlan *plan = nullptr) const {
     auto loc = op.getLoc();
     auto srcTy = op.getSrc().getType();
     auto dstTy = op.getType();
@@ -426,7 +330,7 @@ struct ConvertLayoutOpConversion
     }
     auto outVals = transferSwizzlingLocalMemImpl(
         loc, rewriter, srcLayout, dstLayout, inVals, llvmElemTy, smemBase, op,
-        distributedCoordinates);
+        distributedCoordinates, plan);
 
     Value result = packUniqueTensorElements(loc, getTypeConverter(), outVals,
                                             rewriter, dstTy);
@@ -435,11 +339,11 @@ struct ConvertLayoutOpConversion
 
   // Use warp shuffles to implement a layout conversion where data only needs to
   // be moved within warps.
-  LogicalResult transferWithinWarp(ConvertLayoutOp op,
-                                   const LinearLayout &srcLayout,
-                                   const LinearLayout &dstLayout,
-                                   OpAdaptor adaptor,
-                                   ConversionPatternRewriter &rewriter) const {
+  LogicalResult
+  transferWithinWarp(ConvertLayoutOp op, const LinearLayout &srcLayout,
+                     const LinearLayout &dstLayout, OpAdaptor adaptor,
+                     ConversionPatternRewriter &rewriter,
+                     const MixedRadixConversionPlan *plan = nullptr) const {
     auto loc = op.getLoc();
     auto *ctx = op.getContext();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -450,16 +354,16 @@ struct ConvertLayoutOpConversion
     auto elemTy = getTypeConverter()->convertType(srcTy.getElementType());
     int bitwidth = getIntOrFloatOrPtrBitWidth(elemTy);
 
-    auto factors =
-        getWarpLayoutConvertDecomposition(srcLayout, dstLayout, bitwidth);
-    auto &[pReg, pLane, mixedTranspositions, nPack] = factors;
+    auto [pReg, shuffleMap, mixedTranspositions, nPack] =
+        plan
+            ? *plan->warpFactors
+            : getWarpLayoutConvertDecomposition(srcLayout, dstLayout, bitwidth);
     int m = mixedTranspositions.size();
-    bool pLaneIsTrivial = squareSublayoutIsIdentity(pLane, kLane);
-    assert((m > 0 || !pLaneIsTrivial) && "Shuffles not needed for conversion");
+    bool isXorShuffle = squareSublayoutIsIdentity(shuffleMap, kLane);
 
-    // The desired layout conversion can be expressed as a permutation P of
-    // hardware index bits for the `kLane` and `kReg` dimensions. The `factors`
-    // of P describe a decomposition
+    // In permutation cases, the desired layout conversion can be expressed as
+    // a permutation P of hardware index bits for the `kLane` and `kReg`
+    // dimensions. The `factors` of P describe a decomposition
     //
     //                 P = P_mixed \circ P_lane \circ P_reg,
     //
@@ -471,7 +375,7 @@ struct ConvertLayoutOpConversion
     //    at a time using 1.5 * R selects/permutes and .5 * R shuffles each.
     //  - An in-place `Swap` method which can simultaneously implement P_lane
     //    and multiple mixed transpositions at a time using 2 * m * R selects/
-    //    permutes and either (1 - (1/2)^m) * R shuffles if `pLaneIsTrivial` and
+    //    permutes and either (1 - (1/2)^m) * R shuffles if `isXorShuffle` and
     //    R shuffles otherwise.
     // Here, R denotes the number of 32-bit registers in use after packing (or
     // splitting, if applied to 64-bit types or pointers), and in the `Swap`
@@ -482,21 +386,10 @@ struct ConvertLayoutOpConversion
     // layout, then we broadcast along the register dimension to match size. The
     // removal of broadcasting above and introduction here is expected by the
     // `factors`.
-    int regDim = inVals.size();
-    int pRegDim = pReg.getInDimSize(kReg);
-    if (pRegDim > regDim) {
-      SmallVector<Value> original(inVals.begin(), inVals.end());
-      inVals.clear();
-      inVals.reserve(pRegDim);
-      while (inVals.size() < pRegDim)
-        inVals.append(original.begin(), original.end());
-      regDim = pRegDim;
-    }
-
-    // Apply pReg.
+    int regDim = pReg.getInDimSize(kReg);
     SmallVector<Value> newInVals(regDim);
-    for (const auto &[i, v] : llvm::enumerate(inVals))
-      newInVals[pReg.apply({{kReg, i}})[0].second] = v;
+    for (int r = 0; r < regDim; ++r)
+      newInVals[pReg.apply({{kReg, r}})[0].second] = inVals[r % inVals.size()];
     inVals = std::move(newInVals);
 
     // Pack registers if possible.
@@ -542,12 +435,13 @@ struct ConvertLayoutOpConversion
     };
 
     SmallVector<Value> outVals;
-    if (m == 1 && pLaneIsTrivial && isShippable(mixedTranspositions[0])) {
+    if (m == 1 && isXorShuffle && isShippable(mixedTranspositions[0])) {
       outVals = transferWithinWarpShipImpl(loc, rewriter, inVals, nPack,
                                            mixedTranspositions[0]);
     } else {
-      outVals = transferWithinWarpSwapImpl(loc, rewriter, inVals, nPack, pLane,
-                                           pLaneIsTrivial, mixedTranspositions);
+      outVals =
+          transferWithinWarpSwapImpl(loc, rewriter, inVals, nPack, shuffleMap,
+                                     isXorShuffle, mixedTranspositions);
     }
 
     // Unpack registers if needed.
@@ -567,7 +461,7 @@ struct ConvertLayoutOpConversion
       }
       if (bitwidth < bitsPerVecElem) {
         for (Value &v : unpackedVals) {
-          v = b.trunc(int_ty(bitwidth), v);
+          v = b.trunc(int_ty(bitwidth), v, LLVM::IntegerOverflowFlags::nuw);
           if (elemTy != int_ty(bitwidth))
             v = b.bitcast(v, elemTy);
         }
@@ -575,6 +469,10 @@ struct ConvertLayoutOpConversion
       outVals = std::move(unpackedVals);
     }
 
+    // A mixed-radix plan's pReg output is in destinationRegisterOrder's input
+    // order.
+    if (plan)
+      outVals = plan->destinationRegisterOrder->apply(outVals);
     // If `dstLayout` has a smaller `kReg` dimension than `srcLayout` after
     // broadcasting is removed, then drop the extra registers from `outVals`.
     outVals.resize(dstLayout.getInDimSize(kReg));
@@ -587,12 +485,14 @@ struct ConvertLayoutOpConversion
 
   SmallVector<Value> transferWithinWarpSwapImpl(
       Location loc, ConversionPatternRewriter &rewriter, ArrayRef<Value> inVals,
-      int nPack, const LinearLayout &pLane, bool pLaneIsTrivial,
+      int nPack, const LinearLayout &shuffleMap, bool isXorShuffle,
       ArrayRef<TranspositionInfo> mixedTranspositions) const {
     auto *ctx = rewriter.getContext();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto kReg = str_attr("register");
     auto kLane = str_attr("lane");
+    auto kWarp = str_attr("warp");
+    auto kBlock = str_attr("block");
 
     SmallVector<Value> vals(inVals.begin(), inVals.end());
     int m = mixedTranspositions.size();
@@ -617,24 +517,22 @@ struct ConvertLayoutOpConversion
     // of each transposition together. The two combined `selp` stages each use
     // `numRegs` selects per transposition, while the `shfl` stage only requires
     // code emission when at least one of the `r_i` bits is on, resulting in
-    // `(1 - (1/2)^m) * numRegs` shuffles in total. If `pLane` is nontrivial,
+    // `(1 - (1/2)^m) * numRegs` shuffles in total. If `P_lane` is nontrivial,
     // then we can conjugate its effects through the first two stages and fuse
     // it with the second stage, resulting in `numRegs` shuffles instead.
-    Value laneId = getLaneId(rewriter, loc);
-    auto pLaneInv = pLane.invert();
-    const auto &pLInvBases = pLaneInv.getBases().lookup(kLane);
-
+    Value laneId, warpId;
+    std::tie(laneId, warpId) = getLaneAndWarpId(rewriter, loc);
     // Implement r_i ^= l_j using `numRegs` independent selects or permutes.
     auto applySwap = [&](TranspositionInfo t, bool preShuf) {
-      int rIdx = t.transposition.first - nPack;
-      int origLIdx = t.transposition.second;
-      int lIdx = preShuf ? llvm::Log2_32(pLInvBases[origLIdx][0]) : origLIdx;
+      int rIdx = t.regBit - nPack;
+      int lIdx = preShuf ? t.srcLane : t.dstLane;
       uint16_t topSel = preShuf ? t.topPreSel : t.topPostSel;
       uint16_t botSel = preShuf ? t.botPreSel : t.botPostSel;
 
       SmallVector<Value> newVals(numRegs);
-      Value lBitVal = b.and_(laneId, b.i32_val(1 << lIdx));
-      Value lBitOff = b.icmp_eq(lBitVal, b.i32_val(0));
+      Value lBitOff = b.true_val();
+      if (lIdx >= 0)
+        lBitOff = b.icmp_eq(b.and_(laneId, b.i32_val(1 << lIdx)), b.i32_val(0));
 
       int tileSize = 1 << (rIdx + 1);
       int numTiles = numRegs / tileSize;
@@ -668,18 +566,22 @@ struct ConvertLayoutOpConversion
       vals = applySwap(t, /*preShuf=*/true);
     // Stage 2 (shfl)
     Value laneIdPerm;
-    if (!pLaneIsTrivial)
-      laneIdPerm = triton::gpu::matrixVectorProd(b, pLaneInv, laneId);
+    if (!isXorShuffle) {
+      SmallVector<std::pair<StringAttr, Value>> indices{{kLane, laneId}};
+      if (!shuffleMap.sublayoutIsZero(kWarp, kLane))
+        indices.push_back({kWarp, warpId});
+      if (!shuffleMap.sublayoutIsZero(kBlock, kLane))
+        indices.push_back({kBlock, targetInfo.getClusterCTAId(rewriter, loc)});
+      auto dims = to_vector(llvm::make_first_range(indices));
+      laneIdPerm = applyLinearLayout(loc, rewriter,
+                                     shuffleMap.sublayout(dims, kLane), indices)
+                       .front()
+                       .second;
+    }
+    auto registerToLane = shuffleMap.sublayout(kReg, kLane);
     for (int r = 0; r < numRegs; ++r) {
-      int mask = 0;
-      for (const auto &t : mixedTranspositions) {
-        int rIdx = t.transposition.first - nPack;
-        int lIdx = t.transposition.second;
-        if (r & (1 << rIdx)) {
-          mask |= pLInvBases[lIdx][0];
-        }
-      }
-      if (pLaneIsTrivial) {
+      int mask = registerToLane.apply({{kReg, r << nPack}})[0].second;
+      if (isXorShuffle) {
         if (mask != 0)
           vals[r] = targetInfo.shuffleXor(rewriter, loc, vals[r], mask);
       } else {
@@ -701,8 +603,8 @@ struct ConvertLayoutOpConversion
     // `transferWithinWarpSwapImpl`, but uses auxiliary registers to hold the
     // values to be shuffled, resulting in fewer emitted instructions.
     int numRegs = inVals.size();
-    int rIdx = t.transposition.first - nPack;
-    int lIdx = t.transposition.second;
+    int rIdx = t.regBit - nPack;
+    int lIdx = t.dstLane;
     int tileSize = 1 << (rIdx + 1);
     int numTiles = numRegs / tileSize;
 

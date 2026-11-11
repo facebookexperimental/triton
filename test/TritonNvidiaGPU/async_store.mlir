@@ -22,6 +22,38 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 
 // -----
 
+// Test async_store reductions: cp.reduce.async.bulk without a tensor map. The
+// element type picks the PTX type; f16/bf16 ADD uses .noftz and integer MIN/MAX
+// follow store_reduce_signed.
+
+#shared_r = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem_r = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: async_store_reduce
+  // CHECK-LLVM-LABEL: llvm.func @async_store_reduce
+  tt.func @async_store_reduce(%f32: !tt.ptr<f32>, %bf16: !tt.ptr<bf16>, %i32: !tt.ptr<i32>, %size: i32) {
+    %src_f32 = ttg.local_alloc : () -> !ttg.memdesc<128xf32, #shared_r, #smem_r, mutable>
+    %src_bf16 = ttg.local_alloc : () -> !ttg.memdesc<128xbf16, #shared_r, #smem_r, mutable>
+    %src_i32 = ttg.local_alloc : () -> !ttg.memdesc<128xi32, #shared_r, #smem_r, mutable>
+    // CHECK: ttng.async_store {{.*}} {store_reduce = 1 : i32}
+    // CHECK-LLVM: cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$1], [$2], $3;
+    // CHECK-LLVM: nvvm.cp.async.bulk.commit.group
+    ttng.async_store %src_f32, %f32, %size {store_reduce = 1 : i32} : !ttg.memdesc<128xf32, #shared_r, #smem_r, mutable>, !tt.ptr<f32>
+    // CHECK-LLVM: cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.bf16
+    ttng.async_store %src_bf16, %bf16, %size {store_reduce = 1 : i32} : !ttg.memdesc<128xbf16, #shared_r, #smem_r, mutable>, !tt.ptr<bf16>
+    // CHECK-LLVM: cp.reduce.async.bulk.global.shared::cta.bulk_group.min.s32
+    ttng.async_store %src_i32, %i32, %size {store_reduce = 2 : i32, store_reduce_signed = true} : !ttg.memdesc<128xi32, #shared_r, #smem_r, mutable>, !tt.ptr<i32>
+    // CHECK-LLVM: cp.reduce.async.bulk.global.shared::cta.bulk_group.max.u32
+    ttng.async_store %src_i32, %i32, %size {store_reduce = 3 : i32} : !ttg.memdesc<128xi32, #shared_r, #smem_r, mutable>, !tt.ptr<i32>
+    // CHECK-LLVM: cp.reduce.async.bulk.global.shared::cta.bulk_group.xor.b32
+    ttng.async_store %src_i32, %i32, %size {store_reduce = 8 : i32} : !ttg.memdesc<128xi32, #shared_r, #smem_r, mutable>, !tt.ptr<i32>
+    tt.return
+  }
+}
+
+// -----
+
 // Test async_store with data originating from a register layout (blocked).
 // tl.arange creates a blocked layout in registers; local_alloc writes it to SMEM;
 // async_store bulk-copies from SMEM to global memory.

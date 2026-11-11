@@ -39,6 +39,31 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+#a_scale = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[0, 0], [16, 0]], block = [[32, 0], [0, 0]]}>
+#b_scale = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[16, 0], [0, 0]], block = [[0, 0], [32, 0]]}>
+#mma_acc = #ttg.amd_wmma<{version = 3, ctaLayout = {warp = [[0, 1], [1, 0]]}, isTranspose = true, CGALayout = [[1, 0], [0, 1]], instrShape = [16, 16, 128]}>
+#mma_a = #ttg.amd_wmma<{version = 3, ctaLayout = {warp = [[0, 1], [1, 0]]}, isTranspose = true, CGALayout = [[1, 0], [0, 0]], instrShape = [16, 16, 128]}>
+#mma_b = #ttg.amd_wmma<{version = 3, ctaLayout = {warp = [[0, 1], [1, 0]]}, isTranspose = true, CGALayout = [[0, 0], [0, 1]], instrShape = [16, 16, 128]}>
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: wmma_scaled_dot_clustered
+  // CHECK: llvm.amdgcn.wmma.scale.f32.16x16x128.f8f6f4
+  // CHECK-NOT: llvm.amdgcn.wmma.scale.f32.16x16x128.f8f6f4
+  tt.func @wmma_scaled_dot_clustered(
+      %a: tensor<64x128xi8, #ttg.dot_op<{opIdx = 0, parent = #mma_a, kWidth = 16}>>,
+      %a_scale: tensor<64x4xi8, #a_scale>,
+      %b: tensor<128x64xi8, #ttg.dot_op<{opIdx = 1, parent = #mma_b, kWidth = 16}>>,
+      %b_scale: tensor<64x4xi8, #b_scale>,
+      %acc: tensor<64x64xf32, #mma_acc>) {
+    %result = tt.dot_scaled %a scale %a_scale, %b scale %b_scale, %acc lhs = e4m3 rhs = e4m3 {fastMath = false} :
+      tensor<64x128xi8, #ttg.dot_op<{opIdx = 0, parent = #mma_a, kWidth = 16}>>, tensor<64x4xi8, #a_scale> *
+      tensor<128x64xi8, #ttg.dot_op<{opIdx = 1, parent = #mma_b, kWidth = 16}>>, tensor<64x4xi8, #b_scale> ->
+      tensor<64x64xf32, #mma_acc>
+    tt.return
+  }
+}
+
+// -----
+
 #linear = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[0, 0], [16, 0]], block = []}>
 #linear1 = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[16, 0], [0, 0]], block = []}>
 #mma = #ttg.amd_wmma<{version = 3, ctaLayout = {warp = [[0, 1], [1, 0]]}, isTranspose = true, instrShape=[16, 16, 128]}>
@@ -316,6 +341,25 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK-COUNT-16: llvm.insertelement {{.*}} : vector<1xf32>
     %ptr0 = tt.splat %out0 : !tt.ptr<f32> -> tensor<32x64x!tt.ptr<f32>, #mma>
     tt.store %ptr0, %c : tensor<32x64x!tt.ptr<f32>, #mma>
+    tt.return
+  }
+}
+
+// -----
+
+#linear = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[0, 0], [16, 0]], block = []}>
+#linear1 = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[16, 0], [0, 0]], block = []}>
+#mma = #ttg.amd_wmma<{version = 3, ctaLayout = {warp = [[0, 1], [1, 0]]}, isTranspose = true, instrShape=[16, 16, 128]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: wmma_scaled_dot_fp6
+  tt.func @wmma_scaled_dot_fp6(%arg0: tensor<32x128xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>, %arg1: tensor<32x4xi8, #linear>, %arg2: tensor<128x32xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>, %arg3: tensor<32x4xi8, #linear1>, %out0: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma>
+    // fp6 K=128 packs to 96 bytes per instruction, carried as vector<12xi32>.
+    // CHECK: llvm.call_intrinsic "llvm.amdgcn.wmma.scale.f32.16x16x128.f8f6f4"{{.*}} : (i32, vector<12xi32>, i32, vector<12xi32>, i16, vector<8xf32>, i32, i32, i32, i32, i32, i32, i1, i1) -> vector<8xf32>
+    %c = tt.dot_scaled %arg0 scale %arg1, %arg2 scale %arg3, %cst lhs = e2m3 rhs = e2m3 {fastMath = false} : tensor<32x128xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>, tensor<32x4xi8, #linear> * tensor<128x32xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>, tensor<32x4xi8, #linear1> -> tensor<32x32xf32, #mma>
+    %ptr0 = tt.splat %out0 : !tt.ptr<f32> -> tensor<32x32x!tt.ptr<f32>, #mma>
+    tt.store %ptr0, %c : tensor<32x32x!tt.ptr<f32>, #mma>
     tt.return
   }
 }

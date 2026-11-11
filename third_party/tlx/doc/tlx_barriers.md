@@ -142,6 +142,25 @@ barriers, and c) workgroup barriers (AMD).
 | tlx.named_barrier_wait | ttng::wait_barrier_named | [<u>bar.sync</u>](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-bar) |
 | tlx.named_barrier_arrive | ttng::arrive_barrier_named | [<u>bar.arrive</u>](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-bar) |
 
+#### Code generation: `.aligned` selection
+
+`bar.sync`/`bar.arrive` are the `.aligned` spellings of
+`barrier.sync`/`barrier.arrive`. Per NVIDIA, `.aligned` only requires
+warp-level alignment: all threads in a warp must execute the same barrier
+instruction (same barrier ID and participant count). A branch condition may
+itself be data-dependent so long as it is warp-uniform (e.g. an iteration
+count). Divergence across warps is legal -- e.g. different warp-specialize
+partitions executing the `sync` and `arrive` halves of a ping-pong phase, or
+branches on warp IDs.
+
+The backend emits `.aligned` only when it can prove this property: the
+barrier must execute in a warp-uniform control context (no reaching branches
+on thread/lane IDs or on data-dependent values that can vary by thread
+within a warp) with warp-uniform barrier-ID and count operands. Straight-line code, warp-specialize partitions, and
+branches on constants, program IDs, or warp IDs all qualify. When uniformity
+cannot be proven, the backend falls back to the non-aligned
+`barrier.sync`/`barrier.arrive` forms, which carry no uniformity requirement.
+
 #### Example (PingPong Schedule)
 
 PingPong scheduling creates mutually exclusive ‘Ping’ and ‘Pong’

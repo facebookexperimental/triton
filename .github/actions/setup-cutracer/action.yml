@@ -1,0 +1,67 @@
+name: Set up CUTracer
+description: >
+  Install NVIDIA Compute Sanitizer and put it on PATH for later steps, then
+  install the cutracer CLI from PyPI into the active venv (see
+  setup-test-env). The runner images ship no CUDA toolkit, so the sanitizer
+  comes from the same apt source CUTracer's own CI uses on these runners
+  (.ci/setup-gpu.sh in facebookexperimental/CUTracer), along with the
+  toolkit's forward-compatibility driver libraries, since the runners' R580
+  driver predates CUDA 13.4. PyPI ships no cutracer.so, so the action builds
+  it from the CUTracer tag matching the CLI and exports its path as
+  CUTRACER_SO.
+inputs:
+  cuda-version:
+    description: "CUDA toolkit version providing compute-sanitizer, e.g. 13.4"
+    required: false
+    default: "13.4"
+  cutracer-version:
+    description: cutracer version on PyPI
+    required: true
+  cuda-arch:
+    description: "GPU architecture to build cutracer.so for, e.g. sm_100"
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install Compute Sanitizer
+      shell: bash
+      env:
+        CUDA_VERSION: ${{ inputs.cuda-version }}
+      run: |
+        set -euo pipefail
+        KEYRING_DEB="${RUNNER_TEMP}/cuda-keyring.deb"
+        curl -fsSL -o "${KEYRING_DEB}" https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+        sudo dpkg -i "${KEYRING_DEB}"
+        sudo apt-get update -y
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          "cuda-toolkit-${CUDA_VERSION//./-}" "cuda-compat-${CUDA_VERSION//./-}"
+        CUDA_ROOT="/usr/local/cuda-${CUDA_VERSION}"
+        # Later steps load the toolkit's libcuda instead of the older driver's.
+        echo "LD_LIBRARY_PATH=${CUDA_ROOT}/compat${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "${GITHUB_ENV}"
+        "${CUDA_ROOT}/bin/compute-sanitizer" --version
+        echo "${CUDA_ROOT}/bin" >> "${GITHUB_PATH}"
+    - name: Install CUTracer
+      shell: bash
+      env:
+        CUTRACER_VERSION: ${{ inputs.cutracer-version }}
+      run: |
+        set -euo pipefail
+        uv pip install "cutracer==${CUTRACER_VERSION}"
+        cutracer --help > /dev/null
+    - name: Build cutracer.so
+      shell: bash
+      env:
+        CUTRACER_VERSION: ${{ inputs.cutracer-version }}
+        CUDA_ARCH: ${{ inputs.cuda-arch }}
+        CUDA_VERSION: ${{ inputs.cuda-version }}
+      run: |
+        set -euo pipefail
+        # The Makefile checks the nvcc version with bc and links libzstd.
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bc libzstd-dev
+        export PATH="/usr/local/cuda-${CUDA_VERSION}/bin:${PATH}"
+        SRC="${RUNNER_TEMP}/CUTracer"
+        git clone --depth 1 --branch "v${CUTRACER_VERSION}" https://github.com/facebookexperimental/CUTracer.git "${SRC}"
+        cd "${SRC}"
+        ./install_third_party.sh
+        make -j"$(nproc)" ARCH="${CUDA_ARCH}"
+        echo "CUTRACER_SO=${SRC}/lib/cutracer.so" >> "${GITHUB_ENV}"

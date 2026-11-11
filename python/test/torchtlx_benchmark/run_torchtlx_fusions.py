@@ -6,8 +6,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib
+import json
+import os
 import pathlib
 import statistics
+import subprocess
 import sys
 import types
 
@@ -34,6 +37,32 @@ def attention(q, k, v, *, use_flex=False):
     return flex_attention(q, k, v) if use_flex else F.scaled_dot_product_attention(q, k, v)
 
 
+def select_idle_amd_device() -> None:
+    selectors = ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
+    if not torch.version.hip or any(os.environ.get(name) for name in selectors):
+        return
+    try:
+        output = subprocess.check_output(
+            ["rocm-smi", "--showuse", "--showmeminfo", "vram", "--showbus", "--json"],
+            text=True,
+            timeout=10,
+        )
+    except FileNotFoundError:
+        return
+    states = {state["PCI Bus"].lower(): state for state in json.loads(output).values()}
+    devices = []
+    for index in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(index)
+        bus = f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+        state = states.get(bus)
+        if state is not None and int(state["GPU use (%)"]) == 0:
+            devices.append((int(state["VRAM Total Used Memory (B)"]), index))
+    if not devices:
+        raise RuntimeError("No idle AMD GPU available; select a device explicitly to run here")
+    _, index = min(devices)
+    torch.cuda.set_device(index)
+
+
 def discover_cases() -> dict[str, object]:
     cases = {}
     for path in sorted(_HERE.glob("*_[0-9][0-9]_*.py")):
@@ -48,9 +77,13 @@ def parse_args(cases):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=cases, default=next(iter(cases)))
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--select-idle-amd-device", action="store_true", help="Select an idle AMD GPU before running")
+    parser.add_argument("--check-only", action="store_true", help="Run correctness gates without timing")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--rep", type=int, default=50)
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--gpu-time", action="store_true",
+                        help="Also report summed GPU kernel time (kineto, warm cache) for launch-bound shapes")
     selected, _ = parser.parse_known_args()
     cases[selected.case].add_arguments(parser)
     args = parser.parse_args()
@@ -132,24 +165,42 @@ def bench_us(fn, args) -> float:
     return float(triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep, return_mode="median")) * 1000
 
 
+def gpu_us(fn, args) -> float:
+    for _ in range(args.warmup):
+        fn()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        for _ in range(args.rep):
+            fn()
+        torch.cuda.synchronize()
+    return sum(event.self_device_time_total for event in prof.key_averages()) / args.rep
+
+
 def time_interleaved(case, args, functions, phase) -> None:
-    samples = {variant: [] for variant in functions}
+    timers = {"": bench_us, "gpu_": gpu_us} if args.gpu_time else {"": bench_us}
+    samples = {(prefix, variant): [] for prefix in timers for variant in functions}
     for sample in range(args.samples):
         order = ("baseline", "candidate") if sample % 2 == 0 else ("candidate", "baseline")
-        measured = {}
-        for variant in order:
-            measured[variant] = bench_us(functions[variant], args)
-            samples[variant].append(measured[variant])
-        print(f"{phase} sample={sample + 1} baseline_us={measured['baseline']:.3f} "
-              f"candidate_us={measured['candidate']:.3f}")
-    baseline = statistics.median(samples["baseline"])
-    candidate = statistics.median(samples["candidate"])
-    print(f"FINAL {phase} {case.problem()} baseline_us={baseline:.3f} "
-          f"candidate_us={candidate:.3f} speedup={baseline / candidate:.3f}x")
+        for prefix, timer in timers.items():
+            for variant in order:
+                samples[prefix, variant].append(timer(functions[variant], args))
+        print(f"{phase} sample={sample + 1} " +
+              " ".join(f"{prefix}{variant}_us={samples[prefix, variant][-1]:.3f}" for prefix in timers
+                       for variant in ("baseline", "candidate")))
+    results = []
+    for prefix in timers:
+        baseline = statistics.median(samples[prefix, "baseline"])
+        candidate = statistics.median(samples[prefix, "candidate"])
+        results.append(f"{prefix}baseline_us={baseline:.3f} {prefix}candidate_us={candidate:.3f} "
+                       f"{prefix}speedup={baseline / candidate:.3f}x")
+    print(f"FINAL {phase} {case.problem()} " + " ".join(results))
 
 
 def run_case(case, args) -> None:
-    print(f"case={case.NAME} {case.problem()} device={torch.cuda.get_device_name(0)}")
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    print(f"case={case.NAME} {case.problem()} device={device}:{props.name} "
+          f"pci={props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0")
     torch.manual_seed(0)
     inputs = case.make_inputs()
     grad_inputs = getattr(case, "GRAD_INPUTS", ())
@@ -162,6 +213,8 @@ def run_case(case, args) -> None:
     gate(case, "forward candidate vs baseline", outputs["candidate"], outputs["baseline"])
     if grad_inputs:
         run_backward(case, args, inputs, grad_inputs, outputs)
+    if args.check_only:
+        return
     del outputs
     functions = {variant: (lambda fn=fn: fn(*inputs)) for variant, fn in compiled.items()}
     time_interleaved(case, args, functions, "forward")
@@ -180,7 +233,8 @@ def run_backward(case, args, inputs, grad_inputs, outputs) -> None:
     for variant in grads:
         print(f"INFO {variant} gradients vs eager: rel_l2={relative_l2(grads[variant], eager_grads):.3e}")
     del grads, eager_grads
-    time_interleaved(case, args, functions, "backward")
+    if not args.check_only:
+        time_interleaved(case, args, functions, "backward")
 
 
 def main() -> None:
@@ -192,6 +246,8 @@ def main() -> None:
         return
     case = cases[args.case]
     load_runtime(case)
+    if args.select_idle_amd_device:
+        select_idle_amd_device()
     for shape in selected_shapes(case, args):
         for name, value in shape.items():
             setattr(args, name, value)

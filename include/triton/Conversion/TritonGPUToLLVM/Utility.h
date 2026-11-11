@@ -15,7 +15,7 @@
 #include "triton/Tools/StrUtil.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Support/MathExtras.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 
 #include <functional>
 #include <optional>
@@ -51,6 +51,13 @@ createLLVMIntrinsicCallOp(OpBuilder &builder, Location loc, StringRef intrinsic,
 } // namespace mlir::LLVM
 
 namespace mlir::triton {
+
+class ModuleAxisInfoAnalysis;
+
+// The address of the descriptor's logical origin in its memory space.
+Value getMemDescAddress(RewriterBase &rewriter, Location loc,
+                        const LLVMTypeConverter *typeConverter,
+                        gpu::MemDescType type, Value lowered);
 
 // Shared by backend-specific and generic local-load conversion patterns so a
 // named group produces one lane/warp rematerialization point even when its
@@ -353,6 +360,9 @@ constexpr int kProfileScratchBufferOffset = -1;
 constexpr int kGlobalScratchBufferOffset = -2;
 constexpr int kSharedMemoryOffset = -3;
 
+// Defined in triton/Analysis/Utility.h.
+struct MixedRadixSharedTiling;
+
 namespace triton {
 
 namespace gpu {
@@ -377,6 +387,47 @@ Value emitRedundantThreadPredicate(
     const llvm::MapVector<StringAttr, int32_t> &freeVarMasks,
     ConversionPatternRewriter &rewriter, Location loc,
     const TargetInfoBase &targetInfo);
+
+// True iff every free-variable digit of `indices` is 0 (mixed radix), so each
+// output of `layout` is held by one thread.
+Value emitCanonicalLayoutOwnerPredicate(
+    Location loc, RewriterBase &rewriter, const LinearLayout &layout,
+    ArrayRef<std::pair<StringAttr, Value>> indices,
+    const llvm::MapVector<StringAttr, int32_t> &freeVariableMasks);
+
+// Calls `access` per `run` registers of a mixed-radix `regLayout` with the
+// first register, its offset through `toOffset` (the shared layout's
+// pseudoinverse) and the hardware indices that reach it.
+void forEachMixedRadixSharedRun(
+    Location loc, RewriterBase &rewriter, const LinearLayout &regLayout,
+    const LinearLayout &toOffset, int32_t run,
+    function_ref<void(int32_t, Value, ArrayRef<std::pair<StringAttr, Value>>)>
+        access);
+
+// Moves mixed-radix `inVals` from `srcLayout` to `dstLayout` via scratch at
+// `smemBase`: its thread stores each element once, then each destination
+// register loads it, in vector runs. A `tiling` reuses one scratch tile;
+// `transferTile`, if set, moves each tile in place of that transfer.
+SmallVector<Value> transferMixedRadixThroughSharedMemory(
+    Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+    const LinearLayout &srcLayout, const LinearLayout &dstLayout,
+    ArrayRef<Value> inVals, Type elemTy, Value smemBase,
+    const llvm::MapVector<StringAttr, int32_t> &srcFreeVariableMasks,
+    bool blockScope,
+    std::optional<std::pair<Value, Value>> distributedCoordinates =
+        std::nullopt,
+    const MixedRadixSharedTiling *tiling = nullptr,
+    function_ref<SmallVector<Value>(const LinearLayout &, const LinearLayout &,
+                                    ArrayRef<Value>)>
+        transferTile = nullptr);
+
+// Splits `layout` at the non-binary digits that follow the binary ones of
+// `inDim`: layout(x + w * o) == sub(x) + slabs[o] for x < w, the radix-2 size
+// of `inDim`. Returns sub; fails if any other input digit is non-binary or a
+// table is not in odd-part form.
+FailureOr<LinearLayout>
+splitOddOuterDigits(const LinearLayout &layout, StringAttr inDim,
+                    SmallVectorImpl<SmallVector<int32_t>> &slabs);
 
 // Takes two values that may be boolean, or null to represent constant True.
 Value maybeAnd(OpBuilder &builder, Location loc, Value a, Value b);
@@ -690,6 +741,11 @@ LowerLdStCallback makeSharedStoreEmitter(const TargetInfoBase &targetInfo,
 LowerLdStCallback makeSharedLoadEmitter(const TargetInfoBase &targetInfo,
                                         Operation *localLoadOp = nullptr);
 
+// Scalar stores reuse shared addressing and the unique lane/warp predicate.
+using ScalarSharedStoreEmitter =
+    std::function<void(RewriterBase &, Location, Value /*ptr*/, Value /*ctaId*/,
+                       Value /*value*/, Value /*pred*/)>;
+
 // Close cousin of lowerLdStMatrix in MemoryOpToLLVM.cpp
 // We might want to merge them at some point, but having to support
 // ldmatrix.trans makes the code in lowerLdStMatrix a bit specific
@@ -706,7 +762,8 @@ SmallVector<Value> lowerLdStShared(
     const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems = {},
     Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
     std::optional<Value> barrierPtr = {},
-    std::optional<std::pair<Value, Value>> distributedCoordinates = {});
+    std::optional<std::pair<Value, Value>> distributedCoordinates = {},
+    ScalarSharedStoreEmitter scalarStoreEmitter = {});
 
 // Lower an ld/st-like operation given a layout and a callback that creates the
 // PTX instruction Lowers to st when valArrays is empty, and to ld when it is
@@ -736,6 +793,7 @@ SmallVector<Value> lowerLocalLdSt(
     Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
     std::optional<Value> barrierPtr = {},
     std::optional<std::pair<Value, Value>> distributedCoordinates = {},
+    ScalarSharedStoreEmitter scalarStoreEmitter = {},
     LowerLdStCallback lowerInst = {});
 
 // The callback form is used by target-independent lowering when the target
@@ -784,12 +842,30 @@ std::optional<LLVM::AtomicBinOp> matchAtomicOp(RMWOp atomicOp);
 
 std::optional<LLVM::AtomicOrdering> getMemoryOrdering(MemSemantic memOrdering);
 
+/// Choose a legal atomic load/store width using pointer alignment/contiguity
+/// and mask constancy.
+unsigned getAtomicLoadStoreVectorSize(Value ptr, Value mask,
+                                      ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                                      const TargetInfoBase &targetInfo);
+
+/// Emit `bodyBuilder` inline when `pred` is null. Otherwise, emit it only when
+/// `pred` is true and merge its results with `falseValues` in a continuation
+/// block.
+SmallVector<Value>
+emitPredicated(RewriterBase &rewriter, Location loc, Value pred,
+               ValueRange falseValues,
+               llvm::function_ref<SmallVector<Value>()> bodyBuilder);
+
 /// Insert CTA or cluster barriers around an atomic operation according to its
 /// acquire/release semantics. `emitBarrierAfter` may be false when result
 /// staging already emits the required barrier after the atomic instruction.
 void insertAtomicOrderingBarriers(Operation *op, MemSemantic memOrdering,
                                   bool emitBarrierAfter, RewriterBase &rewriter,
                                   const TargetInfoBase &targetInfo);
+
+/// Whether atomic result broadcast barrier is sufficient for acquire ordering.
+/// Must run after scratch allocation.
+bool atomicResultHasOrderingBarrier(Operation *op);
 
 Value broadcastScalarAtomicResult(Operation *op, Type valueElemTy,
                                   Value resultVal,
@@ -800,30 +876,6 @@ Value broadcastScalarAtomicResult(Operation *op, Type valueElemTy,
 llvm::MapVector<StringAttr, int32_t> getAllFreeVarMasks(MLIRContext *ctx);
 
 llvm::MapVector<StringAttr, int32_t> getFreeVariableMasks(Type type);
-
-/// Clamp vec size for NPOT dims: round down to a pow2 load/store width, then
-/// clamp to the alignment of a non-pow2 sizePerThread (Blocked only; Slice/
-/// Linear don't reach here). No-op for pow2, so safe to run unconditionally
-/// (not flag-gated).
-inline unsigned clampVecSizeForNpot(unsigned vec, RankedTensorType tensorTy) {
-  if (vec <= 1)
-    return vec; // avoids Log2_32(0) UB
-  if (!llvm::isPowerOf2_32(vec))
-    vec = 1u << llvm::Log2_32(vec);
-  if (!tensorTy)
-    return vec;
-  if (auto blocked =
-          dyn_cast<triton::gpu::BlockedEncodingAttr>(tensorTy.getEncoding())) {
-    auto contOrder = triton::gpu::getOrder(tensorTy);
-    unsigned spt = blocked.getSizePerThread()[contOrder[0]];
-    if (spt > 0 && !llvm::isPowerOf2_32(spt)) {
-      // Largest pow2 divisor (lowest set bit) = the guaranteed alignment.
-      unsigned maxAligned = spt & (0u - spt);
-      vec = std::min(vec, maxAligned);
-    }
-  }
-  return vec;
-}
 
 inline bool isCanonicalIndex(unsigned index, unsigned freeVarMask) {
   return (index & freeVarMask) == 0;
@@ -861,13 +913,21 @@ SmallVector<Value> inlineRegion(RewriterBase &rewriter, Region &region,
 std::tuple</*prevBlock=*/Block *, /*ifBlock=*/Block *, /*thenBlock=*/Block *>
 createIfBlock(RewriterBase &b, Location loc, Value cnd);
 
-void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
-                                 ConversionPatternRewriter &rewriter,
-                                 SmallVector<Value> &resultVals,
-                                 Type valueElemTy, TritonLLVMOpBuilder &b,
-                                 Value threadPred,
-                                 const TargetInfoBase &targetInfo,
-                                 const LLVMTypeConverter *typeConverter);
+// Broadcast canonical owners' results to redundant threads and CTAs. Both the
+// input and returned values contain only unique registers.
+SmallVector<Value>
+broadcastTensorResult(Operation *op, RankedTensorType tensorTy,
+                      ConversionPatternRewriter &rewriter,
+                      ArrayRef<Value> uniqueResultVals, Type valueElemTy,
+                      TritonLLVMOpBuilder &b, Value threadPred,
+                      const TargetInfoBase &targetInfo);
+
+/// Synchronize an atomic result, then replace the op.
+void finalizeAtomicResults(Operation *op, ConversionPatternRewriter &rewriter,
+                           SmallVector<Value> &resultVals, Type valueElemTy,
+                           TritonLLVMOpBuilder &b, Value threadPred,
+                           const TargetInfoBase &targetInfo,
+                           const LLVMTypeConverter *typeConverter);
 
 // -----------------------------------------------------------------------
 // FuncOp conversion utilities
