@@ -1189,11 +1189,10 @@ def ScheduledMfmaScaledOp : TT_AMDGPU_Op<"scheduled_mfma_scaled"> {
     without extracting it first. A two-step K128 chain reuses the word and
     adds two to each selector for its second K64 instruction.
 
-    Only the transient contract is supported today: `accumulator_role` must
-    be "transient", `resident_operand` must be "none", and
-    `accumulator_register_class` must be "auto"; persistent scaled chains
-    and their register pinning are not modeled yet. Completion is
-    represented separately by `mfma_commit`, as in `scheduled_mfma`:
+    Packed-storage I8 operands use the transient contract. Typed FP8 dot
+    operands also support persistent accumulator chains and explicit AGPR or
+    VGPR placement, matching `scheduled_mfma`. Completion is represented
+    separately by `mfma_commit`:
     `mfma_commit` accepts the scaled 16x16x128 and 32x32x64 accumulator
     layouts (and live scaled i8 dot operands) and applies the modeled
     scaled drain wait at the boundary.
@@ -1869,6 +1868,35 @@ def ClusterBarrierWaitOp : TT_AMDGPU_Op<"cluster_barrier_wait"> {
     Arrive and wait operations must come in pairs. Waiting before arriving or arriving
     more than once without a corresponding wait will result in undefined behavior.
     This operation is a no-op for a single-CTA cluster.
+  }];
+  let assemblyFormat = "attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// WorkgroupBarrierSignalOp / WorkgroupBarrierWaitOp
+//===----------------------------------------------------------------------===//
+
+def WorkgroupBarrierSignalOp : TT_AMDGPU_Op<"workgroup_barrier_signal"> {
+  let summary = "Arrive at the workgroup barrier without waiting";
+  let description = [{
+    First half of a split workgroup barrier. Shared-memory operations issued
+    before the signal are visible to every thread of the workgroup after its
+    matching `amdg.workgroup_barrier_wait`. Work between the signal and the
+    wait overlaps the rendezvous.
+
+    By convention, each signal is followed in the same block by its wait,
+    with no other signal, wait, or shared-memory access in between. Membar
+    relies on this and treats the pair as one workgroup barrier.
+  }];
+  let assemblyFormat = "attr-dict";
+}
+
+def WorkgroupBarrierWaitOp : TT_AMDGPU_Op<"workgroup_barrier_wait"> {
+  let summary = "Wait for the workgroup barrier signalled earlier";
+  let description = [{
+    Second half of a split workgroup barrier: waits until every thread of
+    the workgroup has executed its `amdg.workgroup_barrier_signal`. See
+    `amdg.workgroup_barrier_signal` for the pairing convention.
   }];
   let assemblyFormat = "attr-dict";
 }

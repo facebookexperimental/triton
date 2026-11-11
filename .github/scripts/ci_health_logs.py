@@ -79,11 +79,12 @@ def checkout_sha(job, log_text):
         if not stamp.endswith("Z"):
             expect = False
             continue
-        if expect and re.fullmatch(r"[0-9a-f]{40}", message):
+        match = re.fullmatch(r"(?:'([0-9a-f]{40})'|([0-9a-f]{40}))", message)
+        if expect and match:
             sec = t(_iso(stamp)).replace(microsecond=0)
             if any(start <= sec <= end for start, end in windows):
-                found.add(message)
-        expect = bool(re.search(r"\[command\].*\bgit log -1 --format=%H$", message))
+                found.add(match[1] or match[2])
+        expect = bool(re.search(r"\[command\].*\bgit log -1 --format=(?:%H|'%H')$", message))
     return next(iter(found)) if len(found) == 1 else None
 
 

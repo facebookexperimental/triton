@@ -198,8 +198,8 @@ bool isGenericLinearEncoding(Attribute attr);
 bool isRadix2Encoding(Attribute layout);
 
 // Whether the encoding of `type`, or the parent of its slices, is exact at its
-// shape. Only a mixed-radix layout can fail: each out size and its pow2 alloc
-// shape must divide.
+// shape: a radix-2 linear layout iff the shape is pow2, a mixed-radix layout
+// iff each out size and its pow2 alloc shape divide.
 bool hasExactLayoutAt(RankedTensorType type);
 
 // Whether `type` has an NPOT shape and an exact mixed-radix layout.
@@ -211,6 +211,16 @@ bool hasExactNpotLayout(RankedTensorType type);
 // only on these ops, and the NPOT pad pass keeps a connected component's shape
 // only if all its ops are.
 bool isMixedRadixLayoutOp(OperationName op);
+
+// Under TRITON_ALLOW_NPOT, whether an MMAv3 instrShape's N may be NPOT: its odd
+// part repeats in registers, which is wgmma's order only while one warpgroup
+// spans N.
+bool isMmaV3NpotNLegal(ArrayRef<unsigned> warpsPerCTA,
+                       ArrayRef<unsigned> instrShape);
+
+// Whether wgmma's k atoms sit on K's power-of-two part, as its warps do on M
+// and N; otherwise an NPOT K's last atom reads past K.
+bool isMmaV3NpotKLegal(int64_t k, unsigned atomK);
 
 // Why the verifier rejects an exact mixed-radix layout among `types` on an op
 // named `name`, if it does; a pass can ask before creating the op.
@@ -505,9 +515,12 @@ getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
 // The widest pow2 vector up to the pow2 `vector` along order[0] whose
 // mixed-radix layout of `shape` holds no more registers than the converter's
 // layout (no vector); `vector` unchanged if `shape` has no mixed-radix layout.
+// A global store or global-to-shared async copy predicates off duplicate
+// threads, so with `predicated` it takes any vector whose layout exists.
 unsigned getMixedRadixVector(MLIRContext *context, ArrayRef<int64_t> shape,
                              unsigned vector, ArrayRef<unsigned> order,
-                             int numWarps, int threadsPerWarp);
+                             int numWarps, int threadsPerWarp,
+                             bool predicated = false);
 
 // Registers per shared access of a mixed-radix `regLayout`: leading register
 // digits at consecutive offsets through the pow2 `toOffset`, at most 128 bits,

@@ -113,7 +113,10 @@ def min_dot_size(target: GPUTarget):
 
 
 def get_ptxas(arch: int) -> knobs.NvidiaTool:
-    return knobs.nvidia.ptxas_blackwell if arch >= 100 else knobs.nvidia.ptxas
+    if arch < 90:
+        return knobs.nvidia.ptxas
+    # The ptxas-blackwell name is misleading; keep it until legacy ptxas is removed.
+    return knobs.nvidia.ptxas_blackwell
 
 
 @functools.lru_cache()
@@ -966,7 +969,8 @@ class CUDABackend(BaseBackend):
         dump_enabled = pm.enable_debug()
         emuTF32 = capability // 10 >= 8
         if knobs.language.allow_npot:
-            passes.ttir.add_npot_pad(pm, opt.num_warps, 32, opt.num_ctas, f"cuda:{capability}")
+            passes.ttir.add_npot_pad(pm, opt.num_warps, 32, opt.num_ctas, f"cuda:{capability}", 0, opt.num_stages,
+                                     False)
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         nvidia.passes.hopper.add_form_multi_cta_collectives(pm, capability, knobs.nvidia.use_meta_ws)
         nvidia.passes.hopper.add_lower_cluster_reduce_to_ttgir(pm)
@@ -1520,7 +1524,8 @@ class CUDABackend(BaseBackend):
         return self._ptxas_compile(src, opt, capability)
 
     def _ptxas_compile(self, src, opt, capability, apply_controls=None):
-        ptxas = get_ptxas(self.target.arch).path
+        ptxas_tool = get_ptxas(self.target.arch)
+        ptxas = ptxas_tool.path
         with (
                 tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".ptx") as fsrc,
                 tempfile.NamedTemporaryFile(delete=False, mode="r", suffix=".log") as flog,
@@ -1554,18 +1559,9 @@ class CUDABackend(BaseBackend):
             if (not knobs.nvidia.disable_ptxas_opt and any(is_enabled(opt, mode) for mode in ["consan", "fpsan"])):
                 ptx_extra_options += ["--opt-level", "1"]
 
-            # Add --regAllocOptLevel=2 to work around ptxas 13.x bug
-            reg_alloc = ["--regAllocOptLevel=2"]
-
-            # compile_iq Stage-3 consumption (gated, default off; fail-open): if the PTX hash hits
-            # the ACF store, append --apply-controls (version check + lookup live in the helper).
-            if _compile_iq_apply_enabled():
-                try:
-                    from triton.magnon.consume import acf_args_for
-
-                    ptx_extra_options += acf_args_for(src, arch, get_ptxas(self.target.arch).version)
-                except Exception:
-                    pass
+            # compile_iq consumption: only the ACF twin built by apply_compile_iq_acf passes controls.
+            # The regular compile must stay plain, or the launch-time A/B would compare ACF to ACF.
+            ptx_extra_options += list(apply_controls or [])
 
             ptxas_cmd = [
                 ptxas,
@@ -1573,7 +1569,6 @@ class CUDABackend(BaseBackend):
                 *fmad,
                 "-v",
                 *disable_opt,
-                *reg_alloc,
                 *ptx_extra_options,
                 f"--gpu-name={arch}",
                 fsrc.name,

@@ -183,16 +183,16 @@ TEST_F(LinearLayoutConversionsTest, SimpleBlocked) {
                           {S("dim0")}));
 }
 
-TEST_F(LinearLayoutConversionsTest, NpotMemoryLayoutsUsePow2Cover) {
+TEST_F(LinearLayoutConversionsTest, NpotMemoryLayoutsUsePow2AllocShape) {
   ScopedAllowNpot npot;
-  // A shared layout of an NPOT shape is built on its pow2 cover.
+  // A shared layout of an NPOT shape is built on its pow2 alloc shape.
   auto swizzled = shared(4, 2, 4, {1, 1}, {1, 1}, {1, 0}, {1, 0});
-  LinearLayout cover = toLinearLayout({128, 64}, swizzled);
-  EXPECT_EQ(toLinearLayout({96, 64}, swizzled), cover);
-  // An NPOT subview of a shared_linear allocation keeps that cover.
+  LinearLayout padded = toLinearLayout({128, 64}, swizzled);
+  EXPECT_EQ(toLinearLayout({96, 64}, swizzled), padded);
+  // An NPOT subview of a shared_linear allocation keeps that pow2 alloc shape.
   auto sharedLinear =
-      SharedLinearEncodingAttr::get(&ctx, cover, /*layoutAlignment=*/16);
-  EXPECT_EQ(toLinearLayout({96, 64}, sharedLinear), cover);
+      SharedLinearEncodingAttr::get(&ctx, padded, /*layoutAlignment=*/16);
+  EXPECT_EQ(toLinearLayout({96, 64}, sharedLinear), padded);
 }
 
 // Whether the tile's layout maps exactly offsets [0, R*C) onto the tile.
@@ -824,6 +824,218 @@ TEST_F(LinearLayoutConversionsTest, MMAv2_Small3D) {
                     {S("block"), {{0, 0, 0}, {0, 64, 0}, {0, 0, 0}, {0, 0, 0}}},
                 },
                 {S("dim0"), S("dim1"), S("dim2")}));
+}
+
+// Each NPOT dim repeats its odd part in registers after its binary repeats,
+// in rep order: N's for wgmma's accumulator, M's for an A in registers.
+TEST_F(LinearLayoutConversionsTest, MMAv3_NpotMixedRadix) {
+  auto mixedRadix = [&](std::vector<std::vector<int32_t>> regs,
+                        std::vector<int32_t> regRadices,
+                        std::vector<std::vector<int32_t>> lanes,
+                        std::vector<std::vector<int32_t>> warps, int32_t dim0,
+                        int32_t dim1) {
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regs);
+    bases[S("lane")] = std::move(lanes);
+    bases[S("warp")] = warps;
+    bases[S("block")] = {};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    radices[S("lane")] = {2, 2, 2, 2, 2};
+    radices[S("warp")] = std::vector<int32_t>(warps.size(), 2);
+    radices[S("block")] = {};
+    return LinearLayout(std::move(bases), std::move(radices),
+                        {{S("dim0"), dim0}, {S("dim1"), dim1}},
+                        /*requireSurjective=*/true);
+  };
+  auto aRegs = dot(mma(3, 0, {16, 128, 16}, {4, 1}), 0, 2);
+  LinearLayout pow2 = aRegs.toLinearLayout({128, 64});
+  ScopedAllowNpot npot;
+  auto acc = mma(3, 0, {16, 96, 16}, {4, 1});
+  std::vector<std::vector<int32_t>> lanes = {
+      {0, 2}, {0, 4}, {1, 0}, {2, 0}, {4, 0}};
+  EXPECT_EQ(toLinearLayout({128, 96}, acc),
+            mixedRadix({{0, 1}, {8, 0}, {0, 8}, {0, 16}, {0, 32}, {64, 0}},
+                       {2, 2, 2, 2, 3, 2}, lanes, {{16, 0}, {32, 0}}, 128, 96));
+  // A repeats over K first, then over M's odd part.
+  EXPECT_EQ(toLinearLayout({192, 64}, aRegs),
+            mixedRadix({{0, 1}, {8, 0}, {0, 8}, {0, 16}, {0, 32}, {64, 0}},
+                       {2, 2, 2, 2, 2, 3}, lanes, {{16, 0}, {32, 0}}, 192, 64));
+  // N=192's two-part is below instrN 128's tile, which keeps the registers that
+  // fit, so it is instrN 192's layout.
+  EXPECT_EQ(toLinearLayout({64, 192}, mma(3, 0, {16, 128, 16}, {4, 1})),
+            toLinearLayout({64, 192}, mma(3, 0, {16, 192, 16}, {4, 1})));
+  // M's two-part is below the 8-warp tile, and broadcasting warps on M would
+  // repeat rows, so the layout keeps its pow2 alloc shape.
+  EXPECT_EQ(toLinearLayout({192, 128}, mma(3, 0, {16, 128, 16}, {8, 1}))
+                .getOutDimSize(S("dim0")),
+            256);
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(aRegs.toLinearLayout({128, 64}), pow2);
+}
+
+TEST_F(LinearLayoutConversionsTest, MMAv2_NpotWarpsOnTwoPart) {
+  EXPECT_EQ(getMmaV2WarpsPerCTA({96, 32}, 8), SmallVector<unsigned>({4, 2}));
+  ScopedAllowNpot npot;
+  // M's two-part 32 holds 2 warps of 16 rows, so the rest go on N.
+  EXPECT_EQ(getMmaV2WarpsPerCTA({96, 32}, 8), SmallVector<unsigned>({2, 4}));
+  // Control: a pow2 shape keeps its split.
+  EXPECT_EQ(getMmaV2WarpsPerCTA({128, 128}, 8), SmallVector<unsigned>({2, 4}));
+}
+
+// Each NPOT dim repeats its odd part in registers after its binary repeats,
+// in rep order, as the MMAv2 lowering indexes them.
+TEST_F(LinearLayoutConversionsTest, MMAv2_NpotMixedRadix) {
+  auto mixedRadix = [&](std::vector<std::vector<int32_t>> regs,
+                        std::vector<int32_t> regRadices,
+                        std::vector<std::vector<int32_t>> lanes,
+                        std::vector<std::vector<int32_t>> warps, int32_t dim0,
+                        int32_t dim1) {
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regs);
+    bases[S("lane")] = std::move(lanes);
+    bases[S("warp")] = warps;
+    bases[S("block")] = {};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    radices[S("lane")] = {2, 2, 2, 2, 2};
+    radices[S("warp")] = std::vector<int32_t>(warps.size(), 2);
+    radices[S("block")] = {};
+    return LinearLayout(std::move(bases), std::move(radices),
+                        {{S("dim0"), dim0}, {S("dim1"), dim1}},
+                        /*requireSurjective=*/true);
+  };
+  auto acc = mma(2, 0, {16, 8}, {2, 2});
+  LinearLayout pow2 = acc.toLinearLayout({128, 128});
+  ScopedAllowNpot npot;
+  std::vector<std::vector<int32_t>> accLanes = {
+      {0, 2}, {0, 4}, {1, 0}, {2, 0}, {4, 0}};
+  EXPECT_EQ(toLinearLayout({128, 96}, acc),
+            mixedRadix({{0, 1}, {8, 0}, {0, 16}, {0, 32}, {32, 0}, {64, 0}},
+                       {2, 2, 2, 3, 2, 2}, accLanes, {{0, 8}, {16, 0}}, 128,
+                       96));
+  EXPECT_EQ(toLinearLayout({48, 96}, mma(2, 0, {16, 8}, {1, 4})),
+            mixedRadix({{0, 1}, {8, 0}, {0, 32}, {16, 0}}, {2, 2, 3, 3},
+                       accLanes, {{0, 8}, {0, 16}}, 48, 96));
+  // B repeats over K first, then over N's two-part and odd part.
+  EXPECT_EQ(toLinearLayout({64, 96}, dot(acc, 1, 2)),
+            mixedRadix({{1, 0}, {8, 0}, {16, 0}, {32, 0}, {0, 16}, {0, 32}},
+                       {2, 2, 2, 2, 2, 3},
+                       {{2, 0}, {4, 0}, {0, 1}, {0, 2}, {0, 4}},
+                       {{0, 8}, {0, 0}}, 64, 96));
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(acc.toLinearLayout({128, 128}), pow2);
+}
+
+// An MFMA operand's NPOT K repeats its odd part in registers after the binary
+// K repeats, so the K rep index stays linear.
+TEST_F(LinearLayoutConversionsTest, MFMA_NpotMixedRadixK) {
+  auto mixedRadix = [&](std::vector<std::vector<int32_t>> regs,
+                        std::vector<std::vector<int32_t>> lanes,
+                        std::vector<std::vector<int32_t>> warps, int32_t dim0,
+                        int32_t dim1) {
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regs);
+    bases[S("lane")] = std::move(lanes);
+    bases[S("warp")] = std::move(warps);
+    bases[S("block")] = {};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = {2, 2, 2, 2, 3};
+    radices[S("lane")] = {2, 2, 2, 2, 2, 2};
+    radices[S("warp")] = {2, 2};
+    radices[S("block")] = {};
+    return LinearLayout(std::move(bases), std::move(radices),
+                        {{S("dim0"), dim0}, {S("dim1"), dim1}},
+                        /*requireSurjective=*/true);
+  };
+  auto mfma32 = mfma(4, {2, 2}, {32, 32, 16}, /*isTransposed=*/true);
+  auto a = mfmaDotOp(mfma32, 0, 8), b = mfmaDotOp(mfma32, 1, 8);
+  LinearLayout pow2 = toLinearLayout({64, 128}, a);
+  ScopedAllowNpot npot;
+  EXPECT_EQ(toLinearLayout({64, 96}, a),
+            mixedRadix({{0, 1}, {0, 2}, {0, 4}, {0, 16}, {0, 32}},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 8}},
+                       {{0, 0}, {32, 0}}, 64, 96));
+  EXPECT_EQ(toLinearLayout({96, 64}, b),
+            mixedRadix({{1, 0}, {2, 0}, {4, 0}, {16, 0}, {32, 0}},
+                       {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {8, 0}},
+                       {{0, 32}, {0, 0}}, 96, 64));
+  // K=48's two-part 16 is below mfma16's 32-wide K tile: pow2 alloc shape.
+  auto mfma16 = mfma(4, {2, 2}, {16, 16, 32}, /*isTransposed=*/true);
+  EXPECT_EQ(toLinearLayout({64, 48}, mfmaDotOp(mfma16, 0, 8))
+                .getOutDimSize(S("dim1")),
+            64);
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(toLinearLayout({64, 128}, a), pow2);
+}
+
+// An MFMA result's or operand's NPOT N repeats its odd part in registers
+// after its binary repeats, so its first 32 columns keep the pow2 layout.
+TEST_F(LinearLayoutConversionsTest, MFMA_NpotMixedRadixN) {
+  LinearLayout::BasesT bases;
+  bases[S("register")] = {{1}};
+  LinearLayout::RadicesT radices;
+  radices[S("register")] = {5};
+  LinearLayout odd(std::move(bases), std::move(radices), {{S("dim1"), 5}},
+                   /*requireSurjective=*/true);
+  auto mfma32 = mfma(4, {4, 1}, {32, 32, 16}, /*isTransposed=*/true);
+  auto b = mfmaDotOp(mfma32, 1, 8);
+  LinearLayout pow2B = toLinearLayout({64, 32}, b);
+  LinearLayout pow2C = toLinearLayout({128, 32}, mfma32);
+  ScopedAllowNpot npot;
+  EXPECT_EQ(toLinearLayout({64, 160}, b), pow2B * odd);
+  EXPECT_EQ(toLinearLayout({128, 160}, mfma32), pow2C * odd);
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(toLinearLayout({64, 32}, b), pow2B);
+  EXPECT_EQ(toLinearLayout({128, 32}, mfma32), pow2C);
+}
+
+// An NPOT scale K puts its odd part in the last K register digit, and lanes
+// past its two-part broadcast: a zero K tail MFMA k reads registers 2k, 2k + 1.
+TEST_F(LinearLayoutConversionsTest, ScaledMfmaScale_NpotK) {
+  auto mixedRadix = [&](std::vector<std::vector<int32_t>> regs,
+                        std::vector<int32_t> regRadices,
+                        std::vector<std::vector<int32_t>> lanes,
+                        std::vector<std::vector<int32_t>> warps, int32_t dim1) {
+    LinearLayout::BasesT bases;
+    bases[S("register")] = std::move(regs);
+    bases[S("lane")] = std::move(lanes);
+    bases[S("warp")] = std::move(warps);
+    bases[S("block")] = {};
+    LinearLayout::RadicesT radices;
+    radices[S("register")] = std::move(regRadices);
+    radices[S("lane")] = {2, 2, 2, 2, 2, 2};
+    radices[S("warp")] = {2, 2};
+    radices[S("block")] = {};
+    return LinearLayout(std::move(bases), std::move(radices),
+                        {{S("dim0"), 128}, {S("dim1"), dim1}},
+                        /*requireSurjective=*/true);
+  };
+  auto scale = [&](int opIdx, int64_t k, unsigned mDim) {
+    return chooseScaledMfmaScaleLayout(&ctx, opIdx, {128, k}, mDim, {1, 1},
+                                       {2, 2});
+  };
+  LinearLayout pow2 = scale(0, 4, 32);
+  ScopedAllowNpot npot;
+  EXPECT_EQ(scale(0, 3, 32),
+            mixedRadix({{0, 1}, {64, 0}}, {3, 2},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 0}},
+                       {{0, 0}, {32, 0}}, 3));
+  EXPECT_EQ(scale(1, 3, 32),
+            mixedRadix({{0, 1}, {64, 0}}, {3, 2},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 0}},
+                       {{32, 0}, {0, 0}}, 3));
+  EXPECT_EQ(scale(0, 6, 16),
+            mixedRadix({{0, 2}, {32, 0}, {64, 0}}, {3, 2, 2},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 1}, {0, 0}},
+                       {{0, 0}, {16, 0}}, 6));
+  // When the MFMA K divides K, MFMA k reads register k.
+  EXPECT_EQ(scale(0, 6, 32),
+            mixedRadix({{0, 2}, {64, 0}}, {3, 2},
+                       {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 1}},
+                       {{0, 0}, {32, 0}}, 6));
+  // Control: a pow2 shape keeps its layout.
+  EXPECT_EQ(scale(0, 4, 32), pow2);
 }
 
 TEST_F(LinearLayoutConversionsTest, MMAv3_64x16) {
@@ -2961,7 +3173,7 @@ TEST_F(LinearLayoutConversionsTest, SliceOfBlocked) {
                          {S("dim0")}));
 }
 
-TEST_F(LinearLayoutConversionsTest, SliceOfBlockedUsesNpotCover) {
+TEST_F(LinearLayoutConversionsTest, SliceOfBlockedUsesNpotPow2AllocShape) {
   auto parent = blocked({1, 4}, {4, 8}, {4, 1}, {1, 1}, {1, 1}, {1, 0}, {1, 0});
 #ifndef NDEBUG
   // Without the flag an NPOT extent still aborts.

@@ -11,9 +11,13 @@ One shot command with extreme simplicity
 
 python python/test/tlx_benchmark/bench_{op}.py
 
-`{op}` is one of `norm`, `mm`, `addmm_mul_add`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
+`{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
-`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`.
+`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, or one of the
+fused operators below.
+
+Fused operators fuse an elementwise epilogue into a GEMM (`tlx/ops/kernels/fused/`): `addmm_mul_add`,
+`linear_rowscale`.
 
 ```
 options:
@@ -51,7 +55,6 @@ options:
 |----|-----------|------|---------------|
 | `mm` | `torch.matmul` | speedup >= 0.9x | heuristic |
 | `addmm` | `torch.addmm` | speedup >= 0.9x | heuristic |
-| `addmm_mul_add` | `torch.addmm` + `torch.addcmul` | speedup >= 0.9x | heuristic |
 | `mm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `addmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `bmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
@@ -66,6 +69,14 @@ options:
 | `mla_window_attn` | `torch.compile` of the module, attention as FlexAttention | speedup >= 0.9x | heuristic |
 | `swiglu_ffn` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 | `rmsnorm_cat` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
+| `moe` | none (FlyDSL's Muse MoE ships with aiter) | absolute floor, currently unset -> reports only | heuristic |
+
+### Fused operators
+
+| op | reference | gate | default space |
+|----|-----------|------|---------------|
+| `addmm_mul_add` | `torch.addmm` + `torch.addcmul` | speedup >= 0.9x | heuristic |
+| `linear_rowscale` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 
 The direct `mm` provider has a `heuristic_config`, so its default is a single
 analytically chosen config. The TorchTLX providers use Inductor's template
@@ -93,6 +104,10 @@ recorded per case as `ref_autotuned` rather than corrected for.
 with a padding (and causal) mask -- what a torch-only caller runs -- so the
 reference also computes the padded positions. The op has one fixed launch
 config, so `--space` does not change it.
+
+`linear_rowscale` races `torch.compile` of the eager expression, which Inductor
+lowers to cuBLAS `addmm` and one fused kernel that applies the row scale. One
+fixed launch config.
 
 Ops with a backward (`flash_attn`, `hstu_attn`, `kda`) produce two cases per
 shape. The backward is a different kernel at 2.5x the FLOPs, so folding it into

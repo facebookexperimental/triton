@@ -840,7 +840,7 @@ for
       // (the modular LinearLayout). Flooring a pow2 is a no-op, so pow2 shapes
       // are byte-identical.
       static const bool allowNpot =
-          mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+          mlir::triton::tools::isNpotAllowed();
       auto pow2Floor = [&](unsigned x) -> unsigned {
         return allowNpot ? (1u << llvm::Log2_32(std::max<unsigned>(x, 1))) : x;
       };
@@ -1050,6 +1050,7 @@ w2 w2 w3 w3
 
     // Check if tilesPerWarp is 1 in every dimension.
     bool hasUnitTilesPerWarp() const;
+    bool hasMixedRadixLayout() const;
 
     // Returns a swizzled shared layout matching this MFMA layout for the
     // dot operand at the given |operandIdx| with |operandShape|.
@@ -1270,48 +1271,13 @@ An encoding for tensors that have been produced by tensor cores.
 It is characterized by two parameters:
 - A 'versionMajor' which specifies the generation the tensor cores
   whose output is being partitioned:
-  - 1 for first-gen tensor cores (Volta), and
-  - 2 for second-gen tensor cores (Turing/Ampere).
+  - 2 for second-gen tensor cores (Turing/Ampere), and
+  - 3 for Hopper tensor cores.
+  First-gen tensor cores (Volta, versionMajor = 1) are no longer supported
+  and are rejected by the attribute verifier.
 - A 'versionMinor' which indicates the specific layout of a tensor core
-  generation, e.g. for Volta, there might be multiple kinds of layouts
-  annotated by 0,1,2 and so on.
+  generation.
 - A `blockTileSize` to indicate how data should be partitioned between warps.
-
-// -------------------------------- version = 1 --------------------------- //
-
-For first-gen tensor cores, the implicit warpTileSize is [16, 16].
-Note: the layout is different from the recommended in PTX ISA
-https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
-(mma.884 section, FP32 accumulator).
-
-For example, when versionMinor=1, the matrix L corresponding to
-blockTileSize=[32,16] is:
-
-                               warp 0
---------------------------------/\-------------------------------
-[ 0   0   2   2   8   8   10  10   0   0   2   2   8   8   10  10 ]
-[ 1   1   3   3   9   9   11  11   1   1   3   3   9   9   11  11 ]
-[ 0   0   2   2   8   8   10  10   0   0   2   2   8   8   10  10 ]
-[ 1   1   3   3   9   9   11  11   1   1   3   3   9   9   11  11 ]
-[ 4   4   6   6   12  12  14  14   4   4   6   6   12  12  14  14 ]
-[ 5   5   7   7   13  13  15  15   5   5   7   7   13  13  15  15 ]
-[ 4   4   6   6   12  12  14  14   4   4   6   6   12  12  14  14 ]
-[ 5   5   7   7   13  13  15  15   5   5   7   7   13  13  15  15 ]
-[ 16  16  18  18  20  20  22  22   16  16  18  18  20  20  22  22 ]
-[ 17  17  19  19  21  21  23  23   17  17  19  19  21  21  23  23 ]
-[ 16  16  18  18  20  20  22  22   16  16  18  18  20  20  22  22 ]
-[ 17  17  19  19  21  21  23  23   17  17  19  19  21  21  23  23 ]
-[ 24  24  26  26  28  28  30  30   24  24  26  26  28  28  30  30 ]
-[ 25  25  27  27  29  29  31  31   25  25  27  27  29  29  31  31 ]
-[ 24  24  26  26  28  28  30  30   24  24  26  26  28  28  30  30 ]
-[ 25  25  27  27  29  29  31  31   25  25  27  27  29  29  31  31 ]
-
-                          warp 1 = warp0 + 32
---------------------------------/\-------------------------------
-[ 32  32  34  34  40  40  42  42   32  32  34  34  40  40  42  42 ]
-[ 33  33  35  35  41  41  43  43   33  33  35  35  41  41  43  43 ]
-[ ............................................................... ]
-
 
 // -------------------------------- version = 2 --------------------------- //
 
@@ -1356,6 +1322,7 @@ For example, the matrix L corresponding to blockTileSize=[32,16] is:
     bool isTuring() const;
     bool isAmpere() const;
     bool isHopper() const;
+    bool hasMixedRadixLayout() const;
 
     SmallVector<int64_t> getRepForOperand(ArrayRef<int64_t> shape,
                                           int bitwidth, int kWidth,
@@ -1364,6 +1331,7 @@ For example, the matrix L corresponding to blockTileSize=[32,16] is:
     LinearLayout dotOperandToLinearLayout(Attribute dotOp, ArrayRef<int64_t> shape) const;
   }];
 
+  let genVerifyDecl = 1;
   let hasCustomAssemblyFormat = 1;
 }
 
@@ -1469,7 +1437,9 @@ vecIdx (index of the element in the quad; this is always along the k-dim)
 
   let assemblyFormat = "`<` `{` struct(params) `}` `>`";
   let genVerifyDecl = 1;
-  let extraClassDeclaration = extraDistributedDeclaration;
+  let extraClassDeclaration = extraDistributedDeclaration#[{
+    bool hasMixedRadixLayout() const;
+  }];
 }
 
 def TTG_SharedMemorySpace : AttrDef<TritonGPU_Dialect, "SharedMemorySpace"> {

@@ -48,6 +48,14 @@ label.ctl { color: var(--text-secondary); display: flex; gap: 6px; align-items: 
 select, button { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--axis);
   border-radius: 6px; padding: 4px 8px; }
 button { cursor: pointer; }
+.tabbar { display: flex; align-items: center; gap: 12px; margin: 24px 0 20px; border-bottom: 1px solid var(--grid); }
+.tablist { display: flex; gap: 24px; }
+.tablist button { border: 0; border-radius: 0; background: none; padding: 10px 0; margin-bottom: -1px;
+  border-bottom: 3px solid transparent; color: var(--text-secondary); font-weight: 600; }
+.tablist button[aria-selected="true"] { border-bottom-color: var(--series-1); color: var(--text-primary); }
+.tablist button:focus-visible { outline: 2px solid var(--series-1); outline-offset: 3px; }
+.tabbar > button { margin-left: auto; font-size: 12px; }
+[role="tabpanel"][hidden] { display: none; }
 .spacer { flex: 1; }
 .tiles { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 16px; }
 .tile { background: var(--surface-1); border: 1px solid var(--ring); border-radius: 8px; padding: 12px; }
@@ -55,6 +63,8 @@ button { cursor: pointer; }
 .tile .v { font-size: 26px; font-weight: 600; }
 .card { background: var(--surface-1); border: 1px solid var(--ring); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
 .card .sub { font-size: 12px; margin-bottom: 8px; }
+.overview-image { display: block; width: 100%; max-width: 1080px; height: auto; margin: 12px auto 0; background: #fff; }
+.overview-sources { margin: 8px 0; padding-left: 20px; color: var(--text-secondary); font-size: 12px; }
 .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); margin: 4px 0 8px; }
 .legend button { border: none; background: none; padding: 2px 4px; color: var(--text-secondary); display: flex; gap: 6px; align-items: center; }
 .legend button[aria-pressed="false"] { opacity: 0.4; }
@@ -149,11 +159,32 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
 <body>
 <div class="viz-root">
 <main>
-  <h1>tlx.ops nightly performance</h1>
-  <p class="sub">TLX kernels raced against each op's reference on the fbtriton nightly wheel. A case under 0.9× is PIP.
+  <h1>tlx.ops performance</h1>
+  <p class="sub">TLX kernels compared with each operation's reference.
     <a href="../">FBTriton site</a></p>
-  <div class="banner" id="banner"></div>
+  <div class="tabbar">
+    <div class="tablist" role="tablist" aria-label="Performance views">
+      <button id="tab-overview" type="button" role="tab" aria-selected="true" aria-controls="overview" tabindex="0">Overview</button>
+      <button id="tab-trending" type="button" role="tab" aria-selected="false" aria-controls="trending" tabindex="-1">Trending</button>
+    </div>
+    <button id="theme" type="button">Toggle theme</button>
+  </div>
 
+  <section class="card" id="overview" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
+    <h2 id="overview-title">Latest measured performance</h2>
+    <p class="sub">Each platform's latest published benchmark results, grouped by operation and direction. Geometric means include noisy measurements and exclude errors or missing references.
+      <a href="tlx_ops_bench_overview.svg" target="_blank" rel="noopener">Open full-size diagram</a></p>
+    <ul class="overview-sources" id="overview-sources"></ul>
+    <a href="tlx_ops_bench_overview.svg" target="_blank" rel="noopener">
+      <img class="overview-image" src="tlx_ops_bench_overview.svg"
+        alt="Latest published TLX performance by platform, operation and direction, with references, compared case counts and geometric mean speedups.">
+    </a>
+  </section>
+
+  <section id="trending" role="tabpanel" aria-labelledby="tab-trending" tabindex="0" hidden>
+  <p class="sub">Nightly performance on the fbtriton wheel. A case under 0.9× is PIP.</p>
+  <div class="banner" id="banner"></div>
+  <div id="trending-content">
   <div class="row filterbar" role="group" aria-label="Filters">
     <label class="ctl">Nights <select id="range"><option value="7">Last 7</option><option value="14">Last 14</option>
       <option value="30" selected>Last 30</option><option value="60">Last 60</option></select></label>
@@ -163,8 +194,6 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       <option value="bwd">bwd</option></select></label>
     <label class="ctl">Dtype <select id="dtype"></select></label>
     <label class="ctl">Group by <select id="group"></select></label>
-    <span class="spacer"></span>
-    <button id="theme" type="button">Toggle theme</button>
   </div>
 
   <div class="tiles" id="tiles"></div>
@@ -227,6 +256,8 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     <p class="sub" id="howto-sub"></p>
     <div id="howto"></div>
   </details>
+  </div>
+  </section>
 </main>
 </div>
 <script>
@@ -270,7 +301,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     pip: {label: "PIP", icon: "▼", color: "var(--serious)"},
     error: {label: "ERROR", icon: "✕", color: "var(--critical)"},
   };
-  const state = {platform: PLATFORMS.map(([k]) => k).find((k) => DATA.platforms[k]) || Object.keys(DATA.platforms)[0], op: "all", dir: "all", dtype: "all", inputs: {}, group: "op", range: 30, trendScroll: null, hidden: new Set(), statuses: new Set(Object.keys(STATUS)),
+  const state = {tab: "overview", platform: PLATFORMS.map(([k]) => k).find((k) => DATA.platforms[k]) || Object.keys(DATA.platforms)[0], op: "all", dir: "all", dtype: "all", inputs: {}, group: "op", range: 30, trendScroll: null, hidden: new Set(), statuses: new Set(Object.keys(STATUS)),
                  sort: {key: null, dir: 1}, sortSum: {key: null, dir: 1}, rows: 50, ev: null, casesSort: "r"};
   const $ = (id) => document.getElementById(id);
   const el = (tag, attrs = {}, text) => {
@@ -281,6 +312,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
   };
   const s = (tag, attrs) => el(tag, {...attrs, svg: true});
   const fmt = (v, d = 3, suf = "") => (v === null || v === undefined ? "–" : v.toFixed(d) + suf);
+  const fmtTf = (v) => fmt(v, v < 10 ? 3 : 0);
   const fmtDate = (d) => `${d.slice(4, 6)}/${d.slice(6)}`;
   // Round tick step near raw: 1, 2, 2.5 or 5 times a power of ten.
   const niceStep = (raw) => { const mag = 10 ** Math.floor(Math.log10(raw)); return mag * [1, 2, 2.5, 5, 10].find((f) => f * mag >= raw); };
@@ -297,9 +329,10 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     const kept = cases.filter(matches), timed = kept.filter((c) => c.s !== "error");
     return {n: kept.length, speedup: geomean(timed.filter((c) => c.x).map((c) => c.x)), tflops: geomean(timed.map((c) => c.t))};
   }
+  const hasReference = (cases) => cases.some((c) => matches(c) && c.s !== "error" && c.x > 0);
   const sliceName = () => [state.dir !== "all" ? state.dir : "", state.dtype !== "all" ? state.dtype : "",
     ...(state.op === "all" ? [] : Object.entries(state.inputs).map(([k, v]) => `${k}=${v}`))].filter(Boolean).join(" · ");
-  const colorOf = (op) => `var(--series-${speedupOps().indexOf(op) + 1})`;
+  const colorOf = (op) => `var(--series-${Math.max(0, speedupOps().indexOf(op)) + 1})`;
 
   // ---- group by: the trend, the latest-night bars and the summary table split the slice by one key.
   const OTHER = "other", MAX_GROUPS = 8;
@@ -490,7 +523,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     box.querySelectorAll(".scroll, .yaxis, .note").forEach((n) => n.remove());
     const H = plat().history.slice(-state.range);
     const single = state.op !== "all";
-    const byTflops = single && !plat().latest[state.op].ref;
+    const byTflops = single && !H.some((n) => hasReference(n.ops[state.op].cases));
     const metric = byTflops ? "tflops" : "speedup";
     // Per-night aggregates for each group of this slice; a group with nothing in the slice has no line.
     const groups = groupList();
@@ -500,7 +533,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     $("trend-title").textContent = (byTflops ? `${state.op}: TLX TFLOP/s per night` : "Geomean speedup per night") + by;
     const unavailable = single && plat().latest[state.op].reason;
     $("trend-sub").textContent = unavailable ? "No benchmark measurements were recorded."
-      : byTflops ? "This op has no reference, so throughput is the number to track."
+      : byTflops ? "These cases have no reference, so throughput is the number to track."
                 : "Solid line: parity with the reference. Dashed line: the 0.9× PIP floor.";
     const legend = $("trend-legend");
     legend.textContent = "";
@@ -525,6 +558,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     const vals = shown.flatMap((o) => H.map((n) => val(n, o))).filter((v) => v);
     let lo = Math.min(...vals), hi = Math.max(...vals);
     if (!byTflops) { lo = Math.min(lo, 0.8); hi = Math.max(hi, 1.05); }
+    else if (lo === hi) lo = 0;
     const step = niceStep((hi - lo) / 4 || 1);
     lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step;
     const x = (i) => m.l + (W - m.l - m.r) * (i / Math.max(H.length - 1, 1));
@@ -537,7 +571,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     yaxis.append(s("rect", {x: 0, y: 0, width: m.l, height: Hh - m.b + 6, fill: "var(--surface-1)"}));
     for (let v = lo; v <= hi + step / 2; v += step) {
       svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1}));
-      yaxis.append(el("text", {svg: 1, x: m.l - 6, y: y(v) + 4, "text-anchor": "end"}, byTflops ? v.toFixed(0) : v.toFixed(2) + "×"));
+      yaxis.append(el("text", {svg: 1, x: m.l - 6, y: y(v) + 4, "text-anchor": "end"}, byTflops ? String(+v.toPrecision(4)) : v.toFixed(2) + "×"));
     }
     if (!byTflops) {
       svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(1), y2: y(1), stroke: "var(--axis)", "stroke-width": 1.5}));
@@ -574,7 +608,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     for (let k = ends.length - 1; k >= 0; k--) ends[k].y = Math.min(ends[k].y, k === ends.length - 1 ? Hh - m.b : ends[k + 1].y - 15);
     for (const e of ends)
       svg.append(el("text", {svg: 1, class: "direct", x: W - m.r + 10, y: e.y + 4},
-                    `${groupName(e.op)}  ${byTflops ? e.v.toFixed(0) : e.v.toFixed(3) + "×"}`));
+                    `${groupName(e.op)}  ${byTflops ? fmtTf(e.v) : e.v.toFixed(3) + "×"}`));
     const hair = s("line", {y1: m.t, y2: Hh - m.b, stroke: "var(--muted)", "stroke-width": 1, visibility: "hidden"});
     svg.append(hair);
     const hit = s("rect", {x: m.l, y: 0, width: W - m.l - m.r, height: Hh, fill: "transparent", tabindex: 0});
@@ -590,7 +624,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
         k.style.background = colorOfGroup(op, groups);
         nm.append(k, document.createTextNode(groupName(op)));
         const v = val(n, op);
-        r.append(el("b", {}, byTflops ? fmt(v, 0, " TF/s") : fmt(v, 3, "×")), nm);
+        r.append(el("b", {}, byTflops ? fmtTf(v) + " TF/s" : fmt(v, 3, "×")), nm);
         tip.append(r);
       }
       // Position against the box, not the svg: the svg may be scrolled partly out of view.
@@ -644,7 +678,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     };
     const hide = () => { tip.style.display = "none"; };
     const single = state.op !== "all", grouped = !single || state.group !== "none";
-    const noRef = single && !L[state.op].ref;
+    const noRef = single && !hasReference(L[state.op].cases);
     if (grouped) {
       // Bars: one per group, the same groups and colors as the trend.
       const metric = noRef ? "tflops" : "speedup";
@@ -664,17 +698,17 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
         const tickStep = noRef ? 10 ** Math.floor(Math.log10(vmax / 2)) * ([1, 2, 5].find((f) => f * 10 ** Math.floor(Math.log10(vmax / 2)) * 4 >= vmax) || 10) : 0.5;
         for (let v = 0; v <= vmax; v += tickStep) {
           bsvg.append(s("line", {x1: x(v), x2: x(v), y1: m.t, y2: Hh - m.b, stroke: "var(--grid)"}));
-          bsvg.append(el("text", {svg: 1, x: x(v), y: Hh - 6, "text-anchor": "middle"}, noRef ? String(Math.round(v)) : v + "×"));
+          bsvg.append(el("text", {svg: 1, x: x(v), y: Hh - 6, "text-anchor": "middle"}, noRef ? String(+v.toPrecision(4)) : v + "×"));
         }
         bars.forEach((g, k) => {
           const v = agg[g][metric], y0 = m.t + k * rowH + 6, h = rowH - 12;
           bsvg.append(el("text", {svg: 1, class: "direct", x: m.l - 10, y: y0 + h / 2 + 4, "text-anchor": "end"}, groupName(g)));
           const bar = s("rect", {x: x(0), y: y0, width: Math.max(0, x(v) - x(0)), height: h, rx: 4, fill: colorOfGroup(g, groups), tabindex: 0});
-          const info = (ev) => place(ev, [el("div", {class: "h"}, groupName(g)), el("div", {}, (noRef ? `${v.toFixed(0)} TF/s` : `${v.toFixed(3)}×`)
-            + ` geomean over ${groupCases(L, g, groups).filter((c) => matches(c) && c.s !== "error").length} measured cases`)]);
+          const info = (ev) => place(ev, [el("div", {class: "h"}, groupName(g)), el("div", {}, (noRef ? `${fmtTf(v)} TF/s` : `${v.toFixed(3)}×`)
+            + ` geomean over ${groupCases(L, g, groups).filter((c) => matches(c) && c.s !== "error" && c[noRef ? "t" : "x"] > 0).length} measured cases`)]);
           bar.addEventListener("pointermove", info); bar.addEventListener("pointerleave", hide);
           bsvg.append(bar);
-          bsvg.append(el("text", {svg: 1, class: "direct", x: x(v) + 8, y: y0 + h / 2 + 4}, noRef ? v.toFixed(0) : v.toFixed(3) + "×"));
+          bsvg.append(el("text", {svg: 1, class: "direct", x: x(v) + 8, y: y0 + h / 2 + 4}, noRef ? fmtTf(v) : v.toFixed(3) + "×"));
         });
         if (!noRef) {
           bsvg.append(s("line", {x1: x(FLOOR), x2: x(FLOOR), y1: m.t, y2: Hh - m.b, stroke: "var(--critical)", "stroke-dasharray": "4 4"}));
@@ -685,21 +719,22 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       if (!single) return;
     }
     {
-      const cs = L[state.op].cases.filter(matches).filter((c) => c.x);
-      const errs = L[state.op].cases.filter((c) => matches(c) && !c.x).length;
+      const cs = L[state.op].cases.filter((c) => matches(c) && c.s !== "error" && c.x);
+      const errs = L[state.op].cases.filter((c) => matches(c) && c.s === "error").length;
+      const uncompared = L[state.op].cases.filter((c) => matches(c) && c.s !== "error" && !c.x).length;
       if (!L[state.op].cases.some(matches)) {
         if (!grouped) { $("dist-title").textContent = `${state.op}: every case, latest night`; $("dist-sub").textContent = ""; }
         box.prepend(el("p", {class: "note"}, `${state.op} has no ${sliceName()} cases.`));
         return;
       }
       if (!grouped) $("dist-title").textContent = `${state.op}: every case, latest night`;
-      if (!L[state.op].ref) {
+      if (noRef) {
         if (!grouped) $("dist-sub").textContent = "No reference, so no speedup: see TLX TFLOP/s per case in the table.";
         box.append(el("p", {class: "note"}, `${L[state.op].cases.filter(matches).length} cases; per-case TFLOP/s are in the table.`));
         return;
       }
-      const dotsNote = `Dots: every case, sorted by speedup; color and icon give the status.${errs ? ` ${errs} errored case(s) have no speedup and appear only in the table.` : ""}`;
-      $("dist-sub").textContent = grouped ? `${$("dist-sub").textContent} ${dotsNote}`.trim() : dotsNote.replace("Dots: every case, sorted", "Sorted");
+      const dotsNote = `Dots: every compared case, sorted by speedup; color and icon give the status.${errs ? ` ${errs} errored case(s) have no speedup and appear only in the table.` : ""}${uncompared ? ` ${uncompared} case(s) have no reference; their throughput is in the chart and table below.` : ""}`;
+      $("dist-sub").textContent = grouped ? `${$("dist-sub").textContent} ${dotsNote}`.trim() : dotsNote.replace("Dots: every compared case, sorted", "Sorted");
       cs.sort((a, b) => a.x - b.x);
       const Hh = 240, m = {l: 48, r: 16, t: 12, b: 20};
       const hi = Math.max(1.2, ...cs.map((c) => c.x)) * 1.05;
@@ -736,8 +771,8 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     box.querySelectorAll(".scroll, .yaxis, .note").forEach((n) => n.remove());
     card.hidden = state.op === "all";
     if (card.hidden) return;
-    const o = plat().latest[state.op], hasRef = !!o.ref;
-    const all = o.cases.filter(matches), cs = all.filter((c) => c.s !== "error" && c.t);
+    const o = plat().latest[state.op], all = o.cases.filter(matches), hasRef = hasReference(all);
+    const cs = all.filter((c) => c.s !== "error" && c.t);
     const sort = hasRef || state.casesSort !== "r" && state.casesSort !== "x" ? state.casesSort : "t";
     $("cases-sort").value = sort;
     [...$("cases-sort").options].forEach((op) => { op.disabled = !hasRef && (op.value === "r" || op.value === "x"); });
@@ -794,12 +829,13 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       const head = el("div", {class: "h"}); head.append(statusBadge(c.s), document.createTextNode(` ${c.d} · ${c.dt}`));
       tip.append(head, el("div", {}, c.l));
       for (const sr of series) {
+        if (!c[sr.k]) continue;
         const r = el("div", {class: "r"}), nm = el("span", {class: "nm"}), k = el("span", {class: "key"});
         k.style.background = sr.color; nm.append(k, document.createTextNode(sr.name));
-        r.append(el("b", {}, fmt(c[sr.k], c[sr.k] < 1 ? 4 : 0, " TF/s")), nm);
+        r.append(el("b", {}, fmtTf(c[sr.k]) + " TF/s"), nm);
         tip.append(r);
       }
-      if (hasRef) tip.append(el("div", {}, `speedup ${fmt(c.x, 3, "×")}`));
+      if (hasRef && c.x) tip.append(el("div", {}, `speedup ${fmt(c.x, 3, "×")}`));
       if (c.n) tip.append(el("div", {class: "note"}, c.n));
       const bx = box.getBoundingClientRect();
       tip.style.display = "block";
@@ -904,16 +940,12 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     }
   }
 
-  if (!state.platform) {
-    $("banner").textContent = "No nightly results published yet.";
-    document.querySelectorAll("main > :not(h1, .sub, .banner)").forEach((n) => { n.hidden = true; });
-    return;
-  }
-
   // The view lives in the URL hash, so a link reopens exactly what the sender saw.
   const params = new URLSearchParams(location.hash.slice(1));
+  if (params.has("tab")) state.tab = params.get("tab") === "trending" ? "trending" : "overview";
+  else if (params.has("platform") || params.has("op") || params.has("ev")) state.tab = "trending";
   if (DATA.platforms[params.get("platform")]) state.platform = params.get("platform");
-  if (params.get("op") && DATA.platforms[state.platform].latest[params.get("op")]) state.op = params.get("op");
+  if (state.platform && params.get("op") && DATA.platforms[state.platform].latest[params.get("op")]) state.op = params.get("op");
   if (["7", "14", "30", "60"].includes(params.get("nights"))) state.range = Number(params.get("nights"));
   if (/^\d{8}$/.test(params.get("ev") || "")) state.ev = params.get("ev");
   if (["fwd", "bwd"].includes(params.get("dir"))) state.dir = params.get("dir");
@@ -924,7 +956,8 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
   $("range").value = String(state.range);
   const saveHash = () => {
     const p = new URLSearchParams();
-    p.set("platform", state.platform);
+    p.set("tab", state.tab);
+    if (state.platform) p.set("platform", state.platform);
     if (state.op !== "all") p.set("op", state.op);
     if (state.range !== 30) p.set("nights", state.range);
     if (state.ev) p.set("ev", state.ev);
@@ -1243,7 +1276,35 @@ python .github/scripts/tlx_ops_bench_dashboard.py render site --from rel   # pre
     td.append(d);
   }
 
-  function render() { controls(); banner(); inputs(); tiles(); trend(); evCard(); dist(); cases(); table(); versions(); howto(); saveHash(); }
+  const TABS = ["overview", "trending"];
+  function render() {
+    for (const name of TABS) {
+      const selected = state.tab === name, tab = $(`tab-${name}`);
+      tab.setAttribute("aria-selected", String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+      $(name).hidden = !selected;
+    }
+    if (state.tab === "trending") {
+      $("trending-content").hidden = !state.platform;
+      if (state.platform) {
+        controls(); banner(); inputs(); tiles(); trend(); evCard(); dist(); cases(); table(); versions(); howto();
+      } else $("banner").textContent = "No nightly results published yet.";
+    }
+    saveHash();
+  }
+  for (const [i, name] of TABS.entries()) {
+    const tab = $(`tab-${name}`);
+    tab.onclick = () => { state.tab = name; render(); };
+    tab.onkeydown = (e) => {
+      const next = {ArrowRight: (i + 1) % TABS.length, ArrowLeft: (i + TABS.length - 1) % TABS.length,
+        Home: 0, End: TABS.length - 1}[e.key];
+      if (next === undefined) return;
+      e.preventDefault();
+      state.tab = TABS[next];
+      render();
+      $(`tab-${state.tab}`).focus();
+    };
+  }
   $("platform").onchange = (e) => { state.platform = e.target.value; state.trendScroll = null; state.hidden.clear(); render(); };
   $("range").onchange = (e) => { state.range = Number(e.target.value); state.trendScroll = null; render(); };
   $("dir").onchange = (e) => { state.dir = e.target.value; state.rows = 50; render(); };
@@ -1259,8 +1320,18 @@ python .github/scripts/tlx_ops_bench_dashboard.py render site --from rel   # pre
     r.dataset.theme = dark ? "light" : "dark";
     saveHash();
   };
-  window.addEventListener("resize", () => { trend(); dist(); cases(); });
+  window.addEventListener("resize", () => {
+    if (state.tab === "trending" && state.platform) { trend(); dist(); cases(); }
+  });
   $("cases-sort").onchange = (e) => { state.casesSort = e.target.value; cases(); };
+  for (const p of (RAW && RAW.overview) || []) {
+    const item = el("li"), date = p.date;
+    item.append(el("a", {href: p.source, target: "_blank", rel: "noopener"},
+      `${p.platform.toUpperCase()} · ${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6)} · source JSON`),
+      document.createTextNode(` · ${p.version || ""} · `),
+      el("a", {href: `${REPO}/commit/${p.sha}`, target: "_blank", rel: "noopener"}, p.sha.slice(0, 12)));
+    $("overview-sources").append(item);
+  }
   render();
 })();
 </script>

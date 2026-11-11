@@ -32,7 +32,7 @@ struct TestAMDGPUMembarPass
     ModuleAllocation allocation(moduleOp);
     ModuleMembarAnalysis membarPass(allocation, triton::AMD::membarFilter,
                                     triton::AMD::getWarpLocalScratchSync());
-    membarPass.run();
+    membarPass.run<triton::AMD::AMDMembarAnalysis>();
   }
 };
 

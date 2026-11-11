@@ -165,6 +165,15 @@ public:
                       function_ref<InFlightDiagnostic()> emitError) const = 0;
 };
 
+// The order and per-thread vector Coalesce gives an NPOT dot operand's load,
+// and the stages the target's pipeliner copies it to shared memory in (0 when
+// it is not copied async).
+struct NpotDotOperandAccess {
+  SmallVector<unsigned> order;
+  unsigned vector;
+  unsigned asyncStages;
+};
+
 // Implemented by the dialect of a target's MMA ops. The pad pass and the
 // target's lowering ask the one whose prefix matches ttg.target.
 class NpotTargetLegality : public DialectInterface::Base<NpotTargetLegality> {
@@ -176,30 +185,63 @@ public:
 
   // Why `dot` can't be exact on `target` with `numWarps` warps, or
   // std::nullopt. `layout` is the mixed-radix layout of the dot's first NPOT
-  // operand.
+  // operand; `nonKDim` is the MMA M/N size the target's dot pass enforces, 0
+  // if none.
   virtual std::optional<std::string>
   getDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
-                          StringRef target, int numWarps) const = 0;
+                          StringRef target, int numWarps,
+                          int nonKDim) const = 0;
+
+  // Why an exact `dot` is slower than padded on `target` when its A and B are
+  // accessed as `operands` say, or std::nullopt. `nonKDim` is as above.
+  virtual std::optional<std::string>
+  getDotSlowReason(Operation *dot, ArrayRef<NpotDotOperandAccess> operands,
+                   int numWarps, int threadsPerWarp, int nonKDim,
+                   StringRef target) const {
+    return std::nullopt;
+  }
 
   // Why a global-to-shared async `copy` of mixed-radix `layout` can't lower on
   // `target`, or std::nullopt.
   virtual std::optional<std::string>
   getAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout,
                                 StringRef target) const = 0;
+
+  // Why tensor descriptor `op` can't move its tile, of mixed-radix `layout`, on
+  // `target`, or std::nullopt.
+  virtual std::optional<std::string>
+  getDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
+                                 StringRef target) const = 0;
 };
 
 // The ttg.target of `op`'s module, or "" if it has none.
 StringRef getModuleTarget(Operation *op);
 
-// Why the NpotTargetLegality matching `target` rejects `layout`, or
-// std::nullopt; without one the dot isn't supported.
+// Why the NpotTargetLegality matching `target` rejects `layout` at `nonKDim`,
+// or std::nullopt; without one the dot isn't supported.
 std::optional<std::string>
 getNpotDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
-                            StringRef target, int numWarps);
+                            StringRef target, int numWarps, int nonKDim);
+
+// The same for the target's cost of an exact `dot` (see getDotSlowReason).
+std::optional<std::string>
+getNpotDotSlowReason(Operation *dot, ArrayRef<NpotDotOperandAccess> operands,
+                     int numWarps, int threadsPerWarp, int nonKDim,
+                     StringRef target);
 
 // The same for a global-to-shared async `copy` of mixed-radix `layout`.
 std::optional<std::string>
 getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout);
+
+// Whether store `op` takes getMixedRadixVector's predicated vector: unless its
+// value is computed elementwise from a tt.load (also through control flow),
+// whose layout a wider store would have to convert from.
+bool npotStoreTakesPredicatedVector(Operation *op);
+
+// The same for a tensor descriptor op on `target`.
+std::optional<std::string>
+getNpotDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
+                                   StringRef target);
 
 // Descriptor gather and scatter have restrictions on the tile sizes.
 LogicalResult verifyGatherScatterResultType(Operation *op,

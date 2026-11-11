@@ -65,6 +65,13 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         filename = item.path.name
         if filename in _VERSION_SKEW_FILES:
+            # Exemption: test_standard_scan (upstream #12007) exercises only core
+            # scan ops (cumsum/cumprod) through the pinned frontend, so it may pass
+            # where pointer-layout tests cannot. Exempted so touched-file coverage
+            # can run. TODO(gluon-ci): revisit after the frontend re-sync.
+            if filename == "test_lowerings.py" and getattr(
+                    item, "originalname", item.name) == "test_standard_scan":
+                continue
             item.add_marker(skew)
             continue
         if any(sub in item.nodeid for sub in _KNOWN_FAIL_SUBSTRINGS):

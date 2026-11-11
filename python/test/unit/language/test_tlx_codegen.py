@@ -29,6 +29,7 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
 from triton.backends.amd import compiler as amd_compiler
 from triton.tlx.ops.kernels.flash_attn import gfx950 as _amd_fa_cluster_module
+from triton.tlx.ops.kernels.mm_mxfp8 import gfx950 as _amd_mm_mxfp8
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_tdm_pipelined import (
     mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
@@ -777,6 +778,44 @@ def compile_for_target(fn, signature, constexprs, target, attrs=None):
 def compile_for_gfx950(fn, signature, constexprs, attrs=None):
     """Compile a TLX kernel for gfx950 and return the compiled object."""
     return compile_for_target(fn, signature, constexprs, GFX950, attrs=attrs)
+
+
+@triton.jit
+def _mxfp8_gfx950_copy_layout_kernel(A, C, COPY: tl.constexpr, ROWS: tl.constexpr):
+    bases: tl.constexpr = [
+        [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [2, 16], [4, 32], [8, 64], [16, 0]
+    ] + ([[32, 0]] if ROWS >= 64 else []) + ([[64, 0]] if ROWS >= 128 else []) + ([[128, 0]] if ROWS >= 256 else [])
+    shared: tl.constexpr = tlx.shared_linear_layout_encoding([[0, pair[0], pair[1]] for pair in bases], [],
+                                                             alignment=16)
+    buf = tlx.local_alloc((1, ROWS, 128), tlx.dtype_of(A), 1, layout=shared)
+    COPY(A, 0, 1, buf[0], ROWS, ROWS - 3, 256)
+    tlx.async_load_commit_group()
+    tlx.async_load_wait_group(0)
+    tlx.workgroup_barrier()
+    values = tlx.local_load(buf[0])
+    rows = tl.arange(0, ROWS)
+    cols = tl.arange(0, 128)
+    tl.store(C + (rows[:, None] * 128 + cols[None, :])[None, :, :], values)
+
+
+@pytest.mark.parametrize("copy", [
+    _amd_mm_mxfp8._n256x192_fly_layout_copy,
+    _amd_mm_mxfp8._ns4_fly_layout_copy,
+    _amd_mm_mxfp8._n256x256_fly_layout_copy,
+])
+@pytest.mark.parametrize("rows", [32, 64, 128, 256])
+def test_mxfp8_gfx950_copy_layout_verifies(copy, rows, tmp_path):
+    source = ASTSource(_mxfp8_gfx950_copy_layout_kernel, signature={"A": "*fp8e4nv", "C": "*fp8e4nv"},
+                       constexprs={"COPY": copy, "ROWS": rows}, attrs={(0, ): [("tt.divisibility", 16)]})
+    compiled = triton_compile(source, target=GFX950, options={"num_warps": 4})
+    backend = triton.compiler.compiler.make_backend(GFX950)
+    context = ir.context()
+    ir.load_dialects(context)
+    backend.load_dialects(context)
+    path = tmp_path / "copy.ttir"
+    path.write_text(compiled.asm["ttir"])
+    assert ir.parse_mlir_module(str(path), context).verify()
+    assert "buffer_load_dwordx4" in compiled.asm["amdgcn"]
 
 
 def compile_for_gfx942(fn, signature, constexprs):
@@ -6892,6 +6931,62 @@ def test_async_amd_desc_load_pred_compiles_gfx1250(device):
     assert "async_tdm_copy_global_to_local" in ttgir
 
 
+@triton.jit
+def _amd_split_workgroup_barrier_kernel(x_ptr, y_ptr, BAR: tl.constexpr, COUNT: tl.constexpr):
+    offsets = tl.arange(0, 128)
+    x = tl.load(x_ptr + offsets)
+    buf = tlx.local_alloc((128, ), tl.float32, 1)
+    tlx.local_store(buf[0], x)
+    tlx.named_barrier_arrive(BAR, COUNT)
+    # Register-only work between the two halves of the barrier.
+    scaled = x * 3.0
+    tlx.named_barrier_wait(BAR, COUNT)
+    # Membar orders every shared-memory RAW; the split barrier must cover it.
+    y = tlx.local_load(buf[0])
+    tl.store(y_ptr + offsets, y + scaled)
+
+
+def test_amd_split_workgroup_barrier_compiles_gfx1250():
+    compiled = compile_for_gfx1250(
+        _amd_split_workgroup_barrier_kernel,
+        signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+        constexprs={"BAR": 0, "COUNT": 128},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count("amdg.workgroup_barrier_signal") == 1
+    assert ttgir.count("amdg.workgroup_barrier_wait") == 1
+    # The pair orders the LDS store before the load, so Membar adds no other
+    # workgroup barrier: the kernel has exactly one signal and one wait.
+    asm = compiled.asm["amdgcn"]
+    assert len(re.findall(r"^\s+s_barrier_signal -1\b", asm, re.MULTILINE)) == 1
+    assert len(re.findall(r"^\s+s_barrier_wait -1\b", asm, re.MULTILINE)) == 1
+    signal = asm.index("s_barrier_signal -1")
+    assert asm.index("ds_store", 0) < signal < asm.index("s_barrier_wait -1") < asm.index("ds_load", signal)
+
+
+@pytest.mark.parametrize("bar,count,match", [
+    (1, 128, "only support the workgroup barrier"),
+    (0, 64, "must be the workgroup size"),
+])
+def test_amd_split_workgroup_barrier_rejects_named_barriers(bar, count, match):
+    with pytest.raises(CompilationError, match=match):
+        compile_for_gfx1250(
+            _amd_split_workgroup_barrier_kernel,
+            signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+            constexprs={"BAR": bar, "COUNT": count},
+        )
+
+
+@pytest.mark.parametrize("compile_fn", [compile_for_gfx950, compile_for_gfx942])
+def test_amd_split_workgroup_barrier_requires_gfx1250(compile_fn):
+    with pytest.raises(CompilationError, match=r"require gfx1250 on AMD, got gfx9(50|42)"):
+        compile_fn(
+            _amd_split_workgroup_barrier_kernel,
+            signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+            constexprs={"BAR": 0, "COUNT": 128},
+        )
+
+
 def test_async_amd_desc_store_compiles_gfx1250(device):
     """async_amd_descriptor_store produces TDM store ops in TTGIR."""
     compiled = compile_for_gfx1250(
@@ -8249,7 +8344,7 @@ def _compile_attention_backward_kernel(config, shape, *, compile_options=None, c
                      DQ_SLICES=max(1, n // config.block_n // 16) if config.cluster_dq else 1, OCC1=config.occ1,
                      OCC1_K_BANDS=config.occ1_k_bands, OCC1_PREFETCH=config.occ1_prefetch, OCC1_SCHED=config.occ1_sched,
                      PHASE_IGLP=config.phase_iglp, OCC1_DQ_FIRST=config.occ1_dq_first,
-                     OCC1_LOAD_AFTER_DK=config.occ1_load_after_dk, OCC1_PAD_K=config.occ1_pad_k)
+                     OCC1_LOAD_AFTER_DK=config.occ1_load_after_dk, OCC1_PAD_K=config.occ1_pad_k, CAUSAL=False)
     constants["SPLIT_KV_STORES"] = config.occ1 and config.packed_dq and config.q_splits > 1
     constants["MERGE_STATS"] = config.merge_stats
     tail_splits = getattr(config, "tail_splits", 1)
@@ -8898,3 +8993,28 @@ def test_attention_backward_occ1_dispatch_tail_selection(shape, packed_dq, q_spl
     for batch in (shape[0] - 1, shape[0] + 1):
         other = select_config(shape[-1], batch, shape[1], shape[2], num_cus=192, packed_dq=packed_dq)
         assert other.q_splits == 1 and other.tail_splits == 1
+
+
+def _attention_backward_causal_config(packed_dq, q_splits=1):
+    import dataclasses
+
+    return dataclasses.replace(_attention_backward_occ1_config(packed_dq, q_splits=q_splits),
+                               occ1_k_bands=0 if q_splits == 4 else 1)
+
+
+@pytest.mark.parametrize("shape,splits", [
+    ((16, 16, 16, 2048), 1),
+    ((8, 64, 8, 1024), 1),
+    ((16, 64, 8, 1024), 2),
+    ((8, 64, 8, 2048), 2),
+    ((8, 64, 8, 4096), 1),
+    ((8, 64, 8, 8192), 2),
+    ((8, 64, 8, 16384), 4),
+    ((12, 64, 8, 1024), 1),
+])
+@pytest.mark.parametrize("packed_dq", [False, True])
+def test_attention_backward_causal_split_selection(shape, splits, packed_dq):
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import select_config
+
+    config = select_config(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq, causal=True)
+    assert config == _attention_backward_causal_config(packed_dq, splits)
