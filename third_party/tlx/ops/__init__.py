@@ -120,11 +120,12 @@ from ._normalization import (
 )
 
 __all__ = [
-    "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "addmm",
-    "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen", "rmsnorm_cat",
-    "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
-    "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp",
-    "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
+    "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen",
+    "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev",
+    "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp", "UnsupportedBackward",
+    "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -689,6 +690,83 @@ def grouped_gemm_mxfp8(x, x_scale, w, w_scale, split_sizes, *, out=None, num_sms
     )
 
 
+# The local-expert histogram and the [next_pow2(topk), next_pow2(H)] fp32 finalize tile live in registers. 2**16
+# elements fit 4 warps without spilling; 2**17 is a whole gfx950 CU register file and spills at any warp count.
+_MOE_MAX_LOCAL_EXPERTS = 512
+_MOE_MAX_FINALIZE_TILE = 1 << 16
+
+
+def moe(x, topk_weights, topk_ids, w13, w2, *, expert_start=0, post_norm_weight=None, post_norm_eps=1e-6,
+        post_norm_gain=0.0, out=None, space=None):
+    """Routed SiLU-gated mixture of experts over precomputed top-k routing. Forward only, bf16.
+
+    For each token ``t`` returns ``sum_k topk_weights[t, k] * f(y_k)`` where, for local expert
+    ``e = topk_ids[t, k] - expert_start``, ``y_k = (silu(x[t] @ w13[e, :I].T) * (x[t] @ w13[e, I:].T)) @ w2[e].T``.
+    ``f`` is the identity, or with ``post_norm_weight`` an RMSNorm without affine of
+    ``bf16((post_norm_weight + post_norm_gain) * y_k)``. Routes whose id falls outside
+    ``[expert_start, expert_start + E)`` belong to other expert-parallel ranks and contribute zero.
+
+    Shapes: ``x (T, K)``, ``topk_weights``/``topk_ids (T, topk)``, ``w13 (E, 2I, K)``, ``w2 (E, H, I)``,
+    ``post_norm_weight (H,)``; returns or fills ``out (T, H)``. ``K``, ``I`` and ``H`` must be positive multiples
+    of 128, ``E <= 512`` and ``next_pow2(topk) * next_pow2(H) <= 2**16``. Ids are never read on the host, so
+    the call is graph-capturable.
+    Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    tensors = (x, topk_weights, topk_ids, w13, w2)
+    if not all(isinstance(t, torch.Tensor) for t in tensors):
+        raise InvalidInput("tlx.ops.moe expects tensor x, topk_weights, topk_ids, w13 and w2")
+    if x.ndim != 2 or topk_ids.ndim != 2 or w13.ndim != 3 or w2.ndim != 3:
+        raise InvalidInput("tlx.ops.moe expects x (T, K), topk_ids (T, topk), w13 (E, 2I, K) and w2 (E, H, I); got "
+                           f"{[tuple(t.shape) for t in (x, topk_ids, w13, w2)]}")
+    T, K = x.shape
+    E, two_i, w13_k = w13.shape
+    I = two_i // 2
+    H = w2.shape[1]
+    if (topk_weights.shape != topk_ids.shape or topk_ids.shape[0] != T or two_i % 2 or w13_k != K
+            or w2.shape != (E, H, I)):
+        raise InvalidInput("tlx.ops.moe shape mismatch: x=%s topk_weights=%s topk_ids=%s w13=%s w2=%s" %
+                           tuple(tuple(t.shape) for t in tensors))
+    if any(t.dtype != x.dtype for t in (w13, w2)):
+        raise InvalidInput("tlx.ops.moe expects x, w13 and w2 to share a dtype")
+    if topk_ids.dtype not in (torch.int32, torch.int64) or not topk_weights.dtype.is_floating_point:
+        raise InvalidInput("tlx.ops.moe expects integer topk_ids and floating-point topk_weights; got "
+                           f"{topk_ids.dtype} and {topk_weights.dtype}")
+    topk = topk_ids.shape[1]
+    tile = (1 << (topk - 1).bit_length()) * (1 << (H - 1).bit_length()) if topk >= 1 and H >= 1 else 0
+    if not 1 <= tile <= _MOE_MAX_FINALIZE_TILE or not 1 <= E <= _MOE_MAX_LOCAL_EXPERTS:
+        raise InvalidInput(f"tlx.ops.moe supports next_pow2(topk) * next_pow2(H) <= {_MOE_MAX_FINALIZE_TILE} and "
+                           f"1 <= E <= {_MOE_MAX_LOCAL_EXPERTS} local experts; got topk={topk}, H={H}, E={E}")
+    if not isinstance(expert_start, int) or expert_start < 0:
+        raise InvalidInput(f"tlx.ops.moe expects a non-negative int expert_start; got {expert_start!r}")
+    extra = []
+    if post_norm_weight is not None:
+        if (not isinstance(post_norm_weight, torch.Tensor) or post_norm_weight.shape != (H, )
+                or not post_norm_weight.dtype.is_floating_point):
+            raise InvalidInput(f"tlx.ops.moe expects a floating-point post_norm_weight of shape ({H},)")
+        extra.append(post_norm_weight)
+    if out is not None:
+        if (not isinstance(out, torch.Tensor) or out.shape != (T, H) or out.dtype != torch.bfloat16
+                or not out.is_contiguous()):
+            raise InvalidInput(f"tlx.ops.moe expects a contiguous bf16 out of shape ({T}, {H})")
+        if any(torch._C._overlaps(out, t) for t in (*tensors, *extra)):
+            raise InvalidInput("tlx.ops.moe out must not alias an input")
+        extra.append(out)
+    if any(t.device != x.device for t in (*tensors, *extra)):
+        raise InvalidInput("tlx.ops.moe expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("moe", space)
+    _check_single_config_space("moe", space_name)
+    fn, spec = impl_for("moe", device=x.device)
+    check_inputs(spec, dtype=x.dtype, K=K, I=I, H=H)
+    check_backward(spec, *tensors, *extra)
+    _check_enforced("moe", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, topk_weights, topk_ids, w13, w2, expert_start, post_norm_weight, post_norm_eps, post_norm_gain,
+                  out)
+
+
 def addmm(input, a, b, *, out=None, space=None):
     """Fused ``input + a @ b`` for two-dimensional fp16/bf16 matrices.
 
@@ -1010,6 +1088,60 @@ def mla_window_attn(x, cu_seqlens, norm_weight, q_proj, kv_proj, gate_proj, *, n
     with torch.cuda.device(x.device):
         return fn(x, cu_seqlens, norm_weight, tuple(q_proj), tuple(kv_proj), tuple(gate_proj), num_heads,
                   tuple(window_size), float(norm_eps), float(lora_eps))
+
+
+def linear_rowscale(x, weight, bias=None, row_scale=None, *, space=None):
+    """Linear layer with an optional per-row output scale, forward only.
+
+    Returns ``((x @ weight.T + bias) * row_scale[:, None]).to(x.dtype)`` for ``x`` of shape ``(M, K)``, ``weight`` of
+    shape ``(N, K)`` (``nn.Linear`` layout), an optional ``bias`` of ``N`` elements in ``x``'s dtype and an optional
+    FP32 ``row_scale`` of ``M`` elements, accumulated in FP32 and rounded once. FP16 or BF16, ``K <= 512`` and ``K``,
+    ``N`` multiples of 8. The kernel reads ``x`` and ``weight`` through TMA; one that TMA cannot address in place
+    (column stride not 1, row stride or base not 16-byte aligned) is copied first. A row's result does not depend on
+    ``M`` or on the other rows. The op has one launch configuration, so ``space`` only selects bitwise-invariance
+    checking. For ``torch.compile`` and AOTInductor, launch the kernel through :func:`linear_rowscale_launch` from a
+    ``torch.library.triton_op``.
+    """
+    import torch
+    if x.ndim != 2 or weight.ndim != 2 or weight.shape[1] != x.shape[1]:
+        raise InvalidInput("tlx.ops.linear_rowscale expects x of shape (M, K) and weight of shape (N, K); got "
+                           f"{tuple(x.shape)} and {tuple(weight.shape)}")
+    M, K = x.shape
+    N = weight.shape[0]
+    if weight.dtype != x.dtype or (bias is not None and bias.dtype != x.dtype):
+        raise InvalidInput("tlx.ops.linear_rowscale expects weight and bias in x's dtype")
+    if bias is not None and bias.numel() != N:
+        raise InvalidInput(f"tlx.ops.linear_rowscale expects a bias of {N} elements; got {tuple(bias.shape)}")
+    if row_scale is not None and (row_scale.numel() != M or row_scale.dtype != torch.float32):
+        raise InvalidInput(f"tlx.ops.linear_rowscale expects an FP32 row_scale of {M} elements; got "
+                           f"{tuple(row_scale.shape)} {row_scale.dtype}")
+    if any(t is not None and t.device != x.device for t in (weight, bias, row_scale)):
+        raise InvalidInput("tlx.ops.linear_rowscale expects all tensors on one device")
+    space_name, invariance = _normalize_space_arg("linear_rowscale", space)
+    _check_single_config_space("linear_rowscale", space_name)
+    fn, spec = impl_for("linear_rowscale", device=x.device)
+    check_inputs(spec, dtype=x.dtype, M=M, N=N, K=K)
+    check_backward(spec, x, weight, bias, row_scale)
+    _check_enforced("linear_rowscale", spec, invariance)
+    return fn(x, weight, None if bias is None else bias.reshape(N), None if row_scale is None else row_scale.reshape(M))
+
+
+def linear_rowscale_launch(x, weight, bias=None, row_scale=None, *, out):
+    """The launch of ``linear_rowscale`` as ``(kernel, grid, args, kwargs)``.
+
+    For callers that must launch the Triton kernel themselves, e.g. a ``torch.library.triton_op`` that runs
+    ``wrap_triton(kernel)[grid](*args, **kwargs)`` so that AOTInductor compiles it into the exported artifact. Same
+    operands and result as ``linear_rowscale``, written to the ``(M, N)`` ``out``; ``bias`` is ``(N,)`` and
+    ``row_scale`` ``(M,)``, both contiguous. Nothing is copied: ``x``, ``weight`` and ``out`` must have a unit column
+    stride and a 16-byte-aligned base and row stride, or ``InvalidInput`` is raised. Works on fake tensors with a
+    symbolic M.
+    """
+    if x.ndim != 2 or weight.ndim != 2:
+        raise InvalidInput("tlx.ops.linear_rowscale_launch expects two-dimensional x and weight")
+    fn, spec = impl_for("linear_rowscale_launch", device=x.device)
+    check_inputs(spec, dtype=x.dtype, N=weight.shape[0], K=x.shape[1])
+    check_backward(spec, x, weight, bias, row_scale)
+    return fn(x, weight, bias, row_scale, out=out)
 
 
 def swiglu_ffn(x, norm_weight, w1, w2, w3, *, eps=1e-5, space=None):

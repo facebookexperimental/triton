@@ -29,10 +29,10 @@ import os
 import pickle
 import re
 
-from triton.backends.nvidia.compiler import get_ptxas
 from triton.runtime.jit import _compile_iq_state, _compile_iq_suppress_competition
 
 from . import ptx_launch
+from .flags import collect_enabled
 from .store import dlog, ptx_sha256
 
 _PICKLE_MAX_BYTES = 1 << 20
@@ -116,7 +116,10 @@ def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
             if isinstance(path, tuple) and len(path) == 1 and path[0] < len(names):
                 constexpr_names.add(names[path[0]])
 
-        ptxas = get_ptxas(kernel.metadata.target.arch)
+        # Imported here so a backend API change fails open inside this try, not at import time.
+        from triton.backends.nvidia.compiler import get_ptxas_for_arch
+
+        ptxas = get_ptxas_for_arch(kernel.metadata.target.arch)
         blobs = {}
         spec = ptx_launch.build_spec(ptx, kernel.metadata, tuple(grid),
                                      _ordered_args(bound_args, constexpr_names, blobs), ptxas.path, ptxas.version)
@@ -168,24 +171,34 @@ def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
 
 
 def wrap_launcher(kernel, run):
-    """Wrap a CompiledKernel's launcher so its first launch dumps a task.
+    """Wrap a CompiledKernel's launcher for compile_iq collection and consumption.
 
     Covers kernels compiled with triton.compile() and launched through CompiledKernel.run (e.g.
-    Inductor's generated launchers), which never reach the JITFunction.run hook. Callers may hold on
-    to the returned function, so it stays installed and only the first launch collects. Launches
-    inside benchmarking() are skipped, so autotune candidates that never run outside a benchmark are
-    never collected."""
-    collected = False
+    Inductor's generated launchers), which never reach the JITFunction.run hooks. Callers may hold on
+    to the returned function, so it stays installed. On the first launch outside benchmarking() it
+    dumps a task (TRITON_COMPILE_IQ_COLLECT) and runs the pending plain-vs-ACF A/B
+    (TRITON_COMPILE_IQ_APPLY), so autotune candidates that only run inside a benchmark get neither."""
+    collect = collect_enabled()
+    done = False
+    swap = None  # (plain, acf) function handles once the A/B kept the ACF twin
 
     def launcher(grid_0, grid_1, grid_2, stream, function, metadata, launch_metadata, enter_hook, exit_hook, *args):
-        nonlocal collected
-        if not collected and not getattr(_compile_iq_state, "suppressed", False):
-            collected = True
+        nonlocal done, swap
+        if not done and not getattr(_compile_iq_state, "suppressed", False):
+            done = True
             src = kernel.src
             fn = getattr(src, "fn", None)
-            if fn is not None:
+            if collect and fn is not None:
                 capture(jitfn=fn, kernel=kernel, bound_args=dict(zip(fn.arg_names, args)), signature=src.signature,
                         constexprs=src.constants, grid=(grid_0, grid_1, grid_2))
+            if getattr(kernel, "_compile_iq_acf_cubin", None) is not None:
+                plain = kernel.function
+                kernel._compile_iq_resolve(grid_0, grid_1, grid_2, stream, dict(enumerate(args)))
+                if kernel.function != plain:
+                    swap = (plain, kernel.function)
+        if swap is not None and function == swap[0]:
+            # The caller captured the plain handle before the A/B replaced it with the ACF twin.
+            function = swap[1]
         return run(grid_0, grid_1, grid_2, stream, function, metadata, launch_metadata, enter_hook, exit_hook, *args)
 
     return launcher

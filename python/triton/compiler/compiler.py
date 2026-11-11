@@ -613,9 +613,9 @@ class CompiledKernel:
             # Used by external runtimes such as NativeRT.
             self.asm["launcher.so"] = run.launcher_bytes
         self._run = run
-        # compile_iq: dump a collection task on the first launch through `run`. Gated by
-        # TRITON_COMPILE_IQ_COLLECT; reaches kernels that bypass the JITFunction.run hook.
-        if _compile_iq_collect_enabled():
+        # compile_iq: collect a task / resolve a pending ACF on the first launch through `run`. Gated
+        # by TRITON_COMPILE_IQ_COLLECT / _APPLY; reaches kernels that bypass the JITFunction.run hooks.
+        if _compile_iq_collect_enabled() or _compile_iq_apply_enabled():
             from triton.magnon.collector import wrap_launcher
             self._run = wrap_launcher(self, run)
         # not enough shared memory to run the kernel

@@ -10,6 +10,8 @@ from triton._internal_testing import is_hip
 
 from pathlib import Path
 
+from triton.backends.compiler import GPUTarget
+
 
 def test_knobs_utils(fresh_knobs) -> None:
     triton.knobs.propagate_env = False
@@ -83,7 +85,6 @@ def test_knobs_utils(fresh_knobs) -> None:
     ])
 def test_amd_codegen_options(arch, enable_fp_fusion, disable_opt, expected_flags, disable_optimization, extra_options,
                              fresh_knobs, monkeypatch):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     calls = []
@@ -132,7 +133,6 @@ def test_amd_codegen_path_override(fresh_knobs, monkeypatch):
 
 
 def test_amd_codegen_revision_invalidates_backend_hash(fresh_knobs, monkeypatch):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     monkeypatch.setattr(compiler, "get_amd_codegen_revision", lambda: "first-revision-1")
@@ -147,7 +147,6 @@ def test_amd_codegen_revision_invalidates_backend_hash(fresh_knobs, monkeypatch)
 
 
 def test_amd_codegen_inlines_functions_from_bitcode(fresh_knobs, monkeypatch):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     source = '''
@@ -251,7 +250,6 @@ define amdgpu_kernel void @mfma_kernel(ptr addrspace(1) %a, ptr addrspace(1) %b,
 
 
 def test_amd_codegen_reports_invalid_llvm_ir(fresh_knobs):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     source = "define amdgpu_kernel void @invalid_kernel() { invalid }"
@@ -261,7 +259,6 @@ def test_amd_codegen_reports_invalid_llvm_ir(fresh_knobs):
 
 
 def test_amd_codegen_assembles_object_with_private_llvm(fresh_knobs):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     source = '''
@@ -280,7 +277,6 @@ define amdgpu_kernel void @object_kernel() {
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_amd_codegen_respects_mir_dump_knob(enabled, fresh_knobs, monkeypatch, tmp_path):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     events = []
@@ -303,7 +299,6 @@ def test_amd_codegen_respects_mir_dump_knob(enabled, fresh_knobs, monkeypatch, t
 
 
 def test_amd_codegen_preserves_mir_replacement(fresh_knobs, monkeypatch):
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     replacement_calls = []
@@ -455,7 +450,6 @@ def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
 
 
 def _register_pressure_scheduler_kernel():
-    from triton.backends.compiler import GPUTarget
     from triton.backends.nvidia import compiler
 
     compiler.llvm.init_targets()
@@ -497,7 +491,6 @@ def test_nvidia_register_pressure_scheduler_hook(link_hip_first, fresh_triton_ca
 
 
 def _nvidia_short_pointer_kernel():
-    from triton.backends.compiler import GPUTarget
     from triton.backends.nvidia import compiler
 
     compiler.llvm.init_targets()
@@ -518,7 +511,6 @@ define ptx_kernel void @short_pointer_kernel(ptr addrspace(1) %out, i64 %offset)
 @pytest.mark.skipif(is_hip(), reason="NVPTX code generation is unavailable on AMD")
 @pytest.mark.parametrize("link_hip_first", [False, True])
 def test_nvidia_short_pointer_abi(link_hip_first, fresh_triton_cache):
-    from triton.backends.compiler import GPUTarget
 
     if link_hip_first:
         # HIP linking resets every LLVM command-line option.
@@ -541,7 +533,6 @@ def test_nvidia_short_pointer_abi(link_hip_first, fresh_triton_cache):
 
 
 def _compile_empty_hip_kernel(arch, warp_size):
-    from triton.backends.compiler import GPUTarget
 
     @triton.jit
     def empty_kernel():
@@ -571,7 +562,6 @@ def _amd_scheduler_kernel():
 
 
 def test_amd_llvm_options_concurrent():
-    from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
 
     compiler.llvm.init_targets()

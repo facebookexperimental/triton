@@ -2446,6 +2446,77 @@ def test_attention_backward_occ1_correctness(shape, q_splits, packed_dq, monkeyp
             assert all(nrmse(value, ref) <= 1e-4 for value, ref in zip(actual[1:], production[0][1:]))
 
 
+def _attention_backward_causal_config(packed_dq, q_splits=1):
+    import dataclasses
+
+    return dataclasses.replace(_attention_backward_occ1_config(packed_dq, q_splits=q_splits),
+                               occ1_k_bands=0 if q_splits == 4 else 1)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("packed_dq", [False, True])
+@pytest.mark.parametrize("shape,q_splits", [
+    ((1, 1, 1, 512), 1),
+    ((2, 4, 4, 1024), 1),
+    ((1, 4, 4, 4096), 1),
+    ((1, 2, 2, 8192), 1),
+    # GROUP > 1 restarts each query head at the KV tile's first unmasked row.
+    ((1, 8, 2, 512), 1),
+    ((1, 8, 2, 2048), 1),
+    ((2, 64, 8, 512), 1),
+    # Splits interleave each tile's outers; two dQ slices at 16K.
+    ((1, 4, 4, 1024), 2),
+    ((2, 8, 2, 1024), 2),
+    ((2, 8, 2, 1024), 4),
+    ((1, 64, 8, 512), 4),
+    ((1, 2, 2, 16384), 2),
+])
+def test_attention_backward_causal_correctness(shape, q_splits, packed_dq, monkeypatch):
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import allocate_workspace, fa_backward, select_config
+
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    torch.manual_seed(2709)
+    b, hq, hk, n = shape
+    q, dout = [torch.randn((b, hq, n, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    k, v = [torch.randn((b, hk, n, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    qr, kr, vr = [t.float().requires_grad_() for t in (q, k, v)]
+    scores = qr @ kr.repeat_interleave(hq // hk, 1).transpose(-1, -2) * 128**-0.5
+    causal = torch.ones((n, n), device="cuda", dtype=torch.bool).tril()
+    scores = scores.masked_fill(~causal, float("-inf"))
+    out = scores.softmax(-1) @ vr.repeat_interleave(hq // hk, 1)
+    expected = torch.autograd.grad(out, (qr, kr, vr), dout.float())
+    case = (q, k, v, out.detach().bfloat16(), dout, scores.detach().logsumexp(-1))
+    config = _attention_backward_causal_config(packed_dq, q_splits)
+    if q_splits == 1:
+        assert select_config(n, b, hq, hk, num_cus=192, packed_dq=packed_dq, causal=True) == config
+    workspace = allocate_workspace(q, k, config=config, causal=True)
+
+    def nrmse(value, ref):
+        return ((value.float() - ref.float()).square().mean() / ref.float().square().mean()).sqrt().item()
+
+    for call in range(3):
+        for buffer in workspace:
+            buffer.fill_(float("nan"))
+        actual = fa_backward(*case, causal=True, config=config, workspace=workspace)
+        assert all(torch.isfinite(value).all() for value in actual)
+        assert all(nrmse(value, ref) < 0.012 for value, ref in zip(actual, expected))
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("changes", [dict(q_splits=3), dict(q_splits=4), dict(tail_splits=3), dict(occ1=False)])
+def test_attention_backward_causal_validation(changes):
+    import dataclasses
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import fa_backward
+
+    b, hq, hk, n = 2, 4, 4, 1024
+    q, o, do = [torch.randn((b, hq, n, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    k, v = [torch.randn((b, hk, n, 128), device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    lse = torch.zeros((b, hq, n), device="cuda", dtype=torch.float32)
+    config = dataclasses.replace(_attention_backward_occ1_config(True), **changes)
+    with pytest.raises(ValueError, match="causal gfx1250 backward requires OCC1 without tail splits"):
+        fa_backward(q, k, v, o, do, lse, causal=True, config=config)
+
+
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 @pytest.mark.parametrize("packed_dq", [False, True])
 @pytest.mark.parametrize("kv_slices", [2, 3, 4])

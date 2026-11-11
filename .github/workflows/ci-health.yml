@@ -51,6 +51,11 @@ on:
       - '.github/workflows/b200.yml'
       - '.github/workflows/h100.yml'
       - '.github/workflows/_tlx-ops-bench.yml'
+      - '.github/workflows/bisect-tlx-ops-regression.yml'
+      - '.github/scripts/tlx_ops_bench*.py'
+      - '.github/scripts/test_tlx_ops_bench*.py'
+      - '.github/scripts/failure_issues.py'
+      - '.github/scripts/test_failure_issues.py'
 
 permissions:
   contents: read
@@ -74,6 +79,9 @@ jobs:
       - name: Run dashboard tests
         working-directory: .github/scripts
         run: python3 -m pytest -s --tb=short test_ci_health.py test_ci_health_rules.py test_ci_health_logs.py test_runner_health.py test_meta_llvm_bump.py test_gpu_ci.py test_kernel_test_selection.py
+      - name: Run throughput regression tests
+        working-directory: .github/scripts
+        run: python3 -m pytest -s --tb=short test_tlx_ops_bench_regressions.py test_tlx_ops_bench_bisect_round.py test_tlx_ops_bench_bisect.py test_tlx_ops_bench_dashboard.py test_failure_issues.py
 
   collect:
     if: github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental'

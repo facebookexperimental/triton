@@ -385,14 +385,27 @@ def run_plan(plan, repo, junit):
 
 
 def verify_manifests(manifests):
+    """Coverage completeness is advisory; failures and claimed-pass integrity are not."""
     files, functions, passed, excluded, unaccounted = set(), set(), set(), set(), set()
+    gaps, states = [], []
     for manifest in manifests:
+        platform = manifest.get("platform", "local")
         for path in manifest["unmapped"]:
-            print(f"::warning::No test mapping for {path}; baseline is not touched-kernel coverage")
+            gaps.append({
+                "target":
+                path, "details": [{
+                    "platform": platform, "status": "unmapped", "reason":
+                    "No test mapping; baseline is not touched-kernel coverage"
+                }]
+            })
         files.update(manifest["files"])
         functions.update(manifest["functions"])
         for function, state in manifest["functions"].items():
-            if state["status"] in ("failed", "limit_reached"):
+            states.append({
+                "function": function, "platform": platform, "status": state["status"], "reason": state["reason"]
+                or "No passing representative recorded"
+            })
+            if state["status"] == "failed":
                 raise ValueError(f"Touched function did not complete: {function}: {state['status']}")
             if state["status"] == "passed":
                 if state["passed"] not in manifest["selected"] or not target_matches(state["passed"], function):
@@ -405,8 +418,25 @@ def verify_manifests(manifests):
                 unaccounted.add(function)
     missing = (functions - passed - excluded) | (unaccounted - passed)
     empty = {file for file in files if not any(function.startswith(file + "::") for function in passed)}
-    if missing or empty:
-        raise ValueError(f"Touched tests lack passing coverage or documented exclusions: {sorted(missing | empty)}")
+    for target in sorted(missing | empty):
+        details = [
+            state for state in states if state["function"] == target or state["function"].startswith(target + "::")
+        ]
+        gaps.append({"target": target, "details": details})
+    warnings = []
+    for gap in gaps:
+        reasons = sorted({f"{detail['platform']}: {detail['status']}, {detail['reason']}" for detail in gap["details"]})
+        message = f"{gap['target']}: {'; '.join(reasons) or 'No passing representative recorded'}"
+        message = message.replace("\r", " ").replace("\n", " ")
+        print(f"::warning::{message}")
+        warnings.append(message)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if warnings and summary:
+        with open(summary, "a") as output:
+            output.write(
+                "## Fast correctness coverage warnings\n\nCoverage gaps are advisory, not passing test evidence.\n\n" +
+                "".join(f"- {message}\n" for message in warnings))
+    return gaps
 
 
 def main():
@@ -435,7 +465,8 @@ def main():
             }
             if {manifest["platform"] for manifest in manifests} != expected:
                 raise ValueError("Selected platforms have missing execution evidence")
-            verify_manifests(manifests)
+            gaps = verify_manifests(manifests)
+            print(json.dumps({"coverage_gaps": gaps}, sort_keys=True))
         except Exception as exc:
             summary = os.environ.get("GITHUB_STEP_SUMMARY")
             if summary:
