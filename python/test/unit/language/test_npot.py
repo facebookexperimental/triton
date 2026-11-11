@@ -423,8 +423,8 @@ def test_npot_reverse_scan(op, N):
 ])
 def test_npot_scan(M, N, axis, num_warps, op):
     """A scan keeps a mixed-radix layout and matches torch: [96, 80] along both dims, [64, 192] carrying across
-    eight warps, argmax as a two-operand scan, [32, 128] as the pow2 control. Vector first: a shape stays
-    only if its pow2 part gives each thread the 16-byte vector padding proves."""
+    eight warps, argmax as a two-operand scan, [32, 128] as the pow2 control. Each shape stays: its exact
+    accesses, narrower on a 64-lane warp, are no more than the padded tile's."""
 
     @triton.jit
     def _argmax(a, i, b, j):
@@ -447,8 +447,7 @@ def test_npot_scan(M, N, axis, num_warps, op):
     x = torch.randperm(M * N, device="cuda", dtype=torch.int32).view(M, N) - M * N // 2
     out, idx = torch.empty_like(x), torch.zeros_like(x)
     h = kernel[(1, )](x, out, idx, M=M, N=N, AXIS=axis, OP=op, num_warps=num_warps)
-    threads = num_warps * triton.runtime.driver.active.get_current_target().warp_size
-    assert (f"tensor<{M}x{N}x" in h.asm["ttgir"]) == ((M & -M) * (N & -N) >= threads * 4)
+    assert f"tensor<{M}x{N}x" in h.asm["ttgir"]
     if op == "argmax":
         ref = x.cummax(axis)
         off = torch.arange(M * N, device="cuda", dtype=torch.int32).view(M, N)
