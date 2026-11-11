@@ -209,3 +209,67 @@ tt.func @dot_k48_i8(%pa: !tt.ptr<i8>) {
   %d = tt.dot %a, %b, %c : tensor<128x48xi8> * tensor<48x128xi8> -> tensor<128x128xi32>
   tt.return
 }
+
+// -----
+
+// B is a TMA-loaded tile, transposed: its 128-byte K-major rows take
+// swizzle 128, so wgmma issues N 104 exactly.
+// CHECK-LABEL: @dot_128x104_trans_b
+// CHECK: tt.dot {{.*}} -> tensor<128x104xf32>
+// W8-LABEL: @dot_128x104_trans_b
+// W8: tt.dot {{.*}} -> tensor<128x104xf32>
+tt.func @dot_128x104_trans_b(%pb: !tt.ptr<f16>, %n: i32, %k: i32, %s: i64) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i64
+  %a = arith.constant dense<1.0> : tensor<128x64xf16>
+  %db = tt.make_tensor_descriptor %pb, [%n, %k], [%s, %c1] : !tt.ptr<f16>, !tt.tensordesc<104x64xf16>
+  %bt = tt.descriptor_load %db[%c0, %c0] : !tt.tensordesc<104x64xf16> -> tensor<104x64xf16>
+  %b = tt.trans %bt {order = array<i32: 1, 0>} : tensor<104x64xf16> -> tensor<64x104xf16>
+  %c = arith.constant dense<0.0> : tensor<128x104xf32>
+  %d = tt.dot %a, %b, %c : tensor<128x64xf16> * tensor<64x104xf16> -> tensor<128x104xf32>
+  tt.return
+}
+
+// -----
+
+// Control: the same B loaded N-contiguous has 208-byte rows, swizzle 0.
+// CHECK-LABEL: @dot_128x104_load
+// CHECK: tt.dot {{.*}} -> tensor<128x128xf32>
+// W8-LABEL: @dot_128x104_load
+// W8: tt.dot {{.*}} -> tensor<128x128xf32>
+tt.func @dot_128x104_load(%pb: !tt.ptr<f16> {tt.divisibility = 16 : i32}) {
+  %a = arith.constant dense<1.0> : tensor<128x64xf16>
+  %k = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
+  %k1 = tt.expand_dims %k {axis = 1 : i32} : tensor<64xi32> -> tensor<64x1xi32>
+  %stride = arith.constant dense<104> : tensor<64x1xi32>
+  %row = arith.muli %k1, %stride : tensor<64x1xi32>
+  %rowb = tt.broadcast %row : tensor<64x1xi32> -> tensor<64x104xi32>
+  %n = tt.make_range {end = 104 : i32, start = 0 : i32} : tensor<104xi32>
+  %n1 = tt.expand_dims %n {axis = 0 : i32} : tensor<104xi32> -> tensor<1x104xi32>
+  %nb = tt.broadcast %n1 : tensor<1x104xi32> -> tensor<64x104xi32>
+  %off = arith.addi %rowb, %nb : tensor<64x104xi32>
+  %sb = tt.splat %pb : !tt.ptr<f16> -> tensor<64x104x!tt.ptr<f16>>
+  %ptr = tt.addptr %sb, %off : tensor<64x104x!tt.ptr<f16>>, tensor<64x104xi32>
+  %b = tt.load %ptr : tensor<64x104x!tt.ptr<f16>>
+  %c = arith.constant dense<0.0> : tensor<128x104xf32>
+  // expected-remark @+1 {{NPOT wgmma N 104 is not yet supported: B's shared layout has no core-matrix form}}
+  %d = tt.dot %a, %b, %c : tensor<128x64xf16> * tensor<64x104xf16> -> tensor<128x104xf32>
+  tt.return
+}
+
+// -----
+
+// Pow2 control: the same transposed B at N 128 is untouched.
+// CHECK-LABEL: @dot_128x128_trans_b
+// CHECK: tt.dot {{.*}} -> tensor<128x128xf32>
+tt.func @dot_128x128_trans_b(%pb: !tt.ptr<f16>, %n: i32, %k: i32, %s: i64) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i64
+  %a = arith.constant dense<1.0> : tensor<128x64xf16>
+  %db = tt.make_tensor_descriptor %pb, [%n, %k], [%s, %c1] : !tt.ptr<f16>, !tt.tensordesc<128x64xf16>
+  %bt = tt.descriptor_load %db[%c0, %c0] : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16>
+  %b = tt.trans %bt {order = array<i32: 1, 0>} : tensor<128x64xf16> -> tensor<64x128xf16>
+  %c = arith.constant dense<0.0> : tensor<128x128xf32>
+  %d = tt.dot %a, %b, %c : tensor<128x64xf16> * tensor<64x128xf16> -> tensor<128x128xf32>
+  tt.return
+}
