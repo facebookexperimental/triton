@@ -167,6 +167,12 @@ categorizeDataPartitionOps()    ← skips already-categorized ops
 Correction runs before DataPartition so that correction ops (accumulator
 rescaling) are not stolen by the data partition categorizer.
 
+Categorized operations retain their deterministic discovery order separately
+from the pointer-keyed category lookup map. Scheduling phases process operations
+in that discovery order; iterating the lookup map directly would make shared
+producer ownership depend on pointer hash order when multiple anchor backward
+slices reach the same index or mask chain.
+
 ### Central dpId Assignment (`collectMMABackwardSlices`)
 
 `collectMMABackwardSlices` is the single source of truth for data partition ID
@@ -400,6 +406,25 @@ rematerialized in any partition and should not force partition assignment.
 Clusters with empty `defPartitions` (containing only scalar ops) are also
 skipped.
 
+After schedule optimization, a scalar closure expands every scalar producer to
+the union of its consumers' partitions. This includes scalar ops that already
+have an anchor partition, such as a jagged sequence-offset `tt.load` initially
+assigned to the load task. Code specialization then clones the scalar chain in
+each consuming task instead of attempting an unsupported cross-partition scalar
+channel. The closure runs to a fixpoint so pointer arithmetic feeding a scalar
+load inherits the same task set.
+
+A backstop immediately after the closure verifies the property the closure is
+supposed to establish: every scalar producer owns at least the partitions of
+all its consumers. A violation is reported as a compile error naming the
+producer, the partitions it owns, and the consuming partition, so a scalar edge
+that escapes the closure fails here instead of crashing channel creation or
+silently dropping the value in the consuming task. It sits next to the
+accumulator-chained MMA backstop and, like it, is unreachable while the phase
+above it is intact — it exists to keep a later re-partitioning phase from
+reintroducing a scalar channel undetected. Any lit test that runs the pass
+enforces it.
+
 Cluster assignment rules:
 
 1. **Multiple def or sink partitions**: The cluster sits between multiple
@@ -420,7 +445,11 @@ cross-partition channels.
 
 **Cloneable ops**:
 - `MemDescTransOp`: metadata-only reinterpretation of shared memory layout
-- `ConvertLayoutOp`, `BroadcastOp`, `ExpandDimsOp`: cheap element rearrangement
+- `ConvertLayoutOp`, `BroadcastOp`, `ExpandDimsOp`, `MakeRangeOp`, `SplatOp`:
+  cheap element rearrangement or index construction
+- integer/index `arith` operations: cheap index and mask construction. Floating
+  point tensor arithmetic remains excluded so reductions and activation work
+  are not duplicated into multiple partitions.
 
 **Not cloned**: `LocalAllocOp`. When a shared SMEM buffer (e.g., K/V in
 Flash Attention) is consumed by ops in multiple partitions, the correct
@@ -437,12 +466,15 @@ The cloning walks in reverse post-order so that an `ExpandDimsOp` feeding a
 `ExpandDimsOp` E feeds B, then E is also cloned into P in the same pass
 (because E's user — the cloned B — is now in P).
 
-**Operand chain cloning**: After cloning a `BroadcastOp`/`ExpandDimsOp`,
+**Operand chain cloning**: After cloning any cloneable root,
 `optimizeSchedule` walks backward through the clone's operand chain and
-also clones any `ConvertLayoutOp`, `BroadcastOp`, or `ExpandDimsOp` that
-feeds it from a different partition. This handles the case where upstream
-layout passes insert a `ConvertLayoutOp` between `ExpandDimsOp` and
-`BroadcastOp` (e.g., `expand_dims -> convert_layout -> broadcast`).
+also clones cloneable producers that feed it from a different partition. This
+handles both layout chains (for example,
+`expand_dims -> convert_layout -> broadcast`) and causal-mask index chains
+such as `make_range -> addi -> expand_dims -> broadcast`. Starting the walk
+from integer arithmetic users is necessary when the broadcast itself feeds an
+unassigned mask cluster; otherwise the full broadcasted index tensor becomes a
+cross-partition SMEM channel.
 
 When a `MemDescTransOp` clone references a `LocalAllocOp` from a different
 partition (e.g., `local_alloc -> memdesc_trans -> dot`), the backward walk
