@@ -10,15 +10,18 @@
 // CHECK-SAME: !ttg.memdesc<128x256xf32
 // CHECK: tt.descriptor_load {{.*}}!tt.tensordesc<128x128xf8E4M3FN
 // CHECK: tt.descriptor_load {{.*}}!tt.tensordesc<1x1x1x2x256xui8
-// CHECK: ttng.tmem_alloc
-// CHECK-SAME: tensor<128x4xi8
-// CHECK-SAME: !ttg.memdesc<128x4xi8
+// Each partition's scale alloc stays with its own MMA: after data
+// partitioning the clones are grouped per partition (DP0 chain, then DP1)
+// instead of hoisting both scale allocs ahead of both MMAs.
 // CHECK: ttng.tmem_alloc
 // CHECK-SAME: tensor<128x4xi8
 // CHECK-SAME: !ttg.memdesc<128x4xi8
 // CHECK: ttng.tc_gen5_mma_scaled
 // CHECK-SAME: !ttg.memdesc<128x128xf8E4M3FN
 // CHECK-SAME: !ttg.memdesc<128x256xf32
+// CHECK-SAME: !ttg.memdesc<128x4xi8
+// CHECK: ttng.tmem_alloc
+// CHECK-SAME: tensor<128x4xi8
 // CHECK-SAME: !ttg.memdesc<128x4xi8
 // CHECK: ttng.tc_gen5_mma_scaled
 // CHECK-SAME: !ttg.memdesc<128x128xf8E4M3FN
