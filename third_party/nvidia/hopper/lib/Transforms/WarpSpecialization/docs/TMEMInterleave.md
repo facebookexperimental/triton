@@ -105,8 +105,9 @@ trade against it.
 
 After this pass restores each wait beside its guarded load,
 `triton-nvidia-unify-ws-barrier-locations` may raise a related AutoWS wait to a
-common location when only load preparation, casts, and broadcast work separate
-the waits. See
+common location and then order the TMEM operand before a streamable SMEM
+broadcast operand. The operand ordering lives in the later pass so it cannot be
+undone by this pass's greedy load sinking. See
 [WS Barrier Location Unification](WSBarrierLocationUnification.md).
 
 An earlier revision of this document declared that reshaping barriers for
@@ -116,15 +117,12 @@ from its producer. The observation stands: on a block where both apply, the two
 objectives really can want different placements. What has changed is that there
 is now a basis for deciding between them.
 
-Running the unification pass second does not by itself resolve anything — it
-just means the codegen objective always wins where it applies. The resolution
-is that "where it applies" is now narrow. Unification requires a broadcast
-whose result is register-heavy, because that is the only case where the
-register relief it buys outweighs the MMA-latency overlap it gives up. On the
-`addmm` epilogue that motivated it, that trade removed a 23 KB spill, which is
-a larger effect than the scheduling distance this pass gives up on the same
-block. Where the broadcast is small, unification declines and this pass's
-placement stands.
+Running the unification pass second does not make the codegen trade free, so
+its eligibility is narrow. It requires a broadcast whose result is
+register-heavy, because that is the only case where the register relief it buys
+outweighs the MMA-latency overlap it gives up. On the `addmm` epilogue that
+motivated it, that trade removed a 23 KB spill. Where the broadcast is small,
+unification declines and this pass's placement stands.
 
 So the conflict is decided in favor of codegen only on measured evidence, and
 only for the shape of block where that evidence applies. If a case turns up
