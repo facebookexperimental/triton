@@ -269,6 +269,306 @@ def _mask_front(s0, s1, front):
 
 
 @triton.jit
+def _mfma_softmax_loop_8w(
+    q_lo,
+    q_hi,
+    qs_lo,
+    qs_hi,
+    ka,
+    kb,
+    ksa,
+    ksb,
+    va,
+    vb,
+    vsa,
+    vsb,
+    s0,
+    s1,
+    p0,
+    p1,
+    m_i,
+    l_i,
+    acc0,
+    acc1,
+    acc2,
+    acc3,
+    n_tiles,
+    k_ptr,
+    v_ptr,
+    ks_ptr,
+    vs_ptr,
+    c_qk,
+    qk_scale,
+    MFMA_PRIO: tl.constexpr,
+    SOFTMAX_PRIO: tl.constexpr,
+    FAST_EXP: tl.constexpr,
+):
+    OFF: tl.constexpr = core._score_offset(FAST_EXP)
+    HN: tl.constexpr = 64
+    D: tl.constexpr = 128
+    k_step = 128 * D
+    v_step = 128 * D
+    ks_step = 128
+    k_n1 = HN * D
+    v_n1 = HN * D
+    ks_n1 = HN
+    for it in tl.range(0, (n_tiles - 2) // 2, num_stages=1):
+        with tlx.warp_pipeline_stage("mfma", priority=MFMA_PRIO):
+            t = 2 * it + 2
+            s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
+                q_lo,
+                q_hi,
+                qs_lo,
+                qs_hi,
+                ka[0],
+                kb[0],
+                ksa[0],
+                ksb[0],
+                va[0],
+                vb[0],
+                vsa[0],
+                vsb[0],
+                p0,
+                p1,
+                acc0,
+                acc1,
+                acc2,
+                acc3,
+                l_i,
+                (OFF - m_i) * c_qk,
+                qk_scale,
+                k_ptr,
+                v_ptr,
+                ks_ptr,
+                vs_ptr,
+                ka[1],
+                kb[1],
+                va[1],
+                vb[1],
+                ksa[1],
+                ksb[1],
+                vsa[1],
+                vsb[1],
+                t,
+                t - 1,
+                k_step,
+                v_step,
+                ks_step,
+                k_n1,
+                v_n1,
+                ks_n1,
+                True,
+                True,
+                True,
+            )
+        tlx.async_load_wait_group(0)
+        with tlx.warp_pipeline_stage("softmax", priority=SOFTMAX_PRIO):
+            p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(
+                s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, FAST_EXP
+            )
+        with tlx.warp_pipeline_stage("mfma", priority=MFMA_PRIO):
+            t = 2 * it + 3
+            s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
+                q_lo,
+                q_hi,
+                qs_lo,
+                qs_hi,
+                ka[1],
+                kb[1],
+                ksa[1],
+                ksb[1],
+                va[1],
+                vb[1],
+                vsa[1],
+                vsb[1],
+                p0,
+                p1,
+                acc0,
+                acc1,
+                acc2,
+                acc3,
+                l_i,
+                (OFF - m_i) * c_qk,
+                qk_scale,
+                k_ptr,
+                v_ptr,
+                ks_ptr,
+                vs_ptr,
+                ka[0],
+                kb[0],
+                va[0],
+                vb[0],
+                ksa[0],
+                ksb[0],
+                vsa[0],
+                vsb[0],
+                t,
+                t - 1,
+                k_step,
+                v_step,
+                ks_step,
+                k_n1,
+                v_n1,
+                ks_n1,
+                True,
+                True,
+                True,
+            )
+        tlx.async_load_wait_group(0)
+        with tlx.warp_pipeline_stage("softmax", priority=SOFTMAX_PRIO):
+            p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(
+                s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, FAST_EXP
+            )
+    return s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3
+
+
+@triton.jit
+def _mfma_softmax_loop_4w(
+    q_lo,
+    q_hi,
+    qs_lo,
+    qs_hi,
+    ka,
+    kb,
+    ksa,
+    ksb,
+    va,
+    vb,
+    vsa,
+    vsb,
+    s0,
+    s1,
+    p0,
+    p1,
+    m_i,
+    l_i,
+    acc0,
+    acc1,
+    acc2,
+    acc3,
+    n_tiles,
+    k_ptr,
+    v_ptr,
+    ks_ptr,
+    vs_ptr,
+    c_qk,
+    qk_scale,
+    FAST_EXP: tl.constexpr,
+):
+    OFF: tl.constexpr = core._score_offset(FAST_EXP)
+    HN: tl.constexpr = 64
+    D: tl.constexpr = 128
+    k_step = 128 * D
+    v_step = 128 * D
+    ks_step = 128
+    k_n1 = HN * D
+    v_n1 = HN * D
+    ks_n1 = HN
+    for it in tl.range(0, (n_tiles - 2) // 2, num_stages=1):
+        t = 2 * it + 2
+        s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
+            q_lo,
+            q_hi,
+            qs_lo,
+            qs_hi,
+            ka[0],
+            kb[0],
+            ksa[0],
+            ksb[0],
+            va[0],
+            vb[0],
+            vsa[0],
+            vsb[0],
+            p0,
+            p1,
+            acc0,
+            acc1,
+            acc2,
+            acc3,
+            l_i,
+            (OFF - m_i) * c_qk,
+            qk_scale,
+            k_ptr,
+            v_ptr,
+            ks_ptr,
+            vs_ptr,
+            ka[1],
+            kb[1],
+            va[1],
+            vb[1],
+            ksa[1],
+            ksb[1],
+            vsa[1],
+            vsb[1],
+            t,
+            t - 1,
+            k_step,
+            v_step,
+            ks_step,
+            k_n1,
+            v_n1,
+            ks_n1,
+            True,
+            True,
+            False,
+        )
+        p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(
+            s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, FAST_EXP
+        )
+        t = 2 * it + 3
+        s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
+            q_lo,
+            q_hi,
+            qs_lo,
+            qs_hi,
+            ka[1],
+            kb[1],
+            ksa[1],
+            ksb[1],
+            va[1],
+            vb[1],
+            vsa[1],
+            vsb[1],
+            p0,
+            p1,
+            acc0,
+            acc1,
+            acc2,
+            acc3,
+            l_i,
+            (OFF - m_i) * c_qk,
+            qk_scale,
+            k_ptr,
+            v_ptr,
+            ks_ptr,
+            vs_ptr,
+            ka[0],
+            kb[0],
+            va[0],
+            vb[0],
+            ksa[0],
+            ksb[0],
+            vsa[0],
+            vsb[0],
+            t,
+            t - 1,
+            k_step,
+            v_step,
+            ks_step,
+            k_n1,
+            v_n1,
+            ks_n1,
+            True,
+            True,
+            False,
+        )
+        p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(
+            s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, FAST_EXP
+        )
+    return s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3
+
+
+@triton.jit
 # Triton TR001: BLOCK_M is a host-selected production contract.
 def _mxfp8_varlen_kernel(  # noqa: TR001
     Q,
@@ -386,9 +686,9 @@ def _mxfp8_varlen_kernel(  # noqa: TR001
         k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(
             K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off
         )
-        tlx.async_load_wait_group(1)
         q_base = Q + q0.to(tl.int64) * ROW + head * D
         q_mask = q_local < q_rows * ROW
+
         q_lo, qs_lo = core._quantize_q_half(
             tlx.buffer_load(q_base, q_local, q_mask, 0.0, contiguity=8)
         )
@@ -406,117 +706,81 @@ def _mxfp8_varlen_kernel(  # noqa: TR001
         acc1 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
         acc2 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
         acc3 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
+        tlx.async_load_wait_group(2)
         s0, s1 = core._qk_first(
             q_lo, q_hi, qs_lo, qs_hi, ka[1], kb[1], ksa[1], ksb[1], qk_scale
         )
         s0, s1 = _mask_front(s0, s1, front)
         p0, p1, m_i, l_i = core._pingpong_softmax_first(s0, s1, FAST_EXP)
-        tlx.async_load_wait_group(0)
-        for it in tl.range(0, (n_tiles - 2) // 2, num_stages=1):
-            with tlx.warp_pipeline_stage("mfma", priority=MFMA_PRIO):
-                t = 2 * it + 2
-                s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
-                    q_lo,
-                    q_hi,
-                    qs_lo,
-                    qs_hi,
-                    ka[0],
-                    kb[0],
-                    ksa[0],
-                    ksb[0],
-                    va[0],
-                    vb[0],
-                    vsa[0],
-                    vsb[0],
-                    p0,
-                    p1,
-                    acc0,
-                    acc1,
-                    acc2,
-                    acc3,
-                    l_i,
-                    (OFF - m_i) * c_qk,
-                    qk_scale,
-                    k_ptr,
-                    v_ptr,
-                    ks_ptr,
-                    vs_ptr,
-                    ka[1],
-                    kb[1],
-                    va[1],
-                    vb[1],
-                    ksa[1],
-                    ksb[1],
-                    vsa[1],
-                    vsb[1],
-                    t,
-                    t - 1,
-                    k_step,
-                    v_step,
-                    ks_step,
-                    k_n1,
-                    v_n1,
-                    ks_n1,
-                    True,
-                    True,
-                )
-            tlx.async_load_wait_group(0)
-            with tlx.warp_pipeline_stage("softmax", priority=SOFTMAX_PRIO):
-                p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(
-                    s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, FAST_EXP
-                )
-            with tlx.warp_pipeline_stage("mfma", priority=MFMA_PRIO):
-                t = 2 * it + 3
-                s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
-                    q_lo,
-                    q_hi,
-                    qs_lo,
-                    qs_hi,
-                    ka[1],
-                    kb[1],
-                    ksa[1],
-                    ksb[1],
-                    va[1],
-                    vb[1],
-                    vsa[1],
-                    vsb[1],
-                    p0,
-                    p1,
-                    acc0,
-                    acc1,
-                    acc2,
-                    acc3,
-                    l_i,
-                    (OFF - m_i) * c_qk,
-                    qk_scale,
-                    k_ptr,
-                    v_ptr,
-                    ks_ptr,
-                    vs_ptr,
-                    ka[0],
-                    kb[0],
-                    va[0],
-                    vb[0],
-                    ksa[0],
-                    ksb[0],
-                    vsa[0],
-                    vsb[0],
-                    t,
-                    t - 1,
-                    k_step,
-                    v_step,
-                    ks_step,
-                    k_n1,
-                    v_n1,
-                    ks_n1,
-                    True,
-                    True,
-                )
-            tlx.async_load_wait_group(0)
-            with tlx.warp_pipeline_stage("softmax", priority=SOFTMAX_PRIO):
-                p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(
-                    s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, FAST_EXP
-                )
+        warps: tl.constexpr = tlx.num_warps()
+        if warps == 8:
+            s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = _mfma_softmax_loop_8w(
+                q_lo,
+                q_hi,
+                qs_lo,
+                qs_hi,
+                ka,
+                kb,
+                ksa,
+                ksb,
+                va,
+                vb,
+                vsa,
+                vsb,
+                s0,
+                s1,
+                p0,
+                p1,
+                m_i,
+                l_i,
+                acc0,
+                acc1,
+                acc2,
+                acc3,
+                n_tiles,
+                k_ptr,
+                v_ptr,
+                ks_ptr,
+                vs_ptr,
+                c_qk,
+                qk_scale,
+                MFMA_PRIO=MFMA_PRIO,
+                SOFTMAX_PRIO=SOFTMAX_PRIO,
+                FAST_EXP=FAST_EXP,
+            )
+        else:
+            s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = _mfma_softmax_loop_4w(
+                q_lo,
+                q_hi,
+                qs_lo,
+                qs_hi,
+                ka,
+                kb,
+                ksa,
+                ksb,
+                va,
+                vb,
+                vsa,
+                vsb,
+                s0,
+                s1,
+                p0,
+                p1,
+                m_i,
+                l_i,
+                acc0,
+                acc1,
+                acc2,
+                acc3,
+                n_tiles,
+                k_ptr,
+                v_ptr,
+                ks_ptr,
+                vs_ptr,
+                c_qk,
+                qk_scale,
+                FAST_EXP=FAST_EXP,
+            )
         s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
             q_lo,
             q_hi,
@@ -561,6 +825,7 @@ def _mxfp8_varlen_kernel(  # noqa: TR001
             ks_n1,
             False,
             True,
+            warps == 8,
             tail,
         )
         # Buffer 0 and buffer 1's K half are free: copy the next item's first

@@ -333,15 +333,17 @@ def _issue_tile(
     # share its offsets and steps.
     if COPY_K:
         tlx.async_load(k_ptr + kt * k_step, ka)
-        tlx.async_load(k_ptr + kt * k_step + k_n1, kb)
         tlx.async_load(ks_ptr + kt * ks_step, ksa)
-        tlx.async_load(ks_ptr + kt * ks_step + ks_n1, ksb)
     if COPY_V:
         tlx.async_load(v_ptr + vt * v_step, va)
-        tlx.async_load(v_ptr + vt * v_step + v_n1, vb)
         tlx.async_load(vs_ptr + vt * ks_step, vsa)
+        tlx.async_load_commit_group()
+    if COPY_K:
+        tlx.async_load(k_ptr + kt * k_step + k_n1, kb)
+        tlx.async_load(ks_ptr + kt * ks_step + ks_n1, ksb)
+    if COPY_V:
+        tlx.async_load(v_ptr + vt * v_step + v_n1, vb)
         tlx.async_load(vs_ptr + vt * ks_step + ks_n1, vsb)
-    if COPY_K or COPY_V:
         tlx.async_load_commit_group()
 
 
@@ -468,6 +470,7 @@ def _mfma_stage(
     ks_n1,
     COPY_K: tl.constexpr,
     COPY_V: tl.constexpr,
+    USE_INTER_WAVE_PIPELINE: tl.constexpr,
     rem=None,
 ):
     # QK(j + 1) and PV(j) with operands read from LDS in MFMA-sized pieces. Each
@@ -499,10 +502,14 @@ def _mfma_stage(
     t0 = tl.dot(  # noqa: TR011
         _as_rowsum_a(p0[0]), ones, tl.zeros([q_lo.shape[0] // 2, 16], dtype=tl.float32)
     )
+    if not USE_INTER_WAVE_PIPELINE:
+        tlx.async_load_wait_group(1)
     kA0 = _ld_k(ka, 0)
     sA0, sA1 = _ld_ks(ksa)
     vA0 = _ld_v(va, 0)
+
     vsA0, vsA1, vsA2, vsA3 = _ld_vs(vsa)
+
     tlx.amd_sched_barrier(0)
     # Triton TR011: FP8 operands do not use the TF32 input mode.
     t1 = tl.dot(  # noqa: TR011
@@ -547,6 +554,8 @@ def _mfma_stage(
     vA3 = _ld_v(va, 3)
     tlx.amd_sched_barrier(0)
     acc2 = _pv(p0, vA2, vsA2, acc2)
+    if not USE_INTER_WAVE_PIPELINE:
+        tlx.async_load_wait_group(2)
     kB0 = _ld_k(kb, 0)
     sB0, sB1 = _ld_ks(ksb)
     tlx.amd_sched_barrier(0)
