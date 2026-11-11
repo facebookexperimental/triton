@@ -1,3 +1,8 @@
+import json
+import math
+from types import SimpleNamespace
+import xml.etree.ElementTree as ET
+
 import tlx_ops_bench_dashboard as dash
 
 
@@ -78,3 +83,82 @@ def test_a_change_the_next_night_cannot_check_stays_unconfirmed(monkeypatch):
     ]
     perf = dash.events(nights)[1]["perf"]["mm"]
     assert perf["unconfirmed"] and perf["n_slower"] == 1 and perf["slower"][0]["next"] is None
+
+
+def test_skipped_operator_remains_visible_alongside_measurements(tmp_path):
+    raw = {
+        "env": {"ref": "torch.matmul", "space": "heuristic"},
+        "results": [{
+            "case":
+            {"op": "mm", "key": "mm/gfx950/float16/256", "input": "((), {})", "direction": "fwd", "dtype": "float16"},
+            "status": "ok",
+            "speedup": 1.0,
+            "tlx": {"mean": 10.0},
+            "ref": {"mean": 10.0},
+        }],
+    }
+    (tmp_path / "mm.json").write_text(json.dumps(raw))
+    suite = ET.Element("testsuite")
+    test = ET.SubElement(suite, "testcase", name="test_op_perf[bench_addmm]")
+    ET.SubElement(test, "skipped", message="no implementation")
+    ET.ElementTree(suite).write(tmp_path / "bench.xml")
+    out = tmp_path / "summary.json"
+    dash.summarize(
+        SimpleNamespace(dir=str(tmp_path), platform="mi350", version="3.9.0.dev20261029", sha="a" * 40, out=str(out)))
+    summary = json.loads(out.read_text())
+    ops = summary["ops"]
+    assert ops["addmm"]["reason"] == "no implementation"
+    assert ops["addmm"]["cases"] == []
+    assert len(ops["mm"]["cases"]) == 1
+    assert ops["mm"]["cases"][0]["tlx_tflops"] == 10.0
+    page = dash.page_data({"mi350": [summary]})["platforms"]["mi350"]
+    assert page["ops"]["addmm"]["reason"] == "no implementation"
+    assert page["ops"]["addmm"]["cases"] == []
+    assert page["nights"][0]["ops"]["addmm"] == []
+
+
+def test_overview_uses_valid_comparisons_and_separates_directions():
+
+    def case(key, ratio, direction="fwd", status="ok"):
+        return {**timed(key, 100, status=status), "speedup": ratio, "ref_tflops": 100 / ratio, "direction": direction}
+
+    night = bench_night("20261109", "a" * 40, case("a", 4), case("b", 1, status="noisy"),
+                        case("error", 100, status="error"), case("bwd", 3, direction="bwd"))
+    night["ops"]["mm"]["ref"] = "torch.matmul"
+    night["ops"]["no_reference"] = {"cases": [case("no-ref", 9)], "ref": ""}
+    overview = dash.overview_data({"b200": [night]})[0]
+    rows = {(r["op"], r["direction"]): r for r in overview["rows"]}
+    fwd = rows["mm", "fwd"]
+    assert math.isclose(fwd["speedup"], 2)
+    assert (fwd["compared"], fwd["cases"], fwd["errors"], fwd["noisy"]) == (2, 3, 1, 1)
+    assert math.isclose(rows["mm", "bwd"]["speedup"], 3)
+    assert rows["no_reference", "fwd"]["speedup"] is None
+    assert rows["no_reference", "fwd"]["compared"] == 0
+    assert overview["source"].endswith("20261109.b200.json")
+    svg = ET.fromstring(dash.overview_svg([overview]))
+    assert "2.00×" in list(svg.itertext())
+
+
+def test_overview_does_not_fill_a_skipped_latest_night_from_history():
+    older = bench_night("20261108", "a" * 40, {**timed("old", 100), "direction": "fwd", "speedup": 2, "ref_tflops": 50})
+    older["ops"]["mm"]["ref"] = "torch.matmul"
+    latest = bench_night("20261109", "b" * 40)
+    latest["ops"]["mm"].update(ref=None, reason="no implementation")
+    overview = dash.overview_data({"mi350": [latest, older]})[0]
+    assert overview["date"] == "20261109"
+    row = overview["rows"][0]
+    assert row["speedup"] is None and row["compared"] == row["cases"] == 0
+    assert row["reason"] == "no implementation"
+
+
+def test_render_publishes_the_measured_overview_diagram(tmp_path):
+    source = tmp_path / "summaries"
+    source.mkdir()
+    night = bench_night("20261109", "a" * 40)
+    night["schema"] = 2
+    (source / "20261109.b200.json").write_text(json.dumps(night))
+    output = tmp_path / "site"
+    dash.render(SimpleNamespace(source=str(source), outdir=str(output)))
+    assert 'src="tlx_ops_bench_overview.svg"' in (output / "index.html").read_text()
+    svg = ET.parse(output / "tlx_ops_bench_overview.svg")
+    assert "B200 · 2026-11-09" in list(svg.getroot().itertext())

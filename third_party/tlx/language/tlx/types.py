@@ -1,4 +1,5 @@
 import enum
+import hashlib
 from abc import abstractmethod
 from typing import List, Optional, Tuple
 
@@ -8,7 +9,68 @@ from triton.language.core import _aggregate as aggregate
 from triton.runtime.jit import constexpr_function
 
 
-class layout_encoding:
+def _freeze_layout_value(value):
+    # Not tl._unwrap_if_constexpr: it also recurses into lists, doubling the walk.
+    while isinstance(value, tl.constexpr):
+        value = value.value
+    if isinstance(value, (list, tuple)):
+        return tuple([_freeze_layout_value(v) for v in value])
+    return value
+
+
+class _value_semantics:
+    """Equality, hashing and repr derived from the instance fields.
+
+    Layouts are passed to kernels as constexprs, so they become part of the
+    JIT kernel cache key: hashing must follow the fields, or a layout rebuilt
+    on every launch adds a new cache entry each time; repr must show the
+    fields, or two different layouts share a compiled-kernel key.
+
+    The normalized fields and their hash are computed once, on the first
+    hash/eq/repr, because the JIT hashes the key on every launch. From then on
+    the object is frozen: setting an attribute raises, and a modified layout
+    must be made with `copy.copy`, which drops the memo.
+    """
+
+    _VALUE_KEY = "_value_key_memo"
+
+    def _value_key(self):
+        key = self.__dict__.get(self._VALUE_KEY)
+        if key is None:
+            fields = tuple(sorted((k, _freeze_layout_value(v)) for k, v in vars(self).items()))
+            key = (fields, hash((type(self), fields)))
+            object.__setattr__(self, self._VALUE_KEY, key)
+        return key
+
+    def _fields(self):
+        return self._value_key()[0]
+
+    def __setattr__(self, name, value):
+        if self._VALUE_KEY in self.__dict__:
+            raise AttributeError(f"{type(self).__name__} is immutable once hashed, compared or printed; "
+                                 f"use copy.copy() to derive a layout with a different {name!r}")
+        object.__setattr__(self, name, value)
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state.pop(self._VALUE_KEY, None)
+        return state
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        return (type(self) is type(other) and self._value_key()[1] == other._value_key()[1]
+                and self._fields() == other._fields())
+
+    def __hash__(self):
+        return self._value_key()[1]
+
+    def __repr__(self):
+        fields = ", ".join(f"{k}={v!r}" for k, v in self._fields())
+        return f"{self.__class__.__name__}<{fields}>"
+
+
+class layout_encoding(_value_semantics):
     """Base class for every TLX layout that lowers to an MLIR layout attribute.
 
     Two families live under this base:
@@ -23,9 +85,6 @@ class layout_encoding:
 
     def __init__(self):
         pass
-
-    def __repr__(self):
-        return self.__class__.__name__
 
     def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
         raise NotImplementedError(f"{self.__class__.__name__}.to_ir() must be overridden in subclasses")
@@ -291,6 +350,9 @@ class padded_shared_layout_encoding(shared_layout_encoding):
             numCTAsPerCGA=self.numCTAsPerCGA,
             numCTASplit=self.numCTASplit,
             numCTAOrder=self.numCTAOrder,
+            # Explicit bases map offsets to coordinates; permute their components.
+            offset_bases=None if self.offset_bases is None else [[base[d] for d in dims] for base in self.offset_bases],
+            block_bases=None if self.block_bases is None else [[base[d] for d in dims] for base in self.block_bases],
         )
 
     def to_ir(self, builder: ir.builder) -> None:
@@ -311,6 +373,37 @@ class padded_shared_layout_encoding(shared_layout_encoding):
             self.numCTASplit,
             self.numCTAOrder,
         )
+
+
+class partitioned_shared_layout_encoding(shared_layout_encoding):
+    """Split a tensor's pieces between physical LDS partitions on gfx1250.
+
+    ``partition_layout`` describes one piece. Along ``partition_dim``, each
+    of ``num_groups`` groups contains ``num_partitions`` consecutive pieces.
+    """
+
+    def __init__(self, num_partitions, num_groups, partition_dim, partition_layout):
+        super().__init__()
+        self.num_partitions = int(num_partitions)
+        self.num_groups = int(num_groups)
+        self.partition_dim = int(partition_dim)
+        self.partition_layout = tl._unwrap_if_constexpr(partition_layout)
+        for name, value in (("num_partitions", self.num_partitions), ("num_groups", self.num_groups)):
+            if value <= 0 or value & (value - 1):
+                raise ValueError(f"{name} must be a positive power of two")
+        if self.partition_dim < 0:
+            raise ValueError("partition_dim must be non-negative")
+        if not isinstance(self.partition_layout, shared_layout_encoding):
+            raise TypeError("partition_layout must be a shared-memory layout")
+
+    def make_permute(self, dims):
+        return partitioned_shared_layout_encoding(self.num_partitions, self.num_groups,
+                                                  tuple(dims).index(self.partition_dim),
+                                                  self.partition_layout.make_permute(dims))
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_partitioned_shared_encoding_attr(self.num_partitions, self.num_groups, self.partition_dim,
+                                                             self.partition_layout.to_ir(builder))
 
 
 class shared_linear_layout_encoding(shared_layout_encoding):
@@ -429,6 +522,29 @@ class amd_mfma_layout(layout_encoding):
                                                    self.cga_layout, self.tiles_per_warp, self.element_bitwidth)
 
 
+class amd_wmma_layout(layout_encoding):
+    """Explicit AMD WMMA accumulator distribution for one CTA."""
+
+    def __init__(self, warp_bases, reg_bases=(), instr_shape=(16, 16, 128), version=3, transposed=True):
+        super().__init__()
+        self.warp_bases = [list(b) for b in tl._unwrap_if_constexpr(warp_bases)]
+        self.reg_bases = [list(b) for b in tl._unwrap_if_constexpr(reg_bases)]
+        self.instr_shape = list(tl._unwrap_if_constexpr(instr_shape))
+        self.version = int(version)
+        self.transposed = bool(transposed)
+        if len(self.instr_shape) != 3 or any(dim <= 0 for dim in self.instr_shape):
+            raise ValueError("instr_shape must contain three positive dimensions")
+        if any(len(basis) != 2 or any(value < 0 for value in basis) for basis in (*self.warp_bases, *self.reg_bases)):
+            raise ValueError("WMMA bases must contain two nonnegative coordinates")
+
+    def __repr__(self):
+        return f"amd_wmma_layout({vars(self)!r})"
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        return builder.make_amd_wmma_encoding_attr(self.version, self.transposed, self.warp_bases, self.reg_bases,
+                                                   self.instr_shape, 2)
+
+
 class slice_layout(layout_encoding):
     """Rank-reduced view of a distributed parent layout.
 
@@ -528,7 +644,7 @@ def make_tensor_memory_layout(block_m: tl.constexpr, block_n: tl.constexpr, _sem
         (tl._unwrap_if_constexpr(block_m), tl._unwrap_if_constexpr(block_n)))
 
 
-class tensor_memory_scales_layout_encoding:
+class tensor_memory_scales_layout_encoding(_value_semantics):
     """
     Tensor memory scales layout encoding for Blackwell.
     Used for scales in scaled MMA operations.
@@ -633,12 +749,6 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
 
     def __str__(self) -> str:
         return f"nv_mma_shared_layout_encoding<{self.shape}, {self.order}, {self.elemType}, {self.numCTAsPerCGA}, {self.numCTASplit}, {self.numCTAOrder}, {self.fp4Padded}, {self.swizzled}>"
-
-    def __eq__(self, other) -> bool:
-        return (type(self) is type(other) and self.shape == other.shape and self.order == other.order
-                and self.elemType == other.elemType and self.numCTAsPerCGA == other.numCTAsPerCGA
-                and self.numCTASplit == other.numCTASplit and self.numCTAOrder == other.numCTAOrder
-                and self.fp4Padded == other.fp4Padded and self.swizzled == other.swizzled)
 
 
 class DummyRegisterLayoutEncoding(layout_encoding):
@@ -1230,7 +1340,7 @@ class storage_alias_spec_type(tl.base_type):
         return f"storage_alias_spec_type(storage={self._storage.value}{size_str})"
 
     def mangle(self) -> str:
-        size_part = f"_{self._buffer_size_bytes}" if self._buffer_size_bytes else ""
+        size_part = "" if self._buffer_size_bytes is None else f"_{self._buffer_size_bytes}"
         return f"storage_alias_spec_{self._storage.value}{size_part}"
 
     def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
@@ -1287,7 +1397,8 @@ class buffered_tensor(tl.base_value):
         self.handle = handle
         # Block shape
         self.shape = shape
-        self.type = buffered_tensor_type(element_ty, shape, num, storage, layout)
+        self.type = buffered_tensor_type(element_ty, shape, num, storage, layout,
+                                         ir_type=handle.get_type() if handle is not None else None)
         # Following the practice in pytorch, dtype is scalar type
         self.dtype = element_ty
 
@@ -1315,6 +1426,7 @@ class buffered_tensor_type(tl.block_type):
         num: int,
         storage: storage_kind,
         layout: Optional[shared_layout_encoding] = None,
+        ir_type=None,
     ):
         super().__init__(element_ty, shape)
         # Storage
@@ -1323,6 +1435,10 @@ class buffered_tensor_type(tl.block_type):
         self.layout = layout
         # Buffer number. 0 means a single buffer, 1+ means a buffer array.
         self.num = num
+        # Views carry an allocation shape and concrete encoding that cannot be
+        # reconstructed from their logical shape and frontend layout alone.
+        # Keep that type across JIT calls, just as the descriptor value does.
+        self._ir_type = ir_type
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[buffered_tensor, int]:
         value = buffered_tensor(
@@ -1335,24 +1451,40 @@ class buffered_tensor_type(tl.block_type):
         )
         return value, cursor + 1
 
+    def _identity(self) -> tuple:
+        # Everything that distinguishes values of this type: equality and
+        # mangling both derive from it, so JIT helpers specialize exactly per
+        # distinct type. The concrete IR type, when present, also fixes the
+        # allocation shape and resolved encoding. Without one, the frontend
+        # storage and layout still keep differently placed buffers apart.
+        return (self.element_ty, tuple(self.shape), self.num, self.storage, self.layout,
+                None if self._ir_type is None else str(self._ir_type))
+
+    def _mangle_prefix(self) -> str:
+        return f"buffered_{self.scalar.mangle()}"
+
     def mangle(self) -> str:
-        elt = self.scalar.mangle()
         shape = "_".join(map(str, self.shape))
         if self.num > 0:
             shape += f"_{self.num}"
-        return f"buffered_{elt}S{shape}"
+        digest = hashlib.sha256(repr(self._identity()).encode()).hexdigest()[:16]
+        return f"{self._mangle_prefix()}S{shape}_{self.storage.value}M{digest}"
 
     def __str__(self) -> str:
-        return f"buffered_tensor_<{self.element_ty}, {self.shape}, {self.layout}, {self.num}>"
+        # Two views can differ only in their IR type (e.g. the allocation
+        # shape), so show it to make type mismatches readable.
+        ir_type = "" if self._ir_type is None else f", {self._ir_type}"
+        return f"buffered_tensor_<{self.element_ty}, {self.shape}, {self.layout}, {self.num}{ir_type}>"
 
     def __eq__(self, other) -> bool:
-        return (type(self) is type(other) and self.shape == other.shape and self.layout == other.layout
-                and self.num == other.num)
+        return type(self) is type(other) and self._identity() == other._identity()
 
     def _flatten_ir_types(self, builder: ir.builder, out: List[ir.type]) -> None:
         out.append(self.to_ir(builder))
 
     def to_ir(self, builder: ir.builder) -> None:
+        if self._ir_type is not None:
+            return self._ir_type
         shape = self.shape
         if self.num >= 1:
             shape = [self.num] + list(shape)
@@ -1415,6 +1547,13 @@ class mbarrier_type(buffered_tensor_type):
         super().__init__(tl.int64, [1], num, storage, layout)
         self.is_warp_barrier = is_warp_barrier
 
+    def _identity(self) -> tuple:
+        # Warp barriers arrive per thread; ordinary ones once per CTA.
+        return super()._identity() + (self.is_warp_barrier, )
+
+    def _mangle_prefix(self) -> str:
+        return "mbarrier"
+
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[mbarrier, int]:
         value = mbarrier(handles[cursor], self.num, self.layout, self.storage, is_warp_barrier=self.is_warp_barrier)
         return value, cursor + 1
@@ -1474,11 +1613,11 @@ class clc_response_type(buffered_tensor_type):
         value = clc_response(handles[cursor], self.num, self.layout)
         return value, cursor + 1
 
-    def mangle(self) -> str:
+    def _mangle_prefix(self) -> str:
         # Distinct from buffered_tensor_type/mbarrier_type, whose mangles are
         # derived from the (placeholder) int64 element type and would otherwise
         # collide with this one for the same shape.
-        return f"clc_response_{self.num}"
+        return "clc_response"
 
     def to_ir(self, builder: ir.builder) -> None:
         if self.num >= 1:
@@ -1604,9 +1743,7 @@ class tensor_descriptor_ptr_type(tl.pointer_type):
         return f"tensor_descriptor_ptr_type(num={self.num}, size={self.size})"
 
     def mangle(self) -> str:
-        if self.num > 1:
-            return f"tensor_desc_ptr_{self.num}_{self.size}"
-        return f"tensor_desc_ptr_{self.size}"
+        return f"tensor_desc_ptr_{self.num}_{self.size}"
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int):
         return tensor_descriptor_ptr(handles[cursor], self.num, self.size), cursor + 1

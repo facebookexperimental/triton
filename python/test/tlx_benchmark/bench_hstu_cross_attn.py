@@ -28,14 +28,17 @@ from _harness import Case, Prepared, close_enough, driver  # noqa: E402
 
 OP = "hstu_cross_attn"
 REF_NAME = "tutorials/hstu_cross_attn/triton_bw_cross_attention.py:triton_bw_hstu_mha_wrapper"
-#: No `heuristic_config` yet; see `bench_flash_attn.py`.
-DEFAULT_SPACE = "full"
+#: The op's default: eight curated configs from its 144-config "full" grid at head dims 64/128.
+DEFAULT_SPACE = "curated"
 EXTRA_COLUMNS = (("q tokens", "q_tokens"), ("kv tokens", "kv_tokens"))
 COLD_COMPILE = "first"
 COMPILE_CAP_S = 900.0
 
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 DIRECTIONS = ("fwd", "bwd")
+#: Inference captures: production never runs their backward, and both backends'
+#: backward takes 60-530 ms a call on them, so the perf suite times the forward.
+FORWARD_ONLY = frozenset(SHAPE_SUITES.resolved_shapes("gfx950_1"))
 
 REL_PRECISION = {"float16": 1e-3, "bfloat16": 8e-3}
 
@@ -57,7 +60,7 @@ def cases(synthetic: bool = False, suites=None) -> list[Case]:
         Case(op=OP, arch=driver.arch(), dtype=str(DTYPES[entry.dtype]).removeprefix("torch."), shape=tuple(entry),
              direction=direction, label=label(entry, direction))
         for entry in shapes(synthetic, suites)
-        for direction in DIRECTIONS
+        for direction in (("fwd", ) if entry in FORWARD_ONLY else DIRECTIONS)
     ]
 
 

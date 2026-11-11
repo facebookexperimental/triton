@@ -248,3 +248,26 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %9 : tensor<64x32xf32, #mma1>
   }
 }
+
+// -----
+
+#fp6 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8, fp6Padded = true}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @fp6_descriptor_load
+  // CHECK: ttng.barrier_expect {{.*}}, 12288,
+  // CHECK: ttng.async_tma_copy_global_to_local
+  // CHECK: ttng.wait_barrier
+  tt.func @fp6_descriptor_load(%desc: !tt.tensordesc<128x128xi8, #fp6>, %offset: i32) -> tensor<128x128xi8, #blocked> {
+    %value = tt.descriptor_load %desc[%offset, %offset] : !tt.tensordesc<128x128xi8, #fp6> -> tensor<128x128xi8, #blocked>
+    tt.return %value : tensor<128x128xi8, #blocked>
+  }
+
+  // CHECK-LABEL: @fp6_make_descriptor
+  // CHECK: ttng.tensormap_create {{.*}} {elem_type = 15 : i32,
+  tt.func @fp6_make_descriptor(%base: !tt.ptr<i8>, %m: i32, %k: i32, %stride: i64) -> !tt.tensordesc<128x128xi8, #fp6> {
+    %one = arith.constant 1 : i64
+    %desc = tt.make_tensor_descriptor %base, [%m, %k], [%stride, %one] : !tt.ptr<i8>, !tt.tensordesc<128x128xi8, #fp6>
+    tt.return %desc : !tt.tensordesc<128x128xi8, #fp6>
+  }
+}

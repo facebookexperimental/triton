@@ -2,26 +2,16 @@
 Multi-CTA Layer Normalization
 ==============================
 
-This tutorial demonstrates how to use ``multi_cta=True`` on ``tl.range`` to
-automatically distribute a reduction across multiple CTAs in a cluster, enabling
-efficient processing of large feature dimensions (N ≥ 4096).
-
-When ``multi_cta=True`` is set on a loop and the kernel is launched with
-``ctas_per_cga`` > (1,1,1), the Triton compiler automatically:
-
-1. Partitions loop iterations across CTAs in the cluster
-2. Performs a local partial reduction within each CTA
-3. Exchanges partial results via Distributed Shared Memory (DSM)
-4. Aggregates the final result across all CTAs
-
-The user writes standard Triton code — the only change from a normal layernorm
-kernel is adding ``multi_cta=True`` to the accumulation loops.
+This tutorial demonstrates reduce-marked multi-CTA collectives. The kernel
+explicitly assigns rank-strided column tiles to each CTA, computes a CTA-local
+partial, and marks only the final ``tl.sum`` with ``multi_cta=True``. The
+compiler combines those partials across the physical cluster with DSMEM; it
+does not rewrite loop bounds or stores.
 
 .. note::
-    Multi-CTA reduction requires SM90+ (Hopper/Blackwell) GPUs and
-    ``ctas_per_cga`` to be set in the kernel launch config.
-    CTAs must cluster on dim 1 (not dim 0) so that all CTAs in a cluster
-    share the same ``program_id(0)`` (row).
+    Multi-CTA reduction requires SM90, SM100, or SM103 and ``ctas_per_cga``.
+    CTAs cluster on dimension 1 so every participant shares the same row ID.
+    The cluster-local rank is ``tl.program_id(1) % NUM_CTAS``.
 """
 
 import torch
@@ -87,9 +77,7 @@ def _layer_norm_fwd_single_cta(
 # %%
 # Multi-CTA Layer Norm
 # ---------------------
-# The **only** change: ``multi_cta=True`` on the three ``tl.range`` loops.
-# The compiler automatically distributes the loop iterations across CTAs
-# and aggregates reductions via DSM.
+# The kernel owns work partitioning. Only the CTA-local reduction is marked.
 
 
 @triton.jit
@@ -104,51 +92,61 @@ def _layer_norm_fwd_multi_cta(
     N,
     eps,
     BLOCK_SIZE: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
 ):
     row = tl.program_id(0)
+    local_rank = tl.program_id(1) % NUM_CTAS
     Y += row * stride
     X += row * stride
 
-    # Accumulate mean — distributed across CTAs
     _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    for off in tl.range(0, N, BLOCK_SIZE, multi_cta=True):
+    for off in tl.range(
+            local_rank * BLOCK_SIZE,
+            N,
+            NUM_CTAS * BLOCK_SIZE,
+    ):
         cols = off + tl.arange(0, BLOCK_SIZE)
-        a = tl.load(X + cols, mask=cols < N, other=0.).to(tl.float32)
-        _mean += a
-    mean = tl.sum(_mean, axis=0) / N
+        values = tl.load(X + cols, mask=cols < N, other=0.0).to(tl.float32)
+        _mean += values
+    mean = tl.sum(_mean, axis=0, multi_cta=True) / N
 
-    # Accumulate variance — distributed across CTAs
     _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    for off in tl.range(0, N, BLOCK_SIZE, multi_cta=True):
+    for off in tl.range(
+            local_rank * BLOCK_SIZE,
+            N,
+            NUM_CTAS * BLOCK_SIZE,
+    ):
         cols = off + tl.arange(0, BLOCK_SIZE)
-        x = tl.load(X + cols, mask=cols < N, other=0.).to(tl.float32)
-        x = tl.where(cols < N, x - mean, 0.)
-        _var += x * x
-    var = tl.sum(_var, axis=0) / N
+        mask = cols < N
+        values = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+        centered = tl.where(mask, values - mean, 0.0)
+        _var += centered * centered
+    var = tl.sum(_var, axis=0, multi_cta=True) / N
     rstd = 1 / tl.sqrt(var + eps)
 
-    tl.store(Mean + row, mean)
-    tl.store(Rstd + row, rstd)
+    is_leader = local_rank == 0
+    tl.store(Mean + row, mean, mask=is_leader)
+    tl.store(Rstd + row, rstd, mask=is_leader)
 
-    # Normalize — distributed across CTAs
-    for off in tl.range(0, N, BLOCK_SIZE, multi_cta=True):
+    for off in tl.range(
+            local_rank * BLOCK_SIZE,
+            N,
+            NUM_CTAS * BLOCK_SIZE,
+    ):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < N
         w = tl.load(W + cols, mask=mask)
         b = tl.load(B + cols, mask=mask)
-        x = tl.load(X + cols, mask=mask, other=0.).to(tl.float32)
-        x_hat = (x - mean) * rstd
-        y = x_hat * w + b
-        tl.store(Y + cols, y, mask=mask)
+        values = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+        output = (values - mean) * rstd * w + b
+        tl.store(Y + cols, output, mask=mask)
 
 
 # %%
 # Multi-CTA Layer Norm with 2D Blocks
 # -------------------------------------
-# Each CTA handles ``BLOCK_SIZE_M`` rows simultaneously, reducing along the
-# column (N) dimension. The ``tl.sum(axis=1)`` after the loop produces a
-# per-row vector, which the MultiCTAReduction pass exchanges across CTAs
-# as a tensor (not a scalar), matching the TLX multi-row pattern.
+# Each CTA handles ``BLOCK_SIZE_M`` rows while the physical cluster partitions
+# columns. The marked axis-1 reductions produce replicated per-row tensors.
 
 
 @triton.jit
@@ -165,43 +163,57 @@ def _layer_norm_fwd_multi_cta_2d(
     eps,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
 ):
     pid = tl.program_id(0)
+    local_rank = tl.program_id(1) % NUM_CTAS
     rows = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     row_mask = rows < M
     X += rows[:, None] * stride
     Y += rows[:, None] * stride
 
     _mean = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
-    for off in tl.range(0, N, BLOCK_SIZE_N, multi_cta=True):
+    for off in tl.range(
+            local_rank * BLOCK_SIZE_N,
+            N,
+            NUM_CTAS * BLOCK_SIZE_N,
+    ):
         cols = off + tl.arange(0, BLOCK_SIZE_N)
         mask = row_mask[:, None] & (cols[None, :] < N)
-        a = tl.load(X + cols[None, :], mask=mask, other=0.).to(tl.float32)
-        _mean += a
-    mean = tl.sum(_mean, axis=1) / N
+        values = tl.load(X + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+        _mean += values
+    mean = tl.sum(_mean, axis=1, multi_cta=True) / N
 
     _var = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
-    for off in tl.range(0, N, BLOCK_SIZE_N, multi_cta=True):
+    for off in tl.range(
+            local_rank * BLOCK_SIZE_N,
+            N,
+            NUM_CTAS * BLOCK_SIZE_N,
+    ):
         cols = off + tl.arange(0, BLOCK_SIZE_N)
         mask = row_mask[:, None] & (cols[None, :] < N)
-        x = tl.load(X + cols[None, :], mask=mask, other=0.).to(tl.float32)
-        x = tl.where(mask, x - mean[:, None], 0.)
-        _var += x * x
-    var = tl.sum(_var, axis=1) / N
+        values = tl.load(X + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+        centered = tl.where(mask, values - mean[:, None], 0.0)
+        _var += centered * centered
+    var = tl.sum(_var, axis=1, multi_cta=True) / N
     rstd = 1 / tl.sqrt(var + eps)
 
-    tl.store(Mean + rows, mean, mask=row_mask)
-    tl.store(Rstd + rows, rstd, mask=row_mask)
+    leader_mask = row_mask & (local_rank == 0)
+    tl.store(Mean + rows, mean, mask=leader_mask)
+    tl.store(Rstd + rows, rstd, mask=leader_mask)
 
-    for off in tl.range(0, N, BLOCK_SIZE_N, multi_cta=True):
+    for off in tl.range(
+            local_rank * BLOCK_SIZE_N,
+            N,
+            NUM_CTAS * BLOCK_SIZE_N,
+    ):
         cols = off + tl.arange(0, BLOCK_SIZE_N)
         mask = row_mask[:, None] & (cols[None, :] < N)
         w = tl.load(W + cols[None, :], mask=cols[None, :] < N)
         b = tl.load(B + cols[None, :], mask=cols[None, :] < N)
-        x = tl.load(X + cols[None, :], mask=mask, other=0.).to(tl.float32)
-        x_hat = (x - mean[:, None]) * rstd[:, None]
-        y = x_hat * w + b
-        tl.store(Y + cols[None, :], y, mask=mask)
+        values = tl.load(X + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+        output = (values - mean[:, None]) * rstd[:, None] * w + b
+        tl.store(Y + cols[None, :], output, mask=mask)
 
 
 # %%
@@ -242,12 +254,12 @@ def multi_cta_layernorm(x, weight, bias, eps=1e-5, NUM_CTAS=2):
     y = torch.empty_like(x)
     mean = torch.empty((M, ), dtype=torch.float32, device=x.device)
     rstd = torch.empty((M, ), dtype=torch.float32, device=x.device)
-    # Compute BLOCK_SIZE: must be power-of-2 and divide chunk = N//NUM_CTAS
+    if NUM_CTAS not in (1, 2, 4):
+        raise ValueError(f"NUM_CTAS must be 1, 2, or 4; got {NUM_CTAS}")
+    if N <= 0:
+        raise ValueError("LayerNorm feature dimension must be positive")
     MAX_FUSED_SIZE = 65536 // x.element_size()
-    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-    chunk = N // NUM_CTAS
-    while BLOCK_SIZE > chunk or chunk % BLOCK_SIZE != 0:
-        BLOCK_SIZE //= 2
+    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(triton.cdiv(N, NUM_CTAS)))
     num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
     # Grid dim 1 = NUM_CTAS: CTAs cluster on dim 1 so all CTAs in a
     # cluster share the same program_id(0) (row).
@@ -262,6 +274,7 @@ def multi_cta_layernorm(x, weight, bias, eps=1e-5, NUM_CTAS=2):
         N,
         eps,
         BLOCK_SIZE=BLOCK_SIZE,
+        NUM_CTAS=NUM_CTAS,
         num_warps=num_warps,
         ctas_per_cga=(1, NUM_CTAS, 1),
     )
@@ -274,11 +287,12 @@ def multi_cta_layernorm_2d(x, weight, bias, eps=1e-5, NUM_CTAS=2, BLOCK_SIZE_M=4
     y = torch.empty_like(x)
     mean = torch.empty((M, ), dtype=torch.float32, device=x.device)
     rstd = torch.empty((M, ), dtype=torch.float32, device=x.device)
+    if NUM_CTAS not in (1, 2, 4):
+        raise ValueError(f"NUM_CTAS must be 1, 2, or 4; got {NUM_CTAS}")
+    if N <= 0:
+        raise ValueError("LayerNorm feature dimension must be positive")
     MAX_FUSED_SIZE = 65536 // x.element_size()
-    BLOCK_SIZE_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-    chunk = N // NUM_CTAS
-    while BLOCK_SIZE_N > chunk or chunk % BLOCK_SIZE_N != 0:
-        BLOCK_SIZE_N //= 2
+    BLOCK_SIZE_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(triton.cdiv(N, NUM_CTAS)))
     num_warps = min(max(BLOCK_SIZE_N // 256, 1), 8)
     grid = (triton.cdiv(M, BLOCK_SIZE_M), NUM_CTAS)
     _layer_norm_fwd_multi_cta_2d[grid](
@@ -294,6 +308,7 @@ def multi_cta_layernorm_2d(x, weight, bias, eps=1e-5, NUM_CTAS=2, BLOCK_SIZE_M=4
         eps,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
+        NUM_CTAS=NUM_CTAS,
         num_warps=num_warps,
         ctas_per_cga=(1, NUM_CTAS, 1),
     )
@@ -305,24 +320,28 @@ def multi_cta_layernorm_2d(x, weight, bias, eps=1e-5, NUM_CTAS=2, BLOCK_SIZE_M=4
 # -----------------
 
 
-def test_multi_cta_layernorm(M=4, N=16384, dtype=torch.float16, eps=1e-5):
+def test_multi_cta_layernorm(M=4, N=16381, dtype=torch.float16, eps=1e-5):
     torch.manual_seed(0)
     x = torch.randn(M, N, device=DEVICE, dtype=dtype)
     weight = torch.randn(N, device=DEVICE, dtype=dtype)
     bias = torch.randn(N, device=DEVICE, dtype=dtype)
 
-    # PyTorch reference
     y_ref = torch.nn.functional.layer_norm(x, (N, ), weight, bias, eps)
+    x_f32 = x.float()
+    mean_ref = x_f32.mean(dim=1)
+    rstd_ref = torch.rsqrt(((x_f32 - mean_ref[:, None])**2).mean(dim=1) + eps)
 
-    # Test with different NUM_CTAS values
-    for nc in [1, 2, 4]:
-        y_tri, _, _ = multi_cta_layernorm(x, weight, bias, eps, NUM_CTAS=nc)
-        max_diff = torch.max(torch.abs(y_ref - y_tri)).item()
-        passed = torch.allclose(y_ref, y_tri, rtol=1e-2, atol=1e-2)
-        status = "✓" if passed else "✗"
-        print(f"  {status} [M={M}, N={N}, NUM_CTAS={nc}] Max diff: {max_diff}")
-        assert passed, f"Mismatch with NUM_CTAS={nc}: max diff = {max_diff}"
-    print("✓ Correctness test passed for all NUM_CTAS values!")
+    for num_ctas in (1, 2, 4):
+        y_tri, mean_tri, rstd_tri = multi_cta_layernorm(x, weight, bias, eps, NUM_CTAS=num_ctas)
+        torch.testing.assert_close(y_tri, y_ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(mean_tri, mean_ref, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(rstd_tri, rstd_ref, rtol=1e-3, atol=1e-3)
+
+    for num_ctas in (2, 4):
+        y_tri, mean_tri, rstd_tri = multi_cta_layernorm_2d(x, weight, bias, eps, NUM_CTAS=num_ctas)
+        torch.testing.assert_close(y_tri, y_ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(mean_tri, mean_ref, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(rstd_tri, rstd_ref, rtol=1e-3, atol=1e-3)
 
 
 # %%

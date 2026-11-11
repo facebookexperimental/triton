@@ -1,3 +1,4 @@
+#include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/Transforms/ConSanTargetHooks.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -27,6 +28,12 @@ Value getLeaderCTAPredicate(ImplicitLocOpBuilder &b, uint32_t broadcastMask) {
       b, ctaId, arith::ConstantIntOp::create(b, broadcastMask, 32));
   return arith::CmpIOp::create(b, arith::CmpIPredicate::eq, ctaIdInGroup,
                                arith::ConstantIntOp::create(b, 0, 32));
+}
+
+uint32_t getBlockBroadcastMask(Type type) {
+  auto memDescTy = cast<ttg::MemDescType>(type);
+  auto kBlock = StringAttr::get(type.getContext(), "block");
+  return toLinearLayout(memDescTy).getFreeVariableMasks().lookup(kBlock);
 }
 
 } // namespace
@@ -97,30 +104,39 @@ public:
     return needed;
   }
 
+  bool needsPtxasMaskedStoreBarrierWorkaround() const override { return true; }
+
   Value getIssuerCTAPred(ImplicitLocOpBuilder &b,
                          Operation *op) const override {
     // mask = 0 means no CTA predication.
     uint32_t mask = 0;
-    auto getBarrierMask = [&](Value barrier) {
-      auto barrierTy = cast<ttg::MemDescType>(barrier.getType());
-      auto kBlock = StringAttr::get(op->getContext(), "block");
-      return toLinearLayout(barrierTy).getFreeVariableMasks().lookup(kBlock);
-    };
     if (auto initOp = dyn_cast<ttng::InitBarrierOp>(op))
-      mask = getBarrierMask(initOp.getAlloc());
+      mask = getBlockBroadcastMask(initOp.getAlloc().getType());
     if (auto waitOp = dyn_cast<ttng::WaitBarrierOp>(op))
-      mask = getBarrierMask(waitOp.getAlloc());
+      mask = getBlockBroadcastMask(waitOp.getAlloc().getType());
     if (auto invalOp = dyn_cast<ttng::InvalBarrierOp>(op))
-      mask = getBarrierMask(invalOp.getAlloc());
+      mask = getBlockBroadcastMask(invalOp.getAlloc().getType());
+    if (isa<ttng::BarrierExpectOp, ttng::ArriveBarrierOp>(op)) {
+      std::optional<uint32_t> fromCTA;
+      if (auto expectOp = dyn_cast<ttng::BarrierExpectOp>(op))
+        fromCTA = expectOp.getFromCTA();
+      else
+        fromCTA = cast<ttng::ArriveBarrierOp>(op).getFromCTA();
+      if (fromCTA)
+        mask = ~*fromCTA & (ttg::lookupNumCTAs(op) - 1);
+    }
     if (auto copyOp = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
       if (copyOp.getMulticast())
-        mask = getBarrierMask(copyOp.getResult());
+        mask = getBlockBroadcastMask(copyOp.getResult().getType());
     }
     if (auto gatherOp = dyn_cast<ttng::AsyncTMAGatherOp>(op))
       if (gatherOp.getMulticast())
-        mask = getBarrierMask(gatherOp.getResult());
+        mask = getBlockBroadcastMask(gatherOp.getResult().getType());
     if (auto storeOp = dyn_cast<ttng::TMAStoreLikeOpInterface>(op))
-      mask = getBarrierMask(storeOp.getSrc());
+      mask = getBlockBroadcastMask(storeOp.getSrc().getType());
+    if (op->hasAttr("allocation.size"))
+      if (auto scratchMask = getAtomicScratchBroadcastMask(op))
+        mask = *scratchMask;
     if (isa<ttng::CLCTryCancelOp>(op) && ttg::lookupNumCTAs(op) > 1) {
       Value ctaId = tti::ExperimentalClusterCTAIdOp::create(b, b.getLoc());
       return arith::CmpIOp::create(b, arith::CmpIPredicate::eq, ctaId,
@@ -143,6 +159,13 @@ public:
     return {ClusterBarrierOp::create(b, b.getLoc()).getOperation()};
   }
 
+  bool hasUnsummarizableCalleeState(Operation *op) const override {
+    if (isa<ClusterBarrierOp>(op))
+      return true;
+    return op->hasAttr("allocation.size") &&
+           getAtomicScratchBroadcastMask(op).value_or(0) != 0;
+  }
+
   std::optional<MemEffectsOpInfo>
   getMemEffectsOpInfo(Operation *op) const override {
     std::optional<MemEffectsOpInfo> info =
@@ -150,7 +173,8 @@ public:
     if (!info) {
       if (!isa<ttng::BarrierExpectOp, ttng::TCGen5CommitOp,
                ttng::ArriveBarrierOp, ttng::TMEMShiftOp, ttng::AsyncTMAGatherOp,
-               ttng::AsyncTMACopyGlobalToLocalOp, ttng::CLCTryCancelOp>(op))
+               ttng::AsyncTMACopyGlobalToLocalOp, ttng::CLCTryCancelOp,
+               ttng::AsyncCopyMbarrierArriveOp>(op))
         return std::nullopt;
       info.emplace();
       info->trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
@@ -173,7 +197,8 @@ public:
       bool hasRead = false;
       bool hasWrite = false;
       for (auto &effect : info->operandEffects) {
-        if (effect.buf != shiftOp.getBuffer())
+        const auto *buffer = std::get_if<Value>(&effect.buffer);
+        if (!buffer || *buffer != shiftOp.getBuffer())
           continue;
         effect.operandName = "Buffer";
         hasRead |= effect.rw == RW::Read;
@@ -234,7 +259,9 @@ public:
            MemEffectsOpInfo::BarrierTrackingMode::EffectWrites,
            /*txCount=*/-txCount});
       if (llvm::none_of(info->operandEffects, [&](const auto &effect) {
-            return effect.buf == copyOp.getResult() && effect.rw == RW::Write;
+            const auto *buffer = std::get_if<Value>(&effect.buffer);
+            return buffer && *buffer == copyOp.getResult() &&
+                   effect.rw == RW::Write;
           }))
         info->operandEffects.emplace_back(RW::Write, copyOp.getResult(), "",
                                           ttg::SharedKind::Async);
@@ -253,7 +280,8 @@ public:
            /*txCount=*/
            -static_cast<int>(tti::getMemDescLength(tryCancelOp.getResult()))});
       if (llvm::none_of(info->operandEffects, [&](const auto &effect) {
-            return effect.buf == tryCancelOp.getResult() &&
+            const auto *buffer = std::get_if<Value>(&effect.buffer);
+            return buffer && *buffer == tryCancelOp.getResult() &&
                    effect.rw == RW::Write;
           }))
         info->operandEffects.emplace_back(RW::Write, tryCancelOp.getResult(),
@@ -284,7 +312,9 @@ public:
            MemEffectsOpInfo::BarrierTrackingMode::EffectWrites,
            /*txCount=*/-txCount});
       if (llvm::none_of(info->operandEffects, [&](const auto &effect) {
-            return effect.buf == gatherOp.getResult() && effect.rw == RW::Write;
+            const auto *buffer = std::get_if<Value>(&effect.buffer);
+            return buffer && *buffer == gatherOp.getResult() &&
+                   effect.rw == RW::Write;
           }))
         info->operandEffects.emplace_back(RW::Write, gatherOp.getResult(), "",
                                           ttg::SharedKind::Async);
@@ -294,12 +324,20 @@ public:
       info->barriers.push_back(
           {arriveOp.getBarrier(), nullptr, (int)arriveOp.getCount()});
     }
+    if (auto arriveOp = dyn_cast<ttng::AsyncCopyMbarrierArriveOp>(op)) {
+      int count = arriveOp.getNoIncrement() ? ttg::lookupNumWarps(op) * 32 : 0;
+      info->barriers.push_back(
+          {arriveOp.getBarrier(), nullptr, count,
+           MemEffectsOpInfo::BarrierTrackingMode::AsyncCopies});
+    }
+
     if (!namedOperands.empty()) {
       SmallVector<MemEffectsOpInfo::Effects> effects;
       for (auto [value, name] : namedOperands)
         for (auto it = info->operandEffects.begin();
              it != info->operandEffects.end(); ++it)
-          if (it->buf == value) {
+          if (auto *buffer = std::get_if<Value>(&it->buffer);
+              buffer && *buffer == value) {
             effects.emplace_back(*it).operandName = name.str();
             break;
           }

@@ -2,6 +2,7 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include <cstdlib>
 #include <string>
@@ -102,7 +103,7 @@ void attachAllocationSizeAndOffsetAttr(ModuleOp mod,
       if (oBufferId != Allocation::InvalidBufferId) {
         int offset = funcAllocation->getOffset(oBufferId);
         op->setAttr("allocation.offset", IntegerAttr::get(i32Ty, offset));
-        if (!funcAllocation->isVirtualBuffer(oBufferId)) {
+        if (!isa<FunctionOpInterface>(op)) {
           int size = funcAllocation->getAllocatedSize(oBufferId);
           op->setAttr("allocation.size", IntegerAttr::get(i32Ty, size));
         }
@@ -138,6 +139,27 @@ void attachAllocationSizeAndOffsetAttr(ModuleOp mod,
   mod->setAttr("ttg.shared",
                mlir::IntegerAttr::get(mlir::IntegerType::get(ctx, 32),
                                       allocation.getSharedMemorySize()));
+}
+
+static bool lacksNpotPow2AllocShape(Type type) {
+  auto memDesc = dyn_cast<MemDescType>(type);
+  return memDesc && isa<SharedEncodingTrait>(memDesc.getEncoding()) &&
+         !holdsNpotPow2AllocShape(memDesc.getEncoding(),
+                                  memDesc.getAllocShape());
+}
+
+LogicalResult verifyNpotTypesSupported(ModuleOp mod) {
+  if (!triton::tools::isNpotAllowed())
+    return success();
+  bool unsupported = false;
+  mod.walk([&](Operation *op) {
+    if (llvm::any_of(op->getOperandTypes(), lacksNpotPow2AllocShape) ||
+        llvm::any_of(op->getResultTypes(), lacksNpotPow2AllocShape)) {
+      op->emitError() << "NPOT shared memory descriptors are not yet supported";
+      unsupported = true;
+    }
+  });
+  return failure(unsupported);
 }
 
 } // namespace mlir::triton::gpu

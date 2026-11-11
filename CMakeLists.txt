@@ -9,7 +9,8 @@ endif()
 project(triton CXX C)
 include(CTest)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -19,6 +20,8 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 option(TRITON_BUILD_PYTHON_MODULE "Build Python Triton bindings" OFF)
 option(TRITON_BUILD_PROTON "Build the Triton Proton profiler" ON)
+option(TRITON_BUILD_NVIDIA_GSAN_RUNTIME
+       "Build the CUDA/NVPTX GSan device runtime for the NVIDIA backend" ON)
 option(TRITON_STABLE_ABI "Build with Python Stable ABI (abi3) for Python 3.12+" OFF)
 option(TRITON_BUILD_UT "Build C++ Triton Unit Tests" ON)
 option(TRITON_BUILD_WITH_CCACHE "Build with ccache (if available)" ON)
@@ -122,6 +125,8 @@ set_property(
   PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/python/build_helpers.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/llvm-info.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/meta-llvm-info.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/python/meta_llvm.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/json-version.txt"
 )
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -147,6 +152,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
     PROPERTY CMAKE_CONFIGURE_DEPENDS
       "${CMAKE_CURRENT_SOURCE_DIR}/python/build_helpers.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/cmake/amd-llvm-info.json"
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/meta-amd-llvm-info.json"
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/amd/backend/codegen/CMakeLists.txt"
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/amd/backend/codegen/amdgpu_codegen.cc"
       "${CMAKE_CURRENT_SOURCE_DIR}/include/triton/Tools/LLVMOptions.h"
@@ -219,7 +225,7 @@ endif()
 # Compiler flags
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(NOT MSVC)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__STDC_FORMAT_MACROS  -fPIC -std=gnu++17")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__STDC_FORMAT_MACROS  -fPIC")
 else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__STDC_FORMAT_MACROS")
 endif()
@@ -297,13 +303,17 @@ if(NOT MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DTRITON_EXT_ENABLED=1")
   endif()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wno-covered-switch-default ")
+  # MLIR still supports attribute-dictionary builders during the properties
+  # migration. Keep their deprecation warnings visible but non-fatal.
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=deprecated-declarations")
 else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4244 /wd4624 /wd4715 /wd4530")
 endif()
 
 include_directories(".")
-include_directories(${MLIR_INCLUDE_DIRS})
-include_directories(${LLVM_INCLUDE_DIRS})
+# LLVM/MLIR range comparisons can trigger -Wambiguous-reversed-operator in
+# C++20. Treat these external headers as system includes.
+include_directories(SYSTEM ${MLIR_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include) # Tablegen'd files
 include_directories(${PROJECT_SOURCE_DIR}/third_party)
@@ -483,6 +493,17 @@ if(TRITON_BUILD_PYTHON_MODULE)
     endif()
     file(GENERATE OUTPUT "${TRITON_EXPORT_SYMBOLS_FILE}"
       CONTENT "${TRITON_EXPORT_SYMBOLS_FILE_CONTENT}")
+  elseif(UNIX AND NOT APPLE)
+    # Extensions use the Triton and LLVM symbols libtriton exports. Put them all
+    # under a TRITON symbol version, so that neither libtriton nor an extension
+    # linked against it binds to another LLVM in the process, such as a
+    # libLLVM.so loaded RTLD_GLOBAL (ROCm's, which torch preloads, versions its
+    # symbols LLVM_<major>). Not available on macOS or Windows.
+    set(TRITON_EXPORT_SYMBOLS_FILE "${CMAKE_CURRENT_BINARY_DIR}/triton.exports")
+    file(GENERATE OUTPUT "${TRITON_EXPORT_SYMBOLS_FILE}"
+      CONTENT "TRITON {\n  global:\n    *;\n};\n")
+    target_link_options(triton PRIVATE
+      "LINKER:--version-script,${TRITON_EXPORT_SYMBOLS_FILE}")
   endif()
 
   if (NOT DEFINED LLVM_SYSPATH)

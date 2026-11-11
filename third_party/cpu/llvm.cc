@@ -4,6 +4,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassTimingInfo.h"
@@ -64,6 +65,15 @@ void initializeHostTarget() {
   llvm::parallel::strategy = llvm::hardware_concurrency(1);
 }
 
+void enableFPContraction(llvm::Module &module) {
+  for (llvm::Function &function : module)
+    for (llvm::Instruction &instruction : llvm::instructions(function))
+      if (instruction.getOpcode() == llvm::Instruction::FAdd ||
+          instruction.getOpcode() == llvm::Instruction::FSub ||
+          instruction.getOpcode() == llvm::Instruction::FMul)
+        instruction.setHasAllowContract(true);
+}
+
 std::unique_ptr<llvm::TargetMachine>
 createHostTargetMachine(llvm::Module &module, bool enableFpFusion,
                         bool enableFastMath) {
@@ -73,11 +83,13 @@ createHostTargetMachine(llvm::Module &module, bool enableFpFusion,
   if (!target)
     throw std::runtime_error("target lookup error: " + error);
 
-  llvm::TargetOptions options;
+  // Newer LLVM versions no longer honor TargetOptions FP fusion or
+  // trapping-math settings during code generation; both are expressed
+  // through instruction fast-math flags instead.
   if (enableFpFusion)
-    options.AllowFPOpFusion = llvm::FPOpFusion::Fast;
-  if (enableFastMath)
-    options.NoTrappingFPMath = true;
+    enableFPContraction(module);
+  (void)enableFastMath;
+  llvm::TargetOptions options;
   options.TrapUnreachable = true;
   options.MCOptions.AsmVerbose = true;
   options.MCOptions.PreserveAsmComments = true;

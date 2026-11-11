@@ -1,4 +1,6 @@
 """TLX warp specialization tests -- Hopper and newer."""
+import warnings
+
 import pytest
 import torch
 import re
@@ -333,6 +335,17 @@ def test_default_task_register_budget(device):
     assert "defaultRequestedRegisters = 80 : i32" in ttgir
     assert default_out.item() == 1
     assert worker_out.item() == 2
+
+
+def test_async_task_missing_num_regs_deprecated():
+    with pytest.warns(DeprecationWarning, match="without num_regs"):
+        tlx.async_task(num_warps=1)
+    with pytest.warns(DeprecationWarning, match="without num_regs"):
+        tlx.async_task("default")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        tlx.async_task(num_warps=1, num_regs=24)
+        tlx.async_task("default", num_regs=80)
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")

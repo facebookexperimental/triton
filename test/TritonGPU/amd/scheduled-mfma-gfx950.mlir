@@ -1,7 +1,7 @@
-// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --verify-diagnostics | FileCheck %s
-// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --canonicalize --cse --verify-diagnostics | FileCheck %s --check-prefix=OPERAND-CSE
-// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --canonicalize --cse --triton-amdgpu-finalize-scheduled-mfma-operands --triton-amdgpu-finalize-scheduled-mfma-operands --verify-diagnostics | FileCheck %s --check-prefix=OPERAND-FINAL --implicit-check-not=ttg.amdg.scheduled_mfma_operand_pin
-// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --canonicalize --cse --triton-amdgpu-finalize-scheduled-mfma-operands --verify-diagnostics | FileCheck %s --check-prefix=LOAD-ORIGIN --implicit-check-not=ttg.amdg.scheduled_mfma_operand_pin
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --triton-amdgpu-membar="gfx-arch=gfx950" --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --verify-diagnostics | FileCheck %s
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --triton-amdgpu-membar="gfx-arch=gfx950" --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --canonicalize --cse --verify-diagnostics | FileCheck %s --check-prefix=OPERAND-CSE
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --triton-amdgpu-membar="gfx-arch=gfx950" --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --canonicalize --cse --triton-amdgpu-finalize-scheduled-mfma-operands --triton-amdgpu-finalize-scheduled-mfma-operands --verify-diagnostics | FileCheck %s --check-prefix=OPERAND-FINAL --implicit-check-not=ttg.amdg.scheduled_mfma_operand_pin
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --triton-amdgpu-membar="gfx-arch=gfx950" --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" --canonicalize --cse --triton-amdgpu-finalize-scheduled-mfma-operands --verify-diagnostics | FileCheck %s --check-prefix=LOAD-ORIGIN --implicit-check-not=ttg.amdg.scheduled_mfma_operand_pin
 
 // On CDNA4 `auto` resolves a persistent accumulator to AGPRs, so the unsafe
 // commit is reachable through the default path with no explicit register class
@@ -498,7 +498,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     %undef = llvm.mlir.undef : vector<1xf32>
     %vector = llvm.insertelement %x, %undef[%index : i32] : vector<1xf32>
     %slot = llvm.alloca %one x f32 : (i32) -> !llvm.ptr<5>
-    llvm.intr.masked.store %vector, %slot, %mask {alignment = 4 : i32} : vector<1xf32>, vector<1xi1> into !llvm.ptr<5>
+    llvm.intr.masked.store (%vector, %slot, %mask), alignment(4) : vector<1xf32>, vector<1xi1> into !llvm.ptr<5>
     %reloaded = llvm.load %slot : !llvm.ptr<5> -> f32
     %out = llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0", "=v,v" %reloaded : (f32) -> f32
     tt.return
@@ -2589,6 +2589,39 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     %committed_dk = amdg.mfma_commit %dk : tensor<32x32xf32, #mma>
     %committed_dv, %preserved = amdg.mfma_commit %merged, %resident
         : tensor<32x32xf32, #mma>, tensor<16x32xbf16, #rhs>
+    tt.return
+  }
+}
+
+// -----
+
+// An unconstrained persistent update keeps its result pin but adds no input
+// register-class pins, so loaded inputs are waited for at the MFMA itself.
+//
+// CHECK-LABEL: llvm.func @persistent_unconstrained_operands
+// CHECK-NOT: "=v,0"
+// CHECK: rocdl.mfma.f32.16x16x32.bf16
+// CHECK-NOT: "=v,0"
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: "", "=a,0"
+// CHECK: llvm.return
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @persistent_unconstrained_operands(
+      %a: tensor<16x32xbf16, #lhs>,
+      %b: tensor<32x16xbf16, #rhs>) {
+    %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "unconstrained" accumulator "persistent"
+        register_class "auto" initialize true
+        : tensor<16x32xbf16, #lhs>,
+          tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma>
+          -> tensor<16x16xf32, #mma>
     tt.return
   }
 }

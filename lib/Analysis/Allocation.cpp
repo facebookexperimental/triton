@@ -55,10 +55,7 @@ unsigned getNumScratchElemsSwizzledCvt(const LinearLayout &srcLayout,
   // Remove the number of elements duplicated in the CGA layout.
   auto nBlocks = product(triton::gpu::getCTASplitNum(
       gpu::LinearEncodingAttr::get(ctx, srcLayout)));
-  // Modular layouts size the padded input cover; pow2 keeps output sizing.
-  auto elems =
-      smem.isModular() ? smem.getTotalInDimSize() : smem.getTotalOutDimSize();
-  return elems / (reps * nBlocks);
+  return smem.getTotalOutDimSize() / (reps * nBlocks);
 }
 
 unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
@@ -70,31 +67,44 @@ unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
       getBitwidth(srcTy), numBanks, srcTile, dstTile);
 }
 
-// Both `atomic_cas` and `atomic_rmw` may need scratch memory to store values
-// because Triton's block-based programming model ensures that
-// all threads sharing the same partition of the tensor see the same values,
-// even for threads that do not participate in the atomic operation
-static SmallVector<unsigned> getRepShapeForAtomic(Value result) {
+static unsigned getResultBroadcastScratchSize(Value result) {
+  if (result.use_empty())
+    return 0;
+
   SmallVector<unsigned> smemShape;
-  if (!result.use_empty()) {
-    if (auto tensorTy = dyn_cast<RankedTensorType>(result.getType())) {
-      auto freeVariableMasks =
-          gpu::toLinearLayout(tensorTy).getFreeVariableMasks();
-      if (llvm::any_of(freeVariableMasks, [](auto variableMask) {
-            return variableMask.second != 0;
-          })) {
-        // The tensor has broadcasted dimensions
-        smemShape = convertType<unsigned>(gpu::getShapePerCTA(tensorTy));
-      }
-    } else {
-      // If the result is a scalar, we need to allocate a single element.
-      smemShape.push_back(1);
-    }
+  if (auto tensorTy = dyn_cast<RankedTensorType>(result.getType())) {
+    auto freeVariableMasks =
+        gpu::toLinearLayout(tensorTy).getFreeVariableMasks();
+    auto *ctx = tensorTy.getContext();
+    bool hasThreadReplication =
+        freeVariableMasks.lookup(StringAttr::get(ctx, "lane")) != 0 ||
+        freeVariableMasks.lookup(StringAttr::get(ctx, "warp")) != 0 ||
+        freeVariableMasks.lookup(StringAttr::get(ctx, "block")) != 0;
+    if (!hasThreadReplication)
+      return 0;
+    smemShape = convertType<unsigned>(gpu::getShapePerCTA(tensorTy));
+  } else {
+    smemShape.push_back(1);
   }
-  return smemShape;
+
+  unsigned elems = getNumScratchElements(smemShape);
+  Type elemTy = getElementTypeOrSelf(result.getType());
+  unsigned bitWidth = getIntOrFloatOrPtrBitWidth(elemTy);
+  return elems * std::max(8u, bitWidth) / 8;
+}
+
+unsigned getAtomicResultScratchSize(Value result) {
+  if (getAtomicResultShuffleMask(result))
+    return 0;
+  return getResultBroadcastScratchSize(result);
 }
 
 unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
+  if (auto reshape = dyn_cast<ReshapeOp>(op)) {
+    RankedTensorType srcTy = reshape.getSrc().getType();
+    if (gpu::isNpotSharedReshape(srcTy, reshape.getType()))
+      return srcTy.getNumElements() * getBitwidth(srcTy) / 8;
+  }
   if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
     return ReduceOpHelper(reduceOp).getScratchSizeInBytes();
   }
@@ -107,6 +117,8 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
     return helper.getScratchSizeInBytes();
   }
   if (auto histogram = dyn_cast<HistogramOp>(op)) {
+    if (canUseWarpBallotHistogram(histogram) && gpu::lookupNumWarps(op) == 1)
+      return 0;
     auto dstTy = histogram.getType();
     int threadsPerWarp = gpu::TritonGPUDialect::getThreadsPerWarp(
         op->getParentOfType<ModuleOp>());
@@ -116,6 +128,8 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
   if (auto cvtLayout = dyn_cast<gpu::ConvertLayoutOp>(op)) {
     auto srcTy = cvtLayout.getSrc().getType();
     auto dstTy = cvtLayout.getType();
+    if (auto bytes = getMixedRadixConversionScratchBytes(cvtLayout))
+      return *bytes;
     if (!cvtNeedsSharedMemory(cvtLayout))
       return 0;
     // The generic pass uses swizzling
@@ -127,16 +141,12 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
     // need to be broadcast through shared memory.
     if (!poll.getTimeout())
       return 0;
+    return getResultBroadcastScratchSize(poll.getResult());
   }
-  if (isa<gpu::LocalAtomicScatterRMWOp, AtomicPollOp>(op) ||
-      isa<AtomicOpInterface>(op)) {
-    auto value = op->getOperand(0);
-    auto smemShape = getRepShapeForAtomic(op->getResult(0));
-    auto elems = getNumScratchElements(smemShape);
-    if (elems == 0)
+  if (isa<gpu::LocalAtomicScatterRMWOp>(op) || isa<AtomicOpInterface>(op)) {
+    if (op->getNumResults() == 0)
       return 0;
-    auto elemTy = getElementTypeOrSelf(getPointeeType(value.getType()));
-    return elems * std::max<int>(8, elemTy.getIntOrFloatBitWidth()) / 8;
+    return getAtomicResultScratchSize(op->getResult(0));
   }
   if (isa<ttng::TensormapCreateOp>(op)) {
     constexpr int32_t kTMASize = 128;
@@ -146,6 +156,20 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
     return ws.getCaptureSize();
   }
   return 0;
+}
+
+std::optional<uint16_t> getAtomicScratchBroadcastMask(Operation *op) {
+  if (!isa<AtomicOpInterface, AtomicPollOp, gpu::LocalAtomicScatterRMWOp>(op))
+    return std::nullopt;
+  if (op->getNumResults() == 0)
+    return std::nullopt;
+
+  Type resultTy = op->getResult(0).getType();
+  if (auto tensorTy = dyn_cast<RankedTensorType>(resultTy)) {
+    auto block = StringAttr::get(op->getContext(), "block");
+    return gpu::toLinearLayout(tensorTy).getFreeVariableMasks().lookup(block);
+  }
+  return static_cast<uint16_t>(gpu::lookupNumCTAs(op) - 1);
 }
 
 bool hasCrossCTAScratch(Operation *op) {
@@ -158,9 +182,21 @@ bool hasCrossCTAScratch(Operation *op) {
   }
   if (auto reduce = dyn_cast<ReduceOp>(op))
     return !ReduceOpHelper(reduce).isReduceWithinCTA();
+  if (auto histogram = dyn_cast<HistogramOp>(op)) {
+    auto block = StringAttr::get(op->getContext(), "block");
+    auto layout = gpu::toLinearLayout(histogram.getSrc().getType());
+    // Each CTA accumulates its inputs into a full set of local bins.
+    // Splitted CTAs in the input make these local bins partial, and thus the
+    // final results need to be aggregated across CTAs
+    return layout.getFreeVariableMasks().lookup(block) !=
+           layout.getInDimSize(block) - 1;
+  }
   if (auto poll = dyn_cast<AtomicPollOp>(op))
-    return poll.getTimeout() && !poll.getResult().use_empty();
+    return poll.getTimeout() && !poll.getResult().use_empty() &&
+           getAtomicScratchBroadcastMask(op).value_or(0) != 0;
   if (isa<AtomicOpInterface, gpu::LocalAtomicScatterRMWOp>(op)) {
+    if (op->getNumResults() == 0)
+      return false;
     Value result = op->getResult(0);
     if (result.use_empty())
       return false;
@@ -313,7 +349,11 @@ private:
       AliasInfo &info = latticeElement->getValue();
       if (!info.getAllocs().empty()) {
         for (auto alloc : info.getAllocs()) {
-          allocation->addAlias(value, alloc);
+          if (allocation->valueBuffer.contains(alloc))
+            allocation->addAlias(value, alloc);
+          else if (auto argument = dyn_cast<BlockArgument>(alloc);
+                   argument && argument.getOwner()->getParentOp() == operation)
+            allocation->argumentAliases[value].insert(argument.getArgNumber());
         }
       }
     }
@@ -330,7 +370,11 @@ private:
     std::unique_ptr<DataFlowSolver> solver = createDataFlowSolver();
     SharedMemoryAliasAnalysis *aliasAnalysis =
         solver->load<SharedMemoryAliasAnalysis>();
-    if (failed(solver->initializeAndRun(operation))) {
+    // Returned descriptors must keep their caller-owned allocations live.
+    Operation *analysisRoot = operation;
+    if (auto module = operation->getParentOfType<ModuleOp>())
+      analysisRoot = module;
+    if (failed(solver->initializeAndRun(analysisRoot))) {
       llvm_unreachable("failed to run SharedMemoryAliasAnalysis");
     }
     operation->walk<WalkOrder::PreOrder>([&](Operation *op) {
@@ -375,7 +419,7 @@ private:
       for (auto *buffer : buffers) {
         auto minId = range.start();
         auto maxId = range.end();
-        if (bufferRange.count(buffer)) {
+        if (bufferRange.contains(buffer)) {
           // Extend the allocated buffer's range
           minId = std::min(minId, bufferRange[buffer].start());
           maxId = std::max(maxId, bufferRange[buffer].end());
@@ -402,16 +446,10 @@ private:
           continue;
         }
 
-        if (op && isa<mlir::triton::gpu::WarpSpecializeOp>(op)) {
-          bufferRange.insert(
-              {buffer, Interval((size_t)0, (size_t)operationId.size())});
-        } else {
-
-          // Any scratch memory's live range is the current operation's live
-          // range.
-          bufferRange.insert(
-              {buffer, Interval(operationId.at(op), operationId.at(op) + 1)});
-        }
+        // Any scratch memory's live range is the current operation's live
+        // range.
+        bufferRange.insert(
+            {buffer, Interval(operationId.at(op), operationId.at(op) + 1)});
         LLVM_DEBUG({
           llvm::dbgs() << "-- buffer " << buffer->id << "; value: ";
           op->dump();

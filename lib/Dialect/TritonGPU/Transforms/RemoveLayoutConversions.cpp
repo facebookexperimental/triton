@@ -257,7 +257,7 @@ public:
   bool backwardRematerialization(ConvertLayoutOp convertOp,
                                  bool disableRematSplitting);
 
-  // TODO: Merge the three hoistConvert*(); functions as they are duplicate code
+  void runHoistConvertPass(std::function<bool(ConvertLayoutOp)> tryHoist);
   void hoistConvertDotOperand();
   void hoistConvertOnTopOfExtOrBroadcast(
       const DenseSet<Operation *> *forceHoists = nullptr);
@@ -488,8 +488,8 @@ bool isLayoutAnchor(Operation *op) {
   // local_load is expensive as it reads from shared memory with specific layout
   if (isa<triton::gpu::LocalLoadOp>(op))
     return isExpensiveLocalLoad(op);
-  if (isa<DotOp, DotScaledOp, nvidia_gpu::WarpGroupDotOp, AtomicRMWOp,
-          AtomicCASOp, triton::nvidia_gpu::TMEMLoadOp>(op) ||
+  if (isa<DotOp, DotScaledOp, nvidia_gpu::WarpGroupDotOp, AtomicOpInterface,
+          triton::nvidia_gpu::TMEMLoadOp>(op) ||
       op->getName().getStringRef() == "tti.dot_i8")
     return true;
   if (auto gatherOp = dyn_cast<GatherOp>(op))
@@ -675,8 +675,8 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
     }
     if (user->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
         user->hasTrait<OpTrait::Elementwise>() ||
-        isa<ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp>(
-            user)) {
+        isa<BroadcastOp, ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp,
+            SplitOp>(user)) {
       setEncoding(user->getResults(), info, changed, user);
       continue;
     }
@@ -725,15 +725,18 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
       continue;
     srcTy = srcTy.cloneWithEncoding(srcEnc);
     auto dstTy = srcTy.cloneWithEncoding(physicalEncoding);
-    // Skip encodings without modular layout support.
-    if (!npotCvtSafe(srcTy, dstTy))
-      continue;
     // Leave force_shuffle absent so this detached op models the default path.
     OperationState state(op->getLoc(), ConvertLayoutOp::getOperationName());
     state.addOperands(operand);
     state.addTypes(dstTy);
     Operation *hypotheticalOp = Operation::create(state);
     auto cvt = cast<ConvertLayoutOp>(hypotheticalOp);
+    // A mixed-radix convert is sized by its plan, as the allocator sizes it.
+    if (auto bytes = getMixedRadixConversionScratchBytes(cvt)) {
+      hypotheticalOp->destroy();
+      cost += *bytes;
+      continue;
+    }
     bool needsSharedMemory = cvtNeedsSharedMemory(cvt);
     hypotheticalOp->destroy();
     if (needsSharedMemory) {
@@ -1633,9 +1636,8 @@ void LayoutPropagation::resolveConflicts() {
       continue;
     }
     Attribute encoding = *info.encodings.begin();
-    bool isLoadOrStore =
-        op && isa<LoadOp, StoreOp, AtomicRMWOp, AtomicCASOp>(op);
-    if (op && isa<AtomicRMWOp, AtomicCASOp>(op) && !axisInfoAnalysis)
+    bool isLoadOrStore = op && isa<LoadOp, StoreOp, AtomicOpInterface>(op);
+    if (op && isa<AtomicOpInterface>(op) && !axisInfoAnalysis)
       axisInfoAnalysis = std::make_unique<ModuleAxisInfoAnalysis>(
           funcOp->getParentOfType<ModuleOp>());
     // Rank lexicographically: widest single relayout, then total relayout
@@ -1649,7 +1651,7 @@ void LayoutPropagation::resolveConflicts() {
     // Atomics are excluded for a different reason: score.first is the vector
     // width the hardware will actually issue, and cost will trade it away --
     // see @atomic_vector_width_beats_relayout_cost.
-    bool costRankable = !(op && isa<AtomicRMWOp, AtomicCASOp>(op)) &&
+    bool costRankable = !(op && isa<AtomicOpInterface>(op)) &&
                         llvm::none_of(info.encodings, [](Attribute e) {
                           e = getEffectiveLayoutEncoding(e);
                           return isa<MmaEncodingTrait, DotOperandEncodingAttr,
@@ -1792,8 +1794,7 @@ void LayoutPropagation::rewriteRegion(Region &region) {
         // If we don't need to rewrite the op we still need to remap the
         // operands.
         for (OpOperand &operand : op.getOpOperands()) {
-          auto it = layouts.find(operand.get());
-          if (it == layouts.end())
+          if (!layouts.contains(operand.get()))
             continue;
           Attribute encoding = getEncodingBeforeRewrite(operand.get());
           Value newOperand = getValueAs(operand.get(), encoding);
@@ -1832,7 +1833,7 @@ Attribute LayoutPropagation::getEncodingBeforeRewrite(Value value) const {
 
 void LayoutPropagation::setEncodingInPlace(Value value, Attribute encoding) {
   auto tensorType = cast<RankedTensorType>(value.getType());
-  if (!originalEncodings.count(value))
+  if (!originalEncodings.contains(value))
     originalEncodings[value] = tensorType.getEncoding();
   value.setType(tensorType.cloneWithEncoding(encoding));
 }
@@ -2038,9 +2039,9 @@ void LayoutPropagation::rewriteOp(Operation *op) {
       setEncodingInPlace(op->getResult(0), encoding);
     } else if (op->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
                op->hasTrait<OpTrait::Elementwise>() ||
-               isa<ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp,
-                   GatherOp, ConvertLayoutOp, nvidia_gpu::WarpGroupDotWaitOp>(
-                   op)) {
+               isa<BroadcastOp, ReduceOp, ExpandDimsOp, ReshapeOp, TransOp,
+                   JoinOp, SplitOp, GatherOp, ConvertLayoutOp,
+                   nvidia_gpu::WarpGroupDotWaitOp>(op)) {
       rewriteGenericOpInPlace(op, encoding);
     } else {
       llvm::report_fatal_error("unexpected op in rewrite");
@@ -2123,7 +2124,7 @@ void LayoutRematerialization::rewriteSlice(
   opsToRewrite = mlir::topologicalSort(opsToRewrite);
 
   // replaceAllUsesWith calls delayed until after initial rewrite.
-  // This is required for slice.count(value) to work mid rewrite.
+  // This is required for slice.contains(value) to work mid rewrite.
   SmallVector<std::tuple<Value, Value>> replacements;
 
   SmallVector<Operation *> deadOps;
@@ -2134,7 +2135,7 @@ void LayoutRematerialization::rewriteSlice(
       SmallVector<std::pair<size_t, size_t>> argMapping;
       SmallVector<Value> newOperands;
       for (auto arg : forOp.getRegionIterArgs()) {
-        if (slice.count(arg)) {
+        if (slice.contains(arg)) {
           OpOperand &initVal = *forOp.getTiedLoopInit(arg);
           argMapping.push_back(std::make_pair(
               forOp.getTiedLoopResult(&initVal).getResultNumber(),
@@ -2169,7 +2170,7 @@ void LayoutRematerialization::rewriteSlice(
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
       SmallVector<Type> newTypes;
       for (auto res : ifOp.getResults()) {
-        if (slice.count(res)) {
+        if (slice.contains(res)) {
           auto it = layout.find(res);
           assert(it != layout.end());
 
@@ -2183,7 +2184,7 @@ void LayoutRematerialization::rewriteSlice(
       unsigned oldIdx = 0;
       unsigned newIdx = ifOp.getNumResults();
       for (auto res : ifOp.getResults()) {
-        if (slice.count(res)) {
+        if (slice.contains(res)) {
           // Why can't we use res instead of ifOp.getResult(oldIdx)?
           mapping.map(ifOp.getResult(oldIdx), newIfOp.getResult(newIdx));
           addRematValue(ifOp.getResult(oldIdx), layout[res],
@@ -2233,8 +2234,9 @@ void LayoutRematerialization::rewriteSlice(
   }
   // Add the rewritten convert to the replacements so it is removed from the
   // remat maps and has its uses replaced like the other ops we delete.
+  // A source already in the target encoding has no mapping.
   replacements.emplace_back(convertOp.getResult(),
-                            mapping.lookup(convertOp.getSrc()));
+                            mapping.lookupOrDefault(convertOp.getSrc()));
 
   updateRematMapping(replacements);
   for (auto &kv : replacements) {
@@ -2334,16 +2336,13 @@ bool LayoutRematerialization::backwardRematerialization(
   return changed;
 }
 
-void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
-    const DenseSet<Operation *> *forceHoists) {
-  // Go through each ConvertLayoutOp.
+void LayoutRematerialization::runHoistConvertPass(
+    std::function<bool(ConvertLayoutOp)> tryHoist) {
   SmallVector<ConvertLayoutOp> convertOps;
   funcOp.walk(
       [&](ConvertLayoutOp convertOp) { convertOps.push_back(convertOp); });
   for (ConvertLayoutOp convertOp : convertOps) {
-    bool forceHoist =
-        forceHoists && forceHoists->contains(convertOp.getOperation());
-    if (!hoistConvertOnTopOfExtOrBroadcast(convertOp, forceHoist)) {
+    if (!tryHoist(convertOp)) {
       // If the conversion didn't get removed, consider it for reuse in future
       // backward slices.
       addRematValue(convertOp.getSrc(), convertOp.getType().getEncoding(),
@@ -2354,31 +2353,24 @@ void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
 
 void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
     bool disableRematSplitting) {
-  SmallVector<ConvertLayoutOp> convertOps;
-  funcOp.walk(
-      [&](ConvertLayoutOp convertOp) { convertOps.push_back(convertOp); });
-  for (ConvertLayoutOp convertOp : convertOps) {
-    if (!hoistConvertOnTopOfExtOrBroadcast(convertOp, /*forceHoist=*/false,
-                                           disableRematSplitting)) {
-      addRematValue(convertOp.getSrc(), convertOp.getType().getEncoding(),
-                    convertOp.getResult());
-    }
-  }
+  runHoistConvertPass([&](ConvertLayoutOp convertOp) {
+    return hoistConvertOnTopOfExtOrBroadcast(convertOp, /*forceHoist=*/false,
+                                             disableRematSplitting);
+  });
 }
 
+void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
+    const DenseSet<Operation *> *forceHoists) {
+  runHoistConvertPass([&](ConvertLayoutOp convertOp) {
+    bool forceHoist =
+        forceHoists && forceHoists->contains(convertOp.getOperation());
+    return hoistConvertOnTopOfExtOrBroadcast(convertOp, forceHoist);
+  });
+}
 void LayoutRematerialization::hoistConvertIntoConditionals() {
-  // Go through each ConvertLayoutOp.
-  SmallVector<ConvertLayoutOp> convertOps;
-  funcOp.walk(
-      [&](ConvertLayoutOp convertOp) { convertOps.push_back(convertOp); });
-  for (ConvertLayoutOp convertOp : convertOps) {
-    if (!hoistConvertIntoConditionals(convertOp)) {
-      // If the conversion didn't get removed, consider it for reuse in future
-      // backward slices.
-      addRematValue(convertOp.getSrc(), convertOp.getType().getEncoding(),
-                    convertOp.getResult());
-    }
-  }
+  runHoistConvertPass([&](ConvertLayoutOp convertOp) {
+    return hoistConvertIntoConditionals(convertOp);
+  });
 }
 
 static bool isExpensiveMathOp(Operation *op) {
@@ -2643,18 +2635,9 @@ bool LayoutRematerialization::backwardRematerialization(
 }
 
 void LayoutRematerialization::hoistConvertDotOperand() {
-  // Go through each ConvertLayoutOp.
-  SmallVector<ConvertLayoutOp> convertOps;
-  funcOp.walk(
-      [&](ConvertLayoutOp convertOp) { convertOps.push_back(convertOp); });
-  for (ConvertLayoutOp convertOp : convertOps) {
-    if (!hoistConvertDotOperand(convertOp)) {
-      // If the conversion didn't get removed, consider it for reuse in future
-      // backward slices.
-      addRematValue(convertOp.getSrc(), convertOp.getType().getEncoding(),
-                    convertOp.getResult());
-    }
-  }
+  runHoistConvertPass([&](ConvertLayoutOp convertOp) {
+    return hoistConvertDotOperand(convertOp);
+  });
 }
 
 bool LayoutRematerialization::hoistConvertDotOperand(
@@ -2700,7 +2683,7 @@ bool LayoutRematerialization::hoistConvertDotOperand(
   // threads We do views and elementwise pure ops for now
   auto noDataMovement = [](Operation *op) {
     return (op->hasTrait<OpTrait::Elementwise>() && isMemoryEffectFree(op)) ||
-           isa<BroadcastOp, Fp4ToFpOp, ConvertLayoutOp, UpcastFpOpInterface>(
+           isa<BroadcastOp, Fp4ToFpOp, ConvertLayoutOp, CastFpOpInterface>(
                op) ||
            isView(op);
   };
@@ -2749,14 +2732,14 @@ bool LayoutRematerialization::hoistConvertDotOperand(
     auto type = dyn_cast<RankedTensorType>(loadOp->getResult(0).getType());
     if (!type)
       continue;
+    // If there is nothing to remat between the leaf op and the convert, we are
+    // done.
+    if (innerSlice.empty())
+      return false;
     auto newType = type.cloneWithEncoding(layout[loadOp->getResult(0)]);
     auto newConvertOp = ConvertLayoutOp::create(builder, convertOp.getLoc(),
                                                 newType, loadOp->getResult(0));
     mapping.map(loadOp->getResult(0), newConvertOp.getResult());
-  }
-
-  if (innerSlice.empty()) {
-    return false;
   }
 
   LLVM_DEBUG({
@@ -3060,7 +3043,7 @@ struct PruneLocalStoreOfReshapeConvert : public OpRewritePattern<LocalStoreOp> {
       return failure();
     if (failed(layoutInterface->inferReshapeOpEncoding(
             srcType.getShape(), srcType.getEncoding(), storeSrcType.getShape(),
-            reshapeEncoding, /*allowReorder=*/false, store.getLoc())))
+            reshapeEncoding, /*allowReorder=*/false, /*loc=*/std::nullopt)))
       return failure();
 
     auto reshapeType =
@@ -3203,11 +3186,6 @@ public:
       // Collect converts whose scratch would push SMEM over budget.
       SmallVector<ConvertLayoutOp> candidates;
       funcOp->walk([&](ConvertLayoutOp cvt) {
-        auto srcTy = cvt.getSrc().getType();
-        auto dstTy = cvt.getType();
-        // Skip encodings without modular layout support.
-        if (!npotCvtSafe(srcTy, dstTy))
-          return;
         if (!cvtNeedsSharedMemory(cvt))
           return;
         candidates.push_back(cvt);

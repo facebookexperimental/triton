@@ -73,7 +73,7 @@ import os
 import sys
 from triton.tlx import ops
 assert 'triton.tlx.ops.kernels.grouped_gemm.gfx950' not in sys.modules
-assert str(inspect.signature(ops.grouped_gemm)) == '(group_a, group_b)'
+assert str(inspect.signature(ops.grouped_gemm)) == '(group_a, group_b, *, space=None)'
 assert 'grouped_gemm' in ops.__all__
 os.environ.pop('TRITON_DISABLE_POST_MISCHED', None)
 from triton.tlx.ops.kernels.grouped_gemm import gfx950

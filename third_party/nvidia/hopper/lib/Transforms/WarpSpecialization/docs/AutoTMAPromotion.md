@@ -123,8 +123,10 @@ or atomic needs:
 - No loop-advanced dimension.
 - A mask that is exactly a rectangle, `AND_d(offs_d < E_d)`
   (`storeMaskIsRectangular`).
-- For `tt.atomic_rmw`: an `add`/`fadd` with relaxed semantics and an unused
-  result.
+- For `tt.atomic_rmw`: an `add`/`fadd` with relaxed semantics, an unused
+  result, and a tensor value whose element type TMA reduce-add supports (i32,
+  signless i64, f32, f16, bf16; `AsyncTMAReduceOp::isSupportedReduceKind`).
+  f64 and scalar atomics stay `tt.atomic_rmw`.
 
 Store descriptors in device mode are deduplicated so that subtiled stores to
 one output share a descriptor, which lets the memory planner fuse their

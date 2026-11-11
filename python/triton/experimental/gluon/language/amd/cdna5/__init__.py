@@ -2,7 +2,8 @@ from triton.runtime.jit import constexpr_function
 from triton._C.libtriton.gluon_ir import get_amd_wmma_scale_layout as _get_wmma_scale_layout
 
 from ..._core import builtin, int8, uint8, int32, float8e4nv, tensor, _unwrap_if_constexpr
-from .._ops import _load_shared_fp4_repacked, _wmma, _verify_wmma, _mma_scaled, _scaled_upcast
+from .._ops import (_load_shared_fp4_repacked, _wmma, _verify_wmma, _mma_scaled, _scaled_upcast, scaled_downcast,
+                    get_scaled_upcast_fp4_scale_layout)
 from .._layouts import AMDWMMALayout
 from ..cdna3 import buffer_load, buffer_store
 from ._layouts import PartitionedSharedLayout, make_partitioned_dot_layouts
@@ -12,8 +13,9 @@ from . import mbarrier
 from . import cluster
 
 __all__ = [
-    "async_copy", "tdm", "mbarrier", "cluster", "wmma", "wmma_scaled", "scaled_upcast", "buffer_load", "buffer_store",
-    "get_wmma_scale_layout", "PartitionedSharedLayout", "make_partitioned_dot_layouts", "load_shared_fp4_repacked"
+    "async_copy", "tdm", "mbarrier", "cluster", "wmma", "wmma_scaled", "scaled_upcast", "scaled_downcast",
+    "buffer_load", "buffer_store", "get_wmma_scale_layout", "PartitionedSharedLayout", "make_partitioned_dot_layouts",
+    "load_shared_fp4_repacked", "get_scaled_upcast_fp4_scale_layout"
 ]
 
 
@@ -31,15 +33,19 @@ def wmma(a, b, acc, _semantic=None):
 
 
 # List all valid combinations directly for readability
+# Gap (followup required): FP6 (e2m3/e3m2) paired with FP4 (e2m1) is
+# only accepted with e8m0 scales on both sides. The mixed rows below
+# keep FP6 out of the per-group (e4m3) scale combinations until the
+# scale-layout helpers are validated for FP6-with-FP4 scales.
 _valid_dtype_combinations = set([(dtype_a, dtype_b, "e8m0", "e8m0")
-                                 for dtype_a in ("e4m3", "e5m2", "e2m1")
-                                 for dtype_b in ("e4m3", "e5m2", "e2m1")] + [(dtype_a, "e2m1", "e8m0", dtype_b_scale)
-                                                                             for dtype_a in ("e4m3", "e5m2")
-                                                                             for dtype_b_scale in ("e4m3", )] +
-                                [("e2m1", dtype_b, dtype_a_scale, "e8m0")
-                                 for dtype_b in ("e4m3", "e5m2")
-                                 for dtype_a_scale in ("e4m3", )] + [("e2m1", "e2m1", dtype_scale, dtype_scale)
-                                                                     for dtype_scale in ("e4m3", )])
+                                 for dtype_a in ("e4m3", "e5m2", "e2m1", "e2m3", "e3m2")
+                                 for dtype_b in ("e4m3", "e5m2", "e2m1", "e2m3", "e3m2")] +
+                                [(dtype_a, "e2m1", "e8m0", dtype_b_scale)
+                                 for dtype_a in ("e4m3", "e5m2")
+                                 for dtype_b_scale in ("e4m3", )] + [("e2m1", dtype_b, dtype_a_scale, "e8m0")
+                                                                     for dtype_b in ("e4m3", "e5m2")
+                                                                     for dtype_a_scale in ("e4m3", )] +
+                                [("e2m1", "e2m1", dtype_scale, dtype_scale) for dtype_scale in ("e4m3", )])
 
 
 @builtin
@@ -59,11 +65,11 @@ def wmma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, _semantic=None)
         a (tensor): The operand A to be multiplied.
         a_scale (Optional[tensor]): Scale factor for operand A.
         a_format (str): Format of operand A. Available formats: ``e2m1``,
-            ``e4m3``, ``e5m2``.
+            ``e2m3``, ``e3m2``, ``e4m3``, ``e5m2``.
         b (tensor): The operand B to be multiplied.
         b_scale (Optional[tensor]): Scale factor for operand B.
         b_format (str): Format of operand B. Available formats: ``e2m1``,
-            ``e4m3``, ``e5m2``.
+            ``e2m3``, ``e3m2``, ``e4m3``, ``e5m2``.
         acc (tensor): Accumulator tensor.
     """
     _verify_wmma(3, a, b, acc)
@@ -80,6 +86,17 @@ def wmma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, _semantic=None)
         wmma_layout = b.type.layout.parent
         assert isinstance(wmma_layout, AMDWMMALayout) and wmma_layout.instr_shape in [[16, 16, 64], [32, 16, 64]], \
             "e2m1 format expects instr_shape to be [16, 16, 64] or [32, 16, 64]"
+    # [16, 16, 96] is K in packed bytes (128 logical FP6 values x 3/4).
+    # TTGIR WMMA instruction shapes use power-of-2 logical sizes, so
+    # this needs an NPOT layout for K.
+    if a_format in ("e2m3", "e3m2"):
+        wmma_layout = a.type.layout.parent
+        assert isinstance(wmma_layout, AMDWMMALayout) and wmma_layout.instr_shape in [[16, 16, 96]], \
+            "e2m3/e3m2 format expects instr_shape to be [16, 16, 96]"
+    if b_format in ("e2m3", "e3m2"):
+        wmma_layout = b.type.layout.parent
+        assert isinstance(wmma_layout, AMDWMMALayout) and wmma_layout.instr_shape in [[16, 16, 96]], \
+            "e2m3/e3m2 format expects instr_shape to be [16, 16, 96]"
     acc_shapes = [[16, 16, 128]]
     if a_format == "e2m1" and b_format == "e2m1":
         acc_shapes.append([32, 16, 128])
@@ -88,8 +105,8 @@ def wmma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, _semantic=None)
     assert isinstance(acc_layout, AMDWMMALayout) and acc_layout.instr_shape in acc_shapes, \
         f"accumulator tensor's layout must be one of {acc_shapes}"
 
-    assert a_format in {"e2m1", "e4m3", "e5m2"}, f"Unsupported lhs_format: {a_format}"
-    assert b_format in {"e2m1", "e4m3", "e5m2"}, f"Unsupported rhs_format: {b_format}"
+    assert a_format in {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}, f"Unsupported lhs_format: {a_format}"
+    assert b_format in {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}, f"Unsupported rhs_format: {b_format}"
 
     scale_dtype_to_format = {float8e4nv: "e4m3"}
 
@@ -130,10 +147,9 @@ def scaled_upcast(src, scale, elem_type, axis=None, _semantic=None):
 
     * **Expanded scale:** one scale per output value. For example, fp4 bytes
       ``[M, K / 2]`` produce output ``[M, K]`` with scale ``[M, K]``.
-    * **Compact scale:** one scale per native scale block. For example, with
+    * **Compact scale:** one scale per scale block. For example, with
       ``axis=1`` and a 32-element scale block, output ``[M, K]`` uses scale
-      ``[M, K / 32]``. CDNA5 preserves those scale bytes in the native
-      ``cvt.scale.pk8`` payload form.
+      ``[M, K / 32]``.
 
     """
     axis = _unwrap_if_constexpr(axis)
@@ -184,6 +200,6 @@ def get_wmma_scale_layout(dot_operand_layout, shape, scale_factor=32):
     transposed = parent.transposed
     reg_bases = parent.reg_bases
     warp_bases = parent.warp_bases
-    cga_bases = parent.cga_layout
+    cga_bases = [list(basis) for basis in dot_operand_layout.cga_layout]
     return _get_wmma_scale_layout_impl(op_idx, shape, mdim, ndim, transposed, scale_factor, reg_bases, warp_bases,
                                        cga_bases)

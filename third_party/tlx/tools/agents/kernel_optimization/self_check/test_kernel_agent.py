@@ -35,6 +35,7 @@ from ..contracts import (
     Decision,
     DecisionStatus,
     ExperimentKind,
+    ExperimentSummary,
     InputCase,
     KernelOptimizationRequest,
     KernelOptimizationResult,
@@ -43,6 +44,7 @@ from ..contracts import (
     PerformanceSummary,
     PriorExperimentEvidence,
     PriorRunEvidence,
+    ResearchEvidence,
     TimingSamples,
     VerificationResult,
 )
@@ -53,6 +55,7 @@ from ..decision_maker.policy import (
     preflight_decision,
     weighted_geometric_speedup,
 )
+from ..decision_maker.optimization_suites import GFX942_MM_OPTIMIZATION_SUITES
 from ..decision_maker.orchestrator import KernelOptimizer, _profile_log_parts
 from ..decision_maker.tuning import (
     _parity_summary,
@@ -63,12 +66,16 @@ from ..decision_maker.tuning import (
 )
 from ..decision_maker.profiling import ProfileRequest
 from ..optimizer.agent import (
+    AgentDiagnosticRequest,
+    AgentSourceResearchRequest,
+    MAX_RECENT_EXPERIMENTS,
     CandidateContext,
     CandidateProposal,
     FixedCandidateProvider,
     MockLLMProvider,
     _build_prompt,
     _read_candidate_metadata,
+    _search_context_prompt_block,
 )
 from ..optimizer.source import (
     apply_candidate_diff,
@@ -85,6 +92,68 @@ _TARGETS_ROOT = Path(target_registry.__file__).resolve().parent
 
 
 class ScoringTest(unittest.TestCase):
+
+    def test_search_context_defaults_preserve_positional_callers(self) -> None:
+        context = CandidateContext(1, 0, "VALUE = 1\n", _performance(("a", 100.0)), ())
+        self.assertIsNone(context.incumbent_experiment)
+        self.assertEqual(context.recent_experiments, ())
+        self.assertIsNone(context.remaining_seconds)
+        self.assertFalse(context.candidate_only)
+
+    def test_search_context_json_is_bounded_and_omits_artifacts(self) -> None:
+        text = 'quoted "hypothesis"\n' + "x" * 10000
+        performance = _performance(*((f"case-{i}" + text, 80.0) for i in range(40)))
+        experiment = ExperimentSummary(
+            "incumbent",
+            1,
+            "baseline",
+            "promoted",
+            Path("/tmp/private/source.py"),
+            hypothesis=text,
+            mutation_summary=text,
+            diagnostics=text,
+            evidence=text,
+            expected_effect=text,
+            risk=text,
+            performance=replace(performance, aggregate_speedup=1.25),
+            decision=Decision(DecisionStatus.PROMOTE, text, text),
+            incremental_patch_path=Path("/tmp/private/change.patch"),
+            commit_summary="SECRET_SOURCE = 1",
+            profile_path=Path("/tmp/private/profile.json"),
+        )
+        context = CandidateContext(
+            2,
+            0,
+            "SECRET_SOURCE = 1",
+            performance,
+            (),
+            incumbent_experiment=experiment,
+            recent_experiments=tuple(
+                replace(experiment, experiment_id=f"trial-{i}") for i in range(30)
+            ),
+            remaining_seconds=float("inf"),
+        )
+        block = _search_context_prompt_block(context)
+        payload = json.loads(block.split("```json\n", 1)[1].split("\n```", 1)[0])
+        self.assertEqual(payload["incumbent"]["experiment_id"], "incumbent")
+        self.assertEqual(payload["incumbent"]["baseline_relative_speedup"], 1.25)
+        self.assertEqual(len(payload["recent_experiments"]), MAX_RECENT_EXPERIMENTS)
+        self.assertEqual(payload["recent_experiments"][0]["experiment_id"], "trial-22")
+        self.assertEqual(len(payload["incumbent"]["hypothesis"]), 240)
+        self.assertIn('quoted "hypothesis"\n', payload["incumbent"]["hypothesis"])
+        self.assertEqual(len(payload["incumbent"]["cases"]), 16)
+        self.assertEqual(len(payload["incumbent"]["cases"][0]["case_id"]), 240)
+        self.assertIsNone(payload["remaining_seconds_including_baseline_cost"])
+        self.assertLess(len(block), 100000)
+        for excluded in (
+            "/tmp/private",
+            "SECRET_SOURCE",
+            "samples_us",
+            "source_path",
+            "profile_path",
+        ):
+            self.assertNotIn(excluded, block)
+
     def test_each_ablation_kind_records_signal(self) -> None:
         performance = PerformanceSummary(
             cases=_performance(("a", 50.0)).cases,
@@ -1369,6 +1438,41 @@ class CliTest(unittest.TestCase):
         self.assertTrue(args.govern)
         self.assertEqual(_resolve_task(args), "tuning")
 
+    def test_gfx942_kernel_authoring_groups_are_disjoint(self) -> None:
+        # Each group targets one structural bottleneck and drives its own
+        # authoring run. A shared shape could get conflicting kernel changes on
+        # one dispatch path and be credited by both runs. Exact counts force a
+        # new shape into one group on purpose. The group_b_* slices overlap
+        # group_b by design and are not checked.
+        groups = {
+            name: production_cases("mm", name)
+            for name in (
+                "gfx942_group_a",
+                "gfx942_group_b",
+                "gfx942_group_c",
+                "gfx942_group_d",
+            )
+        }
+        self.assertEqual({name: len(cases) for name, cases in groups.items()}, {
+            "gfx942_group_a": 24,
+            "gfx942_group_b": 7,
+            "gfx942_group_c": 3,
+            "gfx942_group_d": 1,
+        })
+        case_ids = [
+            case.case_id
+            for cases in groups.values()
+            for case in cases
+        ]
+        self.assertEqual(len(case_ids), len(set(case_ids)))
+
+    @unittest.skipUnless(importlib.util.find_spec("triton"), "production shapes require triton")
+    def test_gfx942_kernel_authoring_groups_come_from_production_shapes(self) -> None:
+        production = {case.case_id for case in production_cases("mm", "gfx942_all")}
+        for name in GFX942_MM_OPTIMIZATION_SUITES:
+            cohort = {case.case_id for case in production_cases("mm", name)}
+            self.assertLessEqual(cohort, production, name)
+
     def test_tune_after_authoring_is_explicit_and_infers_authoring(self) -> None:
         args = _parse_args(
             [
@@ -1971,6 +2075,304 @@ class CommitBodyTest(unittest.TestCase):
 
 
 class KernelOptimizerTest(unittest.TestCase):
+
+    def test_source_research_action_is_collected_before_candidate(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        candidate_source = "LATENCY_US = 80\nCORRECT = True\n"
+        contexts = []
+
+        class Provider:
+            def propose(self, request, context):
+                del request
+                contexts.append(context)
+                if not context.research_evidence:
+                    return AgentSourceResearchRequest(
+                        source_digest=source_digest(context.current_source),
+                        question="Which nearby kernel uses a structural schedule?",
+                        rationale="The local parameter search is saturated.",
+                    )
+                return CandidateProposal(
+                    candidate_source,
+                    "use the researched structural schedule",
+                    research_evidence_ids=(context.research_evidence[0].action_id, ),
+                )
+
+        class ResearchProvider:
+            def research(self, request, context):
+                return ResearchEvidence(
+                    action_id=context.action_id,
+                    status="collected",
+                    source_digest=request.source_digest,
+                    question=request.question,
+                    rationale=request.rationale,
+                    findings=("A nearby kernel uses a persistent row schedule.", ),
+                )
+
+        harness_path = Path(__file__).with_name("fixtures") / "fake_harness.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel_path = root / "kernel.py"
+            kernel_path.write_text(baseline_source)
+            result = KernelOptimizer(
+                Provider(), source_research_provider=ResearchProvider()
+            ).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=harness_path,
+                    cases=(InputCase("a", {}), ),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=root / "out",
+                    kernel_path=kernel_path,
+                    repository_root=root,
+                )
+            )
+
+        self.assertEqual(len(contexts), 2)
+        self.assertEqual(len(contexts[1].research_evidence), 1)
+        self.assertTrue(result.success)
+        self.assertEqual(result.best_kernel, candidate_source)
+
+    def test_diagnostic_budgets_are_charged_per_tool(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        contexts = []
+
+        class Provider:
+            def propose(self, request, context):
+                del request
+                contexts.append(context)
+                if not context.diagnostic_evidence:
+                    return AgentDiagnosticRequest(
+                        tool="proton",
+                        source_digest=source_digest(context.current_source),
+                        case_ids=("a", ),
+                        question="Which role waits longest?",
+                        rationale="Wait time is unattributed.",
+                        proton_passes=("role", "wait"),
+                    )
+                return CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "faster")
+
+        harness_path = Path(__file__).with_name("fixtures") / "fake_harness.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            KernelOptimizer(Provider()).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=harness_path,
+                    cases=(InputCase("a", {}), ),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=root / "out",
+                )
+            )
+
+        budget = OptimizationBudget()
+        self.assertEqual(len(contexts), 2)
+        self.assertEqual(
+            contexts[1].remaining_diagnostic_actions,
+            budget.max_diagnostic_actions_per_candidate - 1,
+        )
+        self.assertEqual(
+            contexts[1].remaining_ncu_collections,
+            budget.max_diagnostic_ncu_collections,
+        )
+        self.assertEqual(
+            contexts[1].remaining_proton_passes,
+            budget.max_diagnostic_proton_passes - 2,
+        )
+    def test_feedback_retains_incumbent_metadata_and_cross_round_budgets(self) -> None:
+        contexts: list[CandidateContext] = []
+        provider = Mock()
+        winner = CandidateProposal(
+            "VALUE = 2\n",
+            summary="change launch geometry",
+            hypothesis="legal neighbor improves utilization",
+            hypothesis_kind="parameter",
+            escalation_reason="measured source-derived hypothesis",
+            evidence="baseline timing",
+            expected_effect="less idle work",
+            risk="preserve masks",
+            commit_title="Change launch geometry",
+            commit_summary="preserved contract",
+        )
+
+        def propose(request, context):
+            contexts.append(context)
+            return (
+                winner
+                if len(contexts) == 1
+                else replace(winner, source=f"VALUE = {len(contexts) + 1}\n")
+            )
+
+        provider.propose.side_effect = propose
+        harness = Mock()
+        harness.evaluate.side_effect = (
+            [_performance(("a", 100.0)), _performance(("a", 80.0))]
+            + [_performance(("a", 120.0))] * 9
+            + [_performance(("a", 80.0))]
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(optimizer_module, "SubprocessHarness", return_value=harness),
+        ):
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    "VALUE = 1\n",
+                    Path(__file__),
+                    (InputCase("a", {}),),
+                    KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(max_rounds=2, candidates_per_round=5),
+                    output_dir=Path(directory),
+                )
+            )
+        self.assertTrue(result.success)
+        self.assertEqual(
+            [context.action_index for context in contexts], list(range(10))
+        )
+        self.assertEqual(
+            [context.remaining_agent_actions for context in contexts],
+            list(range(10, 0, -1)),
+        )
+        self.assertEqual(contexts[5].round_index, 2)
+        self.assertEqual(contexts[5].candidate_index, 0)
+        self.assertEqual(contexts[1].current_source, winner.source)
+        self.assertEqual(contexts[-1].current_source, winner.source)
+        incumbent = contexts[-1].incumbent_experiment
+        self.assertEqual(incumbent, result.experiments[1])
+        self.assertNotIn(incumbent, contexts[-1].recent_experiments)
+        self.assertEqual(len(contexts[-1].recent_experiments), MAX_RECENT_EXPERIMENTS)
+        for context in contexts:
+            self.assertTrue(context.candidate_only)
+            self.assertEqual(
+                context.remaining_diagnostic_actions,
+                OptimizationBudget().max_diagnostic_actions_per_candidate,
+            )
+            self.assertEqual(
+                context.remaining_source_research_actions,
+                min(
+                    OptimizationBudget().max_source_research_actions_per_candidate,
+                    OptimizationBudget().max_source_research_actions_total,
+                ),
+            )
+        for name in (
+            "hypothesis",
+            "hypothesis_kind",
+            "escalation_reason",
+            "evidence",
+            "expected_effect",
+            "risk",
+            "commit_title",
+            "commit_summary",
+        ):
+            self.assertEqual(getattr(incumbent, name), getattr(winner, name))
+        self.assertEqual(contexts[2].recent_experiments[-1].status, "rejected")
+        self.assertIn("rejected", contexts[2].previous_diagnostics[-1])
+
+    def test_remaining_time_counts_baseline_and_clamps_at_zero(self) -> None:
+        contexts: list[CandidateContext] = []
+        harness = Mock()
+        harness.evaluate.return_value = _performance(("a", 100.0))
+        provider = Mock()
+
+        def propose(request, context):
+            contexts.append(context)
+            raise RuntimeError("generation failed")
+
+        provider.propose.side_effect = propose
+        # Start, outer/inner checks, context; then inner check and context at deadline.
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(optimizer_module, "SubprocessHarness", return_value=harness),
+            patch.object(
+                optimizer_module.time,
+                "monotonic",
+                side_effect=[10.0, 35.0, 35.0, 35.0, 59.0, 65.0],
+            ),
+        ):
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    "VALUE = 1\n",
+                    Path(__file__),
+                    (InputCase("a", {}),),
+                    KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1, candidates_per_round=2, max_total_seconds=50.0
+                    ),
+                    output_dir=Path(directory),
+                )
+            )
+        self.assertEqual(
+            [context.remaining_seconds for context in contexts], [25.0, 0.0]
+        )
+        self.assertEqual(result.experiments[-1].status, "failed")
+
+    def test_post_proposal_failure_metadata_does_not_leak_to_generation_failure(
+        self,
+    ) -> None:
+        proposal = CandidateProposal(
+            "VALUE = 2\n",
+            summary="test neighbor",
+            hypothesis="reduce work",
+            hypothesis_kind="pipeline",
+            escalation_reason="source evidence",
+            research_evidence_ids=("research-1",),
+            evidence="measured stalls",
+            expected_effect="less waiting",
+            risk="barrier lifetime",
+            commit_title="Reduce waiting",
+            commit_summary="Change summary: preserve barriers",
+        )
+        harness = Mock()
+        harness.evaluate.side_effect = [
+            _performance(("a", 100.0)),
+            RuntimeError("build failed"),
+        ]
+        provider = Mock()
+        provider.propose.side_effect = [proposal, RuntimeError("generation failed")]
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(optimizer_module, "SubprocessHarness", return_value=harness),
+        ):
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    "VALUE = 1\n",
+                    Path(__file__),
+                    (InputCase("a", {}),),
+                    KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(max_rounds=1, candidates_per_round=2),
+                    output_dir=Path(directory),
+                )
+            )
+        failed, generation = result.experiments[1:]
+        self.assertEqual(failed.status, "failed")
+        self.assertIn("build failed", failed.diagnostics)
+        for name in (
+            "hypothesis",
+            "hypothesis_kind",
+            "escalation_reason",
+            "research_evidence_ids",
+            "evidence",
+            "expected_effect",
+            "risk",
+            "commit_title",
+            "commit_summary",
+        ):
+            self.assertEqual(getattr(failed, name), getattr(proposal, name))
+        self.assertEqual(failed.mutation_summary, proposal.summary)
+        self.assertEqual(generation.hypothesis_kind, "unknown")
+        self.assertEqual(generation.hypothesis, "")
+        self.assertEqual(generation.escalation_reason, "")
+        self.assertEqual(generation.research_evidence_ids, ())
+        self.assertEqual(generation.mutation_summary, "")
+        self.assertEqual(generation.commit_summary, "")
 
     def test_parity_tuning_refines_from_best_intermediate_tree(self) -> None:
         def performance(parity: float) -> PerformanceSummary:
@@ -2977,18 +3379,18 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertIn("proton.intra.dominant_wait=reduction_wait_dq:2.852us", parts)
         self.assertIn(f"proton.intra.trace={trace_path}", parts)
 
-    def test_profile_log_includes_fb_att_artifact(self) -> None:
+    def test_profile_log_includes_amd_att_artifact(self) -> None:
         parts = _profile_log_parts(
             {
-                "fb_att": {
+                "amd_att": {
                     "valid": True,
                     "artifacts": {"ui_directories": ["/tmp/gemm_0_ui"]},
                 }
             }
         )
 
-        self.assertIn("fb_att.valid=true", parts)
-        self.assertIn("fb_att.ui=/tmp/gemm_0_ui", parts)
+        self.assertIn("amd_att.valid=true", parts)
+        self.assertIn("amd_att.ui=/tmp/gemm_0_ui", parts)
 
     def test_diagnostic_proton_profiles_baseline_and_successful_final_only(
         self,

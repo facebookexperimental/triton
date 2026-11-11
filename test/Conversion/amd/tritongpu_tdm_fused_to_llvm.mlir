@@ -128,6 +128,47 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // TTG-LABEL: tdm_fused_scalar_address_selection
+  // LLVM-LABEL: tdm_fused_scalar_address_selection
+  // FOLD-LABEL: llvm.func @tdm_fused_scalar_address_selection
+  tt.func public @tdm_fused_scalar_address_selection(
+      %a: !tt.tensordesc<32x32xf16, #shared>,
+      %b: !tt.tensordesc<32x32xf16, #shared>,
+      %row_a: i32, %row_b: i32, %k: i32,
+      %da: !ttg.memdesc<32x32xf16, #shared, #smem, mutable>,
+      %db: !ttg.memdesc<32x32xf16, #shared, #smem, mutable>) {
+    // Each member's address ends with the same add of the inner offset %k,
+    // after its other offsets. Group 0 is selected per field, the global
+    // address as one i64, and is never bitcast. In a K loop LLVM can then
+    // hoist each member's invariant base address and factor the common
+    // advance out of the selection. Signed extension preserves negative
+    // descriptor-position updates.
+    // FOLD-NOT: llvm.bitcast
+    // FOLD: llvm.sext %arg2 : i32 to i64
+    // FOLD: %[[K:.*]] = llvm.sext %arg4 : i32 to i64
+    // FOLD: %[[K_ELEMS:.*]] = llvm.mul %[[K]], {{.*}} : i64
+    // FOLD: %[[K_BYTES:.*]] = llvm.mul %[[K_ELEMS]], {{.*}} : i64
+    // FOLD: llvm.add {{.*}}, %[[K_BYTES]] : i64
+    // FOLD: llvm.sext %arg3 : i32 to i64
+    // FOLD: llvm.add {{.*}}, %[[K_BYTES]] : i64
+    // FOLD-NOT: : i1, vector<4xi32>
+    // FOLD: llvm.select {{.*}} : i1, i64
+    // FOLD-NOT: : i1, vector<4xi32>
+    // FOLD: llvm.select {{.*}} : i1, vector<8xi32>
+    // FOLD-NOT: llvm.bitcast
+    // FOLD: llvm.call_intrinsic "llvm.amdgcn.tensor.load.to.lds"
+    %ad = amdg.update_tensor_descriptor %a add_offsets = [%row_a, %k] : !tt.tensordesc<32x32xf16, #shared>
+    %bd = amdg.update_tensor_descriptor %b add_offsets = [%row_b, %k] : !tt.tensordesc<32x32xf16, #shared>
+    %0 = amdg.async_tdm_fused_copy_global_to_local %ad, %bd into %da, %db {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<32x32xf16, #shared>, !tt.tensordesc<32x32xf16, #shared> -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>, !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // TTG-LABEL: tdm_fused_heterogeneous_members
   // LLVM-LABEL: tdm_fused_heterogeneous_members
   tt.func public @tdm_fused_heterogeneous_members(

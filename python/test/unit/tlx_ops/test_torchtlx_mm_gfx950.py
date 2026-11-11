@@ -1,14 +1,20 @@
-"""L1 correctness for the gfx950 TorchTLX ``mm`` provider."""
+"""L1 correctness for the gfx950 TorchTLX ``mm`` provider.
+
+Runs the hardware-agnostic synthetic cases plus the gfx950 focus suites. Other
+architectures' focus suites may contain layouts for which gfx950 cannot emit a
+TLX candidate, so they belong to their corresponding provider tests.
+"""
 
 import pytest
 import torch
+from torch._inductor import config
 import torch._inductor.kernel.mm as inductor_mm
 from torch._inductor.utils import fresh_cache
 from triton._internal_testing import is_hip_cdna4
 
 try:
     from triton.language.extra.tlx.inductor import gfx950_torch, tlx_config
-    from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
+    from triton.tlx.ops.kernels.mm._shapes import FOCUS, SYNTHETIC, operand
 except ImportError:  # not the fbtriton fork
     gfx950_torch = None
 
@@ -37,7 +43,11 @@ def test_forced_mode_assesses_only_tlx_candidates(monkeypatch):
     monkeypatch.setattr(inductor_mm, "autotune_select_algorithm", spy)
     x = torch.randn(512, 512, device="cuda", dtype=torch.float16)
     torch._dynamo.reset()
-    with fresh_cache(), tlx_config.patch(use_heuristic_config=True):
+    with (
+            fresh_cache(),
+            config.patch({"fx_graph_remote_cache": False}),
+            tlx_config.patch(use_heuristic_config=True),
+    ):
         gfx950_torch.mm(x, x, mode="force")
 
     assert seen, "mm did not reach the algorithm selector"
@@ -60,13 +70,12 @@ FAILED_SHAPES = {
     (2048, 25408, 10240, (10240, 1), (1, 10240), "bf16"),
     (819200, 192, 1024, (1024, 1), (192, 1), "fp16"),
     (4096, 242432, 1894, (1894, 1), (242432, 1), "fp16"),
-    (800, 1056, 589824, (589824, 1), (1056, 1), "bf16"),
 }
 
 
 def _cases():
-    entries = [] if gfx950_torch is None else CORRECTNESS_SHAPES
-    return [entry for entry in entries if tuple(entry) not in FAILED_SHAPES]
+    entries = [] if gfx950_torch is None else (*SYNTHETIC, *FOCUS.shapes("gfx950"))
+    return [entry for entry in dict.fromkeys(entries) if tuple(entry) not in FAILED_SHAPES]
 
 
 @pytest.mark.parametrize("M,N,K,a_strides,b_strides,dtype_name", _cases())
