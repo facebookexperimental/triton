@@ -1592,6 +1592,31 @@ static bool isRetypingReinterpret(Operation *op) {
           srcType.getShape() != dstType.getShape());
 }
 
+// Whether the source lowers this warp_specialize with direct warp-ID dispatch,
+// where each worker runs its partition once and exits, instead of parking the
+// workers in a dispatch loop until the kernel ends. The module records it as
+// ttg.single-warp-specialize: TLX's exclusive=True sets it in Fixup, and
+// AllocateWarpGroups, which runs before this printer in the compiler, sets it
+// for a single AutoWS warp_specialize. That condition is repeated here for
+// TTGIR printed before AllocateWarpGroups, such as a dumped .ttgir file.
+static bool usesSingleWarpSpecialize(Operation *wsOp) {
+  auto mod = wsOp->getParentOfType<ModuleOp>();
+  if (ttg::hasSingleWarpSpecialize(mod))
+    return true;
+  unsigned numWsOps = 0;
+  mod.walk([&](ttg::WarpSpecializeOp) { ++numWsOps; });
+  if (numWsOps != 1)
+    return false;
+  // kWarpSpecializeTagAttrName, which AutoWS puts on the loops it specializes.
+  return wsOp
+      ->walk([](Operation *inner) {
+        return inner->hasAttr("ttg.warp_specialize.tag")
+                   ? WalkResult::interrupt()
+                   : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
 // Retyping reinterprets inside a partition, hoisted to just before
 // tlx.async_tasks(): `reuse=` must name a top-level allocation, and inside a
 // partition the allocation is only a capture. Maps each op to the hoisted name.
@@ -1650,7 +1675,10 @@ void printWarpSpecialize(
   // Print "with tlx.async_tasks():"
   for (unsigned i = 0; i < indent; ++i)
     os << "  ";
-  os << "with tlx.async_tasks():\n";
+  os << "with tlx.async_tasks(";
+  if (usesSingleWarpSpecialize(op))
+    os << "exclusive=True";
+  os << "):\n";
 
   // Get the operands passed to warp_specialize
   SmallVector<Value> wsOperands;
