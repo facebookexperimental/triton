@@ -82,8 +82,7 @@ def main():
         f"Head `{args.head[:12]}` vs nightly baseline. ",
     ]
     verdict = "PASS"
-    baseline_date, baseline_path = pick_baseline(
-        args.history_dir, args.base_date, args.platform)
+    baseline_date, baseline_path = pick_baseline(args.history_dir, args.base_date, args.platform)
     if baseline_path is None:
         lines.append(f"No nightly baseline found — no signal. (Nightly release has no `*.{args.platform}.json` yet.)")
     elif not pr_cases:
@@ -93,10 +92,8 @@ def main():
             base_cases = load_cases(json.load(handle))
         stale_note = ""
         if baseline_date > args.base_date:
-            stale_note = (
-                f" (newest available; base {args.base_date} predates baseline history — "
-                "treat ratios with extra skepticism)"
-            )
+            stale_note = (f" (newest available; base {args.base_date} predates baseline history — "
+                          "treat ratios with extra skepticism)")
         lines[2] += f"Baseline `{baseline_date}.{args.platform}.json`{stale_note}."
         rows = []
         missing = 0
@@ -130,9 +127,7 @@ def main():
             "|---|---|---|---|",
         ]
         for row in rows[:10]:
-            lines.append(
-                f"| `{row['key']}` | {row['pr']:.1f} | {row['base']:.1f} | {row['ratio']:.3f} |"
-            )
+            lines.append(f"| `{row['key']}` | {row['pr']:.1f} | {row['base']:.1f} | {row['ratio']:.3f} |")
         if verdict == "INVESTIGATE":
             lines += [
                 "",
