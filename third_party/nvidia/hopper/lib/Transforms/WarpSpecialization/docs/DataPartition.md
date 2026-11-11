@@ -250,6 +250,27 @@ Data partitioning operates **after** task ID assignment. The offset parameter
 selects which task ID from the original array. This is how N consumer warp
 groups each get their slice of the data.
 
+### Partition-aware contraction schedules
+
+Most `tt.autows` annotations are cloned unchanged, except for channel buffer
+IDs, which are remapped to keep partitions disjoint. A two-group FA forward
+pipeline additionally needs a partition-aware contraction order to safely
+reuse its single-buffer QK tiles while overlapping adjacent iterations. The
+frontend marks QK and PV contractions with `two_cta_interleave_role`; after
+slicing gives each clone a concrete partition index, data partitioning emits:
+
+```text
+QK partition 0: stage 0, order 0
+PV partition 1: stage 1, order 1
+QK partition 1: stage 0, order 2
+PV partition 0: stage 0, order 3
+```
+
+This puts `QK0`, `QK1`, and `PV0` in the prologue, matches TLX's steady-state
+`QK0(next) -> PV1(previous) -> QK1(next) -> PV0(current)` issue order, and
+leaves `PV1` in the epilogue. The rewrite is opt-in and only applies when there
+are exactly two data partitions.
+
 ## Regression Tests
 
 - `test/Hopper/WarpSpecialization/ws_data_partition_inplace_acc_token.mlir`
