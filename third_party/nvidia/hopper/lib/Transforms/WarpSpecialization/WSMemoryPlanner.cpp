@@ -930,7 +930,7 @@ static std::optional<unsigned> getChannelAnnotationOperandIdx(StringRef name) {
     return 0;
   if (name == "opndB")
     return 1;
-  if (name == "opndD")
+  if (name == tt::kAutoWSOperandDTag)
     return 2;
   // In TCGen5MMAScaledOp, acc_dep is operand 3, so scales are operands 4/5.
   if (name == "opndAScale" || name == "opndA_scale")
@@ -952,9 +952,9 @@ parseChannelAnnotations(Operation *parentOp) {
   std::map<unsigned, std::pair<unsigned, Operation *>> bufferIdToInfo;
 
   parentOp->walk([&](Operation *op) {
-    if (!op->hasAttr("tt.autows"))
+    if (!op->hasAttr(tt::kAutoWSAnnotationAttrName))
       return;
-    auto attr = op->getAttrOfType<StringAttr>("tt.autows");
+    auto attr = op->getAttrOfType<StringAttr>(tt::kAutoWSAnnotationAttrName);
     if (!attr)
       return;
     auto parsed = llvm::json::parse(attr.getValue());
@@ -965,7 +965,7 @@ parseChannelAnnotations(Operation *parentOp) {
     auto *obj = parsed->getAsObject();
     if (!obj)
       return;
-    auto *channelsArr = obj->getArray("channels");
+    auto *channelsArr = obj->getArray(tt::kAutoWSChannelsKey);
     if (!channelsArr)
       return;
     for (auto &elem : *channelsArr) {
@@ -1042,7 +1042,8 @@ parseChannelAnnotations(Operation *parentOp) {
       }
 
       // Check for operand D annotated as SMEM (always TMEM).
-      if (ann.operand == "opndD" && ann.memType != "tmem") {
+      if (StringRef(ann.operand) == tt::kAutoWSOperandDTag &&
+          ann.memType != "tmem") {
         LDBG("WARNING: opndD must be tmem, got '" << ann.memType
                                                   << "' — correcting to tmem");
         ann.memType = "tmem";
@@ -1870,10 +1871,17 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
     // Pick the target with the lowest order (earliest last consumer).
     // Tiebreak: within the same linearOrder, prefer the target whose last
     // consumer appears earlier in program order (its SMEM is free sooner).
-    bool isBetter = false;
-    if (effectiveOrder < bestOrder.linearOrder) {
+    // Seed an unknown-order search only for TMA store staging.  Its consumers
+    // are outside the pipelined inner loop and therefore intentionally have no
+    // loop.stage; the code partitioner supplies the cross-tile WAR edge needed
+    // by allocation.reuseTarget.  Ordinary buffers still require a known
+    // order: allowing them through this fallback can create unsynchronized
+    // reuse chains and make the planner under-count their physical storage.
+    bool isBetter = best == nullptr &&
+                    (effectiveOrder != INT_MAX || candidate.tmaStaging != 0);
+    if (!isBetter && effectiveOrder < bestOrder.linearOrder) {
       isBetter = true;
-    } else if (effectiveOrder == bestOrder.linearOrder &&
+    } else if (!isBetter && effectiveOrder == bestOrder.linearOrder &&
                bestOrder.linearOrder != INT_MAX && order.lastOp &&
                bestOrder.lastOp &&
                order.lastOp->getBlock() == bestOrder.lastOp->getBlock() &&
