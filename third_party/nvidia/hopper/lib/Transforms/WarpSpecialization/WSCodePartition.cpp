@@ -376,10 +376,17 @@ static Operation *getLastOpInBlock(DenseSet<Operation *> &ops) {
       break;
     }
   }
+  // The ops sit in a loop body: an scf.for body, or the after region of a
+  // dynamic persistent scf.while whose K loop folded away.
+  auto bodyOf = [&](Operation *parent) -> Block * {
+    assert((isa<scf::ForOp, scf::WhileOp>(parent)));
+    for (auto *op : ops)
+      if (op->getParentOp() == parent)
+        return op->getBlock();
+    llvm_unreachable("no op in the parent loop");
+  };
   if (inOneBlock) {
-    assert(isa<scf::ForOp>(cBlock));
-    scf::ForOp cFor = cast<scf::ForOp>(cBlock);
-    for (auto &op : reverse(cFor.getBody()->getOperations())) {
+    for (auto &op : reverse(bodyOf(cBlock)->getOperations())) {
       if (ops.count(&op)) {
         tailConsumer = &op;
         break;
@@ -396,9 +403,7 @@ static Operation *getLastOpInBlock(DenseSet<Operation *> &ops) {
     if (appearsBefore(lastB, block))
       lastB = block;
   }
-  assert(isa<scf::ForOp>(lastB));
-  scf::ForOp lastFor = cast<scf::ForOp>(lastB);
-  for (auto &op : reverse(lastFor.getBody()->getOperations())) {
+  for (auto &op : reverse(bodyOf(lastB)->getOperations())) {
     if (ops.count(&op)) {
       tailConsumer = &op;
       break;

@@ -460,6 +460,25 @@ public:
 
       scf::ForOp forOp = dyn_cast<scf::ForOp>(mmaOp->getParentOp());
       if (!forOp) {
+        // Outside a loop only a constant-zero accumulator applies, e.g. a
+        // single-K-tile MMA directly in a dynamic persistent (CLC) scf.while
+        // tile loop, or in a kernel with no loop at all.
+        auto [accUse, accDef] = getAccumulatorUseAndDef(mmaOp);
+        if (!accUse || !accDef || !isConstantZeroTensor(accUse))
+          continue;
+        if (auto tc05MmaOp =
+                dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(mmaOp);
+            tc05MmaOp && !accumulatorInitReachesMMA(tc05MmaOp))
+          continue;
+        if (auto useAccValue = getUseAccFlag(mmaOp)) {
+          auto useAcc = getBoolFromConstant(useAccValue);
+          if (!useAcc || *useAcc == false)
+            continue;
+        }
+        IRRewriter rewriter(mmaOp);
+        rewriter.setInsertionPoint(mmaOp);
+        setUseAccFlag(mmaOp, arith::ConstantOp::create(
+                                 rewriter, loc, rewriter.getBoolAttr(false)));
         continue;
       }
 

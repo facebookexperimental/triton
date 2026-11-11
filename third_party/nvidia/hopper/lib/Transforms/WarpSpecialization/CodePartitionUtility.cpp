@@ -3047,11 +3047,38 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
     if (user->hasAttr("tmem.end"))
       user->removeAttr("tmem.end");
   }
-  auto forOp = mmaOp->getParentOfType<scf::ForOp>();
-  if (!forOp) {
-    return mmaOp->emitError(
-        "handleOperandD: MMA operation is not inside a scf.for loop");
+  // The loop whose body holds the MMA: normally the K loop, but when that loop
+  // has a single iteration and folds away, the persistent tile loop. A dynamic
+  // persistent (CLC / atomic tile counter) tile loop is the warp-specialized
+  // scf.while, whose body is its after region. Other scf.while loops are
+  // skipped as before.
+  Operation *loopOp = nullptr;
+  Block *loopBody = nullptr;
+  for (Operation *p = mmaOp->getParentOp(); p && !loopOp; p = p->getParentOp()) {
+    if (auto f = dyn_cast<scf::ForOp>(p)) {
+      loopOp = f;
+      loopBody = f.getBody();
+    } else if (auto w = dyn_cast<scf::WhileOp>(p);
+               w && w->hasAttr(tt::kWarpSpecializeAttrName)) {
+      loopOp = w;
+      loopBody = w.getAfterBody();
+    }
   }
+  if (!loopOp) {
+    return mmaOp->emitError("handleOperandD: MMA operation is not inside a "
+                            "scf.for or scf.while loop");
+  }
+  // Trace a loop-carried block argument of an scf.for body to its init value.
+  // scf.while after-region arguments come from scf.condition, not from the
+  // inits, so they are left as is.
+  auto traceToInit = [&](Value v) -> Value {
+    auto forOp = dyn_cast<scf::ForOp>(loopOp);
+    auto ba = dyn_cast<BlockArgument>(v);
+    if (!forOp || !ba || ba.getOwner() != loopBody || ba.getArgNumber() == 0)
+      return v;
+    // Block arg 0 is the induction variable, so iter args start at index 1.
+    return forOp.getInitArgs()[ba.getArgNumber() - 1];
+  };
   // Track multiple producers when channels are skipped (same task IDs).
   // All producers in the vector must share the exact same task IDs.
   SmallVector<Operation *> currentProds;
@@ -3073,9 +3100,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
     Value uf = mma.useAccumulator();
     if (!uf)
       return false;
-    if (auto ba = dyn_cast<BlockArgument>(uf))
-      if (ba.getOwner() == forOp.getBody() && ba.getArgNumber() > 0)
-        uf = forOp.getInitArgs()[ba.getArgNumber() - 1];
+    uf = traceToInit(uf);
     if (auto c = uf.getDefiningOp<arith::ConstantOp>()) {
       if (auto b = dyn_cast<BoolAttr>(c.getValue()))
         return !b.getValue();
@@ -3098,7 +3123,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
   bool hasBodyChannelLoop = [&]() {
     Operation *firstInBodyLoad = nullptr;
     Operation *firstInBodyStoreOrMma = nullptr;
-    for (Operation &op : forOp.getBody()->without_terminator()) {
+    for (Operation &op : loopBody->without_terminator()) {
       if (!users.count(&op))
         continue;
       if (isa<ttng::TMEMLoadOp>(&op)) {
@@ -3125,7 +3150,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
     for (auto user : tmemAllocOp.getResult().getUsers()) {
       if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
         // Check if this store is outside the loop (not nested under forOp)
-        if (!forOp->isProperAncestor(storeOp)) {
+        if (!loopOp->isProperAncestor(storeOp)) {
           currentProds.clear();
           currentProds.push_back(storeOp);
           handledUsers.insert(storeOp);
@@ -3140,7 +3165,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
     // gates the gen5's first iteration.
     for (auto user : tmemAllocOp.getResult().getUsers()) {
       if (auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user)) {
-        if (!forOp->isProperAncestor(storeOp))
+        if (!loopOp->isProperAncestor(storeOp))
           handledUsers.insert(storeOp);
       }
     }
@@ -3151,7 +3176,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
     });
   }
 
-  for (Operation &op : forOp.getBody()->without_terminator()) {
+  for (Operation &op : loopBody->without_terminator()) {
     if (!users.count(&op))
       continue;
     handledUsers.insert(&op);
@@ -3175,16 +3200,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
             // If useAccFlag is a block argument of the loop, trace it back
             // to its init value. Even if useAccFlag may be true, we don't
             // need a producer if useAcc = False for the first iteration.
-            if (auto blockArg = dyn_cast<BlockArgument>(useAccFlag)) {
-              if (blockArg.getOwner() == forOp.getBody()) {
-                // Block arg 0 is the induction variable, so iter args start
-                // at index 1.
-                unsigned argNum = blockArg.getArgNumber();
-                if (argNum > 0) {
-                  useAccFlag = forOp.getInitArgs()[argNum - 1];
-                }
-              }
-            }
+            useAccFlag = traceToInit(useAccFlag);
             if (auto constOp = useAccFlag.getDefiningOp<arith::ConstantOp>()) {
               if (auto boolAttr = dyn_cast<BoolAttr>(constOp.getValue())) {
                 useAccIsFalse = !boolAttr.getValue();
