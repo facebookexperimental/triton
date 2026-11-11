@@ -147,6 +147,20 @@ struct ClipAsyncCopySizePerThread
   }
 };
 
+// Assume the expensive copies are already coalesced.
+// Skip dtype smaller than 32 bits to avoid problems with contiguity.
+static bool isCheapAsyncCopy(AsyncCopyGlobalToLocalOp copyOp) {
+  auto srcTy = dyn_cast<RankedTensorType>(copyOp.getSrc().getType());
+  if (!srcTy)
+    return false;
+  auto dstTy = cast<MemDescType>(copyOp.getResult().getType());
+  int numWarps = lookupNumWarps(copyOp);
+  auto mod = copyOp->getParentOfType<ModuleOp>();
+  int threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(mod);
+  return srcTy.getNumElements() < numWarps * threadsPerWarp &&
+         dstTy.getElementTypeBitWidth() >= 32;
+}
+
 // For cheap loads we usually pick the layout based on users but when converting
 // to async_cp the layout of the copy is independent of the layout of the users
 // so picking a coalesced layout is better.
@@ -171,15 +185,8 @@ struct CoalesceCheapAsyncCopyGlobalToLocal
     if (!srcTy)
       return failure();
     auto dstTy = cast<MemDescType>(copyOp.getResult().getType());
-    int numWarps = triton::gpu::lookupNumWarps(copyOp);
-    auto mod = copyOp->getParentOfType<ModuleOp>();
-    int threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
     int numCTAs = triton::gpu::getNumCTAs(dstTy.getEncoding());
-    int64_t size = srcTy.getNumElements();
-    // Assume the expensive copies are already coalesced.
-    // Skip dtype smaller than 32 bits to avoid problems with contiguity.
-    if (size >= numWarps * threadsPerWarp ||
-        dstTy.getElementTypeBitWidth() < 32)
+    if (!isCheapAsyncCopy(copyOp))
       return failure();
     auto shapePerCTA = triton::gpu::getShapePerCTA(dstTy);
     auto cgaLayout = triton::gpu::getCGALayout(dstTy.getEncoding());
@@ -207,7 +214,9 @@ struct CoalesceAsyncCopyPass
     m.walk([&](AsyncCopyGlobalToLocalOp copyOp) {
       if (copyOp.getUseBulk())
         return;
-      if (!isa<RankedTensorType>(copyOp.getSrc().getType()))
+      // Only cheap copies read the map. An NPOT copy with 3 elements per
+      // thread has no power-of-two blocked layout, so don't build one.
+      if (!isCheapAsyncCopy(copyOp))
         return;
       auto dstTy = cast<MemDescType>(copyOp.getResult().getType());
       int numWarps = triton::gpu::lookupNumWarps(copyOp);
