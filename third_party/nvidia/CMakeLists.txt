@@ -3,6 +3,7 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
 add_subdirectory(include)
 add_subdirectory(lib)
 if(TRITON_BUILD_PYTHON_MODULE)
+  if(TRITON_BUILD_NVIDIA_GSAN_RUNTIME)
   set(GSAN_RUNTIME_SRC "${triton_SOURCE_DIR}/python/triton/experimental/gsan/src/GSanLibrary.cu")
   set(GSAN_RUNTIME_HDRS
     "${triton_SOURCE_DIR}/python/triton/experimental/gsan/src/GSan.h"
@@ -78,10 +79,13 @@ if(TRITON_BUILD_PYTHON_MODULE)
       COMMENT "Building GSan runtime"
       VERBATIM)
   add_custom_target(TritonNVIDIAGSanRuntime ALL DEPENDS "${GSAN_RUNTIME_IR}")
+  endif()
 
   add_triton_plugin(TritonNVIDIA ${CMAKE_CURRENT_SOURCE_DIR}/triton_nvidia.cc LINK_LIBS TritonNVIDIAGPUToLLVM NVGPUToLLVM)
   target_link_libraries(TritonNVIDIA PRIVATE Python3::Module nanobind-static)
-  add_dependencies(TritonNVIDIA TritonNVIDIAGSanRuntime)
+  if(TRITON_BUILD_NVIDIA_GSAN_RUNTIME)
+    add_dependencies(TritonNVIDIA TritonNVIDIAGSanRuntime)
+  endif()
 endif()
 if(TRITON_BUILD_UT)
   add_subdirectory(unittest)

@@ -18,6 +18,14 @@ def mock_tensor_from_tensor(tensor):
     return MockTensor(tensor.dtype, tensor.shape)
 
 
+@pytest.mark.parametrize(
+    "shape", [None, (), (0, ), (7, ), (3, 5), (2, 3, 5), (2, 64, 8192, 128), (2, 0, 4), (0, 3, 0), (1, 3, 1, 7)])
+def test_mock_tensor_contiguous_strides(shape):
+    tensor = MockTensor(torch.float32, shape)
+    reference = torch.empty(tensor.shape, device="meta")
+    assert tensor.stride() == reference.stride()
+
+
 class MockJITCallable(JITCallable):
 
     def __init__(self):

@@ -284,7 +284,11 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
       for (int k = 0; k < numRepK; ++k) {
         Value a;
         if (aInShared) {
-          a = aLoader.smemLoad(m * mmaSizeM, k * mmaSizeK, rewriter, loc);
+          auto loadedA =
+              aLoader.smemLoad(m * mmaSizeM, k * mmaSizeK, rewriter, loc);
+          if (failed(loadedA))
+            return failure();
+          a = *loadedA;
         } else {
           auto aDotOpEnc =
               cast<DotOperandEncodingAttr>(aTensorTy.getEncoding());
@@ -328,7 +332,10 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
               SmallVector<Type>(regA.size(), regA[0].getType()));
           a = packLLElements(loc, typeConverter, regA, rewriter, regATy);
         }
-        auto b = bLoader->smemLoad(k * mmaSizeK, n * mmaSizeN, rewriter, loc);
+        auto bOr = bLoader->smemLoad(k * mmaSizeK, n * mmaSizeN, rewriter, loc);
+        if (failed(bOr))
+          return failure();
+        auto b = *bOr;
         numLowPrecisionAcc += K;
         // If using native accumulation would cause use to do more low precion
         // accumulation than allowed do a separate allocation.

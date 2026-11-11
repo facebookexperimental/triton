@@ -1,4 +1,4 @@
-> **[gfx950]** — available on AMD MI350 (CDNA4) only; not available on MI300.
+> **[gfx942+]** - AMD buffer operations; dtype restrictions depend on the target.
 
 Buffer operations access global memory via a scalar base pointer and a tensor of i32 element offsets, rather than a tensor of pointers. This maps directly to AMD's hardware buffer instructions, which use a resource descriptor and byte offsets, enabling the hardware to do out-of-bounds checking and cache optimization.
 
@@ -101,7 +101,11 @@ previous = tlx.buffer_atomic_add(
 `contiguity` is the same trusted per-thread adjacency width accepted by
 `buffer_load`; values greater than one also preserve the selected layout. The
 operation returns the values observed before the additions. FP16 and BF16 use
-packed two-element instructions, so `contiguity` must be at least two and any
+packed two-element instructions. BF16 atomic addition is rejected on gfx942;
+FP16, FP32, FP64, int32, and int64 addition are supported by its buffer-atomic
+lowering. gfx950 and gfx1250 also implement BF16 addition; see the
+[target feature checks](third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp).
+For FP16/BF16, `contiguity` must be at least two and any
 mask must be uniform for each adjacent pair. Compilation fails if mask analysis
 reduces the legal vector width below two.
 

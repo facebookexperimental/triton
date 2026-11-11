@@ -227,7 +227,9 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     dotOp->moveBefore(yield);
     auto elseB = ifOp.getElseBodyBuilder();
     scf::YieldOp::create(elseB, loc, dotOp->getOperand(2));
-    op->replaceAllUsesWith(ifOp->getResults());
+    // Redirect external uses to the scf.if result, but not the then-yield we
+    // just created, which must keep forwarding the dot's own result.
+    dotOp->getResult(0).replaceAllUsesExcept(ifOp->getResult(0), yield);
     return ifOp;
   }
   // Ops without a built-in pred operand: wrap in scf.if.
@@ -276,9 +278,28 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   }
 
-  op->emitOpError("pipeliner doesn't know how to predicate this op.");
-  llvm::report_fatal_error("Fatal pipeliner error");
-  return op;
+  // General fallback: wrap the op in an scf.if gated on the predicate.
+  rewriter.setInsertionPoint(op);
+  Location loc = op->getLoc();
+  SmallVector<Type> resultTypes(op->getResultTypes());
+  auto ifOp = scf::IfOp::create(rewriter, loc, resultTypes, pred);
+  Block *thenBlock = rewriter.createBlock(&ifOp.getThenRegion());
+  op->moveBefore(thenBlock, thenBlock->end());
+  rewriter.setInsertionPointToEnd(thenBlock);
+  scf::YieldOp::create(rewriter, loc, op->getResults());
+  Block *elseBlock = rewriter.createBlock(&ifOp.getElseRegion());
+  rewriter.setInsertionPointToEnd(elseBlock);
+  SmallVector<Value> poisonResults;
+  for (Type ty : resultTypes) {
+    poisonResults.push_back(ub::PoisonOp::create(rewriter, loc, ty));
+  }
+  scf::YieldOp::create(rewriter, loc, poisonResults);
+  for (auto [oldRes, newRes] : llvm::zip(op->getResults(), ifOp.getResults())) {
+    oldRes.replaceUsesWithIf(newRes, [&](OpOperand &use) {
+      return use.getOwner() != ifOp.thenYield();
+    });
+  }
+  return ifOp;
 }
 
 Operation *mlir::triton::wrapInMaskOp(RewriterBase &rewriter, Operation *op,
@@ -358,6 +379,11 @@ int mlir::triton::getCopyVecBytes(RankedTensorType registerTy,
   // FIXME: Here we should pass a MemDescType instead of a SharedEncodingTrait!!
   // This is currently broken for memdesc_subslice!
   auto sharedLayout = triton::gpu::toLinearLayout(shape, sharedEnc);
+  // A mixed-radix layout doesn't compose with the shared layout: copy by runs.
+  if (!regLayout.isRadix2())
+    return ttg::getMixedRadixSharedRun(regLayout, sharedLayout.pseudoinvert(),
+                                       registerTy.getElementTypeBitWidth()) *
+           registerTy.getElementTypeBitWidth() / 8;
   auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
   const int vecElems = regToSharedLayout.getNumConsecutiveInOut();
   return vecElems * registerTy.getElementTypeBitWidth() / 8;
@@ -390,6 +416,22 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
   return width >= 32;
 }
 
+bool mlir::triton::canPipelineInSharedMemory(tt::LoadOp load) {
+  auto ty = dyn_cast<RankedTensorType>(load.getType());
+  if (!ty)
+    return true;
+  LinearLayout layout = ttg::toLinearLayout(ty);
+  if (layout.isRadix2())
+    return true;
+  Type type = ty;
+  for (StringRef name : {ttg::AsyncCopyGlobalToLocalOp::getOperationName(),
+                         ttg::LocalLoadOp::getOperationName()})
+    if (ttg::getNpotLayoutUnsupportedReason(
+            OperationName(name, load.getContext()), type))
+      return false;
+  return !getNpotAsyncCopyUnsupportedReason(load, layout);
+}
+
 void mlir::triton::serializeLatencies(ModuleOp module,
                                       DenseMap<Operation *, int> &opLatency) {
   auto helper = TritonDialect::getLoaded(module)->getLatencyAttrHelper();
@@ -413,7 +455,11 @@ DenseMap<Operation *, int> mlir::triton::deserializeLatencies(Operation *op) {
   auto latencyHelper = TritonDialect::getLoaded(op)->getLatencyAttrHelper();
   op->walk([&](Operation *op) {
     if (auto attr = latencyHelper.getAttr(op)) {
-      opLatency[op] = attr.getInt();
+      // A load whose shared-memory ops can't lower its layout stays
+      // unpipelined.
+      auto load = dyn_cast<tt::LoadOp>(op);
+      if (!load || canPipelineInSharedMemory(load))
+        opLatency[op] = attr.getInt();
       latencyHelper.removeAttr(op);
     }
   });
@@ -508,7 +554,7 @@ void mlir::triton::combineRedundantWaitOps(
         createWait) {
   llvm::MapVector<Operation *, Operation *> toDelete;
   for (Operation *waitOp : waitOps) {
-    if (toDelete.count(waitOp))
+    if (toDelete.contains(waitOp))
       continue;
     StringRef waitName = waitOp->getName().getStringRef();
     auto getNum = [](Operation *op) {
@@ -862,7 +908,8 @@ static Operation *getUseOfPipelinedOp(
     topLevelUsers.insert(users.begin(), users.end());
   }
   for (Operation *topLevelUser : topLevelUsers) {
-    assert(schedule.count(topLevelUser) && "op user not found in the schedule");
+    assert(schedule.contains(topLevelUser) &&
+           "op user not found in the schedule");
     if (!selectedUser || shouldPrefer(topLevelUser, selectedUser)) {
       selectedUser = topLevelUser;
     }

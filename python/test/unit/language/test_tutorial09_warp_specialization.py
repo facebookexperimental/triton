@@ -847,6 +847,82 @@ def test_blackwell_autows_mbarrier_promotion(promote):
         assert ttgir.count("ttng.init_barrier") == 34, f"TTGIR {ttgir}"
 
 
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
+@pytest.mark.parametrize("promote", [False, True])
+def test_autows_mbarrier_promotion_dynamic_persistent_while(promote):
+    """A real kernel reaching the while-aware promotion paths.
+
+    Unlike the static-persistent kernel (whose countable while uplifts to
+    scf.for), the dynamic work-stealing kernel keeps its scf.while around the
+    warp-specialized barriers, so the promotion pass runs its while-uniformity
+    induction, while guard edges, and while loop-nest pairing on real IR. The
+    atomic-driven while is provably non-uniform, so promotion must safely skip
+    these barriers while numerics stay correct.
+    """
+    M, N, K = 256, 128, 256
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
+    EPILOGUE_SUBTILE = 1
+    GROUP_SIZE_M = 8
+    num_stages = 3
+    num_warps = 4
+
+    matmul_kernel_tma_dynamic_persistent_ws_while.device_caches.clear()
+    with triton.knobs.nvidia.scope(), triton.knobs.compilation.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.promote_mbarrier_to_named_barrier = promote
+        triton.knobs.compilation.always_compile = True
+
+        dtype = torch.float16
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        device = "cuda"
+
+        torch.manual_seed(42)
+        A = torch.randn((M, K), dtype=dtype, device=device)
+        B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+        tile_counter = torch.full((1, ), NUM_SMS, dtype=torch.int32, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+        a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE])
+
+        grid = lambda META: (min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ), )
+
+        kernel = matmul_kernel_tma_dynamic_persistent_ws_while[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            tile_counter,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+            NUM_SMS=NUM_SMS,
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+
+    ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+    torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+    ttgir = kernel.asm["ttgir"]
+    assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
+    assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+    # The atomic tile claim makes the while non-uniform, so the while-aware
+    # pass must skip promotion here rather than miscompile.
+    assert "ttng.compiler_named_barrier_id" not in ttgir, f"TTGIR {ttgir}"
+
+
 # ============================================================================
 # Test 2: matmul_kernel_tma_persistent warp specialization (tile-loop based)
 # Tests both Flatten=True and Flatten=False

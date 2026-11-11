@@ -27,7 +27,6 @@ import argparse
 import contextlib
 import dataclasses
 import functools
-import os
 from typing import Any, Callable, Iterable, Optional
 
 from . import report as report_mod
@@ -201,6 +200,11 @@ def default_json(bench, suites=None) -> str:
     return f"/tmp/tlx_benchmark/{bench.OP}.{arch()}{suite_suffix}.json"
 
 
+def missing_focus_default(bench, *, synthetic=False, suites=None) -> bool:
+    registry = bench.SHAPE_SUITES
+    return not synthetic and suites is None and registry is not None and arch() not in registry.defaults
+
+
 def _selected_suite_names(bench, suites=None) -> tuple[str, ...]:
     registry = bench.SHAPE_SUITES
     return () if registry is None else registry.selected_suite_names(arch(), suites)
@@ -241,9 +245,11 @@ def suite_shape_listing(bench, name: str) -> str:
     return f"{header}\n{shapes}" if shapes else header
 
 
-def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: str = "wallclock") -> Result:
+def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: str = "gpu_events") -> Result:
     import torch
 
+    if latency_mode not in LATENCY_MODES:
+        raise ValueError(f"latency_mode must be one of {LATENCY_MODES}, got {latency_mode!r}")
     prep = bench.prepare(case, space)
 
     # Cold pass first, on its own fresh Triton cache. For a backward case
@@ -266,17 +272,22 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     # `measure` converts every timed iteration through flop_count, so both
     # providers come back in TFLOP/s with the dispersion measured on that
     # quantity rather than on latency.
+    tlx_notes, ref_notes = [], []
     tlx = measure(prep.tlx_fn, flop_count=prep.flop_count, replicates=DEFAULT_REPLICATES,
-                  grad_to_none=prep.grad_to_none, mode=latency_mode)
+                  grad_to_none=prep.grad_to_none, mode="gpu_events", notes=tlx_notes)
     ref = None
     if prep.ref_fn is not None:
         ref = measure(prep.ref_fn, flop_count=prep.flop_count, replicates=DEFAULT_REPLICATES,
-                      grad_to_none=prep.grad_to_none, mode=latency_mode)
+                      grad_to_none=prep.grad_to_none, mode="gpu_events", notes=ref_notes)
     host_us = host_overhead_us(prep.tlx_fn)
+    ref_host_us = host_overhead_us(prep.ref_fn) if prep.ref_fn is not None else None
 
     result = verdict.judge(case, tlx, ref, tlx_host_us=host_us, compile_stat=compile_stat, correct=correct,
                            accuracy_note=accuracy_note, floor_tflops=prep.floor_tflops)
+    # After the verdict's notes, which lead the nightly failure summary.
+    result.notes += [f"tlx: {n}" for n in tlx_notes] + [f"ref: {n}" for n in ref_notes]
     result.flop_count = prep.flop_count
+    result.ref_host_us = ref_host_us
     result.extra = dict(prep.extra)
     result.best_config = _render_configs(configs)
 
@@ -292,6 +303,19 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     del prep
     torch.cuda.empty_cache()
     return result
+
+
+def _gpu_usable() -> bool:
+    """Whether this process's GPU context still works. A sticky device error, such
+    as an illegal memory access, breaks it for good: every later GPU call fails
+    with the same error."""
+    import torch
+
+    try:
+        torch.ones(1, device="cuda").sum().item()
+        return True
+    except torch.AcceleratorError:
+        return False
 
 
 def _errored(case: Case, exc: Exception) -> Result:
@@ -349,7 +373,7 @@ def _head_per_direction(cases, head: int):
 
 
 def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=None, cold_compile_mode=None,
-        directions=None, latency_mode="wallclock"):
+        directions=None, latency_mode="gpu_events"):
     if synthetic and suites:
         raise ValueError("--synthetic and --suite cannot be used together")
     space = resolve_space(bench, space)
@@ -365,7 +389,7 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
     results = []
     sampled = set()
     with stable(device_index()) as info:
-        for case in cases:
+        for i, case in enumerate(cases):
             cold = cold_mode == "all" or (cold_mode == "first" and case.direction not in sampled)
             if cold:
                 sampled.add(case.direction)
@@ -373,6 +397,11 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
                 results.append(run_case(bench, case, space=space, cold=cold, latency_mode=latency_mode))
             except Exception as exc:  # a broken case must not hide the others
                 results.append(_errored(case, exc))
+                if not _gpu_usable():
+                    # Every later case would fail with this case's error; report it once.
+                    results[-1].notes.append(
+                        f"{len(cases) - i - 1} later cases not run: this case broke the GPU context")
+                    break
     # The autotune space is part of what a number means: a heuristic-space
     # latency and a full-space latency for the same shape differ by 4x, so two
     # artifacts are only comparable when this matches. Same for the reference --
@@ -381,7 +410,9 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
     env["space"] = space
     env["ref"] = getattr(bench, "REF_NAME", "")
     env["cold_compile"] = cold_mode
-    env["latency_mode"] = latency_mode
+    env["latency_mode"] = "gpu_events"
+    env["requested_latency_mode"] = latency_mode
+    env["cache_policy"] = "cold_cache_per_call"
     if directions:
         env["directions"] = sorted(directions)
     env["replicates"] = DEFAULT_REPLICATES
@@ -398,7 +429,7 @@ def main(bench, argv=None) -> int:
     parser = argparse.ArgumentParser(description=bench.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default="auto", help="GPU index, or 'auto' (default) for the least-used one")
     parser.add_argument(
-        "--space", choices=("heuristic", "full", "smoke"), default=None,
+        "--space", choices=("heuristic", "curated", "full", "smoke"), default=None,
         help=f"autotune search space (default {resolve_space(bench, None)}); the default is what this op "
         "uses by default, and measuring anything else measures a path users do not take")
     parser.add_argument("--head", type=int, default=None, metavar="N",
@@ -417,11 +448,8 @@ def main(bench, argv=None) -> int:
     only = parser.add_mutually_exclusive_group()
     only.add_argument("--fwd-only", action="store_true", help="skip the backward cases")
     only.add_argument("--bwd-only", action="store_true", help="skip the forward cases")
-    parser.add_argument(
-        "--latency-measure-mode", choices=LATENCY_MODES, default="wallclock", dest="latency_mode",
-        help="'wallclock' (default) times each call as a caller would see it, host dispatch "
-        "included; 'gpu_events' pre-enqueues the batch behind a blocked stream to isolate "
-        "device time, which matters most on the multi-kernel backward passes")
+    parser.add_argument("--latency-measure-mode", choices=LATENCY_MODES, default="gpu_events", dest="latency_mode",
+                        help="legacy timing selector; kernel-performance measurements always use verified GPU events")
     parser.add_argument(
         "--cold-compile", choices=COLD_COMPILE_MODES, default=None, dest="cold_compile",
         help=f"how often to time a first call on a fresh cache (default {resolve_cold_compile(bench, None)}); "
@@ -450,10 +478,14 @@ def main(bench, argv=None) -> int:
     # op dispatch independently derives the architecture from its input device.
     select(device)
     if device is not None:
-        os.environ[device.visibility_env] = str(device.index)
+        if not device.pin():
+            print(f"device: gpu{device.index} has no known UUID; not pinning it")
         print(f"device: gpu{device.index} {device.name} "
               f"({'least used' if args.device == 'auto' else 'requested'}, "
               f"{device.memory_used_mib:.0f} MiB in use)")
+    if missing_focus_default(bench, synthetic=args.synthetic, suites=args.suite):
+        print(f"{bench.OP} has no focus inputs configured for {arch()}; nothing measured")
+        return 0
     try:
         if not args.synthetic:
             _selected_suite_names(bench, args.suite)

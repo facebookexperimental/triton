@@ -14,7 +14,8 @@ import sys
 import torch
 import torch.nn.functional as F
 from triton.tlx.ops.kernels.flash_attn_varlen._shapes import FOCUS as SHAPE_SUITES
-from triton.tlx.ops.kernels.flash_attn_varlen._shapes import SYNTHETIC, flops, inputs, label, seqlens
+from triton.tlx.ops.kernels.flash_attn_varlen._shapes import (SYNTHETIC, flops, inputs, is_cross_attention, label,
+                                                              seqlens)
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -31,7 +32,8 @@ REL_PRECISION = {"float16": 1e-3, "bfloat16": 8e-3}
 
 
 def shapes(synthetic: bool = False, suites=None) -> list:
-    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
+    found = SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites)
+    return [entry for entry in found if not is_cross_attention(entry)]
 
 
 def cases(synthetic: bool = False, suites=None) -> list[Case]:

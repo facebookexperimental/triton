@@ -286,8 +286,10 @@ def BufferLoadOp
           "buffer_load",
           [SameLoadStoreOperandsAndResultEncoding, AttrSizedOperandSegments,
            BufferOpInterface, DeclareOpInterfaceMethods<PredicatedOpInterface>,
+           MixedRadixLayoutTrait,
            TypesMatchWith<"result element type matches the pointed type of ptr",
-                          "result", "ptr", "getPointerTypeToElement($_self)">,
+                          "result", "ptr", "$_self",
+                          "::mlir::triton::elementTypeMatchesPointee">,
            TypesMatchWith<"result and offsets have the same shape", "result",
                           "offsets", "getI32SameShape($_self)">,
            TypesMatchWith<"result and mask have the same shape", "result",
@@ -316,23 +318,23 @@ def BufferLoadOp
       with the given layout and mask.
       This allows to use buffer_load even if the alignment cannot be proven based on IR.
     }];
-  let arguments =
-      (ins Arg<TT_Ptr, "Global memory scalar base pointer to load from",
-               [MemRead<GlobalMemory>]>:$ptr,
-          I32Tensor:$offsets, Optional<I32>:$stride,
-          DefaultValuedAttr<TT_CacheModifierAttr,
-                            "::mlir::triton::CacheModifier::NONE">:$cache,
-          Optional<TT_BoolTensor>:$mask, Optional<TT_Tensor>:$other,
-          DefaultValuedAttr<I32Attr, "1">:$contiguity);
+  let arguments = (ins
+      Arg<TT_Ptr, "Global memory scalar base pointer to load from", [MemRead<GlobalMemory>]>:$ptr,
+      I32Tensor:$offsets,
+      Optional<I32>:$stride,
+      OptionalAttr<AnyAttr>:$cachePolicy,
+      Optional<TT_BoolTensor>:$mask,
+      Optional<TT_Tensor>:$other,
+      DefaultValuedAttr<I32Attr, "1">:$contiguity
+    );
   let results = (outs TT_Tensor:$result);
 
   let hasVerifier = 1;
 
   let assemblyFormat = [{
       $ptr `[` $offsets `]` (`,` $mask^)? (`,` $other^)?
-      oilist(`cacheModifier` `=` $cache)
       (`stride` `=` $stride^)?
-      attr-dict `:` type($result)
+      attr-dict `:` qualified(type($ptr)) `->` type($result)
     }];
 }
 
@@ -343,10 +345,12 @@ def BufferLoadOp
 def BufferLoadToLocalOp
     : TT_AMDGPU_Op<
           "buffer_load_to_local",
-          [AttrSizedOperandSegments, BufferOpInterface,
+          [GlobalToLocalCopyTrait, AttrSizedOperandSegments, BufferOpInterface,
            DeclareOpInterfaceMethods<PredicatedOpInterface>,
+           MixedRadixLayoutTrait,
            TypesMatchWith<"dest element type matches pointee type of ptr",
-                          "dest", "ptr", "getPointerTypeToElement($_self)">,
+                          "dest", "ptr", "$_self",
+                          "::mlir::triton::elementTypeMatchesPointee">,
            TypesMatchWith<"infer mask shape from offsets", "offsets", "mask",
                           "getI1SameShape($_self)",
                           "(cast<BufferLoadToLocalOp>($_op).getMask() == "
@@ -367,25 +371,24 @@ def BufferLoadToLocalOp
       elements available in the final offsets and mask layout. This allows
       buffer_load_to_local to vectorize when alignment or mask uniformity cannot be proven from the IR.
     }];
-  let arguments =
-      (ins Arg<
-           TTG_MemDescType,
-           "Shared memory slice to write to", GenericSharedWrite>:$dest,
-          Arg<TT_Ptr, "Global memory scalar base pointer to load from",
-              [MemRead<GlobalMemory>]>:$ptr,
-          I32Tensor:$offsets, Optional<TT_BoolTensor>:$mask,
-          Optional<TT_Tensor>:$other, Optional<I32>:$stride,
-          DefaultValuedAttr<TT_CacheModifierAttr,
-                            "::mlir::triton::CacheModifier::NONE">:$cache,
-          DefaultValuedAttr<I32Attr, "1">:$contiguity);
+  let arguments = (ins
+      Arg<TTG_MemDescType, "Shared memory slice to write to", GenericSharedWrite>:$dest,
+      Arg<TT_Ptr, "Global memory scalar base pointer to load from", [MemRead<GlobalMemory>]>:$ptr,
+      I32Tensor:$offsets,
+      Optional<TT_BoolTensor>:$mask,
+      Optional<TT_Tensor>:$other,
+      Optional<I32>:$stride,
+      OptionalAttr<AnyAttr>:$cachePolicy,
+      DefaultValuedAttr<I32Attr, "1">:$contiguity
+    );
   let results = (outs TTG_AsyncToken:$token);
 
   let hasVerifier = 1;
 
   let assemblyFormat = [{
       $ptr `[` $offsets `]` (`mask` `=` $mask^)? (`other` `=` $other^)? (`stride` `=` $stride^)?
-      oilist(`cacheModifier` `=` $cache) `into` $dest
-      attr-dict `:` type($ptr) `[` type($offsets) `]` type($other) `->` type($dest)
+      oilist(`cachePolicy` `=` $cachePolicy) `into` $dest
+      attr-dict `:` qualified(type($ptr)) `[` type($offsets) `]` type($other) `->` type($dest)
     }];
 }
 
@@ -401,7 +404,8 @@ def BufferAtomicRMWOp
            TypesMatchWith<"result element type matches the value type",
                           "result", "value", "$_self">,
            TypesMatchWith<"result element type matches the pointed type of ptr",
-                          "result", "ptr", "getPointerTypeToElement($_self)">,
+                          "result", "ptr", "$_self",
+                          "::mlir::triton::elementTypeMatchesPointee">,
            TypesMatchWith<"result and offsets have the same shape", "result",
                           "offsets", "getI32SameShape($_self)">,
            TypesMatchWith<"result and mask have the same shape", "result",
@@ -409,7 +413,8 @@ def BufferAtomicRMWOp
                           "(cast<BufferAtomicRMWOp>($_op).getMask() == "
                           "nullptr) || std::equal_to<>()">,
            TypesMatchWith<"value element type matches the pointed type of ptr",
-                          "value", "ptr", "getPointerTypeToElement($_self)">,
+                          "value", "ptr", "$_self",
+                          "::mlir::triton::elementTypeMatchesPointee">,
            TypesMatchWith<"value and offsets have the same shape", "value",
                           "offsets", "getI32SameShape($_self)">,
            TypesMatchWith<"value and mask have the same shape", "value", "mask",
@@ -431,6 +436,8 @@ def BufferAtomicRMWOp
         when it converts to the buffer ops because it is important for optimizing the cache memory access.
         Contiguity is the maximum number of elements that can be processed by one vector atomic with the given layout
         and mask. This preserves alignment information proven before canonicalizing the pointer to buffer form.
+        On gfx1250, cluster_scope opts into shader-engine scope instead of the default device scope.
+        The caller must place all workgroups updating each location in one cluster. Other targets reject this opt-in.
     }];
   let arguments = (ins TT_AtomicRMWAttr:$atomic_rmw_op,
       Arg<TT_Ptr, "Global memory pointer",
@@ -438,7 +445,8 @@ def BufferAtomicRMWOp
       I32Tensor:$offsets, TT_Tensor:$value, Optional<I32>:$stride,
       TT_MemSemanticAttr:$sem, TT_MemSyncScopeAttr:$scope,
       Optional<TT_BoolTensor>:$mask,
-      DefaultValuedAttr<I32Attr, "1">:$contiguity);
+      DefaultValuedAttr<I32Attr, "1">:$contiguity,
+      DefaultValuedAttr<BoolAttr, "false">:$cluster_scope);
   let results = (outs TT_Tensor:$result);
 
   let hasVerifier = 1;
@@ -446,7 +454,7 @@ def BufferAtomicRMWOp
   let assemblyFormat = [{
         $atomic_rmw_op `,` $sem `,` $scope `,` $value `,` $ptr `[` $offsets `]` (`,` $mask^)?
         (`stride` `=` $stride^)?
-        attr-dict `:` type($result)
+        attr-dict `:` qualified(type($ptr)) `->` type($result)
     }];
 }
 
@@ -462,7 +470,8 @@ def BufferAtomicCASOp
            TypesMatchWith<"result element type matches the cmp type", "result",
                           "cmp", "$_self">,
            TypesMatchWith<"result element type matches the pointed type of ptr",
-                          "result", "ptr", "getPointerTypeToElement($_self)">,
+                          "result", "ptr", "$_self",
+                          "::mlir::triton::elementTypeMatchesPointee">,
            TypesMatchWith<"result and offsets have the same shape", "result",
                           "offsets", "getI32SameShape($_self)">,
            TypesMatchWith<"val and offsets have the same shape", "val",
@@ -489,10 +498,12 @@ def BufferAtomicCASOp
           TT_MemSyncScopeAttr:$scope);
   let results = (outs TT_Tensor:$result);
 
+  let hasVerifier = 1;
+
   let assemblyFormat = [{
         $sem `,` $scope `,` $cmp `,` $val `,` $ptr `[` $offsets `]`
         (`stride` `=` $stride^)?
-        attr-dict `:` type($result)
+        attr-dict `:` qualified(type($ptr)) `->` type($result)
     }];
 }
 
@@ -505,8 +516,10 @@ def BufferStoreOp
           "buffer_store",
           [AttrSizedOperandSegments, SameLoadStoreOperandsEncoding,
            BufferOpInterface, DeclareOpInterfaceMethods<PredicatedOpInterface>,
+           MixedRadixLayoutTrait,
            TypesMatchWith<"value element type matches the pointed type of ptr",
-                          "value", "ptr", "getPointerTypeToElement($_self)">,
+                          "value", "ptr", "$_self",
+                          "::mlir::triton::elementTypeMatchesPointee">,
            TypesMatchWith<"value and offsets have the same shape", "value",
                           "offsets", "getI32SameShape($_self)">,
            TypesMatchWith<"value and mask have the same shape", "value", "mask",
@@ -531,20 +544,19 @@ def BufferStoreOp
       with the given layout and mask.
       This allows to use buffer_store even if the alignment cannot be proven based on IR.
     }];
-  let arguments = (ins TT_Tensor:$value,
-      Arg<TT_Ptr, "Global memory scalar base pointer to write to",
-          [MemWrite<GlobalMemory>]>:$ptr,
-      I32Tensor:$offsets, Optional<I32>:$stride,
-      DefaultValuedAttr<TT_CacheModifierAttr,
-                        "mlir::triton::CacheModifier::NONE">:$cache,
+  let arguments = (ins
+      TT_Tensor:$value,
+      Arg<TT_Ptr, "Global memory scalar base pointer to write to", [MemWrite<GlobalMemory>]>:$ptr,
+      I32Tensor:$offsets,
+      Optional<I32>:$stride,
+      OptionalAttr<AnyAttr>:$cachePolicy,
       Optional<TT_BoolTensor>:$mask,
       DefaultValuedAttr<I32Attr, "1">:$contiguity);
 
   let assemblyFormat = [{
       $value `,` $ptr `[` $offsets `]` (`,` $mask^)?
-      oilist(`cacheModifier` `=` $cache)
       (`stride` `=` $stride^)?
-      attr-dict `:` type($value)
+      attr-dict `:` qualified(type($ptr)) `->` type($value)
     }];
   let hasVerifier = 1;
 }
@@ -563,6 +575,8 @@ def MaskedLoadOp : TT_AMDGPU_Op<"masked_load", []> {
       Optional<I32>:$multicastMask,
       DefaultValuedAttr<TT_CacheModifierAttr,
                         "::mlir::triton::CacheModifier::NONE">:$cache,
+      DefaultValuedAttr<TT_EvictionPolicyAttr,
+                        "triton::EvictionPolicy::NORMAL">:$evict,
       DefaultValuedAttr<BoolAttr, "false">:$isVolatile,
       DefaultValuedAttr<BoolAttr, "false">:$forceNoAlias);
 
@@ -570,7 +584,7 @@ def MaskedLoadOp : TT_AMDGPU_Op<"masked_load", []> {
 
   let assemblyFormat = [{
     $ptr `,` $mask `,` $falseVal (`,` $multicastMask^)?
-    oilist(`cacheModifier` `=` $cache)
+    oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
     (`volatile` $isVolatile^)?
     (`forceNoAlias` $forceNoAlias^)?
     attr-dict `:` functional-type(operands, results)
@@ -588,23 +602,57 @@ def MaskedStoreOp : TT_AMDGPU_Op<"masked_store", []> {
   let arguments = (ins LLVM_AnyPointer:$ptr, LLVM_Type:$value, I1:$mask,
       DefaultValuedAttr<TT_CacheModifierAttr,
                         "::mlir::triton::CacheModifier::NONE">:$cache,
+      DefaultValuedAttr<TT_EvictionPolicyAttr,
+                        "triton::EvictionPolicy::NORMAL">:$evict,
       DefaultValuedAttr<BoolAttr, "false">:$forceNoAlias);
 
   let assemblyFormat = [{
     $ptr `,` $value `,` $mask
-    oilist(`cacheModifier` `=` $cache)
+    oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
     (`forceNoAlias` $forceNoAlias^)?
     attr-dict `:` type(operands)
   }];
 }
 
 //===----------------------------------------------------------------------===//
+// PackedDot2Op
+//===----------------------------------------------------------------------===//
+
+def PackedDot2Op
+    : TT_AMDGPU_Op<"packed_dot2",
+                   [Pure, Elementwise, SameOperandsAndResultShape,
+                    SameOperandsAndResultEncoding]> {
+  let summary = "Compute an FP32 dot product of two packed FP16 or BF16 pairs";
+
+  let description = [{
+    Interpret each i32 element of `lhs` and `rhs` as two packed values of
+    `input_type` and compute
+    `lhs[0] * rhs[0] + lhs[1] * rhs[1] + acc` in FP32.
+
+    FP16 lowers to `llvm.amdgcn.fdot2`; BF16 lowers to
+    `llvm.amdgcn.fdot2.f32.bf16`. LLVM therefore retains the DOT instruction
+    semantics needed by AMDGPU scheduling and hazard recognition.
+  }];
+
+  let arguments = (ins RankedTensorOf<[I32]>:$lhs,
+                       RankedTensorOf<[I32]>:$rhs,
+                       RankedTensorOf<[F32]>:$acc,
+                       TypeAttr:$input_type);
+  let results = (outs RankedTensorOf<[F32]>:$result);
+
+  let assemblyFormat = [{
+    $lhs `,` $rhs `,` $acc attr-dict
+        `:` type($lhs) `,` type($rhs) `,` type($acc) `->` type($result)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // ScaledUpcastFp4Op
 //===----------------------------------------------------------------------===//
 
-def ScaledUpcastFp4Op
-    : TT_AMDGPU_Op<"scaled_upcast_fp4", [Pure, DeclareOpInterfaceMethods<
-                                                   UpcastFpOpInterface>]> {
+def ScaledUpcastFp4Op : TT_AMDGPU_Op<"scaled_upcast_fp4", [Pure, DeclareOpInterfaceMethods<CastFpOpInterface>]> {
   let summary = "Upcast fp4 and then multiply scale";
 
   let description = [{
@@ -655,7 +703,7 @@ def ScaledUpcastFp8Op
     : TT_AMDGPU_Op<"scaled_upcast_fp8",
                    [Pure, Elementwise, SameOperandsAndResultShape,
                     SameOperandsAndResultEncoding,
-                    DeclareOpInterfaceMethods<UpcastFpOpInterface>]> {
+                    DeclareOpInterfaceMethods<CastFpOpInterface>]> {
   let summary = "Upcast Fp8 and then multiply scale";
 
   let description = [{
@@ -672,6 +720,133 @@ def ScaledUpcastFp8Op
     $input `scale` $scale attr-dict
         `:` type($input) `,` type($scale) `->` type($output)
   }];
+}
+
+//===----------------------------------------------------------------------===//
+// ScaledDowncastFp4Op
+//===----------------------------------------------------------------------===//
+
+def ScaledDowncastFp4Op : TT_AMDGPU_Op<"scaled_downcast_fp4", [
+    Pure,
+    DeclareOpInterfaceMethods<CastFpOpInterface>]> {
+  let summary = "Scale and downcast floating-point values to packed FP4";
+
+  let description = [{
+    Divide FP16, BF16, or FP32 values by an E8M0 scale and convert them to
+    packed e2m1 values. The result packs two consecutive fp4 values per i8
+    along `axis`: the element at even position provides the low nibble and the
+    following element the high nibble, so the result extent along `axis` is
+    half the input extent (the inverse of `scaled_upcast_fp4`).
+
+    The `axis` attribute identifies the dimension along which the fp4 elements
+    are packed and along which scales are shared. The scale must be compact
+    along `axis`: one raw E8M0 i8 payload covers multiple consecutive packed
+    bytes along that axis (unlike :func:`scaled_upcast_fp4`, expanded scales
+    with one scale per output element are not supported). Each scale block along
+    `axis` must cover a multiple of 8 fp4 values.
+
+    This will be hardware accelerated on architectures supporting
+    `v_cvt_scalef32_pk_*` instructions (e.g. CDNA4 and CDNA5).
+  }];
+
+  let arguments = (ins
+    RankedTensorOf<[F16, BF16, F32]>:$input,
+    RankedTensorOf<[I8]>:$scale,
+    I32Attr:$axis);
+  let results = (outs RankedTensorOf<[I8]>:$output);
+
+  let builders = [
+      OpBuilder<(ins "Value":$input, "Value":$scale, "int32_t":$axis), [{
+        auto inputTy = cast<RankedTensorType>(input.getType());
+        auto resultTy = mlir::triton::gpu::inferFpToFp4ResultType(
+            inputTy, axis, $_state.location);
+        assert(succeeded(resultTy));
+        build($_builder, $_state, *resultTy, input, scale, axis);
+      }]>
+  ];
+
+  let assemblyFormat = [{
+    $input `scale` $scale attr-dict
+        `:` type($input) `,` type($scale) `->` type($output)
+  }];
+
+  let extraClassDeclaration = [{
+    static std::optional<mlir::triton::LinearLayout>
+    computeScaleLayout(const mlir::triton::LinearLayout &outputLayout,
+                       int64_t axis, int64_t pairsPerScale);
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ScaledDowncastFp8Op
+//===----------------------------------------------------------------------===//
+
+def ScaledDowncastFp8Op : TT_AMDGPU_Op<"scaled_downcast_fp8", [
+    Pure,
+    DeclareOpInterfaceMethods<CastFpOpInterface>]> {
+  let summary = "Scale and downcast floating-point values to fp8";
+
+  let description = [{
+    Divide FP16, BF16, or FP32 values by an E8M0 scale and convert them to
+    fp8 (e4m3) or bf8 (e5m2) values. This is the elementwise inverse of
+    `scaled_upcast_fp8`: input and result share the same shape and encoding,
+    and each fp8 result occupies its own byte (no packing).
+
+    The `axis` attribute identifies the dimension along which scales are
+    shared. The scale must be compact along `axis`: one raw E8M0 i8 payload
+    covers multiple consecutive output elements along that axis (unlike
+    :func:`scaled_upcast_fp8`, expanded scales with one scale per output element
+    are not supported). Each scale block along `axis` must cover a multiple of 8
+    output elements.
+
+    This will be hardware accelerated on architectures supporting
+    `v_cvt_scalef32_pk_{fp8,bf8}_*` instructions (e.g. CDNA4 and CDNA5).
+
+    Instead of a scale tensor, `scale_const` can give one raw E8M0 byte shared
+    by every element. The conversion then takes the constant directly, so the
+    scale imposes no layout constraint and `axis` is not used.
+  }];
+
+  let arguments = (ins
+    RankedTensorOf<[F16, BF16, F32]>:$input,
+    Optional<RankedTensorOf<[I8]>>:$scale,
+    I32Attr:$axis,
+    OptionalAttr<I8Attr>:$scale_const);
+  let results = (outs RankedTensorOf<[AnyTypeOf<[F8E4M3FN, F8E5M2]>]>:$output);
+
+  let builders = [
+      OpBuilder<(ins "Value":$input, "Value":$scale, "Type":$elemType,
+                     "int32_t":$axis), [{
+        auto inputTy = cast<RankedTensorType>(input.getType());
+        auto resultTy = inputTy.clone(elemType);
+        build($_builder, $_state, resultTy, input, scale, axis,
+              /*scale_const=*/IntegerAttr());
+      }]>,
+      OpBuilder<(ins "Value":$input, "Type":$elemType,
+                     "uint8_t":$scaleConst), [{
+        auto inputTy = cast<RankedTensorType>(input.getType());
+        auto resultTy = inputTy.clone(elemType);
+        build($_builder, $_state, resultTy, input, /*scale=*/Value(),
+              /*axis=*/inputTy.getRank() - 1,
+              $_builder.getIntegerAttr($_builder.getIntegerType(8),
+                                       scaleConst));
+      }]>
+  ];
+
+  let assemblyFormat = [{
+    $input (`scale` $scale^)? attr-dict
+        `:` type($input) (`,` type($scale)^)? `->` type($output)
+  }];
+
+  let extraClassDeclaration = [{
+    static std::optional<mlir::triton::LinearLayout>
+    computeScaleLayout(const mlir::triton::LinearLayout &outputLayout,
+                       int64_t axis, int64_t elementsPerScale);
+  }];
+
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -848,11 +1023,13 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
   let summary = "Commit native vector MFMA fragments with live dependencies";
   let description = [{
     Returns every input unchanged after applying the architecture-defined MFMA
-    result hazard. Inputs may be direct transient `scheduled_mfma` results
-    followed by dot-operand live dependencies, or a set of direct persistent
-    results at an epilogue boundary. Multiple independent native results can
-    therefore share one completion boundary without first assembling a
-    logical tensor.
+    result hazard. Inputs may be direct transient `scheduled_mfma` or
+    `scheduled_mfma_scaled` results followed by dot-operand live dependencies
+    (BF16/F16 for unscaled layouts, i8 for scaled layouts), or a set of
+    direct persistent results at an epilogue boundary. Multiple independent
+    native results can therefore share one completion boundary without first
+    assembling a logical tensor. CDNA4 scaled accumulator layouts
+    (16x16x128 and 32x32x64) are supported alongside the unscaled shapes.
 
     Distributed MFMA and dot layouts determine storage roles and native
     fragment widths for rank-two or rank-three tensors. Source code does not
@@ -892,16 +1069,28 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     returning to an accumulator dependency chain, while preserving one SSA
     chain per output fragment. LLVM determines the final instruction schedule.
 
-    On the persistent lowering path, `resident_operand` is `none`, `lhs`, or
-    `rhs` and selects an input to constrain to AGPRs; the other input uses
-    VGPRs. The transient intrinsic path does not add those source-class
-    constraints, so a carried source needs a separate `register_resident`
-    boundary when hard residency is required.
     `accumulator_role` is `transient` for a phase-local result or `persistent`
-    for an accumulator carried across phases. `accumulator_register_class` is
-    `auto`, `agpr`, or `vgpr`. Persistent lowering honors this field: `auto`
-    selects AGPRs, while an explicit class supports kernels whose persistent
-    accumulator sets intentionally occupy complementary register classes. The
+    for an accumulator carried across phases. A persistent chain has two
+    guarantees that a transient chain does not: its accumulator keeps one
+    register class across phases, anchored by side-effecting accumulator pins,
+    and its result pins carry the MFMA completion wait when a result reaches
+    an unmodeled consumer (both described below). A transient result relies
+    on LLVM's hazard recognizer for native consumers and on `mfma_commit`
+    otherwise.
+
+    `resident_operand` is a separate operand-placement control, which only
+    the persistent path applies. It does not change either guarantee. `lhs` or
+    `rhs` constrains that input to AGPRs and the other input to VGPRs; `none`
+    constrains both inputs to VGPRs. `unconstrained` adds no input
+    register-class constraints and leaves input placement to LLVM. The
+    transient intrinsic path does not add those source-class constraints, so a
+    carried source needs a separate `register_resident` boundary when hard
+    residency is required.
+
+    `accumulator_register_class` is `auto`, `agpr`, or `vgpr`. Persistent
+    lowering honors this field: `auto` selects AGPRs, while an explicit class
+    supports kernels whose persistent accumulator sets intentionally occupy
+    complementary register classes. The
     transient intrinsic path leaves physical accumulator placement to LLVM.
     CDNA3 retains its VGPR-only accumulator contract and rejects any AGPR
     accumulator request, including persistent `auto`: a persistent accumulator
@@ -919,8 +1108,8 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     `scheduled_mfma` is visible from the commit.
 
     Both accumulator roles lower arithmetic to native ROCDL MFMA intrinsics.
-    Persistent operand register classes are constrained with inline
-    assembly. Persistent accumulator tuples are pinned after all K updates;
+    Persistent operand register classes, when requested, are constrained with
+    inline assembly. Persistent accumulator tuples are pinned after all K updates;
     nonconstant input accumulators are also pinned before the updates when
     `initialize` is false. These side-effecting accumulator pins constrain
     compiler-side ordering. Kernel chains with only native consumers and no
@@ -972,6 +1161,66 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
 }
 
 //===----------------------------------------------------------------------===//
+// ScheduledMfmaScaledOp
+//===----------------------------------------------------------------------===//
+
+def ScheduledMfmaScaledOp : TT_AMDGPU_Op<"scheduled_mfma_scaled"> {
+  let summary = "Execute native scaled MFMA fragments for microscaling operands";
+  let description = [{
+    Scaled twin of `scheduled_mfma`: computes the per-wave Cartesian product
+    of native `v_mfma_scale_f32_*_f8f6f4` fragments in `a` and `b`, replacing
+    every corresponding fragment in `acc`. LLVM determines the final
+    instruction schedule, as in `scheduled_mfma`.
+
+    `a` and `b` hold microscaling codes (formats named by
+    `a_format`/`b_format`: `e4m3`/`e5m2`, `e2m3`/`e3m2`, or `e2m1`) in
+    8-bit storage with logical-value shapes: each lane holds 32 values
+    per native step in K order, the first 32/24/16 bytes packed for
+    FP8/FP6/FP4 (16 FP6 values per 12 bytes; two FP4 codes per byte) and
+    the remaining bytes zero padding (code 0 decodes to 0.0). A dense
+    packed K layout needs a radix-3 repeat for FP6 that landed
+    LinearLayout cannot express yet, so v1 uses this padded form; each
+    lane feeds the packed bytes (8/6/4 x i32) per step through kWidth=8
+    dot-operand windows. `a_scale` and `b_scale` normally hold one E8M0 byte
+    per 32 logical values: shapes are [M, logicalK/32] and [N, logicalK/32]
+    in i8 storage. A single native FP8 step may instead consume one packed
+    i32 scale word per lane. In that form, `a_scale_selector` and
+    `b_scale_selector` select the first E8M0 byte passed to the instruction
+    without extracting it first. A two-step K128 chain reuses the word and
+    adds two to each selector for its second K64 instruction.
+
+    Packed-storage I8 operands use the transient contract. Typed FP8 dot
+    operands also support persistent accumulator chains and explicit AGPR or
+    VGPR placement, matching `scheduled_mfma`. Completion is represented
+    separately by `mfma_commit`:
+    `mfma_commit` accepts the scaled 16x16x128 and 32x32x64 accumulator
+    layouts (and live scaled i8 dot operands) and applies the modeled
+    scaled drain wait at the boundary.
+    CDNA4 (gfx950) only. All active lanes of a wave must execute this
+    operation uniformly.
+  }];
+
+  let arguments = (ins TT_Tensor:$a, TT_Tensor:$b, TT_Tensor:$acc,
+      TT_Tensor:$a_scale, TT_Tensor:$b_scale, StrAttr:$a_format,
+      StrAttr:$b_format, StrAttr:$resident_operand,
+      StrAttr:$accumulator_role, StrAttr:$accumulator_register_class,
+      BoolAttr:$initialize, OptionalAttr<I32Attr>:$a_scale_selector,
+      OptionalAttr<I32Attr>:$b_scale_selector);
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $a `,` $b `,` $acc `scales` $a_scale `,` $b_scale
+    `formats` $a_format `,` $b_format `resident` $resident_operand
+    `accumulator` $accumulator_role
+    `register_class` $accumulator_register_class `initialize` $initialize
+    attr-dict `:` type($a) `,` type($b) `,` type($acc) `,` type($a_scale)
+    `,` type($b_scale) `->` type($result)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // AsyncCopyLocalToGlobalOp
 //===----------------------------------------------------------------------===//
 
@@ -994,20 +1243,19 @@ def AsyncCopyLocalToGlobalOp
     This allows op to use async_copy_local_to_global even if the alignment cannot be proven based on IR.
   }];
 
-  let arguments = (ins Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
-      Arg<TT_PtrTensor, "", [MemWrite<GlobalMemory>]>:$dst,
-      Optional<I1Tensor>:$mask,
-      DefaultValuedAttr<TT_CacheModifierAttr,
-                        "triton::CacheModifier::NONE">:$cache,
-      DefaultValuedAttr<TT_EvictionPolicyAttr,
-                        "triton::EvictionPolicy::NORMAL">:$evict,
-      DefaultValuedAttr<I32Attr, "1">:$contiguity);
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", GenericSharedRead>:$src,
+    Arg<TT_PtrTensor, "", [MemWrite<GlobalMemory>]>:$dst,
+    Optional<I1Tensor>:$mask,
+    OptionalAttr<AnyAttr>:$cachePolicy,
+    DefaultValuedAttr<I32Attr, "1">:$contiguity
+  );
 
   let results = (outs TTG_AsyncToken:$token);
 
   let assemblyFormat = [{
     $src `,` $dst (`mask` $mask^)?
-    oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict)
+    oilist(`cachePolicy` `=` $cachePolicy)
     attr-dict `:` qualified(type($src)) `->` type($dst)
   }];
 }
@@ -1056,7 +1304,8 @@ def ReadBarrierPhaseOp
 
 def AsyncTDMCopyGlobalToLocalOp
     : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
-                   [DeclareOpInterfaceMethods<MBarrierOpInterface>,
+                   [GlobalToLocalCopyTrait,
+                    DeclareOpInterfaceMethods<MBarrierOpInterface>,
                     DeclareOpInterfaceMethods<TDMOpInterface>]> {
   let summary = "Copy data based on descriptor from global memory to local "
                 "memory asynchronously";
@@ -1140,7 +1389,7 @@ def AsyncTDMCopyGlobalToLocalOp
 
 def AsyncTDMFusedCopyGlobalToLocalOp
     : TT_AMDGPU_Op<"async_tdm_fused_copy_global_to_local",
-                   [AttrSizedOperandSegments]> {
+                   [GlobalToLocalCopyTrait, AttrSizedOperandSegments]> {
   let summary = "Fuse multiple TDM global-to-local copies into one async "
                 "operation";
 
@@ -1269,7 +1518,8 @@ def AsyncTDMScatterOp
 
 def AsyncTDMGatherOp
     : TT_AMDGPU_Op<
-          "async_tdm_gather", [DeclareOpInterfaceMethods<MBarrierOpInterface>,
+          "async_tdm_gather", [GlobalToLocalCopyTrait,
+                               DeclareOpInterfaceMethods<MBarrierOpInterface>,
                                DeclareOpInterfaceMethods<TDMOpInterface>]> {
   let summary = "Gather data from non-contiguous global memory rows to local "
                 "memory asynchronously";
@@ -1535,7 +1785,6 @@ def WaitBarrierOp
   let assemblyFormat = [{
     $alloc `,` $phase attr-dict `:` qualified(type($alloc))
   }];
-  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1591,7 +1840,6 @@ def AsyncCopyMbarrierArriveOp
       (ins Arg<TTG_MemDescType,
                "", BarrierSharedReadWrite>:$barrier);
   let assemblyFormat = "$barrier attr-dict `:` qualified(type($barrier))";
-  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//

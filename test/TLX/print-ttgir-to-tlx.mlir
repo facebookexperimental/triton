@@ -661,7 +661,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %118 = ttg.memdesc_index %arg26[%c0_i32_23] {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
         %119 = ttg.memdesc_index %arg56[%c0_i32_23] {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
         ttng.wait_barrier %119, %acc_75 {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
-        ttng.tc_gen5_mma %acc_67, %v_73, %acc_74, %offsetkv_y_60#0, %true_20, %115[%true_20], %116[%true_20], %118[%true_20], %arg27[%true_20], %arg28[%true_20] {async_task_id = array<i32: 1>, is_async, tmem.end = array<i32: 15, 15>, tmem.start = array<i32: 14, 14, 16, 16>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #tmem3, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>
+        %idx27_1d = ttg.memdesc_index %arg27[%c0_i32_23] {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+        %idx28_1d = ttg.memdesc_index %arg28[%c0_i32_23] {async_task_id = array<i32: 1>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+        ttng.tc_gen5_mma %acc_67, %v_73, %acc_74, %offsetkv_y_60#0, %true_20, %115[%true_20], %116[%true_20], %118[%true_20], %idx27_1d[%true_20], %idx28_1d[%true_20] {async_task_id = array<i32: 1>, is_async, tmem.end = array<i32: 15, 15>, tmem.start = array<i32: 14, 14, 16, 16>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #tmem3, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>
         %tile_idx_76 = arith.addi %tile_idx_26, %c1_i64_18 {async_task_id = array<i32: 1>} : i64
         scf.yield {async_task_id = array<i32: 1>} %tile_idx_76, %offsetkv_y_62, %offsetkv_y_61 : i64, i64, i64
       } {async_task_id = array<i32: 1>, tt.data_partition_factor = 2 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
@@ -1081,6 +1083,15 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return
   }
 
+  // CHECK: def read_only_store_wait(
+  // CHECK: tlx.async_descriptor_store_wait(0)
+  // CHECK: tlx.async_descriptor_store_wait(1, read_only=True)
+  tt.func public @read_only_store_wait() {
+    ttng.async_tma_store_wait {pendings = 0 : i32}
+    ttng.async_tma_store_wait {pendings = 1 : i32, read_only}
+    tt.return
+  }
+
   // CHECK: def diagnostic_memory_ops(
   // CHECK: var_{{[0-9_]+}} = tlx.local_slice({{.*}}, [128, 0], [128, 64])
   // CHECK: tlx.async_remote_shmem_copy(
@@ -1240,12 +1251,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
                                  %val: tensor<64x64xf16, #blocked>,
                                  %pred: i1) attributes {noinline = false} {
     llvm.intr.assume %pred : i1
-    %masked = amdg.buffer_load %ptr[%offs], %mask : tensor<64x64xf16, #blocked>
-    %plain = amdg.buffer_load %ptr[%offs] : tensor<64x64xf16, #blocked>
-    %other = amdg.buffer_load %ptr[%offs], %mask, %val : tensor<64x64xf16, #blocked>
+    %masked = amdg.buffer_load %ptr[%offs], %mask : !tt.ptr<f16> -> tensor<64x64xf16, #blocked>
+    %plain = amdg.buffer_load %ptr[%offs] : !tt.ptr<f16> -> tensor<64x64xf16, #blocked>
+    %other = amdg.buffer_load %ptr[%offs], %mask, %val : !tt.ptr<f16> -> tensor<64x64xf16, #blocked>
     %dst = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
-    %tok = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %dst : <f16>[tensor<64x64xi32, #blocked>] -> <64x64xf16, #shared, #smem, mutable>
-    amdg.buffer_store %val, %ptr[%offs], %mask : tensor<64x64xf16, #blocked>
+    %tok = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %dst : !tt.ptr<f16>[tensor<64x64xi32, #blocked>] -> <64x64xf16, #shared, #smem, mutable>
+    amdg.buffer_store %val, %ptr[%offs], %mask : !tt.ptr<f16> -> tensor<64x64xf16, #blocked>
     tt.return
   }
 }
@@ -1274,8 +1285,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
                                     %mask: tensor<64x64xi1, #blocked>) attributes {noinline = false} {
     %d0 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
     %d1 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
-    %t0 = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %d0 : <f16>[tensor<64x64xi32, #blocked>] -> <64x64xf16, #shared, #smem, mutable>
-    %t1 = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %d1 : <f16>[tensor<64x64xi32, #blocked>] -> <64x64xf16, #shared, #smem, mutable>
+    %t0 = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %d0 : !tt.ptr<f16>[tensor<64x64xi32, #blocked>] -> <64x64xf16, #shared, #smem, mutable>
+    %t1 = amdg.buffer_load_to_local %ptr[%offs] mask = %mask into %d1 : !tt.ptr<f16>[tensor<64x64xi32, #blocked>] -> <64x64xf16, #shared, #smem, mutable>
     %g = ttg.async_commit_group tokens %t0, %t1
     %w = ttg.async_wait %g {num = 1 : i32}
     tt.return
@@ -1535,15 +1546,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // tlx.workgroup_barrier brackets its ttg.barrier with two rocdl.sched.barrier
 // guards, so it is only emittable on CDNA. The same barrier on an NVIDIA
-// target must fall through rather than inject ROCDL into the kernel.
+// target must not inject ROCDL into the kernel; tl.debug_barrier covers it.
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  // Assert the fall-through positively too: a bare CHECK-NOT would also pass
+  // Assert the replacement positively too: a bare CHECK-NOT would also pass
   // if the barrier were dropped from the output altogether.
   // CHECK-LABEL: def barrier_is_not_mapped_off_amd(
   // CHECK-NOT: tlx.workgroup_barrier()
-  // CHECK: {{UNSUPPORTED}}: no TLX mapping for ttg.barrier
+  // CHECK: tl.debug_barrier()
   tt.func public @barrier_is_not_mapped_off_amd(%x: tensor<256xf32, #blocked>) attributes {noinline = false} {
     ttg.barrier local
     %m = arith.mulf %x, %x : tensor<256xf32, #blocked>

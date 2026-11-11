@@ -66,6 +66,8 @@ class warp_pipeline_stage:
         self._semantic = _internal.get("_semantic", None)
 
     def __enter__(self):
+        if self._semantic is not None:
+            self._semantic.builder.create_warp_pipeline_begin(self.label if self.label is not None else "cluster")
         return self
 
     def __exit__(self, exc_type, exc, tb):

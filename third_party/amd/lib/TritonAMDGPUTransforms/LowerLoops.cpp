@@ -3,6 +3,7 @@
 #include "Utility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/TargetInfo.h"
+#include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "amd/lib/TritonAMDGPUTransforms/PipelineUtility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/CGAEncodingAttr.h"
@@ -138,8 +139,8 @@ AsyncCopyChainOps createAsyncCopy(tt::LoadOp loadOp, Value alloc,
 
   auto copyOp = ttg::AsyncCopyGlobalToLocalOp::create(
       builder, loc, loadOp.getPtr(), viewLoad, loadOp.getMask(),
-      loadOp.getOther(), loadOp.getCache(), loadOp.getEvict(),
-      loadOp.getIsVolatile(), contiguity);
+      loadOp.getOther(), loadOp.getCachePolicyAttr(), loadOp.getIsVolatile(),
+      contiguity);
   auto commitOp =
       ttg::AsyncCommitGroupOp::create(builder, loc, copyOp->getResult(0));
   ttg::AsyncWaitOp waitOp =
@@ -227,50 +228,8 @@ std::optional<ttg::SharedEncodingTrait> getSharedEncIfAllUsersAreDotEnc(
       auto srcTy = cast<ttg::TensorOrMemDesc>(loadedValue.getType());
       auto cgaLayout = ttg::getCGALayout(srcTy.getEncoding());
 
-      auto order = getOrderForMemory(srcTy);
-      if (useAsyncCopy && !targetInfo.supportsDirectToLdsScatter()) {
-        // For architectures that don't support scattering into LDS we must
-        // ensure that each warp writes a contiguous memory chunk. This requires
-        // the shared memory order to follow the thread order, while preserving
-        // the fastest dimension from the memory order if it's contiguous > 1 to
-        // keep vectorization.
-        auto srcTensorTy = cast<RankedTensorType>(srcTy);
-        auto regOrder = triton::gpu::getOrder(srcTensorTy);
-        auto threadOrder = triton::gpu::getThreadOrder(srcTensorTy);
-
-        SetVector<unsigned> orderSet;
-
-        auto regContig =
-            triton::gpu::getContigPerThread(srcTensorTy)[regOrder[0]];
-        unsigned elemBitWidth = srcTy.getElementType().getIntOrFloatBitWidth();
-        unsigned finalRegContig =
-            fitToValidDirectToLdsVecSize(regContig, elemBitWidth, targetInfo);
-        // We only apply the order change if we find a vector size which works
-        // for async copy.
-        if (finalRegContig > 0) {
-          // Preserve the fastest reg dim for contig > 1 to keep vectorization.
-          if (finalRegContig > 1)
-            orderSet.insert(order[0]);
-          orderSet.insert(threadOrder.begin(), threadOrder.end());
-          order = orderSet.takeVector();
-        }
-      }
-
+      auto order = getLoadSharedOrder(srcTy, targetInfo, useAsyncCopy);
       unsigned bitWidth = srcTy.getElementType().getIntOrFloatBitWidth();
-      SmallVector<unsigned> sharedOrder;
-      int rank = order.size();
-      // TODO rework this when shared -> dotOperand conversions support
-      // arbitrary shared memory ordering
-      if (rank == 3) {
-        // Move the batch dimension (dim #0) to be the last so that it will be
-        // the slowest varying dimension.
-        for (unsigned i = 0; i < rank; ++i)
-          if (order[i] != 0)
-            sharedOrder.emplace_back(order[i]);
-        sharedOrder.emplace_back(0);
-      } else {
-        sharedOrder = order;
-      }
 
       auto userResEnc = cast<ttg::TensorOrMemDesc>(userResType).getEncoding();
       if (auto dotOpEnc = dyn_cast<ttg::DotOperandEncodingAttr>(userResEnc)) {
@@ -283,14 +242,8 @@ std::optional<ttg::SharedEncodingTrait> getSharedEncIfAllUsersAreDotEnc(
           canUseAsyncCopy = canBeConvertedToAsyncLoad(
               2, cast<tt::LoadOp>(loadOp), {}, axisInfoAnalysis, targetInfo);
         }
-        tempAttr = composePaddedLayout(targetFeatures, dotOpEnc.getOpIdx(),
-                                       dotOpEnc.getKWidth(), srcTy, sharedOrder,
-                                       dotOpEnc, canUseAsyncCopy);
-        if (!tempAttr) {
-          tempAttr = ttg::SwizzledSharedEncodingAttr::get(
-              loadedValue.getContext(), dotOpEnc, srcTy.getShape(), sharedOrder,
-              cgaLayout, bitWidth, /*needTrans=*/false);
-        }
+        tempAttr = getDotOperandSharedEncoding(targetFeatures, srcTy, order,
+                                               dotOpEnc, canUseAsyncCopy);
         LDBG("Deduced shared encoding candidate from dot layout: " << tempAttr);
         sharedEncs.push_back(tempAttr);
       } else if (auto llEnc = dyn_cast<ttg::LinearEncodingAttr>(userResEnc)) {
@@ -404,32 +357,10 @@ bool canBeConvertedToAsyncLoad(unsigned numBuffers, tt::LoadOp loadOp,
       !hasEnoughCTABytesForDirectToLds(loadOp, targetInfo))
     return false;
 
-  if (sharedEnc && hasDirectToLdsPath) {
-    // Compute the final vecSize we can use for the combination of
-    // sourceEncoding and sharedEncoding. We can only use AsyncCopy if the
-    // target supports the requested or a smaller vecSize because we cannot
-    // stride when loading directly to lds on GFX9
-    auto srcTy = cast<RankedTensorType>(loadOp.getPtr().getType());
-    auto regLayout = triton::gpu::toLinearLayout(srcTy);
-    // It's the allocation so we trim the multibuffer dimension
-    auto srcShape = srcTy.getShape();
-    triton::LinearLayout sharedLayout;
-    auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(sharedEnc);
-    if (paddedEnc) {
-      sharedLayout = paddedEnc.getLinearComponent();
-    } else {
-      sharedLayout = triton::gpu::toLinearLayout(srcShape, sharedEnc);
-    }
-    auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
-
-    unsigned elemBitWidth = tt::getPointeeBitWidth(srcTy);
-    unsigned vecSize = regToSharedLayout.getNumConsecutiveInOut();
-    if (paddedEnc)
-      vecSize = std::min(vecSize, paddedEnc.getMinInterval());
-
-    if (fitToValidDirectToLdsVecSize(vecSize, elemBitWidth, targetInfo) == 0)
-      return false;
-  }
+  if (sharedEnc && hasDirectToLdsPath)
+    return canLoadDirectToLdsInPipeline(
+        cast<RankedTensorType>(loadOp.getPtr().getType()), sharedEnc,
+        targetInfo);
 
   return true;
 }
@@ -659,6 +590,16 @@ LogicalResult initSchedule(int maxDist, Stages &stages, int numStages,
     asyncWaitCluster = 1;
     globalLoadCluster = 2;
     localLoadCluster = 3;
+    localStoreCluster = 4;
+  }
+
+  // TDM copy reordering to improve latency hiding.
+  bool tdmReorder = hasTDMLoad && hasScaledDot && !waitAtTail;
+  if (tdmReorder) {
+    globalLoadCluster = 0; // all TDM copies first
+    asyncWaitCluster = 1;  // single wait after the copies
+    localLoadCluster = 2;  // local_loads after the wait
+    computeCluster = 3;    // dot_scaled last
     localStoreCluster = 4;
   }
 
@@ -987,6 +928,18 @@ static void lowerLoop(scf::ForOp forOp,
                                   load, axisInfoAnalysis, targetFeatures,
                                   targetInfo, useAsyncCopy)
                                   .value_or(nullptr);
+        // local_store can't take a mixed-radix layout, so only an async copy
+        // can fill an NPOT stage; otherwise the load stays in registers.
+        auto loadOp = dyn_cast<tt::LoadOp>(load);
+        if (sharedEncoding && loadOp &&
+            ttg::getNpotLayoutUnsupportedReason(
+                OperationName(ttg::LocalStoreOp::getOperationName(),
+                              load->getContext()),
+                load->getResultTypes()) &&
+            !(useAsyncCopy &&
+              canBeConvertedToAsyncLoad(2, loadOp, sharedEncoding,
+                                        axisInfoAnalysis, targetInfo)))
+          sharedEncoding = nullptr;
         loadToInfo[load] = {sharedEncoding, distance, use};
         LDBG("Populate loadInfo with shared encoding: " << sharedEncoding);
       }

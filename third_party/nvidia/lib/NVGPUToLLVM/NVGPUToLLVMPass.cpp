@@ -211,7 +211,8 @@ public:
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
 
-    if (triton::gpu::lookupNumWarps(op) == 1) {
+    int numWarps = triton::gpu::lookupNumWarps(op);
+    if (numWarps == 1) {
       // If there is only one warp, the warp ID is always 0.
       rewriter.replaceOp(op, b.i32_val(0));
       return success();
@@ -225,6 +226,12 @@ public:
       tid = LLVM::SubOp::create(rewriter, loc, tid, b.i32_val(*startId));
 
     Value warpId = b.udiv(tid, b.i32_val(32));
+    auto func = op->getParentOfType<FunctionOpInterface>();
+    if (auto offset = func->getAttrOfType<IntegerAttr>(
+            triton::gpu::AttrWarpIdOffsetName)) {
+      warpId = b.sub(warpId, b.i32_val(offset.getInt()));
+      warpId = b.and_(warpId, b.i32_val(numWarps - 1));
+    }
     if (!op.getOmitUniformHint()) {
       // This indicates to PTXAS that the result and its derived values are
       // uniform across the warp. For example, if a branch condition derives
@@ -609,7 +616,9 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, std::string exclusive,
       // Non-TLX 2-CTA AutoWS: this code runs only in the default warp group's
       // exit path. Workers are in the switch loop and cannot participate in a
       // cluster-wide barrier, so use a CTA-level barrier instead.
-      NVVM::BarrierOp::create(b, loc);
+      // Warp-specialized groups may reach different copies of this barrier,
+      // so it must not require all threads to reach the same instruction.
+      NVVM::BarrierOp::create(b, loc, Value{}, Value{}, /*aligned=*/false);
     }
     PTXBuilder ptxBuilder;
     // Calculate the predicate in the inline asm to avoid creating long
@@ -719,6 +728,32 @@ static void lowerTensorMemoryAlloc(ModuleOp mod) {
   }
 }
 
+// Every TMEM access creates its own warp_id, and its shfl.sync uniform hint is
+// convergent, so LLVM never hoists it: each loop iteration recomputes tid ->
+// warp id -> shfl on the latency path right after the barrier wait that guards
+// the access. warp_id is pure and constant per partition, so compute it once at
+// the entry of its partition (or function) instead.
+void hoistWarpIds(ModuleOp mod) {
+  SmallVector<ttg::WarpIdOp> warpIds;
+  mod.walk([&](ttg::WarpIdOp op) { warpIds.push_back(op); });
+  DenseMap<std::pair<Block *, unsigned>, ttg::WarpIdOp> canonical;
+  for (ttg::WarpIdOp op : warpIds) {
+    Region *region = op->getParentRegion();
+    while (!isa<FunctionOpInterface, ttg::WarpSpecializePartitionsOp,
+                ttg::WarpSpecializeOp>(region->getParentOp()))
+      region = region->getParentRegion();
+    Block *entry = &region->front();
+    auto [it, inserted] =
+        canonical.try_emplace({entry, unsigned(op.getOmitUniformHint())}, op);
+    if (inserted) {
+      op->moveBefore(entry, entry->begin());
+    } else {
+      op.replaceAllUsesWith(it->second.getResult());
+      op->erase();
+    }
+  }
+}
+
 } // anonymous namespace
 
 class ConvertNVGPUToLLVM
@@ -732,6 +767,7 @@ public:
     ModuleOp mod = getOperation();
     RewritePatternSet patterns(context);
 
+    hoistWarpIds(mod);
     patterns.add<ClusterCTAIdOpPattern, WGMMAOpPattern, LoadAcquireOpPattern,
                  WGMMAWaitGroupOpPattern, WarpIdOpPattern>(context);
 

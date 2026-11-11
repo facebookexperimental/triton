@@ -1,9 +1,7 @@
 #include "TritonAMDGPUToLLVM/Passes.h"
 
-#include "AsyncUtility.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TargetInfo.h"
-#include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/TypeConverter.h"
 #include "TritonAMDGPUTransforms/SchedulingAttributes.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
@@ -23,7 +21,6 @@
 #include "third_party/amd/include/Analysis/AxisInfoExt.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/Allocation.h"
-#include "triton/Analysis/Membar.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
@@ -218,6 +215,7 @@ public:
     addIllegalDialect<triton::instrument::TritonInstrumentDialect>();
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
+    addIllegalOp<triton::amdgpu::BufferLoadToLocalOp>();
     // Warp specialization is lowered later.
     addLegalOp<triton::gpu::WarpSpecializeOp>();
     addLegalOp<triton::gpu::WarpYieldOp>();
@@ -231,6 +229,7 @@ public:
     // must fail the conversion instead of leaving the op behind. The rest of
     // the dialect stays unmarked: some of it is lowered later.
     addIllegalOp<triton::amdgpu::ScheduledMfmaOp>();
+    addIllegalOp<triton::amdgpu::ScheduledMfmaScaledOp>();
     addIllegalOp<triton::amdgpu::MfmaCommitOp>();
   }
 };
@@ -385,6 +384,20 @@ struct ConvertTritonAMDGPUToLLVM
       return signalPassFailure();
     }
 
+    // A failed conversion pattern alone does not fail partial conversion for
+    // AMD ops with unknown legality. Reject unsupported cluster scope before
+    // conversion so no buffer atomic can silently remain unlowered.
+    if (targetInfo.getISAFamily() != triton::amdgpu::ISAFamily::GFX1250) {
+      WalkResult result = mod.walk([](triton::amdgpu::BufferAtomicRMWOp op) {
+        if (!op.getClusterScope())
+          return WalkResult::advance();
+        op.emitOpError("cluster_scope requires gfx1250");
+        return WalkResult::interrupt();
+      });
+      if (result.wasInterrupted())
+        return signalPassFailure();
+    }
+
     // Function/CFG conversion can replace block arguments with materialization
     // casts, so classify the original tensor graph before the first conversion.
     AMD::ScheduledMfmaLoweringState scheduledMfmaState;
@@ -408,14 +421,7 @@ struct ConvertTritonAMDGPUToLLVM
     ModuleAllocation allocation(mod, allocationFn,
                                 targetInfo.getSharedMemoryPartitionSize());
 
-    if (targetInfo.requiresAliasInfoForAsyncOps())
-      AMD::annotateLocalLoadsSyncedViaAsyncWait(mod);
-
-    ModuleMembarAnalysis membarPass(allocation, AMD::membarFilter,
-                                    AMD::getWarpLocalScratchSync());
-    membarPass.run();
     materializeDeferredSchedGroupBarriers(mod);
-
     // Lower functions
     {
       TritonLLVMFunctionConversionTarget funcTarget(*context);
@@ -490,7 +496,7 @@ struct ConvertTritonAMDGPUToLLVM
         enableTreeReduction);
     populatePatterns7(mlir::triton::populateScanOpToLLVMPatterns,
                       commonBenefit);
-    populatePatterns5(mlir::triton::populateViewOpToLLVMPatterns,
+    populatePatterns7(mlir::triton::populateViewOpToLLVMPatterns,
                       commonBenefit);
     AMD::populateHistogramOpToLLVMPatterns(typeConverter, patterns, targetInfo,
                                            AMDBenefit);
@@ -503,9 +509,9 @@ struct ConvertTritonAMDGPUToLLVM
     AMD::populateMemoryOpToLLVMPatterns(typeConverter, patterns, targetInfo,
                                         AMDBenefit, coordinateGroups,
                                         scheduledMfmaState);
-    mlir::triton::populateMemoryOpToLLVMPatterns(typeConverter, targetInfo,
-                                                 patterns, commonBenefit,
-                                                 std::move(coordinateGroups));
+    mlir::triton::populateMemoryOpToLLVMPatterns(
+        typeConverter, targetInfo, patterns, axisInfoAnalysis, commonBenefit,
+        std::move(coordinateGroups));
     mlir::triton::populateMakeRangeOpToLLVMPattern(typeConverter, targetInfo,
                                                    patterns, commonBenefit);
     mlir::triton::populateAssertOpToLLVMPattern(typeConverter, patterns,

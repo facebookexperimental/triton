@@ -1,9 +1,12 @@
-// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=84' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=84' -reconcile-unrealized-casts | FileCheck %s
-// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=85' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=85' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX85 %s
-// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=86' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=86' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX86 %s
-// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=88' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=88' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX88 %s
-// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=107 ptx-version=87' --initialize-ws-cluster-barriers='compute-capability=107 ptx-version=87' -reconcile-unrealized-casts | FileCheck --check-prefix=RUBIN-PTX87 %s
-// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=107 ptx-version=94' --initialize-ws-cluster-barriers='compute-capability=107 ptx-version=94' -reconcile-unrealized-casts | FileCheck --check-prefix=RUBIN %s
+// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --triton-nvidia-gpu-membar='compute-capability=90 ptx-version=84' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=84' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=84' -reconcile-unrealized-casts | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --triton-nvidia-gpu-membar='compute-capability=90 ptx-version=85' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=85' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=85' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX85 %s
+// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --triton-nvidia-gpu-membar='compute-capability=90 ptx-version=86' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=86' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=86' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX86 %s
+// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --triton-nvidia-gpu-membar='compute-capability=90 ptx-version=88' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=88' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=88' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX88 %s
+// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --triton-nvidia-gpu-membar='compute-capability=107 ptx-version=87' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=107 ptx-version=87' --initialize-ws-cluster-barriers='compute-capability=107 ptx-version=87' -reconcile-unrealized-casts | FileCheck --check-prefix=RUBIN-PTX87 %s
+// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --triton-nvidia-gpu-membar='compute-capability=107 ptx-version=94' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=107 ptx-version=94' --initialize-ws-cluster-barriers='compute-capability=107 ptx-version=94' -reconcile-unrealized-casts | FileCheck --check-prefix=RUBIN %s
+// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --triton-nvidia-gpu-membar='compute-capability=90' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm=compute-capability=90 --initialize-ws-cluster-barriers=compute-capability=90 --canonicalize-llvm-ir -reconcile-unrealized-casts | FileCheck --check-prefix=CLUSTER-MASK %s
+// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --triton-nvidia-gpu-membar='compute-capability=100 ptx-version=86' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=86' --initialize-ws-cluster-barriers='compute-capability=100 ptx-version=86' --canonicalize-llvm-ir -reconcile-unrealized-casts | FileCheck --check-prefix=CANONICALIZE-SM100 %s
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv=compute-capability=90 --test-print-buffer-region -verify-diagnostics=only-expected -o /dev/null
 
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
@@ -46,9 +49,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: init_barrier_cluster_broadcast
+  // CLUSTER-MASK-LABEL: init_barrier_cluster_broadcast
   tt.func @init_barrier_cluster_broadcast() {
     %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1xi64, #shared0, #smem, mutable>
     // CHECK: nvg.cluster_id
+    // CLUSTER-MASK: [[CTA:%.*]] = nvg.cluster_id
+    // CLUSTER-MASK-NOT: llvm.and [[CTA]], {{.*}} : i32
+    // CLUSTER-MASK: llvm.icmp "eq" [[CTA]], {{.*}} : i32
     // CHECK: @$0 mbarrier.init.shared::cta.b64 [$1], 2;
     ttng.init_barrier %alloc, 1 : !ttg.memdesc<1xi64, #shared0, #smem, mutable>
     ttng.inval_barrier %alloc : !ttg.memdesc<1xi64, #shared0, #smem, mutable>
@@ -189,6 +196,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: arrive_barrier_fromCTA0
+  tt.func @arrive_barrier_fromCTA0(%alloc: !ttg.memdesc<2xi64, #barrier, #smem, mutable>, %pred: i1) {
+    // CHECK: llvm.icmp "ult"
+    // CHECK: nvvm.read.ptx.sreg.cluster.ctarank
+    // CHECK: llvm.ptrtoint
+    // CHECK: llvm.xor
+    // CHECK: mbarrier.arrive.shared::cluster.b64
+    ttng.arrive_barrier %alloc, 1, %pred {fromCTA = 0 : i32} : !ttg.memdesc<2xi64, #barrier, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
@@ -215,7 +239,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
 module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: arrive_barrier_multicast_absent
   tt.func public @arrive_barrier_multicast_absent(%alloc: !ttg.memdesc<1xi64, #shared0, #smem, mutable>) {
-    // No ctaMask → non-multicast path.
+    // No multicastCTA → non-multicast path.
     // CHECK-NOT: fence.mbarrier_init.release.cluster
     // CHECK-NOT: nvvm.cluster.arrive
     // CHECK: mbarrier.arrive.shared::cta.b64
@@ -251,7 +275,7 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.num-ctas" = 1 : i32, "ttg
     // RUBIN-LABEL: arrive_barrier_multicast
     // RUBIN: mbarrier.arrive.shared::cluster.multicast::cluster::32b.b64 _, [${{.*}}], ${{.*}};
     ttng.init_barrier %alloc, 1 : !ttg.memdesc<1xi64, #shared0, #smem, mutable>
-    ttng.arrive_barrier %alloc, 1 {ctaMask = 1 : i32} : !ttg.memdesc<1xi64, #shared0, #smem, mutable>
+    ttng.arrive_barrier %alloc, 1 {multicastCTA = 1 : i32} : !ttg.memdesc<1xi64, #shared0, #smem, mutable>
     tt.return
   }
 }
@@ -370,6 +394,26 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-SAME: "r,r,r,b" {{.*}}%[[UNIQUE_THREAD]]
   tt.func @async_shared_store_predicates_redundant_threads(%src: tensor<64xi32, #blocked>, %dst: !ttg.memdesc<64xi32, #shared, #smem, mutable>, %mbarrier: !ttg.memdesc<2xi64, #shared, #smem, mutable>) {
     ttng.async_shared_store %src, %dst, %mbarrier : tensor<64xi32, #blocked> -> !ttg.memdesc<64xi32, #shared, #smem, mutable>, !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1], [2], [4]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 8 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: expect_barrier_fromCTA0145
+  tt.func @expect_barrier_fromCTA0145(%barrier: !ttg.memdesc<8xi64, #barrier, #smem, mutable>, %pred: i1) {
+    // CHECK: llvm.mlir.constant(2 : i32)
+    // CHECK: llvm.icmp "ult"
+    // CHECK: nvvm.read.ptx.sreg.cluster.ctarank
+    // CHECK: llvm.mlir.constant(2 : i32)
+    // CHECK: llvm.shl
+    // CHECK: llvm.ptrtoint
+    // CHECK: llvm.xor
+    // CHECK: @$0 mbarrier.arrive.expect_tx.shared::cluster.b64 _, [$1], 16384;
+    ttng.barrier_expect %barrier, 16384 {fromCTA = 5 : i32}, %pred : !ttg.memdesc<8xi64, #barrier, #smem, mutable>
     tt.return
   }
 }
@@ -809,7 +853,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
   // CHECK: llvm.align = 64
   // CHECK: llvm.byval = !llvm.array<128 x i8>
   // CHECK: nvvm.grid_constant
-  tt.func @byval_tma_desc(%desc: !tt.ptr<i8, 0> {tt.nv_tma_desc = 1 : i32}) {
+  tt.func @byval_tma_desc(%desc: !tt.ptr<i8, "descriptor"> {tt.nv_tma_desc = 1 : i32}) {
     tt.return
   }
 }
@@ -822,17 +866,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c256_i32 = arith.constant 256 : i32
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
-    // CHECK: tensormap.replace.tile.global_address.shared::cta.b1024.b64 [ $0 + 0 ], $1;
-    // CHECK: tensormap.replace.tile.rank.shared::cta.b1024.b32 [ $0 + 0 ], 0x0;
+    // CHECK: llvm.cond_br
+    // CHECK: llvm.inline_asm has_side_effects {{.*}} "tensormap.replace.tile.global_address.shared::cta.b1024.b64 [ $0 + 0 ], $1;"
+    // CHECK-NOT: tensormap.replace.tile.rank
     // CHECK: tensormap.replace.tile.box_dim.shared::cta.b1024.b32 [ $0 + 0 ], 0x0, $1;
     // CHECK: tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [ $0 + 0 ], 0x0, $1;
     // CHECK: tensormap.replace.tile.element_stride.shared::cta.b1024.b32 [ $0 + 0 ], 0x0, $1;
     // CHECK: tensormap.replace.tile.elemtype.shared::cta.b1024.b32 [ $0 + 0 ], 0x3;
-    // CHECK: tensormap.replace.tile.interleave_layout.shared::cta.b1024.b32 [ $0 + 0 ], 0x0;
+    // CHECK-NOT: tensormap.replace.tile.interleave_layout
     // CHECK: tensormap.replace.tile.swizzle_mode.shared::cta.b1024.b32 [ $0 + 0 ], 0x2;
-    // CHECK: tensormap.replace.tile.fill_mode.shared::cta.b1024.b32 [ $0 + 0 ], 0x1;
+    // CHECK-NOT: tensormap.replace.tile.fill_mode
     // CHECK: tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned [ $0 + 0 ], [ $1 + 0 ], 0x80;
-    ttng.tensormap_create %arg1, %arg0, [%c256_i32], [%arg2], [], [%c1_i32] {elem_type = 3 : i32, fill_mode = 1 : i32, interleave_layout = 0 : i32, swizzle_mode = 2 : i32, allocation.offset = 0 : i32} : (!tt.ptr<i8>, !tt.ptr<i16>, i32, i32, i32) -> ()
+    ttng.tensormap_create %arg1, %arg0, [%c256_i32], [%arg2], [], [%c1_i32] {elem_type = 3 : i32, fill_mode = 0 : i32, interleave_layout = 0 : i32, swizzle_mode = 2 : i32, allocation.offset = 0 : i32} : (!tt.ptr<i8>, !tt.ptr<i16>, i32, i32, i32) -> ()
     tt.return
   }
 }
@@ -846,7 +891,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
     %c1024_i64 = arith.constant 1024 : i64
-    // CHECK: tensormap.replace.tile.global_address.shared::cta.b1024.b64 [ $0 + 0 ], $1;
+    // CHECK: llvm.cond_br {{.*}}, ^{{bb[0-9]+}}, ^[[COPY:bb[0-9]+]]
+    // CHECK: llvm.inline_asm has_side_effects {{.*}} "tensormap.replace.tile.global_address.shared::cta.b1024.b64 [ $0 + 0 ], $1;"
     // CHECK: tensormap.replace.tile.rank.shared::cta.b1024.b32 [ $0 + 0 ], 0x1;
     // CHECK: tensormap.replace.tile.box_dim.shared::cta.b1024.b32 [ $0 + 0 ], 0x0, $1;
     // CHECK: tensormap.replace.tile.box_dim.shared::cta.b1024.b32 [ $0 + 0 ], 0x1, $1;
@@ -856,11 +902,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: tensormap.replace.tile.element_stride.shared::cta.b1024.b32 [ $0 + 0 ], 0x0, $1;
     // CHECK: tensormap.replace.tile.element_stride.shared::cta.b1024.b32 [ $0 + 0 ], 0x1, $1;
     // CHECK: tensormap.replace.tile.elemtype.shared::cta.b1024.b32 [ $0 + 0 ], 0x3;
-    // CHECK: tensormap.replace.tile.interleave_layout.shared::cta.b1024.b32 [ $0 + 0 ], 0x0;
+    // CHECK: tensormap.replace.tile.interleave_layout.shared::cta.b1024.b32 [ $0 + 0 ], 0x1;
     // CHECK: tensormap.replace.tile.swizzle_mode.shared::cta.b1024.b32 [ $0 + 0 ], 0x2;
     // CHECK: tensormap.replace.tile.fill_mode.shared::cta.b1024.b32 [ $0 + 0 ], 0x1;
+    // CHECK: ^[[COPY]]:
+    // CHECK: bar.warp.sync
     // CHECK: tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned [ $0 + 0 ], [ $1 + 0 ], 0x80;
-    ttng.tensormap_create %arg1, %arg0, [%c256_i32, %c256_i32], [%arg2, %arg2], [%c1024_i64], [%c1_i32, %c1_i32] {elem_type = 3 : i32, fill_mode = 1 : i32, interleave_layout = 0 : i32, swizzle_mode = 2 : i32, allocation.offset = 0 : i32} : (!tt.ptr<i8>, !tt.ptr<i16>, i32, i32, i32, i32, i64, i32, i32) -> ()
+    ttng.tensormap_create %arg1, %arg0, [%c256_i32, %c256_i32], [%arg2, %arg2], [%c1024_i64], [%c1_i32, %c1_i32] {elem_type = 3 : i32, fill_mode = 1 : i32, interleave_layout = 1 : i32, swizzle_mode = 2 : i32, allocation.offset = 0 : i32} : (!tt.ptr<i8>, !tt.ptr<i16>, i32, i32, i32, i32, i64, i32, i32) -> ()
     tt.return
   }
 }
@@ -973,41 +1021,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 // CHECK-LABEL: mbarrier_sync_cluster_init
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @mbarrier_sync_cluster_init() {
-    // CHECK: fence.mbarrier_init.release.cluster
+    // CHECK: [[ELECT:%.*]] = nvvm.elect.sync
+    // CHECK: [[ISSUER:%.*]] = llvm.and %{{.*}}, [[ELECT]] : i1
+    // CHECK: fence.mbarrier_init.release.cluster {{.*}}"b" [[ISSUER]]
     // CHECK: nvvm.cluster.arrive.relaxed
     // CHECK-NEXT: nvvm.cluster.wait
     ttng.fence_mbarrier_init_release_cluster
     ttng.cluster_barrier {relaxed = 1 : i1}
     tt.return
-  }
-}
-
-// -----
-
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 4 : i32} {
-  // CHECK-LABEL: @cluster_arrive_not_warp_specialized
-  llvm.func @cluster_arrive_not_warp_specialized() {
-    // CHECK-NOT: ttg.warp_specialize
-    // CHECK: nvvm.cluster.arrive
-    ttng.cluster_arrive
-    llvm.return
-  }
-}
-
-// -----
-
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 8 : i32} {
-  // CHECK-LABEL: @cluster_arrive_warp_specialized
-  llvm.func @cluster_arrive_warp_specialized() {
-    // CHECK: ttg.warp_specialize() attributes {warpGroupStartIds = array<i32: 4>}
-    // CHECK: default {
-    // CHECK-NEXT: nvvm.cluster.arrive.relaxed
-    // CHECK-NEXT: ttg.warp_yield
-    // CHECK: partition0() num_warps(4) {
-    // CHECK-NEXT: nvvm.cluster.arrive.relaxed
-    // CHECK-NEXT: ttg.warp_return
-    ttng.cluster_arrive {relaxed = true}
-    llvm.return
   }
 }
 
@@ -1131,7 +1152,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   }
 
   // CHECK-LABEL: @local_store_subslice_other_cta
-  // CHECK: mapa.shared::cluster.u32
+  // CHECK: nvvm.mapa
   // CHECK: st.shared::cluster.b32
   tt.func @local_store_subslice_other_cta(%vals: tensor<2x32xi32, #local_subslice_blocked>) {
     %src = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<4x32xi32, #local_subslice_shared, #ttg.shared_memory, mutable>
@@ -1152,13 +1173,15 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   }
 
   // CHECK-LABEL: @local_atomic_subslice_other_cta
-  // CHECK: mapa.shared::cluster.u32
+  // CHECK: nvvm.mapa
   // CHECK: atom.shared::cluster.cluster.relaxed.add.u32
+  // CHECK: nvvm.cluster.arrive
+  // CHECK: nvvm.cluster.wait
   tt.func @local_atomic_subslice_other_cta(%out: !tt.ptr<i32>, %vals: tensor<2x32xi32, #local_subslice_blocked>) {
     %src = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<4x32xi32, #local_subslice_shared, #ttg.shared_memory, mutable>
     %tile = ttg.memdesc_subslice %src [2, 0] : !ttg.memdesc<4x32xi32, #local_subslice_shared, #ttg.shared_memory, mutable> -> !ttg.memdesc<2x32xi32, #local_subslice_shared, #ttg.shared_memory, mutable, 4x32>
     %idx = arith.constant dense<0> : tensor<2x32xi32, #local_subslice_blocked>
-    %old = ttg.local_atomic_scatter_rmw add, %tile[%idx], %vals {axis = 1 : i32} : (!ttg.memdesc<2x32xi32, #local_subslice_shared, #ttg.shared_memory, mutable, 4x32>, tensor<2x32xi32, #local_subslice_blocked>, tensor<2x32xi32, #local_subslice_blocked>) -> tensor<2x32xi32, #local_subslice_blocked>
+    %old = ttg.local_atomic_scatter_rmw add, %tile[%idx], %vals {axis = 1 : i32, allocation.offset = 256 : i32} : (!ttg.memdesc<2x32xi32, #local_subslice_shared, #ttg.shared_memory, mutable, 4x32>, tensor<2x32xi32, #local_subslice_blocked>, tensor<2x32xi32, #local_subslice_blocked>) -> tensor<2x32xi32, #local_subslice_blocked>
     %ptrs = tt.splat %out : !tt.ptr<i32> -> tensor<2x32x!tt.ptr<i32>, #local_subslice_blocked>
     %offs = arith.constant dense<0> : tensor<2x32xi32, #local_subslice_blocked>
     %out_ptrs = tt.addptr %ptrs, %offs : tensor<2x32x!tt.ptr<i32>, #local_subslice_blocked>, tensor<2x32xi32, #local_subslice_blocked>
@@ -1167,7 +1190,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   }
 
   // CHECK-LABEL: @local_atomic_inc_subslice_other_cta
-  // CHECK: mapa.shared::cluster.u32
+  // CHECK: nvvm.mapa
   // CHECK: red.shared::cluster.cluster.relaxed.inc.u32
   tt.func @local_atomic_inc_subslice_other_cta() {
     %src = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<4x32xi32, #local_subslice_shared, #ttg.shared_memory, mutable>
@@ -1191,11 +1214,13 @@ module attributes {"ttg.num-ctas" = 16 : i32, "ttg.num-warps" = 1 : i32, "ttg.th
   // CHECK: nvvm.mapa
   // CHECK: llvm.load {{.*}} : !llvm.ptr<7> -> i32
   // CHECK: llvm.return
-  tt.func private @local_gather_sharded_16_ctas() -> tensor<32x32xi32, #local_gather_cga16_blocked> {
+  tt.func @local_gather_sharded_16_ctas(%out: tensor<32x32x!tt.ptr<i32>, #local_gather_cga16_blocked>) {
     %src = ttg.local_alloc {allocation.offset = [0 : i32]} : () -> !ttg.memdesc<32x32xi32, #local_gather_cga16_sharded, #ttg.shared_memory, mutable>
     %idx = arith.constant dense<0> : tensor<32x32xi32, #local_gather_cga16_blocked>
+    // expected-remark @+1 {{Buffers: [0, 256]}}
     %g = ttg.local_gather %src[%idx] {axis = 1 : i32} : !ttg.memdesc<32x32xi32, #local_gather_cga16_sharded, #ttg.shared_memory, mutable>, tensor<32x32xi32, #local_gather_cga16_blocked> -> tensor<32x32xi32, #local_gather_cga16_blocked>
-    tt.return %g : tensor<32x32xi32, #local_gather_cga16_blocked>
+    tt.store %out, %g : tensor<32x32x!tt.ptr<i32>, #local_gather_cga16_blocked>
+    tt.return
   }
 
   // CHECK-LABEL: @local_gather_partial_broadcast_16_ctas
@@ -1213,11 +1238,13 @@ module attributes {"ttg.num-ctas" = 16 : i32, "ttg.num-warps" = 1 : i32, "ttg.th
   // CHECK: nvvm.mapa
   // CHECK: llvm.load {{.*}} : !llvm.ptr<7> -> i32
   // CHECK: llvm.return
-  tt.func private @local_gather_partial_broadcast_16_ctas() -> tensor<32x32xi32, #local_gather_cga16_blocked> {
+  tt.func @local_gather_partial_broadcast_16_ctas(%out: tensor<32x32x!tt.ptr<i32>, #local_gather_cga16_blocked>) {
     %src = ttg.local_alloc {allocation.offset = [0 : i32]} : () -> !ttg.memdesc<32x32xi32, #local_gather_cga16_partial, #ttg.shared_memory, mutable>
     %idx = arith.constant dense<0> : tensor<32x32xi32, #local_gather_cga16_blocked>
+    // expected-remark @+1 {{Buffers: [0, 1024]}}
     %g = ttg.local_gather %src[%idx] {axis = 1 : i32} : !ttg.memdesc<32x32xi32, #local_gather_cga16_partial, #ttg.shared_memory, mutable>, tensor<32x32xi32, #local_gather_cga16_blocked> -> tensor<32x32xi32, #local_gather_cga16_blocked>
-    tt.return %g : tensor<32x32xi32, #local_gather_cga16_blocked>
+    tt.store %out, %g : tensor<32x32x!tt.ptr<i32>, #local_gather_cga16_blocked>
+    tt.return
   }
 
   // CHECK-LABEL: @local_gather_full_broadcast_16_ctas
@@ -1225,11 +1252,13 @@ module attributes {"ttg.num-ctas" = 16 : i32, "ttg.num-warps" = 1 : i32, "ttg.th
   // CHECK: llvm.load {{.*}} : !llvm.ptr<3> -> i32
   // CHECK-NOT: nvvm.mapa
   // CHECK: llvm.return
-  tt.func private @local_gather_full_broadcast_16_ctas() -> tensor<32x32xi32, #local_gather_cga16_blocked> {
+  tt.func @local_gather_full_broadcast_16_ctas(%out: tensor<32x32x!tt.ptr<i32>, #local_gather_cga16_blocked>) {
     %src = ttg.local_alloc {allocation.offset = [0 : i32]} : () -> !ttg.memdesc<32x32xi32, #local_gather_cga16_broadcast, #ttg.shared_memory, mutable>
     %idx = arith.constant dense<0> : tensor<32x32xi32, #local_gather_cga16_blocked>
+    // expected-remark @+1 {{Buffers: [0, 4096]}}
     %g = ttg.local_gather %src[%idx] {axis = 1 : i32} : !ttg.memdesc<32x32xi32, #local_gather_cga16_broadcast, #ttg.shared_memory, mutable>, tensor<32x32xi32, #local_gather_cga16_blocked> -> tensor<32x32xi32, #local_gather_cga16_blocked>
-    tt.return %g : tensor<32x32xi32, #local_gather_cga16_blocked>
+    tt.store %out, %g : tensor<32x32x!tt.ptr<i32>, #local_gather_cga16_blocked>
+    tt.return
   }
 }
 
@@ -1249,8 +1278,9 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
   tt.func @cluster_barrier_inside_warp_specialize() {
     ttg.warp_specialize()
     default {
-      // CHECK: nvvm.barrier
+      // CHECK-NOT: nvvm.barrier
       // CHECK: %[[COUNTER:.*]] = llvm.load
+      // CHECK-NEXT: nvvm.barrier
       // CHECK: %[[BARRIER_IDX:.*]] = llvm.and %[[COUNTER]]
       // CHECK: %[[PARITY:.*]] = llvm.lshr %[[COUNTER]]
       // CHECK: %[[BARRIER:.*]] = llvm.getelementptr %{{.*}}[%[[BARRIER_IDX]]]
@@ -1260,10 +1290,11 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
       // CHECK-NOT: mapa
       // CHECK: mbarrier.arrive.release.cluster.shared::cluster.b64
       // CHECK: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64
+      // CHECK-NOT: nvvm.barrier
       // CHECK: %[[NEXT_COUNTER:.*]] = llvm.add %[[COUNTER]]
       // CHECK: llvm.and %[[NEXT_COUNTER]]
       // CHECK: st.shared.b32
-      // CHECK: nvvm.barrier
+      // CHECK-NEXT: nvvm.barrier
       ttng.cluster_barrier
       ttg.warp_yield
     }
@@ -1312,6 +1343,10 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
   // CHECK: nvvm.barrier
   // RUBIN-LABEL: @cluster_barrier_inside_warp_specialize_rubin
   // RUBIN-COUNT-2: mbarrier.init.shared::cta.b64 [$1], 3;
+  // RUBIN: nvvm.cluster.wait
+  // RUBIN-NOT: nvvm.barrier
+  // RUBIN: %[[RUBIN_COUNTER:.*]] = llvm.load
+  // RUBIN-NEXT: nvvm.barrier
   // RUBIN: %[[CTA:.*]] = nvvm.read.ptx.sreg.cluster.ctarank
   // RUBIN-DAG: %[[ALL_CTAS:.*]] = llvm.mlir.constant(15 : i32) : i32
   // RUBIN-DAG: %[[SELF_MASK:.*]] = llvm.shl %{{.*}}, %[[CTA]] : i32
@@ -1324,6 +1359,11 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
   // RUBIN-PTX87: %[[ARRIVE_PRED:.*]] = llvm.icmp "ult"
   // RUBIN-PTX87-COUNT-1: mbarrier.arrive.release.cluster.shared::cluster.b64
   // RUBIN-PTX87-NOT: multicast::cluster::32b
+  // RUBIN-NOT: nvvm.barrier
+  // RUBIN: %[[RUBIN_NEXT_COUNTER:.*]] = llvm.add %[[RUBIN_COUNTER]]
+  // RUBIN: llvm.and %[[RUBIN_NEXT_COUNTER]]
+  // RUBIN: st.shared.b32
+  // RUBIN-NEXT: nvvm.barrier
   tt.func @cluster_barrier_inside_warp_specialize_rubin() {
     ttg.warp_specialize()
     default {
@@ -1390,35 +1430,6 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 // -----
 
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 4 : i32} {
-  // CHECK-LABEL: @cluster_wait_not_warp_specialized
-  llvm.func @cluster_wait_not_warp_specialized() {
-    // CHECK-NOT: ttg.warp_specialize
-    // CHECK: nvvm.cluster.wait
-    ttng.cluster_wait
-    llvm.return
-  }
-}
-
-// -----
-
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 8 : i32} {
-  // CHECK-LABEL: @cluster_wait_warp_specialized
-  llvm.func @cluster_wait_warp_specialized() {
-    // CHECK: ttg.warp_specialize() attributes {warpGroupStartIds = array<i32: 4>}
-    // CHECK: default {
-    // CHECK-NEXT: nvvm.cluster.wait
-    // CHECK-NEXT: ttg.warp_yield
-    // CHECK: partition0() num_warps(4) {
-    // CHECK-NEXT: nvvm.cluster.wait
-    // CHECK-NEXT: ttg.warp_return
-    ttng.cluster_wait
-    llvm.return
-  }
-}
-
-// -----
-
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 4 : i32} {
   // CHECK-LABEL: @cluster_barrier_not_warp_specialized
   llvm.func @cluster_barrier_not_warp_specialized() {
     // CHECK-NOT: ttg.warp_specialize
@@ -1445,5 +1456,504 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
     // CHECK-NEXT: ttg.warp_return
     ttng.cluster_barrier {relaxed = true}
     llvm.return
+  }
+}
+
+// -----
+
+// Named barriers select the `.aligned` NVVM intrinsic only when they provably
+// execute warp-uniformly; otherwise they fall back to the non-aligned form.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @named_barrier_wait_divergent_tid
+  tt.func @named_barrier_wait_divergent_tid() {
+    %tid = gpu.thread_id x
+    %c0 = arith.constant 0 : index
+    %is_first = arith.cmpi eq, %tid, %c0 : index
+    cf.cond_br %is_first, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // CHECK-LABEL: @named_barrier_wait_warp_id
+  tt.func @named_barrier_wait_warp_id() {
+    %tid = gpu.thread_id x
+    %tid32 = arith.index_cast %tid : index to i32
+    %c32 = arith.constant 32 : i32
+    %warp = arith.divui %tid32, %c32 : i32
+    %c0 = arith.constant 0 : i32
+    %is_w0 = arith.cmpi eq, %warp, %c0 : i32
+    cf.cond_br %is_w0, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.aligned.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // `(C - tid) / C` reverses lane order within each warp (lane 0 -> 1, lanes
+  // 1-31 -> 0), so it is not a warp ID; a branch on it is intra-warp divergent
+  // and must select the non-aligned form.
+  // CHECK-LABEL: @named_barrier_wait_reverse_sub_tid
+  tt.func @named_barrier_wait_reverse_sub_tid() {
+    %tid = gpu.thread_id x
+    %tid32 = arith.index_cast %tid : index to i32
+    %c32 = arith.constant 32 : i32
+    %rev = arith.subi %c32, %tid32 : i32
+    %warp = arith.divui %rev, %c32 : i32
+    %c0 = arith.constant 0 : i32
+    %is_w0 = arith.cmpi eq, %warp, %c0 : i32
+    cf.cond_br %is_w0, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // Linearization is x-major, so a `tid.y` quotient by the warp size is not
+  // warp-constant in general: a warp can span `tid.y` values with different
+  // quotients. A branch on one must select the non-aligned form.
+  // CHECK-LABEL: @named_barrier_wait_tid_y_quotient
+  tt.func @named_barrier_wait_tid_y_quotient() {
+    %tid = gpu.thread_id y
+    %tid32 = arith.index_cast %tid : index to i32
+    %c32 = arith.constant 32 : i32
+    %warp = arith.divui %tid32, %c32 : i32
+    %c0 = arith.constant 0 : i32
+    %is_w0 = arith.cmpi eq, %warp, %c0 : i32
+    cf.cond_br %is_w0, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // CHECK-LABEL: @named_barrier_arrive_program_id
+  tt.func @named_barrier_arrive_program_id() {
+    %pid = tt.get_program_id x : i32
+    %c0 = arith.constant 0 : i32
+    %is_zero = arith.cmpi eq, %pid, %c0 : i32
+    cf.cond_br %is_zero, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.arrive.aligned.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.arrive_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // CHECK-LABEL: @named_barrier_arrive_data_dependent
+  tt.func @named_barrier_arrive_data_dependent(%ptr: !llvm.ptr) {
+    %v = llvm.load %ptr : !llvm.ptr -> i32
+    %c0 = arith.constant 0 : i32
+    %is_zero = arith.cmpi eq, %v, %c0 : i32
+    cf.cond_br %is_zero, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.arrive.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.arrive_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // CHECK-LABEL: @named_barrier_arrive_func_arg
+  tt.func @named_barrier_arrive_func_arg(%flag: i1) {
+    cf.cond_br %flag, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.arrive.aligned.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.arrive_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // CHECK-LABEL: @named_barrier_wait_dynamic_tid_id
+  tt.func @named_barrier_wait_dynamic_tid_id() {
+    %tid = gpu.thread_id x
+    %bar32 = arith.index_cast %tid : index to i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %bar32 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    tt.return
+  }
+
+  // Lane 0 skips the loop and returns 0; lane 1 runs it and returns 1.
+  // Both the initial and yielded values are constants, but the result is not
+  // warp-uniform because the bound is a scalar thread ID.
+  // CHECK-LABEL: @named_barrier_wait_lane_varying_for_result
+  tt.func @named_barrier_wait_lane_varying_for_result() {
+    %tid = gpu.thread_id x
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %result = scf.for %i = %c0 to %tid step %c1 iter_args(%value = %c0) -> (index) {
+      scf.yield %c1 : index
+    }
+    %branch = arith.cmpi eq, %result, %c0 : index
+    cf.cond_br %branch, ^then, ^exit
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^exit
+  ^exit:
+    tt.return
+  }
+
+  // The same zero-trip/one-trip distinction applies to scf.while results.
+  // CHECK-LABEL: @named_barrier_wait_lane_varying_while_result
+  tt.func @named_barrier_wait_lane_varying_while_result() {
+    %tid = gpu.thread_id x
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %result = scf.while (%state = %c0) : (index) -> (index) {
+      %first = arith.cmpi eq, %state, %c0 : index
+      %active = arith.cmpi ne, %tid, %c0 : index
+      %continue = arith.andi %first, %active : i1
+      scf.condition(%continue) %state : index
+    } do {
+    ^bb0(%state: index):
+      scf.yield %c1 : index
+    }
+    %branch = arith.cmpi eq, %result, %c0 : index
+    cf.cond_br %branch, ^then, ^exit
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^exit
+  ^exit:
+    tt.return
+  }
+
+  // The loop state starts uniform but the backedge yields a thread ID, so
+  // later iterations can diverge within a warp and the barrier must select
+  // the non-aligned form.
+  // CHECK-LABEL: @named_barrier_wait_while_backedge_divergent
+  tt.func @named_barrier_wait_while_backedge_divergent() {
+    %tid = gpu.thread_id x
+    %c0 = arith.constant 0 : index
+    %c10 = arith.constant 10 : index
+    %loop = scf.while (%state = %c0) : (index) -> (index) {
+      %lt = arith.cmpi ult, %state, %c10 : index
+      scf.condition(%lt) %state : index
+    } do {
+    ^bb0(%arg: index):
+      %c9 = arith.constant 9 : i32
+      %c256 = arith.constant 256 : i32
+      // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+      %bar = ttng.user_named_barrier_id %c9 : i32
+      ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+      scf.yield %tid : index
+    }
+    tt.return
+  }
+
+  // A uniform condition can still forward a lane-varying init value as the
+  // `scf.while` result (including on the zero-trip path), even when the
+  // after-region yield is a constant.
+  // CHECK-LABEL: @named_barrier_wait_while_cond_arg_forward
+  tt.func @named_barrier_wait_while_cond_arg_forward() {
+    %tid = gpu.thread_id x
+    %pid = tt.get_program_id x : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c0 = arith.constant 0 : index
+    %result = scf.while (%state = %tid) : (index) -> (index) {
+      %run = arith.cmpi eq, %pid, %c0_i32 : i32
+      scf.condition(%run) %state : index
+    } do {
+    ^bb0(%arg: index):
+      scf.yield %c0 : index
+    }
+    %branch = arith.cmpi eq, %result, %c0 : index
+    cf.cond_br %branch, ^then, ^exit
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^exit
+  ^exit:
+    tt.return
+  }
+
+  // A loop with a uniform bound and a uniform backedge keeps `.aligned`.
+  // CHECK-LABEL: @named_barrier_wait_while_uniform
+  tt.func @named_barrier_wait_while_uniform(%n: index) {
+    %c0 = arith.constant 0 : index
+    %loop = scf.while (%state = %c0) : (index) -> (index) {
+      %lt = arith.cmpi ult, %state, %n : index
+      scf.condition(%lt) %state : index
+    } do {
+    ^bb0(%arg: index):
+      %c9 = arith.constant 9 : i32
+      %c256 = arith.constant 256 : i32
+      // CHECK: "llvm.nvvm.barrier.cta.sync.aligned.count"(
+      %bar = ttng.user_named_barrier_id %c9 : i32
+      ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+      scf.yield %c0 : index
+    }
+    tt.return
+  }
+
+  // Sign extension from a width that keeps the sign bit above the lane bits
+  // preserves warp blocks, so the quotient is still a warp ID.
+  // CHECK-LABEL: @named_barrier_wait_sext_tid
+  tt.func @named_barrier_wait_sext_tid() {
+    %tid = gpu.thread_id x
+    %tid32 = arith.index_cast %tid : index to i32
+    %tid64 = arith.extsi %tid32 : i32 to i64
+    %c32 = arith.constant 32 : i64
+    %warp = arith.divui %tid64, %c32 : i64
+    %c0 = arith.constant 0 : i64
+    %is_w0 = arith.cmpi eq, %warp, %c0 : i64
+    cf.cond_br %is_w0, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.aligned.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // Sign-extending a thread ID narrowed below the warp-size bits remaps lanes
+  // within a warp (lanes 16-31 go negative while lanes 0-15 stay
+  // non-negative), so the quotient is not a warp ID.
+  // CHECK-LABEL: @named_barrier_wait_narrow_sext_tid
+  tt.func @named_barrier_wait_narrow_sext_tid() {
+    %tid = gpu.thread_id x
+    %tid32 = arith.index_cast %tid : index to i32
+    %narrow = arith.trunci %tid32 : i32 to i5
+    %wide = arith.extsi %narrow : i5 to i32
+    %c32 = arith.constant 32 : i32
+    %warp = arith.divui %wide, %c32 : i32
+    %c0 = arith.constant 0 : i32
+    %is_w0 = arith.cmpi eq, %warp, %c0 : i32
+    cf.cond_br %is_w0, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // A divisor narrower than the warp-size bits cannot be a warp-size multiple;
+  // this must fall back cleanly instead of crashing in the modulus.
+  // CHECK-LABEL: @named_barrier_wait_narrow_divisor
+  tt.func @named_barrier_wait_narrow_divisor() {
+    %tid = gpu.thread_id x
+    %tid5 = arith.index_cast %tid : index to i5
+    %c16 = arith.constant 16 : i5
+    %warp = arith.divui %tid5, %c16 : i5
+    %c0 = arith.constant 0 : i5
+    %is_w0 = arith.cmpi eq, %warp, %c0 : i5
+    cf.cond_br %is_w0, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+
+  // Opaque inline asm may read lane-dependent state (e.g. `elect.sync`) even
+  // with uniform operands and no memory effects, so a branch on its result is
+  // not provably warp-uniform and must select the non-aligned form.
+  // CHECK-LABEL: @named_barrier_wait_inline_asm
+  tt.func @named_barrier_wait_inline_asm() {
+    %c1 = arith.constant 1 : i1
+    %elected = llvm.inline_asm "elect.sync $0, $1;", "=b,b" %c1 : (i1) -> i1
+    cf.cond_br %elected, ^then, ^else
+  ^then:
+    %c9 = arith.constant 9 : i32
+    %c256 = arith.constant 256 : i32
+    // CHECK: "llvm.nvvm.barrier.cta.sync.count"(
+    %bar = ttng.user_named_barrier_id %c9 : i32
+    ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+    cf.br ^merge
+  ^else:
+    cf.br ^merge
+  ^merge:
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 8 : i32} {
+  // CHECK-LABEL: @named_barrier_wait_warp_specialize
+  tt.func @named_barrier_wait_warp_specialize() {
+    ttg.warp_specialize() attributes {warpGroupStartIds = array<i32: 4>}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      %c9 = arith.constant 9 : i32
+      %c256 = arith.constant 256 : i32
+      // CHECK: "llvm.nvvm.barrier.cta.sync.aligned.count"(
+      %bar = ttng.user_named_barrier_id %c9 : i32
+      ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 12 : i32} {
+  // Ping-pong across two partitions: partition bodies belong to the
+  // `warp_specialize.partitions` container op, which distributes whole warps,
+  // so both halves keep `.aligned`.
+  // CHECK-LABEL: @named_barrier_wait_warp_specialize_pingpong
+  tt.func @named_barrier_wait_warp_specialize_pingpong() {
+    ttg.warp_specialize() attributes {warpGroupStartIds = array<i32: 4, 8>}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      %c9 = arith.constant 9 : i32
+      %c256 = arith.constant 256 : i32
+      // CHECK: "llvm.nvvm.barrier.cta.arrive.aligned.count"(
+      %bar = ttng.user_named_barrier_id %c9 : i32
+      ttng.arrive_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+      ttg.warp_return
+    }
+    partition1() num_warps(4) {
+      %c9 = arith.constant 9 : i32
+      %c256 = arith.constant 256 : i32
+      // CHECK: "llvm.nvvm.barrier.cta.sync.aligned.count"(
+      %bar = ttng.user_named_barrier_id %c9 : i32
+      ttng.wait_barrier_named %bar, %c256 : !ttng.named_barrier_id, i32
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CANONICALIZE-SM100-LABEL: @redux_max_abs(
+  // CANONICALIZE-SM100-NOT: llvm.intr.fabs
+  // CANONICALIZE-SM100: nvvm.redux.sync fmax {{.*}} abs = true : f32 -> f32
+  // CANONICALIZE-SM100-NEXT: llvm.return
+  tt.func private @redux_max_abs(%x: tensor<32xf32, #blocked>) -> f32 {
+    %abs = math.absf %x : tensor<32xf32, #blocked>
+    %r = "tt.reduce"(%abs) <{axis = 0 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %combined = arith.maxnumf %a, %b : f32
+      tt.reduce.return %combined : f32
+    }) {allocation.offset = 0 : i32} : (tensor<32xf32, #blocked>) -> f32
+    tt.return %r : f32
+  }
+
+  // CANONICALIZE-SM100-LABEL: @redux_max_abs_nan(
+  // CANONICALIZE-SM100-NOT: llvm.intr.fabs
+  // CANONICALIZE-SM100: nvvm.redux.sync fmax {{.*}} abs = true nan = true : f32 -> f32
+  // CANONICALIZE-SM100-NEXT: llvm.return
+  tt.func private @redux_max_abs_nan(%x: tensor<32xf32, #blocked>) -> f32 {
+    %abs = math.absf %x : tensor<32xf32, #blocked>
+    %r = "tt.reduce"(%abs) <{axis = 0 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %combined = arith.maximumf %a, %b : f32
+      tt.reduce.return %combined : f32
+    }) {allocation.offset = 0 : i32} : (tensor<32xf32, #blocked>) -> f32
+    tt.return %r : f32
+  }
+
+  // CANONICALIZE-SM100-LABEL: @redux_min_abs(
+  // CANONICALIZE-SM100-NOT: llvm.intr.fabs
+  // CANONICALIZE-SM100: nvvm.redux.sync fmin {{.*}} abs = true : f32 -> f32
+  // CANONICALIZE-SM100-NEXT: llvm.return
+  tt.func private @redux_min_abs(%x: tensor<32xf32, #blocked>) -> f32 {
+    %abs = math.absf %x : tensor<32xf32, #blocked>
+    %r = "tt.reduce"(%abs) <{axis = 0 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %combined = arith.minnumf %a, %b : f32
+      tt.reduce.return %combined : f32
+    }) {allocation.offset = 0 : i32} : (tensor<32xf32, #blocked>) -> f32
+    tt.return %r : f32
+  }
+
+  // CANONICALIZE-SM100-LABEL: @redux_max_abs_multiple_values(
+  // CANONICALIZE-SM100-COUNT-2: llvm.intr.fabs
+  // CANONICALIZE-SM100-NEXT: llvm.intr.maxnum
+  // CANONICALIZE-SM100-NEXT: nvvm.redux.sync fmax %{{[^ ]+}}, %{{[^ ]+}} : f32 -> f32
+  // CANONICALIZE-SM100-NEXT: llvm.return
+  tt.func private @redux_max_abs_multiple_values(%x: tensor<64xf32, #blocked>) -> f32 {
+    %abs = math.absf %x : tensor<64xf32, #blocked>
+    %r = "tt.reduce"(%abs) <{axis = 0 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %combined = arith.maxnumf %a, %b : f32
+      tt.reduce.return %combined : f32
+    }) {allocation.offset = 0 : i32} : (tensor<64xf32, #blocked>) -> f32
+    tt.return %r : f32
   }
 }

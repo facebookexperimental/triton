@@ -34,8 +34,7 @@ namespace mlir::LLVM::AMD {
 BufferEmitter::BufferEmitter(RewriterBase &rw, Location loc, TargetInfo ti)
     : rewriter(rw), loc(loc), targetInfo(ti) {}
 
-Value BufferEmitter::createResourceDescriptor(Value basePtr,
-                                              Value blockStride) {
+Value BufferEmitter::createResourceDescriptor(Value basePtr) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   // 1. Create the resource descriptor
   // bits 0-11: dst sel, ignored by these intrinsics
@@ -77,28 +76,6 @@ Value BufferEmitter::createResourceDescriptor(Value basePtr,
   }
 
   Value stride = b.int_val(16, 0);
-  if (llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4},
-                         targetInfo.getISAFamily())) {
-#if 0
-    // Turn off cache-swizzling for the time being while we are figuring out
-    // how to safely use it.
-    if (blockStride) {
-      Value enableSwizzle = b.int_val(16, 16384);
-      Value mask14b = b.int_val(16, 16383);
-      // Cache swizzle supports only upto 8k stride. Also simply swizzling the
-      // largest available stride (8k) doesn't help those unsupported large
-      // stride. Especially better to avoid using the stride which is 2^N when
-      // N>13, e.g. by add padding to the buffer.
-      Value stride16b =
-          LLVM::TruncOp::create(rewriter, loc, i16_ty, blockStride);
-      Value strideSat = LLVM::AndOp::create(rewriter, loc, stride16b, mask14b);
-      // stride[13:0] = swizzling stride
-      // stride[14] = swizzle enabling bit
-      stride = LLVM::OrOp::create(rewriter, loc, enableSwizzle, strideSat);
-    }
-#endif
-  }
-
   Value flagsConst = b.int_val(32, flags);
   Type rsrcType = LLVM::LLVMPointerType::get(rewriter.getContext(), 8);
   Value numRecordsByte = b.int_val(64, std::numeric_limits<int>::max() - 1);
@@ -110,12 +87,13 @@ Value BufferEmitter::createResourceDescriptor(Value basePtr,
 
 Value BufferEmitter::emitLoad(Type type, Value rsrcDesc, Value offset,
                               Value pred, Value falseVal,
-                              triton::CacheModifier cm) {
+                              triton::CacheModifier cm,
+                              triton::EvictionPolicy evict) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   SmallVector<Value, 6> args;
   int32_t aux = 0;
-  fillCommonArgs(type, rsrcDesc, offset, pred, cm, /*isBufferLoad=*/true, args,
-                 aux);
+  fillCommonArgs(type, rsrcDesc, offset, pred, cm, evict,
+                 /*isBufferLoad=*/true, args, aux);
   Type bufferType = getBufferOpType(type, false);
   Value data = ROCDL::RawPtrBufferLoadOp::create(
       rewriter, loc, bufferType, args[0], args[1], args[2],
@@ -127,15 +105,14 @@ Value BufferEmitter::emitLoad(Type type, Value rsrcDesc, Value offset,
   return data;
 }
 
-ROCDL::RawPtrBufferLoadAsyncLdsOp
-BufferEmitter::emitLoadToLds(Type type, Value byteWidth, Value rsrcDesc,
-                             Value offset, Value dst, Value pred,
-                             triton::CacheModifier cm) {
+ROCDL::RawPtrBufferLoadAsyncLdsOp BufferEmitter::emitLoadToLds(
+    Type type, Value byteWidth, Value rsrcDesc, Value offset, Value dst,
+    Value pred, triton::CacheModifier cm, triton::EvictionPolicy evict) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   SmallVector<Value, 6> commonArgs;
   int32_t aux = 0;
-  fillCommonArgs(type, rsrcDesc, offset, pred, cm, /*isBufferLoad=*/true,
-                 commonArgs, aux);
+  fillCommonArgs(type, rsrcDesc, offset, pred, cm, evict,
+                 /*isBufferLoad=*/true, commonArgs, aux);
 
   // buffer_load_to_lds is only supported on gfx942/gfx950 which always use
   // asyncmark. Emit the async intrinsic so LLVM's SIInsertWaitcnts tracks
@@ -169,7 +146,8 @@ Value BufferEmitter::emitAtomicCAS(Type type, Value rsrcDesc, Value offset,
   // and amdg.buffer_atomic_cas
   SmallVector<Value, 6> args{casStoreVal, casCmpVal};
   int32_t aux = 0;
-  fillCommonArgsAtomics(type, rsrcDesc, offset, pred, hasUsers, aux, args);
+  fillCommonArgsAtomics(type, rsrcDesc, offset, pred, hasUsers, false, aux,
+                        args);
 
   Value data = ROCDL::RawPtrBufferAtomicCmpSwap::create(
       rewriter, loc, bufferType, args[0], args[1], args[2], args[3], args[4],
@@ -181,7 +159,7 @@ Value BufferEmitter::emitAtomicCAS(Type type, Value rsrcDesc, Value offset,
 
 Value BufferEmitter::emitAtomicRMW(RMWOp rmwType, Type type, Value rsrcDesc,
                                    Value offset, Value data, Value pred,
-                                   bool hasUsers) {
+                                   bool hasUsers, bool clusterScope) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   VectorType vecTy = cast<VectorType>(data.getType());
   Type bufferType = getBufferOpType(type, true);
@@ -190,7 +168,8 @@ Value BufferEmitter::emitAtomicRMW(RMWOp rmwType, Type type, Value rsrcDesc,
 
   SmallVector<Value, 6> args{data};
   int32_t aux = 0;
-  fillCommonArgsAtomics(type, rsrcDesc, offset, pred, hasUsers, aux, args);
+  fillCommonArgsAtomics(type, rsrcDesc, offset, pred, hasUsers, clusterScope,
+                        aux, args);
 
   // TODO:
   //   The ops in ROCDL (e.g., RawPtrBufferAtomicFaddOp) have no return value,
@@ -220,7 +199,8 @@ Value BufferEmitter::emitAtomicRMW(RMWOp rmwType, Type type, Value rsrcDesc,
 }
 
 void BufferEmitter::emitStore(Value rsrcDesc, Value offset, Value data,
-                              Value pred, triton::CacheModifier cm) {
+                              Value pred, triton::CacheModifier cm,
+                              triton::EvictionPolicy evict) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   VectorType vecTy = cast<VectorType>(data.getType());
   Type bufferType = getBufferOpType(vecTy, false);
@@ -228,8 +208,8 @@ void BufferEmitter::emitStore(Value rsrcDesc, Value offset, Value data,
     data = b.bitcast(data, bufferType);
   SmallVector<Value, 6> args{data};
   int32_t aux = 0;
-  fillCommonArgs(vecTy, rsrcDesc, offset, pred, cm, /*isBufferLoad=*/false,
-                 args, aux);
+  fillCommonArgs(vecTy, rsrcDesc, offset, pred, cm, evict,
+                 /*isBufferLoad=*/false, args, aux);
   ROCDL::RawPtrBufferStoreOp::create(
       rewriter, loc, TypeRange{}, args[0], args[1], args[2], args[3],
       rewriter.getI32IntegerAttr(aux), /*alias_scopes=*/nullptr,
@@ -284,8 +264,10 @@ Type BufferEmitter::getBufferOpType(Type type, bool atomicsOp) {
 
 void BufferEmitter::fillCommonArgs(Type type, Value rsrcDesc,
                                    Value vOffsetElems, Value pred,
-                                   triton::CacheModifier cm, bool isBufferLoad,
-                                   SmallVector<Value> &args, int32_t &aux) {
+                                   triton::CacheModifier cm,
+                                   triton::EvictionPolicy evict,
+                                   bool isBufferLoad, SmallVector<Value> &args,
+                                   int32_t &aux) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   // 1. Create the (masked) offset
   Type elementType = getElementTypeOrSelf(type);
@@ -302,7 +284,8 @@ void BufferEmitter::fillCommonArgs(Type type, Value rsrcDesc,
   // 2. Set the sgprOffset to 0
   Value sgprOffset = b.int_val(32, 0);
 
-  aux = getCtrlBitsForCacheModifierOnTarget(cm, isBufferLoad, targetInfo);
+  aux =
+      getCtrlBitsForCacheModifierOnTarget(cm, evict, isBufferLoad, targetInfo);
 
   // 4. Add the arguments
   args.push_back(rsrcDesc);
@@ -312,7 +295,8 @@ void BufferEmitter::fillCommonArgs(Type type, Value rsrcDesc,
 
 void BufferEmitter::fillCommonArgsAtomics(Type type, Value rsrcDesc,
                                           Value vOffsetElems, Value pred,
-                                          bool hasUsers, int32_t &aux,
+                                          bool hasUsers, bool clusterScope,
+                                          int32_t &aux,
                                           SmallVector<Value> &args) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   // 1. Create the (masked) offset
@@ -330,7 +314,7 @@ void BufferEmitter::fillCommonArgsAtomics(Type type, Value rsrcDesc,
   // 2. Set the sgprOffset to 0
   Value sgprOffset = b.int_val(32, 0);
 
-  aux = targetInfo.getBufferAtomicCachePolicy(hasUsers);
+  aux = targetInfo.getBufferAtomicCachePolicy(hasUsers, clusterScope);
 
   // 4. Add the arguments
   args.push_back(rsrcDesc);

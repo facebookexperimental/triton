@@ -775,3 +775,157 @@ def test_flash_attn_gfx950_rejects_noncontiguous_backward_inputs(operand):
 
     with pytest.raises(InvalidInput, match=rf"{operand} must be contiguous"):
         flash_attn(*tensors, space="smoke")
+
+
+@pytest.mark.parametrize(
+    ("shape", "causal", "split_q", "planes"),
+    (
+        pytest.param((16, 64, 8, 1024, 128), False, 1, 1, id="pr0-gqa1k"),
+        pytest.param((16, 64, 8, 2048, 128), False, 1, 1, id="pr1-gqa2k"),
+        pytest.param((16, 64, 8, 4096, 128), False, 1, 1, id="pr2-gqa4k"),
+        pytest.param((16, 64, 8, 8192, 128), False, 1, 1, id="pr3-gqa8k"),
+        pytest.param((15, 64, 8, 16384, 128), False, 1, 1, id="pr4-gqa16k"),
+        pytest.param((16, 16, 16, 1024, 128), False, 1, 1, id="pr5-mha1k"),
+        pytest.param((16, 16, 16, 2048, 128), False, 1, 1, id="pr6-mha2k"),
+        pytest.param((16, 16, 16, 4096, 128), False, 1, 1, id="pr7-mha4k"),
+        pytest.param((16, 16, 16, 8192, 128), False, 1, 1, id="pr8-mha8k"),
+        pytest.param((16, 16, 16, 16384, 128), False, 1, 2, id="pr9-mha16k"),
+        pytest.param((16, 16, 16, 16384, 128), False, None, 2, id="pr9-auto"),
+        pytest.param((16, 16, 16, 16384, 128), True, None, 1, id="pr9-causal-auto"),
+        pytest.param((16, 16, 16, 16384, 128), True, 1, 1, id="pr9-causal-unsplit"),
+        pytest.param((16, 16, 16, 16384, 128), False, 2, 1, id="pr9-split2"),
+        pytest.param((15, 16, 16, 16384, 128), False, 1, 1, id="batch15"),
+        pytest.param((16, 32, 32, 16384, 128), False, 1, 1, id="heads32"),
+        pytest.param((16, 16, 8, 16384, 128), False, 1, 1, id="gqa2"),
+        pytest.param((16, 16, 16, 16128, 128), False, 1, 1, id="shorter"),
+        pytest.param((16, 16, 16, 16640, 128), False, 1, 1, id="longer"),
+    ),
+)
+def test_flash_attn_gfx950_d128_accumulator_allocation_metadata(shape, causal, split_q, planes):
+    from triton.tlx.ops.kernels.flash_attn import gfx950_bwd
+
+    batch, hq, hkv, n_ctx, head_dim = shape
+    q = torch.empty((batch, hq, n_ctx, head_dim), device="meta", dtype=torch.bfloat16)
+    k = torch.empty((batch, hkv, n_ctx, head_dim), device="meta", dtype=torch.bfloat16)
+    accumulator = gfx950_bwd._allocate_dq_accumulator(q, k, causal=causal, split_q=split_q)
+
+    assert accumulator.shape == ((2, *q.shape) if planes == 2 else q.shape)
+    assert accumulator.dtype is torch.bfloat16
+    assert accumulator.device == q.device
+    assert accumulator.is_contiguous()
+    logical_bytes = accumulator.numel() * accumulator.element_size()
+    assert logical_bytes == planes * q.numel() * q.element_size()
+    assert accumulator.untyped_storage().nbytes() == logical_bytes
+    if planes == 2:
+        # Metadata tensors verify the 2 GiB contract without allocating GPU storage.
+        assert logical_bytes == 2**31
+
+
+@pytest.mark.parametrize(
+    ("shape", "causal", "split_q", "planes"),
+    (
+        pytest.param((16, 16, 16, 16384, 128), False, None, 2, id="planes2-auto"),
+        pytest.param((16, 16, 16, 16384, 128), False, 1, 2, id="planes2-unsplit"),
+        pytest.param((16, 16, 16, 16384, 128), True, 1, 1, id="causal"),
+        pytest.param((16, 16, 16, 16384, 128), False, 2, 1, id="split2"),
+        pytest.param((16, 16, 16, 8192, 128), False, 1, 1, id="mha8k"),
+        pytest.param((16, 64, 8, 8192, 128), False, 1, 1, id="long-gqa"),
+    ),
+)
+@pytest.mark.parametrize("invalid", ("shape", "dtype", "device", "noncontiguous-storage"))
+def test_flash_attn_gfx950_d128_accumulator_rejects_invalid_metadata(shape, causal, split_q, planes, invalid):
+    from triton.tlx.ops.kernels.flash_attn import gfx950_bwd
+
+    batch, hq, hkv, n_ctx, head_dim = shape
+    q = torch.empty((batch, hq, n_ctx, head_dim), device="meta", dtype=torch.bfloat16)
+    k = torch.empty((batch, hkv, n_ctx, head_dim), device="meta", dtype=torch.bfloat16)
+    accumulator_shape = (2, *q.shape) if planes == 2 else tuple(q.shape)
+    if invalid == "shape":
+        wrong_shape = tuple(q.shape) if planes == 2 else (2, *q.shape)
+        accumulator = torch.empty(wrong_shape, device=q.device, dtype=q.dtype)
+    elif invalid == "dtype":
+        accumulator = torch.empty(accumulator_shape, device=q.device, dtype=torch.float32)
+    elif invalid == "device":
+        # Replace only device metadata to avoid a 2 GiB CPU allocation.
+        accumulator = mock.Mock(shape=accumulator_shape, dtype=q.dtype, device=torch.device("cpu"))
+        accumulator.is_contiguous.return_value = True
+    else:
+        padded = torch.empty((*accumulator_shape[:-1], 2 * head_dim), device=q.device, dtype=q.dtype)
+        accumulator = padded[..., ::2]
+        assert accumulator.shape == accumulator_shape
+        assert not accumulator.is_contiguous()
+
+    class LaunchTrap:
+
+        def __getitem__(self, grid):
+            pytest.fail("Invalid accumulator reached a GPU launch")
+
+    with (
+            mock.patch.object(gfx950_bwd, "_attn_bwd_dkdv_dq_d128_gqa_kernel", LaunchTrap()),
+            mock.patch.object(gfx950_bwd, "_attn_bwd_dkdv_dq_d128_gqa_optimized_kernel", LaunchTrap()),
+            mock.patch.object(gfx950_bwd, "_attn_bwd_dkdv_dq_d128_gqa_bm32_kernel", LaunchTrap()),
+            pytest.raises(ValueError, match="dQ accumulator shape, dtype, device, or strides"),
+    ):
+        gfx950_bwd._run_bwd_d128_gqa(
+            q,
+            k,
+            k,
+            q,
+            None,
+            None,
+            accumulator,
+            q,
+            k,
+            k,
+            head_dim**-0.5,
+            causal,
+            split_q=split_q,
+        )
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize(("batch", "heads", "n_ctx"), ((1, 1, 128), (2, 3, 384)))
+def test_flash_attn_gfx950_d128_planes2_converter_merges_full_output(batch, heads, n_ctx):
+    from triton.tlx.ops.kernels.flash_attn import gfx950_bwd
+
+    head_dim, block_m = 128, 128
+    shape = (batch, heads, n_ctx, head_dim)
+    indices = torch.arange(batch * heads * n_ctx * head_dim, dtype=torch.int32).reshape(shape)
+    # Different periods vary both planes across rows, features, heads, and tiles.
+    plane0 = ((indices % 509 - 254).float() / 64).to(torch.bfloat16)
+    plane1 = (((indices * 37) % 257 - 128).float() / 128).to(torch.bfloat16)
+    # Include cancellation and both BF16 rounding directions at a midpoint.
+    plane0.flatten()[:4] = torch.tensor((4, 1 + 2**-7, 1, 1 + 2**-7), dtype=torch.bfloat16)
+    plane1.flatten()[:4] = torch.tensor((-4, -1, 2**-8, 2**-8), dtype=torch.bfloat16)
+    fp32_sum = plane0.float() + plane1.float()
+    expected = fp32_sum.to(torch.bfloat16)
+    assert torch.count_nonzero(fp32_sum != expected.float()) > 0
+    torch.testing.assert_close(
+        expected.flatten()[:4],
+        torch.tensor((0, 2**-7, 1, 1 + 2**-6), dtype=torch.bfloat16),
+        rtol=0,
+        atol=0,
+    )
+
+    def pack_native(logical):
+        # Logical bit order is m3,m2,m1,m0,d6,d5,d4,d3,d2,d1,d0.
+        bits = logical.reshape(-1, *([2] * 11))
+        # Native memory bit order is d5,d4,d6,d1,d3,d2,m3,m2,m1,m0,d0.
+        return bits.permute(0, 6, 7, 5, 10, 8, 9, 1, 2, 3, 4, 11).contiguous().reshape(shape)
+
+    accumulator = torch.stack((pack_native(plane0), pack_native(plane1))).to("cuda")
+    accumulator_before = accumulator.clone()
+    output = torch.full(shape, float("nan"), device="cuda", dtype=torch.bfloat16)
+    gfx950_bwd._attn_bwd_dq_native_planes2_convert_kernel[(n_ctx // block_m, batch * heads)](
+        accumulator,
+        output,
+        N=n_ctx,
+        D=head_dim,
+        BLOCK_M=block_m,
+        PLANE_ELEMENTS=output.numel(),
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(accumulator, accumulator_before, rtol=0, atol=0)

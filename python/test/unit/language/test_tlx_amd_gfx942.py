@@ -263,3 +263,42 @@ def test_masked_unaligned_vector_load_correctness_gfx942(offset):
     expected[:valid_size] = x[offset:offset + valid_size]
     torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
     assert "buffer_load_dwordx4" in compiled.asm["amdgcn"]
+
+
+@triton.jit
+def _stoch_round_fnuz_kernel(x_ptr, rbits_ptr, y_ptr, DST_DTYPE: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offsets)
+    rbits = tl.load(rbits_ptr + offsets)
+    y = tlx.stoch_round(x, DST_DTYPE, rbits)
+    tl.store(y_ptr + offsets, y.to(tl.uint8, bitcast=True))
+
+
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware")
+@pytest.mark.parametrize(
+    "dst_dtype, expected_inst",
+    [
+        (tl.float8e5b16, "v_cvt_sr_bf8_f32"),
+        (tl.float8e4b8, "v_cvt_sr_fp8_f32"),
+    ],
+    ids=["f8e5b16", "f8e4b8"],
+)
+def test_stoch_round_fnuz_gfx942(dst_dtype, expected_inst):
+    # CDNA3 only supports stochastic rounding to FNUZ fp8. torch has no FNUZ
+    # dtype, so outputs are raw bytes: check the emitted instruction and that
+    # different seeds produce different outputs.
+    SIZE = 256
+    a = torch.randn([SIZE], dtype=torch.float32, device="cuda")
+
+    def seeds(salt):
+        # Multiply the salt so the two seed vectors differ across the full
+        # word, including the high bits the hardware consumes.
+        return ((torch.arange(SIZE, device="cuda", dtype=torch.int64) * 2654435761 + salt * 2654435761) % 2**32).to(
+            torch.int32)
+
+    b0 = torch.empty([SIZE], dtype=torch.uint8, device="cuda")
+    b1 = torch.empty([SIZE], dtype=torch.uint8, device="cuda")
+    kernel = _stoch_round_fnuz_kernel[(1, )](a, seeds(0), b0, DST_DTYPE=dst_dtype, BLOCK_SIZE=SIZE, num_warps=1)
+    assert expected_inst in kernel.asm["amdgcn"]
+    _stoch_round_fnuz_kernel[(1, )](a, seeds(1), b1, DST_DTYPE=dst_dtype, BLOCK_SIZE=SIZE, num_warps=1)
+    assert (b0 != b1).any(), "Stochastic rounding output should depend on the seed"
