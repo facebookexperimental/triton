@@ -1,4 +1,4 @@
-// RUN: TRITON_ENABLE_TTGIR_SCHED=1 TRITON_TTGIR_SCHED_APPLY=1 triton-opt %s \
+// RUN: env TRITON_ENABLE_TTGIR_SCHED=1 TRITON_TTGIR_SCHED_APPLY=1 triton-opt %s \
 // RUN:   -split-input-file -tritonamdgpu-dot-decompose-and-schedule \
 // RUN:   2>&1 | FileCheck %s
 //
