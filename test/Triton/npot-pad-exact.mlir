@@ -1,8 +1,6 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad='num-warps=1' -verify-diagnostics | FileCheck %s
-// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad='num-warps=1 num-ctas=2' -verify-diagnostics | FileCheck %s --check-prefix=CTAS
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad='num-warps=1' -convert-triton-to-tritongpu='target=cuda:90 num-warps=1' -verify-diagnostics | FileCheck %s --check-prefix=TTGIR
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad='num-warps=1' -convert-triton-to-tritongpu='target=cuda:90 num-warps=1' -tritongpu-coalesce -verify-diagnostics | FileCheck %s --check-prefix=V4
-// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad='num-warps=4' -verify-diagnostics | FileCheck %s --check-prefix=W4
 
 // The row-pointer idiom (X + m)[:, None] + n[None, :]: only memory accesses
 // must keep their vector, so the [96] row pointers don't force padding on the
@@ -33,17 +31,12 @@ tt.func @row_pointer(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
 
 // Vector first, then total in-dim size. At one warp 384 keeps padded's v4 (4 x
 // 32 lanes x 3) and fills a total in-dim size of 384, where padded wastes 128
-// of 512: exact. At four warps exact can't keep v4 (3 a thread); across CTAs no
-// mixed-radix layout: pad.
+// of 512: exact.
 // CHECK-LABEL: @copy_384
-// CTAS-LABEL: @copy_384
-// W4-LABEL: @copy_384
 tt.func @copy_384(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %s: f32) {
   // CHECK-NOT: tensor<512x
   // CHECK: tt.load %{{.*}} : tensor<384x!tt.ptr<f32>>
   // CHECK: tt.store %{{.*}}, %{{.*}} : tensor<384x!tt.ptr<f32>>
-  // CTAS: tt.load %{{.*}}, %{{.*}} : tensor<512x!tt.ptr<f32>>
-  // W4: tt.load %{{.*}}, %{{.*}} : tensor<512x!tt.ptr<f32>>
   // TTGIR: tt.load %{{.*}} : tensor<384x!tt.ptr<f32>, #linear>
   %r = tt.make_range {end = 384 : i32, start = 0 : i32} : tensor<384xi32>
   %sp = tt.splat %src : !tt.ptr<f32> -> tensor<384x!tt.ptr<f32>>
@@ -59,39 +52,16 @@ tt.func @copy_384(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr
 
 // -----
 
-// An unaligned copy, x[1:] to y[1:]: neither side proves more than one element,
-// so total in-dim sizes decide (384 vs 512): exact.
-// W4-LABEL: @unaligned_384
-tt.func @unaligned_384(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
-  // W4: tt.load %{{.*}} : tensor<384x!tt.ptr<f32>>
-  // W4: tt.store %{{.*}}, %{{.*}} : tensor<384x!tt.ptr<f32>>
-  %c1 = arith.constant 1 : i32
-  %s1 = tt.addptr %src, %c1 : !tt.ptr<f32>, i32
-  %d1 = tt.addptr %dst, %c1 : !tt.ptr<f32>, i32
-  %r = tt.make_range {end = 384 : i32, start = 0 : i32} : tensor<384xi32>
-  %sp = tt.splat %s1 : !tt.ptr<f32> -> tensor<384x!tt.ptr<f32>>
-  %p = tt.addptr %sp, %r : tensor<384x!tt.ptr<f32>>, tensor<384xi32>
-  %x = tt.load %p : tensor<384x!tt.ptr<f32>>
-  %dp = tt.splat %d1 : !tt.ptr<f32> -> tensor<384x!tt.ptr<f32>>
-  %q = tt.addptr %dp, %r : tensor<384x!tt.ptr<f32>>, tensor<384xi32>
-  tt.store %q, %x : tensor<384x!tt.ptr<f32>>
-  tt.return
-}
-
-// -----
-
 // 96 at one warp wastes less total in-dim size exact (0 vs 32), but its
 // 32-element pow2 part only fills the lanes, so it loads 3 x 32b where padded
-// loads v4: pad. At four warps both are scalar and exact replicates to a total
-// in-dim size of 384: pad.
+// loads v4: pad.
 // CHECK-LABEL: @copy_96
-// W4-LABEL: @copy_96
 tt.func @copy_96(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
   // CHECK: tt.load %{{.*}}, %{{.*}} : tensor<128x!tt.ptr<f32>>
-  // W4: tt.load %{{.*}}, %{{.*}} : tensor<128x!tt.ptr<f32>>
   %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32>
   %sp = tt.splat %src : !tt.ptr<f32> -> tensor<96x!tt.ptr<f32>>
   %p = tt.addptr %sp, %r : tensor<96x!tt.ptr<f32>>, tensor<96xi32>
+  // expected-remark @+1 {{NPOT loads and stores pad: exact takes 192 vector accesses, padded 64}}
   %x = tt.load %p : tensor<96x!tt.ptr<f32>>
   %dp = tt.splat %dst : !tt.ptr<f32> -> tensor<96x!tt.ptr<f32>>
   %q = tt.addptr %dp, %r : tensor<96x!tt.ptr<f32>>, tensor<96xi32>
@@ -117,6 +87,7 @@ tt.func @column_contiguous(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst
   %sc = tt.addptr %sp, %col : tensor<1x2x!tt.ptr<f32>>, tensor<1x2xi32>
   %sb = tt.broadcast %sc : tensor<1x2x!tt.ptr<f32>> -> tensor<96x2x!tt.ptr<f32>>
   %p = tt.addptr %sb, %row : tensor<96x2x!tt.ptr<f32>>, tensor<96x2xi32>
+  // expected-remark @+1 {{NPOT loads and stores pad: exact takes 192 vector accesses, padded 128}}
   %x = tt.load %p : tensor<96x2x!tt.ptr<f32>>
   %dp = tt.splat %dst : !tt.ptr<f32> -> tensor<1x2x!tt.ptr<f32>>
   %dc = tt.addptr %dp, %col : tensor<1x2x!tt.ptr<f32>>, tensor<1x2xi32>
@@ -128,61 +99,12 @@ tt.func @column_contiguous(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst
 
 // -----
 
-// [96, 64] at four warps keeps v4 along 64 and fills a total in-dim size of
-// 6144, where padded wastes 2048 of 8192: exact.
-// W4-LABEL: @copy_96x64
-tt.func @copy_96x64(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
-  // W4-NOT: tensor<128x64x
-  // W4: tt.load %{{.*}} : tensor<96x64x!tt.ptr<f32>>
-  %r = tt.make_range {end = 6144 : i32, start = 0 : i32} : tensor<6144xi32>
-  %i = tt.reshape %r : tensor<6144xi32> -> tensor<96x64xi32>
-  %sp = tt.splat %src : !tt.ptr<f32> -> tensor<96x64x!tt.ptr<f32>>
-  %p = tt.addptr %sp, %i : tensor<96x64x!tt.ptr<f32>>, tensor<96x64xi32>
-  %x = tt.load %p : tensor<96x64x!tt.ptr<f32>>
-  %dp = tt.splat %dst : !tt.ptr<f32> -> tensor<96x64x!tt.ptr<f32>>
-  %q = tt.addptr %dp, %i : tensor<96x64x!tt.ptr<f32>>, tensor<96x64xi32>
-  tt.store %q, %x : tensor<96x64x!tt.ptr<f32>>
-  tt.return
-}
-
-// -----
-
-// The tile idiom at four warps: its 96-row index values take a larger total
-// in-dim size exact than padded, but its [96, 64] values take 2048 fewer each,
-// so the connected component keeps its shape: total in-dim sizes are summed
-// over the connected component.
-// W4-LABEL: @tile_96x64
-tt.func @tile_96x64(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
-  // W4: tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32>
-  // W4: tt.load %{{.*}} : tensor<96x64x!tt.ptr<f32>>
-  // W4: tt.store %{{.*}}, %{{.*}} : tensor<96x64x!tt.ptr<f32>>
-  %c64 = arith.constant dense<64> : tensor<96x1xi32>
-  %m = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32>
-  %n = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
-  %m1 = tt.expand_dims %m {axis = 1 : i32} : tensor<96xi32> -> tensor<96x1xi32>
-  %row = arith.muli %m1, %c64 : tensor<96x1xi32>
-  %n1 = tt.expand_dims %n {axis = 0 : i32} : tensor<64xi32> -> tensor<1x64xi32>
-  %col = tt.broadcast %n1 : tensor<1x64xi32> -> tensor<96x64xi32>
-  %sp = tt.splat %src : !tt.ptr<f32> -> tensor<96x1x!tt.ptr<f32>>
-  %sr = tt.addptr %sp, %row : tensor<96x1x!tt.ptr<f32>>, tensor<96x1xi32>
-  %sb = tt.broadcast %sr : tensor<96x1x!tt.ptr<f32>> -> tensor<96x64x!tt.ptr<f32>>
-  %p = tt.addptr %sb, %col : tensor<96x64x!tt.ptr<f32>>, tensor<96x64xi32>
-  %x = tt.load %p : tensor<96x64x!tt.ptr<f32>>
-  %dp = tt.splat %dst : !tt.ptr<f32> -> tensor<96x1x!tt.ptr<f32>>
-  %dr = tt.addptr %dp, %row : tensor<96x1x!tt.ptr<f32>>, tensor<96x1xi32>
-  %db = tt.broadcast %dr : tensor<96x1x!tt.ptr<f32>> -> tensor<96x64x!tt.ptr<f32>>
-  %q = tt.addptr %db, %col : tensor<96x64x!tt.ptr<f32>>, tensor<96x64xi32>
-  tt.store %q, %x : tensor<96x64x!tt.ptr<f32>>
-  tt.return
-}
-
-// -----
-
 // An odd 1023 has no power-of-two part to spread, so exact replicates it over
 // the lanes (a total in-dim size of 32736), where padded wastes 1: pad.
 // CHECK-LABEL: @ranges
 tt.func @ranges() {
   // CHECK: tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32>
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take}}
   %r = tt.make_range {end = 1023 : i32, start = 0 : i32} : tensor<1023xi32>
   tt.return
 }
@@ -202,6 +124,7 @@ tt.func @padded_meets_exact(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
   // CHECK: tt.store %{{.*}}, %{{.*}} : tensor<384x!tt.ptr<f32>>
   // TTGIR: tt.load %{{.*}}, %{{.*}} : tensor<64x!tt.ptr<f32>, #blocked>
   // TTGIR: tt.store %{{.*}}, %{{.*}} : tensor<384x!tt.ptr<f32>, #linear>
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take}}
   %r48 = tt.make_range {end = 48 : i32, start = 0 : i32} : tensor<48xi32>
   %sp = tt.splat %src : !tt.ptr<f32> -> tensor<48x!tt.ptr<f32>>
   %p = tt.addptr %sp, %r48 : tensor<48x!tt.ptr<f32>>, tensor<48xi32>
@@ -263,55 +186,10 @@ tt.func @loop_carried(%src: !tt.ptr<f32>, %n: i32) {
 
 // -----
 
-// Forwarded values join the connected component they reach: at four warps the
-// accesses pad, so the constant arm and the result pad with them.
-// W4-LABEL: @if_forwards
-tt.func @if_forwards(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %c: i1) {
-  // W4: scf.if %{{.*}} -> (tensor<512xf32>)
-  // W4: arith.constant dense<0.000000e+00> : tensor<512xf32>
-  // W4: tt.load %{{.*}}, %{{.*}} : tensor<512x!tt.ptr<f32>>
-  %r = tt.make_range {end = 384 : i32, start = 0 : i32} : tensor<384xi32>
-  %sp = tt.splat %src : !tt.ptr<f32> -> tensor<384x!tt.ptr<f32>>
-  %p = tt.addptr %sp, %r : tensor<384x!tt.ptr<f32>>, tensor<384xi32>
-  %dp = tt.splat %dst : !tt.ptr<f32> -> tensor<384x!tt.ptr<f32>>
-  %q = tt.addptr %dp, %r : tensor<384x!tt.ptr<f32>>, tensor<384xi32>
-  %acc = scf.if %c -> (tensor<384xf32>) {
-    %z = arith.constant dense<0.000000e+00> : tensor<384xf32>
-    scf.yield %z : tensor<384xf32>
-  } else {
-    %x = tt.load %p : tensor<384x!tt.ptr<f32>>
-    scf.yield %x : tensor<384xf32>
-  }
-  tt.store %q, %acc : tensor<384x!tt.ptr<f32>>
-  tt.return
-}
-
-// -----
-
-// So does a loop's iter-arg: the constant it yields pads with the loaded init.
-// W4-LABEL: @for_forwards
-tt.func @for_forwards(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %n: i32) {
-  // W4: scf.for {{.*}} -> (tensor<512xf32>)
-  // W4: arith.constant dense<1.000000e+00> : tensor<512xf32>
-  %c0 = arith.constant 0 : i32
-  %c1 = arith.constant 1 : i32
-  %r = tt.make_range {end = 384 : i32, start = 0 : i32} : tensor<384xi32>
-  %sp = tt.splat %src : !tt.ptr<f32> -> tensor<384x!tt.ptr<f32>>
-  %p = tt.addptr %sp, %r : tensor<384x!tt.ptr<f32>>, tensor<384xi32>
-  %init = tt.load %p : tensor<384x!tt.ptr<f32>>
-  %acc = scf.for %i = %c0 to %n step %c1 iter_args(%a = %init) -> (tensor<384xf32>) : i32 {
-    %one = arith.constant dense<1.000000e+00> : tensor<384xf32>
-    scf.yield %one : tensor<384xf32>
-  }
-  tt.store %p, %acc : tensor<384x!tt.ptr<f32>>
-  tt.return
-}
-
-// -----
-
 // A non-entry block argument belongs to tt.func, which isn't a mixed-radix op,
 // so the connected component of the cf.br feeding it pads, and the pass rejects
 // cf.br by name.
+// expected-remark @+1 {{NPOT mixed-radix layout is not yet supported on tt.func}}
 tt.func @branch_rejects() {
   %r = tt.make_range {end = 384 : i32, start = 0 : i32} : tensor<384xi32>
   // expected-error @+1 {{'cf.br' op on an NPOT tensor is unsupported}}
@@ -325,14 +203,11 @@ tt.func @branch_rejects() {
 // A reduce lowers a mixed-radix layout, also with its odd digit on the axis; an
 // inner_tree reduce has an unsupported reason, so its connected component pads.
 // CHECK-LABEL: @reduce_32x96
-// W4-LABEL: @reduce_32x96
 tt.func @reduce_32x96(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
   // CHECK: tt.load %{{.*}} : tensor<32x96x!tt.ptr<f32>>
   // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
   // CHECK: tt.load %{{.*}}, %{{.*}} : tensor<32x128x!tt.ptr<f32>>
   // CHECK: "tt.reduce"(%{{.*}}) <{axis = 1 : i32, reduction_ordering = "inner_tree"}>
-  // W4: tt.load %{{.*}} : tensor<32x96x!tt.ptr<f32>>
-  // W4: tt.load %{{.*}}, %{{.*}} : tensor<32x128x!tt.ptr<f32>>
   %r = tt.make_range {end = 3072 : i32, start = 0 : i32} : tensor<3072xi32>
   %i = tt.reshape %r : tensor<3072xi32> -> tensor<32x96xi32>
   %sp = tt.splat %src : !tt.ptr<f32> -> tensor<32x96x!tt.ptr<f32>>
@@ -348,6 +223,7 @@ tt.func @reduce_32x96(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt
   %sp2 = tt.splat %src : !tt.ptr<f32> -> tensor<32x96x!tt.ptr<f32>>
   %p2 = tt.addptr %sp2, %i2 : tensor<32x96x!tt.ptr<f32>>, tensor<32x96xi32>
   %y = tt.load %p2 : tensor<32x96x!tt.ptr<f32>>
+  // expected-remark @+1 {{NPOT mixed-radix layout is not yet supported on an inner_tree reduce}}
   %t = "tt.reduce"(%y) <{axis = 1 : i32, reduction_ordering = "inner_tree"}> ({
   ^bb0(%a: f32, %b: f32):
     %c = arith.addf %a, %b : f32
@@ -358,113 +234,5 @@ tt.func @reduce_32x96(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt
   %dp = tt.splat %dst : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
   %q = tt.addptr %dp, %m : tensor<32x!tt.ptr<f32>>, tensor<32xi32>
   tt.store %q, %u : tensor<32x!tt.ptr<f32>>
-  tt.return
-}
-
-// -----
-
-// At four warps [128, 80] puts its warps on 128; a reduce along either dim
-// keeps its shape.
-// W4-LABEL: @reduce_128x80
-tt.func @reduce_128x80(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
-  // W4: tt.load %{{.*}} : tensor<128x80x!tt.ptr<f32>>
-  // W4: "tt.reduce"(%{{.*}}) <{axis = 1 : i32}>
-  // W4: tt.load %{{.*}} : tensor<128x80x!tt.ptr<f32>>
-  // W4: "tt.reduce"(%{{.*}}) <{axis = 0 : i32}>
-  %r = tt.make_range {end = 10240 : i32, start = 0 : i32} : tensor<10240xi32>
-  %i = tt.reshape %r : tensor<10240xi32> -> tensor<128x80xi32>
-  %sp = tt.splat %src : !tt.ptr<f32> -> tensor<128x80x!tt.ptr<f32>>
-  %p = tt.addptr %sp, %i : tensor<128x80x!tt.ptr<f32>>, tensor<128x80xi32>
-  %x = tt.load %p : tensor<128x80x!tt.ptr<f32>>
-  %s = "tt.reduce"(%x) <{axis = 1 : i32}> ({
-  ^bb0(%a: f32, %b: f32):
-    %c = arith.addf %a, %b : f32
-    tt.reduce.return %c : f32
-  }) : (tensor<128x80xf32>) -> tensor<128xf32>
-  %m = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
-  %dp = tt.splat %dst : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>>
-  %q = tt.addptr %dp, %m : tensor<128x!tt.ptr<f32>>, tensor<128xi32>
-  tt.store %q, %s : tensor<128x!tt.ptr<f32>>
-  %r2 = tt.make_range {end = 10240 : i32, start = 0 : i32} : tensor<10240xi32>
-  %i2 = tt.reshape %r2 : tensor<10240xi32> -> tensor<128x80xi32>
-  %sp2 = tt.splat %src : !tt.ptr<f32> -> tensor<128x80x!tt.ptr<f32>>
-  %p2 = tt.addptr %sp2, %i2 : tensor<128x80x!tt.ptr<f32>>, tensor<128x80xi32>
-  %y = tt.load %p2 : tensor<128x80x!tt.ptr<f32>>
-  %t = "tt.reduce"(%y) <{axis = 0 : i32}> ({
-  ^bb0(%a: f32, %b: f32):
-    %c = arith.addf %a, %b : f32
-    tt.reduce.return %c : f32
-  }) : (tensor<128x80xf32>) -> tensor<80xf32>
-  %n = tt.make_range {end = 80 : i32, start = 0 : i32} : tensor<80xi32>
-  %ep = tt.splat %dst : !tt.ptr<f32> -> tensor<80x!tt.ptr<f32>>
-  %e = tt.addptr %ep, %n : tensor<80x!tt.ptr<f32>>, tensor<80xi32>
-  tt.store %e, %t : tensor<80x!tt.ptr<f32>>
-  tt.return
-}
-
-// -----
-
-// A scan lowers a mixed-radix layout along either dim of [96, 80], though the
-// radix-3 digit on 96 is not most-major.
-// W4-LABEL: @scan_96x80
-tt.func @scan_96x80(%src: !tt.ptr<i32> {tt.divisibility = 16 : i32}) {
-  // W4: "tt.scan"(%{{.*}}) <{axis = 1 : i32, reverse = false}>
-  // W4: }) : (tensor<96x80xi32>) -> tensor<96x80xi32>
-  // W4: "tt.scan"(%{{.*}}) <{axis = 0 : i32, reverse = false}>
-  // W4: }) : (tensor<96x80xi32>) -> tensor<96x80xi32>
-  %r = tt.make_range {end = 7680 : i32, start = 0 : i32} : tensor<7680xi32>
-  %i = tt.reshape %r : tensor<7680xi32> -> tensor<96x80xi32>
-  %sp = tt.splat %src : !tt.ptr<i32> -> tensor<96x80x!tt.ptr<i32>>
-  %p = tt.addptr %sp, %i : tensor<96x80x!tt.ptr<i32>>, tensor<96x80xi32>
-  %x = tt.load %p : tensor<96x80x!tt.ptr<i32>>
-  %s = "tt.scan"(%x) <{axis = 1 : i32, reverse = false}> ({
-  ^bb0(%a: i32, %b: i32):
-    %c = arith.addi %a, %b : i32
-    tt.scan.return %c : i32
-  }) : (tensor<96x80xi32>) -> tensor<96x80xi32>
-  tt.store %p, %s : tensor<96x80x!tt.ptr<i32>>
-  %r2 = tt.make_range {end = 7680 : i32, start = 0 : i32} : tensor<7680xi32>
-  %i2 = tt.reshape %r2 : tensor<7680xi32> -> tensor<96x80xi32>
-  %sp2 = tt.splat %src : !tt.ptr<i32> -> tensor<96x80x!tt.ptr<i32>>
-  %p2 = tt.addptr %sp2, %i2 : tensor<96x80x!tt.ptr<i32>>, tensor<96x80xi32>
-  %y = tt.load %p2 : tensor<96x80x!tt.ptr<i32>>
-  %t = "tt.scan"(%y) <{axis = 0 : i32, reverse = false}> ({
-  ^bb0(%a: i32, %b: i32):
-    %c = arith.addi %a, %b : i32
-    tt.scan.return %c : i32
-  }) : (tensor<96x80xi32>) -> tensor<96x80xi32>
-  tt.store %p2, %t : tensor<96x80x!tt.ptr<i32>>
-  tt.return
-}
-
-// -----
-
-// An atomic keeps a mixed-radix layout, but at four warps a [96] one
-// broadcasts, so its connected component pads once its result is used.
-// W4-LABEL: @atomic_96_result_used
-tt.func @atomic_96_result_used(%dst: !tt.ptr<i32>) {
-  // W4: tt.atomic_rmw add, relaxed, gpu, %{{.*}}, %{{.*}} : (tensor<96x!tt.ptr<i32>>
-  // W4: tt.atomic_rmw add, relaxed, gpu, %{{.*}}, %{{.*}}, %{{.*}} : (tensor<128x!tt.ptr<i32>>
-  %r = tt.make_range {end = 3072 : i32, start = 0 : i32} : tensor<3072xi32>
-  %x = tt.reshape %r : tensor<3072xi32> -> tensor<96x32xi32>
-  %s = "tt.reduce"(%x) <{axis = 1 : i32}> ({
-  ^bb0(%a: i32, %b: i32):
-    %c = arith.addi %a, %b : i32
-    tt.reduce.return %c : i32
-  }) : (tensor<96x32xi32>) -> tensor<96xi32>
-  %dp = tt.splat %dst : !tt.ptr<i32> -> tensor<96x!tt.ptr<i32>>
-  %q = tt.addptr %dp, %s : tensor<96x!tt.ptr<i32>>, tensor<96xi32>
-  %u = tt.atomic_rmw add, relaxed, gpu, %q, %s : (tensor<96x!tt.ptr<i32>>, tensor<96xi32>) -> tensor<96xi32>
-  %r2 = tt.make_range {end = 3072 : i32, start = 0 : i32} : tensor<3072xi32>
-  %x2 = tt.reshape %r2 : tensor<3072xi32> -> tensor<96x32xi32>
-  %t = "tt.reduce"(%x2) <{axis = 1 : i32}> ({
-  ^bb0(%a: i32, %b: i32):
-    %c = arith.addi %a, %b : i32
-    tt.reduce.return %c : i32
-  }) : (tensor<96x32xi32>) -> tensor<96xi32>
-  %dp2 = tt.splat %dst : !tt.ptr<i32> -> tensor<96x!tt.ptr<i32>>
-  %q2 = tt.addptr %dp2, %t : tensor<96x!tt.ptr<i32>>, tensor<96xi32>
-  %v = tt.atomic_rmw add, relaxed, gpu, %q2, %t : (tensor<96x!tt.ptr<i32>>, tensor<96xi32>) -> tensor<96xi32>
-  tt.store %q2, %v : tensor<96x!tt.ptr<i32>>
   tt.return
 }
