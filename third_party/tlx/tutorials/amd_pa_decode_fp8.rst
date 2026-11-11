@@ -87,6 +87,11 @@ Implementation and validation
 * ``matrix_tdm_flat`` uses TLX packed-page tensor descriptors, two LDS buffers,
   grouped query rows, WMMA QK/PV and a shape-specific split merge. Full-page V
   masking is peeled using uniform control flow; ragged tails remain sanitized.
+  Selected BF16-Q single-token paths prefill both existing buffers before the
+  first compute step. Later iterations resume the ordinary staggered K/V
+  schedule. Short contexts, windows, FP8 Q and multi-query paths use the
+  ordinary copy schedule. Dense split selection includes a parallelism floor for
+  smaller KV-head grids.
 * ``matrix`` uses masked TLX K staging and grouped WMMA for page sizes outside
   the flat descriptor path. Native FP8 QK is limited to FP8 Q with D64; other
   inputs use BF16 QK. This avoids the referenced gfx1250 larger-FP8-contraction
@@ -115,5 +120,7 @@ sliding windows, split reduction, 128K/256K contexts, an 8192-wide dense view,
 and the T-sweep on the folded 16-head configuration. Unused tail slots contain
 NaNs to expose accidental reads. These are correctness checks, not performance
 measurements or evidence for every combination in the workload table.
+Automatic dispatch is also checked without explicit split overrides across
+additional MQA/GQA/MHA head counts, ragged batches and independent decode batches.
 
 A standard Triton wheel without TLX cannot execute this tutorial.

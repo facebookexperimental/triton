@@ -206,6 +206,7 @@ def _matrix_decode(
     K_LOAD_LAYOUT: tl.constexpr,
     V_LOAD_LAYOUT: tl.constexpr,
     SINGLE_TILE: tl.constexpr,
+    PREFILL_PAIR: tl.constexpr,
 ):
     task = tl.program_id(0)
     kvh = tl.program_id(1)
@@ -255,6 +256,11 @@ def _matrix_decode(
         kbuf = tlx.local_alloc((1, PAGE * D), K.dtype.element_ty, 2)
         vbuf = tlx.local_alloc((1, PAGE * D), V.dtype.element_ty, 2)
         _issue_flat_page(kd, vdsc, BT, kbuf, vbuf, seq, bst, kvh, lo, hi, 0, HQ // G, PAGE)
+        if PREFILL_PAIR:
+            # Queue K0/V0/K1/V1 before computing page0. Its first K/V waits
+            # leave three/two copies pending; page1 resumes the normal loop.
+            if lo + BN < hi:
+                _issue_flat_page(kd, vdsc, BT, kbuf, vbuf, seq, bst, kvh, lo + BN, hi, 1, HQ // G, PAGE)
     else:
         kbuf = tlx.local_alloc((BN, D), K.dtype.element_ty, 1)
     INDEX_TILES: tl.constexpr = tlx.num_warps() == 1
@@ -268,12 +274,15 @@ def _matrix_decode(
         slot = pos % PAGE
         if TDM:
             buffer_slot = ((start - lo) // BN) % 2
-            tlx.async_amd_descriptor_wait(1 if tlx.num_warps() == 1 else 0)
+            if PREFILL_PAIR and start == lo and start + BN < hi:
+                tlx.async_amd_descriptor_wait(3)
+            else:
+                tlx.async_amd_descriptor_wait(1 if tlx.num_warps() == 1 else 0)
             kr = tlx.local_load(tlx.local_view(kbuf, buffer_slot), layout=K_LOAD_LAYOUT, relaxed=tlx.num_warps() == 1)
             if tlx.num_warps() != 1:
                 vr = tlx.local_load(tlx.local_view(vbuf, buffer_slot), layout=V_LOAD_LAYOUT,
                                     relaxed=tlx.num_warps() == 1)
-            if tlx.num_warps() != 1 or (not SINGLE_TILE and start + BN < hi):
+            if (not PREFILL_PAIR or start != lo) and (tlx.num_warps() != 1 or (not SINGLE_TILE and start + BN < hi)):
                 _issue_flat_page(kd, vdsc, BT, kbuf, vbuf, seq, bst, kvh, start + BN, hi, 1 - buffer_slot, HQ // G,
                                  PAGE, 1 if tlx.num_warps() == 1 else 0)
             kval = kr.reshape((D // 16, PAGE, 16)).trans(1, 0, 2).reshape((PAGE, D))
@@ -316,12 +325,14 @@ def _matrix_decode(
         l = l * alpha + tl.sum(p, 1)
         acc *= alpha[:, None]
         if TDM and tlx.num_warps() == 1:
-            if not SINGLE_TILE and start + BN < hi:
+            if PREFILL_PAIR and start == lo and start + BN < hi:
+                tlx.async_amd_descriptor_wait(2)
+            elif not SINGLE_TILE and start + BN < hi:
                 tlx.async_amd_descriptor_wait(1)
             else:
                 tlx.async_amd_descriptor_wait(0)
             vr = tlx.local_load(tlx.local_view(vbuf, buffer_slot), layout=V_LOAD_LAYOUT, relaxed=tlx.num_warps() == 1)
-            if not SINGLE_TILE and start + BN < hi:
+            if (not PREFILL_PAIR or start != lo) and not SINGLE_TILE and start + BN < hi:
                 _issue_flat_page(kd, vdsc, BT, kbuf, vbuf, seq, bst, kvh, start + BN, hi, 1 - buffer_slot, HQ // G,
                                  PAGE, 2)
             vval = vr.reshape((PAGE // 16, D, 16)).trans(0, 2, 1).reshape((PAGE, D))
@@ -366,7 +377,7 @@ def _merge(PART, LSE, OUT, D: tl.constexpr, SPLITS: tl.constexpr, BS: tl.constex
 
 
 def decode(q, k, v, lengths, table, ks, vs, *, q_scale, query_length, causal, window_size, sm_scale, num_splits,
-           variant, out=None, workspace=None, block_n=64, block_m=16, num_warps=4):
+           variant, out=None, workspace=None, block_n=64, block_m=16, num_warps=4, prefill_pair=True):
     tokens, heads, dim = q.shape
     hkv, page = k.shape[1], k.shape[3]
     group = heads // hkv
@@ -404,12 +415,16 @@ def decode(q, k, v, lengths, table, ks, vs, *, q_scale, query_length, causal, wi
             page, dim, fp8_qk) if variant == "matrix_tdm_flat" and num_warps == 1 else (None, None)
         visible_bound = min(table.shape[1] * page, window_size + page - 1) if window_size else table.shape[1] * page
         single_tile = variant == "matrix_tdm_flat" and query_length == 1 and num_warps == 1 and visible_bound <= num_splits * block_n
+        prefill_enabled = (prefill_pair and variant == "matrix_tdm_flat" and num_warps == 1 and not single_tile
+                           and q.dtype == torch.bfloat16 and window_size == 0 and query_length == 1
+                           and visible_bound >= 8192 and ((page == 64 and hkv <= 2) or heads == hkv and hkv >= 64))
         _matrix_decode[(tokens // query_length * rows, hkv,
                         num_splits)](q, k, v, ks, vs, q_scale if q_scale is not None else ks, table, lengths, mid, lse,
                                      out, *strides, sm_scale, dim, heads, group, query_length, page, num_splits,
                                      block_m, block_n, q.dtype == torch.float8_e4m3fn, causal, window_size, rows,
                                      fp8_qk, variant == "matrix_precise", variant == "matrix_tdm_flat", k.shape[0],
-                                     kload, vload, single_tile, num_warps=num_warps, matrix_instr_nonkdim=16)
+                                     kload, vload, single_tile, prefill_enabled, num_warps=num_warps,
+                                     matrix_instr_nonkdim=16)
     if num_splits > 1:
         _merge[(tokens * heads, )](mid, lse, out, dim, num_splits, triton.next_power_of_2(num_splits), vs, heads, group,
                                    num_warps=(1 if num_splits * dim <= 8192 else 4 if num_splits * dim <= 32768 else 8))

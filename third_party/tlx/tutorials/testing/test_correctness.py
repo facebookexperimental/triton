@@ -99,6 +99,7 @@ if is_hip_gfx1250():
     import triton.language.extra.tlx.tutorials.amd_pa_decode_fp8_optimized  # noqa: F401
 
     test_fp8_kv_decode = _fp8_decode_tests.test_fp8_kv_decode
+    test_fp8_kv_decode_auto_geometry = _fp8_decode_tests.test_fp8_kv_decode_auto_geometry
     test_fp8_kv_decode_validation = _fp8_decode_tests.test_fp8_kv_decode_validation
     test_fp8_kv_decode_query_sweep = _fp8_decode_tests.test_fp8_kv_decode_query_sweep
     test_fp8_kv_decode_tile_sizes = _fp8_decode_tests.test_fp8_kv_decode_tile_sizes

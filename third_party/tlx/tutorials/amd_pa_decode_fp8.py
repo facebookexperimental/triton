@@ -199,9 +199,27 @@ def select_decode_config(q, key_cache, *, max_context_len, query_length=1, windo
             splits = min(split_cap, triton.cdiv(effective, chunk))
         else:
             splits = min(triton.cdiv(effective, page), max(1, triton.cdiv(384, tasks)), 128)
+        if query_length == 1 and q.dtype == torch.bfloat16 and effective > 128:
+            if kv_heads >= 32 and effective >= 8192:
+                # Long dense partitions amortize descriptor/setup traffic;
+                # excessive splitting increases scheduling and merge work.
+                # Maintain enough CTAs for smaller KV-head grids.
+                if dim == 128:
+                    splits = max(12, triton.cdiv(768, tasks))
+                elif page == 64:
+                    splits = min(32, max(triton.cdiv(1024, tasks), triton.cdiv(effective, 1024)))
+                else:
+                    splits = min(32, max(12, triton.cdiv(1024, tasks), triton.cdiv(effective, 4096)))
+            elif dim == 64 and kv_heads < 32 and page == 64:
+                # Sparse grouped grids need more independent page partitions.
+                pages = triton.cdiv(effective, page)
+                splits = min(256, triton.next_power_of_2(pages))
+                if tokens > query_length:
+                    # Independent requests already supply parallel work.
+                    splits = min(splits, pages)
         cfg = dict(
-            variant="matrix_tdm_flat", block_n=page, block_m=bm,
-            num_warps=1 if query_length == 1 and (kv_heads >= 32 or dim == 128 or page == 128)
+            variant="matrix_tdm_flat", block_n=page, block_m=bm, num_warps=1 if query_length == 1 and
+            (kv_heads >= 32 or dim == 128 or page == 128 or q.dtype == torch.bfloat16 and effective > 128)
             and not (dim == 128 and q.dtype == torch.float8_e4m3fn and kv_heads < 32 and page == 64) else 4,
             num_splits=splits)
     else:
@@ -437,6 +455,32 @@ def test_fp8_kv_decode(variant, fp8_q, dim, page, hq, hkv, qlen, lengths, causal
                            causal=causal, window_size=window, num_splits=splits, variant=variant,
                            block_n=page if variant in ("vector_page", "matrix_tdm_flat") else 32)
     expected = _reference(q, k, v, table, lengths, ks, vs, qs, qlen, causal, window)
+    assert actual.dtype == torch.bfloat16
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual.float(), expected, atol=5e-4, rtol=1e-2)
+
+
+@pytest.mark.skipif(not _gfx1250_available(), reason="Requires gfx1250")
+@pytest.mark.parametrize("fp8_q", [False, True], ids=["bf16-q", "fp8-q"])
+@pytest.mark.parametrize("hq,hkv,dim,page,lengths", [
+    (16, 1, 64, 64, [1024]),
+    (32, 8, 64, 64, [2304]),
+    (64, 8, 128, 64, [8192]),
+    (64, 64, 64, 64, [4096]),
+    (32, 32, 64, 128, [8192]),
+    (64, 64, 64, 128, [8192]),
+    (128, 32, 128, 64, [8192]),
+    (128, 128, 128, 128, [16384]),
+    (128, 128, 64, 64, [0, 67, 513, 1024]),
+    (16, 2, 128, 64, [1, 128, 511, 1024]),
+    (16, 2, 64, 64, [2304] * 8),
+    (64, 64, 128, 64, [8192] * 8),
+])
+def test_fp8_kv_decode_auto_geometry(fp8_q, hq, hkv, dim, page, lengths):
+    q, kp, vp, contexts, table, ks, vs, qs, max_len, k, v = _make_test_inputs(lengths, hq=hq, hkv=hkv, dim=dim,
+                                                                              page=page, fp8_q=fp8_q)
+    actual = fp8_kv_decode(q, kp, vp, contexts, table, ks, vs, max_context_len=max_len, q_scale=qs)
+    expected = _reference(q, k, v, table, contexts, ks, vs, qs, 1, True, 0)
     assert actual.dtype == torch.bfloat16
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.float(), expected, atol=5e-4, rtol=1e-2)
