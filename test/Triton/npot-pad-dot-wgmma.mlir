@@ -108,7 +108,8 @@ tt.func @dot_128x320(%pb: !tt.ptr<f16>) {
 
 // -----
 
-// At 8 warps, exact B loads 4-element vectors where the pow2 tile loads 8.
+// At 8 warps, exact B loads 4-element vectors where the pow2 tile loads 8, so
+// exact takes more vector accesses than padded.
 // CHECK-LABEL: @dot_128x80_load
 // CHECK: tt.dot {{.*}} -> tensor<128x80xf32>
 // W8-LABEL: @dot_128x80_load
@@ -126,10 +127,46 @@ tt.func @dot_128x80_load(%pb: !tt.ptr<f16> {tt.divisibility = 16 : i32}) {
   %off = arith.addi %rowb, %nb : tensor<64x80xi32>
   %sb = tt.splat %pb : !tt.ptr<f16> -> tensor<64x80x!tt.ptr<f16>>
   %ptr = tt.addptr %sb, %off : tensor<64x80x!tt.ptr<f16>>, tensor<64x80xi32>
-  // expected-remark @+1 {{NPOT tt.load pads: its exact vector is 4 elements, 8 on the pow2 tile}}
+  // expected-remark @+1 {{NPOT loads and stores pad: exact takes 1280 vector accesses, padded 1024}}
   %b = tt.load %ptr : tensor<64x80x!tt.ptr<f16>>
   %c = arith.constant dense<0.0> : tensor<128x80xf32>
   %d = tt.dot %a, %b, %c : tensor<128x64xf16> * tensor<64x80xf16> -> tensor<128x80xf32>
+  tt.return
+}
+
+// -----
+
+// At 8 warps exact B loads 4-element vectors, but the C store takes 144
+// columns where the pow2 tile stores 256: fewer vector accesses in sum.
+// W8-LABEL: @dot_128x144_store
+// W8: tt.dot {{.*}} -> tensor<128x144xf32>
+tt.func @dot_128x144_store(%pb: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %pc: !tt.ptr<f16> {tt.divisibility = 16 : i32}) {
+  %a = arith.constant dense<1.0> : tensor<128x64xf16>
+  %k = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
+  %k1 = tt.expand_dims %k {axis = 1 : i32} : tensor<64xi32> -> tensor<64x1xi32>
+  %stride = arith.constant dense<144> : tensor<64x1xi32>
+  %row = arith.muli %k1, %stride : tensor<64x1xi32>
+  %rowb = tt.broadcast %row : tensor<64x1xi32> -> tensor<64x144xi32>
+  %n = tt.make_range {end = 144 : i32, start = 0 : i32} : tensor<144xi32>
+  %n1 = tt.expand_dims %n {axis = 0 : i32} : tensor<144xi32> -> tensor<1x144xi32>
+  %nb = tt.broadcast %n1 : tensor<1x144xi32> -> tensor<64x144xi32>
+  %off = arith.addi %rowb, %nb : tensor<64x144xi32>
+  %sb = tt.splat %pb : !tt.ptr<f16> -> tensor<64x144x!tt.ptr<f16>>
+  %ptr = tt.addptr %sb, %off : tensor<64x144x!tt.ptr<f16>>, tensor<64x144xi32>
+  %b = tt.load %ptr : tensor<64x144x!tt.ptr<f16>>
+  %c = arith.constant dense<0.0> : tensor<128x144xf32>
+  %d = tt.dot %a, %b, %c : tensor<128x64xf16> * tensor<64x144xf16> -> tensor<128x144xf32>
+  %h = arith.truncf %d : tensor<128x144xf32> to tensor<128x144xf16>
+  %m = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
+  %m1 = tt.expand_dims %m {axis = 1 : i32} : tensor<128xi32> -> tensor<128x1xi32>
+  %cstride = arith.constant dense<144> : tensor<128x1xi32>
+  %crow = arith.muli %m1, %cstride : tensor<128x1xi32>
+  %crowb = tt.broadcast %crow : tensor<128x1xi32> -> tensor<128x144xi32>
+  %cn = tt.broadcast %n1 : tensor<1x144xi32> -> tensor<128x144xi32>
+  %coff = arith.addi %crowb, %cn : tensor<128x144xi32>
+  %sc = tt.splat %pc : !tt.ptr<f16> -> tensor<128x144x!tt.ptr<f16>>
+  %cptr = tt.addptr %sc, %coff : tensor<128x144x!tt.ptr<f16>>, tensor<128x144xi32>
+  tt.store %cptr, %h : tensor<128x144x!tt.ptr<f16>>
   tt.return
 }
 
