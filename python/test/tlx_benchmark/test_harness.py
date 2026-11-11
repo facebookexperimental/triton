@@ -198,6 +198,14 @@ def test_noisy_is_not_a_failure_but_pip_and_error_are():
     assert set(FAILING) == {Status.PIP, Status.ERROR}
 
 
+def test_diagnostic_reference_reports_speedup_without_enforcing_the_floor():
+    from _harness.verdict import judge
+
+    result = judge(_case(), summarize([100.0]), summarize([1000.0]), reference_gate=False)
+    assert result.speedup == pytest.approx(0.1)
+    assert result.status == Status.OK
+
+
 def test_artifact_is_json_serializable_and_versioned():
     case = Case(op="mm", arch="sm100", dtype="float16", shape=(256, 256, 256, True, True))
     result = Result(case=case, status=Status.OK, tlx=summarize([1.0, 1.1, 0.9]), speedup=1.2)
@@ -987,6 +995,7 @@ BENCH_MODULES = (
     "bench_linear_rowscale",
     "bench_mla_window_attn",
     "bench_mm",
+    "bench_mm_mxfp8",
     "bench_rmsnorm_cat",
     "bench_swiglu_ffn",
 )
@@ -1017,6 +1026,39 @@ def test_synthetic_cases_are_well_formed_without_a_gpu(module_name):
         assert case.direction in ("fwd", "bwd")
         assert case.label, "an op must render its own shape tuple"
         assert case.key.count("/") >= 3
+
+
+def test_mm_mxfp8_benchmark_covers_both_public_scale_layouts(monkeypatch):
+    import importlib
+
+    bench = importlib.import_module("bench_mm_mxfp8")
+    monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
+    cases = bench.cases(synthetic=True)
+    assert {case.shape[-1] for case in cases} == {"natural", "cublas_blocked"}
+    assert bench.REFERENCE_GATE is False
+    assert len(cases) == 2 * len(bench.SYNTHETIC_SHAPES)
+    assert all("'sf_layout':" in case.label for case in cases)
+
+
+def test_mm_mxfp8_benchmark_reports_logical_k_for_padded_shapes():
+    from triton.tlx.ops.kernels.mm_mxfp8._shapes import flops, label
+
+    rendered = label(85, 3584, 25600, "natural")
+    assert "'K': '25536'" in rendered
+    assert "'K_kernel': '25600'" in rendered
+    assert flops(85, 3584, 25600) == 2 * 85 * 3584 * 25536
+
+
+def test_mm_mxfp8_default_uses_preshuffled_contract_where_supported(monkeypatch):
+    import importlib
+
+    bench = importlib.import_module("bench_mm_mxfp8")
+    monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
+    model_cases = [case for case in bench.cases() if case.shape[:3] in bench.MODEL_LINEAR_SHAPE_SET]
+    assert len(model_cases) == 30
+    assert sum(case.shape[-1] == "mfma_preshuffled" for case in model_cases) == 15
+    assert sum(case.shape[-1] == "cublas_blocked" for case in model_cases) == 15
+    assert len(bench.cases()) == 78
 
 
 def test_flash_attn_gfx950_has_runnable_focus_and_synthetic_shapes(monkeypatch):
