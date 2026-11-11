@@ -312,6 +312,12 @@ def _compiler_options(config, n=None, causal=False):
     # WORKAROUND: LLVM's MFMA anti-hints (llvm/llvm-project#218075) make the OCC1 kernels spill.
     options = dict(num_warps=config.num_warps, num_stages=1, enable_fp_fusion=True, waves_per_eu=config.waves_per_eu,
                    llvm_cl_opts=(("amdgpu-anti-hints", "false"), ))
+    if config.occ1 and not causal:
+        # Expert scheduling needs s_wait_alu va_vdst before an LDS load overwrites a register an
+        # in-flight WMMA reads. Keep only the VA_VDST anti-hint so the prefetches avoid just-read
+        # operands. Wider lookback windows spill, and causal spills at any window that helps.
+        options["llvm_cl_opts"] = (("amdgpu-anti-hints", "true"), ("amdgpu-anti-hints-rules", "va-vdst-war"),
+                                   ("amdgpu-va-vdst-lookback-window", "8"))
     if not config.occ1:
         # WORKAROUND: the default gfx1250 scheduler spills one dV accumulator tile at 8 waves.
         options["llvm_cl_opts"] += (("amdgpu-sched-strategy", "max-ilp"), )
