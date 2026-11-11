@@ -30,8 +30,7 @@ ARCHES = (90, 100)
 SNAPSHOT_VERSION = 1
 
 # ptxas deltas that escalate a kernel from CHANGED to INVESTIGATE.
-HARD_PTXAS_KEYS = ("regs", "smem", "spills_stores", "spills_loads",
-                   "stack_frame", "lmem")
+HARD_PTXAS_KEYS = ("regs", "smem", "spills_stores", "spills_loads", "stack_frame", "lmem")
 HARD_PTX_KEYS = ("ld_local", "st_local", "local_bytes")
 
 
@@ -49,19 +48,15 @@ def kernels():
         tl.store(out_ptr + offs, x + y, mask=mask)
 
     @triton.jit
-    def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak,
-                      stride_bk, stride_bn, stride_cm, stride_cn,
-                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                      BLOCK_K: tl.constexpr):
+    def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
         pid_m = tl.program_id(axis=0)
         pid_n = tl.program_id(axis=1)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
-        a_ptrs = (a_ptr + offs_m[:, None] * stride_am
-                  + offs_k[None, :] * stride_ak)
-        b_ptrs = (b_ptr + offs_k[:, None] * stride_bk
-                  + offs_n[None, :] * stride_bn)
+        a_ptrs = (a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = (b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for _ in range(0, tl.cdiv(K, BLOCK_K)):
             a = tl.load(a_ptrs)
@@ -69,23 +64,16 @@ def kernels():
             acc = tl.dot(a, b, acc)
             a_ptrs += BLOCK_K * stride_ak
             b_ptrs += BLOCK_K * stride_bk
-        c_ptrs = (c_ptr + offs_m[:, None] * stride_cm
-                  + offs_n[None, :] * stride_cn)
+        c_ptrs = (c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
         tl.store(c_ptrs, acc.to(tl.float16))
 
     return [
-        ("add", add_kernel,
-         {"x_ptr": "*fp32", "y_ptr": "*fp32", "out_ptr": "*fp32",
-          "n_elements": "i32"},
-         {"BLOCK": 1024},
-         {"num_warps": 4, "num_stages": 1}),
-        ("matmul", matmul_kernel,
-         {"a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": "*fp16", "M": "i32",
-          "N": "i32", "K": "i32", "stride_am": "i32", "stride_ak": "i32",
-          "stride_bk": "i32", "stride_bn": "i32", "stride_cm": "i32",
-          "stride_cn": "i32"},
-         {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32},
-         {"num_warps": 8, "num_stages": 3}),
+        ("add", add_kernel, {"x_ptr": "*fp32", "y_ptr": "*fp32", "out_ptr": "*fp32", "n_elements":
+                             "i32"}, {"BLOCK": 1024}, {"num_warps": 4, "num_stages": 1}),
+        ("matmul", matmul_kernel, {
+            "a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": "*fp16", "M": "i32", "N": "i32", "K": "i32", "stride_am":
+            "i32", "stride_ak": "i32", "stride_bk": "i32", "stride_bn": "i32", "stride_cm": "i32", "stride_cn": "i32"
+        }, {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, {"num_warps": 8, "num_stages": 3}),
     ]
 
 
@@ -99,8 +87,7 @@ def find_ptxas(arch):
     try:
         import triton
         name = "ptxas" if arch < 90 else "ptxas-blackwell"
-        bundled = os.path.join(os.path.dirname(triton.__file__), "backends",
-                               "nvidia", "bin", name)
+        bundled = os.path.join(os.path.dirname(triton.__file__), "backends", "nvidia", "bin", name)
         if os.path.isfile(bundled):
             return bundled
     except ImportError:
@@ -127,12 +114,11 @@ def normalize_ptx(ptx):
 
 
 def ptx_features(ptx):
+
     def count(pat):
         return len(re.findall(pat, ptx))
 
-    local_bytes = sum(
-        int(m.group(1)) for m in
-        re.finditer(r"\.local\s+\.align\s+\d+\s+\.b\d+\s+\w+\[(\d+)\]", ptx))
+    local_bytes = sum(int(m.group(1)) for m in re.finditer(r"\.local\s+\.align\s+\d+\s+\.b\d+\s+\w+\[(\d+)\]", ptx))
     return {
         "ld_global": count(r"\bld\.global"),
         "st_global": count(r"\bst\.global"),
@@ -167,16 +153,14 @@ def instr_mix(ptx, limit=40):
 
 
 def ptxas_stats(ptx, arch, ptxas):
-    with tempfile.NamedTemporaryFile("w", suffix=".ptx",
-                                     delete=False) as handle:
+    with tempfile.NamedTemporaryFile("w", suffix=".ptx", delete=False) as handle:
         handle.write(ptx)
         path = handle.name
     try:
         last_err, rc = "", 1
         for gpu in gpu_names(arch):
-            proc = subprocess.run(
-                [ptxas, "-v", f"--gpu-name={gpu}", "-o", "/dev/null", path],
-                capture_output=True, text=True, timeout=300)
+            proc = subprocess.run([ptxas, "-v", f"--gpu-name={gpu}", "-o", "/dev/null", path], capture_output=True,
+                                  text=True, timeout=300)
             last_err = proc.stderr + proc.stdout
             rc = proc.returncode
             if rc == 0:
@@ -212,8 +196,7 @@ def compile_ptx(fn, signature, constexprs, options, arch):
     from triton.backends.compiler import GPUTarget
     from triton.compiler.compiler import ASTSource, compile
     src = ASTSource(fn, signature, constexprs=constexprs)
-    out = compile(src, target=GPUTarget("cuda", arch, 32),
-                  options=dict(options))
+    out = compile(src, target=GPUTarget("cuda", arch, 32), options=dict(options))
     return out.asm["ptx"]
 
 
@@ -240,9 +223,10 @@ def snapshot(args):
                 "options": opts,
             }
             entry = snap["kernels"][name][f"sm{arch}"]
-            print(f"compiled {name}/sm{arch}: "
-                  f"{entry['ptxas'].get('regs')} regs, "
-                  f"{entry['ptxas'].get('smem')} smem", flush=True)
+            print(
+                f"compiled {name}/sm{arch}: "
+                f"{entry['ptxas'].get('regs')} regs, "
+                f"{entry['ptxas'].get('smem')} smem", flush=True)
     with open(args.out, "w") as handle:
         json.dump(snap, handle, indent=1)
     print(f"wrote {args.out}")
@@ -292,34 +276,36 @@ def diff(args):
                 continue
             feat_rows = _delta_rows(b["ptx"], h["ptx"])
             ptxas_rows = _delta_rows(
-                {k: v for k, v in b["ptxas"].items()
+                {k: v
+                 for k, v in b["ptxas"].items()
                  if k not in ("ptxas_rc", "ptxas_err_tail")},
-                {k: v for k, v in h.get("ptxas", {}).items()
+                {k: v
+                 for k, v in h.get("ptxas", {}).items()
                  if k not in ("ptxas_rc", "ptxas_err_tail")})
-            mix_rows = _mix_rows(b.get("instr_mix", {}),
-                                 h.get("instr_mix", {}))
-            hard = ([row for row in ptxas_rows if row[0] in HARD_PTXAS_KEYS]
-                    + [row for row in feat_rows if row[0] in HARD_PTX_KEYS])
+            mix_rows = _mix_rows(b.get("instr_mix", {}), h.get("instr_mix", {}))
+            hard = ([row for row in ptxas_rows if row[0] in HARD_PTXAS_KEYS] +
+                    [row for row in feat_rows if row[0] in HARD_PTX_KEYS])
             verdict = "INVESTIGATE" if hard else "CHANGED"
-            overall = ("INVESTIGATE" if verdict == "INVESTIGATE"
-                       else ("CHANGED" if overall == "IDENTICAL" else overall))
+            overall = ("INVESTIGATE" if verdict == "INVESTIGATE" else
+                       ("CHANGED" if overall == "IDENTICAL" else overall))
             lines += ["", f"### `{tag}`: {verdict}", ""]
             if ptxas_rows + feat_rows:
                 lines += ["| signal | base | head |", "|---|---|---|"]
                 for key, before, after in ptxas_rows + feat_rows:
                     lines.append(f"| `{key}` | {before} | {after} |")
             if mix_rows:
-                lines += ["", "Top instruction-mix moves:",
-                          "", "| op | base | head |",
-                          "|---|---|---|"]
+                lines += ["", "Top instruction-mix moves:", "", "| op | base | head |", "|---|---|---|"]
                 for token, before, after in mix_rows:
                     lines.append(f"| `{token}` | {before} | {after} |")
             if verdict == "INVESTIGATE":
-                lines += ["", "Register/smem/spill allocation moved -- treat "
-                          "as a likely perf-relevant codegen change."]
-    lines += ["", f"Overall: **{overall}**.",
-              "This is advisory, not a gate failure. Corpus v0 is two raw "
-              "kernels; tlx.ops coverage follows."]
+                lines += [
+                    "", "Register/smem/spill allocation moved -- treat "
+                    "as a likely perf-relevant codegen change."
+                ]
+    lines += [
+        "", f"Overall: **{overall}**.", "This is advisory, not a gate failure. Corpus v0 is two raw "
+        "kernels; tlx.ops coverage follows."
+    ]
     with open(args.out, "w") as handle:
         handle.write("\n".join(lines) + "\n")
     print(f"trace verdict: {overall}")
@@ -331,8 +317,7 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
     snap = sub.add_parser("snapshot")
     snap.add_argument("--out", required=True)
-    snap.add_argument("--ptx-version", type=int, default=None,
-                      help="pin PTX version int (e.g. 90); default: wheel max")
+    snap.add_argument("--ptx-version", type=int, default=None, help="pin PTX version int (e.g. 90); default: wheel max")
     dummy = sub.add_parser("diff")
     dummy.add_argument("--base", required=True)
     dummy.add_argument("--head", required=True)
