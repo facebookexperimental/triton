@@ -8,6 +8,7 @@ Usage:
 
 import os
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest import mock
 
@@ -17,7 +18,6 @@ from torch._dynamo.testing import CompileCounterWithBackend
 from torch._inductor import config
 from torch._inductor.test_case import run_tests, TestCase
 from torch._inductor.utils import run_and_get_code
-from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -114,152 +114,6 @@ GEMM_NORM_TEST_CASES = [
 ]
 
 
-class TestGfx950GemmNormEligibility(TestCase):
-
-    @staticmethod
-    def _fake_cuda_tensor(
-        shape: tuple[int, ...],
-        *,
-        stride: tuple[int, ...] | None = None,
-        dtype: torch.dtype = torch.bfloat16,
-    ) -> torch.Tensor:
-        with FakeTensorMode():
-            if stride is None:
-                return torch.empty(shape, device="cuda", dtype=dtype)
-            return torch.empty_strided(
-                shape,
-                stride,
-                device="cuda",
-                dtype=dtype,
-            )
-
-    @staticmethod
-    def _make_match(
-        *,
-        dtype: torch.dtype = torch.bfloat16,
-        overrides: dict[str, torch.Tensor] | None = None,
-        addmm_users: int = 1,
-    ):
-        m, k, n = 3, 64, 128
-        values = {
-            "x": TestGfx950GemmNormEligibility._fake_cuda_tensor(
-                (m, k),
-                stride=(k, 1),
-                dtype=dtype,
-            ),
-            "weight": TestGfx950GemmNormEligibility._fake_cuda_tensor(
-                (k, n),
-                stride=(1, k),
-                dtype=dtype,
-            ),
-            "gemm_bias": TestGfx950GemmNormEligibility._fake_cuda_tensor(
-                (n, ),
-                dtype=dtype,
-            ),
-            "scale": TestGfx950GemmNormEligibility._fake_cuda_tensor(
-                (n, ),
-                dtype=dtype,
-            ),
-            "norm_bias": TestGfx950GemmNormEligibility._fake_cuda_tensor(
-                (n, ),
-                dtype=dtype,
-            ),
-        }
-        values.update(overrides or {})
-        addmm = SimpleNamespace(
-            op="call_function",
-            target=torch.ops.aten.addmm.default,
-            users=[object() for _ in range(addmm_users)],
-        )
-        return SimpleNamespace(
-            nodes=[addmm],
-            kwargs={name: SimpleNamespace(meta={"val": value})
-                    for name, value in values.items()},
-        )
-
-    def test_gfx950_addmm_norm_semantic_eligibility(self):
-        from triton.language.extra.tlx.inductor.gemm_norm_gfx950 import (  # @manual
-            _has_supported_semantics, )
-
-        shape = (3, 64, 128)
-        self.assertTrue(_has_supported_semantics(
-            self._make_match(),
-            shape,
-            requires_norm_bias=True,
-        ))
-
-        rms_match = self._make_match()
-        del rms_match.kwargs["norm_bias"]
-        self.assertTrue(_has_supported_semantics(
-            rms_match,
-            shape,
-            requires_norm_bias=False,
-        ))
-        self.assertFalse(_has_supported_semantics(
-            rms_match,
-            shape,
-            requires_norm_bias=True,
-        ))
-
-        n = shape[2]
-        unsupported_matches = {
-            "broadcast gemm bias":
-            self._make_match(overrides={
-                "gemm_bias": self._fake_cuda_tensor(
-                    (1, n),
-                    dtype=torch.bfloat16,
-                ),
-            }),
-            "fp16 operands":
-            self._make_match(dtype=torch.float16),
-            "different devices":
-            self._make_match(overrides={
-                "scale": torch.empty((n, ), dtype=torch.bfloat16),
-            }),
-            "non-row-major x":
-            self._make_match(
-                overrides={
-                    "x": self._fake_cuda_tensor(
-                        (shape[0], shape[1]),
-                        stride=(1, shape[0]),
-                        dtype=torch.bfloat16,
-                    ),
-                }),
-            "non-transposed weight":
-            self._make_match(overrides={
-                "weight": self._fake_cuda_tensor(
-                    (shape[1], n),
-                    dtype=torch.bfloat16,
-                ),
-            }),
-            "noncontiguous scale":
-            self._make_match(overrides={
-                "scale": self._fake_cuda_tensor(
-                    (n, ),
-                    stride=(2, ),
-                    dtype=torch.bfloat16,
-                ),
-            }),
-            "noncontiguous norm bias":
-            self._make_match(overrides={
-                "norm_bias": self._fake_cuda_tensor(
-                    (n, ),
-                    stride=(2, ),
-                    dtype=torch.bfloat16,
-                ),
-            }),
-            "multiple addmm users":
-            self._make_match(addmm_users=2),
-        }
-        for name, match in unsupported_matches.items():
-            with self.subTest(name=name):
-                self.assertFalse(_has_supported_semantics(
-                    match,
-                    shape,
-                    requires_norm_bias=True,
-                ))
-
-
 def _normalize(
     value: torch.Tensor,
     scale: torch.Tensor,
@@ -289,6 +143,12 @@ class TestTorchTLXEpilogueFusion(TestCase):
     def setUp(self) -> None:
         super().setUp()
         import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        # Reduction epilogues fuse whenever legal, so codegen checks do not
+        # depend on fusion benchmark noise.
+        env = mock.patch.dict(os.environ, {"TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE": "force"})
+        env.start()
+        self.addCleanup(env.stop)
 
     @unittest.skipIf(
         not has_datacenter_blackwell_tma_device(),
@@ -386,6 +246,162 @@ class TestTorchTLXEpilogueFusion(TestCase):
                 self.assertIn("tlx.fence_async_shared()", generated_code_str)
             else:
                 self.assertIn("tl.store(out_ptr", generated_code_str)
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(
+        not (has_tlx() and _HAS_BLACKWELL_TUTORIAL),
+        "TLX Blackwell tutorial not available",
+    )
+    def test_tlx_mm_epilogue_with_live_intermediate_is_not_fused(self):
+        """A GEMM output that stays live outside the fused group vetoes TLX fusion.
+
+        The TLX compute_epilogue/TMA path redirects intermediate stores into
+        variable assignments and materializes only the final result. Fusing
+        mm + mul + sigmoid while the pre-sigmoid mm result is also a graph
+        output (e.g. a tensor saved for backward) leaves that buffer allocated
+        but never written. The veto keeps the GEMM materialized and runs the
+        pointwise ops separately.
+        """
+        m, k, n = 4096, 4096, 1024
+        dtype = torch.bfloat16
+        device = GPU_TYPE
+        torch.manual_seed(0)
+        x = torch.randn(m, k, device=device, dtype=dtype)
+        w = torch.randn(k, n, device=device, dtype=dtype)
+
+        def mm_gated_with_live_mm(
+            x: torch.Tensor,
+            w: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            mm = torch.mm(x, w)
+            return mm * torch.sigmoid(mm), mm
+
+        with torch.no_grad():
+            expected = mm_gated_with_live_mm(x, w)
+            with (
+                    config.patch({
+                        "triton.tlx_mode": "force",
+                        "force_disable_caches": True,
+                        "enable_caching_generated_triton_templates": False,
+                    }),
+                    tlx_config.patch(use_heuristic_config=True),
+            ):
+                actual, code = run_and_get_code(
+                    torch.compile(mm_gated_with_live_mm, fullgraph=True),
+                    x,
+                    w,
+                )
+
+        for actual_output, expected_output in zip(actual, expected):
+            torch.testing.assert_close(
+                actual_output,
+                expected_output,
+                atol=2e-2,
+                rtol=2e-2,
+            )
+        generated_code_str = "\n".join(code)
+        if "_reduce_k_kernel" in generated_code_str:
+            # Split-K disables epilogue fusion; nothing to veto.
+            return
+        self.assertIn(
+            "tlx_mm_",
+            generated_code_str,
+            "Expected the TLX mm template to be in play for this graph.",
+        )
+        self.assertNotIn(
+            "triton_tem_fused_tlx_mm_",
+            generated_code_str,
+            "Live intermediate must veto the single-TMA fused TLX epilogue kernel.",
+        )
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(
+        not (has_tlx() and _HAS_BLACKWELL_TUTORIAL),
+        "TLX Blackwell tutorial not available",
+    )
+    def test_tlx_mm_epilogue_with_internal_intermediate_stays_fused(self):
+        """Positive control: a fully internal intermediate still fuses."""
+        m, k, n = 4096, 4096, 1024
+        dtype = torch.bfloat16
+        device = GPU_TYPE
+        torch.manual_seed(0)
+        x = torch.randn(m, k, device=device, dtype=dtype)
+        w = torch.randn(k, n, device=device, dtype=dtype)
+
+        def mm_gated(
+            x: torch.Tensor,
+            w: torch.Tensor,
+        ) -> torch.Tensor:
+            mm = torch.mm(x, w)
+            return mm * torch.sigmoid(mm)
+
+        with torch.no_grad():
+            expected = mm_gated(x, w)
+            with (
+                    config.patch({
+                        "triton.tlx_mode": "force",
+                        "force_disable_caches": True,
+                        "enable_caching_generated_triton_templates": False,
+                    }),
+                    tlx_config.patch(use_heuristic_config=True),
+            ):
+                actual, code = run_and_get_code(
+                    torch.compile(mm_gated, fullgraph=True),
+                    x,
+                    w,
+                )
+
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        generated_code_str = "\n".join(code)
+        if "_reduce_k_kernel" in generated_code_str:
+            return
+        self.assertIn(
+            "triton_tem_fused_tlx_mm_",
+            generated_code_str,
+            "Fully internal intermediate should still fuse into the TLX kernel.",
+        )
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(
+        not (has_tlx() and _HAS_BLACKWELL_TUTORIAL),
+        "TLX Blackwell tutorial not available",
+    )
+    def test_fp32_matmul_row_bias_bf16_epilogue_is_fused(self):
+        """An fp32 mm whose fused epilogue loads a row bias and stores bf16.
+
+        The output dtype differs from the operand dtype, and the bias load is
+        indexed by the renamed epilogue range symbol alone.
+        """
+
+        def linear_bf16_out(x, weight, bias):
+            return (x.float() @ weight.float().t() + bias.float()).to(torch.bfloat16)
+
+        m, k, n = 1152, 1024, 2048
+        x = torch.randn(m, k, device=GPU_TYPE, dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device=GPU_TYPE, dtype=torch.bfloat16) * 0.01
+        bias = torch.randn(n, device=GPU_TYPE, dtype=torch.bfloat16)
+
+        with (
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "enable_caching_generated_triton_templates": False,
+                }),
+                tlx_config.patch(use_heuristic_config=False),
+        ):
+            actual, code = run_and_get_code(torch.compile(linear_bf16_out), x, weight, bias)
+
+        torch.testing.assert_close(actual, linear_bf16_out(x, weight, bias), atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem_fused_tlx", "\n".join(code))
 
     @unittest.skipIf(
         not has_datacenter_blackwell_tma_device(),
@@ -789,17 +805,11 @@ class TestTorchTLXEpilogueFusion(TestCase):
                 )
 
         torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
-        generated_code = "\n".join(code)
-        self.assertTrue(any(marker in generated_code for marker in ("a16w16_8wave", "_register_kernel_impl")))
-        self.assertTrue(
-            any(marker in generated_code for marker in (
-                "tlx_gfx950_apply_norm",
-                "tlx_gfx950_addmm_norm_row_reduce",
-            )))
-        self.assertIn(code[-1].count(".run("), (2, 3))
+        self._assert_reduction_epilogue_fused(code)
 
         with (
                 torch.no_grad(),
+                mock.patch.dict(os.environ, {"TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE": "1"}),
                 config.patch({
                     "triton.tlx_mode": "allow",
                     "force_disable_caches": True,
@@ -823,81 +833,48 @@ class TestTorchTLXEpilogueFusion(TestCase):
             atol=3e-2,
             rtol=3e-2,
         )
-        self.assertNotIn(f"torch.ops.torch_tlx.gfx950_addmm_{norm_kind}", "\n".join(allow_code),
-                         "The opaque custom-op fallback is not emitted")
+        self.assertNotIn("torch.ops.torch_tlx", "\n".join(allow_code))
 
-    @unittest.skipIf(
-        not is_gfx950(),
-        "Need AMD MI350X (gfx950) for the TLX GEMM + normalization kernels",
-    )
-    @unittest.skipIf(not has_tlx(), "TLX not available")
-    def test_tlx_addmm_layernorm_partial_stats_are_bitwise_repeatable(self):
-        """A fixed partial-stat plan must be bitwise stable across launches."""
-        from triton.language.extra.tlx.inductor.gemm_layernorm_gfx950 import (  # @manual
-            _FOCUSED_PLANS, _fused_gfx950_addmm_layernorm,
-        )
-        from triton.language.extra.tlx.inductor.gemm_norm_gfx950 import (  # @manual
-            _EPILOGUE_STATS, )
+    _FORCE_CONFIG = {
+        "triton.tlx_mode": "force",
+        "force_disable_caches": True,
+        "max_autotune": True,
+        "max_autotune_gemm_backends": "TRITON",
+        "enable_caching_generated_triton_templates": False,
+    }
 
-        m, k, n = 2032, 2560, 2560
+    def _assert_reduction_epilogue_fused(self, code: list[str], fused: bool = True) -> None:
+        source = "\n".join(code)
+        if not fused:
+            self.assertNotIn("_row_consumer", source)
+            return
+        self.assertIn("row_stats_ws", source)
+        self.assertIn("_row_consumer", source)
+        self.assertEqual(code[-1].count(".run("), 2)
+
+    def _run_gemm_epilogue(self, epilogue, m: int, k: int, n: int, *, vector_stride: int = 1, repeats: int = 1):
         dtype = torch.bfloat16
-        x = torch.randn((m, k), device=GPU_TYPE, dtype=dtype)
-        weight = torch.randn((n, k), device=GPU_TYPE, dtype=dtype).t()
-        gemm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
-        scale = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
-        norm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
-
-        def fixed_partial_stats(
-            x: torch.Tensor,
-            weight: torch.Tensor,
-            gemm_bias: torch.Tensor,
-            scale: torch.Tensor,
-            norm_bias: torch.Tensor,
-        ) -> torch.Tensor:
-            return _fused_gfx950_addmm_layernorm(
-                x,
-                weight,
-                gemm_bias,
-                scale,
-                norm_bias,
-                1.0e-5,
-                gemm_plan=_FOCUSED_PLANS[0],
-                norm_impl=_EPILOGUE_STATS,
-                norm_num_warps=8,
-            )
-
-        expected = torch.nn.functional.layer_norm(
-            torch.addmm(gemm_bias, x, weight),
-            (n, ),
-            scale,
-            norm_bias,
-            1.0e-5,
+        inputs = (
+            torch.randn((m, k), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, k), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, ), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n * vector_stride, ), device=GPU_TYPE, dtype=dtype)[::vector_stride],
+            torch.randn((n * vector_stride, ), device=GPU_TYPE, dtype=dtype)[::vector_stride],
         )
-        with (
-                torch.no_grad(),
-                config.patch({
-                    "triton.tlx_mode": "force",
-                    "force_disable_caches": True,
-                    "enable_caching_generated_triton_templates": False,
-                }),
-        ):
-            compiled = torch.compile(fixed_partial_stats, fullgraph=True)
-            first, code = run_and_get_code(
-                compiled,
-                x,
-                weight,
-                gemm_bias,
-                scale,
-                norm_bias,
-            )
-            repeated = [compiled(x, weight, gemm_bias, scale, norm_bias) for _ in range(4)]
 
-        torch.testing.assert_close(first, expected, atol=3e-2, rtol=3e-2)
-        for output in repeated:
-            self.assertTrue(torch.equal(output, first))
-        generated_code = "\n".join(code)
-        self.assertIn("_register_kernel_impl", generated_code)
-        self.assertIn("tlx_gfx950_apply_norm", generated_code)
+        def model(x, weight, gemm_bias, scale, norm_bias):
+            return epilogue(torch.addmm(gemm_bias, x, weight.t()), scale, norm_bias)
+
+        with torch.no_grad():
+            expected = model(*inputs)
+            with config.patch(self._FORCE_CONFIG):
+                compiled = torch.compile(model, fullgraph=True)
+                actual, code = run_and_get_code(compiled, *inputs)
+                torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+                for iteration in range(1, repeats):
+                    with self.subTest(iteration=iteration):
+                        torch.testing.assert_close(compiled(*inputs), expected, atol=3e-2, rtol=3e-2)
+        return code
 
     @unittest.skipIf(
         not is_gfx950(),
@@ -908,8 +885,288 @@ class TestTorchTLXEpilogueFusion(TestCase):
         not supports_template_epilogue_fusion(),
         "torch lacks the template fusion codegen API (old ROCm nightly)",
     )
-    def test_tlx_matmul_norm_dynamic_m_falls_back(self):
-        """Verify the production-shape fusion declines symbolic M."""
+    @parametrize("case", GEMM_NORM_TEST_CASES)
+    def test_tlx_matmul_norm_is_fused_with_dynamic_batch(
+        self,
+        case: tuple[str, tuple[int, int, int]],
+    ):
+        """A dynamic batch dim must still build the direct-to-LDS fused plans.
+
+        The register-resident GEMM takes M as a constexpr and cannot serve a
+        symbolic M; the LDS path must, including its split-K plans.
+        """
+        norm_kind, (m, k, n) = case
+        dtype = torch.bfloat16
+        x = torch.randn((m, k), device=GPU_TYPE, dtype=dtype)
+        weight = torch.randn((n, k), device=GPU_TYPE, dtype=dtype)
+        gemm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
+        scale = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
+        norm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
+
+        def matmul_norm(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            gemm_bias: torch.Tensor,
+            scale: torch.Tensor,
+            norm_bias: torch.Tensor,
+        ) -> torch.Tensor:
+            gemm = torch.addmm(gemm_bias, x, weight.t())
+            return _normalize(gemm, scale, norm_bias, norm_kind)
+
+        torch._dynamo.mark_dynamic(x, 0)
+        with torch.no_grad():
+            expected = matmul_norm(x, weight, gemm_bias, scale, norm_bias)
+            with config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+            }):
+                actual, code = run_and_get_code(
+                    torch.compile(matmul_norm, fullgraph=True),
+                    x,
+                    weight,
+                    gemm_bias,
+                    scale,
+                    norm_bias,
+                )
+
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        self._assert_reduction_epilogue_fused(code)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe GEMM template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not supports_template_epilogue_fusion(),
+        "torch lacks the template fusion codegen API (old ROCm nightly)",
+    )
+    @parametrize(
+        "case",
+        [
+            ("layernorm_no_affine", (2032, 2560, 2560)),
+            ("layernorm_wide", (2032, 2560, 5120)),
+            ("layernorm_tail", (2033, 2560, 2577)),
+            ("relu_layernorm", (2032, 2560, 2560)),
+            ("layernorm_constants", (2032, 2560, 2560)),
+            ("rmsnorm_no_affine", (677, 8192, 4096)),
+            ("rmsnorm_post_relu", (677, 8192, 4096)),
+            ("l2norm", (2032, 2560, 2560)),
+        ],
+    )
+    def test_tlx_matmul_reduction_epilogue_is_fused(self, case: tuple[str, tuple[int, int, int]]):
+        """Verify the generated consumer covers affine-free, N > 4096, and pre-norm pointwise epilogues."""
+        kind, (m, k, n) = case
+        epilogues = {
+            "layernorm_no_affine": lambda v, s, b: torch.nn.functional.layer_norm(v, (n, ), eps=1.0e-5),
+            "layernorm_wide": lambda v, s, b: _normalize(v, s, b, "layernorm"),
+            "layernorm_tail": lambda v, s, b: _normalize(v, s, b, "layernorm"),
+            "relu_layernorm": lambda v, s, b: _normalize(torch.relu(v), s, b, "layernorm"),
+            "layernorm_constants": lambda v, s, b: torch.nn.functional.layer_norm(v * 1.0e-3 + 1.0e-8,
+                                                                                  (n, ), eps=1.0e-5),
+            "rmsnorm_no_affine": lambda v, s, b: torch.nn.functional.rms_norm(v, (n, ), eps=1.0e-5),
+            "rmsnorm_post_relu": lambda v, s, b: torch.relu(_normalize(v, s, b, "rmsnorm")),
+            "l2norm": lambda v, s, b: torch.nn.functional.normalize(v, dim=-1, eps=1.0e-5),
+        }
+        self._assert_reduction_epilogue_fused(self._run_gemm_epilogue(epilogues[kind], m, k, n))
+
+    @unittest.skipIf(not is_gfx950() or not has_tlx() or not supports_template_epilogue_fusion(),
+                     "Need gfx950 template fusion")
+    @parametrize("persistent", (False, True))
+    @parametrize("norm_kind", (None, "layernorm", "rmsnorm"))
+    def test_tlx_norm_fusion_pipeline_drain(self, persistent: bool, norm_kind: str | None):
+        from triton.language.extra.tlx.inductor import mm_templates as tlx_mm
+        from triton.language.extra.tlx.inductor import registry as tlx_registry
+
+        template = (tlx_mm.gfx950_addmm_persistent_warppipe_template
+                    if persistent else tlx_mm.gfx950_addmm_warppipe_template)
+        heuristic = (tlx_registry.Gfx950AddMMPersistentWarpPipeConfigHeuristic
+                     if persistent else tlx_registry.Gfx950AddMMWarpPipeConfigHeuristic)
+        original_append_tlx = tlx_mm.append_tlx
+
+        def only_warppipe(templates, op_name, kernel_inputs):
+            original_append_tlx(templates, op_name, kernel_inputs)
+            if template in templates:
+                templates[:] = [template]
+            return templates
+
+        with (
+                mock.patch.object(tlx_mm, "append_tlx", only_warppipe),
+                mock.patch.object(heuristic, "WARPPIPE_CONFIGS", [(64, 64, 128, 8, 8, 3), (64, 64, 64, 8, 8, 3)]),
+        ):
+            code = self._run_gemm_epilogue(
+                lambda v, s, b: v if norm_kind is None else _normalize(v, s, b, norm_kind),
+                2033,
+                2560,
+                2577,
+                repeats=1000 if norm_kind is None else 1,
+            )
+        self._assert_reduction_epilogue_fused(code, fused=norm_kind is not None)
+        self.assertIn(f"DRAIN_PIPELINE={norm_kind is not None}", "\n".join(code))
+
+    @unittest.skipIf(not is_gfx950() or not has_tlx() or not supports_template_epilogue_fusion(),
+                     "Need gfx950 template fusion")
+    @parametrize("norm_kind", ("layernorm", "rmsnorm"))
+    @parametrize("stride", (2, 3))
+    def test_tlx_matmul_norm_strided_vectors(self, norm_kind: str, stride: int):
+        code = self._run_gemm_epilogue(
+            lambda v, s, b: _normalize(v, s, b, norm_kind),
+            2032,
+            2560,
+            2560,
+            vector_stride=stride,
+        )
+        self._assert_reduction_epilogue_fused(code)
+
+    @unittest.skipIf(not is_gfx950() or not has_tlx() or not supports_template_epilogue_fusion(),
+                     "Need gfx950 template fusion")
+    @parametrize("norm_kind", ("layernorm", "rmsnorm"))
+    def test_tlx_matmul_norm_consumer_partial_loop(self, norm_kind: str):
+        from triton.language.extra.tlx.inductor import reduction_epilogue
+
+        with mock.patch.object(reduction_epilogue, "_CONSUMER_MAX_BLOCK_STATS", 2):
+            code = self._run_gemm_epilogue(
+                lambda v, s, b: _normalize(v, s, b, norm_kind),
+                2032,
+                2560,
+                5120,
+            )
+        self._assert_reduction_epilogue_fused(code)
+        self.assertRegex("\n".join(code), r"range\(0, (?:[3-9]|[1-9][0-9]+), 2\)")
+        self.assertIn("range(0, 5120, 4096)", "\n".join(code))
+
+    @unittest.skipIf(not is_gfx950() or not has_tlx() or not supports_template_epilogue_fusion(),
+                     "Need gfx950 template fusion")
+    @parametrize("norm_kind", ("layernorm", "rmsnorm"))
+    def test_tlx_matmul_norm_without_row_partial_capability(self, norm_kind: str):
+        from triton.language.extra.tlx.inductor import mm_templates
+
+        with ExitStack() as stack:
+            for name in (
+                    "gfx950_addmm_warppipe_template",
+                    "gfx950_addmm_persistent_warppipe_template",
+                    "gfx950_addmm_interwave_template",
+                    "gfx950_mm_interwave_template",
+            ):
+                stack.enter_context(mock.patch.object(getattr(mm_templates, name), "tlx_row_partials", False))
+            code = self._run_gemm_epilogue(
+                lambda v, s, b: _normalize(v, s, b, norm_kind),
+                2032,
+                2560,
+                2560,
+            )
+        self._assert_reduction_epilogue_fused(code, fused=False)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe GEMM template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not supports_template_epilogue_fusion(),
+        "torch lacks the template fusion codegen API (old ROCm nightly)",
+    )
+    @parametrize("kind", ("gelu", "post_gelu", "column_reduction", "side_statistics"))
+    def test_tlx_matmul_unsupported_epilogue_op_falls_back(self, kind: str):
+        """Verify an op outside the consumer whitelist (erf GELU) keeps the epilogue unfused."""
+        epilogues = {
+            "gelu": lambda v, s, b: _normalize(torch.nn.functional.gelu(v), s, b, "layernorm"),
+            "post_gelu": lambda v, s, b: torch.nn.functional.gelu(_normalize(v, s, b, "layernorm")),
+            "column_reduction": lambda v, s, b: v / (v.float().square().sum(dim=0) + 1.0e-5),
+            "side_statistics": lambda v, s, b: (_normalize(v, s, b, "layernorm"), v.float().mean(dim=-1)),
+        }
+        code = self._run_gemm_epilogue(
+            epilogues[kind],
+            2032,
+            2560,
+            2560,
+        )
+        self._assert_reduction_epilogue_fused(code, fused=False)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe GEMM template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not supports_template_epilogue_fusion(),
+        "torch lacks the template fusion codegen API (old ROCm nightly)",
+    )
+    def test_tlx_matmul_layernorm_saved_statistics_fall_back(self):
+        """Verify a training forward that saves mean/rstd for backward is not fused."""
+        m, k, n = 2032, 2560, 2560
+        dtype = torch.bfloat16
+        x = torch.randn((m, k), device=GPU_TYPE, dtype=dtype)
+        weight = torch.randn((n, k), device=GPU_TYPE, dtype=dtype)
+        gemm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype)
+        scale = torch.randn((n, ), device=GPU_TYPE, dtype=dtype, requires_grad=True)
+        norm_bias = torch.randn((n, ), device=GPU_TYPE, dtype=dtype, requires_grad=True)
+
+        def model(x, weight, gemm_bias, scale, norm_bias):
+            return _normalize(torch.addmm(gemm_bias, x, weight.t()), scale, norm_bias, "layernorm")
+
+        expected = model(x, weight, gemm_bias, scale, norm_bias)
+        with config.patch(self._FORCE_CONFIG):
+            actual, code = run_and_get_code(
+                torch.compile(model, fullgraph=True),
+                x,
+                weight,
+                gemm_bias,
+                scale,
+                norm_bias,
+            )
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        self._assert_reduction_epilogue_fused(code, fused=False)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe GEMM template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not supports_template_epilogue_fusion(),
+        "torch lacks the template fusion codegen API (old ROCm nightly)",
+    )
+    @parametrize("case", GEMM_NORM_TEST_CASES)
+    def test_tlx_addmm_norm_partial_stats_are_bitwise_repeatable(self, case):
+        norm_kind, (m, k, n) = case
+        dtype = torch.bfloat16
+        inputs = (
+            torch.randn((m, k), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, k), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, ), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, ), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, ), device=GPU_TYPE, dtype=dtype),
+        )
+
+        def model(x, weight, gemm_bias, scale, norm_bias):
+            return _normalize(torch.addmm(gemm_bias, x, weight.t()), scale, norm_bias, norm_kind)
+
+        with torch.no_grad(), config.patch(self._FORCE_CONFIG):
+            expected = model(*inputs)
+            compiled = torch.compile(model, fullgraph=True)
+            first, code = run_and_get_code(compiled, *inputs)
+            repeated = [compiled(*inputs) for _ in range(4)]
+
+        torch.testing.assert_close(first, expected, atol=3e-2, rtol=3e-2)
+        self._assert_reduction_epilogue_fused(code)
+        for output in repeated:
+            self.assertTrue(torch.equal(output, first))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe GEMM template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not supports_template_epilogue_fusion(),
+        "torch lacks the template fusion codegen API (old ROCm nightly)",
+    )
+    def test_tlx_matmul_norm_dynamic_m(self):
+        """Verify GEMM + RMSNorm stays correct across a symbolic M."""
         m, m_new, k, n = 677, 689, 4096, 2048
         dtype = torch.bfloat16
         x = torch.randn((m, k), device=GPU_TYPE, dtype=dtype)
@@ -979,11 +1236,8 @@ class TestTorchTLXEpilogueFusion(TestCase):
             atol=3e-2,
             rtol=3e-2,
         )
-        # The fused custom op declines dynamic M. The remaining TLX addmm
-        # candidates specialize M, so the second shape recompiles once.
-        self.assertEqual(compile_counter.frame_count, 2)
-        generated_code = "\n".join(code)
-        self.assertNotIn("tlx_gfx950_addmm_rmsnorm", generated_code)
+        # Nothing specializes M, so both shapes reuse one compiled frame.
+        self.assertEqual(compile_counter.frame_count, 1)
         self.assertGreaterEqual(code[-1].count(".run("), 2)
 
     @unittest.skipIf(
@@ -992,11 +1246,11 @@ class TestTorchTLXEpilogueFusion(TestCase):
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
     @parametrize("norm_kind", ("rmsnorm", "layernorm"))
-    def test_tlx_matmul_norm_multiple_user_falls_back(
+    def test_tlx_matmul_norm_shared_gemm_output(
         self,
         norm_kind: str,
     ):
-        """Verify a shared addmm output prevents GEMM-normalization fusion."""
+        """Verify a GEMM output shared with another consumer stays correct."""
         m, k, n = 279, 4096, 2048
         dtype = torch.bfloat16
         x = torch.randn((m, k), device=GPU_TYPE, dtype=dtype)
@@ -1046,9 +1300,8 @@ class TestTorchTLXEpilogueFusion(TestCase):
                 atol=3e-2,
                 rtol=3e-2,
             )
-        generated_code = "\n".join(code)
-        self.assertNotIn(f"tlx_gfx950_addmm_{norm_kind}", generated_code)
-        self.assertGreaterEqual(generated_code.count(".run("), 2)
+        self.assertGreaterEqual("\n".join(code).count(".run("), 2)
+        self._assert_reduction_epilogue_fused(code, fused=False)
 
     @unittest.skipIf(
         not is_gfx950(),
@@ -1096,7 +1349,255 @@ class TestTorchTLXEpilogueFusion(TestCase):
                 )
 
         torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
-        self.assertNotIn("tlx_gfx950_addmm_rmsnorm", "\n".join(code))
+        self._assert_reduction_epilogue_fused(code, fused=False)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe GEMM template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not supports_template_epilogue_fusion(),
+        "torch lacks the template fusion codegen API (old ROCm nightly)",
+    )
+    def test_tlx_matmul_norm_cpp_wrapper_autotune_at_compile_time(self):
+        """The fused norm compiles under the C++ wrapper with compile-time autotuning.
+
+        That codegen builds example args for every kernel call and recognizes a
+        workspace only by its name (``^(workspace|semaphore)``, see
+        ``PythonWrapperCodegen._generate_kernel_call_helper``); a row-stat
+        workspace named otherwise hit "V.graph.get_buffer(arg) and raw_arg can't
+        be None at the same time" (AOTI lowering of an MI350 ads model).
+        """
+        norm_kind, (m, k, n) = GEMM_NORM_TEST_CASES[0]
+        dtype = torch.bfloat16
+        inputs = (
+            torch.randn((m, k), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, k), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, ), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, ), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, ), device=GPU_TYPE, dtype=dtype),
+        )
+
+        def matmul_norm(x, weight, gemm_bias, scale, norm_bias):
+            return _normalize(torch.addmm(gemm_bias, x, weight.t()), scale, norm_bias, norm_kind)
+
+        with torch.no_grad():
+            expected = matmul_norm(*inputs)
+            with config.patch({
+                    **self._FORCE_CONFIG,
+                    "cpp_wrapper": True,
+                    "triton.autotune_at_compile_time": True,
+            }):
+                actual, code = run_and_get_code(torch.compile(matmul_norm, fullgraph=True), *inputs)
+
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        source = "\n".join(code)
+        self.assertIn("_row_consumer", source)
+        self.assertIn("workspace_row_stats_", source)
+
+
+def is_gfx942():
+    """True on AMD MI300X (gfx942)."""
+    try:
+        from triton.language.extra.tlx.hw.target import current_target
+    except ImportError:
+        return False
+    return current_target().is_gfx942
+
+
+@instantiate_parametrized_tests
+class TestGfx942ReductionEpilogue(TestCase):
+
+    def _centered_swish_norm(self, value):
+        value = value.to(torch.float32)
+        value = value - value.mean(dim=-1, keepdim=True)
+        value = value / torch.sqrt(torch.square(value).mean(dim=-1, keepdim=True) + 1e-5)
+        value = value.to(torch.float16)
+        return value * torch.sigmoid(value)
+
+    def _gated_swish_norm(self, value, norm_weight, norm_bias, *, clip=False):
+        dtype = value.dtype
+        value = value.to(torch.float32)
+        centered = value - value.mean(dim=[-1], keepdim=True)
+        if clip:
+            centered = torch.clip(centered, -65504.0, 65504.0)
+        normed = torch.nn.functional.rms_norm(centered, [value.shape[-1]], weight=None, eps=1e-5)
+        normed = normed * norm_weight.to(torch.float32) + norm_bias.to(torch.float32)
+        return (value * torch.sigmoid(normed)).to(dtype)
+
+    @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("epilogue",
+                 ("layernorm", "rmsnorm", "centered_swish_norm", "centered_swish_norm_residual", "gated_swish_norm",
+                  "centered_swish_norm_wide_tile", "centered_swish_norm_tail_tile", "clipped_gated_swish_norm"))
+    def test_gfx942_reduction_epilogue_is_fused(self, epilogue: str):
+        """addmm + row-normalization epilogues lower to the gfx942 template with row partials and a consumer."""
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        m, k, n = (4662, 2560, 2560) if epilogue == "centered_swish_norm_wide_tile" else (1000, 512, 2560)
+        if epilogue == "centered_swish_norm_tail_tile":
+            m, k, n = 1000, 512, 2600
+        fp16 = {"device": GPU_TYPE, "dtype": torch.float16}
+        x = torch.randn((m, k), **fp16)
+        weight = torch.randn((n, k), **fp16) / k**0.5
+        bias = torch.randn((n, ), **fp16)
+        res = torch.randn((m, n), **fp16)
+        scale = torch.randn((n, ), **fp16)
+        shift = torch.randn((n, ), **fp16)
+
+        def layer(x, weight, bias, res, scale, shift):
+            value = torch.nn.functional.linear(x, weight, bias)
+            if epilogue in ("layernorm", "rmsnorm"):
+                return _normalize(value, scale, shift, epilogue)
+            if epilogue == "gated_swish_norm":
+                return self._gated_swish_norm(value, scale, shift)
+            if epilogue == "clipped_gated_swish_norm":
+                return self._gated_swish_norm(value, scale, shift, clip=True)
+            if epilogue == "centered_swish_norm_residual":
+                value = res + value
+            return self._centered_swish_norm(value)
+
+        with torch.no_grad(), mock.patch.dict(os.environ, {"TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE": "force"}):
+            expected = layer(x, weight, bias, res, scale, shift)
+            torch._dynamo.reset()
+            with config.patch({"triton.tlx_mode": "allow", "force_disable_caches": True}):
+                with ExitStack() as stack:
+                    if epilogue in ("centered_swish_norm_wide_tile", "centered_swish_norm_tail_tile"):
+                        from triton import Config
+
+                        stack.enter_context(
+                            mock.patch(
+                                "triton.tlx.ops.kernels.mm.gfx942.torchtlx_heuristic_config",
+                                return_value=[
+                                    Config(
+                                        {
+                                            "BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 8, "NUM_XCDS": 1,
+                                            "XCD_CHUNK": 1, "SPLIT_K": 1
+                                        }, num_warps=8, num_stages=1)
+                                ],
+                            ))
+                    actual, code = run_and_get_code(torch.compile(layer, fullgraph=True), x, weight, bias, res, scale,
+                                                    shift)
+
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        source = "\n".join(code)
+        if epilogue == "clipped_gated_swish_norm":
+            self.assertNotIn("_row_consumer", source)
+            return
+        self.assertIn("tlx_gfx942_addmm", source)
+        self.assertIn("row_stats_ws", source)
+        self.assertIn("_row_consumer", source)
+        self.assertIn("'tlx_consumer_ms':", source)
+        if epilogue in ("centered_swish_norm_wide_tile", "centered_swish_norm_tail_tile"):
+            self.assertIn("pid_n * 2 + 1", source)
+        if epilogue == "centered_swish_norm_tail_tile":
+            self.assertIn("((pid_n * 2 + 1) < 21)", source)
+
+    @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_gfx942_opt_in_persistent_reduction_compiles_both_variants(self):
+        """With the opt-in flag, a 2560-wide norm compiles both variants and runs the re-timed pick."""
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        value = torch.randn((1024, 2560), device=GPU_TYPE, dtype=torch.float16)
+
+        with torch.no_grad():
+            expected = self._centered_swish_norm(value)
+            torch._dynamo.reset()
+            with config.patch({"triton.tlx_mode": "allow", "force_disable_caches": True,
+                               "triton.multi_kernel": False}), \
+                    tlx_config.patch(gfx942_persistent_inner_reductions=True):
+                actual, code = run_and_get_code(torch.compile(self._centered_swish_norm, fullgraph=True), value)
+
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        source = "\n".join(code)
+        self.assertIn("multi_kernel", source)
+        self.assertIn("triton_per_", source)
+        self.assertIn("triton_red_", source)
+
+
+@instantiate_parametrized_tests
+class TestReductionEpilogueGuards(TestCase):
+
+    def test_consumer_cost_uses_metadata_without_source_file(self):
+        from triton.language.extra.tlx.inductor.reduction_epilogue import _module_consumer_cost_ms
+
+        module = SimpleNamespace(triton_=SimpleNamespace(inductor_meta={"config_args": {"tlx_consumer_ms": 0.025}}))
+        self.assertEqual(_module_consumer_cost_ms(module), 0.025)
+        self.assertEqual(_module_consumer_cost_ms(SimpleNamespace()), 0.0)
+        module.triton_.inductor_meta["config_args"] = {}
+        self.assertEqual(_module_consumer_cost_ms(module), 0.0)
+
+    @parametrize("enabled", (False, True))
+    @parametrize("rblock", (None, 1024, 4096))
+    def test_persistent_inner_reduction_guard(self, enabled, rblock):
+        import sympy
+        from torch._inductor.runtime.hints import ReductionHint
+        from torch._inductor.sizevars import SizeVarAllocator
+        from torch._inductor.virtualized import V
+        from triton.language.extra.tlx.inductor.choices import TLXInductorChoices
+
+        features = SimpleNamespace(
+            reduction_numel=sympy.Integer(4096),
+            get_reduction_hint=lambda: ReductionHint.INNER,
+            strict_reduction_rblock=lambda: rblock,
+            has_strict_multirow_reduction=lambda: False,
+        )
+        with V.set_graph_handler(SimpleNamespace(sizevars=SizeVarAllocator())), \
+                tlx_config.patch(gfx942_persistent_inner_reductions=enabled), \
+                config.patch({"triton.tlx_mode": "allow", "triton.persistent_reductions": True,
+                              "triton.multi_kernel": False}), \
+                mock.patch("triton.language.extra.tlx.inductor.registry._is_gfx942", return_value=True):
+            self.assertEqual(TLXInductorChoices.should_use_persistent_reduction(features, False), enabled
+                             and rblock != 1024)
+
+    @parametrize("reduction_numel", (1024, 4096))
+    def test_persistent_only_by_tlx(self, reduction_numel):
+        import sympy
+        from torch._inductor.runtime.hints import ReductionHint
+        from torch._inductor.sizevars import SizeVarAllocator
+        from torch._inductor.virtualized import V
+        from triton.language.extra.tlx.inductor.choices import TLXInductorChoices
+
+        features = SimpleNamespace(
+            reduction_numel=sympy.Integer(reduction_numel),
+            get_reduction_hint=lambda: ReductionHint.INNER,
+            strict_reduction_rblock=lambda: None,
+            has_strict_multirow_reduction=lambda: False,
+        )
+        with V.set_graph_handler(SimpleNamespace(sizevars=SizeVarAllocator())), \
+                tlx_config.patch(gfx942_persistent_inner_reductions=True), \
+                config.patch({"triton.tlx_mode": "allow", "triton.persistent_reductions": True,
+                              "triton.multi_kernel": False}), \
+                mock.patch("triton.language.extra.tlx.inductor.registry._is_gfx942", return_value=True):
+            # Up to 1024 columns Inductor is already persistent; above it only the override is.
+            self.assertEqual(TLXInductorChoices.persistent_only_by_tlx(features, False), reduction_numel > 1024)
+
+    @parametrize("row_offset", (0, 1))
+    def test_centered_moment_checks_mean_row_index(self, row_offset):
+        import sympy
+        from torch._inductor.ir import Buffer, FixedLayout
+        from torch._inductor.kernel.loop_ir_epilogue_lowering import GemmEpilogueIRExpression as Expr
+        from torch._inductor.sizevars import SizeVarAllocator
+        from torch._inductor.virtualized import V
+        from triton.language.extra.tlx.inductor.reduction_epilogue import _Context, _Reject, _Validator
+
+        row, column = sympy.symbols("row column", integer=True)
+        gemm = Buffer(name="gemm", layout=FixedLayout(torch.device("cuda"), torch.float16, [4, 2560]))
+        total_buffer = Buffer(name="total", layout=FixedLayout(torch.device("cuda"), torch.float32, [4, 1]))
+        value = Expr("load", ("gemm", row * 2560 + column, None))
+        total = Expr("reduction", (torch.float32, torch.float32, "sum", value))
+        mean = Expr("truediv", (Expr("load",
+                                     ("total", row + row_offset, total)), Expr("constant", (2560, torch.float32))))
+        source = Expr("square", (Expr("sub", (value, mean)), ))
+        validator = _Validator(gemm, {"total": total_buffer}, {}, 2560)
+        with V.set_graph_handler(SimpleNamespace(sizevars=SizeVarAllocator())):
+            if row_offset:
+                with self.assertRaises(_Reject):
+                    validator._centered_square_source(source, _Context(row, column))
+            else:
+                self.assertEqual(validator._centered_square_source(source, _Context(row, column)), value)
 
 
 if __name__ == "__main__":

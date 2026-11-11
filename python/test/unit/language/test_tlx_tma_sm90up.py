@@ -1,4 +1,5 @@
 """TLX tma tests -- Hopper and newer."""
+import re
 import pytest
 import torch
 import triton
@@ -11,7 +12,8 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 @pytest.mark.parametrize("use_prefetch", [False, True])
-def test_descriptor_load(use_prefetch, device):
+@pytest.mark.parametrize("read_only", [False, True])
+def test_descriptor_load(use_prefetch, read_only, device):
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
         assert align == 128
@@ -20,7 +22,7 @@ def test_descriptor_load(use_prefetch, device):
 
     @triton.jit
     def descriptor_load_kernel(input_ptr, output_ptr, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-                               USE_PREFETCH: tl.constexpr):
+                               USE_PREFETCH: tl.constexpr, READ_ONLY: tl.constexpr):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
 
@@ -54,7 +56,7 @@ def test_descriptor_load(use_prefetch, device):
         tlx.barrier_wait(bar=bar, phase=0)
         tlx.fence("async_shared")
         tlx.async_descriptor_store(desc_out, buffer, [off_m, off_n])
-        tlx.async_descriptor_store_wait(0)
+        tlx.async_descriptor_store_wait(0, read_only=READ_ONLY)
 
     triton.set_allocator(alloc_fn)
     M, N = 128, 128
@@ -64,10 +66,13 @@ def test_descriptor_load(use_prefetch, device):
     grid = lambda meta: (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
 
     kernel = descriptor_load_kernel[grid](x, y, M, N, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
-                                          USE_PREFETCH=use_prefetch)
+                                          USE_PREFETCH=use_prefetch, READ_ONLY=read_only)
     assert kernel.asm["ttgir"].count("ttng.async_tma_copy_global_to_local") == 1
     assert kernel.asm["ttgir"].count("ttng.async_tma_copy_local_to_global") == 1
     assert kernel.asm["ttgir"].count("ttng.async_tma_store_wait") == 1
+    # Device-side descriptor creation emits its own wait_group.read, so count
+    # the full-completion waits instead.
+    assert len(re.findall(r"cp\.async\.bulk\.wait_group\s", kernel.asm["ptx"])) == int(not read_only)
     assert kernel.asm["ttgir"].count("ttng.fence_async_shared") == 1
     if use_prefetch:
         assert kernel.asm["ttgir"].count("ttng.async_tma_prefetch") == 1

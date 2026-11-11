@@ -2055,26 +2055,29 @@ register(name="gemm_persistent", category="gemm-structural",
          shape_note="2048^3 persistent")
 
 
-# --- matmul via block pointers (tl.make_block_ptr / tl.advance) --- #
+# --- matmul via explicit block indexing (block pointers were removed upstream) --- #
 @triton.jit
 def _gemm_block_ptr_kernel(a_ptr, b_ptr, c_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn,
                            BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    a_bp = tl.make_block_ptr(base=a_ptr, shape=(M, K), strides=(sam, sak), offsets=(pid_m * BM, 0),
-                             block_shape=(BM, BK), order=(1, 0))
-    b_bp = tl.make_block_ptr(base=b_ptr, shape=(K, N), strides=(sbk, sbn), offsets=(0, pid_n * BN),
-                             block_shape=(BK, BN), order=(1, 0))
+    offs_am = pid_m * BM + tl.arange(0, BM)
+    offs_bn = pid_n * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    a_ptrs = a_ptr + offs_am[:, None] * sam + offs_k[None, :] * sak
+    b_ptrs = b_ptr + offs_k[:, None] * sbk + offs_bn[None, :] * sbn
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for _k in range(0, tl.cdiv(K, BK)):
-        a = tl.load(a_bp, boundary_check=(0, 1))
-        b = tl.load(b_bp, boundary_check=(0, 1))
+        a = tl.load(a_ptrs, mask=(offs_am[:, None] < M) & (offs_k[None, :] < K - _k * BK), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - _k * BK) & (offs_bn[None, :] < N), other=0.0)
         acc += tl.dot(a, b)
-        a_bp = tl.advance(a_bp, (0, BK))
-        b_bp = tl.advance(b_bp, (BK, 0))
-    c_bp = tl.make_block_ptr(base=c_ptr, shape=(M, N), strides=(scm, scn), offsets=(pid_m * BM, pid_n * BN),
-                             block_shape=(BM, BN), order=(1, 0))
-    tl.store(c_bp, acc.to(c_ptr.dtype.element_ty), boundary_check=(0, 1))
+        a_ptrs += BK * sak
+        b_ptrs += BK * sbk
+    offs_cm = pid_m * BM + tl.arange(0, BM)
+    offs_cn = pid_n * BN + tl.arange(0, BN)
+    c_ptrs = c_ptr + scm * offs_cm[:, None] + scn * offs_cn[None, :]
+    cm = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty), mask=cm)
 
 
 def _run_gemm_block_ptr(inp):

@@ -11,15 +11,19 @@ One shot command with extreme simplicity
 
 python python/test/tlx_benchmark/bench_{op}.py
 
-`{op}` is one of `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
-`flash_attn`, `flash_attn_mxfp8`, `hstu_attn`, `kda`, `kda_prefill`,
-`kda_decode`.
+`{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
+`flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
+`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, or one of the
+fused operators below.
+
+Fused operators fuse an elementwise epilogue into a GEMM (`tlx/ops/kernels/fused/`): `addmm_mul_add`,
+`linear_rowscale`.
 
 ```
 options:
   -h, --help            show this help message and exit
   --device DEVICE       GPU index, or 'auto' (default) for the least-used one
-  --space {heuristic,full,smoke}
+  --space {heuristic,curated,full,smoke}
                         autotune search space; the default is each op's own, and measuring anything
                         else measures a path users do not take
   --head N              only the first N cases PER DIRECTION, for a quick look; on an op with a
@@ -33,8 +37,8 @@ options:
   --fwd-only            skip the backward cases
   --bwd-only            skip the forward cases
   --latency-measure-mode {wallclock,gpu_events}
-                        'wallclock' (default) times each call as a caller sees it; 'gpu_events'
-                        pre-enqueues the batch behind a blocked stream to isolate device time
+                        legacy selector (default gpu_events); measurements always use
+                        verified queued GPU events
   --cold-compile {all,first,none}
                         how often to time a first call on a fresh cache; the default is each
                         op's own (mm: all, everything else: first)
@@ -56,17 +60,32 @@ options:
 | `bmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `flash_attn` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
 | `flash_attn_mxfp8` | `F.scaled_dot_product_attention` | speedup >= 0.9x | full |
+| `flash_attn_varlen` | `F.scaled_dot_product_attention` on the padded batch, masked | speedup >= 0.9x | heuristic |
 | `hstu_attn` | `_reference.py::triton_hstu_mha` (production Triton) | speedup >= 0.9x | full |
+| `hstu_cross_attn` | `tutorials/hstu_cross_attn/triton_bw_cross_attention.py` (Triton) | speedup >= 0.9x | curated |
 | `kda` | none | absolute floor, currently unset -> reports only | full |
 | `kda_prefill` | none | absolute floor, currently unset -> reports only | heuristic |
 | `kda_decode` | none | absolute floor, currently unset -> reports only | heuristic |
+| `mla_window_attn` | `torch.compile` of the module, attention as FlexAttention | speedup >= 0.9x | heuristic |
+| `swiglu_ffn` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
+| `rmsnorm_cat` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
+| `moe` | none (FlyDSL's Muse MoE ships with aiter) | absolute floor, currently unset -> reports only | heuristic |
+
+### Fused operators
+
+| op | reference | gate | default space |
+|----|-----------|------|---------------|
+| `addmm_mul_add` | `torch.addmm` + `torch.addcmul` | speedup >= 0.9x | heuristic |
+| `linear_rowscale` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 
 The direct `mm` provider has a `heuristic_config`, so its default is a single
 analytically chosen config. The TorchTLX providers use Inductor's template
 selection and expose `heuristic` as the suite's comparable default label. The
 remaining direct providers autotune a full space on their first call, which is
 minutes rather than seconds; they raise `cap_s` accordingly rather than measure
-a `smoke` space no user takes.
+a `smoke` space no user takes. `hstu_cross_attn` defaults to `curated`, eight
+forward configs picked from its 144-config `full` grid for head dims 64 and 128;
+`test_autotune_drift.py` checks weekly that they still keep up with the grid.
 
 The TorchTLX providers reach `mm`, `addmm`, and `bmm` through `torch.compile`.
 They force the TLX template (`tlx_mode="force"`) and race it against the same
@@ -81,6 +100,15 @@ races the Triton kernel that ships today. The two are not tuned symmetrically --
 the reference autotunes its full space regardless of `--space` -- which is
 recorded per case as `ref_autotuned` rather than corrected for.
 
+`flash_attn_varlen` races SDPA over the batch padded to its longest sequence
+with a padding (and causal) mask -- what a torch-only caller runs -- so the
+reference also computes the padded positions. The op has one fixed launch
+config, so `--space` does not change it.
+
+`linear_rowscale` races `torch.compile` of the eager expression, which Inductor
+lowers to cuBLAS `addmm` and one fused kernel that applies the row scale. One
+fixed launch config.
+
 Ops with a backward (`flash_attn`, `hstu_attn`, `kda`) produce two cases per
 shape. The backward is a different kernel at 2.5x the FLOPs, so folding it into
 the forward's number would hide it. Both run by default and are reported as two
@@ -92,11 +120,12 @@ different amounts of work do not belong in one TFLOP/s column. `--fwd-only` /
 
 1. Input info (varying between ops), e.g. for mm:
    `((), {'dtype': 'bf16', 'strides': '[[32768, 1], [12800, 1]]', 'M': '2304', 'N': '12800', 'K': '32768'})`
-2. Core metrics: ref (TFLOP/s), TLX (TFLOP/s), speedup, compile time
+2. Core metrics: ref GPU (TFLOP/s), TLX GPU (TFLOP/s), GPU speedup, compile time
 3. Additional stats: samples, CV%, p50, p95, p99 (all based on TFLOP/s)
-4. Op-specific columns, if the op declared any (see below)
-5. status: ok/pip/noisy/error/...
-6. best config: the config each autotuned kernel the case launched actually ran,
+4. Separate ref/TLX CPU submission cost (microseconds)
+5. Op-specific columns, if the op declared any (see below)
+6. status: ok/pip/noisy/error/...
+7. best config: the config each autotuned kernel the case launched actually ran,
    abbreviated (`BM=` for `BLOCK_M`/`BLOCK_SIZE_M`, `w`/`s` for warps/stages).
    With a single-config space that is the shape-picked config; otherwise it is
    the autotune winner. An op launching several autotuned kernels gets one entry
@@ -134,25 +163,60 @@ ok: everything else
 
 ## How a call is timed
 
-`wallclock`, the default, is `triton.testing.do_bench`: CUDA events around each
-`fn()`, dispatched from the host one call at a time. It is the authoritative
-mode here for two reasons. It measures what a caller actually gets -- if the
-host cannot keep the GPU fed, that is a real cost of using the op, and
-`tlx_host_us` sits in the artifact to say how much of the number it is. And it
-is what every existing figure in this suite was taken with, so switching the
-default would silently invalidate comparisons against them.
+`gpu_events` is the default and the kernel-performance verdict metric.
+The calls run back to back behind a GPU gate that gives the host a head start.
+After queuing each call, the harness checks that the GPU has not yet reached
+that call's start event, which proves the whole call was queued before its
+timed work began, so no host gap is inside the sample. A GPU-bound call passes
+even after the launch queue fills (CUDA stops accepting work at about 1024
+pending operations), because the GPU stays behind the host.
 
-`gpu_events` is tritonbench's `--latency-measure-mode=gpu_events`: the whole
-batch is enqueued behind a blocked stream so the host runs far ahead, and the
-measured interval contains no dispatch gaps. Use it when the question is about
-the kernels rather than the end-to-end path -- most usefully on the
-multi-kernel backward passes (`flash_attn`, `hstu_attn`, `kda`), where a
-wallclock reading folds in several launches' worth of host work. It flatters
-both providers, so `speedup` moves much less than either absolute number; a
-large gap between the two modes for one case is itself the finding, and it will
-agree with a large `tlx_host_us`.
+The check is sufficient, not necessary: a call that fails it is uncertified,
+not proven to contain a gap. It also assumes the op keeps its GPU work on the
+current stream; work on a side stream that does not wait for the start event
+would go unseen.
 
-Neither mode is a profiler. There is no per-kernel breakdown here; use
+If any call fails the check, the run is discarded and retried once behind a
+gate four times longer, which absorbs a one-off host stall. If that run also
+fails, the host cannot stay ahead of the GPU and the harness takes the samples
+in batches of up to 100 calls, each small enough to be fully queued before the
+GPU starts. The result then carries a note such as `tlx: timed in batches of
+up to 100 calls`. A batch that fails is retried at half the size with four
+times the gate duration. After four failed batches in a row the case reports
+an error; uncertified samples never produce a performance verdict. A call that
+waits on the timed stream from the host, for example by reading a tensor the
+stream writes with `.tolist()`, fails every check.
+
+Keep the continuous run as the default. On B200 a compute-bound kernel runs at
+the power cap with the SM clock well below its lock, and pauses between batches
+let the clock recover, so batched samples of the same kernel read up to 8%
+faster. For the same reason, a speedup between a batched provider and a
+continuous one mixes two load patterns, which is what the note flags.
+
+Both TLX and the reference clear the same benchmark cache before every timed
+call. Timing includes all device work in the operation, including multiple
+kernel launches, but excludes host submission gaps. It does not change the
+operation's autotuning policy or reselect configurations with GPU-event timing.
+
+CPU submission costs are collected separately for both providers. CPU time
+must not be subtracted from event latency or added to it: these intervals can
+overlap.
+
+The legacy `--latency-measure-mode wallclock` spelling remains accepted, but
+measurements always use GPU events. The artifact records
+`latency_mode="gpu_events"`, the requested legacy mode, and the common
+cold-cache policy.
+
+Schema version 4 stores GPU throughput in `tlx`/`ref` and the GPU throughput
+ratio in `speedup`. CPU submission cost is `tlx_host_us`/`ref_host_us`.
+Earlier artifacts used eager throughput in `tlx`/`ref` by default, so their
+headline ratios must not be compared directly with version 4 GPU ratios.
+Every artifact carries `schema_version`; readers must pass it through
+`require_schema`, which rejects any other version. There is no conversion:
+version 3 never recorded GPU-event timing, so the only backfill is to re-run
+the suite at version 4.
+
+GPU-event timing is not a profiler. There is no per-kernel breakdown here; use
 `ir-debugging` or nsys for that.
 
 ## Compile time
@@ -172,8 +236,8 @@ percentiles ascend: p99 is the best case, `min` (artifact only) the worst.
 
 speedup = TLX / ref. >1 means TLX is faster.
 
-Latency is not reported: it is `flop_count / TFLOP/s`, both in the artifact.
-`tlx_host_us` stays in microseconds — host launch cost is not device work.
+GPU latency can be recovered from `flop_count / TFLOP/s`, both in the artifact.
+`tlx_host_us` and `ref_host_us` stay in microseconds; they measure CPU submission.
 
 ## Tests
 
@@ -182,6 +246,12 @@ Latency is not reported: it is `flop_count / TFLOP/s`, both in the artifact.
   minutes. CI's junitxml comes from here.
 
 `pytest .` runs both, so it starts a benchmark.
+
+With an editable install (`pip install -e .`), plain `pytest` works. Against a
+separately installed wheel, add `--import-mode=importlib`; otherwise
+`python/conftest.py` puts `python/` on `sys.path` and `import triton` loads the
+source tree instead of the wheel. Use a wheel built from the same commit as the
+checkout, or tests that need newer `triton.tlx.ops` code fail.
 
 ## shapes
 
@@ -247,3 +317,7 @@ needs the measured mean.
 `Prepared.tlx_fn`/`ref_fn` must not allocate -- they are called hundreds of times
 inside the measured window. Build the tensors in `prepare` and capture them.
 `test_ops_perf.py` picks the new file up automatically.
+
+`bench_norm.py` covers the GEO plain, saved-state, MXFP8, MXFP4, NVFP4,
+fused/jagged and softmax requests. It replays CUDA graphs for both providers;
+quantized cases report latency without a torch quantization speedup.

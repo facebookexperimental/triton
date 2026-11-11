@@ -22,6 +22,9 @@ import contextlib
 import dataclasses
 import logging
 import os
+import re
+import statistics
+import time
 from typing import Any, Generator
 
 log = logging.getLogger(__name__)
@@ -38,7 +41,16 @@ from torch._inductor.template_heuristics.triton import (
     TMATemplateConfigMixin,
 )
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
-from torch._inductor.utils import get_num_sms, tma_inner_dim
+from torch._inductor.utils import can_use_tma, get_num_sms
+
+try:
+    from torch._inductor.utils import tma_inner_dim
+except ImportError:
+    def tma_inner_dim(strides):
+        from torch._inductor.virtualized import V
+
+        inner = [i for i, stride in enumerate(strides) if V.graph.sizevars.statically_known_equals(stride, 1)]
+        return inner[0] if len(inner) == 1 else None
 
 from ..hw import resources
 from ..hw.resources import BLACKWELL_LIMITS, BlackwellWSGemmConfig, validate_config
@@ -69,10 +81,74 @@ def _sizevar_hint(sizevars, expr, fallback):
     return fn(expr, fallback=fallback)
 
 
+def _storage_span_elems(shape, stride):
+    """Element span of a tensor view: its max flat offset + 1.
+
+    Correct only for nonneg strides; callers prove that separately. Callers
+    needing bytes scale the result by itemsize.
+    """
+    if len(shape) != len(stride):
+        return None
+    return 1 + sum((dim - 1) * step for dim, step in zip(shape, stride))
+
+
+def _guard_int32_spans(sizevars, spans, strides) -> bool:
+    """Admit only when every element span fits int32: static proof or recompile guard.
+
+    The backend performs no verification of the explicit ``.to(tl.int32)``
+    truncations in the templates, so an unguarded hint-sized check admits
+    shapes whose true span wraps at runtime (P2561566366). This helper never
+    consults optimization hints.
+    """
+    int32_max = torch.iinfo(torch.int32).max
+    if not sizevars.statically_known_true(
+        sympy.And(*(sympy.Ge(step, 0) for step in strides))
+    ):
+        return False
+    bound = sympy.And(*(sympy.Le(span, int32_max) for span in spans))
+    if sizevars.statically_known_true(bound):
+        return True
+    return bool(sizevars.guard_or_false(bound))
+
+
+def _warppipe_operands_fit_int32(kernel_inputs, *, per_batch: bool) -> bool:
+    """Stride-aware int32 gate for the warp-pipe templates (P2561566366).
+
+    Every load offset in the warp-pipe bodies is unconditionally narrowed with
+    ``.to(tl.int32)``, so admission requires the true max element offset --
+    ``(M-1)*stride + (K-1)*stride``, not ``M*K`` -- to fit int32. For bmm only
+    the within-batch span is gated; the batch advance stays int64 in the template.
+    """
+    from torch._inductor.virtualized import V
+
+    shapes = kernel_inputs.shapes_symbolic()
+    strides = kernel_inputs.strides_symbolic()
+    a_shape = shapes[kernel_inputs._mat1_idx]
+    a_stride = strides[kernel_inputs._mat1_idx]
+    b_shape = shapes[kernel_inputs._mat2_idx]
+    b_stride = strides[kernel_inputs._mat2_idx]
+    if per_batch:
+        if len(a_shape) != 3 or len(b_shape) != 3:
+            return False
+        a_shape, a_stride = a_shape[1:], a_stride[1:]
+        b_shape, b_stride = b_shape[1:], b_stride[1:]
+    elif len(a_shape) != 2 or len(b_shape) != 2:
+        return False
+    a_span = _storage_span_elems(a_shape, a_stride)
+    b_span = _storage_span_elems(b_shape, b_stride)
+    if a_span is None or b_span is None:
+        return False
+    return _guard_int32_spans(
+        V.graph.sizevars, (a_span, b_span), (*a_stride, *b_stride)
+    )
+
+
 from . import tlx_config
 from .mm_templates import (
     amd_bmm_shared_a_template,
     blackwell_gemm_ws_template,
+    hopper_gemm_small_k_template,
+    hopper_gemm_ws_template,
     gfx942_addmm_template,
     gfx942_mm_template,
     gfx950_addmm_interwave_template,
@@ -132,6 +208,8 @@ def _is_gfx950() -> bool:
 
 def _is_gfx942() -> bool:
     """Whether the live device is MI300X/CDNA3."""
+    if not torch.version.hip:
+        return False
     return current_target().is_gfx942
 
 
@@ -201,6 +279,12 @@ def _warppipe_configs_for(heuristic) -> list[tuple[int, int, int, int, int, int]
 #: against its raw budget, which is what removes tiles the backend cannot run.
 _AMD_LDS_SAFETY_MARGIN_BY_ARCH: dict[str, int] = {"gfx942": 32768}
 
+#: Extra LDS the *persistent* warp-pipe variant needs beyond the tile estimate,
+#: charged only for async persistent candidates. Measured 37376B gap on the
+#: persistent (128, 256, 64, NB3) fp16 tile (147456B estimate vs 184832B actual,
+#: P2561566366 S2); rounded up for headroom.
+_AMD_LDS_PERSISTENT_OVERHEAD: int = 40960
+
 
 def _warppipe_tile_fits(
     block_m: int,
@@ -210,6 +294,7 @@ def _warppipe_tile_fits(
     *,
     elem_bytes: int,
     use_async: bool,
+    persistent: bool = False,
 ) -> bool:
     """Whether a warp-pipe tile fits the *live* target's LDS budget.
 
@@ -228,6 +313,8 @@ def _warppipe_tile_fits(
         elem_bytes=elem_bytes,
     )
     margin = _AMD_LDS_SAFETY_MARGIN_BY_ARCH.get(current_target().key, 0)
+    if persistent and use_async:
+        margin += _AMD_LDS_PERSISTENT_OVERHEAD
     return resources.AMD_WARP_PIPE.validate(cfg, smem_margin=margin)
 def _select_group_size_m(M: int, N: int, block_m: int) -> int:
     """
@@ -817,6 +904,183 @@ def _candidate_scorer_evaluate(
     return best_config
 
 
+def _host_tma_operands(kernel_inputs) -> dict[str, bool]:
+    """Which of A's and B's TMA descriptors the launcher builds on the host.
+
+    A device-built descriptor costs every CTA a descriptor write and fence before
+    its first load. The Python launcher builds host descriptors from integer dims
+    and, where it supports it, from dynamic sizes the kernel takes as args (A's M
+    under a dynamic batch), read at launch. Any other operand is passed as a
+    plain pointer and its descriptor is built on the device.
+    """
+    from torch._inductor.runtime import triton_heuristics
+
+    launch_dims = getattr(triton_heuristics, "HOST_TMA_SYMBOLIC_DIMS", False) and not V.graph.cpp_wrapper
+    dim_types = (int, sympy.Integer, sympy.Symbol) if launch_dims else (int, sympy.Integer)
+    a_host, b_host = (
+        all(isinstance(dim, dim_types) for dim in (*mat.get_size(), *mat.get_stride()))
+        for mat in kernel_inputs.mat1mat2()
+    )
+    return {"HOST_SIDE_TMA": a_host or b_host, "HOST_TMA_A": a_host, "HOST_TMA_B": b_host}
+
+
+@register_template_heuristic(
+    hopper_gemm_ws_template.uid, "cuda", register=not IS_ROCM, op_name="mm"
+)
+class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
+    """Reuse the SM90 TLX ops configuration space for Inductor."""
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        if not current_target().is_hopper or not isinstance(inputs, MMKernelInputs):
+            return False
+        if config.triton.tlx_mode not in ("allow", "force"):
+            return False
+        if any(mat.get_name() in V.graph.unaligned_buffers for mat in inputs.mat1mat2()):
+            return False
+        strides = inputs.strides_hinted()
+        for idx in (inputs._mat1_idx, inputs._mat2_idx):
+            if inputs.dtype(idx) not in (torch.float16, torch.bfloat16):
+                return False
+            inner = tma_inner_dim(strides[idx])
+            if inner is None or strides[idx][1 - inner] % 8:
+                return False
+        return inputs.dtype(inputs._mat1_idx) == inputs.dtype(inputs._mat2_idx)
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        from triton.tlx.ops.kernels.mm import sm90
+
+        m, n, k = kernel_inputs.mnk_hinted()
+        if min(m, n, k) <= 0:
+            return
+        strides = kernel_inputs.strides_hinted()
+        a_row_major = tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1
+        b_row_major = tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 1
+        allow = config.triton.tlx_mode == "allow"
+        if not allow and sm90._use_small_k(m, n, k, "heuristic"):
+            # As tlx.ops.mm's heuristic, leave a few-K-step shape to the small-K
+            # template: autotuning cannot tell few-microsecond kernels apart.
+            return
+        # Skinny M runs swap-AB, as in tlx.ops.mm: the kernel computes C^T with
+        # the problem's N as its M.
+        swap_ab = m <= sm90._SWAP_AB_MAX_M
+        if swap_ab:
+            configs = (sm90._prune_swap_configs(sm90._swap_configs(), {"M": n, "N": m, "K": k})
+                       if allow else sm90._swap_heuristic_config(m, n, k))
+        else:
+            configs = (sm90._prune_full_configs(sm90.CONFIGS(), {"M": m, "N": n, "K": k}, B_ROW_MAJOR=b_row_major)
+                       if allow else sm90.heuristic_config(m, n, k, b_row_major))
+        # Split-K configs write fp32 partials that torchTLX's _reduce_k_kernel
+        # sums, adding the bias with alpha = beta = 1 only; otherwise run whole-K.
+        scalars = getattr(kernel_inputs, "_scalars", None) or {}
+        if scalars.get("alpha", 1) != 1 or scalars.get("beta", 1) != 1:
+            if allow:
+                configs = [conf for conf in configs if conf.kwargs["SPLIT_K"] == 1]
+            else:
+                configs = [self._whole_k(sm90, conf) for conf in configs]
+        host_tma = _host_tma_operands(kernel_inputs)
+        # Non-power-of-two tiles run only as two equal-subtile pieces (192, 96).
+        configs = [
+            conf for conf in configs
+            if sm90._is_pow2(conf.kwargs["BN"]) or (sm90._npot_subtile(conf.kwargs["BN"]) and not b_row_major)
+        ]
+        for conf in configs:
+            meta = conf.kwargs
+            n_tail = sm90._n_piece(meta["BN"], 1)
+            split_k = meta["SPLIT_K"]
+            yield {
+                "BLOCK_M": meta["BM"],
+                "BLOCK_N": meta["BN"],
+                "BLOCK_K": meta["BK"],
+                "BLOCK_M_SPLIT": meta["BM"] // meta["NUM_MMA_GROUPS"],
+                "slice_size": n_tail // 2 if n_tail else meta["BN"] // 4,
+                "N_TAIL": n_tail,
+                "SWAP_AB": swap_ab,
+                "SPLIT_K": split_k,
+                "GROUP_SIZE_M": meta["GROUP_SIZE_M"],
+                "NUM_STAGES": meta["NUM_STAGES"],
+                "NUM_MMA_GROUPS": meta["NUM_MMA_GROUPS"],
+                "NUM_SMS": get_num_sms(),
+                # Under swap-AB the kernel's A is B^T and its B is A^T.
+                "A_ROW_MAJOR": (not b_row_major) if swap_ab else a_row_major,
+                "B_ROW_MAJOR": (not a_row_major) if swap_ab else b_row_major,
+                # A few N tiles reuse each A panel back to back; under swap-AB
+                # the kernel's A is B, streamed once.
+                "A_EVICTION": repr("evict_last" if n <= 1024 and not swap_ab else ""),
+                # Split-K stores partials through pointers; the reducer writes C.
+                "TMA_EPILOGUE_STORE": int(n % 8 == 0 and split_k == 1),
+                # A and B descriptors built on the host, as tlx.ops.mm does,
+                # rather than by every CTA before its first load.
+                **host_tma,
+                "num_stages": conf.num_stages,
+                "num_warps": conf.num_warps,
+                "ACC_TYPE": "tl.float32",
+            }
+
+    @staticmethod
+    def _whole_k(sm90, conf):
+        meta = conf.kwargs
+        if meta["SPLIT_K"] == 1:
+            return conf
+        if meta["SWAP_AB"]:
+            stages = sm90._deepest_ring(meta["BM"], meta["BN"], meta["BK"], 1)
+            return sm90._config(meta["BM"], meta["BN"], stages, meta["GROUP_SIZE_M"], 1, meta["BK"], True)
+        return sm90._config(meta["BM"], meta["BN"], meta["NUM_STAGES"], meta["GROUP_SIZE_M"])
+
+
+@register_template_heuristic(
+    hopper_gemm_ws_template.uid, "cuda", register=not IS_ROCM, op_name="addmm"
+)
+class HopperGemmWSAddMMConfigHeuristic(AddMMConfigMixin, HopperGemmWSConfigHeuristic):
+    """addmm on the SM90 WS template; the bias rides the template's epilogue."""
+
+
+@register_template_heuristic(
+    hopper_gemm_small_k_template.uid, "cuda", register=not IS_ROCM, op_name="mm"
+)
+class HopperGemmSmallKConfigHeuristic(HopperGemmWSConfigHeuristic):
+    """tlx.ops.mm's small-K kernel, offered where tlx.ops.mm would consider it."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        from triton.tlx.ops.kernels.mm import sm90
+
+        m, n, k = kernel_inputs.mnk_hinted()
+        if min(m, n, k) <= 0:
+            return
+        if config.triton.tlx_mode == "allow":
+            if not sm90._small_k_candidate(m, n, k, "full"):
+                return
+            configs = sm90._prune_small_k_configs(sm90._small_k_configs(), {"M": m, "N": n, "K": k})
+        else:
+            if not sm90._use_small_k(m, n, k, "heuristic"):
+                return
+            configs = sm90._small_k_heuristic_config(m, n, k)
+        strides = kernel_inputs.strides_hinted()
+        host_tma = _host_tma_operands(kernel_inputs)
+        for conf in configs:
+            meta = conf.kwargs
+            if meta["SPLIT_K"] > 1:
+                continue
+            yield {
+                "BLOCK_M": meta["BM"],
+                "BLOCK_N": meta["BN"],
+                "BLOCK_K": meta["BK"],
+                "GROUP_SIZE_M": meta["GROUP_SIZE_M"],
+                "A_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1,
+                "B_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 1,
+                **host_tma,
+                "num_stages": conf.num_stages,
+                "num_warps": conf.num_warps,
+                "ACC_TYPE": "tl.float32",
+            }
+
+
+@register_template_heuristic(
+    hopper_gemm_small_k_template.uid, "cuda", register=not IS_ROCM, op_name="addmm"
+)
+class HopperGemmSmallKAddMMConfigHeuristic(AddMMConfigMixin, HopperGemmSmallKConfigHeuristic):
+    """addmm on the SM90 small-K template; the bias rides the template's epilogue."""
+
+
 class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
     """Mixin for TLX Matmul WS template with TLX-specific parameters and config validation."""
 
@@ -902,12 +1166,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
         num_ctas: int,
         epilogue_subtile: int,
     ) -> bool:
-        """Like _is_valid_config but with a safety margin on SMEM.
-
-        SMEM only: every caller has already run the structural rules and the
-        TMEM check, either via ``_is_valid_config`` when the autotuning pool
-        was built or via ``_fix_config_if_needed`` on the heuristic config.
-        """
+        """Validate the final tile's structural rules and SMEM with a safety margin."""
         return validate_config(
             cls._tile(
                 block_m,
@@ -921,7 +1180,6 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             ),
             charge_epilogue=True,
             smem_margin=cls._SMEM_SAFETY_MARGIN,
-            check_rules=False,
             check_tmem=False,
         )
 
@@ -944,9 +1202,15 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             return False
 
         strides = kernel_inputs.strides_hinted()
-        return any(
+        if any(
             tma_inner_dim(strides[idx]) is None
             for idx in (kernel_inputs._mat1_idx, kernel_inputs._mat2_idx)
+        ):
+            return True
+
+        return not can_use_tma(
+            *kernel_inputs.mat1mat2(),
+            output_layout=kernel_inputs.output_layout(flexible=False),
         )
 
     def _get_template_configs_impl(
@@ -1215,8 +1479,12 @@ def _gfx950_static_tn_problem(kernel_inputs, dtypes):
     int32_max = torch.iinfo(torch.int32).max
     # `tt.pointer_range=32` is a byte-range promise for A, B, and the
     # contiguous output, not merely a bound on their element offsets.
-    a_span_bytes = ((m - 1) * stride_am + k) * dtype.itemsize
-    b_span_bytes = (k + (n - 1) * stride_bn) * dtype.itemsize
+    a_span = _storage_span_elems((m, k), (stride_am, stride_ak))
+    b_span = _storage_span_elems((k, n), (stride_bk, stride_bn))
+    if a_span is None or b_span is None:
+        return None
+    a_span_bytes = a_span * dtype.itemsize
+    b_span_bytes = b_span * dtype.itemsize
     c_span_bytes = m * n * out_dtype.itemsize
     if max(a_span_bytes, b_span_bytes, c_span_bytes) > int32_max:
         return None
@@ -1225,6 +1493,11 @@ def _gfx950_static_tn_problem(kernel_inputs, dtypes):
 
 class _Gfx942MMTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
     """Feed the gfx942 tlx.ops heuristic into an Inductor GEMM template."""
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        if config.triton.tlx_mode in ("allow", "force"):
+            return _is_gfx942()
+        return super().should_run(inputs)
 
     def _get_template_configs_impl(self, kernel_inputs, op_name):
         if not isinstance(kernel_inputs, MMKernelInputs) or not _is_gfx942():
@@ -1248,23 +1521,32 @@ class _Gfx942MMTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
         if min(m, n, k, stride_am, stride_ak, stride_bk, stride_bn) <= 0:
             return
 
-        # Keep TorchTLX and tlx.ops on the same measured shape policy.  The
-        # special split-panel/local-split-U paths have different program grids;
-        # this template is the common direct-load path only.
-        from triton.tlx.ops.kernels.mm.gfx942 import heuristic_config
+        # Share the measured shape policy, with layout/dtype guards for the
+        # split-K workspace path. Special local split paths use other grids.
+        from triton.tlx.ops.kernels.mm.gfx942 import torchtlx_heuristic_config
 
-        for config in heuristic_config(m, n, k):
+        scalars = getattr(kernel_inputs, "_scalars", None) or {}
+        for config in torchtlx_heuristic_config(
+            m, n, k, dtype=dtype, out_dtype=kernel_inputs.out_dtype(),
+            a_strides=(stride_am, stride_ak), b_strides=(stride_bk, stride_bn),
+            alpha=scalars.get("alpha", 1), beta=scalars.get("beta", 1),
+        ):
             meta = dict(config.kwargs)
-            if meta.pop("SPLIT_M_128_32", False) or meta.pop(
+            if meta.pop("SPLIT_M_128_64", False) or meta.pop(
                 "USE_LOCAL_SPLIT_U", False
             ):
                 continue
-            meta.pop("XCD_CHUNK", None)  # fixed to four in the template source
+            meta.setdefault("SPLIT_M_128_32", False)
+            meta.setdefault("SPLIT_M_256_64", False)
+            meta.setdefault("SPLIT_K", 1)
+            meta.setdefault("SPLIT_ORDER_CHUNK", 1)
+            meta.setdefault("LAUNCH_XCD_CHUNK", 0)
+            meta.setdefault("PACKED_K_LOADS", False)
+            meta.setdefault("matrix_instr_nonkdim", 16)
             triton_config = self.triton_config(
                 config.num_stages,
                 config.num_warps,
                 **meta,
-                matrix_instr_nonkdim=16,
             )
             yield self._convert_config_to_template_kwargs(
                 triton_config,
@@ -1419,7 +1701,20 @@ def _gfx950_register_plan_for(m, n, k):
     return _gfx950_register_intermediate_config(m, n, k)
 
 
-class _Gfx950InterWaveTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+class _Gfx950TLXModeMixin:
+    """Run on gfx950 whenever torchTLX is enabled.
+
+    torchTLX is independent of max_autotune; the ROCm GEMM base heuristic would
+    otherwise offer these templates only under it.
+    """
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        if config.triton.tlx_mode in ("allow", "force"):
+            return _is_gfx950()
+        return super().should_run(inputs)
+
+
+class _Gfx950InterWaveTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Shared config gate for the gfx950 a16w16 inter-wave kernel.
 
     The reference kernel consumes row-major A directly and relies on a fixed
@@ -1474,15 +1769,13 @@ class _Gfx950InterWaveTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
         if stride_am * itemsize % 16 != 0 or b_row_stride * itemsize % 16 != 0:
             return
 
-        int32_max = 2**31 - 1
-        max_a_offset = (m_int - 1) * stride_am + (k_int - 1) * stride_ak
-        max_b_offset = (k_int - 1) * stride_bk + (n_int - 1) * stride_bn
-        if (
-            max_a_offset >= int32_max
-            or max_b_offset >= int32_max
-            or not sizevars.guard_or_false(
-                sympy.Lt((m - 1) * stride_am + (k_int - 1) * stride_ak, int32_max)
-            )
+        # B's span is static, so only A's dynamic-M span can install a guard.
+        a_span = _storage_span_elems((m, k_int), (stride_am, stride_ak))
+        b_span = _storage_span_elems((k_int, n_int), (stride_bk, stride_bn))
+        if a_span is None or b_span is None or not _guard_int32_spans(
+            sizevars,
+            (a_span, b_span),
+            (stride_am, stride_ak, stride_bk, stride_bn),
         ):
             return
 
@@ -1544,9 +1837,7 @@ class Gfx950MMInterWaveTemplateConfigHeuristic(
     register=IS_ROCM,
     op_name="mm",
 )
-class Gfx950MMLocalSplitUTemplateConfigHeuristic(
-    ROCmMMTemplateConfigHeuristic
-):
+class Gfx950MMLocalSplitUTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Offer LocalSplitU only for its two validated small-M shapes."""
 
     # (M, N, K): (TILE_M, TILE_N, LOCAL_SPLIT_U, WAVE_K, K_WIDTH)
@@ -1601,7 +1892,7 @@ class Gfx950MMLocalSplitUTemplateConfigHeuristic(
     register=IS_ROCM,
     op_name="mm",
 )
-class Gfx950MMRegisterTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+class Gfx950MMRegisterTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Offer the register fallback only when its geometry policy selects it."""
 
     def _get_template_configs_impl(self, kernel_inputs, op_name):
@@ -1658,9 +1949,7 @@ class Gfx950MMRegisterTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
     register=IS_ROCM,
     op_name="mm",
 )
-class Gfx950MMPersistentTemplateConfigHeuristic(
-    ROCmMMTemplateConfigHeuristic
-):
+class Gfx950MMPersistentTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Offer the N160/N192 persistent kernels only for their tuned shapes."""
 
     PERSISTENT_CONFIGS = {
@@ -1720,9 +2009,7 @@ class Gfx950AddMMInterWaveTemplateConfigHeuristic(
 @register_template_heuristic(
     gfx950_addmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="addmm"
 )
-class Gfx950AddMMWarpPipeConfigHeuristic(
-    AddMMConfigMixin, ROCmMMTemplateConfigHeuristic
-):
+class Gfx950AddMMWarpPipeConfigHeuristic(AddMMConfigMixin, _Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """TLX warp-pipelined addmm heuristic for ROCm (col-major B, MI350X/gfx950).
 
     Hand-pipelined (num_stages=1): async-prefetches NUM_BUFFERS K-tiles into multi-buffered
@@ -1760,14 +2047,16 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
 
     WARPPIPE_CONFIGS_BY_ARCH = ADDMM_WARPPIPE_CONFIGS_BY_ARCH
     _PREDRAIN_EPILOGUE_PREFETCH = True
+    _WARPPIPE_PERSISTENT = False
 
     def adjust_kernel_inputs(
         self, kernel_inputs: KernelInputs, op_name: str
     ) -> KernelInputs:
-        # The warp-pipe kernel async-loads B as (BLOCK_N, BLOCK_K) with K contiguous, so it
-        # requires col-major B (stride_bk == 1). REQUIRE it here (free for an nn.Linear weight)
-        # rather than gate on the current -- possibly unfrozen -- stride; this replaces the
-        # require_stride_order that used to live in OSS tuned_addmm.
+        # Must never insert a copy: one dropped from the template signature at
+        # final render fails with NameError('B is not defined') (P2561566366 S1).
+        # The config gate requires col-major B statically, so this only freezes
+        # that layout. This replaces the require_stride_order that used to live
+        # in OSS tuned_addmm.
         from torch._inductor.ir import ExternKernel
 
         kernel_inputs = super().adjust_kernel_inputs(kernel_inputs, op_name)
@@ -1801,14 +2090,16 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
         m, n, k = kernel_inputs.mnk_symbolic()
         out_dtype = kernel_inputs.out_dtype()
         sizevars = V.graph.sizevars
-        # async_load lowers to a 32-bit block pointer, so this template is only valid when M*K
-        # and N*K fit int32. Use optimization_hint (not statically_known) so dynamic/symbolic M
-        # is allowed via the example-input hint -- the int32 buffer-index cast keeps it correct
-        # under AOTI dynamic shapes.
-        int32_max = 2**31 - 1
-        if not (
-            _sizevar_hint(sizevars, m * k, int32_max) < int32_max
-            and _sizevar_hint(sizevars, n * k, int32_max) < int32_max
+        if not _warppipe_operands_fit_int32(kernel_inputs, per_batch=False):
+            return
+        # Col-major B only: a require_stride_order copy risks NameError at
+        # final render (P2561566366 S1; see adjust_kernel_inputs).
+        b_strides = kernel_inputs.strides_symbolic()[kernel_inputs._mat2_idx]
+        if not sizevars.statically_known_true(
+            sympy.And(
+                sympy.Eq(b_strides[-2], 1),
+                sympy.Ge(b_strides[-1], 1),
+            )
         ):
             return
         # DUAL PATH by K alignment (the USE_ASYNC constexpr picks the template branch), mirroring
@@ -1866,6 +2157,7 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
                 num_buffers,
                 elem_bytes=itemsize,
                 use_async=use_async,
+                persistent=self._WARPPIPE_PERSISTENT,
             ):
                 continue
             if use_async:
@@ -1923,7 +2215,7 @@ class Gfx950AddMMWarpPipeConfigHeuristic(
 @register_template_heuristic(
     gfx950_bmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="bmm"
 )
-class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+class Gfx950BMMWarpPipeConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """TLX warp-pipelined bmm heuristic for ROCm (MI350X/gfx950).
 
     Same warp-pipe core as the addmm (async_load prefetch into multi-buffered LDS + MFMA via
@@ -1937,8 +2229,9 @@ class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
         K % BLOCK_K remainder is a sync-tail).
       * otherwise (unaligned K -- the direct-to-LDS async_copy cannot legalize on CDNA4 -- or
         dynamic K): USE_ASYNC=0, the register-path fallback (tl.load->tl.dot, auto-pipelined),
-        correct for ANY K (T280910119). Common gate (fp16/bf16 only): per-batch M*K and N*K fit
-        int32 (the within-batch offset is int32 on both paths).
+        correct for ANY K (T280910119). Common gate (fp16/bf16 only): the
+        within-batch A/B element spans fit int32 (the within-batch offset is
+        int32 on both paths; the batch advance is int64).
     """
 
     # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, NUM_BUFFERS)
@@ -1986,12 +2279,7 @@ class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
         m, n, k = kernel_inputs.mnk_symbolic()
         out_dtype = kernel_inputs.out_dtype()
         sizevars = V.graph.sizevars
-        int32_max = 2**31 - 1
-        # per-batch offsets must fit int32 (the batch offset is applied separately in int64).
-        if not (
-            _sizevar_hint(sizevars, m * k, int32_max) < int32_max
-            and _sizevar_hint(sizevars, n * k, int32_max) < int32_max
-        ):
+        if not _warppipe_operands_fit_int32(kernel_inputs, per_batch=True):
             return
         # DUAL PATH by K alignment (the USE_ASYNC constexpr picks the template branch):
         #  * (K*itemsize) % 16 == 0 (K % 8 for fp16/bf16, 16-byte-aligned rows) -> USE_ASYNC=1, the
@@ -2055,7 +2343,7 @@ class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
 @register_template_heuristic(
     amd_bmm_shared_a_template.uid, "cuda", register=IS_ROCM, op_name="bmm"
 )
-class ROCmBMMSharedATemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+class ROCmBMMSharedATemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
     """Validated gfx950 shared-LHS BMM configs.
 
     This is deliberately a separate candidate from the general BMM warp-pipe.
@@ -2108,17 +2396,12 @@ class ROCmBMMSharedATemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
         # input span and the contiguous output must fit in signed 32-bit bytes.
         # Requiring a static proof also keeps dynamic/very-large batches on the
         # generic BMM path rather than speculating from an example-size hint.
-        def storage_span(shape, stride):
-            if len(shape) != len(stride):
-                return None
-            return 1 + sum((dim - 1) * step for dim, step in zip(shape, stride))
-
         a_shape = symbolic_shapes[kernel_inputs._mat1_idx]
         b_shape = symbolic_shapes[kernel_inputs._mat2_idx]
         a_stride = a_strides
         b_stride = b_strides
-        a_span = storage_span(a_shape, a_stride)
-        b_span = storage_span(b_shape, b_stride)
+        a_span = _storage_span_elems(a_shape, a_stride)
+        b_span = _storage_span_elems(b_shape, b_stride)
         if a_span is None or b_span is None:
             return
         batch = a_shape[0]
@@ -2213,6 +2496,8 @@ class Gfx950AddMMPersistentWarpPipeConfigHeuristic(
     strides over output tiles by it).
     """
 
+    _WARPPIPE_PERSISTENT = True
+
     def _get_template_configs_impl(self, kernel_inputs, op_name):
         num_sms = get_num_sms()
         for template_kwargs in super()._get_template_configs_impl(
@@ -2244,12 +2529,11 @@ class BlackwellGemmWSConfigHeuristic(BlackwellGemmWSConfigMixin, CUDAConfigHeuri
         Override to allow TLX templates to run without max_autotune when tlx_mode is set,
         and to decline operands the template's TMA descriptors cannot describe.
 
-        Both descriptor forms in the template hardcode a unit innermost stride, so an
-        operand that is neither row- nor column-major has no valid form and is declined
-        rather than described with a stride it does not have.
+        The input descriptors and the contiguous output descriptor must satisfy
+        TMA's size, stride, and pointer alignment requirements.
         """
         if self._has_unsupported_layout(inputs):
-            log.debug("TLX blackwell_gemm_ws declined: operand is neither row- nor column-major")
+            log.debug("TLX blackwell_gemm_ws declined: unsupported TMA layout")
             return False
         if config.triton.tlx_mode in ("allow", "force"):
             return True
@@ -2487,11 +2771,13 @@ def _tlx_tt_generate(self, input_nodes, layout, *args, **kwargs):  # type: ignor
             count=split_k * layout.size[0] * layout.size[1],
             zero_mode=WorkspaceZeroMode.UNINITIALIZED,
             device=layout.device,
-            outer_name=WorkspaceArg.unique_name("split_k_ws_"),
+            outer_name=WorkspaceArg.unique_name("workspace_split_k_"),
             inner_name="split_k_ws",
             dtype=torch.float32,
         )
     choice = _orig_tt_generate(self, input_nodes, layout, *args, **kwargs)
+    if choice is not None:
+        choice._tlx_row_partials = getattr(self, "tlx_row_partials", False)
     if split_k > 1 and choice is not None:
         # Tag the ChoiceCaller so benchmark() can add the reducer's cost to this
         # candidate's score; see _tlx_caller_benchmark. optimization_hint (not int())
@@ -3114,6 +3400,17 @@ def _tlx_compute_epilogue(  # type: ignore[no-untyped-def]
         lengths = [V.graph.sizevars.simplify(s) for s in self.output_node.get_size()]
         assert len(indices) == len(lengths)
 
+        # Inductor drops a load's mask when the extent is a multiple of the
+        # largest block it could pick (a power of two, e.g. N = 2048 vs YBLOCK
+        # up to 1024). A non-power-of-two template tile (BLOCK_N = 192 or 96)
+        # still runs past such an extent, so its epilogue loads keep every mask.
+        if any(
+            isinstance(v, int) and v > 0 and v & (v - 1)
+            for k, v in self.meta.items()
+            if k.startswith("BLOCK_")
+        ):
+            self.optimize_mask = False
+
         self.template_out = val
 
         # Use the tma_store index setup path (same as store_output with
@@ -3132,6 +3429,11 @@ def _tlx_compute_epilogue(  # type: ignore[no-untyped-def]
             range_val = range_tree.var_ranges[old_name]
             del range_tree.var_ranges[old_name]
             range_tree.var_ranges[symbol] = range_val
+            # Keep block-shape inference in sync with the renamed symbol, as
+            # store_output does; prefix-input loads (addmm bias) look it up.
+            if self.range_tree_nodes.get(old_name) is lookup_output:
+                del self.range_tree_nodes[old_name]
+            self.range_tree_nodes[symbol] = lookup_output
             intermediate_lines.extend(
                 self._generate_index_from_tma_index(
                     name,
@@ -3186,7 +3488,8 @@ def _tlx_compute_epilogue(  # type: ignore[no-untyped-def]
         # Their stores are redirected to assignments by _TLXComputeOnlyHandler.
         fused = self.epilogue_fn(*epilogue_args)
         V.kernel.cse.store_cache[self.output_node.get_name()] = fused
-        self.body.writeline(f"{result_name} = {fused}")
+        # Emit into compute, after the prefix-input loads that ``fused`` uses.
+        self.compute.writeline(f"{result_name} = {fused}")
 
         # Mark that the template output buffer was "stored" for CSE purposes
         self.store_buffer_names.add(self.output_node.get_name())
@@ -3240,6 +3543,81 @@ _orig_codegen_template_body = getattr(
 )
 
 
+def _hopper_ws_fused_epilogue_stages(meta: dict[str, Any]) -> int:
+    """Ring depth for a Hopper WS template that has epilogue nodes fused in.
+
+    Autotuning sizes the ring for the bare GEMM, and the deepest configs use
+    nearly all SMEM. Fused epilogue inputs are loaded and converted to the
+    accumulator layout through SMEM scratch, one fp32 (BLOCK_M_SPLIT, slice_size)
+    tile, which pushes those configs over the limit; Inductor's fusion benchmark
+    then sees a compile failure and rejects the fusion. Shed ring stages until
+    that tile fits.
+    """
+    from triton.tlx.ops.kernels.mm import sm90
+
+    stages = meta["NUM_STAGES"]
+    reserve = meta["BLOCK_M_SPLIT"] * meta["slice_size"] * 4
+
+    def smem(num_stages: int) -> int:
+        return sm90._smem_bytes(meta["BLOCK_M"], meta["BLOCK_N"], meta["BLOCK_K"], num_stages, 1,
+                                swap_ab=bool(meta.get("SWAP_AB", False)))
+
+    while stages > 2 and smem(stages) + reserve > sm90._MAX_SMEM:
+        stages -= 1
+    return stages
+
+
+_HOPPER_WS_META_KEYS = frozenset({"NUM_STAGES", "BLOCK_M_SPLIT", "slice_size", "N_TAIL", "SWAP_AB"})
+
+
+def _maybe_shrink_ring_for_fused_epilogue(kernel, epilogue_nodes) -> None:  # type: ignore[no-untyped-def]
+    # Identified by its meta: the render callable may be wrapped by other
+    # patches, so the template object is not reachable from here.
+    meta = kernel.meta
+    if not epilogue_nodes or not _HOPPER_WS_META_KEYS <= meta.keys() or not current_target().is_hopper:
+        return
+    if meta.get("SPLIT_K", 1) != 1:
+        return
+    stages = _hopper_ws_fused_epilogue_stages(meta)
+    if stages == meta["NUM_STAGES"]:
+        return
+    # The ring depth reaches the kernel only through its constexpr define;
+    # meta is shared with the unfused renders of this choice, so copy it.
+    kernel.defines = re.sub(r"^NUM_STAGES : tl\.constexpr = \d+$", f"NUM_STAGES : tl.constexpr = {stages}",
+                            kernel.defines, flags=re.M)
+    kernel.meta = {**meta, "NUM_STAGES": stages}
+    log.debug("tlx_hopper_gemm_ws: NUM_STAGES %d -> %d to fit the fused epilogue", meta["NUM_STAGES"], stages)
+
+
+def _device_tma_for_epilogue_operands(kernel, epilogue_nodes) -> None:  # type: ignore[no-untyped-def]
+    """Build an operand's descriptor on the device when a fused epilogue reads it.
+
+    The template and the epilogue share one kernel arg per buffer, and a host
+    descriptor turns that arg into a tensordesc the epilogue's pointer loads
+    cannot use, so Inductor rejects the kernel at final codegen
+    (`_reject_if_template_host_tma`), after the fusion has been chosen.
+    """
+    meta = kernel.meta
+    if not epilogue_nodes or not any(meta.get(f"HOST_TMA_{name}") for name in ("A", "B")):
+        return
+    epilogue_reads = {dep.name for node in epilogue_nodes for dep in node.read_writes.reads}
+    named_inputs = kernel.input_nodes[kernel.prefix_args:len(kernel.input_nodes) - kernel.suffix_args]
+    overrides = {
+        f"HOST_TMA_{name}": False
+        for name, node in zip(("A", "B"), named_inputs)
+        if meta.get(f"HOST_TMA_{name}") and node.get_name() in epilogue_reads
+    }
+    if not overrides:
+        return
+    meta = {**meta, **overrides}
+    meta["HOST_SIDE_TMA"] = bool(meta.get("HOST_TMA_A") or meta.get("HOST_TMA_B"))
+    # render() is bound to the choice's shared meta dict, so _tlx_render
+    # applies these instead of the meta being mutated in place.
+    kernel._tlx_host_tma_overrides = {key: meta[key] for key in (*overrides, "HOST_SIDE_TMA")}
+    kernel.meta = meta
+    log.debug("tlx hopper template: device-side TMA for %s, read by the fused epilogue", sorted(overrides))
+
+
 def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
     self,
     scheduling,
@@ -3251,8 +3629,10 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
     render,
 ):
     split_k = getattr(self, "_tlx_split_k", 1)
+    _maybe_shrink_ring_for_fused_epilogue(self, epilogue_nodes)
+    _device_tma_for_epilogue_operands(self, epilogue_nodes)
     # Set _final_output_name so output_ptr() resolves to the fused output.
-    if epilogue_nodes:
+    if epilogue_nodes and getattr(self, "_tlx_reduction_epilogue_plan", None) is None:
         last_names = epilogue_nodes[-1].get_buffer_names()
         if len(last_names) == 1:
             self._final_output_name = next(iter(last_names))
@@ -3270,6 +3650,11 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
         # After render, codegen epilogue nodes into COMPUTE_EPILOGUE subgraphs,
         # redirecting their stores to variable assignments.
         num_ce = self._tlx_get_compute_epilogue_count()
+        compute_epilogue_nodes = (
+            ()
+            if getattr(self, "_tlx_reduction_epilogue_plan", None) is not None
+            else epilogue_nodes
+        )
         for i in range(num_ce):
             subgraph_name = self._get_compute_epilogue_subgraph_name(i)
             result_name = getattr(
@@ -3287,7 +3672,7 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
 
                 self.store = _redirect_store  # type: ignore[method-assign]
                 try:
-                    for node in epilogue_nodes:
+                    for node in compute_epilogue_nodes:
                         node.codegen(self.split_and_set_ranges(node.get_ranges()))
                 finally:
                     self.store = orig_store  # type: ignore[method-assign]
@@ -3321,6 +3706,11 @@ _orig_render = TritonTemplateKernel.render
 
 
 def _tlx_render(self, template, kwargs, record_input_dependent_tracked_event=False):  # type: ignore[no-untyped-def]
+    kwargs = {
+        **kwargs,
+        **getattr(self, "_tlx_host_tma_overrides", {}),
+        "TLX_REDUCTION_EPILOGUE": getattr(self, "_tlx_reduction_epilogue_plan", None) is not None,
+    }
     # Register the paired prefetch hook for templates that expose a drain
     # boundary. It remains a no-op unless the config knob and eligibility both
     # permit moving a load.
@@ -3455,7 +3845,7 @@ _orig_compute_fusion_metadata = getattr(
 
 
 def _tlx_compute_fusion_metadata(  # type: ignore[no-untyped-def]
-    self, scheduling, epilogue_nodes, prologue_nodes, buf_name_to_prologue_group
+    self, scheduling, epilogue_nodes, *args, **kwargs
 ):
     split_k = getattr(self, "_tlx_split_k", 1)
     if split_k > 1 and epilogue_nodes:
@@ -3467,11 +3857,7 @@ def _tlx_compute_fusion_metadata(  # type: ignore[no-untyped-def]
         self._scheduling_ref = scheduling
     elif _orig_compute_fusion_metadata is not None:
         _orig_compute_fusion_metadata(
-            self,
-            scheduling,
-            epilogue_nodes,
-            prologue_nodes,
-            buf_name_to_prologue_group,
+            self, scheduling, epilogue_nodes, *args, **kwargs
         )
 
 
@@ -3535,10 +3921,266 @@ def _tlx_create_kernel_choices(self, kernel_features, kernel_args, kernel_kwargs
 TritonScheduling.create_kernel_choices = _tlx_create_kernel_choices  # type: ignore[method-assign]
 
 
-# Register graph-level GEMM + normalization rewrites when callers import the
-# TLX integration before compilation.
-from .gemm_rmsnorm_gfx950 import register_gemm_rmsnorm_pattern
-from .gemm_layernorm_gfx950 import register_gemm_layernorm_pattern
+# ---------------------------------------------------------------------------
+# Fusion-aware selection in allow mode without max_autotune.
+#
+# Inductor defers a template choice to the scheduler (MultiTemplateBuffer),
+# which times each template with its epilogue fused against the unfused best,
+# only under max_autotune. Without it a vendor GEMM can win on GEMM-only time
+# and leave the epilogue as a separate pass. TorchTLX does not depend on
+# max_autotune, so take the deferred path whenever a gfx942 TLX template is
+# racing (the only arch measured so far).
+# ---------------------------------------------------------------------------
+from torch._inductor.select_algorithm import AlgorithmSelectorCache
+from .fusion import _is_tlx_choice
 
-register_gemm_rmsnorm_pattern()
-register_gemm_layernorm_pattern()
+_orig_algorithm_selector_call = AlgorithmSelectorCache.__call__
+
+
+def _tlx_algorithm_selector_call(self, name, choices, *args, **kwargs):
+    if (
+        config.triton.tlx_mode == "allow"
+        and kwargs.get("return_multi_template")
+        and not (config.max_autotune or config.max_autotune_gemm)
+        and _is_gfx942()
+        and any(_is_tlx_choice(c) for c in choices)
+    ):
+        with config.patch(max_autotune_gemm=True):
+            return _orig_algorithm_selector_call(self, name, choices, *args, **kwargs)
+    return _orig_algorithm_selector_call(self, name, choices, *args, **kwargs)
+
+
+AlgorithmSelectorCache.__call__ = _tlx_algorithm_selector_call  # type: ignore[method-assign]
+
+
+# ---------------------------------------------------------------------------
+# Unfused near-ties on gfx942 keep the vendor GEMM.
+#
+# A MultiTemplateBuffer with no fused epilogue is finalized on its GEMM-only
+# autotune timing. On gfx942 the TLX template can win that timing by <1% and
+# then run 3-7% slower than hipBLASLt in steady state. Fused picks are made in
+# speedup_by_fusion and are not affected.
+# ---------------------------------------------------------------------------
+from torch._inductor.ir import MultiTemplateBuffer
+from torch._inductor.scheduler import Scheduler
+from torch._inductor.select_algorithm import ExternKernelCaller
+
+_GFX942_UNFUSED_MIN_SPEEDUP = 1.05
+_orig_get_min_choice = MultiTemplateBuffer.get_min_choice
+_orig_finalize_multi_template_buffers = Scheduler.finalize_multi_template_buffers
+
+
+# Autotune times each candidate alone with a cleared cache, which can misrank
+# a TLX template against hipBLASLt by more than their gap. The two finalists
+# are re-timed warm and back to back, the way they run inside a graph.
+_GFX942_STEADY_MIN_SPEEDUP = 1.03
+_STEADY_BATCH = 10
+_STEADY_ROUNDS = 7
+
+
+_RETIME_ERRORS = (AttributeError, AssertionError, RuntimeError, TypeError)
+_RETIME_FAILED = "tlx_gfx942_steady_retime_failed"
+
+
+def _warm_interleaved_ms(fns):
+    """Median per-call time of each fn, timed warm and back to back, fns interleaved."""
+    for fn in fns:
+        for _ in range(_STEADY_BATCH):
+            fn()
+    torch.cuda.synchronize()
+    events = [[] for _ in fns]
+    for _ in range(_STEADY_ROUNDS):
+        for fn, per_fn in zip(fns, events):
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(_STEADY_BATCH):
+                fn()
+            end.record()
+            per_fn.append((start, end))
+    torch.cuda.synchronize()
+    return [sorted(s.elapsed_time(e) / _STEADY_BATCH for s, e in per_fn)[_STEADY_ROUNDS // 2] for per_fn in events]
+
+
+# The 8 XCD L2s of MI300X total 32 MB; the 256 MB Infinity Cache stays warm.
+_L2_FLUSH_BYTES = 64 * 1024 * 1024
+
+
+def _producer_warm_ms(fns):
+    """Median per-call time of each fn with L2 cleared before every call, fns interleaved.
+
+    Models a reduction reading data the previous kernel just wrote: evicted from
+    L2 by that kernel, still resident in the Infinity Cache.
+    """
+    flush = torch.empty(_L2_FLUSH_BYTES // 4, dtype=torch.int, device="cuda")
+    for fn in fns:
+        for _ in range(3):
+            fn()
+    torch.cuda.synchronize()
+    events = [[] for _ in fns]
+    for _ in range(_STEADY_BATCH * _STEADY_ROUNDS):
+        for fn, per_fn in zip(fns, events):
+            flush.zero_()
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            fn()
+            end.record()
+            per_fn.append((start, end))
+    torch.cuda.synchronize()
+    return [statistics.median(s.elapsed_time(e) for s, e in per_fn) for per_fn in events]
+
+
+def _steady_state_ms(choices, multi_node, hint_override):
+    """Median warm per-call ms per choice; None for a choice that fails to run."""
+    from torch._dynamo.utils import counters
+    from torch._inductor.select_algorithm import AlgorithmSelectorCache
+
+    args = AlgorithmSelectorCache.get_inputs(
+        choices, list(multi_node.inputs), multi_node.layout, None, hint_override=hint_override
+    )
+    fns = {}
+    for i, choice in enumerate(choices):
+        try:
+            tensors = args.get_benchmark_tensors(AlgorithmSelectorCache._uses_layout_preserving_inputs(choice))
+            inputs, out = tensors.unpack()
+            fn = choice.bmreq.make_run_fn(*inputs, out=out)
+            fn()
+            torch.cuda.synchronize()
+        except _RETIME_ERRORS as e:
+            log.warning("gfx942 steady-state re-timing of %s failed: %r", choice.name, e)
+            counters["inductor"][_RETIME_FAILED] += 1
+            continue
+        fns[i] = fn
+    ms = dict(zip(fns, _warm_interleaved_ms(list(fns.values())))) if fns else {}
+    return [ms.get(i) for i in range(len(choices))]
+
+
+def _valid_ms(ms) -> bool:
+    return ms is not None and _math.isfinite(ms) and ms > 0
+
+
+def _keep_unfused_tlx(steady, tlx_autotune_ms, extern_autotune_ms) -> bool:
+    from torch._dynamo.utils import counters
+
+    if steady is not None:
+        tlx_ms, extern_ms = steady
+        if tlx_ms is None:
+            return False
+        if extern_ms is None:
+            return True
+        if _valid_ms(tlx_ms) and _valid_ms(extern_ms):
+            return extern_ms >= tlx_ms * _GFX942_STEADY_MIN_SPEEDUP
+        log.warning("gfx942 steady-state re-timing gave invalid times %r, using autotune timings", steady)
+        counters["inductor"][_RETIME_FAILED] += 1
+    if _valid_ms(tlx_autotune_ms) and _valid_ms(extern_autotune_ms):
+        return extern_autotune_ms >= tlx_autotune_ms * _GFX942_UNFUSED_MIN_SPEEDUP
+    return False
+
+
+def _unfused_min_choice(self, hint_override=None):
+    from torch._dynamo.utils import counters
+
+    choice, ms = _orig_get_min_choice(self, hint_override)
+    if not _is_tlx_choice(choice):
+        return choice, ms
+    timings = self.choice_timings(hint_override)
+    externs = [c for c in timings if isinstance(c, ExternKernelCaller)]
+    if not externs:
+        return choice, ms
+    extern = min(externs, key=timings.__getitem__)
+    start = time.perf_counter()
+    try:
+        steady = _steady_state_ms((choice, extern), self, hint_override)
+    except _RETIME_ERRORS as e:
+        log.warning("gfx942 steady-state re-timing of %s failed, using autotune timings: %r", self.get_name(), e)
+        counters["inductor"][_RETIME_FAILED] += 1
+        steady = None
+    keep_tlx = _keep_unfused_tlx(steady, ms, timings[extern])
+    log.info(
+        "gfx942 unfused GEMM %s: autotune tlx=%.4f extern=%.4f ms, steady tlx/extern=%s ms -> %s (%.1f ms)",
+        self.get_name(), ms, timings[extern], steady, "tlx" if keep_tlx else "extern",
+        (time.perf_counter() - start) * 1e3,
+    )
+    if keep_tlx:
+        return choice, ms
+    return extern, timings[extern]
+
+
+def _tlx_finalize_multi_template_buffers(self):
+    if config.triton.tlx_mode != "allow" or not _is_gfx942():
+        return _orig_finalize_multi_template_buffers(self)
+    MultiTemplateBuffer.get_min_choice = _unfused_min_choice  # type: ignore[method-assign]
+    try:
+        return _orig_finalize_multi_template_buffers(self)
+    finally:
+        MultiTemplateBuffer.get_min_choice = _orig_get_min_choice  # type: ignore[method-assign]
+
+
+Scheduler.finalize_multi_template_buffers = _tlx_finalize_multi_template_buffers  # type: ignore[method-assign]
+
+
+# ---------------------------------------------------------------------------
+# Persistent vs looped choice for reductions the gfx942 override made persistent.
+#
+# TLX compiles both variants as a MultiKernel (scheduling/local_buffer_retention).
+# The stock pick times each variant with a cleared cache and cloned arguments,
+# which misranks these memory-bound kernels. Re-running a reduction back to back
+# keeps its input in L2 and favors the multi-pass looped kernel, so each call is
+# timed after clearing only L2. Picks are not reused from the on-disk cache.
+# ---------------------------------------------------------------------------
+from torch._inductor.codegen.multi_kernel import MultiKernel, MultiKernelCall
+
+_TLX_MULTI_KERNELS: set[tuple[str, ...]] = set()
+_TLX_MULTI_KERNEL_NAMES: set[str] = set()
+_orig_multi_kernel_init = MultiKernel.__init__
+_orig_multi_kernel_call_init = MultiKernelCall.__init__
+_orig_benchmark_sub_kernels = MultiKernelCall.benchmark_sub_kernels
+
+
+def _tlx_multi_kernel_init(self, kernels):
+    _orig_multi_kernel_init(self, kernels)
+    if any(getattr(k, "_tlx_retime", False) for k in kernels):
+        _TLX_MULTI_KERNELS.add(tuple(k.kernel_name for k in kernels))
+        _TLX_MULTI_KERNEL_NAMES.add(self.kernel_name)
+
+
+def _is_tlx_multi_kernel(call) -> bool:
+    return tuple(k.inductor_meta.get("kernel_name") for k in call.kernels) in _TLX_MULTI_KERNELS
+
+
+def _tlx_multi_kernel_call_init(self, multi_kernel_name, kernels, arg_index):
+    _orig_multi_kernel_call_init(self, multi_kernel_name, kernels, arg_index)
+    if multi_kernel_name in _TLX_MULTI_KERNEL_NAMES and config.triton.multi_kernel <= 1:
+        self.disable_cache = True
+        self.picked_kernel = None
+
+
+def _tlx_benchmark_sub_kernels(self, *args, **kwargs):
+    if not _is_tlx_multi_kernel(self):
+        return _orig_benchmark_sub_kernels(self, *args, **kwargs)
+    fns = []
+    for index, kernel in enumerate(self.kernels):
+        cloned_args, cloned_kwargs = kernel.clone_args(*self._get_filtered_args(args, index), **kwargs)
+        fns.append(lambda kernel=kernel, a=cloned_args, kw=cloned_kwargs: kernel.run(*a, **kw))
+    timings = _producer_warm_ms(fns)
+    log.info(
+        "gfx942 reduction choice %s: %s",
+        [k.inductor_meta.get("kernel_name") for k in self.kernels],
+        ["%.4f ms" % t for t in timings],
+    )
+    return timings
+
+
+MultiKernel.__init__ = _tlx_multi_kernel_init  # type: ignore[method-assign]
+MultiKernelCall.__init__ = _tlx_multi_kernel_call_init  # type: ignore[method-assign]
+MultiKernelCall.benchmark_sub_kernels = _tlx_benchmark_sub_kernels  # type: ignore[method-assign]
+
+
+from .reduction_epilogue import install as install_reduction_epilogue
+
+install_reduction_epilogue()
+
+# Route eligible SDPA flash-attention calls through the flex lowering when
+# tlx_config.sdpa_to_flex is on (no-op otherwise).
+from .sdpa_to_flex import register_sdpa_to_flex
+
+register_sdpa_to_flex()

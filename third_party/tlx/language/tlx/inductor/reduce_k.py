@@ -78,6 +78,37 @@ _MEASURE_WS_BYTES_LIMIT = 2 * 1024**3
 
 _reduce_k_cost_cache: dict[tuple, float] = {}
 
+# Reducer launches captured per CUDA graph when measuring its cost.
+_COST_GRAPH_CALLS = 20
+
+
+def _warm_kernel_time_ms(run, calls: int = _COST_GRAPH_CALLS, reps: int = 5) -> float:
+    """Median per-call time of `calls` back-to-back launches replayed as one CUDA graph.
+
+    The reducer reads partials the GEMM has just written, so they are in L2; and
+    the candidate's own GEMM timing already carries the benchmarker's fixed
+    per-sample cost. Inductor's benchmarker would add both a cold-L2 flush and a
+    second copy of that cost (~4.5 us on H100) to a kernel that runs 1-6 us.
+    """
+    run()  # compile outside the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(calls):
+            run()
+    graph.replay()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(reps):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        times.append(start.elapsed_time(end) / calls)
+    return sorted(times)[reps // 2]
+
 
 def _modelled_cost_ms(M: int, N: int, split_k: int, itemsize: int) -> float:
     """Bandwidth model for the reducer: it is purely streaming."""
@@ -99,7 +130,7 @@ def _modelled_cost_ms(M: int, N: int, split_k: int, itemsize: int) -> float:
 def reduce_k_cost_ms(
     M: int, N: int, split_k: int, out_dtype: torch.dtype, has_bias: bool
 ) -> float:
-    """Measured wall time of the split-K reducer for this output shape, in ms.
+    """Measured warm-L2 kernel time of the split-K reducer for this output shape, in ms.
 
     Autotune scores a template candidate on the GEMM kernel alone. A SPLIT_K > 1
     candidate additionally needs `_reduce_k_kernel` to run before its output is
@@ -120,10 +151,12 @@ def reduce_k_cost_ms(
     itemsize = torch.empty((), dtype=out_dtype).element_size()
     ws_bytes = split_k * M * N * 4
     cost = None
-    if ws_bytes <= _MEASURE_WS_BYTES_LIMIT and out_dtype in _TRITON_DTYPE:
+    if (
+        ws_bytes <= _MEASURE_WS_BYTES_LIMIT
+        and out_dtype in _TRITON_DTYPE
+        and not torch.cuda.is_current_stream_capturing()
+    ):
         try:
-            from torch._inductor.runtime.benchmarking import benchmarker
-
             dev = torch.cuda.current_device()
             ws = torch.empty(split_k * M * N, dtype=torch.float32, device=dev)
             c = torch.empty((M, N), dtype=out_dtype, device=dev)
@@ -142,7 +175,7 @@ def reduce_k_cost_ms(
                     STRIDE_BIAS_N=1,
                 )
 
-            cost = benchmarker.benchmark_gpu(run)
+            cost = _warm_kernel_time_ms(run)
             del ws, c, bias
         except Exception as e:  # OOM, compile failure, API drift
             log.warning(

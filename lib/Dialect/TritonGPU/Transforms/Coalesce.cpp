@@ -10,7 +10,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/StrUtil.h"
-#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "tritongpu-coalesce"
@@ -43,6 +42,17 @@ static Attribute pickDescriptorLoadStoreLayout(int numWarps, int threadsPerWarp,
 
   SmallVector<unsigned> order =
       getMatrixOrder(type.getRank(), /*rowMajor*/ true);
+  // A mixed-radix tile keeps a mixed-radix layout, at the widest vector adding
+  // no registers.
+  if (!isRadix2Encoding(type.getEncoding())) {
+    MLIRContext *ctx = type.getContext();
+    FailureOr<LinearEncodingAttr> mixedRadix = getMixedRadixEncoding(
+        ctx, type.getShape(), numWarps, threadsPerWarp, /*numCTAs=*/1,
+        getMixedRadixVector(ctx, type.getShape(), maxVectorSize, order,
+                            numWarps, threadsPerWarp),
+        order);
+    return succeeded(mixedRadix) ? Attribute(*mixedRadix) : type.getEncoding();
+  }
   auto cgaLayout = triton::gpu::getCGALayout(type.getEncoding());
 
   Attribute layout = triton::gpu::BlockedEncodingAttr::get(
@@ -69,6 +79,27 @@ static void pickDescriptorLoadStoreLayout(
   });
 }
 
+// The vector AxisInfo proves for this access, kept only as wide as adds no
+// registers to the layout the pad pass accepted unless a store predicates off
+// the duplicates (its vector check calls the same helpers).
+static FailureOr<LinearEncodingAttr>
+buildCoalescedMixedRadixEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                                 Operation *op, int numWarps,
+                                 int threadsPerWarp, unsigned maxVecBits) {
+  MLIRContext *ctx = op->getContext();
+  Value ptr = getMemAccessPtr(op);
+  auto type = cast<RankedTensorType>(ptr.getType());
+  AxisInfo &info = *axisInfoAnalysis.getAxisInfo(ptr);
+  SmallVector<unsigned> order = getOrderFromContiguity(info.getContiguity());
+  unsigned vector = getMixedRadixVector(
+      ctx, type.getShape(),
+      getAxisInfoVector(info, type, type.getShape(), order[0],
+                        numWarps * threadsPerWarp, maxVecBits),
+      order, numWarps, threadsPerWarp, npotStoreTakesPredicatedVector(op));
+  return getMixedRadixEncoding(ctx, type.getShape(), numWarps, threadsPerWarp,
+                               /*numCTAs=*/1, vector, order);
+}
+
 struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
   using impl::TritonGPUCoalesceBase<CoalescePass>::TritonGPUCoalesceBase;
 
@@ -80,32 +111,6 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
   void runOnOperation() override {
     // Run axis info analysis
     ModuleOp moduleOp = getOperation();
-
-    // Modular layouts can have multiple physical slots for one logical tensor
-    // element. Loads and stores tolerate equivalent duplicate values, but an
-    // atomic would apply the update more than once. Reject until lowering can
-    // predicate a canonical representative for every modular alias class.
-    if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT")) {
-      bool hasUnsupportedAtomic = false;
-      moduleOp.walk([&](Operation *op) {
-        if (!isa<triton::AtomicRMWOp, triton::AtomicCASOp>(op))
-          return;
-        Value ptr = getMemAccessPtr(op);
-        auto type = dyn_cast<RankedTensorType>(ptr.getType());
-        if (!type || llvm::all_of(type.getShape(), [](int64_t dim) {
-              return llvm::isPowerOf2_64(dim);
-            }))
-          return;
-        op->emitError("NPOT atomic operations are not yet supported with "
-                      "modular tensor layouts");
-        hasUnsupportedAtomic = true;
-      });
-      if (hasUnsupportedAtomic) {
-        signalPassFailure();
-        return;
-      }
-    }
-
     ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
     // For each i/o operation, we determine what layout
@@ -189,6 +194,15 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
         }
         if (pinned) {
           layoutMap[curr] = pinned;
+        } else if (!isRadix2Encoding(
+                       cast<RankedTensorType>(ptr.getType()).getEncoding())) {
+          // A mixed-radix layout has no CGA layout: without a mixed-radix
+          // rebuild, the access keeps its layout.
+          FailureOr<LinearEncodingAttr> mixedRadix =
+              buildCoalescedMixedRadixEncoding(axisInfoAnalysis, curr, numWarps,
+                                               threadsPerWarp, maxVecBits);
+          if (succeeded(mixedRadix))
+            layoutMap[curr] = *mixedRadix;
         } else {
           auto tensorType = cast<RankedTensorType>(ptr.getType());
           CGAEncodingAttr cgaLayout = getCGALayout(tensorType.getEncoding());

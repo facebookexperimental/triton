@@ -2530,3 +2530,99 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier none
 // CHECK: scf.yield
+
+// -----
+
+// ---- Nested flat pipeline recovered inside a persistent loop ----
+//
+// The flat tag is required for nested execute_regions: untagged stages inside
+// a pipelined_for belong to that loop and are handled by the loop conversion.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @nested_flat_pipeline_backend(%n: index, %ptr: !tt.ptr<f32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %v0 = arith.constant 0.0 : f32
+    %v1 = arith.constant 1.0 : f32
+
+    scf.for %tile = %c0 to %n step %c1 {
+      scf.execute_region no_inline {
+        tt.store %ptr, %v0 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.flat, triton.warp_pipeline.stage = "stage0", triton.warp_pipeline.priority = 1 : i32}
+
+      scf.execute_region no_inline {
+        tt.store %ptr, %v1 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.flat, triton.warp_pipeline.stage = "stage1", triton.warp_pipeline.priority = 0 : i32}
+      scf.yield
+    }
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @nested_flat_pipeline_backend
+// CHECK: scf.for
+// CHECK-NOT: scf.execute_region
+// CHECK: ttg.barrier local
+// CHECK: amdg.cond_barrier
+// CHECK: tt.store
+// CHECK: rocdl.s.barrier
+// CHECK: tt.store
+// CHECK: amdg.cond_barrier
+// CHECK: tt.return
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [8], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+!root = !ttg.memdesc<512xi32, #shared, #smem, mutable>
+!stages = !ttg.memdesc<8x64xi32, #shared, #smem, mutable>
+!group = !ttg.memdesc<4x64xi32, #shared, #smem, mutable, 8x64>
+!source = !ttg.memdesc<256xi32, #shared, #smem, mutable>
+!tile = !ttg.memdesc<128xi32, #shared, #smem, mutable, 256>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+// The halves of %source are disjoint within an iteration, but its origin
+// shifts by 64 elements between iterations. The high write [128, 256) then
+// overlaps the next low read [64, 192), requiring a barrier at the loop tail,
+// not between the read and write. Three stages distinguish those placements.
+// CHECK-LABEL: tt.func @loop_varying_subslice_origin
+// CHECK: scf.for
+// CHECK: ttg.local_load
+// CHECK-NOT: ttg.barrier local
+// CHECK: ttg.local_store
+// CHECK-NOT: scf.yield
+// CHECK: ttg.barrier local
+// CHECK: scf.yield
+tt.func @loop_varying_subslice_origin(%n: i32, %initial: tensor<512xi32, #blocked>, %input: tensor<128xi32, #blocked>) -> tensor<128xi32, #blocked> {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %allocation = ttg.local_alloc %initial : (tensor<512xi32, #blocked>) -> !root
+  %parent = ttg.memdesc_reinterpret %allocation : !root -> !stages
+  %group0 = ttg.memdesc_subslice %parent [0, 0] : !stages -> !group
+  %group1 = ttg.memdesc_subslice %parent [1, 0] : !stages -> !group
+  %source0 = ttg.memdesc_reinterpret %group0 : !group -> !source
+  %source1 = ttg.memdesc_reinterpret %group1 : !group -> !source
+  %result:2 = scf.for %i = %c0 to %n step %c1 iter_args(%source = %source0, %last = %input) -> (!source, tensor<128xi32, #blocked>) : i32 {
+    %loaded = scf.execute_region -> tensor<128xi32, #blocked> no_inline {
+      %low = ttg.memdesc_subslice %source [0] : !source -> !tile
+      %value = ttg.local_load %low : !tile -> tensor<128xi32, #blocked>
+      scf.yield %value : tensor<128xi32, #blocked>
+    } {triton.warp_pipeline.stage = "read"}
+    %next = scf.execute_region -> !source no_inline {
+      %first = arith.cmpi eq, %i, %c0 : i32
+      %selected = arith.select %first, %source1, %source0 : !source
+      scf.yield %selected : !source
+    } {triton.warp_pipeline.stage = "advance"}
+    scf.execute_region no_inline {
+      %high = ttg.memdesc_subslice %source [128] : !source -> !tile
+      ttg.local_store %input, %high : tensor<128xi32, #blocked> -> !tile
+      scf.yield
+    } {triton.warp_pipeline.stage = "write"}
+    scf.yield %next, %loaded : !source, tensor<128xi32, #blocked>
+  } {triton.warp_pipeline.pipelined_for}
+  tt.return %result#1 : tensor<128xi32, #blocked>
+}
+}

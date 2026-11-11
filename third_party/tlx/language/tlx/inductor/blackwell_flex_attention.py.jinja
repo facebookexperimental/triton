@@ -5,7 +5,10 @@
     #   Task 1 "default" : Correction (alpha scaling) + Epilogue (normalize, store)
     #   Task 2 (replicated): Softmax + score_mod/mask_mod via modification() macros
     #   Task 3            : MMA via tlx.async_dot (Q@K^T, P@V)
-    #   Task 4            : TMA Load (Q, K, V)
+    #   Task 4 (x2)       : TMA Load, one warp for Q and K, one for V
+    #
+    # NUM_MMA_GROUPS splits BLOCK_M into 64-row (or larger) MMA groups: 2 for
+    # BLOCK_M >= 128, 1 for BLOCK_M == 64.
     #
     # Memory hierarchy:
     #   SMEM: Q tiles (split), K tiles, V tiles (double buffered)
@@ -45,7 +48,7 @@
     # TMA descriptors
     desc_q = tl.make_tensor_descriptor(
         base=Q, shape=[Q_LEN, QK_HEAD_DIM], strides=[stride_qm, 1],
-        block_shape=[BLOCK_M // 2, QK_HEAD_DIM_ROUNDED],
+        block_shape=[BLOCK_M // NUM_MMA_GROUPS, QK_HEAD_DIM_ROUNDED],
     )
     desc_k = tl.make_tensor_descriptor(
         base=K, shape=[KV_LEN, QK_HEAD_DIM], strides=[stride_kn, 1],
@@ -71,10 +74,11 @@
     sparse_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + (q_start // SPARSE_Q_MULTIPLE) * stride_kv_idx_m  # noqa: B950
 
     # ===================== CONSTANTS =====================
-    NUM_MMA_GROUPS: tl.constexpr = 2
+    tl.static_assert(NUM_MMA_GROUPS == 1 or NUM_MMA_GROUPS == 2)
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     NUM_KV_BUFFERS: tl.constexpr = 2
-    NUM_QK_BUFFERS: tl.constexpr = 1
+    # One group double-buffers QK/P so Q@K[i+1] runs ahead of P@V[i].
+    NUM_QK_BUFFERS: tl.constexpr = 2 if NUM_MMA_GROUPS == 1 else 1
     dtype_bytes: tl.constexpr = 2  # bf16/fp16
 
     # ===================== SMEM ALLOCATIONS =====================
@@ -85,7 +89,7 @@
     # ===================== TMEM ALLOCATIONS =====================
     qk_tmem = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), tl.float32, NUM_MMA_GROUPS * NUM_QK_BUFFERS, tlx.storage_kind.tmem)
     p_tmem = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), MATMUL_PRECISION, NUM_MMA_GROUPS * NUM_QK_BUFFERS, tlx.storage_kind.tmem)
-    acc_tmem = tlx.local_alloc((BLOCK_M_SPLIT, V_HEAD_DIM_ROUNDED), tl.float32, NUM_MMA_GROUPS * NUM_QK_BUFFERS, tlx.storage_kind.tmem)
+    acc_tmem = tlx.local_alloc((BLOCK_M_SPLIT, V_HEAD_DIM_ROUNDED), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
 
     # alpha/l/m use SMEM (not TMEM) to avoid TMEM minimum-size alignment issues
     alpha_smem = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS)
@@ -100,8 +104,10 @@
     v_empties = tlx.alloc_barriers(num_barriers=NUM_KV_BUFFERS)
     qk_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_QK_BUFFERS)
     p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_QK_BUFFERS)
-    acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_QK_BUFFERS)
-    acc_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_QK_BUFFERS)
+    acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+    acc_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+    # P@V[i] done, so correction may rescale acc (one group only).
+    acc_readys = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     alpha_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     alpha_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     l_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
@@ -129,6 +135,10 @@
                     alpha_val = tlx.local_load(alpha_smem[cid])
                     tlx.barrier_arrive(alpha_empties[cid])
 
+                    if NUM_MMA_GROUPS == 1:
+                        # Q@K[i] no longer trails P@V[i-1], so wait for it explicitly.
+                        tlx.barrier_wait(acc_readys[cid], (accum_cnt_c - 1) & 1, pred=accum_cnt_c > 0)
+
                     # Scale accumulator by alpha correction
                     acc_val = tlx.local_load(acc_tmem[cid])
                     acc_val = acc_val * alpha_val
@@ -141,10 +151,14 @@
             for cid in tl.static_range(NUM_MMA_GROUPS):
                 tlx.barrier_wait(l_fulls[cid], 0)
                 l_val = tlx.local_load(l_smem[cid])
+                l_val = tl.where(l_val == 0.0, 1.0, l_val)
                 m_val = tlx.local_load(m_smem[cid])
 
-                tlx.barrier_wait(acc_empties[cid], 0)
-                acc_val = tlx.local_load(acc_tmem[cid])
+                if total_blocks > 0:
+                    tlx.barrier_wait(acc_empties[cid], 0)
+                    acc_val = tlx.local_load(acc_tmem[cid])
+                else:
+                    acc_val = tl.zeros([BLOCK_M_SPLIT, V_HEAD_DIM_ROUNDED], tl.float32)
                 acc_val = acc_val / l_val
                 lse_val = tl.reshape(m_val, [BLOCK_M_SPLIT]) + tl.math.log2(tl.reshape(l_val, [BLOCK_M_SPLIT]))
 
@@ -196,8 +210,10 @@
 
             # ---- Normal blocks (apply score_mod AND mask_mod) ----
             for _sn in range(0, block_n_end_s):
-                tlx.barrier_wait(qk_fulls[cid], accum_cnt_s & 1)
-                qk = tlx.local_load(qk_tmem[cid])
+                qk_buf = cid * NUM_QK_BUFFERS + accum_cnt_s % NUM_QK_BUFFERS
+                qk_phase = (accum_cnt_s // NUM_QK_BUFFERS) & 1
+                tlx.barrier_wait(qk_fulls[qk_buf], qk_phase)
+                qk = tlx.local_load(qk_tmem[qk_buf])
 
                 # Scale and apply score_mod
                 qk = qk * qk_scale
@@ -253,8 +269,8 @@
 
                 # Store P to TMEM for MMA task (P@V)
                 p = p.to(MATMUL_PRECISION)
-                tlx.local_store(p_tmem[cid], p)
-                tlx.barrier_arrive(p_fulls[cid])
+                tlx.local_store(p_tmem[qk_buf], p)
+                tlx.barrier_arrive(p_fulls[qk_buf])
 
                 offset = get_offset_for_next_block(
                     _sn, kv_indices_s, kv_num_blocks_s,
@@ -274,8 +290,10 @@
                 kv_offset_s = 0
 
                 for _sn in range(0, fblock_n_end_s):
-                    tlx.barrier_wait(qk_fulls[cid], accum_cnt_s & 1)
-                    qk = tlx.local_load(qk_tmem[cid])
+                    qk_buf = cid * NUM_QK_BUFFERS + accum_cnt_s % NUM_QK_BUFFERS
+                    qk_phase = (accum_cnt_s // NUM_QK_BUFFERS) & 1
+                    tlx.barrier_wait(qk_fulls[qk_buf], qk_phase)
+                    qk = tlx.local_load(qk_tmem[qk_buf])
 
                     qk = qk * qk_scale
                     m = get_bounded_indices(offs_m[:, None], Q_LEN if not IS_DIVISIBLE else None)
@@ -313,8 +331,8 @@
                     tlx.barrier_arrive(alpha_fulls[cid])
 
                     p = p.to(MATMUL_PRECISION)
-                    tlx.local_store(p_tmem[cid], p)
-                    tlx.barrier_arrive(p_fulls[cid])
+                    tlx.local_store(p_tmem[qk_buf], p)
+                    tlx.barrier_arrive(p_fulls[qk_buf])
 
                     offset = get_offset_for_next_block(
                         _sn, fkv_indices_s, fkv_num_blocks_s,
@@ -349,85 +367,120 @@
                 fkv_num_blocks_m = tl.load(FULL_KV_NUM_BLKS + sparse_kv_num_blks_offset)
                 total_blocks_m = total_blocks_m + tl.minimum(fkv_num_blocks_m * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
 
-            # Wait for Q to be loaded (ONCE, before the loop)
-            tlx.barrier_wait(q_fulls[0], 0)
-            tlx.barrier_wait(q_fulls[1], 0)
+            for cid in tl.static_range(NUM_MMA_GROUPS):
+                tlx.barrier_wait(q_fulls[cid], 0)
 
-            # ---- Peeled first iteration (block 0) ----
-            accum_cnt_m = 0
-            k_buf = 0
-            v_buf = 0
+            if NUM_MMA_GROUPS == 1:
+                # One group, QK/P double-buffered: Q@K[i+1] is issued before P@V[i] so
+                # softmax of block i+1 overlaps correction and P@V of block i.
+                # QK/P buffer b is reused by Q@K[i+2], issued after P@V[i] has waited
+                # for P[i], so softmax has finished reading QK[i] by then.
+                if total_blocks_m > 0:
+                    tlx.barrier_wait(k_fulls[0], 0)
+                    tlx.async_dot(q_tiles[0], tlx.local_trans(k_tiles[0]), qk_tmem[0], use_acc=False,
+                                  mBarriers=[qk_fulls[0], k_empties[0]])
+                acc_init = False
+                for i in range(0, total_blocks_m):
+                    # Q@K[i+1] -> QK[(i+1) % 2], release K[i+1]
+                    if i + 1 < total_blocks_m:
+                        n_kv_buf = (i + 1) % NUM_KV_BUFFERS
+                        n_qk_buf = (i + 1) % NUM_QK_BUFFERS
+                        tlx.barrier_wait(k_fulls[n_kv_buf], ((i + 1) // NUM_KV_BUFFERS) & 1)
+                        tlx.async_dot(q_tiles[0], tlx.local_trans(k_tiles[n_kv_buf]), qk_tmem[n_qk_buf],
+                                      use_acc=False, mBarriers=[qk_fulls[n_qk_buf], k_empties[n_kv_buf]])
 
-            # Q[0]@K[0] → QK[0]
-            tlx.barrier_wait(k_fulls[0], 0)
-            k_t = tlx.local_trans(k_tiles[0])
-            tlx.async_dot(q_tiles[0], k_t, qk_tmem[0], use_acc=False, mBarriers=[qk_fulls[0]])
-            # Q[1]@K[0] → QK[1], release K[0]
-            tlx.async_dot(q_tiles[1], k_t, qk_tmem[1], use_acc=False, mBarriers=[qk_fulls[1], k_empties[0]])
+                    # P@V[i] -> acc, release V[i]
+                    kv_buf = i % NUM_KV_BUFFERS
+                    qk_buf = i % NUM_QK_BUFFERS
+                    tlx.barrier_wait(v_fulls[kv_buf], (i // NUM_KV_BUFFERS) & 1)
+                    tlx.barrier_wait(p_fulls[qk_buf], (i // NUM_QK_BUFFERS) & 1)
+                    tlx.barrier_wait(acc_fulls[0], i & 1)
+                    tlx.async_dot(p_tmem[qk_buf], v_tiles[kv_buf], acc_tmem[0],
+                                  use_acc=acc_init, mBarriers=[v_empties[kv_buf], acc_readys[0]])
+                    acc_init = True
+                if total_blocks_m > 0:
+                    tlx.tcgen05_commit(acc_empties[0])
+            elif total_blocks_m > 0:
+                # ---- Peeled first iteration (block 0) ----
+                accum_cnt_m = 0
+                k_buf = 0
+                v_buf = 0
 
-            # P[0]@V[0] → acc[0] (first write, use_acc=False)
-            tlx.barrier_wait(v_fulls[0], 0)
-            tlx.barrier_wait(p_fulls[0], 0)
-            tlx.barrier_wait(acc_fulls[0], 0)
-            tlx.async_dot(p_tmem[0], v_tiles[0], acc_tmem[0], use_acc=False, force_async=True)
-
-            acc1_init = False
-
-            # ---- Interleaved loop (blocks 1..N-1) ----
-            for _block in range(1, total_blocks_m):
-                v_buf_prev = accum_cnt_m % NUM_KV_BUFFERS
-                qk_phase_prev = accum_cnt_m & 1
-
-                accum_cnt_m = accum_cnt_m + 1
-                k_buf = accum_cnt_m % NUM_KV_BUFFERS
-                v_buf = accum_cnt_m % NUM_KV_BUFFERS
-                k_phase = (accum_cnt_m // NUM_KV_BUFFERS) & 1
-                qk_phase = accum_cnt_m & 1
-
-                # Q[0]@K[i] → QK[0]
-                tlx.barrier_wait(k_fulls[k_buf], k_phase)
-                k_t = tlx.local_trans(k_tiles[k_buf])
+                # Q[0]@K[0] → QK[0]
+                tlx.barrier_wait(k_fulls[0], 0)
+                k_t = tlx.local_trans(k_tiles[0])
                 tlx.async_dot(q_tiles[0], k_t, qk_tmem[0], use_acc=False, mBarriers=[qk_fulls[0]])
+                # Q[1]@K[0] → QK[1], release K[0]
+                tlx.async_dot(q_tiles[1], k_t, qk_tmem[1], use_acc=False, mBarriers=[qk_fulls[1], k_empties[0]])
 
-                # P[1]@V[i-1] → acc[1] (INTERLEAVED from previous iteration!)
-                tlx.barrier_wait(p_fulls[1], qk_phase_prev)
-                tlx.barrier_wait(acc_fulls[1], qk_phase_prev)
-                tlx.async_dot(p_tmem[1], v_tiles[v_buf_prev], acc_tmem[1],
-                              use_acc=acc1_init, mBarriers=[v_empties[v_buf_prev]])
-                acc1_init = True
+                # P[0]@V[0] → acc[0] (first write, use_acc=False)
+                tlx.barrier_wait(v_fulls[0], 0)
+                tlx.barrier_wait(p_fulls[0], 0)
+                tlx.barrier_wait(acc_fulls[0], 0)
+                tlx.async_dot(p_tmem[0], v_tiles[0], acc_tmem[0], use_acc=False, force_async=True)
 
-                # Q[1]@K[i] → QK[1], release K[i]
-                tlx.async_dot(q_tiles[1], k_t, qk_tmem[1], use_acc=False,
-                              mBarriers=[qk_fulls[1], k_empties[k_buf]])
+                acc1_init = False
 
-                # P[0]@V[i] → acc[0] (accumulate)
-                v_phase = (accum_cnt_m // NUM_KV_BUFFERS) & 1
-                tlx.barrier_wait(v_fulls[v_buf], v_phase)
-                tlx.barrier_wait(p_fulls[0], qk_phase)
-                tlx.barrier_wait(acc_fulls[0], qk_phase)
-                tlx.async_dot(p_tmem[0], v_tiles[v_buf], acc_tmem[0],
-                              use_acc=True, force_async=True)
+                # ---- Interleaved loop (blocks 1..N-1) ----
+                for _block in range(1, total_blocks_m):
+                    v_buf_prev = accum_cnt_m % NUM_KV_BUFFERS
+                    qk_phase_prev = accum_cnt_m & 1
 
-            # ---- Cleanup: final P[1]@V[last] ----
-            qk_phase = accum_cnt_m & 1
-            tlx.tcgen05_commit(acc_empties[0])
+                    accum_cnt_m = accum_cnt_m + 1
+                    k_buf = accum_cnt_m % NUM_KV_BUFFERS
+                    v_buf = accum_cnt_m % NUM_KV_BUFFERS
+                    k_phase = (accum_cnt_m // NUM_KV_BUFFERS) & 1
+                    qk_phase = accum_cnt_m & 1
 
-            tlx.barrier_wait(p_fulls[1], qk_phase)
-            tlx.barrier_wait(acc_fulls[1], qk_phase)
-            tlx.async_dot(p_tmem[1], v_tiles[v_buf], acc_tmem[1],
-                          use_acc=acc1_init,
-                          mBarriers=[acc_empties[1], v_empties[v_buf]])
+                    # Q[0]@K[i] → QK[0]
+                    tlx.barrier_wait(k_fulls[k_buf], k_phase)
+                    k_t = tlx.local_trans(k_tiles[k_buf])
+                    tlx.async_dot(q_tiles[0], k_t, qk_tmem[0], use_acc=False, mBarriers=[qk_fulls[0]])
+
+                    # P[1]@V[i-1] → acc[1] (INTERLEAVED from previous iteration!)
+                    tlx.barrier_wait(p_fulls[1], qk_phase_prev)
+                    tlx.barrier_wait(acc_fulls[1], qk_phase_prev)
+                    tlx.async_dot(p_tmem[1], v_tiles[v_buf_prev], acc_tmem[1],
+                                  use_acc=acc1_init, mBarriers=[v_empties[v_buf_prev]])
+                    acc1_init = True
+
+                    # Q[1]@K[i] → QK[1], release K[i]
+                    tlx.async_dot(q_tiles[1], k_t, qk_tmem[1], use_acc=False,
+                                  mBarriers=[qk_fulls[1], k_empties[k_buf]])
+
+                    # P[0]@V[i] → acc[0] (accumulate)
+                    v_phase = (accum_cnt_m // NUM_KV_BUFFERS) & 1
+                    tlx.barrier_wait(v_fulls[v_buf], v_phase)
+                    tlx.barrier_wait(p_fulls[0], qk_phase)
+                    tlx.barrier_wait(acc_fulls[0], qk_phase)
+                    tlx.async_dot(p_tmem[0], v_tiles[v_buf], acc_tmem[0],
+                                  use_acc=True, force_async=True)
+
+                # ---- Cleanup: final P[1]@V[last] ----
+                qk_phase = accum_cnt_m & 1
+                tlx.tcgen05_commit(acc_empties[0])
+
+                tlx.barrier_wait(p_fulls[1], qk_phase)
+                tlx.barrier_wait(acc_fulls[1], qk_phase)
+                tlx.async_dot(p_tmem[1], v_tiles[v_buf], acc_tmem[1],
+                              use_acc=acc1_init,
+                              mBarriers=[acc_empties[1], v_empties[v_buf]])
 
         # ================================================================
-        # TASK 4: LOAD  (1 warp, TMA loads for Q, K, V)
+        # TASK 4: LOAD  (two 1-warp tasks: the first loads Q and K, the second V)
+        #
+        # Separate K and V loaders keep a K load from queuing behind a V buffer
+        # that P@V has not released yet.
         # ================================================================
+{%- for load_v in (False, True) %}
         with tlx.async_task(num_warps=1, registers=24):
-            # Load Q[0] and Q[1] via TMA (once)
+{%- if not load_v %}
+            # Load one Q tile per MMA group via TMA (once)
             q_base = (q_start * BLOCK_M).to(tl.int32)
-            tlx.barrier_expect_bytes(q_fulls[0], dtype_bytes * BLOCK_M_SPLIT * QK_HEAD_DIM_ROUNDED)
-            tlx.async_descriptor_load(desc_q, q_tiles[0], [q_base, 0], q_fulls[0])
-            tlx.barrier_expect_bytes(q_fulls[1], dtype_bytes * BLOCK_M_SPLIT * QK_HEAD_DIM_ROUNDED)
-            tlx.async_descriptor_load(desc_q, q_tiles[1], [q_base + BLOCK_M_SPLIT, 0], q_fulls[1])
+            for cid in tl.static_range(NUM_MMA_GROUPS):
+                tlx.barrier_expect_bytes(q_fulls[cid], dtype_bytes * BLOCK_M_SPLIT * QK_HEAD_DIM_ROUNDED)
+                tlx.async_descriptor_load(desc_q, q_tiles[cid], [q_base + cid * BLOCK_M_SPLIT, 0], q_fulls[cid])
+{%- endif %}
 
             # Sparse indices for load
             kv_indices_ld = KV_IDX + sparse_kv_idx_offset
@@ -435,22 +488,21 @@
             kv_num_blocks_ld = tl.load(KV_NUM_BLKS + sparse_kv_num_blks_offset)
             block_n_end_ld = tl.minimum(kv_num_blocks_ld * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
 
-            # Load K/V for normal blocks
+            # Load {{ "V" if load_v else "K" }} for normal blocks
             kv_offset_ld = 0
             accum_cnt_ld = 0
             for _sn in range(0, block_n_end_ld):
                 buf = accum_cnt_ld % NUM_KV_BUFFERS
                 kv_base = kv_start_ld + kv_offset_ld
-
-                # Load K
-                tlx.barrier_wait(k_empties[buf], (accum_cnt_ld // NUM_KV_BUFFERS) & 1 ^ 1)
-                tlx.barrier_expect_bytes(k_fulls[buf], dtype_bytes * BLOCK_N * QK_HEAD_DIM_ROUNDED)
-                tlx.async_descriptor_load(desc_k, k_tiles[buf], [kv_base, 0], k_fulls[buf])
-
-                # Load V
+{%- if load_v %}
                 tlx.barrier_wait(v_empties[buf], (accum_cnt_ld // NUM_KV_BUFFERS) & 1 ^ 1)
                 tlx.barrier_expect_bytes(v_fulls[buf], dtype_bytes * BLOCK_N * V_HEAD_DIM_ROUNDED)
                 tlx.async_descriptor_load(desc_v, v_tiles[buf], [kv_base, 0], v_fulls[buf])
+{%- else %}
+                tlx.barrier_wait(k_empties[buf], (accum_cnt_ld // NUM_KV_BUFFERS) & 1 ^ 1)
+                tlx.barrier_expect_bytes(k_fulls[buf], dtype_bytes * BLOCK_N * QK_HEAD_DIM_ROUNDED)
+                tlx.async_descriptor_load(desc_k, k_tiles[buf], [kv_base, 0], k_fulls[buf])
+{%- endif %}
 
                 offset = get_offset_for_next_block(
                     _sn, kv_indices_ld, kv_num_blocks_ld,
@@ -459,7 +511,7 @@
                 kv_offset_ld += offset
                 accum_cnt_ld += 1
 
-            # Load K/V for full blocks
+            # Load {{ "V" if load_v else "K" }} for full blocks
             if HAS_FULL_BLOCKS:
                 fkv_indices_ld = FULL_KV_IDX + sparse_kv_idx_offset
                 fkv_start_ld = tl.load(fkv_indices_ld) * SPARSE_KV_BLOCK_SIZE
@@ -470,14 +522,15 @@
                 for _sn in range(0, fblock_n_end_ld):
                     buf = accum_cnt_ld % NUM_KV_BUFFERS
                     kv_base = fkv_start_ld + kv_offset_ld
-
-                    tlx.barrier_wait(k_empties[buf], (accum_cnt_ld // NUM_KV_BUFFERS) & 1 ^ 1)
-                    tlx.barrier_expect_bytes(k_fulls[buf], dtype_bytes * BLOCK_N * QK_HEAD_DIM_ROUNDED)
-                    tlx.async_descriptor_load(desc_k, k_tiles[buf], [kv_base, 0], k_fulls[buf])
-
+{%- if load_v %}
                     tlx.barrier_wait(v_empties[buf], (accum_cnt_ld // NUM_KV_BUFFERS) & 1 ^ 1)
                     tlx.barrier_expect_bytes(v_fulls[buf], dtype_bytes * BLOCK_N * V_HEAD_DIM_ROUNDED)
                     tlx.async_descriptor_load(desc_v, v_tiles[buf], [kv_base, 0], v_fulls[buf])
+{%- else %}
+                    tlx.barrier_wait(k_empties[buf], (accum_cnt_ld // NUM_KV_BUFFERS) & 1 ^ 1)
+                    tlx.barrier_expect_bytes(k_fulls[buf], dtype_bytes * BLOCK_N * QK_HEAD_DIM_ROUNDED)
+                    tlx.async_descriptor_load(desc_k, k_tiles[buf], [kv_base, 0], k_fulls[buf])
+{%- endif %}
 
                     offset = get_offset_for_next_block(
                         _sn, fkv_indices_ld, fkv_num_blocks_ld,
@@ -485,3 +538,4 @@
                     )
                     kv_offset_ld += offset
                     accum_cnt_ld += 1
+{%- endfor %}

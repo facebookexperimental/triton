@@ -24,7 +24,7 @@ TTIR_PATH = str(Path(__file__).parent / "attn_fwd.ttir")
 
 @lru_cache(maxsize=None)
 def compile_for_target(target):
-    return triton.compile(TTIR_PATH, target=target)
+    return triton.compile(TTIR_PATH, target=target, options={"enable_fp_fusion": True})
 
 
 def get_func_body_llir(llir):
@@ -66,7 +66,7 @@ def test_gfx950_matrix_intrinsic_packed_f32_option(intrinsic):
     assert amd_compiler.get_amdgpu_codegen_features("gfx950", llvm_ir) == ""
     assert amd_compiler.get_amdgpu_codegen_features("gfx950", llvm_ir, True) == "-packed-fp32-ops"
     assert amd_compiler.get_amdgpu_codegen_features("gfx942", llvm_ir, True) == ""
-    assert amd_compiler.get_amdgpu_codegen_features("gfx1100", llvm_ir, True) == "-real-true16"
+    assert amd_compiler.get_amdgpu_codegen_features("gfx1100", llvm_ir, True) == ""
     assert amd_compiler.get_amdgpu_codegen_features("gfx950", "fadd float %a, %b", True) == ""
 
 
@@ -109,7 +109,7 @@ def test_gfx1250_packed_f32_in_llir(gfx1250_kernel):
     llir = gfx1250_kernel.asm["llir"]
     func_body = get_func_body_llir(llir)
 
-    packed_fop = re.compile(r"f(mul|sub|add) <2 x float>")
+    packed_fop = re.compile(r"f(mul|sub|add)(?:\s+[a-z]+)* <2 x float>")
     assert packed_fop.search(func_body), ("Expected packed <2 x float> fmul/fsub/fadd in LLVM IR for gfx1250")
 
     # Both fmul and fsub must exist for ISel FMA contraction

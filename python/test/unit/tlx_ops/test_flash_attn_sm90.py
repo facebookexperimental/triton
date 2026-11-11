@@ -256,6 +256,19 @@ def test_flash_attn_non_persistent_dispatch_policy(N_CTX, HEAD_DIM, requires_gra
     assert _should_use_non_persistent(q, k, v, None) is expected
 
 
+def test_flash_attn_releases_outputs():
+    from triton.tlx.ops import flash_attn
+
+    q, k, v = _qkv(2, 2, 256, 128, torch.bfloat16)
+    flash_attn(q, k, v)
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    for _ in range(5):
+        flash_attn(q, k, v)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == baseline
+
+
 def test_flash_attn_rejects_d32():
     from triton.tlx.ops import InvalidInput, flash_attn
 

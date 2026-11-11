@@ -24,7 +24,7 @@ Do not remove `tlx.fence("async_shared")` merely because a nearby kernel omits i
 
 For multiple output buffers, issue independent stores first and then wait in an order consistent with the permitted outstanding-store count and buffer reuse order. Avoid converting a pipelined output path into an unbounded queue or releasing all buffers after only one store completes.
 
-For write-once output tiles, `eviction_policy="evict_first"` may reduce cache pollution. Treat it as an evidence-driven hint, not a correctness mechanism, and verify performance across protected paths.
+For write-once output tiles, `eviction_policy="evict_first"` may reduce cache pollution, but it can also lower throughput when the default policy was already serving later reads (see `memory-bound-and-autotune-selection.md`). Treat it as an evidence-driven hint, not a correctness mechanism, and verify performance across protected paths.
 
 ## Validate Failure-Prone Cases
 

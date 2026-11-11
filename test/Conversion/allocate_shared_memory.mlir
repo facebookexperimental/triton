@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory | FileCheck %s
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file --allocate-shared-memory | FileCheck %s --check-prefix=NPOT
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [2, 2], order = [1, 0]}>
 
@@ -10,10 +11,47 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 // TODO(jeff): Optimize the lowering to reduce shared memory usage.
 tt.func @gather_op(%arg0: tensor<1024x256xi32, #blocked>, %arg1: tensor<128x256xf32, #blocked>) {
   // CHECK-NEXT: allocation.offset = 0 : i32
+  // CHECK-SAME: allocation.size = 131072 : i32
   %0 = tt.gather %arg1[%arg0] {axis = 0 : i32} : (tensor<128x256xf32, #blocked>, tensor<1024x256xi32, #blocked>) -> tensor<1024x256xf32, #blocked>
   tt.return
 }
+}
 
+// -----
+
+#nested_src = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#nested_dst_parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#nested_dst = #ttg.slice<{dim = 1, parent = #nested_dst_parent}>
+#nested_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#nested_smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @nested_scratch_leaf
+  tt.func private @nested_scratch_leaf(%value: tensor<128xi32, #nested_src>) {
+    // CHECK: ttg.convert_layout {{.*}}allocation.offset = 0 : i32, allocation.size = 512 : i32
+    %converted = ttg.convert_layout %value
+        : tensor<128xi32, #nested_src> -> tensor<128xi32, #nested_dst>
+    tt.return
+  }
+
+  // CHECK-LABEL: @nested_scratch_middle
+  tt.func private @nested_scratch_middle(%value: tensor<128xi32, #nested_src>) {
+    // CHECK: tt.call @nested_scratch_leaf{{.*}}allocation.offset = 0 : i32, allocation.size = 512 : i32
+    tt.call @nested_scratch_leaf(%value) : (tensor<128xi32, #nested_src>) -> ()
+    tt.return
+  }
+
+  // CHECK-LABEL: @nested_scratch_caller
+  tt.func public @nested_scratch_caller(%value: tensor<128xi32, #nested_src>) {
+    // CHECK: %[[LIVE_BUFFER:.*]] = ttg.local_alloc {allocation.offset = 0 : i32}
+    %live = ttg.local_alloc : () -> !ttg.memdesc<128xi32, #nested_shared, #nested_smem, mutable>
+    // CHECK: tt.call @nested_scratch_middle{{.*}}allocation.offset = 512 : i32, allocation.size = 512 : i32
+    tt.call @nested_scratch_middle(%value) : (tensor<128xi32, #nested_src>) -> ()
+    %preserved = ttg.local_load %live
+        : !ttg.memdesc<128xi32, #nested_shared, #nested_smem, mutable>
+        -> tensor<128xi32, #nested_src>
+    tt.return
+  }
 }
 
 // -----
@@ -80,7 +118,7 @@ tt.func @local_atomic_scratch_size(
   // CHECK: %[[ATOMIC_DST:.*]] = ttg.local_alloc {allocation.offset = 0 : i32}
   %dst = ttg.local_alloc
       : () -> !ttg.memdesc<1xi32, #atomic_shared, #atomic_smem, mutable>
-  // CHECK: ttg.local_atomic_scatter_rmw {{.*}} {allocation.offset = 128 : i32, axis = 0 : i32}
+  // CHECK: ttg.local_atomic_scatter_rmw {{.*}} {allocation.offset = 128 : i32, allocation.size = 4 : i32, axis = 0 : i32}
   %old = ttg.local_atomic_scatter_rmw add, %dst[%indices], %values {axis = 0 : i32}
       : (!ttg.memdesc<1xi32, #atomic_shared, #atomic_smem, mutable>,
          tensor<1xi32, #atomic_blocked>, tensor<1xi32, #atomic_blocked>)
@@ -107,7 +145,7 @@ tt.func private @scratch_callee() attributes {noinline = true} {
 
 // CHECK-LABEL: @virtual_call_frame_has_no_size
 tt.func @virtual_call_frame_has_no_size() {
-  // CHECK: tt.call @scratch_callee() {allocation.offset = 0 : i32}
+  // CHECK: tt.call @scratch_callee() {allocation.offset = 0 : i32, allocation.size = 4 : i32}
   tt.call @scratch_callee() : () -> ()
   tt.return
 }
@@ -123,7 +161,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 // CHECK-LABEL: @reduce_scratch_size
 tt.func @reduce_scratch_size(%arg0: tensor<1x256xf32, #reduce>) {
   // CHECK: "tt.reduce"
-  // CHECK: }) {allocation.offset = 0 : i32}
+  // CHECK: }) {allocation.offset = 0 : i32, allocation.size = 16 : i32}
   %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
   ^bb0(%lhs: f32, %rhs: f32):
     %sum = arith.addf %lhs, %rhs : f32
@@ -144,9 +182,41 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // CHECK-LABEL: @convert_layout_scratch_size
 tt.func @convert_layout_scratch_size(%arg0: tensor<128xi32, #src>) {
-  // CHECK: ttg.convert_layout {{.*}} {allocation.offset = 0 : i32}
+  // CHECK: ttg.convert_layout {{.*}} {allocation.offset = 0 : i32, allocation.size = 512 : i32}
   %0 = ttg.convert_layout %arg0 : tensor<128xi32, #src> -> tensor<128xi32, #dst>
   tt.return
 }
 
+}
+
+// -----
+
+#npot_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#npot_smem = #ttg.shared_memory
+
+// CHECK-LABEL: module @npot_swizzled_alloc
+// CHECK-SAME: ttg.shared = 12288 : i32
+// NPOT-LABEL: module @npot_swizzled_alloc
+// NPOT-SAME: ttg.shared = 12288 : i32
+module @npot_swizzled_alloc attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+tt.func @npot_swizzled_alloc() {
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<96x64xf16, #npot_shared, #npot_smem, mutable>
+  tt.return
+}
+}
+
+// -----
+
+#pow2_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#pow2_smem = #ttg.shared_memory
+
+// CHECK-LABEL: module @pow2_swizzled_alloc
+// CHECK-SAME: ttg.shared = 16384 : i32
+// NPOT-LABEL: module @pow2_swizzled_alloc
+// NPOT-SAME: ttg.shared = 16384 : i32
+module @pow2_swizzled_alloc attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+tt.func @pow2_swizzled_alloc() {
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #pow2_shared, #pow2_smem, mutable>
+  tt.return
+}
 }
