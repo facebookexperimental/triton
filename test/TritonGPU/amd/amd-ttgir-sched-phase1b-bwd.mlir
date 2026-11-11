@@ -1,4 +1,4 @@
-// RUN: TRITON_ENABLE_TTGIR_SCHED=1 triton-opt %s -split-input-file \
+// RUN: env TRITON_ENABLE_TTGIR_SCHED=1 triton-opt %s -split-input-file \
 // RUN:   -tritonamdgpu-dot-decompose-and-schedule 2>&1 | FileCheck %s
 //
 // Phase 1b of the TTGIR-level SCHED pass: backward walker reports how many
