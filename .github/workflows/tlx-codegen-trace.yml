@@ -1,0 +1,174 @@
+name: TLX codegen trace
+# CPU-only codegen gate for bundle (reactor) PRs: compiles a fixed kernel
+# corpus with the base wheel and the head wheel, diffs PTX features +
+# instruction mix + ptxas stats (regs/smem/spills), and posts the verdict as
+# a PR comment. Advisory only -- posts, never blocks. Deterministic, no GPU.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to bench (defaults to the selected workflow ref)
+        type: string
+        required: false
+        default: ''
+      pr:
+        description: PR number to comment on (blank = no comment)
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codegen-trace-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'reactor/sync-train/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      head: ${{ steps.pick.outputs.head }}
+      base: ${{ steps.pick.outputs.base }}
+      pr: ${{ steps.pick.outputs.pr }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Pick head, base, and PR
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_PR: ${{ inputs.pr }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            HEAD="${HEAD_SHA}"; BASE="${BASE_SHA}"; PR="${PR_NUMBER}"
+          elif [[ -n "${INPUT_PR}" ]]; then
+            HEAD=$(gh pr view "${INPUT_PR}" --json headRefOid --jq .headRefOid)
+            BASE=$(gh pr view "${INPUT_PR}" --json baseRefOid --jq .baseRefOid)
+            PR="${INPUT_PR}"
+          else
+            HEAD=$(git rev-parse "${INPUT_REF:-HEAD}")
+            BASE=$(git merge-base "${HEAD}" origin/main)
+            PR=""
+          fi
+          [[ "${HEAD}" =~ ^[0-9a-f]{40}$ ]] || { echo "bad head: ${HEAD}"; exit 1; }
+          [[ "${BASE}" =~ ^[0-9a-f]{40}$ ]] || { echo "bad base: ${BASE}"; exit 1; }
+          {
+            echo "head=${HEAD}"
+            echo "base=${BASE}"
+            echo "pr=${PR}"
+          } >> "$GITHUB_OUTPUT"
+
+  build-head:
+    needs: resolve
+    if: needs.resolve.outputs.head != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.resolve.outputs.head }}
+
+  build-base:
+    needs: resolve
+    if: needs.resolve.outputs.head != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.resolve.outputs.base }}
+
+  snapshot:
+    needs: [resolve, build-head, build-base]
+    if: needs.resolve.outputs.head != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - side: head
+          - side: base
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout CI actions
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .ci
+          sparse-checkout: .github/actions
+      - name: Create venv
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/venv"
+          echo "${RUNNER_TEMP}/venv/bin" >> "$GITHUB_PATH"
+      - name: Install prebuilt Triton (${{ matrix.side }})
+        uses: ./.ci/.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_url || needs.build-base.outputs.wheel_url }}
+          wheel-filename: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_filename || needs.build-base.outputs.wheel_filename }}
+          wheel-sha256: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_sha256 || needs.build-base.outputs.wheel_sha256 }}
+      - name: Snapshot corpus
+        run: |
+          python3 .github/scripts/tlx_codegen_snapshot.py snapshot \
+            --out "snap-${{ matrix.side }}.json"
+      - name: Upload snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegen-snap-${{ matrix.side }}-${{ github.run_id }}
+          path: snap-${{ matrix.side }}.json
+          retention-days: 90
+
+  diff:
+    needs: [resolve, snapshot]
+    if: always() && needs.resolve.outputs.head != '' && needs.snapshot.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: codegen-snap-*-${{ github.run_id }}
+          path: snaps
+          merge-multiple: true
+      - name: Diff snapshots
+        env:
+          HEAD_SHA: ${{ needs.resolve.outputs.head }}
+          BASE_SHA: ${{ needs.resolve.outputs.base }}
+          SNAPSHOT_RESULT: ${{ needs.snapshot.result }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f snaps/snap-head.json || ! -f snaps/snap-base.json ]]; then
+            printf '## TLX codegen trace (advisory)\n\nMissing snapshots (snapshot job %s) — no signal.\n' \
+              "${SNAPSHOT_RESULT}" > verdict.md
+            exit 0
+          fi
+          python3 .github/scripts/tlx_codegen_snapshot.py diff \
+            --base snaps/snap-base.json --head snaps/snap-head.json \
+            --base-sha "${BASE_SHA}" --head-sha "${HEAD_SHA}" --out verdict.md
+      - name: Comment on PR
+        if: needs.resolve.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.resolve.outputs.pr }}
+        run: gh pr comment "${PR}" --body-file verdict.md
