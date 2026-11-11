@@ -3171,3 +3171,52 @@ module attributes {triton.skip_generic_pipeline, tlx.has_warp_spec_ops = true, "
     tt.return
   }
 }
+
+// -----
+
+// autoWS marks a release whose buffer is refilled by TMA so that
+// ProxyFenceInsertion fences it later; promotion must keep the mark.
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 16, rank = 1}>
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 6 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @keep_fence_request_on_promoted_release(%n: i32, %desc: !tt.tensordesc<128xbf16, #shared>) {
+    %bar = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %buf = ttg.local_alloc {allocation.offset = 256 : i32} : () -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %full = ttg.local_alloc {allocation.offset = 64 : i32} : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttng.init_barrier %full, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttg.warp_specialize(%bar, %n, %buf, %desc, %full) attributes {allocation.offset = 512 : i32, warpGroupStartIds = array<i32: 4, 5>}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%arg0: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %end: i32, %b: !ttg.memdesc<128xbf16, #shared, #smem, mutable>, %d: !tt.tensordesc<128xbf16, #shared>, %f: !ttg.memdesc<1xi64, #barrier, #smem, mutable>) num_warps(1) {
+      %c0 = arith.constant 0 : i32
+      %c1 = arith.constant 1 : i32
+      scf.for %i = %c0 to %end step %c1 : i32 {
+        %ph = arith.andi %i, %c1 : i32
+        ttng.wait_barrier %f, %ph : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+        %v = ttg.local_load %b : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+        // CHECK: ttg.local_load
+        // CHECK: ttng.arrive_barrier_named {{.*}}ttng.fence_generic_reads
+        ttng.arrive_barrier %arg0, 1 {ttng.fence_generic_reads} : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+      }
+      ttg.warp_return
+    }
+    partition1(%arg0: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %end: i32, %b: !ttg.memdesc<128xbf16, #shared, #smem, mutable>, %d: !tt.tensordesc<128xbf16, #shared>, %f: !ttg.memdesc<1xi64, #barrier, #smem, mutable>) num_warps(1) {
+      %c0 = arith.constant 0 : i32
+      %c1 = arith.constant 1 : i32
+      %true = arith.constant true
+      scf.for %i = %c0 to %end step %c1 : i32 {
+        %offset = arith.subi %i, %c0 : i32
+        %iteration = arith.divui %offset, %c1 : i32
+        %phase = arith.andi %iteration, %c1 : i32
+        ttng.wait_barrier %arg0, %phase : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+        ttng.async_tma_copy_global_to_local %d[%c0] %b, %f, %true : !tt.tensordesc<128xbf16, #shared>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+      }
+      ttg.warp_return
+    } : (!ttg.memdesc<1xi64, #barrier, #smem, mutable>, i32, !ttg.memdesc<128xbf16, #shared, #smem, mutable>, !tt.tensordesc<128xbf16, #shared>, !ttg.memdesc<1xi64, #barrier, #smem, mutable>) -> ()
+    tt.return
+  }
+}
