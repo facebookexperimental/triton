@@ -402,9 +402,12 @@ class OpCategorizer {
 public:
   OpCategorizer(LoopLikeOpInterface mainLoop, ArrayRef<Operation *> mmaOps)
       : mainLoop(mainLoop), mmas(mmaOps.begin(), mmaOps.end()) {
-    // Collect all loops (nested + main)
-    for (auto nestedLoop : getLoopBodyBlock(mainLoop)->getOps<scf::ForOp>())
-      loops.push_back(cast<LoopLikeOpInterface>(nestedLoop.getOperation()));
+    // Keep the same nearest-loop traversal used by getInitialSchedule so
+    // collective control flow does not hide an immediately nested loop.
+    getLoopBodyRegion(mainLoop).walk([&](scf::ForOp nestedLoop) {
+      if (getEnclosingSupportedLoop(nestedLoop) == mainLoop)
+        loops.push_back(cast<LoopLikeOpInterface>(nestedLoop.getOperation()));
+    });
     loops.push_back(mainLoop);
   }
 
@@ -422,7 +425,8 @@ public:
   /// Get operations in a specific category.
   SmallVector<CategorizedOp> getOpsInCategory(OpCategory cat) const {
     SmallVector<CategorizedOp> result;
-    for (auto &[op, catOp] : opCategories) {
+    for (Operation *op : opCategoryOrder) {
+      const CategorizedOp &catOp = opCategories.at(op);
       if (catOp.category == cat)
         result.push_back(catOp);
     }
@@ -484,7 +488,8 @@ public:
 
     for (OpCategory cat : categoryOrder) {
       SmallVector<const CategorizedOp *> ops;
-      for (auto &[op, catOp] : opCategories) {
+      for (Operation *op : opCategoryOrder) {
+        const CategorizedOp &catOp = opCategories.at(op);
         if (catOp.category == cat)
           ops.push_back(&catOp);
       }
@@ -509,7 +514,12 @@ private:
 
     SmallVector<Operation *> loopMmas;
     for (auto mmaOp : mmas) {
-      if (mmaOp->getParentOp() == innermostLoop.getOperation())
+      // Collective control flow, such as a per-tile bounds guard, does not
+      // introduce a new scheduling scope.  Select MMAs by their nearest
+      // enclosing loop so MMAs nested in an scf.if still participate in the
+      // enclosing loop's data partitioning, while MMAs in a nested loop do
+      // not.
+      if (getEnclosingSupportedLoop(mmaOp) == innermostLoop)
         loopMmas.push_back(mmaOp);
     }
 
@@ -952,6 +962,8 @@ private:
       if (it != opToDpId.end() && it->second != SHARED_DPID)
         dataPartitionId = it->second;
     }
+    if (!opCategories.contains(op))
+      opCategoryOrder.insert(op);
     opCategories[op] = CategorizedOp{op, cat, dataPartitionId, parentMMA};
   }
 
@@ -959,6 +971,7 @@ private:
   SmallVector<LoopLikeOpInterface> loops;
   SmallVector<Operation *> mmas;
   DenseMap<Operation *, CategorizedOp> opCategories;
+  SetVector<Operation *> opCategoryOrder;
   DenseMap<Operation *, SetVector<Operation *>> mmaToSlice;
   DenseSet<Operation *> sharedOps;
   DenseMap<Operation *, unsigned> opToDpId;
@@ -1295,11 +1308,12 @@ schedulePostLoopOps(LoopLikeOpInterface loop, PartitionSet &schedule,
 
   SmallVector<OpOperand *> uses;
   // For persistent kernels, seed from nested inner loop results.
-  for (auto &op : *getLoopBodyBlock(loop))
-    if (auto innerLoop = dyn_cast<scf::ForOp>(op))
+  getLoopBodyRegion(loop).walk([&](scf::ForOp innerLoop) {
+    if (getEnclosingSupportedLoop(innerLoop) == loop)
       for (OpResult result : innerLoop.getResults())
         for (OpOperand &use : result.getUses())
           uses.push_back(&use);
+  });
   for (OpResult result : loop->getResults())
     for (OpOperand &use : result.getUses())
       uses.push_back(&use);
@@ -1397,16 +1411,21 @@ preScheduleDpOps(SmallVector<CategorizedOp> &dpOps,
 static std::optional<ScheduleResult>
 getInitialSchedule(LoopLikeOpInterface mainLoop,
                    const SchedulingOptions &schedOpts) {
-  // Check for an existing schedule.
-  if (FailureOr<PartitionSet> scheduleOr = PartitionSet::fromLoop(mainLoop);
-      succeeded(scheduleOr))
-    // Deserialized schedule: layout/options unknown, use defaults.
-    return ScheduleResult{std::move(*scheduleOr),
-                          PartitionLayout{},
-                          schedOpts,
-                          DenseMap<Operation *, unsigned>(),
-                          DenseMap<unsigned, Partition *>(),
-                          /*createComputePartitions=*/true};
+  // A bare tt.warp_specialize marks a request for PSM to create a schedule;
+  // only stages + tag identify an already serialized schedule. Do not call
+  // fromLoop (and its strict verifier) on the expected unpartitioned input IR.
+  if (mainLoop->hasAttr(kPartitionStagesAttrName) &&
+      mainLoop->hasAttr(kWarpSpecializeTagAttrName)) {
+    if (FailureOr<PartitionSet> scheduleOr = PartitionSet::fromLoop(mainLoop);
+        succeeded(scheduleOr))
+      // Deserialized schedule: layout/options unknown, use defaults.
+      return ScheduleResult{std::move(*scheduleOr),
+                            PartitionLayout{},
+                            schedOpts,
+                            DenseMap<Operation *, unsigned>(),
+                            DenseMap<unsigned, Partition *>(),
+                            /*createComputePartitions=*/true};
+  }
 
   // Modulo path is authoritative for partitioning. If the loop was modulo-
   // scheduled (carries tt.modulo_ii) but fromLoop() above found no honorable
@@ -1422,10 +1441,15 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
     return std::nullopt;
   }
 
-  // Collect all loops (nested + main)
+  // Collect loops immediately nested in the main scheduling scope, including
+  // loops wrapped in collective control flow such as a per-tile bounds guard.
+  // Use nearest-loop ownership so loops nested in another loop are still
+  // handled only by that loop's schedule.
   SmallVector<LoopLikeOpInterface> loops;
-  for (scf::ForOp nestedLoop : getLoopBodyBlock(mainLoop)->getOps<scf::ForOp>())
-    loops.push_back(cast<LoopLikeOpInterface>(nestedLoop.getOperation()));
+  getLoopBodyRegion(mainLoop).walk([&](scf::ForOp nestedLoop) {
+    if (getEnclosingSupportedLoop(nestedLoop) == mainLoop)
+      loops.push_back(cast<LoopLikeOpInterface>(nestedLoop.getOperation()));
+  });
   loops.push_back(mainLoop);
 
   // Collect all MMAs
@@ -2218,6 +2242,19 @@ static bool isScalarOp(Operation *op) {
   });
 }
 
+// A primitive scalar value can be cloned into multiple async tasks without a
+// communication buffer.  Keep this deliberately narrower than isScalarOp:
+// descriptor, token, and other opaque results are not ranked tensors either,
+// but duplicating their task ownership changes synchronization semantics.
+static bool isRematerializablePrimitiveScalarOp(Operation *op) {
+  if (op->getNumResults() == 0 || op->getNumRegions() != 0)
+    return false;
+  return llvm::all_of(op->getResults(), [](Value value) {
+    Type type = value.getType();
+    return type.isIntOrIndexOrFloat() || isa<triton::PointerType>(type);
+  });
+}
+
 void propagatePartitions(LoopLikeOpInterface loop, PartitionSet &schedule,
                          bool createComputePartitions,
                          Partition *defaultPartition) {
@@ -2502,7 +2539,9 @@ static bool isRematerializableForClone(Operation *defOp) {
 /// them through a cross-partition memory channel.
 ///
 /// Cloneable: MemDescTransOp (metadata-only SMEM-layout reinterpretation),
-/// ConvertLayoutOp, BroadcastOp, ExpandDimsOp (cheap element rearrangement).
+/// cheap integer index arithmetic, and ConvertLayoutOp/BroadcastOp/
+/// ExpandDimsOp/MakeRangeOp/SplatOp (cheap element rearrangement or index
+/// construction).
 /// LocalAllocOp is NOT cloned: a shared SMEM buffer (e.g. K/V in FA) is one
 /// producer feeding N consumer partitions, so cloning would duplicate the
 /// buffer. separateLocalAllocWithSrc instead tags the local_store with the
@@ -2552,7 +2591,14 @@ void optimizeSchedule(LoopLikeOpInterface loop, PartitionSet &schedule) {
           continue;
         Operation *pullClone = OpBuilder(defOp).clone(*defOp);
         setPartition(pullClone, userPartition);
-        current->setOperand(idx, pullClone->getResult(0));
+        // Rewire to the SAME result the operand referred to. Every op accepted
+        // by isRematerializableForClone is single-result today, but keying off
+        // the original result number keeps this correct if a multi-result op
+        // is ever added to the cloneable set instead of silently substituting
+        // result 0.
+        current->setOperand(
+            idx,
+            pullClone->getResult(cast<OpResult>(operand).getResultNumber()));
         worklist.push_back(pullClone);
       }
     }
@@ -2562,8 +2608,7 @@ void optimizeSchedule(LoopLikeOpInterface loop, PartitionSet &schedule) {
   // operands.
   getLoopBodyRegion(loop).walk<WalkOrder::PostOrder, ReverseIterator>(
       [&](Operation *op) {
-        if (!isa<MemDescTransOp, ConvertLayoutOp, BroadcastOp, ExpandDimsOp>(
-                op))
+        if (!isa<MemDescTransOp>(op) && !isRematerializableForClone(op))
           return;
 
         Partition *partition = getPartition(op);
@@ -2942,6 +2987,130 @@ void PartitionSchedulingMeta::runOnOperation() {
         }
       }
 
+      // A predicated TMEM read-modify-write becomes an scf.if only after code
+      // specialization. Until then, keep its predicate chain in the same
+      // partition as the store: code partitioning does not materialize scalar
+      // channels. Also pull tensor elementwise ops feeding the scalar chain
+      // into the store partition. The op may have any number of users, as long
+      // as every one of them is already in the store's partition -- otherwise
+      // moving it would drag a value across a partition boundary. FA forward
+      // uses this to compute `alpha < 1` beside the alpha channel load instead
+      // of creating a second tensor channel for the predicate. Its tensor
+      // operands remain ordinary channel boundaries.
+      getLoopBodyRegion(loop).walk([&](ttng::TMEMStoreOp store) {
+        if (!store.getPred().getType().isInteger(1))
+          return;
+        if (store.getPred().getDefiningOp<arith::ConstantOp>())
+          return;
+        SetVector<int> storeIds = safeGetPartitionIds(store);
+        if (storeIds.size() != 1)
+          return;
+        SmallVector<Operation *> worklist;
+        if (Operation *def = store.getPred().getDefiningOp())
+          worklist.push_back(def);
+        DenseSet<Operation *> seen;
+        while (!worklist.empty()) {
+          Operation *op = worklist.pop_back_val();
+          if (!seen.insert(op).second ||
+              op->getParentRegion() != store->getParentRegion())
+            continue;
+          bool hasTensorResult =
+              llvm::any_of(op->getResults(), [](Value result) {
+                return isa<RankedTensorType>(result.getType());
+              });
+          if (hasTensorResult) {
+            if (!op->hasTrait<OpTrait::Elementwise>() ||
+                llvm::any_of(op->getUsers(), [&](Operation *user) {
+                  return safeGetPartitionIds(user) != storeIds;
+                }))
+              continue;
+          }
+          op->walk([&](Operation *nested) { setPartition(nested, storeIds); });
+          for (Value operand : op->getOperands()) {
+            if (hasTensorResult && isa<RankedTensorType>(operand.getType()))
+              continue;
+            if (Operation *def = operand.getDefiningOp())
+              worklist.push_back(def);
+          }
+        }
+      });
+
+      // Scalar values are rematerializable and must not become cross-partition
+      // channels: WS buffer allocation only materializes ranked tensor values.
+      // This matters for persistent jagged kernels where a scalar seq-offset
+      // load is initially anchored in the load partition but its length/offset
+      // users span reduction, GEMM, load, and computation tasks. Expand scalar
+      // producers to the union of their users' partitions so specialization
+      // clones the scalar chain into each consuming task.
+      bool scalarPartitionsChanged = true;
+      while (scalarPartitionsChanged) {
+        scalarPartitionsChanged = false;
+        getLoopBodyRegion(loop).walk([&](Operation *op) {
+          if (!isRematerializablePrimitiveScalarOp(op))
+            return;
+          SetVector<int> unionIds;
+          SetVector<int> currentIds = safeGetPartitionIds(op);
+          unionIds.insert(currentIds.begin(), currentIds.end());
+          for (Operation *user : op->getUsers()) {
+            SetVector<int> userIds = safeGetPartitionIds(user);
+            unionIds.insert(userIds.begin(), userIds.end());
+          }
+          if (unionIds.empty() || unionIds.size() == currentIds.size())
+            return;
+          setPartition(op, unionIds);
+          scalarPartitionsChanged = true;
+        });
+      }
+
+      auto idsToStr = [](const SetVector<int> &ids) {
+        std::string s;
+        llvm::raw_string_ostream os(s);
+        llvm::interleaveComma(ids, os);
+        return os.str();
+      };
+
+      // Backstop: the closure above must leave every scalar producer owning at
+      // least the partitions of all its consumers, i.e. no scalar value is a
+      // cross-partition channel. Buffer allocation only materializes ranked
+      // tensor channels, so a surviving scalar edge either crashes channel
+      // creation or silently drops the value in the consuming task. The
+      // closure runs to a fixpoint immediately above, so this can only fire if
+      // it stops converging or a later phase re-partitions scalars — make that
+      // a hard compile error here (checkable by any lit test that runs the
+      // pass) instead of an unattributable failure much further downstream.
+      WalkResult scalarVr =
+          getLoopBodyRegion(loop).walk([&](Operation *op) -> WalkResult {
+            if (!isRematerializablePrimitiveScalarOp(op))
+              return WalkResult::advance();
+            SetVector<int> defIds = safeGetPartitionIds(op);
+            if (defIds.empty())
+              return WalkResult::advance();
+            for (Operation *user : op->getUsers()) {
+              SetVector<int> userIds = safeGetPartitionIds(user);
+              for (int id : userIds) {
+                if (defIds.contains(id))
+                  continue;
+                InFlightDiagnostic diag =
+                    op->emitError()
+                    << "warp specialization left a scalar value crossing a "
+                       "partition boundary: this op owns partitions {"
+                    << idsToStr(defIds) << "} but a consumer runs in partition "
+                    << id
+                    << ". Scalars are rematerialized per task, not routed "
+                       "through a channel, so the scalar closure must expand "
+                       "the producer to the union of its consumers' "
+                       "partitions.";
+                diag.attachNote(user->getLoc())
+                    << "consumed here, in partitions {" << idsToStr(userIds)
+                    << "}";
+                return WalkResult::interrupt();
+              }
+            }
+            return WalkResult::advance();
+          });
+      if (scalarVr.wasInterrupted())
+        return signalPassFailure();
+
       // Backstop: verify no two accumulator-chained MMAs were assigned to
       // partitions that cannot be co-located. The data-partition grouping
       // (Layer 1) should keep them together, but any other assignment path
@@ -2960,12 +3129,6 @@ void PartitionSchedulingMeta::runOnOperation() {
       // moment it empties. Store the first writer to point the diagnostic at
       // it.
       DenseMap<Operation *, std::pair<Operation *, SetVector<int>>> accOwner;
-      auto idsToStr = [](const SetVector<int> &ids) {
-        std::string s;
-        llvm::raw_string_ostream os(s);
-        llvm::interleaveComma(ids, os);
-        return os.str();
-      };
       WalkResult vr = loop.walk([&](Operation *op) -> WalkResult {
         Operation *buf = getAccumulatorBuffer(op);
         if (!buf)

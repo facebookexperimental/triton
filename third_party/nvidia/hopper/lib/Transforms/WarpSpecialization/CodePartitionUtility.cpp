@@ -1021,12 +1021,8 @@ static bool tmemReuseGroupOverlaps(ReuseGroup *group) {
     auto *allocOp = ch->getAllocOp();
     if (!allocOp)
       return false;
-    auto memDescType = cast<ttg::MemDescType>(allocOp->getResult(0).getType());
-    int64_t numCols = ttng::getTmemAllocSizes(memDescType).numCols;
-    int64_t off = 0;
-    if (auto a = allocOp->getAttrOfType<IntegerAttr>("buffer.offset"))
-      off = a.getInt();
-    ranges.push_back({off, off + numCols});
+    auto [lo, hi] = getTmemColumnRange(allocOp);
+    ranges.push_back({lo, hi});
   }
   for (unsigned i = 0; i < ranges.size(); ++i)
     for (unsigned j = i + 1; j < ranges.size(); ++j)
@@ -1288,6 +1284,38 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
   return true;
 }
 
+int64_t getTmemBufferOffset(Operation *allocOp) {
+  assert(allocOp && "TMEM column queries require an allocation");
+  if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.offset"))
+    return attr.getInt();
+  return 0;
+}
+
+std::pair<int64_t, int64_t> getTmemColumnRange(Operation *allocOp) {
+  assert(allocOp && "TMEM column queries require an allocation");
+  auto memDescType = cast<ttg::MemDescType>(allocOp->getResult(0).getType());
+  int64_t offset = getTmemBufferOffset(allocOp);
+  int64_t numCols = ttng::getTmemAllocSizes(memDescType).numCols;
+  return {offset, offset + numCols};
+}
+
+std::pair<int64_t, int64_t> getTmemColumnRange(Channel *channel) {
+  assert(channel && "TMEM column queries require a channel");
+  Operation *allocOp = channel->getAllocOp();
+  assert(allocOp && "TMEM reuse channel must have an allocation");
+  return getTmemColumnRange(allocOp);
+}
+
+bool tmemColumnRangesOverlap(std::pair<int64_t, int64_t> rangeA,
+                             std::pair<int64_t, int64_t> rangeB) {
+  return rangeA.first < rangeB.second && rangeB.first < rangeA.second;
+}
+
+bool tmemColumnRangesOverlap(Operation *allocA, Operation *allocB) {
+  return tmemColumnRangesOverlap(getTmemColumnRange(allocA),
+                                 getTmemColumnRange(allocB));
+}
+
 bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh) {
   if (!ownerCh)
     return false;
@@ -1355,18 +1383,17 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   if (reuseGroupIdx < 0)
     return accumCnt;
   // op is a user of the channel. accumCnt is the corresponding argument of the
-  // parentForOp.
-  // Go through chList in the parentForOp, assume ch is directly in parentForOp.
-  // FIXME: handle the case where ch is inside in IfOp.
+  // enclosing control region. Order reuse members in the nearest control
+  // region so channels directly inside a collective IfOp are not collapsed to
+  // the IfOp entry in an enclosing loop's channel list.
   SmallVector<Operation *> chList;
-  // The enclosing loop holding the reuse-group channels can be an scf.for or,
-  // for a static persistent while-loop kernel, an scf.while (the channels live
-  // directly in the while's after region). Using getParentOfType<scf::ForOp>()
-  // alone would be null for the while case and crash getReuseChannels.
-  Operation *parentLoop = op->getParentOfType<scf::ForOp>();
-  if (!parentLoop)
-    parentLoop = op->getParentOfType<scf::WhileOp>();
-  getReuseChannels(config->getGroup(reuseGroupIdx), parentLoop, chList);
+  // The enclosing region holding the reuse-group channels can be an scf.for,
+  // scf.if, or scf.while.
+  Operation *parentRegion = op->getParentOp();
+  while (parentRegion &&
+         !isa<scf::ForOp, scf::IfOp, scf::WhileOp>(parentRegion))
+    parentRegion = parentRegion->getParentOp();
+  getReuseChannels(config->getGroup(reuseGroupIdx), parentRegion, chList);
   assert(chList.size() >= 1);
 
   // When multiple channels in the reuse group share the same getDstOp() but
