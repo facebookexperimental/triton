@@ -1056,9 +1056,9 @@ def heuristic_config(M, N, K):
     # Skinny-N: narrow column tiles keep masked columns low.
     if N <= 64:
         return [_config(128, 64, 32, 8, 4, 4)]
-    # Limit register pressure from unaligned-K loads with narrower tiles.
+    # Unaligned-K loads can spill even for large squares; keep their tiles narrow.
     if K % 16 != 0:
-        if M < 1024:
+        if M < 1024 or N >= 1024:
             return [_config(64, 128, 32, 8, 4, 4)]
         if N <= 128 and K > 512:
             return [_config(128, 64, 32, 8, 4, 4)]
