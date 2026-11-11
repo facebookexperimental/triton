@@ -12,7 +12,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: ttng.async_tma_reduce {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.async_tma_store_token_wait
 // CHECK-NOT: can_rotate_by_buffer_count
-// CHECK-SAME: {loop.cluster = 0 : i32, loop.stage = 1 : i32}
+// CHECK-SAME: loop.cluster = 0 : i32, loop.stage = 1 : i32
   tt.func public @single_buffer_reduce_token_k1(
       %desc: !tt.tensordesc<128x64xf16, #shared>,
       %src: tensor<128x64xf16>,
