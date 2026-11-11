@@ -221,3 +221,93 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
     tt.return %value : tensor<16x64xf16, #ptr>
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
+                   ttg.target = "hip:gfx950",
+                   "ttg.threads-per-warp" = 64 : i32} {
+  // A masked load whose pointer has contiguity 1 (one index per 256 elements,
+  // as in an Inductor gather) cannot be vectorized by any layout, so it keeps
+  // the wide layout of the related relaxed load instead of being clamped.
+  // CHECK: #[[$BCAST_WIDE:.*]] = #ttg.blocked<{sizePerThread = [4]
+  // CHECK-LABEL: @masked_broadcast_index_load_gfx950
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f16>, #[[$BCAST_WIDE]]>
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<i32>, #[[$BCAST_WIDE]]>
+  // CHECK: tt.store {{.*}} : tensor<1024x!tt.ptr<f16>, #[[$BCAST_WIDE]]>
+  tt.func @masked_broadcast_index_load_gfx950(
+      %input: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %index: !tt.ptr<i32> {tt.divisibility = 16 : i32},
+      %table: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %output: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %unaligned: i32,
+      %mask: tensor<1024xi1, #blocked>) {
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %offset = tt.splat %unaligned : i32 -> tensor<1024xi32, #blocked>
+    %inputIndices = arith.addi %range, %offset : tensor<1024xi32, #blocked>
+    %inputBases = tt.splat %input : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %inputPtrs = tt.addptr %inputBases, %inputIndices : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    %relaxed = tt.load %inputPtrs : tensor<1024x!tt.ptr<f16>, #blocked>
+    %c256 = arith.constant dense<256> : tensor<1024xi32, #blocked>
+    %row = arith.divsi %range, %c256 : tensor<1024xi32, #blocked>
+    %indexBases = tt.splat %index : !tt.ptr<i32> -> tensor<1024x!tt.ptr<i32>, #blocked>
+    %indexPtrs = tt.addptr %indexBases, %row : tensor<1024x!tt.ptr<i32>, #blocked>, tensor<1024xi32, #blocked>
+    %zero = arith.constant dense<0> : tensor<1024xi32, #blocked>
+    %idx = tt.load %indexPtrs, %mask, %zero : tensor<1024x!tt.ptr<i32>, #blocked>
+    %tableBases = tt.splat %table : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %tablePtrs = tt.addptr %tableBases, %idx : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    %gathered = tt.load %tablePtrs : tensor<1024x!tt.ptr<f16>, #blocked>
+    %sum = arith.addf %relaxed, %gathered : tensor<1024xf16, #blocked>
+    %outputBases = tt.splat %output : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %outputPtrs = tt.addptr %outputBases, %range : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    tt.store %outputPtrs, %sum : tensor<1024x!tt.ptr<f16>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
+                   ttg.target = "hip:gfx942:sramecc+:xnack-",
+                   "ttg.threads-per-warp" = 64 : i32} {
+  // A masked load whose pointer has contiguity 1 (one index per 256 elements,
+  // as in an Inductor gather) cannot be vectorized by any layout, so it keeps
+  // the wide layout of the related relaxed load instead of being clamped.
+  // CHECK: #[[$BCAST_942_WIDE:.*]] = #ttg.blocked<{sizePerThread = [4]
+  // CHECK-LABEL: @masked_broadcast_index_load_gfx942
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f16>, #[[$BCAST_942_WIDE]]>
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<i32>, #[[$BCAST_942_WIDE]]>
+  // CHECK: tt.store {{.*}} : tensor<1024x!tt.ptr<f16>, #[[$BCAST_942_WIDE]]>
+  tt.func @masked_broadcast_index_load_gfx942(
+      %input: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %index: !tt.ptr<i32> {tt.divisibility = 16 : i32},
+      %table: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %output: !tt.ptr<f16> {tt.divisibility = 16 : i32},
+      %unaligned: i32,
+      %mask: tensor<1024xi1, #blocked>) {
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %offset = tt.splat %unaligned : i32 -> tensor<1024xi32, #blocked>
+    %inputIndices = arith.addi %range, %offset : tensor<1024xi32, #blocked>
+    %inputBases = tt.splat %input : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %inputPtrs = tt.addptr %inputBases, %inputIndices : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    %relaxed = tt.load %inputPtrs : tensor<1024x!tt.ptr<f16>, #blocked>
+    %c256 = arith.constant dense<256> : tensor<1024xi32, #blocked>
+    %row = arith.divsi %range, %c256 : tensor<1024xi32, #blocked>
+    %indexBases = tt.splat %index : !tt.ptr<i32> -> tensor<1024x!tt.ptr<i32>, #blocked>
+    %indexPtrs = tt.addptr %indexBases, %row : tensor<1024x!tt.ptr<i32>, #blocked>, tensor<1024xi32, #blocked>
+    %zero = arith.constant dense<0> : tensor<1024xi32, #blocked>
+    %idx = tt.load %indexPtrs, %mask, %zero : tensor<1024x!tt.ptr<i32>, #blocked>
+    %tableBases = tt.splat %table : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %tablePtrs = tt.addptr %tableBases, %idx : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    %gathered = tt.load %tablePtrs : tensor<1024x!tt.ptr<f16>, #blocked>
+    %sum = arith.addf %relaxed, %gathered : tensor<1024xf16, #blocked>
+    %outputBases = tt.splat %output : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %outputPtrs = tt.addptr %outputBases, %range : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    tt.store %outputPtrs, %sum : tensor<1024x!tt.ptr<f16>, #blocked>
+    tt.return
+  }
+}
