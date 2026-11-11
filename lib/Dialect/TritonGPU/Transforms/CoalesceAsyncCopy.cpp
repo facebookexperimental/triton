@@ -1,5 +1,7 @@
 #include <algorithm>
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Analysis/AxisInfo.h"
@@ -201,6 +203,116 @@ struct CoalesceCheapAsyncCopyGlobalToLocal
   }
 };
 
+// Whether every program reads the same addresses through `ptr`: nothing that
+// computes it reads tt.get_program_id. Follows scf.for loop-carried values;
+// any other region result or block argument counts as varying.
+static bool isProgramInvariant(Value ptr) {
+  SmallVector<Value> worklist{ptr};
+  DenseSet<Value> seen;
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    if (auto arg = dyn_cast<BlockArgument>(v)) {
+      Operation *parent = arg.getOwner()->getParentOp();
+      if (isa<FunctionOpInterface>(parent))
+        continue;
+      auto forOp = dyn_cast<scf::ForOp>(parent);
+      if (!forOp)
+        return false;
+      if (arg == forOp.getInductionVar()) {
+        worklist.append(
+            {forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep()});
+        continue;
+      }
+      worklist.push_back(forOp.getTiedLoopInit(arg)->get());
+      worklist.push_back(forOp.getTiedLoopYieldedValue(arg)->get());
+      continue;
+    }
+    Operation *def = v.getDefiningOp();
+    if (isa<triton::GetProgramIdOp>(def))
+      return false;
+    if (auto forOp = dyn_cast<scf::ForOp>(def)) {
+      unsigned i = cast<OpResult>(v).getResultNumber();
+      worklist.push_back(forOp.getInitArgs()[i]);
+      worklist.push_back(forOp.getYieldedValues()[i]);
+      continue;
+    }
+    if (def->getNumRegions() != 0)
+      return false;
+    worklist.append(def->operand_begin(), def->operand_end());
+  }
+  return true;
+}
+
+// A mixed-radix load keeps the vector that adds no registers (Coalesce), but
+// its async copy predicates off duplicate threads, so it takes the wider
+// vector AxisInfo proves.
+struct WidenMixedRadixAsyncCopy
+    : public OpRewritePattern<AsyncCopyGlobalToLocalOp> {
+  ModuleAxisInfoAnalysis &axisInfoAnalysis;
+  DenseMap<AsyncCopyGlobalToLocalOp, Attribute> &widenedMap;
+  DenseSet<AsyncCopyGlobalToLocalOp> &keepL1;
+  WidenMixedRadixAsyncCopy(
+      ModuleAxisInfoAnalysis &axisInfoAnalysis,
+      DenseMap<AsyncCopyGlobalToLocalOp, Attribute> &widenedMap,
+      DenseSet<AsyncCopyGlobalToLocalOp> &keepL1, MLIRContext *context)
+      : OpRewritePattern(context), axisInfoAnalysis(axisInfoAnalysis),
+        widenedMap(widenedMap), keepL1(keepL1) {}
+
+  LogicalResult matchAndRewrite(AsyncCopyGlobalToLocalOp copyOp,
+                                PatternRewriter &rewriter) const override {
+    Attribute newEnc = widenedMap.lookup(copyOp);
+    if (!newEnc ||
+        newEnc ==
+            cast<RankedTensorType>(copyOp.getSrc().getType()).getEncoding())
+      return failure();
+    retargetCopyOperandsToEncoding(copyOp, newEnc, axisInfoAnalysis, rewriter);
+    // A copy under 16 bytes lowers to cp.async.ca (L1); at 16 bytes it lowers
+    // to .cg (L2 only). Programs sharing an SM hit L1 on a copy every program
+    // makes from the same addresses, so that copy keeps .ca.
+    auto policy =
+        dyn_cast_or_null<triton::CachePolicyAttr>(copyOp.getCachePolicyAttr());
+    if (keepL1.contains(copyOp) &&
+        (!copyOp.getCachePolicyAttr() ||
+         (policy && policy.getCacheModifier() == triton::CacheModifier::NONE)))
+      rewriter.modifyOpInPlace(copyOp, [&]() {
+        copyOp.setCachePolicyAttr(triton::CachePolicyAttr::get(
+            getContext(), triton::CacheModifier::CA,
+            policy ? policy.getEvictionPolicy()
+                   : triton::EvictionPolicy::NORMAL));
+      });
+    return success();
+  }
+};
+
+static FailureOr<LinearEncodingAttr>
+getWidenedMixedRadixEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                             AsyncCopyGlobalToLocalOp copyOp, int numWarps,
+                             int threadsPerWarp, bool &underSixteenBytes) {
+  auto type = dyn_cast<RankedTensorType>(copyOp.getSrc().getType());
+  if (!type || isRadix2Encoding(type.getEncoding()))
+    return failure();
+  MLIRContext *ctx = copyOp.getContext();
+  AxisInfo &info = *axisInfoAnalysis.getAxisInfo(copyOp.getSrc());
+  SmallVector<unsigned> order = getOrderFromContiguity(info.getContiguity());
+  unsigned vector = getMixedRadixVector(
+      ctx, type.getShape(),
+      getAxisInfoVector(info, type, type.getShape(), order[0],
+                        numWarps * threadsPerWarp),
+      order, numWarps, threadsPerWarp, /*predicated=*/true);
+  // A layout already as wide (e.g. a scale tile's TMEM store layout) stays.
+  unsigned contig = getContigPerThread(type)[order[0]];
+  if (vector <= contig)
+    return failure();
+  unsigned bits = cast<triton::PointerType>(type.getElementType())
+                      .getPointeeType()
+                      .getIntOrFloatBitWidth();
+  underSixteenBytes = contig * bits < 128;
+  return getMixedRadixEncoding(ctx, type.getShape(), numWarps, threadsPerWarp,
+                               /*numCTAs=*/1, vector, order);
+}
+
 struct CoalesceAsyncCopyPass
     : impl::TritonGPUCoalesceAsyncCopyBase<CoalesceAsyncCopyPass> {
   using Base::Base;
@@ -211,9 +323,22 @@ struct CoalesceAsyncCopyPass
     // Collect the coalesced encoding first as changing the IR invalidates the
     // axis analysis.
     DenseMap<AsyncCopyGlobalToLocalOp, Attribute> coalescedAsyncCopyMap;
+    DenseMap<AsyncCopyGlobalToLocalOp, Attribute> widenedMap;
+    DenseSet<AsyncCopyGlobalToLocalOp> keepL1;
     m.walk([&](AsyncCopyGlobalToLocalOp copyOp) {
       if (copyOp.getUseBulk())
         return;
+      bool underSixteenBytes = false;
+      FailureOr<LinearEncodingAttr> widened = getWidenedMixedRadixEncoding(
+          axisInfoAnalysis, copyOp, triton::gpu::lookupNumWarps(copyOp),
+          triton::gpu::TritonGPUDialect::getThreadsPerWarp(m),
+          underSixteenBytes);
+      if (succeeded(widened)) {
+        widenedMap[copyOp] = *widened;
+        if (underSixteenBytes && isProgramInvariant(copyOp.getSrc()))
+          keepL1.insert(copyOp);
+        return;
+      }
       // Only cheap copies read the map. An NPOT copy with 3 elements per
       // thread has no power-of-two blocked layout, so don't build one.
       if (!isCheapAsyncCopy(copyOp))
@@ -235,6 +360,8 @@ struct CoalesceAsyncCopyPass
     patterns.add<CoalesceCheapAsyncCopyGlobalToLocal>(
         axisInfoAnalysis, coalescedAsyncCopyMap, context);
     patterns.add<ClipAsyncCopySizePerThread>(axisInfoAnalysis, context);
+    patterns.add<WidenMixedRadixAsyncCopy>(axisInfoAnalysis, widenedMap, keepL1,
+                                           context);
 
     if (failed(applyPatternsGreedily(m, std::move(patterns))))
       signalPassFailure();
