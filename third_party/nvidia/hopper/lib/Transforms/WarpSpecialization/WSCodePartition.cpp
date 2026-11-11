@@ -4615,6 +4615,9 @@ void insertAsyncComm(
             LDBG("Insert ProducerCommitOp " << masterChannel->uniqID << " ");
             producerCommitPoint->dump();
           });
+          // Tag the commit with the producer task, not the consuming MMA's
+          // (see partition-scheduler-bugs.md #43).
+          builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
           builder.setInsertionPointAfter(producerCommitPoint);
           builder.setLoopScheduleInfoFromOp(producerCommitPoint);
           auto commitOp =
