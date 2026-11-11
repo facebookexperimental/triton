@@ -41,4 +41,4 @@
 
 [TDM-pipelined GEMM](third_party/tlx/tutorials/amd_tdm_gemm_pipelined.py)
 
-[MXFP TDM-pipelined GEMM](third_party/tlx/tutorials/amd_mxfp_gemm_tdm_pipelined.py)
+[MXFP TDM-pipelined GEMM](third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/amd_mxfp_gemm_tdm_pipelined.py)

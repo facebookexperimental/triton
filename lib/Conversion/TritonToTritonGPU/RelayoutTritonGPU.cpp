@@ -39,8 +39,13 @@ struct TMEMLoadOpPattern : public OpConversionPattern<ttng::TMEMLoadOp> {
   matchAndRewrite(ttng::TMEMLoadOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type resultType = getTypeConverter()->convertType(op.getType());
+    int numWarps = lookupNumWarps(op);
+    // The TMEM load-layout helper needs a power-of-two warp count >= 4;
+    // fail legalization cleanly instead of crashing.
+    if (numWarps < 4 || !llvm::isPowerOf2_32(numWarps))
+      return failure();
     RankedTensorType type = getTMEMTensorLayout(
-        typeConverter, op.getType(), op.getSrc().getType(), lookupNumWarps(op));
+        typeConverter, op.getType(), op.getSrc().getType(), numWarps);
     rewriter.modifyOpInPlace(op, [&] { op.getResult().setType(type); });
     if (type == resultType)
       return success();
@@ -62,9 +67,13 @@ struct TMEMStoreOpPattern : public OpConversionPattern<ttng::TMEMStoreOp> {
   LogicalResult
   matchAndRewrite(ttng::TMEMStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    RankedTensorType type =
-        getTMEMTensorLayout(typeConverter, op.getSrc().getType(),
-                            op.getDst().getType(), lookupNumWarps(op));
+    int numWarps = lookupNumWarps(op);
+    // The TMEM load-layout helper needs a power-of-two warp count >= 4;
+    // fail legalization cleanly instead of crashing.
+    if (numWarps < 4 || !llvm::isPowerOf2_32(numWarps))
+      return failure();
+    RankedTensorType type = getTMEMTensorLayout(
+        typeConverter, op.getSrc().getType(), op.getDst().getType(), numWarps);
     Value src =
         ConvertLayoutOp::create(rewriter, op.getLoc(), type, adaptor.getSrc());
     rewriter.modifyOpInPlace(op, [&] { op.getSrcMutable().assign(src); });
@@ -80,8 +89,13 @@ struct TMEMAllocOpPattern : public OpConversionPattern<ttng::TMEMAllocOp> {
                   ConversionPatternRewriter &rewriter) const override {
     if (!op.getSrc())
       return success();
+    int numWarps = lookupNumWarps(op);
+    // The TMEM load-layout helper needs a power-of-two warp count >= 4;
+    // fail legalization cleanly instead of crashing.
+    if (numWarps < 4 || !llvm::isPowerOf2_32(numWarps))
+      return failure();
     RankedTensorType type = getTMEMTensorLayout(
-        typeConverter, op.getSrc().getType(), op.getType(), lookupNumWarps(op));
+        typeConverter, op.getSrc().getType(), op.getType(), numWarps);
     Value src =
         ConvertLayoutOp::create(rewriter, op.getLoc(), type, adaptor.getSrc());
     rewriter.modifyOpInPlace(op, [&] { op.getSrcMutable().assign(src); });
@@ -98,6 +112,19 @@ struct LocalLoadOpPattern : public OpConversionPattern<LocalLoadOp> {
     auto type =
         cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
     rewriter.modifyOpInPlace(op, [&] { op.getResult().setType(type); });
+    return success();
+  }
+};
+
+struct ConvertLayoutOpPattern : public OpConversionPattern<ConvertLayoutOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ConvertLayoutOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultType = getTypeConverter()->convertType(op.getType());
+    rewriter.replaceOpWithNewOp<ConvertLayoutOp>(op, resultType,
+                                                 adaptor.getSrc());
     return success();
   }
 };
@@ -142,6 +169,9 @@ public:
     target.addDynamicallyLegalOp<LocalLoadOp>([&](Operation *op) {
       return TritonGPUConversionTarget::isDynamicallyLegal(op, typeConverter);
     });
+    target.addDynamicallyLegalOp<ConvertLayoutOp>([&](Operation *op) {
+      return TritonGPUConversionTarget::isDynamicallyLegal(op, typeConverter);
+    });
     // rewrite patterns
     RewritePatternSet patterns(context);
     // add rules
@@ -149,6 +179,7 @@ public:
         // clang-format off
         GatherScatterOpPattern<ttng::AsyncTMAGatherOp>,
         GatherScatterOpPattern<ttng::AsyncTMAScatterOp>,
+        ConvertLayoutOpPattern,
         LocalLoadOpPattern,
         TMEMLoadOpPattern,
         TMEMStoreOpPattern,

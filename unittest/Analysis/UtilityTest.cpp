@@ -1,6 +1,13 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Analysis/BufferRegion.h"
+#include "triton/Analysis/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/LayoutUtils.h"
+#include "unittest/Tools/MixedRadixLayouts.h"
+#include "unittest/Util/ScopedAllowNpot.h"
 
+#include "mlir/Parser/Parser.h"
 #include "llvm/Support/Signals.h"
 #include <gtest/gtest.h>
 
@@ -28,6 +35,70 @@ TEST(Analysis, reorder) {
     EXPECT_EQ(reordered[1], 10);
     EXPECT_EQ(reordered[2], 30);
   }
+}
+
+TEST(Analysis, SharedMemoryEffectsPreserveResourceAndKind) {
+  MLIRContext context;
+  context.getOrLoadDialect<triton::nvidia_gpu::TritonNvidiaGPUDialect>();
+  auto module = parseSourceString<ModuleOp>(R"mlir(
+    #shared = #ttg.swizzled_shared<{
+      vec = 1, perPhase = 1, maxPhase = 1, order = [0]
+    }>
+    #smem = #ttg.shared_memory
+    module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+      tt.func @access(%payload: !ttg.memdesc<2xi64, #shared, #smem>,
+                      %barrier: !ttg.memdesc<1xi64, #shared, #smem>) {
+        ttng.inval_barrier %barrier : !ttg.memdesc<1xi64, #shared, #smem>
+        ttng.clc_try_cancel %payload, %barrier :
+            !ttg.memdesc<2xi64, #shared, #smem>,
+            !ttg.memdesc<1xi64, #shared, #smem>
+        tt.return
+      }
+    }
+  )mlir",
+                                            &context);
+  ASSERT_TRUE(module);
+
+  SmallVector<triton::gpu::SharedKind> kinds;
+  module->walk([&](MemoryEffectOpInterface op) {
+    SmallVector<MemoryEffects::EffectInstance> effects;
+    op.getEffects(effects);
+    for (const auto &effect : effects) {
+      auto shared = dyn_cast<triton::gpu::SharedMemoryEffect>(&effect);
+      ASSERT_TRUE(shared);
+      EXPECT_EQ(effect.getResource(), triton::gpu::SharedMemory::get());
+      kinds.push_back(shared.getKind());
+    }
+  });
+  using Kind = triton::gpu::SharedKind;
+  EXPECT_EQ(kinds,
+            (SmallVector<Kind>{Kind::Generic, Kind::Async, Kind::Barrier}));
+
+  auto function = cast<triton::FuncOp>(module->getBody()->front());
+  auto invalidate = cast<triton::nvidia_gpu::InvalBarrierOp>(
+      function.getBody().front().front());
+  auto cancel =
+      cast<triton::nvidia_gpu::CLCTryCancelOp>(invalidate->getNextNode());
+  EXPECT_TRUE(
+      triton::hasSharedAccess(invalidate, Kind::Generic, triton::RW::Write));
+  EXPECT_FALSE(
+      triton::hasSharedAccess(invalidate, Kind::Generic, triton::RW::Read));
+  EXPECT_FALSE(triton::hasSharedAccess(invalidate, Kind::Async));
+  EXPECT_TRUE(triton::hasSharedAccess(cancel));
+  EXPECT_EQ(
+      triton::getMemoryAccesses(cancel, Kind::Async, triton::RW::Write).size(),
+      1);
+  EXPECT_EQ(triton::getMemoryAccesses(cancel, Kind::Barrier, triton::RW::Write)
+                .size(),
+            1);
+  EXPECT_TRUE(triton::getMemoryAccesses(cancel, std::nullopt, triton::RW::Read)
+                  .empty());
+
+  MemoryEffects::EffectInstance allocation(MemoryEffects::Allocate::get(),
+                                           triton::gpu::SharedMemory::get());
+  MemoryEffects::EffectInstance unrelated(MemoryEffects::Read::get());
+  EXPECT_FALSE(dyn_cast<triton::gpu::SharedMemoryEffect>(&allocation));
+  EXPECT_FALSE(dyn_cast<triton::gpu::SharedMemoryEffect>(&unrelated));
 }
 
 TEST(Analysis, AddressSetExhaustiveEightUnitUniverse) {
@@ -76,6 +147,34 @@ TEST(Analysis, BufferRegionViewPreservesSubviewProvenance) {
   for (const triton::BufferRegionView &view : joined.views)
     physicalRegions.insert(view.region);
   EXPECT_EQ(physicalRegions.size(), 1);
+}
+
+TEST(Analysis, BufferRegionFootprintUnknownIsNotEmpty) {
+  MLIRContext context;
+  context.getOrLoadDialect<triton::gpu::TritonGPUDialect>();
+  Attribute space = triton::gpu::SharedMemorySpaceAttr::get(&context);
+  triton::BufferRegionView view{
+      {0, 8, {{0, triton::AddressSet::fromRange(0, 8)}}}};
+  view.allocationFrame = 1;
+  triton::BufferRegionFootprint known{space, triton::RegionInfo({view})};
+  triton::BufferRegionFootprint uninitialized{space, {}};
+  triton::BufferRegionFootprint unknown{
+      space, triton::RegionInfo::getPessimisticValueState()};
+  triton::BufferRegionFootprint noCandidates{
+      space, triton::RegionInfo(triton::RegionInfo::ViewList{})};
+
+  const triton::BufferRegionFootprint *incomplete[] = {nullptr, &uninitialized,
+                                                       &unknown, &noCandidates};
+  for (const auto *footprint : incomplete) {
+    EXPECT_TRUE(triton::mayOverlap(footprint, &known));
+    EXPECT_TRUE(triton::mayOverlap(&known, footprint));
+  }
+
+  view.region = {};
+  triton::BufferRegionFootprint empty{space, triton::RegionInfo({view})};
+  EXPECT_FALSE(triton::mayOverlap(&empty, &known));
+  EXPECT_FALSE(triton::mayOverlap(&known, &empty));
+  EXPECT_TRUE(triton::mayOverlap(&empty, &unknown));
 }
 
 namespace {
@@ -266,6 +365,294 @@ TEST(Analysis, BufferStatePlanKeepsLargeSparsePartitionsExact) {
   }
 
   expectFullCoveragePartition(regions);
+}
+
+namespace {
+
+using Bases = std::vector<std::vector<int32_t>>;
+using triton::exactIdentity1D;
+using triton::makeRegLaneLayout;
+
+triton::LinearLayout exactRegisters(MLIRContext &ctx, int32_t size,
+                                    int32_t blockSize = 1) {
+  auto S = [&](StringRef str) { return StringAttr::get(&ctx, str); };
+  return exactIdentity1D(size, S("register"), S("dim0")) *
+         triton::LinearLayout::zeros1D(1, S("lane"), S("dim0")) *
+         triton::LinearLayout::zeros1D(blockSize, S("block"), S("dim0"));
+}
+
+void expectUnsupportedReason(const MixedRadixConversionPlan &plan,
+                             StringRef message) {
+  ASSERT_TRUE(plan.unsupportedReason);
+  EXPECT_FALSE(plan.supported());
+  EXPECT_FALSE(plan.transfer);
+  EXPECT_FALSE(plan.scope);
+  EXPECT_FALSE(plan.warpFactors);
+  EXPECT_FALSE(plan.destinationRegisterOrder);
+  EXPECT_EQ(*plan.unsupportedReason, message.str());
+}
+
+void expectShared(const MixedRadixConversionPlan &plan,
+                  const triton::LinearLayout &src,
+                  triton::MixedRadixConversionScope scope) {
+  ASSERT_TRUE(plan.supported());
+  EXPECT_EQ(plan.transfer, MixedRadixConversionTransfer::Shared);
+  EXPECT_EQ(plan.scope, scope);
+  EXPECT_TRUE(
+      llvm::equal(plan.sourceFreeVariableMasks, src.getFreeVariableMasks()));
+  EXPECT_FALSE(plan.warpFactors);
+  EXPECT_FALSE(plan.destinationRegisterOrder);
+}
+
+} // namespace
+
+TEST(Analysis, MixedRadixConversionPlanRejectsPreflightFailures) {
+  MLIRContext ctx;
+  auto exact = exactRegisters(ctx, 6);
+  expectUnsupportedReason(
+      planMixedRadixLayoutConversion(triton::LinearLayout::empty(),
+                                     triton::LinearLayout::empty(), {}),
+      "NPOT mixed-radix conversion without register and lane input dimensions "
+      "is not yet supported");
+  expectUnsupportedReason(
+      planMixedRadixLayoutConversion(exactRegisters(ctx, 3), exact, {6}),
+      "NPOT mixed-radix conversion with incomplete logical output coverage in "
+      "the source layout is not yet supported");
+  expectUnsupportedReason(
+      planMixedRadixLayoutConversion(exact, exactRegisters(ctx, 3), {6}),
+      "NPOT mixed-radix conversion with incomplete logical output coverage in "
+      "the destination layout is not yet supported");
+  expectUnsupportedReason(
+      planMixedRadixLayoutConversion(exactRegisters(ctx, 6, 2), exact, {6}),
+      "NPOT mixed-radix conversion with a non-singleton block input in the "
+      "source layout is not yet supported");
+  expectUnsupportedReason(
+      planMixedRadixLayoutConversion(exact, exactRegisters(ctx, 6, 2), {6}),
+      "NPOT mixed-radix conversion with a non-singleton block input in the "
+      "destination layout is not yet supported");
+  // A zero radix-3 digit on power-of-two outputs has no free-variable masks.
+  Bases lanes = {{0, 1}, {0, 2}, {0, 4}};
+  auto mixedRadix =
+      makeRegLaneLayout(ctx, {{1, 0}, {2, 0}, {0, 0}}, {2, 2, 3}, lanes, {}, 4);
+  auto pow2 = makeRegLaneLayout(ctx, {{1, 0}, {2, 0}}, {2, 2}, lanes, {}, 4);
+  expectUnsupportedReason(
+      planMixedRadixLayoutConversion(mixedRadix, pow2, {4, 8}),
+      "NPOT mixed-radix conversion with non-radix-2 digits on power-of-two "
+      "outputs in the source layout is not yet supported");
+  expectUnsupportedReason(
+      planMixedRadixLayoutConversion(pow2, mixedRadix, {4, 8}),
+      "NPOT mixed-radix conversion with non-radix-2 digits on power-of-two "
+      "outputs in the destination layout is not yet supported");
+  auto misnamed = exactIdentity1D(6, StringAttr::get(&ctx, "register"),
+                                  StringAttr::get(&ctx, "dim1"));
+  expectUnsupportedReason(
+      planMixedRadixLayoutConversion(misnamed, misnamed, {6}),
+      "NPOT mixed-radix conversion with mismatched or non-standard "
+      "out dims is not yet supported");
+}
+
+TEST(Analysis, MixedRadixConversionPlanFactorsRegisterAndLanePermutations) {
+  MLIRContext ctx;
+  auto reg = StringAttr::get(&ctx, "register");
+  auto lane = StringAttr::get(&ctx, "lane");
+  // `order` is destinationRegisterOrder applied to values 0..n-1, which are
+  // indexed by pReg's output.
+  auto expectFactored = [&](const triton::LinearLayout &src,
+                            const triton::LinearLayout &dst,
+                            MixedRadixConversionTransfer transfer,
+                            const Bases &pReg, const Bases &shuffleMap,
+                            ArrayRef<intptr_t> order) {
+    auto plan = planMixedRadixLayoutConversion(
+        src, dst, {src.getOutDimSize(StringAttr::get(&ctx, "dim0")), 8});
+    ASSERT_TRUE(plan.supported());
+    EXPECT_EQ(plan.transfer, transfer);
+    EXPECT_EQ(plan.scope, transfer == MixedRadixConversionTransfer::Register
+                              ? triton::MixedRadixConversionScope::Register
+                              : triton::MixedRadixConversionScope::Warp);
+    EXPECT_TRUE(
+        llvm::equal(plan.sourceFreeVariableMasks, src.getFreeVariableMasks()));
+    ASSERT_TRUE(plan.warpFactors && plan.destinationRegisterOrder);
+    EXPECT_EQ(plan.warpFactors->pReg.getBases().lookup(reg), pReg);
+    EXPECT_EQ(plan.warpFactors->shuffleMap.getBases().lookup(lane), shuffleMap);
+    SmallVector<Value> values;
+    for (intptr_t i = 0; i < static_cast<intptr_t>(order.size()); ++i)
+      values.push_back(
+          Value::getFromOpaquePointer(reinterpret_cast<void *>(i)));
+    SmallVector<intptr_t> ids;
+    for (Value v : plan.destinationRegisterOrder->apply(values))
+      ids.push_back(reinterpret_cast<intptr_t>(v.getAsOpaquePointer()));
+    EXPECT_EQ(ArrayRef<intptr_t>(ids), order);
+  };
+  Bases lanes = {{0, 1}, {0, 2}, {0, 4}};
+  Bases rotated = {{0, 2}, {0, 4}, {0, 1}};
+  {
+    // dst = 2 * src on the odd coordinate, so src -> dst is 3 mod 5.
+    SCOPED_TRACE("odd register swap");
+    expectFactored(makeRegLaneLayout(ctx, {{1, 0}}, {5}, lanes, {}, 5),
+                   makeRegLaneLayout(ctx, {{2, 0}}, {5}, lanes, {}, 5),
+                   MixedRadixConversionTransfer::Register, {{3}},
+                   {{1}, {2}, {4}}, {0, 1, 2, 3, 4});
+  }
+  {
+    SCOPED_TRACE("destination odd digit first");
+    expectFactored(makeRegLaneLayout(ctx, {{0, 4}, {1, 0}}, {2, 5},
+                                     {{0, 1}, {0, 2}}, {}, 5),
+                   makeRegLaneLayout(ctx, {{1, 0}, {0, 4}}, {5, 2},
+                                     {{0, 1}, {0, 2}}, {}, 5),
+                   MixedRadixConversionTransfer::Register, {{1}, {2}},
+                   {{1}, {2}}, {0, 2, 4, 6, 8, 1, 3, 5, 7, 9});
+  }
+  {
+    // operator* puts the odd digit between binary ones, as {2, 3, 2} here.
+    SCOPED_TRACE("lane permutation with the odd digit in the middle");
+    Bases registers = {{1, 0}, {2, 0}, {0, 1}};
+    expectFactored(
+        makeRegLaneLayout(ctx, registers, {2, 3, 2}, {{0, 2}, {0, 4}}, {}, 6),
+        makeRegLaneLayout(ctx, registers, {2, 3, 2}, {{0, 4}, {0, 2}}, {}, 6),
+        MixedRadixConversionTransfer::Warp, {{1}, {4}, {2}}, {{2}, {1}},
+        {0, 1, 4, 5, 8, 9, 2, 3, 6, 7, 10, 11});
+  }
+  {
+    SCOPED_TRACE("pow2 control");
+    auto src = makeRegLaneLayout(ctx, {{1, 0}, {2, 0}}, {2, 2}, lanes, {}, 4);
+    auto dst = makeRegLaneLayout(ctx, {{1, 0}, {2, 0}}, {2, 2}, rotated, {}, 4);
+    expectFactored(src, dst, MixedRadixConversionTransfer::Warp, {{1}, {2}},
+                   {{2}, {4}, {1}}, {0, 1, 2, 3});
+    auto plan = planMixedRadixLayoutConversion(src, dst, {4, 8});
+    EXPECT_TRUE(plan.warpFactors->pReg.isRadix2());
+  }
+  {
+    // Each warp already holds every value it needs.
+    SCOPED_TRACE("identical layouts replicated across warps");
+    auto layout =
+        exactIdentity1D(3, reg, StringAttr::get(&ctx, "dim0")) *
+        triton::LinearLayout::identity1D(8, lane,
+                                         StringAttr::get(&ctx, "dim1")) *
+        triton::LinearLayout::zeros1D(2, StringAttr::get(&ctx, "warp"),
+                                      StringAttr::get(&ctx, "dim0"));
+    expectFactored(layout, layout, MixedRadixConversionTransfer::Register,
+                   {{1}}, {{1}, {2}, {4}}, {0, 1, 2});
+  }
+}
+
+TEST(Analysis, MixedRadixConversionPlanSharesWithoutRegisterLaneBijection) {
+  MLIRContext ctx;
+  using Scope = triton::MixedRadixConversionScope;
+  {
+    SCOPED_TRACE("register bit moves to a lane");
+    auto src = makeRegLaneLayout(ctx, {{0, 1}, {1, 0}}, {2, 5},
+                                 {{0, 2}, {0, 4}}, {}, 5);
+    auto dst = makeRegLaneLayout(ctx, {{0, 2}, {1, 0}}, {2, 5},
+                                 {{0, 1}, {0, 4}}, {}, 5);
+    expectShared(planMixedRadixLayoutConversion(src, dst, {5, 8}), src,
+                 Scope::Warp);
+  }
+  {
+    SCOPED_TRACE("lane permutation is mixed-radix");
+    auto src = makeRegLaneLayout(ctx, {{0, 1}, {0, 2}, {0, 4}}, {2, 2, 2},
+                                 {{1, 0}}, {3}, 3);
+    auto dst = makeRegLaneLayout(ctx, {{0, 1}, {0, 2}, {0, 4}}, {2, 2, 2},
+                                 {{2, 0}}, {3}, 3);
+    expectShared(planMixedRadixLayoutConversion(src, dst, {3, 8}), src,
+                 Scope::Block);
+  }
+}
+
+TEST(Analysis, MixedRadixConversionQueriesFollowThePlan) {
+  triton::ScopedAllowNpot allowNpot;
+  MLIRContext ctx;
+  ctx.loadDialect<triton::TritonDialect, triton::gpu::TritonGPUDialect>();
+  auto module = parseSourceString<ModuleOp>(R"mlir(
+    #r384 = #ttg.linear<{register = [[1], [2], [128]], lane = [[4], [8], [16], [32], [64]], warp = [], block = [], inputRadices = {register = [2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [384]}>
+    #r384t = #ttg.linear<{register = [[2], [128], [1]], lane = [[4], [8], [16], [32], [64]], warp = [], block = [], inputRadices = {register = [2, 3, 2], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [384]}>
+    #w192 = #ttg.linear<{register = [[1], [64]], lane = [[2], [4], [8], [16], [32]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [192]}>
+    #w192t = #ttg.linear<{register = [[64], [1]], lane = [[4], [2], [8], [16], [32]], warp = [], block = [], inputRadices = {register = [3, 2], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [192]}>
+    #s96 = #ttg.linear<{register = [[32], [16]], lane = [[1], [2], [4], [8], [0]], warp = [], block = [], inputRadices = {register = [3, 2], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+    #s96t = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+    #blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+    #swapped = #ttg.linear<{register = [[2], [1]], lane = [[4], [8], [16], [32], [64]], warp = [], block = []}>
+    module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+      tt.func @f() {
+        %r = tt.make_range {end = 384 : i32, start = 0 : i32} : tensor<384xi32, #r384>
+        %0 = ttg.convert_layout %r : tensor<384xi32, #r384> -> tensor<384xi32, #r384t>
+        %w = tt.make_range {end = 192 : i32, start = 0 : i32} : tensor<192xi32, #w192>
+        %1 = ttg.convert_layout %w : tensor<192xi32, #w192> -> tensor<192xi32, #w192t>
+        %s = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #s96>
+        %2 = ttg.convert_layout %s : tensor<96xi32, #s96> -> tensor<96xi32, #s96t>
+        %b = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+        %3 = ttg.convert_layout %b : tensor<128xi32, #blocked> -> tensor<128xi32, #swapped>
+        tt.return
+      }
+    }
+  )mlir",
+                                            &ctx);
+  ASSERT_TRUE(module);
+  // {has a plan, reorders registers, needs shared memory}: Register, Warp,
+  // Shared, and a power-of-two register permutation as the control.
+  SmallVector<std::tuple<bool, bool, bool>> expected = {{true, true, false},
+                                                        {true, false, false},
+                                                        {true, false, true},
+                                                        {false, true, false}};
+  SmallVector<std::tuple<bool, bool, bool>> actual;
+  module->walk([&](triton::gpu::ConvertLayoutOp cvt) {
+    auto srcTy = cvt.getSrc().getType();
+    auto dstTy = cvt.getType();
+    EXPECT_EQ(cvtNeedsSharedMemory(srcTy, dstTy), cvtNeedsSharedMemory(cvt));
+    actual.push_back({getMixedRadixConversionPlan(srcTy, dstTy).has_value(),
+                      cvtReordersRegisters(srcTy, dstTy),
+                      cvtNeedsSharedMemory(cvt)});
+  });
+  EXPECT_EQ(actual, expected);
+}
+
+TEST(Analysis, ReduceHelpersKeepMixedRadices) {
+  triton::ScopedAllowNpot allowNpot;
+  MLIRContext ctx;
+  ctx.loadDialect<triton::gpu::TritonGPUDialect>();
+  auto S = [&](StringRef str) { return StringAttr::get(&ctx, str); };
+  Bases warps = {{4, 0}, {8, 0}};
+  auto layout = [&](Bases regs, std::vector<int32_t> radices, Bases lanes,
+                    int32_t dim0, int32_t dim1) {
+    triton::LinearLayout::BasesT bases;
+    triton::LinearLayout::RadicesT allRadices;
+    bases[S("register")] = regs;
+    allRadices[S("register")] = radices;
+    bases[S("lane")] = lanes;
+    allRadices[S("lane")].assign(lanes.size(), 2);
+    bases[S("warp")] = warps;
+    allRadices[S("warp")].assign(warps.size(), 2);
+    bases[S("block")] = {};
+    allRadices[S("block")] = {};
+    return triton::LinearLayout(std::move(bases), std::move(allRadices),
+                                {{S("dim0"), dim0}, {S("dim1"), dim1}},
+                                /*requireSurjective=*/false);
+  };
+  Bases lanes = {{0, 4}, {0, 8}, {0, 16}, {1, 0}, {2, 0}};
+  // [32,96] has a radix-3 register digit on dim1; [32,64] is the control.
+  for (int32_t odd : {3, 2}) {
+    SCOPED_TRACE(odd);
+    int32_t dim1 = 32 * odd;
+    auto src = layout({{0, 1}, {0, 2}, {16, 0}, {0, 32}}, {2, 2, 2, odd}, lanes,
+                      32, dim1);
+    auto srcTy =
+        RankedTensorType::get({32, dim1}, Float32Type::get(&ctx),
+                              triton::gpu::LinearEncodingAttr::get(&ctx, src));
+    EXPECT_EQ(ReduceOpHelper::moveAxisBasesToFront(src, 1).apply(src),
+              layout({{0, 1}, {0, 2}, {0, 32}, {16, 0}}, {2, 2, odd, 2}, lanes,
+                     32, dim1));
+    EXPECT_EQ(ReduceOpHelper::reducedRegLaneLayout(srcTy, 1),
+              layout({{16, 0}}, {2}, {{0, 0}, {0, 0}, {0, 0}, {1, 0}, {2, 0}},
+                     32, 1));
+    EXPECT_EQ(ReduceOpHelper::reducedRegLaneLayout(srcTy, 0),
+              layout({{0, 1}, {0, 2}, {0, 32}}, {2, 2, odd},
+                     {{0, 4}, {0, 8}, {0, 16}, {0, 0}, {0, 0}}, 16, dim1));
+    // Swapping dim0's warps into the zero lanes (reduced) or the first lanes
+    // (src) keeps dim1's radix.
+    for (const auto &ll : {ReduceOpHelper::reducedRegLaneLayout(srcTy, 0), src})
+      EXPECT_EQ(
+          ReduceOpHelper::getInterLayout(ll, 0).getInputRadices(S("register")),
+          ll.getInputRadices(S("register")));
+  }
 }
 
 } // namespace mlir

@@ -34,6 +34,11 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
     if (tensorType.getEncoding())
       return tensorType;
     ArrayRef<int64_t> shape = tensorType.getShape();
+    if (auto mixedRadix =
+            getMixedRadixEncoding(this->context, shape, this->numWarps,
+                                  this->threadsPerWarp, this->numCTAs);
+        succeeded(mixedRadix))
+      return tensorType.cloneWithEncoding(*mixedRadix);
     triton::gpu::BlockedEncodingAttr encoding =
         getDefaultBlockedEncoding(this->context, shape, this->numWarps,
                                   this->threadsPerWarp, this->numCTAs);
@@ -82,10 +87,15 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
 
   // We have requirements for the data layouts
   addDynamicallyLegalOp<triton::DotOp>([](triton::DotOp dotOp) -> bool {
+    // A mixed-radix dot's operands wait for accelerate-matmul.
+    Attribute dEncoding = dotOp.getType().getEncoding();
     Attribute aEncoding =
         cast<RankedTensorType>(dotOp.getA().getType()).getEncoding();
     Attribute bEncoding =
         cast<RankedTensorType>(dotOp.getB().getType()).getEncoding();
+    if ((dEncoding && !triton::gpu::isRadix2Encoding(dEncoding)) ||
+        (aEncoding && !triton::gpu::isRadix2Encoding(aEncoding)))
+      return true;
     if (aEncoding && bEncoding &&
         isa<triton::gpu::DotOperandEncodingAttr>(
             triton::tlx::getEffectiveEncoding(aEncoding)) &&

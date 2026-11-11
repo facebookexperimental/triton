@@ -30,6 +30,7 @@
 #include "triton/Dialect/Triton/IR/Interfaces.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
@@ -136,6 +137,8 @@ Attribute unwrapPinnedTDMLayout(Attribute layout) {
 LogicalResult verifyTDMLayoutConsistency(Operation *op,
                                          triton::TensorDescType descTy,
                                          gpu::MemDescType smemTy) {
+  if (failed(gpu::verifyNpotPow2AllocViewOperands(op)))
+    return failure();
   Attribute descLayout = unwrapPinnedTDMLayout(descTy.getSharedLayout());
   if (!descLayout)
     return success();
@@ -144,13 +147,13 @@ LogicalResult verifyTDMLayoutConsistency(Operation *op,
       llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(descLayout);
   auto allocPartitioned =
       llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(allocLayout);
+  // A partitioned allocation needs the same partitioned descriptor layout: TDM
+  // lowering places each warp's tile through the descriptor's layout, so a
+  // descriptor that describes only one piece writes the wrong LDS locations.
+  // Every check below therefore compares against the full allocation layout.
   Attribute effectiveAllocLayout = allocLayout;
-  if (!descPartitioned && allocPartitioned)
-    effectiveAllocLayout = allocPartitioned.getPartitionLayout();
 
-  bool compatible =
-      descLayout == allocLayout || (!descPartitioned && allocPartitioned &&
-                                    descLayout == effectiveAllocLayout);
+  bool compatible = descLayout == allocLayout;
   std::optional<LinearLayout> rankReducedDescLayout;
   // Rank-reducing descriptor loads drop leading unit dimensions from the
   // allocation, so compare the projected physical layout with the allocation.
@@ -271,15 +274,24 @@ LogicalResult verifyBufferContiguity(Operation *op, RankedTensorType tensorTy,
   return success();
 }
 
+// A v_cvt_scalef32 group applies one scale to `groupSize` register-consecutive
+// output values. Check that the first `groupSize` register in-dims of the scale
+// layout are all broadcast (zero), i.e. the whole group maps to a single scale.
+bool groupSharesSingleScale(const LinearLayout &scaleLL, StringAttr kRegister,
+                            int64_t groupSize) {
+  assert(llvm::isPowerOf2_64(groupSize));
+  if (scaleLL.getInDimSizeLog2(kRegister) < llvm::Log2_64(groupSize))
+    return false;
+  auto outDims = llvm::to_vector(scaleLL.getOutDimNames());
+  return scaleLL.resizeInDim(kRegister, /*newSize=*/groupSize)
+      .sublayoutIsZero({kRegister}, outDims);
+}
+
 // The v_cvt_scale_pk8 lowering upcasts 8 register-consecutive fp4 values with a
 // single scale, check that 8 elements in the scale layout are all broadcasts.
 bool pk8GroupSharesSingleScale(const LinearLayout &scaleLL,
                                StringAttr kRegister) {
-  if (scaleLL.getInDimSizeLog2(kRegister) < 3)
-    return false;
-  auto outDims = llvm::to_vector(scaleLL.getOutDimNames());
-  return scaleLL.resizeInDim(kRegister, /*newSize=*/8)
-      .sublayoutIsZero({kRegister}, outDims);
+  return groupSharesSingleScale(scaleLL, kRegister, /*groupSize=*/8);
 }
 
 // Validates the output/scale shape relationship and returns the number of
@@ -302,18 +314,20 @@ std::optional<int64_t> scaledUpcastFp4ScaleBlock(ScaledUpcastFp4Op op) {
   return outputAxis / scaleAxis;
 }
 
-std::optional<LinearLayout>
-computeCompactScaleLayoutForOp(ScaledUpcastFp4Op op, Attribute outputEnc) {
-  auto scaleBlock = scaledUpcastFp4ScaleBlock(op);
-  if (!scaleBlock || *scaleBlock == 1)
-    return std::nullopt;
-  if (!outputEnc || !isa<gpu::LayoutEncodingTrait>(outputEnc))
-    return std::nullopt;
+// Derives the scale layout for `op` given the encoding of its output.
+FailureOr<LinearLayout>
+inferScaleLayoutForOp(ScaledUpcastFp4Op op, Attribute outputEnc,
+                      function_ref<InFlightDiagnostic()> emitError = nullptr) {
+  if (!outputEnc || !isa<gpu::LayoutEncodingTrait>(outputEnc)) {
+    if (emitError)
+      emitError() << "output must carry a distributed layout encoding";
+    return failure();
+  }
   auto outputLL =
       gpu::toLinearLayout(op.getOutput().getType().getShape(),
                           cast<gpu::LayoutEncodingTrait>(outputEnc));
-  return ScaledUpcastFp4Op::computeScaleLayout(outputLL, op.getAxis(),
-                                               *scaleBlock);
+  return inferScaledUpcastFp4ScaleLayout(
+      outputLL, op.getScale().getType().getShape(), op.getAxis(), emitError);
 }
 
 std::optional<Attribute>
@@ -325,15 +339,11 @@ inferScaledUpcastFp4ScaleEncoding(ScaledUpcastFp4Op op, Attribute outputEnc) {
   // outputEnc.
   if (*scaleBlock == 1)
     return outputEnc;
-  // Compact scales: drop the broadcast register bases so the inferred layout
-  // keeps a single register per distinct scale value.
-  auto compact = computeCompactScaleLayoutForOp(op, outputEnc);
-  if (!compact)
+  auto scaleLL = inferScaleLayoutForOp(op, outputEnc);
+  if (failed(scaleLL))
     return std::nullopt;
-
-  auto kRegister = StringAttr::get(outputEnc.getContext(), "register");
-  return gpu::LinearEncodingAttr::get(
-      outputEnc.getContext(), compact->removeZeroBasesAlongDim(kRegister));
+  return gpu::LinearEncodingAttr::get(outputEnc.getContext(),
+                                      std::move(*scaleLL));
 }
 
 LogicalResult verifyScaledUpcastFp4ScaleLayout(ScaledUpcastFp4Op op) {
@@ -346,47 +356,208 @@ LogicalResult verifyScaledUpcastFp4ScaleLayout(ScaledUpcastFp4Op op) {
   if (!scaleEnc)
     return success();
 
-  // Reduce a scale encoding to one register per distinct scale, so the final
+  auto expectedLL =
+      inferScaleLayoutForOp(op, outputEnc, [&]() { return op.emitError(); });
+  if (failed(expectedLL))
+    return failure();
+
+  // Reduce the scale encoding to one register per distinct scale, so the
   // comparison matches up to redundant register broadcasting (a thread may keep
   // one register per distinct scale rather than replicating it across every
   // output register it covers).
   auto kRegister = StringAttr::get(op.getContext(), "register");
-  auto stripped = [&](Attribute enc) {
-    return mlir::triton::gpu::toLinearLayout(
-               scaleTy.getShape(), cast<gpu::LayoutEncodingTrait>(enc))
-        .removeZeroBasesAlongDim(kRegister);
-  };
-
-  std::optional<LinearLayout> expectedLL;
-  if (auto compact = computeCompactScaleLayoutForOp(op, outputEnc)) {
-    // Compact scales: the 8 register-consecutive fp4 of a v_cvt_scale_pk8 group
-    // must share a single scale; otherwise the lowering has no single held
-    // scale to apply to the group (e.g. a group that spans two scale blocks
-    // along the scaled axis, or one that crosses rows of a non-scaled dim).
-    if (!pk8GroupSharesSingleScale(*compact, kRegister))
-      return op.emitError()
-             << "the 8 elements of a v_cvt_scale_pk8 group would not share a "
-                "single scale; the scaled axis must place 8 register-"
-                "consecutive elements within one scale block";
-    expectedLL = compact->removeZeroBasesAlongDim(kRegister);
-  } else if (auto expectedEnc =
-                 inferScaledUpcastFp4ScaleEncoding(op, outputEnc)) {
-    // Expanded scales reuse the output encoding.
-    expectedLL = stripped(*expectedEnc);
-  } else {
-    return op.emitError() << "could not infer expected scale encoding";
-  }
-
-  if (stripped(scaleEnc) != *expectedLL)
+  auto scaleLL = gpu::toLinearLayout(scaleTy.getShape(),
+                                     cast<gpu::LayoutEncodingTrait>(scaleEnc))
+                     .removeZeroBasesAlongDim(kRegister);
+  if (scaleLL != *expectedLL)
     return op.emitError()
            << "scale encoding is not compatible with the inferred scale layout";
   return success();
 }
 
+template <typename OpT>
+std::optional<int64_t> scaledDowncastScaleBlock(OpT op) {
+  auto outputShape = op.getOutput().getType().getShape();
+  auto scaleShape = op.getScale().getType().getShape();
+  int64_t axis = op.getAxis();
+  if (axis < 0 || axis >= static_cast<int64_t>(outputShape.size()) ||
+      outputShape.size() != scaleShape.size())
+    return std::nullopt;
+  for (int64_t dim = 0; dim < static_cast<int64_t>(outputShape.size()); ++dim) {
+    if (dim != axis && outputShape[dim] != scaleShape[dim])
+      return std::nullopt;
+  }
+  if (scaleShape[axis] <= 0 || outputShape[axis] % scaleShape[axis] != 0)
+    return std::nullopt;
+  return outputShape[axis] / scaleShape[axis];
+}
+
+template <typename OpT>
+std::optional<Attribute> inferScaledDowncastScaleEncoding(OpT op,
+                                                          Attribute outputEnc) {
+  auto elementsPerScale = scaledDowncastScaleBlock(op);
+  if (!elementsPerScale || !outputEnc ||
+      !isa<gpu::LayoutEncodingTrait>(outputEnc))
+    return std::nullopt;
+  // Expanded scales have the same axis extent so we can reuse outputEnc
+  if (*elementsPerScale == 1)
+    return outputEnc;
+
+  auto outputLL =
+      gpu::toLinearLayout(op.getOutput().getType().getShape(),
+                          cast<gpu::LayoutEncodingTrait>(outputEnc));
+  auto compact =
+      OpT::computeScaleLayout(outputLL, op.getAxis(), *elementsPerScale);
+  if (!compact)
+    return std::nullopt;
+  auto kRegister = StringAttr::get(op.getContext(), "register");
+  return gpu::LinearEncodingAttr::get(
+      op.getContext(), compact->removeZeroBasesAlongDim(kRegister));
+}
+
+template <typename OpT>
+LogicalResult verifyScaledDowncastScaleLayout(OpT op, int64_t groupSize,
+                                              StringRef groupDescription,
+                                              StringRef blockDescription) {
+  auto scaleTy = op.getScale().getType();
+  auto outputTy = op.getOutput().getType();
+  auto scaleEnc = scaleTy.getEncoding();
+  auto outputEnc = outputTy.getEncoding();
+  if (!scaleEnc != !outputEnc)
+    return op.emitError()
+           << "scale and output must both have an encoding, or neither";
+  if (!scaleEnc)
+    return success();
+
+  auto elementsPerBlock = scaledDowncastScaleBlock(op);
+  if (!elementsPerBlock)
+    return op.emitError() << "scale shape is not compatible with the output "
+                             "shape along the scaled axis";
+  if (*elementsPerBlock == 1)
+    return op.emitError()
+           << "scaled_downcast requires compact scales along the scaled axis; "
+              "expanded scales (one scale per output element) are not "
+              "supported";
+  if (*elementsPerBlock % groupSize != 0)
+    return op.emitError()
+           << "each scale block along the scaled axis must cover "
+           << blockDescription << ", but got " << *elementsPerBlock
+           << " output elements per scale";
+  auto outputLL = gpu::toLinearLayout(
+      outputTy.getShape(), cast<gpu::LayoutEncodingTrait>(outputEnc));
+  auto compact =
+      OpT::computeScaleLayout(outputLL, op.getAxis(), *elementsPerBlock);
+  if (!compact)
+    return op.emitError() << "the scale block along the scaled axis must be a "
+                             "power of two";
+
+  auto kRegister = StringAttr::get(op.getContext(), "register");
+  if (!groupSharesSingleScale(*compact, kRegister, groupSize))
+    return op.emitError()
+           << "each v_cvt_scalef32_pk8 group of " << groupDescription
+           << " must share a single scale; the scale block along the scaled "
+              "axis must be a "
+           << blockDescription;
+
+  auto stripRegisters = [&](RankedTensorType type, Attribute enc) {
+    return gpu::toLinearLayout(type.getShape(),
+                               cast<gpu::LayoutEncodingTrait>(enc))
+        .removeZeroBasesAlongDim(kRegister);
+  };
+  auto actualLayout = stripRegisters(scaleTy, scaleEnc);
+  auto expectedLayout = compact->removeZeroBasesAlongDim(kRegister);
+  if (actualLayout != expectedLayout)
+    return op.emitError()
+           << "scale encoding is not compatible with the inferred scale "
+              "layout\nexpected: "
+           << expectedLayout.toString()
+           << "\nactual: " << actualLayout.toString();
+  return success();
+}
+
+template <typename OpT>
+LogicalResult verifyScaledDowncastScaleShapeAndAxis(OpT op,
+                                                    RankedTensorType outputTy,
+                                                    RankedTensorType scaleTy) {
+  auto outputShape = outputTy.getShape();
+  auto scaleShape = scaleTy.getShape();
+  if (outputShape.size() != scaleShape.size())
+    return op.emitError() << "scale and output must have the same rank";
+
+  int64_t axis = op.getAxis();
+  int64_t rank = outputTy.getRank();
+  if (axis < 0 || axis >= rank)
+    return op.emitError() << "axis out of range: " << axis << " for rank "
+                          << rank;
+
+  for (int64_t dim = 0; dim < rank; ++dim) {
+    if (dim == axis)
+      continue;
+    if (outputShape[dim] != scaleShape[dim])
+      return op.emitError()
+             << "scale and output must match on non-axis dimensions";
+  }
+  if (scaleShape[axis] <= 0 || outputShape[axis] % scaleShape[axis] != 0)
+    return op.emitError() << "expected output.shape[axis] to be divisible by "
+                             "scale.shape[axis], but got output["
+                          << axis << "]=" << outputShape[axis] << ", scale["
+                          << axis << "]=" << scaleShape[axis];
+  return success();
+}
+
 } // namespace
 
-// Derive the layout of a scale tensor from the upcast output layout. A compact
-// scale holds a single value per `elementsPerScale` consecutive output elements
+FailureOr<LinearLayout>
+inferScaledUpcastFp4ScaleLayout(const LinearLayout &outputLL,
+                                ArrayRef<int64_t> scaleShape, int64_t axis,
+                                function_ref<InFlightDiagnostic()> emitError) {
+  auto *ctx = outputLL.getOutDimNames().begin()->getContext();
+  auto fail = [&](const llvm::Twine &reason) {
+    if (emitError)
+      emitError() << reason;
+    return failure();
+  };
+
+  int64_t rank = outputLL.getNumOutDims();
+  if (axis < 0 || axis >= rank ||
+      rank != static_cast<int64_t>(scaleShape.size()))
+    return fail("scaled axis or scale rank is out of range for the output");
+
+  auto axisDim = StringAttr::get(ctx, llvm::formatv("dim{0}", axis).str());
+  if (!outputLL.hasOutDim(axisDim))
+    return fail("output layout has no dimension for the scaled axis");
+
+  int64_t outputExtent = outputLL.getOutDimSize(axisDim);
+  int64_t scaleExtent = scaleShape[axis];
+  if (scaleExtent <= 0 || outputExtent % scaleExtent != 0)
+    return fail("expected output.shape[axis] to be divisible by "
+                "scale.shape[axis]");
+
+  // An `elementsPerScale` of 1 means the scales are expanded to the output
+  // shape; anything larger means compact scales.
+  int64_t elementsPerScale = outputExtent / scaleExtent;
+  auto scaleLL =
+      ScaledUpcastFp4Op::computeScaleLayout(outputLL, axis, elementsPerScale);
+  if (!scaleLL)
+    return fail("could not derive a scale layout from the output layout");
+
+  auto kRegister = StringAttr::get(ctx, "register");
+  // Compact scales: the 8 register-consecutive fp4 of a v_cvt_scale_pk8 group
+  // must share a single scale; otherwise the lowering has no single held scale
+  // to apply to the group (e.g. a group that spans two scale blocks along the
+  // scaled axis, or one that crosses rows of a non-scaled dim).
+  if (elementsPerScale > 1 && !pk8GroupSharesSingleScale(*scaleLL, kRegister))
+    return fail("the 8 elements of a v_cvt_scale_pk8 group would not share a "
+                "single scale; the scaled axis must place 8 register-"
+                "consecutive elements within one scale block");
+
+  // Drop the broadcast register bases so the layout keeps a single register per
+  // distinct scale value.
+  return scaleLL->removeZeroBasesAlongDim(kRegister);
+}
+
+// Derive the layout of a scale tensor from an output layout. A compact scale
+// holds a single value per `elementsPerScale` consecutive output elements
 // along `axis`, so the scale that an output element at coordinate `k` needs is
 // `scale[..., k / elementsPerScale, ...]`, i.e. the output coordinate with its
 // low `log2(elementsPerScale)` bits dropped (right-shifted). Output positions
@@ -394,8 +565,8 @@ LogicalResult verifyScaledUpcastFp4ScaleLayout(ScaledUpcastFp4Op op) {
 // broadcast (zero) bases along the scaled axis. `elementsPerScale` must be a
 // power of two.
 std::optional<LinearLayout>
-ScaledUpcastFp4Op::computeScaleLayout(const LinearLayout &outputLayout,
-                                      int64_t axis, int64_t elementsPerScale) {
+computeScaledCastScaleLayout(const LinearLayout &outputLayout, int64_t axis,
+                             int64_t elementsPerScale) {
   // For expanded scales the scale layout is the same as the output layout.
   if (elementsPerScale == 1)
     return outputLayout;
@@ -433,6 +604,23 @@ ScaledUpcastFp4Op::computeScaleLayout(const LinearLayout &outputLayout,
   return outputLayout.compose(scaleDivisor);
 }
 
+std::optional<LinearLayout>
+ScaledUpcastFp4Op::computeScaleLayout(const LinearLayout &outputLayout,
+                                      int64_t axis, int64_t elementsPerScale) {
+  return computeScaledCastScaleLayout(outputLayout, axis, elementsPerScale);
+}
+
+std::optional<LinearLayout>
+ScaledDowncastFp4Op::computeScaleLayout(const LinearLayout &outputLayout,
+                                        int64_t axis, int64_t pairsPerScale) {
+  return computeScaledCastScaleLayout(outputLayout, axis, pairsPerScale);
+}
+
+std::optional<LinearLayout> ScaledDowncastFp8Op::computeScaleLayout(
+    const LinearLayout &outputLayout, int64_t axis, int64_t elementsPerScale) {
+  return computeScaledCastScaleLayout(outputLayout, axis, elementsPerScale);
+}
+
 LogicalResult ExtractSliceOp::verify() {
   // Basic type/rank checks.
   auto srcTypeVal = getSource().getType();
@@ -462,6 +650,8 @@ LogicalResult ExtractSliceOp::verify() {
   };
 
   for (size_t i = 0; i < rank; ++i) {
+    if (offsets[i] < 0)
+      return failDim("offset must be non-negative", i);
     if (dstShape[i] > srcShape[i])
       return failDim("result shape cannot exceed source shape", i);
     if (offsets[i] + dstShape[i] > srcShape[i])
@@ -557,6 +747,10 @@ struct CanonicalizeExtractSliceAndConcat
     // Calculate which concat operand contains our slice
     auto srcShape = concatItemType.getShape();
     auto rank = srcShape.size();
+    for (auto [dimOffset, dimSize] : llvm::zip_equal(offset, srcShape)) {
+      if (dimOffset % dimSize != 0)
+        return failure();
+    }
     std::vector<unsigned> defaultOrder(rank);
     std::iota(defaultOrder.rbegin(), defaultOrder.rend(), 0);
 
@@ -647,9 +841,6 @@ InThreadTransposeOp::deduceOutputLayout(ArrayRef<int64_t> shape,
   for (int baseIdx = 0; baseIdx < regBasesTransposed; ++baseIdx)
     regBase.second[baseIdx] =
         inThreadTransposedTile.getBasis(regDimName, baseIdx);
-  int regBasesInTile = llvm::Log2_32(product(srcEncoding.getSizePerThread()));
-  for (int baseIdx = regBasesTransposed; baseIdx < regBasesInTile; ++baseIdx)
-    llvm::for_each(regBase.second[baseIdx], [](int32_t &val) { val = 0; });
 
   LinearLayout transposedLL(bases, SmallVector<StringAttr>(outDimNames));
   return transposedLL;
@@ -737,6 +928,69 @@ Attribute ScaledUpcastFp4Op::inferSrcEncoding(unsigned opIdx,
   return {};
 }
 
+LogicalResult ScaledDowncastFp4Op::verify() {
+  RankedTensorType inputTy = getInput().getType();
+  RankedTensorType outputTy = getOutput().getType();
+  RankedTensorType scaleTy = getScale().getType();
+  if (failed(verifyScaledDowncastScaleShapeAndAxis(*this, outputTy, scaleTy)))
+    return failure();
+
+  if (failed(verifyScaledDowncastScaleLayout(
+          *this, /*groupSize=*/4, /*groupDescription=*/"8 fp4 values",
+          /*blockDescription=*/"a multiple of 8 fp4 values (4 packed bytes)")))
+    return failure();
+
+  // Reuse fp4tofp verifier for packed/unpacked relationship
+  return mlir::triton::gpu::Fp4ToFpOp::verifyFp4ToFp(*this, outputTy, inputTy,
+                                                     getAxis());
+}
+
+Attribute ScaledDowncastFp4Op::inferDstEncoding(unsigned opIdx,
+                                                Attribute srcEnc) {
+  // The scale layout is a quotient of the output along the scaled axis
+  if (opIdx == 1) {
+    if (auto scaleEnc = inferScaledDowncastScaleEncoding(*this, srcEnc))
+      return *scaleEnc;
+    return {};
+  }
+  // opIdx == 0: infer the packed output encoding from the unpacked input.
+  Attribute dstEnc;
+  auto shape = getInput().getType().getShape();
+
+  auto iface =
+      srcEnc.getDialect()
+          .getRegisteredInterface<triton::DialectInferLayoutInterface>();
+  if (succeeded(iface->inferFp4ToFpOpEncoding(shape, getAxis(), srcEnc, dstEnc,
+                                              /*fwdInference=*/false,
+                                              std::nullopt))) {
+    return dstEnc;
+  }
+  return {};
+}
+
+Attribute ScaledDowncastFp4Op::inferSrcEncoding(unsigned opIdx,
+                                                Attribute dstEnc) {
+  // The scale layout is a quotient of the output along the scaled axis
+  if (opIdx == 1) {
+    if (auto scaleEnc = inferScaledDowncastScaleEncoding(*this, dstEnc)) {
+      return *scaleEnc;
+    }
+  }
+  // opIdx == 0: infer the unpacked input encoding from the packed output.
+  Attribute srcEnc;
+  auto shape = getInput().getType().getShape();
+
+  auto iface =
+      dstEnc.getDialect()
+          .getRegisteredInterface<triton::DialectInferLayoutInterface>();
+  if (succeeded(iface->inferFp4ToFpOpEncoding(shape, getAxis(), dstEnc, srcEnc,
+                                              /*fwdInference=*/true,
+                                              std::nullopt))) {
+    return srcEnc;
+  }
+  return {};
+}
+
 Attribute ScaledUpcastFp8Op::inferDstEncoding(unsigned opIdx,
                                               Attribute srcEnc) {
   return srcEnc;
@@ -744,6 +998,67 @@ Attribute ScaledUpcastFp8Op::inferDstEncoding(unsigned opIdx,
 
 Attribute ScaledUpcastFp8Op::inferSrcEncoding(unsigned opIdx,
                                               Attribute dstEnc) {
+  return dstEnc;
+}
+
+LogicalResult PackedDot2Op::verify() {
+  Type inputType = getInputType();
+  if (!inputType.isF16() && !inputType.isBF16())
+    return emitError() << "input_type must be f16 or bf16, got " << inputType;
+  return success();
+}
+
+LogicalResult ScaledDowncastFp8Op::verify() {
+  RankedTensorType inputTy = getInput().getType();
+  RankedTensorType outputTy = getOutput().getType();
+  auto inputShape = inputTy.getShape();
+  auto outputShape = outputTy.getShape();
+
+  // fp8 downcast is elementwise: input and output share shape (and encoding).
+  if (inputShape != outputShape)
+    return emitError() << "input and output must have the same shape";
+  if (inputTy.getEncoding() != outputTy.getEncoding())
+    return emitError() << "input and output must have the same encoding";
+  if (bool(getScale()) == bool(getScaleConst()))
+    return emitError() << "requires exactly one of a scale operand or "
+                          "scale_const";
+  if (auto scaleConst = getScaleConst()) {
+    // 0xFF is the E8M0 NaN encoding.
+    if (*scaleConst == 0xFF)
+      return emitError() << "scale_const must be a finite E8M0 scale";
+    return success();
+  }
+  RankedTensorType scaleTy = getScale().getType();
+  if (failed(verifyScaledDowncastScaleShapeAndAxis(*this, outputTy, scaleTy)))
+    return failure();
+
+  return verifyScaledDowncastScaleLayout(
+      *this, /*groupSize=*/8,
+      /*groupDescription=*/"8 elements",
+      /*blockDescription=*/"a multiple of 8 elements");
+}
+
+Attribute ScaledDowncastFp8Op::inferDstEncoding(unsigned opIdx,
+                                                Attribute srcEnc) {
+  if (opIdx == 1) {
+    if (!getScale())
+      return {};
+    if (auto scaleEnc = inferScaledDowncastScaleEncoding(*this, srcEnc))
+      return *scaleEnc;
+    return {};
+  }
+  return srcEnc;
+}
+
+Attribute ScaledDowncastFp8Op::inferSrcEncoding(unsigned opIdx,
+                                                Attribute dstEnc) {
+  if (opIdx == 1) {
+    if (!getScale())
+      return {};
+    if (auto scaleEnc = inferScaledDowncastScaleEncoding(*this, dstEnc)) {
+      return *scaleEnc;
+    }
+  }
   return dstEnc;
 }
 
@@ -785,6 +1100,14 @@ LogicalResult ConcatOp::verify() {
   if (dstType.getElementType() != srcType.getElementType())
     return emitError()
            << "Element types of sources and destination must match.";
+
+  auto srcEncoding = srcType.getEncoding();
+  auto dstEncoding = dstType.getEncoding();
+  if (!srcEncoding != !dstEncoding)
+    return emitError(
+        "sources and result must both have an encoding, or neither");
+  if (!srcEncoding)
+    return success();
 
   auto linearLayoutSrc = triton::gpu::toLinearLayout(srcType);
   auto linearLayoutDst = triton::gpu::toLinearLayout(dstType);
@@ -860,6 +1183,13 @@ LogicalResult BufferLoadToLocalOp::verify() {
   return emitError() << "BufferLoadToLocal unsupported on target architecture";
 }
 
+// A buffer write's scalar base must be global memory (address space 1).
+static LogicalResult verifyBufferWriteBase(Operation *op, Value ptr) {
+  if (triton::getAddressSpace(ptr.getType()) != triton::PtrAddrSpace::Global)
+    return op->emitOpError("buffer writes require a global address space base");
+  return success();
+}
+
 static FailureOr<unsigned> getScheduledMfmaVersion(Operation *op) {
   auto mod = op->getParentOfType<ModuleOp>();
   if (!mod)
@@ -884,12 +1214,18 @@ LogicalResult BufferLoadOp::verify() {
 }
 
 LogicalResult BufferStoreOp::verify() {
+  if (failed(verifyBufferWriteBase(getOperation(), getPtr())))
+    return failure();
+
   return verifyBufferContiguity(getOperation(),
                                 cast<RankedTensorType>(getOffsets().getType()),
                                 getContiguity(), /*checkPhysicalLayout=*/true);
 }
 
 LogicalResult BufferAtomicRMWOp::verify() {
+  if (failed(verifyBufferWriteBase(getOperation(), getPtr())))
+    return failure();
+
   if (failed(verifyBufferContiguity(
           getOperation(), cast<RankedTensorType>(getOffsets().getType()),
           getContiguity())))
@@ -915,6 +1251,10 @@ LogicalResult BufferAtomicRMWOp::verify() {
       !features.supportsBufferAtomicFadd(elementType))
     return emitOpError("fadd is unsupported for this type on the target");
   return success();
+}
+
+LogicalResult BufferAtomicCASOp::verify() {
+  return verifyBufferWriteBase(getOperation(), getPtr());
 }
 
 LogicalResult LocalLoadPackedTransposedOp::verify() {
@@ -1059,6 +1399,32 @@ verifyNativeMfmaLayout(Operation *op,
   return success();
 }
 
+static bool isScaledMfmaInstrShape(ArrayRef<unsigned> instrShape) {
+  return instrShape == ArrayRef<unsigned>({16, 16, 128}) ||
+         instrShape == ArrayRef<unsigned>({32, 32, 64});
+}
+
+// `mfma_commit` is the completion boundary for both unscaled and scaled
+// scheduled MFMA. Scaled CDNA4 shapes reuse the warp/tile invariants above
+// but are not valid shapes for unscaled `scheduled_mfma`, so only the
+// commit verifier accepts them here.
+static LogicalResult
+verifyMfmaLayoutForCommit(Operation *op,
+                          mlir::triton::gpu::AMDMfmaEncodingAttr mfma,
+                          const Twine &prefix) {
+  if (mfma.getVersion() == 4 && isScaledMfmaInstrShape(mfma.getInstrShape())) {
+    if (llvm::is_contained(mfma.getWarpsPerCTA(), 0u))
+      return op->emitOpError()
+             << prefix << "MFMA warpsPerCTA entries must be positive";
+    if (mfma.getTilesPerWarp().size() < mfma.getRank())
+      return op->emitOpError()
+             << prefix << "MFMA tilesPerWarp must have at least "
+             << mfma.getRank() << " entries";
+    return success();
+  }
+  return verifyNativeMfmaLayout(op, mfma, prefix);
+}
+
 LogicalResult MfmaCommitOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
     DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
@@ -1102,8 +1468,8 @@ LogicalResult MfmaCommitOp::verify() {
                << "input " << index << " uses MFMA version "
                << mfma.getVersion() << ", but the target requires "
                << "version " << *targetVersion;
-      if (failed(verifyNativeMfmaLayout(getOperation(), mfma,
-                                        "input " + Twine(index) + " ")))
+      if (failed(verifyMfmaLayoutForCommit(getOperation(), mfma,
+                                           "input " + Twine(index) + " ")))
         return failure();
       // SCF-to-CF turns a runtime loop's yielded accumulator into a loop-header
       // block argument used by the mutually exclusive body and exit blocks.
@@ -1123,7 +1489,8 @@ LogicalResult MfmaCommitOp::verify() {
     }
 
     if (tensorTy.getElementType().isBF16() ||
-        tensorTy.getElementType().isF16()) {
+        tensorTy.getElementType().isF16() ||
+        tensorTy.getElementType().isInteger(8)) {
       auto dot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
           unwrapTlxWrappers(tensorTy.getEncoding()));
       auto mfma = dot ? dyn_cast<ttg::AMDMfmaEncodingAttr>(dot.getParent())
@@ -1133,15 +1500,21 @@ LogicalResult MfmaCommitOp::verify() {
           !llvm::is_contained({4u, 8u}, dot.getKWidth()))
         return emitOpError()
                << "input " << index
-               << " must use a matching BF16 or F16 dot-operand layout with "
-                  "kWidth=4/8";
+               << " must use a matching BF16, F16, or scaled i8 dot-operand "
+                  "layout with kWidth=4/8";
+      bool isScaled = isScaledMfmaInstrShape(mfma.getInstrShape());
+      if (tensorTy.getElementType().isInteger(8) != isScaled)
+        return emitOpError()
+               << "input " << index
+               << " i8 dot-operand dependencies require a scaled MFMA "
+                  "layout, and scaled layouts require i8 operands";
       if (*targetVersion != 0 && mfma.getVersion() != *targetVersion)
         return emitOpError()
                << "input " << index << " uses MFMA version "
                << mfma.getVersion() << ", but the target requires "
                << "version " << *targetVersion;
-      if (failed(verifyNativeMfmaLayout(getOperation(), mfma,
-                                        "input " + Twine(index) + " ")))
+      if (failed(verifyMfmaLayoutForCommit(getOperation(), mfma,
+                                           "input " + Twine(index) + " ")))
         return failure();
       ArrayRef<unsigned> instr = mfma.getInstrShape();
       int64_t fragmentElements =
@@ -1168,7 +1541,8 @@ LogicalResult MfmaCommitOp::verify() {
 
     return emitOpError()
            << "input " << index
-           << " must be an F32 MFMA result or BF16/F16 dot-operand dependency";
+           << " must be an F32 MFMA result or a BF16/F16/scaled-i8 "
+              "dot-operand dependency";
   }
   if (!hasMfmaResult)
     return emitOpError("requires at least one MFMA result");
@@ -1303,9 +1677,9 @@ LogicalResult ScheduledMfmaOp::verify() {
         "accumulator ownership does not match the native MFMA grid");
 
   if (getResidentOperand() != "none" && getResidentOperand() != "lhs" &&
-      getResidentOperand() != "rhs")
-    return emitOpError(
-        "resident_operand must be \"none\", \"lhs\", or \"rhs\"");
+      getResidentOperand() != "rhs" && getResidentOperand() != "unconstrained")
+    return emitOpError("resident_operand must be \"none\", \"lhs\", "
+                       "\"rhs\", or \"unconstrained\"");
   if (getAccumulatorRole() != "transient" &&
       getAccumulatorRole() != "persistent")
     return emitOpError(
@@ -1326,8 +1700,332 @@ LogicalResult ScheduledMfmaOp::verify() {
            << "accumulator_register_class \"" << getAccumulatorRegisterClass()
            << "\" is not yet supported on CDNA3 for a \""
            << getAccumulatorRole()
-           << "\" accumulator: the accumulator read is not ordered against the "
-              "MFMA drain. Use \"vgpr\".";
+           << "\" accumulator: CDNA3 scheduled MFMA currently requires VGPR "
+              "accumulators. Use \"vgpr\".";
+  return success();
+}
+
+static LogicalResult verifyTypedScheduledMfmaScaled(ScheduledMfmaScaledOp op);
+
+LogicalResult ScheduledMfmaScaledOp::verify() {
+  namespace ttg = mlir::triton::gpu;
+
+  if (failed(verifyWaveUniformExecution(getOperation())))
+    return failure();
+
+  FailureOr<unsigned> targetVersion = getScheduledMfmaVersion(getOperation());
+  if (failed(targetVersion))
+    return failure();
+  if (*targetVersion != 0 && *targetVersion != 4)
+    return emitOpError("scaled scheduled MFMA requires a CDNA4 target");
+
+  auto isScaledFormat = [](StringRef format) {
+    return format == "e4m3" || format == "e5m2" || format == "e2m3" ||
+           format == "e3m2" || format == "e2m1";
+  };
+  if (!isScaledFormat(getAFormat()))
+    return emitOpError("a_format must be one of \"e4m3\", \"e5m2\", \"e2m3\", "
+                       "\"e3m2\", \"e2m1\"");
+  if (!isScaledFormat(getBFormat()))
+    return emitOpError("b_format must be one of \"e4m3\", \"e5m2\", \"e2m3\", "
+                       "\"e3m2\", \"e2m1\"");
+  auto aScaleTy = getAScale().getType();
+  auto bScaleTy = getBScale().getType();
+  bool packedScales = aScaleTy.getElementType().isInteger(32);
+  if (packedScales != bScaleTy.getElementType().isInteger(32))
+    return emitOpError(
+        "scale operands must use matching i8 or packed i32 storage");
+  auto aSelector = getAScaleSelectorAttr();
+  auto bSelector = getBScaleSelectorAttr();
+  if (packedScales) {
+    if (!aSelector || !bSelector || aSelector.getInt() < 0 ||
+        aSelector.getInt() > 3 || bSelector.getInt() < 0 ||
+        bSelector.getInt() > 3)
+      return emitOpError(
+          "packed i32 scales require both byte selectors in [0, 3]");
+  } else if (aSelector || bSelector) {
+    return emitOpError("i8 scales do not accept packed byte selectors");
+  }
+  auto aTy = getA().getType();
+  auto bTy = getB().getType();
+  if (!aTy.getElementType().isInteger(8) || !bTy.getElementType().isInteger(8))
+    return verifyTypedScheduledMfmaScaled(*this);
+  if (getAccumulatorRole() != "transient")
+    return emitOpError(
+        "accumulator_role must be \"transient\": persistent scaled MFMA "
+        "drain waits are not modeled yet");
+  if (getResidentOperand() != "none")
+    return emitOpError(
+        "resident_operand must be \"none\" for scaled scheduled MFMA");
+  if (getAccumulatorRegisterClass() != "auto")
+    return emitOpError(
+        "accumulator_register_class must be \"auto\" for scaled scheduled "
+        "MFMA");
+
+  auto accTy = getAcc().getType();
+  auto resultTy = getResult().getType();
+  int64_t rank = accTy.getRank();
+  if (rank != 2 || aTy.getRank() != rank || bTy.getRank() != rank)
+    return emitOpError("requires rank-2 operands and accumulator");
+  if (!aTy.getElementType().isInteger(8) ||
+      !bTy.getElementType().isInteger(8) || !accTy.getElementType().isF32())
+    return emitOpError(
+        "requires i8 packed microscaling operands and an F32 accumulator");
+  if (resultTy != accTy)
+    return emitOpError("result type must exactly match the accumulator type");
+  if (aTy.getShape()[0] != accTy.getShape()[0] ||
+      bTy.getShape()[1] != accTy.getShape()[1] ||
+      aTy.getShape()[1] != bTy.getShape()[0])
+    return emitOpError(
+        "operand and accumulator matrix shapes are inconsistent");
+
+  auto mfma = dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(
+      unwrapTlxWrappers(accTy.getEncoding()));
+  if (!mfma || mfma.getRank() != rank || mfma.getVersion() != 4 ||
+      !mfma.hasUnitTilesPerWarp() || mfma.getElementBitWidth() != 32)
+    return emitOpError(
+        "requires a CDNA4 F32 MFMA accumulator with unit tiles per wave");
+  // verifyNativeMfmaLayout only knows the unscaled CDNA4 shapes, so check
+  // its warp/tile invariants here and the scaled shapes below.
+  if (llvm::is_contained(mfma.getWarpsPerCTA(), 0u))
+    return emitOpError("MFMA warpsPerCTA entries must be positive");
+  if (mfma.getTilesPerWarp().size() < mfma.getRank())
+    return emitOpError("MFMA tilesPerWarp must have at least rank entries");
+  ArrayRef<unsigned> instrShape = mfma.getInstrShape();
+  if (instrShape != ArrayRef<unsigned>({16, 16, 128}) &&
+      instrShape != ArrayRef<unsigned>({32, 32, 64}))
+    return emitOpError(
+        "requires a scaled MFMA instruction shape of 16x16x128 or 32x32x64");
+
+  auto aDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+      unwrapTlxWrappers(aTy.getEncoding()));
+  auto bDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+      unwrapTlxWrappers(bTy.getEncoding()));
+  // The encoding window stays a power of two (8 packed bytes), as in the
+  // existing scaled MFMA path; a native step consumes three windows
+  // (24 packed bytes per lane).
+  if (!aDot || aDot.getOpIdx() != 0 || aDot.getKWidth() != 8 ||
+      aDot.getParent() != mfma)
+    return emitOpError(
+        "operand A must use the matching opIdx=0, kWidth=8 dot layout "
+        "(8-byte packed windows; 24 bytes per native step)");
+  if (!bDot || bDot.getOpIdx() != 1 || bDot.getKWidth() != 8 ||
+      bDot.getParent() != mfma)
+    return emitOpError(
+        "operand B must use the matching opIdx=1, kWidth=8 dot layout "
+        "(8-byte packed windows; 24 bytes per native step)");
+
+  // Operand shapes count logical FP6 values. Each lane holds 32 i8
+  // values per native step in K order: the first 24 are the packed bytes
+  // of 32 codes, the remaining 8 are zero padding (code 0 decodes to 0.0,
+  // so padded steps contribute nothing). A dense 96-byte layout needs a
+  // radix-3 K repeat in the dot-operand layout, which landed LinearLayout
+  // cannot express yet; the padded form lowers today.
+  int64_t logicalK = aTy.getShape()[1];
+  int64_t instrK = instrShape[2];
+  if (logicalK <= 0 || logicalK % instrK != 0)
+    return emitOpError(
+        "operand K dimension must be a positive multiple of the native "
+        "instruction K");
+  int64_t steps = logicalK / instrK;
+
+  ArrayRef<unsigned> warpsPerCTA = mfma.getWarpsPerCTA();
+  int64_t repM = aTy.getShape()[0] / (instrShape[0] * warpsPerCTA[0]);
+  int64_t repN = bTy.getShape()[1] / (instrShape[1] * warpsPerCTA[1]);
+  if (repM <= 0 || repN <= 0 ||
+      repM * instrShape[0] * warpsPerCTA[0] != aTy.getShape()[0] ||
+      repN * instrShape[1] * warpsPerCTA[1] != bTy.getShape()[1])
+    return emitOpError("operand M/N dimensions must tile the MFMA grid");
+  // Per-thread ownership is replication-aware: A is replicated across the
+  // N-warp dimension and B across the M-warp dimension, so dividing the
+  // logical element count by every CTA thread undercounts both operands
+  // and rejects every multi-wave grid except [1, 1]. `getTotalElemsPerThread`
+  // already reflects the dot-operand layout, including that replication,
+  // and matches the element count the lowering unpacks per lane.
+  if (ttg::getTotalElemsPerThread(aTy) != repM * steps * 32 ||
+      ttg::getTotalElemsPerThread(bTy) != repN * steps * 32)
+    return emitOpError(
+        "operand ownership does not match the packed MFMA K grid");
+  constexpr int64_t warpSize = 64;
+  int64_t elemsPerFragment = instrShape[0] * instrShape[1] / warpSize;
+  if (ttg::getTotalElemsPerThread(accTy) != repM * repN * elemsPerFragment)
+    return emitOpError(
+        "accumulator ownership does not match the native MFMA grid");
+
+  int64_t scaleK = logicalK / 32;
+  if (aScaleTy.getRank() != 2 || bScaleTy.getRank() != 2 ||
+      (!packedScales && (!aScaleTy.getElementType().isInteger(8) ||
+                         !bScaleTy.getElementType().isInteger(8))))
+    return emitOpError("requires rank-2 i8 or packed i32 E8M0 scale tensors");
+  if (!packedScales &&
+      (aScaleTy.getShape() != ArrayRef<int64_t>({aTy.getShape()[0], scaleK}) ||
+       bScaleTy.getShape() != ArrayRef<int64_t>({bTy.getShape()[1], scaleK})))
+    return emitOpError(
+        "scale shapes must be [M, logicalK/32] and [N, logicalK/32]");
+  // Conversion assumes the MFMA scale layout register order (non-K tiles,
+  // then K steps): one scale byte per tile-step per lane.
+  if (packedScales) {
+    bool fp8 = (getAFormat() == "e4m3" || getAFormat() == "e5m2") &&
+               (getBFormat() == "e4m3" || getBFormat() == "e5m2");
+    if (!fp8 || instrShape != ArrayRef<unsigned>({32, 32, 64}) ||
+        (steps != 1 && steps != 2) || repM != 1 || repN != 1)
+      return emitOpError(
+          "packed i32 scales require one or two native FP8 32x32x64 steps "
+          "and one output fragment per wave");
+    int64_t maxBaseSelector = steps == 2 ? 1 : 3;
+    if (aSelector.getInt() > maxBaseSelector ||
+        bSelector.getInt() > maxBaseSelector)
+      return emitOpError(
+          "packed i32 scale selectors must leave two bytes for each K64 "
+          "step in the chain");
+    if (ttg::getTotalElemsPerThread(aScaleTy) != 1 ||
+        ttg::getTotalElemsPerThread(bScaleTy) != 1)
+      return emitOpError("packed i32 scales require one dword per lane");
+    return success();
+  }
+  if (ttg::getTotalElemsPerThread(aScaleTy) != repM * steps ||
+      ttg::getTotalElemsPerThread(bScaleTy) != repN * steps)
+    return emitOpError(
+        "scale ownership must hold one E8M0 byte per MFMA tile-step per "
+        "lane (MFMA scale layout)");
+  // Element count alone does not pin register order: two layouts can hold
+  // the same bytes per lane yet assign them to different (tile, step)
+  // pairs, silently scaling the wrong K step once `steps > 1` or the
+  // non-K repetition exceeds one. Require the exact scaled-MFMA layout
+  // the lowering indexes as `nonK * steps + step`.
+  if (!aScaleTy.getEncoding() || !bScaleTy.getEncoding())
+    return emitOpError("scale tensors must use the MFMA scale layout");
+  LinearLayout expectedAScale = ttg::chooseScaledMfmaScaleLayout(
+      getOperation()->getContext(), /*dotOperandIdx=*/0, aScaleTy.getShape(),
+      instrShape[0], mfma.getTilesPerWarp(), warpsPerCTA);
+  LinearLayout actualAScale =
+      ttg::toLinearLayout(aScaleTy.getShape(), aScaleTy.getEncoding());
+  if (actualAScale != expectedAScale)
+    return emitOpError("a_scale layout does not match the scaled MFMA scale "
+                       "layout (register order must be non-K tiles, then K "
+                       "steps)")
+           << "\nExpected layout: " << expectedAScale.toString()
+           << "\nGot layout: " << actualAScale.toString();
+  LinearLayout expectedBScale = ttg::chooseScaledMfmaScaleLayout(
+      getOperation()->getContext(), /*dotOperandIdx=*/1, bScaleTy.getShape(),
+      instrShape[0], mfma.getTilesPerWarp(), warpsPerCTA);
+  LinearLayout actualBScale =
+      ttg::toLinearLayout(bScaleTy.getShape(), bScaleTy.getEncoding());
+  if (actualBScale != expectedBScale)
+    return emitOpError("b_scale layout does not match the scaled MFMA scale "
+                       "layout (register order must be non-K tiles, then K "
+                       "steps)")
+           << "\nExpected layout: " << expectedBScale.toString()
+           << "\nGot layout: " << actualBScale.toString();
+  return success();
+}
+
+static LogicalResult verifyTypedScheduledMfmaScaled(ScheduledMfmaScaledOp op) {
+  namespace ttg = mlir::triton::gpu;
+
+  if (failed(verifyWaveUniformExecution(op.getOperation())))
+    return failure();
+  FailureOr<unsigned> targetVersion =
+      getScheduledMfmaVersion(op.getOperation());
+  if (failed(targetVersion))
+    return failure();
+
+  auto aTy = op.getA().getType();
+  auto bTy = op.getB().getType();
+  auto accTy = op.getAcc().getType();
+  int64_t rank = accTy.getRank();
+  if ((rank != 2 && rank != 3) || aTy.getRank() != rank ||
+      bTy.getRank() != rank || op.getAScale().getType().getRank() != rank ||
+      op.getBScale().getType().getRank() != rank)
+    return op.emitOpError(
+        "requires data, scales, and accumulator of matching rank 2 or 3");
+  if (!accTy.getElementType().isF32() || op.getResult().getType() != accTy)
+    return op.emitOpError(
+        "requires an F32 accumulator and matching result type");
+  auto aScaleTy = op.getAScale().getType();
+  auto bScaleTy = op.getBScale().getType();
+  auto validScaleType = [](Type type) {
+    return type.isInteger(8) || type.isInteger(32);
+  };
+  if (!validScaleType(aScaleTy.getElementType()) ||
+      !validScaleType(bScaleTy.getElementType()))
+    return op.emitOpError("requires I8 or packed I32 microscale tensors");
+  bool packedScales = aScaleTy.getElementType().isInteger(32);
+  if (packedScales != bScaleTy.getElementType().isInteger(32))
+    return op.emitOpError("requires matching scale packing");
+  auto aSelector = op.getAScaleSelectorAttr();
+  auto bSelector = op.getBScaleSelectorAttr();
+  if (packedScales) {
+    for (RankedTensorType type : {aScaleTy, bScaleTy}) {
+      Attribute encoding = unwrapTlxWrappers(type.getEncoding());
+      if (!isa_and_nonnull<ttg::LinearEncodingTrait>(encoding))
+        return op.emitOpError("packed I32 scales require linear layouts");
+      auto resolved = RankedTensorType::get(type.getShape(),
+                                            type.getElementType(), encoding);
+      if (ttg::getTotalElemsPerThread(resolved) != 1)
+        return op.emitOpError("packed I32 scales require one dword per lane");
+    }
+  }
+  if (aTy.getShape()[rank - 2] != accTy.getShape()[rank - 2] ||
+      bTy.getShape()[rank - 1] != accTy.getShape()[rank - 1] ||
+      aTy.getShape()[rank - 1] != bTy.getShape()[rank - 2])
+    return op.emitOpError(
+        "operand and accumulator matrix shapes are inconsistent");
+
+  auto mfma = dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(
+      unwrapTlxWrappers(accTy.getEncoding()));
+  if (!mfma || mfma.getRank() != rank || mfma.getVersion() != 4 ||
+      !mfma.hasUnitTilesPerWarp() || mfma.getElementBitWidth() != 32)
+    return op.emitOpError(
+        "requires a CDNA4 F32 MFMA accumulator with unit tiles per wave");
+  if (*targetVersion != 0 && *targetVersion != 4)
+    return op.emitOpError("requires a CDNA4 target");
+  ArrayRef<unsigned> instr = mfma.getInstrShape();
+  if (instr != ArrayRef<unsigned>({32, 32, 64}) &&
+      instr != ArrayRef<unsigned>({16, 16, 128}))
+    return op.emitOpError(
+        "requires a native scaled 32x32x64 or 16x16x128 MFMA layout");
+
+  if (packedScales) {
+    auto isFp8 = [](StringRef format) {
+      return format == "e4m3" || format == "e5m2";
+    };
+    auto resolvedC =
+        RankedTensorType::get(accTy.getShape(), accTy.getElementType(), mfma);
+    int64_t kFragments = aTy.getShape().back() / 64;
+    int64_t maxBaseSelector = kFragments == 2 ? 1 : 3;
+    if (instr != ArrayRef<unsigned>({32, 32, 64}) || !isFp8(op.getAFormat()) ||
+        !isFp8(op.getBFormat()) || (kFragments != 1 && kFragments != 2) ||
+        bTy.getShape()[rank - 2] != 64 * kFragments ||
+        aSelector.getInt() > maxBaseSelector ||
+        bSelector.getInt() > maxBaseSelector ||
+        ttg::getTotalElemsPerThread(resolvedC) != 16)
+      return op.emitOpError(
+          "packed I32 scales require one or two FP8 32x32x64 MFMA K "
+          "fragments per wave with selectors addressable in one dword");
+  }
+
+  auto aDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+      unwrapTlxWrappers(aTy.getEncoding()));
+  auto bDot = dyn_cast_or_null<ttg::DotOperandEncodingAttr>(
+      unwrapTlxWrappers(bTy.getEncoding()));
+  if (!aDot || aDot.getOpIdx() != 0 || aDot.getParent() != mfma ||
+      aDot.getKWidth() != 16)
+    return op.emitOpError(
+        "operand A must use the matching opIdx=0, kWidth=16 dot layout");
+  if (!bDot || bDot.getOpIdx() != 1 || bDot.getParent() != mfma ||
+      bDot.getKWidth() != 16)
+    return op.emitOpError(
+        "operand B must use the matching opIdx=1, kWidth=16 dot layout");
+  if (op.getAccumulatorRole() != "transient" &&
+      op.getAccumulatorRole() != "persistent")
+    return op.emitOpError(
+        "accumulator_role must be \"transient\" or \"persistent\"");
+  if (op.getAccumulatorRegisterClass() != "auto" &&
+      op.getAccumulatorRegisterClass() != "agpr" &&
+      op.getAccumulatorRegisterClass() != "vgpr")
+    return op.emitOpError("accumulator_register_class must be \"auto\", "
+                          "\"agpr\", or \"vgpr\"");
   return success();
 }
 
@@ -1520,7 +2218,8 @@ LogicalResult AsyncCopyLocalToGlobalOp::verify() {
   if (!isa<gpu::SharedMemorySpaceAttr>(srcTy.getMemorySpace()))
     return emitOpError("source must be in shared memory");
 
-  return success();
+  return triton::verifyCachePolicy(getOperation(), getCachePolicyAttr(),
+                                   triton::CachePolicyOperation::Store);
 }
 
 LogicalResult AsyncTDMFusedCopyGlobalToLocalOp::verify() {
@@ -1614,7 +2313,7 @@ LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
       return emitOpError("TDM store padding is only supported when padding "
                          "interval equals the innermost block dimension (got "
                          "padInterval=")
-             << intervals[0] << ", innermost dimension=" << blockShape.back()
+             << intervals[0] << ", innermost dimension=" << shapePerCTA.back()
              << ")";
   }
 
@@ -1661,11 +2360,12 @@ LogicalResult AsyncTDMScatterOp::verify() {
     if (intervals.size() != 1)
       return emitOpError("TDM scatter only supports single interval paddings.");
 
-    if (intervals[0] != blockShape.back())
+    auto shapePerCTA = triton::gpu::getShapePerCTA(paddedEnc, blockShape);
+    if (intervals[0] != shapePerCTA.back())
       return emitOpError("TDM scatter padding is only supported when padding "
                          "interval equals the innermost block dimension (got "
                          "padInterval=")
-             << intervals[0] << ", innermost dimension=" << blockShape.back()
+             << intervals[0] << ", innermost dimension=" << shapePerCTA.back()
              << ")";
   }
 
@@ -1705,6 +2405,7 @@ LogicalResult AsyncTDMGatherOp::verify() {
     return emitOpError("src_row_indices size must be a power of 2, got ")
            << numIndices;
 
+  auto shapePerCTA = triton::gpu::getShapePerCTA(smemTy);
   auto paddedEnc = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(enc);
   if (paddedEnc) {
     if (!(paddedEnc.getIntervals().size() == 1 &&
@@ -1712,15 +2413,13 @@ LogicalResult AsyncTDMGatherOp::verify() {
       return emitOpError(
           "TDM gather does not support multiple interval-padding pairs");
 
-    if (blockShape.back() % paddedEnc.getIntervals()[0] != 0)
+    if (shapePerCTA.back() % paddedEnc.getIntervals()[0] != 0)
       return emitOpError(
                  "TDM gather padding interval must divide the innermost "
                  "block dimension (got padInterval=")
              << paddedEnc.getIntervals()[0]
-             << ", innermost dimension=" << blockShape.back() << ")";
+             << ", innermost dimension=" << shapePerCTA.back() << ")";
   }
-
-  auto shapePerCTA = triton::gpu::getShapePerCTA(smemTy);
   auto sharedOrder = triton::gpu::getOrder(
       cast<triton::gpu::SharedEncodingTrait>(smemTy.getEncoding()),
       shapePerCTA);
@@ -1806,8 +2505,6 @@ LogicalResult UpdateTensorDescriptorOp::verify() {
 
 // -- InitBarrierOp --
 LogicalResult InitBarrierOp::verify() {
-  if (failed(verifyBarrierType(*this, getAlloc().getType())))
-    return failure();
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
   return success();
@@ -1816,18 +2513,10 @@ LogicalResult InitBarrierOp::verify() {
 TypedValue<gpu::MemDescType> InitBarrierOp::getBarrier() { return getAlloc(); }
 
 // -- WaitBarrierOp --
-LogicalResult WaitBarrierOp::verify() {
-  if (failed(verifyBarrierType(*this, getAlloc().getType())))
-    return failure();
-  return success();
-}
-
 TypedValue<gpu::MemDescType> WaitBarrierOp::getBarrier() { return getAlloc(); }
 
 // -- ArriveBarrierOp --
 LogicalResult ArriveBarrierOp::verify() {
-  if (failed(verifyBarrierType(*this, getAlloc().getType())))
-    return failure();
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
   return success();
@@ -1835,13 +2524,6 @@ LogicalResult ArriveBarrierOp::verify() {
 
 TypedValue<gpu::MemDescType> ArriveBarrierOp::getBarrier() {
   return getAlloc();
-}
-
-// -- AsyncCopyMbarrierArriveOp --
-LogicalResult AsyncCopyMbarrierArriveOp::verify() {
-  if (failed(verifyBarrierType(*this, getBarrier().getType())))
-    return failure();
-  return success();
 }
 
 // -- TDMPrefetchOp --

@@ -451,7 +451,7 @@
     mask_tr = (idx_m_top < M) & (idx_n_right < N)
     mask_br = (idx_m_bot < M) & (idx_n_right < N)
 
-    {{store_output(("idx_m_top", "idx_n_left"), "acc_tl", "mask_tl", val_shape=("HALF_M", "HALF_N"))}}
-    {{store_output(("idx_m_bot", "idx_n_left"), "acc_bl", "mask_bl", val_shape=("HALF_M", "HALF_N"))}}
-    {{store_output(("idx_m_top", "idx_n_right"), "acc_tr", "mask_tr", val_shape=("HALF_M", "HALF_N"))}}
-    {{store_output(("idx_m_bot", "idx_n_right"), "acc_br", "mask_br", val_shape=("HALF_M", "HALF_N"))}}
+    {{reduction_store_output(("idx_m_top", "idx_n_left"), "acc_tl", "mask_tl", partial_index="pid_n * 2", partial_columns="BLOCK_N // 2", val_shape=("BLOCK_M // 2", "BLOCK_N // 2"))}}
+    {{reduction_store_output(("idx_m_bot", "idx_n_left"), "acc_bl", "mask_bl", partial_index="pid_n * 2", partial_columns="BLOCK_N // 2", val_shape=("BLOCK_M // 2", "BLOCK_N // 2"))}}
+    {{reduction_store_output(("idx_m_top", "idx_n_right"), "acc_tr", "mask_tr", partial_index="pid_n * 2 + 1", partial_columns="BLOCK_N // 2", val_shape=("BLOCK_M // 2", "BLOCK_N // 2"))}}
+    {{reduction_store_output(("idx_m_bot", "idx_n_right"), "acc_br", "mask_br", partial_index="pid_n * 2 + 1", partial_columns="BLOCK_N // 2", val_shape=("BLOCK_M // 2", "BLOCK_N // 2"))}}

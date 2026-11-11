@@ -15,6 +15,7 @@ add_triton_library(TritonTLXTransforms
   TritonTLXTransformsIncGen
 
   LINK_LIBS PUBLIC
+  TritonAnalysis
   TritonGPUIR
   TritonAMDGPUTransforms
   TLXIR

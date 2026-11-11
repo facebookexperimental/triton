@@ -4,6 +4,11 @@
 
 namespace llvm {
 
+class TargetIRAnalysis;
+
+// Use generic optimization defaults with selectively validated NVIDIA hooks.
+TargetIRAnalysis createTritonNVPTXTargetIRAnalysis();
+
 // Pass to pre-process LLVM IR before optimization and break up phi of struct.
 // Breaking up those phis into elementary types allows better optimizations
 // downstream.
@@ -12,15 +17,6 @@ struct BreakStructPhiNodesPass
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
   static StringRef name() { return "BreakStructPhiNodesPass"; }
-};
-
-// Split FP32 arithmetic pairs with only one demanded lane on NVPTX. Run after
-// vectorization, followed by InstSimplify to clean up extracts and repacking.
-struct ScalarizePackedFOpsPass
-    : OptionalPassInfoMixin<ScalarizePackedFOpsPass> {
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
-
-  static StringRef name() { return "ScalarizePackedFOpsPass"; }
 };
 
 } // namespace llvm

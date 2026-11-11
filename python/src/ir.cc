@@ -47,10 +47,14 @@
 #include "triton/Tools/PluginUtils.h"
 #include "triton/Tools/Sys/Dump.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include "triton/Tools/TimeTrace.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TimeProfiler.h"
 #include <memory>
+#include <stdexcept>
 
 #include "proton/Dialect/include/Dialect/Proton/IR/Dialect.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "third_party/tlx/dialect/include/IR/Dialect.h"
 
 #include "llvm/ADT/SmallVector.h"
@@ -1056,6 +1060,19 @@ void init_triton_ir(py::module_ &m) {
   builderClassPtr = &TritonOpBuilderBinding;
   TritonOpBuilderBinding.def(py::init<MLIRContext *>())
       .def("get_op_builder", &TritonOpBuilder::getBuilder, ret::reference)
+      .def("get_cache_policy",
+           [](TritonOpBuilder &self, const std::string &cacheModifier,
+              const std::string &evictionPolicy) -> Attribute {
+             auto modifier = symbolizeCacheModifier(cacheModifier);
+             if (!modifier)
+               throw std::invalid_argument("invalid cache modifier '" +
+                                           cacheModifier + "'");
+             auto eviction = symbolizeEvictionPolicy(evictionPolicy);
+             if (!eviction)
+               throw std::invalid_argument("invalid eviction policy '" +
+                                           evictionPolicy + "'");
+             return buildCachePolicy(self.getBuilder(), *modifier, *eviction);
+           })
       // getters
       .def("create_module",
            [](TritonOpBuilder &self) -> ModuleOp {
@@ -1272,8 +1289,14 @@ void init_triton_ir(py::module_ &m) {
              return self.getBuilder().getF64Type();
            })
       .def("get_ptr_ty",
-           [](TritonOpBuilder &self, Type &type, int addrSpace) -> Type {
-             return PointerType::get(type, addrSpace);
+           [](TritonOpBuilder &self, Type &type,
+              const std::string &addrSpace) -> Type {
+             std::optional<PtrAddrSpace> symbolized =
+                 symbolizePtrAddrSpace(addrSpace);
+             if (!symbolized)
+               throw std::invalid_argument("invalid pointer address space '" +
+                                           addrSpace + "'");
+             return PointerType::get(type, *symbolized);
            })
       .def("get_block_ty",
            [](TritonOpBuilder &self, Type &elementType,
@@ -1410,6 +1433,12 @@ void init_triton_ir(py::module_ &m) {
            })
 
       // Cast instructions
+      .def("create_amd_scaled_downcast_fp8",
+           [](TritonOpBuilder &self, Value src, Type elemType,
+              uint8_t scaleConst) -> Value {
+             return self.create<triton::amdgpu::ScaledDowncastFp8Op>(
+                 src, elemType, scaleConst);
+           })
       // Conversions for custom FP types (FP8 and non-standard rounding
       // modes)
       .def(
@@ -1487,6 +1516,10 @@ void init_triton_ir(py::module_ &m) {
       .def("create_fdiv",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return self.create<arith::DivFOp>(lhs, rhs);
+           })
+      .def("create_approx_divf",
+           [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
+             return self.create<ApproxDivFOp>(lhs, rhs);
            })
       .def("create_frem",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
@@ -1737,36 +1770,34 @@ void init_triton_ir(py::module_ &m) {
            })
       // Input/Output
       .def("create_load",
-           [](TritonOpBuilder &self, Value &ptrs, CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy, bool isVolatile) -> Value {
-             return self.create<LoadOp>(ptrs, cacheModifier, evictionPolicy,
+           [](TritonOpBuilder &self, Value &ptrs, Attribute cachePolicy,
+              bool isVolatile) -> Value {
+             return self.create<LoadOp>(ptrs, Value(), Value(), cachePolicy,
                                         isVolatile);
            })
       .def("create_store",
            [](TritonOpBuilder &self, Value &ptrs, Value &value,
-              CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy) -> void {
-             self.create<StoreOp>(ptrs, value, cacheModifier, evictionPolicy);
+              Attribute cachePolicy) -> void {
+             self.create<StoreOp>(ptrs, value, Value(), cachePolicy);
            })
       .def(
           "create_masked_load",
           [](TritonOpBuilder &self, Value &ptrs, Value &mask,
-             std::optional<Value> &other, CacheModifier cacheModifier,
-             EvictionPolicy evictionPolicy, bool isVolatile) -> Value {
+             std::optional<Value> &other, Attribute cachePolicy,
+             bool isVolatile) -> Value {
             return self.create<LoadOp>(ptrs, mask, other.value_or(Value()),
-                                       cacheModifier, evictionPolicy,
-                                       isVolatile);
+                                       cachePolicy, isVolatile);
           },
           py::arg("ptrs"), py::arg("mask"), py::arg("other").none(),
-          py::arg("cacheModifier"), py::arg("evictionPolicy"),
-          py::arg("isVolatile"))
-      .def("create_masked_store",
-           [](TritonOpBuilder &self, Value &ptrs, Value &val, Value &mask,
-              CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy) -> void {
-             self.create<StoreOp>(ptrs, val, mask, cacheModifier,
-                                  evictionPolicy);
-           })
+          py::arg("cachePolicy"), py::arg("isVolatile"))
+      .def(
+          "create_masked_store",
+          [](TritonOpBuilder &self, Value &ptrs, Value &val, Value &mask,
+             Attribute cachePolicy) -> void {
+            self.create<StoreOp>(ptrs, val, mask, cachePolicy);
+          },
+          py::arg("ptrs"), py::arg("val"), py::arg("mask"),
+          py::arg("cachePolicy"))
       .def("create_tensor_descriptor_type",
            [](TritonOpBuilder &self, Type blockTy, bool isSigned) -> Type {
              auto rtt = cast<RankedTensorType>(blockTy);
@@ -1781,20 +1812,25 @@ void init_triton_ir(py::module_ &m) {
              return self.create<ttng::ReinterpretTensorDescOp>(resultTy,
                                                                desc_ptr);
            })
+      .def("create_descriptor_load",
+           [](TritonOpBuilder &self, Value desc, std::vector<Value> &indices,
+              Attribute cachePolicy) -> Value {
+             auto descTy = cast<triton::TensorDescType>(desc.getType());
+             auto resTy = descTy.getSignlessBlockType();
+             return self.create<DescriptorLoadOp>(resTy, desc, indices,
+                                                  cachePolicy);
+           })
       .def(
           "create_descriptor_load",
           [](TritonOpBuilder &self, Value desc, std::vector<Value> &indices,
-             CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-             std::optional<bool> multicast) -> Value {
+             Attribute cachePolicy, std::optional<bool> multicast) -> Value {
             auto descTy = cast<triton::TensorDescType>(desc.getType());
             auto resTy = descTy.getSignlessBlockType();
-            auto op = self.create<DescriptorLoadOp>(
-                resTy, desc, indices, cacheModifier, evictionPolicy,
-                multicast.value_or(false));
-            return op;
+            return self.create<DescriptorLoadOp>(
+                resTy, desc, indices, cachePolicy, multicast.value_or(false));
           },
-          py::arg("desc"), py::arg("indices"), py::arg("cacheModifier"),
-          py::arg("evictionPolicy"), py::arg("multicast").none())
+          py::arg("desc"), py::arg("indices"), py::arg("cachePolicy"),
+          py::arg("multicast").none())
       .def("create_descriptor_gather",
            [](TritonOpBuilder &self, Value desc, Value x_indices, Value y_index,
               Type type) -> Value {
@@ -1843,18 +1879,6 @@ void init_triton_ir(py::module_ &m) {
            [](TritonOpBuilder &self, Value &arg, int axis) -> Value {
              return self.create<ExpandDimsOp>(arg, axis);
            })
-      .def("create_cat",
-           [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
-             auto lhsType = dyn_cast<RankedTensorType>(lhs.getType());
-             auto rhsType = dyn_cast<RankedTensorType>(rhs.getType());
-             if (!(lhsType.getShape().size() == 1 &&
-                   rhsType.getShape().size() == 1))
-               throw std::invalid_argument(
-                   "shape not supported by cat. Expecting rank-1 inputs");
-             std::vector<int64_t> shape{lhsType.getShape()[0] +
-                                        rhsType.getShape()[0]};
-             return self.create<CatOp>(lhsType.clone(shape), lhs, rhs);
-           })
       .def("create_join",
            [](TritonOpBuilder &self, Value &a, Value &b) -> Value {
              return self.create<JoinOp>(a, b);
@@ -1885,6 +1909,17 @@ void init_triton_ir(py::module_ &m) {
              return self.createOrFold<UnsplatOp>(arg);
            })
       // // atomic
+      .def("create_atomic_load",
+           [](TritonOpBuilder &self, Value &ptr, Value &mask, MemSemantic sem,
+              MemSyncScope scope) -> Value {
+             Type dstType = triton::getPointeeType(ptr.getType());
+             return self.create<AtomicLoadOp>(dstType, ptr, mask, sem, scope);
+           })
+      .def("create_atomic_store",
+           [](TritonOpBuilder &self, Value &ptr, Value &val, Value &mask,
+              MemSemantic sem, MemSyncScope scope) {
+             self.create<AtomicStoreOp>(ptr, val, mask, sem, scope);
+           })
       .def("create_atomic_poll",
            [](TritonOpBuilder &self, Value &ptr, Value &expected,
               std::optional<Value> timeout, MemSemantic sem,
@@ -1895,34 +1930,14 @@ void init_triton_ir(py::module_ &m) {
       .def("create_atomic_cas",
            [](TritonOpBuilder &self, Value &ptr, Value &cmp, Value &val,
               MemSemantic sem, MemSyncScope scope) -> Value {
-             Type dstType;
-             if (auto srcTensorType =
-                     dyn_cast<RankedTensorType>(ptr.getType())) {
-               Type dstElemType =
-                   cast<PointerType>(srcTensorType.getElementType())
-                       .getPointeeType();
-               dstType = srcTensorType.clone(dstElemType);
-             } else {
-               auto ptrType = cast<PointerType>(getElementTypeOrSelf(ptr));
-               dstType = ptrType.getPointeeType();
-             }
+             Type dstType = triton::getPointeeType(ptr.getType());
              return self.create<AtomicCASOp>(dstType, ptr, cmp, val, sem,
                                              scope);
            })
       .def("create_atomic_rmw",
            [](TritonOpBuilder &self, RMWOp rmwOp, Value &ptr, Value &val,
               Value &mask, MemSemantic sem, MemSyncScope scope) -> Value {
-             Type dstType;
-             if (auto srcTensorType =
-                     dyn_cast<RankedTensorType>(ptr.getType())) {
-               Type dstElemType =
-                   cast<PointerType>(srcTensorType.getElementType())
-                       .getPointeeType();
-               dstType = srcTensorType.clone(dstElemType);
-             } else {
-               auto ptrType = cast<PointerType>(getElementTypeOrSelf(ptr));
-               dstType = ptrType.getPointeeType();
-             }
+             Type dstType = triton::getPointeeType(ptr.getType());
              return self.create<AtomicRMWOp>(dstType, rmwOp, ptr, val, mask,
                                              sem, scope);
            })
@@ -2162,6 +2177,13 @@ void init_triton_ir(py::module_ &m) {
              self.create<triton::gpu::BarrierOp>(triton::gpu::AddrSpace::All);
            })
       // Warp pipeline border marker (AMD)
+      .def("create_warp_pipeline_begin",
+           [](TritonOpBuilder &self, const std::string &label) {
+             auto marker =
+                 self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
+             marker->setAttr("triton.warp_pipeline.stage_begin",
+                             StringAttr::get(self.getContext(), label));
+           })
       .def("create_warp_pipeline_border",
            [](TritonOpBuilder &self, const std::string &marker, int priority) {
              auto border =
@@ -2178,6 +2200,26 @@ void init_triton_ir(py::module_ &m) {
                auto i32Ty = IntegerType::get(ctx, 32);
                border->setAttr("triton.warp_pipeline.priority",
                                IntegerAttr::get(i32Ty, priority));
+             }
+           })
+      // Intra-wave scheduling-region marker (AMD). Unlike a warp-pipeline
+      // border this is a lexical begin/end marker: a late TTGIR pass consumes
+      // it and emits sched_group_barrier constraints without phase-shifting
+      // warp groups.
+      .def("create_intra_wave_pipeline_marker",
+           [](TritonOpBuilder &self, const std::string &label, int64_t pair,
+              bool isBegin) {
+             auto marker =
+                 self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
+             auto ctx = self.getContext();
+             marker->setAttr("triton.intra_wave_pipeline.marker",
+                             StringAttr::get(ctx, isBegin ? "begin" : "end"));
+             marker->setAttr("triton.intra_wave_pipeline.label",
+                             StringAttr::get(ctx, label));
+             if (pair >= 0) {
+               auto i64Ty = IntegerType::get(ctx, 64);
+               marker->setAttr("triton.intra_wave_pipeline.pair",
+                               IntegerAttr::get(i64Ty, pair));
              }
            })
       // Make a tensor descriptor
@@ -2318,6 +2360,9 @@ void init_triton_ir(py::module_ &m) {
             bool haveTiming = ::triton::tools::getBoolEnv("MLIR_ENABLE_TIMING");
             if (haveTiming) {
               self.enableTiming();
+            }
+            if (llvm::timeTraceProfilerEnabled()) {
+              mlir::triton::tools::addTimeTraceInstrumentation(self);
             }
 
             TritonSourceMgrDiagnosticHandler diagHandler =

@@ -29,11 +29,9 @@ DIAGONAL_LAZY_RESCALE_THRESHOLD = tl.constexpr(4.0)
 DIAGONAL_LAZY_RESCALE_THRESHOLD_FP16 = tl.constexpr(8.0)
 CDNA_WAVE_SIZE = tl.constexpr(64)
 CDNA_MFMA_ROWS_PER_WAVE = tl.constexpr(32)
-_LN_2 = tl.constexpr(0.6931471805599453)
 
 _CLUSTER_PIPELINE_STAGE_COUNT = 4
 _CLUSTER_AUTOTUNE_NUM_WARPS = tuple(range(1, 9))
-_CLUSTER_EXPLICIT_STAGE_PRIORITY_MAX_N = tl.constexpr(512)
 _CLUSTER_STATIC_FP16_K_ROW_MIN_N = 4096
 _CLUSTER_STATIC_BF16_K_ROW_MIN_N = 16384
 _CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS = (("amdgpu-agpr-alloc", "0,0"), )
@@ -179,6 +177,7 @@ def _concat_cols(x0, x1):
 @triton.jit
 def _sum_rows_chain4(x, ROTATE_FINAL: tl.constexpr):
     """Release the MFMA row sum to prevent repeated-RLC N8 relayouts."""
+    CDNA_MFMA_ROWS_PER_WAVE: tl.constexpr = 32
     tl.static_assert(x.shape[0] == CDNA_MFMA_ROWS_PER_WAVE * tlx.num_warps())
     tl.static_assert(x.shape[1] % 4 == 0)
     mma: tl.constexpr = tlx.amd_mfma_layout(
@@ -348,6 +347,7 @@ class SoftmaxState:
     @triton.jit
     def vec1_lazy_max(self, qk, QK_SCALE: tl.constexpr):
         """Advance the lazy softmax frame while retaining the score tile."""
+        LAZY_RESCALE_THRESHOLD: tl.constexpr = 8.0
         m_ij = SoftmaxState._row_max(qk * QK_SCALE)
         score_delta = m_ij - self.m_i
         advance = score_delta > LAZY_RESCALE_THRESHOLD
@@ -910,6 +910,7 @@ def _attn_inner_pipelined(
     # diagonal pruning, but the unmasked steady-state pipeline itself is still
     # a two-slot ping-pong schedule.  Keep that logical depth separate from
     # the allocation depth so lazy softmax can run on the same object.
+    _CLUSTER_EXPLICIT_STAGE_PRIORITY_MAX_N: tl.constexpr = 512
     LAZY_BUF_DEPTH: tl.constexpr = 2
     # N1024 BF16 loses overlap with the stock LLVM scheduler on the extended
     # drain. Keep that class on its established exact-rescale control flow.
@@ -1463,6 +1464,8 @@ def _attn_predicated_causal_tile(
     ENABLE_CLASS_DIAGONAL_LAZY: tl.constexpr,
 ):
     """Consume one diagonal tile for an active wave."""
+    DIAGONAL_LAZY_RESCALE_THRESHOLD: tl.constexpr = 4.0
+    DIAGONAL_LAZY_RESCALE_THRESHOLD_FP16: tl.constexpr = 8.0
     if BLOCK_N == 32:
         k_tile = tlx.local_slice(k_tile, [0, 0], [32, q.shape[1]])
         v_tile = tlx.local_slice(v_tile, [0, 0], [32, q.shape[1]])
@@ -1646,6 +1649,8 @@ def _attn_inner_short(
     PREFIX_DIAGONAL_HANDOFF: tl.constexpr,
 ):
     """Process ranges too short to safely fill the rotated four-stage pipeline."""
+    CDNA_MFMA_ROWS_PER_WAVE: tl.constexpr = 32
+    CDNA_WAVE_SIZE: tl.constexpr = 64
     FOUR_SLOT_PREFIX_HANDOFF: tl.constexpr = (PREFIX_DIAGONAL_HANDOFF and not USE_DIRECT_LOAD and MASK_STEPS
                                               and IS_CAUSAL and q.shape[0] == 256 and q.shape[1] == 128
                                               and BLOCK_N == 64 and BUF_DEPTH == 2 and tlx.num_warps() == 8
@@ -2049,6 +2054,8 @@ def _attn_cluster_tile(
     STORE_LSE: tl.constexpr,
     ALLOW_PRESCALE_Q: tl.constexpr,
 ):
+    CLUSTER_PIPELINE_STAGES: tl.constexpr = 4
+    _LN_2: tl.constexpr = 0.6931471805599453
     q_off = off_z * stride_qz + off_h * stride_qh
     k_off = off_z * stride_kz + off_h * stride_kh
     v_off = off_z * stride_vz + off_h * stride_vh

@@ -1,3 +1,4 @@
+#include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -22,6 +23,12 @@ LogicalResult convertScaledMFMA(triton::DotScaledOp op,
                                 triton::DotScaledOp::Adaptor adaptor,
                                 const LLVMTypeConverter *typeConverter,
                                 ConversionPatternRewriter &rewriter);
+
+LogicalResult convertScheduledScaledMFMA(
+    triton::amdgpu::ScheduledMfmaScaledOp op,
+    triton::amdgpu::ScheduledMfmaScaledOp::Adaptor adaptor,
+    const LLVMTypeConverter *typeConverter,
+    ConversionPatternRewriter &rewriter);
 
 LogicalResult convertWMMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
                           const LLVMTypeConverter *typeConverter,
@@ -75,6 +82,18 @@ struct ScaledDotOpConversion
   LogicalResult
   matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // The target's NpotTargetLegality rejects exact NPOT dots it can't lower,
+    // at the M/N size their MFMA encoding fixed.
+    auto mfma =
+        dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(op.getType().getEncoding());
+    if (FailureOr<LinearLayout> ll = triton::gpu::getExactNpotOperandLayout(op);
+        succeeded(ll))
+      if (std::optional<std::string> reason =
+              triton::getNpotDotUnsupportedReason(
+                  op, *ll, triton::getModuleTarget(op),
+                  triton::gpu::lookupNumWarps(op),
+                  mfma ? mfma.getInstrShape()[0] : 0))
+        return op.emitError(*reason);
     auto dType = op.getD().getType();
     auto dEncoding = dType.getEncoding();
 
@@ -93,6 +112,30 @@ struct ScaledDotOpConversion
         "Unsupported DotScaleOp found when converting TritonGPU to LLVM.");
   }
 };
+
+struct ScheduledMfmaScaledTypedOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::ScheduledMfmaScaledOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::ScheduledMfmaScaledOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getA().getType().getElementType().isInteger(8))
+      return rewriter.notifyMatchFailure(
+          op, "packed-storage operands use the generic scheduled lowering");
+    auto dType = op.getResult().getType();
+    auto dEncoding = dType.getEncoding();
+    if (!isPermutationMatrixLayout(toLinearLayout(dType.getShape(), dEncoding)))
+      return rewriter.notifyMatchFailure(
+          op, "scheduled scaled MFMA result encoding must have a "
+              "permutation-matrix linear layout");
+    if (!isa<AMDMfmaEncodingAttr>(dEncoding))
+      return rewriter.notifyMatchFailure(
+          op, "scheduled scaled MFMA requires an AMD MFMA result encoding");
+    return AMD::convertScheduledScaledMFMA(op, adaptor, getTypeConverter(),
+                                           rewriter);
+  }
+};
 } // namespace
 
 namespace mlir::triton::AMD {
@@ -102,5 +145,6 @@ void populateDotOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                  PatternBenefit benefit) {
   patterns.add<DotOpConversion>(typeConverter, benefit);
   patterns.add<ScaledDotOpConversion>(typeConverter, benefit);
+  patterns.add<ScheduledMfmaScaledTypedOpConversion>(typeConverter, benefit);
 }
 } // namespace mlir::triton::AMD

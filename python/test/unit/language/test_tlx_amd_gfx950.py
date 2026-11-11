@@ -2,6 +2,7 @@
 import gc
 import math
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 import traceback
 from triton._internal_testing import is_hip_cdna4
+from triton.backends.compiler import GPUTarget
 from triton.tlx.ops.kernels.flash_attn.gfx950 import (
     _cluster_causal_query_tile as _amd_fa_cluster_causal_query_tile,
     _cluster_direct_workgroup_window as _amd_fa_cluster_direct_workgroup_window,
@@ -460,6 +462,8 @@ def _amd_scheduled_mfma_persistent_acc_kernel(
     output_ptr,
     USE_VGPR: tl.constexpr,
     COMMIT: tl.constexpr,
+    INITIALIZE: tl.constexpr = True,
+    FULL_K: tl.constexpr = False,
 ):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
@@ -476,31 +480,139 @@ def _amd_scheduled_mfma_persistent_acc_kernel(
     b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
     a = tlx.require_layout(a, dot0, pin=False)
     b = tlx.require_layout(b, dot1, pin=False)
-    a0 = tlx.extract_slice(a, [16, 32], [0, 0])
-    b0 = tlx.extract_slice(b, [32, 64], [0, 0])
-    acc = tlx.zeros((16, 64), tl.float32, layout=mma)
-    acc = tlx.amd_scheduled_mfma(
-        a0,
-        b0,
-        acc,
-        accumulator_role="persistent",
-        accumulator_register_class="vgpr" if USE_VGPR else None,
-        initialize=True,
-    )
-    a1 = tlx.extract_slice(a, [16, 32], [0, 32])
-    b1 = tlx.extract_slice(b, [32, 64], [32, 0])
-    acc = tlx.amd_scheduled_mfma(
-        a1,
-        b1,
-        acc,
-        accumulator_role="persistent",
-        accumulator_register_class="vgpr" if USE_VGPR else None,
-    )
+    acc = tl.full((16, 64), 7.0, tl.float32)
+    acc = tlx.require_layout(acc, mma, pin=False)
+    if FULL_K:
+        # Exercise both K fragments inside one scheduled operation.
+        acc = tlx.amd_scheduled_mfma(
+            a,
+            b,
+            acc,
+            accumulator_role="persistent",
+            accumulator_register_class="vgpr" if USE_VGPR else None,
+            initialize=INITIALIZE,
+        )
+    else:
+        a0 = tlx.extract_slice(a, [16, 32], [0, 0])
+        b0 = tlx.extract_slice(b, [32, 64], [0, 0])
+        acc = tlx.amd_scheduled_mfma(
+            a0,
+            b0,
+            acc,
+            accumulator_role="persistent",
+            accumulator_register_class="vgpr" if USE_VGPR else None,
+            initialize=INITIALIZE,
+        )
+        a1 = tlx.extract_slice(a, [16, 32], [0, 32])
+        b1 = tlx.extract_slice(b, [32, 64], [32, 0])
+        acc = tlx.amd_scheduled_mfma(
+            a1,
+            b1,
+            acc,
+            accumulator_role="persistent",
+            accumulator_register_class="vgpr" if USE_VGPR else None,
+        )
     if COMMIT:
         acc = tlx.amd_mfma_commit(acc)
     output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
     output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
     tl.store(output_offsets, acc)
+
+
+@triton.jit
+def _amd_scheduled_mfma_opaque_consumer_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    iterations,
+    CONSUMER: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=False,
+        warps_per_cta=[1, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 16)
+    a = tlx.require_layout(tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]), dot0, pin=False)
+    b = tlx.require_layout(tl.load(b_ptr + reduction[:, None] * 16 + cols[None, :]), dot1, pin=False)
+    acc = tlx.zeros((16, 16), tl.float32, layout=mma)
+    if CONSUMER == "if":
+        if iterations != 0:
+            acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr",
+                                         initialize=True)
+    elif CONSUMER == "loop":
+        for _ in range(iterations):
+            acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr")
+    else:
+        acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr",
+                                     initialize=True)
+
+    if CONSUMER == "layout":
+        acc = tlx.require_layout(tlx.release_layout(acc), mma, pin=False)
+    elif CONSUMER == "reshape":
+        acc = tl.reshape(tlx.release_layout(acc), [256])
+
+    # An opaque instruction reads the native MFMA result without an explicit
+    # commit. The compiler must complete the result before this consumer.
+    if CONSUMER == "native":
+        acc = acc + 1.0
+    else:
+        acc = tl.inline_asm_elementwise("v_add_f32 $0, $1, 1.0", constraints="=v,v", args=[acc], dtype=tl.float32,
+                                        is_pure=False, pack=1)
+
+    if CONSUMER == "reshape":
+        tl.store(output_ptr + tl.arange(0, 256), acc)
+    else:
+        output_offsets = tlx.require_layout(output_ptr + rows[:, None] * 16 + cols[None, :], mma, pin=False)
+        tl.store(output_offsets, acc)
+
+
+@triton.jit
+def _amd_scheduled_mfma_dead_result_writer_kernel(
+    output_ptr,
+    INSTR_M: tl.constexpr,
+    INSTR_K: tl.constexpr,
+    WRITER: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[INSTR_M, INSTR_M, INSTR_K],
+        transposed=False,
+        warps_per_cta=[1, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    BLOCK_N: tl.constexpr = INSTR_M * (2 if WRITER == "partial" else 1)
+    a = tlx.require_layout(tl.full((INSTR_M, INSTR_K), 1.0, tl.bfloat16), dot0, pin=False)
+    b = tl.full((INSTR_K, BLOCK_N), 1.0, tl.bfloat16)
+    if WRITER == "partial":
+        b = (b + (tl.arange(0, BLOCK_N)[None, :] >= INSTR_M)).to(tl.bfloat16)
+    b = tlx.require_layout(b, dot1, pin=False)
+    zero = tlx.zeros((INSTR_M, BLOCK_N), tl.float32, layout=mma)
+    result = tlx.amd_scheduled_mfma(a, b, zero, accumulator_role="persistent", accumulator_register_class="vgpr",
+                                    initialize=True)
+    if WRITER == "commit":
+        tlx.amd_mfma_commit(result)
+
+    # Discarding the result lets the opaque writer reuse an MFMA destination
+    # register while the instruction may still have writes in flight.
+    if WRITER == "native":
+        written = zero + 1.0
+    else:
+        written = tl.inline_asm_elementwise("v_mov_b32 $0, 1.0", constraints="=v,v", args=[zero], dtype=tl.float32,
+                                            is_pure=WRITER == "pure", pack=1)
+    offsets = output_ptr + tl.arange(0, INSTR_M)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+    tl.store(tlx.require_layout(offsets, mma, pin=False), written)
+    if WRITER == "partial":
+        live = tlx.extract_slice(result, [INSTR_M, INSTR_M], [0, 0])
+        live_offsets = (output_ptr + INSTR_M * BLOCK_N + tl.arange(0, INSTR_M)[:, None] * INSTR_M +
+                        tl.arange(0, INSTR_M)[None, :])
+        tl.store(tlx.require_layout(live_offsets, mma, pin=False), live)
 
 
 @triton.jit
@@ -606,6 +718,46 @@ def _amd_scheduled_mfma_lds_loop_kernel(a_ptr, b_ptr, output_ptr, iterations):
     output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
     output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
     tl.store(output_offsets, acc)
+
+
+@triton.jit
+def _amd_scheduled_mfma_lds_operand_wait_kernel(a_ptr, b_ptr, output_ptr, RESIDENT: tl.constexpr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 64)
+    cols = tl.arange(0, 64)
+    a = tl.load(a_ptr + rows[:, None] * 64 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
+    a_local = tlx.local_alloc((16, 64), tl.bfloat16, 1)
+    b_local = tlx.local_alloc((64, 64), tl.bfloat16, 1)
+    tlx.local_store(tlx.local_view(a_local, 0), a)
+    tlx.local_store(tlx.local_view(b_local, 0), b)
+    tl.debug_barrier()
+    # Chain X reads register-resident operands; it is independent work that
+    # can hide chain Y's LDS loads.
+    xa = tlx.local_load(tlx.local_slice(tlx.local_view(a_local, 0), [0, 0], [16, 32]), layout=dot0, relaxed=True)
+    xb = tlx.local_load(tlx.local_slice(tlx.local_view(b_local, 0), [0, 0], [32, 64]), layout=dot1, relaxed=True)
+    xa = tlx.amd_register_resident(xa, register_class="vgpr", registers_per_group=4)
+    xb = tlx.amd_register_resident(xb, register_class="vgpr", registers_per_group=4)
+    tl.debug_barrier()
+    ya = tlx.local_load(tlx.local_slice(tlx.local_view(a_local, 0), [0, 32], [16, 32]), layout=dot0, relaxed=True)
+    yb = tlx.local_load(tlx.local_slice(tlx.local_view(b_local, 0), [32, 0], [32, 64]), layout=dot1, relaxed=True)
+    acc_x = tlx.zeros((16, 64), tl.float32, layout=mma)
+    for _ in tl.static_range(4):
+        acc_x = tlx.amd_scheduled_mfma(xa, xb, acc_x, accumulator_role="transient")
+    acc_y = tlx.zeros((16, 64), tl.float32, layout=mma)
+    acc_y = tlx.amd_scheduled_mfma(ya, yb, acc_y, accumulator_role="persistent", resident_operand=RESIDENT)
+    acc_x, acc_y = tlx.amd_mfma_commit((acc_x, acc_y))
+    output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
+    output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
+    tl.store(output_offsets, acc_x + acc_y)
 
 
 @triton.jit
@@ -1775,24 +1927,121 @@ def test_amd_scheduled_mfma_chain_correct_gfx950():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_amd_scheduled_mfma_persistent_acc_correct_gfx950():
+@pytest.mark.parametrize("use_vgpr", [False, True], ids=["agpr", "vgpr"])
+@pytest.mark.parametrize("initialize", [False, True], ids=["preserve_c", "initialize"])
+@pytest.mark.parametrize("commit", [False, True], ids=["direct", "commit"])
+@pytest.mark.parametrize("full_k", [False, True], ids=["split_k", "full_k"])
+def test_amd_scheduled_mfma_persistent_acc_correct_gfx950(use_vgpr, initialize, full_k, commit):
     torch.manual_seed(0)
     a = torch.randn((16, 64), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((64, 64), device="cuda", dtype=torch.bfloat16)
-    actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
+    actual = torch.full((16, 64), float("nan"), device="cuda", dtype=torch.float32)
     expected = a.float() @ b.float()
-    for use_vgpr in (False, True):
-        for commit in (False, True):
-            _amd_scheduled_mfma_persistent_acc_kernel[(1, )](
-                a,
-                b,
-                actual,
-                USE_VGPR=use_vgpr,
-                COMMIT=commit,
-                num_warps=4,
-                matrix_instr_nonkdim=16,
-            )
-            torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+    if not initialize:
+        expected += 7.0
+    _amd_scheduled_mfma_persistent_acc_kernel[(1, )](
+        a,
+        b,
+        actual,
+        USE_VGPR=use_vgpr,
+        COMMIT=commit,
+        INITIALIZE=initialize,
+        FULL_K=full_k,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "consumer,iterations",
+    [("direct", 0), ("layout", 0), ("reshape", 0), ("if", 0), ("if", 2), ("loop", 0), ("loop", 2), ("native", 0)],
+)
+def test_amd_scheduled_mfma_opaque_consumer_correct_gfx950(consumer, iterations):
+    for seed in range(3):
+        torch.manual_seed(seed)
+        a = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
+        b = torch.randn((32, 16), device="cuda", dtype=torch.bfloat16)
+        actual = torch.full((16, 16), float("nan"), device="cuda", dtype=torch.float32)
+        _amd_scheduled_mfma_opaque_consumer_kernel[(1, )](a, b, actual, iterations, CONSUMER=consumer, num_warps=1,
+                                                          matrix_instr_nonkdim=16)
+        expected = a.float() @ b.float()
+        if consumer == "if":
+            expected *= iterations != 0
+        elif consumer == "loop":
+            expected *= iterations
+        torch.testing.assert_close(actual, expected + 1.0, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("instr_m,instr_k", [(16, 32), (32, 16)], ids=["16x16", "32x32"])
+@pytest.mark.parametrize("writer", ["opaque", "pure", "partial", "commit", "native"])
+def test_amd_scheduled_mfma_dead_result_writer_correct_gfx950(instr_m, instr_k, writer):
+    elements = instr_m * instr_m
+    expected = torch.ones((elements * (3 if writer == "partial" else 1), ), device="cuda", dtype=torch.float32)
+    if writer == "partial":
+        # The saved first fragment is an all-ones matrix product. The other
+        # fragment is unused and must not corrupt the opaque writer's ones.
+        expected[2 * elements:] = instr_k
+    for _ in range(3):
+        actual = torch.full_like(expected, float("nan"))
+        _amd_scheduled_mfma_dead_result_writer_kernel[(1, )](actual, INSTR_M=instr_m, INSTR_K=instr_k, WRITER=writer,
+                                                             num_warps=1, matrix_instr_nonkdim=instr_m)
+        # Values written by the opaque instruction are always exactly 1.
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("pointer_cast", [False, True], ids=["private", "private_to_generic"])
+@pytest.mark.parametrize("commit", [False, True], ids=["no_commit", "full_commit"])
+def test_amd_scheduled_mfma_private_forward_correct_gfx950(tmp_path, pointer_cast, commit):
+    pointer = "%slot = llvm.alloca %count x f32 : (i32) -> !llvm.ptr<5>"
+    pointer_type = "!llvm.ptr<5>"
+    if pointer_cast:
+        pointer = """%allocation = llvm.alloca %count x f32 : (i32) -> !llvm.ptr<5>
+    %slot = llvm.addrspacecast %allocation : !llvm.ptr<5> to !llvm.ptr"""
+        pointer_type = "!llvm.ptr"
+    boundary = "%committed = amdg.mfma_commit %result : tensor<16x16xf32, #mma>" if commit else ""
+    result = "%committed" if commit else "%result"
+    source = tmp_path / "private_forward.ttgir"
+    source.write_text(f"""
+#mma = #ttg.amd_mfma<{{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = false}}>
+#lhs = #ttg.dot_op<{{opIdx = 0, parent = #mma, kWidth = 8}}>
+#rhs = #ttg.dot_op<{{opIdx = 1, parent = #mma, kWidth = 8}}>
+module attributes {{"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32}} {{
+  tt.func public @private_forward(%out: !tt.ptr<f32>) {{
+    %a = arith.constant dense<1.0> : tensor<16x32xbf16, #lhs>
+    %b = arith.constant dense<1.0> : tensor<32x16xbf16, #rhs>
+    %zero = arith.constant dense<0.0> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent" register_class "vgpr" initialize true
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    {boundary}
+    %pack = builtin.unrealized_conversion_cast {result} : tensor<16x16xf32, #mma> to !llvm.struct<(f32, f32, f32, f32)>
+    %x = llvm.extractvalue %pack[0] : !llvm.struct<(f32, f32, f32, f32)>
+    %count = llvm.mlir.constant(1 : i32) : i32
+    {pointer}
+    llvm.store %x, %slot : f32, {pointer_type}
+    %reloaded = llvm.load %slot : {pointer_type} -> f32
+    %read = llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0", "=v,v" %reloaded : (f32) -> f32
+    %ptr = builtin.unrealized_conversion_cast %out : !tt.ptr<f32> to !llvm.ptr<1>
+    %lane = rocdl.workitem.id.x : i32
+    %dst = llvm.getelementptr %ptr[%lane] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+    llvm.store %read, %dst : f32, !llvm.ptr<1>
+    tt.return
+  }}
+}}
+""")
+    compiled = triton.compile(str(source), target=GPUTarget("hip", "gfx950", 64), options={"num_warps": 1})
+    # Each lane reads one element of an all-ones 16x32 @ 32x16 product,
+    # then adds one in opaque asm after LLVM forwards the private store/load.
+    expected = torch.full((64, ), 33.0, device="cuda", dtype=torch.float32)
+    for _ in range(3):
+        actual = torch.full((64, ), float("nan"), device="cuda", dtype=torch.float32)
+        compiled[(1, 1, 1)](actual)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -1831,6 +2080,70 @@ def test_amd_scheduled_mfma_inferred_lds_loop_correct_gfx950():
         matrix_instr_nonkdim=16,
     )
     torch.testing.assert_close(actual, 3.0 * (a.float() @ b.float()), atol=6e-4, rtol=6e-4)
+
+
+def _vgprs(operand):
+    """Return the VGPR numbers named by one ISA operand such as v8 or v[8:11]."""
+    match = re.fullmatch(r"v(\d+)|v\[(\d+):(\d+)\]", operand)
+    if match is None:
+        return set()
+    if match.group(1) is not None:
+        return {int(match.group(1))}
+    return set(range(int(match.group(2)), int(match.group(3)) + 1))
+
+
+def _early_lds_waits(amdgcn):
+    """Count LDS waits issued before an MFMA that reads no LDS-loaded register.
+
+    Only the region after the last barrier before the final MFMA is examined.
+    """
+    lines = [line.strip() for line in amdgcn.splitlines()]
+    lines = [line for line in lines if line and not line.startswith((";", "."))]
+    last_mfma = max(i for i, line in enumerate(lines) if line.startswith("v_mfma"))
+    start = max(i for i, line in enumerate(lines[:last_mfma]) if line.startswith("s_barrier")) + 1
+    loaded = set()
+    early = 0
+    pending_wait = False
+    for line in lines[start:last_mfma + 1]:
+        opcode, _, rest = line.partition(" ")
+        operands = [operand.strip() for operand in rest.split(",")]
+        if opcode.startswith("ds_read"):
+            loaded |= _vgprs(operands[0])
+        elif opcode == "s_waitcnt" and "lgkmcnt" in rest:
+            pending_wait = True
+        elif opcode.startswith("v_mfma") and pending_wait:
+            sources = _vgprs(operands[1]) | _vgprs(operands[2])
+            early += not (sources & loaded)
+            pending_wait = False
+    return early
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_unconstrained_lds_operand_wait_gfx950():
+    """An unconstrained persistent MFMA waits for its LDS operands at the MFMA.
+
+    Pinned inputs are consumed by their pins, so LLVM waits for the loads
+    before independent MFMAs. The pinned case is a control for the detector.
+    """
+    torch.manual_seed(0)
+    a = torch.randn((16, 64), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((64, 64), device="cuda", dtype=torch.bfloat16)
+    expected = 4.0 * (a[:, :32].float() @ b[:32].float()) + a[:, 32:].float() @ b[32:].float()
+    early_waits = {}
+    for resident in (None, "unconstrained"):
+        actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
+        compiled = _amd_scheduled_mfma_lds_operand_wait_kernel[(1, )](
+            a,
+            b,
+            actual,
+            RESIDENT=resident,
+            num_warps=4,
+            matrix_instr_nonkdim=16,
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+        early_waits[resident] = _early_lds_waits(compiled.asm["amdgcn"])
+    assert early_waits[None] > 0
+    assert early_waits["unconstrained"] == 0
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -2668,6 +2981,83 @@ def test_masked_unaligned_vector_load_correctness_gfx950(device):
 
 
 @triton.jit
+def _amd_packed_dot2_correctness_kernel(
+    lhs_ptr,
+    rhs_ptr,
+    acc_ptr,
+    output_ptr,
+    N: tl.constexpr,
+    INPUT_DTYPE: tl.constexpr,
+):
+    offsets = tl.arange(0, N)
+    lhs = tl.load(lhs_ptr + offsets).to(tl.uint32)
+    rhs = tl.load(rhs_ptr + offsets).to(tl.uint32)
+    acc = tl.load(acc_ptr + offsets)
+    result = tlx.amd_packed_dot2(lhs, rhs, acc, input_dtype=INPUT_DTYPE)
+    tl.store(output_ptr + offsets, result)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("dtype,input_dtype", [(torch.float16, tl.float16), (torch.bfloat16, tl.bfloat16)])
+def test_amd_packed_dot2_correctness_gfx950(device, dtype, input_dtype):
+    lhs = torch.tensor(
+        [[16.0, 1 / 16], [-16.0, 1 / 16], [2.0, -3.0], [0.5, 4.0]],
+        device=device,
+        dtype=dtype,
+    )
+    rhs = torch.tensor(
+        [[1.0, 2.0], [1.0, 2.0], [-4.0, 5.0], [8.0, -0.5]],
+        device=device,
+        dtype=dtype,
+    )
+    acc = torch.tensor([0.25, -0.25, 7.0, -2.0], device=device)
+    output = torch.empty_like(acc)
+    _amd_packed_dot2_correctness_kernel[(1, )](
+        lhs.view(torch.int32),
+        rhs.view(torch.int32),
+        acc,
+        output,
+        N=lhs.shape[0],
+        INPUT_DTYPE=input_dtype,
+        num_warps=1,
+    )
+    expected = (lhs.float() * rhs.float()).sum(dim=1) + acc
+    torch.testing.assert_close(output, expected, atol=0.0, rtol=0.0)
+
+
+@triton.jit
+def _amd_scaled_downcast_fp8_rounding_kernel(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(X + offsets, offsets < N, 0.0)
+    result = tlx.amd_scaled_downcast_fp8(values, 256.0)
+    tl.store(Y + offsets, result, offsets < N)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("block", [128, 256, 512])
+def test_amd_scaled_downcast_fp8_rounding_gfx950(device, block):
+    levels = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+    midpoints = (levels[:-1] + levels[1:]) * (0.5 / 256.0)
+    neighbors = torch.cat((torch.nextafter(midpoints, torch.full_like(midpoints, -float("inf"))), midpoints,
+                           torch.nextafter(midpoints, torch.full_like(midpoints, float("inf")))))
+    # 1.8125 * 256 = 464 is the midpoint above 448 and rounds down to it.
+    positive = torch.cat((levels / 256.0, neighbors, torch.tensor([1.75, 1.8125])))
+    # Values beyond the E4M3 range are not clamped; they convert to NaN.
+    overflow = torch.tensor([2.0, 1.0e30, float("nan")])
+    values = torch.cat((positive, -positive, overflow, -overflow)).to(torch.float32)
+    finite = torch.cat((torch.ones(2 * positive.numel(),
+                                   dtype=torch.bool), torch.zeros(2 * overflow.numel(), dtype=torch.bool)))
+    expected = (values[finite] * 256.0).to(torch.float8_e4m3fn)
+    inputs = values.to(device)
+    actual = torch.empty(values.numel(), device=device, dtype=torch.float8_e4m3fn)
+    _amd_scaled_downcast_fp8_rounding_kernel[(triton.cdiv(values.numel(), block), )](inputs, actual, values.numel(),
+                                                                                     block, num_warps=2)
+    actual = actual.cpu()
+    torch.testing.assert_close(actual.view(torch.uint8)[finite], expected.view(torch.uint8), atol=0, rtol=0)
+    assert torch.isnan(actual.float()[~finite]).all()
+
+
+@triton.jit
 def _amd_scheduled_mfma_column_subtiles_kernel(
     a_ptr,
     b_ptr,
@@ -2847,3 +3237,68 @@ def test_amd_scheduled_mfma_single_subtile_mapping_gfx950(initialize):
         selected += initial[16:32, 0:16]
     expected[16:32, 0:16] = selected
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@triton.jit
+def _stoch_round_kernel_gfx950(x_ptr, rbits_ptr, y_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offsets)
+    rbits = tl.load(rbits_ptr + offsets)
+    y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)
+    tl.store(y_ptr + offsets, y)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "dst_dtype, expected_inst",
+    [
+        ("float8_e5m2", "v_cvt_sr_bf8_f32"),
+        ("float8_e4m3fn", "v_cvt_sr_fp8_f32"),
+        ("float16", "v_cvt_sr_f16_f32"),
+        ("bfloat16", "v_cvt_sr_bf16_f32"),
+    ],
+)
+def test_stoch_round_gfx950(dst_dtype, expected_inst):
+    dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float8_e5m2": torch.float8_e5m2,
+        "float8_e4m3fn": torch.float8_e4m3fn,
+    }
+    dst_dtype_torch = dtype_map[dst_dtype]
+
+    SIZE = 256
+    a = torch.randn([SIZE], dtype=torch.float32, device="cuda")
+    rbits = ((torch.arange(SIZE, device="cuda", dtype=torch.int64) * 2654435761) % 2**32).to(torch.int32)
+    b = torch.empty([SIZE], dtype=torch.float32, device="cuda").to(dst_dtype_torch)
+    kernel = _stoch_round_kernel_gfx950[(1, )](a, rbits, b, BLOCK_SIZE=SIZE, num_warps=1)
+    assert expected_inst in kernel.asm["amdgcn"]
+
+    a_f32 = a.float()
+    b_back = b.float()
+    assert not torch.isnan(b_back).any(), "Stochastic rounding produced NaN"
+    assert not torch.isinf(b_back).any(), "Stochastic rounding produced Inf"
+
+    exact_mask = b_back == a_f32
+    if exact_mask.any():
+        b_ref = a_f32.to(dst_dtype_torch)
+        assert torch.equal(b[exact_mask], b_ref[exact_mask])
+
+    needs_rounding = ~exact_mask
+    if needs_rounding.any():
+        # Stochastic rounding returns one of the two representable neighbors
+        # of the source, so the error must stay below one ulp of the
+        # destination at the source magnitude.
+        mantissa_bits = {"float8_e5m2": 2, "float8_e4m3fn": 3, "float16": 10, "bfloat16": 7}[dst_dtype]
+        min_step = {
+            "float8_e5m2": 2.0**-16,
+            "float8_e4m3fn": 2.0**-9,
+            "float16": 2.0**-24,
+            "bfloat16": 2.0**-133,
+        }[dst_dtype]
+        exponent = torch.floor(torch.log2(torch.abs(a_f32[needs_rounding]).clamp(min=1e-30)))
+        ulp = torch.ldexp(torch.ones_like(exponent), (exponent - mantissa_bits).to(torch.int32))
+        ulp = torch.maximum(ulp, torch.tensor(min_step, device=ulp.device, dtype=ulp.dtype))
+        diff = torch.abs(b_back[needs_rounding] - a_f32[needs_rounding])
+        assert (diff <= ulp).all(), (f"Stochastic rounding error exceeds one ulp: max diff = {diff.max()}, "
+                                     f"max ulp = {ulp.max()}")

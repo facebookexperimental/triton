@@ -16,9 +16,13 @@ def test_op_perf(module_name, pytestconfig, governor):
     if not bench.supported():
         pytest.skip(f"{bench.OP} has no implementation for this device")
 
+    from _harness import driver
+
     fwd_only, bwd_only = pytestconfig.getoption("--fwd-only"), pytestconfig.getoption("--bwd-only")
     if fwd_only and bwd_only:
         raise pytest.UsageError("--fwd-only and --bwd-only are mutually exclusive")
+    if driver.missing_focus_default(bench, synthetic=pytestconfig.getoption("--synthetic")):
+        pytest.skip(f"{bench.OP} has no focus inputs configured for {driver.arch()}")
 
     results, env = bench.run(
         space=pytestconfig.getoption("--space"),

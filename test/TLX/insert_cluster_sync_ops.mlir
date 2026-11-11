@@ -1,4 +1,4 @@
-// RUN: triton-opt -split-input-file --allocate-shared-memory-nv --convert-triton-gpu-to-llvm=compute-capability=100 --verify-diagnostics %s| FileCheck %s
+// RUN: triton-opt -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar=compute-capability=100 --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm=compute-capability=100 --verify-diagnostics %s| FileCheck %s
 
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
