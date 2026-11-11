@@ -51,6 +51,14 @@ def task_root() -> str:
     return os.environ.get("COMPILE_IQ_TASK_DIR", os.path.expanduser("~/.compile_iq/tasks"))
 
 
+def _upload_task(tdir: str) -> None:
+    try:
+        from .fb.upload import upload_task
+    except ImportError:  # fb/ is not exported to GitHub
+        return
+    upload_task(tdir)
+
+
 def _dtype_str(dt) -> str:
     return str(dt).replace("torch.", "")
 
@@ -117,9 +125,9 @@ def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
                 constexpr_names.add(names[path[0]])
 
         # Imported here so a backend API change fails open inside this try, not at import time.
-        from triton.backends.nvidia.compiler import get_ptxas_for_arch
+        from triton.backends.nvidia.compiler import get_ptxas
 
-        ptxas = get_ptxas_for_arch(kernel.metadata.target.arch)
+        ptxas = get_ptxas(kernel.metadata.target.arch)
         blobs = {}
         spec = ptx_launch.build_spec(ptx, kernel.metadata, tuple(grid),
                                      _ordered_args(bound_args, constexpr_names, blobs), ptxas.path, ptxas.version)
@@ -164,6 +172,7 @@ def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
                     f"(launch_metadata={lm is not None}, launcher_src={ls is not None})")
         except Exception as e:
             dlog("collector", f"level1 capture skipped: {type(e).__name__}: {e}")
+        _upload_task(tdir)
     except NotImplementedError as e:
         dlog("collector", f"skip (unsupported by PTX-direct spec): {e}")
     except Exception as e:  # collection must never break the user's run
