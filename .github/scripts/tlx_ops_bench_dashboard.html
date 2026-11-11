@@ -312,6 +312,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
   };
   const s = (tag, attrs) => el(tag, {...attrs, svg: true});
   const fmt = (v, d = 3, suf = "") => (v === null || v === undefined ? "–" : v.toFixed(d) + suf);
+  const fmtTf = (v) => fmt(v, v < 10 ? 3 : 0);
   const fmtDate = (d) => `${d.slice(4, 6)}/${d.slice(6)}`;
   // Round tick step near raw: 1, 2, 2.5 or 5 times a power of ten.
   const niceStep = (raw) => { const mag = 10 ** Math.floor(Math.log10(raw)); return mag * [1, 2, 2.5, 5, 10].find((f) => f * mag >= raw); };
@@ -328,9 +329,10 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     const kept = cases.filter(matches), timed = kept.filter((c) => c.s !== "error");
     return {n: kept.length, speedup: geomean(timed.filter((c) => c.x).map((c) => c.x)), tflops: geomean(timed.map((c) => c.t))};
   }
+  const hasReference = (cases) => cases.some((c) => matches(c) && c.s !== "error" && c.x > 0);
   const sliceName = () => [state.dir !== "all" ? state.dir : "", state.dtype !== "all" ? state.dtype : "",
     ...(state.op === "all" ? [] : Object.entries(state.inputs).map(([k, v]) => `${k}=${v}`))].filter(Boolean).join(" · ");
-  const colorOf = (op) => `var(--series-${speedupOps().indexOf(op) + 1})`;
+  const colorOf = (op) => `var(--series-${Math.max(0, speedupOps().indexOf(op)) + 1})`;
 
   // ---- group by: the trend, the latest-night bars and the summary table split the slice by one key.
   const OTHER = "other", MAX_GROUPS = 8;
@@ -521,7 +523,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     box.querySelectorAll(".scroll, .yaxis, .note").forEach((n) => n.remove());
     const H = plat().history.slice(-state.range);
     const single = state.op !== "all";
-    const byTflops = single && !plat().latest[state.op].ref;
+    const byTflops = single && !H.some((n) => hasReference(n.ops[state.op].cases));
     const metric = byTflops ? "tflops" : "speedup";
     // Per-night aggregates for each group of this slice; a group with nothing in the slice has no line.
     const groups = groupList();
@@ -531,7 +533,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     $("trend-title").textContent = (byTflops ? `${state.op}: TLX TFLOP/s per night` : "Geomean speedup per night") + by;
     const unavailable = single && plat().latest[state.op].reason;
     $("trend-sub").textContent = unavailable ? "No benchmark measurements were recorded."
-      : byTflops ? "This op has no reference, so throughput is the number to track."
+      : byTflops ? "These cases have no reference, so throughput is the number to track."
                 : "Solid line: parity with the reference. Dashed line: the 0.9× PIP floor.";
     const legend = $("trend-legend");
     legend.textContent = "";
@@ -556,6 +558,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     const vals = shown.flatMap((o) => H.map((n) => val(n, o))).filter((v) => v);
     let lo = Math.min(...vals), hi = Math.max(...vals);
     if (!byTflops) { lo = Math.min(lo, 0.8); hi = Math.max(hi, 1.05); }
+    else if (lo === hi) lo = 0;
     const step = niceStep((hi - lo) / 4 || 1);
     lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step;
     const x = (i) => m.l + (W - m.l - m.r) * (i / Math.max(H.length - 1, 1));
@@ -568,7 +571,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     yaxis.append(s("rect", {x: 0, y: 0, width: m.l, height: Hh - m.b + 6, fill: "var(--surface-1)"}));
     for (let v = lo; v <= hi + step / 2; v += step) {
       svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1}));
-      yaxis.append(el("text", {svg: 1, x: m.l - 6, y: y(v) + 4, "text-anchor": "end"}, byTflops ? v.toFixed(0) : v.toFixed(2) + "×"));
+      yaxis.append(el("text", {svg: 1, x: m.l - 6, y: y(v) + 4, "text-anchor": "end"}, byTflops ? String(+v.toPrecision(4)) : v.toFixed(2) + "×"));
     }
     if (!byTflops) {
       svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(1), y2: y(1), stroke: "var(--axis)", "stroke-width": 1.5}));
@@ -605,7 +608,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     for (let k = ends.length - 1; k >= 0; k--) ends[k].y = Math.min(ends[k].y, k === ends.length - 1 ? Hh - m.b : ends[k + 1].y - 15);
     for (const e of ends)
       svg.append(el("text", {svg: 1, class: "direct", x: W - m.r + 10, y: e.y + 4},
-                    `${groupName(e.op)}  ${byTflops ? e.v.toFixed(0) : e.v.toFixed(3) + "×"}`));
+                    `${groupName(e.op)}  ${byTflops ? fmtTf(e.v) : e.v.toFixed(3) + "×"}`));
     const hair = s("line", {y1: m.t, y2: Hh - m.b, stroke: "var(--muted)", "stroke-width": 1, visibility: "hidden"});
     svg.append(hair);
     const hit = s("rect", {x: m.l, y: 0, width: W - m.l - m.r, height: Hh, fill: "transparent", tabindex: 0});
@@ -621,7 +624,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
         k.style.background = colorOfGroup(op, groups);
         nm.append(k, document.createTextNode(groupName(op)));
         const v = val(n, op);
-        r.append(el("b", {}, byTflops ? fmt(v, 0, " TF/s") : fmt(v, 3, "×")), nm);
+        r.append(el("b", {}, byTflops ? fmtTf(v) + " TF/s" : fmt(v, 3, "×")), nm);
         tip.append(r);
       }
       // Position against the box, not the svg: the svg may be scrolled partly out of view.
@@ -675,7 +678,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     };
     const hide = () => { tip.style.display = "none"; };
     const single = state.op !== "all", grouped = !single || state.group !== "none";
-    const noRef = single && !L[state.op].ref;
+    const noRef = single && !hasReference(L[state.op].cases);
     if (grouped) {
       // Bars: one per group, the same groups and colors as the trend.
       const metric = noRef ? "tflops" : "speedup";
@@ -695,17 +698,17 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
         const tickStep = noRef ? 10 ** Math.floor(Math.log10(vmax / 2)) * ([1, 2, 5].find((f) => f * 10 ** Math.floor(Math.log10(vmax / 2)) * 4 >= vmax) || 10) : 0.5;
         for (let v = 0; v <= vmax; v += tickStep) {
           bsvg.append(s("line", {x1: x(v), x2: x(v), y1: m.t, y2: Hh - m.b, stroke: "var(--grid)"}));
-          bsvg.append(el("text", {svg: 1, x: x(v), y: Hh - 6, "text-anchor": "middle"}, noRef ? String(Math.round(v)) : v + "×"));
+          bsvg.append(el("text", {svg: 1, x: x(v), y: Hh - 6, "text-anchor": "middle"}, noRef ? String(+v.toPrecision(4)) : v + "×"));
         }
         bars.forEach((g, k) => {
           const v = agg[g][metric], y0 = m.t + k * rowH + 6, h = rowH - 12;
           bsvg.append(el("text", {svg: 1, class: "direct", x: m.l - 10, y: y0 + h / 2 + 4, "text-anchor": "end"}, groupName(g)));
           const bar = s("rect", {x: x(0), y: y0, width: Math.max(0, x(v) - x(0)), height: h, rx: 4, fill: colorOfGroup(g, groups), tabindex: 0});
-          const info = (ev) => place(ev, [el("div", {class: "h"}, groupName(g)), el("div", {}, (noRef ? `${v.toFixed(0)} TF/s` : `${v.toFixed(3)}×`)
-            + ` geomean over ${groupCases(L, g, groups).filter((c) => matches(c) && c.s !== "error").length} measured cases`)]);
+          const info = (ev) => place(ev, [el("div", {class: "h"}, groupName(g)), el("div", {}, (noRef ? `${fmtTf(v)} TF/s` : `${v.toFixed(3)}×`)
+            + ` geomean over ${groupCases(L, g, groups).filter((c) => matches(c) && c.s !== "error" && c[noRef ? "t" : "x"] > 0).length} measured cases`)]);
           bar.addEventListener("pointermove", info); bar.addEventListener("pointerleave", hide);
           bsvg.append(bar);
-          bsvg.append(el("text", {svg: 1, class: "direct", x: x(v) + 8, y: y0 + h / 2 + 4}, noRef ? v.toFixed(0) : v.toFixed(3) + "×"));
+          bsvg.append(el("text", {svg: 1, class: "direct", x: x(v) + 8, y: y0 + h / 2 + 4}, noRef ? fmtTf(v) : v.toFixed(3) + "×"));
         });
         if (!noRef) {
           bsvg.append(s("line", {x1: x(FLOOR), x2: x(FLOOR), y1: m.t, y2: Hh - m.b, stroke: "var(--critical)", "stroke-dasharray": "4 4"}));
@@ -716,21 +719,22 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       if (!single) return;
     }
     {
-      const cs = L[state.op].cases.filter(matches).filter((c) => c.x);
-      const errs = L[state.op].cases.filter((c) => matches(c) && !c.x).length;
+      const cs = L[state.op].cases.filter((c) => matches(c) && c.s !== "error" && c.x);
+      const errs = L[state.op].cases.filter((c) => matches(c) && c.s === "error").length;
+      const uncompared = L[state.op].cases.filter((c) => matches(c) && c.s !== "error" && !c.x).length;
       if (!L[state.op].cases.some(matches)) {
         if (!grouped) { $("dist-title").textContent = `${state.op}: every case, latest night`; $("dist-sub").textContent = ""; }
         box.prepend(el("p", {class: "note"}, `${state.op} has no ${sliceName()} cases.`));
         return;
       }
       if (!grouped) $("dist-title").textContent = `${state.op}: every case, latest night`;
-      if (!L[state.op].ref) {
+      if (noRef) {
         if (!grouped) $("dist-sub").textContent = "No reference, so no speedup: see TLX TFLOP/s per case in the table.";
         box.append(el("p", {class: "note"}, `${L[state.op].cases.filter(matches).length} cases; per-case TFLOP/s are in the table.`));
         return;
       }
-      const dotsNote = `Dots: every case, sorted by speedup; color and icon give the status.${errs ? ` ${errs} errored case(s) have no speedup and appear only in the table.` : ""}`;
-      $("dist-sub").textContent = grouped ? `${$("dist-sub").textContent} ${dotsNote}`.trim() : dotsNote.replace("Dots: every case, sorted", "Sorted");
+      const dotsNote = `Dots: every compared case, sorted by speedup; color and icon give the status.${errs ? ` ${errs} errored case(s) have no speedup and appear only in the table.` : ""}${uncompared ? ` ${uncompared} case(s) have no reference; their throughput is in the chart and table below.` : ""}`;
+      $("dist-sub").textContent = grouped ? `${$("dist-sub").textContent} ${dotsNote}`.trim() : dotsNote.replace("Dots: every compared case, sorted", "Sorted");
       cs.sort((a, b) => a.x - b.x);
       const Hh = 240, m = {l: 48, r: 16, t: 12, b: 20};
       const hi = Math.max(1.2, ...cs.map((c) => c.x)) * 1.05;
@@ -767,8 +771,8 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     box.querySelectorAll(".scroll, .yaxis, .note").forEach((n) => n.remove());
     card.hidden = state.op === "all";
     if (card.hidden) return;
-    const o = plat().latest[state.op], hasRef = !!o.ref;
-    const all = o.cases.filter(matches), cs = all.filter((c) => c.s !== "error" && c.t);
+    const o = plat().latest[state.op], all = o.cases.filter(matches), hasRef = hasReference(all);
+    const cs = all.filter((c) => c.s !== "error" && c.t);
     const sort = hasRef || state.casesSort !== "r" && state.casesSort !== "x" ? state.casesSort : "t";
     $("cases-sort").value = sort;
     [...$("cases-sort").options].forEach((op) => { op.disabled = !hasRef && (op.value === "r" || op.value === "x"); });
@@ -825,12 +829,13 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
       const head = el("div", {class: "h"}); head.append(statusBadge(c.s), document.createTextNode(` ${c.d} · ${c.dt}`));
       tip.append(head, el("div", {}, c.l));
       for (const sr of series) {
+        if (!c[sr.k]) continue;
         const r = el("div", {class: "r"}), nm = el("span", {class: "nm"}), k = el("span", {class: "key"});
         k.style.background = sr.color; nm.append(k, document.createTextNode(sr.name));
-        r.append(el("b", {}, fmt(c[sr.k], c[sr.k] < 1 ? 4 : 0, " TF/s")), nm);
+        r.append(el("b", {}, fmtTf(c[sr.k]) + " TF/s"), nm);
         tip.append(r);
       }
-      if (hasRef) tip.append(el("div", {}, `speedup ${fmt(c.x, 3, "×")}`));
+      if (hasRef && c.x) tip.append(el("div", {}, `speedup ${fmt(c.x, 3, "×")}`));
       if (c.n) tip.append(el("div", {class: "note"}, c.n));
       const bx = box.getBoundingClientRect();
       tip.style.display = "block";

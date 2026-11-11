@@ -1008,6 +1008,7 @@ def _compute_ds_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_sca
                      SCALED_P: tl.constexpr = False, OMIT_P_ZERO_INITIALIZER: tl.constexpr = False,
                      GUARD_SCORES: tl.constexpr = True, SCALE_LOOKAHEAD: tl.constexpr = False, Q_SCALE_WORDS=None,
                      DO_SCALE_WORDS=None, EXCHANGE_LDS: tl.constexpr = False, xpmem=None, xdsmem=None, xdssmem=None):
+    keep_mma_layout: tl.constexpr = DK is not None and DV is not None and DS_EXPORT is not None
     direct_causal_guards: tl.constexpr = (LSE_SPLIT and PACK_DSS and not COMMON_PREP and PREP_N == 0
                                           and not IMMUTABLE_KV and WARPS_N == 1 and D == 128 and BM == 64 and BN == 64)
     export_mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 64], transposed=True,
@@ -1075,7 +1076,10 @@ def _compute_ds_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_sca
         dp_mma = tlx.dot_scaled(tlx.require_layout(v, export_layout, pin=False), _lhs_scale_kv64(vs, WARPS_N=WARPS_N),
                                 'e4m3', tlx.require_layout(do, native_rhs, pin=False), dos, 'e4m3',
                                 tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False))
-        scores = tlx.release_layout(scores_mma)
+        if keep_mma_layout:
+            scores = tlx.require_layout(scores_mma, export_mma, pin=False)
+        else:
+            scores = tlx.release_layout(scores_mma)
         if LSE_SPLIT:
             # Split launches disable FP fusion to round the product separately.
             scaled = scores * (sm_scale * 1.4426950408889634)
@@ -1087,7 +1091,10 @@ def _compute_ds_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_sca
             valid = valid & (keys[:, None] <= queries[None, :])
         p = tl.exp2(tl.where(valid, logits, -float('inf')))
         tlx.amd_iglp_opt(3)
-        dp = tlx.release_layout(dp_mma)
+        if keep_mma_layout:
+            dp = tlx.require_layout(dp_mma, export_mma, pin=False)
+        else:
+            dp = tlx.release_layout(dp_mma)
     else:
         if LSE_SPLIT and D == 128 and BM == 64 and BN == 64 and WARPS_N == 1 and (
             (PACK_DSS and not IMMUTABLE_KV and not COMMON_PREP and PREP_N == 0) or
@@ -1097,12 +1104,15 @@ def _compute_ds_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_sca
                                         tlx.require_layout(q, native_rhs, pin=False), qs, 'e4m3',
                                         tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False))
             scores_mma = _guard_kv_scores(scores_mma, export_mma, PACK32=not (PACK_DSS and IMMUTABLE_KV and SCALED_P))
-            scores = tlx.release_layout(scores_mma)
         else:
-            scores = tlx.release_layout(
-                tlx.dot_scaled(tlx.require_layout(k, export_layout, pin=False), _lhs_scale_kv64(ks, WARPS_N=WARPS_N),
-                               'e4m3', tlx.require_layout(q, native_rhs, pin=False), qs, 'e4m3',
-                               tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False)))
+            scores_mma = tlx.dot_scaled(tlx.require_layout(k, export_layout, pin=False),
+                                        _lhs_scale_kv64(ks, WARPS_N=WARPS_N), 'e4m3',
+                                        tlx.require_layout(q, native_rhs, pin=False), qs, 'e4m3',
+                                        tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False))
+        if keep_mma_layout:
+            scores = tlx.require_layout(scores_mma, export_mma, pin=False)
+        else:
+            scores = tlx.release_layout(scores_mma)
         if LSE_SPLIT:
             lse, log_norm = _load_softmax_metadata(lsemem[SLOT], BM, WARPS_N=WARPS_N)
         else:
@@ -1133,12 +1143,15 @@ def _compute_ds_tile(Q, K, V, DO, QS, KS, VS, DOS, LSE, Delta, DK, DV, N, sm_sca
                                     tlx.require_layout(do, native_rhs, pin=False), dos, 'e4m3',
                                     tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False))
             dp_mma = _guard_kv_scores(dp_mma, export_mma)
-            dp = tlx.release_layout(dp_mma)
         else:
-            dp = tlx.release_layout(
-                tlx.dot_scaled(tlx.require_layout(v, export_layout, pin=False), _lhs_scale_kv64(vs, WARPS_N=WARPS_N),
-                               'e4m3', tlx.require_layout(do, native_rhs, pin=False), dos, 'e4m3',
-                               tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False)))
+            dp_mma = tlx.dot_scaled(tlx.require_layout(v, export_layout, pin=False),
+                                    _lhs_scale_kv64(vs, WARPS_N=WARPS_N), 'e4m3',
+                                    tlx.require_layout(do, native_rhs, pin=False), dos, 'e4m3',
+                                    tlx.require_layout(tl.full((BN, BM), 0.0, tl.float32), export_mma, pin=False))
+        if keep_mma_layout:
+            dp = tlx.require_layout(dp_mma, export_mma, pin=False)
+        else:
+            dp = tlx.release_layout(dp_mma)
         if dp_before_exp:
             # Limit this schedule to the N2048 noncausal two-wave owner.
             tl.static_assert(N == 2048 and not CAUSAL and D == 128 and BM == 64 and BN == 64 and WARPS_N == 1

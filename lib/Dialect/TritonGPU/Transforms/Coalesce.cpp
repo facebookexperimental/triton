@@ -80,8 +80,8 @@ static void pickDescriptorLoadStoreLayout(
 }
 
 // The vector AxisInfo proves for this access, kept only as wide as adds no
-// registers to the layout the pad pass accepted (its vector check calls the
-// same helper).
+// registers to the layout the pad pass accepted unless a store predicates off
+// the duplicates (its vector check calls the same helpers).
 static FailureOr<LinearEncodingAttr>
 buildCoalescedMixedRadixEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis,
                                  Operation *op, int numWarps,
@@ -95,7 +95,7 @@ buildCoalescedMixedRadixEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis,
       ctx, type.getShape(),
       getAxisInfoVector(info, type, type.getShape(), order[0],
                         numWarps * threadsPerWarp, maxVecBits),
-      order, numWarps, threadsPerWarp);
+      order, numWarps, threadsPerWarp, npotStoreTakesPredicatedVector(op));
   return getMixedRadixEncoding(ctx, type.getShape(), numWarps, threadsPerWarp,
                                /*numCTAs=*/1, vector, order);
 }

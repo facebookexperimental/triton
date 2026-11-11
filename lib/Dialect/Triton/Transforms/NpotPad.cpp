@@ -143,12 +143,16 @@ static bool hasPaddedLowering(Operation *op) {
          !isa<DescriptorStoreLikeOpInterface>(op);
 }
 
+static bool hasFileLoc(Operation *op) {
+  return bool(op->getLoc()->findInstanceOf<FileLineColLoc>());
+}
+
 // Groups the NPOT tensors connected through their ops (a connected component
 // of the def-use graph). A connected component keeps its shape iff its ops
 // lower a mixed-radix layout without an unsupported reason and, unless one has
-// no padded lowering, each access keeps its padded vector and its mixed-radix
-// layouts take a smaller total in-dim size in sum than its padded Blocked
-// layouts.
+// no padded lowering, its loads and stores take no more vector accesses than
+// padded and its mixed-radix layouts take a smaller total in-dim size in sum
+// than its padded Blocked layouts.
 class ExactComponents {
 public:
   ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp, int numCTAs,
@@ -252,10 +256,14 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
     sum.second += pad.toLinearLayout(pow2).getTotalInDimSize();
     return true;
   };
-  // Vector first, per the spec: a load or store must keep the vector AxisInfo
-  // proves for its padded pointer along the dim Coalesce vectorizes.
+  // A load or store takes numel / vector accesses (bytes / vector bytes):
+  // exact at its NPOT numel and vector, padded at the pow2 numel and the vector
+  // AxisInfo proves for its padded pointer along the dim Coalesce vectorizes.
+  // A store predicates off duplicate threads, so Coalesce gives it the vector
+  // by the predicated rule.
   std::optional<ModuleAxisInfoAnalysis> axisInfo;
-  auto losesVector = [&](Operation *op) -> std::optional<std::string> {
+  auto vectorAccesses =
+      [&](Operation *op) -> std::optional<std::pair<int64_t, int64_t>> {
     Value ptr =
         llvm::TypeSwitch<Operation *, Value>(op)
             .Case<LoadOp, StoreOp>([](auto access) { return access.getPtr(); })
@@ -273,13 +281,11 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
     unsigned vector =
         getAxisInfoVector(info, type, type.getShape(), order[0], threads);
     unsigned exactVector = gpu::getMixedRadixVector(
-        ctx, type.getShape(), vector, order, numWarps, threadsPerWarp);
-    if (exactVector >= pow2Vector)
-      return std::nullopt;
-    return llvm::formatv("NPOT {0} pads: its exact vector is {1} elements, {2} "
-                         "on the pow2 tile",
-                         op->getName(), exactVector, pow2Vector)
-        .str();
+        ctx, type.getShape(), vector, order, numWarps, threadsPerWarp,
+        npotStoreTakesPredicatedVector(op));
+    return std::make_pair(
+        llvm::divideCeil(type.getNumElements(), exactVector),
+        llvm::divideCeil(padded(type).getNumElements(), pow2Vector));
   };
   // The pipeliner copies a dot's operands to LDS in the order and vector
   // Coalesce gives their loads: the last dim fastest and 128 bits unless
@@ -349,7 +355,7 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
                                        numWarps, nonKDim);
   };
   // A dot or a descriptor remarks its target reason; else a padded connected
-  // component with a dot remarks the first reason it pads, once.
+  // component remarks the first reason it pads, once.
   using Reasons = llvm::MapVector<Value, std::pair<Operation *, std::string>>;
   Reasons padReasons, slowReasons;
   auto pad = [&](Value leader, Operation *op, std::string reason) {
@@ -357,16 +363,23 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
     padReasons.try_emplace(leader, op, std::move(reason));
   };
   DenseMap<Value, std::pair<int64_t, int64_t>> totalInDimSizes;
+  struct Accesses {
+    Operation *first;
+    int64_t exact = 0, pow2 = 0;
+  };
+  llvm::MapVector<Value, Accesses> accesses;
   DenseMap<Value, Operation *> firstOps;
-  DenseSet<Value> seen, dots, remarked, unpaddable;
+  DenseSet<Value> seen, remarked, unpaddable;
   mod.walk([&](Operation *op) {
     SmallVector<Value> values = npotValues(op);
     if (values.empty())
       return;
     Value leader = components.getLeaderValue(values.front());
-    firstOps.try_emplace(leader, op);
-    if (isa<DotOpInterface>(op))
-      dots.insert(leader);
+    // Hoisted constants have no source line, so the first op with one anchors
+    // the total-size remark.
+    auto [first, inserted] = firstOps.try_emplace(leader, op);
+    if (!inserted && !hasFileLoc(first->second) && hasFileLoc(op))
+      first->second = op;
     if (!gpu::isMixedRadixLayoutOp(op->getName())) {
       pad(leader, op,
           llvm::formatv("NPOT mixed-radix layout is not yet supported on {0}",
@@ -377,10 +390,13 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
         remarked.insert(leader);
       }
       pad(leader, op, *reason);
-    } else if (std::optional<std::string> reason = losesVector(op)) {
-      slowReasons.try_emplace(leader, op, *reason);
     } else if (std::optional<std::string> reason = slowDot(op)) {
       slowReasons.try_emplace(leader, op, *reason);
+    }
+    if (std::optional<std::pair<int64_t, int64_t>> n = vectorAccesses(op)) {
+      Accesses &sum = accesses.try_emplace(leader, Accesses{op}).first->second;
+      sum.exact += n->first;
+      sum.pow2 += n->second;
     }
     if (!hasPaddedLowering(op))
       unpaddable.insert(leader);
@@ -392,6 +408,13 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
                 "NPOT mixed-radix layout is not yet supported for {0}",
                 v.getType()));
   });
+  for (auto &[leader, sum] : accesses)
+    if (sum.exact > sum.pow2)
+      slowReasons.try_emplace(
+          leader, sum.first,
+          llvm::formatv("NPOT loads and stores pad: exact takes {0} vector "
+                        "accesses, padded {1}",
+                        sum.exact, sum.pow2));
   // Summed over the connected component: a thin index value may take a larger
   // total in-dim size than its padded layout while the tile it addresses takes
   // less.
@@ -406,7 +429,7 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
     if (!unpaddable.contains(leader))
       pad(leader, reason.first, reason.second);
   for (auto &[leader, reason] : padReasons)
-    if (dots.contains(leader) && !remarked.contains(leader))
+    if (!remarked.contains(leader))
       reason.first->emitRemark(reason.second);
 }
 
@@ -490,10 +513,14 @@ bool foldFill(Value v, TypedAttr value) {
          other.getSplatValue<Attribute>() == value;
 }
 
-// Pad lanes of `operand` take `value`.
+// Pad lanes of `operand` take `value`. A transpose's source is filled where it
+// is defined, so the dot's shared-memory copy of it can be made there rather
+// than keep the source live in registers until the dot.
 void Padder::fill(OpOperand &operand, RankedTensorType orig, TypedAttr value) {
   Operation *op = operand.getOwner();
   OpBuilder b(op);
+  if (isa<TransOp>(op))
+    b.setInsertionPointAfterValue(operand.get());
   auto type = cast<RankedTensorType>(operand.get().getType());
   Value pad = arith::ConstantOp::create(b, op->getLoc(),
                                         DenseElementsAttr::get(type, value));
@@ -790,6 +817,10 @@ LogicalResult Padder::accept(Operation *op) {
           operands.push_back({&scale[0], true});
     Builder b(op->getContext());
     for (auto [operand, isScale] : operands) {
+      // Through a transpose the fill goes on its source, so the transpose
+      // still feeds the dot and folds into the dot's shared-memory copy.
+      while (auto trans = operand->get().getDefiningOp<TransOp>())
+        operand = &trans.getSrcMutable();
       auto orig = cast<RankedTensorType>(operand->get().getType());
       Type elem = orig.getElementType();
       TypedAttr value = b.getZeroAttr(elem);

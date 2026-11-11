@@ -124,14 +124,16 @@ def test_issue_filing_lists_unindexed_issues_and_deduplicates_without_closing():
 
     def create(method, path, fields=None, paginate=False):
         calls.append((method, path, fields))
+        if "/commits/" in path:
+            return {"commit": {"committer": {"date": "2026-11-03T23:15:00Z"}}}
         return [] if method == "GET" else {"html_url": "https://github.com/o/r/issues/1", "number": 1}
 
     assert regressions.file_issues([alert, alert], "o/r", "run", create) == ["https://github.com/o/r/issues/1"]
     assert [c[:2] for c in calls[:2]] == [("GET", "repos/o/r/issues?state=open&per_page=100"),
                                           ("GET", "repos/o/r/issues?state=all&labels=perf-regression&per_page=100")]
-    assert [c[0] for c in calls] == ["GET", "GET", "POST"]
-    assert calls[2][2]["labels"] == ["nightly", "perf-regression"]
-    assert "Suspect commit range" in calls[2][2]["body"]
+    assert [c[0] for c in calls] == ["GET", "GET", "GET", "GET", "POST"]
+    assert calls[-1][2]["labels"] == ["nightly", "perf-regression"]
+    assert "Suspect commit range" in calls[-1][2]["body"]
     assert alert["bisect_issue"] == 1
 
 
@@ -141,7 +143,43 @@ def test_bisect_uses_a_good_baseline_not_the_already_regressed_previous_night():
     assert spec["good_sha"] == "20261103" * 5
     assert spec["bad_sha"] == "20261105" * 5
     assert spec["required_ratio"] == regressions.COHORT_RATIO
-    assert "ranked" not in regressions.issue_body(alert, "o/r", "run")
+    commit_dates = {spec["good_sha"]: "2026-11-02T23:15:00Z", spec["bad_sha"]: "2026-11-04T23:45:00Z"}
+    assert "ranked" not in regressions.issue_body(alert, "o/r", "run", commit_dates)
+
+
+def test_issue_endpoint_dates_follow_the_bisected_case():
+    previous = night("20261104")
+    previous["ops"]["flash_attn_mxfp8"]["cases"][0]["tlx_tflops"] = 90
+    current = night("20261105")
+    for case, value in zip(current["ops"]["flash_attn_mxfp8"]["cases"], (65, 30, 100)):
+        case["tlx_tflops"] = value
+    alert = regressions.detect(history() + [previous, current])[0]
+    alert["cases"].sort(key=lambda c: c["key"])
+    spec = regressions.bisect_spec(alert)
+    assert spec["key"] == "b" and alert["cases"][0]["good_date"] == "20261103"
+    commit_dates = {spec["good_sha"]: "2026-11-03T23:15:00Z", spec["bad_sha"]: "2026-11-04T23:45:00Z"}
+    bodies = []
+
+    def api(method, path, fields=None, paginate=False):
+        if "/commits/" in path:
+            return {"commit": {"committer": {"date": commit_dates[path.rsplit("/", 1)[-1]]}}}
+        if method == "POST":
+            bodies.append(fields["body"])
+            return {"html_url": "https://github.com/o/r/issues/1", "number": 1}
+        return []
+
+    regressions.file_issues([alert], "o/r", "run", api)
+    body = bodies[0]
+    assert "[Source nightly run](run)" in body
+    assert "## Detection status" in body
+    assert "## Measurement context" in body
+    assert "Only one representative case is selected for bisection" in body
+    assert f"git archive {spec['bad_sha']} python/test/tlx_benchmark" in body
+    assert repr(spec["key"]) in body
+    assert "| Endpoint | Commit | Commit date (UTC) | Benchmark date |" in body
+    for role, sha, benchmark_date in (("Good", spec["good_sha"], "2026-11-04"), ("Bad", spec["bad_sha"], "2026-11-05")):
+        summary = f"https://github.com/o/r/releases/download/tlx-ops-bench/{benchmark_date.replace('-', '')}.mi350.json"
+        assert f"| {role} | [{sha[:8]}](https://github.com/o/r/commit/{sha}) | {commit_dates[sha]} | [{benchmark_date}]({summary}) |" in body
 
 
 def test_only_new_regression_issues_queue_one_representative_bisect_job():
@@ -214,6 +252,8 @@ def test_one_episode_is_filed_once_across_detectors_and_after_a_person_closes_it
     posts = []
 
     def api(method, path, fields=None, paginate=False):
+        if "/commits/" in path:
+            return {"commit": {"committer": {"date": "2026-11-03T23:15:00Z"}}}
         if method == "POST":
             posts.append(fields)
             return {"html_url": "https://github.com/o/r/issues/1", "number": 1}

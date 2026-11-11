@@ -1053,6 +1053,19 @@ bool shouldSkipOp(
       "ttng.tcgen5_global_alloc",
       "amdg.in_thread_transpose",
   };
+  // A remote barrier view that only feeds arrives or two-CTA TMA loads is
+  // folded into them; see barrierArriveTarget.
+  if (isa<ttng::MapToRemoteBufferOp>(op) && !op->use_empty() &&
+      llvm::all_of(op->getUsers(), [&](Operation *user) {
+        if (auto load = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(user)) {
+          auto twoCTA = load->getAttrOfType<BoolAttr>("two_cta");
+          return load.getBarrier() == op->getResult(0) && twoCTA &&
+                 twoCTA.getValue();
+        }
+        return isa<ttng::ArriveBarrierOp>(user) &&
+               user->getOperand(0) == op->getResult(0);
+      }))
+    return true;
   // Emit ttg.memdesc_index as tlx.local_view when a real consumer needs the
   // view (MMA, wait, local_store, loop iter-arg, ...). Skip it when it has no
   // users, or when every user is a barrier-lifecycle op (init_barrier /
@@ -1532,6 +1545,19 @@ printTaskBody(Region &region, llvm::raw_ostream &os,
 }
 
 // Print warp_specialize operation in TLX async_tasks format
+// The barrier argument(s) of tlx.barrier_arrive. TLX maps a barrier to a
+// peer CTA itself and rejects a remote_view, so a remote barrier is spelled
+// as its local view plus the rank.
+static std::string
+barrierArriveTarget(Value barrier,
+                    const DenseMap<Value, Value> *argSubstitutionMap) {
+  if (auto remote = barrier.getDefiningOp<ttng::MapToRemoteBufferOp>())
+    return getValueName(remote.getSrc(), argSubstitutionMap) +
+           ", remote_cta_rank=" +
+           getValueName(remote.getCtaRank(), argSubstitutionMap);
+  return getValueName(barrier, argSubstitutionMap);
+}
+
 void printLocComment(Operation *op, llvm::raw_ostream &os);
 
 // `tlx.local_alloc(..., reuse=base)` viewing `base` as `dstType`.
@@ -1564,6 +1590,31 @@ static bool isRetypingReinterpret(Operation *op) {
   return srcType && dstType &&
          (srcType.getElementType() != dstType.getElementType() ||
           srcType.getShape() != dstType.getShape());
+}
+
+// Whether the source lowers this warp_specialize with direct warp-ID dispatch,
+// where each worker runs its partition once and exits, instead of parking the
+// workers in a dispatch loop until the kernel ends. The module records it as
+// ttg.single-warp-specialize: TLX's exclusive=True sets it in Fixup, and
+// AllocateWarpGroups, which runs before this printer in the compiler, sets it
+// for a single AutoWS warp_specialize. That condition is repeated here for
+// TTGIR printed before AllocateWarpGroups, such as a dumped .ttgir file.
+static bool usesSingleWarpSpecialize(Operation *wsOp) {
+  auto mod = wsOp->getParentOfType<ModuleOp>();
+  if (ttg::hasSingleWarpSpecialize(mod))
+    return true;
+  unsigned numWsOps = 0;
+  mod.walk([&](ttg::WarpSpecializeOp) { ++numWsOps; });
+  if (numWsOps != 1)
+    return false;
+  // kWarpSpecializeTagAttrName, which AutoWS puts on the loops it specializes.
+  return wsOp
+      ->walk([](Operation *inner) {
+        return inner->hasAttr("ttg.warp_specialize.tag")
+                   ? WalkResult::interrupt()
+                   : WalkResult::advance();
+      })
+      .wasInterrupted();
 }
 
 // Retyping reinterprets inside a partition, hoisted to just before
@@ -1624,7 +1675,10 @@ void printWarpSpecialize(
   // Print "with tlx.async_tasks():"
   for (unsigned i = 0; i < indent; ++i)
     os << "  ";
-  os << "with tlx.async_tasks():\n";
+  os << "with tlx.async_tasks(";
+  if (usesSingleWarpSpecialize(op))
+    os << "exclusive=True";
+  os << "):\n";
 
   // Get the operands passed to warp_specialize
   SmallVector<Value> wsOperands;
@@ -2234,6 +2288,12 @@ void printSimplifiedOp(
        << getValueName(op->getOperand(0), argSubstitutionMap);
     if (auto sizeAttr = op->getAttrOfType<IntegerAttr>("size"))
       os << ", " << sizeAttr.getInt();
+    // A two-CTA TMA load signals the leader's barrier for both CTAs, so only
+    // the leader expects the bytes; dropping the predicate makes the peer
+    // expect bytes that never arrive.
+    Value pred = cast<ttng::BarrierExpectOp>(op).getPred();
+    if (!isConstantTrue(pred))
+      os << ", pred=" << getValueName(pred, argSubstitutionMap);
     os << ")";
     printLocComment(op, os);
     return;
@@ -2296,7 +2356,7 @@ void printSimplifiedOp(
       os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
     Value desc = op->getOperand(0);
     SmallVector<Value> coords;
-    Value barrier, result;
+    Value barrier, result, pred;
     for (unsigned i = 1; i < op->getNumOperands(); ++i) {
       Value v = op->getOperand(i);
       if (auto memType = dyn_cast<ttg::MemDescType>(v.getType())) {
@@ -2305,7 +2365,9 @@ void printSimplifiedOp(
           barrier = v;
         else
           result = v;
-      } else if (!v.getType().isInteger(1)) {
+      } else if (v.getType().isInteger(1)) {
+        pred = v;
+      } else {
         coords.push_back(v);
       }
     }
@@ -2316,9 +2378,17 @@ void printSimplifiedOp(
         os << ", ";
       os << getValueName(coords[i], argSubstitutionMap);
     }
+    auto twoCTA = op->getAttrOfType<BoolAttr>("two_cta");
+    bool isTwoCTA = twoCTA && twoCTA.getValue();
+    // With two_ctas TLX maps the barrier to the leader CTA itself, and a
+    // remote_view of a remote_view is rejected.
+    if (isTwoCTA)
+      if (auto remote = barrier.getDefiningOp<ttng::MapToRemoteBufferOp>())
+        barrier = remote.getSrc();
     os << "], " << getValueName(barrier, argSubstitutionMap);
-    if (auto twoCTA = op->getAttrOfType<BoolAttr>("two_cta");
-        twoCTA && twoCTA.getValue())
+    if (pred && !isConstantTrue(pred))
+      os << ", pred=" << getValueName(pred, argSubstitutionMap);
+    if (isTwoCTA)
       os << ", two_ctas=True";
     os << ")";
     printLocComment(op, os);
@@ -2497,7 +2567,8 @@ void printSimplifiedOp(
          llvm::zip(wait.getBarriers(), wait.getBarrierPreds())) {
       for (unsigned i = 0; i < indent; ++i)
         os << "  ";
-      os << "tlx.barrier_arrive(" << getValueName(barrier, argSubstitutionMap);
+      os << "tlx.barrier_arrive("
+         << barrierArriveTarget(barrier, argSubstitutionMap);
       if (!isConstantTrue(pred))
         os << ", pred=" << getValueName(pred, argSubstitutionMap);
       os << ")";
@@ -2684,7 +2755,7 @@ void printSimplifiedOp(
       return;
     }
     os << "tlx.barrier_arrive("
-       << getValueName(op->getOperand(0), argSubstitutionMap);
+       << barrierArriveTarget(op->getOperand(0), argSubstitutionMap);
     // count is required on this op, but tolerate its absence on hand-written
     // IR rather than crash; 1 is the value the op defaults to anyway.
     auto countAttr = op->getAttrOfType<IntegerAttr>("count");

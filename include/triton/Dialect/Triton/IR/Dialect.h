@@ -233,6 +233,11 @@ getNpotDotSlowReason(Operation *dot, ArrayRef<NpotDotOperandAccess> operands,
 std::optional<std::string>
 getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout);
 
+// Whether store `op` takes getMixedRadixVector's predicated vector: unless its
+// value is computed elementwise from a tt.load (also through control flow),
+// whose layout a wider store would have to convert from.
+bool npotStoreTakesPredicatedVector(Operation *op);
+
 // The same for a tensor descriptor op on `target`.
 std::optional<std::string>
 getNpotDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,

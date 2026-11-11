@@ -7,6 +7,7 @@ tt.func @sum(%ptr: !tt.ptr<f32>) {
   // CHECK: %[[PAD:.*]] = arith.constant dense<-0.000000e+00> : tensor<128xf32>
   // CHECK: %[[X:.*]] = arith.select %[[LIVE]], %{{.*}}, %[[PAD]] : tensor<128xi1>, tensor<128xf32>
   // CHECK: "tt.reduce"(%[[X]])
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 768 registers x lanes x warps, their pow2 layouts 256}}
   %p = tt.splat %ptr : !tt.ptr<f32> -> tensor<96x!tt.ptr<f32>>
   %x = tt.load %p : tensor<96x!tt.ptr<f32>>
   %s = "tt.reduce"(%x) <{axis = 0 : i32}> ({
@@ -28,6 +29,7 @@ tt.func @sum_pair(%fptr: !tt.ptr<f32>, %iptr: !tt.ptr<i32>) {
   // CHECK: %[[IPAD:.*]] = arith.constant dense<0> : tensor<128xi32>
   // CHECK: %[[Y:.*]] = arith.select %[[LIVE]], %{{.*}}, %[[IPAD]]
   // CHECK: "tt.reduce"(%[[X]], %[[Y]])
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 1536 registers x lanes x warps, their pow2 layouts 512}}
   %fp = tt.splat %fptr : !tt.ptr<f32> -> tensor<96x!tt.ptr<f32>>
   %x = tt.load %fp : tensor<96x!tt.ptr<f32>>
   %ip = tt.splat %iptr : !tt.ptr<i32> -> tensor<96x!tt.ptr<i32>>
@@ -48,6 +50,7 @@ tt.func @sum_pair(%fptr: !tt.ptr<f32>, %iptr: !tt.ptr<i32>) {
 tt.func @sum_pair_pow2_axis(%ptr: !tt.ptr<f32>) {
   // CHECK-NOT: arith.select
   // CHECK: "tt.reduce"
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 1536 registers x lanes x warps, their pow2 layouts 512}}
   %p = tt.splat %ptr : !tt.ptr<f32> -> tensor<3x32x!tt.ptr<f32>>
   %x = tt.load %p : tensor<3x32x!tt.ptr<f32>>
   %s:2 = "tt.reduce"(%x, %x) <{axis = 1 : i32}> ({
@@ -68,6 +71,7 @@ tt.func @max(%ptr: !tt.ptr<f32>) {
   // CHECK: %[[X:.*]] = arith.select %{{.*}}, %{{.*}}, %[[PAD]]
   // CHECK-NOT: tt.gather
   // CHECK: "tt.reduce"(%[[X]])
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 768 registers x lanes x warps, their pow2 layouts 256}}
   %p = tt.splat %ptr : !tt.ptr<f32> -> tensor<96x!tt.ptr<f32>>
   %x = tt.load %p : tensor<96x!tt.ptr<f32>>
   %s = "tt.reduce"(%x) <{axis = 0 : i32}> ({
@@ -86,6 +90,7 @@ tt.func @max_no_inf(%ptr: !tt.ptr<f8E4M3FN>) {
   // CHECK: arith.constant dense<-4.480000e+02> : tensor<128xf8E4M3FN>
   // CHECK-NOT: tt.gather
   // CHECK: "tt.reduce"
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 768 registers x lanes x warps, their pow2 layouts 256}}
   %p = tt.splat %ptr : !tt.ptr<f8E4M3FN> -> tensor<96x!tt.ptr<f8E4M3FN>>
   %x = tt.load %p : tensor<96x!tt.ptr<f8E4M3FN>>
   %s = "tt.reduce"(%x) <{axis = 0 : i32}> ({
@@ -108,6 +113,7 @@ tt.func @argmax(%ptr: !tt.ptr<f32>) {
   // CHECK: %[[I:.*]] = tt.gather %[[R:.*]][%{{.*}}] {axis = 0 : i32}
   // CHECK: %[[XI:.*]] = arith.select %[[LIVE]], %[[R]], %[[I]]
   // CHECK: "tt.reduce"(%[[XV]], %[[XI]])
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 1152 registers x lanes x warps, their pow2 layouts 384}}
   %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32>
   %p = tt.splat %ptr : !tt.ptr<f32> -> tensor<96x!tt.ptr<f32>>
   %x = tt.load %p : tensor<96x!tt.ptr<f32>>
@@ -128,6 +134,7 @@ tt.func @argmax(%ptr: !tt.ptr<f32>) {
 tt.func @pow2_axis(%ptr: !tt.ptr<f32>) {
   // CHECK-NOT: arith.select
   // CHECK: "tt.reduce"
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 1152 registers x lanes x warps, their pow2 layouts 384}}
   %p = tt.splat %ptr : !tt.ptr<f32> -> tensor<3x32x!tt.ptr<f32>>
   %x = tt.load %p : tensor<3x32x!tt.ptr<f32>>
   %s = "tt.reduce"(%x) <{axis = 1 : i32}> ({
@@ -148,6 +155,7 @@ tt.func @scans(%ptr: !tt.ptr<i32>) {
   // CHECK: "tt.scan"(%[[X]]) <{axis = 0 : i32, reverse = true}>
   // CHECK-NOT: arith.select
   // CHECK: "tt.scan"(%{{.*}}) <{axis = 0 : i32, reverse = false}>
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 1536 registers x lanes x warps, their pow2 layouts 512}}
   %p = tt.splat %ptr : !tt.ptr<i32> -> tensor<96x!tt.ptr<i32>>
   %x = tt.load %p : tensor<96x!tt.ptr<i32>>
   %rev = "tt.scan"(%x) <{axis = 0 : i32, reverse = true}> ({
@@ -166,6 +174,7 @@ tt.func @scans(%ptr: !tt.ptr<i32>) {
 // -----
 
 tt.func @no_pad_value(%ptr: !tt.ptr<f32>) {
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 768 registers x lanes x warps, their pow2 layouts 256}}
   %p = tt.splat %ptr : !tt.ptr<f32> -> tensor<3x32x!tt.ptr<f32>>
   %x = tt.load %p : tensor<3x32x!tt.ptr<f32>>
   // expected-error @+1 {{'tt.reduce' op over an NPOT axis with a combiner that has no pad value is unsupported}}
@@ -181,6 +190,7 @@ tt.func @no_pad_value(%ptr: !tt.ptr<f32>) {
 
 // One result without a pad value rejects the whole reduce.
 tt.func @pair_no_pad_value(%ptr: !tt.ptr<f32>) {
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 768 registers x lanes x warps, their pow2 layouts 256}}
   %p = tt.splat %ptr : !tt.ptr<f32> -> tensor<96x!tt.ptr<f32>>
   %x = tt.load %p : tensor<96x!tt.ptr<f32>>
   // expected-error @+1 {{'tt.reduce' op over an NPOT axis with a combiner that has no pad value is unsupported}}
@@ -199,6 +209,7 @@ tt.func @pair_no_pad_value(%ptr: !tt.ptr<f32>) {
 tt.func @histogram(%ptr: !tt.ptr<i32>) {
   // CHECK: %[[LIVE:.*]] = arith.cmpi slt
   // CHECK: tt.histogram %{{.*}}, %[[LIVE]] : tensor<128xi32> -> tensor<16xi32>
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 768 registers x lanes x warps, their pow2 layouts 256}}
   %p = tt.splat %ptr : !tt.ptr<i32> -> tensor<96x!tt.ptr<i32>>
   %x = tt.load %p : tensor<96x!tt.ptr<i32>>
   %h = tt.histogram %x : tensor<96xi32> -> tensor<16xi32>
@@ -213,6 +224,7 @@ tt.func @gather(%src: tensor<64xf32>, %ptr: !tt.ptr<i32>) {
   // CHECK: %[[ZERO:.*]] = arith.constant dense<0> : tensor<128xi32>
   // CHECK: %[[IDX:.*]] = arith.select %[[LIVE]], %{{.*}}, %[[ZERO]]
   // CHECK: tt.gather %{{.*}}[%[[IDX]]] {axis = 0 : i32} : (tensor<64xf32>, tensor<128xi32>) -> tensor<128xf32>
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 1152 registers x lanes x warps, their pow2 layouts 384}}
   %p = tt.splat %ptr : !tt.ptr<i32> -> tensor<96x!tt.ptr<i32>>
   %idx = tt.load %p : tensor<96x!tt.ptr<i32>>
   %g = tt.gather %src[%idx] {axis = 0 : i32} : (tensor<64xf32>, tensor<96xi32>) -> tensor<96xf32>
@@ -225,6 +237,7 @@ tt.func @gather(%src: tensor<64xf32>, %ptr: !tt.ptr<i32>) {
 tt.func @atomic_rmw(%ptr: !tt.ptr<f32>) {
   // CHECK: %[[LIVE:.*]] = arith.cmpi slt
   // CHECK: tt.atomic_rmw fadd, relaxed, gpu, %{{.*}}, %{{.*}}, %[[LIVE]] : (tensor<128x!tt.ptr<f32>>, tensor<128xf32>, tensor<128xi1>) -> tensor<128xf32>
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 1152 registers x lanes x warps, their pow2 layouts 384}}
   %p = tt.splat %ptr : !tt.ptr<f32> -> tensor<96x!tt.ptr<f32>>
   %v = arith.constant dense<1.0> : tensor<96xf32>
   %r = tt.atomic_rmw fadd, relaxed, gpu, %p, %v : (tensor<96x!tt.ptr<f32>>, tensor<96xf32>) -> tensor<96xf32>
@@ -251,6 +264,7 @@ tt.func @atomic_cas(%ptr: !tt.ptr<i32>) {
 tt.func @atomic_cas_join(%ptr: !tt.ptr<i32>) {
   %p = tt.splat %ptr : !tt.ptr<i32> -> tensor<96x!tt.ptr<i32>>
   %v = arith.constant dense<1> : tensor<96xi32>
+  // expected-remark @+1 {{NPOT mixed-radix layout is not yet supported on tt.join}}
   %j = tt.join %v, %v : tensor<96xi32> -> tensor<96x2xi32>
   // expected-error @+1 {{'tt.atomic_cas' op on an NPOT tensor is unsupported}}
   %r = tt.atomic_cas acq_rel, gpu, %p, %v, %v : (tensor<96x!tt.ptr<i32>>, tensor<96xi32>, tensor<96xi32>) -> tensor<96xi32>

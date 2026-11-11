@@ -2,12 +2,14 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Conversion/MLIRTypes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -381,7 +383,28 @@ static Value createTmemScaleOperand(Value tensor, Attribute tmemEncoding,
                        getNpotPow2AllocShape(tensorType.getShape()));
   auto tmemLayout = nvidia_gpu::getDefaultLayoutForTmemLdSt(tmemType, numWarps);
   auto stagedType = tensorType.cloneWithEncoding(tmemLayout);
-  Value converted = ConvertLayoutOp::create(rewriter, loc, stagedType, tensor);
+  // An NPOT MN load can't take a 4-scale vector without extra registers, so
+  // it loads 1 byte and misses cp.async; load it in the TMEM row word layout.
+  Value converted, src = tensor;
+  if (auto cvt = tensor.getDefiningOp<ConvertLayoutOp>();
+      cvt && cvt->hasOneUse())
+    src = cvt.getSrc();
+  auto load = src.getDefiningOp<LoadOp>();
+  if (load && load->hasOneUse() &&
+      !llvm::isPowerOf2_64(tensorType.getShape()[0])) {
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPoint(load);
+    IRMapping map;
+    for (Value v : load->getOperands())
+      if (auto ty = dyn_cast<RankedTensorType>(v.getType()))
+        map.map(v,
+                ConvertLayoutOp::create(rewriter, load.getLoc(),
+                                        ty.cloneWithEncoding(tmemLayout), v));
+    converted = rewriter.clone(*load, map)->getResult(0);
+    converted.setType(stagedType);
+  } else {
+    converted = ConvertLayoutOp::create(rewriter, loc, stagedType, tensor);
+  }
   return triton::nvidia_gpu::TMEMAllocOp::create(rewriter, loc, tmemType,
                                                  /*token=*/Type(), converted);
 }
@@ -1353,16 +1376,36 @@ public:
 };
 
 namespace {
+// B's fast dim before layouts exist: that of the tile B is loaded as (a
+// tt.load's AxisInfo order, as Coalesce picks it; row-major otherwise, as a
+// descriptor load is), through a tt.trans, unless the dtype forces K-major.
+unsigned getNpotDotBFastDim(DotOp dot) {
+  Type elemTy = dot.getA().getType().getElementType();
+  if (!elemTy.isF16() && !elemTy.isBF16())
+    return 0;
+  Value src = dot.getB();
+  auto trans = src.getDefiningOp<TransOp>();
+  if (trans)
+    src = trans.getSrc();
+  unsigned srcFast = 1;
+  if (auto load = src.getDefiningOp<LoadOp>()) {
+    ModuleAxisInfoAnalysis axisInfo(dot->getParentOfType<ModuleOp>());
+    if (AxisInfo *info = axisInfo.getAxisInfo(load.getPtr()))
+      srcFast = getOrderFromContiguity(info->getContiguity())[0];
+  }
+  if (!trans)
+    return srcFast;
+  return llvm::find(trans.getOrder(), srcFast) - trans.getOrder().begin();
+}
+
 // Why BlockedToMMA can't issue `dot` exactly on wgmma, or std::nullopt. Its
 // warps must sit on each dim's power-of-two part, as the mixed-radix layout
 // puts them; then exact issues no more atoms per warp than padded.
 std::optional<std::string> getMmaUnsupportedReason(DotOp dot, int numWarps) {
   ArrayRef<int64_t> shape = dot.getType().getShape();
-  // B's order isn't known yet: take the N-major order of a row-major load
-  // unless the dtype forces K-major.
   RankedTensorType bTy = dot.getB().getType();
   Type elemTy = dot.getA().getType().getElementType();
-  unsigned fast = elemTy.isF16() || elemTy.isBF16() ? 1 : 0;
+  unsigned fast = getNpotDotBFastDim(dot);
   std::optional<nvidia_gpu::NvmmaSmemAttrs> attrs = getMmaV3BSmemAttrs(
       bTy, {fast, 1 - fast},
       CGAEncodingAttr::get1CTALayout(dot.getContext(), bTy.getRank()));

@@ -1559,15 +1559,9 @@ class CUDABackend(BaseBackend):
             if (not knobs.nvidia.disable_ptxas_opt and any(is_enabled(opt, mode) for mode in ["consan", "fpsan"])):
                 ptx_extra_options += ["--opt-level", "1"]
 
-            # compile_iq Stage-3 consumption (gated, default off; fail-open): if the PTX hash hits
-            # the ACF store, append --apply-controls (version check + lookup live in the helper).
-            if _compile_iq_apply_enabled():
-                try:
-                    from triton.magnon.consume import acf_args_for
-
-                    ptx_extra_options += acf_args_for(src, arch, get_ptxas(self.target.arch).version)
-                except Exception:
-                    pass
+            # compile_iq consumption: only the ACF twin built by apply_compile_iq_acf passes controls.
+            # The regular compile must stay plain, or the launch-time A/B would compare ACF to ACF.
+            ptx_extra_options += list(apply_controls or [])
 
             ptxas_cmd = [
                 ptxas,
