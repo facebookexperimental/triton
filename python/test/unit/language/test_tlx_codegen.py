@@ -6978,6 +6978,16 @@ def test_amd_split_workgroup_barrier_rejects_named_barriers(bar, count, match):
         )
 
 
+@pytest.mark.parametrize("compile_fn", [compile_for_gfx950, compile_for_gfx942])
+def test_amd_split_workgroup_barrier_requires_gfx1250(compile_fn):
+    with pytest.raises(CompilationError, match=r"require gfx1250 on AMD, got gfx9(50|42)"):
+        compile_fn(
+            _amd_split_workgroup_barrier_kernel,
+            signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+            constexprs={"BAR": 0, "COUNT": 128},
+        )
+
+
 def test_async_amd_desc_store_compiles_gfx1250(device):
     """async_amd_descriptor_store produces TDM store ops in TTGIR."""
     compiled = compile_for_gfx1250(
