@@ -618,6 +618,35 @@ CATALOG: tuple[OpSpec, ...] = (
         dtypes=_BF16,
         accepts=lambda d: 1 <= d.get("KEY_DIM", 0) <= 128 and 1 <= d.get("VALUE_DIM", 0) <= 128,
     ),
+    OpSpec(
+        op="paged_attention_decode",
+        arch="gfx950",
+        variant="split_k_mfma",
+        impl="triton.tlx.ops.kernels.paged_attn.gfx950_decode:paged_attention_decode",
+        dtypes=_FP16,
+        accepts=lambda d: (d["HEAD_DIM"] in (64, 128) and 1 <= d["QLEN"] <= 4 and d["QLEN"] * d["GROUP"] <= 64),
+    ),
+    OpSpec(
+        op="paged_attention_decode_workspace",
+        arch="gfx950",
+        variant="split_k_mfma",
+        impl="triton.tlx.ops.kernels.paged_attn.gfx950_decode:paged_attention_decode_workspace",
+        dtypes=_FP16,
+    ),
+    OpSpec(
+        op="allocate_paged_kv_cache_5d",
+        arch="gfx950",
+        variant="aiter_packed",
+        impl="triton.tlx.ops.kernels.paged_attn.gfx950_decode:allocate_5d_kv_cache",
+        dtypes=_FP16,
+    ),
+    OpSpec(
+        op="reshape_and_cache_5d",
+        arch="gfx950",
+        variant="aiter_packed",
+        impl="triton.tlx.ops.kernels.paged_attn.gfx950_decode:reshape_and_cache_5d",
+        dtypes=_FP16,
+    ),
 )
 
 CATALOG += tuple(
