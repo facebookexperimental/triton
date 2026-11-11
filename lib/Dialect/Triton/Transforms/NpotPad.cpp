@@ -490,10 +490,14 @@ bool foldFill(Value v, TypedAttr value) {
          other.getSplatValue<Attribute>() == value;
 }
 
-// Pad lanes of `operand` take `value`.
+// Pad lanes of `operand` take `value`. A transpose's source is filled where it
+// is defined, so the dot's shared-memory copy of it can be made there rather
+// than keep the source live in registers until the dot.
 void Padder::fill(OpOperand &operand, RankedTensorType orig, TypedAttr value) {
   Operation *op = operand.getOwner();
   OpBuilder b(op);
+  if (isa<TransOp>(op))
+    b.setInsertionPointAfterValue(operand.get());
   auto type = cast<RankedTensorType>(operand.get().getType());
   Value pad = arith::ConstantOp::create(b, op->getLoc(),
                                         DenseElementsAttr::get(type, value));
@@ -790,6 +794,10 @@ LogicalResult Padder::accept(Operation *op) {
           operands.push_back({&scale[0], true});
     Builder b(op->getContext());
     for (auto [operand, isScale] : operands) {
+      // Through a transpose the fill goes on its source, so the transpose
+      // still feeds the dot and folds into the dot's shared-memory copy.
+      while (auto trans = operand->get().getDefiningOp<TransOp>())
+        operand = &trans.getSrcMutable();
       auto orig = cast<RankedTensorType>(operand->get().getType());
       Type elem = orig.getElementType();
       TypedAttr value = b.getZeroAttr(elem);
