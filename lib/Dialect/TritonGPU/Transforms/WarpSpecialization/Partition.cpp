@@ -47,7 +47,7 @@ LogicalResult verifyPartitionIdsAttr(Operation *op, StringRef attrName,
 }
 
 LogicalResult verifyPartitionAttrs(Operation *op) {
-  bool useMetaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+  bool useMetaWS = triton::isMetaWSEnabled(op);
   // META_WS_CHANGE: PSM intentionally leaves some nested operations without
   // partition annotations for later task-id propagation.
   if (op->hasAttr(kWarpSpecializeAttrName) && !useMetaWS) {
