@@ -185,4 +185,17 @@ void registerSchedulingBarrierExternalModel(DialectRegistry &registry) {
         SchedulingBarrierModel<ROCDL::SchedGroupBarrier>>(*ctx);
   });
 }
+
+triton::BarrierStages AMDMembarAnalysis::getBarrierStages(Operation *op) {
+  // By convention no shared-memory access sits between the signal and its
+  // wait, so the signal is the earliest point synchronizing earlier accesses.
+  // This also lets an async wait right before the signal defer to it.
+  if (isa<triton::amdgpu::WorkgroupBarrierSignalOp,
+          triton::amdgpu::WorkgroupBarrierWaitOp>(op)) {
+    triton::BarrierStages stages;
+    stages.beforeMemoryEffects = true;
+    return stages;
+  }
+  return MembarAnalysis::getBarrierStages(op);
+}
 } // namespace mlir::triton::AMD

@@ -813,3 +813,37 @@ tt.func @pipelined_loop_refill_after_synced_local_load(%A: !tt.ptr<f16>, %ub: i3
   tt.return
 }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // A split workgroup barrier synchronizes accesses before its signal with
+  // those after its wait. The TDM wait defers to the signal.
+  // CHECK-LABEL: split_workgroup_barrier_orders_tdm_and_reads
+  tt.func @split_workgroup_barrier_orders_tdm_and_reads(
+      %a: !tt.tensordesc<64x64xf16, #shared>, %x: f32) -> f32 {
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %load = amdg.async_tdm_copy_global_to_local %a into %buf : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // CHECK: amdg.async_tdm_wait
+    // CHECK-NEXT: amdg.workgroup_barrier_signal
+    // CHECK-NEXT: arith.mulf
+    // CHECK-NEXT: amdg.workgroup_barrier_wait
+    // CHECK-NEXT: ttg.local_load
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: amdg.workgroup_barrier_signal
+    // CHECK-NEXT: amdg.workgroup_barrier_wait
+    // CHECK-NEXT: amdg.async_tdm_copy_global_to_local
+    %wait = amdg.async_tdm_wait %load {num = 0 : i32}
+    amdg.workgroup_barrier_signal
+    %y = arith.mulf %x, %x : f32
+    amdg.workgroup_barrier_wait
+    %value = ttg.local_load %buf : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> tensor<64x64xf16, #blocked>
+    amdg.workgroup_barrier_signal
+    amdg.workgroup_barrier_wait
+    %refill = amdg.async_tdm_copy_global_to_local %a into %buf : !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return %y : f32
+  }
+}
