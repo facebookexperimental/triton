@@ -1956,24 +1956,6 @@ def test_availability_buffer_atomic_bf16_rejects_gfx942():
         )
 
 
-def test_availability_buffer_load_to_local_rejects_gfx1250():
-    with pytest.raises(RuntimeError, match="BufferLoadToLocal unsupported on target architecture"):
-        compile_for_gfx1250(
-            _buffer_load_to_local_contiguity_subslice_kernel,
-            signature={"x_ptr": "*bf16"},
-            constexprs={},
-        )
-
-
-def test_availability_scheduled_mfma_rejects_gfx1250():
-    with pytest.raises(RuntimeError, match="supported only on CDNA3.*CDNA4"):
-        compile_for_gfx1250(
-            _amd_scheduled_mfma_gfx942_kernel,
-            signature={"a_ptr": "*bf16", "b_ptr": "*bf16", "output_ptr": "*fp32"},
-            constexprs={"PERSISTENT": False, "TRANSPOSED": True, "INSTR_K": 16},
-        )
-
-
 def _load_tlx_gfx9_gemm_bench_module(module_name="_tlx_amd_test_gfx9_bench"):
     repo_root = Path(__file__).resolve().parents[4]
     bench_path = (repo_root / "third_party" / "tlx" / "tutorials" / "gfx9_gemm" / "a16w16" / "bench.py")
@@ -5673,24 +5655,6 @@ def test_padded_local_slice_uses_transposed_lds_read_gfx950():
     assert "ds_read_u16" not in amdgcn
 
 
-@pytest.mark.parametrize(
-    "mode, error",
-    [
-        (0, "requires at least one"),
-        (1, "clamp_bounds requires add_offsets"),
-        (2, "clamp_bounds and set_bounds are mutually exclusive"),
-        (3, "add_offsets must have length 2"),
-    ],
-)
-def test_update_tensor_descriptor_rejects_invalid_gfx1250(mode, error):
-    with pytest.raises(CompilationError, match=error):
-        compile_for_gfx1250(
-            _invalid_update_tensor_descriptor_kernel,
-            signature={"x_ptr": "*fp16"},
-            constexprs={"MODE": mode},
-        )
-
-
 def test_update_tensor_descriptor_rejects_unsupported_target():
     with pytest.raises(CompilationError, match="only available on AMD TDM-capable targets"):
         compile_for_gfx950(
@@ -6880,111 +6844,6 @@ def test_loop_carried_dot_layout_cleanup_compiles_gfx950(device):
     assert len(compiled.asm["amdgcn"]) > 0
 
 
-def test_async_amd_desc_load_compiles_gfx1250(device):
-    """async_amd_descriptor_load should produce TDM ops in TTGIR."""
-    compiled = compile_for_gfx1250(
-        _async_amd_desc_load_kernel,
-        signature={"x_ptr": "*fp16", "output_ptr": "*fp16"},
-        constexprs={"M": 32, "N": 32},
-    )
-    ttgir = compiled.asm["ttgir"]
-    assert "async_tdm_copy_global_to_local" in ttgir
-    assert "clamp_bounds" in ttgir
-    assert "async_tdm_wait" in ttgir
-    assert "local_load" in ttgir
-    assert "amdgcn" in compiled.asm
-    assert len(compiled.asm["amdgcn"]) > 0
-
-
-def test_async_amd_desc_load_fused_compiles_gfx1250(device):
-    """Two positioned TLX descriptors lower to one fused TDM instruction."""
-    compiled = compile_for_gfx1250(
-        _async_amd_desc_load_fused_kernel,
-        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr": "*fp16"},
-        constexprs={"M": 16, "N": 32},
-    )
-    ttgir = compiled.asm["ttgir"]
-    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
-    assert "warp_used_hints = array<i32: 3, 12>" in ttgir
-    assert len(re.findall(r"tensor_load_to_lds|tensor\.load\.to\.lds", compiled.asm["amdgcn"])) == 1
-
-
-def test_async_amd_desc_load_with_token_compiles_gfx1250(device):
-    """async_amd_descriptor_load with token-threaded wait compiles."""
-    compiled = compile_for_gfx1250(
-        _async_amd_desc_load_with_token_kernel,
-        signature={"x_ptr": "*fp16", "output_ptr": "*fp16"},
-        constexprs={"M": 32, "N": 32},
-    )
-    ttgir = compiled.asm["ttgir"]
-    assert "async_tdm_copy_global_to_local" in ttgir
-    assert "async_tdm_wait" in ttgir
-
-
-def test_async_amd_desc_load_pred_compiles_gfx1250(device):
-    """async_amd_descriptor_load with i1 pred extends to i32."""
-    compiled = compile_for_gfx1250(
-        _async_amd_desc_load_pred_kernel,
-        signature={"x_ptr": "*fp16", "output_ptr": "*fp16"},
-        constexprs={"M": 32, "N": 32},
-    )
-    ttgir = compiled.asm["ttgir"]
-    assert "async_tdm_copy_global_to_local" in ttgir
-
-
-def test_async_amd_desc_store_compiles_gfx1250(device):
-    """async_amd_descriptor_store produces TDM store ops in TTGIR."""
-    compiled = compile_for_gfx1250(
-        _async_amd_desc_store_kernel,
-        signature={"x_ptr": "*fp16", "y_ptr": "*fp16"},
-        constexprs={"M": 32, "N": 32},
-    )
-    ttgir = compiled.asm["ttgir"]
-    assert "async_tdm_copy_global_to_local" in ttgir
-    assert "async_tdm_copy_local_to_global" in ttgir
-    assert ttgir.count("clamp_bounds") == 2
-
-
-def test_update_tensor_descriptor_store_compiles_gfx1250(device):
-    compiled = compile_for_gfx1250(
-        _update_tensor_descriptor_store_kernel,
-        signature={"x_ptr": "*fp16", "y_ptr": "*fp16"},
-        constexprs={"M": 32, "N": 32},
-    )
-    ttgir = compiled.asm["ttgir"]
-    assert "amdg.update_tensor_descriptor" in ttgir
-    assert "set_bounds =" in ttgir
-    assert "pred =" in ttgir
-    assert "clamp_bounds" in ttgir
-    assert "amdg.async_tdm_copy_local_to_global" in ttgir
-    assert ttgir.count("clamp_bounds") == 1
-    # Two explicit input updates and one output update are the only descriptor
-    # mutations. Neither pre-positioned copy may add a no-op update.
-    assert ttgir.count("amdg.update_tensor_descriptor") == 3
-
-
-def test_amd_desc_prefetch_compiles_gfx1250(device):
-    """amd_descriptor_prefetch_tensor produces tdm_prefetch in TTGIR."""
-    compiled = compile_for_gfx1250(
-        _amd_desc_prefetch_kernel,
-        signature={"x_ptr": "*fp16", "output_ptr": "*fp16"},
-        constexprs={"M": 32, "N": 32},
-    )
-    ttgir = compiled.asm["ttgir"]
-    assert "tdm_prefetch" in ttgir
-
-
-def test_amd_desc_prefetch_speculative_compiles_gfx1250(device):
-    """amd_descriptor_prefetch_tensor with speculative=True compiles."""
-    compiled = compile_for_gfx1250(
-        _amd_desc_prefetch_speculative_kernel,
-        signature={"x_ptr": "*fp16", "output_ptr": "*fp16"},
-        constexprs={"M": 32, "N": 32},
-    )
-    ttgir = compiled.asm["ttgir"]
-    assert "tdm_prefetch" in ttgir
-
-
 def test_async_descriptor_load_rejects_amd(device):
     """NV-only async_descriptor_load raises NotImplementedError on AMD."""
 
@@ -7036,81 +6895,6 @@ def test_async_descriptor_prefetch_rejects_amd(device):
             signature={"x_ptr": "*fp16"},
             constexprs={"M": 32, "N": 32},
         )
-
-
-def test_padded_layout_local_alloc_compiles_gfx1250(device):
-    """local_alloc with an explicit padded_shared_layout_encoding compiles."""
-
-    @triton.jit
-    def _kernel(x_ptr, output_ptr, M: tl.constexpr, N: tl.constexpr):
-        layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(N, 128 // 16)], [M, N])
-        buf = tlx.local_alloc((M, N), tl.float16, 1, layout=layout)
-        buf0 = tlx.local_view(buf, 0)
-        x = tlx.local_load(buf0)
-        tl.store(output_ptr + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :], x)
-
-    compiled = compile_for_gfx1250(
-        _kernel,
-        signature={"x_ptr": "*fp16", "output_ptr": "*fp16"},
-        constexprs={"M": 32, "N": 32},
-    )
-    ttgir = compiled.asm["ttgir"]
-    assert "padded_shared" in ttgir
-
-
-def test_async_amd_desc_load_auto_propagates_padded_layout_gfx1250(device):
-    """Default local_alloc + async_amd_descriptor_load auto-propagates padded encoding."""
-    compiled = compile_for_gfx1250(
-        _async_amd_desc_load_kernel,
-        signature={"x_ptr": "*fp16", "output_ptr": "*fp16"},
-        constexprs={"M": 32, "N": 32},
-    )
-    ttgir = compiled.asm["ttgir"]
-    assert "padded_shared" in ttgir
-
-
-@pytest.mark.parametrize(
-    "view, expected_op",
-    [(0, "ttg.memdesc_subslice"), (1, "ttg.memdesc_reshape")],
-    ids=["slice", "reshape"],
-)
-def test_pinned_tdm_memdesc_views_compile_gfx1250(device, view, expected_op):
-    compiled = compile_for_gfx1250(
-        _pinned_tdm_memdesc_view_kernel,
-        signature={"input_ptr": "*fp16", "output_ptr": "*fp16"},
-        constexprs={"M": 32, "N": 128, "VIEW": view},
-    )
-    ttgir = compiled.asm["ttgir"]
-    assert ttgir.count("amdg.async_tdm_copy_global_to_local") == 1
-    assert expected_op in ttgir
-    assert "#ttg.padded_shared<[128:+8]" in ttgir
-    assert "#tlx.user_layout" not in ttgir
-    assert "#tlx.no_verify_layout" not in ttgir
-    assert "tlx.require_layout" not in ttgir
-    amdgcn = compiled.asm["amdgcn"]
-    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
-
-
-def test_amd_tdm_gemm_pipelined_compiles_gfx1250(device):
-    """Compile-only: validates TDM GEMM tutorial produces TDM ops + padded encoding."""
-    compiled = compile_for_gfx1250(
-        _amd_tdm_gemm_kernel,
-        signature={
-            "a_ptr": "*fp16",
-            "b_ptr": "*fp16",
-            "c_ptr": "*fp16",
-            "M": "i32",
-            "N": "i32",
-            "K": "i32",
-        },
-        constexprs={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32},
-    )
-    ttgir = compiled.asm["ttgir"]
-    assert "amdg.async_tdm_copy_global_to_local" in ttgir
-    assert "amdg.tdm_prefetch" in ttgir
-    assert "ttg.padded_shared" in ttgir, "expected propagated padded encoding"
-    amdgcn = compiled.asm["amdgcn"]
-    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
 
 
 def test_assume_uniform_compiles_gfx950(device):

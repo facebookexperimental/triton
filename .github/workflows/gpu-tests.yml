@@ -54,6 +54,7 @@ jobs:
       h100_plan: ${{ steps.select.outputs.h100_plan }}
       b200_plan: ${{ steps.select.outputs.b200_plan }}
       mi350_plan: ${{ steps.select.outputs.mi350_plan }}
+      gfx1250: ${{ steps.select.outputs.gfx1250 }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -221,9 +222,27 @@ jobs:
       failures: ${{ needs.cpu-tests.outputs.failures }}
       sha: ${{ needs.select.outputs.sha }}
 
+  # MI450 (gfx1250) emulated on a GitHub-hosted CPU runner via roc-jitsu;
+  # see .github/workflows/gfx1250.yml. It shares the same wheel as the
+  # physical-GPU suites but needs no GPU runner.
+  gfx1250:
+    needs: [select, build]
+    if: needs.select.outputs.gfx1250 == 'true'
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      issues: write
+    uses: ./.github/workflows/gfx1250.yml
+    with:
+      ref: ${{ needs.select.outputs.sha }}
+      wheel_url: ${{ needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+
   gpu-tests:
     name: GPU tests
-    needs: [select, build, h100, b200, mi350, cpu-tests]
+    needs: [select, build, h100, b200, mi350, cpu-tests, gfx1250]
     if: always() && github.repository_owner == 'facebookexperimental'
     runs-on: ubuntu-latest
     steps:
@@ -239,7 +258,7 @@ jobs:
           needs = json.loads(os.environ["NEEDS"])
           if needs["select"]["result"] != "success":
               raise SystemExit("GPU platform selection did not succeed")
-          for job in ("build", "h100", "b200", "mi350", "cpu-tests"):
+          for job in ("build", "h100", "b200", "mi350", "cpu-tests", "gfx1250"):
               if job == "build" and os.environ["EVENT_NAME"] == "pull_request":
                   continue
               selected = needs["select"]["outputs"]["cpu" if job == "cpu-tests" else job] == "true"
