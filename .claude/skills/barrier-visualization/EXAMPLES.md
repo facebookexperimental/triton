@@ -287,3 +287,61 @@ Data flow "A2" (task 0 -> task 2):
   %108  = ttng.warp_group_dot %106, %104, ... {async_task_id = array<i32: 2>} (line 128) -- consumer use
   Will become: producer_acquire/copy/commit in default, consumer_wait/load in partition1
 ```
+
+---
+
+## Focused Reuse-Group Timeline Template
+
+Use this form when auditing one physical reuse group after software-pipeline
+expansion.
+
+```
+Selected group: <buffer.id / physical allocation>
+Members: <owner range>, <packed sibling ranges>
+
+Counters:
+  O      = <outer-loop accumulated-count iter_arg>
+  A      = <inner accumulated-count iter_arg carried by the outer loop>
+  A_next = <inner-loop increment expression>
+  A_exit = <inner-loop result used by the epilogue>
+
+Barrier aliases:
+  <NAME>_FULL  : <allocation> -> <partition argument> -> <indexed aliases>
+  <NAME>_EMPTY : <allocation> -> <partition argument> -> <indexed aliases>
+
+Partition <producer task> -- producer/overwrite
+  Prologue, in final TTGIR order:
+    wait <owner EMPTY>, phase=<SSA expression> = <symbolic expression>
+    wait <sibling EMPTY>, phase=<SSA expression> = <symbolic expression>
+    <owner MMA/write>
+
+  Steady state, in final TTGIR order:
+    wait <owner EMPTY>, phase=<expression>
+    wait <sibling EMPTY>, phase=<expression>
+    <owner MMA/write>
+    wait <sibling EMPTY>, phase=<expression>   # native acquire, if present
+    <sibling MMA/write>
+
+  Epilogue, in final TTGIR order:
+    wait <sibling EMPTY>, phase=<expression>
+    <sibling MMA/write>
+
+Partition <consumer task> -- consumer/release
+  Prologue: <relevant operations or none>
+  Steady state, in final TTGIR order:
+    wait <sibling FULL>, phase=<expression>
+    <load/read sibling>
+    arrive <sibling EMPTY>                     # no phase operand; flips phase
+    <increment/yield accumulated count>
+  Epilogue: <relevant operations or none>
+
+Boundary check:
+  epilogue phase          = phase(A_exit)
+  next prologue phase     = phase(A_exit + 1)
+  equivalent?            = YES/NO
+  missing or extra edge  = <description>
+```
+
+Retain duplicated waits rather than deduplicating them in the report. Two waits
+on the same barrier and phase can reveal that an operation moved from the
+prologue to the epilogue even when the total wait count is unchanged.
