@@ -143,6 +143,50 @@ matching while result and after-region argument, and the after-region
 After rewriting, runs dead code elimination and removes orphaned operations
 that are no longer referenced after partitioning.
 
+### Step 7: Conditional TMEM rescale materialization
+
+FA forward represents its optional accumulator rescale as an eager SSA select
+before tensor-memory allocation is hoisted. `HoistTMEMAlloc` first folds that
+select into a predicated accumulator `TMEMStoreOp`. M partitioning creates one
+scalar predicate and one accumulator view per partition. Partition scheduling
+then co-locates the scalar predicate chain with the correction store. It also
+pulls the single-consumer tensor elementwise predicate operation directly
+feeding that chain, such as `alpha < 1`, into the correction partition while
+leaving its tensor operands as channel boundaries. This makes the
+already-required alpha value the channel boundary and avoids materializing a
+redundant tensor predicate channel. After warp specialization and software
+pipelining have materialized each task, the post-pipeline `HoistTMEMAlloc` pass
+rewrites each such update as:
+
+```mlir
+scf.if %should_rescale {
+  %acc = ttng.tmem_load %buffer
+  %scaled = arith.mulf %acc, %alpha
+  ttng.tmem_store %scaled, %buffer, %true
+}
+```
+
+Delaying the rewrite until each task has been materialized keeps the
+branch within the accumulator task instead of creating an unsupported
+cross-task async-token channel. At that point synchronization is normally
+barrier-managed and the TMEM ops are tokenless; if explicit tokens remain, the
+then branch yields the written token and the else branch yields the incoming
+token. The side-effecting branch cannot be canonicalized back to an eager
+select, so a false predicate skips the accumulator TMEM load, arithmetic, and
+store.
+
+The scalar predicate walk reaches a store predicate through the
+`partitionDependentScalar` mode of `getBackwardSliceToPartition`, which admits
+elementwise ops, scalar constants, and a `ReduceOp` over the partitioned
+dimension. A scalar leaf with no defining op is a block argument, and the two
+kinds are not interchangeable: a `triton::FuncOp` argument is uniform across
+partitions and is shared, matching `sliceOp`, which leaves function arguments
+alone. Any other region argument — an `scf.for` iter-arg, or an `scf.if` /
+`scf.while` carried value — may hold a partition-dependent value the walk
+cannot see, and `sliceOp` would slice its entire parent region even though the
+walk never registered it. Such a predicate rejects the partition trial rather
+than leaving the analysis and the rewrite disagreeing.
+
 ## Key Design Points
 
 ### Partition Dimension Tracking
