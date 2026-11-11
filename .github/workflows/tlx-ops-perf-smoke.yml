@@ -29,7 +29,6 @@ concurrency:
 
 env:
   TORCH_VERSION: "2.14.0"
-  TORCH_INDEX: https://download.pytorch.org/whl/cu130
 
 jobs:
   resolve:
@@ -91,7 +90,23 @@ jobs:
   smoke:
     needs: [resolve, build]
     if: needs.resolve.outputs.head != ''
-    runs-on: nvidia-dgx-b200
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: b200
+            runner: nvidia-dgx-b200
+            torch_index: https://download.pytorch.org/whl/cu130
+          - platform: h100
+            runner: linux-gcp-h100
+            torch_index: https://download.pytorch.org/whl/cu130
+          # mi350 staged: uncomment after b200/h100 calibrate. The runner pool
+          # is small and shared with correctness + nightly, and the rocm env
+          # needs its own validation run first.
+          # - platform: mi350
+          #   runner: linux-fb-triton-mi350-1
+          #   torch_index: https://download.pytorch.org/whl/rocm7.2
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
       id-token: write
@@ -110,12 +125,15 @@ jobs:
       - name: Set up test environment
         uses: ./.ci/.github/actions/setup-test-env
         with:
-          backend: cuda
-          arch: ''
+          backend: ${{ contains(matrix.torch_index, 'rocm') && 'rocm' || 'cuda' }}
+          arch: ${{ matrix.platform == 'mi350' && 'gfx950' || '' }}
           torch: torch==${{ env.TORCH_VERSION }}
-          torch-index-url: ${{ env.TORCH_INDEX }}
+          torch-index-url: ${{ matrix.torch_index }}
           packages: numpy pytest pytest-timeout torchao
+          # Keep the release torch on its bundled ROCm libraries.
+          rocm-lib-path: ""
       - name: Refresh the linker cache
+        if: ${{ !contains(matrix.torch_index, 'rocm') }}
         run: sudo ldconfig
       - name: Install prebuilt Triton
         uses: ./.ci/.github/actions/install-prebuilt-triton
@@ -138,7 +156,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tlx-ops-perf-smoke-${{ github.run_id }}
+          name: tlx-ops-perf-smoke-${{ github.run_id }}-${{ matrix.platform }}
           path: |
             /tmp/tlx_benchmark/*.json
             ${{ runner.temp }}/perf-smoke.xml
@@ -156,9 +174,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: tlx-ops-perf-smoke-${{ github.run_id }}
+          pattern: tlx-ops-perf-smoke-${{ github.run_id }}-*
           path: raw
-      - name: Summarize and compare vs nightly baseline
+      - name: Summarize and compare vs nightly baselines
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ needs.resolve.outputs.head }}
@@ -166,17 +184,29 @@ jobs:
           SMOKE_RESULT: ${{ needs.smoke.result }}
         run: |
           set -euo pipefail
-          if ! ls raw/*.json >/dev/null 2>&1; then
-            printf '## TLX.ops perf smoke (b200, advisory)\n\nNo bench results (smoke job %s) — no signal.\n' \
-              "${SMOKE_RESULT}" > verdict.md
-            exit 0
-          fi
+          : > verdict.md
+          echo "## TLX.ops perf smoke (advisory)" >> verdict.md
+          echo "" >> verdict.md
+          echo "Head \`${HEAD_SHA:0:12}\` vs nearest nightly baselines." >> verdict.md
+          gh release download tlx-ops-bench --pattern '*.b200.json' --pattern '*.h100.json' --pattern '*.mi350.json' --dir history
           TODAY=$(date -u +%Y%m%d)
-          python3 .github/scripts/tlx_ops_bench_dashboard.py summarize raw \
-            --platform b200 --version "0.0.0.dev${TODAY}" --sha "${HEAD_SHA}" --out pr.json
-          gh release download tlx-ops-bench --pattern '*.b200.json' --dir history
-          python3 .github/scripts/tlx_ops_perf_smoke_compare.py pr.json history \
-            --base-date "${BASE_DATE}" --head "${HEAD_SHA}" --out verdict.md
+          for platform in b200 h100 mi350; do
+            dir="raw/tlx-ops-perf-smoke-${{ github.run_id }}-${platform}"
+            if ! ls "${dir}"/*.json >/dev/null 2>&1; then
+              continue  # platform did not run (staged entry) or produced nothing
+            fi
+            python3 .github/scripts/tlx_ops_bench_dashboard.py summarize "${dir}" \
+              --platform "${platform}" --version "0.0.0.dev${TODAY}" --sha "${HEAD_SHA}" --out "pr-${platform}.json"
+            python3 .github/scripts/tlx_ops_perf_smoke_compare.py "pr-${platform}.json" history \
+              --platform "${platform}" --base-date "${BASE_DATE}" --head "${HEAD_SHA}" --out "verdict-${platform}.md"
+            echo "" >> verdict.md
+            cat "verdict-${platform}.md" >> verdict.md
+          done
+          {
+            echo ""
+            echo "Full numbers stay on the nightly suite; smoke covers a \`--head 8 --fwd-only\`"
+            echo "subset (\`bench_mm\`, \`bench_flash_attn*\`, \`bench_norm\`)."
+          } >> verdict.md
       - name: Comment on PR
         if: needs.resolve.outputs.pr != ''
         env:
