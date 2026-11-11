@@ -12,7 +12,6 @@ from triton.backends.compiler import GPUTarget
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
-from triton.language.extra.tlx.tutorials import amd_fa_tdm_pipelined as _gfx1250_attention
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton._filecheck import run_parser
@@ -7756,18 +7755,24 @@ def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M, BLOCK_K)
     assert amdgcn.count("tensor_store_from_lds") + amdgcn.count("tensor.store.from.lds") == 1
 
 
-def test_gfx1250_attn_fwd_tdm_pipelined_compiles():
+@pytest.mark.parametrize("dtype,output_dtype,block_m,block_n,fixed", [
+    ("bf16", "fp32", 128, 128, False),
+    ("fp16", "fp16", 256, 64, True),
+    ("bf16", "bf16", 256, 64, True),
+])
+def test_gfx1250_attn_fwd_tdm_pipelined_compiles(dtype, output_dtype, block_m, block_n, fixed):
     """Compile-only check: lowers cleanly to TDM intrinsics + WMMA."""
     from triton.compiler.compiler import ASTSource, compile as triton_compile
     from triton.backends.compiler import GPUTarget
+    from triton.tlx.ops.kernels.flash_attn.gfx1250 import attn_fwd_tdm_pipelined_kernel
 
     src = ASTSource(
-        fn=_gfx1250_attention.attn_fwd_tdm_pipelined_kernel,
+        fn=attn_fwd_tdm_pipelined_kernel,
         signature={
-            "q_ptr": "*bf16",
-            "k_ptr": "*bf16",
-            "v_ptr": "*bf16",
-            "o_ptr": "*fp32",
+            "q_ptr": f"*{dtype}",
+            "k_ptr": f"*{dtype}",
+            "v_ptr": f"*{dtype}",
+            "o_ptr": f"*{output_dtype}",
             "stride_qz": "i64",
             "stride_qh": "i64",
             "stride_qm": "i64",
@@ -7790,14 +7795,20 @@ def test_gfx1250_attn_fwd_tdm_pipelined_compiles():
             "BLOCK_M": "constexpr",
             "BLOCK_N": "constexpr",
             "HEAD_SZ": "constexpr",
+            "USE_FIXED_REFERENCE": "constexpr",
+            "QUERY_TILES_FIRST": "constexpr",
+            "BATCH": "i32",
+            "NUM_HEADS": "i32",
         },
         constexprs={
             "SM_SCALE": 1.0 / (128**0.5),
             "SEQLEN_Q": 1024,
             "SEQLEN_K": 1024,
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
             "HEAD_SZ": 128,
+            "USE_FIXED_REFERENCE": fixed,
+            "QUERY_TILES_FIRST": fixed,
         },
     )
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options={"num_warps": 4})

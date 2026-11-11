@@ -33,7 +33,7 @@ accumulates tens of GB of autotune workspaces; at "heuristic" the same call is
 under a second. Pass `space="heuristic"` explicitly for a fast first call. The
 gfx950 implementation currently provides only `"heuristic"`.
 
-Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
+Ops with no heuristic yet -- flash_attn on sm90/sm100/gfx950, flash_attn_mxfp8, hstu_attn,
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can offer a
@@ -825,17 +825,22 @@ def addmm_mul_add_launch(bias, a, b, x0, res=None, *, out):
     return fn(bias, a, b, x0, res, out=out)
 
 
-def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
-    """Fused attention over `(Z, H, N_CTX, HEAD_DIM)` fp16/bf16. Differentiable.
+def flash_attn(q, k, v, causal=False, sm_scale=None, *, space=None):
+    """Fused BHSD attention with architecture-specific dtype and shape support.
 
+    gfx1250 supports noncausal D128 FP16/BF16 inference, including cross attention.
+    Its default space is "heuristic"; "smoke" selects the same configuration.
+    sm90, sm100, and gfx950 support backward and retain the "full" default.
     `sm_scale` defaults to `HEAD_DIM ** -0.5`.
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise InvalidInput("tlx.ops.flash_attn expects rank-4 Q/K/V tensors")
     space_name, invariance = _normalize_space_arg("flash_attn", space)
-    if space_name not in ("full", "smoke"):
-        raise InvalidInput(f"tlx.ops.flash_attn does not provide space={space_name!r}")
     fn, spec = impl_for("flash_attn", device=q.device)
+    if space_name is None:
+        space_name = spec.default_space
+    if space_name not in ("full", "smoke", spec.default_space):
+        raise InvalidInput(f"tlx.ops.flash_attn does not provide space={space_name!r}")
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
     check_backward(spec, q, k, v)
     _check_enforced("flash_attn", spec, invariance)
