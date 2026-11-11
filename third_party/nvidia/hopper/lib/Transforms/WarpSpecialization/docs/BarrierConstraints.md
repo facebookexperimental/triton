@@ -245,7 +245,7 @@ attribute directly (as currently defined). The two approaches can coexist:
 **Files:**
 - `nvidia/hopper/include/Transforms/WSBarrierReorder.h` — `canAdvanceWSBarrier`, `canAdvanceWSBarrierArrivePastWait`, `sinkWSArrives`, `raiseWSWaits`, `buildBarrierToMemoryOpMap`, `optimizeWSBarrierLocations`
 - `lib/Dialect/TritonNvidiaGPU/Transforms/InterleaveTMem.cpp` — liveness-oriented consumer of the above
-- `lib/Dialect/TritonNvidiaGPU/Transforms/UnifyWSBarrierLocations.cpp` — codegen-oriented wait co-location
+- `lib/Dialect/TritonNvidiaGPU/Transforms/UnifyWSBarrierLocations.cpp` — codegen-oriented wait co-location and operand ordering
 
 ### Motivation
 
@@ -289,8 +289,21 @@ before the existing tmem_load sinking. Four steps:
    identify AutoWS TMA-ready and TMEM-ready waits whose load chains meet at the
    same consumer. Raise the later wait beside the earlier wait only when the
    crossed range contains load preparation, broadcast/cast work, and barriers
-   accepted by the same channel-graph or ordered-region safety rules. See
+   accepted by the same channel-graph or ordered-region safety rules. It then
+   orders the TMEM load before the streamable SMEM broadcast chain while
+   leaving the unified waits fixed. See
    [WS Barrier Location Unification](WSBarrierLocationUnification.md).
+
+After wait co-location, `UnifyWSBarrierLocations` also handles a
+two-operand computation pattern where an independent SMEM load/broadcast and a
+TMEM load feed the same pure operation. Code partitioning naturally places both
+consumers immediately before that operation, which can leave the SMEM value
+live across the wide TMEM load. The pass moves the SMEM
+load/release/preparation chain after the TMEM channel while leaving both waits
+at their unified location. Profitability requires a cheap SMEM preparation
+chain ending in a broadcast of at least 32 elements per thread. When global
+WS-barrier reordering is disabled, the pass uses the same profitability and
+safety checks but moves the complete SMEM channel as the fallback.
 
 ### `canAdvanceWSBarrier`
 
