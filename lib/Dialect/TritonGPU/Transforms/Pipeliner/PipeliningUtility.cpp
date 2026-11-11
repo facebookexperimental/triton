@@ -183,7 +183,11 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   if (op->hasTrait<OpTrait::LocalLoadTrait>())
     return op;
-  if (isa<ttg::LocalStoreOp>(op))
+  // Under warp specialization a local_store may write a buffer that another
+  // partition reads under an mbarrier handshake. The paired wait_barrier is
+  // predicated, so the store must be too (wrapped in scf.if below).
+  if (isa<ttg::LocalStoreOp>(op) &&
+      !op->getParentOfType<ttg::WarpSpecializeOp>())
     return op;
   if (isa<ttng::TMEMAllocOp, ttng::TMEMLoadOp>(op))
     return op;
@@ -217,7 +221,8 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   // iterations of a dynamic loop: executing a store/reduce/scatter for an
   // iteration past the real trip count would corrupt the output (e.g. a
   // spurious atomic add for a TMA reduce). Guard them with scf.if(pred).
-  if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
+  if (isa<ttg::LocalStoreOp>(op) ||
+      isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
           ttng::AsyncTMAScatterOp, ttng::TMAStoreTokenWaitOp>(op)) {
     rewriter.setInsertionPoint(op);
     bool hasResults = op->getNumResults() > 0;
