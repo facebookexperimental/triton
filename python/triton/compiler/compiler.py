@@ -570,6 +570,7 @@ class CompiledKernel:
         self.function = None
         self._run = None
         self._unload_module = None
+        self._compile_iq_plain_module = None
 
     @property
     def launch_metadata_schema(self):
@@ -589,6 +590,10 @@ class CompiledKernel:
 
             if self._unload_module is not None:
                 self._unload_module(self.module)
+                # compile_iq: the plain module replaced by a winning ACF twin.
+                plain_module = getattr(self, "_compile_iq_plain_module", None)
+                if plain_module is not None:
+                    self._unload_module(plain_module)
             self.module = None
             self._module_pid = None
 
@@ -616,8 +621,11 @@ class CompiledKernel:
         # compile_iq: collect a task / resolve a pending ACF on the first launch through `run`. Gated
         # by TRITON_COMPILE_IQ_COLLECT / _APPLY; reaches kernels that bypass the JITFunction.run hooks.
         if _compile_iq_collect_enabled() or _compile_iq_apply_enabled():
-            from triton.magnon.collector import wrap_launcher
-            self._run = wrap_launcher(self, run)
+            try:
+                from triton.magnon.collector import wrap_launcher
+                self._run = wrap_launcher(self, run)
+            except ImportError:  # fail-open: launch unwrapped
+                pass
         # not enough shared memory to run the kernel
         max_shared = _max_shared_mem(device, utils)
         if self.metadata.shared > max_shared:
@@ -701,6 +709,7 @@ class CompiledKernel:
         self._compile_iq_acf_cubin = None  # one-shot: resolve once, win or lose
         if acf_cubin is None:
             return
+        acf_module = None  # set while the loaded twin is not the live module; unloaded on exit
         try:
             self._init_handles()  # ensure the plain function/module are loaded
             device = driver.active.get_current_device()
@@ -711,9 +720,8 @@ class CompiledKernel:
             # competition. Production keeps the no-regression A/B; smoke tests set this so a store HIT
             # deterministically applies regardless of in-process measurement noise.
             if os.environ.get("TRITON_COMPILE_IQ_FORCE_APPLY"):
-                self.module, self.function, self.kernel = acf_module, acf_function, acf_cubin
-                self.asm["cubin"] = acf_cubin
-                self._build_dispatcher()
+                self._compile_iq_adopt(acf_module, acf_function, acf_cubin)
+                acf_module = None
                 if os.environ.get("TRITON_COMPILE_IQ_DEBUG"):
                     print(f"[compile_iq.freewin] {self.name}: FORCE-APPLY -> kept acf "
                           "(competition skipped)", flush=True)
@@ -730,9 +738,8 @@ class CompiledKernel:
             winner = "acf" if acf_ms < plain_ms else "plain"
             if winner == "acf":
                 # ACF wins -> make the twin the live kernel (in-memory only; compile cache untouched).
-                self.module, self.function, self.kernel = acf_module, acf_function, acf_cubin
-                self.asm["cubin"] = acf_cubin
-                self._build_dispatcher()  # rebuild the C dispatcher for the new function, if used
+                self._compile_iq_adopt(acf_module, acf_function, acf_cubin)
+                acf_module = None
             if os.environ.get("TRITON_COMPILE_IQ_DEBUG"):
                 print(
                     f"[compile_iq.freewin] {self.name}: plain={plain_ms:.4f}ms acf={acf_ms:.4f}ms "
@@ -741,6 +748,20 @@ class CompiledKernel:
             if os.environ.get("TRITON_COMPILE_IQ_DEBUG"):
                 print(f"[compile_iq.freewin] {self.name}: error (fail-open, kept plain): "
                       f"{type(e).__name__}: {e}", flush=True)
+        finally:
+            if acf_module is not None and self._unload_module is not None:
+                try:
+                    self._unload_module(acf_module)
+                except Exception:
+                    pass
+
+    def _compile_iq_adopt(self, module, function, cubin):
+        """Make the ACF twin the live kernel. The plain module stays loaded until __del__, because
+        callers may still hold its function handle (see magnon.collector.wrap_launcher)."""
+        self._compile_iq_plain_module = self.module
+        self.module, self.function, self.kernel = module, function, cubin
+        self.asm["cubin"] = cubin
+        self._build_dispatcher()  # rebuild the C dispatcher for the new function, if used
 
     @property
     def run(self):
