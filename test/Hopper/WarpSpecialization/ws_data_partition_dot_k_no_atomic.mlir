@@ -5,10 +5,8 @@
 // deterministically and choose the legal N-dimension direction here.
 
 // CHECK-LABEL: @dot_k_operand_without_atomic_store
-// CHECK: ttng.warp_group_dot
-// CHECK-SAME: !ttg.memdesc<128x64xf16, #shared, #smem>
-// CHECK-SAME: !ttg.memdesc<64x128xf16, #shared, #smem>
-// CHECK-SAME: -> tensor<128x128xf32, #mma>
+// Each partition's whole chain (both dots plus its store) is emitted before the
+// other partition's, instead of pairing the two partitions' dots by shape.
 // CHECK: ttng.warp_group_dot
 // CHECK-SAME: !ttg.memdesc<128x64xf16, #shared, #smem>
 // CHECK-SAME: !ttg.memdesc<64x128xf16, #shared, #smem>
@@ -16,6 +14,11 @@
 // CHECK: ttng.warp_group_dot
 // CHECK-SAME: !ttg.memdesc<128x128xf16, #shared, #smem>
 // CHECK-SAME: !ttg.memdesc<128x128xf16, #shared, #smem>
+// CHECK-SAME: -> tensor<128x128xf32, #mma>
+// CHECK: tt.store
+// CHECK: ttng.warp_group_dot
+// CHECK-SAME: !ttg.memdesc<128x64xf16, #shared, #smem>
+// CHECK-SAME: !ttg.memdesc<64x128xf16, #shared, #smem>
 // CHECK-SAME: -> tensor<128x128xf32, #mma>
 // CHECK: ttng.warp_group_dot
 // CHECK-SAME: !ttg.memdesc<128x128xf16, #shared, #smem>

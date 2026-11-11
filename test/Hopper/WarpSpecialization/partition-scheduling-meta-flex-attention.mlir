@@ -39,12 +39,12 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: [[COMP_A:[0-9]+]]>
 // CHECK: ttng.tmem_load {{.*}} ttg.partition = array<i32: [[COMP_B:[0-9]+]]>
 //
-// --- Split scf.if: the condition must NOT have a ttg.partition attribute.
-//     If it keeps partition 0 (from the original shared scf.if),
-//     doTaskIdPropagate expands the split scf.if's task set to include
-//     partition 0, creating a cross-partition SMEM channel. ---
-// CHECK: arith.cmpi
-// CHECK-NOT: ttg.partition
+// --- Split scf.if: the condition is replicated into exactly the two
+//     computation partitions that consume it. It must NOT retain partition 0
+//     from the original shared scf.if: doTaskIdPropagate would then expand the
+//     split scf.if's task set to include partition 0, creating a
+//     cross-partition SMEM channel. ---
+// CHECK: arith.cmpi {{.*}}ttg.partition = array<i32: [[COMP_B]], [[COMP_A]]>
 //
 // --- Split scf.if: ops inside then-block get the parent's computation partition.
 //     The scf.if itself inherits loop scheduling attributes from the original so
