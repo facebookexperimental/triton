@@ -897,7 +897,9 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         registry = importlib.import_module(module_name).FOCUS
         assert dict(registry.defaults) == defaults
         assert all(suite.name == "sm90_baseline" or (module_name == "triton.tlx.ops.kernels.mm._shapes"
-                                                     and suite.name == "gfx950_addmm") or pattern.fullmatch(suite.name)
+                                                     and suite.name == "gfx950_addmm") or
+                   (module_name == "triton.tlx.ops.kernels.flash_attn._shapes"
+                    and suite.name == "sm100_d256_batch1024") or pattern.fullmatch(suite.name)
                    for suite in registry.suites)
 
     mm = importlib.import_module("triton.tlx.ops.kernels.mm._shapes").FOCUS
