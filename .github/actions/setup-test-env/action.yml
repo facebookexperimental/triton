@@ -48,14 +48,15 @@ runs:
     - name: Ensure C compiler
       # Triton JIT-compiles its driver shim at runtime, so every GPU test job
       # needs a system C compiler. The runner image normally provides one;
-      # install it when a redeployed image does not (#4751).
+      # install it when a redeployed image does not (#4751). Inductor's
+      # cpp_wrapper tests also need g++ (torch._inductor.config.cpp.cxx).
       shell: bash
       run: |
-        if command -v gcc >/dev/null || command -v clang >/dev/null || command -v cc >/dev/null; then
+        if command -v g++ >/dev/null; then
           exit 0
         fi
         sudo apt-get update
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc g++
     - name: Provide the venv
       shell: bash
       env:
