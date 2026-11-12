@@ -7,8 +7,9 @@ The GPU workflows are reusable test workflows; trigger the parent to run them.
 `workflows/gpu-tests-nightly.yml` runs suites too slow for PRs and pushes once a
 day and on demand: it builds the same wheel and runs TritonBench on H100, B200
 and MI350, filing nightly issues under the same platform workflow names.
-Fork PRs pass the wheel through GitHub artifacts and skip AWS and the S3 cache;
-their downloads are checksum-verified too.
+Fork PRs have no AWS credentials. They reuse a ready S3 wheel through a read-only
+lookup when one exists and otherwise build and pass the wheel through GitHub
+artifacts; their downloads are checksum-verified too.
 
 Push and PR platform selection uses the ordered rules in `gpu-test-paths.json`,
 preserving the former individual workflow filters. PRs use a three-dot diff;
@@ -43,6 +44,19 @@ expiry to allow downstream jobs time to download them.
 Benchmark callers retain the repository, build ID, and resolved-commit interface.
 Callers setting `skip_cache_save` bypass the wheel cache as well as GitHub cache
 writes, and upload their wheel directly. Build IDs keep side A/B uploads distinct.
+
+Fork PRs cannot take a lease. `wheel_cache.py lookup` reads the same manifest
+without signing, reuses it only if it is ready for the exact identity, and treats
+a missing, denied, expired, or malformed manifest as a miss that builds locally.
+The bucket must allow anonymous reads of the cache prefix for forks to hit.
+
+`build.yml`'s `wheel` output describes the validated wheel: its full identity,
+URL, filename, SHA256, and the GitHub artifact it was uploaded to in this run.
+Fast correctness builds the TLX codegen trace's base wheel alongside its head
+wheel (`codegen_trace.py` decides when) and passes both to
+`tlx-codegen-trace.yml`. The trace skips a build only for a supplied wheel of
+exactly the identity it would build and builds anything else itself. Each side
+installs its own wheel, from its URL or, without one, from its artifact.
 
 Conditional S3 PUTs (`If-None-Match` / `If-Match`) provide one producer per cache
 key. Waiters poll every 30 seconds for up to 90 minutes. The producer publishes

@@ -4,6 +4,8 @@ The lease is longer than the entire build job's timeout. A cancelled/failed job
 releases it in an always() step; a lost runner is recovered after lease expiry.
 Publishing uses the lease's ETag, so an old producer cannot replace a newer one.
 Readers only consume ready manifests, published after validation and upload.
+Fork PRs have no AWS credentials: they only look up ready manifests anonymously
+and build locally on any miss, never taking or publishing a lease.
 """
 import argparse
 import hashlib
@@ -15,7 +17,7 @@ import subprocess
 import time
 from urllib.parse import quote
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 BUCKET = "gha-artifacts"
 PREFIX = "tritonci-artifacts/wheel-cache/v1"
@@ -33,8 +35,8 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def build_identity():
-    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+def build_identity(sha=None):
+    sha = sha or subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     recipe = hashlib.sha256()
     # Tooling comes from the workflow revision, even when building an older ref.
     tooling = Path(__file__).resolve().parents[1]
@@ -129,6 +131,34 @@ class WheelCache:
         # A successful publish changes the ETag, making this a harmless no-op.
         self.write({"status": "failed", "identity": self.identity, "expires_at": 0}, lease["etag"])
 
+    def lookup(self):
+        """Reuse a trusted producer's ready wheel without credentials; anything else is a miss, never a lease."""
+        try:
+            state, _ = self.read()
+            return state if self.ready(state) else None
+        except (BotoCoreError, ClientError, ValueError, KeyError, TypeError) as exc:
+            print(f"::warning::Wheel cache lookup failed, building locally: {exc}", flush=True)
+            return None
+
+
+def supplied_wheel(text, identity):
+    """The wheel in build.yml's `wheel` output, if it is exactly `identity`'s build and names a usable source."""
+    try:
+        wheel = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(wheel, dict) or wheel.get("identity") != identity:
+        return None
+    if not re.fullmatch(r"[^/]+\.whl", str(wheel.get("filename"))):
+        return None
+    if not re.fullmatch(r"[a-f0-9]{64}", str(wheel.get("sha256"))):
+        return None
+    # Installers download from the URL when there is one, otherwise from this run's artifact.
+    url, artifact = wheel.get("url"), wheel.get("artifact")
+    if url:
+        return wheel if isinstance(url, str) and url.startswith("https://") and not artifact else None
+    return wheel if isinstance(artifact, str) and artifact else None
+
 
 def emit(**values):
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
@@ -146,9 +176,38 @@ def main():
     import boto3
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("acquire", "publish", "release"))
+    parser.add_argument("command", choices=("acquire", "lookup", "publish", "release", "describe", "supplied"))
     parser.add_argument("--wheel", type=Path)
+    parser.add_argument("--sha", help="supplied: the source SHA the wheel must be built from")
+    parser.add_argument("--output", help="supplied: output receiving the validated wheel, empty if unusable")
     args = parser.parse_args()
+    if args.command == "describe":
+        # The validated wheel and its full build identity, for consumers that skip their own build.
+        env = os.environ
+        emit(wheel=json.dumps({
+            "identity": build_identity(), "url": env["WHEEL_URL"], "filename": env["WHEEL_FILENAME"], "sha256":
+            env["WHEEL_SHA256"], "artifact": env["WHEEL_ARTIFACT"]
+        }))
+        return
+    if args.command == "supplied":
+        wheel = supplied_wheel(os.environ["SUPPLIED_WHEEL"], build_identity(args.sha))
+        print("Reusing the supplied wheel" if wheel else "No matching supplied wheel; building it")
+        emit(**{args.output: json.dumps(wheel) if wheel else ""})
+        return
+    if args.command == "lookup":
+        from botocore import UNSIGNED
+        from botocore.config import Config
+
+        cache = WheelCache(boto3.client("s3", region_name="us-east-1", config=Config(signature_version=UNSIGNED)),
+                           build_identity())
+        state = cache.lookup()
+        if state:
+            emit(hit="true")
+            emit_wheel(state)
+            print(f"Reusing validated wheel: {state['wheel']['key']}")
+        else:
+            print(f"No ready wheel at {cache.key}; building locally")
+        return
     state_path = Path(os.environ["RUNNER_TEMP"]) / "triton-wheel-lease.json"
     s3 = boto3.client("s3", region_name="us-east-1")
     if args.command == "acquire":

@@ -7,11 +7,20 @@ name: TLX codegen trace
 # a PR comment. Advisory only -- posts, never blocks. Deterministic, no GPU.
 
 on:
-  # `branches` matches the PR's target branch. Bundle PRs go from
-  # reactor/sync-train/plan-*/item-* into main. Other PRs run only when they
-  # change compiler or kernel paths; the pick step decides.
-  pull_request:
-    branches: [main]
+  # Fast correctness calls this for PRs into main that codegen_trace.py selects (bundle PRs and compiler or kernel
+  # changes), passing the wheels it built. A missing or non-matching wheel is built here.
+  workflow_call:
+    inputs:
+      head_wheel:
+        description: build.yml `wheel` output for the PR's test merge commit (blank = build it here)
+        type: string
+        required: false
+        default: ''
+      base_wheel:
+        description: build.yml `wheel` output for that merge commit's first parent (blank = build it here)
+        type: string
+        required: false
+        default: ''
   workflow_dispatch:
     inputs:
       ref:
@@ -28,10 +37,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: codegen-trace-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: true
-
 jobs:
   resolve:
     runs-on: ubuntu-latest
@@ -42,12 +47,25 @@ jobs:
       pr_head: ${{ steps.pick.outputs.pr_head }}
       base: ${{ steps.pick.outputs.base }}
       pr: ${{ steps.pick.outputs.pr }}
+      head_wheel: ${{ steps.supplied.outputs.head_wheel }}
+      base_wheel: ${{ steps.supplied.outputs.base_wheel }}
     steps:
       - name: Checkout main
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+      - name: Checkout CI scripts
+        uses: actions/checkout@v4
+        with:
+          # The revision whose build.yml would build the wheels, so supplied wheels are checked against its recipe.
+          ref: ${{ github.workflow_sha }}
+          path: .ci
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            .github/scripts/codegen_trace.py
+            .github/scripts/wheel_cache.py
+            .github/workflows/build.yml
       - name: Pick head, base, and PR
         id: pick
         env:
@@ -57,19 +75,18 @@ jobs:
           INPUT_PR: ${{ inputs.pr }}
           MERGE_SHA: ${{ github.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAD_REF: ${{ github.head_ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           if [[ "${EVENT_NAME}" == "pull_request" ]]; then
             # Compare GitHub's test merge commit with its first parent: exactly
             # what landing changes on main, and the head is the commit Fast
-            # correctness builds, so its wheel is a cache hit.
+            # correctness builds.
             git fetch --no-tags --quiet origin "${MERGE_SHA}"
             HEAD="${MERGE_SHA}"; BASE=$(git rev-parse "${MERGE_SHA}^1")
             PR_HEAD="${HEAD_SHA}"; PR="${PR_NUMBER}"
-            CODEGEN_PATHS='^(lib/|include/|python/src/|python/triton/|third_party/(nvidia|tlx)/|cmake/|CMakeLists\.txt$|setup\.py$|\.github/scripts/(tlx_codegen_snapshot|tlx_ops_bench_ir_diff)\.py$|\.github/workflows/tlx-codegen-trace\.yml$)'
-            if [[ "${HEAD_REF}" != reactor/sync-train/* ]] && ! git diff --name-only "${BASE}" "${HEAD}" | grep -qE "${CODEGEN_PATHS}"; then
+            TRACE=$(python3 .ci/.github/scripts/codegen_trace.py "${BASE}" "${HEAD}")
+            if [[ "${TRACE}" != true ]]; then
               echo "No compiler or kernel changes; skipping."
               exit 0
             fi
@@ -90,6 +107,25 @@ jobs:
             echo "base=${BASE}"
             echo "pr=${PR}"
           } >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v6
+        if: steps.pick.outputs.head != '' && (inputs.head_wheel != '' || inputs.base_wheel != '')
+        with:
+          python-version: '3.12'
+      - name: Reuse the supplied wheels
+        # A supplied wheel replaces a build here only if it is exactly this side's commit, repository, Python ABI,
+        # platform and build recipe, with a filename, checksum and download source; anything else is built.
+        if: steps.pick.outputs.head != '' && (inputs.head_wheel != '' || inputs.base_wheel != '')
+        id: supplied
+        env:
+          HEAD: ${{ steps.pick.outputs.head }}
+          BASE: ${{ steps.pick.outputs.base }}
+          HEAD_WHEEL: ${{ inputs.head_wheel }}
+          BASE_WHEEL: ${{ inputs.base_wheel }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet 'boto3>=1.36.0'
+          SUPPLIED_WHEEL="${HEAD_WHEEL}" python .ci/.github/scripts/wheel_cache.py supplied --sha "${HEAD}" --output head_wheel
+          SUPPLIED_WHEEL="${BASE_WHEEL}" python .ci/.github/scripts/wheel_cache.py supplied --sha "${BASE}" --output base_wheel
       - name: Pick the tlx.ops corpus
         # The nightly B200 and MI350 benchmarks publish the corpora recorded from main. Both sides of this trace use
         # the copies picked here; without one the trace covers only the built-in kernels.
@@ -109,7 +145,7 @@ jobs:
 
   build-head:
     needs: resolve
-    if: needs.resolve.outputs.head != ''
+    if: needs.resolve.outputs.head != '' && needs.resolve.outputs.head_wheel == ''
     permissions:
       contents: read
       id-token: write
@@ -120,7 +156,7 @@ jobs:
 
   build-base:
     needs: resolve
-    if: needs.resolve.outputs.head != ''
+    if: needs.resolve.outputs.head != '' && needs.resolve.outputs.base_wheel == ''
     permissions:
       contents: read
       id-token: write
@@ -130,14 +166,21 @@ jobs:
       build_id: base
 
   snapshot:
+    name: snapshot (${{ matrix.side }})
     needs: [resolve, build-head, build-base]
-    if: needs.resolve.outputs.head != ''
+    # A reused wheel skips its build, so this runs unless a needed build failed.
+    if: >-
+      ${{ !cancelled() && needs.resolve.outputs.head != '' &&
+      needs.build-head.result != 'failure' && needs.build-base.result != 'failure' }}
     strategy:
       fail-fast: false
       matrix:
+        # Each side installs only its own wheel object: the supplied wheel, else the one built here.
         include:
           - side: head
+            wheel: ${{ needs.resolve.outputs.head_wheel || needs.build-head.outputs.wheel }}
           - side: base
+            wheel: ${{ needs.resolve.outputs.base_wheel || needs.build-base.outputs.wheel }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -165,10 +208,10 @@ jobs:
       - name: Install prebuilt Triton (${{ matrix.side }})
         uses: ./.ci/.github/actions/install-prebuilt-triton
         with:
-          artifact-name: run_${{ github.run_id }}_${{ matrix.side }}
-          wheel-url: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_url || needs.build-base.outputs.wheel_url }}
-          wheel-filename: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_filename || needs.build-base.outputs.wheel_filename }}
-          wheel-sha256: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_sha256 || needs.build-base.outputs.wheel_sha256 }}
+          artifact-name: ${{ fromJSON(matrix.wheel).artifact }}
+          wheel-url: ${{ fromJSON(matrix.wheel).url }}
+          wheel-filename: ${{ fromJSON(matrix.wheel).filename }}
+          wheel-sha256: ${{ fromJSON(matrix.wheel).sha256 }}
       - name: Download the tlx.ops corpus
         continue-on-error: true
         uses: actions/download-artifact@v4

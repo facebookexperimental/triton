@@ -43,6 +43,9 @@ on:
       wheel_sha256:
         description: SHA256 of the validated wheel
         value: ${{ jobs.build.outputs.wheel_sha256 }}
+      wheel:
+        description: JSON of the validated wheel's build identity, URL, filename, SHA256 and this run's artifact name
+        value: ${{ jobs.build.outputs.wheel }}
 
 permissions:
   contents: read
@@ -58,6 +61,7 @@ jobs:
       wheel_url: ${{ steps.cache.outputs.wheel_url || steps.wheel_url.outputs.wheel_url }}
       wheel_filename: ${{ steps.cache.outputs.wheel_filename || steps.wheel.outputs.filename }}
       wheel_sha256: ${{ steps.cache.outputs.wheel_sha256 || steps.wheel.outputs.sha256 }}
+      wheel: ${{ steps.describe.outputs.wheel }}
     env:
       MAX_JOBS: 32
       CCACHE_DIR: /tmp/fbtriton-ccache
@@ -115,9 +119,12 @@ jobs:
           aws-region: us-east-1
 
       - name: Reuse a wheel or acquire its build lease
-        if: env.WHEEL_CACHE_ENABLED == 'true'
+        if: ${{ !inputs.skip_cache_save }}
         id: cache
-        run: '"${WHEEL_CACHE_PYTHON}" "${WHEEL_CACHE_SCRIPT}" acquire'
+        env:
+          # Fork PRs have no AWS credentials: look up a trusted wheel read-only and build locally on a miss.
+          CACHE_COMMAND: ${{ env.WHEEL_CACHE_ENABLED == 'true' && 'acquire' || 'lookup' }}
+        run: '"${WHEEL_CACHE_PYTHON}" "${WHEEL_CACHE_SCRIPT}" "${CACHE_COMMAND}"'
 
       - name: Install build tools
         if: steps.cache.outputs.hit != 'true'
@@ -246,7 +253,8 @@ jobs:
           echo "name=${artifact_name}" >> "$GITHUB_OUTPUT"
 
       - name: Upload wheel to GitHub artifacts
-        if: env.IS_FORK_PR == 'true'
+        if: env.IS_FORK_PR == 'true' && steps.cache.outputs.hit != 'true'
+        id: artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.wheel.outputs.name }}
@@ -292,6 +300,15 @@ jobs:
               output.write(f"wheel_url={url}\n")
           PYTHON
           fi
+
+      - name: Describe the wheel for consumers
+        id: describe
+        env:
+          WHEEL_URL: ${{ steps.cache.outputs.wheel_url || steps.wheel_url.outputs.wheel_url }}
+          WHEEL_FILENAME: ${{ steps.cache.outputs.wheel_filename || steps.wheel.outputs.filename }}
+          WHEEL_SHA256: ${{ steps.cache.outputs.wheel_sha256 || steps.wheel.outputs.sha256 }}
+          WHEEL_ARTIFACT: ${{ steps.artifact.outcome == 'success' && steps.wheel.outputs.name || '' }}
+        run: '"${WHEEL_CACHE_PYTHON}" "${WHEEL_CACHE_SCRIPT}" describe'
 
       - name: Save ccache
         if: ${{ steps.cache.outputs.hit != 'true' && !inputs.skip_cache_save && steps.restore-ccache.outputs.cache-hit != 'true' }}

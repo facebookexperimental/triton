@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 from gpu_test_selection import PATH_FILTERS, bump_ref, changed_paths, passed_push_run, select_platforms
-from wheel_cache import BUCKET, LEASE_SECONDS, RETENTION_SECONDS, WheelCache
+from wheel_cache import BUCKET, LEASE_SECONDS, RETENTION_SECONDS, WheelCache, supplied_wheel
 
 ROOT = Path(__file__).resolve().parents[2]
 FILTERS = json.loads(PATH_FILTERS.read_text())
@@ -224,6 +224,94 @@ def test_cache_access_denied_does_not_bypass_lock(cache, monkeypatch):
     with pytest.raises(ClientError, match="AccessDenied"):
         producer.acquire("first")
     assert s3.objects == {}
+
+
+@pytest.mark.parametrize("state", ["missing", "building", "ready", "expired", "malformed", "denied"])
+def test_fork_lookup_reuses_only_ready_wheels_and_never_writes(cache, monkeypatch, state):
+    # Fork PRs have no credentials: lookup reuses a ready wheel, and anything else is a local build, not a lease.
+    producer, s3, now = cache
+    _, lease = producer.acquire("trusted")
+    if state == "missing":
+        s3.objects.clear()
+    elif state in ("ready", "expired"):
+        producer.publish(lease, upload(producer))
+        if state == "expired":
+            now[0] += RETENTION_SECONDS
+    elif state == "malformed":
+        s3.put_object(Bucket=BUCKET, Key=producer.key, Body=b'{"status": "ready"}')
+    elif state == "denied":
+        monkeypatch.setattr(s3, "get_object", lambda **kwargs: s3.fail("AccessDenied"))
+    before = dict(s3.objects)
+    monkeypatch.setattr(s3, "put_object", lambda **kwargs: pytest.fail("fork lookup wrote to the cache"))
+    reused = WheelCache(s3, producer.identity, clock=producer.clock, sleep=producer.sleep).lookup()
+    assert (reused is not None) == (state == "ready")
+    assert s3.objects == before
+
+
+def test_supplied_wheel_is_reused_only_for_the_exact_build():
+    # A consumer skips its own build only for a wheel of exactly the identity it would build, with a usable source.
+    identity = {"repository": "owner/repo", "sha": "a" * 40, "abi": "cp312", "platform": "Linux-X64", "recipe": "r"}
+    artifact = {"identity": identity, "url": "", "filename": "fbtriton.whl", "sha256": "b" * 64, "artifact": "run_1"}
+    s3_wheel = artifact | {"url": "https://example.org/fbtriton.whl", "artifact": ""}
+    for wheel in (artifact, s3_wheel):
+        assert supplied_wheel(json.dumps(wheel), identity) == wheel
+    for field in identity:
+        assert supplied_wheel(json.dumps(artifact), identity | {field: "other"}) is None
+    for damage in ({"filename": ""}, {"sha256": "b" * 63}, {"artifact": ""}, {"url": "http://example.org/w.whl"}):
+        assert supplied_wheel(json.dumps(artifact | damage), identity) is None
+    assert supplied_wheel("", identity) is None
+
+
+def test_codegen_sides_install_their_own_wheel_when_head_has_no_url():
+    # Each side installs its own wheel: a head wheel without a URL (a fork PR's artifact) must not borrow the base
+    # wheel's S3 URL, whether the head wheel was supplied by Fast correctness or built by the trace.
+    import re
+    trace = yaml.load((ROOT / ".github/workflows/tlx-codegen-trace.yml").read_text(), Loader=yaml.BaseLoader)
+    action = yaml.load((ROOT / ".github/actions/install-prebuilt-triton/action.yml").read_text(),
+                       Loader=yaml.BaseLoader)
+    snapshot = trace["jobs"]["snapshot"]
+    install = next(s for s in snapshot["steps"] if s.get("name", "").startswith("Install prebuilt Triton"))
+    routes = {s["name"]: s["if"] for s in action["runs"]["steps"] if s["name"].startswith("Download")}
+
+    def evaluate(template, context):
+        # Just enough of the expression language for these values: names, ==, !=, &&, || and fromJSON(...).field.
+        def expression(match):
+            text = re.sub(r"fromJSON\(matrix\.wheel\)\.(\w+)",
+                          lambda m: repr(json.loads(context["matrix.wheel"])[m[1]]), match[1])
+            text = re.sub(r"\b(?:matrix|github|inputs|needs)\.[\w.-]+", lambda m: repr(context[m[0]]), text)
+            return str(eval(text.replace("&&", " and ").replace("||", " or "), {"__builtins__": {}}))
+
+        return re.sub(r"\$\{\{(.*?)\}\}", expression, template if "${{" in template else "${{ " + template + " }}")
+
+    fork_pr = {
+        "github.run_id": "1", "github.event_name": "pull_request", "github.repository": "owner/triton",
+        "github.event.pull_request.head.repo.full_name": "fork/triton"
+    }
+    base = {"url": "https://example.org/base.whl", "filename": "base.whl", "sha256": "b" * 64, "artifact": ""}
+    for head_artifact in ("run_1", "run_1_head"):  # Fast correctness's head wheel, or the trace's own build
+        head = {"url": "", "filename": "head.whl", "sha256": "a" * 64, "artifact": head_artifact}
+        supplied = head_artifact == "run_1"
+        context = fork_pr | {
+            "needs.resolve.outputs.head_wheel": json.dumps(head) if supplied else "",
+            "needs.resolve.outputs.base_wheel": ""
+        }
+        for side, wheel in (("head", {} if supplied else head), ("base", base)):
+            context[f"needs.build-{side}.outputs.wheel"] = json.dumps(wheel) if wheel else ""
+            for field in ("url", "filename", "sha256"):
+                context[f"needs.build-{side}.outputs.wheel_{field}"] = wheel.get(field, "")
+        entries = snapshot["strategy"]["matrix"]["include"]
+        assert [entry["side"] for entry in entries] == ["head", "base"]
+        for entry, expected in zip(entries, (head, base)):
+            side = {"matrix.side": entry["side"], "matrix.wheel": evaluate(entry.get("wheel", "''"), context)}
+            inputs = {key: evaluate(value, context | side) for key, value in install["with"].items()}
+            assert (inputs["wheel-filename"], inputs["wheel-sha256"]) == (expected["filename"], expected["sha256"])
+            action_context = context | {f"inputs.{key}": value for key, value in inputs.items()}
+            taken = [name for name, condition in routes.items() if evaluate(condition, action_context) == "True"]
+            if expected["url"]:
+                assert taken == ["Download prebuilt Triton wheel from S3"] and inputs["wheel-url"] == expected["url"]
+            else:
+                assert taken == ["Download prebuilt Triton wheel from GitHub artifacts"]
+                assert inputs["artifact-name"] == expected["artifact"]
 
 
 @pytest.mark.parametrize("build_repository", [None, "triton-lang/triton"])
