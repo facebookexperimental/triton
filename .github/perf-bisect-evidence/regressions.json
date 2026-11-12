@@ -1,0 +1,669 @@
+[
+ {
+  "detector": "noise-scaled",
+  "platform": "h100",
+  "op": "norm_fwd",
+  "direction": "bwd",
+  "date": "20261111",
+  "sha": "54d5ab5161306d6cc1e49971082eb00a66e20cec",
+  "reasons": [
+   "throughput loss beyond five times the case's night-to-night spread (at least 3%) on two nights, noisy measurements included"
+  ],
+  "median_ratio": 0.8573161220968857,
+  "compared": 19,
+  "reported_cases": 19,
+  "space": "heuristic",
+  "required_ratio": 0.9680908605643327,
+  "confirmation_date": null,
+  "environment": {
+   "gpu": "NVIDIA H100 80GB HBM3",
+   "driver": "580.178.04",
+   "torch": "2.14.0+cu130",
+   "runtime": "CUDA 13.0",
+   "governed": [
+    "persistence mode",
+    "power cap 700 W",
+    "clock lock 1980 MHz",
+    "NUMA node 0 (26 CPUs)"
+   ],
+   "timing": {
+    "latency_mode": "gpu_events",
+    "replicates": 1
+   }
+  },
+  "cases": [
+   {
+    "key": "norm_fwd/sm90/bfloat16/1048576x384xplainxrmsxbwdxdefaultx1xFalse/bwd",
+    "params": {
+     "input": "plain:rms:1048576x384:default:q1:j0"
+    },
+    "dtype": "bf16",
+    "baseline": 4.185699905265487,
+    "current": 3.379475071432064,
+    "ratio": 0.8073858967244125,
+    "baseline_dates": [
+     "20261103",
+     "20261104",
+     "20261107",
+     "20261108",
+     "20261109"
+    ],
+    "baseline_sha": "391d131cc0da79272af6131f70e480f1d9423b8d",
+    "good_sha": "1966c6d43425ee8b3791d50b1158448870cc8b12",
+    "good_date": "20261109",
+    "reference_before": 2.7550801179842583,
+    "reference_now": 2.7549543463741606,
+    "previous_environment": {
+     "gpu": "NVIDIA H100 80GB HBM3",
+     "driver": "580.178.04",
+     "torch": "2.14.0+cu130",
+     "runtime": "CUDA 13.0",
+     "governed": [
+      "persistence mode",
+      "power cap 700 W",
+      "clock lock 1980 MHz",
+      "NUMA node 0 (26 CPUs)"
+     ],
+     "timing": {
+      "latency_mode": "gpu_events",
+      "replicates": 1
+     }
+    },
+    "noise_onset": "20261110",
+    "required_ratio": 0.9680908605643327,
+    "detector": "noise-scaled",
+    "onset": "20261110"
+   },
+   {
+    "key": "norm_fwd/sm90/bfloat16/8192x384xplainxrmsxbwdxdefaultx1xFalse/bwd",
+    "params": {
+     "input": "plain:rms:8192x384:default:q1:j0"
+    },
+    "dtype": "bf16",
+    "baseline": 1.8844217443708478,
+    "current": 1.7096347446722893,
+    "ratio": 0.9072463474693587,
+    "baseline_dates": [
+     "20261103",
+     "20261104",
+     "20261107",
+     "20261108",
+     "20261109"
+    ],
+    "baseline_sha": "391d131cc0da79272af6131f70e480f1d9423b8d",
+    "good_sha": "1966c6d43425ee8b3791d50b1158448870cc8b12",
+    "good_date": "20261109",
+    "reference_before": 0.9539240597819717,
+    "reference_now": 0.9300356662128073,
+    "previous_environment": {
+     "gpu": "NVIDIA H100 80GB HBM3",
+     "driver": "580.178.04",
+     "torch": "2.14.0+cu130",
+     "runtime": "CUDA 13.0",
+     "governed": [
+      "persistence mode",
+      "power cap 700 W",
+      "clock lock 1980 MHz",
+      "NUMA node 0 (26 CPUs)"
+     ],
+     "timing": {
+      "latency_mode": "gpu_events",
+      "replicates": 1
+     }
+    },
+    "noise_onset": "20261110",
+    "required_ratio": 0.9591533621247395,
+    "detector": "noise-scaled",
+    "onset": "20261110"
+   }
+  ],
+  "detectors": [
+   "noise-scaled"
+  ],
+  "evidence": {
+   "noise-scaled": {
+    "reasons": [
+     "throughput loss beyond five times the case's night-to-night spread (at least 3%) on two nights, noisy measurements included"
+    ],
+    "median_ratio": 0.8573161220968857,
+    "compared": 19,
+    "confirmation_date": null
+   }
+  },
+  "episodes": [
+   "h100|norm_fwd|bwd|norm_fwd/sm90/bfloat16/1048576x384xplainxrmsxbwdxdefaultx1xFalse/bwd|gpu_events,1|20261110",
+   "h100|norm_fwd|bwd|norm_fwd/sm90/bfloat16/8192x384xplainxrmsxbwdxdefaultx1xFalse/bwd|gpu_events,1|20261110"
+  ],
+  "bisect_issue": 4990,
+  "bisect": {
+   "op": "norm_fwd",
+   "direction": "bwd",
+   "key": "norm_fwd/sm90/bfloat16/1048576x384xplainxrmsxbwdxdefaultx1xFalse/bwd",
+   "platform": "h100",
+   "good_sha": "1966c6d43425ee8b3791d50b1158448870cc8b12",
+   "bad_sha": "54d5ab5161306d6cc1e49971082eb00a66e20cec",
+   "required_ratio": 0.9680908605643327,
+   "space": "heuristic"
+  }
+ },
+ {
+  "platform": "b200",
+  "op": "norm_fwd",
+  "direction": "bwd",
+  "date": "20261111",
+  "sha": "54d5ab5161306d6cc1e49971082eb00a66e20cec",
+  "reasons": [
+   "at least 15% throughput loss against the historical best on two reliable measurements",
+   "throughput loss beyond five times the case's night-to-night spread (at least 3%) on two nights, noisy measurements included",
+   "a case with a reliable history turned noisy on two nights, with mean throughput below the noise-scaled threshold"
+  ],
+  "median_ratio": 0.9965727340687183,
+  "compared": 29,
+  "reported_cases": 32,
+  "space": "heuristic",
+  "required_ratio": 0.85,
+  "confirmation_date": null,
+  "environment": {
+   "gpu": "NVIDIA B200",
+   "driver": "580.126.09",
+   "torch": "2.14.0+cu130",
+   "runtime": "CUDA 13.0",
+   "governed": [
+    "persistence mode",
+    "power cap 750 W",
+    "clock lock 1965 MHz",
+    "NUMA node 0 (112 CPUs)"
+   ],
+   "timing": {
+    "latency_mode": "gpu_events",
+    "replicates": 1
+   }
+  },
+  "cases": [
+   {
+    "key": "norm_fwd/sm100/bfloat16/8192x384xsavedxrmsxbwdxrawx1xFalse/bwd",
+    "params": {
+     "input": "saved:rms:8192x384:raw:q1:j0"
+    },
+    "dtype": "bf16",
+    "baseline": 1.8460845757496884,
+    "current": 1.6780199197021781,
+    "ratio": 0.9089615620783463,
+    "baseline_dates": [
+     "20261104",
+     "20261106",
+     "20261107",
+     "20261108",
+     "20261109"
+    ],
+    "baseline_sha": "361492e542b33dc471733f7df7166d5d0983aa1d",
+    "good_sha": "5426e3e1678bffd326eb1d502aeb4d07d9123ee4",
+    "good_date": "20261108",
+    "reference_before": null,
+    "reference_now": null,
+    "previous_environment": {
+     "gpu": "NVIDIA B200",
+     "driver": "580.126.09",
+     "torch": "2.14.0+cu130",
+     "runtime": "CUDA 13.0",
+     "governed": [
+      "persistence mode",
+      "power cap 750 W",
+      "clock lock 1965 MHz",
+      "NUMA node 1 (112 CPUs)"
+     ],
+     "timing": {
+      "latency_mode": "gpu_events",
+      "replicates": 1
+     }
+    },
+    "noise_onset": "20261110",
+    "required_ratio": 0.9669640713882828,
+    "detector": "noise-scaled",
+    "onset": "20261110"
+   },
+   {
+    "key": "norm_fwd/sm100/bfloat16/8192x384xplainxrmsxbwdxdefaultx1xFalse/bwd",
+    "params": {
+     "input": "plain:rms:8192x384:default:q1:j0"
+    },
+    "dtype": "bf16",
+    "baseline": 1.8489779787260343,
+    "current": 1.682807459612288,
+    "ratio": 0.9101284487832356,
+    "baseline_dates": [
+     "20261104",
+     "20261106",
+     "20261107",
+     "20261108",
+     "20261109"
+    ],
+    "baseline_sha": "361492e542b33dc471733f7df7166d5d0983aa1d",
+    "good_sha": "b574d8e423b2b896923509172d97329571cd5118",
+    "good_date": "20261106",
+    "reference_before": 0.879000173047208,
+    "reference_now": 0.8777676310539104,
+    "previous_environment": {
+     "gpu": "NVIDIA B200",
+     "driver": "580.126.09",
+     "torch": "2.14.0+cu130",
+     "runtime": "CUDA 13.0",
+     "governed": [
+      "persistence mode",
+      "power cap 750 W",
+      "clock lock 1965 MHz",
+      "NUMA node 1 (112 CPUs)"
+     ],
+     "timing": {
+      "latency_mode": "gpu_events",
+      "replicates": 1
+     }
+    },
+    "noise_onset": "20261110",
+    "required_ratio": 0.9684796123114489,
+    "detector": "noise-scaled",
+    "onset": "20261110"
+   }
+  ],
+  "detectors": [
+   "historical-best",
+   "noise-scaled",
+   "unstable"
+  ],
+  "evidence": {
+   "historical-best": {
+    "reasons": [
+     "at least 15% throughput loss against the historical best on two reliable measurements"
+    ],
+    "median_ratio": 0.9965727340687183,
+    "compared": 29,
+    "confirmation_date": null
+   },
+   "noise-scaled": {
+    "reasons": [
+     "throughput loss beyond five times the case's night-to-night spread (at least 3%) on two nights, noisy measurements included"
+    ],
+    "median_ratio": 0.909545005430791,
+    "compared": 32,
+    "confirmation_date": null
+   },
+   "unstable": {
+    "reasons": [
+     "a case with a reliable history turned noisy on two nights, with mean throughput below the noise-scaled threshold"
+    ],
+    "median_ratio": 0.9531878439258998,
+    "compared": 32,
+    "confirmation_date": null
+   }
+  },
+  "episodes": [
+   "b200|norm_fwd|bwd|norm_fwd/sm100/bfloat16/1048576x384xplainxrmsxbwdxdefaultx1xFalse/bwd|gpu_events,1|20261110",
+   "b200|norm_fwd|bwd|norm_fwd/sm100/bfloat16/8192x1024xplainxrmsxbwdxdefaultx1xFalse/bwd|gpu_events,1|20261110",
+   "b200|norm_fwd|bwd|norm_fwd/sm100/bfloat16/8192x1024xsoftmaxxsoftmaxxbwdxdefaultx1xFalse/bwd|gpu_events,1|20261110",
+   "b200|norm_fwd|bwd|norm_fwd/sm100/bfloat16/8192x384xdx_quantxrmsxbwdxweightedx1xFalse/bwd|gpu_events,1|20261108",
+   "b200|norm_fwd|bwd|norm_fwd/sm100/bfloat16/8192x384xplainxrmsxbwdxdefaultx1xFalse/bwd|gpu_events,1|20261110",
+   "b200|norm_fwd|bwd|norm_fwd/sm100/bfloat16/8192x384xsavedxlayerxbwdxnormalizedx1xFalse/bwd|gpu_events,1|20261109",
+   "b200|norm_fwd|bwd|norm_fwd/sm100/bfloat16/8192x384xsavedxrmsxbwdxrawx1xFalse/bwd|gpu_events,1|20261110"
+  ],
+  "bisect_issue": 4991,
+  "bisect": {
+   "op": "norm_fwd",
+   "direction": "bwd",
+   "key": "norm_fwd/sm100/bfloat16/8192x384xsavedxrmsxbwdxrawx1xFalse/bwd",
+   "platform": "b200",
+   "good_sha": "5426e3e1678bffd326eb1d502aeb4d07d9123ee4",
+   "bad_sha": "54d5ab5161306d6cc1e49971082eb00a66e20cec",
+   "required_ratio": 0.9669640713882828,
+   "space": "heuristic"
+  }
+ },
+ {
+  "platform": "b200",
+  "op": "norm_fwd",
+  "direction": "fwd",
+  "date": "20261111",
+  "sha": "54d5ab5161306d6cc1e49971082eb00a66e20cec",
+  "reasons": [
+   "at least 15% throughput loss against the historical best on two reliable measurements",
+   "throughput loss beyond five times the case's night-to-night spread (at least 3%) on two nights, noisy measurements included"
+  ],
+  "median_ratio": 0.993979143972421,
+  "compared": 67,
+  "reported_cases": 69,
+  "space": "heuristic",
+  "required_ratio": 0.85,
+  "confirmation_date": null,
+  "environment": {
+   "gpu": "NVIDIA B200",
+   "driver": "580.126.09",
+   "torch": "2.14.0+cu130",
+   "runtime": "CUDA 13.0",
+   "governed": [
+    "persistence mode",
+    "power cap 750 W",
+    "clock lock 1965 MHz",
+    "NUMA node 0 (112 CPUs)"
+   ],
+   "timing": {
+    "latency_mode": "gpu_events",
+    "replicates": 1
+   }
+  },
+  "cases": [
+   {
+    "key": "norm_fwd/sm100/bfloat16/131072x384xnvfp4xlayerxfwdxdefaultx16xFalse",
+    "params": {
+     "input": "nvfp4:layer:131072x384:default:q16:j0"
+    },
+    "dtype": "bf16",
+    "baseline": 4.279901990056227,
+    "current": 4.020099571803328,
+    "ratio": 0.9392971103411913,
+    "baseline_dates": [
+     "20261031",
+     "20261101",
+     "20261103",
+     "20261104",
+     "20261109"
+    ],
+    "baseline_sha": "6b6036f332a3222ced56fd0083aaefdb1f402af1",
+    "good_sha": "e9813bf5e54e46f423e6b594f589f4b6b12a5895",
+    "good_date": "20261101",
+    "reference_before": null,
+    "reference_now": null,
+    "previous_environment": {
+     "gpu": "NVIDIA B200",
+     "driver": "580.126.09",
+     "torch": "2.14.0+cu130",
+     "runtime": "CUDA 13.0",
+     "governed": [
+      "persistence mode",
+      "power cap 750 W",
+      "clock lock 1965 MHz",
+      "NUMA node 1 (112 CPUs)"
+     ],
+     "timing": {
+      "latency_mode": "gpu_events",
+      "replicates": 1
+     }
+    },
+    "noise_onset": "20261110",
+    "required_ratio": 0.9492142813246701,
+    "detector": "noise-scaled",
+    "onset": "20261110"
+   }
+  ],
+  "detectors": [
+   "historical-best",
+   "noise-scaled"
+  ],
+  "evidence": {
+   "historical-best": {
+    "reasons": [
+     "at least 15% throughput loss against the historical best on two reliable measurements"
+    ],
+    "median_ratio": 0.993979143972421,
+    "compared": 67,
+    "confirmation_date": null
+   },
+   "noise-scaled": {
+    "reasons": [
+     "throughput loss beyond five times the case's night-to-night spread (at least 3%) on two nights, noisy measurements included"
+    ],
+    "median_ratio": 0.8837110480651686,
+    "compared": 69,
+    "confirmation_date": null
+   }
+  },
+  "episodes": [
+   "b200|norm_fwd|fwd|norm_fwd/sm100/bfloat16/128x384xmxfp8xrmsxfwdxdefaultx1xFalse|gpu_events,1|20261110",
+   "b200|norm_fwd|fwd|norm_fwd/sm100/bfloat16/131072x384xnvfp4xlayerxfwdxdefaultx16xFalse|gpu_events,1|20261110",
+   "b200|norm_fwd|fwd|norm_fwd/sm100/bfloat16/4096x256xmxfp8xlayerxfwdxdefaultx1xFalse|gpu_events,1|20261106"
+  ],
+  "bisect_issue": 4992,
+  "bisect": {
+   "op": "norm_fwd",
+   "direction": "fwd",
+   "key": "norm_fwd/sm100/bfloat16/131072x384xnvfp4xlayerxfwdxdefaultx16xFalse",
+   "platform": "b200",
+   "good_sha": "e9813bf5e54e46f423e6b594f589f4b6b12a5895",
+   "bad_sha": "54d5ab5161306d6cc1e49971082eb00a66e20cec",
+   "required_ratio": 0.9492142813246701,
+   "space": "heuristic"
+  }
+ },
+ {
+  "detector": "noise-scaled",
+  "platform": "mi350",
+  "op": "flash_attn",
+  "direction": "bwd",
+  "date": "20261010",
+  "sha": "697af9e162c0923135e4670569e3647b0ed9765f",
+  "reasons": [
+   "throughput loss beyond five times the case's night-to-night spread (at least 3%) on two nights, noisy measurements included"
+  ],
+  "median_ratio": 0.8792856908945166,
+  "compared": 3,
+  "reported_cases": 3,
+  "space": "full",
+  "required_ratio": 0.9654647387987648,
+  "confirmation_date": null,
+  "environment": {
+   "gpu": null,
+   "driver": null,
+   "torch": "2.14.0+rocm7.2",
+   "runtime": "ROCm 7.2",
+   "governed": [
+    "perf determinism 2100 MHz",
+    "power cap 1000 W",
+    "NUMA node 1 (192 CPUs)"
+   ],
+   "timing": {
+    "latency_mode": "wallclock",
+    "replicates": 1
+   }
+  },
+  "cases": [
+   {
+    "key": "flash_attn/gfx950/bfloat16/1x16x4096x64xFalse/bwd",
+    "params": {
+     "causal": "False",
+     "Z": "1",
+     "H": "16",
+     "N_CTX": "4096",
+     "HEAD_DIM": "64"
+    },
+    "dtype": "bf16",
+    "baseline": 528.8033546884966,
+    "current": 464.96922307461284,
+    "ratio": 0.8792856908945166,
+    "baseline_dates": [
+     "20261001",
+     "20261002",
+     "20261003",
+     "20261004",
+     "20261006"
+    ],
+    "baseline_sha": "1e024950fbfeaca0ed9b48d9573c13f56a9790c9",
+    "good_sha": "a05314cb02afddf4bd617eb072e7a2641b6de172",
+    "good_date": "20261004",
+    "reference_before": 223.0167274494293,
+    "reference_now": 223.989164678844,
+    "previous_environment": {
+     "gpu": null,
+     "driver": null,
+     "torch": "2.14.0+rocm7.2",
+     "runtime": "ROCm 7.2",
+     "governed": [
+      "perf determinism 2100 MHz",
+      "power cap 1000 W",
+      "NUMA node 1 (192 CPUs)"
+     ],
+     "timing": {
+      "latency_mode": "wallclock",
+      "replicates": 1
+     }
+    },
+    "noise_onset": "20261009",
+    "required_ratio": 0.9654647387987648,
+    "detector": "noise-scaled",
+    "onset": "20261009"
+   }
+  ],
+  "detectors": [
+   "noise-scaled"
+  ],
+  "evidence": {
+   "noise-scaled": {
+    "reasons": [
+     "throughput loss beyond five times the case's night-to-night spread (at least 3%) on two nights, noisy measurements included"
+    ],
+    "median_ratio": 0.8792856908945166,
+    "compared": 3,
+    "confirmation_date": null
+   }
+  },
+  "episodes": [
+   "mi350|flash_attn|bwd|flash_attn/gfx950/bfloat16/1x16x4096x64xFalse/bwd|wallclock,1|20261009"
+  ],
+  "bisect_issue": 4993,
+  "bisect": {
+   "op": "flash_attn",
+   "direction": "bwd",
+   "key": "flash_attn/gfx950/bfloat16/1x16x4096x64xFalse/bwd",
+   "platform": "mi350",
+   "good_sha": "a05314cb02afddf4bd617eb072e7a2641b6de172",
+   "bad_sha": "697af9e162c0923135e4670569e3647b0ed9765f",
+   "required_ratio": 0.9654647387987648,
+   "space": "full"
+  }
+ },
+ {
+  "platform": "b200",
+  "op": "mm",
+  "direction": "fwd",
+  "date": "20261013",
+  "sha": "032bd40b9a62e16f59410e76eb3dad1aa1e7dedb",
+  "reasons": [
+   "at least 15% throughput loss against the historical best on two reliable measurements",
+   "throughput loss beyond five times the case's night-to-night spread (at least 3%) on two nights, noisy measurements included",
+   "a case with a reliable history turned noisy on two nights, with mean throughput below the noise-scaled threshold"
+  ],
+  "median_ratio": 0.9945989291745807,
+  "compared": 197,
+  "reported_cases": 422,
+  "space": "heuristic",
+  "required_ratio": 0.85,
+  "confirmation_date": null,
+  "environment": {
+   "gpu": "NVIDIA B200",
+   "driver": "580.126.09",
+   "torch": "2.14.0+cu130",
+   "runtime": "CUDA 13.0",
+   "governed": [
+    "persistence mode",
+    "power cap 750 W",
+    "clock lock 1965 MHz",
+    "NUMA node 1 (112 CPUs)"
+   ],
+   "timing": {
+    "latency_mode": "wallclock",
+    "replicates": 1
+   }
+  },
+  "cases": [
+   {
+    "key": "mm/sm100/bfloat16/2048x4096x1152x1_2048x4096_1",
+    "params": {
+     "M": "2048",
+     "N": "4096",
+     "K": "1152",
+     "strides": "[[1,2048],[4096,1]]"
+    },
+    "dtype": "bf16",
+    "baseline": 374.37336259058753,
+    "current": 263.30517590902554,
+    "ratio": 0.7033224107799958,
+    "previous_ratio": 0.7117002100185928,
+    "baseline_dates": [
+     "20260922",
+     "20260923",
+     "20260930"
+    ],
+    "baseline_sha": "4758e837e4a869895d63d0bba82dcf13e96a68af",
+    "good_sha": "d19a2e59b0365fb8e4b7bca6e52e8473785e1c4c",
+    "good_date": "20260923",
+    "reference_before": 941.2856094526395,
+    "reference_now": 941.334949467362,
+    "previous_environment": {
+     "gpu": "NVIDIA B200",
+     "driver": "580.126.09",
+     "torch": "2.14.0+cu130",
+     "runtime": "CUDA 13.0",
+     "governed": [
+      "persistence mode",
+      "power cap 750 W",
+      "clock lock 1965 MHz",
+      "NUMA node 1 (112 CPUs)"
+     ],
+     "timing": {
+      "latency_mode": "wallclock",
+      "replicates": 1
+     }
+    },
+    "detector": "historical-best",
+    "onset": "20260925",
+    "required_ratio": 0.8476374787852724
+   }
+  ],
+  "detectors": [
+   "historical-best",
+   "noise-scaled",
+   "unstable"
+  ],
+  "evidence": {
+   "historical-best": {
+    "reasons": [
+     "at least 15% throughput loss against the historical best on two reliable measurements"
+    ],
+    "median_ratio": 0.9945989291745807,
+    "compared": 197,
+    "confirmation_date": null
+   },
+   "noise-scaled": {
+    "reasons": [
+     "throughput loss beyond five times the case's night-to-night spread (at least 3%) on two nights, noisy measurements included"
+    ],
+    "median_ratio": 0.9197884596657603,
+    "compared": 379,
+    "confirmation_date": null
+   },
+   "unstable": {
+    "reasons": [
+     "a case with a reliable history turned noisy on two nights, with mean throughput below the noise-scaled threshold"
+    ],
+    "median_ratio": 0.9419938846223359,
+    "compared": 379,
+    "confirmation_date": null
+   }
+  },
+  "episodes": [
+   "b200|mm|fwd|mm/sm100/bfloat16/1152x1024x34816x34816_1x1024_1|wallclock,1|20260930",
+   "b200|mm|fwd|mm/sm100/bfloat16/2048x4096x1152x1_2048x4096_1|wallclock,1|20260925",
+   "b200|mm|fwd|mm/sm100/bfloat16/2304x1024x12800x12800_1x1024_1|wallclock,1|20261002",
+   "b200|mm|fwd|mm/sm100/bfloat16/384x384x119998x1_384x384_1|wallclock,1|20261010",
+   "b200|mm|fwd|mm/sm100/bfloat16/384x384x66611x1_384x384_1|wallclock,1|20261002"
+  ],
+  "bisect_issue": 4994,
+  "bisect": {
+   "op": "mm",
+   "direction": "fwd",
+   "key": "mm/sm100/bfloat16/2048x4096x1152x1_2048x4096_1",
+   "platform": "b200",
+   "good_sha": "d19a2e59b0365fb8e4b7bca6e52e8473785e1c4c",
+   "bad_sha": "032bd40b9a62e16f59410e76eb3dad1aa1e7dedb",
+   "required_ratio": 0.8476374787852724,
+   "space": "heuristic"
+  }
+ }
+]

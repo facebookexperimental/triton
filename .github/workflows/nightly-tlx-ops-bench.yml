@@ -1,164 +1,18 @@
 name: Nightly TLX.ops Bench
-# Runs the tlx.ops perf suite (python/test/tlx_benchmark) on B200, H100 and
-# MI350 for the commit each published nightly selects, which already passed the
-# correctness checks the nightly is gated on. It installs the wheel build.yml
-# makes for that commit: usually the cached one its GPU tests ran on, rebuilt
-# from the same commit if the cache has expired or the build recipe changed.
+# Evidence-only run for the manually filed regression issues #4990-#4994. It runs no benchmark: it uploads their
+# bisection specs so the production bisect workflow on main accepts this run as its evidence producer.
 on:
-  schedule:
-    - cron: '0 7,8 * * *'
   workflow_dispatch:
-    inputs:
-      version:
-        description: "fbtriton nightly version, e.g. 3.8.0.dev20260923 (blank = latest published)"
-        required: false
-        default: ""
-      sha:
-        description: "Commit that version was built from (required when version is set)"
-        required: false
-        default: ""
 
 permissions:
   contents: read
 
-concurrency:
-  group: nightly-tlx-ops-bench
-  cancel-in-progress: false
-
 jobs:
-  resolve:
-    # A schedule selects the latest published wheel; dispatches still require a main commit.
-    if: >-
-      github.repository_owner == 'facebookexperimental' &&
-      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+  evidence:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: read
-    outputs:
-      version: ${{ steps.pick.outputs.version }}
-      sha: ${{ steps.pick.outputs.sha }}
-    steps:
-      - name: Checkout main
-        uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 0
-      - name: Pick the wheel to bench
-        id: pick
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_SHA: ${{ inputs.sha }}
-        run: |
-          set -euo pipefail
-          if [[ "${EVENT_NAME}" == schedule ]]; then
-            MIDNIGHT=$(python3 -c 'import datetime; from zoneinfo import ZoneInfo; print(int(datetime.datetime.now(ZoneInfo("America/Los_Angeles")).hour in (0, 1)))')
-            [[ "${MIDNIGHT}" == 1 ]] || { echo "Outside the Pacific midnight window; nothing to bench."; exit 0; }
-          fi
-          if [[ -n "${INPUT_VERSION}" ]]; then
-            [[ -n "${INPUT_SHA}" ]] || { echo "sha is required when version is set"; exit 1; }
-            VERSION="${INPUT_VERSION}"
-            SHA="${INPUT_SHA}"
-          else
-            gh release download nightly --pattern latest.json --output latest.json
-            VERSION=$(jq -r .version latest.json)
-            SHA=$(jq -r .commit latest.json)
-          fi
-          # Whatever its source (latest.json or a dispatch input), only a main commit is ever checked out downstream.
-          [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "not a full commit sha: ${SHA}"; exit 1; }
-          [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}$ ]] || { echo "not a nightly version: ${VERSION}"; exit 1; }
-          git merge-base --is-ancestor "${SHA}" origin/main || { echo "${SHA} is not on main"; exit 1; }
-          if [[ "${EVENT_NAME}" == schedule ]]; then
-            DATE="${VERSION##*.dev}"
-            COMPLETE=$(gh release view tlx-ops-bench --json assets --jq '.assets[].name' \
-              | python3 -c 'import sys; date=sys.argv[1]; names=set(sys.stdin.read().splitlines()); print(int(all(f"{date}.{p}.json" in names for p in ("b200", "h100", "mi350"))))' "${DATE}")
-            [[ "${COMPLETE}" != 1 ]] || { echo "${VERSION} already has all platform summaries; nothing to bench."; exit 0; }
-          fi
-          echo "Benching ${VERSION} (${SHA})"
-          {
-            echo "version=${VERSION}"
-            echo "sha=${SHA}"
-          } >> "$GITHUB_OUTPUT"
-
-  build:
-    needs: resolve
-    if: needs.resolve.outputs.version != ''
-    permissions:
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/build.yml
-    with:
-      ref: ${{ needs.resolve.outputs.sha }}
-
-  b200:
-    needs: [resolve, build]
-    if: needs.resolve.outputs.version != ''
-    permissions:
-      id-token: write
-      contents: write   # publish: the dashboard's release
-      issues: write
-      actions: write
-    uses: ./.github/workflows/_tlx-ops-bench.yml
-    with:
-      platform: b200
-      runner: nvidia-dgx-b200
-      torch_index: https://download.pytorch.org/whl/cu130
-      version: ${{ needs.resolve.outputs.version }}
-      sha: ${{ needs.resolve.outputs.sha }}
-      wheel_url: ${{ needs.build.outputs.wheel_url }}
-      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
-      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
-
-  h100:
-    needs: [resolve, build]
-    if: needs.resolve.outputs.version != ''
-    permissions:
-      id-token: write
-      contents: write   # publish: the dashboard's release
-      issues: write
-      actions: write
-    uses: ./.github/workflows/_tlx-ops-bench.yml
-    with:
-      platform: h100
-      runner: linux-gcp-h100
-      torch_index: https://download.pytorch.org/whl/cu130
-      version: ${{ needs.resolve.outputs.version }}
-      sha: ${{ needs.resolve.outputs.sha }}
-      wheel_url: ${{ needs.build.outputs.wheel_url }}
-      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
-      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
-
-  mi350:
-    needs: [resolve, build]
-    if: needs.resolve.outputs.version != ''
-    permissions:
-      id-token: write
-      contents: write   # publish: the dashboard's release
-      issues: write
-      actions: write
-    uses: ./.github/workflows/_tlx-ops-bench.yml
-    with:
-      platform: mi350
-      runner: linux-fb-triton-mi350-1
-      torch_index: https://download.pytorch.org/whl/rocm7.2
-      version: ${{ needs.resolve.outputs.version }}
-      sha: ${{ needs.resolve.outputs.sha }}
-      wheel_url: ${{ needs.build.outputs.wheel_url }}
-      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
-      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
-
-  prune:
-    needs: [resolve, b200, h100, mi350]
-    if: always() && needs.resolve.outputs.version != ''
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Keep the last 60 nights on the tlx-ops-bench release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/tlx_ops_bench_dashboard.py prune 60
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tlx-perf-regressions-manual
+          path: .github/perf-bisect-evidence/regressions.json
