@@ -283,7 +283,8 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     ref_host_us = host_overhead_us(prep.ref_fn) if prep.ref_fn is not None else None
 
     result = verdict.judge(case, tlx, ref, tlx_host_us=host_us, compile_stat=compile_stat, correct=correct,
-                           accuracy_note=accuracy_note, floor_tflops=prep.floor_tflops)
+                           accuracy_note=accuracy_note, floor_tflops=prep.floor_tflops,
+                           reference_gate=getattr(bench, "REFERENCE_GATE", True))
     # After the verdict's notes, which lead the nightly failure summary.
     result.notes += [f"tlx: {n}" for n in tlx_notes] + [f"ref: {n}" for n in ref_notes]
     result.flop_count = prep.flop_count
@@ -407,6 +408,7 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
     # same claim as a ratio against a vendor library.
     env["space"] = space
     env["ref"] = getattr(bench, "REF_NAME", "")
+    env["reference_gate"] = getattr(bench, "REFERENCE_GATE", True)
     env["cold_compile"] = cold_mode
     env["latency_mode"] = "gpu_events"
     env["requested_latency_mode"] = latency_mode
