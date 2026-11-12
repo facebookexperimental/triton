@@ -485,10 +485,15 @@ def _excerpts(args, name, arch, ttgir_ops, mix):
 def _corpus_section(base, head, names, args):
     """One table row per kernel whose specializations changed their TTGIR the same way, then their diffs."""
     irdiff = _irdiff()
-    groups, counts = {}, collections.Counter()
+    groups, counts, stale = {}, collections.Counter(), collections.Counter()
     for name in names:
         for arch, b in sorted(base["kernels"][name].items()):
             h = head["kernels"].get(name, {}).get(arch)
+            # A specialization neither side compiles was not compared at all, usually because its kernel's arguments
+            # changed since the corpus was recorded. Count it apart so lost coverage is not read as equality.
+            if "error" in b and h is not None and "error" in h:
+                stale[b.get("kernel", name)] += 1
+                continue
             verdict, note, rows, mix = _verdict(b, h)
             counts[verdict] += 1
             if verdict == "IDENTICAL":
@@ -509,11 +514,16 @@ def _corpus_section(base, head, names, args):
                     g["hard"][k].append(after - before)
             for token, before, after in mix:
                 g["mix"][token] += after - before
-    total = sum(counts.values())
+    total = sum(counts.values()) + sum(stale.values())
     lines = [
         "", f"### tlx.ops kernels: {total} specializations", "",
         ", ".join(f"{counts[v]} {v.lower()}" for v in ("IDENTICAL", "CHANGED", "INVESTIGATE") if counts[v]) + ".", ""
     ]
+    if stale:
+        lines += [
+            f"{sum(stale.values())} compile on neither side, so they were not compared; their corpus entries need "
+            "regenerating: " + ", ".join(f"`{k}` ({n})" for k, n in sorted(stale.items())) + ".", ""
+        ]
     overall = max(counts, key=VERDICT_RANK.get) if counts else "IDENTICAL"
     if not groups:
         return lines, overall

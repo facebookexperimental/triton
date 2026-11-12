@@ -90,6 +90,22 @@ jobs:
             echo "base=${BASE}"
             echo "pr=${PR}"
           } >> "$GITHUB_OUTPUT"
+      - name: Pick the tlx.ops corpus
+        # The nightly B200 benchmark republishes the corpus from main; the copy checked in at this workflow's
+        # commit covers the time before its first run. Both sides of this trace use the one picked here.
+        if: steps.pick.outputs.head != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p corpus
+          gh release download tlx-ops-bench --repo "${GITHUB_REPOSITORY}" --pattern codegen-corpus.sm100.json --dir corpus \
+            || git show "${GITHUB_SHA}:.github/codegen-corpus/tlx_ops_sm100.json" > corpus/codegen-corpus.sm100.json
+      - name: Upload the tlx.ops corpus
+        if: steps.pick.outputs.head != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegen-corpus-${{ github.run_id }}
+          path: corpus/codegen-corpus.sm100.json
 
   build-head:
     needs: resolve
@@ -152,13 +168,18 @@ jobs:
           wheel-url: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_url || needs.build-base.outputs.wheel_url }}
           wheel-filename: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_filename || needs.build-base.outputs.wheel_filename }}
           wheel-sha256: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_sha256 || needs.build-base.outputs.wheel_sha256 }}
+      - name: Download the tlx.ops corpus
+        uses: actions/download-artifact@v4
+        with:
+          name: codegen-corpus-${{ github.run_id }}
+          path: corpus
       - name: Install CPU torch
         # tlx.ops kernel modules import torch; compiling them needs no GPU.
         run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Snapshot corpus
         run: |
           python3 .github/scripts/tlx_codegen_snapshot.py snapshot \
-            --corpus .github/codegen-corpus/tlx_ops_sm100.json --jobs "$(nproc)" \
+            --corpus corpus/codegen-corpus.sm100.json --jobs "$(nproc)" \
             --ir-dir "ir-${{ matrix.side }}" --out "snap-${{ matrix.side }}.json"
       - name: Upload snapshot
         uses: actions/upload-artifact@v4
