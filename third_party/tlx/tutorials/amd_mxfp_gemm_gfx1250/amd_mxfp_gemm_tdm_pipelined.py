@@ -1675,6 +1675,30 @@ def _mxgemm_defer_bottom_k_step(c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc
         # from adding barriers of its own around the refill.
         tl.static_assert(GROUPED_PREFETCH and PREFETCH_B_AFTER_C10)
         W256: tl.constexpr = _mxgemm_scale_cols(bs_buf) == BK // 32 * 256
+        # Instruction counts behind the three scheduling regions below. Each of
+        # the four waves computes a (BM/4)x(BN/4) quarter of every quadrant dot
+        # (tiles_per_warp=[2, 2]) with 16x16 WMMAs, and reads its quarter of an
+        # operand quadrant with ds_load_b128 (32 lanes x 16 bytes). An
+        # operand's scales take one more read per quadrant; with wave256 scales
+        # one read covers both quadrants, so the second halves read none.
+        DOT_WMMAS: tl.constexpr = (BM // 4 // 16) * (BN // 4 // 16) * (BK // 128)
+        A_READS: tl.constexpr = (BM // 4) * (BK // DA) // (32 * 16)
+        B_READS: tl.constexpr = (BN // 4) * (BK // DB) // (32 * 16)
+        C00_READS: tl.constexpr = B_READS + A_READS + (0 if W256 else 2)  # b01, a10 (+ sb01, sa10)
+        C10_READS: tl.constexpr = A_READS + 1  # next slot's a00 and its scales
+        C11_READS: tl.constexpr = B_READS + 1  # next slot's b00 and its scales
+        # Hand-tuned density: DS reads issued after each WMMA, as early as
+        # possible; the WMMAs left after the last read group cover the reads'
+        # completion. C10 first spends one WMMA on each of the two TDM refill
+        # loads (descriptor SALU, then the load).
+        C00_READS_PER_WMMA: tl.constexpr = 4
+        NEXT_READS_PER_WMMA: tl.constexpr = 3
+        TDM_WMMAS: tl.constexpr = 2
+        C00_GROUPS: tl.constexpr = (C00_READS + C00_READS_PER_WMMA - 1) // C00_READS_PER_WMMA
+        C10_GROUPS: tl.constexpr = (C10_READS + NEXT_READS_PER_WMMA - 1) // NEXT_READS_PER_WMMA
+        C11_GROUPS: tl.constexpr = (C11_READS + NEXT_READS_PER_WMMA - 1) // NEXT_READS_PER_WMMA
+        tl.static_assert(LOADS == TDM_WMMAS)
+        tl.static_assert(C00_GROUPS < DOT_WMMAS and TDM_WMMAS + C10_GROUPS < DOT_WMMAS and C11_GROUPS < DOT_WMMAS)
         if W256:
             # With wave256 scales, sa00/sb00 carry both quadrants' scales from
             # one ds_load_b128 per operand; read only the payloads here.
@@ -1687,12 +1711,12 @@ def _mxgemm_defer_bottom_k_step(c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc
             b01, sb01 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 0, 1, BN, BK, DB, BUFFERS, RELAXED=True)
             a10, sa10 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 0, BM, BK, DA, BUFFERS, RELAXED=True)
         c00 = _mxgemm_native_dot(a00, sa00, "e4m3", b00, sb00, DTYPE_B, c00, tiles_per_warp=[2, 2])
-        # Front-load the 34 reads so the release drain before the signal has
+        # Front-load the reads so the release drain before the signal has
         # several WMMAs of cover.
-        for _ in tl.static_range(9):
+        for _ in tl.static_range(C00_GROUPS):
             tlx.amd_sched_group_barrier(0x8, 1, 107)
-            tlx.amd_sched_group_barrier(0x100, 4, 107)
-        tlx.amd_sched_group_barrier(0x8, 7, 107)
+            tlx.amd_sched_group_barrier(0x100, C00_READS_PER_WMMA, 107)
+        tlx.amd_sched_group_barrier(0x8, DOT_WMMAS - C00_GROUPS, 107)
         tlx.amd_sched_barrier()
         tlx.async_amd_descriptor_wait((BUFFERS - 2) * LOADS)
         tlx.named_barrier_arrive(0, tlx.num_warps() * 32)
@@ -1713,17 +1737,17 @@ def _mxgemm_defer_bottom_k_step(c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc
         tlx.amd_sched_group_barrier(0x4, 6, 108)
         tlx.amd_sched_group_barrier(0x8, 1, 108)
         tlx.amd_sched_group_barrier(0x10, 1, 108)
-        for _ in tl.static_range(6):
+        for _ in tl.static_range(C10_GROUPS):
             tlx.amd_sched_group_barrier(0x8, 1, 108)
-            tlx.amd_sched_group_barrier(0x100, 3, 108)
-        tlx.amd_sched_group_barrier(0x8, 8, 108)
+            tlx.amd_sched_group_barrier(0x100, NEXT_READS_PER_WMMA, 108)
+        tlx.amd_sched_group_barrier(0x8, DOT_WMMAS - TDM_WMMAS - C10_GROUPS, 108)
         tlx.amd_sched_barrier()
         b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BN, BK, DB, BUFFERS, RELAXED=True, BOTH=W256)
         c11 = _mxgemm_native_dot(a10, sa10, "e4m3", b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
-        for _ in tl.static_range(6):
+        for _ in tl.static_range(C11_GROUPS):
             tlx.amd_sched_group_barrier(0x8, 1, 109)
-            tlx.amd_sched_group_barrier(0x100, 3, 109)
-        tlx.amd_sched_group_barrier(0x8, 10, 109)
+            tlx.amd_sched_group_barrier(0x100, NEXT_READS_PER_WMMA, 109)
+        tlx.amd_sched_group_barrier(0x8, DOT_WMMAS - C11_GROUPS, 109)
         tlx.amd_sched_barrier()
         return c00, c01, c10, c11, a00, sa00, b00, sb00
     else:

@@ -7635,6 +7635,28 @@ def test_gfx1250_mxgemm_merged_handoff_barrier_splits_step_barrier(cluster_size,
         assert set(reads) == {"ds_load_b128"}
     else:
         assert "ds_load_2addr_b32" in reads
+    # The step derives its scheduling groups from these instruction counts
+    # (see _mxgemm_defer_bottom_k_step). Each wave reads its 64x128-byte part
+    # of an operand quadrant with 16 ds_load_b128 and runs 16 WMMAs per
+    # quadrant dot. C00 reads the second halves of B and A (plus their scales
+    # unless wave256 delivered them with the first halves); C10 and C11 read
+    # the next slot's A and B with their scales; C01 reads nothing.
+    c00_reads = 2 * 16 + (0 if scale_wave256 else 2)
+    regions = [[]]
+    for inst in body:
+        if "sched_barrier" in inst:
+            regions.append([])
+        elif re.match(r"\s+v_wmma", inst):
+            regions[-1].append("W")
+        elif re.match(r"\s+ds_load", inst):
+            regions[-1].append("r")
+    dots = [region for region in regions if region.count("W") == 16]
+    assert {region.count("r") for region in dots} == {0, 17, c00_reads}
+    for region in dots:
+        if region.count("r") == c00_reads:
+            # Four reads after each WMMA; the remaining WMMAs cover the drain.
+            tail = len(region) - 1 - max(i for i, kind in enumerate(region) if kind == "r")
+            assert tail == 16 - (c00_reads + 3) // 4
 
 
 @pytest.mark.parametrize("dtype_b,num_buffers,block_k", [
