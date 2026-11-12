@@ -4,11 +4,12 @@
 Usage:
     tlx_codegen_snapshot.py snapshot --out S.json [--ptx-version N]
     tlx_codegen_snapshot.py diff --base S_BASE.json --head S_HEAD.json
-        --base-sha SHA --head-sha SHA --out VERDICT.md
+        --base-sha SHA --head-sha SHA [--pr-head-sha SHA] --out VERDICT.md
 
 CPU-only: compiles each corpus kernel for sm90+sm100 with the INSTALLED
 triton (no GPU needed), extracts PTX features + instruction mix + ptxas
-stats (regs/smem/spills via the wheel's bundled ptxas), and diffs them.
+stats (regs/smem/spills via the wheel's bundled ptxas), and diffs them. A
+kernel that fails to compile is recorded in the snapshot, not fatal.
 
 Corpus v0 is two raw kernels (add, matmul). The growth path is tlx.ops
 kernels over focus shapes with pinned configs -- the snapshot/diff machinery
@@ -17,6 +18,7 @@ is corpus-agnostic. Always exits 0.
 
 import argparse
 import collections
+import functools
 import hashlib
 import json
 import os
@@ -27,7 +29,9 @@ import sys
 import tempfile
 
 ARCHES = (90, 100)
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
+CORPUS_VERSION = 0
+VERDICT_RANK = {"IDENTICAL": 0, "CHANGED": 1, "INVESTIGATE": 2}
 
 # ptxas deltas that escalate a kernel from CHANGED to INVESTIGATE.
 HARD_PTXAS_KEYS = ("regs", "smem", "spills_stores", "spills_loads", "stack_frame", "lmem")
@@ -119,7 +123,11 @@ def ptx_features(ptx):
         return len(re.findall(pat, ptx))
 
     local_bytes = sum(int(m.group(1)) for m in re.finditer(r"\.local\s+\.align\s+\d+\s+\.b\d+\s+\w+\[(\d+)\]", ptx))
+    isa = re.search(r"^\s*\.version\s+([\d.]+)", ptx, re.M)
+    target = re.search(r"^\s*\.target\s+(\w+)", ptx, re.M)
     return {
+        "ptx_isa": isa.group(1) if isa else None,
+        "target": target.group(1) if target else None,
         "ld_global": count(r"\bld\.global"),
         "st_global": count(r"\bst\.global"),
         "ld_shared": count(r"\bld\.shared"),
@@ -150,6 +158,16 @@ def instr_mix(ptx, limit=40):
         if re.fullmatch(r"[A-Za-z][\w.$]*", token):
             counts[token] += 1
     return dict(counts.most_common(limit))
+
+
+@functools.lru_cache(maxsize=None)
+def ptxas_version(ptxas):
+    try:
+        out = subprocess.run([ptxas, "--version"], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"V(\d+\.\d+\.\d+)", out)
+    return match.group(1) if match else None
 
 
 def ptxas_stats(ptx, arch, ptxas):
@@ -204,6 +222,7 @@ def snapshot(args):
     import triton
     snap = {
         "version": SNAPSHOT_VERSION,
+        "corpus_version": CORPUS_VERSION,
         "triton_version": triton.__version__,
         "kernels": {},
     }
@@ -213,20 +232,25 @@ def snapshot(args):
             opts["ptx_version"] = args.ptx_version
         snap["kernels"][name] = {}
         for arch in ARCHES:
-            ptx = compile_ptx(fn, sig, const, opts, arch)
-            norm = normalize_ptx(ptx)
-            snap["kernels"][name][f"sm{arch}"] = {
-                "ptx_sha": hashlib.sha256(norm.encode()).hexdigest()[:16],
-                "ptx": ptx_features(norm),
-                "instr_mix": instr_mix(norm),
-                "ptxas": ptxas_stats(ptx, arch, find_ptxas(arch)),
-                "options": opts,
-            }
-            entry = snap["kernels"][name][f"sm{arch}"]
-            print(
-                f"compiled {name}/sm{arch}: "
-                f"{entry['ptxas'].get('regs')} regs, "
-                f"{entry['ptxas'].get('smem')} smem", flush=True)
+            try:
+                ptx = compile_ptx(fn, sig, const, opts, arch)
+                norm = normalize_ptx(ptx)
+                ptxas = find_ptxas(arch)
+                entry = {
+                    "ptx_sha": hashlib.sha256(norm.encode()).hexdigest()[:16],
+                    "ptx": ptx_features(norm),
+                    "instr_mix": instr_mix(norm),
+                    "ptxas": dict(ptxas_stats(ptx, arch, ptxas), ptxas_version=ptxas_version(ptxas)),
+                    "options": opts,
+                }
+                print(
+                    f"compiled {name}/sm{arch}: "
+                    f"{entry['ptxas'].get('regs')} regs, "
+                    f"{entry['ptxas'].get('smem')} smem", flush=True)
+            except Exception as exc:
+                entry = {"error": " ".join(f"{type(exc).__name__}: {exc}".split())[:300], "options": opts}
+                print(f"FAILED {name}/sm{arch}: {entry['error']}", flush=True)
+            snap["kernels"][name][f"sm{arch}"] = entry
     with open(args.out, "w") as handle:
         json.dump(snap, handle, indent=1)
     print(f"wrote {args.out}")
@@ -239,6 +263,23 @@ def _delta_rows(b_feats, h_feats):
         if b_feats[key] != h_feats.get(key):
             rows.append((key, b_feats[key], h_feats.get(key)))
     return rows
+
+
+def _ptxas_signals(entry):
+    return {k: v for k, v in entry.get("ptxas", {}).items() if k not in ("ptxas_rc", "ptxas_err_tail")}
+
+
+def _error_verdict(b, h):
+    if h is None:
+        return "INVESTIGATE", "Missing from the head snapshot."
+    b_err, h_err = b.get("error"), h.get("error")
+    if b_err and h_err:
+        if b_err == h_err:
+            return "IDENTICAL", "fails to compile on both sides"
+        return "CHANGED", f"Fails to compile on both sides; head error: `{h_err}`"
+    if h_err:
+        return "INVESTIGATE", f"Head fails to compile: `{h_err}`"
+    return "CHANGED", "Base failed to compile; head compiles."
 
 
 def _mix_rows(b_mix, h_mix, limit=10):
@@ -257,11 +298,15 @@ def diff(args):
     if base.get("version") != head.get("version"):
         print("snapshot version mismatch -- no signal")
         return 0
+    if args.pr_head_sha and args.pr_head_sha != args.head_sha:
+        sides = (f"Base `{args.base_sha[:12]}` vs merge commit `{args.head_sha[:12]}` "
+                 f"(PR head `{args.pr_head_sha[:12]}`). ")
+    else:
+        sides = f"Base `{args.base_sha[:12]}` vs head `{args.head_sha[:12]}`. "
     lines = [
         "## TLX codegen trace (advisory)",
         "",
-        f"Base `{args.base_sha[:12]}` vs head `{args.head_sha[:12]}`. "
-        f"Corpus v{base.get('version')} "
+        f"{sides}Corpus v{base.get('corpus_version', CORPUS_VERSION)} "
         f"({', '.join(sorted(base['kernels']))}; sm90+sm100).",
         "",
     ]
@@ -269,25 +314,26 @@ def diff(args):
     for name in sorted(base["kernels"]):
         for arch in sorted(base["kernels"][name]):
             b = base["kernels"][name][arch]
-            h = head["kernels"].get(name, {}).get(arch, {})
+            h = head["kernels"].get(name, {}).get(arch)
             tag = f"{name}/{arch}"
-            if not h or b["ptx_sha"] == h.get("ptx_sha"):
-                lines.append(f"- `{tag}`: identical")
+            if h is None or "error" in b or "error" in h:
+                verdict, note = _error_verdict(b, h)
+                overall = max(overall, verdict, key=VERDICT_RANK.get)
+                if verdict == "IDENTICAL":
+                    lines.append(f"- `{tag}`: identical ({note})")
+                else:
+                    lines += ["", f"### `{tag}`: {verdict}", "", note, ""]
                 continue
             feat_rows = _delta_rows(b["ptx"], h["ptx"])
-            ptxas_rows = _delta_rows(
-                {k: v
-                 for k, v in b["ptxas"].items()
-                 if k not in ("ptxas_rc", "ptxas_err_tail")},
-                {k: v
-                 for k, v in h.get("ptxas", {}).items()
-                 if k not in ("ptxas_rc", "ptxas_err_tail")})
+            ptxas_rows = _delta_rows(_ptxas_signals(b), _ptxas_signals(h))
+            if b["ptx_sha"] == h["ptx_sha"] and not ptxas_rows:
+                lines.append(f"- `{tag}`: identical")
+                continue
             mix_rows = _mix_rows(b.get("instr_mix", {}), h.get("instr_mix", {}))
             hard = ([row for row in ptxas_rows if row[0] in HARD_PTXAS_KEYS] +
                     [row for row in feat_rows if row[0] in HARD_PTX_KEYS])
             verdict = "INVESTIGATE" if hard else "CHANGED"
-            overall = ("INVESTIGATE" if verdict == "INVESTIGATE" else
-                       ("CHANGED" if overall == "IDENTICAL" else overall))
+            overall = max(overall, verdict, key=VERDICT_RANK.get)
             lines += ["", f"### `{tag}`: {verdict}", ""]
             if ptxas_rows + feat_rows:
                 lines += ["| signal | base | head |", "|---|---|---|"]
@@ -302,6 +348,7 @@ def diff(args):
                     "", "Register/smem/spill allocation moved -- treat "
                     "as a likely perf-relevant codegen change."
                 ]
+            lines.append("")
     lines += [
         "", f"Overall: **{overall}**.", "This is advisory, not a gate failure. Corpus v0 is two raw "
         "kernels; tlx.ops coverage follows."
@@ -323,6 +370,7 @@ def main():
     dummy.add_argument("--head", required=True)
     dummy.add_argument("--base-sha", required=True)
     dummy.add_argument("--head-sha", required=True)
+    dummy.add_argument("--pr-head-sha", default="", help="PR head when --head-sha is GitHub's merge commit")
     dummy.add_argument("--out", required=True)
     args = parser.parse_args()
     if args.cmd == "snapshot":
