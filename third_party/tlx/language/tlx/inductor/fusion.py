@@ -38,8 +38,7 @@ def _is_tlx_choice(choice: Any) -> bool:
 
 
 def _uses_tma_epilogue_store(annotations: dict[str, Any]) -> bool:
-    """Whether a choice or template buffer, by its KernelTemplateChoice
-    annotation, is a TLX template storing its epilogue through TMA."""
+    """Whether the annotated choice is a TLX template with TMA_EPILOGUE_STORE."""
     ktc = annotations.get("ktc")
     if ktc is None or not getattr(ktc.template, "name", "").startswith("tlx_"):
         return False
@@ -49,10 +48,9 @@ def _uses_tma_epilogue_store(annotations: dict[str, Any]) -> bool:
 def tma_epilogue_store_fusion_unsupported(
     node1: "BaseSchedulerNode", node2: "BaseSchedulerNode"
 ) -> bool:
-    """Whether node2 can't be an epilogue of a TLX template that may store it
-    through TMA_EPILOGUE_STORE. That path stores exactly one buffer, the last
-    epilogue result, through a row-major [M, N] TMA descriptor whose staging
-    tile is budgeted at the template's dtype."""
+    """Whether node2 can't fuse into a TLX template that may use TMA_EPILOGUE_STORE,
+    which stores exactly one buffer through a row-major [M, N] descriptor whose
+    staging tile is sized for the template's dtype."""
     from torch._inductor import ir
     from torch._inductor.scheduler import OutputNode
     from torch._inductor.virtualized import V

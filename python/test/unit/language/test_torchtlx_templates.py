@@ -993,8 +993,7 @@ class TestTLXTemplates(TestCase):
     @parametrize("benchmark_fusion", (False, True))
     @parametrize("case", ("live_output", "two_outputs", "chain_output", "wider_dtype", "fp8_output"))
     def test_tlx_matmul_ws_tma_epilogue_store(self, case: str, benchmark_fusion: bool):
-        """TMA_EPILOGUE_STORE stores one buffer, the fused epilogue's result, in the
-        output's dtype. Epilogues that need any other buffer stored must not fuse."""
+        """TMA_EPILOGUE_STORE stores only the fused result; other epilogues must not fuse."""
         cases = {
             "live_output": lambda o: (o * 2, o),
             "two_outputs": lambda o: (o * 2, o * 3),

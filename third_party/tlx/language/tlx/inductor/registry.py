@@ -3056,8 +3056,7 @@ TritonTemplateKernel.output_ptr = _tlx_output_ptr  # type: ignore[method-assign]
 
 
 def _tlx_output_stride(self, index):  # type: ignore[no-untyped-def]
-    """Stride of the buffer output_ptr() points at, e.g. a fused epilogue
-    writing a cat slot whose rows are wider than the GEMM output."""
+    """Stride of the buffer output_ptr() points at (e.g. a wider cat slot)."""
     stride = _tlx_final_output_node(self).get_stride()[index]
     return texpr(self.rename_indexing(stride))
 
