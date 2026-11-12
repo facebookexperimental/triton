@@ -3308,6 +3308,11 @@ private:
       users.append(user->getResult(0).getUsers().begin(),
                    user->getResult(0).getUsers().end());
     }
+    // Without a TMEM channel the min/max below would build
+    // Interval(SIZE_MAX, 0).
+    if (liveOperations.empty())
+      llvm::report_fatal_error(
+          "WS TMEM memory planner: tmem_alloc has no TMEM channel");
     auto minId = std::numeric_limits<size_t>::max();
     auto maxId = std::numeric_limits<size_t>::min();
     std::for_each(liveOperations.begin(), liveOperations.end(),

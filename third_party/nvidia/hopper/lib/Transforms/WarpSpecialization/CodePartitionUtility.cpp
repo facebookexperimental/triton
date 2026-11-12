@@ -3382,7 +3382,15 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
         createChannelsForProducers(currentProds, producerTaskId, consumerIds,
                                    tmemAllocOp.getOperation(), user, channels);
       } else {
-        assert(false && "Unexpected Producer Found");
+        // A same-partition read still needs a channel: the MMAs are
+        // asynchronous, so program order does not make their results visible.
+        if (!firstProducer)
+          firstProducer = currentProds.front();
+        lastConsumer = user;
+        numChannelsCreated++;
+        SmallVector<int> selfConsumer = {producerTaskId};
+        createChannelsForProducers(currentProds, producerTaskId, selfConsumer,
+                                   tmemAllocOp.getOperation(), user, channels);
       }
     }
   }
@@ -3698,8 +3706,34 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
                           producerTaskId);
   consumerTaskIds.erase(iter, consumerTaskIds.end());
 
+  // An MMA operand written in the MMA's own task and loop body still needs a
+  // (self-consumer) channel: the next iteration's store must wait for the
+  // asynchronous MMA to finish reading the tile.
+  bool isTmem = isa<ttng::TMEMAllocOp>(allocOp);
+  Value allocResult = allocOp->getResult(0);
+  bool sameTaskOperand =
+      consumerTaskIds.empty() &&
+      (isTmem ? isa<ttng::TMEMStoreOp>(producerOp)
+              : isa<ttg::LocalStoreOp>(producerOp)) &&
+      producerOp->getParentOfType<scf::ForOp>() && !consumers.empty() &&
+      llvm::all_of(consumers, [&](Operation *consumer) {
+        auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(consumer);
+        return mmaOp && mmaOp.getAccumulator() != allocResult &&
+               (mmaOp.getA() == allocResult ||
+                (!isTmem && mmaOp.getB() == allocResult)) &&
+               consumer->getBlock() == producerOp->getBlock() &&
+               getAsyncTaskIds(consumer) ==
+                   SmallVector<AsyncTaskId>{producerTaskId};
+      });
+  SmallVector<int> selfConsumer = {producerTaskId};
+
   if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(allocOp)) {
-    if (needsChannel(producerTaskId, consumerTaskIds)) {
+    if (sameTaskOperand) {
+      channels.push_back(std::make_unique<ttng::TmemAllocChannel>(
+          producerTaskId, selfConsumer, allocOp, false, false,
+          channels.size()));
+      channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
+    } else if (needsChannel(producerTaskId, consumerTaskIds)) {
       channels.push_back(std::make_unique<ttng::TmemAllocChannel>(
           producerTaskId, consumerTaskIds, allocOp, false, isOperandDNoAcc,
           channels.size()));
@@ -3707,11 +3741,12 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
     }
   } else {
     bool shouldCreateSmemChannel =
-        includeSameTaskSmemChannels ||
+        sameTaskOperand || includeSameTaskSmemChannels ||
         needsChannel(producerTaskId, consumerTaskIds);
     if (shouldCreateSmemChannel) {
       channels.push_back(std::make_unique<AllocChannel>(
-          producerTaskId, consumerTaskIds, allocOp, channels.size()));
+          producerTaskId, sameTaskOperand ? selfConsumer : consumerTaskIds,
+          allocOp, channels.size()));
       channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
       auto *post = static_cast<AllocChannel *>(channels.back().get());
       // Cache the resolved producer op so getSrcOp() survives a sibling
