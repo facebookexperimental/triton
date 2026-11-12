@@ -1140,13 +1140,8 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
 
     @staticmethod
     def _has_unsupported_fp32_operands(kernel_inputs: KernelInputs) -> bool:
-        """Whether FP32 operands rule out the template.
-
-        The template's MMA runs FP32 inputs as TF32, so it is only an option when
-        TF32 is allowed. tcgen05.mma also rejects transposed FP32 operands in shared
-        memory, and the template loads both operands as stored, so A must be
-        row-major (K inner) and B column-major (K inner).
-        """
+        """FP32 runs as TF32, and tcgen05.mma rejects transposed FP32 SMEM operands,
+        so FP32 needs TF32 allowed and K-inner A and B (the template loads operands as stored)."""
         if not isinstance(kernel_inputs, MMKernelInputs):
             return False
         idxs = (kernel_inputs._mat1_idx, kernel_inputs._mat2_idx)
@@ -1198,8 +1193,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
         m, n, k = kernel_inputs.mnk_hinted()
         num_sms = get_num_sms()
         is_allow_mode = config.triton.tlx_mode == "allow"
-        # The config pool and the heuristic are sized for 2-byte operands; wider
-        # operands (FP32) double the operand and epilogue staging SMEM.
+        # The config pool and the heuristic are sized for 2-byte operands.
         elem_bytes = kernel_inputs.dtype(kernel_inputs._mat1_idx).itemsize
         wide_operands = elem_bytes != resources.OPERAND_ELEM_BYTES
 
