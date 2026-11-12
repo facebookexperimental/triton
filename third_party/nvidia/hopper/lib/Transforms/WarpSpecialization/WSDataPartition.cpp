@@ -989,8 +989,7 @@ static bool getForwardSliceToPartition(Value v,
     if (reduceOp && currentDim != DataPartitionScheme::noOpPartitionDim) {
       if (reduceOp.getAxis() == currentDim &&
           !getShape(reduceOp->getResult(0)).empty()) {
-        // Each partition yields a partial result over its slice. Their users
-        // see the combined result, so the walk stops here.
+        // Users see the combined result, so the walk stops here.
         if (!canCombineAcrossPartitions(reduceOp)) {
           partitionScheme.skipPartitioning = true;
           return false;

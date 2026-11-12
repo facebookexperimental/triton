@@ -1,8 +1,7 @@
 // RUN: triton-opt %s --nvgpu-ws-data-partition=num-warp-groups=3 -verify-diagnostics | FileCheck %s
 
-// A 64x128 accumulator cannot be split two ways (32 rows is below the minimum
-// M slice and 64 columns below the minimum N slice), so data partitioning is
-// skipped with a remark and the tile stays whole instead of failing the pass.
+// A 64x128 accumulator is too small to split two ways: skip data partitioning
+// instead of failing the pass.
 
 // CHECK-LABEL: @small_tile_skips_partitioning
 // CHECK: ttng.warp_group_dot {{.*}} -> tensor<64x128xf32, #mma>
