@@ -227,7 +227,22 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
       // original tt.descriptor_load path kept unified (SMEM/TMEM overflow in FA
       // backward).
       builder.setAsyncTaskIdsFromValueUsers(load.getResult());
-      builder.setLoopScheduleInfoFromOp(*load->getUsers().begin());
+      // Schedule the shared local_load with its earliest consumer: a later
+      // stage can deadlock a forwarding copy on a single-buffer acquire.
+      Operation *earliestUser = nullptr;
+      auto scheduleKey = [](Operation *op) {
+        auto stage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+        auto cluster =
+            op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+        return std::make_pair(stage ? stage.getInt() : INT_MAX,
+                              cluster ? cluster.getInt() : INT_MAX);
+      };
+      for (Operation *user : load->getUsers()) {
+        if (!earliestUser || scheduleKey(user) < scheduleKey(earliestUser))
+          earliestUser = user;
+      }
+      assert(earliestUser && "live descriptor load must have a consumer");
+      builder.setLoopScheduleInfoFromOp(earliestUser);
       auto localLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
           load.getLoc(), load.getType(), buffer);
       load.replaceAllUsesWith(localLoad.getResult());
