@@ -17,6 +17,7 @@ split's partials.
 
 import contextlib
 import inspect
+import math
 import time
 from types import SimpleNamespace
 
@@ -27,7 +28,7 @@ from triton._internal_testing import is_blackwell
 from triton.tlx.ops import BitwiseInvarianceSpec
 from triton.tlx.ops._catalog import invariant_vocab_for
 from triton.tlx.ops.kernels.mm import sm100
-from triton.tlx.ops.kernels.mm._shapes import SM100_CORRECTNESS_SHAPES, operand
+from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, SM100_CORRECTNESS_SHAPES, operand
 
 from mm_test_utils import MAX_SECONDS_PER_CASE, REL_PRECISION, run_mm_case, run_mm_invariance_case
 
@@ -160,6 +161,16 @@ def test_tall_m_heuristic_cluster_fits_one_group(M, N, K):
     assert cfg["NUM_CTAS"] == 2
     assert cfg["GROUP_SIZE_M"] % cfg["NUM_CTAS"] == 0
     assert cfg["GROUP_SIZE_M"] >= cfg["NUM_CTAS"]
+
+
+def test_heuristic_splits_k_only_when_full_tiles_leave_sms_idle():
+    num_sms = 148
+    for M, N, K, *_ in CORRECTNESS_SHAPES:
+        cfg = sm100.get_heuristic_config(M, N, K, num_sms)
+        if cfg is None or cfg["SPLIT_K"] == 1 or M < cfg["BLOCK_SIZE_M"]:
+            continue
+        tiles = math.ceil(M / cfg["BLOCK_SIZE_M"]) * math.ceil(N / cfg["BLOCK_SIZE_N"])
+        assert tiles < num_sms, f"{M}x{N}x{K}: {cfg}"
 
 
 @pytest.mark.parametrize("M, N", [(1, 1), (1280, 1280), (128, 10000)])

@@ -138,6 +138,8 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                     "pre_hook": matmul_tma_set_block_size_hook,
                 }
 
+    split_k_fills_no_sms = False
+
     # Characteristic 2: Undersaturated GPU needs Split-K for parallelism
     if is_undersaturated and fixed is None:
         # Use MN product to determine tile size - larger MN benefits from wider tiles
@@ -157,7 +159,11 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
             if k_tiles >= sk and k_tiles // sk >= 4:
                 split_k = sk
                 break
-        if split_k > 1:
+        # 256x128 tiles can fill the GPU where 256x256 tiles do not. Splitting K
+        # then adds a pass over fp32 partials without occupying idle SMs.
+        split_k_fills_no_sms = (split_k > 1 and is_large_output
+                                and math.ceil(M / block_m) * math.ceil(N / block_n) >= num_sms)
+        if split_k > 1 and not split_k_fills_no_sms:
             if is_large_output:
                 # Larger output: wider tiles, more epilogue subtiling, fewer TMEM buffers
                 return {
@@ -194,7 +200,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                 }
 
     # Characteristic 3: GPU-saturated shapes use wide tiles for data reuse
-    if is_gpu_saturated:
+    if is_gpu_saturated or split_k_fills_no_sms:
         return {
             "BLOCK_SIZE_M": 256,
             "BLOCK_SIZE_N": 256,
