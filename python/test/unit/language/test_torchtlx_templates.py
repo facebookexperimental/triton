@@ -1200,6 +1200,62 @@ class TestTLXTemplates(TestCase):
         if mode == "force":
             self.assertIn("triton_tem_fused_tlx_mm", "\n".join(code))
 
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_matmul_ws_tma_staging_sized_by_output_dtype(self):
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        heuristic = _tlx_registry.BlackwellGemmWSConfigHeuristic
+        template_kwargs = {
+            "BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_SMEM_BUFFERS": 3, "NUM_TMEM_BUFFERS": 2,
+            "NUM_MMA_GROUPS": 1, "NUM_CTAS": 1, "EPILOGUE_SUBTILE": 2, "SPLIT_K": 1,
+        }
+        tma = [kw["TMA_EPILOGUE_STORE"] for kw in heuristic._yield_tma_variants(template_kwargs)]
+        tma_fp32 = [kw["TMA_EPILOGUE_STORE"] for kw in heuristic._yield_tma_variants(template_kwargs, out_elem_bytes=4)]
+        self.assertEqual((tma, tma_fp32), ([1], [0]))
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("epilogue", ("plain", "smem_tight_1cta"))
+    def test_tlx_matmul_ws_tma_epilogue_stores_output_dtype(self, epilogue):
+        # bf16 GEMM + fused .float(): the TMA epilogue must stage fp32 and still fit in SMEM.
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        heuristic_config = {
+            "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 8, "NUM_SMEM_BUFFERS": 3,
+            "NUM_TMEM_BUFFERS": 2, "NUM_MMA_GROUPS": 1, "EPILOGUE_SUBTILE": 1, "NUM_CTAS": 1, "SPLIT_K": 1
+        }
+        if epilogue == "smem_tight_1cta":
+            heuristic_config.update(BLOCK_SIZE_N=256, EPILOGUE_SUBTILE=2)
+
+        a = torch.randn(2048, 1024, device=GPU_TYPE, dtype=torch.bfloat16)
+        b = torch.randn(1024, 2048, device=GPU_TYPE, dtype=torch.bfloat16)
+
+        def mm_to_fp32(a, b):
+            return (a @ b).float()
+
+        with (
+                mock.patch.object(_tlx_registry, "get_heuristic_config", lambda *args, **kwargs: dict(heuristic_config)),
+                tlx_config.patch(use_heuristic_config=True),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "enable_caching_generated_triton_templates": False,
+                }),
+        ):
+            actual, code = run_and_get_code(torch.compile(mm_to_fp32), a, b)
+
+        self.assertEqual(actual.dtype, torch.float32)
+        torch.testing.assert_close(actual, a.float() @ b.float(), atol=1e-2, rtol=1e-2)
+        generated = "\n".join(code)
+        self.assertIn("async_descriptor_store(desc_c", generated)
+        self.assertNotIn("triton_poi_", generated)
+        if epilogue == "smem_tight_1cta":
+            subtile = int(re.search(r"EPILOGUE_SUBTILE : tl.constexpr = (\d+)", generated).group(1))
+            self.assertGreater(subtile, heuristic_config["EPILOGUE_SUBTILE"])
+
     @unittest.skipIf(
         not has_datacenter_blackwell_tma_device(),
         "Need Blackwell with device-side TMA support in Triton",
@@ -4602,12 +4658,12 @@ class TestResourceModel(TestCase):
         from triton.language.extra.tlx.hw.resources import BLACKWELL_WS_GEMM
 
         tile = self._tile()
-        # A: 128*64*2*4, B: 64*128*2*4, epilog: 128*(128/2)*2, barriers: 4*1*8
-        expected = 65536 + 65536 + 16384 + 32
+        # A: 128*64*2*4, B: 64*128*2*4, epilog: max(1, 2)*128*(128/2)*2, barriers: 4*1*8
+        expected = 65536 + 65536 + 32768 + 32
         self.assertEqual(BLACKWELL_WS_GEMM.estimate_smem(tile, charge_epilogue=True), expected)
         self.assertEqual(
             BLACKWELL_WS_GEMM.estimate_smem(tile, charge_epilogue=False),
-            expected - 16384,
+            expected - 32768,
         )
 
     def test_blackwell_smem_two_cta_halves_b_and_doubles_barriers(self):
