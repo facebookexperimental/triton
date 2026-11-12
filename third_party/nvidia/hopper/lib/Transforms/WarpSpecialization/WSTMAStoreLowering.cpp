@@ -771,9 +771,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
           continue;
         }
 
-        // Stage of the writer and the number of TMA store-like ops issued
-        // between the store and the writer's next instance, read before the
-        // schedule is modified.
+        // Read before the schedule is modified.
         int writerStage = -1;
         int storesBeforeWriter = 0;
         if (targetWriter && !sameIteration) {
@@ -828,12 +826,9 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
         } else {
           schedule.insert(waitOp, targetStage, waitCluster);
           rotatedAcrossIterations = !sameIteration;
-          // The rotated wait is a stage later than the writer, so the
-          // pipeliner's prologue has no copy of it: the first iterations of a
-          // run write the slots while the previous run's (e.g. the previous
-          // persistent tile's) last stores may still be in flight. Give the
-          // writer a queue-wide wait in its own stage that retires the store
-          // (at most the stores issued since may stay pending).
+          // The rotated wait is a stage after the writer, so the prologue has
+          // no copy of it and a run's first writes could race the previous
+          // run's last stores. Give the writer its own queue-wide wait.
           if (rotatedAcrossIterations && targetWriter && writerStage >= 0 &&
               k > 1 && waitOp.getBarriers().empty() &&
               waitOp.getBarrierPreds().empty() &&
@@ -871,10 +866,8 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
     if (changed)
       schedule.serialize(forOp);
 
-    // The rotated waits' copies in the pipeliner's drain keep the rotated
-    // count, so the last K-1 stores are still in flight when the loop exits.
-    // The next run's writers wait for them (see above); drain them once after
-    // the outermost enclosing loop, as merged-epilogue and CLC loops do.
+    // The drain copies keep the rotated count, leaving K-1 stores in flight
+    // at loop exit; drain them once after the outermost enclosing loop.
     if (!crossIterationTaskIds.empty()) {
       Operation *exitAnchor = forOp;
       for (Operation *p = forOp->getParentOp();
