@@ -1,5 +1,7 @@
 import copy
 import json
+import re
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 
@@ -145,6 +147,24 @@ def test_bisect_uses_a_good_baseline_not_the_already_regressed_previous_night():
     assert spec["required_ratio"] == regressions.COHORT_RATIO
     commit_dates = {spec["good_sha"]: "2026-11-02T23:15:00Z", spec["bad_sha"]: "2026-11-04T23:45:00Z"}
     assert "ranked" not in regressions.issue_body(alert, "o/r", "run", commit_dates)
+
+
+def test_affected_case_rows_link_to_the_dashboard_filtered_to_that_case():
+    nights = history() + [night("20261104", 30, keys=("a", ))]
+    for n in nights:
+        for case in n["ops"]["flash_attn_mxfp8"]["cases"]:
+            case["params"] = {"N": case["key"], "strides": "[[1,2048],[4096,1]]"}
+    alert = regressions.detect(nights)[0]
+    spec = regressions.bisect_spec(alert)
+    commit_dates = {spec["good_sha"]: "2026-11-02T23:15:00Z", spec["bad_sha"]: "2026-11-03T23:45:00Z"}
+    body = regressions.issue_body(alert, "o/r", "run", commit_dates)
+    row = next(line for line in body.splitlines() if "strides=" in line)
+    links = re.findall(r"\((https://facebookexperimental\.github\.io/triton/bench/#[^)]*)\)", row)
+    assert len(links) == 1, row
+    assert dict(parse_qsl(urlsplit(links[0]).fragment)) == {
+        "tab": "trending", "platform": "mi350", "op": "flash_attn_mxfp8", "dir": "bwd", "dtype": "bf16", "in.N": "a",
+        "in.strides": "[[1,2048],[4096,1]]"
+    }
 
 
 def test_issue_endpoint_dates_follow_the_bisected_case():
