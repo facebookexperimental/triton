@@ -7,10 +7,7 @@
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
-// A non-warp-specialized 2-CTA epilogue: a plain TMA store token wait is
-// followed by an arrive on the peer CTA's barrier (a shared_cluster_memory
-// view). Sinking the wait must treat that view as possibly aliasing the
-// staging buffer (it used to assert "expected an SMEM memdesc") and stop.
+// A shared_cluster_memory view must be treated as possibly aliasing the staging buffer.
 // CHECK-LABEL: @plain_token_wait_before_cluster_arrive
 // CHECK: ttng.async_tma_copy_local_to_global
 // CHECK: ttng.async_tma_store_token_wait
