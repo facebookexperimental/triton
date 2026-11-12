@@ -237,7 +237,7 @@ def nights_of(values, mode="gpu_events", start=1):
     ("ok", ("ok", "ok"), ["recent", "historical-best"]),
     ("ok", ("ok", "noisy"), ["recent"]),
     ("ok", ("noisy", "noisy", "ok"), ["recent"]),
-    ("noisy", ("noisy", "noisy", "ok", "ok"), ["recent"]),
+    ("noisy", ("noisy", "noisy", "ok", "ok"), ["recent", "noise-scaled"]),
 ])
 def test_one_episode_is_filed_once_across_detectors_and_after_a_person_closes_it(prior_status, statuses, detectors):
     baseline = history()
@@ -273,7 +273,7 @@ def test_historical_best_reports_a_lasting_loss_in_one_stable_case_but_not_in_a_
     alerts = regressions.detect_all(nights_of([{"a": a, "f": f, **steady} for a, f in zip(stable, flapping)]))
     assert [(a["date"], a["detectors"], [c["key"]
                                          for c in a["cases"]])
-            for a in alerts] == [("20261007", ["historical-best"], ["a"])]
+            for a in alerts] == [("20261007", ["historical-best", "noise-scaled"], ["a", "a"])]
 
 
 def test_historical_best_skips_missing_nights_but_never_crosses_a_timing_mode():
@@ -296,3 +296,35 @@ def test_bisect_from_the_nearest_good_night_can_still_reproduce_the_loss():
     spec = regressions.bisect_spec(alert)
     assert (spec["good_sha"], spec["bad_sha"]) == ("20261005" * 5, "20261007" * 5)
     assert 84 / 92 <= spec["required_ratio"] < 1
+
+
+def series_nights(values_by_key, statuses=None):
+    """One night per index; values_by_key maps a case key to its per-night throughput."""
+    count = len(next(iter(values_by_key.values())))
+    statuses = statuses or ["ok"] * count
+    out = []
+    for i in range(count):
+        date = f"202610{i + 1:02d}"
+        cases = [{
+            "key": key, "params": {"N": key}, "dtype": "bf16", "direction": "fwd", "status": statuses[i], "tlx_tflops":
+            values[i], "ref_tflops": None, "notes": []
+        } for key, values in values_by_key.items()]
+        out.append({
+            "schema": 2, "platform": "b200", "date": date, "sha": date * 5, "timing":
+            {"latency_mode": "gpu_events", "replicates": 1}, "ops": {"norm_fwd": {"cases": cases}}
+        })
+    return out
+
+
+def test_the_loss_threshold_scales_with_each_cases_own_noise():
+    quiet = [100, 100.2, 99.9, 100.1, 100, 99.8, 100.1, 100, 94, 94]
+    jittery = [100, 104, 97, 103, 96, 104, 98, 103, 94, 94]
+    alerts = regressions.detect_noise(series_nights({"quiet": quiet, "jittery": jittery}))
+    assert [(a["date"], [c["key"] for c in a["cases"]]) for a in alerts] == [("20261010", ["quiet"])]
+
+
+def test_a_regression_that_makes_its_case_noisy_is_still_reported():
+    values = [100, 100.2, 99.9, 100.1, 100, 99.8, 100.1, 100, 92, 92]
+    statuses = ["ok"] * 8 + ["noisy", "noisy"]
+    alerts = regressions.detect_all(series_nights({"a": values}, statuses))
+    assert [(a["date"], a["detectors"]) for a in alerts] == [("20261010", ["noise-scaled", "unstable"])]
