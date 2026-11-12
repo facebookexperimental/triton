@@ -166,9 +166,7 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
-// Test: descriptor_load -> trans -> truncf -> local_alloc is rewritten as a
-// half-width chain. The old full-width producer chain must be erased, and the
-// truncation semantics must be preserved.
+// Test: descriptor_load -> trans -> truncf -> local_alloc is split to half width.
 // CHECK-LABEL: @matmul_2cta_transposed_truncated_b
 // CHECK-SAME: %[[B_DESC:.*]]: !tt.tensordesc<64x64xf32>
 // CHECK-NOT: !tt.tensordesc<128x64xf32>

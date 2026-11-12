@@ -1,8 +1,6 @@
 // RUN: not triton-opt %s --nvgpu-2cta-transform-loads 2>&1 | FileCheck %s
 
-// A host descriptor is retyped in place when its B tile is split between two
-// CTAs. Reject a truncated B path if another load still needs the original
-// descriptor shape.
+// A truncated B whose host descriptor has another load is rejected.
 // CHECK: error: 2-CTA truncated B requires an unshared host descriptor
 
 #src = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
@@ -27,7 +25,6 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %b_smem = ttg.local_alloc %b_trunc : (tensor<64x128xbf16, #dst>) -> !ttg.memdesc<64x128xbf16, #shared_b, #smem>
     %mma = ttng.tc_gen5_mma %a_smem, %b_smem, %acc[%token], %true, %true {two_ctas} : !ttg.memdesc<128x64xbf16, #shared_a, #smem>, !ttg.memdesc<64x128xbf16, #shared_b, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
 
-    // This second use requires the original full-width host descriptor.
     %unused = tt.descriptor_load %b_desc[%c0_i32, %c0_i32] : !tt.tensordesc<128x64xf32> -> tensor<128x64xf32, #src>
     tt.return
   }

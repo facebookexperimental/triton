@@ -178,9 +178,8 @@ static FailureOr<BLoadTrace> traceToDescriptorLoad(Value bMemDesc) {
   while (auto cvt = tensor.getDefiningOp<ttg::ConvertLayoutOp>())
     tensor = cvt.getSrc();
 
-  // A producer-fused B operand can load FP32 through TMA and explicitly round
-  // it to BF16 before the dot.  Preserve that rounding, but move it after the
-  // per-CTA descriptor split so each CTA converts and stages only its N half.
+  // Keep an explicit rounding of B, but redo it after the per-CTA split so
+  // each CTA converts only its N half.
   arith::TruncFOp trunc;
   if (auto truncOp = tensor.getDefiningOp<arith::TruncFOp>()) {
     trunc = truncOp;
@@ -521,9 +520,7 @@ struct Transform2CTALoads
       // and creates the CuTensorMap with the correct half-width box_dim.
       // This follows the same pattern as Data Partitioning (WSDataPartition).
       auto descVal = descLoad.getDesc();
-      // Retyping a shared host descriptor would also change unrelated loads.
-      // Reject the newly supported truncated path instead of producing an
-      // invalid mixed-width descriptor use.
+      // Retyping a shared host descriptor would also change its other loads.
       if (trunc && !descVal.hasOneUse()) {
         mma->emitError(
             "2-CTA truncated B requires an unshared host descriptor");
@@ -626,8 +623,7 @@ struct Transform2CTALoads
       localAlloc.erase();
     }
 
-    // Erase the replaced producer chain downstream-to-upstream. Otherwise a
-    // dead truncation can keep the old transpose and descriptor load alive.
+    // Erase downstream first: a dead truncation would keep the old chain alive.
     if (trunc && trunc.getResult().use_empty())
       trunc.erase();
 
