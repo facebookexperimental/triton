@@ -309,6 +309,13 @@ unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
                    axisInfoAnalysis.getMaskAlignment(load.getMask(), order[0]));
     alignment = std::max(alignment, unalignedAlignment);
   }
+  // The store lowering splits a masked store into accesses no wider than the
+  // mask's alignment, so a wider layout only spreads each warp's writes over
+  // more memory sectors.
+  if (auto store = dyn_cast<triton::StoreOp>(op); store && store.getMask())
+    alignment =
+        std::min(alignment,
+                 axisInfoAnalysis.getMaskAlignment(store.getMask(), order[0]));
   unsigned maxElementsPerThread = getMaxElementsPerThread(op, maxVecBits);
   unsigned currPerThread = std::min(alignment, maxElementsPerThread);
   LDBG("elemNumBytes: " << elemNumBytes
