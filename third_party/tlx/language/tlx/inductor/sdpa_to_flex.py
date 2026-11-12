@@ -1,9 +1,9 @@
 """Route eligible SDPA flash-attention calls to Inductor's flex-attention lowering.
 
-With ``tlx_config.sdpa_to_flex`` on, ``aten._scaled_dot_product_flash_attention``
-and its backward lower through the flex-attention fwd/bwd lowerings (identity
-score_mod, no block mask), so flex templates -- stock today, TLX later -- can
-serve SDPA callers. Ineligible calls keep the original fallback.
+With ``tlx_config.sdpa_to_flex`` on, the flash and cuDNN SDPA ops and their
+backwards lower through the flex-attention fwd/bwd lowerings (identity score_mod,
+no block mask), so flex templates -- stock today, TLX later -- can serve SDPA
+callers. Ineligible calls keep the original fallback.
 
 Routed calls autotune their flex template even with max_autotune off, since flex's
 default tiles are slower than FA2 at these shapes; the rest of the graph keeps its
@@ -32,8 +32,10 @@ from .flex_attention_templates import sm90_flex_bwd_eligible
 
 aten = torch.ops.aten
 prims = torch.ops.prims
-_FWD = aten._scaled_dot_product_flash_attention.default
-_BWD = aten._scaled_dot_product_flash_attention_backward.default
+_FLASH_FWD = aten._scaled_dot_product_flash_attention.default
+_FLASH_BWD = aten._scaled_dot_product_flash_attention_backward.default
+_CUDNN_FWD = aten._scaled_dot_product_cudnn_attention.default
+_CUDNN_BWD = aten._scaled_dot_product_cudnn_attention_backward.default
 _LARGE_SPARSE_BLOCK_SIZE = 1 << 30
 # Shapes where flex beats FA2 on H100 (short queries, D=80/96); others stay on FA2.
 HEAD_DIMS = (80, 96)
@@ -223,16 +225,18 @@ def _placeholder_output(meta, device):
     return _full(meta.shape, 0, meta.dtype, meta.device or device)
 
 
-def _sdpa_flash_fwd(query, key, value, dropout_p=0.0, is_causal=False, return_debug_mask=False, *, scale=None):
+def _flex_fwd(query, key, value, dropout_p, is_causal, scale, lse_rank):
+    """Flex outputs in the SDPA op's output order, or None to keep the fallback.
+
+    lse_rank is the logsumexp rank the op returns: 3 for flash, 4 ([B, H, L, 1]) for
+    cuDNN, or None when the op returns no logsumexp.
+    """
     metas = V.graph.current_node.meta.get("val")
-    lse_shape = list(query.get_size()[:-1])
-    if (
-        return_debug_mask
-        or not eligible(query, key, value, dropout_p, is_causal)
-        or metas is None
-        or list(metas[1].shape) != [_static_int(s) for s in lse_shape]
-    ):
-        return _ORIGINAL[_FWD](query, key, value, dropout_p, is_causal, return_debug_mask, scale=scale)
+    if not eligible(query, key, value, dropout_p, is_causal) or metas is None:
+        return None
+    lse_shape = [_static_int(s) for s in query.get_size()[:-1]] + [1] * ((lse_rank or 3) - 3)
+    if lse_rank is not None and list(metas[1].shape) != lse_shape:
+        return None
     device = query.get_device()
     value = _dedup_kv(key, value, 1)
     score_mod, _, mask_mod = _subgraphs(device)
@@ -242,27 +246,30 @@ def _sdpa_flash_fwd(query, key, value, dropout_p=0.0, is_causal=False, return_de
         out, lse = lowerings[torch.ops.higher_order.flex_attention](
             query, key, value, score_mod, _empty_block_mask(device, mask_mod), scale, _kernel_options(), [], []
         )[:2]
-    # FA2 outputs: out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k, philox_seed, philox_offset, debug_mask.
+    if lse_rank is None:
+        lse = _placeholder_output(metas[1], device)
+    else:
+        if lse_rank == 4:
+            lse = lowerings[aten.unsqueeze.default](lse, -1)
+        lse = _like_meta(lse, metas[1])
+    # Outputs: out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k, philox_seed, philox_offset, debug_mask.
     rest = [_placeholder_output(m, device) for m in metas[2:]]
-    return (_like_meta(out, metas[0]), _like_meta(lse, metas[1]), *rest)
+    return (_like_meta(out, metas[0]), lse, *rest)
 
 
-def _sdpa_flash_bwd(
-    grad_out, query, key, value, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k,
-    dropout_p, is_causal, philox_seed, philox_offset, *, scale=None,
-):
+def _flex_bwd(grad_out, query, key, value, out, logsumexp, dropout_p, is_causal, scale):
+    """Flex dQ, dK, dV, or None to keep the fallback. Mirrors _flex_fwd's routing."""
     if not eligible(query, key, value, dropout_p, is_causal):
-        return _ORIGINAL[_BWD](
-            grad_out, query, key, value, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k,
-            dropout_p, is_causal, philox_seed, philox_offset, scale=scale,
-        )
+        return None
     metas = V.graph.current_node.meta.get("val")
     if metas is None or len(metas) < 3:
-        # The forward already returned flex's log2 logsumexp, so FA2 cannot take over here.
+        # The forward already returned flex's log2 logsumexp, so the SDPA kernel cannot take over here.
         raise RuntimeError(
             f"sdpa_to_flex: SDPA backward node {V.graph.current_node.name} lacks output metadata; "
-            "set TORCHINDUCTOR_TLX_SDPA_TO_FLEX=0 to keep FA2"
+            "set TORCHINDUCTOR_TLX_SDPA_TO_FLEX=0 to keep the SDPA kernel"
         )
+    if len(logsumexp.get_size()) == 4:
+        logsumexp = lowerings[aten.squeeze.dim](logsumexp, -1)
     device = query.get_device()
     value = _dedup_kv(key, value, 2)
     score_mod, joint, mask_mod = _subgraphs(device)
@@ -294,6 +301,56 @@ def _sdpa_flash_bwd(
     return tuple(_like_meta(g, m) for g, m in zip((dq, dk, dv), metas))
 
 
+def _sdpa_flash_fwd(query, key, value, dropout_p=0.0, is_causal=False, return_debug_mask=False, *, scale=None):
+    routed = None if return_debug_mask else _flex_fwd(query, key, value, dropout_p, is_causal, scale, 3)
+    if routed is None:
+        return _ORIGINAL[_FLASH_FWD](query, key, value, dropout_p, is_causal, return_debug_mask, scale=scale)
+    return routed
+
+
+def _sdpa_flash_bwd(
+    grad_out, query, key, value, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k,
+    dropout_p, is_causal, philox_seed, philox_offset, *, scale=None,
+):
+    routed = _flex_bwd(grad_out, query, key, value, out, logsumexp, dropout_p, is_causal, scale)
+    if routed is None:
+        return _ORIGINAL[_FLASH_BWD](
+            grad_out, query, key, value, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k,
+            dropout_p, is_causal, philox_seed, philox_offset, scale=scale,
+        )
+    return routed
+
+
+def _sdpa_cudnn_fwd(
+    query, key, value, attn_bias, compute_log_sumexp, dropout_p=0.0, is_causal=False,
+    return_debug_mask=False, *, scale=None,
+):
+    routed = None
+    if attn_bias is None and not return_debug_mask:
+        routed = _flex_fwd(query, key, value, dropout_p, is_causal, scale, 4 if compute_log_sumexp else None)
+    if routed is None:
+        return _ORIGINAL[_CUDNN_FWD](
+            query, key, value, attn_bias, compute_log_sumexp, dropout_p, is_causal, return_debug_mask,
+            scale=scale,
+        )
+    return routed
+
+
+def _sdpa_cudnn_bwd(
+    grad_out, query, key, value, out, logsumexp, philox_seed, philox_offset, attn_bias,
+    cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, *, scale=None,
+):
+    routed = None
+    if attn_bias is None:
+        routed = _flex_bwd(grad_out, query, key, value, out, logsumexp, dropout_p, is_causal, scale)
+    if routed is None:
+        return _ORIGINAL[_CUDNN_BWD](
+            grad_out, query, key, value, out, logsumexp, philox_seed, philox_offset, attn_bias,
+            cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, scale=scale,
+        )
+    return routed
+
+
 def _add_flag_to_cache_key() -> None:
     # tlx_config is not part of the Inductor config hashed into FX/AOTAutograd cache
     # keys (AOTAutogradCacheDetails subclasses FxGraphHashDetails).
@@ -318,10 +375,15 @@ def _add_flag_to_cache_key() -> None:
 
 
 def register_sdpa_to_flex() -> None:
-    """Wrap the SDPA flash fallbacks once; routing is decided per call by eligible()."""
+    """Wrap the SDPA flash and cuDNN fallbacks once; routing is decided per call by eligible()."""
     if _ORIGINAL:
         return
-    for op, fn in ((_FWD, _sdpa_flash_fwd), (_BWD, _sdpa_flash_bwd)):
+    for op, fn in (
+        (_FLASH_FWD, _sdpa_flash_fwd),
+        (_FLASH_BWD, _sdpa_flash_bwd),
+        (_CUDNN_FWD, _sdpa_cudnn_fwd),
+        (_CUDNN_BWD, _sdpa_cudnn_bwd),
+    ):
         _ORIGINAL[op] = lowerings[op]
         lowerings[op] = fn
     _add_flag_to_cache_key()

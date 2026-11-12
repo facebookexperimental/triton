@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import List, Tuple, TYPE_CHECKING
 from dataclasses import dataclass
+from triton._utils import validate_fp6_box
 from triton.language.core import base_type, base_value
 import triton.experimental.gluon.language._core as ttgl
 from triton.experimental.gluon.language._layouts import NVMMASharedLayout
@@ -49,7 +50,7 @@ class _tensor_descriptor_type_base(base_type):
     @property
     def nbytes_per_cta(self) -> int:
         nbytes = self.block_type.nbytes
-        if self.layout.fp6_padded:
+        if self.layout.padding in ("b6x16_p32", "b6p2x16"):
             # Dense transfer bytes (3/4 of the padded smem footprint).
             # mbarrier.expect counts TMA transfer bytes, not smem-read
             # bytes; consistent with getDescriptorLoadBytes.
@@ -174,7 +175,7 @@ def _emit_alignment_check(desc, coord, fn_name: str, arg_name: str, _semantic=No
     align_bytes = 16
     if desc.layout.fp4_padded:
         align_bytes = 64
-    elif desc.layout.fp6_padded:
+    elif desc.layout.padding in ("b6x16_p32", "b6p2x16"):
         align_bytes = 128
     dtype = desc.dtype
     assert dtype.primitive_bitwidth % 8 == 0, f"unexpected sub-byte dtype {dtype}"
@@ -186,7 +187,7 @@ def _emit_alignment_check(desc, coord, fn_name: str, arg_name: str, _semantic=No
     is_zero = rem.__eq__(0, _semantic=_semantic)
 
     padding = "with fp4_padded=True " if desc.layout.fp4_padded else ""
-    if desc.layout.fp6_padded:
+    if desc.layout.padding in ("b6x16_p32", "b6p2x16"):
         padding = "with fp6_padded=True "
     ttgl.device_assert(
         is_zero, f"{fn_name} {padding}{arg_name} must be {align_bytes}-byte aligned, "
@@ -432,6 +433,12 @@ def make_tensor_descriptor(
 ) -> tensor_descriptor:
     padding_option = _unwrap_if_constexpr(padding_option)
     block_shape = _unwrap_if_constexpr(block_shape)
+    layout = _unwrap_if_constexpr(layout)
+    if layout.padding in ("b6x16_p32", "b6p2x16"):
+        if base.dtype.element_ty != ttgl.uint8:
+            raise ValueError("FP6 tensor maps require uint8 storage")
+        validate_fp6_box(block_shape[-1], _unwrap_if_constexpr(shape[-1]), map(_unwrap_if_constexpr, strides[:-1]),
+                         padding_option)
 
     ndim = len(shape)
     if not (1 <= ndim <= 5):

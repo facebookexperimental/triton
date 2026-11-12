@@ -189,9 +189,9 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Fence proxy acquire for TMA descriptor"},
 
     // MMA operations
-    {"ttng.warp_group_dot", "tlx.warp_group_dot",
+    {"ttng.warp_group_dot", "tlx.async_dot",
      "Warp-group MMA (Hopper wgmma.mma_async)"},
-    {"ttng.warp_group_dot_wait", "tlx.warp_group_dot_wait",
+    {"ttng.warp_group_dot_wait", "tlx.async_dot_wait",
      "Wait for async dot completion"},
     {"ttng.tc_gen5_mma", "tlx.async_dot",
      "Tensor Core Gen5 MMA (Blackwell tcgen05.mma)"},
@@ -1592,6 +1592,31 @@ static bool isRetypingReinterpret(Operation *op) {
           srcType.getShape() != dstType.getShape());
 }
 
+// Whether the source lowers this warp_specialize with direct warp-ID dispatch,
+// where each worker runs its partition once and exits, instead of parking the
+// workers in a dispatch loop until the kernel ends. The module records it as
+// ttg.single-warp-specialize: TLX's exclusive=True sets it in Fixup, and
+// AllocateWarpGroups, which runs before this printer in the compiler, sets it
+// for a single AutoWS warp_specialize. That condition is repeated here for
+// TTGIR printed before AllocateWarpGroups, such as a dumped .ttgir file.
+static bool usesSingleWarpSpecialize(Operation *wsOp) {
+  auto mod = wsOp->getParentOfType<ModuleOp>();
+  if (ttg::hasSingleWarpSpecialize(mod))
+    return true;
+  unsigned numWsOps = 0;
+  mod.walk([&](ttg::WarpSpecializeOp) { ++numWsOps; });
+  if (numWsOps != 1)
+    return false;
+  // kWarpSpecializeTagAttrName, which AutoWS puts on the loops it specializes.
+  return wsOp
+      ->walk([](Operation *inner) {
+        return inner->hasAttr("ttg.warp_specialize.tag")
+                   ? WalkResult::interrupt()
+                   : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
 // Retyping reinterprets inside a partition, hoisted to just before
 // tlx.async_tasks(): `reuse=` must name a top-level allocation, and inside a
 // partition the allocation is only a capture. Maps each op to the hoisted name.
@@ -1650,7 +1675,10 @@ void printWarpSpecialize(
   // Print "with tlx.async_tasks():"
   for (unsigned i = 0; i < indent; ++i)
     os << "  ";
-  os << "with tlx.async_tasks():\n";
+  os << "with tlx.async_tasks(";
+  if (usesSingleWarpSpecialize(op))
+    os << "exclusive=True";
+  os << "):\n";
 
   // Get the operands passed to warp_specialize
   SmallVector<Value> wsOperands;
@@ -2624,6 +2652,58 @@ void printSimplifiedOp(
         os << ", two_ctas=True";
       if (op->hasAttr("is_async"))
         os << ", force_async=True";
+    }
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.warp_group_dot: Hopper wgmma. tlx.async_dot always builds the async
+  // form, so a synchronous dot is wrapped in a wait for zero pending groups,
+  // which is what its lowering does anyway.
+  if (auto dot = dyn_cast<ttng::WarpGroupDotOp>(op)) {
+    os << getValueName(dot.getResult(), argSubstitutionMap) << " = ";
+    if (!dot.getIsAsync())
+      os << "tlx.async_dot_wait(0, ";
+    os << "tlx.async_dot(" << getValueName(dot.getA(), argSubstitutionMap)
+       << ", " << getValueName(dot.getB(), argSubstitutionMap) << ", "
+       << getValueName(dot.getC(), argSubstitutionMap);
+    // The precision only means something for fp32 operands; for narrower
+    // types the attribute holds the enum's zero value whatever the source said.
+    if (getElementTypeOrSelf(dot.getA().getType()).isF32())
+      os << ", input_precision=\""
+         << triton::stringifyInputPrecision(dot.getInputPrecision()) << "\"";
+    os << ")";
+    if (!dot.getIsAsync())
+      os << ")";
+    if (dot.getUseC() && !isConstantTrue(dot.getUseC()))
+      os << "  # UNSUPPORTED: useC operand on ttng.warp_group_dot";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.warp_group_dot_wait carries the outstanding-group count as an
+  // attribute and waits on every input at once, including the operand buffers
+  // still being read and dots from earlier iterations.
+  if (auto wait = dyn_cast<ttng::WarpGroupDotWaitOp>(op)) {
+    if (op->getNumResults() == 1) {
+      os << getValueName(op->getResult(0), argSubstitutionMap);
+    } else {
+      os << "(";
+      for (unsigned i = 0; i < op->getNumResults(); ++i)
+        os << (i ? ", " : "")
+           << getValueName(op->getResult(i), argSubstitutionMap);
+      os << ")";
+    }
+    os << " = tlx.async_dot_wait(" << wait.getPendings() << ", ";
+    if (op->getNumOperands() == 1) {
+      os << getValueName(op->getOperand(0), argSubstitutionMap);
+    } else {
+      os << "(";
+      for (unsigned i = 0; i < op->getNumOperands(); ++i)
+        os << (i ? ", " : "")
+           << getValueName(op->getOperand(i), argSubstitutionMap);
+      os << ")";
     }
     os << ")";
     printLocComment(op, os);

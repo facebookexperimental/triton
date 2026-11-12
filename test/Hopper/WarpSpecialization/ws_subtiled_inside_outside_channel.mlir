@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-warp-specialization="generate-subtiled-region=true num-stages=3 smem-budget=232448" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-warp-specialization="generate-subtiled-region=true num-stages=3 smem-budget=232448" | FileCheck %s --check-prefix=FENCE
 
 // Test: inside->outside subtiled epilogue channel with a STRADDLE. This is the
 // addmm EPILOGUE_SUBTILE=2, separate_epilogue_store=True,
@@ -135,3 +136,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return
   }
 }
+
+// The TMA-filled buffers (4 and 5) are read with local_load inside the
+// subtiled region, so each of their releases asks ProxyFenceInsertion for a
+// proxy fence.
+// FENCE-COUNT-4: ttng.arrive_barrier {{.*}}guardedBufferIds = array<i32: {{4|5}}>{{.*}}ttng.fence_generic_reads

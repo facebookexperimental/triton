@@ -33,7 +33,7 @@ accumulates tens of GB of autotune workspaces; at "heuristic" the same call is
 under a second. Pass `space="heuristic"` explicitly for a fast first call. The
 gfx950 implementation currently provides only `"heuristic"`.
 
-Ops with no heuristic yet -- flash_attn, flash_attn_mxfp8, hstu_attn,
+Ops with no heuristic yet -- flash_attn on sm90/sm100/gfx950, flash_attn_mxfp8, hstu_attn,
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can offer a
@@ -124,8 +124,9 @@ __all__ = [
     "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen",
     "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev",
     "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
-    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "UnsupportedOp", "UnsupportedBackward",
-    "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "paged_attention_decode",
+    "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d", "UnsupportedOp",
+    "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -825,17 +826,22 @@ def addmm_mul_add_launch(bias, a, b, x0, res=None, *, out):
     return fn(bias, a, b, x0, res, out=out)
 
 
-def flash_attn(q, k, v, causal=False, sm_scale=None, *, space="full"):
-    """Fused attention over `(Z, H, N_CTX, HEAD_DIM)` fp16/bf16. Differentiable.
+def flash_attn(q, k, v, causal=False, sm_scale=None, *, space=None):
+    """Fused BHSD attention with architecture-specific dtype and shape support.
 
+    gfx1250 supports noncausal D128 FP16/BF16 inference, including cross attention.
+    Its default space is "heuristic"; "smoke" selects the same configuration.
+    sm90, sm100, and gfx950 support backward and retain the "full" default.
     `sm_scale` defaults to `HEAD_DIM ** -0.5`.
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise InvalidInput("tlx.ops.flash_attn expects rank-4 Q/K/V tensors")
     space_name, invariance = _normalize_space_arg("flash_attn", space)
-    if space_name not in ("full", "smoke"):
-        raise InvalidInput(f"tlx.ops.flash_attn does not provide space={space_name!r}")
     fn, spec = impl_for("flash_attn", device=q.device)
+    if space_name is None:
+        space_name = spec.default_space
+    if space_name not in ("full", "smoke", spec.default_space):
+        raise InvalidInput(f"tlx.ops.flash_attn does not provide space={space_name!r}")
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
     check_backward(spec, q, k, v)
     _check_enforced("flash_attn", spec, invariance)
@@ -1346,3 +1352,94 @@ def kda_recurrent_decode(q, k, v, g, beta, *, scale=1.0, state_pool, read_indice
     return fn(q, k, v, g, beta, scale=scale, state_pool=state_pool, read_indices=read_indices,
               write_indices=write_indices, cu_seqlens=cu_seqlens, A_log=A_log, dt_bias=dt_bias, lower_bound=lower_bound,
               beta_is_raw=beta_is_raw)
+
+
+def _check_sliding_window(op, sliding_window):
+    if isinstance(sliding_window, bool) or not isinstance(sliding_window, int) or sliding_window < 0:
+        raise InvalidInput(f"tlx.ops.{op} expects a non-negative int sliding_window; got {sliding_window!r}")
+
+
+def _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length):
+    import torch
+    if query.ndim != 3 or key_cache.ndim != value_cache.ndim or key_cache.ndim not in (4, 5):
+        raise InvalidInput("tlx.ops.paged_attention_decode expects (tokens, q_heads, head_dim) query and 4-D or "
+                           f"packed 5-D K/V caches; got q={tuple(query.shape)}, k={tuple(key_cache.shape)}, "
+                           f"v={tuple(value_cache.shape)}")
+    if key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
+        raise InvalidInput("tlx.ops.paged_attention_decode expects query and K/V caches of one dtype")
+    if context_lens.dtype != torch.int32 or block_tables.dtype != torch.int32 or block_tables.ndim != 2:
+        raise InvalidInput("tlx.ops.paged_attention_decode expects int32 context_lens and 2-D int32 block_tables")
+    if any(t.device != query.device for t in (key_cache, value_cache, context_lens, block_tables)):
+        raise InvalidInput("tlx.ops.paged_attention_decode expects all tensors on one device")
+    num_kv_heads = key_cache.shape[1]
+    if num_kv_heads == 0 or query.shape[1] % num_kv_heads:
+        raise InvalidInput(f"tlx.ops.paged_attention_decode: {num_kv_heads} KV heads must divide "
+                           f"{query.shape[1]} query heads")
+    if query_length < 1 or query.shape[0] % query_length or query.shape[0] // query_length != context_lens.shape[0]:
+        raise InvalidInput(f"tlx.ops.paged_attention_decode: {query.shape[0]} query tokens must be "
+                           f"{context_lens.shape[0]} sequences x query_length={query_length}")
+    return query.shape[1] // num_kv_heads
+
+
+def paged_attention_decode(query, key_cache, value_cache, context_lens, block_tables, *, sm_scale=None, query_length=1,
+                           sliding_window=0, max_context_len=None, out=None, workspace=None, space=None):
+    """Forward-only GQA decode attention over a paged K/V cache.
+
+    ``query`` is ``(num_seqs * query_length, q_heads, head_dim)``; sequence ``s``
+    owns ``query_length`` consecutive rows, causal among themselves and ending at
+    key ``context_lens[s] - 1``. ``block_tables[s, p]`` is the physical block of
+    the sequence's page ``p``. K/V caches are either ``(blocks, kv_heads, page,
+    head_dim)`` or the AITER-packed 5-D layout from
+    ``allocate_paged_kv_cache_5d``. A positive ``sliding_window`` limits each
+    query row to its last ``sliding_window`` keys, itself included; pages before
+    the earliest window are never read. ``max_context_len`` bounds every context and
+    picks the split-K plan; pass it, and a buffer from
+    ``paged_attention_decode_workspace``, to keep launches graph-capturable.
+    """
+    group = _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length)
+    space_name, invariance = _normalize_space_arg("paged_attention_decode", space)
+    _check_single_config_space("paged_attention_decode", space_name)
+    if sm_scale is None:
+        sm_scale = query.shape[2]**-0.5
+    if not 0 < sm_scale < math.inf:
+        raise InvalidInput(f"tlx.ops.paged_attention_decode expects a positive finite sm_scale; got {sm_scale!r}")
+    _check_sliding_window("paged_attention_decode", sliding_window)
+    if out is not None and (out.shape != query.shape or out.dtype != query.dtype or out.device != query.device):
+        raise InvalidInput("tlx.ops.paged_attention_decode expects out to match query's shape, dtype and device")
+    fn, spec = impl_for("paged_attention_decode", device=query.device)
+    check_inputs(spec, dtype=query.dtype, HEAD_DIM=query.shape[2], QLEN=query_length, GROUP=group)
+    check_backward(spec, query, key_cache, value_cache)
+    _check_enforced("paged_attention_decode", spec, invariance)
+    import torch
+    with torch.cuda.device(query.device):
+        return fn(query, key_cache, value_cache, context_lens, block_tables, float(sm_scale), int(query_length),
+                  int(sliding_window), max_context_len, out, workspace)
+
+
+def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, *, query_length=1, sliding_window=0,
+                                     max_context_len=None):
+    """Reusable FP32 split-K workspace for ``paged_attention_decode`` with the same
+    arguments, or None when the plan needs none."""
+    _check_sliding_window("paged_attention_decode_workspace", sliding_window)
+    fn, spec = impl_for("paged_attention_decode_workspace", device=query.device)
+    check_inputs(spec, dtype=query.dtype)
+    import torch
+    with torch.cuda.device(query.device):
+        return fn(query, key_cache, value_cache, block_tables, int(query_length), int(sliding_window), max_context_len)
+
+
+def allocate_paged_kv_cache_5d(num_blocks, num_kv_heads, page_size, head_dim, *, dtype, device):
+    """Uninitialized packed K/V caches: K ``(blocks, kv_heads, head_dim / X, page, X)`` and V
+    ``(blocks, kv_heads, page / X, head_dim, X)``, with X elements per 16 bytes."""
+    import torch
+    fn, spec = impl_for("allocate_paged_kv_cache_5d", device=torch.device(device))
+    check_inputs(spec, dtype=dtype)
+    return fn(num_blocks, num_kv_heads, page_size, head_dim, dtype=dtype, device=device)
+
+
+def reshape_and_cache_5d(key, value, key_cache, value_cache, slot_mapping):
+    """Scatter ``(tokens, kv_heads, head_dim)`` K/V into packed 5-D caches at
+    ``slot_mapping = block * page_size + offset``; negative slots are skipped."""
+    fn, spec = impl_for("reshape_and_cache_5d", device=key.device)
+    check_inputs(spec, dtype=key.dtype)
+    return fn(key, value, key_cache, value_cache, slot_mapping)
