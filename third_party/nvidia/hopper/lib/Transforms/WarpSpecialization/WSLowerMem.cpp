@@ -227,11 +227,8 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
       // original tt.descriptor_load path kept unified (SMEM/TMEM overflow in FA
       // backward).
       builder.setAsyncTaskIdsFromValueUsers(load.getResult());
-      // A register-consumed descriptor load can feed consumers in different
-      // software-pipeline stages.  The shared local_load must be available to
-      // the earliest one; selecting an arbitrary use can delay a forwarding
-      // copy until the final compute stage and deadlock the load partition on
-      // a later single-buffer producer acquire.
+      // Schedule the shared local_load with its earliest consumer: a later
+      // stage can deadlock a forwarding copy on a single-buffer acquire.
       Operation *earliestUser = nullptr;
       auto scheduleKey = [](Operation *op) {
         auto stage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);

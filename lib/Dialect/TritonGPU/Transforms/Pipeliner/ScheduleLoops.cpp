@@ -533,17 +533,10 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
       maxDistance = d;
   }
 
-  // A descriptor result can be consumed both as registers and through a
-  // local_alloc feeding MMA.  AutoWS lowers that shape through a staging
-  // buffer and materializes the MMA allocation with a forwarding copy on the
-  // load partition.  Keep that publication in the stage immediately after
-  // the descriptor load.  Otherwise the forwarding copy can inherit the last
-  // compute stage; the next iteration's single-buffer producer acquire may
-  // then block the same load partition before it publishes the current MMA
-  // operand, forming a cycle with MMA.
-  //
-  // MMA-only descriptor loads are fused directly into their allocation and
-  // need no adjustment.
+  // A descriptor load consumed both as registers and through an MMA
+  // local_alloc gets a forwarding copy on the load partition. Keep that copy
+  // one stage after the load; in a later stage the next iteration's
+  // single-buffer producer acquire can block it, deadlocking with the MMA.
   for (auto load : forOp.getOps<tt::DescriptorLoadOp>()) {
     SmallVector<ttg::LocalAllocOp> mmaAllocs;
     bool hasRegisterConsumer = false;
