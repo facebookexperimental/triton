@@ -585,14 +585,9 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
       return false;
     };
 
-    // A TMA staging write (local_alloc with a source, read by a TMA store or
-    // reduce) has no memdesc operand, so hoistsAcrossMemoryOp cannot see it.
-    // The memory planner later folds the staging allocs of one descriptor into
-    // a ring of K copies, and the store waits are placed relative to the TMA
-    // ops, so the writes must stay interleaved with the TMA ops in program
-    // order. Hoisting staging write i above TMA op i-1 lets it overwrite a
-    // slot before an earlier TMA op has read it whenever the subtile count
-    // exceeds K. Refuse to hoist a staging write across any TMA op.
+    // A TMA staging write has no memdesc operand, so hoistsAcrossMemoryOp
+    // misses it. The staging allocs later share a ring of K copies, so a write
+    // hoisted above an earlier TMA op can overwrite a slot that op still reads.
     auto isTMAStoreLike = [](Operation *op) {
       return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(op);
     };
