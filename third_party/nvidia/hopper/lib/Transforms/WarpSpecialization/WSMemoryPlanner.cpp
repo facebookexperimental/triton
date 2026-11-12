@@ -1260,10 +1260,8 @@ static bool isSmemTMAChannel(Operation *alloc,
   return isa<ttnvws::DescriptorLoadOp>(srcOp);
 }
 
-/// Return true for an SMEM channel that materializes a descriptor-fed computed
-/// tensor directly consumed by an MMA. Unlike a TMA-fed operand, buffering this
-/// channel hides both the register computation and its source-load latency
-/// while retaining only the narrower, post-conversion tile in the ring.
+/// True for an SMEM channel holding a computed, descriptor-fed MMA operand.
+/// Buffering it hides the computation and source loads at the narrow tile size.
 static bool
 isDescriptorFedComputedMMAOperandChannel(Operation *alloc,
                                          SmallVector<Channel *> &channels) {
@@ -2778,10 +2776,8 @@ static unsigned allocateSmemBuffers(
   // TMA store/reduce staging is on the output critical path. Reserve its
   // legal copy depth before discretionary P0/P1 operand buffering consumes
   // the remaining budget (notably FA-bwd dQ versus the small m/Di buffers).
-  // Reserve the bytes needed to take computed MMA operands to the requested
-  // depth before opportunistically growing TMA-store staging.  Without this,
-  // an output ring is grown first and a compact producer result can be left at
-  // one slot even though it sits on the critical input path of every MMA.
+  // Reserve the bytes for computed MMA operands' full depth first: they sit on
+  // every MMA's input path, so staging must not take their slots.
   unsigned epilogueBudget = smemBudget;
   for (const auto &buf : wsBuffers) {
     if (buf.isPinned ||
@@ -2800,9 +2796,7 @@ static unsigned allocateSmemBuffers(
        << computeTotalSmem(wsBuffers));
 
   // ── Phase 4: Iterative copy increase ────────────────────────────────
-  // Prefer the compact computed MMA tile, then direct TMA operands and other
-  // innermost allocations.  This avoids spending the budget on wide FP32
-  // descriptor scratch before buffering a narrowed BF16 producer result.
+  // Computed MMA tiles first: they are narrower than their descriptor sources.
   for (auto priority : {WSBufferPriority::P0_ComputedMMAOperand,
                         WSBufferPriority::P1_InnermostTMA,
                         WSBufferPriority::P2_InnermostNonTMA}) {

@@ -1,8 +1,6 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=4 smem-alloc-algo=1 smem-budget=232448 reserve-auxiliary-smem=1" | FileCheck %s
 
-// A computed BF16 operand fed by two FP32 descriptor scratch tiles is cheaper
-// to pipeline than retaining the raw source tiles. Reserve the requested four
-// copies before growing the output TMA staging ring.
+// A computed BF16 MMA operand gets its four copies before the TMA staging ring grows.
 // CHECK-LABEL: @triton_tem_fused__to_copy_mm_mul_sigmoid_0
 // CHECK: ttg.local_alloc {buffer.copy = 4 : i32, buffer.id = [[BID:[0-9]+]] : i32} : () -> !ttg.memdesc<64x128xbf16
 // CHECK-COUNT-2: ttg.local_alloc {{.*}}buffer.copy = 2 : i32{{.*}}buffer.tmaStaging = 1 : i32{{.*}}!ttg.memdesc<128x64xf32
