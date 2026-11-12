@@ -1359,19 +1359,22 @@ def _check_sliding_window(op, sliding_window):
         raise InvalidInput(f"tlx.ops.{op} expects a non-negative int sliding_window; got {sliding_window!r}")
 
 
-def _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length):
+def _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length, kv_layout):
     import torch
     if query.ndim != 3 or key_cache.ndim != value_cache.ndim or key_cache.ndim not in (4, 5):
         raise InvalidInput("tlx.ops.paged_attention_decode expects (tokens, q_heads, head_dim) query and 4-D or "
                            f"packed 5-D K/V caches; got q={tuple(query.shape)}, k={tuple(key_cache.shape)}, "
                            f"v={tuple(value_cache.shape)}")
+    if kv_layout not in ("HND", "NHD") or (kv_layout == "NHD" and key_cache.ndim != 4):
+        raise InvalidInput(f"tlx.ops.paged_attention_decode expects kv_layout 'HND', or 'NHD' for a 4-D cache; got "
+                           f"{kv_layout!r} with a {key_cache.ndim}-D cache")
     if key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
         raise InvalidInput("tlx.ops.paged_attention_decode expects query and K/V caches of one dtype")
     if context_lens.dtype != torch.int32 or block_tables.dtype != torch.int32 or block_tables.ndim != 2:
         raise InvalidInput("tlx.ops.paged_attention_decode expects int32 context_lens and 2-D int32 block_tables")
     if any(t.device != query.device for t in (key_cache, value_cache, context_lens, block_tables)):
         raise InvalidInput("tlx.ops.paged_attention_decode expects all tensors on one device")
-    num_kv_heads = key_cache.shape[1]
+    num_kv_heads = key_cache.shape[2 if kv_layout == "NHD" else 1]
     if num_kv_heads == 0 or query.shape[1] % num_kv_heads:
         raise InvalidInput(f"tlx.ops.paged_attention_decode: {num_kv_heads} KV heads must divide "
                            f"{query.shape[1]} query heads")
@@ -1382,21 +1385,24 @@ def _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, q
 
 
 def paged_attention_decode(query, key_cache, value_cache, context_lens, block_tables, *, sm_scale=None, query_length=1,
-                           sliding_window=0, max_context_len=None, out=None, workspace=None, space=None):
+                           sliding_window=0, max_context_len=None, out=None, workspace=None, kv_layout="HND",
+                           space=None):
     """Forward-only GQA decode attention over a paged K/V cache.
 
     ``query`` is ``(num_seqs * query_length, q_heads, head_dim)``; sequence ``s``
     owns ``query_length`` consecutive rows, causal among themselves and ending at
-    key ``context_lens[s] - 1``. ``block_tables[s, p]`` is the physical block of
-    the sequence's page ``p``. K/V caches are either ``(blocks, kv_heads, page,
-    head_dim)`` or the AITER-packed 5-D layout from
+    key ``context_lens[s] - 1``, so speculative verification passes its draft
+    rows here. ``block_tables[s, p]`` is the physical block of the sequence's page
+    ``p``. K/V caches are 4-D, either head-major ``kv_layout="HND"`` ``(blocks,
+    kv_heads, page, head_dim)`` or page-major ``kv_layout="NHD"`` ``(blocks, page,
+    kv_heads, head_dim)``, or the AITER-packed 5-D layout from
     ``allocate_paged_kv_cache_5d``. A positive ``sliding_window`` limits each
     query row to its last ``sliding_window`` keys, itself included; pages before
     the earliest window are never read. ``max_context_len`` bounds every context and
     picks the split-K plan; pass it, and a buffer from
     ``paged_attention_decode_workspace``, to keep launches graph-capturable.
     """
-    group = _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length)
+    group = _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length, kv_layout)
     space_name, invariance = _normalize_space_arg("paged_attention_decode", space)
     _check_single_config_space("paged_attention_decode", space_name)
     if sm_scale is None:
@@ -1413,7 +1419,7 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     import torch
     with torch.cuda.device(query.device):
         return fn(query, key_cache, value_cache, context_lens, block_tables, float(sm_scale), int(query_length),
-                  int(sliding_window), max_context_len, out, workspace)
+                  int(sliding_window), max_context_len, out, workspace, kv_layout)
 
 
 def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k, softmax_scale, causal,
@@ -1486,7 +1492,7 @@ def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
 
 
 def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, *, query_length=1, sliding_window=0,
-                                     max_context_len=None):
+                                     max_context_len=None, kv_layout="HND"):
     """Reusable FP32 split-K workspace for ``paged_attention_decode`` with the same
     arguments, or None when the plan needs none."""
     _check_sliding_window("paged_attention_decode_workspace", sliding_window)
@@ -1494,7 +1500,8 @@ def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables
     check_inputs(spec, dtype=query.dtype)
     import torch
     with torch.cuda.device(query.device):
-        return fn(query, key_cache, value_cache, block_tables, int(query_length), int(sliding_window), max_context_len)
+        return fn(query, key_cache, value_cache, block_tables, int(query_length), int(sliding_window), max_context_len,
+                  kv_layout)
 
 
 def allocate_paged_kv_cache_5d(num_blocks, num_kv_heads, page_size, head_dim, *, dtype, device):
