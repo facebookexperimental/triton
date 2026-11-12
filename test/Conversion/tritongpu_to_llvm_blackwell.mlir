@@ -479,8 +479,6 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, "ttng.tw
                        %pred: i1,
                        %barrier: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>,
                        %barrierPred: i1) {
-    // Outside warp specialization the CTA pair is synchronized with a cluster
-    // barrier.
     // CHECK: nvvm.cluster.arrive
     // CHECK: tcgen05.mma.cta_group::2.kind::f16
     // CHECK: tcgen05.mma.cta_group::2.kind::f16
@@ -2015,9 +2013,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttng.tw
 
 // -----
 
-// A 2-CTA MMA in the default region of a warp_specialize op is synchronized by
-// Insert2CTASync; a cluster barrier there would wait for every warp of the
-// cluster, including the other partitions, and hang.
+// No cluster barrier for a 2-CTA MMA in a warp_specialize default region (would hang).
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16, CGALayout = [[0, 1]]}>
 #shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
