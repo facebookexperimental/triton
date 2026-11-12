@@ -24,6 +24,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/NvmmaSmemAttrs.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -210,10 +211,42 @@ getSharedMemoryMMAOperand(Value v, mlir::PatternRewriter &rewriter, int opIdx,
   Attribute SharedMemorySpace =
       SharedMemorySpaceAttr::get(argType.getContext());
   auto CGALayout = getCGALayout(argType.getEncoding());
+  // An NPOT tile that a descriptor load feeds to the dot, whose logical shape
+  // takes 32B swizzle (one box-16 message per 16 columns: 9 for N144), is
+  // laid out as its pow2 alloc shape when that takes 128B swizzle instead:
+  // whole-atom box-64 messages with overhang into the alloc (zero-filled
+  // per PTX ISA 5.5.3.3), which the loads-only TMA gate allows.
+  SmallVector<int64_t> swizzleShape(argType.getShape());
+  bool npotTmaAtomSwizzle = false;
+  if (auto *defOp = arg.getDefiningOp();
+      defOp && isa<DescriptorLoadOp>(defOp) &&
+      triton::tools::isNpotAllowed()) {
+    unsigned elemBitWidth = argType.getElementType().getIntOrFloatBitWidth();
+    auto pow2Shape = getNpotPow2AllocShape(swizzleShape);
+    npotTmaAtomSwizzle =
+        NVMMASharedEncodingAttr::getDefaultSwizzlingByteWidth(
+            argType.getShape(), newOrder, CGALayout, elemBitWidth,
+            isMMAv5Fp4Padded) == 32 &&
+        NVMMASharedEncodingAttr::getDefaultSwizzlingByteWidth(
+            pow2Shape, newOrder, CGALayout, elemBitWidth,
+            isMMAv5Fp4Padded) == 128;
+    // The 128B layout must actually admit the transfer: tiles narrower than
+    // one swizzle span (fp16 N48, fp8 N96) cannot build it (T297842569).
+    if (npotTmaAtomSwizzle) {
+      auto candLayout = NVMMASharedEncodingAttr::get(
+          argType.getContext(), pow2Shape, newOrder, CGALayout,
+          argType.getElementType(), isMMAv5Fp4Padded);
+      auto candType = MemDescType::get(argType.getShape(),
+                                       argType.getElementType(), candLayout,
+                                       SharedMemorySpace);
+      npotTmaAtomSwizzle =
+          !nvidia_gpu::getNpotTMAUnsupportedReason(
+              candType, TMAMode::Tiled, /*allowOverhang=*/true);
+    }
+  }
   // An NPOT allocation is laid out as its pow2 alloc shape, whose rows can hold
   // a K=96 step that the NPOT rows would split.
-  SmallVector<int64_t> swizzleShape(argType.getShape());
-  if (pow2AllocSwizzle)
+  if (pow2AllocSwizzle || npotTmaAtomSwizzle)
     swizzleShape = getNpotPow2AllocShape(swizzleShape);
   auto newLayout = NVMMASharedEncodingAttr::get(
       argType.getContext(), swizzleShape, newOrder, CGALayout,
@@ -1638,7 +1671,10 @@ struct NvidiaNpotTargetLegality : public NpotTargetLegality {
     auto memDesc = MemDescType::get(tile.getShape(), tile.getElementType(),
                                     layout, SharedMemorySpaceAttr::get(ctx),
                                     /*mutableMemory=*/true);
-    return nvidia_gpu::getNpotTMAUnsupportedReason(memDesc, TMAMode::Tiled);
+    // Gather stays exact-tiling: its lowering plans whole-box messages only.
+    return nvidia_gpu::getNpotTMAUnsupportedReason(
+        memDesc, TMAMode::Tiled,
+        /*allowOverhang=*/!store && !isa<DescriptorGatherOp>(op));
   }
 };
 } // namespace

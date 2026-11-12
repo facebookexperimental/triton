@@ -1093,7 +1093,7 @@ static LogicalResult verifyTMABarrierLayout(Operation *op, Value barrier) {
 }
 
 static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
-                                       MemDescType memDesc) {
+                                       bool isLoad, MemDescType memDesc) {
   auto nvmma = dyn_cast<NVMMASharedEncodingAttr>(memDesc.getEncoding());
   if (!nvmma)
     return op->emitOpError("TMA descriptor must have NVMMA shared layout");
@@ -1139,7 +1139,8 @@ static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
     return success();
   TMAMode mode =
       isa<TensorDescIm2ColType>(desc) ? TMAMode::Im2Col : TMAMode::Tiled;
-  if (auto reason = getNpotTMAUnsupportedReason(memDesc, mode))
+  if (auto reason = getNpotTMAUnsupportedReason(memDesc, mode,
+                                                   /*allowOverhang=*/isLoad))
     return op->emitOpError(*reason);
   return success();
 }
@@ -1147,8 +1148,10 @@ static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
 // A box lands densely in shared memory (PTX ISA 5.5.7). getTMABlockShape caps
 // each box dim at 256 and sets a swizzled inner box to the swizzle span, so
 // those cuTensorMapEncodeTiled boxDim rules (cuda.h) hold by construction.
-std::optional<std::string> getNpotTMAUnsupportedReason(MemDescType ty,
-                                                       TMAMode mode) {
+std::optional<std::string>
+getNpotTMAUnsupportedReason(MemDescType ty, TMAMode mode, bool allowOverhang) {
+  // Flag-off is upstream: overhang relaxes only under TRITON_ALLOW_NPOT.
+  allowOverhang = allowOverhang && triton::tools::isNpotAllowed();
   SmallVector<int64_t> shape = getShapePerCTA(ty);
   if (llvm::all_of(shape, llvm::isPowerOf2_64))
     return std::nullopt;
@@ -1174,13 +1177,21 @@ std::optional<std::string> getNpotTMAUnsupportedReason(MemDescType ty,
                                        /*disableSwizzle=*/false,
                                        /*emitErrors=*/false)))
     return "NPOT TMA tile has no NVMMA shared layout";
+  SmallVector<int64_t> allocShape;
+  if (allowOverhang)
+    allocShape = triton::gpu::getAllocationShapePerCTA(nvmma, shape);
   for (auto [dim, extent, size, pow2AllocSize] :
        llvm::enumerate(shape, *box, *pow2AllocBox)) {
     // PTX ISA 5.5.3.1: the whole box is copied, so boxes must tile the extent.
-    if (extent % size != 0)
-      return ("NPOT TMA box " + Twine(size) + " does not divide extent " +
-              Twine(extent))
-          .str();
+    // Loads may overhang into the allocation instead (zero-filled past the
+    // edge per PTX ISA 5.5.3.3); the transfer footprint must fit the alloc.
+    if (extent % size != 0) {
+      if (!allowOverhang ||
+          llvm::divideCeil(extent, size) * size > allocShape[dim])
+        return ("NPOT TMA box " + Twine(size) + " does not divide extent " +
+                Twine(extent))
+            .str();
+    }
     // Below dim 0, a box narrower than the layout's would change its pitch.
     if (dim != 0 && size != pow2AllocSize)
       return "NPOT TMA box pitch differs from its shared layout";
@@ -1191,15 +1202,14 @@ std::optional<std::string> getNpotTMAUnsupportedReason(MemDescType ty,
   return std::nullopt;
 }
 
-static LogicalResult verifyAsyncTMALoadOp(Operation *op,
-                                          TensorDescInterface desc,
-                                          TypedValue<MemDescType> barrier,
-                                          MemDescType resultType) {
+static LogicalResult verifyAsyncTMALoadOp(
+    Operation *op, TensorDescInterface desc, TypedValue<MemDescType> barrier,
+    MemDescType resultType, bool allowOverhang = true) {
   if (failed(verifyTMABarrierLayout(op, barrier)))
     return failure();
   if (!resultType.getMutableMemory())
     return op->emitOpError("cannot store into immutable memory");
-  if (failed(verifyTMAEncoding(op, desc, resultType)))
+  if (failed(verifyTMAEncoding(op, desc, /*isLoad=*/allowOverhang, resultType)))
     return failure();
   auto block = StringAttr::get(op->getContext(), "block");
   uint32_t barrierMask =
@@ -1234,7 +1244,7 @@ static LogicalResult verifyAsyncTMAStoreOp(Operation *op,
       if (component >= size)
         return op->emitOpError(
             "source subview may have an origin in another CTA");
-  return verifyTMAEncoding(op, desc.getType(), srcType);
+  return verifyTMAEncoding(op, desc.getType(), /*isLoad=*/false, srcType);
 }
 
 static LogicalResult verifyAsyncTMAGatherScatterOp(Operation *op,
@@ -1546,8 +1556,11 @@ LogicalResult AsyncTMAGatherOp::canonicalize(AsyncTMAGatherOp op,
 
 LogicalResult AsyncTMAGatherOp::verify() {
   auto resultType = getResult().getType();
+  // No overhang: gather lowering plans whole-box messages only
+  // (iterateGatherScatterIndices asserts whole-box rows).
   if (failed(verifyAsyncTMALoadOp(*this, getDesc().getType(), getBarrier(),
-                                  resultType)))
+                                  resultType,
+                                  /*allowOverhang=*/false)))
     return failure();
   // `tile::gather4` does not support fp4_padded operands.
   if (isFp4Padded(getResult().getType().getEncoding()))

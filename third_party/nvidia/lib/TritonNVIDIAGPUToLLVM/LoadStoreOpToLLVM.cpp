@@ -1299,11 +1299,13 @@ static LinearLayout getMsgToPackedOffsetLayout(ttg::MemDescType ty,
   LinearLayout msgToOffset;
   for (int dim = 0; dim < rank; ++dim) {
     int64_t box = blockShape[dim];
-    int32_t numMsgs = shapePerCTA[dim] / box;
+    // Ceil: a box may overhang the extent (loads only, zero-filled past
+    // the edge per PTX ISA 5.5.3.3); the gate keeps stores exact-tiling.
+    int32_t numMsgs = llvm::divideCeil(shapePerCTA[dim], box);
     int32_t twoPart = LinearLayout::twoPartOf(numMsgs);
-    // getNpotTMAUnsupportedReason allows an NPOT box only as the whole extent,
-    // and an odd message count as one more mixed-radix digit of stride
-    // twoPart * box.
+    // The gate allows an NPOT box only as the whole extent for stores (and
+    // gather); loads may overhang into the alloc. An odd message count adds
+    // one more mixed-radix digit of stride twoPart * box.
     if (llvm::isPowerOf2_64(box)) {
       msgToOffset *=
           LinearLayout::strided1D(twoPart, box, kMsg, outDimNames[dim]);

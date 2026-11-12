@@ -135,9 +135,12 @@ std::optional<std::string> getNpotMMAv5TileUnsupportedReason(
     unsigned bitwidth, bool supportsK96 = false);
 
 // Why TMA can't copy NPOT tile `ty` as whole getTMABlockShape boxes, or nullopt
-// if it can. An all-pow2 tile always can.
+// if it can. An all-pow2 tile always can. With allowOverhang (loads only, and
+// only under TRITON_ALLOW_NPOT), a box may overhang the extent when the
+// transfer footprint fits the alloc.
 std::optional<std::string> getNpotTMAUnsupportedReason(gpu::MemDescType ty,
-                                                       gpu::TMAMode mode);
+                                                       gpu::TMAMode mode,
+                                                       bool allowOverhang);
 
 // Returns the required ordering of repeated TMEM scale blocks for one
 // tcgen05 scaled-MMA operand.

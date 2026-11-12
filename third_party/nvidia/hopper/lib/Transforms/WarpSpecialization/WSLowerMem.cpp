@@ -205,8 +205,12 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
         load->isBeforeInBlock(bufferDef))
       bufferDef->moveBefore(load);
 
-    int64_t txCount =
-        ttng::getDescriptorLoadBytes(cast<ttg::MemDescType>(buffer.getType()));
+    auto descTy = load.getDesc().getType();
+    auto tmaMode = isa<ttng::TensorDescIm2ColType>(descTy)
+                       ? ttg::TMAMode::Im2Col
+                       : ttg::TMAMode::Tiled;
+    int64_t txCount = ttng::getDescriptorLoadBytes(
+        cast<ttg::MemDescType>(buffer.getType()), tmaMode);
     auto nvwsLoad = builder.createWithAsyncTaskIds<ttnvws::DescriptorLoadOp>(
         load.getLoc(), load.getDesc(), load.getIndices(), txCount, buffer,
         load.getCachePolicyAttr());
