@@ -314,14 +314,37 @@ def compile_asm(fn, signature, constexprs, attrs, options, arch, warp_size=32, b
     return compile(src, target=GPUTarget(backend, arch, warp_size), options=dict(options)).asm
 
 
-def pretend_device(corpus):
+class RecordedDriver:
+    """Stands in for the GPU driver, which a runner without one cannot load, for kernel modules that query it at
+    import."""
+
+    def __init__(self, target):
+        self.target = target
+
+    def get_current_target(self):
+        return self.target
+
+    def get_current_device(self):
+        return 0
+
+    def get_active_torch_device(self):
+        import torch
+        return torch.device("cuda", 0)
+
+
+def pretend_device(corpus, entries):
     """Answer import-time GPU checks in kernel modules the way the recording GPU did.
 
     Some tlx.ops modules pick between kernel definitions at import, from torch.version and
-    torch.cuda.get_device_capability(); without this a CPU-only replay compiles the fallback definition instead of the
-    one the benchmark ran.
+    torch.cuda.get_device_capability(), or query Triton's active driver; without this a CPU-only replay compiles the
+    fallback definition instead of the one the benchmark ran, or fails to import.
     """
     import torch
+    import triton
+    from triton.backends.compiler import GPUTarget
+    if entries:
+        e = entries[0]
+        triton.runtime.driver.set_active(RecordedDriver(GPUTarget(e.get("backend", "cuda"), e["arch"], e["warp_size"])))
     torch.version.cuda, torch.version.hip = corpus.get("torch_cuda", "13.0"), corpus.get("torch_hip")
     capability = corpus["capability"]
     torch.cuda.is_available = lambda: True
@@ -427,7 +450,7 @@ def snapshot(args):
     # and this process never imports them.
     for corpus, tasks in _task_groups(args):
         if corpus is not None:
-            pretend_device(corpus)
+            pretend_device(corpus, [t["entry"] for t in tasks])
         TASKS[:] = tasks
         with multiprocessing.get_context("fork").Pool(args.jobs) as pool:
             results += pool.map(_run_task, range(len(TASKS)), chunksize=1)
