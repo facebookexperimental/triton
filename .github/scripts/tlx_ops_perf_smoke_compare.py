@@ -3,11 +3,12 @@
 
 Usage:
     tlx_ops_perf_smoke_compare.py PR_JSON HISTORY_DIR --platform PLATFORM \
-        --base-date YYYY-MM-DD --head SHA --out VERDICT_MD \
+        --base-date YYYYMMDD --head SHA --out VERDICT_MD \
         [--min-ratio 0.80] [--alarm-ratio 0.60]
 
-Picks the newest baseline summary in HISTORY_DIR (*.<platform>.json) dated on
-or before --base-date, joins PR cases to baseline cases by (key, direction)
+Picks the newest baseline summary in HISTORY_DIR (YYYYMMDD.<platform>.json)
+dated on or before --base-date (YYYY-MM-DD is accepted too), joins PR cases to
+baseline cases by (key, direction)
 on tlx_tflops, and writes a markdown verdict section. Advisory thresholds
 (starting point for calibration, deliberately looser than the nightly
 detector's CASE_RATIO=0.70 / COHORT_RATIO=0.90 to absorb baseline skew and
@@ -75,6 +76,7 @@ def main():
     with open(args.pr_json) as handle:
         pr = json.load(handle)
     pr_cases = load_cases(pr)
+    base_date = args.base_date.replace("-", "")
 
     lines = [
         f"### {args.platform}",
@@ -82,17 +84,19 @@ def main():
         f"Head `{args.head[:12]}` vs nightly baseline. ",
     ]
     verdict = "PASS"
-    baseline_date, baseline_path = pick_baseline(args.history_dir, args.base_date, args.platform)
+    baseline_date, baseline_path = pick_baseline(args.history_dir, base_date, args.platform)
     if baseline_path is None:
+        verdict = "NO SIGNAL"
         lines.append(f"No nightly baseline found — no signal. (Nightly release has no `*.{args.platform}.json` yet.)")
     elif not pr_cases:
+        verdict = "NO SIGNAL"
         lines.append("No PR bench cases produced — no signal. (Check the smoke job log; the bench may have failed.)")
     else:
         with open(baseline_path) as handle:
             base_cases = load_cases(json.load(handle))
         stale_note = ""
-        if baseline_date > args.base_date:
-            stale_note = (f" (newest available; base {args.base_date} predates baseline history — "
+        if baseline_date > base_date:
+            stale_note = (f" (oldest available; base {base_date} predates baseline history — "
                           "treat ratios with extra skepticism)")
         lines[2] += f"Baseline `{baseline_date}.{args.platform}.json`{stale_note}."
         rows = []
@@ -115,7 +119,9 @@ def main():
         rows.sort(key=lambda row: row["ratio"])
         flagged = [row for row in rows if row["ratio"] < args.min_ratio]
         alarmed = [row for row in rows if row["ratio"] < args.alarm_ratio]
-        if len(flagged) >= 2 or alarmed:
+        if not rows:
+            verdict = "NO SIGNAL"
+        elif len(flagged) >= 2 or alarmed:
             verdict = "INVESTIGATE"
         lines += [
             "",

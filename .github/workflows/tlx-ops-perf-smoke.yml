@@ -1,10 +1,13 @@
 name: TLX.ops perf smoke
 # PR smoke gate for bundle (reactor) PRs: benches a small tlx.ops subset on
-# b200 and compares it against the nearest nightly baseline. Advisory only --
-# posts a PR comment, never blocks. The full suite, the regression detector,
-# and bisection stay on the nightly workflow.
+# b200 and h100 and compares it against the nearest nightly baseline. Advisory
+# only -- posts a PR comment, never blocks. The full suite, the regression
+# detector, and bisection stay on the nightly workflow.
 
 on:
+  # `branches` matches the PR's target branch. Bundle PRs go from
+  # reactor/sync-train/plan-*/item-* into main, and GitHub has no
+  # trigger-level source-branch filter, so the resolve job's `if:` picks them.
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -38,6 +41,7 @@ jobs:
       contents: read
     outputs:
       head: ${{ steps.pick.outputs.head }}
+      pr_head: ${{ steps.pick.outputs.pr_head }}
       base_date: ${{ steps.pick.outputs.base_date }}
       pr: ${{ steps.pick.outputs.pr }}
     steps:
@@ -53,27 +57,33 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_REF: ${{ inputs.ref }}
           INPUT_PR: ${{ inputs.pr }}
+          MERGE_SHA: ${{ github.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            HEAD="${HEAD_SHA}"; BASE="${BASE_SHA}"; PR="${PR_NUMBER}"
+            # Bench GitHub's test merge commit: it is what lands, and it is the
+            # commit Fast correctness builds, so the wheel is a cache hit.
+            git fetch --no-tags --quiet origin "${MERGE_SHA}"
+            HEAD="${MERGE_SHA}"; BASE=$(git rev-parse "${MERGE_SHA}^1")
+            PR_HEAD="${HEAD_SHA}"; PR="${PR_NUMBER}"
           elif [[ -n "${INPUT_PR}" ]]; then
             HEAD=$(gh pr view "${INPUT_PR}" --json headRefOid --jq .headRefOid)
             BASE=$(gh pr view "${INPUT_PR}" --json baseRefOid --jq .baseRefOid)
-            PR="${INPUT_PR}"
+            PR_HEAD="${HEAD}"; PR="${INPUT_PR}"
           else
             HEAD=$(git rev-parse "${INPUT_REF:-HEAD}")
             BASE=$(git merge-base "${HEAD}" origin/main)
-            PR=""
+            PR_HEAD="${HEAD}"; PR=""
           fi
           [[ "${HEAD}" =~ ^[0-9a-f]{40}$ ]] || { echo "bad head: ${HEAD}"; exit 1; }
           [[ "${BASE}" =~ ^[0-9a-f]{40}$ ]] || { echo "bad base: ${BASE}"; exit 1; }
           {
             echo "head=${HEAD}"
-            echo "base_date=$(git show -s --format=%cs "${BASE}")"
+            echo "pr_head=${PR_HEAD}"
+            # Nightly summaries are named YYYYMMDD.<platform>.json.
+            echo "base_date=$(git show -s --format=%cd --date=format:%Y%m%d "${BASE}")"
             echo "pr=${PR}"
           } >> "$GITHUB_OUTPUT"
 
@@ -112,7 +122,7 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - name: Checkout suite at PR head
+      - name: Checkout suite at the benched commit
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.resolve.outputs.head }}
@@ -165,7 +175,7 @@ jobs:
 
   compare:
     needs: [resolve, build, smoke]
-    if: always() && needs.resolve.outputs.head != '' && needs.smoke.result != 'skipped'
+    if: ${{ !cancelled() && needs.resolve.outputs.head != '' && needs.smoke.result != 'skipped' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -180,6 +190,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ needs.resolve.outputs.head }}
+          PR_HEAD: ${{ needs.resolve.outputs.pr_head }}
           BASE_DATE: ${{ needs.resolve.outputs.base_date }}
           SMOKE_RESULT: ${{ needs.smoke.result }}
         run: |
@@ -187,13 +198,21 @@ jobs:
           : > verdict.md
           echo "## TLX.ops perf smoke (advisory)" >> verdict.md
           echo "" >> verdict.md
-          echo "Head \`${HEAD_SHA:0:12}\` vs nearest nightly baselines." >> verdict.md
+          if [[ "${PR_HEAD}" != "${HEAD_SHA}" ]]; then
+            echo "Merge commit \`${HEAD_SHA:0:12}\` (PR head \`${PR_HEAD:0:12}\`) vs nearest nightly baselines." >> verdict.md
+          else
+            echo "Head \`${HEAD_SHA:0:12}\` vs nearest nightly baselines." >> verdict.md
+          fi
           gh release download tlx-ops-bench --pattern '*.b200.json' --pattern '*.h100.json' --pattern '*.mi350.json' --dir history
           TODAY=$(date -u +%Y%m%d)
           for platform in b200 h100 mi350; do
             dir="raw/tlx-ops-perf-smoke-${{ github.run_id }}-${platform}"
-            if ! ls "${dir}"/*.json >/dev/null 2>&1; then
-              continue  # platform did not run (staged entry) or produced nothing
+            [[ -d "${dir}" ]] || continue  # platform not in the matrix (staged) or uploaded nothing
+            # upload-artifact keeps the bench JSON under tmp/tlx_benchmark/.
+            if [[ -z "$(find "${dir}" -name '*.json' -print -quit)" ]]; then
+              printf '\n### %s\n\nNo bench results (smoke job: %s) — no signal; check the smoke job log.\n' \
+                "${platform}" "${SMOKE_RESULT}" >> verdict.md
+              continue
             fi
             python3 .github/scripts/tlx_ops_bench_dashboard.py summarize "${dir}" \
               --platform "${platform}" --version "0.0.0.dev${TODAY}" --sha "${HEAD_SHA}" --out "pr-${platform}.json"
@@ -212,4 +231,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.resolve.outputs.pr }}
-        run: gh pr comment "${PR}" --body-file verdict.md
+        run: |
+          set -euo pipefail
+          # One comment per PR, edited in place on later pushes.
+          MARKER='<!-- tlx-ops-perf-smoke -->'
+          { echo "${MARKER}"; cat verdict.md; } > comment.md
+          CID=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"${MARKER}\"))) | .id" | tail -n 1)
+          if [[ -n "${CID}" ]]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${CID}" -F body=@comment.md > /dev/null
+          else
+            gh pr comment "${PR}" --body-file comment.md
+          fi
