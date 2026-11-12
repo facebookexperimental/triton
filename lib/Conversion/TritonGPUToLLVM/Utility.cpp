@@ -2077,8 +2077,9 @@ Value createLLVMIntegerConstant(OpBuilder &builder, Location loc, short width,
 LLVM::CallOp createLLVMCallOp(OpBuilder &builder, Location loc,
                               LLVMFuncOp funcOp, ValueRange args) {
   auto op = LLVM::CallOp::create(builder, loc, funcOp, args);
-  op.getProperties().setOpBundleSizes(builder.getDenseI32ArrayAttr({}));
-  op.getProperties().setOperandSegmentSizes({static_cast<int>(args.size()), 0});
+  op.getProperties().op_bundle_sizes = builder.getDenseI32ArrayAttr({});
+  op.getProperties().operandSegmentSizes = {static_cast<int32_t>(args.size()),
+                                            0};
   return op;
 }
 
