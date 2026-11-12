@@ -1,16 +1,6 @@
 // RUN: triton-opt %s --nvgpu-ws-data-partition=num-warp-groups=1 | FileCheck %s
 
-// Slicing a descriptor store along M for partition 1 creates off_m + 128 for
-// its row coordinate. That shifted value must stay local to the store: the
-// later pointer index splat(off_m) + make_range is sliced with a [128, 256)
-// range, so it must still splat the unshifted off_m. Leaking the shifted
-// coordinate through the shared IRMapping applied the M offset twice and
-// stored rows 128-255 of every tile 128 rows too low.
-//
-// Reduced from a persistent BM=256 GEMM with data_partition_factor=2: a bf16
-// TMA store of the accumulator plus a pointer-stored row sum of the stored
-// value. %vf is placed before the convert_layout feeding the descriptor store
-// so the descriptor store is sliced before the pointer store's operands.
+// The shifted descriptor coordinate must not leak into a later pointer index built from the same scalar.
 
 // CHECK-LABEL: @desc_store_coord_does_not_leak_into_pointer_index
 // CHECK: %[[OFFM:.*]] = arith.muli %{{.*}}, %c256_i32 : i32

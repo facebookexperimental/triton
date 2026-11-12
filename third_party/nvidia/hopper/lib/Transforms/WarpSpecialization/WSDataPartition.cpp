@@ -1742,11 +1742,8 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
 
     newOp = cloneAndSetResultType(op);
     if (offset) {
-      // Set the shifted coordinate on the cloned op only. Mapping coordVal
-      // would leak the offset into every later op cloned for this partition
-      // (e.g. pointer indices built from the same scalar, whose make_range is
-      // already sliced) and into the other index of this op if it shares the
-      // same SSA value.
+      // Shift only this op's operand: mapping coordVal would leak the offset
+      // into later clones that use the same scalar and into a shared index.
       if (auto *defOp = coordVal.getDefiningOp())
         builder.setInsertionPointAfter(defOp);
       else
