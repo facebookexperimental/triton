@@ -2076,20 +2076,18 @@ Value createLLVMIntegerConstant(OpBuilder &builder, Location loc, short width,
 
 LLVM::CallOp createLLVMCallOp(OpBuilder &builder, Location loc,
                               LLVMFuncOp funcOp, ValueRange args) {
-  auto op = LLVM::CallOp::create(builder, loc, funcOp, args);
-  op.getProperties().setOpBundleSizes(builder.getDenseI32ArrayAttr({}));
-  op.getProperties().setOperandSegmentSizes({static_cast<int>(args.size()), 0});
-  return op;
+  // The (func, args) builder sets operand segment and bundle sizes itself.
+  return LLVM::CallOp::create(builder, loc, funcOp, args);
 }
 
 LLVM::CallIntrinsicOp
 createLLVMIntrinsicCallOp(OpBuilder &builder, Location loc, StringRef intrinsic,
                           TypeRange types, ValueRange args) {
-  auto op = LLVM::CallIntrinsicOp::create(builder, loc, types, args);
-  op.getProperties().setIntrin(builder.getStringAttr(intrinsic));
-  op.getProperties().setOpBundleSizes(builder.getDenseI32ArrayAttr({}));
-  op.getProperties().setOperandSegmentSizes({static_cast<int>(args.size()), 0});
-  return op;
+  // The (types, intrin, args, fastmath) builder sets the segment sizes.
+  return LLVM::CallIntrinsicOp::create(
+      builder, loc, types, builder.getStringAttr(intrinsic), args,
+      LLVM::FastmathFlagsAttr::get(builder.getContext(),
+                                   LLVM::FastmathFlags::none));
 }
 
 SharedMemoryObject::SharedMemoryObject(Value base, Type baseElemType,
