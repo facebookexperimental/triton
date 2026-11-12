@@ -49,19 +49,14 @@ static bool isTMAStoreLike(mlir::Operation *op) {
       op);
 }
 
-// Returns the wait that retires the TMA store `store`: the first later wait
-// that leaves at most as many stores in flight as were issued after `store`
-// (bulk stores complete in issue order). A token wait without a planned count
-// retires its own store and every earlier one; with
-// `planned_pending_count = P` (a wait rotated to the next write of a
-// multi-buffered staging slot) it only retires stores that are at least P
-// stores old, exactly like the `async_tma_store_wait {pendings = P}` it lowers
-// to. Returns null when no wait retires the store.
+// Returns the first later wait that retires `store`, or null. Bulk stores
+// complete in issue order; a token wait with `planned_pending_count = P`
+// retires only stores at least P stores old, like the
+// `async_tma_store_wait {pendings = P}` it lowers to.
 static mlir::Operation *getTMAStoreCompletion(mlir::Operation *store) {
   llvm::SmallPtrSet<mlir::Operation *, 8> laterStores;
-  // Scan the rest of the store's region, then continue after each enclosing
-  // op (a retiring wait may follow the loop). Stop at a function or at a
-  // warp-specialize partition region, whose warps do not run what follows.
+  // A retiring wait may follow the enclosing loop. Stop at a warp-specialize
+  // partition region, whose warps do not run what follows.
   for (mlir::Operation *pos = store; pos;) {
     for (mlir::Block *block = pos->getBlock(); block;
          block = block->getNextNode()) {
@@ -556,14 +551,10 @@ private:
         minId = 0;
         maxId = operationId.size();
       }
-      // A TMA store keeps reading its SMEM source asynchronously until a
-      // later wait retires it, so the buffer must stay live until then. SSA
-      // liveness only covers the store op itself; without this, later scratch
-      // or buffers can be placed on top of a tile that is still being stored.
-      // When the retiring wait is in a later block (CFG loops after
-      // SCF-to-CF) or there is none, keep the buffer live across its whole
-      // region, since the store can still be in flight when execution comes
-      // back around the loop.
+      // A TMA store keeps reading its SMEM source until a later wait retires
+      // it. When that wait is in another block (CFG loops after SCF-to-CF) or
+      // missing, the store can still be in flight when control comes back
+      // around, so keep the buffer live across its whole region.
       if (hasOpOfAnyTypeInForwardSlice<ttng::AsyncTMACopyLocalToGlobalOp,
                                        ttng::AsyncTMAReduceOp>(defOp)) {
         llvm::SetVector<Operation *> forwardSlice;
