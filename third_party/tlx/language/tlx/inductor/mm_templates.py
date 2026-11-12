@@ -27,7 +27,10 @@ def _persistent_mm_grid_split_k(*args, cdiv, min):
     meta = args[-1]
     M = args[-3]
     N = args[-2]
-    num_mn_tiles = cdiv(M, meta["BLOCK_M"]) * cdiv(N, meta["BLOCK_N"])
+    # Pad M tiles to the cluster width like _compute_grid_info; a partial cluster fails to launch.
+    num_ctas = meta.get("NUM_CTAS", 1)
+    num_pid_m = cdiv(cdiv(M, meta["BLOCK_M"]), num_ctas) * num_ctas
+    num_mn_tiles = num_pid_m * cdiv(N, meta["BLOCK_N"])
     split_k = meta.get("SPLIT_K", 1)
     return (min(meta["NUM_SMS"], num_mn_tiles * split_k), 1, 1)
 

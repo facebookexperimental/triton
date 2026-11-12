@@ -663,6 +663,14 @@ class TestTLXTemplates(TestCase):
             self.assertIs(_tlx_registry._is_gfx950(), True)
             self.assertIs(_tlx_registry._is_gfx942(), True)
 
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_blackwell_gemm_ws_grid_pads_m_tiles_to_cluster(self):
+        # M=6202 has 25 M tiles of 256; a 2-CTA grid must be a whole number of clusters.
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+
+        meta = {"BLOCK_M": 256, "BLOCK_N": 128, "NUM_SMS": 148, "NUM_CTAS": 2}
+        self.assertEqual(_tlx_mm._persistent_mm_grid_split_k(6202, 384, meta), (78, 1, 1))
+
     @staticmethod
     @contextlib.contextmanager
     def _force_warppipe_split_k_choice():
