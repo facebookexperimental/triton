@@ -1729,9 +1729,8 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     if (auto loadOp = dyn_cast<DescriptorLoadOp>(op)) {
       sliceOp(loadOp.getDesc(), offset, mappings, reverseMappings,
               partitionScheme);
-      // dim indexes the load result. A rank-reducing descriptor drops unit
-      // block dims from the result, so map dim back to the descriptor's
-      // coordinate dim, as the analysis does for the descriptor itself.
+      // dim indexes the load result; a rank-reducing descriptor drops unit
+      // block dims, so map it back to the descriptor's coordinate dim.
       auto descShape = getShape(loadOp.getDesc());
       shape = getShape(loadOp.getResult());
       unsigned coordDim =
