@@ -122,7 +122,13 @@ def close_enough(out, ref, rel: float) -> tuple:
     import torch
 
     try:
-        torch.testing.assert_close(out, ref, atol=rel * ref.abs().max().item(), rtol=rel)
+        atol = rel * ref.abs().max().item()
+        if ref.is_floating_point():
+            # Subnormals are eps * tiny apart, so a near-zero result cannot be
+            # compared more finely than one such step.
+            finfo = torch.finfo(ref.dtype)
+            atol = max(atol, finfo.eps * finfo.tiny)
+        torch.testing.assert_close(out, ref, atol=atol, rtol=rel)
     except AssertionError as mismatch:
         return False, f"output does not match the reference: {str(mismatch).splitlines()[0]}"
     return True, ""

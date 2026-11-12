@@ -1714,6 +1714,16 @@ def test_run_case_uses_only_gpu_timing_and_keeps_cpu_diagnostics(monkeypatch, le
     assert "80.00" in rendered
 
 
+def test_close_enough_allows_one_subnormal_step_on_near_zero_results():
+    import torch
+    from _harness import close_enough
+
+    step = torch.finfo(torch.float16).eps * torch.finfo(torch.float16).tiny
+    reference = torch.full((8, ), 2e-6, dtype=torch.float16)
+    assert close_enough(reference + step, reference, 1e-3) == (True, "")
+    assert not close_enough(reference + 4 * step, reference, 1e-3)[0]
+
+
 @pytest.mark.parametrize("factor,expected", [(1.0, True), (2.0, False), (0.0, False), (float("nan"), False)])
 def test_mxfp8_backward_check_validates_magnitude_and_finiteness(factor, expected):
     import torch
