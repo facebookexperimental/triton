@@ -215,12 +215,8 @@ public:
       return bailOut(funcOp);
     }
 
-    // Every op of an MMA kernel propagated to one task, e.g. a GEMM whose
-    // operands are pointer loads (no load partition) and whose epilogue is a
-    // tl.store (no epilogue partition). There is nothing to specialize, and
-    // code partitioning would build channels for the MMA's buffers without
-    // threading buffer counters through the loop, since no region spans two
-    // tasks.
+    // With a single partition there is nothing to specialize, and code
+    // partitioning would not thread buffer counters through the loop.
     Operation *firstMMA = nullptr;
     funcOp.walk([&](triton::nvidia_gpu::MMAv5OpInterface mmaOp) {
       firstMMA = mmaOp;

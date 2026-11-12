@@ -1,21 +1,11 @@
 // RUN: env TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" | FileCheck %s
 // RUN: env TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
 
-// Code partitioning synchronizes TMEM through channels between a producer
-// partition and a consumer partition. When the TMEM producer and consumer are
-// in the same partition, the asynchronous MMA still needs ordering against the
-// neighbouring TMEM accesses: the channel is built with the partition as its
-// own consumer, and token lowering drops the same-partition full commit/wait
-// but keeps the empty wait before the write and the MMA completion barrier.
+// MMA operands and accumulators accessed in the MMA's own partition still need
+// barriers against the asynchronous MMA.
 
-// Persistent GEMM, B via TMA, TMA-store epilogue: A is a pointer tl.load
-// (f32 cast to bf16) promoted to TMEM (`tmem_alloc %src`) in the gemm
-// partition, the same partition as the MMA. The tmem_alloc is hoisted into a
-// double-buffered TMEM slot written by a tmem_store. Before each write the
-// gemm partition waits on the slot's empty barrier, which the MMA that read
-// the slot two iterations earlier arrives on when it completes. Without the
-// channel this used to build Interval(SIZE_MAX, 0) in the TMEM memory planner
-// (Allocation.h assert).
+// TMEM A operand written in the gemm partition: wait on its empty barrier before
+// each write.
 // CHECK-LABEL: @tmem_operand_a_same_task
 // CHECK: partition0(%{{.*}}: !tt.ptr<f32>, %[[A:arg[0-9]+]]: !ttg.memdesc<2x128x128xbf16, #tmem, #ttng.tensor_memory, mutable>, %[[AEMPTY:arg[0-9]+]]: !ttg.memdesc<2x1xi64
 // CHECK: scf.for
@@ -114,13 +104,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
-// A and B are TMA loads in the load partition, and the gemm partition both
-// issues the MMA and reads the accumulator after the K loop. The accumulator
-// is double-buffered across persistent tiles: the gemm partition waits on the
-// tile's empty barrier before the first MMA, commits the MMAs to the full
-// barrier after the loop, waits on it before the tmem_load, and releases the
-// buffer after the read. This used to hit assert(false && "Unexpected
-// Producer Found") in handleOperandD.
+// Accumulator read after the K loop in the gemm partition: commit, wait, then read.
 // CHECK-LABEL: @post_loop_acc_load_same_task_tma_persistent
 // CHECK: default {
 // CHECK: scf.for
@@ -188,14 +172,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
-// A and B are pointer tl.loads staged through SMEM and the epilogue is a
-// tl.store, so the partition scheduler creates neither a load nor an epilogue
-// partition and every op propagates into the gemm task. With a single
-// partition there is nothing to specialize, and code partitioning would not
-// thread buffer counters through the loop, so the kernel is compiled without
-// warp specialization and all WS metadata is stripped. The fallback is
-// reported as a remark on the MMA, and only for this kernel; the specialized
-// kernels in this file take no fallback.
+// Every op in one partition: fall back to non-WS with a remark.
 // REMARK-NOT: does not support
 // REMARK-NOT: compiling without warp specialization
 // REMARK: remark: meta autoWS placed every op of this MMA kernel in one partition; compiling without warp specialization
@@ -250,13 +227,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
-// The GEMM of the first case with B as a pointer tl.load too. B is promoted to
-// SMEM (`local_alloc %src`) in the gemm partition, the same partition as the
-// MMA, so it gets the same treatment as A: the local_alloc is hoisted into a
-// multi-buffered SMEM slot written by a local_store behind a wait on the
-// slot's empty barrier, and the MMA arrives on both operands' empty barriers
-// when it completes. Left in the loop without a channel, the local_alloc had
-// no synchronization and the post-WS pipeliner failed to predicate it.
+// SMEM B operand written in the gemm partition gets the same treatment as A.
 
 // CHECK-LABEL: @smem_operand_b_same_task
 // CHECK: partition0(%{{.*}}: !tt.ptr<bf16>, %{{.*}}: !tt.ptr<f32>, %[[B:arg[0-9]+]]: !ttg.memdesc<3x128x128xbf16, #shared1, #smem, mutable>, %[[BEMPTY:arg[0-9]+]]: !ttg.memdesc<3x1xi64, #shared, #smem, mutable>, %[[A:arg[0-9]+]]: !ttg.memdesc<2x128x128xbf16, #tmem, #ttng.tensor_memory, mutable>, %[[AEMPTY:arg[0-9]+]]: !ttg.memdesc<2x1xi64
