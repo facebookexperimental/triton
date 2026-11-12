@@ -135,6 +135,48 @@ def test_main_reports_an_incomplete_tool_as_a_fallback(fake_env, monkeypatch):
     assert entry["fallback"] is True
 
 
+@pytest.mark.parametrize("minutes,race_seconds,other_seconds", [(30, 300, 1800), (1, 60, 60)])
+def test_racecheck_budget_does_not_extend_other_tool_limits(fake_env, minutes, race_seconds, other_seconds):
+    _fake_cutracer(
+        fake_env, {
+            "racecheck": "========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)\n", "synccheck":
+            SYNCCHECK_CLEAN
+        })
+    out = fake_env / "out"
+    assert main([
+        "--tools", "racecheck,synccheck", "--timeout-minutes",
+        str(minutes), "--out",
+        str(out), "--", "python", "-c", "pass"
+    ]) == 0
+    results = json.loads((out / "results.json").read_text())["results"]
+    assert [result["timeout_s"] for result in results] == [race_seconds, other_seconds]
+
+
+def test_timed_out_racecheck_stops_its_worker_and_continues_as_incomplete(fake_env, monkeypatch):
+    import sanitize
+
+    _fake_cutracer(fake_env, {"racecheck": SYNCCHECK_CLEAN, "synccheck": SYNCCHECK_CLEAN})
+    script = fake_env / "bin" / "cutracer"
+    pid_file = fake_env / "worker.pid"
+    script.write_text(script.read_text().replace(
+        'sys.exit(fake["exits"].get(tool, 0))', f'''if tool == "racecheck":
+    import subprocess, time
+    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    open({str(pid_file)!r}, "w").write(str(worker.pid))
+    time.sleep(60)
+sys.exit(fake["exits"].get(tool, 0))'''))
+    monkeypatch.setattr(sanitize, "RACECHECK_TIMEOUT_S", 1)
+    out = fake_env / "out"
+    assert main(["--tools", "racecheck,synccheck", "--out", str(out), "--", "python", "-c", "pass"]) == 2
+    results = json.loads((out / "results.json").read_text())["results"]
+    assert results[0]["timed_out"] is True
+    assert results[0]["outcome"] == "infra" and results[0]["count"] is None
+    assert results[1]["outcome"] == "none" and results[1]["returncode"] == 0
+    assert (out / "racecheck" / "racecheck.log").read_text() == SYNCCHECK_CLEAN
+    stat_file = Path(f"/proc/{int(pid_file.read_text())}/stat")
+    assert not stat_file.exists() or stat_file.read_text().split(") ")[1].split()[0] == "Z"
+
+
 def _prefixes(fake_env, monkeypatch):
     output = fake_env / "github_output"
     output.unlink(missing_ok=True)

@@ -10,10 +10,8 @@ name: CUTracer Sanitizer
 # observations without filing or reconciling issues. Pull requests still
 # report in the job summary and fail on an unknown random-delay race.
 #
-# Racecheck is opt-in through the tools input: it reports false-positive
-# shared-memory hazards on mbarrier-synchronized warp-specialized kernels (see
-# .llms/rules/partition-scheduler-bugs.md #9) and did not finish within 30
-# minutes on the default flash-attention test.
+# Racecheck is opt-in through the tools input, capped at five minutes per
+# test command. A timeout preserves the log and counts as incomplete.
 on:
   workflow_dispatch:
     inputs:
