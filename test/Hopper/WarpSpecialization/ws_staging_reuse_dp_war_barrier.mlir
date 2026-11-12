@@ -1,10 +1,9 @@
 // RUN: triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=1 smem-budget=232448" 2>/dev/null | FileCheck %s
 
-// Persistent DP=2 GEMM whose output staging aliases an fp32 operand buffer:
-// the cross-tile release must ride on the last TMA store's deferred wait.
-// CHECK: ttg.local_alloc {{.*}}buffer.tmaStaging = 1
-// CHECK: ttg.memdesc_reinterpret
-// CHECK-NOT: ttg.memdesc_reinterpret
+// Persistent DP=2 GEMM whose output stagings alias two distinct fp32 operand
+// buffers: the cross-tile release must ride on the last TMA store's deferred wait.
+// CHECK: ttg.memdesc_reinterpret {{.*}}buffer.id = 2 : i32
+// CHECK: ttg.memdesc_reinterpret {{.*}}buffer.id = 4 : i32
 // CHECK: partition1(
 // CHECK: scf.for
 // CHECK: ttng.async_tma_store_token_wait {{.*}}, %{{.*}}[%{{.*}}], %{{.*}}[%{{.*}}] {{.*}}loop.stage = 1

@@ -1950,7 +1950,7 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
   bestOrder.linearOrder = INT_MAX;
 
   for (auto &buf : wsBuffers) {
-    if (&buf == &candidate) {
+    if (&buf == &candidate || buf.bufferId == candidate.bufferId) {
       LDBG("  findReuseCandidate: target bufferId="
            << buf.bufferId << " is the candidate itself — skip");
       continue;
@@ -1958,6 +1958,14 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
     if (!buf.isAllocated) {
       LDBG("  findReuseCandidate: target bufferId=" << buf.bufferId
                                                     << " not allocated — skip");
+      continue;
+    }
+    // mergeStagingReuseIntoHost never realizes a staging host, so the plan
+    // would count SMEM it does not save.
+    if (buf.tmaStaging > 0) {
+      LDBG("  findReuseCandidate: target bufferId="
+           << buf.bufferId << " is TMA staging (never realized as a host for "
+           << "candidate bufferId=" << candidate.bufferId << ") — skip");
       continue;
     }
     if (buf.sizeBytes * buf.numCopies < candidate.sizeBytes) {
