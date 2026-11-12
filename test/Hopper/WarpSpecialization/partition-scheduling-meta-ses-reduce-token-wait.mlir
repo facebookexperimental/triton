@@ -1,24 +1,8 @@
 // RUN: triton-opt %s --nvgpu-partition-scheduling-meta | FileCheck %s
-//
-// The loops carry tt.separate_epilogue_store (and tt.merge_epilogue), which
-// drive the partition layout.
-//
-// Persistent WS GEMM with separate_epilogue_store whose epilogue has both a
-// TMA store and a TMA reduce-add (c_desc.store(acc); d_desc.atomic_add(acc)).
-//
-// schedulePostLoopOps walks the K-loop results and overrides earlier
-// assignments. It routed every TMAStoreTokenWaitOp to the epilogue-store
-// partition, including the reduce's wait, while the reduce itself went to the
-// epilogue partition. doCodePartition then cloned the reduce into the
-// epilogue-store partition to satisfy the wait, so d came out 2x (bug #12's
-// misrouting, reached through the post-loop walk instead of Phase 4).
-//
-// @nomma_store_and_reduce is the no-MMA (norm-style) form: its in-loop
-// epilogue-store anchoring pulled the reduce's wait into epilogue_store the
-// same way.
-//
-// Check the reduce and its wait share a partition, and the plain store's
-// copy and wait stay in the distinct epilogue-store partition.
+
+// A TMA reduce's token wait must share the reduce's partition (else the reduce
+// is cloned and applied twice): @ses_store_and_reduce covers the post-loop
+// walk, @nomma_store_and_reduce the in-loop epilogue-store anchoring.
 
 // CHECK-LABEL: @ses_store_and_reduce
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}}ttg.partition = array<i32: [[STORE:[0-9]+]]>

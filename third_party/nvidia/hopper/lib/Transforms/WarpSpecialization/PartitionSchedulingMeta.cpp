@@ -1357,11 +1357,8 @@ schedulePostLoopOps(LoopLikeOpInterface loop, PartitionSet &schedule,
     { // Schedule post-loop op (override earlier phase assignments)
       Partition *target = nullptr;
       if (isReduceTokenWait(user)) {
-        // Keep a reduce's token_wait with its reduce (see isReduceTokenWait).
-        // The wait's only operand is the reduce token, so this walk has
-        // already scheduled the reduce. Routing the wait to the epilogue-store
-        // partition instead makes doCodePartition clone the reduce there, and
-        // the value is reduced into global memory twice.
+        // Keep a reduce's token_wait with its reduce (see isReduceTokenWait);
+        // this walk has already scheduled the reduce.
         auto ids = safeGetPartitionIds(user->getOperand(0).getDefiningOp());
         target = ids.size() == 1 ? schedule.getPartition(ids[0])
                                  : getEpilogueTarget(user);
