@@ -351,10 +351,10 @@ def _softmax_inner_loop(
     p_fulls,
     p_tiles,
     alpha_empties,
-    alpha_fulls,
-    alpha_tiles,
+    alpha_smem,
     cid,
     accum_cnt_qk,
+    tile_count,
     qk_scale,
     offs_m,
     m_i,
@@ -367,7 +367,7 @@ def _softmax_inner_loop(
     NUM_MMA_SLICES: tl.constexpr,
     STAGE: tl.constexpr,
     RESCALE_OPT: tl.constexpr,
-    SCALAR_N: tl.constexpr,
+    ALPHA_BAR_ID: tl.constexpr,
     USE_2CTA: tl.constexpr = False,
     EX2_EMU_FREQ: tl.constexpr = 0,
     EX2_EMU_START_FRG: tl.constexpr = 1,
@@ -377,7 +377,8 @@ def _softmax_inner_loop(
     for start_n in tl.range(lo, hi, BLOCK_N):
         qk_buf = cid
         qk_buf_phase = accum_cnt_qk & 1
-        alpha_phase = accum_cnt_qk & 1
+        # alpha_empties also completes once per tile for l, so its phase counts the tiles too.
+        alpha_phase = (accum_cnt_qk + tile_count) & 1
         tlx.barrier_wait(tlx.local_view(qk_fulls, qk_buf), qk_buf_phase)
         qk = tlx.local_load(tlx.local_view(qk_tiles, qk_buf))
 
@@ -409,9 +410,11 @@ def _softmax_inner_loop(
             m_ij = tl.where(rescale_mask, m_i, m_ij)
         else:
             alpha = tl.math.exp2(m_i - m_ij)
-        # The previous iteration waited for alpha_empties, so the buffer is free.
-        tlx.local_store(tlx.local_view(alpha_tiles, cid), tl.join(alpha, alpha) if SCALAR_N == 2 else alpha[:, None])
-        tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
+        # As in FA4 (sScale), hand alpha to the correction warps through SMEM and a named barrier shared by this
+        # group's 128 threads and the correction's 128. The previous iteration waited for alpha_empties, so the
+        # buffer is free.
+        tlx.local_store(tlx.local_view(alpha_smem, cid), alpha[:, None])
+        tlx.named_barrier_arrive(ALPHA_BAR_ID + cid, 256)
         # Shorten alpha's lifetime: consume immediately, add l_ij later
         l_i *= alpha
 
@@ -1349,50 +1352,13 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
         tlx.storage_kind.tmem,
         reuse=qk_storage_alias,
     )
-    # When BLOCK_M_SPLIT == 64 == blockM, the TMEM lowering selects the
-    # I16x32bx2 message whose secondHalfOffset=0 hits a ptxas bug. Pad to
-    # blockN=2 so secondHalfOffset is naturally non-zero.
-    SCALAR_N: tl.constexpr = 2 if BLOCK_M_SPLIT == 64 else 1
-    alpha_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, SCALAR_N),
-        tl.float32,
-        NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-        tlx.storage_kind.tmem,
-        reuse=qk_storage_alias,
-    )
-    l_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, SCALAR_N),
-        tl.float32,
-        NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-        tlx.storage_kind.tmem,
-        reuse=qk_storage_alias,
-    )
-    m_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, SCALAR_N),
-        tl.float32,
-        NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-        tlx.storage_kind.tmem,
-        reuse=qk_storage_alias,
-    )
-    # Define the buffer reuse strategy:
-    # QK is shared by (P, alpha, l, and m)
-    #   - First half  : stores P
-    #   - Second half  : stores Alpha, l, and m
+    # P overwrites QK in place:
     #   QK : |                                                   BLK_M/2 * BLOCK_N * fp32                         |
     #   P:   |  BLK_M/(2*SLICES) * fp16| BLK_M/(2*SLICES) * fp16|...
-    # Alpha:                                                        |BLK_M/2*1*fp32|
-    #   l  :                                                                        |BLK_M/2*1*fp32|
-    #   m  :                                                                                       |BLK_M/2*1*fp32|
     qk_storage_alias.set_buffer_overlap(
         tlx.reuse_group(
             qk_tiles,
-            tlx.reuse_group(
-                tlx.reuse_group(p_tiles, group_size=NUM_MMA_SLICES),
-                alpha_tiles,
-                l_tiles,
-                m_tiles,
-                group_type=tlx.reuse_group_type.distinct,
-            ),
+            tlx.reuse_group(p_tiles, group_size=NUM_MMA_SLICES),
             group_type=tlx.reuse_group_type.shared,
         ))
 
@@ -1411,9 +1377,13 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
         p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_MMA_SLICES, arrive_count=NUM_CTAS)
         acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=NUM_CTAS)
     # Intra-CTA barriers: always use fast warp barriers (no cross-CTA traffic).
-    alpha_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
+    # The softmax statistics go through SMEM, as in FA4 (sScale). Each iteration the softmax stores alpha and arrives
+    # on named barrier ALPHA_BAR_ID + cid, and the correction arrives on alpha_empties after reading it. At the end
+    # of a tile the softmax stores l in the same slot and m in its own buffer, with the same handshake.
+    ALPHA_BAR_ID: tl.constexpr = 12
+    alpha_smem = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS)
+    m_smem = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS)
     alpha_empties = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
-    l_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
     o_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
 
     # CLC consumers per CTA: correction(1) + softmax(NUM_GROUPS_PER_CTA) + mma(1) + load(1) + epilog(1).
@@ -1428,9 +1398,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
     with tlx.async_tasks(exclusive=True):
         # correction group
         with tlx.async_task("default"):
-            accum_cnt = 0
             phase = 0
-            tile_count = 0
             tile_id = start_pid
             clc_phase_producer = 1
             clc_phase_consumer = 0
@@ -1451,12 +1419,10 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                     GROUP_SIZE_N,
                 )
                 for start_n in tl.range(lo, hi, BLOCK_N):
-                    _, phase = get_bufidx_phase(accum_cnt, 1)
                     for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
                         # -- update output accumulator --
-                        tlx.barrier_wait(alpha_fulls[cid], phase)
-                        alpha_loaded = tlx.local_load(alpha_tiles[cid])
-                        alpha_1 = tl.split(alpha_loaded)[0][:, None] if SCALAR_N == 2 else alpha_loaded
+                        tlx.named_barrier_wait(ALPHA_BAR_ID + cid, 256)
+                        alpha_1 = tlx.local_load(alpha_smem[cid])
                         tlx.barrier_arrive(alpha_empties[cid])
                         # The first PV of a tile overwrites O (use_acc=False), so there is nothing to rescale.
                         if start_n != lo:
@@ -1511,22 +1477,18 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                             )
                         else:
                             tlx.barrier_arrive(acc_fulls[cid])
-                    accum_cnt += 1
 
-                _, phase = get_bufidx_phase(tile_count, 1)
                 for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
                     group_id = cid * NUM_CTAS + cluster_cta_rank
                     # epilogue
-                    tlx.barrier_wait(l_fulls[cid], phase)
-                    l_loaded = tlx.local_load(l_tiles[cid])
-                    m_loaded = tlx.local_load(m_tiles[cid])
-                    l = tl.split(l_loaded)[0][:, None] if SCALAR_N == 2 else l_loaded
-                    m = tl.split(m_loaded)[0][:, None] if SCALAR_N == 2 else m_loaded
-                    # Signal qk_empties after both l and m loads complete,
-                    # since both tiles share the same synchronization group.
+                    tlx.named_barrier_wait(ALPHA_BAR_ID + cid, 256)
+                    l = tlx.local_load(alpha_smem[cid])
+                    m = tlx.local_load(m_smem[cid])
+                    tlx.barrier_arrive(alpha_empties[cid])
+                    # qk_empties used to guard the TMEM l and m against the next tile's QK. With l and m in SMEM the
+                    # QK no longer needs it, but dropping the handshake measured 0.3% slower, so it stays.
                     if USE_2CTA:
-                        # The l/m loads are complete before this recycle token;
-                        # it does not publish ordinary SMEM to the peer CTA.
+                        # Recycle token only; it does not publish ordinary SMEM to the peer CTA.
                         tlx.barrier_arrive(
                             qk_empties[cid],
                             1,
@@ -1535,7 +1497,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                     else:
                         tlx.barrier_arrive(qk_empties[cid])
                     if RESCALE_OPT:
-                        # RESCALE_OPT stores unscaled row-max in m_tiles.
+                        # RESCALE_OPT stores unscaled row-max in m_smem.
                         # The bwd kernel expects scaled values (m * qk_scale),
                         # so we scale here before storing M.
                         m = m * sm_scale * 1.44269504
@@ -1565,7 +1527,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         tlx.local_store(subslice_o, acc)
                     tlx.barrier_arrive(o_fulls[cid])
 
-                tile_count += 1
+                phase ^= 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=USE_2CTA)
                 clc_phase_consumer ^= 1
 
@@ -1573,6 +1535,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
         with tlx.async_task(num_warps=4, registers=256 if (USE_2CTA and HEAD_DIM >= 256) else 184,
                             replicate=NUM_GROUPS_PER_CTA):
             accum_cnt_qk = 0
+            tile_count = 0
             tile_id = start_pid
             clc_phase_consumer = 0
             while tile_id != -1:
@@ -1604,6 +1567,8 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                     cid = tlx.async_task_replica_id()
                     group_id = cid
                 offs_m = (start_m * EFFECTIVE_BLOCK_M) + ((group_id * BLOCK_M_SPLIT) + tl.arange(0, BLOCK_M_SPLIT))
+                # The first alpha store of this tile reuses the slot that held the previous tile's l.
+                tlx.barrier_wait(alpha_empties[cid], (accum_cnt_qk + tile_count + 1) & 1)
                 if STAGE & 1:
                     m_i, l_i, accum_cnt_qk = _softmax_inner_loop(
                         qk_fulls,
@@ -1611,10 +1576,10 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         p_fulls,
                         p_tiles,
                         alpha_empties,
-                        alpha_fulls,
-                        alpha_tiles,
+                        alpha_smem,
                         cid,
                         accum_cnt_qk,
+                        tile_count,
                         qk_scale,
                         offs_m,
                         m_i,
@@ -1627,7 +1592,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         NUM_MMA_SLICES,
                         STAGE=4 - STAGE,
                         RESCALE_OPT=RESCALE_OPT,
-                        SCALAR_N=SCALAR_N,
+                        ALPHA_BAR_ID=ALPHA_BAR_ID,
                         USE_2CTA=USE_2CTA,
                         EX2_EMU_FREQ=10,
                     )
@@ -1638,10 +1603,10 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         p_fulls,
                         p_tiles,
                         alpha_empties,
-                        alpha_fulls,
-                        alpha_tiles,
+                        alpha_smem,
                         cid,
                         accum_cnt_qk,
+                        tile_count,
                         qk_scale,
                         offs_m,
                         m_i,
@@ -1654,14 +1619,16 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         NUM_MMA_SLICES,
                         STAGE=2,
                         RESCALE_OPT=RESCALE_OPT,
-                        SCALAR_N=SCALAR_N,
+                        ALPHA_BAR_ID=ALPHA_BAR_ID,
                         USE_2CTA=USE_2CTA,
                     )
 
                 # prepare l_i for the epilog
-                tlx.local_store(l_tiles[cid], tl.join(l_i, l_i) if SCALAR_N == 2 else l_i[:, None])
-                tlx.local_store(m_tiles[cid], tl.join(m_i, m_i) if SCALAR_N == 2 else m_i[:, None])
-                tlx.barrier_arrive(l_fulls[cid])
+                # The last iteration waited for alpha_empties, so the alpha slot is free for l.
+                tlx.local_store(alpha_smem[cid], l_i[:, None])
+                tlx.local_store(m_smem[cid], m_i[:, None])
+                tlx.named_barrier_arrive(ALPHA_BAR_ID + cid, 256)
+                tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=USE_2CTA)
                 clc_phase_consumer ^= 1
 
