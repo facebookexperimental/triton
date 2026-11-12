@@ -149,3 +149,43 @@ module {
     llvm.optimize_module(llvm_module, llvm.OPTIMIZE_O3, **options)
     expected = "call float @llvm.fma.f32" if scalarize else "call <2 x float> @llvm.fma.v2f32"
     assert expected in str(llvm_module)
+
+
+@pytest.mark.parametrize("disable_slp", [False, True])
+@pytest.mark.parametrize("disable_slp_env", [False, True])
+def test_disable_slp_vectorizer(tmp_path, monkeypatch, disable_slp, disable_slp_env):
+    from triton._C.libtriton import ir, llvm
+
+    monkeypatch.setenv("TRITON_DISABLE_SLPVECTORIZATION", str(int(disable_slp_env)))
+    lines = [
+        "module {",
+        "llvm.func @products(%x: !llvm.ptr, %y: !llvm.ptr, %out: !llvm.ptr) -> f32 {",
+    ]
+    for i in range(4):
+        lines += [
+            f"%px{i} = llvm.getelementptr %x[{i}] : (!llvm.ptr) -> !llvm.ptr, f32",
+            f"%py{i} = llvm.getelementptr %y[{i}] : (!llvm.ptr) -> !llvm.ptr, f32",
+            f"%a{i} = llvm.load %px{i} : !llvm.ptr -> f32",
+            f"%b{i} = llvm.load %py{i} : !llvm.ptr -> f32",
+            f"%v{i} = llvm.fmul %a{i}, %b{i} : f32",
+        ]
+    for i in range(4):
+        lines += [
+            f"%po{i} = llvm.getelementptr %out[{i}] : (!llvm.ptr) -> !llvm.ptr, f32",
+            f"llvm.store %v{i}, %po{i} : f32, !llvm.ptr",
+        ]
+    lines += [
+        "%r0 = llvm.fadd %v2, %v3 : f32",
+        "%r1 = llvm.fadd %r0, %v1 : f32",
+        "%r2 = llvm.fadd %r1, %v0 : f32",
+        "llvm.return %r2 : f32", "}", "}",
+    ]
+    source = tmp_path / "products.mlir"
+    source.write_text("\n".join(lines))
+    context = ir.context()
+    ir.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    llvm_context = llvm.context()
+    llvm_module = llvm.to_module(module, llvm_context)
+    llvm.optimize_module(llvm_module, llvm.OPTIMIZE_O3, disable_slp_vectorizer=disable_slp)
+    assert ("fmul <4 x float>" in str(llvm_module)) == (not disable_slp and not disable_slp_env)
