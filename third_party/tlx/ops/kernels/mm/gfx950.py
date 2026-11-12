@@ -20690,7 +20690,7 @@ def _regular_wave_grid_kernel_args(a, b, out):
     return (
         a,
         b,
-        out,
+        None,
         out,
         m,
         n,

@@ -98,6 +98,9 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
   if (shape.empty()) {
     return emitError() << "rank 0 memdesc is not allowed";
   }
+  auto mma = dyn_cast_if_present<NVMMASharedEncodingAttr>(encoding);
+  if (mma && mma.isPaddedFp6() && !elementType.isInteger(8))
+    return emitError() << "FP6 shared tiles require i8 storage";
   unsigned bitwidth = getIntOrFloatOrPtrBitWidth(elementType);
   if (bitwidth != 1 && bitwidth < 8)
     return emitError() << "element type bit width must be 1 or at least 8; got "
@@ -311,7 +314,7 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
     if (triton::tools::isNpotAllowed())
       blockShape = getNpotPow2AllocShape(blockShape);
     if (failed(getTMABlockShape(blockShape, enc.getElementBitWidth(),
-                                enc.getSwizzlingByteWidth(), enc.getFp4Padded(),
+                                enc.getSwizzlingByteWidth(), enc.isPaddedFp4(),
                                 enc.getTransposed(), /*packedSize=*/false,
                                 emitError, TMAMode::Tiled)))
       return failure();

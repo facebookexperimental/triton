@@ -441,6 +441,9 @@ protected:
   virtual void insertBarrier(Operation *operation, OpBuilder *builder,
                              bool cluster = false);
   virtual triton::BarrierStages getBarrierStages(Operation *operation);
+  /// Returns true if the same block has a later wait or barrier, as classified
+  /// by getBarrierStages, before any memory effect or nested control flow.
+  bool hasSyncPointBeforeMemoryEffect(Operation *operation);
 
   Allocation &allocation;
   MembarFilterFn filter;

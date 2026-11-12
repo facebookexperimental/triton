@@ -43,12 +43,50 @@ MODEL_LINEAR_SHAPES: tuple[tuple[int, int, int], ...] = tuple((m, n, k) for m in
     (3072, 8192),
 ))
 
+# Tile-native caller scale layouts used by the production model-linear routes.
+# Repeats are the A/B MFMA row groups: 256x192 => (4, 3), 128x192 =>
+# (2, 3), 128x128 => (2, 2), 128x256 => (2, 4), 256x256 => (4, 4).
+MODEL_LINEAR_PRESHUFFLE_REPEATS: dict[tuple[int, int, int], tuple[int, int]] = {
+    (1024, 6144, 159744): (4, 3),
+    (1024, 6144, 22656): (4, 3),
+    (1024, 6144, 67584): (4, 3),
+    (1024, 1024, 24576): (2, 4),
+    (1024, 36864, 1024): (2, 3),
+    (1024, 8192, 3072): (2, 2),
+    (2048, 6144, 159744): (4, 3),
+    (2048, 6144, 22656): (4, 3),
+    (2048, 32768, 6144): (4, 4),
+    (2048, 6144, 67584): (4, 3),
+    (2048, 6144, 39936): (4, 3),
+    (2048, 3072, 15360): (4, 3),
+    (2048, 1024, 24576): (2, 4),
+    (2048, 36864, 1024): (2, 3),
+    (2048, 3072, 12416): (2, 3),
+}
+
 LOGICAL_K = {22656: 22592, 12416: 12337, 25600: 25536}
+
+SYNTHETIC_SHAPES: tuple[tuple[int, int, int], ...] = (
+    (128, 128, 128),
+    (256, 384, 512),
+    (1024, 1024, 1024),
+)
 
 FOCUS_SUITES = (
     FocusSuite(name="gfx950_1", op="mm_mxfp8", shapes=PRODUCTION_SHAPES),
     FocusSuite(name="gfx950_short_m", op="mm_mxfp8", shapes=PRODUCTION_SHORT_M_SHAPES),
     FocusSuite(name="gfx950_model_linears", op="mm_mxfp8", shapes=MODEL_LINEAR_SHAPES),
 )
-DEFAULT_SUITES = {"gfx950": ("gfx950_1", "gfx950_short_m")}
+DEFAULT_SUITES = {"gfx950": ("gfx950_1", "gfx950_short_m", "gfx950_model_linears")}
 FOCUS = FocusRegistry("mm_mxfp8", FOCUS_SUITES, DEFAULT_SUITES)
+
+
+def label(m: int, n: int, k: int, sf_layout: str) -> str:
+    logical_k = LOGICAL_K.get(k, k)
+    kernel_k = f", 'K_kernel': '{k}'" if logical_k != k else ""
+    return (f"((), {{'dtype': 'fp8e4m3', 'sf_layout': '{sf_layout}', "
+            f"'M': '{m}', 'N': '{n}', 'K': '{logical_k}'{kernel_k}}})")
+
+
+def flops(m: int, n: int, k: int) -> int:
+    return 2 * m * n * LOGICAL_K.get(k, k)

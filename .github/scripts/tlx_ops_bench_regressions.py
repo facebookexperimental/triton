@@ -337,8 +337,15 @@ def bisect_spec(alert):
     }
 
 
-def issue_body(alert, repo, run_url):
+def issue_body(alert, repo, run_url, commit_dates):
     date = alert["date"]
+    case = min(alert["cases"], key=lambda c: c["ratio"])
+    spec = bisect_spec(alert)
+
+    def summary_link(date):
+        url = f"https://github.com/{repo}/releases/download/tlx-ops-bench/{date}.{alert['platform']}.json"
+        return f"[{day(date).isoformat()}]({url})"
+
     filters = urlencode(
         {"tab": "trending", "platform": alert["platform"], "op": alert["op"], "dir": alert["direction"]})
     dashboard = f"https://facebookexperimental.github.io/triton/bench/#{filters}"
@@ -348,19 +355,21 @@ def issue_body(alert, repo, run_url):
     evidence = alert.get("evidence") or {"recent": alert}
     affected = len({c["key"] for c in alert["cases"]})
     lines = [
-        "## Regression", "",
-        f"{alert['platform'].upper()} `{alert['op']}` {direction} throughput fell {loss} across {affected} cases on {day(date).isoformat()}.",
+        "## Detection status", "",
+        "Nightly throughput loss detected. These measurements do not establish a code cause or verify recovery.", "",
+        f"[Source nightly run]({run_url}) · [Benchmark dashboard]({dashboard})", "", "## Regression", "",
+        f"{alert['platform'].upper()} `{alert['op']}` {direction} throughput fell {loss} across {affected} {'case' if affected == 1 else 'cases'} on {day(date).isoformat()}.",
         ""
     ]
     for detector, found in evidence.items():
         lines.append(f"- {SIGNALS[detector]}: " + "; ".join(found["reasons"]) +
                      f". Compared {found['compared']} reliable cases out of {alert['reported_cases']} reported.")
     lines.extend([
-        "", "The cause is not established.", "", f"[View benchmark dashboard]({dashboard})", "", "## Affected cases",
-        "",
-        "Throughput is in TFLOP/s. Historical-best rows compare with the best three-night median in the same timing mode.",
-        "", "| Signal | Input | TLX baseline | TLX now | Loss | Reference before | Reference now |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: |"
+        "", "## Affected cases", "",
+        "Throughput is in TFLOP/s. Each baseline is a three-night median; historical-best rows use the best median in the same timing mode.",
+        "Reference values are context, not the historical regression gate. A missing value means no reference measurement was recorded.",
+        "", "| Signal | Input | Baseline nights | TLX baseline | TLX now | Loss | Reference before | Reference now |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |"
     ])
     fmt = lambda v: f"{v:.2f}" if v is not None else "not available"
     shown = sorted(alert["cases"], key=lambda c: (list(SIGNALS).index(c.get("detector", "recent")), c["ratio"]))
@@ -371,15 +380,17 @@ def issue_body(alert, repo, run_url):
             inputs += f" · case={c['key'].split('/', 3)[-1]}"
         inputs = inputs.replace("|", "\\|").replace("`", "")
         lines.append(
-            f"| {SIGNALS[c.get('detector', 'recent')]} | {inputs} | {c['baseline']:.2f} | {c['current']:.2f} | {(1 - c['ratio']) * 100:.1f}% | {fmt(c['reference_before'])} | {fmt(c['reference_now'])} |"
+            f"| {SIGNALS[c.get('detector', 'recent')]} | {inputs} | {', '.join(summary_link(d) for d in c['baseline_dates'])} | {c['baseline']:.2f} | {c['current']:.2f} | {(1 - c['ratio']) * 100:.1f}% | {fmt(c['reference_before'])} | {fmt(c['reference_now'])} |"
         )
     if len(alert["cases"]) > 50:
         lines.append(
             f"\n{len(alert['cases']) - 50} additional affected cases can be viewed in the benchmark dashboard.")
     if alert["confirmation_date"]:
-        lines.append(f"\nThe operation/direction also crossed the median threshold on {alert['confirmation_date']}.")
-    lines.extend(["", "## Environment changes", ""])
-    before = alert["cases"][0]["previous_environment"]
+        lines.append(
+            f"\nThe operation/direction also crossed the median threshold on {day(alert['confirmation_date']).isoformat()}."
+        )
+    lines.extend(["", "## Measurement context", ""])
+    before = case["previous_environment"]
 
     def environment_value(value):
         if isinstance(value, list):
@@ -388,29 +399,40 @@ def issue_body(alert, repo, run_url):
             return ", ".join(f"{k}={v}" for k, v in value.items())
         return str(value) if value is not None else "not recorded"
 
-    changes = []
-    for key, value in alert["environment"].items():
-        previous = before.get(key)
-        if previous == value:
-            continue
-        if isinstance(previous, list) and isinstance(value, list):
-            removed = [x for x in previous if x not in value]
-            added = [x for x in value if x not in previous]
-            if removed:
-                changes.append(f"- {key}: removed {environment_value(removed)}.")
-            if added:
-                changes.append(f"- {key}: added {environment_value(added)}.")
-        else:
-            changes.append(f"- {key}: before {environment_value(previous)}; now {environment_value(value)}.")
-    lines.extend(changes or ["- No recorded environment changes."])
-    spec = bisect_spec(alert)
     lines.extend([
-        "", f"[Suspect commit range](https://github.com/{repo}/compare/{spec['good_sha']}...{spec['bad_sha']})", "",
-        "## Performance bisection", "",
-        f"Reproducer: `{spec['key']}`. One bisect job checks the worst affected case for this operation and direction.",
-        "The job remeasures both endpoints on the same GPU before bisecting. Missing cases, build errors, incorrect output and unreliable measurements are inconclusive, not performance failures.",
-        "",
-        "This is a historical throughput regression, separate from the existing absolute 0.9x reference floor. Root cause and recovery require investigation."
+        "Recorded settings for the representative case's endpoint nights. Matching settings do not prove the same physical GPU or execution history.",
+        "", "| Setting | Good benchmark night | Bad benchmark night |", "| --- | --- | --- |"
+    ])
+    for key in sorted(before.keys() | alert["environment"].keys()):
+        lines.append(
+            f"| {key} | {environment_value(before.get(key))} | {environment_value(alert['environment'].get(key))} |")
+    lines.extend(["", f"Recorded search space: `{alert['space']}`."])
+    lines.extend([
+        "", "## Performance bisection", "",
+        "Only one representative case is selected for bisection. Its result does not establish the cause or recovery of every affected case.",
+        "", f"Case: `{spec['key']}`.", "",
+        f"[Suspect commit range](https://github.com/{repo}/compare/{spec['good_sha']}...{spec['bad_sha']})", "",
+        "| Endpoint | Commit | Commit date (UTC) | Benchmark date |", "| --- | --- | --- | --- |",
+        f"| Good | [{spec['good_sha'][:8]}](https://github.com/{repo}/commit/{spec['good_sha']}) | {commit_dates[spec['good_sha']]} | {summary_link(case['good_date'])} |",
+        f"| Bad | [{spec['bad_sha'][:8]}](https://github.com/{repo}/commit/{spec['bad_sha']}) | {commit_dates[spec['bad_sha']]} | {summary_link(date)} |",
+        "", f"Endpoint validation requires bad/good throughput <= {spec['required_ratio']:.6f} on the same GPU.",
+        "Missing cases, build errors, incorrect output and unreliable measurements are inconclusive, not performance failures.",
+        "The job posts its result in the issue comments. A first-bad bundle does not identify an individual upstream patch.",
+        "Issues on one platform may share a workflow batch; each case has independent endpoints and candidate observations.",
+        "", "## One-case reproduction", "",
+        "From the repository root, activate the source run's Torch/runtime environment with a separately installed endpoint wheel. The command preserves the bad endpoint's benchmark snapshot and measures only the case above; it does not build or install a wheel.",
+        "Repeat with each endpoint wheel. Set `GPU_UUID` to the same UUID for both measurements; if unset, the first measurement selects a GPU and reports its UUID.",
+        "An isolated measurement can differ from the full nightly sequence. Failure to reproduce alone is not evidence of recovery.",
+        "", "```bash", 'mkdir -p "$HOME/ai_works/triton/perf-repro"',
+        'export REPRO_DIR="$(mktemp -d "$HOME/ai_works/triton/perf-repro/run.XXXXXX")"',
+        f'git archive {spec["bad_sha"]} python/test/tlx_benchmark | tar -x -C "$REPRO_DIR"',
+        'TRITON_HOME="$REPRO_DIR/triton-home" python - <<\'PY\'', "import json, os, sys", "from pathlib import Path",
+        'sys.path.insert(0, ".github/scripts")', "from tlx_ops_bench_bisect import bench_modules, measure_case",
+        'harness = Path(os.environ["REPRO_DIR"]) / "python/test/tlx_benchmark"',
+        f"step = { {k: spec[k] for k in ('op', 'direction', 'key', 'space')}!r}",
+        'step.update(source=str(Path.cwd()), harness=str(harness),',
+        '            modules=bench_modules(harness).get(step["op"], []), gpu_uuid=os.environ.get("GPU_UUID"))',
+        "print(json.dumps(measure_case(step), indent=2))", "PY", "```"
     ])
     if alert.get("episodes"):
         lines.extend(["", *(f"<!-- tlx-perf-episode: {e} -->" for e in alert["episodes"])])
@@ -447,9 +469,16 @@ def file_issues(alerts, repo, run_url, api=gh):
             alert["untracked_episodes"] = [e for e in alert["episodes"] if e not in seen]
             print(f"Already tracked by #{', #'.join(map(str, alert['tracked_by']))}: {title}")
             continue
+        spec = bisect_spec(alert)
+        commit_dates = {
+            sha: api("GET", f"repos/{repo}/commits/{sha}")["commit"]["committer"]["date"]
+            for sha in (spec["good_sha"], spec["bad_sha"])
+        }
         issue = api(
-            "POST", f"repos/{repo}/issues",
-            {"title": title, "body": issue_body(alert, repo, run_url), "labels": ["nightly", "perf-regression"]})
+            "POST", f"repos/{repo}/issues", {
+                "title": title, "body": issue_body(alert, repo, run_url, commit_dates), "labels":
+                ["nightly", "perf-regression"]
+            })
         titles.add(title)
         seen.update((e, issue["number"]) for e in alert.get("episodes", []))
         alert["bisect_issue"] = issue["number"]

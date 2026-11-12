@@ -768,15 +768,15 @@ triton::BarrierStages getLocalBarrierStages(Operation *op,
 // would make Membar insert a redundant barrier right after the async wait --
 // doubling the workgroup barrier and stalling a hand-written ping-pong
 // schedule.
-static bool hasSyncPointBeforeMemoryEffect(Operation *op,
-                                           Allocation *allocation) {
+bool MembarAnalysis::hasSyncPointBeforeMemoryEffect(Operation *op) {
+  Allocation *allocation = &this->allocation;
   for (Operation *next = op->getNextNode(); next; next = next->getNextNode()) {
     if (isa<triton::gpu::SchedulingBarrierOpInterface>(next))
       continue;
     if (isa<ttng::BarrierExpectOp>(next))
       return true;
 
-    auto stages = getLocalBarrierStages(next, allocation);
+    auto stages = getBarrierStages(next);
     if (stages.beforeMemoryEffects ||
         next->hasTrait<mlir::OpTrait::MemWaitOpTrait>())
       return true;
@@ -840,7 +840,7 @@ void MembarAnalysis::update(Operation *op, MembarInfo *membarInfo,
   if (auto wgWait = dyn_cast<ttng::WarpGroupDotWaitOp>(op)) {
     if (!wgWait.getWarpGroupLocal() &&
         triton::gpu::lookupNumWarps(wgWait) > 4 &&
-        hasSyncPointBeforeMemoryEffect(wgWait, &allocation)) {
+        hasSyncPointBeforeMemoryEffect(wgWait)) {
       wgWait->setAttr("warpGroupLocal", builder->getUnitAttr());
     }
   }
@@ -849,7 +849,7 @@ void MembarAnalysis::update(Operation *op, MembarInfo *membarInfo,
   // point before memory is accessed, insert a barrier op and sync. This avoids
   // redundant barriers by deferring the barrier to the later sync point.
   if (op->hasTrait<mlir::OpTrait::MemWaitOpTrait>() &&
-      !hasSyncPointBeforeMemoryEffect(op, &allocation)) {
+      !hasSyncPointBeforeMemoryEffect(op)) {
     builder->setInsertionPointAfter(op);
     insertBarrier(op, builder);
     membarInfo->sync();

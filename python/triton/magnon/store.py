@@ -71,12 +71,31 @@ def store_root() -> str:
     return os.environ.get("COMPILE_IQ_STORE", os.path.expanduser("~/.compile_iq/store"))
 
 
+def _nested_matches(path: str, ptx_sha: str) -> bool:
+    # The short nested name carries only 16 hex chars; trust it only if its sidecar (when present)
+    # names this exact PTX hash.
+    try:
+        with open(path + ".json") as f:
+            return json.load(f).get("ir_hash", ptx_sha) == ptx_sha
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+
+
 def acf_path(ptx_sha: str, arch: str, ptxas_version: str = "") -> str:
     # Version-tagged ("<sha>.<ptxas>.acf") when a ptxas version is given: an ACF is bound to the ptxas
     # that produced it (a mismatched ptxas rejects it), so one kernel keeps a distinct ACF per ptxas and
     # different toolchains coexist. Falls back to legacy untagged "<sha>.acf" when no version is given.
-    name = f"{ptx_sha}.{_ptxas_tag(ptxas_version)}.acf" if ptxas_version else f"{ptx_sha}.acf"
-    return os.path.join(store_root(), arch, name)
+    # The factory also writes nested per-kernel dirs, "<arch>/<sha[:16]>/<sha[:16] or sha>.<ptxas>.acf";
+    # an existing nested ACF wins, otherwise the flat path is returned.
+    suffix = f".{_ptxas_tag(ptxas_version)}.acf" if ptxas_version else ".acf"
+    root = os.path.join(store_root(), arch)
+    nested = os.path.join(root, ptx_sha[:16])
+    for p in (os.path.join(nested, ptx_sha[:16] + suffix), os.path.join(nested, ptx_sha + suffix)):
+        if os.path.exists(p) and _nested_matches(p, ptx_sha):
+            return p
+    return os.path.join(root, ptx_sha + suffix)
 
 
 def has_acf(ptx_sha: str, arch: str, ptxas_version: str = "") -> bool:
@@ -129,7 +148,8 @@ def _ptxas_tag(ptxas_version: str) -> str:
 
 
 def acf_cubin_path(ptx_sha: str, arch: str, ptxas_version: str) -> str:
-    return os.path.join(store_root(), arch, f"{ptx_sha}.{_ptxas_tag(ptxas_version)}.acf.cubin")
+    # Kept next to the ACF it was assembled from, in whichever layout that ACF uses.
+    return acf_path(ptx_sha, arch, ptxas_version) + ".cubin"
 
 
 def read_acf_cubin(ptx_sha: str, arch: str, ptxas_version: str) -> bytes | None:
