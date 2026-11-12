@@ -100,7 +100,7 @@ def matmul_kernel_warp_pipeline(
         tlx.async_load_commit_group([tok_b])
 
     # Wait for buffers 0 and 1: the leading warp group reads buffer 1 before the
-    # lagging group reaches the loop.
+    # lagging group's first wait in the loop.
     tlx.async_load_wait_group((NUM_BUFFERS - 2) * 2)
     a_tile = tlx.local_load(tlx.local_view(smemA, 0))
     b_tile = tlx.local_load(tlx.local_view(smemB, 0))
