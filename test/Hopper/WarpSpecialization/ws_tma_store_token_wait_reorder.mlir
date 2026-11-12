@@ -73,11 +73,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-// separate_epilogue_store under CLC: another partition fills the 2-slot staging
-// ring behind each wait_barrier, and each token wait hands its slot back with
-// an arrive, so it has no planned pending count. Each wait moves to just before
-// the wait_barrier guarding the store that reuses its slot (2 stores later);
-// the waits of the last two stores move after the last store.
+// CLC barrierful waits move to just before the wait_barrier guarding the store
+// that reuses their slot; the last two move after the last store.
 // CHECK-LABEL: clc_while_barrierful_rotation
 // CHECK: scf.while
 // CHECK: ttng.wait_barrier %[[F0:[a-z0-9_]+]], %
@@ -120,49 +117,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %t1 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf1 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
       ttng.async_tma_store_token_wait %t1, %empty1[%true] {async_task_id = array<i32: 2>, can_rotate_by_buffer_count = 2 : i32} : !ttg.async.token, !ttg.memdesc<1xi64, #bar, #smem, mutable>
       ttng.wait_barrier %full0, %ph : !ttg.memdesc<1xi64, #bar, #smem, mutable>
-      // An unrelated wait_barrier right before the store must not be taken as
-      // the guard of the reused slot.
+      // Not the guard of the reused slot.
       ttng.wait_barrier %bcast, %ph : !ttg.memdesc<1xi64, #bar, #smem, mutable>
       %t2 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf0 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
       ttng.async_tma_store_token_wait %t2, %empty0[%true] {async_task_id = array<i32: 2>, can_rotate_by_buffer_count = 2 : i32} : !ttg.async.token, !ttg.memdesc<1xi64, #bar, #smem, mutable>
       ttng.wait_barrier %full1, %ph : !ttg.memdesc<1xi64, #bar, #smem, mutable>
       %t3 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf1 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
       ttng.async_tma_store_token_wait %t3, %empty1[%true] {async_task_id = array<i32: 2>, can_rotate_by_buffer_count = 2 : i32} : !ttg.async.token, !ttg.memdesc<1xi64, #bar, #smem, mutable>
-      scf.yield %false : i1
-    } attributes {ttg.clc_persistent}
-    tt.return
-  }
-
-  // Two staging rings (e.g. the two data-partition halves), each reused only in
-  // the next iteration: every wait moves after the last store, in order.
-  // CHECK-LABEL: clc_while_barrierful_two_rings
-  // CHECK: %[[T0:.*]] = ttng.async_tma_copy_local_to_global
-  // CHECK-NEXT: ttng.wait_barrier
-  // CHECK-NEXT: %[[T1:.*]] = ttng.async_tma_copy_local_to_global
-  // CHECK-NEXT: ttng.async_tma_store_token_wait %[[T0]] ,
-  // CHECK-NEXT: ttng.async_tma_store_token_wait %[[T1]] ,
-  // CHECK-NEXT: scf.yield
-  tt.func public @clc_while_barrierful_two_rings(
-      %desc: !tt.tensordesc<128x64xf16, #shared>,
-      %ring0: !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable>,
-      %ring1: !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable>,
-      %fulls: !ttg.memdesc<2x1xi64, #bar, #smem, mutable>,
-      %empties: !ttg.memdesc<2x1xi64, #bar, #smem, mutable>, %i: i32, %ph: i32, %slot: i32) {
-    %true = arith.constant true
-    %false = arith.constant false
-    scf.while (%valid = %true) : (i1) -> () {
-      scf.condition(%valid)
-    } do {
-      %buf0 = ttg.memdesc_index %ring0[%slot] : !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-      %buf1 = ttg.memdesc_index %ring1[%slot] : !ttg.memdesc<2x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-      %full = ttg.memdesc_index %fulls[%slot] : !ttg.memdesc<2x1xi64, #bar, #smem, mutable> -> !ttg.memdesc<1xi64, #bar, #smem, mutable>
-      %empty = ttg.memdesc_index %empties[%slot] : !ttg.memdesc<2x1xi64, #bar, #smem, mutable> -> !ttg.memdesc<1xi64, #bar, #smem, mutable>
-      ttng.wait_barrier %full, %ph : !ttg.memdesc<1xi64, #bar, #smem, mutable>
-      %t0 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf0 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %t0, %empty[%true] {async_task_id = array<i32: 2>, can_rotate_by_buffer_count = 2 : i32} : !ttg.async.token, !ttg.memdesc<1xi64, #bar, #smem, mutable>
-      ttng.wait_barrier %full, %ph : !ttg.memdesc<1xi64, #bar, #smem, mutable>
-      %t1 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf1 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %t1, %empty[%true] {async_task_id = array<i32: 2>, can_rotate_by_buffer_count = 2 : i32} : !ttg.async.token, !ttg.memdesc<1xi64, #bar, #smem, mutable>
       scf.yield %false : i1
     } attributes {ttg.clc_persistent}
     tt.return

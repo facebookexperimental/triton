@@ -610,17 +610,11 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
     }
   }
 
-  // A barrierful wait in a CLC while (separate_epilogue_store: the staging
-  // ring is filled by another partition and the wait's arrive hands the slot
-  // back) cannot use a planned pending count, so it would sit right after its
-  // store and serialize every TMA store. There is no software-pipeline
-  // schedule for the while either, so rotate it in program order within the
-  // iteration: move the wait (and with it the slot release) to just before the
-  // first wait_barrier guarding the K-th later TMA store, the earliest store
-  // that can reuse its slot. Waits whose K-th later store is in the next
-  // iteration move to just after the iteration's last TMA store, so the tail
-  // stores overlap each other. The lowering derives the pending count from
-  // program order.
+  // A barrierful wait in a CLC while (separate_epilogue_store) has no planned
+  // pending count and no pipeline schedule, so it would serialize every TMA
+  // store. Rotate it in program order: just before the wait_barrier guarding
+  // the K-th later store (the earliest that can reuse its slot), or after the
+  // iteration's last store if that store is in the next iteration.
   DenseMap<Block *, Operation *> lastTailWait;
   for (ttng::TMAStoreTokenWaitOp waitOp : straightLineWaits) {
     auto whileOp = dyn_cast<scf::WhileOp>(waitOp->getParentOp());
@@ -639,8 +633,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
     for (Operation &op : *body)
       if (isTMAStoreLikeOp(&op))
         stores.push_back(&op);
-    // Every TMA store in the body must be at the top level of the body;
-    // nested ones would be miscounted.
+    // Nested TMA stores would be miscounted.
     bool nestedStore = false;
     for (Operation &op : *body)
       if (op.getNumRegions() != 0)
@@ -650,9 +643,8 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
         });
     if (nestedStore)
       continue;
-    // The slot of this store is reused at the earliest by the K-th later TMA
-    // store (the stores into its own ring are a subsequence of all stores),
-    // which is also where the scf.for path releases it.
+    // The stores into one ring are a subsequence of all stores, so the K-th
+    // later store is the earliest that can reuse this slot.
     auto *it = llvm::find(stores, tmaStore);
     size_t idx = std::distance(stores.begin(), it);
     size_t targetIdx = idx + rotateBy.getInt();
@@ -661,10 +653,8 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
     Operation *insertBefore = nullptr;
     if (target) {
       // The other partition refills a slot behind a wait_barrier between the
-      // previous store and the store reading it. Release the slot before the
-      // first wait_barrier there; releasing earlier than strictly needed is
-      // always safe because the wait already covers this store. Without such
-      // a wait_barrier the guard is somewhere else, so leave the wait alone.
+      // previous store and the store reading it; releasing before the first
+      // one there is safe since the wait already covers this store.
       for (Operation *op = prevStore->getNextNode(); op != target;
            op = op->getNextNode()) {
         if (isa<ttng::WaitBarrierOp>(op)) {
@@ -679,10 +669,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
         continue;
       }
     } else {
-      // Keep the tail waits in their original relative order: each goes
-      // right after the previous tail wait (waits are visited in program
-      // order), the first right after the last store, but never above the
-      // definitions of its own operands (e.g. its barrier view).
+      // Keep tail waits in their original order, below their operands' defs.
       Operation *prevTail = lastTailWait.lookup(body);
       Operation *anchor = prevTail ? prevTail : stores.back();
       for (Value operand : waitOp->getOperands())
