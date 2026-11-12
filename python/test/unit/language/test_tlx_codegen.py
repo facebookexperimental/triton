@@ -12,7 +12,6 @@ from triton.backends.compiler import GPUTarget
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
-from triton.language.extra.tlx.tutorials import amd_fa_tdm_pipelined as _gfx1250_attention
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton._filecheck import run_parser
@@ -6932,6 +6931,62 @@ def test_async_amd_desc_load_pred_compiles_gfx1250(device):
     assert "async_tdm_copy_global_to_local" in ttgir
 
 
+@triton.jit
+def _amd_split_workgroup_barrier_kernel(x_ptr, y_ptr, BAR: tl.constexpr, COUNT: tl.constexpr):
+    offsets = tl.arange(0, 128)
+    x = tl.load(x_ptr + offsets)
+    buf = tlx.local_alloc((128, ), tl.float32, 1)
+    tlx.local_store(buf[0], x)
+    tlx.named_barrier_arrive(BAR, COUNT)
+    # Register-only work between the two halves of the barrier.
+    scaled = x * 3.0
+    tlx.named_barrier_wait(BAR, COUNT)
+    # Membar orders every shared-memory RAW; the split barrier must cover it.
+    y = tlx.local_load(buf[0])
+    tl.store(y_ptr + offsets, y + scaled)
+
+
+def test_amd_split_workgroup_barrier_compiles_gfx1250():
+    compiled = compile_for_gfx1250(
+        _amd_split_workgroup_barrier_kernel,
+        signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+        constexprs={"BAR": 0, "COUNT": 128},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count("amdg.workgroup_barrier_signal") == 1
+    assert ttgir.count("amdg.workgroup_barrier_wait") == 1
+    # The pair orders the LDS store before the load, so Membar adds no other
+    # workgroup barrier: the kernel has exactly one signal and one wait.
+    asm = compiled.asm["amdgcn"]
+    assert len(re.findall(r"^\s+s_barrier_signal -1\b", asm, re.MULTILINE)) == 1
+    assert len(re.findall(r"^\s+s_barrier_wait -1\b", asm, re.MULTILINE)) == 1
+    signal = asm.index("s_barrier_signal -1")
+    assert asm.index("ds_store", 0) < signal < asm.index("s_barrier_wait -1") < asm.index("ds_load", signal)
+
+
+@pytest.mark.parametrize("bar,count,match", [
+    (1, 128, "only support the workgroup barrier"),
+    (0, 64, "must be the workgroup size"),
+])
+def test_amd_split_workgroup_barrier_rejects_named_barriers(bar, count, match):
+    with pytest.raises(CompilationError, match=match):
+        compile_for_gfx1250(
+            _amd_split_workgroup_barrier_kernel,
+            signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+            constexprs={"BAR": bar, "COUNT": count},
+        )
+
+
+@pytest.mark.parametrize("compile_fn", [compile_for_gfx950, compile_for_gfx942])
+def test_amd_split_workgroup_barrier_requires_gfx1250(compile_fn):
+    with pytest.raises(CompilationError, match=r"require gfx1250 on AMD, got gfx9(50|42)"):
+        compile_fn(
+            _amd_split_workgroup_barrier_kernel,
+            signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+            constexprs={"BAR": 0, "COUNT": 128},
+        )
+
+
 def test_async_amd_desc_store_compiles_gfx1250(device):
     """async_amd_descriptor_store produces TDM store ops in TTGIR."""
     compiled = compile_for_gfx1250(
@@ -7756,18 +7811,24 @@ def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M, BLOCK_K)
     assert amdgcn.count("tensor_store_from_lds") + amdgcn.count("tensor.store.from.lds") == 1
 
 
-def test_gfx1250_attn_fwd_tdm_pipelined_compiles():
+@pytest.mark.parametrize("dtype,output_dtype,block_m,block_n,fixed", [
+    ("bf16", "fp32", 128, 128, False),
+    ("fp16", "fp16", 256, 64, True),
+    ("bf16", "bf16", 256, 64, True),
+])
+def test_gfx1250_attn_fwd_tdm_pipelined_compiles(dtype, output_dtype, block_m, block_n, fixed):
     """Compile-only check: lowers cleanly to TDM intrinsics + WMMA."""
     from triton.compiler.compiler import ASTSource, compile as triton_compile
     from triton.backends.compiler import GPUTarget
+    from triton.tlx.ops.kernels.flash_attn.gfx1250 import attn_fwd_tdm_pipelined_kernel
 
     src = ASTSource(
-        fn=_gfx1250_attention.attn_fwd_tdm_pipelined_kernel,
+        fn=attn_fwd_tdm_pipelined_kernel,
         signature={
-            "q_ptr": "*bf16",
-            "k_ptr": "*bf16",
-            "v_ptr": "*bf16",
-            "o_ptr": "*fp32",
+            "q_ptr": f"*{dtype}",
+            "k_ptr": f"*{dtype}",
+            "v_ptr": f"*{dtype}",
+            "o_ptr": f"*{output_dtype}",
             "stride_qz": "i64",
             "stride_qh": "i64",
             "stride_qm": "i64",
@@ -7790,14 +7851,20 @@ def test_gfx1250_attn_fwd_tdm_pipelined_compiles():
             "BLOCK_M": "constexpr",
             "BLOCK_N": "constexpr",
             "HEAD_SZ": "constexpr",
+            "USE_FIXED_REFERENCE": "constexpr",
+            "QUERY_TILES_FIRST": "constexpr",
+            "BATCH": "i32",
+            "NUM_HEADS": "i32",
         },
         constexprs={
             "SM_SCALE": 1.0 / (128**0.5),
             "SEQLEN_Q": 1024,
             "SEQLEN_K": 1024,
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
             "HEAD_SZ": 128,
+            "USE_FIXED_REFERENCE": fixed,
+            "QUERY_TILES_FIRST": fixed,
         },
     )
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options={"num_warps": 4})

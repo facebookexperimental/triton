@@ -389,6 +389,7 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset({"tma"}),
         supports_backward=True,
+        default_space="full",
     ),
     OpSpec(
         op="flash_attn",
@@ -397,9 +398,10 @@ CATALOG: tuple[OpSpec, ...] = (
         impl="triton.tlx.ops.kernels.flash_attn.sm100:flash_attn",
         invariant_vocab=_ATTN_DIMS,
         dtypes=_FP16,
-        accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
+        accepts=lambda d: d.get("HEAD_DIM") in (64, 128, 256),
         requires=frozenset({"tma", "tmem"}),
         supports_backward=True,
+        default_space="full",
     ),
     OpSpec(
         op="flash_attn",
@@ -411,6 +413,16 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset(),
         supports_backward=True,
+        default_space="full",
+    ),
+    OpSpec(
+        op="flash_attn",
+        arch="gfx1250",
+        variant="tdm_pipelined",
+        impl="triton.tlx.ops.kernels.flash_attn.gfx1250:flash_attn",
+        invariant_vocab=_ATTN_DIMS,
+        dtypes=_FP16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128,
     ),
     OpSpec(
         op="prepare_flash_attn_varlen_backward",
@@ -606,6 +618,35 @@ CATALOG: tuple[OpSpec, ...] = (
         dtypes=_BF16,
         accepts=lambda d: 1 <= d.get("KEY_DIM", 0) <= 128 and 1 <= d.get("VALUE_DIM", 0) <= 128,
     ),
+    OpSpec(
+        op="paged_attention_decode",
+        arch="gfx950",
+        variant="split_k_mfma",
+        impl="triton.tlx.ops.kernels.paged_attn.gfx950_decode:paged_attention_decode",
+        dtypes=_FP16,
+        accepts=lambda d: (d["HEAD_DIM"] in (64, 128) and 1 <= d["QLEN"] <= 4 and d["QLEN"] * d["GROUP"] <= 64),
+    ),
+    OpSpec(
+        op="paged_attention_decode_workspace",
+        arch="gfx950",
+        variant="split_k_mfma",
+        impl="triton.tlx.ops.kernels.paged_attn.gfx950_decode:paged_attention_decode_workspace",
+        dtypes=_FP16,
+    ),
+    OpSpec(
+        op="allocate_paged_kv_cache_5d",
+        arch="gfx950",
+        variant="aiter_packed",
+        impl="triton.tlx.ops.kernels.paged_attn.gfx950_decode:allocate_5d_kv_cache",
+        dtypes=_FP16,
+    ),
+    OpSpec(
+        op="reshape_and_cache_5d",
+        arch="gfx950",
+        variant="aiter_packed",
+        impl="triton.tlx.ops.kernels.paged_attn.gfx950_decode:reshape_and_cache_5d",
+        dtypes=_FP16,
+    ),
 )
 
 CATALOG += tuple(
@@ -672,12 +713,18 @@ def any_enforces_invariance(op: str) -> bool:
     return any(spec.op == op and spec.enforces_invariance for spec in CATALOG)
 
 
-@functools.lru_cache(maxsize=None)
-def _impl_for_arch(op: str, arch: str) -> tuple[Callable[..., Any], OpSpec]:
+def spec_for(op: str, arch: str) -> OpSpec:
+    """Read registered metadata without importing a kernel."""
     spec = _BY_KEY.get((op, arch))
     if spec is None:
         available = ", ".join(_arches_for(op)) or "(nothing yet)"
         raise UnsupportedOp(f"tlx.ops.{op} has no implementation for arch={arch!r}. Available on: {available}")
+    return spec
+
+
+@functools.lru_cache(maxsize=None)
+def _impl_for_arch(op: str, arch: str) -> tuple[Callable[..., Any], OpSpec]:
+    spec = spec_for(op, arch)
     return _load(spec.impl), spec
 
 

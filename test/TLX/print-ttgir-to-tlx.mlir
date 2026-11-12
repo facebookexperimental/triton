@@ -41,8 +41,9 @@
 // CHECK-DAG: tlx.local_trans(
 // CHECK-DAG: tlx.subslice(
 
-// Verify warp specialization uses Python-like async_tasks syntax
-// CHECK-DAG: with tlx.async_tasks():
+// Verify warp specialization uses Python-like async_tasks syntax. The kernel's
+// only warp_specialize came from AutoWS, so it keeps direct warp-ID dispatch.
+// CHECK-DAG: with tlx.async_tasks(exclusive=True):
 // CHECK-DAG: with tlx.async_task("default"):
 // CHECK-DAG: with tlx.async_task(num_warps=
 

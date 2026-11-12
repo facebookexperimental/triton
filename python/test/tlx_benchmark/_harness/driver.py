@@ -283,7 +283,8 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     ref_host_us = host_overhead_us(prep.ref_fn) if prep.ref_fn is not None else None
 
     result = verdict.judge(case, tlx, ref, tlx_host_us=host_us, compile_stat=compile_stat, correct=correct,
-                           accuracy_note=accuracy_note, floor_tflops=prep.floor_tflops)
+                           accuracy_note=accuracy_note, floor_tflops=prep.floor_tflops,
+                           reference_gate=getattr(bench, "REFERENCE_GATE", True))
     # After the verdict's notes, which lead the nightly failure summary.
     result.notes += [f"tlx: {n}" for n in tlx_notes] + [f"ref: {n}" for n in ref_notes]
     result.flop_count = prep.flop_count
@@ -325,14 +326,12 @@ def _errored(case: Case, exc: Exception) -> Result:
 
 
 def resolve_space(bench, space: Optional[str]) -> str:
-    """`None` means "whatever this op's own default is".
-
-    Ops do not share one: `mm` has a `heuristic_config` and defaults to it,
-    while `flash_attn`/`hstu_attn_dev`/`kimi_delta_attention` have none and
-    their kernels accept only "full" or "smoke" -- passing a global default of
-    "heuristic" to those is a KeyError, not a slow path.
-    """
-    return space or getattr(bench, "DEFAULT_SPACE", "heuristic")
+    """Resolve an explicit space or the adapter's default for the selected GPU."""
+    if space is not None:
+        return space
+    if hasattr(bench, "default_space"):
+        return bench.default_space()
+    return getattr(bench, "DEFAULT_SPACE", "heuristic")
 
 
 #: How often to pay the cold-compile pass.
@@ -409,6 +408,7 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
     # same claim as a ratio against a vendor library.
     env["space"] = space
     env["ref"] = getattr(bench, "REF_NAME", "")
+    env["reference_gate"] = getattr(bench, "REFERENCE_GATE", True)
     env["cold_compile"] = cold_mode
     env["latency_mode"] = "gpu_events"
     env["requested_latency_mode"] = latency_mode
@@ -428,10 +428,8 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
 def main(bench, argv=None) -> int:
     parser = argparse.ArgumentParser(description=bench.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default="auto", help="GPU index, or 'auto' (default) for the least-used one")
-    parser.add_argument(
-        "--space", choices=("heuristic", "curated", "full", "smoke"), default=None,
-        help=f"autotune search space (default {resolve_space(bench, None)}); the default is what this op "
-        "uses by default, and measuring anything else measures a path users do not take")
+    parser.add_argument("--space", choices=("heuristic", "curated", "full", "smoke"), default=None,
+                        help="autotune search space; defaults to the selected GPU implementation's setting")
     parser.add_argument("--head", type=int, default=None, metavar="N",
                         help="only the first N cases per direction, for a quick look")
     shape_options = parser.add_mutually_exclusive_group()

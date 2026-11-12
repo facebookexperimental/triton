@@ -442,32 +442,54 @@ def NVMMASharedEncodingAttr
   // operand in MMAv5 scaled dot, which needs to be in the special padded layout
   // as described in
   // https://docs.nvidia.com/cuda/parallel-thread-execution/#packing-format-used-for-matrix-a-and-b-by-kind-mxf8f6f4-in-shared-memory
-  // fp6Padded uses 16-byte containers holding 16 densely packed FP6 values
-  // followed by four padding bytes. Shapes and coordinates count FP6 values;
-  // the linear layout addresses the padded byte containers. TMA reads dense
-  // global FP6 through .b6x16_p32 and inserts the padding.
+  // FP6 shapes and coordinates count logical values. B6x16P32 is an opaque
+  // MMA tile whose 16-byte containers hold 16 packed FP6 values and padding.
+  // B6P2x16 exposes one low-six-bit code per byte for compacting TMA stores.
   let parameters = (ins "unsigned":$swizzlingByteWidth, "bool":$transposed,
-      "unsigned":$elementBitWidth, "bool":$fp4Padded,
-      "CGAEncodingAttr":$CGALayout,
-      DefaultValuedParameter<"bool", "false">:$fp6Padded);
+      "unsigned":$elementBitWidth, "NVMmaPadding":$padding,
+      "CGAEncodingAttr":$CGALayout);
 
+  let skipDefaultBuilders = 1;
   let builders =
       [AttrBuilder<(ins "unsigned":$swizzlingByteWidth, "bool":$transposed,
-                       "unsigned":$elementBitWidth, "bool":$fp4Padded,
+                       "unsigned":$elementBitWidth, "NVMmaPadding":$padding,
                        "CGAEncodingAttr":$CGALayout),
                    [{
-        return $_get(context, swizzlingByteWidth, transposed, elementBitWidth,
-                     fp4Padded, CGALayout, false);
-      }]>,
+      return $_get(context, swizzlingByteWidth, transposed, elementBitWidth,
+                   padding, CGALayout);
+    }]>,
+       AttrBuilder<(ins "unsigned":$swizzlingByteWidth, "bool":$transposed,
+                       "unsigned":$elementBitWidth, "bool":$fp4Padded,
+                       "CGAEncodingAttr":$CGALayout,
+                       CArg<"bool", "false">:$fp6Padded),
+                   [{
+      assert(!(fp4Padded && fp6Padded));
+      auto padding = fp4Padded ? NVMmaPadding::Fp4
+                   : fp6Padded ? NVMmaPadding::B6x16P32
+                               : NVMmaPadding::None;
+      return get(context, swizzlingByteWidth, transposed, elementBitWidth,
+                 padding, CGALayout);
+    }]>,
+       AttrBuilder<(ins "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
+                       "CGAEncodingAttr":$CGALayout, "Type":$eltTy,
+                       "NVMmaPadding":$padding),
+                   [{
+      unsigned eleBitWidth = eltTy.getIntOrFloatBitWidth();
+      unsigned swizzlingByteWidth = getDefaultSwizzlingByteWidth(
+          shape, order, CGALayout, eleBitWidth, padding == NVMmaPadding::Fp4);
+      bool transposed = order.size() > 1 && order[0] == 0;
+      return get(context, swizzlingByteWidth, transposed, eleBitWidth, padding,
+                 CGALayout);
+    }]>,
        AttrBuilder<(ins "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
                        "CGAEncodingAttr":$CGALayout, "Type":$eltTy,
                        "bool":$fp4Padded, CArg<"bool", "false">:$fp6Padded),
                    [{
-        unsigned eleBitWidth = eltTy.getIntOrFloatBitWidth();
-        unsigned swizzlingByteWidth = getDefaultSwizzlingByteWidth(
-            shape, order, CGALayout, eleBitWidth, fp4Padded);
-        bool transposed = order.size() > 1 && order[0] == 0;
-        return $_get(context, swizzlingByteWidth, transposed, eleBitWidth, fp4Padded, CGALayout, fp6Padded);
+      assert(!(fp4Padded && fp6Padded));
+      auto padding = fp4Padded ? NVMmaPadding::Fp4
+                   : fp6Padded ? NVMmaPadding::B6x16P32
+                               : NVMmaPadding::None;
+      return get(context, shape, order, CGALayout, eltTy, padding);
     }]>];
 
   let extraClassDeclaration = extraBaseClassDeclaration#[{
@@ -476,6 +498,17 @@ def NVMMASharedEncodingAttr
     static unsigned getDefaultSwizzlingByteWidth(
         ArrayRef<int64_t> shape, ArrayRef<unsigned> order,
         CGAEncodingAttr cgaLayout, unsigned elementBitWidth, bool fp4Padded);
+
+    bool getFp4Padded() const { return isPaddedFp4(); }
+    bool getFp6Padded() const { return getPadding() == NVMmaPadding::B6x16P32; }
+    bool isPaddedFp4() const { return getPadding() == NVMmaPadding::Fp4; }
+    bool isPaddedFp6() const {
+      return getPadding() == NVMmaPadding::B6x16P32 || getPadding() == NVMmaPadding::B6P2x16;
+    }
+    static bool isPackedFp6(Attribute encoding) {
+      auto mma = llvm::dyn_cast_if_present<NVMMASharedEncodingAttr>(encoding);
+      return mma && mma.getPadding() == NVMmaPadding::B6x16P32;
+    }
 
     int getPerPhase() const;
     int getMaxPhase() const;

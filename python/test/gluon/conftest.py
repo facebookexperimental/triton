@@ -64,6 +64,11 @@ def pytest_collection_modifyitems(config, items):
     known = pytest.mark.skip(reason=_KNOWN_FAIL_REASON)
     for item in items:
         filename = item.path.name
+        if filename == "test_core.py" and item.name.split("[", 1)[0] in (
+            "test_fp6_tma_store_contiguous",
+            "test_fp6_tma_mma_operand",
+        ):
+            continue
         if filename in _VERSION_SKEW_FILES:
             # Exemption: test_standard_scan (upstream #12007) exercises only core
             # scan ops (cumsum/cumprod) through the pinned frontend, so it may pass

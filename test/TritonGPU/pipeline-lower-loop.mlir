@@ -3,19 +3,23 @@
 
 #fp6 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8, fp6Padded = true}>
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#smem = #ttg.shared_memory
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
   // CHECK-LABEL: @fp6_tma_pipeline
   // CHECK: ttg.local_alloc : () -> !ttg.memdesc<2x128x128xi8
   // CHECK: scf.for
   // CHECK: ttng.barrier_expect {{.*}}, 12288 {{.*}},
   // CHECK: ttng.async_tma_copy_global_to_local
+  // CHECK-NOT: ttg.local_load
+  // CHECK: "use"
   // TMA-LOWERING-LABEL: @fp6_tma_pipeline
   // TMA-LOWERING: ttng.barrier_expect {{.*}}, 12288 {{.*}},
   tt.func @fp6_tma_pipeline(%desc: !tt.tensordesc<128x128xi8, #fp6>, %lb: index, %ub: index, %step: index) {
     %c0 = arith.constant 0 : i32
     scf.for %iv = %lb to %ub step %step {
       %load = tt.descriptor_load %desc[%c0, %c0] {loop.cluster = 2 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x128xi8, #fp6> -> tensor<128x128xi8, #blocked>
-      "use"(%load) {loop.cluster = 0 : i32, loop.stage = 2 : i32} : (tensor<128x128xi8, #blocked>) -> ()
+      %tile = ttg.local_alloc %load {loop.cluster = 0 : i32, loop.stage = 2 : i32} : (tensor<128x128xi8, #blocked>) -> !ttg.memdesc<128x128xi8, #fp6, #smem>
+      "use"(%tile) {loop.cluster = 0 : i32, loop.stage = 2 : i32} : (!ttg.memdesc<128x128xi8, #fp6, #smem>) -> ()
     } {tt.scheduled_max_stage = 2 : i32}
     tt.return
   }

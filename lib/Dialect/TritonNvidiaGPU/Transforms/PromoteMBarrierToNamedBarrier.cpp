@@ -1436,8 +1436,12 @@ void promoteBarrier(BarrierCandidate &candidate,
                                                  idsBySlot, use.index);
     Value count =
         arith::ConstantIntOp::create(builder, arrive.getLoc(), numThreads, 32);
-    ttng::NamedBarrierArriveOp::create(builder, arrive.getLoc(), namedId,
-                                       count);
+    auto namedArrive = ttng::NamedBarrierArriveOp::create(
+        builder, arrive.getLoc(), namedId, count);
+    // Keep the proxy-fence request for ProxyFenceInsertion.
+    if (arrive->hasAttr(ttng::kFenceGenericReadsAttrName))
+      namedArrive->setAttr(ttng::kFenceGenericReadsAttrName,
+                           builder.getUnitAttr());
     arrive.erase();
   }
   for (const auto &use : candidate.waits) {
