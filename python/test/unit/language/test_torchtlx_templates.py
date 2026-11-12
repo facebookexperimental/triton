@@ -5422,8 +5422,9 @@ class TestTargetDetection(TestCase):
 
 
 # Extern fallback calls; the bare op name also appears in "Original ATen" comments.
-_SDPA_FWD_CALL = "aten._scaled_dot_product_flash_attention.default("
-_SDPA_BWD_CALL = "aten._scaled_dot_product_flash_attention_backward.default("
+# SDPA lowers to flash or cuDNN attention depending on the torch build.
+_SDPA_FWD_CALL = r"aten\._scaled_dot_product_(flash|cudnn)_attention\.default\("
+_SDPA_BWD_CALL = r"aten\._scaled_dot_product_(flash|cudnn)_attention_backward\.default\("
 
 
 def _rel_l2(out, ref):
@@ -5441,14 +5442,17 @@ class TestSdpaToFlex(TestCase):
     The flag is set process-wide because the lazy backward compile reads it.
     """
 
-    def _compile_fw_bw(self, fn, q, kv, routed, disable_caches=True):
+    def _compile_fw_bw(self, fn, q, kv, routed, disable_caches=True, backend=None):
+        from torch.nn.attention import sdpa_kernel
+
         q = q.detach().requires_grad_(True)
         kv = kv.detach().requires_grad_(True)
         saved = tlx_config.sdpa_to_flex
         tlx_config.sdpa_to_flex = routed
         try:
             torch._dynamo.reset()
-            with config.patch({"force_disable_caches": disable_caches}):
+            backends = contextlib.nullcontext() if backend is None else sdpa_kernel(backend)
+            with config.patch({"force_disable_caches": disable_caches}), backends:
                 out, code = run_fw_bw_and_get_code(lambda: torch.compile(fn)(q, kv))
         finally:
             tlx_config.sdpa_to_flex = saved
@@ -5472,8 +5476,12 @@ class TestSdpaToFlex(TestCase):
         (16, 100, 80, True),
         (32, 1536, 80, False),
     ))
-    def test_routes_eligible(self, Lq, Lkv, D, shared_kv):
+    @parametrize("backend", ("flash", "cudnn"))
+    def test_routes_eligible(self, Lq, Lkv, D, shared_kv, backend):
         import triton.language.extra.tlx.inductor.registry  # noqa: F401
+        from torch.nn.attention import SDPBackend
+
+        sdpa_backend = {"flash": SDPBackend.FLASH_ATTENTION, "cudnn": SDPBackend.CUDNN_ATTENTION}[backend]
 
         q, kv = self._inputs(8, Lq, Lkv, D)
         v = None if shared_kv else torch.randn_like(kv)
@@ -5481,13 +5489,13 @@ class TestSdpaToFlex(TestCase):
         def fn(q, k):
             return torch.nn.functional.scaled_dot_product_attention(q, k, k if v is None else v)
 
-        out, grads, code = self._compile_fw_bw(fn, q, kv, routed=True)
-        ref, ref_grads, ref_code = self._compile_fw_bw(fn, q, kv, routed=False)
-        self.assertRegex(code, r"triton_tem_fused_\w*scaled_dot_product_flash_attention_backward")
-        self.assertNotIn(_SDPA_FWD_CALL, code)
-        self.assertNotIn(_SDPA_BWD_CALL, code)
-        self.assertIn(_SDPA_FWD_CALL, ref_code)
-        self.assertIn(_SDPA_BWD_CALL, ref_code)
+        out, grads, code = self._compile_fw_bw(fn, q, kv, routed=True, backend=sdpa_backend)
+        ref, ref_grads, ref_code = self._compile_fw_bw(fn, q, kv, routed=False, backend=sdpa_backend)
+        self.assertRegex(code, rf"triton_tem_fused_\w*scaled_dot_product_{backend}_attention_backward")
+        self.assertNotRegex(code, _SDPA_FWD_CALL)
+        self.assertNotRegex(code, _SDPA_BWD_CALL)
+        self.assertIn(f"aten._scaled_dot_product_{backend}_attention.default(", ref_code)
+        self.assertIn(f"aten._scaled_dot_product_{backend}_attention_backward.default(", ref_code)
         for got, want in zip((out, *grads), (ref, *ref_grads)):
             self.assertLessEqual(_rel_l2(got, want), 1e-2)
 
@@ -5498,9 +5506,9 @@ class TestSdpaToFlex(TestCase):
 
         q, kv = self._inputs(8, 32, 200, 128)
         _, _, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
-        self.assertIn(_SDPA_FWD_CALL, code)
+        self.assertRegex(code, _SDPA_FWD_CALL)
 
-        # Causal with Lq == Lkv so SDPA still picks flash attention.
+        # Causal with Lq == Lkv so SDPA still picks a fused kernel.
         q, kv = self._inputs(8, 32, 32, 80)
         _, _, code = self._compile_fw_bw(
             lambda q, k: torch.nn.functional.scaled_dot_product_attention(q, k, k, is_causal=True),
@@ -5508,11 +5516,11 @@ class TestSdpaToFlex(TestCase):
             kv,
             routed=True,
         )
-        self.assertIn(_SDPA_FWD_CALL, code)
+        self.assertRegex(code, _SDPA_FWD_CALL)
 
         q, kv = self._inputs(8, 64, 1536, 80)
         _, _, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
-        self.assertIn(_SDPA_FWD_CALL, code)
+        self.assertRegex(code, _SDPA_FWD_CALL)
 
     @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
     @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -5522,8 +5530,8 @@ class TestSdpaToFlex(TestCase):
         q, kv = self._inputs(8, 32, 200, 80)
         _, _, off = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=False, disable_caches=False)
         _, _, on = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True, disable_caches=False)
-        self.assertIn(_SDPA_FWD_CALL, off)
-        self.assertNotIn(_SDPA_FWD_CALL, on)
+        self.assertRegex(off, _SDPA_FWD_CALL)
+        self.assertNotRegex(on, _SDPA_FWD_CALL)
 
     @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
     @unittest.skipIf(not has_tlx(), "TLX not available")

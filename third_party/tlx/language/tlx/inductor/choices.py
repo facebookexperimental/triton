@@ -10,6 +10,7 @@ super() when TLX is disabled (mode is None).
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, TYPE_CHECKING
 
 from torch._inductor import config
@@ -369,9 +370,17 @@ def maybe_override_best_choice(
     beats them by a meaningful margin. Short autotuning benchmarks are noisy
     and TLX can narrowly "win" but run slower in steady-state.
 
+    In "force" mode, pick the fastest TLX choice over any non-TLX winner.
+
     Returns the (possibly overridden) best choice.
     """
     from .fusion import _is_tlx_choice
+
+    if config.triton.tlx_mode == "force" and not _is_tlx_choice(best_choice):
+        # tuned_addmm adds its ATen choices in a get_template_configs call of their
+        # own, so _finalize_template_configs never sees them beside the TLX ones.
+        tlx_choices = [c for c in timings if _is_tlx_choice(c) and math.isfinite(timings[c])]
+        return min(tlx_choices, key=lambda c: timings[c]) if tlx_choices else best_choice
 
     if config.triton.tlx_mode != "allow" or not _is_tlx_choice(best_choice):
         return best_choice
