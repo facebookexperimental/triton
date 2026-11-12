@@ -625,7 +625,7 @@ class HIPBackend(BaseBackend):
         return (
             metadata.num_warps,
             metadata.ctas_per_cga[0] if metadata.ctas_per_cga is not None else metadata.num_ctas,
-            metadata.shared,
+            0,
         )
 
     def make_launch_metadata(self, metadata, src):
@@ -656,7 +656,7 @@ class HIPBackend(BaseBackend):
             "num_warps": get("num_warps"),
             "num_ctas": get("num_ctas", 1),
             "warp_size": get("warp_size", self.target.warp_size),
-            "shared_mem": get("shared", 0),
+            "shared_mem": 0,
             "ctas_per_cga": list(cluster) if cluster is not None else None,
             "launch_cooperative_grid": get("launch_cooperative_grid", False),
             "global_scratch_size": get("global_scratch_size", 0),
@@ -1230,6 +1230,11 @@ class HIPBackend(BaseBackend):
                 dump_ir=dump_llvm_ir,
                 enable_timing=knobs.getenv_bool("LLVM_ENABLE_TIMING", False),
             )
+        shared_static = re.search(r"^\s*\.amdhsa_group_segment_fixed_size\s+(\d+)\s*$", amdgcn, re.MULTILINE)
+        if shared_static is None:
+            raise RuntimeError("Missing fixed LDS size in AMDGCN kernel descriptor")
+        metadata["shared_static"] = int(shared_static.group(1))
+        metadata["shared"] = metadata["shared_static"]
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)
