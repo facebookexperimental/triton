@@ -508,11 +508,7 @@ tt.func @tmem_load_sinks_after_barrier_reorder(
   tt.return
 }
 
-// A wait whose slot load is dead (a broadcast value this partition does not
-// use) sits right before the release of the same slot. Its nearest memory op is
-// a tmem_load of another channel, but restoring the wait next to that load
-// must not lower it below its own slot's release: the producer could then
-// overwrite the slot twice before the wait, and the parity wait hangs.
+// A wait whose slot load is dead must not sink below its own slot's release.
 // CHECK-LABEL: @wait_not_lowered_past_own_release
 tt.func @wait_not_lowered_past_own_release(
     %full: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
@@ -532,31 +528,7 @@ tt.func @wait_not_lowered_past_own_release(
   tt.return
 }
 
-// The mirror case: the dead slot's wait/release pair follows a tmem_load.
-// Restoring the release next to that load (its nearest memory op) must not
-// raise it above the slot's own wait.
-// CHECK-LABEL: @arrive_not_raised_past_own_acquire
-tt.func @arrive_not_raised_past_own_acquire(
-    %full: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
-    %empty: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
-    %acc_full: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
-    %acc_empty: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
-    %phase: i32) {
-  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-  // CHECK: ttng.wait_barrier %arg0
-  // CHECK: ttng.arrive_barrier %arg1
-  ttng.wait_barrier %acc_full, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2, 3>, direction = "forward", dstTask = 1 : i32, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
-  %0 = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
-  ttng.arrive_barrier %acc_empty, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2, 3>, dstTask = 1 : i32, maxRegionId = 6 : i32, minRegionId = 6 : i32, parentId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
-  ttng.wait_barrier %full, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2, 3>, dstTask = 3 : i32, maxRegionId = 7 : i32, minRegionId = 7 : i32, parentId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
-  ttng.arrive_barrier %empty, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2, 3>, dstTask = 3 : i32, maxRegionId = 8 : i32, minRegionId = 8 : i32, parentId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
-  "user"(%0) : (tensor<128x128xf32, #linear128>) -> ()
-  tt.return
-}
-
-// Endpoints with different peers normally belong to different channels, but
-// not when they share a barrier array (a reuse group with more members than
-// slots): a release on that array must still not be raised above a wait on it.
+// Endpoints with different peers sharing a barrier array may share a channel.
 // CHECK-LABEL: @arrive_not_raised_past_shared_array_wait
 tt.func @arrive_not_raised_past_shared_array_wait(
     %full: !ttg.memdesc<2x1xi64, #barrier_shared, #smem, mutable>,

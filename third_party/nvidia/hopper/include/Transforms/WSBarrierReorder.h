@@ -287,10 +287,9 @@ buildBarrierToMemoryOpMap(Block &block) {
 }
 
 // Whether two WS barrier endpoints in one partition may belong to the same
-// channel. Endpoints with disjoint channel graphs, or with different peer
-// partitions (dstTask), cannot, unless one of them uses a barrier array that
-// endpoints with different peers share (a reuse group with more members than
-// slots), where the peer no longer identifies the slot.
+// channel. A different peer (dstTask) rules it out unless the barrier array is
+// shared by endpoints with different peers (a reuse group with more members
+// than slots).
 inline bool mayShareWSChannel(WaitBarrierOp wait, ArriveBarrierOp arrive,
                               const DenseSet<Value> &mixedBarrierRoots) {
   if (canAdvanceWSBarrier(wait.getConstraints(), arrive.getConstraints()))
@@ -309,10 +308,8 @@ inline bool mayShareWSChannel(WaitBarrierOp wait, ArriveBarrierOp arrive,
   return !dstA || !dstB || dstA.getInt() == dstB.getInt();
 }
 
-// Check whether `wait` can be lowered below `crossedOp`. Lowering a wait
-// moves `crossedOp` ahead of it, so an arrive may only be crossed when it
-// cannot belong to the same channel: the release of the slot this wait
-// acquires would otherwise signal before the acquire.
+// A wait may not be lowered below an arrive of its own channel: the slot's
+// release would signal before its acquire.
 inline bool canLowerWSWaitPast(WaitBarrierOp wait, Operation *crossedOp,
                                const DenseSet<Value> &mixedBarrierRoots) {
   if (crossedOp->getNumRegions() != 0)
@@ -326,9 +323,7 @@ inline bool canLowerWSWaitPast(WaitBarrierOp wait, Operation *crossedOp,
   return !hasArriveLikeSemantics(crossedOp);
 }
 
-// Check whether `arrive` can be raised above `crossedOp`. Raising an arrive
-// signals before `crossedOp`, so a wait may only be crossed when it cannot
-// belong to the same channel.
+// The mirror of canLowerWSWaitPast for raising an arrive.
 inline bool canRaiseWSArrivePast(ArriveBarrierOp arrive, Operation *crossedOp,
                                  const DenseSet<Value> &mixedBarrierRoots) {
   if (crossedOp->getNumRegions() != 0)
@@ -365,17 +360,9 @@ inline DenseMap<Operation *, unsigned> buildOriginalBlockOrder(Block &block) {
 // counts. When the memory op has no memdesc operand, any side-effecting op
 // counts. Ops with regions, and ops missing from `originalOrder`, are treated
 // as guarded.
-//
-// Lowering a wait toward its memory op, or raising an arrive toward its memory
-// op, is only a scheduling choice: leaving the barrier where it is stays
-// correct. So such a move also stops at the first barrier it may not cross,
-// unless that only restores the original order. A wait lowered below an
-// arrive (or an arrive raised above a wait) of the same channel would signal
-// before the acquire it depends on. Without
-// this, a wait whose nearest memory op belonged to another channel (a
-// broadcast slot whose local_load was dead) was lowered below the release of
-// its own slot, so the producer could overwrite the slot twice and the
-// consumer's parity wait hung.
+// A move also stops at the first barrier of the same channel it would cross
+// (unless that restores the original order); otherwise a wait could sink below
+// its own slot's release and the consumer's parity wait hangs.
 inline void optimizeWSBarrierLocations(
     const DenseMap<Operation *, Operation *> &barrierToMemOp,
     const DenseMap<Operation *, unsigned> &originalOrder) {
