@@ -1,29 +1,15 @@
 #!/usr/bin/env python3
-"""Parse LLVM LIT output and emit failing-test identities for nightly CI.
-
-LIT prints lines such as::
-
-    FAIL: TRITON :: Conversion/foo.mlir (12 of 345)
-    UNRESOLVED: TRITON :: Analysis/bar.mlir (3 of 345)
-
-We extract the finest stable identity available (``TRITON :: <test path>``) for
-each failing/unresolved/timed-out test. If none can be parsed but the run is
-known to have failed, we fall back to a single stable logical bucket so a
-failure is never silently dropped.
-
-Output is written to ``$GITHUB_OUTPUT`` as ``failures=<json>`` (JSON array of
-the same shape produced by ``parse_junit_failures.py``).
-"""
-
+"""Parse LIT failures and positive recovery evidence for CI issue reporting."""
 import argparse
 import json
 import os
 import re
 
 from classify_failure import classify
+from test_results import encode_recovery
 
-# e.g. "FAIL: TRITON :: Conversion/foo.mlir (12 of 345)"
 LIT_LINE = re.compile(r"^(?:FAIL|UNRESOLVED|TIMEOUT|XPASS):\s+(.*?)\s*(?:\(\d+ of \d+\))?\s*$")
+RESULT_LINE = re.compile(r"^(PASS|FAIL|UNRESOLVED|TIMEOUT|XPASS|XFAIL|UNSUPPORTED):\s+(.*?)\s*(?:\(\d+ of \d+\))?\s*$")
 
 
 def parse_log(path):
@@ -43,13 +29,26 @@ def parse_log(path):
     return ids
 
 
-def lit_repro(ident, fallback):
-    """Best-effort local reproduce command for a LIT identity.
+def recovery_results(path, completed, failed, bucket):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            log = f.read()
+    except OSError:
+        return encode_recovery()
+    results = {}
+    for line in log.splitlines():
+        m = RESULT_LINE.match(line.strip())
+        if m:
+            results[m[2]] = m[1]
+    total = re.search(r"-- Testing: (\d+) tests", log)
+    complete = bool(completed and total and int(total[1]) > 0 and len(results) == int(total[1])
+                    and "Testing Time:" in log)
+    passed = [ident for ident, status in results.items() if status == "PASS"]
+    return encode_recovery(passed, [bucket] if complete and not failed and passed else [], complete)
 
-    ``ident`` looks like ``TRITON :: Conversion/foo.mlir``; the path after
-    ``::`` is relative to the ``test/`` suite root. Returns "" for the
-    job-level bucket fallback (no per-test path).
-    """
+
+def lit_repro(ident, fallback):
+    """Best-effort local reproduce command for a LIT identity."""
     if fallback or "::" not in ident:
         return ""
     rel = ident.split("::", 1)[-1].strip()
@@ -68,10 +67,7 @@ def build_items(ids, workflow, job, fallback):
             "job_name": job,
             "summary": summary,
             "repro": lit_repro(ident, fallback),
-            # fallback=True means the bucket identity (no per-test signal), so
-            # reconcile must not close per-test issues from this run.
             "fallback": fallback,
-            # External-dep failures skip bisection and are annotated instead.
             "external_dep": is_external,
             "external_dep_reason": reason,
         })
@@ -80,33 +76,27 @@ def build_items(ids, workflow, job, fallback):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--log", required=True, help="LIT output log file")
+    parser.add_argument("--log", required=True)
     parser.add_argument("--workflow", required=True)
     parser.add_argument("--job", required=True)
-    parser.add_argument("--bucket", default="compiler-lit", help="Fallback identity")
-    parser.add_argument(
-        "--failed",
-        action="store_true",
-        help="The LIT step failed; emit bucket if nothing parsed.",
-    )
+    parser.add_argument("--bucket", default="compiler-lit")
+    parser.add_argument("--failed", action="store_true")
+    parser.add_argument("--completed", action="store_true")
     parser.add_argument("--output-name", default="failures")
     args = parser.parse_args()
-
     ids = parse_log(args.log)
     if not ids and not args.failed:
-        # Step passed and nothing parsed -> no issues.
         items = []
     elif not ids:
-        # Step failed but nothing parseable -> stable bucket fallback.
         items = build_items([args.bucket], args.workflow, args.job, fallback=True)
     else:
         items = build_items(ids, args.workflow, args.job, fallback=False)
-
     payload = json.dumps(items)
+    recovery = recovery_results(args.log, args.completed, args.failed, args.bucket)
     out_path = os.environ.get("GITHUB_OUTPUT")
     if out_path:
         with open(out_path, "a", encoding="utf-8") as fh:
-            fh.write(f"{args.output_name}={payload}\n")
+            fh.write(f"{args.output_name}={payload}\nrecovery={recovery}\n")
     print(payload)
 
 

@@ -23,6 +23,11 @@ on:
         required: false
         type: string
         default: "[]"
+      recovery:
+        description: Encoded passing-test evidence from completed steps.
+        required: false
+        type: string
+        default: ""
       run_url:
         description: URL of the nightly run (for the close comment).
         required: true
@@ -59,7 +64,8 @@ jobs:
           PREFIX: ${{ inputs.title_prefix || format('[nightly] {0} / {1} / ', inputs.workflow_name, inputs.job_name) }}
           LABELS: ${{ inputs.labels }}
           FAILURES: ${{ inputs.failures }}
+          RECOVERY: ${{ inputs.recovery }}
           RUN_URL: ${{ inputs.run_url }}
         run: |
           python3 .github/scripts/failure_issues.py reconcile --prefix "$PREFIX" --labels "$LABELS" \
-            --failures "$FAILURES" --run-url "$RUN_URL"
+            --failures "$FAILURES" --recovery "$RECOVERY" --run-url "$RUN_URL"
