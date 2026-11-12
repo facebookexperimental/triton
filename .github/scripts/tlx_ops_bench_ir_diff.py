@@ -308,10 +308,10 @@ def diff_details(g):
     return f"<details><summary><code>{g['kernel']}</code>: {cases}</summary>\n\n" + "".join(parts) + "</details>\n\n"
 
 
-def brief(s, limit=3):
+def brief(s, limit=3, label="Endpoint IR comparison"):
     """For an issue comment: how many kernels changed, the TTGIR changes of the largest groups, and the TTGIR and
     PTX diffs of the largest one."""
-    lines = [f"Endpoint IR comparison: {s['changed']} of {s['compared']} kernel specializations changed."]
+    lines = [f"{label}: {s['changed']} of {s['compared']} kernel specializations changed."]
     ranked = [g for g in s["groups"] if g["stages"].get("ttgir", {}).get("deltas")]
     for g in ranked[:limit]:
         lines.append(f"- `{g['kernel']}` ({len(g['cases'])} case(s)) TTGIR: {fmt(g['stages']['ttgir']['deltas'])}")

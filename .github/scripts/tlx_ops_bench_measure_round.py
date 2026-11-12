@@ -20,6 +20,10 @@ def measure(prepared, role, source, harness, output):
             return {"status": "error", "reason": "good endpoint did not select a GPU"}
         step["gpu_uuid"] = good["gpu_uuid"]
     work = Path(tempfile.mkdtemp(prefix=f"perf-measure-{role}-", dir=os.environ.get("RUNNER_TEMP")))
+    if role.startswith("ir-"):
+        env = os.environ.copy()
+        env["TRITON_HOME"] = str(output.resolve() / "triton-home")
+        return {"status": dump_ir(step, step["gpu_uuid"], output / "ir" / role, work, env)}
     step_path = work / "step.json"
     step_path.write_text(json.dumps(step))
     destination = work / "measurement.json"
@@ -36,7 +40,8 @@ def measure(prepared, role, source, harness, output):
     if not destination.exists():
         return {"status": "error", "reason": "measurement process failed"}
     result = json.loads(destination.read_text())
-    if role != "candidate" and result.get("gpu_uuid"):
+    # The endpoints stay the same in every round, so their kernels are dumped once, in round 0.
+    if role != "candidate" and prepared.get("round", 0) == 0 and result.get("gpu_uuid"):
         result["ir_dump"] = dump_ir(step, result["gpu_uuid"], output / "ir" / role, work, env)
     return result
 
@@ -61,7 +66,9 @@ def dump_ir(step, gpu_uuid, out, work, env):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepared", type=Path, required=True)
-    parser.add_argument("--role", choices=("good", "bad", "candidate"), required=True)
+    parser.add_argument(
+        "--role", choices=("good", "bad", "candidate", "ir-base", "ir-head"), required=True,
+        help="ir-base and ir-head only dump the case's kernels, for the first bad commit and its parent")
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--harness", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

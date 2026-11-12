@@ -95,7 +95,8 @@ def main():
     parser.add_argument("--measurements", type=Path, required=True)
     parser.add_argument("--state", type=Path)
     parser.add_argument("--recovery-baseline", type=float)
-    parser.add_argument("--ir-diff", type=Path, help="tlx_ops_bench_ir_diff.py summary.json for this round")
+    parser.add_argument("--ir-diff", type=Path, help="tlx_ops_bench_ir_diff.py summary.json for the endpoints")
+    parser.add_argument("--ir-commit-diff", type=Path, help="the same, for the first bad commit and its parent")
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", "facebookexperimental/triton"))
     args = parser.parse_args()
     prepared = json.loads(args.prepared.read_text())
@@ -108,6 +109,11 @@ def main():
             text += (f"\nIR of this round's endpoints, good `{spec.get('good_sha', '')[:8]}` and bad "
                      f"`{spec.get('bad_sha', '')[:8]}`. The `perf-bisect-ir` artifact has the diffs.\n\n" +
                      markdown(json.loads(args.ir_diff.read_text())))
+        if args.ir_commit_diff and args.ir_commit_diff.exists():
+            from tlx_ops_bench_ir_diff import markdown
+            sha = prepared.get("first_bad_sha") or ""
+            text += (f"\nIR of the first bad commit `{sha[:8]}` against its parent. The `perf-bisect-ir` artifact "
+                     "has the diffs.\n\n" + markdown(json.loads(args.ir_commit_diff.read_text())))
     elif args.recovery_baseline:
         text = recovery_summary(prepared["spec"], measurements, args.repo, args.recovery_baseline)
     else:

@@ -42,6 +42,8 @@ jobs:
       good: ${{ steps.plan.outputs.good }}
       bad: ${{ steps.plan.outputs.bad }}
       candidate: ${{ steps.plan.outputs.candidate }}
+      ir_base: ${{ steps.plan.outputs.ir_base }}
+      ir_head: ${{ steps.plan.outputs.ir_head }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -149,6 +151,10 @@ jobs:
               if prepared['needs_measurement']:
                   out.write(f"good={prepared['spec']['good_sha']}\nbad={prepared['spec']['bad_sha']}\n")
                   out.write(f"candidate={prepared['candidate_sha'] or ''}\n")
+                  # Once the first bad commit is isolated, compare its kernels with its parent's. In round 0 the
+                  # endpoint comparison already covers a one-commit range.
+                  if prepared['first_bad_sha'] and prepared['round'] > 0 and prepared['first_bad_parents']:
+                      out.write(f"ir_base={prepared['first_bad_parents'][0]}\nir_head={prepared['first_bad_sha']}\n")
           PY
       - uses: actions/upload-artifact@v4
         with:
@@ -190,8 +196,30 @@ jobs:
       ref: ${{ needs.prepare.outputs.candidate }}
       build_id: perf-candidate
 
+  ir-base-wheel:
+    needs: prepare
+    if: needs.prepare.outputs.ready == 'true' && needs.prepare.outputs.ir_base != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.prepare.outputs.ir_base }}
+      build_id: perf-ir-base
+
+  ir-head-wheel:
+    needs: prepare
+    if: needs.prepare.outputs.ready == 'true' && needs.prepare.outputs.ir_head != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.prepare.outputs.ir_head }}
+      build_id: perf-ir-head
+
   measure:
-    needs: [prepare, good-wheel, bad-wheel, candidate-wheel]
+    needs: [prepare, good-wheel, bad-wheel, candidate-wheel, ir-base-wheel, ir-head-wheel]
     if: always() && needs.prepare.outputs.ready == 'true' && needs.good-wheel.result == 'success' && needs.bad-wheel.result == 'success'
     runs-on: ${{ fromJSON('{"b200":"nvidia-dgx-b200","h100":"linux-gcp-h100","mi350":"linux-fb-triton-mi350-1"}')[inputs.platform] }}
     timeout-minutes: 45
@@ -292,19 +320,11 @@ jobs:
               print(reason)
           PY
       - name: Compare endpoint IR
+        if: hashFiles('measurements/ir/good/index.json') != '' && hashFiles('measurements/ir/bad/index.json') != ''
         continue-on-error: true
         run: |
           python3 tooling/.github/scripts/tlx_ops_bench_ir_diff.py --base measurements/ir/good --head measurements/ir/bad --out measurements/ir/diff
           cp measurements/ir/diff/summary.json measurements/ir-diff.json
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: perf-bisect-ir
-          path: |
-            measurements/ir/diff
-            measurements/ir/good/index.json
-            measurements/ir/bad/index.json
-          if-no-files-found: ignore
       - name: Install candidate wheel
         if: steps.endpoints.outputs.reproduced == 'true' && needs.candidate-wheel.result == 'success'
         uses: ./tooling/.github/actions/install-prebuilt-triton
@@ -316,6 +336,42 @@ jobs:
         if: steps.endpoints.outputs.reproduced == 'true' && needs.candidate-wheel.result == 'success'
         run: |
           python tooling/.github/scripts/tlx_ops_bench_measure_round.py --prepared evidence/prepared.json --role candidate --source source --harness "${RUNNER_TEMP}/perf-bisect-harness/python/test/tlx_benchmark" --output measurements
+          rm -f "${RUNNER_TEMP}"/prebuilt-wheel/*.whl
+      - name: Install first bad commit's parent wheel
+        if: steps.endpoints.outputs.reproduced == 'true' && needs.ir-base-wheel.result == 'success' && needs.ir-head-wheel.result == 'success'
+        uses: ./tooling/.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ needs.ir-base-wheel.outputs.wheel_url }}
+          wheel-filename: ${{ needs.ir-base-wheel.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.ir-base-wheel.outputs.wheel_sha256 }}
+      - name: Dump the parent's kernels
+        if: steps.endpoints.outputs.reproduced == 'true' && needs.ir-base-wheel.result == 'success' && needs.ir-head-wheel.result == 'success'
+        run: |
+          python tooling/.github/scripts/tlx_ops_bench_measure_round.py --prepared evidence/prepared.json --role ir-base --source source --harness "${RUNNER_TEMP}/perf-bisect-harness/python/test/tlx_benchmark" --output measurements
+          rm -f "${RUNNER_TEMP}"/prebuilt-wheel/*.whl
+      - name: Install first bad commit wheel
+        if: steps.endpoints.outputs.reproduced == 'true' && needs.ir-base-wheel.result == 'success' && needs.ir-head-wheel.result == 'success'
+        uses: ./tooling/.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ needs.ir-head-wheel.outputs.wheel_url }}
+          wheel-filename: ${{ needs.ir-head-wheel.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.ir-head-wheel.outputs.wheel_sha256 }}
+      - name: Dump the first bad commit's kernels and compare
+        if: steps.endpoints.outputs.reproduced == 'true' && needs.ir-base-wheel.result == 'success' && needs.ir-head-wheel.result == 'success'
+        continue-on-error: true
+        run: |
+          python tooling/.github/scripts/tlx_ops_bench_measure_round.py --prepared evidence/prepared.json --role ir-head --source source --harness "${RUNNER_TEMP}/perf-bisect-harness/python/test/tlx_benchmark" --output measurements
+          python3 tooling/.github/scripts/tlx_ops_bench_ir_diff.py --base measurements/ir/ir-base --head measurements/ir/ir-head --out measurements/ir/commit-diff
+          cp measurements/ir/commit-diff/summary.json measurements/ir-commit-diff.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-bisect-ir
+          path: |
+            measurements/ir/diff
+            measurements/ir/commit-diff
+            measurements/ir/*/index.json
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -324,7 +380,7 @@ jobs:
           if-no-files-found: ignore
 
   advance:
-    needs: [prepare, good-wheel, bad-wheel, candidate-wheel, measure]
+    needs: [prepare, good-wheel, bad-wheel, candidate-wheel, ir-base-wheel, ir-head-wheel, measure]
     if: always() && !cancelled() && needs.prepare.result == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -372,7 +428,7 @@ jobs:
           PY
       - name: Write the Actions result summary
         run: |
-          python3 tooling/.github/scripts/tlx_ops_bench_bisect_summary.py --prepared evidence/prepared.json --state evidence/state.json --measurements evidence/measurements.json --ir-diff measurements/ir-diff.json
+          python3 tooling/.github/scripts/tlx_ops_bench_bisect_summary.py --prepared evidence/prepared.json --state evidence/state.json --measurements evidence/measurements.json --ir-diff measurements/ir-diff.json --ir-commit-diff measurements/ir-commit-diff.json
       - name: Report completed cases
         env:
           GH_TOKEN: ${{ github.token }}
@@ -389,9 +445,11 @@ jobs:
           repo = os.environ['GITHUB_REPOSITORY']
           run_url = f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           state = json.loads(pathlib.Path('evidence/state.json').read_text())
-          spec = json.loads(pathlib.Path('evidence/prepared.json').read_text()).get('spec') or {}
-          ir_path = pathlib.Path('measurements/ir-diff.json')
-          ir = json.loads(ir_path.read_text()) if ir_path.exists() else None
+          prepared = json.loads(pathlib.Path('evidence/prepared.json').read_text())
+          spec = prepared.get('spec') or {}
+          load = lambda p: json.loads(p.read_text()) if p.exists() else None
+          ir = load(pathlib.Path('measurements/ir-diff.json'))
+          commit_ir = load(pathlib.Path('measurements/ir-commit-diff.json'))
           context_path = pathlib.Path('evidence/inputs.json')
           context = json.loads(context_path.read_text())
           for result in state['results'][context['reported']:]:
@@ -406,6 +464,8 @@ jobs:
               # The IR comparison is for this round's endpoints; attach it only to the result they belong to.
               if ir and (result.get('good_sha'), result.get('bad_sha')) == (spec.get('good_sha'), spec.get('bad_sha')):
                   lines.append(brief(ir))
+              if commit_ir and result.get('first_bad_sha') and result['first_bad_sha'] == prepared.get('first_bad_sha'):
+                  lines.append(brief(commit_ir, label='First bad commit against its parent'))
               subprocess.run(['gh', 'api', f'repos/{repo}/issues/{number}/comments', '--method', 'POST', '--input', '-'],
                              input=json.dumps({'body': '\n\n'.join(lines)}), text=True, check=True)
               context['reported'] += 1
