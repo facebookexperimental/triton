@@ -337,6 +337,14 @@ def bisect_spec(alert):
     }
 
 
+def dashboard_url(alert, case=None):
+    filters = {"tab": "trending", "platform": alert["platform"], "op": alert["op"], "dir": alert["direction"]}
+    if case is not None:
+        filters["dtype"] = case["dtype"]
+        filters.update({f"in.{k}": v for k, v in case["params"].items()})
+    return f"https://facebookexperimental.github.io/triton/bench/#{urlencode(filters)}"
+
+
 def issue_body(alert, repo, run_url, commit_dates):
     date = alert["date"]
     case = min(alert["cases"], key=lambda c: c["ratio"])
@@ -346,9 +354,7 @@ def issue_body(alert, repo, run_url, commit_dates):
         url = f"https://github.com/{repo}/releases/download/tlx-ops-bench/{date}.{alert['platform']}.json"
         return f"[{day(date).isoformat()}]({url})"
 
-    filters = urlencode(
-        {"tab": "trending", "platform": alert["platform"], "op": alert["op"], "dir": alert["direction"]})
-    dashboard = f"https://facebookexperimental.github.io/triton/bench/#{filters}"
+    dashboard = dashboard_url(alert)
     losses = [100 * (1 - case["ratio"]) for case in alert["cases"]]
     loss = f"{min(losses):.1f}% to {max(losses):.1f}%" if len(losses) > 1 else f"{losses[0]:.1f}%"
     direction = {"fwd": "forward", "bwd": "backward"}.get(alert["direction"], alert["direction"])
@@ -378,7 +384,8 @@ def issue_body(alert, repo, run_url, commit_dates):
     for c, inputs in zip(shown[:50], labels[:50]):
         if counts[inputs] > 1:
             inputs += f" · case={c['key'].split('/', 3)[-1]}"
-        inputs = inputs.replace("|", "\\|").replace("`", "")
+        inputs = inputs.replace("|", "\\|").replace("`", "").replace("[", "\\[").replace("]", "\\]")
+        inputs = f"[{inputs}]({dashboard_url(alert, c)})"
         lines.append(
             f"| {SIGNALS[c.get('detector', 'recent')]} | {inputs} | {', '.join(summary_link(d) for d in c['baseline_dates'])} | {c['baseline']:.2f} | {c['current']:.2f} | {(1 - c['ratio']) * 100:.1f}% | {fmt(c['reference_before'])} | {fmt(c['reference_now'])} |"
         )
