@@ -1162,7 +1162,6 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
         m, n, k = kernel_inputs.mnk_hinted()
         num_sms = get_num_sms()
         is_allow_mode = config.triton.tlx_mode == "allow"
-        # The TMA epilogue stages the output; size it by the output's dtype.
         out_elem_bytes = kernel_inputs.out_dtype().itemsize
 
         # Try heuristic config selection first (matches tlx_matmul_ws behavior).
@@ -3548,12 +3547,8 @@ def _blackwell_ws_tma_smem(meta: dict[str, Any], out_elem_bytes: int) -> int:
 def _maybe_fit_blackwell_ws_fused_epilogue(kernel, template_node, epilogue_nodes) -> None:  # type: ignore[no-untyped-def]
     """Keep a Blackwell WS TMA-epilogue config within SMEM after fusion widens its output.
 
-    Configs are validated for the template's own output dtype. A fused epilogue
-    that stores a wider dtype (a bf16 GEMM followed by ``.float()``) doubles the
-    TMA staging buffers, which can push the kernel past the SMEM limit; it then
-    fails to launch, which is fatal when the choice was selected without
-    benchmarking. Narrow the epilogue subtile (halving the staging tile), then
-    shed operand ring stages, until it fits.
+    Configs are validated for the template's own output dtype; a wider fused output (e.g. ``.float()``)
+    can overflow SMEM, which is fatal when the choice was not benchmarked.
     """
     meta = kernel.meta
     if not epilogue_nodes or not _BLACKWELL_WS_META_KEYS <= meta.keys() or not current_target().is_blackwell:

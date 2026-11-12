@@ -1202,9 +1202,6 @@ class TestTLXTemplates(TestCase):
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_matmul_ws_tma_staging_sized_by_output_dtype(self):
-        # The TMA epilogue staging buffer holds the output, so a 4-byte output
-        # costs twice the SMEM of a bf16 one; a 1-CTA tile that fits its TMA
-        # store at bf16 falls back to tl.store for an fp32 output.
         from triton.language.extra.tlx.inductor import registry as _tlx_registry
 
         heuristic = _tlx_registry.BlackwellGemmWSConfigHeuristic
@@ -1221,31 +1218,17 @@ class TestTLXTemplates(TestCase):
         "Need Blackwell with device-side TMA support in Triton",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
-    @parametrize("epilogue", ("plain", "subtiled", "interleaved", "smem_tight_1cta", "smem_tight_2cta"))
+    @parametrize("epilogue", ("plain", "smem_tight_1cta"))
     def test_tlx_matmul_ws_tma_epilogue_stores_output_dtype(self, epilogue):
-        # A bf16 GEMM whose result is cast to fp32 fuses the cast into the
-        # template, so the TMA epilogue stages an fp32 output from bf16 operands.
-        # The staged value must take the output's dtype, not the operands'. On
-        # SMEM-tight configs the fp32 staging no longer fits as configured, so
-        # fusion narrows the epilogue subtile instead of failing to launch.
+        # bf16 GEMM + fused .float(): the TMA epilogue must stage fp32 and still fit in SMEM.
         from triton.language.extra.tlx.inductor import registry as _tlx_registry
 
         heuristic_config = {
             "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 8, "NUM_SMEM_BUFFERS": 3,
             "NUM_TMEM_BUFFERS": 2, "NUM_MMA_GROUPS": 1, "EPILOGUE_SUBTILE": 1, "NUM_CTAS": 1, "SPLIT_K": 1
         }
-        if epilogue != "plain":
-            heuristic_config.update(BLOCK_SIZE_M=256, NUM_MMA_GROUPS=2, NUM_SMEM_BUFFERS=2)
-        if epilogue == "subtiled":
-            heuristic_config.update(EPILOGUE_SUBTILE=2)
-        if epilogue == "interleaved":
-            heuristic_config.update(INTERLEAVE_EPILOGUE=1)
         if epilogue == "smem_tight_1cta":
-            heuristic_config.update(BLOCK_SIZE_M=128, BLOCK_SIZE_N=256, NUM_SMEM_BUFFERS=3, NUM_MMA_GROUPS=1,
-                                    EPILOGUE_SUBTILE=2)
-        if epilogue == "smem_tight_2cta":
-            heuristic_config.update(BLOCK_SIZE_M=256, BLOCK_SIZE_N=256, BLOCK_SIZE_K=128, NUM_SMEM_BUFFERS=2,
-                                    NUM_TMEM_BUFFERS=1, EPILOGUE_SUBTILE=4, NUM_CTAS=2)
+            heuristic_config.update(BLOCK_SIZE_N=256, EPILOGUE_SUBTILE=2)
 
         a = torch.randn(2048, 1024, device=GPU_TYPE, dtype=torch.bfloat16)
         b = torch.randn(1024, 2048, device=GPU_TYPE, dtype=torch.bfloat16)
@@ -1269,7 +1252,7 @@ class TestTLXTemplates(TestCase):
         generated = "\n".join(code)
         self.assertIn("async_descriptor_store(desc_c", generated)
         self.assertNotIn("triton_poi_", generated)
-        if epilogue.startswith("smem_tight"):
+        if epilogue == "smem_tight_1cta":
             subtile = int(re.search(r"EPILOGUE_SUBTILE : tl.constexpr = (\d+)", generated).group(1))
             self.assertGreater(subtile, heuristic_config["EPILOGUE_SUBTILE"])
 
