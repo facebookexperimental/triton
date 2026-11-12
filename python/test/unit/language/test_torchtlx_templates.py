@@ -2556,16 +2556,17 @@ class TestHopperMMTemplate(TestCase):
         def mm_residual(a, b, y, z):
             return (a @ b) * y + z
 
-        with mock.patch.object(sm90, "heuristic_config", lambda *args: [sm90._config(128, 256, 4)]), config.patch({
-                "triton.tlx_mode":
-                "force",
-                "test_configs.autotune_choice_name_regex":
-                "tlx_hopper_gemm_ws",
-                "force_disable_caches":
-                True,
-                "enable_caching_generated_triton_templates":
-                False,
-        }):
+        with mock.patch.object(sm90, "heuristic_config",
+                               lambda *args, **kwargs: [sm90._config(128, 256, 4)]), config.patch({
+                                   "triton.tlx_mode":
+                                   "force",
+                                   "test_configs.autotune_choice_name_regex":
+                                   "tlx_hopper_gemm_ws",
+                                   "force_disable_caches":
+                                   True,
+                                   "enable_caching_generated_triton_templates":
+                                   False,
+                               }):
             actual, code = run_and_get_code(torch.compile(mm_residual), a, b, y, z)
         expected = ((a.float() @ b.float()) * y.float() + z.float()).to(torch.float16)
         torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
@@ -2680,52 +2681,28 @@ class TestHopperMMTemplate(TestCase):
         for load in bias_loads:
             self.assertIn("ymask", load)
 
-    @parametrize("op", ("mm", "addmm_n", "addmm_mn", "mm_gelu"))
     @parametrize("swap_ab", (False, True))
-    @parametrize("cpp_wrapper", (False, True))
-    def test_split_k(self, op, swap_ab, cpp_wrapper):
-        """K split across work units: each writes an fp32 partial to the split-K
-        workspace and _reduce_k_kernel sums them, adds the bias and replays any
-        fused epilogue. M is ragged and K leaves a short last split. The reducer
-        launches with programmatic dependent launch and waits for the partials
-        in-kernel; the GEMM itself does not."""
+    def test_no_split_k(self, swap_ab):
+        """Inductor runs the Hopper template whole-K: a split-K config is
+        replaced by its whole-K counterpart, so no workspace or reducer."""
         from triton.tlx.ops.kernels.mm import sm90
 
         m, n, k = (7, 1000, 64 * 41) if swap_ab else (264, 1000, 64 * 41)
         a, b = _operands((m, n, k), "nt", torch.float16)
-        bias = torch.randn(n if op != "addmm_mn" else (m, n), device=GPU_TYPE, dtype=torch.float16)
-        ref = a.float() @ b.float()
-        if op == "mm":
-            fn, args, expected = torch.mm, (a, b), ref
-        elif op == "mm_gelu":
-            fn, args, expected = (lambda x, y: torch.nn.functional.gelu(x @ y)), (a, b), torch.nn.functional.gelu(ref)
-        else:
-            fn, args, expected = torch.addmm, (bias, a, b), bias.float() + ref
+        bias = torch.randn(n, device=GPU_TYPE, dtype=torch.float16)
         if swap_ab:
             conf = sm90._config(128, 16, 4, 1, 4, 128, True)
             pin = mock.patch.object(sm90, "_swap_heuristic_config", return_value=[conf])
         else:
             conf = sm90._config(128, 128, 4, group_size_m=1, split_k=4)
             pin = mock.patch.object(sm90, "heuristic_config", return_value=[conf])
-        patch = dict(_HOPPER_ADDMM_PATCH)
-        if cpp_wrapper:
-            patch.update({"cpp_wrapper": True, "triton.autotune_at_compile_time": True})
-        with pin, config.patch(patch):
-            actual, code = run_and_get_code(torch.compile(fn), *args)
-        torch.testing.assert_close(actual, expected.half(), atol=3e-2, rtol=3e-2)
+        with pin, config.patch(_HOPPER_ADDMM_PATCH):
+            actual, code = run_and_get_code(torch.compile(torch.addmm), bias, a, b)
+        torch.testing.assert_close(actual, (bias.float() + a.float() @ b.float()).half(), atol=3e-2, rtol=3e-2)
         generated = "\n".join(code)
-        self.assertIn("split_k_ws", generated)
-        self.assertIn("_reduce_k", generated)
-        if cpp_wrapper or op == "mm_gelu":
-            # Generated reducer: it waits in-kernel and only its decorator, not the
-            # GEMM's, compiles for PDL launch.
-            self.assertEqual(generated.count("tl.extra.cuda.gdc_wait()"), 1)
-            self.assertEqual(generated.count("'launch_pdl': True"), 1)
-            if cpp_wrapper:
-                self.assertIn("stream_, true", generated)
-                self.assertIn("stream_, false", generated)
-        else:
-            self.assertIn("USE_PDL=True, launch_pdl=True", generated)
+        self.assertIn(_HOPPER_WS, generated)
+        self.assertNotIn("split_k_ws", generated)
+        self.assertNotIn("_reduce_k", generated)
 
     @parametrize("op", ("mm", "addmm"))
     @parametrize("shape,layout", (
@@ -3303,6 +3280,25 @@ class TestMaybeOverrideBestChoice(TestCase):
         with tlx_config.patch(allow_min_speedup=0.0):
             result = maybe_override_best_choice(tlx_choice, timings)
         self.assertIs(result, tlx_choice)
+
+    def _deferred_pick(self, timings):
+        from triton.language.extra.tlx.inductor import registry
+
+        node = mock.MagicMock()
+        node.choice_timings.return_value = timings
+        best = min(timings, key=timings.__getitem__)
+        with mock.patch.object(registry, "_orig_get_min_choice", return_value=(best, timings[best])):
+            return registry._margin_min_choice(node)
+
+    def test_deferred_pick_applies_margin_over_extern(self):
+        """A MultiTemplateBuffer's final pick honors allow_min_speedup too."""
+        tlx_choice = self._make_choice("triton_tlx_hopper_gemm_small_k_182")
+        extern_choice = self._make_choice("addmm", is_extern=True)
+        timings = {tlx_choice: 0.1130, extern_choice: 0.1208}
+        with tlx_config.patch(allow_min_speedup=1.1):
+            self.assertEqual(self._deferred_pick(timings), (extern_choice, 0.1208))
+        with tlx_config.patch(allow_min_speedup=1.05):
+            self.assertEqual(self._deferred_pick(timings), (tlx_choice, 0.1130))
 
     def _unfused_pick(self, timings, steady=None):
         from triton.language.extra.tlx.inductor import registry
