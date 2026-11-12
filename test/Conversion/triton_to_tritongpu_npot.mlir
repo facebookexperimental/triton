@@ -6,6 +6,8 @@
 // CHECK-DAG: #[[$BLOCKED:.*]] = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 // CHECK-DAG: #[[$MIXED_RADIX:.*]] = #ttg.linear<{register = {{\[\[}}32], [64], [128]], lane = {{\[\[}}1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [384]}>
 // W4-DAG: #[[$MIXED_RADIX:.*]] = #ttg.linear<{register = {{\[\[}}2, 0], [4, 0], [8, 0], [16, 0], [32, 0]], lane = {{\[\[}}0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = {{\[\[}}0, 32], [1, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [96, 64]}>
+// CHECK-DAG: #[[$K96BLOCKED:.*]] = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+// W4-DAG: #[[$K96BLOCKED_W4:.*]] = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 
 // CHECK-LABEL: @copy_384
 // CHECK: tt.load {{.*}} : tensor<384x!tt.ptr<f32>, #[[$MIXED_RADIX]]>
@@ -46,5 +48,20 @@ tt.func @copy_128(%src: !tt.ptr<f32>, %dst: !tt.ptr<f32>) {
   %dsts = tt.splat %dst : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>>
   %dstPtrs = tt.addptr %dsts, %range : tensor<128x!tt.ptr<f32>>, tensor<128xi32>
   tt.store %dstPtrs, %value : tensor<128x!tt.ptr<f32>>
+  tt.return
+}
+
+// A dot over a K the blocked layout cannot cover keeps the converter's
+// operand layouts, but its power-of-two result still takes the dot's
+// blocked layout, as a power-of-two dot's does.
+// CHECK-LABEL: @dot_k96_pow2_result
+// CHECK: tt.dot {{.*}} -> tensor<128x32xf32, #[[$K96BLOCKED]]>
+// W4-LABEL: @dot_k96_pow2_result
+// W4: tt.dot {{.*}} -> tensor<128x32xf32, #[[$K96BLOCKED_W4]]>
+tt.func @dot_k96_pow2_result() {
+  %a = arith.constant dense<1.0> : tensor<128x96xf16>
+  %b = arith.constant dense<2.0> : tensor<96x32xf16>
+  %c = arith.constant dense<0.0> : tensor<128x32xf32>
+  %0 = tt.dot %a, %b, %c : tensor<128x96xf16> * tensor<96x32xf16> -> tensor<128x32xf32>
   tt.return
 }
