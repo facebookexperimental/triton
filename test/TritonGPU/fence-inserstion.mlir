@@ -218,3 +218,38 @@ module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num
     tt.return
   }
 }
+
+// -----
+
+// A register-built B split across the CTA pair gets a cluster-scoped fence.
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, twoCTAs = true>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = true} {
+  // CHECK-LABEL: two_cta_mma_register_operand_fence
+  tt.func public @two_cta_mma_register_operand_fence(%a: !ttg.memdesc<128x64xbf16, #shared, #smem>, %b: tensor<64x64xbf16, #blocked>, %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>) {
+    %true = arith.constant true
+    %b_smem = ttg.local_alloc %b : (tensor<64x64xbf16, #blocked>) -> !ttg.memdesc<64x64xbf16, #shared, #smem>
+    // CHECK: ttng.fence_async_shared {bCluster = true}
+    // CHECK-NEXT: ttng.tc_gen5_mma
+    ttng.tc_gen5_mma %a, %b_smem, %acc, %true, %true {two_cta_register_b, two_ctas} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x64xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+  // A B yielded out of scf.if is traced through both branches.
+  // CHECK-LABEL: two_cta_mma_if_yielded_register_b_fence
+  tt.func public @two_cta_mma_if_yielded_register_b_fence(%a: !ttg.memdesc<128x64xbf16, #shared, #smem>, %b: tensor<64x64xbf16, #blocked>, %c: i1, %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>) {
+    %true = arith.constant true
+    %e = ttg.local_alloc : () -> !ttg.memdesc<64x64xbf16, #shared, #smem, mutable>
+    %r = scf.if %c -> (!ttg.memdesc<64x64xbf16, #shared, #smem, mutable>) {
+      %w = ttg.local_alloc %b : (tensor<64x64xbf16, #blocked>) -> !ttg.memdesc<64x64xbf16, #shared, #smem, mutable>
+      scf.yield %w : !ttg.memdesc<64x64xbf16, #shared, #smem, mutable>
+    } else {
+      scf.yield %e : !ttg.memdesc<64x64xbf16, #shared, #smem, mutable>
+    }
+    // CHECK: ttng.fence_async_shared {bCluster = true}
+    // CHECK-NEXT: ttng.tc_gen5_mma
+    ttng.tc_gen5_mma %a, %r, %acc, %true, %true {two_cta_register_b, two_ctas} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x64xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}

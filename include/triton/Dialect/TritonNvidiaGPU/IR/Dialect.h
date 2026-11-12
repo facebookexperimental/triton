@@ -80,6 +80,9 @@ unsigned getPackedArithFp4Axis(PackedArithOp op);
 
 constexpr static char AttrTwoCTAsName[] = "ttng.two-ctas";
 constexpr static char AttrTwoCTALoadName[] = "two_cta_load";
+// Set by Transform2CTALoads on a 2-CTA MMA whose B it split across the CTA pair
+// from a register-built tile, so each CTA writes its B half from registers.
+constexpr static char AttrTwoCTARegisterBName[] = "two_cta_register_b";
 constexpr static char kPlannedPendingCount[] = "planned_pending_count";
 
 /// Whether the kernel issues paired-CTA (`cta_group::2`) MMA. This is not the

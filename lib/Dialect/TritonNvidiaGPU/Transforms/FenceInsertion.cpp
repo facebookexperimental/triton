@@ -1,3 +1,5 @@
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "triton/Analysis/BufferRegion.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -38,18 +40,30 @@ public:
       return;
     ModuleOp mod = getOperation();
     mod.walk([&](DotOpInterface dotOp) {
+      auto mmaV5 = dyn_cast<MMAv5OpInterface>(dotOp.getOperation());
+      bool twoCtas = mmaV5 && mmaV5.getTwoCtas();
+      bool registerWrittenB = false;
       SmallVector<Operation *> copyRegToSharedOps;
       for (const auto &access : getMemoryAccesses(
                dotOp.getOperation(), ttg::SharedKind::Async, RW::Read)) {
+        size_t numCopies = copyRegToSharedOps.size();
         llvm::append_range(copyRegToSharedOps,
                            findCopyRegToSharedOps(access.value));
+        if (twoCtas && access.value == mmaV5.getB() &&
+            copyRegToSharedOps.size() > numCopies)
+          registerWrittenB = true;
       }
       if (copyRegToSharedOps.empty())
         return WalkResult::advance();
 
       OpBuilder builder(dotOp);
+      // The peer CTA writes its half of a split register-built B, so those
+      // generic writes need a cluster-scoped proxy fence. Other register-written
+      // operands of 2-CTA MMAs keep the CTA-scoped fence for now.
+      bool cluster =
+          registerWrittenB && dotOp->hasAttr(AttrTwoCTARegisterBName);
       auto fence = FenceAsyncSharedOp::create(builder, dotOp.getLoc(),
-                                              /*bCluster=*/false);
+                                              /*bCluster=*/cluster);
       // If there is all the dependencies are outside of the loop try to hoist
       // the fence.
       while (auto loopOp = fence->getParentOfType<LoopLikeOpInterface>()) {
@@ -261,10 +275,39 @@ private:
           }
         }
       }
-      // if it is not an alloc, iterate over the operands.
-      for (auto v : op->getOperands()) {
-        findCopyRegToSharedOps(v, visited, result);
+      if (isa<ttg::LocalAllocOp>(op) ||
+          op->hasTrait<OpTrait::MemDescViewTrait>()) {
+        for (auto v : op->getOperands()) {
+          findCopyRegToSharedOps(v, visited, result);
+        }
+        return;
       }
+      // An undefined buffer is never written.
+      if (isa<ub::PoisonOp>(op))
+        return;
+      if (auto selectOp = dyn_cast<arith::SelectOp>(op)) {
+        findCopyRegToSharedOps(selectOp.getTrueValue(), visited, result);
+        findCopyRegToSharedOps(selectOp.getFalseValue(), visited, result);
+        return;
+      }
+      unsigned resultNum = cast<OpResult>(operand).getResultNumber();
+      if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+        findCopyRegToSharedOps(ifOp.thenYield().getOperand(resultNum), visited,
+                               result);
+        if (ifOp.elseBlock())
+          findCopyRegToSharedOps(ifOp.elseYield().getOperand(resultNum),
+                                 visited, result);
+        return;
+      }
+      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        findCopyRegToSharedOps(forOp.getInitArgs()[resultNum], visited, result);
+        findCopyRegToSharedOps(
+            forOp.getBody()->getTerminator()->getOperand(resultNum), visited,
+            result);
+        return;
+      }
+      // Conservatively assume a register write for other producers.
+      result.insert(op);
       return;
     }
 

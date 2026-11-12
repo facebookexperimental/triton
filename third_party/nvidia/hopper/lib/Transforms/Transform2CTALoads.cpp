@@ -203,6 +203,9 @@ struct Transform2CTALoads
   // B operands (local_alloc / memdesc_trans results) already split by an
   // earlier MMA that shares them.
   DenseSet<Value> splitBOperands;
+  // Half-width B allocs written from registers. Each CTA writes its own half,
+  // so the MMAs reading them need a cluster-scoped fence.
+  DenseSet<Operation *> registerSplitBAllocs;
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
@@ -258,6 +261,18 @@ struct Transform2CTALoads
                     "with BLOCK_N / 2 >= 16)");
       signalPassFailure();
       return;
+    }
+
+    for (auto mma : twoCTAMMAOps) {
+      Value b = mma.getB();
+      while (Operation *def = b.getDefiningOp()) {
+        if (!def->hasTrait<OpTrait::MemDescViewTrait>())
+          break;
+        b = def->getOperand(0);
+      }
+      if (registerSplitBAllocs.contains(b.getDefiningOp()))
+        mma->setAttr(ttng::AttrTwoCTARegisterBName,
+                     UnitAttr::get(mma->getContext()));
     }
 
     // Host-side descriptor arguments are retyped to the half-width block in
@@ -606,6 +621,9 @@ struct Transform2CTALoads
     builder.setInsertionPoint(localAlloc);
     auto newLocalAlloc = ttg::LocalAllocOp::create(builder, localAlloc.getLoc(),
                                                    newMemDescType, allocSrc);
+    // A register transpose makes the alloc a generic write.
+    if (trans)
+      registerSplitBAllocs.insert(newLocalAlloc);
 
     // --- Step 5: Replace uses and clean up ---
     if (memDescTrans) {
