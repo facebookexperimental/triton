@@ -1,11 +1,6 @@
 // RUN: triton-opt %s --nvgpu-partition-scheduling-meta | FileCheck %s
 
-// A GEMM whose dot stays a register tt.dot (mma.sync, e.g. BLOCK_M = 32), with
-// a row reduction in the epilogue. The dot is an MMA even though it is neither
-// MMAv5 nor WGMMA, so this is not a no-MMA reduction kernel: the K loop that
-// carries the accumulator must stay in the dot's partition. Putting the dot in a
-// "reduction" partition and the loop in "epilogue" makes code partitioning
-// recompute the dot in the epilogue partition without waiting on the loads.
+// A register tt.dot with a reduction epilogue keeps its K loop in its partition.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
@@ -60,9 +55,7 @@ tt.func public @gemm_reduction_epilogue_register_mma(
   tt.return
 }
 
-// With a TMA reduce as well as a store in the epilogue, the reduction partition
-// would still split the dot's K loop from the epilogue that reads the
-// accumulator, so the loop is left unspecialized.
+// With a TMA reduce and a store in the epilogue, the loop is not specialized.
 // CHECK-LABEL: @gemm_reduce_and_store_epilogue_register_mma
 // CHECK-NOT: ttg.partition
 // CHECK: tt.return
