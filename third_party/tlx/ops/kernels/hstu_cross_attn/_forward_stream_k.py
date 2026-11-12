@@ -42,6 +42,8 @@ MAX_Z = 64
 PIPE_STAGES = 4
 # Fixed cost of a q tile, in KV blocks, when the cost space charges one (see `_phantom`).
 PHANTOM_BLOCKS = 3
+# A q tile over fewer KV blocks than this is charged as if it had this many (see `_tile_phantom`).
+SHORT_KV_FLOOR_BLOCKS = 8
 LOG2E: tl.constexpr = tl.constexpr(1.4426950408889634)
 _VGPR_ONLY = (("amdgpu-agpr-alloc", "0,0"), )
 
@@ -579,13 +581,21 @@ def _seq_kv_blocks(seq_offsets, z, BLOCK_N: tl.constexpr):
 
 
 @triton.jit
+def _tile_phantom(ph, nb, SHORT_KV_FLOOR_BLOCKS: tl.constexpr):
+    """Fixed cost of one q tile over `nb` KV blocks. A short-KV tile still loads Q, stores its output and runs the
+    unpipelined masked path, so it is charged up to `SHORT_KV_FLOOR_BLOCKS` in all."""
+    return ph + tl.maximum(SHORT_KV_FLOOR_BLOCKS - nb, 0)
+
+
+@triton.jit
 def _owner(v, W, P):
     """Program whose range [p*W//P, (p+1)*W//P) contains cost-space position v."""
     return ((v + 1).to(tl.int64) * P + W - 1) // W - 1
 
 
 @triton.jit
-def _first_unit(tab, v, Z, W, ph, seq_offsets, Z_PAD: tl.constexpr, LOG2_Z_PAD: tl.constexpr, BLOCK_N: tl.constexpr):
+def _first_unit(tab, v, Z, W, ph, seq_offsets, Z_PAD: tl.constexpr, LOG2_Z_PAD: tl.constexpr, BLOCK_N: tl.constexpr,
+                SHORT_KV_FLOOR_BLOCKS: tl.constexpr):
     """First unit at or after cost-space position v (a tile's fixed-cost prefix maps to its first block)."""
     lo = 0
     hi = Z - 1
@@ -596,6 +606,7 @@ def _first_unit(tab, v, Z, W, ph, seq_offsets, Z_PAD: tl.constexpr, LOG2_Z_PAD: 
         hi = tl.where(take, hi, mid - 1)
     rel = v - tl.load(tab + Z_PAD + 2 + lo)
     nb = _seq_kv_blocks(seq_offsets, lo, BLOCK_N)
+    ph = _tile_phantom(ph, nb, SHORT_KV_FLOOR_BLOCKS)
     t = rel // (nb + ph)
     u = tl.load(tab + lo) + t * nb + tl.maximum(rel - t * (nb + ph) - ph, 0)
     return tl.where(v >= W, tl.load(tab + Z_PAD), u)
@@ -636,7 +647,7 @@ def _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_sc
              stride_om: tl.constexpr, stride_oh: tl.constexpr, stride_mm: tl.constexpr, G: tl.constexpr,
              QK_SCALE: tl.constexpr, IS_SOFTMAX: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr,
              BLOCK_N: tl.constexpr, Z_PAD: tl.constexpr, LOG2_Z_PAD: tl.constexpr, PIPELINE: tl.constexpr,
-             PIPE_STAGES: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
+             PIPE_STAGES: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr, SHORT_KV_FLOOR_BLOCKS: tl.constexpr):
     """Process units [u, min(u1, end of u's q tile)) of one q tile; return the next unit."""
     offs_n = _lanes(BLOCK_N)
     offs_d = _lanes(HEAD_DIM)
@@ -726,6 +737,7 @@ def _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_sc
     mid = b0 > 0
     split = mid | (b1 < nb)
     owner = split & (b0 == 0)
+    ph = _tile_phantom(ph, nb, SHORT_KV_FLOOR_BLOCKS)
     v0 = tl.load(tab + Z_PAD + 2 + z) + t_lin * (nb + ph) + ph
     p_lo = tl.where(mid, _owner(v0, W, P).to(tl.int32), p)
     p_hi = tl.where(split, _owner(v0 + nb - 1, W, P).to(tl.int32), p)
@@ -819,6 +831,7 @@ def _hstu_cross_attn_fwd_stream_k(
     LOG2_Z_PAD: tl.constexpr,
     MAX_SEGMENTS: tl.constexpr,
     PHANTOM_BLOCKS: tl.constexpr,
+    SHORT_KV_FLOOR_BLOCKS: tl.constexpr,
     PIPE_STAGES: tl.constexpr,
     RESCALE_THRESHOLD: tl.constexpr,
 ):
@@ -828,28 +841,30 @@ def _hstu_cross_attn_fwd_stream_k(
     p = (pid % 8) * (P // 8) + pid // 8
     # Round-trip the tables through this program's scratch row: values reduced from register tensors are not
     # provably wave-uniform, and every scalar derived from them (pointers, loop bounds) would land in VGPRs.
-    # Row: unit starts [0, Z_PAD), W, 0, cost-space starts [Z_PAD + 2, 2 Z_PAD + 2), cost-space total, phantom.
-    zs, starts, units, _, tiles = _seq_tables(seq_offsets_q, seq_offsets, Z, H, BLOCK_M, BLOCK_N, Z_PAD)
+    # Row: unit starts [0, Z_PAD), W, total fixed cost, cost-space starts [Z_PAD + 2, 2 Z_PAD + 2), cost-space total,
+    # phantom.
+    zs, starts, units, nb, tiles = _seq_tables(seq_offsets_q, seq_offsets, Z, H, BLOCK_M, BLOCK_N, Z_PAD)
     # Charging each q tile a fixed cost evens out the per-segment overhead once most programs cover more than
     # one tile; below that it only moves split points.
     ph = tl.where(2 * tl.sum(tiles, 0) >= 3 * P, PHANTOM_BLOCKS, 0)
-    vstarts = starts + ph * (tl.cumsum(tiles, 0) - tiles)
+    tile_ph = _tile_phantom(ph, nb, SHORT_KV_FLOOR_BLOCKS) * tiles
+    vstarts = starts + tl.cumsum(tile_ph, 0) - tile_ph
     tab = Tab + pid.to(tl.int64) * (2 * Z_PAD + 4)
     first = zs == 0
     tl.store(tab + zs, starts)
     tl.store(tab + Z_PAD + zs * 0, tl.sum(units, 0) + zs * 0, mask=first)
-    tl.store(tab + Z_PAD + 1 + zs * 0, zs * 0, mask=first)
+    tl.store(tab + Z_PAD + 1 + zs * 0, tl.sum(tile_ph, 0) + zs * 0, mask=first)
     tl.store(tab + Z_PAD + 2 + zs, vstarts)
-    tl.store(tab + 2 * Z_PAD + 2 + zs * 0, tl.sum(units + ph * tiles, 0) + zs * 0, mask=first)
+    tl.store(tab + 2 * Z_PAD + 2 + zs * 0, tl.sum(units + tile_ph, 0) + zs * 0, mask=first)
     tl.store(tab + 2 * Z_PAD + 3 + zs * 0, ph + zs * 0, mask=first)
     tl.debug_barrier()
     W = tl.load(tab + 2 * Z_PAD + 2)
     ph = tl.load(tab + 2 * Z_PAD + 3)
     u = (p.to(tl.int64) * W // P).to(tl.int32)
     u1 = ((p + 1).to(tl.int64) * W // P).to(tl.int32)
-    if ph != 0:
-        u = _first_unit(tab, u, Z, W, ph, seq_offsets, Z_PAD, LOG2_Z_PAD, BLOCK_N)
-        u1 = _first_unit(tab, u1, Z, W, ph, seq_offsets, Z_PAD, LOG2_Z_PAD, BLOCK_N)
+    if tl.load(tab + Z_PAD + 1) != 0:
+        u = _first_unit(tab, u, Z, W, ph, seq_offsets, Z_PAD, LOG2_Z_PAD, BLOCK_N, SHORT_KV_FLOOR_BLOCKS)
+        u1 = _first_unit(tab, u1, Z, W, ph, seq_offsets, Z_PAD, LOG2_Z_PAD, BLOCK_N, SHORT_KV_FLOOR_BLOCKS)
 
     kv_offset_bases: tl.constexpr = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0],
                                      [1, 0], [2, 0], [4, 0], [8, 0]]
@@ -865,13 +880,13 @@ def _hstu_cross_attn_fwd_stream_k(
             u = _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_scale, tab, Flags, Z, W, ph,
                          P, p, u, u1, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn, stride_vh,
                          stride_om, stride_oh, stride_mm, G, QK_SCALE, IS_SOFTMAX, HEAD_DIM, BLOCK_M, BLOCK_N, Z_PAD,
-                         LOG2_Z_PAD, True, PIPE_STAGES, RESCALE_THRESHOLD)
+                         LOG2_Z_PAD, True, PIPE_STAGES, RESCALE_THRESHOLD, SHORT_KV_FLOOR_BLOCKS)
     # Rare: ranges spanning more than MAX_SEGMENTS q tiles (short KV sequences).
     while u < u1:
         u = _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_scale, tab, Flags, Z, W, ph, P, p,
                      u, u1, k_buf, v_buf, stride_qm, stride_qh, stride_kn, stride_kh, stride_vn, stride_vh, stride_om,
                      stride_oh, stride_mm, G, QK_SCALE, IS_SOFTMAX, HEAD_DIM, BLOCK_M, BLOCK_N, Z_PAD, LOG2_Z_PAD,
-                     False, PIPE_STAGES, RESCALE_THRESHOLD)
+                     False, PIPE_STAGES, RESCALE_THRESHOLD, SHORT_KV_FLOOR_BLOCKS)
 
 
 _FLAGS = {}
@@ -893,8 +908,9 @@ def _flags(device: torch.device, num_programs: int) -> torch.Tensor:
 
 def stream_k_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, Z: int, num_softmax_heads: int,
                        shared_kv: bool, causal: bool, truncate_method: str, num_cus: int) -> bool:
+    # Under `shared_kv` the caller passes `v` aliasing `k`; the V ring then refetches each K tile, mostly from L2.
     H = q.shape[1]
-    return (not causal and truncate_method == "none" and not shared_kv and 0 < Z <= MAX_Z and num_cus % 8 == 0
+    return (not causal and truncate_method == "none" and 0 < Z <= MAX_Z and num_cus % 8 == 0
             and q.dtype in (torch.float16, torch.bfloat16) and q.shape[2] == HEAD_DIM and v.shape[2] == HEAD_DIM
             and num_softmax_heads in (0, H) and q.stride(2) == 1 and k.stride(2) == 1 and v.stride(2) == 1)
 
@@ -923,5 +939,6 @@ def stream_k_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_offsets:
         stride_mm=M.stride(0) if is_softmax else 0, H=H, G=G, QK_SCALE=alpha * LOG2E.value if is_softmax else alpha,
         IS_SOFTMAX=is_softmax, HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, Z_PAD=z_pad,
         LOG2_Z_PAD=max(1, (z_pad - 1).bit_length()), MAX_SEGMENTS=MAX_SEGMENTS, PHANTOM_BLOCKS=PHANTOM_BLOCKS,
-        PIPE_STAGES=PIPE_STAGES, RESCALE_THRESHOLD=LAZY_RESCALE_THRESHOLD.value, num_warps=8, waves_per_eu=2,
-        llvm_fn_attrs=_VGPR_ONLY, enable_sched_group_barrier_scheduler=False)
+        SHORT_KV_FLOOR_BLOCKS=SHORT_KV_FLOOR_BLOCKS, PIPE_STAGES=PIPE_STAGES,
+        RESCALE_THRESHOLD=LAZY_RESCALE_THRESHOLD.value, num_warps=8, waves_per_eu=2, llvm_fn_attrs=_VGPR_ONLY,
+        enable_sched_group_barrier_scheduler=False)
