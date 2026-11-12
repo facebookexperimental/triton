@@ -1,12 +1,7 @@
 // RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" 2>/dev/null | FileCheck %s
 // RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" -o /dev/null 2>&1 | FileCheck %s --check-prefix=WARN
 
-// A persistent addmm with K == BLOCK_K and data_partition_factor = 2: the bias
-// is folded into each half's accumulator init (tmem_store), so the one bias
-// load feeds the two halves' partitions through separate channels. Buffer
-// creation cannot reload one buffer in two tasks (it asserted, or with
-// asserts off shared one reload across tasks and gave wrong results), so the
-// kernel compiles without warp specialization.
+// DP=2 addmm whose one bias load feeds both halves' accumulator init: no WS.
 
 // WARN: warning: meta autoWS does not support a register value used by consumers in different partitions
 // CHECK-LABEL: @gemm

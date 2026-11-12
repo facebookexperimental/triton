@@ -5623,11 +5623,8 @@ static LogicalResult hoistDescriptorLoadBuffers(triton::FuncOp funcOp) {
   return success();
 }
 
-// Returns a register (tensor) value that feeds consumer ops in different
-// task sets through separate channels in one block, e.g. a bias row loaded
-// once and used by both data-partition halves' accumulator initializers.
-// createBuffer gives such a group a single reload in one consumer task, which
-// is not supported; callers fall back to a non-WS kernel instead.
+// Returns a register value feeding consumers in different task sets through
+// separate channels in one block; createBuffer cannot reload it in each task.
 Value findTensorChannelWithMixedConsumerTasks(triton::FuncOp funcOp) {
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectAsyncChannels(channelsOrigin, funcOp, 1 /*numBuffers*/);
