@@ -6,15 +6,9 @@ name: CUTracer Sanitizer
 # it changes on the NVIDIA GPU it targets (B200 for sm100, H100 for sm90), or a
 # self-test on each GPU when it changes this pipeline (see select_tests.py); a
 # manual run checks the test it names on the GPU it names. CUTracer instruments
-# through NVBit, so AMD kernels are not checked. A manual run on main
-# files each finding as an issue, one per GPU, kernel and source file, labeled
-# cutracer, and closes the issues of kernels it checked that came back clean.
-# It also files one issue per test function that passes without CUTracer but
-# fails twice under random delay; those stay open until closed by hand. Every run
-# but a pull request reduces each such failure with cutracer reduce to the few
-# delayed instructions that still trigger it.
-# Pull requests report in the job summary only, and fail only on such a race
-# in a test function that has no open issue yet.
+# through NVBit, so AMD kernels are not checked. This workflow collects
+# observations without filing or reconciling issues. Pull requests still
+# report in the job summary and fail on an unknown random-delay race.
 #
 # Racecheck is opt-in through the tools input: it reports false-positive
 # shared-memory hazards on mbarrier-synchronized warp-specialized kernels (see
@@ -146,10 +140,8 @@ jobs:
       cuda_arch: sm_100
       tests: ${{ needs.select.outputs.b200 }}
       known_races: ${{ needs.select.outputs.known_b200 }}
-      # The one place that decides whether this run files and closes issues:
-      # only a run of main's code speaks for main. It closes only the issues
-      # of kernels it checked (see findings.py).
-      file_issues: ${{ github.ref == 'refs/heads/main' && inputs.ref == '' }}
+      # Collect observations without filing or reconciling issues.
+      file_issues: false
       ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
       kernel: ${{ inputs.kernel || '' }}
       tools: ${{ inputs.tools || 'synccheck,memcheck' }}
@@ -174,7 +166,7 @@ jobs:
       cuda_arch: sm_90
       tests: ${{ needs.select.outputs.h100 }}
       known_races: ${{ needs.select.outputs.known_h100 }}
-      file_issues: ${{ github.ref == 'refs/heads/main' && inputs.ref == '' }}
+      file_issues: false
       ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
       kernel: ${{ inputs.kernel || '' }}
       tools: ${{ inputs.tools || 'synccheck,memcheck' }}

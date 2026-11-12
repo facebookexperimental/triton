@@ -71,10 +71,12 @@ def test_main_reports_findings_without_failing(fake_env):
 
 def test_main_uses_a_fresh_triton_cache(fake_env, monkeypatch):
     # A cache shared with earlier runs would claim kernels this run never launched.
-    _fake_cutracer(fake_env, {"synccheck": SYNCCHECK_CLEAN, "memcheck": SYNCCHECK_CLEAN})
+    _fake_cutracer(fake_env, {"synccheck": SYNCCHECK_CLEAN, "memcheck": SYNCCHECK_CLEAN}, kernel="mm_kernel")
     monkeypatch.setenv("TRITON_CACHE_DIR", str(fake_env / "shared-cache"))
-    _run(fake_env)
+    _, payload = _run(fake_env)
     assert os.environ["TRITON_CACHE_DIR"] == str(fake_env / "out" / "triton-cache")
+    assert all(result["kernels"] == ["mm_kernel"] for result in payload["results"])
+    assert all(result["elapsed_s"] >= 0 for result in payload["results"])
 
 
 def test_main_fail_on_findings(fake_env):

@@ -38,6 +38,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from findings import failure_list, reconcile_prefixes
@@ -52,6 +53,7 @@ def run_tool(tool: str, cmd: list[str], out: Path, timeout_s: int, triton_cache:
     tool_dir = out / tool
     argv = ["cutracer", "compute-sanitizer", "--tool", tool, "-o", str(tool_dir), "--", *cmd]
     print(f"::group::{tool}: {' '.join(argv)}", flush=True)
+    started = time.perf_counter()
     try:
         returncode = subprocess.run(argv, timeout=timeout_s, check=False).returncode
         timed_out = False
@@ -60,7 +62,10 @@ def run_tool(tool: str, cmd: list[str], out: Path, timeout_s: int, triton_cache:
     print("::endgroup::", flush=True)
     log_path = tool_dir / f"{tool}.log"
     log_text = log_path.read_text(errors="replace") if log_path.is_file() else ""
-    result = {"tool": tool, "returncode": returncode, "timed_out": timed_out, "log": str(log_path)}
+    result = {
+        "tool": tool, "returncode": returncode, "timed_out": timed_out, "log": str(log_path), "elapsed_s":
+        round(time.perf_counter() - started, 2)
+    }
     result.update(classify(tool, log_text) if not timed_out else {"outcome": "infra", "count": None})
     result["report"] = report_lines(log_text)
     result["reports"] = device_reports(log_text) if result["outcome"] == "findings" else []
@@ -104,6 +109,9 @@ def main(argv: list[str] | None = None) -> int:
             result["findings"] = racecheck_findings(Path(result["log"]).read_text(errors="replace"), args.kernel)
         results.append(result)
 
+    kernels = compiled_kernels(triton_cache)
+    for result in results:
+        result["kernels"] = kernels
     (args.out / "results.json").write_text(json.dumps({"kernel": args.kernel, "cmd": cmd, "results": results},
                                                       indent=2))
     summary = render(results, args.kernel, cmd)

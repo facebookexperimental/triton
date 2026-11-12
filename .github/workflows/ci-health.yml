@@ -20,6 +20,8 @@ on:
       - '.github/scripts/ci_health.py'
       - '.github/scripts/ci_health_rules.py'
       - '.github/scripts/ci_health_logs.py'
+      - '.github/scripts/ci_health_sanitizer.py'
+      - '.github/workflows/cutracer.yml'
       - '.github/scripts/ci_health_dashboard.html'
       - '.github/scripts/runner_health.py'
       - '.github/scripts/test_ci_health.py'
