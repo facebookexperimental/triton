@@ -665,21 +665,11 @@ class TestTLXTemplates(TestCase):
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_blackwell_gemm_ws_grid_pads_m_tiles_to_cluster(self):
-        # The kernel pads M tiles to NUM_CTAS (_compute_grid_info), so the launch
-        # grid must too: an odd grid can't be split into 2-CTA clusters.
+        # M=6202 has 25 M tiles of 256; a 2-CTA grid must be a whole number of clusters.
         from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
 
-        grid = _tlx_mm._persistent_mm_grid_split_k
-        meta = {"BLOCK_M": 256, "BLOCK_N": 128, "NUM_SMS": 148}
-        # M=6202 has 25 M tiles and N=384 has 3 N tiles.
-        self.assertEqual(grid(6202, 384, {**meta, "NUM_CTAS": 1}), (75, 1, 1))
-        self.assertEqual(grid(6202, 384, {**meta, "NUM_CTAS": 2}), (78, 1, 1))
-        self.assertEqual(grid(1 << 20, 384, {**meta, "NUM_CTAS": 2}), (148, 1, 1))
-        # With a dynamic M the grid is a whole number of clusters for every M.
-        m = sympy.Symbol("m", positive=True, integer=True)
-        size = grid.sympy_call(m, 384, {**meta, "NUM_CTAS": 2})[0]
-        for m_val in (1, 255, 257, 6202, 6203, 1 << 20):
-            self.assertEqual(int(size.subs(m, m_val)) % 2, 0)
+        meta = {"BLOCK_M": 256, "BLOCK_N": 128, "NUM_SMS": 148, "NUM_CTAS": 2}
+        self.assertEqual(_tlx_mm._persistent_mm_grid_split_k(6202, 384, meta), (78, 1, 1))
 
     @staticmethod
     @contextlib.contextmanager

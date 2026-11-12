@@ -27,9 +27,7 @@ def _persistent_mm_grid_split_k(*args, cdiv, min):
     meta = args[-1]
     M = args[-3]
     N = args[-2]
-    # Pad M tiles to the cluster width, as the kernel's _compute_grid_info does,
-    # so a 2-CTA grid is a whole number of clusters. Unpadded, a dynamic M can
-    # give an odd grid, which fails to launch ("cluster misconfiguration").
+    # Pad M tiles to the cluster width like _compute_grid_info; a partial cluster fails to launch.
     num_ctas = meta.get("NUM_CTAS", 1)
     num_pid_m = cdiv(cdiv(M, meta["BLOCK_M"]), num_ctas) * num_ctas
     num_mn_tiles = num_pid_m * cdiv(N, meta["BLOCK_N"])
