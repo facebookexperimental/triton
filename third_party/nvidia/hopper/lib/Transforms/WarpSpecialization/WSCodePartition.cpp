@@ -5988,11 +5988,8 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     Operation *firstStore;
     int64_t stagingBufferId;
   };
-  // A staging reuse that Step 7.5 cannot guard must not be realized: drop it
-  // so the staging keeps its own SMEM (it may then not fit, which fails the
-  // compile instead of racing). Drop by buffer.id: all stagings of one
-  // buffer.id share one allocation (and Step 5 replaces the allocs), so the
-  // whole group keeps or loses the alias together.
+  // A reuse Step 7.5 cannot guard is dropped rather than left racing. Drop by
+  // buffer.id: stagings that share a buffer.id share one allocation.
   auto dropStagingReuse = [&](int64_t stagingBufferId, StringRef reason) {
     funcOp.walk([&](ttg::LocalAllocOp alloc) {
       auto idAttr = alloc->getAttrOfType<IntegerAttr>("buffer.id");
@@ -6005,12 +6002,8 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
       alloc->removeAttr("allocation.reuseTarget");
     });
   };
-  // mergeStagingReuseIntoHost only aliases a staging onto a host that is
-  // neither a TMA staging buffer nor itself a reuser; any other reuseTarget is
-  // dropped there and never shares SMEM. (Stagings that do share SMEM with
-  // each other do so through a common buffer.id reuse group, whose members are
-  // ordered by the group's intra-iteration and wrap-around acquires, not
-  // through allocation.reuseTarget.) Only realizable pairs need the Step 7.5
+  // mergeStagingReuseIntoHost only realizes a reuse onto a host that is
+  // neither a staging buffer nor a reuser, so only those pairs need the
   // cross-tile edge.
   DenseSet<int64_t> reuseHostIds;
   funcOp.walk([&](ttg::LocalAllocOp alloc) {
@@ -6020,9 +6013,8 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     if (auto attr = alloc->getAttrOfType<IntegerAttr>("buffer.id"))
       reuseHostIds.insert(attr.getInt());
   });
-  // Stagings with one buffer.id share one allocation, which Step 5 gives the
-  // reuseTarget of one of them. So guard per group: if any member names a
-  // realizable host, every member's stores read that host's SMEM.
+  // Guard per buffer.id group: if any member names a realizable host, every
+  // member's stores read that host's SMEM.
   DenseMap<int64_t, int64_t> groupHostId;
   funcOp.walk([&](ttg::LocalAllocOp alloc) {
     auto reuseAttr =
@@ -6190,17 +6182,15 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     }
 
     if (matched && !consistent) {
-      // One coarse token cannot order pairs that span several loops or
-      // tasks; do not realize any of them rather than leave some unguarded.
+      // One coarse token cannot order pairs that span several loops or tasks.
       for (int64_t stagingId : guardedStagings)
         dropStagingReuse(stagingId,
                          "reuse pairs span multiple outer loops / load / "
                          "drained-store tasks, so no single cross-tile "
                          "barrier can guard them");
     } else if (matched && outerLoop && loadTask == drainedStoreTask) {
-      // Program order in one task does not order an async TMA store's SMEM
-      // reads before the next tile's TMA load, and the cross-partition token
-      // below needs two tasks.
+      // Program order does not order an async TMA store's SMEM reads before
+      // the next tile's TMA load, and the token below needs two tasks.
       for (int64_t stagingId : guardedStagings)
         dropStagingReuse(stagingId, "the host is loaded by the task that "
                                     "drains the staging, so no cross-tile "
@@ -6223,22 +6213,16 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
                            "cannot derive the persistent-loop iteration for "
                            "the cross-tile barrier");
       } else {
-        // The release must come after the staging stores have finished
-        // reading SMEM. Store-wait pipelining can defer a store's wait into
-        // the next iteration, so a release at the bottom of the body could
-        // fire while the last TMA store still reads the aliased SMEM. Release
-        // on the wait of the last TMA store instead: it moves with that wait,
-        // and TMA stores drain in order, so all earlier stores have drained
-        // too. Only a wait directly in the body that follows every TMA store
-        // of the task qualifies (a nested wait could run conditionally or
-        // several times per tile).
+        // Release on the last TMA store's wait, not at the body bottom:
+        // store-wait pipelining can defer that wait into the next iteration,
+        // and TMA stores drain in order. Only a top-level wait after every TMA
+        // store of the task qualifies (a nested wait may run conditionally).
         auto isDrainedStoreTaskOp = [&](Operation *op) {
           auto taskIds = getAsyncTaskIds(op);
           return taskIds.size() == 1 && taskIds.front() == drainedStoreTask;
         };
-        // A store nested in a region op (e.g. the collective scf.if of a
-        // CLC loop) is drained within that op when its wait is in the body
-        // too: pipelining only defers waits of top-level ops.
+        // Pipelining only defers waits of top-level ops, so a nested store
+        // (e.g. in a CLC collective scf.if) waited in the body is drained.
         bool hasTopLevelStore = false;
         bool nestedStoresWaitedInBody = true;
         auto isWaitedInBody = [&](Operation *store) {
@@ -6336,9 +6320,6 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
             acqLoc, reuseToken, idxPhase.first, idxPhase.second,
             WSBarrierAttr::forDstTask(ctx, drainedStoreTask).build(ctx));
 
-        // Release on the chosen store wait (see above), which it moves with
-        // if store-wait pipelining defers it, or, when every store is nested
-        // and waited inside the body, at the bottom of the body.
         Operation *term = outerBody->getTerminator();
         Operation *relPoint =
             lastStoreWait ? lastStoreWait.getOperation() : term;

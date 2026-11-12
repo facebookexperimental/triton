@@ -185,7 +185,6 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     // multiple producers or consumers? Check if num_warps agree.
     unsigned producerWarps = 0, consumerWarps = 0;
     SmallVector<Operation *> usersForToken;
-    // The token value and the partition arguments it is captured as.
     SmallPtrSet<Value, 4> tokenValues;
     tokenValues.insert(createTokenOp.getResult());
     for (OpOperand &use : createTokenOp.getResult().getUses()) {
@@ -327,8 +326,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
-        // A wait can release several tokens; lower only the entries of the
-        // token being processed and keep the others for their own token.
+        // A wait can release several tokens; lower only this token's entries.
         Value truePred = arith::ConstantIntOp::create(builder, loc, 1, 1);
         // Snapshot the entries: addBarrier below reallocates the operands.
         SmallVector<Value> toks(op.getNvwsTokens());

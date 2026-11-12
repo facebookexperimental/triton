@@ -1,11 +1,8 @@
 // RUN: triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=1 smem-budget=232448 generate-subtiled-region=true" 2>/dev/null | FileCheck %s
 // RUN: triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=1 smem-budget=232448 generate-subtiled-region=true" 2>&1 >/dev/null | FileCheck %s --check-prefix=WARN
 
-// Same kernel as ws_staging_reuse_dp_war_barrier.mlir, compiled with subtiled
-// regions. The planner still aliases a TMA staging buffer onto an fp32 operand
-// landing buffer, but the staging's users are subtiled regions, so Step 7.5
-// cannot place a cross-tile barrier for it. Such a reuse must not be realized:
-// the staging keeps its own SMEM instead of racing with the next tile's load.
+// Subtiled-region staging users give Step 7.5 nothing to guard, so the reuse
+// must be dropped.
 
 // WARN: warning: [staging-reuse] cannot find one local_store and one drained-store task to guard the reuse; staging keeps its own region
 // CHECK-NOT: ttg.memdesc_reinterpret
