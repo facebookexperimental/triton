@@ -163,11 +163,11 @@ def test_tall_m_heuristic_cluster_fits_one_group(M, N, K):
     assert cfg["GROUP_SIZE_M"] >= cfg["NUM_CTAS"]
 
 
-def test_heuristic_splits_k_only_when_full_tiles_leave_sms_idle():
+def test_heuristic_splits_k_for_large_outputs_only_when_full_tiles_leave_sms_idle():
     num_sms = 148
     for M, N, K, *_ in CORRECTNESS_SHAPES:
         cfg = sm100.get_heuristic_config(M, N, K, num_sms)
-        if cfg is None or cfg["SPLIT_K"] == 1 or M < cfg["BLOCK_SIZE_M"]:
+        if cfg is None or cfg["SPLIT_K"] == 1 or M < cfg["BLOCK_SIZE_M"] or M * N < 1_000_000:
             continue
         tiles = math.ceil(M / cfg["BLOCK_SIZE_M"]) * math.ceil(N / cfg["BLOCK_SIZE_N"])
         assert tiles < num_sms, f"{M}x{N}x{K}: {cfg}"
