@@ -53,6 +53,7 @@ jobs:
       contents: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -65,7 +66,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: .ci
-          sparse-checkout: .github/actions
+          sparse-checkout: |
+            .github/actions
+            .github/scripts
       - name: Set up test environment
         uses: ./.ci/.github/actions/setup-test-env
         with:
@@ -95,6 +98,7 @@ jobs:
           # The harness writes its JSON to a fixed path that outlives the job on
           # a self-hosted runner.
           rm -rf /tmp/tlx_benchmark
+          rm -f "${RUNNER_TEMP}/tlx-ops-bench.xml"
           # TorchTLX benches need Meta's Inductor patches; the per-platform
           # *-torchtlx-test jobs already run them.
           # --timeout caps each bench, so one slow bench fails on its own and
@@ -117,11 +121,13 @@ jobs:
         if: always()
         uses: ./.ci/.github/actions/parse-test-failures
         with:
+          scripts: .ci/.github/scripts
           workflow: ${{ github.workflow }}
           job: ${{ inputs.platform }}-tlx-ops-bench
           failed: ${{ steps.run_bench.outcome != 'success' }}
           bucket: ${{ inputs.platform }}-tlx-ops-bench-job-failed
           junit: ${{ runner.temp }}/tlx-ops-bench.xml
+          completed-junit: ${{ (steps.run_bench.outcome == 'success' || steps.run_bench.outcome == 'failure') && format('{0}/tlx-ops-bench.xml', runner.temp) || '' }}
           budget: ${{ runner.temp }}/tlx-ops-bench.xml=120
       # Records the kernel specializations the suite compiles, for the CPU codegen trace on PRs
       # (tlx-codegen-trace.yml). Runs after the results are uploaded, so a failure here loses nothing.
@@ -249,4 +255,30 @@ jobs:
       workflow_name: ${{ github.workflow }}
       job_name: ${{ inputs.platform }}-tlx-ops-bench
       failures: ${{ needs.bench.outputs.failures }}
+      recovery: ${{ needs.bench.outputs.recovery }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  group:
+    needs: [bench, report, reconcile]
+    if: always() && (needs.bench.result == 'success' || needs.bench.result == 'failure')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ci-parent-${{ inputs.sha }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+      - name: Group new benchmark failures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREFIX: ${{ format('[nightly] {0} / {1}-tlx-ops-bench / ', github.workflow, inputs.platform) }}
+          SHA: ${{ inputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 .github/scripts/failure_issues.py group --prefix "$PREFIX" --labels ci_issues,nightly \
+            --sha "$SHA" --branch main --run-url "$RUN_URL"

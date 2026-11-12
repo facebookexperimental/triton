@@ -153,6 +153,7 @@ jobs:
     timeout-minutes: 60
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -178,12 +179,14 @@ jobs:
           wheel-filename: ${{ inputs.wheel_filename || needs.build.outputs.wheel_filename }}
           wheel-sha256: ${{ inputs.wheel_sha256 || needs.build.outputs.wheel_sha256 }}
       - name: Run codegen tests
+        id: run_codegen_tests
         if: fromJSON(needs.select.outputs.cpu_plan).codegen.files[0] != null
         uses: ./.github/actions/run-selected-tests
         with:
           suite: ${{ toJSON(fromJSON(needs.select.outputs.cpu_plan).codegen) }}
           junit: /tmp/cpu-codegen.xml
       - name: Run Gluon frontend tests
+        id: run_gluon_tests
         if: fromJSON(needs.select.outputs.cpu_plan).gluon.files[0] != null
         uses: ./.github/actions/run-selected-tests
         with:
@@ -196,6 +199,7 @@ jobs:
         with:
           workflow: Meta Triton CPU Tests
           job: cpu-tests
+          completed-junit: ${{ (steps.run_codegen_tests.outcome == 'success' || steps.run_codegen_tests.outcome == 'failure') && '/tmp/cpu-codegen.xml' || '' }} ${{ (steps.run_gluon_tests.outcome == 'success' || steps.run_gluon_tests.outcome == 'failure') && '/tmp/cpu-gluon.xml' || '' }}
           failed: ${{ job.status != 'success' }}
           bucket: cpu-job-failed
           junit: ${{ fromJSON(needs.select.outputs.cpu_plan).codegen.files[0] != null && '/tmp/cpu-codegen.xml' || '' }} ${{ fromJSON(needs.select.outputs.cpu_plan).gluon.files[0] != null && '/tmp/cpu-gluon.xml' || '' }}
@@ -219,6 +223,7 @@ jobs:
       job: cpu-tests
       result: ${{ needs.cpu-tests.result }}
       failures: ${{ needs.cpu-tests.outputs.failures }}
+      recovery: ${{ needs.cpu-tests.outputs.recovery }}
       sha: ${{ needs.select.outputs.sha }}
 
   gpu-tests:

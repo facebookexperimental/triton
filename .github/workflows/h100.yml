@@ -42,6 +42,7 @@ jobs:
       actions: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -111,6 +112,7 @@ jobs:
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
           job: h100-tlx-test
+          completed-junit: ${{ (steps.run_core_tests.outcome == 'success' || steps.run_core_tests.outcome == 'failure') && '/tmp/tlx-core.xml' || '' }} ${{ (steps.run_correctness_tests.outcome == 'success' || steps.run_correctness_tests.outcome == 'failure') && '/tmp/tlx-correctness.xml' || '' }}
           failed: ${{ job.status != 'success' }}
           bucket: h100-tlx-job-failed
           junit: ${{ fromJSON(inputs.plan).core.files[0] != null && '/tmp/tlx-core.xml' || '' }} ${{ fromJSON(inputs.plan).correctness.files[0] != null && '/tmp/tlx-correctness.xml' || '' }}
@@ -131,6 +133,7 @@ jobs:
       actions: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -166,6 +169,7 @@ jobs:
         env:
           TEST_SUITE: ${{ toJSON(fromJSON(inputs.plan).runtime) }}
         run: |
+          rm -f /tmp/runtime-unit.xml
           . "${SETUP_SCRIPT}"
           . ./.ci/tritonbench/setup-ld-library.sh
           python .github/scripts/run_selected_tests.py --junit /tmp/runtime-unit.xml
@@ -176,6 +180,7 @@ jobs:
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
           job: h100-runtime-test
+          completed-junit: ${{ (steps.run_runtime_tests.outcome == 'success' || steps.run_runtime_tests.outcome == 'failure') && '/tmp/runtime-unit.xml' || '' }}
           failed: ${{ job.status != 'success' }}
           bucket: h100-runtime-job-failed
           junit: /tmp/runtime-unit.xml
@@ -197,6 +202,7 @@ jobs:
       job: h100-tlx-test
       result: ${{ needs.h100-tlx-test.result }}
       failures: ${{ needs.h100-tlx-test.outputs.failures }}
+      recovery: ${{ needs.h100-tlx-test.outputs.recovery }}
       sha: ${{ inputs.ref }}
       platform: h100
 
@@ -213,5 +219,6 @@ jobs:
       job: h100-runtime-test
       result: ${{ needs.h100-runtime-test.result }}
       failures: ${{ needs.h100-runtime-test.outputs.failures }}
+      recovery: ${{ needs.h100-runtime-test.outputs.recovery }}
       sha: ${{ inputs.ref }}
       platform: h100

@@ -30,6 +30,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 from classify_failure import classify
+from test_results import encode_recovery
 
 # Matches a single trailing bracketed parametrization suffix: test_x[a-b] -> test_x
 PARAM_SUFFIX = re.compile(r"\[.*\]$")
@@ -249,9 +250,46 @@ def build_bucket_item(bucket, workflow, job):
     }
 
 
+def recovery_results(paths, expected, budgets, threshold, failed, bucket):
+    passed, not_passed, resolved = set(), set(), []
+    roots = {}
+    for path in paths:
+        try:
+            roots[path] = ET.parse(path).getroot()
+        except (OSError, ET.ParseError):
+            continue
+        for tc in roots[path].iter("testcase"):
+            rid = raw_id(tc.get("classname", ""), tc.get("name", ""))
+            if tc.find("failure") is not None or tc.find("error") is not None or tc.find("skipped") is not None:
+                not_passed.add(rid)
+            else:
+                passed.add(rid)
+    passed -= not_passed
+    for path, minutes in budgets:
+        if path not in roots or minutes <= 0:
+            continue
+        cases = list(roots[path].iter("testcase"))
+        seconds = suite_seconds(path)
+        if cases and any(raw_id(tc.get("classname", ""), tc.get("name", "")) in passed for tc in cases):
+            if any(tc.find("failure") is not None or tc.find("error") is not None for tc in cases):
+                continue
+            if seconds is not None and seconds < threshold * minutes * 60:
+                name = os.path.basename(path).removesuffix(".xml")
+                resolved.append(f"slow-step:{name}")
+    complete = bool(expected) and set(roots) == set(expected) and all(
+        list(root.iter("testcase")) and all(
+            int(suite.get("tests", "0")) == len(suite.findall("testcase"))
+            for suite in root.iter("testsuite"))
+        for root in roots.values())
+    if complete and not failed and passed:
+        resolved.extend([bucket, "pytest-junit-missing", "gpu-unhealthy"])
+    return encode_recovery(passed, resolved, bool(complete))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--junit", nargs="+", required=True, help="JUnit XML file(s)")
+    parser.add_argument("--completed-junit", nargs="*", default=[], help="XML from completed test steps only")
     parser.add_argument("--workflow", required=True, help="Workflow name (for title)")
     parser.add_argument("--job", required=True, help="Job name (for title)")
     parser.add_argument("--output-name", default="failures", help="GITHUB_OUTPUT key to write")
@@ -305,10 +343,13 @@ def main():
     # ({workflow, job, normalized_id, status, sha, run_id}) to a Scuba table.
     # Feasible on the self-hosted GPU runners (scribe reachable); skip on the
     # GitHub-hosted ubuntu-latest LIT job, which has no Scuba access.
+    recovery = recovery_results(args.completed_junit, args.junit, [parse_budget(b)
+                                                                   for b in args.budget], args.slow_threshold,
+                                args.failed, args.bucket) if not args.gpu_unhealthy else encode_recovery()
     out_path = os.environ.get("GITHUB_OUTPUT")
     if out_path:
         with open(out_path, "a", encoding="utf-8") as fh:
-            fh.write(f"{args.output_name}={payload}\n")
+            fh.write(f"{args.output_name}={payload}\nrecovery={recovery}\n")
     # Always echo to stdout for log visibility / local debugging.
     print(payload)
 
