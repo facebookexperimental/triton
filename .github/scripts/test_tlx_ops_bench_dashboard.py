@@ -1,7 +1,13 @@
 import json
 import math
+import os
+import re
+import shutil
+import subprocess
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
+
+import pytest
 
 import tlx_ops_bench_dashboard as dash
 
@@ -162,3 +168,61 @@ def test_render_publishes_the_measured_overview_diagram(tmp_path):
     assert 'src="tlx_ops_bench_overview.svg"' in (output / "index.html").read_text()
     svg = ET.parse(output / "tlx_ops_bench_overview.svg")
     assert "B200 · 2026-11-09" in list(svg.getroot().itertext())
+
+
+@pytest.mark.parametrize("input_value,group,has_reference", [
+    ("mxfp8:layer:4096x256:default:q1:j0", "none", False),
+    ("mxfp8:layer:4096x256:default:q1:j0", "dir", False),
+    ("plain:layer:128x384:default:q1:j0", "none", True),
+    ("", "none", True),
+])
+def test_chart_units_follow_the_selected_measurements(tmp_path, input_value, group, has_reference):
+    chrome = os.environ.get("CHROME_BIN") or shutil.which("chromium") or shutil.which("google-chrome")
+    if not chrome:
+        pytest.skip("Chromium is needed to check rendered chart units")
+    cases = [{
+        "key": f"norm_fwd/sm100/{family}",
+        "params": {"input": value},
+        "direction": "fwd",
+        "dtype": "bf16",
+        "status": "ok",
+        "speedup": ratio,
+        "tlx_tflops": throughput,
+        "ref_tflops": reference,
+        "notes": [],
+    } for family, value, ratio, throughput, reference in [
+        ("mxfp8", "mxfp8:layer:4096x256:default:q1:j0", None, 0.8196, None),
+        ("plain", "plain:layer:128x384:default:q1:j0", 1.5, 3.0, 2.0),
+    ]]
+    night = bench_night("20261111", "a" * 40)
+    night.update(schema=2, ops={"norm_fwd": {"ref": "torch (plain/softmax); CUDA graphs", "cases": cases}})
+    source = tmp_path / "summaries"
+    source.mkdir()
+    (source / "20261111.b200.json").write_text(json.dumps(night))
+    site = tmp_path / "site"
+    dash.render(SimpleNamespace(source=str(source), outdir=str(site)))
+    url = (site / "index.html").as_uri() + f"#tab=trending&platform=b200&op=norm_fwd&dir=fwd&group={group}"
+    if input_value:
+        url += f"&in.input={input_value}"
+    result = subprocess.run([
+        chrome,
+        "--headless",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-background-networking",
+        f"--user-data-dir={tmp_path / 'chrome'}",
+        "--virtual-time-budget=1500",
+        "--dump-dom",
+        url,
+    ], capture_output=True, text=True, check=True, timeout=30)
+    trend = "Geomean speedup per night" if has_reference else "norm_fwd: TLX TFLOP/s per night"
+    if group == "dir":
+        trend += ", by direction"
+    chart = re.search(r'<svg[^>]*aria-label="' + re.escape(trend) + r'"[^>]*>(.*?)</svg>', result.stdout, re.S)
+    assert chart is not None
+    assert re.search(r'<circle[^>]*cx="[\d.]+"[^>]*cy="[\d.]+"', chart.group(1))
+    if not has_reference:
+        assert "0.820" in chart.group(1)
+    per_case = "TLX vs reference" if has_reference else "TLX"
+    assert f'aria-label="norm_fwd: {per_case} TFLOP/s per case, latest night"' in result.stdout
+    assert not re.search(r'(?:cx|cy|points|x|y)="[^"]*(?:NaN|Infinity)', result.stdout)

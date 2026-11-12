@@ -22,6 +22,8 @@ from triton.tlx.ops.kernels.mm.gfx950 import (
     tl.assume(stride_bn > 0)
 
     TILE: tl.constexpr = 32
+    K_BLOCKS: tl.constexpr = {{size("A", 1)}} // BLOCK_K
+    HAS_M_TAIL: tl.constexpr = {{size("A", 0)}} % 256 != 0
     N_GROUP_FRAGMENTS: tl.constexpr = 4
 {% if BLOCK_N == 160 %}
     TILE_SPEC: tl.constexpr = (256, 160, 128, 256, 2)
@@ -143,7 +145,9 @@ from triton.tlx.ops.kernels.mm.gfx950 import (
         stride_ak,
         stride_bk,
         stride_bn,
+        M,
         first_tile,
+        HAS_M_TAIL,
         TILE_SPEC,
     )
     prefetched_k0 = _gfx950_persistent_global_loads(
@@ -168,6 +172,7 @@ from triton.tlx.ops.kernels.mm.gfx950 import (
             mma,
             dot_a,
             dot_b,
+            K_BLOCKS,
             PIPELINE_SPEC,
             TILE_SPEC,
         )
@@ -181,7 +186,9 @@ from triton.tlx.ops.kernels.mm.gfx950 import (
                     stride_ak,
                     stride_bk,
                     stride_bn,
+                    M,
                     tile_id + 1,
+                    HAS_M_TAIL,
                     TILE_SPEC,
                 )
             )

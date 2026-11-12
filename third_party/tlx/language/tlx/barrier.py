@@ -328,8 +328,19 @@ def named_barrier_wait(
         arrive_count (int): Total number of threads required to flip the
             barrier phase, including threads executing both `named_barrier_wait`
             and `named_barrier_arrive`. Both calls must use the same count.
+
+    On AMD, only gfx1250 and only the workgroup barrier are supported:
+    ``bar`` must be 0 and ``arrive_count`` must cover every thread of the
+    workgroup. An arrive followed by a wait forms a split workgroup barrier:
+    shared-memory accesses before the arrive are visible after the wait, and
+    independent work between them overlaps the rendezvous. The pair must be in
+    the same block with no shared-memory access or other barrier between them.
     """
 
+    if _semantic.builder.options.backend_name == "hip":
+        _validate_amd_workgroup_barrier(bar, arrive_count, _semantic)
+        _semantic.builder.create_amd_workgroup_barrier_wait()
+        return
     _validate_named_barrier_id(bar)
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
     arrive_count_handle = _semantic._convert_elem_to_ir_value(arrive_count, require_i64=False)
@@ -354,11 +365,40 @@ def named_barrier_arrive(
         arrive_count (int): Total number of threads required to flip the
             barrier phase, including threads executing both `named_barrier_wait`
             and `named_barrier_arrive`. Both calls must use the same count.
+
+    On AMD, only gfx1250 and only the workgroup barrier are supported:
+    ``bar`` must be 0 and ``arrive_count`` must cover every thread of the
+    workgroup. An arrive followed by a wait forms a split workgroup barrier:
+    shared-memory accesses before the arrive are visible after the wait, and
+    independent work between them overlaps the rendezvous. The pair must be in
+    the same block with no shared-memory access or other barrier between them.
     """
+    if _semantic.builder.options.backend_name == "hip":
+        _validate_amd_workgroup_barrier(bar, arrive_count, _semantic)
+        _semantic.builder.create_amd_workgroup_barrier_signal()
+        return
     _validate_named_barrier_id(bar)
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
     arrive_count_handle = _semantic._convert_elem_to_ir_value(arrive_count, require_i64=False)
     _semantic.builder.create_named_barrier_arrive(bar_handle, arrive_count_handle)
+
+
+def _validate_amd_workgroup_barrier(bar, arrive_count, _semantic) -> None:
+    barrier_id = tl._unwrap_if_constexpr(bar)
+    count = tl._unwrap_if_constexpr(arrive_count)
+    options = _semantic.builder.options
+    # Older AMD targets have no s_barrier_signal / s_barrier_wait. The arch
+    # string can carry target features (e.g. "gfx1250:sramecc+:xnack-"), so
+    # compare only the processor name before the first ":".
+    arch = options.arch.split(":", 1)[0]
+    if arch != "gfx1250":
+        raise ValueError(f"tlx.named_barrier_arrive / named_barrier_wait require gfx1250 on AMD, got {arch}; "
+                         "use tlx.workgroup_barrier() for a full workgroup barrier")
+    num_threads = options.num_warps * options.warp_size
+    if not isinstance(barrier_id, int) or barrier_id != 0:
+        raise ValueError("AMD named barriers only support the workgroup barrier (ID 0)")
+    if not isinstance(count, int) or count != num_threads:
+        raise ValueError(f"AMD workgroup barrier arrive_count must be the workgroup size ({num_threads})")
 
 
 def _validate_named_barrier_id(bar) -> None:

@@ -217,6 +217,10 @@ Value createInstDescriptor(ConversionPatternRewriter &rewriter,
     uint32_t shift : 2;
   };
   auto getTypeEncoding = [&](Type type) {
+    if (isa<Float6E2M3FNType>(type))
+      return 3;
+    if (isa<Float6E3M2FNType>(type))
+      return 4;
     if (type.isF16())
       return 0;
     if (type.isBF16())
@@ -240,8 +244,8 @@ Value createInstDescriptor(ConversionPatternRewriter &rewriter,
   desc.transposeB = transposeB;
   desc.M = M >> 4;
   desc.N = N >> 3;
-  desc.aType = getTypeEncoding(op.getA().getType().getElementType());
-  desc.bType = getTypeEncoding(op.getB().getType().getElementType());
+  desc.aType = getTypeEncoding(op.getAElementType());
+  desc.bType = getTypeEncoding(op.getBElementType());
   Type dstElType = op.getD().getType().getElementType();
   assert(dstElType.isF16() || dstElType.isF32() || dstElType.isInteger(32));
   if (dstElType.isInteger(32)) {
@@ -836,12 +840,13 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
   SmallVector<Value> commitDescs = op.getCompletionDescs();
 
   DotConversion dot;
-  Type srcElementTy = aTensorTy.getElementType();
+  Type srcElementTy = op.getAElementType();
   if (srcElementTy.isF16() || srcElementTy.isBF16()) {
     dot.kind = "f16";
   } else if (srcElementTy.isF32()) {
     dot.kind = "tf32";
-  } else if (llvm::isa<Float8E4M3FNType, Float8E5M2Type>(srcElementTy)) {
+  } else if (isa<Float6E2M3FNType, Float6E3M2FNType, Float8E4M3FNType,
+                 Float8E5M2Type>(srcElementTy)) {
     dot.kind = "f8f6f4";
   } else if (dTensorTy.getElementType().isInteger(32)) {
     // PTX uses "i8" for integer operations (both signed and unsigned)
@@ -854,9 +859,11 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
   dot.blockK = aTensorTy.getDimSize(1);
   auto tensorMemAttr =
       cast<ttng::TensorMemoryEncodingAttr>(dTensorTy.getEncoding());
+  bool hasFp6 = isa<Float6E2M3FNType, Float6E3M2FNType>(srcElementTy) ||
+                isa<Float6E2M3FNType, Float6E3M2FNType>(op.getBElementType());
   dot.mmaSizeK = ttng::getTcgen05InstrK(
       aTensorTy.getElementTypeBitWidth(), tensorMemAttr.getBlockM(), dot.blockK,
-      targetFeatures.supports2xFp8Tcgen05MMA());
+      !hasFp6 && targetFeatures.supports2xFp8Tcgen05MMA());
 
   dot.numBitsPerElementA = aTensorTy.getElementTypeBitWidth();
   dot.numBitsPerElementB = bTensorTy.getElementTypeBitWidth();
@@ -975,6 +982,8 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
   unsigned instN = std::min<unsigned>(mmaSizeN, getShapePerCTA(dTensorTy)[1]);
 
   if (!targetFeatures.supports4xFp4Tcgen05MMA() || hasFp4PaddedOperand ||
+      NVMMASharedEncodingAttr::isPackedFp6(aTensorTy.getEncoding()) ||
+      NVMMASharedEncodingAttr::isPackedFp6(bTensorTy.getEncoding()) ||
       // M = 64 for 1CTA or 128 for 2CTA not supported for 2xfp8 / 4xfp4
       mmaSizeM == 64 ||
       // We need to disable MMA_K = 128 for NVFP4 on Rubin when MMA_N < 128,

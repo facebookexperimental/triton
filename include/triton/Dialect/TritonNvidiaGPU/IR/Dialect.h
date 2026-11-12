@@ -89,6 +89,12 @@ constexpr static char kPlannedPendingCount[] = "planned_pending_count";
 // tcgen05.mma collector usage for operand A ("fill" / "use" / "lastuse"), set
 // by the MMA collector reuse pass on single-instruction MMAs.
 constexpr static char kCollectorAAttrName[] = "ttng.collector_a";
+// Set by autoWS code partitioning on a nvws.consumer_release whose partition
+// read the buffer through the generic proxy. Token lowering keeps it on the
+// resulting arrive only when another partition refills the buffer with TMA,
+// and ProxyFenceInsertion puts a proxy fence before every marked arrive
+// (mbarrier or named barrier), wherever the barrier passes have moved it.
+constexpr static char kFenceGenericReadsAttrName[] = "ttng.fence_generic_reads";
 
 /// Whether the kernel issues paired-CTA (`cta_group::2`) MMA. This is not the
 /// same question as whether it runs on a cluster, which is

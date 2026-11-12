@@ -959,8 +959,8 @@ void init_triton_tlx_ir(py::module_ &m) {
              std::vector<Value> realInputs;
              realInputs.reserve(inputs.size());
              for (Value input : inputs) {
-               if (auto releaseOp =
-                       dyn_cast<tlx::ReleaseLayoutOp>(input.getDefiningOp()))
+               if (auto releaseOp = dyn_cast_if_present<tlx::ReleaseLayoutOp>(
+                       input.getDefiningOp()))
                  realInputs.push_back(releaseOp.getSrc());
                else
                  realInputs.push_back(input);
@@ -979,7 +979,7 @@ void init_triton_tlx_ir(py::module_ &m) {
              std::vector<Value> outputs;
              outputs.reserve(inputs.size());
              for (unsigned i = 0; i < inputs.size(); ++i) {
-               if (auto release = dyn_cast<tlx::ReleaseLayoutOp>(
+               if (auto release = dyn_cast_if_present<tlx::ReleaseLayoutOp>(
                        inputs[i].getDefiningOp())) {
                  release->moveAfter(waitOp.getOperation());
                  release.getOperation()->setOperand(0, waitOp.getResult(i));
@@ -1151,6 +1151,14 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self) -> void {
              self.create<amdgpu::ClusterBarrierArriveOp>();
              self.create<amdgpu::ClusterBarrierWaitOp>();
+           })
+      .def("create_amd_workgroup_barrier_signal",
+           [](TritonOpBuilder &self) -> void {
+             self.create<amdgpu::WorkgroupBarrierSignalOp>();
+           })
+      .def("create_amd_workgroup_barrier_wait",
+           [](TritonOpBuilder &self) -> void {
+             self.create<amdgpu::WorkgroupBarrierWaitOp>();
            })
       .def("create_amd_cluster_arrive",
            [](TritonOpBuilder &self) -> void {

@@ -8,7 +8,7 @@ import torch
 
 import triton
 
-from triton.language.extra.tlx.ops.amd_pa_decode import (
+from triton.tlx.ops.kernels.paged_attn.gfx950_decode import (
     allocate_pa_decode_workspace as _allocate_pa_decode_workspace,
     pa_decode_tlx as _pa_decode_tlx,
     build_inputs as _build_inputs,

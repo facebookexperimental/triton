@@ -1,6 +1,7 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-partition-scheduling-meta --nvgpu-test-taskid-propagate=num-warp-groups=2 --nvgpu-test-ws-atomic-broadcast | FileCheck %s --check-prefix=BCAST
 // RUN: triton-opt %s -split-input-file --nvgpu-partition-scheduling-meta --nvgpu-test-taskid-propagate=num-warp-groups=2 --nvgpu-test-ws-atomic-broadcast=tile-prefetch-depth=2 | FileCheck %s --check-prefix=DEPTH2
 // RUN: env TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-partition-scheduling-meta '--nvgpu-warp-specialization=capability=90 num-stages=3 smem-budget=200000 tile-prefetch-depth=2' | FileCheck %s --check-prefix=FULL
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-partition-scheduling-meta '--nvgpu-warp-specialization=capability=90 num-stages=3 smem-budget=200000 tile-prefetch-depth=2' | FileCheck %s --check-prefix=NOFENCE
 // RUN: env TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-partition-scheduling-meta '--nvgpu-warp-specialization=capability=90 num-stages=3 smem-budget=200000 tile-prefetch-depth=2' '--tritongpu-pipeline=num-stages=3' 2>&1 | FileCheck %s --check-prefix=PIPELINE
 
 // Dynamic-persistent GEMM: an outer scf.while claims each tile with a scalar
@@ -117,3 +118,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// wgmma reads its TMA-filled operands through the async proxy, so their
+// releases do not ask ProxyFenceInsertion for a proxy fence.
+// NOFENCE: ttng.warp_group_dot
+// NOFENCE-NOT: ttng.fence_generic_reads
