@@ -47,13 +47,9 @@ static OpPrintingFlags getOpPrintingFlagsWithLoc() {
   return flags;
 }
 
-// Returns a user of an MMAv5 accumulator that sits in a nested region of the
-// MMA's enclosing scf.for (e.g. a tmem_load in an scf.if in the loop body), or
-// null if there is none. handleOperandD only walks the direct children of that
-// loop body and treats every other tmem_load as a consumer after the loop, so
-// it cannot build operand-D channels for such a user. Flattened persistent
-// loops (tritongpu-fuse-nested-loops) produce this shape: the epilogue's
-// tmem_load lands in an `scf.if` guarded by "last K iteration".
+// Returns an MMAv5 accumulator user nested in a region of the MMA's scf.for
+// (e.g. a flattened loop's epilogue tmem_load in an scf.if), or null.
+// handleOperandD treats every non-direct-child user as coming after the loop.
 static Operation *findNestedOperandDUser(triton::FuncOp funcOp) {
   namespace ttng = triton::nvidia_gpu;
   Operation *nestedUser = nullptr;
