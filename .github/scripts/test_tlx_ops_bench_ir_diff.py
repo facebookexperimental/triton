@@ -43,3 +43,43 @@ def test_location_and_value_name_churn_is_not_a_code_change():
     assert dict(ir_diff.deltas(ir_diff.histogram("ttgir", base), ir_diff.histogram("ttgir", rewritten))) == {
         "arith.divf": -1, "arith.mulf": 1, "arith.constant": 1, "tt.approx_divf": 1, "tt.splat": 1
     }
+
+
+def gcn(path, line, insn):
+    return f"""\t.text
+\t.file\t1 "{path}" "k.py"
+\t.loc\t1 {line} 0
+\tv_add_f32_e32 v1, v2, v3 ; {line}
+\t{insn}
+\t.section\t.debug_str,"MS",@progbits,1
+\t.asciz\t"{path}" ; string offset=17
+\t.text
+\t.ident\t"Triton version 3.9.0.dev2026111{line % 10}"
+"""
+
+
+def ptx(path, line, insn):
+    return f""".visible .entry k()
+{{
+\t.loc\t1 {line} 0
+\tadd.f32 \t%f1, %f2, %f3;
+\t{insn}
+}}
+\t.file\t1 "{path}/k.py"
+\t.section\t.debug_str
+\t{{
+.b8 {line}
+\t}}
+"""
+
+
+def test_source_paths_and_lines_in_debug_info_are_not_a_code_change():
+    # The same kernel compiled from another install location or source line must hash and diff as unchanged, or a
+    # trace between two wheel installs reports every kernel as changed.
+    import tlx_codegen_snapshot as snapshot
+    assert ir_diff.normalize("amdgcn", gcn("/a/venv", 3,
+                                           "s_endpgm")) == ir_diff.normalize("amdgcn", gcn("/b/venv", 7, "s_endpgm"))
+    assert ir_diff.normalize("amdgcn", gcn("/a/venv", 3,
+                                           "s_endpgm")) != ir_diff.normalize("amdgcn", gcn("/a/venv", 3, "s_nop 0"))
+    assert snapshot.normalize_ptx(ptx("/a/venv", 3, "ret;")) == snapshot.normalize_ptx(ptx("/b/venv", 7, "ret;"))
+    assert snapshot.normalize_ptx(ptx("/a/venv", 3, "ret;")) != snapshot.normalize_ptx(ptx("/a/venv", 3, "exit;"))

@@ -76,9 +76,16 @@ def normalize(stage, text):
     elif stage == "sass":
         lines = [SASS_REG.sub(r"\1", m.group(1)) for m in SASS_INSN.finditer(text)]
     elif stage == "amdgcn":
+        # DWARF sections and .ident lines carry source paths and tool versions, not generated code.
+        debug = False
         for line in text.splitlines():
             s = line.split(";")[0].rstrip()
-            if s.strip() and not s.strip().startswith((".loc", ".file")):
+            directive = s.strip()
+            if directive.startswith((".section", ".text", ".amdgpu_metadata")):
+                debug = directive.startswith(".section") and ".debug" in directive
+            if debug:
+                continue
+            if directive and not directive.startswith((".loc", ".file", ".ident")):
                 lines.append(re.sub(r"\b([sv])\d+\b|\b([sv])\[\d+:\d+\]", lambda m: m.group(1) or m.group(2), s))
     return lines
 
