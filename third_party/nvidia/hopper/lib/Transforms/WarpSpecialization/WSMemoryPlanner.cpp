@@ -5615,13 +5615,9 @@ static bool feedsOnlySmemOrSplitLoad(Value v, DenseSet<Operation *> &chainCvts,
   return true;
 }
 
-// Whether TMemSplitLoadPattern (OptimizeTMemLayouts) will rewrite `split`
-// into per-subtile TMEM loads, removing the tmem_load -> reshape -> trans ->
-// split chain and the layout conversions on it. Mirrors that pattern's match
-// conditions. A nested split (`fromOuterSplit`) is fed by a result of an outer
-// split that the pattern rewrites first. Requires the whole chain to be in one
-// partition, since a cross-partition channel would hide the tmem_load. The
-// conversions on the chain are collected into `chainCvts`.
+// Whether TMemSplitLoadPattern will rewrite `split` into per-subtile TMEM
+// loads; mirrors that pattern's match conditions. The whole chain must be in
+// one partition, since a cross-partition channel would hide the tmem_load.
 static bool isRewrittenBySplitLoad(tt::SplitOp split,
                                    DenseSet<Operation *> &chainCvts,
                                    bool fromOuterSplit, unsigned depth) {
