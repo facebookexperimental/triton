@@ -1,0 +1,186 @@
+name: Kernel IR diff
+
+# Compiles the tlx.ops benchmark kernels with the PR's merge base and with its head, then reports which kernels'
+# generated IR, PTX and SASS changed. A compiler change that slows a kernel shows up here before any benchmark runs.
+on:
+  pull_request:
+    paths:
+      - 'lib/**'
+      - 'include/**'
+      - 'python/src/**'
+      - 'python/triton/**'
+      - 'python/test/tlx_benchmark/**'
+      - 'third_party/nvidia/**'
+      - 'third_party/tlx/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+      - 'setup.py'
+      - '.github/scripts/tlx_ops_bench_ir_*.py'
+      - '.github/workflows/kernel-ir-diff.yml'
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Base commit (defaults to the merge base of head and main)
+        required: false
+        default: ''
+        type: string
+      head:
+        description: Head commit (defaults to the selected ref)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-ir-diff-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  select:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: ubuntu-latest
+    outputs:
+      base: ${{ steps.refs.outputs.base }}
+      head: ${{ steps.refs.outputs.head }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve base and head
+        id: refs
+        env:
+          BASE: ${{ inputs.base }}
+        run: |
+          head=$(git rev-parse HEAD)
+          base=${BASE:-$(git merge-base origin/main "${head}")}
+          base=$(git rev-parse "${base}")
+          echo "base=${base}" >> "${GITHUB_OUTPUT}"
+          echo "head=${head}" >> "${GITHUB_OUTPUT}"
+
+  base-wheel:
+    needs: select
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.select.outputs.base }}
+      build_id: ir-base
+
+  head-wheel:
+    needs: select
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.select.outputs.head }}
+      build_id: ir-head
+
+  dump:
+    needs: [select, base-wheel, head-wheel]
+    runs-on: nvidia-dgx-b200
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: tooling
+          persist-credentials: false
+      # Both wheels compile the same cases, so the harness comes from head for both.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.head }}
+          path: source
+          sparse-checkout: python/test/tlx_benchmark
+          persist-credentials: false
+      - uses: ./tooling/.github/actions/setup-test-env
+        with:
+          backend: cuda
+          torch: torch==2.14.0
+          torch-index-url: https://download.pytorch.org/whl/cu130
+          packages: numpy pytest torchao
+          rocm-lib-path: ''
+      - name: Refresh CUDA linker cache
+        run: sudo ldconfig
+      - name: Install base wheel
+        uses: ./tooling/.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ needs.base-wheel.outputs.wheel_url }}
+          wheel-filename: ${{ needs.base-wheel.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.base-wheel.outputs.wheel_sha256 }}
+      - name: Dump base kernels
+        run: |
+          python tooling/.github/scripts/tlx_ops_bench_ir_dump.py --harness source/python/test/tlx_benchmark --out ir/base
+          rm -f "${RUNNER_TEMP}"/prebuilt-wheel/*.whl
+      - name: Install head wheel
+        uses: ./tooling/.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ needs.head-wheel.outputs.wheel_url }}
+          wheel-filename: ${{ needs.head-wheel.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.head-wheel.outputs.wheel_sha256 }}
+      - name: Dump head kernels
+        run: python tooling/.github/scripts/tlx_ops_bench_ir_dump.py --harness source/python/test/tlx_benchmark --out ir/head
+      - name: Compare
+        env:
+          BASE: ${{ needs.select.outputs.base }}
+          HEAD: ${{ needs.select.outputs.head }}
+        run: |
+          python3 tooling/.github/scripts/tlx_ops_bench_ir_diff.py --base ir/base --head ir/head --out ir/diff > /dev/null
+          {
+            cat ir/diff/summary.md
+            echo
+            echo "B200. Base [${BASE:0:8}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${BASE}), head [${HEAD:0:8}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${HEAD}). Normalized diffs are in the \`kernel-ir-diff\` artifact of [this run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
+          } > ir/comment.md
+          cat ir/comment.md >> "${GITHUB_STEP_SUMMARY}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-ir-diff
+          path: |
+            ir/diff
+            ir/comment.md
+            ir/base/index.json
+            ir/head/index.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  comment:
+    needs: dump
+    # Fork PRs get a read-only token; their result stays in the job summary and artifact.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-ir-diff
+          path: ir
+      - name: Post or update the PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          repo, pr = os.environ['GITHUB_REPOSITORY'], os.environ['PR']
+          marker = '<!-- kernel-ir-diff -->'
+          body = marker + '\n' + open('ir/comment.md').read()[:60000]
+          comments = json.loads(subprocess.check_output(
+              ['gh', 'api', '--paginate', '--slurp', f'repos/{repo}/issues/{pr}/comments']))
+          mine = [c for page in comments for c in page
+                  if c['user']['login'] == 'github-actions[bot]' and c['body'].startswith(marker)]
+          if mine:
+              cmd = ['gh', 'api', '--method', 'PATCH', f"repos/{repo}/issues/comments/{mine[-1]['id']}", '--input', '-']
+          else:
+              cmd = ['gh', 'api', '--method', 'POST', f'repos/{repo}/issues/{pr}/comments', '--input', '-']
+          subprocess.run(cmd, input=json.dumps({'body': body}), text=True, check=True, stdout=subprocess.DEVNULL)
+          PY

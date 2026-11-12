@@ -291,6 +291,20 @@ jobs:
           if reason:
               print(reason)
           PY
+      - name: Compare endpoint IR
+        continue-on-error: true
+        run: |
+          python3 tooling/.github/scripts/tlx_ops_bench_ir_diff.py --base measurements/ir/good --head measurements/ir/bad --out measurements/ir/diff
+          cp measurements/ir/diff/summary.json measurements/ir-diff.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-bisect-ir
+          path: |
+            measurements/ir/diff
+            measurements/ir/good/index.json
+            measurements/ir/bad/index.json
+          if-no-files-found: ignore
       - name: Install candidate wheel
         if: steps.endpoints.outputs.reproduced == 'true' && needs.candidate-wheel.result == 'success'
         uses: ./tooling/.github/actions/install-prebuilt-triton
@@ -358,7 +372,7 @@ jobs:
           PY
       - name: Write the Actions result summary
         run: |
-          python3 tooling/.github/scripts/tlx_ops_bench_bisect_summary.py --prepared evidence/prepared.json --state evidence/state.json --measurements evidence/measurements.json
+          python3 tooling/.github/scripts/tlx_ops_bench_bisect_summary.py --prepared evidence/prepared.json --state evidence/state.json --measurements evidence/measurements.json --ir-diff measurements/ir-diff.json
       - name: Report completed cases
         env:
           GH_TOKEN: ${{ github.token }}
@@ -368,10 +382,16 @@ jobs:
           import os
           import pathlib
           import subprocess
+          import sys
+          sys.path.insert(0, 'tooling/.github/scripts')
+          from tlx_ops_bench_ir_diff import brief
 
           repo = os.environ['GITHUB_REPOSITORY']
           run_url = f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
           state = json.loads(pathlib.Path('evidence/state.json').read_text())
+          spec = json.loads(pathlib.Path('evidence/prepared.json').read_text()).get('spec') or {}
+          ir_path = pathlib.Path('measurements/ir-diff.json')
+          ir = json.loads(ir_path.read_text()) if ir_path.exists() else None
           context_path = pathlib.Path('evidence/inputs.json')
           context = json.loads(context_path.read_text())
           for result in state['results'][context['reported']:]:
@@ -383,6 +403,9 @@ jobs:
                   lines.append(f"First bad commit for the measured case: https://github.com/{repo}/commit/{sha}")
               if result.get('reason'):
                   lines.append(result['reason'])
+              # The IR comparison is for this round's endpoints; attach it only to the result they belong to.
+              if ir and (result.get('good_sha'), result.get('bad_sha')) == (spec.get('good_sha'), spec.get('bad_sha')):
+                  lines.append(brief(ir))
               subprocess.run(['gh', 'api', f'repos/{repo}/issues/{number}/comments', '--method', 'POST', '--input', '-'],
                              input=json.dumps({'body': '\n\n'.join(lines)}), text=True, check=True)
               context['reported'] += 1

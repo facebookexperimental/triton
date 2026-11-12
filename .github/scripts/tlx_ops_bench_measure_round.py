@@ -35,7 +35,27 @@ def measure(prepared, role, source, harness, output):
          str(destination)], timeout=900, cwd=work, env=env)
     if not destination.exists():
         return {"status": "error", "reason": "measurement process failed"}
-    return json.loads(destination.read_text())
+    result = json.loads(destination.read_text())
+    if role != "candidate" and result.get("gpu_uuid"):
+        result["ir_dump"] = dump_ir(step, result["gpu_uuid"], output / "ir" / role, work, env)
+    return result
+
+
+def dump_ir(step, gpu_uuid, out, work, env):
+    """Dump the case's kernels in a separate process so the measurement itself never runs with IR dumping on."""
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve().parent / "tlx_ops_bench_ir_dump.py"), "--harness", step["harness"], "--key",
+        step["key"], "--direction", step["direction"], "--gpu-uuid", gpu_uuid, "--out",
+        str(out.resolve())
+    ]
+    for module in step["modules"]:
+        cmd += ["--module", module]
+    try:
+        worker.run(cmd, timeout=600, cwd=work, env=env)
+        return "ok"
+    except Exception as exc:
+        return f"failed: {type(exc).__name__}: {exc}"
 
 
 def main():
