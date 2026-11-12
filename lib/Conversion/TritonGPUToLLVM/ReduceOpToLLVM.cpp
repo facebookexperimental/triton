@@ -890,7 +890,10 @@ private:
 
     // Preserve upstream's established inverse bit order for reductions whose
     // participating lane-id bits cannot use the contiguous target hook.
-    for (int bit = llvm::Log2_32(warpSize) - 1; bit >= 0; --bit) {
+    // INNER_TREE counts up instead, matching warpReduce.
+    unsigned numLaneBits = llvm::Log2_32(warpSize);
+    for (unsigned step = 0; step < numLaneBits; ++step) {
+      unsigned bit = isInnerTree(op) ? step : numLaneBits - 1 - step;
       unsigned mask = 1u << bit;
       if ((reduceLaneIdMask & mask) == 0)
         continue;
@@ -940,12 +943,34 @@ private:
     }
   }
 
+  // The lane-id bits whose lane basis moves along the reduction axis.
+  unsigned getReduceLaneIdMask(ReduceOpHelper &helper) const {
+    triton::ReduceOp op = helper.getOperation();
+    auto *ctx = op.getContext();
+    LinearLayout layout = triton::gpu::toLinearLayout(helper.getSrcTy());
+    const auto &laneBases = layout.getBases().lookup(str_attr("lane"));
+    unsigned mask = 0;
+    for (unsigned bit = 0; bit < laneBases.size(); ++bit)
+      if (laneBases[bit][op.getAxis()] != 0)
+        mask |= 1u << bit;
+    return mask;
+  }
+
   // Reduce across threads within each warp.
   void
   reduceWithinWarps(ReduceOpHelper &helper,
                     std::map<SmallVector<unsigned>, SmallVector<Value>> &accs,
                     ConversionPatternRewriter &rewriter) const {
     triton::ReduceOp op = helper.getOperation();
+    // warpReduce shuffles a contiguous run of lane-id bits. Reduce a mask with
+    // gaps (e.g. bits {0, 2}) one bit at a time instead.
+    unsigned reduceLaneIdMask = getReduceLaneIdMask(helper);
+    if (reduceLaneIdMask != 0 && !llvm::isShiftedMask_32(reduceLaneIdMask)) {
+      for (auto &[key, acc] : accs)
+        warpReduceLaneMask(rewriter, op, acc, reduceLaneIdMask,
+                           /*broadcastLaneIdMask=*/0);
+      return;
+    }
     unsigned sizeIntraWarps = helper.getIntraWarpSizeWithUniqueData();
     unsigned threadOffsetOnReductionAxis =
         helper.getThreadOffsetOnReductionAxis();
@@ -1028,8 +1053,10 @@ private:
     auto [multiDimWarpId, isRepresentativeWarp] =
         delinearize(rewriter, loc, srcLayout, srcShape, kWarp, warpId);
 
-    Value laneIdAxis = multiDimLaneId[axis];
-    Value laneZero = b.icmp_eq(laneIdAxis, b.i32_val(0));
+    // Every lane whose reduction-axis lane-id bits are zero holds the reduced
+    // value. Test those bits directly, since they need not be contiguous.
+    Value laneZero = b.icmp_eq(
+        b.and_(laneId, b.i32_val(getReduceLaneIdMask(helper))), b.i32_val(0));
     Value write =
         b.and_(b.and_(isRepresentativeLane, isRepresentativeWarp), laneZero);
 
