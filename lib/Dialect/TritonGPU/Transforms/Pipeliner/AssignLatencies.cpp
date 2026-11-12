@@ -152,13 +152,9 @@ public:
     ModuleOp moduleOp = forOp->getParentOfType<ModuleOp>();
     tt::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
-    // Under Meta autoWS the memory planner, not the pipeliner, sizes TMA
-    // landing buffers and keeps a slot whose size is not a multiple of its
-    // alignment single-buffered. Leaving such a load (e.g. a 1-D [16] fp32
-    // tile) unpipelined only moves it to its consumer's stage, after the
-    // other loads of the same producer partition are prefetched; if one of
-    // those is single-buffered, the producer then blocks on it before issuing
-    // the load the consumer is waiting for, and the kernel deadlocks.
+    // Under Meta autoWS the memory planner sizes TMA landing buffers (an
+    // unaligned slot stays single-buffered). Leaving an unaligned load
+    // unpipelined puts it behind its partition's prefetched loads: deadlock.
     bool allowUnalignedTMA = useMetaWS && isUnderWarpSpecialize(forOp);
     llvm::MapVector<Operation *, std::pair<int, Operation *>> loadOpToIndLevel =
         loadOpsToIndirectionLevel(forOp, pipelineWithoutDot, axisInfoAnalysis,
