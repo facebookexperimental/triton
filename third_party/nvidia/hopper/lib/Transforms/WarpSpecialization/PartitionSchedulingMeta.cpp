@@ -460,6 +460,11 @@ public:
       return false;
     // Copy the lightweight op handle: walk() is non-const but this method is.
     LoopLikeOpInterface loop = mainLoop;
+    // A register tt.dot is an MMA that `mmas` does not track; the reduction
+    // layout would split it from the loop carrying its accumulator.
+    if (loop->walk([](triton::DotOp) { return WalkResult::interrupt(); })
+            .wasInterrupted())
+      return false;
     return loop->walk([](triton::ReduceOp) { return WalkResult::interrupt(); })
         .wasInterrupted();
   }
@@ -1491,6 +1496,20 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   categorizer.categorize();
 
   LLVM_DEBUG(categorizer.printCategorizedOps(llvm::dbgs()));
+
+  // With a register tt.dot, a TMA reduce and a store, the reduction partition
+  // would split the dot's K loop from the epilogue reading its accumulator,
+  // and code partitioning has no channel for that loop result.
+  if (mmas.empty() &&
+      !categorizer.getOpsInCategory(OpCategory::TMAReduction).empty() &&
+      !categorizer.getOpsInCategory(OpCategory::EpilogueStore).empty() &&
+      mainLoop->walk([](triton::DotOp) { return WalkResult::interrupt(); })
+          .wasInterrupted()) {
+    LLVM_DEBUG(llvm::dbgs() << "[tritongpu-partition-scheduling] register "
+                               "tt.dot with a TMA reduce and a store: not "
+                               "specializing\n");
+    return std::nullopt;
+  }
 
   unsigned dataPartitionFactor = categorizer.getDataPartitionFactor();
   LLVM_DEBUG(
