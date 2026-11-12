@@ -304,6 +304,47 @@ def _rowsum_into_pairs(acc, x):
 
 
 @triton.jit
+def _ex2_emu_f32x2(x):
+    # FA4's exp2 emulation (flash_attn/cute/utils.py ex2_emulation_2) on the FMA pipe: split x into
+    # floor + fraction with a round-down add, evaluate a degree-3 polynomial for 2^frac, and add the
+    # floor into the exponent bits. After rounding to bf16 it nearly always matches MUFU ex2.
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 l1, l2, l7, l8, l9, l10, c3, c2, c1, c0;
+            .reg .f32 f1, f2;
+            .reg .s32 r1, r2, r3, r4;
+            max.f32 f1, $2, 0fC2FE0000;
+            max.f32 f2, $3, 0fC2FE0000;
+            mov.b64 l1, { f1, f2 };
+            mov.b64 l2, { 0f4B400000, 0f4B400000 };
+            add.rm.f32x2 l7, l1, l2;
+            sub.rn.f32x2 l8, l7, l2;
+            sub.rn.f32x2 l9, l1, l8;
+            mov.b64 c3, { 0f3D9DF09D, 0f3D9DF09D };
+            mov.b64 c2, { 0f3E6906A4, 0f3E6906A4 };
+            mov.b64 c1, { 0f3F31F519, 0f3F31F519 };
+            mov.b64 c0, { 0f3F800000, 0f3F800000 };
+            fma.rn.f32x2 l10, l9, c3, c2;
+            fma.rn.f32x2 l10, l10, l9, c1;
+            fma.rn.f32x2 l10, l10, l9, c0;
+            mov.b64 { r1, r2 }, l7;
+            mov.b64 { r3, r4 }, l10;
+            shl.b32 r1, r1, 23;
+            add.s32 $0, r1, r3;
+            shl.b32 r2, r2, 23;
+            add.s32 $1, r2, r4;
+        }
+        """,
+        "=r,=r,r,r",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
 def _softmax_inner_loop(
     qk_fulls,
     qk_tiles,
@@ -328,6 +369,8 @@ def _softmax_inner_loop(
     RESCALE_OPT: tl.constexpr,
     SCALAR_N: tl.constexpr,
     USE_2CTA: tl.constexpr = False,
+    EX2_EMU_FREQ: tl.constexpr = 0,
+    EX2_EMU_START_FRG: tl.constexpr = 1,
 ):
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
 
@@ -366,7 +409,7 @@ def _softmax_inner_loop(
             m_ij = tl.where(rescale_mask, m_i, m_ij)
         else:
             alpha = tl.math.exp2(m_i - m_ij)
-        tlx.barrier_wait(tlx.local_view(alpha_empties, cid), alpha_phase ^ 1)
+        # The previous iteration waited for alpha_empties, so the buffer is free.
         tlx.local_store(tlx.local_view(alpha_tiles, cid), tl.join(alpha, alpha) if SCALAR_N == 2 else alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
         # Shorten alpha's lifetime: consume immediately, add l_ij later
@@ -380,17 +423,23 @@ def _softmax_inner_loop(
             qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
         else:
             qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
-        # apply_epx2_convert in FA4:
-        # 128 elements per row is divided into 4 fragments, first fragment covers [0] to [31]
-        # for last fragment, always use SFU, for first 3 fragments, elements 0 to 11 use SFU,
-        # elements 12 to 15 use emulation, elements 16 to 27 use SFU, elements 28 to 31 use emulation
-        # the loop is unrolled twice likely for vectorization
         qks = _split_n_2D(qk, NUM_MMA_SLICES)
-        l_pairs = tl.zeros([l_i.shape[0], 2], tl.float32)
+        p_slices = ()
         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
             # prepare p for the v dot
             p_bufIdx = qk_buf * NUM_MMA_SLICES + slice_id
-            p_i = tl.math.exp2(qks[slice_id])
+            if EX2_EMU_FREQ != 0 and STAGE != 2:
+                # FA4's apply_exp2_convert split: in 32-column fragments, the first EX2_EMU_START_FRG
+                # and the last fragment stay on MUFU; the rest emulate the last 4 of every
+                # EX2_EMU_FREQ columns. Each register's column is a compile-time constant, so the
+                # select folds away.
+                cols = slice_id * (BLOCK_N // NUM_MMA_SLICES) + tl.arange(0, BLOCK_N // NUM_MMA_SLICES)
+                frg = cols // 32
+                emu = (frg >= EX2_EMU_START_FRG) & (frg < BLOCK_N // 32 - 1) & (cols % 32 % EX2_EMU_FREQ
+                                                                                >= EX2_EMU_FREQ - 4)
+                p_i = tl.where(emu[None, :], _ex2_emu_f32x2(qks[slice_id]), tl.math.exp2(qks[slice_id]))
+            else:
+                p_i = tl.math.exp2(qks[slice_id])
             tlx.local_store(tlx.local_view(p_tiles, p_bufIdx), p_i.to(out_dtype))
             if USE_2CTA:
                 # The TMEM store completes before this readiness token; it does
@@ -402,8 +451,14 @@ def _softmax_inner_loop(
                 )
             else:
                 tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
-            l_pairs = _rowsum_into_pairs(l_pairs, p_i)
+            p_slices = p_slices + (p_i, )
 
+        # As in FA4, acquire the alpha buffer for the next iteration here, off the S -> P path,
+        # and do the row sum behind the wait.
+        tlx.barrier_wait(tlx.local_view(alpha_empties, cid), alpha_phase)
+        l_pairs = tl.zeros([l_i.shape[0], 2], tl.float32)
+        for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+            l_pairs = _rowsum_into_pairs(l_pairs, p_slices[slice_id])
         l_i += tl.sum(l_pairs, 1)
         m_i = m_ij
         accum_cnt_qk += 1
@@ -1515,7 +1570,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                 clc_phase_consumer ^= 1
 
         # softmax groups
-        with tlx.async_task(num_warps=4, registers=256 if (USE_2CTA and HEAD_DIM >= 256) else 168,
+        with tlx.async_task(num_warps=4, registers=256 if (USE_2CTA and HEAD_DIM >= 256) else 184,
                             replicate=NUM_GROUPS_PER_CTA):
             accum_cnt_qk = 0
             tile_id = start_pid
@@ -1574,6 +1629,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         RESCALE_OPT=RESCALE_OPT,
                         SCALAR_N=SCALAR_N,
                         USE_2CTA=USE_2CTA,
+                        EX2_EMU_FREQ=10,
                     )
                 if STAGE & 2:
                     m_i, l_i, accum_cnt_qk = _softmax_inner_loop(
