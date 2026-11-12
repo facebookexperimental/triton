@@ -438,6 +438,18 @@ private:
           continue;
         }
 
+        // The peer CTA of a 2-CTA tcgen05.alloc also writes this slot, with no
+        // cluster sync before the alloc under WS, so it must not alias any
+        // other scratch before or after the alloc.
+        if (auto globalAlloc = dyn_cast<ttng::TCGen5GlobalAllocOp>(op)) {
+          if (globalAlloc.getTwoCtas()) {
+            bufferRange.insert(
+                {buffer,
+                 Interval(size_t(), std::numeric_limits<size_t>::max())});
+            continue;
+          }
+        }
+
         // Any scratch memory's live range is the current operation's live
         // range.
         bufferRange.insert(
