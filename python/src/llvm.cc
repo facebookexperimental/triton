@@ -651,6 +651,7 @@ void init_triton_llvm(py::module &&m) {
         tuningOptions.SLPVectorization = true;
 
         bool disableSLPVectorization =
+            disable_slp_vectorizer ||
             mlir::triton::tools::getBoolEnv("TRITON_DISABLE_SLPVECTORIZATION");
 
         if (disableSLPVectorization) {
