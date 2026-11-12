@@ -279,10 +279,8 @@ static void insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
   Value remoteBar = ttng::MapToRemoteBufferOp::create(
       builder, loc, remoteBarType, barrierView, leaderRank);
 
-  // A register-built B split across the pair is written by each CTA with
-  // generic stores and read by the leader's MMA through the async proxy. The
-  // proxy fence must come before the arrive that signals the leader, so the
-  // peer's writes are ordered before the leader's read.
+  // Order this CTA's generic writes of its split B half before the arrive that
+  // lets the leader's MMA read it.
   if (mma->hasAttr(ttng::AttrTwoCTARegisterBName))
     ttng::FenceAsyncSharedOp::create(builder, loc, /*bCluster=*/true);
 

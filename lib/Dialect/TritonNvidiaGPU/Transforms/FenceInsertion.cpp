@@ -57,11 +57,9 @@ public:
         return WalkResult::advance();
 
       OpBuilder builder(dotOp);
-      // A 2-CTA MMA reads B from both CTAs of the pair, so when Transform2CTALoads
-      // split a register-built B across the pair, the peer CTA's generic writes
-      // to its B half must be ordered against the async proxy at cluster scope,
-      // not just within the CTA. Other register-written operands of 2-CTA MMAs
-      // (e.g. FA backward's) keep the CTA-scoped fence for now.
+      // The peer CTA writes its half of a split register-built B, so those
+      // generic writes need a cluster-scoped proxy fence. Other register-written
+      // operands of 2-CTA MMAs keep the CTA-scoped fence for now.
       bool cluster =
           registerWrittenB && dotOp->hasAttr(AttrTwoCTARegisterBName);
       auto fence = FenceAsyncSharedOp::create(builder, dotOp.getLoc(),
@@ -279,7 +277,6 @@ private:
       }
       if (isa<ttg::LocalAllocOp>(op) ||
           op->hasTrait<OpTrait::MemDescViewTrait>()) {
-        // A view (or the alloc's operands): iterate over the operands.
         for (auto v : op->getOperands()) {
           findCopyRegToSharedOps(v, visited, result);
         }
@@ -294,7 +291,6 @@ private:
         return;
       }
       unsigned resultNum = cast<OpResult>(operand).getResultNumber();
-      // Look through values yielded out of scf.if / scf.for.
       if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
         findCopyRegToSharedOps(ifOp.thenYield().getOperand(resultNum), visited,
                                result);

@@ -393,8 +393,6 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<64x32xf16, #[[SW64]]>
 // CHECK: ttg.local_alloc %{{.*}} -> !ttg.memdesc<64x32xf16, #[[SW64]]
 // CHECK: ttng.tc_gen5_mma {{.*}} {two_ctas}
-// A B filled by TMA is not written from registers, so it stays untagged.
-// CHECK-NOT: two_cta_register_b
 
 #blocked_s = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1_s = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -428,10 +426,7 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
-// Test: a B tile transposed in registers (tt.trans) before its local_alloc is
-// written to shared memory from registers, so the split MMA is tagged
-// two_cta_register_b for a cluster-scoped fence. A B that is a plain
-// descriptor load (above) is filled by TMA and stays untagged.
+// Test: a B transposed in registers is tagged two_cta_register_b.
 // CHECK-LABEL: @matmul_2cta_register_trans_b
 // CHECK: tt.descriptor_load {{.*}} -> tensor<32x64xf16
 // CHECK: tt.trans

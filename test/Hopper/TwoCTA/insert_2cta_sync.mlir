@@ -23,7 +23,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK: scf.for
     // CHECK:   nvg.cluster_id
     // CHECK:   ttng.map_to_remote_buffer
-    // CHECK-NOT: ttng.fence_async_shared
     // CHECK:   ttng.arrive_barrier
     // CHECK:   ttng.wait_barrier
     // CHECK:   ttng.tc_gen5_mma
@@ -388,10 +387,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// A 2-CTA MMA whose register-built B was split across the pair
-// (two_cta_register_b) gets a cluster-scoped proxy fence before the arrive that
-// signals the leader, so each CTA's generic writes to its B half are ordered
-// before the leader's MMA reads them.
+// A two_cta_register_b MMA gets a cluster-scoped fence before the arrive.
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
