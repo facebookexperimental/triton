@@ -147,9 +147,7 @@ public:
         tensorMemorySpace,
         /*mutableMemory=*/false);
     // The accumulator and the promoted A are both live at the MMA, so they
-    // must fit in TMEM together. Otherwise keep A in SMEM rather than produce
-    // a kernel that fails the TMEM capacity check at launch.
-    // Rubin (sm_107) has 576 columns, matching the launch check.
+    // must fit in TMEM together (576 columns on sm_107, as the launch check).
     auto target = tcGen5MMAOp->template getParentOfType<ModuleOp>()
                       ->template getAttrOfType<StringAttr>(
                           ttg::AttrTargetName);
