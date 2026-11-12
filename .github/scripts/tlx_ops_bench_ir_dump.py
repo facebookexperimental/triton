@@ -109,7 +109,8 @@ def main():
         entries = sorted(corpus.values(), key=lambda e: (e["kernel"], e["id"]))
         # One entry per line keeps the checked-in corpus reviewable entry by entry.
         head = json.dumps({
-            "triton": triton.__version__, "device": device.name, "capability": list(torch.cuda.get_device_capability())
+            "triton": triton.__version__, "device": device.name, "capability": list(torch.cuda.get_device_capability()),
+            "torch_cuda": torch.version.cuda, "torch_hip": torch.version.hip
         })[:-1]
         args.corpus_out.write_text(head + ', "entries": [\n' + ",\n".join(json.dumps(e) for e in entries) + "\n]}\n")
         print(f"corpus: {len(entries)} specializations; not replayable from source: {sorted(unreplayable) or 'none'}")

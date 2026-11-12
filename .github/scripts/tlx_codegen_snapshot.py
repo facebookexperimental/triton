@@ -36,10 +36,18 @@ SNAPSHOT_VERSION = 2
 CORPUS_VERSION = 1
 # Options derived from the wheel or the target rather than chosen by the kernel launch.
 CORPUS_SKIP_OPTIONS = ("extern_libs", "arch", "backend_name")
+# Table rows per trace comment; GitHub rejects comments over 65536 characters.
+MAX_GROUP_ROWS = 20
 VERDICT_RANK = {"IDENTICAL": 0, "CHANGED": 1, "INVESTIGATE": 2}
 
 # ptxas deltas that escalate a kernel from CHANGED to INVESTIGATE.
-HARD_PTXAS_KEYS = ("regs", "smem", "spills_stores", "spills_loads", "stack_frame", "lmem")
+HARD_PTXAS_KEYS = ("regs", "smem", "spills_stores", "spills_loads", "stack_frame", "lmem", "vgprs", "sgprs",
+                   "vgpr_spills", "sgpr_spills", "lds", "scratch")
+# AMDGCN kernel metadata fields standing in for ptxas statistics on AMD targets.
+AMDGCN_STATS = {
+    "vgprs": ".vgpr_count", "sgprs": ".sgpr_count", "vgpr_spills": ".vgpr_spill_count", "sgpr_spills":
+    ".sgpr_spill_count", "lds": ".group_segment_fixed_size", "scratch": ".private_segment_fixed_size"
+}
 HARD_PTX_KEYS = ("ld_local", "st_local", "local_bytes")
 
 
@@ -270,6 +278,7 @@ def corpus_entry(src, options, target):
         defaults = make_backend(target).parse_options({}).__dict__
         record = {
             "kernel": src.name,
+            "backend": target.backend,
             "module": module,
             "qualname": qualname,
             "arch": target.arch,
@@ -298,21 +307,23 @@ def _group_attrs(attrs):
     return list(grouped.values())
 
 
-def compile_asm(fn, signature, constexprs, attrs, options, arch, warp_size=32):
+def compile_asm(fn, signature, constexprs, attrs, options, arch, warp_size=32, backend="cuda"):
     from triton.backends.compiler import GPUTarget
     from triton.compiler.compiler import ASTSource, compile
     src = ASTSource(fn, signature, constexprs=constexprs, attrs=attrs)
-    return compile(src, target=GPUTarget("cuda", arch, warp_size), options=dict(options)).asm
+    return compile(src, target=GPUTarget(backend, arch, warp_size), options=dict(options)).asm
 
 
-def pretend_device(capability):
+def pretend_device(corpus):
     """Answer import-time GPU checks in kernel modules the way the recording GPU did.
 
-    Some tlx.ops modules pick between kernel definitions at import, from torch.cuda.get_device_capability(); without
-    this a CPU-only replay compiles the fallback definition instead of the one the benchmark ran.
+    Some tlx.ops modules pick between kernel definitions at import, from torch.version and
+    torch.cuda.get_device_capability(); without this a CPU-only replay compiles the fallback definition instead of the
+    one the benchmark ran.
     """
     import torch
-    torch.version.cuda = torch.version.cuda or "13.0"
+    torch.version.cuda, torch.version.hip = corpus.get("torch_cuda", "13.0"), corpus.get("torch_hip")
+    capability = corpus["capability"]
     torch.cuda.is_available = lambda: True
     torch.cuda.device_count = lambda: 1
     torch.cuda.current_device = lambda: 0
@@ -323,18 +334,17 @@ def pretend_device(capability):
 TASKS = []
 
 
-def _task_list(args):
-    tasks = []
-    for name, fn, sig, const, opts in kernels():
-        for arch in ARCHES:
-            tasks.append(
-                {"name": name, "arch": arch, "fn": fn, "sig": sig, "const": const, "attrs": None, "opts": opts})
-    if args.corpus:
-        corpus = json.load(open(args.corpus))
-        pretend_device(corpus["capability"])
-        for e in corpus["entries"]:
-            tasks.append({"name": f"{e['kernel']}-{e['id']}", "arch": e["arch"], "entry": e})
-    return tasks
+def _task_groups(args):
+    """The built-in kernels, then one group per corpus: (corpus header or None, tasks)."""
+    builtin = [{"name": name, "arch": arch, "fn": fn, "sig": sig, "const": const, "attrs": None, "opts": opts}
+               for name, fn, sig, const, opts in kernels()
+               for arch in ARCHES]
+    groups = [(None, builtin)]
+    for path in args.corpus or []:
+        corpus = json.load(open(path))
+        groups.append((corpus, [{"name": f"{e['kernel']}-{e['id']}", "arch": e["arch"], "entry": e}
+                                for e in corpus.pop("entries")]))
+    return groups
 
 
 def _run_task(index):
@@ -344,6 +354,8 @@ def _run_task(index):
     if ARGS.ptx_version is not None:
         opts["ptx_version"] = ARGS.ptx_version
     entry = {"options": opts} if e is None else {"kernel": e["kernel"], "cases": e.get("cases", [])}
+    backend = "cuda" if e is None else e.get("backend", "cuda")
+    tag = f"sm{arch}" if backend == "cuda" else str(arch)
     try:
         if e is None:
             fn, sig, const, attrs, warp_size = task["fn"], task["sig"], task["const"], None, 32
@@ -356,30 +368,45 @@ def _run_task(index):
             const = {tuple(k): _decode(v) for k, v in e["constexprs"]}
             attrs = {tuple(path): attr for attr, paths in e["attrs"] for path in paths}
             warp_size = e["warp_size"]
-        asm = compile_asm(fn, sig, const, attrs, opts, arch, warp_size)
-        ptx = asm["ptx"]
-        norm = normalize_ptx(ptx)
-        ptxas = find_ptxas(arch)
+        asm = compile_asm(fn, sig, const, attrs, opts, arch, warp_size, backend)
         irdiff = _irdiff()
         ttgir = irdiff.normalize("ttgir", asm.get("ttgir", ""))
         entry.update({
-            "ptx_sha": hashlib.sha256(norm.encode()).hexdigest()[:16],
             "ttgir_sha": hashlib.sha256("\n".join(ttgir).encode()).hexdigest()[:16],
             "ttgir_ops": dict(irdiff.histogram("ttgir", ttgir)),
-            "ptx": ptx_features(norm),
-            "instr_mix": instr_mix(norm),
-            "ptxas": dict(ptxas_stats(ptx, arch, ptxas), ptxas_version=ptxas_version(ptxas)),
         })
+        if backend == "cuda":
+            stage = "ptx"
+            norm = normalize_ptx(asm["ptx"])
+            ptxas = find_ptxas(arch)
+            entry.update({
+                "ptx_sha": hashlib.sha256(norm.encode()).hexdigest()[:16],
+                "ptx": ptx_features(norm),
+                "instr_mix": instr_mix(norm),
+                "ptxas": dict(ptxas_stats(asm["ptx"], arch, ptxas), ptxas_version=ptxas_version(ptxas)),
+            })
+        else:
+            # AMDGCN takes the place of PTX, and its kernel metadata that of the ptxas statistics.
+            stage = "amdgcn"
+            gcn = irdiff.normalize("amdgcn", asm["amdgcn"])
+            meta = dict(re.findall(r"^\s*(\.[a-z_]+):\s+(\d+)\s*$", asm["amdgcn"], re.M))
+            entry.update({
+                "ptx_sha": hashlib.sha256("\n".join(gcn).encode()).hexdigest()[:16],
+                "ptx": {"lines": len(gcn)},
+                "instr_mix": dict(irdiff.histogram("amdgcn", gcn).most_common(40)),
+                "ptxas": {k: int(meta[field])
+                          for k, field in AMDGCN_STATS.items()
+                          if field in meta},
+            })
         if ARGS.ir_dir:
-            for stage in ("ttgir", "ptx"):
-                with open(os.path.join(ARGS.ir_dir, f"{name}.sm{arch}.{stage}"), "w") as handle:
-                    handle.write(asm.get(stage, ""))
-        print(f"compiled {name}/sm{arch}: {entry['ptxas'].get('regs')} regs, {entry['ptxas'].get('smem')} smem",
-              flush=True)
+            for part in ("ttgir", stage):
+                with open(os.path.join(ARGS.ir_dir, f"{name}.{tag}.{part}"), "w") as handle:
+                    handle.write(asm.get(part, ""))
+        print(f"compiled {name}/{tag}: {entry['ptxas']}", flush=True)
     except Exception as exc:
         entry["error"] = " ".join(f"{type(exc).__name__}: {exc}".split())[:300]
-        print(f"FAILED {name}/sm{arch}: {entry['error']}", flush=True)
-    return name, f"sm{arch}", entry
+        print(f"FAILED {name}/{tag}: {entry['error']}", flush=True)
+    return name, tag, entry
 
 
 def snapshot(args):
@@ -389,18 +416,21 @@ def snapshot(args):
     ARGS = args
     if args.ir_dir:
         os.makedirs(args.ir_dir, exist_ok=True)
-    TASKS[:] = _task_list(args)
     snap = {
         "version": SNAPSHOT_VERSION,
         "corpus_version": CORPUS_VERSION,
         "triton_version": triton.__version__,
         "kernels": {},
     }
-    if args.jobs > 1:
+    results = []
+    # Each corpus compiles in its own fresh worker processes: kernel modules read the pretended device at import,
+    # and this process never imports them.
+    for corpus, tasks in _task_groups(args):
+        if corpus is not None:
+            pretend_device(corpus)
+        TASKS[:] = tasks
         with multiprocessing.get_context("fork").Pool(args.jobs) as pool:
-            results = pool.map(_run_task, range(len(TASKS)), chunksize=1)
-    else:
-        results = [_run_task(i) for i in range(len(TASKS))]
+            results += pool.map(_run_task, range(len(TASKS)), chunksize=1)
     for name, arch, entry in results:
         snap["kernels"].setdefault(name, {})[arch] = entry
     with open(args.out, "w") as handle:
@@ -470,7 +500,7 @@ def _excerpts(args, name, arch, ttgir_ops, mix):
     import difflib
     irdiff = _irdiff()
     stages = {}
-    for stage, changed in (("ttgir", ttgir_ops), ("ptx", mix)):
+    for stage, changed in (("ttgir", ttgir_ops), ("ptx", mix), ("amdgcn", mix)):
         texts = []
         for root in (args.base_ir, args.head_ir):
             path = os.path.join(root, f"{name}.{arch}.{stage}")
@@ -482,7 +512,7 @@ def _excerpts(args, name, arch, ttgir_ops, mix):
     return stages
 
 
-def _corpus_section(base, head, names, args):
+def _corpus_section(base, head, names, args, tag, budget):
     """One table row per kernel whose specializations changed their TTGIR the same way, then their diffs."""
     irdiff = _irdiff()
     groups, counts, stale = {}, collections.Counter(), collections.Counter()
@@ -516,7 +546,7 @@ def _corpus_section(base, head, names, args):
                 g["mix"][token] += after - before
     total = sum(counts.values()) + sum(stale.values())
     lines = [
-        "", f"### tlx.ops kernels: {total} specializations", "",
+        "", f"### tlx.ops kernels ({tag}): {total} specializations", "",
         ", ".join(f"{counts[v]} {v.lower()}" for v in ("IDENTICAL", "CHANGED", "INVESTIGATE") if counts[v]) + ".", ""
     ]
     if stale:
@@ -531,9 +561,10 @@ def _corpus_section(base, head, names, args):
     ordered = sorted(groups.values(), key=lambda g:
                      (-VERDICT_RANK[g["verdict"]], -spill(g), -bool(g["ops"]), -len(g["cases"])))
     lines += [
-        "| Kernel | Cases | Verdict | Allocation moves | TTGIR ops | PTX instructions |", "|---|---|---|---|---|---|"
+        "| Kernel | Cases | Verdict | Allocation moves | TTGIR ops | PTX or AMDGCN instructions |",
+        "|---|---|---|---|---|---|"
     ]
-    for g in ordered:
+    for g in ordered[:MAX_GROUP_ROWS]:
         cases = ", ".join(f"`{irdiff.case_label(c)}`" for c in g["cases"][:2])
         if len(g["cases"]) > 2:
             cases += f" and {len(g['cases']) - 2} more"
@@ -542,6 +573,11 @@ def _corpus_section(base, head, names, args):
         mix = ", ".join(f"`{t}` {d:+d}" for t, d in sorted(g["mix"].items(), key=lambda kv: -abs(kv[1]))[:4] if d)
         lines.append(f"| `{g['kernel']}` ({g['arch']}) | {cases} | {g['verdict']} | {g['note'] or moves or 'none'} | "
                      f"{irdiff.fmt(g['ops']) if g['ops'] else 'unchanged'} | {mix or 'unchanged'} |")
+    if len(ordered) > MAX_GROUP_ROWS:
+        lines += [
+            "", f"{len(ordered) - MAX_GROUP_ROWS} more groups; run `tlx_codegen_snapshot.py diff` on the snapshot "
+            "artifacts to list them."
+        ]
     if args.base_ir and args.head_ir:
         details = []
         used = sum(map(len, lines))
@@ -550,13 +586,14 @@ def _corpus_section(base, head, names, args):
             block = irdiff.diff_details({"kernel": g["kernel"], "cases": g["cases"], "stages": stages})
             if not block:
                 continue
-            if used + len(block) > irdiff.COMMENT_BUDGET:
+            if used + len(block) > budget:
                 details.append("The remaining groups' diffs are in the workflow artifacts.\n")
                 break
             details.append(block)
             used += len(block)
         if details:
-            lines += ["", "#### TTGIR and PTX diffs", "", "".join(details)]
+            asm = "PTX" if tag.startswith("sm") else "AMDGCN"
+            lines += ["", f"#### TTGIR and {asm} diffs ({tag})", "", "".join(details)]
     return lines, overall
 
 
@@ -619,8 +656,13 @@ def diff(args):
                     "as a likely perf-relevant codegen change."
                 ]
             lines.append("")
-    if corpus:
-        section, verdict = _corpus_section(base, head, corpus, args)
+    # One section per target, each with an equal share of the comment, so one target's changes cannot crowd out
+    # another's.
+    by_tag = collections.defaultdict(list)
+    for name in corpus:
+        by_tag[next(iter(base["kernels"][name]))].append(name)
+    for tag, names in sorted(by_tag.items()):
+        section, verdict = _corpus_section(base, head, names, args, tag, _irdiff().COMMENT_BUDGET // len(by_tag))
         lines += section
         overall = max(overall, verdict, key=VERDICT_RANK.get)
     lines += ["", f"Overall: **{overall}**.", "This is advisory, not a gate failure."]
@@ -636,7 +678,8 @@ def main():
     snap = sub.add_parser("snapshot")
     snap.add_argument("--out", required=True)
     snap.add_argument("--ptx-version", type=int, default=None, help="pin PTX version int (e.g. 90); default: wheel max")
-    snap.add_argument("--corpus", help="tlx.ops kernels recorded by tlx_ops_bench_ir_dump.py --corpus-out")
+    snap.add_argument("--corpus", action="append",
+                      help="tlx.ops kernels recorded by tlx_ops_bench_ir_dump.py --corpus-out; repeatable")
     snap.add_argument("--ir-dir", help="also write each kernel's TTGIR and PTX here, for diff --base-ir/--head-ir")
     snap.add_argument("--jobs", type=int, default=1, help="compile this many kernels in parallel")
     dummy = sub.add_parser("diff")

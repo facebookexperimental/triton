@@ -91,20 +91,20 @@ jobs:
             echo "pr=${PR}"
           } >> "$GITHUB_OUTPUT"
       - name: Pick the tlx.ops corpus
-        # The nightly B200 benchmark publishes the corpus recorded from main. Both sides of this trace use the copy
-        # picked here; without one the trace covers only the built-in kernels.
+        # The nightly B200 and MI350 benchmarks publish the corpora recorded from main. Both sides of this trace use
+        # the copies picked here; without one the trace covers only the built-in kernels.
         if: steps.pick.outputs.head != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download tlx-ops-bench --repo "${GITHUB_REPOSITORY}" --pattern codegen-corpus.sm100.json --dir corpus \
+          gh release download tlx-ops-bench --repo "${GITHUB_REPOSITORY}" --pattern 'codegen-corpus.*.json' --dir corpus \
             || echo "No codegen corpus published yet; tracing the built-in kernels only."
       - name: Upload the tlx.ops corpus
         if: steps.pick.outputs.head != ''
         uses: actions/upload-artifact@v4
         with:
           name: codegen-corpus-${{ github.run_id }}
-          path: corpus/codegen-corpus.sm100.json
+          path: corpus/codegen-corpus.*.json
           if-no-files-found: ignore
 
   build-head:
@@ -179,8 +179,9 @@ jobs:
         run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Snapshot corpus
         run: |
+          shopt -s nullglob
           CORPUS=()
-          [[ -f corpus/codegen-corpus.sm100.json ]] && CORPUS=(--corpus corpus/codegen-corpus.sm100.json)
+          for f in corpus/codegen-corpus.*.json; do CORPUS+=(--corpus "$f"); done
           python3 .github/scripts/tlx_codegen_snapshot.py snapshot "${CORPUS[@]}" --jobs "$(nproc)" \
             --ir-dir "ir-${{ matrix.side }}" --out "snap-${{ matrix.side }}.json"
       - name: Upload snapshot
