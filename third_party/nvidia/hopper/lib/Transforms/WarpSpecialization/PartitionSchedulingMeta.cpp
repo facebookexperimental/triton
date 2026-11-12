@@ -3076,9 +3076,8 @@ void PartitionSchedulingMeta::runOnOperation() {
         });
         if (storePartition) {
           // Atomics are left alone: a tile-claim atomic must keep the full
-          // partition union (or make autoWS bail out). Scalar stores (e.g. a
-          // per-tile flag) are scheduled too; left unscheduled they are
-          // dropped.
+          // partition union (or make autoWS bail out). An unscheduled store,
+          // scalar or not, is dropped.
           getLoopBodyRegion(loop).walk(
               [&](StoreOp store) { tryScheduleOp(storePartition, store); });
         }
