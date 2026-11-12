@@ -19,7 +19,7 @@ and launches the cubin via the CUDA driver API, so the Python source is not need
 (see store.py) is sha256(normalized PTX) x arch.
 
 Only kernels the PTX-direct path covers are collected; anything build_spec can't express yet
-(non-null global/profile scratch, multi-CTA/cluster, tensordesc args, or any param mismatch) is
+(non-null profile scratch, multi-CTA/cluster, tensordesc args, or any param mismatch) is
 skipped fail-open -- the user's run is never affected. WS/TMA support extends build_spec later.
 """
 
