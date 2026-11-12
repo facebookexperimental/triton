@@ -56,7 +56,7 @@ FOCUS_SUITES = (
         ),
     ),
     FocusSuite(
-        name="sm100_d256_batch1024",
+        name="sm100_2",
         op="flash_attn",
         shapes=(
             FlashAttentionShape(1024, 1, 200, 256, False, "bf16"),
