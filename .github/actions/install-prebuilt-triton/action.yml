@@ -5,6 +5,10 @@ description: >
   everything else reads it from S3 as 16 parallel byte ranges, since a single
   S3 stream sometimes runs at ~1 MB/s (6.5 min for the wheel).
 inputs:
+  artifact-name:
+    description: GitHub artifact containing the wheel
+    required: false
+    default: ""
   wheel-url:
     description: "needs.<build job>.outputs.wheel_url"
     required: false
@@ -24,7 +28,7 @@ runs:
       if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
       uses: actions/download-artifact@v4
       with:
-        name: run_${{ github.run_id }}
+        name: ${{ inputs.artifact-name || format('run_{0}', github.run_id) }}
         path: ${{ runner.temp }}/prebuilt-wheel
     - name: Download prebuilt Triton wheel from S3
       if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository

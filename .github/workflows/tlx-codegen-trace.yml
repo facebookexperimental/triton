@@ -165,6 +165,7 @@ jobs:
       - name: Install prebuilt Triton (${{ matrix.side }})
         uses: ./.ci/.github/actions/install-prebuilt-triton
         with:
+          artifact-name: run_${{ github.run_id }}_${{ matrix.side }}
           wheel-url: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_url || needs.build-base.outputs.wheel_url }}
           wheel-filename: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_filename || needs.build-base.outputs.wheel_filename }}
           wheel-sha256: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_sha256 || needs.build-base.outputs.wheel_sha256 }}
@@ -227,8 +228,12 @@ jobs:
             --base snaps/snap-base.json --head snaps/snap-head.json \
             --base-sha "${BASE_SHA}" --head-sha "${HEAD_SHA}" --pr-head-sha "${PR_HEAD}" \
             --base-ir snaps/ir-base --head-ir snaps/ir-head --out verdict.md
+      - name: Write job summary
+        run: cat verdict.md >> "$GITHUB_STEP_SUMMARY"
       - name: Comment on PR
-        if: needs.resolve.outputs.pr != ''
+        if: >-
+          needs.resolve.outputs.pr != '' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.resolve.outputs.pr }}
