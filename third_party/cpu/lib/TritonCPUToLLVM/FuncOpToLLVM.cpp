@@ -240,14 +240,15 @@ private:
                 this->getTypeConverter()->packFunctionResults(resultTypes)))
         return nullptr;
     }
-    auto newCallOp = LLVM::CallOp::create(rewriter, callOp.getLoc(),
-                                          packedResult ? TypeRange(packedResult)
-                                                       : TypeRange(),
-                                          promotedOperands, callOp->getAttrs());
-    newCallOp.getProperties().setOpBundleSizes(
-        rewriter.getDenseI32ArrayAttr({}));
-    newCallOp.getProperties().setOperandSegmentSizes(
-        {static_cast<int>(promotedOperands.size()), 0});
+    // The callee builder sets operand segment and bundle sizes itself; the
+    // generic builder plus manual setters trip gcc 15 -Wstringop-overflow.
+    auto newCallOp = LLVM::CallOp::create(
+        rewriter, callOp.getLoc(),
+        packedResult ? TypeRange(packedResult) : TypeRange(), callOp.getCallee(),
+        promotedOperands);
+    for (auto attr : callOp->getAttrs())
+      if (attr.getName() != "callee")
+        newCallOp->setAttr(attr.getName(), attr.getValue());
     return newCallOp;
   }
 
