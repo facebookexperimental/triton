@@ -3904,6 +3904,8 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                             ),
                             mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_eligible",
                                               return_value=True),
+                            mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_configs",
+                                              side_effect=lambda configs: configs),
                     ):
                         flex_attention_templates.append_tlx_flex(
                             choices,
@@ -4386,8 +4388,57 @@ class TestFlexAttentionChoiceRegistration(TestCase):
 
 
 @unittest.skipIf(not has_tlx(), "TLX not available")
+class TestDeferredSelection(TestCase):
+    """When TLX defers GEMM selection to a MultiTemplateBuffer without max_autotune."""
+
+    def _defers(self, mode, is_blackwell=False, is_gfx942=False, tlx_choice=True, return_multi_template=True):
+        from triton.language.extra.tlx.inductor import registry
+
+        deferred = []
+        choice = mock.MagicMock()
+        choice.name = "tlx_mm" if tlx_choice else "mm"
+        with (
+                config.patch({"triton.tlx_mode": mode, "max_autotune": False, "max_autotune_gemm": False}),
+                mock.patch.object(registry, "current_target", return_value=type("Target", (),
+                                                                                {"is_blackwell": is_blackwell})()),
+                mock.patch.object(registry, "_is_gfx942", return_value=is_gfx942),
+                mock.patch.object(registry, "_orig_algorithm_selector_call",
+                                  side_effect=lambda *args, **kwargs: deferred.append(config.max_autotune_gemm)),
+        ):
+            registry._tlx_algorithm_selector_call(None, "mm", [choice], return_multi_template=return_multi_template)
+        return deferred == [True]
+
+    def test_blackwell_defers_whenever_tlx_is_on(self):
+        self.assertTrue(self._defers("allow", is_blackwell=True))
+        self.assertTrue(self._defers("force", is_blackwell=True))
+        self.assertTrue(self._defers("allow", is_blackwell=True, tlx_choice=False))
+        self.assertFalse(self._defers(None, is_blackwell=True))
+        self.assertFalse(self._defers("allow", is_blackwell=True, return_multi_template=False))
+
+    def test_gfx942_defers_in_allow_with_a_tlx_choice(self):
+        self.assertTrue(self._defers("allow", is_gfx942=True))
+        self.assertFalse(self._defers("force", is_gfx942=True))
+        self.assertFalse(self._defers("allow", is_gfx942=True, tlx_choice=False))
+
+
+@unittest.skipIf(not has_tlx(), "TLX not available")
 class TestBlackwellFlexAttentionChoices(TestCase):
     """Blackwell forward FlexAttention candidate selection; mocked, needs no GPU."""
+
+    @unittest.skipIf(not torch.cuda.is_available(), "Needs the CUDA config heuristics")
+    def test_base_configs_ignore_max_autotune(self):
+        """The TLX tiles come from the same base list with max_autotune on or off."""
+        from torch._inductor.virtualized import V
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        heuristics = V.choices.get_config_heuristics("cuda")
+        base = {}
+        for max_autotune in (False, True):
+            with config.patch(max_autotune=max_autotune):
+                stock = heuristics.get_flex_attn_fwd_configs(128, 512, torch.bfloat16)
+            base[max_autotune] = flex_attention_templates._blackwell_flex_fwd_configs(stock)
+        self.assertEqual(base[True], base[False])
+        self.assertGreater(len(base[False]), 1)
 
     @staticmethod
     def _append(configs, q_len=512, kernel_options=None, dtypes=(torch.bfloat16, ) * 3, is_blackwell=True, tma=True,
@@ -4406,6 +4457,8 @@ class TestBlackwellFlexAttentionChoices(TestCase):
                                   registration._Template()),
                 mock.patch.object(flex_attention_templates, "current_target", return_value=target),
                 mock.patch("torch._inductor.utils.can_use_tma", return_value=tma),
+                mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_configs",
+                                  side_effect=lambda configs: configs),
         ):
             flex_attention_templates.append_tlx_flex(
                 choices,

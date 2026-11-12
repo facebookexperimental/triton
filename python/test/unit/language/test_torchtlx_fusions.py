@@ -193,6 +193,8 @@ class TestTorchTLXEpilogueFusion(TestCase):
                     "triton.tlx_mode": "force",
                     "force_disable_caches": True,
                     "enable_caching_generated_triton_templates": False,
+                    # Checks the fused codegen: pick now, so the epilogue fuses without a profitability benchmark.
+                    "benchmark_template_fusion": False,
                 }),
                 tlx_config.patch(use_heuristic_config=use_heuristic_config, ),
         ):
