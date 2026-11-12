@@ -99,8 +99,9 @@ def matmul_kernel_warp_pipeline(
         tok_b = tlx.async_load(b_ptr + b_offs, tlx.local_view(smemB, i), mask=offs_k[:, None] < K - k_start)
         tlx.async_load_commit_group([tok_b])
 
-    # Wait for buffer 0
-    tlx.async_load_wait_group((NUM_BUFFERS - 1) * 2)
+    # Wait for buffers 0 and 1: the leading warp group reads buffer 1 before the
+    # lagging group reaches the loop.
+    tlx.async_load_wait_group((NUM_BUFFERS - 2) * 2)
     a_tile = tlx.local_load(tlx.local_view(smemA, 0))
     b_tile = tlx.local_load(tlx.local_view(smemB, 0))
 
@@ -116,11 +117,6 @@ def matmul_kernel_warp_pipeline(
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
-        # Drain the buffer we are about to local_load (its A+B commits). With the
-        # wait placed before the prefetch commits, the oldest pending groups are
-        # next_buf's, so we must keep only (NUM_BUFFERS-2) buffers in flight.
-        tlx.async_load_wait_group((NUM_BUFFERS - 2) * 2)
-
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_offs = a_base_off + (k_prefetch + offs_k[None, :]) * stride_ak
             b_offs = (k_prefetch + offs_k[:, None]) * stride_bk + b_base_off
@@ -132,6 +128,11 @@ def matmul_kernel_warp_pipeline(
             tlx.async_load_commit_group([tok_b])
             a_tile = tlx.local_load(tlx.local_view(smemA, next_buf))
             b_tile = tlx.local_load(tlx.local_view(smemB, next_buf))
+
+        # INVARIANT: the leading warp group reads the next tile while the lagging
+        # group is still in "mfma", so every warp waits for its copies of that tile
+        # here, before the barrier that ends the iteration.
+        tlx.async_load_wait_group((NUM_BUFFERS - 2) * 2)
 
     # Epilogue
     acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
