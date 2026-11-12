@@ -692,12 +692,10 @@ class CompiledKernel:
         min median) and only the winner is kept as the live function -- plain stays in the pool, so
         this can never be slower than baseline. In-memory only; the compile cache keeps its plain cubin.
 
-        Idempotency: the A/B re-launches the kernel on the user's buffers, so it assumes the kernel is
-        safe to re-run (overwrite outputs). This is the same contract as autotuning; a non-idempotent
-        kernel (accumulate / atomics / in-place) needs a restore/reset opt-in.
+        Idempotency: the A/B runs on copies of the launch args (magnon.consume.scratch_args), so
+        in-place / accumulating kernels never touch the caller's buffers. When the args cannot be
+        copied safely, the A/B is skipped and plain is kept.
 
-        TODO(compile_iq): expose an idempotency opt-in surface (env/registry/kwarg) for bare @jit
-        kernels that lack @autotune's restore_value/reset_to_zero; default assumes overwrite-safe.
         TODO(compile_iq): optional cross-process winner cache (key sha256(PTX) x arch x acf_sha ->
         plain|acf) so later processes skip re-benchmarking; today the winner is in-memory per process.
         TODO(compile_iq): ACF-wedge protection deferred to a separate PR -- the A/B piggybacks on
@@ -726,7 +724,12 @@ class CompiledKernel:
                     print(f"[compile_iq.freewin] {self.name}: FORCE-APPLY -> kept acf "
                           "(competition skipped)", flush=True)
                 return
-            bargs = tuple(bound_args.values())
+            from triton.magnon.consume import scratch_args
+
+            # Run the A/B on copies so in-place / accumulating kernels never touch the caller's buffers.
+            bargs = scratch_args(bound_args.values())
+            if bargs is None:
+                return  # cannot copy safely: keep plain (the finally unloads the ACF module)
 
             def _call(func):
                 self._run(grid_0, grid_1, grid_2, stream, func, self.packed_metadata, None, None, None, *bargs)

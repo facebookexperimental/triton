@@ -282,7 +282,7 @@ SPLIT_SOFTMAX_DQ_MATRIX_INSTR_NONKDIM: int = 16
 SPLIT_SOFTMAX_DQ_WAVES_PER_EU: int = 1
 SPLIT_SOFTMAX_DQ_NUM_STAGES: int = 1
 
-# Forwards that `stream_k_supported` accepts (non-causal, untruncated, separate K/V, head dim 128, at most 64
+# Forwards that `stream_k_supported` accepts (non-causal, untruncated, head dim 128, at most 64
 # sequences, all or no softmax heads) take the persistent stream-K kernel in `_forward_stream_k`; "0" keeps them
 # on the tiled kernel. For benchmarking and A/B tests.
 STREAM_K_ENV: str = "TLX_HSTU_CROSS_ATTN_STREAM_K"

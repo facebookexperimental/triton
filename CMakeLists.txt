@@ -306,6 +306,14 @@ if(NOT MSVC)
   # MLIR still supports attribute-dictionary builders during the properties
   # migration. Keep their deprecation warnings visible but non-fatal.
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=deprecated-declarations")
+  # GCC 15 cannot rule out the null-storage branch of
+  # Operation::getPropertiesStorage() in MLIR's inline Properties setters and
+  # reports a write to address zero (-Wstringop-overflow). Keep these false
+  # positives visible but non-fatal.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+     CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=stringop-overflow")
+  endif()
 else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4244 /wd4624 /wd4715 /wd4530")
 endif()

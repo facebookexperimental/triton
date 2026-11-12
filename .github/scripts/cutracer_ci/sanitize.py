@@ -36,8 +36,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from findings import failure_list, reconcile_prefixes
@@ -46,21 +48,35 @@ from sanitizer_log import classify, device_reports, racecheck_findings, report_l
 from source_paths import compiled_kernels, resolve_paths
 
 TOOLS = ("racecheck", "synccheck", "memcheck", "initcheck")
+RACECHECK_TIMEOUT_S = 5 * 60
 
 
 def run_tool(tool: str, cmd: list[str], out: Path, timeout_s: int, triton_cache: Path) -> dict:
     tool_dir = out / tool
     argv = ["cutracer", "compute-sanitizer", "--tool", tool, "-o", str(tool_dir), "--", *cmd]
     print(f"::group::{tool}: {' '.join(argv)}", flush=True)
+    if tool == "racecheck":
+        timeout_s = min(timeout_s, RACECHECK_TIMEOUT_S)
+    started = time.perf_counter()
+    proc = subprocess.Popen(argv, start_new_session=True)
     try:
-        returncode = subprocess.run(argv, timeout=timeout_s, check=False).returncode
+        returncode = proc.wait(timeout=timeout_s)
         timed_out = False
     except subprocess.TimeoutExpired:
         returncode, timed_out = None, True
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
     print("::endgroup::", flush=True)
     log_path = tool_dir / f"{tool}.log"
     log_text = log_path.read_text(errors="replace") if log_path.is_file() else ""
-    result = {"tool": tool, "returncode": returncode, "timed_out": timed_out, "log": str(log_path)}
+    result = {
+        "tool": tool, "returncode": returncode, "timed_out": timed_out, "log": str(log_path), "elapsed_s":
+        round(time.perf_counter() - started, 2), "timeout_s": timeout_s
+    }
     result.update(classify(tool, log_text) if not timed_out else {"outcome": "infra", "count": None})
     result["report"] = report_lines(log_text)
     result["reports"] = device_reports(log_text) if result["outcome"] == "findings" else []
@@ -70,13 +86,12 @@ def run_tool(tool: str, cmd: list[str], out: Path, timeout_s: int, triton_cache:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    # racecheck is opt-in: on mbarrier-synchronized warp-specialized kernels it
-    # reports false-positive hazards and can run for over 30 minutes on a
-    # seconds-long test.
+    # Racecheck stays opt-in and is capped at five minutes per test command.
     parser.add_argument("--tools", default="synccheck,memcheck")
     parser.add_argument("--kernel", default=None, help="Kernel name used to attribute racecheck findings.")
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--timeout-minutes", type=int, default=30, help="Per tool.")
+    parser.add_argument("--timeout-minutes", type=int, default=30,
+                        help="Per tool; racecheck is capped at five minutes.")
     parser.add_argument("--fail-on-findings", action="store_true")
     parser.add_argument("--issue-title-prefix", default=None,
                         help="Write the findings to $GITHUB_OUTPUT as failures=, titled '<prefix> <kernel> in <file>'.")
@@ -104,6 +119,9 @@ def main(argv: list[str] | None = None) -> int:
             result["findings"] = racecheck_findings(Path(result["log"]).read_text(errors="replace"), args.kernel)
         results.append(result)
 
+    kernels = compiled_kernels(triton_cache)
+    for result in results:
+        result["kernels"] = kernels
     (args.out / "results.json").write_text(json.dumps({"kernel": args.kernel, "cmd": cmd, "results": results},
                                                       indent=2))
     summary = render(results, args.kernel, cmd)

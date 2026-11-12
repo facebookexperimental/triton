@@ -32,8 +32,11 @@ autotune_tma_epilogue_store: bool = (
 
 # In "allow" mode, minimum speedup TLX must achieve over the best extern
 # kernel (cublas) to be selected. Below this threshold, the extern kernel wins.
+# Autotune times each candidate alone at one sample shape; on the H100 OneFeed
+# merge net, TLX GEMMs that won it by under 10% ran 1.15-1.25x slower than
+# cuBLAS in serving.
 allow_min_speedup: float = float(
-    os.environ.get("TORCHINDUCTOR_TLX_ALLOW_MIN_SPEEDUP", "1.0")
+    os.environ.get("TORCHINDUCTOR_TLX_ALLOW_MIN_SPEEDUP", "1.1")
 )
 
 # Lower eligible SDPA flash-attention calls (see sdpa_to_flex.eligible) through the

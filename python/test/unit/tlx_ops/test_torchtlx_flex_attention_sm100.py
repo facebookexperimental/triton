@@ -66,7 +66,7 @@ def test_flex_forward_one_group(runner, tmp_path, mod, q_len, kv_len, dim, dtype
         normal, full = block_mask.kv_num_blocks, block_mask.full_kv_num_blocks
         total = normal + full
         assert ((normal > 0) & (full > 0) & (total >= 3) & (total % 2 == 1)).any()
-    options = {"FORCE_USE_FLEX_ATTENTION": True}
+    options = {"FORCE_USE_FLEX_ATTENTION": True, "fwd_BLOCK_N": 64}
     stock, reference = runner.compile_arm(tensors, score_mod, block_mask, None, tmp_path / "stock.py",
                                           kernel_options=options)
     tlx, result = runner.compile_arm(tensors, score_mod, block_mask, "force", tmp_path / "tlx.py",
@@ -90,6 +90,7 @@ def test_flex_adapter_preserves_blackwell_choice_space(monkeypatch, benchmark):
         choices.append(kwargs)
 
     monkeypatch.setattr(templates, "_use_amd_flex_template", lambda: False)
+    monkeypatch.setattr(templates, "_blackwell_flex_fwd_configs", lambda configs: configs)
     monkeypatch.setattr(templates, "current_target", lambda: SimpleNamespace(num_sms=148, is_blackwell=True))
     monkeypatch.setattr(torch._inductor.utils, "can_use_tma", lambda *args: True)
     monkeypatch.setattr(templates, "blackwell_flex_attention_template", SimpleNamespace(maybe_append_choice=append))

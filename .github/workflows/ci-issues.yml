@@ -28,6 +28,11 @@ on:
         required: false
         type: string
         default: ""
+      recovery:
+        description: Encoded passing-test evidence from completed steps.
+        required: false
+        type: string
+        default: ""
       sha:
         description: Git SHA the test job tested.
         required: true
@@ -42,6 +47,11 @@ permissions:
   contents: read
   issues: write
   actions: read
+
+concurrency:
+  group: ci-issues-${{ inputs.workflow }}-${{ github.ref_name }}-${{ inputs.job }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   report:
@@ -83,10 +93,15 @@ jobs:
       workflow_name: ${{ inputs.workflow }}${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
       job_name: ${{ inputs.job }}
       failures: ${{ inputs.failures }}
+      recovery: ${{ inputs.recovery }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   group:
     needs: [report, reconcile]
+    concurrency:
+      group: ci-parent-${{ inputs.sha }}
+      cancel-in-progress: false
+      queue: max
     if: >-
       always()
       && (github.event_name == 'schedule' || github.event_name == 'push')

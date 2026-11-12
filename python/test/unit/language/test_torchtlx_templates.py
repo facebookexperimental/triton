@@ -2556,16 +2556,17 @@ class TestHopperMMTemplate(TestCase):
         def mm_residual(a, b, y, z):
             return (a @ b) * y + z
 
-        with mock.patch.object(sm90, "heuristic_config", lambda *args: [sm90._config(128, 256, 4)]), config.patch({
-                "triton.tlx_mode":
-                "force",
-                "test_configs.autotune_choice_name_regex":
-                "tlx_hopper_gemm_ws",
-                "force_disable_caches":
-                True,
-                "enable_caching_generated_triton_templates":
-                False,
-        }):
+        with mock.patch.object(sm90, "heuristic_config",
+                               lambda *args, **kwargs: [sm90._config(128, 256, 4)]), config.patch({
+                                   "triton.tlx_mode":
+                                   "force",
+                                   "test_configs.autotune_choice_name_regex":
+                                   "tlx_hopper_gemm_ws",
+                                   "force_disable_caches":
+                                   True,
+                                   "enable_caching_generated_triton_templates":
+                                   False,
+                               }):
             actual, code = run_and_get_code(torch.compile(mm_residual), a, b, y, z)
         expected = ((a.float() @ b.float()) * y.float() + z.float()).to(torch.float16)
         torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
@@ -2680,24 +2681,15 @@ class TestHopperMMTemplate(TestCase):
         for load in bias_loads:
             self.assertIn("ymask", load)
 
-    @parametrize("op", ("mm", "addmm_n", "addmm_mn", "mm_gelu"))
     @parametrize("swap_ab", (False, True))
-    def test_split_k(self, op, swap_ab):
-        """K split across work units: each writes an fp32 partial to the split-K
-        workspace and _reduce_k_kernel sums them, adds the bias and replays any
-        fused epilogue. M is ragged and K leaves a short last split."""
+    def test_no_split_k(self, swap_ab):
+        """Inductor runs the Hopper template whole-K: a split-K config is
+        replaced by its whole-K counterpart, so no workspace or reducer."""
         from triton.tlx.ops.kernels.mm import sm90
 
         m, n, k = (7, 1000, 64 * 41) if swap_ab else (264, 1000, 64 * 41)
         a, b = _operands((m, n, k), "nt", torch.float16)
-        bias = torch.randn(n if op != "addmm_mn" else (m, n), device=GPU_TYPE, dtype=torch.float16)
-        ref = a.float() @ b.float()
-        if op == "mm":
-            fn, args, expected = torch.mm, (a, b), ref
-        elif op == "mm_gelu":
-            fn, args, expected = (lambda x, y: torch.nn.functional.gelu(x @ y)), (a, b), torch.nn.functional.gelu(ref)
-        else:
-            fn, args, expected = torch.addmm, (bias, a, b), bias.float() + ref
+        bias = torch.randn(n, device=GPU_TYPE, dtype=torch.float16)
         if swap_ab:
             conf = sm90._config(128, 16, 4, 1, 4, 128, True)
             pin = mock.patch.object(sm90, "_swap_heuristic_config", return_value=[conf])
@@ -2705,11 +2697,12 @@ class TestHopperMMTemplate(TestCase):
             conf = sm90._config(128, 128, 4, group_size_m=1, split_k=4)
             pin = mock.patch.object(sm90, "heuristic_config", return_value=[conf])
         with pin, config.patch(_HOPPER_ADDMM_PATCH):
-            actual, code = run_and_get_code(torch.compile(fn), *args)
-        torch.testing.assert_close(actual, expected.half(), atol=3e-2, rtol=3e-2)
+            actual, code = run_and_get_code(torch.compile(torch.addmm), bias, a, b)
+        torch.testing.assert_close(actual, (bias.float() + a.float() @ b.float()).half(), atol=3e-2, rtol=3e-2)
         generated = "\n".join(code)
-        self.assertIn("split_k_ws", generated)
-        self.assertIn("_reduce_k", generated)
+        self.assertIn(_HOPPER_WS, generated)
+        self.assertNotIn("split_k_ws", generated)
+        self.assertNotIn("_reduce_k", generated)
 
     @parametrize("op", ("mm", "addmm"))
     @parametrize("shape,layout", (
@@ -3287,6 +3280,25 @@ class TestMaybeOverrideBestChoice(TestCase):
         with tlx_config.patch(allow_min_speedup=0.0):
             result = maybe_override_best_choice(tlx_choice, timings)
         self.assertIs(result, tlx_choice)
+
+    def _deferred_pick(self, timings):
+        from triton.language.extra.tlx.inductor import registry
+
+        node = mock.MagicMock()
+        node.choice_timings.return_value = timings
+        best = min(timings, key=timings.__getitem__)
+        with mock.patch.object(registry, "_orig_get_min_choice", return_value=(best, timings[best])):
+            return registry._margin_min_choice(node)
+
+    def test_deferred_pick_applies_margin_over_extern(self):
+        """A MultiTemplateBuffer's final pick honors allow_min_speedup too."""
+        tlx_choice = self._make_choice("triton_tlx_hopper_gemm_small_k_182")
+        extern_choice = self._make_choice("addmm", is_extern=True)
+        timings = {tlx_choice: 0.1130, extern_choice: 0.1208}
+        with tlx_config.patch(allow_min_speedup=1.1):
+            self.assertEqual(self._deferred_pick(timings), (extern_choice, 0.1208))
+        with tlx_config.patch(allow_min_speedup=1.05):
+            self.assertEqual(self._deferred_pick(timings), (tlx_choice, 0.1130))
 
     def _unfused_pick(self, timings, steady=None):
         from triton.language.extra.tlx.inductor import registry
@@ -3889,6 +3901,8 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                             ),
                             mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_eligible",
                                               return_value=True),
+                            mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_configs",
+                                              side_effect=lambda configs: configs),
                     ):
                         flex_attention_templates.append_tlx_flex(
                             choices,
@@ -4375,8 +4389,57 @@ class TestFlexAttentionChoiceRegistration(TestCase):
 
 
 @unittest.skipIf(not has_tlx(), "TLX not available")
+class TestDeferredSelection(TestCase):
+    """When TLX defers GEMM selection to a MultiTemplateBuffer without max_autotune."""
+
+    def _defers(self, mode, is_blackwell=False, is_gfx942=False, tlx_choice=True, return_multi_template=True):
+        from triton.language.extra.tlx.inductor import registry
+
+        deferred = []
+        choice = mock.MagicMock()
+        choice.name = "tlx_mm" if tlx_choice else "mm"
+        with (
+                config.patch({"triton.tlx_mode": mode, "max_autotune": False, "max_autotune_gemm": False}),
+                mock.patch.object(registry, "current_target", return_value=type("Target", (),
+                                                                                {"is_blackwell": is_blackwell})()),
+                mock.patch.object(registry, "_is_gfx942", return_value=is_gfx942),
+                mock.patch.object(registry, "_orig_algorithm_selector_call",
+                                  side_effect=lambda *args, **kwargs: deferred.append(config.max_autotune_gemm)),
+        ):
+            registry._tlx_algorithm_selector_call(None, "mm", [choice], return_multi_template=return_multi_template)
+        return deferred == [True]
+
+    def test_blackwell_defers_whenever_tlx_is_on(self):
+        self.assertTrue(self._defers("allow", is_blackwell=True))
+        self.assertTrue(self._defers("force", is_blackwell=True))
+        self.assertTrue(self._defers("allow", is_blackwell=True, tlx_choice=False))
+        self.assertFalse(self._defers(None, is_blackwell=True))
+        self.assertFalse(self._defers("allow", is_blackwell=True, return_multi_template=False))
+
+    def test_gfx942_defers_in_allow_with_a_tlx_choice(self):
+        self.assertTrue(self._defers("allow", is_gfx942=True))
+        self.assertFalse(self._defers("force", is_gfx942=True))
+        self.assertFalse(self._defers("allow", is_gfx942=True, tlx_choice=False))
+
+
+@unittest.skipIf(not has_tlx(), "TLX not available")
 class TestBlackwellFlexAttentionChoices(TestCase):
     """Blackwell forward FlexAttention candidate selection; mocked, needs no GPU."""
+
+    @unittest.skipIf(not torch.cuda.is_available(), "Needs the CUDA config heuristics")
+    def test_base_configs_ignore_max_autotune(self):
+        """The TLX tiles come from the same base list with max_autotune on or off."""
+        from torch._inductor.virtualized import V
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        heuristics = V.choices.get_config_heuristics("cuda")
+        base = {}
+        for max_autotune in (False, True):
+            with config.patch(max_autotune=max_autotune):
+                stock = heuristics.get_flex_attn_fwd_configs(128, 512, torch.bfloat16)
+            base[max_autotune] = flex_attention_templates._blackwell_flex_fwd_configs(stock)
+        self.assertEqual(base[True], base[False])
+        self.assertGreater(len(base[False]), 1)
 
     @staticmethod
     def _append(configs, q_len=512, kernel_options=None, dtypes=(torch.bfloat16, ) * 3, is_blackwell=True, tma=True,
@@ -4396,6 +4459,8 @@ class TestBlackwellFlexAttentionChoices(TestCase):
                                   registration._Template()),
                 mock.patch.object(flex_attention_templates, "current_target", return_value=target),
                 mock.patch("torch._inductor.utils.can_use_tma", return_value=tma),
+                mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_configs",
+                                  side_effect=lambda configs: configs),
         ):
             flex_attention_templates.append_tlx_flex(
                 choices,

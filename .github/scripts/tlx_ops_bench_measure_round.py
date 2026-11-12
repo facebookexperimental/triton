@@ -20,6 +20,10 @@ def measure(prepared, role, source, harness, output):
             return {"status": "error", "reason": "good endpoint did not select a GPU"}
         step["gpu_uuid"] = good["gpu_uuid"]
     work = Path(tempfile.mkdtemp(prefix=f"perf-measure-{role}-", dir=os.environ.get("RUNNER_TEMP")))
+    if role.startswith("ir-"):
+        env = os.environ.copy()
+        env["TRITON_HOME"] = str(output.resolve() / "triton-home")
+        return {"status": dump_ir(step, step["gpu_uuid"], output / "ir" / role, work, env)}
     step_path = work / "step.json"
     step_path.write_text(json.dumps(step))
     destination = work / "measurement.json"
@@ -35,13 +39,36 @@ def measure(prepared, role, source, harness, output):
          str(destination)], timeout=900, cwd=work, env=env)
     if not destination.exists():
         return {"status": "error", "reason": "measurement process failed"}
-    return json.loads(destination.read_text())
+    result = json.loads(destination.read_text())
+    # The endpoints stay the same in every round, so their kernels are dumped once, in round 0.
+    if role != "candidate" and prepared.get("round", 0) == 0 and result.get("gpu_uuid"):
+        result["ir_dump"] = dump_ir(step, result["gpu_uuid"], output / "ir" / role, work, env)
+    return result
+
+
+def dump_ir(step, gpu_uuid, out, work, env):
+    """Dump the case's kernels in a separate process so the measurement itself never runs with IR dumping on."""
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve().parent / "tlx_ops_bench_ir_dump.py"), "--harness", step["harness"], "--key",
+        step["key"], "--direction", step["direction"], "--gpu-uuid", gpu_uuid, "--out",
+        str(out.resolve())
+    ]
+    for module in step["modules"]:
+        cmd += ["--module", module]
+    try:
+        worker.run(cmd, timeout=600, cwd=work, env=env)
+        return "ok"
+    except Exception as exc:
+        return f"failed: {type(exc).__name__}: {exc}"
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepared", type=Path, required=True)
-    parser.add_argument("--role", choices=("good", "bad", "candidate"), required=True)
+    parser.add_argument(
+        "--role", choices=("good", "bad", "candidate", "ir-base", "ir-head"), required=True,
+        help="ir-base and ir-head only dump the case's kernels, for the first bad commit and its parent")
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--harness", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

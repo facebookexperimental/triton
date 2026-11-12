@@ -20,6 +20,8 @@ on:
       - '.github/scripts/ci_health.py'
       - '.github/scripts/ci_health_rules.py'
       - '.github/scripts/ci_health_logs.py'
+      - '.github/scripts/ci_health_sanitizer.py'
+      - '.github/workflows/cutracer.yml'
       - '.github/scripts/ci_health_dashboard.html'
       - '.github/scripts/runner_health.py'
       - '.github/scripts/test_ci_health.py'
@@ -81,7 +83,7 @@ jobs:
         run: python3 -m pytest -s --tb=short test_ci_health.py test_ci_health_rules.py test_ci_health_logs.py test_runner_health.py test_meta_llvm_bump.py test_gpu_ci.py test_kernel_test_selection.py
       - name: Run throughput regression tests
         working-directory: .github/scripts
-        run: python3 -m pytest -s --tb=short test_tlx_ops_bench_regressions.py test_tlx_ops_bench_bisect_round.py test_tlx_ops_bench_bisect.py test_tlx_ops_bench_dashboard.py test_failure_issues.py
+        run: python3 -m pytest -s --tb=short test_tlx_ops_bench_regressions.py test_tlx_ops_bench_bisect_round.py test_tlx_ops_bench_bisect.py test_tlx_ops_bench_dashboard.py test_tlx_ops_bench_ir_diff.py test_failure_issues.py
 
   collect:
     if: github.event_name != 'pull_request' && github.repository_owner == 'facebookexperimental'

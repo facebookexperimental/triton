@@ -202,6 +202,18 @@ def _blackwell_flex_fwd_eligible(query, key, value) -> bool:
     return can_use_tma(query, key, value)
 
 
+def _blackwell_flex_fwd_configs(configs):
+    """The stock autotune configs, then any of ``configs`` not among them.
+
+    max_autotune only widens the stock list, so this base list is the same with it
+    on or off.
+    """
+    from torch._inductor.virtualized import V
+
+    autotune = list(getattr(V.choices.get_config_heuristics("cuda"), "flex_attn_fwd_autotune_configs", ()))
+    return autotune + [conf for conf in configs if conf not in autotune]
+
+
 def _append_tlx_flex_nvidia(
     choices,
     configs,
@@ -228,6 +240,7 @@ def _append_tlx_flex_nvidia(
     if not _blackwell_flex_fwd_eligible(*input_nodes[:3]):
         return
 
+    configs = _blackwell_flex_fwd_configs(configs)
     num_sms = current_target().num_sms
 
     def tlx_options():

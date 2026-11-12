@@ -40,6 +40,7 @@ jobs:
     timeout-minutes: 120
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     env:
       CCACHE_DIR: /tmp/triton-lit-ccache
       CCACHE_MAXSIZE: 2G
@@ -101,6 +102,7 @@ jobs:
         id: lit
         run: |
           set -o pipefail
+          rm -f /tmp/lit.log
           ccache --zero-stats
           python3 -m pip install cmake ninja lit
           LLVM="$GITHUB_WORKSPACE/llvm-install"
@@ -112,6 +114,7 @@ jobs:
             -DTRITON_CODEGEN_BACKENDS="nvidia;amd;cpu" \
             -DTRITON_BUILD_UT=OFF \
             -DLLVM_EXTERNAL_LIT="$(which lit)" \
+            -DLLVM_LIT_ARGS="-v" \
             .
           ninja -C build check-triton-lit-tests 2>&1 | tee /tmp/lit.log
 
@@ -125,6 +128,7 @@ jobs:
           failed: ${{ steps.lit.outcome == 'failure' }}
           bucket: compiler-lit
           lit-log: /tmp/lit.log
+          completed-lit: ${{ steps.lit.outcome == 'success' || steps.lit.outcome == 'failure' }}
 
       - name: Report LIT ccache statistics
         if: always() && steps.lit.outcome != 'skipped'
@@ -151,4 +155,5 @@ jobs:
       job: lit-tests
       result: ${{ needs.lit-tests.result }}
       failures: ${{ needs.lit-tests.outputs.failures }}
+      recovery: ${{ needs.lit-tests.outputs.recovery }}
       sha: ${{ github.sha }}

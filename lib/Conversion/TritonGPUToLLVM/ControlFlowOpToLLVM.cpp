@@ -128,10 +128,10 @@ private:
                                           packedResult ? TypeRange(packedResult)
                                                        : TypeRange(),
                                           promotedOperands, callOp->getAttrs());
-    newCallOp.getProperties().setOpBundleSizes(
-        rewriter.getDenseI32ArrayAttr({}));
-    newCallOp.getProperties().setOperandSegmentSizes(
-        {static_cast<int>(promotedOperands.size()), 0});
+    newCallOp.getProperties().op_bundle_sizes =
+        rewriter.getDenseI32ArrayAttr({});
+    newCallOp.getProperties().operandSegmentSizes = {
+        static_cast<int32_t>(promotedOperands.size()), 0};
     return newCallOp;
   }
 

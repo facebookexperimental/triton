@@ -42,6 +42,7 @@ jobs:
       actions: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -113,6 +114,7 @@ jobs:
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
           job: b200-tlx-test
+          completed-junit: ${{ (steps.run_core_tests.outcome == 'success' || steps.run_core_tests.outcome == 'failure') && '/tmp/tlx-core.xml' || '' }} ${{ (steps.run_correctness_tests.outcome == 'success' || steps.run_correctness_tests.outcome == 'failure') && '/tmp/tlx-correctness.xml' || '' }} ${{ (steps.run_codegen_tests.outcome == 'success' || steps.run_codegen_tests.outcome == 'failure') && '/tmp/tlx-codegen.xml' || '' }}
           failed: ${{ job.status != 'success' }}
           bucket: b200-tlx-job-failed
           junit: ${{ fromJSON(inputs.plan).core.files[0] != null && '/tmp/tlx-core.xml' || '' }} ${{ fromJSON(inputs.plan).correctness.files[0] != null && '/tmp/tlx-correctness.xml' || '' }} ${{ fromJSON(inputs.plan).codegen.files[0] != null && '/tmp/tlx-codegen.xml' || '' }}
@@ -135,6 +137,7 @@ jobs:
       contents: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -243,6 +246,7 @@ jobs:
       actions: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -288,6 +292,7 @@ jobs:
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
           job: b200-gluon-test
+          completed-junit: ${{ (steps.run_gluon.outcome == 'success' || steps.run_gluon.outcome == 'failure') && '/tmp/gluon.xml' || '' }}
           failed: ${{ job.status != 'success' }}
           bucket: b200-gluon-job-failed
           junit: /tmp/gluon.xml
@@ -309,6 +314,7 @@ jobs:
       job: b200-tlx-test
       result: ${{ needs.b200-tlx-test.result }}
       failures: ${{ needs.b200-tlx-test.outputs.failures }}
+      recovery: ${{ needs.b200-tlx-test.outputs.recovery }}
       sha: ${{ inputs.ref }}
       platform: b200
 
@@ -341,5 +347,6 @@ jobs:
       job: b200-gluon-test
       result: ${{ needs.b200-gluon-test.result }}
       failures: ${{ needs.b200-gluon-test.outputs.failures }}
+      recovery: ${{ needs.b200-gluon-test.outputs.recovery }}
       sha: ${{ inputs.ref }}
       platform: b200
