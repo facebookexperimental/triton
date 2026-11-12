@@ -1,4 +1,4 @@
-"""gfx1250 TLX candidates for the plain-E4M3 per-head KV contract.
+"""gfx1250 implementation for TLX paged FP8 attention with per-head scales.
 
 Design references: AITER's split unified attention and packed-cache movement,
 TokenSpeed's grouped-head WMMA decode, vLLM's online softmax/scale placement,
@@ -429,3 +429,88 @@ def decode(q, k, v, lengths, table, ks, vs, *, q_scale, query_length, causal, wi
         _merge[(tokens * heads, )](mid, lse, out, dim, num_splits, triton.next_power_of_2(num_splits), vs, heads, group,
                                    num_warps=(1 if num_splits * dim <= 8192 else 4 if num_splits * dim <= 32768 else 8))
     return out
+
+
+def _select_decode_config(q, key_cache, *, max_context_len, query_length=1, window_size=0, num_splits=None):
+    """Return the measured shape policy; unknown model metadata is never inferred.
+
+    Pass this configuration explicitly or use variant="auto". Shapes outside
+    the measured families use the same semantic kernel with a heuristic config.
+    """
+    tokens, heads, dim = q.shape
+    kv_heads, page = key_cache.shape[1], key_cache.shape[3]
+    effective = max(1, min(max_context_len, window_size or max_context_len))
+    group = heads // kv_heads
+    if query_length == 1 and effective <= 128:
+        cfg = dict(variant="matrix_tdm_flat" if page in (64, 128) else "vector",
+                   block_n=page if page in (64, 128) else min(128, max(32, triton.next_power_of_2(effective))),
+                   block_m=16, num_warps=1 if (dim == 128 and effective > 64) or (dim == 64 and kv_heads >= 32) else 4,
+                   num_splits=1)
+    elif query_length == 1 and effective >= 65536 and kv_heads <= 8:
+        cfg = dict(variant="matrix_tdm_flat" if page in (64, 128) else "matrix",
+                   block_n=page if page in (64, 128) else 32, block_m=16, num_warps=1,
+                   num_splits=min(512, max(128, triton.cdiv(768 if dim == 128 else 512, kv_heads))))
+    elif page in (64, 128):
+        bm = 16 if query_length == 1 else 64
+        tasks = tokens // query_length * kv_heads * triton.cdiv(query_length * group, bm)
+        if query_length == 1:
+            if kv_heads >= 32:
+                chunk = 1024 if page == 128 and effective >= 8192 else 3 * page if dim == 128 else 256
+                split_cap = 128
+            else:
+                chunk = 2 * page if dim == 128 and page == 64 and effective >= 4096 else page
+                split_cap = 256 if page == 128 and dim == 64 else 128
+            splits = min(split_cap, triton.cdiv(effective, chunk))
+        else:
+            splits = min(triton.cdiv(effective, page), max(1, triton.cdiv(384, tasks)), 128)
+        if query_length == 1 and q.dtype == torch.bfloat16 and effective > 128:
+            if kv_heads >= 32 and effective >= 8192:
+                # Long dense partitions amortize descriptor/setup traffic;
+                # excessive splitting increases scheduling and merge work.
+                # Maintain enough CTAs for smaller KV-head grids.
+                if dim == 128:
+                    splits = max(12, triton.cdiv(768, tasks))
+                elif page == 64:
+                    splits = min(32, max(triton.cdiv(1024, tasks), triton.cdiv(effective, 1024)))
+                else:
+                    splits = min(32, max(12, triton.cdiv(1024, tasks), triton.cdiv(effective, 4096)))
+            elif dim == 64 and kv_heads < 32 and page == 64:
+                # Sparse grouped grids need more independent page partitions.
+                pages = triton.cdiv(effective, page)
+                splits = min(256, triton.next_power_of_2(pages))
+                if tokens > query_length:
+                    # Independent requests already supply parallel work.
+                    splits = min(splits, pages)
+        cfg = dict(
+            variant="matrix_tdm_flat", block_n=page, block_m=bm, num_warps=1 if query_length == 1 and
+            (kv_heads >= 32 or dim == 128 or page == 128 or q.dtype == torch.bfloat16 and effective > 128)
+            and not (dim == 128 and q.dtype == torch.float8_e4m3fn and kv_heads < 32 and page == 64) else 4,
+            num_splits=splits)
+    else:
+        cfg = dict(variant="matrix", block_n=32, block_m=16, num_warps=4,
+                   num_splits=min(128, triton.cdiv(effective, 128)))
+    if num_splits is not None:
+        cfg["num_splits"] = num_splits
+    return cfg
+
+
+def paged_attention_decode_fp8(query, key_cache, value_cache, context_lens, block_tables, k_scale, v_scale, *,
+                               max_context_len, q_scale=None, query_length=1, causal=True, sliding_window=0,
+                               sm_scale=None, num_splits=None, out=None, workspace=None):
+    config = _select_decode_config(query, key_cache, max_context_len=max_context_len, query_length=query_length,
+                                   window_size=sliding_window, num_splits=num_splits)
+    return decode(query, key_cache, value_cache, context_lens, block_tables, k_scale, v_scale, q_scale=q_scale,
+                  query_length=query_length, causal=causal, window_size=sliding_window, sm_scale=sm_scale, out=out,
+                  workspace=workspace, **config)
+
+
+def paged_attention_decode_fp8_workspace(query, key_cache, value_cache, block_tables, *, max_context_len,
+                                         query_length=1, sliding_window=0, num_splits=None):
+    config = _select_decode_config(query, key_cache, max_context_len=max_context_len, query_length=query_length,
+                                   window_size=sliding_window, num_splits=num_splits)
+    splits = config["num_splits"]
+    if splits == 1:
+        return None
+    tokens, heads, dim = query.shape
+    return (torch.empty((tokens, heads, splits, dim), dtype=torch.float32, device=query.device),
+            torch.empty((tokens, heads, splits), dtype=torch.float32, device=query.device))
