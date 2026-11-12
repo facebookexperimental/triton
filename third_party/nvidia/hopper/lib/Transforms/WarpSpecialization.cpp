@@ -192,10 +192,8 @@ public:
       return bailOut(funcOp);
     }
 
-    // An MMA operand the TMA engine cannot write in the MMA's layout is staged
-    // through registers into a single buffer that the MMA's own partition both
-    // fills and reads asynchronously, with no barrier between them. Fall back
-    // to the non-specialized pipeline, which orders the store after the MMA.
+    // A register-staged MMA operand is written and read asynchronously by the
+    // MMA's own partition with no barrier between them.
     if (hasRegisterStagedMMAOperand(funcOp)) {
       LDBG("Warp specialization does not support register-staged MMA "
            "operands. Skipping.");

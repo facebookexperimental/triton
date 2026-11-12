@@ -53,12 +53,8 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
                               const MemoryPlannerOptions &options = {});
 
 LogicalResult doBufferAllocation(triton::FuncOp funcOp);
-// Whether an MMAv5 operand is a descriptor load that the TMA engine cannot
-// write in the layout the MMA reads (e.g. FP32 that AccelerateMatmul relaid
-// out to a non-transposed operand), so it would be staged through registers
-// into a buffer owned by the MMA's own partition. Code partitioning puts no
-// barrier between that store and the asynchronous MMA reading the previous
-// contents, so such a function must not be warp-specialized.
+// Whether an MMAv5 operand is a descriptor load TMA cannot write in the MMA's
+// layout, so it would be staged through registers in the MMA's own partition.
 bool hasRegisterStagedMMAOperand(triton::FuncOp funcOp);
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp funcOp);
