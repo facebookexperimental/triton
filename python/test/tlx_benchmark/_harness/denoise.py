@@ -483,6 +483,7 @@ ARCH_BY_PART = {
     "MI300X": "gfx942",
     "MI450X": "gfx1250",
     "MI455X": "gfx1250",
+    "gfx1250": "gfx1250",
 }
 
 
@@ -677,7 +678,9 @@ def _amd_sysfs_devices() -> list[Device]:
     except OSError:
         return []
     found = []
-    parts = {0x74a0: "MI300X", 0x74a1: "MI300X", 0x75a0: "MI350X", 0x75a1: "MI355X", 0x75a3: "MI355X"}
+    parts = {
+        0x74a0: "MI300X", 0x74a1: "MI300X", 0x75a0: "MI350X", 0x75a1: "MI355X", 0x75a3: "MI355X", 0x75c1: "gfx1250"
+    }
     for node in nodes:
         try:
             props = dict(line.split() for line in (node / "properties").read_text().splitlines())

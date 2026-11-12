@@ -86,6 +86,14 @@ _NORM_AUTOGRAD = frozenset([
 # A missing (op, arch) is deferred, not an error -- the op raises on that arch.
 CATALOG: tuple[OpSpec, ...] = (
     OpSpec(
+        op="paged_prefill",
+        arch="gfx1250",
+        variant="tdm_wmma",
+        impl="triton.tlx.ops.kernels.paged_prefill.gfx1250:paged_prefill",
+        invariant_vocab=_ATTN_DIMS,
+        dtypes=_BF16,
+    ),
+    OpSpec(
         op="mm",
         arch="sm90",
         variant="ws_cooperative",

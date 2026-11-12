@@ -13,7 +13,7 @@ python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
-`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, or one of the
+`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, `paged_prefill`, or one of the
 fused operators below.
 
 Fused operators fuse an elementwise epilogue into a GEMM (`tlx/ops/kernels/fused/`): `addmm_mul_add`,
@@ -67,6 +67,7 @@ options:
 | `kda` | none | absolute floor, currently unset -> reports only | full |
 | `kda_prefill` | none | absolute floor, currently unset -> reports only | heuristic |
 | `kda_decode` | none | absolute floor, currently unset -> reports only | heuristic |
+| `paged_prefill` | none | FP64 check; throughput reporting only | heuristic |
 | `mla_window_attn` | `torch.compile` of the module, attention as FlexAttention | speedup >= 0.9x | heuristic |
 | `swiglu_ffn` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 | `rmsnorm_cat` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
@@ -79,6 +80,15 @@ options:
 |----|-----------|------|---------------|
 | `addmm_mul_add` | `torch.addmm` + `torch.addcmul` | speedup >= 0.9x | heuristic |
 | `linear_rowscale` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
+
+`paged_prefill` covers BF16 causal 16Q/2KV, D64, 64-token shuffled pages on
+gfx1250, globally and with a 2048-token window including self. Its useful
+TFLOP/s counts only QK+PV over valid attention pairs (FMA=2); masked work,
+softmax and normalization are excluded. It reports GPU kernel time, excluding
+host allocation/dispatch. It does not compare paged inputs with a dense-only
+reference. Correctness: `pytest -s --tb=short
+python/test/unit/tlx_ops/test_paged_prefill_gfx1250.py`. On shared hosts, hold
+the host's GPU lock for the entire test or benchmark process.
 
 The direct `mm` provider has a `heuristic_config`, so its default is a single
 analytically chosen config. The TorchTLX providers use Inductor's template
