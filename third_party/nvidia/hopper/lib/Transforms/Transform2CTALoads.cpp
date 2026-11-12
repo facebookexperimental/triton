@@ -546,13 +546,9 @@ struct Transform2CTALoads
     return success();
   }
 
-  // Split a B tile built in registers from descriptor loads (e.g. a dtype
-  // cast, a scale by an N-independent vector, a product of two tiles, or a
-  // rank-3 load reshaped to 2-D). Every value on the way from the descriptor
-  // loads to the local_alloc carries the N dimension; each load is replaced by
-  // its CTA's half (as in transformBLoad) and the chain is rebuilt at half
-  // width. Values that do not carry N (broadcast sources, splats, scalars)
-  // are reused as they are.
+  // Split a B tile built in registers from descriptor loads: each load is
+  // replaced by its CTA's half and the N-carrying chain is rebuilt at half
+  // width. Values that do not carry N are reused as they are.
   LogicalResult transformRegisterBuiltB(Value b, Operation *mma) {
     if (!b)
       return failure();
@@ -575,8 +571,8 @@ struct Transform2CTALoads
       return failure();
     int64_t halfN = fullN / 2;
 
-    // Collect the N-carrying slice in post-order (operands first), with the
-    // dimension of each value that holds N.
+    // Post-order (operands first), with the dimension of each value that
+    // holds N.
     DenseMap<Value, unsigned> splitDimOf;
     SmallVector<Value> slice;
     SmallVector<tt::DescriptorLoadOp> loads;
@@ -763,7 +759,6 @@ struct Transform2CTALoads
       halfOf[v] = newV;
     }
 
-    // Allocate the half tile and swap it in.
     OpBuilder builder(localAlloc);
     Value allocSrc = halfOf.lookup(root);
     auto allocSrcType = cast<RankedTensorType>(allocSrc.getType());
@@ -790,7 +785,6 @@ struct Transform2CTALoads
     }
     if (localAlloc.getResult().use_empty())
       localAlloc.erase();
-    // Erase the full-width chain where nothing else uses it.
     for (Value v : llvm::reverse(slice))
       if (v.use_empty())
         v.getDefiningOp()->erase();
