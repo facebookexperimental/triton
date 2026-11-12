@@ -4105,6 +4105,18 @@ def _unfused_min_choice(self, hint_override=None):
     return extern, timings[extern]
 
 
+def _tlx_get_min_choice(self, hint_override=None):
+    # Benchmark fusion picks here, not through override_best_choice.
+    choice, ms = _orig_get_min_choice(self, hint_override)
+    if config.triton.tlx_mode != "force":
+        return choice, ms
+    from .choices import maybe_override_best_choice
+
+    timings = self.choice_timings(hint_override)
+    choice = maybe_override_best_choice(choice, timings)
+    return choice, timings[choice]
+
+
 def _tlx_finalize_multi_template_buffers(self):
     if config.triton.tlx_mode != "allow" or not _is_gfx942():
         return _orig_finalize_multi_template_buffers(self)
@@ -4112,9 +4124,10 @@ def _tlx_finalize_multi_template_buffers(self):
     try:
         return _orig_finalize_multi_template_buffers(self)
     finally:
-        MultiTemplateBuffer.get_min_choice = _orig_get_min_choice  # type: ignore[method-assign]
+        MultiTemplateBuffer.get_min_choice = _tlx_get_min_choice  # type: ignore[method-assign]
 
 
+MultiTemplateBuffer.get_min_choice = _tlx_get_min_choice  # type: ignore[method-assign]
 Scheduler.finalize_multi_template_buffers = _tlx_finalize_multi_template_buffers  # type: ignore[method-assign]
 
 
