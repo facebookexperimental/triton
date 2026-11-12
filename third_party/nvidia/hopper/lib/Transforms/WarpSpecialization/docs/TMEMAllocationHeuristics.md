@@ -25,13 +25,18 @@ The memory planner handles each kind independently: SMEM through
 
 ## Entry Point: `doMemoryPlanner`
 
-The top-level function (line 2289) orchestrates five steps:
+The top-level function orchestrates five steps:
 
 ```
 Step 1: collectAllocChannels      — gather all SMEM and TMEM channels
-Step 2: SMEM planning            — MemoryPlanner::run() or allocateSmemBuffers()
+Step 2: SMEM planning            — MemoryPlanner::run() (smem_alloc_algo 0),
+                                   allocateSmemBuffers() (algo 1, default), or
+                                   allocateSmemBuffersViaSearch() (algo 1 under
+                                   TRITON_WS_SMEM_PLAN_SEARCH)
 Step 3: Visualization dump       — combined DOT graph
-Step 4: TMEM planning            — MemoryPlannerTmem::run()
+Step 4: TMEM planning            — MemoryPlannerTmem::run(), or
+                                   allocateTmemBuffersViaSearch() under
+                                   TRITON_WS_SMEM_PLAN_SEARCH
 Step 5: Decision serialization   — optional JSON read/write for reproducibility
 ```
 
@@ -58,13 +63,14 @@ axis (≤512) while respecting liveness constraints.
 
 Key output attributes set on each `TMEMAllocOp`:
 - `buffer.id` — groups allocations that share physical space
-- `buffer.copy` — always 1 for TMEM (no multi-buffering at the TMEM level)
+- `buffer.copy` — 1 after placement; loop-carried accumulators may then be
+  raised above 1 (see [Accumulator Multi-Buffering](#accumulator-multi-buffering))
 - `buffer.offset` — column offset within the owner's space (for reusing
   allocations)
 
 ## Sorting Priority
 
-Before allocation, all `TMEMAllocOp`s are sorted (line 1217) with this
+Before allocation, all `TMEMAllocOp`s are sorted (in `MemoryPlannerTmem::run`) with this
 priority:
 
 1. **Operand D first**: Accumulators (`isOperandD`) get highest priority.
@@ -82,8 +88,8 @@ priority:
 
 ## Liveness Computation
 
-TMEM liveness is computed by `livenessForTmemChannel` (line 1040) and
-`getLiveIntervals` (line 1140).
+TMEM liveness is computed by `livenessForTmemChannel` and
+`getLiveIntervals`.
 
 ### User Collection
 
@@ -157,11 +163,6 @@ within the owner's row space. For example:
 
 This is implemented through `buffer.offset` and later materialized by
 `sliceAndReinterpretMDTMEM` in code partitioning.
-
-### All TMEM buffers get `buffer.copy = 1`
-
-Unlike SMEM, TMEM does not support multi-buffering at the memory planner
-level. Each TMEM allocation has exactly one copy.
 
 ## Algorithm 2: Backtracking (`allocateTMemAllocs2`)
 
@@ -252,6 +253,40 @@ Determines where a candidate fits within an owner's column space:
    range.
 4. Return the maximum column offset, or `INVALID` if the candidate doesn't
    fit within the owner's total column width.
+
+## Accumulator Multi-Buffering
+
+**Code**: `MemoryPlannerTmem::run` in `WSMemoryPlanner.cpp`, the
+post-processing block after placement.
+
+After placement, `MemoryPlannerTmem::run` raises `buffer.copy` on accumulators
+so that a persistent kernel can run the next tile's MMA while the previous
+tile's epilogue still reads TMEM:
+
+1. **Budget.** 512 columns minus `getMinFutureScaleTmemCols` (the largest TMEM
+   scale footprint MMA lowering will later add for a `TCGen5MMAScaledOp` whose
+   scales are still in SMEM), less the columns owners already use.
+2. **Candidates.** For a user inside an `scf.for`, either a loop-carried MMA
+   accumulator (`hasLoopCarriedAccToken`), or the accumulator of an MMAv5 in
+   that loop body whose first access in the body is a `ttng.tmem_store` (dead
+   across iterations, e.g. a single-K-tile GEMM). Other allocations stay at one
+   copy.
+3. **Round-robin fill.** Each candidate in turn gets one more copy while its
+   `numCols` still fits. The counts become `buffer.copy`, a leading buffer
+   dimension rotated by the loop's accumulation counter.
+
+Example: a 128×128 fp32 accumulator (128 columns) with nothing else in TMEM
+ends at 4 copies. A 128×256 one ends at 2.
+
+What does **not** affect this step: `tt.disallow_acc_multi_buffer` is not
+read here (see [AutoWSAnnotations.md](AutoWSAnnotations.md#disallow_acc_multi_buffer)),
+and neither is any per-loop attribute. The fill always runs on the heuristic
+path.
+
+On the plan-search path (`TRITON_WS_SMEM_PLAN_SEARCH`),
+`allocateTmemBuffersViaSearch` replaces both placement and this step and stamps
+`buffer.copy = 1` on every TMEM allocation. It falls back to the heuristic
+path, including this step, for scaled MMA and `SubtiledRegionOp`.
 
 ## Algorithm Selection
 
