@@ -68,7 +68,7 @@ jobs:
             git fetch --no-tags --quiet origin "${MERGE_SHA}"
             HEAD="${MERGE_SHA}"; BASE=$(git rev-parse "${MERGE_SHA}^1")
             PR_HEAD="${HEAD_SHA}"; PR="${PR_NUMBER}"
-            CODEGEN_PATHS='^(lib/|include/|python/src/|python/triton/|third_party/(nvidia|tlx)/|cmake/|CMakeLists\.txt$|setup\.py$|\.github/scripts/(tlx_codegen_snapshot|tlx_ops_bench_ir_diff)\.py$|\.github/codegen-corpus/|\.github/workflows/tlx-codegen-trace\.yml$)'
+            CODEGEN_PATHS='^(lib/|include/|python/src/|python/triton/|third_party/(nvidia|tlx)/|cmake/|CMakeLists\.txt$|setup\.py$|\.github/scripts/(tlx_codegen_snapshot|tlx_ops_bench_ir_diff)\.py$|\.github/workflows/tlx-codegen-trace\.yml$)'
             if [[ "${HEAD_REF}" != reactor/sync-train/* ]] && ! git diff --name-only "${BASE}" "${HEAD}" | grep -qE "${CODEGEN_PATHS}"; then
               echo "No compiler or kernel changes; skipping."
               exit 0
@@ -91,21 +91,21 @@ jobs:
             echo "pr=${PR}"
           } >> "$GITHUB_OUTPUT"
       - name: Pick the tlx.ops corpus
-        # The nightly B200 benchmark republishes the corpus from main; the copy checked in at this workflow's
-        # commit covers the time before its first run. Both sides of this trace use the one picked here.
+        # The nightly B200 benchmark publishes the corpus recorded from main. Both sides of this trace use the copy
+        # picked here; without one the trace covers only the built-in kernels.
         if: steps.pick.outputs.head != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p corpus
           gh release download tlx-ops-bench --repo "${GITHUB_REPOSITORY}" --pattern codegen-corpus.sm100.json --dir corpus \
-            || git show "${GITHUB_SHA}:.github/codegen-corpus/tlx_ops_sm100.json" > corpus/codegen-corpus.sm100.json
+            || echo "No codegen corpus published yet; tracing the built-in kernels only."
       - name: Upload the tlx.ops corpus
         if: steps.pick.outputs.head != ''
         uses: actions/upload-artifact@v4
         with:
           name: codegen-corpus-${{ github.run_id }}
           path: corpus/codegen-corpus.sm100.json
+          if-no-files-found: ignore
 
   build-head:
     needs: resolve
@@ -169,6 +169,7 @@ jobs:
           wheel-filename: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_filename || needs.build-base.outputs.wheel_filename }}
           wheel-sha256: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_sha256 || needs.build-base.outputs.wheel_sha256 }}
       - name: Download the tlx.ops corpus
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: codegen-corpus-${{ github.run_id }}
@@ -178,8 +179,9 @@ jobs:
         run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Snapshot corpus
         run: |
-          python3 .github/scripts/tlx_codegen_snapshot.py snapshot \
-            --corpus corpus/codegen-corpus.sm100.json --jobs "$(nproc)" \
+          CORPUS=()
+          [[ -f corpus/codegen-corpus.sm100.json ]] && CORPUS=(--corpus corpus/codegen-corpus.sm100.json)
+          python3 .github/scripts/tlx_codegen_snapshot.py snapshot "${CORPUS[@]}" --jobs "$(nproc)" \
             --ir-dir "ir-${{ matrix.side }}" --out "snap-${{ matrix.side }}.json"
       - name: Upload snapshot
         uses: actions/upload-artifact@v4
