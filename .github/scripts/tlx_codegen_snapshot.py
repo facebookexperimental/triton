@@ -2,24 +2,27 @@
 """Snapshot codegen features for a fixed kernel corpus, diff two snapshots.
 
 Usage:
-    tlx_codegen_snapshot.py snapshot --out S.json [--ptx-version N]
+    tlx_codegen_snapshot.py snapshot --out S.json [--ptx-version N] [--corpus C.json] [--ir-dir DIR] [--jobs N]
     tlx_codegen_snapshot.py diff --base S_BASE.json --head S_HEAD.json
-        --base-sha SHA --head-sha SHA [--pr-head-sha SHA] --out VERDICT.md
+        --base-sha SHA --head-sha SHA [--pr-head-sha SHA] [--base-ir DIR --head-ir DIR] --out VERDICT.md
 
 CPU-only: compiles each corpus kernel for sm90+sm100 with the INSTALLED
 triton (no GPU needed), extracts PTX features + instruction mix + ptxas
 stats (regs/smem/spills via the wheel's bundled ptxas), and diffs them. A
 kernel that fails to compile is recorded in the snapshot, not fatal.
 
-Corpus v0 is two raw kernels (add, matmul). The growth path is tlx.ops
-kernels over focus shapes with pinned configs -- the snapshot/diff machinery
-is corpus-agnostic. Always exits 0.
+The corpus is two raw kernels (add, matmul) plus, with --corpus, tlx.ops
+kernel specializations recorded from real benchmark launches by
+tlx_ops_bench_ir_dump.py --corpus-out: the kernel's import path, signature,
+constexprs, attributes and non-default options, replayed here without a GPU.
+Always exits 0.
 """
 
 import argparse
 import collections
 import functools
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -30,7 +33,9 @@ import tempfile
 
 ARCHES = (90, 100)
 SNAPSHOT_VERSION = 2
-CORPUS_VERSION = 0
+CORPUS_VERSION = 1
+# Options derived from the wheel or the target rather than chosen by the kernel launch.
+CORPUS_SKIP_OPTIONS = ("extern_libs", "arch", "backend_name")
 VERDICT_RANK = {"IDENTICAL": 0, "CHANGED": 1, "INVESTIGATE": 2}
 
 # ptxas deltas that escalate a kernel from CHANGED to INVESTIGATE.
@@ -210,47 +215,194 @@ def ptxas_stats(ptx, arch, ptxas):
     return stats
 
 
-def compile_ptx(fn, signature, constexprs, options, arch):
+def _irdiff():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import tlx_ops_bench_ir_diff
+    return tlx_ops_bench_ir_diff
+
+
+def _encode(value):
+    import triton.language as tl
+    from triton.runtime.jit import JITFunction
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (tuple, list)):
+        return {type(value).__name__: [_encode(v) for v in value]}
+    if isinstance(value, tl.dtype):
+        return {"dtype": value.name}
+    if isinstance(value, JITFunction):
+        return {"jit": [value.fn.__module__, value.fn.__qualname__]}
+    raise TypeError(f"cannot record a {type(value).__name__} constexpr")
+
+
+def _decode(value):
+    if not isinstance(value, dict):
+        return value
+    import triton.language as tl
+    (kind, payload), = value.items()
+    if kind in ("tuple", "list"):
+        return {"tuple": tuple, "list": list}[kind](_decode(v) for v in payload)
+    if kind == "dtype":
+        return tl.dtype(payload)
+    return resolve_kernel(*payload)
+
+
+def resolve_kernel(module, qualname):
+    """Import a kernel by module and qualified name, unwrapping autotune and heuristics wrappers."""
+    from triton.runtime.jit import JITFunction
+    obj = importlib.import_module(module)
+    for part in qualname.split("."):
+        obj = getattr(obj, part)
+    while not isinstance(obj, JITFunction) and hasattr(obj, "fn"):
+        obj = obj.fn
+    return obj
+
+
+def corpus_entry(src, options, target):
+    """A JSON record of one real compile that can be replayed from source, or None when it cannot."""
+    from triton.compiler.compiler import make_backend
+    fn = src.fn
+    module, qualname = fn.fn.__module__, fn.fn.__qualname__
+    try:
+        if ("<locals>" in qualname or resolve_kernel(module, qualname) is not fn
+                or list(src.signature) != list(fn.arg_names)):
+            return None
+        defaults = make_backend(target).parse_options({}).__dict__
+        record = {
+            "kernel": src.name,
+            "module": module,
+            "qualname": qualname,
+            "arch": target.arch,
+            "warp_size": target.warp_size,
+            # Argument types in declaration order; the replay pairs them with the kernel's argument names.
+            "signature": [_encode(v) for v in src.signature.values()],
+            "constexprs": [[list(k), _encode(v)] for k, v in src.constants.items()],
+            # Each distinct attribute list with the argument paths that carry it.
+            "attrs": [[attr, paths] for attr, paths in _group_attrs(src.attrs)],
+            "options": {
+                k: _encode(v)
+                for k, v in (options or {}).items()
+                if k not in CORPUS_SKIP_OPTIONS and v != defaults.get(k)
+            },
+        }
+    except (AttributeError, ImportError, TypeError):
+        return None
+    record["id"] = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()[:10]
+    return record
+
+
+def _group_attrs(attrs):
+    grouped = {}
+    for path, attr in attrs.items():
+        grouped.setdefault(json.dumps(attr), (attr, []))[1].append(list(path))
+    return list(grouped.values())
+
+
+def compile_asm(fn, signature, constexprs, attrs, options, arch, warp_size=32):
     from triton.backends.compiler import GPUTarget
     from triton.compiler.compiler import ASTSource, compile
-    src = ASTSource(fn, signature, constexprs=constexprs)
-    out = compile(src, target=GPUTarget("cuda", arch, 32), options=dict(options))
-    return out.asm["ptx"]
+    src = ASTSource(fn, signature, constexprs=constexprs, attrs=attrs)
+    return compile(src, target=GPUTarget("cuda", arch, warp_size), options=dict(options)).asm
+
+
+def pretend_device(capability):
+    """Answer import-time GPU checks in kernel modules the way the recording GPU did.
+
+    Some tlx.ops modules pick between kernel definitions at import, from torch.cuda.get_device_capability(); without
+    this a CPU-only replay compiles the fallback definition instead of the one the benchmark ran.
+    """
+    import torch
+    torch.version.cuda = torch.version.cuda or "13.0"
+    torch.cuda.is_available = lambda: True
+    torch.cuda.device_count = lambda: 1
+    torch.cuda.current_device = lambda: 0
+    torch.cuda.get_device_capability = lambda device=None: tuple(capability)
+
+
+# Filled before the worker pool forks, so workers index it instead of pickling kernels.
+TASKS = []
+
+
+def _task_list(args):
+    tasks = []
+    for name, fn, sig, const, opts in kernels():
+        for arch in ARCHES:
+            tasks.append(
+                {"name": name, "arch": arch, "fn": fn, "sig": sig, "const": const, "attrs": None, "opts": opts})
+    if args.corpus:
+        corpus = json.load(open(args.corpus))
+        pretend_device(corpus["capability"])
+        for e in corpus["entries"]:
+            tasks.append({"name": f"{e['kernel']}-{e['id']}", "arch": e["arch"], "entry": e})
+    return tasks
+
+
+def _run_task(index):
+    task = TASKS[index]
+    name, arch, e = task["name"], task["arch"], task.get("entry")
+    opts = dict(task["opts"] if e is None else {k: _decode(v) for k, v in e["options"].items()})
+    if ARGS.ptx_version is not None:
+        opts["ptx_version"] = ARGS.ptx_version
+    entry = {"options": opts} if e is None else {"kernel": e["kernel"], "cases": e.get("cases", [])}
+    try:
+        if e is None:
+            fn, sig, const, attrs, warp_size = task["fn"], task["sig"], task["const"], None, 32
+        else:
+            fn = resolve_kernel(e["module"], e["qualname"])
+            entry["params"] = list(fn.arg_names)
+            if len(e["signature"]) != len(fn.arg_names):
+                raise ValueError(f"{len(fn.arg_names)} kernel arguments, {len(e['signature'])} recorded")
+            sig = {k: _decode(v) for k, v in zip(fn.arg_names, e["signature"])}
+            const = {tuple(k): _decode(v) for k, v in e["constexprs"]}
+            attrs = {tuple(path): attr for attr, paths in e["attrs"] for path in paths}
+            warp_size = e["warp_size"]
+        asm = compile_asm(fn, sig, const, attrs, opts, arch, warp_size)
+        ptx = asm["ptx"]
+        norm = normalize_ptx(ptx)
+        ptxas = find_ptxas(arch)
+        irdiff = _irdiff()
+        ttgir = irdiff.normalize("ttgir", asm.get("ttgir", ""))
+        entry.update({
+            "ptx_sha": hashlib.sha256(norm.encode()).hexdigest()[:16],
+            "ttgir_sha": hashlib.sha256("\n".join(ttgir).encode()).hexdigest()[:16],
+            "ttgir_ops": dict(irdiff.histogram("ttgir", ttgir)),
+            "ptx": ptx_features(norm),
+            "instr_mix": instr_mix(norm),
+            "ptxas": dict(ptxas_stats(ptx, arch, ptxas), ptxas_version=ptxas_version(ptxas)),
+        })
+        if ARGS.ir_dir:
+            for stage in ("ttgir", "ptx"):
+                with open(os.path.join(ARGS.ir_dir, f"{name}.sm{arch}.{stage}"), "w") as handle:
+                    handle.write(asm.get(stage, ""))
+        print(f"compiled {name}/sm{arch}: {entry['ptxas'].get('regs')} regs, {entry['ptxas'].get('smem')} smem",
+              flush=True)
+    except Exception as exc:
+        entry["error"] = " ".join(f"{type(exc).__name__}: {exc}".split())[:300]
+        print(f"FAILED {name}/sm{arch}: {entry['error']}", flush=True)
+    return name, f"sm{arch}", entry
 
 
 def snapshot(args):
+    import multiprocessing
     import triton
+    global ARGS
+    ARGS = args
+    if args.ir_dir:
+        os.makedirs(args.ir_dir, exist_ok=True)
+    TASKS[:] = _task_list(args)
     snap = {
         "version": SNAPSHOT_VERSION,
         "corpus_version": CORPUS_VERSION,
         "triton_version": triton.__version__,
         "kernels": {},
     }
-    for name, fn, sig, const, opts in kernels():
-        if args.ptx_version is not None:
-            opts = dict(opts)
-            opts["ptx_version"] = args.ptx_version
-        snap["kernels"][name] = {}
-        for arch in ARCHES:
-            try:
-                ptx = compile_ptx(fn, sig, const, opts, arch)
-                norm = normalize_ptx(ptx)
-                ptxas = find_ptxas(arch)
-                entry = {
-                    "ptx_sha": hashlib.sha256(norm.encode()).hexdigest()[:16],
-                    "ptx": ptx_features(norm),
-                    "instr_mix": instr_mix(norm),
-                    "ptxas": dict(ptxas_stats(ptx, arch, ptxas), ptxas_version=ptxas_version(ptxas)),
-                    "options": opts,
-                }
-                print(
-                    f"compiled {name}/sm{arch}: "
-                    f"{entry['ptxas'].get('regs')} regs, "
-                    f"{entry['ptxas'].get('smem')} smem", flush=True)
-            except Exception as exc:
-                entry = {"error": " ".join(f"{type(exc).__name__}: {exc}".split())[:300], "options": opts}
-                print(f"FAILED {name}/sm{arch}: {entry['error']}", flush=True)
-            snap["kernels"][name][f"sm{arch}"] = entry
+    if args.jobs > 1:
+        with multiprocessing.get_context("fork").Pool(args.jobs) as pool:
+            results = pool.map(_run_task, range(len(TASKS)), chunksize=1)
+    else:
+        results = [_run_task(i) for i in range(len(TASKS))]
+    for name, arch, entry in results:
+        snap["kernels"].setdefault(name, {})[arch] = entry
     with open(args.out, "w") as handle:
         json.dump(snap, handle, indent=1)
     print(f"wrote {args.out}")
@@ -292,6 +444,112 @@ def _mix_rows(b_mix, h_mix, limit=10):
     return [(token, before, after) for token, before, after, _ in rows[:limit]]
 
 
+def _is_corpus(snap, name):
+    return any("kernel" in e for e in snap["kernels"][name].values())
+
+
+def _verdict(b, h):
+    """(verdict, note, ptxas and PTX feature rows, top instruction-mix rows) for one kernel on one arch."""
+    if h is None or "error" in b or "error" in h:
+        verdict, note = _error_verdict(b, h)
+        if h is not None and "error" in h and b.get("params") != h.get("params"):
+            verdict, note = "CHANGED", "The kernel's arguments changed; regenerate its corpus entry."
+        return verdict, note, [], []
+    feat_rows = _delta_rows(b["ptx"], h["ptx"])
+    ptxas_rows = _delta_rows(_ptxas_signals(b), _ptxas_signals(h))
+    if b["ptx_sha"] == h["ptx_sha"] and b.get("ttgir_sha") == h.get("ttgir_sha") and not ptxas_rows:
+        return "IDENTICAL", "", [], []
+    hard = ([row for row in ptxas_rows if row[0] in HARD_PTXAS_KEYS] +
+            [row for row in feat_rows if row[0] in HARD_PTX_KEYS])
+    return ("INVESTIGATE" if hard else "CHANGED"), "", ptxas_rows + feat_rows, _mix_rows(
+        b.get("instr_mix", {}), h.get("instr_mix", {}), limit=4)
+
+
+def _excerpts(args, name, arch, ttgir_ops, mix):
+    """Normalized TTGIR and PTX diff excerpts for one corpus kernel, read from the --base-ir/--head-ir dumps."""
+    import difflib
+    irdiff = _irdiff()
+    stages = {}
+    for stage, changed in (("ttgir", ttgir_ops), ("ptx", mix)):
+        texts = []
+        for root in (args.base_ir, args.head_ir):
+            path = os.path.join(root, f"{name}.{arch}.{stage}")
+            texts.append(irdiff.normalize(stage, open(path).read()) if os.path.exists(path) else None)
+        if None in texts or texts[0] == texts[1]:
+            continue
+        lines = list(difflib.unified_diff(texts[0], texts[1], "base", "head", lineterm="", n=3))
+        stages[stage] = {"excerpt": irdiff.excerpt(stage, lines, changed, irdiff.EXCERPT_LINES)}
+    return stages
+
+
+def _corpus_section(base, head, names, args):
+    """One table row per kernel whose specializations changed their TTGIR the same way, then their diffs."""
+    irdiff = _irdiff()
+    groups, counts = {}, collections.Counter()
+    for name in names:
+        for arch, b in sorted(base["kernels"][name].items()):
+            h = head["kernels"].get(name, {}).get(arch)
+            verdict, note, rows, mix = _verdict(b, h)
+            counts[verdict] += 1
+            if verdict == "IDENTICAL":
+                continue
+            ops = irdiff.deltas(collections.Counter(b.get("ttgir_ops", {})),
+                                collections.Counter((h or {}).get("ttgir_ops", {})))
+            key = json.dumps([b.get("kernel", name), arch, note, ops])
+            g = groups.setdefault(
+                key, {
+                    "kernel": b.get("kernel", name), "arch": arch, "note": note, "ops": ops, "verdict": "CHANGED",
+                    "cases": [], "names": [], "hard": collections.defaultdict(list), "mix": collections.Counter()
+                })
+            g["verdict"] = max(g["verdict"], verdict, key=VERDICT_RANK.get)
+            g["cases"] += b.get("cases") or [name]
+            g["names"].append(name)
+            for k, before, after in rows:
+                if k in HARD_PTXAS_KEYS + HARD_PTX_KEYS and isinstance(before, int) and isinstance(after, int):
+                    g["hard"][k].append(after - before)
+            for token, before, after in mix:
+                g["mix"][token] += after - before
+    total = sum(counts.values())
+    lines = [
+        "", f"### tlx.ops kernels: {total} specializations", "",
+        ", ".join(f"{counts[v]} {v.lower()}" for v in ("IDENTICAL", "CHANGED", "INVESTIGATE") if counts[v]) + ".", ""
+    ]
+    overall = max(counts, key=VERDICT_RANK.get) if counts else "IDENTICAL"
+    if not groups:
+        return lines, overall
+    spill = lambda g: any(k != "regs" for k in g["hard"])
+    ordered = sorted(groups.values(), key=lambda g:
+                     (-VERDICT_RANK[g["verdict"]], -spill(g), -bool(g["ops"]), -len(g["cases"])))
+    lines += [
+        "| Kernel | Cases | Verdict | Allocation moves | TTGIR ops | PTX instructions |", "|---|---|---|---|---|---|"
+    ]
+    for g in ordered:
+        cases = ", ".join(f"`{irdiff.case_label(c)}`" for c in g["cases"][:2])
+        if len(g["cases"]) > 2:
+            cases += f" and {len(g['cases']) - 2} more"
+        moves = ", ".join(f"`{k}` {min(d):+d}" + (f" to {max(d):+d}" if max(d) != min(d) else "") +
+                          (f" in {len(d)}" if len(g["names"]) > 1 else "") for k, d in sorted(g["hard"].items()))
+        mix = ", ".join(f"`{t}` {d:+d}" for t, d in sorted(g["mix"].items(), key=lambda kv: -abs(kv[1]))[:4] if d)
+        lines.append(f"| `{g['kernel']}` ({g['arch']}) | {cases} | {g['verdict']} | {g['note'] or moves or 'none'} | "
+                     f"{irdiff.fmt(g['ops']) if g['ops'] else 'unchanged'} | {mix or 'unchanged'} |")
+    if args.base_ir and args.head_ir:
+        details = []
+        used = sum(map(len, lines))
+        for g in ordered:
+            stages = _excerpts(args, g["names"][0], g["arch"], {op for op, _ in g["ops"]}, set(g["mix"]))
+            block = irdiff.diff_details({"kernel": g["kernel"], "cases": g["cases"], "stages": stages})
+            if not block:
+                continue
+            if used + len(block) > irdiff.COMMENT_BUDGET:
+                details.append("The remaining groups' diffs are in the workflow artifacts.\n")
+                break
+            details.append(block)
+            used += len(block)
+        if details:
+            lines += ["", "#### TTGIR and PTX diffs", "", "".join(details)]
+    return lines, overall
+
+
 def diff(args):
     base = json.load(open(args.base))
     head = json.load(open(args.head))
@@ -307,11 +565,13 @@ def diff(args):
         "## TLX codegen trace (advisory)",
         "",
         f"{sides}Corpus v{base.get('corpus_version', CORPUS_VERSION)} "
-        f"({', '.join(sorted(base['kernels']))}; sm90+sm100).",
+        f"({', '.join(n for n in sorted(base['kernels']) if not _is_corpus(base, n))}; sm90+sm100"
+        f"{'; tlx.ops kernels' if any(_is_corpus(base, n) for n in base['kernels']) else ''}).",
         "",
     ]
     overall = "IDENTICAL"
-    for name in sorted(base["kernels"]):
+    corpus = [n for n in sorted(base["kernels"]) if _is_corpus(base, n)]
+    for name in sorted(n for n in base["kernels"] if n not in corpus):
         for arch in sorted(base["kernels"][name]):
             b = base["kernels"][name][arch]
             h = head["kernels"].get(name, {}).get(arch)
@@ -349,10 +609,11 @@ def diff(args):
                     "as a likely perf-relevant codegen change."
                 ]
             lines.append("")
-    lines += [
-        "", f"Overall: **{overall}**.", "This is advisory, not a gate failure. Corpus v0 is two raw "
-        "kernels; tlx.ops coverage follows."
-    ]
+    if corpus:
+        section, verdict = _corpus_section(base, head, corpus, args)
+        lines += section
+        overall = max(overall, verdict, key=VERDICT_RANK.get)
+    lines += ["", f"Overall: **{overall}**.", "This is advisory, not a gate failure."]
     with open(args.out, "w") as handle:
         handle.write("\n".join(lines) + "\n")
     print(f"trace verdict: {overall}")
@@ -365,12 +626,17 @@ def main():
     snap = sub.add_parser("snapshot")
     snap.add_argument("--out", required=True)
     snap.add_argument("--ptx-version", type=int, default=None, help="pin PTX version int (e.g. 90); default: wheel max")
+    snap.add_argument("--corpus", help="tlx.ops kernels recorded by tlx_ops_bench_ir_dump.py --corpus-out")
+    snap.add_argument("--ir-dir", help="also write each kernel's TTGIR and PTX here, for diff --base-ir/--head-ir")
+    snap.add_argument("--jobs", type=int, default=1, help="compile this many kernels in parallel")
     dummy = sub.add_parser("diff")
     dummy.add_argument("--base", required=True)
     dummy.add_argument("--head", required=True)
     dummy.add_argument("--base-sha", required=True)
     dummy.add_argument("--head-sha", required=True)
     dummy.add_argument("--pr-head-sha", default="", help="PR head when --head-sha is GitHub's merge commit")
+    dummy.add_argument("--base-ir", help="snapshot --ir-dir of the base side; adds TTGIR and PTX diffs")
+    dummy.add_argument("--head-ir", help="snapshot --ir-dir of the head side")
     dummy.add_argument("--out", required=True)
     args = parser.parse_args()
     if args.cmd == "snapshot":

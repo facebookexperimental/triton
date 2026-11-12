@@ -52,7 +52,6 @@ on:
       - '.github/workflows/h100.yml'
       - '.github/workflows/_tlx-ops-bench.yml'
       - '.github/workflows/bisect-tlx-ops-regression.yml'
-      - '.github/workflows/kernel-ir-diff.yml'
       - '.github/scripts/tlx_ops_bench*.py'
       - '.github/scripts/test_tlx_ops_bench*.py'
       - '.github/scripts/failure_issues.py'

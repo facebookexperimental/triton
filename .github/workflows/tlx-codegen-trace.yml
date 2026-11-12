@@ -1,13 +1,15 @@
 name: TLX codegen trace
-# CPU-only codegen gate for bundle (reactor) PRs: compiles a fixed kernel
-# corpus with the base wheel and the head wheel, diffs PTX features +
-# instruction mix + ptxas stats (regs/smem/spills), and posts the verdict as
+# CPU-only codegen gate for bundle (reactor) PRs and PRs that change the
+# compiler or tlx.ops kernels: compiles a fixed kernel corpus, including
+# tlx.ops kernels recorded from benchmark launches, with the base wheel and
+# the head wheel, diffs TTGIR ops, PTX features + instruction mix + ptxas
+# stats (regs/smem/spills), and posts the verdict with TTGIR and PTX diffs as
 # a PR comment. Advisory only -- posts, never blocks. Deterministic, no GPU.
 
 on:
   # `branches` matches the PR's target branch. Bundle PRs go from
-  # reactor/sync-train/plan-*/item-* into main, and GitHub has no
-  # trigger-level source-branch filter, so the resolve job's `if:` picks them.
+  # reactor/sync-train/plan-*/item-* into main. Other PRs run only when they
+  # change compiler or kernel paths; the pick step decides.
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -32,7 +34,6 @@ concurrency:
 
 jobs:
   resolve:
-    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'reactor/sync-train/')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -56,6 +57,7 @@ jobs:
           INPUT_PR: ${{ inputs.pr }}
           MERGE_SHA: ${{ github.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
@@ -66,6 +68,11 @@ jobs:
             git fetch --no-tags --quiet origin "${MERGE_SHA}"
             HEAD="${MERGE_SHA}"; BASE=$(git rev-parse "${MERGE_SHA}^1")
             PR_HEAD="${HEAD_SHA}"; PR="${PR_NUMBER}"
+            CODEGEN_PATHS='^(lib/|include/|python/src/|python/triton/|third_party/(nvidia|tlx)/|cmake/|CMakeLists\.txt$|setup\.py$|\.github/scripts/(tlx_codegen_snapshot|tlx_ops_bench_ir_diff)\.py$|\.github/codegen-corpus/|\.github/workflows/tlx-codegen-trace\.yml$)'
+            if [[ "${HEAD_REF}" != reactor/sync-train/* ]] && ! git diff --name-only "${BASE}" "${HEAD}" | grep -qE "${CODEGEN_PATHS}"; then
+              echo "No compiler or kernel changes; skipping."
+              exit 0
+            fi
           elif [[ -n "${INPUT_PR}" ]]; then
             HEAD=$(gh pr view "${INPUT_PR}" --json headRefOid --jq .headRefOid)
             BASE=$(gh pr view "${INPUT_PR}" --json baseRefOid --jq .baseRefOid)
@@ -145,15 +152,21 @@ jobs:
           wheel-url: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_url || needs.build-base.outputs.wheel_url }}
           wheel-filename: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_filename || needs.build-base.outputs.wheel_filename }}
           wheel-sha256: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_sha256 || needs.build-base.outputs.wheel_sha256 }}
+      - name: Install CPU torch
+        # tlx.ops kernel modules import torch; compiling them needs no GPU.
+        run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Snapshot corpus
         run: |
           python3 .github/scripts/tlx_codegen_snapshot.py snapshot \
-            --out "snap-${{ matrix.side }}.json"
+            --corpus .github/codegen-corpus/tlx_ops_sm100.json --jobs "$(nproc)" \
+            --ir-dir "ir-${{ matrix.side }}" --out "snap-${{ matrix.side }}.json"
       - name: Upload snapshot
         uses: actions/upload-artifact@v4
         with:
           name: codegen-snap-${{ matrix.side }}-${{ github.run_id }}
-          path: snap-${{ matrix.side }}.json
+          path: |
+            snap-${{ matrix.side }}.json
+            ir-${{ matrix.side }}
           retention-days: 90
 
   diff:
@@ -185,7 +198,8 @@ jobs:
           fi
           python3 .github/scripts/tlx_codegen_snapshot.py diff \
             --base snaps/snap-base.json --head snaps/snap-head.json \
-            --base-sha "${BASE_SHA}" --head-sha "${HEAD_SHA}" --pr-head-sha "${PR_HEAD}" --out verdict.md
+            --base-sha "${BASE_SHA}" --head-sha "${HEAD_SHA}" --pr-head-sha "${PR_HEAD}" \
+            --base-ir snaps/ir-base --head-ir snaps/ir-head --out verdict.md
       - name: Comment on PR
         if: needs.resolve.outputs.pr != ''
         env:

@@ -29,6 +29,8 @@ def main():
     parser.add_argument("--key", help="dump only this case key")
     parser.add_argument("--direction", help="dump only this direction")
     parser.add_argument("--gpu-uuid", help="pin this GPU")
+    parser.add_argument("--corpus-out", type=Path,
+                        help="also write the compiled specializations as a tlx_codegen_snapshot.py --corpus file")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     # A private, empty cache makes every kernel compile, and so dump, once. TRITON_ALWAYS_COMPILE would do the same
@@ -42,13 +44,21 @@ def main():
     import triton.compiler as compiler
     from triton.runtime.cache import get_dump_manager
 
-    compiles, current = [], {"case": None}
+    compiles, current, corpus, unreplayable = [], {"case": None}, {}, set()
     original = compiler.compile
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from tlx_codegen_snapshot import corpus_entry
 
     def recording_compile(src, *a, **k):
         if hasattr(src, "constants"):
             dump = Path(get_dump_manager(src.hash()).cache_dir).name
             compiles.append({"key": spec_key(src), "name": src.name, "dump": dump, "case": current["case"]})
+            if args.corpus_out:
+                entry = corpus_entry(src, k.get("options"), k.get("target"))
+                if entry is None:
+                    unreplayable.add(src.name)
+                else:
+                    corpus.setdefault(entry["id"], {**entry, "cases": []})["cases"].append(current["case"])
         return original(src, *a, **k)
 
     # JITFunction imports `compile` from triton.compiler when it first builds its device cache.
@@ -95,6 +105,14 @@ def main():
         compiles
     }
     (args.out / "index.json").write_text(json.dumps(index, indent=1))
+    if args.corpus_out:
+        entries = sorted(corpus.values(), key=lambda e: (e["kernel"], e["id"]))
+        # One entry per line keeps the checked-in corpus reviewable entry by entry.
+        head = json.dumps({
+            "triton": triton.__version__, "device": device.name, "capability": list(torch.cuda.get_device_capability())
+        })[:-1]
+        args.corpus_out.write_text(head + ', "entries": [\n' + ",\n".join(json.dumps(e) for e in entries) + "\n]}\n")
+        print(f"corpus: {len(entries)} specializations; not replayable from source: {sorted(unreplayable) or 'none'}")
     print(f"{triton.__version__}: {len(cases)} cases, {len(compiles)} compiles, "
           f"{sum(c['status'] != 'ok' for c in cases)} case errors")
 
