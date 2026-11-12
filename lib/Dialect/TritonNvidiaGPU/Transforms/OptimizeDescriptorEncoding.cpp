@@ -4,6 +4,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -393,18 +394,29 @@ Attribute getFallbackSharedEncoding(RankedTensorType tensorType,
   } else if (cgaLayout.getRank() != tensorType.getRank())
     cgaLayout = ttg::updateCGALayoutForShape(cgaLayout, shape);
 
+  if (isFP6(tensorType.getElementType()))
+    return ttg::NVMMASharedEncodingAttr::get(
+        ctx, 0, false, 8, ttg::NVMmaPadding::B6P2x16, cgaLayout);
   return ttg::NVMMASharedEncodingAttr::get(ctx, shape, order, cgaLayout,
                                            tensorType.getElementType(),
                                            /*fp4Padded*/ false);
 }
 
 TensorDescType getTensorDescTypeWithEncoding(Operation *op,
-                                             RankedTensorType existingTy,
+                                             TensorDescType descTy,
                                              Attribute encoding) {
-  auto sharedEnc = cast<triton::gpu::SharedEncodingTrait>(encoding);
-  encoding = ttg::updateEncodingForShape(op, sharedEnc, existingTy);
-  return TensorDescType::get(existingTy.getShape(), existingTy.getElementType(),
-                             encoding);
+  auto previous = dyn_cast_if_present<ttg::NVMMASharedEncodingAttr>(
+      descTy.getSharedLayout());
+  if (previous && previous.isPaddedFp6())
+    encoding = previous;
+  auto layout =
+      ttg::updateEncodingForShape(op, cast<ttg::SharedEncodingTrait>(encoding),
+                                  descTy.getSignlessBlockType());
+  Type elemTy = descTy.getElementType();
+  if (auto mma = dyn_cast<ttg::NVMMASharedEncodingAttr>(layout);
+      mma && mma.getPadding() == ttg::NVMmaPadding::B6P2x16 && isFP6(elemTy))
+    elemTy = IntegerType::get(descTy.getContext(), 8, IntegerType::Unsigned);
+  return TensorDescType::get(descTy.getShape(), elemTy, layout);
 }
 
 //===----------------------------------------------------------------------===//
@@ -660,8 +672,8 @@ LogicalResult assignMemoryLayouts(FuncOp &func) {
                                                 einfo->shape, numCTAs);
       }
     }
-    desc.setType(getTensorDescTypeWithEncoding(desc.getDefiningOp(), existingTy,
-                                               newEncoding));
+    desc.setType(getTensorDescTypeWithEncoding(desc.getDefiningOp(),
+                                               desc.getType(), newEncoding));
   }
 
   SmallVector<Type> argTys(func.getBlocks().front().getArgumentTypes());
@@ -670,8 +682,7 @@ LogicalResult assignMemoryLayouts(FuncOp &func) {
     if (auto descTy = dyn_cast<TensorDescType>(resultTy)) {
       auto encoding =
           getFallbackSharedEncoding(descTy.getBlockType(), {}, {}, numCTAs);
-      resultTys[i] = getTensorDescTypeWithEncoding(
-          nullptr, descTy.getBlockType(), encoding);
+      resultTys[i] = getTensorDescTypeWithEncoding(nullptr, descTy, encoding);
     }
   }
   func.setFunctionType(FunctionType::get(ctx, argTys, resultTys));

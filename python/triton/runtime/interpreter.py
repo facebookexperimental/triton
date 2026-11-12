@@ -960,11 +960,25 @@ class InterpreterBuilder:
         # Triton's barrier applies to each program in a grid, so it's a no-op in the interpreter
         pass
 
-    def create_make_tensor_descriptor(self, base: TensorHandle, shape: List[TensorHandle], strides: List[TensorHandle],
-                                      tensor_shape: List[int], is_signed: bool, padding: str = "zero"):
-        desc = TensorDescHandle(base, shape, strides, tensor_shape, padding)
+    def create_tensor_descriptor_type(self, block_type, is_signed, fp6_format=None):
+        elem_ty = block_type.element_ty
+        if elem_ty.is_int() and elem_ty.is_int_signed() != is_signed:
+            block_type = block_type.with_element_ty(tl.core.get_int_dtype(elem_ty.primitive_bitwidth, is_signed))
+        return tl.core.tensor_descriptor_base_type(block_type, fp6_format)
+
+    def create_make_tensor_descriptor(self, *args, **kwargs):
+        if args and isinstance(args[0], tl.core.tensor_descriptor_base_type):
+            desc_ty, base, shape, strides, *padding = args
+            desc = TensorDescHandle(base, shape, strides, desc_ty.block_type.shape, *padding, **kwargs)
+        else:
+            desc = self._make_tensor_descriptor_from_shape(*args, **kwargs)
         desc.validate()
         return desc
+
+    def _make_tensor_descriptor_from_shape(self, base: TensorHandle, shape: List[TensorHandle],
+                                           strides: List[TensorHandle], tensor_shape: List[int], is_signed: bool,
+                                           padding: str = "zero"):
+        return TensorDescHandle(base, shape, strides, tensor_shape, padding)
 
     def create_descriptor_load(self, desc: TensorDescHandle, indices: List[TensorHandle], cache_policy, multicast=None):
         assert isinstance(desc, TensorDescHandle)
@@ -983,7 +997,10 @@ class InterpreterBuilder:
             result = TensorHandle(_round_f32_to_tf32(result.data), dtype_tt)
         return result
 
-    def create_descriptor_store(self, desc: TensorDescHandle, value: TensorHandle, indices: List[TensorHandle]):
+    def create_descriptor_store(self, desc: TensorDescHandle, value: TensorHandle, indices: List[TensorHandle],
+                                reduce_kind=_ir.DESCRIPTOR_REDUCE_KIND.NONE):
+        if reduce_kind != _ir.DESCRIPTOR_REDUCE_KIND.NONE:
+            raise NotImplementedError("descriptor store reductions are not supported by the interpreter")
         ptrs, mask = desc.materialize_pointers(indices)
         return self.create_masked_store(ptrs, value, mask, None)
 
@@ -1485,7 +1502,7 @@ def _implicit_cvt(arg):
         desc = interpreter_semantic.make_tensor_descriptor(base=_implicit_cvt(arg.base),
                                                            shape=[_implicit_cvt(s) for s in arg.shape], strides=strides,
                                                            block_shape=[tl.constexpr(b) for b in arg.block_shape],
-                                                           padding_option=arg.padding)
+                                                           padding_option=arg.padding, fp6_format=arg.fp6_format)
         desc.handle.round_f32_to_tf32 = arg.round_f32_to_tf32
         return desc
     return arg
@@ -1529,6 +1546,7 @@ class GridExecutor:
                     arg.block_shape,
                     arg.padding,
                     arg.round_f32_to_tf32,
+                    arg.fp6_format,
                 )
             elif not hasattr(arg, "data_ptr"):
                 return arg
