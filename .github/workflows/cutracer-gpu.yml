@@ -198,7 +198,7 @@ jobs:
   report:
     needs: sanitize
     # A failed sanitize job still reports its fallback items.
-    if: always() && needs.sanitize.outputs.failures != '' && needs.sanitize.outputs.failures != '[]'
+    if: always() && inputs.file_issues && needs.sanitize.outputs.failures != '' && needs.sanitize.outputs.failures != '[]'
     permissions:
       contents: read
       issues: write
@@ -234,7 +234,7 @@ jobs:
     # output means no list was produced, not that nothing was found. Each call
     # closes only within one kernel or tool this run checked, so a run of one
     # test never closes another kernel's issue.
-    if: needs.sanitize.outputs.reconcile_prefixes != ''
+    if: inputs.file_issues && needs.sanitize.outputs.reconcile_prefixes != ''
     permissions:
       contents: read
       issues: write

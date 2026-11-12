@@ -11,6 +11,32 @@ import ci_health as ch
 import subprocess
 
 
+def test_sanitizer_collection_cannot_file_or_reconcile_issues():
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/cutracer.yml"
+    jobs = yaml.safe_load(workflow.read_text())["jobs"]
+    assert jobs["b200"]["with"]["file_issues"] is False
+    assert jobs["h100"]["with"]["file_issues"] is False
+
+
+def test_sanitizer_transient_artifact_failure_retries_with_cached_jobs(tmp_path):
+    created = "2026-10-12T01:00:00Z"
+    run = gh_run(1, created, event="workflow_dispatch", head_branch="main")
+    api = fake_api({"cutracer.yml": [run]}, {1: [gh_job(11, "b200 / sanitize")]})
+    artifact_calls = []
+
+    def fetch(path):
+        if "/artifacts" in path:
+            artifact_calls.append(path)
+            raise subprocess.CalledProcessError(1, "gh", stderr="HTTP 503")
+        return api(path)
+
+    ch.collect(str(tmp_path), created, NOW, api=fetch, get=no_get)
+    assert ch.load_runs(str(tmp_path))[1]["sanitizer"]["retry"] is True
+    ch.collect(str(tmp_path), None, NOW, api=fetch, get=no_get)
+    assert len(artifact_calls) == 2
+    assert sum("/jobs" in call for call in api.calls) == 1
+
+
 def fake_api(runs_by_wf, jobs_by_id, remaining=5000, pulls=None):
     calls = []
     pulls = pulls or {}
@@ -434,7 +460,7 @@ def test_collect_lists_gpu_nightly_and_lit_push_runs_only(tmp_path):
     assert {c.split("/workflows/")[1].split("/")[0]
             for c in listed} == {
                 "gpu-tests.yml", "gpu-tests-nightly.yml", "nightly-tlx-ops-bench.yml", "nightly-fbtriton.yml",
-                "compiler.yml", "fast-gpu-tests.yml"
+                "compiler.yml", "fast-gpu-tests.yml", "cutracer.yml"
             }
     assert [c for c in listed if "/compiler.yml/" in c][0].endswith("&event=push&per_page=100")
 

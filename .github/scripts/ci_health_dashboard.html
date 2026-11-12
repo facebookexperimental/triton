@@ -81,6 +81,11 @@ table.l1l2{table-layout:fixed}table.l1l2 th:first-child{width:90px}table.l1l2 tr
 .q15 .c{border-radius:2px}.q15 .c.idle{background:var(--wash)}.q15 .c.hr{box-shadow:inset 1px 0 0 var(--axis)}.q15 .c:hover{outline:1.5px solid var(--text-primary)}
 .idlebar span.idle{background:var(--wash);color:var(--text-secondary);border:1px solid var(--grid)}
 .gtitle{font-size:13px;font-weight:650;margin:14px 0 2px}
+#s-runs code{word-break:break-word}#s-overview{margin-top:14px}#s-matrix,.s-scroll{overflow-x:auto}#s-matrix table{min-width:680px}.s-scroll table{min-width:760px}
+.s-op-button{font:inherit;font-weight:650;color:var(--series-1);border:0;background:none;text-align:left;padding:0;cursor:pointer}
+.s-op-panel{padding:12px 0}.s-op-panel h3{font-size:15px;color:var(--text-primary)}.s-signal{border:1px solid var(--border);border-left:3px solid var(--warning);border-radius:8px;padding:12px;margin:12px 0}.s-kind{font-size:11px;color:var(--text-secondary);border:1px solid var(--border);border-radius:5px;padding:1px 5px}.s-signal-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}.s-sites{margin:8px 0;overflow-wrap:anywhere}.s-signal pre{font:12px/1.5 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-secondary)}
+#s-op-cards{display:none}.s-mobile-op{padding:12px 0;border-bottom:1px solid var(--grid)}.s-mobile-op p{margin:4px 0}
+@media(max-width:820px){#s-runs table{font-size:12px}#s-matrix{display:none}#s-op-cards{display:block}#s-overview{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style></head><body><div class="viz-root"><div class="wrap">
 <header><div><h1>CI health: facebookexperimental/triton</h1>
 <p class="sub">Meta Triton GPU Tests (<code>gpu-tests.yml</code>) · MI350 · B200 · H100 · data as of <b id="asof">…</b> · refreshed every 15 minutes</p></div>
@@ -91,6 +96,7 @@ table.l1l2{table-layout:fixed}table.l1l2 th:first-child{width:90px}table.l1l2 tr
 <button role="tab" data-tab="main" aria-selected="true">Push <span class="badge" id="b-main"></span></button>
 <button role="tab" data-tab="sched" aria-selected="false">Scheduled <span class="badge" id="b-sched"></span></button>
 <button role="tab" data-tab="pr" aria-selected="false">Pull requests <span class="badge na">author-owned</span></button>
+<button role="tab" data-tab="sanitizer" aria-selected="false">Sanitizer <span class="badge na" id="b-sanitizer"></span></button>
 </nav>
 <span class="muted">Health</span><nav class="tabs" role="tablist" aria-label="Health">
 <button role="tab" data-tab="perf" aria-selected="false">Perf <span class="badge" id="b-perf"></span></button>
@@ -195,6 +201,17 @@ table.l1l2{table-layout:fixed}table.l1l2 th:first-child{width:90px}table.l1l2 tr
 <div class="legend"><span><i class="sw" style="background:var(--series-1)"></i>B200</span><span><i class="sw" style="background:var(--series-2)"></i>H100</span><span><i class="sw" style="background:var(--series-3)"></i>MI350</span><span class="muted">peak per day (per hour, in the 3-day range)</span></div>
 <svg class="bars" id="o-conc" viewBox="0 0 720 190"></svg>
 <p class="note">The most GPU jobs of each type running at the same moment, from job start and finish times; hover for the time-weighted average and the most jobs waiting for a runner. Every branch and trigger counts, since they share the runners. Only this repository's CI workflows are counted: other repositories share some runner pools, so a flat peak with jobs waiting means the pool is full, not that demand stopped.</p></div>
+</section>
+
+<section id="sanitizer" role="tabpanel" hidden>
+<div class="shead"><h2>CUTracer / Sanitizer</h2><span class="q">What did the tools report, and which checks finished?</span></div>
+<div class="callout">Data collection only. Reported signals are not confirmed defects. This workflow does not file or reconcile issues.</div>
+<div class="grid4" id="s-overview"></div>
+<div id="s-limits" class="callout"></div>
+<div class="card"><h3>Which ops have signals to inspect?</h3><p class="note">Select an op to expand its fault sites and supporting logs in place. Select it again to collapse. Counts are observed signatures, not confirmed defects.</p><div id="s-matrix"></div><div id="s-op-cards"></div></div>
+<div id="s-runs"></div>
+<details class="card"><summary>Collection diagnostics, unfiltered raw counts and limits</summary><div id="s-tools"></div>
+<p class="note">Tracked signals require all reported kernels to match this log's compiled Triton/TLX inventory. External CUDA kernels and host API reports are excluded from tracking but retained in raw artifacts. Missing or empty inventories remain unknown. A complete log has a terminal summary, a successful test-command exit and no known omissions or internal tool errors; it does not prove Triton/TLX kernel coverage. Counts and timings in these raw diagnostics cover the whole test command, including external kernels. Signatures merge only within the same run, GPU, tool and workflow revision; historical tool versions and tested-checkout SHA are not recorded. Peer-barrier is a message category, not a legality decision.</p></details>
 </section>
 
 <section id="llvm" role="tabpanel" hidden>
@@ -479,6 +496,81 @@ function renderOccupancy(occ,gs,f1,pc){
         h+=`<span class="c${col?"":" idle"}${s%4===0?" hr":""}" style="height:${rowH}px;${col?`background:${col}`:""}" data-tip="${esc(tt)}"></span>`}}
     return h+`</div>`}).join("")}
 
+function renderSanitizer(data){
+  const runs=data?.runs||[],groups=data?.ops||[],summary=data?.summary;
+  if(!summary){$("s-overview").innerHTML="";$("s-limits").textContent="No sanitizer signal data collected yet.";$("s-tools").innerHTML="";$("s-matrix").innerHTML="";$("s-op-cards").innerHTML="";$("s-runs").innerHTML="";badge("b-sanitizer","no data","na");return}
+  const k=summary.kinds,missingTools=summary.tools.filter(tool=>!tool.observations).map(tool=>tool.tool);
+  const fmt=n=>Number(n).toLocaleString("en-US"),wall=s=>s==null?"not recorded":s<60?`${s.toFixed(1)} s`:`${(s/60).toFixed(1)} min`;
+  $("s-overview").innerHTML=tile("Triton/TLX device signatures",fmt(k.device),"Attributed fault sites, not confirmed bugs",k.device?"warn":"na")+
+    tile("Triton/TLX peer-barrier signatures",fmt(k["peer-barrier"]),"Attributed remote-CTA pattern; legality not verified","na")+
+    tile("Unattributed signatures",fmt(summary.unattributed_signatures),"Not counted as Triton/TLX signals","warn")+
+    tile("Incomplete tool logs",fmt(summary.observations-summary.complete),`of ${fmt(summary.observations)} collected logs`,"warn");
+  const timed=summary.tools.reduce((n,t)=>n+t.timed_observations,0);
+  $("s-limits").innerHTML=`${runs.length} retained run${runs.length===1?"":"s"}; ${summary.runs} with tool observations. `+
+    (summary.runs<2?"This snapshot cannot establish whether a signal persists across runs. ":"")+
+    (missingTools.length?`No collected evidence for ${missingTools.map(esc).join(" or ")}. `:"")+
+    (timed<summary.observations?`${summary.observations-timed} log durations are unrecorded. `:"")+
+    `${summary.excluded_signatures} external-kernel or non-kernel diagnostic signatures excluded from tracking. `+
+    "Only reporting kernels matching the run's compiled Triton/TLX inventory enter the signal counts. A zero tracked count is not a coverage or correctness verdict.";
+  const timeCell=s=>s.tools.some(t=>t.timed_observations)?s.tools.filter(t=>t.timed_observations).map(t=>`${esc(t.tool)}: ${wall(t.max_elapsed_s)} max observed`).join("<br>"):"not recorded";
+  $("s-matrix").innerHTML=table(["Op","Triton/TLX device","Triton/TLX peer","Unattributed","Checks and gaps","Case wall time"],groups.map((g,i)=>{
+    const s=g.summary,k=s.kinds;
+    const checked=s.tools.filter(t=>t.observations).map(t=>`${esc(t.tool)} ${t.complete}/${t.observations}`).join(" · ");
+    const absent=s.tools.filter(t=>!t.observations).map(t=>t.tool).join(", ");
+    return [`<button class="s-op-button" data-op="${i}">${esc(g.op)}</button>`,k.device,k["peer-barrier"],s.unattributed_signatures,`${checked}<br><span class="warn">${absent?`not collected: ${esc(absent)}`:s.complete<s.observations?"incomplete evidence":"all four tools have collected logs"}</span>`,timeCell(s)];
+  }),[1,2,3]);
+  $("s-op-cards").innerHTML=groups.map((g,i)=>{
+    const s=g.summary,device=s.signatures.find(signal=>signal.kind==="device"),absent=s.tools.filter(t=>!t.observations).map(t=>t.tool).join(", ");
+    return `<div class="s-mobile-op"><button class="s-op-button" data-op="${i}">${esc(g.op)}</button>`+
+      `<p>${device?esc(device.message):"No attributed Triton/TLX device report observed"}</p>`+
+      `<p class="note">${s.kinds.device} Triton/TLX device · ${s.kinds["peer-barrier"]} peer signatures · ${s.unattributed_signatures} unattributed</p>`+
+      `<p class="note">${s.complete}/${s.observations} complete logs · case wall time ${timeCell(s)}</p>`+
+      `<p class="note warn">${absent?`Not collected: ${esc(absent)}`:s.complete<s.observations?"Incomplete evidence":"All four tools have collected logs"}</p></div>`;
+  }).join("");
+  const definitions={device:"Device report. Check the access or synchronization rule before calling it a bug.",api:"Host API report. May be a launcher probe or a consequence of an earlier device failure.","peer-barrier":"Remote-CTA barrier message. Verify the actual instruction and barrier lifetime.",tool:"Sanitizer internal error. This leaves a coverage gap."};
+  const signatureCard=signal=>`<div class="s-signal"><div class="s-signal-head"><span class="s-kind">${esc(signal.kind)}</span><b>${esc(signal.message)}</b></div>`+
+    `<p class="note">${esc(signal.gpu)} · ${esc(signal.tool)} · ${fmt(signal.printed_reports)} printed report${signal.printed_reports===1?"":"s"} · ${signal.observed_logs} observed log${signal.observed_logs===1?"":"s"} · ${esc(signal.attribution)} · workflow ${sha(signal.sha)}</p>`+
+    `<div class="s-sites">${signal.sites.length?signal.sites.map(site=>`<code>${esc(site)}</code>`).join("<br>"):"Faulting site not recorded"}</div>`+
+    `<p class="note">${esc(definitions[signal.kind]||"Reported observation, not a confirmed defect.")}</p>`+
+    `<details><summary>Evidence and first report</summary><pre>${esc(signal.example.join("\n"))}</pre>`+
+    signal.evidence.map(e=>`<p class="note"><a href="${esc(e.url)}">Run ${esc(e.run_id)}</a> · ${esc(e.artifact)} / ${esc(e.log)} · ${esc(e.completion)}<br><code>${esc((Array.isArray(e.tests)?e.tests:[e.tests]).join(" "))}</code></p>`).join("")+`</details></div>`;
+  $("s-runs").innerHTML=groups.map((g,i)=>{
+    const s=g.summary,k=s.kinds,observed=g.observations;
+    const devices=s.signatures.filter(v=>v.kind==="device"),secondary=s.signatures.filter(v=>v.kind!=="device");
+    const rawRows=observed.map(row=>[`<a href="${esc(row.url)}">${esc(row.run_id)}</a>`,esc(row.gpu),esc(row.tool),
+      `<details><summary>${esc(row.log||"log unavailable")}</summary><code>${esc((Array.isArray(row.tests)?row.tests:[row.tests]).join(" "))}</code></details>`,
+      row.raw_count??"unknown",row.not_printed??"unknown",esc(row.completion),wall(row.elapsed_s)]);
+    return `<template id="s-op-template-${i}"><div class="s-op-panel"><h3>${esc(g.op)} · ${k.device} Triton/TLX device, ${k["peer-barrier"]} peer signatures</h3>`+
+      `<p class="note">${s.complete}/${s.observations} collected logs complete. Signature counts describe observed sites, not independent bugs. Compiled-kernel match attributes the reporting site, not the root cause.</p>`+
+      (devices.length?devices.map(signatureCard).join(""):`<p class="note">No attributed Triton/TLX device report observed. ${s.unattributed_signatures} unattributed signatures remain unknown. Uncollected or incomplete checks remain unknown.</p>`)+
+      (secondary.length?`<details><summary>Triton/TLX peer-barrier observations (${secondary.length})</summary>${secondary.map(signatureCard).join("")}</details>`:"")+
+      `<details><summary>Raw run records (${observed.length})</summary><div class="s-scroll">`+table(["Run","GPU","Tool","Test command / log","Raw summary","Unprinted","Completion","Wall time"],rawRows,[4,5])+`</div></details></div></template>`;
+  }).join("");
+  const missing=runs.filter(run=>run.missing?.length||!run.tools?.length).map(run=>`<p class="warn"><a href="${esc(run.url)}">Run ${esc(run.id)}</a>: `+
+    (run.missing?.length?run.missing.map(item=>`${esc(item.gpu)}: ${esc(item.reason)}`).join("; "):"No sanitizer artifact collected. Workflow success is not a tool verdict.")+`</p>`).join("");
+  $("s-runs").innerHTML+=missing;
+  $("s-tools").innerHTML=table(["Tool","Complete logs","Raw summary count","Unprinted reports","Timeouts","Wall-time evidence"],summary.tools.map(t=>[esc(t.tool),t.observations?`${t.complete}/${t.observations}`:"not collected",t.observations&&t.unknown_count<t.observations?`${fmt(t.raw_known)}${t.unknown_count?" + unknown":""}`:"unknown",t.observations&&t.unknown_omissions<t.observations?`${fmt(t.unprinted_known)}${t.unknown_omissions?" + unknown":""}`:"unknown",t.observations?t.timed_out:"not collected",`${wall(t.elapsed_s)} · ${t.timed_observations}/${t.observations} durations recorded`]),[2,3,4]);
+  for(const button of document.querySelectorAll("#s-matrix [data-op], #s-op-cards [data-op]")){
+    const desktop=!!button.closest("#s-matrix"),id=`s-op-${desktop?"desktop":"mobile"}-${button.dataset.op}`;
+    let slot;
+    if(desktop){
+      slot=document.createElement("tr");
+      const cell=document.createElement("td");cell.colSpan=6;slot.appendChild(cell);
+      button.closest("tr").after(slot);
+    }else{
+      slot=document.createElement("div");button.closest(".s-mobile-op").appendChild(slot);
+    }
+    slot.id=id;slot.hidden=true;
+    button.setAttribute("aria-controls",id);button.setAttribute("aria-expanded","false");
+    button.onclick=()=>{
+      const body=desktop?slot.firstElementChild:slot;
+      if(!body.childElementCount)body.appendChild($("s-op-template-"+button.dataset.op).content.cloneNode(true));
+      slot.hidden=!slot.hidden;button.setAttribute("aria-expanded",String(!slot.hidden));
+    };
+  }
+  badge("b-sanitizer",runs.length?`${runs.length} runs`:"no data","na");
+}
+
 const LLVM_REPO="https://github.com/facebookexperimental/llvm-project";
 function renderLLVM(u,branch){
   const tag=t=>t?`<code>${esc(t)}</code>`:`<span class="na">–</span>`;
@@ -513,7 +605,7 @@ function renderBranches(d){
     $("branch-sel").innerHTML=Object.keys(d.branches).map(b=>`<button type="button" data-b="${esc(b)}" aria-pressed="${b===cur}">${esc(b)}</button>`).join("");
     for(const b of $("branch-sel").querySelectorAll("button"))b.onclick=()=>{BRANCH=b.dataset.b;saveView();draw()};
     $("m-q").textContent=`Did a push to ${cur} break something new?`;
-    const v=d.branches[cur];renderMain(v.main,renderLit(v.lit),cur);renderNightly(v.nightly);renderPerf(v.nightly);renderPR(v.pr,cur);renderFastFull(v.fast_full);renderOps(v.ops,v.usage,d.occupancy);renderLLVM(v.bump,cur)};
+    const v=d.branches[cur];renderMain(v.main,renderLit(v.lit),cur);renderNightly(v.nightly);renderPerf(v.nightly);renderPR(v.pr,cur);renderFastFull(v.fast_full);renderSanitizer(v.sanitizer);renderOps(v.ops,v.usage,d.occupancy);renderLLVM(v.bump,cur)};
   draw()}
 
 function show(id){if(!$(id)||!$(id).matches("section"))id="main";
