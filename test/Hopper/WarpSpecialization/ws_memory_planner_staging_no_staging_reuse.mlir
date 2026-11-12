@@ -1,23 +1,8 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=1 smem-budget=232448" | FileCheck %s
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=1 smem-budget=232448" --nvgpu-test-ws-code-partition="num-buffers=1" | FileCheck %s --check-prefix=PART
 
-// Real pre-planner IR of a persistent autoWS GEMM with two accumulators whose
-// fp32 tiles are TMA-stored through the same descriptor under
-// separate_epilogue_store (MRS e92, B_MODE=fused, BM64 BN128 BK128 ns1).
-//
-// The plan is over budget, so Phase 3.6 looks for reuse targets for the two
-// TMA staging buffers (ids 4 and 5). It used to land staging 4 on staging 5 and
-// staging 5 on operand 9. A staging host is never realized, so the planner
-// under-counted SMEM, and the 4->5 pair's "load" task was the staging fill
-// task, so code partitioning found the pairs inconsistent and dropped the
-// cross-tile WAR token. Staging 5 then shared operand 9's SMEM with nothing
-// stopping the next tile's load from overwriting it mid-store (silent wrong
-// output).
-//
-// Check each staging buffer reuses a distinct operand host, and that code
-// partitioning then emits the cross-tile WAR token (created at function entry,
-// before any allocation) and realizes both reuses.
-
+// Real pre-planner IR (MRS e92): the two TMA staging buffers must reuse distinct
+// operand hosts, never each other, and both reuses get the cross-tile WAR token.
 // CHECK-DAG: allocation.reuseTarget = 9 : i32, allocation.shareGroup = 4 : i32, buffer.copy = 1 : i32, buffer.id = 4 : i32, buffer.tmaStaging = 1 : i32
 // CHECK-DAG: allocation.reuseTarget = 12 : i32, allocation.shareGroup = 5 : i32, buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.tmaStaging = 1 : i32
 

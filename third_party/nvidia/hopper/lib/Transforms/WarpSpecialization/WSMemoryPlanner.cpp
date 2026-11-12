@@ -1960,10 +1960,8 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
                                                     << " not allocated — skip");
       continue;
     }
-    // A TMA staging buffer cannot host another one: mergeStagingReuseIntoHost
-    // never realizes a staging host, so the planner would count SMEM it does
-    // not save, and Step 7.5 would see the staging fill task as the pair's
-    // "load" task.
+    // mergeStagingReuseIntoHost never realizes a staging host, so the plan
+    // would count SMEM it does not save.
     if (buf.tmaStaging > 0) {
       LDBG("  findReuseCandidate: target bufferId="
            << buf.bufferId << " is TMA staging (never realized as a host for "
