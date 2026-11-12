@@ -154,7 +154,7 @@ def kernel_rmsnorm_bwd_persistent_single_cta(
         ROUND_DX: tl.constexpr = False, DS: tl.constexpr = None, AS: tl.constexpr = 0, DAS: tl.constexpr = 0,
         ACS: tl.constexpr = 0, DXS: tl.constexpr = None, DIRECT: tl.constexpr = True, NW: tl.constexpr = 4,
         TPR: tl.constexpr = 32, V: tl.constexpr = 4, SINGLE_ITER: tl.constexpr = False, STRIDED: tl.constexpr = False,
-        USE_LAYOUT: tl.constexpr = False, WIDE: tl.constexpr = False):
+        USE_LAYOUT: tl.constexpr = False, WIDE: tl.constexpr = False, N_FLOAT=None):
     BM: tl.constexpr = BLOCK_M
     BN: tl.constexpr = BLOCK_N
     XS: tl.constexpr = row_stride
@@ -205,6 +205,8 @@ def kernel_rmsnorm_bwd_persistent_single_cta(
         col_offsets = tl.arange(0, BN)
         mask_col = col_offsets < N
         w = _load_norm_weight(W, col_offsets, mask_col, BN)
+        # PERF: a constant divisor becomes a multiply that ptxas schedules ~15% slower with several rows per thread.
+        n_div = N if N_FLOAT is None else N_FLOAT
         if STRIDED:
             blocks_per_sm = 1 if SINGLE_ITER else tl.cdiv(M - pid * BM, nprog * BM)
             start_block = pid
@@ -239,8 +241,8 @@ def kernel_rmsnorm_bwd_persistent_single_cta(
                 partial_db += tl.sum(tl.where(rw_mask, dy, 0.0), axis=0)
             wdy = w[None, :] * dy
             x_norm_wdy = tl.where(rw_mask, x_norm * wdy, 0.0)
-            c = tl.sum(x_norm_wdy, axis=1, keep_dims=True) / N
-            avg = None if IS_RMS else tl.sum(tl.where(rw_mask, wdy, 0.0), axis=1, keep_dims=True) / N
+            c = tl.sum(x_norm_wdy, axis=1, keep_dims=True) / n_div
+            avg = None if IS_RMS else tl.sum(tl.where(rw_mask, wdy, 0.0), axis=1, keep_dims=True) / n_div
             dx = rstd[:, None] * (wdy - x_norm * c if IS_RMS else wdy - avg - x_norm * c)
             dx = dx.to(DX.dtype.element_ty if ROUND_DX else dx.dtype)
             dx = dx.to(COMPUTE_DTYPE if ROUND_DX else dx.dtype)
@@ -529,7 +531,8 @@ def norm_bwd(x, weight, dout, rstd, *, mean=None, norm='rms', has_bias=False, ad
           FROM_NORMALIZED=from_normalized, ROUND_DX=round_dx_before_accum, row_stride=x.stride(0), DS=dout.stride(0),
           AS=addend.stride(0) if addend is not None else n, DAS=dout_addend.stride(0) if dout_addend is not None else n,
           ACS=dx_accum.stride(0) if dx_accum is not None else n, DXS=dx.stride(0), num_warps=layout_kw.get('NW', 4),
-          NUM_SMS=np, SHOULD_MASK_COL=n != bn, STRIDED=not layout_kw['WIDE'], **layout_kw)
+          NUM_SMS=np, SHOULD_MASK_COL=n != bn, STRIDED=not layout_kw['WIDE'], N_FLOAT=float(n) if bm > 1 else None,
+          **layout_kw)
         if dw is not None or db is not None:
             _param_reduce[triton.cdiv(n, 32)](wp, dw, bp, db, np, n, triton.next_power_of_2(np), 32, num_warps=4)
     return (dx, dw, db)
