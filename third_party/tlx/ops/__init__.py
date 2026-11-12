@@ -125,8 +125,8 @@ __all__ = [
     "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev",
     "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
     "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "paged_attention_decode",
-    "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d", "UnsupportedOp",
-    "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "paged_attention_prefill", "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d",
+    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'paged_attention_decode_fp8', 'paged_attention_decode_fp8_workspace', 'compute_norm_nvfp4_global_scale',
@@ -1415,6 +1415,75 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     with torch.cuda.device(query.device):
         return fn(query, key_cache, value_cache, context_lens, block_tables, float(sm_scale), int(query_length),
                   int(sliding_window), max_context_len, out, workspace)
+
+
+def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k, softmax_scale, causal,
+                            window_size, block_table, softcap, q_descale, k_descale, v_descale, q_scales=None,
+                            alibi_slopes=None, output_scale=None, qq_bias=None, sinks=None, shuffled_kv_cache=False,
+                            skip_reduce=False, *, space=None):
+    """Forward-only causal GQA prefill over a paged K/V cache; a drop-in for AITER's
+    ``aiter.ops.triton.attention.unified_attention`` with the same arguments.
+
+    ``q`` is packed ``(tokens, q_heads, head_dim)``; sequence ``b`` owns rows
+    ``cu_seqlens_q[b]:cu_seqlens_q[b + 1]``, which are the last of its
+    ``seqused_k[b]`` keys, so any earlier keys are a cached prefix. ``k`` and ``v``
+    are ``(blocks, page, kv_heads, head_dim)`` and ``block_table[b, p]`` is the
+    physical block of sequence ``b``'s page ``p``. ``window_size=(W - 1, 0)`` limits
+    each row to its last ``W`` keys, itself included; ``(-1, -1)`` disables it.
+    ``max_seqlen_q`` and ``max_seqlen_k`` bound every sequence's query rows and keys.
+    The result is written into ``out``, which is returned.
+
+    Supported subset: causal, BF16/FP16 Q and K/V of one dtype, no softcap, no
+    scales (FP8/FP4), no ALiBi, ``qq_bias`` or sinks, the linear (unshuffled) cache,
+    and ``skip_reduce=False``; anything else raises ``InvalidInput``.
+    """
+    import torch
+    name = "tlx.ops.paged_attention_prefill"
+    unsupported = {
+        "causal=False": not causal, "softcap": bool(softcap), "q_descale": q_descale is not None, "k_descale": k_descale
+        is not None, "v_descale": v_descale is not None, "q_scales": q_scales is not None, "alibi_slopes": alibi_slopes
+        is not None, "output_scale": output_scale is not None, "qq_bias": qq_bias is not None, "sinks": sinks
+        is not None, "shuffled_kv_cache": bool(shuffled_kv_cache), "skip_reduce": bool(skip_reduce)
+    }
+    if any(unsupported.values()):
+        raise InvalidInput(f"{name} does not support {[key for key, bad in unsupported.items() if bad]}")
+    if q.ndim != 3 or k.ndim != 4 or v.shape != k.shape:
+        raise InvalidInput(f"{name} expects (tokens, q_heads, head_dim) q and 4-D (blocks, page, kv_heads, head_dim) "
+                           f"k/v; got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise InvalidInput(f"{name} expects q and k/v of one dtype")
+    if k.shape[3] != q.shape[2] or q.stride(2) != 1 or k.stride(3) != 1 or v.stride(3) != 1:
+        raise InvalidInput(f"{name} expects one head_dim, contiguous in q and k/v")
+    if (cu_seqlens_q.dtype != torch.int32 or block_table.dtype != torch.int32 or block_table.ndim != 2
+            or seqused_k.dtype not in (torch.int32, torch.int64)):
+        raise InvalidInput(f"{name} expects int32 cu_seqlens_q, 2-D int32 block_table and int32/int64 seqused_k")
+    if cu_seqlens_q.shape != (seqused_k.shape[0] + 1, ) or block_table.shape[0] != seqused_k.shape[0]:
+        raise InvalidInput(f"{name} expects cu_seqlens_q of batch + 1 entries and one seqused_k entry and "
+                           "block_table row per sequence")
+    if any(t.device != q.device for t in (k, v, out, cu_seqlens_q, seqused_k, block_table)):
+        raise InvalidInput(f"{name} expects all tensors on one device")
+    if out.shape != q.shape or out.dtype != q.dtype or out.stride(2) != 1:
+        raise InvalidInput(f"{name} expects out to match q's shape and dtype")
+    num_kv_heads = k.shape[2]
+    if num_kv_heads == 0 or q.shape[1] % num_kv_heads:
+        raise InvalidInput(f"{name}: {num_kv_heads} KV heads must divide {q.shape[1]} query heads")
+    for arg, value in (("max_seqlen_q", max_seqlen_q), ("max_seqlen_k", max_seqlen_k)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise InvalidInput(f"{name} expects a non-negative int {arg}; got {value!r}")
+    if not 0 < softmax_scale < math.inf:
+        raise InvalidInput(f"{name} expects a positive finite softmax_scale; got {softmax_scale!r}")
+    if len(window_size) != 2 or not (tuple(window_size) == (-1, -1) or (window_size[0] >= 0 and window_size[1] == 0)):
+        raise InvalidInput(f"{name} expects window_size (W - 1, 0) or (-1, -1); got {window_size!r}")
+    space_name, invariance = _normalize_space_arg("paged_attention_prefill", space)
+    _check_single_config_space("paged_attention_prefill", space_name)
+    fn, spec = impl_for("paged_attention_prefill", device=q.device)
+    check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2], GROUP=q.shape[1] // num_kv_heads)
+    check_backward(spec, q, k, v)
+    _check_enforced("paged_attention_prefill", spec, invariance)
+    with torch.cuda.device(q.device):
+        fn(q, k, v, cu_seqlens_q, seqused_k.to(torch.int32), block_table, max_seqlen_q, sm_scale=float(softmax_scale),
+           sliding_window=int(window_size[0]) + 1, out=out, max_context_len=max_seqlen_k)
+    return out
 
 
 def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, *, query_length=1, sliding_window=0,

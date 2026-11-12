@@ -56,6 +56,7 @@ import urllib.parse
 
 import ci_health_logs as logs
 import ci_health_rules as rules
+import ci_health_sanitizer as sanitizer
 import meta_llvm_bump as mlb
 import tlx_ops_bench_dashboard as bench
 
@@ -72,7 +73,7 @@ STUCK_DAYS = 7
 #: gpu-tests-nightly.yml runs the slow suites (TritonBench) once a day.
 #: compiler.yml runs LIT on every PR too; only its push runs are collected.
 COLLECT = ("gpu-tests.yml", "gpu-tests-nightly.yml", rules.BENCH_WF, "nightly-fbtriton.yml", rules.LIT_WF,
-           rules.FAST_WF)
+           rules.FAST_WF, sanitizer.WORKFLOW)
 FORK = "facebookexperimental/llvm-project"
 #: Fork branch each tracked branch's cmake/meta-llvm-info.json follows, as in meta-llvm-update.yml.
 FORK_BRANCHES = {"main": "triton_beta", "release/3.8.x": "triton_3.8.x"}
@@ -97,6 +98,10 @@ def gh_text(path):
     response with terminal escape sequences unless allowed, and job logs can hold them."""
     return subprocess.run(["gh", "api", "--allow-escape-sequences", path], capture_output=True, text=True,
                           check=True).stdout
+
+
+def gh_bytes(path):
+    return subprocess.run(["gh", "api", "--allow-escape-sequences", path], capture_output=True, check=True).stdout
 
 
 def month_files(data_dir):
@@ -369,7 +374,7 @@ def _remaining(api):
     return api("rate_limit")[0]["resources"]["core"]["remaining"]
 
 
-def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get):
+def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get, download=gh_bytes):
     state_path = os.path.join(data_dir, "state.json")
     state = json.load(open(state_path)) if os.path.exists(state_path) else {}
     if since is None:
@@ -377,6 +382,12 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get):
                  if state.get("cursor") else rules.iso(rules.t(now) - dt.timedelta(days=BACKFILL_DAYS)))
     runs = load_runs(data_dir)
     enrich = set()
+    sanitizer_retry = {
+        r["id"]
+        for r in runs.values()
+        if r.get("wf") == sanitizer.WORKFLOW and (r.get("sanitizer") or {}).get("retry")
+        and r["created_at"] >= rules.iso(rules.t(now) - dt.timedelta(days=BACKFILL_DAYS))
+    }
     recent = rules.iso(rules.t(now) - dt.timedelta(days=7))
     for wf in COLLECT:
         event = "&event=push" if wf == rules.LIT_WF else ""
@@ -384,13 +395,16 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get):
         # unchanged completed attempts still need no jobs or logs.
         listed_since = min(since, rules.iso(rules.t(now) - dt.timedelta(days=7))) if wf in ("gpu-tests.yml",
                                                                                             rules.FAST_WF) else since
+        if wf == sanitizer.WORKFLOW:
+            listed_since = min(since, recent) if state.get("sanitizer_collected") else rules.iso(
+                rules.t(now) - dt.timedelta(days=BACKFILL_DAYS))
         for page in api(f"repos/{REPO}/actions/workflows/{wf}/runs?created=>={listed_since}{event}&per_page=100"):
             for run in page["workflow_runs"]:
                 old = runs.get(run["id"])
                 same_attempt = old and old.get("run_attempt", 1) == run.get("run_attempt", 1)
                 comparison = wf in ("gpu-tests.yml", rules.FAST_WF) and run["event"] == "pull_request"
                 if old and old["status"] == "completed" and old["jobs"] is not None:
-                    if not comparison:
+                    if not comparison and (wf != sanitizer.WORKFLOW or same_attempt):
                         continue
                     if same_attempt:
                         if old.get("provenance_version") or run["created_at"] < recent:
@@ -415,8 +429,9 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get):
                     record["pr"], record["author"] = _pr_and_author(run, api)
                 runs[run["id"]] = record
     todo = sorted(
-        (r for r in runs.values() if (r["status"] == "completed" and (r["jobs"] is None or r["id"] in enrich)) or (
-            r["wf"] == rules.FAST_WF and r["event"] == "pull_request" and r["status"] != "completed")),
+        (r for r in runs.values()
+         if (r["status"] == "completed" and (r["jobs"] is None or r["id"] in enrich or r["id"] in sanitizer_retry)) or (
+             r["wf"] == rules.FAST_WF and r["event"] == "pull_request" and r["status"] != "completed")),
         key=lambda r: r["created_at"])
     unfetched = []
     for i, r in enumerate(todo):
@@ -424,7 +439,7 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get):
             unfetched = todo[i:]
             break
         legacy = r["id"] in enrich
-        if legacy:
+        if legacy or (r["id"] in sanitizer_retry and r.get("jobs") is not None):
             jobs = r["jobs"]
         else:
             rerun = r["wf"] in ("gpu-tests.yml", rules.FAST_WF) and r["event"] == "pull_request" and r.get(
@@ -462,12 +477,17 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get):
             r["full_select"] = _selection([job for job in jobs if job["name"].startswith("full / ")], log)
         if r["wf"] in ("gpu-tests.yml", rules.FAST_WF) and r["event"] == "pull_request":
             _tested_revision(r, jobs, log)
+        if r["wf"] == sanitizer.WORKFLOW:
+            try:
+                r["sanitizer"] = sanitizer.collect(r, api, download, REPO)
+            except (subprocess.CalledProcessError, OSError, ValueError) as exc:
+                r["sanitizer"] = {"tools": [], "missing": [{"gpu": "all", "reason": str(exc)}], "retry": True}
         r["jobs"] = jobs
     # A run still not completed after STUCK_DAYS (a nightly stuck in "pending") no longer holds the cursor back.
     stuck = rules.iso(rules.t(now) - dt.timedelta(days=STUCK_DAYS))
     pending = [r["created_at"] for r in runs.values() if r["status"] != "completed" and r["created_at"] >= stuck]
     pending += [r["created_at"] for r in unfetched]
-    state = {"cursor": min(pending) if pending else now, "collected_at": now}
+    state = {"cursor": min(pending) if pending else now, "collected_at": now, "sanitizer_collected": True}
     changed = save_runs(data_dir, runs)
     # A failed snapshot keeps the previous bump.json, so the rest of the page still updates.
     try:

@@ -632,7 +632,7 @@ def test_page_data_has_one_section_per_tab():
     data = r.page_data([push(1, tlx())], stamp(23), {})
     assert set(data) == {"asof", "branches", "occupancy"}
     assert all(
-        set(v) == {"main", "lit", "nightly", "pr", "fast_full", "ops", "usage", "bump"}
+        set(v) == {"main", "lit", "nightly", "pr", "fast_full", "sanitizer", "ops", "usage", "bump"}
         for v in data["branches"].values())
 
 

@@ -25,7 +25,22 @@ RECOVERY_RATIO = 0.90
 GATE_SAMPLES = 10
 SWING = 1.15
 BEST_REASON = "at least 15% throughput loss against the historical best on two reliable measurements"
-SIGNALS = {"recent": "Recent baseline", "historical-best": "Historical best"}
+# Per-case noise: a loss counts when it exceeds max(NOISE_MIN_LOSS, NOISE_Z x the case's own night-to-night spread).
+NOISE_BASELINE = 5
+NOISE_WINDOW = 10
+NOISE_Z = 5
+NOISE_MIN_LOSS = 0.03
+NOISE_MIN_SIGMA = 0.005
+STABLE_NIGHTS = 3
+NOISE_REASON = ("throughput loss beyond five times the case's night-to-night spread (at least 3%) on two nights, "
+                "noisy measurements included")
+UNSTABLE_REASON = (
+    "a case with a reliable history turned noisy on two nights, with mean throughput below the noise-scaled "
+    "threshold")
+SIGNALS = {
+    "recent": "Recent baseline", "historical-best": "Historical best", "noise-scaled": "Noise-scaled", "unstable":
+    "Became noisy"
+}
 MARKER = re.compile(r"<!-- tlx-perf-episode: (\S+) -->")
 CV_NOTE = re.compile(r"\bCV\b.*\bover\b.*\blimit\b")
 
@@ -291,6 +306,105 @@ def detect_best(nights, tracked=None):
     return alerts
 
 
+def level(case):
+    """The run's median when recorded: a fast/slow timing mixture within one run moves the mean, not the median."""
+    value = case.get("tlx_p50")
+    return value if isinstance(value, (int, float)) and math.isfinite(value) and value > 0 else case["tlx_tflops"]
+
+
+def spread(values):
+    """Robust standard deviation of night-to-night log changes, or None with fewer than four changes."""
+    changes = [math.log(b / a) for a, b in zip(values, values[1:])]
+    if len(changes) < 4:
+        return None
+    middle = statistics.median(changes)
+    return max(NOISE_MIN_SIGMA, 1.4826 * statistics.median(abs(c - middle) for c in changes) / math.sqrt(2))
+
+
+def detect_noise(nights):
+    """Losses scaled to each case's own noise, and reliable cases that turn noisy while losing throughput.
+
+    Noisy rows count: a regression can itself make a case noisy, and dropping those rows hides it. Low nights do not
+    enter the baseline, so a lasting loss keeps its pre-onset baseline and episode onset.
+    """
+    history = collections.defaultdict(list)
+    pending = {}
+    alerts = []
+    for night in sorted(nights, key=lambda n: n["date"]):
+        mode, now = regime(night), day(night["date"])
+        env = environment(night)
+        for op, result in sorted(night["ops"].items()):
+            found = collections.defaultdict(lambda: collections.defaultdict(list))
+            compared = collections.Counter()
+            for case in result["cases"]:
+                if not valid(case):
+                    continue
+                identity = op, case["direction"], case["key"], mode
+                past = [h for h in history[identity] if (now - day(h["date"])).days <= 4 * MAX_AGE_DAYS]
+                current = {
+                    "date": night["date"], "sha": night["sha"], "value": level(case), "mean": case["tlx_tflops"],
+                    "reliable": reliable(case), "case": case, "environment": env
+                }
+                base = past[-NOISE_BASELINE:]
+                sigma = spread([h["value"] for h in past[-NOISE_WINDOW:]])
+                if len(base) < NOISE_BASELINE or sigma is None:
+                    history[identity].append(current)
+                    continue
+                compared[case["direction"]] += 1
+                baseline = statistics.median(h["value"] for h in base)
+                threshold = max(NOISE_MIN_LOSS, NOISE_Z * sigma)
+                low = math.log(current["value"] / baseline) < -threshold
+                held = pending.get(identity)
+                if held is None:
+                    streak = 0
+                    for h in reversed(past):
+                        if not h["reliable"]:
+                            break
+                        streak += 1
+                    held = {
+                        "baseline": baseline, "mean_baseline": statistics.median(h["mean"] for h in base), "base": base,
+                        "onset": night["date"], "streak": streak, "low": False, "noisy_run": 0
+                    }
+                held["noisy_run"] = 0 if current["reliable"] else held["noisy_run"] + 1
+                if low and held["low"]:
+                    found["noise-scaled"][case["direction"]].append(noise_row(case, held, current, 1 - threshold))
+                unstable = held["noisy_run"] >= 1 and held["streak"] >= STABLE_NIGHTS
+                if unstable and held["noisy_run"] >= 2 and current["mean"] <= (1 - threshold) * held["mean_baseline"]:
+                    found["unstable"][case["direction"]].append(
+                        noise_row(case, held, current, 1 - threshold, key="mean"))
+                held["low"] = low
+                if low or unstable:
+                    pending[identity] = held
+                else:
+                    pending.pop(identity, None)
+                    history[identity].append(current)
+            for detector, reason in (("noise-scaled", NOISE_REASON), ("unstable", UNSTABLE_REASON)):
+                for direction, rows in sorted(found[detector].items()):
+                    alerts.append({
+                        "detector": detector, "platform": night["platform"], "op": op, "direction": direction, "date":
+                        night["date"], "sha": night["sha"], "reasons": [reason], "median_ratio":
+                        statistics.median(r["ratio"] for r in rows), "compared": compared[direction], "reported_cases":
+                        sum(c["direction"] == direction for c in result["cases"]), "space": result.get("space"),
+                        "required_ratio": max(r["required_ratio"] for r in rows), "confirmation_date": None,
+                        "environment": env, "cases": sorted(rows, key=lambda r: r["ratio"])
+                    })
+    return alerts
+
+
+def noise_row(case, held, current, keep, key="value"):
+    base = held["base"]
+    baseline = held["baseline"] if key == "value" else held["mean_baseline"]
+    value = current[key]
+    good = max(base, key=lambda h: h[key])
+    return {
+        "key": case["key"], "params": case["params"], "dtype": case["dtype"], "baseline": baseline, "current": value,
+        "ratio": value / baseline, "baseline_dates": [h["date"] for h in base], "baseline_sha": base[0]["sha"],
+        "good_sha": good["sha"], "good_date": good["date"], "reference_before": base[-1]["case"].get("ref_tflops"),
+        "reference_now": case.get("ref_tflops"), "previous_environment": base[-1]["environment"], "noise_onset":
+        held["onset"], "required_ratio": keep * baseline / good[key]
+    }
+
+
 def episode(alert, case):
     """Hidden marker entry shared by both detectors: platform, case, timing regime and loss onset."""
     mode, replicates = regime({"timing": alert["environment"].get("timing")})
@@ -299,16 +413,21 @@ def episode(alert, case):
 
 
 def detect_all(nights):
-    """Recent-baseline and historical-best alerts merged per platform, op, direction and night."""
+    """Recent-baseline, historical-best, noise-scaled and became-noisy alerts merged per platform, op, direction and
+    night."""
     tracked = track_best(nights)
     merged = {}
-    for detector, alerts in (("recent", detect(nights)), ("historical-best", detect_best(nights, tracked))):
+    noise = detect_noise(nights)
+    for detector, alerts in (("recent", detect(nights)), ("historical-best", detect_best(nights, tracked)),
+                             ("noise-scaled", [a for a in noise if a["detector"] == "noise-scaled"
+                                               ]), ("unstable", [a for a in noise if a["detector"] == "unstable"])):
         for alert in alerts:
             for case in alert["cases"]:
                 case.setdefault("detector", detector)
                 if "onset" not in case:
                     found = tracked.get((alert["op"], alert["direction"], case["key"]), {}).get(alert["date"])
-                    case["onset"] = (found["onset"] if found else None) or case.get("recent_onset")
+                    case["onset"] = ((found["onset"] if found else None) or case.get("recent_onset")
+                                     or case.get("noise_onset"))
             evidence = {k: alert[k] for k in ("reasons", "median_ratio", "compared", "confirmation_date")}
             slot = alert["platform"], alert["op"], alert["direction"], alert["date"]
             if slot not in merged:
@@ -362,11 +481,12 @@ def issue_body(alert, repo, run_url, commit_dates):
         ""
     ]
     for detector, found in evidence.items():
+        kind = "evaluated" if detector in ("noise-scaled", "unstable") else "reliable"
         lines.append(f"- {SIGNALS[detector]}: " + "; ".join(found["reasons"]) +
-                     f". Compared {found['compared']} reliable cases out of {alert['reported_cases']} reported.")
+                     f". Compared {found['compared']} {kind} cases out of {alert['reported_cases']} reported.")
     lines.extend([
         "", "## Affected cases", "",
-        "Throughput is in TFLOP/s. Each baseline is a three-night median; historical-best rows use the best median in the same timing mode.",
+        "Throughput is in TFLOP/s. Recent-baseline rows use a three-night median, noise-scaled and became-noisy rows a five-night median; historical-best rows use the best median in the same timing mode.",
         "Reference values are context, not the historical regression gate. A missing value means no reference measurement was recorded.",
         "", "| Signal | Input | Baseline nights | TLX baseline | TLX now | Loss | Reference before | Reference now |",
         "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |"

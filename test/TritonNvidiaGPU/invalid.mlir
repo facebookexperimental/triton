@@ -2538,3 +2538,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+#fp6 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, padding = "b6p2x16"}>
+#bytes = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
+!desc = !tt.tensordesc<1x64xui8, #fp6>
+!src = !ttg.memdesc<1x64xi8, #fp6, #ttg.shared_memory>
+tt.func @fp6_tma_store_box_width(%desc: !desc, %coord: i32, %src: !src) {
+  // expected-error @below {{FP6 TMA requires a 128-value box}}
+  ttng.async_tma_copy_local_to_global %desc[%coord, %coord] %src : !desc, !src
+  tt.return
+}

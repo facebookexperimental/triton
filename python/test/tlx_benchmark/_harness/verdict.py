@@ -32,6 +32,7 @@ def judge(
     correct: Optional[bool] = None,
     accuracy_note: str = "",
     floor_tflops: Optional[float] = None,
+    reference_gate: bool = True,
 ) -> Result:
     # Precedence is the README's order: error, pip, noisy, ok. pip ahead of noisy is
     # deliberate -- a shape that is slow AND jittery is the one most worth seeing, and
@@ -61,7 +62,7 @@ def judge(
                             (f" ({compile_stat.n_configs} configs benchmarked)" if compile_stat.n_configs else ""))
         return result
 
-    if result.speedup is not None and result.speedup < MIN_SPEEDUP:
+    if reference_gate and result.speedup is not None and result.speedup < MIN_SPEEDUP:
         result.status = Status.PIP
         result.notes.append(f"speedup {result.speedup:.3f}x is under the {MIN_SPEEDUP:g}x floor")
         if tlx.cv > MAX_CV:  # still worth saying the number is soft

@@ -136,7 +136,7 @@ getNvmmaDescriptorLayout(const LinearLayout &ll, unsigned bitwidth,
 std::optional<NvmmaSmemAttrs> getNvmmaSmemAttrs(ttg::MemDescType memTy) {
   if (auto nvmma = dyn_cast<ttg::NVMMASharedEncodingAttr>(memTy.getEncoding()))
     return NvmmaSmemAttrs{nvmma.getSwizzlingByteWidth(), nvmma.getTransposed(),
-                          nvmma.getFp4Padded()};
+                          nvmma.isPaddedFp4()};
   return getMmaOperandSmemAttrs(memTy);
 }
 

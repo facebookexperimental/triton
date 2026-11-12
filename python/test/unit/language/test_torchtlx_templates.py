@@ -76,6 +76,11 @@ def is_blackwell() -> bool:
     return current_target().is_blackwell
 
 
+def _output_code(code) -> str:
+    """Join generated modules, dropping torch's contiguous-layout autotune subgraphs."""
+    return "\n".join(c for c in code if "benchmark_contiguous_" not in c)
+
+
 def flex_choices_hook_available() -> bool:
     """True if torch exposes the flex-attention choices hook the template needs.
 
@@ -1859,7 +1864,7 @@ class TestTLXTemplates(TestCase):
         c_expected = torch.nn.functional.gelu(a.float() @ w.t().float() + bias.float()).to(dtype)
         torch.testing.assert_close(c_actual, c_expected, atol=3e-2, rtol=3e-2)
 
-        code_str = "\n".join(code)
+        code_str = _output_code(code)
         self.assertIn("_reduce_k", code_str)
         self.assertNotIn("triton_poi_", code_str)
 
@@ -1902,7 +1907,7 @@ class TestTLXTemplates(TestCase):
             reference = reference * 0.5
         torch.testing.assert_close(c_actual, reference.to(dtype), atol=4e-2, rtol=4e-2)
 
-        code_str = "\n".join(code)
+        code_str = _output_code(code)
         self.assertIn("split_k_ws", code_str)
         self.assertIn("_reduce_k", code_str)
         self.assertNotIn("triton_poi_", code_str)
@@ -2677,10 +2682,13 @@ class TestHopperMMTemplate(TestCase):
 
     @parametrize("op", ("mm", "addmm_n", "addmm_mn", "mm_gelu"))
     @parametrize("swap_ab", (False, True))
-    def test_split_k(self, op, swap_ab):
+    @parametrize("cpp_wrapper", (False, True))
+    def test_split_k(self, op, swap_ab, cpp_wrapper):
         """K split across work units: each writes an fp32 partial to the split-K
         workspace and _reduce_k_kernel sums them, adds the bias and replays any
-        fused epilogue. M is ragged and K leaves a short last split."""
+        fused epilogue. M is ragged and K leaves a short last split. The reducer
+        launches with programmatic dependent launch and waits for the partials
+        in-kernel; the GEMM itself does not."""
         from triton.tlx.ops.kernels.mm import sm90
 
         m, n, k = (7, 1000, 64 * 41) if swap_ab else (264, 1000, 64 * 41)
@@ -2699,12 +2707,25 @@ class TestHopperMMTemplate(TestCase):
         else:
             conf = sm90._config(128, 128, 4, group_size_m=1, split_k=4)
             pin = mock.patch.object(sm90, "heuristic_config", return_value=[conf])
-        with pin, config.patch(_HOPPER_ADDMM_PATCH):
+        patch = dict(_HOPPER_ADDMM_PATCH)
+        if cpp_wrapper:
+            patch.update({"cpp_wrapper": True, "triton.autotune_at_compile_time": True})
+        with pin, config.patch(patch):
             actual, code = run_and_get_code(torch.compile(fn), *args)
         torch.testing.assert_close(actual, expected.half(), atol=3e-2, rtol=3e-2)
         generated = "\n".join(code)
         self.assertIn("split_k_ws", generated)
         self.assertIn("_reduce_k", generated)
+        if cpp_wrapper or op == "mm_gelu":
+            # Generated reducer: it waits in-kernel and only its decorator, not the
+            # GEMM's, compiles for PDL launch.
+            self.assertEqual(generated.count("tl.extra.cuda.gdc_wait()"), 1)
+            self.assertEqual(generated.count("'launch_pdl': True"), 1)
+            if cpp_wrapper:
+                self.assertIn("stream_, true", generated)
+                self.assertIn("stream_, false", generated)
+        else:
+            self.assertIn("USE_PDL=True, launch_pdl=True", generated)
 
     @parametrize("op", ("mm", "addmm"))
     @parametrize("shape,layout", (
@@ -3883,6 +3904,8 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                             ),
                             mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_eligible",
                                               return_value=True),
+                            mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_configs",
+                                              side_effect=lambda configs: configs),
                     ):
                         flex_attention_templates.append_tlx_flex(
                             choices,
@@ -4365,8 +4388,57 @@ class TestFlexAttentionChoiceRegistration(TestCase):
 
 
 @unittest.skipIf(not has_tlx(), "TLX not available")
+class TestDeferredSelection(TestCase):
+    """When TLX defers GEMM selection to a MultiTemplateBuffer without max_autotune."""
+
+    def _defers(self, mode, is_blackwell=False, is_gfx942=False, tlx_choice=True, return_multi_template=True):
+        from triton.language.extra.tlx.inductor import registry
+
+        deferred = []
+        choice = mock.MagicMock()
+        choice.name = "tlx_mm" if tlx_choice else "mm"
+        with (
+                config.patch({"triton.tlx_mode": mode, "max_autotune": False, "max_autotune_gemm": False}),
+                mock.patch.object(registry, "current_target", return_value=type("Target", (),
+                                                                                {"is_blackwell": is_blackwell})()),
+                mock.patch.object(registry, "_is_gfx942", return_value=is_gfx942),
+                mock.patch.object(registry, "_orig_algorithm_selector_call",
+                                  side_effect=lambda *args, **kwargs: deferred.append(config.max_autotune_gemm)),
+        ):
+            registry._tlx_algorithm_selector_call(None, "mm", [choice], return_multi_template=return_multi_template)
+        return deferred == [True]
+
+    def test_blackwell_defers_whenever_tlx_is_on(self):
+        self.assertTrue(self._defers("allow", is_blackwell=True))
+        self.assertTrue(self._defers("force", is_blackwell=True))
+        self.assertTrue(self._defers("allow", is_blackwell=True, tlx_choice=False))
+        self.assertFalse(self._defers(None, is_blackwell=True))
+        self.assertFalse(self._defers("allow", is_blackwell=True, return_multi_template=False))
+
+    def test_gfx942_defers_in_allow_with_a_tlx_choice(self):
+        self.assertTrue(self._defers("allow", is_gfx942=True))
+        self.assertFalse(self._defers("force", is_gfx942=True))
+        self.assertFalse(self._defers("allow", is_gfx942=True, tlx_choice=False))
+
+
+@unittest.skipIf(not has_tlx(), "TLX not available")
 class TestBlackwellFlexAttentionChoices(TestCase):
     """Blackwell forward FlexAttention candidate selection; mocked, needs no GPU."""
+
+    @unittest.skipIf(not torch.cuda.is_available(), "Needs the CUDA config heuristics")
+    def test_base_configs_ignore_max_autotune(self):
+        """The TLX tiles come from the same base list with max_autotune on or off."""
+        from torch._inductor.virtualized import V
+        from triton.language.extra.tlx.inductor import flex_attention_templates
+
+        heuristics = V.choices.get_config_heuristics("cuda")
+        base = {}
+        for max_autotune in (False, True):
+            with config.patch(max_autotune=max_autotune):
+                stock = heuristics.get_flex_attn_fwd_configs(128, 512, torch.bfloat16)
+            base[max_autotune] = flex_attention_templates._blackwell_flex_fwd_configs(stock)
+        self.assertEqual(base[True], base[False])
+        self.assertGreater(len(base[False]), 1)
 
     @staticmethod
     def _append(configs, q_len=512, kernel_options=None, dtypes=(torch.bfloat16, ) * 3, is_blackwell=True, tma=True,
@@ -4385,6 +4457,8 @@ class TestBlackwellFlexAttentionChoices(TestCase):
                                   registration._Template()),
                 mock.patch.object(flex_attention_templates, "current_target", return_value=target),
                 mock.patch("torch._inductor.utils.can_use_tma", return_value=tma),
+                mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_configs",
+                                  side_effect=lambda configs: configs),
         ):
             flex_attention_templates.append_tlx_flex(
                 choices,
@@ -5417,8 +5491,9 @@ class TestTargetDetection(TestCase):
 
 
 # Extern fallback calls; the bare op name also appears in "Original ATen" comments.
-_SDPA_FWD_CALL = "aten._scaled_dot_product_flash_attention.default("
-_SDPA_BWD_CALL = "aten._scaled_dot_product_flash_attention_backward.default("
+# SDPA lowers to flash or cuDNN attention depending on the torch build.
+_SDPA_FWD_CALL = r"aten\._scaled_dot_product_(flash|cudnn)_attention\.default\("
+_SDPA_BWD_CALL = r"aten\._scaled_dot_product_(flash|cudnn)_attention_backward\.default\("
 
 
 def _rel_l2(out, ref):
@@ -5436,14 +5511,17 @@ class TestSdpaToFlex(TestCase):
     The flag is set process-wide because the lazy backward compile reads it.
     """
 
-    def _compile_fw_bw(self, fn, q, kv, routed, disable_caches=True):
+    def _compile_fw_bw(self, fn, q, kv, routed, disable_caches=True, backend=None):
+        from torch.nn.attention import sdpa_kernel
+
         q = q.detach().requires_grad_(True)
         kv = kv.detach().requires_grad_(True)
         saved = tlx_config.sdpa_to_flex
         tlx_config.sdpa_to_flex = routed
         try:
             torch._dynamo.reset()
-            with config.patch({"force_disable_caches": disable_caches}):
+            backends = contextlib.nullcontext() if backend is None else sdpa_kernel(backend)
+            with config.patch({"force_disable_caches": disable_caches}), backends:
                 out, code = run_fw_bw_and_get_code(lambda: torch.compile(fn)(q, kv))
         finally:
             tlx_config.sdpa_to_flex = saved
@@ -5467,8 +5545,12 @@ class TestSdpaToFlex(TestCase):
         (16, 100, 80, True),
         (32, 1536, 80, False),
     ))
-    def test_routes_eligible(self, Lq, Lkv, D, shared_kv):
+    @parametrize("backend", ("flash", "cudnn"))
+    def test_routes_eligible(self, Lq, Lkv, D, shared_kv, backend):
         import triton.language.extra.tlx.inductor.registry  # noqa: F401
+        from torch.nn.attention import SDPBackend
+
+        sdpa_backend = {"flash": SDPBackend.FLASH_ATTENTION, "cudnn": SDPBackend.CUDNN_ATTENTION}[backend]
 
         q, kv = self._inputs(8, Lq, Lkv, D)
         v = None if shared_kv else torch.randn_like(kv)
@@ -5476,13 +5558,13 @@ class TestSdpaToFlex(TestCase):
         def fn(q, k):
             return torch.nn.functional.scaled_dot_product_attention(q, k, k if v is None else v)
 
-        out, grads, code = self._compile_fw_bw(fn, q, kv, routed=True)
-        ref, ref_grads, ref_code = self._compile_fw_bw(fn, q, kv, routed=False)
-        self.assertRegex(code, r"triton_tem_fused_\w*scaled_dot_product_flash_attention_backward")
-        self.assertNotIn(_SDPA_FWD_CALL, code)
-        self.assertNotIn(_SDPA_BWD_CALL, code)
-        self.assertIn(_SDPA_FWD_CALL, ref_code)
-        self.assertIn(_SDPA_BWD_CALL, ref_code)
+        out, grads, code = self._compile_fw_bw(fn, q, kv, routed=True, backend=sdpa_backend)
+        ref, ref_grads, ref_code = self._compile_fw_bw(fn, q, kv, routed=False, backend=sdpa_backend)
+        self.assertRegex(code, rf"triton_tem_fused_\w*scaled_dot_product_{backend}_attention_backward")
+        self.assertNotRegex(code, _SDPA_FWD_CALL)
+        self.assertNotRegex(code, _SDPA_BWD_CALL)
+        self.assertIn(f"aten._scaled_dot_product_{backend}_attention.default(", ref_code)
+        self.assertIn(f"aten._scaled_dot_product_{backend}_attention_backward.default(", ref_code)
         for got, want in zip((out, *grads), (ref, *ref_grads)):
             self.assertLessEqual(_rel_l2(got, want), 1e-2)
 
@@ -5493,9 +5575,9 @@ class TestSdpaToFlex(TestCase):
 
         q, kv = self._inputs(8, 32, 200, 128)
         _, _, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
-        self.assertIn(_SDPA_FWD_CALL, code)
+        self.assertRegex(code, _SDPA_FWD_CALL)
 
-        # Causal with Lq == Lkv so SDPA still picks flash attention.
+        # Causal with Lq == Lkv so SDPA still picks a fused kernel.
         q, kv = self._inputs(8, 32, 32, 80)
         _, _, code = self._compile_fw_bw(
             lambda q, k: torch.nn.functional.scaled_dot_product_attention(q, k, k, is_causal=True),
@@ -5503,11 +5585,11 @@ class TestSdpaToFlex(TestCase):
             kv,
             routed=True,
         )
-        self.assertIn(_SDPA_FWD_CALL, code)
+        self.assertRegex(code, _SDPA_FWD_CALL)
 
         q, kv = self._inputs(8, 64, 1536, 80)
         _, _, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
-        self.assertIn(_SDPA_FWD_CALL, code)
+        self.assertRegex(code, _SDPA_FWD_CALL)
 
     @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
     @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -5517,8 +5599,8 @@ class TestSdpaToFlex(TestCase):
         q, kv = self._inputs(8, 32, 200, 80)
         _, _, off = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=False, disable_caches=False)
         _, _, on = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True, disable_caches=False)
-        self.assertIn(_SDPA_FWD_CALL, off)
-        self.assertNotIn(_SDPA_FWD_CALL, on)
+        self.assertRegex(off, _SDPA_FWD_CALL)
+        self.assertNotRegex(on, _SDPA_FWD_CALL)
 
     @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
     @unittest.skipIf(not has_tlx(), "TLX not available")

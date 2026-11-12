@@ -47,7 +47,7 @@ env:
 jobs:
   bench:
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 150
+    timeout-minutes: 180
     permissions:
       id-token: write
       contents: read
@@ -123,6 +123,22 @@ jobs:
           bucket: ${{ inputs.platform }}-tlx-ops-bench-job-failed
           junit: ${{ runner.temp }}/tlx-ops-bench.xml
           budget: ${{ runner.temp }}/tlx-ops-bench.xml=120
+      # Records the kernel specializations the suite compiles, for the CPU codegen trace on PRs
+      # (tlx-codegen-trace.yml). Runs after the results are uploaded, so a failure here loses nothing.
+      - name: Record the codegen corpus
+        if: always() && inputs.platform != 'h100'
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          python .github/scripts/tlx_ops_bench_ir_dump.py --harness python/test/tlx_benchmark --out "${RUNNER_TEMP}/codegen-ir" \
+            --corpus-out "${RUNNER_TEMP}/codegen-corpus.${{ inputs.platform == 'mi350' && 'gfx950' || 'sm100' }}.json"
+      - name: Upload the codegen corpus
+        if: always() && inputs.platform != 'h100'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegen-corpus-${{ inputs.platform }}-${{ inputs.version }}
+          path: ${{ runner.temp }}/codegen-corpus.*.json
+          if-no-files-found: ignore
 
   # Feeds the /bench/ dashboard that pages.yml renders from this release. Kept
   # off the GPU runner so it never holds a write token.
@@ -157,6 +173,18 @@ jobs:
                  --notes "Per-night tlx.ops perf summaries behind the /bench/ dashboard." \
             || gh release view tlx-ops-bench >/dev/null
           gh release upload tlx-ops-bench "${SUMMARY}" --clobber
+      - name: Download the codegen corpus
+        if: inputs.platform != 'h100'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: codegen-corpus-${{ inputs.platform }}-${{ inputs.version }}
+          path: corpus
+      - name: Publish the codegen corpus
+        if: inputs.platform != 'h100' && hashFiles('corpus/codegen-corpus.*.json') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload tlx-ops-bench corpus/codegen-corpus.*.json --clobber
       - name: Detect historical throughput regressions
         env:
           GH_TOKEN: ${{ github.token }}

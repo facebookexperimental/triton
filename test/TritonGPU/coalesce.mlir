@@ -419,3 +419,49 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+// The sizePerThread must divide a contiguity that is not a power of two, so
+// that no vector straddles two contiguous runs. A contiguity of 0 gives 1.
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+// CHECK-DAG: [[$SPT1:#.*]] = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+// CHECK-DAG: [[$SPT2:#.*]] = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+// CHECK-DAG: [[$SPT4:#.*]] = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @load_store_contiguity_3
+  // CHECK: tt.load %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT1]]>
+  // CHECK: tt.store %{{.*}}, %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT1]]>
+  tt.func @load_store_contiguity_3(%ptrs: tensor<128x!tt.ptr<f32>, #blocked> {tt.contiguity = 3 : i32, tt.divisibility = 16 : i32}) {
+    %v = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.store %ptrs, %v : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: @load_store_contiguity_6
+  // CHECK: tt.load %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT2]]>
+  // CHECK: tt.store %{{.*}}, %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT2]]>
+  tt.func @load_store_contiguity_6(%ptrs: tensor<128x!tt.ptr<f32>, #blocked> {tt.contiguity = 6 : i32, tt.divisibility = 16 : i32}) {
+    %v = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.store %ptrs, %v : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: @load_store_contiguity_4
+  // CHECK: tt.load %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT4]]>
+  // CHECK: tt.store %{{.*}}, %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT4]]>
+  tt.func @load_store_contiguity_4(%ptrs: tensor<128x!tt.ptr<f32>, #blocked> {tt.contiguity = 4 : i32, tt.divisibility = 16 : i32}) {
+    %v = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.store %ptrs, %v : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: @load_store_contiguity_0
+  // CHECK: tt.load %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT1]]>
+  // CHECK: tt.store %{{.*}}, %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT1]]>
+  tt.func @load_store_contiguity_0(%ptrs: tensor<128x!tt.ptr<f32>, #blocked> {tt.contiguity = 0 : i32, tt.divisibility = 16 : i32}) {
+    %v = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.store %ptrs, %v : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
