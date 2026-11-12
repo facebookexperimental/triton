@@ -19,6 +19,7 @@
 #include "mlir/Transforms/RegionUtils.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
+#include "triton/Analysis/BufferRegion.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -4948,6 +4949,24 @@ void insertAsyncComm(
         }
         auto consumerReleasePoint = consumerReleaseHeuristic(
             tailProducer, tokenTailConsumer, token.first);
+        // Consumers in this task that read the buffer through the generic
+        // proxy (e.g. a local_load, reached through any memdesc views, or
+        // inside a subtiled region). If the producer refills it with TMA, the
+        // release needs a proxy fence.
+        auto readsSmemGenerically = [](Operation *op) {
+          return op
+              ->walk([](Operation *nested) {
+                return tt::hasSharedAccess(nested, ttg::SharedKind::Generic,
+                                           tt::RW::Read)
+                           ? WalkResult::interrupt()
+                           : WalkResult::advance();
+              })
+              .wasInterrupted();
+        };
+        bool readsGenerically = llvm::any_of(consumerOps, [&](Operation *op) {
+          return llvm::is_contained(getAsyncTaskIds(op), token.first) &&
+                 readsSmemGenerically(op);
+        });
         auto subtiled = getEnclosingSubtiledRegionTile(consumerReleasePoint);
         if (!subtiled)
           subtiled = getEnclosingSubtiledRegionTile(tokenTailConsumer);
@@ -4976,14 +4995,19 @@ void insertAsyncComm(
           } else {
             tileBufIdx = subtiled.addSharedArg(bufferIdx);
           }
-          tileBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-              insertTarget->getLoc(), tileToken, tileBufIdx,
-              WSBarrierAttr::forDstTask(funcOp.getContext(),
-                                        masterChannel->relation.first)
-                  .withGuardedBufferIds(
-                      funcOp.getContext(),
-                      getGuardedBufferIds(masterChannel, tokenMap, bufferMap))
-                  .build(funcOp.getContext()));
+          auto tileReleaseOp =
+              tileBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+                  insertTarget->getLoc(), tileToken, tileBufIdx,
+                  WSBarrierAttr::forDstTask(funcOp.getContext(),
+                                            masterChannel->relation.first)
+                      .withGuardedBufferIds(funcOp.getContext(),
+                                            getGuardedBufferIds(masterChannel,
+                                                                tokenMap,
+                                                                bufferMap))
+                      .build(funcOp.getContext()));
+          if (readsGenerically)
+            tileReleaseOp->setAttr(ttng::kFenceGenericReadsAttrName,
+                                   builder.getUnitAttr());
           LDBG("create inline ConsumerRelease in SubtiledRegionOp "
                << masterChannel->uniqID << " ");
         } else {
@@ -5008,6 +5032,9 @@ void insertAsyncComm(
                                                                   tokenMap,
                                                                   bufferMap))
                         .build(funcOp.getContext()));
+            if (readsGenerically)
+              releaseOp->setAttr(ttng::kFenceGenericReadsAttrName,
+                                 builder.getUnitAttr());
             LLVM_DEBUG({
               LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
               token.second.dump();
