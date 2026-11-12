@@ -252,6 +252,30 @@ def _append_tlx_hopper(templates, op_name):
     return templates
 
 
+def tlx_force_drops_addmm_choices(templates, op_name, kernel_inputs) -> bool:
+    """Whether force mode drops this Hopper addmm choice set entirely.
+
+    tuned_addmm offers ATen addmm, bias_addmm and its contiguous subgraph in
+    get_template_configs calls of their own, apart from the unified call the TLX
+    templates join, so filtering each call to TLX choices would keep them. When
+    the unified call will offer TLX, those calls return nothing, as tuned_mm's
+    single call does.
+    """
+    if op_name != "addmm" or is_rocm() or not current_target().is_hopper:
+        return False
+    from torch._inductor.heuristics.template import get_template_heuristic
+    from torch._inductor.kernel.mm import mm_template
+    from torch._inductor.kernel.mm_common import _is_static_problem
+    from torch._inductor.utils import use_triton_template
+
+    if mm_template.uid in {getattr(t, "uid", None) for t in templates}:
+        return False
+    layout = kernel_inputs.output_layout()
+    if not _is_static_problem(layout)[1] or not use_triton_template(layout, check_max_autotune=False):
+        return False
+    return get_template_heuristic(hopper_gemm_ws_template.uid, "cuda", op_name).should_run(kernel_inputs)
+
+
 def _append_tlx_amd(templates, op_name):
     if op_name in ("mm", "addmm"):
         # Identify the unified choice set when autotuning is enabled and the
