@@ -2682,10 +2682,13 @@ class TestHopperMMTemplate(TestCase):
 
     @parametrize("op", ("mm", "addmm_n", "addmm_mn", "mm_gelu"))
     @parametrize("swap_ab", (False, True))
-    def test_split_k(self, op, swap_ab):
+    @parametrize("cpp_wrapper", (False, True))
+    def test_split_k(self, op, swap_ab, cpp_wrapper):
         """K split across work units: each writes an fp32 partial to the split-K
         workspace and _reduce_k_kernel sums them, adds the bias and replays any
-        fused epilogue. M is ragged and K leaves a short last split."""
+        fused epilogue. M is ragged and K leaves a short last split. The reducer
+        launches with programmatic dependent launch and waits for the partials
+        in-kernel; the GEMM itself does not."""
         from triton.tlx.ops.kernels.mm import sm90
 
         m, n, k = (7, 1000, 64 * 41) if swap_ab else (264, 1000, 64 * 41)
@@ -2704,12 +2707,25 @@ class TestHopperMMTemplate(TestCase):
         else:
             conf = sm90._config(128, 128, 4, group_size_m=1, split_k=4)
             pin = mock.patch.object(sm90, "heuristic_config", return_value=[conf])
-        with pin, config.patch(_HOPPER_ADDMM_PATCH):
+        patch = dict(_HOPPER_ADDMM_PATCH)
+        if cpp_wrapper:
+            patch.update({"cpp_wrapper": True, "triton.autotune_at_compile_time": True})
+        with pin, config.patch(patch):
             actual, code = run_and_get_code(torch.compile(fn), *args)
         torch.testing.assert_close(actual, expected.half(), atol=3e-2, rtol=3e-2)
         generated = "\n".join(code)
         self.assertIn("split_k_ws", generated)
         self.assertIn("_reduce_k", generated)
+        if cpp_wrapper or op == "mm_gelu":
+            # Generated reducer: it waits in-kernel and only its decorator, not the
+            # GEMM's, compiles for PDL launch.
+            self.assertEqual(generated.count("tl.extra.cuda.gdc_wait()"), 1)
+            self.assertEqual(generated.count("'launch_pdl': True"), 1)
+            if cpp_wrapper:
+                self.assertIn("stream_, true", generated)
+                self.assertIn("stream_, false", generated)
+        else:
+            self.assertIn("USE_PDL=True, launch_pdl=True", generated)
 
     @parametrize("op", ("mm", "addmm"))
     @parametrize("shape,layout", (
