@@ -205,7 +205,7 @@ def kernel_rmsnorm_bwd_persistent_single_cta(
         col_offsets = tl.arange(0, BN)
         mask_col = col_offsets < N
         w = _load_norm_weight(W, col_offsets, mask_col, BN)
-        # PERF: a constant divisor becomes a multiply that ptxas schedules ~15% slower with several rows per thread.
+        # PERF: a constant N becomes a reciprocal multiply, up to 15% slower for blocks with more than one row.
         n_div = N if N_FLOAT is None else N_FLOAT
         if STRIDED:
             blocks_per_sm = 1 if SINGLE_ITER else tl.cdiv(M - pid * BM, nprog * BM)
