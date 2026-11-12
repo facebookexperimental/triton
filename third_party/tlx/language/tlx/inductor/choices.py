@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from torch._inductor.ir import ChoiceCaller
     from torch._inductor.kernel_inputs import KernelInputs
     from torch._inductor.kernel_template_choice import KernelTemplateChoice
+    from torch._inductor.scheduler import BaseSchedulerNode, Scheduler
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +59,21 @@ class TLXInductorChoices(InductorChoices):
 
         return super()._finalize_template_configs(
             template_choices, kernel_inputs, templates, op_name, kwarg_overrides
+        )
+
+    @staticmethod
+    def can_fuse_vertical(
+        scheduler: Scheduler,
+        node1: BaseSchedulerNode,
+        node2: BaseSchedulerNode,
+        shared_data_score: int,
+    ) -> bool:
+        from .fusion import tma_epilogue_store_fusion_unsupported
+
+        if tma_epilogue_store_fusion_unsupported(node1, node2):
+            return False
+        return InductorChoices.can_fuse_vertical(
+            scheduler, node1, node2, shared_data_score
         )
 
     def customize_fused_kernel_name(self, fused_name: str, src_code: str) -> str:
