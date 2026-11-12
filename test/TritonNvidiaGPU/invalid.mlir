@@ -2050,8 +2050,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
 
 // -----
 
-// A BLOCK_M=64 2-CTA accumulator keeps the right half of each blockN block in
-// TMEM rows 64-127, so a slice narrower than blockN is not a column window.
 #tmem_2cta_rhs = #ttng.tensor_memory_encoding<blockM = 64, blockN = 256, colStride = 1, twoCTAs = true, ctaMode = twocta_rhs>
 #tmem_2cta_rhs_half = #ttng.tensor_memory_encoding<blockM = 64, blockN = 128, colStride = 1, twoCTAs = true, ctaMode = twocta_rhs>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {

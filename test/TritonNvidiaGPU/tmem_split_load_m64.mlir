@@ -30,8 +30,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %outLHS, %outRHS = tt.split %3 : tensor<64x64x2xf32, #blocked4> -> tensor<64x64xf32, #blocked>
     tt.return %outLHS, %outRHS : tensor<64x64xf32, #blocked>, tensor<64x64xf32, #blocked>
   }
-  // A BLOCK_M=64 2-CTA accumulator (TwoCTA_RHS) keeps D[:, N/2:N] in TMEM rows
-  // 64-127, so an N half is not a column window: keep the split in registers.
   // CHECK-LABEL: @tmem_split_load_m64_2cta_rhs
   // CHECK-NOT: ttng.tmem_subslice
   // CHECK: ttng.tmem_load %{{.+}} : !ttg.memdesc<64x128xf32
