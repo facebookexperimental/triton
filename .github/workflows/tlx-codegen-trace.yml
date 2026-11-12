@@ -146,6 +146,9 @@ jobs:
           wheel-filename: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_filename || needs.build-base.outputs.wheel_filename }}
           wheel-sha256: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_sha256 || needs.build-base.outputs.wheel_sha256 }}
       - name: Snapshot corpus
+        # Advisory: a corpus that fails to compile on one side shows up as
+        # "no signal" in the diff comment instead of failing the workflow.
+        continue-on-error: true
         run: |
           python3 .github/scripts/tlx_codegen_snapshot.py snapshot \
             --out "snap-${{ matrix.side }}.json"
