@@ -76,6 +76,11 @@ def is_blackwell() -> bool:
     return current_target().is_blackwell
 
 
+def _output_code(code) -> str:
+    """Join generated modules, dropping torch's contiguous-layout autotune subgraphs."""
+    return "\n".join(c for c in code if "benchmark_contiguous_" not in c)
+
+
 def flex_choices_hook_available() -> bool:
     """True if torch exposes the flex-attention choices hook the template needs.
 
@@ -1859,7 +1864,7 @@ class TestTLXTemplates(TestCase):
         c_expected = torch.nn.functional.gelu(a.float() @ w.t().float() + bias.float()).to(dtype)
         torch.testing.assert_close(c_actual, c_expected, atol=3e-2, rtol=3e-2)
 
-        code_str = "\n".join(code)
+        code_str = _output_code(code)
         self.assertIn("_reduce_k", code_str)
         self.assertNotIn("triton_poi_", code_str)
 
@@ -1902,7 +1907,7 @@ class TestTLXTemplates(TestCase):
             reference = reference * 0.5
         torch.testing.assert_close(c_actual, reference.to(dtype), atol=4e-2, rtol=4e-2)
 
-        code_str = "\n".join(code)
+        code_str = _output_code(code)
         self.assertIn("split_k_ws", code_str)
         self.assertIn("_reduce_k", code_str)
         self.assertNotIn("triton_poi_", code_str)

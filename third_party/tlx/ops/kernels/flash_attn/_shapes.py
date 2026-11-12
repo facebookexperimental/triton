@@ -55,8 +55,9 @@ FOCUS_SUITES = (
             FlashAttentionShape(4, 32, 4096, 128, False, "fp16"),
         ),
     ),
+    # D256, batch 1024, short exact-tail sequences.
     FocusSuite(
-        name="sm100_d256_batch1024",
+        name="sm100_2",
         op="flash_attn",
         shapes=(
             FlashAttentionShape(1024, 1, 200, 256, False, "bf16"),
