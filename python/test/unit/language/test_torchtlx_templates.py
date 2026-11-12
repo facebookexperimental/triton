@@ -939,7 +939,8 @@ class TestTLXTemplates(TestCase):
         self.assertIn(f"tem_fused_tlx_{op_name}", "\n".join(code))
 
     @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
-    @parametrize("shape", ((440, 4096, 1093), (902, 4096, 1091), (440, 4096, 2048)))
+    @parametrize("shape", ((440, 4096, 1093), (902, 4096, 1091), (440, 4096, 2048), (2020, 4096, 1091),
+                           (2020, 2048, 371), (2020, 4096, 6656)))
     def test_tlx_gfx942_addmm(self, shape):
         m, n, k = shape
         torch.manual_seed(m + n + k)

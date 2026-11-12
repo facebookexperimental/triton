@@ -915,7 +915,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
     assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_addmm", "gfx950_4")
 
     addmm = importlib.import_module("triton.tlx.ops.kernels.addmm._shapes").FOCUS
-    assert addmm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2", "gfx942_3")
+    assert addmm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2", "gfx942_3", "gfx942_4")
     assert addmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_4")
 
     bmm = importlib.import_module("triton.tlx.ops.kernels.bmm._shapes").FOCUS
