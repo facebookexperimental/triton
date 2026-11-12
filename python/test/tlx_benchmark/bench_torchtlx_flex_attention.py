@@ -1,4 +1,4 @@
-"""TorchTLX FlexAttention forward comparison with max_autotune disabled."""
+"""TorchTLX FlexAttention prefill throughput and first-use graph compilation/capture cost."""
 from __future__ import annotations
 
 import argparse
@@ -21,10 +21,11 @@ from torch._inductor import config
 from torch._inductor.utils import run_and_get_code
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from triton.tlx.ops.kernels._shape_suites import FocusRegistry, FocusSuite
+from triton.tlx.ops.kernels.flash_attn._shapes import FOCUS as FLASH_ATTN_FOCUS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _harness import Case, Prepared, driver  # noqa: E402
+from _harness import Case, Prepared, cold_compile, driver  # noqa: E402
 
 OP = "flex_attention_torchtlx"
 REF_NAME = "torch.compile flex_attention (TLX off)"
@@ -96,7 +97,8 @@ def inputs(mod, seq, batch=8, heads=16, dim=128, dtype=torch.bfloat16, *, q_len=
     return (q, k, v), score_mod, block_mask
 
 
-def compile_arm(tensors, score_mod, block_mask, mode, out, *, kernel_options=None):
+def compile_arm(tensors, score_mod, block_mask, mode, out, *, kernel_options=None, max_autotune=False):
+    kernel_options = {"FORCE_USE_FLEX_ATTENTION": True, **(kernel_options or {})}
 
     def fn(q, k, v):
         return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask, kernel_options=kernel_options)
@@ -111,8 +113,10 @@ def compile_arm(tensors, score_mod, block_mask, mode, out, *, kernel_options=Non
         return module
 
     torch._dynamo.reset()
-    with mock.patch.object(PyCodeCache, "load_by_key_path", load), config.patch(
-        {"triton.tlx_mode": mode, "max_autotune": False, "max_autotune_gemm": False, "force_disable_caches": True}):
+    with mock.patch.object(PyCodeCache, "load_by_key_path", load), config.patch({
+            "triton.tlx_mode": mode, "max_autotune": max_autotune, "max_autotune_gemm": False, "force_disable_caches":
+            True
+    }):
         compiled = torch.compile(fn, fullgraph=True, dynamic=False)
         _, sources = run_and_get_code(compiled, *tensors)
         # Capture before Dynamo reset can invalidate the selected TLX mode.
@@ -216,14 +220,23 @@ SHAPE_SUITES = FocusRegistry(
         FocusSuite("builtin", OP, includes=MODS),
         FocusSuite("fp16", OP,
                    tuple(FlexAttentionShape(8, 16, 2**i, 128, mod, "float16") for mod in MODS for i in range(7, 15))),
-    ),
-    {"gfx950": ("builtin", ), "sm100": ("builtin", )},
+    ) + tuple(
+        FocusSuite(
+            suite.name, OP,
+            tuple(
+                FlexAttentionShape(s.batch, s.heads, s.context, s.head_dim, "noop",
+                                   {"bf16": "bfloat16", "fp16": "float16"}[s.dtype])
+                for s in suite.shapes
+                if s.head_dim == 128 and not s.causal), suite.includes)
+        for suite in FLASH_ATTN_FOCUS.suites),
+    {"gfx950": ("builtin", ), "sm100": ("builtin", ), "gfx1250": FLASH_ATTN_FOCUS.defaults["gfx1250"]},
 )
 SYNTHETIC = tuple(FlexAttentionShape(1, 2, seq, dim, mod) for mod in MODS for seq, dim in ((128, 64), (256, 128)))
 
 
 def shapes(synthetic=False, suites=None):
-    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
+    entries = SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites)
+    return [entry for entry in entries if driver.arch() != "gfx1250" or entry.dim == 128]
 
 
 def cases(synthetic=False, suites=None):
@@ -235,8 +248,8 @@ def cases(synthetic=False, suites=None):
 
 
 def prepare(case, space):
-    if space != "heuristic":
-        raise ValueError("TorchTLX flex uses offline heuristic configs; max_autotune stays disabled")
+    if space != "heuristic" and not (driver.arch() == "gfx1250" and space == "full"):
+        raise ValueError("TorchTLX flex supports heuristic space, plus full space on gfx1250")
     root = ARTIFACT_DIR / f"flex_attention.{driver.arch()}.{os.getpid()}"
     root.mkdir(parents=True, exist_ok=True)
     cache_env = {
@@ -253,15 +266,26 @@ def prepare(case, space):
                                                 dtype=getattr(torch, entry.dtype))
         name = case.key.replace("/", "_")
         ref, ref_result = compile_arm(tensors, score_mod, block_mask, None, root / f"{name}.stock.py")
-        tlx, result = compile_arm(tensors, score_mod, block_mask, "force", root / f"{name}.tlx.py")
+        prepared = []
+
+        def first_use():
+            prepared.append(
+                compile_arm(tensors, score_mod, block_mask, "force", root / f"{name}.tlx.py",
+                            max_autotune=space == "full"))
+
+        compile_stat = cold_compile(first_use)
+        tlx, result = prepared.pop()
     reference = document_reference(tensors, entry.seq, entry.batch) if entry.mod == "document_mask" else ref_result
     stock_accuracy, _ = _accuracy(ref_result, reference)
-    extra = {"stock_accuracy": stock_accuracy, "max_abs_error": (result.float() - reference.float()).abs().max().item()}
+    extra = {
+        "stock_accuracy": stock_accuracy, "max_abs_error": (result.float() - reference.float()).abs().max().item(),
+        "cold_start_scope": "inductor_graph_compile_and_capture"
+    }
     if not stock_accuracy:
         # An inaccurate stock result cannot support a performance ratio.
         ref = None
     return Prepared(tlx_fn=tlx, ref_fn=ref, flop_count=4 * entry.batch * entry.heads * entry.seq**2 * entry.dim,
-                    check=lambda: _accuracy(tlx(), reference), extra=extra)
+                    check=lambda: _accuracy(tlx(), reference), extra=extra, compile_stat=compile_stat)
 
 
 def _accuracy(result, reference):

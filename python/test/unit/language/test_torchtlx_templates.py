@@ -3896,7 +3896,8 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                             mock.patch.object(
                                 flex_attention_templates,
                                 "current_target",
-                                return_value=type("Target", (), {"num_sms": 256})(),
+                                return_value=type("Target", (),
+                                                  {"num_sms": 256, "key": "sm100", "is_gfx1250": False})(),
                             ),
                             mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_eligible",
                                               return_value=True),
@@ -3930,6 +3931,8 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                 choices = []
                 with (
                         config.patch({"triton.tlx_mode": "force", "max_autotune": False}),
+                        mock.patch.object(flex_attention_templates, "current_target",
+                                          return_value=mock.Mock(key="gfx950", is_gfx1250=False)),
                         mock.patch.object(flex_attention_templates, "_use_amd_flex_template", return_value=True),
                         mock.patch.object(flex_attention_templates, "gfx950_flex_attention_template", self._Template()),
                 ):
@@ -3961,6 +3964,8 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                 choices = []
                 with (
                         config.patch({"triton.tlx_mode": "force", "max_autotune": max_autotune}),
+                        mock.patch.object(flex_attention_templates, "current_target",
+                                          return_value=mock.Mock(key="gfx950", is_gfx1250=False)),
                         mock.patch.object(flex_attention_templates, "_use_amd_flex_template", return_value=True),
                         mock.patch.object(flex_attention_templates, "gfx950_flex_attention_template", self._Template()),
                 ):
@@ -4444,7 +4449,8 @@ class TestBlackwellFlexAttentionChoices(TestCase):
 
         registration = TestFlexAttentionChoiceRegistration
         qkv = [registration._Node([2, 8, rows, 128], dtype) for rows, dtype in zip((q_len, 512, 512), dtypes)]
-        target = type("Target", (), {"num_sms": 148, "is_blackwell": is_blackwell})()
+        target = type("Target", (),
+                      {"key": "sm100", "num_sms": 148, "is_blackwell": is_blackwell, "is_gfx1250": False})()
         choices = []
         with (
                 config.patch({"triton.tlx_mode": "force"}),
@@ -5887,7 +5893,7 @@ class TestWarppipeInt32Gate(TestCase):
                 mock.patch.object(registry, "_amd_num_xcds", return_value=8),
                 mock.patch.object(registry, "get_num_sms", return_value=256),
                 mock.patch.object(DeviceLimits, "current", return_value=gfx950),
-                mock.patch.object(registry, "current_target", return_value=mock.Mock(key="gfx950")),
+                mock.patch.object(registry, "current_target", return_value=mock.Mock(key="gfx950", is_gfx1250=False)),
         ):
             return list(heuristic._get_template_configs_impl(kernel_inputs, op_name))
 
@@ -6233,7 +6239,7 @@ class TestWarppipeInt32Gate(TestCase):
         gfx950 = DeviceLimits.for_arch("gfx950")
         with (
                 mock.patch.object(DeviceLimits, "current", return_value=gfx950),
-                mock.patch.object(registry, "current_target", return_value=mock.Mock(key="gfx950")),
+                mock.patch.object(registry, "current_target", return_value=mock.Mock(key="gfx950", is_gfx1250=False)),
         ):
             self.assertTrue(_warppipe_tile_fits(128, 256, 64, 3, elem_bytes=2, use_async=True))
             self.assertFalse(_warppipe_tile_fits(
