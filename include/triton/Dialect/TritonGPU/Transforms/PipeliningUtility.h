@@ -210,6 +210,21 @@ void removePipeliningAttributes(ModuleOp moduleOp);
 // program point: one sitting after the loop, or in a region that does not
 // dominate it, proves nothing about the trip count.
 bool isLoopTripCountKnownPositive(scf::ForOp loop, DominanceInfo &domInfo);
+
+// FB Change: Meta AutoWS warp-specialization predicates.
+// A loop marked tt.warp_specialize, or an op already assigned to a partition.
+bool requestsMetaWarpSpecialization(Operation *op);
+
+// Whether some op in the function requests warp specialization.
+bool isMetaWarpSpecializedFunc(triton::FuncOp funcOp);
+
+// Whether the module requests Meta AutoWS or is already warp-specialized (e.g.
+// TLX ttg.warp_specialize regions).
+bool requestsMetaWarpSpecialization(ModuleOp mod);
+
+// The module's ttg.use_meta_ws attribute (set per module by make_ttgir), else
+// TRITON_USE_META_WS.
+bool isMetaWSEnabled(Operation *op);
 } // namespace triton
 } // namespace mlir
 
