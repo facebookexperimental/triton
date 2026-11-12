@@ -5456,11 +5456,8 @@ static LogicalResult hoistDescriptorLoadBuffers(triton::FuncOp funcOp) {
 
 // Returns true when \p allocOp is an in-loop `tmem_alloc %src` or
 // `local_alloc %src` whose only users are MMAv5 A/B operands (A only for TMEM)
-// in the same block and the same single task. Such a producer/consumer pair
-// gets no cross-partition channel, so createBuffer never hoists it; it still
-// needs a hoisted buffer and a same-task channel (see createAllocChannel) so
-// that each iteration's write waits for the previous iteration's asynchronous
-// MMA to finish reading the tile.
+// in the same block and task. createBuffer never hoists such an alloc, but it
+// needs a buffer and a same-task channel (see createAllocChannel).
 static bool isSameTaskMMAOperandAlloc(Operation *allocOp) {
   Value src, result = allocOp->getResult(0);
   if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(allocOp))
