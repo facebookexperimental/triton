@@ -29,6 +29,19 @@ if TYPE_CHECKING:
 log: logging.Logger = logging.getLogger(__name__)
 
 
+def _reducer_uses_pdl() -> bool:
+    """Launch the reducer with programmatic dependent launch: it is staged while
+    the split-K GEMM drains and waits for it in-kernel (gdc_wait) just before
+    reading the partials, hiding the launch gap between the two kernels (~1 us
+    on H100). CUDA sm90+ only."""
+    from torch._inductor.virtualized import V
+
+    if torch.version.hip is not None:
+        return False
+    device = V.graph.get_current_device_or_throw()
+    return device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 9
+
+
 @triton.jit
 def _reduce_k_kernel(
     workspace_ptr,
@@ -43,6 +56,7 @@ def _reduce_k_kernel(
     HAS_BIAS: tl.constexpr = False,
     STRIDE_BIAS_M: tl.constexpr = 0,
     STRIDE_BIAS_N: tl.constexpr = 1,
+    USE_PDL: tl.constexpr = False,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -51,6 +65,9 @@ def _reduce_k_kernel(
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     base_offs = offs_m[:, None] * N + offs_n[None, :]
 
+    if USE_PDL:
+        # Launched with launch_pdl: wait for the GEMM's partials to be visible.
+        tl.extra.cuda.gdc_wait()
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for s in range(SPLIT_K):
         ws_offs = base_offs + s * M * N
@@ -227,13 +244,15 @@ def emit_reduce_k_call(
     # means it is never dereferenced.
     has_bias = bias_name is not None
     bias_ptr = bias_name if has_bias else output_name
+    pdl = _reducer_uses_pdl()
     wrapper.writeline(
         f"_reduce_k_kernel[(triton.cdiv({M_expr}, 32), triton.cdiv({N_expr}, 32))]"
         f"({ws_name}, {output_name}, {bias_ptr}, {M_expr}, {N_expr},"
         f" SPLIT_K={split_k}, BLOCK_SIZE_M=32, BLOCK_SIZE_N=32,"
         f" OUTPUT_DTYPE={output_triton_dtype},"
         f" HAS_BIAS={has_bias}, STRIDE_BIAS_M={stride_bias_m},"
-        f" STRIDE_BIAS_N={stride_bias_n})"
+        f" STRIDE_BIAS_N={stride_bias_n}"
+        + (", USE_PDL=True, launch_pdl=True)" if pdl else ")")
     )
 
 
@@ -248,6 +267,7 @@ def _reduce_k_body_source(
     stride_bias_m: int = 0,
     stride_bias_n: int = 1,
     index_dtype: str = "tl.int32",
+    pdl: bool = False,
 ) -> str:
     # The spliced fused epilogue references INDEX_DTYPE (Inductor's per-kernel index
     # dtype, used for dynamic-shape bounds like `tl.full([], ks0, dtype=INDEX_DTYPE)`).
@@ -266,6 +286,7 @@ def _reduce_k_body_source(
     xnumel = {M_expr} * {N_expr}
     xindex = base_offs
     xmask = mask
+    {"tl.extra.cuda.gdc_wait()" if pdl else ""}
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for s in range({split_k}):
         ws_offs = base_offs + s * {M_expr} * {N_expr}
@@ -327,9 +348,25 @@ def emit_aoti_reduce_k_call(
 
         argdefs, call_args, _, arg_types = template_kernel.args.python_argdefs()
         reduce_name = f"{main_kernel_name}_reduce_k"
+        pdl = _reducer_uses_pdl()
         source = IndentedBuffer()
         source.splice(template_kernel.gen_common_triton_imports())
-        source.splice(template_kernel.jit_lines())
+        # The reducer reuses the template's decorator; only it may launch with PDL
+        # (the GEMM has no gdc_wait), so set launch_pdl just while rendering it.
+        if template_kernel.triton_meta is None:
+            template_kernel.triton_meta = {}
+        had_pdl = "launch_pdl" in template_kernel.triton_meta
+        prev_pdl = template_kernel.triton_meta.get("launch_pdl")
+        if pdl:
+            template_kernel.triton_meta["launch_pdl"] = True
+        try:
+            source.splice(template_kernel.jit_lines())
+        finally:
+            if had_pdl:
+                template_kernel.triton_meta["launch_pdl"] = prev_pdl
+            else:
+                template_kernel.triton_meta.pop("launch_pdl", None)
+        reducer_triton_meta = {**template_kernel.triton_meta, **({"launch_pdl": True} if pdl else {})}
         source.writeline(
             f"def {reduce_name}({', '.join(arg.full_name() for arg in argdefs)}):"
         )
@@ -345,6 +382,7 @@ def emit_aoti_reduce_k_call(
                 stride_bias_m,
                 stride_bias_n,
                 index_dtype=getattr(template_kernel, "index_dtype", "tl.int32"),
+                pdl=pdl,
             ))
         source_code = source.getvalue().replace(
             str(Placeholder.DESCRIPTIVE_NAME), reduce_name
@@ -362,7 +400,7 @@ def emit_aoti_reduce_k_call(
             reduce_name,
             [*call_args, *grid_args],
             arg_types=[*arg_types, *map(type, grid_args)],
-            triton_meta=template_kernel.triton_meta,
+            triton_meta=reducer_triton_meta,
             inductor_meta=FixedGrid.setup_grid_as_args(),
             triton=True,
             device=output_node.get_device(),

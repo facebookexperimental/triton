@@ -20,6 +20,7 @@ The runner occupancy (busy, idle and waiting per 15 minutes) is shared by every 
 No I/O.
 """
 import collections
+import ci_health_sanitizer as sanitizer
 import datetime as dt
 import re
 import zoneinfo
@@ -1346,8 +1347,9 @@ def page_data(runs, asof, bench, bump=None):
         # The bench dashboard's perf events come from main's nightly bench.
         branches[b] = {
             "main": main, "lit": lit_view(rs, asof, b), "nightly": nightly_view(rs, asof, bench if b == "main" else {}),
-            "pr": pr_view(rs, asof, main, b), "fast_full": fast_full_view(rs, asof), "ops":
-            {**ops_view(rs, asof), "concurrency": concurrency}, "usage": usage_view(rs, asof), "bump": bump_view(
-                 ((bump or {}).get("lines") or {}).get(b))
+            "pr": pr_view(rs, asof, main, b), "fast_full": fast_full_view(rs, asof), "sanitizer":
+            sanitizer.view(rs, asof), "ops": {**ops_view(rs, asof), "concurrency":
+                                              concurrency}, "usage": usage_view(rs, asof), "bump": bump_view(
+                                                  ((bump or {}).get("lines") or {}).get(b))
         }
     return {"asof": asof, "branches": branches, "occupancy": occupancy_view(runs, asof)}
