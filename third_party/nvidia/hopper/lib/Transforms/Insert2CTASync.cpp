@@ -125,8 +125,6 @@ static Value findWhileIterationCounter(scf::WhileOp whileOp) {
   return {};
 }
 
-// Trip count of `forOp`, or 0 when its upper bound is not above its lower
-// bound.
 static Value computeClampedTripCount(OpBuilder &builder, Location loc,
                                      scf::ForOp forOp) {
   Value tripCount = computeLoopTripCount(builder, loc, forOp);
@@ -144,16 +142,12 @@ static bool isDefinedInside(Value v, Operation *loop) {
   return loop->isAncestor(def);
 }
 
-// The linearized index below assumes every outer iteration runs the same
-// number of MMA-loop iterations. Persistent split-K kernels break that
-// (k_tiles % SPLIT_K != 0 gives tiles of different K length): the computed
-// phase drifts from the barrier's real phase and the CTA pair deadlocks.
-// For a warp-specialized MMA loop whose bounds are computed inside its
-// enclosing persistent scf.for / scf.while, add an i64 loop-carried count of
-// MMA-loop iterations to that persistent loop. Returns the number of the
-// count's block argument in the persistent loop body, or std::nullopt when
-// the trip count is loop-invariant or the loop nest is not supported.
-// This replaces the persistent scf.for, so run it before collecting ops.
+// Persistent split-K tiles run different numbers of MMA-loop iterations, so
+// the linearized index drifts from the barrier phase and the CTA pair
+// deadlocks. Carry a running i64 count of MMA-loop iterations through the
+// enclosing persistent loop; returns its block-argument number, or nullopt
+// when the trip count is invariant or the nest is unsupported. Replaces the
+// persistent scf.for, so run it before collecting ops.
 static std::optional<unsigned> addRunningIterCount(scf::ForOp inner) {
   Operation *outer = inner->getParentOp();
   if (!isa<scf::ForOp, scf::WhileOp>(outer))
