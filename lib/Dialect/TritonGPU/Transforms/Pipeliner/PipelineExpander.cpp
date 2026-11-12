@@ -641,7 +641,12 @@ LogicalResult LoopPipelinerInternal::createKernel(
     Operation *def = retVal.value().getDefiningOp();
     auto defStage = stages.find(def);
     if (defStage == stages.end()) {
-      for (unsigned int stage = 1; stage <= maxStage; stage++)
+      // Version 1 feeds the first last-stage epilogue ops; it must be the
+      // kernel's carried value, which is the init value when the kernel loop
+      // runs zero times (trip count <= maxStage).
+      setValueMapping(forOp.getRegionIterArgs()[retVal.index()],
+                      newForOp->getResult(retVal.index()), 1);
+      for (unsigned int stage = 2; stage <= maxStage; stage++)
         setValueMapping(forOp.getRegionIterArgs()[retVal.index()],
                         retVal.value(), stage);
     } else if (defStage->second > 0) {
@@ -779,6 +784,19 @@ LoopPipelinerInternal::emitEpilogue(RewriterBase &rewriter,
         }
       }
     }
+  }
+  // A yield defined outside the loop is the result once the original loop
+  // runs, but the kernel loop holds the init value when it runs zero times.
+  for (OpOperand &operand : forOp.getBody()->getTerminator()->getOpOperands()) {
+    unsigned ri = operand.getOperandNumber();
+    if (maxStage == 0 || !forOp.isDefinedOutsideOfLoop(operand.get()) ||
+        forOp.getResult(ri).use_empty())
+      continue;
+    if (dynamicLoop)
+      returnValues[ri] = arith::SelectOp::create(
+          rewriter, loc, predicates[1], operand.get(), returnValues[ri]);
+    else
+      returnValues[ri] = operand.get();
   }
   return success();
 }
