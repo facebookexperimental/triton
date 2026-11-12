@@ -971,19 +971,19 @@ class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
         # the problem's N as its M.
         swap_ab = m <= sm90._SWAP_AB_MAX_M
         if swap_ab:
-            configs = (sm90._prune_swap_configs(sm90._swap_configs(), {"M": n, "N": m, "K": k})
-                       if allow else sm90._swap_heuristic_config(m, n, k))
+            configs = (sm90._prune_swap_configs(sm90._swap_configs(), {"M": n, "N": m, "K": k}) if allow else
+                       sm90._swap_heuristic_config(m, n, k, invariance=sm90._FIXED_SPEC))
         else:
             configs = (sm90._prune_full_configs(sm90.CONFIGS(), {"M": m, "N": n, "K": k}, B_ROW_MAJOR=b_row_major)
-                       if allow else sm90.heuristic_config(m, n, k, b_row_major))
-        # Split-K configs write fp32 partials that torchTLX's _reduce_k_kernel
-        # sums, adding the bias with alpha = beta = 1 only; otherwise run whole-K.
-        scalars = getattr(kernel_inputs, "_scalars", None) or {}
-        if scalars.get("alpha", 1) != 1 or scalars.get("beta", 1) != 1:
-            if allow:
-                configs = [conf for conf in configs if conf.kwargs["SPLIT_K"] == 1]
-            else:
-                configs = [self._whole_k(sm90, conf) for conf in configs]
+                       if allow else sm90.heuristic_config(m, n, k, b_row_major, invariance=sm90._FIXED_SPEC))
+        # Whole-K only (the heuristic is asked for its best whole-K tile). Split-K
+        # tuned at one sample M runs at every M in an AOTI package: on the H100
+        # OneFeed merge net it was at best on par with cuBLAS and lost 1.2-1.5x in
+        # serving.
+        if allow:
+            configs = [conf for conf in configs if conf.kwargs["SPLIT_K"] == 1]
+        else:
+            configs = [self._whole_k(sm90, conf) for conf in configs]
         host_tma = _host_tma_operands(kernel_inputs)
         # Non-power-of-two tiles run only as two equal-subtile pieces (192, 96).
         configs = [
@@ -4124,10 +4124,26 @@ def _tlx_get_min_choice(self, hint_override=None):
     return choice, timings[choice]
 
 
+def _margin_min_choice(self, hint_override=None):
+    """The deferred (MultiTemplateBuffer) pick with TLX's allow-mode margin over
+    cuBLAS, which select_algorithm's override_best_choice applies only to
+    non-deferred picks."""
+    from .choices import maybe_override_best_choice
+
+    choice, ms = _orig_get_min_choice(self, hint_override)
+    timings = self.choice_timings(hint_override)
+    picked = maybe_override_best_choice(choice, timings)
+    if picked is choice:
+        return choice, ms
+    log.info("TLX allow-mode margin for %s: %s -> %s", self.get_name(), choice.name, picked.name)
+    return picked, timings[picked]
+
+
 def _tlx_finalize_multi_template_buffers(self):
-    if config.triton.tlx_mode != "allow" or not _is_gfx942():
+    if config.triton.tlx_mode != "allow":
         return _orig_finalize_multi_template_buffers(self)
-    MultiTemplateBuffer.get_min_choice = _unfused_min_choice  # type: ignore[method-assign]
+    MultiTemplateBuffer.get_min_choice = (  # type: ignore[method-assign]
+        _unfused_min_choice if _is_gfx942() else _margin_min_choice)
     try:
         return _orig_finalize_multi_template_buffers(self)
     finally:
