@@ -131,8 +131,6 @@ static Value findWhileIterationCounter(scf::WhileOp whileOp,
   return {};
 }
 
-// Trip count of `forOp`, or 0 when its upper bound is not above its lower
-// bound.
 static Value computeClampedTripCount(OpBuilder &builder, Location loc,
                                      scf::ForOp forOp) {
   Value tripCount = computeLoopTripCount(builder, loc, forOp);
@@ -143,8 +141,6 @@ static Value computeClampedTripCount(OpBuilder &builder, Location loc,
   return arith::SelectOp::create(builder, loc, nonEmpty, tripCount, zero);
 }
 
-// Append an i64 loop-carried value, starting at 0, to `whileOp`. `next`
-// computes its value for the next iteration from the after-region argument.
 // Replaces `whileOp`; returns the new after-region argument.
 static BlockArgument appendWhileCounter(
     scf::WhileOp whileOp,
@@ -180,16 +176,12 @@ static bool isDefinedInside(Value v, Operation *loop) {
   return loop->isAncestor(def);
 }
 
-// The linearized index below assumes every outer iteration runs the same
-// number of MMA-loop iterations. Persistent split-K kernels break that
-// (k_tiles % SPLIT_K != 0 gives tiles of different K length): the computed
-// phase drifts from the barrier's real phase and the CTA pair deadlocks.
-// For an MMA loop whose bounds are computed inside its
-// enclosing persistent scf.for / scf.while, add an i64 loop-carried count of
-// MMA-loop iterations to that persistent loop. Returns the number of the
-// count's block argument in the persistent loop body, or std::nullopt when
-// the trip count is loop-invariant or the loop nest is not supported.
-// This replaces the persistent scf.for, so run it before collecting ops.
+// Persistent split-K tiles run different numbers of MMA-loop iterations, so
+// the linearized index drifts from the barrier phase and the CTA pair
+// deadlocks. Carry a running i64 count of MMA-loop iterations through the
+// enclosing persistent loop; returns its block-argument number, or nullopt
+// when the trip count is invariant or the nest is unsupported. Replaces the
+// persistent scf.for, so run it before collecting ops.
 static std::optional<unsigned> addRunningIterCount(scf::ForOp inner) {
   Operation *outer = inner->getParentOp();
   if (!isa<scf::ForOp, scf::WhileOp>(outer))
@@ -492,11 +484,9 @@ static LogicalResult insertSyncBeforeMMA(ttng::MMAv5OpInterface mma,
   return success();
 }
 
-// Allocate and initialize `numBarriers` cross-CTA barriers at the top of the
-// kernel's entry block, and invalidate them before it returns. The peer CTA
-// arrives on these barriers remotely, so they must be initialized before the
-// kernel-entry cluster rendezvous: an init next to the MMA can race the peer's
-// first remote arrival, which is then lost and the leader waits forever.
+// The peer CTA arrives on these barriers remotely, so they must be initialized
+// before the kernel-entry cluster rendezvous: an init next to the MMA can race
+// the peer's first remote arrival, which is then lost (deadlock).
 static Value createEntryBarrierAlloc(Operation *anyOp, unsigned numBarriers) {
   auto funcOp = anyOp->getParentOfType<triton::FuncOp>();
   Block &entry = funcOp.getBody().front();

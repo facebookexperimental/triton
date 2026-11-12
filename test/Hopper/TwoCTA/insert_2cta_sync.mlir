@@ -38,10 +38,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// Without warp specialization, a 2-CTA MMA left outside the loop (e.g. a
-// software-pipeline epilogue copy) gets its cross-CTA barrier at kernel entry
-// too. Initializing it next to the MMA races the peer CTA's remote arrive,
-// which is then lost and the leader waits forever.
+// Non-WS: a peeled 2-CTA MMA's barrier is also initialized at kernel entry.
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
@@ -203,10 +200,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
-  // Split-K style persistent loop: the inner trip count depends on the tile,
-  // so `outer_iter * inner_trip + inner_iter` is not the number of earlier
-  // rendezvous. The pass carries a running count of inner iterations through
-  // the persistent loop instead.
+  // Split-K persistent loop: the inner trip count varies by tile.
   // CHECK-LABEL: @test_persistent_while_varying_inner_trip_count
   // CHECK: scf.while ({{.*}}, %{{.*}} = %c0_i64{{.*}}) : (i1, i32, i64, i64) -> (i32, i64, i64)
   // CHECK: scf.condition({{.*}}) %{{.*}}, %{{.*}}, %{{.*}} : i32, i64, i64
@@ -270,9 +264,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
-  // The persistent scf.for also holds a 2-CTA MMA of its own (e.g. a
-  // pipeline-peeled copy). Adding the count replaces that loop, which must
-  // happen before MMAs are grouped by loop.
+  // The count must be added before MMAs are grouped by loop.
   // CHECK-LABEL: @test_persistent_for_varying_trip_count_with_outer_mma
   // CHECK: scf.for %{{.*}} iter_args(%[[BASE:.*]] = %c0_i64{{.*}}) -> (i64)
   // CHECK: ttng.wait_barrier
@@ -306,56 +298,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
           !ttg.memdesc<64x128xf16, #shared1, #smem>,
           !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
         scf.for %k = %k_lo to %part_k_tiles step %c1_i32 : i32 {
-          %tok = ttng.tc_gen5_mma %part_a, %part_b, %part_acc[%part_acc_tok], %true, %true {two_ctas} :
-            !ttg.memdesc<128x64xf16, #shared, #smem>,
-            !ttg.memdesc<64x128xf16, #shared1, #smem>,
-            !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-        }
-      }
-      ttg.warp_return
-    } : (!ttg.memdesc<128x64xf16, #shared, #smem>,
-         !ttg.memdesc<64x128xf16, #shared1, #smem>,
-         !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
-         !ttg.async.token, i32, i32) -> ()
-    tt.return
-  }
-
-  // Same with a persistent scf.for.
-  // CHECK-LABEL: @test_persistent_for_varying_inner_trip_count
-  // CHECK: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} iter_args(%[[BASE:.*]] = %c0_i64{{.*}}) -> (i64)
-  // CHECK: scf.for %[[IV:.*]] = %[[LB:.*]] to %[[UB:.*]] step
-  // CHECK: %[[LINEAR:.*]] = arith.addi %[[BASE]], %{{.*}} : i64
-  // CHECK: arith.divui %[[LINEAR]]
-  // CHECK: ttng.wait_barrier
-  // CHECK: ttng.tc_gen5_mma
-  // CHECK: %[[TRIP:.*]] = arith.select
-  // CHECK: %[[NEXT:.*]] = arith.addi %[[BASE]], %[[TRIP]] : i64
-  // CHECK: scf.yield %[[NEXT]] : i64
-  tt.func @test_persistent_for_varying_inner_trip_count(
-      %a: !ttg.memdesc<128x64xf16, #shared, #smem>,
-      %b: !ttg.memdesc<64x128xf16, #shared1, #smem>,
-      %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
-      %acc_tok: !ttg.async.token, %k_tiles: i32, %num_tiles: i32) {
-    ttg.warp_specialize(%a, %b, %acc, %acc_tok, %k_tiles, %num_tiles)
-    default {
-      ttg.warp_yield
-    }
-    partition0(%part_a: !ttg.memdesc<128x64xf16, #shared, #smem>,
-               %part_b: !ttg.memdesc<64x128xf16, #shared1, #smem>,
-               %part_acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
-               %part_acc_tok: !ttg.async.token, %part_k_tiles: i32, %part_num_tiles: i32) num_warps(4) {
-      %true = arith.constant true
-      %c0_i32 = arith.constant 0 : i32
-      %c1_i32 = arith.constant 1 : i32
-      %c3_i32 = arith.constant 3 : i32
-      scf.for %tile = %c0_i32 to %part_num_tiles step %c1_i32 : i32 {
-        %split = arith.remsi %tile, %c3_i32 : i32
-        %lo_n = arith.muli %split, %part_k_tiles : i32
-        %k_lo = arith.divsi %lo_n, %c3_i32 : i32
-        %split1 = arith.addi %split, %c1_i32 : i32
-        %hi_n = arith.muli %split1, %part_k_tiles : i32
-        %k_hi = arith.divsi %hi_n, %c3_i32 : i32
-        scf.for %k = %k_lo to %k_hi step %c1_i32 : i32 {
           %tok = ttng.tc_gen5_mma %part_a, %part_b, %part_acc[%part_acc_tok], %true, %true {two_ctas} :
             !ttg.memdesc<128x64xf16, #shared, #smem>,
             !ttg.memdesc<64x128xf16, #shared1, #smem>,
@@ -606,8 +548,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// Without warp specialization, an scf.while around a 2-CTA MMA that has no
-// iteration counter starting at 0 gets one, and the phase is taken from it.
+// Non-WS: an scf.while without a zero-based iteration counter gets one.
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
