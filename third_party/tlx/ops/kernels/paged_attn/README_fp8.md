@@ -65,6 +65,14 @@ with masked matrix/vector paths for other supported pages. Kernel and launch
 policy selection are private. Explicit split counts from 1 through 1024 remain
 available through the public operator and workspace helper.
 
+Sparse BF16-Q D128 decode uses more page partitions at medium contexts and
+tiles the split merge across output columns to keep more workgroups active.
+Other merge geometries retain their ordinary dimension indexing. Aligned
+128-token windows on page64 use a smaller launch signature and share one stable
+FP32 normalization across the two page-sized QK/PV products. Empty, short and
+unaligned windows use the ordinary masked path. These choices remain private;
+the public call and workspace-planning arguments are unchanged.
+
 Run public correctness tests on gfx1250:
 
 ```bash

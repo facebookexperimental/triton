@@ -101,7 +101,10 @@ def test_fp8_kv_decode(fp8_q, dim, page, hq, hkv, qlen, lengths, causal, window,
                                                      (128, 32, 128, 64, [8192]), (128, 128, 128, 128, [16384]),
                                                      (128, 128, 64, 64, [0, 67, 513, 1024]),
                                                      (16, 2, 128, 64, [1, 128, 511, 1024]), (16, 2, 64, 64, [2304] * 8),
-                                                     (64, 64, 128, 64, [8192] * 8)])
+                                                     (64, 64, 128, 64, [8192] * 8), (16, 2, 128, 128, [2304]),
+                                                     (16, 2, 128, 128, [8192]), (16, 2, 128, 64, [4096]),
+                                                     (16, 2, 128, 64, [8192]), (32, 4, 128, 64, [8192]),
+                                                     (16, 2, 128, 64, [8193])])
 def test_fp8_kv_decode_auto_geometry(fp8_q, hq, hkv, dim, page, lengths):
     q, kp, vp, contexts, table, ks, vs, qs, max_len, k, v = _make_test_inputs(lengths, hq=hq, hkv=hkv, dim=dim,
                                                                               page=page, fp8_q=fp8_q)
@@ -303,15 +306,18 @@ def test_fp8_catalog_is_gfx1250_only():
 
 @pytest.mark.skipif(not _gfx1250_available(), reason='Requires gfx1250')
 @pytest.mark.parametrize('splits', [1, 8])
-def test_fp8_public_workspace_graph_replay(splits):
-    x = _make_test_inputs([67, 2304])
+@pytest.mark.parametrize('dim', [64, 128])
+@pytest.mark.parametrize('window', [0, 128])
+def test_fp8_public_workspace_graph_replay(splits, dim, window):
+    x = _make_test_inputs([67, 2304], dim=dim)
     q, k, v, lengths, table, ks, vs, qs, bound, kd, vd = x
-    work = paged_attention_decode_fp8_workspace(q, k, v, table, max_context_len=bound, num_splits=splits)
+    work = paged_attention_decode_fp8_workspace(q, k, v, table, max_context_len=bound, num_splits=splits,
+                                                sliding_window=window)
     out = torch.empty_like(q, dtype=torch.bfloat16)
 
     def call():
         return paged_attention_decode_fp8(q, k, v, lengths, table, ks, vs, max_context_len=bound, num_splits=splits,
-                                          out=out, workspace=work)
+                                          sliding_window=window, out=out, workspace=work)
 
     call()
     graph = torch.cuda.CUDAGraph()
@@ -319,5 +325,31 @@ def test_fp8_public_workspace_graph_replay(splits):
         call()
     for _ in range(3):
         graph.replay()
-    expected = _reference(q, kd, vd, table, [67, 2304], ks, vs, qs, 1, True, 0)
+    expected = _reference(q, kd, vd, table, [67, 2304], ks, vs, qs, 1, True, window)
     torch.testing.assert_close(out.float(), expected, atol=5e-4, rtol=1e-2)
+
+
+@pytest.mark.skipif(not _gfx1250_available(), reason='Requires gfx1250')
+@pytest.mark.parametrize('fp8_q', [False, True], ids=['bf16-q', 'fp8-q'])
+@pytest.mark.parametrize('hq,hkv', [(16, 2), (64, 64)])
+@pytest.mark.parametrize('seed', [0, 19, 182])
+def test_fp8_kv_decode_window_pair(fp8_q, hq, hkv, seed):
+    lengths = [0, 1, 63, 64, 65, 127, 128, 129, 191, 192, 193, 2303, 2304, 2305]
+    q, kp, vp, contexts, table, ks, vs, qs, max_len, k, v = _make_test_inputs(lengths, hq=hq, hkv=hkv, dim=128, page=64,
+                                                                              fp8_q=fp8_q, seed=seed)
+    if seed == 19:
+        q = (q.float() * 4).to(q.dtype)
+    if seed == 182:
+        storage = torch.empty((*q.shape[:-1], q.shape[-1] * 2), device=q.device, dtype=q.dtype)
+        storage[..., ::2] = q
+        q = storage[..., ::2]
+        contexts = contexts.to(torch.int64)
+        table = table.to(torch.int64)
+    out = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
+    actual = paged_attention_decode_fp8(q, kp, vp, contexts, table, ks, vs, max_context_len=max_len, q_scale=qs,
+                                        sliding_window=128, out=out)
+    expected = _reference(q, k, v, table, contexts, ks, vs, qs, 1, True, 128)
+    assert actual.dtype == torch.bfloat16
+    assert actual.data_ptr() == out.data_ptr()
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual.float(), expected, atol=0.0005, rtol=0.01)

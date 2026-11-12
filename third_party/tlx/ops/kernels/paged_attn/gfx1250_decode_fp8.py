@@ -150,8 +150,11 @@ def _issue_flat_page(KD, VD, BT, kbuf, vbuf, seq, bst, kvh, start, hi, slot, HKV
                      WHICH: tl.constexpr = 0):
     valid = start < hi
     physical = tl.load(BT + seq * bst + start // PAGE, valid, other=0)
-    kd = tlx.update_tensor_descriptor(KD, add_offsets=[physical * HKV + kvh, 0], pred=valid, clamp_bounds=False)
-    vd = tlx.update_tensor_descriptor(VD, add_offsets=[physical * HKV + kvh, 0], pred=valid, clamp_bounds=False)
+    # TDM coordinates are int32 even when the caller uses int64 page ids.
+    # The descriptor still addresses the cache through its 64-bit base/strides.
+    descriptor_row = (physical * HKV + kvh).to(tl.int32)
+    kd = tlx.update_tensor_descriptor(KD, add_offsets=[descriptor_row, 0], pred=valid, clamp_bounds=False)
+    vd = tlx.update_tensor_descriptor(VD, add_offsets=[descriptor_row, 0], pred=valid, clamp_bounds=False)
     if tlx.num_warps() == 1:
         if WHICH != 2:
             tlx.async_amd_descriptor_load(kd, tlx.local_view(kbuf, slot))
@@ -159,6 +162,42 @@ def _issue_flat_page(KD, VD, BT, kbuf, vbuf, seq, bst, kvh, start, hi, slot, HKV
             tlx.async_amd_descriptor_load(vd, tlx.local_view(vbuf, slot))
     else:
         tlx.async_amd_descriptor_load_fused([(kd, tlx.local_view(kbuf, slot), 1), (vd, tlx.local_view(vbuf, slot), 2)])
+
+
+@triton.jit
+def _pair_window_value(q, K, V, BT, seq, bst, kvh, length, qk_scale, vs, D: tl.constexpr, PAGE: tl.constexpr,
+                       HKV: tl.constexpr, BLOCKS: tl.constexpr, KL: tl.constexpr, VL: tl.constexpr):
+    # Both pages are full and inside the active window, as proved by the caller.
+    # Keep page-sized WMMA layouts while sharing one stable FP32 normalization.
+    kd = tl.make_tensor_descriptor(K, shape=[BLOCKS * HKV, PAGE * D], strides=[PAGE * D, tl.constexpr(1)],
+                                   block_shape=[1, PAGE * D])
+    vd = tl.make_tensor_descriptor(V, shape=[BLOCKS * HKV, PAGE * D], strides=[PAGE * D, tl.constexpr(1)],
+                                   block_shape=[1, PAGE * D])
+    kb = tlx.local_alloc((1, PAGE * D), K.dtype.element_ty, 2)
+    vb = tlx.local_alloc((1, PAGE * D), V.dtype.element_ty, 2)
+    first = length - 2 * PAGE
+    _issue_flat_page(kd, vd, BT, kb, vb, seq, bst, kvh, first, length, 0, HKV, PAGE)
+    _issue_flat_page(kd, vd, BT, kb, vb, seq, bst, kvh, first + PAGE, length, 1, HKV, PAGE)
+    tlx.async_amd_descriptor_wait(3)
+    kr0 = tlx.local_load(tlx.local_view(kb, 0), layout=KL, relaxed=True)
+    k0 = kr0.reshape((D // 16, PAGE, 16)).trans(1, 0, 2).reshape((PAGE, D))
+    score0 = tl.dot(q.to(tl.bfloat16), k0.trans().to(tl.bfloat16)) * qk_scale[:, None]
+    tlx.async_amd_descriptor_wait(1)
+    kr1 = tlx.local_load(tlx.local_view(kb, 1), layout=KL, relaxed=True)
+    k1 = kr1.reshape((D // 16, PAGE, 16)).trans(1, 0, 2).reshape((PAGE, D))
+    score1 = tl.dot(q.to(tl.bfloat16), k1.trans().to(tl.bfloat16)) * qk_scale[:, None]
+    m = tl.max(tl.maximum(score0, score1), 1)
+    p0 = tl.exp2(score0 - m[:, None])
+    p1 = tl.exp2(score1 - m[:, None])
+    denom = tl.sum(p0 + p1, 1)
+    vr0 = tlx.local_load(tlx.local_view(vb, 0), layout=VL, relaxed=True)
+    v0 = vr0.reshape((PAGE // 16, D, 16)).trans(0, 2, 1).reshape((PAGE, D)).to(tl.float16)
+    acc = tl.dot((p0 * 32768.).to(tl.float16), v0)
+    tlx.async_amd_descriptor_wait(0)
+    vr1 = tlx.local_load(tlx.local_view(vb, 1), layout=VL, relaxed=True)
+    v1 = vr1.reshape((PAGE // 16, D, 16)).trans(0, 2, 1).reshape((PAGE, D)).to(tl.float16)
+    acc = tl.dot((p1 * 32768.).to(tl.float16), v1, acc=acc)
+    return acc * (vs / 32768.) / tl.maximum(denom[:, None], 1.e-20)
 
 
 @triton.jit
@@ -273,7 +312,7 @@ def _matrix_decode(
         block = tl.load(BT + seq * bst + pos // PAGE, valid, other=0).to(tl.int64)
         slot = pos % PAGE
         if TDM:
-            buffer_slot = ((start - lo) // BN) % 2
+            buffer_slot = (((start - lo) // BN) % 2).to(tl.int32)
             if PREFILL_PAIR and start == lo and start + BN < hi:
                 tlx.async_amd_descriptor_wait(3)
             else:
@@ -360,11 +399,42 @@ def _matrix_decode(
 
 
 @triton.jit
+def _window_decode(Q, K, V, KS, VS, BT, LEN, OUT, scale, QST: tl.constexpr, QSH: tl.constexpr, QSD: tl.constexpr,
+                   BST: tl.constexpr, D: tl.constexpr, HQ: tl.constexpr, G: tl.constexpr, PAGE: tl.constexpr,
+                   BLOCKS: tl.constexpr, BM: tl.constexpr, ROWS: tl.constexpr, KL: tl.constexpr, VL: tl.constexpr):
+    # A smaller launch signature avoids loading unused split/stride arguments.
+    # This condition is uniform across each logical block, including its waits.
+    task = tl.program_id(0)
+    kvh = tl.program_id(1)
+    seq = task // ROWS
+    length = tl.load(LEN + seq)
+    if length >= 2 * PAGE and length % PAGE == 0:
+        row = (task % ROWS) * BM + tl.arange(0, BM)
+        valid = row < G
+        head = kvh * G + row % G
+        d = tl.arange(0, D)
+        q = tl.load(Q + seq * QST + head[:, None] * QSH + d[None, :] * QSD, valid[:, None], other=0.)
+        ks = tl.load(KS + kvh)
+        vs = tl.load(VS + kvh)
+        qk_scale = tl.full((BM, ), 1., tl.float32) * (ks * scale * 1.4426950408889634)
+        value = _pair_window_value(q, K, V, BT, seq, BST, kvh, length, qk_scale, vs, D, PAGE, HQ // G, BLOCKS, KL, VL)
+        tl.store(OUT + (seq * HQ + head[:, None]) * D + d[None, :], value, valid[:, None])
+    else:
+        # Packed K/V strides are fixed by the contiguous physical cache contract.
+        _matrix_decode(Q, K, V, KS, VS, KS, BT, LEN, OUT, OUT, OUT, QST, QSH, QSD, BST, (HQ // G) * PAGE * D, PAGE * D,
+                       PAGE * 16, 16, (HQ // G) * PAGE * D, PAGE * D, D * 16, 16, scale, D, HQ, G, 1, PAGE, 1, BM, PAGE,
+                       False, True, 2 * PAGE, ROWS, False, False, True, BLOCKS, KL, VL, False, False)
+
+
+@triton.jit
 def _merge(PART, LSE, OUT, D: tl.constexpr, SPLITS: tl.constexpr, BS: tl.constexpr, VS, HQ: tl.constexpr,
-           G: tl.constexpr):
+           G: tl.constexpr, BD: tl.constexpr):
     row = tl.program_id(0)
     s = tl.arange(0, BS)
-    d = tl.arange(0, D)
+    if BD == D:
+        d = tl.arange(0, D)
+    else:
+        d = tl.program_id(1) * BD + tl.arange(0, BD)
     lse = tl.load(LSE + row * SPLITS + s, s < SPLITS, other=-float("inf"))
     m = tl.max(lse, 0)
     m = tl.where(m == -float("inf"), 0.0, m)
@@ -418,16 +488,25 @@ def decode(q, k, v, lengths, table, ks, vs, *, q_scale, query_length, causal, wi
         prefill_enabled = (prefill_pair and variant == "matrix_tdm_flat" and num_warps == 1 and not single_tile
                            and q.dtype == torch.bfloat16 and window_size == 0 and query_length == 1
                            and visible_bound >= 8192 and ((page == 64 and hkv <= 2) or heads == hkv and hkv >= 64))
-        _matrix_decode[(tokens // query_length * rows, hkv,
-                        num_splits)](q, k, v, ks, vs, q_scale if q_scale is not None else ks, table, lengths, mid, lse,
-                                     out, *strides, sm_scale, dim, heads, group, query_length, page, num_splits,
-                                     block_m, block_n, q.dtype == torch.float8_e4m3fn, causal, window_size, rows,
-                                     fp8_qk, variant == "matrix_precise", variant == "matrix_tdm_flat", k.shape[0],
-                                     kload, vload, single_tile, prefill_enabled, num_warps=num_warps,
-                                     matrix_instr_nonkdim=16)
+        if (variant == "matrix_tdm_flat" and query_length == 1 and window_size == 128 and page == 64 and dim == 128
+                and num_splits == 1 and num_warps == 1 and q.dtype == torch.bfloat16):
+            _window_decode[(tokens * rows, hkv, 1)](q, k, v, ks, vs, table, lengths, out, sm_scale, *q.stride(),
+                                                    table.stride(0), dim, heads, group, page, k.shape[0], block_m, rows,
+                                                    kload, vload, num_warps=1, matrix_instr_nonkdim=16)
+        else:
+            _matrix_decode[(tokens // query_length * rows, hkv,
+                            num_splits)](q, k, v, ks, vs, q_scale if q_scale is not None else ks, table, lengths, mid,
+                                         lse, out, *strides, sm_scale, dim, heads, group, query_length, page,
+                                         num_splits, block_m, block_n, q.dtype == torch.float8_e4m3fn, causal,
+                                         window_size, rows, fp8_qk, variant == "matrix_precise",
+                                         variant == "matrix_tdm_flat", k.shape[0], kload, vload, single_tile,
+                                         prefill_enabled, num_warps=num_warps, matrix_instr_nonkdim=16)
     if num_splits > 1:
-        _merge[(tokens * heads, )](mid, lse, out, dim, num_splits, triton.next_power_of_2(num_splits), vs, heads, group,
-                                   num_warps=(1 if num_splits * dim <= 8192 else 4 if num_splits * dim <= 32768 else 8))
+        # Dimension tiles give sparse grouped grids more merge workgroups.
+        merge_d = 32 if dim == 128 and tokens * heads <= 32 and q.dtype == torch.bfloat16 and num_splits >= 16 else dim
+        _merge[(tokens * heads, triton.cdiv(dim, merge_d))](
+            mid, lse, out, dim, num_splits, triton.next_power_of_2(num_splits), vs, heads, group, merge_d,
+            num_warps=(1 if num_splits * merge_d <= 8192 else 4 if num_splits * merge_d <= 32768 else 8))
     return out
 
 
@@ -458,7 +537,10 @@ def _select_decode_config(q, key_cache, *, max_context_len, query_length=1, wind
                 chunk = 1024 if page == 128 and effective >= 8192 else 3 * page if dim == 128 else 256
                 split_cap = 128
             else:
-                chunk = 2 * page if dim == 128 and page == 64 and effective >= 4096 else page
+                # One-page partitions expose more parallel work in medium
+                # BF16-Q/D128 grouped decode; longer loops retain amortization.
+                chunk = 2 * page if dim == 128 and page == 64 and effective >= 4096 and (
+                    q.dtype != torch.bfloat16 or effective > 8192 or tasks > 4) else page
                 split_cap = 256 if page == 128 and dim == 64 else 128
             splits = min(split_cap, triton.cdiv(effective, chunk))
         else:
