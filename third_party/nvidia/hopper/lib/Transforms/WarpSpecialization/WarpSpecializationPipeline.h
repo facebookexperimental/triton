@@ -53,6 +53,9 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
                               const MemoryPlannerOptions &options = {});
 
 LogicalResult doBufferAllocation(triton::FuncOp funcOp);
+// Whether an MMAv5 operand is a descriptor load TMA cannot write in the MMA's
+// layout, so it would be staged through registers in the MMA's own partition.
+bool hasRegisterStagedMMAOperand(triton::FuncOp funcOp);
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp funcOp);
 void removeRedundantTmemZeroStores(triton::FuncOp funcOp);

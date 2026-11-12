@@ -192,6 +192,14 @@ public:
       return bailOut(funcOp);
     }
 
+    // A register-staged MMA operand is written and read asynchronously by the
+    // MMA's own partition with no barrier between them.
+    if (hasRegisterStagedMMAOperand(funcOp)) {
+      LDBG("Warp specialization does not support register-staged MMA "
+           "operands. Skipping.");
+      return bailOut(funcOp);
+    }
+
     // Code partitioning cannot yet place communication channels in both sides
     // of an IfOp. An IfOp whose complete then/else region belongs to one task
     // does not need such a channel, however, and specialization already knows
