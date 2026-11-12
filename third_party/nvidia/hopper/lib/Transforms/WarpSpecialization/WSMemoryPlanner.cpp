@@ -3554,10 +3554,8 @@ public:
       if (auto theForOp = dyn_cast<scf::ForOp>(subOp))
         if (isInnermostLoop(theForOp))
           innermostLoops.push_back(subOp);
-      // A warp-specialized dynamic persistent (CLC / atomic tile counter)
-      // tile loop whose K loop folded away (a single K tile) holds the MMA
-      // directly in its after region and contains no other loop, so it is the
-      // innermost loop the TMEM allocs live in.
+      // A warp-specialized CLC tile loop whose single-tile K loop folded away
+      // is the innermost loop the TMEM allocs live in.
       if (auto whileOp = dyn_cast<scf::WhileOp>(subOp)) {
         Block *body = whileOp.getAfterBody();
         bool holdsMMA = llvm::any_of(body->getOperations(), [](Operation &op) {

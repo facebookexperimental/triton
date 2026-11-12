@@ -3047,11 +3047,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
     if (user->hasAttr("tmem.end"))
       user->removeAttr("tmem.end");
   }
-  // The loop whose body holds the MMA: normally the K loop, but when that loop
-  // has a single iteration and folds away, the persistent tile loop. A dynamic
-  // persistent (CLC / atomic tile counter) tile loop is the warp-specialized
-  // scf.while, whose body is its after region. Other scf.while loops are
-  // skipped as before.
+  // The loop whose body holds the MMA: normally the K loop, but when a single
+  // K iteration folds away, the persistent tile loop, which for CLC is the
+  // warp-specialized scf.while.
   Operation *loopOp = nullptr;
   Block *loopBody = nullptr;
   for (Operation *p = mmaOp->getParentOp(); p && !loopOp; p = p->getParentOp()) {
@@ -3068,9 +3066,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
     return mmaOp->emitError("handleOperandD: MMA operation is not inside a "
                             "scf.for or scf.while loop");
   }
-  // Trace a loop-carried block argument of an scf.for body to its init value.
-  // scf.while after-region arguments come from scf.condition, not from the
-  // inits, so they are left as is.
+  // scf.while after-region arguments come from scf.condition, not the inits,
+  // so only scf.for iter args are traced to their init value.
   auto traceToInit = [&](Value v) -> Value {
     auto forOp = dyn_cast<scf::ForOp>(loopOp);
     auto ba = dyn_cast<BlockArgument>(v);

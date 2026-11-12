@@ -460,9 +460,8 @@ public:
 
       scf::ForOp forOp = dyn_cast<scf::ForOp>(mmaOp->getParentOp());
       if (!forOp) {
-        // Outside a loop only a constant-zero accumulator applies, e.g. a
-        // single-K-tile MMA directly in a dynamic persistent (CLC) scf.while
-        // tile loop, or in a kernel with no loop at all.
+        // Outside a loop (e.g. a single-K-tile MMA in a CLC scf.while) only a
+        // constant-zero accumulator applies.
         auto [accUse, accDef] = getAccumulatorUseAndDef(mmaOp);
         if (!accUse || !accDef || !isConstantZeroTensor(accUse))
           continue;
