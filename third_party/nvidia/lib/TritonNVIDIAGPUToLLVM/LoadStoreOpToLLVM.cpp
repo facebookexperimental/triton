@@ -1439,7 +1439,7 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     auto ctx = op.getContext();
     auto kBlock = str_attr("block");
     auto msgToPackedOffset = getMsgToPackedOffsetLayout(smemTy, tmaMode);
-    auto smemLayout = ttg::toLinearLayout(smemTy);
+    auto smemLayout = ttg::toLinearLayoutIgnoringPadding(smemTy);
     bool mixedRadixPlan = !msgToPackedOffset.isRadix2();
     auto msgToShared =
         mixedRadixPlan

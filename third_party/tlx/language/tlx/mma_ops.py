@@ -989,16 +989,26 @@ def async_dot_scaled(
 @tl.builtin
 def async_dot_wait(
     pendings: tl.constexpr,
-    inp: tl.tensor,
+    inp,
     _semantic=None,
-) -> tl.tensor:
+):
     """
     Wait for completion of prior asynchronous dot operations.
     Each input must be the tensors corresponding to the async dot ops that we're
-    waiting on.
+    waiting on. A tuple of inputs is waited on together and returns a tuple; it
+    may include the shared-memory operands the dots read, which stay live until
+    the wait.
     """
     pendings = tl._unwrap_if_constexpr(pendings)
-    return tl.tensor(_semantic.builder.create_warp_group_dot_wait([inp.handle], pendings)[0], inp.type)
+    inputs = list(inp.values) if isinstance(inp, tl.tuple) else [inp]
+    handles = _semantic.builder.create_warp_group_dot_wait([x.handle for x in inputs], pendings)
+    outputs = []
+    for x, handle in zip(inputs, handles):
+        if isinstance(x, tlx.buffered_tensor):
+            outputs.append(tlx.buffered_tensor(handle, x.dtype, x.shape, x.type.num, x.type.storage, x.type.layout))
+        else:
+            outputs.append(tl.tensor(handle, x.type))
+    return tl.tuple(outputs) if isinstance(inp, tl.tuple) else outputs[0]
 
 
 @tl.builtin

@@ -157,7 +157,7 @@ def append_tlx_flex_backward(
     """Add TLX backward flex-attention template choices to ``choices``."""
     from torch._inductor import config
 
-    if config.triton.tlx_mode is None:
+    if config.triton.tlx_mode is None or mutated_inputs is None:
         return choices
 
     if not _is_backward_payload(input_nodes, subgraphs):

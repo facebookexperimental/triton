@@ -54,6 +54,7 @@ options:
 | op | reference | gate | default space |
 |----|-----------|------|---------------|
 | `mm` | `torch.matmul` | speedup >= 0.9x | heuristic |
+| `mm_mxfp8` | `torch.mm` on pre-dequantized BF16 inputs | reports ratio only; non-equivalent reference | heuristic |
 | `addmm` | `torch.addmm` | speedup >= 0.9x | heuristic |
 | `mm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `addmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
@@ -160,6 +161,11 @@ pip: speedup < 0.9, or TFLOP/s under an op's absolute floor when it has no
      no heuristic raise it, see above)
 noisy: CV% > 3%
 ok: everything else
+
+A benchmark may set `REFERENCE_GATE = False` when its reference validates the
+same numerical result but does not use an equivalent storage or instruction
+contract. The harness still measures and reports the ratio, while only
+correctness, compile time, and noise affect that run's status.
 
 ## How a call is timed
 
