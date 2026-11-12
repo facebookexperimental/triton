@@ -23,6 +23,18 @@ def bench_night(date, sha, *cases, **env):
     }
 
 
+def test_push_summary_uses_the_measurement_date_without_changing_nightly_defaults(tmp_path):
+    out = tmp_path / "summary.json"
+    args = SimpleNamespace(dir=str(tmp_path), platform="b200", version="main." + "a" * 40, sha="a" * 40, out=str(out),
+                           date="20261112")
+    dash.summarize(args)
+    assert json.loads(out.read_text())["date"] == "20261112"
+    args.version = "3.9.0.dev20261111"
+    args.date = None
+    dash.summarize(args)
+    assert json.loads(out.read_text())["date"] == "20261111"
+
+
 def test_a_perf_event_needs_the_next_night_to_hold_it(monkeypatch):
     monkeypatch.setattr(dash, "commits", lambda a, b: [])
     nights = [

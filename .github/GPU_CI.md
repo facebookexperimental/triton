@@ -29,6 +29,24 @@ Nightly issue titles retain the previous platform workflow names. Last-green
 lookup checks the relevant GPU job independently of sibling failures and includes
 the old workflow's history. Compiler nightly reporting is unchanged.
 
+## Main-push TLX ops benchmarks
+
+Main pushes also select benchmark work independently of correctness selection.
+Implementation imports map changed kernel files and shared helpers to catalog ops;
+only their benchmark frontends with focus inputs on the selected GPU run. Harness,
+shape-only and common dispatch changes do not expand benchmark work. The existing
+build supplies the same checked wheel tuple. Benchmark checks are not part of the
+required **GPU tests** aggregate and do not change PR fast correctness.
+
+The CPU reporter compares sanitized main measurements with earlier nightly
+summaries through the shared regression detector. Baseline source commits must be
+ancestors of the measured commit and use unchanged benchmark instruments. Missing
+or incompatible historical cases are not passes; the detector retains its sample
+and confirmation requirements. A regression comment goes to relevant merged PRs
+in the push, without claiming the PR caused the loss. Replays deduplicate comments.
+Main measurements remain in Actions artifacts, not the nightly dashboard release;
+no nightly issues or bisects are created by this path.
+
 ## Wheel reuse
 
 `scripts/wheel_cache.py` stores a manifest under

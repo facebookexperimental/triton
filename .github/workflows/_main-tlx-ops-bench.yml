@@ -1,0 +1,115 @@
+name: Main TLX ops benchmark
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+      wheel_url:
+        required: true
+        type: string
+      wheel_filename:
+        required: true
+        type: string
+      wheel_sha256:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ${{ fromJSON('{"h100":"linux-gcp-h100","b200":"nvidia-dgx-b200","mi350":"linux-fb-triton-mi350-1"}')[fromJSON(inputs.plan).platform] }}
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.sha }}
+      - name: Set up test environment
+        uses: ./.github/actions/setup-test-env
+        with:
+          backend: ${{ fromJSON(inputs.plan).platform == 'mi350' && 'rocm' || 'cuda' }}
+          arch: ${{ fromJSON(inputs.plan).platform == 'mi350' && 'gfx950' || '' }}
+          torch: torch==2.14.0
+          torch-index-url: ${{ fromJSON(inputs.plan).platform == 'mi350' && 'https://download.pytorch.org/whl/rocm7.2' || 'https://download.pytorch.org/whl/cu130' }}
+          packages: numpy pytest pytest-timeout torchao
+          rocm-lib-path: ""
+      - name: Refresh the linker cache
+        if: fromJSON(inputs.plan).platform != 'mi350'
+        run: sudo ldconfig
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
+      - name: Run tlx.ops perf suite
+        env:
+          BENCH_PLAN: ${{ inputs.plan }}
+        timeout-minutes: 120
+        run: python .github/scripts/main_tlx_ops_bench.py run --out "${RUNNER_TEMP}/main-tlx-bench"
+      - name: Summarize measurements
+        if: always()
+        env:
+          PLATFORM: ${{ fromJSON(inputs.plan).platform }}
+          SOURCE_SHA: ${{ inputs.sha }}
+        run: |
+          python .github/scripts/tlx_ops_bench_dashboard.py summarize "${RUNNER_TEMP}/main-tlx-bench" \
+            --platform "${PLATFORM}" --version "main.${SOURCE_SHA}" --date "$(date -u +%Y%m%d)" --sha "${SOURCE_SHA}" \
+            --out "${RUNNER_TEMP}/main-tlx-summary.json"
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-tlx-ops-${{ fromJSON(inputs.plan).platform }}-${{ inputs.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/main-tlx-summary.json
+            ${{ runner.temp }}/main-tlx-bench/bench.xml
+          if-no-files-found: error
+
+  report:
+    needs: bench
+    if: always() && (needs.bench.result == 'success' || needs.bench.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    concurrency:
+      group: main-tlx-perf-comment-${{ fromJSON(inputs.plan).platform }}-${{ inputs.sha }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: main-tlx-ops-${{ fromJSON(inputs.plan).platform }}-${{ inputs.sha }}-${{ github.run_attempt }}
+          path: measurements
+      - name: Read nightly baseline measurements
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM: ${{ fromJSON(inputs.plan).platform }}
+        run: |
+          gh release download tlx-ops-bench --pattern "*.${PLATFORM}.json" --dir history
+      - name: Detect regressions and comment on associated PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BENCH_PLAN: ${{ inputs.plan }}
+        run: |
+          python3 .github/scripts/main_tlx_ops_regressions.py measurements/main-tlx-summary.json history \
+            --out regressions.json --comment
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: main-tlx-regressions-${{ fromJSON(inputs.plan).platform }}-${{ inputs.sha }}-${{ github.run_attempt }}
+          path: regressions.json
+          if-no-files-found: ignore

@@ -93,10 +93,16 @@ def workflow_test_jobs(workflow="gpu-tests.yml"):
     for key, job in parent["jobs"].items():
         if "uses" in job:
             children = yaml.load((root / job["uses"]).read_text(), Loader=yaml.BaseLoader)["jobs"]
-            platforms = job.get("strategy", {}).get("matrix", {}).get("platform", [None])
+            matrix = job.get("strategy", {}).get("matrix", {})
+            platforms = matrix.get("platform", [None])
+            if "include" in matrix and "${{ matrix.platform }}" in job.get("name", ""):
+                from main_tlx_ops_bench import PLATFORMS
+                platforms = list(PLATFORMS)
             candidates = []
             for platform in platforms:
-                prefix = f"{key} ({platform})" if platform else key
+                prefix = job.get("name", key).replace("${{ matrix.platform }}", platform or "")
+                if platform and "${{ matrix.platform }}" not in job.get("name", ""):
+                    prefix = f"{prefix} ({platform})"
                 for name, child in children.items():
                     name = child.get("name", name)
                     if platform:

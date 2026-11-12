@@ -132,7 +132,7 @@ def summarize(args):
         "platform": args.platform,
         "version": args.version,
         "sha": args.sha,
-        "date": date.group(1) if date else None,
+        "date": getattr(args, "date", None) or (date.group(1) if date else None),
         "gpu": gpu.get("name"),
         "driver": gpu.get("driver"),
         "torch": torch_version,
@@ -540,6 +540,7 @@ def main():
     s.add_argument("dir")
     for flag in ("--platform", "--version", "--sha", "--out"):
         s.add_argument(flag, required=True)
+    s.add_argument("--date", help="UTC measurement date, YYYYMMDD; nightly versions retain their default date")
     p = sub.add_parser("prune")
     p.add_argument("keep", type=int)
     r = sub.add_parser("render")
