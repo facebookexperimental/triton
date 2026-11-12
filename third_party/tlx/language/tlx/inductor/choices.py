@@ -268,8 +268,10 @@ class TLXInductorChoices(InductorChoices):
                 kernel_inputs, templates, op_name, kwarg_overrides
             )
 
-        from .mm_templates import append_tlx, tlx_kernel_inputs
+        from .mm_templates import append_tlx, tlx_force_drops_addmm_choices, tlx_kernel_inputs
 
+        if tlx_mode == "force" and tlx_force_drops_addmm_choices(templates, op_name, kernel_inputs):
+            return []
         templates = list(templates)
         kwarg_overrides = kwarg_overrides or {}
         append_tlx(templates, op_name, kernel_inputs)
