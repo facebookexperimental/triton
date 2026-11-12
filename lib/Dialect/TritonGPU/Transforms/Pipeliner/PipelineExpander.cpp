@@ -641,12 +641,9 @@ LogicalResult LoopPipelinerInternal::createKernel(
     Operation *def = retVal.value().getDefiningOp();
     auto defStage = stages.find(def);
     if (defStage == stages.end()) {
-      // Version 1 is read by the first epilogue ops of the last stage, which
-      // run the iteration right after the last kernel iteration. Like the
-      // last-stage uses inside the kernel, it must take the kernel's carried
-      // value: when the kernel loop runs zero times (trip count <= maxStage)
-      // that iteration is iteration 0 and the value is still the init value,
-      // not the yielded one.
+      // Version 1 feeds the first last-stage epilogue ops; it must be the
+      // kernel's carried value, which is the init value when the kernel loop
+      // runs zero times (trip count <= maxStage).
       setValueMapping(forOp.getRegionIterArgs()[retVal.index()],
                       newForOp->getResult(retVal.index()), 1);
       for (unsigned int stage = 2; stage <= maxStage; stage++)
@@ -788,9 +785,8 @@ LoopPipelinerInternal::emitEpilogue(RewriterBase &rewriter,
       }
     }
   }
-  // A loop-carried value yielded from outside the loop is returned by the
-  // kernel loop, which holds the init value when it runs zero times. The
-  // original loop returns the yielded value as soon as it runs once.
+  // A yield defined outside the loop is the result once the original loop
+  // runs, but the kernel loop holds the init value when it runs zero times.
   for (OpOperand &operand : forOp.getBody()->getTerminator()->getOpOperands()) {
     unsigned ri = operand.getOperandNumber();
     if (maxStage == 0 || !forOp.isDefinedOutsideOfLoop(operand.get()) ||
