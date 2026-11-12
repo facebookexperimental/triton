@@ -1640,3 +1640,35 @@ llvm.func @single_ws_no_end_realloc() attributes {allocation.offset = 0 : i32} {
 }
 
 }
+
+// -----
+
+// Code after a single-WS warp_specialize op reads what the partitions wrote,
+// so every region ends with a barrier that joins the warps before it runs.
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 8 : i32, "ttg.single-warp-specialize" = true} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @single_ws_join_before_post_ws_code
+llvm.func @single_ws_join_before_post_ws_code() attributes {allocation.offset = 0 : i32} {
+  // CHECK: "partition0"
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"
+  // CHECK-NEXT: llvm.br
+  // CHECK: "default"
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"
+  // CHECK-NEXT: llvm.br
+  // CHECK: "post_ws"
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
+  default {
+    "default"() : () -> ()
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    "partition0"() : () -> ()
+    ttg.warp_return
+  } : () -> ()
+  "post_ws"() : () -> ()
+  llvm.return
+}
+
+}

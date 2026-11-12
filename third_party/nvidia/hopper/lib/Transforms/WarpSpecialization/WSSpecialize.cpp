@@ -786,6 +786,24 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   auto wsOp = ttg::WarpSpecializeOp::create(impB, dummyTypes, partitionNumWarps,
                                             nTaskIds.size() - 1);
 
+  // Untagged ops after the last specialized op must run after the partitions,
+  // so keep them after the warp_specialize op.
+  SmallVector<Operation *> postWsOps;
+  bool foundSpecializedOp = false;
+  for (Operation &op : llvm::reverse(lastBlock->without_terminator())) {
+    if (&op == wsOp.getOperation())
+      continue;
+    if (opsInList.count(&op)) {
+      foundSpecializedOp = true;
+      break;
+    }
+    postWsOps.push_back(&op);
+  }
+  if (foundSpecializedOp) {
+    for (Operation *op : llvm::reverse(postWsOps))
+      op->moveBefore(returnOp);
+  }
+
   // Copy partition types attribute from the loop to the WarpSpecializeOp.
   // This is needed by OptimizePartitionWarps for type-aware warp assignment.
   funcOp.walk([&](LoopLikeOpInterface forOp) {
