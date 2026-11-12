@@ -2415,7 +2415,6 @@ LogicalResult replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
           }
         }
 
-        // If all representatives fail, report the error and fail the pass.
         if (!reinter) {
           channel->getAllocOp()->emitError(
               "Failed to allocate TMEM buffer: out of bounds. "

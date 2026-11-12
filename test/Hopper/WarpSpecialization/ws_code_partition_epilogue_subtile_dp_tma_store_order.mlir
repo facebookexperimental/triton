@@ -1,19 +1,7 @@
 // RUN: triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" 2>&1 | FileCheck %s
 
-// Regression test for a column-sum epilogue at DATA_PARTITION_FACTOR=2 and
-// EPILOGUE_SUBTILE=2 with early TMA store lowering (the Inductor Blackwell
-// persistent TMA template at BLOCK_M=256, num_stages=2 per partition).
-//
-// tt.split yields (LHS, RHS), but the RHS convert_layout is emitted first, so
-// the reorderEpilogOps streamline step hoists RHS's staging local_alloc ahead of
-// LHS's while the TMA copies stay LHS then RHS. The two staging buffers of each
-// data partition share one N-buffer reuse group, and restoring producer order to
-// match TMA store order only recognized tt.descriptor_store, not the already
-// lowered ttng.async_tma_copy_local_to_global. The group therefore reached
-// insertAsyncComm with producer and consumer orders reversed, which aborted the
-// process with "N-buffer reuse group: producer and consumer orderings are
-// inconsistent".
-
+// DP=2 + EPILOGUE_SUBTILE=2 with early TMA store lowering: staging writes must
+// follow TMA copy order for the N-buffer reuse group.
 // CHECK-NOT: error
 // CHECK: remark: reuse barrier: channel 3 waits on channel 2 (intra-iteration)
 // CHECK-NOT: error

@@ -9,8 +9,7 @@
 // orderReuseGroupChain finds no unique order. Without the guard this would fall
 // to the same-block path and emit a WAR making dq wait on dk's release - but dk
 // runs after dq in the same partition -> deadlock. The guard turns it into a
-// recoverable compile-time error (pass failure, not an abort) instead. `not`
-// also accepts a crash, so the CHECK-NOTs are what pin the no-abort behavior.
+// recoverable compile-time error; `not` also accepts a crash, hence CHECK-NOT.
 //
 // CHECK-NOT: LLVM ERROR
 // CHECK: TMEM reuse group with >= 3 buffers has no unique dependency-chain order
