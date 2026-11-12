@@ -1,10 +1,6 @@
 // RUN: triton-opt %s --nvgpu-partition-scheduling-meta | FileCheck %s
 
-// A non-persistent GEMM whose epilogue reads the accumulator after the
-// warp-specialized K loop and writes it with a pointer store (no TMA store).
-// The post-loop tmem_load needs a partition of its own: left unscheduled it
-// lands in the gemm task and code partitioning asserts in handleOperandD
-// ("Unexpected Producer Found").
+// A post-loop accumulator tmem_load with only a pointer store gets its own epilogue partition.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>

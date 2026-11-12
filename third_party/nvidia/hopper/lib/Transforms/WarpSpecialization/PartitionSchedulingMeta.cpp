@@ -464,9 +464,7 @@ public:
         .wasInterrupted();
   }
 
-  /// True when a tmem_load after the main loop reads a TMEM value the loop
-  /// produced (its token comes from the loop), e.g. the accumulator read of a
-  /// non-persistent kernel whose epilogue has no TMA store.
+  /// True when a tmem_load after the main loop reads a TMEM value it produced.
   bool hasPostLoopTMemRead() const {
     // Copy the lightweight op handle: getOperation() is non-const.
     LoopLikeOpInterface loop = mainLoop;
@@ -1064,10 +1062,8 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
     layout.gemmPartition->setType("gemm");
   }
 
-  // A post-loop TMEM read (accumulator tmem_load of a non-persistent kernel
-  // whose epilogue only has pointer stores) also needs an epilogue partition
-  // when nothing else would take it: otherwise the tmem_load stays
-  // unscheduled and lands in the gemm task.
+  // A post-loop TMEM read with nothing else to take it needs an epilogue
+  // partition; left unscheduled it lands in the gemm task.
   bool hasPostLoopTMemEpilogue = !hasEpilogue && !hasCorrection &&
                                  !hasReduction && !hasComputeAnchor &&
                                  hasMMAv5 && categorizer.hasPostLoopTMemRead();
