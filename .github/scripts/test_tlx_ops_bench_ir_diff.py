@@ -61,8 +61,8 @@ def gcn(path, line, insn):
 def ptx(path, line, insn):
     return f""".visible .entry k()
 {{
-\t.loc\t1 {line} 0
-\tadd.f32 \t%f1, %f2, %f3;
+\t.loc\t1 {line} 0, function_name $L__info_string0, inlined_at 1 {line * 4} 36 // standard.py:{line}:16
+\tadd.f32 \t%f1, %f2, %f3; // k.py:{line}
 \t{insn}
 }}
 \t.file\t1 "{path}/k.py"
