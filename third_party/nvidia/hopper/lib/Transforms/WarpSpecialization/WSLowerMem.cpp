@@ -121,6 +121,44 @@ getTMAWritableEncoding(tt::DescriptorLoadOp load, RankedTensorType tensorType,
   return std::nullopt;
 }
 
+bool hasRegisterStagedMMAOperand(triton::FuncOp funcOp) {
+  bool found = false;
+  funcOp.walk([&](ttng::MMAv5OpInterface mma) {
+    SmallVector<AsyncTaskId> mmaTasks = getAsyncTaskIds(mma);
+    for (Value operand : {mma.getA(), mma.getB()}) {
+      while (auto trans = operand.getDefiningOp<ttg::MemDescTransOp>())
+        operand = trans.getSrc();
+      auto alloc = operand.getDefiningOp<ttg::LocalAllocOp>();
+      if (!alloc || !alloc.getSrc())
+        continue;
+      Value src = alloc.getSrc();
+      while (auto cvt = src.getDefiningOp<ttg::ConvertLayoutOp>())
+        src = cvt.getSrc();
+      auto load = src.getDefiningOp<tt::DescriptorLoadOp>();
+      if (!load || !llvm::any_of(getAsyncTaskIds(alloc), [&](AsyncTaskId id) {
+            return llvm::is_contained(mmaTasks, id);
+          }))
+        continue;
+      // Mirror doConvertDescriptorLoadsToNVWS: the TMA copy lands in the alloc
+      // only when the alloc is the load's sole user and a legal destination.
+      auto tensorType = dyn_cast<RankedTensorType>(load.getType());
+      Attribute descEnc =
+          cast<tt::TensorDescType>(load.getDesc().getType()).getSharedLayout();
+      bool fused = tensorType && load->hasOneUse() &&
+                   *load->user_begin() == alloc.getOperation() &&
+                   getTMAWritableEncoding(
+                       load, tensorType,
+                       cast<ttg::MemDescType>(alloc.getType()), descEnc);
+      if (!fused) {
+        found = true;
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  return found;
+}
+
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
   // Schedule rematerialization can leave dead per-task clones attached to a
   // descriptor load. Remove only dead layout-rematerialization chains before
