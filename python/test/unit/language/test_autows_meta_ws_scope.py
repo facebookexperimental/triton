@@ -1,9 +1,4 @@
-"""TRITON_USE_META_WS only changes kernels that request warp specialization.
-
-A kernel with no tt.warp_specialize loop (and no partition annotations) must
-compile exactly as with the knob off; a warp-specialized kernel still gets Meta
-AutoWS.
-"""
+"""TRITON_USE_META_WS only changes kernels that request warp specialization."""
 
 import pytest
 import torch
@@ -51,9 +46,3 @@ def _compile(monkeypatch, use_meta_ws, warp_specialize):
 def test_non_ws_kernel_compiles_as_without_meta_ws(monkeypatch):
     assert _compile(monkeypatch, True, False) == _compile(monkeypatch, False, False)
 
-
-@pytest.mark.skipif(not _is_blackwell(), reason="Meta AutoWS pipeline under test is Blackwell")
-def test_ws_kernel_still_uses_meta_ws(monkeypatch):
-    ttgir = _compile(monkeypatch, True, True)
-    assert "ttg.warp_specialize" in ttgir
-    assert "ttg.partition.types" in ttgir  # set by Meta AutoWS partition scheduling

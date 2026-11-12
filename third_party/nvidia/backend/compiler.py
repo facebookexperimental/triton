@@ -920,12 +920,9 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, opt, capability):
-        # TRITON_USE_META_WS selects Meta AutoWS for kernels that request warp
-        # specialization. Its pipeline choices (latencies, loop schedule, early
-        # TMA-store lowering) assume the loop gets partitioned, so a module with
-        # no warp-specialization request compiles exactly as with the knob off.
-        # The modulo / joint / LLM schedulers add partitions inside the pipeline,
-        # so their modules keep the knob as set.
+        # Meta AutoWS pipeline choices assume the loop gets partitioned, so a
+        # module with no warp-specialization request compiles as with the knob
+        # off. The modulo / joint / LLM schedulers add partitions themselves.
         use_meta_ws = knobs.nvidia.use_meta_ws and (
             nvidia.requests_warp_specialization(mod) or knobs.nvidia.use_modulo_schedule is not None
             or knobs.nvidia.use_joint_schedule or knobs.nvidia.use_llm_schedule)
@@ -933,8 +930,7 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def _make_ttgir(mod, metadata, opt, capability, use_meta_ws):
-        # Passes that read TRITON_USE_META_WS directly honor this per-module
-        # decision instead.
+        # Read by passes in place of TRITON_USE_META_WS.
         mod.set_attr("ttg.use_meta_ws", ir.builder(mod.context).get_bool_attr(use_meta_ws))
         if opt.clc and capability < 100:
             raise ValueError("clc=True requires NVIDIA SM100+ (Blackwell); "
