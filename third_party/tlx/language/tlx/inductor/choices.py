@@ -125,9 +125,10 @@ class TLXInductorChoices(InductorChoices):
         buffer saved for backward). Otherwise the GEMM output stays
         materialized and the pointwise work runs separately.
 
-        Only node1 (producer side) writes are examined: node2's final outputs
-        become the fused kernel's TMA store target and are correctly
-        materialized even when they are graph outputs.
+        node2 may keep at most one live write: it becomes the single TMA store
+        target and is materialized even when it is a graph output. A second
+        live write (e.g. a GELU-backward epilogue that also recomputes gelu(x)
+        for a wgrad) would be dropped.
 
         This hook is graph-level, not per-candidate: a proposed group
         containing an affected TLX GEMM candidate is conservatively rejected
@@ -150,24 +151,35 @@ class TLXInductorChoices(InductorChoices):
         fused_node_names = OrderedSet(
             node.get_name() for node in (*node1.get_nodes(), *node2.get_nodes())
         )
-        for dep in node1.read_writes.writes:
-            if not isinstance(dep, Dep):
-                continue
-            write_name = scheduler.mutation_renames.get(dep.name, dep.name)
-            if write_name not in scheduler.name_to_buf:
-                WhyNoFuse(node1, node2)(
-                    "TLX WS GEMM epilogue would drop unknown buffer %s",
-                    write_name,
-                )
-                return False
-            if not scheduler.can_buffer_be_removed_through_fusion(
-                write_name, fused_node_names
-            ):
-                WhyNoFuse(node1, node2)(
-                    "TLX WS GEMM epilogue would drop live intermediate %s",
-                    write_name,
-                )
-                return False
+        live = {}
+        for node in (node1, node2):
+            live[node] = []
+            for dep in node.read_writes.writes:
+                if not isinstance(dep, Dep):
+                    continue
+                write_name = scheduler.mutation_renames.get(dep.name, dep.name)
+                if write_name not in scheduler.name_to_buf:
+                    WhyNoFuse(node1, node2)(
+                        "TLX WS GEMM epilogue would drop unknown buffer %s",
+                        write_name,
+                    )
+                    return False
+                if not scheduler.can_buffer_be_removed_through_fusion(
+                    write_name, fused_node_names
+                ):
+                    live[node].append(write_name)
+        if live[node1]:
+            WhyNoFuse(node1, node2)(
+                "TLX WS GEMM epilogue would drop live intermediate %s",
+                live[node1][0],
+            )
+            return False
+        if len(live[node2]) > 1:
+            WhyNoFuse(node1, node2)(
+                "TLX WS GEMM epilogue stores one output, not %s",
+                live[node2],
+            )
+            return False
         return True
 
     def _finalize_template_configs(
