@@ -34,6 +34,9 @@ from ..flash_attn.gfx950 import (
 BLOCK_M = 256
 BLOCK_N = 64
 HEAD_DIM = 128
+_MFMA_M = tl.constexpr(32)
+_MFMA_N = tl.constexpr(32)
+_MFMA_K = tl.constexpr(16)
 # Static segment copies per program; ranges spanning more q tiles finish in a non-pipelined loop.
 MAX_SEGMENTS = 5
 # Sequence tables are register vectors of next_power_of_2(Z) entries.
@@ -49,7 +52,8 @@ _VGPR_ONLY = (("amdgpu-agpr-alloc", "0,0"), )
 
 @triton.jit
 def _mma():
-    return tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 16], transposed=True, warps_per_cta=[tlx.num_warps(), 1])
+    return tlx.amd_mfma_layout(version=4, instr_shape=[_MFMA_M, _MFMA_N, _MFMA_K], transposed=True,
+                               warps_per_cta=[tlx.num_warps(), 1])
 
 
 @triton.jit
@@ -142,9 +146,9 @@ class LazySoftmaxFragments:
 
 
 @triton.jit
-def _maybe_exp_fragment(x, m_i, QK_SCALE: tl.constexpr, FORM_PROBABILITY: tl.constexpr):
+def _maybe_exp_fragment(x, m_i, QK_SCALE: tl.constexpr, NEEDS_EXPONENTIATION: tl.constexpr):
     """Form a probability from score fragment `x` when requested."""
-    if FORM_PROBABILITY:
+    if NEEDS_EXPONENTIATION:
         return tl.math.exp2(x * QK_SCALE - m_i)
     else:
         return x
@@ -249,25 +253,32 @@ def _anchor_probability_carry(probability_carry):
 
 
 @triton.jit
-def _schedule_softmax_mfma_valu(SYNC_ID: tl.constexpr):
-    """Schedule a softmax dot stage as 16 times one MFMA then up to five VALU or transcendental ops, which the
-    MFMA's 32 cycles hide."""
-    for _ in tl.static_range(16):
+def _schedule_softmax_mfma_valu(SYNC_ID: tl.constexpr, MFMA_PER_WAVE: tl.constexpr):
+    """Schedule one MFMA followed by up to five VALU or transcendental operations,
+    which the MFMA's 32 cycles hide."""
+    for _ in tl.static_range(MFMA_PER_WAVE):
         tlx.amd_sched_group_barrier(0x8, 1, SYNC_ID)
         tlx.amd_sched_group_barrier(0x402, 5, SYNC_ID)
 
 
 @triton.jit
 def _softmax_lazy_pipeline_step(state, probability_carry, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn,
-                                stride_vn, QK_SCALE: tl.constexpr, BLOCK_N: tl.constexpr, CUR_SLOT: tl.constexpr,
-                                NEXT_SLOT: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
+                                stride_vn, QK_SCALE: tl.constexpr, BLOCK_M: tl.constexpr,
+                                BLOCK_N: tl.constexpr, CUR_SLOT: tl.constexpr, NEXT_SLOT: tl.constexpr,
+                                RESCALE_THRESHOLD: tl.constexpr):
     """One steady-state QK/PV step with the probability carry one block behind QK."""
+    QK_MFMA_PER_WAVE: tl.constexpr = (
+        (BLOCK_M // _MFMA_M * (BLOCK_N // _MFMA_N) // tlx.num_warps()) * (q.shape[1] // _MFMA_K)
+    )
+    PV_MFMA_PER_WAVE: tl.constexpr = (
+        (BLOCK_M // _MFMA_M * (q.shape[1] // _MFMA_N) // tlx.num_warps()) * (BLOCK_N // _MFMA_K)
+    )
     # dot1: compute the next QK and finish the deferred probability fragments from the prior QK.
     with tlx.warp_pipeline_stage("dot1"):
         qk = _qk_pieces(q, kt_dot)
         state, probability_tile = _finish_probability_fragments(state, probability_carry, QK_SCALE, q.dtype,
                                                                 EAGER_PROBABILITY_FRAGMENTS)
-        _schedule_softmax_mfma_valu(1)
+        _schedule_softmax_mfma_valu(1, QK_MFMA_PER_WAVE)
     #tlx.async_load_wait_group(1)
     # mem1: read V for the completed probability tile and prefetch the next K tile.
     with tlx.warp_pipeline_stage("mem1"):
@@ -279,7 +290,7 @@ def _softmax_lazy_pipeline_step(state, probability_carry, q, kt_dot, k_ptrs, v_p
         state, probability_carry, score_delta, max_advance = _pv_and_start_probability_fragments(
             state, probability_tile, v_dot, qk, QK_SCALE, RESCALE_THRESHOLD)
         probability_carry = _anchor_probability_carry(probability_carry)
-        _schedule_softmax_mfma_valu(2)
+        _schedule_softmax_mfma_valu(2, PV_MFMA_PER_WAVE)
     tlx.async_load_wait_group(2)
     # mem2: prepare the next K/V operands and rescale the running softmax state.
     with tlx.warp_pipeline_stage("mem2"):
@@ -293,7 +304,8 @@ def _softmax_lazy_pipeline_step(state, probability_carry, q, kt_dot, k_ptrs, v_p
 
 @triton.jit
 def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, stride_kn, stride_vn,
-                       QK_SCALE: tl.constexpr, BLOCK_N: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
+                       QK_SCALE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                       RESCALE_THRESHOLD: tl.constexpr):
     """Lazy-rescale pipeline over an odd `n_blocks` (at least three) of unmasked KV blocks.
 
     The caller uses ``PIPE_STAGES`` as the threshold for entering this path; an
@@ -327,11 +339,11 @@ def _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_blocks, k_buf, v_buf, str
         block_n = pair_idx * 2
         state, probability_carry, kt_dot = _softmax_lazy_pipeline_step(state, probability_carry, q, kt_dot, k_ptrs,
                                                                        v_ptrs, block_n, k_buf, v_buf, stride_kn,
-                                                                       stride_vn, QK_SCALE, BLOCK_N, 0, 1,
+                                                                       stride_vn, QK_SCALE, BLOCK_M, BLOCK_N, 0, 1,
                                                                        RESCALE_THRESHOLD)
         state, probability_carry, kt_dot = _softmax_lazy_pipeline_step(state, probability_carry, q, kt_dot, k_ptrs,
                                                                        v_ptrs, block_n + 1, k_buf, v_buf, stride_kn,
-                                                                       stride_vn, QK_SCALE, BLOCK_N, 1, 0,
+                                                                       stride_vn, QK_SCALE, BLOCK_M, BLOCK_N, 1, 0,
                                                                        RESCALE_THRESHOLD)
     # Drain the last three blocks without further prefetches.
     nm1 = n_blocks - 1
@@ -836,7 +848,7 @@ def _segment(Q, K, V, Out, M, Part, PartLse, seq_offsets_q, seq_offsets, attn_sc
             # The paired steady state takes an odd block count; an extra block joins the masked tail.
             n_pipe = n_full - (n_full - 3) % 2
             state, q = _softmax_pipelined(state, q_buf, k_ptrs, v_ptrs, n_pipe, k_buf, v_buf, stride_kn, stride_vn,
-                                          QK_SCALE, BLOCK_N, RESCALE_THRESHOLD)
+                                          QK_SCALE, BLOCK_M, BLOCK_N, RESCALE_THRESHOLD)
             for start_n in tl.range(n_pipe * BLOCK_N, kv_len, BLOCK_N, num_stages=1):
                 state = _softmax_block_masked(state, q, k_ptrs, v_ptrs, start_n, kv_len, k_buf, v_buf, stride_kn,
                                               stride_vn, QK_SCALE, BLOCK_N)
