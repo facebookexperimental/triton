@@ -3,6 +3,8 @@
 `workflows/gpu-tests.yml` selects platforms, calls `build.yml` once, then passes
 the same wheel URL and SHA256 to `h100.yml`, `b200.yml`, and `mi350.yml`. Build and
 test checkouts use the same exact commit, including the merge commit for PRs.
+For PRs it runs as a follow-up of Fast correctness and tests its wheel instead of
+building (see "Pull request follow-ups").
 The GPU workflows are reusable test workflows; trigger the parent to run them.
 `workflows/gpu-tests-nightly.yml` runs suites too slow for PRs and pushes once a
 day and on demand: it builds the same wheel and runs TritonBench on H100, B200
@@ -52,11 +54,6 @@ The bucket must allow anonymous reads of the cache prefix for forks to hit.
 
 `build.yml`'s `wheel` output describes the validated wheel: its full identity,
 URL, filename, SHA256, and the GitHub artifact it was uploaded to in this run.
-Fast correctness builds the TLX codegen trace's base wheel alongside its head
-wheel (`codegen_trace.py` decides when) and passes both to
-`tlx-codegen-trace.yml`. The trace skips a build only for a supplied wheel of
-exactly the identity it would build and builds anything else itself. Each side
-installs its own wheel, from its URL or, without one, from its artifact.
 
 Conditional S3 PUTs (`If-None-Match` / `If-Match`) provide one producer per cache
 key. Waiters poll every 30 seconds for up to 90 minutes. The producer publishes
@@ -70,6 +67,52 @@ The existing `gha_workflow_triton_artifacts` role needs `s3:GetObject` and
 It also needs `s3:ListBucket` for missing keys to return 404 instead of 403. No
 delete permission is needed for the cache. Authorization or service errors fail
 the build rather than silently bypassing the producer lock.
+
+## Pull request follow-ups
+
+A PR's `Fast correctness` run is the only workflow its `pull_request` event
+starts for GPU coverage: it builds the head wheel once, runs the fast suites, and
+publishes `fast-followup-v1-attempt-<attempt>`, a manifest naming its run,
+attempt, PR, PR head, test merge commit and wheel. GPU full tests
+(`gpu-tests.yml`) and the TLX codegen trace (`tlx-codegen-trace.yml`) start
+from that run's success (`workflow_run`), each with its own run, conclusion,
+re-run and cancellation. Neither runs before Fast correctness passes, and a
+Fast failure starts no follow-up tests.
+
+A follow-up runs on the default branch, so `_fast-followup.yml` verifies the
+producer from data instead of trusting it. The run, attempt and PR head come
+from the event and are rechecked against the run's current API record (a later
+re-run attempt makes the event `stale`). The PR, open or already closed for
+landing, must still be the run's branch with the same head and with GitHub's
+current test merge commit equal to the manifest's (a moved head or a newer base
+is `stale`). The merge commit's parents come from git, and the wheel's identity
+is recomputed with the build recipe at that merge commit. Artifacts are fetched
+by exact name from exactly that run, and only their one expected file is
+extracted. A fork's artifact wheel is copied into the follow-up run after its
+checksum is checked; jobs share nothing else. A Fast run without a v1 manifest
+(status `none`, an older generation that still runs full tests itself) and a
+stale one test nothing; a failed verification fails the run. Each follow-up's
+run name and summary record the producer run, attempt and PR head for consumers
+that correlate them.
+
+Selection reruns the default branch's rules over the verified merge commit,
+so a PR cannot shrink its own required work. Full tests never build: a missing,
+expired or mismatched head wheel fails them. The codegen trace takes the same
+head wheel and never builds PR code; without it the trace reports no signal. Its
+base is a commit of the base branch: a cached wheel is looked up in the resolve
+job, and only a miss starts a build, without credentials or cache writes
+(`read_only_cache`) for a fork's PR.
+
+Jobs that check out PR code or install its wheel hold read-only tokens with no
+persisted credentials and no OIDC; issue reporters and the codegen PR comment
+are separate jobs that run no PR code. A fork's PR gets the trace summary and
+verdict artifact but no comment, as before.
+
+These triggers work only once the workflows are on the default branch, and
+Fast's switch to the manifest and the follow-ups must land together. Consumers of
+CI status (Reactor and the internal importer) must bind the follow-up runs to
+the Fast producer, PR head and attempt, treat a missing or running full run as
+pending, keep full failures as failures, and treat codegen as advisory.
 
 ## CI health dashboard
 

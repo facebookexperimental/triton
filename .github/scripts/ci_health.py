@@ -21,6 +21,7 @@
 Stored run record, one JSON object per line in the month of created_at; a later
 line for the same id replaces an earlier one:
   {id, wf, event, status, conclusion, created_at, head_sha, title, url, branch, pr, author,
+   followup_status?, followup_producer_run_id?, followup_producer_attempt?, pr_head_sha?,
    select: {h100, b200, mi350, build, cpu?, fallback} | null (gpu-tests.yml only),
    jobs: [{name, conclusion, created_at, started_at, completed_at, labels,
            steps: [{name, conclusion, started_at, completed_at,
@@ -192,6 +193,97 @@ def _pr_and_author(run, api):
     return None, None
 
 
+def _followup_log_identity(jobs, text):
+    """The verified producer object printed by the trusted follow-up job, or None.
+
+    GitHub prefixes each log line with a timestamp. Decode complete JSON objects
+    after removing those prefixes, then require exactly one producer result.
+    """
+    verify = next((job for job in jobs if job["name"] == "followup / verify"), None)
+    if verify is None:
+        return None
+    try:
+        body = text(f"repos/{REPO}/actions/jobs/{verify['id']}/logs")
+    except subprocess.CalledProcessError:
+        return None
+    messages = []
+    for line in body.splitlines():
+        stamp, sep, message = line.partition(" ")
+        messages.append(message if sep and stamp.endswith("Z") else line)
+    body = "\n".join(messages)
+    decoder, found = json.JSONDecoder(), []
+    for start, char in enumerate(body):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(body[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and {"status", "pr", "pr_head", "producer_run_id", "producer_attempt"
+                                        } <= value.keys():
+            found.append(value)
+    return (found[0], verify) if len(found) == 1 else None
+
+
+def _followup_identity(jobs, text, api):
+    """Return a workflow_run follow-up's API-checked Fast producer identity.
+
+    The display title is only presentation. Correlation uses the trusted verify
+    job's result and the exact producer attempt from the Actions API.
+    """
+    parsed = _followup_log_identity(jobs, text)
+    if parsed is None:
+        return None
+    source, verify_job = parsed
+    run_id, attempt = source.get("producer_run_id"), source.get("producer_attempt")
+    if not isinstance(run_id, int) or not isinstance(attempt, int):
+        return None
+    try:
+        response = api(f"repos/{REPO}/actions/runs/{run_id}/attempts/{attempt}")
+        producer = response[0] if len(response) == 1 else None
+    except (subprocess.CalledProcessError, KeyError, IndexError, TypeError):
+        return None
+    if producer is None:
+        return None
+    path = str(producer.get("path", "")).split("@", 1)[0]
+    repository = (producer.get("repository") or {}).get("full_name", REPO)
+    try:
+        prs = api(f"repos/{REPO}/pulls/{source.get('pr')}")
+        pr = prs[0] if len(prs) == 1 else None
+    except (subprocess.CalledProcessError, KeyError, IndexError, TypeError):
+        return None
+    if pr is None:
+        return None
+    head, base = pr.get("head") or {}, pr.get("base") or {}
+    head_repo, base_repo = head.get("repo") or {}, base.get("repo") or {}
+    producer_head_repo = producer.get("head_repository") or {}
+    author = (pr.get("user") or {}).get("login")
+    if (producer.get("id") != run_id or producer.get("run_attempt", 1) != attempt
+            or producer.get("event") != "pull_request" or producer.get("conclusion") != "success"
+            or path != f".github/workflows/{rules.FAST_WF}" or repository != REPO
+            or producer.get("head_sha") != source.get("pr_head")
+            or producer.get("head_branch") != source.get("head_ref")
+            or producer_head_repo.get("full_name") != source.get("head_repo") or pr.get("number") != source.get("pr")
+            or head_repo.get("full_name") != source.get("head_repo") or head.get("ref") != source.get("head_ref")
+            or base_repo.get("full_name") != REPO or base.get("ref") != source.get("base_ref") or not author):
+        return None
+    status = source.get("status")
+    if status not in ("ok", "stale"):
+        return None
+    out = {
+        "followup_status": status, "followup_producer_run_id": run_id, "followup_producer_attempt": attempt, "pr":
+        pr["number"], "author": author, "pr_head_sha": source["pr_head"], "pr_branch": source.get("head_ref"),
+        "head_repo": source.get("head_repo"), "base": source.get("base_ref"), "followup_verify_job": verify_job["id"]
+    }
+    if status == "ok":
+        merge, base = source.get("merge"), source.get("base")
+        if not (isinstance(merge, str) and re.fullmatch(r"[0-9a-f]{40}", merge) and isinstance(base, str)
+                and re.fullmatch(r"[0-9a-f]{40}", base)):
+            return None
+        out.update(followup_merge=merge, followup_base=base)
+    return out
+
+
 def _attach_failures(jobs, text, wf="gpu-tests.yml"):
     for j in jobs:
         if j["conclusion"] != "failure" or rules.test_platform_of({"wf": wf}, j) is None:
@@ -234,8 +326,46 @@ def _selection(jobs, text):
     return None
 
 
+def _checkout_from_step(job, log_text, step_name=None):
+    """Read one checkout's logged HEAD, optionally restricting the parser to one named step."""
+    if step_name is None:
+        return logs.checkout_sha(job, log_text)
+    steps = [{**step, "name": "Checkout"} for step in job["steps"] if step["name"] == step_name]
+    return logs.checkout_sha({**job, "steps": steps}, log_text) if len(steps) == 1 else None
+
+
 def _tested_revision(run, jobs, text):
     """Verify each stage against its selector and the one shared wheel producer."""
+    if run["wf"] == "gpu-tests.yml" and run["event"] == "workflow_run":
+        run["provenance_version"] = 2
+        run["run_attempt"] = run.get("run_attempt", 1)
+        evidence = []
+        merge = run.get("followup_merge") if run.get("followup_status") == "ok" else None
+        if merge:
+            evidence.append({
+                "sha": merge, "job": "followup / verify", "job_id": run["followup_verify_job"], "run_attempt":
+                run["run_attempt"], "job_attempt": 1, "source": "API-verified Fast producer and test merge", "url":
+                f"{run['url']}/job/{run['followup_verify_job']}"
+            })
+        select = next((job for job in jobs if job["name"] == "select"), None)
+        selected_sha = None
+        if select is not None:
+            try:
+                selected_sha = _checkout_from_step(select, text(f"repos/{REPO}/actions/jobs/{select['id']}/logs"),
+                                                   "Checkout the PR's test merge commit")
+            except subprocess.CalledProcessError:
+                pass
+        if selected_sha:
+            evidence.append({
+                "sha": selected_sha, "job": "select", "job_id": select["id"], "run_attempt": run["run_attempt"],
+                "job_attempt": select.get("run_attempt", 1), "source": "selected test merge checkout log", "url":
+                f"{run['url']}/job/{select['id']}"
+            })
+        run["tested_sha"] = merge if merge and selected_sha == merge else None
+        run["tested_sha_provenance"] = evidence
+        run["stage_provenance"] = {"gpu-tests.yml": {"sha": run["tested_sha"], "evidence": evidence}}
+        return
+
     run["provenance_version"] = 1
     run["run_attempt"] = run.get("run_attempt", 1)
     stages = {}
@@ -402,7 +532,8 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get, download
             for run in page["workflow_runs"]:
                 old = runs.get(run["id"])
                 same_attempt = old and old.get("run_attempt", 1) == run.get("run_attempt", 1)
-                comparison = wf in ("gpu-tests.yml", rules.FAST_WF) and run["event"] == "pull_request"
+                comparison = (wf == rules.FAST_WF and run["event"] == "pull_request") or (
+                    wf == "gpu-tests.yml" and run["event"] in ("pull_request", "workflow_run"))
                 if old and old["status"] == "completed" and old["jobs"] is not None:
                     if not comparison and (wf != sanitizer.WORKFLOW or same_attempt):
                         continue
@@ -431,7 +562,8 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get, download
     todo = sorted(
         (r for r in runs.values()
          if (r["status"] == "completed" and (r["jobs"] is None or r["id"] in enrich or r["id"] in sanitizer_retry)) or (
-             r["wf"] == rules.FAST_WF and r["event"] == "pull_request" and r["status"] != "completed")),
+             r["wf"] == rules.FAST_WF and r["event"] == "pull_request" and r["status"] != "completed") or (
+                 r["wf"] == "gpu-tests.yml" and r["event"] == "workflow_run" and r["status"] != "completed")),
         key=lambda r: r["created_at"])
     unfetched = []
     for i, r in enumerate(todo):
@@ -442,8 +574,9 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get, download
         if legacy or (r["id"] in sanitizer_retry and r.get("jobs") is not None):
             jobs = r["jobs"]
         else:
-            rerun = r["wf"] in ("gpu-tests.yml", rules.FAST_WF) and r["event"] == "pull_request" and r.get(
-                "run_attempt", 1) > 1
+            rerun = ((r["wf"] == rules.FAST_WF and r["event"] == "pull_request") or
+                     (r["wf"] == "gpu-tests.yml" and r["event"] in ("pull_request", "workflow_run"))) and r.get(
+                         "run_attempt", 1) > 1
             jobs = _jobs(
                 api(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=100&filter={'all' if rerun else 'latest'}"))
             if rerun:
@@ -456,6 +589,10 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get, download
                 jobs = list(latest.values())
         # Failures, selection and revision evidence can need the same log: fetch it once.
         log = functools.lru_cache(maxsize=None)(text)
+        if r["wf"] == "gpu-tests.yml" and r["event"] == "workflow_run":
+            identity = _followup_identity(jobs, log, api)
+            if identity:
+                r.update(identity)
         if legacy:
             # Keep the full-only PR view's existing normalized failures unchanged.
             evidence_jobs = copy.deepcopy(jobs)
@@ -475,7 +612,8 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get, download
                 r["select"] = _selection(jobs, log)
         if r["wf"] == rules.FAST_WF and r["event"] == "pull_request":
             r["full_select"] = _selection([job for job in jobs if job["name"].startswith("full / ")], log)
-        if r["wf"] in ("gpu-tests.yml", rules.FAST_WF) and r["event"] == "pull_request":
+        if ((r["wf"] == rules.FAST_WF and r["event"] == "pull_request")
+                or (r["wf"] == "gpu-tests.yml" and r["event"] in ("pull_request", "workflow_run"))):
             _tested_revision(r, jobs, log)
         if r["wf"] == sanitizer.WORKFLOW:
             try:

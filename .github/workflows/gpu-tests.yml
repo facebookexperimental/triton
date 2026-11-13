@@ -1,28 +1,18 @@
 name: Meta Triton GPU Tests
+# A pull request's GPU full tests start when its Fast correctness run succeeds (workflow_run) and test that run's
+# head wheel. This workflow then runs on the default branch: the PR's test merge commit, wheel and selection come
+# from _fast-followup.yml's verification, and the jobs that run PR code get read-only tokens.
+run-name: >-
+  ${{ github.event_name == 'workflow_run' && format('GPU tests for Fast run {0} attempt {1} (PR head {2})',
+  github.event.workflow_run.id, github.event.workflow_run.run_attempt, github.event.workflow_run.head_sha) || '' }}
 
 on:
   push:
     # Meta LLVM bump branches: the updater turns this run into the bump's issue.
     branches: [main, 'scratch/meta-llvm-bump/main']
-  workflow_call:
-    inputs:
-      commit:
-        description: Exact source commit of the already verified fast wheel
-        required: false
-        default: ''
-        type: string
-      wheel_url:
-        required: false
-        default: ''
-        type: string
-      wheel_filename:
-        required: false
-        default: ''
-        type: string
-      wheel_sha256:
-        required: false
-        default: ''
-        type: string
+  workflow_run:
+    workflows: [Fast Triton correctness]
+    types: [completed]
   schedule:
     - cron: '0 */6 * * *'
   workflow_dispatch:
@@ -33,12 +23,24 @@ permissions:
 # Only superseded PRs cancel. Independent pushes and scheduled runs can test
 # concurrently, including runs that reuse the same cached wheel.
 concurrency:
-  group: gpu-tests-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: >-
+    gpu-tests-${{ github.event_name }}-${{ github.event.workflow_run && format('{0}:{1}',
+    github.event.workflow_run.head_repository.full_name, github.event.workflow_run.head_branch) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_run' }}
 
 jobs:
+  followup:
+    if: github.event_name == 'workflow_run'
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_fast-followup.yml
+
   select:
-    if: github.repository_owner == 'facebookexperimental'
+    needs: followup
+    if: >-
+      ${{ !cancelled() && github.repository_owner == 'facebookexperimental' &&
+      (github.event_name != 'workflow_run' || needs.followup.outputs.status == 'ok') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -59,26 +61,66 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Checkout the PR's test merge commit
+        # Selection runs this (default-branch) checkout's rules over the verified source, as a PR run would.
+        if: github.event_name == 'workflow_run'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.followup.outputs.merge }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
       - name: Select test work
         id: select
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/gpu_test_selection.py
+          EVENT_NAME: ${{ github.event_name }}
+          BASE: ${{ needs.followup.outputs.base }}
+          PR_HEAD: ${{ needs.followup.outputs.pr_head }}
+          BASE_REF: ${{ needs.followup.outputs.base_ref }}
+          HEAD_REF: ${{ needs.followup.outputs.head_ref }}
+          HEAD_REPO: ${{ needs.followup.outputs.head_repo }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" != workflow_run ]]; then
+            exec python3 .github/scripts/gpu_test_selection.py
+          fi
+          python3 - "${RUNNER_TEMP}/pr-event.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          e = os.environ
+          event = {"pull_request": {
+              "base": {"sha": e["BASE"], "ref": e["BASE_REF"], "repo": {"full_name": e["GITHUB_REPOSITORY"]}},
+              "head": {"sha": e["PR_HEAD"], "ref": e["HEAD_REF"], "repo": {"full_name": e["HEAD_REPO"]}},
+          }}
+          with open(sys.argv[1], "w") as f:
+              json.dump(event, f)
+          PY
+          cd source
+          GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="${RUNNER_TEMP}/pr-event.json" \
+            python3 ../.github/scripts/gpu_test_selection.py --repo .
       - name: Validate shared wheel source
-        if: github.event_name == 'pull_request' && steps.select.outputs.build == 'true'
+        if: github.event_name == 'workflow_run' && steps.select.outputs.build == 'true'
         env:
-          COMMIT: ${{ inputs.commit }}
+          WHEEL: ${{ needs.followup.outputs.wheel }}
+          REASON: ${{ needs.followup.outputs.wheel_reason }}
           EXPECTED: ${{ steps.select.outputs.sha }}
-          WHEEL_URL: ${{ inputs.wheel_url }}
-          WHEEL_FILENAME: ${{ inputs.wheel_filename }}
-          WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
-          IS_FORK_PR: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+          IS_FORK_PR: ${{ needs.followup.outputs.fork }}
         run: |
           python3 - <<'PY'
+          import json
           import os
           import re
           from urllib.parse import urlparse
           e = os.environ
+          if not e['WHEEL']:
+              raise SystemExit(f"Full tests require Fast correctness's head wheel: {e['REASON']}")
+          wheel = json.loads(e['WHEEL'])
+          e = {**e, 'COMMIT': wheel['identity']['sha'], 'WHEEL_URL': wheel['url'], 'WHEEL_FILENAME': wheel['filename'],
+               'WHEEL_SHA256': wheel['sha256']}
           if e['COMMIT'] != e['EXPECTED'] or not re.fullmatch(r'[0-9a-f]{40}', e['COMMIT']):
               raise SystemExit('Full tests require the exact fast wheel source')
           if not e['WHEEL_FILENAME'].endswith('.whl') or not re.fullmatch(r'[0-9a-f]{64}', e['WHEEL_SHA256']):
@@ -89,7 +131,7 @@ jobs:
 
   build:
     needs: select
-    if: github.event_name != 'pull_request' && needs.select.outputs.build == 'true'
+    if: github.event_name != 'workflow_run' && needs.select.outputs.build == 'true'
     permissions:
       contents: read
       id-token: write
@@ -98,57 +140,57 @@ jobs:
       ref: ${{ needs.select.outputs.sha }}
 
   h100:
-    needs: [select, build]
-    if: ${{ !cancelled() && needs.select.result == 'success' && (github.event_name == 'pull_request' || needs.build.result == 'success') && needs.select.outputs.h100 == 'true' }}
+    needs: [followup, select, build]
+    if: ${{ !cancelled() && needs.select.result == 'success' && (github.event_name == 'workflow_run' || needs.build.result == 'success') && needs.select.outputs.h100 == 'true' }}
+    # Test jobs run the PR's code with read-only tokens; only the trusted issue reporters write.
     permissions:
       contents: read
       actions: read
-      id-token: write
       issues: write
     uses: ./.github/workflows/h100.yml
     with:
       plan: ${{ needs.select.outputs.h100_plan }}
       ref: ${{ needs.select.outputs.sha }}
-      wheel_url: ${{ inputs.wheel_url || needs.build.outputs.wheel_url }}
-      wheel_filename: ${{ inputs.wheel_filename || needs.build.outputs.wheel_filename }}
-      wheel_sha256: ${{ inputs.wheel_sha256 || needs.build.outputs.wheel_sha256 }}
+      wheel_url: ${{ fromJSON(needs.followup.outputs.wheel || '{}').url || needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ fromJSON(needs.followup.outputs.wheel || '{}').filename || needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ fromJSON(needs.followup.outputs.wheel || '{}').sha256 || needs.build.outputs.wheel_sha256 }}
 
   b200:
-    needs: [select, build]
-    if: ${{ !cancelled() && needs.select.result == 'success' && (github.event_name == 'pull_request' || needs.build.result == 'success') && needs.select.outputs.b200 == 'true' }}
+    needs: [followup, select, build]
+    if: ${{ !cancelled() && needs.select.result == 'success' && (github.event_name == 'workflow_run' || needs.build.result == 'success') && needs.select.outputs.b200 == 'true' }}
+    # Test jobs run the PR's code with read-only tokens; only the trusted issue reporters write.
     permissions:
       contents: read
       actions: read
-      id-token: write
       issues: write
     uses: ./.github/workflows/b200.yml
     with:
       plan: ${{ needs.select.outputs.b200_plan }}
       ref: ${{ needs.select.outputs.sha }}
-      wheel_url: ${{ inputs.wheel_url || needs.build.outputs.wheel_url }}
-      wheel_filename: ${{ inputs.wheel_filename || needs.build.outputs.wheel_filename }}
-      wheel_sha256: ${{ inputs.wheel_sha256 || needs.build.outputs.wheel_sha256 }}
+      wheel_url: ${{ fromJSON(needs.followup.outputs.wheel || '{}').url || needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ fromJSON(needs.followup.outputs.wheel || '{}').filename || needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ fromJSON(needs.followup.outputs.wheel || '{}').sha256 || needs.build.outputs.wheel_sha256 }}
 
   mi350:
-    needs: [select, build]
-    if: ${{ !cancelled() && needs.select.result == 'success' && (github.event_name == 'pull_request' || needs.build.result == 'success') && needs.select.outputs.mi350 == 'true' }}
+    needs: [followup, select, build]
+    if: ${{ !cancelled() && needs.select.result == 'success' && (github.event_name == 'workflow_run' || needs.build.result == 'success') && needs.select.outputs.mi350 == 'true' }}
+    # Test jobs run the PR's code with read-only tokens; only the trusted issue reporters write.
     permissions:
       contents: read
       actions: read
-      id-token: write
       issues: write
     uses: ./.github/workflows/mi350.yml
     with:
       plan: ${{ needs.select.outputs.mi350_plan }}
       ref: ${{ needs.select.outputs.sha }}
-      wheel_url: ${{ inputs.wheel_url || needs.build.outputs.wheel_url }}
-      wheel_filename: ${{ inputs.wheel_filename || needs.build.outputs.wheel_filename }}
-      wheel_sha256: ${{ inputs.wheel_sha256 || needs.build.outputs.wheel_sha256 }}
+      wheel_url: ${{ fromJSON(needs.followup.outputs.wheel || '{}').url || needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ fromJSON(needs.followup.outputs.wheel || '{}').filename || needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ fromJSON(needs.followup.outputs.wheel || '{}').sha256 || needs.build.outputs.wheel_sha256 }}
 
   cpu-tests:
     name: Compiler tests on CPU
-    needs: [select, build]
-    if: ${{ !cancelled() && needs.select.result == 'success' && (github.event_name == 'pull_request' || needs.build.result == 'success') && needs.select.outputs.cpu == 'true' }}
+    needs: [followup, select, build]
+    if: ${{ !cancelled() && needs.select.result == 'success' && (github.event_name == 'workflow_run' || needs.build.result == 'success') && needs.select.outputs.cpu == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
@@ -158,7 +200,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.select.outputs.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -175,9 +218,9 @@ jobs:
       - name: Install prebuilt Triton
         uses: ./.github/actions/install-prebuilt-triton
         with:
-          wheel-url: ${{ inputs.wheel_url || needs.build.outputs.wheel_url }}
-          wheel-filename: ${{ inputs.wheel_filename || needs.build.outputs.wheel_filename }}
-          wheel-sha256: ${{ inputs.wheel_sha256 || needs.build.outputs.wheel_sha256 }}
+          wheel-url: ${{ fromJSON(needs.followup.outputs.wheel || '{}').url || needs.build.outputs.wheel_url }}
+          wheel-filename: ${{ fromJSON(needs.followup.outputs.wheel || '{}').filename || needs.build.outputs.wheel_filename }}
+          wheel-sha256: ${{ fromJSON(needs.followup.outputs.wheel || '{}').sha256 || needs.build.outputs.wheel_sha256 }}
       - name: Run codegen tests
         id: run_codegen_tests
         if: fromJSON(needs.select.outputs.cpu_plan).codegen.files[0] != null
@@ -228,8 +271,12 @@ jobs:
 
   gpu-tests:
     name: GPU tests
-    needs: [select, build, h100, b200, mi350, cpu-tests]
-    if: always() && github.repository_owner == 'facebookexperimental'
+    needs: [followup, select, build, h100, b200, mi350, cpu-tests]
+    # A follow-up of a superseded head (stale) or of a Fast run that published no manifest (an older generation that
+    # runs full tests itself) tests nothing and reports no aggregate; a failed verification fails it.
+    if: >-
+      ${{ always() && github.repository_owner == 'facebookexperimental' &&
+      (github.event_name != 'workflow_run' || needs.followup.result == 'failure' || needs.followup.outputs.status == 'ok') }}
     runs-on: ubuntu-latest
     steps:
       - name: Require selected suites and their build to succeed
@@ -242,10 +289,13 @@ jobs:
           import os
 
           needs = json.loads(os.environ["NEEDS"])
+          if os.environ["EVENT_NAME"] == "workflow_run" and needs["followup"]["result"] != "success":
+              raise SystemExit("The Fast correctness producer could not be verified")
           if needs["select"]["result"] != "success":
               raise SystemExit("GPU platform selection did not succeed")
           for job in ("build", "h100", "b200", "mi350", "cpu-tests"):
-              if job == "build" and os.environ["EVENT_NAME"] == "pull_request":
+              # Follow-ups test Fast correctness's verified wheel and never build.
+              if job == "build" and os.environ["EVENT_NAME"] == "workflow_run":
                   continue
               selected = needs["select"]["outputs"]["cpu" if job == "cpu-tests" else job] == "true"
               if selected and needs[job]["result"] != "success":

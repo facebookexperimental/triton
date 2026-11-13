@@ -30,6 +30,13 @@ on:
         type: boolean
         required: false
         default: false
+      read_only_cache:
+        description: >-
+          Build like a fork's PR: no AWS credentials, a read-only wheel cache lookup, and the wheel handed over as a
+          GitHub artifact. For callers whose triggering event does not reveal that the work came from a fork.
+        type: boolean
+        required: false
+        default: false
     outputs:
       commit:
         description: Resolved Git commit used to build the wheel
@@ -70,8 +77,8 @@ jobs:
       TRITON_BUILD_WITH_CLANG_LLD: "1"
       TRITON_WHEEL_NAME: fbtriton
       LDFLAGS: -Wl,--strip-all
-      IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-      WHEEL_CACHE_ENABLED: ${{ !inputs.skip_cache_save && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      IS_FORK_PR: ${{ inputs.read_only_cache || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
+      WHEEL_CACHE_ENABLED: ${{ !inputs.skip_cache_save && !inputs.read_only_cache && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
       TRITON_BUILD_REPOSITORY: ${{ inputs.repository || github.repository }}
     steps:
       - name: Checkout build tooling

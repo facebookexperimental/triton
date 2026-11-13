@@ -24,8 +24,6 @@ jobs:
       b200_plan: ${{ steps.select.outputs.b200_plan }}
       mi350_plan: ${{ steps.select.outputs.mi350_plan }}
       cpu_plan: ${{ steps.select.outputs.cpu_plan }}
-      codegen: ${{ steps.codegen.outputs.codegen }}
-      codegen_base: ${{ steps.codegen.outputs.codegen_base }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -34,16 +32,6 @@ jobs:
       - name: Select affected fast suites
         id: select
         run: python3 .github/scripts/fast_tests.py select
-      - name: Select the TLX codegen trace
-        # Advisory: a failure here skips the trace, never the fast suites.
-        if: github.event_name == 'pull_request'
-        id: codegen
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          base=$(git rev-parse HEAD^1)
-          trace=$(python3 .github/scripts/codegen_trace.py "${base}" HEAD)
-          printf 'codegen=%s\ncodegen_base=%s\n' "${trace}" "${base}" >> "${GITHUB_OUTPUT}"
 
   build:
     needs: select
@@ -54,32 +42,6 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       ref: ${{ github.sha }}
-
-  codegen-base:
-    # The TLX codegen trace compares the head wheel above with this one, built alongside it.
-    needs: select
-    if: needs.select.outputs.build == 'true' && needs.select.outputs.codegen == 'true'
-    permissions:
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/build.yml
-    with:
-      ref: ${{ needs.select.outputs.codegen_base }}
-      build_id: codegen-base
-
-  codegen:
-    name: TLX codegen trace
-    # Advisory and outside the Fast correctness check. Wheels the trace cannot reuse are built there.
-    needs: [select, build, codegen-base]
-    if: ${{ !cancelled() && needs.select.outputs.codegen == 'true' }}
-    permissions:
-      contents: read
-      id-token: write
-      pull-requests: write
-    uses: ./.github/workflows/tlx-codegen-trace.yml
-    with:
-      head_wheel: ${{ needs.build.outputs.wheel }}
-      base_wheel: ${{ needs.codegen-base.outputs.wheel }}
 
   h100:
     needs: [select, build]
@@ -195,18 +157,20 @@ jobs:
       - name: Verify touched-test coverage across platforms
         if: needs.select.outputs.build == 'true'
         run: python3 .github/scripts/fast_tests.py verify --evidence "${RUNNER_TEMP}/fast-evidence"
-
-  full:
-    needs: [build, result]
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.result.result == 'success' }}
-    permissions:
-      contents: read
-      actions: read
-      id-token: write
-      issues: write
-    uses: ./.github/workflows/gpu-tests.yml
-    with:
-      commit: ${{ needs.build.outputs.commit }}
-      wheel_url: ${{ needs.build.outputs.wheel_url }}
-      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
-      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      # GPU full tests and the TLX codegen trace are separate workflows that start when this run succeeds
+      # (workflow_run). They take this run's head wheel through this manifest and verify it; see fast_followup.py.
+      - name: Write the follow-up manifest
+        if: github.event_name == 'pull_request'
+        id: followup
+        env:
+          WHEEL: ${{ needs.build.outputs.wheel }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/fast_followup.py manifest --out "${RUNNER_TEMP}/followup/fast-followup.json"
+      - name: Upload the follow-up manifest
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.followup.outputs.name }}
+          path: ${{ runner.temp }}/followup/fast-followup.json
+          if-no-files-found: error
