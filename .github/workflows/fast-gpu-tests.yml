@@ -1,6 +1,9 @@
-name: Fast Triton correctness
+# EXPERIMENTAL (branch experiment/tlx-listeners-no-b200 only; never lands): Fast correctness with the B200 worker
+# excluded while B200 runners are offline. Manual dispatch only, under a different name, so it is no PR gate and
+# no Fast follow-up listener can match it. H100, MI350 and CPU stay required.
+name: Experimental Fast correctness (B200 excluded)
+run-name: Experimental Fast correctness (B200 excluded) on ${{ github.ref_name }}
 on:
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -17,11 +20,11 @@ jobs:
     outputs:
       build: ${{ steps.select.outputs.build }}
       h100: ${{ steps.select.outputs.h100 }}
-      b200: ${{ steps.select.outputs.b200 }}
+      b200: ${{ steps.exclude.outputs.b200 }}
       mi350: ${{ steps.select.outputs.mi350 }}
       cpu: ${{ steps.select.outputs.cpu }}
       h100_plan: ${{ steps.select.outputs.h100_plan }}
-      b200_plan: ${{ steps.select.outputs.b200_plan }}
+      b200_plan: ${{ steps.exclude.outputs.b200_plan }}
       mi350_plan: ${{ steps.select.outputs.mi350_plan }}
       cpu_plan: ${{ steps.select.outputs.cpu_plan }}
     steps:
@@ -32,6 +35,25 @@ jobs:
       - name: Select affected fast suites
         id: select
         run: python3 .github/scripts/fast_tests.py select
+      - name: Exclude B200 (experimental)
+        id: exclude
+        env:
+          SELECTED: ${{ steps.select.outputs.b200 }}
+          PLAN: ${{ steps.select.outputs.b200_plan }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          plan = json.loads(os.environ["PLAN"])
+          excluded = {key: [] for key in plan} | {"excluded": "B200 runners are offline; experimental run only"}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"b200=false\nb200_plan={json.dumps(excluded, separators=(',', ':'))}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"## B200 excluded (experimental)\n\nSelection wanted B200: {os.environ['SELECTED']}. "
+                            f"Its {len(plan.get('baseline', []))} baseline targets and {len(plan.get('touched', []))} "
+                            "touched groups were not run. This is not full fast coverage.\n")
+          PY
 
   build:
     needs: select
@@ -121,7 +143,7 @@ jobs:
           if-no-files-found: ignore
 
   result:
-    name: Fast correctness
+    name: Experimental fast correctness (B200 excluded)
     needs: [select, build, h100, b200, mi350, cpu]
     if: always() && github.repository_owner == 'facebookexperimental'
     runs-on: ubuntu-latest
@@ -157,18 +179,16 @@ jobs:
       - name: Verify touched-test coverage across platforms
         if: needs.select.outputs.build == 'true'
         run: python3 .github/scripts/fast_tests.py verify --evidence "${RUNNER_TEMP}/fast-evidence"
-      # GPU full tests and the TLX codegen trace are separate workflows that start when this run succeeds
-      # (workflow_run). They take this run's head wheel through this manifest and verify it; see fast_followup.py.
+      # Exercises the production manifest writer on this manual run. Follow-ups accept only a pull_request Fast
+      # correctness producer with a real PR, so they reject this manifest (PR 0, this branch's commit).
       - name: Write the follow-up manifest
-        if: github.event_name == 'pull_request'
         id: followup
         env:
           WHEEL: ${{ needs.build.outputs.wheel }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: '0'
+          PR_HEAD_SHA: ${{ github.sha }}
         run: python3 .github/scripts/fast_followup.py manifest --out "${RUNNER_TEMP}/followup/fast-followup.json"
       - name: Upload the follow-up manifest
-        if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.followup.outputs.name }}

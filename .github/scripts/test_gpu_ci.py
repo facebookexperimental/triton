@@ -864,7 +864,9 @@ def test_full_tests_follow_only_a_verified_current_fast_run():
     assert calls.count('./.github/workflows/build.yml') == 1
     assert not {'./.github/workflows/gpu-tests.yml', './.github/workflows/tlx-codegen-trace.yml'} & set(calls)
     for listener in (full, trace):
-        assert listener['on']['workflow_run'] == {'workflows': [fast['name']], 'types': ['completed']}
+        # EXPERIMENTAL branch: listeners keep the production producer name, which this branch's renamed Fast avoids.
+        assert listener['on']['workflow_run'] == {'workflows': ['Fast Triton correctness'], 'types': ['completed']}
+        assert fast['name'] != 'Fast Triton correctness'
     produced = {'github.event.workflow_run.conclusion': 'success', 'github.event.workflow_run.event': 'pull_request'}
     assert workflow_condition(followup['jobs']['verify']['if'], produced)
     for change in ({'github.event.workflow_run.conclusion':
@@ -922,9 +924,87 @@ def test_shared_full_wheel_validates_source_and_fork_artifact_identity(fork, url
                                   {'github.event_name': 'workflow_run', 'steps.select.outputs.build': 'false'})
 
 
-def test_fast_automatic_runs_are_pr_only():
+def test_experimental_fast_is_manual_only_and_excludes_only_b200(tmp_path):
+    # EXPERIMENTAL branch: B200 runners are offline, so this branch's Fast correctness is a manually dispatched,
+    # visibly renamed run that skips only the B200 worker. It can never act as the PR gate or trigger the follow-up
+    # listeners, and H100, MI350 and CPU stay selected and required as before.
+    import os
+    import sys
     workflow = yaml.load((ROOT / ".github/workflows/fast-gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
-    assert set(workflow["on"]) == {"pull_request", "workflow_dispatch"}
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    assert "Experimental" in workflow["name"] and "B200 excluded" in workflow["name"]
+    assert workflow["jobs"]["result"]["name"] != "Fast correctness"
+    select = workflow["jobs"]["select"]
+    for platform in ("h100", "mi350", "cpu"):
+        assert select["outputs"][platform] == "${{ steps.select.outputs." + platform + " }}"
+        assert select["outputs"][f"{platform}_plan"] == "${{ steps.select.outputs." + platform + "_plan }}"
+    step = next(s for s in select["steps"] if s.get("id") == "exclude")
+    source = step["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    plan = {
+        "baseline": ["python/test/unit/tlx_ops/test_mm.py"], "touched": [{"file": "t.py", "k": ""}], "unmapped": [],
+        "limited": []
+    }
+    output, summary = tmp_path / "output", tmp_path / "summary"
+    env = os.environ | {
+        "SELECTED": "true", "PLAN": json.dumps(plan), "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary)
+    }
+    subprocess.run([sys.executable, "-c", source], env=env, check=True)
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert outputs["b200"] == "false"
+    excluded = json.loads(outputs["b200_plan"])
+    assert not excluded["baseline"] and not excluded["touched"] and excluded["excluded"]
+    assert select["outputs"]["b200"] == "${{ steps.exclude.outputs.b200 }}"
+    assert select["outputs"]["b200_plan"] == "${{ steps.exclude.outputs.b200_plan }}"
+    assert "not full fast coverage" in summary.read_text()
+    # Excluded B200 is not required; selected H100 still is.
+    gate = workflow["jobs"]["result"]["steps"][0]["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    needs = {
+        "select": {
+            "result": "success", "outputs":
+            {"build": "true", "h100": "true", "b200": "false", "mi350": "false", "cpu": "false"}
+        }, "build": {"result": "success"}, "h100": {"result": "success"}, "b200": {"result": "skipped"}, "mi350":
+        {"result": "skipped"}, "cpu": {"result": "skipped"}
+    }
+    run = lambda n: subprocess.run([sys.executable, "-c", gate], env=os.environ | {
+        "NEEDS": json.dumps(n), "GITHUB_STEP_SUMMARY": str(summary)
+    }, capture_output=True).returncode
+    assert run(needs) == 0
+    assert run(needs | {"h100": {"result": "failure"}}) != 0
+
+
+def test_followups_reject_the_experimental_manual_producer(tmp_path):
+    # EXPERIMENTAL branch: the manual run writes a manifest with the production writer, and follow-ups must reject
+    # it, since it names no PR and was not a pull_request run. Realistic break: accepting workflow_dispatch producers.
+    from fast_followup import FAST_WORKFLOW, Rejected, manifest, verify
+    env = {
+        "GITHUB_REPOSITORY": "o/r", "GITHUB_RUN_ID": "9", "GITHUB_RUN_ATTEMPT": "1", "PR_NUMBER": "0", "PR_HEAD_SHA":
+        "a" * 40, "GITHUB_SHA": "a" * 40, "WHEEL": ""
+    }
+    written = manifest(env)
+    run = {
+        "id": 9, "run_attempt": 1, "event": "workflow_dispatch", "conclusion": "success", "status": "completed", "path":
+        FAST_WORKFLOW, "repository": {"full_name": "o/r"}, "head_sha": "a" * 40, "head_branch":
+        "experiment/tlx-listeners-no-b200", "head_repository": {"full_name": "o/r", "owner": {"login": "o"}}
+    }
+    pr = {
+        "number": 5, "merge_commit_sha": "b" * 40, "head":
+        {"sha": "a" * 40, "ref": run["head_branch"], "repo":
+         {"full_name": "o/r"}}, "base": {"ref": "main", "repo": {"full_name": "o/r"}}
+    }
+
+    def api(path):
+        return pr if "/pulls/" in path else run
+
+    # Even a manual run whose manifest names a real PR with this head is not a Fast correctness PR producer.
+    for manifest_pr in (written, manifest(env | {"PR_NUMBER": "5", "GITHUB_SHA": "b" * 40})):
+        with pytest.raises(Rejected, match="not a successful pull_request run"):
+            verify({"workflow_run": run}, manifest_pr, "o/r", api, lambda *a: "", lambda sha: None)
+
+
+def test_fast_automatic_runs_are_pr_only():
+    # EXPERIMENTAL branch: Fast correctness here is manual only (see above); production keeps pull_request.
+    workflow = yaml.load((ROOT / ".github/workflows/fast-gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
+    assert set(workflow["on"]) == {"workflow_dispatch"}
 
 
 @pytest.mark.parametrize("paths,expected", [
