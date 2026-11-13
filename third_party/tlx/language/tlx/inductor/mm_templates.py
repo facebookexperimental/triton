@@ -237,12 +237,14 @@ def append_tlx(templates, op_name, kernel_inputs):
 
 def _append_tlx_hopper(templates, op_name):
     if op_name == "addmm":
-        # tuned_addmm issues several get_template_configs calls; only the unified
-        # one (with the stock mm_template) passes the bias expanded to [M, N],
-        # which the template epilogue indexes in 2-D.
-        from torch._inductor.kernel.mm import mm_template
+        # tuned_addmm issues several get_template_configs calls: join the unified one
+        # (with the stock mm_template) or, without max_autotune, the ATen-only one.
+        # tlx_kernel_inputs expands the latter's bias to the [M, N] the epilogue indexes.
+        from torch._inductor.kernel.mm import aten_addmm, mm_template
 
-        if mm_template.uid not in {getattr(t, "uid", None) for t in templates}:
+        uids = {getattr(t, "uid", None) for t in templates}
+        default_set = not (inductor_config.max_autotune or inductor_config.max_autotune_gemm) and aten_addmm.uid in uids
+        if mm_template.uid not in uids and not default_set:
             return templates
     elif op_name != "mm":
         return templates
@@ -311,8 +313,10 @@ def _append_tlx_amd(templates, op_name):
 
 
 def tlx_kernel_inputs(template, kernel_inputs, op_name):
-    """Expand default addmm bias inputs for the AMD TLX addmm template epilogues."""
+    """Expand default addmm bias inputs for the TLX addmm template epilogues."""
     if op_name != "addmm" or template not in (
+            hopper_gemm_ws_template,
+            hopper_gemm_small_k_template,
             gfx942_addmm_template,
             gfx950_addmm_interwave_template,
             gfx950_addmm_warppipe_template,
