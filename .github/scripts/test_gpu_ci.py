@@ -1124,14 +1124,15 @@ class TestNested:
     assert result.returncode == 0, result.stdout + result.stderr
     assert manifest["baseline"] == ["test_sample.py::test_baseline[0]", "test_sample.py::test_baseline[1]"]
     assert manifest["selected"] == [
-        *manifest["baseline"], "test_sample.py::test_touched[1]", "test_sample.py::TestNested::test_expected[1]"
+        *manifest["baseline"], "test_sample.py::test_touched[1]", "test_sample.py::test_touched[2]",
+        "test_sample.py::TestNested::test_expected[1]"
     ]
     assert len(manifest["exclusions"]) == 2
     summary = (tmp_path / "summary.md").read_text()
     assert "test_sample.py::test_baseline[0] | both | pass |" in summary
     assert "test_sample.py::test_touched[0] | touched | skipped |" in summary
     assert "test_sample.py::test_touched[1] | touched | pass |" in summary
-    assert "test_sample.py::test_touched[2] | touched | not executed |" in summary
+    assert "test_sample.py::test_touched[2] | touched | pass |" in summary
     assert "JUnit seconds" in summary
     verify_manifests([manifest])
 
@@ -1159,6 +1160,36 @@ def test_touched():
             broken["selected"].remove(broken["functions"][function]["passed"])
         with pytest.raises(ValueError):
             verify_manifests([broken, passing_platform])
+
+
+def test_fast_failure_in_a_later_parameter_value_blocks(tmp_path):
+    result, manifest = fast_fixture_run(
+        tmp_path, '''import pytest
+def test_baseline():
+    assert True
+@pytest.mark.parametrize("n", [1024, 2048])
+@pytest.mark.parametrize("causal", [False, True])
+def test_touched(causal, n):
+    assert not causal
+''')
+    assert result.returncode != 0
+    assert manifest["functions"]["test_sample.py::test_touched"]["status"] == "failed"
+    assert manifest["selected"] == ["test_sample.py::test_baseline", "test_sample.py::test_touched[False-1024]"]
+
+
+def test_fast_sampling_limit_leaves_uncovered_values_visible(tmp_path):
+    from fast_tests import verify_manifests
+    result, manifest = fast_fixture_run(
+        tmp_path, '''import pytest
+def test_baseline():
+    assert True
+@pytest.mark.parametrize("value", [*range(32), pytest.param(10**10000, id="overflowing-integer")])
+def test_touched(value):
+    assert True
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert manifest["functions"]["test_sample.py::test_touched"]["status"] == "limit_reached"
+    assert [gap["target"] for gap in verify_manifests([manifest])] == ["test_sample.py::test_touched"]
 
 
 def test_fast_failure_cannot_be_replaced_by_a_passing_parameter(tmp_path):
