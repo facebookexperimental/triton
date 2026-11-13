@@ -169,9 +169,18 @@ hopper_gemm_ws_template = TritonTemplate(
 
 # tlx.ops.mm's small-K kernel: one tile per CTA, software-pipelined tl.dot. With
 # only a few K steps the WS kernel's fixed cost dominates.
+@SymbolicGridFn
+def _small_k_grid(m, n, meta, *, cdiv, min):
+    """One program per tile, or ``NUM_PROGS`` persistent programs when set."""
+    tiles = cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"])
+    if meta.get("NUM_PROGS", 0):
+        return (min(meta["NUM_PROGS"], tiles), 1, 1)
+    return (tiles, 1, 1)
+
+
 hopper_gemm_small_k_template = TritonTemplate(
     name="tlx_hopper_gemm_small_k",
-    grid=_mm_grid_split_k,
+    grid=_small_k_grid,
     source=load_tlx_template("hopper_gemm_small_k"),
 )
 

@@ -1013,6 +1013,18 @@ def _host_tma_operands(kernel_inputs) -> dict[str, bool]:
     return {"HOST_SIDE_TMA": a_host or b_host, "HOST_TMA_A": a_host, "HOST_TMA_B": b_host}
 
 
+# Streaming small-K GEMMs (K <= 128, >= 16 waves) always take the persistent small-K tile: mm-only
+# autotune cannot see that a fused epilogue makes the WS kernel up to 2.6x slower on them.
+_PERSISTENT_SMALL_K = {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128, "num_warps": 4, "num_stages": 2}
+
+
+def _streaming_small_k(m, n, k):
+    from triton.tlx.ops.kernels.mm import sm90
+
+    tiles = sm90._mn_tiles(m, n, _PERSISTENT_SMALL_K["BLOCK_M"], _PERSISTENT_SMALL_K["BLOCK_N"])
+    return k <= _PERSISTENT_SMALL_K["BLOCK_K"] and tiles >= 16 * get_num_sms()
+
+
 @register_template_heuristic(
     hopper_gemm_ws_template.uid, "cuda", register=not IS_ROCM, op_name="mm"
 )
@@ -1045,6 +1057,8 @@ class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
         a_row_major = tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1
         b_row_major = tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 1
         allow = config.triton.tlx_mode == "allow"
+        if _streaming_small_k(m, n, k):
+            return
         if not allow and sm90._use_small_k(m, n, k, "heuristic"):
             # As tlx.ops.mm's heuristic, leave a few-K-step shape to the small-K
             # template: autotuning cannot tell few-microsecond kernels apart.
@@ -1135,6 +1149,19 @@ class HopperGemmSmallKConfigHeuristic(HopperGemmWSConfigHeuristic):
         m, n, k = kernel_inputs.mnk_hinted()
         if min(m, n, k) <= 0:
             return
+        strides = kernel_inputs.strides_hinted()
+        host_tma = _host_tma_operands(kernel_inputs)
+        if _streaming_small_k(m, n, k):
+            yield {
+                **_PERSISTENT_SMALL_K,
+                "NUM_PROGS": 2 * get_num_sms(),
+                "GROUP_SIZE_M": 8,
+                "A_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1,
+                "B_ROW_MAJOR": tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 1,
+                **host_tma,
+                "ACC_TYPE": "tl.float32",
+            }
+            return
         if config.triton.tlx_mode == "allow":
             if not sm90._small_k_candidate(m, n, k, "full"):
                 return
@@ -1143,8 +1170,6 @@ class HopperGemmSmallKConfigHeuristic(HopperGemmWSConfigHeuristic):
             if not sm90._use_small_k(m, n, k, "heuristic"):
                 return
             configs = sm90._small_k_heuristic_config(m, n, k)
-        strides = kernel_inputs.strides_hinted()
-        host_tma = _host_tma_operands(kernel_inputs)
         for conf in configs:
             meta = conf.kwargs
             if meta["SPLIT_K"] > 1:

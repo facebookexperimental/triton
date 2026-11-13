@@ -1447,6 +1447,39 @@ def is_gfx942():
     return current_target().is_gfx942
 
 
+def _mm_gelu_bwd_two_outputs(x, w, a):
+    # GELU backward with recompute: gelu(a) feeds a wgrad, mm * gelu'(a) the dgrad.
+    mm = torch.mm(x, w).float()
+    af = a.float()
+    cdf = 0.5 * (1 + torch.erf(af * 0.7071067811865476))
+    pdf = torch.exp(af * af * -0.5) * 0.3989422804014327
+    return (af * cdf).to(a.dtype), (mm * (cdf + af * pdf)).to(a.dtype)
+
+
+@unittest.skipIf(
+    not (has_tlx() and torch.cuda.is_available() and torch.version.hip is None
+         and torch.cuda.get_device_capability() == (9, 0)), "Need TLX on H100")
+@instantiate_parametrized_tests
+class TestSm90WsGemmMultiOutputEpilogue(TestCase):
+    """A TLX WS GEMM epilogue group with two live outputs must not drop one."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        torch._dynamo.reset()
+
+    @parametrize("m,k,n", [(16384, 128, 256), (4096, 4096, 1024)])
+    def test_both_outputs_written(self, m, k, n):
+        torch.manual_seed(0)
+        bf16 = {"device": GPU_TYPE, "dtype": torch.bfloat16}
+        args = (torch.randn((m, k), **bf16), torch.randn((k, n), **bf16) / k**0.5, torch.randn((m, n), **bf16))
+        expected = _mm_gelu_bwd_two_outputs(*args)
+        with config.patch({"triton.tlx_mode": "force", "force_disable_caches": True}):
+            actual, (code, ) = run_and_get_code(torch.compile(_mm_gelu_bwd_two_outputs, fullgraph=True), *args)
+        self.assertIn("tlx", code)
+        for a, e in zip(actual, expected, strict=True):
+            torch.testing.assert_close(a, e, atol=2e-2, rtol=2e-2)
+
+
 @instantiate_parametrized_tests
 class TestGfx942ReductionEpilogue(TestCase):
 
