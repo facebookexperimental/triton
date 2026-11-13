@@ -21,15 +21,18 @@ import torch
 import triton
 import triton.language as tl
 from triton._internal_testing import is_hip_gfx1250
-from triton.tlx.ops.kernels.grouped_gemm.gfx1250 import (  # noqa: F401
-    _GROUPED_GEMM_INTERFACE_CONFIG, _GROUPED_GEMM_INTERFACE_SCHEDULES, _XCD_REMAP_MODES, _active_num_cus, _cdiv_int,
-    _grouped_gemm_enable_wmma_queuing, _grouped_gemm_interface_config, _grouped_gemm_interface_launch_config,
-    _grouped_gemm_matrix_pointer, _grouped_gemm_tdm_impl, _grouped_tile_offsets, _make_grouped_gemm_args,
-    _make_grouped_gemm_tdm_list_args, _perf_fn, _remap_grouped_program_id, _require_grouped_gemm_gfx1250,
-    _tdm_accumulate_subtiles, _tdm_c_store_chunk, _tdm_issue_loads, _tdm_issue_loads_unpredicated, _tdm_load_fused,
-    _tdm_load_subtile, _tdm_prefetch_unpredicated, _tdm_wait_and_finish_k_block, _validate_grouped_gemm_cluster_config,
-    _validate_grouped_gemm_tdm_list_inputs, grouped_gemm, grouped_gemm_tdm_list_kernel,
+from triton.tlx.ops.kernels.grouped_gemm.gfx1250 import (
+    XCD_REMAP_MODES,
+    grouped_gemm_enable_wmma_queuing,
+    grouped_gemm_tdm_impl,
+    grouped_gemm_tdm_list_kernel,
+    make_grouped_gemm_tdm_list_args,
+    validate_grouped_gemm_cluster_config,
 )
+
+
+def _active_num_cus(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def _grouped_gemm_tflops(ms: float, m_list: list[int], n: int, k: int) -> float:
@@ -62,14 +65,14 @@ def _rank_grouped_gemm_configs(m_list: list[int], n: int, k: int, num_sms: int, 
         if k % bk != 0 or (not allow_mn_tails and (n % bn != 0 or any(m % bm != 0 for m in m_list))):
             continue
 
-        group_tiles = [_cdiv_int(m, bm) * _cdiv_int(n, bn) for m in m_list]
+        group_tiles = [triton.cdiv(m, bm) * triton.cdiv(n, bn) for m in m_list]
         total_tiles = sum(group_tiles)
         if total_tiles == 0:
             continue
         launch_programs = min(num_sms, total_tiles)
-        slots = _cdiv_int(total_tiles, num_sms) * num_sms
+        slots = triton.cdiv(total_tiles, num_sms) * num_sms
         utilization = total_tiles / slots
-        padded = sum(_cdiv_int(m, bm) * bm * _cdiv_int(n, bn) * bn * k for m in m_list)
+        padded = sum(triton.cdiv(m, bm) * bm * triton.cdiv(n, bn) * bn * k for m in m_list)
         padding_efficiency = useful / padded
 
         cross_tile_prefetch = bool(cfg["cross_tile_prefetch"])
@@ -303,7 +306,7 @@ def grouped_gemm_tdm_kernel(
     CLUSTER_MULTICAST: tl.constexpr = True,
 ):
     """Original packed entry point; the pointer-table path is compiled out."""
-    _grouped_gemm_tdm_impl(
+    grouped_gemm_tdm_impl(
         a_packed,
         b_t,
         c_packed,
@@ -383,7 +386,7 @@ def grouped_gemm_tdm(
     assert a_packed.dim() == 2 and b_t.dim() == 3
     assert a_packed.stride(1) == 1 and b_t.stride(2) == 1
     assert group_offsets.dtype == torch.int32
-    assert xcd_remap_mode in _XCD_REMAP_MODES
+    assert xcd_remap_mode in XCD_REMAP_MODES
     assert num_xcds >= 1 and xcd_chunk >= 1
     if cluster_size not in (1, 2, 4):
         raise ValueError("cluster_size must be 1, 2, or 4")
@@ -439,11 +442,11 @@ def grouped_gemm_tdm(
     num_programs = max(1, min(int(num_programs), total_tiles))
 
     if cluster_size > 1:
-        _validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=block_m, block_n=block_n,
-                                              block_k=block_k, group_m=group_m, tdm_pipeline_depth=tdm_pipeline_depth,
-                                              l2_prefetch_distance=l2_prefetch_distance, c_staging_mode=c_staging_mode,
-                                              cross_tile_prefetch=cross_tile_prefetch, auto_config=auto_config,
-                                              xcd_remap_mode=xcd_remap_mode, num_xcds=num_xcds, xcd_chunk=xcd_chunk)
+        validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=block_m, block_n=block_n, block_k=block_k,
+                                             group_m=group_m, tdm_pipeline_depth=tdm_pipeline_depth,
+                                             l2_prefetch_distance=l2_prefetch_distance, c_staging_mode=c_staging_mode,
+                                             cross_tile_prefetch=cross_tile_prefetch, auto_config=auto_config,
+                                             xcd_remap_mode=xcd_remap_mode, num_xcds=num_xcds, xcd_chunk=xcd_chunk)
 
     # The group count is known from B's shape. Specializing the square
     # cross-tile schedule removes unused boundary-refill state for small groups.
@@ -472,15 +475,15 @@ def grouped_gemm_tdm(
             L2_PREFETCH_DISTANCE=l2_prefetch_distance,
             C_STAGING_MODE=c_staging_mode,
             CROSS_TILE_PREFETCH=cross_tile_prefetch,
-            XCD_REMAP_MODE=_XCD_REMAP_MODES[xcd_remap_mode],
+            XCD_REMAP_MODE=XCD_REMAP_MODES[xcd_remap_mode],
             NUM_XCDS=num_xcds,
             XCD_CHUNK=xcd_chunk,
             CLUSTER_SIZE=cluster_size,
             CLUSTER_MULTICAST=cluster_multicast,
             num_warps=4,
             waves_per_eu=1,
-            enable_wmma_queuing=_grouped_gemm_enable_wmma_queuing(block_m, block_n, tdm_pipeline_depth, c_staging_mode,
-                                                                  cross_tile_prefetch),
+            enable_wmma_queuing=grouped_gemm_enable_wmma_queuing(block_m, block_n, tdm_pipeline_depth, c_staging_mode,
+                                                                 cross_tile_prefetch),
             ctas_per_cga=(cluster_size, 1, 1),
         )
 
@@ -530,7 +533,7 @@ def grouped_gemm_tdm_list(
     automatically use the full-tile specialization. Tile sizes are unchanged.
     Benchmarking measures the kernel launch after metadata and output setup.
     """
-    args = _make_grouped_gemm_tdm_list_args(group_a, group_b, group_c)
+    args = make_grouped_gemm_tdm_list_args(group_a, group_b, group_c)
     a_ptrs, b_ptrs, c_ptrs, group_sizes, group_lds, outputs, m_list, n, k = args
     device = group_a[0].device
     model_sms = max(1, int(num_programs)) if num_programs is not None else _active_num_cus(device)
@@ -556,22 +559,22 @@ def grouped_gemm_tdm_list(
             raise ValueError("cross-tile prefetch requires depth 2 and an even number of K blocks")
         if c_staging_mode == 0 and (block_m, block_n) != (256, 256):
             raise ValueError("alias-C cross-tile prefetch requires a 256x256 tile")
-    if xcd_remap_mode not in _XCD_REMAP_MODES or num_xcds < 1 or xcd_chunk < 1:
+    if xcd_remap_mode not in XCD_REMAP_MODES or num_xcds < 1 or xcd_chunk < 1:
         raise ValueError("invalid XCD remapping configuration")
     if cluster_size not in (1, 2, 4):
         raise ValueError("cluster_size must be 1, 2, or 4")
     if allow_mn_tails and cluster_size != 1:
         raise ValueError("M/N tails require cluster_size=1")
-    total_tiles = sum(_cdiv_int(m, block_m) * _cdiv_int(n, block_n) for m in m_list)
+    total_tiles = sum(triton.cdiv(m, block_m) * triton.cdiv(n, block_n) for m in m_list)
     if total_tiles == 0:
         return outputs
     num_programs = max(1, min(model_sms, total_tiles))
     if cluster_size > 1:
-        _validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=block_m, block_n=block_n,
-                                              block_k=block_k, group_m=group_m, tdm_pipeline_depth=tdm_pipeline_depth,
-                                              l2_prefetch_distance=l2_prefetch_distance, c_staging_mode=c_staging_mode,
-                                              cross_tile_prefetch=cross_tile_prefetch, auto_config=auto_config,
-                                              xcd_remap_mode=xcd_remap_mode, num_xcds=num_xcds, xcd_chunk=xcd_chunk)
+        validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=block_m, block_n=block_n, block_k=block_k,
+                                             group_m=group_m, tdm_pipeline_depth=tdm_pipeline_depth,
+                                             l2_prefetch_distance=l2_prefetch_distance, c_staging_mode=c_staging_mode,
+                                             cross_tile_prefetch=cross_tile_prefetch, auto_config=auto_config,
+                                             xcd_remap_mode=xcd_remap_mode, num_xcds=num_xcds, xcd_chunk=xcd_chunk)
     group_size = len(group_a)
     kernel_group_size = (tl.constexpr(group_size)
                          if cross_tile_prefetch and block_m == 256 and block_n == 256 else group_size)
@@ -594,7 +597,7 @@ def grouped_gemm_tdm_list(
             L2_PREFETCH_DISTANCE=l2_prefetch_distance,
             C_STAGING_MODE=c_staging_mode,
             CROSS_TILE_PREFETCH=cross_tile_prefetch,
-            XCD_REMAP_MODE=_XCD_REMAP_MODES[xcd_remap_mode],
+            XCD_REMAP_MODE=XCD_REMAP_MODES[xcd_remap_mode],
             NUM_XCDS=num_xcds,
             XCD_CHUNK=xcd_chunk,
             CLUSTER_SIZE=cluster_size,
@@ -602,8 +605,8 @@ def grouped_gemm_tdm_list(
             ALLOW_MN_TAILS=allow_mn_tails,
             num_warps=4,
             waves_per_eu=1,
-            enable_wmma_queuing=_grouped_gemm_enable_wmma_queuing(block_m, block_n, tdm_pipeline_depth, c_staging_mode,
-                                                                  cross_tile_prefetch),
+            enable_wmma_queuing=grouped_gemm_enable_wmma_queuing(block_m, block_n, tdm_pipeline_depth, c_staging_mode,
+                                                                 cross_tile_prefetch),
             ctas_per_cga=(cluster_size, 1, 1),
         )
 
@@ -730,8 +733,8 @@ def test_grouped_gemm_tdm_compiles_gfx1250(BLOCK_SIZE, TDM_PIPELINE_DEPTH):
     )
     compiled = triton_compile(
         src, target=GPUTarget("hip", "gfx1250", 32), options=dict(
-            num_warps=4, enable_wmma_queuing=_grouped_gemm_enable_wmma_queuing(BLOCK_SIZE, BLOCK_SIZE,
-                                                                               TDM_PIPELINE_DEPTH, 0, False)))
+            num_warps=4, enable_wmma_queuing=grouped_gemm_enable_wmma_queuing(BLOCK_SIZE, BLOCK_SIZE,
+                                                                              TDM_PIPELINE_DEPTH, 0, False)))
 
     ttgir = compiled.asm["ttgir"]
     assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
@@ -852,7 +855,7 @@ def test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250(XCD_REMAP_MODE, B
     compiled = triton_compile(
         src, target=GPUTarget("hip", "gfx1250", 32),
         options=dict(num_warps=4,
-                     enable_wmma_queuing=_grouped_gemm_enable_wmma_queuing(BLOCK_M, 256, 2, C_STAGING_MODE, True)))
+                     enable_wmma_queuing=grouped_gemm_enable_wmma_queuing(BLOCK_M, 256, 2, C_STAGING_MODE, True)))
 
     assert compiled.metadata.shared < 320 * 1024
     ttgir = compiled.asm["ttgir"]
@@ -1054,7 +1057,7 @@ if __name__ == "__main__":
                         help="prefetch the next tile; alias-C uses the 256x256 within-group hybrid")
     parser.add_argument("--auto_config", action=argparse.BooleanOptionalAction, default=False,
                         help="select a validated tile config using the host cost model")
-    parser.add_argument("--xcd_remap", choices=tuple(_XCD_REMAP_MODES), default="none",
+    parser.add_argument("--xcd_remap", choices=tuple(XCD_REMAP_MODES), default="none",
                         help="persistent program-id mapping across gfx1250 XCDs")
     parser.add_argument("--num_xcds", type=int, default=8)
     parser.add_argument("--xcd_chunk", type=int, default=2)

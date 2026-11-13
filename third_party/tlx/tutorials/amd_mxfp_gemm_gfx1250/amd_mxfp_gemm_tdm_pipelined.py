@@ -28,24 +28,22 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor
-from triton.tlx.ops.kernels.mm_mxfp8.gfx1250 import (  # noqa: F401
-    _XCD_REMAP_MODES, _mxgemm_c_slot, _mxgemm_c_slot_wait, _mxgemm_c_tdm_store, _mxgemm_can_be_cluster_step,
-    _mxgemm_cluster_arrive, _mxgemm_cluster_program_id, _mxgemm_defer_bottom_k_step, _mxgemm_desc_group_rows,
-    _mxgemm_flat_view, _mxgemm_grid_cols, _mxgemm_grid_masks, _mxgemm_grid_rows, _mxgemm_issue_load_a_data,
-    _mxgemm_issue_load_a_scale, _mxgemm_issue_load_b_data, _mxgemm_issue_load_b_scale, _mxgemm_issue_loads,
-    _mxgemm_load_a_operand, _mxgemm_load_b_operand, _mxgemm_native_dot, _mxgemm_native_operand, _mxgemm_overlap_store,
-    _mxgemm_persistent_a, _mxgemm_persistent_b, _mxgemm_persistent_compute_256, _mxgemm_persistent_compute_top,
-    _mxgemm_persistent_load, _mxgemm_persistent_store, _mxgemm_position_load_descriptor, _mxgemm_remap_program_id,
-    _mxgemm_scale_cols, _mxgemm_scale_quads, _mxgemm_schedule_prefetch, _mxgemm_tile_offsets, _mxgemm_view_rows,
-    _mxgemm_w256_scale_view, _operand_shared_layout, _partitioned_operand_shared_layout, _scale_shared_layout,
-    mxgemm_tdm_persistent_kernel, pack_scale,
+from triton.tlx.ops.kernels.mm_mxfp8.gfx1250 import (
+    XCD_REMAP_MODES,
+    mxgemm_issue_loads,
+    mxgemm_load_a_operand,
+    mxgemm_load_b_operand,
+    mxgemm_tdm_persistent_kernel,
+    operand_shared_layout,
+    pack_scale,
+    scale_shared_layout,
 )
 
 
 @triton.constexpr_function
 def _b_shared_layout(block_shape, transpose_b):
     if transpose_b:
-        return _operand_shared_layout(block_shape)
+        return operand_shared_layout(block_shape)
     return tlx.padded_shared_layout_encoding.with_identity_for([[block_shape[1], 16]], block_shape, [1, 0])
 
 
@@ -513,7 +511,7 @@ def mxgemm_tdm_pipelined_kernel(
             )
             b0_shape: tl.constexpr = (BLOCK_K_PACKED_B, HALF_BLOCK_N)
             b1_shape: tl.constexpr = (BLOCK_K_PACKED_B, HALF_BLOCK_N)
-        a_split_layout: tl.constexpr = _operand_shared_layout([HALF_BLOCK_M, BLOCK_K_PACKED_A])
+        a_split_layout: tl.constexpr = operand_shared_layout([HALF_BLOCK_M, BLOCK_K_PACKED_A])
         b_split_layout: tl.constexpr = _b_shared_layout(b0_shape, TRANSPOSE_B)
         a0_buf = tlx.local_alloc((HALF_BLOCK_M, BLOCK_K_PACKED_A), tlx.dtype_of(a_ptr), NUM_BUFFERS,
                                  layout=a_split_layout)
@@ -535,7 +533,7 @@ def mxgemm_tdm_pipelined_kernel(
                 strides=[stride_bn, tl.constexpr(1)],
                 block_shape=[BLOCK_N, BLOCK_K_PACKED_B],
             )
-            b_layout: tl.constexpr = _operand_shared_layout([BLOCK_N, BLOCK_K_PACKED_B])
+            b_layout: tl.constexpr = operand_shared_layout([BLOCK_N, BLOCK_K_PACKED_B])
             b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K_PACKED_B), tlx.dtype_of(b_ptr), NUM_BUFFERS, layout=b_layout)
         else:
             b_desc = tl.make_tensor_descriptor(
@@ -593,10 +591,10 @@ def mxgemm_tdm_pipelined_kernel(
         c_off_m = pid_m * BLOCK_M
         c_off_n = pid_n * BLOCK_N
 
-    a_scale_layout: tl.constexpr = _scale_shared_layout(a_scale_shape)
-    b_scale_layout: tl.constexpr = _scale_shared_layout(b_scale_shape)
+    a_scale_layout: tl.constexpr = scale_shared_layout(a_scale_shape)
+    b_scale_layout: tl.constexpr = scale_shared_layout(b_scale_shape)
     if not TDM_SPLIT:
-        a_layout: tl.constexpr = _operand_shared_layout([BLOCK_M, BLOCK_K_PACKED_A])
+        a_layout: tl.constexpr = operand_shared_layout([BLOCK_M, BLOCK_K_PACKED_A])
         a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K_PACKED_A), tlx.dtype_of(a_ptr), NUM_BUFFERS, layout=a_layout)
     a_scale_buf = tlx.local_alloc(a_scale_shape, tlx.dtype_of(a_scale), NUM_BUFFERS, layout=a_scale_layout)
     b_scale_buf = tlx.local_alloc(b_scale_shape, tlx.dtype_of(b_scale), NUM_BUFFERS, layout=b_scale_layout)
@@ -619,7 +617,7 @@ def mxgemm_tdm_pipelined_kernel(
                                                  BLOCK_K_PACKED_A, BLOCK_K_PACKED_B, BLOCK_K_SCALE_PRESHUFFLED,
                                                  NUM_BUFFERS, TRANSPOSE_B, SCALE_PRESHUFFLE, WITH_A_SCALE, TDM_FUSION)
         else:
-            load_idx = _mxgemm_issue_loads(
+            load_idx = mxgemm_issue_loads(
                 a_desc,
                 b_desc,
                 a_scale_desc,
@@ -660,15 +658,15 @@ def mxgemm_tdm_pipelined_kernel(
                                                  NUM_BUFFERS, TRANSPOSE_B, SCALE_PRESHUFFLE, WITH_A_SCALE, TDM_FUSION)
         else:
             tlx.async_amd_descriptor_wait((NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH)
-            a00, scale_a00 = _mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 0, 0, BLOCK_M, BLOCK_K, DIV_FACTOR_A,
-                                                    SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED, SCALE_KWIDTH,
-                                                    NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
-                                                    WITH_A_SCALE)
-            b00, scale_b00 = _mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 0, 0, BLOCK_N, BLOCK_K, DIV_FACTOR_B,
-                                                    SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED, SCALE_KWIDTH,
-                                                    NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
-                                                    SCALE_PRESHUFFLE)
-            load_idx = _mxgemm_issue_loads(
+            a00, scale_a00 = mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 0, 0, BLOCK_M, BLOCK_K, DIV_FACTOR_A,
+                                                   SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED, SCALE_KWIDTH,
+                                                   NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
+                                                   WITH_A_SCALE)
+            b00, scale_b00 = mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 0, 0, BLOCK_N, BLOCK_K, DIV_FACTOR_B,
+                                                   SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED, SCALE_KWIDTH,
+                                                   NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
+                                                   SCALE_PRESHUFFLE)
+            load_idx = mxgemm_issue_loads(
                 a_desc,
                 b_desc,
                 a_scale_desc,
@@ -723,10 +721,10 @@ def mxgemm_tdm_pipelined_kernel(
                                                               NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
                                                               SCALE_PRESHUFFLE)
             else:
-                b01, scale_b01 = _mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 0, 1, BLOCK_N, BLOCK_K,
-                                                        DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
-                                                        SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
-                                                        TRANSPOSE_B, SCALE_PRESHUFFLE)
+                b01, scale_b01 = mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 0, 1, BLOCK_N, BLOCK_K,
+                                                       DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
+                                                       SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
+                                                       TRANSPOSE_B, SCALE_PRESHUFFLE)
             pred_prefetch = i - epilogue_lb
             pred_prefetch = (pred_prefetch >> 31) & 1
             if TDM_SPLIT:
@@ -746,10 +744,10 @@ def mxgemm_tdm_pipelined_kernel(
                                                               NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
                                                               WITH_A_SCALE)
             else:
-                a10, scale_a10 = _mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 1, 0, BLOCK_M, BLOCK_K,
-                                                        DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED,
-                                                        SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K,
-                                                        SCALE_PRESHUFFLE, WITH_A_SCALE)
+                a10, scale_a10 = mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 1, 0, BLOCK_M, BLOCK_K,
+                                                       DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED,
+                                                       SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K,
+                                                       SCALE_PRESHUFFLE, WITH_A_SCALE)
             c10 = tlx.dot_scaled(a10, scale_a10, DTYPE_A, b00, scale_b00, DTYPE_B, c10, tiles_per_warp=TILES_PER_WARP)
             if NUM_SUBTILES_K == 2:
                 if TDM_SPLIT:
@@ -759,11 +757,11 @@ def mxgemm_tdm_pipelined_kernel(
                                                                   NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
                                                                   SCALE_PRESHUFFLE)
                 else:
-                    b10, scale_b10 = _mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 1, 0, BLOCK_N, BLOCK_K,
-                                                            DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
-                                                            BLOCK_N_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
-                                                            NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
-                                                            SCALE_PRESHUFFLE)
+                    b10, scale_b10 = mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 1, 0, BLOCK_N, BLOCK_K,
+                                                           DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
+                                                           BLOCK_N_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
+                                                           NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
+                                                           SCALE_PRESHUFFLE)
             c11 = tlx.dot_scaled(a10, scale_a10, DTYPE_A, b01, scale_b01, DTYPE_B, c11, tiles_per_warp=TILES_PER_WARP)
             if NUM_SUBTILES_K == 2:
                 if TDM_SPLIT:
@@ -773,11 +771,11 @@ def mxgemm_tdm_pipelined_kernel(
                                                                   NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
                                                                   WITH_A_SCALE)
                 else:
-                    a01, scale_a01 = _mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 0, 1, BLOCK_M, BLOCK_K,
-                                                            DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
-                                                            BLOCK_M_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
-                                                            NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
-                                                            WITH_A_SCALE)
+                    a01, scale_a01 = mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 0, 1, BLOCK_M, BLOCK_K,
+                                                           DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
+                                                           BLOCK_M_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
+                                                           NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
+                                                           WITH_A_SCALE)
                 c00 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b10, scale_b10, DTYPE_B, c00,
                                      tiles_per_warp=TILES_PER_WARP)
                 if TDM_SPLIT:
@@ -787,11 +785,11 @@ def mxgemm_tdm_pipelined_kernel(
                                                                   NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
                                                                   SCALE_PRESHUFFLE)
                 else:
-                    b11, scale_b11 = _mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 1, 1, BLOCK_N, BLOCK_K,
-                                                            DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
-                                                            BLOCK_N_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
-                                                            NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
-                                                            SCALE_PRESHUFFLE)
+                    b11, scale_b11 = mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 1, 1, BLOCK_N, BLOCK_K,
+                                                           DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE,
+                                                           BLOCK_N_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
+                                                           NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
+                                                           SCALE_PRESHUFFLE)
                 c01 = tlx.dot_scaled(a01, scale_a01, DTYPE_A, b11, scale_b11, DTYPE_B, c01,
                                      tiles_per_warp=TILES_PER_WARP)
                 if TDM_SPLIT:
@@ -801,11 +799,11 @@ def mxgemm_tdm_pipelined_kernel(
                                                                   NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
                                                                   WITH_A_SCALE)
                 else:
-                    a11, scale_a11 = _mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 1, 1, BLOCK_M, BLOCK_K,
-                                                            DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
-                                                            BLOCK_M_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
-                                                            NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
-                                                            WITH_A_SCALE)
+                    a11, scale_a11 = mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 1, 1, BLOCK_M, BLOCK_K,
+                                                           DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE,
+                                                           BLOCK_M_PRESHUFFLED, SCALE_KWIDTH, NUM_BUFFERS,
+                                                           NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
+                                                           WITH_A_SCALE)
             wmma_idx += 1
             if NUM_SUBTILES_K == 2:
                 c10 = tlx.dot_scaled(a11, scale_a11, DTYPE_A, b10, scale_b10, DTYPE_B, c10,
@@ -832,19 +830,19 @@ def mxgemm_tdm_pipelined_kernel(
                                                               NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
                                                               SCALE_PRESHUFFLE)
             else:
-                load_idx = _mxgemm_issue_loads(a_desc, b_desc, a_scale_desc, b_scale_desc, a_buf, b_buf, a_scale_buf,
-                                               b_scale_buf, load_idx, pred_load, BLOCK_K_PACKED_A, BLOCK_K_PACKED_B,
-                                               BLOCK_K_SCALE_PRESHUFFLED, NUM_BUFFERS, TRANSPOSE_B, SCALE_PRESHUFFLE,
-                                               WITH_A_SCALE, TDM_FUSION)
+                load_idx = mxgemm_issue_loads(a_desc, b_desc, a_scale_desc, b_scale_desc, a_buf, b_buf, a_scale_buf,
+                                              b_scale_buf, load_idx, pred_load, BLOCK_K_PACKED_A, BLOCK_K_PACKED_B,
+                                              BLOCK_K_SCALE_PRESHUFFLED, NUM_BUFFERS, TRANSPOSE_B, SCALE_PRESHUFFLE,
+                                              WITH_A_SCALE, TDM_FUSION)
                 tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
-                a00, scale_a00 = _mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 0, 0, BLOCK_M, BLOCK_K,
-                                                        DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED,
-                                                        SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K,
-                                                        SCALE_PRESHUFFLE, WITH_A_SCALE)
-                b00, scale_b00 = _mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 0, 0, BLOCK_N, BLOCK_K,
-                                                        DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
-                                                        SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
-                                                        TRANSPOSE_B, SCALE_PRESHUFFLE)
+                a00, scale_a00 = mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 0, 0, BLOCK_M, BLOCK_K,
+                                                       DIV_FACTOR_A, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED,
+                                                       SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K,
+                                                       SCALE_PRESHUFFLE, WITH_A_SCALE)
+                b00, scale_b00 = mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, 0, 0, BLOCK_N, BLOCK_K,
+                                                       DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
+                                                       SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
+                                                       TRANSPOSE_B, SCALE_PRESHUFFLE)
             if PIN_LOOP_SCALES:
                 scale_a00 = tlx.require_layout(scale_a00, SCALE_A_LOOP_LAYOUT)
                 scale_b00 = tlx.require_layout(scale_b00, SCALE_B_LOOP_LAYOUT)
@@ -866,27 +864,27 @@ def mxgemm_tdm_pipelined_kernel(
         for i in tl.range(0, K_ITERS):
             pred = i - epilogue_lb
             pred = (pred >> 31) & 1
-            load_idx = _mxgemm_issue_loads(a_desc, b_desc, a_scale_desc, b_scale_desc, a_buf, b_buf, a_scale_buf,
-                                           b_scale_buf, load_idx, pred, BLOCK_K_PACKED_A, BLOCK_K_PACKED_B,
-                                           BLOCK_K_SCALE_PRESHUFFLED, NUM_BUFFERS, TRANSPOSE_B, SCALE_PRESHUFFLE,
-                                           WITH_A_SCALE, TDM_FUSION)
+            load_idx = mxgemm_issue_loads(a_desc, b_desc, a_scale_desc, b_scale_desc, a_buf, b_buf, a_scale_buf,
+                                          b_scale_buf, load_idx, pred, BLOCK_K_PACKED_A, BLOCK_K_PACKED_B,
+                                          BLOCK_K_SCALE_PRESHUFFLED, NUM_BUFFERS, TRANSPOSE_B, SCALE_PRESHUFFLE,
+                                          WITH_A_SCALE, TDM_FUSION)
             _mxgemm_issue_l2_prefetches(a_desc, b_desc, a_scale_desc, b_scale_desc, load_idx, always,
                                         L2_PREFETCH_DISTANCE, BLOCK_K_PACKED_A, BLOCK_K_PACKED_B,
                                         BLOCK_K_SCALE_PRESHUFFLED, TRANSPOSE_B, SCALE_PRESHUFFLE, WITH_A_SCALE)
             tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
             for kt in tl.static_range(2):
-                a, scale_a = _mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 0, kt, BLOCK_M, BLOCK_K, DIV_FACTOR_A,
-                                                    SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED, SCALE_KWIDTH,
-                                                    NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
-                                                    WITH_A_SCALE)
-                b0, scale_b0 = _mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, kt, 0, BLOCK_N, BLOCK_K,
-                                                      DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
-                                                      SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
-                                                      TRANSPOSE_B, SCALE_PRESHUFFLE)
-                b1, scale_b1 = _mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, kt, 1, BLOCK_N, BLOCK_K,
-                                                      DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
-                                                      SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
-                                                      TRANSPOSE_B, SCALE_PRESHUFFLE)
+                a, scale_a = mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 0, kt, BLOCK_M, BLOCK_K, DIV_FACTOR_A,
+                                                   SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED, SCALE_KWIDTH,
+                                                   NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
+                                                   WITH_A_SCALE)
+                b0, scale_b0 = mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, kt, 0, BLOCK_N, BLOCK_K,
+                                                     DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
+                                                     SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
+                                                     TRANSPOSE_B, SCALE_PRESHUFFLE)
+                b1, scale_b1 = mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, kt, 1, BLOCK_N, BLOCK_K,
+                                                     DIV_FACTOR_B, SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED,
+                                                     SCALE_KWIDTH, NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K,
+                                                     TRANSPOSE_B, SCALE_PRESHUFFLE)
                 c0 = tlx.dot_scaled(a, scale_a, DTYPE_A, b0, scale_b0, DTYPE_B, c0, tiles_per_warp=TILES_PER_WARP)
                 c1 = tlx.dot_scaled(a, scale_a, DTYPE_A, b1, scale_b1, DTYPE_B, c1, tiles_per_warp=TILES_PER_WARP)
             wmma_idx += 1
@@ -903,23 +901,23 @@ def mxgemm_tdm_pipelined_kernel(
         for i in tl.range(0, K_ITERS):
             pred = i - epilogue_lb
             pred = (pred >> 31) & 1
-            load_idx = _mxgemm_issue_loads(a_desc, b_desc, a_scale_desc, b_scale_desc, a_buf, b_buf, a_scale_buf,
-                                           b_scale_buf, load_idx, pred, BLOCK_K_PACKED_A, BLOCK_K_PACKED_B,
-                                           BLOCK_K_SCALE_PRESHUFFLED, NUM_BUFFERS, TRANSPOSE_B, SCALE_PRESHUFFLE,
-                                           WITH_A_SCALE, TDM_FUSION)
+            load_idx = mxgemm_issue_loads(a_desc, b_desc, a_scale_desc, b_scale_desc, a_buf, b_buf, a_scale_buf,
+                                          b_scale_buf, load_idx, pred, BLOCK_K_PACKED_A, BLOCK_K_PACKED_B,
+                                          BLOCK_K_SCALE_PRESHUFFLED, NUM_BUFFERS, TRANSPOSE_B, SCALE_PRESHUFFLE,
+                                          WITH_A_SCALE, TDM_FUSION)
             _mxgemm_issue_l2_prefetches(a_desc, b_desc, a_scale_desc, b_scale_desc, load_idx, always,
                                         L2_PREFETCH_DISTANCE, BLOCK_K_PACKED_A, BLOCK_K_PACKED_B,
                                         BLOCK_K_SCALE_PRESHUFFLED, TRANSPOSE_B, SCALE_PRESHUFFLE, WITH_A_SCALE)
             tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
             for kt in tl.static_range(NUM_SUBTILES_K):
-                a, scale_a = _mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 0, kt, BLOCK_M, BLOCK_K, DIV_FACTOR_A,
-                                                    SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED, SCALE_KWIDTH,
-                                                    NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
-                                                    WITH_A_SCALE)
-                b, scale_b = _mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, kt, 0, BLOCK_N, BLOCK_K, DIV_FACTOR_B,
-                                                    SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED, SCALE_KWIDTH,
-                                                    NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
-                                                    SCALE_PRESHUFFLE)
+                a, scale_a = mxgemm_load_a_operand(a_buf, a_scale_buf, wmma_idx, 0, kt, BLOCK_M, BLOCK_K, DIV_FACTOR_A,
+                                                   SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_M_PRESHUFFLED, SCALE_KWIDTH,
+                                                   NUM_BUFFERS, NUM_SUBTILES_M, NUM_SUBTILES_K, SCALE_PRESHUFFLE,
+                                                   WITH_A_SCALE)
+                b, scale_b = mxgemm_load_b_operand(b_buf, b_scale_buf, wmma_idx, kt, 0, BLOCK_N, BLOCK_K, DIV_FACTOR_B,
+                                                   SCALE_BLOCK, BLOCK_K_SCALE, BLOCK_N_PRESHUFFLED, SCALE_KWIDTH,
+                                                   NUM_BUFFERS, NUM_SUBTILES_N, NUM_SUBTILES_K, TRANSPOSE_B,
+                                                   SCALE_PRESHUFFLE)
                 acc = tlx.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, acc, tiles_per_warp=TILES_PER_WARP)
             wmma_idx += 1
         acc = tlx.require_amd_wmma_layout(acc, warp_bases=STORE_WARP_BASES, reg_bases=STORE_REG_BASES,
@@ -977,7 +975,7 @@ def _validate_mxfp_scheduling(M, N, num_programs, *, persistent, block_m, block_
                               cluster_multicast=True):
     if not isinstance(cluster_barrier_interval, int) or cluster_barrier_interval < 0:
         raise ValueError("CLUSTER_BARRIER_INTERVAL must be a nonnegative integer")
-    if xcd_remap not in _XCD_REMAP_MODES:
+    if xcd_remap not in XCD_REMAP_MODES:
         raise ValueError("XCD_REMAP must be none, balanced, or chunked")
     if num_xcds <= 0 or xcd_chunk <= 0:
         raise ValueError("NUM_XCDS and XCD_CHUNK must be positive")
@@ -1251,7 +1249,7 @@ def mxgemm_tdm_pipelined(
                 a, b, c, a_scale_arg, b_scale, M, N, K, a.stride(0), b.stride(0), c.stride(0), a_scale_arg.stride(0),
                 b_scale.stride(0), DTYPE_B=DTYPE_B, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
                 GROUP_SIZE_M=GROUP_SIZE_M, NUM_BUFFERS=NUM_BUFFERS, NUM_PROGRAMS=NUM_PROGRAMS,
-                CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, XCD_REMAP_MODE=_XCD_REMAP_MODES[XCD_REMAP], NUM_XCDS=NUM_XCDS,
+                CROSS_TILE_PREFETCH=CROSS_TILE_PREFETCH, XCD_REMAP_MODE=XCD_REMAP_MODES[XCD_REMAP], NUM_XCDS=NUM_XCDS,
                 XCD_CHUNK=XCD_CHUNK, CLUSTER_SIZE=CLUSTER_SIZE, CLUSTER_MULTICAST=CLUSTER_MULTICAST,
                 CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
                 SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES,
@@ -1475,7 +1473,7 @@ if __name__ == "__main__":
     parser.add_argument("--out_dtype", choices=tuple(_OUT_DTYPES), default="fp32",
                         help="C element type; FP16 converts the FP32 accumulators before storing")
     parser.add_argument("--num_programs", type=int, default=None, help="persistent workgroup count (default: CU count)")
-    parser.add_argument("--xcd_remap", choices=tuple(_XCD_REMAP_MODES), default="none")
+    parser.add_argument("--xcd_remap", choices=tuple(XCD_REMAP_MODES), default="none")
     parser.add_argument("--num_xcds", type=int, default=8)
     parser.add_argument("--xcd_chunk", type=int, default=2)
     parser.add_argument("--cluster_size", type=int, choices=(1, 2, 4, 8, 16), default=1)

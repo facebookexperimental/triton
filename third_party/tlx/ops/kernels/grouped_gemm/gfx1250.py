@@ -33,12 +33,12 @@ def _active_num_cus(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-def _grouped_gemm_enable_wmma_queuing(block_m, block_n, num_buffers, c_staging_mode, cross_tile_prefetch):
+def grouped_gemm_enable_wmma_queuing(block_m, block_n, num_buffers, c_staging_mode, cross_tile_prefetch):
     # The square single-wave-per-SIMD schedules benefit from SCHED_MODE[2].
     return block_m == block_n == 256 and (cross_tile_prefetch or (c_staging_mode == 0 and num_buffers == 2))
 
 
-_XCD_REMAP_MODES = {
+XCD_REMAP_MODES = {
     "none": 0,
     "balanced": 1,
     "chunked": 2,
@@ -270,7 +270,7 @@ def _grouped_gemm_matrix_pointer(base, group, packed_offset, POINTER_TABLES: tl.
 
 
 @triton.jit
-def _grouped_gemm_tdm_impl(
+def grouped_gemm_tdm_impl(
     a_packed,
     b_t,
     c_packed,
@@ -891,7 +891,7 @@ def grouped_gemm_tdm_list_kernel(
     No offsets, descriptor buffers, or matrix repacking are required.
     """
     N = tl.load(group_gemm_sizes + 1)
-    _grouped_gemm_tdm_impl(
+    grouped_gemm_tdm_impl(
         group_a_ptrs,
         group_b_ptrs,
         group_c_ptrs,
@@ -923,9 +923,9 @@ def grouped_gemm_tdm_list_kernel(
     )
 
 
-def _validate_grouped_gemm_cluster_config(m_list, n, num_programs, *, block_m, block_n, block_k, group_m,
-                                          tdm_pipeline_depth, l2_prefetch_distance, c_staging_mode, cross_tile_prefetch,
-                                          auto_config, xcd_remap_mode, num_xcds, xcd_chunk):
+def validate_grouped_gemm_cluster_config(m_list, n, num_programs, *, block_m, block_n, block_k, group_m,
+                                         tdm_pipeline_depth, l2_prefetch_distance, c_staging_mode, cross_tile_prefetch,
+                                         auto_config, xcd_remap_mode, num_xcds, xcd_chunk):
     """Require identical cluster control flow and the tested operand-sharing map."""
     if (block_m, block_n, block_k, group_m, tdm_pipeline_depth, l2_prefetch_distance,
             c_staging_mode) != (256, 256, 128, 4, 2, 0, 0) or not cross_tile_prefetch or auto_config:
@@ -980,7 +980,7 @@ def _validate_grouped_gemm_tdm_list_inputs(group_a, group_b):
     return m_list, n, k, device
 
 
-def _make_grouped_gemm_tdm_list_args(group_a, group_b, group_c=None):
+def make_grouped_gemm_tdm_list_args(group_a, group_b, group_c=None):
     """Validate the list contract and construct metadata without packing inputs."""
     m_list, n, k, device = _validate_grouped_gemm_tdm_list_inputs(group_a, group_b)
     if group_c is not None and (not isinstance(group_c, (list, tuple)) or len(group_c) != len(group_a)):
@@ -1098,12 +1098,12 @@ def _grouped_gemm_interface_launch_config(cfg, m_list, n, k, num_sms, *, auto_cl
         raise InvalidInput("gfx1250 grouped GEMM tile count plus NUM_SM must fit in int32")
     if cfg["CLUSTER_SIZE"] > 1:
         try:
-            _validate_grouped_gemm_cluster_config(
+            validate_grouped_gemm_cluster_config(
                 m_list, n, num_sm, block_m=cfg["BLOCK_SIZE_M"], block_n=cfg["BLOCK_SIZE_N"],
                 block_k=cfg["BLOCK_SIZE_K"], group_m=cfg["GROUP_SIZE_M"], tdm_pipeline_depth=cfg["NUM_BUFFERS"],
                 l2_prefetch_distance=cfg["L2_PREFETCH_DISTANCE"], c_staging_mode=cfg["C_STAGING_MODE"],
                 cross_tile_prefetch=cfg["CROSS_TILE_PREFETCH"], auto_config=False,
-                xcd_remap_mode=next(name for name, value in _XCD_REMAP_MODES.items() if value == cfg["XCD_REMAP_MODE"]),
+                xcd_remap_mode=next(name for name, value in XCD_REMAP_MODES.items() if value == cfg["XCD_REMAP_MODE"]),
                 num_xcds=cfg["NUM_XCDS"], xcd_chunk=cfg["XCD_CHUNK"])
         except InvalidInput:
             if not auto_cluster:
@@ -1135,7 +1135,7 @@ def _make_grouped_gemm_args(group_A, group_B, config=None):
     cfg = _grouped_gemm_interface_launch_config(cfg, m_list, n, k,
                                                 cfg["NUM_SM"] if "NUM_SM" in cfg else _active_num_cus(device),
                                                 auto_cluster=config is None or "CLUSTER_SIZE" not in config)
-    a, b, c, sizes, lds, outputs, _, _, _ = _make_grouped_gemm_tdm_list_args(group_A, group_B)
+    a, b, c, sizes, lds, outputs, _, _, _ = make_grouped_gemm_tdm_list_args(group_A, group_B)
     # gfx950 emits flat size/stride tables. Views preserve the same allocation.
     return a, b, c, sizes.view(-1), lds.view(-1), len(m_list), cfg, outputs
 
@@ -1188,9 +1188,9 @@ def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
             CROSS_TILE_PREFETCH=tuning["CROSS_TILE_PREFETCH"], XCD_REMAP_MODE=tuning["XCD_REMAP_MODE"],
             NUM_XCDS=tuning["NUM_XCDS"], XCD_CHUNK=tuning["XCD_CHUNK"], CLUSTER_SIZE=tuning["CLUSTER_SIZE"],
             CLUSTER_MULTICAST=tuning["CLUSTER_MULTICAST"], ALLOW_MN_TAILS=cfg["ALLOW_MN_TAILS"],
-            enable_wmma_queuing=_grouped_gemm_enable_wmma_queuing(tuning["BLOCK_SIZE_M"], tuning["BLOCK_SIZE_N"],
-                                                                  tuning["NUM_BUFFERS"], tuning["C_STAGING_MODE"],
-                                                                  tuning["CROSS_TILE_PREFETCH"]),
+            enable_wmma_queuing=grouped_gemm_enable_wmma_queuing(tuning["BLOCK_SIZE_M"], tuning["BLOCK_SIZE_N"],
+                                                                 tuning["NUM_BUFFERS"], tuning["C_STAGING_MODE"],
+                                                                 tuning["CROSS_TILE_PREFETCH"]),
             num_warps=tuning["num_warps"], waves_per_eu=tuning["waves_per_eu"], ctas_per_cga=(tuning["CLUSTER_SIZE"], 1,
                                                                                               1))
 

@@ -8,6 +8,8 @@ from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx12
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
+from triton.tlx.ops.kernels.grouped_gemm import gfx1250 as _gfx1250_grouped_ops
+from triton.tlx.ops.kernels.mm_mxfp8 import gfx1250 as _gfx1250_mxfp_ops
 from triton.tools.mxfp import MXScaleTensor
 from triton._internal_testing import is_hip_gfx1250
 
@@ -876,9 +878,9 @@ def test_mxgemm_persistent_invalid_config(config, match):
 def _mxfp_cluster_tile_ids(output, NUM_M: tl.constexpr, NUM_N: tl.constexpr, PROGRAMS: tl.constexpr,
                            GROUP_M: tl.constexpr, REMAP: tl.constexpr, LAYOUT: tl.constexpr = "2x2"):
     pid = tl.program_id(0)
-    tile = _gfx1250_mxfp._mxgemm_cluster_program_id(pid, PROGRAMS, REMAP, 8, 2, LAYOUT)
+    tile = _gfx1250_mxfp_ops._mxgemm_cluster_program_id(pid, PROGRAMS, REMAP, 8, 2, LAYOUT)
     for step in range(NUM_M * NUM_N // PROGRAMS):
-        off_m, off_n = _gfx1250_mxfp._mxgemm_tile_offsets(tile, NUM_M, NUM_N, GROUP_M, 256, 256, LAYOUT)
+        off_m, off_n = _gfx1250_mxfp_ops._mxgemm_tile_offsets(tile, NUM_M, NUM_N, GROUP_M, 256, 256, LAYOUT)
         tl.store(output + step * PROGRAMS + pid, off_m // 256 * NUM_N + off_n // 256)
         tile += PROGRAMS
 
@@ -1265,11 +1267,11 @@ def test_amd_independent_cluster_invalid_options(dims, num_ctas, arch):
 def test_grouped_gemm_multicast_config_validation(m_list, n, num_programs, valid):
 
     def validate():
-        _gfx1250_grouped._validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=256, block_n=256,
-                                                               block_k=128, group_m=4, tdm_pipeline_depth=2,
-                                                               l2_prefetch_distance=0, c_staging_mode=0,
-                                                               cross_tile_prefetch=True, auto_config=False,
-                                                               xcd_remap_mode="chunked", num_xcds=8, xcd_chunk=2)
+        _gfx1250_grouped.validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=256, block_n=256,
+                                                              block_k=128, group_m=4, tdm_pipeline_depth=2,
+                                                              l2_prefetch_distance=0, c_staging_mode=0,
+                                                              cross_tile_prefetch=True, auto_config=False,
+                                                              xcd_remap_mode="chunked", num_xcds=8, xcd_chunk=2)
 
     if valid:
         validate()
@@ -1612,7 +1614,7 @@ def test_grouped_gemm_interface_rejects_config(config, k, match, monkeypatch):
     monkeypatch.setattr(torch, "empty", no_allocation)
     monkeypatch.setattr(torch, "tensor", no_allocation)
     with pytest.raises(ValueError, match=match):
-        _gfx1250_grouped._make_grouped_gemm_args([a], [b], config)
+        _gfx1250_grouped_ops._make_grouped_gemm_args([a], [b], config)
 
 
 @pytest.mark.parametrize("condition,match", [
@@ -1668,7 +1670,7 @@ def test_grouped_gemm_interface_rejects_inputs(condition, match, monkeypatch):
     monkeypatch.setattr(torch, "empty", no_allocation)
     monkeypatch.setattr(torch, "tensor", no_allocation)
     with pytest.raises(ValueError, match=match):
-        _gfx1250_grouped.grouped_gemm(a, b)
+        _gfx1250_grouped_ops.grouped_gemm(a, b)
 
 
 def test_grouped_gemm_interface_rejects_other_arch(monkeypatch):
@@ -1678,7 +1680,7 @@ def test_grouped_gemm_interface_rejects_other_arch(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_properties",
                         lambda device: SimpleNamespace(gcnArchName="gfx950:sramecc+"))
     with pytest.raises(ValueError, match="requires gfx1250; got gfx950"):
-        _gfx1250_grouped._require_grouped_gemm_gfx1250(torch.device("cuda"))
+        _gfx1250_grouped_ops._require_grouped_gemm_gfx1250(torch.device("cuda"))
 
 
 def test_grouped_gemm_interface_defaults_match_bench(monkeypatch):
@@ -1688,9 +1690,9 @@ def test_grouped_gemm_interface_defaults_match_bench(monkeypatch):
     checked = []
 
     def check_case(args, case, kernel_variant, index, total):
-        cfg = _gfx1250_grouped._grouped_gemm_interface_launch_config(
-            _gfx1250_grouped._grouped_gemm_interface_config(None, case.k), [case.m] * case.groups, case.n, case.k, 256,
-            auto_cluster=True)
+        cfg = _gfx1250_grouped_ops._grouped_gemm_interface_launch_config(
+            _gfx1250_grouped_ops._grouped_gemm_interface_config(None, case.k), [case.m] * case.groups, case.n, case.k,
+            256, auto_cluster=True)
         for key, value in dict(
                 BLOCK_SIZE_M=args.block_m,
                 BLOCK_SIZE_N=args.block_n,
@@ -1700,7 +1702,7 @@ def test_grouped_gemm_interface_defaults_match_bench(monkeypatch):
                 L2_PREFETCH_DISTANCE=args.l2_prefetch_distance,
                 C_STAGING_MODE=int(args.dedicated_c_buffer),
                 CROSS_TILE_PREFETCH=args.cross_tile_prefetch,
-                XCD_REMAP_MODE=_gfx1250_grouped._XCD_REMAP_MODES[args.xcd_remap],
+                XCD_REMAP_MODE=_gfx1250_grouped.XCD_REMAP_MODES[args.xcd_remap],
                 NUM_XCDS=args.num_xcds,
                 XCD_CHUNK=args.xcd_chunk,
                 CLUSTER_SIZE=args.cluster_size,
@@ -1736,15 +1738,16 @@ def test_grouped_gemm_interface_defaults_match_bench(monkeypatch):
     ([1024], 512, 32, {}, 1),
 ])
 def test_grouped_gemm_interface_selects_cluster(ms, n, num_sm, config, expected):
-    cfg = _gfx1250_grouped._grouped_gemm_interface_launch_config(
-        _gfx1250_grouped._grouped_gemm_interface_config(config, 512), ms, n, 512, num_sm, auto_cluster="CLUSTER_SIZE"
-        not in config)
+    cfg = _gfx1250_grouped_ops._grouped_gemm_interface_launch_config(
+        _gfx1250_grouped_ops._grouped_gemm_interface_config(config, 512), ms, n, 512, num_sm,
+        auto_cluster="CLUSTER_SIZE" not in config)
     assert cfg["CLUSTER_SIZE"] == expected
     if expected == 1 and "CLUSTER_SIZE" not in config:
         explicit = dict(config, CLUSTER_SIZE=4)
         with pytest.raises(ValueError, match="clustering requires"):
-            _gfx1250_grouped._grouped_gemm_interface_launch_config(
-                _gfx1250_grouped._grouped_gemm_interface_config(explicit, 512), ms, n, 512, num_sm, auto_cluster=False)
+            _gfx1250_grouped_ops._grouped_gemm_interface_launch_config(
+                _gfx1250_grouped_ops._grouped_gemm_interface_config(explicit, 512), ms, n, 512, num_sm,
+                auto_cluster=False)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -1758,19 +1761,17 @@ def test_grouped_gemm_interface_multicast_launch(cluster_size, monkeypatch):
     config = {} if cluster_size is None else dict(CLUSTER_SIZE=cluster_size)
     # Pretend the device has 16 CUs so the 64 tiles give each program four:
     # cluster members then step through several tiles together, and NUM_SM does
-    # not depend on the machine. Patch the tlx.ops module, which defines
-    # _make_grouped_gemm_args; the tutorial only re-exports it.
-    from triton.tlx.ops.kernels.grouped_gemm import gfx1250 as grouped_ops
-    monkeypatch.setattr(grouped_ops, "_active_num_cus", lambda device: 16)
-    *launch_args, outputs = _gfx1250_grouped._make_grouped_gemm_args(a, b, config)
+    # not depend on the machine.
+    monkeypatch.setattr(_gfx1250_grouped_ops, "_active_num_cus", lambda device: 16)
+    *launch_args, outputs = _gfx1250_grouped_ops._make_grouped_gemm_args(a, b, config)
     assert launch_args[-1]["CLUSTER_SIZE"] == (4 if cluster_size is None else cluster_size)
     assert launch_args[-1]["NUM_SM"] == 16
     assert launch_args[-1]["ALLOW_MN_TAILS"] is False
-    _gfx1250_grouped._perf_fn(*launch_args)
+    _gfx1250_grouped_ops._perf_fn(*launch_args)
     torch.cuda.synchronize()
     allocated = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
-    _gfx1250_grouped._perf_fn(*launch_args)
+    _gfx1250_grouped_ops._perf_fn(*launch_args)
     torch.cuda.synchronize()
     assert torch.cuda.max_memory_allocated() == allocated
     for out, x, w in zip(outputs, cpu_a, cpu_b):
@@ -1783,7 +1784,7 @@ def test_grouped_gemm_interface_list_api(ms, n):
     torch.manual_seed(1250)
     a = [torch.randn((m, 256), dtype=torch.float16) for m in ms]
     b = [torch.randn((n, 256), dtype=torch.float16) for _ in ms]
-    outputs = _gfx1250_grouped.grouped_gemm(tuple(x.cuda() for x in a), tuple(x.cuda().T for x in b))
+    outputs = _gfx1250_grouped_ops.grouped_gemm(tuple(x.cuda() for x in a), tuple(x.cuda().T for x in b))
     assert isinstance(outputs, list) and len(outputs) == len(ms)
     for out, x, w in zip(outputs, a, b):
         torch.testing.assert_close(out.cpu(), (x.float() @ w.float().T).half(), atol=1e-2, rtol=1e-2)
@@ -1803,7 +1804,7 @@ def test_grouped_gemm_interface_prepared_launch(config, k, monkeypatch):
     cpu_a = [torch.randn((m, k), dtype=torch.float16) for m in ms]
     cpu_b = [torch.randn((n, k), dtype=torch.float16) for _ in ms]
     a, b = [x.cuda() for x in cpu_a], [x.cuda().T for x in cpu_b]
-    args = _gfx1250_grouped._make_grouped_gemm_args(a, b, dict(config, NUM_SM=2))
+    args = _gfx1250_grouped_ops._make_grouped_gemm_args(a, b, dict(config, NUM_SM=2))
     *launch_args, outputs = args
     assert len(args) == 8
     assert [tuple(t.shape) for t in args[:5]] == [(2, ), (2, ), (2, ), (6, ), (6, )]
@@ -1812,7 +1813,7 @@ def test_grouped_gemm_interface_prepared_launch(config, k, monkeypatch):
     assert args[6]["ALLOW_MN_TAILS"] is True
     assert args[0].cpu().tolist() == [x.data_ptr() for x in a]
     assert args[1].cpu().tolist() == [x.data_ptr() for x in b]
-    _gfx1250_grouped._perf_fn(*launch_args)
+    _gfx1250_grouped_ops._perf_fn(*launch_args)
     torch.cuda.synchronize()
 
     def no_setup(*args, **kwargs):
@@ -1825,7 +1826,7 @@ def test_grouped_gemm_interface_prepared_launch(config, k, monkeypatch):
             patch.setattr(torch, name, no_setup)
         for name in ("cpu", "item", "tolist"):
             patch.setattr(torch.Tensor, name, no_setup)
-        _gfx1250_grouped._perf_fn(*launch_args)
+        _gfx1250_grouped_ops._perf_fn(*launch_args)
         torch.cuda.synchronize()
     assert torch.cuda.max_memory_allocated() == allocated
     for out, x, w in zip(outputs, cpu_a, cpu_b):
@@ -1864,7 +1865,7 @@ def test_grouped_gemm_interface_rejects_metadata(condition, match):
     elif condition == "cluster_grid":
         cfg.update(CLUSTER_SIZE=4, ALLOW_MN_TAILS=False)
     with pytest.raises(ValueError, match=match):
-        _gfx1250_grouped._perf_fn(*tables, g, cfg)
+        _gfx1250_grouped_ops._perf_fn(*tables, g, cfg)
 
 
 @pytest.mark.parametrize("m,n,k,match", [

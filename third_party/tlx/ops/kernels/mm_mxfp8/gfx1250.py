@@ -30,14 +30,14 @@ from ..._catalog import InvalidInput
 
 
 @triton.constexpr_function
-def _operand_shared_layout(block_shape):
+def operand_shared_layout(block_shape):
     block_k = block_shape[1]
     pad_interval = 256 if block_k <= 256 else block_k
     return tlx.padded_shared_layout_encoding.with_identity_for([[pad_interval, 16]], block_shape, [1, 0])
 
 
 @triton.constexpr_function
-def _scale_shared_layout(block_shape, wave256=False):
+def scale_shared_layout(block_shape, wave256=False):
     if wave256:
         return tlx.padded_shared_layout_encoding.with_identity_for([[1024, 16]], block_shape, [1, 0])
     return tlx.padded_shared_layout_encoding.with_identity_for([[256, 8]], block_shape, [1, 0])
@@ -242,7 +242,7 @@ def _mxgemm_issue_load_b_data(
 
 
 @triton.jit
-def _mxgemm_issue_loads(
+def mxgemm_issue_loads(
     a_desc,
     b_desc,
     a_scale_desc,
@@ -370,7 +370,7 @@ def _mxgemm_issue_loads(
 
 
 @triton.jit
-def _mxgemm_load_a_operand(
+def mxgemm_load_a_operand(
     a_buf,
     a_scale_buf,
     wmma_idx,
@@ -447,7 +447,7 @@ def _mxgemm_load_a_operand(
 
 
 @triton.jit
-def _mxgemm_load_b_operand(
+def mxgemm_load_b_operand(
     b_buf,
     b_scale_buf,
     wmma_idx,
@@ -522,7 +522,7 @@ def _mxgemm_load_b_operand(
     return b, scale_b
 
 
-_XCD_REMAP_MODES = {"none": 0, "balanced": 1, "chunked": 2}
+XCD_REMAP_MODES = {"none": 0, "balanced": 1, "chunked": 2}
 
 
 @triton.jit
@@ -662,9 +662,9 @@ def _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_b
                     tlx.amd_cluster_wait()
                 else:
                     tlx.cluster_barrier()
-    _mxgemm_issue_loads(ad, bd, asd, bsd, a_buf, b_buf, as_buf, bs_buf, k, None, BK // DA, BK // DB, BK // 32 * SROWS,
-                        BUFFERS, True, True, True, FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
-                        XCD_REMAP_MODE, load_slot=slot, SCALES_FIRST=False, CLUSTER_LAYOUT=CLUSTER_LAYOUT)
+    mxgemm_issue_loads(ad, bd, asd, bsd, a_buf, b_buf, as_buf, bs_buf, k, None, BK // DA, BK // DB, BK // 32 * SROWS,
+                       BUFFERS, True, True, True, FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE,
+                       load_slot=slot, SCALES_FIRST=False, CLUSTER_LAYOUT=CLUSTER_LAYOUT)
 
 
 @triton.constexpr_function
@@ -677,14 +677,14 @@ def _mxgemm_can_be_cluster_step(k0, step, interval):
 def _mxgemm_persistent_a(a_buf, as_buf, slot, m: tl.constexpr, k: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr,
                          DA: tl.constexpr, BUFFERS: tl.constexpr, PREFETCH_SCALES: tl.constexpr = False,
                          RELAXED: tl.constexpr = False, LOAD: tl.constexpr = 3, BOTH: tl.constexpr = False):
-    # LOAD and BOTH: see _mxgemm_load_a_operand. BOTH keeps a wave256 slot's
+    # LOAD and BOTH: see mxgemm_load_a_operand. BOTH keeps a wave256 slot's
     # scales for both 128-row quadrants in one register tensor.
     tl.assume(slot >= 0)
     tl.assume(slot < BUFFERS)
-    a, scale = _mxgemm_load_a_operand(a_buf, as_buf, slot, m, k, BM, BK, DA, 32, BK // 32, BM // 128, 4, BUFFERS, 2,
-                                      BK // 128, True, True,
-                                      SCALES_FIRST=(PREFETCH_SCALES or ((BUFFERS == 4) and BK == 128)) and DA == 1,
-                                      RELAXED=RELAXED, LOAD=LOAD, BOTH=BOTH)
+    a, scale = mxgemm_load_a_operand(a_buf, as_buf, slot, m, k, BM, BK, DA, 32, BK // 32, BM // 128, 4, BUFFERS, 2,
+                                     BK // 128, True, True,
+                                     SCALES_FIRST=(PREFETCH_SCALES or ((BUFFERS == 4) and BK == 128)) and DA == 1,
+                                     RELAXED=RELAXED, LOAD=LOAD, BOTH=BOTH)
     if (LOAD & 2) == 0:
         pass
     elif BOTH:
@@ -703,10 +703,10 @@ def _mxgemm_persistent_b(b_buf, bs_buf, slot, k: tl.constexpr, n: tl.constexpr, 
                          RELAXED: tl.constexpr = False, LOAD: tl.constexpr = 3, BOTH: tl.constexpr = False):
     tl.assume(slot >= 0)
     tl.assume(slot < BUFFERS)
-    b, scale = _mxgemm_load_b_operand(b_buf, bs_buf, slot, k, n, BN, BK, DB, 32, BK // 32, BN // 128, 4, BUFFERS, 2,
-                                      BK // 128, True, True,
-                                      SCALES_FIRST=(PREFETCH_SCALES or ((BUFFERS == 4) and BK == 128)) and DB == 1,
-                                      RELAXED=RELAXED, LOAD=LOAD, BOTH=BOTH)
+    b, scale = mxgemm_load_b_operand(b_buf, bs_buf, slot, k, n, BN, BK, DB, 32, BK // 32, BN // 128, 4, BUFFERS, 2,
+                                     BK // 128, True, True,
+                                     SCALES_FIRST=(PREFETCH_SCALES or ((BUFFERS == 4) and BK == 128)) and DB == 1,
+                                     RELAXED=RELAXED, LOAD=LOAD, BOTH=BOTH)
     if (LOAD & 2) == 0:
         pass
     elif BOTH:
@@ -1179,13 +1179,13 @@ def mxgemm_tdm_persistent_kernel(
         a_desc = tl.make_tensor_descriptor(a_ptr, [M, K], [stride_am, tl.constexpr(1)], [BLOCK_M, BLOCK_K])
         b_desc = tl.make_tensor_descriptor(b_ptr, [N, K // DB], [stride_bn, tl.constexpr(1)], [BLOCK_N, BLOCK_K // DB])
         a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS,
-                                layout=_operand_shared_layout([BLOCK_M, BLOCK_K]))
+                                layout=operand_shared_layout([BLOCK_M, BLOCK_K]))
         b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K // DB), tlx.dtype_of(b_ptr), NUM_BUFFERS,
-                                layout=_operand_shared_layout([BLOCK_N, BLOCK_K // DB]))
+                                layout=operand_shared_layout([BLOCK_N, BLOCK_K // DB]))
     as_buf = tlx.local_alloc((BLOCK_M // SC_ROWS, BLOCK_K // 32 * SC_ROWS), tlx.dtype_of(a_scale), NUM_BUFFERS,
-                             layout=_scale_shared_layout([BLOCK_M // SC_ROWS, BLOCK_K // 32 * SC_ROWS], SCALE_WAVE256))
+                             layout=scale_shared_layout([BLOCK_M // SC_ROWS, BLOCK_K // 32 * SC_ROWS], SCALE_WAVE256))
     bs_buf = tlx.local_alloc((BLOCK_N // SC_ROWS, BLOCK_K // 32 * SC_ROWS), tlx.dtype_of(b_scale), NUM_BUFFERS,
-                             layout=_scale_shared_layout([BLOCK_N // SC_ROWS, BLOCK_K // 32 * SC_ROWS], SCALE_WAVE256))
+                             layout=scale_shared_layout([BLOCK_N // SC_ROWS, BLOCK_K // 32 * SC_ROWS], SCALE_WAVE256))
     # Two 16 KiB output slots (64x64 FP32 or 64x128 FP16) leave room for a
     # fourth BK128 input stage.
     C_COLS: tl.constexpr = (256 // tlx.dtype_of(c_ptr).primitive_bitwidth * 8) if NUM_BUFFERS == 4 else BLOCK_N // 2
@@ -1693,7 +1693,7 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="he
             a, b, out, a_scale, b_scale, m, n, k, a.stride(0), b.stride(0), out.stride(0), a_scale.stride(0),
             b_scale.stride(0), DTYPE_B="e4m3", BLOCK_M=_BLOCK_M, BLOCK_N=_BLOCK_N, BLOCK_K=_BLOCK_K,
             GROUP_SIZE_M=_GROUP_SIZE_M, NUM_BUFFERS=cfg["NUM_BUFFERS"], NUM_PROGRAMS=cfg["NUM_PROGRAMS"],
-            CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=_XCD_REMAP_MODES["chunked"], NUM_XCDS=8, XCD_CHUNK=2,
+            CROSS_TILE_PREFETCH=True, XCD_REMAP_MODE=XCD_REMAP_MODES["chunked"], NUM_XCDS=8, XCD_CHUNK=2,
             CLUSTER_SIZE=cfg["CLUSTER_SIZE"], CLUSTER_MULTICAST=True,
             CLUSTER_BARRIER_INTERVAL=cfg["CLUSTER_BARRIER_INTERVAL"], CLUSTER_LAYOUT=cfg["CLUSTER_LAYOUT"],
             STATIC_SLOT_UNROLL=cfg["STATIC_SLOT_UNROLL"], OUTPUT_C_SLOTS=cfg["OUTPUT_C_SLOTS"],
