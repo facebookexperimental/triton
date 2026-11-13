@@ -843,6 +843,7 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.fused.linear_rowscale._shapes",
         "triton.tlx.ops.kernels.mla_window_attn._shapes",
         "triton.tlx.ops.kernels.mm._shapes",
+        "triton.tlx.ops.kernels.moe._routing_shapes",
         "triton.tlx.ops.kernels.swiglu_ffn._shapes",
     ],
 )
@@ -898,6 +899,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
             "gfx950": ("gfx950_all", ),
             "gfx942": ("gfx942_all", ),
         },
+        "triton.tlx.ops.kernels.moe._routing_shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.swiglu_ffn._shapes": {"sm90": ("sm90_1", )},
     }
     pattern = re.compile(r"^(?:sm|gfx)\d+_(?:[1-9]\d*|all)$")
@@ -996,6 +998,7 @@ BENCH_MODULES = (
     "bench_mla_window_attn",
     "bench_mm",
     "bench_mm_mxfp8",
+    "bench_moe_routing",
     "bench_rmsnorm_cat",
     "bench_swiglu_ffn",
 )
