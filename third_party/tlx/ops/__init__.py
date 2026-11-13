@@ -126,7 +126,7 @@ __all__ = [
     "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
     "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "paged_attention_decode",
     "paged_attention_prefill", "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d",
-    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space", "paged_prefill"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -221,6 +221,42 @@ def mm(a, b, *, out=None, space=None):
     if out is None:
         return fn(a, b, space=space_name, invariance=invariance)
     return fn(a, b, out=out, space=space_name, invariance=invariance)
+
+
+def paged_prefill(q, k, v, tables, *, kv_length=None, window=0, space=None):
+    """BF16 causal GQA prefill over 64-token KV pages, forward only.
+
+    Q is contiguous ``[B, SQ, 8 * KVH, 64]``; K/V are contiguous
+    ``[physical_pages, 64, KVH, 64]`` with 16-byte-aligned bases. The contiguous
+    int32 table is ``[B, logical_pages]``. Callers provide valid physical page
+    IDs and finite cache contents for every token through ``kv_length``;
+    unused slots in the final page are ignored. All sequences share lengths.
+
+    ``kv_length`` defaults to SQ and may include a cached prefix; causal
+    alignment is bottom-right. ``window=0`` is global, and ``window=2048``
+    includes self plus the preceding 2047 tokens. Scale is fixed to 1/sqrt(64).
+    Returns BF16 Q-shaped output; neither appends KV nor returns LSE.
+
+    Only gfx1250 is supported. ``space=None`` or ``"heuristic"`` uses frozen
+    configurations without autotuning. FP32 dot products and intermediate
+    weighted-value sums must remain finite.
+    The fast path normalizes the BF16 probabilities used by PV, accumulating
+    in FP32; abnormal ranges replay stable online softmax on the device.
+    """
+    import torch
+
+    if not all(isinstance(t, torch.Tensor) for t in (q, k, v, tables)):
+        raise InvalidInput("tlx.ops.paged_prefill expects tensor inputs")
+    if not q.is_cuda or any(t.device != q.device for t in (k, v, tables)):
+        raise InvalidInput("tlx.ops.paged_prefill expects inputs on one GPU")
+    space_name, invariance = _normalize_space_arg("paged_prefill", space)
+    _check_single_config_space("paged_prefill", space_name)
+    fn, spec = impl_for("paged_prefill", device=q.device)
+    check_inputs(spec, dtype=q.dtype)
+    check_backward(spec, q, k, v)
+    _check_enforced("paged_prefill", spec, invariance)
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, tables, kv_length=kv_length, window=window)
 
 
 def int4_embedding(weights, weights_offsets, indices, offsets, D, *, out=None, space=None):

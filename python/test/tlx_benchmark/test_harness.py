@@ -488,6 +488,30 @@ def test_clock_trace_unknown_without_samples():
     assert ClockTrace(samples=0).to_dict()["stable"] is None
 
 
+def test_amd_sysfs_gfx1250_identity(tmp_path, monkeypatch):
+    from _harness import denoise
+
+    nodes = tmp_path / "nodes"
+    node = nodes / "2"
+    node.mkdir(parents=True)
+    (node / "properties"
+     ).write_text("simd_count 1024\nvendor_id 4098\ndevice_id 30145\nunique_id 1234\nlocation_id 256\ndomain 1\n")
+    pci = tmp_path / "pci"
+    device = pci / "0001:01:00.0"
+    device.mkdir(parents=True)
+    (device / "mem_info_vram_used").write_text(str(3 * 1024**2))
+    monkeypatch.setattr(denoise, "_KFD_NODES", str(nodes))
+    monkeypatch.setattr(denoise, "_PCI_DEVICES", str(pci))
+    found = denoise._amd_sysfs_devices()
+    assert len(found) == 1
+    assert found[0].arch == "gfx1250"
+    assert found[0].uuid == "GPU-00000000000004d2"
+    assert found[0].pci_bus == "0001:01:00.0"
+    assert found[0].memory_used_mib == 3
+    # Architecture identity does not imply a product-specific power setting.
+    assert found[0].power_target_w is None
+
+
 def test_power_target_matches_the_part():
     from _harness.denoise import AMD, NVIDIA, Device
 
