@@ -13,7 +13,8 @@ python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
-`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, or one of the
+`kda_prefill`, `kda_decode`, `paged_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`,
+`moe`, `moe_routing`, or one of the
 fused operators below.
 
 Fused operators fuse an elementwise epilogue into a GEMM (`tlx/ops/kernels/fused/`): `addmm_mul_add`,
@@ -70,6 +71,7 @@ options:
 | `mla_window_attn` | `torch.compile` of the module, attention as FlexAttention | speedup >= 0.9x | heuristic |
 | `swiglu_ffn` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 | `rmsnorm_cat` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
+| `paged_decode` | none | full FP64 check; throughput and latency reporting | heuristic |
 | `moe` | none (FlyDSL's Muse MoE ships with aiter) | absolute floor, currently unset -> reports only | heuristic |
 | `moe_routing` | `torch.compile` of the eager routing | speedup >= 0.9x | heuristic |
 
@@ -333,3 +335,57 @@ inside the measured window. Build the tensors in `prepare` and capture them.
 `bench_norm.py` covers the GEO plain, saved-state, MXFP8, MXFP4, NVFP4,
 fused/jagged and softmax requests. It replays CUDA graphs for both providers;
 quantized cases report latency without a torch quantization speedup.
+
+### BF16 paged decode on gfx1250
+
+`bench_paged_decode.py` exercises `tlx.ops.paged_attention_decode`: BF16
+16 query heads / 2 KV heads, head dimension 64, 64-token shuffled pages,
+causal query lengths 1 and 8, global attention and a 2048-token window
+including self. `gfx1250_primary` (default) covers batches 1/8/32/128 and
+contexts 2K/8K/32K; `gfx1250_extended` covers batches 2/16/64/256 and contexts
+4K/16K/64K. Both use AITER-packed 5-D caches. `gfx1250_4d` repeats the primary
+matrix with standard `[blocks, heads, page, dim]` caches.
+
+```sh
+python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_primary
+python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_extended
+python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_4d
+pytest -s --tb=short python/test/unit/tlx_ops/test_paged_attn_gfx1250.py
+```
+
+On shared hosts, hold the host GPU lock for the whole process. GPU measurements
+include both partition and reduction kernels, using preallocated output and
+workspace. Allocation, cache packing, host dispatch and reference gathering
+are excluded. Useful FLOPs count QK + PV over visible attention pairs (FMA=2),
+excluding masks, softmax and normalization. Every output element is checked
+against independent FP64 attention, with relative RMS < 0.005 and elementwise
+atol/rtol 0.025. No dense-versus-paged speedup is reported by this benchmark.
+
+For allocation-free inference and HIP graph capture, allocate output and
+workspace once with matching plan arguments, warm up, then capture or replay:
+
+```python
+import torch
+from triton.tlx.ops import paged_attention_decode, paged_attention_decode_workspace
+
+# q: [batch * query_length, 16, 64], k/v: [blocks, 2, 64, 64], all BF16.
+# lengths: int32 [batch]; table: int32 [batch, capacity_pages].
+workspace = paged_attention_decode_workspace(
+    q, k, v, table, query_length=8, sliding_window=2048, max_context_len=32768)
+out = torch.empty_like(q)
+paged_attention_decode(
+    q, k, v, lengths, table, query_length=8, sliding_window=2048,
+    max_context_len=32768, out=out, workspace=workspace)
+```
+
+Lengths include the current query tokens. A query before key zero, or a
+zero-length sequence, produces zero. Inputs must be contiguous on one GPU;
+cache pointers must be 16-byte aligned. Used page IDs and device lengths must
+be valid; the operator does not copy metadata to the CPU. `max_context_len`
+defaults to table capacity and is limited to `2**31 - 32768`. It bounds device
+lengths even for sliding windows. Separate concurrently executing graphs or
+streams must use separate output and workspace storage, disjoint from inputs.
+The split plan is fixed by batch, query length, context bound and window.
+Q and visible K/V must be finite and produce finite FP32 accumulations.
+The operator is forward-only; it accepts grad-enabled input tensors under
+`torch.no_grad()`.
