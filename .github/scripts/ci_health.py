@@ -160,7 +160,8 @@ def _jobs(pages):
         "id":
         j.get("id"), "run_attempt":
         j.get("run_attempt", 1), "name":
-        j["name"], "conclusion":
+        j["name"], "status":
+        j.get("status"), "conclusion":
         j["conclusion"], "created_at":
         j.get("created_at"), "started_at":
         j["started_at"], "completed_at":
@@ -563,7 +564,7 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get, download
         (r for r in runs.values()
          if (r["status"] == "completed" and (r["jobs"] is None or r["id"] in enrich or r["id"] in sanitizer_retry)) or (
              r["wf"] == rules.FAST_WF and r["event"] == "pull_request" and r["status"] != "completed") or (
-                 r["wf"] == "gpu-tests.yml" and r["event"] == "workflow_run" and r["status"] != "completed")),
+                 r["wf"] == "gpu-tests.yml" and r["event"] in ("push", "workflow_run") and r["status"] != "completed")),
         key=lambda r: r["created_at"])
     unfetched = []
     for i, r in enumerate(todo):
@@ -604,7 +605,7 @@ def collect(data_dir, since, now, api=gh_api, text=gh_text, get=gh_get, download
         else:
             if r["wf"] in rules.GPU_RUN_WORKFLOWS:
                 _attach_failures(jobs, log, r["wf"])
-            if rules.slow_test_run(r):
+            if rules.slow_test_run(r) and r["status"] == "completed":
                 _attach_durations(jobs, log)
             if r["wf"] == rules.LIT_WF:
                 _attach_lit_failures(jobs, log)

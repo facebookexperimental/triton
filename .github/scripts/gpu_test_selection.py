@@ -698,6 +698,15 @@ def test_plan(paths, repo, filters, suites, narrow=True, offload=True):
     }
 
 
+def skipped_platforms(raw, platforms):
+    """The platforms named in GPU_CI_SKIP_PLATFORMS, comma or space separated. An unknown name is reported, not
+    fatal: a typo must not stop every CI run."""
+    names = {name.lower() for name in re.split(r"[\s,]+", raw or "") if name}
+    for name in sorted(names - set(platforms)):
+        print(f"::warning::GPU_CI_SKIP_PLATFORMS names unknown platform '{name}'; known: {', '.join(platforms)}")
+    return sorted(names & set(platforms))
+
+
 def selection_summary(plan, suites, sha, note=""):
     gpu_jobs = sum(
         int(any(groups[name]["files"] for name in ("core", "correctness", "codegen"))) +
@@ -773,6 +782,7 @@ def main():
     paths = None
     diff_known = True
     selection_note = ""
+    bump = None
     event_name = os.environ["GITHUB_EVENT_NAME"]
     event = {}
     try:
@@ -806,10 +816,23 @@ def main():
                     suite["files"] = []
         if "cpu" not in platforms:
             plan["cpu"] = {}
+        selection_note = " ".join(
+            filter(None,
+                   (selection_note,
+                    f"Manual platform list: {','.join(platforms)}. Other platforms are not covered by this run.")))
+    skipped = [] if bump else skipped_platforms(os.environ.get("GPU_CI_SKIP_PLATFORMS"), list(plan["gpu"]))
+    for platform in skipped:
+        plan["gpu"][platform] = {group: {**entry, "files": []} for group, entry in plan["gpu"][platform].items()}
+    if skipped:
+        print(f"::warning::GPU_CI_SKIP_PLATFORMS skips {', '.join(skipped)}: not tested on this run")
+        print(f"GPU platforms skipped by GPU_CI_SKIP_PLATFORMS: {skipped}")
+        selection_note = " ".join(
+            filter(None, (selection_note, f"Not tested, skipped by the repository variable "
+                          f"GPU_CI_SKIP_PLATFORMS: {', '.join(skipped)}.")))
+    if platforms is not None or skipped:
         plan["build"] = bool(plan["cpu"]) or any(suite["files"]
                                                  for suites in plan["gpu"].values()
                                                  for suite in suites.values())
-        selection_note = f"Manual platform list: {','.join(platforms)}. Other platforms are not covered by this run."
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     print(json.dumps(plan, indent=2))
     selection = {platform: any(step["files"] for step in steps.values()) for platform, steps in plan["gpu"].items()}

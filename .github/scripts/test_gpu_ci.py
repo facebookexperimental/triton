@@ -1302,6 +1302,67 @@ def test_manual_platform_allowlist_rejects_invalid_names(requested):
 
 
 @pytest.mark.parametrize("script", ["fast_tests.py", "gpu_test_selection.py"])
+@pytest.mark.parametrize("requested,skipped", [
+    ("h100,b200,cpu", "b200"),
+    ("b200", "b200"),
+    ("h100,b200,mi350", "h100 b200 mi350"),
+])
+def test_manual_platform_allowlist_combines_with_outage_skips(tmp_path, script, requested, skipped):
+    import os
+    import sys
+
+    outputs = []
+    for index, skip in enumerate(("", skipped)):
+        event, output, summary = (tmp_path / f"{name}-{index}" for name in ("event", "output", "summary"))
+        event.write_text(json.dumps({"inputs": {"platforms": requested}}))
+        command = [sys.executable, str(ROOT / ".github/scripts" / script)]
+        if script == "fast_tests.py":
+            command.append("select")
+        subprocess.run(
+            command, cwd=ROOT, env=os.environ | {
+                "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(output),
+                "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_REPOSITORY": "facebookexperimental/triton",
+                "GPU_CI_SKIP_PLATFORMS": skip
+            }, check=True, capture_output=True, text=True)
+        outputs.append(dict(line.split("=", 1) for line in output.read_text().splitlines()))
+        assert f"Manual platform list: {requested}" in summary.read_text()
+        if skip:
+            assert "Not tested, skipped by the repository variable GPU_CI_SKIP_PLATFORMS" in summary.read_text()
+    normal, limited = outputs
+    for platform in ("h100", "b200", "mi350", "cpu"):
+        plan = json.loads(limited[f"{platform}_plan"])
+        if platform in skipped.split():
+            assert limited[platform] == "false"
+            if script == "fast_tests.py":
+                assert all(not entries for entries in plan.values())
+            else:
+                assert all(not suite["files"] for suite in plan.values())
+        else:
+            assert limited[platform] == normal[platform]
+            assert plan == json.loads(normal[f"{platform}_plan"])
+    assert (limited["build"] == "true") == any(limited[platform] == "true"
+                                               for platform in ("h100", "b200", "mi350", "cpu"))
+
+
+def test_outage_skips_do_not_reduce_meta_llvm_bump_coverage(tmp_path):
+    import os
+    import sys
+
+    event, output = tmp_path / "event", tmp_path / "output"
+    event.write_text(json.dumps({"ref": "refs/heads/scratch/meta-llvm-bump/main"}))
+    subprocess.run(
+        [sys.executable, str(ROOT / ".github/scripts/gpu_test_selection.py")], cwd=ROOT, env=os.environ | {
+            "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(output),
+            "GPU_CI_SKIP_PLATFORMS": "h100 b200 mi350"
+        }, check=True, capture_output=True, text=True)
+    selected = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    for platform in ("h100", "b200", "mi350"):
+        assert selected[platform] == "true"
+        assert any(suite["files"] for suite in json.loads(selected[f"{platform}_plan"]).values())
+    assert selected["build"] == "true"
+
+
+@pytest.mark.parametrize("script", ["fast_tests.py", "gpu_test_selection.py"])
 @pytest.mark.parametrize("requested", ["h100,mi350,cpu", "b200", "cpu"])
 def test_manual_platform_allowlist_preserves_requested_work(tmp_path, script, requested):
     import os

@@ -389,6 +389,19 @@ def test_collect_rejects_exact_pr_with_wrong_verified_repository_or_ref(tmp_path
     assert stored.get("followup_status") is None and stored.get("pr") is None and stored["tested_sha"] is None
 
 
+@pytest.mark.parametrize("event", ["push", "workflow_run"])
+def test_collect_hydrates_running_gpu_push_and_followup(tmp_path, event):
+    raw = gh_run(1, "2026-10-12T01:00:00Z", status="in_progress", conclusion=None, event=event, head_branch="main")
+    finished = gh_job(10, "h100 / h100-tlx-test") | {"status": "completed"}
+    waiting = gh_job(11, "b200 / b200-tlx-test",
+                     conclusion=None) | {"status": "queued", "started_at": None, "completed_at": None, "steps": []}
+    _, api, _ = collect(tmp_path, {"gpu-tests.yml": [raw]}, {1: [finished, waiting]})
+    stored = ch.load_runs(str(tmp_path))[1]
+    assert stored["status"] == "in_progress"
+    assert [job["status"] for job in stored["jobs"]] == ["completed", "queued"]
+    assert any("/runs/1/jobs?" in call for call in api.calls)
+
+
 def test_collect_hydrates_running_fast_parent_and_preserves_source_evidence(tmp_path):
     sha = 'ab' * 20
     raw = gh_run(1, '2026-10-12T01:00:00Z', status='in_progress', conclusion=None, pull_requests=[{'number': 4855}])

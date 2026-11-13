@@ -37,6 +37,9 @@ jobs:
           fetch-depth: 0
       - name: Select affected fast suites
         id: select
+        env:
+          # Platforms to leave untested while their runners are down, e.g. "b200".
+          GPU_CI_SKIP_PLATFORMS: ${{ vars.GPU_CI_SKIP_PLATFORMS }}
         run: python3 .github/scripts/fast_tests.py select
 
   build:

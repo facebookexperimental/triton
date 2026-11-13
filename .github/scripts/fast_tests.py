@@ -18,6 +18,7 @@ from gpu_test_selection import (
     kernel_matchers_for,
     parse_catalog,
     select_platforms,
+    skipped_platforms,
     test_file_affected,
     PATH_FILTERS,
     CORRECTNESS_REL,
@@ -487,6 +488,11 @@ def main():
                 if platform not in platforms:
                     selected[platform] = False
                     plans[platform] = {key: [] for key in plans[platform]}
+        skipped = skipped_platforms(os.environ.get("GPU_CI_SKIP_PLATFORMS"), [p for p in plans if p != "cpu"])
+        for platform in skipped:
+            selected[platform] = False
+            plans[platform] = {key: [] for key in plans[platform]}
+        if platforms is not None or skipped:
             selected["build"] = any(selected[platform] for platform in plans)
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             for key, value in selected.items():
@@ -500,6 +506,9 @@ def main():
                 if platforms is not None:
                     output.write(f"Manual platform list: {','.join(platforms)}. "
                                  "Other platforms are not covered by this run.\n\n")
+                if skipped:
+                    output.write(f"Not tested, skipped by the repository variable GPU_CI_SKIP_PLATFORMS: "
+                                 f"{', '.join(skipped)}.\n\n")
                 for platform, plan in plans.items():
                     if not selected[platform]:
                         continue

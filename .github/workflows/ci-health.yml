@@ -5,7 +5,8 @@ name: CI Health
 # branch's Meta LLVM pin, into the
 # 'ci-health' release, for the /ci/ dashboard
 # that pages.yml renders after each successful collection. Never deploys. It also
-# opens an issue when a GPU runner pool stops picking up jobs (runner_health.py).
+# opens an issue when a GPU runner pool stops picking up jobs, and cancels test runs left
+# waiting only on that pool (runner_health.py).
 # On pull requests it only runs the tests.
 on:
   schedule:
@@ -122,7 +123,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read     # list queued and running jobs
+      actions: write    # list queued and running jobs, cancel runs stuck on a down pool
       issues: write     # open and close runner pool issues
     steps:
       - uses: actions/checkout@v4
