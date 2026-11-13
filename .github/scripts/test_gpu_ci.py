@@ -927,7 +927,8 @@ def test_full_tests_follow_only_a_verified_current_fast_run():
     assert workflow_condition(full['jobs']['select']['if'], push)
     assert not workflow_condition(full['jobs']['build']['if'],
                                   run | {'needs.select.outputs.build': 'true', 'needs.select.result': 'success'})
-    for platform in ('h100', 'b200', 'mi350', 'cpu'):
+    assert full['jobs']['b200']['if'] == '${{ false }}'
+    for platform in ('h100', 'mi350', 'cpu'):
         worker = full['jobs']['cpu-tests' if platform == 'cpu' else platform]
         context = run | {
             'needs.select.result': 'success', 'needs.build.result': 'skipped', f'needs.select.outputs.{platform}':

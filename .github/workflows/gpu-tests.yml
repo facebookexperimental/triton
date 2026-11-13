@@ -155,7 +155,8 @@ jobs:
 
   b200:
     needs: [followup, select, build]
-    if: ${{ !cancelled() && needs.select.result == 'success' && (github.event_name == 'workflow_run' || needs.build.result == 'success') && needs.select.outputs.b200 == 'true' }}
+    # Temporarily disabled while the B200 runner is offline.
+    if: ${{ false }}
     # Test jobs run the PR's code with read-only tokens; only the trusted issue reporters write.
     permissions:
       contents: read
