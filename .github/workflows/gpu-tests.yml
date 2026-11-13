@@ -81,6 +81,7 @@ jobs:
         id: select
         env:
           GH_TOKEN: ${{ github.token }}
+          GPU_CI_SKIP_PLATFORMS: ${{ vars.GPU_CI_SKIP_PLATFORMS }}
           EVENT_NAME: ${{ github.event_name }}
           BASE: ${{ needs.followup.outputs.base }}
           PR_HEAD: ${{ needs.followup.outputs.pr_head }}

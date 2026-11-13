@@ -160,17 +160,23 @@ def attach_lit_failures(job, log_text):
 
 
 SELECTION = re.compile(r"GPU selection for \S+: (\{.*\})")
+SKIPPED = re.compile(r"GPU platforms skipped by GPU_CI_SKIP_PLATFORMS: (\[.*\])")
 
 
 def parse_selection(log_text):
-    """What gpu_test_selection.py chose for a run: {h100, b200, mi350, build, cpu?, fallback}, or None if not found.
-    fallback is True when the changed paths were unavailable and every suite ran."""
-    found = None
+    """What gpu_test_selection.py chose for a run: {h100, b200, mi350, build, cpu?, fallback, skipped?}, or None if
+    not found. fallback is True when the changed paths were unavailable and every suite ran; skipped lists the
+    platforms GPU_CI_SKIP_PLATFORMS turned off."""
+    found, skipped = None, None
     for line in log_text.splitlines():
-        m = SELECTION.search(ANSI.sub("", line))
-        if m:
+        line = ANSI.sub("", line)
+        if m := SELECTION.search(line):
             found = {k: v is True for k, v in ast.literal_eval(m.group(1)).items()}
+        elif m := SKIPPED.search(line):
+            skipped = ast.literal_eval(m.group(1))
     if found is not None:
+        if skipped:
+            found["skipped"] = skipped
         found["fallback"] = any(message in log_text
                                 for message in ("Cannot determine changed paths", "Cannot select tests"))
     return found

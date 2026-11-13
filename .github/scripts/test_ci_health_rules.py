@@ -765,6 +765,27 @@ def test_grid_marks_gpus_skipped_by_selection_and_runs_in_progress():
     assert [p["cells"]["H100"] for p in v["pushes"]] == ["na", "skip", "running"]
 
 
+def test_each_gpu_of_a_push_in_progress_shows_its_own_jobs():
+    h100 = tlx(gpu="h100")
+    queued = {**tlx(), "status": "queued", "conclusion": None, "steps": []}
+    running = {**tlx(gpu="mi350"), "status": "in_progress", "conclusion": None}
+    stuck = push(1, h100, queued, running, status="in_progress", conclusion=None)
+    stuck["select"] = {"h100": True, "b200": True, "mi350": True, "build": True}
+    never_ran = {**tlx(), "conclusion": "cancelled", "steps": []}
+    skipped = push(2, tlx(gpu="h100"), never_ran, conclusion="cancelled")
+    skipped["select"] = {"h100": True, "b200": False, "mi350": False, "build": True, "skipped": ["mi350"]}
+    v = main([stuck, skipped])
+    assert [p["cells"]
+            for p in v["pushes"]] == [{"H100": "pass", "B200": "waiting", "MI350": "running", "CPU": "running"},
+                                      {"H100": "pass", "B200": "norunner", "MI350": "off", "CPU": "na"}]
+
+
+def test_a_gpu_job_that_never_got_a_runner_keeps_its_known_failures():
+    never_ran = {**tlx(), "conclusion": "cancelled", "steps": []}
+    v = main([push(1, tlx("t1")), push(2, tlx("t1")), push(3, never_ran, conclusion="cancelled")])
+    assert v["gpus"]["B200"]["verdict"] == "known" and items(v, "B200", "known") == {("t1", "01")}
+
+
 def test_lit_run_in_progress_shows_as_running():
     v = r.lit_view([lit(1), run(2, [], wf="compiler.yml", status="in_progress", conclusion=None)], stamp(23))
     assert [p["cell"] for p in v["pushes"]] == ["pass", "running"] and v["verdict"] == "passing"
