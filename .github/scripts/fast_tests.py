@@ -13,6 +13,7 @@ from gpu_test_selection import (
     classify,
     collect_imports,
     correctness_selection,
+    exclude_b200,
     iter_scan_files,
     kernel_matchers_for,
     parse_catalog,
@@ -480,6 +481,10 @@ def main():
         paths = changed_paths(os.environ["GITHUB_EVENT_NAME"], event)
         selected, plans = fast_plan(paths, ROOT, json.loads(PATH_FILTERS.read_text()), json.loads(SUITES.read_text()),
                                     narrow=os.environ["GITHUB_EVENT_NAME"] == "pull_request")
+        excluded = exclude_b200(os.environ["GITHUB_EVENT_NAME"], event)
+        if excluded:
+            selected["b200"] = False
+            plans["b200"] = {key: [] for key in plans["b200"]}
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             for key, value in selected.items():
                 output.write(f"{key}={str(value).lower()}\n")
@@ -489,6 +494,8 @@ def main():
         if summary:
             with open(summary, "a") as output:
                 output.write("## Baseline plus touched tests\n\n")
+                if excluded:
+                    output.write("B200 excluded by manual request. This run does not validate B200 coverage.\n\n")
                 for platform, plan in plans.items():
                     if not selected[platform]:
                         continue

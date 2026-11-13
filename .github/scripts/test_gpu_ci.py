@@ -1253,3 +1253,53 @@ def test_fast_collection_cannot_silently_remove_a_touched_function(tmp_path, tes
     gaps = verify_manifests([manifest])
     assert gaps and gaps[0]["details"][0]["status"] == "missing"
     assert "test_touched" in gaps[0]["target"]
+
+
+@pytest.mark.parametrize("event_name,requested,expected", [
+    ("workflow_dispatch", True, True),
+    ("workflow_dispatch", "true", True),
+    ("workflow_dispatch", False, False),
+    ("workflow_dispatch", "false", False),
+    ("pull_request", True, False),
+    ("push", True, False),
+    ("schedule", True, False),
+    ("workflow_run", True, False),
+])
+def test_b200_exclusion_is_opt_in_and_manual_only(event_name, requested, expected):
+    from gpu_test_selection import exclude_b200
+    assert exclude_b200(event_name, {"inputs": {"exclude_b200": requested}}) == expected
+    assert not exclude_b200(event_name, {})
+
+
+@pytest.mark.parametrize("script", ["fast_tests.py", "gpu_test_selection.py"])
+def test_manual_b200_exclusion_preserves_other_platforms(tmp_path, script):
+    import os
+    import sys
+
+    outputs = []
+    for excluded in (False, True):
+        event, output, summary = (tmp_path / f"{name}-{excluded}" for name in ("event", "output", "summary"))
+        event.write_text(json.dumps({"inputs": {"exclude_b200": excluded}}))
+        command = [sys.executable, str(ROOT / ".github/scripts" / script)]
+        if script == "fast_tests.py":
+            command.append("select")
+        subprocess.run(
+            command, cwd=ROOT, env=os.environ | {
+                "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(output),
+                "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_REPOSITORY": "facebookexperimental/triton"
+            }, check=True, capture_output=True, text=True)
+        outputs.append(dict(line.split("=", 1) for line in output.read_text().splitlines()))
+        if excluded:
+            assert "does not validate B200 coverage" in summary.read_text()
+    normal, limited = outputs
+    assert normal["b200"] == "true" and limited["b200"] == "false"
+    plan = json.loads(limited["b200_plan"])
+    if script == "fast_tests.py":
+        assert not plan["baseline"] and not plan["touched"]
+    else:
+        assert all(not suite["files"] for suite in plan.values())
+    for platform in ("h100", "mi350", "cpu"):
+        assert limited[platform] == normal[platform]
+        assert limited[f"{platform}_plan"] == normal[f"{platform}_plan"]
+    assert limited["h100"] == limited["mi350"] == "true"
+    assert limited["build"] == normal["build"] == "true"

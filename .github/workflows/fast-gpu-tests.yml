@@ -2,6 +2,12 @@ name: Fast Triton correctness
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      exclude_b200:
+        description: Exclude B200 from this manual run only (not full platform coverage)
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -121,7 +127,7 @@ jobs:
           if-no-files-found: ignore
 
   result:
-    name: Fast correctness
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.exclude_b200 && 'Fast correctness (B200 excluded)' || 'Fast correctness' }}
     needs: [select, build, h100, b200, mi350, cpu]
     if: always() && github.repository_owner == 'facebookexperimental'
     runs-on: ubuntu-latest

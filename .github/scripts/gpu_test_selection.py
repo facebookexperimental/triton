@@ -737,6 +737,11 @@ def selection_summary(plan, suites, sha, note=""):
     return "\n".join(lines)
 
 
+def exclude_b200(event_name, event):
+    requested = event.get("inputs", {}).get("exclude_b200", False)
+    return event_name == "workflow_dispatch" and requested in (True, "true")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--changed-files")
@@ -762,6 +767,7 @@ def main():
     diff_known = True
     selection_note = ""
     event_name = os.environ["GITHUB_EVENT_NAME"]
+    event = {}
     try:
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         bump = bump_ref(event_name, event)
@@ -785,6 +791,10 @@ def main():
         # Configuration or test enumeration failures must not produce an empty success.
         plan = test_plan(None, repo, filters, suites, narrow=False, offload=False)
         selection_note = "Test selection could not be narrowed; full GPU coverage is retained."
+    if exclude_b200(event_name, event):
+        for suite in plan["gpu"]["b200"].values():
+            suite["files"] = []
+        selection_note = "B200 excluded by manual request. This run does not validate B200 coverage."
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     print(json.dumps(plan, indent=2))
     selection = {platform: any(step["files"] for step in steps.values()) for platform, steps in plan["gpu"].items()}
