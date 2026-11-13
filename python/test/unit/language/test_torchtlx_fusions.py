@@ -150,6 +150,45 @@ class TestTorchTLXEpilogueFusion(TestCase):
         env.start()
         self.addCleanup(env.stop)
 
+    def test_manual_output_templates_veto_epilogue_fusion(self):
+        from torch._inductor import ir
+        from triton.language.extra.tlx.inductor import choices, mm_templates
+
+        manual_templates = tuple(template for template in vars(mm_templates).values()
+                                 if getattr(template, "tlx_manual_output", False))
+        self.assertTrue(manual_templates)
+        self.assertEqual(
+            choices._TLX_NO_EPILOGUE_FUSION_TEMPLATE_NAMES,
+            frozenset(template.name for template in manual_templates),
+        )
+
+        node2 = mock.Mock()
+        node2.get_nodes.return_value = ()
+        for template in manual_templates:
+            with self.subTest(template=template.name):
+                template_node = SimpleNamespace(annotations={"ktc": SimpleNamespace(template=template)}, )
+                scheduler_node = mock.Mock()
+                scheduler_node.is_template.return_value = True
+                scheduler_node.get_template_node.return_value = template_node
+                node1 = mock.Mock()
+                node1.get_nodes.return_value = (scheduler_node, )
+                self.assertTrue(choices._has_tlx_no_epilogue_fusion_candidate(node1, node2))
+
+                class MultiTemplateBuffer:
+
+                    def __init__(self):
+                        self.choices = (SimpleNamespace(name=f"triton_{template.name}_0"), )
+
+                scheduler_node.get_template_node.return_value = MultiTemplateBuffer()
+                with mock.patch.object(ir, "MultiTemplateBuffer", MultiTemplateBuffer):
+                    self.assertTrue(choices._has_tlx_no_epilogue_fusion_candidate(node1, node2))
+
+                scheduler_node.get_template_node.return_value = MultiTemplateBuffer()
+                scheduler_node.get_template_node.return_value.choices = (SimpleNamespace(
+                    name=f"triton_prefix_{template.name}_0"), )
+                with mock.patch.object(ir, "MultiTemplateBuffer", MultiTemplateBuffer):
+                    self.assertFalse(choices._has_tlx_no_epilogue_fusion_candidate(node1, node2))
+
     @unittest.skipIf(
         not has_datacenter_blackwell_tma_device(),
         "Need Blackwell with device-side TMA support in Triton",

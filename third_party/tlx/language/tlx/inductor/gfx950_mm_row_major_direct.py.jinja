@@ -1,0 +1,41 @@
+from triton.tlx.ops.kernels.mm.gfx950 import (
+    _row_major_direct_kernel as _gfx950_row_major_direct,
+)
+
+
+{{def_kernel("A", "B")}}
+    M: tl.constexpr = {{size("A", 0)}}
+    N: tl.constexpr = {{size("B", 1)}}
+    K: tl.constexpr = {{size("A", 1)}}
+    C = {{output_ptr()}}
+
+    _gfx950_row_major_direct(
+        A,
+        B,
+        C,
+        C,
+        M,
+        N,
+        K,
+        0,
+        {{stride("A", 0)}},
+        {{stride("A", 1)}},
+        0,
+        {{stride("B", 0)}},
+        {{stride("B", 1)}},
+        0,
+        0,
+        0,
+        N,
+        1,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        NUM_BUFFERS=NUM_BUFFERS,
+        NUM_XCDS=1,
+        TILES_PER_PROBLEM=TILES_PER_PROBLEM,
+        PROGRAM_COUNT=PROGRAM_COUNT,
+        A_BASES=A_BASES,
+        B_BASES=B_BASES,
+        ADD_BIAS=False,
+    )

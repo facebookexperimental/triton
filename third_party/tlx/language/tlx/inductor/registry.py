@@ -20,6 +20,7 @@ them without importing torch._inductor.
 
 import contextlib
 import dataclasses
+import functools
 import logging
 import os
 import re
@@ -155,10 +156,22 @@ from .mm_templates import (
     gfx950_addmm_persistent_warppipe_template,
     gfx950_addmm_warppipe_template,
     gfx950_bmm_warppipe_template,
+    gfx950_mm_cached_b_template,
+    gfx950_mm_extern,
+    gfx950_mm_fragmented_m_template,
+    gfx950_mm_hybrid_n160_extern,
     gfx950_mm_interwave_template,
+    gfx950_mm_m192n256_extern,
+    gfx950_mm_ragged_n_extern,
+    gfx950_mm_streamk_extern,
+    gfx950_mm_fragmented_register_template,
+    gfx950_mm_lds_template,
+    gfx950_mm_wave_grid_template,
     gfx950_mm_local_split_u_template,
     gfx950_mm_persistent_template,
     gfx950_mm_register_template,
+    gfx950_mm_row_major_direct_template,
+    gfx950_mm_short_k_template,
 )
 
 
@@ -204,6 +217,75 @@ def _is_gfx950() -> bool:
         return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
     except (AssertionError, AttributeError, RuntimeError):
         return False
+
+
+@functools.cache
+def _gfx950_benchmark_shape_keys():
+    from triton.tlx.ops.kernels.mm._shapes import FOCUS
+
+    return frozenset(
+        (
+            shape.m,
+            shape.n,
+            shape.k,
+            shape.a_strides,
+            shape.b_strides,
+            shape.dtype,
+        )
+        for shape in FOCUS.resolved_shapes("gfx950_all")
+    )
+
+
+def _gfx950_mm_extern_is_supported(kernel_inputs):
+    if not isinstance(kernel_inputs, MMKernelInputs) or not _is_gfx950():
+        return False
+    dtype = kernel_inputs.dtype(kernel_inputs._mat1_idx)
+    if (
+        dtype not in (torch.float16, torch.bfloat16)
+        or kernel_inputs.dtype(kernel_inputs._mat2_idx) != dtype
+        or kernel_inputs.out_dtype() != dtype
+    ):
+        return False
+
+    m, n, k = kernel_inputs.mnk_symbolic()
+    strides = kernel_inputs.strides_hinted()
+    a_strides = strides[kernel_inputs._mat1_idx][-2:]
+    b_strides = strides[kernel_inputs._mat2_idx][-2:]
+    values = (m, n, k, *a_strides, *b_strides)
+    if not all(isinstance(value, (int, sympy.Integer)) for value in values):
+        return False
+    m, n, k, stride_am, stride_ak, stride_bk, stride_bn = (
+        int(value) for value in values
+    )
+    if min(m, n, k, stride_am, stride_ak, stride_bk, stride_bn) <= 0:
+        return False
+
+    dtype_name = "fp16" if dtype == torch.float16 else "bf16"
+    key = (
+        m,
+        n,
+        k,
+        (stride_am, stride_ak),
+        (stride_bk, stride_bn),
+        dtype_name,
+    )
+    if key in _gfx950_benchmark_shape_keys():
+        return True
+
+    from triton.tlx.ops.kernels.mm.gfx950 import heuristic_config
+
+    return (
+        heuristic_config(
+            m,
+            n,
+            k,
+            dtype,
+            torch.finfo(dtype).bits // 8,
+            (stride_am, stride_ak),
+            (stride_bk, stride_bn),
+        )
+        is not None
+    )
 
 
 def _is_gfx942() -> bool:
@@ -1459,7 +1541,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 1}
 
 
-def _gfx950_static_tn_problem(kernel_inputs, dtypes):
+def _gfx950_static_problem(kernel_inputs, dtypes):
     if not isinstance(kernel_inputs, MMKernelInputs) or not _is_gfx950():
         return None
     dtype = kernel_inputs.dtype(kernel_inputs._mat1_idx)
@@ -1479,7 +1561,7 @@ def _gfx950_static_tn_problem(kernel_inputs, dtypes):
     )
     if min(m, n, k, stride_am, stride_ak, stride_bk, stride_bn) <= 0:
         return None
-    if stride_ak != 1 or stride_bk != 1:
+    if stride_ak != 1:
         return None
 
     out_dtype = kernel_inputs.out_dtype()
@@ -1495,7 +1577,77 @@ def _gfx950_static_tn_problem(kernel_inputs, dtypes):
     c_span_bytes = m * n * out_dtype.itemsize
     if max(a_span_bytes, b_span_bytes, c_span_bytes) > int32_max:
         return None
+    return (
+        m,
+        n,
+        k,
+        dtype,
+        out_dtype,
+        (stride_am, stride_ak),
+        (stride_bk, stride_bn),
+    )
+
+
+def _gfx950_static_tn_problem(kernel_inputs, dtypes):
+    problem = _gfx950_static_problem(kernel_inputs, dtypes)
+    if problem is None or problem[6][0] != 1:
+        return None
+    m, n, k, _, out_dtype, _, _ = problem
     return m, n, k, out_dtype
+
+
+def _gfx950_static_dispatch(kernel_inputs):
+    problem = _gfx950_static_problem(
+        kernel_inputs,
+        (torch.float16, torch.bfloat16),
+    )
+    if problem is None:
+        return None
+    m, n, k, dtype, _, a_strides, b_strides = problem
+    from triton.tlx.ops.kernels.mm.gfx950 import (
+        _dispatch_plan,
+        _optimized_geometry_config,
+        _persistent_plan_for_shape,
+        _ROW_MAJOR_DIRECT_PLANS,
+        _ROW_MAJOR_WAVE_GRID_PLANS,
+        heuristic_config,
+    )
+
+    args = (
+        m,
+        n,
+        k,
+        dtype,
+        torch.finfo(dtype).bits // 8,
+        a_strides,
+        b_strides,
+    )
+    optimized = _optimized_geometry_config(*args)
+    if optimized is not None:
+        return optimized
+    if dtype == torch.bfloat16:
+        return heuristic_config(*args)
+    if b_strides[1] == 1:
+        persistent = _persistent_plan_for_shape(m, n, k, dtype)
+        if persistent is not None:
+            return "persistent", persistent
+        wave_grid = _ROW_MAJOR_WAVE_GRID_PLANS.get((m, n, k))
+        if wave_grid is not None:
+            return "wave_grid", wave_grid
+        direct = _ROW_MAJOR_DIRECT_PLANS.get((m, n, k))
+        if direct is not None:
+            return "row_major_direct", direct
+    # `_dispatch_plan` is the dense-TN selector. Other B layouts retain the
+    # stride-aware public heuristic used by `tlx.ops.mm`.
+    if b_strides[0] != 1:
+        return heuristic_config(*args)
+    return _dispatch_plan(
+        m,
+        n,
+        k,
+        dtype,
+        torch.finfo(dtype).bits // 8,
+    )
 
 
 class _Gfx942MMTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
@@ -1787,6 +1939,78 @@ class _Gfx950InterWaveTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplat
             return
 
         out_dtype = kernel_inputs.out_dtype()
+        from triton.tlx.ops.kernels.mm.gfx950 import heuristic_config
+
+        dispatch = heuristic_config(
+            m_int,
+            n_int,
+            k_int,
+            kernel_inputs.dtype(kernel_inputs._mat1_idx),
+            itemsize,
+            (stride_am, stride_ak),
+            (stride_bk, stride_bn),
+        )
+        if dispatch is not None and dispatch[0] == "inter_wave" and dispatch[1]:
+            plan = dispatch[1]
+            block_m, block_n = plan.get("TILE", (256, 256))
+            if plan.get("SPLIT_K", 1) == 1:
+                warps_m, warps_n = plan.get("WARP_GRID", (2, 4))
+                group_m = plan.get("GROUP_M_OVERRIDE")
+                if group_m is None:
+                    group_m = (
+                        4
+                        if m_int == n_int and k_int >= 8192
+                        else 2
+                        if m_int <= 1024 and n_int >= 16384
+                        else 8
+                    )
+                num_xcds = plan.get("NUM_XCDS_OVERRIDE")
+                if num_xcds is None:
+                    num_xcds = 1 if m_int == n_int and k_int >= 8192 else 8
+                triton_config = self.triton_config(
+                    1,
+                    warps_m * warps_n,
+                    BLOCK_M=block_m,
+                    BLOCK_N=block_n,
+                    BLOCK_K=64,
+                    GROUP_M=group_m,
+                    NUM_XCDS=num_xcds,
+                    B_COL_MAJOR=b_is_col_major and not b_is_row_major,
+                    HAS_M_TAIL=not m_is_static or m_int % block_m != 0,
+                    HAS_REGISTER_TAIL=k_int % 128 != 0,
+                    matrix_instr_nonkdim=plan.get("MATRIX_INSTR_NONKDIM", 16),
+                    waves_per_eu=plan.get("WAVES_PER_EU", 0),
+                    kpack=get_default_kpack(64),
+                    llvm_fn_attrs=(
+                        (("amdgpu-agpr-alloc", "0,0"),)
+                        if plan.get("DISABLE_AGPR", True)
+                        else ()
+                    ),
+                    reverse_local_assignment=plan.get(
+                        "REVERSE_LOCAL_ASSIGNMENT", False
+                    ),
+                    sink_insts_to_avoid_spills=plan.get(
+                        "SINK_INSTS_TO_AVOID_SPILLS", False
+                    ),
+                    regclass_priority_trumps_globalness=plan.get(
+                        "REGCLASS_PRIORITY", False
+                    ),
+                    disable_unclustered_high_rp_reschedule=plan.get(
+                        "DISABLE_HIGH_RP_RESCHEDULE", False
+                    ),
+                    enable_sched_group_barrier_scheduler=True,
+                    sched_group_barrier_mfma_per_dwordx4=plan.get(
+                        "SCHED_MFMA_PER_DWORDX4", 4
+                    ),
+                )
+                yield self._convert_config_to_template_kwargs(
+                    triton_config,
+                    m,
+                    n,
+                    k,
+                    out_dtype,
+                )
+                return
         for (
             block_m,
             block_n,
@@ -1827,6 +2051,371 @@ class _Gfx950InterWaveTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplat
 
 
 @register_template_heuristic(
+    gfx950_mm_extern.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMExternConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Offer the trusted ``tlx.ops.mm`` dispatch as an autotuning candidate."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm" or not _gfx950_mm_extern_is_supported(kernel_inputs):
+            return
+        dispatch = _gfx950_static_dispatch(kernel_inputs)
+        if dispatch is not None and dispatch[0] in (
+            "streamk",
+            "ragged_n",
+            "m192n256",
+            "hybrid_n160",
+        ):
+            return
+        yield {}
+
+
+class _Gfx950MMFamilyExternConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    FAMILY = ""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        dispatch = _gfx950_static_dispatch(kernel_inputs)
+        if dispatch is not None and dispatch[0] == self.FAMILY:
+            yield {}
+
+
+@register_template_heuristic(
+    gfx950_mm_streamk_extern.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMStreamKExternConfigHeuristic(
+    _Gfx950MMFamilyExternConfigHeuristic
+):
+    FAMILY = "streamk"
+
+
+@register_template_heuristic(
+    gfx950_mm_ragged_n_extern.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMRaggedNExternConfigHeuristic(
+    _Gfx950MMFamilyExternConfigHeuristic
+):
+    FAMILY = "ragged_n"
+
+
+@register_template_heuristic(
+    gfx950_mm_m192n256_extern.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMM192N256ExternConfigHeuristic(
+    _Gfx950MMFamilyExternConfigHeuristic
+):
+    FAMILY = "m192n256"
+
+
+@register_template_heuristic(
+    gfx950_mm_hybrid_n160_extern.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMHybridN160ExternConfigHeuristic(
+    _Gfx950MMFamilyExternConfigHeuristic
+):
+    FAMILY = "hybrid_n160"
+
+
+@register_template_heuristic(
+    gfx950_mm_cached_b_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMCachedBTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Mirror the trusted short-K cached-B LDS dispatch exactly."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(
+            kernel_inputs,
+            (torch.float16, torch.bfloat16),
+        )
+        if problem is None:
+            return
+        m, n, k, dtype, out_dtype, a_strides, b_strides = problem
+        from triton.tlx.ops.kernels.mm.gfx950 import _optimized_geometry_config
+
+        dispatch = _optimized_geometry_config(
+            m,
+            n,
+            k,
+            dtype,
+            torch.finfo(dtype).bits // 8,
+            a_strides,
+            b_strides,
+        )
+        if dispatch is None or dispatch[0] != "cached_b_lds":
+            return
+        plan = dispatch[1]
+        triton_config = self.triton_config(
+            1,
+            2 * plan["WARPS_M"],
+            BLOCK_M=16 * plan["WARPS_M"] * plan["MI_WAVE_TILE_M"],
+            BLOCK_N=32 * plan["MI_WAVE_TILE_N"],
+            BLOCK_K=64,
+            K_BLOCKS=k // 64,
+            MI_WAVE_TILE_M=plan["MI_WAVE_TILE_M"],
+            MI_WAVE_TILE_N=plan["MI_WAVE_TILE_N"],
+            WARPS_M=plan["WARPS_M"],
+            PROGRAM_COUNT=plan["PROGRAM_COUNT"],
+            NUM_PROGRAMS=plan["PROGRAM_COUNT"],
+            GROUP_M=plan["GROUP_M"],
+            MANUAL_OUTPUT=True,
+            WIDE=True,
+            matrix_instr_nonkdim=16,
+            regclass_priority_trumps_globalness=True,
+            reverse_local_assignment=True,
+            sink_insts_to_avoid_spills=True,
+            disable_unclustered_high_rp_reschedule=True,
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_lds_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMLDSTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Mirror the trusted split-K LDS dispatch and reduction exactly."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(
+            kernel_inputs,
+            (torch.float16, torch.bfloat16),
+        )
+        if problem is None:
+            return
+        m, n, k, dtype, out_dtype, a_strides, b_strides = problem
+        if a_strides[0] % 16 or b_strides[1] % 16:
+            return
+
+        from triton.tlx.ops.kernels.mm.gfx950 import (
+            _LDS_DISABLE_SCHEDULER_SHAPES,
+            _lds_grid_mapping,
+            _optimized_geometry_config,
+            heuristic_config,
+        )
+
+        args = (
+            m,
+            n,
+            k,
+            dtype,
+            torch.finfo(dtype).bits // 8,
+            a_strides,
+            b_strides,
+        )
+        dispatch = _optimized_geometry_config(*args) or heuristic_config(*args)
+        if dispatch is None or dispatch[0] != "lds":
+            return
+        block_m, block_n, split_k = dispatch[1]
+        if split_k <= 1 or k % split_k:
+            return
+        group_m, num_xcds = _lds_grid_mapping(m, n, k, dtype)
+        split_size = k // split_k
+        triton_config = self.triton_config(
+            1,
+            4 if block_m == 128 else 8,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=64,
+            GROUP_M=group_m,
+            NUM_XCDS=num_xcds,
+            SPLIT_K=split_k,
+            HAS_REGISTER_TAIL=split_size % 128 != 0,
+            HAS_M_TAIL=m % block_m != 0,
+            HAS_N_TAIL=n % block_n != 0,
+            matrix_instr_nonkdim=16,
+            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+            enable_sched_group_barrier_scheduler=(
+                (m, n, k, dtype) not in _LDS_DISABLE_SCHEDULER_SHAPES
+            ),
+            inductor_32bit_pointer_range=(
+                "arg_A",
+                "arg_B",
+                "out_ptr*",
+                "split_k_ws",
+            ),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_wave_grid_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMWaveGridTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Mirror exact regular and transposed MI16/MI32 wave-grid plans."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(
+            kernel_inputs,
+            (torch.float16, torch.bfloat16),
+        )
+        if problem is None:
+            return
+        m, n, k, dtype, out_dtype, a_strides, b_strides = problem
+        from triton.tlx.ops.kernels.mm.gfx950 import (
+            _optimized_geometry_config,
+            _regular_wave_grid_options,
+            heuristic_config,
+        )
+
+        args = (
+            m,
+            n,
+            k,
+            dtype,
+            torch.finfo(dtype).bits // 8,
+            a_strides,
+            b_strides,
+        )
+        dispatch = _optimized_geometry_config(*args) or heuristic_config(*args)
+        if dispatch is None or dispatch[0] not in (
+            "wave_grid",
+            "transposed_wave_grid",
+        ):
+            return
+        plan = dispatch[1]
+        kind = plan.get("kind")
+        if (
+            kind
+            not in (
+                "register_mi16_wave_grid",
+                "regular_mi16_wave_grid",
+                "regular_mi32_wave_grid",
+            )
+            or plan.get("split_k", 1) != 1
+            or plan.get("streamk_tail_split", 0)
+            or plan.get("persistent_program_count", 0)
+        ):
+            return
+
+        if kind == "regular_mi16_wave_grid":
+            meta = _regular_wave_grid_options(plan, 1)
+            num_warps = meta.pop("num_warps")
+            num_stages = meta.pop("num_stages")
+            meta["DOT_MODE"] = repr(meta["DOT_MODE"])
+            if meta["llvm_fn_attrs"] == "":
+                meta["llvm_fn_attrs"] = ()
+            instr_m = 16
+        elif kind == "regular_mi32_wave_grid":
+            num_warps = plan["num_warps"]
+            num_stages = 1
+            meta = {
+                "MI_WAVE_TILE_M": plan["mi_wave_tile_m"],
+                "MI_WAVE_TILE_N": plan["mi_wave_tile_n"],
+                "WARPS_M": plan["warps_m"],
+                "WARPS_N": plan["warps_n"],
+                "BLOCK_K": 64,
+                "GROUP_M": 8,
+                "TILES_PER_PROGRAM": 1,
+                "DIRECT_TO_LDS": plan.get("direct_to_lds", False),
+                "DIRECT_CHUNK": plan.get("direct_chunk", 32),
+                "matrix_instr_nonkdim": 32,
+                "regclass_priority_trumps_globalness": True,
+                "reverse_local_assignment": plan.get(
+                    "reverse_local_assignment", True
+                ),
+                "sink_insts_to_avoid_spills": plan.get(
+                    "sink_insts_to_avoid_spills", False
+                ),
+                "disable_unclustered_high_rp_reschedule": plan.get(
+                    "disable_unclustered_high_rp_reschedule", False
+                ),
+            }
+            instr_m = 32
+        else:
+            num_warps = plan["num_warps"]
+            num_stages = 1
+            meta = {
+                "MI_WAVE_TILE_M": plan["mi_wave_tile_m"],
+                "MI_WAVE_TILE_N": plan["mi_wave_tile_n"],
+                "WARPS_M": plan["warps_m"],
+                "WARPS_N": plan["warps_n"],
+                "BLOCK_K": 32,
+                "GROUP_M": 8,
+                "TILES_PER_PROGRAM": 1,
+                "PREFETCH_NEXT": plan.get("prefetch_next", True),
+                "matrix_instr_nonkdim": 16,
+                "reverse_local_assignment": plan.get(
+                    "reverse_local_assignment", True
+                ),
+                "disable_unclustered_high_rp_reschedule": plan.get(
+                    "disable_unclustered_high_rp_reschedule", False
+                ),
+            }
+            instr_m = 16
+        block_m = instr_m * plan["mi_wave_tile_m"] * plan["warps_m"]
+        block_n = instr_m * plan["mi_wave_tile_n"] * plan["warps_n"]
+        meta.update({
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "INSTR_M": instr_m,
+            "REGISTER_WAVE": kind == "register_mi16_wave_grid",
+            "MI32": kind == "regular_mi32_wave_grid",
+            "TRANSPOSED": dispatch[0] == "transposed_wave_grid",
+            "MANUAL_OUTPUT": True,
+            "inductor_32bit_pointer_range": (
+                "arg_A",
+                "arg_B",
+                "out_ptr*",
+            ),
+        })
+        triton_config = self.triton_config(
+            num_stages,
+            num_warps,
+            **meta,
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
     gfx950_mm_interwave_template.uid,
     "cuda",
     register=IS_ROCM,
@@ -1845,28 +2434,38 @@ class Gfx950MMInterWaveTemplateConfigHeuristic(
     op_name="mm",
 )
 class Gfx950MMLocalSplitUTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
-    """Offer LocalSplitU only for its two validated small-M shapes."""
-
-    # (M, N, K): (TILE_M, TILE_N, LOCAL_SPLIT_U, WAVE_K, K_WIDTH)
-    LOCAL_SPLIT_U_CONFIGS = {
-        (7, 8192, 2048): (16, 32, 16, 32, 8),
-        (7, 2048, 4096): (16, 16, 4, 256, 8),
-    }
+    """Mirror the trusted ``tlx.ops.mm`` LocalSplitU dispatch exactly."""
 
     def _get_template_configs_impl(self, kernel_inputs, op_name):
         if op_name != "mm":
             return
-        problem = _gfx950_static_tn_problem(
+        problem = _gfx950_static_problem(
             kernel_inputs,
             (torch.float16,),
         )
-        if problem is None:
+        if problem is None or problem[6][0] != 1:
             return
-        m, n, k, out_dtype = problem
-        plan = self.LOCAL_SPLIT_U_CONFIGS.get((m, n, k))
-        if plan is None:
+        m, n, k, dtype, out_dtype, a_strides, b_strides = problem
+
+        from triton.tlx.ops.kernels.mm.gfx950 import heuristic_config
+
+        dispatch = heuristic_config(
+            m,
+            n,
+            k,
+            dtype,
+            torch.finfo(dtype).bits // 8,
+            a_strides,
+            b_strides,
+        )
+        if dispatch is None or dispatch[0] != "local_split_u":
             return
-        tile_m, tile_n, local_split_u, wave_k, k_width = plan
+        plan = dispatch[1]
+        tile_m = plan.tile_m
+        tile_n = plan.tile_n
+        local_split_u = plan.local_split_u
+        wave_k = plan.wave_k
+        k_width = plan.k_width
         triton_config = self.triton_config(
             1,
             local_split_u,
@@ -1894,29 +2493,258 @@ class Gfx950MMLocalSplitUTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemp
 
 
 @register_template_heuristic(
+    gfx950_mm_short_k_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMShortKTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """Mirror the one-K64 BF16 direct-register family."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(kernel_inputs, (torch.bfloat16,))
+        if problem is None:
+            return
+        m, n, k, _, out_dtype, _, _ = problem
+        from triton.tlx.ops.kernels.mm.gfx950 import _supports_short_k_register
+
+        if not _supports_short_k_register(m, n, k, torch.bfloat16):
+            return
+        triton_config = self.triton_config(
+            1,
+            1,
+            BLOCK_M=64,
+            BLOCK_N=64,
+            BLOCK_K=64,
+            GROUP_M=1,
+            matrix_instr_nonkdim=32,
+            waves_per_eu=0,
+            MANUAL_OUTPUT=True,
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_row_major_direct_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMRowMajorDirectTemplateConfigHeuristic(
+    ROCmMMTemplateConfigHeuristic
+):
+    """Mirror measured dense row-major-B direct-to-LDS plans."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(kernel_inputs, (torch.float16,))
+        if problem is None or problem[6][1] != 1:
+            return
+        m, n, k, _, out_dtype, _, _ = problem
+        from triton.tlx.ops.kernels.mm.gfx950 import _ROW_MAJOR_DIRECT_PLANS
+
+        plan = _ROW_MAJOR_DIRECT_PLANS.get((m, n, k))
+        if plan is None:
+            return
+        tiles = ((m + plan["BLOCK_M"] - 1) // plan["BLOCK_M"]) * (
+            (n + plan["BLOCK_N"] - 1) // plan["BLOCK_N"]
+        )
+        triton_config = self.triton_config(
+            1,
+            plan["num_warps"],
+            BLOCK_M=plan["BLOCK_M"],
+            BLOCK_N=plan["BLOCK_N"],
+            BLOCK_K=plan["BLOCK_K"],
+            GROUP_M=1,
+            NUM_BUFFERS=plan["NUM_BUFFERS"],
+            TILES_PER_PROBLEM=tiles,
+            PROGRAM_COUNT=tiles,
+            NUM_PROGRAMS=tiles,
+            A_BASES=plan["A_BASES"],
+            B_BASES=plan["B_BASES"],
+            MANUAL_OUTPUT=True,
+            matrix_instr_nonkdim=plan["matrix_instr_nonkdim"],
+            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_fragmented_register_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMFragmentedRegisterTemplateConfigHeuristic(
+    ROCmMMTemplateConfigHeuristic
+):
+    """Mirror exact two-fragment transposed register production plans."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(kernel_inputs, (torch.float16,))
+        if problem is None:
+            return
+        m, n, k, dtype, out_dtype, a_strides, b_strides = problem
+        if b_strides[0] != 1:
+            return
+
+        from triton.tlx.ops.kernels.mm.gfx950 import _dispatch_plan
+
+        dispatch = _dispatch_plan(
+            m,
+            n,
+            k,
+            dtype,
+            torch.finfo(dtype).bits // 8,
+        )
+        if dispatch is None or dispatch[0] != "fragmented_register":
+            return
+        plan = dispatch[1]
+        triton_config = self.triton_config(
+            plan["num_stages"],
+            plan["num_warps"],
+            M_HEAD=plan["M_HEAD"],
+            M_TAIL=plan["M_TAIL"],
+            BLOCK_M=plan["M_HEAD"] + plan["M_TAIL"],
+            BLOCK_N=plan["BLOCK_N"],
+            BLOCK_K=plan["BLOCK_K"],
+            GROUP_M=1,
+            matrix_instr_nonkdim=plan["matrix_instr_nonkdim"],
+            MANUAL_OUTPUT=True,
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
+    gfx950_mm_fragmented_m_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx950MMFragmentedMTemplateConfigHeuristic(
+    ROCmMMTemplateConfigHeuristic
+):
+    """Mirror two- and three-fragment register wave-grid plans."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if op_name != "mm":
+            return
+        problem = _gfx950_static_problem(kernel_inputs, (torch.float16,))
+        if problem is None:
+            return
+        m, n, k, _, out_dtype, _, _ = problem
+        dispatch = _gfx950_static_dispatch(kernel_inputs)
+        if dispatch is None or dispatch[0] not in (
+            "wave_grid",
+            "transposed_wave_grid",
+        ):
+            return
+        plan = dispatch[1]
+        if plan.get("kind") != "register_fragmented_m":
+            return
+        fragments = tuple(extent for _, extent in plan["m_fragments"])
+        if len(fragments) not in (2, 3):
+            return
+        triton_config = self.triton_config(
+            plan["num_stages"],
+            plan["num_warps"],
+            M0=fragments[0],
+            M1=fragments[1],
+            M2=fragments[2] if len(fragments) == 3 else 0,
+            FRAGMENT_COUNT=len(fragments),
+            BLOCK_M=sum(fragments),
+            BLOCK_N=plan["block_n"],
+            BLOCK_K=plan["block_k"],
+            GROUP_M=1,
+            TRANSPOSED=dispatch[0] == "transposed_wave_grid",
+            MANUAL_OUTPUT=True,
+            matrix_instr_nonkdim=16,
+            inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
+        )
+        yield self._convert_config_to_template_kwargs(
+            triton_config,
+            m,
+            n,
+            k,
+            out_dtype,
+        )
+
+
+@register_template_heuristic(
     gfx950_mm_register_template.uid,
     "cuda",
     register=IS_ROCM,
     op_name="mm",
 )
 class Gfx950MMRegisterTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplateConfigHeuristic):
-    """Offer the register fallback only when its geometry policy selects it."""
+    """Mirror the trusted ``tlx.ops.mm`` register dispatch exactly."""
 
     def _get_template_configs_impl(self, kernel_inputs, op_name):
         if op_name != "mm":
             return
-        problem = _gfx950_static_tn_problem(
+        problem = _gfx950_static_problem(
             kernel_inputs,
             (torch.float16, torch.bfloat16),
         )
         if problem is None:
             return
-        m, n, k, out_dtype = problem
-        plan = _gfx950_register_plan_for(m, n, k)
-        if plan is None:
+        m, n, k, dtype, out_dtype, a_strides, b_strides = problem
+        # The production winner is a pair-balanced FP32 Split-K wave-grid plan;
+        # a single-kernel register template cannot express its reduction schedule.
+        if (m, n, k) == (128, 2688, 4416):
             return
 
-        disable_agpr = (k == 256 and n > 256) or (
+        from triton.tlx.ops.kernels.mm.gfx950 import heuristic_config
+
+        dispatch = heuristic_config(
+            m,
+            n,
+            k,
+            dtype,
+            torch.finfo(dtype).bits // 8,
+            a_strides,
+            b_strides,
+        )
+        transposed = dispatch is not None and dispatch[0] == "transposed_register"
+        if dispatch is not None and dispatch[0] in (
+            "register",
+            "range_register",
+            "transposed_register",
+        ):
+            plan = dict(dispatch[1])
+        else:
+            plan = _gfx950_register_plan_for(m, n, k)
+            if plan is None:
+                return
+
+        plan_n = m if transposed else n
+        disable_agpr = (k == 256 and plan_n > 256) or (
             k > 512
             and (k % 64 != 0 or m * n <= 2 * 1024 * 1024)
         )
@@ -1931,13 +2759,25 @@ class Gfx950MMRegisterTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTemplat
             matrix_instr_nonkdim=plan["matrix_instr_nonkdim"],
             waves_per_eu=plan["waves_per_eu"],
             kpack=plan["kpack"],
-            llvm_fn_attrs=(
-                (("amdgpu-agpr-alloc", "0,0"),)
-                if disable_agpr
-                else ()
+            CACHE_A_CG=plan.get("CACHE_A_CG", False),
+            CACHE_B_CG=plan.get("CACHE_B_CG", False),
+            TRANSPOSED=transposed,
+            llvm_fn_attrs=plan.get(
+                "llvm_fn_attrs",
+                (("amdgpu-agpr-alloc", "0,0"),) if disable_agpr else (),
             ),
-            reverse_local_assignment=(
-                plan["BLOCK_K"] == 128 and plan["num_stages"] == 3
+            reverse_local_assignment=plan.get(
+                "reverse_local_assignment",
+                plan["BLOCK_K"] == 128 and plan["num_stages"] == 3,
+            ),
+            sink_insts_to_avoid_spills=plan.get(
+                "sink_insts_to_avoid_spills", False
+            ),
+            regclass_priority_trumps_globalness=plan.get(
+                "regclass_priority_trumps_globalness", False
+            ),
+            disable_unclustered_high_rp_reschedule=plan.get(
+                "disable_unclustered_high_rp_reschedule", False
             ),
             inductor_32bit_pointer_range=("arg_A", "arg_B", "out_ptr*"),
         )
@@ -1984,6 +2824,7 @@ class Gfx950MMPersistentTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTempl
             BLOCK_M=256,
             BLOCK_N=block_n,
             BLOCK_K=64,
+            K_BLOCKS=k // 64,
             NUM_PROGRAMS=256,
             matrix_instr_nonkdim=16,
             enable_sched_group_barrier_scheduler=True,
@@ -2878,11 +3719,15 @@ _orig_set_subgraph_body = TritonTemplateKernel.set_subgraph_body
 def _tlx_set_subgraph_body(self, body_name):  # type: ignore[no-untyped-def]
     """Restore TLX-specific state for one deferred store subgraph."""
     previous_output_layout = getattr(self, "_tlx_output_layout", None)
+    previous_store_cache = getattr(self, "_tlx_store_cache", None)
     previous_subgraph_name = getattr(self, "_tlx_current_subgraph_name", None)
     self._tlx_current_subgraph_name = body_name
     layouts = getattr(self, "_tlx_output_layout_by_subgraph", {})
     if body_name in layouts:
         self._tlx_output_layout = layouts[body_name]
+    store_caches = getattr(self, "_tlx_store_cache_by_subgraph", {})
+    if body_name in store_caches:
+        self._tlx_store_cache = store_caches[body_name]
     try:
         with _orig_set_subgraph_body(self, body_name):
             # TritonTemplate's range tree is shared by store_output hooks. Keep
@@ -2908,6 +3753,7 @@ def _tlx_set_subgraph_body(self, body_name):  # type: ignore[no-untyped-def]
             yield
     finally:
         self._tlx_output_layout = previous_output_layout
+        self._tlx_store_cache = previous_store_cache
         self._tlx_current_subgraph_name = previous_subgraph_name
 
 
@@ -2919,6 +3765,7 @@ def _tlx_store_output(  # type: ignore[no-untyped-def]
     *args,
     async_tma_store_buf_idx=None,
     output_layout=None,
+    store_cache=None,
     prefetched_epilogue=None,
     **kwargs,
 ):
@@ -2929,7 +3776,9 @@ def _tlx_store_output(  # type: ignore[no-untyped-def]
         # the regular TMA mode that OSS store_output will select.
         self._tlx_async_tma_store_active = True
     previous_output_layout = getattr(self, "_tlx_output_layout", None)
+    previous_store_cache = getattr(self, "_tlx_store_cache", None)
     self._tlx_output_layout = output_layout
+    self._tlx_store_cache = store_cache
     try:
         if not hasattr(V.interpreter, "current_node") and hasattr(
             V.graph, "current_node"
@@ -2938,23 +3787,23 @@ def _tlx_store_output(  # type: ignore[no-untyped-def]
             # the separate interpreter virtual is installed. CSEProxy still
             # needs the active FX node while rendering the addmm epilogue.
             with V.set_interpreter_handler(V.graph):
-                result = _orig_store_output(self, *args, **kwargs)
+                body_name = _orig_store_output(self, *args, **kwargs)
         else:
-            result = _orig_store_output(self, *args, **kwargs)
+            body_name = _orig_store_output(self, *args, **kwargs)
         if prefetched_epilogue is not None:
             request = self._tlx_predrain_prefetches.get(prefetched_epilogue)
             if request is not None:
-                request["subgraph_name"] = result
+                request["subgraph_name"] = body_name
                 request["load_names"] = _tlx_eligible_predrain_loads(
                     self,
-                    result,
+                    body_name,
                     request["max_operands"],
                 )
         if output_layout is not None:
             layouts = getattr(self, "_tlx_output_layout_by_subgraph", None)
             if layouts is None:
                 layouts = self._tlx_output_layout_by_subgraph = {}
-            layouts[result] = output_layout
+            layouts[body_name] = output_layout
             block_indexing = kwargs.get(
                 "block_indexing", args[5] if len(args) > 5 else False
             )
@@ -2964,17 +3813,23 @@ def _tlx_store_output(  # type: ignore[no-untyped-def]
                 )
                 if index_states is None:
                     index_states = self._tlx_output_indices_by_subgraph = {}
-                index_states[result] = (
+                index_states[body_name] = (
                     tuple(self.template_indices),
                     tuple(
                         V.graph.sizevars.simplify(s)
                         for s in self.output_node.get_size()
                     ),
                 )
-        return result
+        if store_cache is not None:
+            store_caches = getattr(self, "_tlx_store_cache_by_subgraph", None)
+            if store_caches is None:
+                store_caches = self._tlx_store_cache_by_subgraph = {}
+            store_caches[body_name] = store_cache
+        return body_name
     finally:
         self._tlx_async_tma_store_active = False
         self._tlx_output_layout = previous_output_layout
+        self._tlx_store_cache = previous_store_cache
 
 
 # Jinja template_env uses fn.__name__ to build the dict key — preserve it.
@@ -3256,8 +4111,15 @@ def _tlx_store(self, name, index, value, mode=None):  # type: ignore[no-untyped-
         mask = indexing.mask_str
         if mask != "None":
             mask = f"tlx.require_layout({mask}, {output_layout}, pin=False)"
+        store_cache = getattr(self, "_tlx_store_cache", None)
+        cache_arg = (
+            f", cache_modifier={store_cache!r}" if store_cache is not None else ""
+        )
         self.stores.writeline(
-            DeferredLine(name, f"tl.store({ptr}, {stored_value}, {mask})")
+            DeferredLine(
+                name,
+                f"tl.store({ptr}, {stored_value}, {mask}{cache_arg})",
+            )
         )
         if not self.inside_reduction:
             self.outside_loop_vars.add(value)
@@ -3725,12 +4587,13 @@ def _tlx_render(self, template, kwargs, record_input_dependent_tracked_event=Fal
         fn.__name__ == "prefetch_epilogue" for fn in self.extra_template_env_fns
     ):
         self._register_extra_template_env_fns(self.prefetch_epilogue)
-
     # Register compute_epilogue and output_ptr as extra template env functions
     # so they're available in the jinja template.
     if getattr(self, "async_tma_store", False):
         self._register_extra_template_env_fns(self.compute_epilogue, self.output_ptr)
-    elif getattr(self, "_tlx_split_k", 1) > 1:
+    elif getattr(self, "_tlx_split_k", 1) > 1 or self.meta.get(
+        "MANUAL_OUTPUT", False
+    ):
         # split-K writes partials to split_k_ws and never store_output()s, so the
         # output arg would be pruned from the kernel signature -- but the autotuning
         # harness still passes `out` positionally (arg-count mismatch). Expose
