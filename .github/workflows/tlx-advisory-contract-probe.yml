@@ -1,0 +1,20 @@
+name: TLX advisory contract probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  job-tolerated:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Intentional advisory failure
+        run: exit 1
+  step-tolerated:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Intentional advisory failure
+        continue-on-error: true
+        run: exit 1
+      - name: Record the advisory result
+        run: printf "Advisory operation failed; required gate unaffected.\n" >> "$GITHUB_STEP_SUMMARY"
