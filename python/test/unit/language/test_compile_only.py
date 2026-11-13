@@ -7,6 +7,7 @@ import pytest
 import triton
 import triton.language as tl
 from triton.backends.compiler import GPUTarget
+from triton.backends.amd.compiler import HIPBackend
 from triton.backends.nvidia.compiler import _max_shared_mem_for_capability
 from triton.compiler import ASTSource
 from triton.compiler.errors import CompileTimeAssertionFailure
@@ -103,6 +104,34 @@ def test_shared_memory_budget_uses_compilation_target(capability, expected):
         active.return_value.utils.get_device_properties.return_value = {"max_shared_mem": 49152}
         assert _max_shared_mem_for_capability(capability) == expected
         active.assert_not_called()
+
+
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+@pytest.mark.parametrize("transpose", [False, True])
+def test_compile_only_amd_static_lds_metadata(arch, transpose):
+
+    @triton.jit
+    def kernel(src, dst, TRANSPOSE: tl.constexpr):
+        if TRANSPOSE:
+            rows = tl.arange(0, 128)[:, None]
+            cols = tl.arange(0, 128)[None, :]
+            values = tl.load(src + rows * 128 + cols)
+            tl.store(dst + cols * 128 + rows, values)
+        else:
+            offsets = tl.arange(0, 128)
+            tl.store(dst + offsets, tl.load(src + offsets))
+
+    source = ASTSource(fn=kernel, signature={"src": "*fp32", "dst": "*fp32", "TRANSPOSE": "constexpr"},
+                       constexprs={"TRANSPOSE": transpose})
+    target = GPUTarget("hip", arch, 64)
+    compiled = triton.compile(source, target=target, options={"num_warps": 8})
+    shared = compiled.metadata.shared
+    assert (shared > 0) == transpose
+    assert compiled.metadata.shared_static == shared
+    assert f".amdhsa_group_segment_fixed_size {shared}" in compiled.asm["amdgcn"]
+    assert HIPBackend(target).pack_metadata(compiled.metadata)[2] == 0
+    assert compiled.packed_metadata[2] == 0
+    assert compiled.launch_metadata_schema["shared_mem"] == 0
 
 
 def test_compile_only_ws_cluster_barrier_shared_memory(tmp_path) -> None:

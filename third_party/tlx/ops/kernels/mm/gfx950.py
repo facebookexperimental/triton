@@ -14061,6 +14061,7 @@ def _wg_store_cached_b_output(
     prefetched_bias,
     PREFETCH_BIAS: tl.constexpr,
     FUSED_GROUP_FRAGMENTS: tl.constexpr,
+    STORE_CACHE: tl.constexpr,
 ):
     group_m: tl.constexpr = 16 * warps_m
     if warps_m == 4 and wide:
@@ -14100,7 +14101,7 @@ def _wg_store_cached_b_output(
                     ADD_BIAS,
                 )
                 value = tlx.require_layout(value.to(c_ptr.dtype.element_ty), store_layout)
-                tlx.buffer_store(value, base, offsets, contiguity=8, cache=".cs")
+                tlx.buffer_store(value, base, offsets, contiguity=8, cache=STORE_CACHE)
     else:
         _wg_store_mi16_wave_grid_output(
             c_ptr,
@@ -14125,7 +14126,7 @@ def _wg_store_cached_b_output(
             False,
             mma,
             ADD_BIAS,
-            store_cache=".cs",
+            store_cache=STORE_CACHE,
             prefetched_bias=prefetched_bias,
             PREFETCH_BIAS=PREFETCH_BIAS,
             FUSED_GROUP_FRAGMENTS=FUSED_GROUP_FRAGMENTS,
@@ -14158,6 +14159,7 @@ def _wg_kernel_cached_b_lds(
     ADD_BIAS: tl.constexpr,
     PREFETCH_BIAS: tl.constexpr,
     FUSED_GROUP_FRAGMENTS: tl.constexpr,
+    STORE_CACHE: tl.constexpr = ".cs",
 ):
     tl.static_assert(K % 64 == 0 and K >= 128 and K <= 256)
     tl.static_assert(WARPS_M == 2 or WARPS_M == 4)
@@ -14270,6 +14272,7 @@ def _wg_kernel_cached_b_lds(
             prefetched_bias,
             PREFETCH_BIAS,
             FUSED_GROUP_FRAGMENTS,
+            STORE_CACHE,
         )
 
 
@@ -25934,8 +25937,24 @@ _CACHED_B_SHAPE_PLANS = {
     },
 }
 
+# Each C store instruction here writes alternate 16 B chunks of a 128 B L2 line.
+# With ``.cs`` the two halves of a line only merge in L2 while the store pair
+# stays back to back; otherwise every line is written back twice.
+_CACHED_B_TEMPORAL_STORE_SHAPES = frozenset({
+    (819_200, 1_024, 192, torch.bfloat16),
+    (819_200, 1_024, 192, torch.float16),
+    (2_252_800, 256, 256, torch.float16),
+})
+
 
 def _cached_b_geometry_plan(m, n, k, dtype, a_strides):
+    plan = _cached_b_tile_plan(m, n, k, dtype, a_strides)
+    if plan is not None and (m, n, k, dtype) in _CACHED_B_TEMPORAL_STORE_SHAPES:
+        plan = dict(plan, STORE_CACHE="")
+    return plan
+
+
+def _cached_b_tile_plan(m, n, k, dtype, a_strides):
     exact = _CACHED_B_SHAPE_PLANS.get((m, n, k, dtype))
     if exact is not None:
         return exact
