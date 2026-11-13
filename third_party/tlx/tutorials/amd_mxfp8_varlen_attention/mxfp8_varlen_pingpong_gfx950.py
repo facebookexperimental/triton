@@ -683,22 +683,20 @@ def _mxfp8_varlen_kernel(  # noqa: TR001
         head, q0, q_rows, front, tail, pad_start, n_tiles = _item(
             item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS, BLOCK_M
         )
+        q_base = Q + q0.to(tl.int64) * ROW + head * D
+        q_mask = q_local < q_rows * ROW
+        q_reg0 = tlx.buffer_load(q_base, q_local, q_mask, 0.0, contiguity=8)
+        q_reg1 = tlx.buffer_load(q_base + HD, q_local, q_mask, 0.0, contiguity=8)
+        tlx.amd_sched_barrier(0)
         k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(
             K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off
         )
-        q_base = Q + q0.to(tl.int64) * ROW + head * D
-        q_mask = q_local < q_rows * ROW
-
-        q_lo, qs_lo = core._quantize_q_half(
-            tlx.buffer_load(q_base, q_local, q_mask, 0.0, contiguity=8)
-        )
+        tlx.amd_sched_barrier(0)
+        q_lo, qs_lo = core._quantize_q_half(q_reg0)
         q_lo = tlx.require_layout(q_lo, q_layout)
-        tlx.amd_sched_barrier(0)
-        q_hi, qs_hi = core._quantize_q_half(
-            tlx.buffer_load(q_base + HD, q_local, q_mask, 0.0, contiguity=8)
-        )
+        q_hi, qs_hi = core._quantize_q_half(q_reg1)
         q_hi = tlx.require_layout(q_hi, q_layout)
-        tlx.amd_sched_barrier(0)
+
         if FAST_EXP:
             qs_lo = (tl.maximum(qs_lo, 9) - 9).to(tl.uint8)
             qs_hi = (tl.maximum(qs_hi, 9) - 9).to(tl.uint8)
