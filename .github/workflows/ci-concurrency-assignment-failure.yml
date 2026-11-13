@@ -1,0 +1,12 @@
+name: B200 assignment failure probe
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  probe:
+    if: github.head_ref == 'ci/b200-background-concurrency' && github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/_ci-background-concurrency-smoke-worker.yml
+    with:
+      fail_assign: true

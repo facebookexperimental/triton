@@ -23,6 +23,23 @@ name and summary disclose the chosen list. Automatic runs ignore this input.
 Documentation-only changes run selection and the aggregate check without building
 or allocating GPU runners.
 
+## B200 full-test concurrency
+
+B200 full-test workers share seven repository-wide concurrency groups. A CPU job
+assigns distinct groups to the workers in each batch using the run and attempt
+as a deterministic shuffle seed. Group names contain neither the PR nor the run
+ID, so PR, push and scheduled full tests share the same limit.
+
+Each group runs one worker and uses `queue: max` to retain up to 100 pending
+jobs; further arrivals are cancelled when the queue is full. Queue ordering is
+not a Fast-priority guarantee, and job timeouts do not bound pending time.
+Fast workers do not enter these groups. The parent workflow still cancels
+superseded full runs of the same PR; the worker groups do not cancel other PRs.
+
+This limit applies to `b200.yml` workers only, not other B200 workflows or other
+repositories using the runner pool. Existing jobs without these groups are not
+retroactively limited. Groups do not bind jobs to particular runner instances.
+
 ## Checks and nightly reporting
 
 Use **GPU tests** as the aggregate required check: a failed build or selected

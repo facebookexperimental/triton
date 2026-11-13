@@ -1,0 +1,33 @@
+name: Concurrency cancellation Full B
+on:
+  pull_request:
+    types: [edited]
+permissions:
+  contents: read
+concurrency:
+  group: >-
+    ${{ contains(github.event.pull_request.title, '[Full probe]') &&
+    format('prototype-full-b-{0}', github.event.pull_request.number) ||
+    format('prototype-idle-full-b-{0}', github.event.pull_request.number) }}
+  cancel-in-progress: false
+jobs:
+  holder:
+    if: github.head_ref == 'ci/b200-background-concurrency' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.title, '[Full probe]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: prototype-pending-b200-${{ github.event.pull_request.number }}
+      queue: max
+      cancel-in-progress: false
+    steps:
+      - run: python3 -c 'import time; print("holding pending lane", flush=True); time.sleep(180)'
+  prepare:
+    if: github.head_ref == 'ci/b200-background-concurrency' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.title, '[Full probe]')
+    runs-on: ubuntu-latest
+    steps:
+      - run: python3 -c 'import time; time.sleep(30)'
+  pending:
+    needs: prepare
+    uses: ./.github/workflows/_ci-background-concurrency-smoke-worker.yml
+    with:
+      forced_group: prototype-pending-b200-${{ github.event.pull_request.number }}

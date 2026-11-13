@@ -1,0 +1,19 @@
+name: Concurrency cancellation Fast A
+on:
+  pull_request:
+    types: [edited]
+permissions:
+  contents: read
+concurrency:
+  group: >-
+    ${{ contains(github.event.pull_request.title, '[Fast probe]') &&
+    format('prototype-full-a-{0}', github.event.pull_request.number) ||
+    format('prototype-idle-fast-a-{0}', github.event.pull_request.number) }}
+  cancel-in-progress: true
+jobs:
+  fast:
+    if: github.head_ref == 'ci/b200-background-concurrency' && github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.title, '[Fast probe]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: python3 -c 'print("Fast A")'
