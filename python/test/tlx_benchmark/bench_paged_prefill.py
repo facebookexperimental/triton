@@ -11,7 +11,7 @@ import torch
 import triton
 from triton.tlx.ops import paged_prefill
 from triton.tlx.ops.kernels.paged_prefill._shapes import FOCUS as SHAPE_SUITES
-from triton.tlx.ops.kernels.paged_prefill._shapes import SYNTHETIC, flops
+from triton.tlx.ops.kernels.paged_prefill._shapes import SYNTHETIC, Shape, flops
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _harness import Case, Prepared, driver
@@ -30,16 +30,17 @@ def shapes(synthetic=False, suites=None):
 def cases(synthetic=False, suites=None):
     return [
         Case(op=OP, arch=driver.arch(), dtype="bfloat16", shape=shape,
-             label=f"B={shape[0]} Q={shape[1]} KV={shape[2]} window={shape[3]}") for shape in shapes(synthetic, suites)
+             label=f"B={shape[0]} Q={shape[1]} KV={shape[2]} window={shape[3]} heads={8*shape[4]}/{shape[4]}")
+        for shape in shapes(synthetic, suites)
     ]
 
 
 def prepare(case, space):
-    batch, sq, sk, window = case.shape
+    batch, sq, sk, window, kv_heads = Shape(*case.shape)
     generator = torch.Generator(device="cuda").manual_seed(41)
     pages = triton.cdiv(sk, 64)
-    q = torch.randn((batch, sq, 16, 64), generator=generator, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((batch * pages + 3, 64, 2, 64), generator=generator, device=q.device, dtype=q.dtype)
+    q = torch.randn((batch, sq, kv_heads * 8, 64), generator=generator, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch * pages + 3, 64, kv_heads, 64), generator=generator, device=q.device, dtype=q.dtype)
     v = torch.randn(k.shape, generator=generator, device=q.device, dtype=q.dtype)
     table = torch.randperm(k.shape[0], generator=generator, device=q.device, dtype=torch.int32)
     table = table[:batch * pages].reshape(batch, pages)
@@ -49,9 +50,12 @@ def prepare(case, space):
         out = fn()
         if not torch.isfinite(out).all():
             return False, "nonfinite output"
-        rows = torch.tensor(sorted({x
-                                    for x in (0, 7, 8, 15, 16, 31, 32, 63, 64, 2047, 2048, sq - 1)
-                                    if x < sq}), device=q.device)
+        rows = torch.tensor(
+            sorted({
+                x
+                for x in (0, 7, 8, 15, 16, 31, 32, 63, 64, 2047, 2048, sq // 2 - 1, sq // 2, sq - 65, sq - 64, sq - 1)
+                if 0 <= x < sq
+            }), device=q.device)
         keys = torch.arange(sk, device=q.device)
         end = rows[:, None] + sk - sq
         mask = keys[None, :] <= end
@@ -60,9 +64,9 @@ def prepare(case, space):
         error_sq = torch.zeros((), device=q.device, dtype=torch.float64)
         ref_sq = torch.zeros_like(error_sq)
         for b in range(batch):
-            kk = k[table[b].long()].reshape(-1, 2, 64)[:sk].double()
-            vv = v[table[b].long()].reshape(-1, 2, 64)[:sk].double()
-            for h in range(16):
+            kk = k[table[b].long()].reshape(-1, kv_heads, 64)[:sk].double()
+            vv = v[table[b].long()].reshape(-1, kv_heads, 64)[:sk].double()
+            for h in range(kv_heads * 8):
                 scores = q[b, rows, h].double() @ kk[:, h // 8].T * 0.125
                 ref = scores.masked_fill(~mask, -float("inf")).softmax(-1) @ vv[:, h // 8]
                 actual = out[b, rows, h].double()

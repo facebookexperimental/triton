@@ -6,7 +6,7 @@ The interior omits masking only when causal and window validity follow from
 its bounds. SWA uses this path only for tiles aligned within a KV page.
 Physical K/V pages are complete; Q descriptor bounds still cover ragged tails.
 
-Q is contiguous [B,S,16,64]; K/V are [physical_pages,64,2,64]. The
+Q is contiguous [B,S,8*KVH,64]; K/V are [physical_pages,64,KVH,64]. The
 int32 page table is [B,logical_pages] and must contain valid physical IDs.
 All sequences in a batch share Q/KV lengths. Window 2048 includes self;
 window 0 means global. Cached prefixes use bottom-right causal alignment.
@@ -192,6 +192,7 @@ def _pass(
     SQ: tl.constexpr,
     SK: tl.constexpr,
     NPAGES: tl.constexpr,
+    KH: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
     WINDOW: tl.constexpr,
     BM: tl.constexpr,
@@ -207,27 +208,27 @@ def _pass(
 ):
     batch = tl.program_id(2)
     linear = tl.program_id(0) + tl.cdiv(SQ * GROUP, BM * FACTOR) * tl.program_id(1)
-    block = linear // (16 // GROUP)
+    block = linear // (KH * 8 // GROUP)
     if REVERSE:
         block = tl.cdiv(SQ * GROUP, BM * FACTOR) - 1 - block
     block = block * FACTOR + CHUNK
-    head = (linear % (16 // GROUP)) * GROUP
+    head = (linear % (KH * 8 // GROUP)) * GROUP
     kv_head = head // 8
     row_ids = block * BM + tl.arange(0, BM)
     rows = row_ids // GROUP
     heads = head + row_ids % GROUP
     dims = tl.arange(0, 64)
-    offsets = ((batch.to(tl.int64) * SQ + rows[:, None]) * 16 + heads[:, None]) * 64 + dims[None, :]
+    offsets = ((batch.to(tl.int64) * SQ + rows[:, None]) * (KH * 8) + heads[:, None]) * 64 + dims[None, :]
     qd = tl.make_tensor_descriptor(
-        Q + batch.to(tl.int64) * SQ * 16 * 64 + head * 64,
+        Q + batch.to(tl.int64) * SQ * KH * 8 * 64 + head * 64,
         [SQ, GROUP * 64],
-        [16 * 64, 1],
+        [KH * 8 * 64, 1],
         [BM // GROUP, GROUP * 64],
     )
     qb = tlx.local_alloc((BM // GROUP, GROUP * 64), tl.bfloat16, 1)
     tlx.async_amd_descriptor_load(qd, tlx.local_view(qb, 0), [block * (BM // GROUP), 0], clamp_bounds=True)
-    kd = tl.make_tensor_descriptor(K + kv_head * 64, [NPAGES * 64, 64], [128, 1], [64, 64])
-    vd = tl.make_tensor_descriptor(V + kv_head * 64, [NPAGES * 64, 64], [128, 1], [64, 64])
+    kd = tl.make_tensor_descriptor(K + kv_head * 64, [NPAGES * 64, 64], [KH * 64, 1], [64, 64])
+    vd = tl.make_tensor_descriptor(V + kv_head * 64, [NPAGES * 64, 64], [KH * 64, 1], [64, 64])
     if PAD:
         layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(64, PAD)], [64, 64], [1, 0])
         kb = tlx.local_alloc((64, 64), tl.bfloat16, 2 if PIPE else 1, layout=layout)
@@ -467,6 +468,7 @@ def _replay(
     SQ: tl.constexpr,
     SK: tl.constexpr,
     NPAGES: tl.constexpr,
+    KH: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
     WINDOW: tl.constexpr,
     BM: tl.constexpr,
@@ -487,6 +489,7 @@ def _replay(
             SQ,
             SK,
             NPAGES,
+            KH,
             TABLE_STRIDE,
             WINDOW,
             BM // FACTOR,
@@ -512,6 +515,7 @@ def paged_prefill_kernel(
     SQ: tl.constexpr,
     SK: tl.constexpr,
     NPAGES: tl.constexpr,
+    KH: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
     WINDOW: tl.constexpr,
     BM: tl.constexpr,
@@ -532,6 +536,7 @@ def paged_prefill_kernel(
         SQ,
         SK,
         NPAGES,
+        KH,
         TABLE_STRIDE,
         WINDOW,
         BM,
@@ -554,6 +559,7 @@ def paged_prefill_kernel(
                 SQ,
                 SK,
                 NPAGES,
+                KH,
                 TABLE_STRIDE,
                 WINDOW,
                 BM,
@@ -590,11 +596,11 @@ def launch(
 ):
     if warps not in (2, 4):
         raise ValueError("The explicit WMMA pipeline supports two or four waves")
-    b, sq, _, _ = q.shape
+    b, sq, q_heads, _ = q.shape
     sk = sq if sk is None else sk
     # A window covering the full KV length is exactly global causal attention.
     window = 0 if window and sk <= window else window
-    return paged_prefill_kernel[(triton.cdiv(sq * group, bm), 16 // group, b)](
+    return paged_prefill_kernel[(triton.cdiv(sq * group, bm), q_heads // group, b)](
         q,
         k,
         v,
@@ -603,6 +609,7 @@ def launch(
         sq,
         sk,
         k.shape[0],
+        k.shape[2],
         tables.stride(0),
         window,
         bm,

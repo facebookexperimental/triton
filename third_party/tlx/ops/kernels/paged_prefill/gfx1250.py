@@ -1,6 +1,6 @@
-"""BF16 paged causal 16Q/2KV D64 prefill for gfx1250 TLX.
+"""BF16 paged causal GQA8 D64 prefill for gfx1250 TLX.
 
-Q is contiguous [B,S,16,64]; K/V are [physical_pages,64,2,64]. The
+Q is contiguous [B,S,8*KVH,64]; K/V are [physical_pages,64,KVH,64]. The
 int32 page table is [B,logical_pages] and must contain valid physical IDs.
 All sequences in a batch share Q/KV lengths. Window 2048 includes self;
 window 0 means global. Cached prefixes use bottom-right causal alignment.
@@ -165,6 +165,7 @@ def _pass(
     SQ: tl.constexpr,
     SK: tl.constexpr,
     NPAGES: tl.constexpr,
+    KH: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
     WINDOW: tl.constexpr,
     BM: tl.constexpr,
@@ -186,10 +187,10 @@ def _pass(
     rows = row_ids // GROUP
     heads = head + row_ids % GROUP
     dims = tl.arange(0, 64)
-    offsets = ((batch.to(tl.int64) * SQ + rows[:, None]) * 16 + heads[:, None]) * 64 + dims[None, :]
+    offsets = ((batch.to(tl.int64) * SQ + rows[:, None]) * (KH * 8) + heads[:, None]) * 64 + dims[None, :]
     q = tl.load(Q + offsets, rows[:, None] < SQ, 0)
-    kd = tl.make_tensor_descriptor(K + kv_head * 64, [NPAGES * 64, 64], [128, 1], [64, 64])
-    vd = tl.make_tensor_descriptor(V + kv_head * 64, [NPAGES * 64, 64], [128, 1], [64, 64])
+    kd = tl.make_tensor_descriptor(K + kv_head * 64, [NPAGES * 64, 64], [KH * 64, 1], [64, 64])
+    vd = tl.make_tensor_descriptor(V + kv_head * 64, [NPAGES * 64, 64], [KH * 64, 1], [64, 64])
     if PAD:
         layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(64, PAD)], [64, 64], [1, 0])
         kb = tlx.local_alloc((64, 64), tl.bfloat16, 2 if PIPE else 1, layout=layout)
@@ -386,6 +387,7 @@ def _replay(
     SQ: tl.constexpr,
     SK: tl.constexpr,
     NPAGES: tl.constexpr,
+    KH: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
     WINDOW: tl.constexpr,
     BM: tl.constexpr,
@@ -404,6 +406,7 @@ def _replay(
         SQ,
         SK,
         NPAGES,
+        KH,
         TABLE_STRIDE,
         WINDOW,
         BM,
@@ -427,6 +430,7 @@ def paged_prefill_kernel(
     SQ: tl.constexpr,
     SK: tl.constexpr,
     NPAGES: tl.constexpr,
+    KH: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
     WINDOW: tl.constexpr,
     BM: tl.constexpr,
@@ -447,6 +451,7 @@ def paged_prefill_kernel(
         SQ,
         SK,
         NPAGES,
+        KH,
         TABLE_STRIDE,
         WINDOW,
         BM,
@@ -469,6 +474,7 @@ def paged_prefill_kernel(
                 SQ,
                 SK,
                 NPAGES,
+                KH,
                 TABLE_STRIDE,
                 WINDOW,
                 BM,
@@ -530,11 +536,11 @@ def _launch(
             enable_wmma_queuing=enable_wmma_queuing,
             llvm_fn_attrs=llvm_fn_attrs,
         )
-    b, sq, _, _ = q.shape
+    b, sq, q_heads, _ = q.shape
     sk = sq if sk is None else sk
     # A window covering the full KV length is exactly global causal attention.
     window = 0 if window and sk <= window else window
-    return paged_prefill_kernel[(triton.cdiv(sq * group, bm), 16 // group, b)](
+    return paged_prefill_kernel[(triton.cdiv(sq * group, bm), q_heads // group, b)](
         q,
         k,
         v,
@@ -543,6 +549,7 @@ def _launch(
         sq,
         sk,
         k.shape[0],
+        k.shape[2],
         tables.stride(0),
         window,
         bm,
@@ -571,8 +578,9 @@ def paged_prefill(q, k, v, tables, *, kv_length=None, window=0):
         raise InvalidInput("Expected tensor inputs")
     if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
         raise InvalidInput("Q/K/V must be BF16")
-    if (q.ndim != 4 or q.shape[2:] != (16, 64) or k.ndim != 4 or k.shape[1:] != (64, 2, 64) or v.shape != k.shape):
-        raise InvalidInput("Expected Q [B,S,16,64] and K/V [pages,64,2,64]")
+    if (q.ndim != 4 or k.ndim != 4 or q.shape[3] != 64 or k.shape[1] != 64 or k.shape[3] != 64 or k.shape[2] < 1
+            or q.shape[2] != 8 * k.shape[2] or v.shape != k.shape):
+        raise InvalidInput("Expected Q [B,S,8*KVH,64] and K/V [pages,64,KVH,64] (GQA8)")
     if not all(t.is_contiguous() for t in (q, k, v, tables)):
         raise InvalidInput("Expected contiguous tensors")
     if any(t.device != q.device for t in (k, v, tables)) or not q.is_cuda:

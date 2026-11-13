@@ -9,12 +9,12 @@ from triton.tlx.ops import InvalidInput, Space, BitwiseInvarianceSpec, Unsupport
 pytestmark = pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 
 
-def _inputs(batch, sq, sk, q_offset=0):
+def _inputs(batch, sq, sk, q_offset=0, kv_heads=2):
     torch.manual_seed(41)
-    q_storage = torch.full((batch * sq * 16 * 64 + q_offset + 1, ), 13, dtype=torch.bfloat16, device="cuda")
-    q = q_storage[q_offset:-1].view(batch, sq, 16, 64).normal_()
+    q_storage = torch.full((batch * sq * kv_heads * 8 * 64 + q_offset + 1, ), 13, dtype=torch.bfloat16, device="cuda")
+    q = q_storage[q_offset:-1].view(batch, sq, kv_heads * 8, 64).normal_()
     pages = triton.cdiv(sk, 64)
-    k = torch.randn((batch * pages + 3, 64, 2, 64), dtype=q.dtype, device=q.device)
+    k = torch.randn((batch * pages + 3, 64, kv_heads, 64), dtype=q.dtype, device=q.device)
     v = torch.randn_like(k)
     table = torch.randperm(k.shape[0], device=q.device, dtype=torch.int32)[:batch * pages].reshape(batch, pages)
     if sk % 64:
@@ -40,9 +40,9 @@ def _check(q, k, v, table, sk, window, out, *, full=True):
     error_sq = torch.zeros((), device=q.device, dtype=torch.float64)
     reference_sq = torch.zeros_like(error_sq)
     for batch in range(q.shape[0]):
-        kk = k[table[batch].long()].reshape(-1, 2, 64)[:sk].double()
-        vv = v[table[batch].long()].reshape(-1, 2, 64)[:sk].double()
-        for h in range(16):
+        kk = k[table[batch].long()].reshape(-1, k.shape[2], 64)[:sk].double()
+        vv = v[table[batch].long()].reshape(-1, k.shape[2], 64)[:sk].double()
+        for h in range(q.shape[2]):
             # Bound reference memory while checking every requested query row.
             for positions in rows.split(512):
                 scores = q[batch, positions, h].double() @ kk[:, h // 8].T * 0.125
@@ -85,6 +85,23 @@ def test_paged_prefill_boundaries(batch, sq, prefix, offset, window):
     assert storage[-1] == 13
     if offset:
         assert storage[0] == 13
+
+
+@pytest.mark.parametrize("kv_heads", [4, 16])
+@pytest.mark.parametrize("window", [0, 2048])
+@pytest.mark.parametrize("sq,sk,offset", [(65, 129, 1), (769, 2817, 0), (2048, 8192, 0)])
+def test_paged_prefill_head_counts(kv_heads, window, sq, sk, offset):
+    q, k, v, table, storage = _inputs(2, sq, sk, offset, kv_heads)
+    out = paged_prefill(q, k, v, table, kv_length=sk, window=window)
+    _check(q, k, v, table, sk, window, out, full=sq <= 769)
+    assert storage[-1] == 13
+    if offset:
+        assert storage[0] == 13
+    # Replay the stable recovery path with the same head strides.
+    q.fill_(1)
+    k.fill_(16)
+    out = paged_prefill(q, k, v, table, kv_length=sk, window=window)
+    _check(q, k, v, table, sk, window, out, full=False)
 
 
 @pytest.mark.parametrize("sq", [2048, 8192, 16384])

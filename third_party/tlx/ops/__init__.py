@@ -226,8 +226,8 @@ def mm(a, b, *, out=None, space=None):
 def paged_prefill(q, k, v, tables, *, kv_length=None, window=0, space=None):
     """BF16 causal GQA prefill over 64-token KV pages, forward only.
 
-    Q is contiguous ``[B, SQ, 16, 64]``; K/V are contiguous
-    ``[physical_pages, 64, 2, 64]`` with 16-byte-aligned bases. The contiguous
+    Q is contiguous ``[B, SQ, 8 * KVH, 64]``; K/V are contiguous
+    ``[physical_pages, 64, KVH, 64]`` with 16-byte-aligned bases. The contiguous
     int32 table is ``[B, logical_pages]``. Callers provide valid physical page
     IDs and finite cache contents for every token through ``kv_length``;
     unused slots in the final page are ignored. All sequences share lengths.

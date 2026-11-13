@@ -81,8 +81,13 @@ options:
 | `addmm_mul_add` | `torch.addmm` + `torch.addcmul` | speedup >= 0.9x | heuristic |
 | `linear_rowscale` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 
-`paged_prefill` covers BF16 causal 16Q/2KV, D64, 64-token shuffled pages on
-gfx1250, globally and with a 2048-token window including self. Its useful
+`paged_prefill` covers BF16 causal GQA8 (16Q/2KV, 32Q/4KV and 128Q/16KV),
+D64, 64-token shuffled pages on gfx1250, globally and with a 2048-token
+window including self. The default suites include batches 1/2/4, full prefill
+through 64K, and Q=2K with cached-prefix KV=8K/32K. Select `gfx1250_1`,
+`gfx1250_heads`, `gfx1250_batched`, `gfx1250_long`, or `gfx1250_prefix` with
+`--suite` to run a subset. Long/prefix benchmarks check sampled query rows
+in FP64 across every batch and head, plus finiteness of the full output. Its useful
 TFLOP/s counts only QK+PV over valid attention pairs (FMA=2); masked work,
 softmax and normalization are excluded. It reports GPU kernel time, excluding
 host allocation/dispatch. It does not compare paged inputs with a dense-only
