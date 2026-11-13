@@ -89,7 +89,7 @@ def test_paged_prefill_boundaries(batch, sq, prefix, offset, window):
 
 @pytest.mark.parametrize("kv_heads", [4, 16])
 @pytest.mark.parametrize("window", [0, 2048])
-@pytest.mark.parametrize("sq,sk,offset", [(65, 129, 1), (769, 2817, 0), (2048, 8192, 0)])
+@pytest.mark.parametrize("sq,sk,offset", [(65, 129, 1), (512, 512, 0), (769, 2817, 0), (2048, 8192, 0)])
 def test_paged_prefill_head_counts(kv_heads, window, sq, sk, offset):
     q, k, v, table, storage = _inputs(2, sq, sk, offset, kv_heads)
     out = paged_prefill(q, k, v, table, kv_length=sk, window=window)

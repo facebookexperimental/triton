@@ -595,16 +595,25 @@ def paged_prefill(q, k, v, tables, *, kv_length=None, window=0):
         raise InvalidInput("Invalid KV length, window or page table shape")
     if tables.dtype != torch.int32:
         raise InvalidInput("Page table must be int32")
-    config = _select_config(q.shape[1], sk, window)
+    config = _select_config(q.shape[1], sk, window, batch=q.shape[0], kv_heads=k.shape[2])
     out = torch.empty_like(q)
     _launch(q, k, v, tables, out, sk=sk, window=window, **config)
     return out
 
 
-def _select_config(query_length, kv_length, window):
+def _select_config(query_length, kv_length, window, *, batch=1, kv_heads=2):
     """Frozen choices from the BF16 prefill sweep; q_len=8 is not tuned."""
     effective_window = 0 if window and kv_length <= window else window
-    if query_length > 4096 or (query_length > 768 and effective_window == 0):
+    if query_length > 768 or (query_length >= 512 and kv_length == query_length):
+        if query_length <= 4096:
+            # Keep enough CTAs for small grids; wider tiles reuse K/V when
+            # heads, batches or a cached prefix provide sufficient work.
+            groups = batch * kv_heads
+            bm = 128 if groups >= 16 or (kv_length > query_length and groups >= 4) else 64
+            if groups >= 32 and query_length > 768 and not effective_window:
+                bm = 256
+        else:
+            bm = 128 if effective_window or query_length <= 8192 else 256
         return dict(
             pipe=True,
             pad=8,
@@ -615,22 +624,12 @@ def _select_config(query_length, kv_length, window):
             deep=True,
             fast=True,
             enable_wmma_queuing=False,
-            bm=(64 if query_length <= 4096 else (128 if effective_window or query_length <= 8192 else 256)),
-            warps=2 if effective_window or query_length <= 8192 else 4,
+            bm=bm,
+            warps=4 if bm == 256 else 2,
             reverse_local_assignment=True,
             llvm_fn_attrs="amdgpu-sched-strategy=coexec",
         )
     base = dict(pipe=True, pad=8, reverse=True, fixed=True, split_mask=True, warps=4)
     if query_length < 256:
         return dict(base, bm=32, group=1, warps=2, fixed=False, split_mask=False)
-    if query_length <= 768:
-        return dict(base, bm=64, group=1, deep=False)
-    if query_length <= 4096:
-        return dict(
-            base,
-            bm=128,
-            group=4,
-            deep=False,
-            enable_wmma_queuing=True,
-            llvm_fn_attrs="amdgpu-sched-strategy=iterative-ilp",
-        )
+    return dict(base, bm=64, group=1, deep=False)
