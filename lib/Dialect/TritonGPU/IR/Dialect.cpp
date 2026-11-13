@@ -1122,10 +1122,12 @@ getDefaultBlockedEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
 FailureOr<LinearEncodingAttr>
 getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
                       int numWarps, int threadsPerWarp, int numCTAs,
-                      unsigned vector, ArrayRef<unsigned> order) {
+                      ArrayRef<unsigned> sizePerThreadArg,
+                      ArrayRef<unsigned> order) {
   if (!triton::tools::isNpotAllowed() ||
       llvm::all_of(shape, llvm::isPowerOf2_64))
     return failure();
+  assert(sizePerThreadArg.size() == shape.size() && "rank mismatch");
   auto twoParts = llvm::map_to_vector(shape, [](int64_t size) -> int64_t {
     return LinearLayout::twoPartOf(size);
   });
@@ -1133,11 +1135,9 @@ getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
   if (blockedOrder.empty())
     blockedOrder =
         llvm::to_vector(llvm::reverse(llvm::seq<unsigned>(shape.size())));
-  SmallVector<unsigned> sizePerThread(shape.size(), 1);
-  sizePerThread[blockedOrder[0]] = vector;
   auto blocked =
-      BlockedEncodingAttr::get(context, twoParts, sizePerThread, blockedOrder,
-                               numWarps, threadsPerWarp, numCTAs);
+      BlockedEncodingAttr::get(context, twoParts, sizePerThreadArg,
+                               blockedOrder, numWarps, threadsPerWarp, numCTAs);
   LinearLayout layout = toLinearLayout(twoParts, blocked);
   auto kRegister = StringAttr::get(context, "register");
   SmallVector<StringAttr> dims = standardOutDimNames(context, shape.size());
@@ -1155,6 +1155,16 @@ getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
   if (!hasMixedRadixConversionInputDims(layout))
     return failure();
   return LinearEncodingAttr::get(context, std::move(layout));
+}
+
+FailureOr<LinearEncodingAttr>
+getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
+                      int numWarps, int threadsPerWarp, int numCTAs,
+                      unsigned vector, ArrayRef<unsigned> order) {
+  SmallVector<unsigned> sizePerThread(shape.size(), 1);
+  sizePerThread[order.empty() ? shape.size() - 1 : order[0]] = vector;
+  return getMixedRadixEncoding(context, shape, numWarps, threadsPerWarp,
+                               numCTAs, sizePerThread, order);
 }
 
 unsigned getMixedRadixVector(MLIRContext *context, ArrayRef<int64_t> shape,
