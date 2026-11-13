@@ -322,7 +322,8 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space=Non
 
     ``a`` is contiguous E4M3 ``[M, K]`` and ``b`` is contiguous E4M3 ``[N, K]``
     (K-major, as for a linear weight); K must be a multiple of 128.
-    M and N may be ragged on gfx950; sm100 still requires 128-aligned rows.
+    M and N may be ragged on gfx950; sm100 still requires 128-aligned rows,
+    and gfx1250 requires 256-aligned M and N with K of at least 256.
     Each run of 32 values along K has one E8M0 scale. ``sf_layout="natural"``
     takes ``[M, K // 32]`` and ``[N, K // 32]`` scales; ``"cublas_blocked"``
     takes the swizzled byte layout returned by torchao's
@@ -334,10 +335,10 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space=Non
     occupies 128 physical rows. A supplied ``out`` is returned by identity.
     Forward-only.
 
-    ``space=None`` uses "full" on sm100 (autotuning) and "heuristic" on gfx950.
-    "heuristic" launches one shape-picked config without autotuning; gfx950
-    provides only this space. A ``Space`` is also accepted; its invariance
-    request is validated but not enforced yet.
+    ``space=None`` uses "full" on sm100 (autotuning) and "heuristic" on gfx950
+    and gfx1250. "heuristic" launches one shape-picked config without
+    autotuning; gfx950 and gfx1250 provide only this space. A ``Space`` is also
+    accepted; its invariance request is validated but not enforced yet.
     """
     import torch
 

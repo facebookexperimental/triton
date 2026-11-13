@@ -12,10 +12,12 @@ of the [gfx950 table](tlx-gfx950.html).
 | Op | Variant | Impl | Dtypes | Requires | Backward | What it does |
 |---|---|---|---|---|---|---|
 | `flash_attn_mxfp8` | wmma_tdm_mxfp8 | `flash_attn_mxfp8/gfx1250.py:flash_attn_mxfp8` | bfloat16 | — | no | MXFP8 attention forward, D128: E4M3 Q/K/V + E8M0 scales, both WMMAs scaled; TDM loads into LDS, softmax and WMMA stages ping-ponged across warp groups; persistent non-causal and causal kernels. |
+| `grouped_gemm` | persistent_tdm | `grouped_gemm/gfx1250.py:grouped_gemm` | float16 | — | no | Persistent ragged-M grouped GEMM over pointer tables: 256x256x128 tiles, two-stage fused TDM ring with cross-tile prefetch, four-workgroup TDM multicast when the groups allow it. Common N/K; K a multiple of 128 with at least two blocks; M/N tails masked. |
+| `mm_mxfp8` | persistent_tdm | `mm_mxfp8/gfx1250.py:mm_mxfp8` | float8_e4m3fn | — | no | Persistent MXFP8 GEMM with BF16 output: 256x256x128 tiles, four-stage fused TDM ring carried across tiles, statically unrolled loop with split workgroup barriers up to K=16384, C staged through LDS for TDM stores, 4x4 multicast clusters. M and N multiples of 256, K a multiple of 128 and at least 256; natural or cuBLAS-blocked scales. |
 
-The tutorial `third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/` also
-exercises fused TDM loads/stores, TDM prefetch, and WMMA in grouped GEMM.
-See its [README](third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md).
+`grouped_gemm` and `mm_mxfp8` were promoted from the tutorials
+[`amd_grouped_gemm_gfx1250`](third_party/tlx/tutorials/amd_grouped_gemm_gfx1250/README.md) and
+[`amd_mxfp_gemm_gfx1250`](third_party/tlx/tutorials/amd_mxfp_gemm_gfx1250/README.md).
 
 ## Supported extension builtins (`tlx.*`)
 
@@ -121,5 +123,4 @@ The CDNA-only restrictions are enforced by the
 ## Notes
 
 - WMMA queuing is a compiler launch option (`enable_wmma_queuing`), not a `tlx.amd_set_wave_sched_mode` builtin. The AMD backend sets the wave-scheduler-mode register; see the [compiler options](third_party/amd/backend/compiler.py).
-- Promoting a gfx1250 tutorial into `tlx.ops` means adding a catalog entry with `arch="gfx1250"`; see [high-performance kernels](tlx-ops.html).
 - Fused TDM loads require disjoint warp masks and support at most 5 multicast recipients. `async_amd_descriptor_wait` takes pending counts or tokens, not both.
