@@ -143,6 +143,25 @@ static bool hasPaddedLowering(Operation *op) {
          !isa<DescriptorStoreLikeOpInterface>(op);
 }
 
+// An exact shared shape is legal iff its rows tile whole swizzle atoms:
+// unswizzled, or the contiguous row bytes are a multiple of the span.
+static bool hasExactSharedShape(gpu::MemDescType type) {
+  // Non-NVMMA shared encodings (AMD) pad: no exact atom rule for them yet.
+  auto nvmma = dyn_cast<gpu::NVMMASharedEncodingAttr>(type.getEncoding());
+  if (!nvmma)
+    return false;
+  // The core matrix is 8 rows x 16B: rows are the non-contiguous tile dim.
+  unsigned contig = gpu::getOrder(type).front();
+  unsigned rank = type.getShape().size();
+  unsigned rows = contig == rank - 1 ? rank - 2 : rank - 1;
+  int64_t rowBytes = type.getShape()[contig] *
+                     type.getElementType().getIntOrFloatBitWidth() / 8;
+  unsigned swizzle = nvmma.getSwizzlingByteWidth();
+  if (swizzle == 0)
+    return rowBytes % 16 == 0;
+  return rowBytes % swizzle == 0 && type.getShape()[rows] % 8 == 0;
+}
+
 static bool hasFileLoc(Operation *op) {
   return bool(op->getLoc()->findInstanceOf<FileLineColLoc>());
 }
@@ -238,6 +257,9 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
   // mixed-radix and Blocked layouts to sum; false if v cannot take a
   // mixed-radix layout.
   auto addTotalInDimSizes = [&](Value v, std::pair<int64_t, int64_t> &sum) {
+    if (auto alloc = v.getDefiningOp<gpu::LocalAllocOp>();
+        alloc && alloc.getSrc())
+      return true;
     if (auto desc = dyn_cast<TensorDescType>(v.getType()))
       return !desc.getSharedLayout();
     auto type = dyn_cast<RankedTensorType>(v.getType());
@@ -380,7 +402,13 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
     auto [first, inserted] = firstOps.try_emplace(leader, op);
     if (!inserted && !hasFileLoc(first->second) && hasFileLoc(op))
       first->second = op;
-    if (!gpu::isMixedRadixLayoutOp(op->getName())) {
+    auto alloc = dyn_cast<gpu::LocalAllocOp>(op);
+    if (alloc && alloc.getSrc() && !hasExactSharedShape(alloc.getType())) {
+      pad(leader, op,
+          "NPOT shared allocation rows do not tile whole swizzle atoms");
+    } else if (alloc && alloc.getSrc()) {
+      // Exact shared shape is legal: the alloc keeps its dense shape.
+    } else if (!gpu::isMixedRadixLayoutOp(op->getName())) {
       pad(leader, op,
           llvm::formatv("NPOT mixed-radix layout is not yet supported on {0}",
                         op->getName()));
@@ -686,6 +714,14 @@ LogicalResult Padder::accept(Operation *op) {
     llvm::append_range(types, region.getArgumentTypes());
   if (!llvm::any_of(types, touchesNpot))
     return success();
+  // An alloc in a padded component is retyped to the padded shape below.
+  if (auto alloc = dyn_cast<gpu::LocalAllocOp>(op); alloc && alloc.getSrc())
+    return success();
+  // A load of an alloc retyped above: its result tensor takes the generic
+  // exact/padded retype and layout checks like any other op's result.
+  if (auto load = dyn_cast<gpu::LocalLoadOp>(op);
+      load && load.getSrc().getDefiningOp<gpu::LocalAllocOp>())
+    return success();
   if (llvm::any_of(types, [](Type type) {
         auto desc = dyn_cast<TensorDescType>(type);
         auto tensor = desc && !desc.getSharedLayout()
@@ -845,7 +881,14 @@ void Padder::apply(ModuleOp mod, const ExactComponents &exact) {
       return;
     if (auto type = dyn_cast<RankedTensorType>(value.getType()))
       value.setType(padded(type));
-    else if (auto desc = dyn_cast<TensorDescType>(value.getType()))
+    else if (auto mem = dyn_cast<gpu::MemDescType>(value.getType())) {
+      auto shape =
+          padded(RankedTensorType::get(mem.getShape(), mem.getElementType()))
+              .getShape();
+      value.setType(gpu::MemDescType::get(
+          shape, mem.getElementType(), mem.getEncoding(), mem.getMemorySpace(),
+          mem.getMutableMemory(), shape));
+    } else if (auto desc = dyn_cast<TensorDescType>(value.getType()))
       value.setType(TensorDescType::get(padded(desc.getBlockType()).getShape(),
                                         desc.getElementType(),
                                         desc.getSharedLayout()));
