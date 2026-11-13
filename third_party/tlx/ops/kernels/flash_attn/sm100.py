@@ -392,10 +392,14 @@ def _softmax_inner_loop(
         # -> FA4 handles one row per thread (32 threads per warp * 4)
         # -> use fmax_reduce(one row of qk, m_i[0])
         # -> m_i|m_ij = row_max[0] * scale
+        # Reduce each row in 2 independent chains, like FA4's fmax_reduce (which uses 4): a single chain over the row is
+        # 64 dependent 3-input maxes, and the exp2s, alpha and the first P chunk all wait for it. 2 chains measured
+        # faster than 4 or 8 here. Max is exact, so the result does not change.
+        row_max = tl.max(tl.max(tl.reshape(qk, [qk.shape[0], BLOCK_N // 2, 2]), 1), 1)
         if RESCALE_OPT:
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            m_ij = tl.maximum(m_i, row_max)
         else:
-            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+            m_ij = tl.maximum(m_i, row_max * qk_scale)
 
         # -- compute correction factor
         # update_row_max: acc_scale_ = (row_max[0] - row_max_new) * scale
