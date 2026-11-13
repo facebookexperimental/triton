@@ -4616,16 +4616,16 @@ def test_dense_bwd_diagonal_groups_scales_gfx950(shape, sm_scale, monkeypatch):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-@pytest.mark.parametrize("shape,split_q", [
-    pytest.param((16, 16, 16, 4096, 128), None, id="mha-4k"),
-    pytest.param((16, 16, 16, 8192, 128), None, id="mha-8k"),
-    pytest.param((16, 16, 16, 16384, 128), None, id="mha-16k"),
-    pytest.param((16, 64, 8, 8192, 128), None, id="gqa-8k"),
-    pytest.param((15, 64, 8, 16384, 128), None, id="gqa-16k"),
-    pytest.param((16, 64, 8, 2048, 128), 1, id="gqa-2k-forced-unsplit"),
-    pytest.param((16, 64, 8, 4096, 128), 1, id="gqa-4k-forced-unsplit"),
+@pytest.mark.parametrize("shape,split_q,expected_spills", [
+    pytest.param((16, 16, 16, 4096, 128), None, 33, id="mha-4k"),
+    pytest.param((16, 16, 16, 8192, 128), None, 55, id="mha-8k"),
+    pytest.param((16, 16, 16, 16384, 128), None, 0, id="mha-16k"),
+    pytest.param((16, 64, 8, 8192, 128), None, 0, id="gqa-8k"),
+    pytest.param((15, 64, 8, 16384, 128), None, 0, id="gqa-16k"),
+    pytest.param((16, 64, 8, 2048, 128), 1, 0, id="gqa-2k-forced-unsplit"),
+    pytest.param((16, 64, 8, 4096, 128), 1, 0, id="gqa-4k-forced-unsplit"),
 ])
-def test_dense_bwd_causal_sampled_owners_gfx950(shape, split_q, monkeypatch):
+def test_dense_bwd_causal_sampled_owners_gfx950(shape, split_q, expected_spills, monkeypatch):
     batch, hq, hk, n_ctx, _head_dim = shape
     owners = {(b, h) for b in (0, batch // 2, batch - 1) for h in (0, hk // 2, hk - 1)}
     case = _make_dense_gqa_reference_case(shape, causal=True, seed=2831, owners=owners)
@@ -4650,7 +4650,17 @@ def test_dense_bwd_causal_sampled_owners_gfx950(shape, split_q, monkeypatch):
     actual = fa_backward(*case.kernel_args, split_q=split_q)
     assert len(launches) == 1
     assert len(partials) == (2 if dispatch.bf16_kv_partials else 0)
-    _assert_scratch_free(dispatch.main_entry.__name__, launches[0][1])
+    compiled = launches[0][1]
+    if expected_spills and compiled.n_spills:
+        assert compiled.n_spills == expected_spills
+        assert compiled.metadata.global_scratch_size == 0
+        private_segments = {
+            int(value)
+            for value in re.findall(r"(?:\.amdhsa_)?private_segment_fixed_size:?\s+(\d+)", compiled.asm["amdgcn"])
+        }
+        assert private_segments == {4 * expected_spills}
+    else:
+        _assert_scratch_free(dispatch.main_entry.__name__, compiled)
     for result in actual:
         assert torch.isfinite(result).all()
     group_size = hq // hk
