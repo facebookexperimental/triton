@@ -1,4 +1,4 @@
-"""SM103+ compile and runtime coverage for PTX 9.4 TLX packed x4 arithmetic."""
+"""SM103+ compile and runtime coverage for PTX 9.4 TLX packed arithmetic."""
 
 import pytest
 
@@ -387,3 +387,84 @@ def test_packed_x4_rejects_fp4_shape_mismatch():
                 "FP4_LAYOUT": _RESULT_LAYOUT,
             },
         )
+
+
+@triton.jit
+def _fp16_exp_row_sum_kernel(qk_ptr, l_ptr, output_ptr, HALF_DTYPE: tl.constexpr, RESULT_LAYOUT: tl.constexpr):
+    offsets = tlx.require_layout(tl.arange(0, _RESULT_SIZE), RESULT_LAYOUT)
+    qk = tlx.require_layout(tl.load(qk_ptr + offsets), RESULT_LAYOUT)
+    l_i = tlx.require_layout(tl.load(l_ptr + offsets), RESULT_LAYOUT)
+    p = tlx.packed_exp2(qk.to(HALF_DTYPE))
+    tl.store(output_ptr + offsets, tlx.packed_add2(p, l_i))
+
+
+@triton.jit
+def _packed_add2_kernel(a_ptr, b_ptr, output_ptr, RESULT_LAYOUT: tl.constexpr):
+    offsets = tlx.require_layout(tl.arange(0, _RESULT_SIZE), RESULT_LAYOUT)
+    a = tlx.require_layout(tl.load(a_ptr + offsets), RESULT_LAYOUT)
+    b = tlx.require_layout(tl.load(b_ptr + offsets), RESULT_LAYOUT)
+    tl.store(output_ptr + offsets, tlx.packed_add2(a, b))
+
+
+@triton.jit
+def _packed_exp2_kernel(x_ptr, output_ptr):
+    offsets = tl.arange(0, _RESULT_SIZE)
+    tl.store(output_ptr + offsets, tlx.packed_exp2(tl.load(x_ptr + offsets)))
+
+
+_ROW_SUM_SIGNATURE = {"qk_ptr": "*fp32", "l_ptr": "*fp32", "output_ptr": "*fp32"}
+
+
+@pytest.mark.parametrize(
+    "half_dtype,ex2_instruction,add_instruction",
+    [
+        (tl.float16, "ex2.approx.f16x2", "add.f32x2.f16x2.f32x2"),
+        (tl.bfloat16, "ex2.approx.ftz.bf16x2", "add.f32x2.bf16x2.f32x2"),
+    ],
+)
+def test_fp16_exp_row_sum_lowers_on_sm107(half_dtype, ex2_instruction, add_instruction):
+    compiled = _compile(_fp16_exp_row_sum_kernel, _ROW_SUM_SIGNATURE,
+                        {"HALF_DTYPE": half_dtype, "RESULT_LAYOUT": _RESULT_LAYOUT}, capability=107, stop_after="ptx")
+    assert "ttng.packed_arith add" in compiled["ttgir"]
+    assert ".target sm_107a" in compiled["ptx"]
+    assert ex2_instruction in compiled["ptx"]
+    assert add_instruction in compiled["ptx"]
+    assert "cubin" not in compiled
+
+
+@pytest.mark.parametrize("capability,ptx_target", [(100, "sm_100a"), (103, "sm_103a")])
+@pytest.mark.parametrize(
+    "half_dtype,ex2_instruction",
+    [(tl.float16, "ex2.approx.f16x2"), (tl.bfloat16, "ex2.approx.ftz.bf16x2")],
+)
+def test_fp16_exp_row_sum_falls_back_before_sm107(capability, ptx_target, half_dtype, ex2_instruction):
+    compiled = _compile(_fp16_exp_row_sum_kernel, _ROW_SUM_SIGNATURE,
+                        {"HALF_DTYPE": half_dtype, "RESULT_LAYOUT": _RESULT_LAYOUT}, capability=capability)
+    assert "ttng.packed_arith" not in compiled["ttgir"]
+    assert f".target {ptx_target}" in compiled["ptx"]
+    assert ex2_instruction in compiled["ptx"]
+    assert ".f32x2.f16x2" not in compiled["ptx"] and ".f32x2.bf16x2" not in compiled["ptx"]
+    assert compiled["cubin"]
+
+
+def test_packed_add2_accepts_fp32_first_operand():
+    compiled = _compile(_packed_add2_kernel, {"a_ptr": "*fp32", "b_ptr": "*fp16", "output_ptr": "*fp32"},
+                        {"RESULT_LAYOUT": _RESULT_LAYOUT}, capability=107, stop_after="ptx")
+    assert "add.f32x2.f16x2.f32x2" in compiled["ptx"]
+
+
+@pytest.mark.parametrize("a_type,b_type", [("*fp16", "*fp16"), ("*fp32", "*fp32"), ("*fp8e4nv", "*fp32")])
+def test_packed_add2_rejects_unsupported_operand_types(a_type, b_type):
+    with pytest.raises(triton.CompilationError, match="requires one FP16/BF16 and one FP32 operand"):
+        _compile(_packed_add2_kernel, {"a_ptr": a_type, "b_ptr": b_type, "output_ptr": "*fp32"},
+                 {"RESULT_LAYOUT": _RESULT_LAYOUT}, capability=107, stop_after="ttir")
+
+
+def test_packed_exp2_rejects_fp32():
+    with pytest.raises(triton.CompilationError, match="only supports FP16/BF16"):
+        _compile(_packed_exp2_kernel, {"x_ptr": "*fp32", "output_ptr": "*fp32"}, {}, capability=107, stop_after="ttir")
+
+
+def test_packed_exp2_rejects_bf16_before_sm90():
+    with pytest.raises(triton.CompilationError, match="requires compute capability >= 90"):
+        _compile(_packed_exp2_kernel, {"x_ptr": "*bf16", "output_ptr": "*bf16"}, {}, capability=80, stop_after="ttir")

@@ -96,7 +96,7 @@ from .mma_ops import (
     release_layout,
     tcgen05_commit,
 )
-from .packed_arith import packed_add4, packed_fma4, packed_mul4, packed_sub4
+from .packed_arith import packed_add2, packed_add4, packed_exp2, packed_fma4, packed_mul4, packed_sub4
 from .types import (
     async_token,
     buffered_tensor,
@@ -158,6 +158,8 @@ __all__ = [
     "async_tasks",
     "async_task",
     # packed arithmetic
+    "packed_add2",
+    "packed_exp2",
     "packed_add4",
     "packed_sub4",
     "packed_mul4",

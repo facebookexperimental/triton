@@ -3,6 +3,11 @@ import triton.language.core as tl
 from .utility import cuda_parse_arch
 
 _SUPPORTED_FP8_TYPES = (tl.float8e4nv, tl.float8e5)
+_SUPPORTED_HALF_TYPES = (tl.float16, tl.bfloat16)
+_EX2_X2_INSTRUCTIONS = {
+    tl.float16: ("ex2.approx.f16x2", 75),
+    tl.bfloat16: ("ex2.approx.ftz.bf16x2", 90),
+}
 
 
 def _is_packed_fp4(operand):
@@ -26,11 +31,15 @@ def _packed_fp4_axis(operand_shape, result_shape):
     return packed_axis
 
 
-def _packed_arith(operation, operands, dtype, semantic):
+def _cuda_capability(name, semantic):
     arch = semantic.builder.options.arch
-    assert isinstance(arch, str) and arch.startswith("sm"), (
-        f"tlx.packed_{operation}4 requires an NVIDIA GPU, got architecture {arch}")
-    capability = cuda_parse_arch(arch)
+    is_cuda = isinstance(arch, str) and arch.startswith("sm")
+    assert is_cuda, f"tlx.{name} requires an NVIDIA GPU, got architecture {arch}"
+    return cuda_parse_arch(arch)
+
+
+def _packed_arith(operation, operands, dtype, semantic):
+    capability = _cuda_capability(f"packed_{operation}4", semantic)
     assert capability >= 103, (f"tlx.packed_{operation}4 requires compute capability >= 103, "
                                f"current capability: {capability}")
 
@@ -127,3 +136,52 @@ def packed_mul4(lhs, rhs, dtype=None, _semantic=None):
 def packed_fma4(lhs, rhs, acc, dtype=None, _semantic=None):
     """Fused multiply-add four packed FP8/FP4 lanes with an SM103+ PTX 9.4 instruction."""
     return _packed_arith("fma", (lhs, rhs, acc), dtype, _semantic)
+
+
+@tl.builtin
+def packed_exp2(x, _semantic=None):
+    """Approximate 2**x on FP16/BF16 tensors, two lanes per ``ex2.approx`` instruction.
+
+    Rubin (SM107) doubles FP16 exp throughput relative to FP32.
+    """
+    x = _semantic.to_tensor(x)
+    assert x.dtype in _EX2_X2_INSTRUCTIONS, f"tlx.packed_exp2 only supports FP16/BF16, got {x.dtype}"
+    instruction, min_capability = _EX2_X2_INSTRUCTIONS[x.dtype]
+    capability = _cuda_capability("packed_exp2", _semantic)
+    assert capability >= min_capability, (f"tlx.packed_exp2 on {x.dtype} requires compute capability >= "
+                                          f"{min_capability}, current capability: {capability}")
+    return tl.inline_asm_elementwise(
+        f"{instruction} $0, $1;",
+        "=r,r",
+        [x],
+        dtype=x.dtype,
+        is_pure=True,
+        pack=2,
+        _semantic=_semantic,
+    )
+
+
+@tl.builtin
+def packed_add2(lhs, rhs, _semantic=None):
+    """Add an FP16/BF16 tensor to an FP32 tensor, producing FP32.
+
+    On SM107 this lowers to the mixed-precision ``add.f32x2.{f16x2,bf16x2}.f32x2``
+    (PTX 9.4) and, like ``packed_add4``, needs operands with a distributed layout
+    (e.g. from a TMEM load or ``tlx.require_layout``); earlier targets upcast and
+    use an ordinary FP32 add.
+    """
+    lhs = _semantic.to_tensor(lhs)
+    rhs = _semantic.to_tensor(rhs)
+    if lhs.dtype == tl.float32:
+        lhs, rhs = rhs, lhs
+    assert lhs.dtype in _SUPPORTED_HALF_TYPES and rhs.dtype == tl.float32, (
+        f"tlx.packed_add2 requires one FP16/BF16 and one FP32 operand, got {lhs.dtype} and {rhs.dtype}")
+    assert lhs.type.is_block() and rhs.type.is_block(), "tlx.packed_add2 requires block tensor operands"
+    assert lhs.type.shape == rhs.type.shape, (
+        f"tlx.packed_add2 operand shapes must match, got {lhs.type.shape} and {rhs.type.shape}")
+
+    if _cuda_capability("packed_add2", _semantic) != 107:
+        return _semantic.add(_semantic.cast(lhs, tl.float32), rhs, True)
+    builder = _semantic.builder
+    handle = builder.create_packed_arith(tl.float32.to_ir(builder), "add", [lhs.handle, rhs.handle], rhs.handle)
+    return tl.tensor(handle, rhs.type)
