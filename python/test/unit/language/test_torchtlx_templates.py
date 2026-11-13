@@ -727,6 +727,21 @@ class TestTLXTemplates(TestCase):
             base_get_configs.assert_called_once()
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_hopper_addmm_joins_aten_set_without_max_autotune(self):
+        from torch._inductor.kernel.mm import aten_addmm
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+
+        hopper = [_tlx_mm.hopper_gemm_ws_template, _tlx_mm.hopper_gemm_small_k_template]
+        with mock.patch.object(_tlx_mm, "is_rocm", return_value=False), mock.patch.object(_tlx_mm,
+                                                                                          "current_target") as target:
+            target.return_value.is_blackwell = False
+            target.return_value.is_hopper = True
+            for max_autotune, expected in ((False, [aten_addmm, *hopper]), (True, [aten_addmm])):
+                with self.subTest(max_autotune=max_autotune), config.patch(max_autotune=max_autotune):
+                    templates = _tlx_mm.append_tlx([aten_addmm], "addmm", _mm_kernel_inputs_stub())
+                    self.assertEqual(templates, expected)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_blackwell_template_is_arch_gated(self):
         from torch._inductor.kernel.mm import mm_template
         from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
@@ -2724,9 +2739,6 @@ def _operands(shape, layout, dtype):
 # consumer loop and the small-K template's descriptor loads.
 _HOPPER_WS = "_consume_tile"
 _HOPPER_SMALL_K = "desc_a.load"
-# max_autotune is required for addmm (mm works without it): without max_autotune
-# or max_autotune_gemm, tuned_addmm returns an ATen-only choice before any template
-# is considered, and tlx_mode=force then has no candidate (NoValidChoicesError).
 _HOPPER_ADDMM_PATCH = {
     "max_autotune": True,
     "triton.tlx_mode": "force",
@@ -2893,6 +2905,17 @@ class TestHopperMMTemplate(TestCase):
             actual, code = run_and_get_code(torch.compile(torch.addmm), bias, a, b)
         torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
         self.assertIn("_consume_tile", "\n".join(code))
+
+    @parametrize("bias_shape", ("n", "mn"))
+    def test_addmm_without_max_autotune(self, bias_shape):
+        """Without max_autotune, TLX joins tuned_addmm's ATen-only choice set with the
+        bias expanded to [M, N]."""
+        a, b = _operands((264, 1000, 64 * 41), "nt", torch.float16)
+        bias = torch.randn(1000 if bias_shape == "n" else (264, 1000), device=GPU_TYPE, dtype=torch.float16)
+        with config.patch({**_HOPPER_ADDMM_PATCH, "max_autotune": False}):
+            actual, code = run_and_get_code(torch.compile(torch.addmm), bias, a, b)
+        torch.testing.assert_close(actual, (bias.float() + a.float() @ b.float()).half(), atol=3e-2, rtol=3e-2)
+        self.assertIn(_HOPPER_WS, "\n".join(code))
 
     @parametrize("op", ("mm", "addmm"))
     @parametrize("m", (1, 7, 64))
@@ -4190,7 +4213,7 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                             ),
                             mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_eligible",
                                               return_value=True),
-                            mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_configs",
+                            mock.patch.object(flex_attention_templates, "_flex_fwd_base_configs",
                                               side_effect=lambda configs: configs),
                     ):
                         flex_attention_templates.append_tlx_flex(
@@ -4219,11 +4242,12 @@ class TestFlexAttentionChoiceRegistration(TestCase):
             with self.subTest(sparse_q=sparse_q, sparse_kv=sparse_kv):
                 choices = []
                 with (
-                        config.patch({"triton.tlx_mode": "force", "max_autotune": False}),
+                        config.patch({"triton.tlx_mode": "force"}),
                         mock.patch.object(flex_attention_templates, "current_target",
                                           return_value=mock.Mock(key="gfx950", is_gfx1250=False)),
                         mock.patch.object(flex_attention_templates, "_use_amd_flex_template", return_value=True),
                         mock.patch.object(flex_attention_templates, "gfx950_flex_attention_template", self._Template()),
+                        mock.patch.object(flex_attention_templates, "_flex_fwd_base_configs", return_value=[]),
                 ):
                     flex_attention_templates.append_tlx_flex(
                         choices,
@@ -4242,12 +4266,14 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                     tuple(choices[0][name]
                           for name in ("num_warps", "num_stages", "waves_per_eu", "matrix_instr_nonkdim", "kpack")))
 
-    def test_flex_forward_autotune_and_wide_head(self):
+    def test_flex_forward_stock_tiles_and_wide_head(self):
+        """Stock-derived tiles follow the offline one with max_autotune on or off."""
         from triton.language.extra.tlx.inductor import flex_attention_templates
 
         stock = self._forward_config()
         stock.block_m, stock.block_n = 64, 32
-        cases = ((True, 128, [(128, 64), (64, 32), (128, 128)]), (False, 256, []), (True, 256, []))
+        tiles = [(128, 64), (64, 32), (128, 128)]
+        cases = ((True, 128, tiles), (False, 128, tiles), (False, 256, []), (True, 256, []))
         for max_autotune, head_dim, expected in cases:
             with self.subTest(max_autotune=max_autotune, head_dim=head_dim):
                 choices = []
@@ -4257,6 +4283,8 @@ class TestFlexAttentionChoiceRegistration(TestCase):
                                           return_value=mock.Mock(key="gfx950", is_gfx1250=False)),
                         mock.patch.object(flex_attention_templates, "_use_amd_flex_template", return_value=True),
                         mock.patch.object(flex_attention_templates, "gfx950_flex_attention_template", self._Template()),
+                        mock.patch.object(flex_attention_templates, "_flex_fwd_base_configs",
+                                          side_effect=lambda configs: configs),
                 ):
                     flex_attention_templates.append_tlx_flex(
                         choices,
@@ -4681,34 +4709,37 @@ class TestFlexAttentionChoiceRegistration(TestCase):
 class TestDeferredSelection(TestCase):
     """When TLX defers GEMM selection to a MultiTemplateBuffer without max_autotune."""
 
-    def _defers(self, mode, is_blackwell=False, is_gfx942=False, tlx_choice=True, return_multi_template=True):
+    def _defers(self, mode, arch, tlx_choice=True, return_multi_template=True):
         from triton.language.extra.tlx.inductor import registry
 
         deferred = []
         choice = mock.MagicMock()
         choice.name = "tlx_mm" if tlx_choice else "mm"
+        target = type(
+            "Target", (), {
+                "is_blackwell": arch == "sm100",
+                "is_hopper": arch == "sm90",
+                "is_gfx942": arch == "gfx942",
+                "is_gfx950": arch == "gfx950",
+            })()
         with (
                 config.patch({"triton.tlx_mode": mode, "max_autotune": False, "max_autotune_gemm": False}),
-                mock.patch.object(registry, "current_target", return_value=type("Target", (),
-                                                                                {"is_blackwell": is_blackwell})()),
-                mock.patch.object(registry, "_is_gfx942", return_value=is_gfx942),
+                mock.patch.object(registry, "current_target", return_value=target),
                 mock.patch.object(registry, "_orig_algorithm_selector_call",
                                   side_effect=lambda *args, **kwargs: deferred.append(config.max_autotune_gemm)),
         ):
             registry._tlx_algorithm_selector_call(None, "mm", [choice], return_multi_template=return_multi_template)
         return deferred == [True]
 
-    def test_blackwell_defers_whenever_tlx_is_on(self):
-        self.assertTrue(self._defers("allow", is_blackwell=True))
-        self.assertTrue(self._defers("force", is_blackwell=True))
-        self.assertTrue(self._defers("allow", is_blackwell=True, tlx_choice=False))
-        self.assertFalse(self._defers(None, is_blackwell=True))
-        self.assertFalse(self._defers("allow", is_blackwell=True, return_multi_template=False))
-
-    def test_gfx942_defers_in_allow_with_a_tlx_choice(self):
-        self.assertTrue(self._defers("allow", is_gfx942=True))
-        self.assertFalse(self._defers("force", is_gfx942=True))
-        self.assertFalse(self._defers("allow", is_gfx942=True, tlx_choice=False))
+    def test_defers_whenever_tlx_is_on(self):
+        for arch in ("sm100", "sm90", "gfx942", "gfx950"):
+            with self.subTest(arch=arch):
+                self.assertTrue(self._defers("allow", arch))
+                self.assertTrue(self._defers("force", arch))
+                self.assertTrue(self._defers("allow", arch, tlx_choice=False))
+                self.assertFalse(self._defers(None, arch))
+                self.assertFalse(self._defers("allow", arch, return_multi_template=False))
+        self.assertFalse(self._defers("allow", "sm80"))
 
 
 @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -4726,7 +4757,7 @@ class TestBlackwellFlexAttentionChoices(TestCase):
         for max_autotune in (False, True):
             with config.patch(max_autotune=max_autotune):
                 stock = heuristics.get_flex_attn_fwd_configs(128, 512, torch.bfloat16)
-            base[max_autotune] = flex_attention_templates._blackwell_flex_fwd_configs(stock)
+            base[max_autotune] = flex_attention_templates._flex_fwd_base_configs(stock)
         self.assertEqual(base[True], base[False])
         self.assertGreater(len(base[False]), 1)
 
@@ -4748,7 +4779,7 @@ class TestBlackwellFlexAttentionChoices(TestCase):
                                   registration._Template()),
                 mock.patch.object(flex_attention_templates, "current_target", return_value=target),
                 mock.patch("torch._inductor.utils.can_use_tma", return_value=tma),
-                mock.patch.object(flex_attention_templates, "_blackwell_flex_fwd_configs",
+                mock.patch.object(flex_attention_templates, "_flex_fwd_base_configs",
                                   side_effect=lambda configs: configs),
         ):
             flex_attention_templates.append_tlx_flex(
