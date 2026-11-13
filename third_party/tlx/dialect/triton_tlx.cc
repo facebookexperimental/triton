@@ -1536,7 +1536,14 @@ void init_triton_tlx_ir(py::module &&m) {
 }
 
 void init_triton_tlx_passes(py::module &&m) {
-  ADD_PASS_WRAPPER_0("add_tlx_propagate_layout", tlx::createTlxPropagateLayout);
+  m.def(
+      "add_tlx_propagate_layout",
+      [](mlir::PassManager &pm, bool onlyHandPlacedLds) {
+        tlx::TlxPropagateLayoutOptions options;
+        options.onlyHandPlacedLds = onlyHandPlacedLds;
+        pm.addPass(tlx::createTlxPropagateLayout(options));
+      },
+      py::arg("pm"), py::arg("only_hand_placed_lds") = false);
   ADD_PASS_WRAPPER_0("add_tlx_insert_require_layout",
                      tlx::createTLXInsertRequireLayout);
   ADD_PASS_WRAPPER_0("add_tlx_rewrite_local_alias",

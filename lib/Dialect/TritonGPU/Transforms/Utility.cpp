@@ -9,6 +9,7 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -2062,6 +2063,23 @@ std::optional<bool> getBoolFromConstant(Value cst) {
     return boolAttr.getValue();
   }
   return std::nullopt;
+}
+
+bool placesLdsByHand(ModuleOp mod) {
+  for (StringRef name : {tlx::AttrHasTLXOpsName,
+                         tlx::AttrHasExplicitLocalMemAccessName,
+                         tlx::AttrHasWarpSpecOpsName}) {
+    if (auto attr = mod->getAttrOfType<BoolAttr>(name); attr && attr.getValue())
+      return true;
+  }
+  return mod
+      .walk([](Operation *op) {
+        return op->hasAttr("triton.warp_pipeline.border") ||
+                       op->hasAttr("triton.intra_wave_pipeline.marker")
+                   ? WalkResult::interrupt()
+                   : WalkResult::advance();
+      })
+      .wasInterrupted();
 }
 
 } // namespace mlir::triton
