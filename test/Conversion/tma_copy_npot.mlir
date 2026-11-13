@@ -1,5 +1,6 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -verify-diagnostics --convert-triton-gpu-to-llvm="compute-capability=90 ptx-version=84" | FileCheck %s
 // RUN: env -u TRITON_ALLOW_NPOT not triton-opt %s -split-input-file 2>&1 | FileCheck %s --check-prefix=OFF --implicit-check-not="op NPOT"
+// RUN: env -u TRITON_ALLOW_NPOT not triton-opt %s -split-input-file 2>&1 | FileCheck %s --check-prefix=OFF144
 
 // With TRITON_ALLOW_NPOT=1, TMA copies an NPOT tile as whole boxes: an NPOT box
 // spans its extent and an odd box count adds the message index as a mixed-radix
@@ -170,6 +171,47 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @tma_load_512x64(%desc: !tt.tensordesc<512x64xf16, #nvmma>, %alloc: !ttg.memdesc<512x64xf16, #nvmma, #smem, mutable>, %x: i32, %barrier: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
     ttng.async_tma_copy_global_to_local %desc[%x, %x] %alloc, %barrier, %pred : !tt.tensordesc<512x64xf16, #nvmma>, !ttg.memdesc<1xi64, #shared0, #smem> -> !ttg.memdesc<512x64xf16, #nvmma, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// 144 columns: three 64-column sw128 boxes, the last overhanging into the
+// 256-wide alloc (zero-filled past the edge per PTX ISA 5.5.3.3). Loads only.
+// CHECK-LABEL: llvm.func @tma_load_64x144_sw128
+// CHECK: %[[N:.*]] = llvm.mlir.constant(96 : i32) : i32
+// CHECK-NEXT: llvm.icmp "ult" %{{.*}}, %[[N]] : i32
+// CHECK: %[[R:.*]] = llvm.mlir.constant(3 : i32) : i32
+// CHECK-NEXT: %[[D:.*]] = llvm.urem %{{.*}}, %[[R]] : i32
+// CHECK-NEXT: %[[S:.*]] = llvm.mlir.constant(6 : i32) : i32
+// CHECK-NEXT: llvm.shl %[[D]], %[[S]] : i32
+// CHECK-COUNT-1: cp.async.bulk.tensor.2d.shared::cluster.global
+// CHECK-NOT: cp.async.bulk.tensor
+// Flag off, the N144 chunks fail the upstream inner-dim shape check.
+// OFF144: shape must have power-of-2 and non-zero dimensions; got 64, 144
+// OFF144: tt.func @tma_load_64x144_sw128
+#shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tma_load_64x144_sw128(%desc: !tt.tensordesc<64x144xf16, #nvmma>, %alloc: !ttg.memdesc<64x144xf16, #nvmma, #smem, mutable, 64x256>, %x: i32, %barrier: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
+    ttng.async_tma_copy_global_to_local %desc[%x, %x] %alloc, %barrier, %pred : !tt.tensordesc<64x144xf16, #nvmma>, !ttg.memdesc<1xi64, #shared0, #smem> -> !ttg.memdesc<64x144xf16, #nvmma, #smem, mutable, 64x256>
+    tt.return
+  }
+}
+
+// -----
+
+// Stores keep exact tiling: the same overhang a load allows still fails.
+// OFF144: shape must have power-of-2 and non-zero dimensions; got 64, 144
+// OFF144: tt.func @tma_store_64x144_sw128
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tma_store_64x144_sw128(%desc: !tt.tensordesc<64x144xf16, #nvmma>, %alloc: !ttg.memdesc<64x144xf16, #nvmma, #smem, 64x256>, %x: i32) {
+    // expected-error @+1 {{NPOT TMA box 64 does not divide extent 144}}
+    ttng.async_tma_copy_local_to_global %desc[%x, %x] %alloc : !tt.tensordesc<64x144xf16, #nvmma>, !ttg.memdesc<64x144xf16, #nvmma, #smem, 64x256>
     tt.return
   }
 }

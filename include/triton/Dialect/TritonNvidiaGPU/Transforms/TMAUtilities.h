@@ -27,7 +27,11 @@ getEncodingFromDescriptor(Operation *op, RankedTensorType tensorType,
 
 int64_t getDescriptorLoadBytes(Operation *op, RankedTensorType tensorType,
                                Value desc);
-int64_t getDescriptorLoadBytes(triton::gpu::MemDescType memDescType);
+// Buffer-typed form: the buffer's own shape+encoding is ground truth for
+// delivered bytes (callers with fused encodings must not recompute it).
+// The caller supplies the transfer mode from the descriptor type.
+int64_t getDescriptorLoadBytes(triton::gpu::MemDescType memDesc,
+                               triton::gpu::TMAMode mode);
 
 bool hasCGABroadcast(gpu::MemDescType memDescType);
 

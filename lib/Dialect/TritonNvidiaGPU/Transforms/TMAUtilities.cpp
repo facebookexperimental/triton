@@ -30,20 +30,50 @@ ttg::SharedEncodingTrait getEncodingFromDescriptor(Operation *op,
   return ttg::updateEncodingForShape(op, sharedEnc, tensorType);
 }
 
-int64_t getDescriptorLoadBytes(Operation *op, RankedTensorType tensorType,
-                               Value desc) {
-  auto encoding = getEncodingFromDescriptor(op, tensorType, desc);
-  auto shapePerCTA = ttg::getShapePerCTA(encoding, tensorType.getShape());
-  int64_t bytes = product(shapePerCTA) *
-                  getIntOrFloatOrPtrBitWidth(tensorType.getElementType()) / 8;
+static int64_t transferBytes(ttg::MemDescType memDesc, ttg::TMAMode mode) {
+  auto encoding = memDesc.getEncoding();
+  auto shapePerCTA = ttg::getShapePerCTA(memDesc);
+  unsigned bitwidth = getIntOrFloatOrPtrBitWidth(memDesc.getElementType());
+  int64_t bytes = product(shapePerCTA) * bitwidth / 8;
+  if (llvm::all_of(shapePerCTA, llvm::isPowerOf2_64))
+    return isFp6Padded(encoding) ? bytes * 3 / 4 : bytes;
+  // Whole-box loads whose boxes overhang the extent (TMA-B): the barrier
+  // must expect the transfer footprint, not the logical bytes. mbarrier
+  // tx-count exact-matches (PTX ISA 9.3, 9.7.14.16.8): over-delivery past
+  // zero never completes. The gate admits exactly these transfers; every
+  // other case keeps logical bytes.
+  if (getNpotTMAUnsupportedReason(memDesc, mode, /*allowOverhang=*/true))
+    return isFp6Padded(encoding) ? bytes * 3 / 4 : bytes;
+  auto nvmma = cast<ttg::NVMMASharedEncodingAttr>(encoding);
+  auto box = ttg::getTMABlockShape(
+      shapePerCTA, nvmma.getElementBitWidth(),
+      nvmma.getSwizzlingByteWidth(), /*fp4Padded=*/false,
+      /*isTransposed=*/false, /*packedSize=*/true, /*emitError=*/nullptr,
+      mode);
+  if (failed(box))
+    return isFp6Padded(encoding) ? bytes * 3 / 4 : bytes;
+  int64_t footprint = 1;
+  for (auto [extent, size] : llvm::zip_equal(shapePerCTA, *box))
+    footprint *= llvm::divideCeil(extent, size) * size;
+  bytes = footprint * bitwidth / 8;
   return isFp6Padded(encoding) ? bytes * 3 / 4 : bytes;
 }
 
-int64_t getDescriptorLoadBytes(ttg::MemDescType memDescType) {
-  auto shapePerCTA = ttg::getShapePerCTA(memDescType);
-  int64_t bytes = product(shapePerCTA) *
-                  getIntOrFloatOrPtrBitWidth(memDescType.getElementType()) / 8;
-  return isFp6Padded(memDescType.getEncoding()) ? bytes * 3 / 4 : bytes;
+int64_t getDescriptorLoadBytes(Operation *op, RankedTensorType tensorType,
+                               Value desc) {
+  auto encoding = getEncodingFromDescriptor(op, tensorType, desc);
+  auto mode = isa<TensorDescIm2ColType>(desc.getType())
+                    ? ttg::TMAMode::Im2Col
+                    : ttg::TMAMode::Tiled;
+  auto memDesc = ttg::MemDescType::get(
+      tensorType.getShape(), tensorType.getElementType(), encoding,
+      ttg::SharedMemorySpaceAttr::get(tensorType.getContext()),
+      /*mutableMemory=*/true);
+  return transferBytes(memDesc, mode);
+}
+
+int64_t getDescriptorLoadBytes(ttg::MemDescType memDesc, ttg::TMAMode mode) {
+  return transferBytes(memDesc, mode);
 }
 
 Value sextI16ToI32Indices(Value indices, OpBuilder &builder, Location loc) {
