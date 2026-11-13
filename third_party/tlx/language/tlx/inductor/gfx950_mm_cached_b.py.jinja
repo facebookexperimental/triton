@@ -1,0 +1,275 @@
+from triton.tlx.ops.kernels.mm.gfx950 import (
+    _C_STORE_32X128_LAYOUT as _GFX950_CACHED_B_STORE_32X128_LAYOUT,
+    _wg_cached_b_tile_coords as _gfx950_cached_b_tile_coords,
+    _wg_wave_grid_allocate_pgr2_operand_chunks as _gfx950_cached_b_allocate_operand,
+    _wg_wave_grid_dot_column_major_range as _gfx950_cached_b_dot,
+    _wg_wave_grid_global_load_a as _gfx950_cached_b_load_a,
+    _wg_wave_grid_global_load_pgr2_b_half as _gfx950_cached_b_load_b,
+    _wg_wave_grid_local_load_pgr2_a_half as _gfx950_cached_b_local_load_a,
+    _wg_wave_grid_local_load_pgr2_b_half as _gfx950_cached_b_local_load_b,
+    _wg_wave_grid_local_store_pgr2_fragment as _gfx950_cached_b_local_store,
+)
+
+
+{{def_kernel("A", "B")}}
+    M: tl.constexpr = {{size("A", 0)}}
+    N: tl.constexpr = {{size("B", 1)}}
+    K: tl.constexpr = {{size("A", 1)}}
+    C = {{output_ptr()}}
+    stride_am: tl.constexpr = {{stride("A", 0)}}
+    stride_ak: tl.constexpr = {{stride("A", 1)}}
+    stride_bk: tl.constexpr = {{stride("B", 0)}}
+    stride_bn: tl.constexpr = {{stride("B", 1)}}
+
+    group_m: tl.constexpr = 16 * WARPS_M
+    block_m: tl.constexpr = group_m * MI_WAVE_TILE_M
+    block_n: tl.constexpr = 32 * MI_WAVE_TILE_N
+    grid_m: tl.constexpr = M // block_m
+    grid_n: tl.constexpr = N // block_n
+    tile_count: tl.constexpr = grid_m * grid_n
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[WARPS_M, 2],
+    )
+    dot_a: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot_b: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    a_local = _gfx950_cached_b_allocate_operand(
+        block_m,
+        group_m,
+        64,
+        1,
+        True,
+        tlx.dtype_of(A),
+    )
+    b_locals = tl.tuple([
+        _gfx950_cached_b_allocate_operand(
+            block_n,
+            32,
+            64,
+            1,
+            False,
+            tlx.dtype_of(B),
+        )
+        for _ in range(K_BLOCKS)
+    ])
+    program = tl.program_id(0)
+    first_pid_m, pid_n = _gfx950_cached_b_tile_coords(
+        program,
+        tile_count,
+        grid_m,
+        grid_n,
+        GROUP_M,
+        1,
+    )
+    for kb in tl.static_range(K_BLOCKS):
+        b_values = tl.tuple([
+            _gfx950_cached_b_load_b(
+                B,
+                pid_n,
+                kb,
+                group,
+                0,
+                block_m,
+                block_n,
+                MI_WAVE_TILE_M,
+                64,
+                32,
+                stride_bk,
+                stride_bn,
+                M,
+                N,
+                cache_policy=".ca",
+            )
+            for group in range(MI_WAVE_TILE_N)
+        ])
+        for group in tl.static_range(MI_WAVE_TILE_N):
+            _gfx950_cached_b_local_store(
+                a_local,
+                b_locals[kb],
+                tl.tuple([]),
+                b_values,
+                group,
+                MI_WAVE_TILE_N,
+                MI_WAVE_TILE_M,
+                group_m,
+                32,
+                64,
+            )
+    tl.debug_barrier()
+    first_a = tl.tuple([
+        _gfx950_cached_b_load_a(
+            A,
+            first_pid_m,
+            0,
+            row,
+            group_m,
+            32,
+            block_m,
+            64,
+            stride_am,
+            stride_ak,
+            M,
+            cache_policy=".ca",
+        )
+        for row in range(MI_WAVE_TILE_M)
+    ])
+    for tile in tl.range(program, tile_count, PROGRAM_COUNT, num_stages=1):
+        pid_m, _ = _gfx950_cached_b_tile_coords(
+            tile,
+            tile_count,
+            grid_m,
+            grid_n,
+            GROUP_M,
+            1,
+        )
+        future_pid_m, _ = _gfx950_cached_b_tile_coords(
+            tile + PROGRAM_COUNT,
+            tile_count,
+            grid_m,
+            grid_n,
+            GROUP_M,
+            1,
+        )
+        current_a = first_a
+        accumulators = tl.tuple([
+            tlx.zeros((group_m, 32), tl.float32, layout=mma)
+            for _ in range(MI_WAVE_TILE_M * MI_WAVE_TILE_N)
+        ])
+        for kb in tl.static_range(K_BLOCKS):
+            tl.debug_barrier()
+            for row in tl.static_range(MI_WAVE_TILE_M):
+                _gfx950_cached_b_local_store(
+                    a_local,
+                    b_locals[kb],
+                    current_a,
+                    tl.tuple([]),
+                    MI_WAVE_TILE_N + row,
+                    MI_WAVE_TILE_N,
+                    MI_WAVE_TILE_M,
+                    group_m,
+                    32,
+                    64,
+                )
+            tl.debug_barrier()
+            if kb + 1 < K_BLOCKS:
+                next_a = tl.tuple([
+                    _gfx950_cached_b_load_a(
+                        A,
+                        pid_m,
+                        kb + 1,
+                        row,
+                        group_m,
+                        32,
+                        block_m,
+                        64,
+                        stride_am,
+                        stride_ak,
+                        M,
+                        cache_policy=".ca",
+                    )
+                    for row in range(MI_WAVE_TILE_M)
+                ])
+            for half in tl.static_range(2):
+                a_operands = tl.tuple([
+                    _gfx950_cached_b_local_load_a(
+                        a_local,
+                        row,
+                        half,
+                        group_m,
+                        MI_WAVE_TILE_M,
+                        dot_a,
+                    )
+                    for row in range(MI_WAVE_TILE_M)
+                ])
+                b_operands = tl.tuple([
+                    _gfx950_cached_b_local_load_b(
+                        b_locals[kb],
+                        group,
+                        half,
+                        32,
+                        MI_WAVE_TILE_N,
+                        dot_b,
+                    )
+                    for group in range(MI_WAVE_TILE_N)
+                ])
+                accumulators = _gfx950_cached_b_dot(
+                    a_operands,
+                    b_operands,
+                    accumulators,
+                    0,
+                    MI_WAVE_TILE_M * MI_WAVE_TILE_N,
+                    MI_WAVE_TILE_M,
+                    MI_WAVE_TILE_N,
+                    mma,
+                    dot_a,
+                    dot_b,
+                    kb == 0 and half == 0,
+                )
+            if kb + 1 < K_BLOCKS:
+                current_a = next_a
+        if tile + PROGRAM_COUNT < tile_count:
+            first_a = tl.tuple([
+                _gfx950_cached_b_load_a(
+                    A,
+                    future_pid_m,
+                    0,
+                    row,
+                    group_m,
+                    32,
+                    block_m,
+                    64,
+                    stride_am,
+                    stride_ak,
+                    M,
+                    cache_policy=".ca",
+                )
+                for row in range(MI_WAVE_TILE_M)
+            ])
+
+        accumulators = tlx.amd_mfma_commit(tl.tuple([
+            tlx.require_layout(accumulators[index], mma, pin=False)
+            for index in range(MI_WAVE_TILE_M * MI_WAVE_TILE_N)
+        ]))
+        if WARPS_M == 4:
+            store_layout: tl.constexpr = tlx.layout(
+                shape=((16, 4, 4, 2), (16, 1)),
+                stride=((128, 16, 2048, 64), (1, group_m * 128)),
+            )
+        else:
+            store_layout: tl.constexpr = _GFX950_CACHED_B_STORE_32X128_LAYOUT
+        for row in tl.static_range(MI_WAVE_TILE_M):
+            for column in tl.static_range(MI_WAVE_TILE_N // 4):
+                committed = tl.tuple([
+                    tlx.require_layout(
+                        accumulators[row * MI_WAVE_TILE_N + column * 4 + index],
+                        mma,
+                        pin=False,
+                    )
+                    for index in range(4)
+                ])
+                lo = tl.cat(committed[0], committed[1], dim=1)
+                hi = tl.cat(committed[2], committed[3], dim=1)
+                value = tl.cat(lo, hi, dim=1)
+                row_base = pid_m * block_m + row * group_m
+                col_base = pid_n * block_n + column * 128
+                base = C + row_base * N + col_base
+                local_rows = tl.arange(0, group_m)
+                local_cols = tl.arange(0, 128)
+                offsets = tlx.require_layout(
+                    local_rows[:, None] * N + local_cols[None, :],
+                    store_layout,
+                    pin=False,
+                )
+                stored = tlx.require_layout(
+                    value.to(C.dtype.element_ty),
+                    store_layout,
+                )
+                tlx.buffer_store(
+                    stored,
+                    base,
+                    offsets,
+                    contiguity=8,
+                    cache=".cs",
+                )
