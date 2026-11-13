@@ -2309,4 +2309,16 @@ std::optional<bool> getBoolFromConstant(Value cst) {
   return std::nullopt;
 }
 
+DescriptorLoadOp getTwoCTADescriptorLoad(Value value) {
+  while (Operation *op = value.getDefiningOp()) {
+    if (auto load = dyn_cast<DescriptorLoadOp>(op))
+      return load;
+    if ((!isa<ttg::ConvertLayoutOp>(op) && !isView(op)) ||
+        op->getNumOperands() != 1)
+      return {};
+    value = op->getOperand(0);
+  }
+  return {};
+}
+
 } // namespace mlir::triton

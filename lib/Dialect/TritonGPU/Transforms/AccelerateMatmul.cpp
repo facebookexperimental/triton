@@ -809,6 +809,14 @@ public:
             << "two_ctas=True with BLOCK_M < 64 is not supported. "
                "Falling back to 1-CTA MMA.";
         useTwoCTAs = false;
+      } else if (!getTwoCTADescriptorLoad(b)) {
+        // Transform2CTALoads gives each CTA its half of B only when B
+        // traces to a descriptor load; with any other B both CTAs would
+        // supply the first half of N.
+        dotOp.emitWarning() << "two_ctas=True requires B to be loaded "
+                               "through a tensor descriptor. Falling back "
+                               "to 1-CTA MMA.";
+        useTwoCTAs = false;
       } else {
         useTwoCTAs = true;
         if (oldRetType.getShape()[0] == 64)
@@ -1151,6 +1159,10 @@ public:
             << "two_ctas=True requires ctas_per_cga=(2,1,1) or larger; "
                "cluster-dim-x is "
             << clusterDims[0] << ". Falling back to 1-CTA scaled MMA.";
+      } else if (!getTwoCTADescriptorLoad(dotOp.getB())) {
+        dotOp.emitWarning() << "two_ctas=True requires B to be loaded "
+                               "through a tensor descriptor. Falling back "
+                               "to 1-CTA scaled MMA.";
       } else {
         useTwoCTAs = true;
       }
