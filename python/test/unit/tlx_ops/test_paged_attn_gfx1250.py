@@ -30,9 +30,10 @@ def _prepare(inputs, query_length=1, window=0, max_context_len=None, out=None):
 @pytest.mark.parametrize("query_length", [1, 8])
 @pytest.mark.parametrize("packed", [False, True], ids=["4d", "5d"])
 @pytest.mark.parametrize("window", [0, 1, 63, 2048])
-def test_boundaries_and_poison(query_length, packed, window):
+@pytest.mark.parametrize("kv_heads", [2, 4, 16])
+def test_boundaries_and_poison(query_length, packed, window, kv_heads):
     lengths = [0, 1, 7, 63, 64, 65, 129, 2047, 2048, 2049, 8193]
-    inputs = make_inputs(lengths, query_length)
+    inputs = make_inputs(lengths, query_length, kv_heads=kv_heads)
     q, k, v, lens, table = inputs
     expected = reference(*inputs, query_length, window)
     # Poison both edges of a partially visible page and every unused table entry.
@@ -90,9 +91,10 @@ def test_split_numerics(query_length, packed, case):
 @pytest.mark.parametrize("query_length", [1, 8])
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("window", [0, 63, 2048])
-def test_graph_updates_and_independent_streams(query_length, packed, window):
+@pytest.mark.parametrize("kv_heads", [2, 16])
+def test_graph_updates_and_independent_streams(query_length, packed, window, kv_heads):
     batch, capacity = 33, 4099
-    inputs = make_inputs([capacity] * batch, query_length)
+    inputs = make_inputs([capacity] * batch, query_length, kv_heads=kv_heads)
     q, k, v, lengths, table = inputs
     out, workspace, run = _prepare(_cache(inputs, packed), query_length, window, capacity)
     run()
@@ -144,6 +146,12 @@ def test_scale_and_no_grad(query_length, scale):
 def test_invalid_inputs_and_workspace():
     inputs = make_inputs([129, 129], 1)
     q, k, v, lengths, table = inputs
+    other_heads = make_inputs([129, 129], 1, kv_heads=4)
+    other_workspace = paged_attention_decode_workspace(*other_heads[:3], other_heads[4])
+    with pytest.raises(InvalidInput, match="workspace"):
+        paged_attention_decode(*inputs, workspace=other_workspace)
+    with pytest.raises(InvalidInput):
+        paged_attention_decode(other_heads[0], k, v, lengths, table)
     for qlen in (0, True, 1.5):
         with pytest.raises(InvalidInput):
             paged_attention_decode(*inputs, query_length=qlen)

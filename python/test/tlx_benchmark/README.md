@@ -339,15 +339,21 @@ quantized cases report latency without a torch quantization speedup.
 ### BF16 paged decode on gfx1250
 
 `bench_paged_decode.py` exercises `tlx.ops.paged_attention_decode`: BF16
-16 query heads / 2 KV heads, head dimension 64, 64-token shuffled pages,
+GQA8 (16Q/2KV, 32Q/4KV and 128Q/16KV), head dimension 64, 64-token shuffled pages,
 causal query lengths 1 and 8, global attention and a 2048-token window
-including self. `gfx1250_primary` (default) covers batches 1/8/32/128 and
-contexts 2K/8K/32K; `gfx1250_extended` covers batches 2/16/64/256 and contexts
-4K/16K/64K. Both use AITER-packed 5-D caches. `gfx1250_4d` repeats the primary
-matrix with standard `[blocks, heads, page, dim]` caches.
+including self. `gfx1250_primary` covers 16Q/2KV, batches 1/8/32/128 and
+contexts 2K/8K/16K/32K; `gfx1250_heads` repeats that matrix at 32Q/4KV and
+128Q/16KV. `gfx1250_mixed` covers batches 8/32/128 with mixed, unaligned KV
+lengths through 8K/32K, across all three head counts. These three suites run
+by default and use AITER-packed 5-D caches. `gfx1250_extended` adds 16Q/2KV,
+batches 2/16/64/256 and contexts 4K/16K/64K. `gfx1250_4d` repeats the primary
+matrix with standard `[blocks, heads, page, dim]` caches. Mixed-length useful
+FLOPs count each sequence's actual visible keys, not the context bound.
 
 ```sh
 python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_primary
+python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_heads
+python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_mixed
 python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_extended
 python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_4d
 pytest -s --tb=short python/test/unit/tlx_ops/test_paged_attn_gfx1250.py
@@ -368,7 +374,8 @@ workspace once with matching plan arguments, warm up, then capture or replay:
 import torch
 from triton.tlx.ops import paged_attention_decode, paged_attention_decode_workspace
 
-# q: [batch * query_length, 16, 64], k/v: [blocks, 2, 64, 64], all BF16.
+# q: [batch * query_length, 8 * kv_heads, 64], all BF16.
+# k/v: [blocks, kv_heads, 64, 64], all BF16.
 # lengths: int32 [batch]; table: int32 [batch, capacity_pages].
 workspace = paged_attention_decode_workspace(
     q, k, v, table, query_length=8, sliding_window=2048, max_context_len=32768)
@@ -385,7 +392,7 @@ be valid; the operator does not copy metadata to the CPU. `max_context_len`
 defaults to table capacity and is limited to `2**31 - 32768`. It bounds device
 lengths even for sliding windows. Separate concurrently executing graphs or
 streams must use separate output and workspace storage, disjoint from inputs.
-The split plan is fixed by batch, query length, context bound and window.
+The split plan is fixed by batch, KV head count, query length, context bound and window.
 Q and visible K/V must be finite and produce finite FP32 accumulations.
 The operator is forward-only; it accepts grad-enabled input tensors under
 `torch.no_grad()`.

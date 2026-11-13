@@ -6,7 +6,7 @@ import sys
 import torch
 from triton.tlx.ops import paged_attention_decode, paged_attention_decode_workspace
 from triton.tlx.ops.kernels.paged_attn._shapes import FOCUS as SHAPE_SUITES
-from triton.tlx.ops.kernels.paged_attn._shapes import SYNTHETIC, flops
+from triton.tlx.ops.kernels.paged_attn._shapes import SYNTHETIC, Shape, context_lengths, flops
 from triton.tlx.ops.kernels.paged_attn._testing import assert_close, make_inputs, pack_cache, reference
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -25,15 +25,16 @@ def shapes(synthetic=False, suites=None):
 
 def cases(synthetic=False, suites=None):
     return [
-        Case(op=OP, arch=driver.arch(), dtype="bfloat16", shape=s,
-             label=f"B={s[0]} Q={s[1]} KV={s[2]} window={s[3]} cache={'5d' if s[4] else '4d'}")
-        for s in shapes(synthetic, suites)
+        Case(
+            op=OP, arch=driver.arch(), dtype="bfloat16", shape=s, label=
+            f"B={s[0]} Q={s[1]} KV={s[2]} window={s[3]} cache={'5d' if s[4] else '4d'} heads={8*s[5]}/{s[5]} lengths={s[6]}"
+        ) for s in shapes(synthetic, suites)
     ]
 
 
 def prepare(case, space):
-    batch, query_length, context, window, packed = case.shape
-    inputs = make_inputs([context] * batch, query_length)
+    batch, query_length, context, window, packed, kv_heads, profile = Shape(*case.shape)
+    inputs = make_inputs(context_lengths(batch, query_length, context, profile), query_length, kv_heads=kv_heads)
     q, k, v, lengths, table = inputs
     if packed:
         k, v = pack_cache(k, v)

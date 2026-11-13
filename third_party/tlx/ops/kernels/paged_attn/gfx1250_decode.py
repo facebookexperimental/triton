@@ -24,7 +24,7 @@ def _dot(a, b, c, LAYOUT: tl.constexpr):
 @triton.jit
 def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS: tl.constexpr, NS: tl.constexpr,
                BN: tl.constexpr, BM: tl.constexpr, WINDOW: tl.constexpr, PACKED: tl.constexpr, LAYOUT: tl.constexpr,
-               SCALE: tl.constexpr, NP: tl.constexpr, REG: tl.constexpr):
+               SCALE: tl.constexpr, NP: tl.constexpr, REG: tl.constexpr, KH: tl.constexpr):
     b = tl.program_id(0)
     h = tl.program_id(1)
     s = tl.program_id(2)
@@ -37,27 +37,27 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
     m = tl.arange(0, BM)
     d = tl.arange(0, 64)
     n = tl.arange(0, BN)
-    qoff = ((b.to(tl.int64) * QLEN + m // 8) * 16 + h * 8 + m % 8)[:, None] * 64 + d[None, :]
+    qoff = ((b.to(tl.int64) * QLEN + m // 8) * (KH * 8) + h * 8 + m % 8)[:, None] * 64 + d[None, :]
     q = tl.load(Q + qoff, m[:, None] < QLEN * 8, 0)
     maximum = tl.full((BM, ), -float('inf'), tl.float32)
     denom = tl.zeros((BM, ), tl.float32)
     acc = tl.zeros((BM, 64), tl.float32)
     if PACKED:
-        kd = tl.make_tensor_descriptor(K, [NP * 16, 512], [512, 1], [8, 512])
-        vd = tl.make_tensor_descriptor(V, [NP * 16, 512], [512, 1], [8, 512])
+        kd = tl.make_tensor_descriptor(K, [NP * KH * 8, 512], [512, 1], [8, 512])
+        vd = tl.make_tensor_descriptor(V, [NP * KH * 8, 512], [512, 1], [8, 512])
         kb = tlx.local_alloc((8, 512), tl.bfloat16, 2)
         vb = tlx.local_alloc((8, 512), tl.bfloat16, 2)
     else:
-        kd = tl.make_tensor_descriptor(K, [NP * 128, 64], [64, 1], [64, 64])
-        vd = tl.make_tensor_descriptor(V, [NP * 128, 64], [64, 1], [64, 64])
+        kd = tl.make_tensor_descriptor(K, [NP * KH * 64, 64], [64, 1], [64, 64])
+        vd = tl.make_tensor_descriptor(V, [NP * KH * 64, 64], [64, 1], [64, 64])
         kb = tlx.local_alloc((64, 64), tl.bfloat16, 2)
         vb = tlx.local_alloc((64, 64), tl.bfloat16, 2)
     if first < end:
         physical = tl.load(Table + b.to(tl.int64) * TS + first // 64)
-        tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 0), [(physical * 16 + h * 8) if PACKED else
-                                                                  (physical * 2 + h) * 64, 0], clamp_bounds=False)
-        tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 0), [(physical * 16 + h * 8) if PACKED else
-                                                                  (physical * 2 + h) * 64, 0], clamp_bounds=False)
+        tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 0), [(physical * KH + h) * (8 if PACKED else 64), 0],
+                                      clamp_bounds=False)
+        tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 0), [(physical * KH + h) * (8 if PACKED else 64), 0],
+                                      clamp_bounds=False)
     for base in range(first, end, BN):
         pos = base + n
         slot = ((base - first) // BN) % 2
@@ -68,12 +68,10 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
             kr = tlx.local_load(tlx.local_view(kb, slot), relaxed=True)
         if base + BN < end:
             next_phys = tl.load(Table + b.to(tl.int64) * TS + (base + BN) // 64)
-            tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 1 - slot), [(next_phys * 16 + h * 8) if PACKED else
-                                                                             (next_phys * 2 + h) * 64, 0],
-                                          clamp_bounds=False)
-            tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 1 - slot), [(next_phys * 16 + h * 8) if PACKED else
-                                                                             (next_phys * 2 + h) * 64, 0],
-                                          clamp_bounds=False)
+            tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 1 - slot),
+                                          [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False)
+            tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 1 - slot),
+                                          [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False)
         if PACKED:
             k = tl.reshape(tl.permute(tl.reshape(kr, (8, 64, 8)), (0, 2, 1)), (64, 64))
         else:
@@ -120,7 +118,7 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
     else:
         # Store only real query rows, including for the padded q_len=1 tile.
         # Raw FP32 numerators avoid a divide/multiply pair across the merge.
-        offset = ((b.to(tl.int64) * 2 + h) * NS + s) * (QLEN * 8) + m
+        offset = ((b.to(tl.int64) * KH + h) * NS + s) * (QLEN * 8) + m
         tl.store(Part + offset[:, None] * 64 + d[None, :], acc, m[:, None] < QLEN * 8)
         # Keep max and sum separate: max + log2(sum) loses the sum when
         # logits have very large magnitude, causing incorrect split weights.
@@ -130,14 +128,14 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
 
 @triton.jit
 def _reduce(Part, Stats, Out, QLEN: tl.constexpr, BM: tl.constexpr, NS: tl.constexpr, BS: tl.constexpr,
-            RM: tl.constexpr):
+            RM: tl.constexpr, KH: tl.constexpr):
     group = tl.program_id(0)
-    h = tl.program_id(1) % 2
-    b = tl.program_id(1) // 2
+    h = tl.program_id(1) % KH
+    b = tl.program_id(1) // KH
     m = group * RM + tl.arange(0, RM)
     s = tl.arange(0, BS)
     d = tl.arange(0, 64)
-    offset = ((b.to(tl.int64) * 2 + h) * NS + s[None, :]) * BM + m[:, None]
+    offset = ((b.to(tl.int64) * KH + h) * NS + s[None, :]) * BM + m[:, None]
     maxima = tl.load(Stats + offset * 2, (s[None, :] < NS) & (m[:, None] < QLEN * 8), -float('inf'))
     denom = tl.load(Stats + offset * 2 + 1, (s[None, :] < NS) & (m[:, None] < QLEN * 8), 0.)
     mx = tl.max(maxima, 1)
@@ -147,34 +145,36 @@ def _reduce(Part, Stats, Out, QLEN: tl.constexpr, BM: tl.constexpr, NS: tl.const
     part = tl.load(Part + offset[:, :, None] * 64 + d[None, None, :],
                    (s[None, :, None] < NS) & (m[:, None, None] < QLEN * 8), 0.)
     result = tl.sum(part * weights[:, :, None], 1) / tl.where(total[:, None] > 0, total[:, None], 1.)
-    outoff = ((b.to(tl.int64) * QLEN + m // 8) * 16 + h * 8 + m % 8)[:, None] * 64 + d[None, :]
+    outoff = ((b.to(tl.int64) * QLEN + m // 8) * (KH * 8) + h * 8 + m % 8)[:, None] * 64 + d[None, :]
     tl.store(Out + outoff, result, m[:, None] < QLEN * 8)
 
 
-def _select_config(batch, qlen, max_context_len, window=0):
+def _select_config(batch, qlen, max_context_len, window=0, kv_heads=2):
     """Frozen dispatch rules; no on-device tuning or data-dependent host reads."""
     active = min(max_context_len, window + qlen + 62) if window else max_context_len
     short = active <= 2176
+    # Occupancy depends on sequence/head groups, not batch size alone.
+    groups = batch * kv_heads
     if qlen == 1:
-        if batch <= 2:
+        if groups <= 4:
             budget = 512 if active > 32768 else 256
-        elif batch <= 8:
+        elif groups <= 16:
             budget = 256 if short else 1024
         else:
-            budget = 1024 if short and batch <= 32 else 2048
+            budget = 1024 if short and groups <= 64 else 2048
         warps = 1
     else:
-        if batch <= 2:
-            budget = 512 if batch == 2 and active > 32768 else 256
-        elif batch <= 8:
+        if groups <= 4:
+            budget = 512 if groups == 4 and active > 32768 else 256
+        elif groups <= 16:
             budget = 256 if short else 512
-        elif batch <= 32:
+        elif groups <= 64:
             budget = 512 if short else 1024
         else:
             budget = 1024
         warps = 4
-    splits = max(1, min(triton.cdiv(active, 64), triton.next_power_of_2(max(1, budget // (2 * batch)))))
-    reduce_rows = min(8, max(1, 128 // triton.next_power_of_2(splits))) if batch >= 32 and qlen == 8 else 1
+    splits = max(1, min(triton.cdiv(active, 64), triton.next_power_of_2(max(1, budget // groups))))
+    reduce_rows = min(8, max(1, 128 // triton.next_power_of_2(splits))) if groups >= 64 and qlen == 8 else 1
     reduce_warps = 4 if splits >= 256 else 1
     return splits, warps, reduce_rows, reduce_warps
 
@@ -183,14 +183,17 @@ def _plan(query, key_cache, value_cache, block_tables, query_length, sliding_win
     tensors = (query, key_cache, value_cache, block_tables)
     if not all(isinstance(t, torch.Tensor) for t in tensors):
         raise InvalidInput("paged decode inputs must be tensors")
-    if query_length not in (1, 8) or query.ndim != 3 or query.shape[1:] != (16, 64):
-        raise InvalidInput("gfx1250 paged decode requires query [batch * query_length, 16, 64], query_length 1 or 8")
+    if (query_length not in (1, 8) or query.ndim != 3 or query.shape[2] != 64 or query.shape[1] < 8
+            or query.shape[1] % 8):
+        raise InvalidInput(
+            "gfx1250 paged decode requires query [batch * query_length, Q_heads, 64], GQA8, query_length 1 or 8")
     if query.shape[0] == 0 or query.shape[0] % query_length:
         raise InvalidInput("query rows must contain a positive whole number of sequences")
     batch = query.shape[0] // query_length
+    kv_heads = query.shape[1] // 8
     if (key_cache.ndim not in (4, 5) or key_cache.shape != value_cache.shape or key_cache.shape[0] < 1
-            or key_cache.shape[1:] not in ((2, 64, 64), (2, 8, 64, 8))):
-        raise InvalidInput("gfx1250 paged decode requires page64, 2 KV heads, D64 in standard 4-D or packed 5-D caches")
+            or key_cache.shape[1:] not in ((kv_heads, 64, 64), (kv_heads, 8, 64, 8))):
+        raise InvalidInput("gfx1250 paged decode requires page64, GQA8, D64 in standard 4-D or packed 5-D caches")
     if block_tables.ndim != 2 or block_tables.shape[0] != batch or block_tables.shape[1] < 1:
         raise InvalidInput("block_tables must have shape [batch, capacity_pages >= 1]")
     if any(t.dtype != torch.bfloat16 for t in tensors[:3]) or block_tables.dtype != torch.int32:
@@ -204,16 +207,16 @@ def _plan(query, key_cache, value_cache, block_tables, query_length, sliding_win
     # Reserve 512 page64 tiles for rounded split ends and inactive partitions.
     if type(max_context_len) is not int or not 0 <= max_context_len <= min(block_tables.shape[1] * 64, 2**31 - 32768):
         raise InvalidInput("max_context_len must fit block_tables and be in [0, 2**31 - 32768]")
-    descriptor_rows = key_cache.shape[0] * (16 if key_cache.ndim == 5 else 128)
+    descriptor_rows = key_cache.shape[0] * kv_heads * (8 if key_cache.ndim == 5 else 64)
     if descriptor_rows >= 2**31:
         raise InvalidInput("cache exceeds the tensor descriptor coordinate range")
     if sliding_window >= max_context_len:
         sliding_window = 0
-    return batch, sliding_window, _select_config(batch, query_length, max_context_len, sliding_window)
+    return batch, sliding_window, _select_config(batch, query_length, max_context_len, sliding_window, kv_heads)
 
 
-def _workspace_shapes(batch, query_length, splits):
-    return (batch, 2, splits, query_length * 8, 64), (batch, 2, splits, query_length * 8, 2)
+def _workspace_shapes(batch, query_length, splits, kv_heads):
+    return (batch, kv_heads, splits, query_length * 8, 64), (batch, kv_heads, splits, query_length * 8, 2)
 
 
 def _allocate_workspace(query, batch, query_length, splits):
@@ -221,7 +224,7 @@ def _allocate_workspace(query, batch, query_length, splits):
         return None
     return tuple(
         torch.empty(shape, dtype=torch.float32, device=query.device)
-        for shape in _workspace_shapes(batch, query_length, splits))
+        for shape in _workspace_shapes(batch, query_length, splits, query.shape[1] // 8))
 
 
 def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, query_length, sliding_window,
@@ -241,7 +244,7 @@ def _check_writes(out, workspace, query, batch, query_length, splits, inputs):
     else:
         if not isinstance(workspace, (tuple, list)) or len(workspace) != 2:
             raise InvalidInput("workspace must come from paged_attention_decode_workspace with matching arguments")
-        for tensor, shape in zip(workspace, _workspace_shapes(batch, query_length, splits)):
+        for tensor, shape in zip(workspace, _workspace_shapes(batch, query_length, splits, query.shape[1] // 8)):
             if (not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != shape or tensor.dtype != torch.float32
                     or tensor.device != query.device or not tensor.is_contiguous() or tensor.requires_grad):
                 raise InvalidInput(
@@ -274,13 +277,13 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     # Inverse of [8,64,8] -> [8,8,64] -> [64,64] packing, in flat offsets.
     # Loads land directly in WMMA B operands; all row waves share K/V.
     registers = tlx.layout(shape=((16, 2, warps), (8, 2, 2, 2, 2)), stride=((8, 512, 0), (1, 1024, 2048, 128, 256)))
-    _partition[(batch, 2, splits)](query, key_cache, value_cache, block_tables, context_lens,
-                                   partial, stats, out, query_length, block_tables.shape[1], splits, 64,
-                                   max(16, query_length * 8), window, key_cache.ndim == 5, layout, sm_scale,
-                                   key_cache.shape[0], registers, num_warps=warps)
+    kv_heads = key_cache.shape[1]
+    _partition[(batch, kv_heads, splits)](query, key_cache, value_cache, block_tables, context_lens, partial,
+                                          stats, out, query_length, block_tables.shape[1], splits, 64,
+                                          max(16, query_length * 8), window, key_cache.ndim == 5, layout, sm_scale,
+                                          key_cache.shape[0], registers, kv_heads, num_warps=warps)
     if splits > 1:
-        _reduce[(triton.cdiv(query_length * 8,
-                             reduce_rows), batch * 2)](partial, stats, out, query_length, query_length * 8, splits,
-                                                       triton.next_power_of_2(splits), reduce_rows,
-                                                       num_warps=reduce_warps)
+        _reduce[(triton.cdiv(query_length * 8, reduce_rows),
+                 batch * kv_heads)](partial, stats, out, query_length, query_length * 8, splits,
+                                    triton.next_power_of_2(splits), reduce_rows, kv_heads, num_warps=reduce_warps)
     return out
