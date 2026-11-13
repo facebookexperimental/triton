@@ -13,7 +13,7 @@ python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
-`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, or one of the
+`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, or one of the
 fused operators below.
 
 Fused operators fuse an elementwise epilogue into a GEMM (`tlx/ops/kernels/fused/`): `addmm_mul_add`,
@@ -71,6 +71,7 @@ options:
 | `swiglu_ffn` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 | `rmsnorm_cat` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 | `moe` | none (FlyDSL's Muse MoE ships with aiter) | absolute floor, currently unset -> reports only | heuristic |
+| `moe_routing` | `torch.compile` of the eager routing | speedup >= 0.9x | heuristic |
 
 ### Fused operators
 

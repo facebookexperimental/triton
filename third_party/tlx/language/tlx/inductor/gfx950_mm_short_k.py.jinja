@@ -1,0 +1,29 @@
+from triton.tlx.ops.kernels.mm.gfx950 import (
+    _short_k_register_kernel as _gfx950_short_k_register,
+)
+
+
+{{def_kernel("A", "B")}}
+    M: tl.constexpr = {{size("A", 0)}}
+    N: tl.constexpr = {{size("B", 1)}}
+    K: tl.constexpr = {{size("A", 1)}}
+    C = {{output_ptr()}}
+
+    _gfx950_short_k_register(
+        A,
+        B,
+        C,
+        C,
+        M,
+        N,
+        K,
+        {{stride("A", 0)}},
+        {{stride("A", 1)}},
+        {{stride("B", 0)}},
+        {{stride("B", 1)}},
+        0,
+        0,
+        N,
+        1,
+        ADD_BIAS=False,
+    )

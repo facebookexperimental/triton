@@ -823,7 +823,19 @@ class TestTLXTemplates(TestCase):
             self.assertIs(_tlx_mm.append_tlx(templates, "mm", kernel_inputs), templates)
 
         expected = ([_tlx_mm.gfx942_mm_template.uid] if is_gfx942() else [
+            _tlx_mm.gfx950_mm_extern.uid,
+            _tlx_mm.gfx950_mm_streamk_extern.uid,
+            _tlx_mm.gfx950_mm_ragged_n_extern.uid,
+            _tlx_mm.gfx950_mm_m192n256_extern.uid,
+            _tlx_mm.gfx950_mm_hybrid_n160_extern.uid,
+            _tlx_mm.gfx950_mm_cached_b_template.uid,
             _tlx_mm.gfx950_mm_interwave_template.uid,
+            _tlx_mm.gfx950_mm_lds_template.uid,
+            _tlx_mm.gfx950_mm_fragmented_register_template.uid,
+            _tlx_mm.gfx950_mm_fragmented_m_template.uid,
+            _tlx_mm.gfx950_mm_wave_grid_template.uid,
+            _tlx_mm.gfx950_mm_short_k_template.uid,
+            _tlx_mm.gfx950_mm_row_major_direct_template.uid,
             _tlx_mm.gfx950_mm_local_split_u_template.uid,
             _tlx_mm.gfx950_mm_register_template.uid,
             _tlx_mm.gfx950_mm_persistent_template.uid,
@@ -1016,6 +1028,49 @@ class TestTLXTemplates(TestCase):
                     object(), _KernelInputs(), "mm"))
 
         self.assertEqual(configs, [])
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_mm_static_dispatch_routes_strided_b_through_public_heuristic(self):
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+        from triton.tlx.ops.kernels.mm import gfx950 as _gfx950
+
+        class _KernelInputs:
+            _mat1_idx = 0
+            _mat2_idx = 1
+
+            def dtype(self, _index):
+                return torch.float16
+
+            def mnk_symbolic(self):
+                return 128, 256, 512
+
+            def strides_hinted(self):
+                return (512, 1), (2, 1024)
+
+            def out_dtype(self):
+                return torch.float16
+
+        expected = ("register", {"BLOCK_M": 64})
+        with (
+                mock.patch.object(_tlx_registry, "MMKernelInputs", _KernelInputs),
+                mock.patch.object(_tlx_registry, "_is_gfx950", return_value=True),
+                mock.patch.object(_gfx950, "_optimized_geometry_config", return_value=None),
+                mock.patch.object(_gfx950, "heuristic_config", return_value=expected) as heuristic,
+                mock.patch.object(_gfx950, "_dispatch_plan") as dispatch_plan,
+        ):
+            actual = _tlx_registry._gfx950_static_dispatch(_KernelInputs())
+
+        self.assertEqual(actual, expected)
+        heuristic.assert_called_once_with(
+            128,
+            256,
+            512,
+            torch.float16,
+            2,
+            (512, 1),
+            (2, 1024),
+        )
+        dispatch_plan.assert_not_called()
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     @parametrize(
@@ -1297,6 +1352,30 @@ class TestTLXTemplates(TestCase):
 
     @unittest.skipIf(
         not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX mm external candidate",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_mm_extern_is_selectable(self):
+        m, n, k = 128, 448, 384
+        a = torch.randn(m, k, device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn(n, k, device=GPU_TYPE, dtype=torch.float16).t()
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "autotune_fallback_to_aten": False,
+                "test_configs.autotune_choice_name_regex": "^tlx_gfx950_mm$",
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(torch.mm), a, b)
+
+        torch.testing.assert_close(actual, a @ b, atol=2e-2, rtol=2e-2)
+        self.assertIn("extern_kernels.tlx_gfx950_mm", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
         "Need AMD MI350X (gfx950) for the TLX inter-wave mm template",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -1341,6 +1420,215 @@ class TestTLXTemplates(TestCase):
         generated = "\n".join(code)
         self.assertIn("smem_a_top", generated)
         self.assertNotIn("triton_poi_", generated)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the cached-B TLX mm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_mm_cached_b_is_selectable(self):
+        m, n, k = 524288, 512, 192
+        a = torch.randn(m, k, device=GPU_TYPE, dtype=torch.bfloat16) * 0.1
+        b = torch.randn(n, k, device=GPU_TYPE, dtype=torch.bfloat16).mul(0.1).t()
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "autotune_fallback_to_aten": False,
+                "test_configs.autotune_choice_name_regex": "tlx_gfx950_mm_cached_b",
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(torch.mm), a, b)
+
+        torch.testing.assert_close(actual, a @ b, atol=2e-2, rtol=2e-2)
+        self.assertIn("_gfx950_cached_b_tile_coords", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the split-K LDS TLX mm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_mm_lds_fused_epilogue(self):
+        m, n, k = 4096, 1894, 242432
+        a = torch.randn(m, k, device=GPU_TYPE, dtype=torch.bfloat16) * 0.01
+        b = torch.randn(n, k, device=GPU_TYPE, dtype=torch.bfloat16).mul(0.01).t()
+
+        def mm_gelu(a, b):
+            return torch.nn.functional.gelu(torch.mm(a, b))
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "autotune_fallback_to_aten": False,
+                "test_configs.autotune_choice_name_regex": "tlx_gfx950_mm_lds",
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(mm_gelu), a, b)
+
+        expected = torch.nn.functional.gelu(a.float() @ b.float()).to(a.dtype)
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        generated = "\n".join(code)
+        self.assertIn("_gfx950_a16w16_8wave", generated)
+        self.assertNotIn("triton_poi_", generated)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the wave-grid TLX mm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize(
+        "shape",
+        (
+            (128, 10304, 1728),
+            (128, 70770, 192),
+        ),
+    )
+    def test_tlx_mm_wave_grid_is_selectable(self, shape):
+        m, n, k = shape
+        a = torch.randn(m, k, device=GPU_TYPE, dtype=torch.float16) * 0.01
+        b = torch.randn(n, k, device=GPU_TYPE, dtype=torch.float16).mul(0.01).t()
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "autotune_fallback_to_aten": False,
+                "test_configs.autotune_choice_name_regex": "tlx_gfx950_mm_wave_grid",
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(torch.mm), a, b)
+
+        torch.testing.assert_close(actual, a @ b, atol=2e-2, rtol=2e-2)
+        self.assertIn("_gfx950_regular_mi16_wave_grid", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for fragmented-register TLX mm",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_mm_fragmented_register_is_selectable(self):
+        m, n, k = 196608, 80, 80
+        a = torch.randn(m, k, device=GPU_TYPE, dtype=torch.float16) * 0.01
+        b = torch.randn(n, k, device=GPU_TYPE, dtype=torch.float16).mul(0.01).t()
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "autotune_fallback_to_aten": False,
+                "test_configs.autotune_choice_name_regex": ("tlx_gfx950_mm_fragmented_register"),
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(torch.mm), a, b)
+
+        torch.testing.assert_close(actual, a @ b, atol=2e-2, rtol=2e-2)
+        self.assertIn("_gfx950_register_split_m2", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for fragmented-M TLX mm",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_mm_fragmented_m_is_selectable(self):
+        m, n, k = 48, 131072, 256
+        a = torch.randn(m, k, device=GPU_TYPE, dtype=torch.float16) * 0.01
+        b = torch.randn(n, k, device=GPU_TYPE, dtype=torch.float16).mul(0.01).t()
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "autotune_fallback_to_aten": False,
+                "test_configs.autotune_choice_name_regex": "tlx_gfx950_mm_fragmented_m",
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(torch.mm), a, b)
+
+        torch.testing.assert_close(actual, a @ b, atol=2e-2, rtol=2e-2)
+        self.assertIn("_gfx950_register_split_m2", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for direct specialized TLX mm templates",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize(
+        "shape,dtype,column_major_b,choice_name,source_marker",
+        (
+            (
+                (256, 256, 64),
+                torch.bfloat16,
+                True,
+                "tlx_gfx950_mm_short_k",
+                "_gfx950_short_k_register",
+            ),
+            (
+                (1024, 6144, 4096),
+                torch.float16,
+                False,
+                "tlx_gfx950_mm_row_major_direct",
+                "_gfx950_row_major_direct",
+            ),
+        ),
+    )
+    def test_tlx_mm_direct_specialization_is_selectable(
+        self,
+        shape,
+        dtype,
+        column_major_b,
+        choice_name,
+        source_marker,
+    ):
+        m, n, k = shape
+        a = torch.randn(m, k, device=GPU_TYPE, dtype=dtype) * 0.01
+        b = torch.randn(k, n, device=GPU_TYPE, dtype=dtype)
+        if column_major_b:
+            b = b.t().contiguous().t()
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "autotune_fallback_to_aten": False,
+                "test_configs.autotune_choice_name_regex": choice_name,
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(torch.mm), a, b)
+
+        torch.testing.assert_close(actual, a @ b, atol=2e-2, rtol=2e-2)
+        self.assertIn(source_marker, "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for multi-kernel TLX mm families",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_mm_m192n256_family_is_selectable(self):
+        m, n, k = 147472, 1488, 768
+        a = torch.randn(m, k, device=GPU_TYPE, dtype=torch.float16) * 0.01
+        b = torch.randn(n, k, device=GPU_TYPE, dtype=torch.float16).mul(0.01).t()
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "autotune_fallback_to_aten": False,
+                "test_configs.autotune_choice_name_regex": "tlx_gfx950_mm_m192n256",
+                "enable_caching_generated_triton_templates": False,
+        }):
+            actual, code = run_and_get_code(torch.compile(torch.mm), a, b)
+
+        torch.testing.assert_close(actual, a @ b, atol=2e-2, rtol=2e-2)
+        self.assertIn("extern_kernels.tlx_gfx950_mm_m192n256", "\n".join(code))
 
     @unittest.skipIf(
         not is_gfx950(),
@@ -5876,6 +6164,13 @@ class TestWarppipeInt32Gate(TestCase):
         b = self._Node((k, n), b_strides)
         return MMKernelInputs([bias, a, b], out_dtype=torch.float16, mat1_idx=1, mat2_idx=2)
 
+    def _mm_inputs(self, m, n, k, a_strides, b_strides):
+        from torch._inductor.kernel_inputs import MMKernelInputs
+
+        a = self._Node((m, k), a_strides)
+        b = self._Node((k, n), b_strides)
+        return MMKernelInputs([a, b], out_dtype=torch.float16, mat1_idx=0, mat2_idx=1)
+
     def _bmm_inputs(self, batch, m, n, k, a_strides, b_strides):
         from torch._inductor.kernel_inputs import MMKernelInputs
 
@@ -5893,6 +6188,7 @@ class TestWarppipeInt32Gate(TestCase):
                 V.set_graph_handler(self._graph(sizevars)),
                 mock.patch.object(registry, "_amd_num_xcds", return_value=8),
                 mock.patch.object(registry, "get_num_sms", return_value=256),
+                mock.patch.object(registry, "_is_gfx950", return_value=True),
                 mock.patch.object(DeviceLimits, "current", return_value=gfx950),
                 mock.patch.object(registry, "current_target", return_value=mock.Mock(key="gfx950", is_gfx1250=False)),
         ):
@@ -6003,6 +6299,24 @@ class TestWarppipeInt32Gate(TestCase):
         kernel_inputs = self._addmm_inputs(4096, 192, 2048, a_strides=(2048, 1), b_strides=(1, 2048))
         configs = self._configs(Gfx950AddMMWarpPipeConfigHeuristic, kernel_inputs, "addmm")
         self.assertGreater(len(configs), 0)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_fragmented_register_requires_dense_tn_b(self):
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950MMFragmentedRegisterTemplateConfigHeuristic, )
+
+        m, n, k = 196608, 80, 80
+        dense_tn = self._mm_inputs(m, n, k, a_strides=(k, 1), b_strides=(1, k))
+        row_major = self._mm_inputs(m, n, k, a_strides=(k, 1), b_strides=(n, 1))
+
+        self.assertGreater(
+            len(self._configs(Gfx950MMFragmentedRegisterTemplateConfigHeuristic, dense_tn, "mm")),
+            0,
+        )
+        self.assertEqual(
+            self._configs(Gfx950MMFragmentedRegisterTemplateConfigHeuristic, row_major, "mm"),
+            [],
+        )
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_addmm_declines_row_major_b(self):

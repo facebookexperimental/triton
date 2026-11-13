@@ -121,9 +121,9 @@ from ._normalization import (
 
 __all__ = [
     "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
-    "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen",
-    "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev",
-    "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+    "moe_routing", "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8",
+    "flash_attn_varlen", "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn",
+    "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
     "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "paged_attention_decode",
     "paged_attention_prefill", "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d",
     "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
@@ -766,6 +766,80 @@ def moe(x, topk_weights, topk_ids, w13, w2, *, expert_start=0, post_norm_weight=
     with torch.cuda.device(x.device):
         return fn(x, topk_weights, topk_ids, w13, w2, expert_start, post_norm_weight, post_norm_eps, post_norm_gain,
                   out)
+
+
+_MOE_ROUTING_MAX_EXPERTS = 1024
+_MOE_ROUTING_MAX_TOPK = 32
+
+
+def moe_routing(router_logits, correction_bias, topk=8, *, router_multiplier=1.0, route_scale=1.0, eps=0.0,
+                num_valid_tokens=None, out=None, space=None):
+    """Sigmoid top-k MoE routing with a selection-only correction bias. Forward only, fp32.
+
+    Per token ``t``, with ``s = sigmoid(router_logits[t] * router_multiplier)``: picks the ``topk`` experts with the
+    largest ``s + correction_bias`` (equal values pick the lower expert id), in that order, and weights expert ``k``
+    by ``s[id_k] * (route_scale / (s[id_0] + s[id_1] + ... + s[id_{topk-1}] + eps))``, summed left to right. The
+    bias steers selection only; the weights use the unbiased scores. NaN scores are never picked: a token with fewer
+    than ``topk`` non-NaN experts gets id ``-1`` and weight ``0`` in its remaining slots, and its weights are
+    normalized over the experts it got.
+
+    Shapes: ``router_logits (T, E)`` fp32, ``correction_bias (E,)``; returns or fills
+    ``out = (topk_weights, topk_ids)``, fp32 and int32 ``(T, topk)`` with unit column stride and a row stride of at
+    least ``topk``. ``E <= 1024``, ``1 <= topk <= min(E, 32)``. The ids are global expert ids, as ``tlx.ops.moe`` takes
+    them. ``num_valid_tokens`` is an optional one-element int32/int64 device tensor holding the real token count: rows
+    at or past it get id ``-1`` and weight ``0``, which ``tlx.ops.moe`` treats as routed to no local expert. Nothing is
+    read on the host, so the call is graph-capturable. Batch invariant: the launch layout depends on ``T``, but every
+    layout gives the same bits.
+    Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    if not isinstance(router_logits, torch.Tensor) or not isinstance(correction_bias, torch.Tensor):
+        raise InvalidInput("tlx.ops.moe_routing expects tensor router_logits and correction_bias")
+    if router_logits.ndim != 2 or correction_bias.shape != router_logits.shape[1:]:
+        raise InvalidInput("tlx.ops.moe_routing expects router_logits (T, E) and correction_bias (E,); got "
+                           f"{tuple(router_logits.shape)} and {tuple(correction_bias.shape)}")
+    T, E = router_logits.shape
+    if not correction_bias.dtype.is_floating_point:
+        raise InvalidInput(f"tlx.ops.moe_routing expects a floating-point correction_bias; got {correction_bias.dtype}")
+    if not 1 <= E <= _MOE_ROUTING_MAX_EXPERTS:
+        raise InvalidInput(f"tlx.ops.moe_routing supports 1 <= E <= {_MOE_ROUTING_MAX_EXPERTS}; got E={E}")
+    if not isinstance(topk, int) or isinstance(topk, bool) or not 1 <= topk <= min(E, _MOE_ROUTING_MAX_TOPK):
+        raise InvalidInput(f"tlx.ops.moe_routing supports 1 <= topk <= min(E, {_MOE_ROUTING_MAX_TOPK}); got "
+                           f"topk={topk!r}, E={E}")
+    scalars = dict(router_multiplier=router_multiplier, route_scale=route_scale, eps=eps)
+    for name, value in scalars.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise InvalidInput(f"tlx.ops.moe_routing expects a Python number for {name}; got {value!r}")
+    tensors = [router_logits, correction_bias]
+    if num_valid_tokens is not None:
+        if (not isinstance(num_valid_tokens, torch.Tensor) or num_valid_tokens.numel() != 1
+                or num_valid_tokens.dtype not in (torch.int32, torch.int64)):
+            raise InvalidInput("tlx.ops.moe_routing expects num_valid_tokens as a one-element int32/int64 tensor")
+        tensors.append(num_valid_tokens)
+    if out is not None:
+        if not isinstance(out, (tuple, list)) or len(out) != 2:
+            raise InvalidInput("tlx.ops.moe_routing expects out=(topk_weights, topk_ids)")
+        weights, ids = out
+        for t, dtype in ((weights, torch.float32), (ids, torch.int32)):
+            if (not isinstance(t, torch.Tensor) or t.shape != (T, topk) or t.dtype != dtype
+                    or (topk > 1 and t.stride(1) != 1) or (T > 1 and t.stride(0) < topk)):
+                raise InvalidInput(f"tlx.ops.moe_routing expects out as fp32 and int32 ({T}, {topk}) tensors with "
+                                   "unit column stride and rows that do not overlap")
+        if any(torch._C._overlaps(o, t) for o in out for t in tensors) or torch._C._overlaps(weights, ids):
+            raise InvalidInput("tlx.ops.moe_routing out must not alias an input or each other")
+        tensors.extend(out)
+    if any(t.device != router_logits.device for t in tensors):
+        raise InvalidInput("tlx.ops.moe_routing expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("moe_routing", space)
+    _check_single_config_space("moe_routing", space_name)
+    fn, spec = impl_for("moe_routing", device=router_logits.device)
+    check_inputs(spec, dtype=router_logits.dtype, E=E, topk=topk)
+    check_backward(spec, router_logits, correction_bias, *(out or ()))
+    _check_enforced("moe_routing", spec, invariance)
+    with torch.cuda.device(router_logits.device):
+        return fn(router_logits, correction_bias, topk, router_multiplier, route_scale, eps, num_valid_tokens, out)
 
 
 def addmm(input, a, b, *, out=None, space=None):

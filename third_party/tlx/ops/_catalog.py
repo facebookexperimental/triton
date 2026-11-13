@@ -305,6 +305,14 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="moe_routing",
+        arch="gfx950",
+        variant="wave_rows",
+        impl="triton.tlx.ops.kernels.moe.routing_gfx950:moe_routing",
+        dtypes=frozenset({"float32"}),
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="mm_torchtlx",
         arch="sm90",
         variant="inductor_hopper_gemm_ws",
