@@ -17,11 +17,11 @@ on:
     - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
-      exclude_b200:
-        description: Exclude B200 from this manual run only (not full platform coverage)
-        type: boolean
+      platforms:
+        description: 'Comma-separated platform list: h100,b200,mi350,cpu; blank keeps normal selection'
+        type: string
         required: false
-        default: false
+        default: ''
 
 permissions:
   contents: read
@@ -276,7 +276,9 @@ jobs:
       sha: ${{ needs.select.outputs.sha }}
 
   gpu-tests:
-    name: ${{ github.event_name == 'workflow_dispatch' && inputs.exclude_b200 && 'GPU tests (B200 excluded)' || 'GPU tests' }}
+    name: >-
+      ${{ github.event_name == 'workflow_dispatch' && inputs.platforms != '' &&
+      format('GPU tests (platforms: {0})', inputs.platforms) || 'GPU tests' }}
     needs: [followup, select, build, h100, b200, mi350, cpu-tests]
     # A follow-up of a superseded head (stale) or of a Fast run that published no manifest (an older generation that
     # runs full tests itself) tests nothing and reports no aggregate; a failed verification fails it.

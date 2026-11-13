@@ -737,9 +737,16 @@ def selection_summary(plan, suites, sha, note=""):
     return "\n".join(lines)
 
 
-def exclude_b200(event_name, event):
-    requested = event.get("inputs", {}).get("exclude_b200", False)
-    return event_name == "workflow_dispatch" and requested in (True, "true")
+def manual_platforms(event_name, event):
+    if event_name != "workflow_dispatch":
+        return None
+    requested = event.get("inputs", {}).get("platforms", "").strip()
+    if not requested:
+        return None
+    platforms = tuple(dict.fromkeys(item.strip() for item in requested.split(",")))
+    if any(item not in ("h100", "b200", "mi350", "cpu") for item in platforms):
+        raise ValueError("platforms must be a comma-separated list of h100,b200,mi350,cpu")
+    return platforms
 
 
 def main():
@@ -791,10 +798,18 @@ def main():
         # Configuration or test enumeration failures must not produce an empty success.
         plan = test_plan(None, repo, filters, suites, narrow=False, offload=False)
         selection_note = "Test selection could not be narrowed; full GPU coverage is retained."
-    if exclude_b200(event_name, event):
-        for suite in plan["gpu"]["b200"].values():
-            suite["files"] = []
-        selection_note = "B200 excluded by manual request. This run does not validate B200 coverage."
+    platforms = manual_platforms(event_name, event)
+    if platforms is not None:
+        for platform, groups in plan["gpu"].items():
+            if platform not in platforms:
+                for suite in groups.values():
+                    suite["files"] = []
+        if "cpu" not in platforms:
+            plan["cpu"] = {}
+        plan["build"] = bool(plan["cpu"]) or any(suite["files"]
+                                                 for suites in plan["gpu"].values()
+                                                 for suite in suites.values())
+        selection_note = f"Manual platform list: {','.join(platforms)}. Other platforms are not covered by this run."
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     print(json.dumps(plan, indent=2))
     selection = {platform: any(step["files"] for step in steps.values()) for platform, steps in plan["gpu"].items()}

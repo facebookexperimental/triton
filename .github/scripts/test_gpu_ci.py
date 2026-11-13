@@ -1256,30 +1256,38 @@ def test_fast_collection_cannot_silently_remove_a_touched_function(tmp_path, tes
 
 
 @pytest.mark.parametrize("event_name,requested,expected", [
-    ("workflow_dispatch", True, True),
-    ("workflow_dispatch", "true", True),
-    ("workflow_dispatch", False, False),
-    ("workflow_dispatch", "false", False),
-    ("pull_request", True, False),
-    ("push", True, False),
-    ("schedule", True, False),
-    ("workflow_run", True, False),
+    ("workflow_dispatch", "h100,mi350,cpu", ("h100", "mi350", "cpu")),
+    ("workflow_dispatch", " b200, b200 ", ("b200", )),
+    ("workflow_dispatch", "cpu", ("cpu", )),
+    ("workflow_dispatch", "", None),
+    ("pull_request", "h100", None),
+    ("push", "h100", None),
+    ("schedule", "h100", None),
+    ("workflow_run", "h100", None),
 ])
-def test_b200_exclusion_is_opt_in_and_manual_only(event_name, requested, expected):
-    from gpu_test_selection import exclude_b200
-    assert exclude_b200(event_name, {"inputs": {"exclude_b200": requested}}) == expected
-    assert not exclude_b200(event_name, {})
+def test_platform_allowlist_is_manual_only(event_name, requested, expected):
+    from gpu_test_selection import manual_platforms
+    assert manual_platforms(event_name, {"inputs": {"platforms": requested}}) == expected
+    assert manual_platforms(event_name, {}) is None
+
+
+@pytest.mark.parametrize("requested", ["h100,unknown", "h100,", ",", "true"])
+def test_manual_platform_allowlist_rejects_invalid_names(requested):
+    from gpu_test_selection import manual_platforms
+    with pytest.raises(ValueError, match="comma-separated list"):
+        manual_platforms("workflow_dispatch", {"inputs": {"platforms": requested}})
 
 
 @pytest.mark.parametrize("script", ["fast_tests.py", "gpu_test_selection.py"])
-def test_manual_b200_exclusion_preserves_other_platforms(tmp_path, script):
+@pytest.mark.parametrize("requested", ["h100,mi350,cpu", "b200", "cpu"])
+def test_manual_platform_allowlist_preserves_requested_work(tmp_path, script, requested):
     import os
     import sys
 
     outputs = []
-    for excluded in (False, True):
-        event, output, summary = (tmp_path / f"{name}-{excluded}" for name in ("event", "output", "summary"))
-        event.write_text(json.dumps({"inputs": {"exclude_b200": excluded}}))
+    for index, platforms in enumerate(("", requested)):
+        event, output, summary = (tmp_path / f"{name}-{index}" for name in ("event", "output", "summary"))
+        event.write_text(json.dumps({"inputs": {"platforms": platforms}}))
         command = [sys.executable, str(ROOT / ".github/scripts" / script)]
         if script == "fast_tests.py":
             command.append("select")
@@ -1289,17 +1297,20 @@ def test_manual_b200_exclusion_preserves_other_platforms(tmp_path, script):
                 "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_REPOSITORY": "facebookexperimental/triton"
             }, check=True, capture_output=True, text=True)
         outputs.append(dict(line.split("=", 1) for line in output.read_text().splitlines()))
-        if excluded:
-            assert "does not validate B200 coverage" in summary.read_text()
+        if platforms:
+            assert f"Manual platform list: {platforms}" in summary.read_text()
+            assert "Other platforms are not covered" in summary.read_text()
     normal, limited = outputs
-    assert normal["b200"] == "true" and limited["b200"] == "false"
-    plan = json.loads(limited["b200_plan"])
-    if script == "fast_tests.py":
-        assert not plan["baseline"] and not plan["touched"]
-    else:
-        assert all(not suite["files"] for suite in plan.values())
-    for platform in ("h100", "mi350", "cpu"):
-        assert limited[platform] == normal[platform]
-        assert limited[f"{platform}_plan"] == normal[f"{platform}_plan"]
-    assert limited["h100"] == limited["mi350"] == "true"
-    assert limited["build"] == normal["build"] == "true"
+    for platform in ("h100", "b200", "mi350", "cpu"):
+        plan = json.loads(limited[f"{platform}_plan"])
+        if platform in requested.split(","):
+            assert limited[platform] == normal[platform]
+            assert plan == json.loads(normal[f"{platform}_plan"])
+        else:
+            assert limited[platform] == "false"
+            if script == "fast_tests.py":
+                assert not plan["baseline"] and not plan["touched"]
+            else:
+                assert all(not suite["files"] for suite in plan.values())
+    assert (limited["build"] == "true") == any(limited[platform] == "true"
+                                               for platform in ("h100", "b200", "mi350", "cpu"))

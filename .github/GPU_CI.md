@@ -16,9 +16,12 @@ artifacts; their downloads are checksum-verified too.
 Push and PR platform selection uses the ordered rules in `gpu-test-paths.json`,
 preserving the former individual workflow filters. PRs use a three-dot diff;
 pushes compare the before/after SHAs. An unavailable diff runs all platforms.
-Schedules run every six hours at minute zero, and manual runs also select all
-platforms. Documentation-only changes run selection and the aggregate check,
-without building or allocating GPU runners.
+Schedules run every six hours at minute zero. Manual Fast and full runs accept a
+comma-separated `platforms` list (`h100,b200,mi350,cpu`); blank keeps normal
+selection. A list restricts existing test work to those platforms, and the check
+name and summary disclose the chosen list. Automatic runs ignore this input.
+Documentation-only changes run selection and the aggregate check without building
+or allocating GPU runners.
 
 ## Checks and nightly reporting
 
