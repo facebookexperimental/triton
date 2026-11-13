@@ -1,0 +1,126 @@
+name: Fast follow-up source
+# Called by the workflow_run follow-ups of Fast correctness (GPU full tests and the TLX codegen trace). Verifies the
+# triggering run and its follow-up manifest (fast_followup.py) and hands its head wheel to the calling run. It runs
+# trusted default-branch code only; the PR's commits, manifest and wheel are read as data.
+#
+# status: ok (verified, current), stale (the PR head moved; a newer Fast run owns it), none (that Fast run
+# published no follow-up manifest, e.g. an older generation that runs full tests itself) or empty when the
+# triggering run did not succeed. Verification failures fail this job.
+
+on:
+  workflow_call:
+    outputs:
+      status:
+        value: ${{ jobs.verify.outputs.status }}
+      pr:
+        value: ${{ jobs.verify.outputs.pr }}
+      pr_head:
+        value: ${{ jobs.verify.outputs.pr_head }}
+      merge:
+        description: The producer's test merge commit
+        value: ${{ jobs.verify.outputs.merge }}
+      base:
+        description: The test merge commit's first parent, on the PR's base branch
+        value: ${{ jobs.verify.outputs.base }}
+      base_ref:
+        value: ${{ jobs.verify.outputs.base_ref }}
+      head_ref:
+        value: ${{ jobs.verify.outputs.head_ref }}
+      head_repo:
+        value: ${{ jobs.verify.outputs.head_repo }}
+      fork:
+        value: ${{ jobs.verify.outputs.fork }}
+      wheel:
+        description: The verified head wheel object (empty when unavailable); an artifact wheel is this run's copy
+        value: ${{ jobs.verify.outputs.wheel }}
+      wheel_reason:
+        value: ${{ jobs.verify.outputs.wheel_reason }}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      status: ${{ steps.verify.outputs.status || (steps.locate.outputs.manifest_id == '' && 'none' || '') }}
+      pr: ${{ steps.verify.outputs.pr }}
+      pr_head: ${{ steps.verify.outputs.pr_head }}
+      merge: ${{ steps.verify.outputs.merge }}
+      base: ${{ steps.verify.outputs.base }}
+      base_ref: ${{ steps.verify.outputs.base_ref }}
+      head_ref: ${{ steps.verify.outputs.head_ref }}
+      head_repo: ${{ steps.verify.outputs.head_repo }}
+      fork: ${{ steps.verify.outputs.fork }}
+      wheel: ${{ steps.verify.outputs.wheel || steps.relayed.outputs.wheel }}
+      wheel_reason: ${{ steps.verify.outputs.wheel_reason }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PRODUCER_RUN: ${{ github.event.workflow_run.id }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install wheel cache tools
+        run: python3 -m pip install --quiet 'boto3>=1.36.0'
+      - name: Locate the follow-up manifest
+        id: locate
+        run: python3 .github/scripts/fast_followup.py locate
+      - name: Download the follow-up manifest
+        if: steps.locate.outputs.manifest_id != ''
+        env:
+          ARTIFACT: ${{ steps.locate.outputs.manifest_id }}
+        # The archive may come from a fork: extract only its one expected file, never the whole zip.
+        run: |
+          gh api --allow-escape-sequences "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT}/zip" > "${RUNNER_TEMP}/manifest.zip"
+          python3 .github/scripts/fast_followup.py extract --zip "${RUNNER_TEMP}/manifest.zip" \
+            --out "${RUNNER_TEMP}/manifest/fast-followup.json"
+      - name: Verify the producer
+        if: steps.locate.outputs.manifest_id != ''
+        id: verify
+        run: python3 .github/scripts/fast_followup.py verify --manifest "${RUNNER_TEMP}/manifest/fast-followup.json"
+      - name: Download the producer's wheel artifact
+        if: steps.verify.outputs.relay_id != ''
+        env:
+          ARTIFACT: ${{ steps.verify.outputs.relay_id }}
+        run: gh api --allow-escape-sequences "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT}/zip" > "${RUNNER_TEMP}/wheel.zip"
+      - name: Check the producer's wheel
+        # Extracts only the verified wheel file name from the archive, then checks its checksum.
+        if: steps.verify.outputs.relay_id != ''
+        id: relayed
+        env:
+          RELAY_WHEEL: ${{ steps.verify.outputs.relay_wheel }}
+          RELAY_ARTIFACT: run_${{ github.run_id }}
+        run: python3 .github/scripts/fast_followup.py relayed --zip "${RUNNER_TEMP}/wheel.zip" --dir "${RUNNER_TEMP}/relay"
+      - name: Copy the producer's wheel into this run
+        if: steps.verify.outputs.relay_id != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: run_${{ github.run_id }}
+          path: ${{ runner.temp }}/relay/*.whl
+          retention-days: 14
+          if-no-files-found: error
+      - name: Record the producer
+        if: always()
+        env:
+          STATUS: ${{ steps.verify.outputs.status || (steps.locate.outputs.manifest_id == '' && 'none' || 'failed') }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          PR_HEAD: ${{ github.event.workflow_run.head_sha }}
+          MERGE: ${{ steps.verify.outputs.merge }}
+          REASON: ${{ steps.verify.outputs.wheel_reason }}
+        run: |
+          {
+            echo "## Fast correctness follow-up"
+            echo
+            echo "Producer: run ${PRODUCER_RUN} attempt ${ATTEMPT}, PR head ${PR_HEAD}, test merge ${MERGE:-unknown}"
+            echo
+            echo "Status: ${STATUS}${REASON:+ (head wheel unavailable: ${REASON})}"
+          } >> "${GITHUB_STEP_SUMMARY}"

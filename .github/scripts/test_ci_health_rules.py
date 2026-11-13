@@ -144,6 +144,44 @@ def test_ordered_resources_count_physical_jobs_once_and_exclude_cpu():
     assert r.fast_full_view([parent, parent], stamp(11))['comparable'] == 1
 
 
+def independent_full(fast, h=2, tested_sha=None, **changes):
+    full = comparison_run(h, tested_sha=tested_sha or fast["tested_sha"], pr=fast["pr"])
+    full.update({
+        "event": "workflow_run", "head_sha": "de" *
+        20, "branch": "main", "pr_head_sha": fast["head_sha"], "pr_branch": "feature", "followup_status": "ok",
+        "followup_producer_run_id": fast["id"], "followup_producer_attempt": fast.get("run_attempt", 1), "base": "main"
+    } | changes)
+    return full
+
+
+def test_independent_full_run_keeps_event_and_reaches_pr_views_and_accounting():
+    fast = comparison_run(1, r.FAST_WF)
+    full = independent_full(fast)
+    view = r.fast_full_view([fast, full], stamp(23))
+    assert view["counts"]["passed"] == view["comparable"] == 1
+    row = view["records"][0]
+    assert row["fast"]["id"] == 1 and row["full"]["id"] == 2 and row["head_sha"] == fast["head_sha"]
+    pr = r.pr_view([full], stamp(23), r.main_view([], stamp(23)))[0]
+    assert full["event"] == "workflow_run" and pr["result"] == "passed" and pr["branch"] == "feature"
+    assert r.trigger_event(full) == "pull_request" and r.gpu_minutes(full) == 10
+    ops = r.ops_view([full], stamp(23))
+    assert ops["per_run"][-1]["PR"]["n"] == 1
+    assert r.usage_view([full], stamp(23))["triggers"][-1]["MI350"]["PR"] == 0.17
+
+
+def test_independent_full_pairs_only_with_its_verified_producer_attempt():
+    fast1 = comparison_run(1, r.FAST_WF)
+    fast2 = {**fast1, "run_attempt": 2, "updated_at": stamp(4)}
+    old_failure = fail_comparison(independent_full(fast1, 2))
+    view = r.fast_full_view([fast1, fast2, old_failure], stamp(23))
+    row = view["records"][0]
+    assert row["latest"] == "missing_pair" and row["gaps"][0]["fast"]["attempt"] == 1
+    assert row["fast"]["attempt"] == 2 and row["full"] is None
+    wrong = independent_full(fast1, 3, followup_producer_run_id=99)
+    view = r.fast_full_view([fast1, wrong], stamp(23))
+    assert view["comparable"] == 0 and view["records"][0]["latest"] == "missing_pair"
+
+
 def test_fast_full_pairs_only_the_same_pr_and_actual_checkout():
     fast = comparison_run(1, r.FAST_WF)
     full = fail_comparison(comparison_run(2))

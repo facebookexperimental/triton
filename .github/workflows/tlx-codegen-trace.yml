@@ -5,13 +5,18 @@ name: TLX codegen trace
 # the head wheel, diffs TTGIR ops, PTX features + instruction mix + ptxas
 # stats (regs/smem/spills), and posts the verdict with TTGIR and PTX diffs as
 # a PR comment. Advisory only -- posts, never blocks. Deterministic, no GPU.
+#
+# A pull request's trace starts when its Fast correctness run succeeds (workflow_run) and runs on the default
+# branch: the PR's test merge commit and head wheel come from _fast-followup.yml's verification. Jobs that run PR
+# code or its wheel get read-only tokens; a separate job without PR code posts the comment.
+run-name: >-
+  ${{ github.event_name == 'workflow_run' && format('TLX codegen trace for Fast run {0} attempt {1} (PR head {2})',
+  github.event.workflow_run.id, github.event.workflow_run.run_attempt, github.event.workflow_run.head_sha) || '' }}
 
 on:
-  # `branches` matches the PR's target branch. Bundle PRs go from
-  # reactor/sync-train/plan-*/item-* into main. Other PRs run only when they
-  # change compiler or kernel paths; the pick step decides.
-  pull_request:
-    branches: [main]
+  workflow_run:
+    workflows: [Fast Triton correctness]
+    types: [completed]
   workflow_dispatch:
     inputs:
       ref:
@@ -29,11 +34,22 @@ permissions:
   contents: read
 
 concurrency:
-  group: codegen-trace-${{ github.event.pull_request.number || github.run_id }}
+  group: >-
+    codegen-trace-${{ github.event.workflow_run && format('{0}:{1}', github.event.workflow_run.head_repository.full_name,
+    github.event.workflow_run.head_branch) || github.run_id }}
   cancel-in-progress: true
 
 jobs:
+  followup:
+    if: github.event_name == 'workflow_run'
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_fast-followup.yml
+
   resolve:
+    needs: followup
+    if: ${{ !cancelled() && (github.event_name != 'workflow_run' || needs.followup.outputs.status == 'ok') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -42,12 +58,18 @@ jobs:
       pr_head: ${{ steps.pick.outputs.pr_head }}
       base: ${{ steps.pick.outputs.base }}
       pr: ${{ steps.pick.outputs.pr }}
+      fork: ${{ needs.followup.outputs.fork }}
+      head_wheel: ${{ needs.followup.outputs.wheel }}
+      head_wheel_reason: ${{ needs.followup.outputs.wheel_reason }}
+      base_wheel: ${{ steps.base.outputs.base_wheel }}
     steps:
-      - name: Checkout main
+      # Default-branch scripts only (the workflow revision for manual runs); the PR's commits are fetched as data.
+      - name: Checkout the workflow revision
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
       - name: Pick head, base, and PR
         id: pick
         env:
@@ -55,21 +77,23 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_REF: ${{ inputs.ref }}
           INPUT_PR: ${{ inputs.pr }}
-          MERGE_SHA: ${{ github.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAD_REF: ${{ github.head_ref }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGE_SHA: ${{ needs.followup.outputs.merge }}
+          MERGE_BASE: ${{ needs.followup.outputs.base }}
+          PR_HEAD_SHA: ${{ needs.followup.outputs.pr_head }}
+          PR_NUMBER: ${{ needs.followup.outputs.pr }}
+          PR_BASE_REF: ${{ needs.followup.outputs.base_ref }}
+          PR_HEAD_REF: ${{ needs.followup.outputs.head_ref }}
         run: |
           set -euo pipefail
-          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            # Compare GitHub's test merge commit with its first parent: exactly
-            # what landing changes on main, and the head is the commit Fast
-            # correctness builds, so its wheel is a cache hit.
+          if [[ "${EVENT_NAME}" == "workflow_run" ]]; then
+            # Compare the producer's verified test merge commit with its first
+            # parent: exactly what landing changes on the base branch.
             git fetch --no-tags --quiet origin "${MERGE_SHA}"
-            HEAD="${MERGE_SHA}"; BASE=$(git rev-parse "${MERGE_SHA}^1")
-            PR_HEAD="${HEAD_SHA}"; PR="${PR_NUMBER}"
-            CODEGEN_PATHS='^(lib/|include/|python/src/|python/triton/|third_party/(nvidia|tlx)/|cmake/|CMakeLists\.txt$|setup\.py$|\.github/scripts/(tlx_codegen_snapshot|tlx_ops_bench_ir_diff)\.py$|\.github/workflows/tlx-codegen-trace\.yml$)'
-            if [[ "${HEAD_REF}" != reactor/sync-train/* ]] && ! git diff --name-only "${BASE}" "${HEAD}" | grep -qE "${CODEGEN_PATHS}"; then
+            HEAD="${MERGE_SHA}"; BASE="${MERGE_BASE}"
+            PR_HEAD="${PR_HEAD_SHA}"; PR="${PR_NUMBER}"
+            TRACE=$(GITHUB_BASE_REF="${PR_BASE_REF}" GITHUB_HEAD_REF="${PR_HEAD_REF}" \
+              python3 .github/scripts/codegen_trace.py "${BASE}" "${HEAD}")
+            if [[ "${TRACE}" != true ]]; then
               echo "No compiler or kernel changes; skipping."
               exit 0
             fi
@@ -90,6 +114,19 @@ jobs:
             echo "base=${BASE}"
             echo "pr=${PR}"
           } >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v6
+        if: steps.pick.outputs.head != ''
+        with:
+          python-version: '3.12'
+      - name: Look up the base wheel
+        # A ready cached base wheel skips allocating a build runner; a miss builds it in build-base.
+        if: steps.pick.outputs.head != ''
+        id: base
+        env:
+          BASE: ${{ steps.pick.outputs.base }}
+        run: |
+          python -m pip install --quiet 'boto3>=1.36.0'
+          python .github/scripts/wheel_cache.py lookup --sha "${BASE}" --output base_wheel
       - name: Pick the tlx.ops corpus
         # The nightly B200 and MI350 benchmarks publish the corpora recorded from main. Both sides of this trace use
         # the copies picked here; without one the trace covers only the built-in kernels.
@@ -108,8 +145,9 @@ jobs:
           if-no-files-found: ignore
 
   build-head:
+    # Manual runs only. A follow-up never builds PR code; without Fast correctness's head wheel it reports no signal.
     needs: resolve
-    if: needs.resolve.outputs.head != ''
+    if: github.event_name == 'workflow_dispatch' && needs.resolve.outputs.head != ''
     permissions:
       contents: read
       id-token: write
@@ -119,8 +157,12 @@ jobs:
       build_id: head
 
   build-base:
+    # The base is a commit of the base branch. For a fork's PR it is built without credentials or cache writes.
+    # A follow-up without a head wheel has nothing to compare, so it builds no base.
     needs: resolve
-    if: needs.resolve.outputs.head != ''
+    if: >-
+      needs.resolve.outputs.head != '' && needs.resolve.outputs.base_wheel == '' &&
+      (github.event_name != 'workflow_run' || needs.resolve.outputs.head_wheel != '')
     permissions:
       contents: read
       id-token: write
@@ -128,29 +170,41 @@ jobs:
     with:
       ref: ${{ needs.resolve.outputs.base }}
       build_id: base
+      read_only_cache: ${{ needs.resolve.outputs.fork == 'true' }}
 
   snapshot:
+    name: snapshot (${{ matrix.side }})
     needs: [resolve, build-head, build-base]
-    if: needs.resolve.outputs.head != ''
+    # Both sides need a wheel object; a missing one is reported by diff as no signal.
+    if: >-
+      ${{ !cancelled() && needs.resolve.outputs.head != '' &&
+      (needs.resolve.outputs.head_wheel || needs.build-head.outputs.wheel) != '' &&
+      (needs.resolve.outputs.base_wheel || needs.build-base.outputs.wheel) != '' }}
     strategy:
       fail-fast: false
       matrix:
+        # Each side installs only its own wheel object: the verified or cached wheel, else the one built here.
         include:
           - side: head
+            wheel: ${{ needs.resolve.outputs.head_wheel || needs.build-head.outputs.wheel }}
           - side: base
+            wheel: ${{ needs.resolve.outputs.base_wheel || needs.build-base.outputs.wheel }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && needs.resolve.outputs.head || github.sha }}
+          persist-credentials: false
       - name: Checkout CI actions
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           path: .ci
           sparse-checkout: .github/actions
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -165,10 +219,10 @@ jobs:
       - name: Install prebuilt Triton (${{ matrix.side }})
         uses: ./.ci/.github/actions/install-prebuilt-triton
         with:
-          artifact-name: run_${{ github.run_id }}_${{ matrix.side }}
-          wheel-url: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_url || needs.build-base.outputs.wheel_url }}
-          wheel-filename: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_filename || needs.build-base.outputs.wheel_filename }}
-          wheel-sha256: ${{ matrix.side == 'head' && needs.build-head.outputs.wheel_sha256 || needs.build-base.outputs.wheel_sha256 }}
+          artifact-name: ${{ fromJSON(matrix.wheel).artifact }}
+          wheel-url: ${{ fromJSON(matrix.wheel).url }}
+          wheel-filename: ${{ fromJSON(matrix.wheel).filename }}
+          wheel-sha256: ${{ fromJSON(matrix.wheel).sha256 }}
       - name: Download the tlx.ops corpus
         continue-on-error: true
         uses: actions/download-artifact@v4
@@ -198,14 +252,17 @@ jobs:
           retention-days: 90
 
   diff:
-    needs: [resolve, snapshot]
-    if: ${{ !cancelled() && needs.resolve.outputs.head != '' && needs.snapshot.result != 'skipped' }}
+    needs: [resolve, build-head, build-base, snapshot]
+    # Runs whenever a trace was selected, so a missing wheel or snapshot is reported as no signal.
+    if: ${{ !cancelled() && needs.resolve.outputs.head != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
     steps:
+      # The default branch's diff script reads both snapshots as data.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           pattern: codegen-snap-*-${{ github.run_id }}
@@ -217,23 +274,47 @@ jobs:
           PR_HEAD: ${{ needs.resolve.outputs.pr_head }}
           BASE_SHA: ${{ needs.resolve.outputs.base }}
           SNAPSHOT_RESULT: ${{ needs.snapshot.result }}
+          HEAD_WHEEL: ${{ (needs.resolve.outputs.head_wheel || needs.build-head.outputs.wheel) != '' }}
+          BASE_WHEEL: ${{ (needs.resolve.outputs.base_wheel || needs.build-base.outputs.wheel) != '' }}
+          HEAD_WHEEL_REASON: ${{ needs.resolve.outputs.head_wheel_reason }}
         run: |
           set -euo pipefail
-          if [[ ! -f snaps/snap-head.json || ! -f snaps/snap-base.json ]]; then
-            printf '## TLX codegen trace (advisory)\n\nMissing snapshots (snapshot job %s) — no signal.\n' \
-              "${SNAPSHOT_RESULT}" > verdict.md
-            exit 0
+          no_signal() {
+            printf '## TLX codegen trace (advisory)\n\n%s — no signal.\n' "$1" > verdict.md
+          }
+          if [[ "${HEAD_WHEEL}" != true ]]; then
+            no_signal "Head wheel unavailable${HEAD_WHEEL_REASON:+: ${HEAD_WHEEL_REASON}}"
+          elif [[ "${BASE_WHEEL}" != true ]]; then
+            no_signal "Base wheel unavailable; see the build-base job"
+          elif [[ ! -f snaps/snap-head.json || ! -f snaps/snap-base.json ]]; then
+            no_signal "Missing snapshots (snapshot job ${SNAPSHOT_RESULT})"
+          else
+            python3 .github/scripts/tlx_codegen_snapshot.py diff \
+              --base snaps/snap-base.json --head snaps/snap-head.json \
+              --base-sha "${BASE_SHA}" --head-sha "${HEAD_SHA}" --pr-head-sha "${PR_HEAD}" \
+              --base-ir snaps/ir-base --head-ir snaps/ir-head --out verdict.md
           fi
-          python3 .github/scripts/tlx_codegen_snapshot.py diff \
-            --base snaps/snap-base.json --head snaps/snap-head.json \
-            --base-sha "${BASE_SHA}" --head-sha "${HEAD_SHA}" --pr-head-sha "${PR_HEAD}" \
-            --base-ir snaps/ir-base --head-ir snaps/ir-head --out verdict.md
       - name: Write job summary
         run: cat verdict.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload verdict
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegen-verdict-${{ github.run_id }}
+          path: verdict.md
+
+  report:
+    # Posts the verdict as data; no PR code runs here. A fork's PR keeps the summary only.
+    needs: [resolve, diff]
+    if: ${{ !cancelled() && needs.diff.result == 'success' && needs.resolve.outputs.pr != '' && needs.resolve.outputs.fork != 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: codegen-verdict-${{ github.run_id }}
       - name: Comment on PR
-        if: >-
-          needs.resolve.outputs.pr != '' &&
-          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.resolve.outputs.pr }}
@@ -247,5 +328,5 @@ jobs:
           if [[ -n "${CID}" ]]; then
             gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${CID}" -F body=@comment.md > /dev/null
           else
-            gh pr comment "${PR}" --body-file comment.md
+            gh pr comment "${PR}" --repo "${GITHUB_REPOSITORY}" --body-file comment.md
           fi

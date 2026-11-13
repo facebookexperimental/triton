@@ -2,6 +2,12 @@ name: Fast Triton correctness
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Comma-separated platform list: h100,b200,mi350,cpu; blank keeps normal selection'
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -121,7 +127,9 @@ jobs:
           if-no-files-found: ignore
 
   result:
-    name: Fast correctness
+    name: >-
+      ${{ github.event_name == 'workflow_dispatch' && inputs.platforms != '' &&
+      format('Fast correctness (platforms: {0})', inputs.platforms) || 'Fast correctness' }}
     needs: [select, build, h100, b200, mi350, cpu]
     if: always() && github.repository_owner == 'facebookexperimental'
     runs-on: ubuntu-latest
@@ -157,18 +165,20 @@ jobs:
       - name: Verify touched-test coverage across platforms
         if: needs.select.outputs.build == 'true'
         run: python3 .github/scripts/fast_tests.py verify --evidence "${RUNNER_TEMP}/fast-evidence"
-
-  full:
-    needs: [build, result]
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.result.result == 'success' }}
-    permissions:
-      contents: read
-      actions: read
-      id-token: write
-      issues: write
-    uses: ./.github/workflows/gpu-tests.yml
-    with:
-      commit: ${{ needs.build.outputs.commit }}
-      wheel_url: ${{ needs.build.outputs.wheel_url }}
-      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
-      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      # GPU full tests and the TLX codegen trace are separate workflows that start when this run succeeds
+      # (workflow_run). They take this run's head wheel through this manifest and verify it; see fast_followup.py.
+      - name: Write the follow-up manifest
+        if: github.event_name == 'pull_request'
+        id: followup
+        env:
+          WHEEL: ${{ needs.build.outputs.wheel }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/fast_followup.py manifest --out "${RUNNER_TEMP}/followup/fast-followup.json"
+      - name: Upload the follow-up manifest
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.followup.outputs.name }}
+          path: ${{ runner.temp }}/followup/fast-followup.json
+          if-no-files-found: error
