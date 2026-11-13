@@ -648,6 +648,58 @@ def test_aggregate_gate_rejects_failed_build_and_selected_tests(results, selecte
     assert (result.returncode == 0) == success, result.stderr.decode()
 
 
+def test_b200_background_permits_share_one_namespace_and_keep_batch_parallel():
+    from b200_background_groups import assign_groups
+    expected = {f"background-b200-{slot}" for slot in range(7)}
+    observed = set()
+    for run_id in range(1, 1001):
+        for attempt in (1, 2):
+            groups = assign_groups(str(run_id), attempt)
+            assert set(groups) == {"tlx", "torchtlx", "gluon"}
+            assert set(groups.values()) <= expected
+            assert len(set(groups.values())) == len(groups)
+            observed.update(groups.values())
+    assert observed == expected
+
+
+def test_b200_full_workers_require_permits_but_fast_does_not(tmp_path):
+    import os
+    import sys
+    output = tmp_path / "groups"
+    result = subprocess.run([sys.executable, str(ROOT / ".github/scripts/b200_background_groups.py")], env=os.environ
+                            | {"GITHUB_RUN_ID": "5042", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_OUTPUT": str(output)},
+                            capture_output=True, text=True, check=True)
+    groups = json.loads(result.stdout)
+    declared = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert declared == {f"{worker}_group": group for worker, group in groups.items()}
+    jobs = yaml.load((ROOT / ".github/workflows/b200.yml").read_text(), Loader=yaml.BaseLoader)["jobs"]
+    checkout = next(step for step in jobs["assign-background-groups"]["steps"]
+                    if step.get("uses", "").startswith("actions/checkout@"))
+    assert checkout["with"] == {"ref": "${{ github.sha }}", "persist-credentials": "false"}
+    selection = {
+        "tlx":
+        "(fromJSON(inputs.plan).core.files[0] != null || fromJSON(inputs.plan).correctness.files[0] != null || fromJSON(inputs.plan).codegen.files[0] != null)",
+        "gluon": "(fromJSON(inputs.plan).gluon.files[0] != null)",
+    }
+    for worker in ("tlx", "torchtlx", "gluon"):
+        job = jobs[f"b200-{worker}-test"]
+        assert job["needs"] == "assign-background-groups"
+        assert job["concurrency"] == {
+            "group": "${{ needs.assign-background-groups.outputs." + worker + "_group }}", "queue": "max",
+            "cancel-in-progress": "false"
+        }
+        if worker != "torchtlx":
+            assert job["if"] == ("${{ !cancelled() && needs.assign-background-groups.result == 'success' && "
+                                 "github.repository_owner == 'facebookexperimental' && " + selection[worker] + " }}")
+            gate = job["if"].split(" && github.repository_owner", 1)[0] + " }}"
+            for status in ("success", "failure", "cancelled", "skipped"):
+                assert workflow_condition(gate,
+                                          {"needs.assign-background-groups.result": status}) == (status == "success")
+    assert jobs["b200-torchtlx-test"]["if"] == "${{ false }}"
+    fast = yaml.load((ROOT / ".github/workflows/_fast-gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
+    assert "concurrency" not in fast["jobs"]["correctness"]
+
+
 def test_workflows_share_one_build_and_pin_all_checkouts():
 
     def workflow(name):
