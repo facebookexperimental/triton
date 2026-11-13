@@ -1695,7 +1695,8 @@ void printWarpSpecialize(
   // gets without asking and stays unprinted, and a partition's is clamped.
   std::optional<int32_t> defaultRegs;
   std::optional<ArrayRef<int32_t>> partRegs;
-  if (auto actual = op->getAttrOfType<DenseI32ArrayAttr>("actualRegisters")) {
+  if (auto actual = op->getAttrOfType<DenseI32ArrayAttr>("actualRegisters");
+      actual && !actual.empty()) {
     if (actual[0] <= kMaxTaskRegisters)
       defaultRegs = actual[0];
     partRegs = actual.asArrayRef().drop_front();
