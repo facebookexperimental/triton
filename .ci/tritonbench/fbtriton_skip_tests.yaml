@@ -28,6 +28,12 @@ flash_attention:
   disabled_devices:
     - hip
 # Device specific tests
+tlx_flash_attention_varlen:
+  # The gfx950 kernel supports HEAD_DIM 128 only, and the operator's one input
+  # is HEAD_DIM 64. H100 still runs the TLX backend.
+  backends: tlx_ops_flash_attn_varlen
+  disabled_devices:
+    - hip
 gemm:
   # gfx950 TLX matmul does not support backward.
   backends: tlx_matmul_gfx950
