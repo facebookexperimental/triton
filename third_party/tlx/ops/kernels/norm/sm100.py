@@ -261,12 +261,14 @@ def _param_reduce(DW, FINAL_DW, DB, FINAL_DB, M: tl.constexpr, N: tl.constexpr, 
     rows = tl.arange(0, BM)
     offsets = rows[:, None] * N + cols[None, :]
     mask = (rows[:, None] < M) & (cols[None, :] < N)
-    for i in tl.static_range(2):
-        partial = DW if i == 0 else DB
-        final = FINAL_DW if i == 0 else FINAL_DB
-        if final is not None:
-            value = tl.load(partial + offsets, mask, 0)
-            tl.store(final + cols, tl.sum(value, 0), cols < N)
+    if FINAL_DW is not None:
+        dw = tl.load(DW + offsets, mask, 0)
+    if FINAL_DB is not None:
+        db = tl.load(DB + offsets, mask, 0)
+    if FINAL_DW is not None:
+        tl.store(FINAL_DW + cols, tl.sum(dw, 0), cols < N)
+    if FINAL_DB is not None:
+        tl.store(FINAL_DB + cols, tl.sum(db, 0), cols < N)
 
 
 @triton.jit
@@ -374,14 +376,14 @@ def _check_x(x):
     return x.shape
 
 
-def _geometry(x, norm='layer', backward=False, *inputs):
+def _geometry(x, norm='layer', backward=False, *inputs, bwd_tile=8192):
     m, n = x.shape
     bn = triton.next_power_of_2(n)
     nw = 8 if not backward and (n >= 16384 or (norm == 'rms' and n >= 4096)) else 4
     if backward and n == 16384:
         nw = 16 if norm == 'rms' else 8
     if backward:
-        bm = max(1, min(16, 8192 // bn))
+        bm = max(1, min(16, (bwd_tile if bn <= 512 else 8192) // bn))
     elif n <= 512:
         bm = 1 if m <= 128 else 8
     elif n <= 2048:
@@ -518,24 +520,59 @@ def norm_bwd(x, weight, dout, rstd, *, mean=None, norm='rms', has_bias=False, ad
         if db is not None:
             db.zero_()
         return (dx, dw, db)
-    bm, bn, np, layout_kw = _geometry(x, norm, True, dout, addend, dout_addend, dx_accum)
+    # A residual addend measured slower with the narrow row tile (B200, 1M x 384), so it keeps the wide one.
+    bm, bn, np, layout_kw = _geometry(x, norm, True, dout, addend, dout_addend, dx_accum,
+                                      bwd_tile=8192 if addend is not None else 2048)
+    kernel = kernel_rmsnorm_bwd_persistent_single_cta
+    args = dict(X=x, W=weight, DY=dout, Addend=addend, DoutAddend=dout_addend, DxAccum=dx_accum, Mean=mean, Rstd=rstd,
+                DX=dx, M=m, N=n, BLOCK_M=bm, BLOCK_N=bn, IS_RMS=norm == 'rms', FROM_NORMALIZED=from_normalized,
+                ROUND_DX=round_dx_before_accum, row_stride=x.stride(0), DS=dout.stride(0),
+                AS=addend.stride(0) if addend is not None else n,
+                DAS=dout_addend.stride(0) if dout_addend is not None else n,
+                ACS=dx_accum.stride(0) if dx_accum is not None else n, DXS=dx.stride(0),
+                num_warps=layout_kw.get('NW', 4), SHOULD_MASK_COL=n != bn, STRIDED=not layout_kw['WIDE'],
+                N_FLOAT=float(n) if bm > 1 else None, **layout_kw)
+    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    if not layout_kw['WIDE']:
+        tiles = triton.cdiv(m, bm)
+        np = min(tiles, sms * _resident_ctas(kernel, args, dw is not None, db is not None, np))
+        args['SINGLE_ITER'] = np == tiles
     allocate = torch.zeros if layout_kw['WIDE'] else torch.empty
     wp = allocate((np, n), device=x.device, dtype=torch.float32) if dw is not None else None
     bp = allocate((np, n), device=x.device, dtype=torch.float32) if db is not None else None
-    kernel = kernel_rmsnorm_bwd_persistent_single_cta
     with torch.cuda.device(x.device):
-        kernel[
-            np,
-        ](X=x, W=weight, DY=dout, Addend=addend, DoutAddend=dout_addend, DxAccum=dx_accum, Mean=mean, Rstd=rstd, DX=dx,
-          DW_PARTIAL=wp, DbPart=bp, M=m, N=n, BLOCK_M=bm, BLOCK_N=bn, IS_RMS=norm == 'rms',
-          FROM_NORMALIZED=from_normalized, ROUND_DX=round_dx_before_accum, row_stride=x.stride(0), DS=dout.stride(0),
-          AS=addend.stride(0) if addend is not None else n, DAS=dout_addend.stride(0) if dout_addend is not None else n,
-          ACS=dx_accum.stride(0) if dx_accum is not None else n, DXS=dx.stride(0), num_warps=layout_kw.get('NW', 4),
-          NUM_SMS=np, SHOULD_MASK_COL=n != bn, STRIDED=not layout_kw['WIDE'], N_FLOAT=float(n) if bm > 1 else None,
-          **layout_kw)
+        kernel[np](DW_PARTIAL=wp, DbPart=bp, NUM_SMS=np, **args)
         if dw is not None or db is not None:
-            _param_reduce[triton.cdiv(n, 32)](wp, dw, bp, db, np, n, triton.next_power_of_2(np), 32, num_warps=4)
+            rows = triton.next_power_of_2(np)
+            cols = min(32, max(8, triton.next_power_of_2(triton.cdiv(n, sms))), max(1, 65536 // rows))
+            _param_reduce[triton.cdiv(n, cols)](wp, dw, bp, db, np, n, rows, cols,
+                                                num_warps=min(16, max(4, rows * cols // 4096)))
     return (dx, dw, db)
+
+
+_RESIDENT_CTAS = {}
+
+
+def _resident_ctas(kernel, args, has_dw, has_db, np):
+    """Number of CTAs of the persistent backward kernel that fit on one SM."""
+    key = (args['X'].device, has_dw, has_db) + tuple(
+        (k, (v.dtype, v.stride()) if isinstance(v, torch.Tensor) else v) for k, v in args.items() if k != 'M')
+    ctas = _RESIDENT_CTAS.get(key)
+    if ctas is None:
+        device = args['X'].device
+        with torch.cuda.device(device):
+            part = torch.empty((np, args['N']), device=device, dtype=torch.float32)
+            compiled = kernel.warmup(DW_PARTIAL=part if has_dw else None, DbPart=part if has_db else None, NUM_SMS=np,
+                                     grid=(np, ), **args)
+            compiled._init_handles()
+        props = torch.cuda.get_device_properties(device)
+        threads = 32 * args['num_warps']
+        ctas = min(props.regs_per_multiprocessor // (triton.cdiv(compiled.n_regs, 8) * 8 * threads),
+                   props.max_threads_per_multi_processor // threads)
+        if compiled.metadata.shared:
+            ctas = min(ctas, props.shared_memory_per_multiprocessor // (compiled.metadata.shared + 1024))
+        ctas = _RESIDENT_CTAS[key] = max(1, ctas)
+    return ctas
 
 
 def norm_backward_from_normalized(x_hat, weight, dout, rstd, *, norm='layer', has_bias=False, dx_dtype=None,
