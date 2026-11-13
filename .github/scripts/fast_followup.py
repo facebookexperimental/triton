@@ -68,12 +68,37 @@ def producer(event, repo):
     return run
 
 
-def verify(event, manifest, repo, api, git, recipe_identity):
+def producer_merge(run, repo, api, text):
+    from ci_health_logs import checkout_sha
+
+    jobs, page = [], 1
+    while True:
+        listing = api(f"repos/{repo}/actions/runs/{run['id']}/jobs?filter=all&per_page=100&page={page}")
+        batch = listing.get("jobs", [])
+        jobs.extend(batch)
+        if len(jobs) >= listing["total_count"]:
+            break
+        if not batch:
+            raise Rejected("The producer job listing is incomplete")
+        page += 1
+    selected = [job for job in jobs if job.get("name") == "select" and job.get("run_attempt", 1) <= run["run_attempt"]]
+    if not selected:
+        raise Rejected("The Fast producer has no source selection job")
+    job = max(selected, key=lambda item: (item.get("run_attempt", 1), item["id"]))
+    if job.get("conclusion") != "success":
+        raise Rejected("The Fast producer source selection did not pass")
+    merge = checkout_sha(job, text(f"repos/{repo}/actions/jobs/{job['id']}/logs"))
+    if not merge:
+        raise Rejected("The Fast producer checkout log does not identify one tested commit")
+    return merge
+
+
+def verify(event, manifest, repo, api, git, recipe_identity, text=None):
     """Check the manifest against the triggering run, the API and git. Returns the verified source and wheel.
 
     `recipe_identity(sha)` is the identity a build of `sha` would have with the build recipe at `sha`.
-    Status "stale" means the producer is no longer the PR's current Fast correctness result: the run was re-run, the
-    PR head moved, or GitHub's test merge commit changed (a newer base). A newer Fast run owns the current state.
+    Status "stale" means the run was re-run or the PR head moved. A base-only update does not invalidate the source
+    that this Fast attempt tested; when GitHub's current merge differs, authenticate that source from its checkout log.
     """
     run = producer(event, repo)
     if (manifest.get("version") != VERSION or manifest.get("repository") != repo or manifest.get("run_id") != run["id"]
@@ -107,10 +132,9 @@ def verify(event, manifest, repo, api, git, recipe_identity):
     merge = manifest.get("test_merge_sha")
     if not SHA.fullmatch(str(merge)):
         raise Rejected("The manifest has no test merge SHA")
-    # The test merge must be GitHub's current one for this PR, not any commit the manifest names. (A PR merged on
-    # GitHub reports its landing commit instead and is stale; this repository lands by closing the PR.)
     if pr.get("merge_commit_sha") != merge:
-        return {"status": "stale", **source}
+        if text is None or producer_merge(run, repo, api, text) != merge:
+            raise Rejected("The manifest merge does not match the Fast producer checkout")
     git("fetch", "--no-tags", "--quiet", "origin", merge,
         f"+refs/heads/{source['base_ref']}:refs/remotes/origin/{source['base_ref']}")
     parents = git("rev-list", "--parents", "-n", "1", merge).split()
@@ -132,6 +156,10 @@ def verify(event, manifest, repo, api, git, recipe_identity):
 
 def gh_api(path):
     return json.loads(subprocess.check_output(["gh", "api", path], text=True))
+
+
+def gh_text(path):
+    return subprocess.check_output(["gh", "api", path, "--allow-escape-sequences"], text=True)
 
 
 def git(*args):
@@ -202,7 +230,7 @@ def main():
         emit(manifest_id=artifact or "")
         return
     if args.command == "verify":
-        result = verify(event, json.loads(args.manifest.read_text()), repo, gh_api, git, recipe_identity)
+        result = verify(event, json.loads(args.manifest.read_text()), repo, gh_api, git, recipe_identity, gh_text)
         wheel = result.pop("wheel", None)
         relay = ""
         if wheel and not wheel["url"]:

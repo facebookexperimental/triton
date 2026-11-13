@@ -296,10 +296,27 @@ def test_followup_accepts_only_the_exact_current_producer():
     repo, event, manifest, pr, identity, (merge, base, head) = followup_fixture()
 
     def check(event=event, manifest=manifest, pr=pr, parents=(merge, base, head), on_base=(base, ), recipe=identity,
-              live=None, current_merge=merge):
+              live=None, current_merge=merge, logged_merge=merge):
         live = {**event["workflow_run"], "status": "completed", **(live or {})}
+        job = {
+            "id":
+            11, "name":
+            "select", "run_attempt":
+            2, "conclusion":
+            "success", "steps": [{
+                "name": "Run actions/checkout@v6", "started_at": "2026-11-13T01:00:00Z", "completed_at":
+                "2026-11-13T01:00:02Z"
+            }]
+        }
+
+        def text(path):
+            assert path == f"repos/{repo}/actions/jobs/11/logs"
+            return ("2026-11-13T01:00:01Z [command]/usr/bin/git log -1 --format=%H\n"
+                    f"2026-11-13T01:00:01Z {logged_merge}\n")
 
         def api(path):
+            if "/jobs?" in path:
+                return {"total_count": 1, "jobs": [job]}
             if path == f"repos/{repo}/actions/runs/7":
                 return live
             if path != f"repos/{repo}/pulls/5":  # another PR, e.g. one a fork's manifest names
@@ -313,7 +330,7 @@ def test_followup_accepts_only_the_exact_current_producer():
                 raise subprocess.CalledProcessError(1, args)
             return ""
 
-        return verify(event, manifest, repo, api, git, lambda sha: recipe if sha == merge else None)
+        return verify(event, manifest, repo, api, git, lambda sha: recipe if sha == merge else None, text)
 
     result = check()
     assert (result["status"], result["merge"], result["base"], result["fork"]) == ("ok", merge, base, True)
@@ -350,10 +367,12 @@ def test_followup_accepts_only_the_exact_current_producer():
         with pytest.raises(Rejected):
             check(pr=case)
     assert check(pr=changed(pr, ["head", "sha"], "4" * 40))["status"] == "stale"
-    # A re-run attempt or a new test merge commit (newer base, same head) supersedes the producer.
+    # Base-only movement must not suppress full tests of the completed Fast source.
     assert check(live={"run_attempt": 3})["status"] == "stale"
-    assert check(current_merge="5" * 40)["status"] == "stale"
-    assert check(current_merge=None)["status"] == "stale"
+    for current_merge in ("5" * 40, None):
+        assert check(current_merge=current_merge)["merge"] == merge
+        with pytest.raises(Rejected, match="producer checkout"):
+            check(current_merge=current_merge, logged_merge="6" * 40)
     for live in ({"conclusion": "failure"}, {"status":
                                              "in_progress"}, {"head_sha":
                                                               "4" * 40}, {"path": ".github/workflows/other.yml"}):
