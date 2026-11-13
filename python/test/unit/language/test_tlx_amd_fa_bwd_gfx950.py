@@ -5154,8 +5154,10 @@ def test_varlen_d128_prefix_ds_cold_capture_graph_replay_gfx950(monkeypatch, q_h
         env = os.environ.copy()
         env.update(TRITON_CACHE_DIR=str(cache), TLX_PREFIX_DS_COLD_CAPTURE_CHILD=child_key)
         completed = subprocess.run(
-            [sys.executable, "-m", "pytest", "-s", "--tb=short",
-             str(Path(__file__).resolve()) + "::" + child_key],
+            [
+                sys.executable, "-m", "pytest", "--import-mode=importlib", "-s", "--tb=short",
+                str(Path(__file__).resolve()) + "::" + child_key
+            ],
             env=env,
             text=True,
             stdout=subprocess.PIPE,
