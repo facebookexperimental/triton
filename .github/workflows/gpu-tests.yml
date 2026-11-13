@@ -12,7 +12,7 @@ on:
     branches: [main, 'scratch/meta-llvm-bump/main']
   workflow_run:
     workflows: [Fast Triton correctness]
-    types: [completed]
+    types: [in_progress, completed]
   schedule:
     - cron: '0 */6 * * *'
   workflow_dispatch:
@@ -36,7 +36,7 @@ concurrency:
 
 jobs:
   followup:
-    if: github.event_name == 'workflow_run'
+    if: github.event_name == 'workflow_run' && github.event.action == 'completed'
     permissions:
       contents: read
       actions: read

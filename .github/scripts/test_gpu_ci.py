@@ -882,8 +882,12 @@ def test_full_tests_follow_only_a_verified_current_fast_run():
     calls = [job.get('uses') for job in fast['jobs'].values()]
     assert calls.count('./.github/workflows/build.yml') == 1
     assert not {'./.github/workflows/gpu-tests.yml', './.github/workflows/tlx-codegen-trace.yml'} & set(calls)
-    for listener in (full, trace):
-        assert listener['on']['workflow_run'] == {'workflows': [fast['name']], 'types': ['completed']}
+    assert full['on']['workflow_run'] == {'workflows': [fast['name']], 'types': ['in_progress', 'completed']}
+    assert trace['on']['workflow_run'] == {'workflows': [fast['name']], 'types': ['completed']}
+    event = {'github.event_name': 'workflow_run', 'github.event.action': 'completed'}
+    assert workflow_condition(full['jobs']['followup']['if'], event)
+    assert not workflow_condition(full['jobs']['followup']['if'], event | {'github.event.action': 'in_progress'})
+    assert full['concurrency']['cancel-in-progress'] == "${{ github.event_name == 'workflow_run' }}"
     produced = {'github.event.workflow_run.conclusion': 'success', 'github.event.workflow_run.event': 'pull_request'}
     assert workflow_condition(followup['jobs']['verify']['if'], produced)
     for change in ({'github.event.workflow_run.conclusion':
