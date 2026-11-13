@@ -74,8 +74,9 @@ _NORM_MODULES = {
         'rmsnorm_backward_quantize_dx_mxfp8', 'rmsnorm_backward_quantize_dx_mxfp8_precomputed',
         'rmsnorm_backward_quantize_dx_mxfp8_bf16_precomputed',
         'rmsnorm_backward_quantize_dx_mxfp8_from_output_recompute_q_precomputed'
-    ]
+    ], 'gfx950': ['rmsnorm', 'norm_fwd']
 }
+_NORM_ARCHES = {'sm100': ('sm90', 'sm100'), '_softmax': ('sm90', 'sm100'), 'gfx950': ('gfx950', )}
 _NORM_AUTOGRAD = frozenset([
     'layernorm', 'layernorm_add', 'rmsnorm', 'softmax', 'layernorm_mxfp8_with_backward',
     'layernorm_mxfp8_gdpa_with_backward'
@@ -691,10 +692,10 @@ CATALOG: tuple[OpSpec, ...] = (
 
 CATALOG += tuple(
     OpSpec(op=op, arch=arch, variant="row_norm", impl=f"triton.tlx.ops.kernels.norm.{module}:{op}", dtypes=frozenset(
-        {"float16", "bfloat16", "float32"}), supports_backward=op in _NORM_AUTOGRAD)
+        {"float16", "bfloat16", "float32"}), supports_backward=op in _NORM_AUTOGRAD and arch != "gfx950")
     for module, names in _NORM_MODULES.items()
     for op in names
-    for arch in (("sm90", "sm100") if module in ("sm100", "_softmax") else ("sm100", )))
+    for arch in _NORM_ARCHES.get(module, ("sm100", )))
 
 _BY_KEY = {(s.op, s.arch): s for s in CATALOG}
 assert len(_BY_KEY) == len(CATALOG), "duplicate (op, arch) in CATALOG"

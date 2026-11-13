@@ -331,5 +331,6 @@ inside the measured window. Build the tensors in `prepare` and capture them.
 `test_ops_perf.py` picks the new file up automatically.
 
 `bench_norm.py` covers the GEO plain, saved-state, MXFP8, MXFP4, NVFP4,
-fused/jagged and softmax requests. It replays CUDA graphs for both providers;
+fused/jagged and softmax requests, and on gfx950 the forward RMSNorm (`norm_fwd`
+with `norm='rms'`). It replays CUDA graphs for both providers;
 quantized cases report latency without a torch quantization speedup.
