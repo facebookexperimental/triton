@@ -560,8 +560,8 @@ FailureOr<LinearLayout> getTMemLdStMessageLayout(MLIRContext *ctx,
 }
 
 FailureOr<SmallVector<DenseSet<uint32_t>>>
-getTMemLdStWarpAddresses(RankedTensorType regTy, MemDescType memTy, int maxnreg,
-                         uint32_t baseAddress) {
+getTMemLdStThreadAddresses(RankedTensorType regTy, MemDescType memTy,
+                           int maxnreg, uint32_t baseAddress) {
   auto info = computeTMemLdStEncodingInfo(regTy, memTy, maxnreg);
   if (failed(info))
     return failure();
@@ -597,20 +597,29 @@ getTMemLdStWarpAddresses(RankedTensorType regTy, MemDescType memTy, int maxnreg,
   if (failed(messageLayout))
     return failure();
 
-  SmallVector<uint32_t> messageOffsets;
+  // A 16x32bx2 message layout covers 16 lanes. Lanes 16-31 access the same
+  // offsets as lanes 0-15, moved by the second-half offset.
+  constexpr int32_t numLanes = 32;
+  int32_t numMessageLanes = messageLayout->getInDimSize(kLane);
+  if (numMessageLanes != (info->secondHalfOffset ? numLanes / 2 : numLanes))
+    return failure();
+  SmallVector<SmallVector<uint32_t>> messageOffsetsByLane(numLanes);
   for (int32_t messageReg = 0; messageReg < messageLayout->getInDimSize(kReg);
        ++messageReg) {
-    for (int32_t lane = 0; lane < messageLayout->getInDimSize(kLane); ++lane) {
+    for (int32_t lane = 0; lane < numMessageLanes; ++lane) {
       auto [row, col] =
           getRowCol(messageLayout->apply({{kReg, messageReg}, {kLane, lane}}));
       if (!row || !col)
         return failure();
-      messageOffsets.push_back(encode(*row, *col));
+      messageOffsetsByLane[lane].push_back(encode(*row, *col));
+      if (info->secondHalfOffset)
+        messageOffsetsByLane[lane + numMessageLanes].push_back(
+            encode(*row, *col) + *info->secondHalfOffset);
     }
   }
 
-  SmallVector<DenseSet<uint32_t>> addressesByWarp;
-  addressesByWarp.resize(reps.getInDimSize(kWarp));
+  SmallVector<DenseSet<uint32_t>> addressesByThread(reps.getInDimSize(kWarp) *
+                                                    numLanes);
   for (int32_t warp = 0; warp < reps.getInDimSize(kWarp); ++warp) {
     // Keep this warp-base calculation synchronized with lowerTMemLdSt.
     uint32_t warpOffset = (warp & 3) << (5 + 16);
@@ -622,7 +631,6 @@ getTMemLdStWarpAddresses(RankedTensorType regTy, MemDescType memTy, int maxnreg,
       warpOffset += encode(*row, *col);
     }
 
-    DenseSet<uint32_t> addresses;
     for (int32_t reg = 0; reg < reps.getInDimSize(kReg);
          reg += info->numRegsPerMessage) {
       auto [messageRow, messageCol] =
@@ -631,17 +639,16 @@ getTMemLdStWarpAddresses(RankedTensorType regTy, MemDescType memTy, int maxnreg,
         return failure();
       uint32_t messageOffset = encode(*messageRow, *messageCol);
 
-      for (uint32_t inMessageOffset : messageOffsets) {
-        uint32_t address =
-            baseAddress + warpOffset + messageOffset + inMessageOffset;
-        addresses.insert(address);
-        if (info->secondHalfOffset)
-          addresses.insert(address + *info->secondHalfOffset);
+      for (int32_t lane = 0; lane < numLanes; ++lane) {
+        DenseSet<uint32_t> &addresses =
+            addressesByThread[warp * numLanes + lane];
+        for (uint32_t inMessageOffset : messageOffsetsByLane[lane])
+          addresses.insert(baseAddress + warpOffset + messageOffset +
+                           inMessageOffset);
       }
     }
-    addressesByWarp[warp] = std::move(addresses);
   }
-  return addressesByWarp;
+  return addressesByThread;
 }
 
 bool supportsTMemLoadReduce(RankedTensorType regTy, MemDescType memTy,

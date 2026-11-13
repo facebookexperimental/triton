@@ -52,7 +52,9 @@ static TMemAccessKind getTMemAccessKind(Operation *op) {
 
 struct TMemAccessInfo {
   Region *warpScope;
-  SmallVector<DenseSet<uint32_t>> addressesByWarp;
+  // The thread that accesses each physical address, or -1 if more than one
+  // thread does.
+  DenseMap<uint32_t, int> threadByAddress;
 };
 
 static Region *getWarpScope(Operation *op) {
@@ -103,6 +105,17 @@ static std::optional<uint32_t> getTMemBaseAddress(Value value) {
       value = reinterpret.getSrc();
       continue;
     }
+    // A constant buffer index moves the base by whole buffers, as in the
+    // MemDescIndexOp lowering. A dynamic index keeps the CTA barrier.
+    if (auto index = dyn_cast<ttg::MemDescIndexOp>(defOp)) {
+      APInt idx;
+      if (!matchPattern(index.getIndex(), m_ConstantInt(&idx)))
+        return std::nullopt;
+      offset += static_cast<uint32_t>(idx.getZExtValue()) *
+                getTmemAllocSizes(index.getType()).numCols;
+      value = index.getSrc();
+      continue;
+    }
     return std::nullopt;
   }
   return std::nullopt;
@@ -141,16 +154,22 @@ static std::optional<TMemAccessInfo> getTMemAccessInfo(Operation *op) {
   if (!baseAddress)
     return std::nullopt;
 
-  auto addressesByWarp =
-      getTMemLdStWarpAddresses(accessOp->regType, accessOp->memDescType,
-                               getContextualMaxNReg(op), *baseAddress);
-  if (failed(addressesByWarp) || addressesByWarp->size() != *numWarps)
+  auto addressesByThread =
+      getTMemLdStThreadAddresses(accessOp->regType, accessOp->memDescType,
+                                 getContextualMaxNReg(op), *baseAddress);
+  if (failed(addressesByThread) || addressesByThread->size() != *numWarps * 32)
     return std::nullopt;
 
-  TMemAccessInfo access{getWarpScope(op), std::move(*addressesByWarp)};
-  if (llvm::any_of(access.addressesByWarp,
-                   [](const auto &addresses) { return addresses.empty(); }))
-    return std::nullopt;
+  TMemAccessInfo access{getWarpScope(op), {}};
+  for (auto [thread, addresses] : llvm::enumerate(*addressesByThread)) {
+    if (addresses.empty())
+      return std::nullopt;
+    for (uint32_t address : addresses) {
+      auto [it, inserted] = access.threadByAddress.try_emplace(address, thread);
+      if (!inserted && it->second != static_cast<int>(thread))
+        it->second = -1;
+    }
+  }
   return access;
 }
 
@@ -162,34 +181,24 @@ static void cacheTMemAccessInfo(Operation *op, TMemAccessCache &cache) {
     it->second = getTMemAccessInfo(op);
 }
 
-static bool isWarpLocalHazard(Operation *lhs, Operation *rhs,
-                              TMemAccessCache &cache) {
+// True if every physical address accessed by both per-warp operations is
+// accessed by the same single thread at both endpoints. tcgen05.wait::{ld,st}
+// only waits for the executing thread's own accesses, so it orders nothing
+// between two threads, even two in the same warp.
+static bool isThreadLocalHazard(Operation *lhs, Operation *rhs,
+                                TMemAccessCache &cache) {
   cacheTMemAccessInfo(lhs, cache);
   cacheTMemAccessInfo(rhs, cache);
   const std::optional<TMemAccessInfo> &lhsAccess = cache.find(lhs)->second;
   const std::optional<TMemAccessInfo> &rhsAccess = cache.find(rhs)->second;
-  if (!lhsAccess || !rhsAccess ||
-      lhsAccess->warpScope != rhsAccess->warpScope ||
-      lhsAccess->addressesByWarp.size() != rhsAccess->addressesByWarp.size())
+  if (!lhsAccess || !rhsAccess || lhsAccess->warpScope != rhsAccess->warpScope)
     return false;
 
-  for (auto [lhsWarp, lhsAddresses] :
-       llvm::enumerate(lhsAccess->addressesByWarp)) {
-    for (auto [rhsWarp, rhsAddresses] :
-         llvm::enumerate(rhsAccess->addressesByWarp)) {
-      if (lhsWarp == rhsWarp)
-        continue;
-      const auto &smaller = lhsAddresses.size() < rhsAddresses.size()
-                                ? lhsAddresses
-                                : rhsAddresses;
-      const auto &larger = lhsAddresses.size() < rhsAddresses.size()
-                               ? rhsAddresses
-                               : lhsAddresses;
-      if (llvm::any_of(smaller, [&](uint32_t address) {
-            return larger.contains(address);
-          }))
-        return false;
-    }
+  for (auto [address, rhsThread] : rhsAccess->threadByAddress) {
+    auto it = lhsAccess->threadByAddress.find(address);
+    if (it != lhsAccess->threadByAddress.end() &&
+        (it->second == -1 || it->second != rhsThread))
+      return false;
   }
   return true;
 }
@@ -222,9 +231,15 @@ static bool filterFn(Operation *lhs, Operation *rhs, bool /*lhsIsRead*/,
       lhsKind == TMemAccessKind::Store && rhsKind == TMemAccessKind::MMA;
 
   // A hazard between two per-warp accesses needs no CTA rendezvous when every
-  // physical address is owned by the same warp at both endpoints. Program
-  // order plus the tcgen05.wait::{ld,st} emitted by lowering is sufficient.
-  if ((war || raw || waw) && isWarpLocalHazard(lhs, rhs, cache))
+  // physical address is accessed by the same thread at both endpoints: the
+  // tcgen05.wait::{ld,st} that TMemWaitInsertion places before the second
+  // access orders it. Every other hazard keeps its barrier here, even one that
+  // TMemWaitInsertion would no longer see because a wait for a thread-local
+  // hazard, or a wait boundary such as an mbarrier wait, completed the first
+  // access.
+  // TODO: A hazard that stays within one warp but crosses threads only needs
+  // that warp to synchronize. Consider bar.warp.sync instead of a CTA barrier.
+  if ((war || raw || waw) && isThreadLocalHazard(lhs, rhs, cache))
     return true;
 
   bool requiresBarrier = war || raw || waw || loadToMma || storeToMma;
@@ -368,12 +383,15 @@ private:
                                       : info.syncWriteSlices;
   }
 
+  // With crossThreadOnly, ignore conflicts whose physical addresses are
+  // accessed by the same thread at both endpoints.
   bool hasHazard(const BlockInfo &pending, const BlockInfo &effects,
-                 TMEMWaitKind kind) {
+                 TMEMWaitKind kind, bool crossThreadOnly = false) {
     return pending.isIntersected(
         effects,
-        [kind](Operation *, Operation *, bool isRead, bool, Allocation *) {
-          return isRead != (kind == TMEMWaitKind::LOAD);
+        [&](Operation *lhs, Operation *rhs, bool isRead, bool, Allocation *) {
+          return isRead != (kind == TMEMWaitKind::LOAD) ||
+                 (crossThreadOnly && isThreadLocalHazard(lhs, rhs, cache));
         },
         &allocation);
   }
@@ -459,13 +477,29 @@ private:
         if (storeHazard)
           waitBeforeBarrier(TMEMWaitKind::STORE, pending, builder);
       } else {
+        // A hazard whose conflicting accesses are all made by the same thread
+        // at both endpoints needs only the wait. A CTA barrier would add a
+        // rendezvous, one that is unsafe if different warps diverge to
+        // different branches. The wait completes every pending access of its
+        // kind, so later hazards stop seeing them here; TMEM barrier insertion
+        // keeps the barrier for any of those that cross threads.
+        auto crossThreadHazard = [&](TMEMWaitKind kind) {
+          return hasHazard(pending, effects, kind, /*crossThreadOnly=*/true) ||
+                 hasHazard(beforeBarrier, effects, kind,
+                           /*crossThreadOnly=*/true);
+        };
+        bool needsBarrier =
+            (loadHazard && crossThreadHazard(TMEMWaitKind::LOAD)) ||
+            (storeHazard && crossThreadHazard(TMEMWaitKind::STORE));
         if (loadHazard)
           waitNow(op, TMEMWaitKind::LOAD, pending, builder);
         if (storeHazard)
           waitNow(op, TMEMWaitKind::STORE, pending, builder);
-        builder->setInsertionPoint(op);
-        insertBarrier(op, builder);
-        rememberBarrier(op->getPrevNode(), pending);
+        if (needsBarrier) {
+          builder->setInsertionPoint(op);
+          insertBarrier(op, builder);
+          rememberBarrier(op->getPrevNode(), pending);
+        }
       }
     }
 
@@ -493,6 +527,7 @@ private:
   Operation *lastBarrier = nullptr;
   BlockInfo beforeBarrier;
   BlockInfo afterBarrier;
+  TMemAccessCache cache;
 };
 
 template <typename AnalysisT>

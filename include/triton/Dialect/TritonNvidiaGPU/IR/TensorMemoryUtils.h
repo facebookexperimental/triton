@@ -55,11 +55,12 @@ FailureOr<LinearLayout> getTMemLdStMessageLayout(MLIRContext *ctx,
                                                  bool unpacked,
                                                  int numRegsPerMessage);
 
-// Return the physical tensor-memory word addresses touched by each warp when
-// lowering a tmem_load or tmem_store with these types.
+// Return the physical tensor-memory word addresses touched by each thread when
+// lowering a tmem_load or tmem_store with these types, indexed by
+// warp * 32 + lane.
 FailureOr<SmallVector<DenseSet<uint32_t>>>
-getTMemLdStWarpAddresses(RankedTensorType regTy, gpu::MemDescType memTy,
-                         int maxnreg, uint32_t baseAddress = 0);
+getTMemLdStThreadAddresses(RankedTensorType regTy, gpu::MemDescType memTy,
+                           int maxnreg, uint32_t baseAddress = 0);
 
 // Check whether a tmem_load with register layout `regTy` reading from `memTy`
 // can be supported with a fused reduction along the N dimension. This is the
