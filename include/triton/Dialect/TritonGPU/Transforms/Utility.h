@@ -491,6 +491,11 @@ SmallVector<Value> getTiedArgs(Operation *op, int resultIdx);
 // Get a boolean if the Value is an arith::ConstantOp
 std::optional<bool> getBoolFromConstant(Value cst);
 
+// The descriptor load a tensor-level value comes from, walking back
+// through convert_layout and single-operand view ops, or null. A 2-CTA
+// MMA's B must trace to one: Transform2CTALoads splits only that load.
+DescriptorLoadOp getTwoCTADescriptorLoad(Value value);
+
 } // namespace mlir::triton
 
 #endif // TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
