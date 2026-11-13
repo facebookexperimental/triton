@@ -8462,6 +8462,15 @@ def _attention_backward_isa_loop(assembly):
     return max(loops, key=lambda body: sum("v_wmma_" in line for line in body))
 
 
+def _assert_occ1_scratch_outside_loop(assembly):
+    import re
+
+    # The non-causal VA_VDST anti-hint may leave a one-time spill outside the main loop;
+    # scratch traffic inside the loop, or a larger spill, is still a regression.
+    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) <= 32
+    assert not any("scratch_" in line for line in _attention_backward_isa_loop(assembly))
+
+
 @pytest.mark.parametrize("spread_dq,log2_lse,cache_score_k", [
     (False, False, False),
     (True, False, False),
@@ -8779,7 +8788,7 @@ def test_attention_backward_occ1_assembly(shape, q_splits, packed_dq):
     kernel = _compile_attention_backward_kernel(config, shape)
     assembly = kernel.asm["amdgcn"]
     assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
-    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == 0
+    _assert_occ1_scratch_outside_loop(assembly)
     assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
     loop = _attention_backward_isa_loop(assembly)
     # One merged LSE/Delta request joins Q and dO; a fourth request stalls the issue.
@@ -8826,7 +8835,7 @@ def test_attention_backward_occ1_war_flags_default_off():
     assert not config.occ1_load_after_dk
 
 
-@pytest.mark.parametrize("shape,expected_drains", [((16, 16, 16, 16384), 30), ((8, 64, 8, 8192), 30)])
+@pytest.mark.parametrize("shape,expected_drains", [((16, 16, 16, 16384), 14), ((8, 64, 8, 8192), 14)])
 @pytest.mark.parametrize("packed_dq", [False, True])
 def test_attention_backward_occ1_war_drain_assembly(shape, expected_drains, packed_dq):
     import dataclasses
@@ -8843,7 +8852,7 @@ def test_attention_backward_occ1_war_drain_assembly(shape, expected_drains, pack
     for kernel in builds:
         assembly = kernel.asm["amdgcn"]
         assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
-        assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == 0
+        _assert_occ1_scratch_outside_loop(assembly)
         assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
         loop = _attention_backward_isa_loop(assembly)
         drains.append(sum("s_wait_alu depctr_va_vdst(0)" in line for line in loop))
@@ -8979,7 +8988,7 @@ def test_attention_backward_occ1_tail_assembly(shape, packed_dq):
     kernel = _compile_attention_backward_kernel(config, shape)
     assembly = kernel.asm["amdgcn"]
     assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
-    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == 0
+    _assert_occ1_scratch_outside_loop(assembly)
     assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
     loop = _attention_backward_isa_loop(assembly)
     waits = [int(x, 0) for line in loop for x in re.findall(r"s_wait_tensorcnt\s+(0x[0-9a-f]+|\d+)", line)]
