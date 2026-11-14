@@ -349,7 +349,7 @@ def test_descriptor_store_l2_cache_hint(eviction_policy, device):
     ttgir = kernel.asm["ttgir"]
     assert ttgir.count("ttng.async_tma_copy_local_to_global") == 1
     if eviction_policy:
-        assert f"evictionPolicy = {eviction_policy}" in ttgir
+        assert f"eviction_policy = {eviction_policy}" in ttgir
 
     # Verify PTX output
     ptx = kernel.asm["ptx"]

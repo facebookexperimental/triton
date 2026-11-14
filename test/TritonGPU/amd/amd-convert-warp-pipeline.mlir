@@ -491,7 +491,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
         scf.yield
       } {triton.warp_pipeline.stage = "stage1"}
 
-      // amdg.async_wait sits between stages and must be recognized as a barrier.
+      // The group wait marks a cluster boundary and needs a local rendezvous.
       amdg.async_wait {num_inst = 0 : i32}
 
       scf.execute_region {
@@ -791,14 +791,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // ---- Flat pipeline with pre-existing barrier between stages ----
 //
-// When an async_wait (or similar barrier op) already exists between
-// flat pipeline stages, the pass should wrap it with sched_barriers
-// instead of inserting a redundant s_barrier.
+// A group wait between flat pipeline stages gets a local rendezvous inside
+// the scheduling fences. Boundaries without a wait use the dependency result.
 //
 // Stage layout: stage0 -- async_wait -- stage1 -- (nothing) -- stage2
 //
 // Expected between stage0 and stage1:
-//   sched_barrier + async_wait + sched_barrier   (wrapped, no s_barrier)
+//   sched_barrier + async_wait + local barrier + sched_barrier
 // Expected between stage1 and stage2:
 //   sched_barrier + s_barrier + sched_barrier     (inserted, no async_wait)
 
@@ -839,12 +838,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Stage 0 ops.
 // CHECK: tt.store
 //
-// Between stage 0 and 1: existing async_wait wrapped, no s_barrier.
+// Between stage 0 and 1: the group wait and local rendezvous are fenced.
 // The per-mem-op barrier (non_mem_non_sideeffect) follows stage 0's store; the
 // cluster barrier (none) is next.
 // CHECK: rocdl.sched.barrier non_mem_non_sideeffect
 // CHECK-NEXT: rocdl.sched.barrier none
 // CHECK-NEXT: amdg.async_wait
+// CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier none
 // CHECK-NOT: rocdl.s.barrier
 // Stage 1 ops.
@@ -1563,7 +1563,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
         scf.yield
       } {triton.warp_pipeline.stage = "stage1"}
 
-      // amdg.async_wait sits between stages and must be recognized as a barrier.
+      // The group wait marks a cluster boundary and needs a local rendezvous.
       amdg.async_wait {num_inst = 0 : i32}
 
       scf.execute_region {
@@ -1863,14 +1863,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // ---- Flat pipeline with pre-existing barrier between stages ----
 //
-// When an async_wait (or similar barrier op) already exists between
-// flat pipeline stages, the pass should wrap it with sched_barriers
-// instead of inserting a redundant s_barrier.
+// A group wait between flat pipeline stages gets a local rendezvous inside
+// the scheduling fences. Boundaries without a wait use the dependency result.
 //
 // Stage layout: stage0 -- async_wait -- stage1 -- (nothing) -- stage2
 //
 // Expected between stage0 and stage1:
-//   sched_barrier + async_wait + sched_barrier   (wrapped, no s_barrier)
+//   sched_barrier + async_wait + local barrier + sched_barrier
 // Expected between stage1 and stage2:
 //   sched_barrier + s_barrier + sched_barrier     (inserted, no async_wait)
 
@@ -1911,10 +1910,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Stage 0 ops.
 // CHECK: tt.store
 //
-// Between stage 0 and 1: existing async_wait wrapped, no s_barrier.
+// Between stage 0 and 1: the group wait and local rendezvous are fenced.
 // CHECK: rocdl.sched.barrier non_mem_non_sideeffect
 // CHECK-NEXT: rocdl.sched.barrier none
 // CHECK-NEXT: amdg.async_wait
+// CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier none
 // CHECK-NOT: rocdl.s.barrier
 // Stage 1 ops.

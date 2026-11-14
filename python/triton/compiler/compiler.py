@@ -626,10 +626,14 @@ class CompiledKernel:
                 self._run = wrap_launcher(self, run)
             except ImportError:  # fail-open: launch unwrapped
                 pass
+        # Backends may reserve additional shared memory at launch time.
+        # Read from the unwrapped launcher: the compile_iq wrapper is a plain
+        # function without the launcher's attributes.
+        shared = getattr(run, "shared", self.metadata.shared)
         # not enough shared memory to run the kernel
-        max_shared = _max_shared_mem(device, utils)
-        if self.metadata.shared > max_shared:
-            raise_(OutOfResources(self.metadata.shared, max_shared, "shared memory"))
+        max_shared = max_shared_mem(device)
+        if shared > max_shared:
+            raise_(OutOfResources(shared, max_shared, "shared memory"))
         if hasattr(self.metadata, "tmem_size") and self.metadata.tmem_size is not None:
             # Use blackwell max tmem size for now, this should be moved in device properties
             max_tmem_size = 512  # tmem size in number of columns
@@ -642,7 +646,7 @@ class CompiledKernel:
         # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`
         self._unload_module = utils.unload_module
         self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = utils.load_binary(
-            self.name, self.kernel, self.metadata.shared, device)
+            self.name, self.kernel, shared, device)
         self._module_pid = os.getpid()
         warp_size = self.metadata.warp_size
         if self.metadata.num_warps * warp_size > self.n_max_threads:
@@ -651,6 +655,7 @@ class CompiledKernel:
             knobs.runtime.kernel_load_end_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
 
         # Create C dispatcher if enabled and schema is available.
+        self._launch_shared = shared
         self._build_dispatcher()
 
     def _build_dispatcher(self):
@@ -660,6 +665,7 @@ class CompiledKernel:
         self._dispatcher = None
         self._dispatch_arg_indices = None
         self._num_kernel_args = None
+        self._dispatcher_launch = None
         if (knobs.runtime.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
                 and "launch_metadata" in self.asm):
             try:
@@ -673,7 +679,10 @@ class CompiledKernel:
                 # Auto-TMA kernels carry compiler-synthesized descriptor params
                 # that only the variadic CudaLauncher injects; skip the dispatcher
                 # (fast path) for them so they fall back to the working launcher.
-                if schema.get("auto_tma_recipes"):
+                # The dispatcher launches with the schema's static shared size, so a launcher
+                # that reserves more at launch time (max_occupancy) keeps the launcher path.
+                if schema.get("auto_tma_recipes") or getattr(self, "_launch_shared",
+                                                             schema["shared_mem"]) != schema["shared_mem"]:
                     dispatcher = None
                 else:
                     dispatcher = make_triton_dispatcher(schema, self.function)
@@ -682,6 +691,7 @@ class CompiledKernel:
                     self._dispatcher = dispatcher
                     self._dispatch_arg_indices = indices
                     self._num_kernel_args = len(schema["args"])
+                    self._dispatcher_launch = getattr(self._run, "launch", None)
             except (KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError) as e:
                 logger.warning("Triton dispatcher creation failed for %s: %s", self.name, e)
 
@@ -812,8 +822,10 @@ class CompiledKernel:
             return runner
 
         dispatcher = getattr(self, '_dispatcher', None)
+        # The dispatcher replicates launcher.launch; a replaced launch must not be bypassed.
         if (knobs.runtime.use_triton_dispatcher and dispatcher is not None and not callable(grid)
-                and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook):
+                and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook
+                and getattr(self._run, "launch", None) is self._dispatcher_launch):
             # Try to create a _TritonJITRunner for maximum speed
             try:
                 from triton.backends.nvidia.triton_dispatcher_factory import _load_module

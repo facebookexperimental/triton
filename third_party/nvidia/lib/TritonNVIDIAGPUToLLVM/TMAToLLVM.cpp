@@ -195,7 +195,7 @@ struct TensormapFenceproxyAcquireOpConversion
     auto *descAddrOpr = ptxBuilder.newAddrOperand(adaptor.getDescPtr(), "l");
     auto *sizeOpr = ptxBuilder.newConstantOperand(TMA_SIZE_BYTES);
 
-    // Define the instruction opcode
+    // Running the fence on one warp is faster than running it on every warp.
     constexpr int kWarpSize = 32;
     Value threadId = getThreadId(rewriter, loc);
     Value pred = b.icmp_slt(threadId, b.i32_val(kWarpSize));
@@ -211,11 +211,6 @@ struct TensormapFenceproxyAcquireOpConversion
     wait().predicate(pred);
 
     ptxBuilder.launch(rewriter, loc, getVoidType());
-
-    // We run the fence on a single warp, then use a barrier to synchronize the
-    // rest. This ends up being faster than running the fence on each warp.
-    // TODO: Ideally we only emit one barrier after all fences are issued
-    b.barrier(triton::gpu::AddrSpace::Local);
 
     rewriter.eraseOp(op);
     return success();

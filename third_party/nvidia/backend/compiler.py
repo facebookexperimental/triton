@@ -253,6 +253,9 @@ class CUDAOptions:
     preferred_ctas_per_cga: Optional[tuple] = (
         None  # Hint for preferred cluster size (CUDA 12.8+)
     )
+    # Limit resident CTAs per SM by reserving shared memory at launch time.
+    # Other resource limits can reduce occupancy further. None adds no limit.
+    max_occupancy: Optional[int] = None
     ptx_version: int = None
     ptx_options: Optional[str] = knobs.nvidia.ptxas_options
     ir_override: Optional[str] = (
@@ -283,7 +286,6 @@ class CUDAOptions:
     arch: str = None
     instrumentation_mode: str = ""
     fpsan_homomorphic_casts: bool = False
-    min_shared_mem: Optional[int] = None
 
     early_tma_store_lowering: Optional[None] = None
     tma_store_pipelining: Optional[bool] = None
@@ -306,6 +308,8 @@ class CUDAOptions:
     disable_lsr: bool = False
 
     def __post_init__(self):
+        if self.max_occupancy is not None and (type(self.max_occupancy) is not int or self.max_occupancy <= 0):
+            raise ValueError("max_occupancy must be a positive integer or None")
         default_libdir = Path(__file__).parent / "lib"
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
         if not extern_libs.get("libdevice", None):
@@ -413,6 +417,9 @@ class CUDABackend(BaseBackend):
         if args.get("instrumentation_mode", ""):
             # Instrumentation can require more registers than the user-specified limit.
             args["maxnreg"] = None
+        if is_enabled(args, "gsan"):
+            # GSan identifies CTAs by SM and requires at most one CTA per SM.
+            args["max_occupancy"] = 1
         capability = int(self._parse_arch(args["arch"]))
 
         if "enable_tree_reduction" not in args:
@@ -446,12 +453,6 @@ class CUDABackend(BaseBackend):
                 args["deprecated_fp8_dot_operand_dtypes"] = ("fp8e4b15", )
 
         args["enable_fp_fusion"] = knobs.language.fp_fusion_enabled(args.get("enable_fp_fusion"))
-
-        if is_enabled(args, "gsan"):
-            from triton.runtime.driver import driver
-            device = driver.active.get_current_device()
-            device_max = driver.active.utils.get_device_properties(device)["max_shared_mem"]
-            args["min_shared_mem"] = max(args.get("min_shared_mem", 0), device_max)
 
         args["max_num_imprecise_acc_default"] = 2**30 if capability == 90 else 0
 
@@ -1319,7 +1320,6 @@ class CUDABackend(BaseBackend):
 
         if is_enabled(options, "gsan"):
             # GSan introduces layout conversions, so it must run before shared-memory allocation.
-            mod.set_attr("tti.gsan_launch_pdl", ir.builder(mod.context).get_int32_attr(int(options.launch_pdl)))
             passes.ttgpuir.add_global_sanitizer(pm)
 
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
@@ -1336,8 +1336,6 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_concurrency_sanitizer(pm)
             passes.gluon.add_canonicalizer(pm)
             passes.common.add_cse(pm)
-        if is_enabled(options, "gsan"):
-            passes.ttgpuir.add_global_sanitizer(pm)
         # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
         tlx_dump_dir = None
         tlx_saved_fd = None
@@ -1352,9 +1350,9 @@ class CUDABackend(BaseBackend):
         instrument(pm, point="ttgpuir-to-llvmir", context=mod.context)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
-        nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
         nvidia.passes.ttgpuir.add_membar(pm, capability, ptx_version)
-        nvidia.passes.ttnvgpuir.add_tmem_wait_insertion(pm)
+        nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
+        nvidia.passes.ttnvgpuir.add_optimize_mbarrier_arrivals(pm)
         if is_enabled(options, "consan"):
             passes.ttgpuir.add_concurrency_sanitizer(pm)
             passes.gluon.add_canonicalizer(pm)
@@ -1370,8 +1368,6 @@ class CUDABackend(BaseBackend):
             options.enable_tree_reduction,
         )
         nvidia.passes.ttnvgpuir.add_initialize_ws_cluster_barriers(pm, capability, ptx_version)
-        if options.min_shared_mem is not None:
-            nvidia.passes.ttgpuir.add_set_minimum_shared_memory(pm, options.min_shared_mem)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)
         # Meta Triton divergence: upstream #9535 ("Re-order WS lowering and NVGPU

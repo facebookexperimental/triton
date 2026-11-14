@@ -5,13 +5,13 @@
 #p = #ttg.linear<{register = [[0, 1], [0, 2], [16, 0], [0, 32]], lane = [[0, 4], [0, 8], [0, 16], [1, 0], [2, 0]], warp = [[4, 0], [8, 0]], block = [], inputRadices = {register = [2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [32, 96]}>
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: llvm.func @odd_on_axis
+  // CHECK-DAG: %[[X4:.+]] = llvm.mlir.constant(4 : i32)
+  // CHECK-DAG: %[[X2:.+]] = llvm.mlir.constant(2 : i32)
+  // CHECK-DAG: %[[X1:.+]] = llvm.mlir.constant(1 : i32)
   // CHECK-COUNT-22: llvm.fadd %{{.*}} : f32
   // CHECK-NOT: llvm.fadd
-  // CHECK: %[[X4:.+]] = llvm.mlir.constant(4 : i32)
   // CHECK: nvvm.shfl.sync bfly %{{.+}}, %{{.+}}, %[[X4]],
-  // CHECK: %[[X2:.+]] = llvm.mlir.constant(2 : i32)
   // CHECK: nvvm.shfl.sync bfly %{{.+}}, %{{.+}}, %[[X2]],
-  // CHECK: %[[X1:.+]] = llvm.mlir.constant(1 : i32)
   // CHECK: nvvm.shfl.sync bfly %{{.+}}, %{{.+}}, %[[X1]],
   // CHECK-COUNT-3: nvvm.shfl.sync bfly
   // CHECK-NOT: nvvm.shfl.sync
@@ -37,13 +37,13 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 #b = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: llvm.func @pow2_control
+  // CHECK-DAG: %[[X4:.+]] = llvm.mlir.constant(4 : i32)
+  // CHECK-DAG: %[[X2:.+]] = llvm.mlir.constant(2 : i32)
+  // CHECK-DAG: %[[X1:.+]] = llvm.mlir.constant(1 : i32)
   // CHECK-COUNT-30: llvm.fadd %{{.*}} : f32
   // CHECK-NOT: llvm.fadd
-  // CHECK: %[[X4:.+]] = llvm.mlir.constant(4 : i32)
   // CHECK: nvvm.shfl.sync bfly %{{.+}}, %{{.+}}, %[[X4]],
-  // CHECK: %[[X2:.+]] = llvm.mlir.constant(2 : i32)
   // CHECK: nvvm.shfl.sync bfly %{{.+}}, %{{.+}}, %[[X2]],
-  // CHECK: %[[X1:.+]] = llvm.mlir.constant(1 : i32)
   // CHECK: nvvm.shfl.sync bfly %{{.+}}, %{{.+}}, %[[X1]],
   // CHECK-COUNT-3: nvvm.shfl.sync bfly
   // CHECK-NOT: nvvm.shfl.sync
@@ -94,15 +94,14 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 #w = #ttg.linear<{register = [[0, 1], [0, 2], [32, 0], [64, 0], [0, 16]], lane = [[0, 4], [0, 8], [1, 0], [2, 0], [4, 0]], warp = [[8, 0], [16, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 5], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 80]}>
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: llvm.func @warps_on_axis
+  // CHECK-DAG: %[[N:.+]] = llvm.mlir.constant(320 : i32)
   // CHECK: nvvm.barrier
-  // CHECK: %[[N:.+]] = llvm.mlir.constant(320 : i32)
-  // CHECK-NEXT: %[[P:.+]] = llvm.icmp "slt" %[[TID:.+]], %[[N]]
+  // CHECK: %[[P:.+]] = llvm.icmp "slt" %[[TID:.+]], %[[N]]
   // CHECK: ld.shared.b32 {{.*}}, %[[P]] :
   // CHECK: %[[OFF1:.+]] = llvm.add %[[TID]],
   // CHECK: ld.shared.b32 {{.*}}, %[[P]] :
   // CHECK: %[[OFF2:.+]] = llvm.add %[[OFF1]],
-  // CHECK: %[[N2:.+]] = llvm.mlir.constant(320 : i32)
-  // CHECK-NEXT: %[[P2:.+]] = llvm.icmp "slt" %[[OFF2]], %[[N2]]
+  // CHECK: %[[P2:.+]] = llvm.icmp "slt" %[[OFF2]], %[[N]]
   // CHECK: ld.shared.b32 {{.*}}, %[[P2]] :
   // CHECK-NOT: ld.shared
   // CHECK: nvvm.barrier
@@ -152,10 +151,10 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 #bw = #ttg.blocked<{sizePerThread = [4, 1], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: llvm.func @pow2_warps_on_axis
+  // CHECK-DAG: %[[N:.+]] = llvm.mlir.constant(256 : i32)
   // CHECK: llvm.fadd %{{.*}} : vector<2xf16>
   // CHECK: nvvm.barrier
-  // CHECK: %[[N:.+]] = llvm.mlir.constant(256 : i32)
-  // CHECK-NEXT: %[[P:.+]] = llvm.icmp "slt" %{{.+}}, %[[N]]
+  // CHECK: %[[P:.+]] = llvm.icmp "slt" %{{.+}}, %[[N]]
   // CHECK-COUNT-2: ld.shared.b16 {{.*}}, %[[P]] :
   // CHECK-NOT: ld.shared
   // CHECK: nvvm.barrier

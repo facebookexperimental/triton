@@ -116,14 +116,13 @@ struct FromCTALowering {
 
 FromCTALowering getFromCTALowering(Location loc,
                                    ConversionPatternRewriter &rewriter,
-                                   Value barrierPtr, uint32_t fromCTA,
+                                   Value barrierPtr, Value id, uint32_t fromCTA,
                                    bool supportsMBarrierMulticast) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   uint32_t broadcastMask =
       (triton::gpu::lookupNumCTAs(rewriter) - 1) & ~fromCTA;
   Type i32Ty = rewriter.getIntegerType(32);
 
-  Value id = getThreadId(rewriter, loc);
   Value pred =
       supportsMBarrierMulticast
           ? b.icmp_eq(id, b.i32_val(0))
@@ -134,7 +133,8 @@ FromCTALowering getFromCTALowering(Location loc,
 
   if (supportsMBarrierMulticast)
     return {pred, barrierPtr,
-            LLVM::NVIDIA::createTMAMulticastMask(loc, rewriter, broadcastMask)};
+            LLVM::NVIDIA::createTMAMulticastMask(loc, rewriter, broadcastMask,
+                                                 ctaId)};
 
   Value peerOffset = b.i32_val(0);
   unsigned srcBit = 0;
@@ -315,22 +315,22 @@ struct BarrierExpectConversion
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getAlloc(),
         typeConverter->convertType(barrierTy.getElementType()), rewriter);
-    // Because this operation can signal other partitions we need to synchronize
-    // the current partition first.
-    ttg::BarrierOp::create(rewriter, loc, ttg::AddrSpace::Local);
-
-    // The partition-relative thread ID lowers the same or marginally better
-    // than an elect: LOP3.LUT vs. ELECT + ISETP.EQ.U32.AND.
-    Value id = getThreadId(rewriter, loc);
-    Value pred = b.icmp_eq(id, b.i32_val(0));
+    unsigned size = op.getSize();
+    if (op.getPerWarp())
+      size /= ttg::lookupNumWarps(op);
     bool isCrossClusterBarrier =
         LLVM::NVIDIA::getCGABroadcastMask(barrierTy) != 0;
     Value barrierPtr = LLVM::NVIDIA::getLeaderAddress(
         loc, rewriter, smemObj.getBase(), barrierTy);
     Value multicastMask;
+    // Each expectation registers its bytes before consuming its arrival, so
+    // pending arrivals keep the phase open even when TMA copies complete first.
+    Value id =
+        op.getPerWarp() ? getLaneId(rewriter, loc) : getThreadId(rewriter, loc);
+    Value pred = b.icmp_eq(id, b.i32_val(0));
     if (std::optional<uint32_t> fromCTA = op.getFromCTA()) {
       FromCTALowering lowering =
-          getFromCTALowering(loc, rewriter, smemObj.getBase(), *fromCTA,
+          getFromCTALowering(loc, rewriter, smemObj.getBase(), id, *fromCTA,
                              supportsMBarrierMulticast);
       pred = lowering.pred;
       barrierPtr = lowering.barrierPtr;
@@ -344,7 +344,7 @@ struct BarrierExpectConversion
         "@$0 mbarrier.arrive.expect_tx." +
         std::string(isCrossClusterBarrier ? "shared::cluster" : "shared::cta") +
         std::string(multicastMask ? ".multicast::cluster::32b" : "") +
-        ".b64 _, [$1], " + std::to_string(op.getSize()) +
+        ".b64 _, [$1], " + std::to_string(size) +
         std::string(multicastMask ? ", $2" : "") + ";";
     auto &expectOp = *expectPtxBuilder.create(expectPtx);
     SmallVector<PTXBuilder::Operand *, 3> operands = {
@@ -481,7 +481,17 @@ struct ArriveBarrierOpConversion
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::ArriveBarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    unsigned count = op.getCount();
+    if (op.getPerWarp()) {
+      unsigned numWarps = ttg::lookupNumWarps(op);
+      if (count % numWarps != 0)
+        return op.emitOpError("per_warp count must be divisible by the warp "
+                              "count before lowering");
+      count /= numWarps;
+    }
+
     auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
     bool isPerThread = op.getPerThread();
     auto barrierTy = op.getAlloc().getType();
     // Compute the shared-memory base before any barrier so the lead (non-
@@ -490,15 +500,6 @@ struct ArriveBarrierOpConversion
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getAlloc(),
         typeConverter->convertType(barrierTy.getElementType()), rewriter);
-
-    // A (non-perThread) arrive has block-level semantics, so we must
-    // synchronize the CTA before it. Technically this should be MemBar's job,
-    // but an arrive can follow TMEM accesses which have no MemBar equivalent.
-    // perThread arrives are per-thread (no leader pattern) and must NOT emit a
-    // CTA-wide barrier -- doing so would deadlock under warp specialization
-    // where not all threads of the CTA reach the arrive.
-    if (!isPerThread)
-      ttg::BarrierOp::create(rewriter, loc, ttg::AddrSpace::Local);
 
     // A barrier physically in cluster shared memory must be signalled with
     // cluster scope regardless of broadcast.
@@ -537,21 +538,25 @@ struct ArriveBarrierOpConversion
       auto voidTy = void_ty(getContext());
       ptxBuilder.launch(rewriter, loc, voidTy);
     } else {
-      // Leader pattern: only thread 0 arrives.
+      // Leader pattern: only thread 0 (or lane 0 of each warp for per_warp)
+      // arrives.
       //
       // MultiCTA broadcast (#9475): when several CTAs broadcast into the same
       // barrier, each CTA's leader arrives on the lead CTA's barrier with
       // cluster scope. getLeaderCTAPredicate / getLeaderAddress are no-ops for
       // CTA-local barriers, so the common path is unchanged.
-      TritonLLVMOpBuilder b(loc, rewriter);
       bool isCrossClusterBarrier =
+          op.isMulticast() ||
+          LLVM::NVIDIA::getCGABroadcastMask(barrierTy) != 0 ||
           LLVM::NVIDIA::getLeaderCTAPredicate(loc, rewriter, barrierTy)
               .has_value();
       Value barrierPtr = LLVM::NVIDIA::getLeaderAddress(
           loc, rewriter, smemObj.getBase(), barrierTy);
 
-      Value id = getThreadId(rewriter, loc);
-      Value pred = b.icmp_eq(id, b.i32_val(0));
+      // Warp-aligned partition offsets preserve the lane ID.
+      Value id = op.getPerWarp() ? getLaneId(rewriter, loc)
+                                 : getThreadId(rewriter, loc);
+      Value pred;
       Value fromCTAMulticastMask;
       // An identity fromCTA (num_ctas - 1) is a no-op that canonicalization
       // removes; treat it as absent here so a coexisting multicastCTA (which
@@ -562,13 +567,16 @@ struct ArriveBarrierOpConversion
           *fromCTA == static_cast<uint32_t>(triton::gpu::lookupNumCTAs(op) - 1))
         fromCTA = std::nullopt;
       if (fromCTA) {
+        // Routing may use several lane IDs to address peer CTAs.
         FromCTALowering lowering =
-            getFromCTALowering(loc, rewriter, smemObj.getBase(), *fromCTA,
+            getFromCTALowering(loc, rewriter, smemObj.getBase(), id, *fromCTA,
                                supportsMBarrierMulticast && !op.isMulticast());
         pred = lowering.pred;
         barrierPtr = lowering.barrierPtr;
         fromCTAMulticastMask = lowering.multicastMask;
         isCrossClusterBarrier = true;
+      } else {
+        pred = b.icmp_eq(id, b.i32_val(0));
       }
       if (op.getPred())
         pred = b.and_(pred, adaptor.getPred());
@@ -582,8 +590,8 @@ struct ArriveBarrierOpConversion
         if (multicastMask)
           ptxAsm << ".multicast::cluster::32b";
         ptxAsm << ".b64 _, [$1]";
-        if (op.getCount() > 1)
-          ptxAsm << ", " << op.getCount();
+        if (count > 1)
+          ptxAsm << ", " << count;
         if (multicastMask)
           ptxAsm << ", $2";
         ptxAsm << ";";

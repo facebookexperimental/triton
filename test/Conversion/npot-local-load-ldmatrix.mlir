@@ -10,13 +10,13 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
   // Each chunk adds its start, column 32 or 64, to the view's column offset.
   // CHECK-LABEL: @b_64x96
+  // CHECK-DAG: %[[S1:.*]] = llvm.mlir.constant(32 : i32) : i32
+  // CHECK-DAG: %[[S2:.*]] = llvm.mlir.constant(64 : i32) : i32
   // CHECK: %[[COL:.*]] = llvm.extractvalue %arg0[2]
   // CHECK-COUNT-4: nvvm.ldmatrix {{.*}}layout = <col>
-  // CHECK: %[[S1:.*]] = llvm.mlir.constant(32 : i32) : i32
-  // CHECK-NEXT: llvm.add %[[COL]], %[[S1]] : i32
+  // CHECK: llvm.add %[[COL]], %[[S1]] : i32
   // CHECK-COUNT-4: nvvm.ldmatrix {{.*}}layout = <col>
-  // CHECK: %[[S2:.*]] = llvm.mlir.constant(64 : i32) : i32
-  // CHECK-NEXT: llvm.add %[[COL]], %[[S2]] : i32
+  // CHECK: llvm.add %[[COL]], %[[S2]] : i32
   // CHECK-COUNT-4: nvvm.ldmatrix {{.*}}layout = <col>
   tt.func @b_64x96(%m: !ttg.memdesc<64x96xf16, #s, #smem, mutable>) {
     // CHECK-NOT: nvvm.ldmatrix
@@ -34,9 +34,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // A dense buffer's 64-column panels sit 64 x 64 elements apart, so row 32 is
   // 4096 bytes on, not the 16384 of the pow2 cover's 256-element rows.
   // CHECK-LABEL: @b_64x192
+  // CHECK-DAG: %[[ROW:.*]] = llvm.mlir.constant(4096 : i32) : i32
   // CHECK: nvvm.ldmatrix {{.*}}layout = <col>
-  // CHECK: %[[ROW:.*]] = llvm.mlir.constant(4096 : i32) : i32
-  // CHECK-NEXT: llvm.add %{{.*}}, %[[ROW]] : i32
+  // CHECK: llvm.add %{{.*}}, %[[ROW]] : i32
   // CHECK-NEXT: llvm.getelementptr
   // CHECK-NEXT: nvvm.ldmatrix {{.*}}layout = <col>
   // CHECK-COUNT-22: nvvm.ldmatrix {{.*}}layout = <col>
@@ -50,11 +50,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // elements down the panel, 96 x 64 per panel.
   // CHECK-LABEL: @b_96x192
   // CHECK-COUNT-12: nvvm.ldmatrix {{.*}}layout = <col>
-  // CHECK: %[[P1:.*]] = llvm.mlir.constant(6144 : i32) : i32
-  // CHECK-NEXT: llvm.getelementptr %{{.*}}[%[[P1]]] : {{.*}}, f16
+  // CHECK: llvm.getelementptr %{{.*}}[6144] : {{.*}}, f16
   // CHECK: nvvm.ldmatrix {{.*}}layout = <col>
-  // CHECK: %[[R1:.*]] = llvm.mlir.constant(8192 : i32) : i32
-  // CHECK-NEXT: llvm.getelementptr %{{.*}}[%[[R1]]] : {{.*}}, f16
+  // CHECK: llvm.getelementptr %{{.*}}[8192] : {{.*}}, f16
   // CHECK-COUNT-23: nvvm.ldmatrix {{.*}}layout = <col>
   tt.func @b_96x192(%m: !ttg.memdesc<96x192xf16, #s, #smem, mutable>) {
     // CHECK-NOT: nvvm.ldmatrix
@@ -73,18 +71,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // tf32 has no transposed ldmatrix, so its chunks take the radix-2 path,
   // as the pow2 load does.
   // CHECK-LABEL: @b_tf32
-  tt.func @b_tf32(%m: !ttg.memdesc<32x96xf32, #s, #smem, mutable>) {
+  tt.func @b_tf32(%m: !ttg.memdesc<32x96xf32, #s, #smem, mutable>, %q: !tt.ptr<f32>) {
     // CHECK-NOT: nvvm.ldmatrix
     // CHECK-COUNT-48: llvm.load {{.*}}ptr<3> -> i32
     // CHECK-NOT: llvm.load
     %v = ttg.local_load %m : !ttg.memdesc<32x96xf32, #s, #smem, mutable> -> tensor<32x96xf32, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>>
+    %qs = tt.splat %q : !tt.ptr<f32> -> tensor<32x96x!tt.ptr<f32>, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>>
+    tt.store %qs, %v : tensor<32x96x!tt.ptr<f32>, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>>
     tt.return
   }
   // CHECK-LABEL: @b_tf32_128
-  tt.func @b_tf32_128(%m: !ttg.memdesc<32x128xf32, #s, #smem, mutable>) {
+  tt.func @b_tf32_128(%m: !ttg.memdesc<32x128xf32, #s, #smem, mutable>, %q: !tt.ptr<f32>) {
     // CHECK-COUNT-64: llvm.load {{.*}}ptr<3> -> i32
     // CHECK-NOT: llvm.load
     %v = ttg.local_load %m : !ttg.memdesc<32x128xf32, #s, #smem, mutable> -> tensor<32x128xf32, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>>
+    %qs = tt.splat %q : !tt.ptr<f32> -> tensor<32x128x!tt.ptr<f32>, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>>
+    tt.store %qs, %v : tensor<32x128x!tt.ptr<f32>, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>>
     tt.return
   }
   // A K tile loads in its pre-trans layout, not a dot operand, and takes the

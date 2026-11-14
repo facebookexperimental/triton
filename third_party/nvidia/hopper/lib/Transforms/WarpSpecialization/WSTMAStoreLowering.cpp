@@ -96,7 +96,7 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
     auto tokenType = ttg::AsyncTokenType::get(ctx);
     auto tmaStore = builder.create<ttng::AsyncTMACopyLocalToGlobalOp>(
         loc, tokenType, desc, storeOp.getIndices(), alloc,
-        tt::EvictionPolicy::NORMAL);
+        /*cachePolicy=*/Attribute{});
     copyLoopScheduleAttrs(storeOp, tmaStore);
 
     // Wait for this specific TMA store to finish reading from SMEM.

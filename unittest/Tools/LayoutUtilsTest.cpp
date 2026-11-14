@@ -60,7 +60,7 @@ TEST_F(LayoutUtilsTest, MixedRadixHelpersKeepRadices) {
   LinearLayout ll(bases, radices, {{S("dim0"), 8}}, true);
 
   // d1 maps past the extent and is dropped with its radix.
-  LinearLayout shrunk = ensureLayoutNotLargerThan(ll, {{S("dim0"), 4}},
+  LinearLayout shrunk = ensureLayoutNotLargerThan(ll, {S("dim0")}, {4},
                                                   /*broadcastRegisters=*/false);
   EXPECT_THAT(shrunk.getInputRadices(S("register")), ::testing::ElementsAre(3));
   EXPECT_EQ(shrunk.getOutDimSize(S("dim0")), 4);
@@ -87,13 +87,15 @@ TEST_F(LayoutUtilsTest, EnsureLayoutNotSmallerThanNpotPow2AllocShape) {
   auto layout = LinearLayout::identity1D(64, S("register"), S("dim0"));
 #ifndef NDEBUG
   // Without the flag an NPOT extent still aborts.
-  EXPECT_DEATH(ensureLayoutNotSmallerThan(layout, {{S("dim0"), 192}}),
-               "isPowerOf2_32");
+  EXPECT_DEATH(
+      ensureLayoutNotSmallerThan(layout, {S("dim0")}, {192}, S("register")),
+      "isPowerOf2_32");
 #endif
   ScopedAllowNpot npot;
   // 192 / 64 floors to 3; the layout grows to the pow2 alloc shape 256 instead.
-  EXPECT_EQ(ensureLayoutNotSmallerThan(layout, {{S("dim0"), 192}}),
-            LinearLayout::identity1D(256, S("register"), S("dim0")));
+  EXPECT_EQ(
+      ensureLayoutNotSmallerThan(layout, {S("dim0")}, {192}, S("register")),
+      LinearLayout::identity1D(256, S("register"), S("dim0")));
 }
 
 TEST_F(LayoutUtilsTest, OutputBasisMask) {
@@ -457,6 +459,28 @@ TEST_F(LayoutUtilsTest, MixedRadixInputMapRejectsNonBijections) {
                     .transposeOuts({dim0, dim1, dim2});
     EXPECT_FALSE(mapMixedRadixConversionInputs(same, same));
   }
+}
+
+TEST_F(LayoutUtilsTest, GetRepsWithInputSubview) {
+  auto tile = LinearLayout::identity1D(2, S("K"), S("offset")) *
+              LinearLayout::identity1D(2, S("N"), S("offset"));
+  auto padded = (tile * LinearLayout::identity1D(2, S("K"), S("offset")))
+                    .resizeInDim(S("N"), 1);
+
+  auto reps = getReps(padded, tile);
+  ASSERT_TRUE(reps);
+  EXPECT_EQ(*reps,
+            LinearLayout({{S("K"), {{0}, {4}}}, {S("N"), {}}},
+                         {{S("offset"), 8}}, /*requireSurjective=*/false));
+
+  // Compact repetitions overlap the N bases omitted by the view.
+  auto compact = LinearLayout::identity1D(4, S("K"), S("offset")) *
+                 LinearLayout::identity1D(1, S("N"), S("offset"));
+  EXPECT_FALSE(getReps(compact, tile));
+
+  // Even a single-tile view must reserve the full tile's four offsets.
+  auto view = tile.resizeInDim(S("N"), 1);
+  EXPECT_FALSE(getReps(view.resizeOutDim(S("offset"), 2), tile));
 }
 
 } // namespace

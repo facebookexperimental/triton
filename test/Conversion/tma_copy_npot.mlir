@@ -7,8 +7,8 @@
 
 // 48 rows: one 48-row box.
 // CHECK-LABEL: llvm.func @tma_load_48x64
-// CHECK: %[[N:.*]] = llvm.mlir.constant(32 : i32) : i32
-// CHECK-NEXT: llvm.icmp "ult" %{{.*}}, %[[N]] : i32
+// CHECK-DAG: %[[N:.*]] = llvm.mlir.constant(32 : i32) : i32
+// CHECK: llvm.icmp "ult" %{{.*}}, %[[N]] : i32
 // CHECK-NOT: llvm.urem
 // CHECK-COUNT-1: cp.async.bulk.tensor.2d.shared::cluster.global
 // CHECK-NOT: cp.async.bulk.tensor
@@ -27,11 +27,11 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // 96 columns: three 32-column sw64 boxes.
 // CHECK-LABEL: llvm.func @tma_load_64x96
-// CHECK: %[[N:.*]] = llvm.mlir.constant(96 : i32) : i32
-// CHECK-NEXT: llvm.icmp "ult" %{{.*}}, %[[N]] : i32
-// CHECK: %[[R:.*]] = llvm.mlir.constant(3 : i32) : i32
-// CHECK-NEXT: %[[D:.*]] = llvm.urem %{{.*}}, %[[R]] : i32
-// CHECK-NEXT: %[[S:.*]] = llvm.mlir.constant(5 : i32) : i32
+// CHECK-DAG: %[[N:.*]] = llvm.mlir.constant(96 : i32) : i32
+// CHECK-DAG: %[[R:.*]] = llvm.mlir.constant(3 : i32) : i32
+// CHECK-DAG: %[[S:.*]] = llvm.mlir.constant(5 : i32) : i32
+// CHECK: llvm.icmp "ult" %{{.*}}, %[[N]] : i32
+// CHECK: %[[D:.*]] = llvm.urem %{{.*}}, %[[R]] : i32
 // CHECK-NEXT: llvm.shl %[[D]], %[[S]] : i32
 // CHECK-COUNT-1: cp.async.bulk.tensor.2d.shared::cluster.global
 // CHECK-NOT: cp.async.bulk.tensor
@@ -49,11 +49,11 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // 768 rows: three 256-row boxes.
 // CHECK-LABEL: llvm.func @tma_store_768x64
-// CHECK: %[[N:.*]] = llvm.mlir.constant(96 : i32) : i32
-// CHECK-NEXT: llvm.icmp "ult" %{{.*}}, %[[N]] : i32
-// CHECK: %[[R:.*]] = llvm.mlir.constant(3 : i32) : i32
-// CHECK-NEXT: %[[D:.*]] = llvm.urem %{{.*}}, %[[R]] : i32
-// CHECK-NEXT: %[[S:.*]] = llvm.mlir.constant(8 : i32) : i32
+// CHECK-DAG: %[[N:.*]] = llvm.mlir.constant(96 : i32) : i32
+// CHECK-DAG: %[[R:.*]] = llvm.mlir.constant(3 : i32) : i32
+// CHECK-DAG: %[[S:.*]] = llvm.mlir.constant(8 : i32) : i32
+// CHECK: llvm.icmp "ult" %{{.*}}, %[[N]] : i32
+// CHECK: %[[D:.*]] = llvm.urem %{{.*}}, %[[R]] : i32
 // CHECK-NEXT: llvm.shl %[[D]], %[[S]] : i32
 // CHECK-COUNT-1: cp.async.bulk.tensor.2d.global.shared::cta.bulk_group
 // CHECK-NOT: cp.async.bulk.tensor
@@ -158,8 +158,8 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // Power-of-two control: 512 rows are two 256-row boxes and lower.
 // CHECK-LABEL: llvm.func @tma_load_512x64
-// CHECK: %[[N:.*]] = llvm.mlir.constant(64 : i32) : i32
-// CHECK-NEXT: llvm.icmp "ult" %{{.*}}, %[[N]] : i32
+// CHECK-DAG: %[[N:.*]] = llvm.mlir.constant(64 : i32) : i32
+// CHECK: llvm.icmp "ult" %{{.*}}, %[[N]] : i32
 // CHECK-NOT: llvm.urem
 // CHECK-COUNT-1: cp.async.bulk.tensor.2d.shared::cluster.global
 // CHECK-NOT: cp.async.bulk.tensor

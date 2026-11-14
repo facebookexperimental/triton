@@ -13,6 +13,8 @@ from .schedule import (
     DynamicPersistent1DScheduler,
 )
 from .standard import (
+    all,
+    any,
     argmax,
     argmin,
     bitonic_merge,
@@ -176,6 +178,8 @@ __all__ = [
     "add",
     "aggregate_replace",
     "advance",
+    "all",
+    "any",
     "arange",
     "argmax",
     "argmin",

@@ -861,6 +861,12 @@ static LogicalResult canonicalizeBarrierFromCTA(BarrierOp op,
 LogicalResult BarrierExpectOp::verify() {
   if (failed(verifyBarrierFromCTA(*this, getAlloc(), getFromCTA())))
     return failure();
+  if (getPerWarp()) {
+    int numWarps = gpu::lookupNumWarps(*this);
+    if (numWarps <= 1 || getSize() % numWarps != 0)
+      return emitOpError("per_warp requires multiple warps and size divisible "
+                         "by the warp count");
+  }
   return success();
 }
 
@@ -870,6 +876,8 @@ LogicalResult BarrierExpectOp::canonicalize(BarrierExpectOp op,
     return success();
   return canonicalizeBarrierFromCTA(op, rewriter);
 }
+
+bool BarrierExpectOp::isPerWarp() { return getPerWarp(); }
 
 Value BarrierExpectOp::getPredicateOperand() { return getPred(); }
 
@@ -914,6 +922,8 @@ TypedValue<MemDescType> WaitBarrierOp::getBarrier() { return getAlloc(); }
 LogicalResult ArriveBarrierOp::verify() {
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
+  if (getPerWarp() && gpu::lookupNumWarps(*this) <= 1)
+    return emitOpError("per_warp requires multiple warps");
   if (isMulticast()) {
     if (getPerThread())
       return emitOpError("multicast arrive does not support perThread");
@@ -955,6 +965,8 @@ LogicalResult ArriveBarrierOp::canonicalize(ArriveBarrierOp op,
     return success();
   return canonicalizeBarrierFromCTA(op, rewriter);
 }
+
+bool ArriveBarrierOp::isPerWarp() { return getPerWarp(); }
 
 Value ArriveBarrierOp::getPredicateOperand() { return getPred(); }
 
@@ -1388,6 +1400,27 @@ bool AsyncTMAReduceOp::isSupportedReduceKind(DescriptorReduceKind kind,
   llvm_unreachable("unexpected reduce kind for async_tma_reduce");
 }
 
+static LogicalResult verifyTMACachePolicy(Operation *op, Attribute attr) {
+  if (attr) {
+    if (auto policy = dyn_cast<triton::CachePolicyAttr>(attr)) {
+      if (policy.getCacheModifier() != triton::CacheModifier::NONE)
+        return op->emitOpError("TMA operations do not support cache modifiers");
+    } else if (auto policy = dyn_cast<CachePolicyAttr>(attr)) {
+      if (policy.getCacheModifier() != triton::CacheModifier::NONE)
+        return op->emitOpError("TMA operations do not support cache modifiers");
+      if (policy.getL1() != CacheEvictionPriority::NONE)
+        return op->emitOpError(
+            "TMA operations do not support L1 eviction policies");
+      if (policy.getL2PrefetchSize())
+        return op->emitOpError(
+            "TMA operations do not support L2 prefetch size");
+    } else {
+      return op->emitOpError("unsupported TMA cache policy attribute ") << attr;
+    }
+  }
+  return success();
+}
+
 // -- AsyncTMACopyGlobalToLocalOp --
 LogicalResult
 AsyncTMACopyGlobalToLocalOp::canonicalize(AsyncTMACopyGlobalToLocalOp op,
@@ -1396,6 +1429,14 @@ AsyncTMACopyGlobalToLocalOp::canonicalize(AsyncTMACopyGlobalToLocalOp op,
 }
 
 LogicalResult AsyncTMACopyGlobalToLocalOp::verify() {
+  // Do not silently accept obsolete attributes in generic textual IR.
+  if ((*this)->hasAttr("cache") || (*this)->hasAttr("evict"))
+    return emitOpError(
+        "use cachePolicy instead of legacy cache/evict attributes");
+  if (getIsVolatile())
+    return emitOpError("volatile TMA loads are not supported");
+  if (failed(verifyTMACachePolicy(*this, getCachePolicyAttr())))
+    return failure();
   auto descType = getDesc().getType();
   bool isIm2Col = isIm2ColDescriptor(descType);
   auto descInterface = cast<TensorDescInterface>(descType);
@@ -1430,6 +1471,8 @@ Type AsyncTMACopyGlobalToLocalOp::getPredicateOperandTypeLike() {
 
 // -- AsyncTMACopyLocalToGlobalOp --
 LogicalResult AsyncTMACopyLocalToGlobalOp::verify() {
+  if (failed(verifyTMACachePolicy(*this, getCachePolicyAttr())))
+    return failure();
   // Store ops only support TILED mode
   if (failed(verifyAsyncTMACoords(*this, getCoord(), getDesc().getType(),
                                   /*isIm2Col=*/false)))
@@ -1545,6 +1588,8 @@ LogicalResult AsyncTMAGatherOp::canonicalize(AsyncTMAGatherOp op,
 }
 
 LogicalResult AsyncTMAGatherOp::verify() {
+  if (failed(verifyTMACachePolicy(*this, getCachePolicyAttr())))
+    return failure();
   auto resultType = getResult().getType();
   if (failed(verifyAsyncTMALoadOp(*this, getDesc().getType(), getBarrier(),
                                   resultType)))
@@ -1574,6 +1619,8 @@ Type AsyncTMAGatherOp::getPredicateOperandTypeLike() {
 
 // -- AsyncTMAScatter --
 LogicalResult AsyncTMAScatterOp::verify() {
+  if (failed(verifyTMACachePolicy(*this, getCachePolicyAttr())))
+    return failure();
   auto srcType = getSrc().getType();
   if (failed(verifyAsyncTMAStoreOp(*this, getDesc(), srcType)))
     return failure();
@@ -1900,9 +1947,6 @@ static LogicalResult verifyMMAOperandPacking(Operation *op, MemDescType mem,
 LogicalResult TCGen5MMAOp::verify() {
   if (failed(verifyTcgen05Target(getOperation())))
     return failure();
-  if (!getIsAsync() && !getBarriers().empty()) {
-    return emitOpError("The op is synchronous but a barrier is present.");
-  }
   for (auto barrier : getBarriers()) {
     auto barrierTy = cast<MemDescType>(barrier.getType());
     // Meta Triton divergence: Meta Triton's TLX / warp-spec paths emit
@@ -1932,13 +1976,6 @@ LogicalResult TCGen5MMAOp::verify() {
   if (failed(verifyMMADType(*this, atype, btype, dtype)))
     return failure();
 
-  if (getA().getType().getRank() != 2)
-    return emitOpError("LHS operand must have a rank-2 tensor");
-  if (getB().getType().getRank() != 2)
-    return emitOpError("RHS operand must have a rank-2 tensor");
-  if (getD().getType().getRank() != 2)
-    return emitOpError("Return operand must have a rank-2 tensor");
-
   auto kind = getMMAv5DTypeKindAndAcc(atype)->first;
   int64_t minK = kind == MMADTypeKind::tf32  ? 8
                  : kind == MMADTypeKind::f16 ? 16
@@ -1957,11 +1994,7 @@ LogicalResult TCGen5MMAOp::verify() {
   if (!isa<NVMMASharedEncodingAttr, SharedLinearEncodingAttr>(bEnc))
     return emitOpError("RHS operand must have a NVMMAShared encoding");
   auto retType = getD().getType();
-  auto retEnc = dyn_cast<TensorMemoryEncodingAttr>(retType.getEncoding());
-  if (!retEnc)
-    return emitOpError("Return operand must have a TensorMemory encoding");
-  if (retEnc.getFp4Padded())
-    return emitOpError("Accumulator must not be fp4_padded");
+  auto retEnc = cast<TensorMemoryEncodingAttr>(retType.getEncoding());
 
   // Check colStride of TMEM operands
   if (auto tmem = dyn_cast<TensorMemoryEncodingAttr>(aEnc)) {
@@ -1982,6 +2015,24 @@ LogicalResult TCGen5MMAOp::verify() {
   if (instrSizeN > 256)
     return emitOpError("The block size of the return operand must be less than "
                        "or equal to 256");
+
+  auto aCGA = getCGALayout(aEnc).getLinearLayout();
+  auto bCGA = getCGALayout(bEnc).getLinearLayout();
+  auto outDims = standardOutDimNames(getContext(), 2);
+  if (aCGA.getOutDimSize(outDims[1]) != 1) {
+    return emitOpError("LHS CTASplit along K should be 1, but got ")
+           << aCGA.getOutDimSize(outDims[1]);
+  }
+  if (bCGA.getOutDimSize(outDims[0]) != 1) {
+    return emitOpError("RHS CTASplit along K should be 1, but got ")
+           << bCGA.getOutDimSize(outDims[0]);
+  }
+
+  // NOTE(TLX): upstream's twoCTAs CGA-basis and LHS-encoding twoCTA-match
+  // checks are also disabled here: TLX two-CTA mode sets the op flag without
+  // propagating twoCTAs into the encodings (see below), so it violates them
+  // by design. Re-enable together with the checks below once TLX adopts
+  // upstream's CGAEncodingAttr convention.
 
   // if (getTwoCtas()) {
   // Once we have a `block` dimension in TMEM, we can look at this via the
@@ -2223,8 +2274,8 @@ static Type getScaledMMAOperandType(Type elementType,
 }
 
 static bool isScaledMMATransposed(MemDescType type, bool isLhs) {
-  auto shared = dyn_cast<NVMMASharedEncodingAttr>(type.getEncoding());
-  return shared && (isLhs ? shared.getTransposed() : !shared.getTransposed());
+  auto shared = getNvmmaSmemAttrs(type);
+  return shared && (isLhs ? shared->transposed : !shared->transposed);
 }
 
 static LogicalResult
@@ -2286,13 +2337,9 @@ static LogicalResult verifyScaledLHSOperand(Operation *op, Type elementType,
 
   return op->emitOpError("unsupported LHS operand type for scaled MMA");
 }
-
 LogicalResult TCGen5MMAScaledOp::verify() {
   if (failed(verifyTcgen05Target(getOperation())))
     return failure();
-  if (!getIsAsync() && !getBarriers().empty()) {
-    return emitOpError("The op is synchronous but a barrier is present.");
-  }
   for (auto barrier : getBarriers()) {
     auto barrierTy = cast<MemDescType>(barrier.getType());
     // Meta Triton divergence (see TCGen5MMAOp::verify): rank-1 form only.
@@ -2358,8 +2405,8 @@ LogicalResult TCGen5MMAScaledOp::verify() {
                       ? std::nullopt
                       : getNvmmaSmemAttrs(getA().getType());
     auto bAttrs = getNvmmaSmemAttrs(getB().getType());
-    bool transposed =
-        (aAttrs && aAttrs->transposed) || (bAttrs && !bAttrs->transposed);
+    bool transposed = isScaledMMATransposed(getA().getType(), /*isLhs=*/true) ||
+                      isScaledMMATransposed(getB().getType(), /*isLhs=*/false);
     bool isUE4M3 = isa<Float8E4M3FNType>(aScaleType.getElementType()) &&
                    isa<Float8E4M3FNType>(bScaleType.getElementType());
     bool isUE5M3 = aScaleType.getElementType().isInteger(8) &&
@@ -2411,6 +2458,31 @@ LogicalResult TCGen5MMAScaledOp::verify() {
   if (failed(verifyScaleEncoding(aScaleType, /*isA=*/true)) ||
       failed(verifyScaleEncoding(bScaleType, /*isA=*/false)))
     return failure();
+  unsigned mmaSizeN = getMMAv5InstructionN(getD().getType());
+  // A padded accumulator has no CGA split along N.
+  if (isa<TensorMemorySpaceAttr>(bScaleType.getMemorySpace()) &&
+      mmaSizeN > getD().getType().getDimSize(1) &&
+      mmaSizeN > bScaleType.getDimSize(0)) {
+    if (bScaleType.getRank() != 2)
+      return emitOpError("expected rank-2 B scales for MMA with padded N");
+    if (bScaleType.getDimSize(0) != bScaleType.getAllocShape()[0])
+      return emitOpError(
+          "cannot expand the row dimension of a B scale subview");
+    auto dims = standardOutDimNames(getContext(), 2);
+    auto scaleEncoding = bScaleType.getEncoding();
+    auto allocShape =
+        dropPipeliningDim(bScaleType.getAllocShape(), scaleEncoding);
+    auto expectedType =
+        MemDescType::get({mmaSizeN, allocShape[1]}, bScaleType.getElementType(),
+                         scaleEncoding, bScaleType.getMemorySpace());
+    if (getTmemAllocSizes(bScaleType).numRows <
+            getTmemAllocSizes(expectedType).numRows ||
+        ensureLayoutNotLargerThan(toLinearLayout(expectedType), dims,
+                                  allocShape) !=
+            toLinearLayout(allocShape, scaleEncoding))
+      return emitOpError("B scale layout does not reserve the rows required by "
+                         "the MMA instruction");
+  }
   // The FP4 kinds (minK 64) step K in 4-bit units; unpadded they take K=96
   // where the target has it.
   auto mod = (*this)->getParentOfType<ModuleOp>();
@@ -2454,16 +2526,11 @@ void TCGen5MMAScaledOp::getEffects(
 }
 
 bool TCGen5MMAScaledOp::verifyDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-
-  bool transA = isScaledMMATransposed(getA().getType(), /*isLhs=*/true);
+  auto aKdim = getBlockK();
+  auto bShape = getB().getType().getShape();
   bool transB = isScaledMMATransposed(getB().getType(), /*isLhs=*/false);
-  auto aKdim = aShape[aShape.size() - 1];
-  auto bKdim = bShape[aShape.size() - 2];
-  if (this->getAType() == ScaleDotElemType::E2M1 && !transA)
-    aKdim *= 2;
-  if (this->getBType() == ScaleDotElemType::E2M1 && !transB)
+  auto bKdim = bShape[bShape.size() - 2];
+  if (getBType() == ScaleDotElemType::E2M1 && !transB)
     bKdim *= 2;
   // fp6 shapes count logical values, consumed in groups of 16 values
   // (the MXFP6Tensor storage group), same as the tl.dot_scaled contract.
@@ -2483,29 +2550,16 @@ bool TCGen5MMAScaledOp::verifyDims() {
 }
 
 bool TCGen5MMAScaledOp::verifyOutputDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-  auto cShape = this->getD().getType().getShape();
-  auto oMdim = cShape[cShape.size() - 2];
-  auto oNdim = cShape[cShape.size() - 1];
-
-  int aMdim = aShape[aShape.size() - 2];
-  int bNdim = bShape[bShape.size() - 1];
-  bool transA = isScaledMMATransposed(getA().getType(), /*isLhs=*/true);
-  bool transB = isScaledMMATransposed(getB().getType(), /*isLhs=*/false);
-  if (this->getAType() == ScaleDotElemType::E2M1 && transA)
-    aMdim *= 2;
-  if (this->getBType() == ScaleDotElemType::E2M1 && transB)
-    bNdim *= 2;
-
-  if (aMdim != oMdim)
+  auto shape = getD().getType().getShape();
+  int aMdim = getBlockM();
+  int bNdim = getBlockN();
+  if (aMdim != shape[shape.size() - 2])
     return false;
-
   // For 2-CTA TLX mode, output N should be 2 * B's N dimension
   if (getTwoCtas()) {
-    return oNdim == bNdim || oNdim == 2 * bNdim;
+    return shape.back() == bNdim || shape.back() == 2 * bNdim;
   }
-  return bNdim == oNdim;
+  return bNdim == shape.back();
 }
 
 Value TCGen5MMAScaledOp::useAccumulator() { return getUseD(); }

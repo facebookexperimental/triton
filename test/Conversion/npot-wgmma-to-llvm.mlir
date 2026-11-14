@@ -51,9 +51,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @wgmma_dense_k96
-  // CHECK: llvm.mlir.constant(1536 : i32)
-  // CHECK-NEXT: llvm.mul
-  // CHECK-COUNT-12: llvm.mlir.constant(50331648 : i32)
+  // CHECK-DAG: llvm.mlir.constant(1536 : i32)
+  // CHECK-DAG: llvm.mlir.constant(50331648 : i32)
+  // CHECK: llvm.mul
   // CHECK-NOT: llvm.mlir.constant(50331648 : i32)
   tt.func @wgmma_dense_k96(%a: !ttg.memdesc<128x96xf16, #shared1, #smem>, %b: !ttg.memdesc<96x256xf16, #shared, #smem>) {
     %c = arith.constant dense<0.0> : tensor<128x256xf32, #mma>
@@ -72,8 +72,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @wgmma_dense_m192_n96
-  // CHECK: llvm.mlir.constant(1536 : i32)
-  // CHECK: llvm.mlir.constant(768 : i32)
+  // CHECK-DAG: llvm.mlir.constant(1536 : i32)
+  // CHECK-DAG: llvm.mlir.constant(768 : i32)
   // CHECK: nvg.wgmma %{{.*}} m = 64 : i32, n = 96 : i32
   tt.func @wgmma_dense_m192_n96(%a: !ttg.memdesc<192x128xf16, #shared, #smem>, %b: !ttg.memdesc<128x96xf16, #sharedT, #smem>) {
     %c = arith.constant dense<0.0> : tensor<192x96xf32, #mma>

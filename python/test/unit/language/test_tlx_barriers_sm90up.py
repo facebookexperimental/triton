@@ -423,16 +423,13 @@ def test_barrier_live_range(device):
     kernel = bar_live_kernel[(2, 1)]()
     ptx = kernel.asm["ptx"]
 
-    # e.g. extract %1 and 1 from "mbarrier.init.shared::cta.b64 [%r1], 1;"
+    # e.g. extract %1 from "mbarrier.init.shared::cta.b64 [%r1], 1;". Per-warp arrival may raise an
+    # init count to the warp count, so identify the three barriers by their init instructions.
     pattern = r"mbarrier\.init\..*\.b64 \[(%r\d+)\], (\d+);"
     matches = re.findall(pattern, ptx)
-
-    arrive_count_to_reg = {int(arrive_count): reg for reg, arrive_count in matches}
-    assert len(arrive_count_to_reg) == 3, f"Expected 3 mbarrier init, got ptx: \n{ptx}"
+    assert len(matches) == 3, f"Expected 3 mbarrier init, got ptx: \n{ptx}"
     # Make sure they all have different registers (different SMEM addresses)
-    assert arrive_count_to_reg[1] != arrive_count_to_reg[2], f"invalid reuse of SMEM, full ptx: \n{ptx}"
-    assert arrive_count_to_reg[2] != arrive_count_to_reg[3], f"invalid reuse of SMEM, full ptx: \n{ptx}"
-    assert arrive_count_to_reg[1] != arrive_count_to_reg[3], f"invalid reuse of SMEM, full ptx: \n{ptx}"
+    assert len({reg for reg, _ in matches}) == 3, f"invalid reuse of SMEM, full ptx: \n{ptx}"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
