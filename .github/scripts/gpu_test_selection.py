@@ -1,4 +1,4 @@
-"""Plan CPU and GPU test work before allocating runners."""
+"""Plan GPU test work before allocating runners."""
 from __future__ import annotations
 
 import argparse
@@ -582,52 +582,6 @@ def select_kernel_tests(paths, repo, tritonbench=()):
     }
 
 
-def cpu_ineligible_reason(paths, repo, spec):
-    if paths is None:
-        paths = []
-    if any(p.startswith(tuple(spec["dependencies"])) or p in spec["files"] or p.endswith(".py") for p in paths):
-        return "The current diff changes Python or a declared CPU-suite dependency."
-    if "gluon_skip_files" not in spec:
-        return None
-    directory = repo / "python/test/gluon"
-    actual = {
-        str(p.relative_to(repo))
-        for p in directory.rglob("*.py")
-        if p.name.startswith("test_") or p.name.endswith("_test.py")
-    }
-    expected = set(spec["files"]) | {"python/test/gluon/" + name for name in spec["gluon_skip_files"]}
-    if actual != expected:
-        return "The Gluon test inventory differs from the audited CPU group."
-    try:
-        tree = ast.parse((directory / "conftest.py").read_text())
-        settings = {
-            n.targets[0].id: ast.literal_eval(n.value)
-            for n in tree.body
-            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
-            and n.targets[0].id in ("_VERSION_SKEW_FILES", "_KNOWN_FAIL_SUBSTRINGS")
-        }
-    except (OSError, SyntaxError, ValueError, UnicodeError):
-        return "Gluon's CPU audit policy could not be read."
-    ignores = [
-        n.value
-        for n in tree.body
-        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "collect_ignore" for t in n.targets)
-    ]
-    references = [n for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id == "collect_ignore"]
-    if len(ignores) != 1 or len(references) != 1:
-        return "Gluon's collection exclusions changed."
-    if ast.dump(ignores[0]) != ast.dump(ast.parse("sorted(_VERSION_SKEW_FILES)", mode="eval").body):
-        return "Gluon's collection exclusions changed."
-    if (settings.get("_VERSION_SKEW_FILES") != set(spec["gluon_skip_files"])
-            or settings.get("_KNOWN_FAIL_SUBSTRINGS") != tuple(spec["gluon_skip_tests"])):
-        return "Gluon's skipped-test policy differs from the CPU audit."
-    return None
-
-
-def cpu_eligible(paths, repo, spec):
-    return cpu_ineligible_reason(paths, repo, spec) is None
-
-
 def suite_files(repo, patterns):
     files = sorted({
         str(p.relative_to(repo))
@@ -640,33 +594,11 @@ def suite_files(repo, patterns):
     return files
 
 
-def reviewed_changes(repo, revision, paths):
-    try:
-        if subprocess.run(["git", "cat-file", "-e", revision + "^{commit}"], cwd=repo, stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL).returncode:
-            subprocess.run(["git", "fetch", "--no-tags", "origin", revision], cwd=repo, check=True, timeout=60)
-        return subprocess.check_output(["git", "diff", "--name-only", "--no-renames", revision, "--", *paths], cwd=repo,
-                                       text=True).splitlines()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return None
-
-
-def test_plan(paths, repo, filters, suites, narrow=True, offload=True):
+def test_plan(paths, repo, filters, suites, narrow=True):
     platforms = dict.fromkeys(filters, True) if paths is None else select_platforms(paths, filters)
     kernel = select_kernel_tests(paths, repo) if narrow else select_kernel_tests(None, repo)
     affected = set(kernel["affected"])
-    gpu, cpu = {}, {}
-    cpu_ready, cpu_reasons = {}, {}
-    for group, spec in suites["cpu"].items():
-        reason = cpu_ineligible_reason(paths, repo, spec) if offload else "CPU offload is disabled for this run."
-        if reason is None:
-            changes = reviewed_changes(repo, suites["reviewed_revision"], spec["dependencies"] + spec["files"])
-            if changes is None:
-                reason = "The reviewed CPU revision could not be checked."
-            elif changes:
-                reason = "CPU-suite dependencies changed since the reviewed revision."
-        cpu_ready[group] = reason is None
-        cpu_reasons[group] = reason
+    gpu = {}
     for platform, enabled in platforms.items():
         plan = {
             "core": {"files": [], "k": ""}, "correctness": {"files": [], "k": ""}, "codegen": {"files": [], "k": ""},
@@ -682,29 +614,22 @@ def test_plan(paths, repo, filters, suites, narrow=True, offload=True):
             # These groups historically run their full suite when any file is affected.
             if not kernel["kernel_only"] or any(p.startswith(files[0].rstrip("/") + "/") for p in affected):
                 plan[group]["files"] = files
-            if platform == "b200" and (not kernel["kernel_only"] or suites["cpu"]["codegen"]["files"][0] in affected):
-                plan["codegen"]["files"] = suites["cpu"]["codegen"]["files"]
-        for group in ("codegen", "gluon"):
-            if cpu_ready[group] and plan[group]["files"]:
-                cpu[group] = {
-                    "files": suites["cpu"][group]["files"], "k": "", "allowed_skips":
-                    suites["cpu"][group]["allowed_skips"]
-                }
-                plan[group]["files"] = []
+            codegen = suites["platforms"][platform].get("codegen")
+            if codegen and (not kernel["kernel_only"] or codegen[0] in affected):
+                plan["codegen"]["files"] = codegen
         gpu[platform] = plan
     return {
-        "gpu": gpu, "cpu": cpu, "kernel": kernel, "cpu_reasons": cpu_reasons, "build": bool(cpu)
-        or any(entry["files"] for plan in gpu.values() for entry in plan.values())
+        "gpu": gpu, "kernel": kernel, "build": any(entry["files"] for plan in gpu.values() for entry in plan.values())
     }
 
 
-def selection_summary(plan, suites, sha, note=""):
+def selection_summary(plan, sha, note=""):
     gpu_jobs = sum(
         int(any(groups[name]["files"] for name in ("core", "correctness", "codegen"))) +
         int(any(groups[name]["files"] for name in ("runtime", "gluon"))) for groups in plan["gpu"].values())
     lines = [
         "## Test selection", "", f"Selected commit: `{sha}`.", f"Wheel required: {'yes' if plan['build'] else 'no'}.",
-        f"Planned GPU jobs: {gpu_jobs}. Planned CPU jobs: {int(bool(plan['cpu']))}.", ""
+        f"Planned GPU jobs: {gpu_jobs}.", ""
     ]
     if note:
         lines += [note, ""]
@@ -712,28 +637,7 @@ def selection_summary(plan, suites, sha, note=""):
     for platform, groups in plan["gpu"].items():
         selected = "; ".join(f"{group}: {len(entry['files'])}" for group, entry in groups.items() if entry["files"])
         lines.append(f"| {platform} | {selected or 'None, no GPU runner requested'} |")
-    lines += [
-        "", "Counts are selected file or directory targets, not collected test cases.", "",
-        "### Compiler-only suite placement", "", "| Suite | Placement | Reason |", "| --- | --- | --- |"
-    ]
-    for group in suites["cpu"]:
-        if group in plan["cpu"]:
-            placement, reason = "CPU", "The compiler-only group and its dependencies match the CPU audit."
-        elif any(groups[group]["files"] for groups in plan["gpu"].values()):
-            placement, reason = "GPU", plan["cpu_reasons"][group]
-        else:
-            placement, reason = "Not selected", "No work for this suite is selected by this change."
-        lines.append(f"| {group} | {placement} | {reason} |")
-    lines += [
-        "", "### Audited Gluon exclusions", "", f"CPU audit revision: `{suites['reviewed_revision']}`.", "",
-        "The audit includes these files as already disabled by Gluon's version-skew policy:"
-    ]
-    lines += [f"- `{name}`" for name in suites["cpu"]["gluon"]["gluon_skip_files"]]
-    lines += [
-        "", "The pinned Gluon frontend is older than these upstream-synced GPU tests. "
-        "CPU offload does not introduce these exclusions. Re-enable them after the frontend re-sync "
-        "and renew the CPU audit. This list records the audited policy, not a new skip decision.", ""
-    ]
+    lines += ["", "Counts are selected file or directory targets, not collected test cases.", ""]
     return "\n".join(lines)
 
 
@@ -771,7 +675,6 @@ def main():
                 output.write(f"{key}={str(value).lower() if isinstance(value, bool) else value}\n")
         return
     paths = None
-    diff_known = True
     selection_note = ""
     event_name = os.environ["GITHUB_EVENT_NAME"]
     event = {}
@@ -787,16 +690,15 @@ def main():
             paths = changed_paths(event_name, event)
     except (KeyError, ValueError, OSError, subprocess.CalledProcessError) as exc:
         print(f"::warning::Cannot determine changed paths; running full suites: {exc}")
-        diff_known = False
         selection_note = "Changed-path discovery failed; full GPU coverage is retained."
     filters = json.loads(PATH_FILTERS.read_text())
     suites = json.loads(SUITES.read_text())
     try:
-        plan = test_plan(paths, repo, filters, suites, narrow=event_name == "pull_request", offload=diff_known)
+        plan = test_plan(paths, repo, filters, suites, narrow=event_name == "pull_request")
     except (ValueError, OSError, SyntaxError) as exc:
         print(f"::warning::Cannot select tests; running full GPU suites: {exc}")
         # Configuration or test enumeration failures must not produce an empty success.
-        plan = test_plan(None, repo, filters, suites, narrow=False, offload=False)
+        plan = test_plan(None, repo, filters, suites, narrow=False)
         selection_note = "Test selection could not be narrowed; full GPU coverage is retained."
     platforms = manual_platforms(event_name, event)
     if platforms is not None:
@@ -804,33 +706,27 @@ def main():
             if platform not in platforms:
                 for suite in groups.values():
                     suite["files"] = []
-        if "cpu" not in platforms:
-            plan["cpu"] = {}
         selection_note = f"Manual platform list: {','.join(platforms)}. Other platforms are not covered by this run."
     for suite in plan["gpu"]["b200"].values():
         suite["files"] = []
-    plan["build"] = bool(plan["cpu"]) or any(suite["files"]
-                                             for groups in plan["gpu"].values()
-                                             for suite in groups.values())
+    plan["build"] = any(suite["files"] for groups in plan["gpu"].values() for suite in groups.values())
     disabled_note = "B200 temporarily disabled: runner offline; this run does not cover B200."
     selection_note = (selection_note + "\n\n" if selection_note else "") + disabled_note
     print(f"::warning::{disabled_note}")
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     print(json.dumps(plan, indent=2))
     selection = {platform: any(step["files"] for step in steps.values()) for platform, steps in plan["gpu"].items()}
-    selection.update(build=plan["build"], cpu=bool(plan["cpu"]))
+    selection.update(build=plan["build"])
     print(f"GPU selection for {sha}: {selection}")
-    cpu_plan = {group: plan["cpu"].get(group, {"files": [], "k": ""}) for group in ("codegen", "gluon")}
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write(f"sha={sha}\nbuild={str(plan['build']).lower()}\n")
-        output.write(f"cpu={str(bool(plan['cpu'])).lower()}\ncpu_plan={json.dumps(cpu_plan, separators=(',', ':'))}\n")
         for platform, steps in plan["gpu"].items():
             output.write(f"{platform}={str(any(s['files'] for s in steps.values())).lower()}\n")
             output.write(f"{platform}_plan={json.dumps(steps, separators=(',', ':'))}\n")
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a") as summary:
-            summary.write(selection_summary(plan, suites, sha, selection_note))
+            summary.write(selection_summary(plan, sha, selection_note))
 
 
 if __name__ == "__main__":

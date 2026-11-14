@@ -1,12 +1,12 @@
-"""Hand Fast correctness's head wheel to its workflow_run follow-ups (GPU full tests and the TLX codegen trace).
+"""Hand a PR's GPU tests head wheel to its workflow_run follow-up (the TLX codegen trace).
 
-Fast correctness (pull_request) writes a versioned manifest naming its run, attempt, PR, PR head, test merge commit
+GPU tests (pull_request) writes a versioned manifest naming its run, attempt, PR, PR head, test merge commit
 and validated wheel. A follow-up runs on the default branch with its own token, so it trusts nothing in that
 manifest it cannot check: the producer run comes from the workflow_run event, the PR and its current head from the
 API, the merge commit's parents from git, and the wheel's identity is recomputed from the build recipe at that merge
 commit. It reads all of this as data and never runs code from the PR.
 
-Fast correctness writes its manifest with the standard library only; wheel_cache (boto3) is imported only by the
+GPU tests writes its manifest with the standard library only; wheel_cache (boto3) is imported only by the
 follow-up commands that check wheels.
 """
 import argparse
@@ -21,7 +21,7 @@ import tempfile
 import zipfile
 
 VERSION = 1
-FAST_WORKFLOW = ".github/workflows/fast-gpu-tests.yml"
+PRODUCER_WORKFLOW = ".github/workflows/gpu-tests.yml"
 MANIFEST_FILE = "fast-followup.json"
 SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -35,7 +35,7 @@ def manifest_name(attempt):
 
 
 def manifest(env):
-    """The producer's manifest, written by Fast correctness after its fast suites pass."""
+    """The producer's manifest, written by GPU tests after its build."""
     wheel = json.loads(env["WHEEL"]) if env.get("WHEEL") else None
     return {
         "version": VERSION, "repository": env["GITHUB_REPOSITORY"], "run_id": int(env["GITHUB_RUN_ID"]), "run_attempt":
@@ -57,12 +57,12 @@ def find_artifact(api, repo, run_id, name):
 
 
 def producer(event, repo):
-    """The triggering Fast correctness run, if it is a successful pull_request run of this repository's workflow."""
+    """The triggering GPU tests run, if it is a successful pull_request run of this repository's workflow."""
     run = event.get("workflow_run") or {}
     if (run.get("event") != "pull_request" or run.get("conclusion") != "success"
             or (run.get("repository") or {}).get("full_name") != repo
-            or str(run.get("path", "")).split("@")[0] != FAST_WORKFLOW):
-        raise Rejected("The triggering run is not a successful pull_request run of Fast correctness")
+            or str(run.get("path", "")).split("@")[0] != PRODUCER_WORKFLOW):
+        raise Rejected("The triggering run is not a successful pull_request run of GPU tests")
     if not SHA.fullmatch(str(run.get("head_sha"))):
         raise Rejected("The triggering run has no PR head SHA")
     return run
@@ -83,13 +83,13 @@ def producer_merge(run, repo, api, text):
         page += 1
     selected = [job for job in jobs if job.get("name") == "select" and job.get("run_attempt", 1) <= run["run_attempt"]]
     if not selected:
-        raise Rejected("The Fast producer has no source selection job")
+        raise Rejected("The GPU tests producer has no source selection job")
     job = max(selected, key=lambda item: (item.get("run_attempt", 1), item["id"]))
     if job.get("conclusion") != "success":
-        raise Rejected("The Fast producer source selection did not pass")
+        raise Rejected("The GPU tests producer source selection did not pass")
     merge = checkout_sha(job, text(f"repos/{repo}/actions/jobs/{job['id']}/logs"))
     if not merge:
-        raise Rejected("The Fast producer checkout log does not identify one tested commit")
+        raise Rejected("The GPU tests producer checkout log does not identify one tested commit")
     return merge
 
 
@@ -98,7 +98,7 @@ def verify(event, manifest, repo, api, git, recipe_identity, text=None):
 
     `recipe_identity(sha)` is the identity a build of `sha` would have with the build recipe at `sha`.
     Status "stale" means the run was re-run or the PR head moved. A base-only update does not invalidate the source
-    that this Fast attempt tested; when GitHub's current merge differs, authenticate that source from its checkout log.
+    that this GPU tests attempt tested; when GitHub's current merge differs, authenticate that source from its checkout log.
     """
     run = producer(event, repo)
     if (manifest.get("version") != VERSION or manifest.get("repository") != repo or manifest.get("run_id") != run["id"]
@@ -107,8 +107,8 @@ def verify(event, manifest, repo, api, git, recipe_identity, text=None):
     live = api(f"repos/{repo}/actions/runs/{run['id']}")
     if (live.get("id") != run["id"] or live.get("event") != "pull_request" or live.get("head_sha") != run["head_sha"]
             or (live.get("repository") or {}).get("full_name") != repo
-            or str(live.get("path", "")).split("@")[0] != FAST_WORKFLOW):
-        raise Rejected("The API does not describe the triggering run as Fast correctness for this PR head")
+            or str(live.get("path", "")).split("@")[0] != PRODUCER_WORKFLOW):
+        raise Rejected("The API does not describe the triggering run as GPU tests for this PR head")
     live_attempt = live.get("run_attempt")
     head_repo = (run.get("head_repository") or {}).get("full_name")
     number = manifest.get("pr_number")
@@ -134,7 +134,7 @@ def verify(event, manifest, repo, api, git, recipe_identity, text=None):
         raise Rejected("The manifest has no test merge SHA")
     if pr.get("merge_commit_sha") != merge:
         if text is None or producer_merge(run, repo, api, text) != merge:
-            raise Rejected("The manifest merge does not match the Fast producer checkout")
+            raise Rejected("The manifest merge does not match the GPU tests producer checkout")
     git("fetch", "--no-tags", "--quiet", "origin", merge,
         f"+refs/heads/{source['base_ref']}:refs/remotes/origin/{source['base_ref']}")
     parents = git("rev-list", "--parents", "-n", "1", merge).split()
@@ -150,7 +150,7 @@ def verify(event, manifest, repo, api, git, recipe_identity, text=None):
         wheel = supplied_wheel(json.dumps(wheel), recipe_identity(merge))
         reason = "" if wheel else "the producer's wheel does not match the merge commit's build identity"
     else:
-        reason = "Fast correctness built no head wheel"
+        reason = "GPU tests built no head wheel"
     return {"status": "ok", "merge": merge, "base": parents[1], "wheel": wheel, "wheel_reason": reason, **source}
 
 
@@ -225,8 +225,8 @@ def main():
         run = producer(event, repo)
         artifact = find_artifact(gh_api, repo, run["id"], manifest_name(run["run_attempt"]))
         if artifact is None:
-            # An older Fast correctness keeps full tests and the trace in its own run.
-            print(f"Fast run {run['id']} attempt {run['run_attempt']} published no follow-up manifest v{VERSION}")
+            # A run without a build publishes no manifest.
+            print(f"GPU tests run {run['id']} attempt {run['run_attempt']} published no follow-up manifest v{VERSION}")
         emit(manifest_id=artifact or "")
         return
     if args.command == "verify":

@@ -263,12 +263,12 @@ def test_supplied_wheel_is_reused_only_for_the_exact_build():
 
 
 def followup_fixture():
-    from fast_followup import FAST_WORKFLOW
+    from fast_followup import PRODUCER_WORKFLOW
     repo, head, merge, base = "owner/triton", "1" * 40, "2" * 40, "3" * 40
     identity = {"repository": repo, "sha": merge, "abi": "cp312", "platform": "Linux-X64", "recipe": "r"}
     event = {
         "workflow_run": {
-            "id": 7, "run_attempt": 2, "event": "pull_request", "conclusion": "success", "path": FAST_WORKFLOW,
+            "id": 7, "run_attempt": 2, "event": "pull_request", "conclusion": "success", "path": PRODUCER_WORKFLOW,
             "repository": {"full_name": repo}, "head_sha": head, "head_branch": "feat", "head_repository":
             {"full_name": "fork/triton", "owner": {"login": "fork"}}
         }
@@ -458,7 +458,7 @@ def test_followups_never_run_pr_code_with_write_or_oidc_tokens():
 
     full, trace = workflow("gpu-tests"), workflow("tlx-codegen-trace")
     read_only = ({}, {"contents": "read"}, {"contents": "read", "actions": "read"})
-    pr_code_jobs = [full["jobs"]["cpu-tests"], trace["jobs"]["snapshot"]]
+    pr_code_jobs = [trace["jobs"]["snapshot"]]
     for platform in FILTERS:
         assert "id-token" not in full["jobs"][platform]["permissions"]
         pr_code_jobs += [job for job in workflow(platform)["jobs"].values() if "steps" in job]
@@ -621,31 +621,23 @@ def test_build_source_checkout_after_sparse_tooling(tmp_path, monkeypatch):
     assert (runner_temp / "wheel-ci/workflows/build.yml").read_text() == files[".github/workflows/build.yml"]
 
 
-@pytest.mark.parametrize("results,selected,success", [
-    ({"select": "success", "build": "skipped", "h100": "skipped"}, False, True),
-    ({"select": "success", "build": "failure", "h100": "skipped"}, True, False),
-    ({"select": "success", "build": "success", "h100": "failure"}, True, False),
-    ({"select": "success", "build": "success", "h100": "success"}, True, True),
-    ({"select": "failure", "build": "skipped", "h100": "skipped"}, False, False),
-])
-def test_aggregate_gate_rejects_failed_build_and_selected_tests(results, selected, success):
-    import os
-    import sys
-
-    parent = yaml.load((ROOT / ".github/workflows/gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
-    gate = parent["jobs"]["gpu-tests"]
-    assert "always()" in gate["if"]
-    script = gate["steps"][0]["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-    needs = {name: {"result": result} for name, result in results.items()}
-    needs["select"]["outputs"] = {
-        "build": str(selected).lower(), "h100": str(selected).lower(), "b200": "false", "mi350": "false", "cpu": "false"
-    }
-    needs["cpu-tests"] = {"result": "skipped"}
-    for platform in ("b200", "mi350"):
-        needs[platform] = {"result": "skipped"}
-    result = subprocess.run([sys.executable, "-c", script],
-                            env=os.environ | {"NEEDS": json.dumps(needs), "EVENT_NAME": "push"}, capture_output=True)
-    assert (result.returncode == 0) == success, result.stderr.decode()
+def test_final_check_covers_every_job():
+    # The GPU tests check stands for the whole run: a failed or cancelled job anywhere fails it, and skipped jobs
+    # (unselected or turned-off platforms) do not. Realistic breaks: adding a job without listing it in the final
+    # job's needs, or a fail condition that misses one result.
+    import itertools
+    full = yaml.load((ROOT / ".github/workflows/gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
+    final = full["jobs"]["gpu-tests"]
+    assert set(final["needs"]) == set(full["jobs"]) - {"gpu-tests"}
+    fail = next(step for step in final["steps"] if step.get("run") == "exit 1")
+    assert final["steps"].index(fail) == 0
+    owner = {"github.repository_owner": "facebookexperimental"}
+    for results in itertools.product(("success", "skipped", "failure", "cancelled"), repeat=len(final["needs"])):
+        context = owner | {f"needs.{job}.result": result for job, result in zip(final["needs"], results)}
+        assert workflow_condition(final["if"], context)
+        # A step condition sees its job's earlier steps, not the needs, so pass only the result list.
+        failed = workflow_condition(fail["if"], {"needs.*.result": results})
+        assert failed == any(result in ("failure", "cancelled") for result in results)
 
 
 def test_workflows_share_one_build_and_pin_all_checkouts():
@@ -657,9 +649,8 @@ def test_workflows_share_one_build_and_pin_all_checkouts():
     assert sum(job.get("uses") == "./.github/workflows/build.yml" for job in parent["jobs"].values()) == 1
     for platform in FILTERS:
         caller = parent["jobs"][platform]
-        assert caller["needs"] == ["followup", "select", "build"]
-        assert caller["with"]["wheel_url"] == ("${{ fromJSON(needs.followup.outputs.wheel || '{}').url || "
-                                               "needs.build.outputs.wheel_url }}")
+        assert caller["needs"] == ["select", "build"]
+        assert caller["with"]["wheel_url"] == "${{ needs.build.outputs.wheel_url }}"
         child = workflow(platform)
         assert set(child["on"]) == {"workflow_call"}
         assert "concurrency" not in child
@@ -696,7 +687,6 @@ def test_execution_dependencies_keep_full_suites_on_the_gpu(changed):
     from gpu_test_selection import SUITES, test_plan as plan_tests
     suites = json.loads(SUITES.read_text())
     plan = plan_tests(["lib/Analysis/Allocation.cpp", changed], ROOT, FILTERS, suites)
-    assert not plan["cpu"]
     assert plan["gpu"]["b200"]["gluon"]["files"] == ["python/test/gluon"]
     assert plan["gpu"]["mi350"]["gluon"]["files"] == ["python/test/gluon"]
     assert plan["gpu"]["b200"]["codegen"]["files"]
@@ -705,54 +695,9 @@ def test_execution_dependencies_keep_full_suites_on_the_gpu(changed):
 def test_fixture_only_changes_do_not_skip_tests():
     from gpu_test_selection import SUITES, test_plan as plan_tests
     plan = plan_tests(["python/test/conftest.py"], ROOT, FILTERS, json.loads(SUITES.read_text()))
-    assert not plan["cpu"]
     for platform in plan["gpu"].values():
         assert platform["core"]["files"] and platform["correctness"]["files"]
     assert plan["gpu"]["h100"]["runtime"]["files"]
-
-
-def test_cpu_consumers_still_require_the_wheel():
-    from gpu_test_selection import SUITES, test_plan as plan_tests
-    suites = json.loads(SUITES.read_text())
-    suites["reviewed_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    plan = plan_tests(["lib/Analysis/Allocation.cpp"], ROOT, FILTERS, suites)
-    assert plan["cpu"]["codegen"]["files"]
-    assert plan["build"]
-
-
-def test_new_gluon_tests_and_reenabled_files_keep_gpu_coverage(tmp_path):
-    from gpu_test_selection import SUITES, cpu_eligible
-    spec = json.loads(SUITES.read_text())["cpu"]["gluon"]
-    directory = tmp_path / "python/test/gluon"
-    directory.mkdir(parents=True)
-    for path in spec["files"]:
-        (tmp_path / path).write_text("")
-    for filename in spec["gluon_skip_files"]:
-        (directory / filename).write_text("")
-    original = (ROOT / "python/test/gluon/conftest.py").read_text()
-    fixture = directory / "conftest.py"
-    fixture.write_text(original)
-    assert cpu_eligible(["lib/Analysis/Allocation.cpp"], tmp_path, spec)
-    extra = directory / "new_test.py"
-    extra.write_text("")
-    assert not cpu_eligible(["lib/Analysis/Allocation.cpp"], tmp_path, spec)
-    extra.unlink()
-    fixture.write_text(original.replace("collect_ignore = sorted(_VERSION_SKEW_FILES)", "collect_ignore = []"))
-    assert not cpu_eligible(["lib/Analysis/Allocation.cpp"], tmp_path, spec)
-
-
-@pytest.mark.parametrize("result", ["failure", "cancelled", "skipped"])
-def test_cpu_failure_reaches_the_final_check(result):
-    import os
-    import sys
-    parent = yaml.load((ROOT / ".github/workflows/gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
-    script = parent["jobs"]["gpu-tests"]["steps"][0]["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-    needs = {name: {"result": "success"} for name in ("select", "build", "h100", "b200", "mi350")}
-    needs["cpu-tests"] = {"result": result}
-    needs["select"]["outputs"] = {name: "true" for name in ("build", "h100", "b200", "mi350", "cpu")}
-    proc = subprocess.run([sys.executable, "-c", script], env=os.environ | {"NEEDS": json.dumps(needs)},
-                          capture_output=True)
-    assert proc.returncode != 0
 
 
 def test_execution_preserves_the_selected_expression():
@@ -765,69 +710,16 @@ def test_execution_preserves_the_selected_expression():
         command({"files": [], "k": ""}, 1, "results.xml")
 
 
-def test_cpu_routing_cannot_hide_new_gpu_only_skips(tmp_path):
-    from run_selected_tests import check_cpu_skips
-    report = tmp_path / "results.xml"
-    report.write_text('<testsuite><testcase><skipped message="requires a CUDA GPU"/></testcase></testsuite>')
-    with pytest.raises(ValueError, match="Unexpected skip"):
-        check_cpu_skips({"allowed_skips": []}, report)
-    report.write_text('<testsuite><testcase><skipped message="known target limitation"/></testcase></testsuite>')
-    check_cpu_skips({"allowed_skips": ["known target limitation"]}, report)
-
-
-def test_cpu_dependency_changes_remain_invalid_after_commit(tmp_path):
-    from gpu_test_selection import reviewed_changes
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    helper = tmp_path / "helper.py"
-    helper.write_text("value = 1\n")
-    subprocess.run(["git", "add", "helper.py"], cwd=tmp_path, check=True)
-    commit = ["git", "-c", "user.name=CI", "-c", "user.email=ci@example.invalid", "commit", "-qm", "test"]
-    subprocess.run(commit, cwd=tmp_path, check=True)
-    reviewed = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=tmp_path, text=True).strip()
-    assert reviewed_changes(tmp_path, reviewed, ["helper.py"]) == []
-    helper.write_text("value = 2\n")
-    subprocess.run(["git", "add", "helper.py"], cwd=tmp_path, check=True)
-    subprocess.run(commit, cwd=tmp_path, check=True)
-    assert reviewed_changes(tmp_path, reviewed, ["helper.py"]) == ["helper.py"]
-
-
-def test_cpu_eligibility_rejects_an_overridden_ignore_policy(tmp_path):
-    from gpu_test_selection import SUITES, cpu_eligible
-    spec = json.loads(SUITES.read_text())["cpu"]["gluon"]
-    directory = tmp_path / "python/test/gluon"
-    directory.mkdir(parents=True)
-    for path in spec["files"]:
-        (tmp_path / path).write_text("")
-    for name in spec["gluon_skip_files"]:
-        (directory / name).write_text("")
-    source = (ROOT / "python/test/gluon/conftest.py").read_text()
-    (directory / "conftest.py").write_text(source + "\ncollect_ignore = []\n")
-    assert not cpu_eligible(["lib/Analysis/Allocation.cpp"], tmp_path, spec)
-
-
-@pytest.mark.parametrize("paths,offload,placement,gpu_jobs,reason", [
-    (["lib/Analysis/Allocation.cpp"], True, "CPU", 6, "match the CPU audit"),
-    (["python/triton/runtime/jit.py"], True, "GPU", 6, "current diff changes Python"),
-    (["README.md"], True, "Not selected", 0, "No work for this suite"),
-    (["lib/Analysis/Allocation.cpp"], False, "GPU", 6, "CPU offload is disabled"),
-])
-def test_run_summary_explains_actual_placement(paths, offload, placement, gpu_jobs, reason):
+@pytest.mark.parametrize("paths,gpu_jobs", [(["lib/Analysis/Allocation.cpp"], 6), (["README.md"], 0)])
+def test_run_summary_explains_actual_placement(paths, gpu_jobs):
     from gpu_test_selection import SUITES, selection_summary, test_plan as plan_tests
-    suites = json.loads(SUITES.read_text())
-    suites["reviewed_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    suites["cpu"]["gluon"]["dependencies"].append("lib/")
-    plan = plan_tests(paths, ROOT, FILTERS, suites, offload=offload)
-    summary = selection_summary(plan, suites, "tested-sha", "Selection note")
+    plan = plan_tests(paths, ROOT, FILTERS, json.loads(SUITES.read_text()))
+    summary = selection_summary(plan, "tested-sha", "Selection note")
     assert f"Planned GPU jobs: {gpu_jobs}." in summary
-    assert f"| codegen | {placement} |" in summary
-    assert reason in summary and "Selection note" in summary
+    assert "Selection note" in summary
     assert "Selected commit: `tested-sha`." in summary
     assert "Tested commit:" not in summary
     assert "not collected test cases" in summary
-    for name in suites["cpu"]["gluon"]["gluon_skip_files"]:
-        assert f"`{name}`" in summary
-    assert "does not introduce these exclusions" in summary
-    assert "not a new skip decision" in summary
 
 
 def test_unreadable_kernel_test_retains_full_coverage(tmp_path):
@@ -840,71 +732,52 @@ def test_unreadable_kernel_test_retains_full_coverage(tmp_path):
     assert plan["correctness_mode"] == "all"
 
 
-@pytest.mark.parametrize("policy", [None, "def broken(", "_VERSION_SKEW_FILES = unknown"])
-def test_unreadable_gluon_audit_only_blocks_gluon_cpu_placement(tmp_path, policy):
-    from gpu_test_selection import SUITES, cpu_ineligible_reason
-    suites = json.loads(SUITES.read_text())
-    spec = suites["cpu"]["gluon"]
-    directory = tmp_path / "python/test/gluon"
-    directory.mkdir(parents=True)
-    for path in spec["files"]:
-        (tmp_path / path).write_text("")
-    for name in spec["gluon_skip_files"]:
-        (directory / name).write_text("")
-    if policy is not None:
-        (directory / "conftest.py").write_text(policy)
-    assert cpu_ineligible_reason(["lib/Analysis/Allocation.cpp"], tmp_path, spec) is not None
-    assert cpu_ineligible_reason(["lib/Analysis/Allocation.cpp"], tmp_path, suites["cpu"]["codegen"]) is None
-
-
 def workflow_condition(expression, context):
     import re
     expression = expression.removeprefix('${{').removesuffix('}}').strip()
     has_status = 'cancelled()' in expression or 'always()' in expression
-    if not has_status and any(value != 'success' for key, value in context.items() if key.endswith('.result')):
+    if not has_status and any(
+            value != 'success' for key, value in context.items() if key.endswith('.result') and isinstance(value, str)):
         return False
     expression = expression.replace('!cancelled()', str(not context.get('cancelled', False)))
     expression = expression.replace('always()', 'True').replace('&&', ' and ').replace('||', ' or ')
+    expression = re.sub(r"contains\(needs\.\*\.result, '(\w+)'\)",
+                        lambda match: repr(match.group(1) in context['needs.*.result']), expression)
+    expression = re.sub(r"contains\(vars\.(\w+), '(\w+)'\)",
+                        lambda match: repr(match.group(2) in context.get('vars.' + match.group(1), '')), expression)
+    expression = re.sub(r'!(?!=)', ' not ', expression)
     expression = re.sub(
         r'(github\.(?:event_name|repository_owner|event\.[\w.]+)|(?:needs|steps)\.[\w-]+\.(?:result|outputs\.[\w]+))',
         lambda match: repr(context[match.group()]), expression)
     return eval(expression, {'__builtins__': {}}, {})
 
 
-def test_standalone_full_build_ignores_skipped_pr_followup():
+def test_build_runs_only_for_successful_selection():
     full = yaml.load((ROOT / '.github/workflows/gpu-tests.yml').read_text(), Loader=yaml.BaseLoader)
     build = full['jobs']['build']
-    context = {
-        'needs.followup.result': 'skipped',
-        'needs.select.result': 'success',
-        'needs.select.outputs.build': 'true',
-    }
-    for event in ('push', 'schedule', 'workflow_dispatch'):
-        run = context | {'github.event_name': event}
+    for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+        run = {'github.event_name': event, 'needs.select.result': 'success', 'needs.select.outputs.build': 'true'}
         assert workflow_condition(build['if'], run)
         assert not workflow_condition(build['if'], run | {'needs.select.outputs.build': 'false'})
         assert not workflow_condition(build['if'], run | {'needs.select.result': 'failure'})
-        assert not workflow_condition(build['if'], run | {'cancelled': True})
-    assert not workflow_condition(build['if'], context | {'github.event_name': 'workflow_run'})
 
 
-def test_full_tests_follow_only_a_verified_current_fast_run():
-    # Fast correctness stays one quick run with one head build. GPU full tests start only from its success
-    # (workflow_run), test only after the producer is verified current, and never rebuild the head.
+def test_gpu_tests_run_on_the_change_and_feed_the_codegen_trace():
+    # GPU tests run on the PR itself, so every platform is a check on the PR. The codegen trace follows a
+    # successful run and only after verifying it. Realistic break: making GPU tests depend on another workflow again.
     def workflow(name):
         return yaml.load((ROOT / f'.github/workflows/{name}.yml').read_text(), Loader=yaml.BaseLoader)
 
-    fast, full, trace, followup = (workflow(name)
-                                   for name in ('fast-gpu-tests', 'gpu-tests', 'tlx-codegen-trace', '_fast-followup'))
-    calls = [job.get('uses') for job in fast['jobs'].values()]
-    assert calls.count('./.github/workflows/build.yml') == 1
-    assert not {'./.github/workflows/gpu-tests.yml', './.github/workflows/tlx-codegen-trace.yml'} & set(calls)
-    assert full['on']['workflow_run'] == {'workflows': [fast['name']], 'types': ['completed']}
-    assert trace['on']['workflow_run'] == {'workflows': [fast['name']], 'types': ['completed']}
-    event = {'github.event_name': 'workflow_run', 'github.event.action': 'completed'}
-    assert workflow_condition(full['jobs']['followup']['if'], event)
-    assert not workflow_condition(full['jobs']['followup']['if'], event | {'github.event.action': 'in_progress'})
-    assert 'concurrency' not in full
+    full, trace, followup = (workflow(name) for name in ('gpu-tests', 'tlx-codegen-trace', '_fast-followup'))
+    assert set(full['on']) == {'pull_request', 'push', 'schedule', 'workflow_dispatch'}
+    assert full['on']['push']['branches'] == ['main']
+    assert trace['on']['workflow_run'] == {'workflows': [full['name']], 'types': ['completed']}
+    # The run the trace follows must publish the manifest the trace looks for, without adding a PR check.
+    manifest = [
+        job for job in full['jobs'].values()
+        if any('fast_followup.py manifest' in step.get('run', '') for step in job.get('steps', []))
+    ]
+    assert manifest == [full['jobs']['gpu-tests']]
     produced = {'github.event.workflow_run.conclusion': 'success', 'github.event.workflow_run.event': 'pull_request'}
     assert workflow_condition(followup['jobs']['verify']['if'], produced)
     for change in ({'github.event.workflow_run.conclusion':
@@ -915,57 +788,28 @@ def test_full_tests_follow_only_a_verified_current_fast_run():
         context = run | {
             'needs.followup.result': 'success' if status else 'skipped', 'needs.followup.outputs.status': status
         }
-        assert workflow_condition(full['jobs']['select']['if'], context) == (status == 'ok')
         assert workflow_condition(trace['jobs']['resolve']['if'], context) == (status == 'ok')
-        assert workflow_condition(full['jobs']['gpu-tests']['if'], context) == (status == 'ok')
-    failed = run | {'needs.followup.result': 'failure', 'needs.followup.outputs.status': ''}
-    assert workflow_condition(full['jobs']['gpu-tests']['if'], failed)  # a failed verification fails the aggregate
-    push = {
-        'github.event_name': 'push', 'github.repository_owner': 'facebookexperimental', 'needs.followup.result':
-        'skipped', 'needs.followup.outputs.status': ''
-    }
-    assert workflow_condition(full['jobs']['select']['if'], push)
-    assert not workflow_condition(full['jobs']['build']['if'],
-                                  run | {'needs.select.outputs.build': 'true', 'needs.select.result': 'success'})
-    assert full['jobs']['b200']['if'] == '${{ false }}'
-    for platform in ('h100', 'mi350', 'cpu'):
-        worker = full['jobs']['cpu-tests' if platform == 'cpu' else platform]
-        context = run | {
-            'needs.select.result': 'success', 'needs.build.result': 'skipped', f'needs.select.outputs.{platform}':
-            'true'
-        }
-        assert workflow_condition(worker['if'], context)
-        assert not workflow_condition(worker['if'], context | {'needs.select.result': 'skipped'})
-        assert not workflow_condition(worker['if'], context | {'cancelled': True})
 
 
-@pytest.mark.parametrize('fork,url,valid', [(False, 'https://example.org/w.whl', True), (False, '', False),
-                                            (True, '', True)])
-def test_shared_full_wheel_validates_source_and_fork_artifact_identity(fork, url, valid):
-    import os
-    import sys
+@pytest.mark.parametrize('skip', ['', 'h100', 'b200', 'mi350', 'b200,mi350', 'h100, b200', 'h100,b200,mi350'])
+def test_platform_skip_variable_stops_only_named_platforms(skip):
+    # GPU_CI_SKIP_PLATFORMS stops the platforms it names and leaves every other selected platform running.
+    # Realistic breaks: one shared condition, or a name check that matches another platform.
     full = yaml.load((ROOT / '.github/workflows/gpu-tests.yml').read_text(), Loader=yaml.BaseLoader)
-    step = next(s for s in full['jobs']['select']['steps'] if s.get('name') == 'Validate shared wheel source')
-    source = step['run'].split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
-    wheel = {'identity': {'sha': 'a' * 40}, 'url': url, 'filename': 'fbtriton.whl', 'sha256': 'b' * 64}
-    env = os.environ | {'EXPECTED': 'a' * 40, 'IS_FORK_PR': str(fork).lower(), 'REASON': 'no wheel'}
-
-    def run(**changes):
-        return subprocess.run([sys.executable, '-c', source], env=env | {'WHEEL': json.dumps(wheel | changes)},
-                              capture_output=True).returncode
-
-    assert (run() == 0) == valid
-    assert run(identity={'sha': 'c' * 40}) != 0
-    assert run(sha256='') != 0
-    assert run(filename='') != 0
-    assert subprocess.run([sys.executable, '-c', source], env=env | {'WHEEL': ''}).returncode != 0
-    assert not workflow_condition(step['if'],
-                                  {'github.event_name': 'workflow_run', 'steps.select.outputs.build': 'false'})
+    named = {item.strip() for item in skip.split(',') if item.strip()}
+    for platform in ('h100', 'b200', 'mi350'):
+        context = {
+            'needs.select.result': 'success', 'needs.build.result': 'success', f'needs.select.outputs.{platform}':
+            'true', 'vars.GPU_CI_SKIP_PLATFORMS': skip
+        }
+        assert workflow_condition(full['jobs'][platform]['if'], context) == (platform not in named)
+        unselected = context | {f'needs.select.outputs.{platform}': 'false'}
+        assert not workflow_condition(full['jobs'][platform]['if'], unselected)
 
 
-def test_fast_automatic_runs_are_pr_only():
+def test_fast_runs_only_on_manual_dispatch():
     workflow = yaml.load((ROOT / ".github/workflows/fast-gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
-    assert set(workflow["on"]) == {"pull_request", "workflow_dispatch"}
+    assert set(workflow["on"]) == {"workflow_dispatch"}
 
 
 @pytest.mark.parametrize("paths,expected", [
@@ -1344,7 +1188,8 @@ def test_manual_platform_allowlist_preserves_requested_work(tmp_path, script, re
             assert "Other platforms are not covered" in summary.read_text()
     normal, limited = outputs
     assert normal['b200'] == limited['b200'] == 'false'
-    for platform in ("h100", "b200", "mi350", "cpu"):
+    workers = ("h100", "b200", "mi350", "cpu") if script == "fast_tests.py" else ("h100", "b200", "mi350")
+    for platform in workers:
         plan = json.loads(limited[f"{platform}_plan"])
         if platform in requested.split(","):
             assert limited[platform] == normal[platform]
@@ -1355,5 +1200,38 @@ def test_manual_platform_allowlist_preserves_requested_work(tmp_path, script, re
                 assert not plan["baseline"] and not plan["touched"]
             else:
                 assert all(not suite["files"] for suite in plan.values())
-    assert (limited["build"] == "true") == any(limited[platform] == "true"
-                                               for platform in ("h100", "b200", "mi350", "cpu"))
+    assert (limited["build"] == "true") == any(limited[platform] == "true" for platform in workers)
+
+
+def test_trigger_skips_only_paths_selection_skips_everywhere():
+    # A change that does not start the workflow can never be tested, so the trigger may skip only paths the selector
+    # skips on every platform. Realistic break: a trigger rule that skips a path some platform's rules re-include,
+    # such as a README inside a test action.
+    from gpu_test_selection import matches
+    full = yaml.load((ROOT / '.github/workflows/gpu-tests.yml').read_text(), Loader=yaml.SafeLoader)
+    trigger = full[True]['pull_request']['paths']
+    assert full[True]['push']['paths'] == trigger
+
+    def included(path, rules):
+        result = False
+        for rule in rules:
+            if matches(path, rule.removeprefix('!')):
+                result = not rule.startswith('!')
+        return result
+
+    def witnesses(rule):
+        pattern = rule.removeprefix('!')
+        concrete = pattern.replace('**/', 'd/').replace('**', 'd/e').replace('*', 'w')
+        directory = pattern.split('*')[0].rstrip('/')
+        found = {concrete}
+        for leaf in ('README.md', 'notes.md', 'x.py', 'x.mlir'):
+            found.add(f'{directory}/{leaf}' if directory else leaf)
+        return found
+
+    rules = trigger + [rule for patterns in FILTERS.values() for rule in patterns]
+    paths = {path for rule in rules for path in witnesses(rule)}
+    paths |= set(subprocess.check_output(['git', 'ls-files'], cwd=ROOT, text=True).splitlines())
+    skipped = sorted(path for path in paths if not included(path, trigger))
+    assert skipped, 'the trigger skips nothing'
+    for path in skipped:
+        assert not any(included(path, patterns) for patterns in FILTERS.values()), f'trigger skips selected {path}'

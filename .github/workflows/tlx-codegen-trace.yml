@@ -6,16 +6,16 @@ name: TLX codegen trace
 # stats (regs/smem/spills), and posts the verdict with TTGIR and PTX diffs as
 # a PR comment. Advisory only -- posts, never blocks. Deterministic, no GPU.
 #
-# A pull request's trace starts when its Fast correctness run succeeds (workflow_run) and runs on the default
-# branch: the PR's test merge commit and head wheel come from _fast-followup.yml's verification. Jobs that run PR
+# A pull request's trace starts when its GPU tests run succeeds (workflow_run) and runs on the default branch:
+# the PR's test merge commit and head wheel come from _fast-followup.yml's verification. Jobs that run PR
 # code or its wheel get read-only tokens; a separate job without PR code posts the comment.
 run-name: >-
-  ${{ github.event_name == 'workflow_run' && format('TLX codegen trace for Fast run {0} attempt {1} (PR head {2})',
+  ${{ github.event_name == 'workflow_run' && format('TLX codegen trace for GPU tests run {0} attempt {1} (PR head {2})',
   github.event.workflow_run.id, github.event.workflow_run.run_attempt, github.event.workflow_run.head_sha) || '' }}
 
 on:
   workflow_run:
-    workflows: [Fast Triton correctness]
+    workflows: [Meta Triton GPU Tests]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -145,7 +145,7 @@ jobs:
           if-no-files-found: ignore
 
   build-head:
-    # Manual runs only. A follow-up never builds PR code; without Fast correctness's head wheel it reports no signal.
+    # Manual runs only. A follow-up never builds PR code; without the GPU tests run's head wheel it reports no signal.
     needs: resolve
     if: github.event_name == 'workflow_dispatch' && needs.resolve.outputs.head != ''
     permissions:
