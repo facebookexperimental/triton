@@ -320,6 +320,16 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="norm_residual_norm",
+        arch="gfx950",
+        variant="row_per_program",
+        impl="triton.tlx.ops.kernels.fused.norm_residual_norm.gfx950:norm_residual_norm",
+        dtypes=_BF16,
+        # One 8-wave program holds the row in registers as 8-element lanes over 4096-element chunks, in one
+        # tl.arange, so H must be a power of two.
+        accepts=lambda d: d["H"] in (4096, 8192, 16384),
+    ),
+    OpSpec(
         op="moe",
         arch="gfx950",
         variant="heuristic",

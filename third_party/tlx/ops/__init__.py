@@ -121,12 +121,13 @@ from ._normalization import (
 
 __all__ = [
     "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
-    "moe_routing", "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8",
-    "flash_attn_varlen", "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn",
-    "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
-    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "paged_attention_decode",
-    "paged_attention_prefill", "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d",
-    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "moe_routing", "norm_residual_norm", "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn",
+    "flash_attn_mxfp8", "flash_attn_varlen", "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn",
+    "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
+    "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward",
+    "paged_attention_decode", "paged_attention_prefill", "paged_attention_decode_workspace",
+    "allocate_paged_kv_cache_5d", "reshape_and_cache_5d", "UnsupportedOp", "UnsupportedBackward", "InvalidInput",
+    "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -841,6 +842,68 @@ def moe_routing(router_logits, correction_bias, topk=8, *, router_multiplier=1.0
     _check_enforced("moe_routing", spec, invariance)
     with torch.cuda.device(router_logits.device):
         return fn(router_logits, correction_bias, topk, router_multiplier, route_scale, eps, num_valid_tokens, out)
+
+
+def norm_residual_norm(stream, branch, *, post_weight=None, post_norm_input_scale=False, pre_weight=None, alpha=None,
+                       beta=None, post_eps=1e-6, pre_eps=1e-6, pre_norm_bf16=False, out=None, new_stream=None,
+                       space=None):
+    """One residual-stream boundary: RMSNorm the branch, add it to the stream, RMSNorm the new stream. Forward only.
+
+    With ``p = branch`` (BF16, upcast) and ``w_post = post_weight``:
+    ``y = bf16(rmsnorm(p) * w_post)``, or with ``post_norm_input_scale`` ``y = bf16(rmsnorm(bf16(p * w_post)))``;
+    ``new_stream = alpha * stream + beta * y`` (``stream + y`` without a gate), in FP32;
+    ``out = bf16(rmsnorm(q) * pre_weight)`` with ``q = new_stream``, or ``bf16(new_stream)`` with ``pre_norm_bf16``.
+    Each RMSNorm is ``x * rsqrt(mean(x * x) + eps)`` in FP32; a missing weight is the identity.
+
+    Shapes: ``stream`` FP32 and ``branch`` BF16 ``(T, H)``, contiguous; ``post_weight``/``pre_weight`` BF16 ``(H,)``;
+    ``alpha``/``beta`` FP32 ``(H,)`` or ``(1,)``, both or neither. Returns ``(out, new_stream)``, BF16 and FP32
+    ``(T, H)``, filling the given buffers when passed. ``H`` must be 4096, 8192 or 16384.
+    Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    if not isinstance(stream, torch.Tensor) or not isinstance(branch, torch.Tensor):
+        raise InvalidInput("tlx.ops.norm_residual_norm expects tensor stream and branch")
+    if (stream.ndim != 2 or stream.shape != branch.shape or stream.dtype != torch.float32
+            or branch.dtype != torch.bfloat16 or not stream.is_contiguous() or not branch.is_contiguous()):
+        raise InvalidInput("tlx.ops.norm_residual_norm expects contiguous FP32 stream and BF16 branch of one "
+                           f"(T, H) shape; got {tuple(stream.shape)} {stream.dtype} and {tuple(branch.shape)} "
+                           f"{branch.dtype}")
+    T, H = branch.shape
+    for name, w in (("post_weight", post_weight), ("pre_weight", pre_weight)):
+        if w is not None and (not isinstance(w, torch.Tensor) or w.shape != (H, ) or w.dtype != torch.bfloat16
+                              or not w.is_contiguous()):
+            raise InvalidInput(f"tlx.ops.norm_residual_norm expects a contiguous BF16 {name} of shape ({H},)")
+    if (alpha is None) != (beta is None):
+        raise InvalidInput("tlx.ops.norm_residual_norm expects alpha and beta together")
+    if alpha is not None and any(not isinstance(g, torch.Tensor) or g.shape not in (
+        (H, ), (1, )) or g.dtype != torch.float32 or not g.is_contiguous() or g.shape != alpha.shape
+                                 for g in (alpha, beta)):
+        raise InvalidInput(f"tlx.ops.norm_residual_norm expects contiguous FP32 alpha and beta of shape ({H},) "
+                           "or (1,)")
+    inputs = tuple(t for t in (stream, branch, post_weight, pre_weight, alpha, beta) if t is not None)
+    outputs = []
+    for name, buf, dtype in (("out", out, torch.bfloat16), ("new_stream", new_stream, torch.float32)):
+        if buf is None:
+            continue
+        if not isinstance(buf, torch.Tensor) or buf.shape != (T, H) or buf.dtype != dtype or not buf.is_contiguous():
+            raise InvalidInput(f"tlx.ops.norm_residual_norm expects a contiguous {dtype} {name} of shape "
+                               f"({T}, {H})")
+        if any(torch._C._overlaps(buf, t) for t in (*inputs, *outputs)):
+            raise InvalidInput(f"tlx.ops.norm_residual_norm {name} must not alias an input or output")
+        outputs.append(buf)
+    if any(t.device != branch.device for t in (*inputs, *outputs)):
+        raise InvalidInput("tlx.ops.norm_residual_norm expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("norm_residual_norm", space)
+    _check_single_config_space("norm_residual_norm", space_name)
+    fn, spec = impl_for("norm_residual_norm", device=branch.device)
+    check_inputs(spec, dtype=branch.dtype, H=H)
+    check_backward(spec, *inputs, *outputs)
+    _check_enforced("norm_residual_norm", spec, invariance)
+    with torch.cuda.device(branch.device):
+        return fn(stream, branch, post_weight, bool(post_norm_input_scale), pre_weight, alpha, beta, post_eps, pre_eps,
+                  bool(pre_norm_bf16), out, new_stream)
 
 
 def addmm(input, a, b, *, out=None, space=None):

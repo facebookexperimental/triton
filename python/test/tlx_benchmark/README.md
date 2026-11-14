@@ -16,8 +16,9 @@ python python/test/tlx_benchmark/bench_{op}.py
 `kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, or one of the
 fused operators below.
 
-Fused operators fuse an elementwise epilogue into a GEMM (`tlx/ops/kernels/fused/`): `addmm_mul_add`,
-`linear_rowscale`.
+Fused operators (`tlx/ops/kernels/fused/`) run steps that would otherwise be separate kernels in one launch:
+`addmm_mul_add` and `linear_rowscale` fuse an elementwise epilogue into a GEMM, and `norm_residual_norm`
+fuses the post-norm, gated residual add and pre-norm of a residual-stream boundary.
 
 ```
 options:
@@ -79,6 +80,7 @@ options:
 |----|-----------|------|---------------|
 | `addmm_mul_add` | `torch.addmm` + `torch.addcmul` | speedup >= 0.9x | heuristic |
 | `linear_rowscale` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
+| `norm_residual_norm` | `torch.compile` of the unfused module sequence | speedup >= 0.9x | heuristic |
 
 The direct `mm` provider has a `heuristic_config`, so its default is a single
 analytically chosen config. The TorchTLX providers use Inductor's template
