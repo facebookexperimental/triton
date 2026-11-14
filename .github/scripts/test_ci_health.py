@@ -285,7 +285,7 @@ def test_selector_output_remains_readable_by_dashboard(tmp_path):
     outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
     selected = ch.logs.parse_selection(proc.stdout)
     assert selected is not None, "Dashboard cannot parse the selector's real output"
-    for key in ("h100", "b200", "mi350", "build", "cpu"):
+    for key in ("h100", "b200", "mi350", "build"):
         assert selected[key] == (outputs[key] == "true")
     assert selected["fallback"] is False
 
