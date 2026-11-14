@@ -1605,8 +1605,8 @@ def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
     if num_kv_heads == 0 or q.shape[1] % num_kv_heads:
         raise InvalidInput(f"{name}: {num_kv_heads} KV heads must divide {q.shape[1]} query heads")
     for arg, value in (("max_seqlen_q", max_seqlen_q), ("max_seqlen_k", max_seqlen_k)):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise InvalidInput(f"{name} expects a non-negative int {arg}; got {value!r}")
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**31:
+            raise InvalidInput(f"{name} expects an int {arg} in [0, 2**31); got {value!r}")
     if not 0 < softmax_scale < math.inf:
         raise InvalidInput(f"{name} expects a positive finite softmax_scale; got {softmax_scale!r}")
     if len(window_size) != 2 or not (tuple(window_size) == (-1, -1) or (window_size[0] >= 0 and window_size[1] == 0)):

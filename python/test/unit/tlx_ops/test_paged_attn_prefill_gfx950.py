@@ -161,7 +161,10 @@ def test_rejects_invalid_inputs():
         dict(window_size=(4, 4)),
         dict(window_size=(-2, 0)),
         dict(max_seqlen_k=-1),
+        dict(max_seqlen_k=2**31),
     ]
     for override in bad:
         with pytest.raises(InvalidInput):
             _prefill(inputs, 8, **override)
+    with pytest.raises(InvalidInput):
+        _prefill(inputs, 2**31)
