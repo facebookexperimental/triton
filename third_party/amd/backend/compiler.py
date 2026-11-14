@@ -463,7 +463,11 @@ class HIPBackend(BaseBackend):
         # Late AMD passes can reintroduce dot-operand layout conversions as
         # tensor local_alloc/local_load pairs. Run TLX propagation after
         # canonicalization so the final cleanup sees and folds those fallbacks.
-        tlx.tlx_passes.add_tlx_propagate_layout(pm)
+        # Plain Triton keeps ReduceDataDuplication's staging, as legacy Triton
+        # does: its swizzled read beats a shared-memory convert_layout.
+        tlx.tlx_passes.add_tlx_propagate_layout(pm, only_hand_placed_lds=True)
+        # The staging plain Triton keeps can overflow LDS.
+        amd.passes.ttgpuir.add_fold_lds_staging_over_budget(pm, options.arch)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         # Consume tlx.warp_pipeline_stage border markers (rocdl.sched.barrier with
