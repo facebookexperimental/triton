@@ -306,9 +306,13 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     # rotate sequences between head/split planes to avoid repeated length order.
     # Keep partial groups of 16 sequences in their original order: adjacent
     # heads can otherwise concentrate the final long sequence on one engine.
-    reorder = query_length > 1 and window == 0 and batch >= 16
-    head_first = reorder and kv_heads >= 16 and batch % 16 == 0
-    rotate = reorder and kv_heads < 16 and batch * kv_heads >= 128
+    reorder = batch >= 16
+    # Windowed head-first dispatch needs enough groups to amortize its cost.
+    head_first = reorder and kv_heads >= 16 and batch % 16 == 0 and (window == 0 or batch * kv_heads >= 512)
+    # Short q1 windows and incomplete batch groups benefit from the original
+    # order; speculative queries have more work to hide the rotation overhead.
+    rotate = (reorder and kv_heads < 16 and batch * kv_heads >= 128
+              and (query_length > 1 or (window == 0 and batch % 16 == 0)))
     grid = (kv_heads, batch, splits) if head_first else (batch, kv_heads, splits)
     _partition[grid](query, key_cache, value_cache, block_tables, context_lens, partial, stats,
                      out, query_length, block_tables.shape[1], splits, 64,
