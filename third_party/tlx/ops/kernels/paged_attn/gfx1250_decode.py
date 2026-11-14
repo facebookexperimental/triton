@@ -74,24 +74,44 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
                                       clamp_bounds=False, cache_modifier=".cs" if PACKED else "")
         tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 0), [(physical * KH + h) * (8 if PACKED else 64), 0],
                                       clamp_bounds=False, cache_modifier=".cs" if PACKED else "")
+    # Keep the original unsplit q_len=7 schedule: earlier prefetch regresses
+    # some uneven and large windowed batches.
+    EARLY: tl.constexpr = QLEN != 7 or NS != 1
     for base in range(first, end, BN):
         pos = base + n
         slot = ((base - first) // BN) % 2
+        if EARLY:
+            next_phys = 0
+            if base + BN < end:
+                next_phys = tl.load(Table + b.to(tl.int64) * TS + (base + BN) // 64)
         tlx.async_amd_descriptor_wait(0)
-        if PACKED and QLEN > 1:
-            kr = _load_packed_operand(kb, slot, LAYOUT)
-        elif PACKED:
-            kr = tlx.local_load(tlx.local_view(kb, slot), layout=REG, relaxed=True)
+        if EARLY:
+            # Complete all previous-stage consumers before refilling it.
+            # Adjacent waits can share their synchronization.
+            tlx.workgroup_barrier()
         else:
-            kr = tlx.local_load(tlx.local_view(kb, slot), relaxed=True)
+            if PACKED and QLEN > 1:
+                kr = _load_packed_operand(kb, slot, LAYOUT)
+            elif PACKED:
+                kr = tlx.local_load(tlx.local_view(kb, slot), layout=REG, relaxed=True)
+            else:
+                kr = tlx.local_load(tlx.local_view(kb, slot), relaxed=True)
         if base + BN < end:
-            next_phys = tl.load(Table + b.to(tl.int64) * TS + (base + BN) // 64)
+            if not EARLY:
+                next_phys = tl.load(Table + b.to(tl.int64) * TS + (base + BN) // 64)
             tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 1 - slot),
                                           [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False,
                                           cache_modifier=".cs" if PACKED else "")
             tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 1 - slot),
                                           [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False,
                                           cache_modifier=".cs" if PACKED else "")
+        if EARLY:
+            if PACKED and QLEN > 1:
+                kr = _load_packed_operand(kb, slot, LAYOUT)
+            elif PACKED:
+                kr = tlx.local_load(tlx.local_view(kb, slot), layout=REG, relaxed=True)
+            else:
+                kr = tlx.local_load(tlx.local_view(kb, slot), relaxed=True)
         if PACKED and QLEN > 1:
             k = kr
         elif PACKED:
@@ -127,8 +147,9 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
             v = tl.reshape(tl.permute(tl.reshape(vr, (8, 64, 8)), (0, 2, 1)), (64, 64))
         else:
             v = vr
-        # Both K and V reads must finish before this stage can be refilled.
-        tlx.workgroup_barrier()
+        if not EARLY:
+            # The next iteration may refill this stage after all reads finish.
+            tlx.workgroup_barrier()
         if PACKED and QLEN > 1:
             needs_v_mask = base + BN > length
             if WINDOW:
