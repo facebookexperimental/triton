@@ -27,7 +27,7 @@ def _prepare(inputs, query_length=1, window=0, max_context_len=None, out=None):
     return out, workspace, lambda: paged_attention_decode(*inputs, **kwargs)
 
 
-@pytest.mark.parametrize("query_length", [1, 8])
+@pytest.mark.parametrize("query_length", [1, 7, 8])
 @pytest.mark.parametrize("packed", [False, True], ids=["4d", "5d"])
 @pytest.mark.parametrize("window", [0, 1, 63, 2048])
 @pytest.mark.parametrize("kv_heads", [2, 4, 16])
@@ -58,7 +58,7 @@ def test_boundaries_and_poison(query_length, packed, window, kv_heads):
     assert torch.all(storage[:16] == 37) and torch.all(storage[-16:] == 37)
 
 
-@pytest.mark.parametrize("query_length", [1, 8])
+@pytest.mark.parametrize("query_length", [1, 7, 8])
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("case", ["zero", "peaky", "negative", "offset", "cancellation"])
 def test_split_numerics(query_length, packed, case):
@@ -88,12 +88,14 @@ def test_split_numerics(query_length, packed, case):
         torch.testing.assert_close(actual[-1].double(), expected[-1], atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("query_length", [1, 8])
+@pytest.mark.parametrize("query_length", [1, 7, 8])
 @pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("window", [0, 63, 2048])
-@pytest.mark.parametrize("kv_heads", [2, 16])
-def test_graph_updates_and_independent_streams(query_length, packed, window, kv_heads):
-    batch, capacity = 33, 4099
+@pytest.mark.parametrize("window", [0, 63, 2048, 4099])
+@pytest.mark.parametrize("batch,kv_heads", [(65, 2), (32, 16), (33, 16)])
+def test_graph_updates_and_independent_streams(query_length, packed, window, batch, kv_heads):
+    # Exercise sequence rotation, adjacent-head dispatch, and irregular batches.
+    # A full-context window must use the same plan as global attention.
+    capacity = 4099
     inputs = make_inputs([capacity] * batch, query_length, kv_heads=kv_heads)
     q, k, v, lengths, table = inputs
     out, workspace, run = _prepare(_cache(inputs, packed), query_length, window, capacity)
@@ -131,7 +133,7 @@ def test_graph_updates_and_independent_streams(query_length, packed, window, kv_
     assert_close(out2, expected)
 
 
-@pytest.mark.parametrize("query_length", [1, 8])
+@pytest.mark.parametrize("query_length", [1, 7, 8])
 @pytest.mark.parametrize("scale", [0.0625, 0.5])
 def test_scale_and_no_grad(query_length, scale):
     inputs = make_inputs([129, 4099], query_length)
@@ -187,7 +189,7 @@ def test_invalid_inputs_and_workspace():
         paged_attention_decode(*inputs, out=alias_out, workspace=(bad[0], workspace[1]))
 
 
-@pytest.mark.parametrize("query_length", [1, 8])
+@pytest.mark.parametrize("query_length", [1, 7, 8])
 @pytest.mark.parametrize("packed", [False, True])
 def test_single_partition_and_empty_context(query_length, packed):
     inputs = _cache(make_inputs([0, 1, 63], query_length), packed)
@@ -202,7 +204,7 @@ def test_single_partition_and_empty_context(query_length, packed):
     assert torch.count_nonzero(out) == 0
 
 
-@pytest.mark.parametrize("query_length", [1, 8])
+@pytest.mark.parametrize("query_length", [1, 7, 8])
 @pytest.mark.parametrize("packed", [False, True])
 def test_int32_context_boundary(query_length, packed):
     limit = 2**31 - 32768

@@ -656,7 +656,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="split_k_wmma",
         impl="triton.tlx.ops.kernels.paged_attn.gfx1250_decode:paged_attention_decode",
         dtypes=_BF16,
-        accepts=lambda d: d["HEAD_DIM"] == 64 and d["QLEN"] in (1, 8) and d["GROUP"] == 8,
+        accepts=lambda d: d["HEAD_DIM"] == 64 and d["QLEN"] in (1, 7, 8) and d["GROUP"] == 8,
     ),
     OpSpec(
         op="paged_attention_decode_workspace",

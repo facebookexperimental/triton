@@ -24,10 +24,15 @@ def _dot(a, b, c, LAYOUT: tl.constexpr):
 @triton.jit
 def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS: tl.constexpr, NS: tl.constexpr,
                BN: tl.constexpr, BM: tl.constexpr, WINDOW: tl.constexpr, PACKED: tl.constexpr, LAYOUT: tl.constexpr,
-               SCALE: tl.constexpr, NP: tl.constexpr, REG: tl.constexpr, KH: tl.constexpr):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
+               SCALE: tl.constexpr, NP: tl.constexpr, REG: tl.constexpr, KH: tl.constexpr, ROTATE: tl.constexpr,
+               BATCH: tl.constexpr, HEAD_FIRST: tl.constexpr):
+    b = tl.program_id(1) if HEAD_FIRST else tl.program_id(0)
+    h = tl.program_id(0) if HEAD_FIRST else tl.program_id(1)
     s = tl.program_id(2)
+    # Each (head, split) rotates a complete permutation of the batch.
+    # Output/workspace addresses always use the resulting logical sequence.
+    if ROTATE:
+        b = (b + 17 * h + 3 * s) % BATCH
     length = tl.load(Lengths + b)
     start = tl.maximum(length - QLEN - WINDOW + 1, 0) // 64 * 64 if WINDOW else 0
     tiles = tl.cdiv(length - start, BN)
@@ -173,8 +178,15 @@ def _select_config(batch, qlen, max_context_len, window=0, kv_heads=2):
         else:
             budget = 1024
         warps = 4
+    if qlen > 1:
+        # Long speculative partitions need more CTAs at small group counts.
+        # Short windowed partitions need fewer CTAs to limit reduction overhead.
+        if not window and 4 < groups <= 16 and (active >= 98304 or (groups == 16 and active >= 65536)):
+            budget = 1024
+        elif window and short and 64 < groups <= 128:
+            budget = 512
     splits = max(1, min(triton.cdiv(active, 64), triton.next_power_of_2(max(1, budget // groups))))
-    reduce_rows = min(8, max(1, 128 // triton.next_power_of_2(splits))) if groups >= 64 and qlen == 8 else 1
+    reduce_rows = min(8, max(1, 128 // triton.next_power_of_2(splits))) if groups >= 64 and qlen > 1 else 1
     reduce_warps = 4 if splits >= 256 else 1
     return splits, warps, reduce_rows, reduce_warps
 
@@ -183,10 +195,10 @@ def _plan(query, key_cache, value_cache, block_tables, query_length, sliding_win
     tensors = (query, key_cache, value_cache, block_tables)
     if not all(isinstance(t, torch.Tensor) for t in tensors):
         raise InvalidInput("paged decode inputs must be tensors")
-    if (query_length not in (1, 8) or query.ndim != 3 or query.shape[2] != 64 or query.shape[1] < 8
+    if (query_length not in (1, 7, 8) or query.ndim != 3 or query.shape[2] != 64 or query.shape[1] < 8
             or query.shape[1] % 8):
         raise InvalidInput(
-            "gfx1250 paged decode requires query [batch * query_length, Q_heads, 64], GQA8, query_length 1 or 8")
+            "gfx1250 paged decode requires query [batch * query_length, Q_heads, 64], GQA8, query_length 1, 7 or 8")
     if query.shape[0] == 0 or query.shape[0] % query_length:
         raise InvalidInput("query rows must contain a positive whole number of sequences")
     batch = query.shape[0] // query_length
@@ -278,10 +290,19 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     # Loads land directly in WMMA B operands; all row waves share K/V.
     registers = tlx.layout(shape=((16, 2, warps), (8, 2, 2, 2, 2)), stride=((8, 512, 0), (1, 1024, 2048, 128, 256)))
     kv_heads = key_cache.shape[1]
-    _partition[(batch, kv_heads, splits)](query, key_cache, value_cache, block_tables, context_lens, partial,
-                                          stats, out, query_length, block_tables.shape[1], splits, 64,
-                                          max(16, query_length * 8), window, key_cache.ndim == 5, layout, sm_scale,
-                                          key_cache.shape[0], registers, kv_heads, num_warps=warps)
+    # Spread long sequences over the device without reading lengths on the host.
+    # With many heads, dispatch adjacent heads together; with fewer heads,
+    # rotate sequences between head/split planes to avoid repeated length order.
+    # Keep partial groups of 16 sequences in their original order: adjacent
+    # heads can otherwise concentrate the final long sequence on one engine.
+    reorder = query_length > 1 and window == 0 and batch >= 16
+    head_first = reorder and kv_heads >= 16 and batch % 16 == 0
+    rotate = reorder and kv_heads < 16 and batch * kv_heads >= 128
+    grid = (kv_heads, batch, splits) if head_first else (batch, kv_heads, splits)
+    _partition[grid](query, key_cache, value_cache, block_tables, context_lens, partial, stats,
+                     out, query_length, block_tables.shape[1], splits, 64,
+                     max(16, triton.next_power_of_2(query_length * 8)), window, key_cache.ndim == 5, layout, sm_scale,
+                     key_cache.shape[0], registers, kv_heads, rotate, batch, head_first, num_warps=warps)
     if splits > 1:
         _reduce[(triton.cdiv(query_length * 8, reduce_rows),
                  batch * kv_heads)](partial, stats, out, query_length, query_length * 8, splits,

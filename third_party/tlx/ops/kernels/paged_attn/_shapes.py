@@ -25,7 +25,7 @@ def context_lengths(batch, query_length, context, profile="uniform"):
     return [max(query_length, min(context, lengths[b % len(lengths)])) for b in range(batch)]
 
 
-SYNTHETIC = (Shape(1, 1, 65, 0), Shape(3, 8, 2049, 2048, False, 4, "mixed"))
+SYNTHETIC = (Shape(1, 1, 65, 0), Shape(3, 7, 65, 0), Shape(3, 8, 2049, 2048, False, 4, "mixed"))
 PRIMARY = tuple(
     Shape(b, q, k, w) for b in (1, 8, 32, 128) for k in (2048, 8192, 16384, 32768) for q in (1, 8) for w in (0, 2048))
 EXTENDED = tuple(
@@ -38,15 +38,30 @@ MIXED = tuple(
     for k in (8192, 32768)
     for q in (1, 8)
     for w in (0, 2048))
+# Seven-token drafting and eight-token verification, including 128K contexts.
+SBD = tuple(
+    shape._replace(kv_heads=h) for h in (2, 4, 16) for shape in (
+        Shape(16, 1, 8192, 0),
+        Shape(64, 1, 8192, 0),
+        Shape(16, 8, 8192, 0),
+        Shape(32, 8, 8192, 0),
+        Shape(64, 8, 8192, 0),
+        Shape(64, 7, 8192, 0),
+        Shape(64, 8, 8192, 2048),
+        Shape(8, 8, 131072, 0),
+        Shape(8, 8, 131072, 2048),
+        Shape(16, 8, 131072, 0),
+    ))
 FOCUS = FocusRegistry(
     "paged_attention_decode",
     (FocusSuite(name="gfx1250_primary", op="paged_attention_decode",
                 shapes=PRIMARY), FocusSuite(name="gfx1250_extended", op="paged_attention_decode", shapes=EXTENDED),
      FocusSuite(name="gfx1250_heads", op="paged_attention_decode",
                 shapes=FULL_HEADS), FocusSuite(name="gfx1250_mixed", op="paged_attention_decode", shapes=MIXED),
+     FocusSuite(name="gfx1250_sbd", op="paged_attention_decode", shapes=SBD),
      FocusSuite(name="gfx1250_4d", op="paged_attention_decode", shapes=tuple(s._replace(packed=False)
                                                                              for s in PRIMARY))),
-    {"gfx1250": ("gfx1250_primary", "gfx1250_heads", "gfx1250_mixed")},
+    {"gfx1250": ("gfx1250_primary", "gfx1250_heads", "gfx1250_mixed", "gfx1250_sbd")},
 )
 
 

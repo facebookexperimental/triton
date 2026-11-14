@@ -1476,7 +1476,7 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     picks the split-K plan; pass it, and a buffer from
     ``paged_attention_decode_workspace``, to keep launches graph-capturable.
 
-    On gfx1250, BF16 GQA8, head_dim=64, page=64 and query_length in {1, 8}
+    On gfx1250, BF16 GQA8, head_dim=64, page=64 and query_length in {1, 7, 8}
     are supported. Inputs/output must be contiguous and caches 16-byte aligned.
     The default max_context_len is block_tables.shape[1] * 64 (no device read).
     Supply out and workspace to avoid allocations during graph capture/replay;
