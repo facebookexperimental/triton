@@ -167,3 +167,74 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return
   }
 }
+
+// -----
+
+// A scalar store unreachable from every partition is still scheduled.
+// CHECK-LABEL: @scalar_side_store
+// CHECK: tt.store %{{.*}}, %{{.*}} {ttg.partition = array<i32: {{[0-9]+}}>} : !tt.ptr<i32>
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+#shared2 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.early_tma_store_lowering = true, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = false} {
+  tt.func public @scalar_side_store(%a_desc: !tt.tensordesc<128x64xbf16, #shared>, %a_desc.shape.0: i32, %a_desc.shape.1: i32, %a_desc.stride.0: i64, %a_desc.stride.1: i64, %b_desc: !tt.tensordesc<128x64xbf16, #shared>, %b_desc.shape.0: i32, %b_desc.shape.1: i32, %b_desc.stride.0: i64, %b_desc.stride.1: i64, %c_desc: !tt.tensordesc<128x128xf32, #shared1>, %c_desc.shape.0: i32, %c_desc.shape.1: i32, %c_desc.stride.0: i64, %c_desc.stride.1: i64, %M: i32 {tt.divisibility = 16 : i32}, %N: i32 {tt.divisibility = 16 : i32}, %owner_ptr: !tt.ptr<i32> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %false = arith.constant false
+    %true = arith.constant true
+    %c8_i32 = arith.constant 8 : i32
+    %c128_i32 = arith.constant 128 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c64_i32 = arith.constant 64 : i32
+    %c3_i32 = arith.constant 3 : i32
+    %c148_i32 = arith.constant 148 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c4_i32 = arith.constant 4 : i32
+    %c127_i32 = arith.constant 127 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #linear>
+    %start_pid = tt.get_program_id x : i32
+    %grid_m = arith.addi %M, %c127_i32 : i32
+    %grid_m_0 = arith.divsi %grid_m, %c128_i32 : i32
+    %grid_n = arith.addi %N, %c127_i32 : i32
+    %grid_n_1 = arith.divsi %grid_n, %c128_i32 : i32
+    %num_tiles = arith.muli %grid_m_0, %grid_n_1 : i32
+    %num_pid_in_group = arith.muli %grid_n_1, %c8_i32 : i32
+    scf.for %tile_id = %start_pid to %num_tiles step %c148_i32  : i32 {
+      %group_id = arith.divsi %tile_id, %num_pid_in_group : i32
+      %first_pid_m = arith.muli %group_id, %c8_i32 : i32
+      %group_size_m = arith.subi %grid_m_0, %first_pid_m : i32
+      %group_size_m_2 = arith.minsi %group_size_m, %c8_i32 : i32
+      %pid_m = arith.remsi %tile_id, %group_size_m_2 : i32
+      %pid_m_3 = arith.addi %first_pid_m, %pid_m : i32
+      %pid_n = arith.remsi %tile_id, %num_pid_in_group : i32
+      %pid_n_4 = arith.divsi %pid_n, %group_size_m_2 : i32
+      %offs_am = arith.muli %pid_m_3, %c128_i32 : i32
+      %offs_bn = arith.muli %pid_n_4, %c128_i32 : i32
+      %acc, %acc_5 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+      %acc_6 = ttng.tmem_store %cst, %acc[%acc_5], %true : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %acc_7:2 = scf.for %ki = %c0_i32 to %c4_i32 step %c1_i32 iter_args(%acc_10 = %false, %acc_11 = %acc_6) -> (i1, !ttg.async.token)  : i32 {
+        %offs_k = arith.muli %ki, %c64_i32 {loop.cluster = 2 : i32, loop.stage = 0 : i32} : i32
+        %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] {loop.cluster = 2 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xbf16, #shared> -> tensor<128x64xbf16, #blocked>
+        %a_12 = ttg.local_alloc %a {loop.cluster = 0 : i32, loop.stage = 2 : i32} : (tensor<128x64xbf16, #blocked>) -> !ttg.memdesc<128x64xbf16, #shared, #smem>
+        %b = tt.descriptor_load %b_desc[%offs_bn, %offs_k] {loop.cluster = 2 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xbf16, #shared> -> tensor<128x64xbf16, #blocked>
+        %acc_13 = ttg.local_alloc %b {loop.cluster = 0 : i32, loop.stage = 2 : i32} : (tensor<128x64xbf16, #blocked>) -> !ttg.memdesc<128x64xbf16, #shared, #smem>
+        %acc_14 = ttg.memdesc_trans %acc_13 {loop.cluster = 0 : i32, loop.stage = 2 : i32, order = array<i32: 1, 0>} : !ttg.memdesc<128x64xbf16, #shared, #smem> -> !ttg.memdesc<64x128xbf16, #shared2, #smem>
+        %acc_15 = ttng.tc_gen5_mma %a_12, %acc_14, %acc[%acc_11], %acc_10, %true {loop.cluster = 0 : i32, loop.stage = 2 : i32, tt.self_latency = 0 : i32} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        scf.yield %true, %acc_15 : i1, !ttg.async.token
+      } {tt.scheduled_max_stage = 2 : i32}
+      %acc_8, %acc_9 = ttng.tmem_load %acc[%acc_7#1] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear>
+      %0 = ttg.convert_layout %acc_8 : tensor<128x128xf32, #linear> -> tensor<128x128xf32, #blocked1>
+      %c_desc_staging = ttg.local_alloc %0 : (tensor<128x128xf32, #blocked1>) -> !ttg.memdesc<128x128xf32, #shared1, #smem, mutable>
+      %1 = ttng.async_tma_copy_local_to_global %c_desc[%offs_am, %offs_bn] %c_desc_staging : !tt.tensordesc<128x128xf32, #shared1>, !ttg.memdesc<128x128xf32, #shared1, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %1   : !ttg.async.token
+      %2 = tt.addptr %owner_ptr, %tile_id : !tt.ptr<i32>, i32
+      %3 = arith.muli %tile_id, %c3_i32 : i32
+      %4 = arith.addi %3, %c1_i32 : i32
+      tt.store %2, %4 : !tt.ptr<i32>
+    } {tt.data_partition_factor = 1 : i32, tt.warp_specialize}
+    tt.return
+  }
+}
