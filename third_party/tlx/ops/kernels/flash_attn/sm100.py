@@ -153,11 +153,6 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
 
 
 @triton.jit
-def _reduce_or(x, y):
-    return x | y
-
-
-@triton.jit
 def _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE: tl.constexpr):
     if STAGE == 1:
         # First part of STAGE == 3 in _get_fused_loop_bounds
@@ -936,13 +931,17 @@ def _attn_fwd_ws_hd256_kernel(sm_scale, M,  #
                     tlx.barrier_wait(alpha_fulls[s_buf], s_phase)
                     alpha_1 = tlx.local_load(alpha_tiles[s_buf])
                     tlx.barrier_arrive(alpha_empties[s_buf])
-                    # The tile's first PV overwrites O (use_acc=False), so it needs no rescale.
+                    # The tile's first PV overwrites O (use_acc=False), so it needs no rescale. Each warp decides
+                    # for its own 32 rows, as FA4 does: rescale only if some row's alpha dropped below 1. The warps
+                    # need not agree.
                     if RESCALE_OPT:
-                        ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, alpha_1 < 1.0)
-                        should_rescale_red = tl.reduce(ballot_result != 0, axis=0, combine_fn=_reduce_or)
-                        do_rescale = (accum_cnt != tile_first_cnt) & tl.reshape(should_rescale_red, ())
+                        do_rescale = (accum_cnt != tile_first_cnt) & tlx.warp_any(alpha_1 < 1.0)
                     else:
                         do_rescale = accum_cnt != tile_first_cnt
+                    # TODO: not all warps make the same decision on whether to enter this if-branch,
+                    # we need to guard this region as warp pred region and reject cta sync inside.
+                    # For now it's fine, since there is no cross thread race in tmem load/store here,
+                    # and no bar.sync would be inserted, but it's not robust
                     if do_rescale:
                         # QK(j) completing implies PV(j - 2) completed, so only PV(j - 1) can still be in
                         # flight and this parity wait is unambiguous.
@@ -1369,15 +1368,10 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         tlx.barrier_arrive(alpha_empties[cid])
                         # The first PV of a tile overwrites O (use_acc=False), so there is nothing to rescale.
                         if start_n != lo:
-                            # Perform warp-level ballot vote to check if any thread needs rescaling
-                            # 0xFFFFFFFF means all 32 threads in the warp participate
+                            # Each warp decides for its own 32 rows, as FA4 does: rescale only if some row's alpha
+                            # dropped below 1. The warps need not agree.
                             if RESCALE_OPT:
-                                pred = alpha_1 < 1.0
-                                # ballot_result is a tensor with the same shape as pred
-                                # All elements contain the same warp-level ballot value
-                                # Non-zero means at least one thread has alpha_1 < 1.0
-                                ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
-                                should_rescale = ballot_result != 0
+                                should_rescale = tlx.warp_any(alpha_1 < 1.0)
 
                             if USE_WHERE:
                                 for slice_id in tl.static_range(0, NUM_MMA_SLICES):
@@ -1396,11 +1390,13 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                                         acc = _mul_f32x2(acc, alpha_1)
                                     tlx.local_store(subslice, acc)
                             else:
-                                # option 2: use a single scalar IfOp
-                                if RESCALE_OPT:
-                                    should_rescale_red = tl.reduce(should_rescale, axis=0, combine_fn=_reduce_or)
-                                    should_rescale_scalar = tl.reshape(should_rescale_red, ())
-                                if not RESCALE_OPT or (RESCALE_OPT and should_rescale_scalar):
+                                # option 2: branch per warp. Each warp only loads and stores its own O lanes, so the
+                                # branch needs no CTA barrier.
+                                if not RESCALE_OPT or (RESCALE_OPT and should_rescale):
+                                    # TODO: not all warps make the same decision on whether to enter this if-branch,
+                                    # we need to guard this region as warp pred region and reject cta sync inside.
+                                    # For now it's fine, since there is no cross thread race in tmem load/store here,
+                                    # and no bar.sync would be inserted, but it's not robust
                                     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                                         subslice = tlx.subslice(
                                             acc_tiles[cid],
