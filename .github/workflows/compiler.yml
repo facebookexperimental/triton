@@ -2,11 +2,10 @@ name: Compiler LIT Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, release/3.8.x]
   pull_request:
     branches-ignore:
       - 'llvm-**'
-      - release/3.8.x
   merge_group:
     branches: [main, 'dev-**']
     types: [checks_requested]
@@ -20,6 +19,10 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions: read-all
+
+env:
+  # Issue-title scope. Off main it names the branch, so branches never share issues.
+  ISSUE_WORKFLOW_NAME: ${{ github.workflow }}${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
 
 jobs:
   lit-tests:
@@ -87,7 +90,7 @@ jobs:
 
       - name: Collect nightly failures (LIT)
         id: parse
-        if: always() && github.event_name == 'schedule'
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))))
         run: |
           FAILED_FLAG=""
           if [ "${{ steps.lit.outcome }}" = "failure" ]; then
@@ -95,7 +98,7 @@ jobs:
           fi
           python3 .github/scripts/parse_lit_failures.py \
             --log /tmp/lit.log \
-            --workflow "${GITHUB_WORKFLOW}" \
+            --workflow "${ISSUE_WORKFLOW_NAME}" \
             --job "lit-tests" \
             --bucket "compiler-lit" \
             ${FAILED_FLAG}
@@ -103,7 +106,7 @@ jobs:
   # ----- Nightly issue filing (schedule only) -----
   report-compiler-lit:
     needs: lit-tests
-    if: always() && github.event_name == 'schedule' && needs.lit-tests.outputs.failures != '' && needs.lit-tests.outputs.failures != '[]'
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && needs.lit-tests.outputs.failures != '' && needs.lit-tests.outputs.failures != '[]'
     permissions:
       contents: read
       issues: write
@@ -117,7 +120,7 @@ jobs:
       issue_title: ${{ matrix.item.issue_title }}
       normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
       raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
+      workflow_name: ${{ github.workflow }}${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
       job_name: ${{ matrix.item.job_name }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       ref: ${{ github.ref }}
@@ -135,13 +138,14 @@ jobs:
   # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
   reconcile-compiler-lit:
     needs: lit-tests
-    if: always() && github.event_name == 'schedule' && (needs.lit-tests.result == 'success' || needs.lit-tests.result == 'failure')
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && (needs.lit-tests.result == 'success' || needs.lit-tests.result == 'failure')
     permissions:
       contents: read
       issues: write
     uses: ./.github/workflows/reconcile-nightly-issues.yml
     with:
-      workflow_name: ${{ github.workflow }}
+      workflow_name: ${{ github.workflow }}${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
       job_name: lit-tests
       failures: ${{ needs.lit-tests.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ github.sha }}
