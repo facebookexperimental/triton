@@ -226,6 +226,15 @@ public:
     // sees a plain, compilable non-WS kernel. The broadcast channel depth comes
     // from the `tile-prefetch-depth` pass option (a Python knob), not an env
     // var.
+    if (Value src = findTensorChannelWithMixedConsumerTasks(funcOp)) {
+      src.getDefiningOp()->emitWarning(
+          "meta autoWS does not support a register value used by consumers "
+          "in different partitions (e.g. a bias folded into both "
+          "data-partition halves' accumulator init); compiling without warp "
+          "specialization");
+      return bailOut(funcOp);
+    }
+
     if (failed(doDynamicTileBroadcast(funcOp, tilePrefetchDepth))) {
       LDBG("Dynamic tile broadcast rejected warp specialization. Skipping.");
       return bailOut(funcOp);
