@@ -91,11 +91,21 @@ def test_split_numerics(query_length, packed, case):
 @pytest.mark.parametrize("query_length", [1, 7, 8])
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("window", [0, 63, 2048, 4099])
-@pytest.mark.parametrize("batch,kv_heads", [(12, 2), (16, 2), (64, 2), (65, 2), (96, 2), (32, 16), (33, 16)])
-def test_graph_updates_and_independent_streams(query_length, packed, window, batch, kv_heads):
+@pytest.mark.parametrize("batch,kv_heads,capacity", [
+    (12, 2, 4099),
+    (16, 2, 4099),
+    (64, 2, 4099),
+    (65, 2, 4099),
+    (96, 2, 4099),
+    (32, 16, 4099),
+    (33, 16, 4099),
+    (8, 2, 16384),
+    (4, 4, 32768),
+    (1, 16, 16384),
+])
+def test_graph_updates_and_independent_streams(query_length, packed, window, batch, kv_heads, capacity):
     # Exercise medium split counts, sequence rotation, and adjacent-head dispatch.
     # A full-context window must use the same plan as global attention.
-    capacity = 4099
     inputs = make_inputs([capacity] * batch, query_length, kv_heads=kv_heads)
     q, k, v, lengths, table = inputs
     out, workspace, run = _prepare(_cache(inputs, packed), query_length, window, capacity)
@@ -108,8 +118,10 @@ def test_graph_updates_and_independent_streams(query_length, packed, window, bat
     generator = torch.Generator(device=q.device).manual_seed(81)
     for iteration in range(6):
         q.normal_(generator=generator)
+        # Reuse one graph while long q1 partitions switch between prefetch schedules.
+        bound = capacity if iteration % 2 == 0 else min(capacity, 4099)
         lengths.copy_(
-            torch.tensor([0 if b == iteration else max(0, capacity - b * 113 - iteration * 67) for b in range(batch)],
+            torch.tensor([0 if b == iteration else max(0, bound - b * 113 - iteration * 67) for b in range(batch)],
                          dtype=torch.int32, device=q.device))
         table.copy_(original_table.roll(iteration + 1, 0))
         expected = reference(q, k, v, lengths, table, query_length, window)

@@ -31,6 +31,82 @@ def _load_packed_operand(buffer, slot, LAYOUT: tl.constexpr):
 
 
 @triton.jit
+def _qk_update(q, k, maximum, denom, base, length, m, n, QLEN: tl.constexpr, WINDOW: tl.constexpr, BM: tl.constexpr,
+               BN: tl.constexpr, LAYOUT: tl.constexpr, SCALE: tl.constexpr):
+    pos = base + n
+    scores = _dot(q, k, tl.zeros((BM, BN), tl.float32), LAYOUT) * (SCALE * 1.4426950408889634)
+    full = base + BN <= length - QLEN + 1
+    if WINDOW:
+        full &= base >= length - WINDOW
+    if not full:
+        qpos = length - QLEN + m // 8
+        valid = (pos[None, :] <= qpos[:, None]) & (pos[None, :] < length)
+        if WINDOW:
+            valid &= pos[None, :] > qpos[:, None] - WINDOW
+        scores = tl.where(valid, scores, -float('inf'))
+    new_max = tl.maximum(maximum, tl.max(scores, 1))
+    safe_max = tl.where(new_max == -float('inf'), 0., new_max)
+    p = tl.exp2(scores - safe_max[:, None])
+    alpha = tl.exp2(maximum - safe_max)
+    denom = denom * alpha + tl.sum(p, 1)
+    return p, alpha, new_max, denom, full
+
+
+@triton.jit
+def _pv_update(p, v, acc, alpha, base, length, n, full, QLEN: tl.constexpr, WINDOW: tl.constexpr, BN: tl.constexpr,
+               PACKED: tl.constexpr, LAYOUT: tl.constexpr):
+    pos = base + n
+    if PACKED and QLEN > 1:
+        needs_v_mask = base + BN > length
+        if WINDOW:
+            needs_v_mask |= base < tl.maximum(length - QLEN - WINDOW + 1, 0)
+        if needs_v_mask:
+            valid_v = pos < length
+            if WINDOW:
+                valid_v &= pos >= tl.maximum(length - QLEN - WINDOW + 1, 0)
+            # Convert the small row mask before broadcasting it. All-ones
+            # preserves every BF16 bit; zero clears poisoned page padding.
+            mask_v = tlx.require_layout(-valid_v.to(tl.int16),
+                                        tlx.slice_layout(tlx.dot_operand_layout(1, LAYOUT, k_width=8), 1))
+            mask_v = tl.broadcast_to(mask_v[:, None], (BN, 64))
+            v = (v.to(tl.int16, bitcast=True) & mask_v).to(tl.bfloat16, bitcast=True)
+    elif not full:
+        valid_v = pos < length
+        if WINDOW:
+            valid_v &= pos >= tl.maximum(length - QLEN - WINDOW + 1, 0)
+        v = tl.where(valid_v[:, None], v, 0.)
+    # BF16 matrix operands, with FP32 score/output and normalizer accumulation.
+    return _dot(p.to(tl.bfloat16), v, acc * alpha[:, None], LAYOUT)
+
+
+@triton.jit
+def _prefetched_tile(q, kd, vd, kb, vb, base, slot, next_phys, length, h, m, n, acc, maximum, denom, BN: tl.constexpr,
+                     BM: tl.constexpr, QLEN: tl.constexpr, WINDOW: tl.constexpr, PACKED: tl.constexpr,
+                     LAYOUT: tl.constexpr, SCALE: tl.constexpr, REG: tl.constexpr, KH: tl.constexpr,
+                     REFILL: tl.constexpr):
+    if REFILL:
+        tlx.async_amd_descriptor_wait(2)
+    # This helper is reached only by the packed q1/global specialization.
+    tl.static_assert(PACKED and QLEN == 1 and WINDOW == 0)
+    kr = tlx.local_load(tlx.local_view(kb, slot), layout=REG, relaxed=True)
+    vr = tlx.local_load(tlx.local_view(vb, slot), layout=REG, relaxed=True)
+    v = tl.reshape(tl.permute(tl.reshape(vr, (8, 64, 8)), (0, 2, 1)), (64, 64))
+    # Every reader has finished current K/V before those stages are refilled.
+    if REFILL:
+        tlx.workgroup_barrier()
+        tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, slot), [(next_phys * KH + h) * (8 if PACKED else 64), 0],
+                                      clamp_bounds=False, cache_modifier=".cs" if PACKED else "")
+        tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, slot), [(next_phys * KH + h) * (8 if PACKED else 64), 0],
+                                      clamp_bounds=False, cache_modifier=".cs" if PACKED else "")
+    k = tl.reshape(tl.permute(tl.reshape(kr, (8, 64, 8)), (0, 2, 1)), (64, 64))
+    p, alpha, new_max, denom, full = _qk_update(q, k, maximum, denom, base, length, m, n, QLEN, WINDOW, BM, BN, LAYOUT,
+                                                SCALE)
+    acc = _pv_update(p, v, acc, alpha, base, length, n, full, QLEN, WINDOW, BN, PACKED, LAYOUT)
+    maximum = new_max
+    return acc, maximum, denom
+
+
+@triton.jit
 def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS: tl.constexpr, NS: tl.constexpr,
                BN: tl.constexpr, BM: tl.constexpr, WINDOW: tl.constexpr, PACKED: tl.constexpr, LAYOUT: tl.constexpr,
                SCALE: tl.constexpr, NP: tl.constexpr, REG: tl.constexpr, KH: tl.constexpr, ROTATE: tl.constexpr,
@@ -66,112 +142,108 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
         vd = tl.make_tensor_descriptor(V, [NP * KH * 64, 64], [64, 1], [64, 64])
         kb = tlx.local_alloc((64, 64), tl.bfloat16, 2)
         vb = tlx.local_alloc((64, 64), tl.bfloat16, 2)
-    # Packed pages are streamed once per partition; avoid retaining them in
-    # preference to the query, page table and reduction workspace.
-    if first < end:
-        physical = tl.load(Table + b.to(tl.int64) * TS + first // 64)
-        tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 0), [(physical * KH + h) * (8 if PACKED else 64), 0],
+    # Deeper prefetch helps long q1 partitions when the grid is underfilled.
+    # Keep the lower-register schedule above four CTAs per gfx1250 CU.
+    # Capacity can rule it out; the actual sequence length chooses the path.
+    DEEP: tl.constexpr = PACKED and QLEN == 1 and BATCH * KH <= 16 and WINDOW == 0 and NS > 1 and TS > 7 * NS and BATCH * KH * NS <= 1024
+    if DEEP and step >= 8 and first + 2 * BN < end:
+        # These four copies dominate the steady loop, so wait(2) keeps the
+        # next tile in flight. Conditional startup copies force full waits.
+        physical0 = tl.load(Table + b.to(tl.int64) * TS + first // 64)
+        tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 0), [(physical0 * KH + h) * (8 if PACKED else 64), 0],
                                       clamp_bounds=False, cache_modifier=".cs" if PACKED else "")
-        tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 0), [(physical * KH + h) * (8 if PACKED else 64), 0],
+        tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 0), [(physical0 * KH + h) * (8 if PACKED else 64), 0],
                                       clamp_bounds=False, cache_modifier=".cs" if PACKED else "")
-    # Keep the original unsplit q_len=7 schedule: earlier prefetch regresses
-    # some uneven and large windowed batches.
-    EARLY: tl.constexpr = QLEN != 7 or NS != 1
-    for base in range(first, end, BN):
-        pos = base + n
-        slot = ((base - first) // BN) % 2
-        if EARLY:
-            next_phys = 0
-            if base + BN < end:
-                next_phys = tl.load(Table + b.to(tl.int64) * TS + (base + BN) // 64)
+        physical1 = tl.load(Table + b.to(tl.int64) * TS + (first + BN) // 64)
+        tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 1), [(physical1 * KH + h) * (8 if PACKED else 64), 0],
+                                      clamp_bounds=False, cache_modifier=".cs" if PACKED else "")
+        tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 1), [(physical1 * KH + h) * (8 if PACKED else 64), 0],
+                                      clamp_bounds=False, cache_modifier=".cs" if PACKED else "")
+        for base in range(first, end - 2 * BN, BN):
+            slot = ((base - first) // BN) % 2
+            next_phys = tl.load(Table + b.to(tl.int64) * TS + (base + 2 * BN) // 64)
+            acc, maximum, denom = _prefetched_tile(q, kd, vd, kb, vb, base, slot, next_phys, length, h, m, n, acc,
+                                                   maximum, denom, BN, BM, QLEN, WINDOW, PACKED, LAYOUT, SCALE, REG, KH,
+                                                   True)
         tlx.async_amd_descriptor_wait(0)
-        if EARLY:
-            # Complete all previous-stage consumers before refilling it.
-            # Adjacent waits can share their synchronization.
-            tlx.workgroup_barrier()
-        else:
-            if PACKED and QLEN > 1:
-                kr = _load_packed_operand(kb, slot, LAYOUT)
-            elif PACKED:
-                kr = tlx.local_load(tlx.local_view(kb, slot), layout=REG, relaxed=True)
+        tail = first + tl.maximum(0, tl.cdiv(end - first, BN) - 2) * BN
+        for base in range(tail, end, BN):
+            slot = ((base - first) // BN) % 2
+            acc, maximum, denom = _prefetched_tile(q, kd, vd, kb, vb, base, slot, 0, length, h, m, n, acc, maximum,
+                                                   denom, BN, BM, QLEN, WINDOW, PACKED, LAYOUT, SCALE, REG, KH, False)
+    else:
+        # Packed pages are streamed once per partition; avoid retaining them in
+        # preference to the query, page table and reduction workspace.
+        if first < end:
+            physical = tl.load(Table + b.to(tl.int64) * TS + first // 64)
+            tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 0), [(physical * KH + h) * (8 if PACKED else 64), 0],
+                                          clamp_bounds=False, cache_modifier=".cs" if PACKED else "")
+            tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 0), [(physical * KH + h) * (8 if PACKED else 64), 0],
+                                          clamp_bounds=False, cache_modifier=".cs" if PACKED else "")
+        # Keep the original unsplit q_len=7 schedule: earlier prefetch regresses
+        # some uneven and large windowed batches.
+        EARLY: tl.constexpr = QLEN != 7 or NS != 1
+        for base in range(first, end, BN):
+            slot = ((base - first) // BN) % 2
+            if EARLY:
+                next_phys = 0
+                if base + BN < end:
+                    next_phys = tl.load(Table + b.to(tl.int64) * TS + (base + BN) // 64)
+            tlx.async_amd_descriptor_wait(0)
+            if EARLY:
+                # Complete all previous-stage consumers before refilling it.
+                # Adjacent waits can share their synchronization.
+                tlx.workgroup_barrier()
             else:
-                kr = tlx.local_load(tlx.local_view(kb, slot), relaxed=True)
-        if base + BN < end:
+                if PACKED and QLEN > 1:
+                    kr = _load_packed_operand(kb, slot, LAYOUT)
+                elif PACKED:
+                    kr = tlx.local_load(tlx.local_view(kb, slot), layout=REG, relaxed=True)
+                else:
+                    kr = tlx.local_load(tlx.local_view(kb, slot), relaxed=True)
+            if base + BN < end:
+                if not EARLY:
+                    next_phys = tl.load(Table + b.to(tl.int64) * TS + (base + BN) // 64)
+                tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 1 - slot),
+                                              [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False,
+                                              cache_modifier=".cs" if PACKED else "")
+                tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 1 - slot),
+                                              [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False,
+                                              cache_modifier=".cs" if PACKED else "")
+            if EARLY:
+                if PACKED and QLEN > 1:
+                    kr = _load_packed_operand(kb, slot, LAYOUT)
+                elif PACKED:
+                    kr = tlx.local_load(tlx.local_view(kb, slot), layout=REG, relaxed=True)
+                else:
+                    kr = tlx.local_load(tlx.local_view(kb, slot), relaxed=True)
+            if PACKED and QLEN > 1:
+                k = kr
+            elif PACKED:
+                k = tl.reshape(tl.permute(tl.reshape(kr, (8, 64, 8)), (0, 2, 1)), (64, 64))
+            else:
+                k = tl.trans(kr)
+            p, alpha, new_max, denom, full = _qk_update(q, k, maximum, denom, base, length, m, n, QLEN, WINDOW, BM, BN,
+                                                        LAYOUT, SCALE)
+            # The wait at the top of this iteration orders both K and V loads.
+            # Delay reading V into registers until QK and softmax have consumed K.
+            if PACKED and QLEN > 1:
+                vr = _load_packed_operand(vb, slot, LAYOUT)
+            elif PACKED:
+                vr = tlx.local_load(tlx.local_view(vb, slot), layout=REG, relaxed=True)
+            else:
+                vr = tlx.local_load(tlx.local_view(vb, slot), relaxed=True)
+            if PACKED and QLEN > 1:
+                v = vr
+            elif PACKED:
+                v = tl.reshape(tl.permute(tl.reshape(vr, (8, 64, 8)), (0, 2, 1)), (64, 64))
+            else:
+                v = vr
             if not EARLY:
-                next_phys = tl.load(Table + b.to(tl.int64) * TS + (base + BN) // 64)
-            tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 1 - slot),
-                                          [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False,
-                                          cache_modifier=".cs" if PACKED else "")
-            tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 1 - slot),
-                                          [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False,
-                                          cache_modifier=".cs" if PACKED else "")
-        if EARLY:
-            if PACKED and QLEN > 1:
-                kr = _load_packed_operand(kb, slot, LAYOUT)
-            elif PACKED:
-                kr = tlx.local_load(tlx.local_view(kb, slot), layout=REG, relaxed=True)
-            else:
-                kr = tlx.local_load(tlx.local_view(kb, slot), relaxed=True)
-        if PACKED and QLEN > 1:
-            k = kr
-        elif PACKED:
-            k = tl.reshape(tl.permute(tl.reshape(kr, (8, 64, 8)), (0, 2, 1)), (64, 64))
-        else:
-            k = tl.trans(kr)
-        scores = _dot(q, k, tl.zeros((BM, BN), tl.float32), LAYOUT) * (SCALE * 1.4426950408889634)
-        full = base + BN <= length - QLEN + 1
-        if WINDOW:
-            full &= base >= length - WINDOW
-        if not full:
-            qpos = length - QLEN + m // 8
-            valid = (pos[None, :] <= qpos[:, None]) & (pos[None, :] < length)
-            if WINDOW:
-                valid &= pos[None, :] > qpos[:, None] - WINDOW
-            scores = tl.where(valid, scores, -float('inf'))
-        new_max = tl.maximum(maximum, tl.max(scores, 1))
-        safe_max = tl.where(new_max == -float('inf'), 0., new_max)
-        p = tl.exp2(scores - safe_max[:, None])
-        alpha = tl.exp2(maximum - safe_max)
-        denom = denom * alpha + tl.sum(p, 1)
-        # The wait at the top of this iteration orders both K and V loads.
-        # Delay reading V into registers until QK and softmax have consumed K.
-        if PACKED and QLEN > 1:
-            vr = _load_packed_operand(vb, slot, LAYOUT)
-        elif PACKED:
-            vr = tlx.local_load(tlx.local_view(vb, slot), layout=REG, relaxed=True)
-        else:
-            vr = tlx.local_load(tlx.local_view(vb, slot), relaxed=True)
-        if PACKED and QLEN > 1:
-            v = vr
-        elif PACKED:
-            v = tl.reshape(tl.permute(tl.reshape(vr, (8, 64, 8)), (0, 2, 1)), (64, 64))
-        else:
-            v = vr
-        if not EARLY:
-            # The next iteration may refill this stage after all reads finish.
-            tlx.workgroup_barrier()
-        if PACKED and QLEN > 1:
-            needs_v_mask = base + BN > length
-            if WINDOW:
-                needs_v_mask |= base < tl.maximum(length - QLEN - WINDOW + 1, 0)
-            if needs_v_mask:
-                valid_v = pos < length
-                if WINDOW:
-                    valid_v &= pos >= tl.maximum(length - QLEN - WINDOW + 1, 0)
-                # Convert the small row mask before broadcasting it. All-ones
-                # preserves every BF16 bit; zero clears poisoned page padding.
-                mask_v = tlx.require_layout(-valid_v.to(tl.int16),
-                                            tlx.slice_layout(tlx.dot_operand_layout(1, LAYOUT, k_width=8), 1))
-                mask_v = tl.broadcast_to(mask_v[:, None], (BN, 64))
-                v = (v.to(tl.int16, bitcast=True) & mask_v).to(tl.bfloat16, bitcast=True)
-        elif not full:
-            valid_v = pos < length
-            if WINDOW:
-                valid_v &= pos >= tl.maximum(length - QLEN - WINDOW + 1, 0)
-            v = tl.where(valid_v[:, None], v, 0.)
-        # BF16 matrix operands, with FP32 score/output and normalizer accumulation.
-        acc = _dot(p.to(tl.bfloat16), v, acc * alpha[:, None], LAYOUT)
-        maximum = new_max
+                # The next iteration may refill this stage after all reads finish.
+                tlx.workgroup_barrier()
+            acc = _pv_update(p, v, acc, alpha, base, length, n, full, QLEN, WINDOW, BN, PACKED, LAYOUT)
+            maximum = new_max
     if NS == 1:
         inv = tl.div_rn(1., tl.where(denom > 0, denom, 1.))
         result = acc * inv[:, None]
