@@ -22,6 +22,15 @@ def _dot(a, b, c, LAYOUT: tl.constexpr):
 
 
 @triton.jit
+def _load_packed_operand(buffer, slot, LAYOUT: tl.constexpr):
+    # View the physical [8, 64, 8] page as a matrix before loading it.
+    # Keeping the load in the WMMA operand layout avoids a live register copy.
+    view = tlx.local_reshape(tlx.local_view(buffer, slot), (8, 64, 8))
+    view = tlx.local_reshape(tlx.local_trans(view, (0, 2, 1)), (64, 64))
+    return tlx.local_load(view, layout=tlx.dot_operand_layout(1, LAYOUT, k_width=8), relaxed=True)
+
+
+@triton.jit
 def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS: tl.constexpr, NS: tl.constexpr,
                BN: tl.constexpr, BM: tl.constexpr, WINDOW: tl.constexpr, PACKED: tl.constexpr, LAYOUT: tl.constexpr,
                SCALE: tl.constexpr, NP: tl.constexpr, REG: tl.constexpr, KH: tl.constexpr, ROTATE: tl.constexpr,
@@ -67,7 +76,9 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
         pos = base + n
         slot = ((base - first) // BN) % 2
         tlx.async_amd_descriptor_wait(0)
-        if PACKED:
+        if PACKED and QLEN > 1:
+            kr = _load_packed_operand(kb, slot, LAYOUT)
+        elif PACKED:
             kr = tlx.local_load(tlx.local_view(kb, slot), layout=REG, relaxed=True)
         else:
             kr = tlx.local_load(tlx.local_view(kb, slot), relaxed=True)
@@ -77,7 +88,9 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
                                           [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False)
             tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 1 - slot),
                                           [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False)
-        if PACKED:
+        if PACKED and QLEN > 1:
+            k = kr
+        elif PACKED:
             k = tl.reshape(tl.permute(tl.reshape(kr, (8, 64, 8)), (0, 2, 1)), (64, 64))
         else:
             k = tl.trans(kr)
@@ -98,17 +111,35 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
         denom = denom * alpha + tl.sum(p, 1)
         # The wait at the top of this iteration orders both K and V loads.
         # Delay reading V into registers until QK and softmax have consumed K.
-        if PACKED:
+        if PACKED and QLEN > 1:
+            vr = _load_packed_operand(vb, slot, LAYOUT)
+        elif PACKED:
             vr = tlx.local_load(tlx.local_view(vb, slot), layout=REG, relaxed=True)
         else:
             vr = tlx.local_load(tlx.local_view(vb, slot), relaxed=True)
-        if PACKED:
+        if PACKED and QLEN > 1:
+            v = vr
+        elif PACKED:
             v = tl.reshape(tl.permute(tl.reshape(vr, (8, 64, 8)), (0, 2, 1)), (64, 64))
         else:
             v = vr
         # Both K and V reads must finish before this stage can be refilled.
         tlx.workgroup_barrier()
-        if not full:
+        if PACKED and QLEN > 1:
+            needs_v_mask = base + BN > length
+            if WINDOW:
+                needs_v_mask |= base < tl.maximum(length - QLEN - WINDOW + 1, 0)
+            if needs_v_mask:
+                valid_v = pos < length
+                if WINDOW:
+                    valid_v &= pos >= tl.maximum(length - QLEN - WINDOW + 1, 0)
+                # Convert the small row mask before broadcasting it. All-ones
+                # preserves every BF16 bit; zero clears poisoned page padding.
+                mask_v = tlx.require_layout(-valid_v.to(tl.int16),
+                                            tlx.slice_layout(tlx.dot_operand_layout(1, LAYOUT, k_width=8), 1))
+                mask_v = tl.broadcast_to(mask_v[:, None], (BN, 64))
+                v = (v.to(tl.int16, bitcast=True) & mask_v).to(tl.bfloat16, bitcast=True)
+        elif not full:
             valid_v = pos < length
             if WINDOW:
                 valid_v &= pos >= tl.maximum(length - QLEN - WINDOW + 1, 0)
@@ -133,13 +164,16 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
 
 @triton.jit
 def _reduce(Part, Stats, Out, QLEN: tl.constexpr, BM: tl.constexpr, NS: tl.constexpr, BS: tl.constexpr,
-            RM: tl.constexpr, KH: tl.constexpr):
+            RM: tl.constexpr, KH: tl.constexpr, RD: tl.constexpr = 64):
     group = tl.program_id(0)
     h = tl.program_id(1) % KH
     b = tl.program_id(1) // KH
     m = group * RM + tl.arange(0, RM)
     s = tl.arange(0, BS)
-    d = tl.arange(0, 64)
+    if RD == 64:
+        d = tl.arange(0, 64)
+    else:
+        d = tl.program_id(2) * RD + tl.arange(0, RD)
     offset = ((b.to(tl.int64) * KH + h) * NS + s[None, :]) * BM + m[:, None]
     maxima = tl.load(Stats + offset * 2, (s[None, :] < NS) & (m[:, None] < QLEN * 8), -float('inf'))
     denom = tl.load(Stats + offset * 2 + 1, (s[None, :] < NS) & (m[:, None] < QLEN * 8), 0.)
@@ -164,7 +198,7 @@ def _select_config(batch, qlen, max_context_len, window=0, kv_heads=2):
         if groups <= 4:
             budget = 512 if active > 32768 else 256
         elif groups <= 16:
-            budget = 256 if short else 1024
+            budget = 256 if short else (512 if groups == 16 and active <= 16384 else 1024)
         else:
             budget = 1024 if short and groups <= 64 else 2048
         warps = 1
@@ -191,13 +225,29 @@ def _select_config(batch, qlen, max_context_len, window=0, kv_heads=2):
     medium_global = not window and 16 < groups <= 64 and 2176 < active and groups * active <= 524288
     if medium_global:
         if qlen == 1:
-            budget = 512 if groups == 32 and active <= 8192 else 1024
+            budget = 1024
         else:
             budget = 1024 if groups == 64 and active > 4096 else 512
         splits = max(1, min(triton.cdiv(active, 64), triton.cdiv(budget, groups)))
     else:
         splits = max(1, min(triton.cdiv(active, 64), triton.next_power_of_2(max(1, budget // groups))))
+    if qlen > 1 and not window and splits >= 16:
+        # Rounding up for intermediate group counts can exceed the intended
+        # work budget by almost 2x.
+        splits = min(splits, triton.cdiv(budget, groups))
+    if qlen > 1 and not window and splits == 8 and groups > 128:
+        # Short dense batches need fewer partials. Longer contexts benefit
+        # from more parallel reads once there are over 160 sequence/head groups.
+        if short:
+            splits = 4
+        elif active <= 8192:
+            splits = triton.cdiv(1024, groups)
+        elif groups > 160:
+            splits = triton.cdiv(2048, groups)
     reduce_rows = min(8, max(1, 128 // triton.next_power_of_2(splits))) if groups >= 64 and qlen > 1 else 1
+    # Pair q1 head rows; each reduction CTA covers 32 output channels.
+    if qlen == 1 and 1 < splits <= 128:
+        reduce_rows = 2
     reduce_warps = 4 if splits >= 256 else 1
     return splits, warps, reduce_rows, reduce_warps
 
@@ -319,7 +369,9 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
                      max(16, triton.next_power_of_2(query_length * 8)), window, key_cache.ndim == 5, layout, sm_scale,
                      key_cache.shape[0], registers, kv_heads, rotate, batch, head_first, num_warps=warps)
     if splits > 1:
-        _reduce[(triton.cdiv(query_length * 8, reduce_rows),
-                 batch * kv_heads)](partial, stats, out, query_length, query_length * 8, splits,
-                                    triton.next_power_of_2(splits), reduce_rows, kv_heads, num_warps=reduce_warps)
+        reduce_columns = 32 if query_length == 1 and splits <= 128 else 64
+        _reduce[(triton.cdiv(query_length * 8, reduce_rows), batch * kv_heads,
+                 64 // reduce_columns)](partial, stats, out, query_length, query_length * 8, splits,
+                                        triton.next_power_of_2(splits), reduce_rows, kv_heads, reduce_columns,
+                                        num_warps=reduce_warps)
     return out
