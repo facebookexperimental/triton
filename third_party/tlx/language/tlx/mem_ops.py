@@ -1886,6 +1886,7 @@ def async_amd_descriptor_load(
     offsets: Optional[list[tl.tensor]] = None,
     pred: tl.tensor = None,
     clamp_bounds: tl.constexpr = True,
+    cache_modifier: str = "",
     _semantic=None,
 ) -> tlx.async_token:
     """Asynchronous descriptor load from global to a local buffer (AMD).
@@ -1897,6 +1898,9 @@ def async_amd_descriptor_load(
     ``offsets=None`` to avoid a redundant update. Supplying ``offsets`` is a
     convenience that advances the descriptor and clamps its remaining bounds
     by default; set ``clamp_bounds=False`` for position-only advancement.
+
+    ``cache_modifier`` accepts the same load cache hints as ``tl.load``;
+    ``".cs"`` requests streaming access. The default preserves normal caching.
 
     Available only on AMD TDM-capable targets (gfx1250+).
     """
@@ -1947,6 +1951,9 @@ def async_amd_descriptor_load(
         result.handle,
         None,
     )
+    if cache_modifier:
+        cache = _semantic._str_to_load_cache_modifier(cache_modifier)
+        token_handle.set_attr("cache", _semantic.builder.get_int32_attr(cache.value))
     return tlx.async_token(token_handle)
 
 

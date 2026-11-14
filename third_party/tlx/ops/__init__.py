@@ -1499,14 +1499,19 @@ def _check_sliding_window(op, sliding_window):
 
 def _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length):
     import torch
+    if not all(isinstance(t, torch.Tensor) for t in (query, key_cache, value_cache, context_lens, block_tables)):
+        raise InvalidInput("tlx.ops.paged_attention_decode expects tensor inputs")
+    if isinstance(query_length, bool) or not isinstance(query_length, int) or query_length < 1:
+        raise InvalidInput("tlx.ops.paged_attention_decode expects a positive int query_length")
     if query.ndim != 3 or key_cache.ndim != value_cache.ndim or key_cache.ndim not in (4, 5):
         raise InvalidInput("tlx.ops.paged_attention_decode expects (tokens, q_heads, head_dim) query and 4-D or "
                            f"packed 5-D K/V caches; got q={tuple(query.shape)}, k={tuple(key_cache.shape)}, "
                            f"v={tuple(value_cache.shape)}")
     if key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
         raise InvalidInput("tlx.ops.paged_attention_decode expects query and K/V caches of one dtype")
-    if context_lens.dtype != torch.int32 or block_tables.dtype != torch.int32 or block_tables.ndim != 2:
-        raise InvalidInput("tlx.ops.paged_attention_decode expects int32 context_lens and 2-D int32 block_tables")
+    if (context_lens.dtype != torch.int32 or context_lens.ndim != 1 or block_tables.dtype != torch.int32
+            or block_tables.ndim != 2):
+        raise InvalidInput("tlx.ops.paged_attention_decode expects 1-D int32 context_lens and 2-D int32 block_tables")
     if any(t.device != query.device for t in (key_cache, value_cache, context_lens, block_tables)):
         raise InvalidInput("tlx.ops.paged_attention_decode expects all tensors on one device")
     num_kv_heads = key_cache.shape[1]
@@ -1533,6 +1538,21 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     the earliest window are never read. ``max_context_len`` bounds every context and
     picks the split-K plan; pass it, and a buffer from
     ``paged_attention_decode_workspace``, to keep launches graph-capturable.
+
+    On gfx1250, BF16 GQA8, head_dim=64, page=64 and query_length in {1, 7, 8}
+    are supported. Inputs/output must be contiguous and caches 16-byte aligned.
+    The default max_context_len is block_tables.shape[1] * 64 (no device read).
+    Supply out and workspace to avoid allocations during graph capture/replay;
+    each concurrent stream/graph needs its own output and workspace storage.
+    These writable tensors must not share storage with inputs or each other.
+    Workspace may be reused across lengths/tables with the same tensor shapes,
+    query_length, sliding_window and max_context_len.
+
+    Callers must ensure used page IDs are in range and device context_lens are
+    in [0, max_context_len]; metadata values are not checked on the host. On
+    gfx1250, zero-length sequences and query rows preceding key zero return
+    zero. Q and visible K/V must be finite, with finite FP32 dot products and
+    accumulations. Unused table entries and cache slots may be uninitialized.
     """
     group = _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length)
     space_name, invariance = _normalize_space_arg("paged_attention_decode", space)
@@ -1627,6 +1647,8 @@ def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables
                                      max_context_len=None):
     """Reusable FP32 split-K workspace for ``paged_attention_decode`` with the same
     arguments, or None when the plan needs none."""
+    if isinstance(query_length, bool) or not isinstance(query_length, int) or query_length < 1:
+        raise InvalidInput("tlx.ops.paged_attention_decode_workspace expects a positive int query_length")
     _check_sliding_window("paged_attention_decode_workspace", sliding_window)
     fn, spec = impl_for("paged_attention_decode_workspace", device=query.device)
     check_inputs(spec, dtype=query.dtype)
