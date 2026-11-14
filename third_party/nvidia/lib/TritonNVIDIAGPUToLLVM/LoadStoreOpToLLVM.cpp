@@ -1373,6 +1373,26 @@ applyMsgToShared(Location loc, RewriterBase &rewriter,
   return applyLinearLayout(loc, rewriter, msgToShared, ins);
 }
 
+FailureOr<Value> createTMACachePolicy(Operation *op, Attribute attr,
+                                      ConversionPatternRewriter &rewriter,
+                                      int computeCapability,
+                                      int minimumCapability) {
+  auto cachePolicy = getCachePolicy(op, attr);
+  if (failed(cachePolicy))
+    return failure();
+  bool hasL2Policy =
+      cachePolicy->legacy != triton::EvictionPolicy::NORMAL ||
+      (cachePolicy->detailed && cachePolicy->detailed.getL2Primary() !=
+                                    ttng::CacheEvictionPriority::NONE);
+  if (hasL2Policy && computeCapability < minimumCapability) {
+    op->emitOpError("TMA L2 cache policies require compute capability ")
+        << minimumCapability << " or newer";
+    return failure();
+  }
+  return createCachePolicy(*cachePolicy, rewriter, op->getLoc(),
+                           computeCapability, op);
+}
+
 struct AsyncTMACopyGlobalToLocalOpConversion
     : public ConvertOpToLLVMPattern<
           triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp> {
@@ -1382,14 +1402,17 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       : ConvertOpToLLVMPattern(converter, benefit),
         computeCapability(computeCapability) {}
 
+  int computeCapability;
+
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp op,
                   OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.getCache() != triton::CacheModifier::NONE)
-      return op.emitError("cache modifiers not supported yet");
-    if (op.getIsVolatile())
-      return op.emitError("volatile not supported yet");
+    auto l2Policy = createTMACachePolicy(op, op.getCachePolicyAttr(), rewriter,
+                                         computeCapability, 90);
+    if (failed(l2Policy))
+      return failure();
+    Value l2PolicyReg = *l2Policy;
 
     // Determine the TMA mode based on the descriptor type
     auto descType = op.getDesc().getType();
@@ -1399,15 +1422,6 @@ struct AsyncTMACopyGlobalToLocalOpConversion
 
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-
-    // Create L2 cache policy register if eviction policy is specified
-    CachePolicy policy;
-    policy.legacy = op.getEvict();
-    FailureOr<Value> l2Policy =
-        createCachePolicy(policy, rewriter, loc, computeCapability, op);
-    if (failed(l2Policy))
-      return failure();
-    Value l2PolicyReg = *l2Policy;
 
     ttg::MemDescType dstTy = op.getResult().getType();
     Type llvmElemTy = typeConverter->convertType(dstTy.getElementType());
@@ -1546,7 +1560,6 @@ struct AsyncTMACopyGlobalToLocalOpConversion
         tmaInst += ".cta_group::2";
       if (multicast || multicastMask != nullptr)
         tmaInst += ".multicast::cluster";
-      // Add L2 cache hint modifier if eviction policy is specified
       if (l2PolicyReg)
         tmaInst += ".L2::cache_hint";
       tmaInst += " [$1], [$2, {";
@@ -1576,11 +1589,6 @@ struct AsyncTMACopyGlobalToLocalOpConversion
         operands.push_back(ptxBuilderTMA.newOperand(multicastMask, "h"));
         tmaInst += ", $" + std::to_string(operandIdx++);
       }
-      // Add L2 cache policy operand if specified
-      if (l2PolicyReg) {
-        operands.push_back(ptxBuilderTMA.newOperand(l2PolicyReg, "l"));
-        tmaInst += ", $" + std::to_string(operandIdx++);
-      }
       if (isIm2Col) {
         auto im2colOffsets = adaptor.getOffsets();
         if (!im2colOffsets.empty()) {
@@ -1602,6 +1610,10 @@ struct AsyncTMACopyGlobalToLocalOpConversion
         operands.push_back(ptxBuilderTMA.newOperand(derivedMulticastMask, "h"));
         tmaInst += ", $" + std::to_string(operandIdx++);
       }
+      if (l2PolicyReg) {
+        operands.push_back(ptxBuilderTMA.newOperand(l2PolicyReg, "l"));
+        tmaInst += ", $" + std::to_string(operandIdx++);
+      }
       tmaInst += ";";
 
       auto &tma = *ptxBuilderTMA.create(tmaInst);
@@ -1611,9 +1623,6 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     rewriter.eraseOp(op);
     return success();
   }
-
-private:
-  int computeCapability;
 };
 
 struct AsyncTMAPrefetchOpConversion
@@ -1736,7 +1745,7 @@ LogicalResult
 convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
                       ConversionPatternRewriter &rewriter, Value tmaPtr,
                       ttg::MemDescType srcTy, Value src, ValueRange coords,
-                      const std::string &tmaInst, Value l2PolicyReg = nullptr) {
+                      const std::string &tmaInst, Value l2Policy = {}) {
   auto loc = op->getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   Type llvmElemTy = typeConverter->convertType(srcTy.getElementType());
@@ -1813,9 +1822,8 @@ convertTMAStoreLikeOp(Operation *op, const TypeConverter *typeConverter,
       operands.push_back(ptxBuilderTMA.newOperand(coord, "r"));
     }
     operands.push_back(ptxBuilderTMA.newOperand(shMemPtr, "r"));
-    // Add L2 cache policy operand if specified
-    if (l2PolicyReg)
-      operands.push_back(ptxBuilderTMA.newOperand(l2PolicyReg, "l"));
+    if (l2Policy)
+      operands.push_back(ptxBuilderTMA.newOperand(l2Policy, "l"));
     auto &tma = *ptxBuilderTMA.create(tmaInst);
     tma(operands, /*onlyAttachMLIRArgs=*/true);
     ptxBuilderTMA.launch(rewriter, loc, voidTy);
@@ -1846,27 +1854,21 @@ struct AsyncTMACopyLocalToGlobalOpConversion
       : ConvertOpToLLVMPattern(converter, benefit),
         computeCapability(computeCapability) {}
 
+  int computeCapability;
+
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::AsyncTMACopyLocalToGlobalOp op,
                   OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto loc = op->getLoc();
-
-    // Create L2 cache policy register if eviction policy is specified
-    CachePolicy policy;
-    policy.legacy = op.getEvict();
-    FailureOr<Value> l2Policy =
-        createCachePolicy(policy, rewriter, loc, computeCapability, op);
+    auto l2Policy = createTMACachePolicy(op, op.getCachePolicyAttr(), rewriter,
+                                         computeCapability, 90);
     if (failed(l2Policy))
       return failure();
-    Value l2PolicyReg = *l2Policy;
-
     std::ostringstream tmaInst;
     auto rank = op.getCoord().size();
     tmaInst << "@$0 cp.async.bulk.tensor." << rank;
     tmaInst << "d.global.shared::cta.bulk_group";
-    // Add L2 cache hint modifier if eviction policy is specified
-    if (l2PolicyReg)
+    if (*l2Policy)
       tmaInst << ".L2::cache_hint";
     tmaInst << " [$1, {";
     int operandIdx = 2;
@@ -1876,17 +1878,13 @@ struct AsyncTMACopyLocalToGlobalOpConversion
         tmaInst << ", ";
     }
     tmaInst << "}], [$" << (operandIdx++) << "]";
-    // Add L2 cache policy operand placeholder if specified
-    if (l2PolicyReg)
-      tmaInst << ", $" << (operandIdx++);
+    if (*l2Policy)
+      tmaInst << ", $" << operandIdx++;
     tmaInst << ";";
-    return convertTMAStoreLikeOp(
-        op, typeConverter, rewriter, adaptor.getDesc(), op.getSrc().getType(),
-        adaptor.getSrc(), adaptor.getCoord(), tmaInst.str(), l2PolicyReg);
+    return convertTMAStoreLikeOp(op, typeConverter, rewriter, adaptor.getDesc(),
+                                 op.getSrc().getType(), adaptor.getSrc(),
+                                 adaptor.getCoord(), tmaInst.str(), *l2Policy);
   }
-
-private:
-  int computeCapability;
 };
 
 struct AsyncTMAReduceOpConversion
@@ -2099,7 +2097,12 @@ static LogicalResult iterateGatherScatterIndices(
 
 struct AsyncTMAGatherOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::AsyncTMAGatherOp> {
-  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+  AsyncTMAGatherOpConversion(LLVMTypeConverter &converter,
+                             int computeCapability, PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(converter, benefit),
+        computeCapability(computeCapability) {}
+
+  int computeCapability;
 
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::AsyncTMAGatherOp op, OpAdaptor adaptor,
@@ -2109,6 +2112,10 @@ struct AsyncTMAGatherOpConversion
 LogicalResult AsyncTMAGatherOpConversion::matchAndRewrite(
     triton::nvidia_gpu::AsyncTMAGatherOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
+  auto l2Policy = createTMACachePolicy(op, op.getCachePolicyAttr(), rewriter,
+                                       computeCapability, 100);
+  if (failed(l2Policy))
+    return failure();
   Location loc = op.getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
 
@@ -2165,9 +2172,13 @@ LogicalResult AsyncTMAGatherOpConversion::matchAndRewrite(
     tmaInst += ".global.mbarrier::complete_tx::bytes";
     if (multicast)
       tmaInst += ".multicast::cluster";
+    if (*l2Policy)
+      tmaInst += ".L2::cache_hint";
     tmaInst += " [$1], [$2, {$3, $4, $5, $6, $7}], [$8]";
     if (multicast)
       tmaInst += ", $9";
+    if (*l2Policy)
+      tmaInst += multicast ? ", $10" : ", $9";
     tmaInst += ";";
 
     PTXBuilder ptxBuilder;
@@ -2187,6 +2198,8 @@ LogicalResult AsyncTMAGatherOpConversion::matchAndRewrite(
           loc, rewriter, maskCGABroadcast, targetCTA);
       operands.push_back(ptxBuilder.newOperand(multicastMask, "h"));
     }
+    if (*l2Policy)
+      operands.push_back(ptxBuilder.newOperand(*l2Policy, "l"));
 
     auto &tma = *ptxBuilder.create(tmaInst);
     tma(operands, /*attachOnlyMLIRArgs=*/true);
@@ -2205,7 +2218,12 @@ LogicalResult AsyncTMAGatherOpConversion::matchAndRewrite(
 
 struct AsyncTMAScatterOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::AsyncTMAScatterOp> {
-  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+  AsyncTMAScatterOpConversion(LLVMTypeConverter &converter,
+                              int computeCapability, PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(converter, benefit),
+        computeCapability(computeCapability) {}
+
+  int computeCapability;
 
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::AsyncTMAScatterOp op, OpAdaptor adaptor,
@@ -2215,6 +2233,10 @@ struct AsyncTMAScatterOpConversion
 LogicalResult AsyncTMAScatterOpConversion::matchAndRewrite(
     triton::nvidia_gpu::AsyncTMAScatterOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
+  auto l2Policy = createTMACachePolicy(op, op.getCachePolicyAttr(), rewriter,
+                                       computeCapability, 100);
+  if (failed(l2Policy))
+    return failure();
   Location loc = op.getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   LLVM::LLVMVoidType voidTy = void_ty(op->getContext());
@@ -2235,8 +2257,13 @@ LogicalResult AsyncTMAScatterOpConversion::matchAndRewrite(
   auto callback = [&](Value pred, Value shMemPtr, Value, Value yOffset,
                       ArrayRef<Value> xOffsets) {
     std::string tmaInst = "@$0 cp.async.bulk.tensor.2d.tile::scatter4.global"
-                          ".shared::cta.bulk_group "
-                          "[$1, {$2, $3, $4, $5, $6}], [$7];";
+                          ".shared::cta.bulk_group";
+    if (*l2Policy)
+      tmaInst += ".L2::cache_hint";
+    tmaInst += " [$1, {$2, $3, $4, $5, $6}], [$7]";
+    if (*l2Policy)
+      tmaInst += ", $8";
+    tmaInst += ";";
 
     PTXBuilder ptxBuilder;
     SmallVector<PTXBuilder::Operand *, 8> operands{
@@ -2249,6 +2276,8 @@ LogicalResult AsyncTMAScatterOpConversion::matchAndRewrite(
     for (Value xOffset : xOffsets)
       operands.push_back(ptxBuilder.newOperand(xOffset, "r"));
     operands.push_back(ptxBuilder.newOperand(shMemPtr, "r"));
+    if (*l2Policy)
+      operands.push_back(ptxBuilder.newOperand(*l2Policy, "l"));
 
     auto &tma = *ptxBuilder.create(tmaInst);
     tma(operands, /*attachOnlyMLIRArgs=*/true);
@@ -2410,13 +2439,13 @@ void mlir::triton::NVIDIA::populateLoadStoreOpToLLVMPatterns(
   patterns.add<AsyncCommitGroupOpConversion, AsyncWaitOpConversion,
                AsyncCopyMbarrierArriveOpConversion>(typeConverter, benefit);
   patterns.add<AsyncTMACopyGlobalToLocalOpConversion,
-               AsyncTMAPrefetchOpConversion, PrefetchOpConversion>(
+               AsyncTMACopyLocalToGlobalOpConversion,
+               AsyncTMAGatherOpConversion, AsyncTMAScatterOpConversion>(
       typeConverter, computeCapability, benefit);
-  patterns.add<AsyncTMACopyLocalToGlobalOpConversion>(
+  patterns.add<AsyncTMAPrefetchOpConversion, PrefetchOpConversion>(
       typeConverter, computeCapability, benefit);
   patterns.add<AsyncTMAReduceOpConversion>(typeConverter, computeCapability,
                                            benefit);
-  patterns.add<AsyncTMAGatherOpConversion, AsyncTMAScatterOpConversion,
-               TMAStoreWaitOpConversion, AsyncStoreOpConversion>(typeConverter,
+  patterns.add<TMAStoreWaitOpConversion, AsyncStoreOpConversion>(typeConverter,
                                                                  benefit);
 }

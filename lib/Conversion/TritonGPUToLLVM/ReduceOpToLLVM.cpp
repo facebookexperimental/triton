@@ -21,6 +21,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -79,7 +80,6 @@ private:
 
     auto *ctx = op.getContext();
 
-    // Remove block as we don't currently support it
     LinearLayout regLl = triton::gpu::toLinearLayout(helper.getSrcTy());
     // Remove broadcasting in registers as SliceLayout removes them
     auto removeBroadcast = actionRemoveBroadcastedRegs(regLl);
@@ -89,6 +89,7 @@ private:
         vals = removeBroadcast.apply(vals);
     }
 
+    // First reduce all the values along the axis within each thread.
     std::tie(regLl, accs) =
         reduceWithinThreads(op, std::move(regLl), std::move(accs), rewriter);
     std::tie(regLl, accs) =
@@ -99,19 +100,20 @@ private:
     assert(regLl ==
            ReduceOpHelper::reducedRegLaneLayout(helper.getSrcTy(), axis));
 
-    // If we still need to reduce along warps / blocks:
-    // Create temporary layout for reduction within warps.
+    // If we still need to reduce across warps / blocks:
+    // Create a temporary layout for reduction within warps.
     // By construction of tmpLl, we will iterate at most 2 times, as the maximum
-    // number of warp / block bases is 64 * 16 = 32 * 32
-    // That is, they fit in 2 rounds of warp reductions
-    // Even more, if we do two rounds, getInterLayout will make sure that the
-    // first one does not cross CTAs
+    // number of warps * blocks is 64 * 16 = 32 * 32.
+    // That is, they fit in 2 rounds of warp reductions.
+    // Moreover, if we do two rounds, getInterWarpReductionLayout will make sure
+    // that the first one does not cross CTAs.
     auto kAxis = *(regLl.getOutDimNames().begin() + axis);
     auto kBlock = StringAttr::get(ctx, "block");
     bool lastCvtCrossesCTAs = false;
     int i = 0;
     while (regLl.getOutDimSize(kAxis) != 1) {
-      LinearLayout tmpLl = ReduceOpHelper::getInterLayout(regLl, axis);
+      LinearLayout tmpLl =
+          ReduceOpHelper::getInterWarpReductionLayout(regLl, axis);
 
       // Emit a barrier if we are reusing the shmem
       if (i > 0) {
@@ -540,26 +542,59 @@ private:
     }
   }
 
-  std::unique_ptr<Region> createVectorCombineRegion(
-      Location loc, Type elemTy,
-      ReduceOpHelper::InThreadVectorizeOpKind vectorizeKind,
-      ConversionPatternRewriter &rewriter) const {
-    if (vectorizeKind == ReduceOpHelper::InThreadVectorizeOpKind::None)
-      return nullptr;
-    MLIRContext *ctx = rewriter.getContext();
-    auto vecTy = vec_ty(elemTy, 2);
+  using InThreadVectorizeOpKind = ReduceOpHelper::InThreadVectorizeOpKind;
 
+  template <typename Op>
+  static Value createBinaryOp(OpBuilder &builder, Location loc, Value lhs,
+                              Value rhs) {
+    return Op::create(builder, loc, lhs.getType(), lhs, rhs);
+  }
+
+  Value createInThreadVectorizedCombineOp(OpBuilder &builder, Location loc,
+                                          InThreadVectorizeOpKind kind,
+                                          Value lhs, Value rhs) const {
+    using CreateOpFn = Value (*)(OpBuilder &, Location, Value, Value);
+    static const DenseMap<InThreadVectorizeOpKind, CreateOpFn> builders = {
+        {InThreadVectorizeOpKind::AddF, createBinaryOp<LLVM::FAddOp>},
+        {InThreadVectorizeOpKind::MulF, createBinaryOp<LLVM::FMulOp>},
+        {InThreadVectorizeOpKind::MinNumF, createBinaryOp<LLVM::MinNumOp>},
+        {InThreadVectorizeOpKind::MaxNumF, createBinaryOp<LLVM::MaxNumOp>},
+        {InThreadVectorizeOpKind::MinimumF, createBinaryOp<LLVM::MinimumOp>},
+        {InThreadVectorizeOpKind::MaximumF, createBinaryOp<LLVM::MaximumOp>},
+        {InThreadVectorizeOpKind::AddI, createBinaryOp<LLVM::AddOp>},
+        {InThreadVectorizeOpKind::MulI, createBinaryOp<LLVM::MulOp>},
+        {InThreadVectorizeOpKind::MinSI, createBinaryOp<LLVM::SMinOp>},
+        {InThreadVectorizeOpKind::MaxSI, createBinaryOp<LLVM::SMaxOp>},
+        {InThreadVectorizeOpKind::MinUI, createBinaryOp<LLVM::UMinOp>},
+        {InThreadVectorizeOpKind::MaxUI, createBinaryOp<LLVM::UMaxOp>},
+    };
+    auto createOp = builders.lookup(kind);
+    if (!createOp)
+      llvm::report_fatal_error("Unsupported in-thread vectorize op kind");
+    return createOp(builder, loc, lhs, rhs);
+  }
+
+  std::unique_ptr<Region>
+  createVectorCombineRegion(triton::ReduceOp op,
+                            bool supportBitwidth32Elementwise) const {
+    auto kind = ReduceOpHelper(op).getInThreadVectorizeOpKind(
+        targetInfo.supportBitwidth16Elementwise(),
+        supportBitwidth32Elementwise);
+    if (kind == InThreadVectorizeOpKind::None)
+      return nullptr;
+
+    auto loc = op.getLoc();
+    auto vecTy = vec_ty(op.getInputTypes().front().getElementType(), 2);
     auto storage = std::make_unique<Region>();
     auto *block = new Block();
     storage->push_back(block);
-    block->addArgument(vecTy, loc);
-    block->addArgument(vecTy, loc);
+    Value lhs = block->addArgument(vecTy, loc);
+    Value rhs = block->addArgument(vecTy, loc);
 
-    OpBuilder builder(ctx);
+    OpBuilder builder(op.getContext());
     builder.setInsertionPointToStart(block);
-    Value result = ReduceOpHelper::createInThreadVectorizedCombineOp(
-        builder, loc, vectorizeKind, block->getArgument(0),
-        block->getArgument(1));
+    Value result =
+        createInThreadVectorizedCombineOp(builder, loc, kind, lhs, rhs);
     triton::ReduceReturnOp::create(builder, loc, ValueRange{result});
     return storage;
   }
@@ -585,7 +620,7 @@ private:
     }
   }
 
-  // Reduce along op axis for elements that are in the same thread. The
+  // Reduce along the op axis for elements that are in the same thread. The
   // accumulated value is stored in accs.
   void reduceWithinThreads(
       ReduceOpHelper &helper, SmallVector<SmallVector<Value>> &srcValues,
@@ -646,13 +681,11 @@ private:
         groupValues.push_back(srcValues[idx]);
 
       // Packing pairs neighbours, so an odd group stays scalar.
-      auto vectorizeKind = enableTreeReduction && groupValues.size() % 2 == 0
-                               ? helper.getInThreadVectorizeOpKind(
-                                     groupValues.size(),
-                                     targetInfo.supportBitwidth16Elementwise(),
-                                     targetInfo.supportBitwidth32Elementwise())
-                               : ReduceOpHelper::InThreadVectorizeOpKind::None;
-      if (vectorizeKind == ReduceOpHelper::InThreadVectorizeOpKind::None)
+      std::unique_ptr<Region> vectorCombineRegion;
+      if (enableTreeReduction && groupValues.size() % 2 == 0)
+        vectorCombineRegion = createVectorCombineRegion(
+            op, targetInfo.supportBitwidth32Elementwise());
+      if (!vectorCombineRegion)
         return reduceValueSequence(op.getLoc(), op, std::move(groupValues),
                                    rewriter);
 
@@ -672,9 +705,6 @@ private:
         packedValues.push_back(std::move(values));
       }
 
-      auto elemTy = operandType.getElementType();
-      auto vectorCombineRegion = createVectorCombineRegion(
-          op.getLoc(), elemTy, vectorizeKind, rewriter);
       Operation &combinerOp = vectorCombineRegion->front().front();
       unsigned arity = targetInfo.getReductionTreeArity(&combinerOp);
       auto reduced = treeReduce(op.getLoc(), rewriter, *vectorCombineRegion,
@@ -727,14 +757,12 @@ private:
 
     ReduceOpHelper helper(op);
     // Packing pairs registers 2k and 2k+1, so digit 0 must have radix 2.
-    auto vectorizeKind =
-        enableTreeReduction && layout.getInputRadix(kReg, 0) == 2
-            ? helper.getInThreadVectorizeOpKind(
-                  axisPack, targetInfo.supportBitwidth16Elementwise(),
-                  targetInfo.supportBitwidth32Elementwise())
-            : ReduceOpHelper::InThreadVectorizeOpKind::None;
-    bool vectorize =
-        vectorizeKind != ReduceOpHelper::InThreadVectorizeOpKind::None;
+    // Create the vectorized region if needed.
+    std::unique_ptr<Region> vectorCombineRegion;
+    if (enableTreeReduction && layout.getInputRadix(kReg, 0) == 2)
+      vectorCombineRegion = createVectorCombineRegion(
+          op, targetInfo.supportBitwidth32Elementwise());
+    bool vectorize = vectorCombineRegion != nullptr;
 
     // Bring the registers that move the axis to the front.
     auto perm = ReduceOpHelper::moveAxisBasesToFront(layout, axis, vectorize);
@@ -748,17 +776,13 @@ private:
     if (vectorize)
       packVectorized(accs, rewriter);
 
-    // If we pack along the reduction axis we need to process half the
+    // If we pack along the reduction axis, we need to process half the
     // registers.
     const auto &regBases = layout.getBases().lookup(kReg);
     bool packAlongAxis = vectorize && regBases.front()[axis] != 0;
     if (packAlongAxis)
       axisPack /= 2;
 
-    auto elemTy =
-        cast<RankedTensorType>(op.getOperandTypes().front()).getElementType();
-    std::unique_ptr<Region> vectorCombineRegion =
-        createVectorCombineRegion(loc, elemTy, vectorizeKind, rewriter);
     Region &combineRegion =
         vectorCombineRegion ? *vectorCombineRegion : op.getCombineOp();
 
@@ -813,14 +837,16 @@ private:
     }
     accs = std::move(reduced);
 
-    // Reduce one last time via the scalar combine op if vector packing also
-    // packed along the reduction axis.
+    // Unpack the vector values into the accumulator values.
+    // Reduce one last time via the scalar combine op if we packed along the
+    // axis.
     if (vectorize) {
       Region *reduceAfterUnpacking =
           packAlongAxis ? &op.getCombineOp() : nullptr;
       unpackVectorized(loc, accs, rewriter, reduceAfterUnpacking);
     }
 
+    // Update the layout, killing the axis bases along registers.
     layout = ReduceOpHelper::zeroBasesAlongDimAndReorder(layout, axis, kReg);
     layout = layout.removeZeroBasesAlongDim(kReg);
     return {std::move(layout), std::move(accs)};
@@ -848,32 +874,72 @@ private:
     if (reduceLaneIdMask == 0)
       return {std::move(layout), std::move(accs)};
 
-    for (unsigned reg = 0; reg < accs.front().size(); ++reg) {
-      SmallVector<Value> acc(op.getNumOperands());
-      for (unsigned i = 0; i < op.getNumOperands(); ++i)
-        acc[i] = accs[i][reg];
-
-      warpReduceLaneMask(rewriter, op, acc, reduceLaneIdMask,
-                         broadcastLaneIdMask);
-
-      for (unsigned i = 0; i < op.getNumOperands(); ++i)
-        accs[i][reg] = acc[i];
-    }
+    warpReduce(op, reduceLaneIdMask, broadcastLaneIdMask, accs, rewriter);
 
     layout = ReduceOpHelper::zeroBasesAlongDimAndReorder(layout, op.getAxis(),
                                                          kLane);
     return {std::move(layout), std::move(accs)};
   }
 
-  void warpReduceLaneMask(ConversionPatternRewriter &rewriter,
-                          triton::ReduceOp op, SmallVector<Value> &acc,
-                          unsigned reduceLaneIdMask,
-                          unsigned broadcastLaneIdMask) const {
+  void warpReduce(triton::ReduceOp op, unsigned reduceLaneIdMask,
+                  unsigned broadcastLaneIdMask,
+                  SmallVector<SmallVector<Value>> &accs,
+                  ConversionPatternRewriter &rewriter) const {
+    auto loc = op.getLoc();
+    auto vectorCombineRegion =
+        createVectorCombineRegion(op, /*supportBitwidth32Elementwise=*/false);
+    unsigned regs = accs.front().size();
+    for (unsigned reg = 0; reg < regs; ++reg) {
+      SmallVector<Value> acc(op.getNumOperands());
+      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+        acc[i] = accs[i][reg];
+      }
+      // The target interface speaks (numLanes, interleave); map the contiguous
+      // lane-ID run back. Non-contiguous masks use shuffles.
+      unsigned firstBit = llvm::countr_zero(reduceLaneIdMask);
+      unsigned numBits = llvm::popcount(reduceLaneIdMask);
+      bool contiguous = reduceLaneIdMask != 0 &&
+                        reduceLaneIdMask == (((1u << numBits) - 1) << firstBit);
+      bool targetReduced =
+          contiguous &&
+          targetInfo.warpReduce(rewriter, loc, acc, op, 1u << numBits,
+                                1u << firstBit, broadcastLaneIdMask);
+      if (!targetReduced) {
+        // Shuffle pairs of independent outputs in one 32-bit register.
+        if (vectorCombineRegion && reg + 1 < regs) {
+          for (unsigned i = 0; i < op.getNumOperands(); ++i)
+            acc[i] = packLLVector(loc, {acc[i], accs[i][reg + 1]}, rewriter);
+          shuffleAndCombine(op, reduceLaneIdMask, acc, *vectorCombineRegion,
+                            rewriter, broadcastLaneIdMask);
+          for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+            auto values = unpackLLVector(loc, acc[i], rewriter);
+            accs[i][reg] = values[0];
+            accs[i][reg + 1] = values[1];
+          }
+          ++reg;
+          continue;
+        }
+        shuffleAndCombine(op, reduceLaneIdMask, acc, op.getCombineOp(),
+                          rewriter, broadcastLaneIdMask);
+      }
+      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+        accs[i][reg] = acc[i];
+      }
+    }
+  }
+
+  void shuffleAndCombine(
+      triton::ReduceOp op, unsigned reduceLaneIdMask, SmallVector<Value> &acc,
+      Region &combineRegion, ConversionPatternRewriter &rewriter,
+      std::optional<unsigned> broadcastMask = std::nullopt) const {
+    // No reduction to do
+    if (reduceLaneIdMask == 0)
+      return;
     auto moduleOp = op->getParentOfType<ModuleOp>();
     unsigned warpSize =
         triton::gpu::TritonGPUDialect::getThreadsPerWarp(moduleOp);
     assert(reduceLaneIdMask < warpSize &&
-           "expected reduce lane ID mask to be smaller than the warp size");
+           "expected reduce lane ID mask to be strictly less than warp size");
 
     unsigned firstBit = llvm::countr_zero(reduceLaneIdMask);
     unsigned numBits = llvm::popcount(reduceLaneIdMask);
@@ -881,24 +947,44 @@ private:
 
     // Keep target-specific optimized reductions for the common contiguous
     // case. Non-contiguous lane distributions require one XOR shuffle per
-    // participating lane-id bit.
-    if (reduceLaneIdMask == contiguousMask) {
+    // participating lane-id bit. Packed vector combines bypass this path:
+    // the scalar combiner cannot consume packed values.
+    if (reduceLaneIdMask == contiguousMask &&
+        &combineRegion == &op.getCombineOp()) {
       warpReduce(rewriter, op.getLoc(), acc, op, 1u << numBits, 1u << firstBit,
-                 /*pred=*/Value(), broadcastLaneIdMask);
+                 /*pred=*/Value(), broadcastMask);
       return;
     }
 
-    // Preserve upstream's established inverse bit order for reductions whose
-    // participating lane-id bits cannot use the contiguous target hook.
+    // Not that it matters a lot, but a more reasonable iteration order would be
+    // from bit 0 to bit llvm::Log2_32(warpSize) - 1. Changing this breaks a ton
+    // of bitwise comparisons so we stick with the legacy inverse order
     for (int bit = llvm::Log2_32(warpSize) - 1; bit >= 0; --bit) {
       unsigned mask = 1u << bit;
       if ((reduceLaneIdMask & mask) == 0)
         continue;
-      SmallVector<Value> shuffled(op.getNumOperands());
-      for (unsigned i = 0; i < op.getNumOperands(); ++i)
-        shuffled[i] =
-            targetInfo.shuffleXor(rewriter, op.getLoc(), acc[i], mask);
-      accumulate(op.getLoc(), rewriter, op.getCombineOp(), acc, shuffled);
+      SmallVector<Value> shfl(op.getNumOperands());
+      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+        auto b = TritonLLVMOpBuilder(op.getLoc(), rewriter);
+        Value value = acc[i];
+        if (auto ty = dyn_cast<VectorType>(value.getType())) {
+          assert(ty.getNumElements() * ty.getElementTypeBitWidth() == 32);
+          value = b.bitcast(value, i32_ty);
+        }
+        shfl[i] = targetInfo.shuffleXor(rewriter, op.getLoc(), value, mask);
+        shfl[i] = b.bitcast(shfl[i], acc[i].getType());
+      }
+      accumulate(op.getLoc(), rewriter, combineRegion, acc, shfl);
+    }
+    if (!op.isCommutative()) {
+      // The lane with all reduction bits clear combines each subtree in the
+      // same order. Broadcast its result instead of ordering both operands at
+      // every step of the tree.
+      auto b = TritonLLVMOpBuilder(op.getLoc(), rewriter);
+      Value leader = b.and_(getLaneId(rewriter, op.getLoc()),
+                            b.i32_val(~reduceLaneIdMask));
+      for (Value &value : acc)
+        value = targetInfo.shuffleIdx(rewriter, op.getLoc(), value, leader);
     }
   }
 
@@ -937,6 +1023,34 @@ private:
         }
         accumulate(op.getLoc(), rewriter, op.getCombineOp(), acc, shfl, pred);
       }
+    }
+    if (!op.isCommutative() && !pred) {
+      // Mirror the leader broadcast in shuffleAndCombine (#12045): lanes
+      // that the result layout treats as redundant must agree. The
+      // (numLanes, interleave) pair denotes a contiguous lane-ID run; map
+      // it back to mask form. Predicated reductions keep their own values.
+      auto moduleOp = op->getParentOfType<ModuleOp>();
+      unsigned warpSize =
+          triton::gpu::TritonGPUDialect::getThreadsPerWarp(moduleOp);
+      unsigned fullMask = warpSize - 1;
+      unsigned reduceLaneIdMask;
+      if (numLaneToReduce == warpSize) {
+        reduceLaneIdMask = fullMask;
+      } else if (numLaneToReduce != 0 && llvm::isPowerOf2_32(numLaneToReduce) &&
+                 interleave != 0 && llvm::isPowerOf2_32(interleave)) {
+        unsigned numBits = llvm::Log2_32(numLaneToReduce);
+        unsigned firstBit = llvm::Log2_32(interleave);
+        if (firstBit + numBits > llvm::Log2_32(warpSize))
+          return;
+        reduceLaneIdMask = ((1u << numBits) - 1) << firstBit;
+      } else {
+        return;
+      }
+      auto b = TritonLLVMOpBuilder(loc, rewriter);
+      Value leader =
+          b.and_(getLaneId(rewriter, loc), b.i32_val(~reduceLaneIdMask));
+      for (Value &value : acc)
+        value = targetInfo.shuffleIdx(rewriter, loc, value, leader);
     }
   }
 

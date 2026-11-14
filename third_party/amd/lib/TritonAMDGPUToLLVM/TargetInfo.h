@@ -18,6 +18,7 @@ public:
   llvm::AMDGPU::IsaVersion getIsaVersion() const;
 
   StringRef getArch() const { return targetFeatures.getArch(); }
+  StringRef getBaseArch() const { return targetFeatures.getBaseArch(); }
   amdgpu::ISAFamily getISAFamily() const {
     return targetFeatures.getISAFamily();
   }
@@ -35,6 +36,8 @@ public:
   bool supportMaximumMinimum() const override;
 
   bool supportDppBroadcast() const;
+
+  bool isGFX1250Strict() const;
 
   Value getClusterCTAId(RewriterBase &rewriter, Location loc) const override;
 
@@ -138,6 +141,7 @@ public:
   bool useAsyncMarks() const;
 
   bool supportsMultiCTALaunch() const;
+  bool supportsMulticast() const;
   unsigned getMaxMulticastMaskPopcount() const;
   bool supportsTDM() const;
   bool supportsClusterLoadBitWidth(int biwWidth) const;
@@ -164,6 +168,8 @@ public:
   bool supportsWaveId() const;
   bool supportsPermlaneSwap() const;
   bool supportsCvtPkScalePk8() const;
+  bool supportsCvtPkScalePk8Upcast() const;
+  bool supportsCvtPkScalePk8Block16() const;
   bool supportsHwScaledUpcast() const;
   bool supportsHwScaledDowncast() const;
 

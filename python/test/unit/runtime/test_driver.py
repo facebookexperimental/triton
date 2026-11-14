@@ -5,7 +5,6 @@ from multiprocessing.connection import Client
 from pathlib import Path
 from types import SimpleNamespace
 
-import cloudpickle
 import pytest
 import torch
 
@@ -80,6 +79,7 @@ def test_compile_warmup_random_helpers_preserve_normal_randomness():
 
 @pytest.mark.parametrize("fails", [False, True])
 def test_compile_warmup_coordinator_deduplicates_and_propagates_errors(monkeypatch, fails):
+    pytest.importorskip("cloudpickle")
     coordinator = SharedWarmupCoordinator(max_workers=1, trace_directory=None)
     submissions = []
 
@@ -219,7 +219,7 @@ def test_gsan_runner_isolates_distributed_tests_when_multiple_gpus_are_visible(m
     assert _test_runner._gsan(SimpleNamespace(num_gpus=num_gpus, num_procs=24)) == 0
     assert len(commands) == num_gpus
     assert commands[0][0][commands[0][0].index("-n") + 1] == str(8 * num_gpus)
-    assert all(kwargs["timeout"] == 180 for _, kwargs in commands)
+    assert all(kwargs["timeout"] == 300 for _, kwargs in commands)
     assert all(kwargs["environment"]["TRITON_TEST_PROCESS_TIMEOUT"] == "90" for _, kwargs in commands)
     if num_gpus == 1:
         assert "not xdist_group" not in commands[0][0]
@@ -279,6 +279,7 @@ def test_compile_warmup_spreads_prioritized_tests_across_capture_workers(monkeyp
 
 
 def test_compile_warmup_serializes_patched_source_globals(monkeypatch):
+    cloudpickle = pytest.importorskip("cloudpickle")
 
     @triton.jit
     def helper(value):
@@ -295,6 +296,7 @@ def test_compile_warmup_serializes_patched_source_globals(monkeypatch):
 
 
 def test_compile_warmup_reuses_equivalent_kernel_payloads(monkeypatch):
+    pytest.importorskip("cloudpickle")
     dispatcher = ProcessPoolWarmupDispatcher(max_workers=1, trace_directory=None, phase="warmup")
     dispatcher.current_test = "test"
     serialized = []

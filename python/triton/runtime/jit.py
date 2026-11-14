@@ -1284,9 +1284,12 @@ class JITFunction(JITCallable, KernelInterface[T]):
                     and not getattr(_compile_iq_state, "suppressed", False)):
                 kernel._compile_iq_resolve(grid_0, grid_1, grid_2, stream, bound_args)
             # launch kernel — prefer _TritonDispatcher (C direct cuLaunchKernelEx)
-            # when available and hooks are not needed.
+            # when available and hooks are not needed. Instrumented kernels need
+            # the Python launcher (it appends sanitizer params and fires launch
+            # hooks); the dispatcher schema covers user args only.
             _disp = getattr(kernel, '_dispatcher', None) if knobs.runtime.use_triton_dispatcher else None
-            if _disp is not None and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook:
+            if (_disp is not None and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook
+                    and not knobs.compilation.instrumentation_mode):
                 if _CACHE_STATS_ON:
                     _cache_stats_record(self._fn_name, "run_slow_c")
                 _vals = tuple(bound_args.values())

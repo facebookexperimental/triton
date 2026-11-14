@@ -1,5 +1,5 @@
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar='compute-capability=100 ptx-version=87' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' | FileCheck %s --check-prefix=LOWER
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar='compute-capability=100 ptx-version=87' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' --initialize-ws-cluster-barriers='compute-capability=100 ptx-version=87' --convert-warp-specialize-to-llvm | FileCheck %s --check-prefix=WS
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar='compute-capability=100 ptx-version=87' --triton-nvidia-gpu-tmem-barrier-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' | FileCheck %s --check-prefix=LOWER
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar='compute-capability=100 ptx-version=87' --triton-nvidia-gpu-tmem-barrier-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' --initialize-ws-cluster-barriers='compute-capability=100 ptx-version=87' --convert-warp-specialize-to-llvm | FileCheck %s --check-prefix=WS
 
 // Single-WS lowering supports exactly one warp_specialize region. The module
 // keeps it unless lowering adds a synthetic region for worker warps to join a
@@ -14,10 +14,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
   // LOWER-LABEL: llvm.func @explicit_bootstrap_keeps_single_ws
   // LOWER: nvvm.cluster.arrive.relaxed aligned
   // LOWER-NEXT: nvvm.cluster.wait aligned
-  // LOWER-NEXT: ttg.warp_specialize
+  // The empty region folds away; no synthetic region is added.
   // LOWER-NOT: ttg.warp_specialize
+  // LOWER: llvm.return
   // WS-LABEL: llvm.func @explicit_bootstrap_keeps_single_ws
-  // WS: @!$0 barrier.cluster.arrive.relaxed.aligned
+  // WS: nvvm.cluster.arrive.relaxed aligned
   // WS-NOT: llvm.switch
   tt.func public @explicit_bootstrap_keeps_single_ws() {
     %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -74,7 +75,9 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
   // LOWER-NOT: ttg.single-warp-specialize
   // LOWER-LABEL: llvm.func @multi_cta_drops_single_ws
   // WS-LABEL: llvm.func @multi_cta_drops_single_ws
-  // WS: llvm.switch
+  // The empty region folds before WS lowering; nothing to dispatch.
+  // WS-NOT: llvm.switch
+  // WS: llvm.return
   tt.func public @multi_cta_drops_single_ws() {
     ttg.warp_specialize() attributes {warpGroupStartIds = array<i32: 4>}
     default {

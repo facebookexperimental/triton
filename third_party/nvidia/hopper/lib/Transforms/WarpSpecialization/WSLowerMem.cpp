@@ -393,7 +393,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     auto copyOp =
         builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
             tmaLoad.getLoc(), tmaLoad.getDesc(), tmaLoad.getIndices(),
-            tmaBarrier, pipelineBuffer, pred);
+            tmaBarrier, pipelineBuffer, pred, /*multicast=*/false,
+            tmaLoad.getCachePolicyAttr());
     if (tmaLoad->hasAttr(ttng::AttrTwoCTALoadName))
       copyOp.setTwoCta(true);
     copy = copyOp;

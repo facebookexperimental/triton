@@ -27,13 +27,6 @@
 
 namespace py = nanobind;
 
-// Defined in ir.cc. Declared here rather than in ir.h so ir.h stays free of
-// Python binding implementation details and matches upstream.
-namespace ir {
-extern py::class_<TritonOpBuilder> *getBuilderClass();
-} // namespace ir
-
-using namespace ir;
 using namespace mlir;
 namespace tt = triton;
 namespace ttg = triton::gpu;
@@ -128,9 +121,12 @@ static Value materializeConcreteMemDesc(TritonOpBuilder &builder, Value value) {
 }
 
 void init_triton_tlx_ir(py::module_ &m) {
-  auto *builder_cls = ir::getBuilderClass();
+  // Borrow the registered builder type; a static binding would retain
+  // ir.builder past interpreter shutdown (see test_bindings).
+  auto builder_cls =
+      py::borrow<py::class_<TritonOpBuilder>>(py::type<TritonOpBuilder>());
   builder_cls
-      ->def(
+      .def(
           "create_memdesc_subview",
           [](TritonOpBuilder &self, Value localAlloc,
              Value bufferIdx) -> mlir::Value {
@@ -1640,7 +1636,10 @@ void init_triton_tlx_ir(py::module_ &m) {
              self.create<ttng::AsyncTMACopyGlobalToLocalOp>(
                  multicastTargetBitMask, desc, coord,
                  /*offsets=*/std::vector<Value>{}, mbarrier, result, pred,
-                 multicast, cacheModifier, evictionPolicy, isVolatile, twoCta);
+                 multicast,
+                 buildCachePolicy(self.getBuilder(), cacheModifier,
+                                  evictionPolicy),
+                 isVolatile, twoCta);
            })
       .def(
           "create_async_TMA_gather",
@@ -1678,8 +1677,10 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def("create_async_TMA_store",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
               Value source, tt::EvictionPolicy evictionPolicy) -> void {
-             self.create<ttng::AsyncTMACopyLocalToGlobalOp>(desc, coord, source,
-                                                            evictionPolicy);
+             self.create<ttng::AsyncTMACopyLocalToGlobalOp>(
+                 desc, coord, source,
+                 buildCachePolicy(self.getBuilder(), tt::CacheModifier::NONE,
+                                  evictionPolicy));
            })
       .def("create_async_TMA_reduce",
            [](TritonOpBuilder &self, tt::DescriptorReduceKind kind, Value desc,

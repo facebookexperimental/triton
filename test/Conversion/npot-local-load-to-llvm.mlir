@@ -51,8 +51,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
     %a = ttg.local_alloc : () -> !ttg.memdesc<64x96xf16, #s8, #smem, mutable>
     %s = ttg.memdesc_subslice %a [16, 0] : !ttg.memdesc<64x96xf16, #s8, #smem, mutable> -> !ttg.memdesc<16x96xf16, #s8, #smem, mutable, 64x96>
     // CHECK: llvm.mlir.constant(16 : i32)
-    // CHECK: %[[ROW:.*]] = llvm.extractvalue %{{.*}}[1]
-    // CHECK: llvm.shl %[[ROW]]
     // CHECK: %[[O:.*]] = llvm.or disjoint
     // CHECK-NEXT: %[[ORIGIN:.*]] = llvm.xor %{{.*}}, %[[O]] : i32
     // CHECK: llvm.xor %{{.*}}, %[[ORIGIN]] : i32

@@ -8,9 +8,9 @@
 #scales = #ttng.tensor_memory_scales_encoding<>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103"} {
   // CHECK-LABEL: @nvfp4_k96
+  // CHECK-DAG: %[[DESC:.*]] = llvm.mlir.constant(-2011167616 : i32)
   // CHECK: tcgen05.st.sync.aligned.32x32b.x8.b32
-  // CHECK: llvm.mlir.constant(-2011167616 : i32)
-  // CHECK-NEXT: tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16
+  // CHECK: tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16{{.*}}%[[DESC]]
   // CHECK-NOT: tcgen05.mma
   tt.func @nvfp4_k96(%a: !ttg.memdesc<128x48xi8, #a, #ttg.shared_memory>, %b: !ttg.memdesc<48x128xi8, #b, #ttg.shared_memory>, %p: i1) {
     %s = arith.constant dense<1.0> : tensor<128x6xf8E4M3FN, #s>

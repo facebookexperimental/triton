@@ -479,23 +479,34 @@ static int64_t getPow2AllocSize(int64_t size) {
   return llvm::PowerOf2Ceil(size);
 }
 
-LinearLayout
-ensureLayoutNotLargerThan(const LinearLayout &layout,
-                          const llvm::SmallDenseMap<StringAttr, int64_t> &shape,
-                          bool broadcastRegisters) {
+LinearLayout ensureLayoutNotLargerThan(const LinearLayout &layout,
+                                       ArrayRef<StringAttr> dimNames,
+                                       ArrayRef<int64_t> shape,
+                                       bool broadcastRegisters) {
   assert(shape.size() == layout.getNumOutDims());
+  assert(dimNames.size() == shape.size());
+  assert(llvm::SmallDenseSet<StringAttr>(dimNames.begin(), dimNames.end())
+                 .size() == dimNames.size() &&
+         "duplicate dimension names given");
   if (shape.empty()) {
     return layout;
   }
-  MLIRContext *ctx = shape.begin()->first.getContext();
+  MLIRContext *ctx = dimNames.front().getContext();
   auto bases = layout.getBases();
   auto kRegister = StringAttr::get(ctx, "register");
   std::set<int32_t> broadcastedDims;
 
+  // Positional shape lookup by output-dim name (names map 1:1 to sizes).
+  auto desiredSizeFor = [&](StringAttr outDimName) {
+    auto it = llvm::find(dimNames, outDimName);
+    assert(it != dimNames.end());
+    return getPow2AllocSize(shape[it - dimNames.begin()]);
+  };
+
   for (auto outDim : llvm::enumerate(layout.getOutDimNames())) {
     auto outDimName = outDim.value();
     int32_t actualSize = layout.getOutDimSize(outDimName);
-    int32_t desiredSize = getPow2AllocSize(shape.lookup(outDimName));
+    int32_t desiredSize = desiredSizeFor(outDimName);
     if (actualSize <= desiredSize) {
       continue;
     }
@@ -547,41 +558,65 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
   }
   auto outDims = layout.getOutDims();
   for (auto &[outDim, outDimSize] : outDims) {
-    outDimSize =
-        std::min<int32_t>(outDimSize, getPow2AllocSize(shape.lookup(outDim)));
+    outDimSize = std::min<int32_t>(outDimSize, desiredSizeFor(outDim));
   }
 
   return LinearLayout(std::move(bases), std::move(radices), std::move(outDims),
                       /*requireSurjective=*/false);
 }
 
-// For each out-dim d, ensure the layout's out-size (i.e. its codomain) is no
-// smaller than shape[d].  Do this by increasing the size of the layout's inputs
-// along its most-minor dimension ("register" for register layouts, "offset" for
-// shared layouts).
-//
-// This function is invariant to the order of the layout's input dimensions, but
-// it cares about the order of the output dims, which should be minor-to-major.
-LinearLayout ensureLayoutNotSmallerThan(
-    const LinearLayout &layout,
-    const llvm::SmallDenseMap<StringAttr, int64_t> &shape) {
+LinearLayout
+ensureLayoutNotLargerThan(const LinearLayout &layout,
+                          const llvm::SmallDenseMap<StringAttr, int64_t> &shape,
+                          bool broadcastRegisters) {
+  SmallVector<StringAttr> dimNames;
+  SmallVector<int64_t> sizes;
+  for (auto &[dim, size] : shape) {
+    dimNames.push_back(dim);
+    sizes.push_back(size);
+  }
+  return ensureLayoutNotLargerThan(layout, dimNames, sizes, broadcastRegisters);
+}
+
+LinearLayout ensureLayoutNotSmallerThan(const LinearLayout &layout,
+                                        ArrayRef<StringAttr> dimNames,
+                                        ArrayRef<int64_t> shape,
+                                        StringAttr inDim) {
   assert(shape.size() == layout.getNumOutDims());
+  llvm::SmallDenseMap<StringAttr, int64_t> namedDims;
+  for (auto [dimName, length] : llvm::zip_equal(dimNames, shape))
+    namedDims[dimName] = length;
+  assert(namedDims.size() == shape.size() && "duplicate dimension names given");
   if (shape.empty()) {
     return layout;
   }
 
-  StringAttr kDim = *layout.getInDimNames().begin();
-  assert(kDim == "register" || kDim == "offset");
+  assert(layout.hasInDim(inDim));
 
   LinearLayout ret = layout;
   for (StringAttr outDimName : layout.getOutDimNames()) {
     int32_t actualSize = layout.getOutDimSize(outDimName);
-    int32_t desiredSize = getPow2AllocSize(shape.lookup(outDimName));
+    int32_t desiredSize = getPow2AllocSize(namedDims.lookup(outDimName));
     assert(actualSize > desiredSize || desiredSize % actualSize == 0);
-    ret *= LinearLayout::identity1D(desiredSize / actualSize, kDim, outDimName);
+    ret *=
+        LinearLayout::identity1D(desiredSize / actualSize, inDim, outDimName);
     assert(ret.getOutDimSize(outDimName) >= desiredSize);
   }
   return ret;
+}
+
+LinearLayout ensureLayoutNotSmallerThan(
+    const LinearLayout &layout,
+    const llvm::SmallDenseMap<StringAttr, int64_t> &shape) {
+  StringAttr kDim = *layout.getInDimNames().begin();
+  assert(kDim == "register" || kDim == "offset");
+  SmallVector<StringAttr> dimNames;
+  SmallVector<int64_t> sizes;
+  for (auto &[dim, size] : shape) {
+    dimNames.push_back(dim);
+    sizes.push_back(size);
+  }
+  return ensureLayoutNotSmallerThan(layout, dimNames, sizes, kDim);
 }
 
 // Returns ["dim0", "dim1", ..., "dim<rank-1>"].
@@ -1173,11 +1208,14 @@ largestVectorisation(MLIRContext *ctx, const LinearLayout &cvt, int bitwidth,
 std::optional<LinearLayout> getReps(const LinearLayout &cvt,
                                     const LinearLayout &tile) {
 
-  // Ensure tile out-dims are subset of cvt out-dims.
-  for (auto od : tile.getOutDimNames())
+  // The full tile must fit even when cvt is a view of it.
+  for (auto od : tile.getOutDimNames()) {
     assert(cvt.hasOutDim(od) && "tile out-dims must be contained in cvt");
+    if (tile.getOutDimSize(od) > cvt.getOutDimSize(od))
+      return std::nullopt;
+  }
 
-  // Build a per-out-dimension mask by OR-ing all tile bases that touch it.
+  // Include bases outside the view so repetitions cannot overlap the full tile.
   llvm::SmallDenseMap<StringAttr, int32_t> tileMaskPerOutDim;
   auto tileInDims = llvm::to_vector(tile.getInDimNames());
   for (StringAttr od : cvt.getOutDimNames())
@@ -1189,13 +1227,7 @@ std::optional<LinearLayout> getReps(const LinearLayout &cvt,
   LinearLayout::BasesT repsBases;
   for (StringAttr id : cvt.getInDimNames()) {
     int inA = cvt.getInDimSizeLog2(id);
-    int inB = tile.hasInDim(id) ? tile.getInDimSizeLog2(id) : 0;
-    if (inB > inA) {
-      return std::nullopt;
-    }
-
-    std::vector<std::vector<int32_t>> basesForDim;
-    basesForDim.reserve(inA);
+    int inB = tile.hasInDim(id) ? std::min(inA, tile.getInDimSizeLog2(id)) : 0;
 
     // 1) Validate the starting bases match exactly.
     for (int i = 0; i < inB; ++i) {
@@ -1224,17 +1256,9 @@ std::optional<LinearLayout> getReps(const LinearLayout &cvt,
     }
 
     // 3) Emit reps bases: first inB as all-zeros; remainder copied from cvt.
-    for (int i = 0; i < inB; ++i) {
-      std::vector<int32_t> zero(cvt.getNumOutDims(), 0);
-      basesForDim.push_back(std::move(zero));
-    }
-    for (int i = inB; i < inA; ++i) {
-      std::vector<int32_t> keep;
-      keep.reserve(cvt.getNumOutDims());
-      for (StringAttr od : cvt.getOutDimNames())
-        keep.push_back(cvt.getBasis(id, i, od));
-      basesForDim.push_back(std::move(keep));
-    }
+    auto basesForDim = cvt.getBases().lookup(id);
+    for (int i = 0; i < inB; ++i)
+      std::fill(basesForDim[i].begin(), basesForDim[i].end(), 0);
 
     repsBases[id] = std::move(basesForDim);
   }
