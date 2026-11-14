@@ -130,7 +130,7 @@ d_weight, d_bias = mm_bias_grad(dout, input_act, space=&quot;full&quot;)</code><
 <pre><code class="language-bash">CUDA_VISIBLE_DEVICES=1 buck2 run @mode/opt -m ovr_config//triton:beta \
   -c fbcode.nvcc_arch=b200a -m ovr_config//third-party/cuda/constraints:12.8 \
   --agent-context direct_call=true --agent-context reason=&quot;Check fused weight and bias gradients&quot; \
-  fbsource//third-party/triton/beta/triton:py_tlx_mm_bias_grad_test -- -s --tb=short -v</code></pre>
+  fbsource//third-party/triton/beta/triton:py_tlx_ops_blackwell_test -- -s --tb=short -v</code></pre>
 <h3 id="benchmark-against-unfused-pt2">Benchmark against unfused PT2</h3>
 <p>The TritonBench operator is <code>mm_bias_grad</code>, with <code>pt2_unfused_best</code> and <code>tlx</code> providers. Both return the complete weight and bias pair. PT2 selects among 28 separately compiled serial and concurrent candidates before TritonBench times the providers with CUDA graphs. Inputs are seeded random BF16 tensors.</p>
 <p>From <code>fbsource/fbcode</code>:</p>
