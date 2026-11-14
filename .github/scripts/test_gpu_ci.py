@@ -871,6 +871,23 @@ def workflow_condition(expression, context):
     return eval(expression, {'__builtins__': {}}, {})
 
 
+def test_standalone_full_build_ignores_skipped_pr_followup():
+    full = yaml.load((ROOT / '.github/workflows/gpu-tests.yml').read_text(), Loader=yaml.BaseLoader)
+    build = full['jobs']['build']
+    context = {
+        'needs.followup.result': 'skipped',
+        'needs.select.result': 'success',
+        'needs.select.outputs.build': 'true',
+    }
+    for event in ('push', 'schedule', 'workflow_dispatch'):
+        run = context | {'github.event_name': event}
+        assert workflow_condition(build['if'], run)
+        assert not workflow_condition(build['if'], run | {'needs.select.outputs.build': 'false'})
+        assert not workflow_condition(build['if'], run | {'needs.select.result': 'failure'})
+        assert not workflow_condition(build['if'], run | {'cancelled': True})
+    assert not workflow_condition(build['if'], context | {'github.event_name': 'workflow_run'})
+
+
 def test_full_tests_follow_only_a_verified_current_fast_run():
     # Fast correctness stays one quick run with one head build. GPU full tests start only from its success
     # (workflow_run), test only after the producer is verified current, and never rebuild the head.
@@ -882,12 +899,12 @@ def test_full_tests_follow_only_a_verified_current_fast_run():
     calls = [job.get('uses') for job in fast['jobs'].values()]
     assert calls.count('./.github/workflows/build.yml') == 1
     assert not {'./.github/workflows/gpu-tests.yml', './.github/workflows/tlx-codegen-trace.yml'} & set(calls)
-    assert full['on']['workflow_run'] == {'workflows': [fast['name']], 'types': ['in_progress', 'completed']}
+    assert full['on']['workflow_run'] == {'workflows': [fast['name']], 'types': ['completed']}
     assert trace['on']['workflow_run'] == {'workflows': [fast['name']], 'types': ['completed']}
     event = {'github.event_name': 'workflow_run', 'github.event.action': 'completed'}
     assert workflow_condition(full['jobs']['followup']['if'], event)
     assert not workflow_condition(full['jobs']['followup']['if'], event | {'github.event.action': 'in_progress'})
-    assert full['concurrency']['cancel-in-progress'] == "${{ github.event_name == 'workflow_run' }}"
+    assert 'concurrency' not in full
     produced = {'github.event.workflow_run.conclusion': 'success', 'github.event.workflow_run.event': 'pull_request'}
     assert workflow_condition(followup['jobs']['verify']['if'], produced)
     for change in ({'github.event.workflow_run.conclusion':
@@ -910,7 +927,8 @@ def test_full_tests_follow_only_a_verified_current_fast_run():
     assert workflow_condition(full['jobs']['select']['if'], push)
     assert not workflow_condition(full['jobs']['build']['if'],
                                   run | {'needs.select.outputs.build': 'true', 'needs.select.result': 'success'})
-    for platform in ('h100', 'b200', 'mi350', 'cpu'):
+    assert full['jobs']['b200']['if'] == '${{ false }}'
+    for platform in ('h100', 'mi350', 'cpu'):
         worker = full['jobs']['cpu-tests' if platform == 'cpu' else platform]
         context = run | {
             'needs.select.result': 'success', 'needs.build.result': 'skipped', f'needs.select.outputs.{platform}':
@@ -1320,10 +1338,12 @@ def test_manual_platform_allowlist_preserves_requested_work(tmp_path, script, re
                 "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_REPOSITORY": "facebookexperimental/triton"
             }, check=True, capture_output=True, text=True)
         outputs.append(dict(line.split("=", 1) for line in output.read_text().splitlines()))
+        assert 'this run does not cover B200' in summary.read_text()
         if platforms:
             assert f"Manual platform list: {platforms}" in summary.read_text()
             assert "Other platforms are not covered" in summary.read_text()
     normal, limited = outputs
+    assert normal['b200'] == limited['b200'] == 'false'
     for platform in ("h100", "b200", "mi350", "cpu"):
         plan = json.loads(limited[f"{platform}_plan"])
         if platform in requested.split(","):

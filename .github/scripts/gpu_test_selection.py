@@ -806,10 +806,15 @@ def main():
                     suite["files"] = []
         if "cpu" not in platforms:
             plan["cpu"] = {}
-        plan["build"] = bool(plan["cpu"]) or any(suite["files"]
-                                                 for suites in plan["gpu"].values()
-                                                 for suite in suites.values())
         selection_note = f"Manual platform list: {','.join(platforms)}. Other platforms are not covered by this run."
+    for suite in plan["gpu"]["b200"].values():
+        suite["files"] = []
+    plan["build"] = bool(plan["cpu"]) or any(suite["files"]
+                                             for groups in plan["gpu"].values()
+                                             for suite in groups.values())
+    disabled_note = "B200 temporarily disabled: runner offline; this run does not cover B200."
+    selection_note = (selection_note + "\n\n" if selection_note else "") + disabled_note
+    print(f"::warning::{disabled_note}")
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     print(json.dumps(plan, indent=2))
     selection = {platform: any(step["files"] for step in steps.values()) for platform, steps in plan["gpu"].items()}
