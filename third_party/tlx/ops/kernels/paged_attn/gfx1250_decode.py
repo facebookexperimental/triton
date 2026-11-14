@@ -185,7 +185,18 @@ def _select_config(batch, qlen, max_context_len, window=0, kv_heads=2):
             budget = 1024
         elif window and short and 64 < groups <= 128:
             budget = 512
-    splits = max(1, min(triton.cdiv(active, 64), triton.next_power_of_2(max(1, budget // groups))))
+    # Medium global workloads spend a significant fraction of their time writing
+    # and merging partials. Limit their CTA count without rounding up to a power
+    # of two: that can nearly double the work for intermediate batch sizes.
+    medium_global = not window and 16 < groups <= 64 and 2176 < active and groups * active <= 524288
+    if medium_global:
+        if qlen == 1:
+            budget = 512 if groups == 32 and active <= 8192 else 1024
+        else:
+            budget = 1024 if groups == 64 and active > 4096 else 512
+        splits = max(1, min(triton.cdiv(active, 64), triton.cdiv(budget, groups)))
+    else:
+        splits = max(1, min(triton.cdiv(active, 64), triton.next_power_of_2(max(1, budget // groups))))
     reduce_rows = min(8, max(1, 128 // triton.next_power_of_2(splits))) if groups >= 64 and qlen > 1 else 1
     reduce_warps = 4 if splits >= 256 else 1
     return splits, warps, reduce_rows, reduce_warps

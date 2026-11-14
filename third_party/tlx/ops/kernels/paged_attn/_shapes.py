@@ -30,6 +30,12 @@ PRIMARY = tuple(
     Shape(b, q, k, w) for b in (1, 8, 32, 128) for k in (2048, 8192, 16384, 32768) for q in (1, 8) for w in (0, 2048))
 EXTENDED = tuple(
     Shape(b, q, k, w) for b in (2, 16, 64, 256) for k in (4096, 16384, 65536) for q in (1, 8) for w in (0, 2048))
+INTERMEDIATE = tuple(
+    Shape(b, q, k, 0, True, 2, profile)
+    for b in (12, 24)
+    for q in (1, 7, 8)
+    for k in (4096, 8192, 16384)
+    for profile in ("uniform", "mixed"))
 FULL_HEADS = tuple(s._replace(kv_heads=h) for h in (4, 16) for s in PRIMARY)
 MIXED = tuple(
     Shape(b, q, k, w, True, h, "mixed")
@@ -58,10 +64,11 @@ FOCUS = FocusRegistry(
                 shapes=PRIMARY), FocusSuite(name="gfx1250_extended", op="paged_attention_decode", shapes=EXTENDED),
      FocusSuite(name="gfx1250_heads", op="paged_attention_decode",
                 shapes=FULL_HEADS), FocusSuite(name="gfx1250_mixed", op="paged_attention_decode", shapes=MIXED),
-     FocusSuite(name="gfx1250_sbd", op="paged_attention_decode", shapes=SBD),
+     FocusSuite(name="gfx1250_intermediate", op="paged_attention_decode",
+                shapes=INTERMEDIATE), FocusSuite(name="gfx1250_sbd", op="paged_attention_decode", shapes=SBD),
      FocusSuite(name="gfx1250_4d", op="paged_attention_decode", shapes=tuple(s._replace(packed=False)
                                                                              for s in PRIMARY))),
-    {"gfx1250": ("gfx1250_primary", "gfx1250_heads", "gfx1250_mixed", "gfx1250_sbd")},
+    {"gfx1250": ("gfx1250_primary", "gfx1250_heads", "gfx1250_mixed", "gfx1250_intermediate", "gfx1250_sbd")},
 )
 
 

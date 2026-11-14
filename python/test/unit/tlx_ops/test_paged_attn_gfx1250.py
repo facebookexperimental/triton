@@ -91,9 +91,9 @@ def test_split_numerics(query_length, packed, case):
 @pytest.mark.parametrize("query_length", [1, 7, 8])
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("window", [0, 63, 2048, 4099])
-@pytest.mark.parametrize("batch,kv_heads", [(65, 2), (32, 16), (33, 16)])
+@pytest.mark.parametrize("batch,kv_heads", [(12, 2), (16, 2), (65, 2), (32, 16), (33, 16)])
 def test_graph_updates_and_independent_streams(query_length, packed, window, batch, kv_heads):
-    # Exercise sequence rotation, adjacent-head dispatch, and irregular batches.
+    # Exercise medium split counts, sequence rotation, and adjacent-head dispatch.
     # A full-context window must use the same plan as global attention.
     capacity = 4099
     inputs = make_inputs([capacity] * batch, query_length, kv_heads=kv_heads)
