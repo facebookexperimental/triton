@@ -20,11 +20,12 @@ def _async_amd_desc_load_kernel(
     output_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
+    CACHE: tl.constexpr = "",
 ):
     desc = tl.make_tensor_descriptor(x_ptr, [M, N], [N, 1], [M, N])
     buf = tlx.local_alloc((M, N), tl.float16, 1)
     buf0 = tlx.local_view(buf, 0)
-    tlx.async_amd_descriptor_load(desc, buf0, [0, 0])
+    tlx.async_amd_descriptor_load(desc, buf0, [0, 0], cache_modifier=CACHE)
     tlx.async_amd_descriptor_wait(pendings=0)
     x = tlx.local_load(buf0)
     tl.store(output_ptr + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :], x)
@@ -177,11 +178,12 @@ def _local_reshape_kernel(
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
 @pytest.mark.parametrize("M, N", [(32, 32), (64, 128)])
-def test_async_amd_desc_load_correctness_gfx1250(device, M, N):
+@pytest.mark.parametrize("cache", ["", ".ca", ".cg", ".cs", ".cv"])
+def test_async_amd_desc_load_correctness_gfx1250(device, M, N, cache):
     """async_amd_descriptor_load produces correct results on gfx1250."""
     x = torch.randn(M, N, dtype=torch.float16, device=device)
     output = torch.empty_like(x)
-    _async_amd_desc_load_kernel[(1, )](x, output, M=M, N=N)
+    _async_amd_desc_load_kernel[(1, )](x, output, M=M, N=N, CACHE=cache)
     torch.testing.assert_close(x, output)
 
 

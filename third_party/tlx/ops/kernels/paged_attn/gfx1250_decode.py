@@ -66,12 +66,14 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
         vd = tl.make_tensor_descriptor(V, [NP * KH * 64, 64], [64, 1], [64, 64])
         kb = tlx.local_alloc((64, 64), tl.bfloat16, 2)
         vb = tlx.local_alloc((64, 64), tl.bfloat16, 2)
+    # Packed pages are streamed once per partition; avoid retaining them in
+    # preference to the query, page table and reduction workspace.
     if first < end:
         physical = tl.load(Table + b.to(tl.int64) * TS + first // 64)
         tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 0), [(physical * KH + h) * (8 if PACKED else 64), 0],
-                                      clamp_bounds=False)
+                                      clamp_bounds=False, cache_modifier=".cs" if PACKED else "")
         tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 0), [(physical * KH + h) * (8 if PACKED else 64), 0],
-                                      clamp_bounds=False)
+                                      clamp_bounds=False, cache_modifier=".cs" if PACKED else "")
     for base in range(first, end, BN):
         pos = base + n
         slot = ((base - first) // BN) % 2
@@ -85,9 +87,11 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
         if base + BN < end:
             next_phys = tl.load(Table + b.to(tl.int64) * TS + (base + BN) // 64)
             tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 1 - slot),
-                                          [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False)
+                                          [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False,
+                                          cache_modifier=".cs" if PACKED else "")
             tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 1 - slot),
-                                          [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False)
+                                          [(next_phys * KH + h) * (8 if PACKED else 64), 0], clamp_bounds=False,
+                                          cache_modifier=".cs" if PACKED else "")
         if PACKED and QLEN > 1:
             k = kr
         elif PACKED:

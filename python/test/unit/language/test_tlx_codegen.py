@@ -6570,11 +6570,12 @@ def _async_amd_desc_load_kernel(
     output_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
+    CACHE: tl.constexpr = "",
 ):
     desc = tl.make_tensor_descriptor(x_ptr, [M, N], [N, 1], [M, N])
     buf = tlx.local_alloc((M, N), tl.float16, 1)
     buf0 = tlx.local_view(buf, 0)
-    tlx.async_amd_descriptor_load(desc, buf0, [0, 0])
+    tlx.async_amd_descriptor_load(desc, buf0, [0, 0], cache_modifier=CACHE)
     tlx.async_amd_descriptor_wait(pendings=0)
     x = tlx.local_load(buf0)
     tl.store(output_ptr + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :], x)
@@ -6879,20 +6880,37 @@ def test_loop_carried_dot_layout_cleanup_compiles_gfx950(device):
     assert len(compiled.asm["amdgcn"]) > 0
 
 
-def test_async_amd_desc_load_compiles_gfx1250(device):
+@pytest.mark.parametrize("cache", ["", ".ca", ".cg", ".cs", ".cv"])
+def test_async_amd_desc_load_compiles_gfx1250(device, cache):
     """async_amd_descriptor_load should produce TDM ops in TTGIR."""
     compiled = compile_for_gfx1250(
         _async_amd_desc_load_kernel,
         signature={"x_ptr": "*fp16", "output_ptr": "*fp16"},
-        constexprs={"M": 32, "N": 32},
+        constexprs={"M": 32, "N": 32, "CACHE": cache},
     )
     ttgir = compiled.asm["ttgir"]
     assert "async_tdm_copy_global_to_local" in ttgir
     assert "clamp_bounds" in ttgir
     assert "async_tdm_wait" in ttgir
     assert "local_load" in ttgir
+    if cache:
+        value = getattr(ir.CACHE_MODIFIER, cache[1:].upper()).value
+        assert f"cache = {value} : i32" in ttgir
+    else:
+        assert "cache =" not in ttgir
     assert "amdgcn" in compiled.asm
     assert len(compiled.asm["amdgcn"]) > 0
+    if cache == ".cs":
+        assert "th:TH_LOAD_NT" in compiled.asm["amdgcn"]
+
+
+def test_async_amd_desc_load_rejects_invalid_cache_gfx1250(device):
+    with pytest.raises(CompilationError, match=r"Cache modifier.*\.wb.*not supported"):
+        compile_for_gfx1250(
+            _async_amd_desc_load_kernel,
+            signature={"x_ptr": "*fp16", "output_ptr": "*fp16"},
+            constexprs={"M": 32, "N": 32, "CACHE": ".wb"},
+        )
 
 
 def test_async_amd_desc_load_fused_compiles_gfx1250(device):
