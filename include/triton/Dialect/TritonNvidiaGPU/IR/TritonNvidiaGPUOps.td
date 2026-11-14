@@ -379,12 +379,22 @@ def TTNG_CLCAdvanceOp
     from the claimed cluster base and may differ along clustered dimensions.
     Which CTA issues the request is a lowering detail and is not observable in
     the operation semantics.
+
+    The optional `steal` predicate enables partial work-stealing. When it is
+    false, no request is issued, no pending cluster is cancelled, and the op
+    returns `isValid = false`, so the CTA retires after its current tile. Tiles
+    are never lost because only a CTA that issues a request (and then runs the
+    claimed tile) can cancel a cluster. In a clustered launch `steal` must be
+    cluster-uniform. Absent means always steal.
   }];
+
+  let arguments = (ins Optional<I1>:$steal);
 
   let results = (outs I1:$isValid, I32:$x, I32:$y, I32:$z);
 
-  let assemblyFormat =
-      [{ attr-dict `:` type($isValid) `,` type($x) `,` type($y) `,` type($z) }];
+  let assemblyFormat = [{
+    ($steal^)? attr-dict `:` type($isValid) `,` type($x) `,` type($y) `,` type($z)
+  }];
 }
 
 //
@@ -411,11 +421,17 @@ def TTNG_CLCTryCancelAsyncOp
 
     In a clustered launch, the token represents one cluster-scoped request.
     Exactly one CTA issues it; CTA election is a lowering detail.
+
+    The optional `steal` predicate is carried over from `clc_advance`: when it
+    is false no request is issued and the paired `clc_read` returns
+    `isValid = false`.
   }];
+
+  let arguments = (ins Optional<I1>:$steal);
 
   let results = (outs TTG_AsyncToken:$token);
 
-  let assemblyFormat = [{ attr-dict `:` type($token) }];
+  let assemblyFormat = [{ ($steal^)? attr-dict `:` type($token) }];
 }
 
 def TTNG_CLCReadOp
