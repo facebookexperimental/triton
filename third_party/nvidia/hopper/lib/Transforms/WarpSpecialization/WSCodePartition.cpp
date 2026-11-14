@@ -29,6 +29,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/MapVector.h"
 #include <unordered_set>
 
@@ -5651,6 +5652,120 @@ static LogicalResult hoistDescriptorLoadBuffers(triton::FuncOp funcOp) {
   return success();
 }
 
+/// Forward an MMA-only allocation to the descriptor buffer that supplied its
+/// source tensor. This removes an otherwise redundant SMEM-to-register-to-SMEM
+/// copy while leaving the register consumer on the original local_load.
+static void foldDescriptorLoadMmaBridge(triton::FuncOp funcOp) {
+  auto module = funcOp->getParentOfType<ModuleOp>();
+  if (!module || ttg::lookupPhysicalNumCTAs(module) != 1 ||
+      triton::tools::getBoolEnv("TRITON_WS_DISABLE_BRIDGE_FOLD"))
+    return;
+
+  struct BridgeFold {
+    ttg::LocalAllocOp bridge;
+    ttg::LocalLoadOp localLoad;
+    Value descriptorBuffer;
+    SmallVector<AsyncTaskId> registerConsumerTasks;
+  };
+  SmallVector<BridgeFold> bridges;
+  funcOp.walk([&](ttg::LocalAllocOp bridge) {
+    if (!bridge.getSrc() || !bridge->hasOneUse())
+      return;
+
+    auto localLoad = bridge.getSrc().getDefiningOp<ttg::LocalLoadOp>();
+    auto sourceAlloc =
+        localLoad ? localLoad.getSrc().getDefiningOp<ttg::LocalAllocOp>()
+                  : nullptr;
+    if (!localLoad || !sourceAlloc || sourceAlloc.getSrc())
+      return;
+    for (NamedAttribute attr : bridge->getAttrs()) {
+      if (attr.getName() != kAsyncTaskIdAttrName &&
+          attr.getName() != "alignment" && attr.getName() != "loop.cluster" &&
+          attr.getName() != "loop.stage")
+        return;
+    }
+    Operation *registerConsumer = nullptr;
+    for (Operation *user : localLoad.getResult().getUsers()) {
+      if (user == bridge || user == registerConsumer)
+        continue;
+      if (registerConsumer)
+        return;
+      registerConsumer = user;
+    }
+    if (!registerConsumer)
+      return;
+
+    ttnvws::DescriptorLoadOp descriptorLoad;
+    unsigned localLoadUsers = 0;
+    for (Operation *user : sourceAlloc->getUsers()) {
+      if (auto load = dyn_cast<ttnvws::DescriptorLoadOp>(user)) {
+        if (descriptorLoad)
+          return;
+        descriptorLoad = load;
+      } else if (user == localLoad) {
+        ++localLoadUsers;
+      } else {
+        return;
+      }
+    }
+    if (!descriptorLoad || localLoadUsers != 1 ||
+        descriptorLoad.getResult() != sourceAlloc.getResult())
+      return;
+
+    auto srcType = cast<ttg::MemDescType>(sourceAlloc.getType());
+    auto dstType = cast<ttg::MemDescType>(bridge.getType());
+    if (srcType.getShape() != dstType.getShape() ||
+        srcType.getAllocShape() != dstType.getAllocShape() ||
+        srcType.getElementType() != dstType.getElementType() ||
+        srcType.getEncoding() != dstType.getEncoding() ||
+        srcType.getMemorySpace() != dstType.getMemorySpace() ||
+        sourceAlloc.getAlignment() != bridge.getAlignment())
+      return;
+
+    auto mma = dyn_cast<ttng::MMAv5OpInterface>(*bridge->user_begin());
+    if (!mma ||
+        (mma.getA() != bridge.getResult() && mma.getB() != bridge.getResult()))
+      return;
+    if (descriptorLoad->getBlock() != localLoad->getBlock() ||
+        localLoad->getBlock() != bridge->getBlock() ||
+        bridge->getBlock() != mma->getBlock() ||
+        !descriptorLoad->isBeforeInBlock(localLoad) ||
+        !localLoad->isBeforeInBlock(bridge) || !bridge->isBeforeInBlock(mma))
+      return;
+    // The descriptor producer may be scheduled earlier. The register snapshot,
+    // bridge, and MMA must still consume the same pipelined iteration.
+    for (StringRef attrName : {"loop.cluster", "loop.stage"}) {
+      Attribute cadence = bridge->getAttr(attrName);
+      if (localLoad->getAttr(attrName) != cadence ||
+          mma->getAttr(attrName) != cadence)
+        return;
+    }
+
+    auto producerTasks = getAsyncTaskIds(descriptorLoad.getOperation());
+    auto registerConsumerTasks = getAsyncTaskIds(registerConsumer);
+    auto mmaTasks = getAsyncTaskIds(mma.getOperation());
+    if (producerTasks.size() != 1 || registerConsumerTasks.size() != 1 ||
+        mmaTasks.size() != 1 || getAsyncTaskIds(bridge) != producerTasks ||
+        producerTasks == registerConsumerTasks || producerTasks == mmaTasks ||
+        registerConsumerTasks == mmaTasks)
+      return;
+    // Data-partitioned slices need no extra guard: each slice has its own
+    // ring with exactly these two readers, and tcgen05.commit covers every
+    // earlier MMA of the issuing thread, so a shared MMA partition can only
+    // delay a slice's release.
+
+    bridges.push_back({bridge, localLoad, sourceAlloc.getResult(),
+                       std::move(registerConsumerTasks)});
+  });
+
+  for (auto &fold : bridges) {
+    fold.bridge.getResult().replaceAllUsesWith(fold.descriptorBuffer);
+    // The producer task read the local_load only to feed the bridge.
+    setAsyncTaskIds(fold.localLoad, fold.registerConsumerTasks);
+    fold.bridge.erase();
+  }
+}
+
 LogicalResult doBufferAllocation(triton::FuncOp funcOp) {
   // Step 0: Swap transposed local_alloc + memdesc_trans patterns so that
   // allocs that share the same source value can also share a buffer.
@@ -5665,6 +5780,10 @@ LogicalResult doBufferAllocation(triton::FuncOp funcOp) {
   // memory planning sees the canonical allocation from the outset.
   if (failed(hoistDescriptorLoadBuffers(funcOp)))
     return failure();
+
+  // Step 0.9: Share an exact-layout descriptor destination between its
+  // register consumer and a single MMAv5 consumer.
+  foldDescriptorLoadMmaBridge(funcOp);
 
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
