@@ -2061,13 +2061,10 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                                                                                                                    k)
                 != (1024, 1024, 24576), sink_insts_to_avoid_spills=(m, n, k) == (1024, 1024, 24576),
                 regclass_priority_trumps_globalness=(m, n, k) == (1024, 1024, 24576), llvm_fn_attrs=((
-                    ("amdgpu-agpr-alloc", "0,0"),
                     ("amdgpu-sched-strategy", "max-ilp"),
                     ("amdgpu-post-sched-strategy", "nop"),
                 ) if (m, n, k) == (1024, 1024, 24576) else (
-                    ("amdgpu-agpr-alloc", "0,0"),
-                    ("amdgpu-sched-strategy", "iterative-ilp" if skinny_uneven_split else "max-ilp"),
-                )))
+                    ("amdgpu-sched-strategy", "iterative-ilp" if skinny_uneven_split else "max-ilp"), )))
             if split_k > 1:
                 _reduce_split_k[(m // 32, n // 128)](workspace, out, m, n, split_k, 32, 128, num_warps=8)
             return out
@@ -2180,9 +2177,7 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                     (2048, 8192, 3072),
                 }), schedule_hint="mfma-schedule" if use_mfma_schedule else "",
                 regclass_priority_trumps_globalness=(m, n, k) == (2048, 1024, 24576), llvm_fn_attrs=((
-                    ("amdgpu-agpr-alloc", "0,0"),
-                    ("amdgpu-sched-strategy", "iterative-ilp"),
-                ) if (m, n, k) == (2048, 3072, 15360) else (("amdgpu-agpr-alloc", "0,0"), )))
+                    ("amdgpu-sched-strategy", "iterative-ilp"), ) if (m, n, k) == (2048, 3072, 15360) else ()))
             if split_k > 1 and not fused_split_reduce:
                 _reduce_split_k[(m // 32, n // 128)](workspace, out, m, n, split_k, 32, 128, STREAMING=(m, n, k) in {
                     (1024, 6144, 22656),

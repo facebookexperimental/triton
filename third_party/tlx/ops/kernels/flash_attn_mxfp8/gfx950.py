@@ -1323,14 +1323,13 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
             ZERO_SCALE=sm_scale == 0,
             num_warps=cfg["num_warps"],
             num_stages=1,
-            # Accumulators and scores stay in arch VGPRs for the softmax VALU
-            # work; the group-barrier scheduler interleaves LDS reads with MFMAs.
             # Without IEEE mode, max needs no canonicalizing v_max x, x of its
             # operands (NaN scores would still come out NaN).
-            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ("amdgpu-ieee", "false")),
+            llvm_fn_attrs=(("amdgpu-ieee", "false"), ),
             # Packed FP32 ops only issue in gaps in the other warp group's MFMA
             # stream; in thread traces the softmax adds stall for hundreds of cycles.
             disable_packed_fp32_ops=True,
+            # The group-barrier scheduler interleaves LDS reads with MFMAs.
             enable_sched_group_barrier_scheduler=True,
             sched_group_barrier_mfma_per_dwordx4=4,
         )

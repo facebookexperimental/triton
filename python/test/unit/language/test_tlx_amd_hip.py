@@ -139,7 +139,6 @@ def amd_fa_cluster_long_bf16_codegen_gfx950():
             num_stages=3,
             waves_per_eu=2,
             enable_sched_group_barrier_scheduler=False,
-            llvm_fn_attrs=_amd_fa_cluster_module._CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS,
         )
     return compiled
 
@@ -479,7 +478,6 @@ def test_amd_fa_cluster_n2048_four_slot_prefix_handoff_codegen_gfx950(dtype):
             num_stages=3,
             waves_per_eu=2,
             enable_sched_group_barrier_scheduler=False,
-            llvm_fn_attrs=_amd_fa_cluster_module._CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS,
         )
 
     ttir = compiled.asm["ttir"]
