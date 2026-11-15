@@ -17363,7 +17363,6 @@ def _launch_row_major_direct(a, b, out, plan, bias=None):
         TILES_PER_PROBLEM=tiles_per_problem,
         PROGRAM_COUNT=program_count,
         ADD_BIAS=bias is not None,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
         num_stages=1,
         **plan,
     )
@@ -19222,7 +19221,6 @@ NUM_XCDS = 8
 
 MIN_K = 2 * BLOCK_K  # pipeline prefetches 2 whole K-tiles; the rest goes to the masked tail
 KERNEL_NAME = "a16w16_8wave"
-_LLVM_ATTRS = (("amdgpu-agpr-alloc", "0,0"), )
 _READY_VALUE = 3
 
 
@@ -21091,9 +21089,9 @@ def _launch_lds(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EP
         num_warps=4 if BM == 128 else NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
-        # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
-        # v_accvgpr moves around each mfma). Essential to match the reference perf.
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+        # Only a four-wave work-group leaves AGPRs in the per-wave register budget,
+        # so the VGPR-only pin is a no-op for the eight-wave tile.
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ) if BM == 128 else (),
         enable_sched_group_barrier_scheduler=((M, N, K, a.dtype) not in _LDS_DISABLE_SCHEDULER_SHAPES),
     )
     if SPLIT_K > 1:
@@ -21203,7 +21201,7 @@ def streamk_matmul(a, b):
                                                  b.stride(0), b.stride(1), c.stride(0), c.stride(1), BLOCK_M=BM,
                                                  BLOCK_N=BN, BLOCK_K=BLOCK_K, NUM_XCDS=NUM_XCDS, NUM_CU=NUM_CU,
                                                  GROUP_SIZE_M=GROUP_SIZE_M, **schedule, num_warps=NUM_WARPS,
-                                                 num_stages=1, matrix_instr_nonkdim=16, llvm_fn_attrs=_LLVM_ATTRS)
+                                                 num_stages=1, matrix_instr_nonkdim=16)
     return c
 
 
@@ -21223,7 +21221,6 @@ _iw_NUM_XCDS = 8
 
 _iw_MIN_K = (2 * _iw_BLOCK_K)  # pipeline prefetches 2 whole K-tiles; the rest goes to the masked tail
 _iw_KERNEL_NAME = "a16w16_8wave"
-_iw_LLVM_ATTRS = (("amdgpu-agpr-alloc", "0,0"), )
 _iw_READY_VALUE = 3
 
 # Coalesced SIMD layout for a 128x128 fp16 output quadrant.  Keeping the
@@ -23372,7 +23369,6 @@ def _iw_streamk_matmul(
         num_warps=_iw_NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
-        llvm_fn_attrs=_iw_LLVM_ATTRS,
     )
     return c
 

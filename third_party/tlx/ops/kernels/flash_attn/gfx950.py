@@ -3429,13 +3429,6 @@ def flash_attn_cluster_pipeline(
             launch_meta.setdefault("llvm_fn_attrs", _CLUSTER_SHORT_N1024_LLVM_FN_ATTRS)
     else:
         launch_meta["STATIC_STRIDE_KN"] = static_stride_kn
-        if D == 128 and block_m == 256 and num_warps == 8:
-            # Keeping both MFMA accumulators in VGPRs removes mixed AGPR/VGPR
-            # handoffs; the full-attention object also becomes spill-free.
-            launch_meta.setdefault(
-                "llvm_fn_attrs",
-                _CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS,
-            )
     if causal and D == 128 and block_m == 256 and block_n == 32 and N_CTX == 4096:
         # Reverse assignment wins the N4096 causal object. The spill-free
         # N2048 pruned object instead selects the forward stage-two plan above.
@@ -3521,10 +3514,6 @@ def flash_attn_cluster_persistent_pipeline(q, k, v, sm_scale, causal=False, **kw
         **kw,
     }
     launch_meta.setdefault("enable_sched_group_barrier_scheduler", False)
-    if not causal and D == 128 and block_m == 256 and num_warps == 8:
-        # The persistent causal schedule loses overlap with VGPR-only
-        # allocation, while full attention benefits from removing AGPR moves.
-        launch_meta.setdefault("llvm_fn_attrs", _CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS)
     if not use_autotune:
         launch_meta.update({
             "USE_DIRECT_LOAD": False if use_direct_load is None else use_direct_load,
