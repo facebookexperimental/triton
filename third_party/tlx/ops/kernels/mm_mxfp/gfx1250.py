@@ -985,18 +985,18 @@ def _mxgemm_persistent_compute_256(c00, c01, c10, c11, a00, sa00, b00, sb00, a_b
                                    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, DA: tl.constexpr,
                                    DB: tl.constexpr, DTYPE_B: tl.constexpr, BUFFERS: tl.constexpr,
                                    PIN_NATIVE: tl.constexpr = False, ARRIVE_K=None, CLUSTER_SIZE: tl.constexpr = 1,
-                                   CLUSTER_BARRIER_INTERVAL: tl.constexpr = 0):
+                                   CLUSTER_BARRIER_INTERVAL: tl.constexpr = 0, RELAXED: tl.constexpr = False):
     tl.static_assert(BK == 256)
     dot: tl.constexpr = _mxgemm_native_dot if PIN_NATIVE else tlx.dot_scaled
     c00 = dot(a00, sa00, "e4m3", b00, sb00, DTYPE_B, c00, tiles_per_warp=[2, 2])
-    b01, sb01 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 0, 1, BN, BK, DB, BUFFERS)
+    b01, sb01 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 0, 1, BN, BK, DB, BUFFERS, RELAXED=RELAXED)
     c01 = dot(a00, sa00, "e4m3", b01, sb01, DTYPE_B, c01, tiles_per_warp=[2, 2])
-    a10, sa10 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 0, BM, BK, DA, BUFFERS)
+    a10, sa10 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 0, BM, BK, DA, BUFFERS, RELAXED=RELAXED)
     if ARRIVE_K is not None:
         _mxgemm_cluster_arrive(ARRIVE_K, CLUSTER_SIZE, CLUSTER_BARRIER_INTERVAL)
     c10 = dot(a10, sa10, "e4m3", b00, sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
-    b10, sb10 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 1, 0, BN, BK, DB, BUFFERS)
-    a01, sa01 = _mxgemm_persistent_a(a_buf, as_buf, slot, 0, 1, BM, BK, DA, BUFFERS)
+    b10, sb10 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 1, 0, BN, BK, DB, BUFFERS, RELAXED=RELAXED)
+    a01, sa01 = _mxgemm_persistent_a(a_buf, as_buf, slot, 0, 1, BM, BK, DA, BUFFERS, RELAXED=RELAXED)
     if DB != 2:
         c11 = dot(a10, sa10, "e4m3", b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
     # Bound operand lifetimes before gathering the remaining second half.
@@ -1004,10 +1004,10 @@ def _mxgemm_persistent_compute_256(c00, c01, c10, c11, a00, sa00, b00, sb00, a_b
     tlx.amd_sched_barrier()
     if DB != 2:
         c00 = dot(a01, sa01, "e4m3", b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
-    b11, sb11 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 1, 1, BN, BK, DB, BUFFERS)
+    b11, sb11 = _mxgemm_persistent_b(b_buf, bs_buf, slot, 1, 1, BN, BK, DB, BUFFERS, RELAXED=RELAXED)
     if DB != 2:
         c01 = dot(a01, sa01, "e4m3", b11, sb11, DTYPE_B, c01, tiles_per_warp=[2, 2])
-    a11, sa11 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 1, BM, BK, DA, BUFFERS)
+    a11, sa11 = _mxgemm_persistent_a(a_buf, as_buf, slot, 1, 1, BM, BK, DA, BUFFERS, RELAXED=RELAXED)
     if PIN_NATIVE:
         a01 = _mxgemm_native_operand(a01, 0, "e4m3")
         a11 = _mxgemm_native_operand(a11, 0, "e4m3")
@@ -1213,6 +1213,12 @@ def mxgemm_tdm_persistent_kernel(
     DEFER_BOTTOM: tl.constexpr = BLOCK_K == 128
     GROUPED_PREFETCH: tl.constexpr = DEFER_BOTTOM and (NUM_BUFFERS == 4) and DB == 1
     PREFETCH_B_AFTER_C10: tl.constexpr = GROUPED_PREFETCH
+    # A8W4 output reuse waits for the next stage before the refill, so one
+    # split workgroup barrier both releases the consumed slot and publishes the
+    # next one. Register-only C00/C01 WMMAs fill the barrier window and C11
+    # covers the LDS drain before it. Membar cannot tell the refill slot from
+    # the next slot, so the next-slot operand reads are relaxed.
+    A8W4_SPLIT_HANDOFF: tl.constexpr = OUTPUT_REUSE and DB == 2
     # In the three-buffer dynamic-slot loop, read each operand's scale before
     # its payload. The next quadrant's first WMMA then waits only for its own
     # operands instead of draining every outstanding LDS read. The unrolled
@@ -1427,25 +1433,30 @@ def mxgemm_tdm_persistent_kernel(
                     c00, c01, c10, c11, a00, sa00, b00, sb00, a_buf, b_buf, as_buf, bs_buf, slot, BLOCK_M, BLOCK_N,
                     BLOCK_K, 1, DB, DTYPE_B, NUM_BUFFERS, PIN_NATIVE=False,
                     ARRIVE_K=i + NUM_BUFFERS if SPLIT_CLUSTER_BARRIER else None, CLUSTER_SIZE=CLUSTER_SIZE,
-                    CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL)
+                    CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, RELAXED=A8W4_SPLIT_HANDOFF)
+            if A8W4_SPLIT_HANDOFF:
+                c11 = dot(a10, sa10, "e4m3", b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
+                tlx.amd_sched_barrier()
+                tlx.async_amd_descriptor_wait((NUM_BUFFERS - 2) * LOADS)
+                tlx.named_barrier_arrive(0, tlx.num_warps() * 32)
+                tlx.amd_sched_barrier()
+                c00 = dot(a01, sa01, "e4m3", b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
+                tlx.amd_sched_barrier()
+                c01 = dot(a01, sa01, "e4m3", b11, sb11, DTYPE_B, c01, tiles_per_warp=[2, 2])
+                tlx.amd_sched_barrier()
+                tlx.named_barrier_wait(0, tlx.num_warps() * 32)
             _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n,
                                     i + NUM_BUFFERS, slot, BLOCK_K, 1, DB, NUM_BUFFERS, "partial", CLUSTER_SIZE,
                                     CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
                                     CLUSTER_LAYOUT=CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER)
-            tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
+            if not A8W4_SPLIT_HANDOFF:
+                tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
             a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BLOCK_M, BLOCK_K, 1, NUM_BUFFERS,
-                                             PREFETCH_SCALES=STEP_SCALES_FIRST)
+                                             PREFETCH_SCALES=STEP_SCALES_FIRST, RELAXED=A8W4_SPLIT_HANDOFF)
             if not PREFETCH_B_AFTER_C10:
                 b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, next_slot, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS,
-                                                 PREFETCH_SCALES=STEP_SCALES_FIRST)
+                                                 PREFETCH_SCALES=STEP_SCALES_FIRST, RELAXED=A8W4_SPLIT_HANDOFF)
             if OUTPUT_REUSE:
-                if DB == 2:
-                    c11 = dot(a10, sa10, "e4m3", b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
-                    tlx.amd_sched_barrier()
-                    c00 = dot(a01, sa01, "e4m3", b10, sb10, DTYPE_B, c00, tiles_per_warp=[2, 2])
-                    tlx.amd_sched_barrier()
-                    c01 = dot(a01, sa01, "e4m3", b11, sb11, DTYPE_B, c01, tiles_per_warp=[2, 2])
-                    tlx.amd_sched_barrier()
                 c10 = dot(a11, sa11, "e4m3", b10, sb10, DTYPE_B, c10, tiles_per_warp=[2, 2])
                 tlx.amd_sched_barrier()
                 c11 = dot(a11, sa11, "e4m3", b11, sb11, DTYPE_B, c11, tiles_per_warp=[2, 2])
