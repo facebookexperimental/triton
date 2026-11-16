@@ -15104,6 +15104,10 @@ def _launch_bwd_d64_fused_n256(
         KV_SPLITS=dispatch.kv_splits,
         num_warps=4,
         matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+        # PERF: gfx950 turns on the AMDGPU register-pressure trackers for every kernel. Here they make the
+        # scheduler cut AGPR use at occupancy 1, where the lower pressure buys nothing, and cost 12%. Other
+        # kernels keep the default: the D128 causal backward kernel spills without them.
+        llvm_cl_opts=(("amdgpu-use-amdgpu-trackers", "false"), ),
     )
 
 
