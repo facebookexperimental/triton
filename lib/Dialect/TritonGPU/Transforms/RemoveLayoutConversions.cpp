@@ -2462,6 +2462,29 @@ static unsigned getCostFactor(Value result, Attribute rematEncoding) {
   return std::max(1u, newElemsPerThread / oldElemsPerThread);
 }
 
+bool rematDuplicatesNothing(ConvertLayoutOp convertOp,
+                           const SetVector<Value> &slice) {
+  SetVector<Operation *> sliceOps;
+  for (Value v : slice)
+    if (Operation *op = v.getDefiningOp())
+      sliceOps.insert(op);
+  for (Value v : slice)
+    if (auto arg = dyn_cast<BlockArgument>(v))
+      if (isa<scf::ForOp>(arg.getParentBlock()->getParentOp()))
+        return false;
+  for (Operation *op : sliceOps) {
+    bool usedOutside = llvm::any_of(op->getResults(), [&](Value v) {
+      return llvm::any_of(v.getUses(), [&](OpOperand &use) {
+        Operation *user = use.getOwner();
+        return user != convertOp && !sliceOps.contains(user);
+      });
+    });
+    if (usedOutside)
+      return false;
+  }
+  return true;
+}
+
 /// Determine whether rematerializing \p slice is beneficial given that it will
 /// eliminate \p convertOp and require creating new convert ops with cost \p
 /// newCvtCost.
@@ -2624,6 +2647,12 @@ bool LayoutRematerialization::backwardRematerialization(
   Value oldV = convertOp.getSrc();
   LDBG("check backward remat with source " << oldV << " encoding "
                                            << targetType.getEncoding());
+  auto srcTensorType = cast<RankedTensorType>(oldV.getType());
+  auto srcLayout = dyn_cast<LayoutEncodingTrait>(srcTensorType.getEncoding());
+  auto dstLayout = dyn_cast<LayoutEncodingTrait>(targetType.getEncoding());
+  bool samePhysicalLayout =
+      srcLayout && dstLayout &&
+      areLayoutsEquivalent(srcTensorType.getShape(), srcLayout, dstLayout);
   // 1. Take a backward slice of all the tensor dependencies that can be
   // rematerialized.
   SetVector<Value> slice;
@@ -2638,7 +2667,10 @@ bool LayoutRematerialization::backwardRematerialization(
   }
 
   // 2. Determine whether rematerialisation is beneficial.
-  if (!isRematBeneficial(convertOp, slice, layout, /*newCvtCost=*/0)) {
+  bool bypassCost =
+      samePhysicalLayout && rematDuplicatesNothing(convertOp, slice);
+  if (!bypassCost &&
+      !isRematBeneficial(convertOp, slice, layout, /*newCvtCost=*/0)) {
     LDBG("  skipped rematerialization due to higher cost");
     return false;
   }
