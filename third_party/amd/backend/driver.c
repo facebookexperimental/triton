@@ -4,6 +4,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <dlfcn.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -642,7 +643,7 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps,
                     int num_ctas, int launch_cooperative_grid,
                     int shared_memory, int warp_size, hipStream_t stream,
                     hipFunction_t function, void **params) {
-  if (gridX * gridY * gridZ == 0)
+  if (gridX == 0 || gridY == 0 || gridZ == 0)
     return;
   if (num_ctas > 1) {
     if (!hipSymbolTable.hipDrvLaunchKernelEx) {
@@ -693,7 +694,7 @@ bool extractPointer(void *ptr, PyObject *obj) {
   }
   if (PyLong_Check(obj)) {
     *dev_ptr = (hipDeviceptr_t)PyLong_AsUnsignedLongLong(obj);
-    return true;
+    return PyErr_Occurred() == NULL;
   }
   PyObject *ret = PyObject_CallMethodNoArgs(obj, data_ptr_str);
   if (!ret) {
@@ -705,23 +706,27 @@ bool extractPointer(void *ptr, PyObject *obj) {
   if (!PyLong_Check(ret)) {
     PyErr_SetString(PyExc_TypeError,
                     "data_ptr method of Pointer object must return 64-bit int");
+    Py_DECREF(ret);
     return false;
   }
   *dev_ptr = (hipDeviceptr_t)PyLong_AsUnsignedLongLong(ret);
   Py_DECREF(ret);
+  if (PyErr_Occurred())
+    return false;
   if (*dev_ptr == 0) {
     return true; // valid nullptr
   }
   hipError_t status = hipSymbolTable.hipPointerGetAttribute(
       dev_ptr, HIP_POINTER_ATTRIBUTE_DEVICE_POINTER, *dev_ptr);
   if (status == hipErrorInvalidValue) {
-    PyErr_Format(PyExc_ValueError, "Pointer argument (at %d) cannot be "
-                                   "accessed from Triton (cpu tensor?)");
+    PyErr_SetString(PyExc_ValueError, "Pointer argument cannot be "
+                                      "accessed from Triton (cpu tensor?)");
     // Clear and ignore HIP error
     (void)hipSymbolTable.hipGetLastError();
     return false;
   }
-  return true;
+  gpuAssert(status, __FILE__, __LINE__);
+  return !PyErr_Occurred();
 }
 
 bool extractI8(void *ptr, PyObject *obj) {
@@ -1147,6 +1152,229 @@ cleanup:
   return NULL;
 }
 
+// Bind the HIP launch contract once. Each call owns its parameter storage.
+typedef struct {
+  PyObject_HEAD vectorcallfunc vectorcall;
+  hipFunction_t function;
+  int num_warps, num_ctas, shared_memory, warp_size;
+  int cooperative, physical_cluster_x;
+  Py_ssize_t global_size, global_align, profile_size, profile_align;
+  PyObject *signature, *allocator, *profile_allocator;
+} TritonDispatcher;
+
+static PyObject *TritonDispatcher_vectorcall(PyObject *, PyObject *const *,
+                                             size_t, PyObject *);
+
+static int td_field(PyObject *schema, const char *key, Py_ssize_t fallback,
+                    Py_ssize_t *result) {
+  PyObject *value = PyDict_GetItemString(schema, key);
+  *result = value ? PyLong_AsSsize_t(value) : fallback;
+  return !PyErr_Occurred();
+}
+
+static void TritonDispatcher_dealloc(PyObject *object) {
+  TritonDispatcher *self = (TritonDispatcher *)object;
+  Py_XDECREF(self->signature);
+  Py_XDECREF(self->allocator);
+  Py_XDECREF(self->profile_allocator);
+  Py_TYPE(object)->tp_free(object);
+}
+
+static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
+                                      PyObject *kwargs) {
+  PyObject *schema, *signature, *allocator, *profile_allocator;
+  unsigned long long function;
+  static char *names[] = {"schema",    "function",          "signature",
+                          "allocator", "profile_allocator", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OKOOO", names, &schema,
+                                   &function, &signature, &allocator,
+                                   &profile_allocator))
+    return NULL;
+  if (!PyDict_Check(schema) || !PyBytes_Check(signature)) {
+    PyErr_SetString(PyExc_TypeError,
+                    "Expected a schema dict and signature bytes");
+    return NULL;
+  }
+  TritonDispatcher *self = (TritonDispatcher *)type->tp_alloc(type, 0);
+  if (!self)
+    return NULL;
+  self->vectorcall = TritonDispatcher_vectorcall;
+  self->function = (hipFunction_t)function;
+  struct {
+    const char *name;
+    int *target;
+    Py_ssize_t fallback;
+  } fields[] = {{"num_warps", &self->num_warps, 0},
+                {"num_ctas", &self->num_ctas, 1},
+                {"shared_mem", &self->shared_memory, 0},
+                {"warp_size", &self->warp_size, 0},
+                {"launch_cooperative_grid", &self->cooperative, 0},
+                {"physical_cluster_x", &self->physical_cluster_x, 0}};
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+    Py_ssize_t value;
+    if (!td_field(schema, fields[i].name, fields[i].fallback, &value))
+      goto fail;
+    if (value < 0 || value > INT_MAX) {
+      PyErr_SetString(PyExc_ValueError, "Invalid HIP launch metadata");
+      goto fail;
+    }
+    *fields[i].target = (int)value;
+  }
+  if (self->num_warps == 0 || self->warp_size == 0 || self->num_ctas == 0 ||
+      self->num_warps > INT_MAX / self->warp_size) {
+    PyErr_SetString(PyExc_ValueError, "Invalid HIP block dimensions");
+    goto fail;
+  }
+  if (!td_field(schema, "global_scratch_size", 0, &self->global_size) ||
+      !td_field(schema, "global_scratch_align", 1, &self->global_align) ||
+      !td_field(schema, "profile_scratch_size", 0, &self->profile_size) ||
+      !td_field(schema, "profile_scratch_align", 1, &self->profile_align))
+    goto fail;
+  if (self->global_size < 0 || self->profile_size < 0 ||
+      self->global_align <= 0 || self->profile_align <= 0) {
+    PyErr_SetString(PyExc_ValueError, "Invalid HIP scratch metadata");
+    goto fail;
+  }
+  const uint8_t *codes = (const uint8_t *)PyBytes_AS_STRING(signature);
+  for (Py_ssize_t i = 0; i < PyBytes_GET_SIZE(signature); ++i) {
+    Extractor extractor = getExtractor(codes[i]);
+    if (!extractor.extract || extractor.size > sizeof(uint64_t) ||
+        codes[i] == EXTRACTOR_TDMDESC_INDEX) {
+      PyErr_SetString(PyExc_ValueError,
+                      "Unsupported HIP dispatcher argument type");
+      goto fail;
+    }
+  }
+  self->signature = Py_NewRef(signature);
+  self->allocator = Py_NewRef(allocator);
+  self->profile_allocator = Py_NewRef(profile_allocator);
+  return (PyObject *)self;
+fail:
+  Py_DECREF(self);
+  return NULL;
+}
+
+static PyObject *td_scratch(PyObject *allocator, Py_ssize_t size,
+                            Py_ssize_t align, Py_ssize_t grid,
+                            PyObject *stream) {
+  if (!size)
+    return Py_NewRef(Py_None);
+  if (grid > PY_SSIZE_T_MAX / size) {
+    PyErr_SetString(PyExc_OverflowError,
+                    "HIP scratch allocation size overflow");
+    return NULL;
+  }
+  PyObject *allocate = PyObject_CallMethod(allocator, "get", NULL);
+  if (!allocate)
+    return NULL;
+  PyObject *result =
+      PyObject_CallFunction(allocate, "nnO", grid * size, align, stream);
+  Py_DECREF(allocate);
+  return result;
+}
+
+static PyObject *TritonDispatcher_vectorcall(PyObject *object,
+                                             PyObject *const *args,
+                                             size_t nargsf, PyObject *kwnames) {
+  TritonDispatcher *self = (TritonDispatcher *)object;
+  Py_ssize_t count = PyBytes_GET_SIZE(self->signature);
+  Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+  if ((kwnames && PyTuple_GET_SIZE(kwnames)) || nargs != count + 4) {
+    PyErr_Format(PyExc_TypeError,
+                 "Expected %zd positional HIP dispatcher arguments", count + 4);
+    return NULL;
+  }
+  int grid[3];
+  for (int i = 0; i < 3; ++i) {
+    long value = PyLong_AsLong(args[i]);
+    if (PyErr_Occurred())
+      return NULL;
+    if (value < 0 || value > INT_MAX) {
+      PyErr_SetString(PyExc_ValueError,
+                      "HIP grid dimensions must be nonnegative C integers");
+      return NULL;
+    }
+    grid[i] = (int)value;
+  }
+  uint64_t stream = PyLong_AsUnsignedLongLong(args[3]);
+  if (PyErr_Occurred())
+    return NULL;
+  int launch_x = grid[0];
+  if (self->physical_cluster_x) {
+    if (launch_x % self->physical_cluster_x) {
+      PyErr_SetString(PyExc_ValueError,
+                      "grid X must be divisible by ctas_per_cga[0]");
+      return NULL;
+    }
+    launch_x /= self->physical_cluster_x;
+  }
+  if (launch_x > INT_MAX / self->num_ctas) {
+    PyErr_SetString(PyExc_OverflowError, "HIP cluster grid overflow");
+    return NULL;
+  }
+  Py_ssize_t grid_size = grid[0];
+  for (int i = 1; i < 3; ++i) {
+    if (grid[i] && grid_size > PY_SSIZE_T_MAX / grid[i]) {
+      PyErr_SetString(PyExc_OverflowError, "HIP grid size overflow");
+      return NULL;
+    }
+    grid_size *= grid[i];
+  }
+  if (count > PY_SSIZE_T_MAX / (sizeof(uint64_t) + sizeof(void *)) - 2) {
+    PyErr_NoMemory();
+    return NULL;
+  }
+  uint64_t *values = PyMem_Malloc((count + 2) * sizeof(uint64_t));
+  void **params = PyMem_Malloc((count + 2) * sizeof(void *));
+  PyObject *global = NULL, *profile = NULL;
+  if (!values || !params) {
+    PyErr_NoMemory();
+    goto cleanup;
+  }
+  global = td_scratch(self->allocator, self->global_size, self->global_align,
+                      grid_size, args[3]);
+  if (!global)
+    goto cleanup;
+  profile = td_scratch(self->profile_allocator, self->profile_size,
+                       self->profile_align, grid_size, args[3]);
+  if (!profile)
+    goto cleanup;
+  const uint8_t *codes = (const uint8_t *)PyBytes_AS_STRING(self->signature);
+  for (Py_ssize_t i = 0; i < count; ++i) {
+    params[i] = &values[i];
+    if (!getExtractor(codes[i]).extract(params[i], args[i + 4]) ||
+        PyErr_Occurred())
+      goto cleanup;
+  }
+  params[count] = &values[count];
+  params[count + 1] = &values[count + 1];
+  if (!extractPointer(params[count], global) || PyErr_Occurred() ||
+      !extractPointer(params[count + 1], profile) || PyErr_Occurred())
+    goto cleanup;
+  _launch(launch_x, grid[1], grid[2], self->num_warps, self->num_ctas,
+          self->cooperative, self->shared_memory, self->warp_size,
+          (hipStream_t)stream, self->function, params);
+cleanup:
+  Py_XDECREF(global);
+  Py_XDECREF(profile);
+  PyMem_Free(values);
+  PyMem_Free(params);
+  if (PyErr_Occurred())
+    return NULL;
+  Py_RETURN_NONE;
+}
+
+static PyTypeObject TritonDispatcherType = {
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name =
+        "triton.backends.amd._TritonDispatcher",
+    .tp_basicsize = sizeof(TritonDispatcher),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_VECTORCALL,
+    .tp_vectorcall_offset = offsetof(TritonDispatcher, vectorcall),
+    .tp_call = PyVectorcall_Call,
+    .tp_new = TritonDispatcher_new,
+    .tp_dealloc = TritonDispatcher_dealloc,
+};
+
 static PyMethodDef ModuleMethods[] = {
     {"load_binary", loadBinary, METH_VARARGS,
      "Load provided hsaco into HIP driver"},
@@ -1177,6 +1405,15 @@ PyMODINIT_FUNC PyInit_hip_utils(void) {
 
   PyObject *m = PyModule_Create(&ModuleDef);
   if (m == NULL) {
+    return NULL;
+  }
+  if (PyType_Ready(&TritonDispatcherType) < 0) {
+    Py_DECREF(m);
+    return NULL;
+  }
+  if (PyModule_AddObjectRef(m, "_TritonDispatcher",
+                            (PyObject *)&TritonDispatcherType) < 0) {
+    Py_DECREF(m);
     return NULL;
   }
   PyModule_AddFunctions(m, ModuleMethods);

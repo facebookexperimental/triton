@@ -3382,12 +3382,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
         createChannelsForProducers(currentProds, producerTaskId, consumerIds,
                                    tmemAllocOp.getOperation(), user, channels);
       } else {
-        // The read runs in the MMA's own partition, but the MMAs are
-        // asynchronous: program order does not make their results visible to
-        // the tmem_load. Build the channel with the producer's own task as the
-        // consumer so code partitioning commits the MMAs to a barrier after
-        // the loop and waits on it before the read, as for a cross-partition
-        // consumer.
+        // A same-partition read still needs a channel: the MMAs are
+        // asynchronous, so program order does not make their results visible.
         if (!firstProducer)
           firstProducer = currentProds.front();
         lastConsumer = user;
@@ -3710,13 +3706,9 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
                           producerTaskId);
   consumerTaskIds.erase(iter, consumerTaskIds.end());
 
-  // An MMA operand written by a tmem_store/local_store in the MMA's own task
-  // and loop body still needs a channel: the MMA is asynchronous, so the next
-  // iteration's store must wait for it to finish reading the tile. Model it as
-  // a channel whose consumer is the producer's own task; code partitioning
-  // then emits the usual acquire/commit/wait tokens with the MMA's completion
-  // barrier releasing the buffer, all within one partition, and the memory
-  // planner gets a live range for the buffer.
+  // An MMA operand written in the MMA's own task and loop body still needs a
+  // (self-consumer) channel: the next iteration's store must wait for the
+  // asynchronous MMA to finish reading the tile.
   bool isTmem = isa<ttng::TMEMAllocOp>(allocOp);
   Value allocResult = allocOp->getResult(0);
   bool sameTaskOperand =
@@ -3757,10 +3749,15 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
           allocOp, channels.size()));
       channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
       auto *post = static_cast<AllocChannel *>(channels.back().get());
-      // Cache the resolved producer op so getSrcOp() survives a sibling
-      // subtiled-region channel's lowering. Skip the direct alloc-with-src case
-      // (producerOp == allocOp), where getSrcOp() intentionally returns null.
-      if (producerOp != allocOp)
+      // Fix the regression introduced by 401386fae8: cache only
+      // subtiled-region producers, whose template store survives sibling
+      // channel lowering. Ordinary TMA producers are replaced and erased by
+      // optimizeTMALoads, so caching them would leave a dangling pointer;
+      // getSrcOp() must rediscover their replacement from alloc users.
+      bool isSubtiledProducer =
+          producerOp && (isa<ttng::SubtiledRegionOp>(producerOp) ||
+                         producerOp->getParentOfType<ttng::SubtiledRegionOp>());
+      if (producerOp != allocOp && isSubtiledProducer)
         post->cachedSrcOp = producerOp;
     }
   }

@@ -1,15 +1,14 @@
 """Grouped GEMM kernels for AMD/gfx1250.
 
-This file starts with the correctness-oriented pointer-table baseline from
-``third_party/tlx/doc/gfx1250_grouped_gemm.md``.  It supports a fully ragged
-group of FP16 GEMMs in one persistent launch:
+The phase-0 baseline accepts fully ragged FP16 A_i @ B_i products with
+row-major inputs and masked tails. The optimized TDM entry points share a
+persistent ragged-M pipeline: grouped_gemm_tdm takes packed tensors, while
+grouped_gemm_tdm_list accepts lists of row-major A and column-major B views.
+Both optimized paths require common N/K. The list path also supports M/N tails.
 
-    C_i = A_i @ B_i
-
-Each group may have different M/N/K.  A, B, and C are expected to be row-major
-with inner stride 1.  The kernel masks M, N, and K tails and uses ordinary
-global loads/stores, not gfx1250 TDM.  The optimized TDM packed-ragged-M path
-should use this kernel as a reference.
+The shared TDM implementation, the list kernel, and the gfx950-compatible host
+interface live in ``triton.tlx.ops.kernels.grouped_gemm.gfx1250``, which backs
+``tlx.ops.grouped_gemm`` on gfx1250; this module imports them.
 """
 
 from __future__ import annotations
@@ -21,8 +20,15 @@ import torch
 
 import triton
 import triton.language as tl
-import triton.language.extra.tlx as tlx
 from triton._internal_testing import is_hip_gfx1250
+from triton.tlx.ops.kernels.grouped_gemm.gfx1250 import (
+    XCD_REMAP_MODES,
+    grouped_gemm_enable_wmma_queuing,
+    grouped_gemm_tdm_impl,
+    grouped_gemm_tdm_list_kernel,
+    make_grouped_gemm_tdm_list_args,
+    validate_grouped_gemm_cluster_config,
+)
 
 
 def _active_num_cus(device: torch.device) -> int:
@@ -33,12 +39,6 @@ def _grouped_gemm_tflops(ms: float, m_list: list[int], n: int, k: int) -> float:
     total_flops = sum(2 * m * n * k for m in m_list)
     return total_flops / (ms * 1e-3) / 1e12
 
-
-_XCD_REMAP_MODES = {
-    "none": 0,
-    "balanced": 1,
-    "chunked": 2,
-}
 
 # Tile-selection weights relative to the 256x256 configuration.
 _GROUPED_GEMM_CONFIGS = (
@@ -53,11 +53,7 @@ _GROUPED_GEMM_CONFIGS = (
 )
 
 
-def _cdiv_int(a: int, b: int) -> int:
-    return -(-a // b)
-
-
-def _rank_grouped_gemm_configs(m_list: list[int], n: int, k: int, num_sms: int):
+def _rank_grouped_gemm_configs(m_list: list[int], n: int, k: int, num_sms: int, *, allow_mn_tails=False):
     num_sms = max(1, int(num_sms))
     useful = sum(m * n * k for m in m_list)
     ranked = []
@@ -66,17 +62,17 @@ def _rank_grouped_gemm_configs(m_list: list[int], n: int, k: int, num_sms: int):
         bm = int(cfg["block_m"])
         bn = int(cfg["block_n"])
         bk = int(cfg["block_k"])
-        if n % bn != 0 or k % bk != 0 or any(m % bm != 0 for m in m_list):
+        if k % bk != 0 or (not allow_mn_tails and (n % bn != 0 or any(m % bm != 0 for m in m_list))):
             continue
 
-        group_tiles = [(m // bm) * (n // bn) for m in m_list]
+        group_tiles = [triton.cdiv(m, bm) * triton.cdiv(n, bn) for m in m_list]
         total_tiles = sum(group_tiles)
         if total_tiles == 0:
             continue
         launch_programs = min(num_sms, total_tiles)
-        slots = _cdiv_int(total_tiles, num_sms) * num_sms
+        slots = triton.cdiv(total_tiles, num_sms) * num_sms
         utilization = total_tiles / slots
-        padded = sum(_cdiv_int(m, bm) * bm * _cdiv_int(n, bn) * bn * k for m in m_list)
+        padded = sum(triton.cdiv(m, bm) * bm * triton.cdiv(n, bn) * bn * k for m in m_list)
         padding_efficiency = useful / padded
 
         cross_tile_prefetch = bool(cfg["cross_tile_prefetch"])
@@ -94,10 +90,10 @@ def _rank_grouped_gemm_configs(m_list: list[int], n: int, k: int, num_sms: int):
     return ranked
 
 
-def _pick_grouped_gemm_config(m_list: list[int], n: int, k: int, num_sms: int):
-    ranked = _rank_grouped_gemm_configs(m_list, n, k, num_sms)
+def _pick_grouped_gemm_config(m_list: list[int], n: int, k: int, num_sms: int, *, allow_mn_tails=False):
+    ranked = _rank_grouped_gemm_configs(m_list, n, k, num_sms, allow_mn_tails=allow_mn_tails)
     if not ranked:
-        raise ValueError("no validated gfx1250 grouped GEMM config supports these full-tile shapes")
+        raise ValueError("no validated gfx1250 grouped GEMM config supports these shapes")
     top_score = ranked[0][0]
     near_top = [entry for entry in ranked if entry[0] >= 0.9 * top_score]
     return dict(max(near_top, key=lambda entry: (entry[1], entry[2]))[3])
@@ -275,214 +271,10 @@ def grouped_gemm_phase0(
     )
     return out
 
-
-@triton.jit
-def _tdm_load_subtile(
-    a_buf,
-    b_buf,
-    consumer,
-    start: tl.constexpr,
-    NUM_BUFFERS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    SUBTILE_LEN: tl.constexpr,
-):
-    slot = consumer % NUM_BUFFERS
-    a_view = tlx.local_slice(a_buf[slot], [0, start], [BLOCK_M, SUBTILE_LEN])
-    b_view = tlx.local_slice(b_buf[slot], [0, start], [BLOCK_N, SUBTILE_LEN])
-    return tlx.local_load(a_view), tlx.local_load(tlx.local_trans(b_view))
-
-
-@triton.jit
-def _tdm_load_fused(a_desc, b_desc, a_view, b_view, CLUSTER_SIZE: tl.constexpr, CLUSTER_MULTICAST: tl.constexpr):
-    if CLUSTER_SIZE > 1:
-        # Every wave must finish reading a slot before any workgroup can
-        # refill that slot through multicast into a neighbor's LDS.
-        tlx.cluster_barrier()
-    if CLUSTER_SIZE > 1 and CLUSTER_MULTICAST:
-        rank = tlx.cluster_cta_rank()
-        a_mask = 0 if CLUSTER_SIZE == 2 else 5 << (rank & 1)
-        b_mask = 3 if CLUSTER_SIZE == 2 else 3 << (rank & 2)
-        masks = [a_mask, b_mask]
-    else:
-        masks = None
-    tlx.async_amd_descriptor_load_fused([(a_desc, a_view, 3), (b_desc, b_view, 12)], multicast_masks=masks)
-
-
-@triton.jit
-def _tdm_issue_loads(
-    a_desc,
-    b_desc,
-    a_buf,
-    b_buf,
-    producer,
-    off_m,
-    off_n,
-    pred,
-    BLOCK_K: tl.constexpr,
-    NUM_BUFFERS: tl.constexpr,
-    CLUSTER_SIZE: tl.constexpr = 1,
-    CLUSTER_MULTICAST: tl.constexpr = True,
-):
-    slot = producer % NUM_BUFFERS
-    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K], clamp_bounds=False,
-                                          pred=pred)
-    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, producer * BLOCK_K], clamp_bounds=False,
-                                          pred=pred)
-    _tdm_load_fused(a_desc, b_desc, a_buf[slot], b_buf[slot], CLUSTER_SIZE, CLUSTER_MULTICAST)
-    return producer + 1
-
-
-@triton.jit
-def _tdm_issue_loads_unpredicated(
-    a_desc,
-    b_desc,
-    a_buf,
-    b_buf,
-    producer,
-    off_m,
-    off_n,
-    BLOCK_K: tl.constexpr,
-    NUM_BUFFERS: tl.constexpr,
-    CLUSTER_SIZE: tl.constexpr = 1,
-    CLUSTER_MULTICAST: tl.constexpr = True,
-):
-    slot = producer % NUM_BUFFERS
-    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, producer * BLOCK_K], clamp_bounds=False)
-    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, producer * BLOCK_K], clamp_bounds=False)
-    _tdm_load_fused(a_desc, b_desc, a_buf[slot], b_buf[slot], CLUSTER_SIZE, CLUSTER_MULTICAST)
-    return producer + 1
-
-
-@triton.jit
-def _tdm_prefetch_unpredicated(a_desc, b_desc, prefetch_iter, off_m, off_n, BLOCK_K: tl.constexpr):
-    tlx.amd_descriptor_prefetch_tensor(a_desc, [off_m, prefetch_iter * BLOCK_K])
-    tlx.amd_descriptor_prefetch_tensor(b_desc, [off_n, prefetch_iter * BLOCK_K])
-
-
-@triton.jit
-def _tdm_accumulate_subtiles(
-    acc,
-    a0,
-    b0,
-    a_desc,
-    b_desc,
-    a_buf,
-    b_buf,
-    consumer,
-    producer,
-    L2_PREFETCH_DISTANCE: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    NUM_BUFFERS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    SUBTILE_LEN: tl.constexpr,
-    LIMIT_DOT_LIFETIME: tl.constexpr = False,
-):
-    a1, b1 = _tdm_load_subtile(a_buf, b_buf, consumer, SUBTILE_LEN, NUM_BUFFERS, BLOCK_M, BLOCK_N, SUBTILE_LEN)
-    acc = tl.dot(a0, b0, acc)
-    if LIMIT_DOT_LIFETIME:
-        # Bound live operand tiles while allowing loads to interleave with
-        # this dot. The following dot starts a new scheduling region.
-        tlx.amd_sched_barrier()
-
-    if L2_PREFETCH_DISTANCE > 0:
-        prefetch_iter = producer + L2_PREFETCH_DISTANCE - 1
-        _tdm_prefetch_unpredicated(a_desc, b_desc, prefetch_iter, 0, 0, BLOCK_K)
-
-    a2, b2 = _tdm_load_subtile(a_buf, b_buf, consumer, 2 * SUBTILE_LEN, NUM_BUFFERS, BLOCK_M, BLOCK_N, SUBTILE_LEN)
-    acc = tl.dot(a1, b1, acc)
-    if LIMIT_DOT_LIFETIME:
-        tlx.amd_sched_barrier()
-
-    a3, b3 = _tdm_load_subtile(a_buf, b_buf, consumer, 3 * SUBTILE_LEN, NUM_BUFFERS, BLOCK_M, BLOCK_N, SUBTILE_LEN)
-    acc = tl.dot(a2, b2, acc)
-    if LIMIT_DOT_LIFETIME:
-        tlx.amd_sched_barrier()
-    return acc, a3, b3
-
-
-@triton.jit
-def _tdm_wait_and_finish_k_block(
-    acc,
-    a3,
-    b3,
-    a_buf,
-    b_buf,
-    consumer,
-    NUM_BUFFERS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    SUBTILE_LEN: tl.constexpr,
-    LIMIT_DOT_LIFETIME: tl.constexpr = False,
-):
-    tlx.async_amd_descriptor_wait(NUM_BUFFERS - 1)
-    a0, b0 = _tdm_load_subtile(a_buf, b_buf, consumer, 0, NUM_BUFFERS, BLOCK_M, BLOCK_N, SUBTILE_LEN)
-    acc = tl.dot(a3, b3, acc)
-    if LIMIT_DOT_LIFETIME:
-        tlx.amd_sched_barrier()
-    return acc, a0, b0
-
-
-@triton.jit
-def _tdm_c_store_chunk(acc, part: tl.constexpr):
-    """Select 32 rows without keeping a second full output tile in registers."""
-    width: tl.constexpr = acc.shape[1]
-    lo, hi = tl.split(tl.reshape(acc, (2, 128, width)).permute(1, 2, 0))
-    half = lo if part < 4 else hi
-    lo2, hi2 = tl.split(tl.reshape(half, (2, 64, width)).permute(1, 2, 0))
-    quarter = lo2 if part % 4 < 2 else hi2
-    lo3, hi3 = tl.split(tl.reshape(quarter, (2, 32, width)).permute(1, 2, 0))
-    return lo3 if part % 2 == 0 else hi3
-
-
-@triton.jit
-def _grouped_tile_offsets(
-    tile_idx,
-    last_problem_end,
-    num_m_tiles,
-    num_n_tiles,
-    GROUP_M: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    tile_idx_in_gemm = tile_idx - last_problem_end
-    num_pid_in_group = GROUP_M * num_n_tiles
-    group_id = tile_idx_in_gemm // num_pid_in_group
-    first_pid_m = group_id * GROUP_M
-    group_size_m = min(num_m_tiles - first_pid_m, GROUP_M)
-    tile_m_idx = first_pid_m + ((tile_idx_in_gemm % num_pid_in_group) % group_size_m)
-    tile_n_idx = (tile_idx_in_gemm % num_pid_in_group) // group_size_m
-    return tile_m_idx * BLOCK_M, tile_n_idx * BLOCK_N
-
-
-@triton.jit
-def _remap_grouped_program_id(
-    pid,
-    num_programs,
-    XCD_REMAP_MODE: tl.constexpr,
-    NUM_XCDS: tl.constexpr,
-    XCD_CHUNK: tl.constexpr,
-):
-    if XCD_REMAP_MODE == 0 or NUM_XCDS == 1:
-        return pid
-    elif XCD_REMAP_MODE == 1:
-        # Physical workgroups are assigned round-robin across XCDs. Map each
-        # XCD's local sequence onto one balanced contiguous logical range.
-        xcd = pid % NUM_XCDS
-        local_pid = pid // NUM_XCDS
-        min_per_xcd = num_programs // NUM_XCDS
-        extra = num_programs % NUM_XCDS
-        return xcd * min_per_xcd + min(xcd, extra) + local_pid
-    else:
-        tl.static_assert(XCD_REMAP_MODE == 2, "XCD_REMAP_MODE must be none, balanced, or chunked")
-        tl.static_assert(XCD_CHUNK >= 1, "XCD_CHUNK must be positive")
-        aligned = (num_programs // (NUM_XCDS * XCD_CHUNK)) * (NUM_XCDS * XCD_CHUNK)
-        if pid >= aligned:
-            return pid
-        xcd = pid % NUM_XCDS
-        local_pid = pid // NUM_XCDS
-        return ((local_pid // XCD_CHUNK) * NUM_XCDS * XCD_CHUNK + xcd * XCD_CHUNK + (local_pid % XCD_CHUNK))
+    # At kernel exit, rely on s_endpgm to drain the final async TDM
+    # local-to-global store. Keep the explicit wait here as a marker in case
+    # target semantics require restoring it.
+    # tlx.async_amd_descriptor_wait(0)
 
 
 @triton.jit
@@ -513,467 +305,35 @@ def grouped_gemm_tdm_kernel(
     CLUSTER_SIZE: tl.constexpr = 1,
     CLUSTER_MULTICAST: tl.constexpr = True,
 ):
-    """Packed ragged-M grouped GEMM using gfx1250 TDM descriptor loads/stores.
-
-    ``b_t`` is [G, N, K], so each B tile is loaded as [BLOCK_N, BLOCK_K] and
-    locally transposed before ``tl.dot``.
-    """
-    tl.static_assert(NUM_BUFFERS >= 2, "NUM_BUFFERS must be at least 2")
-    tl.static_assert(C_STAGING_MODE == 0 or C_STAGING_MODE == 1, "C_STAGING_MODE must be 0 or 1")
-    tl.static_assert(not CROSS_TILE_PREFETCH or C_STAGING_MODE == 1 or (BLOCK_M == 256 and BLOCK_N == 256),
-                     "alias-C cross-tile prefetch requires a 256x256 tile")
-    tl.static_assert(not CROSS_TILE_PREFETCH or NUM_BUFFERS == 2, "cross-tile prefetch currently requires depth 2")
-    tl.static_assert(NUM_XCDS >= 1, "NUM_XCDS must be positive")
-    # The square tile uses one third fewer LDS reads per WMMA than 128x256.
-    # Limit operand lifetimes and K-loop scope to keep it free of scratch spills.
-    OPTIMIZE_CROSS_TILE: tl.constexpr = CROSS_TILE_PREFETCH and BLOCK_M == 256 and BLOCK_N == 256
-    HYBRID_TILE_PREFETCH: tl.constexpr = OPTIMIZE_CROSS_TILE and C_STAGING_MODE == 0
-    tl.static_assert(CLUSTER_SIZE == 1 or CLUSTER_SIZE == 2 or CLUSTER_SIZE == 4, "cluster size must be 1, 2, or 4")
-    tl.static_assert(CLUSTER_SIZE == 1 or HYBRID_TILE_PREFETCH, "clustering requires the square within-group hybrid")
-    CROSS_GROUP_PREFETCH: tl.constexpr = OPTIMIZE_CROSS_TILE and not HYBRID_TILE_PREFETCH
-    OPTIMIZE_ALIAS_C: tl.constexpr = C_STAGING_MODE == 0 and BLOCK_M == 256 and BLOCK_N == 256 and NUM_BUFFERS == 2
-    LIMIT_DOT_LIFETIME: tl.constexpr = OPTIMIZE_CROSS_TILE or OPTIMIZE_ALIAS_C
-    if LIMIT_DOT_LIFETIME:
-        # CDNA5 SCHED_MODE[2] lets this single-wave-per-SIMD schedule queue
-        # WMMAs while independent scalar and memory instructions execute.
-        tlx.amd_set_wave_sched_mode(1, offset=2, width=1)
-    DIRECT_LOAD_OFFSETS: tl.constexpr = OPTIMIZE_CROSS_TILE and L2_PREFETCH_DISTANCE == 0
-    K_BLOCKS_PER_LOOP: tl.constexpr = 1 if CROSS_GROUP_PREFETCH else NUM_BUFFERS
-    NUM_SUBTILES: tl.constexpr = 4
-    SUBTILE_LEN: tl.constexpr = BLOCK_K // NUM_SUBTILES
-    K_ITERS: tl.constexpr = K // BLOCK_K
-    USE_FULL_C_TILE: tl.constexpr = (NUM_BUFFERS * BLOCK_K) % BLOCK_N == 0
-    tl.static_assert(K % BLOCK_K == 0, "K must be divisible by BLOCK_K")
-    tl.static_assert(K_ITERS >= NUM_BUFFERS, "K must cover the TDM pipeline")
-    tl.static_assert(SUBTILE_LEN == 32, "BLOCK_K must be 128 for the first TDM schedule")
-
-    pid = _remap_grouped_program_id(tl.program_id(0), NUM_PROGRAMS, XCD_REMAP_MODE, NUM_XCDS, XCD_CHUNK)
-    tile_idx = pid
-    last_problem_end = 0
-    num_n_tiles = tl.cdiv(N, BLOCK_N)
-
-    a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_packed), NUM_BUFFERS)
-    b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K), tlx.dtype_of(b_t), NUM_BUFFERS)
-    # TLXRewriteLocalAlias only accepts size-mismatched shared aliases when
-    # the backing allocation is an integer multiple of the alias.  Reuse A only
-    # when that ratio is legal.  Otherwise store C in BLOCK_K-wide chunks that
-    # are each small enough to alias A.  Reusing B can satisfy the size check
-    # for asymmetric tiles, but B's TDM-load/dot-transpose layout constraints
-    # conflict with C's TDM-store layout constraints.
-    if HYBRID_TILE_PREFETCH:
-        # Two 16-KiB output slots fit alongside the input rings. TDM drains
-        # one chunk while the other is filled, leaving prefetched A/B intact.
-        c_buf = tlx.local_alloc((32, BLOCK_N), tlx.dtype_of(c_packed), 2)
-    elif C_STAGING_MODE == 1:
-        tl.static_assert(USE_FULL_C_TILE, "dedicated C staging currently requires a full C buffer")
-        c_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_packed), 1)
-    elif USE_FULL_C_TILE:
-        c_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_packed), 1, reuse=a_buf)
-    else:
-        tl.static_assert(BLOCK_N == 2 * BLOCK_K, "split C store currently supports BLOCK_N == 2 * BLOCK_K")
-        c_buf = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(c_packed), 1, reuse=a_buf)
-
-    group_primed = False
-    if CROSS_GROUP_PREFETCH:
-        # Keep four upcoming boundaries available across output stores. Refill
-        # the window in a tile's tail so group entry needs no metadata load.
-        carried_m_start = tl.load(group_offsets)
-        carried_m_end = tl.load(group_offsets + 1, mask=group_size > 0, other=0)
-        carried_following_m_end = tl.load(group_offsets + tl.minimum(2, group_size))
-        carried_third_m_end = tl.load(group_offsets + tl.minimum(3, group_size))
-        carried_fourth_m_end = tl.load(group_offsets + tl.minimum(4, group_size))
-    for g in range(group_size):
-        if CROSS_GROUP_PREFETCH:
-            m_start, m_end = carried_m_start, carried_m_end
-            following_m_end = carried_following_m_end
-            third_m_end = carried_third_m_end
-            fourth_m_end = carried_fourth_m_end
-            prefetched_boundary = g + 4 >= group_size
-        else:
-            m_start = tl.load(group_offsets + g)
-            m_end = tl.load(group_offsets + g + 1)
-        gm = m_end - m_start
-
-        num_m_tiles = tl.cdiv(gm, BLOCK_M)
-        num_tiles = num_m_tiles * num_n_tiles
-        group_base_m = m_start.to(tl.int64) * stride_am
-        group_base_c = m_start.to(tl.int64) * stride_cm
-        group_base_b = g.to(tl.int64) * stride_bg
-
-        a_desc_base = tl.make_tensor_descriptor(
-            a_packed + group_base_m,
-            # The launcher validates exact BLOCK_K coverage. Keeping the K
-            # extent static avoids rebuilding dynamic bounds at every TDM issue.
-            shape=[gm, K],
-            strides=[stride_am, tl.constexpr(1)],
-            block_shape=[BLOCK_M, BLOCK_K],
-        )
-        b_desc_base = tl.make_tensor_descriptor(
-            b_t + group_base_b,
-            shape=[N, K],
-            strides=[stride_bn, tl.constexpr(1)],
-            block_shape=[BLOCK_N, BLOCK_K],
-        )
-        if USE_FULL_C_TILE:
-            c_desc_base = tl.make_tensor_descriptor(
-                c_packed + group_base_c,
-                shape=[gm, N],
-                strides=[stride_cm, tl.constexpr(1)],
-                block_shape=[32 if HYBRID_TILE_PREFETCH else BLOCK_M, BLOCK_N],
-            )
-        else:
-            c_desc_base = tl.make_tensor_descriptor(
-                c_packed + group_base_c,
-                shape=[gm, N],
-                strides=[stride_cm, tl.constexpr(1)],
-                # Match the BLOCK_K-wide LDS alias above: when a full C tile
-                # cannot legally alias the A ring, store its two halves. This
-                # is an aliasing constraint, not a store-efficiency choice.
-                block_shape=[BLOCK_M, BLOCK_K],
-            )
-
-        if CROSS_TILE_PREFETCH:
-            # Prime only when the predecessor did not provide K0/K1. The
-            # cross-group mode also carries inputs across group boundaries.
-            if tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles and (not CROSS_GROUP_PREFETCH
-                                                                                             or not group_primed):
-                if HYBRID_TILE_PREFETCH:
-                    # Retire the previous group's outstanding output chunks.
-                    tlx.async_amd_descriptor_wait(0)
-                first_off_m, first_off_n = _grouped_tile_offsets(tile_idx, last_problem_end, num_m_tiles, num_n_tiles,
-                                                                 GROUP_M, BLOCK_M, BLOCK_N)
-                _tdm_issue_loads_unpredicated(
-                    a_desc_base,
-                    b_desc_base,
-                    a_buf,
-                    b_buf,
-                    0,
-                    first_off_m,
-                    first_off_n,
-                    BLOCK_K,
-                    NUM_BUFFERS,
-                    CLUSTER_SIZE,
-                    CLUSTER_MULTICAST,
-                )
-                # Fold the tile position into each fused load to shorten
-                # descriptor lifetimes. L2 prefetch retains the positioned path.
-                if DIRECT_LOAD_OFFSETS:
-                    first_a_desc, first_b_desc = a_desc_base, b_desc_base
-                    first_load_m, first_load_n = first_off_m, first_off_n
-                else:
-                    first_a_desc = tlx.update_tensor_descriptor(a_desc_base, add_offsets=[first_off_m, 0])
-                    first_b_desc = tlx.update_tensor_descriptor(b_desc_base, add_offsets=[first_off_n, 0])
-                    first_load_m, first_load_n = 0, 0
-                _tdm_issue_loads_unpredicated(
-                    first_a_desc,
-                    first_b_desc,
-                    a_buf,
-                    b_buf,
-                    1,
-                    first_load_m,
-                    first_load_n,
-                    BLOCK_K,
-                    NUM_BUFFERS,
-                    CLUSTER_SIZE,
-                    CLUSTER_MULTICAST,
-                )
-                tlx.async_amd_descriptor_wait(NUM_BUFFERS - 1)
-
-        while tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
-            off_m, off_n = _grouped_tile_offsets(tile_idx, last_problem_end, num_m_tiles, num_n_tiles, GROUP_M, BLOCK_M,
-                                                 BLOCK_N)
-            if DIRECT_LOAD_OFFSETS:
-                a_desc, b_desc = a_desc_base, b_desc_base
-                load_off_m, load_off_n = off_m, off_n
-            else:
-                a_desc = tlx.update_tensor_descriptor(a_desc_base, add_offsets=[off_m, 0])
-                b_desc = tlx.update_tensor_descriptor(b_desc_base, add_offsets=[off_n, 0])
-                load_off_m, load_off_n = 0, 0
-
-            producer = 0
-            consumer = 0
-
-            if C_STAGING_MODE == 0 and not HYBRID_TILE_PREFETCH:
-                # The previous tile's async C store may still be reading from
-                # c_buf, which aliases a_buf. Delay the drain until the next
-                # actual LDS overwrite hazard instead of waiting immediately
-                # after the store.
-                tlx.async_amd_descriptor_wait(0)
-
-            if not CROSS_TILE_PREFETCH:
-                # Prime all ring slots up front so the first consumer load only
-                # waits until the oldest TDM op is complete, leaving newer
-                # slots in flight.
-                for _ in tl.static_range(NUM_BUFFERS):
-                    producer = _tdm_issue_loads_unpredicated(
-                        a_desc,
-                        b_desc,
-                        a_buf,
-                        b_buf,
-                        producer,
-                        0,
-                        0,
-                        BLOCK_K,
-                        NUM_BUFFERS,
-                        CLUSTER_SIZE,
-                        CLUSTER_MULTICAST,
-                    )
-                # With dedicated C staging, the previous C store is older than
-                # these input groups. This count-based wait retires that store
-                # and the oldest input group before the first LDS read.
-                tlx.async_amd_descriptor_wait(NUM_BUFFERS - 1)
-
-            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-            epilogue_lb = K_ITERS - (NUM_BUFFERS - 1)
-            a0, b0 = _tdm_load_subtile(a_buf, b_buf, consumer, 0, NUM_BUFFERS, BLOCK_M, BLOCK_N, SUBTILE_LEN)
-
-            if CROSS_TILE_PREFETCH:
-                if not OPTIMIZE_CROSS_TILE:
-                    next_tile_idx = tile_idx + NUM_PROGRAMS
-                    group_end = last_problem_end + num_tiles
-                    has_next = next_tile_idx < group_end
-                    safe_next_tile_idx = min(next_tile_idx, group_end - 1)
-                    next_off_m, next_off_n = _grouped_tile_offsets(safe_next_tile_idx, last_problem_end, num_m_tiles,
-                                                                   num_n_tiles, GROUP_M, BLOCK_M, BLOCK_N)
-                    if DIRECT_LOAD_OFFSETS:
-                        next_a_desc, next_b_desc = a_desc_base, b_desc_base
-                        next_load_m, next_load_n = next_off_m, next_off_n
-                    else:
-                        next_a_desc = tlx.update_tensor_descriptor(a_desc_base, add_offsets=[next_off_m, 0])
-                        next_b_desc = tlx.update_tensor_descriptor(b_desc_base, add_offsets=[next_off_n, 0])
-                        next_load_m, next_load_n = 0, 0
-
-                steady_end = K_ITERS - NUM_BUFFERS
-                # Producer and consumer are affine functions of the canonical
-                # loop IV; deriving them avoids two scalar loop-carried values.
-                # Cross-group lookahead keeps one K block per loop to limit
-                # live state. Other paths retain ring-sized chunks; the
-                # host contract makes steady_end divisible by NUM_BUFFERS.
-                chunk_end = steady_end // K_BLOCKS_PER_LOOP
-                for chunk in tl.range(0, chunk_end):
-                    for phase in tl.static_range(K_BLOCKS_PER_LOOP):
-                        i = chunk * K_BLOCKS_PER_LOOP + phase
-                        producer_i = i + NUM_BUFFERS
-                        acc, a3, b3 = _tdm_accumulate_subtiles(acc, a0, b0, a_desc, b_desc, a_buf, b_buf, i, producer_i,
-                                                               L2_PREFETCH_DISTANCE, BLOCK_K, NUM_BUFFERS, BLOCK_M,
-                                                               BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
-                        _tdm_issue_loads_unpredicated(
-                            a_desc,
-                            b_desc,
-                            a_buf,
-                            b_buf,
-                            producer_i,
-                            load_off_m,
-                            load_off_n,
-                            BLOCK_K,
-                            NUM_BUFFERS,
-                            CLUSTER_SIZE,
-                            CLUSTER_MULTICAST,
-                        )
-                        acc, a0, b0 = _tdm_wait_and_finish_k_block(acc, a3, b3, a_buf, b_buf, i + 1, NUM_BUFFERS,
-                                                                   BLOCK_M, BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
-
-                if CROSS_GROUP_PREFETCH:
-                    if not prefetched_boundary:
-                        carried_fourth_m_end = tl.load(group_offsets + g + 5)
-                        prefetched_boundary = True
-                    # Discover the next tile only after the steady K loop, so its
-                    # descriptors are not live through the main matrix schedule.
-                    tlx.amd_sched_barrier()
-                    next_tile_idx = tile_idx + NUM_PROGRAMS
-                    next_group = g
-                    next_group_start = last_problem_end
-                    next_group_end = last_problem_end + num_tiles
-                    next_m_start = m_start
-                    next_gm = gm
-                    next_num_m_tiles = num_m_tiles
-                    while next_tile_idx >= next_group_end and next_group + 1 < group_size:
-                        next_group += 1
-                        next_m_start += next_gm
-                        if next_group == g + 1:
-                            next_m_end = following_m_end
-                        elif next_group == g + 2:
-                            next_m_end = third_m_end
-                        elif next_group == g + 3:
-                            next_m_end = fourth_m_end
-                        else:
-                            next_m_end = tl.load(group_offsets + next_group + 1)
-                        next_gm = next_m_end - next_m_start
-                        next_num_m_tiles = tl.cdiv(next_gm, BLOCK_M)
-                        next_group_start = next_group_end
-                        next_group_end += next_num_m_tiles * num_n_tiles
-                    has_next = next_tile_idx < next_group_end
-                    # Keep descriptor dimensions and tile arithmetic valid even
-                    # when the final groups are empty and these loads are disabled.
-                    next_group = tl.where(has_next, next_group, g)
-                    next_group_start = tl.where(has_next, next_group_start, last_problem_end)
-                    next_m_start = tl.where(has_next, next_m_start, m_start)
-                    next_gm = tl.where(has_next, next_gm, gm)
-                    next_num_m_tiles = tl.where(has_next, next_num_m_tiles, num_m_tiles)
-                    safe_next_tile_idx = tl.where(has_next, next_tile_idx, tile_idx)
-                    next_off_m, next_off_n = _grouped_tile_offsets(safe_next_tile_idx, next_group_start,
-                                                                   next_num_m_tiles, num_n_tiles, GROUP_M, BLOCK_M,
-                                                                   BLOCK_N)
-                    next_a_desc = tl.make_tensor_descriptor(a_packed + next_m_start.to(tl.int64) * stride_am,
-                                                            shape=[next_gm, K], strides=[stride_am,
-                                                                                         tl.constexpr(1)],
-                                                            block_shape=[BLOCK_M, BLOCK_K])
-                    next_b_desc = tl.make_tensor_descriptor(b_t + next_group.to(tl.int64) * stride_bg, shape=[N, K],
-                                                            strides=[stride_bn,
-                                                                     tl.constexpr(1)], block_shape=[BLOCK_N, BLOCK_K])
-                    next_load_m, next_load_n = next_off_m, next_off_n
-                    group_primed = has_next
-                    tlx.amd_sched_barrier()
-                elif HYBRID_TILE_PREFETCH:
-                    # Keep only the current group's descriptors alive.
-                    tlx.amd_sched_barrier()
-                    next_tile_idx = tile_idx + NUM_PROGRAMS
-                    group_end = last_problem_end + num_tiles
-                    has_next = next_tile_idx < group_end
-                    safe_next_tile_idx = min(next_tile_idx, group_end - 1)
-                    next_off_m, next_off_n = _grouped_tile_offsets(safe_next_tile_idx, last_problem_end, num_m_tiles,
-                                                                   num_n_tiles, GROUP_M, BLOCK_M, BLOCK_N)
-                    next_a_desc, next_b_desc = a_desc_base, b_desc_base
-                    next_load_m, next_load_n = next_off_m, next_off_n
-                    tlx.amd_sched_barrier()
-
-                # Peel one full ring rotation. Once a current-tile slot has
-                # been read into registers, recycle it for the matching K
-                # block of the next tile handled by this persistent program.
-                # Prefer the late unroll hint over static_range. Early
-                # expansion lets LICM hoist both iterations' LDS view setup
-                # across the group loop, increasing C-store barrier skew.
-                for j in tl.range(0, NUM_BUFFERS, loop_unroll_factor=NUM_BUFFERS):
-                    consumer_j = steady_end + j
-                    acc, a3, b3 = _tdm_accumulate_subtiles(acc, a0, b0, a_desc, b_desc, a_buf, b_buf, consumer_j, j, 0,
-                                                           BLOCK_K, NUM_BUFFERS, BLOCK_M, BLOCK_N, SUBTILE_LEN,
-                                                           LIMIT_DOT_LIFETIME)
-                    _tdm_issue_loads(
-                        next_a_desc,
-                        next_b_desc,
-                        a_buf,
-                        b_buf,
-                        j,
-                        next_load_m,
-                        next_load_n,
-                        has_next,
-                        BLOCK_K,
-                        NUM_BUFFERS,
-                        CLUSTER_SIZE,
-                        CLUSTER_MULTICAST,
-                    )
-                    acc, a0, b0 = _tdm_wait_and_finish_k_block(acc, a3, b3, a_buf, b_buf, consumer_j + 1, NUM_BUFFERS,
-                                                               BLOCK_M, BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
-            else:
-                for i in tl.range(0, K_ITERS):
-                    acc, a3, b3 = _tdm_accumulate_subtiles(acc, a0, b0, a_desc, b_desc, a_buf, b_buf, consumer,
-                                                           producer, L2_PREFETCH_DISTANCE, BLOCK_K, NUM_BUFFERS,
-                                                           BLOCK_M, BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
-                    consumer += 1
-                    pred = (i + 1) - epilogue_lb
-                    pred = (pred >> 31) & 1
-                    producer = _tdm_issue_loads(
-                        a_desc,
-                        b_desc,
-                        a_buf,
-                        b_buf,
-                        producer,
-                        0,
-                        0,
-                        pred,
-                        BLOCK_K,
-                        NUM_BUFFERS,
-                        CLUSTER_SIZE,
-                        CLUSTER_MULTICAST,
-                    )
-                    # Issue first so the next producer group can overlap the
-                    # final WMMA, then wait until the older consumer group is
-                    # complete.
-                    acc, a0, b0 = _tdm_wait_and_finish_k_block(acc, a3, b3, a_buf, b_buf, consumer, NUM_BUFFERS,
-                                                               BLOCK_M, BLOCK_N, SUBTILE_LEN, LIMIT_DOT_LIFETIME)
-
-            if HYBRID_TILE_PREFETCH:
-                tlx.amd_sched_barrier()
-                for part in tl.static_range(BLOCK_M // 32):
-                    if part >= 2:
-                        # The older output must finish before its slot is
-                        # overwritten. Keep the newer chunk in flight.
-                        tlx.async_amd_descriptor_wait(1)
-                    c_part = _tdm_c_store_chunk(acc, part)
-                    c_part = c_part.to(tlx.dtype_of(c_packed))
-                    c_view = c_buf[part % 2]
-                    c_desc = tlx.update_tensor_descriptor(c_desc_base, add_offsets=[off_m + part * 32, off_n])
-                    tlx.local_store(c_view, c_part)
-                    tlx.async_amd_descriptor_store(c_desc, c_view, [0, 0], clamp_bounds=False)
-                # The last two output stores overlap the next tile's entry.
-                # Its input waits also retire them before C staging is reused.
-            elif OPTIMIZE_CROSS_TILE:
-                # Direct C stores leave both input rings intact without a
-                # full C tile in LDS or serialized stores through a small one.
-                tlx.amd_sched_barrier()
-                rows = (m_start + off_m).to(tl.int64) + tl.arange(0, BLOCK_M)
-                cols = off_n + tl.arange(0, BLOCK_N)
-                c_ptrs = c_packed + rows[:, None] * stride_cm + cols[None, :]
-                c = acc.to(tlx.dtype_of(c_packed))
-                tlx.amd_sched_barrier()
-                tl.store(c_ptrs, c)
-
-            else:
-                c_view = c_buf[0]
-                c = acc.to(tlx.dtype_of(c_packed))
-                # The descriptor update is pure, so LICM otherwise hoists it into
-                # the tile preheader and lengthens its live range through the K
-                # loop. Keep it in the epilogue to avoid an extra gfx1250 VGPR-MSB
-                # mode transition in the steady body.
-                tlx.amd_sched_barrier()
-                c_desc = tlx.update_tensor_descriptor(c_desc_base, add_offsets=[off_m, off_n])
-                tlx.amd_sched_barrier()
-                if USE_FULL_C_TILE:
-                    tlx.local_store(c_view, c)
-                    tlx.async_amd_descriptor_store(c_desc, c_view, [0, 0], clamp_bounds=False)
-                else:
-                    c_pair = tl.reshape(c, (BLOCK_M, 2, BLOCK_K)).permute(0, 2, 1)
-                    c0, c1 = tl.split(c_pair)
-                    tlx.local_store(c_view, c0)
-                    tlx.async_amd_descriptor_store(c_desc, c_view, [0, 0], clamp_bounds=False)
-                    # c1 reuses the same LDS view immediately, so this wait is
-                    # still required; the second-half store is drained lazily.
-                    tlx.async_amd_descriptor_wait(0)
-                    tlx.local_store(c_view, c1)
-                    tlx.async_amd_descriptor_store(c_desc, c_view, [0, BLOCK_K], clamp_bounds=False)
-
-            tile_idx += NUM_PROGRAMS
-
-        last_problem_end += num_tiles
-        if CROSS_GROUP_PREFETCH:
-            if not prefetched_boundary:
-                # Groups with no tile still advance the boundary pipeline.
-                carried_fourth_m_end = tl.load(group_offsets + g + 5)
-            carried_m_start, carried_m_end = m_end, following_m_end
-            carried_following_m_end, carried_third_m_end = third_m_end, fourth_m_end
-
-    # At kernel exit, rely on s_endpgm to drain the final async TDM
-    # local-to-global store. Keep the explicit wait here as a marker in case
-    # target semantics require restoring it.
-    # tlx.async_amd_descriptor_wait(0)
-
-
-def _validate_grouped_gemm_cluster_config(m_list, n, num_programs, *, block_m, block_n, block_k, group_m,
-                                          tdm_pipeline_depth, l2_prefetch_distance, c_staging_mode, cross_tile_prefetch,
-                                          auto_config, xcd_remap_mode, num_xcds, xcd_chunk):
-    """Require identical cluster control flow and the tested operand-sharing map."""
-    if (block_m, block_n, block_k, group_m, tdm_pipeline_depth, l2_prefetch_distance,
-            c_staging_mode) != (256, 256, 128, 4, 2, 0, 0) or not cross_tile_prefetch or auto_config:
-        raise ValueError("clustering requires the 256x256x128 depth-2 hybrid, group_m=4, "
-                         "no L2 prefetch, and auto_config=False")
-    if (xcd_remap_mode, num_xcds, xcd_chunk) != ("chunked", 8, 2):
-        raise ValueError("clustering requires chunked XCD remapping with num_xcds=8 and xcd_chunk=2")
-    if not m_list or min(m_list) <= 0 or len(set(m_list)) != 1 or m_list[0] % (4 * block_m) or n % (2 * block_n):
-        raise ValueError("clustering requires equal nonempty groups, M divisible by 1024, and N divisible by 512")
-    tiles_per_group = (m_list[0] // block_m) * (n // block_n)
-    if num_programs % 16 or tiles_per_group % num_programs:
-        raise ValueError("clustering requires num_programs divisible by 16 and each group's tile count "
-                         "divisible by num_programs; set num_programs explicitly if necessary")
+    """Original packed entry point; the pointer-table path is compiled out."""
+    grouped_gemm_tdm_impl(
+        a_packed,
+        b_t,
+        c_packed,
+        group_offsets,
+        group_size,
+        N,
+        stride_am,
+        stride_bg,
+        stride_bn,
+        stride_cm,
+        K,
+        NUM_PROGRAMS,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        GROUP_M,
+        NUM_BUFFERS,
+        L2_PREFETCH_DISTANCE,
+        C_STAGING_MODE,
+        CROSS_TILE_PREFETCH,
+        XCD_REMAP_MODE,
+        NUM_XCDS,
+        XCD_CHUNK,
+        CLUSTER_SIZE,
+        CLUSTER_MULTICAST,
+        POINTER_TABLES=False,
+    )
 
 
 def grouped_gemm_tdm(
@@ -1026,7 +386,7 @@ def grouped_gemm_tdm(
     assert a_packed.dim() == 2 and b_t.dim() == 3
     assert a_packed.stride(1) == 1 and b_t.stride(2) == 1
     assert group_offsets.dtype == torch.int32
-    assert xcd_remap_mode in _XCD_REMAP_MODES
+    assert xcd_remap_mode in XCD_REMAP_MODES
     assert num_xcds >= 1 and xcd_chunk >= 1
     if cluster_size not in (1, 2, 4):
         raise ValueError("cluster_size must be 1, 2, or 4")
@@ -1082,11 +442,11 @@ def grouped_gemm_tdm(
     num_programs = max(1, min(int(num_programs), total_tiles))
 
     if cluster_size > 1:
-        _validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=block_m, block_n=block_n,
-                                              block_k=block_k, group_m=group_m, tdm_pipeline_depth=tdm_pipeline_depth,
-                                              l2_prefetch_distance=l2_prefetch_distance, c_staging_mode=c_staging_mode,
-                                              cross_tile_prefetch=cross_tile_prefetch, auto_config=auto_config,
-                                              xcd_remap_mode=xcd_remap_mode, num_xcds=num_xcds, xcd_chunk=xcd_chunk)
+        validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=block_m, block_n=block_n, block_k=block_k,
+                                             group_m=group_m, tdm_pipeline_depth=tdm_pipeline_depth,
+                                             l2_prefetch_distance=l2_prefetch_distance, c_staging_mode=c_staging_mode,
+                                             cross_tile_prefetch=cross_tile_prefetch, auto_config=auto_config,
+                                             xcd_remap_mode=xcd_remap_mode, num_xcds=num_xcds, xcd_chunk=xcd_chunk)
 
     # The group count is known from B's shape. Specializing the square
     # cross-tile schedule removes unused boundary-refill state for small groups.
@@ -1115,13 +475,15 @@ def grouped_gemm_tdm(
             L2_PREFETCH_DISTANCE=l2_prefetch_distance,
             C_STAGING_MODE=c_staging_mode,
             CROSS_TILE_PREFETCH=cross_tile_prefetch,
-            XCD_REMAP_MODE=_XCD_REMAP_MODES[xcd_remap_mode],
+            XCD_REMAP_MODE=XCD_REMAP_MODES[xcd_remap_mode],
             NUM_XCDS=num_xcds,
             XCD_CHUNK=xcd_chunk,
             CLUSTER_SIZE=cluster_size,
             CLUSTER_MULTICAST=cluster_multicast,
             num_warps=4,
             waves_per_eu=1,
+            enable_wmma_queuing=grouped_gemm_enable_wmma_queuing(block_m, block_n, tdm_pipeline_depth, c_staging_mode,
+                                                                 cross_tile_prefetch),
             ctas_per_cga=(cluster_size, 1, 1),
         )
 
@@ -1134,6 +496,130 @@ def grouped_gemm_tdm(
     else:
         run_kernel()
     return c_packed
+
+
+def grouped_gemm_tdm_list(
+    group_a: list[torch.Tensor],
+    group_b: list[torch.Tensor],
+    group_c: Optional[list[torch.Tensor]] = None,
+    *,
+    block_m: int = 128,
+    block_n: int = 128,
+    block_k: int = 128,
+    group_m: int = 4,
+    tdm_pipeline_depth: int = 2,
+    l2_prefetch_distance: int = 0,
+    num_programs: Optional[int] = None,
+    benchmark: Optional[str] = None,
+    benchmark_num_iters: int = 32,
+    c_staging_mode: int = 0,
+    cross_tile_prefetch: bool = False,
+    auto_config: bool = False,
+    xcd_remap_mode: str = "none",
+    num_xcds: int = 8,
+    xcd_chunk: int = 2,
+    cluster_size: int = 1,
+    cluster_multicast: bool = True,
+) -> list[torch.Tensor]:
+    """Compute FP16 A[g] @ B[g] using the optimized TDM list kernel.
+
+    A[g] is row-major [M_g, K] and B[g] is a column-major [K, N] view.
+    N and K must be shared by all groups. Matrices can have independent
+    allocations; only their pointers and gfx950-style size/stride tables are
+    copied to device. Call grouped_gemm_tdm_list_kernel directly to reuse
+    already-prepared device tables and outputs without allocating metadata.
+    M/N may be smaller than a tile or have tails; K must still cover full
+    tiles and fill the pipeline. Tails require cluster_size=1. Aligned shapes
+    automatically use the full-tile specialization. Tile sizes are unchanged.
+    Benchmarking measures the kernel launch after metadata and output setup.
+    """
+    args = make_grouped_gemm_tdm_list_args(group_a, group_b, group_c)
+    a_ptrs, b_ptrs, c_ptrs, group_sizes, group_lds, outputs, m_list, n, k = args
+    device = group_a[0].device
+    model_sms = max(1, int(num_programs)) if num_programs is not None else _active_num_cus(device)
+    if auto_config:
+        selected = _pick_grouped_gemm_config(m_list, n, k, model_sms, allow_mn_tails=True)
+        block_m, block_n, block_k = (int(selected[key]) for key in ("block_m", "block_n", "block_k"))
+        group_m = int(selected["group_m"])
+        tdm_pipeline_depth = int(selected["tdm_pipeline_depth"])
+        c_staging_mode = int(selected["c_staging_mode"])
+        cross_tile_prefetch = bool(selected["cross_tile_prefetch"])
+
+    if block_m <= 0 or block_n <= 0 or block_k != 128 or group_m <= 0:
+        raise ValueError("TDM requires positive M/N tile sizes and group_m, and block_k=128")
+    if tdm_pipeline_depth not in (2, 3, 4) or c_staging_mode not in (0, 1):
+        raise ValueError("TDM requires pipeline depth 2/3/4 and c_staging_mode 0/1")
+    if k % block_k:
+        raise ValueError("TDM requires full K tiles: K must be divisible by block_k")
+    allow_mn_tails = bool(n % block_n or any(m % block_m for m in m_list))
+    if k // block_k < tdm_pipeline_depth:
+        raise ValueError("K must contain enough blocks to fill the TDM pipeline")
+    if cross_tile_prefetch:
+        if tdm_pipeline_depth != 2 or (k // block_k) % 2:
+            raise ValueError("cross-tile prefetch requires depth 2 and an even number of K blocks")
+        if c_staging_mode == 0 and (block_m, block_n) != (256, 256):
+            raise ValueError("alias-C cross-tile prefetch requires a 256x256 tile")
+    if xcd_remap_mode not in XCD_REMAP_MODES or num_xcds < 1 or xcd_chunk < 1:
+        raise ValueError("invalid XCD remapping configuration")
+    if cluster_size not in (1, 2, 4):
+        raise ValueError("cluster_size must be 1, 2, or 4")
+    if allow_mn_tails and cluster_size != 1:
+        raise ValueError("M/N tails require cluster_size=1")
+    total_tiles = sum(triton.cdiv(m, block_m) * triton.cdiv(n, block_n) for m in m_list)
+    if total_tiles == 0:
+        return outputs
+    num_programs = max(1, min(model_sms, total_tiles))
+    if cluster_size > 1:
+        validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=block_m, block_n=block_n, block_k=block_k,
+                                             group_m=group_m, tdm_pipeline_depth=tdm_pipeline_depth,
+                                             l2_prefetch_distance=l2_prefetch_distance, c_staging_mode=c_staging_mode,
+                                             cross_tile_prefetch=cross_tile_prefetch, auto_config=auto_config,
+                                             xcd_remap_mode=xcd_remap_mode, num_xcds=num_xcds, xcd_chunk=xcd_chunk)
+    group_size = len(group_a)
+    kernel_group_size = (tl.constexpr(group_size)
+                         if cross_tile_prefetch and block_m == 256 and block_n == 256 else group_size)
+
+    def run_kernel():
+        return grouped_gemm_tdm_list_kernel[(num_programs, )](
+            a_ptrs,
+            b_ptrs,
+            c_ptrs,
+            group_sizes,
+            group_lds,
+            kernel_group_size,
+            K=k,
+            NUM_PROGRAMS=num_programs,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            GROUP_M=group_m,
+            NUM_BUFFERS=tdm_pipeline_depth,
+            L2_PREFETCH_DISTANCE=l2_prefetch_distance,
+            C_STAGING_MODE=c_staging_mode,
+            CROSS_TILE_PREFETCH=cross_tile_prefetch,
+            XCD_REMAP_MODE=XCD_REMAP_MODES[xcd_remap_mode],
+            NUM_XCDS=num_xcds,
+            XCD_CHUNK=xcd_chunk,
+            CLUSTER_SIZE=cluster_size,
+            CLUSTER_MULTICAST=cluster_multicast,
+            ALLOW_MN_TAILS=allow_mn_tails,
+            num_warps=4,
+            waves_per_eu=1,
+            enable_wmma_queuing=grouped_gemm_enable_wmma_queuing(block_m, block_n, tdm_pipeline_depth, c_staging_mode,
+                                                                 cross_tile_prefetch),
+            ctas_per_cga=(cluster_size, 1, 1),
+        )
+
+    with torch.cuda.device(device):
+        if benchmark == "graph":
+            ms = triton.testing.do_bench_cudagraph(run_kernel, rep=benchmark_num_iters)
+            print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
+        elif benchmark == "eager":
+            ms = triton.testing.do_bench(run_kernel, warmup=30, rep=benchmark_num_iters)
+            print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
+        else:
+            run_kernel()
+    return outputs
 
 
 def _make_groups(shapes: list[tuple[int, int, int]], device: torch.device):
@@ -1177,6 +663,24 @@ def _grouped_gemm_tdm_compile_attrs() -> dict[tuple[int, ...], list[list[int | s
         attrs[(names.index(name), )] = [["tt.divisibility", 16], ["tt.pointer_range", 32]]
     for name in ("N", "stride_am", "stride_bg", "stride_bn", "stride_cm"):
         attrs[(names.index(name), )] = [["tt.divisibility", 16]]
+    return attrs
+
+
+def _grouped_gemm_tdm_list_compile_signature() -> dict[str, str]:
+    return {
+        "group_a_ptrs": "*i64",
+        "group_b_ptrs": "*i64",
+        "group_c_ptrs": "*i64",
+        "group_gemm_sizes": "*i32",
+        "g_lds": "*i32",
+        "group_size": "i32",
+    }
+
+
+def _grouped_gemm_tdm_list_compile_attrs() -> dict[tuple[int, ...], list[list[int | str]]]:
+    names = grouped_gemm_tdm_list_kernel.arg_names
+    attrs = {(names.index(name), ): [["tt.divisibility", 16], ["tt.pointer_range", 32]]
+             for name in ("group_a_ptrs", "group_b_ptrs", "group_c_ptrs", "group_gemm_sizes", "g_lds")}
     return attrs
 
 
@@ -1227,7 +731,10 @@ def test_grouped_gemm_tdm_compiles_gfx1250(BLOCK_SIZE, TDM_PIPELINE_DEPTH):
         },
         attrs=_grouped_gemm_tdm_compile_attrs(),
     )
-    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options={"num_warps": 4})
+    compiled = triton_compile(
+        src, target=GPUTarget("hip", "gfx1250", 32), options=dict(
+            num_warps=4, enable_wmma_queuing=grouped_gemm_enable_wmma_queuing(BLOCK_SIZE, BLOCK_SIZE,
+                                                                              TDM_PIPELINE_DEPTH, 0, False)))
 
     ttgir = compiled.asm["ttgir"]
     assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
@@ -1345,7 +852,10 @@ def test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250(XCD_REMAP_MODE, B
         },
         attrs=_grouped_gemm_tdm_compile_attrs(),
     )
-    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options={"num_warps": 4})
+    compiled = triton_compile(
+        src, target=GPUTarget("hip", "gfx1250", 32),
+        options=dict(num_warps=4,
+                     enable_wmma_queuing=grouped_gemm_enable_wmma_queuing(BLOCK_M, 256, 2, C_STAGING_MODE, True)))
 
     assert compiled.metadata.shared < 320 * 1024
     ttgir = compiled.asm["ttgir"]
@@ -1527,6 +1037,8 @@ if __name__ == "__main__":
         raise SystemExit("Requires gfx1250 hardware")
 
     parser = argparse.ArgumentParser(description="Benchmark the TLX AMD f16 grouped GEMM TDM kernel")
+    parser.add_argument("--kernel", choices=("packed", "list"), default="packed",
+                        help="select the packed or pointer-table TDM kernel")
     parser.add_argument("--m_list", type=str, default="512,512,512,512", help="Comma-separated M sizes per group")
     parser.add_argument("-N", type=int, default=1024, help="problem N size")
     parser.add_argument("-K", type=int, default=2048, help="problem K size")
@@ -1545,7 +1057,7 @@ if __name__ == "__main__":
                         help="prefetch the next tile; alias-C uses the 256x256 within-group hybrid")
     parser.add_argument("--auto_config", action=argparse.BooleanOptionalAction, default=False,
                         help="select a validated tile config using the host cost model")
-    parser.add_argument("--xcd_remap", choices=tuple(_XCD_REMAP_MODES), default="none",
+    parser.add_argument("--xcd_remap", choices=tuple(XCD_REMAP_MODES), default="none",
                         help="persistent program-id mapping across gfx1250 XCDs")
     parser.add_argument("--num_xcds", type=int, default=8)
     parser.add_argument("--xcd_chunk", type=int, default=2)
@@ -1577,15 +1089,12 @@ if __name__ == "__main__":
 
     if args.auto_config:
         model_sms = args.num_programs if args.num_programs is not None else _active_num_cus(device)
-        selected = _pick_grouped_gemm_config(m_list, args.N, args.K, model_sms)
+        selected = _pick_grouped_gemm_config(m_list, args.N, args.K, model_sms, allow_mn_tails=args.kernel == "list")
         print("selected config:", selected["name"], f"BM={selected['block_m']}", f"BN={selected['block_n']}",
               f"cross_tile_prefetch={selected['cross_tile_prefetch']}")
 
     benchmark = None if args.benchmark_mode == "none" else args.benchmark_mode
-    out = grouped_gemm_tdm(
-        a_packed,
-        b_t,
-        group_offsets,
+    launch_options = dict(
         block_m=args.BM,
         block_n=args.BN,
         block_k=args.BK,
@@ -1604,15 +1113,20 @@ if __name__ == "__main__":
         benchmark=benchmark,
         benchmark_num_iters=args.benchmark_num_iters,
     )
+    if args.kernel == "packed":
+        out = grouped_gemm_tdm(a_packed, b_t, group_offsets, **launch_options)
+        group_out = list(out.split(m_list))
+    else:
+        if group_a is None:
+            group_a = list(a_packed.split(m_list))
+        group_out = grouped_gemm_tdm_list(group_a, [weight.T for weight in b_t.unbind()], **launch_options)
 
     if args.check:
         assert group_a is not None
-        start = 0
         max_diff = 0.0
-        for i, m in enumerate(m_list):
+        for i, actual in enumerate(group_out):
             ref = group_a[i] @ b_t[i].T
-            diff = (out[start:start + m] - ref).abs().max().item()
+            diff = (actual - ref).abs().max().item()
             max_diff = max(max_diff, diff)
-            torch.testing.assert_close(out[start:start + m], ref, atol=1e-2, rtol=1e-2)
-            start += m
+            torch.testing.assert_close(actual, ref, atol=1e-2, rtol=1e-2)
         print(f"max abs diff: {max_diff:.4f}")

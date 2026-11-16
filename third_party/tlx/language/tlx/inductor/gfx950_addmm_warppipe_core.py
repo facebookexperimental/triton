@@ -20,12 +20,16 @@ def gfx950_addmm_warppipe_compute_async(
     tail_width,
     stride_ak,
     stride_bk,
+    predrain_prefetch_ptr,
+    predrain_prefetch_mask,
+    PREDRAIN_EPILOGUE_PREFETCH: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
     ACC_TYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
+    DRAIN_PIPELINE: tl.constexpr = False,
 ):
     """Compute one output tile with the shared async-load warp pipeline."""
     # gfx950 cannot lower partial-K async copies into this padded LDS layout.
@@ -45,7 +49,10 @@ def gfx950_addmm_warppipe_compute_async(
         # One combined group per K tile lets wait counts correspond to tiles.
         tlx.async_load_commit_group([tok_a, tok_b])
 
-    tlx.async_load_wait_group(NUM_BUFFERS - 2)
+    if DRAIN_PIPELINE:
+        tlx.async_load_wait_group(0)
+    else:
+        tlx.async_load_wait_group(NUM_BUFFERS - 2)
     a_tile = tlx.local_load(tlx.local_view(smem_a, 0))
     b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smem_b, 0)))
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
@@ -56,9 +63,10 @@ def gfx950_addmm_warppipe_compute_async(
         next_buf = ((tile_id + 1) % NUM_BUFFERS).to(tl.int32)
         k_prefetch = (k_lo + tile_id + NUM_BUFFERS) * BLOCK_K
 
-        # The loop-tail wait prevents the leading wave from refilling LDS while
-        # another wave still consumes the current buffer.
-        tlx.async_load_wait_group(NUM_BUFFERS - 2)
+        if DRAIN_PIPELINE:
+            tlx.async_load_wait_group(0)
+        else:
+            tlx.async_load_wait_group(NUM_BUFFERS - 2)
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc = tl.dot(
                 a_tile,
@@ -91,10 +99,19 @@ def gfx950_addmm_warppipe_compute_async(
         out_dtype=ACC_TYPE,
     )
     tlx.async_load_wait_group(0)
+    if PREDRAIN_EPILOGUE_PREFETCH:
+        prefetched_epilogue = tl.load(
+            predrain_prefetch_ptr,
+            mask=predrain_prefetch_mask,
+            other=0.0,
+        ).to(tl.float32)
+    else:
+        prefetched_epilogue = 0.0
+
     for i in tl.range(
-        0,
-        NUM_BUFFERS - 1,
-        loop_unroll_factor=NUM_BUFFERS - 1,
+            0,
+            NUM_BUFFERS - 1,
+            loop_unroll_factor=NUM_BUFFERS - 1,
     ):
         buf = ((n_iters - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS).to(tl.int32)
         a_tile = tlx.local_load(tlx.local_view(smem_a, buf))
@@ -120,13 +137,14 @@ def gfx950_addmm_warppipe_compute_async(
         mask=offs_k[:, None] < tail_width,
         other=0.0,
     )
-    return tl.dot(
+    acc = tl.dot(
         a_tail,
         b_tail,
         acc,
         allow_tf32=ALLOW_TF32,
         out_dtype=ACC_TYPE,
     )
+    return acc, prefetched_epilogue
 
 
 @triton.jit

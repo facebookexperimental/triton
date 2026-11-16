@@ -125,36 +125,6 @@ struct ArithConstantSplatOpConversion
   }
 };
 
-struct CatOpConversion : public ConvertOpToLLVMPattern<CatOp> {
-  using OpAdaptor = typename CatOp::Adaptor;
-  explicit CatOpConversion(LLVMTypeConverter &typeConverter,
-                           PatternBenefit benefit = patternBenefitDefault)
-      : ConvertOpToLLVMPattern<CatOp>(typeConverter, benefit) {}
-  LogicalResult
-  matchAndRewrite(CatOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    Location loc = op->getLoc();
-    auto resultTy = cast<RankedTensorType>(op.getType());
-    // Unpack input values.
-    auto lhsVals = unpackUniqueTensorElements(loc, adaptor.getLhs(), rewriter);
-    auto rhsVals = unpackUniqueTensorElements(loc, adaptor.getRhs(), rewriter);
-
-    // concatenate (and potentially reorder) values
-    SmallVector<Value> retVals;
-    for (Value v : lhsVals)
-      retVals.push_back(v);
-    for (Value v : rhsVals)
-      retVals.push_back(v);
-
-    assert(retVals.size() == getUniqueElemsPerThread(resultTy));
-
-    // pack and replace
-    Value ret = packUniqueTensorElements(loc, getTypeConverter(), retVals,
-                                         rewriter, resultTy);
-    rewriter.replaceOp(op, ret);
-    return success();
-  }
-};
 struct JoinOpConversion : public ConvertOpToLLVMPattern<JoinOp> {
   using OpAdaptor = typename JoinOp::Adaptor;
   explicit JoinOpConversion(LLVMTypeConverter &typeConverter,
@@ -268,11 +238,17 @@ struct SplitOpConversion : public ConvertOpToLLVMPattern<SplitOp> {
 struct ReshapeOpConversion : public ConvertOpToLLVMPattern<ReshapeOp> {
   using OpAdaptor = typename ReshapeOp::Adaptor;
   explicit ReshapeOpConversion(LLVMTypeConverter &typeConverter,
+                               const TargetInfoBase &targetInfo,
                                PatternBenefit benefit = patternBenefitDefault)
-      : ConvertOpToLLVMPattern<ReshapeOp>(typeConverter, benefit) {}
+      : ConvertOpToLLVMPattern<ReshapeOp>(typeConverter, benefit),
+        targetInfo(targetInfo) {}
   LogicalResult
   matchAndRewrite(ReshapeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (isNpotSharedReshape(op.getSrc().getType(), op.getType())) {
+      rewriter.replaceOp(op, lowerThroughSharedMemory(op, adaptor, rewriter));
+      return success();
+    }
     assert(!isExpensiveView(op.getSrc().getType(), op.getType()));
     Location loc = op.getLoc();
     auto resultTy = cast<RankedTensorType>(op.getType());
@@ -284,6 +260,49 @@ struct ReshapeOpConversion : public ConvertOpToLLVMPattern<ReshapeOp> {
     rewriter.replaceOp(op, ret);
     return success();
   }
+
+private:
+  // Scratch holds getBitwidth(srcTy) bits per element: pointers as i64 and i1
+  // as i8.
+  Value lowerThroughSharedMemory(ReshapeOp op, OpAdaptor adaptor,
+                                 ConversionPatternRewriter &rewriter) const {
+    Location loc = op.getLoc();
+    MLIRContext *ctx = op.getContext();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto kReg = str_attr("register");
+    RankedTensorType srcTy = op.getSrc().getType();
+    RankedTensorType dstTy = op.getType();
+    Type elemTy = getTypeConverter()->convertType(srcTy.getElementType());
+    bool isPtr = isa<LLVM::LLVMPointerType>(elemTy);
+    Type storageTy = isPtr                                ? i64_ty
+                     : elemTy.getIntOrFloatBitWidth() < 8 ? i8_ty
+                                                          : elemTy;
+    SmallVector<Value> vals =
+        unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
+    for (Value &val : vals) {
+      if (isPtr)
+        val = b.ptrtoint(storageTy, val);
+      else if (storageTy != elemTy)
+        val = b.zext(storageTy, val);
+    }
+    LinearLayout srcLayout =
+        toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
+    vals = transferMixedRadixThroughSharedMemory(
+        loc, rewriter, targetInfo, srcLayout,
+        toLinearLayout(dstTy).removeZeroBasesAlongDim(kReg), vals, storageTy,
+        LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op),
+        srcLayout.getFreeVariableMasks(), /*blockScope=*/true);
+    for (Value &val : vals) {
+      if (isPtr)
+        val = b.inttoptr(elemTy, val);
+      else if (storageTy != elemTy)
+        val = b.trunc(elemTy, val);
+    }
+    return packUniqueTensorElements(loc, getTypeConverter(), vals, rewriter,
+                                    dstTy);
+  }
+
+  const TargetInfoBase &targetInfo;
 };
 struct ExpandDimsOpConversion : public ConvertOpToLLVMPattern<ExpandDimsOp> {
   using OpAdaptor = typename ExpandDimsOp::Adaptor;
@@ -520,38 +539,17 @@ struct MemDescSubsliceOpConversion
       offsetVals.push_back(b.add(oldOffVal, b.i32_val(opOff)));
     }
 
-    // For PartitionedSharedEncoding we need to pick the right base at load
-    // time. Let
-    //   o     = this op's static subslice offsets (one per dim),
-    //   c     = a logical base indices to the current subslice op,
-    //   L     = the shared LL (inputs: offset, partition, block;
-    //                          outputs: dim0, dim1, ...).
-    //
-    //   (1) c_src = c + o
-    //   (2) verifier makes o's bits disjoint from c's bits per dim, so:
-    //         c + o = c ^ o                                   (bit-disjoint)
-    //   (3) L^-1 is linear, so projecting (2) onto the partition component:
-    //         partition(L^-1(c_src)) = partition(L^-1(c)) ^ S
-    //       where  S = partition(L^-1(o))
-    //   (4) the existing lowering already computes i = partition(L^-1(c))
-    //       and indexes bases[i]; from (3) the correct base is:
-    //         bases[i ^ S]
-    //   (5) precompute that rotation once here
-    //         newBases[i] = oldBases[i ^ S]
-    //
-    // The offset component of (3) is already XORed in by getShmemOffset at
-    // load time; only the partition component needs this fix.
-    if (newBases.size() > 1) {
-      LinearLayout ll = triton::gpu::toLinearLayoutIgnoringPadding(srcTy);
-      auto kPartition = StringAttr::get(ctx, "partition");
-      assert(ll.hasInDim(kPartition) &&
-             "multiple bases require a partition input dim");
-      auto dimNames = standardOutDimNames(ctx, layoutOffsets.size());
-      SmallVector<std::pair<StringAttr, int32_t>> namedOffsets;
-      for (auto [dim, off] : llvm::zip(dimNames, layoutOffsets))
-        namedOffsets.push_back({dim, off});
-      auto partitionLayout = ll.invert().sublayout(dimNames, {kPartition});
-      int32_t partitionShift = partitionLayout.apply(namedOffsets)[0].second;
+    // Partition pieces repeat independently within each CTA, with partitions
+    // varying faster than groups. The logical piece selected by the static
+    // offset therefore determines the physical base rotation directly.
+    if (auto part = dyn_cast<PartitionedSharedEncodingAttr>(encoding)) {
+      auto allocShape = dropPipeliningDim(srcTy.getAllocShape(), encoding);
+      auto shapePerCTA = getShapePerCTA(part, allocShape);
+      unsigned dim = part.getPartitionDim();
+      int64_t pieceSize = shapePerCTA[dim] / part.getNumLogicalPieces();
+      unsigned partitionShift =
+          (layoutOffsets[dim] / pieceSize) % part.getNumPartitions();
+
       SmallVector<Value> rotated(newBases.size());
       for (size_t i = 0; i < newBases.size(); ++i)
         rotated[i] = newBases[i ^ partitionShift];
@@ -585,7 +583,41 @@ struct MemDescDynamicSubsliceOpConversion
          llvm::zip_equal(smemObj.getOffsets(), adaptor.getOffsets()))
       offsetVals.push_back(b.add(oldOffset, dynamicOffset));
 
-    SharedMemoryObject resultObj(smemObj.getBases(), llvmElemTy, offsetVals);
+    SmallVector<Value> newBases = llvm::to_vector(smemObj.getBases());
+    auto encoding = srcTy.getEncoding();
+    auto part = dyn_cast<PartitionedSharedEncodingAttr>(encoding);
+    if (part && newBases.size() > 1) {
+      auto dynamicOffsets = llvm::to_vector(adaptor.getOffsets());
+      auto layoutOffsets = dropPipeliningDim<Value>(dynamicOffsets, encoding);
+      auto allocShape = dropPipeliningDim(srcTy.getAllocShape(), encoding);
+      if (layoutOffsets.size() != adaptor.getOffsets().size()) {
+        int64_t stride = getAllocationElems(encoding, allocShape);
+        stride /= newBases.size();
+        Value offset = b.mul(adaptor.getOffsets().front(), b.i32_val(stride));
+        // Apply padding based on the amount we move the base ptr, as
+        // MemDescIndexOp does.
+        if (auto padEnc = getPaddedEncoding(encoding)) {
+          auto paddingShifts = getPaddedSharedShifts(
+              padEnc, srcTy.getElementTypeBitWidth(), /*offsetInBytes=*/false);
+          offset = applyPadding(loc, rewriter, offset, paddingShifts);
+        }
+        for (Value &base : newBases)
+          base = b.gep(base.getType(), llvmElemTy, base, offset);
+      }
+      // As for static subslices, tile-aligned coordinates are bit-disjoint
+      // from the slice's local coordinates, and partitions vary faster than
+      // groups. Rotate the physical bases by the partition of the logical
+      // piece that the runtime offset selects.
+      auto shapePerCTA = getShapePerCTA(part, allocShape);
+      unsigned dim = part.getPartitionDim();
+      int64_t pieceSize = shapePerCTA[dim] / part.getNumLogicalPieces();
+      Value pieceIndex = b.udiv(layoutOffsets[dim], b.i32_val(pieceSize));
+      Value shift = b.urem(pieceIndex, b.i32_val(part.getNumPartitions()));
+      Value vector = LLVM::buildBasePtrVector(loc, rewriter, newBases);
+      for (unsigned i = 0; i < newBases.size(); ++i)
+        newBases[i] = b.extract_element(vector, b.xor_(shift, b.i32_val(i)));
+    }
+    SharedMemoryObject resultObj(newBases, llvmElemTy, offsetVals);
     rewriter.replaceOp(
         op, getStructFromSharedMemoryObject(loc, resultObj, rewriter));
     return success();
@@ -624,13 +656,12 @@ struct MemDescReinterpretOpConversion
 
 void mlir::triton::populateViewOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    PatternBenefit benefit) {
-  patterns.add<ReshapeOpConversion>(typeConverter, benefit);
+    const TargetInfoBase &targetInfo, PatternBenefit benefit) {
+  patterns.add<ReshapeOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<ExpandDimsOpConversion>(typeConverter, benefit);
   patterns.add<SplatOpConversion>(typeConverter, benefit);
   patterns.add<UnsplatOpConversion>(typeConverter, benefit);
   patterns.add<ArithConstantSplatOpConversion>(typeConverter, benefit);
-  patterns.add<CatOpConversion>(typeConverter, benefit);
   patterns.add<JoinOpConversion>(typeConverter, benefit);
   patterns.add<SplitOpConversion>(typeConverter, benefit);
   patterns.add<MemDescTransOpConversion, MemDescReshapeOpConversion>(

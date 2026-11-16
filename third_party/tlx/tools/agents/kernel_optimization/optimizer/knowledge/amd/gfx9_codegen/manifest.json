@@ -1,0 +1,6 @@
+{
+  "priority": 15,
+  "backends": ["amd", "hip", "rocm"],
+  "architectures": ["gfx950", "gfx942", "gfx940", "gfx941", "cdna3", "cdna4", "mi300", "mi300x", "mi325x", "mi350", "mi350x", "mi355x"],
+  "documents": ["gfx9-codegen-patterns.md"]
+}

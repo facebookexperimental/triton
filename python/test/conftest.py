@@ -9,9 +9,14 @@ import torch
 
 
 def pytest_configure(config):
+    config.addinivalue_line("markers", "gsan_fine_granularity(reason): requires sub-16-byte GSan tracking")
     # If pytest-sugar is not active, enable instafail
     if not config.pluginmanager.hasplugin("sugar"):
         config.option.instafail = True
+
+
+# Set once a test leaves this process's GPU context unusable (see _gpu_cleanup).
+_gpu_context_broken = False
 
 
 @pytest.fixture(autouse=True)
@@ -22,20 +27,38 @@ def _gpu_cleanup():
     cleanup, GPU memory from compiled Triton kernels and torch tensors
     accumulates across tests, leading to OOM. This fixture ensures each test
     starts with a clean GPU state.
+
+    It also checks that the GPU context still works. A sticky device error,
+    such as an illegal memory access or a device-side assertion, makes every
+    later GPU call in the process fail, so later tests would fail with it too.
     """
+    global _gpu_context_broken
     yield
     gc.collect()
     if torch.cuda.is_available():
         try:
             torch.cuda.empty_cache()
+            torch.ones(1, device="cuda").sum().item()
         except torch.AcceleratorError:
-            # CUDA context may be in an error state after tests that
-            # intentionally trigger device-side assertions (e.g. py_debug_test).
-            # Silently skip cleanup — the next test will reset the context.
-            pass
+            _gpu_context_broken = True
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    yield
+    if _gpu_context_broken and os.environ.get("PYTEST_XDIST_WORKER"):
+        # The context cannot recover in this process. Exiting now, before the
+        # worker reports this test complete, makes pytest-xdist report it as
+        # having crashed the worker and run the remaining tests in a new one.
+        os._exit(1)
 
 
 def pytest_addoption(parser):
+    # An installed pytest plugin may already provide --device. Reuse that
+    # option instead of registering it twice (pytest has no public lookup API).
+    for group in (parser._anonymous, *parser._groups):
+        if any("--device" in option.names() for option in group.options):
+            return
     parser.addoption("--device", action="store", default="cuda")
 
 
@@ -44,7 +67,23 @@ def device(request):
     # --device is unpassable under buck; cpu backend implies cpu tensors.
     if os.environ.get("TRITON_DEFAULT_BACKEND") == "cpu":
         return "cpu"
-    return request.config.getoption("--device")
+    selected = request.config.getoption("--device")
+    # The shared option may come from a plugin whose default is None.
+    return "cuda" if selected is None else selected
+
+
+@pytest.fixture(scope="module")
+def process_pool(request):
+    from triton._internal_testing import is_hopper_or_newer, use_process_pool
+
+    if request.config.getoption("--warmup-only", default=False) or os.environ.get("DISABLE_SUBPROCESS"):
+        yield
+        return
+    if not is_hopper_or_newer():
+        yield
+        return
+    with use_process_pool(request.module.__name__) as pool:
+        yield pool
 
 
 @pytest.fixture
@@ -72,6 +111,14 @@ def fresh_knobs():
 
 
 @pytest.fixture
+def fresh_compilation_knobs():
+    from triton import knobs
+
+    with knobs.compilation.scope():
+        yield knobs
+
+
+@pytest.fixture
 def fresh_knobs_including_libraries():
     """
     Resets ALL knobs including ``build``, ``nvidia``, and ``amd``.
@@ -83,6 +130,16 @@ def fresh_knobs_including_libraries():
         yield fresh_function()
     finally:
         reset_function()
+
+
+# Exercise synchronization/ordering at the default granularity. Tests whose
+# behavior depends on cell size explicitly parametrize this fixture indirectly.
+@pytest.fixture(params=[4], ids=lambda granularity: f"granularity-{granularity}")
+def shadow_granularity(request):
+    marker = request.node.get_closest_marker("gsan_fine_granularity")
+    if request.param == 16 and marker is not None:
+        pytest.skip(marker.args[0])
+    return request.param
 
 
 @pytest.fixture
@@ -107,7 +164,7 @@ def pytest_collection_modifyitems(config, items):
     if os.environ.get("TRITON_INTERPRET") == "1":
         return
     try:
-        device = config.getoption("device")
+        device = config.getoption("--device")
     except ValueError:
         device = None
     # Some CI jobs select the CPU backend implicitly (GPU-less runners) and

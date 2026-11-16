@@ -8,6 +8,15 @@ from __future__ import annotations
 _VERDICT = ("success", "failure", "timed_out")
 
 
+def canonical_check_name(name):
+    # Reusable GPU workflows prefix check names with their caller job. Accept
+    # both forms so the rollout can still select commits tested before it.
+    for platform in ("h100", "b200", "mi350"):
+        if name == f"{platform} / {platform}-tlx-test":
+            return f"{platform}-tlx-test"
+    return name
+
+
 def check_green(runs, cut):
     verdicts = sorted(
         (x for x in runs if x.get("conclusion") in _VERDICT and x.get("completed_at") and x["completed_at"] <= cut),

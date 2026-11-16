@@ -1,0 +1,37 @@
+from triton.tlx.ops.kernels.mm.gfx950 import (
+    _wg_kernel_register_split_m2 as _gfx950_register_split_m2,
+)
+
+
+{{def_kernel("A", "B")}}
+    M: tl.constexpr = {{size("A", 0)}}
+    N: tl.constexpr = {{size("B", 1)}}
+    K: tl.constexpr = {{size("A", 1)}}
+    C = {{output_ptr()}}
+    stride_am: tl.constexpr = {{stride("A", 0)}}
+    stride_ak: tl.constexpr = {{stride("A", 1)}}
+    stride_bk: tl.constexpr = {{stride("B", 0)}}
+    stride_bn: tl.constexpr = {{stride("B", 1)}}
+
+    _gfx950_register_split_m2(
+        B,
+        A,
+        C,
+        C,
+        N,
+        M,
+        K,
+        stride_bn,
+        stride_bk,
+        stride_ak,
+        stride_am,
+        0,
+        0,
+        1,
+        N,
+        M_HEAD=M_HEAD,
+        M_TAIL=M_TAIL,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        ADD_BIAS=False,
+    )
