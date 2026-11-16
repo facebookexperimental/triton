@@ -1,26 +1,41 @@
 # GPU CI
 
-`workflows/gpu-tests.yml` selects platforms, calls `build.yml` once, then passes
-the same wheel URL and SHA256 to `h100.yml`, `b200.yml`, and `mi350.yml`. Build and
-test checkouts use the same exact commit, including the merge commit for PRs.
-The GPU workflows are reusable test workflows; trigger the parent to run them.
+`workflows/gpu-tests.yml` runs on pull requests, pushes to `main`, a six-hourly
+schedule and manual dispatch. It selects platforms, calls `build.yml` once, then
+passes the same wheel URL and SHA256 to `h100.yml`, `b200.yml`, and `mi350.yml`.
+Build and test checkouts use the same exact commit, including the merge commit
+for PRs. The GPU workflows are reusable test workflows; trigger the parent to run
+them. `fast-gpu-tests.yml` (Fast correctness) runs only on manual dispatch.
 `workflows/gpu-tests-nightly.yml` runs suites too slow for PRs and pushes once a
 day and on demand: it builds the same wheel and runs TritonBench on H100, B200
 and MI350, filing nightly issues under the same platform workflow names.
-Fork PRs pass the wheel through GitHub artifacts and skip AWS and the S3 cache;
-their downloads are checksum-verified too.
+Fork PRs have no AWS credentials. They reuse a ready S3 wheel through a read-only
+lookup when one exists and otherwise build and pass the wheel through GitHub
+artifacts; their downloads are checksum-verified too.
 
 Push and PR platform selection uses the ordered rules in `gpu-test-paths.json`,
 preserving the former individual workflow filters. PRs use a three-dot diff;
 pushes compare the before/after SHAs. An unavailable diff runs all platforms.
-Schedules run every six hours at minute zero, and manual runs also select all
-platforms. Documentation-only changes run selection and the aggregate check,
-without building or allocating GPU runners.
+Schedules run every six hours at minute zero. Manual runs accept a
+comma-separated `platforms` list (`h100,b200,mi350`; Fast also accepts `cpu`);
+blank keeps normal selection. A list restricts existing test work to those
+platforms, and the run summary discloses the chosen list. Automatic runs ignore
+this input.
+
+Changes only to docs, Markdown outside `.github/`, LIT tests (`compiler.yml` runs
+them) or agent instructions do not start the workflow: its `paths` trigger skips
+them. Every path the trigger skips is one the selector skips on every platform.
+
+To stop a platform, for example while its runners are offline, set the repository
+variable `GPU_CI_SKIP_PLATFORMS` (for example `b200` or `b200,mi350`). The
+platform's jobs then show as skipped, and new runs do not queue on its runners;
+cancel runs already queued. B200 is currently paused in the selector itself.
 
 ## Checks and nightly reporting
 
-Use **GPU tests** as the aggregate required check: a failed build or selected
-suite fails it, while intentionally unselected suites do not. Reusable workflows
+Use **GPU tests** as the aggregate required check: it fails when any job in the
+run failed or was cancelled. Skipped jobs (unselected or turned-off platforms) do
+not fail it. Reusable workflows
 prefix individual check names, for example `h100 / h100-tlx-test`; branch rules
 that require the old bare job names need to use the new names or the aggregate.
 The nightly publisher accepts both old and new TLX check names during migration.
@@ -44,6 +59,14 @@ Benchmark callers retain the repository, build ID, and resolved-commit interface
 Callers setting `skip_cache_save` bypass the wheel cache as well as GitHub cache
 writes, and upload their wheel directly. Build IDs keep side A/B uploads distinct.
 
+Fork PRs cannot take a lease. `wheel_cache.py lookup` reads the same manifest
+without signing, reuses it only if it is ready for the exact identity, and treats
+a missing, denied, expired, or malformed manifest as a miss that builds locally.
+The bucket must allow anonymous reads of the cache prefix for forks to hit.
+
+`build.yml`'s `wheel` output describes the validated wheel: its full identity,
+URL, filename, SHA256, and the GitHub artifact it was uploaded to in this run.
+
 Conditional S3 PUTs (`If-None-Match` / `If-Match`) provide one producer per cache
 key. Waiters poll every 30 seconds for up to 90 minutes. The producer publishes
 the ready manifest only after wheel validation and upload. An `always()` cleanup
@@ -56,6 +79,36 @@ The existing `gha_workflow_triton_artifacts` role needs `s3:GetObject` and
 It also needs `s3:ListBucket` for missing keys to return 404 instead of 403. No
 delete permission is needed for the cache. Authorization or service errors fail
 the build rather than silently bypassing the producer lock.
+
+## Codegen trace follow-up
+
+On a PR whose build succeeded, the final **GPU tests** job publishes
+`fast-followup-v1-attempt-<attempt>`, a manifest naming its run, attempt, PR, PR
+head, test merge commit and wheel. The TLX codegen trace
+(`tlx-codegen-trace.yml`) starts from that run's success (`workflow_run`), so a
+PR whose GPU tests fail gets no trace.
+
+The trace runs on the default branch, so `_fast-followup.yml` verifies the
+producer from data instead of trusting it. The run, attempt and PR head come
+from the event and are rechecked against the run's current API record (a later
+re-run attempt makes the event `stale`). The PR, open or already closed for
+landing, must still be the run's branch with the same head and with GitHub's
+current test merge commit equal to the manifest's (a moved head or a newer base
+is `stale`). The merge commit's parents come from git, and the wheel's identity
+is recomputed with the build recipe at that merge commit. Artifacts are fetched
+by exact name from exactly that run, and only their one expected file is
+extracted. A fork's artifact wheel is copied into the trace run after its
+checksum is checked. A run without a manifest (status `none`: it built no wheel)
+and a stale one trace nothing; a failed verification fails the run.
+
+The trace never builds PR code; without the head wheel it reports no signal. Its
+base is a commit of the base branch: a cached wheel is looked up in the resolve
+job, and only a miss starts a build, without credentials or cache writes
+(`read_only_cache`) for a fork's PR. Jobs that check out PR code or install its
+wheel hold read-only tokens with no persisted credentials and no OIDC; the PR
+comment is a separate job that runs no PR code. A fork's PR gets the trace
+summary and verdict artifact but no comment. The trigger works only once the
+workflow is on the default branch.
 
 ## CI health dashboard
 

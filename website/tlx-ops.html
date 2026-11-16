@@ -75,6 +75,8 @@ out = tlx_mm(a, b)</code></pre>
 <pre><code>mm/sm100.py
 mm_bias_grad/sm100.py
 mm_mxfp8/sm100.py
+mm_mxfp8/gfx1250.py
+grouped_gemm/gfx1250.py
 flash_attn/sm100.py
 flash_attn/gfx950.py
 flash_attn_mxfp8/sm100.py
@@ -88,7 +90,7 @@ kda/sm100.py</code></pre>
 <pre><code>kernels/
     mm/                   sm90.py  sm100.py  gfx942.py  gfx950.py
     mm_bias_grad/         sm100.py
-    mm_mxfp8/             sm100.py
+    mm_mxfp8/             sm100.py  gfx950.py  gfx1250.py
     addmm/                gfx942.py
     bmm/                  gfx942.py
     flash_attn/           sm90.py  sm100.py  gfx950.py  (fwd + bwd)
@@ -99,7 +101,7 @@ kda/sm100.py</code></pre>
     hstu_cross_attn/      gfx950.py                     (fwd + bwd, split-KV)
     kda/                  sm100.py
     gdpa/                 sm100.py  gfx950.py
-    grouped_gemm/         sm100.py  gfx950.py
+    grouped_gemm/         sm100.py  gfx950.py  gfx1250.py
     grouped_gemm_mxfp8/   sm100.py  gfx950.py
     addmm_glu/            gfx950.py
     paged_decode/         gfx950.py
@@ -159,7 +161,7 @@ d_weight, d_bias = mm_bias_grad(dout, input_act, space=&quot;full&quot;)</code><
 <p>A subsequent large-case matched run measured TLX at 123.92 us and PT2 at 145.76 us. A graph-autotuning trial selected a slower 143.02 us TLX configuration for this shape; the large-K policy uses ordinary-launch autotuning. All reports retain the selected configurations, individual timing samples and compiler diagnostics.</p>
 <h2 id="mxfp8-gemm">MXFP8 GEMM</h2>
 <pre><code class="language-python">out = triton.tlx.ops.mm_mxfp8(a, a_scale, b, b_scale, out=None, sf_layout=&quot;natural&quot;, space=&quot;full&quot;)</code></pre>
-<p>Computes <code>a @ b.T</code> from contiguous E4M3 <code>a</code> <code>[M, K]</code> and <code>b</code> <code>[N, K]</code> with one E8M0 scale per 32 K values, returning contiguous BF16 <code>[M, N]</code>. <code>M</code>, <code>N</code> and <code>K</code> must be multiples of 128. This is a forward-only SM100 operation promoted from <code>tutorials/blackwell_gemm_ws_mxfp8.py</code>.</p>
+<p>Computes <code>a @ b.T</code> from contiguous E4M3 <code>a</code> <code>[M, K]</code> and <code>b</code> <code>[N, K]</code> with one E8M0 scale per 32 K values, returning contiguous BF16 <code>[M, N]</code>. <code>M</code>, <code>N</code> and <code>K</code> must be multiples of 128. This is a forward-only SM100 operation promoted from <code>tutorials/blackwell_gemm_ws_mxfp8.py</code>. On gfx1250, <code>M</code> and <code>N</code> must be multiples of 256 and <code>K</code> at least 256; that implementation is promoted from <code>tutorials/amd_mxfp_gemm_gfx1250</code> and has one shape-picked schedule, so <code>space=&quot;full&quot;</code> and <code>&quot;heuristic&quot;</code> are the same.</p>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>sf_layout=&quot;natural&quot;</code>: <code>a_scale</code> is <code>[M, K // 32]</code> and <code>b_scale</code> is</div></div>
 <p><code>[N, K // 32]</code>; they are packed into the blocked layout on every call.</p>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>sf_layout=&quot;cublas_blocked&quot;</code>: scales are already in the cuBLAS 128x4 atom</div></div>

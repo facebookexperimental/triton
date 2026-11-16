@@ -8,6 +8,8 @@
 // W4-DAG: #[[$MIXED_RADIX:.*]] = #ttg.linear<{register = {{\[\[}}2, 0], [4, 0], [8, 0], [16, 0], [32, 0]], lane = {{\[\[}}0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = {{\[\[}}0, 32], [1, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [96, 64]}>
 // CHECK-DAG: #[[$K96BLOCKED:.*]] = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
 // W4-DAG: #[[$K96BLOCKED_W4:.*]] = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+// CHECK-DAG: #[[$DENSE:.*]] = #ttg.linear<{register = {{\[\[}}0, 1], [0, 2], [1, 0], [2, 0], [16, 0], [32, 0], [64, 0], [0, 32]], lane = {{\[\[}}0, 4], [0, 8], [0, 16], [4, 0], [8, 0]], warp = [], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [128, 96]}>
+// W4-DAG: #[[$DENSE_W4:.*]] = #ttg.linear<{register = {{\[\[}}0, 1], [0, 2], [1, 0], [2, 0], [64, 0], [0, 32]], lane = {{\[\[}}0, 4], [0, 8], [0, 16], [4, 0], [8, 0]], warp = {{\[\[}}16, 0], [32, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 96]}>
 
 // CHECK-LABEL: @copy_384
 // CHECK: tt.load {{.*}} : tensor<384x!tt.ptr<f32>, #[[$MIXED_RADIX]]>
@@ -63,5 +65,39 @@ tt.func @dot_k96_pow2_result() {
   %b = arith.constant dense<2.0> : tensor<96x32xf16>
   %c = arith.constant dense<0.0> : tensor<128x32xf32>
   %0 = tt.dot %a, %b, %c : tensor<128x96xf16> * tensor<96x32xf16> -> tensor<128x32xf32>
+  tt.return
+}
+
+// Every mixed-radix dot result takes the dense layout, whatever its users:
+// the dot's 4x4 sizePerThread on the pow2 parts, the odd factor slowest.
+// CHECK-LABEL: @dot_reduce_n96
+// CHECK: tt.dot {{.*}} -> tensor<128x96xf32, #[[$DENSE]]>
+// W4-LABEL: @dot_reduce_n96
+// W4: tt.dot {{.*}} -> tensor<128x96xf32, #[[$DENSE_W4]]>
+tt.func @dot_reduce_n96() {
+  %a = arith.constant dense<1.0> : tensor<128x96xf16>
+  %b = arith.constant dense<2.0> : tensor<96x96xf16>
+  %c = arith.constant dense<0.0> : tensor<128x96xf32>
+  %d = tt.dot %a, %b, %c : tensor<128x96xf16> * tensor<96x96xf16> -> tensor<128x96xf32>
+  %e = "tt.reduce"(%d) <{axis = 1 : i32}> ({
+  ^bb0(%x: f32, %y: f32):
+    %m = arith.maximumf %x, %y : f32
+    tt.reduce.return %m : f32
+  }) : (tensor<128x96xf32>) -> tensor<128xf32>
+  tt.return
+}
+
+// A chained dot consumes the dense layout directly.
+// CHECK-LABEL: @dot_chain_n96
+// CHECK-COUNT-2: tt.dot {{.*}} -> tensor<128x96xf32, #[[$DENSE]]>
+// W4-LABEL: @dot_chain_n96
+// W4-COUNT-2: tt.dot {{.*}} -> tensor<128x96xf32, #[[$DENSE_W4]]>
+tt.func @dot_chain_n96() {
+  %a = arith.constant dense<1.0> : tensor<128x96xf16>
+  %b = arith.constant dense<2.0> : tensor<96x96xf16>
+  %c = arith.constant dense<0.0> : tensor<128x96xf32>
+  %d = tt.dot %a, %b, %c : tensor<128x96xf16> * tensor<96x96xf16> -> tensor<128x96xf32>
+  %b2 = arith.constant dense<2.0> : tensor<96x96xf32>
+  %e = tt.dot %d, %b2, %c : tensor<128x96xf32> * tensor<96x96xf32> -> tensor<128x96xf32>
   tt.return
 }

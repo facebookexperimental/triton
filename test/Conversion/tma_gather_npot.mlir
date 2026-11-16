@@ -21,13 +21,13 @@ module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num
 
   // 96 columns: three 32-column boxes at y, y + 32 and y + 64.
   // CHECK-LABEL: llvm.func @gather_8x96
+  // CHECK-DAG: %[[C1:.*]] = llvm.mlir.constant(32 : i32) : i32
+  // CHECK-DAG: %[[C2:.*]] = llvm.mlir.constant(64 : i32) : i32
   // CHECK: %[[Y:.*]] = llvm.add %arg2
   // CHECK: tile::gather4
-  // CHECK: %[[C1:.*]] = llvm.mlir.constant(32 : i32) : i32
-  // CHECK-NEXT: %[[Y1:.*]] = llvm.add %[[Y]], %[[C1]] : i32
+  // CHECK: %[[Y1:.*]] = llvm.add %[[Y]], %[[C1]] : i32
   // CHECK-NEXT: tile::gather4{{.*}}, %[[Y1]],
-  // CHECK: %[[C2:.*]] = llvm.mlir.constant(64 : i32) : i32
-  // CHECK-NEXT: %[[Y2:.*]] = llvm.add %[[Y]], %[[C2]] : i32
+  // CHECK: %[[Y2:.*]] = llvm.add %[[Y]], %[[C2]] : i32
   // CHECK-NEXT: tile::gather4{{.*}}, %[[Y2]],
   // CHECK-NOT: tile::gather4
   tt.func @gather_8x96(%desc: !tt.tensordesc<1x96xf16, #sw64>, %x: tensor<8xi32, #ttg.slice<{dim = 0, parent = #blocked}>>, %y: i32, %alloc: !ttg.memdesc<8x96xf16, #sw64, #smem, mutable, 8x128>, %barrier: !ttg.memdesc<1xi64, #shared0, #smem, mutable>, %pred: i1) {

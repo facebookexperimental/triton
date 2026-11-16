@@ -5,8 +5,12 @@ This directory contains TLX MXFP GEMM kernels for AMD gfx1250:
 elements), FP32 accumulation, and FP32 or FP16 output.
 
 - [`amd_mxfp_gemm_tdm_pipelined.py`](amd_mxfp_gemm_tdm_pipelined.py): the
-  kernels, the config-based `matmul` API, the `mxgemm_tdm_pipelined` API,
-  and a single-shape command line.
+  non-persistent kernel, the config-based `matmul` API, the
+  `mxgemm_tdm_pipelined` API, and a single-shape command line.
+- The persistent kernel, the device helpers it shares with the non-persistent
+  kernel, and `pack_scale` live in
+  [`ops/kernels/mm_mxfp8/gfx1250.py`](../../ops/kernels/mm_mxfp8/gfx1250.py),
+  which backs `tlx.ops.mm_mxfp8` on gfx1250; the tutorial imports them.
 - [`bench.py`](bench.py): a multi-shape benchmark of the persistent kernel
   that runs each case in a separate process.
 

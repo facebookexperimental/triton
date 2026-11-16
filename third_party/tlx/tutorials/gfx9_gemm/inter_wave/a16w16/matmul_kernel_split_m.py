@@ -285,6 +285,5 @@ def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         num_warps=NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
     )
     return c

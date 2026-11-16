@@ -95,8 +95,13 @@ public:
   bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
                   triton::ReduceOp op, unsigned numLaneToReduce,
                   unsigned interleave,
-                  std::optional<unsigned> broadcastLaneIdMask =
-                      std::nullopt) const override;
+                  std::optional<unsigned> broadcastLaneIdMask) const override;
+  // Mask-based entry point matching upstream #12067; holds the shared redux
+  // heuristics. No default on the override above so internal calls resolve
+  // to this overload unambiguously.
+  bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
+                  triton::ReduceOp op, unsigned reduceLaneIdMask,
+                  unsigned broadcastLaneIdMask) const;
   unsigned getReductionTreeArity(Operation *combinerOp) const override;
 
   void printf(RewriterBase &rewriter, Value formatStrStart,

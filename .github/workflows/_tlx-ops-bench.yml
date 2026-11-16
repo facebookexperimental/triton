@@ -104,7 +104,11 @@ jobs:
           # --timeout caps each bench, so one slow bench fails on its own and
           # the benches after it still run. The longest healthy bench takes
           # about 15 minutes (mm on B200).
-          python -m pytest python/test/tlx_benchmark/test_ops_perf.py --import-mode=importlib \
+          # -p no:logging: pytest's log capture keeps handlers on torch's
+          # structured-trace logger, so every torch.compile builds trace payloads
+          # nobody reads. After the earlier benches that stalls each
+          # torch.compile bench for about 40 minutes on the H100 runner.
+          python -m pytest python/test/tlx_benchmark/test_ops_perf.py --import-mode=importlib -p no:logging \
             -k "not torchtlx" -v -s --timeout=2700 --junitxml="${RUNNER_TEMP}/tlx-ops-bench.xml"
       - name: Upload results
         if: always()

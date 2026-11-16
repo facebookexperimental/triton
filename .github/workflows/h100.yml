@@ -37,7 +37,6 @@ jobs:
       SETUP_SCRIPT: /workspace/setup_instance.sh
     timeout-minutes: 180
     permissions:
-      id-token: write
       contents: read
       actions: read
     outputs:
@@ -48,6 +47,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
       - name: Tune Nvidia GPU
         id: gpu_health
         # Also a health check: a runner whose GPU stopped responding fails here instead of hanging a later step.
@@ -128,7 +128,6 @@ jobs:
       SETUP_SCRIPT: /workspace/setup_instance.sh
     timeout-minutes: 60
     permissions:
-      id-token: write
       contents: read
       actions: read
     outputs:
@@ -139,6 +138,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
       - name: Tune Nvidia GPU
         id: gpu_health
         # Also a health check: a runner whose GPU stopped responding fails here instead of hanging a later step.

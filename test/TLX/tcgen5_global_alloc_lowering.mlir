@@ -1,4 +1,4 @@
-// RUN: triton-opt -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm --convert-nv-gpu-to-llvm %s | FileCheck %s
+// RUN: triton-opt -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar --triton-nvidia-gpu-tmem-barrier-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm --convert-nv-gpu-to-llvm %s | FileCheck %s
 // RUN: triton-opt -split-input-file --allocate-shared-memory-nv %s | FileCheck %s --check-prefix=ALLOC
 
 // Test that TCGen5GlobalAllocOp is lowered to tcgen05.alloc PTX at its position,

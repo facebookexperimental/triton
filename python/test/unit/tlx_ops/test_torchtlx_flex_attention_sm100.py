@@ -91,7 +91,8 @@ def test_flex_adapter_preserves_blackwell_choice_space(monkeypatch, benchmark):
 
     monkeypatch.setattr(templates, "_use_amd_flex_template", lambda: False)
     monkeypatch.setattr(templates, "_blackwell_flex_fwd_configs", lambda configs: configs)
-    monkeypatch.setattr(templates, "current_target", lambda: SimpleNamespace(num_sms=148, is_blackwell=True))
+    monkeypatch.setattr(templates, "current_target",
+                        lambda: SimpleNamespace(num_sms=148, is_blackwell=True, is_gfx1250=False))
     monkeypatch.setattr(torch._inductor.utils, "can_use_tma", lambda *args: True)
     monkeypatch.setattr(templates, "blackwell_flex_attention_template", SimpleNamespace(maybe_append_choice=append))
     configs = [
