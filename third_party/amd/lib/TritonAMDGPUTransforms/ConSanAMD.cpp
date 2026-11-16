@@ -51,6 +51,8 @@ public:
     return std::nullopt;
   }
 
+  bool barrierWritesInvalidate() const override { return true; }
+
   std::optional<WaitOpInfo>
   getWaitOpInfo(Operation *op, const tti::AuxDataMap &auxData) const override {
     // On asyncmark targets (CDNA3/CDNA4), ttg::AsyncWaitOp is kept as-is
@@ -97,6 +99,10 @@ public:
     auto arrive = ttag::ClusterBarrierArriveOp::create(b, b.getLoc());
     auto wait = ttag::ClusterBarrierWaitOp::create(b, b.getLoc());
     return {arrive.getOperation(), wait.getOperation()};
+  }
+
+  bool hasUnsummarizableCalleeState(Operation *op) const override {
+    return isa<ttag::ClusterBarrierArriveOp, ttag::ClusterBarrierWaitOp>(op);
   }
 
   std::optional<MemEffectsOpInfo>

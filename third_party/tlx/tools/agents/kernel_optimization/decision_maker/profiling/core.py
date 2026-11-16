@@ -476,11 +476,13 @@ def resolve_profile_request_for_target(
         resolved: list[str] = []
         for tool in tools:
             if tool == "proton_launch":
-                if request.level == "deep" and "fb_att" not in resolved:
-                    resolved.append("fb_att")
+                if request.level == "deep" and "amd_att" not in resolved:
+                    resolved.append("amd_att")
                 continue
             if tool not in resolved:
                 resolved.append(tool)
+        if "rocprofv3" in resolved and "amdgcn_isa" not in resolved:
+            resolved.append("amdgcn_isa")
         tools = tuple(resolved)
     return replace(request, tools=tools).to_json()
 
@@ -1338,10 +1340,16 @@ def native_profiler_regression_diagnostic(
         or candidate_us is None
     ):
         return ""
-    if candidate_us > baseline_us * 1.01:
+    # Device timestamps for very short kernels are quantized and fluctuate by
+    # several tenths of a microsecond. Require both a relative regression and
+    # an absolute 0.5us delta so unchanged cohort cases cannot veto a targeted
+    # candidate on profiler noise alone.
+    allowed_us = max(baseline_us * 0.01, 0.5)
+    if candidate_us > baseline_us + allowed_us:
         return (
             f"{baseline_tool} duration regressed: "
-            f"candidate {candidate_us:.3f}us > baseline {baseline_us:.3f}us by >1%"
+            f"candidate {candidate_us:.3f}us > baseline {baseline_us:.3f}us "
+            f"by more than max(1%, 0.5us)"
         )
     return ""
 
@@ -1403,7 +1411,9 @@ def compact_profile_summary(profile: Mapping[str, Any]) -> dict[str, Any]:
         "proton",
         "ncu",
         "rocprofv3",
-        "fb_att",
+        "amd_att",
+        "amdgcn_isa",
+        "roofline",
         "native_profiler",
         "diagnostics",
         "diagnostic_proton_intra_kernel",

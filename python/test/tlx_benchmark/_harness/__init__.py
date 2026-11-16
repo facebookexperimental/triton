@@ -1,7 +1,7 @@
 from .compile import COLD_COMPILE_CAP_S, CompileStat, cold_compile, fresh_triton_cache, prewarm
 from . import report, verdict
 from .verdict import MAX_CV, MIN_SPEEDUP, judge
-from .contract import SCHEMA_VERSION, Case, Result, Stat, Status, artifact
+from .contract import SCHEMA_VERSION, Case, Result, Stat, Status, artifact, require_schema
 from .denoise import (MAX_CLOCK_IDR, DEGRADING_REASONS, EVENT_REASONS, ClockTrace, GpuState, capture_env, check,
                       decode_event_reasons, foreign_processes, gpu_state, numa_bound, numa_node, nvml, parse_cpulist,
                       stable)
@@ -27,6 +27,7 @@ __all__ = [
     "Stat",
     "Status",
     "artifact",
+    "require_schema",
     "MAX_CLOCK_IDR",
     "DEGRADING_REASONS",
     "EVENT_REASONS",

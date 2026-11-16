@@ -31,10 +31,11 @@
 // CHECK-LABEL: @_attn_bwd_persist
 // Load task (2) acquires the dedicated single-buffered reuse token at the top of
 // the persistent outer loop (loop-carried phase), targeting the staging task.
-// CHECK: nvws.producer_acquire %[[WAR_TOK:[a-zA-Z0-9_]+]], %{{[a-zA-Z0-9_]+}}, %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 2>, constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 3>, dstTask = 3 : i32, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 1 : i32}}} : tensor<1x!nvws.token>, i32, i1
+// The token guards both matched staging pairs (target + staging buffer ids).
+// CHECK: nvws.producer_acquire %[[WAR_TOK:[a-zA-Z0-9_]+]], %{{[a-zA-Z0-9_]+}}, %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 2>, constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 3>, dstTask = 3 : i32, guardedBufferIds = array<i32: 3, 4, 22, 24>, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 1 : i32}}} : tensor<1x!nvws.token>, i32, i1
 // Staging task (3) releases the SAME token at the bottom of the outer-loop body
 // (region 4) with a constant buffer index, targeting the load task (2).
-// CHECK: nvws.consumer_release %[[WAR_TOK]], %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 3>, constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 2>, dstTask = 2 : i32, maxRegionId = 4 : i32, minRegionId = 4 : i32, parentId = 1 : i32}}} : tensor<1x!nvws.token>, i32
+// CHECK: nvws.consumer_release %[[WAR_TOK]], %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 3>, constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 2>, dstTask = 2 : i32, guardedBufferIds = array<i32: 3, 4, 22, 24>, maxRegionId = 4 : i32, minRegionId = 4 : i32, parentId = 1 : i32}}} : tensor<1x!nvws.token>, i32
 
 // CLC keeps the persistent loop as scf.while. Its AutoWS accumulation counter
 // must drive the same dedicated cross-tile token and alternating phase.

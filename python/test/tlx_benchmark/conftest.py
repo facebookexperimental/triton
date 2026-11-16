@@ -1,5 +1,3 @@
-import os
-
 import pytest
 
 
@@ -8,19 +6,18 @@ def pytest_addoption(parser):
     # Not --device: python/test/conftest.py already takes it for the backend name.
     group.addoption("--gpu", default="auto", help="GPU index, or 'auto' (default) for the least-used one")
     group.addoption(
-        "--space", choices=("heuristic", "full", "smoke"), default=None,
-        help="autotune search space; the default is each op's own (mm: heuristic, everything "
-        "else: full), and measuring anything else measures a path users do not take")
+        "--space", choices=("heuristic", "curated", "full", "smoke"), default=None,
+        help="autotune search space; the default is each op's own (mm: heuristic, hstu_cross_attn: "
+        "curated, everything else: full), and measuring anything else measures a path users do not take")
     group.addoption("--head", type=int, default=None, metavar="N",
                     help="only the first N cases per direction, for a quick look")
     group.addoption("--synthetic", action="store_true",
                     help="run the correctness shapes instead of this arch's focus list")
     group.addoption("--fwd-only", action="store_true", dest="fwd_only", help="skip the backward cases")
     group.addoption("--bwd-only", action="store_true", dest="bwd_only", help="skip the forward cases")
-    group.addoption(
-        "--latency-measure-mode", choices=("wallclock", "gpu_events"), default="wallclock", dest="latency_mode",
-        help="'wallclock' (default) times each call as a caller would see it; 'gpu_events' "
-        "pre-enqueues the batch behind a blocked stream to isolate device time")
+    group.addoption("--latency-measure-mode", choices=("wallclock", "gpu_events"), default="gpu_events",
+                    dest="latency_mode",
+                    help="legacy timing selector; kernel-performance measurements always use verified GPU events")
     group.addoption(
         "--cold-compile", choices=("all", "first", "none"), default=None, dest="cold_compile",
         help="how often to time a first call on a fresh cache; the default is each op's own "
@@ -41,7 +38,8 @@ def governor(pytestconfig):
     device = select_device(pytestconfig.getoption("--gpu"))
     driver.select(device)
     if device is not None:
-        os.environ[device.visibility_env] = str(device.index)
+        if not device.pin():
+            print(f"\ndevice: gpu{device.index} has no known UUID; not pinning it")
         print(f"\ndevice: gpu{device.index} {device.name} ({device.memory_used_mib:.0f} MiB in use)")
     with Governor(device) as gov:
         for step in gov.applied:

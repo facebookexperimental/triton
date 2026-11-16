@@ -27,6 +27,7 @@ LogicalResult verifyTensorSize(Operation *op);
 LogicalResult verifyTensorLayouts(Operation *op);
 
 LogicalResult verifySameOperandsEncoding(Operation *op);
+LogicalResult verifySameResultsType(Operation *op);
 LogicalResult verifyEquivalentTensorType(Type typeA, Type typeB);
 LogicalResult verifySameOperandsAndResultEncoding(Operation *op);
 
@@ -74,6 +75,14 @@ public:
 };
 
 template <typename ConcreteType>
+class SameResultsType : public TraitBase<ConcreteType, SameResultsType> {
+public:
+  static LogicalResult verifyTrait(Operation *op) {
+    return impl::verifySameResultsType(op);
+  }
+};
+
+template <typename ConcreteType>
 class SameLoadStoreOperandsShape
     : public TraitBase<ConcreteType, SameLoadStoreOperandsShape> {
 public:
@@ -113,6 +122,18 @@ public:
 // each other.
 template <typename ConcreteType>
 struct AsyncRegions : public TraitBase<ConcreteType, AsyncRegions> {};
+
+// This trait marks a one-operand, one-result operation that preserves the
+// value's AxisInfo unchanged.
+template <typename ConcreteType>
+struct AxisInfoPassthroughTrait
+    : public TraitBase<ConcreteType, AxisInfoPassthroughTrait> {};
+
+// This trait marks an op whose lowering takes every exact NPOT mixed-radix
+// layout.
+template <typename ConcreteType>
+struct MixedRadixLayoutTrait
+    : public TraitBase<ConcreteType, MixedRadixLayoutTrait> {};
 
 } // namespace OpTrait
 } // namespace mlir
