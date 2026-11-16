@@ -1111,15 +1111,16 @@ def _mxgemm_overlap_store(c_ptr, acc, off_m, off_n, stride_cm, c_buf, C_SLOTS: t
                           XCD_REMAP_MODE: tl.constexpr, CLUSTER_BARRIER_INTERVAL: tl.constexpr,
                           CLUSTER_LAYOUT: tl.constexpr):
     # Store one 128x128 C quadrant through dedicated 64-row slots. Before
-    # chunk REFILL_CHUNK, refill the next tile's stage-0 slot with stage
-    # BUFFERS. TDM operations complete in order, so each later chunk's
-    # slot-reuse wait also leaves the refill's LOADS operations pending.
+    # chunk REFILL_CHUNK (after the last chunk when it equals 4 * PARTS),
+    # refill the next tile's stage-0 slot with stage BUFFERS. TDM operations
+    # complete in order, so each later chunk's slot-reuse wait also leaves the
+    # refill's LOADS operations pending.
     PARTS: tl.constexpr = 2 * (128 // C_COLS)
     SPLIT: tl.constexpr = REFILL_CHUNK - QUADRANT * PARTS
     if SPLIT > 0:
         _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, 128, 128, 16, c_buf, 64, C_SLOTS, QUADRANT,
                                  C_COLS, True, PART_END=SPLIT if SPLIT < PARTS else PARTS)
-    if SPLIT >= 0 and SPLIT < PARTS:
+    if (SPLIT >= 0 and SPLIT < PARTS) or (QUADRANT == 3 and SPLIT == PARTS):
         _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m, next_n, BUFFERS,
                                 n_phase, BK, DA, DB, BUFFERS, FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
                                 XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT)
@@ -1594,12 +1595,19 @@ def mxgemm_tdm_persistent_kernel(
             C_PARTS: tl.constexpr = 2 * ((BLOCK_N // 2) // C_COLS)
             C_CHUNKS: tl.constexpr = 4 * C_PARTS
             # Refill stage 0's slot with next-tile stage NUM_BUFFERS after
-            # its last read (end of quadrant 1) and as early as possible.
-            # TDM operations complete in order, so the refill may precede
-            # only the last C_SLOTS chunks: each of those reuses a slot whose
-            # previous chunk is older than the refill. Any earlier, a chunk
-            # would wait for the refill's global loads.
-            REFILL_CHUNK: tl.constexpr = (C_CHUNKS - C_SLOTS if C_CHUNKS - C_SLOTS > 2 * C_PARTS else 2 * C_PARTS)
+            # its last read (end of quadrant 1). TDM operations complete in
+            # order, so the refill may precede only the last C_SLOTS chunks:
+            # each of those reuses a slot whose previous chunk is older than
+            # the refill. Any earlier, a chunk would wait for the refill's
+            # global loads. On gfx1250 the C store issued right before the
+            # multicast refill often completes 1-2k cycles late, and the next
+            # cluster rendezvous waits for the slowest CTA. With four buffers
+            # the next tile needs that stage only at its fourth step, so
+            # refill after the last chunk (FP16 8192^2x4096 -1.8%, 8192^3
+            # -1.4%); three buffers need it a step sooner and keep the early
+            # refill (the late one is 1.5-2.2% slower).
+            REFILL_CHUNK: tl.constexpr = (C_CHUNKS if NUM_BUFFERS == 4 else
+                                          (C_CHUNKS - C_SLOTS if C_CHUNKS - C_SLOTS > 2 * C_PARTS else 2 * C_PARTS))
             n_phase = (phase + k_iters) % NUM_BUFFERS
             tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
             if has_next:

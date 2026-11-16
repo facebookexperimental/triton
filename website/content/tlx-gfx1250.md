@@ -97,8 +97,10 @@ share inputs.
 - `OVERLAP_PEEL` runs each next tile's first K step inside the current
   tile's C epilogue: after a C quadrant is staged, its registers take that
   quadrant's next-tile WMMAs, which execute while later C chunks wait for
-  slots. The next tile's first refill is issued before the last C chunks,
-  because TDM operations complete in order.
+  slots. With three buffers the next tile's first refill is issued before
+  the last C chunks, because TDM operations complete in order; with four it
+  follows the last C chunk, since the next tile needs that stage only at its
+  fourth step.
 - Without the static unroll, the three-stage loop reads each operand's
   scale before its payload, so each quadrant waits only for its own LDS
   reads.
