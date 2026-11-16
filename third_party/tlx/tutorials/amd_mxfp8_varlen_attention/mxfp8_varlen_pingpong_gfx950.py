@@ -1028,9 +1028,6 @@ def _mxfp8_varlen_extended_kernel(  # noqa: TR001
             head, q0, q_rows, front, tail, pad_start, n_tiles = _item(
                 item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS, BLOCK_M
             )
-            k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(
-                K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off
-            )
         q_base = Q + q0.to(tl.int64) * ROW + head * D
         q_mask = q_local < q_rows * ROW
         if PREQUANTIZED_Q:
@@ -1042,6 +1039,10 @@ def _mxfp8_varlen_extended_kernel(  # noqa: TR001
                 tlx.buffer_load(q_base + HD, q_local, q_mask, 0.0, contiguity=16),
                 q_layout,
             )
+            if not REUSE_METADATA:
+                k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(
+                    K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off
+                )
             scale_base = QScales + q0.to(tl.int64) * HEADS * 4 + head * 4
             scale_offsets = (
                 offs_mm[:, None] * (HEADS * 4) + tl.arange(0, 2)[None, :]
@@ -1061,6 +1062,11 @@ def _mxfp8_varlen_extended_kernel(  # noqa: TR001
             q_reg1 = tlx.buffer_load(
                 q_base + HD, q_local, q_mask, 0.0, contiguity=8
             )
+            tlx.amd_sched_barrier(0)
+            if not REUSE_METADATA:
+                k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(
+                    K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off
+                )
             tlx.amd_sched_barrier(0)
             q_lo, qs_lo = core._quantize_q_half(q_reg0)
             q_lo = tlx.require_layout(q_lo, q_layout)

@@ -3401,6 +3401,61 @@ def test_mxfp8_prequantized_forward_matches_fused_quantization(
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_mxfp8_scheduled_long_preserves_q_pipeline(
+    mxfp8_varlen_forward_module,
+):
+    fwd = mxfp8_varlen_forward_module
+    torch.manual_seed(23)
+    cu_q = torch.tensor([0, 128], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, 4096], device="cuda", dtype=torch.int32)
+    q = torch.randn((128, 4, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((4096, 4, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    state = fwd.prepare_kv(
+        k, v, cu_k, fwd._metadata(cu_q, cu_k, 128, 4096, 128)
+    )
+    schedule = fwd.prepare_work_schedule(
+        [128], [4096], q.device, num_ctas=8
+    )
+    expected, expected_lse, _ = fwd.forward(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        128**-0.5,
+        kv_state=state,
+        block_m=128,
+        num_ctas=8,
+    )
+    actual, actual_lse, _ = fwd.forward(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        128**-0.5,
+        kv_state=state,
+        work_schedule=schedule,
+    )
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_lse, expected_lse)
+    q8, q_scales = fwd.prepare_q(q, cu_q)
+    prepared, prepared_lse = fwd.forward_prequantized(
+        q8,
+        q_scales,
+        *state,
+        cu_q,
+        cu_k,
+        128**-0.5,
+        total_kv=4096,
+        work_schedule=schedule,
+    )
+    assert torch.equal(prepared, expected)
+    assert torch.equal(prepared_lse, expected_lse)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_mxfp8_prequantized_forward_uses_independent_row_scales(
     mxfp8_varlen_forward_module,
 ):
