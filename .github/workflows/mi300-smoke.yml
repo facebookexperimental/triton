@@ -1,8 +1,8 @@
 name: MI300 runner smoke
 # Trial workflow for the AMD-hosted MI300 runner (linux-fb-triton-mi300-1).
-# Manual dispatch only: validates the runner end to end (GPU health, ROCm env,
-# prebuilt wheel install, one gfx942-gated GEMM) before MI300 joins the GPU
-# test matrix. Dispatch from the branch under test; no PR or push triggers.
+# Validates the runner end to end (GPU health, ROCm env, prebuilt wheel
+# install, one gfx942-gated GEMM) before MI300 joins the GPU test matrix.
+# Runs when this file changes, plus manual dispatch; nothing else triggers it.
 on:
   workflow_dispatch:
     inputs:
@@ -11,6 +11,9 @@ on:
         type: string
         required: false
         default: ''
+  pull_request:
+    paths:
+      - .github/workflows/mi300-smoke.yml
 
 permissions:
   contents: read
