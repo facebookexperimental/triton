@@ -24,6 +24,8 @@ using AllocationAnalysisScratchSizeFn = std::function<unsigned(Operation *)>;
 
 unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op);
 
+unsigned getAtomicResultScratchSize(Value result);
+
 /// Returns whether an operation uses scratch memory across CTAs.
 bool hasCrossCTAScratch(Operation *op);
 
@@ -155,9 +157,9 @@ public:
 
   /// Returns the scratch buffer id of the given value.
   BufferId getBufferId(Operation *operation) const {
-    if (opScratch.count(operation)) {
+    if (opScratch.contains(operation)) {
       return opScratch.lookup(operation)->id;
-    } else if (opVirtual.count(operation)) {
+    } else if (opVirtual.contains(operation)) {
       return opVirtual.lookup(operation)->id;
     } else {
       return InvalidBufferId;

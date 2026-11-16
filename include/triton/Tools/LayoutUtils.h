@@ -11,7 +11,7 @@ namespace mlir::triton {
 bool coversAllLogicalOutputs(const LinearLayout &layout,
                              ArrayRef<int64_t> logicalShape);
 
-enum class ProductConversionScope {
+enum class MixedRadixConversionScope {
   Register,
   Warp,
   Block,
@@ -21,25 +21,25 @@ enum class ProductConversionScope {
 // unless the source out dims are dim0, dim1, ... of `logicalShape`'s rank and
 // the destination has the same out-dim names.
 std::optional<LinearLayout>
-alignProductConversionOutDims(const LinearLayout &srcLayout,
-                              const LinearLayout &dstLayout,
-                              ArrayRef<int64_t> logicalShape);
+alignMixedRadixConversionOutDims(const LinearLayout &srcLayout,
+                                 const LinearLayout &dstLayout,
+                                 ArrayRef<int64_t> logicalShape);
 
 // Whether every input dimension is register, lane, warp or a singleton block.
-bool hasProductConversionInputDims(const LinearLayout &layout);
+bool hasMixedRadixConversionInputDims(const LinearLayout &layout);
 
-// The narrowest scope holding every canonical source owner and in-bounds
-// destination replica; Block if a non-radix-2 digit lies outside registers.
-// Requires planProductLayoutConversion's preflight to pass.
-ProductConversionScope
-classifyProductConversionScope(const LinearLayout &srcLayout,
-                               const LinearLayout &dstLayout,
-                               ArrayRef<int64_t> logicalShape);
+// The narrowest scope holding every source thread that holds unique data and
+// in-bounds destination replica; Block if a non-radix-2 digit lies outside
+// registers. Requires planMixedRadixLayoutConversion's preflight to pass.
+MixedRadixConversionScope
+classifyMixedRadixConversionScope(const LinearLayout &srcLayout,
+                                  const LinearLayout &dstLayout,
+                                  ArrayRef<int64_t> logicalShape);
 
 // Maps L with a(registerOrder(L(x))) == b(x). L's register output puts a's
-// radix-2 register digits first and its odd digit last, as a Product out dim
-// needs; registerOrder takes that order to a's flat register order.
-struct ProductConversionInputMap {
+// radix-2 register digits first and its odd digit last, as a mixed-radix out
+// dim needs; registerOrder takes that order to a's flat register order.
+struct MixedRadixConversionInputMap {
   LinearLayout registerMap;
   LinearLayout laneMap;
   ColumnAction registerOrder;
@@ -48,8 +48,8 @@ struct ProductConversionInputMap {
 // Closed form; std::nullopt when a and b differ in outs or in dims, have
 // non-radix-2 digits outside registers or L would move another dim, and for
 // some register/lane bijections too (T294601128).
-std::optional<ProductConversionInputMap>
-mapProductConversionInputs(const LinearLayout &a, const LinearLayout &b);
+std::optional<MixedRadixConversionInputMap>
+mapMixedRadixConversionInputs(const LinearLayout &a, const LinearLayout &b);
 
 // Is the sublayout defined from dimNames to dimNames the identity?
 // In particular, is the input and  output size in these dimensions
@@ -112,32 +112,18 @@ invertAndComposeLocal(const LinearLayout &A, const LinearLayout &B,
 //   L(register=2) = 1
 //   L(lane=1) = 2
 //   L(lane=2) = 0
-LinearLayout
-ensureLayoutNotLargerThan(const LinearLayout &layout,
-                          const llvm::SmallDenseMap<StringAttr, int64_t> &shape,
-                          bool broadcastRegisters = true);
+LinearLayout ensureLayoutNotLargerThan(const LinearLayout &layout,
+                                       llvm::ArrayRef<StringAttr> dimNames,
+                                       llvm::ArrayRef<int64_t> shape,
+                                       bool broadcastRegisters = true);
 
-// For each out-dim d, ensure the layout's out-size (i.e. its codomain) is no
-// smaller than shape[d].  Do this by increasing the size of the layout's inputs
-// along its most-minor dimension ("register" for register layouts, "offset" for
-// shared layouts).
-//
-// This function is invariant to the order of the layout's input dimensions, but
-// it cares about the order of the output dims, which should be minor-to-major.
-LinearLayout ensureLayoutNotSmallerThan(
-    const LinearLayout &layout,
-    const llvm::SmallDenseMap<StringAttr, int64_t> &shape);
-
-inline LinearLayout
-ensureLayoutNotSmallerThan(const LinearLayout &layout,
-                           const llvm::ArrayRef<StringAttr> dimNames,
-                           const llvm::ArrayRef<int64_t> shape) {
-  llvm::SmallDenseMap<StringAttr, int64_t> namedDims;
-  for (auto [dimName, length] : llvm::zip_equal(dimNames, shape))
-    namedDims[dimName] = length;
-  assert(namedDims.size() == shape.size() && "duplicate dimension names given");
-  return ensureLayoutNotSmallerThan(layout, namedDims);
-}
+// For each output dimension d, ensure the layout's output size is at least
+// shape[d] by growing inDim. Repetitions follow the layout's output dimension
+// order, from minor to major.
+LinearLayout ensureLayoutNotSmallerThan(const LinearLayout &layout,
+                                        llvm::ArrayRef<StringAttr> dimNames,
+                                        llvm::ArrayRef<int64_t> shape,
+                                        StringAttr inDim);
 
 // Return a vector of the standard out dimension names for tensor layouts. These
 // are "dim0", "dim1", etc.
@@ -220,8 +206,9 @@ SmallVector<StringAttr> supremum(const SmallVector<StringAttr> &x,
 LinearLayout reshapeLayout(MLIRContext *ctx, LinearLayout layout,
                            ArrayRef<int64_t> shape);
 
-// reshapeLayout for NPOT outputs: each new dim must take whole digits of the
-// row-major index, binary digits first and its odd digit last; else nullopt.
+// reshapeLayout returning nullopt, not asserting, when a mixed-radix layout
+// can't be regrouped: each new dim must take whole digits of the row-major
+// index, binary digits first and its odd digit last.
 std::optional<LinearLayout> tryReshapeLayout(MLIRContext *ctx,
                                              const LinearLayout &layout,
                                              ArrayRef<int64_t> shape);
@@ -236,6 +223,11 @@ std::pair<int, ColumnAction>
 largestVectorisation(MLIRContext *ctx, const LinearLayout &cvt, int bitwidth,
                      std::optional<int> maybeMaxVecElems = std::nullopt);
 
+// Match tile over cvt's input domain and return the repetition offsets in cvt's
+// coordinates, with the matched input bases set to zero. The full tile's output
+// extents must fit in cvt, and its bases outside the view still reserve output
+// bits that repetitions cannot use.
+//
 // Close cousin of doing zerosLike(tile) * divideLeft(cvt, tile)
 // This one is a tad more general in the sense that it allows to divide
 //  cvt:

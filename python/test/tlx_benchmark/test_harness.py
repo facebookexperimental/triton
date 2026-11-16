@@ -198,6 +198,14 @@ def test_noisy_is_not_a_failure_but_pip_and_error_are():
     assert set(FAILING) == {Status.PIP, Status.ERROR}
 
 
+def test_diagnostic_reference_reports_speedup_without_enforcing_the_floor():
+    from _harness.verdict import judge
+
+    result = judge(_case(), summarize([100.0]), summarize([1000.0]), reference_gate=False)
+    assert result.speedup == pytest.approx(0.1)
+    assert result.status == Status.OK
+
+
 def test_artifact_is_json_serializable_and_versioned():
     case = Case(op="mm", arch="sm100", dtype="float16", shape=(256, 256, 256, True, True))
     result = Result(case=case, status=Status.OK, tlx=summarize([1.0, 1.1, 0.9]), speedup=1.2)
@@ -551,6 +559,64 @@ def test_amd_devices_get_the_rocr_uuid_of_their_pci_bus(monkeypatch):
     assert denoise_mod.select_device("auto").uuid == "GPU-46c1d72dcdc11989"
 
 
+def test_amd_identity_and_least_used_selection_survive_missing_management_tools(tmp_path, monkeypatch):
+    from _harness import denoise
+
+    nodes, pci = tmp_path / "nodes", tmp_path / "pci"
+    for ordinal, bus, unique_id, used in [(2, 0x88, 0x46c1d72dcdc11989, 808349696),
+                                          (5, 0x08, 0xbe8bd961d1e61412, 30000000000)]:
+        node = nodes / str(ordinal)
+        node.mkdir(parents=True)
+        props = {
+            "simd_count": 1024, "vendor_id": 0x1002, "device_id": 0x75a0, "unique_id": unique_id, "location_id":
+            bus << 8, "domain": 0
+        }
+        (node / "properties").write_text("".join(f"{k} {v}\n" for k, v in props.items()))
+        device = pci / f"0000:{bus:02x}:00.0"
+        device.mkdir(parents=True)
+        (device / "mem_info_vram_used").write_text(str(used))
+    monkeypatch.setattr(denoise, "_KFD_NODES", str(nodes), raising=False)
+    monkeypatch.setattr(denoise, "_PCI_DEVICES", str(pci))
+    monkeypatch.setattr(denoise, "_smi", lambda args: None)
+    monkeypatch.setattr(denoise, "_rocm", lambda args: None)
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", os.environ.get("ROCR_VISIBLE_DEVICES", ""))
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    selected = denoise.select_device()
+    assert selected.uuid == "GPU-46c1d72dcdc11989"
+    assert selected.pci_bus == "0000:88:00.0"
+    assert selected.arch == "gfx950"
+    assert selected.memory_used_mib == pytest.approx(808349696 / 1024 / 1024)
+    assert selected.pin()
+    assert os.environ["ROCR_VISIBLE_DEVICES"] == selected.uuid
+
+
+def test_required_benchmark_gpu_cannot_be_an_empty_success(monkeypatch):
+    from _harness import denoise
+
+    monkeypatch.setattr(denoise, "list_devices", lambda: [])
+    with pytest.raises(RuntimeError, match="No benchmark GPU discovered"):
+        denoise.select_device()
+
+
+@pytest.mark.parametrize("mapped_index", [None, 6])
+def test_fallback_inventory_governs_only_its_pci_matched_gpu(monkeypatch, mapped_index):
+    from _harness import denoise
+
+    calls = []
+    bus = None if mapped_index is None else f"device,PCI Bus\ncard{mapped_index},0000:88:00.0"
+    monkeypatch.setattr(denoise, "_rocm", lambda args: bus)
+    monkeypatch.setattr(denoise.Governor, "_sudo", lambda self, args: calls.append(args) or True)
+    device = denoise.Device(denoise.AMD, 1, "MI350X", uuid="GPU-46c1d72dcdc11989", pci_bus="0000:88:00.0")
+    with denoise.Governor(device) as governor:
+        if mapped_index is None:
+            assert "management GPU mapping unavailable" in " ".join(governor.skipped)
+    if mapped_index is None:
+        assert calls == []
+    else:
+        assert [args[2] for args in calls] == [str(mapped_index)] * 4
+
+
 def test_sampler_join_does_not_shadow_thread_internals():
     from _harness.denoise import _Sampler
 
@@ -572,6 +638,8 @@ def test_arch_matches_the_part():
     assert Device(NVIDIA, 0, "NVIDIA GB200").arch == "sm100"
     assert Device(AMD, 0, "MI350X").arch == "gfx950"
     assert Device(AMD, 0, "MI355X").arch == "gfx950"
+    assert Device(AMD, 0, "MI450X").arch == "gfx1250"
+    assert Device(AMD, 0, "MI455X").arch == "gfx1250"
 
 
 def test_amd_numa_node_resolves_through_pci_not_the_drm_index(tmp_path, monkeypatch):
@@ -762,6 +830,7 @@ def test_focus_suite_can_union_other_suites():
     "module_name",
     [
         "triton.tlx.ops.kernels.addmm._shapes",
+        "triton.tlx.ops.kernels.fused.addmm_mul_add._shapes",
         "triton.tlx.ops.kernels.bmm._shapes",
         "triton.tlx.ops.kernels.flash_attn._shapes",
         "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes",
@@ -771,8 +840,12 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.kda._shapes",
         "triton.tlx.ops.kernels.kda._prefill_shapes",
         "triton.tlx.ops.kernels.kda._decode_shapes",
+        "triton.tlx.ops.kernels.fused.linear_rowscale._shapes",
+        "triton.tlx.ops.kernels.fused.norm_residual_norm._shapes",
         "triton.tlx.ops.kernels.mla_window_attn._shapes",
         "triton.tlx.ops.kernels.mm._shapes",
+        "triton.tlx.ops.kernels.moe._routing_shapes",
+        "triton.tlx.ops.kernels.norm._shapes",
         "triton.tlx.ops.kernels.swiglu_ffn._shapes",
     ],
 )
@@ -794,8 +867,10 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
             "gfx942": ("gfx942_all", ),
             "gfx950": ("gfx950_all", ),
         },
+        "triton.tlx.ops.kernels.fused.addmm_mul_add._shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.flash_attn._shapes": {
+            "gfx1250": ("sm90_1", "gfx950_all"),
             "sm90": ("sm90_1", ),
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_all", ),
@@ -803,6 +878,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.flash_attn_mxfp8._shapes": {
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_1", ),
+            "gfx1250": ("gfx1250_1", ),
         },
         "triton.tlx.ops.kernels.flash_attn_varlen._shapes": {
             "gfx950": ("gfx950_1", ),
@@ -816,14 +892,22 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.kda._shapes": {"sm100": ("sm100_1", )},
         "triton.tlx.ops.kernels.kda._prefill_shapes": {"gfx950": ("gfx950_1", )},
         "triton.tlx.ops.kernels.kda._decode_shapes": {"gfx950": ("gfx950_1", )},
+        "triton.tlx.ops.kernels.fused.linear_rowscale._shapes": {"sm90": ("sm90_1", )},
+        "triton.tlx.ops.kernels.fused.norm_residual_norm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.mla_window_attn._shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.norm._cat_shapes": {"sm90": ("sm90_1", )},
+        "triton.tlx.ops.kernels.norm._shapes": {
+            "sm100": ("sm100_1", ),
+            "sm90": ("sm90_1", ),
+            "gfx950": ("gfx950_all", ),
+        },
         "triton.tlx.ops.kernels.mm._shapes": {
             "sm90": ("sm90_baseline", "sm90_1"),
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_all", ),
             "gfx942": ("gfx942_all", ),
         },
+        "triton.tlx.ops.kernels.moe._routing_shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.swiglu_ffn._shapes": {"sm90": ("sm90_1", )},
     }
     pattern = re.compile(r"^(?:sm|gfx)\d+_(?:[1-9]\d*|all)$")
@@ -841,7 +925,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
     assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_addmm", "gfx950_4")
 
     addmm = importlib.import_module("triton.tlx.ops.kernels.addmm._shapes").FOCUS
-    assert addmm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2", "gfx942_3")
+    assert addmm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2", "gfx942_3", "gfx942_4")
     assert addmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_4")
 
     bmm = importlib.import_module("triton.tlx.ops.kernels.bmm._shapes").FOCUS
@@ -868,6 +952,7 @@ def test_flash_attn_mxfp8_gfx950_benchmark_supports_backward(monkeypatch):
 
     assert directions("gfx950") == {"fwd", "bwd"}
     assert directions("sm100") == {"fwd", "bwd"}
+    assert directions("gfx1250") == {"fwd"}
 
 
 def test_hstu_cross_attn_benchmark_times_inference_shapes_forward_only(monkeypatch):
@@ -907,6 +992,7 @@ def test_focus_suite_op_mismatch_is_rejected_explicitly():
 
 BENCH_MODULES = (
     "bench_addmm",
+    "bench_addmm_mul_add",
     "bench_flash_attn",
     "bench_flash_attn_mxfp8",
     "bench_flash_attn_varlen",
@@ -916,8 +1002,13 @@ BENCH_MODULES = (
     "bench_kda",
     "bench_kda_decode",
     "bench_kda_prefill",
+    "bench_linear_rowscale",
     "bench_mla_window_attn",
     "bench_mm",
+    "bench_mm_mxfp8",
+    "bench_moe_routing",
+    "bench_norm_residual_norm",
+    "bench_norm",
     "bench_rmsnorm_cat",
     "bench_swiglu_ffn",
 )
@@ -950,6 +1041,39 @@ def test_synthetic_cases_are_well_formed_without_a_gpu(module_name):
         assert case.key.count("/") >= 3
 
 
+def test_mm_mxfp8_benchmark_covers_both_public_scale_layouts(monkeypatch):
+    import importlib
+
+    bench = importlib.import_module("bench_mm_mxfp8")
+    monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
+    cases = bench.cases(synthetic=True)
+    assert {case.shape[-1] for case in cases} == {"natural", "cublas_blocked"}
+    assert bench.REFERENCE_GATE is False
+    assert len(cases) == 2 * len(bench.SYNTHETIC_SHAPES)
+    assert all("'sf_layout':" in case.label for case in cases)
+
+
+def test_mm_mxfp8_benchmark_reports_logical_k_for_padded_shapes():
+    from triton.tlx.ops.kernels.mm_mxfp8._shapes import flops, label
+
+    rendered = label(85, 3584, 25600, "natural")
+    assert "'K': '25536'" in rendered
+    assert "'K_kernel': '25600'" in rendered
+    assert flops(85, 3584, 25600) == 2 * 85 * 3584 * 25536
+
+
+def test_mm_mxfp8_default_uses_preshuffled_contract_where_supported(monkeypatch):
+    import importlib
+
+    bench = importlib.import_module("bench_mm_mxfp8")
+    monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
+    model_cases = [case for case in bench.cases() if case.shape[:3] in bench.MODEL_LINEAR_SHAPE_SET]
+    assert len(model_cases) == 30
+    assert sum(case.shape[-1] == "mfma_preshuffled" for case in model_cases) == 15
+    assert sum(case.shape[-1] == "cublas_blocked" for case in model_cases) == 15
+    assert len(bench.cases()) == 78
+
+
 def test_flash_attn_gfx950_has_runnable_focus_and_synthetic_shapes(monkeypatch):
     import importlib
 
@@ -979,17 +1103,42 @@ def test_flash_attn_forward_only_shapes_have_no_backward_case(monkeypatch):
     assert any(dirs == {"fwd", "bwd"} for dirs in directions.values())
 
 
-def test_space_resolves_to_each_ops_own_default():
+def test_space_resolves_to_each_ops_own_default(monkeypatch):
     import importlib
 
     from _harness import driver
 
-    # mm has a heuristic_config; the attention ops do not, and their kernels
-    # accept only "full"/"smoke" -- a shared "heuristic" default is a KeyError.
+    monkeypatch.setattr(driver, "arch", lambda: "sm100")
     assert driver.resolve_space(importlib.import_module("bench_mm"), None) == "heuristic"
     assert driver.resolve_space(importlib.import_module("bench_flash_attn"), None) == "full"
-    # An explicit choice still wins.
+    monkeypatch.setattr(driver, "arch", lambda: "gfx1250")
+    assert driver.resolve_space(importlib.import_module("bench_flash_attn"), None) == "heuristic"
+    assert driver.resolve_space(importlib.import_module("bench_flash_attn"), "full") == "full"
     assert driver.resolve_space(importlib.import_module("bench_mm"), "full") == "full"
+
+
+@pytest.mark.parametrize("arch", ["gfx1250", "gfx950", "sm90", "sm100"])
+@pytest.mark.parametrize("space", ["heuristic", "full"])
+def test_attention_benchmark_follows_catalog_default(monkeypatch, arch, space):
+    import dataclasses
+
+    import bench_flash_attn as bench
+    from triton.tlx.ops import _catalog
+
+    key = (bench.OP, arch)
+    monkeypatch.setitem(_catalog._BY_KEY, key, dataclasses.replace(_catalog.spec_for(*key), default_space=space))
+    monkeypatch.setattr(bench.driver, "arch", lambda: arch)
+    monkeypatch.setattr(_catalog, "_load", lambda impl: pytest.fail("reading a default must not import a kernel"))
+    assert bench.driver.resolve_space(bench, None) == space
+    assert bench.driver.resolve_space(bench, "full") == "full"
+
+
+def test_attention_suite_listing_needs_no_supported_gpu(monkeypatch, capsys):
+    import bench_flash_attn as bench
+
+    monkeypatch.setattr(bench.driver, "arch", lambda: None)
+    assert bench.main(["--list-suites"]) == 0
+    assert "sm90_1" in capsys.readouterr().out
 
 
 def test_bind_returns_the_four_entry_points_bound_to_the_module():
@@ -1154,6 +1303,24 @@ def test_all_is_the_default_so_an_op_that_says_nothing_is_unchanged(monkeypatch)
 def test_none_skips_every_cold_pass(monkeypatch):
     seen = _cold_flags(_FakeBench(cold_compile="none"), monkeypatch)
     assert not any(cold for _, cold in seen)
+
+
+def test_prepared_graph_compile_time_reaches_verdict(monkeypatch):
+    from types import SimpleNamespace
+    import torch
+    from _harness import driver
+
+    compile_stat = CompileStat(t_cold_s=121.0, n_compiles=1, cap_s=120.0)
+    bench = SimpleNamespace(prepare=lambda case, space: driver.Prepared(lambda: None, compile_stat=compile_stat))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(driver, "measure", lambda *a, **kw: summarize([1.0]))
+    monkeypatch.setattr(driver, "host_overhead_us", lambda fn: 0.0)
+    monkeypatch.setattr(driver, "cold_compile",
+                        lambda *a, **kw: pytest.fail("must not time a graph replay as compilation"))
+    result = driver.run_case(bench, _case(), space="heuristic", cold=False)
+    assert result.t_cold_s == compile_stat.t_cold_s
+    assert result.status == Status.PIP
 
 
 def test_an_explicit_mode_overrides_the_ops_own(monkeypatch):
@@ -1640,3 +1807,82 @@ def test_a_case_that_breaks_the_gpu_is_reported_once_and_ends_the_run(monkeypatc
     # An ordinary error leaves the GPU usable, so the remaining cases still run.
     results = _run_with_failure(monkeypatch, gpu_usable_after=True)
     assert [r.status for r in results] == [Status.OK, Status.OK, Status.ERROR, Status.OK, Status.OK]
+
+
+@pytest.mark.parametrize("uuid", ["GPU-0123456789abcdef", "GPU-XX"])
+def test_amd_arch_uses_rocr_agent_without_product_name(monkeypatch, uuid):
+    import _harness.denoise as denoise
+    monkeypatch.setattr(denoise, "vendor", lambda: denoise.AMD)
+    monkeypatch.setattr(denoise, "_rocm", lambda args: _ROCM_SMI_VRAM_BUS if "--showbus" in args else None)
+    monkeypatch.setattr(denoise, "_amd_name", lambda index: "AMD Radeon Graphics")
+    monkeypatch.setattr(denoise, "_amd_sysfs_devices", lambda: [])
+    monkeypatch.setattr(
+        denoise, "_rocminfo", lambda: f"""Agent 1
+  Name: gfx1250
+  Uuid: {uuid}
+  Device Type: GPU
+  BDFID: 34816
+Agent 2
+  Name: gfx950
+  Uuid: GPU-abc123
+  Device Type: GPU
+  BDFID: 2048
+""")
+    card0, card1 = denoise.list_devices()
+    assert (card0.arch, card1.arch) == ("gfx950", "gfx1250")
+    assert card1.uuid == (None if uuid == "GPU-XX" else uuid)
+
+
+def test_gfx1250_governor_does_not_guess_clock_or_power_policy(monkeypatch):
+    from _harness.denoise import AMD, Device, Governor
+    governor = Governor(Device(AMD, 0, "AMD Radeon Graphics", gpu_arch="gfx1250"))
+    calls = []
+    monkeypatch.setattr(governor, "_sudo", lambda args: calls.append(args))
+    governor._govern_amd(governor.device)
+    assert not calls
+    assert governor.skipped
+
+
+def test_gfx1250_attention_focus_cases_share_workload_suites(monkeypatch):
+    from _harness import driver
+    import bench_flash_attn as standalone
+    import bench_torchtlx_flex_attention as flex
+    from triton.tlx.ops.kernels.flash_attn._shapes import FOCUS
+
+    monkeypatch.setattr(driver, "arch", lambda: "gfx1250")
+    expected = {(s.batch, s.heads, s.context, s.head_dim)
+                for s in FOCUS.shapes("gfx1250")
+                if s.head_dim == 128 and not s.causal}
+    for bench in (standalone, flex):
+        cases = bench.cases()
+        assert {case.shape[:4] for case in cases} == expected
+        assert {case.dtype for case in cases} == {"float16", "bfloat16"}
+        assert {case.direction for case in cases} == {"fwd"}
+
+
+@pytest.mark.parametrize("arch", ["gfx1250", "gfx950", "sm100"])
+def test_flex_first_use_cost_is_measured_on_every_arch(monkeypatch, tmp_path, arch):
+    import contextlib
+    import torch
+    import bench_torchtlx_flex_attention as flex
+    from _harness import driver
+
+    tensor = torch.zeros((1, 2, 128, 128))
+    measured = []
+
+    def measure_first_use(fn):
+        fn()
+        measured.append(True)
+        return CompileStat(t_cold_s=2.0)
+
+    monkeypatch.setattr(driver, "arch", lambda: arch)
+    monkeypatch.setattr(flex, "ARTIFACT_DIR", tmp_path)
+    monkeypatch.setattr(flex, "flex_adapter", contextlib.nullcontext)
+    monkeypatch.setattr(flex, "inputs", lambda *a, **kw: ((tensor, tensor, tensor), None, None))
+    monkeypatch.setattr(flex, "compile_arm", lambda *a, **kw: (lambda: tensor, tensor))
+    monkeypatch.setattr(flex, "cold_compile", measure_first_use)
+    case = Case(flex.OP, arch, "float16", (1, 2, 128, 128, "noop"))
+    prepared = flex.prepare(case, "heuristic")
+    assert measured == [True]
+    assert prepared.compile_stat.t_cold_s == 2.0
+    assert prepared.extra["cold_start_scope"] == "inductor_graph_compile_and_capture"

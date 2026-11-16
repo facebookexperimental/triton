@@ -2,6 +2,8 @@
 #define TRITON_IR_OP_INTERFACES_H_
 
 #include <cstdint>
+#include <optional>
+#include <string>
 
 #include "mlir/IR/OpDefinition.h"
 #include "triton/Dialect/Triton/IR/Types.h"
@@ -13,6 +15,7 @@ class PatternRewriter;
 namespace triton {
 
 enum class MemSemantic : uint32_t;
+class LinearLayout;
 class PredicatedOpInterface;
 
 // Call only for operations whose false predicate suppresses all effects.

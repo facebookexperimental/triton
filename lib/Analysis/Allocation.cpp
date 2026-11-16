@@ -93,6 +93,12 @@ static unsigned getResultBroadcastScratchSize(Value result) {
   return elems * std::max(8u, bitWidth) / 8;
 }
 
+unsigned getAtomicResultScratchSize(Value result) {
+  if (getAtomicResultShuffleMask(result))
+    return 0;
+  return getResultBroadcastScratchSize(result);
+}
+
 unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
   if (auto reshape = dyn_cast<ReshapeOp>(op)) {
     RankedTensorType srcTy = reshape.getSrc().getType();
@@ -111,6 +117,8 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
     return helper.getScratchSizeInBytes();
   }
   if (auto histogram = dyn_cast<HistogramOp>(op)) {
+    if (canUseWarpBallotHistogram(histogram) && gpu::lookupNumWarps(op) == 1)
+      return 0;
     auto dstTy = histogram.getType();
     int threadsPerWarp = gpu::TritonGPUDialect::getThreadsPerWarp(
         op->getParentOfType<ModuleOp>());
@@ -120,7 +128,7 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
   if (auto cvtLayout = dyn_cast<gpu::ConvertLayoutOp>(op)) {
     auto srcTy = cvtLayout.getSrc().getType();
     auto dstTy = cvtLayout.getType();
-    if (auto bytes = getProductConversionScratchBytes(cvtLayout))
+    if (auto bytes = getMixedRadixConversionScratchBytes(cvtLayout))
       return *bytes;
     if (!cvtNeedsSharedMemory(cvtLayout))
       return 0;
@@ -138,7 +146,7 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
   if (isa<gpu::LocalAtomicScatterRMWOp>(op) || isa<AtomicOpInterface>(op)) {
     if (op->getNumResults() == 0)
       return 0;
-    return getResultBroadcastScratchSize(op->getResult(0));
+    return getAtomicResultScratchSize(op->getResult(0));
   }
   if (isa<ttng::TensormapCreateOp>(op)) {
     constexpr int32_t kTMASize = 128;
@@ -341,7 +349,7 @@ private:
       AliasInfo &info = latticeElement->getValue();
       if (!info.getAllocs().empty()) {
         for (auto alloc : info.getAllocs()) {
-          if (allocation->valueBuffer.count(alloc))
+          if (allocation->valueBuffer.contains(alloc))
             allocation->addAlias(value, alloc);
           else if (auto argument = dyn_cast<BlockArgument>(alloc);
                    argument && argument.getOwner()->getParentOp() == operation)
@@ -411,7 +419,7 @@ private:
       for (auto *buffer : buffers) {
         auto minId = range.start();
         auto maxId = range.end();
-        if (bufferRange.count(buffer)) {
+        if (bufferRange.contains(buffer)) {
           // Extend the allocated buffer's range
           minId = std::min(minId, bufferRange[buffer].start());
           maxId = std::max(maxId, bufferRange[buffer].end());

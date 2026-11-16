@@ -6,6 +6,10 @@ on:
         description: Exact commit used to build the wheel
         required: true
         type: string
+      plan:
+        description: Explicit test work selected by the CPU planner
+        required: true
+        type: string
       wheel_url:
         required: true
         type: string
@@ -27,24 +31,21 @@ env:
 
 jobs:
   mi350-tlx-test:
-    if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    if: ${{ !cancelled() && github.repository_owner == 'facebookexperimental' && (fromJSON(inputs.plan).core.files[0] != null || fromJSON(inputs.plan).correctness.files[0] != null || fromJSON(inputs.plan).codegen.files[0] != null) }}
     runs-on: linux-fb-triton-mi350-1
     timeout-minutes: 240
     permissions:
-      id-token: write
       contents: read
       actions: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
-      - name: Select kernel-affected tests
-        id: select
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/select-kernel-tests
+          persist-credentials: false
       - name: Set up test environment
         timeout-minutes: 30
         uses: ./.github/actions/setup-test-env
@@ -64,25 +65,22 @@ jobs:
           wheel-sha256: ${{ inputs.wheel_sha256 }}
       - name: Run TLX core tests
         id: run_core_tests
+        if: fromJSON(inputs.plan).core.files[0] != null
         timeout-minutes: 90
-        uses: ./.github/actions/run-tlx-core-tests
+        uses: ./.github/actions/run-selected-tests
         with:
-          platform: mi350
-          files: |
-            python/test/unit/language/test_tlx_*_any.py
-            python/test/unit/language/test_tlx_*hip*.py
-            python/test/unit/language/test_tlx_*gfx950*.py
-            python/test/unit/tlx_ops/test_*_hip.py
-            python/test/unit/tlx_ops/test_*_gfx950.py
-          kernel-only: ${{ steps.select.outputs.kernel_only }}
+          suite: ${{ toJSON(fromJSON(inputs.plan).core) }}
+          workers: "4"
+          junit: /tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
+        if: fromJSON(inputs.plan).correctness.files[0] != null
         timeout-minutes: 30
-        uses: ./.github/actions/run-tlx-correctness-tests
+        uses: ./.github/actions/run-selected-tests
         with:
-          kernel-only: ${{ steps.select.outputs.kernel_only }}
-          correctness-mode: ${{ steps.select.outputs.correctness_mode }}
-          correctness-k: ${{ steps.select.outputs.correctness_k }}
+          suite: ${{ toJSON(fromJSON(inputs.plan).correctness) }}
+          workers: "4"
+          junit: /tmp/tlx-correctness.xml
       - name: Parse test failures (TLX)
         id: parse
         if: always()
@@ -90,9 +88,10 @@ jobs:
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
           job: mi350-tlx-test
-          failed: ${{ steps.run_core_tests.outcome != 'success' || steps.run_correctness_tests.outcome != 'success' }}
+          completed-junit: ${{ (steps.run_core_tests.outcome == 'success' || steps.run_core_tests.outcome == 'failure') && '/tmp/tlx-core.xml' || '' }} ${{ (steps.run_correctness_tests.outcome == 'success' || steps.run_correctness_tests.outcome == 'failure') && '/tmp/tlx-correctness.xml' || '' }}
+          failed: ${{ job.status != 'success' }}
           bucket: mi350-tlx-job-failed
-          junit: /tmp/tlx-core.xml /tmp/tlx-correctness.xml
+          junit: ${{ fromJSON(inputs.plan).core.files[0] != null && '/tmp/tlx-core.xml' || '' }} ${{ fromJSON(inputs.plan).correctness.files[0] != null && '/tmp/tlx-correctness.xml' || '' }}
           budget: /tmp/tlx-core.xml=90 /tmp/tlx-correctness.xml=30
           gpu-unhealthy: ${{ steps.gpu_health.outcome == 'failure' }}
 
@@ -111,15 +110,16 @@ jobs:
       PYTEST_ADDOPTS: ""
     timeout-minutes: 180
     permissions:
-      id-token: write
       contents: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -206,37 +206,22 @@ jobs:
           junit: /tmp/torchtlx.xml /tmp/torchtlx_perf.xml
 
   mi350-gluon-test:
-    if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    if: ${{ !cancelled() && github.repository_owner == 'facebookexperimental' && (fromJSON(inputs.plan).gluon.files[0] != null) }}
     runs-on: linux-fb-triton-mi350-1
     timeout-minutes: 60
     permissions:
-      id-token: write
       contents: read
       actions: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
-      - name: Select kernel-affected tests
-        id: select
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/select-kernel-tests
-      - name: Decide whether Gluon tests run
-        id: gluon
-        env:
-          KERNEL_ONLY: ${{ steps.select.outputs.kernel_only }}
-        run: |
-          if [ "${KERNEL_ONLY}" = true ] && ! grep -q "^python/test/gluon/" /tmp/affected.txt; then
-            echo "kernel-only PR: no Gluon tests touch the changed kernel(s); skipping"
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
+          persist-credentials: false
       - name: Set up test environment
-        if: steps.gluon.outputs.run == 'true'
         timeout-minutes: 30
         uses: ./.github/actions/setup-test-env
         with:
@@ -245,12 +230,10 @@ jobs:
           packages: numpy pytest expecttest
       - name: Check AMD GPU
         id: gpu_health
-        if: steps.gluon.outputs.run == 'true'
         # A runner whose GPU stopped responding fails here instead of hanging a later step.
         timeout-minutes: 4
         run: timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
       - name: Install prebuilt Triton
-        if: steps.gluon.outputs.run == 'true'
         uses: ./.github/actions/install-prebuilt-triton
         with:
           wheel-url: ${{ inputs.wheel_url }}
@@ -258,11 +241,13 @@ jobs:
           wheel-sha256: ${{ inputs.wheel_sha256 }}
       - name: Run Gluon tests (python/test/gluon)
         id: run_gluon
-        if: steps.gluon.outputs.run == 'true'
+        if: fromJSON(inputs.plan).gluon.files[0] != null
         timeout-minutes: 50
-        run: |
-          set -eux
-          python -m pytest python/test/gluon/ -v --junitxml=/tmp/gluon.xml
+        uses: ./.github/actions/run-selected-tests
+        with:
+          suite: ${{ toJSON(fromJSON(inputs.plan).gluon) }}
+          workers: "1"
+          junit: /tmp/gluon.xml
       - name: Parse test failures (Gluon)
         id: parse
         if: always()
@@ -270,7 +255,8 @@ jobs:
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
           job: mi350-gluon-test
-          failed: ${{ steps.run_gluon.outcome != 'success' }}
+          completed-junit: ${{ (steps.run_gluon.outcome == 'success' || steps.run_gluon.outcome == 'failure') && '/tmp/gluon.xml' || '' }}
+          failed: ${{ job.status != 'success' }}
           bucket: mi350-gluon-job-failed
           junit: /tmp/gluon.xml
           budget: /tmp/gluon.xml=50
@@ -290,6 +276,7 @@ jobs:
       job: mi350-tlx-test
       result: ${{ needs.mi350-tlx-test.result }}
       failures: ${{ needs.mi350-tlx-test.outputs.failures }}
+      recovery: ${{ needs.mi350-tlx-test.outputs.recovery }}
       sha: ${{ inputs.ref }}
       platform: mi350
 
@@ -322,5 +309,6 @@ jobs:
       job: mi350-gluon-test
       result: ${{ needs.mi350-gluon-test.result }}
       failures: ${{ needs.mi350-gluon-test.outputs.failures }}
+      recovery: ${{ needs.mi350-gluon-test.outputs.recovery }}
       sha: ${{ inputs.ref }}
       platform: mi350

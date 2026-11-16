@@ -377,6 +377,7 @@ class CMakeBuild(build_ext):
         # environment variables we will pass through to cmake
         passthrough_args = [
             "TRITON_BUILD_PROTON",
+            "TRITON_BUILD_NVIDIA_GSAN_RUNTIME",
             "TRITON_BUILD_WITH_CCACHE",
             "TRITON_PARALLEL_LINK_JOBS",
             "TRITON_OFFLINE_BUILD",
@@ -494,7 +495,6 @@ def get_packages():
         yield "triton.profiler"
 
     yield "triton.language.extra.tlx"
-    yield "triton.language.extra.tlx.ops"
 
     # The TLX op library. find_packages() does follow the symlink once it
     # exists, but on a fresh tree add_links() may not have run yet, so
@@ -675,8 +675,8 @@ def get_triton_version_suffix():
 TRITON_VERSION = "3.9.0" + get_triton_version_suffix()
 
 # Dynamically define supported Python versions and classifiers
-MIN_PYTHON = (3, 10)
-MAX_PYTHON = (3, 14)
+MIN_PYTHON = (3, 11)
+MAX_PYTHON = (3, 15)
 
 PYTHON_REQUIRES = f">={MIN_PYTHON[0]}.{MIN_PYTHON[1]},<{MAX_PYTHON[0]}.{MAX_PYTHON[1] + 1}"
 BASE_CLASSIFIERS = [

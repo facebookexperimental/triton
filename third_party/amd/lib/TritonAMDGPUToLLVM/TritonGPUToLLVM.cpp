@@ -215,6 +215,7 @@ public:
     addIllegalDialect<triton::instrument::TritonInstrumentDialect>();
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
+    addIllegalOp<triton::amdgpu::BufferLoadToLocalOp>();
     // Warp specialization is lowered later.
     addLegalOp<triton::gpu::WarpSpecializeOp>();
     addLegalOp<triton::gpu::WarpYieldOp>();
@@ -474,7 +475,7 @@ struct ConvertTritonAMDGPUToLLVM
     mlir::triton::populateConvertLayoutOpToLLVMPatterns(
         typeConverter, targetInfo, patterns, commonBenefit);
     AMD::populateDotOpToLLVMPatterns(typeConverter, patterns, axisInfoAnalysis,
-                                     AMDBenefit);
+                                     targetInfo, AMDBenefit);
     AMD::populateElementwiseOpToLLVMPatterns(typeConverter, patterns, ftz,
                                              axisInfoAnalysis, allocation,
                                              targetInfo, AMDBenefit);
@@ -508,9 +509,9 @@ struct ConvertTritonAMDGPUToLLVM
     AMD::populateMemoryOpToLLVMPatterns(typeConverter, patterns, targetInfo,
                                         AMDBenefit, coordinateGroups,
                                         scheduledMfmaState);
-    mlir::triton::populateMemoryOpToLLVMPatterns(typeConverter, targetInfo,
-                                                 patterns, commonBenefit,
-                                                 std::move(coordinateGroups));
+    mlir::triton::populateMemoryOpToLLVMPatterns(
+        typeConverter, targetInfo, patterns, axisInfoAnalysis, commonBenefit,
+        std::move(coordinateGroups));
     mlir::triton::populateMakeRangeOpToLLVMPattern(typeConverter, targetInfo,
                                                    patterns, commonBenefit);
     mlir::triton::populateAssertOpToLLVMPattern(typeConverter, patterns,
@@ -535,7 +536,7 @@ struct ConvertTritonAMDGPUToLLVM
                                                      patterns, commonBenefit);
 
     FailureOr<mlir::amdgpu::Chipset> maybeChipset =
-        mlir::amdgpu::Chipset::parse(this->gfxArch);
+        mlir::amdgpu::Chipset::parse(targetInfo.getBaseArch());
     if (failed(maybeChipset)) {
       emitError(UnknownLoc::get(&getContext()),
                 "Invalid AMDGPU chipset name: " + this->gfxArch);

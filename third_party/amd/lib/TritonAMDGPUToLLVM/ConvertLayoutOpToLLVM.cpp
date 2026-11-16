@@ -33,7 +33,7 @@ public:
     auto *ctx = op.getContext();
     StringAttr kReg = str_attr("register");
     StringAttr kLane = str_attr("lane");
-    // NPOT Product conversions lower in the common pattern.
+    // NPOT mixed-radix conversions lower in the common pattern.
     if (hasNpotShape(srcTy) || hasNpotShape(dstTy))
       return failure();
     auto srcLayout =
@@ -206,7 +206,7 @@ public:
       }
       if (bitwidth < bitsPerVecElem) {
         llvm::for_each(unpackedVals, [&](Value &v) {
-          v = b.trunc(int_ty(bitwidth), v);
+          v = b.trunc(int_ty(bitwidth), v, LLVM::IntegerOverflowFlags::nuw);
           if (elemTy != int_ty(bitwidth))
             v = b.bitcast(v, elemTy);
         });
@@ -230,7 +230,7 @@ public:
         if (isa<LLVM::LLVMPointerType>(elemTy))
           v = b.inttoptr(elemTy, v);
         if (bitwidth < 32)
-          v = b.trunc(int_ty(bitwidth), v);
+          v = b.trunc(int_ty(bitwidth), v, LLVM::IntegerOverflowFlags::nuw);
         if (!isa<IntegerType>(elemTy))
           v = b.bitcast(v, elemTy);
       });
@@ -706,7 +706,7 @@ public:
 
     auto ctx = op.getContext();
     StringAttr kRegister = mlir::StringAttr::get(ctx, "register");
-    // NPOT Product conversions lower in the common pattern.
+    // NPOT mixed-radix conversions lower in the common pattern.
     if (hasNpotShape(srcTy) || hasNpotShape(dstTy))
       return failure();
     auto srcLayout =

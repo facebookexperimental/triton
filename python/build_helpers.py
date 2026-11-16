@@ -18,12 +18,15 @@ import zipfile
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-try:
-    from . import meta_llvm
-except ImportError:  # run as a script
+if TYPE_CHECKING:
     import meta_llvm
+else:
+    try:
+        import meta_llvm
+    except ImportError:  # run as a package (e.g. setup.py imports python.build_helpers)
+        from python import meta_llvm
 
 
 def get_base_dir():
@@ -88,9 +91,10 @@ def find_therock_rocm_include_dir() -> Optional[str]:
     """
     rocm_sdk = Path(sys.executable).with_name("rocm-sdk")
     if not rocm_sdk.is_file():
-        rocm_sdk = shutil.which("rocm-sdk")
-    if rocm_sdk is None:
-        return None
+        found_sdk = shutil.which("rocm-sdk")
+        if found_sdk is None:
+            return None
+        rocm_sdk = Path(found_sdk)
     try:
         # Run the caller venv's rocm-sdk entry point in isolated mode so pip's
         # temporary PEP 517 import path cannot shadow its installed packages.
@@ -413,8 +417,8 @@ def get_llvm_system_suffix(helper_args: BuildHelperArgs):
             system_suffix = "ubuntu-arm64"
         elif arch == "x64":
             vglibc = tuple(map(int, platform.libc_ver()[1].split(".")))
-            vglibc = vglibc[0] * 100 + vglibc[1]
-            if vglibc > 228:
+            vglibc_num = vglibc[0] * 100 + vglibc[1]
+            if vglibc_num > 228:
                 # Ubuntu 24 LTS (v2.39)
                 # Ubuntu 22 LTS (v2.35)
                 # Ubuntu 20 LTS (v2.31)
@@ -471,15 +475,19 @@ def get_amd_codegen_package_info(helper_args: BuildHelperArgs):
     revision = amd_llvm_info["llvm_hash"][:8]
     build_number = amd_llvm_info["build_number"]
     name = f"amd-codegen-{revision}-{system_suffix}-{build_number}"
-    url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
+    archive = DependencyArchive(
+        f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz",
+        f"triton-llvm/{name}.tar.gz",
+        amd_llvm_info.get("sha256sum", {}).get(system_suffix),
+    )
     return Package(
         "amd",
         name,
-        url,
+        archive.url,
         "",
         "",
         "",
-        sha256sum=amd_llvm_info.get("sha256sum", {}).get(system_suffix),
+        sha256sum=archive.sha256sum,
     )
 
 
@@ -584,8 +592,8 @@ def download_codegen_llvm(backend: str, llvm_info: dict, helper_args: BuildHelpe
     if not os.path.isfile(llvm_config):
         if helper_args.offline_build:
             raise RuntimeError(f"Requested an offline build but {backend} bootstrap LLVM is missing from {llvm_path}")
-        url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
-        _download_and_extract(url, package_root, name, helper_args.archives_path, checksum)
+        archive = get_llvm_archive(system_suffix, {**bootstrap, "llvm_hash": llvm_info["llvm_hash"]})
+        _download_and_extract(archive.url, package_root, name, helper_args.archives_path, archive.sha256sum)
     if not os.path.isfile(llvm_config):
         raise RuntimeError(f"Cannot find independently pinned {backend} LLVM configuration at {llvm_config}")
     return llvm_path
@@ -702,9 +710,9 @@ def download_and_copy(name, src_func, dst_path, override_path, version, url_func
     download = not os.path.exists(src_path)
     if os.path.exists(dst_path) and system == "Linux" and shutil.which(dst_path) is not None:
         curr_version = subprocess.check_output([dst_path, "--version"]).decode("utf-8").strip()
-        curr_version = re.search(r"V([.|\d]+)", curr_version)
-        assert curr_version is not None, f"No version information for {dst_path}"
-        download = download or curr_version.group(1) != version
+        version_match = re.search(r"V([.|\d]+)", curr_version)
+        assert version_match is not None, f"No version information for {dst_path}"
+        download = download or version_match.group(1) != version
     if download:
         _download_and_extract(url, tmp_path, name, helper_args.archives_path)
     os.makedirs(os.path.split(dst_path)[0], exist_ok=True)

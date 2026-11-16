@@ -2,7 +2,6 @@
 #define TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_UTILITY_H_
 
 #include "TargetInfo.h"
-#include "TritonAMDGPUToLLVM/GCNAsmFormat.h"
 
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
@@ -125,14 +124,41 @@ bool canCoalesceWriteIntoSharedMemory(MLIRContext *ctx,
                                       const LinearLayout &srcToSharedLayout,
                                       unsigned threadsPerWarp);
 
+// Splits a direct-to-LDS copy of |srcLayout| into |sharedLayout| into one
+// radix-2 copy per odd register value o, written from element
+// |slabOffsets|[o]; returns that copy's register-to-offset layout.
+FailureOr<LinearLayout> splitDirectToLdsCopy(
+    const LinearLayout &srcLayout, const LinearLayout &sharedLayout,
+    SmallVectorImpl<int32_t> &slabOffsets, std::string &reason);
+
+// Returns why a mixed-radix |srcLayout| cannot be loaded directly into
+// |dstEnc|, else sets |vectorSize| as canLoadDirectToLDS does.
+std::optional<std::string> getNpotDirectToLdsUnsupportedReason(
+    const triton::AMD::TargetInfo &targetInfo, const LinearLayout &srcLayout,
+    unsigned elemBitWidth, Attribute dstEnc, ArrayRef<int64_t> dstAllocShape,
+    unsigned &vectorSize);
+
+// The vector sizes the pointers/offsets and the mask each allow. Zero means
+// unknown, in which case no attribution is made.
+struct DirectToLdsVecInfo {
+  unsigned fromPtr = 0;
+  unsigned fromMask = 0;
+
+  bool maskIsLimiting() const { return fromPtr != 0 && fromMask < fromPtr; }
+};
+
 // Returns true if we can load directly from global |srcTy| to shared memory
 // |dstEnc| for the given target.
 // This function expects the caller to pass in |vectorSize| as the vector size
 // reading from global memory, after factoring in axis information and alignment
 // hints. It will be updated to factor in shared memory |dstEnc| constraints.
+// On failure |*failureReason|, if non-null, is set to an explanation of the
+// check that failed and how to satisfy it.
 bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
                         RankedTensorType srcTy, Attribute dstEnc,
-                        ArrayRef<int64_t> dstAllocShape, unsigned &vectorSize);
+                        ArrayRef<int64_t> dstAllocShape, unsigned &vectorSize,
+                        DirectToLdsVecInfo vecInfo = {},
+                        std::string *failureReason = nullptr);
 
 // Check if the result of this tl.dot is used as opA or opB of another tl.dot.
 bool isChainDotHead(mlir::triton::DotOpInterface dotOp, unsigned opIdx = 0);

@@ -141,24 +141,25 @@ void attachAllocationSizeAndOffsetAttr(ModuleOp mod,
                                       allocation.getSharedMemorySize()));
 }
 
-static bool isNpotSharedCover(Type type) {
+static bool lacksNpotPow2AllocShape(Type type) {
   auto memDesc = dyn_cast<MemDescType>(type);
   return memDesc && isa<SharedEncodingTrait>(memDesc.getEncoding()) &&
-         !holdsNpotSharedCover(memDesc.getEncoding(), memDesc.getAllocShape());
+         !holdsNpotPow2AllocShape(memDesc.getEncoding(),
+                                  memDesc.getAllocShape());
 }
 
 LogicalResult verifyNpotTypesSupported(ModuleOp mod) {
-  if (!triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+  if (!triton::tools::isNpotAllowed())
     return success();
-  bool rejected = false;
+  bool unsupported = false;
   mod.walk([&](Operation *op) {
-    if (llvm::any_of(op->getOperandTypes(), isNpotSharedCover) ||
-        llvm::any_of(op->getResultTypes(), isNpotSharedCover)) {
+    if (llvm::any_of(op->getOperandTypes(), lacksNpotPow2AllocShape) ||
+        llvm::any_of(op->getResultTypes(), lacksNpotPow2AllocShape)) {
       op->emitError() << "NPOT shared memory descriptors are not yet supported";
-      rejected = true;
+      unsupported = true;
     }
   });
-  return failure(rejected);
+  return failure(unsupported);
 }
 
 } // namespace mlir::triton::gpu

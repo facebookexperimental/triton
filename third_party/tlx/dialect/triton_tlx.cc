@@ -27,13 +27,6 @@
 
 namespace py = nanobind;
 
-// Defined in ir.cc. Declared here rather than in ir.h so ir.h stays free of
-// Python binding implementation details and matches upstream.
-namespace ir {
-extern py::class_<TritonOpBuilder> *getBuilderClass();
-} // namespace ir
-
-using namespace ir;
 using namespace mlir;
 namespace tt = triton;
 namespace ttg = triton::gpu;
@@ -128,9 +121,12 @@ static Value materializeConcreteMemDesc(TritonOpBuilder &builder, Value value) {
 }
 
 void init_triton_tlx_ir(py::module_ &m) {
-  auto *builder_cls = ir::getBuilderClass();
+  // Borrow the registered builder type; a static binding would retain
+  // ir.builder past interpreter shutdown (see test_bindings).
+  auto builder_cls =
+      py::borrow<py::class_<TritonOpBuilder>>(py::type<TritonOpBuilder>());
   builder_cls
-      ->def(
+      .def(
           "create_memdesc_subview",
           [](TritonOpBuilder &self, Value localAlloc,
              Value bufferIdx) -> mlir::Value {
@@ -205,6 +201,21 @@ void init_triton_tlx_ir(py::module_ &m) {
              return self.create<amdgpu::ExtractSliceOp>(resultType, source,
                                                         offsetsAttr);
            })
+      .def("create_amd_concat",
+           [](TritonOpBuilder &self, std::vector<Value> sources,
+              std::vector<int64_t> shape) -> Value {
+             if (sources.empty())
+               throw std::runtime_error(
+                   "amd_concat: at least one source is required");
+             auto sourceType =
+                 cast<RankedTensorType>(sources.front().getType());
+             if (shape.size() != static_cast<size_t>(sourceType.getRank()))
+               throw std::runtime_error(
+                   "amd_concat: result shape must match source rank");
+             auto resultType = RankedTensorType::get(
+                 shape, sourceType.getElementType(), sourceType.getEncoding());
+             return self.create<amdgpu::ConcatOp>(resultType, sources);
+           })
       .def("create_amd_rematerialized_range",
            [](TritonOpBuilder &self, int32_t start, int32_t end,
               int32_t identity, Value placement) -> Value {
@@ -261,27 +272,52 @@ void init_triton_tlx_ir(py::module_ &m) {
                  accumulatorRoleAttr, accumulatorRegisterClassAttr,
                  initializeAttr);
            })
-      .def("create_amd_scheduled_mfma_scaled",
-           [](TritonOpBuilder &self, Value a, Value b, Value acc, Value aScale,
-              Value bScale, const std::string &aFormat,
-              const std::string &bFormat, const std::string &residentOperand,
-              const std::string &accumulatorRole,
-              const std::string &accumulatorRegisterClass,
-              bool initialize) -> Value {
-             auto aFormatAttr = self.getBuilder().getStringAttr(aFormat);
-             auto bFormatAttr = self.getBuilder().getStringAttr(bFormat);
-             auto residentOperandAttr =
-                 self.getBuilder().getStringAttr(residentOperand);
-             auto accumulatorRoleAttr =
-                 self.getBuilder().getStringAttr(accumulatorRole);
-             auto accumulatorRegisterClassAttr =
-                 self.getBuilder().getStringAttr(accumulatorRegisterClass);
-             auto initializeAttr = self.getBuilder().getBoolAttr(initialize);
-             return self.create<amdgpu::ScheduledMfmaScaledOp>(
-                 acc.getType(), a, b, acc, aScale, bScale, aFormatAttr,
-                 bFormatAttr, residentOperandAttr, accumulatorRoleAttr,
-                 accumulatorRegisterClassAttr, initializeAttr);
-           })
+      .def(
+          "create_amd_scheduled_mfma_scaled",
+          [](TritonOpBuilder &self, Value a, Value b, Value acc, Value aScale,
+             Value bScale, const std::string &aFormat,
+             const std::string &bFormat, const std::string &residentOperand,
+             const std::string &accumulatorRole,
+             const std::string &accumulatorRegisterClass, bool initialize,
+             int64_t aScaleSelector, int64_t bScaleSelector) -> Value {
+            auto aFormatAttr = self.getBuilder().getStringAttr(aFormat);
+            auto bFormatAttr = self.getBuilder().getStringAttr(bFormat);
+            auto residentOperandAttr =
+                self.getBuilder().getStringAttr(residentOperand);
+            auto accumulatorRoleAttr =
+                self.getBuilder().getStringAttr(accumulatorRole);
+            auto accumulatorRegisterClassAttr =
+                self.getBuilder().getStringAttr(accumulatorRegisterClass);
+            auto initializeAttr = self.getBuilder().getBoolAttr(initialize);
+            auto selectorAttr = [&](int64_t selector) -> IntegerAttr {
+              return selector < 0
+                         ? IntegerAttr()
+                         : self.getBuilder().getI32IntegerAttr(selector);
+            };
+            auto op = self.create<amdgpu::ScheduledMfmaScaledOp>(
+                acc.getType(), a, b, acc, aScale, bScale, aFormatAttr,
+                bFormatAttr, residentOperandAttr, accumulatorRoleAttr,
+                accumulatorRegisterClassAttr, initializeAttr,
+                selectorAttr(aScaleSelector), selectorAttr(bScaleSelector));
+            // Persistent accumulator chains default to AGPRs even when the
+            // caller leaves register placement on "auto".
+            if (accumulatorRegisterClass != "auto" ||
+                accumulatorRole == "persistent") {
+              StringRef cdClass = accumulatorRegisterClass == "agpr" ||
+                                          (accumulatorRegisterClass == "auto" &&
+                                           accumulatorRole == "persistent")
+                                      ? "a"
+                                      : "v";
+              op->setAttr("amdg.cd_regclass",
+                          self.getBuilder().getStringAttr(cdClass));
+            }
+            return op.getResult();
+          },
+          py::arg("a"), py::arg("b"), py::arg("acc"), py::arg("a_scale"),
+          py::arg("b_scale"), py::arg("a_format"), py::arg("b_format"),
+          py::arg("resident_operand"), py::arg("accumulator_role"),
+          py::arg("accumulator_register_class"), py::arg("initialize"),
+          py::arg("a_scale_selector") = -1, py::arg("b_scale_selector") = -1)
       .def(
           "create_require_layout",
           [](TritonOpBuilder &self, Value &v, Attribute &encoding, bool pin,
@@ -919,8 +955,8 @@ void init_triton_tlx_ir(py::module_ &m) {
              std::vector<Value> realInputs;
              realInputs.reserve(inputs.size());
              for (Value input : inputs) {
-               if (auto releaseOp =
-                       dyn_cast<tlx::ReleaseLayoutOp>(input.getDefiningOp()))
+               if (auto releaseOp = dyn_cast_if_present<tlx::ReleaseLayoutOp>(
+                       input.getDefiningOp()))
                  realInputs.push_back(releaseOp.getSrc());
                else
                  realInputs.push_back(input);
@@ -939,7 +975,7 @@ void init_triton_tlx_ir(py::module_ &m) {
              std::vector<Value> outputs;
              outputs.reserve(inputs.size());
              for (unsigned i = 0; i < inputs.size(); ++i) {
-               if (auto release = dyn_cast<tlx::ReleaseLayoutOp>(
+               if (auto release = dyn_cast_if_present<tlx::ReleaseLayoutOp>(
                        inputs[i].getDefiningOp())) {
                  release->moveAfter(waitOp.getOperation());
                  release.getOperation()->setOperand(0, waitOp.getResult(i));
@@ -1081,6 +1117,16 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, uint32_t variant) {
              self.create<ROCDL::IglpOpt>(variant);
            })
+      .def("create_amd_packed_dot2",
+           [](TritonOpBuilder &self, Value lhs, Value rhs, Value acc,
+              Type inputType) -> Value {
+             auto lhsType = cast<RankedTensorType>(lhs.getType());
+             auto resultType = RankedTensorType::get(
+                 lhsType.getShape(), self.getBuilder().getF32Type(),
+                 lhsType.getEncoding());
+             return self.create<amdgpu::PackedDot2Op>(resultType, lhs, rhs, acc,
+                                                      TypeAttr::get(inputType));
+           })
       .def("create_warp_vote",
            [](TritonOpBuilder &self, Value pred,
               const std::string &kind) -> mlir::Value {
@@ -1101,6 +1147,14 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self) -> void {
              self.create<amdgpu::ClusterBarrierArriveOp>();
              self.create<amdgpu::ClusterBarrierWaitOp>();
+           })
+      .def("create_amd_workgroup_barrier_signal",
+           [](TritonOpBuilder &self) -> void {
+             self.create<amdgpu::WorkgroupBarrierSignalOp>();
+           })
+      .def("create_amd_workgroup_barrier_wait",
+           [](TritonOpBuilder &self) -> void {
+             self.create<amdgpu::WorkgroupBarrierWaitOp>();
            })
       .def("create_amd_cluster_arrive",
            [](TritonOpBuilder &self) -> void {
@@ -1582,7 +1636,10 @@ void init_triton_tlx_ir(py::module_ &m) {
              self.create<ttng::AsyncTMACopyGlobalToLocalOp>(
                  multicastTargetBitMask, desc, coord,
                  /*offsets=*/std::vector<Value>{}, mbarrier, result, pred,
-                 multicast, cacheModifier, evictionPolicy, isVolatile, twoCta);
+                 multicast,
+                 buildCachePolicy(self.getBuilder(), cacheModifier,
+                                  evictionPolicy),
+                 isVolatile, twoCta);
            })
       .def(
           "create_async_TMA_gather",
@@ -1620,8 +1677,10 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def("create_async_TMA_store",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &coord,
               Value source, tt::EvictionPolicy evictionPolicy) -> void {
-             self.create<ttng::AsyncTMACopyLocalToGlobalOp>(desc, coord, source,
-                                                            evictionPolicy);
+             self.create<ttng::AsyncTMACopyLocalToGlobalOp>(
+                 desc, coord, source,
+                 buildCachePolicy(self.getBuilder(), tt::CacheModifier::NONE,
+                                  evictionPolicy));
            })
       .def("create_async_TMA_reduce",
            [](TritonOpBuilder &self, tt::DescriptorReduceKind kind, Value desc,

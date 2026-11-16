@@ -4,8 +4,8 @@
 extern "C" float mi450_aiter_bwd(void *q, void *k, void *v, void *o, void *dout,
                                  void *lse, void *delta, void *dq_acc, void *dq,
                                  void *dk_expanded, void *dv_expanded,
-                                 int batch, int hq, int hk, int n, float scale,
-                                 void *stream) {
+                                 int batch, int hq, int hk, int n, int causal,
+                                 float scale, void *stream) {
   aiter::mha_bwd_args a{};
   a.use_asm_v3 = true;
   a.v3_atomic_fp32 = true;
@@ -16,7 +16,11 @@ extern "C" float mi450_aiter_bwd(void *q, void *k, void *v, void *o, void *dout,
   a.nhead_q = hq;
   a.nhead_k = hk;
   a.seqlen_q = a.seqlen_k = a.max_seqlen_q = a.max_seqlen_k = n;
-  a.window_size_left = a.window_size_right = -1;
+  // Q and KV have equal lengths, so bottom-right causal is ordinary causal.
+  a.mask_type = causal ? static_cast<int>(mask_enum::mask_bottom_right)
+                       : static_cast<int>(mask_enum::no_mask);
+  a.window_size_left = -1;
+  a.window_size_right = causal ? 0 : -1;
   a.scale = scale;
   a.q_ptr = q;
   a.k_ptr = k;

@@ -90,6 +90,9 @@ static unsigned mfmaCountOf(Operation *op) {
   if (auto ds = dyn_cast<triton::DotScaledOp>(op))
     if (ds.getAElemType() == triton::ScaleDotElemType::E2M1)
       k *= 2; // two fp4 values per byte
+  if (auto ds = dyn_cast<triton::amdgpu::ScheduledMfmaScaledOp>(op))
+    if (ds.getAFormat() == "e2m1")
+      k *= 2;
   int64_t tileM = std::max<int64_t>(1, (int64_t)instr[0] * warps[0]);
   int64_t tileN = std::max<int64_t>(1, (int64_t)instr[1] * warps[1]);
   int64_t iK = std::max<int64_t>(1, (int64_t)instr[2]);
@@ -438,8 +441,8 @@ static void clearIntraWaveMarker(Operation *op) {
 
 static std::optional<std::pair<int32_t, unsigned>>
 priceIntraWaveOp(Operation *op, triton::AMD::ModuleAxisInfoAnalysis &axisInfo) {
-  if (isa<triton::DotOp, triton::DotScaledOp, triton::amdgpu::ScheduledMfmaOp>(
-          op))
+  if (isa<triton::DotOp, triton::DotScaledOp, triton::amdgpu::ScheduledMfmaOp,
+          triton::amdgpu::ScheduledMfmaScaledOp>(op))
     return std::pair<int32_t, unsigned>{kMaskMFMA, mfmaCountOf(op)};
   if (isa<triton::gpu::LocalLoadOp>(op))
     return std::pair<int32_t, unsigned>{kMaskDSRead, dsReadCountOf(op)};
@@ -1164,7 +1167,9 @@ struct TritonAMDGPUSchedGroupBarrierSchedulerPass
                     b.getI32IntegerAttr(mfmaCover));
     };
     mod.walk([&](Operation *op) {
-      if (isa<triton::DotOp, triton::DotScaledOp>(op))
+      if (isa<triton::DotOp, triton::DotScaledOp,
+              triton::amdgpu::ScheduledMfmaOp,
+              triton::amdgpu::ScheduledMfmaScaledOp>(op))
         annotate(op, kMaskMFMA, mfmaCountOf(op));
       else if (isa<triton::gpu::LocalLoadOp>(op))
         annotate(op, kMaskDSRead, dsReadCountOf(op));

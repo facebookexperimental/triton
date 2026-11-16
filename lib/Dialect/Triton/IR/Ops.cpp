@@ -1,3 +1,4 @@
+#include <array>
 #include <sstream>
 
 #include "mlir/IR/Builders.h"
@@ -7,10 +8,14 @@
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Tools/LinearLayout.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -80,15 +85,6 @@ LogicalResult verifyCachePolicy(Operation *op, Attribute cachePolicy,
   });
 }
 
-static LogicalResult verifyLoadStoreType(Operation *op, Type ptrTy) {
-  Type elementTy = getElementTypeOrSelf(getPointeeType(ptrTy));
-  if (!elementTy.isIntOrFloat())
-    return op->emitOpError("only supports integer and floating-point elements");
-  if (elementTy.getIntOrFloatBitWidth() < 8)
-    return op->emitOpError("does not support sub-byte elements");
-  return success();
-}
-
 //-- LoadOp --
 void LoadOp::build(OpBuilder &builder, OperationState &state, Value ptr,
                    bool isVolatile) {
@@ -115,8 +111,6 @@ void LoadOp::setPredicateOperand(Value pred) { getMaskMutable().assign(pred); }
 Type LoadOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
 
 LogicalResult LoadOp::verify() {
-  if (failed(verifyLoadStoreType(*this, getPtr().getType())))
-    return failure();
   return verifyCachePolicy(*this, getCachePolicyAttr(),
                            CachePolicyOperation::Load);
 }
@@ -172,8 +166,6 @@ void StoreOp::setPredicateOperand(Value pred) { getMaskMutable().assign(pred); }
 Type StoreOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
 
 LogicalResult StoreOp::verify() {
-  if (failed(verifyLoadStoreType(*this, getPtr().getType())))
-    return failure();
   return verifyCachePolicy(*this, getCachePolicyAttr(),
                            CachePolicyOperation::Store);
 }
@@ -227,16 +219,48 @@ LogicalResult AtomicStoreOp::canonicalize(AtomicStoreOp op,
   return eraseIfPredicateIsFalse(op, rewriter);
 }
 
+static LogicalResult verifyAtomicLoadStoreType(Operation *op, Type ptrTy) {
+  Type elementTy = getElementTypeOrSelf(getPointeeType(ptrTy));
+  if (!elementTy.isIntOrFloat())
+    return op->emitOpError("only supports integer and floating-point elements");
+  if (elementTy.getIntOrFloatBitWidth() < 8)
+    return op->emitOpError("does not support sub-byte elements");
+  return success();
+}
+
 LogicalResult AtomicLoadOp::verify() {
   if (getSem() != MemSemantic::ACQUIRE && getSem() != MemSemantic::RELAXED)
     return emitOpError("only supports acquire and relaxed semantics");
-  return verifyLoadStoreType(*this, getPtr().getType());
+  return verifyAtomicLoadStoreType(getOperation(), getPtr().getType());
 }
 
 LogicalResult AtomicStoreOp::verify() {
   if (getSem() != MemSemantic::RELEASE && getSem() != MemSemantic::RELAXED)
     return emitOpError("only supports release and relaxed semantics");
-  return verifyLoadStoreType(*this, getPtr().getType());
+  return verifyAtomicLoadStoreType(getOperation(), getPtr().getType());
+}
+
+// A used result with duplicates is broadcast back through pow2-only
+// shared-memory algebra.
+static std::optional<std::string>
+getAtomicMixedRadixUnsupportedReason(Operation *op,
+                                     const LinearLayout &layout) {
+  if (!op->getResult(0).use_empty() &&
+      llvm::any_of(layout.getFreeVariableMasks(),
+                   [](auto mask) { return mask.second != 0; }))
+    return "NPOT mixed-radix layout with broadcast elements is not yet "
+           "supported on an atomic whose result is used";
+  return std::nullopt;
+}
+
+std::optional<std::string>
+AtomicRMWOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getAtomicMixedRadixUnsupportedReason(*this, layout);
+}
+
+std::optional<std::string>
+AtomicCASOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getAtomicMixedRadixUnsupportedReason(*this, layout);
 }
 
 LogicalResult AtomicPollOp::verify() {
@@ -388,6 +412,91 @@ LogicalResult DotOp::verify() {
   auto interface = cast<DialectInferLayoutInterface>(&dialect);
   return interface->verifyDotOpEncodingCompatibility(getOperation(), aEncoding,
                                                      bEncoding);
+}
+
+// The NpotTargetLegality whose prefix matches `target`, or nullptr.
+static const NpotTargetLegality *lookupNpotTargetLegality(MLIRContext *ctx,
+                                                          StringRef target) {
+  for (Dialect *dialect : ctx->getLoadedDialects()) {
+    auto *legality = dyn_cast<NpotTargetLegality>(dialect);
+    if (legality && target.split(':').first == legality->getTargetPrefix())
+      return legality;
+  }
+  return nullptr;
+}
+
+std::optional<std::string>
+getNpotDotUnsupportedReason(Operation *dot, const LinearLayout &layout,
+                            StringRef target, int numWarps, int nonKDim) {
+  if (auto *legality = lookupNpotTargetLegality(dot->getContext(), target))
+    return legality->getDotUnsupportedReason(dot, layout, target, numWarps,
+                                             nonKDim);
+  return std::string("NPOT dot is not yet supported without an MMA target");
+}
+
+std::optional<std::string>
+getNpotDotSlowReason(Operation *dot, ArrayRef<NpotDotOperandAccess> operands,
+                     int numWarps, int threadsPerWarp, int nonKDim,
+                     StringRef target) {
+  if (auto *legality = lookupNpotTargetLegality(dot->getContext(), target))
+    return legality->getDotSlowReason(dot, operands, numWarps, threadsPerWarp,
+                                      nonKDim, target);
+  return std::nullopt;
+}
+
+StringRef getModuleTarget(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  auto target = mod ? mod->getAttrOfType<StringAttr>("ttg.target") : nullptr;
+  return target ? target.getValue() : StringRef();
+}
+
+std::optional<std::string>
+getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout) {
+  StringRef target = getModuleTarget(copy);
+  if (auto *legality = lookupNpotTargetLegality(copy->getContext(), target))
+    return legality->getAsyncCopyUnsupportedReason(copy, layout, target);
+  return std::string("NPOT async copy is not yet supported without a target");
+}
+
+bool npotStoreTakesPredicatedVector(Operation *op) {
+  auto store = dyn_cast<StoreOp>(op);
+  if (!store)
+    return false;
+  SmallVector<Value> work{store.getValue()};
+  DenseSet<Value> seen;
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    // A value forwarded along control flow comes from what is forwarded.
+    auto arg = dyn_cast<BlockArgument>(v);
+    Operation *def = arg ? arg.getOwner()->getParentOp() : v.getDefiningOp();
+    if (auto branch = dyn_cast_or_null<RegionBranchOpInterface>(def)) {
+      RegionBranchInverseSuccessorMapping forwarded;
+      branch.getSuccessorInputOperandMapping(forwarded);
+      for (OpOperand *operand : forwarded.lookup(v))
+        work.push_back(operand->get());
+      continue;
+    }
+    if (!def || arg)
+      continue;
+    if (isa<LoadOp>(def))
+      return false;
+    if (def->hasTrait<OpTrait::Elementwise>() ||
+        def->hasTrait<OpTrait::SameOperandsAndResultShape>() ||
+        def->hasTrait<OpTrait::SameOperandsAndResultType>())
+      llvm::append_range(work, def->getOperands());
+  }
+  return true;
+}
+
+std::optional<std::string>
+getNpotDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
+                                   StringRef target) {
+  if (auto *legality = lookupNpotTargetLegality(op->getContext(), target))
+    return legality->getDescriptorUnsupportedReason(op, layout, target);
+  return std::string(
+      "NPOT tensor descriptor is not yet supported without a target");
 }
 
 //-- DotScaledOp --
@@ -840,6 +949,88 @@ bool ReduceOp::hasDefinedOrdering() {
   return attr && attr.getValue() != "unordered";
 }
 
+std::optional<std::string>
+ReduceOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  auto ordering = getReductionOrderingAttr();
+  if (ordering && ordering.getValue() == "inner_tree")
+    return "NPOT mixed-radix layout is not yet supported on an inner_tree "
+           "reduce";
+  return std::nullopt;
+}
+
+bool ReduceOp::isCommutative() {
+  Block &block = getCombineOp().front();
+  // Restrict the proof to a pure, straight-line expression DAG.
+  for (Operation &op : block.without_terminator())
+    if (op.getNumRegions() || !isMemoryEffectFree(&op))
+      return false;
+
+  // Number each value twice: with the original arguments and with the two
+  // input tuples exchanged. Captures are opaque leaves shared by both views.
+  DenseMap<Value, std::array<unsigned, 2>> numbers;
+  unsigned nextNumber = 0;
+  unsigned numOperands = getNumOperands();
+  for (unsigned i = 0; i < numOperands; ++i) {
+    numbers[block.getArgument(i)] = {nextNumber, nextNumber + 1};
+    numbers[block.getArgument(i + numOperands)] = {nextNumber + 1, nextNumber};
+    nextNumber += 2;
+  }
+  auto getNumber = [&](Value value, unsigned view) {
+    auto [it, inserted] =
+        numbers.try_emplace(value, std::array{nextNumber, nextNumber});
+    if (inserted)
+      ++nextNumber;
+    return it->second[view];
+  };
+
+  struct Expression {
+    Operation *op;
+    SmallVector<unsigned> operands;
+    SmallVector<unsigned> results;
+  };
+  DenseMap<size_t, SmallVector<Expression, 1>> expressions;
+  for (Operation &op : block.without_terminator()) {
+    for (unsigned view = 0; view < 2; ++view) {
+      SmallVector<unsigned> operands;
+      for (Value operand : op.getOperands())
+        operands.push_back(getNumber(operand, view));
+      if (op.hasTrait<OpTrait::IsCommutative>())
+        llvm::sort(operands);
+
+      size_t hash = OperationEquivalence::computeHash(
+          &op,
+          [&](Value operand) {
+            return llvm::hash_value(getNumber(operand, view));
+          },
+          OperationEquivalence::ignoreHashValue,
+          OperationEquivalence::IgnoreLocations);
+      auto &bucket = expressions[hash];
+      // A hash match alone is not a proof. Compare the full operation,
+      // including its types, attributes and properties, and numbered operands.
+      auto it = llvm::find_if(bucket, [&](const Expression &expr) {
+        return expr.operands == operands &&
+               OperationEquivalence::isEquivalentTo(
+                   expr.op, &op, OperationEquivalence::ignoreValueEquivalence,
+                   /*markEquivalent=*/nullptr,
+                   OperationEquivalence::IgnoreLocations);
+      });
+      if (it == bucket.end()) {
+        SmallVector<unsigned> results;
+        for (unsigned i = 0; i < op.getNumResults(); ++i)
+          results.push_back(nextNumber++);
+        bucket.push_back({&op, std::move(operands), std::move(results)});
+        it = std::prev(bucket.end());
+      }
+      for (auto [result, number] : llvm::zip(op.getResults(), it->results))
+        numbers[result][view] = number;
+    }
+  }
+
+  return llvm::all_of(block.getTerminator()->getOperands(), [&](Value value) {
+    return getNumber(value, 0) == getNumber(value, 1);
+  });
+}
+
 //-- ScanOp --
 void ScanOp::build(OpBuilder &builder, OperationState &state,
                    ValueRange operands, int axis, bool reverse,
@@ -880,6 +1071,58 @@ llvm::SmallVector<RankedTensorType> ScanOp::getInputTypes() {
 
 llvm::SmallVector<Type> ScanOp::getElementTypes() {
   return getElementTypesImpl(this->getOperands());
+}
+
+// Walks bases: LinearEncodingAttr's per-dim counts lose the order checked here.
+std::optional<SmallVector<unsigned>>
+ScanOp::getBlockedTile(const LinearLayout &layout) {
+  // A general offset table hides its digits' steps from the bases.
+  if (!layout.hasOddPartForm())
+    return std::nullopt;
+  MLIRContext *ctx = layout.getOutDimNames().begin()->getContext();
+  auto kReg = StringAttr::get(ctx, "register");
+  LinearLayout ll = layout.removeZeroBasesAlongDim(kReg);
+  auto nonZero = [](int32_t b) { return b != 0; };
+  SmallVector<unsigned> tile(ll.getNumOutDims(), 1);
+  // A thread's contiguous run, as LinearEncodingAttr::getContigPerThread.
+  const auto &regs = ll.getBases().lookup(kReg);
+  int runDim = -1;
+  for (const auto &basis :
+       ArrayRef(regs).take_front(ll.getNumLeadingRadix2Digits(kReg))) {
+    unsigned dim = llvm::find_if(basis, nonZero) - basis.begin();
+    if (llvm::count_if(basis, nonZero) != 1 || basis[dim] != tile[dim] ||
+        (int(dim) != runDim && tile[dim] != 1))
+      break;
+    runDim = dim;
+    tile[dim] *= 2;
+  }
+  for (const char *inDim : {"lane", "warp"}) {
+    SmallVector<int> last(tile.size(), -1);
+    const auto &bases = ll.getBases().lookup(StringAttr::get(ctx, inDim));
+    for (auto [pos, basis] : llvm::enumerate(bases)) {
+      auto count = llvm::count_if(basis, nonZero);
+      if (count == 0)
+        continue;
+      unsigned dim = llvm::find_if(basis, nonZero) - basis.begin();
+      if (count != 1 || basis[dim] != tile[dim] ||
+          (last[dim] >= 0 && last[dim] + 1 != int(pos)))
+        return std::nullopt;
+      last[dim] = pos;
+      tile[dim] *= 2;
+    }
+  }
+  return tile;
+}
+
+std::optional<std::string>
+ScanOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  auto ordering = getReductionOrderingAttr();
+  if (ordering && ordering.getValue() == "inner_tree")
+    return "NPOT mixed-radix layout is not yet supported on an inner_tree scan";
+  if (!getBlockedTile(layout))
+    return "NPOT mixed-radix layout is not yet supported on a scan whose lanes "
+           "or warps are not blocked";
+  return std::nullopt;
 }
 
 //-- MapElementwiseOp
@@ -1024,10 +1267,8 @@ LogicalResult ExpandDimsOp::canonicalize(ExpandDimsOp op,
       Dialect &dialect = srcEnc.getDialect();
       auto inferLayoutInterface = cast<DialectInferLayoutInterface>(&dialect);
       if (failed(inferLayoutInterface->inferExpandDimsOpEncoding(
-              srcEnc, op.getAxis(), newExpandEnc, op.getLoc()))) {
-        return emitOptionalError(op.getLoc(),
-                                 "failed to infer layout for ExpandDimsOp");
-      }
+              srcEnc, op.getAxis(), newExpandEnc, std::nullopt)))
+        return failure();
     }
 
     auto newExpandTy = RankedTensorType::get(
@@ -1446,6 +1687,15 @@ LogicalResult BroadcastOp::verify() {
              << i << " between source and result.  "
              << "Broadcast requires the source dimension to be 1.";
     }
+  }
+  auto srcEncoding = srcTensorType.getEncoding();
+  if (srcEncoding && resultTensorType.getEncoding()) {
+    auto interface =
+        cast<DialectInferLayoutInterface>(&srcEncoding.getDialect());
+    if (failed(interface->verifyBroadcastOpEncoding(srcTensorType,
+                                                    resultTensorType)))
+      return emitOpError("requires matching source and result layouts up to "
+                         "broadcasting");
   }
   return success();
 }
@@ -2202,6 +2452,36 @@ LogicalResult DescriptorStoreOp::verify() {
 LogicalResult DescriptorReduceOp::verify() {
   return verifyDescriptorLoadStoreOp(*this, getDesc().getType(),
                                      getSrc().getType());
+}
+
+std::optional<std::string>
+DescriptorLoadOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorStoreOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorReduceOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string>
+DescriptorGatherOp::getMixedRadixUnsupportedReason(const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
+}
+
+std::optional<std::string> DescriptorScatterOp::getMixedRadixUnsupportedReason(
+    const LinearLayout &layout) {
+  return getNpotDescriptorUnsupportedReason(*this, layout,
+                                            getModuleTarget(*this));
 }
 
 } // namespace triton

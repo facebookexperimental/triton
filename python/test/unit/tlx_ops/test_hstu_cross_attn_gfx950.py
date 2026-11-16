@@ -180,6 +180,28 @@ def test_hstu_cross_attn_stream_k(dtype, num_softmax_heads, lengths_kv, lengths_
         assert int(flags.abs().sum()) == 0
 
 
+@requires_gfx950
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_hstu_cross_attn_stream_k_shared_kv_short_kv(dtype, monkeypatch):
+    # Shared K/V takes stream-K; long q over short KV takes the short-KV cost floor.
+    from triton.tlx.ops import hstu_cross_attn
+    from triton.tlx.ops.kernels.hstu_cross_attn import gfx950
+
+    lengths_kv, lengths_q = [107, 6151, 12000, 353, 2313, 0], [5440, 1920, 3200, 4800, 640, 128]
+    calls = []
+    stream_k_fwd = gfx950.stream_k_fwd
+    monkeypatch.setattr(gfx950, "stream_k_fwd", lambda *args: calls.append(args) or stream_k_fwd(*args))
+    torch.manual_seed(1041)
+    _run(lengths_kv, lengths_q, heads=1, num_softmax_heads=1, dtype=dtype, has_num_targets=False, shared_kv=True,
+         check_backward=True)
+    assert calls
+    a = _inference_inputs(lengths_kv, lengths_q, heads=1, dtype=dtype)
+    a["v"] = a["k"]
+    first = hstu_cross_attn(**a, shared_kv=True)
+    for _ in range(3):
+        assert torch.equal(hstu_cross_attn(**a, shared_kv=True), first)
+
+
 def _inference_inputs(lengths_kv, lengths_q, heads=2, dim=128, dtype=torch.bfloat16):
     device = torch.device("cuda")
     seq_offsets = _offsets(torch.tensor(lengths_kv, device=device))

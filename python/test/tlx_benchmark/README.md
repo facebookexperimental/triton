@@ -13,7 +13,12 @@ python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
-`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`.
+`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, or one of the
+fused operators below.
+
+Fused operators (`tlx/ops/kernels/fused/`) run steps that would otherwise be separate kernels in one launch:
+`addmm_mul_add` and `linear_rowscale` fuse an elementwise epilogue into a GEMM, and `norm_residual_norm`
+fuses the post-norm, gated residual add and pre-norm of a residual-stream boundary.
 
 ```
 options:
@@ -50,6 +55,7 @@ options:
 | op | reference | gate | default space |
 |----|-----------|------|---------------|
 | `mm` | `torch.matmul` | speedup >= 0.9x | heuristic |
+| `mm_mxfp8` | `torch.mm` on pre-dequantized BF16 inputs | reports ratio only; non-equivalent reference | heuristic |
 | `addmm` | `torch.addmm` | speedup >= 0.9x | heuristic |
 | `mm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `addmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
@@ -65,6 +71,16 @@ options:
 | `mla_window_attn` | `torch.compile` of the module, attention as FlexAttention | speedup >= 0.9x | heuristic |
 | `swiglu_ffn` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 | `rmsnorm_cat` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
+| `moe` | none (FlyDSL's Muse MoE ships with aiter) | absolute floor, currently unset -> reports only | heuristic |
+| `moe_routing` | `torch.compile` of the eager routing | speedup >= 0.9x | heuristic |
+
+### Fused operators
+
+| op | reference | gate | default space |
+|----|-----------|------|---------------|
+| `addmm_mul_add` | `torch.addmm` + `torch.addcmul` | speedup >= 0.9x | heuristic |
+| `linear_rowscale` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
+| `norm_residual_norm` | `torch.compile` of the unfused module sequence | speedup >= 0.9x | heuristic |
 
 The direct `mm` provider has a `heuristic_config`, so its default is a single
 analytically chosen config. The TorchTLX providers use Inductor's template
@@ -92,6 +108,10 @@ recorded per case as `ref_autotuned` rather than corrected for.
 with a padding (and causal) mask -- what a torch-only caller runs -- so the
 reference also computes the padded positions. The op has one fixed launch
 config, so `--space` does not change it.
+
+`linear_rowscale` races `torch.compile` of the eager expression, which Inductor
+lowers to cuBLAS `addmm` and one fused kernel that applies the row scale. One
+fixed launch config.
 
 Ops with a backward (`flash_attn`, `hstu_attn`, `kda`) produce two cases per
 shape. The backward is a different kernel at 2.5x the FLOPs, so folding it into
@@ -144,6 +164,11 @@ pip: speedup < 0.9, or TFLOP/s under an op's absolute floor when it has no
      no heuristic raise it, see above)
 noisy: CV% > 3%
 ok: everything else
+
+A benchmark may set `REFERENCE_GATE = False` when its reference validates the
+same numerical result but does not use an equivalent storage or instruction
+contract. The harness still measures and reports the ratio, while only
+correctness, compile time, and noise affect that run's status.
 
 ## How a call is timed
 
@@ -211,6 +236,11 @@ no heuristic it compiles their whole autotune space -- `hstu_attn` is 48 forward
 configs -- which per case is most of the suite's runtime, spent re-answering a
 question that is not per-shape. Those ops sample it instead: one case per
 direction, the rest report `-` and are not gated on compile.
+
+For TorchTLX FlexAttention, first use includes Inductor graph compilation and
+CUDA graph capture on every architecture. This happens during preparation;
+the adapter reports that cost instead of timing a graph replay as compilation.
+Artifacts identify it as `cold_start_scope=inductor_graph_compile_and_capture`.
 
 `--cold-compile {all,first,none}` overrides. `all` is the honest per-case
 reading and what to use when compile time is what you are investigating.
@@ -303,5 +333,6 @@ inside the measured window. Build the tensors in `prepare` and capture them.
 `test_ops_perf.py` picks the new file up automatically.
 
 `bench_norm.py` covers the GEO plain, saved-state, MXFP8, MXFP4, NVFP4,
-fused/jagged and softmax requests. It replays CUDA graphs for both providers;
+fused/jagged and softmax requests, and on gfx950 the forward RMSNorm (`norm_fwd`
+with `norm='rms'`). It replays CUDA graphs for both providers;
 quantized cases report latency without a torch quantization speedup.
