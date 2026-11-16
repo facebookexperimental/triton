@@ -522,7 +522,8 @@ def _tlx_gfx950_ragged_hstu_attn_fwd_one_block(  # noqa: C901
         m_i = m_ij
     else:
         # pyrefly: ignore [bad-argument-type]
-        silu = fast_silu(qk, True) * scale[:, None]
+        scale_2d = scale[None] if len(scale.shape) == 0 else scale[:, None]
+        silu = fast_silu(qk, True) * scale_2d
         if IS_MASKLESS:
             act_qk = silu
         else:
@@ -4085,7 +4086,7 @@ def _tlx_gfx950_ragged_hstu_attn_bwd_one_block(  # noqa C901
             q_tile = tlx.local_load(q_view, token=qdo_wait)
         else:
             q_tile = tlx.local_load(q_view)
-        dqk_trans = (dqk_trans * sig_trans * (1 + qk_trans * (1 - sig_trans)) * scale[None, :])
+        dqk_trans = (dqk_trans * sig_trans * (1 + qk_trans * (1 - sig_trans)) * scale[None])
         dqk_trans = tl.where(invalid_mask_trans, dqk_trans, 0)
         dqk_trans = dqk_trans.to(k.dtype)
 

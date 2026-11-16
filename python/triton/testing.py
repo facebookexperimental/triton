@@ -13,6 +13,27 @@ from . import language as tl
 from . import runtime
 
 
+@functools.lru_cache(maxsize=None)
+def _cublas_for_device(device):
+    import torch
+    from triton._C.libtriton import nvidia
+
+    workspace = torch.empty(32 * 1024 * 1024, device=device, dtype=torch.uint8)
+    return workspace, nvidia.cublas.CublasLt(workspace)
+
+
+def cublas():
+    """Return the current device's cached cuBLAS handle outside compile warmup."""
+    from triton._internal_testing import is_compile_warmup
+
+    if is_compile_warmup():
+        return None
+
+    import torch
+
+    return _cublas_for_device(torch.cuda.current_device())[1]
+
+
 def nvsmi(attrs):
     attrs = ','.join(attrs)
     cmd = ['nvidia-smi', '-i', '0', '--query-gpu=' + attrs, '--format=csv,noheader,nounits']
@@ -757,7 +778,7 @@ def get_max_simd_tflops(dtype, clock_rate, device=None):
         device = torch.cuda.current_device()
 
     num_subcores = driver.active.utils.get_device_properties(device)["multiprocessor_count"] * 4
-    capability = torch.cuda.get_device_capability()
+    capability = torch.cuda.get_device_capability(device)
     if capability[0] < 8:
         if dtype == torch.float32:
             ops_per_sub_core = 32  # 2*16

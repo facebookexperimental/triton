@@ -1,60 +1,137 @@
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "AsyncUtility.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "triton/Analysis/Membar.h"
+#include "triton/Analysis/Utility.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 namespace mlir::triton::AMD {
 namespace {
-// Returns true for a producer-to-consumer dependency ordered by AsyncWait.
-// AsyncWait does not release the consumed LDS slice for a later async write.
+// Returns true if
+// 1) op2 is a LocalLoad synced via AsyncWait and op1 is an AsyncLoad into the
+//    same buffer (RAW).
+// 2) both are AsyncLoad
 bool filterAsyncLocalLoadsDependencies(Operation *op1, Operation *op2,
-                                       bool op1IsRead, bool op2IsRead,
                                        Allocation *allocation) {
-  auto isAsyncLDSWrite = [](Operation *op) {
-    return llvm::isa<triton::gpu::AsyncCopyGlobalToLocalOp,
-                     triton::amdgpu::BufferLoadToLocalOp>(op);
+  auto isAsyncLoad = [](Operation *op) {
+    return op->hasTrait<mlir::OpTrait::GlobalToLocalCopyTrait>();
   };
-  auto isLocalLoadSyncedViaAsyncWait = [](Operation *op) {
+  auto isLocalLoadWithAsyncWaitToken = [](Operation *op) {
     auto localLoad = llvm::dyn_cast<triton::gpu::LocalLoadOp>(op);
     return localLoad && isSyncedViaAsyncWait(localLoad);
   };
-  auto getMemdescValue = [](Operation *op) -> Value {
-    return llvm::TypeSwitch<Operation *, Value>(op)
+  // Returns the local memory operands an op reads from or writes to. Fused TDM
+  // copies write to several destinations, hence the vector.
+  auto getMemdescValues = [](Operation *op) -> SmallVector<Value> {
+    return llvm::TypeSwitch<Operation *, SmallVector<Value>>(op)
         .Case<triton::amdgpu::BufferLoadToLocalOp>(
-            [](auto op) { return op.getDest(); })
-        .Case<triton::gpu::AsyncCopyGlobalToLocalOp>(
-            [](auto op) { return op.getResult(); })
-        .Case<triton::gpu::LocalLoadOp>([](auto op) { return op.getSrc(); })
-        .Default([](Operation *) { return Value(); });
+            [](auto op) -> SmallVector<Value> { return {op.getDest()}; })
+        .Case<triton::gpu::AsyncCopyGlobalToLocalOp,
+              triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(
+            [](auto op) -> SmallVector<Value> { return {op.getResult()}; })
+        .Case<triton::amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(
+            [](auto op) -> SmallVector<Value> {
+              return llvm::to_vector(op.getDests());
+            })
+        .Case<triton::amdgpu::AsyncTDMGatherOp>(
+            [](auto op) -> SmallVector<Value> { return {op.getDst()}; })
+        .Case<triton::gpu::LocalLoadOp>(
+            [](auto op) -> SmallVector<Value> { return {op.getSrc()}; })
+        .Default([](Operation *) { return SmallVector<Value>{}; });
   };
 
-  // Only filter a RAW dependency from a prior async LDS write to its local
-  // consumer. In particular, never filter the opposite LocalLoad-to-prefetch
-  // WAR dependency: a wait says nothing about consumer completion.
-  if (op1IsRead || !op2IsRead || !isAsyncLDSWrite(op1) ||
-      !isLocalLoadSyncedViaAsyncWait(op2)) {
+  // Early return if neither operands are an AsyncLoad
+  if (!isAsyncLoad(op1) && !isAsyncLoad(op2)) {
     return false;
   }
+  // Filter if both operands are an AsyncLoad
+  if (isAsyncLoad(op1) && isAsyncLoad(op2)) {
+    return true;
+  }
 
-  Value op1Memdesc = getMemdescValue(op1);
-  Value op2Memdesc = getMemdescValue(op2);
-  if (!op1Memdesc || !op2Memdesc)
+  SmallVector<Value> op1Memdescs = getMemdescValues(op1);
+  SmallVector<Value> op2Memdescs = getMemdescValues(op2);
+  if (op1Memdescs.empty() || op2Memdescs.empty())
     return false;
-  auto op1BufferIds = allocation->getAllBufferIdsWithAliases(op1Memdesc);
-  auto op2BufferIds = allocation->getAllBufferIdsWithAliases(op2Memdesc);
+
+  auto collectBufferIds = [&](ArrayRef<Value> memdescs) {
+    Allocation::BufferIdSetT bufferIds;
+    for (Value memdesc : memdescs) {
+      auto ids = allocation->getAllBufferIdsWithAliases(memdesc);
+      bufferIds.insert(ids.begin(), ids.end());
+    }
+    return bufferIds;
+  };
+  auto op1BufferIds = collectBufferIds(op1Memdescs);
+  auto op2BufferIds = collectBufferIds(op2Memdescs);
 
   // Check if operations access the same buffer
   bool sameBuffer = llvm::any_of(
-      op1BufferIds, [&](auto id) { return op2BufferIds.count(id); });
+      op1BufferIds, [&](auto id) { return op2BufferIds.contains(id); });
 
   if (!sameBuffer)
     return false;
 
-  return true;
+  // Filter only the RAW direction: the AsyncWait orders the synced LocalLoad
+  // after the AsyncLoad, but not a later refill of the same buffer (WAR).
+  return isLocalLoadWithAsyncWaitToken(op2);
+}
+
+// A deliberately narrow reuse rule. Equal concrete tensor types select
+// equal shared swizzles, and equal allocation intervals select the same base.
+// Warp-local, injective layouts therefore give both conversions the same
+// disjoint per-wave byte partitions. Membar pairs this proof with a leading
+// wave fence only when allocated scratch has an unsynchronized read-to-write
+// dependency, without rendezvousing waves.
+bool filterWarpLocalScratchReuse(Operation *op1, Operation *op2,
+                                 Allocation *allocation) {
+  auto first = dyn_cast<triton::gpu::ConvertLayoutOp>(op1);
+  auto second = dyn_cast<triton::gpu::ConvertLayoutOp>(op2);
+  if (!first || !second || op1 == op2 || op1->getBlock() != op2->getBlock() ||
+      !op1->isBeforeInBlock(op2))
+    return false;
+  auto srcTy = cast<RankedTensorType>(first.getSrc().getType());
+  auto dstTy = cast<RankedTensorType>(first.getType());
+  if (!srcTy.getEncoding() || !dstTy.getEncoding() ||
+      srcTy != second.getSrc().getType() || dstTy != second.getType())
+    return false;
+
+  auto firstId = allocation->getBufferId(op1);
+  auto secondId = allocation->getBufferId(op2);
+  if (firstId == Allocation::InvalidBufferId ||
+      secondId == Allocation::InvalidBufferId)
+    return false;
+  auto interval = allocation->getAllocatedInterval(firstId);
+  if (interval != allocation->getAllocatedInterval(secondId))
+    return false;
+
+  // Restrict this first rule to one complete, non-broadcast scratch image.
+  // Partial/repeated scratch images need their physical wave partition proved
+  // separately; different bases cannot be accepted on logical layout alone.
+  auto elemTy = srcTy.getElementType();
+  if (!elemTy.isIntOrFloat())
+    return false;
+  unsigned bitwidth = elemTy.getIntOrFloatBitWidth();
+  if ((bitwidth != 8 && bitwidth != 16 && bitwidth != 32 && bitwidth != 64) ||
+      interval.size() != srcTy.getNumElements() * (bitwidth / 8))
+    return false;
+  auto srcLayout = triton::gpu::toLinearLayout(srcTy);
+  auto dstLayout = triton::gpu::toLinearLayout(dstTy);
+  if (!srcLayout.isInjective() || !dstLayout.isInjective())
+    return false;
+  // Equal types can select different lowerings through forceWarpShuffle.
+  // Both operations must actually use the shared-memory scratch image.
+  if (!mlir::cvtNeedsSharedMemory(first) || !mlir::cvtNeedsSharedMemory(second))
+    return false;
+  auto warp = StringAttr::get(op1->getContext(), "warp");
+  return mlir::isCvtDimSync(srcTy, dstTy, warp);
 }
 
 bool filterLDSMemoryBarriersDependencies(Operation *op1, Operation *op2) {
@@ -69,11 +146,24 @@ bool filterLDSMemoryBarriersDependencies(Operation *op1, Operation *op2) {
 }
 } // namespace
 
-bool membarFilter(Operation *op1, Operation *op2, bool op1IsRead,
-                  bool op2IsRead, Allocation *allocation) {
-  return (filterAsyncLocalLoadsDependencies(op1, op2, op1IsRead, op2IsRead,
-                                            allocation) ||
+bool membarFilter(Operation *op1, Operation *op2, bool /*op1IsRead*/,
+                  bool /*op2IsRead*/, Allocation *allocation,
+                  const AllocationSlice &, const AllocationSlice &) {
+  return (filterAsyncLocalLoadsDependencies(op1, op2, allocation) ||
           filterLDSMemoryBarriersDependencies(op1, op2));
+}
+
+MembarScratchSync getWarpLocalScratchSync() {
+  return {filterWarpLocalScratchReuse, [](Operation *op, OpBuilder &builder) {
+            // Repeated Membar runs retain the real fence rather than trusting
+            // an input attribute to stand for synchronization.
+            auto previous =
+                dyn_cast_or_null<LLVM::CallIntrinsicOp>(op->getPrevNode());
+            if (previous && previous.getIntrin() == "llvm.amdgcn.wave.barrier")
+              return;
+            LLVM::createLLVMIntrinsicCallOp(builder, op->getLoc(),
+                                            "llvm.amdgcn.wave.barrier", {}, {});
+          }};
 }
 
 namespace {
@@ -92,5 +182,18 @@ void registerSchedulingBarrierExternalModel(DialectRegistry &registry) {
     ROCDL::SchedGroupBarrier::attachInterface<
         SchedulingBarrierModel<ROCDL::SchedGroupBarrier>>(*ctx);
   });
+}
+
+triton::BarrierStages AMDMembarAnalysis::getBarrierStages(Operation *op) {
+  // By convention no shared-memory access sits between the signal and its
+  // wait, so the signal is the earliest point synchronizing earlier accesses.
+  // This also lets an async wait right before the signal defer to it.
+  if (isa<triton::amdgpu::WorkgroupBarrierSignalOp,
+          triton::amdgpu::WorkgroupBarrierWaitOp>(op)) {
+    triton::BarrierStages stages;
+    stages.beforeMemoryEffects = true;
+    return stages;
+  }
+  return MembarAnalysis::getBarrierStages(op);
 }
 } // namespace mlir::triton::AMD

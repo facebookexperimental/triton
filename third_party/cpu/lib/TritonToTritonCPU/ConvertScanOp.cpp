@@ -43,6 +43,15 @@ struct ScanOpConversion
     : public ReduceScanOpConversionBase<triton::ScanOp, triton::ScanReturnOp> {
   using ReduceScanOpConversionBase::ReduceScanOpConversionBase;
 
+  LogicalResult
+  matchAndRewrite(triton::ScanOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (auto ordering = op.getReductionOrderingAttr();
+        ordering && ordering.getValue() != "unordered")
+      return op.emitError("ordered scans are not supported by the CPU backend");
+    return ReduceScanOpConversionBase::matchAndRewrite(op, adaptor, rewriter);
+  }
+
   SmallVector<Value>
   lower1DInput(ValueRange inputs, ScanOp op,
                ConversionPatternRewriter &rewriter) const override {

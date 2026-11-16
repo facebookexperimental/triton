@@ -311,15 +311,16 @@ tt.func public @tdm_store_pinned_allocation_encoding(%desc: !tt.tensordesc<32x32
 // -----
 // Pins nested inside a partitioned layout are normalized before descriptor
 // assignment and verification as well.
-#padded = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+#padded = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [64, 32]}>
 #pinned_inner = #tlx.user_layout<#padded>
 #partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #pinned_inner}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
-// CHECK-DAG: #[[$PARTITIONED_TDM_PADDED:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-DAG: #[[$PARTITIONED_TDM_PADDED:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [64, 32]}>
+// CHECK-DAG: #[[$PARTITIONED_TDM:.*]] = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #[[$PARTITIONED_TDM_PADDED]]}>
 // CHECK-LABEL: @tdm_load_partitioned_pinned_inner_encoding
 tt.func public @tdm_load_partitioned_pinned_inner_encoding(%desc: !tt.tensordesc<128x32xf16>) {
-  // CHECK-SAME: %[[PARTITIONED_DESC:.*]]: !tt.tensordesc<128x32xf16, #[[$PARTITIONED_TDM_PADDED]]>
+  // CHECK-SAME: %[[PARTITIONED_DESC:.*]]: !tt.tensordesc<128x32xf16, #[[$PARTITIONED_TDM]]>
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<128x32xf16, #partitioned, #smem, mutable>
   // CHECK: amdg.async_tdm_copy_global_to_local %[[PARTITIONED_DESC]] into
   %token = amdg.async_tdm_copy_global_to_local %desc into %alloc : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #partitioned, #smem, mutable>

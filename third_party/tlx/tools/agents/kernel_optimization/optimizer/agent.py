@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import math
 import re
 import subprocess
 import tempfile
@@ -18,6 +19,7 @@ from ..contracts import (
     ChangeScope,
     DiagnosticEvidence,
     ExperimentKind,
+    ExperimentSummary,
     JsonValue,
     KernelOptimizationRequest,
     PerformanceSummary,
@@ -35,7 +37,7 @@ from .source import (
     source_digest,
     validate_replacement_source,
 )
-from .strategy import OPTIMIZATION_STRATEGY
+from .strategy import CANDIDATE_ONLY_STRATEGY, OPTIMIZATION_STRATEGY
 
 _SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
 _LAYOUT_CONVERSION_SKILL = _SKILLS_ROOT / "common/layout-conversion-efficiency.md"
@@ -549,6 +551,97 @@ class CandidateContext:
     research_evidence: tuple[ResearchEvidence, ...] = ()
     local_search_failure_streak: int = 0
     source_research_saturation_threshold: int = 1
+    incumbent_experiment: ExperimentSummary | None = None
+    recent_experiments: tuple[ExperimentSummary, ...] = ()
+    remaining_seconds: float | None = None
+    candidate_only: bool = False
+
+
+MAX_RECENT_EXPERIMENTS = 8
+_MAX_SEARCH_CASES = 16
+_MAX_SEARCH_TEXT = 240
+
+
+def _finite_prompt_number(value: float | None) -> float | None:
+    return value if value is not None and math.isfinite(value) else None
+
+
+def _search_experiment_projection(experiment: ExperimentSummary) -> dict[str, object]:
+    payload: dict[str, object] = {
+        name: getattr(experiment, name)[:_MAX_SEARCH_TEXT]
+        for name in (
+            "experiment_id",
+            "status",
+            "mutation_summary",
+            "hypothesis",
+            "hypothesis_kind",
+            "escalation_reason",
+            "evidence",
+            "expected_effect",
+            "risk",
+        )
+    }
+    payload.update(
+        parent_id=(
+            experiment.parent_id[:_MAX_SEARCH_TEXT] if experiment.parent_id else None
+        ),
+        experiment_kind=experiment.experiment_kind.value,
+        diagnostics=experiment.diagnostics[:960],
+        decision=(
+            {
+                "status": experiment.decision.status.value,
+                "rationale": experiment.decision.rationale[:_MAX_SEARCH_TEXT],
+                "feedback": experiment.decision.feedback[:_MAX_SEARCH_TEXT],
+            }
+            if experiment.decision
+            else None
+        ),
+    )
+    performance = experiment.performance
+    payload["baseline_relative_speedup"] = (
+        _finite_prompt_number(performance.aggregate_speedup) if performance else None
+    )
+    payload["cases"] = [
+        {
+            "case_id": case.case_id[:_MAX_SEARCH_TEXT],
+            "correct": case.verification.passed,
+            "median_us": (
+                _finite_prompt_number(case.timing.median_us) if case.timing else None
+            ),
+            "cv": (
+                _finite_prompt_number(case.timing.coefficient_of_variation)
+                if case.timing
+                else None
+            ),
+        }
+        for case in (performance.cases[:_MAX_SEARCH_CASES] if performance else ())
+    ]
+    return payload
+
+
+def _search_context_prompt_block(context: CandidateContext) -> str:
+    payload = {
+        "action_index": context.action_index,
+        "remaining_agent_actions_including_current": context.remaining_agent_actions,
+        "remaining_seconds_including_baseline_cost": _finite_prompt_number(
+            context.remaining_seconds
+        ),
+        "incumbent": (
+            _search_experiment_projection(context.incumbent_experiment)
+            if context.incumbent_experiment
+            else None
+        ),
+        "recent_experiments": [
+            _search_experiment_projection(experiment)
+            for experiment in context.recent_experiments[-MAX_RECENT_EXPERIMENTS:]
+        ],
+    }
+    return (
+        "\nCurrent-run search context:\n"
+        "Speedups are baseline-relative. Proposal explanations are hypotheses, not proven causes.\n"
+        "The incumbent is retained separately from the bounded recent window.\n"
+        "```json\n" + json.dumps(payload, sort_keys=True, allow_nan=False) + "\n```\n"
+    )
 
 
 class CandidateProvider(Protocol):
@@ -1054,6 +1147,10 @@ class CodexCandidateProvider:
                     allowed_case_ids=tuple(case.case_id for case in request.cases),
                 )
                 if not isinstance(action, str):
+                    if context.candidate_only:
+                        raise ValueError(
+                            "candidate-only context requires a candidate action"
+                        )
                     if source != context.current_source:
                         raise ValueError(
                             "non-candidate agent actions must leave candidate.py unchanged"
@@ -1295,7 +1392,11 @@ def _agent_action_prompt_block(
             "hypothesis": "one line under 240 characters",
             "hypothesis_kind": "parameter | memory_layout | pipeline | topology | synchronization | compiler_layout | algorithmic | unknown",
             "escalation_reason": "optional one-line reason for moving beyond local tuning",
-            "research_evidence_ids": ["source research action IDs used by this hypothesis"],
+            "research_evidence_ids": (
+                []
+                if context.candidate_only
+                else ["source research action IDs used by this hypothesis"]
+            ),
             "evidence": "one line under 240 characters",
             "change": "one line under 240 characters",
             "expected_effect": "one line under 240 characters",
@@ -1314,6 +1415,38 @@ def _agent_action_prompt_block(
         },
         indent=2,
     )
+    candidate_protocol = f"""
+For a candidate, use exactly this `agent_action.json` schema:
+```json
+{candidate_action}
+```
+Then edit `candidate.py` as the complete replacement source and write
+`candidate_metadata.json` using this schema:
+```json
+{metadata}
+```
+You may also add the existing optional `profiling_hint` object with `pass_name`, string
+arrays `expected_regions` and `case_ids`, and a one-line `rationale`. Compare `original.py`
+to final `candidate.py`; base metadata only on that final unified diff. The first five
+metadata strings must each be one line under 240 characters. `commit_title` must be an
+imperative line under 80 characters that precisely describes the actual change. Avoid
+performance claims, attribution, or vague titles such as "Optimize kernel".
+`commit_summary` must be under 4000 characters and contain exactly the labeled
+`Change summary:` and `Why:` sections. Name at least one changed top-level function, class,
+or module variable exactly, state preserved invariants or fallback paths, and do not include
+`Performance:` or `TLX agent authored`. The external harness adds authoritative performance.
+"""
+    if context.candidate_only:
+        return f"""
+Agent action protocol (schema version {_AGENT_ACTION_SCHEMA_VERSION}):
+Only candidate submissions are supported by this controller. Choose one testable source edit.
+Never include execution controls, raw source, or patches in `agent_action.json`;
+the external harness owns execution. Leave `research_evidence_ids` empty when no evidence exists.
+Current source digest: {current_digest}
+Action index (global, zero-based): {context.action_index}
+Remaining candidate calls (including this call): {context.remaining_agent_actions}
+{candidate_protocol}
+"""
     saturation_reached = (
         context.local_search_failure_streak
         >= context.source_research_saturation_threshold
@@ -1379,27 +1512,7 @@ Remaining source research actions: {context.remaining_source_research_actions}
 Consecutive rejected candidates without research evidence: {context.local_search_failure_streak}
 Source research saturation threshold: {context.source_research_saturation_threshold}
 Saturation guidance: {saturation_guidance}
-
-For a candidate, use exactly this `agent_action.json` schema:
-```json
-{candidate_action}
-```
-Then edit `candidate.py` as the complete replacement source and write
-`candidate_metadata.json` using this schema:
-```json
-{metadata}
-```
-You may also add the existing optional `profiling_hint` object with `pass_name`, string
-arrays `expected_regions` and `case_ids`, and a one-line `rationale`. Compare `original.py`
-to final `candidate.py`; base metadata only on that final unified diff. The first five
-metadata strings must each be one line under 240 characters. `commit_title` must be an
-imperative line under 80 characters that precisely describes the actual change. Avoid
-performance claims, attribution, or vague titles such as "Optimize kernel".
-`commit_summary` must be under 4000 characters and contain exactly the labeled
-`Change summary:` and `Why:` sections. Name at least one changed top-level function, class,
-or module variable exactly, state preserved invariants or fallback paths, and do not include
-`Performance:` or `TLX agent authored`. The external harness adds authoritative performance.
-
+{candidate_protocol}
 For an NCU diagnostic, use exactly this `agent_action.json` schema:
 ```json
 {ncu_action}
@@ -1584,10 +1697,14 @@ def _build_prompt(
     diagnostic_evidence_block = _diagnostic_evidence_prompt_block(context)
     diagnostic_history_block = _agent_diagnostic_history_prompt_block(context)
     research_history_block = _agent_research_history_prompt_block(context)
+    search_context_block = _search_context_prompt_block(context)
+    strategy = (
+        CANDIDATE_ONLY_STRATEGY if context.candidate_only else OPTIMIZATION_STRATEGY
+    )
     action_protocol_block = _agent_action_prompt_block(context, current_digest)
     return f"""{TLX_PROMPT_PREAMBLE}
 Optimization strategy:
-{OPTIMIZATION_STRATEGY}
+{strategy}
 {target_knowledge_block}{guidance_block}{reference_block}{prior_run_block}
 You are choosing the next action for the closed loop `build -> verify -> benchmark -> profile -> propose -> repeat`.
 Do not return source or a diff, and do not claim correctness or performance; an external
@@ -1607,6 +1724,7 @@ Current measurements:
 {diagnostic_evidence_block}
 {diagnostic_history_block}
 {research_history_block}
+{search_context_block}
 Recent failed-candidate diagnostics:
 {diagnostics}
 

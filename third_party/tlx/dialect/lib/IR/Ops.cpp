@@ -53,14 +53,31 @@ OpFoldResult RequireLayoutOp::fold(FoldAdaptor) {
 //-- ReleaseLayoutOp --
 
 OpFoldResult ReleaseLayoutOp::fold(FoldAdaptor) {
-  if (getType() == getSrc().getType()) {
-    // no-op
+  if (getType() == getSrc().getType() &&
+      (getRelaxed() || !getType().getEncoding())) {
+    // A relaxed release or an encoding-free release has no boundary to keep.
     return getSrc();
   }
   return {};
 }
 
 //-- StorageAliasSpecOp --
+
+// Each storage_alias_spec is a distinct logical buffer group. Emit an
+// unconditional Allocate effect so CSE never merges two specs with identical
+// attributes (which would collapse separate reuse groups into one), while
+// still allowing dead specs to be erased by DCE.
+void StorageAliasSpecOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  OpResult spec = getOperation()->getOpResult(0);
+  if (getStorage() == StorageKind::tmem)
+    effects.emplace_back(MemoryEffects::Allocate::get(), spec,
+                         ::mlir::triton::nvidia_gpu::TensorMemory::get());
+  else
+    effects.emplace_back(MemoryEffects::Allocate::get(), spec,
+                         ::mlir::triton::gpu::SharedMemory::get());
+}
 
 LogicalResult StorageAliasSpecOp::verify() {
   // Verify storage kind is valid for storage alias specs (smemCluster not

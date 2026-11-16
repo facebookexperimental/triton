@@ -346,6 +346,11 @@ std::vector<ttng::WarpGroupDotOp> splitRSDot(ttng::WarpGroupDotOp dotOp) {
   if (origK <= instrK) {
     return {dotOp};
   }
+  // splitLhs's reshape/trans/split chain infers binary layouts only, so a
+  // mixed-radix A stays one RS wgmma.
+  if (ttg::toLinearLayout(a.getType()).hasNonPow2OutDim()) {
+    return {dotOp};
+  }
   constexpr int numSplits = 2;
   uint32_t newK = origK / numSplits;
 

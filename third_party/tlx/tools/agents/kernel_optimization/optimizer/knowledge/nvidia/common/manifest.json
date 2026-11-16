@@ -4,6 +4,7 @@
   "architectures": [],
   "documents": [
     "async-tma-output-publication.md",
-    "warp-barrier-efficiency.md"
+    "warp-barrier-efficiency.md",
+    "memory-bound-and-autotune-selection.md"
   ]
 }

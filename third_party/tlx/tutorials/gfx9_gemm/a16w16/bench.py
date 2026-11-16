@@ -150,7 +150,7 @@ def provider_defaults(_version):
     return ["rocblas", "tlx"]
 
 
-def launch_tutorial_matmul(module, version_dir, a, b, out=None):
+def launch_tutorial_matmul(module, version_dir, a, b, out=None, schedule_hint=None):
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
     K, N = b.shape
@@ -172,6 +172,8 @@ def launch_tutorial_matmul(module, version_dir, a, b, out=None):
         "num_stages": 1,
         "matrix_instr_nonkdim": 16,
     }
+    if schedule_hint:
+        compile_kwargs["schedule_hint"] = schedule_hint
     if version_dir in GROUPED_PID_VERSIONS:
         compile_kwargs.update({
             "GROUP_SIZE_M": 4,
@@ -198,10 +200,10 @@ def launch_tutorial_matmul(module, version_dir, a, b, out=None):
     return out
 
 
-def provider_matmul(provider, module, version_dir, a, b, out=None):
+def provider_matmul(provider, module, version_dir, a, b, out=None, schedule_hint=None):
     if provider == "rocblas":
         return torch.matmul(a, b, out=out)
-    return launch_tutorial_matmul(module, version_dir, a, b, out=out)
+    return launch_tutorial_matmul(module, version_dir, a, b, out=out, schedule_hint=schedule_hint)
 
 
 def do_bench_batched(
@@ -266,7 +268,7 @@ def benchmark_provider(args, provider, version_dir, a, b, ref, M, N, K):
         if args.arch is not None:
             knobs.runtime.override_arch = args.arch
         c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-        provider_matmul(provider, module, version_dir, a, b, out=c)
+        provider_matmul(provider, module, version_dir, a, b, out=c, schedule_hint=args.schedule_hint)
         torch.cuda.synchronize()
         ok = torch.allclose(c, ref, atol=args.atol, rtol=args.rtol)
         max_err = (c - ref).abs().max().item()
@@ -281,7 +283,7 @@ def benchmark_provider(args, provider, version_dir, a, b, ref, M, N, K):
             }
         ms = measure_provider(
             args,
-            lambda: provider_matmul(provider, module, version_dir, a, b, out=c),
+            lambda: provider_matmul(provider, module, version_dir, a, b, out=c, schedule_hint=args.schedule_hint),
         )
     return {
         "ok": True,
@@ -497,6 +499,13 @@ def main():
     parser.add_argument("--atol", type=float, default=3e-1)
     parser.add_argument("--rtol", type=float, default=0.0)
     parser.add_argument("--arch", default=None, help="optional Triton runtime arch override")
+    parser.add_argument(
+        "--schedule-hint",
+        default="",
+        choices=("", "mfma-schedule"),
+        help="AMD backend scheduling hint for the TLX kernel; mfma-schedule runs the gfx950 MFMA scheduler "
+        "(4-wave kernels only, see the README)",
+    )
     parser.add_argument("--cache-dir", default=None, help="optional Triton cache root")
     parser.add_argument(
         "--compile-workers",

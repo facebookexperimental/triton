@@ -1,0 +1,41 @@
+{
+  "platforms": {
+    "h100": {
+      "core": [
+        "python/test/unit/language/test_tlx_*_any.py",
+        "python/test/unit/language/test_tlx_*sm90up*.py",
+        "python/test/unit/language/test_tlx_*sm90.py",
+        "python/test/unit/tlx_ops/test_*_sm90.py"
+      ],
+      "runtime": [
+        "python/test/unit/runtime/"
+      ]
+    },
+    "b200": {
+      "core": [
+        "python/test/unit/language/test_tlx_*_any.py",
+        "python/test/unit/language/test_tlx_*sm90up*.py",
+        "python/test/unit/language/test_tlx_*sm100*.py",
+        "python/test/unit/tlx_ops/test_*_sm100.py"
+      ],
+      "codegen": [
+        "python/test/unit/language/test_tlx_codegen.py"
+      ],
+      "gluon": [
+        "python/test/gluon/"
+      ]
+    },
+    "mi350": {
+      "core": [
+        "python/test/unit/language/test_tlx_*_any.py",
+        "python/test/unit/language/test_tlx_*hip*.py",
+        "python/test/unit/language/test_tlx_*gfx950*.py",
+        "python/test/unit/tlx_ops/test_*_hip.py",
+        "python/test/unit/tlx_ops/test_*_gfx950.py"
+      ],
+      "gluon": [
+        "python/test/gluon/"
+      ]
+    }
+  }
+}

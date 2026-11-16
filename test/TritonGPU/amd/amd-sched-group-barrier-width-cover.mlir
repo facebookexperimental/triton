@@ -13,7 +13,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   tt.func @dwordx4(
       %ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
       %offsets: tensor<1024xi32, #blocked> {tt.contiguity = 4 : i32, tt.divisibility = 16 : i32}) {
-    %result = amdg.buffer_load %ptr[%offsets] : tensor<1024xf32, #blocked>
+    %result = amdg.buffer_load %ptr[%offsets] : !tt.ptr<f32> -> tensor<1024xf32, #blocked>
     tt.return
   }
 }
@@ -30,7 +30,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   tt.func @dwordx2(
       %ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
       %offsets: tensor<512xi32, #blocked> {tt.contiguity = 2 : i32, tt.divisibility = 16 : i32}) {
-    %result = amdg.buffer_load %ptr[%offsets] : tensor<512xf32, #blocked>
+    %result = amdg.buffer_load %ptr[%offsets] : !tt.ptr<f32> -> tensor<512xf32, #blocked>
     tt.return
   }
 }
@@ -47,7 +47,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   tt.func @dword(
       %ptr: !tt.ptr<f32> {tt.divisibility = 16 : i32},
       %offsets: tensor<256xi32, #blocked> {tt.contiguity = 1 : i32, tt.divisibility = 16 : i32}) {
-    %result = amdg.buffer_load %ptr[%offsets] : tensor<256xf32, #blocked>
+    %result = amdg.buffer_load %ptr[%offsets] : !tt.ptr<f32> -> tensor<256xf32, #blocked>
     tt.return
   }
 }

@@ -793,8 +793,8 @@ lowerLoadToStagedCopy(scf::ForOp forOp, triton::LoadOp ld,
   auto viewLoad = triton::createSingleBufferView(b, alloc, 0)
                       .getDefiningOp<triton::gpu::MemDescIndexOp>();
   auto copyOp = triton::gpu::AsyncCopyGlobalToLocalOp::create(
-      b, loc, ld.getPtr(), viewLoad, ld.getMask(), ld.getOther(), ld.getCache(),
-      ld.getEvict(), ld.getIsVolatile(), /*contiguity=*/1);
+      b, loc, ld.getPtr(), viewLoad, ld.getMask(), ld.getOther(),
+      ld.getCachePolicyAttr(), ld.getIsVolatile(), /*contiguity=*/1);
   auto commitOp =
       triton::gpu::AsyncCommitGroupOp::create(b, loc, copyOp->getResult(0));
   auto waitOp =

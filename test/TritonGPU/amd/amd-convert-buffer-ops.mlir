@@ -215,10 +215,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %4 = tt.addptr %3, %1 : tensor<16x!tt.ptr<bf16>, #blocked>, tensor<16xi32, #blocked>
     %5 = tt.splat %arg1 : !tt.ptr<bf16> -> tensor<16x!tt.ptr<bf16>, #blocked>
     %6 = tt.addptr %5, %1 : tensor<16x!tt.ptr<bf16>, #blocked>, tensor<16xi32, #blocked>
-    // COMMON: %[[loaded:.*]] = amdg.buffer_load %arg1[%1]
-    %7 = tt.load %6 : tensor<16x!tt.ptr<bf16>, #blocked>
-    // COMMON: amdg.buffer_store %[[loaded]], %[[ptr]][%[[range]]]
-    tt.store %4, %7 : tensor<16x!tt.ptr<bf16>, #blocked>
+    // COMMON: %[[loaded:.*]] = amdg.buffer_load %arg1[%1] {cachePolicy = #ttng.cache_policy<l1 = evict_last>}
+    %7 = tt.load %6 {cachePolicy = #ttng.cache_policy<l1 = evict_last>} : tensor<16x!tt.ptr<bf16>, #blocked>
+    // COMMON: amdg.buffer_store %[[loaded]], %[[ptr]][%[[range]]] {cachePolicy = #ttng.cache_policy<l1 = evict_last>}
+    tt.store %4, %7 {cachePolicy = #ttng.cache_policy<l1 = evict_last>} : tensor<16x!tt.ptr<bf16>, #blocked>
     tt.return
   }
 }
@@ -336,18 +336,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 #blocked = #ttg.blocked<{sizePerThread = [2, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
-#blocked2 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
-#blocked3 = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
-  // COMMON-LABEL: join_cat_transitive_nonneg
-  tt.func @join_cat_transitive_nonneg(%arg0: !tt.ptr<bf16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg1: !tt.ptr<bf16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}) {
+  // COMMON-LABEL: join_transitive_nonneg
+  tt.func @join_transitive_nonneg(%arg0: !tt.ptr<bf16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg1: !tt.ptr<bf16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}) {
     %0 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #blocked1>
     %1 = tt.make_range {end = 10 : i32, start = 2 : i32} : tensor<8xi32, #blocked1>
     %2 = tt.join %0, %1 : tensor<8xi32, #blocked1> -> tensor<8x2xi32, #blocked>
-    %3 = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32, #blocked2>
-    %4 = tt.make_range {end = 8 : i32, start = 4 : i32} : tensor<4xi32, #blocked2>
-    %5 = tt.join %3, %4 : tensor<4xi32, #blocked2> -> tensor<4x2xi32, #blocked3>
-    %6 = tt.cat %5, %5 : tensor<4x2xi32, #blocked3> -> tensor<8x2xi32, #blocked>
+    %6 = tt.join %0, %0 : tensor<8xi32, #blocked1> -> tensor<8x2xi32, #blocked>
     %7 = arith.addi %2, %6 : tensor<8x2xi32, #blocked>
     %zeros = arith.constant dense<0> : tensor<8x1xi32, #blocked>
     %ones = arith.constant dense<1> : tensor<8x1xi32, #blocked>
@@ -798,17 +793,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     // CDNA: %[[buffer:.*]] = amdg.buffer_load_to_local %[[ptr]][%[[offset]]] mask = %arg11 other = %arg12 stride = %arg[[#stride]] into %arg10
     %15 = ttg.async_copy_global_to_local %11, %arg10 mask %arg11 other %arg12 : tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>
 
-    // CDNA: %[[buffer:.*]] = amdg.buffer_load_to_local %[[ptr]][%[[offset]]] mask = %arg11 other = %arg12 stride = %arg[[#stride]] cacheModifier = ca into %arg10
-    %16 = ttg.async_copy_global_to_local %11, %arg10 mask %arg11 other %arg12 cacheModifier = ca: tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>
+    // CDNA: %[[buffer:.*]] = amdg.buffer_load_to_local %[[ptr]][%[[offset]]] mask = %arg11 other = %arg12 stride = %arg[[#stride]] cachePolicy = #tt.cache_policy<cache_modifier = ca, eviction_policy = evict_normal> into %arg10
+    %16 = ttg.async_copy_global_to_local %11, %arg10 mask %arg11 other %arg12 {cachePolicy = #tt.cache_policy<cache_modifier = ca, eviction_policy = evict_normal>}: tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>
 
-    // CDNA: %[[buffer:.*]] = amdg.buffer_load_to_local %[[ptr]][%[[offset]]] mask = %arg11 other = %arg12 stride = %arg[[#stride]] cacheModifier = cg into %arg10
-    %17 = ttg.async_copy_global_to_local %11, %arg10 mask %arg11 other %arg12 cacheModifier = cg: tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>
+    // CDNA: %[[buffer:.*]] = amdg.buffer_load_to_local %[[ptr]][%[[offset]]] mask = %arg11 other = %arg12 stride = %arg[[#stride]] cachePolicy = #tt.cache_policy<cache_modifier = cg, eviction_policy = evict_normal> into %arg10
+    %17 = ttg.async_copy_global_to_local %11, %arg10 mask %arg11 other %arg12 {cachePolicy = #tt.cache_policy<cache_modifier = cg, eviction_policy = evict_normal>}: tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>
 
-    // CDNA: %[[buffer:.*]] = amdg.buffer_load_to_local %[[ptr]][%[[offset]]] mask = %arg11 other = %arg12 stride = %arg[[#stride]] cacheModifier = cv into %arg10
-    %18 = ttg.async_copy_global_to_local %11, %arg10 mask %arg11 other %arg12 cacheModifier = cv: tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>
+    // CDNA: %[[buffer:.*]] = amdg.buffer_load_to_local %[[ptr]][%[[offset]]] mask = %arg11 other = %arg12 stride = %arg[[#stride]] cachePolicy = #tt.cache_policy<cache_modifier = cv, eviction_policy = evict_normal> into %arg10
+    %18 = ttg.async_copy_global_to_local %11, %arg10 mask %arg11 other %arg12 {cachePolicy = #tt.cache_policy<cache_modifier = cv, eviction_policy = evict_normal>}: tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>
+
+    // CDNA: %[[buffer:.*]] = amdg.buffer_load_to_local %[[ptr]][%[[offset]]] stride = %arg[[#stride]] cachePolicy = #ttng.cache_policy<l1 = evict_last> into %arg10
+    %19 = ttg.async_copy_global_to_local %11, %arg10 {cachePolicy = #ttng.cache_policy<l1 = evict_last>} : tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>
 
     // CDNA: %[[buffer:.*]] = amdg.buffer_load_to_local %[[ptr]][%[[offset]]] stride = %arg[[#stride]] into %arg10 {contiguity = 8 : i32
-    %19 = ttg.async_copy_global_to_local %11, %arg10 {contiguity = 8 : i32} : tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>
+    %20 = ttg.async_copy_global_to_local %11, %arg10 {contiguity = 8 : i32} : tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }
@@ -834,7 +832,7 @@ module attributes {"ttg.compute-capability" = 0 : i32, "ttg.num-ctas" = 1 : i32,
 // COMMON:    %[[VAR_0:.*]] = arith.constant dense<0> : tensor<256x256xi64, #blocked>
 // COMMON:    %[[VAR_1:.*]] = amdg.extract_slice %[[VAR_0]] [0, 0] : tensor<256x256xi64, #blocked> to tensor<128x256xi64, #blocked>
 // COMMON:    %[[VAR_2:.*]] = arith.trunci %[[VAR_1]] : tensor<128x256xi64, #blocked> to tensor<128x256xi32, #blocked>
-// COMMON:    %[[VAR_3:.*]] = amdg.buffer_load %[[ARG_0]][%[[VAR_2]]] : tensor<128x256xf32, #blocked>
+// COMMON:    %[[VAR_3:.*]] = amdg.buffer_load %[[ARG_0]][%[[VAR_2]]] : !tt.ptr<f32> -> tensor<128x256xf32, #blocked>
 // COMMON:    tt.return %[[VAR_3]] : tensor<128x256xf32, #blocked>
 // COMMON:  }
 
@@ -894,12 +892,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %9 = tt.splat %8 : !tt.ptr<i64> -> tensor<64x!tt.ptr<i64>, #blocked>
     %10 = tt.addptr %9, %2 : tensor<64x!tt.ptr<i64>, #blocked>, tensor<64xi32, #blocked>
     %11 = tt.load %10, %cst : tensor<64x!tt.ptr<i64>, #blocked>
-    // COMMON: amdg.buffer_load %[[ptr1:.*]][%[[ofst1:.*]]], %[[mask1:.*]] : tensor<64xi64, #blocked>
+    // COMMON: amdg.buffer_load %[[ptr1:.*]][%[[ofst1:.*]]], %[[mask1:.*]] : !tt.ptr<i64> -> tensor<64xi64, #blocked>
     %12 = tt.addptr %in_ptr, %1 : !tt.ptr<f32>, i32
     %13 = tt.splat %12 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
     %14 = tt.addptr %13, %2 : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
     %15 = tt.load %14, %cst : tensor<64x!tt.ptr<f32>, #blocked>
-    // COMMON: amdg.buffer_load %[[ptr2:.*]][%[[ofst2:.*]]], %[[mask2:.*]] : tensor<64xf32, #blocked>
+    // COMMON: amdg.buffer_load %[[ptr2:.*]][%[[ofst2:.*]]], %[[mask2:.*]] : !tt.ptr<f32> -> tensor<64xf32, #blocked>
     %16 = arith.extsi %7 : tensor<64xi32, #blocked> to tensor<64xi64, #blocked>
     %17 = arith.addi %11, %16 : tensor<64xi64, #blocked>
     %18 = arith.trunci %17 : tensor<64xi64, #blocked> to tensor<64xi32, #blocked>
@@ -933,18 +931,88 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %9 = tt.splat %8 : !tt.ptr<i64> -> tensor<64x!tt.ptr<i64>, #blocked>
     %10 = tt.addptr %9, %2 : tensor<64x!tt.ptr<i64>, #blocked>, tensor<64xi32, #blocked>
     %11 = tt.load %10, %cst : tensor<64x!tt.ptr<i64>, #blocked>
-    // COMMON: amdg.buffer_load %[[ptr1:.*]][%[[ofst1:.*]]] : tensor<64xi64, #blocked>
+    // COMMON: amdg.buffer_load %[[ptr1:.*]][%[[ofst1:.*]]] : !tt.ptr<i64> -> tensor<64xi64, #blocked>
     %12 = tt.addptr %in_ptr, %1 : !tt.ptr<f32>, i32
     %13 = tt.splat %12 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
     %14 = tt.addptr %13, %2 : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
     %15 = tt.load %14, %cst : tensor<64x!tt.ptr<f32>, #blocked>
-    // COMMON: amdg.buffer_load %[[ptr2:.*]][%[[ofst2:.*]]] : tensor<64xf32, #blocked>
+    // COMMON: amdg.buffer_load %[[ptr2:.*]][%[[ofst2:.*]]] : !tt.ptr<f32> -> tensor<64xf32, #blocked>
     %16 = arith.extsi %7 : tensor<64xi32, #blocked> to tensor<64xi64, #blocked>
     %17 = arith.addi %11, %16 : tensor<64xi64, #blocked>
     %18 = arith.trunci %17 : tensor<64xi64, #blocked> to tensor<64xi32, #blocked>
     %19 = tt.splat %out_ptr : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
     %20 = tt.addptr %19, %18 : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
     %21 = tt.atomic_rmw fadd, relaxed, gpu, %20, %15, %cst : (tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xf32, #blocked>, tensor<64xi1, #blocked>) -> tensor<64xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// Volatile loads cannot use buffer intrinsics, which cannot express volatile
+// semantics. The non-volatile control load converts, proving the pointers are
+// buffer-eligible; the volatile load must stay a tt.load.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // COMMON-LABEL: volatile_load_skips_buffer_load
+  tt.func @volatile_load_skips_buffer_load(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
+    %0 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #blocked>
+    %1 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>, #blocked>
+    %2 = tt.addptr %1, %0 : tensor<16x!tt.ptr<f32>, #blocked>, tensor<16xi32, #blocked>
+    // COMMON: %[[loaded:.*]] = amdg.buffer_load %arg0[%{{.*}}]
+    %3 = tt.load %2 : tensor<16x!tt.ptr<f32>, #blocked>
+    // COMMON-NOT: amdg.buffer_load
+    // COMMON: %{{.*}} = tt.load %{{.*}} {isVolatile = true}
+    %4 = tt.load %2 {isVolatile = true} : tensor<16x!tt.ptr<f32>, #blocked>
+    %5 = arith.addf %3, %4 : tensor<16xf32, #blocked>
+    %6 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>, #blocked>
+    %7 = tt.addptr %6, %0 : tensor<16x!tt.ptr<f32>, #blocked>, tensor<16xi32, #blocked>
+    tt.store %7, %5 : tensor<16x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// Volatile async copies cannot use buffer_load_to_local, which has no way to
+// express volatility. The non-volatile control copy converts, proving the
+// pointers are buffer-eligible; the volatile copy must stay an async_copy
+// (it is decomposed to a synchronous volatile load by coalesce-async-copy).
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+// COMMON-LABEL: volatile_async_copy_skips_buffer_load_to_local
+  tt.func public @volatile_async_copy_skips_buffer_load_to_local(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg2: !tt.ptr<f16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg3: i32 {tt.divisibility = 16 : i32}, %arg4: i32 {tt.divisibility = 16 : i32}, %arg5: i32 {tt.divisibility = 16 : i32}, %arg6: i32 {tt.divisibility = 16 : i32}, %arg7: i32 {tt.divisibility = 16 : i32}, %arg8: i32 {tt.divisibility = 16 : i32}, %arg9: i32 {tt.divisibility = 16 : i32},
+                                       %arg10: !ttg.memdesc<256x64xf16, #shared, #smem, mutable>) {
+    %c48_i32 = arith.constant 48 : i32
+    %c32_i32 = arith.constant 32 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %0 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %1 = tt.expand_dims %0 {axis = 1 : i32} : tensor<256xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<256x1xi32, #blocked>
+    %cmp = arith.cmpi sgt, %arg6, %c0_i32 : i32
+    llvm.intr.assume %cmp : i1
+    %2 = tt.splat %arg6 : i32 -> tensor<256x1xi32, #blocked>
+    %3 = arith.muli %1, %2 : tensor<256x1xi32, #blocked>
+    %4 = tt.addptr %arg0, %c32_i32 : !tt.ptr<f16>, i32
+    %5 = tt.broadcast %3 : tensor<256x1xi32, #blocked> -> tensor<256x64xi32, #blocked>
+    %6 = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %7 = tt.expand_dims %6 {axis = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x64xi32, #blocked>
+    %8 = tt.broadcast %7 : tensor<1x64xi32, #blocked> -> tensor<256x64xi32, #blocked>
+    %9 = arith.addi %8, %5 : tensor<256x64xi32, #blocked>
+    %10 = tt.splat %4 : !tt.ptr<f16> -> tensor<256x64x!tt.ptr<f16>, #blocked>
+    %11 = tt.addptr %10, %9 : tensor<256x64x!tt.ptr<f16>, #blocked>, tensor<256x64xi32, #blocked>
+
+    %arg6_up = arith.constant 4210752: i32
+    %cmp2 = arith.cmpi slt, %arg6, %arg6_up : i32
+    llvm.intr.assume %cmp2 : i1
+
+    // CDNA: %[[buffer:.*]] = amdg.buffer_load_to_local %[[ptr:.*]][%[[offset:.*]]]{{.*}}into %arg10
+    %12 = ttg.async_copy_global_to_local %11, %arg10 : tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>
+
+    // CDNA-NOT: amdg.buffer_load_to_local
+    // CDNA: ttg.async_copy_global_to_local{{.*}}isVolatile = true
+    %13 = ttg.async_copy_global_to_local %11, %arg10 {isVolatile = true} : tensor<256x64x!tt.ptr<f16>, #blocked> -> <256x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }

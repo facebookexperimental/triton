@@ -48,7 +48,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
   add_triton_plugin(TritonCPU
     ${CMAKE_CURRENT_SOURCE_DIR}/triton_cpu.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/llvm.cc
-    LINK_LIBS TritonToTritonCPU TritonCPUToLLVM TritonCPUTransforms
+    LINK_LIBS TritonToTritonCPU TritonCPUToLLVM TritonCPUTransforms TritonTools
   )
   target_link_libraries(TritonCPU
     PUBLIC
