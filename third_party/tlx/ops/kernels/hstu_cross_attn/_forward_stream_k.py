@@ -265,16 +265,13 @@ def _schedule_softmax_mfma_valu(SYNC_ID: tl.constexpr, MFMA_PER_WAVE: tl.constex
 
 @triton.jit
 def _softmax_lazy_pipeline_step(state, probability_carry, q, kt_dot, k_ptrs, v_ptrs, block_n, k_buf, v_buf, stride_kn,
-                                stride_vn, QK_SCALE: tl.constexpr, BLOCK_M: tl.constexpr,
-                                BLOCK_N: tl.constexpr, CUR_SLOT: tl.constexpr, NEXT_SLOT: tl.constexpr,
-                                RESCALE_THRESHOLD: tl.constexpr):
+                                stride_vn, QK_SCALE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                                CUR_SLOT: tl.constexpr, NEXT_SLOT: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr):
     """One steady-state QK/PV step with the probability carry one block behind QK."""
-    QK_MFMA_PER_WAVE: tl.constexpr = (
-        (BLOCK_M // _MFMA_M * (BLOCK_N // _MFMA_N) // tlx.num_warps()) * (q.shape[1] // _MFMA_K)
-    )
-    PV_MFMA_PER_WAVE: tl.constexpr = (
-        (BLOCK_M // _MFMA_M * (q.shape[1] // _MFMA_N) // tlx.num_warps()) * (BLOCK_N // _MFMA_K)
-    )
+    QK_MFMA_PER_WAVE: tl.constexpr = ((BLOCK_M // _MFMA_M * (BLOCK_N // _MFMA_N) // tlx.num_warps()) *
+                                      (q.shape[1] // _MFMA_K))
+    PV_MFMA_PER_WAVE: tl.constexpr = ((BLOCK_M // _MFMA_M * (q.shape[1] // _MFMA_N) // tlx.num_warps()) *
+                                      (BLOCK_N // _MFMA_K))
     # dot1: compute the next QK and finish the deferred probability fragments from the prior QK.
     with tlx.warp_pipeline_stage("dot1"):
         qk = _qk_pieces(q, kt_dot)
@@ -1106,5 +1103,5 @@ def stream_k_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_offsets:
         IS_SOFTMAX=is_softmax, HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, Z_PAD=z_pad,
         LOG2_Z_PAD=max(1, (z_pad - 1).bit_length()), MAX_SEGMENTS=MAX_SEGMENTS, PHANTOM_BLOCKS=PHANTOM_BLOCKS,
         SHORT_KV_FLOOR_BLOCKS=SHORT_KV_FLOOR_BLOCKS, PIPE_STAGES=PIPE_STAGES,
-        RESCALE_THRESHOLD=LAZY_RESCALE_THRESHOLD.value, num_warps=8, waves_per_eu=2,
-        llvm_fn_attrs=_VGPR_ONLY, enable_sched_group_barrier_scheduler=False, disable_packed_fp32_ops=is_softmax)
+        RESCALE_THRESHOLD=LAZY_RESCALE_THRESHOLD.value, num_warps=8, waves_per_eu=2, llvm_fn_attrs=_VGPR_ONLY,
+        enable_sched_group_barrier_scheduler=False, disable_packed_fp32_ops=is_softmax)
