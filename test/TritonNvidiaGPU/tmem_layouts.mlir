@@ -240,3 +240,57 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     tt.return %3 : f32
   }
 }
+
+// -----
+
+// The split-load rewrite needs a TMEM load layout for the slices, which only
+// exists for a power-of-two warp count >= 4. With 2 warps it must decline
+// instead of crashing.
+#b2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 1], order = [1, 0]}>
+#b2_split = #ttg.blocked<{sizePerThread = [1, 1, 2], threadsPerWarp = [1, 32, 1], warpsPerCTA = [2, 1, 1], order = [2, 1, 0]}>
+#v2 = #tlx.user_layout<#tlx.no_verify_layout<#b2>>
+#v2_split = #tlx.user_layout<#tlx.no_verify_layout<#b2_split>>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @split_load_two_warps
+  // CHECK-NOT: ttng.tmem_subslice
+  // CHECK: ttng.tmem_load
+  // CHECK: tt.reshape
+  // CHECK: tt.trans
+  // CHECK: tt.split
+  // CHECK-NOT: ttng.tmem_subslice
+  tt.func @split_load_two_warps(%src: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>) -> (tensor<128x64xf32, #v2>, tensor<128x64xf32, #v2>) {
+    %loaded = ttng.tmem_load %src : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #v2>
+    %reshaped = tt.reshape %loaded : tensor<128x128xf32, #v2> -> tensor<128x2x64xf32, #v2_split>
+    %transposed = tt.trans %reshaped {order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #v2_split> -> tensor<128x64x2xf32, #v2_split>
+    %lhs, %rhs = tt.split %transposed : tensor<128x64x2xf32, #v2_split> -> tensor<128x64xf32, #v2>
+    tt.return %lhs, %rhs : tensor<128x64xf32, #v2>, tensor<128x64xf32, #v2>
+  }
+}
+
+// -----
+
+// The store-join rewrite has the same warp precondition as the split-load
+// rewrite above. With 2 warps it must decline instead of crashing.
+#b2j = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 1], order = [1, 0]}>
+#b2j_split = #ttg.blocked<{sizePerThread = [1, 1, 2], threadsPerWarp = [1, 32, 1], warpsPerCTA = [2, 1, 1], order = [2, 1, 0]}>
+#v2j = #tlx.user_layout<#tlx.no_verify_layout<#b2j>>
+#v2j_split = #tlx.user_layout<#tlx.no_verify_layout<#b2j_split>>
+#tmemj = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @store_join_two_warps
+  // CHECK-NOT: ttng.tmem_subslice
+  // CHECK: tt.join
+  // CHECK: tt.trans
+  // CHECK: tt.reshape
+  // CHECK: ttng.tmem_store
+  // CHECK-NOT: ttng.tmem_subslice
+  tt.func @store_join_two_warps(%lhs: tensor<128x64xf32, #v2j>, %rhs: tensor<128x64xf32, #v2j>, %dst: !ttg.memdesc<128x128xf32, #tmemj, #ttng.tensor_memory, mutable>) {
+    %joined = tt.join %lhs, %rhs : tensor<128x64xf32, #v2j> -> tensor<128x64x2xf32, #v2j_split>
+    %transposed = tt.trans %joined {order = array<i32: 0, 2, 1>} : tensor<128x64x2xf32, #v2j_split> -> tensor<128x2x64xf32, #v2j_split>
+    %reshaped = tt.reshape %transposed : tensor<128x2x64xf32, #v2j_split> -> tensor<128x128xf32, #v2j>
+    %true = arith.constant true
+    ttng.tmem_store %reshaped, %dst, %true : tensor<128x128xf32, #v2j> -> !ttg.memdesc<128x128xf32, #tmemj, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}

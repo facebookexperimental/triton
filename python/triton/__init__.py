@@ -26,6 +26,11 @@ from .runtime._allocation import set_allocator
 from . import language
 from . import testing
 from . import tools
+from . import knobs as _knobs
+
+if _knobs.compilation.compile_trace:
+    from .tools import compile_trace as _compile_trace
+    _compile_trace.enable(_knobs.compilation.compile_trace)
 
 must_use_result = language.core.must_use_result
 aggregate = language.core._aggregate
@@ -67,7 +72,7 @@ __all__ = [
 
 @constexpr_function
 def cdiv(x: int, y: int):
-    return (x + y - 1) // y
+    return (x + (y - 1)) // y
 
 
 @constexpr_function

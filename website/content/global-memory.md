@@ -1,4 +1,4 @@
-> **[gfx950]** — available on AMD MI350 (CDNA4) only; not available on MI300.
+> **[gfx942+]** - AMD buffer operations; dtype restrictions depend on the target.
 
 Buffer operations access global memory via a scalar base pointer and a tensor of i32 element offsets, rather than a tensor of pointers. This maps directly to AMD's hardware buffer instructions, which use a resource descriptor and byte offsets, enabling the hardware to do out-of-bounds checking and cache optimization.
 
@@ -30,7 +30,14 @@ Lowers to `amdg.buffer_load`, which is eventually lowered to `rocdl.raw.ptr.buff
 Store a tensor of values to global memory.
 
 ```python
-tlx.buffer_store(stored_value, ptr, offsets, mask=None, cache=None)
+tlx.buffer_store(
+    stored_value,
+    ptr,
+    offsets,
+    mask=None,
+    cache=None,
+    contiguity=1,
+)
 ```
 
 | Argument | Type | Description |
@@ -40,6 +47,42 @@ tlx.buffer_store(stored_value, ptr, offsets, mask=None, cache=None)
 | `offsets` | i32 tensor | Per-element byte offsets from `ptr`. |
 | `mask` | bool tensor, optional | When `mask[i]` is `False`, the element is not written. |
 | `cache` | str, optional | Cache modifier. |
+| `contiguity` | constexpr int | Trusted positive power-of-two lower bound on the number of adjacent elements available for vectorization. Values greater than one require `stored_value` to be pinned with `tlx.require_layout`. |
+
+`contiguity` is a correctness contract, not a best-effort hint. For every group
+of `contiguity` elements owned by one thread, the caller promises that the
+offsets are consecutive, the mask predicate is identical, and the first address
+meets the packed access's alignment. The compiler verifies that the width is a
+positive power of two, divides the number of elements owned by each thread, and
+does not exceed the physical adjacency of the pinned layout; it cannot verify the
+runtime address or mask promises. An incorrect promise can change which
+elements are written.
+
+Pinning `stored_value` anchors the store layout; the store's operand constraint
+keeps offsets and mask in the same encoding. The final instruction width is
+also capped by AMD's 128-bit buffer-store limit. For example, BF16
+`contiguity=16` is emitted as legal eight-element `buffer_store_dwordx4`
+operations. The default `contiguity=1` retains the existing scalar-contract
+behavior.
+
+```python
+store_layout: tl.constexpr = tlx.amd_mfma_layout(
+    version=4,
+    instr_shape=[16, 16, 32],
+    transposed=True,
+    warps_per_cta=[2, 2],
+)
+mask_boundary = mask_boundary - mask_boundary % 4
+mask = offsets < mask_boundary
+values = tlx.require_layout(values, store_layout)
+tlx.buffer_store(
+    values,
+    out_ptr,
+    offsets,
+    mask=mask,
+    contiguity=4,
+)
+```
 
 **Returns**: Nothing.
 
@@ -58,7 +101,11 @@ previous = tlx.buffer_atomic_add(
 `contiguity` is the same trusted per-thread adjacency width accepted by
 `buffer_load`; values greater than one also preserve the selected layout. The
 operation returns the values observed before the additions. FP16 and BF16 use
-packed two-element instructions, so `contiguity` must be at least two and any
+packed two-element instructions. BF16 atomic addition is rejected on gfx942;
+FP16, FP32, FP64, int32, and int64 addition are supported by its buffer-atomic
+lowering. gfx950 and gfx1250 also implement BF16 addition; see the
+[target feature checks](third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp).
+For FP16/BF16, `contiguity` must be at least two and any
 mask must be uniform for each adjacent pair. Compilation fails if mask analysis
 reduces the legal vector width below two.
 

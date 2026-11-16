@@ -168,6 +168,50 @@ struct ClusterBarrierWaitOpConversion
     return success();
   }
 };
+
+// Split workgroup barrier: release fence + s_barrier_signal -1, then
+// s_barrier_wait -1 + acquire fence. The fences carry the same local-memory
+// MMRA tag as the gpu.barrier lowering of ttg.barrier local, so the memory
+// model inserts the LDS waits before the signal.
+static void emitWorkgroupFence(ConversionPatternRewriter &rewriter,
+                               Location loc, LLVM::AtomicOrdering ordering) {
+  Attribute localMMRA =
+      rewriter.getAttr<LLVM::MMRATagAttr>("amdgpu-synchronize-as", "local");
+  auto fence = LLVM::FenceOp::create(rewriter, loc, ordering,
+                                     /*syncscope=*/"workgroup");
+  fence->setDiscardableAttr(LLVM::LLVMDialect::getMmraAttrName(), localMMRA);
+}
+
+struct WorkgroupBarrierSignalOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::WorkgroupBarrierSignalOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::WorkgroupBarrierSignalOp op,
+                  OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    emitWorkgroupFence(rewriter, loc, LLVM::AtomicOrdering::release);
+    ROCDL::BarrierSignalOp::create(rewriter, loc, -1);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct WorkgroupBarrierWaitOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::WorkgroupBarrierWaitOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::WorkgroupBarrierWaitOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    ROCDL::BarrierWaitOp::create(rewriter, loc, -1);
+    emitWorkgroupFence(rewriter, loc, LLVM::AtomicOrdering::acquire);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
 } // namespace
 
 void mlir::triton::AMD::populateBarrierOpToLLVMPatterns(
@@ -178,4 +222,6 @@ void mlir::triton::AMD::populateBarrierOpToLLVMPatterns(
   patterns.add<ArriveBarrierOpConversion>(typeConverter, benefit);
   patterns.add<ClusterBarrierArriveOpConversion>(typeConverter, benefit);
   patterns.add<ClusterBarrierWaitOpConversion>(typeConverter, benefit);
+  patterns.add<WorkgroupBarrierSignalOpConversion>(typeConverter, benefit);
+  patterns.add<WorkgroupBarrierWaitOpConversion>(typeConverter, benefit);
 }

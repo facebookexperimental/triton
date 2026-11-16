@@ -1,0 +1,155 @@
+{{def_kernel("Q", "K", "V", "LSE", "MAX", "KV_NUM_BLKS", "KV_IDX", "FULL_KV_NUM_BLKS", "FULL_KV_IDX")}}
+
+    tl.static_assert(QK_HEAD_DIM == 128 and V_HEAD_DIM == 128)
+    tl.static_assert(SPARSE_Q_BLOCK_SIZE % BLOCK_M == 0)
+    tl.static_assert(SPARSE_KV_BLOCK_SIZE % BLOCK_N == 0)
+    stride_qz, stride_qh, stride_qm, stride_qk = {{stride("Q")}}
+    stride_kz, stride_kh, stride_kn, stride_kk = {{stride("K")}}
+    stride_vz, stride_vh, stride_vn, stride_vk = {{stride("V")}}
+    Q_LEN = {{size("Q", 2)}}
+    KV_LEN = {{size("K", 2)}}
+    HQ = {{size("Q", 1)}}
+    ZKV = {{size("K", 0)}}
+    off_m = tl.program_id(0) * BLOCK_M
+    off_zq = tl.program_id(1)
+    off_hq = tl.program_id(2)
+    off_zkv = off_zq % ZKV
+    off_hkv = off_hq // GQA_SHARED_HEADS
+    dtype: tl.constexpr = Q.dtype.element_ty
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+    PARTS: tl.constexpr = 4 if BLOCK_M >= 128 else 2
+    FIXED: tl.constexpr = USE_FIXED_REFERENCE and not OUTPUT_MAX
+    MULTIPLE: tl.constexpr = SPARSE_KV_BLOCK_SIZE // BLOCK_N
+
+    q_desc = tl.make_tensor_descriptor(Q + off_zq.to(tl.int64) * stride_qz + off_hq.to(tl.int64) * stride_qh,
+        [Q_LEN, 128], [stride_qm, 1], [BLOCK_M, 128])
+    k_desc = tl.make_tensor_descriptor(K + off_zkv.to(tl.int64) * stride_kz + off_hkv.to(tl.int64) * stride_kh,
+        [KV_LEN, 128], [stride_kn, 1], [BLOCK_N, 128])
+    v_desc = tl.make_tensor_descriptor(V + off_zkv.to(tl.int64) * stride_vz + off_hkv.to(tl.int64) * stride_vh,
+        [KV_LEN, 128], [stride_vn, 1], [BLOCK_N, 128])
+    q_tiles = tlx.local_alloc((BLOCK_M, 128), dtype, 1)
+    k_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for(
+        [(128, 8)], [BLOCK_N, 128], [1, 0])
+    k_tiles = tlx.local_alloc((BLOCK_N, 128), dtype, 2, layout=k_layout)
+    v_tiles = tlx.local_alloc((BLOCK_N, 128), dtype, 2)
+    tlx.async_amd_descriptor_load(q_desc, tlx.local_view(q_tiles, 0), [off_m, 0], clamp_bounds=True)
+    tlx.async_amd_descriptor_wait(0)
+    q = tlx.local_load(tlx.local_view(q_tiles, 0))
+
+    sparse_z = off_zq % {{size("KV_NUM_BLKS", 0)}}
+    sparse_h = off_hq % {{size("KV_NUM_BLKS", 1)}}
+    sparse_row = off_m // SPARSE_Q_BLOCK_SIZE
+    counts = sparse_z * {{stride("KV_NUM_BLKS", 0)}} + sparse_h * {{stride("KV_NUM_BLKS", 1)}} + sparse_row * {{stride("KV_NUM_BLKS", 2)}}
+    indices = sparse_z * {{stride("KV_IDX", 0)}} + sparse_h * {{stride("KV_IDX", 1)}} + sparse_row * {{stride("KV_IDX", 2)}}
+    partial_count = tl.load(KV_NUM_BLKS + counts)
+    full_count = 0
+    {% if HAS_FULL_BLOCKS %}
+    full_counts = sparse_z * {{stride("FULL_KV_NUM_BLKS", 0)}} + sparse_h * {{stride("FULL_KV_NUM_BLKS", 1)}} + sparse_row * {{stride("FULL_KV_NUM_BLKS", 2)}}
+    full_indices = sparse_z * {{stride("FULL_KV_IDX", 0)}} + sparse_h * {{stride("FULL_KV_IDX", 1)}} + sparse_row * {{stride("FULL_KV_IDX", 2)}}
+    full_count = tl.load(FULL_KV_NUM_BLKS + full_counts)
+    {% endif %}
+    partial_tiles = tl.minimum(partial_count * MULTIPLE, tl.cdiv(KV_LEN, BLOCK_N))
+    full_tiles = tl.minimum(full_count * MULTIPLE, tl.cdiv(KV_LEN, BLOCK_N))
+    total_tiles = partial_tiles + full_tiles
+    rows = off_m + tl.arange(0, BLOCK_M)
+    m = get_bounded_indices(rows[:, None], Q_LEN)
+    retry = False
+    acc = tl.zeros((BLOCK_M, 128), tl.float32)
+    m_i = tl.full((BLOCK_M,), float("-inf"), tl.float32)
+    denominator = tl.zeros((BLOCK_M,), tl.float32)
+
+    # INVARIANT: score/mask modifications can invalidate the fixed reference; replay stays device-side.
+    for pass_id in tl.static_range(2 if FIXED else 1):
+        if pass_id == 0 or retry:
+            acc = tl.zeros((BLOCK_M, 128), tl.float32)
+            m_i = tl.full((BLOCK_M,), float("-inf"), tl.float32)
+            if FIXED and pass_id == 0:
+                partial_sum = tl.zeros((BLOCK_M, PARTS), tl.float32)
+            else:
+                denominator = tl.zeros((BLOCK_M,), tl.float32)
+            slot = 0
+            key_start = 0
+            if total_tiles > 0:
+                first_ptr = KV_IDX + indices
+                if HAS_FULL_BLOCKS:
+                    first_ptr = tl.where(partial_count > 0, first_ptr, FULL_KV_IDX + full_indices)
+                key_start = tl.load(first_ptr) * SPARSE_KV_BLOCK_SIZE
+                tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_tiles, slot), [key_start, 0], clamp_bounds=True)
+                tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_tiles, slot), [key_start, 0], clamp_bounds=True)
+            for tile in range(total_tiles):
+                tlx.async_amd_descriptor_wait(1)
+                kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_tiles, slot)))
+                next_slot = 1 - slot
+                next_start = 0
+                if tile + 1 < total_tiles:
+                    next_tile = tile + 1
+                    next_ptr = KV_IDX + indices + (next_tile // MULTIPLE) * {{stride("KV_IDX", 3)}}
+                    if HAS_FULL_BLOCKS:
+                        full_tile = next_tile - partial_tiles
+                        next_ptr = tl.where(next_tile < partial_tiles, next_ptr,
+                            FULL_KV_IDX + full_indices + (full_tile // MULTIPLE) * {{stride("FULL_KV_IDX", 3) if HAS_FULL_BLOCKS else 1}})
+                    next_local = tl.where(next_tile < partial_tiles, next_tile, next_tile - partial_tiles)
+                    next_start = (tl.load(next_ptr) * SPARSE_KV_BLOCK_SIZE + (next_local % MULTIPLE) * BLOCK_N).to(tl.int32)
+                    tlx.async_amd_descriptor_load(k_desc, tlx.local_view(k_tiles, next_slot), [next_start, 0], clamp_bounds=True)
+                    tlx.async_amd_descriptor_load(v_desc, tlx.local_view(v_tiles, next_slot), [next_start, 0], clamp_bounds=True)
+                qk = tl.dot(q, kt) * SM_SCALE
+                cols = key_start + tl.arange(0, BLOCK_N)
+                n = get_bounded_indices(cols[None, :], KV_LEN)
+
+                {{ modification(subgraph_number=0, output_name="scores", score="qk",
+                                b="off_zq", h="off_hq", m="m", n="n", out="qk") | indent_except_first(4) }}
+
+                if tile < partial_tiles:
+                    {{ modification(subgraph_number=1, output_name="valid", score="qk",
+                                    b="off_zq", h="off_hq", m="m", n="n") | indent_except_first(5) }}
+                    scores = tl.where(valid, scores, float("-inf"))
+                scores = tl.where(cols[None, :] < KV_LEN, scores, float("-inf"))
+                if FIXED and pass_id == 0:
+                    if tile == 0:
+                        m_i = tl.max(scores, 1)
+                    reference = tl.where(m_i == float("-inf"), 0.0, m_i)
+                    p = tl.exp2((scores - reference[:, None]) * RCP_LN2)
+                    terms = tl.reshape(p, (BLOCK_M, BLOCK_N // (PARTS * 8), PARTS, 8))
+                    partial_sum += tl.sum(tl.sum(terms, 3), 1)
+                else:
+                    new_max = tl.maximum(m_i, tl.max(scores, 1))
+                    reference = tl.where(new_max == float("-inf"), 0.0, new_max)
+                    p = tl.exp2((scores - reference[:, None]) * RCP_LN2)
+                    alpha = tl.exp2((m_i - reference) * RCP_LN2)
+                    denominator = denominator * alpha + tl.sum(p, 1)
+                    acc = acc * alpha[:, None]
+                    m_i = new_max
+                p_low = p.to(dtype)
+                if tile + 1 < total_tiles:
+                    tlx.async_amd_descriptor_wait(2)
+                else:
+                    tlx.async_amd_descriptor_wait(0)
+                v = tlx.local_load(tlx.local_view(v_tiles, slot))
+                # INVARIANT: no wave may reuse an LDS stage before every wave has read it.
+                tlx.workgroup_barrier()
+                acc = tl.dot(p_low, v, acc)
+                slot = next_slot
+                key_start = next_start
+            if FIXED and pass_id == 0:
+                denominator = tl.sum(partial_sum, 1)
+                bad = ~((denominator > 0.0) & (denominator < 1.e30))
+                bad |= ~(tl.abs(m_i * RCP_LN2) <= 64.0)
+                bad |= tl.sum((~(tl.abs(acc) <= 3.402823466e38)).to(tl.int32), 1) > 0
+                retry = tl.sum(((rows < Q_LEN) & bad).to(tl.int32), 0) > 0
+
+    safe_denominator = tl.where(denominator == 0.0, 1.0, denominator)
+    acc = acc / safe_denominator[:, None]
+    if dtype == tl.float16:
+        # INVARIANT: finite FP16 attention is bounded by the input value range.
+        acc = tl.where(tl.abs(acc) < float("inf"), tl.minimum(tl.maximum(acc, -65504.0), 65504.0), acc)
+    idx_zq = off_zq.to(tl.int64)
+    idx_hq = off_hq.to(tl.int64)
+    idx_m = rows[:, None].to(INDEX_DTYPE)
+    idx_d = tl.arange(0, 128)[None, :].to(INDEX_DTYPE)
+    mask = idx_m < Q_LEN
+    {{store_output(("idx_zq", "idx_hq", "idx_m", "idx_d"), "acc", "mask", val_shape=("BLOCK_M", "V_HEAD_DIM_ROUNDED"))}}
+    if OUTPUT_LOGSUMEXP:
+        lse = tl.where(m_i == float("-inf"), float("-inf"), m_i * RCP_LN2 + tl.log2(safe_denominator))
+        tl.store(LSE + (idx_zq * HQ + idx_hq) * Q_LEN + rows, lse, mask=rows < Q_LEN)
+    if OUTPUT_MAX:
+        tl.store(MAX + (idx_zq * HQ + idx_hq) * Q_LEN + rows, m_i * RCP_LN2, mask=rows < Q_LEN)

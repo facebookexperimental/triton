@@ -101,6 +101,15 @@ static LogicalResult ensureWarpSpecializeBarrierIdsImpl(
   module.walk([&](gpu::WarpSpecializeOp op) {
     maxPartitions =
         std::max<unsigned>(maxPartitions, op.getPartitionRegions().size());
+    // `ttg.partition.types` leads with the default region's entry ahead of the
+    // partition entries, so the eventual partition count is one less than the
+    // attribute size.
+    if (auto partitionTypes =
+            op->getAttrOfType<ArrayAttr>("ttg.partition.types")) {
+      if (!partitionTypes.empty())
+        maxPartitions =
+            std::max<unsigned>(maxPartitions, partitionTypes.size() - 1);
+    }
   });
   if (maxPartitions == 0)
     return success();

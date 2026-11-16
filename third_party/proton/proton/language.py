@@ -1,6 +1,7 @@
 from triton.language import core as tl
 from triton.language.core import builtin
 from triton._C.libtriton import proton as triton_proton
+from triton.compiler.code_generator import WITH_DISPATCH
 from triton.language.semantic import TritonSemantic
 from triton.experimental.gluon.language._semantic import GluonSemantic
 
@@ -17,6 +18,54 @@ aggressive compiler rewrites (loop pipelining, instruction re-ordering, IR dupli
 These transformations can invalidate naïve instrumentation and lead to misleading results.
 """
 _SEMANTICS = {_ALL_SEMANTICS["gluon"]}
+
+
+class _EventType(tl.base_type):
+    """Frontend type for an asynchronous event.
+
+    Its IR representation is i32, but retaining a distinct frontend type keeps
+    events opaque when they are passed across loops or regions instead of
+    reconstructing them as generic tensors.
+    """
+
+    def _unflatten_ir(self, handles, cursor):
+        return Event(handles[cursor]), cursor + 1
+
+    def _flatten_ir_types(self, builder, out):
+        tl.int32._flatten_ir_types(builder, out)
+
+    def __eq__(self, other):
+        return isinstance(other, _EventType)
+
+    def __hash__(self):
+        return hash(_EventType)
+
+    def mangle(self):
+        return "PEvent"
+
+    def __str__(self):
+        return "proton.event"
+
+
+_EVENT_TYPE = _EventType()
+
+
+class Event(tl.base_value):
+    """Opaque event returned by :func:`allocate_event`.
+
+    The event identifies a static asynchronous transaction and may only be
+    consumed by :func:`start_event` and :func:`end_event`.
+    """
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.type = _EVENT_TYPE
+
+    def _flatten_ir(self, handles):
+        handles.append(self.handle)
+
+    def _set_name(self, builder, name):
+        self.handle.set_loc(builder.create_name_loc(name, self.handle.get_loc()))
 
 
 def _check_supported_semantic(semantic):
@@ -42,8 +91,7 @@ def record(is_start: tl.constexpr, scope_name: tl.constexpr, predicate=True, _se
     if predicate is False:
         return
     predicate_handle = None if predicate is True else predicate.handle
-    handle = triton_proton.create_proton_record(_semantic.builder, is_start, scope_name, predicate_handle)
-    return tl.tensor(handle, tl.void)
+    triton_proton.create_proton_record(_semantic.builder, is_start, scope_name, predicate_handle)
 
 
 @builtin
@@ -54,6 +102,36 @@ def enter_scope(name: tl.constexpr, predicate=True, _semantic=None):
 @builtin
 def exit_scope(name: tl.constexpr, predicate=True, _semantic=None):
     record(is_start=False, scope_name=name, predicate=predicate, _semantic=_semantic)
+
+
+@builtin
+def allocate_event(name: tl.constexpr, _semantic=None):
+    if not flags.instrumentation_on:
+        return Event(handle=None)
+    _check_supported_semantic(_semantic)
+    name = tl._unwrap_if_constexpr(name)
+    handle = triton_proton.create_proton_allocate_event(_semantic.builder, name)
+    return Event(handle)
+
+
+def record_event(event, is_start: tl.constexpr, _semantic=None):
+    if not flags.instrumentation_on:
+        return
+    _check_supported_semantic(_semantic)
+    if not isinstance(event, Event):
+        raise TypeError("expected an event returned by allocate_event")
+    is_start = tl._unwrap_if_constexpr(is_start)
+    triton_proton.create_proton_event(_semantic.builder, is_start, event.handle)
+
+
+@builtin
+def start_event(event, _semantic=None):
+    record_event(event, is_start=True, _semantic=_semantic)
+
+
+@builtin
+def end_event(event, _semantic=None):
+    record_event(event, is_start=False, _semantic=_semantic)
 
 
 class scope:
@@ -68,3 +146,33 @@ class scope:
 
     def __exit__(self, exc_type, exc_value, traceback):
         exit_scope(self.name, predicate=self.predicate, _semantic=self.semantic)
+
+
+def _visit_with_proton_scope(codegen, node):
+    """Lower `with pl.scope(...)` inside JIT functions.
+
+    The JIT only calls ``__enter__``/``__exit__`` for context managers
+    registered in its ``WITH_DISPATCH`` table; anything else is silently
+    reduced to its body. Registering this handler restores instrumentation
+    for the context-manager form (equivalent to ``enter_scope`` /
+    ``exit_scope``), threading the code generator's semantic through so the
+    builtin calls succeed.
+    """
+    if len(node.items) != 1:
+        raise ValueError("pl.scope cannot be combined with other context managers in a single 'with' statement")
+    item = node.items[0]
+    if item.optional_vars is not None:
+        raise ValueError("pl.scope does not support 'as' targets")
+    context = item.context_expr
+    args = [codegen.visit(arg) for arg in context.args]
+    kwargs = {kw.arg: codegen.visit(kw.value) for kw in context.keywords}
+    kwargs["_semantic"] = codegen.semantic
+    ctx = scope(*args, **kwargs)
+    ctx.__enter__()
+    try:
+        codegen.visit_compound_statement(node.body)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+WITH_DISPATCH[scope] = _visit_with_proton_scope
