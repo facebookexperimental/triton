@@ -189,6 +189,40 @@ def test_async_dot(device):
 
 
 @pytest.mark.skipif(not is_hopper(), reason="Need Hopper")
+def test_async_dot_wait_tuple(device):
+
+    @triton.jit
+    def _kernel(X, Y, Z0, Z1, BLOCK: tl.constexpr):
+        off = tl.arange(0, BLOCK)
+        ptrs = off[:, None] * BLOCK + off[None, :]
+        a_tile = tlx.local_view(tlx.local_alloc((BLOCK, BLOCK), tl.float16, 1), 0)
+        b_tile = tlx.local_view(tlx.local_alloc((BLOCK, BLOCK), tl.float16, 1), 0)
+        tlx.async_load(X + ptrs, a_tile)
+        tlx.async_load(Y + ptrs, b_tile)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(tl.constexpr(0))
+        c0 = tlx.async_dot(a_tile, b_tile)
+        c1 = tlx.async_dot(b_tile, a_tile)
+        c0, c1, _ = tlx.async_dot_wait(0, (c0, c1, a_tile))
+        tl.store(Z0 + ptrs, c0.to(tl.float16))
+        tl.store(Z1 + ptrs, c1.to(tl.float16))
+
+    torch.manual_seed(0)
+    B = 64
+    x = torch.randn((B, B), device=device, dtype=torch.float16)
+    y = torch.randn((B, B), device=device, dtype=torch.float16)
+    z0 = torch.empty_like(x)
+    z1 = torch.empty_like(x)
+    kernel = _kernel[(1, )](x, y, z0, z1, BLOCK=B)
+    ttgir = kernel.asm["ttgir"]
+    # One wait covers both dots and the buffer they read.
+    assert ttgir.count("ttng.warp_group_dot_wait") == 1
+    assert "!ttg.memdesc" in next(line for line in ttgir.splitlines() if "ttng.warp_group_dot_wait" in line)
+    torch.testing.assert_close(z0, torch.matmul(x, y))
+    torch.testing.assert_close(z1, torch.matmul(y, x))
+
+
+@pytest.mark.skipif(not is_hopper(), reason="Need Hopper")
 def test_async_dot_explicit_accumulator_layout(device):
 
     @triton.jit

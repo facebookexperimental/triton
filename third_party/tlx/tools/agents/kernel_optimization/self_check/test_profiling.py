@@ -11,7 +11,8 @@ from unittest import mock
 from unittest.mock import patch
 
 from ..decision_maker.profiling import rocm_profiler as rocm_profiler_module
-from ..decision_maker.profiling.amd_att import collect_fb_att
+from ..decision_maker.profiling.amd_att import collect_amd_att
+from ..decision_maker.profiling.amdgcn_isa import analyze_amdgcn, collect_amdgcn_isa
 from ..decision_maker.profiling import (
     ProfileRequest,
     compact_profile_summary,
@@ -111,12 +112,12 @@ class ProfileRequestTest(unittest.TestCase):
         assert amd is not None
         self.assertEqual(
             amd["tools"],
-            ["rocprofv3", "ncu"],
+            ["rocprofv3", "ncu", "amdgcn_isa"],
         )
 
         hip = resolve_profile_request_for_target(payload, {"backend": "hip"})
         assert hip is not None
-        self.assertEqual(hip["tools"], ["rocprofv3", "ncu"])
+        self.assertEqual(hip["tools"], ["rocprofv3", "ncu", "amdgcn_isa"])
 
         deep = resolve_profile_request_for_target(
             ProfileRequest(
@@ -126,7 +127,8 @@ class ProfileRequestTest(unittest.TestCase):
             {"backend": "hip"},
         )
         assert deep is not None
-        self.assertEqual(deep["tools"], ["fb_att", "rocprofv3"])
+        self.assertEqual(deep["tools"], ["amd_att", "rocprofv3", "amdgcn_isa"])
+        self.assertNotIn("amdgcn_isa", cuda["tools"])
 
     def test_per_case_profile_request_expands_absolute_dir(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -504,7 +506,7 @@ class ProfileParsingTest(unittest.TestCase):
         self.assertEqual(ncu_regression_diagnostic(normalized, old_flat), "")
 
         rocprof_baseline = {"rocprofv3": {"summary": {"duration_us": 10.0}}}
-        rocprof_candidate = {"rocprofv3": {"summary": {"duration_us": 10.2}}}
+        rocprof_candidate = {"rocprofv3": {"summary": {"duration_us": 10.6}}}
         self.assertEqual(
             extract_native_profiler_duration_us(rocprof_baseline),
             ("rocprofv3", 10.0),
@@ -515,6 +517,13 @@ class ProfileParsingTest(unittest.TestCase):
         )
         self.assertEqual(
             native_profiler_regression_diagnostic(old_flat, rocprof_candidate),
+            "",
+        )
+        self.assertEqual(
+            native_profiler_regression_diagnostic(
+                rocprof_baseline,
+                {"rocprofv3": {"summary": {"duration_us": 10.2}}},
+            ),
             "",
         )
         self.assertEqual(
@@ -714,38 +723,128 @@ class ProfileParsingTest(unittest.TestCase):
                 repetitions=3,
             )
 
-    def test_collects_fb_att_without_rocprof_separator(self) -> None:
+    def test_production_mm_profile_invokes_native_profiler_for_selected_winner(self) -> None:
+        from ..decision_maker.tuning_harnesses import mm
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            profiler = root / "fb_att"
+            source = root / "candidate.py"
+            source.write_text("def mm():\n    pass\n")
+            artifact = {
+                "records": {
+                    "shape": {
+                        "full_best_config": "kernel: BLOCK_M=64 num_warps=4 num_stages=2",
+                        "full_config_timings": [],
+                    }
+                },
+                "source_path": source,
+                "device": "cuda",
+                "arch": "gfx942",
+            }
+            expected = {
+                "tool": "rocprofv3",
+                "summary": {"duration_us": 12.0, "dominant_kernel": "gemm"},
+            }
+            properties = mock.Mock(multi_processor_count=304)
+            with (
+                patch.object(mm, "collect_rocprofv3", return_value=expected) as collect,
+                patch.object(mm.torch.cuda, "get_device_properties", return_value=properties),
+            ):
+                profile = mm.profile(
+                    artifact,
+                    {"case_id": "shape", "parameters": {"m": 128, "n": 128, "k": 128}},
+                    {
+                        "tools": ["rocprofv3"],
+                        "level": "deep",
+                        "artifacts_dir": str(root / "artifacts"),
+                    },
+                )
+            self.assertEqual(profile["rocprofv3"], expected)
+            self.assertEqual(profile["roofline"]["limiter"], "memory")
+            workload = collect.call_args.args[0]
+            self.assertIn("--winner", workload)
+            self.assertIn("gfx942", workload)
+
+    def test_collects_and_validates_rocprofv3_att_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profiler = root / "rocprofv3"
             profiler.write_text(
                 "#!/usr/bin/python3\n"
-                "import sys\n"
+                "import sqlite3, sys\n"
                 "from pathlib import Path\n"
                 "args = sys.argv[1:]\n"
-                "assert '--' not in args\n"
-                "assert args[args.index('--att-perfcounter-ctrl') + 1] == '3'\n"
-                "output_dir = Path(args[args.index('--fb-output-directory') + 1])\n"
-                "ui_dir = output_dir / 'fbrocrof_1' / 'gemm_0_ui'\n"
+                "if '--help' in args:\n"
+                "    print('--att --rocm-root')\n"
+                "    raise SystemExit(0)\n"
+                "assert '--' in args\n"
+                "assert args[args.index('--att-activity') + 1] == '8'\n"
+                "output_dir = Path(args[args.index('-d') + 1])\n"
+                "output_dir.mkdir(parents=True)\n"
+                "db = sqlite3.connect(output_dir / 'tlx_att_results.db')\n"
+                "db.execute('create table trace(id integer)')\n"
+                "db.commit(); db.close()\n"
+                "(output_dir / 'trace.att').write_text('trace')\n"
+                "(output_dir / 'gfx942_code_object_id_1.out').write_text('code')\n"
+                "(output_dir / 'stats_ui_output_agent_0_dispatch_4.csv').write_text('name,value\\ngemm,1\\n')\n"
+                "ui_dir = output_dir / 'ui_output_agent_0_dispatch_4'\n"
                 "ui_dir.mkdir(parents=True)\n"
-                "(ui_dir / 'wstates0.json').write_text('{}')\n"
+                "for name in ('code.json', 'filenames.json', 'occupancy.json', 'wstates0.json', 'se0_sm0_sl0_wv0.json'):\n"
+                "    (ui_dir / name).write_text('{}')\n"
             )
             profiler.chmod(0o755)
+            decoder = root / "librocprof-trace-decoder.so"
+            decoder.write_text("decoder")
 
-            profile = collect_fb_att(
+            profile = collect_amd_att(
                 ("/usr/bin/python3", "-c", "pass"),
                 root / "artifacts",
                 kernel_filter="gemm",
-                counters=("SQ_LDS_BANK_CONFLICT",),
-                environment={"TLX_FB_ATT": str(profiler)},
+                environment={
+                    "TLX_ROCPROFV3": str(profiler),
+                    "ROCPROF_ATT_LIBRARY_PATH": str(root),
+                },
             )
 
             self.assertTrue(profile["valid"])
             self.assertEqual(profile["kernel_filter"], "gemm")
-            self.assertEqual(profile["iteration_range"], "[4-4]")
-            self.assertEqual(profile["perfcounter_control"], 3)
+            self.assertEqual(profile["iteration_range"], "[4]")
             self.assertEqual(len(profile["artifacts"]["ui_directories"]), 1)
-            self.assertTrue(Path(profile["artifacts"]["wstates"][0]).exists())
+
+    def _roofline(self, m: int, n: int, k: int, duration_us: float, arch: str = "gfx942"):
+        from ..decision_maker.tuning_harnesses import mm
+
+        case = {"parameters": {"m": m, "n": n, "k": k}}
+        rocprof = {"summary": {"duration_us": duration_us}}
+        properties = mock.Mock(multi_processor_count=304)
+        with patch.object(mm.torch.cuda, "get_device_properties", return_value=properties):
+            return mm._roofline(case, rocprof, arch, "cuda:0")
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "mm tuning harness requires torch")
+    def test_roofline_reports_compute_limiter_and_headroom(self) -> None:
+        roofline = self._roofline(4096, 4096, 4096, 150.0)
+        self.assertTrue(roofline["valid"])
+        self.assertEqual(roofline["limiter"], "compute")
+        self.assertAlmostEqual(roofline["peak_tflops"], 1307.4)
+        self.assertAlmostEqual(roofline["roofline_us"], 2 * 4096**3 / 1307.4e12 * 1e6)
+        self.assertAlmostEqual(roofline["fraction_of_roofline"], roofline["roofline_us"] / 150.0)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "mm tuning harness requires torch")
+    def test_roofline_reports_memory_limiter_for_skinny_gemm(self) -> None:
+        roofline = self._roofline(294912, 128, 128, 40.0)
+        self.assertTrue(roofline["valid"])
+        self.assertEqual(roofline["limiter"], "memory")
+        min_bytes = 2 * (294912 * 128 + 128 * 128 + 294912 * 128)
+        self.assertAlmostEqual(roofline["roofline_us"], min_bytes / 5.3e12 * 1e6)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "mm tuning harness requires torch")
+    def test_roofline_rejects_unusable_durations_and_unknown_arch(self) -> None:
+        self.assertFalse(self._roofline(4096, 4096, 4096, 0.0)["valid"])
+        beats = self._roofline(4096, 4096, 4096, 1.0)
+        self.assertIn("beats", beats["error"])
+        self.assertTrue(beats["exceeds_roofline"])
+        self.assertNotIn("exceeds_roofline", self._roofline(4096, 4096, 4096, 0.0))
+        self.assertFalse(self._roofline(4096, 4096, 4096, 150.0, arch="gfx950")["valid"])
 
     def test_compact_profile_summary_omits_raw_blobs(self) -> None:
         compact = compact_profile_summary(
@@ -761,9 +860,13 @@ class ProfileParsingTest(unittest.TestCase):
                     "summary": {"duration_us": 2.0},
                     "raw_metrics": {"huge": "blob"},
                 },
-                "fb_att": {
+                "amd_att": {
                     "valid": True,
                     "artifacts": {"ui_directories": ["/tmp/gemm_0_ui"]},
+                },
+                "amdgcn_isa": {
+                    "resources": {"vgpr_spills": 37},
+                    "findings": ["37 VGPR + 41 SGPR spills"],
                 },
                 "native_profiler": {
                     "raw": "x" * 5000,
@@ -782,13 +885,116 @@ class ProfileParsingTest(unittest.TestCase):
         self.assertNotIn("raw_metrics", compact["ncu"])
         self.assertEqual(compact["rocprofv3"]["summary"]["duration_us"], 2.0)
         self.assertNotIn("raw_metrics", compact["rocprofv3"])
-        self.assertTrue(compact["fb_att"]["valid"])
+        self.assertTrue(compact["amd_att"]["valid"])
+        self.assertEqual(compact["amdgcn_isa"]["resources"]["vgpr_spills"], 37)
+        self.assertEqual(compact["amdgcn_isa"]["findings"], ["37 VGPR + 41 SGPR spills"])
         self.assertIn("native_profiler", compact)
         self.assertNotIn("raw", compact["native_profiler"])
         diagnostic = compact["diagnostic_proton_intra_kernel"]
         self.assertNotIn("trace_events", diagnostic)
         self.assertEqual(diagnostic["artifacts"]["trace"], "/tmp/proton.trace")
         self.assertEqual(compact["artifacts"]["csv"], "/tmp/profile.csv")
+
+
+_AMDGCN_FIXTURE = Path(__file__).with_name("fixtures") / "amdgcn" / "persistent_mxfp8_excerpt.amdgcn"
+
+
+class AmdgcnIsaTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.analysis = analyze_amdgcn(
+            _AMDGCN_FIXTURE.read_text(), kernel_name="_mxfp8_grouped_gemm_kernel"
+        )
+
+    def test_extracts_resources(self) -> None:
+        resources = self.analysis["resources"]
+        self.assertEqual(resources["total_vgprs"], 256)
+        self.assertEqual(resources["vgpr_spills"], 37)
+        self.assertEqual(resources["sgpr_spills"], 41)
+        self.assertEqual(resources["scratch_bytes"], 152)
+        self.assertEqual(resources["occupancy_waves_per_simd"], 2)
+
+    def test_selects_innermost_mfma_loop_as_hot_loop(self) -> None:
+        hot = self.analysis["hot_loop"]
+        self.assertEqual(hot["label"], ".LBB0_16")
+        self.assertEqual(hot["loop_depth"], 3)
+        self.assertEqual(hot["mfma"], 8)
+        self.assertEqual(hot["scaled_mfma"], 8)
+        self.assertEqual(hot["ds_read_by_width"], {"b128": 4, "u8": 8})
+        self.assertEqual(hot["byte_assembly_valu"], 3)
+        self.assertEqual(hot["lds_dma_loads"], 2)
+        self.assertEqual(hot["global_stores"], 0)
+
+    def test_reports_reloads_that_drain_outstanding_stores(self) -> None:
+        boundary = self.analysis["boundary"]
+        self.assertGreater(boundary["global_stores"], 0)
+        self.assertGreater(boundary["reload_drains_after_stores"], 0)
+        reloads = self.analysis["source_locations"]["boundary_scratch_reloads"]
+        self.assertTrue(reloads[0].startswith("gfx950.py:353 "))
+
+    def test_attributes_byte_reads_to_source_lines(self) -> None:
+        byte_reads = self.analysis["source_locations"]["hot_loop_byte_reads"]
+        self.assertTrue(all(entry.startswith("gfx950.py:") for entry in byte_reads))
+        self.assertFalse(any(":0 " in entry for entry in byte_reads))
+
+    def test_findings_name_spills_reload_drains_and_byte_gathers(self) -> None:
+        findings = "\n".join(self.analysis["findings"])
+        self.assertIn("37 VGPR + 41 SGPR spills at the 256-VGPR ceiling", findings)
+        self.assertIn("followed by s_waitcnt vmcnt(0) after", findings)
+        self.assertIn("8 sub-dword ds_reads + 3 byte-assembly VALU per 8 MFMA", findings)
+        self.assertLessEqual(len(self.analysis["findings"]), 8)
+
+    def test_tolerates_dump_without_metadata(self) -> None:
+        analysis = analyze_amdgcn(
+            "k:\n.LBB0_1: ; =>This Inner Loop Header: Depth=1\n"
+            "\tv_mfma_f32_16x16x32_bf16 v[0:3], v[4:7], v[8:11], v[0:3]\n"
+            "\ts_cbranch_scc1 .LBB0_1\n.Lfunc_end0:\n",
+            kernel_name="k",
+        )
+        self.assertEqual(analysis["resources"], {})
+        self.assertEqual(analysis["hot_loop"]["mfma"], 1)
+        self.assertEqual(analysis["findings"], [])
+
+    def test_collects_dump_for_dominant_kernel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "workload.py"
+            script.write_text(
+                "import os, pathlib, shutil, sys\n"
+                "dump = pathlib.Path(os.environ['TRITON_DUMP_DIR']) / 'HASH'\n"
+                "dump.mkdir(parents=True)\n"
+                "assert os.environ['TRITON_ALWAYS_COMPILE'] == '1'\n"
+                "shutil.copyfile(sys.argv[1], dump / '_mxfp8_grouped_gemm_kernel.amdgcn')\n"
+                "(dump / 'other.amdgcn').write_text('')\n"
+            )
+            result = collect_amdgcn_isa(
+                [sys.executable, str(script), str(_AMDGCN_FIXTURE)],
+                Path(directory) / "artifacts",
+                kernel_filter="_mxfp8_grouped_gemm_kernel.kd",
+                timeout_seconds=60.0,
+            )
+            self.assertNotIn("error", result)
+            self.assertEqual(result["tool"], "amdgcn_isa")
+            self.assertEqual(result["kernel"], "_mxfp8_grouped_gemm_kernel")
+            self.assertEqual(result["resources"]["vgpr_spills"], 37)
+            self.assertTrue(Path(result["artifacts"]["amdgcn"]).is_file())
+
+            missing = collect_amdgcn_isa(
+                [sys.executable, str(script), str(_AMDGCN_FIXTURE)],
+                Path(directory) / "artifacts-missing",
+                kernel_filter="absent_kernel",
+                timeout_seconds=60.0,
+            )
+            self.assertIn("no AMDGCN dump", missing["error"])
+            self.assertIn("_mxfp8_grouped_gemm_kernel", missing["available_kernels"])
+
+    def test_reports_failed_workload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = collect_amdgcn_isa(
+                [sys.executable, "-c", "raise SystemExit(3)"],
+                Path(directory),
+                kernel_filter="k",
+                timeout_seconds=60.0,
+            )
+        self.assertIn("failed with code 3", result["error"])
 
 
 if __name__ == "__main__":

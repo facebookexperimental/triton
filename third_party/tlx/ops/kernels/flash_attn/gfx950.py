@@ -29,11 +29,9 @@ DIAGONAL_LAZY_RESCALE_THRESHOLD = tl.constexpr(4.0)
 DIAGONAL_LAZY_RESCALE_THRESHOLD_FP16 = tl.constexpr(8.0)
 CDNA_WAVE_SIZE = tl.constexpr(64)
 CDNA_MFMA_ROWS_PER_WAVE = tl.constexpr(32)
-_LN_2 = tl.constexpr(0.6931471805599453)
 
 _CLUSTER_PIPELINE_STAGE_COUNT = 4
 _CLUSTER_AUTOTUNE_NUM_WARPS = tuple(range(1, 9))
-_CLUSTER_EXPLICIT_STAGE_PRIORITY_MAX_N = tl.constexpr(512)
 _CLUSTER_STATIC_FP16_K_ROW_MIN_N = 4096
 _CLUSTER_STATIC_BF16_K_ROW_MIN_N = 16384
 _CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS = (("amdgpu-agpr-alloc", "0,0"), )
@@ -178,7 +176,8 @@ def _concat_cols(x0, x1):
 
 @triton.jit
 def _sum_rows_chain4(x, ROTATE_FINAL: tl.constexpr):
-    """Reduce four MFMA-layout column slices through one dependency chain."""
+    """Release the MFMA row sum to prevent repeated-RLC N8 relayouts."""
+    CDNA_MFMA_ROWS_PER_WAVE: tl.constexpr = 32
     tl.static_assert(x.shape[0] == CDNA_MFMA_ROWS_PER_WAVE * tlx.num_warps())
     tl.static_assert(x.shape[1] % 4 == 0)
     mma: tl.constexpr = tlx.amd_mfma_layout(
@@ -200,7 +199,8 @@ def _sum_rows_chain4(x, ROTATE_FINAL: tl.constexpr):
     else:
         partial = partial + x_2
         partial = partial + x_3
-    return tl.sum(partial, 1)
+    reduced = tl.sum(partial, 1)
+    return tlx.release_layout(reduced)
 
 
 @triton.jit
@@ -347,6 +347,7 @@ class SoftmaxState:
     @triton.jit
     def vec1_lazy_max(self, qk, QK_SCALE: tl.constexpr):
         """Advance the lazy softmax frame while retaining the score tile."""
+        LAZY_RESCALE_THRESHOLD: tl.constexpr = 8.0
         m_ij = SoftmaxState._row_max(qk * QK_SCALE)
         score_delta = m_ij - self.m_i
         advance = score_delta > LAZY_RESCALE_THRESHOLD
@@ -909,6 +910,7 @@ def _attn_inner_pipelined(
     # diagonal pruning, but the unmasked steady-state pipeline itself is still
     # a two-slot ping-pong schedule.  Keep that logical depth separate from
     # the allocation depth so lazy softmax can run on the same object.
+    _CLUSTER_EXPLICIT_STAGE_PRIORITY_MAX_N: tl.constexpr = 512
     LAZY_BUF_DEPTH: tl.constexpr = 2
     # N1024 BF16 loses overlap with the stock LLVM scheduler on the extended
     # drain. Keep that class on its established exact-rescale control flow.
@@ -1438,7 +1440,8 @@ def _attn_inner_pipelined(
     PRESERVE_ALIGNED_CAUSAL_ACC_LAYOUT: tl.constexpr = (EXPLICIT_PV_LAYOUT and not MASK_STEPS and IS_CAUSAL
                                                         and q.shape[0] == 256 and BLOCK_N == 64)
     if (EXPLICIT_PV_LAYOUT32 or EXPLICIT_PV_LAYOUT) and not PRESERVE_ALIGNED_CAUSAL_ACC_LAYOUT:
-        state = SoftmaxState(tlx.release_layout(state.acc), state.l_i, state.m_i)
+        # Keep the handoff removable when an outer branch selects the same MFMA carrier.
+        state = SoftmaxState(tlx.release_layout(state.acc, relaxed=True), state.l_i, state.m_i)
 
     return state
 
@@ -1461,6 +1464,8 @@ def _attn_predicated_causal_tile(
     ENABLE_CLASS_DIAGONAL_LAZY: tl.constexpr,
 ):
     """Consume one diagonal tile for an active wave."""
+    DIAGONAL_LAZY_RESCALE_THRESHOLD: tl.constexpr = 4.0
+    DIAGONAL_LAZY_RESCALE_THRESHOLD_FP16: tl.constexpr = 8.0
     if BLOCK_N == 32:
         k_tile = tlx.local_slice(k_tile, [0, 0], [32, q.shape[1]])
         v_tile = tlx.local_slice(v_tile, [0, 0], [32, q.shape[1]])
@@ -1615,7 +1620,8 @@ def _attn_inner_full2_lazy(
     )
     v_dot = tlx.local_load(tlx.local_view(v_buf, 1), token=wait, relaxed=True)
     acc = _attn_dot_pv_mfma(state.acc, p_dot, v_dot)
-    return SoftmaxState(tlx.release_layout(acc), state.l_i, state.m_i)
+    # A hard release here forces a 128 KiB relayout when this path joins an MFMA path.
+    return SoftmaxState(tlx.release_layout(acc, relaxed=True), state.l_i, state.m_i)
 
 
 @triton.jit
@@ -1643,6 +1649,8 @@ def _attn_inner_short(
     PREFIX_DIAGONAL_HANDOFF: tl.constexpr,
 ):
     """Process ranges too short to safely fill the rotated four-stage pipeline."""
+    CDNA_MFMA_ROWS_PER_WAVE: tl.constexpr = 32
+    CDNA_WAVE_SIZE: tl.constexpr = 64
     FOUR_SLOT_PREFIX_HANDOFF: tl.constexpr = (PREFIX_DIAGONAL_HANDOFF and not USE_DIRECT_LOAD and MASK_STEPS
                                               and IS_CAUSAL and q.shape[0] == 256 and q.shape[1] == 128
                                               and BLOCK_N == 64 and BUF_DEPTH == 2 and tlx.num_warps() == 8
@@ -2046,6 +2054,8 @@ def _attn_cluster_tile(
     STORE_LSE: tl.constexpr,
     ALLOW_PRESCALE_Q: tl.constexpr,
 ):
+    CLUSTER_PIPELINE_STAGES: tl.constexpr = 4
+    _LN_2: tl.constexpr = 0.6931471805599453
     q_off = off_z * stride_qz + off_h * stride_qh
     k_off = off_z * stride_kz + off_h * stride_kh
     v_off = off_z * stride_vz + off_h * stride_vh
@@ -3419,13 +3429,6 @@ def flash_attn_cluster_pipeline(
             launch_meta.setdefault("llvm_fn_attrs", _CLUSTER_SHORT_N1024_LLVM_FN_ATTRS)
     else:
         launch_meta["STATIC_STRIDE_KN"] = static_stride_kn
-        if D == 128 and block_m == 256 and num_warps == 8:
-            # Keeping both MFMA accumulators in VGPRs removes mixed AGPR/VGPR
-            # handoffs; the full-attention object also becomes spill-free.
-            launch_meta.setdefault(
-                "llvm_fn_attrs",
-                _CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS,
-            )
     if causal and D == 128 and block_m == 256 and block_n == 32 and N_CTX == 4096:
         # Reverse assignment wins the N4096 causal object. The spill-free
         # N2048 pruned object instead selects the forward stage-two plan above.
@@ -3511,10 +3514,6 @@ def flash_attn_cluster_persistent_pipeline(q, k, v, sm_scale, causal=False, **kw
         **kw,
     }
     launch_meta.setdefault("enable_sched_group_barrier_scheduler", False)
-    if not causal and D == 128 and block_m == 256 and num_warps == 8:
-        # The persistent causal schedule loses overlap with VGPR-only
-        # allocation, while full attention benefits from removing AGPR moves.
-        launch_meta.setdefault("llvm_fn_attrs", _CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS)
     if not use_autotune:
         launch_meta.update({
             "USE_DIRECT_LOAD": False if use_direct_load is None else use_direct_load,
@@ -3611,10 +3610,8 @@ def _alert_nondeterministic_backward():
             stacklevel=2,
         )
         return
-    raise RuntimeError(
-        f"{caller} does not have a deterministic implementation, but "
-        "'torch.use_deterministic_algorithms(True)' is enabled"
-    )
+    raise RuntimeError(f"{caller} does not have a deterministic implementation, but "
+                       "'torch.use_deterministic_algorithms(True)' is enabled")
 
 
 class _attention(torch.autograd.Function):
@@ -3632,14 +3629,14 @@ class _attention(torch.autograd.Function):
         q, k, v, o, lse = ctx.saved_tensors
         do = do.contiguous()
         if torch.are_deterministic_algorithms_enabled() and not gfx950_bwd.fa_backward_is_deterministic(
-            q,
-            k,
-            v,
-            o,
-            do,
-            lse,
-            ctx.sm_scale,
-            ctx.causal,
+                q,
+                k,
+                v,
+                o,
+                do,
+                lse,
+                ctx.sm_scale,
+                ctx.causal,
         ):
             _alert_nondeterministic_backward()
         dq, dk, dv = gfx950_bwd.fa_backward(

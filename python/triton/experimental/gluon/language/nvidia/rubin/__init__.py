@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from triton.experimental.gluon.language._core import _unwrap_if_constexpr, builtin
 
 from ..blackwell import (
+    CachePolicy,
+    FractionalEvictionPolicy,
     TensorMemoryLayout,
     _TensorMemoryLinearLayout,
     _packed_arith,
@@ -12,6 +14,7 @@ from ..blackwell import (
     allocate_tensor_memory,
     async_copy,
     clc,
+    cluster,
     fence_async_shared,
     fma2,
     max2,
@@ -32,11 +35,14 @@ from ..blackwell import TensorMemoryScalesLayout as _BlackwellTensorMemoryScales
 from . import mbarrier
 
 __all__ = [
+    "CachePolicy",
+    "FractionalEvictionPolicy",
     "add2",
     "add4",
     "allocate_tensor_memory",
     "async_copy",
     "clc",
+    "cluster",
     "fence_async_shared",
     "fma2",
     "fma4",

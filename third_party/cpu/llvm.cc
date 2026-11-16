@@ -1,8 +1,10 @@
+#include "triton/Tools/LLVMOptions.h"
 #include "triton/Tools/Sys/GetEnv.h"
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassTimingInfo.h"
@@ -35,6 +37,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace py = nanobind;
 
@@ -62,12 +65,13 @@ void initializeHostTarget() {
   llvm::parallel::strategy = llvm::hardware_concurrency(1);
 }
 
-void setLLVMBooleanOption(const std::string &name, bool value) {
-  auto options = llvm::cl::getRegisteredOptions();
-  auto it = options.find(name);
-  if (it == options.end())
-    return;
-  it->second->addOccurrence(1, name, value ? "true" : "false");
+void enableFPContraction(llvm::Module &module) {
+  for (llvm::Function &function : module)
+    for (llvm::Instruction &instruction : llvm::instructions(function))
+      if (instruction.getOpcode() == llvm::Instruction::FAdd ||
+          instruction.getOpcode() == llvm::Instruction::FSub ||
+          instruction.getOpcode() == llvm::Instruction::FMul)
+        instruction.setHasAllowContract(true);
 }
 
 std::unique_ptr<llvm::TargetMachine>
@@ -79,11 +83,13 @@ createHostTargetMachine(llvm::Module &module, bool enableFpFusion,
   if (!target)
     throw std::runtime_error("target lookup error: " + error);
 
-  llvm::TargetOptions options;
+  // Newer LLVM versions no longer honor TargetOptions FP fusion or
+  // trapping-math settings during code generation; both are expressed
+  // through instruction fast-math flags instead.
   if (enableFpFusion)
-    options.AllowFPOpFusion = llvm::FPOpFusion::Fast;
-  if (enableFastMath)
-    options.NoTrappingFPMath = true;
+    enableFPContraction(module);
+  (void)enableFastMath;
+  llvm::TargetOptions options;
   options.TrapUnreachable = true;
   options.MCOptions.AsmVerbose = true;
   options.MCOptions.PreserveAsmComments = true;
@@ -98,8 +104,10 @@ createHostTargetMachine(llvm::Module &module, bool enableFpFusion,
 
 std::string translateHostLLVMIRToASM(llvm::Module &module, bool enableFpFusion,
                                      bool enableFastMath) {
+  using Setting = mlir::triton::tools::ScopedLLVMOptions::Setting;
+  std::vector<Setting> settings;
   if (mlir::triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP"))
-    setLLVMBooleanOption("print-after-all", true);
+    settings.emplace_back("print-after-all", "true");
 
   bool disableLLVMOpt = mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (!disableLLVMOpt) {
@@ -108,9 +116,10 @@ std::string translateHostLLVMIRToASM(llvm::Module &module, bool enableFpFusion,
       llvm::SmallVector<llvm::StringRef, 3> flags;
       llvm::StringRef(flagList).split(flags, ',');
       for (llvm::StringRef flag : flags)
-        setLLVMBooleanOption(flag.str(), true);
+        settings.emplace_back(flag.str(), "true");
     }
   }
+  mlir::triton::tools::ScopedLLVMOptions optionScope(settings);
 
   for (llvm::Function &function : module.functions())
     if (!function.hasFnAttribute(llvm::Attribute::NoInline))

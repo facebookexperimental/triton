@@ -80,6 +80,7 @@ Check out the following documents to learn more about Triton and how it compares
 - Chapter 3: :doc:`Debugging <programming-guide/chapter-3/debugging>` and
   :doc:`Floating-Point Sanitizer (FpSan) <programming-guide/chapter-3/fpsan>`
 - Design: :doc:`Compiler-selected TMA multicast <design/triton_tma_multicast>`
+- Design: :doc:`MXFP6 data type support <design/mxfp6_design>`
 
 .. toctree::
    :maxdepth: 1
@@ -91,5 +92,6 @@ Check out the following documents to learn more about Triton and how it compares
    programming-guide/chapter-3/debugging
    programming-guide/chapter-3/fpsan
    design/triton_tma_multicast
+   design/mxfp6_design
 
 .. _Triton: https://github.com/triton-lang/triton

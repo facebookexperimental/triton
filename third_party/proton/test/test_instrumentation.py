@@ -13,9 +13,11 @@ import triton.language as tl
 import triton.profiler.language as pl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.nvidia.ampere import async_copy
 from triton.experimental.gluon.language.nvidia.blackwell import clc
 from triton.experimental.gluon.language.nvidia.hopper import mbarrier
 from triton._internal_testing import (
+    is_ampere_or_newer,
     is_cuda,
     is_hip,
     is_hip_cdna2,
@@ -267,6 +269,189 @@ def test_record_predicate_ir(fresh_knobs, tmp_path: pathlib.Path):
     assert "scf.if" not in ttir
 
 
+def test_event(tmp_path: pathlib.Path):
+
+    @triton.jit
+    def kernel(x_ptr):
+        value = tl.load(x_ptr)
+        event = pl.allocate_event("async")
+        pl.start_event(event)
+        value += 1
+        pl.end_event(event)
+        tl.store(x_ptr, value)
+
+    def find_node(node, name):
+        if node["frame"]["name"] == name:
+            return node
+        for child in node.get("children", []):
+            if result := find_node(child, name):
+                return result
+        return None
+
+    x = torch.tensor([5], device="cuda", dtype=torch.int32)
+    tree_path = tmp_path / "event.hatchet"
+    proton.start(str(tree_path.with_suffix("")), backend="instrumentation")
+    kernel[(1, )](x, num_warps=1)
+    proton.finalize()
+
+    with tree_path.open("rb") as f:
+        tree = json.load(f)[0]
+    async_node = find_node(tree, "async")
+    assert async_node["metrics"]["cycles"] > 0
+
+    trace_path = tmp_path / "event.chrome_trace"
+    proton.start(
+        str(trace_path.with_suffix("")),
+        backend="instrumentation",
+        data="trace",
+    )
+    kernel[(1, )](x, num_warps=1)
+    proton.finalize()
+
+    with trace_path.open("rb") as f:
+        events = json.load(f)["traceEvents"]
+    async_events = [event for event in events if event["name"] == "async"]
+    assert len(async_events) == 1
+    assert async_events[0]["ph"] == "X"
+    assert async_events[0]["dur"] > 0
+    assert "bind_id" not in async_events[0]
+
+
+@pytest.mark.skipif(not is_ampere_or_newer(), reason="requires Ampere or newer")
+def test_gluon_event(tmp_path: pathlib.Path):
+
+    @gluon.jit
+    def kernel(output_ptr, input_ptr, BLOCK: gl.constexpr, NUM_TILES: gl.constexpr):
+        blocked_layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [4, 1], [1, 0])
+        shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+        shared = gl.allocate_shared_memory(gl.float32, [BLOCK, BLOCK], shared_layout)
+        rows = gl.arange(0, BLOCK, gl.SliceLayout(1, blocked_layout))[:, None]
+        cols = gl.arange(0, BLOCK, gl.SliceLayout(0, blocked_layout))[None, :]
+        offsets = rows * BLOCK + cols
+        tile_size: gl.constexpr = BLOCK * BLOCK
+
+        event = pl.allocate_event("async_copy")
+        pl.start_event(event)
+        async_copy.async_load(shared, input_ptr + offsets)
+        async_copy.commit_group()
+
+        for tile in tl.range(1, NUM_TILES):
+            async_copy.wait_group(0)
+            pl.end_event(event)
+            value = shared.load(blocked_layout)
+            gl.store(output_ptr + (tile - 1) * tile_size + offsets, value)
+
+            pl.start_event(event)
+            async_copy.async_load(shared, input_ptr + tile * tile_size + offsets)
+            async_copy.commit_group()
+
+        async_copy.wait_group(0)
+        pl.end_event(event)
+        value = shared.load(blocked_layout)
+        gl.store(output_ptr + (NUM_TILES - 1) * tile_size + offsets, value)
+
+    input = torch.randn((3, 32, 32), device="cuda", dtype=torch.float32)
+    output = torch.empty_like(input)
+    trace_path = tmp_path / "gluon_event.chrome_trace"
+    proton.start(str(trace_path.with_suffix("")), backend="instrumentation", data="trace")
+    kernel[(1, )](output, input, BLOCK=32, NUM_TILES=3, num_warps=4)
+    proton.finalize()
+    torch.testing.assert_close(output, input)
+
+    with trace_path.open("rb") as f:
+        events = json.load(f)["traceEvents"]
+    async_events = [event for event in events if event["name"] == "async_copy"]
+    events_by_warp = {}
+    for event in async_events:
+        assert event["ph"] == "X" and event["dur"] > 0
+        assert "bind_id" not in event
+        events_by_warp.setdefault(event["tid"], []).append(event)
+    assert events_by_warp
+    assert set(map(len, events_by_warp.values())) == {3}
+
+
+@pytest.mark.skipif(not supports_ws(), reason="requires warp specialization")
+def test_gluon_warp_specialized_event(tmp_path: pathlib.Path):
+
+    @gluon.jit
+    def consumer(barrier, event):
+        mbarrier.wait(barrier, phase=0)
+        pl.end_event(event)
+
+    @gluon.jit
+    def producer(barrier, event):
+        pl.start_event(event)
+        mbarrier.arrive(barrier, count=1)
+
+    @gluon.jit
+    def kernel():
+        barrier = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
+        mbarrier.init(barrier, count=1)
+        event = pl.allocate_event("warp_specialized")
+        gl.warp_specialize([
+            (consumer, (barrier, event)),
+            (producer, (barrier, event)),
+        ], [4], [24])
+
+    trace_path = tmp_path / "warp_specialized_event.chrome_trace"
+    proton.start(str(trace_path.with_suffix("")), backend="instrumentation", data="trace")
+    kernel[(1, )](num_warps=4)
+    proton.finalize()
+
+    with trace_path.open("rb") as f:
+        events = json.load(f)["traceEvents"]
+    async_events = [event for event in events if event["name"] == "warp_specialized"]
+    assert async_events
+
+    links = {}
+    for event in async_events:
+        assert event["ph"] == "X" and event["dur"] == 0
+        assert "bind_id" in event
+        links.setdefault(event["bind_id"], []).append(event)
+
+    assert len(links) == 4
+    for endpoints in links.values():
+        assert len(endpoints) == 2
+        start = next(event for event in endpoints if event.get("flow_out"))
+        end = next(event for event in endpoints if event.get("flow_in"))
+        assert start["tid"] != end["tid"]
+        assert start["ts"] <= end["ts"]
+
+
+@pytest.mark.skipif(not supports_ws(), reason="requires warp specialization")
+def test_gluon_warp_specialized_dynamic_event(tmp_path: pathlib.Path):
+
+    @gluon.jit
+    def default_partition(iterations):
+        event = pl.allocate_event("dynamic_warp_specialized")
+        # The dynamic loop makes Proton's segment part of warp specialization's CFG.
+        for _ in range(iterations):
+            pl.start_event(event)
+            pl.end_event(event)
+
+    @gluon.jit
+    def empty_partition():
+        pass
+
+    @gluon.jit(do_not_specialize=["iterations"])
+    def kernel(iterations):
+        gl.warp_specialize([
+            (default_partition, (iterations, )),
+            (empty_partition, ()),
+        ], [4], [24])
+
+    trace_path = tmp_path / "warp_specialized_dynamic_event.chrome_trace"
+    proton.start(str(trace_path.with_suffix("")), backend="instrumentation", data="trace")
+    kernel[(1, )](2, num_warps=4)
+    proton.finalize()
+
+    with trace_path.open("rb") as f:
+        events = json.load(f)["traceEvents"]
+    async_events = [event for event in events if event["name"] == "dynamic_warp_specialized"]
+    assert async_events
+    assert all(event["ph"] == "X" for event in async_events)
+
+
 def test_select_ids(tmp_path: pathlib.Path):
     from contextlib import contextmanager
 
@@ -377,6 +562,62 @@ def test_no_scope_zero_scratch(tmp_path: pathlib.Path):
         add_kernel[(1, 1, 1)](x, y, output, size, BLOCK_SIZE=1024, num_warps=4)
         # Header is still built even though there is no profile-scratch payload.
         assert proton.hooks.InstrumentationHook.host_buffer is not None
+
+
+def test_host_buffer_survives_uninstrumented_kernel(tmp_path: pathlib.Path):
+    from contextlib import contextmanager
+
+    # A session that launches an instrumented (scoped) kernel followed by an
+    # uninstrumented one (no scopes, profile_scratch_size == 0, e.g. an
+    # auxiliary reduction trailing the profiled kernel). The trailing kernel
+    # must not clobber the valid host_buffer snapshot: block_num/total_unit
+    # must still describe the scoped kernel. Complements
+    # test_no_scope_zero_scratch, which covers the single-kernel case.
+    @contextmanager
+    def instrumentation(file_path):
+        proton.hooks.InstrumentationHook.enable_host_buffer = True
+        proton.start(str(file_path.with_suffix("")), backend="instrumentation")
+        try:
+            yield
+        finally:
+            proton.hooks.InstrumentationHook.enable_host_buffer = False
+            proton.finalize()
+
+    @triton.jit
+    def scoped_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        with pl.scope("load0"):
+            x = tl.load(x_ptr + offsets, mask=mask)
+        tl.store(output_ptr + offsets, x, mask=mask)
+
+    @triton.jit
+    def plain_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask)
+        tl.store(output_ptr + offsets, x, mask=mask)
+
+    size = 256
+    x = torch.rand(size, device="cuda")
+    out0 = torch.empty_like(x)
+    out1 = torch.empty_like(x)
+    temp_file = tmp_path / "test_host_buffer_survives_uninstrumented_kernel.hatchet"
+
+    def header_u32(buf, off):
+        return int.from_bytes(buf[off:off + 4].numpy().tobytes(), "little")
+
+    with instrumentation(temp_file):
+        scoped_kernel[(1, 1, 1)](x, out0, size, BLOCK_SIZE=1024, num_warps=8)
+        plain_kernel[(1, 1, 1)](x, out1, size, BLOCK_SIZE=1024, num_warps=4)
+        host_buffer = proton.hooks.InstrumentationHook.host_buffer
+        assert host_buffer is not None
+        # The snapshot must still describe the scoped kernel (8 warps with
+        # profiling data), not the trailing plain kernel (4 warps, no data).
+        assert header_u32(host_buffer, 28) == 8  # total_unit
+        assert header_u32(host_buffer, 24) > 0  # block_num
 
 
 @pytest.mark.parametrize("hook", ["triton", None])
