@@ -926,6 +926,7 @@ def _mxfp8_varlen_extended_kernel(  # noqa: TR001
     PREQUANTIZED_Q: tl.constexpr,
     USE_WORK_ORDER: tl.constexpr,
     REUSE_METADATA: tl.constexpr,
+    SCHEDULE_ITEMS: tl.constexpr,
 ):
     HN: tl.constexpr = 64
     HD: tl.constexpr = 64
@@ -934,6 +935,8 @@ def _mxfp8_varlen_extended_kernel(  # noqa: TR001
     pid = tl.program_id(0)
     n_ctas = tl.num_programs(0)
     n_items = tl.load(CuQTile + BATCH) * HEADS
+    if USE_WORK_ORDER and n_items != SCHEDULE_ITEMS:
+        return
     base = pid % 8 * (n_ctas // 8) + pid // 8
     if base >= n_items:
         return
@@ -1917,6 +1920,11 @@ def _launch_extended_forward(
         REUSE_METADATA=(
             work_schedule is not None
             and work_schedule.total_kv < 4096 * batch
+        ),
+        SCHEDULE_ITEMS=(
+            work_schedule.item_order.numel()
+            if work_schedule is not None
+            else 0
         ),
         **{**_LAUNCH_OPTIONS, "num_warps": block_m // 32},
     )
