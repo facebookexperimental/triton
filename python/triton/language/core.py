@@ -1386,6 +1386,12 @@ class tensor(base_value):
     def ravel(self) -> tensor:
         ...
 
+    def all(self, axis=None, keep_dims=False) -> tensor:
+        ...
+
+    def any(self, axis=None, keep_dims=False) -> tensor:
+        ...
+
     def max(
         self,
         axis=None,

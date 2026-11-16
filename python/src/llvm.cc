@@ -2,6 +2,7 @@
 #include "mlir/IR/BuiltinOps.h" // mlir::ModuleOp
 #include "mlir/Target/LLVMIR/LLVMTranslationInterface.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
+#include "third_party/amd/lib/Target/MIRDAG/DAGBuilder.h"
 #include "triton/Tools/LLVMOptions.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include "triton/Version.h"
@@ -318,6 +319,88 @@ createTargetMachine(llvm::Module *module, std::string proc,
       disableLLVMOpt ? llvm::CodeGenOptLevel::None
                      : llvm::CodeGenOptLevel::Aggressive)};
   return machine;
+}
+
+std::string
+translateLLVMIRToMIR(llvm::Module &module, const std::string &triple,
+                     const std::string &proc, const std::string &features,
+                     const std::vector<std::string> &flags,
+                     bool enable_fp_fusion, const std::string &dumpFileId) {
+  using namespace mlir;
+
+  // Check if we should dump MIR
+  std::string dumpMirBase = triton::tools::getStrEnv("TRITON_DUMP_MIR");
+  bool dumpMir = !dumpMirBase.empty();
+  if (!dumpMir) {
+    return "";
+  }
+
+  llvm::StripDebugInfo(module);
+
+  LLVMOptionSettings options;
+  options.enable(flags);
+  options.enableFlagsFromDisableLLVMOptEnv();
+  options.enablePrintAfterAllIfRequested();
+  // Stop right after the scheduling-DAG pass, which substitutes itself for the
+  // machine scheduler (see armLivePipelineDAGEmission). This truncates the
+  // pipeline at exactly the same point -stop-before=machine-scheduler did, so
+  // the MIR dumped below is unchanged.
+  options.set("stop-after", llvm::mir_dag::livePipelineDAGPassName());
+  ScopedLLVMOptions optionScope(options.settings);
+
+  // inline everything
+  for (llvm::Function &f : module.functions())
+    if (!f.hasFnAttribute(llvm::Attribute::NoInline))
+      f.addFnAttr(llvm::Attribute::AlwaysInline);
+  // verify and store llvm
+  llvm::legacy::PassManager pm;
+  pm.add(llvm::createAlwaysInlinerLegacyPass());
+  pm.add(llvm::createVerifierPass());
+
+  pm.run(module);
+
+  // create machine
+  module.setTargetTriple(Triple(triple));
+  auto machine = createTargetMachine(&module, proc, enable_fp_fusion, features);
+  // set data layout
+  module.setDataLayout(machine->createDataLayout());
+
+  // Emit machine code (MIR text, since the pipeline stops before regalloc) and,
+  // in the same run, the scheduling DAG built on the live MachineFunction. The
+  // DAG pass takes the machine scheduler's slot, so it sees exactly the MF
+  // whose MIR is printed here -- (bb, position) maps 1:1 onto the dumped body
+  // lines, and `bb` is the number the MIR printer puts in the `bb.N` labels.
+  std::string result;
+  std::string dagText;
+  {
+    llvm::mir_dag::armLivePipelineDAGEmission(&dagText);
+    llvm::scope_exit disarm(
+        [] { llvm::mir_dag::disarmLivePipelineDAGEmission(); });
+    llvm::raw_string_ostream stream(result);
+    llvm::buffer_ostream pstream(stream);
+    llvm::legacy::PassManager pass;
+    machine->addPassesToEmitFile(pass, pstream, nullptr,
+                                 llvm::CodeGenFileType::AssemblyFile);
+    pass.run(module);
+  }
+
+  std::string dumpFilename = dumpMirBase + "/" + dumpFileId + ".txt";
+  {
+    std::error_code EC;
+    llvm::raw_fd_ostream outFile(dumpFilename, EC, llvm::sys::fs::OF_None);
+    if (EC) {
+      llvm::errs() << "Error opening file " << dumpFilename << ": "
+                   << EC.message() << "\n";
+    } else {
+      outFile << result;
+      outFile << "---";
+      outFile << "\n========== SCHEDULING DAG ==========\n";
+      outFile << dagText;
+    }
+    llvm::errs() << "MIR dumped to: " << dumpFilename << "\n";
+  }
+
+  return result;
 }
 
 std::string

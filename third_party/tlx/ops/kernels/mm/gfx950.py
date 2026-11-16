@@ -14061,6 +14061,7 @@ def _wg_store_cached_b_output(
     prefetched_bias,
     PREFETCH_BIAS: tl.constexpr,
     FUSED_GROUP_FRAGMENTS: tl.constexpr,
+    STORE_CACHE: tl.constexpr,
 ):
     group_m: tl.constexpr = 16 * warps_m
     if warps_m == 4 and wide:
@@ -14100,7 +14101,7 @@ def _wg_store_cached_b_output(
                     ADD_BIAS,
                 )
                 value = tlx.require_layout(value.to(c_ptr.dtype.element_ty), store_layout)
-                tlx.buffer_store(value, base, offsets, contiguity=8, cache=".cs")
+                tlx.buffer_store(value, base, offsets, contiguity=8, cache=STORE_CACHE)
     else:
         _wg_store_mi16_wave_grid_output(
             c_ptr,
@@ -14125,7 +14126,7 @@ def _wg_store_cached_b_output(
             False,
             mma,
             ADD_BIAS,
-            store_cache=".cs",
+            store_cache=STORE_CACHE,
             prefetched_bias=prefetched_bias,
             PREFETCH_BIAS=PREFETCH_BIAS,
             FUSED_GROUP_FRAGMENTS=FUSED_GROUP_FRAGMENTS,
@@ -14158,6 +14159,7 @@ def _wg_kernel_cached_b_lds(
     ADD_BIAS: tl.constexpr,
     PREFETCH_BIAS: tl.constexpr,
     FUSED_GROUP_FRAGMENTS: tl.constexpr,
+    STORE_CACHE: tl.constexpr = ".cs",
 ):
     tl.static_assert(K % 64 == 0 and K >= 128 and K <= 256)
     tl.static_assert(WARPS_M == 2 or WARPS_M == 4)
@@ -14270,6 +14272,7 @@ def _wg_kernel_cached_b_lds(
             prefetched_bias,
             PREFETCH_BIAS,
             FUSED_GROUP_FRAGMENTS,
+            STORE_CACHE,
         )
 
 
@@ -17360,7 +17363,6 @@ def _launch_row_major_direct(a, b, out, plan, bias=None):
         TILES_PER_PROBLEM=tiles_per_problem,
         PROGRAM_COUNT=program_count,
         ADD_BIAS=bias is not None,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
         num_stages=1,
         **plan,
     )
@@ -18032,9 +18034,8 @@ def _register_kernel_impl(  # noqa: TR001
         tl.store(c_ptr + output_offsets, acc, mask=mask)
 
 
-def _register_launch_options(m, n, k, config):
-    disable_agpr = ((k == 256 and n > 256) or (k > 512 and (k % _BLOCK_K != 0 or m * n <= 2 * 1024 * 1024)))
-    launch_options = ({"llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"), )} if disable_agpr else {})
+def _register_launch_options(config):
+    launch_options = {}
     if config["BLOCK_K"] == 128 and config["num_stages"] == 3:
         launch_options["reverse_local_assignment"] = True
         if config["BLOCK_M"] == 64 and config["BLOCK_N"] == 64:
@@ -18165,7 +18166,7 @@ def _dense_tn_register_launcher(
     del a_strides, b_strides, out_strides
     config = dict(config_items)
     grid = (triton.cdiv(m, config["BLOCK_M"]) * triton.cdiv(n, config["BLOCK_N"]), )
-    launch_options = _register_launch_options(m, n, k, config)
+    launch_options = _register_launch_options(config)
     compile_lock = threading.Lock()
     launcher = None
 
@@ -18223,7 +18224,7 @@ def _launch_register_plan(a, b, *, config, bias=None, out=None, _validated=False
             out.stride(),
             tuple(sorted(config.items())),
         )(a, b, out)
-    launch_options = _register_launch_options(m, n, k, config)
+    launch_options = _register_launch_options(config)
     grid = (triton.cdiv(m, config["BLOCK_M"]) * triton.cdiv(n, config["BLOCK_N"]), )
     kernel_args = _register_kernel_args(a, b, bias, out)
     _register_kernel_impl[grid](
@@ -18715,7 +18716,7 @@ def _launch_split_register(a, b, out, plan, *, fallback_plan=None, workspace=Non
     use_i64_a = (m - 1) * a.stride(0) + (k_extent - 1) * a.stride(1) >= 1 << 31
     use_i64_b = (k_extent - 1) * b.stride(0) + (n - 1) * b.stride(1) >= 1 << 31
     pipe_iters = (16 if (k == 16 * split_k * block_k and a.stride() == (k, 1) and b.stride() == (1, k)) else 0)
-    launch_options = dict(_register_launch_options(m, n, k, plan))
+    launch_options = dict(_register_launch_options(plan))
     for key, value in plan.items():
         if key not in _SPLIT_REGISTER_HOST_KEYS:
             launch_options[key] = value
@@ -18917,7 +18918,6 @@ def _paired_b_has_padding(b):
 def _range_register_launch_options(a, b, config):
     options = {}
     if a.dtype == torch.bfloat16 and config["BLOCK_K"] == 64:
-        options["llvm_fn_attrs"] = (("amdgpu-agpr-alloc", "0,0"), )
         square = config["BLOCK_M"] == config["BLOCK_N"] == 256
         if (not square and config["BLOCK_M"] >= 128 and b.shape[1] % config["BLOCK_N"] != 0 and b.stride(1) == 1
                 and a.shape[0] >= 8 * b.shape[1]):
@@ -19219,7 +19219,6 @@ NUM_XCDS = 8
 
 MIN_K = 2 * BLOCK_K  # pipeline prefetches 2 whole K-tiles; the rest goes to the masked tail
 KERNEL_NAME = "a16w16_8wave"
-_LLVM_ATTRS = (("amdgpu-agpr-alloc", "0,0"), )
 _READY_VALUE = 3
 
 
@@ -19450,8 +19449,7 @@ def _launch_register(a, b, bias=None, config=None, out=None):
             raise ValueError("Bias and matrix operands must have matching device and dtype")
     if out is None:
         out = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    disable_agpr = (K == 256 and N > 256) or (K > 512 and (K % BLOCK_K != 0 or M * N <= 2 * 1024 * 1024))
-    launch_options = {"llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"), )} if disable_agpr else {}
+    launch_options = {}
     bias_ptr = bias if bias is not None else out
     args = (
         a,
@@ -21088,9 +21086,9 @@ def _launch_lds(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EP
         num_warps=4 if BM == 128 else NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
-        # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
-        # v_accvgpr moves around each mfma). Essential to match the reference perf.
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+        # Only a four-wave work-group leaves AGPRs in the per-wave register budget,
+        # so the VGPR-only pin is a no-op for the eight-wave tile.
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ) if BM == 128 else (),
         enable_sched_group_barrier_scheduler=((M, N, K, a.dtype) not in _LDS_DISABLE_SCHEDULER_SHAPES),
     )
     if SPLIT_K > 1:
@@ -21200,7 +21198,7 @@ def streamk_matmul(a, b):
                                                  b.stride(0), b.stride(1), c.stride(0), c.stride(1), BLOCK_M=BM,
                                                  BLOCK_N=BN, BLOCK_K=BLOCK_K, NUM_XCDS=NUM_XCDS, NUM_CU=NUM_CU,
                                                  GROUP_SIZE_M=GROUP_SIZE_M, **schedule, num_warps=NUM_WARPS,
-                                                 num_stages=1, matrix_instr_nonkdim=16, llvm_fn_attrs=_LLVM_ATTRS)
+                                                 num_stages=1, matrix_instr_nonkdim=16)
     return c
 
 
@@ -21220,7 +21218,6 @@ _iw_NUM_XCDS = 8
 
 _iw_MIN_K = (2 * _iw_BLOCK_K)  # pipeline prefetches 2 whole K-tiles; the rest goes to the masked tail
 _iw_KERNEL_NAME = "a16w16_8wave"
-_iw_LLVM_ATTRS = (("amdgpu-agpr-alloc", "0,0"), )
 _iw_READY_VALUE = 3
 
 # Coalesced SIMD layout for a 128x128 fp16 output quadrant.  Keeping the
@@ -22972,7 +22969,6 @@ def _iw_launch(
     TILE=None,
     K_LIMIT=None,
     DEFER_EPILOGUE=False,
-    DISABLE_AGPR=True,
     REVERSE_LOCAL_ASSIGNMENT=False,
     SINK_INSTS_TO_AVOID_SPILLS=False,
     DISABLE_HIGH_RP_RESCHEDULE=False,
@@ -23061,8 +23057,6 @@ def _iw_launch(
     warps_m, warps_n = WARP_GRID
     assert warps_m * warps_n in (4, 8)
     launch_options = {}
-    if DISABLE_AGPR:
-        launch_options["llvm_fn_attrs"] = (("amdgpu-agpr-alloc", "0,0"), )
     if REVERSE_LOCAL_ASSIGNMENT:
         launch_options["reverse_local_assignment"] = True
     if SINK_INSTS_TO_AVOID_SPILLS:
@@ -23369,7 +23363,6 @@ def _iw_streamk_matmul(
         num_warps=_iw_NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
-        llvm_fn_attrs=_iw_LLVM_ATTRS,
     )
     return c
 
@@ -25934,8 +25927,24 @@ _CACHED_B_SHAPE_PLANS = {
     },
 }
 
+# Each C store instruction here writes alternate 16 B chunks of a 128 B L2 line.
+# With ``.cs`` the two halves of a line only merge in L2 while the store pair
+# stays back to back; otherwise every line is written back twice.
+_CACHED_B_TEMPORAL_STORE_SHAPES = frozenset({
+    (819_200, 1_024, 192, torch.bfloat16),
+    (819_200, 1_024, 192, torch.float16),
+    (2_252_800, 256, 256, torch.float16),
+})
+
 
 def _cached_b_geometry_plan(m, n, k, dtype, a_strides):
+    plan = _cached_b_tile_plan(m, n, k, dtype, a_strides)
+    if plan is not None and (m, n, k, dtype) in _CACHED_B_TEMPORAL_STORE_SHAPES:
+        plan = dict(plan, STORE_CACHE="")
+    return plan
+
+
+def _cached_b_tile_plan(m, n, k, dtype, a_strides):
     exact = _CACHED_B_SHAPE_PLANS.get((m, n, k, dtype))
     if exact is not None:
         return exact

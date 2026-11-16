@@ -31,7 +31,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from . import report as report_mod
 from . import verdict
-from .compile import COLD_COMPILE_CAP_S, cold_compile
+from .compile import COLD_COMPILE_CAP_S, CompileStat, cold_compile
 from .contract import Case, Result, Status
 from .denoise import Governor, capture_env, list_devices, select_device, stable
 from .measure import DEFAULT_REPLICATES, LATENCY_MODES, host_overhead_us, measure
@@ -71,6 +71,8 @@ class Prepared:
     #: no `heuristic_config` autotunes a full space on its first call and will
     #: legitimately exceed the default; see the suite README.
     cap_s: float = COLD_COMPILE_CAP_S
+    #: For adapters that must compile and capture their graph during preparation.
+    compile_stat: Optional[CompileStat] = None
 
 
 #: The GPU this run is about. Everything downstream -- which focus suites are
@@ -259,7 +261,9 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     #
     # `cold=False` skips it and the case reports no compile time. See
     # `resolve_cold_compile` for why that is the default on some ops.
-    compile_stat = cold_compile(prep.tlx_fn, cap_s=prep.cap_s) if cold else None
+    compile_stat = prep.compile_stat
+    if compile_stat is None and cold:
+        compile_stat = cold_compile(prep.tlx_fn, cap_s=prep.cap_s)
 
     configs: dict = {}
     with _record_configs(configs):

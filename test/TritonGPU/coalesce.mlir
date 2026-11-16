@@ -59,7 +59,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // CHECK: [[NARROW_LAYOUT:#.*]] = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 // CHECK: [[WIDE_LAYOUT:#.*]] = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
-tt.func public @load_tensors_two_types(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg3: i32) {
+tt.func public @load_tensors_two_types(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg3: i32 {tt.divisibility = 16 : i32}) {
     %c1024_i32 = arith.constant 1024 : i32
     %0 = tt.get_program_id x : i32
     %1 = arith.muli %0, %c1024_i32 : i32
@@ -93,7 +93,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // CHECK-NOT: sizePerThread = [4]
 // CHECK: #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 // CHECK-NOT: sizePerThread = [4]
-tt.func public @load_tensors_two_types(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg3: i32) {
+tt.func public @load_tensors_two_types(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg3: i32 {tt.divisibility = 16 : i32}) {
     %c1024_i32 = arith.constant 1024 : i32
     %0 = tt.get_program_id x : i32
     %1 = arith.muli %0, %c1024_i32 : i32
@@ -462,6 +462,58 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
   tt.func @load_store_contiguity_0(%ptrs: tensor<128x!tt.ptr<f32>, #blocked> {tt.contiguity = 0 : i32, tt.divisibility = 16 : i32}) {
     %v = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #blocked>
     tt.store %ptrs, %v : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// The store lowering caps a masked store at its mask's alignment. With a
+// runtime bound of unknown divisibility the store gets one element per thread
+// and the load keeps its wider layout. A bound divisible by 16 changes nothing.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// CHECK-DAG: [[$NARROW:#.*]] = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// CHECK-DAG: [[$WIDE:#.*]] = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @store_mask_unaligned
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f16>, [[$WIDE]]>
+  // CHECK: tt.store {{.*}} : tensor<1024x!tt.ptr<f16>, [[$NARROW]]>
+  tt.func public @store_mask_unaligned(%in: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %out: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %n: i32) {
+    %c1024_i32 = arith.constant 1024 : i32
+    %pid = tt.get_program_id x : i32
+    %start = arith.muli %pid, %c1024_i32 : i32
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %starts = tt.splat %start : i32 -> tensor<1024xi32, #blocked>
+    %offs = arith.addi %starts, %range : tensor<1024xi32, #blocked>
+    %bound = tt.splat %n : i32 -> tensor<1024xi32, #blocked>
+    %mask = arith.cmpi slt, %offs, %bound : tensor<1024xi32, #blocked>
+    %in_base = tt.splat %in : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %in_ptrs = tt.addptr %in_base, %offs : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    %x = tt.load %in_ptrs, %mask : tensor<1024x!tt.ptr<f16>, #blocked>
+    %out_base = tt.splat %out : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %out_ptrs = tt.addptr %out_base, %offs : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    tt.store %out_ptrs, %x, %mask : tensor<1024x!tt.ptr<f16>, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: @store_mask_aligned
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f16>, [[$WIDE]]>
+  // CHECK: tt.store {{.*}} : tensor<1024x!tt.ptr<f16>, [[$WIDE]]>
+  tt.func public @store_mask_aligned(%in: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %out: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %n: i32 {tt.divisibility = 16 : i32}) {
+    %c1024_i32 = arith.constant 1024 : i32
+    %pid = tt.get_program_id x : i32
+    %start = arith.muli %pid, %c1024_i32 : i32
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %starts = tt.splat %start : i32 -> tensor<1024xi32, #blocked>
+    %offs = arith.addi %starts, %range : tensor<1024xi32, #blocked>
+    %bound = tt.splat %n : i32 -> tensor<1024xi32, #blocked>
+    %mask = arith.cmpi slt, %offs, %bound : tensor<1024xi32, #blocked>
+    %in_base = tt.splat %in : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %in_ptrs = tt.addptr %in_base, %offs : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    %x = tt.load %in_ptrs, %mask : tensor<1024x!tt.ptr<f16>, #blocked>
+    %out_base = tt.splat %out : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %out_ptrs = tt.addptr %out_base, %offs : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    tt.store %out_ptrs, %x, %mask : tensor<1024x!tt.ptr<f16>, #blocked>
     tt.return
   }
 }

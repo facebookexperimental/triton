@@ -45,7 +45,6 @@ PHANTOM_BLOCKS = 3
 # A q tile over fewer KV blocks than this is charged as if it had this many (see `_tile_phantom`).
 SHORT_KV_FLOOR_BLOCKS = 8
 LOG2E: tl.constexpr = tl.constexpr(1.4426950408889634)
-_VGPR_ONLY = (("amdgpu-agpr-alloc", "0,0"), )
 
 
 @triton.jit
@@ -940,5 +939,5 @@ def stream_k_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_offsets:
         IS_SOFTMAX=is_softmax, HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, Z_PAD=z_pad,
         LOG2_Z_PAD=max(1, (z_pad - 1).bit_length()), MAX_SEGMENTS=MAX_SEGMENTS, PHANTOM_BLOCKS=PHANTOM_BLOCKS,
         SHORT_KV_FLOOR_BLOCKS=SHORT_KV_FLOOR_BLOCKS, PIPE_STAGES=PIPE_STAGES,
-        RESCALE_THRESHOLD=LAZY_RESCALE_THRESHOLD.value, num_warps=8, waves_per_eu=2, llvm_fn_attrs=_VGPR_ONLY,
+        RESCALE_THRESHOLD=LAZY_RESCALE_THRESHOLD.value, num_warps=8, waves_per_eu=2,
         enable_sched_group_barrier_scheduler=False)

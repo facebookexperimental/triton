@@ -453,7 +453,6 @@ def _launch_quad(a, b, c, sorted_ids, expert_ids, num_post, N, K, num_valid, top
                                                A_ROW_DIV_TOPK=a_row_div_topk, DUAL_B=dual_b, BLOCK_M=bm,
                                                GROUP_M=cfg["GROUP_M"], XCD_CHUNK=cfg["XCD_CHUNK"], num_warps=8,
                                                num_stages=1, matrix_instr_nonkdim=16,
-                                               llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
                                                llvm_cl_opts=(("enable-post-misched", "false"), ))
 
 

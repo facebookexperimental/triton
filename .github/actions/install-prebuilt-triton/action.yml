@@ -1,9 +1,9 @@
 name: Install prebuilt Triton
 description: >
   Fetch the wheel the build job produced and install it into the active venv
-  (see setup-test-env). Fork PRs read it from the run's GitHub artifacts;
-  everything else reads it from S3 as 16 parallel byte ranges, since a single
-  S3 stream sometimes runs at ~1 MB/s (6.5 min for the wheel).
+  (see setup-test-env). A wheel without a URL (a fork PR's own build) comes from
+  the run's GitHub artifacts; a wheel with one comes from S3 as 16 parallel byte
+  ranges, since a single S3 stream sometimes runs at ~1 MB/s (6.5 min for the wheel).
 inputs:
   artifact-name:
     description: GitHub artifact containing the wheel
@@ -25,13 +25,13 @@ runs:
   using: composite
   steps:
     - name: Download prebuilt Triton wheel from GitHub artifacts
-      if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+      if: inputs.wheel-url == ''
       uses: actions/download-artifact@v4
       with:
         name: ${{ inputs.artifact-name || format('run_{0}', github.run_id) }}
         path: ${{ runner.temp }}/prebuilt-wheel
     - name: Download prebuilt Triton wheel from S3
-      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      if: inputs.wheel-url != ''
       shell: bash
       env:
         WHEEL_URL: ${{ inputs.wheel-url }}
