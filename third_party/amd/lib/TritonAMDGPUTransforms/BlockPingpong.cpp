@@ -1,5 +1,6 @@
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
@@ -63,6 +64,55 @@ static bool isLoopVariant(Value val, scf::ForOp forOp) {
       continue;
     for (Value operand : def->getOperands())
       worklist.push_back(operand);
+  }
+  return false;
+}
+
+// Traces a stage-buffer memdesc through subviews and loop-carried rotation
+// to the value that identifies the buffer (usually the local_alloc result).
+static Value rootStageBuffer(Value memdesc, scf::ForOp forOp) {
+  while (true) {
+    if (auto arg = dyn_cast<BlockArgument>(memdesc)) {
+      auto init = forOp.getTiedLoopInit(arg);
+      if (!init)
+        return memdesc;
+      memdesc = init->get();
+      continue;
+    }
+    Operation *def = memdesc.getDefiningOp();
+    if (auto index = dyn_cast_or_null<ttg::MemDescIndexOp>(def)) {
+      memdesc = index.getSrc();
+      continue;
+    }
+    if (auto trans = dyn_cast_or_null<ttg::MemDescTransOp>(def)) {
+      memdesc = trans.getSrc();
+      continue;
+    }
+    return memdesc;
+  }
+}
+
+// True if some stage buffer's refill copy precedes, in final loop-body
+// order, a local_load of the same buffer whose async_wait still tolerates
+// outstanding copy groups (num > 0).
+static bool hasStageBufferWar(scf::ForOp forOp) {
+  DenseMap<Value, int64_t> firstCopyAt;
+  int64_t pos = 0;
+  for (Operation &op : *forOp.getBody()) {
+    if (auto copy = dyn_cast<tt::amdgpu::BufferLoadToLocalOp>(&op))
+      firstCopyAt.try_emplace(rootStageBuffer(copy.getDest(), forOp), pos);
+    else if (auto copy = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(&op))
+      firstCopyAt.try_emplace(rootStageBuffer(copy.getResult(), forOp), pos);
+    else if (auto load = dyn_cast<ttg::LocalLoadOp>(&op)) {
+      int64_t waitNum = 0;
+      if (Value token = load.getToken())
+        if (auto wait = token.getDefiningOp<ttg::AsyncWaitOp>())
+          waitNum = wait.getNum();
+      auto copyAt = firstCopyAt.find(rootStageBuffer(load.getSrc(), forOp));
+      if (waitNum > 0 && copyAt != firstCopyAt.end() && copyAt->second < pos)
+        return true;
+    }
+    ++pos;
   }
   return false;
 }
@@ -1103,6 +1153,26 @@ void Pingponger::getDotPingponged() {
   if (numOfDotLikeOps == 2) {
     if (numStages != 4 || !hasTwoDotSchedule)
       return;
+
+    // Stage buffers rotate through the loop: a refill copy for the next
+    // rotation is issued in an earlier cluster than the local_load that
+    // reads the current rotation of the same buffer, and the load's
+    // async_wait still tolerates outstanding copy groups (num > 0), i.e.
+    // the schedule assumes the copy has landed by lockstep timing. That is
+    // safe in lockstep, where the read precedes the next loop-top barrier
+    // in every warp. The asymmetric sync offsets the warp halves by one
+    // cluster epoch: the leading half's loop-top arrival is released by the
+    // lagging half's mid-loop barrier arrival, which precedes its
+    // local_load, so the leading half can refill the buffer before the
+    // lagging half reads it, and the per-warp async_wait tokens do not
+    // order another warp's copy. Reject such write-after-read stage-buffer
+    // patterns, computed from the final loop-body order.
+    if (hasStageBufferWar(forOp)) {
+      LDBG("Unable to apply ping pong scheduling. Details: a stage buffer "
+           "refill copy precedes a local_load of the same buffer whose "
+           "async_wait tolerates outstanding groups");
+      return;
+    }
 
     if (transformChainedDotSchedule(builder, loc).failed()) {
       LDBG("Encountered failure when trying the ChainedDot ping pong "
