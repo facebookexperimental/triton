@@ -1559,10 +1559,14 @@ def paged_attention_decode_fp8(query, key_cache, value_cache, context_lens, bloc
     """Forward-only attention over packed E4M3FN KV with per-head multipliers.
 
     Q is ``[batch * query_length, query_heads, D]``, BF16 or E4M3FN; D is 64/128.
-    K is ``[blocks, kv_heads, D/16, page, 16]`` and V is
-    ``[blocks, kv_heads, page/16, D, 16]``, contiguous E4M3FN. Separate FP32
-    ``k_scale``/``v_scale`` vectors have one multiplier per KV head; FP8 Q
-    requires an FP32 ``q_scale`` per query head. Scale values must be positive
+    K is ``[blocks, kv_heads, D/16, page_size, 16]`` and V is
+    ``[blocks, kv_heads, page_size/16, D, 16]``, contiguous E4M3FN.
+    ``page_size`` counts cached tokens per physical KV block and is a positive
+    multiple of 16; the inner 16 is a separate packing factor. ``block_tables``
+    maps each sequence's logical page to a physical block id: token t uses
+    entry ``t // page_size`` and within-page offset ``t % page_size``.
+    Separate FP32 ``k_scale``/``v_scale`` vectors have one multiplier per KV
+    head; FP8 Q requires an FP32 ``q_scale`` per query head. Scale values must be positive
     and finite and inputs finite. This is not E8M0 block-scaled MXFP8.
 
     ``context_lens`` includes the queries' K/V. Causal queries align with the
@@ -1574,9 +1578,11 @@ def paged_attention_decode_fp8(query, key_cache, value_cache, context_lens, bloc
 
     Returns contiguous BF16 with Q's shape, before output projection. ``out``
     can supply that allocation. Reuse ``paged_attention_decode_fp8_workspace``
-    with the same planning arguments for graph capture. Explicit split counts
-    override the heuristic. Only the ``heuristic`` search space is supported;
-    implementation/architecture choices remain private.
+    with the same planning arguments for graph capture. Allocate both before
+    capture; workspace planning uses the same query/cache shapes, context
+    bound, query length, sliding window and optional split override as attention.
+    Explicit split counts override the heuristic. Only the ``heuristic`` search
+    space is supported; implementation/architecture choices remain private.
     """
     import torch
     batch, kv_heads = _check_fp8_paged_kv(query, key_cache, value_cache, block_tables, max_context_len=max_context_len,
@@ -1636,8 +1642,12 @@ def paged_attention_decode_fp8_workspace(query, key_cache, value_cache, block_ta
                                          query_length=1, sliding_window=0, num_splits=None, space=None):
     """Allocate reusable opaque FP32 split buffers, or None for a single split.
 
-    Planning arguments must match ``paged_attention_decode_fp8``. No device
-    metadata values are read back and no quantization or attention is run.
+    Planning arguments must match ``paged_attention_decode_fp8``. Returned
+    capacity shapes are ``[tokens, query_heads, splits, D]`` for partial values
+    and ``[tokens, query_heads, splits]`` for log-sum-exp. Treat both buffers as
+    opaque: the backend may use narrower views inside the FP32 allocation.
+    No device metadata values are read back and no quantization or attention
+    is run. Allocate this workspace and output before graph capture.
     """
     import torch
     _check_fp8_paged_kv(query, key_cache, value_cache, block_tables, max_context_len=max_context_len,

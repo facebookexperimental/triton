@@ -41,8 +41,20 @@ def _make_test_inputs(lengths, hq=16, hkv=2, dim=64, page=64, query_length=1, fp
 
 
 def _reference(q, k, v, table, lengths, ks, vs, qs, query_length, causal, window_size):
-    """Independent dense FP32 attention over the actual quantized inputs."""
-    q = q.float() if qs is None else q.float() * qs[None, :, None]
+    """CPU float64 attention over quantized inputs, returned as device FP32.
+
+    Keep the oracle independent of GPU GEMM/softmax implementations. Captured
+    failures of the former GPU FP32 reference disagreed with CPU float64 even
+    when the attention kernel satisfied the unchanged numerical tolerance.
+    """
+    output_device = q.device
+    q = q.detach().cpu().double()
+    k, v = k.detach().cpu().double(), v.detach().cpu().double()
+    table = table.detach().cpu()
+    lengths = lengths.detach().cpu().tolist() if isinstance(lengths, torch.Tensor) else lengths
+    ks, vs = ks.detach().cpu().double(), vs.detach().cpu().double()
+    if qs is not None:
+        q *= qs.detach().cpu().double()[None, :, None]
     hq, dim = q.shape[1:]
     hkv, page = k.shape[1:3]
     out = torch.zeros_like(q)
@@ -50,8 +62,8 @@ def _reference(q, k, v, table, lengths, ks, vs, qs, query_length, causal, window
         if not length:
             continue
         blocks = table[seq, :triton.cdiv(length, page)].long()
-        kd = k[blocks].float().permute(1, 0, 2, 3).reshape(hkv, -1, dim)[:, :length]
-        vd = v[blocks].float().permute(1, 0, 2, 3).reshape(hkv, -1, dim)[:, :length]
+        kd = k[blocks].permute(1, 0, 2, 3).reshape(hkv, -1, dim)[:, :length]
+        vd = v[blocks].permute(1, 0, 2, 3).reshape(hkv, -1, dim)[:, :length]
         kd *= ks[:, None, None]
         vd *= vs[:, None, None]
         mapping = torch.arange(hq, device=q.device) // (hq // hkv)
@@ -67,7 +79,27 @@ def _reference(q, k, v, table, lengths, ks, vs, qs, query_length, causal, window
             mask &= positions[None, :] > qpos[:, None] - window_size
         probabilities = torch.softmax(scores.masked_fill(~mask[None], -float('inf')), -1).nan_to_num()
         out[seq * query_length:(seq + 1) * query_length] = torch.matmul(probabilities, vd).transpose(0, 1)
-    return out
+    return out.to(device=output_device, dtype=torch.float32)
+
+
+@pytest.mark.parametrize('fp8_q', [False, True])
+@pytest.mark.parametrize('causal,window,values', [(True, 0, [[2., 0.], [3., 8.]]), (True, 2, [[2., 0.], [4., 16.]]),
+                                                  (False, 0, [[3., 8.], [3., 8.]])])
+def test_fp8_reference_uniform_attention(fp8_q, causal, window, values):
+    # Zero logits give exact uniform means; this also checks page mapping,
+    # per-head descales, GQA sharing, causal/window masks and poisoned tails.
+    q = torch.zeros((2, 4, 64), dtype=torch.float8_e4m3fn if fp8_q else torch.bfloat16)
+    k = torch.full((2, 2, 16, 64), float('nan')).to(torch.float8_e4m3fn)
+    v = k.clone()
+    k[1, :, :3] = 0.
+    v[1, 0, :3] = torch.tensor([2., 6., 10.])[:, None].expand(3, 64).to(v.dtype)
+    v[1, 1, :3] = torch.tensor([-4., 4., 12.])[:, None].expand(3, 64).to(v.dtype)
+    ks = torch.tensor([2., 4.])
+    vs = torch.tensor([.5, 2.])
+    qs = torch.tensor([1., 2., 4., 8.]) if fp8_q else None
+    actual = _reference(q, k, v, torch.tensor([[1]]), [3], ks, vs, qs, 2, causal, window)
+    expected = torch.tensor(values).repeat_interleave(2, dim=1)[:, :, None].expand(2, 4, 64)
+    torch.testing.assert_close(actual, expected, atol=0., rtol=0.)
 
 
 @pytest.mark.skipif(not _gfx1250_available(), reason='Requires gfx1250')
@@ -307,9 +339,10 @@ def test_fp8_catalog_is_gfx1250_only():
 @pytest.mark.skipif(not _gfx1250_available(), reason='Requires gfx1250')
 @pytest.mark.parametrize('splits', [1, 8])
 @pytest.mark.parametrize('dim', [64, 128])
-@pytest.mark.parametrize('window', [0, 128])
-def test_fp8_public_workspace_graph_replay(splits, dim, window):
-    x = _make_test_inputs([67, 2304], dim=dim)
+@pytest.mark.parametrize('window', [0, 37, 128])
+@pytest.mark.parametrize('page', [64, 128])
+def test_fp8_public_workspace_graph_replay(splits, dim, window, page):
+    x = _make_test_inputs([67, 2304], dim=dim, page=page)
     q, k, v, lengths, table, ks, vs, qs, bound, kd, vd = x
     work = paged_attention_decode_fp8_workspace(q, k, v, table, max_context_len=bound, num_splits=splits,
                                                 sliding_window=window)
@@ -327,16 +360,25 @@ def test_fp8_public_workspace_graph_replay(splits, dim, window):
         graph.replay()
     expected = _reference(q, kd, vd, table, [67, 2304], ks, vs, qs, 1, True, window)
     torch.testing.assert_close(out.float(), expected, atol=5e-4, rtol=1e-2)
+    for replay_lengths in ([64, 2303], [0, 128]):
+        lengths.copy_(torch.tensor(replay_lengths, device=lengths.device, dtype=lengths.dtype))
+        graph.replay()
+        expected = _reference(q, kd, vd, table, replay_lengths, ks, vs, qs, 1, True, window)
+        torch.testing.assert_close(out.float(), expected, atol=5e-4, rtol=1e-2)
 
 
 @pytest.mark.skipif(not _gfx1250_available(), reason='Requires gfx1250')
 @pytest.mark.parametrize('fp8_q', [False, True], ids=['bf16-q', 'fp8-q'])
-@pytest.mark.parametrize('hq,hkv', [(16, 2), (64, 64)])
+@pytest.mark.parametrize('dim,page,hq,hkv,window', [(128, 64, 16, 2, 128), (128, 64, 64, 64, 128),
+                                                    (64, 64, 128, 128, 37), (64, 64, 32, 32, 64), (64, 128, 16, 2, 37),
+                                                    (64, 128, 128, 128, 128), (128, 128, 16, 1, 64),
+                                                    (128, 128, 64, 64, 128), (128, 128, 16, 2, 128),
+                                                    (64, 128, 16, 2, 128)])
 @pytest.mark.parametrize('seed', [0, 19, 182])
-def test_fp8_kv_decode_window_pair(fp8_q, hq, hkv, seed):
+def test_fp8_kv_decode_window_boundaries(fp8_q, dim, page, hq, hkv, window, seed):
     lengths = [0, 1, 63, 64, 65, 127, 128, 129, 191, 192, 193, 2303, 2304, 2305]
-    q, kp, vp, contexts, table, ks, vs, qs, max_len, k, v = _make_test_inputs(lengths, hq=hq, hkv=hkv, dim=128, page=64,
-                                                                              fp8_q=fp8_q, seed=seed)
+    q, kp, vp, contexts, table, ks, vs, qs, max_len, k, v = _make_test_inputs(lengths, hq=hq, hkv=hkv, dim=dim,
+                                                                              page=page, fp8_q=fp8_q, seed=seed)
     if seed == 19:
         q = (q.float() * 4).to(q.dtype)
     if seed == 182:
@@ -347,8 +389,8 @@ def test_fp8_kv_decode_window_pair(fp8_q, hq, hkv, seed):
         table = table.to(torch.int64)
     out = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
     actual = paged_attention_decode_fp8(q, kp, vp, contexts, table, ks, vs, max_context_len=max_len, q_scale=qs,
-                                        sliding_window=128, out=out)
-    expected = _reference(q, k, v, table, contexts, ks, vs, qs, 1, True, 128)
+                                        sliding_window=window, out=out)
+    expected = _reference(q, k, v, table, contexts, ks, vs, qs, 1, True, window)
     assert actual.dtype == torch.bfloat16
     assert actual.data_ptr() == out.data_ptr()
     assert torch.isfinite(actual).all()
