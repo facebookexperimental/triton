@@ -27,7 +27,28 @@ struct TMemLdStEncodingInfo {
   bool unpacked = false;
   unsigned vec = 1;
   bool padding = false;
+  // An NPOT K of scales moves as its pow2 alloc shape: entry r is the register
+  // that holds padded register r, or -1 past K.
+  SmallVector<int32_t> npotPaddedRegs;
 };
+
+// Why scales of an NPOT MN can't move as pow2 row chunks, or nullopt.
+std::optional<std::string>
+getNpotTMemScalesUnsupportedReason(int64_t mn, bool pow2K, bool oneCTA);
+
+// The pow2 column chunk that an NPOT TMEM view of N = c * q (q odd) moves q
+// times (row chunk for NPOT MN scales), or failure if that plan doesn't cover
+// `memTy`.
+FailureOr<gpu::MemDescType>
+getNpotTMemChunkType(gpu::MemDescType memTy,
+                     std::function<InFlightDiagnostic()> emitError = {});
+
+// Map registers, lanes, and all warps to physical TMEM rows and element
+// columns. Preserve warp-addressable replicas when the memory layout broadcasts
+// rows.
+FailureOr<LinearLayout>
+computeTMemLdStLayout(RankedTensorType regTy, gpu::MemDescType memTy,
+                      std::function<InFlightDiagnostic()> emitError = {});
 
 FailureOr<TMemLdStEncodingInfo>
 computeTMemLdStEncodingInfo(RankedTensorType regTy, gpu::MemDescType memTy,
@@ -41,11 +62,12 @@ FailureOr<LinearLayout> getTMemLdStMessageLayout(MLIRContext *ctx,
                                                  bool unpacked,
                                                  int numRegsPerMessage);
 
-// Return the physical tensor-memory word addresses touched by each warp when
-// lowering a tmem_load or tmem_store with these types.
+// Return the physical tensor-memory word addresses touched by each thread when
+// lowering a tmem_load or tmem_store with these types, indexed by
+// warp * 32 + lane.
 FailureOr<SmallVector<DenseSet<uint32_t>>>
-getTMemLdStWarpAddresses(RankedTensorType regTy, gpu::MemDescType memTy,
-                         int maxnreg, uint32_t baseAddress = 0);
+getTMemLdStThreadAddresses(RankedTensorType regTy, gpu::MemDescType memTy,
+                           int maxnreg, uint32_t baseAddress = 0);
 
 // Check whether a tmem_load with register layout `regTy` reading from `memTy`
 // can be supported with a fused reduction along the N dimension. This is the

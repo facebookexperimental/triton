@@ -44,6 +44,14 @@ struct ScaledDotOpConversion
   LogicalResult
   matchAndRewrite(triton::DotScaledOp op, triton::DotScaledOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // The target's NpotTargetLegality rejects exact NPOT dots it can't lower.
+    if (FailureOr<LinearLayout> ll = triton::gpu::getExactNpotOperandLayout(op);
+        succeeded(ll))
+      if (std::optional<std::string> reason =
+              triton::getNpotDotUnsupportedReason(
+                  op, *ll, triton::getModuleTarget(op),
+                  triton::gpu::lookupNumWarps(op), /*nonKDim=*/0))
+        return op.emitError(*reason);
     auto rty = cast<RankedTensorType>(op.getResult().getType());
     if (!isPermutationMatrixLayout(
             toLinearLayout(rty.getShape(), rty.getEncoding())))
@@ -205,16 +213,7 @@ struct WarpGroupDotWaitOpConversion
                                                         op.getPendings());
     auto outputs =
         unpackOutput(loc, rewriter, wait.getResult(), inputs.getTypes());
-    bool synchronizeWarpGroups =
-        !op.getWarpGroupLocal() && triton::gpu::lookupNumWarps(op) > 4;
     rewriter.replaceOp(op, outputs);
-
-    // WGMMA waits only synchronize the issuing warp group. Synchronize all
-    // warp groups before releasing shared-memory dependencies.
-    if (synchronizeWarpGroups) {
-      triton::gpu::BarrierOp::create(rewriter, loc,
-                                     triton::gpu::AddrSpace::Local);
-    }
     return success();
   }
 };

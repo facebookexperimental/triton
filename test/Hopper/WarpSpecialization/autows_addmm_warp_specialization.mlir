@@ -11,21 +11,21 @@
 // CHECK: ttg.warp_specialize
 // CHECK-SAME: ttg.partition.types = ["epilogue", "gemm", "epilogue_store", "load", "computation"]
 // CHECK: default
-// CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 1, 3>, dstTask = 1 : i32, maxRegionId = 4 : i32, minRegionId = 4 : i32, parentId = 1 : i32}}
-// CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 1, 3>, dstTask = 3 : i32, maxRegionId = 2 : i32, minRegionId = 2 : i32, parentId = 1 : i32}}
-// CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 2>, dstTask = 2 : i32, maxRegionId = 4 : i32, minRegionId = 4 : i32, parentId = 1 : i32}}
+// CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 1, 3>, dstTask = 1 : i32, guardedBufferIds = array<i32: 13>, maxRegionId = 4 : i32, minRegionId = 4 : i32, parentId = 1 : i32}}
+// CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 1, 3>, dstTask = 3 : i32, guardedBufferIds = array<i32: 0>, maxRegionId = 2 : i32, minRegionId = 2 : i32, parentId = 1 : i32}}
+// CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 2>, dstTask = 2 : i32, guardedBufferIds = array<i32: 1>, maxRegionId = 4 : i32, minRegionId = 4 : i32, parentId = 1 : i32}}
 // CHECK: partition0
-// CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 0, 2, 3>, dstTask = 0 : i32, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 1 : i32}}
+// CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 0, 2, 3>, dstTask = 0 : i32, guardedBufferIds = array<i32: 13>, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 1 : i32}}
 // CHECK: ttng.tc_gen5_mma
 // CHECK: partition1
-// CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 3>, dstTask = 0 : i32, maxRegionId = 2 : i32, minRegionId = 2 : i32, parentId = 1 : i32}}
+// CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 3>, dstTask = 0 : i32, guardedBufferIds = array<i32: 1>, maxRegionId = 2 : i32, minRegionId = 2 : i32, parentId = 1 : i32}}
 // CHECK: ttng.async_tma_copy_local_to_global
 // CHECK: partition2
 // CHECK-COUNT-6: ttng.async_tma_copy_global_to_local
 // CHECK: ttg.local_load {{.*}} -> tensor<128x32xf16
 // CHECK-NOT: tt.descriptor_load
 // CHECK-NOT: nvws.descriptor_load
-// CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 2>, dstTask = 0 : i32, maxRegionId = 4 : i32, minRegionId = 4 : i32, parentId = 1 : i32}}
+// CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 2>, dstTask = 0 : i32, guardedBufferIds = array<i32: 6>, maxRegionId = 4 : i32, minRegionId = 4 : i32, parentId = 1 : i32}}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>

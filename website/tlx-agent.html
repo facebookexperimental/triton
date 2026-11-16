@@ -12,7 +12,6 @@
     <a class="brand" href="../"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
 <a href="tlx.html">TLX</a>
-<a href="tlx-ops.html">tlx.ops</a>
 <a href="torchtlx.html">TorchTLX</a>
 <a href="ci.html">CI</a>
 <a href="tooling.html" data-current="true">Tooling</a></nav>
@@ -109,7 +108,7 @@ def profile(build_artifact, case: dict, request: dict | None = None): ...</code>
 <h2 id="profiling">Profiling</h2>
 <p>Profiling is staged so expensive evidence is collected where it can change a decision:</p>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Proton attributes wrapper, launch, main-kernel, and non-main-kernel time.</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div>NVIDIA NCU summary and deep profiles expose duration, throughput, occupancy, registers, memory traffic, tensor activity, and stall metrics.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>The portable <code>native_profiler</code> request selects the target platform profiler. NVIDIA harnesses map it to NCU for duration, throughput, occupancy, register, memory-traffic, tensor-activity, and stall metrics.</div></div>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Optional per-warp Proton instrumentation can answer intra-kernel attribution questions for warp-specialized pipelines.</div></div>
 <p>An ordinary Proton launch timeline does not prove that <code>tlx.async_task</code> regions overlap. Per-warp instrumentation must select aligned logical work across task warps, and the instrumented source is diagnostic-only: it is never benchmarked, promoted, or committed.</p>
 <h2 id="promotion-and-final-validation">Promotion and final validation</h2>

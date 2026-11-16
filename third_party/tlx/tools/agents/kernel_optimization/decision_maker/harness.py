@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import signal
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, replace
 from pathlib import Path
+from queue import Empty, Queue
 from types import ModuleType
 from typing import Any, Mapping, Protocol, runtime_checkable
 
@@ -101,6 +104,136 @@ class SubprocessHarness:
         profile: bool | ProfileRequest | Mapping[str, Any] = False,
         experiment: Mapping[str, JsonValue] | None = None,
     ) -> PerformanceSummary:
+        raw_pool = target.environment.get("TLX_AGENT_DEVICE_POOL")
+        if raw_pool and cases:
+            try:
+                device_pool = json.loads(raw_pool)
+            except json.JSONDecodeError as error:
+                raise HarnessExecutionError("TLX_AGENT_DEVICE_POOL is not valid JSON") from error
+            if not isinstance(device_pool, list) or not device_pool:
+                raise HarnessExecutionError("TLX_AGENT_DEVICE_POOL must be a non-empty list")
+            return self._evaluate_isolated(
+                kernel_source,
+                cases,
+                target,
+                benchmark_repetitions,
+                profile,
+                experiment,
+                tuple(device_pool),
+            )
+        return self._evaluate_subprocess(
+            kernel_source,
+            cases,
+            target,
+            benchmark_repetitions,
+            profile,
+            experiment,
+        )
+
+    def _evaluate_isolated(
+        self,
+        kernel_source: str,
+        cases: tuple[InputCase, ...],
+        target: KernelTarget,
+        benchmark_repetitions: int,
+        profile: bool | ProfileRequest | Mapping[str, Any],
+        experiment: Mapping[str, JsonValue] | None,
+        device_pool: tuple[Mapping[str, str], ...],
+    ) -> PerformanceSummary:
+        checkpoint_root_raw = target.environment.get("TLX_AGENT_CHECKPOINT_DIR")
+        checkpoint_root = Path(checkpoint_root_raw) if checkpoint_root_raw else None
+        if checkpoint_root is not None:
+            checkpoint_root.mkdir(parents=True, exist_ok=True)
+        common_environment = {
+            key: value
+            for key, value in target.environment.items()
+            if key not in {"TLX_AGENT_DEVICE_POOL", "TLX_AGENT_CHECKPOINT_DIR"}
+        }
+        source_digest = hashlib.sha256(kernel_source.encode()).hexdigest()
+
+        def checkpoint_path(case: InputCase) -> Path | None:
+            if checkpoint_root is None:
+                return None
+            digest = hashlib.sha256(case.case_id.encode()).hexdigest()[:16]
+            return checkpoint_root / f"{digest}.json"
+
+        results: dict[str, CaseEvaluation] = {}
+        pending: list[InputCase] = []
+        for case in cases:
+            path = checkpoint_path(case)
+            if path is not None and path.is_file():
+                try:
+                    saved = json.loads(path.read_text())
+                    if saved.get("source_digest") == source_digest and saved.get("case_id") == case.case_id:
+                        results[case.case_id] = _case_evaluation_from_json(saved["evaluation"])
+                        continue
+                except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    pass
+            pending.append(case)
+
+        work_queue: Queue[InputCase] = Queue()
+        for case in pending:
+            work_queue.put(case)
+
+        def run_worker(worker_index: int) -> list[tuple[str, CaseEvaluation]]:
+            completed: list[tuple[str, CaseEvaluation]] = []
+            device_environment = device_pool[worker_index]
+            while True:
+                try:
+                    case = work_queue.get_nowait()
+                except Empty:
+                    break
+                case_target = replace(
+                    target,
+                    environment={**common_environment, **device_environment},
+                )
+                summary = self._evaluate_subprocess(
+                    kernel_source,
+                    (case,),
+                    case_target,
+                    benchmark_repetitions,
+                    profile,
+                    experiment,
+                )
+                evaluation = summary.cases[0]
+                path = checkpoint_path(case)
+                if path is not None:
+                    payload = {
+                        "case_id": case.case_id,
+                        "source_digest": source_digest,
+                        "evaluation": to_json_value(evaluation),
+                    }
+                    temporary = path.with_suffix(".tmp")
+                    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                    temporary.replace(path)
+                completed.append((case.case_id, evaluation))
+                print(
+                    f"[tlx-agent] gpu{device_environment.get('TLX_AGENT_PHYSICAL_GPU', '?')}: "
+                    f"completed {case.case_id}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                work_queue.task_done()
+            return completed
+
+        if pending:
+            workers = min(len(device_pool), len(pending))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(run_worker, index) for index in range(workers)]
+                for future in as_completed(futures):
+                    for case_id, evaluation in future.result():
+                        results[case_id] = evaluation
+        return PerformanceSummary(cases=tuple(results[case.case_id] for case in cases))
+
+    def _evaluate_subprocess(
+        self,
+        kernel_source: str,
+        cases: tuple[InputCase, ...],
+        target: KernelTarget,
+        benchmark_repetitions: int,
+        profile: bool | ProfileRequest | Mapping[str, Any] = False,
+        experiment: Mapping[str, JsonValue] | None = None,
+    ) -> PerformanceSummary:
         request = {
             "kernel_source": kernel_source,
             "cases": to_json_value(cases),
@@ -115,6 +248,11 @@ class SubprocessHarness:
         worker_path = Path(__file__).with_name("runner.py")
         environment = os.environ.copy()
         environment.update(target.environment)
+        cpu_list = environment.pop("TLX_AGENT_NUMA_CPUS", "")
+
+        def set_affinity() -> None:
+            if cpu_list and hasattr(os, "sched_setaffinity"):
+                os.sched_setaffinity(0, {int(cpu) for cpu in cpu_list.split(",")})
         response_file = tempfile.NamedTemporaryFile(
             prefix="tlx-kernel-agent-response-", suffix=".json", delete=False
         )
@@ -135,6 +273,7 @@ class SubprocessHarness:
                 stderr=subprocess.PIPE,
                 text=True,
                 env=environment,
+                preexec_fn=set_affinity if cpu_list else None,
                 start_new_session=True,
             )
             try:

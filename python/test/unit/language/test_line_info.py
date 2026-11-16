@@ -7,7 +7,7 @@ import torch
 
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hopper_or_newer, is_interpreter
+from triton._internal_testing import is_cuda, is_hopper_or_newer, is_interpreter
 from triton._filecheck import run_filecheck
 
 
@@ -222,6 +222,7 @@ def test_line_info_env(monkeypatch, status: str):
     kernel_info = kernel_single.warmup(torch.float32, torch.float32, BLOCK=shape[0], grid=(1, ))
     file_lines = extract_file_lines(command, anchor, separator, kernel_info.asm[obj_kind])
     assert len(file_lines) == 0 if status == "1" else len(file_lines) > 0
+    kernel_single.device_caches.clear()
 
 
 @pytest.mark.parametrize("status", ["ttir", ""])
@@ -263,43 +264,42 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
 
     @triton.jit
     def kernel_basic(src, N, BLOCK_SIZE: tl.constexpr):
-        # CHECK: #loc = loc("{{.*}}":265:5)
+        # CHECK: #loc = loc("{{.*}}":266:5)
         # CHECK-LABEL:  tt.func public @kernel_basic(
         # CHECK-SAME:                                %src: !tt.ptr<f32> loc("src"(#loc)), %N: i32 loc("N"(#loc)))
-        # CHECK:          %x_plus_1 = arith.constant dense<1.000000e+00> : tensor<16xf32> loc(#loc12)
-        # CHECK:          %c16_i32 = arith.constant 16 : i32 loc(#loc2)
+        # CHECK:          %x_plus_1 = arith.constant dense<1.000000e+00> : tensor<16xf32> loc(#loc11)
+        # CHECK:          %offset = arith.constant 16 : i32 loc(#loc12)
         # CHECK:          %pid = tt.get_program_id x : i32 loc(#loc13)
-        # CHECK:          %offset = arith.muli %pid, %c16_i32 : i32 loc(#loc14)
-        # CHECK:          %offsets = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32> loc(#loc15)
-        # CHECK:          %offsets_0 = tt.splat %offset : i32 -> tensor<16xi32> loc(#loc16)
-        # CHECK:          %offsets_1 = arith.addi %offsets_0, %offsets : tensor<16xi32> loc(#loc16)
-        # CHECK:          %load_src_store_dst = tt.splat %src : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>> loc(#loc17)
-        # CHECK:          %load_src_store_dst_2 = tt.addptr %load_src_store_dst, %offsets_1 : tensor<16x!tt.ptr<f32>>, tensor<16xi32> loc(#loc17)
-        # CHECK:          %mask = tt.splat %N : i32 -> tensor<16xi32> loc(#loc18)
-        # CHECK:          %mask_3 = arith.cmpi slt, %offsets_1, %mask : tensor<16xi32> loc(#loc18)
-        # CHECK:          %x_plus_1_4 = tt.load %load_src_store_dst_2, %mask_3 : tensor<16x!tt.ptr<f32>> loc(#loc12)
-        # CHECK:          %x_plus_1_5 = arith.addf %x_plus_1_4, %x_plus_1 : tensor<16xf32> loc(#loc12)
-        # CHECK:          tt.store %load_src_store_dst_2, %x_plus_1_5, %mask_3 : tensor<16x!tt.ptr<f32>> loc(#loc9)
+        # CHECK:          %offset_0 = arith.muli %pid, %offset : i32 loc(#loc12)
+        # CHECK:          %offsets = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32> loc(#loc14)
+        # CHECK:          %offsets_1 = tt.splat %offset_0 : i32 -> tensor<16xi32> loc(#loc15)
+        # CHECK:          %offsets_2 = arith.addi %offsets_1, %offsets : tensor<16xi32> loc(#loc15)
+        # CHECK:          %load_src_store_dst = tt.splat %src : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>> loc(#loc16)
+        # CHECK:          %load_src_store_dst_3 = tt.addptr %load_src_store_dst, %offsets_2 : tensor<16x!tt.ptr<f32>>, tensor<16xi32> loc(#loc16)
+        # CHECK:          %mask = tt.splat %N : i32 -> tensor<16xi32> loc(#loc17)
+        # CHECK:          %mask_4 = arith.cmpi slt, %offsets_2, %mask : tensor<16xi32> loc(#loc17)
+        # CHECK:          %x_plus_1_5 = tt.load %load_src_store_dst_3, %mask_4 : tensor<16x!tt.ptr<f32>> loc(#loc11)
+        # CHECK:          %x_plus_1_6 = arith.addf %x_plus_1_5, %x_plus_1 : tensor<16xf32> loc(#loc11)
+        # CHECK:          tt.store %load_src_store_dst_3, %x_plus_1_6, %mask_4 : tensor<16x!tt.ptr<f32>> loc(#loc8)
         # CHECK:          tt.return loc(#loc)
         # CHECK:          } loc(#loc)
         # CHECK:         } loc(#loc)
 
         # CHECK: #loc1 = loc({{.*}})
-        # CHECK: #loc2 = loc(unknown)
+        # CHECK: #loc2 = loc({{.*}})
         # CHECK: #loc3 = loc({{.*}})
         # CHECK: #loc4 = loc({{.*}})
         # CHECK: #loc5 = loc({{.*}})
         # CHECK: #loc6 = loc({{.*}})
         # CHECK: #loc7 = loc({{.*}})
         # CHECK: #loc8 = loc({{.*}})
-        # CHECK: #loc9 = loc({{.*}})
-        # CHECK: #loc12 = loc("x_plus_1"(#loc1))
+        # CHECK: #loc11 = loc("x_plus_1"(#loc1))
+        # CHECK: #loc12 = loc("offset"(#loc2))
         # CHECK: #loc13 = loc("pid"(#loc3))
-        # CHECK: #loc14 = loc("offset"(#loc4))
+        # CHECK: #loc14 = loc("offsets"(#loc4))
         # CHECK: #loc15 = loc("offsets"(#loc5))
-        # CHECK: #loc16 = loc("offsets"(#loc6))
-        # CHECK: #loc17 = loc("load_src_store_dst"(#loc7))
-        # CHECK: #loc18 = loc("mask"(#loc8))
+        # CHECK: #loc16 = loc("load_src_store_dst"(#loc6))
+        # CHECK: #loc17 = loc("mask"(#loc7))
 
         pid = tl.program_id(0)
         offset = pid * BLOCK_SIZE
@@ -504,44 +504,43 @@ def test_line_and_column_numbers(fresh_triton_cache):
     @triton.jit
     def kernel_basic(src, N, BLOCK_SIZE: tl.constexpr):
         # CHECK: #loc = loc("{{.*}}":505:5)
-        # CHECK: #loc10 = loc("src"(#loc))
-        # CHECK: #loc11 = loc("N"(#loc))
+        # CHECK: #loc9 = loc("src"(#loc))
+        # CHECK: #loc10 = loc("N"(#loc))
         # CHECK-LABEL:  tt.func public @kernel_basic(
         # CHECK-SAME:                                %src: !tt.ptr<f32> loc("src"(#loc)), %N: i32 loc("N"(#loc)))
-        # CHECK:          %x_plus_1 = arith.constant dense<1.000000e+00> : tensor<16xf32> loc(#loc12)
-        # CHECK:          %c16_i32 = arith.constant 16 : i32 loc(#loc2)
+        # CHECK:          %x_plus_1 = arith.constant dense<1.000000e+00> : tensor<16xf32> loc(#loc11)
+        # CHECK:          %offset = arith.constant 16 : i32 loc(#loc12)
         # CHECK:          %pid = tt.get_program_id x : i32 loc(#loc13)
-        # CHECK:          %offset = arith.muli %pid, %c16_i32 : i32 loc(#loc14)
-        # CHECK:          %offsets = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32> loc(#loc15)
-        # CHECK:          %offsets_0 = tt.splat %offset : i32 -> tensor<16xi32> loc(#loc16)
-        # CHECK:          %offsets_1 = arith.addi %offsets_0, %offsets : tensor<16xi32> loc(#loc16)
-        # CHECK:          %load_src_store_dst = tt.splat %src : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>> loc(#loc17)
-        # CHECK:          %load_src_store_dst_2 = tt.addptr %load_src_store_dst, %offsets_1 : tensor<16x!tt.ptr<f32>>, tensor<16xi32> loc(#loc17)
-        # CHECK:          %mask = tt.splat %N : i32 -> tensor<16xi32> loc(#loc18)
-        # CHECK:          %mask_3 = arith.cmpi slt, %offsets_1, %mask : tensor<16xi32> loc(#loc18)
-        # CHECK:          %x_plus_1_4 = tt.load %load_src_store_dst_2, %mask_3 : tensor<16x!tt.ptr<f32>> loc(#loc12)
-        # CHECK:          %x_plus_1_5 = arith.addf %x_plus_1_4, %x_plus_1 : tensor<16xf32> loc(#loc12)
-        # CHECK:          tt.store %load_src_store_dst_2, %x_plus_1_5, %mask_3 : tensor<16x!tt.ptr<f32>> loc(#loc9)
+        # CHECK:          %offset_0 = arith.muli %pid, %offset : i32 loc(#loc12)
+        # CHECK:          %offsets = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32> loc(#loc14)
+        # CHECK:          %offsets_1 = tt.splat %offset_0 : i32 -> tensor<16xi32> loc(#loc15)
+        # CHECK:          %offsets_2 = arith.addi %offsets_1, %offsets : tensor<16xi32> loc(#loc15)
+        # CHECK:          %load_src_store_dst = tt.splat %src : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>> loc(#loc16)
+        # CHECK:          %load_src_store_dst_3 = tt.addptr %load_src_store_dst, %offsets_2 : tensor<16x!tt.ptr<f32>>, tensor<16xi32> loc(#loc16)
+        # CHECK:          %mask = tt.splat %N : i32 -> tensor<16xi32> loc(#loc17)
+        # CHECK:          %mask_4 = arith.cmpi slt, %offsets_2, %mask : tensor<16xi32> loc(#loc17)
+        # CHECK:          %x_plus_1_5 = tt.load %load_src_store_dst_3, %mask_4 : tensor<16x!tt.ptr<f32>> loc(#loc11)
+        # CHECK:          %x_plus_1_6 = arith.addf %x_plus_1_5, %x_plus_1 : tensor<16xf32> loc(#loc11)
+        # CHECK:          tt.store %load_src_store_dst_3, %x_plus_1_6, %mask_4 : tensor<16x!tt.ptr<f32>> loc(#loc8)
         # CHECK:          tt.return loc(#loc)
         # CHECK:          } loc(#loc)
         # CHECK:         } loc(#loc)
 
-        # CHECK: #loc1 = loc({{.*}}:551:20)
-        # CHECK: #loc2 = loc(unknown)
-        # CHECK: #loc3 = loc({{.*}}:546:15)
-        # CHECK: #loc4 = loc({{.*}}:547:18)
-        # CHECK: #loc5 = loc({{.*}}:548:28)
-        # CHECK: #loc6 = loc({{.*}}:548:19)
-        # CHECK: #loc7 = loc({{.*}}:549:30)
-        # CHECK: #loc8 = loc({{.*}}:550:16)
-        # CHECK: #loc9 = loc({{.*}}:552:9)
-        # CHECK: #loc12 = loc("x_plus_1"(#loc1))
+        # CHECK: #loc1 = loc({{.*}}:550:20)
+        # CHECK: #loc2 = loc({{.*}}:546:18)
+        # CHECK: #loc3 = loc({{.*}}:545:15)
+        # CHECK: #loc4 = loc({{.*}}:547:28)
+        # CHECK: #loc5 = loc({{.*}}:547:19)
+        # CHECK: #loc6 = loc({{.*}}:548:30)
+        # CHECK: #loc7 = loc({{.*}}:549:16)
+        # CHECK: #loc8 = loc({{.*}}:551:9)
+        # CHECK: #loc11 = loc("x_plus_1"(#loc1))
+        # CHECK: #loc12 = loc("offset"(#loc2))
         # CHECK: #loc13 = loc("pid"(#loc3))
-        # CHECK: #loc14 = loc("offset"(#loc4))
+        # CHECK: #loc14 = loc("offsets"(#loc4))
         # CHECK: #loc15 = loc("offsets"(#loc5))
-        # CHECK: #loc16 = loc("offsets"(#loc6))
-        # CHECK: #loc17 = loc("load_src_store_dst"(#loc7))
-        # CHECK: #loc18 = loc("mask"(#loc8))
+        # CHECK: #loc16 = loc("load_src_store_dst"(#loc6))
+        # CHECK: #loc17 = loc("mask"(#loc7))
 
         pid = tl.program_id(0)
         offset = pid * BLOCK_SIZE
@@ -583,3 +582,51 @@ def test_while_block_arg_carries_init_handle_loc(fresh_triton_cache):
 @pytest.fixture(autouse=True)
 def with_line_info(fresh_knobs):
     fresh_knobs.compilation.disable_line_info = False
+
+
+@pytest.mark.parametrize("preserve", ["0", "1"])
+def test_ptx_source_paths(monkeypatch, preserve: str, fresh_triton_cache):
+    if is_interpreter() or not is_cuda():
+        pytest.skip("PTX source path virtualization is NVIDIA-only")
+
+    monkeypatch.setenv("TRITON_PRESERVE_PTX_SOURCE_PATHS", preserve)
+    kernel_single.device_caches.clear()
+    kernel_info = kernel_single.warmup(torch.float32, torch.float32, BLOCK=128, grid=(1, ))
+    file_directives = [line for line in kernel_info.asm["ptx"].splitlines() if line.lstrip().startswith(".file")]
+    expected = f'"{__file__}"' if preserve == "1" else '"<source>/test_line_info.py", 0, 0'
+    assert any(expected in line for line in file_directives), file_directives
+    kernel_single.device_caches.clear()
+
+
+@triton.jit
+def kernel_multiline_inline_asm(X, Y, BLOCK: tl.constexpr):
+    x = tl.load(X + tl.arange(0, BLOCK))
+    y = tl.inline_asm_elementwise("{\n.reg .b32 t;\nadd.u32 t, $1, 1;\nadd.u32 $0, t, 1;\n}", "=r,r", [x],
+                                  dtype=tl.int32, is_pure=True, pack=1)
+    tl.store(Y + tl.arange(0, BLOCK), y)
+
+
+def test_inline_asm_line_info(fresh_triton_cache):
+    if is_interpreter() or not is_cuda():
+        pytest.skip("inline asm line info is NVIDIA-only")
+
+    # NVPTX attributes the instructions of a multi-line inline asm to
+    # `call line + line index in the asm string`. Every asm instruction must
+    # instead map to the line of the inline asm call.
+    kernel_info = kernel_multiline_inline_asm.warmup(torch.int32, torch.int32, BLOCK=128, grid=(1, ))
+    src_lines, start = inspect.getsourcelines(kernel_multiline_inline_asm.fn)
+    asm_line = start + next(i for i, line in enumerate(src_lines) if "tl.inline_asm_elementwise(" in line)
+    in_asm = False
+    loc_line = None
+    add_lines = []
+    for line in kernel_info.asm["ptx"].splitlines():
+        line = line.strip()
+        if line.startswith("// begin inline asm"):
+            in_asm = True
+        elif line.startswith("// end inline asm"):
+            in_asm = False
+        elif line.startswith(".loc"):
+            loc_line = int(line.split()[2])
+        elif in_asm and line.startswith("add.u32"):
+            add_lines.append(loc_line)
+    assert add_lines == [asm_line, asm_line]
