@@ -58,6 +58,18 @@ def _linear_rowscale_accepts(d):
     return 0 < d["K"] <= 512 and d["K"] % 8 == 0 and d["N"] > 0 and d["N"] % 8 == 0
 
 
+def _pow2(x):
+    return 1 << (x - 1).bit_length()
+
+
+def _paged_decode_gfx950_accepts(d):
+    # The kernel pads QLEN and GROUP to powers of two (GROUP to at least 16 // QLEN) and supports at most 64 padded
+    # rows; QLEN=5, GROUP=12 has 60 real rows but pads to 8 x 16.
+    qlen, group = d["QLEN"], d["GROUP"]
+    return (d["HEAD_DIM"] in (64, 128) and 1 <= qlen <= 8 and group >= 1
+            and _pow2(qlen) * max(16 // _pow2(qlen), _pow2(group)) <= 64)
+
+
 _NORM_MODULES = {
     'sm100': ['layernorm', 'layernorm_add', 'rmsnorm', 'norm_fwd', 'norm_bwd', 'norm_backward_from_normalized'],
     '_softmax': ['softmax', 'softmax_fwd', 'softmax_bwd'], '_fp4': [
@@ -667,7 +679,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="split_k_mfma",
         impl="triton.tlx.ops.kernels.paged_attn.gfx950_decode:paged_attention_decode",
         dtypes=_FP16,
-        accepts=lambda d: (d["HEAD_DIM"] in (64, 128) and 1 <= d["QLEN"] <= 4 and d["QLEN"] * d["GROUP"] <= 64),
+        accepts=_paged_decode_gfx950_accepts,
     ),
     OpSpec(
         op="paged_attention_prefill",
