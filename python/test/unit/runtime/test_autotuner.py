@@ -5,7 +5,6 @@ import triton.language as tl
 import pytest
 
 import pathlib
-import uuid
 from triton._internal_testing import is_cuda, is_hip_cdna2, is_rubin
 from triton.backends.amd.compiler import HIPBackend
 from triton.backends.compiler import GPUTarget
@@ -574,7 +573,7 @@ def test_pruned_single_config_preserves_ir_pruning(device: str):
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
                     reason="Requires compute capability >= 9 for NV")
-def test_override_ttir(device):
+def test_override_ttir(device, tmp_path: pathlib.Path):
     N = 1024
     src = torch.randn(N, device=device)
     dst = torch.empty(N, device=device)
@@ -602,7 +601,7 @@ module {
   }
 }
     """
-    temp_file = pathlib.Path(f"/tmp/test_override_{str(uuid.uuid4())}.ttir")
+    temp_file = tmp_path / "test_override.ttir"
     temp_file.write_text(ir_src)
 
     configs = [triton.Config(kwargs={'BLOCK_SIZE': 32, 'ir_override': str(temp_file)})]
@@ -623,7 +622,7 @@ module {
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
                     reason="Requires compute capability >= 9 for NV")
-def test_override_ttgir(device):
+def test_override_ttgir(device, tmp_path: pathlib.Path):
     N = 1024
     src = torch.randn(N, device=device)
     dst = torch.empty(N, device=device)
@@ -652,7 +651,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
     """
-    temp_file = pathlib.Path(f"/tmp/test_override_{str(uuid.uuid4())}.ttgir")
+    temp_file = tmp_path / "test_override.ttgir"
     temp_file.write_text(ir_src)
 
     configs = [triton.Config(kwargs={'BLOCK_SIZE': 32, 'ir_override': str(temp_file)})]
@@ -673,7 +672,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] != 9,
                     reason="PTX file in this unit test is only for SM90")
-def test_override_ptx(device):
+def test_override_ptx(device, tmp_path: pathlib.Path):
     N = 1024
     src = torch.randn(N, device=device)
     dst = torch.empty(N, device=device)
@@ -749,7 +748,7 @@ $L__func_end0:
                                         // -- End function
 }
     """
-    temp_file = pathlib.Path(f"/tmp/test_override_{str(uuid.uuid4())}.ptx")
+    temp_file = tmp_path / "test_override.ptx"
     temp_file.write_text(ir_src)
 
     configs = [triton.Config(kwargs={'BLOCK_SIZE': 32, 'ir_override': str(temp_file)})]
@@ -1042,19 +1041,27 @@ def test_generate_wave_quant_candidates_appends_npot_and_noop():
     assert npot, "expected wave-quant NPOT candidates for a bad tail"
 
 
-def test_npot_runtime_error_prunable_gating():
-    pow2_cfg = triton.Config(kwargs={'BLOCK_M': 128})
-    npot_cfg = _autotuner._clone_config(pow2_cfg, BLOCK_M=96)
-    # A pow2 config must re-raise even a device error (never be masked).
-    assert _autotuner._npot_runtime_error_prunable(pow2_cfg, RuntimeError("Triton Error [CUDA]: out of memory"),
-                                                   allow_npot=True) is False
-    # An NPOT config under the flag is prunable on a device failure -- case-insensitively and across
-    # both backends (CUDA and HIP).
-    for msg in ("Triton Error [CUDA]: misaligned address", "Triton Error [HIP]: out of memory range.", "Out Of Memory",
-                "an illegal memory access was encountered"):
-        assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError(msg), allow_npot=True) is True
-    # Flag off, or a non-device RuntimeError -> re-raise.
-    assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError("Triton Error [CUDA]: x"),
-                                                   allow_npot=False) is False
-    assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError("invalid config value"),
-                                                   allow_npot=True) is False
+def _autotune_with_failing_block(fail_block):
+    # A real compile failure: the reshape needs BLOCK to be a multiple of 64, which only 128 is.
+    @triton.autotune(configs=[triton.Config({'BLOCK': fail_block}),
+                              triton.Config({'BLOCK': 128})], key=['n'], do_bench=do_bench)
+    @triton.jit
+    def _kernel(x_ptr, n, BLOCK: tl.constexpr):
+        offs = tl.arange(0, BLOCK)
+        x = tl.reshape(tl.load(x_ptr + offs, mask=offs < n), (BLOCK // 64, 64))
+        tl.store(x_ptr + offs, tl.reshape(x, (BLOCK, )), mask=offs < n)
+
+    return _kernel
+
+
+def test_autotune_skips_npot_config_that_fails_to_compile(fresh_knobs, device):
+    fresh_knobs.language.allow_npot = True
+    kernel = _autotune_with_failing_block(96)
+    kernel[(1, )](torch.randn(128, device=device), 128)
+    assert kernel.best_config.kwargs['BLOCK'] == 128
+
+
+def test_autotune_raises_when_pow2_config_fails_to_compile(fresh_knobs, device):
+    fresh_knobs.language.allow_npot = True
+    with pytest.raises(triton.CompilationError):
+        _autotune_with_failing_block(32)[(1, )](torch.randn(128, device=device), 128)

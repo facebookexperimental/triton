@@ -2,6 +2,7 @@
 #include "PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 
 using ::mlir::triton::gpu::AMDMfmaEncodingAttr;
@@ -32,25 +33,28 @@ public:
     auto *ctx = op.getContext();
     StringAttr kReg = str_attr("register");
     StringAttr kLane = str_attr("lane");
+    // NPOT mixed-radix conversions lower in the common pattern.
+    if (hasNpotShape(srcTy) || hasNpotShape(dstTy))
+      return failure();
     auto srcLayout =
         triton::gpu::toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
     auto dstLayout =
         triton::gpu::toLinearLayout(dstTy).removeZeroBasesAlongDim(kReg);
     auto conversion = minimalCvtLayout(srcLayout, dstLayout);
     if (llvm::to_vector(conversion.getOutDimNames()) !=
-        SmallVector<StringAttr, 2>{kReg, kLane})
+            SmallVector<StringAttr, 2>{kReg, kLane} ||
+        !cvtNeedsWarpShuffle(op))
       return failure();
 
     auto elemTy = getTypeConverter()->convertType(srcTy.getElementType());
     int bitwidth = elemTy.isIntOrFloat() ? elemTy.getIntOrFloatBitWidth() : 64;
-    auto factors =
+    auto [pReg, shuffleMap, mixedTranspositions, nPack] =
         getWarpLayoutConvertDecomposition(srcLayout, dstLayout, bitwidth);
-    auto &[pReg, pLane, mixedTranspositions, nPack] = factors;
 
     if (mixedTranspositions.size() != 1)
       return failure();
     auto t = mixedTranspositions[0];
-    auto [rBit, lBit] = t.transposition;
+    auto [rBit, lBit] = std::pair{t.regBit, t.dstLane};
 
     // Following `transferWithinWarp` and `getWarpLayoutConvertDecomposition`,
     // an intra-warp layout conversion can be described as a permutation of
@@ -77,9 +81,9 @@ public:
     }
 
     bool isSingleTransposition =
-        mlir::triton::squareSublayoutIsIdentity(pLane, kLane);
+        mlir::triton::squareSublayoutIsIdentity(shuffleMap, kLane);
 
-    const auto &laneBases = pLane.getBases().lookup(kLane);
+    const auto &laneBases = shuffleMap.getBases().lookup(kLane);
     auto next = [&](size_t b) { return llvm::Log2_32(laneBases[b][0]); };
     for (size_t b = 0; b < laneBases.size(); ++b) {
       if (b == 4 || b == 5)
@@ -111,23 +115,10 @@ public:
     };
 
     auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
-    // The input values may require broadcasting so that the conversion can be
-    // described as a permutation. This does not cost anything for simple cases.
-    int regDim = inVals.size();
-    int pRegDim = pReg.getInDimSize(kReg);
-    if (pRegDim > regDim) {
-      SmallVector<Value> original(inVals.begin(), inVals.end());
-      inVals.clear();
-      inVals.reserve(pRegDim);
-      while (inVals.size() < pRegDim)
-        inVals.append(original.begin(), original.end());
-      regDim = pRegDim;
-    }
-
-    // Apply pReg.
+    int regDim = pReg.getInDimSize(kReg);
     SmallVector<Value> newInVals(regDim);
-    for (const auto &[i, v] : llvm::enumerate(inVals))
-      newInVals[pReg.apply({{kReg, i}})[0].second] = v;
+    for (int i = 0; i < regDim; ++i)
+      newInVals[pReg.apply({{kReg, i}})[0].second] = inVals[i % inVals.size()];
     inVals = std::move(newInVals);
 
     // Handle register packing.
@@ -215,7 +206,7 @@ public:
       }
       if (bitwidth < bitsPerVecElem) {
         llvm::for_each(unpackedVals, [&](Value &v) {
-          v = b.trunc(int_ty(bitwidth), v);
+          v = b.trunc(int_ty(bitwidth), v, LLVM::IntegerOverflowFlags::nuw);
           if (elemTy != int_ty(bitwidth))
             v = b.bitcast(v, elemTy);
         });
@@ -239,7 +230,7 @@ public:
         if (isa<LLVM::LLVMPointerType>(elemTy))
           v = b.inttoptr(elemTy, v);
         if (bitwidth < 32)
-          v = b.trunc(int_ty(bitwidth), v);
+          v = b.trunc(int_ty(bitwidth), v, LLVM::IntegerOverflowFlags::nuw);
         if (!isa<IntegerType>(elemTy))
           v = b.bitcast(v, elemTy);
       });
@@ -715,6 +706,9 @@ public:
 
     auto ctx = op.getContext();
     StringAttr kRegister = mlir::StringAttr::get(ctx, "register");
+    // NPOT mixed-radix conversions lower in the common pattern.
+    if (hasNpotShape(srcTy) || hasNpotShape(dstTy))
+      return failure();
     auto srcLayout =
         triton::gpu::toLinearLayout(srcTy).removeZeroBasesAlongDim(kRegister);
     auto dstLayout =

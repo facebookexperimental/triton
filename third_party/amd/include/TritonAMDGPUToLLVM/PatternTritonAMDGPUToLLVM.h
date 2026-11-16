@@ -16,7 +16,15 @@ void populateConcatOpToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
                                     mlir::RewritePatternSet &patterns,
                                     mlir::PatternBenefit benefit);
 
+void populatePackedDot2OpToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
+                                        mlir::RewritePatternSet &patterns,
+                                        mlir::PatternBenefit benefit);
+
 void populateScaledUpcastOpToLLVMPatterns(
+    mlir::LLVMTypeConverter &typeConverter, mlir::RewritePatternSet &patterns,
+    const AMD::TargetInfo &targetInfo, mlir::PatternBenefit benefit);
+
+void populateScaledDowncastOpToLLVMPatterns(
     mlir::LLVMTypeConverter &typeConverter, mlir::RewritePatternSet &patterns,
     const AMD::TargetInfo &targetInfo, mlir::PatternBenefit benefit);
 

@@ -84,6 +84,31 @@ TLX_PAGES = (
         "Production-ready TLX kernels, one blessed implementation per op and architecture.",
     ),
     Page(
+        "tlx-sm90",
+        "TLX on sm90 (Hopper)",
+        "Supported ops and extension builtins on NVIDIA Hopper.",
+    ),
+    Page(
+        "tlx-sm100",
+        "TLX on sm100 (Blackwell)",
+        "Supported ops and extension builtins on NVIDIA Blackwell.",
+    ),
+    Page(
+        "tlx-gfx942",
+        "TLX on gfx942 (MI300)",
+        "Supported ops and extension builtins on AMD MI300.",
+    ),
+    Page(
+        "tlx-gfx950",
+        "TLX on gfx950 (MI350)",
+        "Supported ops and extension builtins on AMD MI350.",
+    ),
+    Page(
+        "tlx-gfx1250",
+        "TLX on gfx1250 (RDNA4)",
+        "TDM descriptors and expected support on next-gen AMD.",
+    ),
+    Page(
         "testing",
         "Testing",
         "Correctness and performance scripts for the TLX tutorial kernels.",
@@ -228,7 +253,7 @@ def table_row(line: str, tag: str) -> str:
     return ("<tr>" + "".join(f"<{tag}>{render_inline(cell)}</{tag}>" for cell in cells) + "</tr>")
 
 
-def render_markdown(source: str) -> str:
+def render_markdown(source: str, *, from_root: bool = False) -> str:
     lines = source.splitlines()
     output: list[str] = []
     paragraph: list[str] = []
@@ -270,6 +295,20 @@ def render_markdown(source: str) -> str:
                 quote_lines.append(lines[index][1:].strip())
                 index += 1
             output.append(f"<blockquote><p>{render_inline(' '.join(quote_lines))}</p></blockquote>")
+            continue
+
+        image = re.fullmatch(r"!\[([^]]*)\]\(([^)]+)\)", line.strip())
+        if image:
+            flush_paragraph()
+            alt, target = image.groups()
+            if not target.startswith(("http://", "https://", "/")):
+                base = Path("website/content" if from_root else "content")
+                target = (base / target).as_posix()
+            output.append(
+                f'<p><img src="{html.escape(target, quote=True)}" '
+                f'alt="{html.escape(alt, quote=True)}" '
+                'style="max-width:100%;height:auto" loading="lazy"></p>')
+            index += 1
             continue
 
         heading = re.match(r"^(#{1,6})\s+(.+)$", line)
@@ -391,8 +430,8 @@ def page_links(page: Page, from_root: bool) -> str:
 
 
 def render_page(page: Page, source: str) -> str:
-    body = render_markdown(content_without_page_heading(source))
     from_root = page.slug == "home"
+    body = render_markdown(content_without_page_heading(source), from_root=from_root)
     stylesheet_path = "website/assets/tlx.css" if from_root else "assets/tlx.css"
     stylesheet = f"{stylesheet_path}?v={STYLESHEET_VERSION}"
     home = "./" if from_root else "../"

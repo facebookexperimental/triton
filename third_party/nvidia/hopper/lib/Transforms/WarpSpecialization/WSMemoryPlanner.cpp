@@ -10,6 +10,8 @@
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
+#include "nvidia/lib/TritonNVIDIAGPUToLLVM/Allocation.h"
+#include "nvidia/lib/TritonNVIDIAGPUToLLVM/TargetInfo.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -1392,6 +1394,19 @@ static unsigned getSmemAllocSizeBytes(ttg::LocalAllocOp alloc) {
                                8);
 }
 
+/// Copy i of a multi-buffered alloc starts at base + i * size. A TMA landing
+/// buffer must start at its encoding's alignment (128 bytes, or the swizzle
+/// period for a swizzled layout), so one whose size is not a multiple of that
+/// (e.g. a 1-D bias tile of 32 bf16 = 64 bytes) must stay single-buffered:
+/// every odd copy would fault with a misaligned address or land in the wrong
+/// swizzle phase.
+static bool isUnalignedTMALoadSlot(Operation *allocOp, unsigned sizeBytes,
+                                   SmallVector<Channel *> &channels) {
+  auto alloc = cast<ttg::LocalAllocOp>(allocOp);
+  return sizeBytes % alloc.getAlignmentOrDefault() != 0 &&
+         isSmemTMAChannel(allocOp, channels);
+}
+
 /// Compute total SMEM usage in bytes across all WSBuffers.
 /// Buffers sharing the same buffer.id (reuse group) contribute
 /// max(sizes) * copies instead of sum(sizes) * copies.
@@ -1543,6 +1558,7 @@ static unsigned getTmaReduceStagingCopies() {
 
 static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
                                         SmallVector<Channel *> &channels,
+                                        triton::FuncOp funcOp,
                                         unsigned numBuffers,
                                         unsigned smemBudget) {
   // Staging-depth search axis: cap the bump target (K|S/budget still enforced).
@@ -1563,6 +1579,10 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
         return true;
     return false;
   };
+  bool twoCTAs = false;
+  if (auto module = funcOp->getParentOfType<ModuleOp>())
+    if (auto attr = module->getAttrOfType<BoolAttr>("ttng.two-ctas"))
+      twoCTAs = attr.getValue();
 
   LDBG("Phase 3.7: enter \u2014 numBuffers="
        << numBuffers << " smemBudget=" << smemBudget
@@ -1611,6 +1631,28 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
 
     for (unsigned bufferId : ids) {
       auto &indices = epilogueGroups[bufferId];
+      // Ordinary 2CTA TMA stores have one completion phase per paired-CTA
+      // tile, not one cluster-aware phase per circular staging slot. Restrict
+      // every such group, including a single-subtile group, to one copy.
+      if (twoCTAs && wsBuffers[indices.front()].tmaStaging == 1) {
+        unsigned requiredCopies = 1;
+        for (unsigned idx : indices) {
+          requiredCopies = std::max(requiredCopies, wsBuffers[idx].numCopies);
+          requiredCopies = std::max(requiredCopies, wsBuffers[idx].minCopies);
+        }
+        if (requiredCopies > 1) {
+          funcOp->setAttr("ttg.ws_memory_plan_invalid",
+                          UnitAttr::get(funcOp.getContext()));
+          funcOp.emitError()
+              << "2CTA ordinary TMA output staging requires one copy; "
+              << "the correctness floor requires " << requiredCopies;
+          return;
+        }
+        LDBG("Phase 3.7:   bufferId="
+             << bufferId
+             << " kept at one copy for 2CTA ordinary output staging");
+        continue;
+      }
       if (indices.size() < 2) {
         LDBG("Phase 3.7: bufferId=" << bufferId << " \u2014 only "
                                     << indices.size()
@@ -2364,6 +2406,7 @@ static unsigned allocateSmemBuffersViaSearch(
   // output-store staging is single-store, instead of deferring the whole
   // kernel.
   bool needsFallback = !allocToAnnotation.empty();
+  Operation *unalignedTMALoadSlot = nullptr;
   funcOp->walk([&](Operation *op) {
     if (isa<ttng::SubtiledRegionOp>(op))
       needsFallback = true;
@@ -2377,8 +2420,26 @@ static unsigned allocateSmemBuffersViaSearch(
           ++storeUsers;
       if (storeUsers > 1)
         needsFallback = true; // subtiled staging (K|S) unmodeled
+      // A TMA landing buffer that is not a multiple of 128 bytes must stay
+      // single-buffered (see isUnalignedTMALoadSlot); the search does not
+      // model that cap.
+      if (!unalignedTMALoadSlot &&
+          isUnalignedTMALoadSlot(alloc, getSmemAllocSizeBytes(alloc),
+                                 channels)) {
+        unalignedTMALoadSlot = alloc;
+        needsFallback = true;
+      }
     }
   });
+  // This disables the search for the whole kernel, not just this buffer, so
+  // say so instead of changing the plan quietly.
+  if (unalignedTMALoadSlot)
+    unalignedTMALoadSlot->emitRemark()
+        << "SMEM plan-search: TMA landing buffer \""
+        << getLocName(unalignedTMALoadSlot) << "\" ("
+        << getSmemAllocSizeBytes(cast<ttg::LocalAllocOp>(unalignedTMALoadSlot))
+        << "B) is not a multiple of its TMA alignment and stays "
+           "single-buffered; using the heuristic planner for this kernel";
   if (needsFallback) {
     LDBG("SMEM plan-search: unmodeled feature present, falling back to "
          "heuristic");
@@ -2753,7 +2814,8 @@ static unsigned allocateSmemBuffers(
   // TMA store/reduce staging is on the output critical path. Reserve its
   // legal copy depth before discretionary P0/P1 operand buffering consumes
   // the remaining budget (notably FA-bwd dQ versus the small m/Di buffers).
-  increaseFusedEpilogueCopies(wsBuffers, channels, numBuffers, smemBudget);
+  increaseFusedEpilogueCopies(wsBuffers, channels, funcOp, numBuffers,
+                              smemBudget);
 
   LDBG("Phase 3.7 epilogue copies complete: totalSmem="
        << computeTotalSmem(wsBuffers));
@@ -2764,11 +2826,22 @@ static unsigned allocateSmemBuffers(
                         WSBufferPriority::P1_InnermostNonTMA}) {
     // Collect candidate indices at this priority.
     SmallVector<unsigned> candidateIndices;
+    // Candidates before dropping unaligned TMA landing buffers. Grouping is
+    // decided on this count so that dropping such a buffer never turns a
+    // three-buffer set into the two-buffer circular reuse group.
+    unsigned numCandidates = 0;
     for (unsigned i = 0; i < wsBuffers.size(); ++i) {
-      if (wsBuffers[i].isPinned)
+      if (wsBuffers[i].isPinned || wsBuffers[i].priority != priority)
         continue;
-      if (wsBuffers[i].priority == priority)
-        candidateIndices.push_back(i);
+      ++numCandidates;
+      if (isUnalignedTMALoadSlot(wsBuffers[i].allocOp, wsBuffers[i].sizeBytes,
+                                 channels)) {
+        LDBG("Phase 4: WSBuffer["
+             << wsBuffers[i].bufferId << "] is a TMA landing buffer of "
+             << wsBuffers[i].sizeBytes << " bytes; keeping its copy count");
+        continue;
+      }
+      candidateIndices.push_back(i);
     }
     if (candidateIndices.empty())
       continue;
@@ -2787,7 +2860,8 @@ static unsigned allocateSmemBuffers(
 
     // Step 0: Decide grouping upfront.
     bool isReuseGroup = false;
-    if (smemCircularReuse && candidateIndices.size() == 2) {
+    if (smemCircularReuse && numCandidates == 2 &&
+        candidateIndices.size() == 2) {
       isReuseGroup = true;
       auto &bufA = wsBuffers[candidateIndices[0]];
       auto &bufB = wsBuffers[candidateIndices[1]];
@@ -3832,6 +3906,28 @@ public:
           if (hasLoopCarriedAccToken(alloc, forOp)) {
             hasLoopCarriedMMA = true;
             break;
+          }
+          // A per-iteration accumulator (MMA directly in the loop body,
+          // not loop-carried, e.g. k_tiles == 1) needs a slot per in-flight
+          // iteration too, since the loop scheduler can put its init and its
+          // epilogue load in different stages; createBufferForAllocs already
+          // rotates these by the loop's accumCnt. Only accept accumulators
+          // whose value is dead across iterations: a tmem_store in the body
+          // writes them before any other access in the body.
+          auto mma = dyn_cast<ttng::MMAv5OpInterface>(user);
+          if (mma && user->getParentOp() == forOp.getOperation() &&
+              mma.getAccumulator() == alloc.getResult()) {
+            Block *body = forOp.getBody();
+            Operation *first = nullptr;
+            for (auto *other : alloc.getResult().getUsers()) {
+              Operation *anc = body->findAncestorOpInBlock(*other);
+              if (anc && (!first || anc->isBeforeInBlock(first)))
+                first = anc;
+            }
+            if (first && isa<ttng::TMEMStoreOp>(first)) {
+              hasLoopCarriedMMA = true;
+              break;
+            }
           }
         }
       }
@@ -5514,7 +5610,72 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
   return true;
 }
 
-// Reserve a conservative allowance for barriers, captures, and tensor-map
+// Op scratch (layout conversions, reductions, ...) is placed by
+// AllocateSharedMemoryNv after planning, and the planned buffers are live from
+// function entry through the warp_specialize. Reserve one slot sized to the
+// largest single op scratch, skipping scratch after the last WS loop (the
+// planned buffers are dead by then). This is an approximation: it over-reserves
+// when a later pass shrinks or drops the op (TMemSplitLoadPattern subtiling,
+// tritongpu-optimize-partition-warps), and under-reserves when several
+// partitions have scratch, since scratch in different warp_specialize regions
+// interferes. An under-reservation fails at launch and Inductor falls back to
+// num_stages=1.
+// TODO: size it exactly, with helpers shared with TMemSplitLoadPattern,
+// tritongpu-optimize-partition-warps, canonicalization and
+// AllocateSharedMemoryNv.
+static uint64_t estimateOpScratchBytes(triton::FuncOp funcOp) {
+  // Size it with the same function AllocateSharedMemoryNv uses (the generic
+  // one, which over-sizes layout conversions, only for IR without a CUDA
+  // target).
+  auto mod = funcOp->getParentOfType<ModuleOp>();
+  auto target = mod->getAttrOfType<StringAttr>(ttg::AttrTargetName);
+  std::optional<triton::NVIDIA::TargetInfo> targetInfo;
+  triton::AllocationAnalysisScratchSizeFn scratchSizeFn =
+      triton::defaultAllocationAnalysisScratchSizeFn;
+  if (target && target.getValue().starts_with("cuda:")) {
+    targetInfo.emplace(getNVIDIAComputeCapability(mod));
+    scratchSizeFn = ttng::getNvidiaAllocationAnalysisScratchSizeFn(*targetInfo);
+  }
+
+  auto topLevelAncestor = [&](Operation *op) {
+    while (op->getParentOp() != funcOp.getOperation())
+      op = op->getParentOp();
+    return op;
+  };
+  Operation *lastWSAnchor = nullptr;
+  funcOp->walk([&](LoopLikeOpInterface loop) {
+    if (!loop->hasAttr(tt::kWarpSpecializeAttrName))
+      return;
+    Operation *anchor = topLevelAncestor(loop);
+    if (!lastWSAnchor || lastWSAnchor->isBeforeInBlock(anchor))
+      lastWSAnchor = anchor;
+  });
+  if (!lastWSAnchor)
+    return 0;
+
+  uint64_t peak = 0;
+  funcOp->walk([&](Operation *op) {
+    // Tensor-map scratch is reserved separately.
+    if (isa<ttng::TensormapCreateOp>(op))
+      return;
+    // Canonicalization folds a conversion into local_store/local_alloc users.
+    if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(op);
+        cvt && !cvt->use_empty() &&
+        llvm::all_of(cvt->getUsers(), [](Operation *user) {
+          return isa<ttg::LocalStoreOp, ttg::LocalAllocOp>(user);
+        }))
+      return;
+    uint64_t bytes = scratchSizeFn(op);
+    if (bytes <= peak || lastWSAnchor->isBeforeInBlock(topLevelAncestor(op)))
+      return;
+    peak = bytes;
+    LDBG("auxiliary op scratch: " << bytes << " bytes for " << *op);
+  });
+  LDBG("auxiliary op scratch: reserving " << peak << " bytes");
+  return peak;
+}
+
+// Reserve a conservative allowance for barriers, captures, tensor-map and op
 // scratch created after SMEM planning.
 static unsigned estimateAuxiliarySmemBytes(
     triton::FuncOp funcOp,
@@ -5557,10 +5718,12 @@ static unsigned estimateAuxiliarySmemBytes(
     tensorMapScratchBytes += tensorMapBytesPerOp;
   });
 
+  uint64_t opScratchBytes = estimateOpScratchBytes(funcOp);
+
   uint64_t totalBytes = numBarrierSlots * barrierBytesPerSlot *
                             triton::gpu::lookupNumCTAs(funcOp) +
                         numBarrierArrays * barrierCaptureBytesPerArray +
-                        captureBytes + tensorMapScratchBytes;
+                        captureBytes + tensorMapScratchBytes + opScratchBytes;
   return static_cast<unsigned>(
       std::min<uint64_t>(totalBytes, std::numeric_limits<unsigned>::max()));
 }
@@ -5698,6 +5861,10 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
                                          effectiveSmemBudget,
                                          effectiveSmemCircularReuse,
                                          smemAllocAnnotations, annotationMaxId);
+    if (funcOp->hasAttr("ttg.ws_memory_plan_invalid")) {
+      funcOp->removeAttr("ttg.ws_memory_plan_invalid");
+      return failure();
+    }
   } else {
     // Original SMEM allocation.
     LDBG("using SMEM allocation algorithm 0 (original)");
@@ -5709,6 +5876,20 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
     LLVM_DEBUG(funcOp.dump());
     LLVM_DEBUG(planner.dumpBuffers());
   }
+
+  // Phase 4 keeps unaligned TMA landing buffers single-buffered, but a floor or
+  // annotation (or the original algorithm) can still give one several copies;
+  // every odd copy is then misaligned. Say so at compile time.
+  funcOp->walk([&](ttg::LocalAllocOp alloc) {
+    auto copies = alloc->getAttrOfType<IntegerAttr>("buffer.copy");
+    if (copies && copies.getInt() > 1 &&
+        isUnalignedTMALoadSlot(alloc, getSmemAllocSizeBytes(alloc), channels))
+      alloc.emitWarning()
+          << "TMA landing buffer \"" << getLocName(alloc) << "\" ("
+          << getSmemAllocSizeBytes(alloc) << "B) has " << copies.getInt()
+          << " copies but is not a multiple of its TMA alignment; copies "
+             "after the first are misaligned";
+  });
 
   // Dump combined key ops + channel graph (side by side visualization)
   // Note: Placed before MemoryPlannerTmem to visualize state even if TMEM

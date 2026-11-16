@@ -6,6 +6,7 @@ include "mlir/IR/OpBase.td"
 def TLX_Dialect : Dialect {
   let name = "tlx";
   let cppNamespace = "::mlir::triton::tlx";
+  let useStrictPropertiesInAssemblyFormat = 0;
 
   let description = [{
     TLX Dialect.

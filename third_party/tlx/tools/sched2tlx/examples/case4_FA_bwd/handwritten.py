@@ -108,6 +108,11 @@ def fa_bwd_dkdv_ws(
     p_tmem = tlx.local_alloc(
         (BLOCK_N, BLOCK_M), tl.float16, 1, tlx.storage_kind.tmem, reuse=qk_p
     )
+    qk_p.set_buffer_overlap(
+        tlx.reuse_group(
+            qk_tmem, p_tmem, group_type=tlx.reuse_group_type.shared
+        )
+    )
     dp_dq = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     dp_tmem = tlx.local_alloc(
         (BLOCK_N, BLOCK_M), tl.float32, 1, tlx.storage_kind.tmem, reuse=dp_dq

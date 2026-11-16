@@ -4,6 +4,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -458,3 +459,167 @@ class AgentActionPromptTest(unittest.TestCase):
                 _request(),
                 _context(current_source_digest="0" * 64),
             )
+
+
+class CandidateOnlyActionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.request = KernelOptimizationRequest(
+            _CURRENT_SOURCE,
+            Path(__file__),
+            (InputCase("primary", {}),),
+            KernelTarget("fake", "fake"),
+        )
+        self.context = CandidateContext(
+            1,
+            0,
+            _CURRENT_SOURCE,
+            PerformanceSummary(()),
+            (),
+            local_search_failure_streak=1,
+            candidate_only=True,
+            remaining_agent_actions=2,
+            remaining_seconds=120.0,
+        )
+
+    def test_candidate_only_prompt_reuses_metadata_without_unavailable_actions(
+        self,
+    ) -> None:
+        prompt = _build_prompt(self.request, self.context)
+        for required in (
+            '"action": "candidate"',
+            '"schema_version": 3',
+            '"source_sha256"',
+            '"hypothesis_kind"',
+            '"escalation_reason"',
+            '"change_scopes"',
+            '"blast_radius"',
+            "final unified diff",
+            "changed top-level function",
+            "authoritative performance",
+            "untried, source-derived legal neighbor",
+            "Interpret a failed value narrowly",
+            "Remaining candidate calls (including this call): 2",
+        ):
+            self.assertIn(required, prompt)
+        for unavailable in (
+            '"action": "diagnostic"',
+            '"action": "source_research"',
+            "Request NCU",
+            "Request Proton",
+            "Request source research",
+            "SATURATED",
+            "saturation threshold",
+            "Do not repeat current-file-only tuning",
+            "Remaining NCU collections",
+            "Modify PTX or AMDGCN experimentally",
+        ):
+            self.assertNotIn(unavailable, prompt)
+        self.assertIn('"research_evidence_ids": []', prompt)
+
+    def test_default_rich_context_retains_schemas_and_saturation_rules(self) -> None:
+        rich = replace(
+            self.context, candidate_only=False, remaining_source_research_actions=1
+        )
+        prompt = _build_prompt(self.request, rich)
+        for preserved in (
+            '"action": "diagnostic"',
+            '"action": "source_research"',
+            '"tool": "ncu"',
+            '"tool": "proton"',
+            "LOCAL SEARCH IS SATURATED",
+            "Prefer one focused source_research action",
+            "Modify PTX or AMDGCN experimentally",
+            "Remaining source research actions: 1",
+        ):
+            self.assertIn(preserved, prompt)
+        exhausted = _build_prompt(
+            self.request, replace(rich, remaining_source_research_actions=0)
+        )
+        self.assertIn("Do not repeat current-file-only tuning", exhausted)
+
+    def test_candidate_only_rejects_non_candidate_action(self) -> None:
+        def write_action(command, **kwargs):
+            workspace = Path(command[command.index("--cd") + 1])
+            (workspace / "agent_action.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "action": "source_research",
+                        "source_digest": source_digest(_CURRENT_SOURCE),
+                        "question": "Which legal neighbor preserves invariants?",
+                        "rationale": "Need source evidence",
+                        "search_terms": [],
+                        "goals": [],
+                    }
+                )
+            )
+            return Mock(returncode=0, stderr="")
+
+        with patch(
+            "third_party.tlx.tools.agents.kernel_optimization.optimizer.agent.subprocess.run",
+            side_effect=write_action,
+        ):
+            with self.assertRaisesRegex(ValueError, "candidate-only context"):
+                CodexCandidateProvider().propose(self.request, self.context)
+
+    def test_candidate_metadata_binding_is_identical_for_candidate_only_and_rich(
+        self,
+    ) -> None:
+        candidate = "def kernel():\n    return 2\n"
+        metadata = {
+            "schema_version": 3,
+            "hypothesis": "Reduce repeated work.",
+            "hypothesis_kind": "parameter",
+            "escalation_reason": "",
+            "research_evidence_ids": [],
+            "evidence": "Measured latency.",
+            "change": "Fold repeated work in kernel.",
+            "expected_effect": "Fewer instructions.",
+            "risk": "Preserve return contract.",
+            "commit_title": "Fold repeated work in kernel",
+            "commit_summary": "Change summary:\nUpdate kernel to fold repeated work.\n\nWhy:\nReduce instructions.",
+            "source_sha256": hashlib.sha256(candidate.encode()).hexdigest(),
+            "experiment_kind": "promotable",
+            "blast_radius": "local",
+            "change_scopes": ["kernel"],
+            "changes": [
+                {"scope": "kernel", "summary": "Fold repeated work", "files": []}
+            ],
+            "experiment_payload": {},
+        }
+
+        def write_candidate(command, **kwargs):
+            workspace = Path(command[command.index("--cd") + 1])
+            (workspace / "candidate.py").write_text(candidate)
+            (workspace / "agent_action.json").write_text(
+                json.dumps({"schema_version": 1, "action": "candidate"})
+            )
+            (workspace / "candidate_metadata.json").write_text(json.dumps(metadata))
+            return Mock(returncode=0, stderr="")
+
+        with patch(
+            "third_party.tlx.tools.agents.kernel_optimization.optimizer.agent.subprocess.run",
+            side_effect=write_candidate,
+        ):
+            for candidate_only in (True, False):
+                context = replace(self.context, candidate_only=candidate_only)
+                with self.subTest(candidate_only=candidate_only):
+                    proposal = CodexCandidateProvider().propose(self.request, context)
+                    self.assertIsInstance(proposal, CandidateProposal)
+                    self.assertEqual(proposal.source, candidate)
+                    self.assertEqual(proposal.hypothesis_kind, "parameter")
+                    self.assertEqual(
+                        proposal.commit_summary, metadata["commit_summary"]
+                    )
+                    digest = metadata["source_sha256"]
+                    metadata["source_sha256"] = "0" * 64
+                    with self.assertRaisesRegex(ValueError, "source_sha256"):
+                        CodexCandidateProvider().propose(self.request, context)
+                    metadata["source_sha256"] = digest
+                    summary = metadata["commit_summary"]
+                    metadata["commit_summary"] = (
+                        "Change summary:\nUpdate unrelated.\n\nWhy:\nReduce work."
+                    )
+                    with self.assertRaisesRegex(ValueError, "changed top-level scope"):
+                        CodexCandidateProvider().propose(self.request, context)
+                    metadata["commit_summary"] = summary

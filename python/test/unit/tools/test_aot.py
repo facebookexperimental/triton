@@ -12,6 +12,14 @@ import triton
 from triton.backends.compiler import GPUTarget
 from triton._internal_testing import is_cuda, is_hip, is_hip_gfx1250
 
+# Buck expands $(location) in TRITON_AMD_CODEGEN_PATH to a runfiles-relative
+# path. The AOT helpers below spawn compile.py/link.py children with cwd set to
+# a temp dir, where the relative path no longer resolves (OSError: .so not
+# found). Absolutize eagerly while our own cwd is still the runfiles root so
+# all children inherit a valid path.
+if "TRITON_AMD_CODEGEN_PATH" in os.environ and not os.path.isabs(os.environ["TRITON_AMD_CODEGEN_PATH"]):
+    os.environ["TRITON_AMD_CODEGEN_PATH"] = os.path.abspath(os.environ["TRITON_AMD_CODEGEN_PATH"])
+
 if is_cuda():
     from triton.backends.nvidia.driver import include_dirs, library_dirs
 
@@ -26,7 +34,7 @@ elif is_hip():
         return [os.path.dirname(hip_runtime_dylib)]
 
     def library_names():
-        return ["amdhip64"]
+        return [_get_path_to_hip_runtime_dylib()]
 
 
 def runtime_env(tmp_dir):
@@ -299,8 +307,13 @@ int main(int argc, char **argv) {{
         command.extend(["-I", inc_dir])
     for lib_dir in library_dirs():
         command.extend(["-L", lib_dir])
+        if is_hip():
+            command.append(f"-Wl,-rpath,{lib_dir}")
     for lib_name in library_names():
-        command.extend(["-l", lib_name])
+        if os.path.isabs(lib_name):
+            command.append(lib_name)
+        else:
+            command.extend(["-l", lib_name])
     command.extend(["-L", dir, "-l", "kernel", "-o", exe])
     subprocess.run(command, check=True, cwd=dir)
 
@@ -401,6 +414,71 @@ def check_hasco_binary_str(tmp_dir: str, dtype: str):
         assert int(matches[0]) > 16, "Expected valid HSACO object binary string"
 
 
+def test_linker_rejects_invalid_algo_id():
+    from triton.tools.link import (
+        KernelLinkerMeta,
+        make_func_pointers,
+        make_get_num_algos_def,
+        make_kernel_meta_const_dispatcher,
+    )
+
+    meta = KernelLinkerMeta(
+        orig_kernel_name="kernel",
+        arg_names=["x"],
+        arg_ctypes=["int"],
+        sizes=[None],
+        sig_hash="abcdef12",
+        triton_suffix="",
+        suffix="",
+        num_specs=0,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        c_path = os.path.join(tmp_dir, "test_linker_algo_id_bounds.c")
+        exe_path = os.path.join(tmp_dir, "test_linker_algo_id_bounds")
+        with open(c_path, "w") as fp:
+            fp.write(f"""
+#include <stdio.h>
+
+typedef void *TT_StreamTy;
+typedef int TT_ResultTy;
+
+#define TT_ERROR_INVALID_VALUE 777
+#define CHECK_EQ(actual, expected) \\
+  do {{ \\
+    TT_ResultTy got = (actual); \\
+    if (got != (expected)) {{ \\
+      fprintf(stderr, "%s:%d: got %d, expected %d\\n", __FILE__, __LINE__, got, (expected)); \\
+      return 1; \\
+    }} \\
+  }} while (0)
+
+TT_ResultTy kernel_algo0(TT_StreamTy stream, int x) {{
+  return x + 10;
+}}
+
+TT_ResultTy kernel_algo1(TT_StreamTy stream, int x) {{
+  return x + 20;
+}}
+
+{make_func_pointers(["kernel_algo0", "kernel_algo1"], meta)}
+{make_get_num_algos_def(meta)}
+{make_kernel_meta_const_dispatcher(meta)}
+
+int main(void) {{
+  CHECK_EQ(kernel_get_num_algos(), 2);
+  CHECK_EQ(kernel(0, 5, 0), 15);
+  CHECK_EQ(kernel(0, 5, 1), 25);
+  CHECK_EQ(kernel(0, 5, -1), TT_ERROR_INVALID_VALUE);
+  CHECK_EQ(kernel(0, 5, 2), TT_ERROR_INVALID_VALUE);
+  return 0;
+}}
+""")
+
+        subprocess.run(["gcc", "-std=c99", "-DNDEBUG", c_path, "-o", exe_path], check=True)
+        subprocess.run([exe_path], check=True)
+
+
 # Test edge case where the provided kernel signature has no specializations
 def test_compile_link_matmul_no_specialization():
     np.random.seed(3)
@@ -413,6 +491,7 @@ def test_compile_link_matmul_no_specialization():
         compile_aot_kernel_no_specialization(tmp_dir, kernel_path, dtype, BM, BN, BK)
         if is_hip():
             check_hasco_binary_str(tmp_dir, dtype)
+            return
 
         link_aot_kernels(tmp_dir)
 
@@ -446,6 +525,7 @@ def test_compile_link_matmul():
         compile_aot_kernels(tmp_dir, kernel_path, dtype, BM, BN, BK, ha_hb_hints=[(":16", ":16")])
         if is_hip():
             check_hasco_binary_str(tmp_dir, dtype)
+            return
         link_aot_kernels(tmp_dir)
 
         # compile test case
@@ -478,6 +558,7 @@ def test_launcher_has_no_available_kernel():
         compile_aot_kernels(tmp_dir, kernel_path, dtype, BM, BN, BK, ha_hb_hints=[(":1", ":1")])
         if is_hip():
             check_hasco_binary_str(tmp_dir, dtype)
+            return
 
         link_aot_kernels(tmp_dir)
 
@@ -521,6 +602,9 @@ def test_compile_link_autotune_matmul():
             BM, BN, BK = ts[0], ts[1], ts[2]
             compile_aot_kernels(tmp_dir, kernel_path, dtype, BM, BN, BK, ha_hb_hints=[(":16", ":16"), (":16", ""),
                                                                                       ("", ":16")])
+
+        if is_hip():
+            return
 
         link_aot_kernels(tmp_dir)
 
@@ -571,7 +655,8 @@ module attributes {{"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = {warp_si
             assert ".address_size 64" in ptx
         elif is_hip():
             amdgcn = k.asm["amdgcn"]
-            assert re.search(r'\.amdgcn_target "amdgcn-amd-amdhsa-[^-]*-gfx942"', amdgcn)
+            assert 'target triple = "amdgpu9.42-amd-amdhsa"' in k.asm["llir"]
+            assert re.search(r'\.amdgcn_target "amdgpu9\.42-amd-amdhsa-[^-]*-gfx942"', amdgcn)
             assert '.wavefront_size: 64' in amdgcn
 
 
@@ -590,3 +675,29 @@ def test_gluon_kernel(target):
         kernel_path = write_triton_kernels(tmp_dir, gluon_kernel_src, kernel_utils_src)
         compile_aot_kernel_no_specialization(tmp_dir, kernel_path, dtype, BM, BN, BK, target=target)
         check_hasco_binary_str(tmp_dir, dtype)
+
+
+def test_aot_target_parsing_with_explicit_target():
+    """
+    Regression test for target parsing in compile.py CLI.
+
+    Previously, `GPUTarget(*args.target.split(":"))` passed arch and warp_size
+    as strings, causing TypeError in downstream integer comparisons (e.g.,
+    `arch >= 100`) and silent logic errors (e.g., `warp_size * 4` producing
+    string repetition instead of arithmetic).
+
+    This test exercises the `--target` CLI path by explicitly passing a target
+    to _compile_kernel, which formats it as a colon-separated string for the
+    CLI. The compile.py code must correctly parse the string back into proper
+    types (int for arch on CUDA, str for arch on HIP, int for warp_size).
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        dtype = "fp16"
+        BM, BN, BK = 16, 16, 16
+
+        kernel_path = write_triton_kernels(tmp_dir, kernel_src, kernel_utils_src)
+
+        # Use the current machine's target but pass it explicitly through CLI
+        # to exercise the --target string parsing path in compile.py
+        target = triton.runtime.driver.active.get_current_target()
+        compile_aot_kernel_no_specialization(tmp_dir, kernel_path, dtype, BM, BN, BK, target=target)

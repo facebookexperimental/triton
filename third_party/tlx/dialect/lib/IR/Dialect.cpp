@@ -2,6 +2,7 @@
 #include "mlir/IR/OpImplementation.h"
 #include "triton/Dialect/Triton/IR/Interfaces.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include <numeric>
 
@@ -182,6 +183,29 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
         });
   }
 
+  // Upstream #11759 relaxed broadcast layouts: the result may differ from the
+  // source when no data moves between threads/registers (projection
+  // equality). Strip TLX wrappers on both sides so wrapper asymmetry alone
+  // never rejects an otherwise valid pair, then defer to the underlying
+  // source encoding's dialect check to preserve the upstream intent exactly.
+  // Pairs with no concrete source dialect (or a TLX-owned inner encoding)
+  // cannot delegate without recursing here, so they keep strict equality.
+  LogicalResult
+  verifyBroadcastOpEncoding(RankedTensorType srcType,
+                            RankedTensorType dstType) const override {
+    Attribute srcEnc = getEffectiveEncoding(srcType.getEncoding());
+    Attribute dstEnc = getEffectiveEncoding(dstType.getEncoding());
+    const triton::DialectInferLayoutInterface *delegate =
+        getInferLayoutInterfaceFor(srcEnc);
+    if (!delegate || delegate == this)
+      return success(srcType.getEncoding() == dstType.getEncoding());
+    return delegate->verifyBroadcastOpEncoding(
+        RankedTensorType::get(srcType.getShape(), srcType.getElementType(),
+                              srcEnc),
+        RankedTensorType::get(dstType.getShape(), dstType.getElementType(),
+                              dstEnc));
+  }
+
   LogicalResult inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
                                    Attribute retEncoding,
                                    std::optional<Location> loc) const override {
@@ -288,10 +312,6 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
     return delegate->verifyDotOpEncodingCompatibility(op, a, b);
   }
 
-  LogicalResult verifyCatOpEncodingCompatibility(Operation *op) const override {
-    return success();
-  }
-
   LogicalResult
   inferFp4ToFpOpEncoding(ArrayRef<int64_t> shape, int axis, Attribute inEnc,
                          Attribute &outEnc, bool fwdInference,
@@ -334,6 +354,9 @@ LogicalResult mlir::triton::tlx::NoVerifyLayoutAttr::verify(
     return emitError()
            << "no-verify layout must wrap a distributed tensor layout";
   }
+  if (triton::tools::isNpotAllowed() && !ttg::isRadix2Encoding(layout))
+    return emitError() << "NPOT mixed-radix layout is not yet supported in a "
+                          "TLX layout wrapper";
   return success();
 }
 
@@ -358,17 +381,9 @@ Attribute mlir::triton::tlx::wrapNoVerifyLayout(Attribute layout) {
     return layout;
   if (!isa<ttg::DistributedEncodingTrait>(layout))
     return layout;
-  // AMD MFMA and dot-operand encodings are concrete hardware ownerships, not
-  // unresolved Triton blocked layouts.  Gluon's CDNA MFMA path emits these
-  // attributes bare, and the early Triton-to-TritonGPU conversion must see the
-  // same concrete types before TLX's later placeholder cleanup runs.  Wrapping
-  // them in #tlx.no_verify_layout makes a live tt.dot result look like an
-  // unresolved blocked-to-MFMA materialization and fails conversion on gfx950.
-  if (isa<ttg::AMDMfmaEncodingAttr>(layout))
-    return layout;
-  if (auto dotLayout = dyn_cast<ttg::DotOperandEncodingAttr>(layout))
-    if (isa<ttg::AMDMfmaEncodingAttr>(dotLayout.getParent()))
-      return layout;
+  // AMD MFMA ownership also needs deferral through helper inlining. The TLX
+  // placeholder resolver removes the marker once the executing warp partition
+  // provides the context for layout verification.
   if (auto mmaLayout = dyn_cast<ttg::NvidiaMmaEncodingAttr>(layout);
       mmaLayout && mmaLayout.isHopper())
     return layout;
@@ -418,6 +433,9 @@ LogicalResult mlir::triton::tlx::UserLayoutAttr::verify(
       !isa<ttg::SharedEncodingTrait>(layout))
     return emitError()
            << "user layout must wrap a distributed or shared layout";
+  if (triton::tools::isNpotAllowed() && !ttg::isRadix2Encoding(layout))
+    return emitError() << "NPOT mixed-radix layout is not yet supported in a "
+                          "TLX layout wrapper";
   return success();
 }
 
@@ -498,6 +516,14 @@ void mlir::triton::tlx::setClusterSyncKernelInitOnMod(Operation *op,
                               "cluster sync kernel init marker");
   module->setAttr(AttrClusterSyncKernelInitName,
                   BoolAttr::get(module->getContext(), value));
+}
+
+bool mlir::triton::tlx::isClusterSyncBootstrap(Operation *op) {
+  return op->hasAttrOfType<UnitAttr>(AttrClusterSyncBootstrapName);
+}
+
+void mlir::triton::tlx::setClusterSyncBootstrap(Operation *op) {
+  op->setAttr(AttrClusterSyncBootstrapName, UnitAttr::get(op->getContext()));
 }
 
 bool mlir::triton::tlx::hasClusterSyncKernelCleanup(Operation *op) {

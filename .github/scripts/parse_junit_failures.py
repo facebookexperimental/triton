@@ -30,6 +30,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 from classify_failure import classify
+from test_results import encode_recovery
 
 # Matches a single trailing bracketed parametrization suffix: test_x[a-b] -> test_x
 PARAM_SUFFIX = re.compile(r"\[.*\]$")
@@ -146,6 +147,23 @@ def build_missing_junit_item(missing_paths, workflow, job):
     }
 
 
+def build_gpu_unhealthy_item(workflow, job):
+    """Build the job-level item for a runner whose GPU failed the health check before any test ran."""
+    norm = "gpu-unhealthy"
+    return {
+        "normalized_failure_id": norm,
+        "raw_failure_ids": "",
+        "issue_title": f"[nightly] {workflow} / {job} / {norm}",
+        "job_name": job,
+        "summary": "The runner's GPU failed the health check in the Tune Nvidia GPU step; no test ran.",
+        "repro": "",
+        # No test ran -> reconcile must not close.
+        "fallback": True,
+        "external_dep": True,
+        "external_dep_reason": "GPU unresponsive on the runner (runner infra)",
+    }
+
+
 def parse_budget(spec):
     """Parse a ``--budget`` pair, ``<junit-xml-path>=<timeout-minutes>``."""
     path, sep, minutes = spec.rpartition("=")
@@ -232,9 +250,46 @@ def build_bucket_item(bucket, workflow, job):
     }
 
 
+def recovery_results(paths, expected, budgets, threshold, failed, bucket):
+    passed, not_passed, resolved = set(), set(), []
+    roots = {}
+    for path in paths:
+        try:
+            roots[path] = ET.parse(path).getroot()
+        except (OSError, ET.ParseError):
+            continue
+        for tc in roots[path].iter("testcase"):
+            rid = raw_id(tc.get("classname", ""), tc.get("name", ""))
+            if tc.find("failure") is not None or tc.find("error") is not None or tc.find("skipped") is not None:
+                not_passed.add(rid)
+            else:
+                passed.add(rid)
+    passed -= not_passed
+    for path, minutes in budgets:
+        if path not in roots or minutes <= 0:
+            continue
+        cases = list(roots[path].iter("testcase"))
+        seconds = suite_seconds(path)
+        if cases and any(raw_id(tc.get("classname", ""), tc.get("name", "")) in passed for tc in cases):
+            if any(tc.find("failure") is not None or tc.find("error") is not None for tc in cases):
+                continue
+            if seconds is not None and seconds < threshold * minutes * 60:
+                name = os.path.basename(path).removesuffix(".xml")
+                resolved.append(f"slow-step:{name}")
+    complete = bool(expected) and set(roots) == set(expected) and all(
+        list(root.iter("testcase")) and all(
+            int(suite.get("tests", "0")) == len(suite.findall("testcase"))
+            for suite in root.iter("testsuite"))
+        for root in roots.values())
+    if complete and not failed and passed:
+        resolved.extend([bucket, "pytest-junit-missing", "gpu-unhealthy"])
+    return encode_recovery(passed, resolved, bool(complete))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--junit", nargs="+", required=True, help="JUnit XML file(s)")
+    parser.add_argument("--completed-junit", nargs="*", default=[], help="XML from completed test steps only")
     parser.add_argument("--workflow", required=True, help="Workflow name (for title)")
     parser.add_argument("--job", required=True, help="Job name (for title)")
     parser.add_argument("--output-name", default="failures", help="GITHUB_OUTPUT key to write")
@@ -248,6 +303,11 @@ def main():
         "--bucket",
         default="job-failed-no-parseable-failures",
         help="Stable bucket id for the fallback item emitted when --failed is set.",
+    )
+    parser.add_argument(
+        "--gpu-unhealthy",
+        action="store_true",
+        help="The GPU health check failed: report the runner instead of parsing test output.",
     )
     parser.add_argument(
         "--budget",
@@ -265,25 +325,31 @@ def main():
     )
     args = parser.parse_args()
 
-    failures, missing_paths = collect_failures(args.junit)
-    items = build_items(failures, args.workflow, args.job)
-    if not items and missing_paths:
-        items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
-    if not items and args.failed:
-        items.append(build_bucket_item(args.bucket, args.workflow, args.job))
-    # Appended after the fallback guards: a slow-step item must not suppress the
-    # job-level fallback that a genuine failure needs.
-    items += build_slow_items([parse_budget(b) for b in args.budget], args.slow_threshold, args.workflow, args.job)
+    if args.gpu_unhealthy:
+        items = [build_gpu_unhealthy_item(args.workflow, args.job)]
+    else:
+        failures, missing_paths = collect_failures(args.junit)
+        items = build_items(failures, args.workflow, args.job)
+        if not items and missing_paths:
+            items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
+        if not items and args.failed:
+            items.append(build_bucket_item(args.bucket, args.workflow, args.job))
+        # Appended after the fallback guards: a slow-step item must not suppress the
+        # job-level fallback that a genuine failure needs.
+        items += build_slow_items([parse_budget(b) for b in args.budget], args.slow_threshold, args.workflow, args.job)
     payload = json.dumps(items)
 
     # TODO(scuba): in a follow-up, also emit a metrics row per failure
     # ({workflow, job, normalized_id, status, sha, run_id}) to a Scuba table.
     # Feasible on the self-hosted GPU runners (scribe reachable); skip on the
     # GitHub-hosted ubuntu-latest LIT job, which has no Scuba access.
+    recovery = recovery_results(args.completed_junit, args.junit, [parse_budget(b)
+                                                                   for b in args.budget], args.slow_threshold,
+                                args.failed, args.bucket) if not args.gpu_unhealthy else encode_recovery()
     out_path = os.environ.get("GITHUB_OUTPUT")
     if out_path:
         with open(out_path, "a", encoding="utf-8") as fh:
-            fh.write(f"{args.output_name}={payload}\n")
+            fh.write(f"{args.output_name}={payload}\nrecovery={recovery}\n")
     # Always echo to stdout for log visibility / local debugging.
     print(payload)
 

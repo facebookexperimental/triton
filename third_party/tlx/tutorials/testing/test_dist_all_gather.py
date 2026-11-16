@@ -26,6 +26,7 @@ def test_dist_all_gather():
         "third_party",
         "tlx",
         "tutorials",
+        "distributed",
         "blackwell_dist_all_gather.py",
     )
 
