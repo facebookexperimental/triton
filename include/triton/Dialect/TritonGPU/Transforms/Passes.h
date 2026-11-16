@@ -17,6 +17,9 @@ namespace gpu {
 #define GEN_PASS_REGISTRATION
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
+// Attaches NpotTargetLegality to TritonNvidiaGPUDialect when it loads.
+void registerNpotTargetLegality(DialectRegistry &registry);
+
 } // namespace gpu
 } // namespace triton
 } // namespace mlir

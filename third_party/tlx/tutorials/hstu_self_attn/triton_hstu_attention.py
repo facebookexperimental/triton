@@ -43,6 +43,19 @@ from triton.language.extra.subtile_ops import _split_n_2D  # @manual=//triton:tr
 from dataclasses import dataclass, replace as _dc_replace
 
 
+def _switch_hstu_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
+    """Keep packed QKV views when each head's feature dimension is contiguous."""
+    if x.stride(-1) == 1:
+        return x
+    return x.contiguous()
+
+
+@triton.jit
+def _hstu_descriptor_width(H, stride_h, head_dim):
+    # A packed head starts at h * stride_h; include the final head's full tile.
+    return (H - 1) * stride_h + head_dim
+
+
 def _allocate_tma_workspace(size: int, _alignment: int, _stream: Optional[int]) -> torch.Tensor:
     return torch.empty(size, dtype=torch.uint8, device="cuda")
 
@@ -876,8 +889,10 @@ def _hstu_attn_fwd_one_block_0(  # noqa: C901
     K,
     V,
     acc,
-    K_block_ptr,
-    V_block_ptr,
+    stride_kh,
+    stride_kn,
+    stride_vh,
+    stride_vn,
     device_desc_k,
     device_desc_v,
     offset_kh,
@@ -909,7 +924,11 @@ def _hstu_attn_fwd_one_block_0(  # noqa: C901
         # tma can only be loaded in one order, use trans afterwards
         qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32)
     else:
-        k = tl.load(K_block_ptr, boundary_check=(1, ), padding_option="zero")
+        offs_kd = tl.arange(0, BLOCK_D_Q)
+        offs_kv_n = start_n + tl.arange(0, BLOCK_N)
+        k = tl.load(
+            K + off_h * stride_kh + seq_start_kv * stride_kn + offs_kd[:, None] + offs_kv_n[None, :] * stride_kn,
+            mask=offs_kv_n[None, :] < seq_len_kv, other=0.0)
         qk = tl.dot(q, k, allow_tf32=ALLOW_TF32)
     valid_mask = forward_valid_mask(
         offs_m,
@@ -927,7 +946,10 @@ def _hstu_attn_fwd_one_block_0(  # noqa: C901
     if ENABLE_TMA:
         v = device_desc_v.load([(seq_start_kv + start_n).to(tl.int32), offset_vh.to(tl.int32)])
     else:
-        v = tl.load(V_block_ptr, boundary_check=(0, ), padding_option="zero")
+        offs_vd = tl.arange(0, BLOCK_D_V)
+        offs_v_n = start_n + tl.arange(0, BLOCK_N)
+        v = tl.load(V + off_h * stride_vh + seq_start_kv * stride_vn + offs_v_n[:, None] * stride_vn + offs_vd[None, :],
+                    mask=offs_v_n[:, None] < seq_len_kv, other=0.0)
     act_qk = act_qk.to(v.dtype)
     acc += tl.dot(act_qk, v, allow_tf32=ALLOW_TF32)
     return acc
@@ -1203,11 +1225,14 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
                         ],
                     } if DQ_REUSE else None),
                 ) * alpha)
+            if not DQ_FP32:
+                # Narrow the full accumulator before splitting it. Converting
+                # each slice separately keeps the full FP32 value live across
+                # every reduction store and causes substantial register spills.
+                dq = dq.to(k.dtype)
             dqs = _split_n_2D(dq, DQ_ITERS)
             for _s in tl.static_range(DQ_ITERS):
                 dq_slice = dqs[_s]
-                if not DQ_FP32:
-                    dq_slice = dq_slice.to(k.dtype)
                 device_desc_dq.store(
                     [(desc_row_q + start_m).to(tl.int32), (off_h * stride_dqh + _s * dq_slice_size).to(tl.int32)],
                     dq_slice,
@@ -1332,8 +1357,8 @@ def _hstu_attn_fwd_compute(  # noqa C901
     if ENABLE_TMA:
         device_desc_k = tl.make_tensor_descriptor(
             K,
-            shape=[seq_end_kv.to(tl.int32), H * DimQ],
-            strides=[H * DimQ, 1],
+            shape=[seq_end_kv.to(tl.int32), _hstu_descriptor_width(H, stride_kh, DimQ)],
+            strides=[stride_kn, 1],
             block_shape=[
                 BLOCK_N,
                 BLOCK_D_Q,
@@ -1341,8 +1366,8 @@ def _hstu_attn_fwd_compute(  # noqa C901
         )
         device_desc_v = tl.make_tensor_descriptor(
             V,
-            shape=[seq_end_kv.to(tl.int32), H * DimV],
-            strides=[H * DimV, 1],
+            shape=[seq_end_kv.to(tl.int32), _hstu_descriptor_width(H, stride_vh, DimV)],
+            strides=[stride_vn, 1],
             block_shape=[
                 BLOCK_N,
                 BLOCK_D_V,
@@ -1361,41 +1386,16 @@ def _hstu_attn_fwd_compute(  # noqa C901
             tl.static_assert(ATTN_SCALE_TYPE == "dynamic")
             scale = tl.load(attn_scale + seq_start_q + offs_m, mask=offs_m < seq_len_q).to(tl.float32)
 
-        Q_block_ptr = None
-        K_block_ptr = None
-        V_block_ptr = None
         if not ENABLE_TMA:
-            Q_block_ptr = tl.make_block_ptr(
-                base=Q + off_h * stride_qh + seq_start_q * stride_qm,
-                shape=(seq_len_q, BLOCK_D_Q),
-                strides=(stride_qm, 1),
-                offsets=(start_m, 0),
-                block_shape=(BLOCK_M, BLOCK_D_Q),
-                order=(1, 0),
-            )
-            q = tl.load(Q_block_ptr, boundary_check=(0, ), padding_option="zero")
-
-            K_block_ptr = tl.make_block_ptr(
-                base=K + off_h * stride_kh + seq_start_kv * stride_kn,
-                shape=(BLOCK_D_Q, seq_len_kv),
-                strides=(1, stride_kn),
-                offsets=(0, 0),
-                block_shape=(BLOCK_D_Q, BLOCK_N),
-                order=(0, 1),
-            )
-            V_block_ptr = tl.make_block_ptr(
-                base=V + off_h * stride_vh + seq_start_kv * stride_vn,
-                shape=(seq_len_kv, BLOCK_D_V),
-                strides=(stride_vn, 1),
-                offsets=(0, 0),
-                block_shape=(BLOCK_N, BLOCK_D_V),
-                order=(1, 0),
-            )
+            Q_base = Q + off_h * stride_qh + seq_start_q * stride_qm
+            offs_qd = tl.arange(0, BLOCK_D_Q)
+            q = tl.load(Q_base + offs_m[:, None] * stride_qm + offs_qd[None, :], mask=offs_m[:, None] < seq_len_q,
+                        other=0.0)
         else:
             device_desc_q = tl.make_tensor_descriptor(
                 Q,
-                shape=[seq_end_q.to(tl.int32), H * DimQ],
-                strides=[H * DimQ, 1],
+                shape=[seq_end_q.to(tl.int32), _hstu_descriptor_width(H, stride_qh, DimQ)],
+                strides=[stride_qm, 1],
                 block_shape=[
                     BLOCK_M,
                     BLOCK_D_Q,
@@ -1444,7 +1444,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
             n_tgt = tl.where(has_tgt, (BLOCK_M + BLOCK_N - 1) // BLOCK_N, 0)
             tgt_lo = start_m
         n_iters = n_uih + n_tgt
-        ptr_pos = 0  # non-TMA: absolute key position the K/V block ptrs point at
         for it in tl.range(
                 0,
                 n_iters,
@@ -1454,12 +1453,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
             is_tgt = it >= n_uih
             blk = tl.where(is_tgt, it - n_uih, it)
             start_n = tl.where(is_tgt, tgt_lo + blk * BLOCK_N, uih_lo + blk * BLOCK_N)
-            if not ENABLE_TMA:
-                adv = (start_n - ptr_pos).to(tl.int32)
-                if adv != 0:
-                    K_block_ptr = tl.advance(K_block_ptr, (0, adv))
-                    V_block_ptr = tl.advance(V_block_ptr, (adv, 0))
-                ptr_pos = start_n
             acc = _hstu_attn_fwd_one_block_0(
                 start_n=start_n,
                 seq_len_q=seq_len_q,
@@ -1471,8 +1464,10 @@ def _hstu_attn_fwd_compute(  # noqa C901
                 K=K,
                 V=V,
                 acc=acc,
-                K_block_ptr=K_block_ptr,
-                V_block_ptr=V_block_ptr,
+                stride_kh=stride_kh,
+                stride_kn=stride_kn,
+                stride_vh=stride_vh,
+                stride_vn=stride_vn,
                 device_desc_k=device_desc_k,
                 device_desc_v=device_desc_v,
                 offset_kh=off_h * stride_kh,
@@ -1510,8 +1505,8 @@ def _hstu_attn_fwd_compute(  # noqa C901
             acc = acc.to(Out.dtype.element_ty)
             device_desc_o = tl.make_tensor_descriptor(
                 Out,
-                shape=[seq_end_q.to(tl.int32), H * DimV],
-                strides=[H * DimV, 1],
+                shape=[seq_end_q.to(tl.int32), _hstu_descriptor_width(H, stride_oh, DimV)],
+                strides=[stride_om, 1],
                 block_shape=[BLOCK_M, BLOCK_D_V],
             )
             device_desc_o.store(
@@ -1578,14 +1573,14 @@ def _hstu_attn_fwd_compute_dp(  # noqa C901
 
     device_desc_k = tl.make_tensor_descriptor(
         K,
-        shape=[seq_end_kv.to(tl.int32), H * DimQ],
-        strides=[H * DimQ, 1],
+        shape=[seq_end_kv.to(tl.int32), _hstu_descriptor_width(H, stride_kh, DimQ)],
+        strides=[stride_kn, 1],
         block_shape=[BLOCK_N, BLOCK_D_Q],
     )
     device_desc_v = tl.make_tensor_descriptor(
         V,
-        shape=[seq_end_kv.to(tl.int32), H * DimV],
-        strides=[H * DimV, 1],
+        shape=[seq_end_kv.to(tl.int32), _hstu_descriptor_width(H, stride_vh, DimV)],
+        strides=[stride_vn, 1],
         block_shape=[BLOCK_N, BLOCK_D_V],
     )
 
@@ -1603,8 +1598,8 @@ def _hstu_attn_fwd_compute_dp(  # noqa C901
             scale1 = tl.load(attn_scale + seq_start_q + offs_m1, mask=offs_m1 < seq_len_q).to(tl.float32)
         device_desc_q = tl.make_tensor_descriptor(
             Q,
-            shape=[seq_end_q.to(tl.int32), H * DimQ],
-            strides=[H * DimQ, 1],
+            shape=[seq_end_q.to(tl.int32), _hstu_descriptor_width(H, stride_qh, DimQ)],
+            strides=[stride_qm, 1],
             block_shape=[BLOCK_M_H, BLOCK_D_Q],
         )
         q0 = device_desc_q.load([(seq_start_q + start_m).to(tl.int32), (off_h * stride_qh).to(tl.int32)])
@@ -1696,8 +1691,8 @@ def _hstu_attn_fwd_compute_dp(  # noqa C901
         acc1 = acc1.to(Out.dtype.element_ty)
         device_desc_o = tl.make_tensor_descriptor(
             Out,
-            shape=[seq_end_q.to(tl.int32), H * DimV],
-            strides=[H * DimV, 1],
+            shape=[seq_end_q.to(tl.int32), _hstu_descriptor_width(H, stride_oh, DimV)],
+            strides=[stride_om, 1],
             block_shape=[BLOCK_M_H, BLOCK_D_V],
         )
         device_desc_o.store(
@@ -2252,8 +2247,8 @@ def _hstu_attn_bwd(  # noqa C901
     if ENABLE_TMA:
         device_desc_q = tl.make_tensor_descriptor(
             Q,
-            shape=[seq_len_q, H * DimQ],
-            strides=[H * DimQ, 1],
+            shape=[seq_len_q, _hstu_descriptor_width(H, stride_qh, DimQ)],
+            strides=[stride_qm, 1],
             block_shape=[
                 BLOCK_M,
                 BLOCK_D_Q,
@@ -2261,8 +2256,8 @@ def _hstu_attn_bwd(  # noqa C901
         )
         device_desc_do = tl.make_tensor_descriptor(
             DOut,
-            shape=[seq_len_q, H * DimV],
-            strides=[H * DimV, 1],
+            shape=[seq_len_q, _hstu_descriptor_width(H, stride_doh, DimV)],
+            strides=[stride_dom, 1],
             block_shape=[
                 BLOCK_M,
                 BLOCK_D_V,
@@ -2270,8 +2265,8 @@ def _hstu_attn_bwd(  # noqa C901
         )
         device_desc_k = tl.make_tensor_descriptor(
             K,
-            shape=[seq_len_kv, H * DimQ],
-            strides=[H * DimQ, 1],
+            shape=[seq_len_kv, _hstu_descriptor_width(H, stride_kh, DimQ)],
+            strides=[stride_kn, 1],
             block_shape=[
                 BLOCK_N,
                 BLOCK_D_Q,
@@ -2279,8 +2274,8 @@ def _hstu_attn_bwd(  # noqa C901
         )
         device_desc_dk = tl.make_tensor_descriptor(
             DK,
-            shape=[seq_len_kv, H * DimQ],
-            strides=[H * DimQ, 1],
+            shape=[seq_len_kv, _hstu_descriptor_width(H, stride_dkh, DimQ)],
+            strides=[stride_dkn, 1],
             block_shape=[
                 BLOCK_N,
                 BLOCK_D_Q,
@@ -2288,8 +2283,8 @@ def _hstu_attn_bwd(  # noqa C901
         )
         device_desc_v = tl.make_tensor_descriptor(
             V,
-            shape=[seq_len_kv, H * DimV],
-            strides=[H * DimV, 1],
+            shape=[seq_len_kv, _hstu_descriptor_width(H, stride_vh, DimV)],
+            strides=[stride_vn, 1],
             block_shape=[
                 BLOCK_N,
                 BLOCK_D_V,
@@ -2297,8 +2292,8 @@ def _hstu_attn_bwd(  # noqa C901
         )
         device_desc_dv = tl.make_tensor_descriptor(
             DV,
-            shape=[seq_len_kv, H * DimV],
-            strides=[H * DimV, 1],
+            shape=[seq_len_kv, _hstu_descriptor_width(H, stride_dvh, DimV)],
+            strides=[stride_dvn, 1],
             block_shape=[
                 BLOCK_N,
                 BLOCK_D_V,
@@ -2309,8 +2304,8 @@ def _hstu_attn_bwd(  # noqa C901
             # (DQ) carries only the seq offset, head via the store column.
             device_desc_dq = tl.make_tensor_descriptor(
                 DQ,
-                shape=[seq_len_q, H * DimQ],
-                strides=[H * DimQ, 1],
+                shape=[seq_len_q, _hstu_descriptor_width(H, stride_dqh, DimQ)],
+                strides=[stride_dqm, 1],
                 block_shape=[
                     BLOCK_M,
                     BLOCK_D_Q // DQ_ITERS,
@@ -2532,30 +2527,30 @@ def _hstu_attn_bwd_clc(  # noqa C901
 
     total_kv = tl.load(seq_offsets + Z).to(tl.int64)
     total_q = tl.load(seq_offsets_q + Z).to(tl.int64)
-    desc_q = tl.make_tensor_descriptor(Q, shape=[total_q, H * DimQ], strides=[H * DimQ, 1],
-                                       block_shape=[BLOCK_M, BLOCK_D_Q])
-    desc_k = tl.make_tensor_descriptor(K, shape=[total_kv, H * DimQ], strides=[H * DimQ, 1],
-                                       block_shape=[BLOCK_N, BLOCK_D_Q])
-    desc_v = tl.make_tensor_descriptor(V, shape=[total_kv, H * DimV], strides=[H * DimV, 1],
-                                       block_shape=[BLOCK_N, BLOCK_D_V])
-    desc_do = tl.make_tensor_descriptor(DOut, shape=[total_q, H * DimV], strides=[H * DimV, 1],
-                                        block_shape=[BLOCK_M, BLOCK_D_V])
+    desc_q = tl.make_tensor_descriptor(Q, shape=[total_q, _hstu_descriptor_width(H, stride_qh, DimQ)],
+                                       strides=[stride_qm, 1], block_shape=[BLOCK_M, BLOCK_D_Q])
+    desc_k = tl.make_tensor_descriptor(K, shape=[total_kv, _hstu_descriptor_width(H, stride_kh, DimQ)],
+                                       strides=[stride_kn, 1], block_shape=[BLOCK_N, BLOCK_D_Q])
+    desc_v = tl.make_tensor_descriptor(V, shape=[total_kv, _hstu_descriptor_width(H, stride_vh, DimV)],
+                                       strides=[stride_vn, 1], block_shape=[BLOCK_N, BLOCK_D_V])
+    desc_do = tl.make_tensor_descriptor(DOut, shape=[total_q, _hstu_descriptor_width(H, stride_doh, DimV)],
+                                        strides=[stride_dom, 1], block_shape=[BLOCK_M, BLOCK_D_V])
     desc_dq = tl.make_tensor_descriptor(
         DQ,
-        shape=[total_q, H * DimQ],
-        strides=[H * DimQ, 1],
+        shape=[total_q, _hstu_descriptor_width(H, stride_dqh, DimQ)],
+        strides=[stride_dqm, 1],
         block_shape=[BLOCK_M, BLOCK_D_Q // DQ_ITERS],
     )
     desc_dk = tl.make_tensor_descriptor(
         DK,
-        shape=[total_kv, H * DimQ],
-        strides=[H * DimQ, 1],
+        shape=[total_kv, _hstu_descriptor_width(H, stride_dkh, DimQ)],
+        strides=[stride_dkn, 1],
         block_shape=[BLOCK_N, BLOCK_D_Q // DKDV_SUBTILE],
     )
     desc_dv = tl.make_tensor_descriptor(
         DV,
-        shape=[total_kv, H * DimV],
-        strides=[H * DimV, 1],
+        shape=[total_kv, _hstu_descriptor_width(H, stride_dvh, DimV)],
+        strides=[stride_dvn, 1],
         block_shape=[BLOCK_N, BLOCK_D_V // DKDV_SUBTILE],
     )
 
@@ -2682,9 +2677,9 @@ def triton_hstu_attention_fwd(
     max_attn_len: int,
     contextual_seq_len: int,
 ) -> torch.Tensor:
-    q = switch_to_contiguous_if_needed(q)
-    k = switch_to_contiguous_if_needed(k)
-    v = switch_to_contiguous_if_needed(v)
+    q = _switch_hstu_to_contiguous_if_needed(q)
+    k = _switch_hstu_to_contiguous_if_needed(k)
+    v = _switch_hstu_to_contiguous_if_needed(v)
     Z = seq_offsets.numel() - 1
     AUTOTUNE_Z = prev_power_of_2(Z)
     if max_q_len is None:
@@ -2772,7 +2767,10 @@ def triton_hstu_attention_bwd(
     max_attn_len: int,
     contextual_seq_len: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dout = switch_to_contiguous_if_needed(dout)
+    q = _switch_hstu_to_contiguous_if_needed(q)
+    k = _switch_hstu_to_contiguous_if_needed(k)
+    v = _switch_hstu_to_contiguous_if_needed(v)
+    dout = _switch_hstu_to_contiguous_if_needed(dout)
     dq = switch_to_contiguous_if_needed(dq)
     dk = switch_to_contiguous_if_needed(dk)
     dv = switch_to_contiguous_if_needed(dv)

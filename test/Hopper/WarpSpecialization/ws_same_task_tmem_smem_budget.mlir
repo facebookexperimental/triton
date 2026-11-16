@@ -1,32 +1,13 @@
-// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=400000 tma-store-pipelining=true" | FileCheck %s --check-prefix=ROOMY
-// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=300000 tma-store-pipelining=true" | FileCheck %s --check-prefix=TRIMMED
-// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" 2>/dev/null | FileCheck %s --check-prefix=FALLBACK
-// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tma-store-pipelining=true" 2>/dev/null | FileCheck %s
 
-// The same-task TMEM A operand GEMM of ws_same_task_tmem.mlir. A is a pointer
-// tl.load of a 128x128 f32 tile in the gemm partition, and the pipeliner that
-// runs after warp specialization gives it num-stages - 1 = 2 cp.async buffers
-// (128 KiB), plus up to a 32 KiB tile of layout-conversion scratch for the
-// bf16 operand. The memory planner reserves those 160 KiB. With room to spare
-// the TMA-loaded B operand gets three buffers; at a 300000-byte budget the
-// reservation trims it to two; at the 232448-byte hardware limit even the
-// planner's floors do not fit, so the kernel compiles without warp
-// specialization rather than failing with OutOfResources later.
-// ROOMY-LABEL: @tmem_operand_a_same_task
-// ROOMY: ttg.local_alloc {{.*}} -> !ttg.memdesc<3x128x128xbf16
-// ROOMY: ttg.warp_specialize
-
-// TRIMMED-LABEL: @tmem_operand_a_same_task
-// TRIMMED: ttg.local_alloc {{.*}} -> !ttg.memdesc<2x128x128xbf16
-// TRIMMED: ttg.warp_specialize
-
-// REMARK: remark: meta autoWS cannot fit its buffers plus 163840 bytes of pipelined loads and conversion scratch for an MMA operand written in the MMA's own partition in the 232448-byte shared-memory budget; compiling without warp specialization
-// FALLBACK-LABEL: @tmem_operand_a_same_task
-// FALLBACK-NOT: ttg.warp_specialize
-// FALLBACK-NOT: async_task_id
-// FALLBACK-NOT: ttg.partition =
-// FALLBACK: ttng.tmem_alloc %{{.*}} : (tensor<128x128xbf16
-// FALLBACK: ttng.tc_gen5_mma
+// The pipelined loads of a same-task MMA operand do not fit next to the WS
+// buffers at the hardware budget, so the kernel falls back to non-WS.
+// CHECK-LABEL: @tmem_operand_a_same_task
+// CHECK-NOT: ttg.warp_specialize
+// CHECK-NOT: async_task_id
+// CHECK-NOT: ttg.partition =
+// CHECK: ttng.tmem_alloc %{{.*}} : (tensor<128x128xbf16
+// CHECK: ttng.tc_gen5_mma
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>

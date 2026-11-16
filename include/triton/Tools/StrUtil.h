@@ -1,3 +1,6 @@
+#ifndef TRITON_TOOLS_STRUTIL_H
+#define TRITON_TOOLS_STRUTIL_H
+
 #include <string>
 #include <type_traits>
 
@@ -52,3 +55,5 @@ std::string join(C &&container, llvm::StringRef sep, Fn &&fn) {
 }
 
 } // namespace mlir::triton
+
+#endif // TRITON_TOOLS_STRUTIL_H

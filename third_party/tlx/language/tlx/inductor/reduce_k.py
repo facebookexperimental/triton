@@ -29,6 +29,19 @@ if TYPE_CHECKING:
 log: logging.Logger = logging.getLogger(__name__)
 
 
+def _reducer_uses_pdl() -> bool:
+    """Launch the reducer with programmatic dependent launch: it is staged while
+    the split-K GEMM drains and waits for it in-kernel (gdc_wait) just before
+    reading the partials, hiding the launch gap between the two kernels (~1 us
+    on H100). CUDA sm90+ only."""
+    from torch._inductor.virtualized import V
+
+    if torch.version.hip is not None:
+        return False
+    device = V.graph.get_current_device_or_throw()
+    return device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 9
+
+
 @triton.jit
 def _reduce_k_kernel(
     workspace_ptr,
@@ -43,6 +56,7 @@ def _reduce_k_kernel(
     HAS_BIAS: tl.constexpr = False,
     STRIDE_BIAS_M: tl.constexpr = 0,
     STRIDE_BIAS_N: tl.constexpr = 1,
+    USE_PDL: tl.constexpr = False,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -51,6 +65,9 @@ def _reduce_k_kernel(
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     base_offs = offs_m[:, None] * N + offs_n[None, :]
 
+    if USE_PDL:
+        # Launched with launch_pdl: wait for the GEMM's partials to be visible.
+        tl.extra.cuda.gdc_wait()
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for s in range(SPLIT_K):
         ws_offs = base_offs + s * M * N
@@ -78,6 +95,37 @@ _MEASURE_WS_BYTES_LIMIT = 2 * 1024**3
 
 _reduce_k_cost_cache: dict[tuple, float] = {}
 
+# Reducer launches captured per CUDA graph when measuring its cost.
+_COST_GRAPH_CALLS = 20
+
+
+def _warm_kernel_time_ms(run, calls: int = _COST_GRAPH_CALLS, reps: int = 5) -> float:
+    """Median per-call time of `calls` back-to-back launches replayed as one CUDA graph.
+
+    The reducer reads partials the GEMM has just written, so they are in L2; and
+    the candidate's own GEMM timing already carries the benchmarker's fixed
+    per-sample cost. Inductor's benchmarker would add both a cold-L2 flush and a
+    second copy of that cost (~4.5 us on H100) to a kernel that runs 1-6 us.
+    """
+    run()  # compile outside the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(calls):
+            run()
+    graph.replay()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(reps):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        times.append(start.elapsed_time(end) / calls)
+    return sorted(times)[reps // 2]
+
 
 def _modelled_cost_ms(M: int, N: int, split_k: int, itemsize: int) -> float:
     """Bandwidth model for the reducer: it is purely streaming."""
@@ -99,7 +147,7 @@ def _modelled_cost_ms(M: int, N: int, split_k: int, itemsize: int) -> float:
 def reduce_k_cost_ms(
     M: int, N: int, split_k: int, out_dtype: torch.dtype, has_bias: bool
 ) -> float:
-    """Measured wall time of the split-K reducer for this output shape, in ms.
+    """Measured warm-L2 kernel time of the split-K reducer for this output shape, in ms.
 
     Autotune scores a template candidate on the GEMM kernel alone. A SPLIT_K > 1
     candidate additionally needs `_reduce_k_kernel` to run before its output is
@@ -120,10 +168,12 @@ def reduce_k_cost_ms(
     itemsize = torch.empty((), dtype=out_dtype).element_size()
     ws_bytes = split_k * M * N * 4
     cost = None
-    if ws_bytes <= _MEASURE_WS_BYTES_LIMIT and out_dtype in _TRITON_DTYPE:
+    if (
+        ws_bytes <= _MEASURE_WS_BYTES_LIMIT
+        and out_dtype in _TRITON_DTYPE
+        and not torch.cuda.is_current_stream_capturing()
+    ):
         try:
-            from torch._inductor.runtime.benchmarking import benchmarker
-
             dev = torch.cuda.current_device()
             ws = torch.empty(split_k * M * N, dtype=torch.float32, device=dev)
             c = torch.empty((M, N), dtype=out_dtype, device=dev)
@@ -142,7 +192,7 @@ def reduce_k_cost_ms(
                     STRIDE_BIAS_N=1,
                 )
 
-            cost = benchmarker.benchmark_gpu(run)
+            cost = _warm_kernel_time_ms(run)
             del ws, c, bias
         except Exception as e:  # OOM, compile failure, API drift
             log.warning(
@@ -194,13 +244,15 @@ def emit_reduce_k_call(
     # means it is never dereferenced.
     has_bias = bias_name is not None
     bias_ptr = bias_name if has_bias else output_name
+    pdl = _reducer_uses_pdl()
     wrapper.writeline(
         f"_reduce_k_kernel[(triton.cdiv({M_expr}, 32), triton.cdiv({N_expr}, 32))]"
         f"({ws_name}, {output_name}, {bias_ptr}, {M_expr}, {N_expr},"
         f" SPLIT_K={split_k}, BLOCK_SIZE_M=32, BLOCK_SIZE_N=32,"
         f" OUTPUT_DTYPE={output_triton_dtype},"
         f" HAS_BIAS={has_bias}, STRIDE_BIAS_M={stride_bias_m},"
-        f" STRIDE_BIAS_N={stride_bias_n})"
+        f" STRIDE_BIAS_N={stride_bias_n}"
+        + (", USE_PDL=True, launch_pdl=True)" if pdl else ")")
     )
 
 
@@ -215,6 +267,7 @@ def _reduce_k_body_source(
     stride_bias_m: int = 0,
     stride_bias_n: int = 1,
     index_dtype: str = "tl.int32",
+    pdl: bool = False,
 ) -> str:
     # The spliced fused epilogue references INDEX_DTYPE (Inductor's per-kernel index
     # dtype, used for dynamic-shape bounds like `tl.full([], ks0, dtype=INDEX_DTYPE)`).
@@ -233,6 +286,7 @@ def _reduce_k_body_source(
     xnumel = {M_expr} * {N_expr}
     xindex = base_offs
     xmask = mask
+    {"tl.extra.cuda.gdc_wait()" if pdl else ""}
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for s in range({split_k}):
         ws_offs = base_offs + s * {M_expr} * {N_expr}
@@ -294,9 +348,25 @@ def emit_aoti_reduce_k_call(
 
         argdefs, call_args, _, arg_types = template_kernel.args.python_argdefs()
         reduce_name = f"{main_kernel_name}_reduce_k"
+        pdl = _reducer_uses_pdl()
         source = IndentedBuffer()
         source.splice(template_kernel.gen_common_triton_imports())
-        source.splice(template_kernel.jit_lines())
+        # The reducer reuses the template's decorator; only it may launch with PDL
+        # (the GEMM has no gdc_wait), so set launch_pdl just while rendering it.
+        if template_kernel.triton_meta is None:
+            template_kernel.triton_meta = {}
+        had_pdl = "launch_pdl" in template_kernel.triton_meta
+        prev_pdl = template_kernel.triton_meta.get("launch_pdl")
+        if pdl:
+            template_kernel.triton_meta["launch_pdl"] = True
+        try:
+            source.splice(template_kernel.jit_lines())
+        finally:
+            if had_pdl:
+                template_kernel.triton_meta["launch_pdl"] = prev_pdl
+            else:
+                template_kernel.triton_meta.pop("launch_pdl", None)
+        reducer_triton_meta = {**template_kernel.triton_meta, **({"launch_pdl": True} if pdl else {})}
         source.writeline(
             f"def {reduce_name}({', '.join(arg.full_name() for arg in argdefs)}):"
         )
@@ -312,6 +382,7 @@ def emit_aoti_reduce_k_call(
                 stride_bias_m,
                 stride_bias_n,
                 index_dtype=getattr(template_kernel, "index_dtype", "tl.int32"),
+                pdl=pdl,
             ))
         source_code = source.getvalue().replace(
             str(Placeholder.DESCRIPTIVE_NAME), reduce_name
@@ -329,7 +400,7 @@ def emit_aoti_reduce_k_call(
             reduce_name,
             [*call_args, *grid_args],
             arg_types=[*arg_types, *map(type, grid_args)],
-            triton_meta=template_kernel.triton_meta,
+            triton_meta=reducer_triton_meta,
             inductor_meta=FixedGrid.setup_grid_as_args(),
             triton=True,
             device=output_node.get_device(),

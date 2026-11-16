@@ -215,12 +215,8 @@ public:
       return bailOut(funcOp);
     }
 
-    // Every op of an MMA kernel propagated to one task, e.g. a GEMM whose
-    // operands are pointer loads (no load partition) and whose epilogue is a
-    // tl.store (no epilogue partition). There is nothing to specialize, and
-    // code partitioning would build channels for the MMA's buffers without
-    // threading buffer counters through the loop, since no region spans two
-    // tasks.
+    // With a single partition there is nothing to specialize, and code
+    // partitioning would not thread buffer counters through the loop.
     Operation *firstMMA = nullptr;
     funcOp.walk([&](triton::nvidia_gpu::MMAv5OpInterface mmaOp) {
       firstMMA = mmaOp;
@@ -235,10 +231,8 @@ public:
       return bailOut(funcOp);
     }
 
-    // An MMA operand written in the MMA's own task keeps its pointer loads in
-    // the MMA's loop, where the pipeliner later adds cp.async buffers that
-    // the memory planner would otherwise not budget for. Reserve them, and
-    // keep a copy of the function to fall back to if the plan cannot fit.
+    // Reserve the cp.async buffers the post-WS pipeliner adds for a same-task
+    // MMA operand's pointer loads; keep a copy to fall back to if it can't fit.
     unsigned stagingSmemBytes =
         estimateSameTaskOperandStagingSmem(funcOp, numStages);
     OwningOpRef<triton::FuncOp> preWSFuncOp;

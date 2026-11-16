@@ -175,6 +175,8 @@ private:
 
 public:
   static bool canHaveSharedEncoding(tt::LoadOp op) {
+    if (!canPipelineInSharedMemory(op))
+      return false;
     // If used by an user with DotOp encoding, all the uses must be compatible.
     bool incompatible = false;
     getSharedEncIfAllUsersAreDotEnc(op.getResult(), incompatible);
@@ -250,7 +252,7 @@ public:
     DenseMap<Operation *, int> mmaSelfLatency;
     // Check if the load op (mma operand) is pipelineable.
     auto isLoadToBePipelined = [&](Operation *op) {
-      return opLatency.count(op) && opLatency[op] > 0;
+      return opLatency.contains(op) && opLatency[op] > 0;
     };
     for (auto &op : forOp.getBody()->without_terminator()) {
       // If the acc can not be multibuffered, do not pipeline the uses of
@@ -431,7 +433,7 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
 
   std::function<void(Operation *, Operation *, int)> dfs =
       [&](Operation *op, Operation *finalUser, int distance) {
-        if (!seen.insert(op).second || excluded.count(op))
+        if (!seen.insert(op).second || excluded.contains(op))
           return;
         if (isa<tt::LoadOp, tt::DescriptorLoadLikeOpInterface>(op)) {
           if (!AssignLoadLatencies::isPipeliningBeneficial(
@@ -441,7 +443,7 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
           // TODO: Support user provided non-zero latency for loads.
           if (opLatency.count(op))
             return;
-          if (loadOpToIndLevel.count(op)) {
+          if (loadOpToIndLevel.contains(op)) {
             int level = loadOpToIndLevel[op].first;
             if (level != distance) {
               // If we have multiple uses at different distances, we don't

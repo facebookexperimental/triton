@@ -1,4 +1,4 @@
-// RUN: triton-opt -split-input-file --allocate-shared-memory-nv --convert-triton-gpu-to-llvm --verify-diagnostics %s | FileCheck %s
+// RUN: triton-opt -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar --triton-nvidia-gpu-tmem-barrier-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm --verify-diagnostics %s | FileCheck %s
 
 // Verify that 2-CTA kernels can combine entry-block cross-CTA barriers with
 // local AutoWS pipeline barriers. Only entry-block barrier initialization should
@@ -17,8 +17,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
     // CHECK: mbarrier.init.shared::cta.b64
     // CHECK: fence.mbarrier_init.release.cluster
-    // CHECK-NEXT: nvvm.cluster.arrive.relaxed {aligned}
-    // CHECK-NEXT: nvvm.cluster.wait {aligned}
+    // CHECK-NEXT: nvvm.cluster.arrive.relaxed aligned
+    // CHECK-NEXT: nvvm.cluster.wait aligned
     // CHECK: nvvm.mapa
     ttng.init_barrier %entry_barrier, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %remote_entry_barrier = ttng.map_to_remote_buffer %entry_barrier, %c0 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>

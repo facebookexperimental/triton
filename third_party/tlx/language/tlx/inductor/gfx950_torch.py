@@ -20,10 +20,9 @@ def _compiled(mode):
 
 def mm(a, b, *, mode="allow"):
     """Run ``torch.mm`` with the gfx950 TLX templates enabled."""
-    settings = {"triton.tlx_mode": mode, "max_autotune": True}
-    if mode == "force":
-        settings["max_autotune_gemm_backends"] = "TRITON"
-    with config.patch(settings):
+    # torchTLX is independent of max_autotune: TLX configs come from the
+    # template heuristics.
+    with config.patch({"triton.tlx_mode": mode, "max_autotune": False, "max_autotune_gemm": False}):
         return _compiled(mode)(a, b)
 
 

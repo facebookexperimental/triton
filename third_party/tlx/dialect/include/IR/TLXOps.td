@@ -9,6 +9,7 @@ include "mlir/Interfaces/ControlFlowInterfaces.td" // RegionBranchOpInterface
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td" // Pure
 include "triton/Dialect/Triton/IR/TritonTypes.td"
+include "triton/Dialect/Triton/IR/TritonInterfaces.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypeInterfaces.td"
 include "TLXDialect.td"
@@ -28,8 +29,11 @@ class TLX_Op<string mnemonic, list<Trait> traits = []> :
 // storage_alias_spec<tmem>) must NOT be merged by CSE -- doing so collapses
 // separate reuse groups into one, tripping the "duplicate set_buffer_overlap"
 // check and corrupting size/offset computation. This matters once storage-alias
-// lowering runs after CSE (i.e. after layout propagation).
-def TLX_StorageAliasSpecOp : TLX_Op<"storage_alias_spec", []> {
+// lowering runs after CSE (i.e. after layout propagation). Declaring an
+// allocation memory effect keeps each op distinct (not CSE-able) while still
+// allowing dead-spec elimination.
+def TLX_StorageAliasSpecOp : TLX_Op<"storage_alias_spec",
+                                    [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Define a storage alias specification";
 
   let description = [{
@@ -257,6 +261,7 @@ def TLX_SetBufferOverlapOp : TLX_Op<"set_buffer_overlap", []> {
 def TLX_RequireLayoutOp : TLX_Op<"require_layout",
                                  [SameOperandsAndResultShape,
                                   SameOperandsAndResultElementType,
+                                  AxisInfoPassthroughTrait,
                                   Pure]> {
   let summary = "materialize an explicit layout constraint on a memdesc or tensor value";
 
@@ -283,6 +288,7 @@ def TLX_RequireLayoutOp : TLX_Op<"require_layout",
 def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
                                  [SameOperandsAndResultShape,
                                   SameOperandsAndResultElementType,
+                                  AxisInfoPassthroughTrait,
                                   Pure]> {
   let summary = "release specific layout for a register buffer";
 
@@ -291,10 +297,13 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
     propagation may choose an encoding independently of the source. The
     source may be encoding-free, in which case there is no layout to release
     and the operation is a no-op. The result may be unencoded in TTIR or carry
-    the layout selected during TTGIR propagation.
+    the layout selected during TTGIR propagation. A relaxed release inserted
+    by TLX implementation details may be optimized through; the default release
+    remains a boundary across repeated layout propagation.
   }];
 
-  let arguments = (ins TT_Tensor:$src);
+  let arguments = (ins TT_Tensor:$src,
+                       DefaultValuedAttr<BoolAttr, "false">:$relaxed);
 
   let results = (outs TT_Tensor:$result);
 

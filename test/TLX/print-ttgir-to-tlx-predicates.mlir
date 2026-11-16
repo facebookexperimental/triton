@@ -156,3 +156,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// A two-CTA TMA load signals the leader CTA's barrier for both CTAs, so only
+// the leader expects the bytes: AutoWS predicates the barrier_expect on
+// `cluster_cta_rank % 2 == 0`. Printed without it, the peer CTA expects bytes
+// on its own barrier that no load ever delivers, and the kernel faults. The
+// TMA load's own predicate was dropped the same way.
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: def expect_and_load_with_predicate(
+  // CHECK: tlx.barrier_expect_bytes({{[a-z_0-9]+}}, 32768, pred=arg2)
+  // CHECK: tlx.async_descriptor_load({{.*}}, pred=arg2)
+  // CHECK: tlx.barrier_expect_bytes({{[a-z_0-9]+}}, 32768)
+  // CHECK: tlx.async_descriptor_load({{[^=]*}})
+  tt.func public @expect_and_load_with_predicate(%desc: !tt.tensordesc<128x128xbf16, #shared1>, %x: i32, %p: i1) attributes {noinline = false} {
+    %true = arith.constant true
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>
+    ttng.barrier_expect %bar, 32768, %p : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%x, %x] %buf, %bar, %p : !tt.tensordesc<128x128xbf16, #shared1>, !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>
+    ttng.barrier_expect %bar, 32768, %true : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%x, %x] %buf, %bar, %true : !tt.tensordesc<128x128xbf16, #shared1>, !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>
+    tt.return
+  }
+}
