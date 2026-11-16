@@ -10450,6 +10450,9 @@ def _run_bwd_d128_gqa_optimized(
         main_kwargs["disable_unclustered_high_rp_reschedule"] = True
     if _disables_mfma_anti_hints((batch, hq, hk, n_ctx, head_dim), causal):
         main_kwargs["llvm_cl_opts"] = (("amdgpu-anti-hints", "false"), )
+        if precise_mha16k:
+            # Remove once LLVM's compacted allocation is scratch-free here (llvm/llvm-project#235806).
+            main_kwargs["llvm_cl_opts"] += (("greedy-compact-slot-indexes", "false"), )
     dispatch.main_entry[grid](
         q,
         k,
