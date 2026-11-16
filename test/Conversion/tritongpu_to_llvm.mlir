@@ -3659,7 +3659,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
   // CHECK-LABEL: approx_div
   tt.func private @approx_div(%arg0 : tensor<256xf32, #blocked>, %arg1 : tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked> {
-    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} {fastmathFlags = #llvm.fastmath<afn>} : f32
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} fastmath<afn> : f32
     %0 = tt.approx_divf %arg0, %arg1 : tensor<256xf32, #blocked>
     tt.return %0 : tensor<256xf32, #blocked>
   }
