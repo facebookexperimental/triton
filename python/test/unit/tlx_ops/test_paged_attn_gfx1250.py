@@ -33,6 +33,9 @@ def _prepare(inputs, query_length=1, window=0, max_context_len=None, out=None):
 @pytest.mark.parametrize("kv_heads", [2, 4, 16])
 def test_boundaries_and_poison(query_length, packed, window, kv_heads):
     lengths = [0, 1, 7, 63, 64, 65, 129, 2047, 2048, 2049, 8193]
+    if packed and window == 2048 and kv_heads == 16 and query_length > 1:
+        # Exercise unsplit speculative windows with the five-wave register budget.
+        lengths *= 9
     inputs = make_inputs(lengths, query_length, kv_heads=kv_heads)
     q, k, v, lens, table = inputs
     expected = reference(*inputs, query_length, window)
@@ -60,9 +63,10 @@ def test_boundaries_and_poison(query_length, packed, window, kv_heads):
 
 @pytest.mark.parametrize("query_length", [1, 7, 8])
 @pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("context_length", [128, 32768])
 @pytest.mark.parametrize("case", ["zero", "peaky", "negative", "offset", "cancellation"])
-def test_split_numerics(query_length, packed, case):
-    inputs = make_inputs([65 if case == "negative" else 128], query_length)
+def test_split_numerics(query_length, packed, context_length, case):
+    inputs = make_inputs([context_length - 63 if case == "negative" else context_length], query_length)
     q, k, v, lens, table = inputs
     if case == "zero":
         q.zero_()
@@ -77,9 +81,11 @@ def test_split_numerics(query_length, packed, case):
         k.add_(32)
     elif case == "cancellation":
         q.zero_()
+        v.zero_()
         v[table[0, 0]].fill_(1)
         v[table[0, 0], :, 0].fill_(1.0078125)
-        v[table[0, 1]].fill_(-1)
+        # Keep the cancelling values in separate partitions at both lengths.
+        v[table[0, 1 if context_length == 128 else 4]].fill_(-1)
     expected = reference(*inputs, query_length)
     actual = paged_attention_decode(*_cache(inputs, packed), query_length=query_length)
     assert_close(actual, expected)
@@ -102,6 +108,10 @@ def test_split_numerics(query_length, packed, case):
     (8, 2, 16384),
     (4, 4, 32768),
     (1, 16, 16384),
+    (1, 2, 131072),
+    (8, 2, 131072),
+    (8, 4, 131072),
+    (1, 16, 131072),
 ])
 def test_graph_updates_and_independent_streams(query_length, packed, window, batch, kv_heads, capacity):
     # Exercise medium split counts, sequence rotation, and adjacent-head dispatch.
@@ -118,8 +128,9 @@ def test_graph_updates_and_independent_streams(query_length, packed, window, bat
     generator = torch.Generator(device=q.device).manual_seed(81)
     for iteration in range(6):
         q.normal_(generator=generator)
-        # Reuse one graph while long q1 partitions switch between prefetch schedules.
-        bound = capacity if iteration % 2 == 0 else min(capacity, 4099)
+        # Reuse the reserved workspace across long, short and empty requests.
+        # This also switches between prefetch schedules without recapturing.
+        bound = (capacity, min(capacity, 1024), 0, capacity, min(capacity, 64), min(capacity, 4099))[iteration]
         lengths.copy_(
             torch.tensor([0 if b == iteration else max(0, bound - b * 113 - iteration * 67) for b in range(batch)],
                          dtype=torch.int32, device=q.device))

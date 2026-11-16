@@ -395,7 +395,10 @@ be valid; the operator does not copy metadata to the CPU. `max_context_len`
 defaults to table capacity and is limited to `2**31 - 32768`. It bounds device
 lengths even for sliding windows. Separate concurrently executing graphs or
 streams must use separate output and workspace storage, disjoint from inputs.
-The split plan is fixed by batch, KV head count, query length, context bound and window.
+Workspace capacity and the launch grid are fixed by batch, KV head count,
+query length, context bound and window. Large-capacity plans use device lengths
+to bound active split and merge work, so shorter requests can reuse the same
+captured graph and workspace.
 Q and visible K/V must be finite and produce finite FP32 accumulations.
 The operator is forward-only; it accepts grad-enabled input tensors under
 `torch.no_grad()`.

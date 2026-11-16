@@ -1,9 +1,11 @@
 """BF16 page64 GQA decode for gfx1250.
 
-One CTA handles a sequence, KV head and context partition. Two TDM stages
-feed explicitly laid out WMMA operands. Split reduction retains FP32 raw
-numerators, maxima and denominators, including for empty partitions.
+One CTA handles a sequence, KV head and context partition. Two or three TDM
+stages feed explicitly laid out WMMA operands. Large-capacity plans bound
+split work and merging by live lengths while retaining FP32 partial results.
 """
+
+from functools import lru_cache
 
 import torch
 import triton
@@ -107,10 +109,32 @@ def _prefetched_tile(q, kd, vd, kb, vb, base, slot, next_phys, length, h, m, n, 
 
 
 @triton.jit
+def _partition_step(length, tiles, NS: tl.constexpr, CAPS: tl.constexpr):
+    step = tl.cdiv(tiles, NS)
+    for i in tl.static_range(len(CAPS) - 1, -1, -1):
+        bound = CAPS[i][0]
+        count = CAPS[i][1]
+        step = tl.where(length <= bound, tl.cdiv(tiles, count), step)
+    return step
+
+
+@triton.jit
+def _ring_compute(q, kb, vb, slot, acc, maximum, denom, base, length, m, n, QLEN: tl.constexpr, WINDOW: tl.constexpr,
+                  BM: tl.constexpr, BN: tl.constexpr, LAYOUT: tl.constexpr, SCALE: tl.constexpr):
+    tl.static_assert(QLEN > 1)
+    k = _load_packed_operand(kb, slot, LAYOUT)
+    p, alpha, new_max, denom, full = _qk_update(q, k, maximum, denom, base, length, m, n, QLEN, WINDOW, BM, BN, LAYOUT,
+                                                SCALE)
+    v = _load_packed_operand(vb, slot, LAYOUT)
+    acc = _pv_update(p, v, acc, alpha, base, length, n, full, QLEN, WINDOW, BN, True, LAYOUT)
+    return acc, new_max, denom
+
+
+@triton.jit
 def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS: tl.constexpr, NS: tl.constexpr,
                BN: tl.constexpr, BM: tl.constexpr, WINDOW: tl.constexpr, PACKED: tl.constexpr, LAYOUT: tl.constexpr,
                SCALE: tl.constexpr, NP: tl.constexpr, REG: tl.constexpr, KH: tl.constexpr, ROTATE: tl.constexpr,
-               BATCH: tl.constexpr, HEAD_FIRST: tl.constexpr):
+               BATCH: tl.constexpr, HEAD_FIRST: tl.constexpr, CAPS: tl.constexpr, LIVE: tl.constexpr):
     b = tl.program_id(1) if HEAD_FIRST else tl.program_id(0)
     h = tl.program_id(0) if HEAD_FIRST else tl.program_id(1)
     s = tl.program_id(2)
@@ -118,10 +142,15 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
     # Output/workspace addresses always use the resulting logical sequence.
     if ROTATE:
         b = (b + 17 * h + 3 * s) % BATCH
+    # One-page partitions can use Table[b, s]. Issue that address read
+    # beside Lengths; consume it only after the actual step is known.
+    HINT: tl.constexpr = QLEN == 1 and LIVE and WINDOW == 0 and NS <= TS
+    if HINT:
+        hinted_phys = tl.load(Table + b.to(tl.int64) * TS + s)
     length = tl.load(Lengths + b)
     start = tl.maximum(length - QLEN - WINDOW + 1, 0) // 64 * 64 if WINDOW else 0
     tiles = tl.cdiv(length - start, BN)
-    step = tl.cdiv(tiles, NS)
+    step = _partition_step(length, tiles, NS, CAPS)
     first = start + s * step * BN
     end = tl.minimum(length, first + step * BN)
     m = tl.arange(0, BM)
@@ -132,21 +161,52 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
     maximum = tl.full((BM, ), -float('inf'), tl.float32)
     denom = tl.zeros((BM, ), tl.float32)
     acc = tl.zeros((BM, 64), tl.float32)
+    CAP_TILES: tl.constexpr = min(TS, triton.cdiv(WINDOW + QLEN + 62, 64)) if WINDOW else TS
+    RING: tl.constexpr = PACKED and QLEN > 1 and CAP_TILES >= 4 * NS
+    STAGES: tl.constexpr = 3 if RING else 2
     if PACKED:
         kd = tl.make_tensor_descriptor(K, [NP * KH * 8, 512], [512, 1], [8, 512])
         vd = tl.make_tensor_descriptor(V, [NP * KH * 8, 512], [512, 1], [8, 512])
-        kb = tlx.local_alloc((8, 512), tl.bfloat16, 2)
-        vb = tlx.local_alloc((8, 512), tl.bfloat16, 2)
+        kb = tlx.local_alloc((8, 512), tl.bfloat16, STAGES)
+        vb = tlx.local_alloc((8, 512), tl.bfloat16, STAGES)
     else:
         kd = tl.make_tensor_descriptor(K, [NP * KH * 64, 64], [64, 1], [64, 64])
         vd = tl.make_tensor_descriptor(V, [NP * KH * 64, 64], [64, 1], [64, 64])
-        kb = tlx.local_alloc((64, 64), tl.bfloat16, 2)
-        vb = tlx.local_alloc((64, 64), tl.bfloat16, 2)
+        kb = tlx.local_alloc((64, 64), tl.bfloat16, STAGES)
+        vb = tlx.local_alloc((64, 64), tl.bfloat16, STAGES)
     # Deeper prefetch helps long q1 partitions when the grid is underfilled.
     # Keep the lower-register schedule above four CTAs per gfx1250 CU.
     # Capacity can rule it out; the actual sequence length chooses the path.
     DEEP: tl.constexpr = PACKED and QLEN == 1 and BATCH * KH <= 16 and WINDOW == 0 and NS > 1 and TS > 7 * NS and BATCH * KH * NS <= 1024
-    if DEEP and step >= 8 and first + 2 * BN < end:
+    if RING and tl.cdiv(end - first, BN) >= 4:
+        # All startup copies dominate the steady loop; no conditional fill.
+        for j in tl.static_range(0, 2):
+            phys = tl.load(Table + b.to(tl.int64) * TS + (first + j * BN) // 64)
+            tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, j), [(phys * KH + h) * 8, 0], clamp_bounds=False,
+                                          cache_modifier=".cs")
+            tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, j), [(phys * KH + h) * 8, 0], clamp_bounds=False,
+                                          cache_modifier=".cs")
+        for base in range(first, end - 2 * BN, BN):
+            slot = ((base - first) // BN) % 3
+            next_slot = (slot + 2) % 3
+            phys = tl.load(Table + b.to(tl.int64) * TS + (base + 2 * BN) // 64)
+            tlx.async_amd_descriptor_wait(2)
+            # The free stage held the preceding iteration, whose readers must finish.
+            tlx.workgroup_barrier()
+            tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, next_slot), [(phys * KH + h) * 8, 0],
+                                          clamp_bounds=False, cache_modifier=".cs")
+            tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, next_slot), [(phys * KH + h) * 8, 0],
+                                          clamp_bounds=False, cache_modifier=".cs")
+            acc, maximum, denom = _ring_compute(q, kb, vb, slot, acc, maximum, denom, base, length, m, n, QLEN, WINDOW,
+                                                BM, BN, LAYOUT, SCALE)
+        tail = first + (tl.cdiv(end - first, BN) - 2) * BN
+        for j in tl.static_range(0, 2):
+            base = tail + j * BN
+            slot = ((base - first) // BN) % 3
+            tlx.async_amd_descriptor_wait(2 * (2 - 1 - j))
+            acc, maximum, denom = _ring_compute(q, kb, vb, slot, acc, maximum, denom, base, length, m, n, QLEN, WINDOW,
+                                                BM, BN, LAYOUT, SCALE)
+    elif DEEP and step >= 8 and first + 2 * BN < end:
         # These four copies dominate the steady loop, so wait(2) keeps the
         # next tile in flight. Conditional startup copies force full waits.
         physical0 = tl.load(Table + b.to(tl.int64) * TS + first // 64)
@@ -175,7 +235,10 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
         # Packed pages are streamed once per partition; avoid retaining them in
         # preference to the query, page table and reduction workspace.
         if first < end:
-            physical = tl.load(Table + b.to(tl.int64) * TS + first // 64)
+            if HINT and step == 1:
+                physical = hinted_phys
+            else:
+                physical = tl.load(Table + b.to(tl.int64) * TS + first // 64)
             tlx.async_amd_descriptor_load(kd, tlx.local_view(kb, 0), [(physical * KH + h) * (8 if PACKED else 64), 0],
                                           clamp_bounds=False, cache_modifier=".cs" if PACKED else "")
             tlx.async_amd_descriptor_load(vd, tlx.local_view(vb, 0), [(physical * KH + h) * (8 if PACKED else 64), 0],
@@ -247,12 +310,24 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
     if NS == 1:
         inv = tl.div_rn(1., tl.where(denom > 0, denom, 1.))
         result = acc * inv[:, None]
+        if PACKED and QLEN > 1 and WINDOW:
+            store_warps: tl.constexpr = REG.thread_shape[2]
+            result = tlx.require_layout(
+                tlx.release_layout(result.to(tl.bfloat16)),
+                tlx.layout(shape=((8, 4, store_warps), (8, 16 // store_warps)),
+                           stride=((8, 64, 256), (1, 256 * store_warps))))
         tl.store(Out + qoff, result, m[:, None] < QLEN * 8)
-    else:
+    elif not LIVE or QLEN == 1 or WINDOW or first < end:
         # Store only real query rows, including for the padded q_len=1 tile.
         # Raw FP32 numerators avoid a divide/multiply pair across the merge.
         offset = ((b.to(tl.int64) * KH + h) * NS + s) * (QLEN * 8) + m
-        tl.store(Part + offset[:, None] * 64 + d[None, :], acc, m[:, None] < QLEN * 8)
+        if RING and tl.cdiv(end - first, BN) >= 4:
+            # Amortize the store conversion only on partitions that use the ring.
+            stored_acc = tlx.require_layout(tlx.release_layout(acc),
+                                            tlx.layout(shape=((8, 4, 4), (8, 4)), stride=((8, 64, 256), (1, 1024))))
+            tl.store(Part + offset[:, None] * 64 + d[None, :], stored_acc, m[:, None] < QLEN * 8)
+        else:
+            tl.store(Part + offset[:, None] * 64 + d[None, :], acc, m[:, None] < QLEN * 8)
         # Keep max and sum separate: max + log2(sum) loses the sum when
         # logits have very large magnitude, causing incorrect split weights.
         tl.store(Stats + offset * 2, maximum, m < QLEN * 8)
@@ -260,29 +335,72 @@ def _partition(Q, K, V, Table, Lengths, Part, Stats, Out, QLEN: tl.constexpr, TS
 
 
 @triton.jit
-def _reduce(Part, Stats, Out, QLEN: tl.constexpr, BM: tl.constexpr, NS: tl.constexpr, BS: tl.constexpr,
-            RM: tl.constexpr, KH: tl.constexpr, RD: tl.constexpr = 64):
+def _reduce_impl(Part, Stats, Out, QLEN: tl.constexpr, BM: tl.constexpr, NS: tl.constexpr, BS: tl.constexpr,
+                 RM: tl.constexpr, KH: tl.constexpr, RD: tl.constexpr, ACTIVE: tl.constexpr, used):
     group = tl.program_id(0)
     h = tl.program_id(1) % KH
     b = tl.program_id(1) // KH
     m = group * RM + tl.arange(0, RM)
     s = tl.arange(0, BS)
+    valid_s = s < used if ACTIVE else s < NS
     if RD == 64:
         d = tl.arange(0, 64)
     else:
         d = tl.program_id(2) * RD + tl.arange(0, RD)
     offset = ((b.to(tl.int64) * KH + h) * NS + s[None, :]) * BM + m[:, None]
-    maxima = tl.load(Stats + offset * 2, (s[None, :] < NS) & (m[:, None] < QLEN * 8), -float('inf'))
-    denom = tl.load(Stats + offset * 2 + 1, (s[None, :] < NS) & (m[:, None] < QLEN * 8), 0.)
+    maxima = tl.load(Stats + offset * 2, valid_s[None, :] & (m[:, None] < QLEN * 8), -float('inf'))
+    denom = tl.load(Stats + offset * 2 + 1, valid_s[None, :] & (m[:, None] < QLEN * 8), 0.)
     mx = tl.max(maxima, 1)
     mx = tl.where(mx == -float('inf'), 0., mx)
     weights = tl.exp2(maxima - mx[:, None])
     total = tl.sum(weights * denom, 1)
     part = tl.load(Part + offset[:, :, None] * 64 + d[None, None, :],
-                   (s[None, :, None] < NS) & (m[:, None, None] < QLEN * 8), 0.)
+                   valid_s[None, :, None] & (m[:, None, None] < QLEN * 8), 0.)
     result = tl.sum(part * weights[:, :, None], 1) / tl.where(total[:, None] > 0, total[:, None], 1.)
     outoff = ((b.to(tl.int64) * QLEN + m // 8) * (KH * 8) + h * 8 + m % 8)[:, None] * 64 + d[None, :]
     tl.store(Out + outoff, result, m[:, None] < QLEN * 8)
+
+
+@triton.jit
+def _reduce(Part, Stats, Out, Lengths, WINDOW: tl.constexpr, QLEN: tl.constexpr, BM: tl.constexpr, NS: tl.constexpr,
+            BS: tl.constexpr, RM: tl.constexpr, KH: tl.constexpr, RD: tl.constexpr, CAPS: tl.constexpr,
+            LIVE: tl.constexpr):
+    if not LIVE or WINDOW:
+        _reduce_impl(Part, Stats, Out, QLEN, BM, NS, BS, RM, KH, RD, False, NS)
+    elif QLEN == 1:
+        # q1 writes neutral values for empty splits, so every lane of the
+        # chosen tile is initialized. Avoid a per-lane active mask here.
+        length = tl.load(Lengths + tl.program_id(1) // KH)
+        bound = tl.minimum(tl.cdiv(length, 64), NS)
+        if BS > 16 and bound <= 16:
+            _reduce_impl(Part, Stats, Out, QLEN, BM, NS, 16, RM, KH, RD, False, NS)
+        elif BS > 32 and bound <= 32:
+            _reduce_impl(Part, Stats, Out, QLEN, BM, NS, 32, RM, KH, RD, False, NS)
+        elif BS > 64 and bound <= 64:
+            _reduce_impl(Part, Stats, Out, QLEN, BM, NS, 64, RM, KH, RD, False, NS)
+        elif BS > 128 and bound <= 128:
+            _reduce_impl(Part, Stats, Out, QLEN, BM, NS, 128, RM, KH, RD, False, NS)
+        elif BS > 256 and bound <= 256:
+            _reduce_impl(Part, Stats, Out, QLEN, BM, NS, 256, RM, KH, RD, False, NS)
+        else:
+            _reduce_impl(Part, Stats, Out, QLEN, BM, NS, BS, RM, KH, RD, False, NS)
+    else:
+        length = tl.load(Lengths + tl.program_id(1) // KH)
+        tiles = tl.cdiv(length, 64)
+        step = _partition_step(length, tiles, NS, CAPS)
+        full = (NS - 1) * step < tiles
+        if full:
+            _reduce_impl(Part, Stats, Out, QLEN, BM, NS, BS, RM, KH, RD, False, NS)
+        else:
+            used = tl.cdiv(tiles, tl.maximum(step, 1))
+            if BS > 16 and used <= 16:
+                _reduce_impl(Part, Stats, Out, QLEN, BM, NS, 16, RM, KH, RD, True, used)
+            elif BS > 32 and used <= 32:
+                _reduce_impl(Part, Stats, Out, QLEN, BM, NS, 32, RM, KH, RD, True, used)
+            elif BS > 64 and used <= 64:
+                _reduce_impl(Part, Stats, Out, QLEN, BM, NS, 64, RM, KH, RD, True, used)
+            else:
+                _reduce_impl(Part, Stats, Out, QLEN, BM, NS, BS, RM, KH, RD, True, used)
 
 
 def _select_config(batch, qlen, max_context_len, window=0, kv_heads=2):
@@ -347,6 +465,26 @@ def _select_config(batch, qlen, max_context_len, window=0, kv_heads=2):
         reduce_rows = 2
     reduce_warps = 4 if splits >= 256 else 1
     return splits, warps, reduce_rows, reduce_warps
+
+
+@lru_cache(maxsize=256)
+def _runtime_caps(batch, qlen, capacity, window, heads, reserved):
+    if qlen == 1 or window or reserved <= 1 or capacity < 32768:
+        return ()
+    bounds = sorted({448, 960, 2176, 4096, 8192, 16384, 32768, 65535, 98303, 524288 // (batch * heads)})
+    # Short requests benefit from fewer partials; long requests retain parallelism.
+    choices = [(bound, min(reserved,
+                           _select_config(batch, qlen, bound, window, heads)[0]))
+               for bound in bounds
+               if 0 < bound < capacity and bound <= 16384]
+    # Drop an alternative when its successor uses the same partition count.
+    result = []
+    following = reserved
+    for bound, count in reversed(choices):
+        if count != following and triton.cdiv(bound, 64) > min(count, following):
+            result.append((bound, count))
+            following = count
+    return tuple(reversed(result))
 
 
 def _plan(query, key_cache, value_cache, block_tables, query_length, sliding_window, max_context_len):
@@ -436,6 +574,12 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
             or not context_lens.is_contiguous()):
         raise InvalidInput("context_lens must be contiguous int32 [batch] on query's GPU")
     splits, warps, reduce_rows, reduce_warps = config
+    capacity = block_tables.shape[1] * 64 if max_context_len is None else max_context_len
+    # Large capacities can reserve many more splits than a short request uses.
+    # Cache the constexpr alternatives; lengths stay on the GPU. Only wide
+    # q1 merges amortize the runtime length check.
+    live = capacity >= 32768 and (query_length > 1 or splits >= 256)
+    caps = _runtime_caps(batch, query_length, capacity, window, key_cache.shape[1], splits)
     if out is None:
         out = torch.empty_like(query)
     if workspace is None:
@@ -461,14 +605,17 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     rotate = (reorder and kv_heads < 16 and batch * kv_heads >= 128
               and (query_length > 1 or (window == 0 and batch % 16 == 0)))
     grid = (kv_heads, batch, splits) if head_first else (batch, kv_heads, splits)
+    # Bound register use so the prefetch ring can retain five resident waves.
     _partition[grid](query, key_cache, value_cache, block_tables, context_lens, partial, stats,
                      out, query_length, block_tables.shape[1], splits, 64,
                      max(16, triton.next_power_of_2(query_length * 8)), window, key_cache.ndim == 5, layout, sm_scale,
-                     key_cache.shape[0], registers, kv_heads, rotate, batch, head_first, num_warps=warps)
+                     key_cache.shape[0], registers, kv_heads, rotate, batch, head_first, caps, live, num_warps=warps,
+                     waves_per_eu=5 if query_length > 1 and key_cache.ndim == 5 else 0)
     if splits > 1:
         reduce_columns = 32 if query_length == 1 and splits <= 128 else 64
         _reduce[(triton.cdiv(query_length * 8, reduce_rows), batch * kv_heads,
-                 64 // reduce_columns)](partial, stats, out, query_length, query_length * 8, splits,
-                                        triton.next_power_of_2(splits), reduce_rows, kv_heads, reduce_columns,
-                                        num_warps=reduce_warps)
+                 64 // reduce_columns)](partial, stats, out,
+                                        context_lens, window, query_length, query_length * 8, splits,
+                                        triton.next_power_of_2(splits), reduce_rows, kv_heads, reduce_columns, caps,
+                                        live, num_warps=reduce_warps)
     return out
