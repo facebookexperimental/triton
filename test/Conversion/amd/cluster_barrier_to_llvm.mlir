@@ -69,3 +69,17 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: split_workgroup_barrier
+  tt.func @split_workgroup_barrier() {
+    // CHECK: llvm.fence syncscope("workgroup") release {llvm.mmra = #mmra_tag}
+    // CHECK-NEXT: rocdl.s.barrier.signal id = -1
+    // CHECK-NEXT: rocdl.s.barrier.wait id = -1
+    // CHECK-NEXT: llvm.fence syncscope("workgroup") acquire {llvm.mmra = #mmra_tag}
+    amdg.workgroup_barrier_signal
+    amdg.workgroup_barrier_wait
+    tt.return
+  }
+}

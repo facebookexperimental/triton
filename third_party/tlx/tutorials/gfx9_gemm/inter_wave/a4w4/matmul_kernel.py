@@ -100,10 +100,7 @@ NUM_XCDS = 8
 # Keep the LLVM post-RA machine scheduler from reordering this kernel's manual
 # warp_pipeline_stage mem/MFMA interleave. The AMD function attribute selects
 # LLVM's no-op post scheduler for this function only.
-_A4W4_8WAVE_LLVM_FN_ATTRS = (
-    ("amdgpu-agpr-alloc", "0,0"),
-    ("amdgpu-post-sched-strategy", "nop"),
-)
+_A4W4_8WAVE_LLVM_FN_ATTRS = (("amdgpu-post-sched-strategy", "nop"), )
 
 # The 2x-unrolled pipeline prefetches two K tiles and drains two in the
 # epilogue, so it requires at least four tiles. The loop trip count stays a

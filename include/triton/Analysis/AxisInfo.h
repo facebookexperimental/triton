@@ -174,6 +174,13 @@ private:
   std::optional<APInt> constantValue;
 };
 
+// The widest pow2 vector AxisInfo proves along dim for a pointer of this
+// shape: divisibility x contiguity x bits, capped at maxBits and elements per
+// thread. Target caps such as gfx950 unaligned loads aren't modelled.
+unsigned getAxisInfoVector(const AxisInfo &info, Type ptrType,
+                           ArrayRef<int64_t> shape, unsigned dim,
+                           int64_t threads, unsigned maxBits = 128);
+
 class AxisInfoVisitor {
 public:
   AxisInfoVisitor() = default;
@@ -319,5 +326,13 @@ private:
   void update(CallOpInterface callOp, FunctionOpInterface funcOp);
 };
 } // namespace mlir::triton
+
+namespace mlir {
+// Gets the order of a tensor from its contiguity. Places the dimensions with
+// the largest contiguity as the inner most dimension. If the contiguity is
+// all ones, returns the order {dim - 1, dim - 2, ..., 0}
+SmallVector<unsigned, 4>
+getOrderFromContiguity(const SmallVector<int64_t> &contiguity);
+} // namespace mlir
 
 #endif

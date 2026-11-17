@@ -63,6 +63,26 @@ std::unique_ptr<ConSanTargetHooks> createConSanHooks(llvm::StringRef key) {
 
 namespace {
 
+// Temporary workaround for PTXAS mis-analysis of divergent control-flow joins.
+void addPtxasMaskedStoreBarrierWorkaround(ModuleOp module) {
+  SmallVector<tt::StoreOp> maskedStores;
+  module.walk([&](tt::StoreOp store) {
+    if (store.getMask())
+      maskedStores.push_back(store);
+  });
+
+  for (tt::StoreOp store : maskedStores) {
+    OpBuilder builder(store);
+    builder.setInsertionPointAfter(store);
+    // In the NVIDIA conversion pipeline, ConSan runs after tensor-memory wait
+    // insertion. Restrict the declared ordering to the global writes this
+    // workaround follows; the operation still provides the CTA rendezvous
+    // needed to shape native control flow.
+    ttg::BarrierOp::create(builder, store.getLoc(),
+                           ttg::AddrSpace::GlobalWrite);
+  }
+}
+
 // OpBuilder listener tracking operations added to the builder to be wrapped
 // with a lock acquire/release pair.
 class CriticalSectionListener : public ImplicitLocOpBuilder::Listener {
@@ -112,7 +132,7 @@ int getCurrentThread(Operation *op, const ConSanTargetHooks &hooks,
                      const AuxDataMap::ThreadLayout &threadLayout) {
   // Default partition is 0, other partitions are idx + 1
   int thread = maybeGetPartitionIdx(op).value_or(-1) + 1;
-  if (hooks.isTMAOp(op)) {
+  if (hooks.isTMAOp(op) || isa<ttng::AsyncCopyMbarrierArriveOp>(op)) {
     assert(threadLayout.hasTMAThreads() &&
            "TMA thread class must exist when instrumenting a TMA op");
     thread += threadLayout.tmaThreadOffset;
@@ -258,6 +278,33 @@ FailureOr<Value> createBufferStateMask(ImplicitLocOpBuilder &b,
   return result;
 }
 
+Value createSingleBufferStateIndex(ImplicitLocOpBuilder &b,
+                                   const BufferStateCandidates &candidates,
+                                   ArrayRef<Value> predicates) {
+  if (candidates.unknown)
+    return {};
+
+  // Every candidate contains its physical base atom, so one-hot candidates
+  // sharing a runtime base select the same lane even with different CTA masks.
+  for (const BufferStateCandidate &candidate : candidates.cases) {
+    if (candidate.mask.count() != 1)
+      return {};
+  }
+
+  if (candidates.cases.size() == 1)
+    return arith::ConstantIntOp::create(
+        b, candidates.cases.front().mask.find_first(), 32);
+
+  assert(predicates.size() == candidates.cases.size());
+  Value index = arith::ConstantIntOp::create(b, 0, 32);
+  for (auto [candidate, predicate] : llvm::zip(candidates.cases, predicates)) {
+    Value lane =
+        arith::ConstantIntOp::create(b, candidate.mask.find_first(), 32);
+    index = arith::SelectOp::create(b, predicate, lane, index);
+  }
+  return index;
+}
+
 bool shouldInitializeAllocations() {
   std::string envValue = tt::tools::getStrEnv("TRITON_CONSAN_INIT_ALLOCATIONS");
   if (envValue.empty())
@@ -381,9 +428,14 @@ void initializeAllocation(ImplicitLocOpBuilder &b, Value alloc) {
 
 bool canInitializeAllocation(Value alloc) {
   auto allocType = cast<ttg::MemDescType>(alloc.getType());
+  // A tensor cannot hold the NPOT tile of a shared pow2 alloc view.
   if (!isa<ttng::TensorMemorySpaceAttr>(allocType.getMemorySpace()))
-    return true;
+    return !ttg::isNpotPow2AllocView(allocType);
   unsigned numWarps = ttg::lookupNumWarps(alloc.getDefiningOp());
+  // There is no default tcgen05.ld/st layout for an NPOT TMEM tile, so, as for
+  // a warp count that is not a multiple of 4, the allocation is not poisoned.
+  if (!llvm::all_of(allocType.getShape().take_back(2), llvm::isPowerOf2_64))
+    return false;
   return numWarps % 4 == 0;
 }
 
@@ -531,15 +583,16 @@ void extendXorSpan(uint32_t &span, uint32_t basis, int numCTAs) {
 
 LinearLayout getLocalLoadStoreConversion(ttg::MemDescType memDescTy,
                                          RankedTensorType regTy) {
-  return invertAndComposeBlockLocal(
-      ttg::toLinearLayoutIgnoringPadding(memDescTy),
-      ttg::toLinearLayout(regTy));
+  auto kBlock = StringAttr::get(memDescTy.getContext(), "block");
+  return invertAndComposeLocal(ttg::toLinearLayoutIgnoringPadding(memDescTy),
+                               ttg::toLinearLayout(regTy), {kBlock});
 }
 
 LinearLayout getLocalGatherScatterConversion(ttg::MemDescType memDescTy,
                                              RankedTensorType regTy,
                                              unsigned axis) {
   MLIRContext *ctx = memDescTy.getContext();
+  auto kBlock = StringAttr::get(ctx, "block");
   LinearLayout sharedLayout = ttg::toLinearLayoutIgnoringPadding(memDescTy);
   SmallVector<StringAttr> allDims =
       standardOutDimNames(ctx, memDescTy.getRank());
@@ -553,7 +606,7 @@ LinearLayout getLocalGatherScatterConversion(ttg::MemDescType memDescTy,
       LinearLayout::identity1D(sharedLayout.getOutDimSize(axisDim), axisDim,
                                axisDim);
   indexedLayout = indexedLayout.transposeOuts(allDims);
-  return invertAndComposeBlockLocal(sharedLayout, indexedLayout);
+  return invertAndComposeLocal(sharedLayout, indexedLayout, {kBlock});
 }
 
 uint32_t getXorImageMask(const LinearLayout &layout, StringAttr outDim,
@@ -655,8 +708,9 @@ Value getScratchReadCTAs(ImplicitLocOpBuilder &b, Operation *op,
   if (auto convert = dyn_cast<ttg::ConvertLayoutOp>(op)) {
     LinearLayout srcLayout = ttg::toLinearLayout(convert.getSrc().getType());
     LinearLayout dstLayout = ttg::toLinearLayout(convert.getType());
+    auto kBlock = b.getStringAttr("block");
     Value loadCTAs = getLocalMemoryRecipientCTAs(
-        b, invertAndComposeBlockLocal(srcLayout, dstLayout));
+        b, invertAndComposeLocal(srcLayout, dstLayout, {kBlock}));
     return arith::OrIOp::create(b, ownerCTAs, loadCTAs);
   }
 
@@ -835,6 +889,11 @@ public:
     if (failed(validateNonEntryFunctions()))
       return failure();
 
+    // Snapshot and modify the input program before ConSan creates helper
+    // functions, so sanitizer-internal masked stores are not affected.
+    if (hooks.needsPtxasMaskedStoreBarrierWorkaround())
+      addPtxasMaskedStoreBarrierWorkaround(module);
+
     tti::FunctionBuilder funcBuilder(module, auxData);
     if (failed(auxData.populateAndPassToWarpSpecialize(module, entryPoint,
                                                        funcBuilder, hooks)))
@@ -854,7 +913,7 @@ private:
       return true;
 
     // NVIDIA broadcasts scalar atomic results; AMD executes them in each CTA.
-    if (isa<tt::AtomicRMWOp, tt::AtomicCASOp>(op) &&
+    if (isa<tt::AtomicOpInterface>(op) && op->getNumResults() == 1 &&
         !isa<RankedTensorType>(op->getResult(0).getType()))
       return !hooks.hasUnsummarizableCalleeState(op);
 
@@ -1250,6 +1309,7 @@ private:
     Value defaultEffectCTAs = getMemEffectCTAs(b, op);
     struct MaterializedEffect {
       Value bufferMask;
+      Value bufferIndex;
       Value effectCTAs;
       Value barrierCTAs;
       MemType memType;
@@ -1316,6 +1376,8 @@ private:
       if (failed(stateMask))
         return failure();
       materialized.bufferMask = *stateMask;
+      materialized.bufferIndex =
+          createSingleBufferStateIndex(b, candidates, predicates);
 
       if (candidates.unknown) {
         materialized.effectCTAs = allCTAsMask(b);
@@ -1427,12 +1489,13 @@ private:
 
       if (memType == MemType::SHARED_MEM) {
         if (effect.sharedKind == ttg::SharedKind::Async) {
-          funcBuilder.createVerifyProxyAccessCall(b, bufferMask, baseThread,
-                                                  effect.operandName, pred, op,
-                                                  effectCTAs);
+          funcBuilder.createVerifyProxyAccessCall(
+              b, bufferMask, baseThread, effect.rw == RW::Write,
+              effect.operandName, pred, op, effectCTAs);
         } else {
-          funcBuilder.createSetProxyAccessCall(b, bufferMask, baseThread, pred,
-                                               op, readCTAs);
+          funcBuilder.createSetProxyAccessCall(
+              b, bufferMask, baseThread, effect.rw == RW::Write, pred, op,
+              readCTAs, materialized.bufferIndex);
         }
       }
       if (effect.rw == RW::Read) {
@@ -1444,7 +1507,7 @@ private:
           funcBuilder.createSetReadVisibilityCall(
               b, bufferMask, thread,
               getThreadPeersMask(thread, auxData.threadLayout), pred, memType,
-              op, effectCTAs);
+              op, effectCTAs, materialized.bufferIndex);
         }
         if (opInfo->trackingKind ==
             MemEffectsOpInfo::TrackingKind::CommitCount) {
@@ -1466,6 +1529,10 @@ private:
         if (opInfo->trackingKind ==
             MemEffectsOpInfo::TrackingKind::CommitCount) {
           assert(memType == MemType::SHARED_MEM);
+          if (auxData.hasAsyncCopyMbarriers &&
+              opInfo->commitKind == CommitKind::AsyncCp)
+            funcBuilder.createPublishWriteVisibilityCall(
+                b, bufferMask, 0, pred, memType, op, effectCTAs);
           funcBuilder.createStageAccessForCommitCall(
               b, bufferMask, baseThread, pred, memType, opInfo->commitKind, op);
         }
@@ -1495,7 +1562,7 @@ private:
         funcBuilder.createSetReadVisibilityCall(
             b, completionBufferMask, thread,
             getThreadPeersMask(thread, auxData.threadLayout), combinedPred,
-            MemType::SHARED_MEM, op, recipientCTAs);
+            MemType::SHARED_MEM, op, recipientCTAs, completion->bufferIndex);
       }
       if (barrierInfo.count == 0 && barrierInfo.txCount == 0)
         funcBuilder.createVerifyBarrierInitializedCall(b, barrier, combinedPred,
@@ -1529,6 +1596,13 @@ private:
           funcBuilder.createTrackVisibleAccessesCall(
               b, barrier, thread, combinedPred, MemType::SHARED_MEM, op,
               recipientCTAs, completionBufferMask);
+      } else if (barrierInfo.trackingMode ==
+                 MemEffectsOpInfo::BarrierTrackingMode::AsyncCopies) {
+        funcBuilder.createTrackAsyncCopiesForBarrierCall(
+            b, barrier, baseThread, combinedPred, op, recipientCTAs);
+        funcBuilder.createTrackVisibleAccessesCall(
+            b, barrier, thread, combinedPred, MemType::SHARED_MEM, op,
+            recipientCTAs, completionBufferMask);
       }
       if (barrierInfo.count > 0 || barrierInfo.txCount != 0) {
         funcBuilder.createVerifyAndUpdateBarrierStateCall(
@@ -1600,8 +1674,8 @@ private:
 
 } // namespace
 
-LogicalResult runConcurrencySanitizer(ModuleOp module,
-                                      const ConSanTargetHooks &hooks) {
+static LogicalResult runConcurrencySanitizer(ModuleOp module,
+                                             const ConSanTargetHooks &hooks) {
   ConcurrencySanitizerImpl impl(module, hooks);
   return impl.run();
 }
@@ -1613,13 +1687,23 @@ public:
   void runOnOperation() override {
     ModuleOp module = getOperation();
     auto targetAttr = module->getAttrOfType<StringAttr>(ttg::AttrTargetName);
-    assert(targetAttr && "module missing ttg.target attribute");
+    if (!targetAttr) {
+      module.emitError("ConSan requires a ttg.target module attribute");
+      return signalPassFailure();
+    }
     StringRef target = targetAttr.strref();
     StringRef key = target.starts_with("cuda:")  ? "nvidia"
                     : target.starts_with("hip:") ? "amd"
                                                  : "";
+    if (key.empty()) {
+      module.emitError("unsupported ConSan target '") << target << "'";
+      return signalPassFailure();
+    }
     auto hooks = createConSanHooks(key);
-    assert(hooks && "no ConSan hooks registered for target");
+    if (!hooks) {
+      module.emitError("no ConSan hooks registered for target '") << key << "'";
+      return signalPassFailure();
+    }
     if (failed(runConcurrencySanitizer(module, *hooks)))
       return signalPassFailure();
   }

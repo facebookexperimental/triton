@@ -835,9 +835,6 @@ def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
                     num_warps=cfg["num_warps"],
                     num_stages=1,
                     matrix_instr_nonkdim=16,
-                    # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
-                    # v_accvgpr moves around each mfma)
-                    llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
                 )
         finally:
             _teardown_env(previous_env)
