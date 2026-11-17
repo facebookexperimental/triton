@@ -80,8 +80,9 @@ public:
           registerWrittenB = true;
       }
       // The peer CTA writes its half of a split register-built B, so those
-      // generic writes need a cluster-scoped proxy fence. Other register-written
-      // operands of 2-CTA MMAs keep the CTA-scoped fence for now.
+      // generic writes need a cluster-scoped proxy fence. Other
+      // register-written operands of 2-CTA MMAs keep the CTA-scoped fence for
+      // now.
       bool cluster =
           registerWrittenB && dotOp->hasAttr(AttrTwoCTARegisterBName);
       // A producer-side fence may be CTA-scoped, so it does not replace the
