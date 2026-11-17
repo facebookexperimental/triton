@@ -136,7 +136,9 @@ def test_fp8_kv_decode(fp8_q, dim, page, hq, hkv, qlen, lengths, causal, window,
                                                      (64, 64, 128, 64, [8192] * 8), (16, 2, 128, 128, [2304]),
                                                      (16, 2, 128, 128, [8192]), (16, 2, 128, 64, [4096]),
                                                      (16, 2, 128, 64, [8192]), (32, 4, 128, 64, [8192]),
-                                                     (16, 2, 128, 64, [8193])])
+                                                     (16, 2, 128, 64, [8193]), (16, 2, 64, 64, [8192]),
+                                                     (16, 2, 64, 64, [32768]), (32, 4, 64, 128, [32768]),
+                                                     (16, 2, 64, 64, [8192, 32768])])
 def test_fp8_kv_decode_auto_geometry(fp8_q, hq, hkv, dim, page, lengths):
     q, kp, vp, contexts, table, ks, vs, qs, max_len, k, v = _make_test_inputs(lengths, hq=hq, hkv=hkv, dim=dim,
                                                                               page=page, fp8_q=fp8_q)
