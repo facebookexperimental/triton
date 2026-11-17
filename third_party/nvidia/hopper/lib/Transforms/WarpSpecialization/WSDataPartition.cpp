@@ -1729,9 +1729,14 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     if (auto loadOp = dyn_cast<DescriptorLoadOp>(op)) {
       sliceOp(loadOp.getDesc(), offset, mappings, reverseMappings,
               partitionScheme);
-      coordVal = loadOp.getIndices()[dim];
-      coordOperandIdx = loadOp.getIndicesMutable()[dim].getOperandNumber();
+      // dim indexes the load result; a rank-reducing descriptor drops unit
+      // block dims, so map it back to the descriptor's coordinate dim.
+      auto descShape = getShape(loadOp.getDesc());
       shape = getShape(loadOp.getResult());
+      unsigned coordDim =
+          remappedSqueezedDim(descShape, shape, dim, /*unsqueeze=*/true);
+      coordVal = loadOp.getIndices()[coordDim];
+      coordOperandIdx = loadOp.getIndicesMutable()[coordDim].getOperandNumber();
     } else if (auto storeOp = dyn_cast<DescriptorStoreOp>(op)) {
       sliceOp(storeOp.getDesc(), offset, mappings, reverseMappings,
               partitionScheme);
