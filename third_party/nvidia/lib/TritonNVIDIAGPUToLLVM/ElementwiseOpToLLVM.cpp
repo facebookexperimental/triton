@@ -669,6 +669,62 @@ private:
   int ptxVersion;
 };
 
+// arith.truncf through the generic elementwise path converts one
+// element at a time. For an f32 -> bf16/f16 truncf whose operand has
+// an exact NPOT (mixed-radix) layout on sm_90+, PTX has a two-wide
+// convert (cvt.rn.bf16x2.f32), so pair adjacent elements into one
+// packed convert, as the fp8 converters above do. The scalar form
+// reads wgmma accumulator registers one at a time in an epilogue,
+// which makes ptxas serialize the wgmma pipeline (C7514). Inline
+// PTX because paired results feed scalar smem stores, so LLVM
+// would split a vector fptrunc (measured: 104 scalar cvt in the
+// gate PTX). Other truncfs keep the generic path so their PTX is
+// unchanged.
+struct TruncFOpConversion
+    : public ElementwiseOpConversionBase<arith::TruncFOp, TruncFOpConversion> {
+  using Base = ElementwiseOpConversionBase<arith::TruncFOp, TruncFOpConversion>;
+  using Base::Base;
+  using OpAdaptor = typename Base::OpAdaptor;
+
+  explicit TruncFOpConversion(LLVMTypeConverter &typeConverter,
+                              ModuleAxisInfoAnalysis &axisAnalysisPass,
+                              int computeCapability,
+                              PatternBenefit benefit = patternBenefitDefault)
+      : Base(typeConverter, axisAnalysisPass, benefit),
+        computeCapability(computeCapability) {}
+
+  SmallVector<Value> createDestOps(arith::TruncFOp op, OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter,
+                                   Type elemTy, MultipleOperandsRange operands,
+                                   Location loc) const {
+    auto srcElemTy = getElementTypeOrSelf(op.getIn().getType());
+    auto srcTy = dyn_cast<RankedTensorType>(op.getIn().getType());
+    bool hasNpotLayout = srcTy && gpu::hasExactNpotLayout(srcTy);
+    if (!srcElemTy.isF32() || operands.size() < 2 ||
+        !(elemTy.isBF16() || elemTy.isF16()) || computeCapability < 90 ||
+        op->hasAttr("roundingmode") || !hasNpotLayout)
+      return {LLVM::FPTruncOp::create(rewriter, loc, elemTy, operands[0][0])};
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    PTXBuilder builder;
+    auto *outOperand = builder.newOperand("=r");
+    auto *in0 = builder.newOperand(operands[0][0], "f");
+    auto *in1 = builder.newOperand(operands[1][0], "f");
+    // PTX places the first source in the upper half of the packed
+    // result, so pass element 1 before element 0 ('$0, $2, $1').
+    auto &ptxOp = *builder.create(elemTy.isBF16()
+                                      ? "cvt.rn.bf16x2.f32 $0, $2, $1;"
+                                      : "cvt.rn.f16x2.f32 $0, $2, $1;");
+    ptxOp({outOperand, in0, in1}, /*onlyAttachMLIRArgs=*/true);
+    Value packed = builder.launch(rewriter, loc, i32_ty, false);
+    Value pair = b.bitcast(packed, vec_ty(elemTy, 2));
+    return {b.extract_element(elemTy, pair, b.i32_val(0)),
+            b.extract_element(elemTy, pair, b.i32_val(1))};
+  }
+
+private:
+  int computeCapability;
+};
+
 struct FDivOpConversion
     : ElementwiseOpConversionBase<arith::DivFOp, FDivOpConversion> {
   using Base = ElementwiseOpConversionBase<arith::DivFOp, FDivOpConversion>;
@@ -1024,7 +1080,8 @@ void mlir::triton::NVIDIA::populateElementwiseOpToLLVMPatterns(
   });
 
   POPULATE_OP(arith::ExtFOp, LLVM::FPExtOp);
-  POPULATE_OP(arith::TruncFOp, LLVM::FPTruncOp);
+  patterns.add<TruncFOpConversion>(typeConverter, axisInfoAnalysis,
+                                   computeCapability, benefit);
   POPULATE_OP(arith::FPToSIOp, LLVM::FPToSIOp);
 
 #undef POPULATE_OP
