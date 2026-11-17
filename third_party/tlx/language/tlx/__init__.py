@@ -7,12 +7,15 @@ from .barrier import (
     barrier_expect_bytes,
     barrier_wait,
     cluster_barrier,
+    amd_cluster_arrive,
+    amd_cluster_wait,
     cond_barrier,
     fence_mbarrier_init_cluster,
     named_barrier_arrive,
     named_barrier_wait,
     amd_iglp_opt,
     amd_sched_barrier,
+    amd_sched_group_barrier,
     workgroup_barrier,
 )
 from .dynamic_launch import (
@@ -74,11 +77,14 @@ from .mem_ops import (
     update_tensor_descriptor,
 )
 from .mma_ops import (
+    amd_concat,
     amd_dot,
+    amd_packed_dot2,
     amd_mfma_commit,
     amd_register_class_anchor,
     amd_register_resident,
     amd_scheduled_mfma,
+    amd_scheduled_mfma_scaled,
     async_dot,
     async_dot_scaled,
     async_dot_wait,
@@ -90,7 +96,7 @@ from .mma_ops import (
     release_layout,
     tcgen05_commit,
 )
-from .packed_arith import packed_add4, packed_fma4, packed_mul4, packed_sub4
+from .packed_arith import packed_add2, packed_add4, packed_exp2, packed_fma4, packed_mul4, packed_sub4
 from .types import (
     async_token,
     buffered_tensor,
@@ -152,6 +158,8 @@ __all__ = [
     "async_tasks",
     "async_task",
     # packed arithmetic
+    "packed_add2",
+    "packed_exp2",
     "packed_add4",
     "packed_sub4",
     "packed_mul4",
@@ -177,11 +185,14 @@ __all__ = [
     "nv_mma_shared_layout_encoding",
     "storage_kind",
     "layout",
+    "amd_concat",
     "amd_dot",
+    "amd_packed_dot2",
     "amd_mfma_commit",
     "amd_register_class_anchor",
     "amd_register_resident",
     "amd_scheduled_mfma",
+    "amd_scheduled_mfma_scaled",
     "extract_slice",
     "rematerialized_range",
     "release_layout",
@@ -249,6 +260,8 @@ __all__ = [
     "prefetch",
     # barriers
     "cluster_barrier",
+    "amd_cluster_arrive",
+    "amd_cluster_wait",
     "cond_barrier",
     "workgroup_barrier",
     "alloc_barriers",
@@ -261,6 +274,7 @@ __all__ = [
     "named_barrier_arrive",
     "amd_iglp_opt",
     "amd_sched_barrier",
+    "amd_sched_group_barrier",
     # mma_ops
     "dot_scaled",
     "require_amd_wmma_layout",

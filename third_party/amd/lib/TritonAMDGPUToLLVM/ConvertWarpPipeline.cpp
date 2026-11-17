@@ -135,7 +135,7 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
             "non-warp-pipeline scf.execute_region inside pipelined_for body");
       ++numClusters;
     } else if (isWarpPipelineIgnorableBarrier(&op)) {
-      if (existingBarrierMap.count(numClusters))
+      if (existingBarrierMap.contains(numClusters))
         return op.emitError("multiple pre-existing barriers between pipeline "
                             "stages; insert a dummy stage instead");
       existingBarrierMap[numClusters] = &op;
@@ -150,7 +150,8 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
   if (numClusters < 2)
     return forOp.emitError(
         "pipelined_for body must contain at least two pipeline stages");
-  if (existingBarrierMap.count(0) && existingBarrierMap.count(numClusters))
+  if (existingBarrierMap.contains(0) &&
+      existingBarrierMap.contains(numClusters))
     return forOp.emitError("pipelined_for body has both top-of-loop and "
                            "bottom-of-loop pre-existing barriers");
   return success();
@@ -283,10 +284,8 @@ static void emitClusterPriority(OpBuilder &r, Location loc,
   }
 }
 
-// Wrap a pre-existing barrier op (e.g. async_wait) with sched_barriers so the
-// backend scheduler cannot move ops across it, and emit the cluster's
-// priority just before the barrier.  Used in place of inserting a fresh
-// cluster barrier when one already exists at the cluster boundary.
+// Fence a pre-existing cluster-boundary barrier or wait and emit the cluster's
+// priority before it. Group waits also need an explicit local rendezvous.
 static void wrapExistingBarrier(OpBuilder &b, Location loc,
                                 Operation *clusterOp,
                                 Operation *existingBarrier, bool anyHasPriority,
@@ -296,6 +295,12 @@ static void wrapExistingBarrier(OpBuilder &b, Location loc,
     emitClusterPriority(b, loc, clusterOp, anyHasPriority);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
   b.setInsertionPointAfter(existingBarrier);
+  // Group waits lower to per-thread completion waits. Place the rendezvous
+  // here so Membar cannot defer it into the next stage. The trailing scheduling
+  // fence also prevents ScheduleMembar from moving it to a global-load use.
+  if (isa<triton::gpu::AsyncWaitOp, triton::amdgpu::AsyncWaitOp>(
+          existingBarrier))
+    triton::gpu::BarrierOp::create(b, loc, triton::gpu::AddrSpace::Local);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
 }
 
@@ -442,9 +447,8 @@ private:
 
     // Normally, we don't expect a pipelined loop begins with a barrier
     // but sometimes required by memory prefetching pattern.
-    auto topBar = existingBarrierMap.find(0);
     auto bottomBar = existingBarrierMap.find(numClusters);
-    bool hasTopBarrier = topBar != existingBarrierMap.end();
+    bool hasTopBarrier = existingBarrierMap.contains(0);
     bool hasBottomBarrier = bottomBar != existingBarrierMap.end();
     if (bottomBar != existingBarrierMap.end()) {
       // validatePipelinedForBody guarantees we cannot have both top and
@@ -500,10 +504,9 @@ private:
 
       if (auto exBar = existingBarrierMap.find(i);
           exBar != existingBarrierMap.end()) {
-        // FIXME: If bars[i] is true, wrapping a non-LOCAL pre-existing
-        // barrier is not enough to satisfy LDS ordering.  For now we rely on
-        // the producer to place such barriers only where no local fence is
-        // needed.
+        // FIXME: Non-LOCAL barriers other than group waits do not acquire
+        // a local fence in wrapExistingBarrier. They must occur only where
+        // no local fence is needed.
         wrapExistingBarrier(b, loc, clusterOps[i], exBar->second,
                             anyHasPriority, emitPriorityAtBoundary);
       } else {
@@ -1044,7 +1047,7 @@ public:
   void runOnOperation() override {
     ModuleOp m = getOperation();
     // Reject before the ModuleAllocation below, as the allocation passes do.
-    if (failed(mlir::triton::gpu::verifyNpotModularOpsSupported(m)))
+    if (failed(mlir::triton::gpu::verifyNpotTypesSupported(m)))
       return signalPassFailure();
 
     mlir::triton::AMD::TargetInfo targetInfo(gfxArch.getValue());

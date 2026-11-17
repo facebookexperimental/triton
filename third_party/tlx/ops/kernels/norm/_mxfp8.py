@@ -562,7 +562,7 @@ def _emit_quant(y, Q, K, T, Row, Sfv, Represented, rows, padded_rows, valid, til
 
 @triton.jit
 def _fused_forward(X, W, B, Y, Mean, Rstd, Q, K, T, Row, Sfv, Represented, GlobalAmax, ColPart, Starts, Counts, M,
-                   TILES, TOTAL_PADDED, NK, NT, eps, N: tl.constexpr, BN: tl.constexpr, HEAD_DIM: tl.constexpr,
+                   TILES, TOTAL_PADDED, NK, NT, eps, N_FLOAT, N: tl.constexpr, BN: tl.constexpr, HEAD_DIM: tl.constexpr,
                    IS_RMS: tl.constexpr, HAS_BIAS: tl.constexpr, CENTERED: tl.constexpr, SKIP_NORM: tl.constexpr,
                    JAGGED: tl.constexpr, SAVE_Y: tl.constexpr, SAVE_STATS: tl.constexpr, SAVE_AMAX: tl.constexpr,
                    SAVE_COLSUM: tl.constexpr, RCP: tl.constexpr, EMIT_K: tl.constexpr, HEAD_MAJOR: tl.constexpr,
@@ -590,16 +590,17 @@ def _fused_forward(X, W, B, Y, Mean, Rstd, Q, K, T, Row, Sfv, Represented, Globa
         if SKIP_NORM:
             y = x
         else:
+            # PERF: a constexpr N divisor becomes a slower reciprocal multiply; divide by the runtime N_FLOAT.
             if IS_RMS:
                 mu = tl.zeros([32], tl.float32)
-                var = tl.sum(x * x, axis=1) / N
+                var = tl.sum(x * x, axis=1) / N_FLOAT
             else:
-                mu = tl.sum(x, axis=1) / N
+                mu = tl.sum(x, axis=1) / N_FLOAT
                 if CENTERED:
                     xc = tl.where((cols < N)[None, :], x - mu[:, None], 0.0)
-                    var = tl.sum(xc * xc, axis=1) / N
+                    var = tl.sum(xc * xc, axis=1) / N_FLOAT
                 else:
-                    var = tl.sum(x * x, axis=1) / N - mu * mu
+                    var = tl.sum(x * x, axis=1) / N_FLOAT - mu * mu
             rr = libdevice.rsqrt(var + eps)
             if not IS_RMS and HAS_BIAS and (not CENTERED):
                 normalized = tl.fma(x, rr[:, None], (-mu * rr)[:, None]).to(tl.bfloat16)
@@ -743,10 +744,11 @@ def _core(x, weight, bias, n_heads, head_dim, *, norm, eps=1e-05, offsets=None, 
             if fused:
                 _fused_forward[
                     grid,
-                ](x, weight, bias if bias is not None else x, y, mean, rstd, q, k, trans, row, sfv_out, rep, amax,
-                  parts, starts, counts, m, tiles, mp, nk, nt, eps, BN=triton.next_power_of_2(n), IS_RMS=norm == 'rms',
-                  HAS_BIAS=bias is not None, SKIP_NORM=skip_norm, SAVE_Y=save_y, SAVE_STATS=save_stats,
-                  SAVE_AMAX=centered, SAVE_COLSUM=colsum, SINGLE_ITER=grid == tiles, **quant_kw)
+                ](x, weight, bias if bias is not None else x, y,
+                  mean, rstd, q, k, trans, row, sfv_out, rep, amax, parts, starts, counts, m, tiles, mp, nk, nt, eps,
+                  float(n), BN=triton.next_power_of_2(n), IS_RMS=norm == 'rms', HAS_BIAS=bias is not None,
+                  SKIP_NORM=skip_norm, SAVE_Y=save_y, SAVE_STATS=save_stats, SAVE_AMAX=centered, SAVE_COLSUM=colsum,
+                  SINGLE_ITER=grid == tiles, **quant_kw)
             else:
                 if skip_norm:
                     y = x

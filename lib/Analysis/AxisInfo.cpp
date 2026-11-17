@@ -1110,6 +1110,10 @@ public:
     if (isa<IntegerType>(op.getOperand(0).getType()))
       return AxisInfo::join(lhsInfo, rhsInfo);
 
+    int64_t elemBytes = 1;
+    if (isa<PointerType>(getElementTypeOrSelf(op.getType())))
+      elemBytes = std::max<int64_t>(1, getPointeeBitWidth(op.getType()) / 8);
+
     AxisInfo::DimVectorT contiguity, divisibility, constancy;
     for (int d = 0; d < lhsInfo.getRank(); ++d) {
       constancy.push_back(gcd(lhsInfo.getConstancy(d), rhsInfo.getConstancy(d),
@@ -1117,12 +1121,16 @@ public:
       contiguity.push_back(gcd(lhsInfo.getContiguity(d),
                                rhsInfo.getContiguity(d),
                                condInfo.getConstancy(d)));
-      // getDivisibilityFromContiguity does not see condConstancy; clamp
-      // by the just-computed output contiguity so the result remains
-      // sound when condConstancy reduces it below the input contiguities.
-      divisibility.push_back(
-          gcd(getDivisibilityFromContiguity(lhsInfo, rhsInfo, d),
-              contiguity.back()));
+      auto divisor =
+          gcd(lhsInfo.getDivisibility(d), rhsInfo.getDivisibility(d));
+      // Smaller groups introduce new bases inside an input group. Pointer
+      // divisibility measures those offsets in bytes, not elements.
+      if ((lhsInfo.getContiguity(d) != kMaxDivisor &&
+           contiguity.back() < lhsInfo.getContiguity(d)) ||
+          (rhsInfo.getContiguity(d) != kMaxDivisor &&
+           contiguity.back() < rhsInfo.getContiguity(d)))
+        divisor = gcd(divisor, multiplyDivisor(contiguity.back(), elemBytes));
+      divisibility.push_back(divisor);
     }
 
     return AxisInfo(contiguity, divisibility, constancy);
@@ -1631,4 +1639,33 @@ void ModuleAxisInfoAnalysis::update(CallOpInterface callOp,
   }
 }
 
+unsigned getAxisInfoVector(const AxisInfo &info, Type ptrType,
+                           ArrayRef<int64_t> shape, unsigned dim,
+                           int64_t threads, unsigned maxBits) {
+  unsigned bits = getPointeeBitWidth(ptrType);
+  uint64_t aligned =
+      std::max<int64_t>(info.getDivisibility(dim) / std::max(bits / 8, 1u), 1);
+  uint64_t perThread =
+      std::max<int64_t>(ShapedType::getNumElements(shape) / threads, 1);
+  // A run of contiguous elements can be NPOT, and must hold whole vectors.
+  uint64_t contiguity = std::min<int64_t>(info.getContiguity(dim), shape[dim]);
+  return std::min<uint64_t>({aligned, maxBits / bits,
+                             llvm::bit_floor(perThread),
+                             uint64_t(1) << llvm::countr_zero(contiguity)});
+}
+
 } // namespace mlir::triton
+
+namespace mlir {
+
+SmallVector<unsigned, 4>
+getOrderFromContiguity(const SmallVector<int64_t> &arr) {
+  SmallVector<unsigned, 4> ret(arr.size());
+  std::iota(ret.begin(), ret.end(), 0);
+  std::reverse(ret.begin(), ret.end());
+  std::stable_sort(ret.begin(), ret.end(),
+                   [&](unsigned x, unsigned y) { return arr[x] > arr[y]; });
+  return ret;
+}
+
+} // namespace mlir

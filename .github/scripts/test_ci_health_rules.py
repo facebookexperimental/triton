@@ -1,4 +1,5 @@
 import ci_health_rules as r
+import pytest
 
 CORE, CODEGEN = "Run TLX core tests", "Run device-agnostic TLX codegen tests"
 
@@ -57,6 +58,100 @@ def main(runs, asof=stamp(23)):
 
 def items(view, gpu, kind):
     return {(i["id"], i["first_sha"][:2]) for i in view["gpus"][gpu][kind]}
+
+
+def comparison_run(h, wf="gpu-tests.yml", tested_sha="ab" * 20, pr=4855, **kw):
+    fast = wf == r.FAST_WF
+    worker = job("mi350 / correctness" if fast else "mi350 / mi350-tlx-test",
+                 step("Run fast correctness tests" if fast else CORE, "success"), label="linux-mi350")
+    aggregate = job("Fast correctness" if fast else r.SUMMARY_JOB, label="ubuntu-latest")
+    item = run(h, [build_ok(), worker, aggregate], event="pull_request", wf=wf, pr=pr, **kw)
+    item.update(tested_sha=tested_sha, run_attempt=1, updated_at=stamp(h))
+    return item
+
+
+def fail_comparison(item, kind="failed"):
+    worker = item["jobs"][1]
+    worker["conclusion"] = item["conclusion"] = item["jobs"][-1]["conclusion"] = "failure"
+    test = worker["steps"][0]
+    test["conclusion"] = "failure"
+    test["test_failures"] = [{
+        "id": "test_flash_attn_mxfp8_shared_fp8_boundary_graph[False]", "kind": kind, "msg":
+        "AssertionError: bitwise equality", "t": stamp(3)
+    }]
+    return item
+
+
+def test_ordered_parent_exposes_fast_pass_before_full_and_retains_failure():
+    fast = comparison_run(1, r.FAST_WF)
+    fast['jobs'][-1]['completed_at'] = stamp(2)
+    full = comparison_run(1)
+    parent = {**fast, 'status': 'in_progress', 'conclusion': None, 'updated_at': stamp(8)}
+    pending = [{**j, 'name': 'full / ' + j['name'], 'conclusion': None, 'completed_at': None} for j in full['jobs'][1:]]
+    parent['jobs'] = fast['jobs'] + pending
+    projected = list(r.comparison_runs([parent]))
+    assert projected[0]['updated_at'] == stamp(2)
+    failed = fail_comparison(full)
+    parent.update(status='completed', conclusion='failure', updated_at=stamp(10))
+    parent['jobs'] = fast['jobs'] + [{**j, 'name': 'full / ' + j['name']} for j in failed['jobs'][1:]]
+    assert r.pr_view([parent], stamp(11), r.main_view([], stamp(11)))[0]['result'] == 'test'
+    failed_snapshot = {**parent}
+    retry_full = comparison_run(1)
+    parent['attempts'] = [failed_snapshot]
+    parent['run_attempt'] = 2
+    parent['jobs'] = fast['jobs'] + [{**j, 'name': 'full / ' + j['name']} for j in retry_full['jobs'][1:]]
+    parent['conclusion'] = 'success'
+    assert r.pr_view([parent], stamp(11), r.main_view([], stamp(11)))[0]['result'] == 'passed'
+
+
+def test_partial_physical_jobs_do_not_report_known_idle_time():
+    parent = comparison_run(1, r.FAST_WF)
+    parent.update(status='in_progress', conclusion=None)
+    parent['jobs'][1].update(conclusion=None, completed_at=None)
+    occupancy = r.occupancy_view([parent], stamp(3))
+    last = r.concurrency_view([parent], stamp(3))['hours'][-1]
+    assert last['MI350']['peak'] is None
+    end = r.t(occupancy['t0']) + r.dt.timedelta(minutes=len(occupancy['gpus']['MI350']['run']) * r.OCC_CELL_MIN)
+    assert end <= r.t(parent['created_at'])
+
+
+def test_ordered_resources_count_physical_jobs_once_and_exclude_cpu():
+    fast, full = comparison_run(1, r.FAST_WF), comparison_run(1)
+    parent = {**fast, 'jobs': fast['jobs'] + [{**j, 'name': 'full / ' + j['name']} for j in full['jobs'][1:]]}
+    parent['jobs'].append(job('full / Compiler tests on CPU', step(CODEGEN, 'success'), label='ubuntu-latest'))
+    assert r.gpu_minutes(parent) == r.gpu_minutes(fast) + r.gpu_minutes(full) == 20
+    assert [g for g, _ in r._test_jobs(parent)] == ['MI350', 'MI350', 'CPU']
+    assert r.job_key('full / mi350 / mi350-tlx-test') == 'mi350-tlx-test'
+    views = list(r.comparison_runs([parent]))
+    assert len(views) == 2 and all(v['id'] == parent['id'] for v in views)
+
+
+def independent_full(fast, h=2, tested_sha=None, **changes):
+    full = comparison_run(h, tested_sha=tested_sha or fast["tested_sha"], pr=fast["pr"])
+    full.update({
+        "event": "workflow_run", "head_sha": "de" *
+        20, "branch": "main", "pr_head_sha": fast["head_sha"], "pr_branch": "feature", "followup_status": "ok",
+        "followup_producer_run_id": fast["id"], "followup_producer_attempt": fast.get("run_attempt", 1), "base": "main"
+    } | changes)
+    return full
+
+
+def test_independent_full_run_keeps_event_and_reaches_pr_views_and_accounting():
+    fast = comparison_run(1, r.FAST_WF)
+    full = independent_full(fast)
+    pr = r.pr_view([full], stamp(23), r.main_view([], stamp(23)))[0]
+    assert full["event"] == "workflow_run" and pr["result"] == "passed" and pr["branch"] == "feature"
+    assert r.trigger_event(full) == "pull_request" and r.gpu_minutes(full) == 10
+    ops = r.ops_view([full], stamp(23))
+    assert ops["per_run"][-1]["PR"]["n"] == 1
+    assert r.usage_view([full], stamp(23))["triggers"][-1]["MI350"]["PR"] == 0.17
+
+
+def test_page_data_keeps_main_and_pr_views():
+    fast, full = comparison_run(1, r.FAST_WF), fail_comparison(comparison_run(2))
+    v = r.page_data([fast, full], stamp(23), {})["branches"]["main"]
+    assert v["main"] == r.main_view([full], stamp(23))
+    assert v["pr"] == r.pr_view([full], stamp(23), v["main"])
 
 
 def test_mi350_core_step_keeps_its_name_before_the_rename():
@@ -450,7 +545,9 @@ def test_failed_select_is_an_anomaly():
 def test_page_data_has_one_section_per_tab():
     data = r.page_data([push(1, tlx())], stamp(23), {})
     assert set(data) == {"asof", "branches", "occupancy"}
-    assert all(set(v) == {"main", "lit", "nightly", "pr", "ops", "usage", "bump"} for v in data["branches"].values())
+    assert all(
+        set(v) == {"main", "lit", "nightly", "pr", "sanitizer", "ops", "usage", "bump"}
+        for v in data["branches"].values())
 
 
 def test_every_test_step_in_the_gpu_workflows_maps_to_a_group():

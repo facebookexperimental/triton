@@ -14,9 +14,29 @@
     tl.assume(stride_bk > 0)
     tl.assume(stride_bn > 0)
 
+{% if TRANSPOSED %}
+    MM: tl.constexpr = N
+    NN: tl.constexpr = M
+    lhs = B
+    rhs = A
+    stride_lm: tl.constexpr = stride_bn
+    stride_lk: tl.constexpr = stride_bk
+    stride_rk: tl.constexpr = stride_ak
+    stride_rn: tl.constexpr = stride_am
+{% else %}
+    MM: tl.constexpr = M
+    NN: tl.constexpr = N
+    lhs = A
+    rhs = B
+    stride_lm: tl.constexpr = stride_am
+    stride_lk: tl.constexpr = stride_ak
+    stride_rk: tl.constexpr = stride_bk
+    stride_rn: tl.constexpr = stride_bn
+{% endif %}
+
     pid = tl.program_id(0).to(tl.int32)
-    grid_m = (M + BLOCK_M - 1) // BLOCK_M
-    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    grid_m = (MM + BLOCK_M - 1) // BLOCK_M
+    grid_n = (NN + BLOCK_N - 1) // BLOCK_N
     grid_mn = grid_m * grid_n
 
     XCD_CHUNK: tl.constexpr = 4
@@ -45,13 +65,13 @@
     input_cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
     offs_m = (
         input_rows
-        if M % BLOCK_M == 0
-        else tl.where(input_rows < M, input_rows, 0)
+        if MM % BLOCK_M == 0
+        else tl.where(input_rows < MM, input_rows, 0)
     )
     offs_n = (
         input_cols
-        if N % BLOCK_N == 0
-        else tl.where(input_cols < N, input_cols, 0)
+        if NN % BLOCK_N == 0
+        else tl.where(input_cols < NN, input_cols, 0)
     )
     offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
     reg_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
@@ -62,17 +82,17 @@
     for k_idx in range(0, full_k_tiles):
         k = k_idx * BLOCK_K
         a_ptrs = (
-            A
-            + reg_m[:, None] * stride_am
-            + (k + offs_k[None, :]) * stride_ak
+            lhs
+            + reg_m[:, None] * stride_lm
+            + (k + offs_k[None, :]) * stride_lk
         )
         b_ptrs = (
-            B
-            + (k + offs_k[:, None]) * stride_bk
-            + reg_n[None, :] * stride_bn
+            rhs
+            + (k + offs_k[:, None]) * stride_rk
+            + reg_n[None, :] * stride_rn
         )
-        a = tl.load(a_ptrs)
-        b = tl.load(b_ptrs)
+        a = tl.load(a_ptrs, cache_modifier=".cg" if CACHE_A_CG else "")
+        b = tl.load(b_ptrs, cache_modifier=".cg" if CACHE_B_CG else "")
         acc += tl.dot(
             a,
             b,
@@ -84,17 +104,27 @@
         k = full_k_tiles * BLOCK_K
         k_mask = offs_k < K - k
         a_ptrs = (
-            A
-            + reg_m[:, None] * stride_am
-            + (k + offs_k[None, :]) * stride_ak
+            lhs
+            + reg_m[:, None] * stride_lm
+            + (k + offs_k[None, :]) * stride_lk
         )
         b_ptrs = (
-            B
-            + (k + offs_k[:, None]) * stride_bk
-            + reg_n[None, :] * stride_bn
+            rhs
+            + (k + offs_k[:, None]) * stride_rk
+            + reg_n[None, :] * stride_rn
         )
-        a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
-        b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
+        a = tl.load(
+            a_ptrs,
+            mask=k_mask[None, :],
+            other=0.0,
+            cache_modifier=".cg" if CACHE_A_CG else "",
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=k_mask[:, None],
+            other=0.0,
+            cache_modifier=".cg" if CACHE_B_CG else "",
+        )
         acc += tl.dot(
             a,
             b,
@@ -104,7 +134,15 @@
 
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
     cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
+{% if TRANSPOSED %}
+    idx_m = cols[:, None]
+    idx_n = rows[None, :]
+    value = tl.trans(acc)
+    mask = (idx_m < M) & (idx_n < N)
+    {{store_output(("idx_m", "idx_n"), "value", "mask", val_shape=("BLOCK_N", "BLOCK_M"))}}
+{% else %}
     idx_m = rows[:, None]
     idx_n = cols[None, :]
     mask = (idx_m < M) & (idx_n < N)
     {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}
+{% endif %}
