@@ -54,11 +54,35 @@ AutoWS inventory.
 | `merge_epilogue` / `merge_epilogue_to_computation` / `merge_correction` | `tt.merge_*` | `PartitionSchedulingMeta` (`SchedulingOptions`) | epilogue/correction routing |
 | `separate_epilogue_store` | `tt.separate_epilogue_store` | `PartitionSchedulingMeta` | epilogue store gets own partition |
 | `tmem_alloc_algo` / `smem_alloc_algo` / `smem_budget` / `smem_circular_reuse` | `tt.{tmem,smem}_alloc_algo`, `tt.smem_budget`, `tt.smem_circular_reuse` | `WSMemoryPlanner` | allocation heuristics |
+| `lhs_buffer_depth` / `rhs_buffer_depth` | `tt.lhs_buffer_depth` / `tt.rhs_buffer_depth` | `AssignLatencies`, `WSMemoryPlanner` | exact per-MMA-operand TMA/SMEM ring depths |
 | `list_schedule_pick` / `mem_plan_pick` | `tt.list_schedule_pick` / `tt.mem_plan_pick` | list scheduler / `WSMemoryPlanner` | ranked schedule and memory-plan selection |
 | `disable_licm` | `llvm.loop_annotation` | LICM | suppress hoisting |
 
 See `PartitionSchedulingMeta.md` for how the `merge_*` / `separate_epilogue_store`
 knobs shape the partition layout.
+
+### Asymmetric MMA operand buffering
+
+`lhs_buffer_depth` and `rhs_buffer_depth` are an opt-in prototype for a single
+MMA K-loop whose two operands come from distinct tensor-descriptor loads. Both
+options must be present, positive, and no greater than `num_stages`. The
+compiler rejects loops with zero or multiple MMAs, operands that do not resolve
+to exactly one descriptor load, and a descriptor load shared by both operands.
+
+For a requested depth `D`, `AssignLatencies` gives the descriptor load software
+pipeline distance `D - 1`. Thus A3/B2 with three stages places the A load at
+stage 0, the B load at stage 1, and the MMA at stage 2. It also marks each load
+with `tt.requested_buffer_depth`. Descriptor-to-NVWS conversion preserves that
+marker, and `WSMemoryPlanner` pins the destination allocation to exactly `D`
+copies. Pinned operand buffers cannot enter circular-reuse groups, so the two
+channels receive distinct IDs, barrier rings, and modulo indexing even when
+`smem_circular_reuse` is enabled.
+
+The prototype does not create an additional load partition. Both loads may
+still execute in one producer partition, but software-pipeline expansion can
+issue the A load one iteration farther ahead than B. Supporting multiple MMAs,
+shared lhs/rhs channels, or non-descriptor operands requires an explicit
+channel-selection policy and is intentionally rejected.
 
 ## Operation scheduling annotations
 
