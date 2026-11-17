@@ -279,6 +279,11 @@ static void insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
   Value remoteBar = ttng::MapToRemoteBufferOp::create(
       builder, loc, remoteBarType, barrierView, leaderRank);
 
+  // Order this CTA's generic writes of its split B half before the arrive that
+  // lets the leader's MMA read it.
+  if (mma->hasAttr(ttng::AttrTwoCTARegisterBName))
+    ttng::FenceAsyncSharedOp::create(builder, loc, /*bCluster=*/true);
+
   // Both CTAs arrive on leader's barrier (count=1 each, total=2).
   ttng::ArriveBarrierOp::create(builder, loc, remoteBar, /*count=*/1u);
 
