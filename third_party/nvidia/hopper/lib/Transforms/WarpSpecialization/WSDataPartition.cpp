@@ -1749,14 +1749,17 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     if (offset) {
       // Shift only this op's operand: mapping coordVal would leak the offset
       // into later clones that use the same scalar and into a shared index.
-      if (auto *defOp = coordVal.getDefiningOp())
+      // Start from the clone's operand, i.e. this partition's copy of the
+      // coordinate when the scalar itself was sliced, not the original op.
+      Value baseCoordVal = newOp->getOperand(coordOperandIdx);
+      if (auto *defOp = baseCoordVal.getDefiningOp())
         builder.setInsertionPointAfter(defOp);
       else
         builder.setInsertionPoint(newOp);
       Value offsetVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           op->getLoc(), offset * shape[dim] / numOfPartitions, 32);
       Value newCoordVal = builder.createWithAsyncTaskIds<arith::AddIOp>(
-          op->getLoc(), coordVal, offsetVal);
+          op->getLoc(), baseCoordVal, offsetVal);
       newOp->setOperand(coordOperandIdx, newCoordVal);
     }
     if (isa<DescriptorLoadOp>(op)) {
