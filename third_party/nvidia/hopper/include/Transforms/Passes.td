@@ -309,6 +309,23 @@ def NVGPUTMAStoreTokenWaitLowering
   let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
 }
 
+def NVGPUTMAStoreTokenWaitAnnotatePendings
+    : Pass<"nvgpu-tma-store-token-wait-annotate-pendings", "mlir::ModuleOp"> {
+  let summary = "Record program-order pendings on TMAStoreTokenWaitOp before "
+                "scf-to-cf";
+
+  let description = [{
+    Computes, on structured IR, the number of TMA store-like ops issued
+    between each `ttng.async_tma_store_token_wait`'s token and the wait, and
+    stores it as `program_order_pending_count`. Waits that already carry
+    `planned_pending_count` are left alone. `nvgpu-tma-store-token-wait-lowering`
+    runs after scf-to-cf, where a loop-carried token is a CFG block argument
+    it cannot trace; it uses this attribute instead of draining every store.
+  }];
+
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
 def NVGPUPartitionSchedulingMeta
     : Pass<"nvgpu-partition-scheduling-meta", "mlir::ModuleOp"> {
   let summary = "Meta warp specialization partitioning pass";
