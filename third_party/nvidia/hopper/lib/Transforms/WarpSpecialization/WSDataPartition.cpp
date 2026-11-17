@@ -2798,7 +2798,8 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
               arith::AddIOp::create(builder, loc, indices[dim], offset);
         }
         auto slicedLoad = DescriptorLoadOp::create(
-            builder, loc, slicedResultType, descLoadOp.getDesc(), indices);
+            builder, loc, slicedResultType, descLoadOp.getDesc(), indices,
+            descLoadOp.getCachePolicyAttr());
         slicedLoads.push_back(slicedLoad.getResult());
       }
 

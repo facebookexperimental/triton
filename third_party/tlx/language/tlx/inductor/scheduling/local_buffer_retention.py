@@ -659,6 +659,13 @@ def create_kernel_choices(
     )
     kernel = kernel_type(*kernel_args, **kernel_kwargs)
     if not config.triton.multi_kernel:
+        if _persistent_only_by_tlx(kernel, kernel_features, kernel_kwargs):
+            # Compile the looped sibling too; MultiKernel keeps the faster one.
+            with config.patch({"triton.multi_kernel": 1}):
+                kernels = scheduling.add_multi_kernel_choices(kernel, kernel_args, kernel_kwargs)
+            for candidate in kernels:
+                candidate._tlx_retime = True
+            return kernels
         return [kernel]
 
     kernels = scheduling.add_multi_kernel_choices(kernel, kernel_args, kernel_kwargs)
@@ -674,6 +681,18 @@ def create_kernel_choices(
         kernels.extend(retained)
         kernels.sort(key=lambda k: k.persistent_reduction)
     return kernels
+
+
+def _persistent_only_by_tlx(
+    kernel: TritonKernel, features: SIMDKernelFeatures, kernel_kwargs: dict[str, Any]
+) -> bool:
+    from ..choices import TLXInductorChoices
+
+    return (
+        kernel.persistent_reduction
+        and "override_persistent_reduction" not in kernel_kwargs
+        and TLXInductorChoices.persistent_only_by_tlx(features, getattr(kernel, "cooperative_reduction", False))
+    )
 
 
 def get_extra_kernel_choices(

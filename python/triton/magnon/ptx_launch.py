@@ -13,7 +13,8 @@ Because the PTX is frozen, what we tune is byte-identical to production and the 
 Launch ABI (discovered from third_party/nvidia/backend/driver.py): the kernel params are the
 NON-constexpr, NON-`equal_to_1`-specialized scalar/pointer args in source order, followed by two
 trailing internal pointers -- `global_scratch` then `profile_scratch` -- which are NULL when their
-sizes are 0. The PTX `.visible .entry` param list is authoritative for the count/types; callers
+sizes are 0. A non-zero global scratch (e.g. device-side TMA descriptors from tl.make_tensor_descriptor)
+is recorded in the spec and allocated by the launcher as grid_size * size bytes. The PTX `.visible .entry` param list is authoritative for the count/types; callers
 build `kernel_args` to match and we assert parity against the PTX before launching.
 """
 
@@ -155,6 +156,17 @@ def _scalar_kind_from_type(ty: str) -> str:
     raise NotImplementedError(f"unsupported scalar schema type {ty!r}")
 
 
+def _scratch(gss: int, gss_align: int, pss: int):
+    """Return (spec["global_scratch"] or None, the two trailing scratch args). A non-zero global
+    scratch becomes a {"global_scratch": true} arg the launcher fills with a per-launch buffer of
+    grid_size * size bytes; profile scratch (proton instrumentation) is not supported."""
+    if pss:
+        raise NotImplementedError(f"non-null profile scratch (size={pss})")
+    if not gss:
+        return None, [{"null": True}, {"null": True}]
+    return {"size": gss, "align": gss_align}, [{"global_scratch": True}, {"null": True}]
+
+
 def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str, ptxas_version: str = "") -> dict:
     """Build the source-free launch spec from a compiled kernel + its (bound-order) call args.
 
@@ -168,26 +180,26 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str, ptxas_version
     Applies Triton's specialization (drop constexprs and `equal_to_1` integer scalars), maps the
     survivors onto the PTX `.entry` param slots -- including expanding each TensorDescriptor into its
     [tensormap, *shape, *strides] params (the TMA ABI, see nvidia/backend/driver.py
-    make_tensordesc_arg) -- and appends the two trailing null scratch pointers. Backing tensors are
-    deduped by `id` so descriptors that share a tensor share one allocation.
+    make_tensordesc_arg) -- and appends the two trailing scratch pointers (see _scratch). Backing tensors
+    are deduped by `id` so descriptors that share a tensor share one allocation.
 
     Cluster shape is read from ``metadata.ctas_per_cga`` ONLY: that is the sole field TLX kernels set to
     request a cluster (the CUDA-native path), and the nvidia backend mirrors it into ``cluster_dims`` in
     ``Metadata.__post_init__`` -- so ctas_per_cga is authoritative and cluster_dims/cluster are not read.
 
-    Raises NotImplementedError for kernels this PTX-direct path does not cover yet (non-null
-    global/profile scratch, multi-CTA/cluster, fp4-padded/im2col TMA, other arg types, or any param
-    mismatch) so the caller fails open and simply does not collect that kernel."""
+    Raises NotImplementedError for kernels this PTX-direct path does not cover yet (non-null profile
+    scratch, multi-CTA/cluster, fp4-padded/im2col TMA, other arg types, or any param mismatch) so the
+    caller fails open and simply does not collect that kernel."""
     name, kinds = parse_entry(ptx)
     gss = int(getattr(metadata, "global_scratch_size", 0) or 0)
+    gss_align = int(getattr(metadata, "global_scratch_align", 1) or 1)
     pss = int(getattr(metadata, "profile_scratch_size", 0) or 0)
     num_ctas = int(getattr(metadata, "num_ctas", 1) or 1)
     # Cluster shape from ctas_per_cga only (see docstring): the field TLX kernels populate; the backend
     # mirrors it into cluster_dims, so ctas_per_cga is authoritative.
     cluster = list(getattr(metadata, "ctas_per_cga", None) or [1, 1, 1])
     tdmeta = list(getattr(metadata, "tensordesc_meta", None) or [])
-    if gss or pss:
-        raise NotImplementedError(f"non-null scratch (global={gss} profile={pss})")
+    global_scratch, scratch_args = _scratch(gss, gss_align, pss)
     # Cluster support is limited to the TLX / CUDA-native path: num_ctas == 1 with the cluster shape
     # carried by the cubin's `.reqnctapercluster` directive, so a plain launch with the total-CTA grid
     # re-forms the clusters (matches the frontend launcher, which sets NO CLUSTER_DIMENSION attr for
@@ -275,7 +287,7 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str, ptxas_version
 
     if ki != len(user_kinds):
         raise NotImplementedError(f"param parity: consumed {ki} != {len(user_kinds)} PTX user params")
-    args += [{"null": True}, {"null": True}]  # global_scratch, profile_scratch
+    args += scratch_args
 
     g = [int(grid[0]), int(grid[1]) if len(grid) > 1 else 1, int(grid[2]) if len(grid) > 2 else 1]
     # A clustered launch re-forms clusters from the total-CTA grid via `.reqnctapercluster`; the driver
@@ -297,6 +309,8 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str, ptxas_version
         spec["cluster"] = cluster
     if tensordescs:
         spec["tensordescs"] = tensordescs
+    if global_scratch:
+        spec["global_scratch"] = global_scratch
     return spec
 
 
@@ -321,13 +335,13 @@ def build_spec_from_schema(schema: dict, ptx: str, grid, ordered_args, ptxas: st
     num_ctas = int(schema.get("num_ctas") or 1)
     cluster = [int(c) for c in (schema.get("cluster_dims") or [1, 1, 1])]
     gss = int(schema.get("global_scratch_size") or 0)
+    gss_align = int(schema.get("global_scratch_align") or 1)
     pss = int(schema.get("profile_scratch_size") or 0)
     num_warps = int(schema.get("num_warps") or 1)
     shared = int(schema.get("shared_mem") or 0)
     schema_args = schema.get("args") or []
 
-    if gss or pss:
-        raise NotImplementedError(f"non-null scratch (global={gss} profile={pss})")
+    global_scratch, scratch_args = _scratch(gss, gss_align, pss)
     if num_ctas != 1:
         raise NotImplementedError(f"multi-CTA via num_ctas>1 (num_ctas={num_ctas})")
     cluster_size = 1
@@ -367,7 +381,7 @@ def build_spec_from_schema(schema: dict, ptx: str, grid, ordered_args, ptxas: st
         else:  # scalar
             k = _scalar_kind_from_type(ty)
             args.append({k: int(s[1]) if k in ("i32", "i64") else float(s[1])})
-    args += [{"null": True}, {"null": True}]  # global_scratch, profile_scratch
+    args += scratch_args
 
     g = [int(grid[0]), int(grid[1]) if len(grid) > 1 else 1, int(grid[2]) if len(grid) > 2 else 1]
     if cluster_size != 1 and any(gd % cd != 0 for gd, cd in zip(g, cluster, strict=True)):
@@ -384,6 +398,8 @@ def build_spec_from_schema(schema: dict, ptx: str, grid, ordered_args, ptxas: st
     }
     if cluster_size != 1:
         spec["cluster"] = cluster
+    if global_scratch:
+        spec["global_scratch"] = global_scratch
     return spec
 
 
@@ -482,9 +498,11 @@ def load_cubin(cubin: bytes, name: str, shared: int) -> LoadedKernel:
 #     "grid": [4,4,1],
 #     "tensors": [{"shape":[256,256],"dtype":"float16","strides":[256,1]}, ...],
 #     "args": [ {"t":0}, {"t":1}, {"t":2}, {"i32":256}, ..., {"null":true}, {"null":true} ],
+#     "global_scratch": {"size": 128, "align": 128},   # only when the kernel uses global scratch
 #   }
 # "args" is the FINAL kernel-param order (post equal_to_1 / constexpr specialization) including the
-# two trailing null scratch params; {"t":i} is a pointer to tensors[i].
+# two trailing scratch params; {"t":i} is a pointer to tensors[i], {"global_scratch":true} a pointer to
+# a grid_size * global_scratch.size byte buffer (see alloc_global_scratch).
 # --------------------------------------------------------------------------------------
 _DT = {
     "float16": "float16",
@@ -537,8 +555,24 @@ def build_tensormaps(spec, tensors):
     return objs, addrs
 
 
-def kernel_args_from_spec(spec, tensors, tensormap_addrs=None):
-    """Turn the spec's final arg list + allocated tensors (+ tensormap addrs) into launch() args."""
+def alloc_global_scratch(spec, device="cuda"):
+    """Allocate the spec's global scratch: grid_size * size bytes (num_ctas is always 1 here), aligned
+    to `align`, as the Triton launcher does per launch. Returns a uint8 view (KEEP ALIVE across launch)
+    or None when the kernel uses no global scratch."""
+    gs = spec.get("global_scratch")
+    if not gs:
+        return None
+    import torch
+    gx, gy, gz = spec["grid"]
+    size, align = gx * gy * gz * int(gs["size"]), int(gs["align"])
+    buf = torch.zeros(size + align, dtype=torch.uint8, device=device)
+    off = -buf.data_ptr() % align
+    return buf[off:off + size]
+
+
+def kernel_args_from_spec(spec, tensors, tensormap_addrs=None, global_scratch=None):
+    """Turn the spec's final arg list + allocated tensors (+ tensormap addrs, + the
+    alloc_global_scratch buffer) into launch() args."""
     tensormap_addrs = tensormap_addrs or []
     ka = []
     for a in spec["args"]:
@@ -546,6 +580,10 @@ def kernel_args_from_spec(spec, tensors, tensormap_addrs=None):
             ka.append(("ptr", tensors[a["t"]].data_ptr()))
         elif "tma" in a:
             ka.append(("tma", tensormap_addrs[a["tma"]]))
+        elif a.get("global_scratch"):
+            if global_scratch is None:
+                raise ValueError("spec needs a global scratch buffer (see alloc_global_scratch)")
+            ka.append(("ptr", global_scratch.data_ptr()))
         elif a.get("null"):
             ka.append(("null", ))
         elif "i32" in a:

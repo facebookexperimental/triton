@@ -101,6 +101,10 @@ int getCopyVecBytes(RankedTensorType registerTy,
 bool canBeConvertedToAsyncLoad(
     triton::LoadOp loadOp, triton::ModuleAxisInfoAnalysis &axisInfoAnalysis);
 
+// Whether every op that pipelining `load` through shared memory creates, an
+// async copy and a local_load, lowers its layout on its target.
+bool canPipelineInSharedMemory(triton::LoadOp load);
+
 // Serialize the latencies of the operations in the loops into the latency
 // attribute.
 void serializeLatencies(ModuleOp module, DenseMap<Operation *, int> &opLatency);

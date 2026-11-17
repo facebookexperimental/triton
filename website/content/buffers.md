@@ -33,13 +33,15 @@
     Store a distributed tensor into a buffer in local memory or tensor memory.
 
 
-- `distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)` **[sm90+, gfx942+?]**
+- `distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)` **[sm90+, gfx942+]**
 
     Gather elements from shared memory along a specified axis using an indices tensor. The output shape matches the indices shape, and elements are gathered from `src` at positions specified by `indices` along the given `axis`.
 
-- `tlx.local_scatter(dst, src, indices, axis, optional_token)` **[sm90+, gfx942+?]**
+- `tlx.local_scatter(dst, src, indices, axis, optional_token)` **[sm90+, gfx942+]**
 
     Scatter elements to shared memory along a specified axis using an indices tensor. Elements from `src` are written to `dst` at positions specified by `indices` along the given `axis`.
+
+    Gather and scatter use portable shared-memory lowering. Neither supports a partitioned-shared memory encoding; use an ordinary shared layout for these operations, including on gfx1250. See the [lowering](lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp).
 
 - `buffer = tlx.local_trans(buffer, dims)` **[sm90+, gfx942+]**
 

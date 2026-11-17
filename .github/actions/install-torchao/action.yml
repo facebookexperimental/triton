@@ -8,6 +8,10 @@ inputs:
     description: Python executable in the target environment; uv must be available
     required: false
     default: python
+  defer-verification:
+    description: Verify after the exact Triton wheel is installed by the caller
+    required: false
+    default: "false"
   setup-script:
     description: Optional environment activation script to source before installing
     required: false
@@ -21,6 +25,7 @@ runs:
         TORCHAO_PLATFORM: ${{ inputs.platform }}
         TORCHAO_PYTHON: ${{ inputs.python }}
         TORCHAO_SETUP_SCRIPT: ${{ inputs.setup-script }}
+        TORCHAO_DEFER_VERIFICATION: ${{ inputs.defer-verification }}
       run: |
         set -eo pipefail
         case "${TORCHAO_PLATFORM}" in
@@ -36,4 +41,6 @@ runs:
         TORCHAO_PYTHON="$("${TORCHAO_PYTHON}" -c 'import sys; print(sys.executable)')"
         uv pip install --python "${TORCHAO_PYTHON}" --pre torchao \
           --index-url "https://download.pytorch.org/whl/nightly/${TORCHAO_INDEX}"
-        "${TORCHAO_PYTHON}" -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
+        if [[ "${TORCHAO_DEFER_VERIFICATION}" != true ]]; then
+          "${TORCHAO_PYTHON}" -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
+        fi

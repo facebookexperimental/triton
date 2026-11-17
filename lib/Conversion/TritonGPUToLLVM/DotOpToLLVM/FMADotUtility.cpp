@@ -51,21 +51,16 @@ ValueTableFMA getValueTableFromStructFMA(
   ValueTableFMA res;
   auto elems = unpackTensorElements(loc, val, rewriter, tensorTy);
   assert(perRepShape.size() == 3);
+  auto numElemsRep = product(perRepShape);
+  assert(elems.size() == numElemsRep * product(repetitions));
   assert(kDim == 1 || kDim == 2);
   assert(nonKDim == 1 || nonKDim == 2);
-  // fmaDotToLinearLayout gives an NPOT K a modular digit of PowerOf2Ceil(K)
-  // registers (register k >= K holds element k % K). Delinearize with that
-  // count; the caller's k < K loop never reads the duplicates.
-  SmallVector<unsigned> regShape(perRepShape);
-  regShape[kDim] = static_cast<unsigned>(llvm::PowerOf2Ceil(perRepShape[kDim]));
-  auto numElemsRep = product(regShape);
-  assert(elems.size() == numElemsRep * product(repetitions));
 
   for (unsigned idx = 0; idx < elems.size(); ++idx) {
     auto inRepLinearIdx = idx % numElemsRep;
     auto repLinearIdx = idx / numElemsRep;
     auto inRepSpatialIdx =
-        mlir::LLVM::delinearize(inRepLinearIdx, regShape, inRepOrder);
+        mlir::LLVM::delinearize(inRepLinearIdx, perRepShape, inRepOrder);
     auto repSpatialIdx =
         mlir::LLVM::delinearize(repLinearIdx, repetitions, repOrder);
     OperandValueKey key{repSpatialIdx[0], repSpatialIdx[nonKDim],

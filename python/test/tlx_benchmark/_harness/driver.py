@@ -31,7 +31,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from . import report as report_mod
 from . import verdict
-from .compile import COLD_COMPILE_CAP_S, cold_compile
+from .compile import COLD_COMPILE_CAP_S, CompileStat, cold_compile
 from .contract import Case, Result, Status
 from .denoise import Governor, capture_env, list_devices, select_device, stable
 from .measure import DEFAULT_REPLICATES, LATENCY_MODES, host_overhead_us, measure
@@ -71,6 +71,8 @@ class Prepared:
     #: no `heuristic_config` autotunes a full space on its first call and will
     #: legitimately exceed the default; see the suite README.
     cap_s: float = COLD_COMPILE_CAP_S
+    #: For adapters that must compile and capture their graph during preparation.
+    compile_stat: Optional[CompileStat] = None
 
 
 #: The GPU this run is about. Everything downstream -- which focus suites are
@@ -259,7 +261,9 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     #
     # `cold=False` skips it and the case reports no compile time. See
     # `resolve_cold_compile` for why that is the default on some ops.
-    compile_stat = cold_compile(prep.tlx_fn, cap_s=prep.cap_s) if cold else None
+    compile_stat = prep.compile_stat
+    if compile_stat is None and cold:
+        compile_stat = cold_compile(prep.tlx_fn, cap_s=prep.cap_s)
 
     configs: dict = {}
     with _record_configs(configs):
@@ -283,7 +287,8 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
     ref_host_us = host_overhead_us(prep.ref_fn) if prep.ref_fn is not None else None
 
     result = verdict.judge(case, tlx, ref, tlx_host_us=host_us, compile_stat=compile_stat, correct=correct,
-                           accuracy_note=accuracy_note, floor_tflops=prep.floor_tflops)
+                           accuracy_note=accuracy_note, floor_tflops=prep.floor_tflops,
+                           reference_gate=getattr(bench, "REFERENCE_GATE", True))
     # After the verdict's notes, which lead the nightly failure summary.
     result.notes += [f"tlx: {n}" for n in tlx_notes] + [f"ref: {n}" for n in ref_notes]
     result.flop_count = prep.flop_count
@@ -325,14 +330,12 @@ def _errored(case: Case, exc: Exception) -> Result:
 
 
 def resolve_space(bench, space: Optional[str]) -> str:
-    """`None` means "whatever this op's own default is".
-
-    Ops do not share one: `mm` has a `heuristic_config` and defaults to it,
-    while `flash_attn`/`hstu_attn_dev`/`kimi_delta_attention` have none and
-    their kernels accept only "full" or "smoke" -- passing a global default of
-    "heuristic" to those is a KeyError, not a slow path.
-    """
-    return space or getattr(bench, "DEFAULT_SPACE", "heuristic")
+    """Resolve an explicit space or the adapter's default for the selected GPU."""
+    if space is not None:
+        return space
+    if hasattr(bench, "default_space"):
+        return bench.default_space()
+    return getattr(bench, "DEFAULT_SPACE", "heuristic")
 
 
 #: How often to pay the cold-compile pass.
@@ -409,6 +412,7 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
     # same claim as a ratio against a vendor library.
     env["space"] = space
     env["ref"] = getattr(bench, "REF_NAME", "")
+    env["reference_gate"] = getattr(bench, "REFERENCE_GATE", True)
     env["cold_compile"] = cold_mode
     env["latency_mode"] = "gpu_events"
     env["requested_latency_mode"] = latency_mode
@@ -428,10 +432,8 @@ def run(bench, *, space=None, head=None, synthetic=False, suites=None, governor=
 def main(bench, argv=None) -> int:
     parser = argparse.ArgumentParser(description=bench.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default="auto", help="GPU index, or 'auto' (default) for the least-used one")
-    parser.add_argument(
-        "--space", choices=("heuristic", "curated", "full", "smoke"), default=None,
-        help=f"autotune search space (default {resolve_space(bench, None)}); the default is what this op "
-        "uses by default, and measuring anything else measures a path users do not take")
+    parser.add_argument("--space", choices=("heuristic", "curated", "full", "smoke"), default=None,
+                        help="autotune search space; defaults to the selected GPU implementation's setting")
     parser.add_argument("--head", type=int, default=None, metavar="N",
                         help="only the first N cases per direction, for a quick look")
     shape_options = parser.add_mutually_exclusive_group()
