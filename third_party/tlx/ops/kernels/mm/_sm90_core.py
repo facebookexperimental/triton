@@ -9,7 +9,8 @@ import triton.language.extra.tlx as tlx
 
 @triton.jit
 def _allocate_buffers(a_desc, b_desc, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NUM_STAGES: tl.constexpr,
-                      NUM_MMA_GROUPS: tl.constexpr, A_ROW_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr):
+                      NUM_MMA_GROUPS: tl.constexpr, A_ROW_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr,
+                      SKIP_B: tl.constexpr = False):
     block_m_split: tl.constexpr = BM // NUM_MMA_GROUPS
 
     if A_ROW_MAJOR:
@@ -24,7 +25,9 @@ def _allocate_buffers(a_desc, b_desc, BM: tl.constexpr, BN: tl.constexpr, BK: tl
             tlx.dtype_of(a_desc),
             NUM_STAGES * NUM_MMA_GROUPS,
         )
-    if B_ROW_MAJOR:
+    if SKIP_B:
+        b = tlx.local_alloc((BK, 64), tlx.dtype_of(b_desc), 1)
+    elif B_ROW_MAJOR:
         b = tlx.local_alloc((BK, BN), tlx.dtype_of(b_desc), NUM_STAGES)
     else:
         b = tlx.local_alloc((BN, BK), tlx.dtype_of(b_desc), NUM_STAGES)
@@ -63,7 +66,7 @@ def _run_producer(M, N, K, a_desc, b_desc, a, b, bars_empty_a, bars_full_a, bars
                   GROUP_SIZE_M: tl.constexpr, NUM_STAGES: tl.constexpr, NUM_MMA_GROUPS: tl.constexpr,
                   A_ROW_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr, A_EVICTION: tl.constexpr,
                   SPLIT_K: tl.constexpr = 1, b_tail_desc=None, b_tail=None, N_TAIL: tl.constexpr = 0, b_tail2_desc=None,
-                  b_tail2=None, N_TAIL2: tl.constexpr = 0):
+                  b_tail2=None, N_TAIL2: tl.constexpr = 0, b_single=None):
     # BN is the tile's main power-of-two N piece; N_TAIL (and N_TAIL2) > 0 add
     # K-major B pieces after it, loaded onto the same full barrier.
     block_m_split: tl.constexpr = BM // NUM_MMA_GROUPS
@@ -126,13 +129,35 @@ def _run_producer(M, N, K, a_desc, b_desc, a, b, bars_empty_a, bars_full_a, bars
                 BN_TILE * BK * tlx.size_of(tlx.dtype_of(b_desc)),
             )
             data_b = tlx.local_view(b, buf)
-            if B_ROW_MAJOR:
+            if b_single is not None:
+                # One uniform-stride B buffer, filled by piece-wise boxes
+                # at whole-atom row offsets.
+                full = tlx.local_view(b_single, buf)
+                tlx.async_descriptor_load(
+                    b_desc, tlx.local_slice(full, [0, 0], [BN, BK]),
+                    [offset_bn, offset_k], full_b)
+                if N_TAIL > 0:
+                    tlx.async_descriptor_load(
+                        b_tail_desc,
+                        tlx.local_slice(full, [BN, 0], [N_TAIL, BK]),
+                        [offset_bn + BN, offset_k], full_b)
+                if N_TAIL2 > 0:
+                    tlx.async_descriptor_load(
+                        b_tail2_desc,
+                        tlx.local_slice(full, [BN + N_TAIL, 0], [N_TAIL2, BK]),
+                        [offset_bn + BN + N_TAIL, offset_k], full_b)
+            elif B_ROW_MAJOR:
                 tlx.async_descriptor_load(
                     b_desc,
                     data_b,
                     [offset_k, offset_bn],
                     full_b,
                 )
+                if N_TAIL > 0:
+                    tlx.async_descriptor_load(b_tail_desc, tlx.local_view(b_tail, buf), [offset_bn + BN, offset_k], full_b)
+                if N_TAIL2 > 0:
+                    tlx.async_descriptor_load(b_tail2_desc, tlx.local_view(b_tail2, buf),
+                                              [offset_bn + BN + N_TAIL, offset_k], full_b)
             else:
                 tlx.async_descriptor_load(
                     b_desc,
@@ -140,11 +165,11 @@ def _run_producer(M, N, K, a_desc, b_desc, a, b, bars_empty_a, bars_full_a, bars
                     [offset_bn, offset_k],
                     full_b,
                 )
-            if N_TAIL > 0:
-                tlx.async_descriptor_load(b_tail_desc, tlx.local_view(b_tail, buf), [offset_bn + BN, offset_k], full_b)
-            if N_TAIL2 > 0:
-                tlx.async_descriptor_load(b_tail2_desc, tlx.local_view(b_tail2, buf),
-                                          [offset_bn + BN + N_TAIL, offset_k], full_b)
+                if N_TAIL > 0:
+                    tlx.async_descriptor_load(b_tail_desc, tlx.local_view(b_tail, buf), [offset_bn + BN, offset_k], full_b)
+                if N_TAIL2 > 0:
+                    tlx.async_descriptor_load(b_tail2_desc, tlx.local_view(b_tail2, buf),
+                                              [offset_bn + BN + N_TAIL, offset_k], full_b)
 
             # The second consumer's A tile; a 64-row tile has a single consumer.
             if NUM_MMA_GROUPS == 2:
@@ -180,7 +205,8 @@ def _run_producer(M, N, K, a_desc, b_desc, a, b, bars_empty_a, bars_full_a, bars
 
 @triton.jit
 def _consume_tile(K, a, b, bars_empty_a, bars_full_a, bars_empty_b, bars_full_b, buf, phase, consumer_id: tl.constexpr,
-                  BK: tl.constexpr, NUM_STAGES: tl.constexpr, A_ROW_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr):
+                  BK: tl.constexpr, NUM_STAGES: tl.constexpr, A_ROW_MAJOR: tl.constexpr, B_ROW_MAJOR: tl.constexpr,
+                  B_ROWS: tl.constexpr = 0):
     last_buf = buf
     a_index = buf + NUM_STAGES * consumer_id
     full_a = tlx.local_view(bars_full_a, a_index)
@@ -190,6 +216,8 @@ def _consume_tile(K, a, b, bars_empty_a, bars_full_a, bars_empty_b, bars_full_b,
 
     data_a = tlx.local_view(a, a_index)
     data_b = tlx.local_view(b, buf)
+    if B_ROWS > 0:
+        data_b = tlx.local_slice(data_b, [0, 0], [B_ROWS, BK])
     a_operand = data_a if A_ROW_MAJOR else tlx.local_trans(data_a)
     b_operand = data_b if B_ROW_MAJOR else tlx.local_trans(data_b)
     acc = tlx.async_dot(a_operand, b_operand)
@@ -208,6 +236,8 @@ def _consume_tile(K, a, b, bars_empty_a, bars_full_a, bars_empty_b, bars_full_b,
 
         data_a = tlx.local_view(a, a_index)
         data_b = tlx.local_view(b, buf)
+        if B_ROWS > 0:
+            data_b = tlx.local_slice(data_b, [0, 0], [B_ROWS, BK])
         a_operand = data_a if A_ROW_MAJOR else tlx.local_trans(data_a)
         b_operand = data_b if B_ROW_MAJOR else tlx.local_trans(data_b)
         acc = tlx.async_dot(a_operand, b_operand, acc)
