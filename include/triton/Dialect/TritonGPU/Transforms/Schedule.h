@@ -29,7 +29,8 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
                           triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
                           int numStages,
                           llvm::DenseMap<Operation *, int> &opLatency,
-                          bool filterSmall = true);
+                          bool filterSmall = true,
+                          bool allowUnalignedTMA = false);
 
 }; // namespace gpu
 
