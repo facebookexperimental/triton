@@ -824,9 +824,16 @@ Value getThreadId(OpBuilder &rewriter, Location loc) {
 
   // For the mask, use the total number of warps if available (for warp
   // specialization). This ensures threads beyond the original numWarps are
-  // not incorrectly masked to lower thread IDs.
+  // not incorrectly masked to lower thread IDs. A helper that carries a warp
+  // ID offset is instead shared by equal-sized partitions modulo its own warp
+  // count (see annotateWarpIdOffsets), so it keeps the function-local mask to
+  // fold its thread ID into [0, numWarps * threadsPerWarp).
   int upperBound = numWarps * threadsPerWarp;
-  if (auto mod = lookupPt->getParentOfType<ModuleOp>()) {
+  auto func = lookupPt->getParentOfType<FunctionOpInterface>();
+  bool hasWarpIdOffset =
+      func && func->hasAttr(triton::gpu::AttrWarpIdOffsetName);
+  if (auto mod = lookupPt->getParentOfType<ModuleOp>();
+      mod && !hasWarpIdOffset) {
     if (auto totalNumWarps =
             mod->getAttrOfType<IntegerAttr>("ttg.total-num-warps")) {
       upperBound = totalNumWarps.getInt() * threadsPerWarp;
@@ -843,9 +850,9 @@ Value getThreadId(OpBuilder &rewriter, Location loc) {
 
   std::optional<int> startId =
       getWarpGroupStartThreadId(rewriter.getInsertionBlock());
-  auto func = lookupPt->getParentOfType<FunctionOpInterface>();
   auto offset =
-      func->getAttrOfType<IntegerAttr>(triton::gpu::AttrWarpIdOffsetName);
+      func ? func->getAttrOfType<IntegerAttr>(triton::gpu::AttrWarpIdOffsetName)
+           : IntegerAttr();
   if (!startId && offset)
     startId = offset.getInt() * threadsPerWarp;
   if (startId) {
@@ -2077,8 +2084,9 @@ Value createLLVMIntegerConstant(OpBuilder &builder, Location loc, short width,
 LLVM::CallOp createLLVMCallOp(OpBuilder &builder, Location loc,
                               LLVMFuncOp funcOp, ValueRange args) {
   auto op = LLVM::CallOp::create(builder, loc, funcOp, args);
-  op.getProperties().setOpBundleSizes(builder.getDenseI32ArrayAttr({}));
-  op.getProperties().setOperandSegmentSizes({static_cast<int>(args.size()), 0});
+  op.getProperties().op_bundle_sizes = builder.getDenseI32ArrayAttr({});
+  op.getProperties().operandSegmentSizes = {static_cast<int32_t>(args.size()),
+                                            0};
   return op;
 }
 

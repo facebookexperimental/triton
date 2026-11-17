@@ -58,6 +58,18 @@ def _linear_rowscale_accepts(d):
     return 0 < d["K"] <= 512 and d["K"] % 8 == 0 and d["N"] > 0 and d["N"] % 8 == 0
 
 
+def _pow2(x):
+    return 1 << (x - 1).bit_length()
+
+
+def _paged_decode_gfx950_accepts(d):
+    # The kernel pads QLEN and GROUP to powers of two (GROUP to at least 16 // QLEN) and supports at most 64 padded
+    # rows; QLEN=5, GROUP=12 has 60 real rows but pads to 8 x 16.
+    qlen, group = d["QLEN"], d["GROUP"]
+    return (d["HEAD_DIM"] in (64, 128) and 1 <= qlen <= 8 and group >= 1
+            and _pow2(qlen) * max(16 // _pow2(qlen), _pow2(group)) <= 64)
+
+
 _NORM_MODULES = {
     'sm100': ['layernorm', 'layernorm_add', 'rmsnorm', 'norm_fwd', 'norm_bwd', 'norm_backward_from_normalized'],
     '_softmax': ['softmax', 'softmax_fwd', 'softmax_bwd'], '_fp4': [
@@ -74,8 +86,9 @@ _NORM_MODULES = {
         'rmsnorm_backward_quantize_dx_mxfp8', 'rmsnorm_backward_quantize_dx_mxfp8_precomputed',
         'rmsnorm_backward_quantize_dx_mxfp8_bf16_precomputed',
         'rmsnorm_backward_quantize_dx_mxfp8_from_output_recompute_q_precomputed'
-    ]
+    ], 'gfx950': ['rmsnorm', 'norm_fwd']
 }
+_NORM_ARCHES = {'sm100': ('sm90', 'sm100'), '_softmax': ('sm90', 'sm100'), 'gfx950': ('gfx950', )}
 _NORM_AUTOGRAD = frozenset([
     'layernorm', 'layernorm_add', 'rmsnorm', 'softmax', 'layernorm_mxfp8_with_backward',
     'layernorm_mxfp8_gdpa_with_backward'
@@ -250,6 +263,18 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="mm_mxfp8",
+        arch="gfx1250",
+        variant="persistent_tdm",
+        impl="triton.tlx.ops.kernels.mm_mxfp8.gfx1250:mm_mxfp8",
+        invariant_vocab=_GEMM_DIMS,
+        dtypes=frozenset({"float8_e4m3fn"}),
+        # TDM descriptors need 16-byte-aligned bases; row strides follow from
+        # the K contract.
+        accepts=lambda d: all(ptr % 16 == 0 for ptr in d["base_ptrs"]),
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="mm_mxfp6",
         arch="sm100",
         variant="ws_mxfp6",
@@ -295,6 +320,37 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="grouped_gemm",
+        arch="gfx1250",
+        variant="persistent_tdm",
+        impl="triton.tlx.ops.kernels.grouped_gemm.gfx1250:grouped_gemm",
+        invariant_vocab=_GROUPED_GEMM_DIMS,
+        dtypes=frozenset({"float16"}),
+        # TDM descriptors need 16-byte-aligned bases; canonical row strides
+        # and common N/K are checked by the implementation.
+        accepts=lambda d: all(ptr % 16 == 0 for ptr in d["base_ptrs"]),
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="norm_residual_norm",
+        arch="gfx950",
+        variant="row_per_program",
+        impl="triton.tlx.ops.kernels.fused.norm_residual_norm.gfx950:norm_residual_norm",
+        dtypes=_BF16,
+        # One 8-wave program holds the row in registers as 8-element lanes over 4096-element chunks, in one
+        # tl.arange, so H must be a power of two.
+        accepts=lambda d: d["H"] in (4096, 8192, 16384),
+    ),
+    OpSpec(
+        op="rmsnorm_gate",
+        arch="gfx950",
+        variant="eight_heads_per_program",
+        impl="triton.tlx.ops.kernels.fused.rmsnorm_gate.gfx950:rmsnorm_gate",
+        dtypes=_BF16,
+        # The summation order is that of 32 two-element lanes per 64-element head; a program owns 8 heads.
+        accepts=lambda d: d["head_dim"] == 64 and d["H"] > 0 and d["H"] % 8 == 0,
+    ),
+    OpSpec(
         op="moe",
         arch="gfx950",
         variant="heuristic",
@@ -302,6 +358,35 @@ CATALOG: tuple[OpSpec, ...] = (
         dtypes=_BF16,
         # Tiles have no K/N tail; 256-wide N tiles fall back to 128 when they do not divide I or H.
         accepts=lambda d: all(d[dim] > 0 and d[dim] % 128 == 0 for dim in ("K", "I", "H")),
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="moe_routing",
+        arch="gfx950",
+        variant="wave_rows",
+        impl="triton.tlx.ops.kernels.moe.routing_gfx950:moe_routing",
+        dtypes=frozenset({"float32"}),
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="qk_norm_rope_kv_cache",
+        arch="gfx950",
+        variant="token_rows",
+        impl="triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache.gfx950:qk_norm_rope_kv_cache",
+        dtypes=_BF16,
+        # One program holds a token's q and k heads: power-of-two tiles of at most 4096 elements each.
+        accepts=lambda d: (all(n > 0 and n & (n - 1) == 0 for n in (d["HQ"], d["HK"], d["D"])) and 16 <= d["D"] <= 256
+                           and d["HQ"] * d["D"] <= 4096 and d["HK"] * d["D"] <= 4096),
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="router_gemm",
+        arch="gfx950",
+        variant="bf16x3_split_k",
+        impl="triton.tlx.ops.kernels.router_gemm.gfx950:router_gemm",
+        dtypes=_BF16,
+        # GEMV loads and split-K partitions are powers of two that divide E and K.
+        accepts=lambda d: d["E"] > 0 and d["E"] % 16 == 0 and d["K"] > 0 and d["K"] % 1024 == 0,
         requires=frozenset(),
     ),
     OpSpec(
@@ -624,7 +709,15 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="split_k_mfma",
         impl="triton.tlx.ops.kernels.paged_attn.gfx950_decode:paged_attention_decode",
         dtypes=_FP16,
-        accepts=lambda d: (d["HEAD_DIM"] in (64, 128) and 1 <= d["QLEN"] <= 4 and d["QLEN"] * d["GROUP"] <= 64),
+        accepts=_paged_decode_gfx950_accepts,
+    ),
+    OpSpec(
+        op="paged_attention_prefill",
+        arch="gfx950",
+        variant="tlx_mfma",
+        impl="triton.tlx.ops.kernels.paged_attn.gfx950_prefill:paged_attention_prefill",
+        dtypes=_FP16,
+        accepts=lambda d: d["HEAD_DIM"] == 64 and d["GROUP"] <= 256 and d["GROUP"] & (d["GROUP"] - 1) == 0,
     ),
     OpSpec(
         op="paged_attention_decode_workspace",
@@ -651,10 +744,10 @@ CATALOG: tuple[OpSpec, ...] = (
 
 CATALOG += tuple(
     OpSpec(op=op, arch=arch, variant="row_norm", impl=f"triton.tlx.ops.kernels.norm.{module}:{op}", dtypes=frozenset(
-        {"float16", "bfloat16", "float32"}), supports_backward=op in _NORM_AUTOGRAD)
+        {"float16", "bfloat16", "float32"}), supports_backward=op in _NORM_AUTOGRAD and arch != "gfx950")
     for module, names in _NORM_MODULES.items()
     for op in names
-    for arch in (("sm90", "sm100") if module in ("sm100", "_softmax") else ("sm100", )))
+    for arch in _NORM_ARCHES.get(module, ("sm100", )))
 
 _BY_KEY = {(s.op, s.arch): s for s in CATALOG}
 assert len(_BY_KEY) == len(CATALOG), "duplicate (op, arch) in CATALOG"

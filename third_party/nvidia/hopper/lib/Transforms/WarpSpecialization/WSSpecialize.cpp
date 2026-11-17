@@ -18,6 +18,7 @@
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
@@ -730,6 +731,136 @@ static SmallVector<Operation *> topologicalSort(ArrayRef<Operation *> opList) {
   return sortedOpList;
 }
 
+// True if `op` or an op nested in it may read or write memory. Ops without a
+// memory effect interface count as touching memory.
+static bool mayReadOrWriteMemory(Operation *op) {
+  return op
+      ->walk([](Operation *nested) {
+        if (nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
+          return WalkResult::advance();
+        auto iface = dyn_cast<MemoryEffectOpInterface>(nested);
+        if (!iface || iface.hasEffect<MemoryEffects::Read>() ||
+            iface.hasEffect<MemoryEffects::Write>())
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+static bool mayWriteMemory(Operation *op) {
+  return op
+      ->walk([](Operation *nested) {
+        if (nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
+          return WalkResult::advance();
+        auto iface = dyn_cast<MemoryEffectOpInterface>(nested);
+        if (!iface || iface.hasEffect<MemoryEffects::Write>())
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+// The kernel argument a global memory access is based on, or null if unknown.
+static Value getAccessedKernelArg(Operation *op) {
+  Value ptr;
+  if (auto load = dyn_cast<tt::LoadOp>(op))
+    ptr = load.getPtr();
+  else if (auto store = dyn_cast<tt::StoreOp>(op))
+    ptr = store.getPtr();
+  else if (auto rmw = dyn_cast<tt::AtomicRMWOp>(op))
+    ptr = rmw.getPtr();
+  else if (auto cas = dyn_cast<tt::AtomicCASOp>(op))
+    ptr = cas.getPtr();
+  else if (auto load = dyn_cast<tt::DescriptorLoadOp>(op))
+    ptr = load.getDesc();
+  else if (auto store = dyn_cast<tt::DescriptorStoreOp>(op))
+    ptr = store.getDesc();
+  else
+    return {};
+  while (Operation *def = ptr.getDefiningOp()) {
+    if (auto addPtr = dyn_cast<tt::AddPtrOp>(def))
+      ptr = addPtr.getPtr();
+    else if (auto splat = dyn_cast<tt::SplatOp>(def))
+      ptr = splat.getSrc();
+    else if (auto broadcast = dyn_cast<tt::BroadcastOp>(def))
+      ptr = broadcast.getSrc();
+    else if (auto makeDesc = dyn_cast<tt::MakeTensorDescOp>(def))
+      ptr = makeDesc.getBase();
+    else
+      return {};
+  }
+  return ptr;
+}
+
+// True if running `a` after `b` instead of before it may change what either
+// one reads or writes. Accesses based on different kernel arguments are
+// treated as accesses to different buffers.
+static bool mayConflict(Operation *a, Operation *b) {
+  if (!mayReadOrWriteMemory(a) || !mayReadOrWriteMemory(b))
+    return false;
+  if (!mayWriteMemory(a) && !mayWriteMemory(b))
+    return false;
+  Value argA = getAccessedKernelArg(a);
+  Value argB = getAccessedKernelArg(b);
+  return !argA || !argB || argA == argB;
+}
+
+// Untagged ops after the warp-specialized loop read what the loop wrote, so
+// they have to run after the partitions finish: move them after `wsOp`. An
+// untagged op has to stay ahead of `wsOp` when a specialized op depends on it
+// (directly or through other untagged ops), or when moving it past a later
+// specialized op may reorder their memory accesses. Warn if such an op
+// touches memory, since it then runs before the loop's writes land.
+static void moveUntaggedPostLoopOps(Block *block, ttg::WarpSpecializeOp wsOp,
+                                    const DenseSet<Operation *> &opsInList) {
+  auto loopIt = llvm::find_if(*block, [](Operation &op) {
+    return op
+        .walk([](Operation *nested) {
+          return nested->hasAttr(tt::kWarpSpecializeAttrName)
+                     ? WalkResult::interrupt()
+                     : WalkResult::advance();
+        })
+        .wasInterrupted();
+  });
+  if (loopIt == block->end() || &*loopIt == wsOp.getOperation())
+    return;
+
+  SmallVector<Operation *> postLoopOps;
+  for (Operation &op :
+       llvm::make_range(std::next(loopIt), wsOp->getIterator())) {
+    if (!opsInList.count(&op))
+      postLoopOps.push_back(&op);
+  }
+
+  DenseSet<Operation *> pinned;
+  for (Operation *op : llvm::reverse(postLoopOps)) {
+    bool neededBySpecializedOp =
+        llvm::any_of(op->getUsers(), [&](Operation *u) {
+          Operation *user = block->findAncestorOpInBlock(*u);
+          return user && (opsInList.count(user) || pinned.count(user));
+        });
+    bool conflictsWithLaterSpecializedOp = llvm::any_of(
+        llvm::make_range(std::next(op->getIterator()), wsOp->getIterator()),
+        [&](Operation &later) {
+          return opsInList.count(&later) && mayConflict(op, &later);
+        });
+    if (neededBySpecializedOp || conflictsWithLaterSpecializedOp)
+      pinned.insert(op);
+  }
+
+  for (Operation *op : postLoopOps) {
+    if (!pinned.count(op)) {
+      op->moveBefore(block->getTerminator());
+      continue;
+    }
+    if (mayReadOrWriteMemory(op))
+      op->emitWarning("this op runs after the warp-specialized loop but a "
+                      "later warp-specialized op depends on it or may access "
+                      "the same memory, so it stays ahead of the partitions "
+                      "and may not see the loop's writes");
+  }
+}
+
 } // namespace
 
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
@@ -786,23 +917,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   auto wsOp = ttg::WarpSpecializeOp::create(impB, dummyTypes, partitionNumWarps,
                                             nTaskIds.size() - 1);
 
-  // Untagged ops after the last specialized op must run after the partitions,
-  // so keep them after the warp_specialize op.
-  SmallVector<Operation *> postWsOps;
-  bool foundSpecializedOp = false;
-  for (Operation &op : llvm::reverse(lastBlock->without_terminator())) {
-    if (&op == wsOp.getOperation())
-      continue;
-    if (opsInList.count(&op)) {
-      foundSpecializedOp = true;
-      break;
-    }
-    postWsOps.push_back(&op);
-  }
-  if (foundSpecializedOp) {
-    for (Operation *op : llvm::reverse(postWsOps))
-      op->moveBefore(returnOp);
-  }
+  moveUntaggedPostLoopOps(lastBlock, wsOp, opsInList);
 
   // Copy partition types attribute from the loop to the WarpSpecializeOp.
   // This is needed by OptimizePartitionWarps for type-aware warp assignment.

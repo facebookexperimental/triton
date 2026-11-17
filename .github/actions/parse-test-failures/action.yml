@@ -3,6 +3,10 @@ description: >-
   Parse a test job's JUnit XML or LIT log into the failure list that
   report-nightly-failure.yml and reconcile-nightly-issues.yml take.
 inputs:
+  scripts:
+    description: Directory containing reporting parsers from the same revision as this action
+    required: false
+    default: .github/scripts
   workflow:
     description: Workflow name; scopes the issue titles
     required: true
@@ -20,6 +24,14 @@ inputs:
     description: Space-separated JUnit XML paths
     required: false
     default: ""
+  completed-junit:
+    description: XML paths whose test steps completed, excluding skipped or cancelled steps
+    required: false
+    default: ""
+  completed-lit:
+    description: Whether the LIT step completed, rather than being skipped or cancelled
+    required: false
+    default: "false"
   budget:
     description: Space-separated <xml>=<timeout-minutes> pairs; reports passing steps close to timing out
     required: false
@@ -40,6 +52,9 @@ outputs:
   failures:
     description: JSON failure list
     value: ${{ steps.parse.outputs.failures }}
+  recovery:
+    description: Encoded passing-test evidence from completed steps
+    value: ${{ steps.parse.outputs.recovery }}
 runs:
   using: composite
   steps:
@@ -52,10 +67,13 @@ runs:
         FAILED: ${{ inputs.failed }}
         BUCKET: ${{ inputs.bucket }}
         JUNIT: ${{ inputs.junit }}
+        COMPLETED_JUNIT: ${{ inputs.completed-junit }}
+        COMPLETED_LIT: ${{ inputs.completed-lit }}
         BUDGET: ${{ inputs.budget }}
         LIT_LOG: ${{ inputs.lit-log }}
         GPU_UNHEALTHY: ${{ inputs.gpu-unhealthy }}
         SETUP_SCRIPT: ${{ inputs.setup-script }}
+        SCRIPTS: ${{ inputs.scripts }}
       run: |
         [[ -z "${SETUP_SCRIPT}" ]] || . "${SETUP_SCRIPT}"
         ARGS=(--workflow "${WORKFLOW}" --job "${JOB}" --bucket "${BUCKET}")
@@ -63,10 +81,11 @@ runs:
         # The list reaches later jobs through GITHUB_OUTPUT. Keep it out of the
         # job log, which internal CI signal cards read for their highlight.
         if [[ -n "${LIT_LOG}" ]]; then
-          python3 .github/scripts/parse_lit_failures.py --log "${LIT_LOG}" "${ARGS[@]}" > /dev/null
+          [[ "${COMPLETED_LIT}" != true ]] || ARGS+=(--completed)
+          python3 "${SCRIPTS}/parse_lit_failures.py" --log "${LIT_LOG}" "${ARGS[@]}" > /dev/null
         else
           for b in ${BUDGET}; do ARGS+=(--budget "${b}"); done
           [[ "${GPU_UNHEALTHY}" != true ]] || ARGS+=(--gpu-unhealthy)
           # shellcheck disable=SC2086  # JUNIT is a space-separated list
-          python3 .github/scripts/parse_junit_failures.py --junit ${JUNIT} "${ARGS[@]}" > /dev/null
+          python3 "${SCRIPTS}/parse_junit_failures.py" --junit ${JUNIT} "${ARGS[@]}" --completed-junit ${COMPLETED_JUNIT} > /dev/null
         fi

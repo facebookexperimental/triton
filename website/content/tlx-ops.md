@@ -38,8 +38,10 @@ Implemented today:
 mm/sm100.py
 mm_bias_grad/sm100.py
 mm_mxfp8/sm100.py
+mm_mxfp8/gfx1250.py
 mm_mxfp6/sm100.py
 mm_mxfp6/gfx950.py
+grouped_gemm/gfx1250.py
 flash_attn/sm100.py
 flash_attn/gfx950.py
 flash_attn_mxfp8/sm100.py
@@ -57,7 +59,7 @@ Current kernel selections for the rest of the catalog:
 kernels/
     mm/                   sm90.py  sm100.py  gfx942.py  gfx950.py
     mm_bias_grad/         sm100.py
-    mm_mxfp8/             sm100.py
+    mm_mxfp8/             sm100.py  gfx950.py  gfx1250.py
     mm_mxfp6/             sm100.py  gfx950.py
     addmm/                gfx942.py
     bmm/                  gfx942.py
@@ -69,7 +71,7 @@ kernels/
     hstu_cross_attn/      gfx950.py                     (fwd + bwd, split-KV)
     kda/                  sm100.py
     gdpa/                 sm100.py  gfx950.py
-    grouped_gemm/         sm100.py  gfx950.py
+    grouped_gemm/         sm100.py  gfx950.py  gfx1250.py
     grouped_gemm_mxfp8/   sm100.py  gfx950.py
     addmm_glu/            gfx950.py
     paged_decode/         gfx950.py
@@ -155,7 +157,7 @@ Run them from `fbsource/fbcode`:
 CUDA_VISIBLE_DEVICES=1 buck2 run @mode/opt -m ovr_config//triton:beta \
   -c fbcode.nvcc_arch=b200a -m ovr_config//third-party/cuda/constraints:12.8 \
   --agent-context direct_call=true --agent-context reason="Check fused weight and bias gradients" \
-  fbsource//third-party/triton/beta/triton:py_tlx_mm_bias_grad_test -- -s --tb=short -v
+  fbsource//third-party/triton/beta/triton:py_tlx_ops_blackwell_test -- -s --tb=short -v
 ```
 
 ### Benchmark against unfused PT2
@@ -266,6 +268,9 @@ Computes `a @ b.T` from contiguous E4M3 `a` `[M, K]` and `b` `[N, K]` with one
 E8M0 scale per 32 K values, returning contiguous BF16 `[M, N]`. `M`, `N` and
 `K` must be multiples of 128. This is a forward-only SM100 operation promoted
 from `tutorials/blackwell_gemm_ws_mxfp8.py`.
+On gfx1250, `M` and `N` must be multiples of 256 and `K` at least 256; that
+implementation is promoted from `tutorials/amd_mxfp_gemm_gfx1250` and has one
+shape-picked schedule, so `space="full"` and `"heuristic"` are the same.
 
 - `sf_layout="natural"`: `a_scale` is `[M, K // 32]` and `b_scale` is
   `[N, K // 32]`; they are packed into the blocked layout on every call.

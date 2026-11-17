@@ -62,6 +62,9 @@ constexpr static char AttrClusterDimZ[] = "ttg.cluster-dim-z";
 // diverge behavior in the warp specialization lowering to LLVM.
 constexpr static char AttrSingleWarpSpecializeName[] =
     "ttg.single-warp-specialize";
+// Set on a `ttg.warp_specialize` op whose following code touches memory, so the
+// single-WS lowering has to join the partitions before that code runs.
+constexpr static char AttrWarpSpecializeJoinName[] = "ttg.warp_specialize.join";
 
 // Find the contextual number of warps on which this operation is executed.
 int lookupNumWarps(Operation *op);
@@ -387,8 +390,6 @@ SmallVector<unsigned> getCTAsPerCGA(Attribute layout);
 
 SmallVector<unsigned> getCTASplitNum(Attribute layout);
 
-SmallVector<unsigned> getCTAOrder(Attribute layout);
-
 // Returns the "logical" shape per CTA.
 // When shape and CTASplitNum have different number of dimensions, we assume
 // only the last N between common dimensions are split.
@@ -504,9 +505,15 @@ getDefaultBlockedEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
 // The layout of `op`'s first operand with an exact mixed-radix layout.
 FailureOr<LinearLayout> getExactNpotOperandLayout(Operation *op);
 
-// Under TRITON_ALLOW_NPOT, an NPOT `shape`'s mixed-radix layout with `vector`
-// elements along order[0] (default the last dim) and odd digits slowest. Fails
-// if pow2 or CTAs > 1.
+// Under TRITON_ALLOW_NPOT, an NPOT `shape`'s mixed-radix layout: a Blocked
+// layout with `sizePerThread` on the pow2 parts, then each odd factor as a
+// register digit slowest. Fails if pow2 or CTAs > 1.
+FailureOr<LinearEncodingAttr>
+getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
+                      int numWarps, int threadsPerWarp, int numCTAs,
+                      ArrayRef<unsigned> sizePerThread,
+                      ArrayRef<unsigned> order = {});
+// Same, with `vector` elements on order[0] (default the last dim).
 FailureOr<LinearEncodingAttr>
 getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
                       int numWarps, int threadsPerWarp, int numCTAs,

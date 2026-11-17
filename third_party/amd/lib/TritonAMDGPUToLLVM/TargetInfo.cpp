@@ -125,10 +125,6 @@ Value printfPromoteValue(RewriterBase &rewriter, Value value, bool isSigned) {
 }
 } // namespace
 
-llvm::AMDGPU::IsaVersion TargetInfo::getIsaVersion() const {
-  return llvm::AMDGPU::getIsaVersion(getArch());
-}
-
 llvm::AMDGPU::GPUKind TargetInfo::getGPUKind() const {
   return llvm::AMDGPU::parseArchAMDGCN(getArch());
 }
@@ -633,10 +629,6 @@ bool TargetInfo::warpReduceInnerTree(RewriterBase &rewriter, Location loc,
   // count-up order.
   if (numLaneToReduce != getWarpSize() || getWarpSize() != 64)
     return false;
-  // DPP warp reduce requires gfx90a+ (CDNA2+) or gfx11+ (RDNA3+).
-  auto v = getIsaVersion();
-  if (!((v.Major == 9 && (v.Minor > 0 || v.Stepping >= 0xa)) || v.Major >= 11))
-    return false;
   Operation *reduxOp = op.getSingleCombiner();
   if (!reduxOp)
     return false;
@@ -666,11 +658,6 @@ bool TargetInfo::warpReduce(
       warpReduceSwap16or32(rewriter, loc, acc, op, numLaneToReduce, interleave))
     return true;
   if (numLaneToReduce != getWarpSize())
-    return false;
-  // DPP warp reduce requires gfx90a+ (CDNA2+) or gfx11+ (RDNA3+).
-  // Pre-CDNA2 GFX9 (gfx906/gfx908) and GFX10 (RDNA1/2) are excluded.
-  auto v = getIsaVersion();
-  if (!((v.Major == 9 && (v.Minor > 0 || v.Stepping >= 0xa)) || v.Major >= 11))
     return false;
 
   Operation *reduxOp = op.getSingleCombiner();
@@ -791,16 +778,16 @@ void TargetInfo::assertFail(RewriterBase &rewriter, Location loc,
       rewriter, loc, IntegerType::get(ctx, 64), msgBuffer.size_in_bytes());
   SmallVector<Value> callArgs = {msgValue, msgLen};
   b.call(assertFailFunc, callArgs);
+}
 
-  // Set block barrier before aborting kernel, give a chance for all
-  // the threads in a block to check/print the assert failure.
-  b.barrier(triton::gpu::AddrSpace::All);
+void TargetInfo::assertTrap(RewriterBase &rewriter, Location loc) const {
   // Perform the trap to abort the kernel.
   // Use inline asm "s_trap 2" instead of LLVM::Trap because llvm.trap is
   // noreturn, inserting 'unreachable' which causes StructurizeCFG to defer
   // the block past convergence points, making ConSan lock releases
-  // unreachable and causing deadlocks. The noinline helper above prevents
-  // the printf code from being inlined and bloating the kernel.
+  // unreachable and causing deadlocks. The noinline helper in assertFail
+  // prevents the printf code from being inlined and bloating the kernel.
+  auto *ctx = rewriter.getContext();
   LLVM::InlineAsmOp::create(
       rewriter, loc, LLVM::LLVMVoidType::get(ctx), /*operands=*/ValueRange{},
       "s_trap 2", /*constraints=*/"",
@@ -862,6 +849,10 @@ bool TargetInfo::supportsMultiCTALaunch() const {
   return targetFeatures.supportsMultiCTALaunch();
 }
 
+bool TargetInfo::supportsMulticast() const {
+  return targetFeatures.supportsMulticast();
+}
+
 unsigned TargetInfo::getMaxMulticastMaskPopcount() const {
   return targetFeatures.getMaxMulticastMaskPopcount();
 }
@@ -909,6 +900,14 @@ bool TargetInfo::supportsCvtPkScalePk8() const {
   return targetFeatures.supportsCvtPkScalePk8();
 }
 
+bool TargetInfo::supportsCvtPkScalePk8Upcast() const {
+  return targetFeatures.supportsCvtPkScalePk8Upcast();
+}
+
+bool TargetInfo::supportsCvtPkScalePk8Block16() const {
+  return targetFeatures.supportsCvtPkScalePk8Block16();
+}
+
 bool TargetInfo::supportsHwScaledUpcast() const {
   return targetFeatures.supportsHwScaledUpcast();
 }
@@ -921,11 +920,14 @@ bool TargetInfo::supportDppBroadcast() const {
   return targetFeatures.supportDppBroadcast();
 }
 
+bool TargetInfo::isGFX1250Strict() const {
+  return targetFeatures.isGFX1250Strict();
+}
+
 std::pair<mlir::triton::gpu::LocalMemOpTile, mlir::triton::gpu::LocalMemOpTile>
 TargetInfo::getSharedLdStTiles(int32_t vecBitwidth) const {
   switch (getISAFamily()) {
   case ISAFamily::CDNA3:
-  case ISAFamily::RDNA2:
   case ISAFamily::RDNA3:
   case ISAFamily::RDNA4m:
     if (vecBitwidth == 128)

@@ -545,7 +545,8 @@ def TT_ExpandDimsOp
 }
 
 def TT_ReshapeOp : TT_Op<"reshape", [Pure, SameOperandsAndResultElementType,
-                                     MixedRadixLayoutTrait]> {
+                                     MixedRadixLayoutTrait,
+                                     EfficientLayoutOpInterface]> {
   let summary = "reinterpret a tensor to a different shape. It may change "
                 "elements order if the attribute is set.";
   let description = [{
@@ -843,6 +844,11 @@ def TT_ReduceOp
       // indicating that the reduction has a defined ordering that must be
       // preserved by compiler passes.
       bool hasDefinedOrdering();
+
+      // Proves that exchanging the two input tuples preserves every result,
+      // comparing pure expression DAGs modulo commutative operand order.
+      // Returns false when the proof fails or the region is unsupported.
+      bool isCommutative();
     }];
 }
 
@@ -1029,7 +1035,7 @@ def TT_HistogramOp
 //
 def TT_GatherOp
     : TT_Op<"gather", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>,
-                       MixedRadixLayoutTrait]> {
+                       MixedRadixLayoutTrait, EfficientLayoutOpInterface]> {
   let summary = "local gather operation";
   let description = [{
     Gather elements from the input tensor using the indices tensor along a

@@ -382,8 +382,10 @@ static void disableLICM(LLVM::BrOp latchBr) {
 
 // Single-WS partitions exit without rejoining the default warps, so code after
 // the warp_specialize op needs a barrier to see the partitions' writes.
+// AllocateWarpGroups decides this on TTGIR, before kernel-exit code such as the
+// TMEM dealloc is added after the op.
 static bool needsSingleWarpSpecializeJoin(WarpSpecializeOp ws) {
-  return !isa<LLVM::ReturnOp>(ws->getNextNode());
+  return ws->hasAttr(AttrWarpSpecializeJoinName);
 }
 
 static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,

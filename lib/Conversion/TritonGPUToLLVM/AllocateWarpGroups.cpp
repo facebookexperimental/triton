@@ -8,6 +8,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 namespace mlir::triton::gpu {
 #define GEN_PASS_DEF_TRITONGPUALLOCATEWARPGROUPS
@@ -60,6 +61,88 @@ static void enableSingleWarpSpecializeForAutoWS(ModuleOp mod) {
   });
   if (hasAutoWSTag)
     setHasSingleWarpSpecialize(mod, true);
+}
+
+// True if `op` or an op nested in it may read or write memory. Ops without a
+// memory effect interface count as touching memory.
+static bool mayReadOrWriteMemory(Operation *op) {
+  return op
+      ->walk([](Operation *nested) {
+        if (nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
+          return WalkResult::advance();
+        auto iface = dyn_cast<MemoryEffectOpInterface>(nested);
+        if (!iface || iface.hasEffect<MemoryEffects::Read>() ||
+            iface.hasEffect<MemoryEffects::Write>())
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+static bool isTMAStoreLikeOp(Operation *op) {
+  return isa<nvidia_gpu::AsyncTMACopyLocalToGlobalOp,
+             nvidia_gpu::AsyncTMAReduceOp, nvidia_gpu::AsyncTMAScatterOp,
+             nvidia_gpu::AsyncStoreOp>(op);
+}
+
+// Wait for every TMA store a region issued to finish writing global memory
+// before the region ends.
+static void drainTMAStoresAtRegionEnd(Region &region) {
+  bool hasTMAStore = region
+                         .walk([](Operation *op) {
+                           return isTMAStoreLikeOp(op) ? WalkResult::interrupt()
+                                                       : WalkResult::advance();
+                         })
+                         .wasInterrupted();
+  if (!hasTMAStore)
+    return;
+  for (Block &block : region) {
+    Operation *terminator = block.getTerminator();
+    if (!isa<WarpYieldOp, WarpReturnOp>(terminator))
+      continue;
+    OpBuilder b(terminator);
+    nvidia_gpu::TMAStoreWaitOp::create(b, terminator->getLoc(),
+                                       /*pendings=*/0, /*read_only=*/false);
+  }
+}
+
+// Code after a single-WS `ttg.warp_specialize` op that touches memory may read
+// what the partitions wrote, but single-WS partitions exit without rejoining
+// the default warps. Mark the op for a join barrier and make the regions drain
+// their TMA stores first: a TMA store wait only covers the slots a region
+// reuses, so stores can still be writing global memory when a region ends.
+// When nothing after the op touches memory, drop the barrier invalidations
+// that follow it: they only retire barriers at kernel exit, and without a join
+// they can run while a partition still waits on them.
+static void annotateWarpSpecializeJoin(WarpSpecializeOp ws, bool instrumented) {
+  Block *block = ws->getBlock();
+  bool needsJoin = instrumented || !isa<FuncOp>(ws->getParentOp()) ||
+                   !isa<ReturnOp>(block->getTerminator());
+  SmallVector<Operation *> invals;
+  for (Operation &op :
+       llvm::make_range(std::next(ws->getIterator()), block->end())) {
+    if (op.hasTrait<OpTrait::IsTerminator>())
+      break;
+    if (isa<nvidia_gpu::InvalBarrierOp>(op)) {
+      invals.push_back(&op);
+      continue;
+    }
+    if (isa<LocalDeallocOp>(op))
+      continue;
+    if (mayReadOrWriteMemory(&op))
+      needsJoin = true;
+  }
+
+  if (!needsJoin) {
+    for (Operation *inval : invals)
+      inval->erase();
+    return;
+  }
+
+  ws->setAttr(AttrWarpSpecializeJoinName, UnitAttr::get(ws.getContext()));
+  drainTMAStoresAtRegionEnd(ws.getDefaultRegion());
+  for (Region *partition : ws.getPartitionRegions())
+    drainTMAStoresAtRegionEnd(*partition);
 }
 
 // Given a `ttg.warp_specialize` with a certain number of existing warps, pad it
@@ -161,6 +244,13 @@ struct AllocateWarpGroups
     ModuleOp mod = getOperation();
     bool laterInstrumentation = instrumented.getValue();
     enableSingleWarpSpecializeForAutoWS(mod);
+    bool singleWS = hasSingleWarpSpecialize(mod);
+    if (singleWS) {
+      SmallVector<WarpSpecializeOp> wsOps;
+      mod.walk([&](WarpSpecializeOp op) { wsOps.push_back(op); });
+      for (WarpSpecializeOp op : wsOps)
+        annotateWarpSpecializeJoin(op, laterInstrumentation);
+    }
 
     // First determine the maximum number of extra warps.
     int maxExtraWarps = 0;

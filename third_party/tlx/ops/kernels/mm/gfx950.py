@@ -14061,6 +14061,7 @@ def _wg_store_cached_b_output(
     prefetched_bias,
     PREFETCH_BIAS: tl.constexpr,
     FUSED_GROUP_FRAGMENTS: tl.constexpr,
+    STORE_CACHE: tl.constexpr,
 ):
     group_m: tl.constexpr = 16 * warps_m
     if warps_m == 4 and wide:
@@ -14100,7 +14101,7 @@ def _wg_store_cached_b_output(
                     ADD_BIAS,
                 )
                 value = tlx.require_layout(value.to(c_ptr.dtype.element_ty), store_layout)
-                tlx.buffer_store(value, base, offsets, contiguity=8, cache=".cs")
+                tlx.buffer_store(value, base, offsets, contiguity=8, cache=STORE_CACHE)
     else:
         _wg_store_mi16_wave_grid_output(
             c_ptr,
@@ -14125,7 +14126,7 @@ def _wg_store_cached_b_output(
             False,
             mma,
             ADD_BIAS,
-            store_cache=".cs",
+            store_cache=STORE_CACHE,
             prefetched_bias=prefetched_bias,
             PREFETCH_BIAS=PREFETCH_BIAS,
             FUSED_GROUP_FRAGMENTS=FUSED_GROUP_FRAGMENTS,
@@ -14158,6 +14159,7 @@ def _wg_kernel_cached_b_lds(
     ADD_BIAS: tl.constexpr,
     PREFETCH_BIAS: tl.constexpr,
     FUSED_GROUP_FRAGMENTS: tl.constexpr,
+    STORE_CACHE: tl.constexpr = ".cs",
 ):
     tl.static_assert(K % 64 == 0 and K >= 128 and K <= 256)
     tl.static_assert(WARPS_M == 2 or WARPS_M == 4)
@@ -14270,6 +14272,7 @@ def _wg_kernel_cached_b_lds(
             prefetched_bias,
             PREFETCH_BIAS,
             FUSED_GROUP_FRAGMENTS,
+            STORE_CACHE,
         )
 
 
@@ -17360,7 +17363,6 @@ def _launch_row_major_direct(a, b, out, plan, bias=None):
         TILES_PER_PROBLEM=tiles_per_problem,
         PROGRAM_COUNT=program_count,
         ADD_BIAS=bias is not None,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
         num_stages=1,
         **plan,
     )
@@ -18032,9 +18034,8 @@ def _register_kernel_impl(  # noqa: TR001
         tl.store(c_ptr + output_offsets, acc, mask=mask)
 
 
-def _register_launch_options(m, n, k, config):
-    disable_agpr = ((k == 256 and n > 256) or (k > 512 and (k % _BLOCK_K != 0 or m * n <= 2 * 1024 * 1024)))
-    launch_options = ({"llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"), )} if disable_agpr else {})
+def _register_launch_options(config):
+    launch_options = {}
     if config["BLOCK_K"] == 128 and config["num_stages"] == 3:
         launch_options["reverse_local_assignment"] = True
         if config["BLOCK_M"] == 64 and config["BLOCK_N"] == 64:
@@ -18165,7 +18166,7 @@ def _dense_tn_register_launcher(
     del a_strides, b_strides, out_strides
     config = dict(config_items)
     grid = (triton.cdiv(m, config["BLOCK_M"]) * triton.cdiv(n, config["BLOCK_N"]), )
-    launch_options = _register_launch_options(m, n, k, config)
+    launch_options = _register_launch_options(config)
     compile_lock = threading.Lock()
     launcher = None
 
@@ -18223,7 +18224,7 @@ def _launch_register_plan(a, b, *, config, bias=None, out=None, _validated=False
             out.stride(),
             tuple(sorted(config.items())),
         )(a, b, out)
-    launch_options = _register_launch_options(m, n, k, config)
+    launch_options = _register_launch_options(config)
     grid = (triton.cdiv(m, config["BLOCK_M"]) * triton.cdiv(n, config["BLOCK_N"]), )
     kernel_args = _register_kernel_args(a, b, bias, out)
     _register_kernel_impl[grid](
@@ -18715,7 +18716,7 @@ def _launch_split_register(a, b, out, plan, *, fallback_plan=None, workspace=Non
     use_i64_a = (m - 1) * a.stride(0) + (k_extent - 1) * a.stride(1) >= 1 << 31
     use_i64_b = (k_extent - 1) * b.stride(0) + (n - 1) * b.stride(1) >= 1 << 31
     pipe_iters = (16 if (k == 16 * split_k * block_k and a.stride() == (k, 1) and b.stride() == (1, k)) else 0)
-    launch_options = dict(_register_launch_options(m, n, k, plan))
+    launch_options = dict(_register_launch_options(plan))
     for key, value in plan.items():
         if key not in _SPLIT_REGISTER_HOST_KEYS:
             launch_options[key] = value
@@ -18917,7 +18918,6 @@ def _paired_b_has_padding(b):
 def _range_register_launch_options(a, b, config):
     options = {}
     if a.dtype == torch.bfloat16 and config["BLOCK_K"] == 64:
-        options["llvm_fn_attrs"] = (("amdgpu-agpr-alloc", "0,0"), )
         square = config["BLOCK_M"] == config["BLOCK_N"] == 256
         if (not square and config["BLOCK_M"] >= 128 and b.shape[1] % config["BLOCK_N"] != 0 and b.stride(1) == 1
                 and a.shape[0] >= 8 * b.shape[1]):
@@ -19219,7 +19219,6 @@ NUM_XCDS = 8
 
 MIN_K = 2 * BLOCK_K  # pipeline prefetches 2 whole K-tiles; the rest goes to the masked tail
 KERNEL_NAME = "a16w16_8wave"
-_LLVM_ATTRS = (("amdgpu-agpr-alloc", "0,0"), )
 _READY_VALUE = 3
 
 
@@ -19450,8 +19449,7 @@ def _launch_register(a, b, bias=None, config=None, out=None):
             raise ValueError("Bias and matrix operands must have matching device and dtype")
     if out is None:
         out = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    disable_agpr = (K == 256 and N > 256) or (K > 512 and (K % BLOCK_K != 0 or M * N <= 2 * 1024 * 1024))
-    launch_options = {"llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"), )} if disable_agpr else {}
+    launch_options = {}
     bias_ptr = bias if bias is not None else out
     args = (
         a,
@@ -21088,9 +21086,9 @@ def _launch_lds(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EP
         num_warps=4 if BM == 128 else NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
-        # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
-        # v_accvgpr moves around each mfma). Essential to match the reference perf.
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+        # Only a four-wave work-group leaves AGPRs in the per-wave register budget,
+        # so the VGPR-only pin is a no-op for the eight-wave tile.
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ) if BM == 128 else (),
         enable_sched_group_barrier_scheduler=((M, N, K, a.dtype) not in _LDS_DISABLE_SCHEDULER_SHAPES),
     )
     if SPLIT_K > 1:
@@ -21200,7 +21198,7 @@ def streamk_matmul(a, b):
                                                  b.stride(0), b.stride(1), c.stride(0), c.stride(1), BLOCK_M=BM,
                                                  BLOCK_N=BN, BLOCK_K=BLOCK_K, NUM_XCDS=NUM_XCDS, NUM_CU=NUM_CU,
                                                  GROUP_SIZE_M=GROUP_SIZE_M, **schedule, num_warps=NUM_WARPS,
-                                                 num_stages=1, matrix_instr_nonkdim=16, llvm_fn_attrs=_LLVM_ATTRS)
+                                                 num_stages=1, matrix_instr_nonkdim=16)
     return c
 
 
@@ -21220,7 +21218,6 @@ _iw_NUM_XCDS = 8
 
 _iw_MIN_K = (2 * _iw_BLOCK_K)  # pipeline prefetches 2 whole K-tiles; the rest goes to the masked tail
 _iw_KERNEL_NAME = "a16w16_8wave"
-_iw_LLVM_ATTRS = (("amdgpu-agpr-alloc", "0,0"), )
 _iw_READY_VALUE = 3
 
 # Coalesced SIMD layout for a 128x128 fp16 output quadrant.  Keeping the
@@ -22972,7 +22969,6 @@ def _iw_launch(
     TILE=None,
     K_LIMIT=None,
     DEFER_EPILOGUE=False,
-    DISABLE_AGPR=True,
     REVERSE_LOCAL_ASSIGNMENT=False,
     SINK_INSTS_TO_AVOID_SPILLS=False,
     DISABLE_HIGH_RP_RESCHEDULE=False,
@@ -23061,8 +23057,6 @@ def _iw_launch(
     warps_m, warps_n = WARP_GRID
     assert warps_m * warps_n in (4, 8)
     launch_options = {}
-    if DISABLE_AGPR:
-        launch_options["llvm_fn_attrs"] = (("amdgpu-agpr-alloc", "0,0"), )
     if REVERSE_LOCAL_ASSIGNMENT:
         launch_options["reverse_local_assignment"] = True
     if SINK_INSTS_TO_AVOID_SPILLS:
@@ -23369,7 +23363,6 @@ def _iw_streamk_matmul(
         num_warps=_iw_NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
-        llvm_fn_attrs=_iw_LLVM_ATTRS,
     )
     return c
 
@@ -25328,7 +25321,8 @@ def _launch_optimized_inter_wave(a, b, out, kind, plan=None, bias=None):
     if plan is not None:
         if (kind == "inter_wave" and a.dtype == torch.bfloat16
                 and ((a.shape[0], b.shape[1], a.shape[1]) in _BF16_INTER_WAVE_PROMOTIONS or
-                     (a.shape[0], b.shape[1], a.shape[1]) in _BF16_TRANSPOSED_INTER_WAVE_FALLBACKS)
+                     (a.shape[0], b.shape[1], a.shape[1]) in _BF16_TRANSPOSED_INTER_WAVE_FALLBACKS
+                     or _bf16_prefill_inter_wave_plan(a.shape[0], b.shape[1], a.shape[1]) is not None)
                 and (a.data_ptr() % 16 or b.data_ptr() % 16 or a.stride(1) != 1 or b.stride(0) != 1 or a.stride(0) % 8
                      or b.stride(1) % 8)):
             return _launch_register(a, b, bias=bias, out=out)
@@ -25495,6 +25489,138 @@ _BF16_INTER_WAVE_PROMOTIONS = {
         "STORE_CACHE": ".cs",
     },
 }
+
+# Dense-TN prefill projections keyed by (N, K): (min M, plan).  Paired L2-cold
+# medians over M=2048..32768 measured this plan at or above lds(256, 256, 1)
+# throughout each range; below min M the LDS route stays faster.
+_BF16_PREFILL_INTER_WAVE_MAX_M = 32_768
+_BF16_PREFILL_INTER_WAVE_PLANS = {
+    (2560, 8192): (4096, {
+        "TILE": (256, 256), "SPLIT_K": 1, "WARP_GRID": (2, 4), "GROUP_M_OVERRIDE": 2, "NUM_XCDS_OVERRIDE": 8,
+        "STORE_CACHE": ".cs", "SCHED_MFMA_PER_DWORDX4": 2
+    }),
+    (8192, 2048): (2048, {
+        "TILE": (256, 256), "SPLIT_K": 1, "WARP_GRID": (2, 4), "GROUP_M_OVERRIDE": 2, "NUM_XCDS_OVERRIDE": 1,
+        "STORE_CACHE": ".cs", "SCHED_MFMA_PER_DWORDX4": 2
+    }),
+    (4096, 8192): (3072, {
+        "TILE": (256, 256), "SPLIT_K": 1, "WARP_GRID": (2, 4), "GROUP_M_OVERRIDE": 2, "NUM_XCDS_OVERRIDE": 8,
+        "WORKGROUP_MAPPING": 8, "STORE_CACHE": ".cs", "SCHED_MFMA_PER_DWORDX4": 2, "CACHE_A_CG": True
+    }),
+    (8192, 4096): (2048, {
+        "TILE": (256, 256), "SPLIT_K": 1, "WARP_GRID": (2, 4), "GROUP_M_OVERRIDE": 2, "NUM_XCDS_OVERRIDE": 1,
+        "STORE_CACHE": ".cs", "SCHED_MFMA_PER_DWORDX4": 2
+    }),
+}
+
+
+def _bf16_prefill_inter_wave_plan(m, n, k):
+    entry = _BF16_PREFILL_INTER_WAVE_PLANS.get((n, k))
+    if entry is None or not entry[0] <= m <= _BF16_PREFILL_INTER_WAVE_MAX_M:
+        return None
+    return entry[1]
+
+
+def _k8192_prefill_wave_grid(mi_m, mi_n, warps_m, warps_n, **overrides):
+    options = dict(local_stages=2, pgr2_operands=True, direct_to_lds=True, direct_chunk=128, refill_read_window=0,
+                   read_cover_sixteenths=8, loop_unroll_factor=2, num_xcds=8, workgroup_mapping=8, dot_mode="logical",
+                   sink_insts_to_avoid_spills=True, disable_unclustered_high_rp_reschedule=True)
+    options.update(overrides)
+    return _wg_regular_wave_grid_plan(mi_m, mi_n, warps_m, warps_n, 64, **options)
+
+
+# K=8192 tiles chosen per M by device rounds x measured L2-cold cost per round
+# (µs, N=2560 and N=4096 agree within 2%).  The MT256x256 inter-wave plan is
+# the reference; a wave-grid tile must beat it by the margin to be selected.
+_BF16_K8192_PREFILL_INTER_WAVE_ROUND_US = 171.0
+_BF16_K8192_PREFILL_WAVE_GRID_MARGIN = 0.97
+_BF16_K8192_PREFILL_WAVE_GRIDS = (
+    ((160, 256), 134.0, _k8192_prefill_wave_grid(5, 8, 2, 2)),
+    ((256, 160), 142.0, _k8192_prefill_wave_grid(8, 5, 2, 2)),
+    ((256, 176), 147.0, _k8192_prefill_wave_grid(4, 11, 4, 1, loop_unroll_factor=4)),
+    ((192, 256), 160.0, _k8192_prefill_wave_grid(6, 8, 2, 2)),
+)
+
+
+def _bf16_k8192_prefill_wave_grid_plan(m, n):
+    if n not in (2560, 4096) or not 4096 <= m <= 16384:
+        return None
+
+    def rounds(block_m, block_n):
+        return triton.cdiv(triton.cdiv(m, block_m) * triton.cdiv(n, block_n), NUM_CU)
+
+    best_cost = rounds(256, 256) * _BF16_K8192_PREFILL_INTER_WAVE_ROUND_US * _BF16_K8192_PREFILL_WAVE_GRID_MARGIN
+    best = None
+    for (block_m, block_n), round_us, plan in _BF16_K8192_PREFILL_WAVE_GRIDS:
+        cost = rounds(block_m, block_n) * round_us
+        if cost < best_cost:
+            best_cost, best = cost, plan
+    return best
+
+
+# MT256x256 inter-wave fills exact device rounds every 4096 rows at N=4096 and
+# every 25.6 row tiles at N=2560 (6400 rows for one round, 13056 for two).  A
+# row remainder runs best as a separate Split-K launch instead of a mostly idle
+# extra round.  Paired runs
+# against hipBLASLt, split vs single launch:
+#   N=4096: 16-768 rows 1.12-1.24x vs 1.01-1.11x, 896-1024 rows 1.01-1.10x vs
+#     0.93-1.02x, 1280-1536 rows 1.12-1.21x vs 1.03-1.09x, 1792-2048 rows
+#     0.99-1.14x vs 0.91-1.04x; at 3072 rows one launch wins.
+#   N=2560: 1-768 rows 1.10-1.26x vs 0.96-0.98x, 1024-1792 rows 1.07-1.12x vs
+#     0.97-1.01x, 1954-2816 rows 1.08-1.15x vs 1.01-1.07x; at 3328 rows one
+#     launch wins.
+def _k8192_prefill_tail_wave_grid(mi_m, mi_n, split_k):
+    return "wave_grid", _k8192_prefill_wave_grid(mi_m, mi_n, 2, 2, split_k=split_k, reduce_tile=(32, 128),
+                                                 reduce_warps=4)
+
+
+def _k8192_prefill_tail_inter_wave(n, split_k):
+    return "inter_wave", dict(_BF16_PREFILL_INTER_WAVE_PLANS[(n, 8192)][1], SPLIT_K=split_k)
+
+
+# N -> (max head rows, ((max tail rows, tail dispatch), ...))
+_BF16_K8192_PREFILL_ROW_SPLITS = {
+    4096: (16384, (
+        (192, _k8192_prefill_tail_wave_grid(6, 8, 16)),
+        (768, _k8192_prefill_tail_wave_grid(6, 8, 4)),
+        (1024, _k8192_prefill_tail_inter_wave(4096, 4)),
+        (1536, _k8192_prefill_tail_wave_grid(6, 8, 2)),
+        (2048, _k8192_prefill_tail_inter_wave(4096, 2)),
+    )),
+    2560: (13056, (
+        (64, _k8192_prefill_tail_wave_grid(5, 8, 16)),
+        (256, _k8192_prefill_tail_wave_grid(5, 8, 8)),
+        (768, _k8192_prefill_tail_wave_grid(5, 8, 4)),
+        (1536, _k8192_prefill_tail_inter_wave(2560, 4)),
+        (1792, _k8192_prefill_tail_wave_grid(5, 8, 2)),
+        (2816, _k8192_prefill_tail_inter_wave(2560, 2)),
+    )),
+}
+
+
+def _bf16_k8192_prefill_row_split(m, n):
+    entry = _BF16_K8192_PREFILL_ROW_SPLITS.get(n)
+    if entry is None:
+        return None
+    max_head, tails = entry
+    columns = n // 256
+    full_rounds = triton.cdiv(m, 256) * columns // NUM_CU
+    head_m = min(full_rounds * NUM_CU // columns * 256, max_head)
+    tail = m - head_m
+    if head_m == 0 or tail <= 0:
+        return None
+    for max_tail, tail_dispatch in tails:
+        if tail <= max_tail:
+            return head_m, ("inter_wave", _BF16_PREFILL_INTER_WAVE_PLANS[(n, 8192)][1]), tail_dispatch
+    return None
+
+
+def _launch_row_split(a, b, out, plan, bias=None):
+    split_m, head, tail = plan
+    _launch_dispatch(a[:split_m], b, out[:split_m], head, bias=None if bias is None else bias[:split_m])
+    _launch_dispatch(a[split_m:], b, out[split_m:], tail, bias=None if bias is None else bias[split_m:])
+    return out
+
 
 _BF16_STREAMK_PROMOTIONS = {}
 
@@ -25728,6 +25854,9 @@ def _dispatch_plan(m, n, k, dtype, element_size, *, invariance=None):
                 # LDS each check (or force) the fixed schedule.
             else:
                 return "inter_wave", promotion
+        prefill = _bf16_prefill_inter_wave_plan(m, n, k)
+        if prefill is not None and fixed is None:
+            return "inter_wave", prefill
         if _supports_short_k_register(m, n, k, dtype):
             return "short_k_register", None
     if dtype == torch.bfloat16 and wave_grid_plan is not None and (fixed is None
@@ -25934,8 +26063,24 @@ _CACHED_B_SHAPE_PLANS = {
     },
 }
 
+# Each C store instruction here writes alternate 16 B chunks of a 128 B L2 line.
+# With ``.cs`` the two halves of a line only merge in L2 while the store pair
+# stays back to back; otherwise every line is written back twice.
+_CACHED_B_TEMPORAL_STORE_SHAPES = frozenset({
+    (819_200, 1_024, 192, torch.bfloat16),
+    (819_200, 1_024, 192, torch.float16),
+    (2_252_800, 256, 256, torch.float16),
+})
+
 
 def _cached_b_geometry_plan(m, n, k, dtype, a_strides):
+    plan = _cached_b_tile_plan(m, n, k, dtype, a_strides)
+    if plan is not None and (m, n, k, dtype) in _CACHED_B_TEMPORAL_STORE_SHAPES:
+        plan = dict(plan, STORE_CACHE="")
+    return plan
+
+
+def _cached_b_tile_plan(m, n, k, dtype, a_strides):
     exact = _CACHED_B_SHAPE_PLANS.get((m, n, k, dtype))
     if exact is not None:
         return exact
@@ -26426,6 +26571,14 @@ def _cached_optimized_geometry_config(m, n, k, dtype, element_size, a_strides, b
             or not _offsets_fit_signed_i32(m, n, k, element_size, a_strides, b_strides)):
         return None
     shape = (m, n, k)
+    if (dtype == torch.bfloat16 and k == 8192 and b_strides[0] == 1 and a_strides[0] % 8 == 0
+            and b_strides[1] % 8 == 0):
+        row_split = _bf16_k8192_prefill_row_split(m, n)
+        if row_split is not None:
+            return "row_split", row_split
+        prefill = _bf16_k8192_prefill_wave_grid_plan(m, n)
+        if prefill is not None:
+            return "wave_grid", prefill
     if dtype == torch.bfloat16 and shape == (2_048, 9_216, 2_304):
         # WGM4 and transient accumulators shorten the current transposed
         # direct-PGR2 schedule. Two independent 63-round cold-cache runs
@@ -26896,6 +27049,8 @@ def _full_dispatch_candidates(m, n, k, dtype, element_size, a_strides, b_strides
 
 def _launch_dispatch(a, b, out, dispatch, bias=None):
     path, plan = dispatch
+    if path == "row_split":
+        return _launch_row_split(a, b, out, plan, bias=bias)
     if bias is not None and path in ("gemv", "split_register"):
         return _launch_register(a, b, bias=bias, out=out)
     if path == "split_register":
@@ -27180,6 +27335,8 @@ def mm(a, b, *, out=None, space="heuristic", invariance=None):
     # Keep this catalog hot path inline: ``tlx.ops.mm`` already validated the
     # inputs, and another Python call is material for the small-M kernels.
     path, plan = dispatch
+    if path == "row_split":
+        return _launch_row_split(a, b, out, plan)
     if path == "split_register":
         return _launch_split_register(a, b, out, _normalize_split_register_plan(plan))
     if path == "gemv":

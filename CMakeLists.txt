@@ -38,7 +38,6 @@ set(LLVM_SYSPATH "" CACHE PATH "Path to system LLVM installation")
 set(JSON_SYSPATH "" CACHE PATH "Path to system nlohmann/json headers")
 set(TRITON_AMD_CODEGEN_PATH "" CACHE FILEPATH "Path override for AMD code-generation library")
 set(TRITON_PTXAS_PATH "" CACHE FILEPATH "Path override for ptxas")
-set(TRITON_PTXAS_BLACKWELL_PATH "" CACHE FILEPATH "Path override for ptxas-blackwell")
 set(TRITON_CUOBJDUMP_PATH "" CACHE FILEPATH "Path override for cuobjdump")
 set(TRITON_NVDISASM_PATH "" CACHE FILEPATH "Path override for nvdisasm")
 set(TRITON_CUDACRT_PATH "" CACHE PATH "Path to CUDA CRT headers.")
@@ -69,9 +68,6 @@ if(NOT "${TRITON_AMD_CODEGEN_PATH}" STREQUAL "")
 endif()
 if(NOT "${TRITON_PTXAS_PATH}" STREQUAL "")
   list(APPEND TRITON_BUILD_HELPER_COMMON_ARGS --triton-ptxas-path "${TRITON_PTXAS_PATH}")
-endif()
-if(NOT "${TRITON_PTXAS_BLACKWELL_PATH}" STREQUAL "")
-  list(APPEND TRITON_BUILD_HELPER_COMMON_ARGS --triton-ptxas-blackwell-path "${TRITON_PTXAS_BLACKWELL_PATH}")
 endif()
 if(NOT "${TRITON_CUOBJDUMP_PATH}" STREQUAL "")
   list(APPEND TRITON_BUILD_HELPER_COMMON_ARGS --triton-cuobjdump-path "${TRITON_CUOBJDUMP_PATH}")
@@ -306,6 +302,14 @@ if(NOT MSVC)
   # MLIR still supports attribute-dictionary builders during the properties
   # migration. Keep their deprecation warnings visible but non-fatal.
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=deprecated-declarations")
+  # GCC 15 cannot rule out the null-storage branch of
+  # Operation::getPropertiesStorage() in MLIR's inline Properties setters and
+  # reports a write to address zero (-Wstringop-overflow). Keep these false
+  # positives visible but non-fatal.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+     CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=stringop-overflow")
+  endif()
 else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4244 /wd4624 /wd4715 /wd4530")
 endif()
