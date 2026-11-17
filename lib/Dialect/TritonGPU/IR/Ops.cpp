@@ -11,6 +11,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/LogicalResult.h"
@@ -1695,7 +1696,15 @@ LogicalResult MemDescSubsliceOp::verify() {
       namedOffsets[layoutDim].second = dimSize;
       auto offsetAndBlock = llInv.apply(namedOffsets);
       auto offset = offsetAndBlock[0];
-      if (!llvm::isPowerOf2_32(offset.second) && offset.second != 0) {
+      // An NPOT-extent view at the start of its alloc (the logical tile
+      // of a pow2-cover buffer) keeps the pattern by construction when
+      // its pow2 cover spans the alloc; other splits must land on digits.
+      bool npotPrefix =
+          triton::tools::isNpotAllowed() && offsets[dim] == 0 &&
+          !llvm::isPowerOf2_32(dstTy.getDimSize(dim)) &&
+          npotExtentSpansAlloc(dstTy.getDimSize(dim), allocShape[layoutDim]);
+      if (!npotPrefix && !llvm::isPowerOf2_32(offset.second) &&
+          offset.second != 0) {
         return emitError(
             "We don't support splitting along the swizzling pattern");
       }
