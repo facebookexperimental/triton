@@ -262,6 +262,7 @@ def TLX_RequireLayoutOp : TLX_Op<"require_layout",
                                  [SameOperandsAndResultShape,
                                   SameOperandsAndResultElementType,
                                   AxisInfoPassthroughTrait,
+                                  MixedRadixLayoutTrait,
                                   Pure]> {
   let summary = "materialize an explicit layout constraint on a memdesc or tensor value";
 
@@ -289,6 +290,7 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
                                  [SameOperandsAndResultShape,
                                   SameOperandsAndResultElementType,
                                   AxisInfoPassthroughTrait,
+                                  MixedRadixLayoutTrait,
                                   Pure]> {
   let summary = "release specific layout for a register buffer";
 

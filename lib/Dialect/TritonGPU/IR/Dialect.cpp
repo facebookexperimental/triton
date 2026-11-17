@@ -4830,7 +4830,10 @@ getExactNpotLayout(RankedTensorType type,
         llvm::any_of(encoded.getInputRadices(inDim),
                      [](int32_t radix) { return radix != 2; }))
       return reject(("a non-binary " + inDim.str() + " digit").c_str());
-  if (linear &&
+  // A linear layout that is already exact needs no rebuild; a failed
+  // rebuild rejects here, before toLinearLayout sees the mismatched
+  // shape (it crashes on one: the #p96-on-192 cases below).
+  if (linear && !llvm::equal(encoded.getOutDimSizes(), shape) &&
       failed(buildMixedRadixLayout(encoded, linear.getRepOrder(), shape)))
     return failure();
   LinearLayout ll = toLinearLayout(type);
@@ -5431,7 +5434,8 @@ bool triton::gpu::isMixedRadixLayoutOp(OperationName op) {
          op.hasInterface<triton::MixedRadixLayoutOpInterface>() ||
          isAnyOf<arith::ConstantOp, scf::ForOp, scf::IfOp, scf::WhileOp,
                  scf::YieldOp, scf::ConditionOp, cf::BranchOp, cf::CondBranchOp,
-                 ub::PoisonOp, UnrealizedConversionCastOp>(op);
+                 ub::PoisonOp, UnrealizedConversionCastOp, WarpSpecializeOp,
+                 WarpSpecializePartitionsOp>(op);
 }
 
 std::optional<std::string>
@@ -5469,6 +5473,28 @@ static LogicalResult verifyExactNpotLayouts(Operation *op) {
     auto plan = getMixedRadixConversionPlan(srcTy, dstTy);
     if (plan && !plan->supported())
       return op->emitError(*plan->unsupportedReason);
+  }
+  // Any trait op forwarding one tensor to another with only its
+  // layout changed is a conversion: same plan check. Memdesc anchors
+  // are not tensors here; they go through the shared-shape rule in
+  // the pad pass.
+  if (op->hasTrait<OpTrait::MixedRadixLayoutTrait>() &&
+      op->getNumOperands() == 1 && op->getNumResults() == 1) {
+    auto srcTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+    auto dstTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    if (srcTy && dstTy && srcTy.getShape() == dstTy.getShape() &&
+        srcTy.getElementType() == dstTy.getElementType() &&
+        srcTy.getEncoding() && dstTy.getEncoding() &&
+        srcTy.getEncoding() != dstTy.getEncoding() &&
+        (hasNpotShape(srcTy) || hasNpotShape(dstTy))) {
+      if (!hasExactNpotLayout(srcTy) || !hasExactNpotLayout(dstTy))
+        return op->emitError(
+            "NPOT conversion to or from a non-mixed-radix layout is "
+            "not yet supported");
+      auto plan = getMixedRadixConversionPlan(srcTy, dstTy);
+      if (plan && !plan->supported())
+        return op->emitError(*plan->unsupportedReason);
+    }
   }
   SmallVector<Type> types(op->getOperandTypes());
   llvm::append_range(types, op->getResultTypes());

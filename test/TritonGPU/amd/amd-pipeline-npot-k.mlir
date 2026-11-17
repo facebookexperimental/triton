@@ -29,18 +29,16 @@
 // RUN:   -tritonamdgpu-schedule-loops -verify-diagnostics -o /dev/null
 
 // make_ttgir's gfx950 order minus intra-wave-pipeline (not in triton-opt).
-// TLX insert keeps the exact NPOT operand convert, not a require_layout the
-// verifier rejects. K=96 uses the padded 32x32x16 MFMA; no module attribute.
+// TLX insert anchors the exact NPOT operand layouts. K=96 uses the
+// padded 32x32x16 MFMA; no module attribute.
 // CHECK: #mma = #ttg.amd_mfma<{version = 4, {{.*}}instrShape = [32, 32, 16]
 // CHECK: module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
 // CHECK-LABEL: @dot_k96
 // CHECK: tt.dot {{.*}} : tensor<128x96xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> * tensor<96x128xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>>
 // INSERT-LABEL: @dot_k96
-// INSERT-NOT: tlx.require_layout
-// INSERT: ttg.convert_layout {{.*}} -> tensor<128x96xbf16, #ttg.dot_op<{opIdx = 0
-// INSERT: ttg.convert_layout {{.*}} -> tensor<96x128xbf16, #ttg.dot_op<{opIdx = 1
-// INSERT-NOT: tlx.require_layout
-// INSERT: tt.dot
+// INSERT: %[[A:.*]] = tlx.require_layout {{.*}} -> tensor<128x96xbf16, #ttg.dot_op<{opIdx = 0
+// INSERT: %[[B:.*]] = tlx.require_layout {{.*}} -> tensor<96x128xbf16, #ttg.dot_op<{opIdx = 1
+// INSERT: tt.dot %[[A]], %[[B]]
 tt.func @dot_k96(%pa: !tt.ptr<bf16>, %pb: !tt.ptr<bf16>, %pc: !tt.ptr<f32>) {
   %sa = tt.splat %pa : !tt.ptr<bf16> -> tensor<128x96x!tt.ptr<bf16>>
   %a = tt.load %sa : tensor<128x96x!tt.ptr<bf16>>

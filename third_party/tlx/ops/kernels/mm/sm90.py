@@ -59,6 +59,13 @@ def _npot_subtile(n):
     return _n_piece(n, 1) > 0 and _n_piece(n, 2) == 0 and _n_piece(n, 0) == 2 * _n_piece(n, 1)
 
 
+def _single_wgmma(block_n):
+    """The config's SINGLE_WGMMA flag for a tile: one wgmma over the
+    whole NPOT N, not the subtiled piece epilogue. _config sets it and
+    _smem_bytes reads it; the two must not re-derive it separately."""
+    return bool(triton.knobs.language.allow_npot) and not _npot_subtile(block_n)
+
+
 def matmul_tma_set_block_size_hook(nargs):
     block_m = nargs["BM"]
     block_n = nargs["BN"]
@@ -78,7 +85,10 @@ def matmul_tma_set_block_size_hook(nargs):
     # Tail-piece descriptors; an unused one is never read, so give it a valid box.
     for piece, name in ((n1, "b_tail_desc"), (n2, "b_tail2_desc")):
         nargs[name].block_shape = [piece or n0, block_k]
-    if swap_ab:
+    if swap_ab and n1:
+        # Transposed pieces: one descriptor box per pow2 piece.
+        epilogue_block = [n0, block_m_split]
+    elif swap_ab:
         # The kernel computes C^T; each consumer stores its transposed tile.
         epilogue_block = [block_n, block_m_split]
     elif _npot_subtile(block_n):
@@ -91,7 +101,10 @@ def matmul_tma_set_block_size_hook(nargs):
     c = nargs["c_desc"]
     c.block_shape = epilogue_block
     for piece, name in ((n1, "c_tail_desc"), (n2, "c_tail2_desc")):
-        nargs[name].block_shape = [block_m_split, piece] if piece else epilogue_block
+        if swap_ab and n1:
+            nargs[name].block_shape = [piece, block_m_split] if piece else epilogue_block
+        else:
+            nargs[name].block_shape = [block_m_split, piece] if piece else epilogue_block
 
     split_k = nargs["SPLIT_K"]
     workspace_desc = nargs["workspace_desc"]
@@ -131,6 +144,10 @@ def _config(block_m, block_n, num_stages, group_size_m=8, split_k=1, block_k=64,
             "EPILOGUE_SUBTILE": not swap_ab and _is_pow2(block_n),
             "SPLIT_K": split_k,
             "SWAP_AB": swap_ab,
+            # Subtile tiles (96, 192) take the double-buffered piece
+            # epilogue the block-size hook sizes for; the single-wgmma
+            # round-trip stores whole pieces and would disagree.
+            "SINGLE_WGMMA": _single_wgmma(block_n),
         },
         num_stages=1,
         num_warps=4,
@@ -140,6 +157,11 @@ def _config(block_m, block_n, num_stages, group_size_m=8, split_k=1, block_k=64,
 
 def _smem_bytes(block_m, block_n, block_k, num_stages, split_k, elem_bytes=2, swap_ab=False):
     ring = (block_m + block_n) * block_k * elem_bytes * num_stages
+    if not _is_pow2(block_n) and split_k == 1 and _single_wgmma(block_n):
+        # Single-wgmma path: pow2-cover B ring plus epilogue round-trip.
+        cover = triton.next_power_of_2(block_n)
+        ring = (block_m + cover) * block_k * elem_bytes * num_stages
+        return ring + block_m * cover * elem_bytes + block_m * block_n * elem_bytes
     # Subtiled epilogue: four (BM/2, BN/4) slots. Swap-AB: one transposed
     # (BN, BM/2) slot per consumer. Non-power-of-two BN: one slot per N piece
     # per consumer.
@@ -343,6 +365,15 @@ def _deepest_ring(block_m, block_n, block_k, split_k, max_stages=6):
     return num_stages
 
 
+def _swap_stages(block_m, block_n, block_k, split_k, num_stages):
+    """A re-flagged swap-AB config's stages, sized for the swapped
+    layout: no more than the heuristic's count, fewer where the
+    swapped epilogue's bytes leave no room for it."""
+    while num_stages > 2 and not _fits_smem(block_m, block_n, num_stages, split_k, block_k, swap_ab=True):
+        num_stages -= 1
+    return num_stages
+
+
 def _swap_configs():
     return [
         _config(block_m, block_n, _deepest_ring(block_m, block_n, block_k, split_k), 1, split_k, block_k, True)
@@ -393,21 +424,66 @@ def _swap_heuristic_config(M, N, K, b_row_major=True, *, invariance=None):
     return [_config(block_m, block_n, _deepest_ring(block_m, block_n, block_k, split_k), 1, split_k, block_k, True)]
 
 
+def _pick_cost(cfg, M, N, K, num_sms):
+    kw = cfg[0].kwargs
+    return _heuristic_cost(M, N, K, kw["BM"], kw["BN"], kw["SPLIT_K"], num_sms)
+
+
+def _swap_wins_by_cost(M, N, K, a_rm, b_rm):
+    """Cost-compare both orientations for the heuristic space. The swapped
+    kernel's B is A^T, K-major exactly when A is row-major."""
+    num_sms = _get_num_sms()
+    normal = _pick_cost(heuristic_config(M, N, K, b_row_major=b_rm), M, N, K, num_sms)
+    swapped_cfg = heuristic_config(N, M, K, b_row_major=not a_rm)
+    kw = swapped_cfg[0].kwargs
+    if not _is_pow2(kw["BN"]) and not a_rm:
+        return False
+    # The launched config's stages are re-sized for the swapped
+    # layout (_tuned_for_fixed), so gate on that count, not the
+    # heuristic's normal-layout count.
+    stages = _swap_stages(kw["BM"], kw["BN"], kw.get("BK", 64), kw["SPLIT_K"],
+                          kw["NUM_STAGES"])
+    if not _fits_smem(kw["BM"], kw["BN"], stages, kw["SPLIT_K"],
+                      kw.get("BK", 64), swap_ab=True):
+        return False
+    swapped = _heuristic_cost(N, M, K, kw["BM"], kw["BN"], kw["SPLIT_K"], num_sms)
+    return swapped < normal
+
+
 # Sub-wave heuristic cost model, fitted on H100 to the pinned-config timings of
 # the M ~ 706 merge-net shapes: MMA work on the busiest SM over a per-tile-width
 # efficiency, plus a split-K reduction's DRAM traffic and launch. Narrow tiles
 # re-read B from SMEM more often per MMA: 128x64 does 128x128's per-SM work 58%
 # slower on 706x2560x20992. A two-piece 192 tile matches a 128-wide one.
-_TILE_EFFICIENCY = {256: 1.0, 192: 1.0, 128: 1.0, 64: 0.6}
+# NPOT widths measured on H100 (T298010710): BN104 0.85, BN112
+# 0.89. Widths with no measurement are not candidates.
+_TILE_EFFICIENCY = {256: 1.0, 192: 1.0, 128: 1.0, 112: 0.89, 104: 0.85, 64: 0.6}
+_MEASURED_NPOT_WIDTHS = (104, 112)
 _SM_MACS_PER_S = 2.8e12
 _DRAM_BYTES_PER_S = 2.5e12
 _REDUCE_LAUNCH_S = 1e-6
 
 
+def _npot_candidates(n):
+    """NPOT widths near n/tiles that the kernel accepts: at most three
+    binary pieces (the _n_piece rule), multiples of 8 in [64, 256]."""
+    if not triton.knobs.language.allow_npot or n % 128 == 0:
+        return []
+    out = set()
+    base = triton.cdiv(n, 128)
+    for tiles in {max(1, base - 1), base, base + 1}:
+        w0 = (triton.cdiv(n, tiles) + 7) // 8 * 8
+        for w in range(max(64, w0 - 32), min(256, w0 + 32) + 1, 8):
+            if not _is_pow2(w) and _n_piece(w, 3) == 0 and w in _MEASURED_NPOT_WIDTHS:
+                out.add(w)
+    return sorted(out)
+
+
 def _heuristic_cost(M, N, K, block_m, block_n, split_k, num_sms):
     units = _mn_tiles(M, N, block_m, block_n) * split_k
     macs = triton.cdiv(units, num_sms) * block_m * block_n * triton.cdiv(triton.cdiv(K, 64), split_k) * 64
-    seconds = macs / (_SM_MACS_PER_S * _TILE_EFFICIENCY[block_n])
+    efficiency = _TILE_EFFICIENCY[block_n]
+    seconds = macs / (_SM_MACS_PER_S * efficiency)
     if split_k > 1:
         # Write and re-read the fp32 partials, write C.
         seconds += (2 * split_k * M * N * 4 + M * N * 2) / _DRAM_BYTES_PER_S + _REDUCE_LAUNCH_S
@@ -447,6 +523,11 @@ def heuristic_config(M, N, K, b_row_major=True, *, invariance=None):
                                                   or not _split_k_valid(K, split_k)):
                 continue
             candidates.append((_heuristic_cost(M, N, K, bm, bn, split_k, num_sms), split_k, -bm * bn, bm, bn))
+    if not b_row_major:
+        # NPOT widths (104 among them) split N evenly; tails handle the rest.
+        for bn in _npot_candidates(N):
+            if _fits_smem(128, bn, _heuristic_stages(128, bn, 1), 1):
+                candidates.append((_heuristic_cost(M, N, K, 128, bn, 1, num_sms), 1, -128 * bn, 128, bn))
     cost, split_k, _, block_m, block_n = min(candidates)
     # The two-piece 192 tile, for a K-major B: on a tie with 128x128, and against
     # a wider tile only when it cuts the cost by 10% (706x3072x12288: 100.8 vs
@@ -634,6 +715,7 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
     SPLIT_K: tl.constexpr,
     SWAP_AB: tl.constexpr,
     ADD_BIAS: tl.constexpr,
+    SINGLE_WGMMA: tl.constexpr = False,
 ):
     block_m_split: tl.constexpr = BM // NUM_MMA_GROUPS
     # Split-K adds the bias in its reduction instead.
@@ -644,9 +726,10 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
     N_TAIL: tl.constexpr = _n_piece(BN, 1)
     N_TAIL2: tl.constexpr = _n_piece(BN, 2)
     tl.static_assert(_n_piece(BN, 3) == 0)
-    tl.static_assert(N_TAIL == 0 or (SPLIT_K == 1 and not B_ROW_MAJOR and not SWAP_AB))
+    tl.static_assert(N_TAIL == 0 or (SPLIT_K == 1 and not B_ROW_MAJOR))
     # workspace_desc is fp32 for split-K and aliases c_desc otherwise.
     out_desc = workspace_desc if SPLIT_K > 1 else c_desc
+    USE_SINGLE: tl.constexpr = SINGLE_WGMMA and N_TAIL > 0 and SPLIT_K == 1 and not B_ROW_MAJOR
     a, b, bars_empty_a, bars_full_a, bars_empty_b, bars_full_b = _allocate_buffers(
         a_desc,
         b_desc,
@@ -657,19 +740,20 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
         NUM_MMA_GROUPS,
         A_ROW_MAJOR,
         B_ROW_MAJOR,
+        SKIP_B=USE_SINGLE,
     )
-    NPOT_SUBTILE: tl.constexpr = _npot_subtile(BN)
+    NPOT_SUBTILE: tl.constexpr = _npot_subtile(BN) and not SWAP_AB
     if NPOT_SUBTILE:
-        b_tail = tlx.local_alloc((N_TAIL, BK), tlx.dtype_of(b_desc), NUM_STAGES)
+        b_tail = tlx.local_alloc((N_TAIL, BK), tlx.dtype_of(b_desc), NUM_STAGES) if not USE_SINGLE else None
         c_smem_sub = tlx.local_alloc((block_m_split, N_TAIL // 2), tlx.dtype_of(c_desc), 2 * NUM_MMA_GROUPS)
     elif N_TAIL > 0:
-        b_tail = tlx.local_alloc((N_TAIL, BK), tlx.dtype_of(b_desc), NUM_STAGES)
+        b_tail = tlx.local_alloc((N_TAIL, BK), tlx.dtype_of(b_desc), NUM_STAGES) if not USE_SINGLE else None
         c_smem_p0 = tlx.local_alloc((block_m_split, N0), tlx.dtype_of(c_desc), NUM_MMA_GROUPS)
         c_smem_p1 = tlx.local_alloc((block_m_split, N_TAIL), tlx.dtype_of(c_desc), NUM_MMA_GROUPS)
     else:
         b_tail = None
     if N_TAIL2 > 0:
-        b_tail2 = tlx.local_alloc((N_TAIL2, BK), tlx.dtype_of(b_desc), NUM_STAGES)
+        b_tail2 = tlx.local_alloc((N_TAIL2, BK), tlx.dtype_of(b_desc), NUM_STAGES) if not USE_SINGLE else None
         c_smem_p2 = tlx.local_alloc((block_m_split, N_TAIL2), tlx.dtype_of(c_desc), NUM_MMA_GROUPS)
     else:
         b_tail2 = None
@@ -677,10 +761,33 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
         c_smem = tlx.local_alloc((block_m_split, BN // 4), tlx.dtype_of(out_desc), 2 * NUM_MMA_GROUPS)
     else:
         c_smem = None
-    if SWAP_AB:
+    if SWAP_AB and N_TAIL > 0:
+        # Transposed piece buffers: each piece stores as (piece, rows).
+        ct0 = tlx.local_alloc((N0, block_m_split), tlx.dtype_of(out_desc), NUM_MMA_GROUPS)
+        ct1 = tlx.local_alloc((N_TAIL, block_m_split), tlx.dtype_of(out_desc), NUM_MMA_GROUPS)
+        ct2 = tlx.local_alloc((N_TAIL2, block_m_split), tlx.dtype_of(out_desc), NUM_MMA_GROUPS) if N_TAIL2 > 0 else None
+        c_smem_t = None
+    elif SWAP_AB:
+        ct0 = None
+        ct1 = None
+        ct2 = None
         c_smem_t = tlx.local_alloc((BN, block_m_split), tlx.dtype_of(out_desc), NUM_MMA_GROUPS)
     else:
+        ct0 = None
+        ct1 = None
+        ct2 = None
         c_smem_t = None
+    # One wgmma over a uniform-stride B, filled by piece-wise boxes.
+    if USE_SINGLE:
+        # Pow2 cover buffers; the NPOT tile is a slice of the cover.
+        BN_COVER: tl.constexpr = (BN + 127) // 128 * 128 if BN > 128 else 128
+        b_single = tlx.local_alloc((BN_COVER, BK), tlx.dtype_of(b_desc), NUM_STAGES)
+        epi = tlx.local_alloc((block_m_split, BN_COVER), tlx.dtype_of(out_desc), NUM_MMA_GROUPS)
+        epi_t = tlx.local_alloc((BN_COVER, block_m_split), tlx.dtype_of(out_desc), NUM_MMA_GROUPS) if SWAP_AB else None
+    else:
+        b_single = None
+        epi = None
+        epi_t = None
 
     with tlx.async_tasks():
         with tlx.async_task("default"):
@@ -713,6 +820,7 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                 b_tail2_desc,
                 b_tail2,
                 N_TAIL2,
+                b_single=b_single,
             )
 
         with tlx.async_task(num_warps=4, replicate=NUM_MMA_GROUPS, registers=232):
@@ -738,7 +846,55 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                 k_lo, k_hi = _k_tile_range(K, split_id, BK, SPLIT_K)
                 offset_cm = offset_am + block_m_split * consumer_id
 
-                if N_TAIL > 0:
+                if USE_SINGLE:
+                    acc, buf, phase = _consume_tile(
+                        (k_hi - k_lo) * BK, a, b_single, bars_empty_a, bars_full_a,
+                        bars_empty_b, bars_full_b, buf, phase, consumer_id, BK,
+                        NUM_STAGES, A_ROW_MAJOR, B_ROW_MAJOR, B_ROWS=BN)
+                    if SWAP_AB:
+                        acc = _add_bias(acc, _bias_vec(bias_ptr, offset_cm, M, stride_bias, block_m_split, TILE_BIAS), TILE_BIAS, True)
+                    else:
+                        acc = _add_bias(acc, _bias_vec(bias_ptr, offset_bn, N, stride_bias, BN, TILE_BIAS), TILE_BIAS, False)
+                    # Round-trip through SMEM so each piece stores from its
+                    # own pow2 buffer, as in the piece path.
+                    tlx.async_descriptor_store_wait(0)
+                    if SWAP_AB:
+                        slot_t = tlx.local_view(epi_t, consumer_id)
+                        tlx.local_store(
+                            tlx.local_slice(slot_t, [0, 0], [BN, block_m_split]),
+                            tl.trans(acc.to(tlx.dtype_of(c_desc))))
+                        tlx.fence("async_shared")
+                        t0 = tlx.local_view(ct0, consumer_id)
+                        t1 = tlx.local_view(ct1, consumer_id)
+                        tlx.local_store(t0, tlx.local_load(tlx.local_slice(slot_t, [0, 0], [N0, block_m_split])))
+                        tlx.local_store(t1, tlx.local_load(tlx.local_slice(slot_t, [N0, 0], [N_TAIL, block_m_split])))
+                        if N_TAIL2 > 0:
+                            t2 = tlx.local_view(ct2, consumer_id)
+                            tlx.local_store(t2, tlx.local_load(tlx.local_slice(slot_t, [N0 + N_TAIL, 0], [N_TAIL2, block_m_split])))
+                        tlx.fence("async_shared")
+                        tlx.async_descriptor_store(c_desc, t0, [offset_bn, offset_cm])
+                        tlx.async_descriptor_store(c_tail_desc, t1, [offset_bn + N0, offset_cm])
+                        if N_TAIL2 > 0:
+                            tlx.async_descriptor_store(c_tail2_desc, t2, [offset_bn + N0 + N_TAIL, offset_cm])
+                    else:
+                        slot = tlx.local_view(epi, consumer_id)
+                        tlx.local_store(
+                            tlx.local_slice(slot, [0, 0], [block_m_split, BN]),
+                            acc.to(tlx.dtype_of(c_desc)))
+                        tlx.fence("async_shared")
+                        s0 = tlx.local_view(c_smem_p0, consumer_id)
+                        s1 = tlx.local_view(c_smem_p1, consumer_id)
+                        tlx.local_store(s0, tlx.local_load(tlx.local_slice(slot, [0, 0], [block_m_split, N0])))
+                        tlx.local_store(s1, tlx.local_load(tlx.local_slice(slot, [0, N0], [block_m_split, N_TAIL])))
+                        if N_TAIL2 > 0:
+                            s2 = tlx.local_view(c_smem_p2, consumer_id)
+                            tlx.local_store(s2, tlx.local_load(tlx.local_slice(slot, [0, N0 + N_TAIL], [block_m_split, N_TAIL2])))
+                        tlx.fence("async_shared")
+                        tlx.async_descriptor_store(c_desc, s0, [offset_cm, offset_bn])
+                        tlx.async_descriptor_store(c_tail_desc, s1, [offset_cm, offset_bn + N0])
+                        if N_TAIL2 > 0:
+                            tlx.async_descriptor_store(c_tail2_desc, s2, [offset_cm, offset_bn + N0 + N_TAIL])
+                elif N_TAIL > 0:
                     # Pieces never run under swap-AB, so the bias runs along the columns.
                     bias0 = _bias_vec(bias_ptr, offset_bn, N, stride_bias, N0, TILE_BIAS)
                     bias1 = _bias_vec(bias_ptr, offset_bn + N0, N, stride_bias, N_TAIL, TILE_BIAS)
@@ -752,10 +908,18 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                         (k_hi - k_lo) * BK, a, b, b_tail, b_tail2, acc0, acc1, acc2, bars_empty_a, bars_full_a,
                         bars_empty_b, bars_full_b, buf, phase, consumer_id, BK, NUM_STAGES, A_ROW_MAJOR, N_TAIL,
                         N_TAIL2)
-                    acc0 = _add_bias(acc0, bias0, TILE_BIAS, False)
-                    acc1 = _add_bias(acc1, bias1, TILE_BIAS, False)
-                    if N_TAIL2 > 0:
-                        acc2 = _add_bias(acc2, bias2, TILE_BIAS, False)
+                    if SWAP_AB:
+                        # Bias runs along C's rows here (the kernel's M).
+                        bias_row = _bias_vec(bias_ptr, offset_cm, M, stride_bias, block_m_split, TILE_BIAS)
+                        acc0 = _add_bias(acc0, bias_row, TILE_BIAS, True)
+                        acc1 = _add_bias(acc1, bias_row, TILE_BIAS, True)
+                        if N_TAIL2 > 0:
+                            acc2 = _add_bias(acc2, bias_row, TILE_BIAS, True)
+                    else:
+                        acc0 = _add_bias(acc0, bias0, TILE_BIAS, False)
+                        acc1 = _add_bias(acc1, bias1, TILE_BIAS, False)
+                        if N_TAIL2 > 0:
+                            acc2 = _add_bias(acc2, bias2, TILE_BIAS, False)
                     if NPOT_SUBTILE:
                         sub: tl.constexpr = N_TAIL // 2
                         s_0 = tlx.local_view(c_smem_sub, 2 * consumer_id)
@@ -768,6 +932,21 @@ def matmul_kernel_tma_ws_hopper_cooperative(  # noqa: TR001
                         _store_subtile(c_desc, s_1, p_3, offset_cm, offset_bn + 3 * sub)
                         _store_subtile(c_desc, s_0, t_0, offset_cm, offset_bn + 4 * sub)
                         _store_subtile(c_desc, s_1, t_1, offset_cm, offset_bn + 5 * sub)
+                    elif SWAP_AB:
+                        # Transposed per-piece stores into C.
+                        tlx.async_descriptor_store_wait(0)
+                        t0 = tlx.local_view(ct0, consumer_id)
+                        t1 = tlx.local_view(ct1, consumer_id)
+                        tlx.local_store(t0, tl.trans(acc0.to(tlx.dtype_of(c_desc))))
+                        tlx.local_store(t1, tl.trans(acc1.to(tlx.dtype_of(c_desc))))
+                        if N_TAIL2 > 0:
+                            t2 = tlx.local_view(ct2, consumer_id)
+                            tlx.local_store(t2, tl.trans(acc2.to(tlx.dtype_of(c_desc))))
+                        tlx.fence("async_shared")
+                        tlx.async_descriptor_store(c_desc, t0, [offset_bn, offset_cm])
+                        tlx.async_descriptor_store(c_tail_desc, t1, [offset_bn + N0, offset_cm])
+                        if N_TAIL2 > 0:
+                            tlx.async_descriptor_store(c_tail2_desc, t2, [offset_bn + N0 + N_TAIL, offset_cm])
                     else:
                         # The previous tile's stores read these slots; drain them first.
                         tlx.async_descriptor_store_wait(0)
@@ -1108,8 +1287,26 @@ def _tuned_for_fixed(space, shape, swap_ab, fixed, add_bias=False, *, dtype=None
     prune_configs_by = None
     if space == "heuristic":
         fixed_spec = None if fixed is None else _FIXED_SPEC
-        configs = _swap_heuristic_config(*shape, invariance=fixed_spec) if swap_ab else heuristic_config(
-            *shape, invariance=fixed_spec)
+        if swap_ab and shape[0] > _SWAP_AB_MAX_M:
+            # Cost-chosen swap: the swapped problem's own heuristic pick,
+            # re-flagged as swap-AB (shape is the problem's M, N, K).
+            base = heuristic_config(shape[1], shape[0], shape[2],
+                                    b_row_major=shape[3], invariance=fixed_spec)
+            base = [c for c in base
+                    if _is_pow2(c.kwargs["BN"]) or not shape[3]] or [
+                _config(128, 128, _heuristic_stages(128, 128, 1))]
+            configs = [
+                _config(c.kwargs["BM"], c.kwargs["BN"],
+                        _swap_stages(c.kwargs["BM"], c.kwargs["BN"],
+                                     c.kwargs.get("BK", 64), c.kwargs["SPLIT_K"],
+                                     c.kwargs["NUM_STAGES"]),
+                        c.kwargs["GROUP_SIZE_M"], c.kwargs["SPLIT_K"],
+                        c.kwargs.get("BK", 64), True) for c in base
+            ]
+        elif swap_ab:
+            configs = _swap_heuristic_config(*shape, invariance=fixed_spec)
+        else:
+            configs = heuristic_config(*shape, invariance=fixed_spec)
     elif space == "full":
         configs = _swap_configs() if swap_ab else CONFIGS()
         prune = _prune_swap_configs if swap_ab else _prune_full_configs
@@ -1282,6 +1479,8 @@ def _launch_small_k(a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias=None, 
 
 def _launch_ws(a_store, b_store, a_rm, b_rm, c, M, N, K, space, bias=None, stride_bias=0, invariance=None):
     swap_ab = _use_swap_ab(M, space)
+    if not swap_ab and space == "heuristic" and M > _SWAP_AB_MAX_M and triton.knobs.language.allow_npot:
+        swap_ab = _swap_wins_by_cost(M, N, K, a_rm, b_rm)
     if swap_ab:
         # Run the same kernel on (B^T, A^T) and write C^T tiles back to C. B^T
         # is row-major exactly when B is column-major, and likewise for A^T.

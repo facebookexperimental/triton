@@ -1,6 +1,7 @@
 """sm90 L1 correctness for ``tlx.ops.mm``."""
 
 import contextlib
+import os
 
 import pytest
 import torch
@@ -663,3 +664,112 @@ def test_npot_prune_rules():
         assert pieces[3] == 0 and min(p for p in pieces if p) >= 32
         assert sm90._fits_smem(128, bn, 2, 1)
     assert num_sms > 0
+
+
+def test_npot_candidates(monkeypatch):
+    monkeypatch.setattr("triton.knobs.language.allow_npot", True)
+    assert 104 in sm90._npot_candidates(104)
+    assert 104 in sm90._npot_candidates(600)
+    assert all(sm90._n_piece(w, 3) == 0 for w in sm90._npot_candidates(600))
+    assert sm90._npot_candidates(2560) == []
+    assert sm90._npot_candidates(8192) == []
+
+
+def test_heuristic_npot_candidate_costed(monkeypatch):
+    monkeypatch.setattr("triton.knobs.language.allow_npot", True)
+    # K-major B only: the NPOT width is among the costed candidates and the
+    # pick never costs more than the best power-of-two tile.
+    num_sms = sm90._get_num_sms()
+    cfg = sm90.heuristic_config(600, 104, 512, b_row_major=False)[0]
+    assert sm90._n_piece(cfg.kwargs["BN"], 3) == 0
+    cost = sm90._heuristic_cost(600, 104, 512, cfg.kwargs["BM"], cfg.kwargs["BN"],
+                                cfg.kwargs["SPLIT_K"], num_sms)
+    pow2 = sm90._heuristic_cost(600, 104, 512, 128, 128, 1, num_sms)
+    assert cost <= pow2
+    assert sm90._n_piece(cfg.kwargs["BN"], 3) == 0
+
+
+def test_gate_shape_compiles_swapped_104(monkeypatch):
+    if os.environ.get("TRITON_ALLOW_NPOT") != "1":
+        pytest.skip("compiling an NPOT shape needs TRITON_ALLOW_NPOT=1 "
+                    "in the environment (C++ reads it once at startup)")
+    monkeypatch.setattr("triton.knobs.language.allow_npot", True)
+    # The cost model reads the host's SM count; pin the H100 count it
+    # was fitted on so the pick does not depend on the host's variant
+    # (108/114-SM hosts take the pow2 tile instead and fail below).
+    monkeypatch.setattr(sm90, "_get_num_sms", lambda: 132)
+    # The 600x2560x20992 gate, compile-only: with the flag on, the cost
+    # model swaps and the swapped problem's heuristic pick is the
+    # 128x104 tile (the launch re-flags it SWAP_AB). Warmup compiles to
+    # PTX without launching; the tile must survive into the TTGIR.
+    assert sm90._swap_wins_by_cost(600, 2560, 20992, True, True)
+    cfg = sm90.heuristic_config(2560, 600, 20992, b_row_major=False)[0]
+    assert cfg.kwargs["BM"] == 128
+    assert cfg.kwargs["BN"] == 104
+    a = torch.empty((600, 20992), device="cuda", dtype=torch.bfloat16)
+    b = torch.empty((20992, 2560), device="cuda", dtype=torch.bfloat16)
+    c = torch.empty((600, 2560), device="cuda", dtype=torch.bfloat16)
+    kernel = sm90.matmul_kernel_tma_ws_hopper_cooperative
+    nargs = {
+        "a_desc": sm90._descriptor(b),
+        "b_desc": sm90._descriptor(a),
+        "c_desc": sm90._descriptor(c),
+        "workspace_desc": sm90._descriptor(c),
+        "b_tail_desc": sm90._descriptor(a),
+        "b_tail2_desc": sm90._descriptor(a),
+        "c_tail_desc": sm90._descriptor(c),
+        "c_tail2_desc": sm90._descriptor(c),
+        "BM": cfg.kwargs["BM"],
+        "BN": cfg.kwargs["BN"],
+        "BK": cfg.kwargs["BK"],
+        "NUM_MMA_GROUPS": cfg.kwargs["NUM_MMA_GROUPS"],
+        "EPILOGUE_SUBTILE": cfg.kwargs["EPILOGUE_SUBTILE"],
+        "SPLIT_K": cfg.kwargs["SPLIT_K"],
+        "SWAP_AB": True,
+        "A_ROW_MAJOR": False,
+        "B_ROW_MAJOR": False,
+    }
+    sm90.matmul_tma_set_block_size_hook(nargs)
+    compiled = kernel.warmup(
+        nargs["a_desc"],
+        nargs["b_desc"],
+        nargs["c_desc"],
+        nargs["workspace_desc"],
+        nargs["b_tail_desc"],
+        nargs["b_tail2_desc"],
+        nargs["c_tail_desc"],
+        nargs["c_tail2_desc"],
+        c,
+        2560,
+        600,
+        20992,
+        0,
+        NUM_SMS=sm90._get_num_sms(),
+        A_ROW_MAJOR=False,
+        B_ROW_MAJOR=False,
+        A_EVICTION="",
+        ADD_BIAS=False,
+        **{**cfg.kwargs, "SWAP_AB": True},
+        grid=(1,),
+    )
+    assert "memdesc<64x104xbf16" in compiled.asm["ttgir"]
+    assert "tensor<64x104xf32" in compiled.asm["ttgir"]
+    assert compiled.asm["ptx"]
+
+
+def test_swap_wins_by_cost_matches_model(monkeypatch):
+    monkeypatch.setattr("triton.knobs.language.allow_npot", True)
+    # The swap decision is exactly the cost comparison of the two picks.
+    num_sms = sm90._get_num_sms()
+    for M, N, K in ((600, 2560, 20992), (256, 256, 512), (1024, 1024, 1024)):
+        normal_cfg = sm90.heuristic_config(M, N, K, b_row_major=True)[0]
+        swapped_cfg = sm90.heuristic_config(N, M, K, b_row_major=False)[0]
+        kw = swapped_cfg.kwargs
+        fits = sm90._fits_smem(kw["BM"], kw["BN"], kw["NUM_STAGES"], kw["SPLIT_K"],
+                               kw.get("BK", 64), swap_ab=True)
+        # a_rm=True in this call: swapped pieces are legal (K-major A^T).
+        expected = fits and sm90._heuristic_cost(
+            N, M, K, kw["BM"], kw["BN"], kw["SPLIT_K"], num_sms) < sm90._heuristic_cost(
+            M, N, K, normal_cfg.kwargs["BM"], normal_cfg.kwargs["BN"],
+            normal_cfg.kwargs["SPLIT_K"], num_sms)
+        assert sm90._swap_wins_by_cost(M, N, K, True, True) == expected
