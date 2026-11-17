@@ -1136,3 +1136,35 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#store = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#load = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // Per-thread arrives stay tagged (warp-scope placement, no CTA
+  // rendezvous) but keep unscaled counts: every thread's arrival is
+  // required for completion, so scaling only multiplies arrival traffic.
+  // PREP-LABEL: @perthread_arrival_unscaled
+  // PREP: ttng.init_barrier %[[BAR:.*]], 1 :
+  // PREP: ttng.arrive_barrier %[[BAR]], 1 {perThread, per_warp} :
+  // FOLD-LABEL: @perthread_arrival_unscaled
+  // FOLD: ttng.init_barrier {{.*}}, 1 :
+  // FOLD: ttg.local_store
+  // FOLD-NEXT: ttg.barrier warp local
+  // FOLD-NEXT: ttng.arrive_barrier {{.*}}, 1 {perThread, per_warp}
+  tt.func @perthread_arrival_unscaled(%data: tensor<512xi32, #store>) -> tensor<512xi32, #load> {
+    %phase = arith.constant 0 : i32
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %mem = ttg.local_alloc : () -> !ttg.memdesc<512xi32, #shared, #smem, mutable>
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttg.barrier local
+    ttg.local_store %data, %mem : tensor<512xi32, #store> -> !ttg.memdesc<512xi32, #shared, #smem, mutable>
+    ttng.arrive_barrier %bar, 1 {perThread} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %loaded = ttg.local_load %mem : !ttg.memdesc<512xi32, #shared, #smem, mutable> -> tensor<512xi32, #load>
+    ttng.wait_barrier %bar, %phase : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return %loaded : tensor<512xi32, #load>
+  }
+}

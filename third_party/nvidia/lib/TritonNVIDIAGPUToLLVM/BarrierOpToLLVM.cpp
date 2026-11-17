@@ -482,7 +482,11 @@ struct ArriveBarrierOpConversion
   matchAndRewrite(triton::nvidia_gpu::ArriveBarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     unsigned count = op.getCount();
-    if (op.getPerWarp()) {
+    // The perThread path arrives with op.getCount() directly and never uses
+    // the divided count, so divisibility is only required for the leader
+    // path below. Unscaled per_warp perThread arrives (kept tagged for
+    // warp-scope placement without count scaling) lower here.
+    if (op.getPerWarp() && !op.getPerThread()) {
       unsigned numWarps = ttg::lookupNumWarps(op);
       if (count % numWarps != 0)
         return op.emitOpError("per_warp count must be divisible by the warp "

@@ -280,6 +280,23 @@ struct OptimizeMBarrierArrivalsPass
       uint64_t scale = getDistributionScale(uses, isPerWarp);
       if (!scale)
         return;
+      // Per-thread arrives already distribute over every thread: each
+      // thread's arrival is required for completion, so tagging cannot
+      // reduce participation and scaling only multiplies arrival traffic.
+      // Keep the tags (warp-scope placement) but skip count scaling when
+      // every per-warp conversion is a perThread arrive. Scale normally
+      // otherwise: lowering needs divisible counts for distributed
+      // arrivals, and phase math must stay uniform per barrier.
+      bool hasDistributedUse =
+          llvm::any_of(uses.arrivals,
+                       [](ArriveBarrierOp arrive) {
+                         return arrive.getPerWarp() && !arrive.getPerThread();
+                       }) ||
+          llvm::any_of(uses.expects, [](BarrierExpectOp expect) {
+            return expect.getPerWarp();
+          });
+      if (!hasDistributedUse)
+        return;
       // Scale every contribution, including bootstrap and conditional arrivals.
       OpBuilder builder(alloc.getContext());
       for (InitBarrierOp init : uses.inits)
