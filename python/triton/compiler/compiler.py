@@ -633,7 +633,9 @@ class CompiledKernel:
         # not enough shared memory to run the kernel
         max_shared = max_shared_mem(device)
         if shared > max_shared:
-            raise_(OutOfResources(shared, max_shared, "shared memory"))
+            raise_(
+                OutOfResources(shared, max_shared, "shared memory",
+                               getattr(self.metadata, "shared_memory_breakdown", None)))
         if hasattr(self.metadata, "tmem_size") and self.metadata.tmem_size is not None:
             # Use blackwell max tmem size for now, this should be moved in device properties
             max_tmem_size = 512  # tmem size in number of columns
