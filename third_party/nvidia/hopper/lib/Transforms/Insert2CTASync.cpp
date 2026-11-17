@@ -189,10 +189,9 @@ static std::optional<unsigned> addRunningIterCount(scf::ForOp inner) {
   if (auto whileOp = dyn_cast<scf::WhileOp>(outer))
     if (inner->getParentRegion() != &whileOp.getAfter())
       return std::nullopt;
-  if (!llvm::any_of(
-          ValueRange{inner.getLowerBound(), inner.getUpperBound(),
-                     inner.getStep()},
-          [&](Value v) { return isDefinedInside(v, outer); }))
+  if (!llvm::any_of(ValueRange{inner.getLowerBound(), inner.getUpperBound(),
+                               inner.getStep()},
+                    [&](Value v) { return isDefinedInside(v, outer); }))
     return std::nullopt;
   // The barrier lives outside the warp_specialize op, or at kernel entry
   // without warp specialization (see runOnOperation), so the persistent loop
@@ -234,7 +233,8 @@ static void addWhileIterationCounters(Operation *mma) {
   for (Operation *parent = mma->getParentOp();
        parent && !isa<triton::FuncOp>(parent); parent = parent->getParentOp()) {
     auto whileOp = dyn_cast<scf::WhileOp>(parent);
-    if (!whileOp || findWhileIterationCounter(whileOp, /*requireZeroInit=*/true))
+    if (!whileOp ||
+        findWhileIterationCounter(whileOp, /*requireZeroInit=*/true))
       continue;
     BlockArgument counter = appendWhileCounter(
         whileOp, [](OpBuilder &b, Location loc, BlockArgument arg) -> Value {
@@ -416,12 +416,10 @@ static unsigned getOperandPipelineDepth(ttng::MMAv5OpInterface mma) {
 // Insert the "arrive remote, wait local" cross-CTA sync ops before a 2-CTA
 // MMA. The barrier must be allocated externally (before the containing loop
 // if the MMA is in a loop).
-static LogicalResult insertSyncBeforeMMA(ttng::MMAv5OpInterface mma,
-                                         Value barrierAlloc,
-                                Operation *phaseScope, unsigned baseIdx,
-                                unsigned depth,
-                                const RunningIterCounts &counts,
-                                bool requireExact) {
+static LogicalResult
+insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
+                    Operation *phaseScope, unsigned baseIdx, unsigned depth,
+                    const RunningIterCounts &counts, bool requireExact) {
   MLIRContext *ctx = mma->getContext();
   Location loc = mma->getLoc();
   OpBuilder builder(mma);
@@ -432,9 +430,8 @@ static LogicalResult insertSyncBeforeMMA(ttng::MMAv5OpInterface mma,
   // slot instead of lapping a single barrier's phase bit.
   // A null iteration means no enclosing loop contributes an index, so there is
   // a single rendezvous: slot 0, phase 0.
-  FailureOr<Value> maybeLinearIter =
-      computeLinearBarrierIter(builder, loc, mma, phaseScope, counts,
-                               requireExact);
+  FailureOr<Value> maybeLinearIter = computeLinearBarrierIter(
+      builder, loc, mma, phaseScope, counts, requireExact);
   if (failed(maybeLinearIter))
     return failure();
   Value linearIter = *maybeLinearIter;
