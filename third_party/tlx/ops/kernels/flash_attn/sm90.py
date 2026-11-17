@@ -45,7 +45,6 @@ _DEFAULT_BLOCK_M = 128
 # because the serving batch may be symbolic.
 _NON_PERSISTENT_N_CTX_LIMIT = 4 * _DEFAULT_BLOCK_M
 # Profile-selected on H100 to avoid consumer spills without reducing CTA residency.
-_FWD_CONSUMER_REGISTERS = tl.constexpr(240)
 _DEFAULT_ROW_SCHEDULE = {
     "ROW_REVERSE_HEAD_GROUP": 0,
     "ROW_REVERSE_MAX": 0,
@@ -222,13 +221,7 @@ def _attn_fwd_non_persistent(
     offs_d = tl.arange(0, HEAD_DIM)
     d_mask = offs_d < HEAD_DIM
 
-    q_ptrs = (
-        q
-        + off_z * stride_qz
-        + off_h * stride_qh
-        + offs_m[:, None] * stride_qm
-        + offs_d[None, :] * stride_qd
-    )
+    q_ptrs = (q + off_z * stride_qz + off_h * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
     q_tile = tl.load(
         q_ptrs,
         mask=(offs_m[:, None] < N_CTX) & d_mask[None, :],
@@ -243,20 +236,8 @@ def _attn_fwd_non_persistent(
     for start_n in range(0, N_CTX, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         n_mask = offs_n < N_CTX
-        k_ptrs = (
-            k
-            + off_z * stride_kz
-            + off_h * stride_kh
-            + offs_n[:, None] * stride_kn
-            + offs_d[None, :] * stride_kd
-        )
-        v_ptrs = (
-            v
-            + off_z * stride_vz
-            + off_h * stride_vh
-            + offs_n[:, None] * stride_vn
-            + offs_d[None, :] * stride_vd
-        )
+        k_ptrs = (k + off_z * stride_kz + off_h * stride_kh + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd)
+        v_ptrs = (v + off_z * stride_vz + off_h * stride_vh + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)
         tile_mask = n_mask[:, None] & d_mask[None, :]
         k_tile = tl.load(k_ptrs, mask=tile_mask, other=0.0)
         v_tile = tl.load(v_ptrs, mask=tile_mask, other=0.0)
@@ -274,13 +255,7 @@ def _attn_fwd_non_persistent(
         m_i = m_ij
 
     acc = acc / l_i[:, None]
-    out_ptrs = (
-        out
-        + off_z * stride_oz
-        + off_h * stride_oh
-        + offs_m[:, None] * stride_om
-        + offs_d[None, :] * stride_od
-    )
+    out_ptrs = (out + off_z * stride_oz + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od)
     tl.store(
         out_ptrs,
         acc.to(out.dtype.element_ty),
@@ -414,6 +389,7 @@ def _attn_fwd_ws_pipelined_pingpong(sm_scale, M,  #
                                     NUM_MMA_WARPS: tl.constexpr,  #
                                     NUM_MMA_GROUPS: tl.constexpr,  #
                                     ):
+    _FWD_CONSUMER_REGISTERS: tl.constexpr = 240
     tl.static_assert(BLOCK_N <= HEAD_DIM or (HEAD_DIM == 64 and BLOCK_N == 128))
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     SERIALIZE_QK: tl.constexpr = (CAUSAL and not USE_BM192) or HEAD_DIM == 128
@@ -1283,15 +1259,9 @@ class _attention(torch.autograd.Function):
         o = torch.empty_like(q)
         extra_kern_args = {}
         n_ctx = triton.cdiv(q.shape[2], _DEFAULT_BLOCK_M) * _DEFAULT_BLOCK_M
-        use_bm192 = (
-            config is None
-            and all(isinstance(dim, int) for dim in q.shape)
-            and q.dtype == torch.bfloat16
-            and q.shape[0] == 4
-            and q.shape[1] == 48
-            and q.shape[2] in (1024, 2048, 4096, 8192)
-            and q.shape[3] == 64
-        )
+        use_bm192 = (config is None and all(isinstance(dim, int) for dim in q.shape) and q.dtype == torch.bfloat16
+                     and q.shape[0] == 4 and q.shape[1] == 48 and q.shape[2] in (1024, 2048, 4096, 8192)
+                     and q.shape[3] == 64)
 
         M = torch.empty((q.shape[0], q.shape[1], n_ctx), device=q.device, dtype=torch.float32)
         # Per-head rank-3 descriptors zero-fill loads and clip stores past the
@@ -1300,29 +1270,19 @@ class _attention(torch.autograd.Function):
         if rank3_desc:
             assert q.dtype != torch.float8_e5m2
             dummy_block = [1, 1, 1]
-            desc_q, desc_k, desc_v, desc_o = (
-                TensorDescriptor.from_tensor(t.view(-1, *t.shape[2:]), dummy_block) for t in (q, k, v, o))
+            desc_q, desc_k, desc_v, desc_o = (TensorDescriptor.from_tensor(t.view(-1, *t.shape[2:]), dummy_block)
+                                              for t in (q, k, v, o))
         else:
             # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
             y_dim = q.shape[0] * q.shape[1] * q.shape[2]
             dummy_block = [1, 1]
-            desc_q = TensorDescriptor.from_tensor(
-                q.reshape(y_dim, HEAD_DIM_K), dummy_block
-            )
+            desc_q = TensorDescriptor.from_tensor(q.reshape(y_dim, HEAD_DIM_K), dummy_block)
             if q.dtype == torch.float8_e5m2:
-                desc_v = TensorDescriptor.from_tensor(
-                    v.reshape(HEAD_DIM_K, y_dim), dummy_block
-                )
+                desc_v = TensorDescriptor.from_tensor(v.reshape(HEAD_DIM_K, y_dim), dummy_block)
             else:
-                desc_v = TensorDescriptor.from_tensor(
-                    v.reshape(y_dim, HEAD_DIM_K), dummy_block
-                )
-            desc_k = TensorDescriptor.from_tensor(
-                k.reshape(y_dim, HEAD_DIM_K), dummy_block
-            )
-            desc_o = TensorDescriptor.from_tensor(
-                o.reshape(y_dim, HEAD_DIM_K), dummy_block
-            )
+                desc_v = TensorDescriptor.from_tensor(v.reshape(y_dim, HEAD_DIM_K), dummy_block)
+            desc_k = TensorDescriptor.from_tensor(k.reshape(y_dim, HEAD_DIM_K), dummy_block)
+            desc_o = TensorDescriptor.from_tensor(o.reshape(y_dim, HEAD_DIM_K), dummy_block)
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -1374,7 +1334,14 @@ class _attention(torch.autograd.Function):
             "RANK3_DESC": rank3_desc,
         }
         _host_descriptor_pre_hook(nargs)
-        torch._library.capture_triton(_attn_fwd_ws_pipelined_pingpong.fn)[grid](
+        # capture_triton files each call's TMA descriptors in torch's
+        # process-wide kernel side table and never frees them, and desc_o pins
+        # o, so in eager mode every call would leak its output. Only
+        # torch.compile needs the wrapper.
+        kernel = _attn_fwd_ws_pipelined_pingpong.fn
+        if torch.compiler.is_compiling():
+            kernel = torch._library.capture_triton(kernel)
+        kernel[grid](
             sm_scale,
             M,
             q.shape[0],
@@ -1506,13 +1473,8 @@ def _persistent_attention(q, k, v, sm_scale, causal, config):
 
 def _should_use_non_persistent(q, k, v, config):
     n_ctx = q.shape[2]
-    return (
-        config is None
-        and q.shape[-1] == 128
-        and n_ctx < _NON_PERSISTENT_N_CTX_LIMIT
-        and n_ctx % _DEFAULT_BLOCK_M != 0
-        and not (q.requires_grad or k.requires_grad or v.requires_grad)
-    )
+    return (config is None and q.shape[-1] == 128 and n_ctx < _NON_PERSISTENT_N_CTX_LIMIT
+            and n_ctx % _DEFAULT_BLOCK_M != 0 and not (q.requires_grad or k.requires_grad or v.requires_grad))
 
 
 def _apply_attention(q, k, v, sm_scale, causal, config):

@@ -513,8 +513,7 @@ findReachableSMemOps(ttg::LocalLoadOp root) {
         smemOperand = candidate->getOperand(0);
       } else if (isa<ttg::LocalLoadOp, ttg::LocalDeallocOp>(candidate)) {
         smemOperand = candidate->getOperand(0);
-      } else if (isa<ttg::AsyncCopyGlobalToLocalOp,
-                     tt::amdgpu::BufferLoadToLocalOp>(candidate)) {
+      } else if (candidate->hasTrait<mlir::OpTrait::GlobalToLocalCopyTrait>()) {
         // InTheadTranspose cannot be used with direct-to-lds loads
         LDBG(" skip because of direct-to-lds load");
         return failure();
@@ -590,10 +589,9 @@ matchInThreadTransposePattern(ttg::LocalLoadOp lLoad) {
     return failure();
 
   int kDimNum = opDotOpEnc.getOpIdx() == 0 ? 1 : 0;
-  // TODO: support wmma
   if (!isa<ttg::AMDMfmaEncodingAttr, ttg::AMDWmmaEncodingAttr>(
           opDotOpEnc.getParent())) {
-    LDBG("Operand's parent encoding is not MFMA");
+    LDBG("Operand's parent encoding is not MFMA or WMMA");
     return failure();
   }
 

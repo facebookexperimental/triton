@@ -1,0 +1,12 @@
+{
+  "priority": 20,
+  "backends": ["cuda", "nvidia"],
+  "architectures": ["hopper", "h100", "sm90", "sm_90"],
+  "documents": [
+    "hopper-machine-limits.md",
+    "hopper-warp-spec-producer-consumer.md",
+    "hopper-warp-spec-geometry-retune.md",
+    "hopper-warp-spec-consumer-patterns.md",
+    "hopper-warp-spec-pipeline-overlap.md"
+  ]
+}

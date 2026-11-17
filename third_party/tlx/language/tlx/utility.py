@@ -1,5 +1,6 @@
 import re
 import builtins
+import math
 
 import triton.language.core as tl
 import triton.runtime.driver as driver
@@ -19,26 +20,38 @@ def is_amd_tdm_target(arch):
 
 
 @tl.builtin
-def amd_set_wave_sched_mode(value: tl.constexpr, offset: tl.constexpr = 0, width: tl.constexpr = 2, _semantic=None):
-    """Write a field of ``HW_REG_WAVE_SCHED_MODE`` on gfx12 GPUs.
+def amd_scaled_downcast_fp8(value, scale: tl.constexpr, dtype: tl.constexpr = tl.float8e4nv, _semantic=None):
+    """Convert ``value * scale`` from FP32 to FP8 on gfx950.
 
-    ``value``, ``offset``, and ``width`` must be compile-time integers. Each
-    executing wave updates the selected field and preserves the other bits.
-    This emits ``llvm.amdgcn.s.setreg`` and does not configure LLVM's scheduler
-    or its wait insertion. Bits 0..1 select the hardware scheduling mode;
-    bit 2 controls WMMA queuing on gfx1250.
+    ``scale`` must be a compile-time power of two from 2^-127 to 2^126. The
+    conversion instruction divides by the E8M0 scale ``1 / scale``, emitted as
+    ``amdg.scaled_downcast_fp8`` with ``scale_const = 127 - log2(scale)``, so
+    no separate FP32 multiply is needed. ``dtype`` is ``tl.float8e4nv``
+    (E4M3FN, the default) or ``tl.float8e5`` (E5M2). Rounding is
+    round-to-nearest-even; NaNs and values beyond the FP8 range convert to
+    NaN. The result keeps the input's layout.
     """
     options = _semantic.builder.options
-    if options.backend_name != "hip" or not options.arch.startswith("gfx12"):
-        raise NotImplementedError("tlx.amd_set_wave_sched_mode requires an AMD gfx12 target")
-    value, offset, width = (tl._unwrap_if_constexpr(arg) for arg in (value, offset, width))
-    if any(type(arg) is not int for arg in (value, offset, width)):
-        raise ValueError("value, offset, and width must be constexpr integers")
-    if not 0 <= offset < 32 or not 1 <= width <= 32 - offset:
-        raise ValueError("the register field must fit within 32 bits")
-    if not 0 <= value < 1 << width:
-        raise ValueError("value must fit in the selected register field")
-    _semantic.builder.create_amd_set_wave_sched_mode(value, offset, width)
+    if options.backend_name != "hip" or options.arch != "gfx950":
+        raise NotImplementedError("tlx.amd_scaled_downcast_fp8 requires gfx950")
+    value = _semantic.to_tensor(value)
+    if not value.type.is_block() or value.dtype != tl.float32:
+        raise TypeError("value must be an FP32 tensor")
+    dtype = tl._unwrap_if_constexpr(dtype)
+    if dtype not in (tl.float8e4nv, tl.float8e5):
+        raise TypeError("dtype must be tl.float8e4nv or tl.float8e5")
+    scale = tl._unwrap_if_constexpr(scale)
+    if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("scale must be a positive compile-time power of two")
+    mantissa, exponent = math.frexp(scale)
+    log2_scale = exponent - 1
+    # E8M0 byte 0 (2^-127) lowers to a zero divisor, and 255 is NaN.
+    if mantissa != 0.5 or not -127 <= log2_scale <= 126:
+        raise ValueError("scale must be a power of two from 2^-127 to 2^126")
+    result_ty = tl.block_type(dtype, value.type.shape)
+    handle = _semantic.builder.create_amd_scaled_downcast_fp8(value.handle, dtype.to_ir(_semantic.builder),
+                                                              127 - log2_scale)
+    return tl.tensor(handle, result_ty)
 
 
 def cuda_parse_arch(arch):
@@ -94,13 +107,14 @@ def num_warps(_semantic=None):
 
 @tl.builtin
 def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semantic=None, _generator=None):
-    """Execute ``body`` under an AMD per-lane execution predicate.
+    """Execute ``body`` under a per-lane execution predicate.
 
     A scalar predicate supplies the execution bit for the current physical
     lane. For a tensor predicate, elements owned by one lane are OR-reduced to
     that lane's execution bit. A wavefront skips ``body`` when none of its
     lanes are active. Active lanes receive the values returned by
-    ``body(*inits, *args)``; inactive lanes keep ``inits``. The body must be an
+    ``body(*inits, *args)``; inactive lanes keep ``inits``. With no ``inits``,
+    the body returns nothing and is run only for its effects. The body must be an
     ``@triton.jit`` function containing straight-line computation without
     cross-wave synchronization. Bodies containing reductions, dots, or layout
     shuffles must pass ``wave_uniform=True`` to declare that the predicate has
@@ -110,8 +124,12 @@ def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semanti
     match each carried tensor or a common leading shape (for example, one row
     predicate for row-major matrices).
 
-    This operation has no cross-wave synchronization and is currently lowered
-    only by the AMD backend.
+    This operation has no cross-wave synchronization, so compilation fails if
+    the body needs a CTA barrier. NVIDIA so far supports only effects-only
+    bodies (no ``inits``) under a scalar ``wave_uniform=True`` predicate such as
+    ``tlx.warp_any(...)``, containing register math and tensor memory loads and
+    stores. Other operations, such as mbarrier arrives and waits, are not yet
+    supported in the body on NVIDIA.
     """
     if isinstance(inits, tl.tensor):
         inits = (inits, )
@@ -122,8 +140,6 @@ def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semanti
 
     inits = builtins.list(inits)
     args = builtins.list(args)
-    if not inits:
-        raise ValueError("warp_predicate requires at least one carried value")
     if not all(isinstance(value, tl.tensor) for value in inits):
         raise TypeError("warp_predicate carried values must be tensors")
 
@@ -135,12 +151,19 @@ def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semanti
         raise TypeError(f"warp_predicate wave_uniform must be a bool, got {type(wave_uniform).__name__}")
 
     builder = _semantic.builder
+    # Moving the insertion point into the detached body block and back resets
+    # the builder location, so restore the caller's location for the body call
+    # and for the op, whose diagnostics should point at this call.
+    loc = builder.get_loc()
     block = builder.new_block()
     insertion_point = builder.get_insertion_point()
     try:
         builder.set_insertion_point_to_start(block)
+        builder.set_loc(loc)
         body_result = _generator.call_JitFunction(body, inits + args, kwargs={})
-        if isinstance(body_result, tl.tensor):
+        if body_result is None or (isinstance(body_result, tl.constexpr) and body_result.value is None):
+            results = []
+        elif isinstance(body_result, tl.tensor):
             results = [body_result]
         elif isinstance(body_result, (builtins.tuple, builtins.list, tl.tuple)):
             results = builtins.list(body_result)
@@ -156,6 +179,7 @@ def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semanti
         builder.create_predicate_yield_op([result.handle for result in results])
     finally:
         builder.restore_insertion_point(insertion_point)
+        builder.set_loc(loc)
 
     result_types = [result.type.to_ir(builder) for result in results]
     op = builder.create_warp_predicate_op(
@@ -268,7 +292,7 @@ def stoch_round(
     """
     Hardware-accelerated stochastic rounding for FP32→FP8/BF16/F16 conversions.
 
-    Requires Blackwell GPU (compute capability >= 100).
+    Requires Blackwell GPU (compute capability >= 100), or CDNA3/CDNA4/CDNA5 on AMD.
 
     Semantics:
         y = tlx.stoch_round(src, dst_ty, rand_bits)
@@ -277,28 +301,56 @@ def stoch_round(
         cvt.rs.satfinite.{e4m3x4,e5m2x4}.f32  d, {a,b,c,d}, rbits  (for FP8)
         cvt.rs.satfinite.{bf16x2,f16x2}.f32   d, {a,b}, rbits      (for BF16/F16)
 
+    Maps to GCN (on AMD):
+        v_cvt_sr_fp8_f32 / v_cvt_sr_bf8_f32  (for FP8, one element per seed)
+        v_cvt_sr_f16_f32 / v_cvt_sr_bf16_f32 (for F16/BF16 on CDNA4)
+        v_cvt_sr_pk_f16_f32 / v_cvt_sr_pk_bf16_f32 (for F16/BF16 on CDNA5,
+            i.e. gfx1250; packed pairs sharing one seed)
+    The fp8 encoding follows the architecture: FNUZ on CDNA3 (gfx942),
+    OCP on CDNA4 (gfx950) and CDNA5 (gfx1250).
+
     Args:
         src:
             Source FP32 tensor. Shape defines output shape.
         dst_ty:
-            Destination dtype: tl.float8e5, tl.float8e4nv, tl.float16, or tl.bfloat16
+            Destination dtype. On CUDA: tl.float8e5, tl.float8e4nv, tl.float16,
+            or tl.bfloat16. On CDNA4/CDNA5: the same four. On CDNA3:
+            tl.float8e4b8 or tl.float8e5b16 (FNUZ fp8 only).
         rand_bits:
             Random bits (uint32 tensor) for entropy, must match src shape
 
     Returns:
         Tensor with dtype dst_ty and shape matching src.
     """
-    capability = int(cuda_parse_arch(_semantic.builder.options.arch))
-    assert capability >= 100, (f"stoch_round requires compute capability >= 100 (Blackwell GPU), "
-                               f"current capability: {capability}")
+    if isinstance(dst_ty, tl.constexpr):
+        dst_ty = dst_ty.value
+    arch = _semantic.builder.options.arch
+    if isinstance(arch, str) and arch.startswith("gfx"):
+        # CDNA3 (gfx942) converts to FNUZ fp8 only; CDNA4 (gfx950) and CDNA5
+        # (gfx1250) convert to OCP fp8/f16/bf16. Older CDNA has no
+        # stochastic-rounding support.
+        # Strip any ":feature" suffix (e.g. "gfx942:sramecc+:xnack-") before
+        # matching the version.
+        gfx_version = arch.split(":")[0].removeprefix("gfx")
+        if gfx_version in ("950", "1250"):
+            supported_dst = [tl.float8e5, tl.float8e4nv, tl.float16, tl.bfloat16]
+        elif gfx_version == "942":
+            supported_dst = [tl.float8e4b8, tl.float8e5b16]
+        else:
+            raise AssertionError(f"stoch_round requires gfx942 (CDNA3, FNUZ fp8 only), gfx950 (CDNA4), or "
+                                 f"gfx1250 (CDNA5), got arch {arch}")
+    else:
+        capability = int(cuda_parse_arch(arch))
+        assert capability >= 100, (f"stoch_round requires compute capability >= 100 (Blackwell GPU), "
+                                   f"current capability: {capability}")
+        supported_dst = [tl.float8e5, tl.float8e4nv, tl.float16, tl.bfloat16]
     src_ty = src.type
     src_sca_ty = src_ty.scalar
 
     assert src_sca_ty == tl.float32, (f"Stochastic rounding only supports fp32 source, got {src_sca_ty}. "
                                       f"Source must be float32.")
-    assert dst_ty in [tl.float8e5, tl.float8e4nv, tl.float16, tl.bfloat16
-                      ], (f"Stochastic rounding only supports fp8/fp16/bf16 destination, got {dst_ty}. "
-                          f"Supported types: float8e5 (fp8 E5M2), float8e4nv (fp8 E4M3FN), float16, bfloat16")
+    assert dst_ty in supported_dst, (f"Stochastic rounding does not support destination {dst_ty} on arch {arch}. "
+                                     f"Supported types: {', '.join(str(t) for t in supported_dst)}")
 
     rbits_ty = rand_bits.type
     if src_ty.is_block() and rbits_ty.is_block():

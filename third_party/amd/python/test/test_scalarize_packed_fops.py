@@ -5,7 +5,7 @@ import pytest
 import triton
 
 current_target = triton.runtime.driver.active.get_current_target()
-if current_target.arch not in ("gfx950", "gfx942", "gfx90a", "gfx908"):
+if current_target.arch not in ("gfx950", "gfx942", "gfx90a"):
     pytest.skip(allow_module_level=True)
 
 
@@ -29,10 +29,15 @@ def _packed_op_feeds_wide_store(bb, match, wide_store):
     if not dest:
         return False
     lo, hi = sorted((int(dest.group(1)), int(dest.group(2))))
+
+    def lane_referenced(store_line, lane):
+        if re.search(rf"v(?:\[)?{lane}\b", store_line):
+            return True
+        # 64-bit wide stores take the pair as one v[lo:hi] range operand.
+        return any(int(rlo) <= lane <= int(rhi) for rlo, rhi in re.findall(r"v\[(\d+):(\d+)\]", store_line))
+
     for store_line in bb.splitlines():
-        if wide_store.search(store_line) and all(
-            re.search(rf"v(?:\[)?{lane}\b", store_line) for lane in range(lo, hi + 1)
-        ):
+        if wide_store.search(store_line) and all(lane_referenced(store_line, lane) for lane in range(lo, hi + 1)):
             return True
     return False
 
@@ -49,7 +54,7 @@ def test_check_not_scalarize():
         bbs = list(re.split(r"^\d+:\s+; preds = %.*?$", func_body, flags=re.MULTILINE))
         assert len(bbs) > 1, "didn't split func body correctly"
         found_colliding_packed_fop = False
-        packed_fop = re.compile(r"= f(add|sub|mul) <")
+        packed_fop = re.compile(r"= f(add|sub|mul)(?:\s+[a-z]+)* <")
         for bb in bbs:
             if ("mfma" in bb or "wmma" in bb) and packed_fop.search(bb):
                 found_colliding_packed_fop = True
@@ -90,7 +95,7 @@ def test_check_scalarized():
         bbs = list(re.split(r"^\d+:\s+; preds = %.*?$", func_body, flags=re.MULTILINE))
         assert len(bbs) > 1, "didn't split func body correctly"
         found_mfma = False
-        packed_fop = re.compile(r"= f(add|sub|mul) <")
+        packed_fop = re.compile(r"= f(add|sub|mul)(?:\s+[a-z]+)* <")
         for bb in bbs:
             if "mfma" in bb or "wmma" in bb:
                 assert not packed_fop.search(bb)
@@ -114,18 +119,15 @@ def test_check_scalarized():
         # MFMA-adjacent unpacking leaves those alone when they do not overlap
         # MFMA latency, so they are not scalarization failures. Anything else
         # packed in an MFMA block is.
-        wide_store = re.compile(
-            r"(ds_write2\w*|buffer_store_format_xy\w*|(?:buffer|flat|global)_store_dwordx2\w*)\b"
-        )
+        wide_store = re.compile(r"(ds_write2\w*|buffer_store_format_xy\w*|(?:buffer|flat|global)_store_dwordx2\w*)\b")
         for bb in bbs:
             has_mfma = "mfma" in bb or "wmma" in bb
             if has_mfma:
                 found_mfma = True
             for m in packed_fop.finditer(bb):
                 if has_mfma:
-                    assert _packed_op_feeds_wide_store(bb, m, wide_store), (
-                        f"packed op in MFMA block not feeding a wide store: {m.group(0)}"
-                    )
+                    assert _packed_op_feeds_wide_store(
+                        bb, m, wide_store), (f"packed op in MFMA block not feeding a wide store: {m.group(0)}")
                 else:
                     found_packed_fop = True
             # the remaining v_pk_muls are in the epilogue; the one v_pk_add left

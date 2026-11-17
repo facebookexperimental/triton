@@ -13,7 +13,9 @@ The pybind11 -> nanobind port dropped ``.none()`` from every ``std::optional``
 parameter in ``triton_tlx.cc`` (and from ``create_descriptor_load`` in ``ir.cc``).
 This test parses both sources, finds every ``std::optional`` parameter, and asserts
 the built extension renders it as ``... | None``, so it also covers bindings added
-after this test was written.
+after this test was written. A binding may expose several overloads (e.g.
+``create_descriptor_load``); every overload that declares an optional parameter
+must render it none-able.
 """
 
 import re
@@ -78,10 +80,33 @@ def _optional_params_by_method():
     return result
 
 
-def _signature(method_name):
+def _signatures(method_name):
+    """Every rendered signature for a builder method, one entry per overload.
+
+    pybind11 renders one signature per ``__doc__`` line; nanobind renders a
+    ``name(*args, **kwargs)`` header, an ``Overloaded function.`` line, then
+    numbered ``1. sig`` / ``2. sig`` lines. Headers are skipped and ``N. ``
+    prefixes stripped so callers see only real signatures.
+    """
     fn = getattr(libtriton.ir.builder, method_name, None)
     assert fn is not None, f"ir.builder has no method {method_name}"
-    return (fn.__doc__ or "").splitlines()[0]
+    sigs = []
+    for raw in (fn.__doc__ or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        line = re.sub(r"^\d+\.\s*", "", line)
+        if line.startswith("Overloaded function"):
+            continue
+        if "(" not in line or ")" not in line or "->" not in line:
+            continue
+        if method_name not in line:
+            continue
+        if "*args" in line:
+            continue
+        sigs.append(line)
+    assert sigs, f"no signatures found for {method_name}; doc: {fn.__doc__!r}"
+    return sigs
 
 
 def _signature_args(signature):
@@ -104,13 +129,16 @@ def test_all_optional_params_are_none_able():
 
     errors = []
     for method, opts in sorted(optional_params.items()):
-        sig = _signature(method)
-        args = _signature_args(sig)
+        sigs = _signatures(method)
+        parsed = [(sig, _signature_args(sig)) for sig in sigs]
         for pos, cpp_name in sorted(opts.items()):
-            assert pos < len(args), f"{method}: parsed param {cpp_name} at {pos} but signature has {len(args)} args"
-            if not _NONE_ABLE.search(args[pos]):
-                errors.append(f"{method}({cpp_name}) is std::optional but not none-able\n"
-                              f"    rendered as: {args[pos]}\n    signature:   {sig}")
+            matching = [(sig, args) for sig, args in parsed if pos < len(args)]
+            assert matching, (f"{method}: parsed param {cpp_name} at {pos} but no overload "
+                              f"has that many args; signatures: {sigs}")
+            for sig, args in matching:
+                if not _NONE_ABLE.search(args[pos]):
+                    errors.append(f"{method}({cpp_name}) is std::optional but not none-able\n"
+                                  f"    rendered as: {args[pos]}\n    signature:   {sig}")
 
     assert not errors, ("nanobind std::optional parameters missing `py::arg(...).none()`:\n\n" + "\n".join(errors))
 
@@ -126,8 +154,13 @@ def test_all_optional_params_are_none_able():
     ],
 )
 def test_known_regressed_bindings_accept_none(method, args):
-    sig = _signature(method)
+    sigs = _signatures(method)
+    parsed = [(sig, _signature_args(sig)) for sig in sigs]
     for arg in args:
-        rendered = [a for a in _signature_args(sig) if a.startswith(f"{arg}:")]
-        assert rendered, f"{method} has no argument named {arg}; got: {sig}"
-        assert _NONE_ABLE.search(rendered[0]), f"{method}({arg}) must accept None; got: {sig}"
+        declaring = [(sig, match)
+                     for sig, sig_args in parsed
+                     for match in [a for a in sig_args if a.startswith(f"{arg}:")]
+                     if match]
+        assert declaring, f"{method} has no argument named {arg}; got: {' | '.join(sigs)}"
+        for sig, rendered in declaring:
+            assert _NONE_ABLE.search(rendered), f"{method}({arg}) must accept None; got: {sig}"
