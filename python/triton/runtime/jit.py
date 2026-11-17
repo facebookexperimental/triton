@@ -1254,6 +1254,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
             # canonicalize grid
             if callable(grid):
                 grid = grid(bound_args)
+            if isinstance(grid, int):
+                grid = (grid, )
             grid_size = len(grid)
             grid_0 = grid[0]
             grid_1 = grid[1] if grid_size > 1 else 1

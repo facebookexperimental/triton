@@ -271,33 +271,6 @@ public:
   }
 };
 
-void lowerNVPTXFAbs(llvm::Module &module) {
-  if (!module.getTargetTriple().isNVPTX())
-    return;
-
-  SmallVector<IntrinsicInst *> calls;
-  for (Function &function : module) {
-    if (function.getIntrinsicID() != Intrinsic::fabs ||
-        !function.getReturnType()->getScalarType()->isFloatTy())
-      continue;
-    for (User *user : function.users())
-      if (auto *call = dyn_cast<IntrinsicInst>(user))
-        if (!call->hasNoNaNs())
-          calls.push_back(call);
-  }
-
-  for (IntrinsicInst *call : calls) {
-    IRBuilder<> builder(call);
-    Type *bitsType = builder.getInt32Ty();
-    if (auto *vectorType = dyn_cast<VectorType>(call->getType()))
-      bitsType = VectorType::get(bitsType, vectorType->getElementCount());
-    Value *bits = builder.CreateBitCast(call->getArgOperand(0), bitsType);
-    Value *magnitude = builder.CreateAnd(bits, 0x7fffffff);
-    call->replaceAllUsesWith(builder.CreateBitCast(magnitude, call->getType()));
-    call->eraseFromParent();
-  }
-}
-
 std::unique_ptr<TargetMachine>
 createTargetMachine(llvm::Module *module, std::string proc,
                     bool enable_fp_fusion, const std::string &features,
@@ -319,6 +292,36 @@ createTargetMachine(llvm::Module *module, std::string proc,
       disableLLVMOpt ? llvm::CodeGenOptLevel::None
                      : llvm::CodeGenOptLevel::Aggressive)};
   return machine;
+}
+
+void lowerNVPTXFAbs(llvm::Module &module) {
+  if (!module.getTargetTriple().isNVPTX())
+    return;
+
+  SmallVector<IntrinsicInst *> calls;
+  for (Function &function : module) {
+    if (function.getIntrinsicID() != Intrinsic::fabs ||
+        !function.getReturnType()->getScalarType()->isFloatTy())
+      continue;
+    for (User *user : function.users())
+      if (auto *call = dyn_cast<IntrinsicInst>(user))
+        if (!call->hasNoNaNs())
+          calls.push_back(call);
+  }
+
+  // FPSan needs NaN payloads preserved, but PTX abs.f32 may canonicalize them.
+  // Rewrite after IR optimization: InstCombine can otherwise recreate fabs,
+  // and NVPTX does not consistently lower its scalar and vector forms alike.
+  for (IntrinsicInst *call : calls) {
+    IRBuilder<> builder(call);
+    Type *bitsType = builder.getInt32Ty();
+    if (auto *vectorType = dyn_cast<VectorType>(call->getType()))
+      bitsType = VectorType::get(bitsType, vectorType->getElementCount());
+    Value *bits = builder.CreateBitCast(call->getArgOperand(0), bitsType);
+    Value *magnitude = builder.CreateAnd(bits, 0x7fffffff);
+    call->replaceAllUsesWith(builder.CreateBitCast(magnitude, call->getType()));
+    call->eraseFromParent();
+  }
 }
 
 std::string
