@@ -731,78 +731,13 @@ static SmallVector<Operation *> topologicalSort(ArrayRef<Operation *> opList) {
   return sortedOpList;
 }
 
-// True if `op` or an op nested in it may read or write memory. Ops without a
-// memory effect interface count as touching memory.
-static bool mayReadOrWriteMemory(Operation *op) {
-  return op
-      ->walk([](Operation *nested) {
-        if (nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
-          return WalkResult::advance();
-        auto iface = dyn_cast<MemoryEffectOpInterface>(nested);
-        if (!iface || iface.hasEffect<MemoryEffects::Read>() ||
-            iface.hasEffect<MemoryEffects::Write>())
-          return WalkResult::interrupt();
-        return WalkResult::advance();
-      })
-      .wasInterrupted();
-}
-
-static bool mayWriteMemory(Operation *op) {
-  return op
-      ->walk([](Operation *nested) {
-        if (nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
-          return WalkResult::advance();
-        auto iface = dyn_cast<MemoryEffectOpInterface>(nested);
-        if (!iface || iface.hasEffect<MemoryEffects::Write>())
-          return WalkResult::interrupt();
-        return WalkResult::advance();
-      })
-      .wasInterrupted();
-}
-
-// The kernel argument a global memory access is based on, or null if unknown.
-static Value getAccessedKernelArg(Operation *op) {
-  Value ptr;
-  if (auto load = dyn_cast<tt::LoadOp>(op))
-    ptr = load.getPtr();
-  else if (auto store = dyn_cast<tt::StoreOp>(op))
-    ptr = store.getPtr();
-  else if (auto rmw = dyn_cast<tt::AtomicRMWOp>(op))
-    ptr = rmw.getPtr();
-  else if (auto cas = dyn_cast<tt::AtomicCASOp>(op))
-    ptr = cas.getPtr();
-  else if (auto load = dyn_cast<tt::DescriptorLoadOp>(op))
-    ptr = load.getDesc();
-  else if (auto store = dyn_cast<tt::DescriptorStoreOp>(op))
-    ptr = store.getDesc();
-  else
-    return {};
-  while (Operation *def = ptr.getDefiningOp()) {
-    if (auto addPtr = dyn_cast<tt::AddPtrOp>(def))
-      ptr = addPtr.getPtr();
-    else if (auto splat = dyn_cast<tt::SplatOp>(def))
-      ptr = splat.getSrc();
-    else if (auto broadcast = dyn_cast<tt::BroadcastOp>(def))
-      ptr = broadcast.getSrc();
-    else if (auto makeDesc = dyn_cast<tt::MakeTensorDescOp>(def))
-      ptr = makeDesc.getBase();
-    else
-      return {};
-  }
-  return ptr;
-}
-
 // True if running `a` after `b` instead of before it may change what either
-// one reads or writes. Accesses based on different kernel arguments are
-// treated as accesses to different buffers.
+// one reads or writes. Kernel pointer arguments may alias (in-place kernels
+// are legal and nothing marks them noalias), so any pair of memory accesses
+// where one writes counts as a conflict.
 static bool mayConflict(Operation *a, Operation *b) {
-  if (!mayReadOrWriteMemory(a) || !mayReadOrWriteMemory(b))
-    return false;
-  if (!mayWriteMemory(a) && !mayWriteMemory(b))
-    return false;
-  Value argA = getAccessedKernelArg(a);
-  Value argB = getAccessedKernelArg(b);
-  return !argA || !argB || argA == argB;
+  return tt::mayReadOrWriteMemory(a) && tt::mayReadOrWriteMemory(b) &&
+         (tt::mayWriteMemory(a) || tt::mayWriteMemory(b));
 }
 
 // Untagged ops after the warp-specialized loop read what the loop wrote, so
@@ -853,7 +788,7 @@ static void moveUntaggedPostLoopOps(Block *block, ttg::WarpSpecializeOp wsOp,
       op->moveBefore(block->getTerminator());
       continue;
     }
-    if (mayReadOrWriteMemory(op))
+    if (tt::mayReadOrWriteMemory(op))
       op->emitWarning("this op runs after the warp-specialized loop but a "
                       "later warp-specialized op depends on it or may access "
                       "the same memory, so it stays ahead of the partitions "

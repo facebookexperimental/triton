@@ -5,6 +5,7 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/CallInterfaces.h"
 #include "triton/Analysis/CallGraph.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -63,22 +64,6 @@ static void enableSingleWarpSpecializeForAutoWS(ModuleOp mod) {
   });
   if (hasAutoWSTag)
     setHasSingleWarpSpecialize(mod, true);
-}
-
-// True if `op` or an op nested in it may read or write memory. Ops without a
-// memory effect interface count as touching memory.
-static bool mayReadOrWriteMemory(Operation *op) {
-  return op
-      ->walk([](Operation *nested) {
-        if (nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
-          return WalkResult::advance();
-        auto iface = dyn_cast<MemoryEffectOpInterface>(nested);
-        if (!iface || iface.hasEffect<MemoryEffects::Read>() ||
-            iface.hasEffect<MemoryEffects::Write>())
-          return WalkResult::interrupt();
-        return WalkResult::advance();
-      })
-      .wasInterrupted();
 }
 
 static bool isTMAStoreLikeOp(Operation *op) {
