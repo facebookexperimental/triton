@@ -285,6 +285,16 @@ public:
     // persistent kernels.
     removeRedundantTmemZeroStores(funcOp);
 
+    // createAllocChannel (inside doCodePartition) cannot represent a buffer
+    // written by more than one partition for a consumer in another one. By
+    // then the descriptor-load rewrite below has already happened and there is
+    // no way back, so detect it here, while bailing out is still clean.
+    if (hasMultipleCrossPartitionProducers(funcOp)) {
+      LDBG("Warp specialization found a buffer with multiple cross-partition "
+           "producers. Skipping.");
+      return bailOut(funcOp);
+    }
+
     if (failed(doConvertDescriptorLoadsToNVWS(funcOp))) {
       signalPassFailure();
       return;
