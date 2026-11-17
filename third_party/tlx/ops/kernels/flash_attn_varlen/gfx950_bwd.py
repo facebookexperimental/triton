@@ -6129,6 +6129,9 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False, dq_ato
             reverse_local_assignment=True,
             enable_sched_group_barrier_scheduler=False,
             llvm_fn_attrs=() if chunked_prefix_fp32_case else (("amdgpu-sched-strategy", "max-ilp"), ),
+            # WORKAROUND: LLVM's MFMA anti-hints (llvm/llvm-project#218075) make this kernel spill 20 VGPRs.
+            llvm_cl_opts=(("amdgpu-anti-hints",
+                           "false"), ) if exact_core is _varlen_bwd_interleaved_bm16_bn256_fp32_kernel else (),
         )
     elif (block_m, block_n) == (_WIDE_BLOCK_M, _WIDE_BLOCK_N):
         wide_core = _varlen_bwd_interleaved_bm32_kernel

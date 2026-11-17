@@ -280,6 +280,5 @@ def matmul(a, b):
         num_warps=8,
         num_stages=1,
         matrix_instr_nonkdim=16,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
     )
     return c

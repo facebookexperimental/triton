@@ -12,16 +12,11 @@
 
 namespace mlir::triton::AMD {
 
-unsigned getConvertLayoutScratchInBytes(gpu::ConvertLayoutOp op,
-                                        TargetInfoBase &targetInfo) {
-  if (!cvtNeedsSharedMemory(op))
-    return 0;
-  auto srcTy = op.getSrc().getType();
-  auto dstTy = op.getType();
+static unsigned getSwizzledCvtScratchInBytes(const LinearLayout &srcLayout,
+                                             const LinearLayout &dstLayout,
+                                             unsigned bitwidth,
+                                             TargetInfoBase &targetInfo) {
   int numBanks = targetInfo.getSharedMemoryBanks();
-  auto srcLayout = gpu::toLinearLayout(srcTy);
-  auto dstLayout = gpu::toLinearLayout(dstTy);
-  auto bitwidth = getBitwidth(srcTy);
   auto vecBitwidth =
       triton::gpu::getVecBitwidthLdSt(srcLayout, dstLayout, bitwidth);
   auto [dstTile, srcTile] = targetInfo.getSharedLdStTiles(vecBitwidth);
@@ -30,24 +25,29 @@ unsigned getConvertLayoutScratchInBytes(gpu::ConvertLayoutOp op,
   return elems * bitwidth / 8;
 }
 
-static unsigned getBufferAtomicScratchSizeInBytes(Operation *op) {
-  Value result = op->getResult(0);
-  if (result.use_empty())
+unsigned getConvertLayoutScratchInBytes(gpu::ConvertLayoutOp op,
+                                        TargetInfoBase &targetInfo) {
+  auto srcTy = op.getSrc().getType();
+  auto dstTy = op.getType();
+  // A transpose moves its odd tiles one at a time on the pow2 path.
+  auto plan = getMixedRadixConversionPlan(srcTy, dstTy);
+  if (plan && plan->transfer == MixedRadixConversionTransfer::Shared) {
+    auto kReg = StringAttr::get(op.getContext(), "register");
+    if (auto tiles = getMixedRadixTransposeTiles(
+            gpu::toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg),
+            gpu::toLinearLayout(dstTy).removeZeroBasesAlongDim(kReg),
+            getBitwidth(srcTy)))
+      return getSwizzledCvtScratchInBytes(tiles->sourceTile,
+                                          tiles->destinationTile,
+                                          getBitwidth(srcTy), targetInfo);
+  }
+  if (auto bytes = getMixedRadixConversionScratchBytes(op))
+    return *bytes;
+  if (!cvtNeedsSharedMemory(op))
     return 0;
-  auto tensorTy = dyn_cast<RankedTensorType>(result.getType());
-  if (!tensorTy)
-    return 0;
-  auto freeVariableMasks = gpu::toLinearLayout(tensorTy).getFreeVariableMasks();
-  bool hasBroadcast = llvm::any_of(freeVariableMasks,
-                                   [](auto mask) { return mask.second != 0; });
-  if (!hasBroadcast)
-    return 0;
-  auto smemShape = convertType<unsigned>(gpu::getShapePerCTA(tensorTy));
-  auto elems = getNumScratchElements(smemShape);
-  if (elems == 0)
-    return 0;
-  auto elemTy = tensorTy.getElementType();
-  return elems * std::max<int>(8, elemTy.getIntOrFloatBitWidth()) / 8;
+  return getSwizzledCvtScratchInBytes(gpu::toLinearLayout(srcTy),
+                                      gpu::toLinearLayout(dstTy),
+                                      getBitwidth(srcTy), targetInfo);
 }
 
 unsigned AMDAllocationAnalysisScratchSizeFn(Operation *op,
@@ -91,7 +91,7 @@ unsigned AMDAllocationAnalysisScratchSizeFn(Operation *op,
   }
 
   if (isa<amdgpu::BufferAtomicCASOp, amdgpu::BufferAtomicRMWOp>(op))
-    return getBufferAtomicScratchSizeInBytes(op);
+    return getAtomicResultScratchSize(op->getResult(0));
 
   return defaultAllocationAnalysisScratchSizeFn(op);
 }

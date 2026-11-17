@@ -82,6 +82,8 @@ def parse_args(cases):
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--rep", type=int, default=50)
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--gpu-time", action="store_true",
+                        help="Also report summed GPU kernel time (kineto, warm cache) for launch-bound shapes")
     selected, _ = parser.parse_known_args()
     cases[selected.case].add_arguments(parser)
     args = parser.parse_args()
@@ -163,20 +165,35 @@ def bench_us(fn, args) -> float:
     return float(triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep, return_mode="median")) * 1000
 
 
+def gpu_us(fn, args) -> float:
+    for _ in range(args.warmup):
+        fn()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        for _ in range(args.rep):
+            fn()
+        torch.cuda.synchronize()
+    return sum(event.self_device_time_total for event in prof.key_averages()) / args.rep
+
+
 def time_interleaved(case, args, functions, phase) -> None:
-    samples = {variant: [] for variant in functions}
+    timers = {"": bench_us, "gpu_": gpu_us} if args.gpu_time else {"": bench_us}
+    samples = {(prefix, variant): [] for prefix in timers for variant in functions}
     for sample in range(args.samples):
         order = ("baseline", "candidate") if sample % 2 == 0 else ("candidate", "baseline")
-        measured = {}
-        for variant in order:
-            measured[variant] = bench_us(functions[variant], args)
-            samples[variant].append(measured[variant])
-        print(f"{phase} sample={sample + 1} baseline_us={measured['baseline']:.3f} "
-              f"candidate_us={measured['candidate']:.3f}")
-    baseline = statistics.median(samples["baseline"])
-    candidate = statistics.median(samples["candidate"])
-    print(f"FINAL {phase} {case.problem()} baseline_us={baseline:.3f} "
-          f"candidate_us={candidate:.3f} speedup={baseline / candidate:.3f}x")
+        for prefix, timer in timers.items():
+            for variant in order:
+                samples[prefix, variant].append(timer(functions[variant], args))
+        print(f"{phase} sample={sample + 1} " +
+              " ".join(f"{prefix}{variant}_us={samples[prefix, variant][-1]:.3f}" for prefix in timers
+                       for variant in ("baseline", "candidate")))
+    results = []
+    for prefix in timers:
+        baseline = statistics.median(samples[prefix, "baseline"])
+        candidate = statistics.median(samples[prefix, "candidate"])
+        results.append(f"{prefix}baseline_us={baseline:.3f} {prefix}candidate_us={candidate:.3f} "
+                       f"{prefix}speedup={baseline / candidate:.3f}x")
+    print(f"FINAL {phase} {case.problem()} " + " ".join(results))
 
 
 def run_case(case, args) -> None:

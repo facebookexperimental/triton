@@ -42,7 +42,8 @@ def TritonAMDGPUAccelerateMatmul
     (e.g., AMD matrix cores)
   }];
 
-  let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect"];
+  let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect",
+                           "mlir::math::MathDialect"];
 
   let options =
       [Option<"gfxArch", "gfx-arch", "std::string", /*default=*/"std::string{}",
@@ -86,6 +87,10 @@ def TritonAMDGPUSinkLayoutConversions
   let description = [{
     This pass sinks layout conversions after the last dealloc but before the first use in their block.
     This helps to avoid unnecessary shared memory allocation.
+    It also moves conversions between amdg.cond_barrier(p) and a following
+    amdg.cond_barrier(~p) in the same block after the closing barrier, where both
+    warp groups are back in phase. Barriers whose predicates are not provably
+    complementary are left alone.
   }];
 
   let dependentDialects = [];

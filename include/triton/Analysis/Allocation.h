@@ -10,6 +10,7 @@
 
 #include <limits>
 #include <optional>
+#include <string>
 
 namespace mlir {
 
@@ -23,6 +24,8 @@ class MemoryPlannerTmem;
 using AllocationAnalysisScratchSizeFn = std::function<unsigned(Operation *)>;
 
 unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op);
+
+unsigned getAtomicResultScratchSize(Value result);
 
 /// Returns whether an operation uses scratch memory across CTAs.
 bool hasCrossCTAScratch(Operation *op);
@@ -146,11 +149,18 @@ public:
     return bufferIds;
   }
 
+  /// Returns the current function's entry arguments aliased by a value.
+  ArrayRef<unsigned> getAliasedArgumentIndices(Value value) const {
+    auto it = argumentAliases.find(value);
+    return it == argumentAliases.end() ? ArrayRef<unsigned>{}
+                                       : it->second.getArrayRef();
+  }
+
   /// Returns the scratch buffer id of the given value.
   BufferId getBufferId(Operation *operation) const {
-    if (opScratch.count(operation)) {
+    if (opScratch.contains(operation)) {
       return opScratch.lookup(operation)->id;
-    } else if (opVirtual.count(operation)) {
+    } else if (opVirtual.contains(operation)) {
       return opVirtual.lookup(operation)->id;
     } else {
       return InvalidBufferId;
@@ -261,6 +271,7 @@ private:
   OpScratchMapT opVirtual;
   ValueBufferMapT valueBuffer;
   AliasBufferMapT aliasBuffer;
+  DenseMap<Value, llvm::SmallSetVector<unsigned, 2>> argumentAliases;
   BufferSetT bufferSet;
   size_t sharedMemorySize = 0;
 
@@ -322,6 +333,33 @@ public:
 private:
   FuncOffsetMapT sharedMemoryValue;
 };
+
+namespace triton {
+
+inline constexpr llvm::StringLiteral kSharedMemoryBreakdownAttr =
+    "ttg.shared_memory_breakdown";
+
+struct SharedMemoryReservation {
+  StringRef kind;
+  size_t offset;
+  size_t size;
+  Operation *owner;
+};
+
+/// Keep original IR identifiers out of downstream printed IR.
+void encodeSharedMemoryBreakdown(ModuleOp mod);
+
+/// Read diagnostic JSON from either its raw or encoded representation.
+std::optional<std::string> getSharedMemoryBreakdown(ModuleOp mod);
+
+/// Capture allocated byte ranges; their sizes are not additive under reuse.
+void attachSharedMemoryBreakdown(ModuleOp mod, ModuleAllocation &allocation);
+
+/// Record reservations made after allocation without changing their placement.
+void appendSharedMemoryReservations(
+    ModuleOp mod, ArrayRef<SharedMemoryReservation> reservations);
+
+} // namespace triton
 
 } // namespace mlir
 

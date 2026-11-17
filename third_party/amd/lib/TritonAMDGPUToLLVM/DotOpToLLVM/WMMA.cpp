@@ -24,20 +24,36 @@
 #include "mlir/Support/LLVM.h"
 
 #include "../PatternTritonGPUOpToLLVM.h"
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "TritonAMDGPUTransforms/WmmaGroup.h"
 #include "Utility.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/TypeSwitch.h"
 namespace mlir::triton::AMD {
 namespace {
 
+static std::optional<mlir::triton::LinearLayout>
+wmmaRepLayoutForTensor(const mlir::triton::LinearLayout &wholeTileLL,
+                       const mlir::triton::LinearLayout &tileLL) {
+  // Clamp the tileLL to the tensor's output dims so that divideLeft succeeds
+  // when the tensor is smaller than the WMMA instruction shape.
+  auto clampedTileLL = ensureLayoutNotLargerThan(
+      tileLL, llvm::to_vector(wholeTileLL.getOutDimNames()),
+      SmallVector<int64_t>(wholeTileLL.getOutDimSizes()));
+
+  auto quot = divideLeft(wholeTileLL, clampedTileLL);
+  if (quot.has_value())
+    return zerosLike(clampedTileLL) * *quot;
+  return {};
+}
+
 #define S(v) StringAttr::get(ctx, (v))
 using ::mlir::triton::gpu::AMDWmmaEncodingAttr;
 using ::mlir::triton::gpu::DotOperandEncodingAttr;
-using ::mlir::triton::gpu::LinearEncodingAttr;
 
 Value prepareOperands(ConversionPatternRewriter &rewriter, Value rawElems,
                       Type type, int wmmaVer, int kBase, Location loc,
@@ -380,6 +396,7 @@ std::optional<int> findNextM(LinearLayout repLayout, int &reg, int elemsPerVec,
 
 // Conduct the Dot conversion.
 LogicalResult convertDot(DotOp op, DotOpAdaptor adaptor,
+                         const TargetInfo &targetInfo,
                          ConversionPatternRewriter &rewriter,
                          const LLVMTypeConverter *typeConverter) {
   auto wmmaLayout = cast<AMDWmmaEncodingAttr>(
@@ -415,6 +432,14 @@ LogicalResult convertDot(DotOp op, DotOpAdaptor adaptor,
            << ", D=" << dElemTy << ". Check whether the wmma version,"
            << " instruction shape, and data types "
            << "are supported on the current AMD GPU architecture.";
+  }
+
+  amdgpu::TargetFeatures targetFeatures(targetInfo.getArch());
+  if (llvm::is_contained(targetFeatures.getUnsupportedWmmaFeatures(),
+                         maybeWmmaIntrinsic->requiredFeature)) {
+    return op.emitError("wmma intrinsic ")
+           << maybeWmmaIntrinsic->name << " is not supported on "
+           << targetFeatures.getArch();
   }
 
   unsigned kInstrSize = maybeWmmaIntrinsic->kDim;
@@ -476,7 +501,7 @@ LogicalResult convertDot(DotOp op, DotOpAdaptor adaptor,
     int nextMReg = reg + dElemsToStorePerThread;
     std::optional<int> nextM;
     if (paddedOutputElemSize == 2) {
-      if (mnProcessed.count(packMN((uint32_t)m, (uint32_t)n))) {
+      if (mnProcessed.contains(packMN((uint32_t)m, (uint32_t)n))) {
         continue;
       }
       nextM = findNextM(wmmaLL, nextMReg, dElemsToStorePerThread, m, rank);
@@ -574,6 +599,7 @@ LogicalResult convertDot(DotOp op, DotOpAdaptor adaptor,
 //  types
 LogicalResult convertScaledDot(triton::DotScaledOp op,
                                triton::DotScaledOp::Adaptor adaptor,
+                               const TargetInfo &targetInfo,
                                ConversionPatternRewriter &rewriter,
                                const LLVMTypeConverter *typeConverter) {
   auto ctx = op.getContext();
@@ -599,23 +625,33 @@ LogicalResult convertScaledDot(triton::DotScaledOp op,
 
   unsigned kInstrSize = mnkDim[2];
 
-  auto aElemType = op.getAElemType();
-  bool isFp4A = aElemType == triton::ScaleDotElemType::E2M1;
-  int kDimA = isFp4A ? kInstrSize / 2 : kInstrSize;
+  auto packedKDim = [](triton::ScaleDotElemType elemType,
+                       int kInstrSize) -> FailureOr<int> {
+    if (elemType == triton::ScaleDotElemType::E2M1)
+      return kInstrSize / 2;
+    if (triton::isMXFP6ScaleType(elemType)) {
+      // fp6 packs groups of 16 values per 12 bytes; the x3/4 byte
+      // conversion steps within a group by 4 values.
+      if (kInstrSize % 4 != 0)
+        return failure();
+      return kInstrSize * 3 / 4;
+    }
+    return kInstrSize;
+  };
 
+  auto aElemType = op.getAElemType();
+  auto kDimAOr = packedKDim(aElemType, kInstrSize);
   auto bElemType = op.getBElemType();
-  bool isFp4B = bElemType == triton::ScaleDotElemType::E2M1;
-  int kDimB = isFp4B ? kInstrSize / 2 : kInstrSize;
+  auto kDimBOr = packedKDim(bElemType, kInstrSize);
+  if (failed(kDimAOr) || failed(kDimBOr))
+    return op.emitError("fp6 WMMA instruction K size ")
+           << kInstrSize << " is not a multiple of 4, so it cannot be "
+           << "converted to packed bytes (x3/4)";
+  int kDimA = *kDimAOr;
+  int kDimB = *kDimBOr;
 
   unsigned scaleFactor = op.deduceScaleFactor();
   int kDimScale = kInstrSize / scaleFactor;
-
-  bool isFp6A = (aElemType == triton::ScaleDotElemType::E2M3) ||
-                (aElemType == triton::ScaleDotElemType::E3M2);
-  bool isFp6B = (bElemType == triton::ScaleDotElemType::E2M3) ||
-                (bElemType == triton::ScaleDotElemType::E3M2);
-  if (isFp6A || isFp6B)
-    return op.emitError("NYI: FP6 scaled dot");
 
   Type scaledAElemType =
       LLVM::AMD::scaleDotElemTypeToMLIRType(op.getContext(), op.getAElemType());
@@ -636,6 +672,14 @@ LogicalResult convertScaledDot(triton::DotScaledOp op,
            << ", D=" << dTensorTy.getElementType()
            << ". Check whether the wmma version, instruction shape, and data "
               "types are supported on the current AMD GPU architecture.";
+  }
+
+  amdgpu::TargetFeatures targetFeatures(targetInfo.getArch());
+  if (llvm::is_contained(targetFeatures.getUnsupportedWmmaFeatures(),
+                         maybeWmmaScaleIntrinsic->requiredFeature)) {
+    return op.emitError("wmma scale intrinsic ")
+           << maybeWmmaScaleIntrinsic->name << " is not supported on "
+           << targetFeatures.getArch();
   }
 
   auto kBaseA = maybeWmmaScaleIntrinsic->kBaseA;
@@ -763,6 +807,7 @@ LogicalResult convertScaledDot(triton::DotScaledOp op,
 } // namespace
 
 LogicalResult convertWMMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
+                          const TargetInfo &targetInfo,
                           const LLVMTypeConverter *typeConverter,
                           ConversionPatternRewriter &rewriter) {
   auto rankedTType = [](Value tensor) {
@@ -782,11 +827,12 @@ LogicalResult convertWMMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
          cTensorTy.getShape()[1] == dTensorTy.getShape()[1] &&
          "DotOp's $c operand should pass the same number of values as $d");
 
-  return convertDot(op, adaptor, rewriter, typeConverter);
+  return convertDot(op, adaptor, targetInfo, rewriter, typeConverter);
 }
 
 LogicalResult convertScaledWMMA(triton::DotScaledOp op,
                                 triton::DotScaledOp::Adaptor adaptor,
+                                const TargetInfo &targetInfo,
                                 const LLVMTypeConverter *typeConverter,
                                 ConversionPatternRewriter &rewriter) {
   assert(isa<mlir::triton::gpu::LinearEncodingTrait>(
@@ -804,6 +850,6 @@ LogicalResult convertScaledWMMA(triton::DotScaledOp op,
          cTensorTy.getShape()[1] == dTensorTy.getShape()[1] &&
          "DotOp's C operand should pass the same number of values as D.");
 
-  return convertScaledDot(op, adaptor, rewriter, typeConverter);
+  return convertScaledDot(op, adaptor, targetInfo, rewriter, typeConverter);
 }
 } // namespace mlir::triton::AMD

@@ -59,6 +59,11 @@ public:
   }
 
   bool supportsI8Tcgen05MMA() const { return computeCapability == 100; }
+  bool supportsTcgen05() const {
+    int architectureFamily = computeCapability / 10;
+    return architectureFamily == 10 || architectureFamily == 11 ||
+           architectureFamily == 12;
+  }
   bool supportsExclusiveTMEMAlloc() const { return computeCapability == 107; }
   int getMaxTMEMColumns() const {
     return supportsExclusiveTMEMAlloc() ? 576 : 512;
@@ -72,7 +77,7 @@ public:
   bool supports2xFp8Tcgen05MMA() const { return computeCapability == 107; }
   bool supportsReuseA() const {
     // A collectors are part of the baseline tcgen05 ISA (PTX 8.6).
-    return computeCapability >= 100 && computeCapability < 120;
+    return supportsTcgen05();
   }
   bool supportsUE5M3Tcgen05MMA() const { return computeCapability == 107; }
   bool supportsReuseB() const { return computeCapability == 107; }

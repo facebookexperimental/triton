@@ -12,6 +12,7 @@ from collections import OrderedDict
 
 import pytest
 import torch
+import triton
 
 from triton.tools.tlx_benchmark_gen import (
     _dtype_str,
@@ -213,6 +214,7 @@ class _FakeOptions:
     matrix_instr_nonkdim: int = 0
     arch: str = ""
     supported_fp8_dtypes: tuple = ("fp8e5", )
+    ctas_per_cga: tuple = (1, 1, 1)
 
 
 def test_capture_kernel_args_launch_options(monkeypatch, tmp_path):
@@ -228,6 +230,56 @@ def test_capture_kernel_args_launch_options(monkeypatch, tmp_path):
         meta = json.load(f)
     # Defaults, the target arch and non-scalar capability lists are all omitted.
     assert meta["launch_options"] == {"num_warps": 8, "matrix_instr_nonkdim": 16}
+
+
+def test_capture_kernel_args_cluster_shape(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRITON_TLX_DUMP_DIR", str(tmp_path))
+    options = _FakeOptions(ctas_per_cga=(2, 1, 1))
+
+    capture_kernel_args(OrderedDict([("x", 1.0)]), {"x": "fp32"}, {}, None, options)
+
+    with open(tmp_path / "_kernel_args.json") as f:
+        meta = json.load(f)
+    # Integer tuples are cluster shapes and are kept; string capability lists are not.
+    assert meta["launch_options"] == {"ctas_per_cga": [2, 1, 1]}
+
+
+def test_capture_kernel_args_knobs(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRITON_TLX_DUMP_DIR", str(tmp_path))
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        capture_kernel_args(OrderedDict([("x", 1.0)]), {"x": "fp32"}, {})
+
+    with open(tmp_path / "_kernel_args.json") as f:
+        meta = json.load(f)
+    assert meta["knobs"]["nvidia"]["use_meta_ws"] is True
+
+
+def _sample_kernel():
+    pass
+
+
+def test_capture_kernel_args_kernel_origin(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRITON_TLX_DUMP_DIR", str(tmp_path))
+    capture_kernel_args(OrderedDict([("x", 1.0)]), {"x": "fp32"}, {}, fn=_sample_kernel)
+
+    with open(tmp_path / "_kernel_args.json") as f:
+        meta = json.load(f)
+    assert meta["kernel"]["name"] == "_sample_kernel"
+    assert meta["kernel"]["module"] == __name__
+    assert meta["kernel"]["file"].endswith("test_tlx_benchmark_gen.py")
+
+
+def test_capture_kernel_args_kernel_origin_without_source(monkeypatch, tmp_path):
+    # inspect.getsourcefile returns None when the source is not on disk; the
+    # dump then records no file rather than a null path the replay would load.
+    monkeypatch.setenv("TRITON_TLX_DUMP_DIR", str(tmp_path))
+    monkeypatch.setattr("inspect.getsourcefile", lambda fn: None)
+    capture_kernel_args(OrderedDict([("x", 1.0)]), {"x": "fp32"}, {}, fn=_sample_kernel)
+
+    with open(tmp_path / "_kernel_args.json") as f:
+        meta = json.load(f)
+    assert meta["kernel"] == {"name": "_sample_kernel", "module": __name__}
 
 
 def test_capture_kernel_args_no_options(monkeypatch, tmp_path):
@@ -376,6 +428,8 @@ def test_generate_standalone_test_with_source(tmp_path):
     assert "user_kwargs" in content
     # Constexprs should NOT be passed to TLX kernel
     assert "*kernel_args, **launch_opts)" in content
+    # JSON carries cluster shapes as lists; the launch needs them back as tuples.
+    assert "tuple(v) if isinstance(v, list)" in content
     # The generated script should be valid Python syntax
     compile(content, str(test_path), "exec")
 

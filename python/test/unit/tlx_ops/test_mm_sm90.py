@@ -13,6 +13,14 @@ from mm_test_utils import REL_PRECISION, run_mm_case, run_mm_invariance_case
 
 pytestmark = pytest.mark.skipif(not is_hopper(), reason="Requires sm90")
 
+
+@pytest.fixture(autouse=True)
+def _pin_num_sms(monkeypatch):
+    # Heuristic picks and prune expectations below assume a full H100 (132
+    # SMs); CI workers may be MIG slices with fewer.
+    monkeypatch.setattr(sm90, "_get_num_sms", lambda: 132)
+
+
 ARCH = "sm90"
 COOPERATIVE_CONFIGS = (
     (128, 256, 3, 1),
@@ -25,6 +33,12 @@ COOPERATIVE_CONFIGS = (
     (256, 128, 3, 3),
     (128, 128, 6, 5),
     (128, 64, 8, 2),
+    # 64-row tiles: one consumer warpgroup.
+    (64, 64, 8, 1),
+    (64, 128, 6, 1),
+    (64, 256, 4, 1),
+    (64, 64, 8, 3),
+    (64, 128, 6, 2),
 )
 
 
@@ -161,6 +175,52 @@ def test_full_space_prune_fills_the_gpu(M, N, K):
         assert kw["SPLIT_K"] == 1 or work <= num_sms
     best = max(sm90._mn_tiles(M, N, c.kwargs["BM"], c.kwargs["BN"]) * c.kwargs["SPLIT_K"] for c in configs)
     assert best > num_sms // 2
+
+
+# Sub-wave merge-net shapes: 128x128 tiles leave SMs idle, so the full space
+# offers single-consumer 64-row tiles (BK 128) next to split-K and lets
+# autotune choose (704x512x8192: 64x64 whole-K 23.6 us, 128x128 split-K 24.5,
+# cuBLAS 28.9; 608x512x20992: split-K 46.2, 64x64 56.9, cuBLAS 43.6).
+@pytest.mark.parametrize("M, N, K", [(608, 512, 20992), (704, 512, 8192), (706, 288, 2048), (706, 128, 3536)])
+def test_prune_offers_64_row_tiles_on_sub_wave_shapes(M, N, K):
+    configs = sm90._prune_full_configs(sm90.CONFIGS(), {"M": M, "N": N, "K": K})
+    small = [c.kwargs for c in configs if c.kwargs["BM"] == 64]
+    assert small and all(kw["NUM_MMA_GROUPS"] == 1 and kw["BK"] == 128 for kw in small)
+    assert any(kw["SPLIT_K"] == 1 for kw in small)
+
+
+def test_prune_drops_64_row_tiles_on_full_shapes():
+    configs = sm90._prune_full_configs(sm90.CONFIGS(), {"M": 4096, "N": 4096, "K": 4096})
+    assert configs and all(c.kwargs["BM"] != 64 for c in configs)
+
+
+@pytest.mark.parametrize("M, N, K", [(608, 512, 4096), (704, 1024, 2048)])
+def test_full_space_on_sub_wave_shapes(M, N, K):
+    from triton.tlx.ops import mm as tlx_mm
+
+    a, b = _inputs(M=M, N=N, K=K)
+    sm90._tuned.cache_clear()
+    _assert_close(tlx_mm(a, b, space="full"), torch.matmul(a, b))
+
+
+@pytest.mark.parametrize("block_n, num_stages, split_k", [(64, 6, 1), (64, 5, 3), (128, 4, 1), (128, 3, 2)])
+def test_single_consumer_bk128_config(block_n, num_stages, split_k):
+    from triton.tlx.ops import mm as tlx_mm
+
+    # The 64-row tiles the full space offers: one consumer warpgroup, BK 128.
+    a, b = _inputs(M=706, N=520, K=128 * (7 if split_k == 1 else 41))
+    conf = sm90._config(64, block_n, num_stages, 1, split_k, block_k=128)
+    original = sm90.CONFIGS
+    sm90.CONFIGS = lambda: [conf]
+    sm90._FORCE_PATH = "ws"
+    sm90._tuned.cache_clear()
+    try:
+        actual = tlx_mm(a, b, space="full")
+    finally:
+        sm90.CONFIGS = original
+        sm90._FORCE_PATH = None
+        sm90._tuned.cache_clear()
+    _assert_close(actual, torch.matmul(a, b))
 
 
 @pytest.mark.parametrize("M, N, K, group_size_m", [(706, 2560, 2560, 8), (706, 2560, 20992, 8),
@@ -456,7 +516,7 @@ def test_small_k_split_k_config(monkeypatch, M, tile, split_k, a_row_major, b_ro
     sm90._tuned_small_k.cache_clear()
     try:
         actual = tlx_mm(a, b, space="full")
-        assert sm90._tuned_small_k("full", None).best_config.kwargs["SPLIT_K"] == split_k
+        assert sm90._tuned_small_k("full", None, False, dtype=a.dtype).best_config.kwargs["SPLIT_K"] == split_k
     finally:
         sm90._tuned_small_k.cache_clear()
     _assert_close(actual, torch.matmul(a, b))
@@ -471,7 +531,7 @@ def test_small_k_split_k_is_deterministic(monkeypatch):
     sm90._tuned_small_k.cache_clear()
     try:
         first = tlx_mm(a, b, space="full")
-        assert sm90._tuned_small_k("full", None).best_config.kwargs["SPLIT_K"] == 2
+        assert sm90._tuned_small_k("full", None, False, dtype=a.dtype).best_config.kwargs["SPLIT_K"] == 2
         for _ in range(3):
             assert torch.equal(tlx_mm(a, b, space="full"), first)
     finally:
@@ -548,10 +608,10 @@ def test_npot_config_not_reused_across_b_layouts(monkeypatch):
         a = _operand(M, K, True)
         b_col = _operand(K, N, False)
         _assert_close(tlx_mm(a, b_col, space="full"), torch.matmul(a, b_col))
-        assert sm90._tuned("full", None, False).best_config.kwargs["BN"] == 192
+        assert sm90._tuned("full", None, False, dtype=a.dtype).best_config.kwargs["BN"] == 192
         b_row = b_col.contiguous()
         _assert_close(tlx_mm(a, b_row, space="full"), torch.matmul(a, b_row))
-        assert sm90._tuned("full", None, False).best_config.kwargs["BN"] == 128
+        assert sm90._tuned("full", None, False, dtype=a.dtype).best_config.kwargs["BN"] == 128
     finally:
         sm90._tuned.cache_clear()
 
@@ -570,7 +630,7 @@ def test_npot_block_n_config(block_n, a_row_major):
     num_stages = {c.kwargs["BN"]: c.kwargs["NUM_STAGES"] for c in sm90._npot_configs()}[block_n]
     with _pinned_full_config(128, block_n, num_stages):
         actual = tlx_mm(a, b, space="full")
-        assert sm90._tuned("full", None, False).best_config.kwargs["BN"] == block_n
+        assert sm90._tuned("full", None, False, dtype=a.dtype).best_config.kwargs["BN"] == block_n
 
     _assert_close(actual, torch.matmul(a, b))
 

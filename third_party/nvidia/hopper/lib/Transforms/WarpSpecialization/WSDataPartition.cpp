@@ -1074,12 +1074,79 @@ static bool getForwardSliceToPartition(Value v,
 
 // Compute a closure of all ops originated from
 // or being dependent on by the root op.
+static bool getForwardClosureToPartition(Value root,
+                                         DataPartitionScheme &partitionScheme,
+                                         unsigned currentDim);
+
+// A descriptor load reached backward from the dot can have other register
+// users, e.g. a row reduction over the same A tile. Leaving them unsliced
+// makes the rewrite keep a full-size load of a descriptor whose block type it
+// has already sliced, which fails verification. Pull those users into the
+// closure. When that is impossible for a function-argument descriptor, which
+// the rewrite slices, skip data partitioning instead.
+static bool closeOverDescriptorLoadUsers(DataPartitionScheme &partitionScheme) {
+  for (bool changed = true; changed;) {
+    changed = false;
+    SmallVector<Operation *> loads;
+    for (Operation *op : partitionScheme.ops)
+      if (isa<DescriptorLoadOp>(op))
+        loads.push_back(op);
+    for (Operation *load : loads) {
+      unsigned dim = partitionScheme.opPartitionDims[load];
+      if (dim == DataPartitionScheme::noOpPartitionDim)
+        continue;
+      Value result = load->getResult(0);
+      if (llvm::all_of(result.getUsers(), [&](Operation *user) {
+            return partitionScheme.ops.contains(user);
+          }))
+        continue;
+      DataPartitionScheme trial = partitionScheme;
+      bool closed = getForwardClosureToPartition(result, trial, dim) &&
+                    trial.partitionIsCompatible();
+      if (trial.skipPartitioning) {
+        partitionScheme.skipPartitioning = true;
+        return true;
+      }
+      if (!closed) {
+        auto desc =
+            dyn_cast<BlockArgument>(cast<DescriptorLoadOp>(load).getDesc());
+        if (desc && isa<triton::FuncOp>(desc.getOwner()->getParentOp())) {
+          load->emitWarning()
+              << "skipping data partitioning because a register user of this "
+                 "descriptor load cannot be partitioned with it";
+          partitionScheme.skipPartitioning = true;
+          return true;
+        }
+        // Any other descriptor comes from an in-kernel op such as
+        // make_tensor_descriptor or reinterpret_tensor_descriptor. sliceOp
+        // clones that op with a sliced block type for the partitioned loads
+        // and leaves the original in place. The load that stays outside the
+        // closure keeps the full-size original descriptor, so its block type
+        // still matches its result and verification passes. Only a function
+        // argument is retyped in place, which is why it alone has to bail out.
+        continue;
+      }
+      partitionScheme = trial;
+      changed = true;
+    }
+  }
+  return true;
+}
+
 static bool getSliceToPartition(Value root,
                                 DataPartitionScheme &partitionScheme,
                                 unsigned currentDim) {
   if (!getBackwardSliceToPartition(root, partitionScheme, currentDim)) {
     return false;
   }
+  if (!getForwardClosureToPartition(root, partitionScheme, currentDim))
+    return false;
+  return closeOverDescriptorLoadUsers(partitionScheme);
+}
+
+static bool getForwardClosureToPartition(Value root,
+                                         DataPartitionScheme &partitionScheme,
+                                         unsigned currentDim) {
   DataPartitionScheme forwardPartitionScheme = partitionScheme;
   DenseSet<Value> seen;
   bool forwardSuccess = getForwardSliceToPartition(root, forwardPartitionScheme,
@@ -2798,7 +2865,8 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
               arith::AddIOp::create(builder, loc, indices[dim], offset);
         }
         auto slicedLoad = DescriptorLoadOp::create(
-            builder, loc, slicedResultType, descLoadOp.getDesc(), indices);
+            builder, loc, slicedResultType, descLoadOp.getDesc(), indices,
+            descLoadOp.getCachePolicyAttr());
         slicedLoads.push_back(slicedLoad.getResult());
       }
 
