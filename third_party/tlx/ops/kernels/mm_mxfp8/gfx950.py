@@ -1660,7 +1660,6 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                 num_stages=1,
                 matrix_instr_nonkdim=16,
                 disable_unclustered_high_rp_reschedule=True,
-                llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
             )
             return out
         if ((m, n, k) == (1024, 1024, 159744) and sf_layout == "cublas_blocked"
@@ -2061,13 +2060,10 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                                                                                                                    k)
                 != (1024, 1024, 24576), sink_insts_to_avoid_spills=(m, n, k) == (1024, 1024, 24576),
                 regclass_priority_trumps_globalness=(m, n, k) == (1024, 1024, 24576), llvm_fn_attrs=((
-                    ("amdgpu-agpr-alloc", "0,0"),
                     ("amdgpu-sched-strategy", "max-ilp"),
                     ("amdgpu-post-sched-strategy", "nop"),
-                ) if (m, n, k) == (1024, 1024, 24576) else (
-                    ("amdgpu-agpr-alloc", "0,0"),
-                    ("amdgpu-sched-strategy", "iterative-ilp" if skinny_uneven_split else "max-ilp"),
-                )))
+                ) if (m, n, k) == (1024, 1024, 24576) else (("amdgpu-sched-strategy",
+                                                             "iterative-ilp" if skinny_uneven_split else "max-ilp"), )))
             if split_k > 1:
                 _reduce_split_k[(m // 32, n // 128)](workspace, out, m, n, split_k, 32, 128, num_warps=8)
             return out
@@ -2179,20 +2175,21 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                     (1024, 64512, 1024),
                     (2048, 8192, 3072),
                 }), schedule_hint="mfma-schedule" if use_mfma_schedule else "",
-                regclass_priority_trumps_globalness=(m, n, k) == (2048, 1024, 24576), llvm_fn_attrs=((
-                    ("amdgpu-agpr-alloc", "0,0"),
-                    ("amdgpu-sched-strategy", "iterative-ilp"),
-                ) if (m, n, k) == (2048, 3072, 15360) else (("amdgpu-agpr-alloc", "0,0"), )))
+                regclass_priority_trumps_globalness=(m, n, k) == (2048, 1024, 24576),
+                llvm_fn_attrs=((("amdgpu-sched-strategy", "iterative-ilp"), ) if (m, n, k) == (2048, 3072, 15360) else
+                               ()))
             if split_k > 1 and not fused_split_reduce:
                 _reduce_split_k[(m // 32, n // 128)](workspace, out, m, n, split_k, 32, 128, STREAMING=(m, n, k) in {
                     (1024, 6144, 22656),
                     (1024, 6144, 39936),
                 }, num_warps=8)
             return out
-        return _gemm_generic[(triton.cdiv(m, 128) * triton.cdiv(n, 128), )](
-            a, b, out, a_scale.view(torch.uint8), b_scale.view(torch.uint8), m, n, k, 128, 128, 128, 4,
-            sf_layout == "cublas_blocked", num_warps=4, num_stages=1, matrix_instr_nonkdim=16,
-            disable_unclustered_high_rp_reschedule=True, llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ))
+        return _gemm_generic[(triton.cdiv(m, 128) * triton.cdiv(n, 128), )](a, b, out, a_scale.view(torch.uint8),
+                                                                            b_scale.view(torch.uint8), m, n, k, 128,
+                                                                            128, 128, 4, sf_layout == "cublas_blocked",
+                                                                            num_warps=4, num_stages=1,
+                                                                            matrix_instr_nonkdim=16,
+                                                                            disable_unclustered_high_rp_reschedule=True)
 
 
 def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="heuristic"):
@@ -2268,7 +2265,6 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="he
         num_stages=1,
         matrix_instr_nonkdim=16,
         disable_unclustered_high_rp_reschedule=True,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
     )
     return out
 

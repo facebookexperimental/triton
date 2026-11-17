@@ -2113,6 +2113,19 @@ _TORCHTLX_BF16_TILES = {
     (4096, 1894, 242432): ((64, 64, 256, 4, 8), {"XCD_CHUNK": 1}),
 }
 
+# Threads LSR rows at the PG benchmark batch (M=2020), from offline template sweeps.
+_THREADS_LSR_BS2048_TILES = {
+    (2048, 4096): ((128, 128, 128, 16, 8), {"XCD_CHUNK": 4, "kpack": 2}),
+    (2048, 2048): ((128, 128, 128, 16, 8), {"XCD_CHUNK": 4, "kpack": 2}),
+    (2048, 371): ((64, 128, 128, 4, 8), {"XCD_CHUNK": 2, "kpack": 2, "PACKED_K_LOADS": True}),
+    (4096, 2048): ((128, 128, 64, 8, 4), {"XCD_CHUNK": 4, "kpack": 2}),
+    (4096, 7552): ((128, 128, 64, 8, 4), {"XCD_CHUNK": 4, "kpack": 2}),
+    (4096, 6656): ((128, 128, 64, 8, 4), {"XCD_CHUNK": 4, "kpack": 2}),
+    (4096, 6400): ((128, 128, 64, 8, 4), {"XCD_CHUNK": 4, "kpack": 2}),
+    (4096, 1091): ((128, 128, 64, 8, 8), {"XCD_CHUNK": 4, "kpack": 2, "PACKED_K_LOADS": True}),
+    (4096, 1093): ((128, 128, 64, 8, 8), {"XCD_CHUNK": 4, "kpack": 2, "PACKED_K_LOADS": True}),
+}
+
 
 def _threads_lsr_config(M, N, K):
     # Threads LSR expert GEMMs: bands come from offline template sweeps over the
@@ -2162,6 +2175,11 @@ def torchtlx_heuristic_config(M, N, K, *, dtype, out_dtype, a_strides, b_strides
         return [_template_config(tile, **extra)]
     if enable and M <= 1536 and (N, K) in _THREADS_LSR_NK:
         return [_threads_lsr_config(M, N, K)]
+    if enable and 1536 < M <= 2048 and (N, K) in _THREADS_LSR_BS2048_TILES:
+        tile, extra = _THREADS_LSR_BS2048_TILES[N, K]
+        return [_template_config(tile, **extra)]
+    if enable and M <= 32 and (N, K) == (2048, 720):
+        return [_template_config((16, 16, 256, 4, 4), waves_per_eu=2)]
     bf16 = (dtype == torch.bfloat16 and out_dtype == torch.bfloat16 and a_strides == (K, 1) and b_strides == (1, K)
             and alpha == 1 and beta == 1)
     if bf16 and (M, N, K) in _TORCHTLX_BF16_TILES:

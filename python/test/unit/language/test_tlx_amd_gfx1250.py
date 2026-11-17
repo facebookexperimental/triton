@@ -8,6 +8,8 @@ from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx12
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
+from triton.tlx.ops.kernels.grouped_gemm import gfx1250 as _gfx1250_grouped_ops
+from triton.tlx.ops.kernels.mm_mxfp8 import gfx1250 as _gfx1250_mxfp_ops
 from triton.tools.mxfp import MXScaleTensor
 from triton._internal_testing import is_hip_gfx1250
 
@@ -611,7 +613,8 @@ def _mxgemm_ring_phase_params():
 def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, CLUSTER_SIZE,
                                       CLUSTER_LAYOUT="linear", SPLIT_CLUSTER_BARRIER=False, EARLY_C_STORES=False,
                                       CLUSTER_BARRIER_INTERVAL=4, STATIC_SLOT_UNROLL=False, OUTPUT_C_SLOTS=None,
-                                      OVERLAP_PEEL=False, OUT_DTYPE="fp32"):
+                                      OVERLAP_PEEL=False, OUT_DTYPE="fp32", MERGED_HANDOFF_BARRIER=False,
+                                      STATIC_CLUSTER_STEPS=False, SCALE_LAYOUT="block128"):
     # Ten tiles over three programs exercise uneven tile counts, changes in
     # both M and N, the zero-length steady loop, and input/output slot reuse
     # across ring wrap. Cluster cases give each program two tiles; K5/K9 also
@@ -630,8 +633,8 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
     out = _gfx1250_mxfp.matmul(
         a.cuda(),
         b_data.T.contiguous().cuda(),
-        _gfx1250_mxfp.pack_scale(a_scale).cuda(),
-        _gfx1250_mxfp.pack_scale(b_scale).cuda(),
+        _gfx1250_mxfp.pack_scale(a_scale, layout=SCALE_LAYOUT).cuda(),
+        _gfx1250_mxfp.pack_scale(b_scale, layout=SCALE_LAYOUT).cuda(),
         config=dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=BLOCK_K, NUM_BUFFERS=NUM_BUFFERS, DTYPE_A="e4m3",
                     DTYPE_B=_gfx1250_mxfp.DTYPE_TO_TRITON[DTYPE_B], TRANSPOSE_B=True, SCHEDULE="sliceMNK",
                     TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=programs,
@@ -639,7 +642,8 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
                     CLUSTER_BARRIER_INTERVAL=CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
                     SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES,
                     STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL, OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL,
-                    OUT_DTYPE=OUT_DTYPE))
+                    OUT_DTYPE=OUT_DTYPE, MERGED_HANDOFF_BARRIER=MERGED_HANDOFF_BARRIER,
+                    STATIC_CLUSTER_STEPS=STATIC_CLUSTER_STEPS, SCALE_LAYOUT=SCALE_LAYOUT))
     if OUT_DTYPE == "fp32":
         torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
     else:
@@ -649,13 +653,68 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
-@pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 9, 10])
+@pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 7, 9, 10])
+@pytest.mark.parametrize("buffers", [3, 4])
 @pytest.mark.parametrize("cluster_size", [1, 4])
-def test_mxgemm_static_slot_unroll_ring_phase(k_iters, cluster_size):
-    # Cover an empty steady loop, zero/one/two steps after the ring-depth
+def test_mxgemm_static_slot_unroll_ring_phase(k_iters, buffers, cluster_size):
+    # Cover an empty steady loop, zero to three steps after the ring-depth
     # unroll, and every starting slot across uneven tile assignments.
-    test_mxgemm_persistent_ring_phase(k_iters, 3, True, "float8_e4m3", 128, cluster_size,
+    if k_iters < buffers:
+        pytest.skip("needs at least one K tile per buffer")
+    test_mxgemm_persistent_ring_phase(k_iters, buffers, True, "float8_e4m3", 128, cluster_size,
                                       CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear", STATIC_SLOT_UNROLL=True)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [4, 5, 6, 7, 9, 13])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+@pytest.mark.parametrize("overlap_peel,out_dtype", [(False, "fp32"), (True, "fp16")])
+def test_mxgemm_merged_handoff_barrier_ring_phase(k_iters, cluster_size, overlap_peel, out_dtype):
+    # One split workgroup barrier per static K step must still order each
+    # slot's last reads before its refill and publish every wave's next slot
+    # across ring wrap, tile transitions, and periodic cluster synchronization.
+    if overlap_peel and k_iters <= 4:
+        pytest.skip("OVERLAP_PEEL needs more K tiles than buffers")
+    test_mxgemm_persistent_ring_phase(k_iters, 4, True, "float8_e4m3", 128, cluster_size,
+                                      CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear", STATIC_SLOT_UNROLL=True,
+                                      OUTPUT_C_SLOTS=2, OVERLAP_PEEL=overlap_peel, OUT_DTYPE=out_dtype,
+                                      MERGED_HANDOFF_BARRIER=True)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [6, 9, 13, 18, 21])
+@pytest.mark.parametrize("buffers", [3, 4])
+@pytest.mark.parametrize("interval", [2, 4, 8])
+def test_mxgemm_static_cluster_steps_ring_phase(k_iters, buffers, interval):
+    # Unrolled steps that can never refill a rendezvous stage drop the run-time
+    # k % interval test; the others keep it. Cover intervals below, equal to,
+    # and above the unroll depth, with steady loops of several iterations.
+    test_mxgemm_persistent_ring_phase(k_iters, buffers, True, "float8_e4m3", 128, 4, CLUSTER_LAYOUT="2x2",
+                                      CLUSTER_BARRIER_INTERVAL=interval, STATIC_SLOT_UNROLL=True,
+                                      OUTPUT_C_SLOTS=3 if buffers == 3 else 2, OVERLAP_PEEL=True,
+                                      OUT_DTYPE="fp16" if buffers == 4 else "fp32", MERGED_HANDOFF_BARRIER=buffers == 4,
+                                      STATIC_CLUSTER_STEPS=True)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 7, 9, 13])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+@pytest.mark.parametrize("schedule", ["merged", "static3", "dynamic3", "dynamic4"])
+def test_mxgemm_wave256_scales_ring_phase(k_iters, cluster_size, schedule):
+    # wave256 scales hold both 128-row quadrants per 256-row tile. The merged
+    # step reads them with one load per operand and splits them in registers,
+    # carrying both quadrants across steps, the peeled first step, and tile
+    # transitions. The other schedules read one quadrant per load.
+    buffers = 4 if schedule in ("merged", "dynamic4") else 3
+    if k_iters <= buffers:
+        pytest.skip("OVERLAP_PEEL needs more K tiles than buffers")
+    merged = schedule == "merged"
+    test_mxgemm_persistent_ring_phase(k_iters, buffers, True, "float8_e4m3", 128, cluster_size,
+                                      CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
+                                      STATIC_SLOT_UNROLL=schedule in ("merged", "static3"),
+                                      OUTPUT_C_SLOTS=3 if buffers == 3 else 2, OVERLAP_PEEL=schedule != "dynamic4",
+                                      OUT_DTYPE="fp16" if merged else "fp32", MERGED_HANDOFF_BARRIER=merged,
+                                      STATIC_CLUSTER_STEPS=merged and cluster_size > 1, SCALE_LAYOUT="wave256")
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -791,6 +850,10 @@ def test_mxgemm_grid_cluster_ring_phase(k_iters, layout, schedule):
     ({"SPLIT_CLUSTER_BARRIER": True}, "SPLIT_CLUSTER_BARRIER requires clustering"),
     ({"NUM_BUFFERS": 2, "EARLY_C_STORES": True}, "require three buffers"),
     ({"NUM_BUFFERS": 2, "STATIC_SLOT_UNROLL": True}, "STATIC_SLOT_UNROLL requires"),
+    ({"MERGED_HANDOFF_BARRIER": True}, "MERGED_HANDOFF_BARRIER requires"),
+    ({"STATIC_CLUSTER_STEPS": True}, "STATIC_CLUSTER_STEPS requires"),
+    ({"SCALE_LAYOUT": "invalid"}, "SCALE_LAYOUT must be"),
+    ({"BLOCK_K": 256, "NUM_BUFFERS": 2, "CROSS_TILE_PREFETCH": False, "SCALE_LAYOUT": "wave256"}, "wave256"),
     ({"OVERLAP_PEEL": True}, "OVERLAP_PEEL requires"),
     ({"OUTPUT_C_SLOTS": 1}, "OUTPUT_C_SLOTS requires"),
     ({"PERSISTENT": False, "OVERLAP_PEEL": True}, "require PERSISTENT"),
@@ -815,9 +878,9 @@ def test_mxgemm_persistent_invalid_config(config, match):
 def _mxfp_cluster_tile_ids(output, NUM_M: tl.constexpr, NUM_N: tl.constexpr, PROGRAMS: tl.constexpr,
                            GROUP_M: tl.constexpr, REMAP: tl.constexpr, LAYOUT: tl.constexpr = "2x2"):
     pid = tl.program_id(0)
-    tile = _gfx1250_mxfp._mxgemm_cluster_program_id(pid, PROGRAMS, REMAP, 8, 2, LAYOUT)
+    tile = _gfx1250_mxfp_ops._mxgemm_cluster_program_id(pid, PROGRAMS, REMAP, 8, 2, LAYOUT)
     for step in range(NUM_M * NUM_N // PROGRAMS):
-        off_m, off_n = _gfx1250_mxfp._mxgemm_tile_offsets(tile, NUM_M, NUM_N, GROUP_M, 256, 256, LAYOUT)
+        off_m, off_n = _gfx1250_mxfp_ops._mxgemm_tile_offsets(tile, NUM_M, NUM_N, GROUP_M, 256, 256, LAYOUT)
         tl.store(output + step * PROGRAMS + pid, off_m // 256 * NUM_N + off_n // 256)
         tile += PROGRAMS
 
@@ -871,9 +934,12 @@ def test_mxgemm_bench_defaults_and_overrides():
 
     # Defaults: 4x4 clusters with an eight-block barrier interval and chunked
     # XCD remapping of whole clusters for both variants, each with FP32 and
-    # then FP16 output. MX8xMX8 uses a four-stage ring with two C slots from
-    # K=16384, static slot unroll from K=8192, and the overlap peel with three
-    # stages. MX8xMX4 splits cluster barriers and starts C stores early.
+    # then FP16 output. FP32 MX8xMX8 uses a four-stage ring with two C slots
+    # from K=16384, static slot unroll from K=8192, and the overlap peel with
+    # three stages. FP16 MX8xMX8 up to K=16384 uses the four-stage static loop
+    # with the merged handoff barrier, static cluster steps, two C slots, and
+    # the overlap peel. MX8xMX4 splits cluster barriers and starts C stores
+    # early.
     _, shapes, variants = bench.parse_benchmark_args(["--dry-run"])
     assert [(variant, args.out_dtype) for variant, _, args in variants] == [("mx8xmx8", "fp32"), ("mx8xmx8", "fp16"),
                                                                             ("mx8xmx4", "fp32"), ("mx8xmx4", "fp16")]
@@ -885,13 +951,16 @@ def test_mxgemm_bench_defaults_and_overrides():
             assert cmd[cmd.index("--cluster_barrier_interval") + 1] == "8"
             assert cmd[cmd.index("--xcd_remap") + 1] == "chunked"
             a8w8 = variant == "mx8xmx8"
-            four_stage = a8w8 and shape[2] >= 16384
+            merged = a8w8 and args.out_dtype == "fp16" and shape[2] <= 16384
+            four_stage = a8w8 and (shape[2] >= 16384 or merged)
             assert cmd[cmd.index("-BK") + 1] == ("128" if a8w8 else "256")
             assert cmd[cmd.index("--num_buffers") + 1] == ("4" if four_stage else "3")
-            slots = None if not a8w8 or four_stage else ("3" if args.out_dtype == "fp32" else "6")
+            slots = "2" if merged else (None if not a8w8 or four_stage else "3")
             assert (cmd[cmd.index("--output_c_slots") + 1] if "--output_c_slots" in cmd else None) == slots
-            assert ("--static_slot_unroll" in cmd) == (a8w8 and shape[2] == 8192)
-            assert ("--overlap_peel" in cmd) == (a8w8 and not four_stage)
+            assert ("--static_slot_unroll" in cmd) == (merged or (a8w8 and shape[2] == 8192))
+            assert ("--merged_handoff_barrier" in cmd) == ("--static_cluster_steps" in cmd) == merged
+            assert ("--overlap_peel" in cmd) == (merged or (a8w8 and not four_stage))
+            assert "--scale_layout" not in cmd
             assert ("--no-cross_tile_prefetch" in cmd) == (not a8w8)
             assert ("--split_cluster_barrier" in cmd) == ("--early_c_stores" in cmd) == (not a8w8)
             assert (cmd[cmd.index("--out_dtype") + 1] if "--out_dtype" in cmd else "fp32") == args.out_dtype
@@ -903,6 +972,19 @@ def test_mxgemm_bench_defaults_and_overrides():
         cmd = bench._command(bench._case_args(args, shapes[0]), shapes[0], dtype_b)
         assert cmd[cmd.index("--cluster_layout") + 1] == "2x2"
         assert cmd[cmd.index("--xcd_remap") + 1] == "none"
+
+    # wave256 scales apply to MX8xMX8 only; opting out of the merged barrier
+    # restores the three-stage FP16 schedule with six C slots.
+    _, shapes, variants = bench.parse_benchmark_args(["--scale-layout", "wave256", "--out-dtype", "fp16", "--dry-run"])
+    for variant, dtype_b, args in variants:
+        cmd = bench._command(bench._case_args(args, shapes[1]), shapes[1], dtype_b)
+        assert ("--scale_layout" in cmd) == (variant == "mx8xmx8")
+    _, shapes, variants = bench.parse_benchmark_args(
+        ["--variant", "mx8xmx8", "--out-dtype", "fp16", "--no-merged-handoff-barrier", "--dry-run"])
+    (_, dtype_b, args), = variants
+    cmd = bench._command(bench._case_args(args, shapes[1]), shapes[1], dtype_b)
+    assert cmd[cmd.index("--num_buffers") + 1] == "3" and cmd[cmd.index("--output_c_slots") + 1] == "6"
+    assert "--merged_handoff_barrier" not in cmd and "--static_slot_unroll" in cmd
 
     # Opting out of the overlap peel, and forcing it on for the four-stage ring.
     for flag, expected in (("--no-overlap-peel", (False, False)), ("--overlap-peel", (True, True))):
@@ -1185,11 +1267,11 @@ def test_amd_independent_cluster_invalid_options(dims, num_ctas, arch):
 def test_grouped_gemm_multicast_config_validation(m_list, n, num_programs, valid):
 
     def validate():
-        _gfx1250_grouped._validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=256, block_n=256,
-                                                               block_k=128, group_m=4, tdm_pipeline_depth=2,
-                                                               l2_prefetch_distance=0, c_staging_mode=0,
-                                                               cross_tile_prefetch=True, auto_config=False,
-                                                               xcd_remap_mode="chunked", num_xcds=8, xcd_chunk=2)
+        _gfx1250_grouped.validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=256, block_n=256,
+                                                              block_k=128, group_m=4, tdm_pipeline_depth=2,
+                                                              l2_prefetch_distance=0, c_staging_mode=0,
+                                                              cross_tile_prefetch=True, auto_config=False,
+                                                              xcd_remap_mode="chunked", num_xcds=8, xcd_chunk=2)
 
     if valid:
         validate()
@@ -1532,7 +1614,7 @@ def test_grouped_gemm_interface_rejects_config(config, k, match, monkeypatch):
     monkeypatch.setattr(torch, "empty", no_allocation)
     monkeypatch.setattr(torch, "tensor", no_allocation)
     with pytest.raises(ValueError, match=match):
-        _gfx1250_grouped._make_grouped_gemm_args([a], [b], config)
+        _gfx1250_grouped_ops._make_grouped_gemm_args([a], [b], config)
 
 
 @pytest.mark.parametrize("condition,match", [
@@ -1588,7 +1670,7 @@ def test_grouped_gemm_interface_rejects_inputs(condition, match, monkeypatch):
     monkeypatch.setattr(torch, "empty", no_allocation)
     monkeypatch.setattr(torch, "tensor", no_allocation)
     with pytest.raises(ValueError, match=match):
-        _gfx1250_grouped.grouped_gemm(a, b)
+        _gfx1250_grouped_ops.grouped_gemm(a, b)
 
 
 def test_grouped_gemm_interface_rejects_other_arch(monkeypatch):
@@ -1598,7 +1680,7 @@ def test_grouped_gemm_interface_rejects_other_arch(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_properties",
                         lambda device: SimpleNamespace(gcnArchName="gfx950:sramecc+"))
     with pytest.raises(ValueError, match="requires gfx1250; got gfx950"):
-        _gfx1250_grouped._require_grouped_gemm_gfx1250(torch.device("cuda"))
+        _gfx1250_grouped_ops._require_grouped_gemm_gfx1250(torch.device("cuda"))
 
 
 def test_grouped_gemm_interface_defaults_match_bench(monkeypatch):
@@ -1608,9 +1690,9 @@ def test_grouped_gemm_interface_defaults_match_bench(monkeypatch):
     checked = []
 
     def check_case(args, case, kernel_variant, index, total):
-        cfg = _gfx1250_grouped._grouped_gemm_interface_launch_config(
-            _gfx1250_grouped._grouped_gemm_interface_config(None, case.k), [case.m] * case.groups, case.n, case.k, 256,
-            auto_cluster=True)
+        cfg = _gfx1250_grouped_ops._grouped_gemm_interface_launch_config(
+            _gfx1250_grouped_ops._grouped_gemm_interface_config(None, case.k), [case.m] * case.groups, case.n, case.k,
+            256, auto_cluster=True)
         for key, value in dict(
                 BLOCK_SIZE_M=args.block_m,
                 BLOCK_SIZE_N=args.block_n,
@@ -1620,7 +1702,7 @@ def test_grouped_gemm_interface_defaults_match_bench(monkeypatch):
                 L2_PREFETCH_DISTANCE=args.l2_prefetch_distance,
                 C_STAGING_MODE=int(args.dedicated_c_buffer),
                 CROSS_TILE_PREFETCH=args.cross_tile_prefetch,
-                XCD_REMAP_MODE=_gfx1250_grouped._XCD_REMAP_MODES[args.xcd_remap],
+                XCD_REMAP_MODE=_gfx1250_grouped.XCD_REMAP_MODES[args.xcd_remap],
                 NUM_XCDS=args.num_xcds,
                 XCD_CHUNK=args.xcd_chunk,
                 CLUSTER_SIZE=args.cluster_size,
@@ -1656,15 +1738,16 @@ def test_grouped_gemm_interface_defaults_match_bench(monkeypatch):
     ([1024], 512, 32, {}, 1),
 ])
 def test_grouped_gemm_interface_selects_cluster(ms, n, num_sm, config, expected):
-    cfg = _gfx1250_grouped._grouped_gemm_interface_launch_config(
-        _gfx1250_grouped._grouped_gemm_interface_config(config, 512), ms, n, 512, num_sm, auto_cluster="CLUSTER_SIZE"
-        not in config)
+    cfg = _gfx1250_grouped_ops._grouped_gemm_interface_launch_config(
+        _gfx1250_grouped_ops._grouped_gemm_interface_config(config, 512), ms, n, 512, num_sm,
+        auto_cluster="CLUSTER_SIZE" not in config)
     assert cfg["CLUSTER_SIZE"] == expected
     if expected == 1 and "CLUSTER_SIZE" not in config:
         explicit = dict(config, CLUSTER_SIZE=4)
         with pytest.raises(ValueError, match="clustering requires"):
-            _gfx1250_grouped._grouped_gemm_interface_launch_config(
-                _gfx1250_grouped._grouped_gemm_interface_config(explicit, 512), ms, n, 512, num_sm, auto_cluster=False)
+            _gfx1250_grouped_ops._grouped_gemm_interface_launch_config(
+                _gfx1250_grouped_ops._grouped_gemm_interface_config(explicit, 512), ms, n, 512, num_sm,
+                auto_cluster=False)
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
@@ -1676,16 +1759,19 @@ def test_grouped_gemm_interface_multicast_launch(cluster_size, monkeypatch):
     cpu_b = [torch.randn((n, k), dtype=torch.float16) for _ in range(2)]
     a, b = [x.cuda() for x in cpu_a], [x.cuda().T for x in cpu_b]
     config = {} if cluster_size is None else dict(CLUSTER_SIZE=cluster_size)
-    monkeypatch.setattr(_gfx1250_grouped, "_active_num_cus", lambda device: 16)
-    *launch_args, outputs = _gfx1250_grouped._make_grouped_gemm_args(a, b, config)
+    # Pretend the device has 16 CUs so the 64 tiles give each program four:
+    # cluster members then step through several tiles together, and NUM_SM does
+    # not depend on the machine.
+    monkeypatch.setattr(_gfx1250_grouped_ops, "_active_num_cus", lambda device: 16)
+    *launch_args, outputs = _gfx1250_grouped_ops._make_grouped_gemm_args(a, b, config)
     assert launch_args[-1]["CLUSTER_SIZE"] == (4 if cluster_size is None else cluster_size)
     assert launch_args[-1]["NUM_SM"] == 16
     assert launch_args[-1]["ALLOW_MN_TAILS"] is False
-    _gfx1250_grouped._perf_fn(*launch_args)
+    _gfx1250_grouped_ops._perf_fn(*launch_args)
     torch.cuda.synchronize()
     allocated = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
-    _gfx1250_grouped._perf_fn(*launch_args)
+    _gfx1250_grouped_ops._perf_fn(*launch_args)
     torch.cuda.synchronize()
     assert torch.cuda.max_memory_allocated() == allocated
     for out, x, w in zip(outputs, cpu_a, cpu_b):
@@ -1698,7 +1784,7 @@ def test_grouped_gemm_interface_list_api(ms, n):
     torch.manual_seed(1250)
     a = [torch.randn((m, 256), dtype=torch.float16) for m in ms]
     b = [torch.randn((n, 256), dtype=torch.float16) for _ in ms]
-    outputs = _gfx1250_grouped.grouped_gemm(tuple(x.cuda() for x in a), tuple(x.cuda().T for x in b))
+    outputs = _gfx1250_grouped_ops.grouped_gemm(tuple(x.cuda() for x in a), tuple(x.cuda().T for x in b))
     assert isinstance(outputs, list) and len(outputs) == len(ms)
     for out, x, w in zip(outputs, a, b):
         torch.testing.assert_close(out.cpu(), (x.float() @ w.float().T).half(), atol=1e-2, rtol=1e-2)
@@ -1718,7 +1804,7 @@ def test_grouped_gemm_interface_prepared_launch(config, k, monkeypatch):
     cpu_a = [torch.randn((m, k), dtype=torch.float16) for m in ms]
     cpu_b = [torch.randn((n, k), dtype=torch.float16) for _ in ms]
     a, b = [x.cuda() for x in cpu_a], [x.cuda().T for x in cpu_b]
-    args = _gfx1250_grouped._make_grouped_gemm_args(a, b, dict(config, NUM_SM=2))
+    args = _gfx1250_grouped_ops._make_grouped_gemm_args(a, b, dict(config, NUM_SM=2))
     *launch_args, outputs = args
     assert len(args) == 8
     assert [tuple(t.shape) for t in args[:5]] == [(2, ), (2, ), (2, ), (6, ), (6, )]
@@ -1727,7 +1813,7 @@ def test_grouped_gemm_interface_prepared_launch(config, k, monkeypatch):
     assert args[6]["ALLOW_MN_TAILS"] is True
     assert args[0].cpu().tolist() == [x.data_ptr() for x in a]
     assert args[1].cpu().tolist() == [x.data_ptr() for x in b]
-    _gfx1250_grouped._perf_fn(*launch_args)
+    _gfx1250_grouped_ops._perf_fn(*launch_args)
     torch.cuda.synchronize()
 
     def no_setup(*args, **kwargs):
@@ -1740,7 +1826,7 @@ def test_grouped_gemm_interface_prepared_launch(config, k, monkeypatch):
             patch.setattr(torch, name, no_setup)
         for name in ("cpu", "item", "tolist"):
             patch.setattr(torch.Tensor, name, no_setup)
-        _gfx1250_grouped._perf_fn(*launch_args)
+        _gfx1250_grouped_ops._perf_fn(*launch_args)
         torch.cuda.synchronize()
     assert torch.cuda.max_memory_allocated() == allocated
     for out, x, w in zip(outputs, cpu_a, cpu_b):
@@ -1779,7 +1865,7 @@ def test_grouped_gemm_interface_rejects_metadata(condition, match):
     elif condition == "cluster_grid":
         cfg.update(CLUSTER_SIZE=4, ALLOW_MN_TAILS=False)
     with pytest.raises(ValueError, match=match):
-        _gfx1250_grouped._perf_fn(*tables, g, cfg)
+        _gfx1250_grouped_ops._perf_fn(*tables, g, cfg)
 
 
 @pytest.mark.parametrize("m,n,k,match", [

@@ -154,6 +154,10 @@ jobs:
       - name: Run smoke subset
         id: run_bench
         timeout-minutes: 30
+        # The harness asserts an absolute floor against the reference kernel;
+        # this smoke reports a ratio against the nightly instead, in the
+        # compare job's comment. A floor miss must not fail the workflow.
+        continue-on-error: true
         run: |
           rm -rf /tmp/tlx_benchmark
           # mm (380 nightly cases) and norm_fwd (101) are --head trimmed;

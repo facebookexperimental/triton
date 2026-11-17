@@ -107,6 +107,7 @@ def summarize(args):
             "status": r["status"],
             "speedup": r.get("speedup"),
             "tlx_tflops": (r.get("tlx") or {}).get("mean"),
+            "tlx_p50": (r.get("tlx") or {}).get("p50"),
             "ref_tflops": (r.get("ref") or {}).get("mean"),
             "notes": r.get("notes", []),
         } for r in artifact["results"]]

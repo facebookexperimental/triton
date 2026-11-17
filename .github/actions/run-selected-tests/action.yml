@@ -22,5 +22,6 @@ runs:
         JUNIT: ${{ inputs.junit }}
         SETUP_SCRIPT: ${{ inputs.setup-script }}
       run: |
+        rm -f "${JUNIT}"
         [ -z "${SETUP_SCRIPT}" ] || . "${SETUP_SCRIPT}"
         python .github/scripts/run_selected_tests.py --workers "${WORKERS}" --junit "${JUNIT}"

@@ -35,16 +35,17 @@ jobs:
     runs-on: linux-fb-triton-mi350-1
     timeout-minutes: 240
     permissions:
-      id-token: write
       contents: read
       actions: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
       - name: Set up test environment
         timeout-minutes: 30
         uses: ./.github/actions/setup-test-env
@@ -69,7 +70,7 @@ jobs:
         uses: ./.github/actions/run-selected-tests
         with:
           suite: ${{ toJSON(fromJSON(inputs.plan).core) }}
-          workers: "4"
+          workers: "12"
           junit: /tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
@@ -78,7 +79,7 @@ jobs:
         uses: ./.github/actions/run-selected-tests
         with:
           suite: ${{ toJSON(fromJSON(inputs.plan).correctness) }}
-          workers: "4"
+          workers: "12"
           junit: /tmp/tlx-correctness.xml
       - name: Parse test failures (TLX)
         id: parse
@@ -87,6 +88,7 @@ jobs:
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
           job: mi350-tlx-test
+          completed-junit: ${{ (steps.run_core_tests.outcome == 'success' || steps.run_core_tests.outcome == 'failure') && '/tmp/tlx-core.xml' || '' }} ${{ (steps.run_correctness_tests.outcome == 'success' || steps.run_correctness_tests.outcome == 'failure') && '/tmp/tlx-correctness.xml' || '' }}
           failed: ${{ job.status != 'success' }}
           bucket: mi350-tlx-job-failed
           junit: ${{ fromJSON(inputs.plan).core.files[0] != null && '/tmp/tlx-core.xml' || '' }} ${{ fromJSON(inputs.plan).correctness.files[0] != null && '/tmp/tlx-correctness.xml' || '' }}
@@ -108,15 +110,16 @@ jobs:
       PYTEST_ADDOPTS: ""
     timeout-minutes: 180
     permissions:
-      id-token: write
       contents: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -207,16 +210,17 @@ jobs:
     runs-on: linux-fb-triton-mi350-1
     timeout-minutes: 60
     permissions:
-      id-token: write
       contents: read
       actions: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
       - name: Set up test environment
         timeout-minutes: 30
         uses: ./.github/actions/setup-test-env
@@ -251,6 +255,7 @@ jobs:
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
           job: mi350-gluon-test
+          completed-junit: ${{ (steps.run_gluon.outcome == 'success' || steps.run_gluon.outcome == 'failure') && '/tmp/gluon.xml' || '' }}
           failed: ${{ job.status != 'success' }}
           bucket: mi350-gluon-job-failed
           junit: /tmp/gluon.xml
@@ -271,6 +276,7 @@ jobs:
       job: mi350-tlx-test
       result: ${{ needs.mi350-tlx-test.result }}
       failures: ${{ needs.mi350-tlx-test.outputs.failures }}
+      recovery: ${{ needs.mi350-tlx-test.outputs.recovery }}
       sha: ${{ inputs.ref }}
       platform: mi350
 
@@ -303,5 +309,6 @@ jobs:
       job: mi350-gluon-test
       result: ${{ needs.mi350-gluon-test.result }}
       failures: ${{ needs.mi350-gluon-test.outputs.failures }}
+      recovery: ${{ needs.mi350-gluon-test.outputs.recovery }}
       sha: ${{ inputs.ref }}
       platform: mi350

@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 
 GOOD, BAD, SKIP = 0, 1, 125
 MAX_CV = 0.03
@@ -30,6 +31,7 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 FIRST_BAD = re.compile(r"^([0-9a-f]{40}) is the first bad commit", re.M)
 SELF = Path(__file__).resolve()
 GIT_REPO_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_PREFIX")
+TOOLING_HARNESS = SELF.parents[2] / "python" / "test" / "tlx_benchmark" / "_harness"
 
 
 def bench_modules(harness):
@@ -169,17 +171,29 @@ def evaluate(step, timeout=None):
         return {"status": "error", "reason": f"measurement process failed: {type(exc).__name__}: {exc}"}
 
 
+def tooling_denoise():
+    """This checkout's device discovery, which an older endpoint's benchmark snapshot may predate."""
+    package = types.ModuleType("_tooling_harness")
+    package.__path__ = [str(TOOLING_HARNESS)]
+    sys.modules[package.__name__] = package
+    return importlib.import_module(f"{package.__name__}.denoise")
+
+
 def measure_case(step):
     sys.path.insert(0, step["harness"])
     import triton
     if inside(triton.__file__, step["source"]):
         return {"status": "error", "reason": f"triton imported from the source tree: {triton.__file__}"}
     from _harness import driver
-    from _harness.denoise import Governor, list_devices, select_device, stable
+    from _harness.denoise import Governor, stable
+    denoise = tooling_denoise()
 
     # Every evaluation after the good endpoint measures on the GPU the good endpoint used.
     uuid = step.get("gpu_uuid")
-    device = next((d for d in list_devices() if d.uuid == uuid), None) if uuid else select_device("auto")
+    if uuid:
+        device = next((d for d in denoise.list_devices() if d.uuid == uuid), None)
+    else:
+        device = denoise.select_device("auto")
     if device is None:
         return {"status": "error", "reason": f"GPU {uuid} not found"}
     driver.select(device)
