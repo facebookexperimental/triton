@@ -129,6 +129,30 @@ def test_a_skipped_or_unselected_case_does_not_prove_recovery(tmp_path):
         assert api.writes == []
 
 
+def test_valid_subtest_reports_allow_only_explicitly_passed_ids_to_recover(tmp_path):
+    path = xml(tmp_path, [("t::test_a[one]", "passed")])
+    tree = ET.parse(path)
+    tree.getroot().set("tests", "3")
+    tree.write(path)
+    unselected = dict(issue(8, title=PREFIX + "t::other"), body=body(ids=("t::other", ), norm="t::other"))
+    api = FakeApi([issue(7), unselected])
+    assert fi.reconcile(api, REPO, PREFIX, LABELS, "[]", RUN + "150", 150, parsed_recovery([path])) == [7]
+    assert api.issues[7]["state"] == "closed" and api.issues[8]["state"] == "open"
+
+
+def test_subtest_counts_do_not_override_contradictory_target_results(tmp_path):
+    passed = xml(tmp_path, [("t::test_a[one]", "passed")], name="passed.xml")
+    for status in ("failure", "error", "skipped"):
+        path = xml(tmp_path, [("t::test_a[one]", status)])
+        tree = ET.parse(path)
+        tree.getroot().set("tests", "3")
+        tree.write(path)
+        api = FakeApi([issue(7)])
+        proof = parsed_recovery([passed, path])
+        assert fi.reconcile(api, REPO, PREFIX, LABELS, "[]", RUN + "150", 150, proof) == []
+        assert api.writes == []
+
+
 def test_every_previously_failing_parameter_must_pass(tmp_path):
     both = dict(issue(7), body=body(ids=("t::test_a[one]", "t::test_a[two]")))
     for second, expected in (("skipped", []), ("passed", [7])):
@@ -142,8 +166,9 @@ def test_missing_malformed_or_unfinished_results_do_not_close_issues(tmp_path):
     missing = str(tmp_path / "missing.xml")
     malformed = tmp_path / "malformed.xml"
     malformed.write_text("<testsuite>")
-    for expected, completed in (([path, missing], [path]), ([path, str(malformed)], [path,
-                                                                                     str(malformed)]), ([path], [])):
+    empty = xml(tmp_path, [], name="empty.xml")
+    for expected, completed in (([path, missing], [path]), ([path, str(malformed)], [path, str(malformed)]),
+                                ([path], []), ([empty], [empty])):
         api = FakeApi([issue(7)])
         assert fi.reconcile(api, REPO, PREFIX, LABELS, "[]", RUN + "150", 150, parsed_recovery(completed,
                                                                                                expected)) == []
