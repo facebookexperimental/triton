@@ -1252,7 +1252,8 @@ static Partition *scheduleUsers(LoopLikeOpInterface loop,
 
 // Schedule post-loop operations (operations outside and after the loop) into
 // the appropriate partition. Epilogue store ops and their transitive users
-// (e.g., TMAStoreTokenWaitOp) go to the epilogue partition. All other post-loop
+// (e.g., TMAStoreTokenWaitOp) go to the epilogue partition, except that a TMA
+// reduce's token wait goes to its reduce's partition. All other post-loop
 // ops (e.g., tmem_load for accumulator reads, arithmetic for normalization) go
 // to the default partition. This prevents TMEM ops from landing in the
 // epilogue, which would force it to use 4 warps (TMEM lane coverage
