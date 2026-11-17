@@ -508,6 +508,52 @@ tt.func @tmem_load_sinks_after_barrier_reorder(
   tt.return
 }
 
+// A wait whose slot load is dead must not sink below its own slot's release.
+// CHECK-LABEL: @wait_not_lowered_past_own_release
+tt.func @wait_not_lowered_past_own_release(
+    %full: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %empty: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %acc_full: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %acc_empty: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %phase: i32) {
+  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  // CHECK: ttng.wait_barrier %arg0
+  // CHECK: ttng.arrive_barrier %arg1
+  ttng.wait_barrier %full, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2, 3>, dstTask = 3 : i32, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.arrive_barrier %empty, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2, 3>, dstTask = 3 : i32, maxRegionId = 6 : i32, minRegionId = 6 : i32, parentId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %acc_full, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2, 3>, direction = "forward", dstTask = 1 : i32, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %0 = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
+  ttng.arrive_barrier %acc_empty, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2, 3>, dstTask = 1 : i32, maxRegionId = 6 : i32, minRegionId = 6 : i32, parentId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  "user"(%0) : (tensor<128x128xf32, #linear128>) -> ()
+  tt.return
+}
+
+// Endpoints with different peers sharing a barrier array may share a channel.
+// CHECK-LABEL: @arrive_not_raised_past_shared_array_wait
+tt.func @arrive_not_raised_past_shared_array_wait(
+    %full: !ttg.memdesc<2x1xi64, #barrier_shared, #smem, mutable>,
+    %empty: !ttg.memdesc<2x1xi64, #barrier_shared, #smem, mutable>,
+    %acc_full: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %phase: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %f0 = ttg.memdesc_index %full[%c0] : !ttg.memdesc<2x1xi64, #barrier_shared, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %e0 = ttg.memdesc_index %empty[%c0] : !ttg.memdesc<2x1xi64, #barrier_shared, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %f1 = ttg.memdesc_index %full[%c1] : !ttg.memdesc<2x1xi64, #barrier_shared, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %e1 = ttg.memdesc_index %empty[%c1] : !ttg.memdesc<2x1xi64, #barrier_shared, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  // CHECK: ttng.wait_barrier %{{.*}}, %arg3 {{.*}}dstTask = 1 : i32, maxRegionId = 1
+  // CHECK: ttng.arrive_barrier %{{.*}}, 1 {{.*}}dstTask = 2 : i32, maxRegionId = 2
+  ttng.wait_barrier %f1, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2, 3>, dstTask = 1 : i32, maxRegionId = 1 : i32, minRegionId = 1 : i32, parentId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.arrive_barrier %e1, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2, 3>, dstTask = 2 : i32, maxRegionId = 2 : i32, minRegionId = 2 : i32, parentId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %f0, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2, 3>, dstTask = 2 : i32, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.arrive_barrier %e0, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2, 3>, dstTask = 1 : i32, maxRegionId = 6 : i32, minRegionId = 6 : i32, parentId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %acc_full, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2, 3>, dstTask = 4 : i32, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %0 = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
+  "user"(%0) : (tensor<128x128xf32, #linear128>) -> ()
+  tt.return
+}
+
 // Ordered WSBarrier metadata lets a tmem_load inherit constraints and sink past
 // an overlapping wait when the wait's region is earlier than the arrive's
 // region in the same parent.
