@@ -6,10 +6,12 @@
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
@@ -80,6 +82,9 @@ public:
                triton::gpu::WarpYieldOp,
                triton::gpu::WarpSpecializePartitionsOp,
                triton::gpu::WarpReturnOp>();
+    // Predicated regions are lowered by ConvertWarpSpecializeToLLVM after
+    // their bodies have been converted to LLVM.
+    addLegalOp<triton::gpu::WarpPredicateOp, triton::gpu::PredicateYieldOp>();
     // TCGen5GlobalAllocOp survives until NVGPUToLLVM, despite its dialect
     // otherwise being illegal at this stage.
     addLegalOp<triton::nvidia_gpu::TCGen5GlobalAllocOp>();
@@ -475,16 +480,68 @@ private:
   }
 };
 
+// A predicated region on NVIDIA supports what the FA correction rescale
+// needs: register math and tensor memory loads and stores through views. Each
+// warp runs the whole body or skips it, and every one of these operations is
+// executed and completed by the warp itself, so warps that skip the body
+// cannot change its result. Anything else, such as a store deduplicated to one
+// representative thread, an MMA or TMA issued once for the CTA, or a call,
+// could. A per-thread mbarrier arrive would not, but the rescale does not need
+// one, and membar puts a CTA barrier before one that follows a memory access.
+static bool isAllowedInPredicatedRegion(Operation *op) {
+  if (isa<arith::ArithDialect, math::MathDialect>(op->getDialect()))
+    return true;
+  return isa<triton::ElementwiseInlineAsmOp, triton::SplatOp,
+             triton::ExpandDimsOp, triton::BroadcastOp,
+             triton::gpu::ConvertLayoutOp, triton::gpu::MemDescIndexOp,
+             triton::gpu::MemDescSubsliceOp, ttng::TMEMSubSliceOp,
+             ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMWaitOp,
+             triton::gpu::PredicateYieldOp>(op);
+}
+
+static LogicalResult validateWarpPredicates(ModuleOp mod) {
+  WalkResult result = mod.walk([&](triton::gpu::WarpPredicateOp predicateOp) {
+    // A scalar predicate that every lane of a warp agrees on, such as
+    // tlx.warp_any, keeps warp-collective instructions (tcgen05.ld/st/wait,
+    // shuffles) well defined.
+    if (!predicateOp.getPredicate().getType().isInteger(1) ||
+        !predicateOp.getWaveUniform().value_or(false)) {
+      predicateOp.emitError("per-lane and non-wave-uniform predicates are not "
+                            "yet supported in predicated regions on NVIDIA");
+      return WalkResult::interrupt();
+    }
+    if (!predicateOp.getInits().empty()) {
+      predicateOp.emitError(
+          "carried values are not yet supported in predicated regions on "
+          "NVIDIA");
+      return WalkResult::interrupt();
+    }
+    WalkResult unsupported = predicateOp.getRegion().walk([&](Operation *op) {
+      if (isAllowedInPredicatedRegion(op))
+        return WalkResult::advance();
+      predicateOp.emitError("operation ")
+          << op->getName()
+          << " is not yet supported in predicated regions on NVIDIA";
+      return WalkResult::interrupt();
+    });
+    return unsupported.wasInterrupted() ? WalkResult::interrupt()
+                                        : WalkResult::advance();
+  });
+  return failure(result.wasInterrupted());
+}
+
 void ConvertTritonGPUToLLVM::runOnOperation() {
   MLIRContext *context = &getContext();
   ModuleOp mod = getOperation();
+  triton::encodeSharedMemoryBreakdown(mod);
   TargetInfo targetInfo(computeCapability, ptxVersion);
 
   mlir::LowerToLLVMOptions option(context);
   option.overrideIndexBitwidth(32);
   TritonGPUToLLVMTypeConverter typeConverter(context, option, targetInfo);
 
-  if (failed(lowerFunctions(mod, typeConverter, targetInfo))) {
+  if (failed(validateWarpPredicates(mod)) ||
+      failed(lowerFunctions(mod, typeConverter, targetInfo))) {
     signalPassFailure();
     return;
   }
