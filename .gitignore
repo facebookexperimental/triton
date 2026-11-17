@@ -67,7 +67,6 @@ cmake-build-*
 cuobjdump
 nvdisasm
 ptxas
-ptxas-blackwell
 third_party/nvidia/backend/bin
 third_party/tlx/language/tlx/inductor/bin
 
