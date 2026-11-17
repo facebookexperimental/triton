@@ -3,6 +3,9 @@ import triton.language as tl
 
 import torch
 import math
+import subprocess
+import sys
+import textwrap
 import pytest
 
 _BLOCK_SIZE = 16
@@ -78,6 +81,33 @@ def test_nvptx_tti_vector_load_scalarization(dtype, num_elements, enable_nvptx_t
     else:
         assert f"load <{num_elements} x {llvm_type}>" not in result
         assert result.count(f"load {llvm_type},") == num_elements
+
+
+def test_binding_classes_released_at_shutdown():
+    script = textwrap.dedent("""
+        import os
+        from triton._C.libtriton import gluon_ir, ir
+        from triton.experimental.gluon.language import BlockedLayout
+
+        class ShutdownSentinel:
+            def __init__(self, message):
+                self.message = message
+
+            def __del__(self, write=os.write):
+                write(1, self.message)
+
+        ir.builder._shutdown_sentinel = ShutdownSentinel(b"builder released\\n")
+        context = ir.context()
+        ir.load_dialects(context)
+        builder = gluon_ir.GluonOpBuilder(context)
+        layout = BlockedLayout([1], [32], [4], [0])._to_ir(builder)
+        result = builder.to_linear_layout(layout, [128])
+        type(result)._shutdown_sentinel = ShutdownSentinel(b"layout released\\n")
+        del result, layout, builder, context
+    """)
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True)
+    assert set(result.stdout.splitlines()) == {"builder released", "layout released"}, result.stderr
+    assert "nanobind: leaked" not in result.stderr
 
 
 @triton.jit
@@ -193,3 +223,44 @@ def test_python_func_in_visit_call(device):
     x = torch.randn(4, device=device)
     out = torch.zeros_like(x)
     test_py_call_const_kernel[(4, )](x, out, 4, 4)
+
+
+# ttg.shared_memory_breakdown module attribute roundtrip. The C++ side attaches
+# breakdown JSON as a StringAttr; module.get_str_attr exposes it to backends.
+
+_BREAKDOWN_ATTR = "ttg.shared_memory_breakdown"
+
+
+def _parse_test_module(tmp_path, name):
+    from triton._C.libtriton import ir
+
+    source = tmp_path / name
+    source.write_text("module {\n  tt.func public @k() { tt.return }\n}\n")
+    context = ir.context()
+    ir.load_dialects(context)
+    return context, ir.parse_mlir_module(str(source), context)
+
+
+def test_module_get_str_attr_contract(tmp_path):
+    from triton._C.libtriton import ir
+
+    context, module = _parse_test_module(tmp_path, "breakdown.mlir")
+    assert module.get_str_attr(_BREAKDOWN_ATTR) is None
+    module.set_attr(_BREAKDOWN_ATTR, ir.builder(context).get_int32_attr(7))
+    assert module.get_str_attr(_BREAKDOWN_ATTR) is None
+    module.set_attr(_BREAKDOWN_ATTR, ir.builder(context).get_string_attr('{"version": 1}'))
+    assert module.get_str_attr(_BREAKDOWN_ATTR) == '{"version": 1}'
+
+
+def test_breakdown_raw_roundtrip_through_module(tmp_path):
+    import json
+
+    from triton._C.libtriton import ir
+    from triton.runtime.errors import attach_shared_memory_breakdown
+
+    raw = json.dumps({"version": 1, "reserved_bytes": 1024, "functions": [], "reservations": []})
+    context, module = _parse_test_module(tmp_path, "roundtrip.mlir")
+    module.set_attr(_BREAKDOWN_ATTR, ir.builder(context).get_string_attr(raw))
+    metadata = {}
+    attach_shared_memory_breakdown(module, metadata)
+    assert metadata["shared_memory_breakdown"] == raw

@@ -287,7 +287,7 @@ private:
     }
     LinearLayout srcLayout =
         toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
-    vals = transferProductThroughSharedMemory(
+    vals = transferMixedRadixThroughSharedMemory(
         loc, rewriter, targetInfo, srcLayout,
         toLinearLayout(dstTy).removeZeroBasesAlongDim(kReg), vals, storageTy,
         LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op),

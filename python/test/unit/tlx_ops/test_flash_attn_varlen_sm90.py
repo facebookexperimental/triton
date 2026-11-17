@@ -288,6 +288,44 @@ def test_flash_attn_varlen_more_sequences_than_the_schedule_sorts(causal):
         _check(lens_q, lens_k, causal, dtype=torch.float16)
 
 
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_varlen_int64_output_offsets(causal):
+    """Output element offsets past 2**31, stored by both the TMA path (full tiles) and the masked path (the rest)."""
+    from triton.tlx.ops import flash_attn_varlen
+
+    torch.manual_seed(20)
+    heads, kv_heads = 32, 4
+    lengths = [128, 100, 37, 200] * 1128
+    cu = _cu(lengths)
+    qkv = torch.randn(sum(lengths), heads + 2 * kv_heads, 128, device="cuda", dtype=torch.float16)
+    q, k, v = qkv[:, :heads], qkv[:, heads:heads + kv_heads], qkv[:, heads + kv_heads:]
+    out = flash_attn_varlen(q, k, v, cu, cu, max(lengths), max(lengths), causal=causal)
+    # The output is contiguous, 32 * 128 elements per token, and passes 2**31 at token 524288, which a 37-token
+    # sequence holds; the last sequence has 200 tokens, so its rows from 192 on take the masked path.
+    tokens = torch.tensor([0, 524288, sum(lengths) - 1], device="cuda", dtype=torch.int32)
+    for b in (torch.searchsorted(cu, tokens, right=True) - 1).tolist():
+        b0, b1 = cu[b].item(), cu[b + 1].item()
+        local = _cu([b1 - b0])
+        ref = _reference(q[b0:b1], k[b0:b1], v[b0:b1], local, local, causal, 128**-0.5)
+        torch.testing.assert_close(out[b0:b1].float(), ref, **TOLERANCE[torch.float16])
+
+
+def test_flash_attn_varlen_needs_i64_offsets():
+    """The output's int64 choice counts the masked rows of the last tile and takes int64 for a symbolic size."""
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+    from triton.tlx.ops.kernels.flash_attn_varlen.sm90 import BLOCK_M, _needs_i64_offsets
+
+    for heads, head_dim in ((32, 128), (8, 64)):
+        row = heads * head_dim
+        # The most tokens whose rows, masked ones included, stay below 2**31 elements; with one more token only the
+        # masked rows of the last tile pass it.
+        last = (1 << 31) // row - BLOCK_M + 1
+        assert not _needs_i64_offsets(last, row, BLOCK_M)
+        assert _needs_i64_offsets(last + 1, row, BLOCK_M)
+    # Comparing an unbacked size raises, so this also checks that no guard is taken.
+    assert _needs_i64_offsets(ShapeEnv().create_unbacked_symint(), 32 * 128, BLOCK_M)
+
+
 def test_flash_attn_varlen_rejects_invalid_inputs():
     from triton.tlx.ops import InvalidInput, UnsupportedBackward, flash_attn_varlen
 

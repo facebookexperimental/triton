@@ -17,7 +17,7 @@ void attachAllocationSizeAndOffsetAttr(ModuleOp mod,
 void addSharedMemoryAnnotations(ModuleOp mod);
 
 /// Under TRITON_ALLOW_NPOT, emits one error per op with an NPOT shared memdesc
-/// whose allocation does not include its pow2 cover. Runs before
+/// whose allocation does not include its pow2 alloc shape. Runs before
 /// ModuleAllocation.
 LogicalResult verifyNpotTypesSupported(ModuleOp mod);
 

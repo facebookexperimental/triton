@@ -236,12 +236,16 @@ def _run(x, weight, bias=None, *, mx=False, rms=False, eps=1e-05, global_scale=1
                         m,
                     ](ps, pq, mu, rr, n, eps, parts, triton.next_power_of_2(parts), rms, centered, num_warps=4)
                 bm, bn = (16 if qrows == 16 else 4, 128)
+            # PERF: 16x512 layer-norm tiles need over 96 registers, which fits 4 instead of 5 CTAs per SM. Grids with at
+            # most 4 CTAs per SM keep the compiler's allocation, because the cap's spills slowed some of them by 4%.
+            sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+            maxnreg = 96 if qrows == 16 and bn == 512 and not rms and triton.cdiv(m, bm) > 4 * sms else None
             _norm_quant[triton.cdiv(m, bm),
                         triton.cdiv(n, bn)](x, weight, bias, q.view(torch.uint16) if stochastic else q, s,
                                             mu if stats or wide else None,
                                             rr if stats or wide else None, normalized_out, m, n, eps, gs,
                                             triton.cdiv(n // block, 4), bm, bn, rms, mx, gemma, qrows, stochastic, wide,
-                                            num_warps=4)
+                                            num_warps=4, maxnreg=maxnreg)
     return (q, s, rr, mu)
 
 

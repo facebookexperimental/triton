@@ -56,8 +56,9 @@ LinearLayout toLinearLayout(TensorOrMemDesc type);
 LinearLayout toLinearLayout(ArrayRef<int64_t> shape, Attribute layout);
 
 // Under TRITON_ALLOW_NPOT, `shape` with every NPOT extent rounded up to a power
-// of two; NPOT layouts are built on this cover. Without the flag, `shape`.
-SmallVector<int64_t> getNpotCoverShape(ArrayRef<int64_t> shape);
+// of two; NPOT layouts are built on this pow2 alloc shape. Without the flag,
+// `shape`.
+SmallVector<int64_t> getNpotPow2AllocShape(ArrayRef<int64_t> shape);
 
 // Returns true if the layouts differ only in the order of their register
 // basis vectors. Reordering those vectors changes the order of values within a
@@ -102,9 +103,9 @@ nvmmaSharedToLinearLayout(ArrayRef<int64_t> shape,
 // `inDimNames`. The latter does not modify the output sizes.
 LinearLayout getLayoutWithinBlock(const LinearLayout &layout);
 
-// Combines the layout of a CTA (input dims [register, lane, warp]) with the
-// layout of a CGA (i.e. a block), and ensures that the resulting layout has the
-// given shape.
+// Combines CTA and CGA layouts and fits the result to shape. Repetitions grow
+// "col" for TMEM, "offset" for shared layouts, and "register" otherwise,
+// following the CTA layout's output dimension order.
 //
 // See the nomenclature note at the top of LinearLayoutConversions.cpp for why
 // the variable with type CGAEncodingAttr is called cgaLayoutAttr.

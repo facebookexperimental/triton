@@ -14,16 +14,18 @@ namespace nvidia_gpu {
 std::function<unsigned(Operation *)>
 getNvidiaAllocationAnalysisScratchSizeFn(TargetInfoBase &targetInfo);
 
-// A Shared Product conversion moved as the pow2 swizzled transfers of its odd
-// slabs, side by side in scratch, so each rep is one store/bar/load phase.
-struct ProductSlabTransfer {
-  ProductSharedTiling slabs;
-  int32_t numSlabs;
+// A Shared mixed-radix conversion moved as the pow2 swizzled transfers of its
+// odd tiles, `tilesPerRound` side by side per round, so scratch stays within
+// the pow2 alloc shape's and each rep of a round is one store/bar/load.
+struct MixedRadixTileTransfer {
+  MixedRadixSharedTiling tiles;
+  int32_t numTiles;
+  int32_t tilesPerRound;
   unsigned scratchBytes;
 };
-std::optional<ProductSlabTransfer>
-getProductSlabTransfer(RankedTensorType srcTy, RankedTensorType dstTy,
-                       const TargetInfoBase &targetInfo);
+std::optional<MixedRadixTileTransfer>
+getMixedRadixTileTransfer(RankedTensorType srcTy, RankedTensorType dstTy,
+                          const TargetInfoBase &targetInfo);
 
 } // namespace nvidia_gpu
 } // namespace triton

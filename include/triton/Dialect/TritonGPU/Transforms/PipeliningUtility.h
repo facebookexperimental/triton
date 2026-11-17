@@ -101,9 +101,9 @@ int getCopyVecBytes(RankedTensorType registerTy,
 bool canBeConvertedToAsyncLoad(
     triton::LoadOp loadOp, triton::ModuleAxisInfoAnalysis &axisInfoAnalysis);
 
-// getSharedEncoding and getCopyVecBytes need a radix-2 register layout; NPOT
-// Product loads are not yet supported in shared memory.
-bool hasRadix2Layout(triton::LoadOp load);
+// Whether every op that pipelining `load` through shared memory creates, an
+// async copy and a local_load, lowers its layout on its target.
+bool canPipelineInSharedMemory(triton::LoadOp load);
 
 // Serialize the latencies of the operations in the loops into the latency
 // attribute.
@@ -218,12 +218,19 @@ bool requestsMetaWarpSpecialization(Operation *op);
 // Whether some op in the function requests warp specialization.
 bool isMetaWarpSpecializedFunc(triton::FuncOp funcOp);
 
-// Whether the module requests Meta AutoWS or is already warp-specialized (e.g.
-// TLX ttg.warp_specialize regions).
-bool requestsMetaWarpSpecialization(ModuleOp mod);
+// Whether some op in the module requests Meta AutoWS, or the module is already
+// warp-specialized (e.g. TLX ttg.warp_specialize regions).
+bool moduleRequestsMetaWarpSpecialization(ModuleOp mod);
 
-// The module's ttg.use_meta_ws attribute (set per module by make_ttgir), else
-// TRITON_USE_META_WS.
+// Module attribute recording the per-module TRITON_USE_META_WS decision. It is
+// set by make_ttgir (CUDA backend) and exposed to Python as
+// triton._C.libtriton.nvidia.USE_META_WS_ATTR_NAME.
+inline constexpr llvm::StringLiteral kUseMetaWSAttrName = "ttg.use_meta_ws";
+
+// The module's kUseMetaWSAttrName attribute if present, else
+// TRITON_USE_META_WS. The decision is per module: a module that requests Meta
+// AutoWS gets the Meta-WS pipeline choices on all of its loops, including
+// loops that are not themselves warp-specialized.
 bool isMetaWSEnabled(Operation *op);
 } // namespace triton
 } // namespace mlir

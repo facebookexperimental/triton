@@ -224,3 +224,33 @@ tt.func @one_contextual_warp() {
 }
 
 }
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+
+// CHECK-LABEL: @warp_id_hoisted_to_partition_entry
+tt.func @warp_id_hoisted_to_partition_entry() {
+  ttg.warp_specialize()
+  default {
+    ttg.warp_yield
+  }
+  // CHECK: partition0
+  partition0() num_warps(4) {
+    // CHECK: [[WARP_ID:%.*]] = nvvm.shfl.sync idx
+    // CHECK-NOT: nvvm.shfl.sync
+    // CHECK: "use"([[WARP_ID]])
+    "use"() : () -> ()
+    %0 = ttg.warp_id
+    "use"(%0) : (i32) -> ()
+    llvm.br ^bb1
+  ^bb1:
+    // CHECK: "use"([[WARP_ID]])
+    %1 = ttg.warp_id
+    "use"(%1) : (i32) -> ()
+    ttg.warp_return
+  } : () -> ()
+  tt.return
+}
+
+}

@@ -134,7 +134,7 @@ def _run_amd_fa_cluster_regression_isolated(test_name):
     env[_AMD_FA_CLUSTER_REGRESSION_WORKER] = test_name
     env["DISABLE_LLVM_OPT"] = "disable-machine-sink"
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-s", "--tb=short", f"{__file__}::{test_name}"],
+        [sys.executable, "-m", "pytest", "--import-mode=importlib", "-s", "--tb=short", f"{__file__}::{test_name}"],
         check=False,
         capture_output=True,
         env=env,
@@ -2978,6 +2978,51 @@ def test_masked_unaligned_vector_load_correctness_gfx950(device):
     expected[:valid_size] = x[1:1 + valid_size]
     torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
     assert "buffer_load_dwordx4" in compiled.asm["amdgcn"]
+
+
+@triton.jit
+def _amd_packed_dot2_correctness_kernel(
+    lhs_ptr,
+    rhs_ptr,
+    acc_ptr,
+    output_ptr,
+    N: tl.constexpr,
+    INPUT_DTYPE: tl.constexpr,
+):
+    offsets = tl.arange(0, N)
+    lhs = tl.load(lhs_ptr + offsets).to(tl.uint32)
+    rhs = tl.load(rhs_ptr + offsets).to(tl.uint32)
+    acc = tl.load(acc_ptr + offsets)
+    result = tlx.amd_packed_dot2(lhs, rhs, acc, input_dtype=INPUT_DTYPE)
+    tl.store(output_ptr + offsets, result)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("dtype,input_dtype", [(torch.float16, tl.float16), (torch.bfloat16, tl.bfloat16)])
+def test_amd_packed_dot2_correctness_gfx950(device, dtype, input_dtype):
+    lhs = torch.tensor(
+        [[16.0, 1 / 16], [-16.0, 1 / 16], [2.0, -3.0], [0.5, 4.0]],
+        device=device,
+        dtype=dtype,
+    )
+    rhs = torch.tensor(
+        [[1.0, 2.0], [1.0, 2.0], [-4.0, 5.0], [8.0, -0.5]],
+        device=device,
+        dtype=dtype,
+    )
+    acc = torch.tensor([0.25, -0.25, 7.0, -2.0], device=device)
+    output = torch.empty_like(acc)
+    _amd_packed_dot2_correctness_kernel[(1, )](
+        lhs.view(torch.int32),
+        rhs.view(torch.int32),
+        acc,
+        output,
+        N=lhs.shape[0],
+        INPUT_DTYPE=input_dtype,
+        num_warps=1,
+    )
+    expected = (lhs.float() * rhs.float()).sum(dim=1) + acc
+    torch.testing.assert_close(output, expected, atol=0.0, rtol=0.0)
 
 
 @triton.jit

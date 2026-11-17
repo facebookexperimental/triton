@@ -19,7 +19,6 @@ using namespace mlir::triton;
 namespace mlir {
 namespace triton {
 #define GEN_PASS_DEF_ALLOCATESHAREDMEMORYNV
-#define GEN_PASS_DEF_SETMINIMUMSHAREDMEMORY
 #include "TritonNVIDIAGPUToLLVM/Passes.h.inc"
 } // namespace triton
 } // namespace mlir
@@ -48,25 +47,6 @@ struct AllocateSharedMemoryNv
   }
 };
 
-struct SetMinimumSharedMemory
-    : public mlir::triton::impl::SetMinimumSharedMemoryBase<
-          SetMinimumSharedMemory> {
-  using SetMinimumSharedMemoryBase::SetMinimumSharedMemoryBase;
-
-  void runOnOperation() override {
-    ModuleOp mod = getOperation();
-    if (minimumSize < 0) {
-      mod.emitError("minimum shared memory size must be non-negative");
-      return signalPassFailure();
-    }
-    auto sharedAttr = mod->getAttrOfType<IntegerAttr>("ttg.shared");
-    int64_t sharedSize = sharedAttr ? sharedAttr.getInt() : 0;
-    if (sharedSize < minimumSize)
-      mod->setAttr("ttg.shared",
-                   IntegerAttr::get(IntegerType::get(mod.getContext(), 32),
-                                    minimumSize));
-  }
-};
 } // namespace
 
 namespace mlir::triton::nvidia_gpu {
@@ -100,26 +80,30 @@ static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
       product(triton::gpu::getCTASplitNum(srcTy.getEncoding())), targetInfo);
 }
 
-std::optional<ProductSlabTransfer>
-getProductSlabTransfer(RankedTensorType srcTy, RankedTensorType dstTy,
-                       const TargetInfoBase &targetInfo) {
-  auto plan = getProductConversionPlan(srcTy, dstTy);
-  if (!plan || plan->transport != ProductConversionTransport::Shared)
+std::optional<MixedRadixTileTransfer>
+getMixedRadixTileTransfer(RankedTensorType srcTy, RankedTensorType dstTy,
+                          const TargetInfoBase &targetInfo) {
+  auto plan = getMixedRadixConversionPlan(srcTy, dstTy);
+  if (!plan || plan->transfer != MixedRadixConversionTransfer::Shared)
     return std::nullopt;
   auto kReg = StringAttr::get(srcTy.getContext(), "register");
   auto src = triton::gpu::toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
   auto dst = triton::gpu::toLinearLayout(dstTy).removeZeroBasesAlongDim(kReg);
-  auto slabs = getProductSharedSlabs(src, dst);
-  if (!slabs)
+  auto tiles = getMixedRadixSharedTiles(src, dst);
+  if (!tiles)
     return std::nullopt;
-  int32_t numSlabs =
-      src.getInDimSize(kReg) / slabs->sourceTile.getInDimSize(kReg);
+  int32_t numTiles =
+      src.getInDimSize(kReg) / tiles->sourceTile.getInDimSize(kReg);
   auto bitwidth = getBitwidth(srcTy);
+  int32_t nBlocks = product(triton::gpu::getCTASplitNum(srcTy.getEncoding()));
   unsigned elems = getNumScratchElemsSwizzledCvt(
-      slabs->sourceTile, slabs->destinationTile, bitwidth,
-      product(triton::gpu::getCTASplitNum(srcTy.getEncoding())), targetInfo);
-  return ProductSlabTransfer{std::move(*slabs), numSlabs,
-                             numSlabs * elems * bitwidth / 8};
+      tiles->sourceTile, tiles->destinationTile, bitwidth, nBlocks, targetInfo);
+  unsigned paddedElems = getNumScratchElemsSwizzledCvt(
+      padMixedRadixLayout(src), padMixedRadixLayout(dst), bitwidth, nBlocks,
+      targetInfo);
+  int32_t tilesPerRound = std::clamp<int32_t>(paddedElems / elems, 1, numTiles);
+  return MixedRadixTileTransfer{std::move(*tiles), numTiles, tilesPerRound,
+                                tilesPerRound * elems * bitwidth / 8};
 }
 
 std::function<unsigned(Operation *)>
@@ -128,9 +112,9 @@ getNvidiaAllocationAnalysisScratchSizeFn(TargetInfoBase &targetInfo) {
     if (auto cvtOp = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
       auto srcTy = cvtOp.getSrc().getType();
       auto dstTy = cvtOp.getType();
-      if (auto slabs = getProductSlabTransfer(srcTy, dstTy, targetInfo))
-        return slabs->scratchBytes;
-      if (auto bytes = getProductConversionScratchBytes(cvtOp))
+      if (auto tiles = getMixedRadixTileTransfer(srcTy, dstTy, targetInfo))
+        return tiles->scratchBytes;
+      if (auto bytes = getMixedRadixConversionScratchBytes(cvtOp))
         return *bytes;
       if (!cvtNeedsSharedMemory(cvtOp))
         return 0;

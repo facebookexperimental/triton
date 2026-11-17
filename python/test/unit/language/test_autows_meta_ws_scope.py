@@ -45,3 +45,45 @@ def _compile(monkeypatch, use_meta_ws, warp_specialize):
 @pytest.mark.skipif(not _is_blackwell(), reason="Meta AutoWS pipeline under test is Blackwell")
 def test_non_ws_kernel_compiles_as_without_meta_ws(monkeypatch):
     assert _compile(monkeypatch, True, False) == _compile(monkeypatch, False, False)
+
+
+@pytest.mark.skipif(not _is_blackwell(), reason="Meta AutoWS pipeline under test is Blackwell")
+def test_ws_kernel_keeps_meta_ws(monkeypatch):
+    ttgir = _compile(monkeypatch, True, True)
+    # Upstream WS also writes ttg.partition.types, so check the Meta-only
+    # module attribute and a Meta partition type.
+    assert "ttg.use_meta_ws = true" in ttgir
+    assert '"gemm"' in ttgir
+
+
+@triton.jit
+def _clc_copy(x_ptr, y_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(y_ptr + offs, tl.load(x_ptr + offs))
+
+
+@pytest.mark.skipif(not _is_blackwell(), reason="clc=True requires SM100+")
+def test_non_ws_clc_kernel_compiles_under_meta_ws(monkeypatch):
+    # clc=True is rejected only for modules that actually use Meta AutoWS.
+    monkeypatch.setenv("TRITON_USE_META_WS", "1")
+    x = torch.randn(4096, device="cuda")
+    y = torch.empty_like(x)
+    _clc_copy.device_caches.clear()
+    with triton.knobs.compilation.scope():
+        triton.knobs.compilation.always_compile = True
+        _clc_copy[(4096 // 256, )](x, y, BLOCK=256, clc=True)
+    torch.testing.assert_close(y, x, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not _is_blackwell(), reason="clc=True requires SM100+")
+def test_ws_clc_kernel_rejected_under_meta_ws(monkeypatch):
+    monkeypatch.setenv("TRITON_USE_META_WS", "1")
+    M = N = K = 512
+    a = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    b = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    c = torch.empty(M, N, device="cuda", dtype=torch.float16)
+    _matmul.device_caches.clear()
+    with triton.knobs.compilation.scope(), pytest.raises(Exception, match="clc=True does not support Meta AutoWS"):
+        triton.knobs.compilation.always_compile = True
+        _matmul.warmup(a, b, c, M, N, K, BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, WARP_SPECIALIZE=True, num_warps=4,
+                       num_stages=3, clc=True, grid=(1, ))

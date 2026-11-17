@@ -382,6 +382,11 @@ int mlir::triton::getCopyVecBytes(RankedTensorType registerTy,
   // FIXME: Here we should pass a MemDescType instead of a SharedEncodingTrait!!
   // This is currently broken for memdesc_subslice!
   auto sharedLayout = triton::gpu::toLinearLayout(shape, sharedEnc);
+  // A mixed-radix layout doesn't compose with the shared layout: copy by runs.
+  if (!regLayout.isRadix2())
+    return ttg::getMixedRadixSharedRun(regLayout, sharedLayout.pseudoinvert(),
+                                       registerTy.getElementTypeBitWidth()) *
+           registerTy.getElementTypeBitWidth() / 8;
   auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
   const int vecElems = regToSharedLayout.getNumConsecutiveInOut();
   return vecElems * registerTy.getElementTypeBitWidth() / 8;
@@ -414,9 +419,20 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
   return width >= 32;
 }
 
-bool mlir::triton::hasRadix2Layout(tt::LoadOp load) {
+bool mlir::triton::canPipelineInSharedMemory(tt::LoadOp load) {
   auto ty = dyn_cast<RankedTensorType>(load.getType());
-  return !ty || ttg::toLinearLayout(ty).isRadix2();
+  if (!ty)
+    return true;
+  LinearLayout layout = ttg::toLinearLayout(ty);
+  if (layout.isRadix2())
+    return true;
+  Type type = ty;
+  for (StringRef name : {ttg::AsyncCopyGlobalToLocalOp::getOperationName(),
+                         ttg::LocalLoadOp::getOperationName()})
+    if (ttg::getNpotLayoutUnsupportedReason(
+            OperationName(name, load.getContext()), type))
+      return false;
+  return !getNpotAsyncCopyUnsupportedReason(load, layout);
 }
 
 void mlir::triton::serializeLatencies(ModuleOp module,
@@ -442,10 +458,10 @@ DenseMap<Operation *, int> mlir::triton::deserializeLatencies(Operation *op) {
   auto latencyHelper = TritonDialect::getLoaded(op)->getLatencyAttrHelper();
   op->walk([&](Operation *op) {
     if (auto attr = latencyHelper.getAttr(op)) {
-      // An NPOT Product load is not yet supported in shared memory: drop its
-      // latency so it stays unpipelined.
+      // A load whose shared-memory ops can't lower its layout stays
+      // unpipelined.
       auto load = dyn_cast<tt::LoadOp>(op);
-      if (!load || hasRadix2Layout(load))
+      if (!load || canPipelineInSharedMemory(load))
         opLatency[op] = attr.getInt();
       latencyHelper.removeAttr(op);
     }
@@ -541,7 +557,7 @@ void mlir::triton::combineRedundantWaitOps(
         createWait) {
   llvm::MapVector<Operation *, Operation *> toDelete;
   for (Operation *waitOp : waitOps) {
-    if (toDelete.count(waitOp))
+    if (toDelete.contains(waitOp))
       continue;
     StringRef waitName = waitOp->getName().getStringRef();
     auto getNum = [](Operation *op) {
@@ -895,7 +911,8 @@ static Operation *getUseOfPipelinedOp(
     topLevelUsers.insert(users.begin(), users.end());
   }
   for (Operation *topLevelUser : topLevelUsers) {
-    assert(schedule.count(topLevelUser) && "op user not found in the schedule");
+    assert(schedule.contains(topLevelUser) &&
+           "op user not found in the schedule");
     if (!selectedUser || shouldPrefer(topLevelUser, selectedUser)) {
       selectedUser = topLevelUser;
     }
@@ -988,24 +1005,14 @@ bool mlir::triton::requestsMetaWarpSpecialization(Operation *op) {
           op->hasAttr(kWarpSpecializeAttrName));
 }
 
-static bool containsMetaWarpSpecializationRequest(Operation *root) {
+// One walk for both the function and module predicates. With
+// `countWarpSpecializeOp`, an existing ttg.warp_specialize region (e.g. from
+// TLX) also counts as a request.
+static bool containsMetaWarpSpecializationRequest(Operation *root,
+                                                  bool countWarpSpecializeOp) {
   return root
-      ->walk([](Operation *op) {
-        return triton::requestsMetaWarpSpecialization(op)
-                   ? WalkResult::interrupt()
-                   : WalkResult::advance();
-      })
-      .wasInterrupted();
-}
-
-bool mlir::triton::isMetaWarpSpecializedFunc(triton::FuncOp funcOp) {
-  return containsMetaWarpSpecializationRequest(funcOp);
-}
-
-bool mlir::triton::requestsMetaWarpSpecialization(ModuleOp mod) {
-  return mod
-      ->walk([](Operation *op) {
-        return isa<ttg::WarpSpecializeOp>(op) ||
+      ->walk([&](Operation *op) {
+        return (countWarpSpecializeOp && isa<ttg::WarpSpecializeOp>(op)) ||
                        triton::requestsMetaWarpSpecialization(op)
                    ? WalkResult::interrupt()
                    : WalkResult::advance();
@@ -1013,12 +1020,22 @@ bool mlir::triton::requestsMetaWarpSpecialization(ModuleOp mod) {
       .wasInterrupted();
 }
 
+bool mlir::triton::isMetaWarpSpecializedFunc(triton::FuncOp funcOp) {
+  return containsMetaWarpSpecializationRequest(funcOp,
+                                               /*countWarpSpecializeOp=*/false);
+}
+
+bool mlir::triton::moduleRequestsMetaWarpSpecialization(ModuleOp mod) {
+  return containsMetaWarpSpecializationRequest(mod,
+                                               /*countWarpSpecializeOp=*/true);
+}
+
 bool mlir::triton::isMetaWSEnabled(Operation *op) {
   auto mod = dyn_cast<ModuleOp>(op);
   if (!mod)
     mod = op->getParentOfType<ModuleOp>();
   if (mod)
-    if (auto attr = mod->getAttrOfType<BoolAttr>("ttg.use_meta_ws"))
+    if (auto attr = mod->getAttrOfType<BoolAttr>(kUseMetaWSAttrName))
       return attr.getValue();
   return triton::tools::getBoolEnv("TRITON_USE_META_WS");
 }
