@@ -355,3 +355,77 @@ def test_reshape_and_cache_5d_over_2gi_elements(slot_dtype):
     reshape_and_cache_5d(key, value, huge_k, huge_v, slots + base * 16)
     torch.testing.assert_close(huge_k[base:], key_cache, atol=0, rtol=0)
     torch.testing.assert_close(huge_v[base:], value_cache, atol=0, rtol=0)
+
+
+def _fp8_inputs(ctx_lens, num_kv_heads, group, query_length, cache_layout, q_fp8, k_scale=0.05, v_scale=0.2,
+                q_scale=0.01):
+    """FP8 e4m3fn K/V (and optionally Q) stored as value / scale, as SGLang's FP8 KV pool holds them; K, V and Q get
+    different scales so a scale applied to the wrong operand shows."""
+    query, key_cache, value_cache, context_lens, block_tables = _inputs(ctx_lens, num_kv_heads, group, 64, 16,
+                                                                        query_length, cache_layout)
+    fp8 = torch.float8_e4m3fn
+    key_cache = (key_cache.float() / k_scale).to(fp8)
+    value_cache = (value_cache.float() / v_scale).to(fp8)
+    descales = dict(k_descale=torch.tensor([k_scale], device=DEVICE), v_descale=torch.tensor([v_scale], device=DEVICE))
+    if q_fp8:
+        query = (query.float() / q_scale).to(fp8)
+        descales["q_descale"] = torch.tensor([q_scale], device=DEVICE)
+    return (query, key_cache, value_cache, context_lens, block_tables), descales
+
+
+@pytest.mark.parametrize("q_fp8", [False, True], ids=["bf16_q", "fp8_q"])
+@pytest.mark.parametrize("window", [0, 37, 2048], ids=lambda w: f"w{w}")
+@pytest.mark.parametrize("query_length", [1, 4, 8], ids=lambda q: f"qlen{q}")
+@pytest.mark.parametrize("cache_layout", ["4d", "nhd"])
+def test_fp8_kv_cache(cache_layout, query_length, window, q_fp8):
+    """Full-attention decode (direct-load path), window layers and verify rows (LDS path) on FP8 caches."""
+    ctx_lens = [max(3, query_length), 40, 2055, 9000]
+    kv_layout = _kv_layout(cache_layout)
+    inputs, descales = _fp8_inputs(ctx_lens, 4, 8, query_length, cache_layout, q_fp8)
+    query, key_cache, value_cache, _, block_tables = inputs
+    kwargs = dict(query_length=query_length, sliding_window=window, max_context_len=max(ctx_lens), kv_layout=kv_layout)
+    workspace = paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, **kwargs)
+    out = paged_attention_decode(*inputs, workspace=workspace, **kwargs, **descales)
+    assert out.dtype == torch.bfloat16
+    sm_scale = query.shape[2]**-0.5
+    expected = pa.ref_decode(query, key_cache, value_cache, inputs[3], block_tables, sm_scale, 32, 4, query_length,
+                             window, kv_layout, **descales)
+    _assert_matches(out, expected)
+
+
+@pytest.mark.parametrize("num_kv_heads", [2, 16], ids=lambda h: f"kvh{h}")
+def test_fp8_kv_cache_sglang_shape(num_kv_heads):
+    """GQA 8, D64, page 16 page-major pool with FP8 Q and an FP16 output buffer."""
+    inputs, descales = _fp8_inputs([9, 3000], num_kv_heads, 8, 1, "nhd", True)
+    out = torch.empty(inputs[0].shape, dtype=torch.float16, device=DEVICE)
+    result = paged_attention_decode(*inputs, kv_layout="NHD", out=out, **descales)
+    assert result is out
+    query, key_cache, value_cache, context_lens, block_tables = inputs
+    expected = pa.ref_decode(query, key_cache, value_cache, context_lens, block_tables, 64**-0.5, num_kv_heads * 8,
+                             num_kv_heads, 1, 0, "NHD", **descales)
+    _assert_matches(out, expected)
+
+
+def test_fp8_kv_cache_rejects_invalid_inputs():
+    inputs, descales = _fp8_inputs([40], 2, 8, 1, "nhd", False)
+    query, key_cache, value_cache, context_lens, block_tables = inputs
+    bf16 = _inputs([40], 2, 8, 64, 16, cache_layout="nhd")
+    fp8_q = (query.float() / 0.01).to(torch.float8_e4m3fn)
+    q_descale = torch.tensor([0.01], device=DEVICE)
+    bad = [
+        ((query, key_cache, value_cache, context_lens, block_tables), {}),
+        ((query, key_cache, value_cache, context_lens, block_tables), dict(k_descale=descales["k_descale"])),
+        ((query, key_cache, value_cache, context_lens, block_tables), dict(descales, q_descale=q_descale)),
+        ((fp8_q, key_cache, value_cache, context_lens, block_tables), descales),
+        ((fp8_q, *bf16[1:]), dict(q_descale=q_descale)),
+        (bf16, descales),
+        ((query, key_cache, value_cache, context_lens, block_tables),
+         dict(descales, out=torch.empty(query.shape, dtype=torch.float32, device=DEVICE))),
+    ]
+    for case_inputs, kwargs in bad:
+        with pytest.raises(InvalidInput):
+            paged_attention_decode(*case_inputs, kv_layout="NHD", **kwargs)
+    k5, v5 = allocate_paged_kv_cache_5d(4, 2, 16, 64, dtype=torch.bfloat16, device=DEVICE)
+    with pytest.raises(InvalidInput):
+        paged_attention_decode(query, k5.to(torch.float8_e4m3fn), v5.to(torch.float8_e4m3fn), context_lens,
+                               block_tables[:, :3], **descales)

@@ -5841,6 +5841,8 @@ class TestSdpaToFlex(TestCase):
         import triton.language.extra.tlx.inductor.registry  # noqa: F401
         from torch.nn.attention import SDPBackend
 
+        if backend == "cudnn" and (torch.backends.cudnn.version() or 0) < 90000:
+            self.skipTest("cuDNN attention needs cuDNN >= 9")
         sdpa_backend = {"flash": SDPBackend.FLASH_ATTENTION, "cudnn": SDPBackend.CUDNN_ATTENTION}[backend]
 
         q, kv = self._inputs(8, Lq, Lkv, D)

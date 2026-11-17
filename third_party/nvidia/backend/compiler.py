@@ -16,7 +16,7 @@ from triton._C.libtriton import ir, llvm, nvidia, passes, tlx
 from triton._instrumentation import instrument as _instrument, is_enabled
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.magnon.flags import apply_enabled as _compile_iq_apply_enabled
-from triton.runtime.errors import PTXASError
+from triton.runtime.errors import PTXASError, attach_shared_memory_breakdown
 from triton.tools.compile_trace import run_subprocess
 
 # Auto-TMA host-launcher caps. These MUST stay in lockstep with the C macros of
@@ -113,10 +113,7 @@ def min_dot_size(target: GPUTarget):
 
 
 def get_ptxas(arch: int) -> knobs.NvidiaTool:
-    if arch < 90:
-        return knobs.nvidia.ptxas
-    # The ptxas-blackwell name is misleading; keep it until legacy ptxas is removed.
-    return knobs.nvidia.ptxas_blackwell
+    return knobs.nvidia.ptxas
 
 
 @functools.lru_cache()
@@ -158,6 +155,8 @@ def get_ptx_version_from_options(options, arch: int):
     if ptx_version is None:
         cuda_version = get_ptxas(arch).version
         ptx_version = ptx_get_version(cuda_version)
+    if arch == 107 and ptx_version < 94:
+        raise ValueError("SM107 requires PTX 9.4 or later")
     return ptx_version
 
 
@@ -175,7 +174,7 @@ def get_features(options, arch: int):
     # To check if a newer PTX version is supported, increase this value
     # and run a test.  If it's not supported, LLVM will print a warning
     # like "+ptx8.4 is not a recognized feature for this target".
-    llvm_ptx_version = min(90, ptx_version)
+    llvm_ptx_version = min(94, ptx_version)
     features = f"+ptx{llvm_ptx_version}"
     return features
 
@@ -1428,13 +1427,9 @@ class CUDABackend(BaseBackend):
             raise RuntimeError(
                 "Address Sanitizer Error: Address sanitizer is currently only supported on the AMD backend")
         llvm_mod = llvm.to_module(mod, context)
-        if capability == 107:
-            cap_llvm = 100
-        else:
-            cap_llvm = capability
 
-        proc = sm_arch_from_capability(cap_llvm)
-        features = get_features(options, cap_llvm)
+        proc = sm_arch_from_capability(capability)
+        features = get_features(options, capability)
         triple = 'nvptx64-nvidia-cuda'
         flags = get_llvm_flags()
         llvm.attach_datalayout(llvm_mod, triple, proc, features, flags, abi="shortptr")
@@ -1463,6 +1458,7 @@ class CUDABackend(BaseBackend):
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment") or 1
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0
         metadata["profile_scratch_align"] = src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1
+        attach_shared_memory_breakdown(src, metadata)
 
         # Add Triton and LLVM versions to the dumped IR.
         if knobs.compilation.dump_ir:
@@ -1477,13 +1473,8 @@ class CUDABackend(BaseBackend):
 
         triple = "nvptx64-nvidia-cuda"
 
-        if capability == 107:
-            cap_llvm = 100
-        else:
-            cap_llvm = capability
-
-        proc = sm_arch_from_capability(cap_llvm)
-        features = get_features(opt, cap_llvm)
+        proc = sm_arch_from_capability(capability)
+        features = get_features(opt, capability)
         flags = get_llvm_flags()
         if opt.enable_nvptx_v2i32:
             flags.append("nvptx-v2i32")
