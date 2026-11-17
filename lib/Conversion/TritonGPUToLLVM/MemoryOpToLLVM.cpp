@@ -148,7 +148,7 @@ struct LocalAllocOpConversion
         auto masks = regLayout.getFreeVariableMasks();
         auto ptrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
         forEachMixedRadixSharedRun(
-            loc, rewriter, regLayout, toOffset, run,
+            loc, rewriter, regLayout, toOffset, run, /*origin=*/{},
             [&](int32_t reg, Value offset, auto indices) {
               Value value =
                   run == 1 ? inVals[reg]
@@ -226,13 +226,18 @@ public:
       int32_t run = getMixedRadixSharedRun(regLayout, toOffset,
                                            llvmElemTy.getIntOrFloatBitWidth());
       auto ptrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
-      // The verifier allows views on pow2 subslice extents only, so XOR is ADD.
-      Value origin = smemObj.getShmemOffset(loc, rewriter, memDescTy);
+      // Test for a subslice by shape: the affine mask is zero for a view of
+      // an NPOT buffer in its top pow2 digit (e.g. 32 of 48 rows).
+      auto enc = memDescTy.getEncoding();
+      SmallVector<Value> origin;
+      if (dropPipeliningDim(memDescTy.getShape(), enc) !=
+          dropPipeliningDim(memDescTy.getAllocShape(), enc))
+        origin = llvm::to_vector(
+            dropPipeliningDim(ArrayRef(smemObj.getOffsets()), enc));
       SmallVector<Value> outVals;
       forEachMixedRadixSharedRun(
-          loc, rewriter, regLayout, toOffset, run,
+          loc, rewriter, regLayout, toOffset, run, origin,
           [&](int32_t, Value offset, auto) {
-            offset = b.xor_(offset, origin);
             Value ptr = b.gep(ptrTy, llvmElemTy, smemObj.getBase(), offset);
             Value vec = b.load(vec_ty(llvmElemTy, run), ptr);
             llvm::append_range(outVals, unpackLLVector(loc, vec, rewriter));
