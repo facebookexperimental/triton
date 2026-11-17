@@ -47,10 +47,10 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 #b4 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: llvm.func @hist_96_broadcast
-  // CHECK: %[[LANE_MASK:.+]] = llvm.mlir.constant(16 : i32)
+  // CHECK-DAG: %[[LANE_MASK:.+]] = llvm.mlir.constant(16 : i32)
+  // CHECK-DAG: %[[WARP_MASK:.+]] = llvm.mlir.constant(3 : i32)
   // CHECK: %[[LANE_BIT:.+]] = llvm.and %{{.+}}, %[[LANE_MASK]] : i32
   // CHECK: %[[LANE_OK:.+]] = llvm.icmp "eq" %[[LANE_BIT]], %{{.+}} : i32
-  // CHECK: %[[WARP_MASK:.+]] = llvm.mlir.constant(3 : i32)
   // CHECK: %[[WARP_BITS:.+]] = llvm.and %{{.+}}, %[[WARP_MASK]] : i32
   // CHECK: %[[WARP_OK:.+]] = llvm.icmp "eq" %[[WARP_BITS]], %{{.+}} : i32
   // CHECK: %[[OWNER:.+]] = llvm.and %[[LANE_OK]], %[[WARP_OK]] : i1

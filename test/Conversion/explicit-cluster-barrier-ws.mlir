@@ -1,5 +1,5 @@
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar='compute-capability=100 ptx-version=87' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' | FileCheck %s --check-prefix=LOWER
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar='compute-capability=100 ptx-version=87' --triton-nvidia-gpu-tmem-wait-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' --convert-warp-specialize-to-llvm > %t
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar='compute-capability=100 ptx-version=87' --triton-nvidia-gpu-tmem-barrier-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' | FileCheck %s --check-prefix=LOWER
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory-nv --triton-nvidia-gpu-membar='compute-capability=100 ptx-version=87' --triton-nvidia-gpu-tmem-barrier-insertion --triton-nvidia-gpu-cluster-barrier-mbar-allocator --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' --convert-warp-specialize-to-llvm > %t
 // RUN: FileCheck %s --check-prefix=HEADER < %t
 // RUN: FileCheck %s --check-prefix=ARRIVES < %t
 // RUN: FileCheck %s --check-prefix=WAITS < %t
@@ -18,8 +18,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
   // LOWER: mbarrier.init.shared::cta.b64
   // LOWER: nvvm.cluster.arrive.relaxed aligned
   // LOWER-NEXT: nvvm.cluster.wait aligned
-  // LOWER: ttg.warp_specialize
-  // LOWER: ttg.warp_return
+  // The empty user region folds; the three sync regions below remain.
   // LOWER: ttg.warp_specialize
   // LOWER: default {
   // LOWER-NEXT: nvvm.cluster.arrive.relaxed aligned
@@ -82,8 +81,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
   // LOWER: nvvm.cluster.arrive.relaxed aligned
   // LOWER-NEXT: nvvm.cluster.wait aligned
   // LOWER: nvvm.mapa
-  // LOWER: ttg.warp_specialize
-  // LOWER: ttg.warp_return
+  // The empty user region folds; the sync region below remains.
   // LOWER: ttg.warp_specialize
   // LOWER: default {
   // LOWER-NEXT: nvvm.cluster.arrive.relaxed aligned

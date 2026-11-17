@@ -1,11 +1,11 @@
-name: Fast follow-up source
-# Called by the workflow_run follow-ups of Fast correctness (GPU full tests and the TLX codegen trace). Verifies the
-# triggering run and its follow-up manifest (fast_followup.py) and hands its head wheel to the calling run. It runs
-# trusted default-branch code only; the PR's commits, manifest and wheel are read as data.
+name: GPU tests follow-up source
+# Called by the workflow_run follow-up of GPU tests (the TLX codegen trace). Verifies the triggering run and its
+# follow-up manifest (fast_followup.py) and hands its head wheel to the calling run. It runs trusted default-branch
+# code only; the PR's commits, manifest and wheel are read as data.
 #
-# status: ok (verified, current), stale (the PR head moved; a newer Fast run owns it), none (that Fast run
-# published no follow-up manifest, e.g. an older generation that runs full tests itself) or empty when the
-# triggering run did not succeed. Verification failures fail this job.
+# status: ok (verified, current), stale (the PR head moved; a newer GPU tests run owns it), none (that run built no
+# wheel, so it published no manifest) or empty when the triggering run did not succeed. Verification failures fail
+# this job.
 
 on:
   workflow_call:
@@ -26,8 +26,6 @@ on:
         value: ${{ jobs.verify.outputs.base_ref }}
       head_ref:
         value: ${{ jobs.verify.outputs.head_ref }}
-      head_repo:
-        value: ${{ jobs.verify.outputs.head_repo }}
       fork:
         value: ${{ jobs.verify.outputs.fork }}
       wheel:
@@ -53,7 +51,6 @@ jobs:
       base: ${{ steps.verify.outputs.base }}
       base_ref: ${{ steps.verify.outputs.base_ref }}
       head_ref: ${{ steps.verify.outputs.head_ref }}
-      head_repo: ${{ steps.verify.outputs.head_repo }}
       fork: ${{ steps.verify.outputs.fork }}
       wheel: ${{ steps.verify.outputs.wheel || steps.relayed.outputs.wheel }}
       wheel_reason: ${{ steps.verify.outputs.wheel_reason }}
@@ -118,7 +115,7 @@ jobs:
           REASON: ${{ steps.verify.outputs.wheel_reason }}
         run: |
           {
-            echo "## Fast correctness follow-up"
+            echo "## GPU tests follow-up"
             echo
             echo "Producer: run ${PRODUCER_RUN} attempt ${ATTEMPT}, PR head ${PR_HEAD}, test merge ${MERGE:-unknown}"
             echo

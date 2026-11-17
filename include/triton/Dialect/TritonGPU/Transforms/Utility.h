@@ -35,6 +35,13 @@ class SwizzledSharedEncodingAttr;
 // bounds, including triangular nests; resolve warp-specialize captures.
 bool haveEquivalentWarpSpecializeLoopNests(ArrayRef<scf::ForOp> lhs,
                                            ArrayRef<scf::ForOp> rhs);
+
+// True when `op` implements EfficientLayoutOpInterface and has pinned its
+// result layout.
+inline bool hasEfficientLayout(Operation *op) {
+  auto iface = dyn_cast_if_present<EfficientLayoutOpInterface>(op);
+  return iface && iface.getEfficientLayout();
+}
 } // namespace gpu
 } // namespace triton
 

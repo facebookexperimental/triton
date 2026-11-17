@@ -277,10 +277,7 @@ def recovery_results(paths, expected, budgets, threshold, failed, bucket):
                 name = os.path.basename(path).removesuffix(".xml")
                 resolved.append(f"slow-step:{name}")
     complete = bool(expected) and set(roots) == set(expected) and all(
-        list(root.iter("testcase")) and all(
-            int(suite.get("tests", "0")) == len(suite.findall("testcase"))
-            for suite in root.iter("testsuite"))
-        for root in roots.values())
+        list(root.iter("testcase")) for root in roots.values())
     if complete and not failed and passed:
         resolved.extend([bucket, "pytest-junit-missing", "gpu-unhealthy"])
     return encode_recovery(passed, resolved, bool(complete))

@@ -246,7 +246,8 @@ def _qk_interleaved(q0, q1, k_slot, v_src, v_dst, BLOCK_N: tl.constexpr, MFMA32:
 def _qk_pv_interleaved(q0, q1, p, k_slot, v_slot, acc0, acc1, v_src, v_dst, k_src, k_dst, BLOCK_N: tl.constexpr,
                        MFMA32: tl.constexpr):
     # QK of the next key block and PV of the current one. Each dot is paired with the LDS read the next
-    # dot needs, and the next V and K copies ride with the first two dots.
+    # dot needs, and the next K and V copies ride with the first two dots. The caller waits only for this
+    # block's K; its V lands while the first QK dot runs.
     if MFMA32:
         mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[32, 32, 16], transposed=True,
                                                 warps_per_cta=[4, 1])
@@ -256,20 +257,23 @@ def _qk_pv_interleaved(q0, q1, p, k_slot, v_slot, acc0, acc1, v_src, v_dst, k_sr
     p = tlx.require_layout(p, tlx.dot_operand_layout(0, mma, k_width=4), pin=False)
     s = tlx.zeros((q0.shape[0], BLOCK_N), tl.float32, layout=mma)
     k0 = _read_k(k_slot, 0, MFMA32)
-    with tlx.warp_pipeline_stage("v_copy_read_v0", scope="intra_wave", pair=0):
-        tlx.async_load_commit_group([tlx.async_load(v_src, v_dst)])
-        v0 = _read_v(v_slot, 0, MFMA32)
-    with tlx.warp_pipeline_stage("qk0", scope="intra_wave", pair=0):
-        s = tl.dot(q0, k0, s)
-    with tlx.warp_pipeline_stage("k_copy_read_k1", scope="intra_wave", pair=1):
+    with tlx.warp_pipeline_stage("k_copy_read_k1", scope="intra_wave", pair=0):
         tlx.async_load_commit_group([tlx.async_load(k_src, k_dst)])
         k1 = _read_k(k_slot, 32, MFMA32)
-    with tlx.warp_pipeline_stage("pv0", scope="intra_wave", pair=1):
-        acc0 = tl.dot(p, v0, acc0)
+    with tlx.warp_pipeline_stage("qk0", scope="intra_wave", pair=0):
+        s = tl.dot(q0, k0, s)
+    # Everything but the K copy just issued: this block's V.
+    tlx.async_load_wait_group(1)
+    tl.debug_barrier()
+    with tlx.warp_pipeline_stage("v_copy_read_v0", scope="intra_wave", pair=1):
+        tlx.async_load_commit_group([tlx.async_load(v_src, v_dst)])
+        v0 = _read_v(v_slot, 0, MFMA32)
+    with tlx.warp_pipeline_stage("qk1", scope="intra_wave", pair=1):
+        s = tl.dot(q1, k1, s)
     with tlx.warp_pipeline_stage("read_v1", scope="intra_wave", pair=2):
         v1 = _read_v(v_slot, 32, MFMA32)
-    with tlx.warp_pipeline_stage("qk1", scope="intra_wave", pair=2):
-        s = tl.dot(q1, k1, s)
+    with tlx.warp_pipeline_stage("pv0", scope="intra_wave", pair=2):
+        acc0 = tl.dot(p, v0, acc0)
     acc1 = tl.dot(p, v1, acc1)
     return s, acc0, acc1
 
@@ -289,9 +293,21 @@ def _softmax(s, m_i, l_i, acc0, acc1, qk_scale, dtype: tl.constexpr):
 @triton.jit
 def _kv_ptrs(Base, bt_row, kv_head, blk, lo, ctx, stride_p, stride_s, stride_h, BLOCK_N: tl.constexpr,
              HEAD_DIM: tl.constexpr, PAGE: tl.constexpr):
+    return _kv_page_ptrs(Base, _kv_pages(bt_row, blk, lo, ctx, BLOCK_N, PAGE), kv_head, blk, stride_p, stride_s,
+                         stride_h, BLOCK_N, HEAD_DIM, PAGE)
+
+
+@triton.jit
+def _kv_pages(bt_row, blk, lo, ctx, BLOCK_N: tl.constexpr, PAGE: tl.constexpr):
     # Row r of key block blk is token blk * BLOCK_N + r, in slot (token % PAGE) of page block_tables[token // PAGE].
     kpos = blk * BLOCK_N + tl.arange(0, BLOCK_N)
-    page = tl.load(bt_row + kpos // PAGE, mask=(kpos >= lo) & (kpos < ctx), other=0).to(tl.int64)
+    return tl.load(bt_row + kpos // PAGE, mask=(kpos >= lo) & (kpos < ctx), other=0).to(tl.int64)
+
+
+@triton.jit
+def _kv_page_ptrs(Base, page, kv_head, blk, stride_p, stride_s, stride_h, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+                  PAGE: tl.constexpr):
+    kpos = blk * BLOCK_N + tl.arange(0, BLOCK_N)
     rows = page * stride_p + (kpos % PAGE) * stride_s + kv_head * stride_h
     return Base + rows[:, None] + tl.arange(0, HEAD_DIM)[None, :]
 
@@ -324,7 +340,7 @@ def _masked_step(q0, q1, qpos, K, V, k_slot, v_slot, bt_row, kv_head, blk, k_lo,
 @triton.jit
 def _paged_prefill_tlx_kernel(Q, K, V, Out, CuQ, CtxLens, BlockTables, stride_qt, stride_qh, stride_kp, stride_ks,
                               stride_kh, stride_vp, stride_vs, stride_vh, stride_ot, stride_oh, stride_bt, qk_scale,
-                              window, num_kv_heads, num_m_blocks, n_items, GROUP: tl.constexpr, ROWS: tl.constexpr,
+                              window, num_kv_heads, num_m_blocks, n_items, zig, GROUP: tl.constexpr, ROWS: tl.constexpr,
                               BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr, PAGE: tl.constexpr,
                               HAS_WINDOW: tl.constexpr, SEQ_MAJOR: tl.constexpr, K_LAYOUT: tl.constexpr,
                               V_LAYOUT: tl.constexpr, MFMA32: tl.constexpr):
@@ -332,6 +348,10 @@ def _paged_prefill_tlx_kernel(Q, K, V, Out, CuQ, CtxLens, BlockTables, stride_qt
     BLOCK_M: tl.constexpr = ROWS * GROUP
     dtype: tl.constexpr = Q.dtype.element_ty
     pid = tl.program_id(0)
+    if zig > 0:
+        # Reverse every other chunk of zig tiles, so the tiles that land on one CU pair long with short.
+        chunk = pid // zig
+        pid = tl.where(chunk % 2 == 1, chunk * zig + tl.minimum(zig, n_items - chunk * zig) - 1 - pid % zig, pid)
     if SEQ_MAJOR:
         # The tiles of one (sequence, KV head) back to back, longest first: with cached prefixes of different
         # lengths a tile's cost no longer follows its index, and adjacent tiles share the prefix in cache.
@@ -412,20 +432,25 @@ def _paged_prefill_tlx_kernel(Q, K, V, Out, CuQ, CtxLens, BlockTables, stride_qt
                                             HEAD_DIM, PAGE, HAS_WINDOW, dtype, MFMA32)
 
     if f_hi > f_lo:
-        # Counting from f_lo: K(0) into slot 0, then K(1) and V(0); step i reads K(i + 1) and V(i) and copies
-        # K(i + 2) and V(i + 1) into the slots step i - 1 freed. Copies past the last block repeat it.
+        # Counting from f_lo: K(0) and K(1) into the K slots, then V(0); step i reads K(i + 1) and V(i) and
+        # copies K(i + 2), then V(i + 1), into the slots step i - 1 freed. Copies past the last block repeat it.
+        # Page numbers are loaded one copy ahead: vmcnt retires in issue order, so a page load issued after V(i)
+        # would make the wait for it drain V(i) too.
         last = f_hi - f_lo - 1
+        pg_a = _kv_pages(bt_row, f_lo, k_lo, ctx, BLOCK_N, PAGE)
+        pg_b = _kv_pages(bt_row, f_lo + tl.minimum(1, last), k_lo, ctx, BLOCK_N, PAGE)
         tlx.async_load_commit_group([
             tlx.async_load(
-                _kv_ptrs(K, bt_row, kv_head, f_lo, k_lo, ctx, stride_kp, stride_ks, stride_kh, BLOCK_N, HEAD_DIM, PAGE),
+                _kv_page_ptrs(K, pg_a, kv_head, f_lo, stride_kp, stride_ks, stride_kh, BLOCK_N, HEAD_DIM, PAGE),
                 tlx.local_view(k_buf, 0))
         ])
         tlx.async_load_commit_group([
             tlx.async_load(
-                _kv_ptrs(K, bt_row, kv_head, f_lo + tl.minimum(1, last), k_lo, ctx, stride_kp, stride_ks, stride_kh,
-                         BLOCK_N, HEAD_DIM, PAGE), tlx.local_view(k_buf, 1))
+                _kv_page_ptrs(K, pg_b, kv_head, f_lo + tl.minimum(1, last), stride_kp, stride_ks, stride_kh, BLOCK_N,
+                              HEAD_DIM, PAGE), tlx.local_view(k_buf, 1))
         ])
-        v_src = _kv_ptrs(V, bt_row, kv_head, f_lo, k_lo, ctx, stride_vp, stride_vs, stride_vh, BLOCK_N, HEAD_DIM, PAGE)
+        pg_c = _kv_pages(bt_row, f_lo + tl.minimum(2, last), k_lo, ctx, BLOCK_N, PAGE)
+        v_src = _kv_page_ptrs(V, pg_a, kv_head, f_lo, stride_vp, stride_vs, stride_vh, BLOCK_N, HEAD_DIM, PAGE)
         tlx.async_load_wait_group(1)
         tl.debug_barrier()
         s = _qk_interleaved(q0, q1, tlx.local_view(k_buf, 0), v_src, tlx.local_view(v_buf, 0), BLOCK_N, MFMA32)
@@ -433,13 +458,15 @@ def _paged_prefill_tlx_kernel(Q, K, V, Out, CuQ, CtxLens, BlockTables, stride_qt
         for i in tl.range(0, last, num_stages=1):
             cur = i % 2
             nxt = 1 - cur
-            # Block-table loads for the next copies overlap the copies still in flight.
-            v_next = _kv_ptrs(V, bt_row, kv_head, f_lo + i + 1, k_lo, ctx, stride_vp, stride_vs, stride_vh, BLOCK_N,
-                              HEAD_DIM, PAGE)
-            k_next = _kv_ptrs(K, bt_row, kv_head, f_lo + tl.minimum(i + 2, last), k_lo, ctx, stride_kp, stride_ks,
-                              stride_kh, BLOCK_N, HEAD_DIM, PAGE)
-            tlx.async_load_wait_group(0)
+            # In flight: K(i + 1), page numbers of block i + 2, then V(i). Wait for the first two only.
+            tlx.async_load_wait_group(1)
             tl.debug_barrier()
+            v_next = _kv_page_ptrs(V, pg_b, kv_head, f_lo + i + 1, stride_vp, stride_vs, stride_vh, BLOCK_N, HEAD_DIM,
+                                   PAGE)
+            k_next = _kv_page_ptrs(K, pg_c, kv_head, f_lo + tl.minimum(i + 2, last), stride_kp, stride_ks, stride_kh,
+                                   BLOCK_N, HEAD_DIM, PAGE)
+            pg_b = pg_c
+            pg_c = _kv_pages(bt_row, f_lo + tl.minimum(i + 3, last), k_lo, ctx, BLOCK_N, PAGE)
             s, acc0, acc1 = _qk_pv_interleaved(q0, q1, p, tlx.local_view(k_buf, nxt), tlx.local_view(v_buf, cur), acc0,
                                                acc1, v_next, tlx.local_view(v_buf, nxt), k_next,
                                                tlx.local_view(k_buf, cur), BLOCK_N, MFMA32)
@@ -472,9 +499,14 @@ def _kv_layout(pad):
     return tlx.padded_shared_layout_encoding.with_bases([(512, pad)], bases, [64, 64])
 
 
+@lru_cache(maxsize=None)
+def _num_cus(device):
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
 def paged_attention_prefill(query, key_cache, value_cache, cu_seqlens_q, context_lens, block_tables, max_seqlen_q,
                             sm_scale=None, sliding_window=0, out=None, *, max_context_len=None, rows=None,
-                            waves_per_eu=2, seq_major=None, k_pad=32, v_pad=32, mfma32=True):
+                            waves_per_eu=2, seq_major=None, k_pad=32, v_pad=32, mfma32=True, zig=None):
     """Launch the TLX forward (head dim 64); inputs are validated by ``tlx.ops.paged_attention_prefill``."""
     num_q_heads, head_dim = query.shape[1], query.shape[2]
     page_size, num_kv_heads = key_cache.shape[1], key_cache.shape[2]
@@ -494,12 +526,18 @@ def paged_attention_prefill(query, key_cache, value_cache, cu_seqlens_q, context
     extra = {} if waves_per_eu is None else {"waves_per_eu": waves_per_eu}
     if seq_major is None:
         seq_major = batch > 1 and max_context_len is not None and max_context_len > max_seqlen_q
+    if zig is None:
+        # With at most two tiles per CU, CU c runs tiles c and num_cus + c of the longest-first order, so the
+        # first CUs get the heaviest pairs; reversing the second chunk pairs the longest tile with the shortest.
+        # Past two rounds, dispatch already balances the tail.
+        num_cus = _num_cus(query.device)
+        zig = num_cus if not seq_major and num_cus < n_items <= 2 * num_cus else 0
     _paged_prefill_tlx_kernel[(n_items, )](query, key_cache, value_cache, out, cu_seqlens_q, context_lens, block_tables,
                                            query.stride(0), query.stride(1), key_cache.stride(0), key_cache.stride(1),
                                            key_cache.stride(2), value_cache.stride(0), value_cache.stride(1),
                                            value_cache.stride(2), out.stride(0), out.stride(1), block_tables.stride(0),
                                            sm_scale * 1.4426950408889634, sliding_window, num_kv_heads, num_m_blocks,
-                                           n_items, GROUP=group, ROWS=rows, BLOCK_N=64, HEAD_DIM=head_dim,
+                                           n_items, zig, GROUP=group, ROWS=rows, BLOCK_N=64, HEAD_DIM=head_dim,
                                            PAGE=page_size, HAS_WINDOW=sliding_window > 0, SEQ_MAJOR=seq_major,
                                            K_LAYOUT=_kv_layout(k_pad), V_LAYOUT=_kv_layout(v_pad), MFMA32=mfma32,
                                            num_warps=4, num_stages=1, **extra)

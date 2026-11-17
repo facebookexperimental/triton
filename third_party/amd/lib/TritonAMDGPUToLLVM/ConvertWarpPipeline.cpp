@@ -284,10 +284,8 @@ static void emitClusterPriority(OpBuilder &r, Location loc,
   }
 }
 
-// Wrap a pre-existing barrier op (e.g. async_wait) with sched_barriers so the
-// backend scheduler cannot move ops across it, and emit the cluster's
-// priority just before the barrier.  Used in place of inserting a fresh
-// cluster barrier when one already exists at the cluster boundary.
+// Fence a pre-existing cluster-boundary barrier or wait and emit the cluster's
+// priority before it. Group waits also need an explicit local rendezvous.
 static void wrapExistingBarrier(OpBuilder &b, Location loc,
                                 Operation *clusterOp,
                                 Operation *existingBarrier, bool anyHasPriority,
@@ -297,6 +295,12 @@ static void wrapExistingBarrier(OpBuilder &b, Location loc,
     emitClusterPriority(b, loc, clusterOp, anyHasPriority);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
   b.setInsertionPointAfter(existingBarrier);
+  // Group waits lower to per-thread completion waits. Place the rendezvous
+  // here so Membar cannot defer it into the next stage. The trailing scheduling
+  // fence also prevents ScheduleMembar from moving it to a global-load use.
+  if (isa<triton::gpu::AsyncWaitOp, triton::amdgpu::AsyncWaitOp>(
+          existingBarrier))
+    triton::gpu::BarrierOp::create(b, loc, triton::gpu::AddrSpace::Local);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
 }
 
@@ -500,10 +504,9 @@ private:
 
       if (auto exBar = existingBarrierMap.find(i);
           exBar != existingBarrierMap.end()) {
-        // FIXME: If bars[i] is true, wrapping a non-LOCAL pre-existing
-        // barrier is not enough to satisfy LDS ordering.  For now we rely on
-        // the producer to place such barriers only where no local fence is
-        // needed.
+        // FIXME: Non-LOCAL barriers other than group waits do not acquire
+        // a local fence in wrapExistingBarrier. They must occur only where
+        // no local fence is needed.
         wrapExistingBarrier(b, loc, clusterOps[i], exBar->second,
                             anyHasPriority, emitPriorityAtBoundary);
       } else {

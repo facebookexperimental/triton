@@ -4389,6 +4389,19 @@ def test_mm_cached_b_rejects_i32_offset_overflow():
     assert _gfx950.heuristic_config(m, n, k, torch.bfloat16, 2, (k, 1), b_strides)[0] == "register"
 
 
+@pytest.mark.parametrize("m,n,k,dtype,b_strides,store_cache", [
+    (819200, 1024, 192, torch.bfloat16, (1, 192), ""),
+    (819200, 1024, 192, torch.float16, (1, 192), ""),
+    (2252800, 256, 256, torch.float16, (256, 1), ""),
+    (2252800, 256, 256, torch.float16, (1, 256), ""),
+    (524288, 512, 192, torch.bfloat16, (512, 1), ".cs"),
+])
+def test_mm_cached_b_store_cache(m, n, k, dtype, b_strides, store_cache):
+    path, plan = _gfx950._optimized_geometry_config(m, n, k, dtype, 2, (k, 1), b_strides)
+    assert path == "cached_b_lds"
+    assert plan.get("STORE_CACHE", ".cs") == store_cache
+
+
 @pytest.mark.parametrize("m,n,k", [
     (32768, 4096, 1536),
     (32768, 4352, 1664),

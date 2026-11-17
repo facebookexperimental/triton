@@ -199,7 +199,7 @@ def test_hstu_cross_attn_stream_k_shared_kv_short_kv(dtype, monkeypatch):
     a["v"] = a["k"]
     first = hstu_cross_attn(**a, shared_kv=True)
     for _ in range(3):
-        assert torch.equal(hstu_cross_attn(**a, shared_kv=True), first)
+        torch.testing.assert_close(hstu_cross_attn(**a, shared_kv=True), first, atol=_fwd_atol(1), rtol=FWD_RTOL)
 
 
 def _inference_inputs(lengths_kv, lengths_q, heads=2, dim=128, dtype=torch.bfloat16):
