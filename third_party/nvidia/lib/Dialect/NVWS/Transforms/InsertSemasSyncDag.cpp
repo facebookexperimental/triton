@@ -713,6 +713,7 @@ public:
     if (hadError || failed(resolveDeferredEntries()))
       return failure();
     if (remainingEdges.empty() && placed.supplies.empty()) {
+      drainTerminalAsyncChannels();
       if (failed(verifyRegionDrains()))
         return failure();
       if (failed(formSemaphores()))
@@ -1009,6 +1010,32 @@ private:
     uniteChannels(drain, channel);
     regionDrains.push_back({anchor, channel, owner, drain, {}});
     return regionDrains.back();
+  }
+  void drainTerminalAsyncChannels() {
+    for (Node *region : g.nodesOfKind(Node::For)) {
+      if (!gpu::hasWarpSpecializeTag(region->op) || region->flow)
+        continue;
+      auto pieces = sortedPieceInfo(region);
+      if (llvm::any_of(pieces, [&](const auto &piece) {
+            return pieceTouchedAfter(g, region, piece.first);
+          }))
+        continue;
+      for (const auto &[_, info] : pieces) {
+        Node *channel = regionChannelFor(region, info.owner);
+        if (!channel)
+          continue;
+        bool hasAsyncClose = llvm::any_of(
+            g.nodesOfKind(Node::Release), [&](Node *release) {
+              return withinRegion(release, region) && release->sat &&
+                     findChannel(release->sat) == findChannel(channel) &&
+                     hasAsyncPayload(release->payloads);
+            });
+        // The next iteration normally acquires this channel. On loop exit,
+        // observe its final async release before the barriers are destroyed.
+        if (hasAsyncClose)
+          getOrCreateRegionDrain(region, info.owner, channel, nullptr);
+      }
+    }
   }
   LogicalResult verifyRegionDrains() {
     for (auto [index, entry] : llvm::enumerate(regionDrains)) {
@@ -2518,7 +2545,27 @@ static LogicalResult assignCircularStageOffsets(PhysicalSets &physical) {
         return semaError(member.allocOp)
                << "circular consumer appears before producer";
     }
-    auto assignProtocolOffset = [](Node *n, Node *Node::*step) {
+    auto assignProtocolOffset = [&](GroupDag *group, Node *n,
+                                    Node *Node::*step) {
+      Node *anchor = n->scheduleAnchor;
+      if (n->kind == Node::Acquire && anchor->isRegion() &&
+          anchor->parent == n->parent && precedesInChain(anchor, n)) {
+        // A region-exit acquire observes this group's last produced slot.
+        // Rebase it against the final cursor of the entire physical ring;
+        // the release-site offset may precede advances by another group.
+        std::optional<int64_t> slot, cursor;
+        for (const SlotEvent &event : ordered) {
+          if (!anchor->op->isProperAncestor(event.node->op))
+            continue;
+          cursor = slots.baseOrdinalByEvent.lookup(event.node);
+          if (event.group == group)
+            slot = slots.ordinalByAccess.lookup(event.node);
+        }
+        if (slot && cursor) {
+          n->stageOffset = *slot - *cursor;
+          return;
+        }
+      }
       if (n->scheduleAnchor->bufferStageOffset) {
         n->stageOffset = n->scheduleAnchor->bufferStageOffset;
         return;
@@ -2532,9 +2579,9 @@ static LogicalResult assignCircularStageOffsets(PhysicalSets &physical) {
     };
     for (GroupDag *g : set) {
       for (Node *acquire : g->nodesOfKind(Node::Acquire))
-        assignProtocolOffset(acquire, &Node::next);
+        assignProtocolOffset(g, acquire, &Node::next);
       for (Node *release : g->nodesOfKind(Node::Release))
-        assignProtocolOffset(release, &Node::prev);
+        assignProtocolOffset(g, release, &Node::prev);
     }
   }
   return success();

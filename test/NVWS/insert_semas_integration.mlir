@@ -5,6 +5,7 @@
 // RUN: triton-opt %t/completion.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas=num-stages=2 --nvws-semaphore-optimize=num-stages=2 --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore=num-stages=2 --triton-nvidia-tma-lowering --verify-each=false -cse | FileCheck %t/completion.mlir --check-prefix=TMA
 // RUN: triton-opt %t/startup.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas=num-stages=2 --nvws-semaphore-optimize=num-stages=2 --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore=num-stages=2 --tritongpu-partition-loops --nvws-lower-warp-group --tritongpu-schedule-loops=num-stages=2 --tritongpu-pipeline=num-stages=2 -cse | FileCheck %t/startup.mlir --check-prefix=PIPE
 // RUN: triton-opt %t/startup.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas='num-stages=2 use-meta-partitioner=true' --nvws-semaphore-optimize=num-stages=2 --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore=num-stages=2 --tritongpu-partition-loops --nvws-lower-warp-group --tritongpu-schedule-loops='num-stages=2 use-meta-ws=true' --tritongpu-pipeline=num-stages=2 -cse | FileCheck %t/startup.mlir --check-prefix=PIPE
+// RUN: triton-opt %t/observer.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas=num-stages=2 --nvws-semaphore-optimize=num-stages=2 --nvws-assign-semaphore-stage-phase -cse | FileCheck %t/observer.mlir --check-prefix=ASSIGN
 // RUN: triton-opt %t/observer.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas=num-stages=2 --nvws-semaphore-optimize=num-stages=2 --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore=num-stages=2 -cse | FileCheck %t/observer.mlir --check-prefix=LOWER
 // RUN: triton-opt %t/observer.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-semas=num-stages=2 --nvws-semaphore-optimize=num-stages=2 --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore=num-stages=2 --tritongpu-partition-loops | FileCheck %t/observer.mlir --check-prefix=PARTITION
 // RUN: triton-opt %t/insert_allocas.mlir -split-input-file -allow-unregistered-dialect --nvws-insert-allocas | FileCheck %t/insert_allocas.mlir --check-prefix=SMEM --implicit-check-not=nvws.semaphore.
@@ -543,6 +544,125 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // LOWER-NEXT: "use"([[OUT]])
     // PARTITION-NEXT: "use"([[POST_OUT]])
     "use"(%out) : (tensor<128x128xf32, #blocked>) -> ()
+    tt.return
+  }
+
+  // ASSIGN-LABEL: @post_ws_operand_completion
+  // LOWER-LABEL: @post_ws_operand_completion
+  // PARTITION-LABEL: @post_ws_operand_completion
+  tt.func @post_ws_operand_completion(
+      %ub: i32, %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %rhs: !ttg.memdesc<64x128xf16, #shared1, #smem>,
+      %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %independent_acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c64 = arith.constant 64 : i32
+    %false = arith.constant false
+    %true = arith.constant true
+    // ASSIGN: [[EMPTY:%.*]] = nvws.semaphore.create {{.*}} released = 3
+    // LOWER: [[EMPTY:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64,
+    // LOWER: [[FIRST_EMPTY:%.*]] = ttg.memdesc_index [[EMPTY]][
+    // PARTITION: [[EMPTY:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64,
+    %lhs = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    // ASSIGN: [[WS:%.*]]:{{[0-9]+}} = scf.for
+    // PARTITION: nvws.warp_group
+    scf.for %iv = %c0 to %ub step %c1 : i32 {
+      %offset = arith.muli %iv, %c64 {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : i32
+      // ASSIGN: nvws.semaphore.acquire [[EMPTY]]
+      // PARTITION: ttng.async_tma_copy_global_to_local
+      nvws.descriptor_load %desc[%c0, %offset] 16384 %lhs {loop.cluster = 1 : i32, loop.stage = 0 : i32, multicast = false, ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared>, i32, i32, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      // No accumulation: each MMA writes the whole accumulator before reading it.
+      %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[], %false, %true {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      // ASSIGN: nvws.semaphore.release [[EMPTY]]{{.*}}[#nvws.async_op<tc5mma>]
+      scf.yield
+    } {tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32, tt.warp_specialize, ttg.partition = array<i32: 1, 2>, ttg.partition.outputs = [], ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    // The producer waits on the last EMPTY slot using its loop's cursor and
+    // phase, then cleanup stays outside the group before independent work.
+    // ASSIGN: } {{.*}}tt.warp_specialize
+    // ASSIGN: nvws.semaphore.acquire [[EMPTY]][[[WS]]#{{[0-9]+}}, {{%.*}}] {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 0 : i32}
+    // LOWER: } {{.*}}tt.warp_specialize
+    // LOWER-NOT: ttng.inval_barrier [[FIRST_EMPTY]] :
+    // LOWER: [[LAST_EMPTY:%.*]] = ttg.memdesc_index [[EMPTY]][
+    // LOWER-NEXT: ttng.wait_barrier [[LAST_EMPTY]],
+    // LOWER: ttng.inval_barrier [[FIRST_EMPTY]] :
+    // LOWER: ttg.local_dealloc [[EMPTY]]
+    // PARTITION: scf.yield
+    // PARTITION: [[LAST_EMPTY:%.*]] = ttg.memdesc_index [[EMPTY]][
+    // PARTITION-NEXT: ttng.wait_barrier [[LAST_EMPTY]],
+    // PARTITION-NEXT: nvws.warp_group.return
+    // PARTITION: [[CLEANUP_EMPTY:%.*]] = ttg.memdesc_index [[EMPTY]][
+    // PARTITION-NEXT: ttng.inval_barrier [[CLEANUP_EMPTY]]
+    // PARTITION: ttg.local_dealloc [[EMPTY]]
+    %independent_lhs = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    // LOWER: scf.for
+    // PARTITION: nvws.warp_group
+    scf.for %i = %c0 to %ub step %c1 : i32 {
+      %offset = arith.muli %i, %c64 {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : i32
+      // LOWER: ttng.async_tma_copy_global_to_local
+      // PARTITION: ttng.async_tma_copy_global_to_local
+      nvws.descriptor_load %desc[%c0, %offset] 16384 %independent_lhs {loop.cluster = 1 : i32, loop.stage = 0 : i32, multicast = false, ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared>, i32, i32, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %mma = ttng.tc_gen5_mma %independent_lhs, %rhs, %independent_acc[], %false, %true {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      scf.yield
+    } {tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32, tt.warp_specialize, ttg.partition = array<i32: 1, 2>, ttg.partition.outputs = [], ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 1 : i32}
+    tt.return
+  }
+
+  // ASSIGN-LABEL: @post_ws_operand_reused
+  // LOWER-LABEL: @post_ws_operand_reused
+  // PARTITION-LABEL: @post_ws_operand_reused
+  tt.func @post_ws_operand_reused(
+      %ub: i32, %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %rhs: !ttg.memdesc<64x128xf16, #shared1, #smem>,
+      %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %second_acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c64 = arith.constant 64 : i32
+    %false = arith.constant false
+    %true = arith.constant true
+    // ASSIGN: [[REUSE_ENTRY:%.*]] = nvws.semaphore.create {{.*}} released = 3
+    // PARTITION: [[REUSE_ENTRY:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64,
+    %lhs = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    // PARTITION: nvws.warp_group
+    scf.for %iv = %c0 to %ub step %c1 : i32 {
+      %offset = arith.muli %iv, %c64 {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : i32
+      // PARTITION: ttng.async_tma_copy_global_to_local
+      nvws.descriptor_load %desc[%c0, %offset] 16384 %lhs {loop.cluster = 1 : i32, loop.stage = 0 : i32, multicast = false, ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared>, i32, i32, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %mma = ttng.tc_gen5_mma %lhs, %rhs, %acc[], %false, %true {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      scf.yield
+    } {tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32, tt.warp_specialize, ttg.partition = array<i32: 1, 2>, ttg.partition.outputs = [], ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    // The first loop already acquires a permit to hand the buffer to the second.
+    // Do not add another wait on the same channel before that handoff.
+    // ASSIGN: } {{.*}}ttg.warp_specialize.tag = 0
+    // ASSIGN: [[HANDOFF:%.*]] = nvws.semaphore.acquire [[REUSE_ENTRY]][
+    // ASSIGN-NEXT: nvws.semaphore.release [[REUSE_EXIT:%[-a-zA-Z0-9_.$]+]][{{.*}}], [[HANDOFF]] [#nvws.async_op<none>]
+    // ASSIGN-NOT: nvws.semaphore.acquire
+    // ASSIGN: scf.for
+    // LOWER: } {{.*}}ttg.warp_specialize.tag = 0
+    // LOWER: ttng.wait_barrier
+    // LOWER-NOT: ttng.wait_barrier
+    // LOWER: ttng.arrive_barrier
+    // LOWER-NOT: ttng.wait_barrier
+    // LOWER: scf.for
+    // PARTITION: scf.yield
+    // PARTITION: [[REUSE_SLOT:%.*]] = ttg.memdesc_index [[REUSE_ENTRY]][
+    // PARTITION-NEXT: ttng.wait_barrier [[REUSE_SLOT]],
+    // PARTITION-NOT: ttng.wait_barrier
+    // PARTITION: ttng.arrive_barrier
+    // PARTITION-NEXT: nvws.warp_group.return
+    // PARTITION: nvws.warp_group
+    scf.for %i = %c0 to %ub step %c1 : i32 {
+      %offset = arith.muli %i, %c64 {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : i32
+      // ASSIGN: nvws.semaphore.acquire [[REUSE_EXIT]][
+      nvws.descriptor_load %desc[%c0, %offset] 16384 %lhs {loop.cluster = 1 : i32, loop.stage = 0 : i32, multicast = false, ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared>, i32, i32, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %mma = ttng.tc_gen5_mma %lhs, %rhs, %second_acc[], %false, %true {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      scf.yield
+    } {tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32, tt.warp_specialize, ttg.partition = array<i32: 1, 2>, ttg.partition.outputs = [], ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 1 : i32}
+    // Only the final loop needs an acquire with no handoff.
+    // ASSIGN: } {{.*}}ttg.warp_specialize.tag = 1
+    // ASSIGN: nvws.semaphore.acquire [[REUSE_EXIT]][
+    // ASSIGN-NEXT: tt.return
     tt.return
   }
 }
