@@ -11,10 +11,9 @@ One shot command with extreme simplicity
 
 python python/test/tlx_benchmark/bench_{op}.py
 
-`{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
+`{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`, `paged_decode`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
-`kda_prefill`, `kda_decode`, `paged_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`,
-`moe`, `moe_routing`, or one of the
+`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, or one of the
 fused operators below.
 
 Fused operators fuse an elementwise epilogue into a GEMM (`tlx/ops/kernels/fused/`): `addmm_mul_add`,
@@ -344,9 +343,11 @@ causal query lengths 1, 7 and 8, global attention and a 2048-token window
 including self. `gfx1250_primary` covers 16Q/2KV, batches 1/8/32/128 and
 contexts 2K/8K/16K/32K; `gfx1250_heads` repeats that matrix at 32Q/4KV and
 128Q/16KV. `gfx1250_mixed` covers batches 8/32/128 with mixed, unaligned KV
-lengths through 8K/32K, across all three head counts. `gfx1250_sbd` adds
-seven-token drafting, eight-token verification, and contexts through 128K
-across all three head counts. These four suites run by default and use
+lengths through 8K/32K, across all three head counts. `gfx1250_intermediate`
+covers 16Q/2KV, batches 12/24, query lengths 1/7/8 and global contexts
+4K/8K/16K with uniform and mixed lengths. `gfx1250_sbd` adds seven-token
+drafting, eight-token verification, and contexts through 128K across all
+three head counts. These five suites run by default and use
 AITER-packed 5-D caches. `gfx1250_extended` adds 16Q/2KV,
 batches 2/16/64/256 and contexts 4K/16K/64K. `gfx1250_4d` repeats the primary
 matrix with standard `[blocks, heads, page, dim]` caches. Mixed-length useful
@@ -356,6 +357,7 @@ FLOPs count each sequence's actual visible keys, not the context bound.
 python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_primary
 python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_heads
 python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_mixed
+python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_intermediate
 python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_sbd
 python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_extended
 python python/test/tlx_benchmark/bench_paged_decode.py --suite gfx1250_4d
