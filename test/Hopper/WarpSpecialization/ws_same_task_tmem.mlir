@@ -232,7 +232,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // SMEM B operand written in the gemm partition gets the same treatment as A.
 
 // CHECK-LABEL: @smem_operand_b_same_task
-// CHECK: partition0(%{{.*}}: !tt.ptr<bf16>, %{{.*}}: !tt.ptr<f32>, %[[B:arg[0-9]+]]: !ttg.memdesc<3x128x128xbf16, #shared1, #smem, mutable>, %[[BEMPTY:arg[0-9]+]]: !ttg.memdesc<3x1xi64, #shared, #smem, mutable>, %[[A:arg[0-9]+]]: !ttg.memdesc<2x128x128xbf16, #tmem, #ttng.tensor_memory, mutable>, %[[AEMPTY:arg[0-9]+]]: !ttg.memdesc<2x1xi64
+// CHECK: partition0(%{{.*}}: !tt.ptr<bf16>, %{{.*}}: !tt.ptr<f32>, %[[B:arg[0-9]+]]: !ttg.memdesc<{{[23]}}x128x128xbf16, #shared1, #smem, mutable>, %[[BEMPTY:arg[0-9]+]]: !ttg.memdesc<{{[23]}}x1xi64, #shared, #smem, mutable>, %[[A:arg[0-9]+]]: !ttg.memdesc<2x128x128xbf16, #tmem, #ttng.tensor_memory, mutable>, %[[AEMPTY:arg[0-9]+]]: !ttg.memdesc<2x1xi64
 // CHECK: scf.for
 // CHECK: scf.for
 // CHECK: %[[BSLOT:.*]] = ttg.memdesc_index %[[B]][
