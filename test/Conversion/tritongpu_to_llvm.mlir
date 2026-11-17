@@ -3650,11 +3650,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:75", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: precise_math
   tt.func private @precise_math(%arg0 : tensor<256xf32, #blocked>, %arg1 : tensor<256xf32, #blocked>) -> (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>) {
-    // CHECK: llvm.call_intrinsic "llvm.nvvm.div.rn.f"
+    // CHECK: llvm.fdiv {{.*}} : f32
     %0 = tt.precise_divf %arg0, %arg1 : tensor<256xf32, #blocked>
-    // CHECK: llvm.call_intrinsic "llvm.nvvm.sqrt.rn.f"
+    // CHECK: llvm.intr.sqrt
     %1 = tt.precise_sqrt %arg0 : tensor<256xf32, #blocked>
     tt.return %0, %1 : tensor<256xf32, #blocked>, tensor<256xf32, #blocked>
+  }
+
+  // CHECK-LABEL: approx_div
+  tt.func private @approx_div(%arg0 : tensor<256xf32, #blocked>, %arg1 : tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked> {
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} fastmath<afn> : f32
+    %0 = tt.approx_divf %arg0, %arg1 : tensor<256xf32, #blocked>
+    tt.return %0 : tensor<256xf32, #blocked>
   }
 }
 
@@ -4086,6 +4093,19 @@ module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-
 // -----
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @extern_tf32
+  // CHECK: %[[RN_BITS:.*]] = llvm.call @llvm.nvvm.f2tf32.rn(%arg0) : (f32) -> i32
+  // CHECK: llvm.bitcast %[[RN_BITS]] : i32 to f32
+  // CHECK: %[[RNA_BITS:.*]] = llvm.call @llvm.nvvm.f2tf32.rna(%arg0) : (f32) -> i32
+  // CHECK: llvm.bitcast %[[RNA_BITS]] : i32 to f32
+  // CHECK: llvm.call @llvm.nvvm.f2tf32.rn(%arg0) : (f32) -> i32
+  tt.func private @extern_tf32(%arg: f32) -> (f32, f32, i32) {
+    %rn = tt.extern_elementwise %arg {libname = "", libpath = "", pure = true, symbol = "llvm.nvvm.f2tf32.rn"} : (f32) -> f32
+    %rna = tt.extern_elementwise %arg {libname = "", libpath = "", pure = true, symbol = "llvm.nvvm.f2tf32.rna"} : (f32) -> f32
+    %bits = tt.extern_elementwise %arg {libname = "", libpath = "", pure = true, symbol = "llvm.nvvm.f2tf32.rn"} : (f32) -> i32
+    tt.return %rn, %rna, %bits : f32, f32, i32
+  }
+
   // CHECK-LABEL: @bf16_to_fp16_fallback
   // CHECK: llvm.fpext {{.*}} : bf16 to f32
   // CHECK: llvm.call_intrinsic "llvm.fptrunc.round"
