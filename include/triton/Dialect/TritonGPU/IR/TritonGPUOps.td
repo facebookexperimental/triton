@@ -497,7 +497,7 @@ def TTG_LocalLoadOp
   let hasVerifier = 1;
 }
 
-def TTG_LocalStoreOp : TTG_Op<"local_store"> {
+def TTG_LocalStoreOp : TTG_Op<"local_store", [MixedRadixLayoutTrait]> {
   let summary = "Store a distributed tensor into a buffer in local memory";
 
   let description = [{

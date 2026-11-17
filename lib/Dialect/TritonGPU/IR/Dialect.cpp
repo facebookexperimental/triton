@@ -4830,7 +4830,10 @@ getExactNpotLayout(RankedTensorType type,
         llvm::any_of(encoded.getInputRadices(inDim),
                      [](int32_t radix) { return radix != 2; }))
       return reject(("a non-binary " + inDim.str() + " digit").c_str());
-  if (linear &&
+  // A linear layout that is already exact needs no rebuild; a failed
+  // rebuild rejects here, before toLinearLayout sees the mismatched
+  // shape (it crashes on one: the #p96-on-192 cases below).
+  if (linear && !llvm::equal(encoded.getOutDimSizes(), shape) &&
       failed(buildMixedRadixLayout(encoded, linear.getRepOrder(), shape)))
     return failure();
   LinearLayout ll = toLinearLayout(type);
