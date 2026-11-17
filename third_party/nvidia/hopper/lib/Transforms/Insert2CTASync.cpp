@@ -155,10 +155,9 @@ static std::optional<unsigned> addRunningIterCount(scf::ForOp inner) {
   if (auto whileOp = dyn_cast<scf::WhileOp>(outer))
     if (inner->getParentRegion() != &whileOp.getAfter())
       return std::nullopt;
-  if (!llvm::any_of(
-          ValueRange{inner.getLowerBound(), inner.getUpperBound(),
-                     inner.getStep()},
-          [&](Value v) { return isDefinedInside(v, outer); }))
+  if (!llvm::any_of(ValueRange{inner.getLowerBound(), inner.getUpperBound(),
+                               inner.getStep()},
+                    [&](Value v) { return isDefinedInside(v, outer); }))
     return std::nullopt;
   // The barrier lives outside the warp_specialize op (see runOnOperation), so
   // the persistent loop must be the only loop between it and the MMA loop.
@@ -192,8 +191,8 @@ static std::optional<unsigned> addRunningIterCount(scf::ForOp inner) {
   inits.push_back(zero);
   SmallVector<Type> resultTypes(whileOp.getResultTypes());
   resultTypes.push_back(builder.getI64Type());
-  auto newWhile = scf::WhileOp::create(builder, whileOp.getLoc(), resultTypes,
-                                       inits);
+  auto newWhile =
+      scf::WhileOp::create(builder, whileOp.getLoc(), resultTypes, inits);
   newWhile->setAttrs(whileOp->getAttrs());
   newWhile.getBefore().takeBody(whileOp.getBefore());
   newWhile.getAfter().takeBody(whileOp.getAfter());
@@ -359,9 +358,9 @@ static unsigned getOperandPipelineDepth(ttng::MMAv5OpInterface mma) {
 // if the MMA is in a loop).
 static LogicalResult insertSyncBeforeMMA(ttng::MMAv5OpInterface mma,
                                          Value barrierAlloc,
-                                Operation *phaseScope, unsigned baseIdx,
-                                unsigned depth,
-                                const RunningIterCounts &counts) {
+                                         Operation *phaseScope,
+                                         unsigned baseIdx, unsigned depth,
+                                         const RunningIterCounts &counts) {
   MLIRContext *ctx = mma->getContext();
   Location loc = mma->getLoc();
   OpBuilder builder(mma);
