@@ -52,6 +52,19 @@ SmallVector<Value> lowerLocalScGt(Location loc, MemDescType memDescTy,
   return results;
 }
 
+// The logical offsets of a view, which mixed-radix runs add to their
+// coordinates; empty for a whole buffer. Test for a subslice by shape: the
+// affine mask is zero for a view of an NPOT buffer in its top pow2 digit.
+SmallVector<Value> getMixedRadixViewOrigin(const SharedMemoryObject &smemObj,
+                                           MemDescType memDescTy) {
+  auto enc = memDescTy.getEncoding();
+  if (dropPipeliningDim(memDescTy.getShape(), enc) ==
+      dropPipeliningDim(memDescTy.getAllocShape(), enc))
+    return {};
+  return llvm::to_vector(
+      dropPipeliningDim(ArrayRef(smemObj.getOffsets()), enc));
+}
+
 LogicalResult lowerLocalStore(
     Location loc, MLIRContext *ctx, LinearLayout regLayout,
     MemDescType memDescTy, SharedMemoryObject smemObj, ArrayRef<Value> inVals,
@@ -62,6 +75,33 @@ LogicalResult lowerLocalStore(
          "expected register broadcasting to be removed by the caller");
   auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
   auto sharedLayout = toLinearLayoutIgnoringPadding(memDescTy);
+  // A mixed-radix layout's odd digits add rather than XOR, so it doesn't
+  // compose with the shared layout: store each run contiguous there.
+  if (!regLayout.isRadix2()) {
+    if (clusterCTARank || barrierPtr)
+      return failure();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    LinearLayout toOffset = sharedLayout.pseudoinvert();
+    int32_t run = getMixedRadixSharedRun(regLayout, toOffset,
+                                         llvmElemTy.getIntOrFloatBitWidth());
+    auto masks = regLayout.getFreeVariableMasks();
+    auto ptrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
+    forEachMixedRadixSharedRun(
+        loc, rewriter, regLayout, toOffset, run,
+        getMixedRadixViewOrigin(smemObj, memDescTy),
+        [&](int32_t reg, Value offset, auto indices) {
+          Value value =
+              run == 1 ? inVals[reg]
+                       : packLLVector(loc, ArrayRef(inVals).slice(reg, run),
+                                      rewriter);
+          targetInfo.storeShared(
+              rewriter, loc,
+              b.gep(ptrTy, llvmElemTy, smemObj.getBase(), offset), value,
+              emitCanonicalLayoutOwnerPredicate(loc, rewriter, regLayout,
+                                                indices, masks));
+        });
+    return success();
+  }
   auto kBlock = str_attr("block");
   auto cvt = invertAndComposeLocal(sharedLayout, regLayout, {kBlock});
   lowerLocalLdSt(loc, ctx, cvt, inVals, llvmElemTy, memDescTy, smemObj,
@@ -137,34 +177,9 @@ struct LocalAllocOpConversion
       auto regLayout =
           toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
       auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
-      if (!regLayout.isRadix2()) {
-        // A mixed-radix layout's odd digits add rather than XOR, so it doesn't
-        // compose with the shared layout: store each run contiguous there.
-        auto b = TritonLLVMOpBuilder(loc, rewriter);
-        LinearLayout toOffset =
-            toLinearLayoutIgnoringPadding(memDescTy).pseudoinvert();
-        int32_t run = getMixedRadixSharedRun(
-            regLayout, toOffset, llvmElemTy.getIntOrFloatBitWidth());
-        auto masks = regLayout.getFreeVariableMasks();
-        auto ptrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
-        forEachMixedRadixSharedRun(
-            loc, rewriter, regLayout, toOffset, run, /*origin=*/{},
-            [&](int32_t reg, Value offset, auto indices) {
-              Value value =
-                  run == 1 ? inVals[reg]
-                           : packLLVector(loc, ArrayRef(inVals).slice(reg, run),
-                                          rewriter);
-              targetInfo.storeShared(
-                  rewriter, loc,
-                  b.gep(ptrTy, llvmElemTy, smemObj.getBase(), offset), value,
-                  emitCanonicalLayoutOwnerPredicate(loc, rewriter, regLayout,
-                                                    indices, masks));
-            });
-      } else if (failed(lowerLocalStore(loc, ctx, regLayout, memDescTy, smemObj,
-                                        inVals, typeConverter, rewriter,
-                                        targetInfo))) {
+      if (failed(lowerLocalStore(loc, ctx, regLayout, memDescTy, smemObj,
+                                 inVals, typeConverter, rewriter, targetInfo)))
         return failure();
-      }
     }
     auto retVal = getStructFromSharedMemoryObject(loc, smemObj, rewriter);
     rewriter.replaceOp(op, retVal);
@@ -226,17 +241,10 @@ public:
       int32_t run = getMixedRadixSharedRun(regLayout, toOffset,
                                            llvmElemTy.getIntOrFloatBitWidth());
       auto ptrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
-      // Test for a subslice by shape: the affine mask is zero for a view of
-      // an NPOT buffer in its top pow2 digit (e.g. 32 of 48 rows).
-      auto enc = memDescTy.getEncoding();
-      SmallVector<Value> origin;
-      if (dropPipeliningDim(memDescTy.getShape(), enc) !=
-          dropPipeliningDim(memDescTy.getAllocShape(), enc))
-        origin = llvm::to_vector(
-            dropPipeliningDim(ArrayRef(smemObj.getOffsets()), enc));
       SmallVector<Value> outVals;
       forEachMixedRadixSharedRun(
-          loc, rewriter, regLayout, toOffset, run, origin,
+          loc, rewriter, regLayout, toOffset, run,
+          getMixedRadixViewOrigin(smemObj, memDescTy),
           [&](int32_t, Value offset, auto) {
             Value ptr = b.gep(ptrTy, llvmElemTy, smemObj.getBase(), offset);
             Value vec = b.load(vec_ty(llvmElemTy, run), ptr);

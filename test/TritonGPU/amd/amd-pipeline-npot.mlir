@@ -51,7 +51,7 @@ module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.n
 // -----
 
 // An NPOT stage in shared memory is filled by async copy. Without it the load
-// stays in registers, since local_store can't take the layout.
+// stays in registers, since a local_store stage isn't used for the layout yet.
 #p192 = #ttg.linear<{register = [[64]], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [192]}>
 #s = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
