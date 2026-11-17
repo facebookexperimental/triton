@@ -101,6 +101,13 @@ public:
     if (mDim != 64 && mDim != 128)
       return failure();
     int splitNSize = shape[2];
+    // A TwoCTA_RHS slice narrower than blockN is not a column window (see
+    // TMEMSubSliceOp::verify); split in registers instead.
+    auto tmemEnc = dyn_cast<TensorMemoryEncodingAttr>(
+        tmemLoad.getSrc().getType().getEncoding());
+    if (tmemEnc && tmemEnc.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS &&
+        splitNSize % tmemEnc.getBlockN() != 0)
+      return failure();
     if (splitNSize < 8)
       return failure();
 
