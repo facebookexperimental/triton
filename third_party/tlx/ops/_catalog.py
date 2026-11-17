@@ -360,6 +360,17 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="qk_norm_rope_kv_cache",
+        arch="gfx950",
+        variant="token_rows",
+        impl="triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache.gfx950:qk_norm_rope_kv_cache",
+        dtypes=_BF16,
+        # One program holds a token's q and k heads: power-of-two tiles of at most 4096 elements each.
+        accepts=lambda d: (all(n > 0 and n & (n - 1) == 0 for n in (d["HQ"], d["HK"], d["D"])) and 16 <= d["D"] <= 256
+                           and d["HQ"] * d["D"] <= 4096 and d["HK"] * d["D"] <= 4096),
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="router_gemm",
         arch="gfx950",
         variant="bf16x3_split_k",
