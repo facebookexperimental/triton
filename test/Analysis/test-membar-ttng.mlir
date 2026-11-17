@@ -492,21 +492,23 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 
 // -----
 
-// Central scheduling inserts a CTA barrier before a perThread arrive after a
-// shared memory write, conservatively ordering the publication.
+// Verify that a perThread arrive after a shared memory write does NOT get a
+// ttg.barrier inserted before it. The perThread attribute opts out of the
+// CTA-wide fence because each thread's program order guarantees its own SMEM
+// ops complete before its arrive.
 
 #shared_pt = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #blocked_pt = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #A_SHARED_pt = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 1024 : i32} {
-// CHECK-LABEL: @membar_before_perthread_arrive
-tt.func @membar_before_perthread_arrive(%arg: tensor<32x16xf16, #blocked_pt>) {
+// CHECK-LABEL: @no_barrier_before_perthread_arrive
+tt.func @no_barrier_before_perthread_arrive(%arg: tensor<32x16xf16, #blocked_pt>) {
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x16xf16, #A_SHARED_pt, #ttg.shared_memory, mutable>
   %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_pt, #ttg.shared_memory, mutable>
   //      CHECK: ttg.local_store
-  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.arrive_barrier
+  //  CHECK-NOT: ttg.barrier local
   //      CHECK: tt.return
   ttg.local_store %arg, %alloc : tensor<32x16xf16, #blocked_pt> -> !ttg.memdesc<32x16xf16, #A_SHARED_pt, #ttg.shared_memory, mutable>
   ttng.arrive_barrier %barrier, 1 {perThread} : !ttg.memdesc<1xi64, #shared_pt, #ttg.shared_memory, mutable>
@@ -866,6 +868,25 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.thr
     ttng.wait_barrier %ready, %phase : !barrier
     %value = tt.load %src : !tt.ptr<i32>
     tt.store %dst, %value : !tt.ptr<i32>
+    tt.return
+  }
+
+  // Prints and asserts cannot notify a peer. Under a thread-zero branch, a
+  // barrier would deadlock.
+  // CHECK-LABEL: @mbarrier_wait_before_print
+  tt.func private @mbarrier_wait_before_print(%ready: !barrier, %phase: i32, %value: i32, %thread0: i1) {
+    // CHECK: ttng.wait_barrier
+    // CHECK-NOT: ttg.barrier
+    // CHECK: tt.print
+    // CHECK-NOT: ttg.barrier
+    // CHECK: tt.assert
+    // CHECK-NOT: ttg.barrier
+    // CHECK: tt.return
+    ttng.wait_barrier %ready, %phase : !barrier
+    scf.if %thread0 {
+      tt.print " value: " {hex = false, isSigned = array<i32: 1>} : %value : i32
+      tt.assert %thread0, "assert text" : i1
+    }
     tt.return
   }
 
@@ -1255,6 +1276,160 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 2 : i32, "ttg.thr
     tt.call @different_issuers(%barrier) : (!barrier) -> ()
     ttng.wait_barrier %barrier, %phase : !barrier
     ttng.inval_barrier %barrier : !barrier
+    tt.return
+  }
+}
+
+// -----
+
+#bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 16}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#warp = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+#smem = #ttg.shared_memory
+!barrier = !ttg.memdesc<1xi64, #bar, #smem, mutable>
+!lhs = !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+!rhs = !ttg.memdesc<128x128xf16, #shared1, #smem, mutable>
+!acc = !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+!scratch = !ttg.memdesc<32xi32, #bar, #smem, mutable>
+!desc = !tt.tensordesc<128x128xf16, #shared>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // MMAs and commits issue from one elected lane of warp zero, so a commit
+  // needs no rendezvous after the MMAs it tracks. Their election, like a TMA
+  // copy's, waits for every lane, which in a single-warp partition also
+  // finishes pending waits. A thread-zero arrive or a wider partition still
+  // needs a barrier, and so do shared writes, because the election does not
+  // order memory.
+  // CHECK-LABEL: @elected_issue_after_waits
+  tt.func @elected_issue_after_waits(%acc: !acc, %desc: !desc, %phase: i32) {
+    %lhs = ttg.local_alloc : () -> !lhs
+    %payload = ttg.local_alloc : () -> !lhs
+    %rhs = ttg.local_alloc : () -> !rhs
+    %ready = ttg.local_alloc : () -> !barrier
+    %done = ttg.local_alloc : () -> !barrier
+    %scratch = ttg.local_alloc : () -> !scratch
+    ttg.warp_specialize(%ready, %done, %lhs, %rhs, %acc, %scratch, %desc, %payload, %phase)
+    default {
+      ttg.warp_yield
+    }
+    partition0(%r: !barrier, %d: !barrier, %a: !lhs, %b: !rhs, %c: !acc, %s: !scratch, %t: !desc, %l: !lhs, %p: i32) num_warps(1) {
+      %true = arith.constant true
+      %c0 = arith.constant 0 : i32
+      // CHECK: partition0
+      // CHECK: ttng.wait_barrier
+      // CHECK-NEXT: ttng.tc_gen5_mma
+      // CHECK-NEXT: ttng.tc_gen5_mma
+      // CHECK-NEXT: ttng.tc_gen5_commit
+      // CHECK-NEXT: ttng.async_tma_copy_global_to_local
+      // CHECK-NEXT: ttg.barrier local
+      // CHECK-NEXT: ttng.arrive_barrier
+      ttng.wait_barrier %r, %p : !barrier
+      ttng.tc_gen5_mma %a, %b, %c, %true, %true {is_async} : !lhs, !rhs, !acc
+      ttng.tc_gen5_mma %a, %b, %c, %true, %true, %d[%true] {is_async} : !lhs, !rhs, !acc, !barrier
+      ttng.tc_gen5_commit %d : !barrier
+      ttng.async_tma_copy_global_to_local %t[%c0, %c0] %l, %r, %true : !desc, !barrier -> !lhs
+      ttng.arrive_barrier %d, 1 : !barrier
+      ttg.warp_return
+    }
+    partition1(%r: !barrier, %d: !barrier, %a: !lhs, %b: !rhs, %c: !acc, %s: !scratch, %t: !desc, %l: !lhs, %p: i32) num_warps(4) {
+      %true = arith.constant true
+      // CHECK: partition1
+      // CHECK: ttng.wait_barrier
+      // CHECK-NEXT: ttg.barrier local
+      // CHECK-NEXT: ttng.tc_gen5_mma
+      // CHECK-NEXT: ttng.tc_gen5_commit
+      ttng.wait_barrier %r, %p : !barrier
+      ttng.tc_gen5_mma %a, %b, %c, %true, %true {is_async} : !lhs, !rhs, !acc
+      ttng.tc_gen5_commit %d : !barrier
+      ttg.warp_return
+    }
+    partition2(%r: !barrier, %d: !barrier, %a: !lhs, %b: !rhs, %c: !acc, %s: !scratch, %t: !desc, %l: !lhs, %p: i32) num_warps(1) {
+      %zero = arith.constant dense<0> : tensor<32xi32, #warp>
+      // CHECK: partition2
+      // CHECK: ttg.local_store
+      // CHECK-NEXT: ttg.barrier local
+      // CHECK-NEXT: ttng.tc_gen5_commit
+      ttg.local_store %zero, %s : tensor<32xi32, #warp> -> !scratch
+      ttng.tc_gen5_commit %d : !barrier
+      ttg.warp_return
+    } : (!barrier, !barrier, !lhs, !rhs, !acc, !scratch, !desc, !lhs, i32) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 16}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#rows = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#vec = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#smem = #ttg.shared_memory
+!barrier = !ttg.memdesc<1xi64, #bar, #smem, mutable>
+!lhs = !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+!rhs = !ttg.memdesc<128x128xf16, #shared1, #smem, mutable>
+!acc = !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+!alpha = !ttg.memdesc<128xf32, #bar, #smem, mutable>
+!response = !ttg.memdesc<1xui128, #bar, #smem, mutable>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // Weak shared and tensor memory stores cannot release a peer, and a named
+  // barrier completes only after every warp arrives, so neither needs pending
+  // waits finished. A leader arrive still does. Reading a CLC response does
+  // not notify a peer either. In a single-warp partition, a proxy fence or a
+  // thread-zero arrive needs no barrier before an elected MMA.
+  // CHECK-LABEL: @notifications_after_waits
+  tt.func @notifications_after_waits(%acc: !acc, %phase: i32) {
+    %ready = ttg.local_alloc : () -> !barrier
+    %done = ttg.local_alloc : () -> !barrier
+    %alpha = ttg.local_alloc : () -> !alpha
+    %lhs = ttg.local_alloc : () -> !lhs
+    %rhs = ttg.local_alloc : () -> !rhs
+    %response = ttg.local_alloc : () -> !response
+    ttg.warp_specialize(%ready, %done, %alpha, %acc, %lhs, %rhs, %response, %phase)
+    default {
+      ttg.warp_yield
+    }
+    partition0(%r: !barrier, %d: !barrier, %s: !alpha, %c: !acc, %a: !lhs, %b: !rhs, %q: !response, %p: i32) num_warps(4) {
+      %true = arith.constant true
+      %c12 = arith.constant 12 : i32
+      %c256 = arith.constant 256 : i32
+      %id = ttng.user_named_barrier_id %c12 : i32
+      %scale = arith.constant dense<1.0> : tensor<128xf32, #vec>
+      %probs = arith.constant dense<0.0> : tensor<128x128xf32, #rows>
+      // CHECK: partition0
+      // CHECK: ttng.wait_barrier
+      // CHECK-NEXT: ttg.local_store
+      // CHECK-NEXT: ttng.arrive_barrier_named
+      // CHECK-NEXT: ttng.tmem_store
+      // CHECK-NEXT: ttg.barrier local
+      // CHECK-NEXT: ttng.arrive_barrier
+      ttng.wait_barrier %r, %p : !barrier
+      ttg.local_store %scale, %s : tensor<128xf32, #vec> -> !alpha
+      ttng.arrive_barrier_named %id, %c256 : !ttng.named_barrier_id, i32
+      ttng.tmem_store %probs, %c, %true : tensor<128x128xf32, #rows> -> !acc
+      ttng.arrive_barrier %d, 1 : !barrier
+      ttg.warp_return
+    }
+    partition1(%r: !barrier, %d: !barrier, %s: !alpha, %c: !acc, %a: !lhs, %b: !rhs, %q: !response, %p: i32) num_warps(1) {
+      %true = arith.constant true
+      // CHECK: partition1
+      // CHECK: ttng.wait_barrier
+      // CHECK-NEXT: ttng.fence_async_shared
+      // CHECK-NEXT: ttng.tc_gen5_mma
+      // CHECK-NEXT: ttng.clc_query_cancel
+      // CHECK-NEXT: ttg.barrier local
+      // CHECK-NEXT: ttng.arrive_barrier
+      // CHECK-NEXT: ttng.tc_gen5_mma
+      ttng.wait_barrier %r, %p : !barrier
+      ttng.fence_async_shared {bCluster = true}
+      ttng.tc_gen5_mma %a, %b, %c, %true, %true, %d[%true] {is_async} : !lhs, !rhs, !acc, !barrier
+      %x, %y, %z = ttng.clc_query_cancel %q : (!response) -> (i32, i32, i32)
+      ttng.arrive_barrier %r, 1 : !barrier
+      ttng.tc_gen5_mma %a, %b, %c, %true, %true, %d[%true] {is_async} : !lhs, !rhs, !acc, !barrier
+      ttg.warp_return
+    } : (!barrier, !barrier, !alpha, !acc, !lhs, !rhs, !response, i32) -> ()
     tt.return
   }
 }

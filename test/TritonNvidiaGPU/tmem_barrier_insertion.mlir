@@ -24,6 +24,29 @@
 #tmem_scales = #ttng.tensor_memory_scales_encoding<>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // Each thread releases its own TMEM reads with a per-thread arrival, and a
+  // named barrier is its own rendezvous, so neither needs a CTA barrier. The
+  // per-thread arrival is not rewritten into a per-warp one.
+  // CHECK-LABEL: @tmem_load_then_perthread_arrive
+  // CHECK: ttng.init_barrier %{{.*}}, 128 :
+  // CHECK: ttng.tmem_load
+  // CHECK-NEXT: ttng.tmem_wait load
+  // CHECK-NEXT: ttng.arrive_barrier %{{.*}}, 1 {perThread} :
+  // CHECK-NEXT: ttng.wait_barrier_named
+  // CHECK-NEXT: tt.return
+  tt.func @tmem_load_then_perthread_arrive(%tmem: !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>) -> tensor<128x128xf32, #blocked> {
+    %c12 = arith.constant 12 : i32
+    %c256 = arith.constant 256 : i32
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>
+    ttng.init_barrier %bar, 128 : !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>
+    %id = ttng.user_named_barrier_id %c12 : i32
+    ttg.barrier local
+    %value = ttng.tmem_load %tmem : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    ttng.arrive_barrier %bar, 1 {perThread} : !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>
+    ttng.wait_barrier_named %id, %c256 : !ttng.named_barrier_id, i32
+    tt.return %value : tensor<128x128xf32, #blocked>
+  }
+
   // CHECK-LABEL: @alloc_then_alloc
   // CHECK: ttng.tmem_alloc
   // CHECK-NEXT: ttng.tmem_wait store

@@ -207,6 +207,15 @@ static TMemBoundary getTMemBoundary(Operation *op) {
   if (auto barrier = dyn_cast<gpu::MBarrierOpInterface>(op);
       barrier && barrier.isPerWarp())
     return TMemBoundary::Wait;
+  // Every thread arrives for itself, and the barrier completes only after all
+  // of them do, so each thread only completes its own accesses. A named
+  // barrier is executed by every thread of the region and is its own
+  // rendezvous.
+  if (auto arrive = dyn_cast<ArriveBarrierOp>(op);
+      arrive && arrive.getPerThread())
+    return TMemBoundary::Wait;
+  if (isa<NamedBarrierArriveOp, NamedBarrierWaitOp>(op))
+    return TMemBoundary::Wait;
   // An acquire does not publish earlier TMEM accesses. Keep them pending.
   if (isa<WaitBarrierOp>(op))
     return TMemBoundary::None;

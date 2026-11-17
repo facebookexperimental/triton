@@ -212,8 +212,12 @@ struct BlockInfo {
 
   // Thread ordering is independent of which physical addresses are accessed.
   struct ThreadSyncState {
+    // Issuers of pending effects that carry a payload.
     IssuerSummary effectIssuers;
     CompletionSync completion = CompletionSync::None;
+    // Issuers of pending waits, proxy fences and mbarrier arrivals. They carry
+    // no payload, so a later publication only needs them finished.
+    IssuerSummary syncIssuers;
     bool peerWaitNeedsSync = false;
 
     bool operator==(const ThreadSyncState &) const = default;
@@ -225,6 +229,9 @@ struct BlockInfo {
     // Only publication demands contribute to this issuer summary.
     IssuerSummary publicationIssuers;
     bool mayNotifyPeer = false;
+    // Some demand can take effect before every thread of its region reaches
+    // it.
+    bool mayIssueAhead = false;
 
     bool operator==(const ThreadDemandState &) const = default;
   } threadDemands;
@@ -232,7 +239,8 @@ struct BlockInfo {
   BlockInfo() = default;
 
   bool hasEffects() const {
-    return !threadSync.effectIssuers.empty() || !syncReadSlices.empty() ||
+    return !threadSync.effectIssuers.empty() ||
+           !threadSync.syncIssuers.empty() || !syncReadSlices.empty() ||
            !syncWriteSlices.empty();
   }
 

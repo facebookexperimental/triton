@@ -323,8 +323,9 @@ void prepareMBarrierArrivals(ModuleOp mod, BufferRegionAnalysis &regions,
       return;
     for (BarrierExpectOp expect : uses.expects)
       expect.setPerWarp(true);
+    // Every thread already arrives for itself in a per-thread arrival.
     for (ArriveBarrierOp arrive : uses.arrivals)
-      if (gpu::lookupNumWarps(arrive) > 1)
+      if (gpu::lookupNumWarps(arrive) > 1 && !arrive.getPerThread())
         arrive.setPerWarp(true);
   });
 }

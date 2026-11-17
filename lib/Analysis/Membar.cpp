@@ -669,6 +669,9 @@ enum class ThreadSyncKind {
   Publication,
   // Each warp publishes its completed effects without a CTA rendezvous.
   WarpPublication,
+  // Each thread publishes its own effects. The barrier completes only after
+  // every thread has arrived.
+  ThreadPublication,
   // Completions only establish completion or acquire state; they do
   // not access payload or consume another completion's unpublished effects.
   Completion,
@@ -727,6 +730,9 @@ ThreadSyncInfo getThreadSyncInfo(Operation *op) {
     // SM90.
     return {ThreadSyncKind::Ordinary, ThreadIssuer::Warp0Leader};
   }
+  if (auto arrive = dyn_cast<ttng::ArriveBarrierOp>(op);
+      arrive && arrive.getPerThread())
+    return {ThreadSyncKind::ThreadPublication};
   if (auto barrier = dyn_cast<triton::gpu::MBarrierOpInterface>(op);
       barrier && barrier.isPerWarp())
     return {ThreadSyncKind::WarpPublication};
@@ -738,12 +744,45 @@ ThreadSyncInfo getThreadSyncInfo(Operation *op) {
     return {ThreadSyncKind::Publication,
             !fromCTA ? ThreadIssuer::Thread0 : ThreadIssuer::Unknown};
   }
+  // MMAs and commits are issued by the same full-mask election in warp zero,
+  // so a commit tracks every earlier MMA of its region.
   if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(op))
     return {mma.getCompletionBarriers().empty() ? ThreadSyncKind::Ordinary
-                                                : ThreadSyncKind::Publication};
+                                                : ThreadSyncKind::Publication,
+            ThreadIssuer::Warp0Leader};
   if (isa<ttng::TCGen5CommitOp>(op))
-    return {ThreadSyncKind::Publication};
+    return {ThreadSyncKind::Publication, ThreadIssuer::Warp0Leader};
   return {};
+}
+
+// The operation cannot take effect before every thread of its region reaches
+// it, so the threads have finished their earlier waits, fences and arrivals.
+// Unlike a barrier, this does not order memory.
+bool waitsForWholeRegion(Operation *op) {
+  // Every thread arrives, and the barrier completes only after all of them do.
+  // Named barriers are aligned, so each warp arrives as a whole.
+  if (auto arrive = dyn_cast<ttng::ArriveBarrierOp>(op))
+    return arrive.getPerThread();
+  if (isa<ttng::NamedBarrierArriveOp, ttng::NamedBarrierWaitOp>(op))
+    return true;
+  // These issue under a full-mask elect.sync, which waits until every lane of
+  // the warp executes it.
+  return isa<ttng::MMAv5OpInterface, ttng::TCGen5CommitOp,
+             ttng::AsyncTMACopyGlobalToLocalOp,
+             ttng::AsyncTMACopyLocalToGlobalOp>(op) &&
+         triton::gpu::maybeLookupNumWarps(op) == 1;
+}
+
+// Effects that only synchronize. Their mbarrier updates and proxy ordering
+// carry no payload for a later publication to make visible.
+bool carriesNoPayload(Operation *op) {
+  return isa<ttng::WaitBarrierOp, ttng::FenceAsyncSharedOp,
+             ttng::ArriveBarrierOp, ttng::BarrierExpectOp,
+             ttng::TCGen5CommitOp>(op);
+}
+
+bool hasIssuedEffects(const BlockInfo::ThreadSyncState &sync) {
+  return !sync.effectIssuers.empty() || !sync.syncIssuers.empty();
 }
 
 // Every observer stays in this region and CTA. Follow views and selects;
@@ -837,6 +876,7 @@ void BlockInfo::joinThreadState(const BlockInfo &other) {
   const auto &sync = other.threadSync;
   threadSync.effectIssuers.join(sync.effectIssuers);
   threadSync.completion = std::max(threadSync.completion, sync.completion);
+  threadSync.syncIssuers.join(sync.syncIssuers);
   threadSync.peerWaitNeedsSync |= sync.peerWaitNeedsSync;
   const auto &demands = other.threadDemands;
   threadDemands.hasDemand |= demands.hasDemand;
@@ -844,6 +884,7 @@ void BlockInfo::joinThreadState(const BlockInfo &other) {
       demands.hasDemandBeyondGlobalReads;
   threadDemands.publicationIssuers.join(demands.publicationIssuers);
   threadDemands.mayNotifyPeer |= demands.mayNotifyPeer;
+  threadDemands.mayIssueAhead |= demands.mayIssueAhead;
 }
 
 bool MembarAnalysis::isRegionLocal(Value value) {
@@ -864,6 +905,17 @@ bool MembarAnalysis::mayNotifyPeer(Operation *op) {
   if (isa<RegionBranchOpInterface, triton::AtomicLoadOp, triton::AtomicPollOp>(
           op))
     return false;
+  // A weak shared or tensor memory store cannot release a peer. The peer
+  // observes it only after a barrier, which is checked as a notification
+  // itself.
+  if (isa<triton::gpu::LocalStoreOp, triton::gpu::LocalAllocOp,
+          ttng::TMEMStoreOp, ttng::TMEMAllocOp>(op))
+    return false;
+  // Prints go to the host and an assert only aborts, so no peer observes
+  // either. They often run under a thread-zero branch, where a CTA barrier
+  // would deadlock.
+  if (isa<triton::PrintOp, triton::AssertOp>(op))
+    return false;
   auto effects = getEffectsRecursively(op);
   return !effects || llvm::any_of(*effects, [&](const auto &effect) {
     return isa<MemoryEffects::Write>(effect.getEffect()) &&
@@ -875,7 +927,17 @@ bool MembarAnalysis::requiresThreadSync(const BlockInfo &pending,
                                         const BlockInfo &effects) {
   const auto &sync = pending.threadSync;
   const auto &demands = effects.threadDemands;
-  if (sync.effectIssuers.empty() || !demands.hasDemand)
+  if (!demands.hasDemand)
+    return false;
+  // Waits, fences and arrivals only have to finish before another thread's
+  // publication, or before a notification can let a peer advance a waited
+  // phase. Private counter updates are already ordered by the slice hazards.
+  if (!sync.syncIssuers.empty() && demands.mayIssueAhead &&
+      ((!demands.publicationIssuers.empty() &&
+        !sync.syncIssuers.hasSameKnownIssuer(demands.publicationIssuers)) ||
+       (sync.peerWaitNeedsSync && demands.mayNotifyPeer)))
+    return true;
+  if (sync.effectIssuers.empty())
     return false;
   // The maps also include implicit scratch and translated callee accesses.
   bool hasSharedAccesses =
@@ -884,10 +946,7 @@ bool MembarAnalysis::requiresThreadSync(const BlockInfo &pending,
          (sync.completion == CompletionSync::Shared &&
           (hasSharedAccesses || demands.hasDemandBeyondGlobalReads)) ||
          (!demands.publicationIssuers.empty() &&
-          !sync.effectIssuers.hasSameKnownIssuer(demands.publicationIssuers)) ||
-         // A notification can let a peer advance a pending wait's phase.
-         // Private counter updates are already ordered by the slice hazards.
-         (sync.peerWaitNeedsSync && demands.mayNotifyPeer);
+          !sync.effectIssuers.hasSameKnownIssuer(demands.publicationIssuers));
 }
 
 Operation *MembarAnalysis::syncIfNeeded(Operation *op, const BlockInfo &effects,
@@ -902,8 +961,8 @@ Operation *MembarAnalysis::syncIfNeeded(Operation *op, const BlockInfo &effects,
                      const AllocationSlice &afterSlice) {
     // Effects issued by the same thread are ordered with respect to each other.
     // A fixed thread-zero issuer and an elected warp-zero leader may differ.
-    return (!pending.threadSync.effectIssuers.empty() &&
-            !effects.threadSync.effectIssuers.empty() &&
+    return (hasIssuedEffects(pending.threadSync) &&
+            hasIssuedEffects(effects.threadSync) &&
             haveSameThreadSyncIssuer(before, after)) ||
            (filter && filter(before, after, beforeIsRead, afterIsRead,
                              allocation, beforeSlice, afterSlice));
@@ -1046,21 +1105,25 @@ bool MembarAnalysis::hasThreadEffects(Operation *op) {
 
 BlockInfo MembarAnalysis::getThreadEffects(Operation *op) {
   BlockInfo effects;
-  effects.threadSync.effectIssuers = IssuerSummary{getThreadIssuer(op)};
   auto sync = getThreadSyncInfo(op);
+  if (carriesNoPayload(op)) {
+    effects.threadSync.syncIssuers = IssuerSummary{getThreadIssuer(op)};
+    if (auto wait = dyn_cast<ttng::WaitBarrierOp>(op))
+      effects.threadSync.peerWaitNeedsSync = !isRegionLocal(wait.getAlloc());
+    return effects;
+  }
+  effects.threadSync.effectIssuers = IssuerSummary{getThreadIssuer(op)};
   if (sync.kind == ThreadSyncKind::CompletionNeedsSync)
     effects.threadSync.completion = CompletionSync::All;
   else if (sync.kind == ThreadSyncKind::SharedCompletionNeedsSync)
     effects.threadSync.completion = CompletionSync::Shared;
-  effects.threadSync.peerWaitNeedsSync =
-      sync.kind == ThreadSyncKind::MBarrierWait &&
-      !isRegionLocal(cast<ttng::WaitBarrierOp>(op).getAlloc());
   return effects;
 }
 
 void MembarAnalysis::addThreadDemand(BlockInfo &effects, Operation *op) {
   effects.threadDemands.hasDemand = true;
   effects.threadDemands.mayNotifyPeer = mayNotifyPeer(op);
+  effects.threadDemands.mayIssueAhead = !waitsForWholeRegion(op);
   effects.threadDemands.hasDemandBeyondGlobalReads = !hasOnlyGlobalReads(op);
   if (getThreadSyncInfo(op).requiresBefore())
     effects.threadDemands.publicationIssuers =
