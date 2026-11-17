@@ -373,6 +373,7 @@ struct ConvertTritonAMDGPUToLLVM
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
+    triton::encodeSharedMemoryBreakdown(mod);
 
     if (failed(validateFinalWarpPredicateLayouts(mod)))
       return signalPassFailure();

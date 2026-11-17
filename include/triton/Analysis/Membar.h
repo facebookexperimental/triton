@@ -585,6 +585,7 @@ public:
 
   template <typename AnalysisT>
   void runAnalysis(triton::BufferRegionAnalysis &regions) {
+    triton::encodeSharedMemoryBreakdown(moduleAllocation.getModuleOp());
     AnalysisT::runModule(
         moduleAllocation.getModuleOp(), [&](FunctionOpInterface function) {
           auto &allocation = *moduleAllocation.getFuncData(function);
