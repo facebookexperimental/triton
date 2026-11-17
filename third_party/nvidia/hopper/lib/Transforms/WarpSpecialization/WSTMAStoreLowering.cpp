@@ -968,6 +968,17 @@ countTMAStoresUntilWait(Block *block, Block::iterator from,
   return std::nullopt;
 }
 
+// Branch context that still holds in another iteration of `forOp`: only
+// conditions defined outside the loop keep their value across iterations.
+static ConditionContext getLoopInvariantContext(const ConditionContext &context,
+                                                scf::ForOp forOp) {
+  ConditionContext invariant;
+  for (const ConditionBranch &branch : context)
+    if (forOp.isDefinedOutsideOfLoop(branch.condition))
+      invariant.push_back(branch);
+  return invariant;
+}
+
 // Pendings bound for a token no store produced (ub.poison, e.g. the else
 // value of a guarded prologue store): waiting on it constrains nothing.
 static constexpr int kUnconstrainedPendings = 1 << 20;
@@ -1095,25 +1106,16 @@ computePendingsFromToken(Value token, ttng::TMAStoreTokenWaitOp waitOp,
       return std::nullopt;
     int storesBeforeWait = *storesBeforeWaitOpt;
 
-    // Steady state. With one hop the store is in the previous iteration and
-    // keeps the wait's branch context. With more hops, earlier iterations are
-    // counted without it, since their scf.if conditions are evaluated in a
-    // different iteration.
+    // Steady state. Stores issued in earlier iterations are counted with only
+    // the loop-invariant part of the wait's branch context: a condition
+    // computed in the loop body may differ in those iterations.
+    ConditionContext invariantContext = getLoopInvariantContext(context, forOp);
     int hops = chain.size();
-    int pendings;
-    int storesPerIter = 0;
-    if (hops == 1) {
-      pendings = countTMAStoresInRange(std::next(defOp->getIterator()),
-                                       body->end(), context) +
-                 storesBeforeWait;
-    } else {
-      ConditionContext noContext;
-      storesPerIter =
-          countTMAStoresInRange(body->begin(), body->end(), noContext);
-      pendings = countTMAStoresInRange(std::next(defOp->getIterator()),
-                                       body->end(), noContext) +
-                 (hops - 1) * storesPerIter + storesBeforeWait;
-    }
+    int storesPerIter =
+        countTMAStoresInRange(body->begin(), body->end(), invariantContext);
+    int pendings = countTMAStoresInRange(std::next(defOp->getIterator()),
+                                         body->end(), invariantContext) +
+                   (hops - 1) * storesPerIter + storesBeforeWait;
 
     // The first H iterations wait on tokens that enter through the init
     // values: iteration j waits on the init value of chain[j]. Each must be
@@ -1193,9 +1195,8 @@ struct NVGPUTMAStoreTokenWaitAnnotatePendingsPass
       std::optional<int> count =
           computePendingsFromToken(op.getToken(), op, context);
       if (count && *count < kUnconstrainedPendings)
-        op->setAttr(
-            ttng::kProgramOrderPendingCount,
-            IntegerAttr::get(IntegerType::get(op.getContext(), 32), *count));
+        op->setAttr(ttng::kProgramOrderPendingCount,
+                    Builder(op).getI32IntegerAttr(*count));
     });
   }
 };
