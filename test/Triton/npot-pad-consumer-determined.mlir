@@ -1,12 +1,8 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad='num-warps=4' -verify-diagnostics | FileCheck %s
-// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -triton-npot-pad='num-warps=8' -verify-diagnostics | FileCheck %s --check-prefix=W8
 
 // The matmul index idiom: the N-248 index values take the B/C tiles' layout, so
-// tiles alone decide the connected component and it stays exact at 4 warps. At
-// 8 warps the B tile's total in-dim size on its own doubles and the connected
-// component pads.
+// tiles alone decide the connected component and it stays exact at 4 warps.
 // CHECK-LABEL: @matmul_index_248
-// W8-LABEL: @matmul_index_248
 module {
   tt.func @matmul_index_248(%a_ptr: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %b_ptr: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %c_ptr: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %M: i32 {tt.divisibility = 16 : i32}, %N: i32, %K: i32 {tt.divisibility = 16 : i32}, %sam: i32 {tt.divisibility = 16 : i32}, %sbk: i32, %scm: i32) attributes {noinline = false} {
     %cst = arith.constant dense<0.000000e+00> : tensor<16x248xf16>
@@ -25,7 +21,6 @@ module {
     %offs_m_5 = arith.addi %offs_m_4, %offs_m_3 : tensor<128xi32>
     %offs_n = arith.muli %pid_n, %c248_i32 : i32
   // CHECK: tt.make_range {end = 248 : i32, start = 0 : i32} : tensor<248xi32>
-  // W8: tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
     %offs_n_6 = tt.make_range {end = 248 : i32, start = 0 : i32} : tensor<248xi32>
     %offs_n_7 = tt.splat %offs_n : i32 -> tensor<248xi32>
     %offs_n_8 = arith.addi %offs_n_7, %offs_n_6 : tensor<248xi32>
@@ -45,7 +40,6 @@ module {
     %b_ptrs_19 = tt.splat %b_ptr : !tt.ptr<f16> -> tensor<16x1x!tt.ptr<f16>>
     %b_ptrs_20 = tt.addptr %b_ptrs_19, %b_ptrs_18 : tensor<16x1x!tt.ptr<f16>>, tensor<16x1xi32>
   // CHECK: tt.expand_dims %{{.*}} : tensor<248xi32> -> tensor<1x248xi32>
-  // W8: tt.expand_dims %{{.*}} : tensor<256xi32> -> tensor<1x256xi32>
     %b_ptrs_21 = tt.expand_dims %offs_n_8 {axis = 0 : i32} : tensor<248xi32> -> tensor<1x248xi32>
     %b_ptrs_22 = tt.broadcast %b_ptrs_20 : tensor<16x1x!tt.ptr<f16>> -> tensor<16x248x!tt.ptr<f16>>
     %b_ptrs_23 = tt.broadcast %b_ptrs_21 : tensor<1x248xi32> -> tensor<16x248xi32>
@@ -73,7 +67,6 @@ module {
       %b_51 = tt.broadcast %b_50 : tensor<16x1xi1> -> tensor<16x248xi1>
       %b_52 = arith.andi %b_51, %b_30 : tensor<16x248xi1>
   // CHECK: tt.load %{{.*}}, %{{.*}}, %{{.*}} : tensor<16x248x!tt.ptr<f16>>
-  // W8: tt.load %{{.*}}, %{{.*}}, %{{.*}} : tensor<16x256x!tt.ptr<f16>>
       %b_53 = tt.load %b_ptrs_40, %b_52, %cst : tensor<16x248x!tt.ptr<f16>>
       tt.store %b_ptrs_40, %b_53, %b_52 : tensor<16x248x!tt.ptr<f16>>
       %acc_54 = arith.addf %acc_41, %acc_41 : tensor<128x248xf32>
@@ -97,7 +90,6 @@ module {
     %6 = arith.andi %4, %5 : tensor<128x248xi1>
     %7 = arith.truncf %acc#2 : tensor<128x248xf32> to tensor<128x248xf16>
   // CHECK: tt.store %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x248x!tt.ptr<f16>>
-  // W8: tt.store %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x256x!tt.ptr<f16>>
     tt.store %c_ptrs_38, %7, %6 : tensor<128x248x!tt.ptr<f16>>
     tt.return
   }

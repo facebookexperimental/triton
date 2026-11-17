@@ -95,6 +95,21 @@ struct ProxyFenceFunctionAnalysis
       return;
     }
 
+    // An autoWS release whose buffer another partition refills with TMA. That
+    // async write is in a different region, so the frontiers here never see
+    // the hazard; fence the generic reads before the release unconditionally.
+    // The release may have been promoted to a named barrier by now.
+    if (isa<ArriveBarrierOp, NamedBarrierArriveOp>(op) &&
+        op->hasAttr(kFenceGenericReadsAttrName)) {
+      uint8_t scope = scopes & kClusterScope ? kClusterScope : kCTAScope;
+      if (!isa_and_nonnull<FenceAsyncSharedOp>(op->getPrevNode())) {
+        builder->setInsertionPoint(op);
+        FenceAsyncSharedOp::create(*builder, op->getLoc(),
+                                   scope == kClusterScope);
+      }
+      state->fenceGeneric(scope);
+    }
+
     if (auto call = dyn_cast<CallOpInterface>(op)) {
       auto effects = getCallSummary(
           call, *funcMap,

@@ -5,7 +5,6 @@
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Support/LLVM.h"
@@ -87,51 +86,6 @@ bool triton::canUseWarpBallotHistogram(HistogramOp op) {
          numBins * gpu::lookupNumWarps(op) <= 4;
 }
 
-// Cases where distributed shared memory is not required in ConvertLayout:
-// (1) numCTAs == 1
-// (2) numCTAs > 1 but srcCGALayout == dstCGALayout
-// TODO: Case with SliceLayout as srcLayout and numCTAs > 1 is to be implemented
-// in the future
-bool shouldUseDistSmem(Attribute srcLayout, Attribute dstLayout) {
-  unsigned numCTAs = getNumCTAs(srcLayout);
-  assert(numCTAs == getNumCTAs(dstLayout) &&
-         "Invalid layout conversion: the numbers of CTAs of src and dst "
-         "layouts are different");
-
-  // Case (1): Never use dsmem when numCTAs == 1
-  if (numCTAs == 1)
-    return false;
-
-  // Case where CTAsPerCGA of srcLayout in the sliced dim is not 1 is not
-  // implemented yet
-  if (auto sliceLayout = mlir::dyn_cast<SliceEncodingAttr>(srcLayout)) {
-    auto dim = sliceLayout.getDim();
-    auto CTAsPerCGA = getCTAsPerCGA(sliceLayout.getParent());
-    if (CTAsPerCGA[dim] != 1)
-      llvm::report_fatal_error("Layout conversion to be implemented");
-  }
-
-  // Case where CTAsPerCGA of dstLayout in the sliced dim is not 1 is supported
-  if (auto sliceLayout = mlir::dyn_cast<SliceEncodingAttr>(dstLayout)) {
-    auto dim = sliceLayout.getDim();
-    auto CTAsPerCGA = getCTAsPerCGA(sliceLayout.getParent());
-    if (CTAsPerCGA[dim] != 1)
-      return true;
-  }
-
-  // The above two branches make sure that it is legal to call getCGALayout of
-  // srcLayout and dstLayout
-
-  // Case (2): Do not use dsmem when srcCGALayout == dstCGALayout
-  auto srcCGALayout = getCGALayout(srcLayout);
-  auto dstCGALayout = getCGALayout(dstLayout);
-  if (srcCGALayout == dstCGALayout)
-    return false;
-
-  // Dsmem access is required when srcCGALayout != dstCGALayout
-  return true;
-}
-
 unsigned ReduceOpHelper::getInterWarpSizeWithUniqueData() {
   return getWarpsPerCTA(srcEncoding, srcShape)[axis];
 }
@@ -192,92 +146,59 @@ SmallVector<unsigned> ReduceOpHelper::getScratchRepShape() {
 
 unsigned ReduceOpHelper::getScratchSizeInBytes(
     GetNumScratchElemsFn numScratchElemsGetter) {
-  (void)numScratchElemsGetter;
   auto getLegacyScratchSize = [&]() {
     auto smemShape = getScratchRepShape();
     auto elems = product<unsigned>(smemShape);
     unsigned bytesPerElem = 0;
-    for (const auto &ty : srcElementTypes) {
+    for (const auto &ty : op.getElementTypes()) {
       bytesPerElem += ceil<unsigned>(ty.getIntOrFloatBitWidth(), 8);
     }
     return bytesPerElem * elems;
   };
 
   auto kLane = StringAttr::get(op.getContext(), "lane");
-
-  auto isReduced = [axis = axis](const LinearLayout &layout) {
-    return layout.getOutDimSizes().begin()[axis] == 1;
-  };
   auto regLl = reducedRegLaneLayout(srcTy, axis);
-  if (!isReduced(regLl))
+  auto kAxis = *(regLl.getOutDimNames().begin() + axis);
+  if (regLl.getOutDimSize(kAxis) != 1)
     return getLegacyScratchSize();
 
-  // All the inputs have the same layout so, since we order them from largest
-  // bitsize to smallest, and the first one is aligned, by induction, they are
-  // all aligned, so we don't need to align the byte numbers returned here.
-  unsigned bytesRegToTmp = 0;
-  while (!isReduced(regLl)) {
-    auto tmpLl = getInterLayout(regLl, axis);
-    // We take the maximum of the elements and multiply by the total bitwidth.
-    // We do this as otherwise it's quite tricky to find the correct
-    // BaseOffsets in the lowering.
-    int bytes = 0;
-    for (auto inputTy : op.getInputTypes()) {
-      auto nelem =
-          getNumScratchElemsSwizzledCvt(regLl, tmpLl, getBitwidth(inputTy));
-      bytes += nelem * (getBitwidth(inputTy) / 8);
-    }
-    bytesRegToTmp = std::max<unsigned>(bytesRegToTmp, bytes);
+  // Successive reduction stages reuse the scratch allocation.
+  unsigned bytes = 0;
+  while (regLl.getOutDimSize(kAxis) != 1) {
+    auto tmpLl = getInterWarpReductionLayout(regLl, axis);
+    auto config = getScratchConfig(regLl, tmpLl, numScratchElemsGetter);
+    bytes = std::max(bytes, config.sizeInBytes);
     regLl = zeroBasesAlongDimAndReorder(tmpLl, axis, kLane);
   }
-  return bytesRegToTmp;
+  return bytes;
 }
 
 bool ReduceOpHelper::isReduceWithinCTA() {
-  // TODO: Support reduce across CTAS
-  // Layout optimization passes such as AssignCGALayoutsPass and
-  // RemoveLayoutConversionPass should avoid cross-CTA reduction
   return getCTASplitNum(srcEncoding)[axis] == 1;
 }
 
 bool ReduceOpHelper::isAssociative() {
-  auto dtype = srcElementTypes[0];
-  if (!type::isFloat(dtype))
+  if (srcShape[axis] <= 2)
     return true;
-  size_t reduce_size = srcShape[axis];
-  if (reduce_size <= 2)
-    return true;
-  bool hasNoAssociativeOp = false;
-  op.walk([&](Operation *nestedOp) -> WalkResult {
-    if (isa<arith::AddFOp, arith::MulFOp>(nestedOp)) {
-      // Only when the data type is float point and reduce size greater than 2,
-      // and has addf or mulf op, we though it's a non-associative reduce.
-      hasNoAssociativeOp = true;
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  return !hasNoAssociativeOp;
+  // Reductions with more than two elements are treated as non-associative
+  // if their combiner contains an addf or mulf operation.
+  return !op.getCombineOp()
+              .walk([](Operation *nestedOp) {
+                return isa<arith::AddFOp, arith::MulFOp>(nestedOp)
+                           ? WalkResult::interrupt()
+                           : WalkResult::advance();
+              })
+              .wasInterrupted();
 }
 
 ReduceOpHelper::InThreadVectorizeOpKind
-ReduceOpHelper::getInThreadVectorizeOpKind(unsigned axisPack,
-                                           bool supportBitwidth16Elementwise,
+ReduceOpHelper::getInThreadVectorizeOpKind(bool supportBitwidth16Elementwise,
                                            bool supportBitwidth32Elementwise) {
-  Operation *reduceOperation = op.getOperation();
-  if (axisPack < 4 || reduceOperation->getNumOperands() != 1 ||
-      reduceOperation->getNumResults() != 1)
+  Operation *combiner = op.getSingleCombiner();
+  if (!combiner)
     return InThreadVectorizeOpKind::None;
 
-  assert(reduceOperation->getNumRegions() == 1 &&
-         "expected a single combine region");
-  Region &combineRegion = reduceOperation->getRegion(0);
-  Block &block = combineRegion.front();
-  if (block.getOperations().size() != 2)
-    return InThreadVectorizeOpKind::None;
-  Operation &combiner = block.front();
-
-  Type elemTy = srcElementTypes.front();
+  Type elemTy = srcTy.getElementType();
   unsigned bitwidth = elemTy.getIntOrFloatBitWidth();
   if (bitwidth == 16 && !supportBitwidth16Elementwise)
     return InThreadVectorizeOpKind::None;
@@ -290,12 +211,10 @@ ReduceOpHelper::getInThreadVectorizeOpKind(unsigned axisPack,
     return InThreadVectorizeOpKind::None;
 
   if (isa<arith::AddFOp>(combiner)) {
-    return (is16Bit || isF32) ? InThreadVectorizeOpKind::AddF
-                              : InThreadVectorizeOpKind::None;
+    return InThreadVectorizeOpKind::AddF;
   }
   if (isa<arith::MulFOp>(combiner)) {
-    return (is16Bit || isF32) ? InThreadVectorizeOpKind::MulF
-                              : InThreadVectorizeOpKind::None;
+    return InThreadVectorizeOpKind::MulF;
   }
   if (isa<arith::MinNumFOp>(combiner)) {
     return is16Bit ? InThreadVectorizeOpKind::MinNumF
@@ -339,57 +258,37 @@ ReduceOpHelper::getInThreadVectorizeOpKind(unsigned axisPack,
   return InThreadVectorizeOpKind::None;
 }
 
-Value ReduceOpHelper::createInThreadVectorizedCombineOp(
-    OpBuilder &builder, Location loc, InThreadVectorizeOpKind kind, Value lhs,
-    Value rhs) {
-  auto vecTy = lhs.getType();
-  Value result;
-  switch (kind) {
-  case InThreadVectorizeOpKind::AddF:
-    result = LLVM::FAddOp::create(builder, loc, lhs, rhs);
-    break;
-  case InThreadVectorizeOpKind::MulF:
-    result = LLVM::FMulOp::create(builder, loc, lhs, rhs);
-    break;
-  case InThreadVectorizeOpKind::MinNumF:
-    result = LLVM::MinNumOp::create(builder, loc, vecTy, lhs, rhs);
-    break;
-  case InThreadVectorizeOpKind::MaxNumF:
-    result = LLVM::MaxNumOp::create(builder, loc, vecTy, lhs, rhs);
-    break;
-  case InThreadVectorizeOpKind::MinimumF:
-    result = LLVM::MinimumOp::create(builder, loc, vecTy, lhs, rhs);
-    break;
-  case InThreadVectorizeOpKind::MaximumF:
-    result = LLVM::MaximumOp::create(builder, loc, vecTy, lhs, rhs);
-    break;
-  case InThreadVectorizeOpKind::AddI:
-    result = LLVM::AddOp::create(builder, loc, lhs, rhs);
-    break;
-  case InThreadVectorizeOpKind::MulI:
-    result = LLVM::MulOp::create(builder, loc, lhs, rhs);
-    break;
-  case InThreadVectorizeOpKind::MinSI:
-    result = LLVM::SMinOp::create(builder, loc, vecTy, lhs, rhs);
-    break;
-  case InThreadVectorizeOpKind::MaxSI:
-    result = LLVM::SMaxOp::create(builder, loc, vecTy, lhs, rhs);
-    break;
-  case InThreadVectorizeOpKind::MinUI:
-    result = LLVM::UMinOp::create(builder, loc, vecTy, lhs, rhs);
-    break;
-  case InThreadVectorizeOpKind::MaxUI:
-    result = LLVM::UMaxOp::create(builder, loc, vecTy, lhs, rhs);
-    break;
-  case InThreadVectorizeOpKind::None:
-  default:
-    llvm::report_fatal_error("Unsupported in-thread vectorize op kind");
+ReduceOpHelper::ScratchConfig
+ReduceOpHelper::getScratchConfig(const LinearLayout &src,
+                                 const LinearLayout &dst,
+                                 GetNumScratchElemsFn numScratchElemsGetter) {
+  auto inputTypes = op.getInputTypes();
+  auto indices = llvm::to_vector(llvm::seq<unsigned>(inputTypes.size()));
+  llvm::sort(indices, [&](unsigned i, unsigned j) {
+    return getBitwidth(inputTypes[i]) > getBitwidth(inputTypes[j]);
+  });
+
+  // All the inputs have the same layout, so, since we order them from largest
+  // bit size to smallest and the first one is aligned, by induction they are
+  // all aligned. We therefore don't need to align the byte offsets computed
+  // here. Compute the scratch size and base offsets together, as otherwise it
+  // is quite tricky to find the correct base offsets in the lowering.
+  ScratchConfig config;
+  config.offsets.resize(inputTypes.size());
+  for (unsigned idx : indices) {
+    unsigned bitwidth = getBitwidth(inputTypes[idx]);
+    unsigned elems = numScratchElemsGetter
+                         ? numScratchElemsGetter(src, dst, bitwidth)
+                         : getNumScratchElemsSwizzledCvt(src, dst, bitwidth);
+    config.offsets[idx] = config.sizeInBytes;
+    config.sizeInBytes += elems * (bitwidth / 8);
   }
-  return result;
+  return config;
 }
 
-LinearLayout ReduceOpHelper::getInterLayout(const LinearLayout &layout,
-                                            int axis) {
+LinearLayout
+ReduceOpHelper::getInterWarpReductionLayout(const LinearLayout &layout,
+                                            unsigned axis) {
   auto *ctx = layout.getOutDimNames().begin()->getContext();
   auto kLane = mlir::StringAttr::get(ctx, "lane");
   auto kWarp = mlir::StringAttr::get(ctx, "warp");
@@ -532,6 +431,44 @@ ColumnAction ReduceOpHelper::moveAxisBasesToFront(const LinearLayout &layout,
                       layout.getInputRadices(kReg));
 }
 
+// The scan indexes registers as a blocked layout does: elements, then blocks,
+// each in `order`. Map each blocked index to its mixed-radix source register,
+// or return empty if ScanOp::getBlockedTile rejects the layout.
+static SmallVector<unsigned> computeBlockedToSrc(LinearEncodingAttr encoding,
+                                                 ArrayRef<int64_t> shape,
+                                                 ArrayRef<unsigned> order) {
+  const LinearLayout &ll = encoding.getLinearLayout();
+  std::optional<SmallVector<unsigned>> tile = ScanOp::getBlockedTile(ll);
+  if (!tile)
+    return {};
+  auto kReg = StringAttr::get(encoding.getContext(), "register");
+  SmallVector<unsigned> contig = encoding.getContigPerThread();
+  unsigned numElems = product(contig);
+  unsigned numRegs = ll.getInDimSize(kReg);
+  SmallVector<unsigned> blockedToSrc(numRegs, numRegs);
+  for (unsigned reg = 0; reg < numRegs; ++reg) {
+    SmallVector<std::pair<StringAttr, int32_t>> ins;
+    for (StringAttr inDim : ll.getInDimNames())
+      ins.push_back({inDim, inDim == kReg ? reg : 0});
+    auto coords = ll.apply(ins);
+    unsigned elem = 0, block = 0, elemStride = 1, blockStride = 1;
+    for (unsigned dim : order) {
+      unsigned coord = coords[dim].second, extent = (*tile)[dim];
+      if (coord % extent >= contig[dim])
+        return {};
+      elem += coord % extent * elemStride;
+      block += coord / extent * blockStride;
+      elemStride *= contig[dim];
+      blockStride *= ceil<unsigned>(shape[dim], extent);
+    }
+    unsigned index = elem + numElems * block;
+    if (index >= numRegs || blockedToSrc[index] != numRegs)
+      return {};
+    blockedToSrc[index] = reg;
+  }
+  return blockedToSrc;
+}
+
 ScanLoweringHelper::ScanLoweringHelper(triton::ScanOp op) : scanOp(op) {
   auto firstTy = cast<RankedTensorType>(op.getOperands()[0].getType());
   srcShape = firstTy.getShape();
@@ -555,6 +492,8 @@ ScanLoweringHelper::ScanLoweringHelper(triton::ScanOp op) : scanOp(op) {
   } else {
     order = srcEncoding.getOrder();
   }
+  if (srcEncoding.getLinearLayout().hasNonPow2OutDim())
+    blockedToSrc = computeBlockedToSrc(srcEncoding, srcShape, order);
 
   for (const auto &t : op.getInputTypes()) {
     if (t.getShape() != srcShape) {
@@ -609,6 +548,7 @@ unsigned ScanLoweringHelper::getAxisNumBlocks() {
 }
 
 unsigned ScanLoweringHelper::getNonAxisNumBlocks() {
+  auto shapePerCTA = getShapePerCTA(getEncoding(), getShape());
   auto contigPerThread = getEncoding().getContigPerThread();
   auto threadsPerWarp = getEncoding().getThreadsPerWarp();
   auto warpsPerCTA = getEncoding().getWarpsPerCTA();
@@ -619,8 +559,8 @@ unsigned ScanLoweringHelper::getNonAxisNumBlocks() {
     if (i == axis)
       continue;
     numBlocks *=
-        ceil<unsigned>(getShape()[i], (contigPerThread[i] * threadsPerWarp[i] *
-                                       warpsPerCTA[i]));
+        ceil<unsigned>(shapePerCTA[i], (contigPerThread[i] * threadsPerWarp[i] *
+                                        warpsPerCTA[i]));
   }
   return numBlocks;
 }
@@ -628,9 +568,10 @@ unsigned ScanLoweringHelper::getNonAxisNumBlocks() {
 bool ScanLoweringHelper::isSupported() {
   // TODO: Support the following cases:
   // 1. Scan on non-blocking encodings
-  if (!isa<BlockedEncodingAttr>(legacyEncoding))
+  if (!isa<BlockedEncodingAttr>(legacyEncoding) && blockedToSrc.empty())
     return false;
-  return true;
+  // Partial results are only combined within each CTA.
+  return getCTASplitNum(srcEncoding)[getAxis()] == 1;
 }
 
 unsigned ScanLoweringHelper::getScratchSizeInElems() {
@@ -939,6 +880,8 @@ MixedRadixConversionPlan MixedRadixConversionPlan::factored(
 // Like the pow2 reps, it keeps the leading digits that vectorize `outDim`.
 static int32_t findTileDigit(const LinearLayout &layout, StringAttr outDim,
                              int32_t bit) {
+  if (!layout.hasOddPartForm())
+    return -1;
   bool odd = bit == 0;
   int32_t size = layout.getOutDimSize(outDim);
   int32_t twoPart = LinearLayout::twoPartOf(size);
@@ -1071,6 +1014,40 @@ getMixedRadixSharedTiles(const LinearLayout &src, const LinearLayout &dst) {
       return std::nullopt;
   if (tiles.sourceDigits.empty() || !tiles.sourceTile.isRadix2() ||
       !tiles.destinationTile.isRadix2())
+    return std::nullopt;
+  return tiles;
+}
+
+int32_t getMixedRadixSharedRunLength(const LinearLayout &layout, int32_t dim,
+                                     unsigned bitwidth) {
+  auto kOffset =
+      StringAttr::get(layout.getInDimNames().begin()->getContext(), "offset");
+  auto toOffset = LinearLayout::empty();
+  for (auto [i, outDim] : llvm::enumerate(layout.getOutDimNames())) {
+    int32_t size = llvm::PowerOf2Ceil(layout.getOutDimSize(outDim));
+    toOffset *= static_cast<int32_t>(i) == dim
+                    ? LinearLayout::identity1D(size, outDim, kOffset)
+                    : LinearLayout::zeros1D(size, outDim, kOffset);
+  }
+  return getMixedRadixSharedRun(layout, toOffset, bitwidth);
+}
+
+std::optional<MixedRadixSharedTiling>
+getMixedRadixTransposeTiles(const LinearLayout &src, const LinearLayout &dst,
+                            unsigned bitwidth) {
+  auto tiles = getMixedRadixSharedTiles(src, dst);
+  if (!tiles)
+    return std::nullopt;
+  bool srcVector = false, dstVector = false;
+  for (int32_t dim = 0; dim < src.getNumOutDims(); ++dim) {
+    int32_t srcRun = getMixedRadixSharedRunLength(src, dim, bitwidth);
+    int32_t dstRun = getMixedRadixSharedRunLength(dst, dim, bitwidth);
+    if (srcRun > 1 && dstRun > 1)
+      return std::nullopt;
+    srcVector |= srcRun > 1;
+    dstVector |= dstRun > 1;
+  }
+  if (!srcVector || !dstVector)
     return std::nullopt;
   return tiles;
 }
@@ -1406,7 +1383,7 @@ getReshapeDecomposition(ArrayRef<int64_t> srcShape,
 }
 
 unsigned ScanLoweringHelper::getAxisElementStride() {
-  auto order = getOrder();
+  auto order = getEncoding().getOrder();
   unsigned stride = 1;
   for (unsigned dim : order) {
     if (dim == getAxis())
@@ -1427,6 +1404,7 @@ unsigned ScanLoweringHelper::getAxisThreadStride() {
 
 unsigned ScanLoweringHelper::getAxisBlockStride() {
   auto order = getOrder();
+  auto shapePerCTA = getShapePerCTA(getEncoding(), getShape());
   unsigned stride = 1;
   auto contigPerThread = getEncoding().getContigPerThread();
   auto threadsPerWarp = getEncoding().getThreadsPerWarp();
@@ -1434,9 +1412,9 @@ unsigned ScanLoweringHelper::getAxisBlockStride() {
   for (unsigned dim : order) {
     if (dim == getAxis())
       return stride;
-    stride *= ceil<unsigned int>(getShape()[dim], contigPerThread[dim] *
-                                                      threadsPerWarp[dim] *
-                                                      warpsPerCTA[dim]);
+    stride *= ceil<unsigned int>(shapePerCTA[dim], contigPerThread[dim] *
+                                                       threadsPerWarp[dim] *
+                                                       warpsPerCTA[dim]);
   }
   llvm_unreachable("Axis not found in order");
 }
@@ -1530,7 +1508,10 @@ unsigned getNumScratchElements(ArrayRef<unsigned> shape) {
   return product<unsigned>(shape);
 }
 
-bool supportMMA(triton::DotOp op, int version) {
+bool supportMMA(triton::DotOp op, int version,
+                std::optional<int> knownNumWarps) {
+  // knownNumWarps is fork-retained: AccelerateMatmul passes the pipeline's
+  // numWarps explicitly instead of re-deriving it from the op.
   // Refer to mma section for the data type supported by Volta and Hopper
   // Tensor Core in
   // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-884-f16
@@ -1545,9 +1526,12 @@ bool supportMMA(triton::DotOp op, int version) {
     RankedTensorType typeA = op.getA().getType();
     int k = typeA.getShape().back();
     auto retType = op.getType();
-    auto retShapePerCTA = getShapePerCTA(retType);
+    // The target dot-legality query asks before layouts and ttg.num-warps
+    // exist, on one CTA.
+    auto retShapePerCTA = retType.getEncoding() ? getShapePerCTA(retType)
+                                                : to_vector(retType.getShape());
     auto rank = retShapePerCTA.size();
-    int numWarps = lookupNumWarps(op);
+    int numWarps = knownNumWarps ? *knownNumWarps : lookupNumWarps(op);
     // Allow int8 * int8 -> int32 for MMAv5, reject other integer combinations
     if (aElemTy.isInteger() || bElemTy.isInteger() ||
         retType.getElementType().isInteger()) {
@@ -1583,9 +1567,12 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
-    auto retShapePerCTA = getShapePerCTA(retType);
+    // The target dot-legality query asks before layouts and ttg.num-warps
+    // exist, on one CTA.
+    auto retShapePerCTA = retType.getEncoding() ? getShapePerCTA(retType)
+                                                : to_vector(retType.getShape());
     auto rank = retShapePerCTA.size();
-    int numWarps = lookupNumWarps(op);
+    int numWarps = knownNumWarps ? *knownNumWarps : lookupNumWarps(op);
     // TODO(Keren): for now, fallback to MMAv2 if handling batch matmul.
     if (rank == 3)
       return false;
@@ -1635,6 +1622,15 @@ bool supportMMA(Value value, int version) {
 
 static bool npotMmaConversion(RankedTensorType srcTy, RankedTensorType dstTy) {
   if (!hasNpotShape(srcTy) && !hasNpotShape(dstTy)) {
+    return false;
+  }
+  // Identical MMA layouts alias no bases, so the convert is a no-op, as at
+  // pow2.
+  if (isa<triton::gpu::NvidiaMmaEncodingAttr>(srcTy.getEncoding()) &&
+      isa<triton::gpu::NvidiaMmaEncodingAttr>(dstTy.getEncoding()) &&
+      triton::gpu::hasExactNpotLayout(srcTy) &&
+      triton::gpu::hasExactNpotLayout(dstTy) &&
+      toLinearLayout(srcTy) == toLinearLayout(dstTy)) {
     return false;
   }
   auto hasMmaFamily = [](Attribute enc) {

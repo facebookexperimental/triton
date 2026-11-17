@@ -326,8 +326,21 @@ private:
 
   // inputRadices[inDim][i] is the radix of input digit i, whose weight is the
   // product of the preceding radices (2^i when all are 2). A digit whose radix
-  // is not 2 has an all-zero basis.
+  // is not 2 reaches an out dim only through that out dim's table.
   llvm::MapVector<StringAttr, std::vector<int32_t>> inputRadices;
+
+  // A non-power-of-two outDim may add tables[outDim].offsets[index] to the XOR
+  // of its other digits' bases, where index is the value of the digits
+  // tables[outDim].digits as a mixed-radix number, first digit low.
+  struct OffsetTable {
+    SmallVector<std::pair<StringAttr, int32_t>> digits;
+    std::vector<int32_t> offsets;
+    bool operator==(const OffsetTable &other) const {
+      return digits == other.digits && offsets == other.offsets;
+    }
+  };
+  // One map keeps sizeof(LinearLayout) under SmallVector's 256-byte limit.
+  llvm::MapVector<StringAttr, OffsetTable> tables;
 
   llvm::MapVector<StringAttr, int32_t /*size*/> outDims;
   int32_t rank = 0;
@@ -335,6 +348,9 @@ private:
 public:
   using BasesT = decltype(bases);
   using RadicesT = decltype(inputRadices);
+  using TableDigitsT =
+      llvm::MapVector<StringAttr, SmallVector<std::pair<StringAttr, int32_t>>>;
+  using TableOffsetsT = llvm::MapVector<StringAttr, std::vector<int32_t>>;
 
   LinearLayout() = default;
 
@@ -408,9 +424,16 @@ public:
   explicit LinearLayout(BasesT bases, RadicesT inputRadices,
                         ArrayRef<std::pair<StringAttr, int32_t>> outDims,
                         bool requireSurjective);
+  // Same, with offset tables. Construction normalizes them, so equal
+  // functions compare equal.
+  explicit LinearLayout(BasesT bases, RadicesT inputRadices,
+                        ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+                        TableDigitsT tableDigits, TableOffsetsT tableOffsets,
+                        bool requireSurjective);
 
   // A mixed-radix output splits each basis at its size's power-of-two factor:
-  // `binary` XORs in for a nonzero digit and `odd` is added digit times.
+  // `binary` XORs in for a nonzero digit and `odd` is added digit times. On an
+  // out dim whose table is not in odd-part form, odd is -1.
   struct BasisContribution {
     int32_t binary;
     int32_t odd;
@@ -430,6 +453,11 @@ public:
   static std::optional<LinearLayout>
   tryCreate(BasesT bases, RadicesT inputRadices,
             ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+            bool requireSurjective, std::string *diagnostic = nullptr);
+  static std::optional<LinearLayout>
+  tryCreate(BasesT bases, RadicesT inputRadices,
+            ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+            TableDigitsT tableDigits, TableOffsetsT tableOffsets,
             bool requireSurjective, std::string *diagnostic = nullptr);
 
   // Construct a LinearLayout from an explicit list of bases.  (This constructor
@@ -496,6 +524,20 @@ public:
   // False for a non-binary input digit or a non-Binary output: the radix-2
   // algorithms below assert it.
   bool isRadix2() const;
+  ArrayRef<std::pair<StringAttr, int32_t>>
+  getTableDigits(StringAttr outDim) const {
+    auto it = tables.find(outDim);
+    return it == tables.end() ? ArrayRef<std::pair<StringAttr, int32_t>>()
+                              : ArrayRef(it->second.digits);
+  }
+  ArrayRef<int32_t> getTableOffsets(StringAttr outDim) const {
+    auto it = tables.find(outDim);
+    return it == tables.end() ? ArrayRef<int32_t>()
+                              : ArrayRef(it->second.offsets);
+  }
+  // True when every table is one unit odd digit over binary bases below the
+  // size's power-of-two factor, so getBasisContribution describes the layout.
+  bool hasOddPartForm() const;
   bool hasNonPow2OutDim() const {
     return !llvm::all_of(llvm::make_second_range(outDims), [](int32_t size) {
       return llvm::isPowerOf2_32(size);
@@ -831,6 +873,15 @@ public:
   // the algorithm chooses the smallest offset for a given (lane, warp).
   [[nodiscard]] LinearLayout invertAndCompose(const LinearLayout &outer) const;
 
+  // compose and invertAndCompose for any radices; on failure, set
+  // `*diagnostic` and return nullopt.
+  std::optional<LinearLayout>
+  tryCompose(const LinearLayout &outer,
+             std::string *diagnostic = nullptr) const;
+  std::optional<LinearLayout>
+  tryInvertAndCompose(const LinearLayout &outer,
+                      std::string *diagnostic = nullptr) const;
+
   // Get the layout that is the inverse of this layout.
   [[nodiscard]] LinearLayout invert() const;
   // Compute and return a psueodinverse of this layout. This is a layout such
@@ -862,6 +913,7 @@ public:
   friend size_t hash_value(const LinearLayout &layout);
 
 private:
+  friend class ColumnAction;
   // Constructor that does not check invariants.  Used by tryCreate.
   struct NoCheckInvariants {};
   LinearLayout(BasesT bases, ArrayRef<std::pair<StringAttr, int32_t>> outDims,
@@ -873,20 +925,71 @@ private:
   [[nodiscard]] std::optional<std::string>
   checkInvariants(bool requireSurjective, bool allowMixedRadixSizes);
   [[nodiscard]] std::optional<std::string> checkInputRadices() const;
-  [[nodiscard]] std::optional<std::string> checkMixedRadixOutDims() const;
+  // Checks the tables and normalizes them; landed odd-digit bases become
+  // odd-part tables.
+  [[nodiscard]] std::optional<std::string> checkTables();
+  [[nodiscard]] std::optional<std::string> setTables(TableDigitsT digits,
+                                                     TableOffsetsT offsets);
+  // The tables as the constructor takes them.
+  std::pair<TableDigitsT, TableOffsetsT> getTableMaps() const;
+  bool isOddPartOutDim(StringAttr outDim) const;
+  static LinearLayout mixedRadixStrided1D(int32_t size, int32_t stride,
+                                          StringAttr inDim, StringAttr outDim);
+  static std::optional<LinearLayout>
+  fromValues(RadicesT radices, ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+             ArrayRef<std::vector<int32_t>> values, std::string *diagnostic);
+  SmallVector<std::pair<StringAttr, int32_t>>
+  applyMixedRadix(ArrayRef<std::pair<StringAttr, int32_t>> ins) const;
+  LinearLayout
+  reshapeMixedRadixIns(ArrayRef<std::pair<StringAttr, int32_t>> newIns) const;
+  std::optional<LinearLayout> resizeMixedRadixOutDim(StringAttr outDim,
+                                                     int32_t newSize) const;
+  // Builds a layout from its values: fn(ins, outs) sets the out-dim values at
+  // `ins`. The ops below that mix digit values take this path.
+  static std::optional<LinearLayout>
+  fromFunction(RadicesT radices,
+               ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+               function_ref<void(ArrayRef<std::pair<StringAttr, int32_t>>,
+                                 MutableArrayRef<int32_t>)>
+                   fn,
+               std::string *diagnostic = nullptr);
+  static std::optional<LinearLayout>
+  mixedRadixProduct(const LinearLayout &inner, const LinearLayout &outer,
+                    ArrayRef<StringAttr> inDims, ArrayRef<StringAttr> outDims);
+  std::optional<LinearLayout> reshapeMixedRadixOuts(
+      ArrayRef<std::pair<StringAttr, int32_t>> newOutDims) const;
+  std::optional<LinearLayout>
+  concatMixedRadixIns(const LinearLayout &other) const;
+  std::optional<LinearLayout>
+  concatMixedRadixOuts(const LinearLayout &other) const;
+  // `moved` maps each kept digit to its new position in the same in-dim;
+  // the other digits are held at 0.
+  using DigitMap = llvm::DenseMap<std::pair<StringAttr, int32_t>,
+                                  std::pair<StringAttr, int32_t>>;
+  LinearLayout remapDigits(const DigitMap &moved) const;
+  void remapTables(const DigitMap &moved, TableDigitsT &digits,
+                   TableOffsetsT &offsets) const;
+  LinearLayout removeMixedRadixZeroBases(StringAttr stripDim) const;
+  std::optional<LinearLayout> resizeMixedRadixInDim(StringAttr inDim,
+                                                    int32_t newSize) const;
+  llvm::MapVector<StringAttr, int32_t> getMixedRadixFreeVariableMasks() const;
+  size_t hashMixedRadix(size_t seed) const;
+  void sublayoutTables(ArrayRef<StringAttr> inDimNames,
+                       ArrayRef<StringAttr> outDimNames, TableDigitsT &digits,
+                       TableOffsetsT &offsets) const;
+  std::string tablesToString() const;
   // A mixed-radix output (any size but a power of 2) XORs bases below the
   // size's largest power-of-two factor and adds the odd part above it.
   bool isMixedRadixOutDim(StringAttr outDim) const {
     return !llvm::isPowerOf2_32(getOutDimSize(outDim));
   }
-  // The rank of a layout that passed checkMixedRadixOutDims: the binary part's
-  // plus one per non-binary digit, which owns one odd coordinate or is zero.
+  // The binary part's rank plus one per odd-part table; another table counts
+  // only when the layout covers its codomain.
   int32_t getMixedRadixRank() const;
 
   // Binary output bits plus one odd coordinate per mixed-radix output.
   int32_t getMixedRadixCodomainRank() const;
-  // The GF(2) layout of the binary parts: mixed-radix outputs keep their
-  // power-of-two factor (checked non-binary digits have no binary part).
+  // The GF(2) layout of the bases of the digits outside each out dim's table.
   LinearLayout binaryPart() const;
 };
 
@@ -925,6 +1028,8 @@ private:
   bool isRadix2() const {
     return llvm::all_of(inputRadices, [](int32_t r) { return r == 2; });
   }
+  SmallVector<Value> applyMixedRadix(ValueRange values) const;
+  LinearLayout applyMixedRadix(const LinearLayout &layout) const;
 
 public:
   ColumnAction() = default;

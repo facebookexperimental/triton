@@ -247,6 +247,7 @@ def _flash_attn_varlen_fwd(
     NUM_MMA_WARPS: tl.constexpr,
     NUM_MMA_GROUPS: tl.constexpr,
     CONSUMER_REGISTERS: tl.constexpr,
+    USE_I64_O_OFFSETS: tl.constexpr,
 ):
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     # Pingpong: the consumers alternate QK issue so the tensor core is never contended.
@@ -365,8 +366,12 @@ def _flash_attn_varlen_fwd(
                 off_h, off_kh, q_start, q_len, k_start, k_len, m_block, n_kv = _tile_info(
                     tile_idx, CuQ, CuK, H, kv_group, num_m_blocks, BLOCK_M, BLOCK_N, CAUSAL)
                 offs_m = m_block * BLOCK_M + cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
-                o_ptrs = (Out + (q_start + offs_m)[:, None] * stride_ot + off_h * stride_oh +
-                          tl.arange(0, HEAD_DIM)[None, :])
+                row0 = q_start + m_block * BLOCK_M + cid * BLOCK_M_SPLIT
+                # The launcher sets USE_I64_O_OFFSETS when the output's element offsets reach 2**31, where int32 wraps.
+                if USE_I64_O_OFFSETS:
+                    row0 = tl.cast(row0, tl.int64)
+                o_base = Out + row0 * stride_ot + off_h * stride_oh
+                o_ptrs = o_base + tl.arange(0, BLOCK_M_SPLIT)[:, None] * stride_ot + tl.arange(0, HEAD_DIM)[None, :]
                 row_ok = (offs_m < q_len)[:, None]
                 if n_kv == 0:
                     zeros = tl.zeros([BLOCK_M_SPLIT, HEAD_DIM], dtype=Out.dtype.element_ty)
@@ -490,6 +495,17 @@ def _rows(x):
     return x.view(tokens, heads * head_dim)
 
 
+def _needs_i64_offsets(tokens, row_stride, block):
+    """Whether an element offset the masked output store forms can reach 2**31.
+
+    The store addresses whole ``block``-row tiles, so the masked rows of a sequence's last tile, up to ``block - 1``
+    past the last token, count. A symbolic size, traced by ``torch.compile`` with dynamic shapes or by export, takes
+    int64 instead of a guard on the token count.
+    """
+    limit = (tokens + block - 1) * row_stride
+    return not isinstance(limit, int) or limit > 1 << 31
+
+
 def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scale, causal):
     """Launch the forward; inputs are validated by ``tlx.ops.flash_attn_varlen``.
 
@@ -517,6 +533,7 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scal
     num_buffers = 3 if (head_dim == 64 and not causal) or kv_same else 2
     split = BLOCK_M // NUM_MMA_GROUPS
     out_rows = out.view(tokens_q, heads * head_dim)
+    use_i64 = _needs_i64_offsets(tokens_q, out_rows.stride(0), BLOCK_M)
     desc_q = TensorDescriptor.from_tensor(_rows(q), [split, head_dim])
     desc_k = TensorDescriptor.from_tensor(_rows(k), [block_n, head_dim])
     desc_v = desc_k if kv_same else TensorDescriptor.from_tensor(_rows(v), [block_n, head_dim])
@@ -533,5 +550,5 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scal
                HEAD_DIM=head_dim, BLOCK_M=BLOCK_M, BLOCK_N=block_n, CAUSAL=causal, TMA_STORE=TMA_STORE, KV_SAME=kv_same,
                NUM_BUFFERS=num_buffers, NUM_TILE_BUFFERS=NUM_TILE_BUFFERS, CLAIM_AHEAD=CLAIM_AHEAD,
                NUM_MMA_WARPS=NUM_MMA_WARPS, NUM_MMA_GROUPS=NUM_MMA_GROUPS, CONSUMER_REGISTERS=CONSUMER_REGISTERS,
-               num_warps=4, num_stages=1)
+               USE_I64_O_OFFSETS=use_i64, num_warps=4, num_stages=1)
     return out

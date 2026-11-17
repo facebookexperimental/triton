@@ -1,0 +1,54 @@
+from triton.tlx.ops.kernels.mm.gfx950 import (
+    a16w16_8wave as _gfx950_a16w16_8wave,
+)
+
+
+{{def_kernel("A", "B")}}
+    M: tl.constexpr = {{size("A", 0)}}
+    N: tl.constexpr = {{size("B", 1)}}
+    K: tl.constexpr = {{size("A", 1)}}
+    C = {{output_ptr()}}
+    stride_am: tl.constexpr = {{stride("A", 0)}}
+    stride_ak: tl.constexpr = {{stride("A", 1)}}
+    stride_bk: tl.constexpr = {{stride("B", 0)}}
+    stride_bn: tl.constexpr = {{stride("B", 1)}}
+
+    _gfx950_a16w16_8wave(
+        A,
+        B,
+        C,
+        C,
+        split_k_ws,
+        C,
+        C,
+        M,
+        N,
+        K,
+        K // SPLIT_K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        0,
+        0,
+        N,
+        1,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        GROUP_SIZE_M=GROUP_M,
+        NUM_XCDS=NUM_XCDS,
+        SPLIT_K=SPLIT_K,
+        ADD_BIAS=False,
+        HAS_REGISTER_TAIL=HAS_REGISTER_TAIL,
+        USE_I64_A_OFFSETS=False,
+        USE_I64_B_OFFSETS=False,
+        USE_I64_C_OFFSETS=False,
+        UNEVEN_SPLIT_K=False,
+        HAS_M_TAIL=HAS_M_TAIL,
+        HAS_N_TAIL=HAS_N_TAIL,
+        PIN_OFFSET_LAYOUT=False,
+        DEFER_EPILOGUE=True,
+        WRITE_STATS=False,
+        IS_RMS_NORM=False,
+    )

@@ -75,7 +75,7 @@ bool mustLoadToRegisters(Operation *op) {
 
 int getDefUseStageDiff(Operation *op, scf::ForOp forOp,
                        CoarseSchedule &schedule) {
-  assert(schedule.count(op) && "Op not found in the schedule");
+  assert(schedule.contains(op) && "Op not found in the schedule");
   int defStage = schedule[op].first;
   CoarseSchedule::Cluster defCluster = schedule[op].second;
   std::optional<int> useStage;
@@ -241,7 +241,9 @@ void createTMAAsyncLoad(scf::ForOp forOp, tt::DescriptorLoadOp loadOp,
                                 Value barrier, Value view, Value pred) {
                               ttng::AsyncTMACopyGlobalToLocalOp::create(
                                   builder, loadOp.getLoc(), desc,
-                                  loadOp.getIndices(), barrier, view, pred);
+                                  loadOp.getIndices(), barrier, view, pred,
+                                  /*multicast=*/false,
+                                  loadOp.getCachePolicyAttr());
                             });
 }
 
@@ -329,7 +331,7 @@ void createTMABarrierAndWait(
   // Find groups of loads that can share the same barrier. We look consecutive
   // loads and check that there are uses in between.
   for (auto &[loadOp, asyncLoad] : asyncLoads) {
-    if (!isTMALoad(loadOp) || visited.count(loadOp))
+    if (!isTMALoad(loadOp) || visited.contains(loadOp))
       continue;
     llvm::SmallDenseSet<Operation *> users;
     SmallVector<Operation *> group;
@@ -357,9 +359,9 @@ void createTMABarrierAndWait(
     Operation *nextOp = loadOp->getNextNode();
     int numBuffers = asyncLoad.stageDiff;
     while (nextOp) {
-      if (users.count(nextOp) || visited.count(nextOp))
+      if (users.contains(nextOp) || visited.contains(nextOp))
         break;
-      if (isTMALoad(nextOp) && asyncLoads.count(nextOp)) {
+      if (isTMALoad(nextOp) && asyncLoads.contains(nextOp)) {
         if (asyncLoads[nextOp].stageDiff != numBuffers)
           break;
         if (group.size() > 0 && schedule[group[0]] == schedule[nextOp]) {
@@ -466,11 +468,12 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         // 4 bytes)
         canUseAsyncCp =
             isa<tt::LoadOp>(op) &&
-            canBeConvertedToAsyncLoad(cast<tt::LoadOp>(op), axisInfoAnalysis);
-        int copyVecBytes = getCopyVecBytes(
-            cast<RankedTensorType>(op.getResultTypes()[0]), sharedEncoding);
-
-        canUseAsyncCp &= copyVecBytes >= 4;
+            canBeConvertedToAsyncLoad(cast<tt::LoadOp>(op), axisInfoAnalysis) &&
+            canPipelineInSharedMemory(cast<tt::LoadOp>(op));
+        if (canUseAsyncCp)
+          canUseAsyncCp =
+              getCopyVecBytes(cast<RankedTensorType>(op.getResultTypes()[0]),
+                              sharedEncoding) >= 4;
         if (canUseAsyncCp) {
           auto loadOp = cast<tt::LoadOp>(op);
           auto ptr = loadOp.getPtr();
@@ -634,10 +637,10 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
 
   // Make sure all ops have attributes.
   for (Operation &op : forOp.getBody()->without_terminator()) {
-    if (!schedule.count(&op)) {
+    if (!schedule.contains(&op)) {
       op.emitError() << "op not found in the schedule";
     }
-    assert(schedule.count(&op) && "op not found in the schedule");
+    assert(schedule.contains(&op) && "op not found in the schedule");
   }
   return forOp;
 }
@@ -681,10 +684,11 @@ Operation *hoistBufferOutOfLoop(scf::ForOp forOp, Operation *op,
     return nullptr;
   OpBuilderForStage builder(op->getLoc(), forOp, schedule);
   auto allocType = dyn_cast<MemDescType>(op->getResult(0).getType());
+  // Keep the alloc shape: an NPOT tile's buffer is its pow2 alloc shape.
   auto newType = triton::gpu::MemDescType::get(
       allocType.getShape(), allocType.getElementType(), allocType.getEncoding(),
       allocType.getMemorySpace(),
-      /*mutableMemory=*/true);
+      /*mutableMemory=*/true, allocType.getAllocShape());
   auto newAlloc = builder.clone(*op);
   newAlloc->getResult(0).setType(newType);
   builder.setStageCluster(schedule[op]);

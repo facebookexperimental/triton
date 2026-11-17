@@ -13,9 +13,56 @@ hit still re-checks the ACF store -- TRITON_ALWAYS_COMPILE is not required, and 
 reloading the same cache entry can never pick up an ACF cubin.
 """
 
+import dataclasses
 import os
 
 from . import store
+
+# Total bytes of tensor storage the consume A/B may copy; above it the A/B is skipped (plain is kept).
+AB_COPY_LIMIT_ENV = "TRITON_COMPILE_IQ_AB_COPY_LIMIT_MB"
+_AB_COPY_LIMIT_MB_DEFAULT = 1024
+_SCALAR_TYPES = (bool, int, float, str, type(None))
+
+
+def scratch_args(args):
+    """Copies of the launch args for the plain-vs-ACF A/B, or None when the A/B must be skipped.
+
+    The A/B launches the kernel many times before the real launch. A kernel that modifies its own
+    inputs (in-place update, atomics, split-K accumulation) would corrupt the caller's buffers, so
+    the A/B runs on copies instead. Each tensor's whole storage is copied once and the view is
+    rebuilt with the same offset, sizes and strides, so aliasing between args is preserved. Returns
+    None for any arg it cannot redirect (an object that may carry a raw pointer) or when the copies
+    would exceed TRITON_COMPILE_IQ_AB_COPY_LIMIT_MB; the caller then keeps plain."""
+    import torch
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    limit = int(os.environ.get(AB_COPY_LIMIT_ENV, _AB_COPY_LIMIT_MB_DEFAULT)) << 20
+    storages = {}  # storage data_ptr -> copied storage, so aliased args share one copy
+
+    def copy(t):
+        s = t.untyped_storage()
+        if s.data_ptr() not in storages:
+            if sum(c.nbytes() for c in storages.values()) + s.nbytes() > limit:
+                raise OverflowError
+            storages[s.data_ptr()] = s.clone()
+        return t.new_empty(0).set_(storages[s.data_ptr()], t.storage_offset(), t.size(), t.stride())
+
+    out = []
+    try:
+        for a in args:
+            if isinstance(a, torch.Tensor):
+                out.append(copy(a))
+            elif isinstance(a, TensorDescriptor) and isinstance(a.base, torch.Tensor):
+                out.append(dataclasses.replace(a, base=copy(a.base)))
+            elif isinstance(a, _SCALAR_TYPES):
+                out.append(a)
+            else:
+                store.dlog("consume", f"A/B skipped: cannot copy arg of type {type(a).__name__}")
+                return None
+    except OverflowError:
+        store.dlog("consume", f"A/B skipped: arg copies exceed {limit >> 20} MB ({AB_COPY_LIMIT_ENV})")
+        return None
+    return out
 
 
 def acf_args_for(ptx: str, arch: str | None, ptxas_version: str) -> list[str]:

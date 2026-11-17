@@ -37,14 +37,41 @@ public:
     if (computeCapability < 90)
       return;
     ModuleOp mod = getOperation();
+    // Computed before any fence is inserted, so the result does not depend on
+    // the order in which consumers are visited.
+    DenseMap<Operation *, UnfencedWrites> unfencedWrites;
+    mod.walk([&](FunctionOpInterface func) {
+      unfencedWrites[func] = collectUnfencedWrites(func);
+    });
+    // Every generic-proxy write to the allocations `consumer` reads was already
+    // fenced by the kernel. A writer in the same thread fenced it in program
+    // order; a writer in another thread or partition fenced it before the
+    // synchronization the consumer must wait on, so a fence here is redundant.
+    auto producerFenced = [&](Operation *consumer, ValueRange operands,
+                              ArrayRef<Operation *> writers) {
+      auto it =
+          unfencedWrites.find(consumer->getParentOfType<FunctionOpInterface>());
+      if (it == unfencedWrites.end())
+        return false;
+      const UnfencedWrites &unfenced = it->second;
+      return !unfenced.unknownRoot && llvm::all_of(writers, [](Operation *op) {
+        return !getGenericDataWrites(op).empty() && isFencedBeforeUse(op);
+      }) && llvm::all_of(operands, [&](Value operand) {
+        Operation *root = getRootAlloc(operand);
+        return root && !unfenced.roots.contains(root);
+      });
+    };
     mod.walk([&](DotOpInterface dotOp) {
       SmallVector<Operation *> copyRegToSharedOps;
+      SmallVector<Value> operands;
       for (const auto &access : getMemoryAccesses(
                dotOp.getOperation(), ttg::SharedKind::Async, RW::Read)) {
+        operands.push_back(access.value);
         llvm::append_range(copyRegToSharedOps,
                            findCopyRegToSharedOps(access.value));
       }
-      if (copyRegToSharedOps.empty())
+      if (copyRegToSharedOps.empty() ||
+          producerFenced(dotOp, operands, copyRegToSharedOps))
         return WalkResult::advance();
 
       OpBuilder builder(dotOp);
@@ -71,7 +98,8 @@ public:
     mod.walk([&](AsyncTMACopyLocalToGlobalOp tmaStoreOp) {
       Value src = tmaStoreOp.getSrc();
       SmallVector<Operation *> copyRegToSharedOps = findCopyRegToSharedOps(src);
-      if (copyRegToSharedOps.empty())
+      if (copyRegToSharedOps.empty() ||
+          producerFenced(tmaStoreOp, src, copyRegToSharedOps))
         return WalkResult::advance();
 
       OpBuilder builder(tmaStoreOp);
@@ -96,7 +124,8 @@ public:
     mod.walk([&](AsyncTMAReduceOp tmaReduceOp) {
       Value src = tmaReduceOp.getSrc();
       SmallVector<Operation *> copyRegToSharedOps = findCopyRegToSharedOps(src);
-      if (copyRegToSharedOps.empty())
+      if (copyRegToSharedOps.empty() ||
+          producerFenced(tmaReduceOp, src, copyRegToSharedOps))
         return WalkResult::advance();
 
       OpBuilder builder(tmaReduceOp);
@@ -117,6 +146,147 @@ public:
   }
 
 private:
+  // True if `op` may sit between a generic-proxy write and its fence: it
+  // neither publishes the write to another thread (barrier arrive, atomic,
+  // global store) nor reads shared memory through the async proxy.
+  static bool canPrecedeFence(Operation *op) {
+    if (isMemoryEffectFree(op))
+      return true;
+    if (op->getNumRegions() != 0)
+      return false;
+    auto memoryEffects = dyn_cast<MemoryEffectOpInterface>(op);
+    if (!memoryEffects)
+      return false;
+    SmallVector<MemoryEffects::EffectInstance> effects;
+    memoryEffects.getEffects(effects);
+    return llvm::all_of(
+        effects, [](const MemoryEffects::EffectInstance &effect) {
+          auto shared = dyn_cast<ttg::SharedMemoryEffect>(&effect);
+          bool generic = shared && shared.getKind() == ttg::SharedKind::Generic;
+          if (isa<MemoryEffects::Write>(effect.getEffect()))
+            return generic;
+          if (isa<MemoryEffects::Read>(effect.getEffect()))
+            return !shared || generic;
+          return true;
+        });
+  }
+
+  // True if a fence_async_shared follows `write` before any op that could
+  // publish it or read it through the async proxy. Looks past the end of an
+  // scf.if branch, but not past a loop body or partition boundary.
+  static bool isFencedBeforeUse(Operation *write) {
+    for (Operation *op = write; op;) {
+      for (Operation *next = op->getNextNode(); next;
+           next = next->getNextNode()) {
+        if (isa<FenceAsyncSharedOp>(next))
+          return true;
+        if (!canPrecedeFence(next))
+          return false;
+      }
+      op = op->getBlock()->getParentOp();
+      if (!isa_and_nonnull<scf::IfOp>(op))
+        return false;
+    }
+    return false;
+  }
+
+  // The allocation `v` is a view of, looking through memdesc views (TLX
+  // local_alias is already rewritten to memdesc_reinterpret by this point),
+  // warp_specialize captures and loop arguments whose initial and yielded
+  // values have the same allocation. Null if it cannot be determined. A view
+  // of another CTA's buffer is not resolved: its writes need a cluster-scope
+  // fence, which this analysis does not distinguish.
+  static Operation *getRootAlloc(Value v) {
+    DenseSet<BlockArgument> activeLoopArgs;
+    return getRootAlloc(v, activeLoopArgs);
+  }
+
+  static Operation *getRootAlloc(Value v,
+                                 DenseSet<BlockArgument> &activeLoopArgs) {
+    while (true) {
+      if (auto arg = dyn_cast<BlockArgument>(v)) {
+        Operation *owner = arg.getOwner()->getParentOp();
+        if (auto partitions =
+                dyn_cast<ttg::WarpSpecializePartitionsOp>(owner)) {
+          v = partitions.getExplicitCaptures()[arg.getArgNumber()];
+          continue;
+        }
+        auto forOp = dyn_cast<scf::ForOp>(owner);
+        // A loop argument reached again while resolving itself is a cycle.
+        if (!forOp || arg.getArgNumber() == 0 ||
+            !activeLoopArgs.insert(arg).second)
+          return nullptr;
+        unsigned i = arg.getArgNumber() - 1;
+        Operation *init = getRootAlloc(forOp.getInitArgs()[i], activeLoopArgs);
+        Value yielded = forOp.getBody()->getTerminator()->getOperand(i);
+        bool sameRoot =
+            yielded == arg || getRootAlloc(yielded, activeLoopArgs) == init;
+        activeLoopArgs.erase(arg);
+        return sameRoot ? init : nullptr;
+      }
+      Operation *op = v.getDefiningOp();
+      if (isa<ttg::LocalAllocOp>(op))
+        return op;
+      if (!op->hasTrait<OpTrait::MemDescViewTrait>() ||
+          isa<MapToRemoteBufferOp>(op))
+        return nullptr;
+      v = op->getOperand(0);
+    }
+  }
+
+  // Allocations with a generic-proxy data write that the kernel did not fence,
+  // and whether any write, fenced or not, goes to an allocation that cannot be
+  // determined (a fence does not help if its scope is wrong, e.g. a write to
+  // another CTA's buffer). Writes through a memdesc_reinterpret alias resolve
+  // to the same allocation, so they count.
+  struct UnfencedWrites {
+    DenseSet<Operation *> roots;
+    bool unknownRoot = false;
+  };
+
+  // The shared-memory values `op` writes through the generic proxy. An
+  // immutable local_alloc with a source declares no effects before allocation,
+  // so it is listed explicitly. mbarrier.init is a generic write, but barriers
+  // are never read through the async proxy as MMA or TMA operands.
+  static SmallVector<Value> getGenericDataWrites(Operation *op) {
+    SmallVector<Value> writes;
+    if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op)) {
+      if (alloc.getSrc())
+        writes.push_back(alloc.getResult());
+      return writes;
+    }
+    SmallVector<Value> barriers;
+    if (auto barrierOp = dyn_cast<ttg::MBarrierOpInterface>(op))
+      llvm::append_range(barriers, barrierOp.getBarriers());
+    for (const auto &access :
+         getMemoryAccesses(op, ttg::SharedKind::Generic, RW::Write)) {
+      if (access.isShared() && !llvm::is_contained(barriers, access.value))
+        writes.push_back(access.value);
+    }
+    return writes;
+  }
+
+  static UnfencedWrites collectUnfencedWrites(FunctionOpInterface func) {
+    UnfencedWrites unfenced;
+    func.walk([&](Operation *op) {
+      SmallVector<Value> writes = getGenericDataWrites(op);
+      if (writes.empty())
+        return;
+      SmallVector<Operation *> roots;
+      for (Value write : writes) {
+        Operation *root = getRootAlloc(write);
+        if (!root) {
+          unfenced.unknownRoot = true;
+          return;
+        }
+        roots.push_back(root);
+      }
+      if (!isFencedBeforeUse(op))
+        unfenced.roots.insert(roots.begin(), roots.end());
+    });
+    return unfenced;
+  }
+
   // Erase `fence` if a matching FenceAsyncSharedOp already exists earlier
   // in the same block, with only pure (memory-effect-free) ops in between.
   void eraseIfDuplicateFence(FenceAsyncSharedOp fence) {
@@ -194,7 +364,7 @@ private:
                               llvm::SetVector<Operation *> &result) {
     // If the value has already been visited we can safely return false as we
     // would early return when true.
-    if (visited.count(operand))
+    if (visited.contains(operand))
       return;
     visited.insert(operand);
     if (!isa<triton::gpu::MemDescType>(operand.getType()))

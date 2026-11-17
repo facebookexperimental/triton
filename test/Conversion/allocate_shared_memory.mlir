@@ -197,7 +197,7 @@ tt.func @convert_layout_scratch_size(%arg0: tensor<128xi32, #src>) {
 // CHECK-LABEL: module @npot_swizzled_alloc
 // CHECK-SAME: ttg.shared = 12288 : i32
 // NPOT-LABEL: module @npot_swizzled_alloc
-// NPOT-SAME: ttg.shared = 16384 : i32
+// NPOT-SAME: ttg.shared = 12288 : i32
 module @npot_swizzled_alloc attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 tt.func @npot_swizzled_alloc() {
   %0 = ttg.local_alloc : () -> !ttg.memdesc<96x64xf16, #npot_shared, #npot_smem, mutable>

@@ -21,6 +21,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 #include "../PatternTritonGPUOpToLLVM.h"
+#include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
 #include "Utility.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
@@ -28,6 +29,8 @@
 #include "mlir/IR/Matchers.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/TypeSwitch.h"
+
+#include <type_traits>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -523,10 +526,13 @@ struct DotOpMFMAConversionHelper {
 
   /// Converts dot operand structure to value table and converts types
   /// appropriate for mfma instructions
+  /// With `kTailFill`, K ends inside the last kBase-element vector, which
+  /// takes that 8-bit fill past K.
   virtual ValueTable getValuesFromDotOperandLayoutStruct(
       Value value, int batch, int nonKRep, int kRepInKWidth, int kWidth,
       int kBase, RankedTensorType tensorType, Type type, bool allowXF32,
-      bool preserveBF16, bool isConstantScale = false) const {
+      bool preserveBF16, bool isConstantScale = false,
+      std::optional<int> kTailFill = std::nullopt) const {
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
     auto elems = unpackTensorElements(loc, value, rewriter, tensorType);
     if (type.isF32() && allowXF32) {
@@ -537,7 +543,9 @@ struct DotOpMFMAConversionHelper {
                    ->getResult(0);
     }
     // number of kBase-element vectors
-    int numVecInKBase = kRepInKWidth * kWidth / kBase;
+    int numVecInKBase = kTailFill
+                            ? llvm::divideCeil(kRepInKWidth * kWidth, kBase)
+                            : kRepInKWidth * kWidth / kBase;
     if (numVecInKBase == 0) {
       numVecInKBase = 1;
       nonKRep /= kBase / (kRepInKWidth * kWidth);
@@ -547,6 +555,12 @@ struct DotOpMFMAConversionHelper {
 
     SmallVector<int64_t> strides =
         computeStrides({batch, nonKRep, numVecInKBase, kBase});
+    int64_t perRep = strides[1];
+    if (kTailFill) {
+      perRep = elems.size() / (batch * nonKRep);
+      strides[0] = nonKRep * perRep;
+      strides[1] = perRep;
+    }
     for (int b = 0; b < batch; ++b) {
       for (int nonK = 0; nonK < nonKRep; nonK++) {
         for (int kBaseVec = 0; kBaseVec < numVecInKBase; kBaseVec++) {
@@ -559,9 +573,11 @@ struct DotOpMFMAConversionHelper {
           Type ty = vec_ty(elemTy, kBase);
           Value rawElems = tb.undef(ty);
           for (int k = 0; k < kBase; ++k) {
-            auto index = linearize({b, nonK, kBaseVec, k}, strides);
-            rawElems =
-                tb.insert_element(ty, rawElems, elems[index], tb.i32_val(k));
+            Value elem =
+                kBaseVec * kBase + k < perRep
+                    ? elems[linearize({b, nonK, kBaseVec, k}, strides)]
+                    : tb.int_val(elemTy.getIntOrFloatBitWidth(), *kTailFill);
+            rawElems = tb.insert_element(ty, rawElems, elem, tb.i32_val(k));
           }
 
           // Step 2: process rawElems based on element type
@@ -654,8 +670,96 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     return rewriter.create(loweredOp)->getResult(0);
   }
 
-  LogicalResult convertScaledDot(DotScaledOp op,
-                                 DotScaledOpAdaptor adaptor) const {
+  // Dense-pack 32 FP6 codes per lane into 24 bytes (code i at bits
+  // [6i, 6i+6), LSB first, matching host packing): vec<8xi32> -> vec<6xi32>.
+  Value packFp6Operand(Value codes) const {
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    Value bytes = b.bitcast(codes, vec_ty(i8_ty, 32));
+    SmallVector<Value> words(6, b.i32_val(0));
+    for (int i = 0; i < 32; ++i) {
+      Value code = LLVM::ZExtOp::create(
+          rewriter, loc, i32_ty, b.extract_element(i8_ty, bytes, b.i32_val(i)));
+      int bitPos = i * 6;
+      int word = bitPos / 32;
+      int shift = bitPos % 32;
+      Value shifted =
+          LLVM::ShlOp::create(rewriter, loc, code, b.i32_val(shift));
+      words[word] = LLVM::OrOp::create(rewriter, loc, words[word], shifted);
+      if (shift > 26) {
+        Value hi =
+            LLVM::LShrOp::create(rewriter, loc, code, b.i32_val(32 - shift));
+        words[word + 1] =
+            LLVM::OrOp::create(rewriter, loc, words[word + 1], hi);
+      }
+    }
+    auto wordTy = vec_ty(i32_ty, 6);
+    Value packed = b.undef(wordTy);
+    for (int w = 0; w < 6; ++w)
+      packed = b.insert_element(wordTy, packed, words[w], b.i32_val(w));
+    return packed;
+  }
+
+  static Value scaledAcc(triton::DotScaledOp op) { return op.getC(); }
+  static Value scaledAcc(triton::amdgpu::ScheduledMfmaScaledOp op) {
+    return op.getAcc();
+  }
+  static Value scaledResult(triton::DotScaledOp op) { return op.getD(); }
+  static Value scaledResult(triton::amdgpu::ScheduledMfmaScaledOp op) {
+    return op.getResult();
+  }
+  static Value scaledAdaptorAcc(triton::DotScaledOp::Adaptor adaptor) {
+    return adaptor.getC();
+  }
+  static Value
+  scaledAdaptorAcc(triton::amdgpu::ScheduledMfmaScaledOp::Adaptor adaptor) {
+    return adaptor.getAcc();
+  }
+  static ScaleDotElemType scaledElemType(triton::DotScaledOp op, bool lhs) {
+    return lhs ? op.getAElemType() : op.getBElemType();
+  }
+  static ScaleDotElemType
+  scaledElemType(triton::amdgpu::ScheduledMfmaScaledOp op, bool lhs) {
+    StringRef format = lhs ? op.getAFormat() : op.getBFormat();
+    if (format == "e4m3")
+      return ScaleDotElemType::E4M3;
+    if (format == "e5m2")
+      return ScaleDotElemType::E5M2;
+    if (format == "e2m3")
+      return ScaleDotElemType::E2M3;
+    if (format == "e3m2")
+      return ScaleDotElemType::E3M2;
+    return ScaleDotElemType::E2M1;
+  }
+
+  template <typename Op, typename Adaptor>
+  LogicalResult convertScaledDot(Op op, Adaptor adaptor) const {
+    // FP6 lowers natively only for K=128: one 16x16x128 step or two
+    // 32x32x64 steps (96-byte packed K, 128 logical values). Wider
+    // dots (e.g. K=256) must decompose earlier - fail cleanly, never
+    // crash. This is the same supported set as the native gate in
+    // AccelerateAMDMatmul.cpp, stated in both places so neither pass
+    // can silently drift from the other.
+    if (isMXFP6ScaleType(scaledElemType(op, true)) ||
+        isMXFP6ScaleType(scaledElemType(op, false))) {
+      ArrayRef<unsigned> instr = mfmaLayout.getInstrShape();
+      // K is A's last dim and B's first dim; validate whichever
+      // operand(s) are FP6, not just A.
+      bool aNative =
+          !isMXFP6ScaleType(scaledElemType(op, true)) ||
+          cast<RankedTensorType>(op.getA().getType()).getShape().back() == 128;
+      bool bNative =
+          !isMXFP6ScaleType(scaledElemType(op, false)) ||
+          cast<RankedTensorType>(op.getB().getType()).getShape().front() == 128;
+      bool instrNative =
+          (instr[0] == 16 && instr[1] == 16 && instr[2] == 128) ||
+          (instr[0] == 32 && instr[1] == 32 && instr[2] == 64);
+      if (!instrNative || !aNative || !bNative)
+        return op.emitError(
+            "native ScaledMFMA for FP6 only supports K=128 as one "
+            "16x16x128 step or two 32x32x64 steps (96-byte packed K, "
+            "128 logical values) yet; decompose the scaled dot before "
+            "LLVM lowering");
+    }
     // Check if this dot has come with priority set by setprio.
     auto setPrioOp = dyn_cast_or_null<ROCDL::SetPrioOp>(op->getPrevNode());
 
@@ -669,7 +773,7 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     Value b = op.getB();
     Value aScale = op.getAScale();
     Value bScale = op.getBScale();
-    FailureOr<CDPins> cdPins = getCDPins(op.getOperation(), op.getC());
+    FailureOr<CDPins> cdPins = getCDPins(op.getOperation(), scaledAcc(op));
     if (failed(cdPins))
       return failure();
     if ((aScale && !bScale) || (!aScale && bScale)) {
@@ -681,14 +785,14 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
                                           aScale.getDefiningOp());
     bool isBScaleConstant = bScale && isa<arith::ConstantOp, triton::SplatOp>(
                                           bScale.getDefiningOp());
-    Value d = op.getD();
+    Value d = scaledResult(op);
     auto aTensorTy = cast<RankedTensorType>(a.getType());
     auto bTensorTy = cast<RankedTensorType>(b.getType());
     auto dTensorTy = cast<RankedTensorType>(d.getType());
     auto elemTyA = aTensorTy.getElementType();
     auto elemTyB = bTensorTy.getElementType();
-    ScaleDotElemType aElemType = op.getAElemType();
-    ScaleDotElemType bElemType = op.getBElemType();
+    ScaleDotElemType aElemType = scaledElemType(op, true);
+    ScaleDotElemType bElemType = scaledElemType(op, false);
 
     int64_t kDimOperandSize = aTensorTy.getShape().back();
 
@@ -733,8 +837,16 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     unsigned aKBase = *aKBaseOr;
     unsigned bKBase = *bKBaseOr;
 
-    int aKWidth = aKBase;
-    int bKWidth = bKBase;
+    // FP6 layout chunks hold 32 codes per lane; the x3/4 packed width
+    // (24 bytes) is produced by packFp6Operand after extraction. The
+    // mixed widths below are intentional: aKWidth/bKWidth count
+    // unpacked logical values (kBase, e.g. 128) so the layout/rep
+    // queries see the logical K, while aKBase/bKBase count packed
+    // bytes (kBase * 3/4, e.g. 96) for the instruction K size.
+    int aKWidth = isMXFP6ScaleType(aElemType) ? static_cast<int>(kBase)
+                                              : static_cast<int>(aKBase);
+    int bKWidth = isMXFP6ScaleType(bElemType) ? static_cast<int>(kBase)
+                                              : static_cast<int>(bKBase);
 
     const auto kDimInstrSize = mfmaLayout.getInstrShapeForOperand(aKBase, 0)[1];
 
@@ -750,13 +862,32 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     Value loadedB = adaptor.getB();
     Value loadedAScale = adaptor.getAScale();
     Value loadedBScale = adaptor.getBScale();
-    Value loadedC = adaptor.getC();
+    Value loadedC = scaledAdaptorAcc(adaptor);
 
+    // The target dot-legality query allows an NPOT K whose last MFMA is zero
+    // past K.
+    bool zeroKTail = !llvm::isPowerOf2_64(kDimOperandSize) &&
+                     kDimOperandSize % kDimInstrSize != 0;
     auto numRepM = repA[1];
     auto numRepN = repB[2];
-    auto numRepK = repA[2];
+    int64_t numRepK =
+        zeroKTail ? llvm::divideCeil(kDimOperandSize, kDimInstrSize) : repA[2];
     auto numRepB = repA[0];
     assert(repA[0] == repB[0]);
+    // An NPOT scale K takes the scale layout's NPOT branch, whose registers the
+    // power-of-two packing below cannot index.
+    bool npotScale =
+        existBothScales &&
+        !llvm::isPowerOf2_64(
+            cast<RankedTensorType>(aScale.getType()).getShape().back());
+    int perMfma = zeroKTail ? 2 : 1;
+
+    int numVecInKBase = numRepK * aKWidth / aKBase;
+    // For FP6 the truncating division above is exact per instruction
+    // rep: 128/96 and 64/48 both truncate to 1 packed vector per rep,
+    // so numVecInKBase counts one packed vector for each of the
+    // numRepK reps (one rep for 16x16x128, two for 32x32x64 at
+    // K=128). See the mixed packed/unpacked comment at aKWidth.
 
     // Scaled MFMA instructions expect scale operands as 32-bit values,
     // even though each individual scale is only 8 bits. To reduce register
@@ -765,49 +896,122 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     // along the K dimension first; if there aren’t enough values in K, we
     // continue along the non-K dimension.
     // TODO: Support opSel selection for constant scales stored in SGPRs.
-    const int scaleAKBase =
-        isAScaleConstant ? 1 : std::min(4, static_cast<int>(numRepK * numRepM));
-    const int scaleBKBase =
-        isBScaleConstant ? 1 : std::min(4, static_cast<int>(numRepK * numRepN));
+    int scaleAKBase = isAScaleConstant || npotScale
+                          ? 1
+                          : std::min(4, static_cast<int>(numRepK * numRepM));
+    int scaleBKBase = isBScaleConstant || npotScale
+                          ? 1
+                          : std::min(4, static_cast<int>(numRepK * numRepN));
 
-    int akPackedVals =
-        isAScaleConstant ? 1 : std::min(4, static_cast<int>(numRepK));
-    int bkPackedVals =
-        isBScaleConstant ? 1 : std::min(4, static_cast<int>(numRepK));
+    int akPackedVals = isAScaleConstant || npotScale
+                           ? 1
+                           : std::min(4, static_cast<int>(numRepK));
+    int bkPackedVals = isBScaleConstant || npotScale
+                           ? 1
+                           : std::min(4, static_cast<int>(numRepK));
 
     assert(scaleAKBase % akPackedVals == 0 && scaleBKBase % bkPackedVals == 0);
     int aNonKPackedVals = scaleAKBase / akPackedVals;
     int bNonKPackedVals = scaleBKBase / bkPackedVals;
 
+    std::optional<int> kTailFill =
+        zeroKTail ? std::make_optional(0) : std::nullopt;
     auto operandA = getValuesFromDotOperandLayoutStruct(
-        loadedA, numRepB, numRepM, numRepK, aKWidth, aKBase, aTensorTy,
-        aTensorTy.getElementType(), allowXF32,
-        /*preserveBF16=*/false);
+        loadedA, numRepB, numRepM, numRepK, aKWidth,
+        isMXFP6ScaleType(aElemType) ? static_cast<int>(kBase)
+                                    : static_cast<int>(aKBase),
+        aTensorTy, aTensorTy.getElementType(), allowXF32,
+        /*preserveBF16=*/false, /*isConstantScale=*/false, kTailFill);
     auto operandB = getValuesFromDotOperandLayoutStruct(
-        loadedB, numRepB, numRepN, numRepK, bKWidth, bKBase, bTensorTy,
-        bTensorTy.getElementType(), allowXF32,
-        /*preserveBF16=*/false);
+        loadedB, numRepB, numRepN, numRepK, bKWidth,
+        isMXFP6ScaleType(bElemType) ? static_cast<int>(kBase)
+                                    : static_cast<int>(bKBase),
+        bTensorTy, bTensorTy.getElementType(), allowXF32,
+        /*preserveBF16=*/false, /*isConstantScale=*/false, kTailFill);
+    if (isMXFP6ScaleType(aElemType))
+      for (auto &[key, val] : operandA)
+        val = packFp6Operand(val);
+    if (isMXFP6ScaleType(bElemType))
+      for (auto &[key, val] : operandB)
+        val = packFp6Operand(val);
 
     // Scales have the same replica distributions as their corresponding
     // operands.
     ValueTable operandAScale;
     ValueTable operandBScale;
-    if (existBothScales) {
+    bool packedScales = false;
+    int packedSelectorA = 0, packedSelectorB = 0;
+    if (npotScale) {
+      // 4 scales per i32: MFMA k reads byte k * perMfma. A zero tail reads 2
+      // per MFMA, the second for lanes 32-63, and pads past K with 127 (1.0),
+      // since E8M0 0xFF is NaN.
       auto aScaleTensorTy = cast<RankedTensorType>(aScale.getType());
       operandAScale = getValuesFromDotOperandLayoutStruct(
-          loadedAScale, numRepB, numRepM, numRepK, scaleKWidth, scaleAKBase,
-          aScaleTensorTy, aScaleTensorTy.getElementType(), allowXF32,
-          /*preserveBF16=*/false, isAScaleConstant);
-
+          loadedAScale, numRepB, numRepM, numRepK * perMfma, scaleKWidth,
+          /*kBase=*/4, aScaleTensorTy, aScaleTensorTy.getElementType(),
+          allowXF32, /*preserveBF16=*/false, isAScaleConstant,
+          /*kTailFill=*/127);
       auto bScaleTensorTy = cast<RankedTensorType>(bScale.getType());
       operandBScale = getValuesFromDotOperandLayoutStruct(
-          loadedBScale, numRepB, numRepN, numRepK, scaleKWidth, scaleBKBase,
-          bScaleTensorTy, bScaleTensorTy.getElementType(), allowXF32,
-          /*preserveBF16=*/false, isBScaleConstant);
+          loadedBScale, numRepB, numRepN, numRepK * perMfma, scaleKWidth,
+          /*kBase=*/4, bScaleTensorTy, bScaleTensorTy.getElementType(),
+          allowXF32, /*preserveBF16=*/false, isBScaleConstant,
+          /*kTailFill=*/127);
+      if (perMfma == 2) {
+        auto tb = TritonLLVMOpBuilder(loc, rewriter);
+        Value shift = tb.shl(tb.lshr(getLaneId(rewriter, loc), tb.i32_val(5)),
+                             tb.i32_val(3));
+        for (ValueTable *scales : {&operandAScale, &operandBScale})
+          for (auto &[key, packed] : *scales)
+            packed = tb.lshr(packed, shift);
+      }
+    } else if (existBothScales) {
+      auto aScaleTensorTy = cast<RankedTensorType>(aScale.getType());
+      auto bScaleTensorTy = cast<RankedTensorType>(bScale.getType());
+      packedScales = aScaleTensorTy.getElementType().isInteger(32);
+      if (packedScales) {
+        scaleAKBase =
+            isAScaleConstant
+                ? 1
+                : std::min(4, numVecInKBase * static_cast<int>(numRepM));
+        scaleBKBase =
+            isBScaleConstant
+                ? 1
+                : std::min(4, numVecInKBase * static_cast<int>(numRepN));
+        akPackedVals = isAScaleConstant ? 1 : std::min(4, numVecInKBase);
+        bkPackedVals = isBScaleConstant ? 1 : std::min(4, numVecInKBase);
+        aNonKPackedVals = scaleAKBase / akPackedVals;
+        bNonKPackedVals = scaleBKBase / bkPackedVals;
+        auto scheduled =
+            dyn_cast<triton::amdgpu::ScheduledMfmaScaledOp>(op.getOperation());
+        auto aValues =
+            unpackTensorElements(loc, loadedAScale, rewriter, aScaleTensorTy);
+        auto bValues =
+            unpackTensorElements(loc, loadedBScale, rewriter, bScaleTensorTy);
+        if (!scheduled || numRepB != 1 || numRepM != 1 || numRepN != 1 ||
+            numVecInKBase > 2 || aValues.size() != 1 || bValues.size() != 1)
+          return op.emitError(
+              "packed scales require one dword per lane and at most two "
+              "native K fragments per wave");
+        packedSelectorA = scheduled.getAScaleSelectorAttr().getInt();
+        packedSelectorB = scheduled.getBScaleSelectorAttr().getInt();
+        operandAScale[{0, 0, 0}] = aValues.front();
+        operandBScale[{0, 0, 0}] = bValues.front();
+      } else {
+        operandAScale = getValuesFromDotOperandLayoutStruct(
+            loadedAScale, numRepB, numRepM, numRepK, scaleKWidth, scaleAKBase,
+            aScaleTensorTy, aScaleTensorTy.getElementType(), allowXF32,
+            /*preserveBF16=*/false, isAScaleConstant);
+        operandBScale = getValuesFromDotOperandLayoutStruct(
+            loadedBScale, numRepB, numRepN, numRepK, scaleKWidth, scaleBKBase,
+            bScaleTensorTy, bScaleTensorTy.getElementType(), allowXF32,
+            /*preserveBF16=*/false, isBScaleConstant);
+      }
     }
 
     auto dstElemTy = dTensorTy.getElementType();
-    auto fc = unpackTensorElements(loc, loadedC, rewriter, op.getC().getType());
+    auto fc =
+        unpackTensorElements(loc, loadedC, rewriter, scaledAcc(op).getType());
 
     unsigned warpSize = triton::gpu::lookupThreadsPerWarp(rewriter);
     // compute number of output elements that each thread holds for one MFMA
@@ -815,8 +1019,6 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     const int subBlocks =
         getNumSubmatrices(aTensorTy.getElementType(), mDim, nDim);
     auto elemsPerVec = mDim * nDim * subBlocks / warpSize;
-    int numVecInKBase = numRepK * aKWidth / aKBase;
-
     Value firstMfma;
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
     auto vecTy = vec_ty(dstElemTy, elemsPerVec);
@@ -876,7 +1078,16 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
                 int nScale = n / bNonKPackedVals;
                 opSelA = (m * numRepK + k) % (aNonKPackedVals * akPackedVals);
                 opSelB = (n * numRepK + k) % (bNonKPackedVals * bkPackedVals);
-
+                if (npotScale) {
+                  akScale = bkScale = k * perMfma / 4;
+                  opSelA = opSelB = k * perMfma % 4;
+                } else if (packedScales) {
+                  // The verifier restricts packed typed operands to 32x32x64
+                  // FP8. Each K64 fragment advances by two K32 scale bytes;
+                  // 16x16x128 uses the unpacked scale path above.
+                  opSelA = packedSelectorA + 2 * k;
+                  opSelB = packedSelectorB + 2 * k;
+                }
                 if (mfmaLayout.getIsTransposed()) {
                   acc = generateScaledMFMAOp(
                       intrinsicName, operandB[{b, n, k}], operandA[{b, m, k}],
@@ -911,8 +1122,10 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
             // Pin D right after this pass's MFMAs.
             acc = pinRegClass(acc, cdPins->d);
             acc = reduceSubBlocks(subBlocks, acc);
+            // A zero tail duplicates no K, so the sum needs no scaling.
             adjustAccForSmallKDim(fc, acc, dstElemTy, b, m, n, numRepM, numRepN,
-                                  kDimInstrSize, kDimOperandSize, elemsPerVec);
+                                  zeroKTail ? kDimOperandSize : kDimInstrSize,
+                                  kDimOperandSize, elemsPerVec);
           }
         }
       }
@@ -968,10 +1181,11 @@ LogicalResult convertMFMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
   return helper.convertDot(op, adaptor);
 }
 
-LogicalResult convertScaledMFMA(triton::DotScaledOp op,
-                                triton::DotScaledOp::Adaptor adaptor,
-                                const LLVMTypeConverter *typeConverter,
-                                ConversionPatternRewriter &rewriter) {
+template <typename Op, typename Adaptor>
+static LogicalResult
+convertScaledMFMAImpl(Op op, Adaptor adaptor,
+                      const LLVMTypeConverter *typeConverter,
+                      ConversionPatternRewriter &rewriter) {
   assert(isa<DotOperandEncodingAttr>(op.getA().getType().getEncoding()) &&
          isa<DotOperandEncodingAttr>(op.getB().getType().getEncoding()) &&
          "Both lhs and rhs should be in DotOperand layout.");
@@ -1005,8 +1219,18 @@ LogicalResult convertScaledMFMA(triton::DotScaledOp op,
         "If scales exist, both LhsScale and RhsScale should be linear layout.");
   }
 
-  auto cTensorTy = op.getC().getType();
-  auto dTensorTy = op.getD().getType();
+  auto cTensorTy = [&]() {
+    if constexpr (std::is_same_v<Op, triton::amdgpu::ScheduledMfmaScaledOp>)
+      return op.getAcc().getType();
+    else
+      return op.getC().getType();
+  }();
+  auto dTensorTy = [&]() {
+    if constexpr (std::is_same_v<Op, triton::amdgpu::ScheduledMfmaScaledOp>)
+      return op.getResult().getType();
+    else
+      return op.getD().getType();
+  }();
   assert(isa<AMDMfmaEncodingAttr>(cTensorTy.getEncoding()) &&
          "Currently, we only support C with a mfma layout.");
 
@@ -1022,5 +1246,20 @@ LogicalResult convertScaledMFMA(triton::DotScaledOp op,
                                          loc);
 
   return helper.convertScaledDot(op, adaptor);
+}
+
+LogicalResult convertScaledMFMA(triton::DotScaledOp op,
+                                triton::DotScaledOp::Adaptor adaptor,
+                                const LLVMTypeConverter *typeConverter,
+                                ConversionPatternRewriter &rewriter) {
+  return convertScaledMFMAImpl(op, adaptor, typeConverter, rewriter);
+}
+
+LogicalResult convertScheduledScaledMFMA(
+    triton::amdgpu::ScheduledMfmaScaledOp op,
+    triton::amdgpu::ScheduledMfmaScaledOp::Adaptor adaptor,
+    const LLVMTypeConverter *typeConverter,
+    ConversionPatternRewriter &rewriter) {
+  return convertScaledMFMAImpl(op, adaptor, typeConverter, rewriter);
 }
 } // namespace mlir::triton::AMD

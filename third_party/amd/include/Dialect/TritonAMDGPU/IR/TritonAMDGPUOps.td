@@ -347,6 +347,7 @@ def BufferLoadToLocalOp
           "buffer_load_to_local",
           [GlobalToLocalCopyTrait, AttrSizedOperandSegments, BufferOpInterface,
            DeclareOpInterfaceMethods<PredicatedOpInterface>,
+           MixedRadixLayoutTrait,
            TypesMatchWith<"dest element type matches pointee type of ptr",
                           "dest", "ptr", "$_self",
                           "::mlir::triton::elementTypeMatchesPointee">,
@@ -651,7 +652,7 @@ def PackedDot2Op
 // ScaledUpcastFp4Op
 //===----------------------------------------------------------------------===//
 
-def ScaledUpcastFp4Op : TT_AMDGPU_Op<"scaled_upcast_fp4", [Pure, DeclareOpInterfaceMethods<CastFpOpInterface>]> {
+def ScaledUpcastFp4Op : TT_AMDGPU_Op<"scaled_upcast_fp4", [Pure, EfficientLayoutOpInterface, DeclareOpInterfaceMethods<CastFpOpInterface>]> {
   let summary = "Upcast fp4 and then multiply scale";
 
   let description = [{
@@ -664,6 +665,10 @@ def ScaledUpcastFp4Op : TT_AMDGPU_Op<"scaled_upcast_fp4", [Pure, DeclareOpInterf
 
     The `axis` attribute specifies the axis along which the fp4 elements are
     packed.
+
+    The result encoding is always a layout constraint: the conversion consumes
+    register-consecutive groups along `axis`, so layout conversion will not
+    rewrite this op.
   }];
 
   let arguments = (ins RankedTensorOf<[I8]>:$input,
@@ -686,6 +691,8 @@ def ScaledUpcastFp4Op : TT_AMDGPU_Op<"scaled_upcast_fp4", [Pure, DeclareOpInterf
   }];
 
   let extraClassDeclaration = [{
+    bool getEfficientLayout() { return true; }
+
     static std::optional<mlir::triton::LinearLayout>
     computeScaleLayout(const mlir::triton::LinearLayout &outputLayout,
                        int64_t axis, int64_t elementsPerScale);
@@ -701,7 +708,7 @@ def ScaledUpcastFp4Op : TT_AMDGPU_Op<"scaled_upcast_fp4", [Pure, DeclareOpInterf
 def ScaledUpcastFp8Op
     : TT_AMDGPU_Op<"scaled_upcast_fp8",
                    [Pure, Elementwise, SameOperandsAndResultShape,
-                    SameOperandsAndResultEncoding,
+                    SameOperandsAndResultEncoding, EfficientLayoutOpInterface,
                     DeclareOpInterfaceMethods<CastFpOpInterface>]> {
   let summary = "Upcast Fp8 and then multiply scale";
 
@@ -709,16 +716,25 @@ def ScaledUpcastFp8Op
     Upcast fp8 (e4m3/e5m2) values and multiply with the given E8M0 scale
     encoded as BF16. This maps to `v_cvt_scalef32_*` intrinsics
     on the AMD CDNA4 architecture.
+
+    The result encoding is always a layout constraint: the conversion consumes
+    register-consecutive groups, so layout conversion will not rewrite this op.
   }];
 
   let arguments = (ins RankedTensorOf<[AnyTypeOf<[F8E4M3FN, F8E5M2]>]>:$input,
       RankedTensorOf<[AnyTypeOf<[BF16, I8]>]>:$scale);
   let results = (outs RankedTensorOf<[AnyTypeOf<[F16, BF16]>]>:$output);
 
+  let extraClassDeclaration = [{
+    bool getEfficientLayout() { return true; }
+  }];
+
   let assemblyFormat = [{
     $input `scale` $scale attr-dict
         `:` type($input) `,` type($scale) `->` type($output)
   }];
+
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1180,15 +1196,18 @@ def ScheduledMfmaScaledOp : TT_AMDGPU_Op<"scheduled_mfma_scaled"> {
     packed K layout needs a radix-3 repeat for FP6 that landed
     LinearLayout cannot express yet, so v1 uses this padded form; each
     lane feeds the packed bytes (8/6/4 x i32) per step through kWidth=8
-    dot-operand windows. `a_scale` and
-    `b_scale` hold one E8M0 byte per 32 logical values: shapes are
-    [M, logicalK/32] and [N, logicalK/32] in i8 storage.
+    dot-operand windows. `a_scale` and `b_scale` normally hold one E8M0 byte
+    per 32 logical values: shapes are [M, logicalK/32] and [N, logicalK/32]
+    in i8 storage. A single native FP8 step may instead consume one packed
+    i32 scale word per lane. In that form, `a_scale_selector` and
+    `b_scale_selector` select the first E8M0 byte passed to the instruction
+    without extracting it first. A two-step K128 chain reuses the word and
+    adds two to each selector for its second K64 instruction.
 
-    Only the transient contract is supported today: `accumulator_role` must
-    be "transient", `resident_operand` must be "none", and
-    `accumulator_register_class` must be "auto"; persistent scaled chains
-    and their register pinning are not modeled yet. Completion is
-    represented separately by `mfma_commit`, as in `scheduled_mfma`:
+    Packed-storage I8 operands use the transient contract. Typed FP8 dot
+    operands also support persistent accumulator chains and explicit AGPR or
+    VGPR placement, matching `scheduled_mfma`. Completion is represented
+    separately by `mfma_commit`:
     `mfma_commit` accepts the scaled 16x16x128 and 32x32x64 accumulator
     layouts (and live scaled i8 dot operands) and applies the modeled
     scaled drain wait at the boundary.
@@ -1200,7 +1219,8 @@ def ScheduledMfmaScaledOp : TT_AMDGPU_Op<"scheduled_mfma_scaled"> {
       TT_Tensor:$a_scale, TT_Tensor:$b_scale, StrAttr:$a_format,
       StrAttr:$b_format, StrAttr:$resident_operand,
       StrAttr:$accumulator_role, StrAttr:$accumulator_register_class,
-      BoolAttr:$initialize);
+      BoolAttr:$initialize, OptionalAttr<I32Attr>:$a_scale_selector,
+      OptionalAttr<I32Attr>:$b_scale_selector);
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
@@ -1863,6 +1883,35 @@ def ClusterBarrierWaitOp : TT_AMDGPU_Op<"cluster_barrier_wait"> {
     Arrive and wait operations must come in pairs. Waiting before arriving or arriving
     more than once without a corresponding wait will result in undefined behavior.
     This operation is a no-op for a single-CTA cluster.
+  }];
+  let assemblyFormat = "attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// WorkgroupBarrierSignalOp / WorkgroupBarrierWaitOp
+//===----------------------------------------------------------------------===//
+
+def WorkgroupBarrierSignalOp : TT_AMDGPU_Op<"workgroup_barrier_signal"> {
+  let summary = "Arrive at the workgroup barrier without waiting";
+  let description = [{
+    First half of a split workgroup barrier. Shared-memory operations issued
+    before the signal are visible to every thread of the workgroup after its
+    matching `amdg.workgroup_barrier_wait`. Work between the signal and the
+    wait overlaps the rendezvous.
+
+    By convention, each signal is followed in the same block by its wait,
+    with no other signal, wait, or shared-memory access in between. Membar
+    relies on this and treats the pair as one workgroup barrier.
+  }];
+  let assemblyFormat = "attr-dict";
+}
+
+def WorkgroupBarrierWaitOp : TT_AMDGPU_Op<"workgroup_barrier_wait"> {
+  let summary = "Wait for the workgroup barrier signalled earlier";
+  let description = [{
+    Second half of a split workgroup barrier: waits until every thread of
+    the workgroup has executed its `amdg.workgroup_barrier_signal`. See
+    `amdg.workgroup_barrier_signal` for the pairing convention.
   }];
   let assemblyFormat = "attr-dict";
 }

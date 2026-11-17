@@ -28,7 +28,6 @@
 // Below headers will allow registration to ROCm passes
 #include "TritonAMDGPUToLLVM/Passes.h"
 #include "TritonAMDGPUTransforms/Passes.h"
-#include "TritonAMDGPUTransforms/TritonGPUConversion.h"
 
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -113,7 +112,6 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerConvertNVGPUToLLVMPass();
   mlir::triton::registerAllocateSharedMemoryNvPass();
   mlir::triton::registerCudaWarningsPass();
-  mlir::triton::registerSetMinimumSharedMemoryPass();
   mlir::registerLLVMDIScope();
   mlir::LLVM::registerInlinerInterface(registry);
   mlir::registerLLVMDILocalVariable();
@@ -214,4 +212,6 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
       mlir::triton::gluon::GluonDialect, mlir::triton::tlx::TLXDialect>();
 
   mlir::triton::AMD::registerSchedulingBarrierExternalModel(registry);
+  mlir::triton::gpu::registerNpotTargetLegality(registry);
+  mlir::triton::amdgpu::registerNpotTargetLegality(registry);
 }

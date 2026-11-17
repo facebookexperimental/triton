@@ -20,9 +20,11 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FormatVariadic.h"
 
 #define DEBUG_TYPE "ttg-utility"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -104,9 +106,31 @@ bool containsPinnedEncoding(Attribute encoding) {
   return pinned;
 }
 
-SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
-                                                const ArrayRef<int64_t> &shape,
-                                                Type eltType, int numWarps) {
+bool hasMmaV3WarpgroupsOnN(ArrayRef<int64_t> shape, int numWarps) {
+  int64_t split = numWarps / 4;
+  return triton::tools::isNpotAllowed() && split > 1 &&
+         !llvm::isPowerOf2_64(shape[0]) && shape[0] % (64 * split) != 0;
+}
+
+std::optional<std::string>
+getWarpPlacementUnsupportedReason(ArrayRef<int64_t> shape,
+                                  ArrayRef<unsigned> warps,
+                                  ArrayRef<unsigned> instrShape) {
+  for (auto [dim, size] : llvm::enumerate(shape)) {
+    int64_t twoPart = LinearLayout::twoPartOf(static_cast<int32_t>(size));
+    if (twoPart % (warps[dim] * LinearLayout::twoPartOf(instrShape[dim])) != 0)
+      return llvm::formatv("NPOT dot is not yet supported with {0} warps of "
+                           "{1} on dim {2}, whose power-of-two part is {3}",
+                           warps[dim], instrShape[dim], dim, twoPart)
+          .str();
+  }
+  return std::nullopt;
+}
+
+SmallVector<unsigned, 3>
+mmaVersionToInstrShape(int version, const ArrayRef<int64_t> &shape,
+                       Type eltType, int numWarps,
+                       function_ref<bool(unsigned)> isLegalN) {
   if (version == 1)
     return {16, 16};
   else if (version == 2) {
@@ -140,12 +164,16 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
     unsigned m = 16;
     unsigned mWarps = std::max<unsigned>(shape[0] / m, 1);
     unsigned nWarps = std::max<unsigned>(numWarps / mWarps, 1);
+    if (hasMmaV3WarpgroupsOnN(shape, numWarps))
+      nWarps = numWarps / 4;
     unsigned maxN = std::max<unsigned>(shape[1] / nWarps, 8);
     for (auto n : validN) {
-      if (shape[1] % n == 0 && n <= maxN) {
+      if (shape[1] % n == 0 && n <= maxN && (!isLegalN || isLegalN(n))) {
         return {m, n, k};
       }
     }
+    if (isLegalN)
+      return mmaVersionToInstrShape(version, shape, eltType, numWarps);
 
     assert(false && "type not supported");
     return {0, 0, 0};
@@ -263,6 +291,10 @@ unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
   unsigned maxMultiple = std::max(maxMultipleBytes / elemNumBytes, 1u);
   unsigned maxContig =
       std::min(valInfo.getContiguity(order[0]), shapePerCTA[order[0]]);
+  // A contiguous run (e.g. from a tt.contiguity hint) need not be a power of
+  // two and must hold whole vectors, so use its largest power-of-two factor.
+  // A hint of 0 gives no run to vectorize.
+  maxContig = maxContig ? 1u << llvm::countr_zero(maxContig) : 1u;
   unsigned alignment = std::min(maxMultiple, maxContig);
   // Some targets implement byte-aligned global vector loads in hardware, so no
   // residual element-alignment proof is required. Axis analysis must still
@@ -277,6 +309,13 @@ unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
                    axisInfoAnalysis.getMaskAlignment(load.getMask(), order[0]));
     alignment = std::max(alignment, unalignedAlignment);
   }
+  // The store lowering splits a masked store into accesses no wider than the
+  // mask's alignment, so a wider layout only spreads each warp's writes over
+  // more memory sectors.
+  if (auto store = dyn_cast<triton::StoreOp>(op); store && store.getMask())
+    alignment =
+        std::min(alignment,
+                 axisInfoAnalysis.getMaskAlignment(store.getMask(), order[0]));
   unsigned maxElementsPerThread = getMaxElementsPerThread(op, maxVecBits);
   unsigned currPerThread = std::min(alignment, maxElementsPerThread);
   LDBG("elemNumBytes: " << elemNumBytes
@@ -435,7 +474,7 @@ std::string GraphDumper::emitEdge(const std::string &srcId,
 
 std::string GraphDumper::emitValueNode(Value value) const {
   NodeInfo info = onValue(value);
-  if (info.find("label") == info.end()) {
+  if (!info.contains("label")) {
     std::string shapeStr = getShapeStr(value.getType());
     if (auto arg = mlir::dyn_cast<BlockArgument>(value))
       info["label"] =
@@ -448,7 +487,7 @@ std::string GraphDumper::emitValueNode(Value value) const {
 
 std::string GraphDumper::emitOperationNode(Operation *op) const {
   NodeInfo info = onOperation(op);
-  if (info.find("label") == info.end())
+  if (!info.contains("label"))
     info["label"] = op->getName().getStringRef().str();
   return emitNode(getUniqueId(op), info);
 }
@@ -693,12 +732,23 @@ static bool isSingleValue(Value value) {
   return true;
 }
 
+// Besides Blocked, tt.scan lowers in place the mixed-radix layouts it allows;
+// any other layout keeps its convert.
+static bool isScanEncoding(triton::ScanOp scan, Attribute encoding) {
+  if (isa<triton::gpu::BlockedEncodingAttr>(encoding))
+    return true;
+  auto type = cast<RankedTensorType>(scan.getOperand(0).getType())
+                  .cloneWithEncoding(encoding);
+  return !triton::gpu::isRadix2Encoding(encoding) &&
+         triton::gpu::hasExactLayoutAt(type) &&
+         !scan.getMixedRadixUnsupportedReason(
+             triton::gpu::toLinearLayout(type));
+}
+
 static Attribute inferSrcEncodingAtAnyShape(Operation *op, Attribute encoding) {
-  if (isa<triton::ScanOp>(op)) {
-    // Scan only supports blocked encoding at the moment.
-    if (!isa<triton::gpu::BlockedEncodingAttr>(encoding))
+  if (auto scan = dyn_cast<triton::ScanOp>(op))
+    if (!isScanEncoding(scan, encoding))
       return {};
-  }
 
   if (isa<triton::gpu::CastFpOpInterface>(op))
     return {};
@@ -732,10 +782,9 @@ static Attribute inferSrcEncodingAtAnyShape(Operation *op, Attribute encoding) {
 }
 
 static Attribute inferDstEncodingAtAnyShape(Operation *op, Attribute encoding) {
-  if (isa<triton::ScanOp>(op)) {
-    if (!isa<triton::gpu::BlockedEncodingAttr>(encoding))
+  if (auto scan = dyn_cast<triton::ScanOp>(op))
+    if (!isScanEncoding(scan, encoding))
       return {};
-  }
   if (isa<triton::gpu::CastFpOpInterface>(op))
     return {};
 
@@ -871,10 +920,8 @@ bool canBeRematerialized(Operation *op) {
     return !isExpensiveLocalLoad(op);
   if (isa<AtomicOpInterface, DotOpInterface>(op))
     return false;
-  if (auto gather = dyn_cast<GatherOp>(op))
-    return !gather.getEfficientLayout();
-  if (auto reshape = dyn_cast<ReshapeOp>(op))
-    return !reshape.getEfficientLayout();
+  if (ttg::hasEfficientLayout(op))
+    return false;
 
   if (isa<scf::WhileOp, scf::ConditionOp>(op))
     return false;
@@ -2258,6 +2305,18 @@ std::optional<bool> getBoolFromConstant(Value cst) {
     return boolAttr.getValue();
   }
   return std::nullopt;
+}
+
+DescriptorLoadOp getTwoCTADescriptorLoad(Value value) {
+  while (Operation *op = value.getDefiningOp()) {
+    if (auto load = dyn_cast<DescriptorLoadOp>(op))
+      return load;
+    if ((!isa<ttg::ConvertLayoutOp>(op) && !isView(op)) ||
+        op->getNumOperands() != 1)
+      return {};
+    value = op->getOperand(0);
+  }
+  return {};
 }
 
 } // namespace mlir::triton

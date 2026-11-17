@@ -14,6 +14,7 @@
 #include <functional>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <utility>
 
 namespace mlir {
@@ -34,6 +35,13 @@ class SwizzledSharedEncodingAttr;
 // bounds, including triangular nests; resolve warp-specialize captures.
 bool haveEquivalentWarpSpecializeLoopNests(ArrayRef<scf::ForOp> lhs,
                                            ArrayRef<scf::ForOp> rhs);
+
+// True when `op` implements EfficientLayoutOpInterface and has pinned its
+// result layout.
+inline bool hasEfficientLayout(Operation *op) {
+  auto iface = dyn_cast_if_present<EfficientLayoutOpInterface>(op);
+  return iface && iface.getEfficientLayout();
+}
 } // namespace gpu
 } // namespace triton
 
@@ -42,9 +50,23 @@ bool haveEquivalentWarpSpecializeLoopNests(ArrayRef<scf::ForOp> lhs,
 // Version = 1: <m, n>
 // Version = 2: <1, m, n>
 // Version = 3: <m, n, k>
-SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
-                                                const ArrayRef<int64_t> &shape,
-                                                Type type, int numWarps);
+// For version 3, isLegalN (if set) picks the largest n the operands can be
+// tiled by, falling back to the unfiltered pick when there is none.
+SmallVector<unsigned, 3>
+mmaVersionToInstrShape(int version, const ArrayRef<int64_t> &shape, Type type,
+                       int numWarps,
+                       function_ref<bool(unsigned)> isLegalN = nullptr);
+
+// Under TRITON_ALLOW_NPOT, whether MMAv3's warpgroups go on N: splitting an
+// NPOT M would leave a warpgroup a share that is not a multiple of 64.
+bool hasMmaV3WarpgroupsOnN(ArrayRef<int64_t> shape, int numWarps);
+
+// Why `warps` of `instrShape` can't sit on each dim's power-of-two part, as
+// the mixed-radix layout puts them, or std::nullopt.
+std::optional<std::string>
+getWarpPlacementUnsupportedReason(ArrayRef<int64_t> shape,
+                                  ArrayRef<unsigned> warps,
+                                  ArrayRef<unsigned> instrShape);
 
 // Return the operand used to access the memory in the operation
 Value getMemAccessPtr(Operation *op);
@@ -475,6 +497,11 @@ SmallVector<Value> getTiedArgs(Operation *op, int resultIdx);
 
 // Get a boolean if the Value is an arith::ConstantOp
 std::optional<bool> getBoolFromConstant(Value cst);
+
+// The descriptor load a tensor-level value comes from, walking back
+// through convert_layout and single-operand view ops, or null. A 2-CTA
+// MMA's B must trace to one: Transform2CTALoads splits only that load.
+DescriptorLoadOp getTwoCTADescriptorLoad(Value value);
 
 } // namespace mlir::triton
 

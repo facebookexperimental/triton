@@ -198,16 +198,34 @@ bool isGenericLinearEncoding(Attribute attr);
 bool isRadix2Encoding(Attribute layout);
 
 // Whether the encoding of `type`, or the parent of its slices, is exact at its
-// shape. Only a mixed-radix layout can fail: each out size and its pow2 alloc
-// shape must divide.
+// shape: a radix-2 linear layout iff the shape is pow2, a mixed-radix layout
+// iff each out size and its pow2 alloc shape divide.
 bool hasExactLayoutAt(RankedTensorType type);
+
+// Whether `type` has an NPOT shape and an exact mixed-radix layout.
+bool hasExactNpotLayout(RankedTensorType type);
 
 // Whether `op` lowers a mixed-radix layout: it is elementwise, carries
 // MixedRadixLayoutTrait or MixedRadixLayoutOpInterface, or is an upstream
 // constant, control-flow or cast op. The verifier allows a mixed-radix layout
 // only on these ops, and the NPOT pad pass keeps a connected component's shape
 // only if all its ops are.
-bool isMixedRadixLayoutOp(Operation *op);
+bool isMixedRadixLayoutOp(OperationName op);
+
+// Under TRITON_ALLOW_NPOT, whether an MMAv3 instrShape's N may be NPOT: its odd
+// part repeats in registers, which is wgmma's order only while one warpgroup
+// spans N.
+bool isMmaV3NpotNLegal(ArrayRef<unsigned> warpsPerCTA,
+                       ArrayRef<unsigned> instrShape);
+
+// Whether wgmma's k atoms sit on K's power-of-two part, as its warps do on M
+// and N; otherwise an NPOT K's last atom reads past K.
+bool isMmaV3NpotKLegal(int64_t k, unsigned atomK);
+
+// Why the verifier rejects an exact mixed-radix layout among `types` on an op
+// named `name`, if it does; a pass can ask before creating the op.
+std::optional<std::string> getNpotLayoutUnsupportedReason(OperationName name,
+                                                          TypeRange types);
 
 // Create a GenericLinearEncoding if the source isGenericLinearEncoding, and a
 // LinearEncoding otherwise.
@@ -369,8 +387,6 @@ SmallVector<unsigned> getCTAsPerCGA(Attribute layout);
 
 SmallVector<unsigned> getCTASplitNum(Attribute layout);
 
-SmallVector<unsigned> getCTAOrder(Attribute layout);
-
 // Returns the "logical" shape per CTA.
 // When shape and CTASplitNum have different number of dimensions, we assume
 // only the last N between common dimensions are split.
@@ -389,6 +405,16 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
                                               ArrayRef<int64_t> shape);
 SmallVector<int64_t> getAllocationShapePerCTA(Type type);
 
+// Returns the layout of a rank-2 NPOT tile allocated without its pow2 cover:
+// the cover's layout when it maps [0, product(tile)) onto the tile, or, for
+// NPOT rows across whole panels, the cover's panels at stride rows * width.
+// Swizzled and rotating panels span the contiguous dim's pow2 part; a padded
+// tile gives its linear component. Otherwise sets `reason` and fails, and the
+// tile keeps its cover.
+FailureOr<LinearLayout> getNpotDenseSharedLayout(Attribute layout,
+                                                 ArrayRef<int64_t> tile,
+                                                 std::string *reason = nullptr);
+
 // Returns the layout-ranked suffix, dropping a leading pipelining dimension.
 template <typename T>
 ArrayRef<T> dropPipeliningDim(ArrayRef<T> shape, Attribute layout) {
@@ -406,7 +432,8 @@ int64_t getAllocationElems(Attribute layout, ArrayRef<int64_t> shape,
                            ArrayRef<int64_t> allocShape = {});
 
 // Returns whether a shared allocation holds the footprint of its layout, which
-// is built on allocShape rounded up to pow2.
+// is built on allocShape rounded up to pow2. A tile that
+// getNpotDenseSharedLayout accepts holds it exactly.
 bool holdsNpotPow2AllocShape(Attribute layout, ArrayRef<int64_t> allocShape);
 
 // MemDescType::verify's power-of-two test: every layout dimension but a leading
@@ -472,9 +499,18 @@ triton::gpu::BlockedEncodingAttr
 getDefaultBlockedEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
                           int numWarps, int threadsPerWarp, int numCTAs);
 
-// Under TRITON_ALLOW_NPOT, an NPOT `shape`'s mixed-radix layout with `vector`
-// elements along order[0] (default the last dim) and odd digits slowest. Fails
-// if pow2 or CTAs > 1.
+// The layout of `op`'s first operand with an exact mixed-radix layout.
+FailureOr<LinearLayout> getExactNpotOperandLayout(Operation *op);
+
+// Under TRITON_ALLOW_NPOT, an NPOT `shape`'s mixed-radix layout: a Blocked
+// layout with `sizePerThread` on the pow2 parts, then each odd factor as a
+// register digit slowest. Fails if pow2 or CTAs > 1.
+FailureOr<LinearEncodingAttr>
+getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
+                      int numWarps, int threadsPerWarp, int numCTAs,
+                      ArrayRef<unsigned> sizePerThread,
+                      ArrayRef<unsigned> order = {});
+// Same, with `vector` elements on order[0] (default the last dim).
 FailureOr<LinearEncodingAttr>
 getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
                       int numWarps, int threadsPerWarp, int numCTAs,
@@ -483,9 +519,18 @@ getMixedRadixEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
 // The widest pow2 vector up to the pow2 `vector` along order[0] whose
 // mixed-radix layout of `shape` holds no more registers than the converter's
 // layout (no vector); `vector` unchanged if `shape` has no mixed-radix layout.
+// A global store or global-to-shared async copy predicates off duplicate
+// threads, so with `predicated` it takes any vector whose layout exists.
 unsigned getMixedRadixVector(MLIRContext *context, ArrayRef<int64_t> shape,
                              unsigned vector, ArrayRef<unsigned> order,
-                             int numWarps, int threadsPerWarp);
+                             int numWarps, int threadsPerWarp,
+                             bool predicated = false);
+
+// Registers per shared access of a mixed-radix `regLayout`: leading register
+// digits at consecutive offsets through the pow2 `toOffset`, at most 128 bits,
+// cut until every run starts aligned.
+int32_t getMixedRadixSharedRun(const LinearLayout &regLayout,
+                               const LinearLayout &toOffset, unsigned bitwidth);
 
 // Dump information about which threads/registers contain each of the tensor
 // elements.

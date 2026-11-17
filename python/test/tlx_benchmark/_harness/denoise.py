@@ -10,6 +10,7 @@ import ctypes
 import dataclasses
 import gc
 import os
+from pathlib import Path
 import re
 import shutil
 import socket
@@ -480,6 +481,8 @@ ARCH_BY_PART = {
     "MI350X": "gfx950",
     "MI355X": "gfx950",
     "MI300X": "gfx942",
+    "MI450X": "gfx1250",
+    "MI455X": "gfx1250",
 }
 
 
@@ -492,6 +495,8 @@ class Device:
     #: "Unique ID"; None when rocminfo could not be matched.
     uuid: Optional[str] = None
     memory_used_mib: float = 0.0
+    pci_bus: Optional[str] = None
+    gpu_arch: Optional[str] = None
 
     @property
     def visibility_env(self) -> str:
@@ -523,6 +528,8 @@ class Device:
 
     @property
     def arch(self) -> Optional[str]:
+        if self.gpu_arch is not None:
+            return self.gpu_arch
         for part, key in ARCH_BY_PART.items():
             if part.lower() in self.name.lower().replace(" ", ""):
                 return key
@@ -560,12 +567,12 @@ def list_devices() -> list[Device]:
     if which == AMD:
         lines = (_rocm(["--showmeminfo", "vram", "--showbus", "--csv"]) or "").splitlines()
         if not lines:
-            return []
+            return _amd_sysfs_devices()
         col = {name.strip(): i for i, name in enumerate(lines[0].split(","))}
         used_col, bus_col = col.get("VRAM Total Used Memory (B)"), col.get("PCI Bus")
         if used_col is None:
-            return []
-        rocr = _rocr_uuids()
+            return _amd_sysfs_devices()
+        rocr = _rocr_agents()
         found = []
         for line in lines[1:]:
             f = [x.strip() for x in line.split(",")]
@@ -574,10 +581,13 @@ def list_devices() -> list[Device]:
                 continue
             bus = f[bus_col] if bus_col is not None and len(f) > bus_col else None
             used = _num(f[used_col])
-            uuid = rocr.get(_pci_bus_number(bus))
-            found.append(Device(AMD, int(idx), _amd_name(int(idx)), uuid, (used or 0.0) / 1024 / 1024))
-        return found
-    return []
+            uuid, gpu_arch = rocr.get(_pci_bus_number(bus), (None, None))
+            found.append(
+                Device(AMD, int(idx), _amd_name(int(idx)), uuid, (used or 0.0) / 1024 / 1024, gpu_arch=gpu_arch))
+        if found and all(d.uuid and d.arch for d in found):
+            return found
+        return _amd_sysfs_devices() or found
+    return _amd_sysfs_devices()
 
 
 def _pci_bus_number(bus: Optional[str]) -> Optional[int]:
@@ -596,29 +606,34 @@ def _rocminfo() -> Optional[str]:
     return out.stdout
 
 
-def _rocr_uuids() -> dict[int, str]:
-    """ROCr GPU agent UUIDs by PCI bus number.
+def _rocr_agents() -> dict[int, tuple[Optional[str], Optional[str]]]:
+    """ROCr UUID and architecture by PCI bus, before HIP context creation.
 
-    rocm-smi numbers cards in a different order from ROCr (and HIP), so the PCI
-    bus is the key that joins the two tools. rocminfo's BDFID is
-    bus << 8 | device << 3 | function.
+    rocm-smi and ROCr/HIP can number GPUs differently; PCI bus joins the tools.
+    rocminfo's BDFID encodes bus << 8 | device << 3 | function.
     """
-    found: dict[int, str] = {}
-    uuid = bdf = None
+    found = {}
+    uuid = bdf = arch = None
     gpu = False
     for line in (_rocminfo() or "").splitlines():
         line = line.strip()
         if re.match(r"Agent \d+", line):
-            uuid, bdf, gpu = None, None, False
+            uuid = bdf = arch = None
+            gpu = False
+        elif line.startswith("Name:"):
+            name = line.split()[-1]
+            if re.fullmatch(r"gfx[0-9a-f]+", name):
+                arch = name
         elif line.startswith("Uuid:"):
-            uuid = line.split()[-1]
+            value = line.split()[-1]
+            # ROCr rejects the "GPU-XX" placeholder reported without a UUID.
+            uuid = value if re.fullmatch(r"GPU-[0-9a-fA-F]+", value) else None
         elif line.startswith("BDFID:"):
             bdf = line.split()[-1]
         elif line.startswith("Device Type:"):
             gpu = line.split()[-1] == "GPU"
-        # A GPU without a UUID reports the placeholder "GPU-XX", which ROCr rejects.
-        if gpu and uuid and re.fullmatch(r"GPU-[0-9a-fA-F]+", uuid) and bdf and bdf.isdigit():
-            found[int(bdf) >> 8] = uuid
+        if gpu and bdf and bdf.isdigit():
+            found[int(bdf) >> 8] = (uuid, arch)
     return found
 
 
@@ -627,28 +642,59 @@ def _amd_name(index: int) -> str:
     blob = info.lower()
     for marker, part in (("0x74a0", "MI300X"), ("0x74a1", "MI300X"), ("mi300", "MI300X"), ("gfx942", "MI300X"),
                          ("0x75a1", "MI355X"), ("0x75a3", "MI355X"), ("mi355", "MI355X"), ("0x75a0", "MI350X"),
-                         ("mi350", "MI350X"), ("gfx950", "MI350X")):
+                         ("mi350", "MI350X"), ("gfx950", "MI350X"), ("0x75c8", "MI450X"), ("mi455", "MI455X"),
+                         ("gfx1250", "MI450X")):
         if marker in blob:
             return part
     return f"AMD GPU {index}"
 
 
-def select_device(spec: str = "auto") -> Optional[Device]:
+def select_device(spec: str = "auto") -> Device:
     devices = list_devices()
     if not devices:
-        return None
+        raise RuntimeError("No benchmark GPU discovered; check GPU access and management tools")
     if spec != "auto":
         wanted = int(spec)
-        for d in devices:
-            if d.index == wanted:
-                return d
-        raise ValueError(f"--device {spec}: no such GPU (have {[d.index for d in devices]})")
-    return min(devices, key=lambda d: d.memory_used_mib)
+        device = next((d for d in devices if d.index == wanted), None)
+        if device is None:
+            raise ValueError(f"--device {spec}: no such GPU (have {[d.index for d in devices]})")
+    else:
+        device = min(devices, key=lambda d: d.memory_used_mib)
+    if device.vendor == AMD and (device.uuid is None or device.arch is None):
+        raise RuntimeError("AMD benchmark GPU identity is incomplete; cannot pin its ROCr UUID and architecture")
+    return device
 
 
 #: Where sysfs enumerates PCI devices. A module constant so the resolution above
 #: can be tested without a GPU.
 _PCI_DEVICES = "/sys/bus/pci/devices"
+_KFD_NODES = "/sys/class/kfd/kfd/topology/nodes"
+
+
+def _amd_sysfs_devices() -> list[Device]:
+    try:
+        nodes = list(Path(_KFD_NODES).iterdir())
+    except OSError:
+        return []
+    found = []
+    parts = {0x74a0: "MI300X", 0x74a1: "MI300X", 0x75a0: "MI350X", 0x75a1: "MI355X", 0x75a3: "MI355X"}
+    for node in nodes:
+        try:
+            props = dict(line.split() for line in (node / "properties").read_text().splitlines())
+            if int(props["simd_count"]) == 0 or int(props["vendor_id"]) != 0x1002:
+                continue
+            unique_id = int(props["unique_id"])
+            if not unique_id:
+                continue
+            bdf, domain = int(props["location_id"]), int(props["domain"])
+            pci = f"{domain:04x}:{bdf >> 8:02x}:{(bdf >> 3) & 31:02x}.{bdf & 7}"
+            used = int((Path(_PCI_DEVICES) / pci / "mem_info_vram_used").read_text())
+            name = parts.get(int(props["device_id"]), "AMD GPU")
+        except (OSError, KeyError, ValueError):
+            continue
+        # INVARIANT: ROCr formats the kernel UniqueID, not rocm-smi's ID, as its GPU UUID.
+        found.append((pci, name, f"GPU-{unique_id:016x}", used / 1024 / 1024))
+    return [Device(AMD, i, name, uuid, used, pci) for i, (pci, name, uuid, used) in enumerate(sorted(found))]
 
 
 def _amd_numa_node(index: int) -> Optional[int]:
@@ -713,18 +759,40 @@ class Governor(contextlib.AbstractContextManager):
             self._restore.append(["nvidia-smi", "-rgc", "-i", str(d.index)])
 
     def _govern_amd(self, d: Device):
+        if d.arch == "gfx1250":
+            self.skipped.append("gfx1250 clock/power policy is not calibrated")
+            return
+        index = d.index
+        if d.pci_bus is not None:
+            rows = (_rocm(["--showbus", "--csv"]) or "").splitlines()
+            fields = [line.split(",") for line in rows[1:]]
+            index = next(
+                (int(f[0][4:])
+                 for f in fields
+                 if len(f) == 2 and f[0].startswith("card") and f[0][4:].isdigit() and f[1].strip().lower() == d.pci_bus
+                 ), None)
+            if index is None:
+                self.skipped.append("AMD clock and power governing (management GPU mapping unavailable)")
+                return
         target = d.power_target_w or 500
-        if self._sudo(["rocm-smi", "-d", str(d.index), "--setperfdeterminism", str(AMD_DETERMINISM_MHZ)]):
+        if self._sudo(["rocm-smi", "-d", str(index), "--setperfdeterminism", str(AMD_DETERMINISM_MHZ)]):
             self.applied.append(f"perf determinism {AMD_DETERMINISM_MHZ} MHz")
-            self._restore.append(["rocm-smi", "-d", str(d.index), "--resetperfdeterminism"])
+            self._restore.append(["rocm-smi", "-d", str(index), "--resetperfdeterminism"])
         else:
             self.skipped.append("perf determinism (needs passwordless sudo)")
-        if self._sudo(["rocm-smi", "-d", str(d.index), "--setpoweroverdrive", str(target)]):
+        if self._sudo(["rocm-smi", "-d", str(index), "--setpoweroverdrive", str(target)]):
             self.applied.append(f"power cap {target} W")
-            self._restore.append(["rocm-smi", "-d", str(d.index), "--resetpoweroverdrive"])
+            self._restore.append(["rocm-smi", "-d", str(index), "--resetpoweroverdrive"])
 
     def _bind_numa(self, d: Device):
-        node = _amd_numa_node(d.index) if d.vendor == AMD else numa_node(d.uuid)
+        if d.pci_bus is not None:
+            try:
+                node = int((Path(_PCI_DEVICES) / d.pci_bus / "numa_node").read_text())
+                node = node if node >= 0 else None
+            except (OSError, ValueError):
+                node = None
+        else:
+            node = _amd_numa_node(d.index) if d.vendor == AMD else numa_node(d.uuid)
         if node is None:
             self.skipped.append("NUMA binding (GPU-local node unknown)")
             return
