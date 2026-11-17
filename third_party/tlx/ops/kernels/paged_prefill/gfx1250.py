@@ -12,6 +12,7 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 
 from ..._catalog import InvalidInput
+from .gfx1250_wmma import _scale_online
 
 
 @triton.jit
@@ -31,7 +32,11 @@ def _consume(
     FIXED: tl.constexpr,
     MASK: tl.constexpr = True,
 ):
-    scores = tl.dot(q, k) * (0.125 * 1.4426950408889634)
+    scores = tl.dot(q, k)
+    if FIXED:
+        scores *= 0.125 * 1.4426950408889634
+    else:
+        scores = _scale_online(scores)
     if MASK:
         keys = key_start + tl.arange(0, 64)
         valid = (keys[None, :] <= rows[:, None] + SK - SQ) & (keys[None, :] < SK)
@@ -601,6 +606,33 @@ def paged_prefill(q, k, v, tables, *, kv_length=None, window=0):
     return out
 
 
+def paged_attention_prefill(q, k, v, cu_q, used_k, tables, max_q, *, sm_scale=0.125, sliding_window=0, out,
+                            max_context_len, shuffled_kv_cache=False):
+    """Packed runtime-length entry for AITER-compatible serving calls."""
+    from .gfx1250_wmma import launch_packed
+
+    if sm_scale != 0.125 or sliding_window not in (0, 2048):
+        raise InvalidInput("gfx1250 prefill supports scale 1/sqrt(64) and window 0 or 2048")
+    if max_q >= 2**31 or max_context_len >= 2**31:
+        raise InvalidInput("gfx1250 prefill lengths must fit int32")
+    if not all(t.is_contiguous() for t in (q, k, v, out, cu_q, used_k, tables)):
+        raise InvalidInput("gfx1250 prefill expects contiguous tensors")
+    if any(t.data_ptr() % 16 for t in (q, k, v, out)):
+        raise InvalidInput("gfx1250 prefill expects 16-byte-aligned Q/K/V/output bases")
+    if any(torch._C._overlaps(out, t) for t in (q, k, v, cu_q, used_k, tables)):
+        raise InvalidInput("gfx1250 prefill output must not overlap any input")
+    kh = q.shape[1] // 8
+    expected = (k.shape[0], kh, 8, 64, 8) if shuffled_kv_cache else (k.shape[0], 64, kh, 64)
+    if k.shape != expected or v.shape != expected or tables.shape[1] < triton.cdiv(max_context_len, 64):
+        raise InvalidInput("gfx1250 prefill expects page64 caches and a page table covering max_seqlen_k")
+    if max_q == 0 or used_k.numel() == 0:
+        return out
+    config = _select_config(max_q, max_context_len, sliding_window, batch=used_k.numel(), kv_heads=kh)
+    bm = config["bm"] if config.get("fast") else 64
+    launch_packed(q, k, v, tables, out, cu_q, used_k, max_q, window=sliding_window, bm=bm, shuffled=shuffled_kv_cache)
+    return out
+
+
 def _select_config(query_length, kv_length, window, *, batch=1, kv_heads=2):
     """Frozen choices from the BF16 prefill sweep; q_len=8 is not tuned."""
     effective_window = 0 if window and kv_length <= window else window
@@ -614,6 +646,9 @@ def _select_config(query_length, kv_length, window, *, batch=1, kv_heads=2):
                 bm = 256
         else:
             bm = 128 if effective_window or query_length <= 8192 else 256
+        if (batch == 1 and kv_heads == 2 and not effective_window and query_length >= 16384
+                and kv_length - query_length >= 32768):
+            bm = 512
         return dict(
             pipe=True,
             pad=8,
@@ -625,7 +660,7 @@ def _select_config(query_length, kv_length, window, *, batch=1, kv_heads=2):
             fast=True,
             enable_wmma_queuing=False,
             bm=bm,
-            warps=4 if bm == 256 else 2,
+            warps=4 if bm >= 256 else 2,
             reverse_local_assignment=True,
             llvm_fn_attrs="amdgpu-sched-strategy=coexec",
         )

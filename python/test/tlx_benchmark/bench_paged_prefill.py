@@ -9,7 +9,7 @@ import sys
 
 import torch
 import triton
-from triton.tlx.ops import paged_prefill
+from triton.tlx.ops import paged_attention_prefill, paged_prefill
 from triton.tlx.ops.kernels.paged_prefill._shapes import FOCUS as SHAPE_SUITES
 from triton.tlx.ops.kernels.paged_prefill._shapes import SYNTHETIC, Shape, flops
 
@@ -29,14 +29,15 @@ def shapes(synthetic=False, suites=None):
 
 def cases(synthetic=False, suites=None):
     return [
-        Case(op=OP, arch=driver.arch(), dtype="bfloat16", shape=shape,
-             label=f"B={shape[0]} Q={shape[1]} KV={shape[2]} window={shape[3]} heads={8*shape[4]}/{shape[4]}")
-        for shape in shapes(synthetic, suites)
+        Case(
+            op=OP, arch=driver.arch(), dtype="bfloat16", shape=shape,
+            label=f"B={shape[0]} Q={shape[1]} KV={shape[2]} window={shape[3]} heads={8*shape[4]}/{shape[4]} "
+            f"cache={'shuffled5D' if shape[5] else 'NHD'}") for shape in shapes(synthetic, suites)
     ]
 
 
 def prepare(case, space):
-    batch, sq, sk, window, kv_heads = Shape(*case.shape)
+    batch, sq, sk, window, kv_heads, shuffled = Shape(*case.shape)
     generator = torch.Generator(device="cuda").manual_seed(41)
     pages = triton.cdiv(sk, 64)
     q = torch.randn((batch, sq, kv_heads * 8, 64), generator=generator, device="cuda", dtype=torch.bfloat16)
@@ -45,6 +46,20 @@ def prepare(case, space):
     table = torch.randperm(k.shape[0], generator=generator, device=q.device, dtype=torch.int32)
     table = table[:batch * pages].reshape(batch, pages)
     fn = lambda: paged_prefill(q, k, v, table, kv_length=sk, window=window, space=space)
+    if shuffled:
+        # The cache is already in the serving layout when the timed call begins;
+        # the operator reads it directly without an unshuffle or gather launch.
+        kp = k.reshape(-1, 64, kv_heads, 8, 8).permute(0, 2, 3, 1, 4).contiguous()
+        vp = v.reshape(-1, 8, 8, kv_heads, 64).permute(0, 3, 1, 4, 2).contiguous()
+        cu_q = torch.arange(batch + 1, device=q.device, dtype=torch.int32) * sq
+        used_k = torch.full((batch, ), sk, device=q.device, dtype=torch.int32)
+        out = torch.empty_like(q)
+
+        def fn():
+            paged_attention_prefill(q.flatten(0, 1), kp, vp, out.flatten(0, 1), cu_q, sq, used_k, sk, 0.125, True,
+                                    (window - 1, 0) if window else (-1, -1), table, 0, None, None, None,
+                                    shuffled_kv_cache=True, space=space)
+            return out
 
     def check():
         out = fn()
@@ -77,7 +92,7 @@ def prepare(case, space):
         rrms = (error_sq / ref_sq).sqrt().item()
         return rrms < 0.005, f"FP64 relative RMS {rrms:.5f}"
 
-    return Prepared(tlx_fn=fn, ref_fn=None, flop_count=flops(*case.shape), check=check)
+    return Prepared(tlx_fn=fn, ref_fn=None, flop_count=flops(batch, sq, sk, window, kv_heads), check=check)
 
 
 def annotate(result):

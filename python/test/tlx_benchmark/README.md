@@ -84,16 +84,20 @@ options:
 `paged_prefill` covers BF16 causal GQA8 (16Q/2KV, 32Q/4KV and 128Q/16KV),
 D64, 64-token shuffled pages on gfx1250, globally and with a 2048-token
 window including self. The default suites include batches 1/2/4, full prefill
-through 64K, and Q=2K with cached-prefix KV=8K/32K. Select `gfx1250_1`,
-`gfx1250_heads`, `gfx1250_batched`, `gfx1250_long`, or `gfx1250_prefix` with
-`--suite` to run a subset. Long/prefix benchmarks check sampled query rows
+through 64K, Q=2K with cached-prefix KV=8K/32K, and Q=16K after a 48K/112K
+prefix. Select `gfx1250_1`, `gfx1250_heads`, `gfx1250_batched`, `gfx1250_long`,
+`gfx1250_prefix`, `gfx1250_chunked`, or `gfx1250_serving` with `--suite` to run
+a subset. The serving suite calls `paged_attention_prefill` with GPU-resident
+lengths and native shuffled 5-D K/V caches; it performs no cache conversion in
+the operator. Long/prefix benchmarks check sampled query rows
 in FP64 across every batch and head, plus finiteness of the full output. Its useful
 TFLOP/s counts only QK+PV over valid attention pairs (FMA=2); masked work,
 softmax and normalization are excluded. It reports GPU kernel time, excluding
 host allocation/dispatch. It does not compare paged inputs with a dense-only
 reference. Correctness: `pytest -s --tb=short
 python/test/unit/tlx_ops/test_paged_prefill_gfx1250.py`. On shared hosts, hold
-the host's GPU lock for the entire test or benchmark process.
+the host's GPU lock for each test or benchmark process, releasing it between
+independent runs and during CPU analysis.
 
 The direct `mm` provider has a `heuristic_config`, so its default is a single
 analytically chosen config. The TorchTLX providers use Inductor's template

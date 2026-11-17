@@ -11,6 +11,7 @@ class Shape(NamedTuple):
     context: int
     window: int
     kv_heads: int = 2
+    shuffled: bool = False
 
 
 SYNTHETIC = (Shape(1, 65, 129, 0), Shape(2, 769, 2817, 2048, 4))
@@ -19,13 +20,19 @@ FULL_HEADS = tuple(s._replace(kv_heads=h) for h in (4, 16) for s in PRIMARY)
 BATCHED = tuple(Shape(b, k, k, w, h) for h in (2, 4, 16) for b in (2, 4) for k in (2048, 8192) for w in (0, 2048))
 LONG = tuple(Shape(b, k, k, w, h) for h in (2, 4, 16) for b in (1, 2) for k in (32768, 65536) for w in (0, 2048))
 PREFIX = tuple(Shape(b, 2048, k, w, h) for h in (2, 4, 16) for b in (1, 2, 4) for k in (8192, 32768) for w in (0, 2048))
+CHUNKED = tuple(Shape(1, 16384, k, w) for k in (65536, 131072) for w in (0, 2048))
+SERVING = tuple(s._replace(shuffled=True) for s in CHUNKED)
 FOCUS = FocusRegistry(
     "paged_prefill",
     tuple(
         FocusSuite(name=name, op="paged_prefill", shapes=shapes)
-        for name, shapes in (("gfx1250_1", PRIMARY), ("gfx1250_heads", FULL_HEADS), ("gfx1250_batched", BATCHED),
-                             ("gfx1250_long", LONG), ("gfx1250_prefix", PREFIX))),
-    {"gfx1250": ("gfx1250_1", "gfx1250_heads", "gfx1250_batched", "gfx1250_long", "gfx1250_prefix")},
+        for name, shapes in (("gfx1250_1", PRIMARY), ("gfx1250_heads", FULL_HEADS), ("gfx1250_batched",
+                                                                                     BATCHED), ("gfx1250_long", LONG),
+                             ("gfx1250_prefix", PREFIX), ("gfx1250_chunked", CHUNKED), ("gfx1250_serving", SERVING))),
+    {
+        "gfx1250": ("gfx1250_1", "gfx1250_heads", "gfx1250_batched", "gfx1250_long", "gfx1250_prefix",
+                    "gfx1250_chunked", "gfx1250_serving")
+    },
 )
 
 

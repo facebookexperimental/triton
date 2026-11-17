@@ -4,9 +4,209 @@ import pytest
 import torch
 import triton
 from triton._internal_testing import is_hip_gfx1250
-from triton.tlx.ops import InvalidInput, Space, BitwiseInvarianceSpec, UnsupportedBackward, UnsupportedOp, paged_prefill
+from triton.tlx.ops import InvalidInput, Space, BitwiseInvarianceSpec, UnsupportedBackward, UnsupportedOp, paged_prefill, paged_attention_prefill
 
 pytestmark = pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+
+
+def _pack_cache(k, v):
+    pages, _, heads, _ = k.shape
+    kk = k.reshape(pages, 64, heads, 8, 8).permute(0, 2, 3, 1, 4).contiguous()
+    vv = v.reshape(pages, 8, 8, heads, 64).permute(0, 3, 1, 4, 2).contiguous()
+    return kk, vv
+
+
+def _packed_call(q, k, v, out, cu_q, used_k, table, max_q, max_k, window, shuffled):
+    return paged_attention_prefill(q, k, v, out, cu_q, max_q, used_k, max_k, 0.125, True, (window - 1, 0) if window else
+                                   (-1, -1), table, 0, None, None, None, shuffled_kv_cache=shuffled)
+
+
+@pytest.mark.parametrize("shuffled", [False, True])
+@pytest.mark.parametrize("window", [0, 2048])
+def test_paged_prefill_packed_runtime_graph(shuffled, window):
+    from triton.tlx.ops.kernels.paged_prefill.gfx1250_wmma import packed_prefill_kernel
+
+    torch.manual_seed(41)
+    q = torch.randn((2048, 16, 64), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((5 * 65 + 3, 64, 2, 64), device=q.device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    table = torch.randperm(k.shape[0], device=q.device, dtype=torch.int32)[:5 * 65].reshape(5, 65)
+    cu_q = torch.tensor([0, 0, 8, 73, 586, 1355], device=q.device, dtype=torch.int32)
+    used_k = torch.tensor([0, 4097, 129, 1025, 2817], device=q.device, dtype=torch.int32)
+    kp, vp = _pack_cache(k, v) if shuffled else (k, v)
+    out = torch.empty_like(q)
+    args = (q, kp, vp, out, cu_q, used_k, table, 1024, 4097, window, shuffled)
+    _packed_call(*args)
+    cache = packed_prefill_kernel.device_caches[torch.cuda.current_device()][0]
+    compiled = set(cache)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _packed_call(*args)
+    for mode, qlens, klens in (
+        ("random", [0, 8, 65, 513, 769], [0, 4097, 129, 1025, 2817]),
+        ("cap44", [1, 63, 17, 257, 769], [1, 128, 2049, 4097, 1025]),
+        ("late_spike", [0, 8, 65, 513, 769], [0, 4097, 129, 1025, 2817]),
+        ("negative", [1, 63, 17, 257, 769], [1, 128, 2049, 4097, 1025]),
+        ("random", [0, 8, 65, 513, 769], [0, 4097, 129, 1025, 2817]),
+    ):
+        offsets = [0]
+        for n in qlens:
+            offsets.append(offsets[-1] + n)
+        cu_q.copy_(torch.tensor(offsets, device=q.device, dtype=cu_q.dtype))
+        used_k.copy_(torch.tensor(klens, device=q.device, dtype=used_k.dtype))
+        q.normal_()
+        k.normal_()
+        v.normal_()
+        if mode == "cap44":
+            q.fill_(1)
+            k.fill_(5.5)
+        elif mode == "late_spike":
+            q.fill_(1)
+            k.zero_()
+            for b, sk in enumerate(klens):
+                if sk:
+                    position = max(0, sk - 1024)
+                    k[table[b, position // 64].long(), position % 64] = 32
+        elif mode == "negative":
+            q.fill_(2.0**50)
+            k.fill_(-(2.0**50))
+            v.fill_(1)
+        for b, sk in enumerate(klens):
+            if sk % 64:
+                k[table[b, sk // 64].long(), sk % 64:] = float("nan")
+                v[table[b, sk // 64].long(), sk % 64:] = float("nan")
+        if shuffled:
+            kk, vv = _pack_cache(k, v)
+            kp.copy_(kk)
+            vp.copy_(vv)
+        out.fill_(float("nan"))
+        graph.replay()
+        for b, (sq, sk) in enumerate(zip(qlens, klens)):
+            if sq:
+                qq = q[offsets[b]:offsets[b + 1]][None]
+                oo = out[offsets[b]:offsets[b + 1]][None]
+                _check(qq, k, v, table[b:b + 1, :triton.cdiv(sk, 64)], sk, window, oo)
+        assert torch.isnan(out[offsets[-1]:]).all()
+        expected = out[:offsets[-1]].clone()
+        out.fill_(float("nan"))
+        graph.replay()
+        assert torch.equal(out[:offsets[-1]], expected)
+        _packed_call(*args)
+        assert set(cache) == compiled
+
+
+@pytest.mark.parametrize("shuffled", [False, True])
+def test_paged_prefill_runtime_capacity_reuses_binary(shuffled):
+    from triton.tlx.ops.kernels.paged_prefill.gfx1250_wmma import launch_packed
+
+    binaries = []
+    for sq, sk, capacity in ((769, 4097, 81), (1031, 8192, 145), (513, 2048, 49)):
+        q, k, v, table, _ = _inputs(1, sq, sk)
+        # Change both physical pool capacity and page-table row stride.
+        larger = torch.randn((capacity, 64, 2, 64), device=q.device, dtype=q.dtype)
+        larger[:k.shape[0]].copy_(k)
+        values = torch.randn_like(larger)
+        values[:v.shape[0]].copy_(v)
+        bt = torch.full((1, capacity), -1, device=q.device, dtype=torch.int32)
+        bt[:, :table.shape[1]].copy_(table)
+        kk, vv = _pack_cache(larger, values) if shuffled else (larger, values)
+        cu = torch.tensor([0, sq], device=q.device, dtype=torch.int32)
+        used = torch.tensor([sk], device=q.device, dtype=torch.int64)
+        out = torch.empty_like(q)
+        compiled = launch_packed(q[0], kk, vv, bt, out[0], cu, used, sq, bm=128, shuffled=shuffled)
+        _check(q, k, v, table, sk, 0, out, full=False)
+        binaries.append(compiled)
+    assert all(binary is binaries[0] for binary in binaries)
+
+
+@pytest.mark.parametrize("window", [0, 2048])
+@pytest.mark.parametrize("sq", [256, 769])
+@pytest.mark.parametrize("q_value,k_value", [(4096, 4224), (65536, 66560), (4128, 6368), (66048, 101888),
+                                             (2.0**50, 2.0**50), (4096, -4224), (2.0**50, -(2.0**50))])
+def test_paged_prefill_large_equal_logits_keep_page_weights(window, sq, q_value, k_value):
+    q, k, v, table, _ = _inputs(1, sq, 4096)
+    q.fill_(q_value)
+    k.fill_(k_value)
+    v.zero_()
+    for page in range(table.shape[1]):
+        v[table[0, page].long()] = page % 2
+    out = paged_prefill(q, k, v, table, kv_length=4096, window=window)
+    # Every key has exactly the same score: use an analytic uniform mean,
+    # with alternating page values so first-page-only normalization fails.
+    values = (torch.arange(4096, device=q.device) // 64 % 2).double()
+    prefix_sum = torch.cat((torch.zeros(1, device=q.device, dtype=torch.float64), values.cumsum(0)))
+    end = torch.arange(sq, device=q.device) + 4096 - sq + 1
+    start = (end - window).clamp_min(0) if window else torch.zeros_like(end)
+    expected = ((prefix_sum[end] - prefix_sum[start]) / (end - start))[None, :, None, None].expand_as(out)
+    torch.testing.assert_close(out.double(), expected, atol=0.003, rtol=0.005)
+
+
+def test_paged_prefill_packed_rejects_metadata_rank_and_output_alias():
+    q, k, v, table, _ = _inputs(1, 65, 129)
+    cu = torch.tensor([0, 65], device=q.device, dtype=torch.int32)
+    used = torch.tensor([129], device=q.device, dtype=torch.int32)
+    with pytest.raises(InvalidInput, match="overlap"):
+        _packed_call(q[0], k, v, q[0], cu, used, table, 65, 129, 0, False)
+    bad_used = torch.tensor([[129, 129]], device=q.device, dtype=torch.int32)
+    with pytest.raises(InvalidInput):
+        _packed_call(q[0], k, v, torch.empty_like(q[0]), cu, bad_used, table, 65, 129, 0, False)
+
+
+def test_paged_prefill_full_large_values_keep_recovery_guard():
+    q, k, v, table, _ = _inputs(1, 2048, 2048)
+    q.fill_(1)
+    k.fill_(5.5)
+    magnitude = (201 / 128) * 2.0**30
+    v[table[0, :16].long()] = magnitude
+    v[table[0, 16:].long()] = -magnitude
+    v[table[0].long(), 63] = 0
+    out = paged_prefill(q, k, v, table)
+    # The last row has equal probabilities and exact cancellation. Widening
+    # the uncentered denominator guard admits a finite but inaccurate PV sum.
+    assert torch.count_nonzero(out[0, -1]) == 0
+
+
+@pytest.mark.parametrize("shuffled", [False, True])
+def test_paged_prefill_wide_runtime_tail_and_recovery(shuffled):
+    max_q, sk = 16385, 65537
+    q, k, v, table, _ = _inputs(1, max_q, sk)
+    logical_values = (torch.arange(sk, device=q.device) // 64 % 2).double()
+    page_values = (torch.arange(table.shape[1], device=q.device) % 2).to(v.dtype)
+    v[table[0].long()] = page_values[:, None, None, None]
+    v[table[0, -1].long(), 1:] = float("nan")
+    kp, vp = _pack_cache(k, v) if shuffled else (k, v)
+    cu = torch.tensor([0, max_q], device=q.device, dtype=torch.int32)
+    used = torch.tensor([sk], device=q.device, dtype=torch.int32)
+    out = torch.empty_like(q)
+    args = (q[0], kp, vp, out[0], cu, used, table, max_q, sk, 0, shuffled)
+    _packed_call(*args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _packed_call(*args)
+    prefix_sum = torch.cat((torch.zeros(1, device=q.device, dtype=torch.float64), logical_values.cumsum(0)))
+    for sq, mode in ((max_q, "cap44"), (65, "negative"), (63, "positive"), (64, "spike"), (max_q, "uniform")):
+        cu[1] = sq
+        q.fill_(1)
+        k.zero_()
+        if mode == "cap44":
+            k.fill_(5.5)
+        elif mode in ("negative", "positive"):
+            q.fill_(2.0**50)
+            k.fill_(-(2.0**50) if mode == "negative" else 2.0**50)
+        elif mode == "spike":
+            # An unsampled, fully visible key forces online recovery.
+            k[table[0, 511].long(), 7] = 32
+        k[table[0, -1].long(), 1:] = float("nan")
+        if shuffled:
+            kk, _ = _pack_cache(k, v)
+            kp.copy_(kk)
+        out.fill_(float("nan"))
+        graph.replay()
+        end = torch.arange(sq, device=q.device) + sk - sq + 1
+        expected = torch.ones(sq, device=q.device, dtype=torch.float64) if mode == "spike" else prefix_sum[end] / end
+        expected = expected[None, :, None, None].expand_as(out[:, :sq])
+        torch.testing.assert_close(out[:, :sq].double(), expected, atol=0.003, rtol=0.005)
+        assert torch.isnan(out[:, sq:]).all()
 
 
 def _inputs(batch, sq, sk, q_offset=0, kv_heads=2):

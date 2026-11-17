@@ -675,6 +675,14 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d["HEAD_DIM"] == 64 and d["GROUP"] <= 256 and d["GROUP"] & (d["GROUP"] - 1) == 0,
     ),
     OpSpec(
+        op="paged_attention_prefill",
+        arch="gfx1250",
+        variant="tlx_wmma",
+        impl="triton.tlx.ops.kernels.paged_prefill.gfx1250:paged_attention_prefill",
+        dtypes=_BF16,
+        accepts=lambda d: d["HEAD_DIM"] == 64 and d["GROUP"] == 8,
+    ),
+    OpSpec(
         op="paged_attention_decode_workspace",
         arch="gfx950",
         variant="split_k_mfma",
