@@ -442,6 +442,14 @@ std::optional<int32_t> getAtomicResultShuffleMask(Value result);
 // Whether distributing an atomic result requires communication between CTAs.
 bool atomicResultHasCTABroadcast(Operation *op);
 
+// Whether `op` or an op nested in it may read or write memory. Ops without a
+// memory effect interface count as touching memory.
+bool mayReadOrWriteMemory(Operation *op);
+
+// Whether `op` or an op nested in it may write memory, with the same rule for
+// ops without a memory effect interface.
+bool mayWriteMemory(Operation *op);
+
 } // namespace triton
 
 namespace triton::nvidia_gpu {
