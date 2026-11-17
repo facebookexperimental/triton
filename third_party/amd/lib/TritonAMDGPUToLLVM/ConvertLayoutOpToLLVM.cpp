@@ -2,11 +2,10 @@
 #include "PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 
-using ::mlir::triton::gpu::AMDMfmaEncodingAttr;
 using ::mlir::triton::gpu::ConvertLayoutOp;
-using ::triton::gpu::LinearEncodingAttr;
 
 namespace {
 
@@ -32,6 +31,9 @@ public:
     auto *ctx = op.getContext();
     StringAttr kReg = str_attr("register");
     StringAttr kLane = str_attr("lane");
+    // NPOT mixed-radix conversions lower in the common pattern.
+    if (hasNpotShape(srcTy) || hasNpotShape(dstTy))
+      return failure();
     auto srcLayout =
         triton::gpu::toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
     auto dstLayout =
@@ -202,7 +204,7 @@ public:
       }
       if (bitwidth < bitsPerVecElem) {
         llvm::for_each(unpackedVals, [&](Value &v) {
-          v = b.trunc(int_ty(bitwidth), v);
+          v = b.trunc(int_ty(bitwidth), v, LLVM::IntegerOverflowFlags::nuw);
           if (elemTy != int_ty(bitwidth))
             v = b.bitcast(v, elemTy);
         });
@@ -226,7 +228,7 @@ public:
         if (isa<LLVM::LLVMPointerType>(elemTy))
           v = b.inttoptr(elemTy, v);
         if (bitwidth < 32)
-          v = b.trunc(int_ty(bitwidth), v);
+          v = b.trunc(int_ty(bitwidth), v, LLVM::IntegerOverflowFlags::nuw);
         if (!isa<IntegerType>(elemTy))
           v = b.bitcast(v, elemTy);
       });
@@ -702,6 +704,9 @@ public:
 
     auto ctx = op.getContext();
     StringAttr kRegister = mlir::StringAttr::get(ctx, "register");
+    // NPOT mixed-radix conversions lower in the common pattern.
+    if (hasNpotShape(srcTy) || hasNpotShape(dstTy))
+      return failure();
     auto srcLayout =
         triton::gpu::toLinearLayout(srcTy).removeZeroBasesAlongDim(kRegister);
     auto dstLayout =

@@ -158,6 +158,28 @@ def PredicatedOpInterface : OpInterface<"PredicatedOpInterface"> {
   ];
 }
 
+def EfficientLayoutOpInterface : OpInterface<"EfficientLayoutOpInterface"> {
+  let description = [{
+    Operations that can pin a compiler-chosen result layout.
+
+    `getEfficientLayout` is a hint that the current result encoding should be
+    kept. Layout conversion treats the operation as a layout anchor and will
+    not rewrite or rematerialize it in a different encoding. When false, the
+    operation participates in layout propagation normally.
+  }];
+
+  let cppNamespace = "::mlir::triton";
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/"Return true if the compiler has pinned the current result layout.",
+      /*retType=*/"bool",
+      /*methodName=*/"getEfficientLayout",
+      /*args=*/(ins)
+    >
+  ];
+}
+
 def AtomicOpInterface : OpInterface<"AtomicOpInterface"> {
   let description = [{
     Common interface for atomic operations with memory-ordering semantics.
@@ -183,6 +205,29 @@ def AtomicOpInterface : OpInterface<"AtomicOpInterface"> {
       /*defaultImplementation=*/[{
         return $_op.getSem();
       }]
+    >
+  ];
+}
+
+def MixedRadixLayoutOpInterface : OpInterface<"MixedRadixLayoutOpInterface"> {
+  let description = [{
+    An op whose lowering takes an exact NPOT mixed-radix layout unless
+    getMixedRadixUnsupportedReason names a reason. Ops that take every exact
+    layout carry MixedRadixLayoutTrait instead.
+  }];
+
+  let cppNamespace = "::mlir::triton";
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/[{
+        Returns why the lowering can't yet take `layout`, the mixed-radix layout
+        of the first NPOT operand, or std::nullopt. The pad pass pads the
+        connected component of such an op and the verifier emits the reason.
+      }],
+      /*retType=*/"std::optional<std::string>",
+      /*methodName=*/"getMixedRadixUnsupportedReason",
+      /*args=*/(ins "const ::mlir::triton::LinearLayout &":$layout)
     >
   ];
 }

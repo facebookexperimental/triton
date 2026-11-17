@@ -11,8 +11,7 @@ from triton._C.libtriton import ir
 from triton.backends.compiler import GPUTarget
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
-from triton.language.extra.tlx.tutorials import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
-from triton.language.extra.tlx.tutorials import amd_fa_tdm_pipelined as _gfx1250_attention
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton._filecheck import run_parser
@@ -30,7 +29,8 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
 from triton.backends.amd import compiler as amd_compiler
 from triton.tlx.ops.kernels.flash_attn import gfx950 as _amd_fa_cluster_module
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
+from triton.tlx.ops.kernels.mm_mxfp8 import gfx950 as _amd_mm_mxfp8
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_tdm_pipelined import (
     mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
@@ -780,9 +780,101 @@ def compile_for_gfx950(fn, signature, constexprs, attrs=None):
     return compile_for_target(fn, signature, constexprs, GFX950, attrs=attrs)
 
 
+@triton.jit
+def _mxfp8_gfx950_copy_layout_kernel(A, C, COPY: tl.constexpr, ROWS: tl.constexpr):
+    bases: tl.constexpr = [
+        [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [2, 16], [4, 32], [8, 64], [16, 0]
+    ] + ([[32, 0]] if ROWS >= 64 else []) + ([[64, 0]] if ROWS >= 128 else []) + ([[128, 0]] if ROWS >= 256 else [])
+    shared: tl.constexpr = tlx.shared_linear_layout_encoding([[0, pair[0], pair[1]] for pair in bases], [],
+                                                             alignment=16)
+    buf = tlx.local_alloc((1, ROWS, 128), tlx.dtype_of(A), 1, layout=shared)
+    COPY(A, 0, 1, buf[0], ROWS, ROWS - 3, 256)
+    tlx.async_load_commit_group()
+    tlx.async_load_wait_group(0)
+    tlx.workgroup_barrier()
+    values = tlx.local_load(buf[0])
+    rows = tl.arange(0, ROWS)
+    cols = tl.arange(0, 128)
+    tl.store(C + (rows[:, None] * 128 + cols[None, :])[None, :, :], values)
+
+
+@pytest.mark.parametrize("copy", [
+    _amd_mm_mxfp8._n256x192_fly_layout_copy,
+    _amd_mm_mxfp8._ns4_fly_layout_copy,
+    _amd_mm_mxfp8._n256x256_fly_layout_copy,
+])
+@pytest.mark.parametrize("rows", [32, 64, 128, 256])
+def test_mxfp8_gfx950_copy_layout_verifies(copy, rows, tmp_path):
+    source = ASTSource(_mxfp8_gfx950_copy_layout_kernel, signature={"A": "*fp8e4nv", "C": "*fp8e4nv"},
+                       constexprs={"COPY": copy, "ROWS": rows}, attrs={(0, ): [("tt.divisibility", 16)]})
+    compiled = triton_compile(source, target=GFX950, options={"num_warps": 4})
+    backend = triton.compiler.compiler.make_backend(GFX950)
+    context = ir.context()
+    ir.load_dialects(context)
+    backend.load_dialects(context)
+    path = tmp_path / "copy.ttir"
+    path.write_text(compiled.asm["ttir"])
+    assert ir.parse_mlir_module(str(path), context).verify()
+    assert "buffer_load_dwordx4" in compiled.asm["amdgcn"]
+
+
 def compile_for_gfx942(fn, signature, constexprs):
     """Compile a TLX kernel for gfx942 and return the compiled object."""
     return compile_for_target(fn, signature, constexprs, GFX942)
+
+
+@triton.jit
+def _amd_packed_dot2_rejects_fp32_kernel(lhs_ptr, rhs_ptr, output_ptr):
+    offsets = tl.arange(0, 64)
+    lhs = tl.load(lhs_ptr + offsets)
+    rhs = tl.load(rhs_ptr + offsets)
+    result = tlx.amd_packed_dot2(lhs, rhs, tl.zeros((64, ), tl.float32), input_dtype=tl.bfloat16)
+    tl.store(output_ptr + offsets, result)
+
+
+def test_amd_packed_dot2_rejects_unpacked_inputs():
+    with pytest.raises(CompilationError, match="lhs and rhs must contain packed input pairs as uint32"):
+        compile_for_gfx950(
+            _amd_packed_dot2_rejects_fp32_kernel,
+            signature={"lhs_ptr": "*fp32", "rhs_ptr": "*fp32", "output_ptr": "*fp32"},
+            constexprs={},
+        )
+
+
+@triton.jit
+def _amd_packed_dot2_target_kernel(lhs_ptr, rhs_ptr, output_ptr, INPUT_DTYPE: tl.constexpr):
+    offsets = tl.arange(0, 64)
+    lhs = tl.load(lhs_ptr + offsets).to(tl.uint32)
+    rhs = tl.load(rhs_ptr + offsets).to(tl.uint32)
+    result = tlx.amd_packed_dot2(lhs, rhs, tl.zeros((64, ), tl.float32), input_dtype=INPUT_DTYPE)
+    tl.store(output_ptr + offsets, result)
+
+
+def test_amd_packed_dot2_rejects_gfx942():
+    with pytest.raises(CompilationError, match="currently requires gfx950"):
+        compile_for_gfx942(
+            _amd_packed_dot2_target_kernel,
+            signature={"lhs_ptr": "*i32", "rhs_ptr": "*i32", "output_ptr": "*fp32", "INPUT_DTYPE": "constexpr"},
+            constexprs={"INPUT_DTYPE": tl.bfloat16},
+        )
+
+
+@triton.jit
+def _amd_packed_dot2_rejects_dtype_kernel(lhs_ptr, rhs_ptr, output_ptr):
+    offsets = tl.arange(0, 64)
+    lhs = tl.load(lhs_ptr + offsets).to(tl.uint32)
+    rhs = tl.load(rhs_ptr + offsets).to(tl.uint32)
+    result = tlx.amd_packed_dot2(lhs, rhs, tl.zeros((64, ), tl.float32), input_dtype=tl.float32)
+    tl.store(output_ptr + offsets, result)
+
+
+def test_amd_packed_dot2_rejects_unsupported_input_dtype():
+    with pytest.raises(CompilationError, match="input_dtype must be tl.float16 or tl.bfloat16"):
+        compile_for_gfx950(
+            _amd_packed_dot2_rejects_dtype_kernel,
+            signature={"lhs_ptr": "*i32", "rhs_ptr": "*i32", "output_ptr": "*fp32"},
+            constexprs={},
+        )
 
 
 @triton.jit
@@ -1930,6 +2022,33 @@ def _extract_slice_kernel(x_ptr, y_ptr):
     out_ptrs = y_ptr + rows[:, None] * 32 + band_cols[None, :]
     out_ptrs = tlx.require_layout(out_ptrs, dot0, pin=False)
     tl.store(out_ptrs, band)
+
+
+@triton.jit
+def _concat_fragments(low, high):
+    return tlx.amd_concat((low, high), [16, 64])
+
+
+@triton.jit
+def _amd_concat_kernel(x_ptr, y_ptr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    cols = tl.arange(0, 32)
+    low = tl.load(x_ptr + rows[:, None] * 64 + cols[None, :])
+    high = tl.load(x_ptr + rows[:, None] * 64 + cols[None, :] + 32)
+    low = tlx.require_layout(low, dot0)
+    high = tlx.require_layout(high, dot0)
+    values = _concat_fragments(low, high)
+    out_cols = tl.arange(0, 64)
+    out_ptrs = y_ptr + rows[:, None] * 64 + out_cols[None, :]
+    out_ptrs = tlx.require_layout(out_ptrs, dot0, pin=False)
+    tl.store(out_ptrs, values)
 
 
 @triton.jit
@@ -3598,7 +3717,11 @@ def test_amd_fa_cluster_selects_static_k_row_stride(dtype, n_ctx, head_dim, caus
 def test_amd_fa_cluster_launch_forwards_static_k_row_stride(monkeypatch, dtype, n_ctx, expected):
     """The public wrapper forwards the selected stride to the compiled kernel."""
     strides = (64 * n_ctx * 263, n_ctx * 263, 263, 1)
-    tensor = SimpleNamespace(shape=(1, 64, n_ctx, 128), dtype=dtype, stride=lambda dim: strides[dim])
+
+    def stride(dim=None):
+        return strides if dim is None else strides[dim]
+
+    tensor = SimpleNamespace(shape=(1, 64, n_ctx, 128), dtype=dtype, stride=stride)
     captured = {}
 
     class CaptureKernel:
@@ -4052,6 +4175,17 @@ def test_extract_slice_compiles_gfx950():
         constexprs={},
     )
     assert "amdg.extract_slice" in compiled.asm["ttir"]
+    assert "amdgcn" in compiled.asm
+
+
+def test_amd_concat_compiles_across_helper_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_concat_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*bf16"},
+        constexprs={},
+    )
+    concat_ir = next(line for line in compiled.asm["ttir"].splitlines() if "amdg.concat" in line)
+    assert ", #" in concat_ir.split("->", 1)[1]
     assert "amdgcn" in compiled.asm
 
 
@@ -5582,6 +5716,20 @@ def test_local_reshape_compiles_gfx1250(device):
     assert len(compiled.asm["amdgcn"]) > 0
 
 
+@triton.jit
+def _npot_local_reshape_kernel(ROWS: tl.constexpr, COLS: tl.constexpr):
+    buffers = tlx.local_alloc((ROWS, COLS), tl.float32, 1)
+    tlx.local_reshape(tlx.local_view(buffers, 0), [COLS, ROWS])
+
+
+def test_npot_local_reshape_rejected_with_flag(monkeypatch):
+    monkeypatch.setenv("TRITON_ALLOW_NPOT", "1")
+    run_parser(_npot_local_reshape_kernel, args=(128, 32), target=SM90)
+    with pytest.raises(CompilationError) as e:
+        run_parser(_npot_local_reshape_kernel, args=(96, 32), target=SM90)
+    assert "NPOT reshape is not yet supported" in str(e.value.__cause__)
+
+
 @pytest.mark.parametrize("tiles_per_warp", [(1, 1), (2, 1), (1, 2), (2, 2)])
 def test_dot_scaled_tiles_per_warp_attr_gfx1250(tiles_per_warp):
     compiled = _compile_dot_scaled_tiles_per_warp(tiles_per_warp)
@@ -6787,6 +6935,62 @@ def test_async_amd_desc_load_pred_compiles_gfx1250(device):
     assert "async_tdm_copy_global_to_local" in ttgir
 
 
+@triton.jit
+def _amd_split_workgroup_barrier_kernel(x_ptr, y_ptr, BAR: tl.constexpr, COUNT: tl.constexpr):
+    offsets = tl.arange(0, 128)
+    x = tl.load(x_ptr + offsets)
+    buf = tlx.local_alloc((128, ), tl.float32, 1)
+    tlx.local_store(buf[0], x)
+    tlx.named_barrier_arrive(BAR, COUNT)
+    # Register-only work between the two halves of the barrier.
+    scaled = x * 3.0
+    tlx.named_barrier_wait(BAR, COUNT)
+    # Membar orders every shared-memory RAW; the split barrier must cover it.
+    y = tlx.local_load(buf[0])
+    tl.store(y_ptr + offsets, y + scaled)
+
+
+def test_amd_split_workgroup_barrier_compiles_gfx1250():
+    compiled = compile_for_gfx1250(
+        _amd_split_workgroup_barrier_kernel,
+        signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+        constexprs={"BAR": 0, "COUNT": 128},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count("amdg.workgroup_barrier_signal") == 1
+    assert ttgir.count("amdg.workgroup_barrier_wait") == 1
+    # The pair orders the LDS store before the load, so Membar adds no other
+    # workgroup barrier: the kernel has exactly one signal and one wait.
+    asm = compiled.asm["amdgcn"]
+    assert len(re.findall(r"^\s+s_barrier_signal -1\b", asm, re.MULTILINE)) == 1
+    assert len(re.findall(r"^\s+s_barrier_wait -1\b", asm, re.MULTILINE)) == 1
+    signal = asm.index("s_barrier_signal -1")
+    assert asm.index("ds_store", 0) < signal < asm.index("s_barrier_wait -1") < asm.index("ds_load", signal)
+
+
+@pytest.mark.parametrize("bar,count,match", [
+    (1, 128, "only support the workgroup barrier"),
+    (0, 64, "must be the workgroup size"),
+])
+def test_amd_split_workgroup_barrier_rejects_named_barriers(bar, count, match):
+    with pytest.raises(CompilationError, match=match):
+        compile_for_gfx1250(
+            _amd_split_workgroup_barrier_kernel,
+            signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+            constexprs={"BAR": bar, "COUNT": count},
+        )
+
+
+@pytest.mark.parametrize("compile_fn", [compile_for_gfx950, compile_for_gfx942])
+def test_amd_split_workgroup_barrier_requires_gfx1250(compile_fn):
+    with pytest.raises(CompilationError, match=r"require gfx1250 on AMD, got gfx9(50|42)"):
+        compile_fn(
+            _amd_split_workgroup_barrier_kernel,
+            signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+            constexprs={"BAR": 0, "COUNT": 128},
+        )
+
+
 def test_async_amd_desc_store_compiles_gfx1250(device):
     """async_amd_descriptor_store produces TDM store ops in TTGIR."""
     compiled = compile_for_gfx1250(
@@ -7241,7 +7445,359 @@ def test_gfx1250_mxgemm_tdm_pipelined_compiles(TDM_FUSION):
     assert "wmma" in amdgcn
 
 
-def test_gfx1250_mxgemm_tdm_split_compiles():
+@pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
+@pytest.mark.parametrize("cluster_size,multicast,group_m", [
+    (2, True, 8),
+    (4, True, 4),
+    (4, True, 8),
+    (4, False, 4),
+])
+@pytest.mark.parametrize("remap_mode", [0, 2])
+def test_gfx1250_mxgemm_persistent_multicast_compiles(dtype_b, block_k, cluster_size, multicast, group_m, remap_mode):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, 3, block_k, XCD_REMAP_MODE=remap_mode, GROUP_SIZE_M=group_m,
+                                                  CLUSTER_SIZE=cluster_size, CLUSTER_MULTICAST=multicast)
+    assert compiled.metadata.num_ctas == 1
+    assert compiled.metadata.ctas_per_cga == (cluster_size, 1, 1)
+    assert compiled.metadata.shared <= 320 * 1024
+    assert "amdg.cluster_barrier_arrive" in compiled.asm["ttgir"]
+    assert "amdg.cluster_barrier_wait" in compiled.asm["ttgir"]
+    assert (" multicast " in compiled.asm["ttgir"]) == multicast
+    asm = compiled.asm["amdgcn"]
+    assert "ds_load_b128" in asm and "ds_store_b128" in asm
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
+
+
+@pytest.mark.parametrize("changes,valid", [
+    ({}, True),
+    ({"group_m": 8}, True),
+    ({"num_programs": 32}, True),
+    ({"xcd_remap": "none"}, True),
+    ({"xcd_remap": "none", "group_m": 8}, True),
+    ({"xcd_remap": "none", "num_xcds": 1, "xcd_chunk": 1}, True),
+    ({"xcd_remap": "balanced"}, False),
+    ({"num_xcds": 4}, False),
+    ({"xcd_chunk": 1}, False),
+    ({"num_xcds": 0}, False),
+    ({"cluster_size": 3}, False),
+    ({"group_m": 2}, False),
+    ({"M": 2304}, False),
+    ({"N": 768}, False),
+    ({"num_programs": 24}, False),
+    ({"num_programs": 48}, False),
+    ({"num_programs": 0}, False),
+    ({"persistent": False}, False),
+    ({"cluster_barrier_interval": 0}, True),
+    ({"cluster_barrier_interval": 4}, True),
+    ({"cluster_barrier_interval": -1}, False),
+    ({"cluster_barrier_interval": 1.5}, False),
+    # Linear multicast clusters must stay within one M group (one N tile) and
+    # reach at most four CTAs.
+    ({"xcd_remap": "none", "cluster_size": 2}, True),
+    ({"xcd_remap": "none", "cluster_size": 4, "group_m": 8}, True),
+    ({"xcd_remap": "none", "cluster_size": 8, "group_m": 4}, False),
+    ({"xcd_remap": "none", "cluster_size": 8, "group_m": 8}, False),
+    ({"xcd_remap": "none", "cluster_size": 16, "group_m": 8}, False),
+    ({"xcd_remap": "none", "cluster_size": 16, "group_m": 8, "cluster_multicast": False}, True),
+    ({"xcd_remap": "none", "cluster_size": 16, "group_m": 8, "cluster_layout": "4x4"}, True),
+])
+def test_gfx1250_mxgemm_persistent_cluster_config_validation(changes, valid):
+    config = dict(M=2048, N=1024, num_programs=16, persistent=True, block_m=256, block_n=256, group_m=4,
+                  xcd_remap="chunked", num_xcds=8, xcd_chunk=2, cluster_size=4)
+    config.update(changes)
+    if valid:
+        _gfx1250_mxfp._validate_mxfp_scheduling(**config)
+    else:
+        with pytest.raises(ValueError):
+            _gfx1250_mxfp._validate_mxfp_scheduling(**config)
+
+
+@pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
+@pytest.mark.parametrize("remap_mode", [0, 2])
+@pytest.mark.parametrize("interval", [0, 4])
+def test_gfx1250_mxgemm_cluster_barrier_interval_compiles(dtype_b, block_k, remap_mode, interval):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, 3, block_k, CLUSTER_SIZE=4, GROUP_SIZE_M=4,
+                                                  XCD_REMAP_MODE=remap_mode, CLUSTER_BARRIER_INTERVAL=interval)
+    ttgir = compiled.asm["ttgir"]
+    assert ("amdg.cluster_barrier_arrive" in ttgir) == (interval > 0)
+    assert ("amdg.cluster_barrier_wait" in ttgir) == (interval > 0)
+    assert " multicast " in ttgir
+    asm = compiled.asm["amdgcn"]
+    assert "ds_load_b128" in asm and "ds_store_b128" in asm
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
+
+
+def _strip_tdm_hazard_waits(asm):
+    """Drop the TDM issue-limit waits the AMDGPU hazard recognizer inserts.
+
+    GCNHazardRecognizer::fixTDM emits ``s_wait_tensorcnt 10`` immediately
+    before a TDM instruction unless an earlier wait already bounds the count
+    by ten. It only caps the number of outstanding TDM operations and never
+    drains the queues these schedule checks reason about.
+    """
+    lines = asm.splitlines(keepends=True)
+    return "".join(line for line, following in zip(lines, lines[1:] + [""])
+                   if not (re.fullmatch(r"\s*s_wait_tensorcnt 0xa\s*", line)
+                           and re.match(r"\s*tensor_(?:load_to|store_from)_lds\b", following)))
+
+
+def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, c_type="*fp32", **constants):
+    kernel = _gfx1250_mxfp.mxgemm_tdm_persistent_kernel
+    signature = dict(a_ptr="*fp8e4nv", b_ptr="*u8" if dtype_b == "e2m1" else "*fp8e4nv", c_ptr=c_type, a_scale="*u8",
+                     b_scale="*u8")
+    # Match bench.py's aligned, sub-2GB tensors and specialize the dimensions
+    # and strides so the persistent kernel can fold descriptor/tile setup.
+    attrs = {(kernel.arg_names.index(name), ): [["tt.divisibility", 16], ["tt.pointer_range", 32]]
+             for name in signature}
+    m, n, k = (constants.get(dim, 8192) for dim in ("M", "N", "K"))
+    config = dict(M=m, N=n, K=k, stride_am=k, stride_bn=k // 2 if dtype_b == "e2m1" else k, stride_cm=n,
+                  stride_as=k * 4, stride_bs=k * 4, DTYPE_B=dtype_b, BLOCK_M=256, BLOCK_N=256, BLOCK_K=block_k,
+                  GROUP_SIZE_M=8, NUM_BUFFERS=num_buffers, NUM_PROGRAMS=256, CROSS_TILE_PREFETCH=block_k == 128,
+                  XCD_REMAP_MODE=0, NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True,
+                  CLUSTER_BARRIER_INTERVAL=1, CLUSTER_LAYOUT="linear")
+    config.update(constants)
+    src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32),
+                              options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(config["CLUSTER_SIZE"], 1, 1)))
+    compiled.asm["amdgcn"] = _strip_tdm_hazard_waits(compiled.asm["amdgcn"])
+    return compiled
+
+
+@pytest.mark.parametrize("cluster_size", [1, 4])
+@pytest.mark.parametrize("k, output_c_slots", [(8192, None), (4096, None), (4096, 3), (16384, 3)])
+def test_gfx1250_mxgemm_static_slot_unroll_keeps_operands_in_place(cluster_size, k, output_c_slots):
+    extra = {} if output_c_slots is None else dict(OUTPUT_C_SLOTS=output_c_slots)
+    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 3, 128, K=k, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=4,
+                                                  CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear",
+                                                  STATIC_SLOT_UNROLL=True, **extra)
+    asm = compiled.asm["amdgcn"]
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    # Peeled, unrolled, and remainder steps share the output's native WMMA
+    # layout: no accumulator conversions, so three C slots fit in LDS.
+    assert "ttg.convert_layout" not in compiled.asm["ttgir"]
+    assert compiled.metadata.shared <= 320 * 1024
+    assert asm.count("tensor_store_from_lds") == 8
+    # The peeled first step reads the tile's zero accumulators as WMMA inline
+    # constants instead of zeroing 512 accumulator VGPRs.
+    wmmas = re.findall(r"^\s+v_wmma_scale_f32_16x16x128_f8f6f4 .*$", asm, re.MULTILINE)
+    # Drop register-name comments such as "/*v[272:287]*/" before matching.
+    wmmas = [re.sub(r"\s*/\*.*?\*/", "", wmma) for wmma in wmmas]
+    assert sum(bool(re.search(r"\], 0, ", wmma)) for wmma in wmmas) == 64
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    bodies = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            bodies.append("\n".join(lines[labels[branch[1]]:i]))
+    # One iteration covers every ring slot. Each step's next-stage operands are
+    # loaded straight into the registers the following step reads, so the
+    # steady loop carries no operand register copies. Cluster rendezvous adds a
+    # second back edge around the same body; check the innermost one.
+    steady = [body for body in bodies if body.count("v_wmma_scale_f32_16x16x128_f8f6f4") == 3 * 64]
+    assert steady
+    body = min(steady, key=len)
+    assert body.count("tensor_load_to_lds") == 3 * 2
+    assert not re.search(r"\bv_(?:dual_)?mov_b(?:32|64)\b", body)
+
+
+@pytest.mark.parametrize("scale_wave256", [False, True])
+@pytest.mark.parametrize("cluster_size", [1, 16])
+def test_gfx1250_mxgemm_merged_handoff_barrier_splits_step_barrier(cluster_size, scale_wave256):
+    # The FP16 bench schedule: four static stages, two C slots, the overlap
+    # peel, and one split workgroup barrier per K step.
+    grid = cluster_size == 16
+    compiled = _compile_gfx1250_mxgemm_persistent("e4m3", 4, 128, c_type="*fp16", K=8192, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=8 if grid else 1,
+                                                  CLUSTER_LAYOUT="4x4" if grid else "linear",
+                                                  XCD_REMAP_MODE=2 if grid else 0, STATIC_SLOT_UNROLL=True,
+                                                  OUTPUT_C_SLOTS=2, OVERLAP_PEEL=True, MERGED_HANDOFF_BARRIER=True,
+                                                  STATIC_CLUSTER_STEPS=grid, SCALE_WAVE256=scale_wave256)
+    asm = compiled.asm["amdgcn"]
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert compiled.metadata.shared <= 320 * 1024
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    bodies = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            bodies.append(lines[labels[branch[1]]:i])
+    steady = [body for body in bodies if sum("v_wmma_scale_f32_16x16x128_f8f6f4" in inst for inst in body) == 4 * 64]
+    assert steady
+    body = min(steady, key=len)
+    # One signal/wait pair per unrolled step and no other workgroup barrier:
+    # relaxed operand reads leave Membar nothing to add around the refills.
+    assert sum(re.match(r"\s+s_barrier_signal -1\b", inst) is not None for inst in body) == 4
+    assert sum(re.match(r"\s+s_barrier_wait -1\b", inst) is not None for inst in body) == 4
+    assert not any(re.match(r"\s+s_barrier\b(?!_)", inst) for inst in body)
+    reads = [match[1] for inst in body if (match := re.match(r"\s+(ds_load\w*)", inst))]
+    if scale_wave256:
+        # Each operand's scales for both quadrants come from one b128 read.
+        assert set(reads) == {"ds_load_b128"}
+    else:
+        assert "ds_load_2addr_b32" in reads
+    # The step derives its scheduling groups from these instruction counts
+    # (see _mxgemm_defer_bottom_k_step). Each wave reads its 64x128-byte part
+    # of an operand quadrant with 16 ds_load_b128 and runs 16 WMMAs per
+    # quadrant dot. C00 reads the second halves of B and A (plus their scales
+    # unless wave256 delivered them with the first halves); C10 and C11 read
+    # the next slot's A and B with their scales; C01 reads nothing.
+    c00_reads = 2 * 16 + (0 if scale_wave256 else 2)
+    regions = [[]]
+    for inst in body:
+        if "sched_barrier" in inst:
+            regions.append([])
+        elif re.match(r"\s+v_wmma", inst):
+            regions[-1].append("W")
+        elif re.match(r"\s+ds_load", inst):
+            regions[-1].append("r")
+    dots = [region for region in regions if region.count("W") == 16]
+    assert {region.count("r") for region in dots} == {0, 17, c00_reads}
+    for region in dots:
+        if region.count("r") == c00_reads:
+            # Four reads after each WMMA; the remaining WMMAs cover the drain.
+            tail = len(region) - 1 - max(i for i, kind in enumerate(region) if kind == "r")
+            assert tail == 16 - (c00_reads + 3) // 4
+
+
+@pytest.mark.parametrize("dtype_b,num_buffers,block_k", [
+    ("e2m1", 2, 128),
+    ("e2m1", 3, 128),
+    ("e2m1", 2, 256),
+    ("e2m1", 3, 256),
+    ("e4m3", 2, 256),
+    ("e4m3", 3, 128),
+    ("e4m3", 4, 128),
+    ("e2m1", 4, 128),
+])
+@pytest.mark.parametrize("k", [4096, 8192])
+@pytest.mark.parametrize("cluster_size,barrier_interval", [(1, 1), (4, 4)], ids=["unclustered", "periodic-cluster"])
+def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, block_k, cluster_size, barrier_interval,
+                                                          k):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, K=k, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=barrier_interval)
+    asm = compiled.asm["amdgcn"]
+    assert "ds_load_b128" in asm and "ds_store_b128" in asm
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+    assert not re.search(r"^\s+ds_store_2addr", asm, re.MULTILINE)
+    assert compiled.metadata.shared <= 320 * 1024
+    assert asm.count("tensor_store_from_lds") == (4 if block_k == 256 else (16 if num_buffers == 4 else 8))
+    grouped_prefetch = block_k == 128 and num_buffers == 4 and dtype_b == "e4m3"
+    assert ("sched_group_barrier" in asm) == grouped_prefetch
+    if dtype_b == "e4m3" and block_k == 128 and num_buffers == 3:
+        # One steady body and one rolled tail retain the native K128 work.
+        # Expanding the tail per ring slot used to duplicate three full bodies.
+        native_mma = re.findall(r"^\s+v_wmma_scale_f32_16x16x128_f8f6f4\s", asm, re.MULTILINE)
+        assert len(native_mma) <= 128, "duplicated native A8W8 compute bodies in the persistent tail"
+
+    # Find the innermost loop containing both compute and a TDM refill. Merely
+    # emitting both kinds of instructions is insufficient: the regression put
+    # every WMMA before the tensor wait, exposing all subsequent operand reads.
+    lines = asm.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    loops = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            body = lines[labels[branch[1]]:i]
+            if any("v_wmma" in inst for inst in body) and any("tensor_load_to_lds" in inst for inst in body):
+                loops.append(body)
+    assert loops, "missing steady compute/refill loop"
+    # The K tail is a loop of similar size; it branches on the next tile.
+    body = min(
+        loops, key=lambda body:
+        (sum("v_wmma" in inst for inst in body), sum("s_cbranch" in inst for inst in body), len(body)))
+    assert not any("scratch_" in inst for inst in body), "register spills in the steady K loop"
+    if dtype_b == "e4m3" and block_k == 128:
+        # Each wave selects its data/scale base once, outside the K loop.
+        # The fused refills then need only their K advances; the three-stage
+        # dynamic loop reads scales first and advances one more base.
+        scales_first = num_buffers == 3
+        assert sum("s_add_nc_u64" in inst for inst in body) <= (3 if scales_first else 2)
+    wait = next(i for i, inst in enumerate(body) if "s_wait_tensorcnt" in inst)
+    load = next(i for i, inst in enumerate(body) if i > wait and "ds_load_b128" in inst)
+    # A periodic cluster barrier can put the refill block before the compute
+    # block in assembly order. Do not count the next iteration's WMMAs as
+    # overlap: independent matrix work must remain in the refill block itself.
+    block_end = next((i for i in range(load + 1, len(body)) if re.match(r"(?:\.LBB\d+_\d+:|; %bb\.\d+:)", body[i])),
+                     len(body))
+    assert any("v_wmma" in inst for inst in body[load + 1:block_end]), "no matrix work overlaps the next operand loads"
+    if grouped_prefetch:
+        # Four independent prefetch regions retain their own scheduling IDs.
+        for sync_id in (101, 102, 103, 104):
+            assert f"SyncID({sync_id})" in "\n".join(body)
+    if block_k == 256 and dtype_b == "e2m1":
+        deferred = sum("v_wmma" in inst for inst in body[wait + 1:block_end])
+        assert deferred >= 64, "too little deferred matrix work covers the refill"
+
+
+@pytest.mark.parametrize("dtype_b,num_buffers", [("e4m3", 2), ("e4m3", 3), ("e4m3", 4), ("e2m1", 3)])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_gfx1250_mxgemm_output_staging_waits_on_reuse(dtype_b, num_buffers, cluster_size):
+    compiled = _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, 128, K=4096, CLUSTER_SIZE=cluster_size,
+                                                  CLUSTER_BARRIER_INTERVAL=4)
+    lines = compiled.asm["amdgcn"].splitlines()
+    stores = [i for i, line in enumerate(lines) if "tensor_store_from_lds" in line]
+    assert len(stores) >= 3
+    output_start = max(i for i in range(stores[0]) if re.match(r"(?:\.LBB\d+_\d+:|; %bb\.\d+:)", lines[i]))
+    # The first two slots are free. Waiting here would drain next-tile
+    # A/B transfers instead of protecting an outstanding output reader.
+    assert not any("s_wait_tensorcnt" in line for line in lines[output_start:stores[1]])
+    # The third chunk reuses slot zero, so the older C transfer must finish
+    # before the first local store into that slot, leaving slot one in flight.
+    reuse = lines[stores[1] + 1:stores[2]]
+    wait = next(i for i, line in enumerate(reuse) if re.search(r"s_wait_tensorcnt\s+(?:0x0*1|1)\b", line))
+    write = next(i for i, line in enumerate(reuse) if "ds_store_" in line)
+    assert wait < write
+
+
+@pytest.mark.parametrize("k", [4096, 8192])
+def test_gfx1250_mxgemm_a8w4_handoff_preserves_slot_stride(k):
+    compiled = _compile_gfx1250_mxgemm_persistent("e2m1", 3, 256, K=k, CROSS_TILE_PREFETCH=True, CLUSTER_SIZE=4,
+                                                  CLUSTER_BARRIER_INTERVAL=4)
+    ttgir, asm = compiled.asm["ttgir"], compiled.asm["amdgcn"]
+    alias = re.search(
+        r"ttg.memdesc_reinterpret %\w+ \{tlx.storage_alias_view\} : "
+        r"!ttg.memdesc<3x256x256xf8E4M3FN, (#\w+),.*? -> !ttg.memdesc<3x128x128xf32, (#\w+),", ttgir)
+    assert alias, "C must reuse the three A slots: " + "\n".join(
+        line for line in ttgir.splitlines() if "local_alloc" in line or "memdesc_reinterpret" in line)
+    paddings = {
+        name: (int(interval), int(padding))
+        for name, interval, padding in re.findall(r"(#\w+) = #ttg.padded_shared<\[(\d+):\+(\d+)\]", ttgir)
+    }
+    strides = []
+    for layout, elements, width in ((alias[1], 256 * 256, 1), (alias[2], 128 * 128, 4)):
+        interval, padding = paddings[layout]
+        strides.append((elements + elements // interval * padding) * width)
+    # Functional simulation can retire stores too quickly to expose an alias
+    # race. Retiring C slot i must free exactly A slot i, including padding.
+    assert strides[0] == strides[1], "C-slot retirement does not protect the corresponding A-slot refill"
+    assert compiled.metadata.shared <= 320 * 1024
+    assert re.findall(r"\bds_store_\w+", asm) == ["ds_store_b128"] * 128
+    assert asm.count("tensor_store_from_lds") == 4
+    assert not re.search(r"^\s+scratch_", asm, re.MULTILINE)
+
+
+@pytest.mark.parametrize("dtype_b,buffers,prefetch,error", [("e2m1", 2, True, "CROSS_TILE_PREFETCH=False"),
+                                                            ("e4m3", 3, False, "2 buffers")])
+def test_gfx1250_mxgemm_persistent_output_reuse_rejects_conflict(dtype_b, buffers, prefetch, error):
+    a = torch.empty((256, 1024), dtype=torch.float8_e4m3fn, device="meta")
+    b = torch.empty((256, 512 if dtype_b == "e2m1" else 1024), dtype=torch.uint8, device="meta")
+    scale = torch.empty((2, 4096), dtype=torch.uint8, device="meta")
+    with pytest.raises(ValueError, match=error):
+        _gfx1250_mxfp.mxgemm_tdm_pipelined(a, b, scale, scale, BLOCK_M=256, BLOCK_N=256, BLOCK_K=256, TRANSPOSE_B=True,
+                                           NUM_BUFFERS=buffers, DTYPE_A="e4m3", DTYPE_B=dtype_b, SCHEDULE="sliceMNK",
+                                           TDM_FUSION="partial", PERSISTENT=True, CROSS_TILE_PREFETCH=prefetch)
+
+
+@pytest.mark.parametrize("DTYPE_B", ["e4m3", "e2m1"])
+@pytest.mark.parametrize("TDM_SPLIT", [False, True])
+@pytest.mark.parametrize("BLOCK_M", [128, 256])
+@pytest.mark.parametrize("BLOCK_K", [128, 256])
+def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M, BLOCK_K):
     from triton.backends.compiler import GPUTarget
     from triton.compiler.compiler import ASTSource, compile as triton_compile
 
@@ -7249,7 +7805,7 @@ def test_gfx1250_mxgemm_tdm_split_compiles():
         fn=_gfx1250_mxfp.mxgemm_tdm_pipelined_kernel,
         signature={
             "a_ptr": "*fp8e4nv",
-            "b_ptr": "*u8",
+            "b_ptr": "*u8" if DTYPE_B == "e2m1" else "*fp8e4nv",
             "c_ptr": "*fp32",
             "a_scale": "*i8",
             "b_scale": "*i8",
@@ -7266,45 +7822,77 @@ def test_gfx1250_mxgemm_tdm_split_compiles():
         },
         constexprs={
             "DTYPE_A": "e4m3",
-            "DTYPE_B": "e2m1",
+            "DTYPE_B": DTYPE_B,
             "SCALE_BLOCK": 32,
-            "BLOCK_M": 256,
+            "BLOCK_M": BLOCK_M,
             "BLOCK_N": 256,
-            "BLOCK_K": 256,
+            "BLOCK_K": BLOCK_K,
             "GROUP_SIZE_M": 8,
             "TRANSPOSE_B": True,
-            "NUM_BUFFERS": 3,
+            "NUM_BUFFERS": 4 if BLOCK_K == 128 else (3 if DTYPE_B == "e2m1" else 2),
             "SCALE_PRESHUFFLE": True,
             "WITH_A_SCALE": True,
             "SCHEDULE": "sliceMNK",
             "TDM_FUSION": "partial",
             "L2_PREFETCH_DISTANCE": -1,
-            "TDM_SPLIT": True,
+            "TDM_SPLIT": TDM_SPLIT,
+            "TILES_PER_WARP": (2, 2),
         },
     )
-    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32),
+                              options=_gfx1250_mxfp.PIPELINED_COMPILE_OPTIONS)
     ttgir = compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
     assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
     assert "amdg.async_tdm_copy_local_to_global" in ttgir
-    assert "warp_used_hints = array<i32: 5, 10>" in ttgir
+    if TDM_SPLIT:
+        assert "warp_used_hints = array<i32: 5, 10>" in ttgir
     assert "tt.dot_scaled" in ttgir
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
     assert "wmma" in amdgcn
+    # K128 stages need one native K128 contribution per output quadrant.
+    # Two padded K64 halves pass numerical checks but double the matrix work.
+    lines = amdgcn.splitlines()
+    labels = {match[1]: i for i, line in enumerate(lines) if (match := re.match(r"(\.LBB\d+_\d+):", line))}
+    loops = []
+    for i, line in enumerate(lines):
+        branch = re.match(r"\s+s_cbranch_\w+\s+(\.LBB\d+_\d+)", line)
+        if branch and labels[branch[1]] < i:
+            body = lines[labels[branch[1]]:i]
+            if any("v_wmma" in inst for inst in body) and any("tensor_load_to_lds" in inst for inst in body):
+                loops.append(body)
+    assert loops, "missing steady compute/refill loop"
+    body = min(loops, key=len)
+    assert sum("v_wmma" in inst for inst in body) == BLOCK_M * 256 // (4 * 16 * 16) * (BLOCK_K // 128)
+    assert not any("scratch_" in inst for inst in body)
+    assert compiled.metadata.shared <= 320 * 1024
+    # Scale distributions must survive the loop edge without an LDS exchange.
+    # Output quadrants should vectorize directly, avoiding paired-address
+    # stores and their high-register DATA1 path.
+    lds_stores = re.findall(r"\bds_store_\w+", amdgcn)
+    assert set(lds_stores) == {"ds_store_b128"}
+    assert len(lds_stores) == BLOCK_M * 256 // (4 * 32 * 4)
+    assert amdgcn.count("tensor_store_from_lds") + amdgcn.count("tensor.store.from.lds") == 1
 
 
-def test_gfx1250_attn_fwd_tdm_pipelined_compiles():
+@pytest.mark.parametrize("dtype,output_dtype,block_m,block_n,fixed", [
+    ("bf16", "fp32", 128, 128, False),
+    ("fp16", "fp16", 256, 64, True),
+    ("bf16", "bf16", 256, 64, True),
+])
+def test_gfx1250_attn_fwd_tdm_pipelined_compiles(dtype, output_dtype, block_m, block_n, fixed):
     """Compile-only check: lowers cleanly to TDM intrinsics + WMMA."""
     from triton.compiler.compiler import ASTSource, compile as triton_compile
     from triton.backends.compiler import GPUTarget
+    from triton.tlx.ops.kernels.flash_attn.gfx1250 import attn_fwd_tdm_pipelined_kernel
 
     src = ASTSource(
-        fn=_gfx1250_attention.attn_fwd_tdm_pipelined_kernel,
+        fn=attn_fwd_tdm_pipelined_kernel,
         signature={
-            "q_ptr": "*bf16",
-            "k_ptr": "*bf16",
-            "v_ptr": "*bf16",
-            "o_ptr": "*fp32",
+            "q_ptr": f"*{dtype}",
+            "k_ptr": f"*{dtype}",
+            "v_ptr": f"*{dtype}",
+            "o_ptr": f"*{output_dtype}",
             "stride_qz": "i64",
             "stride_qh": "i64",
             "stride_qm": "i64",
@@ -7327,14 +7915,20 @@ def test_gfx1250_attn_fwd_tdm_pipelined_compiles():
             "BLOCK_M": "constexpr",
             "BLOCK_N": "constexpr",
             "HEAD_SZ": "constexpr",
+            "USE_FIXED_REFERENCE": "constexpr",
+            "QUERY_TILES_FIRST": "constexpr",
+            "BATCH": "i32",
+            "NUM_HEADS": "i32",
         },
         constexprs={
             "SM_SCALE": 1.0 / (128**0.5),
             "SEQLEN_Q": 1024,
             "SEQLEN_K": 1024,
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
             "HEAD_SZ": 128,
+            "USE_FIXED_REFERENCE": fixed,
+            "QUERY_TILES_FIRST": fixed,
         },
     )
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options={"num_warps": 4})
@@ -7686,3 +8280,863 @@ def test_amd_tdm_rank_reducing_load_rejects_partitioned_destination():
     with pytest.raises(RuntimeError, match="is inconsistent with the shared memory allocation layout"):
         triton_compile(ASTSource(kernel, signature=dict(x_ptr="*fp16")), target=GPUTarget("hip", "gfx1250", 32),
                        options=dict(num_warps=4))
+
+
+# gfx1250 attention backward (triton.tlx.ops.kernels.flash_attn.gfx1250_bwd): config selection and
+# compile-only ISA checks. Runtime correctness stays in test_tlx_amd_gfx1250.py.
+
+
+# Keep the eight-wave policy tests independent of the measured OCC1 selector.
+@pytest.mark.parametrize("batch,hq,hk,n,num_cus,packed_dq,splits,pingpong,spread_dq,block_m,cache_score_k,tile_major", [
+    (8, 64, 8, 1024, 192, True, 3, True, False, 64, False, True),
+    (8, 64, 8, 2048, 192, True, 3, True, False, 64, False, True),
+    (15, 64, 8, 16384, 192, True, 3, True, False, 64, False, True),
+    (8, 64, 8, 16384, 384, True, 3, True, False, 64, False, True),
+    (8, 64, 8, 16384, 192, False, 3, True, True, 64, False, True),
+    (8, 32, 8, 2048, 192, True, 3, True, False, 64, False, True),
+    (8, 64, 8, 768, 192, True, 3, True, False, 64, False, False),
+    (1, 1, 1, 256, 192, True, 2, True, False, 64, False, False),  # two steps per split
+    (1, 1, 1, 256, 1, True, 2, True, False, 64, False, False),
+    (8, 64, 8, 1152, 192, True, 1, True, False, 32, False, False),
+    (2, 6, 2, 384, 192, True, 1, False, False, 32, False, False),
+    (8, 64, 8, 1024, 192, False, 3, True, True, 64, False, True),
+    (8, 64, 8, 2048, 192, False, 3, True, True, 64, False, True),
+    (8, 32, 8, 2048, 192, False, 3, True, True, 64, False, True),
+    (8, 64, 8, 1152, 192, False, 1, True, False, 32, False, False),
+    # Literal MHA expectations from the matched 1K-16K cache/split sweep.
+    (16, 16, 16, 1024, 192, True, 1, True, False, 32, True, True),
+    (16, 16, 16, 2048, 192, True, 1, True, False, 32, True, True),
+    (16, 16, 16, 4096, 192, True, 1, True, False, 32, True, True),
+    (16, 16, 16, 8192, 192, True, 1, True, False, 32, True, True),
+    (16, 16, 16, 16384, 192, True, 3, True, False, 64, False, True),
+    (16, 16, 16, 1024, 192, False, 1, True, False, 32, True, True),
+    (16, 16, 16, 2048, 192, False, 1, True, False, 32, True, True),
+    (16, 16, 16, 4096, 192, False, 1, True, False, 32, True, True),
+    (16, 16, 16, 8192, 192, False, 1, True, False, 32, True, True),
+    (16, 16, 16, 16384, 192, False, 3, True, True, 64, False, True),
+])
+def test_attention_backward_base_split_selection(batch, hq, hk, n, num_cus, packed_dq, splits, pingpong, spread_dq,
+                                                 block_m, cache_score_k, tile_major):
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _select_config_base as select_config
+
+    original = select_config(n, packed_dq=packed_dq)
+    assert original.q_splits == 1 and not original.pingpong and not original.spread_dq
+    assert original.packed_dq == packed_dq and not original.cache_score_k and not original.tile_major
+    config = select_config(n, batch, hq, hk, num_cus=num_cus, packed_dq=packed_dq)
+    assert config.block_n == original.block_n
+    assert config.q_splits == splits
+    assert config.pingpong == pingpong
+    assert config.spread_dq == spread_dq
+    assert config.block_m == block_m
+    assert config.cache_score_k == cache_score_k
+    assert config.packed_dq == packed_dq
+    assert config.tile_major == tile_major
+    if pingpong:
+        assert config.reuse_q and not config.regalloc
+        assert config.preprocess_block == 64 and config.convert_block == 4096
+
+
+@pytest.mark.parametrize("shape,packed_dq,partition,front,bridge", [
+    ((8, 64, 8, 2048), True, True, 1, 0),
+    ((8, 64, 8, 2048), False, True, 1, 0),
+    ((8, 64, 8, 16384), True, True, 2, 2),
+    ((8, 64, 8, 16384), False, True, 1, 0),
+    ((3, 64, 8, 4096), True, True, 1, 0),
+    ((4, 32, 4, 16384), True, True, 2, 2),
+    ((16, 16, 16, 1024), True, True, 0, 0),  # BM32: cached score K replaces the front regions
+    ((16, 16, 16, 1024), False, True, 0, 4),
+    ((16, 16, 16, 2048), False, True, 0, 4),
+    ((16, 16, 16, 4096), False, True, 0, 4),
+    ((16, 16, 16, 2048), True, True, 0, 0),
+    ((16, 16, 16, 4096), True, True, 0, 0),
+    ((16, 16, 16, 8192), False, True, 0, 0),
+    ((16, 16, 16, 16384), True, True, 1, 0),
+    ((2, 16, 16, 4096), False, True, 0, 4),
+    ((8, 16, 16, 2048), False, True, 0, 4),
+    ((16, 32, 32, 1024), False, True, 0, 4),
+    ((4, 16, 16, 4096), False, True, 0, 4),
+    ((1, 8, 8, 4096), False, True, 1, 0),  # MHA grid below one wave: BM64 path
+    ((8, 64, 8, 1152), True, False, 0, 0),  # BN128
+    ((2, 6, 2, 384), True, False, 0, 0),
+])
+def test_attention_backward_base_lds_selection(shape, packed_dq, partition, front, bridge):
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _select_config_base as select_config
+
+    b, hq, hk, n = shape
+    config = select_config(n, b, hq, hk, num_cus=192, packed_dq=packed_dq)
+    assert config.partition_lds == partition
+    assert config.front_regions == front and config.bridge_regions == bridge
+    legacy = select_config(n, packed_dq=packed_dq)
+    assert not legacy.partition_lds and legacy.front_regions == 0 and legacy.bridge_regions == 0
+
+
+@pytest.mark.parametrize("n", [1024, 2048, 4096, 8192, 16384])
+@pytest.mark.parametrize("packed_dq", [False, True])
+def test_attention_backward_base_cluster_selection(n, packed_dq):
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _select_config_base as select_config
+
+    config = select_config(n, 16, 16, 16, num_cus=192, packed_dq=packed_dq)
+    assert config.cluster_dq and config.tile_major
+    assert config.q_splits == (3 if n == 16384 else 1) and config.block_n == 256
+    assert select_config(n, 8, 16, 16, num_cus=192, packed_dq=packed_dq).cluster_dq
+    gqa = select_config(n, 8, 64, 8, num_cus=192, packed_dq=packed_dq)
+    assert gqa.cluster_dq and gqa.tile_major and gqa.q_splits == 3
+    # Legacy n-only calls and other sequence lengths stay unchanged.
+    assert not select_config(n, packed_dq=packed_dq).cluster_dq
+    assert select_config(8192, 16, 16, 16, num_cus=192, packed_dq=packed_dq).cluster_dq
+    assert select_config(8192, 8, 64, 8, num_cus=192, packed_dq=packed_dq).cluster_dq
+    assert not select_config(n + 512, 16, 16, 16, num_cus=192, packed_dq=packed_dq).cluster_dq
+    assert not select_config(n + 512, 8, 64, 8, num_cus=192, packed_dq=packed_dq).cluster_dq
+
+
+def _compile_attention_backward_kernel(config, shape, *, compile_options=None, constants_overrides=None):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _compiler_options, _delayed_bwd_kernel
+
+    b, hq, hk, n = shape
+    constants = dict(HQ=hq, HK=hk, N=n, SM_SCALE=128**-0.5, BM=config.block_m, BN=config.block_n, NW=config.num_warps,
+                     TDM=config.use_tdm, STAGES=config.stages, DELAYED=config.delayed, UNROLL=config.unroll,
+                     FRAGMENT_FENCES=config.fragment_fences, FRAGMENT_FENCE_MASK=config.fragment_fence_mask,
+                     FRAGMENTED=config.fragmented, RESIDENT_KV=config.resident_kv, ORDERED=config.ordered,
+                     PACKED_DQ=config.packed_dq, REMATERIALIZE=config.rematerialize, OUTER_M=config.outer_m,
+                     ASYNC_STATS=config.async_stats, Q_SPLITS=config.q_splits, REUSE_Q=config.reuse_q,
+                     PINGPONG=config.pingpong, SPREAD_DQ=config.spread_dq, LOG2_LSE=config.log2_lse,
+                     CACHE_SCORE_K=config.cache_score_k, TILE_MAJOR=config.tile_major,
+                     PARTITION_LDS=config.partition_lds, FRONT_REGIONS=config.front_regions,
+                     BRIDGE_REGIONS=config.bridge_regions, CLUSTER_DQ=config.cluster_dq,
+                     DQ_SLICES=max(1, n // config.block_n // 16) if config.cluster_dq else 1, OCC1=config.occ1,
+                     OCC1_K_BANDS=config.occ1_k_bands, OCC1_PREFETCH=config.occ1_prefetch, OCC1_SCHED=config.occ1_sched,
+                     PHASE_IGLP=config.phase_iglp, OCC1_DQ_FIRST=config.occ1_dq_first,
+                     OCC1_LOAD_AFTER_DK=config.occ1_load_after_dk, OCC1_PAD_K=config.occ1_pad_k, CAUSAL=False)
+    constants["SPLIT_KV_STORES"] = config.occ1 and config.packed_dq and config.q_splits > 1
+    constants["MERGE_STATS"] = config.merge_stats
+    tail_splits = getattr(config, "tail_splits", 1)
+    tail_base = tail_owners = 0
+    if tail_splits > 1:
+        from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _tail_partition
+        tail_base, tail_owners = _tail_partition(config, b, hk, n, num_cus=192)
+    constants.update(TAIL_SPLITS=tail_splits, TAIL_BASE=tail_base, TAIL_OWNERS=tail_owners)
+    if tail_splits == 1:
+        constants.update(TAIL_DK=None, TAIL_DV=None)
+    constants.update(constants_overrides or {})
+    signature = {name: "*bf16" for name in ("Q", "K", "V", "DO")}
+    signature.update({name: "*fp32" for name in ("LSE", "Delta")})
+    signature["DQA"] = "*bf16" if config.packed_dq else "*fp32"
+    if config.merge_stats:
+        signature["STATS_STRIDE"] = "i32"
+    else:
+        constants["STATS_STRIDE"] = 0
+    signature.update({name: "*fp32" if config.q_splits > 1 else "*bf16" for name in ("DK", "DV")})
+    if tail_splits > 1:
+        signature.update(DK="*fp32", DV="*fp32", TAIL_DK="*bf16", TAIL_DV="*bf16")
+    attrs = {(_delayed_bwd_kernel.arg_names.index(name), ): [("tt.divisibility", 16)] for name in signature}
+    if config.occ1:
+        # Match runtime specialization: these buffers have a known byte range.
+        qe, ke = b * hq * n * 128, b * hk * n * 128
+        sizes = dict(Q=qe * 2, K=ke * 2, V=ke * 2, DO=qe * 2, LSE=b * hq * n * 4,
+                     Delta=b * hq * n * 4 * (2 if config.merge_stats else 1),
+                     DQA=qe * (2 if config.packed_dq else 4) * constants["DQ_SLICES"],
+                     DK=ke * (4 * config.q_splits if config.q_splits > 1 else 2),
+                     DV=ke * (4 * config.q_splits if config.q_splits > 1 else 2))
+        if tail_splits > 1:
+            sizes.update(DK=tail_owners * config.block_n * 128 * 4 * tail_splits,
+                         DV=tail_owners * config.block_n * 128 * 4 * tail_splits, TAIL_DK=ke * 2, TAIL_DV=ke * 2)
+        for name, size in sizes.items():
+            if size <= 2**31 - 1:
+                attrs[(_delayed_bwd_kernel.arg_names.index(name), )].append(("tt.pointer_range", 32))
+    return triton.compile(ASTSource(_delayed_bwd_kernel, signature, constants,
+                                    attrs=attrs), target=GPUTarget("hip", "gfx1250", 32),
+                          options={**_compiler_options(config, n), **(compile_options or {})})
+
+
+def _attention_backward_isa_loop(assembly):
+    import re
+
+    lines = assembly.splitlines()
+    labels = {}
+    loops = []
+    for index, line in enumerate(lines):
+        label = re.match(r"^([.\w]+):", line)
+        if label:
+            labels[label[1]] = index
+        branch = re.match(r"\s*s_(?:cbranch_\w+|branch)\s+([.\w]+)", line)
+        if branch and labels.get(branch[1], index) < index:
+            loops.append(lines[labels[branch[1]]:index + 1])
+    return max(loops, key=lambda body: sum("v_wmma_" in line for line in body))
+
+
+def _assert_occ1_scratch_outside_loop(assembly):
+    import re
+
+    # The non-causal VA_VDST anti-hint may leave a one-time spill outside the main loop;
+    # scratch traffic inside the loop, or a larger spill, is still a regression.
+    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) <= 32
+    assert not any("scratch_" in line for line in _attention_backward_isa_loop(assembly))
+
+
+@pytest.mark.parametrize("spread_dq,log2_lse,cache_score_k", [
+    (False, False, False),
+    (True, False, False),
+    (False, True, False),
+    (True, True, False),
+    (False, False, True),
+    (False, True, True),
+])
+def test_attention_backward_fp32_dq_addressing(spread_dq, log2_lse, cache_score_k):
+    import dataclasses
+    import re
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _select_config_base as select_config
+
+    # FP32 dQ atomics must share one address VGPR with immediate offsets.
+    # Otherwise each atomic rewrites the address and waits on s_wait_xcnt.
+    hq, hk = (16, 16) if cache_score_k else (64, 8)
+    config = dataclasses.replace(select_config(2048, 16 if cache_score_k else 8, hq, hk, num_cus=192,
+                                               packed_dq=False), spread_dq=spread_dq, log2_lse=log2_lse,
+                                 cache_score_k=cache_score_k, block_m=32 if cache_score_k else 64,
+                                 q_splits=1 if cache_score_k else 3, front_regions=0 if cache_score_k else 1)
+    kernel = _compile_attention_backward_kernel(config, (16 if cache_score_k else 8, hq, hk, 2048))
+    memory_atomics = [
+        line for line in kernel.asm["amdgcn"].splitlines() if re.match(r"\s*(?:buffer|global|flat)_atomic_", line)
+    ]
+    # Cluster dQ atomics use SE scope; split dK/dV partials keep device scope.
+    assert memory_atomics and all("scope:SCOPE_SE" in line or "scope:SCOPE_DEV" in line for line in memory_atomics)
+    loop = _attention_backward_isa_loop(kernel.asm["amdgcn"])
+    atomics = [line for line in loop if "buffer_atomic_add_f32" in line]
+    scope = "scope:SCOPE_SE" if config.cluster_dq else "scope:SCOPE_DEV"
+    assert all(scope in line for line in atomics)
+    assert (any("0x3fb8aa3b" in line for line in loop)) == (not log2_lse)
+    assert len(atomics) == (16 if cache_score_k else 32)
+    addresses = [re.search(r",\s*(v\d+)(?:\s*/\*(v\d+)\*/)?\s*,\s*s\[", line) for line in atomics]
+    assert len({match[2] or match[1] for match in addresses}) == 1
+    assert not any("s_wait_xcnt" in line for line in loop)
+    assert sum("v_wmma_" in line for line in loop) == (80 if cache_score_k else 160)
+    assert sum(bool(re.match(r"\s*ds_load", line)) for line in loop) == (136 if cache_score_k else 240)
+    assert int(re.search(r"\.vgpr_count:\s*(\d+)", kernel.asm["amdgcn"])[1]) <= 512
+    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", kernel.asm["amdgcn"])[1]) == 0
+
+
+@pytest.mark.parametrize("shape,packed_dq", [((8, 64, 8, 16384), True), ((8, 64, 8, 16384), False),
+                                             ((16, 16, 16, 1024), True), ((16, 16, 16, 1024), False)])
+def test_attention_backward_partitioned_lds_assembly(shape, packed_dq):
+    import re
+    from pathlib import Path
+    from triton.tlx.ops.kernels.flash_attn import gfx1250_bwd
+
+    config = gfx1250_bwd._select_config_base(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq)
+    assert config.partition_lds
+    kernel = _compile_attention_backward_kernel(config, shape)
+    assembly, llir = kernel.asm["amdgcn"], kernel.asm["llir"]
+    assert kernel.metadata.shared <= 327680
+    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == 0
+    assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 512
+    loop = _attention_backward_isa_loop(assembly)
+    assert sum("v_wmma_" in line for line in loop) == (160 if config.block_m == 64 else 80)
+    assert sum(bool(re.match(r"\s*ds_load", line)) for line in loop) == (240 if config.block_m == 64 else 136)
+    assert sum("s_barrier_wait -1" in line for line in loop) == 2
+    assert "partitionDim = 1" in kernel.asm["ttgir"]
+    # The dS seed constructs both physical piece pointers at its source
+    # location. Every ring stage of each piece must stay in its own 64 KiB
+    # LDS partition.
+    lines = Path(gfx1250_bwd.__file__).read_text().splitlines()
+    seed_line = next(i for i, line in enumerate(lines, 1) if "tlx.local_store(tlx.local_view(dsb, (step_start" in line)
+    locations = re.findall(r"!(\d+) = !DILocation\(line: " + str(seed_line) + r",", llir)
+    seed = [
+        line for line in llir.splitlines() if any(
+            re.search(r"!dbg !" + location + r"\b", line) for location in locations)
+    ]
+    bases = {int(value) for line in seed for value in re.findall(r"@global_smem, i32 (\d+)", line)}
+    if not bases:
+        # LLVM may fold the two piece pointers into one GEP:
+        # @global_smem + piece * stride + offset, where piece is a single lane bit.
+        defs = dict(re.findall(r"^\s*(%\d+) = (.*?), !dbg !\d+$", "\n".join(seed), re.M))
+        smem, piece_offset = re.search(r"(%\d+) = getelementptr i8, ptr addrspace\(3\) @global_smem, i32 (%\d+)",
+                                       "\n".join(seed)).groups()
+        piece, stride = re.fullmatch(r"mul nuw nsw i32 (%\d+), (\d+)", defs[piece_offset]).groups()
+        masked, shift = re.fullmatch(r"lshr exact i32 (%\d+), (\d+)", defs[piece]).groups()
+        assert re.fullmatch(r"and i32 %\d+, " + str(1 << int(shift)), defs[masked])
+        offset = int(re.search(r"ptr addrspace\(3\) " + smem + r", i32 (\d+)", "\n".join(seed))[1])
+        bases = {offset, offset + int(stride)}
+    assert len(bases) == 2
+    piece_bytes = 3 * config.block_m * (config.block_n // 2) * 2 * 528 // 512
+    partitions = [set(range(base // 65536, (base + piece_bytes - 1) // 65536 + 1)) for base in sorted(bases)]
+    assert partitions[0].isdisjoint(partitions[1])
+    assert all(base + piece_bytes <= kernel.metadata.shared for base in bases)
+
+
+@pytest.mark.parametrize("packed_dq", [True, False])
+def test_attention_backward_bridge_regions_assembly(packed_dq):
+    import dataclasses
+    import re
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _select_config_base as select_config
+
+    shape = (8, 64, 8, 16384)
+    config = dataclasses.replace(select_config(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq),
+                                 front_regions=2, bridge_regions=2)
+    kernel = _compile_attention_backward_kernel(config, shape)
+    assembly = kernel.asm["amdgcn"]
+    assert kernel.metadata.shared <= 327680
+    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == 0
+    assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 512
+    loop = _attention_backward_isa_loop(assembly)
+    assert sum("v_wmma_" in line for line in loop) == 160
+    assert sum(bool(re.match(r"\s*ds_load", line)) for line in loop) == 240
+    assert sum("s_barrier_wait -1" in line for line in loop) == 2
+    regions = kernel.asm["llir"].split("call void @llvm.amdgcn.sched.barrier(i32 0)")
+    assert len(regions) >= 24
+    # Native WMMA blocks and their next-region LDS reads stay in separate
+    # full-fence intervals. The final blocks need no next read.
+    blocks = [region for region in regions if region.count("call <8 x float> @llvm.amdgcn.wmma") in (4, 8)]
+    assert len(blocks) >= 16
+    assert sum("ptr addrspace(3)" in block for block in blocks) >= 12
+
+
+@pytest.mark.parametrize("packed_dq", [False, True])
+@pytest.mark.parametrize("bridge_regions", [3, 4])
+def test_attention_backward_early_q_assembly(packed_dq, bridge_regions):
+    import dataclasses
+    from pathlib import Path
+    import re
+    from triton.tlx.ops.kernels.flash_attn import gfx1250_bwd
+
+    shape = (16, 16, 16, 1024)
+    config = dataclasses.replace(
+        gfx1250_bwd._select_config_base(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq),
+        bridge_regions=bridge_regions)
+    kernel = _compile_attention_backward_kernel(config, shape)
+    assembly = kernel.asm["amdgcn"]
+    assert kernel.metadata.shared <= 327680
+    assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 512
+    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == 0
+    loop = _attention_backward_isa_loop(assembly)
+    assert sum("v_wmma_" in line for line in loop) == 80
+    assert sum(bool(re.match(r"\s*ds_load", line)) for line in loop) == 136
+    assert sum("s_barrier_wait -1" in line for line in loop) == 2
+    assert not any("s_wait_xcnt" in line for line in loop)
+    if not packed_dq:
+        atomics = [line for line in loop if "buffer_atomic_add_f32" in line]
+        addresses = [re.search(r",\s*(v\d+)(?:\s*/\*(v\d+)\*/)?\s*,\s*s\[", line) for line in atomics]
+        assert len(atomics) == 16
+        assert len({match[2] or match[1] for match in addresses}) == 1
+
+    source = Path(gfx1250_bwd.__file__).read_text().splitlines()
+
+    def marker(name):
+        matches = [i for i, line in enumerate(source, 1) if line.strip() == "# " + name]
+        assert len(matches) == 1, (name, matches)
+        return matches[0]
+
+    begin = marker("early-q-seed-begin")
+    end = marker("early-q-seed-end")
+    join_line = marker("early-q-front-join") + 1
+    assert source[join_line - 1].strip() == "tlx.workgroup_barrier()"
+    location = None
+    seed_reads = []
+    front_joins = []
+    lookahead_reads = []
+    lookahead_begin = marker("early-q-lookahead-begin")
+    lookahead_end = marker("early-q-lookahead-end")
+    for index, line in enumerate(loop):
+        if line.lstrip().startswith(".loc"):
+            match = re.search(r"gfx1250_bwd\.py:(\d+):", line)
+            location = int(match[1]) if match else None
+        if location is not None and begin < location < end and re.match(r"\s*ds_load", line):
+            seed_reads.append(index)
+        if location is not None and lookahead_begin < location < lookahead_end and re.match(r"\s*ds_load", line):
+            lookahead_reads.append(index)
+        if location == join_line and "s_barrier_wait -1" in line:
+            front_joins.append(index)
+    # The first panel moves across the existing front rendezvous. It adds
+    # neither an operand read nor a workgroup barrier to the steady loop.
+    assert len(seed_reads) == 4
+    # LLVM may rotate the loop so its other rendezvous appears first in
+    # assembly. Identify the front rendezvous by its source location.
+    assert len(front_joins) == 1
+    assert max(seed_reads) < front_joins[0]
+
+    # Mode 4 loads exactly three further Q panels through its lookahead
+    # branch. This also detects an earlier branch shadowing the new path.
+    assert len(lookahead_reads) == (12 if bridge_regions == 4 else 0)
+
+
+@pytest.mark.parametrize("changes,n", [
+    ({}, 1536),
+    ({}, 6144),
+    ({"tile_major": False}, 1024),
+    ({"block_n": 128}, 1024),
+])
+def test_attention_backward_cluster_validation(changes, n):
+    import dataclasses
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import BackwardConfig, _compiler_options
+
+    config = dataclasses.replace(BackwardConfig(tile_major=True, cluster_dq=True), **changes)
+    with pytest.raises(ValueError, match="cluster_dq requires"):
+        _compiler_options(config, n)
+
+
+@pytest.mark.parametrize("n", [512, 1024, 2048, 4096, 8192])
+@pytest.mark.parametrize("packed_dq", [False, True])
+def test_attention_backward_cluster_assembly(n, packed_dq):
+    import dataclasses
+    import re
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _select_config_base as select_config
+
+    config = dataclasses.replace(select_config(1024, 16, 16, 16, num_cus=192, packed_dq=packed_dq), tile_major=True,
+                                 cluster_dq=True)
+    kernel = _compile_attention_backward_kernel(config, (1, 16, 16, n))
+    # Keep the cluster launch fixed when isolating the atomic scope change.
+    baseline = _compile_attention_backward_kernel(dataclasses.replace(config, cluster_dq=False), (1, 16, 16, n),
+                                                  compile_options={"ctas_per_cga": (min(n // 256, 16), 1, 1)},
+                                                  constants_overrides={"DQ_SLICES": max(1, n // 4096)})
+    assembly = kernel.asm["amdgcn"]
+    atomics = [line for line in assembly.splitlines() if re.match(r"\s*buffer_atomic_", line)]
+    # With one Q split, the main kernel has only dQ atomics; dK/dV are stores.
+    assert len(atomics) == (16 if packed_dq else 32)
+    assert all("scope:SCOPE_SE" in line for line in atomics)
+    # LLVM's existing instruction prefetch also uses SE scope. It is not an
+    # atomic and must remain identical in the complete instruction comparison.
+    memory_atomics = [line for line in assembly.splitlines() if re.match(r"\s*(?:buffer|global|flat)_atomic_", line)]
+    assert sum("scope:SCOPE_SE" in line for line in memory_atomics) == len(atomics)
+    assert kernel.metadata.shared == baseline.metadata.shared
+    assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 512
+    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == 0
+    loop = _attention_backward_isa_loop(assembly)
+    assert sum("v_wmma_" in line for line in loop) == 80
+    assert sum(bool(re.match(r"\s*ds_load", line)) for line in loop) == 136
+    assert sum("s_barrier_wait" in line for line in loop) == 2
+    assert not any("s_wait_xcnt" in line for line in loop)
+
+    def instructions(text):
+        return [
+            " ".join(re.sub(r"/\*.*?\*/", "", line).split("//")[0].split())
+            for line in text.splitlines()
+            if re.match(r"\s*(?:s_|v_|ds_|buffer_|flat_|global_|scratch_|tensor_|image_)\w", line)
+        ]
+
+    assert instructions(assembly) == [
+        line.replace("scope:SCOPE_DEV", "scope:SCOPE_SE") if "buffer_atomic_" in line else line
+        for line in instructions(baseline.asm["amdgcn"])
+    ]
+
+
+@pytest.mark.parametrize("packed_dq", [False, True])
+@pytest.mark.parametrize("shape", [(8, 64, 8, 2048), (8, 64, 8, 8192)])
+def test_attention_backward_cluster_split_assembly(packed_dq, shape):
+    import dataclasses
+    import re
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _select_config_base as select_config
+
+    config = dataclasses.replace(select_config(shape[3], *shape[:3], num_cus=192, packed_dq=packed_dq), tile_major=True,
+                                 cluster_dq=True)
+    assert config.q_splits > 1
+    kernel = _compile_attention_backward_kernel(config, shape)
+    baseline = _compile_attention_backward_kernel(dataclasses.replace(config, cluster_dq=False), shape,
+                                                  compile_options={"ctas_per_cga": (min(shape[3] // 256, 16), 1, 1)},
+                                                  constants_overrides={"DQ_SLICES": max(1, shape[3] // 4096)})
+
+    def instructions(text):
+        return [
+            " ".join(re.sub(r"/\*.*?\*/", "", line).split("//")[0].split())
+            for line in text.splitlines()
+            if re.match(r"\s*(?:s_|v_|ds_|buffer_|flat_|global_|scratch_|tensor_|image_)\w", line)
+        ]
+
+    assert kernel.metadata.shared == baseline.metadata.shared
+    assert int(re.search(r"\.vgpr_count:\s*(\d+)", kernel.asm["amdgcn"])[1]) <= 512
+    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", kernel.asm["amdgcn"])[1]) == 0
+    new, old = instructions(kernel.asm["amdgcn"]), instructions(baseline.asm["amdgcn"])
+    assert len(new) == len(old)
+    changed = [(a, b) for a, b in zip(new, old) if a != b]
+    # Only dQ atomics move to SE scope; the dK/dV split partials stay device scoped.
+    assert changed and all(
+        a.startswith("buffer_atomic_") and a == b.replace("scope:SCOPE_DEV", "scope:SCOPE_SE") for a, b in changed)
+    atomics = [line for line in new if line.startswith("buffer_atomic_")]
+    assert sum("scope:SCOPE_SE" in line for line in atomics) == len(changed)
+    assert sum("scope:SCOPE_DEV" in line for line in atomics) > 0
+
+
+def _attention_backward_occ1_config(packed_dq, *, q_splits=1):
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import BackwardConfig
+
+    return BackwardConfig(block_m=32, num_warps=4, stages=3, ordered=True, packed_dq=packed_dq, outer_m=64,
+                          async_stats=True, queue_wmma=True, regalloc=True, q_splits=q_splits, waves_per_eu=1,
+                          convert_block=8192 if q_splits > 1 and packed_dq else 4096, tile_major=True, cluster_dq=True,
+                          occ1=True, occ1_k_bands=2, occ1_load_after_dk=True, occ1_pad_k=not packed_dq or q_splits == 1,
+                          log2_lse=True, merge_stats=True)
+
+
+def _attention_backward_occ1_pad_k(config):
+    import dataclasses
+
+    # Split packed kernels keep the unpadded K image; padding spills them.
+    pad_k = not config.packed_dq or config.q_splits == 1 and config.tail_splits == 1
+    return dataclasses.replace(config, occ1_pad_k=pad_k) if config.occ1 else config
+
+
+@pytest.mark.parametrize("packed_dq", [False, True])
+@pytest.mark.parametrize("shape,q_splits", [
+    ((1, 8, 2, 512), 3),
+    ((1, 8, 2, 4096), 1),
+    ((1, 8, 2, 8192), 1),
+    ((1, 4, 4, 512), 2),
+    ((1, 4, 4, 512), 3),
+    ((1, 4, 4, 512), 4),
+    ((1, 64, 8, 512), 2),
+    ((1, 64, 8, 512), 3),
+    ((1, 64, 8, 512), 4),
+])
+def test_attention_backward_occ1_assembly(shape, q_splits, packed_dq):
+    import re
+
+    config = _attention_backward_occ1_config(packed_dq, q_splits=q_splits)
+    kernel = _compile_attention_backward_kernel(config, shape)
+    assembly = kernel.asm["amdgcn"]
+    assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
+    # TODO(T298388915): restore spill-free codegen for the admitted sizes below.
+    expected_private = {
+        ((1, 8, 2, 512), 3, True): 24,
+        ((1, 8, 2, 4096), 1, False): 16,
+        ((1, 8, 2, 4096), 1, True): 32,
+        ((1, 8, 2, 8192), 1, False): 16,
+        ((1, 8, 2, 8192), 1, True): 32,
+        ((1, 4, 4, 512), 2, True): 12,
+        ((1, 4, 4, 512), 3, True): 24,
+        ((1, 4, 4, 512), 4, True): 24,
+        ((1, 64, 8, 512), 2, True): 12,
+        ((1, 64, 8, 512), 3, True): 24,
+        ((1, 64, 8, 512), 4, True): 24,
+    }.get((shape, q_splits, packed_dq), 0)
+    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == expected_private
+    assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
+    loop = _attention_backward_isa_loop(assembly)
+    # One merged LSE/Delta request joins Q and dO; a fourth request stalls the issue.
+    assert sum("tensor_load_to_lds" in line for line in loop) == 3
+    if q_splits > 1:
+        # Guaranteed prologue TDM issues must keep the two-stage lookahead;
+        # a skippable prologue path previously clamped this wait to 0x1.
+        tensor_waits = [
+            int(value, 0) for line in loop for value in re.findall(r"s_wait_tensorcnt\s+(0x[0-9a-f]+|\d+)", line)
+        ]
+        assert 6 in tensor_waits
+        assert 1 not in tensor_waits
+    wmma = sum("v_wmma_" in line for line in loop)
+    lds = sum(bool(re.match(r"\s*ds_load", line)) for line in loop)
+    assert wmma == 320
+    assert lds / wmma <= 0.80
+    # The phase barrier must wait only for LDS, never for outstanding dQ stores.
+    assert not any("s_wait_storecnt" in line for line in loop)
+    assert not any("s_wait_xcnt" in line for line in loop)
+    atomics = [line for line in loop if "buffer_atomic_" in line]
+    assert len(atomics) == (32 if packed_dq else 64)
+    assert all("scope:SCOPE_SE" in line for line in atomics)
+    # Both phases reuse one address VGPR each; register-owned deltas are immediates.
+    addresses = [re.search(r",\s*(v\d+)(?:\s*/\*(v\d+)\*/)?\s*,\s*s\[", line) for line in atomics]
+    assert all(addresses)
+    assert len({match[2] or match[1] for match in addresses}) <= 2
+    if q_splits > 1:
+        epilogue = [
+            line for line in assembly.splitlines() if "buffer_atomic_add_f32" in line and "scope:SCOPE_DEV" in line
+        ]
+        if packed_dq:
+            assert not epilogue
+            assert "buffer_store_b" in assembly or "global_store_b" in assembly
+        else:
+            # FP32 retains the committed shared-partial atomic epilogue.
+            assert len(epilogue) == 512
+
+
+def test_attention_backward_occ1_war_flags_default_off():
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import BackwardConfig
+
+    config = BackwardConfig()
+    assert not config.occ1_dq_first
+    assert not config.occ1_load_after_dk
+
+
+@pytest.mark.parametrize("shape", [(16, 16, 16, 16384), (8, 64, 8, 8192)])
+@pytest.mark.parametrize("packed_dq", [False, True])
+def test_attention_backward_occ1_war_drain_assembly(shape, packed_dq):
+    import dataclasses
+    import re
+
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import select_config
+
+    config = select_config(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq)
+    builds = [
+        _compile_attention_backward_kernel(dataclasses.replace(config, occ1_load_after_dk=enabled), shape)
+        for enabled in (False, True)
+    ]
+    drains = []
+    privates = []
+    for kernel in builds:
+        assembly = kernel.asm["amdgcn"]
+        assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
+        privates.append(int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]))
+        assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
+        loop = _attention_backward_isa_loop(assembly)
+        drains.append(sum("s_wait_alu depctr_va_vdst(0)" in line for line in loop))
+        assert not any("s_wait_xcnt" in line for line in loop)
+        waits = [int(value, 0) for line in loop for value in re.findall(r"s_wait_tensorcnt\s+(0x[0-9a-f]+|\d+)", line)]
+        assert 6 in waits
+        assert 1 not in waits
+    # Count instructions rather than matching source text or fixed line numbers.
+    # TODO(T298388915): restore spill-free codegen for the admitted sizes below.
+    assert privates == {
+        ((16, 16, 16, 16384), False): [0, 16],
+        ((16, 16, 16, 16384), True): [8, 32],
+        ((8, 64, 8, 8192), False): [0, 16],
+        ((8, 64, 8, 8192), True): [8, 28],
+    }[(shape, packed_dq)]
+    assert drains == {
+        ((16, 16, 16, 16384), False): [16, 17],
+        ((16, 16, 16, 16384), True): [16, 16],
+        ((8, 64, 8, 8192), False): [16, 17],
+        ((8, 64, 8, 8192), True): [16, 15],
+    }[(shape, packed_dq)]
+
+
+@pytest.mark.parametrize("shape,packed_dq,occ1", [
+    ((16, 16, 16, 1024), False, True),
+    ((16, 16, 16, 1024), True, True),
+    ((8, 64, 8, 1024), False, True),
+    ((8, 64, 8, 1024), True, True),
+    ((16, 64, 8, 1024), False, True),
+    ((16, 64, 8, 1024), True, True),
+    ((16, 16, 16, 2048), False, True),
+    ((16, 16, 16, 2048), True, True),
+    ((8, 64, 8, 2048), False, True),
+    ((8, 64, 8, 2048), True, True),
+    ((16, 64, 8, 2048), False, True),
+    ((16, 64, 8, 2048), True, True),
+    ((16, 16, 16, 4096), False, True),
+    ((16, 16, 16, 4096), True, True),
+    ((8, 64, 8, 4096), False, True),
+    ((8, 64, 8, 4096), True, True),
+    ((16, 64, 8, 4096), False, True),
+    ((16, 64, 8, 4096), True, True),
+    ((16, 16, 16, 8192), False, True),
+    ((16, 16, 16, 8192), True, True),
+    ((8, 64, 8, 8192), False, True),
+    ((8, 64, 8, 8192), True, True),
+    ((16, 64, 8, 8192), False, True),
+    ((16, 64, 8, 8192), True, True),
+    ((16, 16, 16, 16384), False, True),
+    ((16, 16, 16, 16384), True, True),
+    ((8, 64, 8, 16384), False, True),
+    ((8, 64, 8, 16384), True, True),
+    ((15, 64, 8, 16384), False, True),
+    ((15, 64, 8, 16384), True, True),
+])
+def test_attention_backward_occ1_selection(shape, packed_dq, occ1):
+    import dataclasses
+
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _select_config_base, select_config
+
+    config = select_config(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq)
+    assert config.occ1 == occ1
+    splits = 3 if shape[-1] == 1024 and shape[1] > shape[2] and tuple(shape) not in ((8, 64, 8, 1024),
+                                                                                     (16, 64, 8, 1024)) else 1
+    expected = _attention_backward_occ1_config(packed_dq, q_splits=splits) if occ1 else _select_config_base(
+        shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq)
+    if tuple(shape) + (packed_dq, ) in ((8, 64, 8, 2048, False), (8, 64, 8, 2048, True), (16, 64, 8, 2048, False),
+                                        (16, 64, 8, 2048, True), (8, 64, 8, 4096, False), (8, 64, 8, 4096, True)):
+        expected = dataclasses.replace(expected, tail_splits=3)
+    measured = {(8, 64, 8, 1024, False): (1, 3, 4096), (8, 64, 8, 1024, True):
+                (1, 3, 4096), (16, 64, 8, 1024, False): (1, 3, 4096), (16, 64, 8, 1024, True): (1, 3, 4096),
+                (16, 16, 16, 1024, False): (1, 2, 4096), (16, 16, 16, 4096, False): (1, 3, 4096),
+                (16, 16, 16, 4096, True): (1, 2, 4096), (16, 64, 8, 4096, False): (1, 3, 4096), (16, 64, 8, 4096, True):
+                (1, 3, 4096), (8, 64, 8, 8192, False): (1, 3, 4096), (8, 64, 8, 8192, True): (1, 3, 4096),
+                (16, 64, 8, 8192, False): (1, 3, 4096), (16, 64, 8, 8192, True): (1, 3, 4096), (8, 64, 8, 16384, False):
+                (1, 3, 4096), (8, 64, 8, 16384, True): (1, 3, 4096)}
+    policy = measured.get(tuple(shape) + (packed_dq, ))
+    if policy is not None:
+        expected = dataclasses.replace(expected, q_splits=policy[0], tail_splits=policy[1], convert_block=policy[2])
+    assert config == _attention_backward_occ1_pad_k(expected)
+
+
+@pytest.mark.parametrize("packed_dq", [False, True])
+@pytest.mark.parametrize("shape,enabled", [
+    ((8, 64, 8, 1024), True),
+    ((16, 64, 8, 1024), True),
+    ((8, 128, 16, 1024), True),
+    ((16, 32, 4, 1024), True),
+    ((1, 64, 8, 1024), False),
+    ((2, 64, 8, 1024), False),
+    ((4, 64, 8, 1024), False),
+    ((9, 64, 8, 1024), False),
+    ((8, 32, 8, 1024), False),
+    ((8, 128, 8, 1024), False),
+    ((8, 64, 8, 512), False),
+])
+def test_attention_backward_occ1_split_selection(shape, enabled, packed_dq):
+    import dataclasses
+
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _select_config_base, select_config
+
+    config = select_config(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq)
+    if enabled:
+        if tuple(shape) in ((8, 64, 8, 1024), (16, 64, 8, 1024)):
+            assert config == _attention_backward_occ1_pad_k(
+                dataclasses.replace(_attention_backward_occ1_config(packed_dq), tail_splits=3))
+            assert config.convert_block == 4096
+        else:
+            assert config == _attention_backward_occ1_pad_k(_attention_backward_occ1_config(packed_dq, q_splits=3))
+            assert config.convert_block == (8192 if packed_dq else 4096)
+    else:
+        assert config == _select_config_base(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq)
+    # The same shape falls below four split rounds on the larger offline device.
+    assert select_config(1024, 8, 64, 8, num_cus=384,
+                         packed_dq=packed_dq) == _select_config_base(1024, 8, 64, 8, num_cus=384, packed_dq=packed_dq)
+
+
+@pytest.mark.parametrize("packed_dq", [False, True])
+def test_attention_backward_occ1_selection_fallback(packed_dq):
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _select_config_base, select_config
+
+    for n in (512, 1024, 2048, 4096, 8192, 16384):
+        assert select_config(n, packed_dq=packed_dq) == _select_config_base(n, packed_dq=packed_dq)
+    for shape in ((1, 8, 8, 4096), (8, 64, 8, 1152), (16, 16, 16, 1536), (1, 64, 8, 2048), (2, 64, 8, 4096),
+                  (1, 8, 1, 8192), (1, 2, 2, 16384)):
+        args = (shape[-1], *shape[:3])
+        assert select_config(*args, num_cus=192,
+                             packed_dq=packed_dq) == _select_config_base(*args, num_cus=192, packed_dq=packed_dq)
+    # One-split short MHA matches the base grid; 512 owners clear the split-fill guard.
+    for shape in ((2, 16, 16, 2048), (1, 64, 8, 16384)):
+        assert select_config(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq).occ1
+
+
+@pytest.mark.parametrize("packed_dq", [False, True])
+@pytest.mark.parametrize("shape", [(16, 16, 16, 1024), (8, 64, 8, 1024), (16, 64, 8, 1024), (8, 64, 8, 2048),
+                                   (16, 64, 8, 2048), (8, 64, 8, 4096), (1, 4, 4, 512), (2, 4, 4, 512), (1, 8, 1, 512),
+                                   (2, 8, 1, 512)])
+def test_attention_backward_occ1_tail_assembly(shape, packed_dq):
+    import dataclasses
+    import re
+
+    config = _attention_backward_occ1_pad_k(
+        dataclasses.replace(_attention_backward_occ1_config(packed_dq), tail_splits=3))
+    kernel = _compile_attention_backward_kernel(config, shape)
+    assembly = kernel.asm["amdgcn"]
+    assert int(re.search(r"\.vgpr_count:\s*(\d+)", assembly)[1]) <= 1024
+    # TODO(T298388915): restore spill-free codegen for the admitted sizes below.
+    expected_private = {
+        ((16, 16, 16, 1024), False): 20,
+        ((16, 16, 16, 1024), True): 12,
+        ((8, 64, 8, 1024), False): 16,
+        ((8, 64, 8, 1024), True): 28,
+        ((16, 64, 8, 1024), False): 16,
+        ((16, 64, 8, 1024), True): 28,
+        ((8, 64, 8, 2048), False): 16,
+        ((8, 64, 8, 2048), True): 28,
+        ((16, 64, 8, 2048), False): 16,
+        ((16, 64, 8, 2048), True): 28,
+        ((8, 64, 8, 4096), False): 16,
+        ((8, 64, 8, 4096), True): 28,
+        ((1, 4, 4, 512), False): 16,
+        ((1, 4, 4, 512), True): 24,
+        ((2, 4, 4, 512), False): 16,
+        ((2, 4, 4, 512), True): 12,
+        ((1, 8, 1, 512), False): 16,
+        ((1, 8, 1, 512), True): 24,
+        ((2, 8, 1, 512), False): 16,
+        ((2, 8, 1, 512), True): 24,
+    }[(shape, packed_dq)]
+    assert int(re.search(r"\.private_segment_fixed_size:\s*(\d+)", assembly)[1]) == expected_private
+    assert kernel.metadata.shared == (215536 if config.occ1_pad_k else 211456)
+    loop = _attention_backward_isa_loop(assembly)
+    waits = [int(x, 0) for line in loop for x in re.findall(r"s_wait_tensorcnt\s+(0x[0-9a-f]+|\d+)", line)]
+    assert 6 in waits and 1 not in waits
+    assert sum("v_wmma_" in line for line in loop) == 320
+    assert all("scope:SCOPE_SE" in line for line in loop if "buffer_atomic_" in line)
+    assert not any("SCOPE_DEV" in line and "atomic_" in line for line in assembly.splitlines())
+
+
+@pytest.mark.parametrize("shape,packed_dq", [((8, 64, 8, 2048), False), ((8, 64, 8, 2048), True),
+                                             ((16, 64, 8, 2048), False), ((16, 64, 8, 2048), True),
+                                             ((8, 64, 8, 4096), False), ((8, 64, 8, 4096), True)])
+def test_attention_backward_occ1_tail_selection(shape, packed_dq):
+    import dataclasses
+
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import select_config
+
+    config = select_config(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq)
+    assert config == _attention_backward_occ1_pad_k(
+        dataclasses.replace(_attention_backward_occ1_config(packed_dq), tail_splits=3))
+    assert config.q_splits == 1 and config.convert_block == 4096
+    assert select_config(shape[-1], *shape[:3], num_cus=384, packed_dq=packed_dq).tail_splits == 1
+
+
+@pytest.mark.parametrize("b,hk,n", [(3, 16, 1024), (6, 8, 2048), (3, 8, 4096)])
+def test_attention_backward_occ1_tail_exact_round_rejected(b, hk, n):
+    import dataclasses
+
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _tail_partition
+
+    config = dataclasses.replace(_attention_backward_occ1_config(False), tail_splits=3)
+    with pytest.raises(ValueError, match="nonempty dispatch tail"):
+        _tail_partition(config, b, hk, n, num_cus=192)
+
+
+@pytest.mark.parametrize("num_cus,expected", [(192, (1920, 128)), (96, (2016, 32))])
+def test_attention_backward_occ1_tail_partition_num_cus(num_cus, expected):
+    import dataclasses
+
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _tail_partition
+
+    # B=16, HK=8, N=4096: 2048 KV owners; the tail is the final partial round.
+    config = dataclasses.replace(_attention_backward_occ1_config(False), tail_splits=3)
+    assert _tail_partition(config, 16, 8, 4096, num_cus=num_cus) == expected
+
+
+@pytest.mark.parametrize("shape,packed_dq,q_splits,tail_splits,convert_block", [((16, 16, 16, 2048), False, 1, 1, 4096),
+                                                                                ((16, 16, 16, 2048), True, 1, 1, 4096),
+                                                                                ((16, 16, 16, 4096), False, 1, 3, 4096),
+                                                                                ((16, 16, 16, 4096), True, 1, 2, 4096),
+                                                                                ((16, 64, 8, 4096), False, 1, 3, 4096),
+                                                                                ((16, 64, 8, 4096), True, 1, 3, 4096),
+                                                                                ((8, 64, 8, 8192), False, 1, 3, 4096),
+                                                                                ((8, 64, 8, 8192), True, 1, 3, 4096),
+                                                                                ((16, 64, 8, 8192), False, 1, 3, 4096),
+                                                                                ((16, 64, 8, 8192), True, 1, 3, 4096),
+                                                                                ((8, 64, 8, 16384), False, 1, 3, 4096),
+                                                                                ((8, 64, 8, 16384), True, 1, 3, 4096)])
+def test_attention_backward_occ1_dispatch_tail_selection(shape, packed_dq, q_splits, tail_splits, convert_block):
+    import dataclasses
+
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import select_config
+
+    config = select_config(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq)
+    expected = dataclasses.replace(_attention_backward_occ1_config(packed_dq, q_splits=q_splits),
+                                   tail_splits=tail_splits, convert_block=convert_block)
+    assert config == _attention_backward_occ1_pad_k(expected)
+    # Each additional policy is measured on exactly the explicit 192-CU tuple.
+    other = select_config(shape[-1], *shape[:3], num_cus=384, packed_dq=packed_dq)
+    assert other.q_splits == 1 and other.tail_splits == 1
+    for batch in (shape[0] - 1, shape[0] + 1):
+        other = select_config(shape[-1], batch, shape[1], shape[2], num_cus=192, packed_dq=packed_dq)
+        assert other.q_splits == 1 and other.tail_splits == 1
+
+
+def _attention_backward_causal_config(packed_dq, q_splits=1):
+    import dataclasses
+
+    return dataclasses.replace(_attention_backward_occ1_config(packed_dq, q_splits=q_splits),
+                               occ1_k_bands=0 if q_splits == 4 else 1)
+
+
+@pytest.mark.parametrize("shape,splits", [
+    ((16, 16, 16, 2048), 1),
+    ((8, 64, 8, 1024), 1),
+    ((16, 64, 8, 1024), 2),
+    ((8, 64, 8, 2048), 2),
+    ((8, 64, 8, 4096), 1),
+    ((8, 64, 8, 8192), 2),
+    ((8, 64, 8, 16384), 4),
+    ((12, 64, 8, 1024), 1),
+])
+@pytest.mark.parametrize("packed_dq", [False, True])
+def test_attention_backward_causal_split_selection(shape, splits, packed_dq):
+    from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import select_config
+
+    config = select_config(shape[-1], *shape[:3], num_cus=192, packed_dq=packed_dq, causal=True)
+    assert config == _attention_backward_causal_config(packed_dq, splits)

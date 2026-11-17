@@ -487,6 +487,33 @@ tt.func public @memdesc_reinterpret_oversized_shared_linear(%arg0: !ttg.memdesc<
 
 // -----
 
+#shared_linear_rows = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [1, 0], [2, 0]]}, alignment = 16>
+#smem = #ttg.shared_memory
+// expected-error @+1 {{shared linear encoding needs power-of-two layout dimensions}}
+tt.func public @shared_linear_npot_rows(%arg0: !ttg.memdesc<3x4xf16, #shared_linear_rows, #smem>) {
+    tt.return
+}
+
+
+// -----
+
+#fp6 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, padding = "b6x16_p32"}>
+#bytes = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+tt.func @memdesc_reinterpret_partial_fp6_atom(%arg: !ttg.memdesc<1x8xi8, #fp6, #smem, 1x16>) {
+    // expected-error @+1 {{cannot reinterpret an FP6 subview that splits a 16-value packing atom}}
+    %0 = ttg.memdesc_reinterpret %arg : !ttg.memdesc<1x8xi8, #fp6, #smem, 1x16> -> !ttg.memdesc<1x8xi8, #bytes, #smem>
+    tt.return
+}
+
+tt.func @memdesc_subslice_partial_fp6_atom(%arg: !ttg.memdesc<1x32xi8, #fp6, #smem>) {
+    // expected-error @+1 {{FP6 subviews must preserve complete 16-value packing atoms}}
+    %0 = ttg.memdesc_subslice %arg [0, 8] : !ttg.memdesc<1x32xi8, #fp6, #smem> -> !ttg.memdesc<1x8xi8, #fp6, #smem, 1x32>
+    tt.return
+}
+
+// -----
+
 #shared_split = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[1, 0]]}>
 #shared_broadcast = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 0]]}>
 #smem = #ttg.shared_memory
@@ -1066,6 +1093,22 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32}
 
 // -----
 
+// NVIDIA lowering relies on the body staying a single block.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @warp_predicate_multiple_blocks(%predicate: tensor<64xi1, #blocked>) {
+    // expected-error @+1 {{region with 1 blocks}}
+    ttg.warp_predicate %predicate () {
+      cf.br ^bb1
+    ^bb1:
+      ttg.predicate_yield
+    } : (tensor<64xi1, #blocked>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
   tt.func @warp_predicate_cta_barrier(
@@ -1329,4 +1372,29 @@ tt.func @pure_elementwise_asm_tensor_descriptor(%offset: i32, %mem: !desc) {
   // expected-error @+1 {{requires pure=false for memory descriptor operands}}
   %value = tt.elementwise_inline_asm "add.u32 $0, $1, $2;" {constraints = "=r,r,r", pure = true, packed_element = 1 : i32} %offset, %mem : i32, !desc -> i32
   tt.return
+}
+
+// -----
+
+#src = #ttg.linear<{register = [], lane = [[1, 0], [0, 0], [0, 0], [0, 0], [0, 0]], warp = [[0, 0], [0, 0]], block = []}>
+#dst = #ttg.linear<{register = [[1, 0], [0, 1]], lane = [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]], warp = [[0, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @broadcast_requires_lane_movement(%arg: tensor<2x1xi32, #src>) {
+    // expected-error @+1 {{requires matching source and result layouts up to broadcasting}}
+    %result = tt.broadcast %arg : tensor<2x1xi32, #src> -> tensor<2x2xi32, #dst>
+    tt.return
+  }
+}
+
+// -----
+
+#src = #ttg.linear<{register = [[1, 0], [2, 0]], lane = [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]], warp = [[0, 0], [0, 0]], block = []}>
+#dst = #ttg.linear<{register = [[2, 0], [0, 1], [1, 0]], lane = [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]], warp = [[0, 0], [0, 0]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // Register permutations require an explicit layout conversion.
+  tt.func @broadcast_requires_register_permutation(%arg: tensor<4x1xi32, #src>) {
+    // expected-error @+1 {{requires matching source and result layouts up to broadcasting}}
+    %result = tt.broadcast %arg : tensor<4x1xi32, #src> -> tensor<4x2xi32, #dst>
+    tt.return
+  }
 }

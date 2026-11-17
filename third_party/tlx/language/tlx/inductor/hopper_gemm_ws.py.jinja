@@ -101,7 +101,7 @@ from triton.tlx.ops.kernels.mm.sm90 import _consume_tile_pieces
                 NUM_MMA_GROUPS, A_ROW_MAJOR, B_ROW_MAJOR, A_EVICTION, SPLIT_K
 {%- if N_TAIL %}, b_tail_desc=desc_b_tail, b_tail=b_tail, N_TAIL=N_TAIL{% endif %})
 
-        with tlx.async_task(num_warps=4, replicate=2, registers=232):
+        with tlx.async_task(num_warps=4, replicate={{NUM_MMA_GROUPS}}, registers=232):
 {% if TMA_EPILOGUE_STORE %}
             # Built here, not before the task split, so the producer's first TMA
             # loads do not wait on it; only the consumers' epilogue stores use it.

@@ -5,10 +5,8 @@ name: Nightly TLX.ops Bench
 # makes for that commit: usually the cached one its GPU tests ran on, rebuilt
 # from the same commit if the cache has expired or the build recipe changed.
 on:
-  workflow_run:
-    workflows: ["Nightly fbtriton"]
-    types: [completed]
-    branches: [main]
+  schedule:
+    - cron: '0 7,8 * * *'
   workflow_dispatch:
     inputs:
       version:
@@ -29,14 +27,10 @@ concurrency:
 
 jobs:
   resolve:
-    # The benched commit is checked out and run on GPU runners, so it must be a main commit the nightly shipped:
-    # only this repo's scheduled or dispatched nightly may trigger, never a fork or a pull request.
+    # A schedule selects the latest published wheel; dispatches still require a main commit.
     if: >-
       github.repository_owner == 'facebookexperimental' &&
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.head_repository.full_name == github.repository &&
-        (github.event.workflow_run.event == 'schedule' || github.event.workflow_run.event == 'workflow_dispatch')))
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -55,25 +49,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
+          EVENT_NAME: ${{ github.event_name }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_SHA: ${{ inputs.sha }}
         run: |
           set -euo pipefail
+          if [[ "${EVENT_NAME}" == schedule ]]; then
+            MIDNIGHT=$(python3 -c 'import datetime; from zoneinfo import ZoneInfo; print(int(datetime.datetime.now(ZoneInfo("America/Los_Angeles")).hour in (0, 1)))')
+            [[ "${MIDNIGHT}" == 1 ]] || { echo "Outside the Pacific midnight window; nothing to bench."; exit 0; }
+          fi
           if [[ -n "${INPUT_VERSION}" ]]; then
             [[ -n "${INPUT_SHA}" ]] || { echo "sha is required when version is set"; exit 1; }
             VERSION="${INPUT_VERSION}"
             SHA="${INPUT_SHA}"
           else
-            # A green nightly run ships nothing when no newer commit is green;
-            # benching latest.json then would re-measure yesterday's wheel.
-            if [[ -n "${RUN_ID}" ]]; then
-              PUBLISH=$(gh run view "${RUN_ID}" --json jobs --jq '.jobs[] | select(.name == "publish") | .conclusion')
-              if [[ "${PUBLISH}" != "success" ]]; then
-                echo "Nightly run ${RUN_ID} published nothing (publish: ${PUBLISH:-skipped}); nothing to bench."
-                exit 0
-              fi
-            fi
             gh release download nightly --pattern latest.json --output latest.json
             VERSION=$(jq -r .version latest.json)
             SHA=$(jq -r .commit latest.json)
@@ -82,6 +71,12 @@ jobs:
           [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "not a full commit sha: ${SHA}"; exit 1; }
           [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}$ ]] || { echo "not a nightly version: ${VERSION}"; exit 1; }
           git merge-base --is-ancestor "${SHA}" origin/main || { echo "${SHA} is not on main"; exit 1; }
+          if [[ "${EVENT_NAME}" == schedule ]]; then
+            DATE="${VERSION##*.dev}"
+            COMPLETE=$(gh release view tlx-ops-bench --json assets --jq '.assets[].name' \
+              | python3 -c 'import sys; date=sys.argv[1]; names=set(sys.stdin.read().splitlines()); print(int(all(f"{date}.{p}.json" in names for p in ("b200", "h100", "mi350"))))' "${DATE}")
+            [[ "${COMPLETE}" != 1 ]] || { echo "${VERSION} already has all platform summaries; nothing to bench."; exit 0; }
+          fi
           echo "Benching ${VERSION} (${SHA})"
           {
             echo "version=${VERSION}"
@@ -105,7 +100,7 @@ jobs:
       id-token: write
       contents: write   # publish: the dashboard's release
       issues: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/_tlx-ops-bench.yml
     with:
       platform: b200
@@ -124,7 +119,7 @@ jobs:
       id-token: write
       contents: write   # publish: the dashboard's release
       issues: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/_tlx-ops-bench.yml
     with:
       platform: h100
@@ -143,7 +138,7 @@ jobs:
       id-token: write
       contents: write   # publish: the dashboard's release
       issues: write
-      actions: read
+      actions: write
     uses: ./.github/workflows/_tlx-ops-bench.yml
     with:
       platform: mi350

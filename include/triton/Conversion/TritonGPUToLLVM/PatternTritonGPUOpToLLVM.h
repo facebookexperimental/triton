@@ -35,7 +35,8 @@ void populateElementwiseOpToLLVMPatterns(
 // callback and, thus, handle backend-specific behaviors.
 void populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
-    RewritePatternSet &patterns, PatternBenefit benefit,
+    RewritePatternSet &patterns, ModuleAxisInfoAnalysis &axisInfoAnalysis,
+    PatternBenefit benefit,
     std::shared_ptr<DistributedCoordinateGroups> coordinateGroups = nullptr);
 
 void populateAssertOpToLLVMPattern(LLVMTypeConverter &typeConverter,
@@ -50,6 +51,7 @@ void populateMakeRangeOpToLLVMPattern(LLVMTypeConverter &typeConverter,
 
 void populateViewOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                   RewritePatternSet &patterns,
+                                  const TargetInfoBase &targetInfo,
                                   PatternBenefit benefit);
 
 void populateMinMaxFOpToLLVMPattern(LLVMTypeConverter &typeConverter,

@@ -7,6 +7,7 @@ TLX candidate, so they belong to their corresponding provider tests.
 
 import pytest
 import torch
+from torch._inductor import config
 import torch._inductor.kernel.mm as inductor_mm
 from torch._inductor.utils import fresh_cache
 from triton._internal_testing import is_hip_cdna4
@@ -42,7 +43,11 @@ def test_forced_mode_assesses_only_tlx_candidates(monkeypatch):
     monkeypatch.setattr(inductor_mm, "autotune_select_algorithm", spy)
     x = torch.randn(512, 512, device="cuda", dtype=torch.float16)
     torch._dynamo.reset()
-    with fresh_cache(), tlx_config.patch(use_heuristic_config=True):
+    with (
+            fresh_cache(),
+            config.patch({"fx_graph_remote_cache": False}),
+            tlx_config.patch(use_heuristic_config=True),
+    ):
         gfx950_torch.mm(x, x, mode="force")
 
     assert seen, "mm did not reach the algorithm selector"

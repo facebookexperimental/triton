@@ -9,12 +9,13 @@ This framework is fixed. A shape the torchTLX path cannot run goes in
 """
 import pytest
 import torch
+from torch._inductor import config
 import torch._inductor.kernel.mm as inductor_mm
 from torch._inductor.utils import fresh_cache
 from triton._internal_testing import is_blackwell
 try:
     from triton.language.extra.tlx.inductor import sm100_torch, tlx_config
-    from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, operand
+    from triton.tlx.ops.kernels.mm._shapes import SM100_CORRECTNESS_SHAPES, operand
 except ImportError:  # not the fbtriton fork
     sm100_torch = None
 
@@ -43,8 +44,11 @@ def test_forced_mode_assesses_only_tlx_candidates(monkeypatch):
     monkeypatch.setattr(inductor_mm, "autotune_select_algorithm", spy)
     x = torch.randn(512, 512, device="cuda", dtype=torch.float16)
     # A cached graph is never codegened, so the spy would see nothing.
+    # fresh_cache only clears local state; the remote inductor cache survives
+    # it, so disable caches outright.
     with fresh_cache(), tlx_config.patch(use_heuristic_config=True):
-        sm100_torch.mm(x, x, mode="force")
+        with config.patch({"force_disable_caches": True}):
+            sm100_torch.mm(x, x, mode="force")
 
     assert seen, "mm did not reach the algorithm selector"
     others = [name for name in seen if not name.startswith("triton_tlx_")]
@@ -100,7 +104,7 @@ FAILED_SHAPES = {
 
 
 def _cases():
-    entries = [] if sm100_torch is None else CORRECTNESS_SHAPES
+    entries = [] if sm100_torch is None else SM100_CORRECTNESS_SHAPES
     return [entry for entry in entries if tuple(entry) not in FAILED_SHAPES]
 
 

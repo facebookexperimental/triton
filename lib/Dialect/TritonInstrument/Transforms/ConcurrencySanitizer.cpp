@@ -63,6 +63,26 @@ std::unique_ptr<ConSanTargetHooks> createConSanHooks(llvm::StringRef key) {
 
 namespace {
 
+// Temporary workaround for PTXAS mis-analysis of divergent control-flow joins.
+void addPtxasMaskedStoreBarrierWorkaround(ModuleOp module) {
+  SmallVector<tt::StoreOp> maskedStores;
+  module.walk([&](tt::StoreOp store) {
+    if (store.getMask())
+      maskedStores.push_back(store);
+  });
+
+  for (tt::StoreOp store : maskedStores) {
+    OpBuilder builder(store);
+    builder.setInsertionPointAfter(store);
+    // In the NVIDIA conversion pipeline, ConSan runs after tensor-memory wait
+    // insertion. Restrict the declared ordering to the global writes this
+    // workaround follows; the operation still provides the CTA rendezvous
+    // needed to shape native control flow.
+    ttg::BarrierOp::create(builder, store.getLoc(),
+                           ttg::AddrSpace::GlobalWrite);
+  }
+}
+
 // OpBuilder listener tracking operations added to the builder to be wrapped
 // with a lock acquire/release pair.
 class CriticalSectionListener : public ImplicitLocOpBuilder::Listener {
@@ -408,9 +428,14 @@ void initializeAllocation(ImplicitLocOpBuilder &b, Value alloc) {
 
 bool canInitializeAllocation(Value alloc) {
   auto allocType = cast<ttg::MemDescType>(alloc.getType());
+  // A tensor cannot hold the NPOT tile of a shared pow2 alloc view.
   if (!isa<ttng::TensorMemorySpaceAttr>(allocType.getMemorySpace()))
-    return true;
+    return !ttg::isNpotPow2AllocView(allocType);
   unsigned numWarps = ttg::lookupNumWarps(alloc.getDefiningOp());
+  // There is no default tcgen05.ld/st layout for an NPOT TMEM tile, so, as for
+  // a warp count that is not a multiple of 4, the allocation is not poisoned.
+  if (!llvm::all_of(allocType.getShape().take_back(2), llvm::isPowerOf2_64))
+    return false;
   return numWarps % 4 == 0;
 }
 
@@ -863,6 +888,11 @@ public:
     }
     if (failed(validateNonEntryFunctions()))
       return failure();
+
+    // Snapshot and modify the input program before ConSan creates helper
+    // functions, so sanitizer-internal masked stores are not affected.
+    if (hooks.needsPtxasMaskedStoreBarrierWorkaround())
+      addPtxasMaskedStoreBarrierWorkaround(module);
 
     tti::FunctionBuilder funcBuilder(module, auxData);
     if (failed(auxData.populateAndPassToWarpSpecialize(module, entryPoint,
@@ -1459,13 +1489,13 @@ private:
 
       if (memType == MemType::SHARED_MEM) {
         if (effect.sharedKind == ttg::SharedKind::Async) {
-          funcBuilder.createVerifyProxyAccessCall(b, bufferMask, baseThread,
-                                                  effect.operandName, pred, op,
-                                                  effectCTAs);
+          funcBuilder.createVerifyProxyAccessCall(
+              b, bufferMask, baseThread, effect.rw == RW::Write,
+              effect.operandName, pred, op, effectCTAs);
         } else {
-          funcBuilder.createSetProxyAccessCall(b, bufferMask, baseThread, pred,
-                                               op, readCTAs,
-                                               materialized.bufferIndex);
+          funcBuilder.createSetProxyAccessCall(
+              b, bufferMask, baseThread, effect.rw == RW::Write, pred, op,
+              readCTAs, materialized.bufferIndex);
         }
       }
       if (effect.rw == RW::Read) {

@@ -1,0 +1,56 @@
+from triton.tlx.ops.kernels.mm.gfx950 import (
+    _wg_kernel_register_split_m2 as _gfx950_register_split_m2,
+    _wg_kernel_register_split_m3 as _gfx950_register_split_m3,
+)
+
+
+{{def_kernel("A", "B")}}
+    M: tl.constexpr = {{size("A", 0)}}
+    N: tl.constexpr = {{size("B", 1)}}
+    K: tl.constexpr = {{size("A", 1)}}
+    C = {{output_ptr()}}
+    stride_am: tl.constexpr = {{stride("A", 0)}}
+    stride_ak: tl.constexpr = {{stride("A", 1)}}
+    stride_bk: tl.constexpr = {{stride("B", 0)}}
+    stride_bn: tl.constexpr = {{stride("B", 1)}}
+
+{% if TRANSPOSED %}
+    lhs, rhs = B, A
+    out_m: tl.constexpr = N
+    out_n: tl.constexpr = M
+    lhs_m, lhs_k = stride_bn, stride_bk
+    rhs_k, rhs_n = stride_ak, stride_am
+    out_m_stride: tl.constexpr = 1
+    out_n_stride: tl.constexpr = N
+{% else %}
+    lhs, rhs = A, B
+    out_m: tl.constexpr = M
+    out_n: tl.constexpr = N
+    lhs_m, lhs_k = stride_am, stride_ak
+    rhs_k, rhs_n = stride_bk, stride_bn
+    out_m_stride: tl.constexpr = N
+    out_n_stride: tl.constexpr = 1
+{% endif %}
+
+{% if FRAGMENT_COUNT == 2 %}
+    _gfx950_register_split_m2(
+        lhs, rhs, C, C, out_m, out_n, K,
+        lhs_m, lhs_k, rhs_k, rhs_n, 0, 0, out_m_stride, out_n_stride,
+        M_HEAD=M0,
+        M_TAIL=M1,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        ADD_BIAS=False,
+    )
+{% else %}
+    _gfx950_register_split_m3(
+        lhs, rhs, C, C, out_m, out_n, K,
+        lhs_m, lhs_k, rhs_k, rhs_n, 0, 0, out_m_stride, out_n_stride,
+        M0=M0,
+        M1=M1,
+        M2=M2,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        ADD_BIAS=False,
+    )
+{% endif %}

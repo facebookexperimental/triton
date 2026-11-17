@@ -299,8 +299,7 @@ def test_grouped_gemm_quadrant_large_input_offsets(operand, monkeypatch):
     other.fill_(0.25)
     out = torch.empty((m, n), device="cuda", dtype=torch.float16)
     monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "1")
-    _grouped_gemm_quadrant_test_tile[(1, )](a, b, out, m, n, k, pid_m, pid_n, num_warps=8, matrix_instr_nonkdim=16,
-                                            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ))
+    _grouped_gemm_quadrant_test_tile[(1, )](a, b, out, m, n, k, pid_m, pid_n, num_warps=8, matrix_instr_nonkdim=16)
     tile = out[32768:] if operand == "a" else out[:, 32768:]
     torch.testing.assert_close(tile, torch.full_like(tile, 0.5), atol=0, rtol=0)
 
@@ -312,8 +311,7 @@ def test_grouped_gemm_quadrant_large_output_offsets(monkeypatch):
     b = torch.ones((n, k), device="cuda", dtype=torch.float16)
     out = torch.empty((m, n), device="cuda", dtype=torch.float16)
     monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "1")
-    _grouped_gemm_quadrant_test_tile[(1, )](a, b, out, m, n, k, 128, 0, num_warps=8, matrix_instr_nonkdim=16,
-                                            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ))
+    _grouped_gemm_quadrant_test_tile[(1, )](a, b, out, m, n, k, 128, 0, num_warps=8, matrix_instr_nonkdim=16)
     tile = out[32768:, :256]
     torch.testing.assert_close(tile, torch.full_like(tile, k), atol=0, rtol=0)
 

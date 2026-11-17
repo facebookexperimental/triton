@@ -134,6 +134,11 @@ static LogicalResult setOptimizedGatherLayout(GatherOp op, RewriterBase &b) {
   unsigned rank = srcType.getRank();
   if (rank == 1)
     return failure();
+  // The blocked layout below tiles power-of-two dims only.
+  auto isNpotDim = [](int64_t d) { return !llvm::isPowerOf2_64(d); };
+  if (llvm::any_of(srcType.getShape(), isNpotDim) ||
+      llvm::any_of(idxType.getShape(), isNpotDim))
+    return failure();
   SmallVector<unsigned> threadsPerWarp(rank);
   SmallVector<unsigned> warpsPerCTA(rank);
   SmallVector<unsigned> order;
@@ -289,7 +294,7 @@ class TritonGPUOptimizeThreadLocalityPass
       if (!reduce->hasOneUse())
         return;
       Operation *user = *(reduce->getUsers().begin());
-      if (!user->hasOneUse())
+      if (user->getNumOperands() != 2 || !user->hasOneUse())
         return;
       OpOperand &yieldOpOperand = *(user->getUses().begin());
       auto yieldOp = dyn_cast<scf::YieldOp>(yieldOpOperand.getOwner());
@@ -306,6 +311,12 @@ class TritonGPUOptimizeThreadLocalityPass
       auto oldAccum = forOp.getInitArgs()[argNum];
       auto cstOp = oldAccum.getDefiningOp<arith::ConstantOp>();
       if (!cstOp)
+        return;
+      // The rewrite re-homes the accumulator into a thread-local partial that
+      // is only merged back after the loop, so an in-loop use of the
+      // accumulator other than the update would observe the partial state
+      // instead of the running value.
+      if (!forOp.getRegionIterArgs()[argNum].hasOneUse())
         return;
       reduceOps.insert(reduce);
     });
