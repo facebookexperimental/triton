@@ -72,3 +72,43 @@ tt.func @join_before_post_ws_load(%desc: !tt.tensordesc<128x64xf16, #nvmma>, %pt
 }
 
 }
+
+// -----
+
+// The TMA store is issued by a noinline helper the partition calls, so the
+// partition still drains it before it ends.
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+// CHECK-LABEL: @join_drains_tma_store_in_noinline_helper
+// CHECK: ttg.warp_specialize.join
+// CHECK: partition0
+// CHECK: tt.call @tma_store_helper
+// CHECK-NEXT: ttng.async_tma_store_wait {pendings = 0 : i32}
+// CHECK-NEXT: ttg.warp_return
+module attributes {"ttg.num-warps" = 4 : i32} {
+
+tt.func private @tma_store_helper(%desc: !tt.tensordesc<128x64xf16, #nvmma>, %buf: !ttg.memdesc<128x64xf16, #nvmma, #smem, mutable>) attributes {noinline = true} {
+  %c0_i32 = arith.constant 0 : i32
+  ttng.async_tma_copy_local_to_global %desc[%c0_i32, %c0_i32] %buf : !tt.tensordesc<128x64xf16, #nvmma>, !ttg.memdesc<128x64xf16, #nvmma, #smem, mutable>
+  tt.return
+}
+
+tt.func @join_drains_tma_store_in_noinline_helper(%desc: !tt.tensordesc<128x64xf16, #nvmma>, %ptr: !tt.ptr<f32>) {
+  %buf = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #nvmma, #smem, mutable>
+  ttg.warp_specialize(%desc, %buf)
+  default {
+    %c0 = arith.constant {ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    ttg.warp_yield
+  }
+  partition0(%arg0: !tt.tensordesc<128x64xf16, #nvmma>, %arg1: !ttg.memdesc<128x64xf16, #nvmma, #smem, mutable>) num_warps(4) {
+    tt.call @tma_store_helper(%arg0, %arg1) : (!tt.tensordesc<128x64xf16, #nvmma>, !ttg.memdesc<128x64xf16, #nvmma, #smem, mutable>) -> ()
+    ttg.warp_return
+  } : (!tt.tensordesc<128x64xf16, #nvmma>, !ttg.memdesc<128x64xf16, #nvmma, #smem, mutable>) -> ()
+  %v = tt.load %ptr : !tt.ptr<f32>
+  tt.return
+}
+
+}

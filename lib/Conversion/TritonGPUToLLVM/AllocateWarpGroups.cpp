@@ -2,6 +2,8 @@
 
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/CallInterfaces.h"
 #include "triton/Analysis/CallGraph.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -85,15 +87,39 @@ static bool isTMAStoreLikeOp(Operation *op) {
              nvidia_gpu::AsyncStoreOp>(op);
 }
 
+// True if `region` issues a TMA store, directly or in a function it calls.
+// Functions are not inlined yet, so a noinline helper can issue the store.
+static bool issuesTMAStore(Region &region, SymbolTableCollection &symbolTable,
+                           DenseSet<Operation *> &visited) {
+  return region
+      .walk([&](Operation *op) {
+        if (isTMAStoreLikeOp(op))
+          return WalkResult::interrupt();
+        auto call = dyn_cast<CallOpInterface>(op);
+        if (!call)
+          return WalkResult::advance();
+        Operation *callee = call.resolveCallableInTable(&symbolTable);
+        // A call we cannot resolve may issue a TMA store.
+        if (!callee)
+          return WalkResult::interrupt();
+        auto callable = dyn_cast<CallableOpInterface>(callee);
+        Region *body = callable ? callable.getCallableRegion() : nullptr;
+        if (!body)
+          return WalkResult::interrupt();
+        if (visited.insert(callee).second &&
+            issuesTMAStore(*body, symbolTable, visited))
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
 // Wait for every TMA store a region issued to finish writing global memory
 // before the region ends.
-static void drainTMAStoresAtRegionEnd(Region &region) {
-  bool hasTMAStore = region
-                         .walk([](Operation *op) {
-                           return isTMAStoreLikeOp(op) ? WalkResult::interrupt()
-                                                       : WalkResult::advance();
-                         })
-                         .wasInterrupted();
+static void drainTMAStoresAtRegionEnd(Region &region,
+                                      SymbolTableCollection &symbolTable) {
+  DenseSet<Operation *> visited;
+  bool hasTMAStore = issuesTMAStore(region, symbolTable, visited);
   if (!hasTMAStore)
     return;
   for (Block &block : region) {
@@ -140,9 +166,10 @@ static void annotateWarpSpecializeJoin(WarpSpecializeOp ws, bool instrumented) {
   }
 
   ws->setAttr(AttrWarpSpecializeJoinName, UnitAttr::get(ws.getContext()));
-  drainTMAStoresAtRegionEnd(ws.getDefaultRegion());
+  SymbolTableCollection symbolTable;
+  drainTMAStoresAtRegionEnd(ws.getDefaultRegion(), symbolTable);
   for (Region *partition : ws.getPartitionRegions())
-    drainTMAStoresAtRegionEnd(*partition);
+    drainTMAStoresAtRegionEnd(*partition, symbolTable);
 }
 
 // Given a `ttg.warp_specialize` with a certain number of existing warps, pad it
