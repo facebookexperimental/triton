@@ -999,6 +999,86 @@ public:
 
   LogicalResult matchAndRewrite(tt::DotScaledOp dotOp,
                                 PatternRewriter &rewriter) const override {
+    // MFMA-layout FP6 dots match no blocked pattern and crash in
+    // lowering; decompose to a BF16/F16 dot via scaleArg + retargeting.
+    // WMMA-layout FP6 dots are intentionally not decomposed here: the
+    // retarget below is MFMA-specific, so they fail cleanly with
+    // "fp6 decompose only supports MFMA result layouts" instead. That
+    // is the supported set stated in one place, alongside the native
+    // gate below and the guard in DotOpToLLVM/MFMA.cpp.
+    bool isFp6 = isMXFP6ScaleType(dotOp.getAElemType()) ||
+                 isMXFP6ScaleType(dotOp.getBElemType());
+    if (isFp6 && !isa_and_nonnull<ttg::BlockedEncodingAttr>(
+                     dotOp.getType().getEncoding())) {
+      // A K=128 FP6 dot lowers natively as one 16x16x128 step or two
+      // 32x32x64 steps (96-byte packed K, 128 logical values); wider
+      // or NPOT FP6 decomposes. This is the only native FP6 shape, and
+      // it is the same set the MFMA lowering guard accepts, so a
+      // 32x32x64 dot arrives natively here rather than decomposing,
+      // and a K=256 dot decomposes in both places.
+      if (auto mfmaEnc = dyn_cast<ttg::AMDMfmaEncodingAttr>(
+              dotOp.getType().getEncoding())) {
+        ArrayRef<unsigned> instr = mfmaEnc.getInstrShape();
+        // K is A's last dim and B's first dim; validate whichever
+        // operand(s) are FP6, not just A.
+        bool aNative = !isMXFP6ScaleType(dotOp.getAElemType()) ||
+                       dotOp.getA().getType().getShape().back() == 128;
+        bool bNative = !isMXFP6ScaleType(dotOp.getBElemType()) ||
+                       dotOp.getB().getType().getShape().front() == 128;
+        bool instrNative =
+            (instr[0] == 16 && instr[1] == 16 && instr[2] == 128) ||
+            (instr[0] == 32 && instr[1] == 32 && instr[2] == 64);
+        if (instrNative && aNative && bNative)
+          return rewriter.notifyMatchFailure(
+              dotOp, "fp6 K=128 MFMA layout uses native ScaledMFMA");
+      }
+      if ((isMXFP6ScaleType(dotOp.getAElemType()) && !dotOp.getLhsKPack()) ||
+          (isMXFP6ScaleType(dotOp.getBElemType()) && !dotOp.getRhsKPack()))
+        return rewriter.notifyMatchFailure(dotOp, "NYI: fp6 without K-packing");
+      auto computeType =
+          getComputeType(dotOp.getAElemType(), dotOp.getBElemType(), rewriter);
+      auto scaledAOr = scaleArg(rewriter, dotOp, 0, computeType);
+      if (failed(scaledAOr))
+        return rewriter.notifyMatchFailure(dotOp, "failed to scale lhs");
+      auto scaledBOr = scaleArg(rewriter, dotOp, 1, computeType);
+      if (failed(scaledBOr))
+        return rewriter.notifyMatchFailure(dotOp, "failed to scale rhs");
+      // The shared cvtDotOperand omits kWidth, which an MFMA/WMMA
+      // parent requires; the decomposed operands are 16-bit, so each
+      // thread chunk holds 8 elements (the 16-byte MFMA operand step).
+      // The scaled layout's K (64/128 for f8f6f4) has no 16-bit MFMA
+      // intrinsic, so retarget the dot at the 16-bit shape with the
+      // same M/N: 16x16x32 or 32x32x16, both with kBase 8.
+      auto *ctx = dotOp.getContext();
+      auto mfmaEnc =
+          dyn_cast<ttg::AMDMfmaEncodingAttr>(dotOp.getType().getEncoding());
+      if (!mfmaEnc)
+        return rewriter.notifyMatchFailure(
+            dotOp, "fp6 decompose only supports MFMA result layouts");
+      auto instr = mfmaEnc.getInstrShape();
+      unsigned dotK = instr[0] == 32 ? 16 : 32;
+      auto dotEnc = ttg::AMDMfmaEncodingAttr::get(
+          ctx, mfmaEnc.getVersion(), mfmaEnc.getWarpsPerCTA(),
+          {instr[0], instr[1], dotK}, mfmaEnc.getIsTransposed(),
+          mfmaEnc.getCGALayout(), mfmaEnc.getTilesPerWarp(),
+          dotOp.getType().getElementType().getIntOrFloatBitWidth());
+      auto toDotOperand = [&](int opIdx, TensorValue v) {
+        auto enc = ttg::DotOperandEncodingAttr::get(ctx, opIdx, dotEnc, 8);
+        auto ty = v.getType().cloneWithEncoding(enc);
+        return ttg::ConvertLayoutOp::create(rewriter, dotOp.getLoc(), ty, v)
+            .getResult();
+      };
+      auto scaledA = toDotOperand(0, *scaledAOr);
+      auto scaledB = toDotOperand(1, *scaledBOr);
+      auto dotAccTy = dotOp.getC().getType().cloneWithEncoding(dotEnc);
+      auto dotAcc = ttg::ConvertLayoutOp::create(rewriter, dotOp.getLoc(),
+                                                 dotAccTy, dotOp.getC());
+      auto newDot =
+          tt::DotOp::create(rewriter, dotOp.getLoc(), scaledA, scaledB, dotAcc);
+      rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(dotOp, dotOp.getType(),
+                                                        newDot);
+      return success();
+    }
     dotOp.emitRemark() << "Decomposing scaled dot operation into regular dot "
                           "operation with explicit scaling.";
     return ttg::DecomposeScaledBlocked::matchAndRewrite(dotOp, rewriter);
