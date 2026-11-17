@@ -923,9 +923,9 @@ class CUDABackend(BaseBackend):
         # Meta AutoWS pipeline choices assume the loop gets partitioned, so a
         # module with no warp-specialization request compiles as with the knob
         # off. The modulo / joint / LLM schedulers add partitions themselves.
-        use_meta_ws = knobs.nvidia.use_meta_ws and (
-            nvidia.requests_warp_specialization(mod) or knobs.nvidia.use_modulo_schedule is not None
-            or knobs.nvidia.use_joint_schedule or knobs.nvidia.use_llm_schedule)
+        use_meta_ws = knobs.nvidia.use_meta_ws and (nvidia.requests_warp_specialization(mod)
+                                                    or knobs.nvidia.use_modulo_schedule is not None
+                                                    or knobs.nvidia.use_joint_schedule or knobs.nvidia.use_llm_schedule)
         return CUDABackend._make_ttgir(mod, metadata, opt, capability, use_meta_ws)
 
     @staticmethod

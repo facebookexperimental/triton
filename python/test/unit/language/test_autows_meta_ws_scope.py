@@ -37,12 +37,11 @@ def _compile(monkeypatch, use_meta_ws, warp_specialize):
     _matmul.device_caches.clear()
     with triton.knobs.compilation.scope():
         triton.knobs.compilation.always_compile = True
-        kernel = _matmul.warmup(a, b, c, M, N, K, BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
-                                WARP_SPECIALIZE=warp_specialize, num_warps=4, num_stages=3, grid=(1, ))
+        kernel = _matmul.warmup(a, b, c, M, N, K, BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, WARP_SPECIALIZE=warp_specialize,
+                                num_warps=4, num_stages=3, grid=(1, ))
     return kernel.asm["ttgir"]
 
 
 @pytest.mark.skipif(not _is_blackwell(), reason="Meta AutoWS pipeline under test is Blackwell")
 def test_non_ws_kernel_compiles_as_without_meta_ws(monkeypatch):
     assert _compile(monkeypatch, True, False) == _compile(monkeypatch, False, False)
-
