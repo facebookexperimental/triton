@@ -14,10 +14,10 @@
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked3 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
-// CHECK{LITERAL}: #linear = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[0, 0], [16, 0]], block = []}>
-// CHECK{LITERAL}: #linear1 = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[16, 0], [0, 0]], block = []}>
-// CHECK{LITERAL}: #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 128]}>
-// CHECK{LITERAL}: #mma1 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 64]}>
+// CHECK{LITERAL}: #linear = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[16, 0], [0, 0]], block = []}>
+// CHECK{LITERAL}: #linear1 = #ttg.linear<{register = [[0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[0, 0], [0, 0]], block = []}>
+// CHECK{LITERAL}: #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[1, 0], [2, 0]]}, instrShape = [32, 16, 128]}>
+// CHECK{LITERAL}: #mma1 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[1, 0], [2, 0]]}, instrShape = [32, 16, 64]}>
 // CHECK-LABEL: wmma_dot_scaled_mxfp4_mxfp4
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @wmma_dot_scaled_mxfp4_mxfp4(
@@ -48,8 +48,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #blocked = #ttg.blocked<{sizePerThread = [16, 2], threadsPerWarp = [2, 16], warpsPerCTA = [1, 4], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [2, 16], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
-// CHECK{LITERAL}: #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 128]}>
-// CHECK{LITERAL}: #mma1 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 64]}>
+// CHECK{LITERAL}: #mma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [0, 2]]}, instrShape = [32, 16, 128]}>
+// CHECK{LITERAL}: #mma1 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [0, 2]]}, instrShape = [32, 16, 64]}>
 // CHECK-LABEL: wmma_dot_scaled_mxfp4_mxfp4_packed_mn
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @wmma_dot_scaled_mxfp4_mxfp4_packed_mn(
@@ -495,10 +495,10 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 16], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked3 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
-// CHECK-DAG: #[[$SCALE0_LAYOUT:.+]] = #ttg.linear{{<{register = \[\[0, 1\], \[0, 2\]\], lane = \[\[1, 0\], \[2, 0\], \[4, 0\], \[8, 0\], \[0, 0\]\], warp = \[\[0, 0\], \[16, 0\]\], block = \[\]}>}}
-// CHECK-DAG: #[[$SCALE1_LAYOUT:.+]] = #ttg.linear{{<{register = \[\[0, 1\], \[0, 2\]\], lane = \[\[1, 0\], \[2, 0\], \[4, 0\], \[8, 0\], \[0, 0\]\], warp = \[\[16, 0\], \[0, 0\]\], block = \[\]}>}}
-// CHECK-DAG: #[[$MMA:.+]] = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = {{\[\[0, 1\], \[1, 0\]\]}}}, instrShape = [16, 16, 128]}>
-// CHECK-DAG: #[[$MMA1:.+]] = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = {{\[\[0, 1\], \[1, 0\]\]}}}, instrShape = [16, 16, 64]}>
+// CHECK-DAG: #[[$SCALE0_LAYOUT:.+]] = #ttg.linear{{<{register = \[\[0, 1\], \[0, 2\]\], lane = \[\[1, 0\], \[2, 0\], \[4, 0\], \[8, 0\], \[0, 0\]\], warp = \[\[16, 0\], \[0, 0\]\], block = \[\]}>}}
+// CHECK-DAG: #[[$SCALE1_LAYOUT:.+]] = #ttg.linear{{<{register = \[\[0, 1\], \[0, 2\]\], lane = \[\[1, 0\], \[2, 0\], \[4, 0\], \[8, 0\], \[16, 0\]\], warp = \[\[0, 0\], \[0, 0\]\], block = \[\]}>}}
+// CHECK-DAG: #[[$MMA:.+]] = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = {{\[\[1, 0\], \[2, 0\]\]}}}, instrShape = [32, 16, 128]}>
+// CHECK-DAG: #[[$MMA1:.+]] = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = {{\[\[1, 0\], \[2, 0\]\]}}}, instrShape = [32, 16, 64]}>
 // CHECK-LABEL: wmma_dot_scaled_mxfp4_mxfp4_missing_scale
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @wmma_dot_scaled_mxfp4_mxfp4_missing_scale(
