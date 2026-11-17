@@ -1460,7 +1460,10 @@ public:
     auto oldShapePerCTA =
         ttg::getShapePerCTA(cgaLayout.getCTASplitNum(), oldShape);
 
-    constexpr unsigned mDim = 16;
+    bool useFp4Wmma = aElemType == ScaleDotElemType::E2M1 &&
+                      bElemType == ScaleDotElemType::E2M1 &&
+                      oldShapePerCTA[0] % 32 == 0;
+    unsigned mDim = useFp4Wmma ? 32 : 16;
     constexpr unsigned nDim = 16;
     constexpr unsigned kDim = 128;
 
