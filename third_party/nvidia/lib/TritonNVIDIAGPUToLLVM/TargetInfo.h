@@ -73,6 +73,9 @@ public:
   bool supportBitwidth32Elementwise() const override {
     return targetFeatures.supportBitwidth32Elementwise();
   }
+  bool supportsTcgen05() const override {
+    return targetFeatures.supportsTcgen05();
+  }
 
   Value shuffleXor(RewriterBase &rewriter, Location loc, Value val,
                    int i) const override;
@@ -92,8 +95,13 @@ public:
   bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
                   triton::ReduceOp op, unsigned numLaneToReduce,
                   unsigned interleave,
-                  std::optional<unsigned> broadcastLaneIdMask =
-                      std::nullopt) const override;
+                  std::optional<unsigned> broadcastLaneIdMask) const override;
+  // Mask-based entry point matching upstream #12067; holds the shared redux
+  // heuristics. No default on the override above so internal calls resolve
+  // to this overload unambiguously.
+  bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
+                  triton::ReduceOp op, unsigned reduceLaneIdMask,
+                  unsigned broadcastLaneIdMask) const;
   unsigned getReductionTreeArity(Operation *combinerOp) const override;
 
   void printf(RewriterBase &rewriter, Value formatStrStart,
@@ -106,6 +114,8 @@ public:
 
   void assertFail(RewriterBase &rewriter, Location loc, StringRef message,
                   StringRef file, StringRef func, int line) const override;
+
+  void assertTrap(RewriterBase &rewriter, Location loc) const override;
 
   int getSharedAddressSpace() const override;
 

@@ -98,6 +98,12 @@ We call each individual tile "rep".
                      }]>,
        InterfaceMethod<"Convert to LinearLayout.", "LinearLayout",
                        "toLinearLayout", (ins "ArrayRef<int64_t>":$shape)>,
+       InterfaceMethod<"Whether toLinearLayout builds an exact mixed-radix "
+                       "layout at an NPOT shape. Encodings implement it once "
+                       "they do.",
+                       "bool", "hasMixedRadixLayout", (ins),
+                       /*methodBody=*/"",
+                       /*defaultImplementation=*/"return false;">,
   ];
 }
 

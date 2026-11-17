@@ -163,6 +163,7 @@ def TTG_AsyncCopyGlobalToLocalOp
              [GlobalToLocalCopyTrait,
               AttrSizedOperandSegments,
               DeclareOpInterfaceMethods<PredicatedOpInterface>,
+              MixedRadixLayoutTrait,
               OptionalTypesMatchWith<"infer mask type from src type", "src",
                                      "mask", "getI1SameShape($_self)">,
               OptionalTypesMatchWith<"infer other type from src type", "src",
@@ -242,7 +243,8 @@ def TTG_AsyncCopyGlobalToLocalOp
 
 // Allocate shared memory
 def TTG_LocalAllocOp : TTG_Op<"local_alloc", [DeclareOpInterfaceMethods<
-                                                 MemoryEffectsOpInterface>]> {
+                                                 MemoryEffectsOpInterface>,
+                                             MixedRadixLayoutTrait]> {
   let summary = "allocate tensor";
   let description = [{
     This operation allocates buffer in shared memory and return a descriptor
@@ -472,7 +474,8 @@ def TTG_MemDescReinterpretOp
   let hasVerifier = 1;
 }
 
-def TTG_LocalLoadOp : TTG_Op<"local_load", [LocalLoadTrait]> {
+def TTG_LocalLoadOp
+    : TTG_Op<"local_load", [LocalLoadTrait, MixedRadixLayoutTrait]> {
   let summary = "Load a buffer from local memory into a distributed tensor";
 
   let description = [{
@@ -715,7 +718,9 @@ def TTG_PredicateStageOp
                        "$stage attr-dict `:` type($iv) `->` type($result)";
 }
 
-def TTG_MaskOp : TTG_Op<"mask", [SingleBlock]> {
+// The pipeliner resolves a mask into its body before lowering, and each body
+// op is checked on its own, so a mask only forwards values.
+def TTG_MaskOp : TTG_Op<"mask", [SingleBlock, MixedRadixLayoutTrait]> {
   let summary = "mask op for pipelining";
   let arguments = (ins I1:$pred);
   let results = (outs Variadic<AnyType>:$result);
@@ -723,7 +728,8 @@ def TTG_MaskOp : TTG_Op<"mask", [SingleBlock]> {
 }
 
 def TTG_MaskReturnOp : TTG_Op<"mask.return", [HasParent<"MaskOp">, Pure,
-                                              Terminator, ReturnLike]> {
+                                              Terminator, ReturnLike,
+                                              MixedRadixLayoutTrait]> {
   let summary = "terminator for mask operator";
   let arguments = (ins Variadic<AnyType>:$result);
   let assemblyFormat = "$result attr-dict `:` type($result)";
@@ -981,10 +987,9 @@ def TTG_Clock64Op
 }
 
 def TTG_BarrierOp : TTG_Op<"barrier"> {
-  let summary = "Synchronizes execution and reads/writes to the selected "
-                "address spaces for all threads in the CTA.";
+  let summary = "Synchronizes execution and memory accesses within a CTA or warp.";
   let description = [{
-    The `barrier` op synchronises the execution and all operations between the selected address spaces for all
+    At the default CTA scope, the `barrier` op synchronises the execution and all operations between the selected address spaces for all
     threads in the CTA. It is used to coordinate communication between threads in the CTA.
 
     This operation waits until all threads in the CTA have reached a `barrier` (for synchronization) and operations
@@ -995,10 +1000,13 @@ def TTG_BarrierOp : TTG_Op<"barrier"> {
 
     A `barrier` operation only provides synchronization and memory guarantees on the selected address spaces in the CTA.
 
+    Warp scope currently supports only the `local` address space. It synchronizes
+    all lanes of each participating warp and orders their shared memory accesses.
+
     The mandatory `addrspace` attribute is a bitmask describing which address spaces will be visible when the `barrier` completes:
 
     * `none`         control-only synchronization (no memory ordering).
-    * `local`        shared-memory operations are complete and visible CTA-wide.
+    * `local`        shared-memory operations are complete and visible within the selected scope.
     * `global_read`  global memory reads are complete and visible CTA-wide.
     * `global_write` global memory writes are complete and visible CTA-wide.
     * `tensor_read`  tensor memory read operations are complete and visible CTA-wide.
@@ -1012,13 +1020,18 @@ def TTG_BarrierOp : TTG_Op<"barrier"> {
     ```mlir
     ttg.barrier local
     ttg.barrier local|global_read|global_write
+    ttg.barrier warp local
     ```
   }];
 
-  let arguments = (ins TTG_AddrSpace:$addrSpace);
+  let arguments = (ins TTG_AddrSpace:$addrSpace,
+    DefaultValuedAttr<TTG_BarrierScope, "::mlir::triton::gpu::BarrierScope::CTA">:$scope);
   let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 
   let extraClassDeclaration = [{
+    bool isWarp() { return getScope() == BarrierScope::Warp; }
+
     /// Returns true if the barrier includes all of the given address spaces.
     /// For example, hasAddrSpaces(Local | GlobalRead) returns true only if
     /// both Local and GlobalRead are set.

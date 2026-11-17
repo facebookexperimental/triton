@@ -210,3 +210,53 @@ module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.n
     tt.return
   }
 }
+
+// -----
+
+// B arrives N-contiguous and #k, the 32x32x16 MFMA B operand at kWidth 8, is
+// K-contiguous, so no dim keeps a vector on both sides. Each odd K tile moves
+// like the pow2 convert below.
+#b = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [32, 0], [64, 0]], lane = [[0, 8], [0, 16], [0, 32], [1, 0], [2, 0], [4, 0]], warp = [[8, 0], [16, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [192, 64]}>
+#k = #ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [16, 0], [32, 0], [64, 0]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [8, 0]], warp = [[0, 32], [0, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [192, 64]}>
+module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK: module attributes {{.*}}ttg.shared = 8192 : i32
+  // CHECK-LABEL: llvm.func @transpose_odd_tiles
+  // CHECK-COUNT-8: llvm.store {{.*}} : vector<2xf16>, !llvm.ptr<3>
+  // CHECK-COUNT-16: llvm.load {{.*}} : !llvm.ptr<3> -> vector<2xf16>
+  // CHECK-COUNT-8: llvm.store {{.*}} : vector<2xf16>, !llvm.ptr<3>
+  // CHECK-COUNT-16: llvm.load {{.*}} : !llvm.ptr<3> -> vector<2xf16>
+  // CHECK-COUNT-8: llvm.store {{.*}} : vector<2xf16>, !llvm.ptr<3>
+  // CHECK-COUNT-16: llvm.load {{.*}} : !llvm.ptr<3> -> vector<2xf16>
+  // CHECK-NOT: !llvm.ptr<3>
+  // CHECK: llvm.return
+  tt.func public @transpose_odd_tiles(%p: !tt.ptr<f16>) {
+    %s = tt.splat %p : !tt.ptr<f16> -> tensor<192x64x!tt.ptr<f16>, #b>
+    %v = tt.load %s : tensor<192x64x!tt.ptr<f16>, #b>
+    %c = ttg.convert_layout %v : tensor<192x64xf16, #b> -> tensor<192x64xf16, #k>
+    %d = tt.splat %p : !tt.ptr<f16> -> tensor<192x64x!tt.ptr<f16>, #k>
+    tt.store %d, %c : tensor<192x64x!tt.ptr<f16>, #k>
+    tt.return
+  }
+}
+
+// -----
+
+#b = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [32, 32, 16], isTransposed = true}>
+#dot = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK: module attributes {{.*}}ttg.shared = 8192 : i32
+  // CHECK-LABEL: llvm.func @transpose_pow2
+  // CHECK-COUNT-8: llvm.store {{.*}} : vector<2xf16>, !llvm.ptr<3>
+  // CHECK-COUNT-16: llvm.load {{.*}} : !llvm.ptr<3> -> vector<2xf16>
+  // CHECK-NOT: !llvm.ptr<3>
+  // CHECK: llvm.return
+  tt.func public @transpose_pow2(%p: !tt.ptr<f16>) {
+    %s = tt.splat %p : !tt.ptr<f16> -> tensor<64x64x!tt.ptr<f16>, #b>
+    %v = tt.load %s : tensor<64x64x!tt.ptr<f16>, #b>
+    %c = ttg.convert_layout %v : tensor<64x64xf16, #b> -> tensor<64x64xf16, #dot>
+    %d = tt.splat %p : !tt.ptr<f16> -> tensor<64x64x!tt.ptr<f16>, #dot>
+    tt.store %d, %c : tensor<64x64x!tt.ptr<f16>, #dot>
+    tt.return
+  }
+}

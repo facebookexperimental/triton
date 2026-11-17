@@ -9,6 +9,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "llvm/IR/Constants.h"
@@ -135,12 +136,6 @@ void init_triton_nvidia_passes_ttgpuir(py::module_ &m) {
           pm.addPass(mlir::triton::createAllocateSharedMemoryNvPass(
               capability, ptxVersion));
         });
-  m.def("add_set_minimum_shared_memory",
-        [](mlir::PassManager &pm, int32_t minimumSize) {
-          mlir::triton::SetMinimumSharedMemoryOptions options;
-          options.minimumSize = minimumSize;
-          pm.addPass(mlir::triton::createSetMinimumSharedMemory(options));
-        });
   ADD_PASS_OPTION_WRAPPER_2("add_membar",
                             mlir::triton::createTritonNvidiaGPUMembar, int32_t,
                             int32_t);
@@ -219,8 +214,8 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module_ &m) {
                      ttng::createTritonNvidiaGPUFuseTMEMLoadReducePass);
   ADD_PASS_WRAPPER_0("add_tmem_barrier_insertion",
                      ttng::createTritonNvidiaGPUTMemBarrierInsertionPass);
-  ADD_PASS_WRAPPER_0("add_tmem_wait_insertion",
-                     ttng::createTritonNvidiaGPUTMemWaitInsertionPass);
+  ADD_PASS_WRAPPER_0("add_optimize_mbarrier_arrivals",
+                     ttng::createTritonNvidiaGPUOptimizeMBarrierArrivalsPass);
   ADD_PASS_WRAPPER_0(
       "add_cluster_barrier_mbar_allocator",
       ttng::createTritonNvidiaGPUClusterBarrierMbarAllocatorPass);
@@ -391,6 +386,7 @@ void init_triton_nvidia(py::module_ &m) {
                     mlir::triton::nvgpu::NVGPUDialect,
                     mlir::triton::nvws::NVWSDialect>();
     mlir::registerNVVMDialectTranslation(registry);
+    mlir::triton::gpu::registerNpotTargetLegality(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });

@@ -7,17 +7,17 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
   // stays below twice the extent, so a compare-and-subtract reduces it. The
   // compare and the subtract are independent, so their order is not checked.
   // CHECK-LABEL: llvm.func @pointwise
-  // CHECK: llvm.mlir.constant(16 : i32) : i32
+  // CHECK-DAG: llvm.mlir.constant(16 : i32) : i32
+  // CHECK-DAG: %[[ZERO:.*]] = llvm.mlir.constant(0 : i32) : i32
+  // CHECK-DAG: %[[ODD:.*]] = llvm.mlir.constant(32 : i32) : i32
+  // CHECK-DAG: %[[N:.*]] = llvm.mlir.constant(96 : i32) : i32
   // CHECK: %[[LANE:.*]] = llvm.xor
   // CHECK: llvm.xor %[[LANE]], %{{.*}} : i32
-  // CHECK-NEXT: %[[ZERO:.*]] = llvm.mlir.constant(0 : i32) : i32
-  // CHECK-NEXT: %[[BIN:.*]] = llvm.xor %[[LANE]], %[[ZERO]] : i32
-  // CHECK-NEXT: %[[ODD:.*]] = llvm.mlir.constant(32 : i32) : i32
-  // CHECK-NEXT: %[[SUM:.*]] = llvm.add %[[BIN]], %[[ODD]] : i32
-  // CHECK-DAG: %[[WRAP:.*]] = llvm.icmp "uge" %[[SUM]], %[[N:.*]] : i32
-  // CHECK-DAG: %[[N]] = llvm.mlir.constant(96 : i32) : i32
-  // CHECK-DAG: %[[SUB:.*]] = llvm.sub %[[SUM]], %[[M:.*]] : i32
-  // CHECK-DAG: %[[M]] = llvm.mlir.constant(96 : i32) : i32
+  // CHECK: llvm.xor %{{.*}}, %[[ZERO]] : i32
+  // CHECK: %[[BIN:.*]] = llvm.xor %{{.*}}, %[[ZERO]] : i32
+  // CHECK: %[[SUM:.*]] = llvm.add %[[BIN]], %[[ODD]] : i32
+  // CHECK: %[[WRAP:.*]] = llvm.icmp "uge" %[[SUM]], %[[N]] : i32
+  // CHECK: %[[SUB:.*]] = llvm.sub %[[SUM]], %[[N]] : i32
   // CHECK: llvm.select %[[WRAP]], %[[SUB]], %[[SUM]] : i1, i32
   // CHECK-COUNT-3: llvm.fadd
   tt.func public @pointwise(%p: !tt.ptr<f32>) {
@@ -99,17 +99,32 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
   // Destination register j holds source register 2j mod 11 (11 for j = 11).
   // CHECK: module attributes {{.*}}ttg.shared = 0 : i32
   // CHECK-LABEL: llvm.func @registers
-  // CHECK: %[[S0:.*]] = llvm.extractvalue %[[SRC:.*]][0] :
-  // CHECK-NEXT: %[[S1:.*]] = llvm.extractvalue %[[SRC]][1] :
-  // CHECK-NEXT: %[[S2:.*]] = llvm.extractvalue %[[SRC]][2] :
-  // CHECK-NEXT: llvm.extractvalue %[[SRC]][3] :
-  // CHECK-NEXT: %[[S4:.*]] = llvm.extractvalue %[[SRC]][4] :
+  // CHECK-DAG: %[[ZERO:.+]] = llvm.mlir.constant(0 : i32) : i32
+  // CHECK: %[[V0:.*]] = llvm.add %{{.+}}, %[[ZERO]] : i32
+  // CHECK: %[[V1:.*]] = llvm.add %{{.+}}, %[[ZERO]] : i32
+  // CHECK: %[[V2:.*]] = llvm.add %{{.+}}, %[[ZERO]] : i32
+  // CHECK: %[[V3:.*]] = llvm.add %{{.+}}, %[[ZERO]] : i32
+  // CHECK: %[[V4:.*]] = llvm.add %{{.+}}, %[[ZERO]] : i32
+  // CHECK: %[[V5:.*]] = llvm.add %{{.+}}, %[[ZERO]] : i32
+  // CHECK: %[[V6:.*]] = llvm.add %{{.+}}, %[[ZERO]] : i32
+  // CHECK: %[[V7:.*]] = llvm.add %{{.+}}, %[[ZERO]] : i32
+  // CHECK: %[[V8:.*]] = llvm.add %{{.+}}, %[[ZERO]] : i32
+  // CHECK: %[[V9:.*]] = llvm.add %{{.+}}, %[[ZERO]] : i32
+  // CHECK: %[[V10:.*]] = llvm.add %{{.+}}, %[[ZERO]] : i32
+  // CHECK: %[[V11:.*]] = llvm.add %{{.+}}, %[[ZERO]] : i32
   // CHECK-NOT: {{ptr<3>|nvvm.shfl}}
-  // CHECK: llvm.insertvalue %[[S0]], %{{.*}}[0] :
-  // CHECK-NEXT: llvm.insertvalue %[[S2]], %{{.*}}[1] :
-  // CHECK-NEXT: llvm.insertvalue %[[S4]], %{{.*}}[2] :
-  // CHECK-COUNT-3: llvm.insertvalue
-  // CHECK-NEXT: llvm.insertvalue %[[S1]], %{{.*}}[6] :
+  // CHECK: llvm.insertelement %[[V0]],
+  // CHECK: llvm.insertelement %[[V2]],
+  // CHECK: llvm.insertelement %[[V4]],
+  // CHECK: llvm.insertelement %[[V6]],
+  // CHECK: llvm.insertelement %[[V8]],
+  // CHECK: llvm.insertelement %[[V10]],
+  // CHECK: llvm.insertelement %[[V1]],
+  // CHECK: llvm.insertelement %[[V3]],
+  // CHECK: llvm.insertelement %[[V5]],
+  // CHECK: llvm.insertelement %[[V7]],
+  // CHECK: llvm.insertelement %[[V9]],
+  // CHECK: llvm.insertelement %[[V11]],
   tt.func public @registers(%p: !tt.ptr<i32>) {
     %r = tt.make_range {end = 384 : i32, start = 0 : i32} : tensor<384xi32, #src>
     %c = ttg.convert_layout %r : tensor<384xi32, #src> -> tensor<384xi32, #dst>
@@ -133,10 +148,10 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
   // CHECK: nvvm.shfl.sync idx
   // CHECK: %[[W4:.*]] = nvvm.shfl.sync idx
   // CHECK-NOT: ptr<3>
-  // CHECK: llvm.insertvalue %[[W0]], %{{.*}}[0] :
-  // CHECK-NEXT: llvm.insertvalue %[[W2]], %{{.*}}[1] :
-  // CHECK-NEXT: llvm.insertvalue %[[W4]], %{{.*}}[2] :
-  // CHECK-NEXT: llvm.insertvalue %[[W1]], %{{.*}}[3] :
+  // CHECK: llvm.insertelement %[[W0]],
+  // CHECK: llvm.insertelement %[[W2]],
+  // CHECK: llvm.insertelement %[[W4]],
+  // CHECK: llvm.insertelement %[[W1]],
   tt.func public @warp_reorder(%p: !tt.ptr<i32>) {
     %r = tt.make_range {end = 192 : i32, start = 0 : i32} : tensor<192xi32, #src>
     %c = ttg.convert_layout %r {force_warp_shuffle} : tensor<192xi32, #src> -> tensor<192xi32, #dst>
@@ -156,15 +171,13 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
   // suffices.
   // CHECK: module attributes {{.*}}ttg.shared = 384 : i32
   // CHECK-LABEL: llvm.func @warp_shared
+  // CHECK-DAG: llvm.mlir.constant(-1 : i32) : i32
   // CHECK: nvvm.stmatrix
-  // CHECK-NEXT: %[[S1:.*]] = llvm.mlir.constant(32 : i32) : i32
-  // CHECK-NEXT: llvm.getelementptr %[[BASE:.*]][%[[S1]]] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i32
+  // CHECK: llvm.getelementptr %{{.*}}[32] : (!llvm.ptr<3>) -> !llvm.ptr<3>, i32
   // CHECK: nvvm.stmatrix
-  // CHECK-NEXT: %[[S2:.*]] = llvm.mlir.constant(64 : i32) : i32
-  // CHECK-NEXT: llvm.getelementptr %[[BASE]][%[[S2]]] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i32
+  // CHECK: llvm.getelementptr %{{.*}}[64] : (!llvm.ptr<3>) -> !llvm.ptr<3>, i32
   // CHECK: nvvm.stmatrix
-  // CHECK-NEXT: llvm.mlir.constant(-1 : i32) : i32
-  // CHECK-NEXT: nvvm.bar.warp.sync
+  // CHECK: nvvm.bar.warp.sync
   // CHECK-NOT: nvvm.barrier
   // CHECK-COUNT-3: nvvm.ldmatrix {{.*}}, num = 1,
   // CHECK-NOT: {{nvvm.barrier|matrix}}
@@ -262,8 +275,8 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
   // tiles, four per round, and a warp sync suffices.
   // CHECK: module attributes {{.*}}ttg.shared = 512 : i32
   // CHECK-LABEL: llvm.func @register_shared
+  // CHECK-DAG: llvm.mlir.constant(-1 : i32) : i32
   // CHECK-COUNT-4: nvvm.stmatrix
-  // CHECK-NEXT: llvm.mlir.constant(-1 : i32) : i32
   // CHECK-NEXT: nvvm.bar.warp.sync
   // CHECK-COUNT-4: nvvm.ldmatrix
   // CHECK-COUNT-4: nvvm.bar.warp.sync
@@ -285,11 +298,11 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // Warp bit 0 broadcasts, so only even warps store.
   // CHECK-LABEL: llvm.func @warp_broadcast_store
+  // CHECK-DAG: %[[ONE:.*]] = llvm.mlir.constant(1 : i32)
   // CHECK: ttg.warp_id
   // CHECK: %[[W:.*]] = ttg.warp_id
-  // CHECK-NEXT: %[[ONE:.*]] = llvm.mlir.constant(1 : i32)
-  // CHECK-NEXT: %[[BIT:.*]] = llvm.and %[[W]], %[[ONE]]
-  // CHECK-NEXT: %[[OWN:.*]] = llvm.icmp "eq" %[[BIT]], %{{.*}}
+  // CHECK: %[[BIT:.*]] = llvm.and %[[W]], %[[ONE]]
+  // CHECK: %[[OWN:.*]] = llvm.icmp "eq" %[[BIT]], %{{.*}}
   // CHECK: st.global{{.*}}%[[OWN]]
   tt.func public @warp_broadcast_store(%p: !tt.ptr<i32>) {
     %r = tt.make_range {end = 192 : i32, start = 0 : i32} : tensor<192xi32, #p>
@@ -498,6 +511,31 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // -----
 
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 96, 16]}>
+#dst = #ttg.linear<{register = [[0, 1], [0, 2], [16, 0], [32, 0], [64, 0], [0, 32]], lane = [[0, 4], [0, 8], [0, 16], [1, 0], [2, 0]], warp = [[4, 0], [8, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 96]}>
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // A split-K wgmma epilogue: the pow2 alloc shape's (128x128) scratch holds
+  // one 128x32 tile, so the three tiles move in three rounds.
+  // CHECK: module attributes {{.*}}ttg.shared = 16384 : i32
+  // CHECK-LABEL: llvm.func @odd_tiles_three_rounds
+  // CHECK-COUNT-8: llvm.store {{.*}} : vector<4xi32>, !llvm.ptr<3>
+  // CHECK-NEXT: nvvm.barrier
+  // CHECK-COUNT-8: llvm.load {{.*}} : !llvm.ptr<3> -> vector<4xi32>
+  // CHECK-COUNT-4: nvvm.barrier
+  // CHECK-COUNT-8: llvm.load {{.*}} : !llvm.ptr<3> -> vector<4xi32>
+  // CHECK-NOT: {{nvvm.barrier|ptr<3>}}
+  // CHECK: llvm.return
+  tt.func public @odd_tiles_three_rounds(%p: !tt.ptr<f32>, %f: f32) {
+    %v = tt.splat %f : f32 -> tensor<128x96xf32, #mma>
+    %c = ttg.convert_layout %v : tensor<128x96xf32, #mma> -> tensor<128x96xf32, #dst>
+    %d = tt.splat %p : !tt.ptr<f32> -> tensor<128x96x!tt.ptr<f32>, #dst>
+    tt.store %d, %c : tensor<128x96x!tt.ptr<f32>, #dst>
+    tt.return
+  }
+}
+
+// -----
+
 #a = #ttg.linear<{register = [[0, 32], [1, 0]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [3, 64]}>
 #b = #ttg.linear<{register = [[32, 0], [0, 1]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [], block = [], inputRadices = {register = [2, 3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [64, 3]}>
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
@@ -548,13 +586,13 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
   // element at row * 3 + column and every thread reloads after a barrier.
   // CHECK: module attributes {{.*}}ttg.shared = 768 : i32
   // CHECK-LABEL: llvm.func @moving_reshape
+  // CHECK-DAG: llvm.mlir.constant(16 : i32) : i32
+  // CHECK-DAG: %[[THREE:.*]] = llvm.mlir.constant(3 : i32) : i32
   // CHECK: %[[Q:.*]] = llvm.udiv %{{.*}}, %{{.*}} : i32
   // CHECK: %[[D:.*]] = llvm.urem %[[Q]], %{{.*}} : i32
   // CHECK: %[[OWN:.*]] = llvm.icmp "eq" %[[D]], %{{.*}} : i32
   // CHECK-NEXT: %[[PRED:.*]] = llvm.and %{{.*}}, %[[OWN]] : i1
-  // CHECK: llvm.mlir.constant(16 : i32) : i32
-  // CHECK: %[[THREE:.*]] = llvm.mlir.constant(3 : i32) : i32
-  // CHECK-NEXT: llvm.mul %{{.*}}, %[[THREE]] : i32
+  // CHECK: llvm.mul %{{.*}}, %[[THREE]] : i32
   // CHECK: "@$2 st.shared.b32 [ $0 + 0 ], $1;"{{.*}} %[[PRED]] :
   // CHECK-COUNT-2: "@$2 st.shared.b32 [ $0 + 0 ], $1;"
   // CHECK-NEXT: nvvm.barrier

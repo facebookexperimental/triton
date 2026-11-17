@@ -43,22 +43,8 @@ public:
   };
 
   explicit ReduceOpHelper(triton::ReduceOp op)
-      : op(op.getOperation()), axis(op.getAxis()) {
-    auto firstTy = cast<RankedTensorType>(op.getOperands()[0].getType());
-    srcTy = firstTy;
-    srcShape = firstTy.getShape();
-    srcEncoding = firstTy.getEncoding();
-    srcElementTypes = op.getElementTypes();
-
-    for (const auto &t : op.getInputTypes()) {
-      if (t.getShape() != srcShape) {
-        op.emitError() << "shape mismatch";
-      }
-      if (t.getEncoding() != srcEncoding) {
-        op.emitError() << "encoding mismatch";
-      }
-    }
-  }
+      : op(op), srcTy(op.getInputTypes().front()), srcShape(srcTy.getShape()),
+        srcEncoding(srcTy.getEncoding()), axis(op.getAxis()) {}
 
   ArrayRef<int64_t> getSrcShape() { return srcShape; }
 
@@ -87,24 +73,31 @@ public:
 
   bool isReduceWithinCTA();
 
-  // Callback to allow backends to specify target-specific getter for scratch
+  // Callback to allow backends to specify a target-specific getter for scratch
   // elements.
   using GetNumScratchElemsFn = std::function<unsigned(
       const triton::LinearLayout &src, const triton::LinearLayout &dst,
       unsigned bitwidth)>;
 
+  // Allocation size for the whole reduction: the maximum sizeInBytes returned
+  // by getScratchConfig across its inter-warp/CTA reduction stages.
   unsigned
   getScratchSizeInBytes(GetNumScratchElemsFn numScratchElemsGetter = nullptr);
 
   InThreadVectorizeOpKind
-  getInThreadVectorizeOpKind(unsigned axisPack,
-                             bool supportBitwidth16Elementwise,
+  getInThreadVectorizeOpKind(bool supportBitwidth16Elementwise,
                              bool supportBitwidth32Elementwise);
 
-  static Value createInThreadVectorizedCombineOp(OpBuilder &builder,
-                                                 Location loc,
-                                                 InThreadVectorizeOpKind kind,
-                                                 Value lhs, Value rhs);
+  struct ScratchConfig {
+    SmallVector<unsigned> offsets;
+    unsigned sizeInBytes = 0;
+  };
+
+  // Byte offsets in operand order and total storage for one layout conversion.
+  ScratchConfig
+  getScratchConfig(const triton::LinearLayout &src,
+                   const triton::LinearLayout &dst,
+                   GetNumScratchElemsFn numScratchElemsGetter = nullptr);
 
   static triton::ColumnAction
   moveAxisBasesToFront(const triton::LinearLayout &layout, int axis,
@@ -113,8 +106,9 @@ public:
   static triton::LinearLayout reducedRegLaneLayout(RankedTensorType srcTy,
                                                    int axis);
 
-  static triton::LinearLayout getInterLayout(const triton::LinearLayout &layout,
-                                             int axis);
+  static triton::LinearLayout
+  getInterWarpReductionLayout(const triton::LinearLayout &layout,
+                              unsigned axis);
 
   static triton::LinearLayout
   zeroBasesAlongDimAndReorder(const triton::LinearLayout &layout, int axis,
@@ -129,7 +123,6 @@ private:
   RankedTensorType srcTy;
   ArrayRef<int64_t> srcShape;
   Attribute srcEncoding;
-  SmallVector<Type> srcElementTypes;
   int axis;
 };
 
@@ -175,6 +168,8 @@ public:
   unsigned getNumOperands() { return scanOp.getNumOperands(); }
   SmallVector<Type> getElementTypes() { return srcElementTypes; }
   SmallVector<unsigned> getOrder() { return order; }
+  // The source register of each blocked index; empty for a Blocked source.
+  ArrayRef<unsigned> getBlockedToSrc() { return blockedToSrc; }
   Region &getCombineOp();
 
 private:
@@ -184,6 +179,7 @@ private:
   llvm::ArrayRef<int64_t> srcShape;
   SmallVector<Type> srcElementTypes;
   SmallVector<unsigned> order;
+  SmallVector<unsigned> blockedToSrc;
 };
 
 // Helper class for lowering `tt.gather` operations. This class shares lowering
@@ -255,6 +251,16 @@ struct MixedRadixSharedTiling {
 std::optional<MixedRadixSharedTiling>
 getMixedRadixSharedTiles(const triton::LinearLayout &src,
                          const triton::LinearLayout &dst);
+
+// Elements per shared access on `dim` when it is a tile's fastest dim.
+int32_t getMixedRadixSharedRunLength(const triton::LinearLayout &layout,
+                                     int32_t dim, unsigned bitwidth);
+
+// The odd tiles of a Shared transfer that transposes: each side has a vector
+// but no dim keeps one on both, so a single shared order leaves a side scalar.
+std::optional<MixedRadixSharedTiling>
+getMixedRadixTransposeTiles(const triton::LinearLayout &src,
+                            const triton::LinearLayout &dst, unsigned bitwidth);
 
 // The pow2 padding of a mixed-radix `layout`: each digit of odd radix r becomes
 // ceil(log2 r) binary digits, so each out dim pads to its next power of two.
@@ -359,9 +365,8 @@ getReshapeDecomposition(ArrayRef<int64_t> srcShape, ArrayRef<int64_t> dstShape);
 // If shape is empty, it means no shared memory is needed.
 unsigned getNumScratchElements(ArrayRef<unsigned> shape);
 
-bool supportWMMA(triton::DotOp op);
-
-bool supportMMA(triton::DotOp op, int version);
+bool supportMMA(triton::DotOp op, int version,
+                std::optional<int> knownNumWarps = std::nullopt);
 
 bool supportMMA(triton::DotOpInterface op, int version);
 
@@ -385,10 +390,6 @@ bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy);
 
 // The conversion requires data exchange through shared memory.
 bool cvtNeedsSharedMemory(triton::gpu::ConvertLayoutOp op);
-
-// TODO: Move utility functions that belong to ConvertLayoutOp to class
-// ConvertLayoutOpHelper in the future
-bool shouldUseDistSmem(Attribute srcLayout, Attribute dstLayout);
 
 /// Create a basic DataFlowSolver with constant and dead code analysis included.
 std::unique_ptr<DataFlowSolver> createDataFlowSolver();

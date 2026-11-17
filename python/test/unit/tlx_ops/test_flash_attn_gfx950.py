@@ -929,3 +929,102 @@ def test_flash_attn_gfx950_d128_planes2_converter_merges_full_output(batch, head
     assert torch.isfinite(output).all()
     torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
     torch.testing.assert_close(accumulator, accumulator_before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("shape", "stride", "block_rows", "expected"),
+    (
+        # Contiguous (B, 32, 8192, 128): 64 batches end at element 2**31 - 1 and 65 pass it.
+        ((64, 32, 8192, 128), (2**25, 2**20, 128, 1), 256, False),
+        ((65, 32, 8192, 128), (2**25, 2**20, 128, 1), 256, True),
+        # Three heads whose real rows end at element 2147451263: only the masked rows of the last tile pass 2**31.
+        ((1, 3, 5592320, 128), (3 * 5592320 * 128, 5592320 * 128, 128, 1), 256, False),
+        ((1, 3, 5592321, 128), (3 * 5592321 * 128, 5592321 * 128, 128, 1), 256, True),
+        # A slice of one long sequence: its size-1 batch and head strides do not fit in int32.
+        ((1, 1, 1024, 128), ((2**24 + 256) * 128, (2**24 + 256) * 128, 128, 1), 256, True),
+    ),
+)
+def test_flash_attn_gfx950_needs_i64_offsets(shape, stride, block_rows, expected):
+    """The int64-offset choice at its threshold, from a tensor's shape and strides and the tile height."""
+    from triton.tlx.ops.kernels.flash_attn.gfx950 import _needs_i64_offsets
+
+    assert _needs_i64_offsets(shape, stride, block_rows) is expected
+
+
+def _qkv_past_int32(layout):
+    """Q/K/V views of one 4.5 GiB buffer whose element offsets or strides do not fit in int32."""
+    head_dim = 128
+    buffer = torch.empty(2**31 + 2**28, device="cuda", dtype=torch.bfloat16)
+    if layout == "batch":
+        # Batch 2 starts at element 2**31 + 2**17, so its batch offset no longer fits in int32.
+        batch, seq, batch_stride = 3, 256, 2**30 + 2**16
+        shape, stride = (batch, 1, seq, head_dim), (batch_stride, seq * head_dim, head_dim, 1)
+        offsets = [i * seq * head_dim for i in range(3)]
+    elif layout == "slice":
+        # Slices of one sequence of 2**24 + 256 rows, whose batch and head strides do not fit in int32.
+        seq, rows = 1024, 2**24 + 256
+        shape, stride = (1, 1, seq, head_dim), (rows * head_dim, rows * head_dim, head_dim, 1)
+        offsets = [i * seq * head_dim for i in range(3)]
+    else:
+        # Rows 2**20 elements apart start past 2**31 from row 2048 on; the size-1 batch and head strides fit in int32.
+        seq, row_stride = 2304, 2**20
+        shape, stride = (1, 1, seq, head_dim), (row_stride, row_stride, row_stride, 1)
+        offsets = [i * head_dim for i in range(3)]
+    views = [buffer.as_strided(shape, stride, offset) for offset in offsets]
+    for view in views:
+        view.copy_(torch.randn(shape, device="cuda", dtype=torch.bfloat16))
+    return views
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("causal", (False, True))
+@pytest.mark.parametrize("layout", ("batch", "rows", "slice"))
+def test_flash_attn_gfx950_int64_offsets(layout, causal):
+    """Inputs whose element offsets or strides do not fit in int32 match contiguous copies of them bitwise."""
+    from triton.tlx.ops import flash_attn
+
+    torch.manual_seed(31)
+    q, k, v = _qkv_past_int32(layout)
+    out = flash_attn(q, k, v, causal=causal, space="smoke")
+    expected = flash_attn(*[tensor.contiguous() for tensor in (q, k, v)], causal=causal, space="smoke")
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+@pytest.mark.parametrize("causal", (False, True))
+def test_flash_attn_gfx950_int64_offsets_lse(causal):
+    """With the LSE stored, both forward kernels (short-causal for causal N = 256) match contiguous copies bitwise."""
+    from triton.tlx.ops.kernels.flash_attn.gfx950 import flash_attn_cluster_pipeline
+
+    torch.manual_seed(31)
+    q, k, v = _qkv_past_int32("batch")
+    dense = [tensor.contiguous() for tensor in (q, k, v)]
+    scale = q.shape[-1]**-0.5
+    options = {"_return_lse": True, "_allow_prescale_q": False, "USE_DIRECT_LOAD": False}
+    out, lse = flash_attn_cluster_pipeline(q, k, v, scale, causal, **options)
+    expected, expected_lse = flash_attn_cluster_pipeline(*dense, scale, causal, **options)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="requires a gfx950 GPU")
+def test_flash_attn_gfx950_rejects_backward_past_grid_limit(monkeypatch):
+    """D128 training inputs longer than 2**24 rows fail validation before any kernel runs."""
+    from triton.tlx.ops import InvalidInput, flash_attn
+    from triton.tlx.ops.kernels.flash_attn import gfx950, gfx950_bwd
+
+    assert gfx950_bwd._is_supported_gqa_shape((1, 1, 1, 2**24, 128))
+    assert not gfx950_bwd._is_supported_gqa_shape((1, 1, 1, 2**24 + 256, 128))
+
+    def forward(*args, **kwargs):
+        raise AssertionError("the forward ran")
+
+    monkeypatch.setattr(gfx950, "flash_attn_cluster_pipeline", forward)
+    seq = 2**24 + 256
+    # Overlapping rows keep the inputs at 32 MiB.
+    storage = torch.zeros(seq + 127, device="cuda", dtype=torch.bfloat16)
+    q, k, v = [storage.as_strided((1, 1, seq, 128), (seq, seq, 1, 1)).detach().requires_grad_() for _ in range(3)]
+    with pytest.raises(InvalidInput, match=f"N <= {2**24}"):
+        flash_attn(q, k, v)
+    with pytest.raises(ValueError, match=f"N <= {2**24}"):
+        gfx950_bwd.fa_backward(q, k, v, q, q, storage, 0.125, False)

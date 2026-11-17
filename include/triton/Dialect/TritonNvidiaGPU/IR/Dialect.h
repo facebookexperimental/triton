@@ -89,6 +89,12 @@ constexpr static char kPlannedPendingCount[] = "planned_pending_count";
 // tcgen05.mma collector usage for operand A ("fill" / "use" / "lastuse"), set
 // by the MMA collector reuse pass on single-instruction MMAs.
 constexpr static char kCollectorAAttrName[] = "ttng.collector_a";
+// Set by autoWS code partitioning on a nvws.consumer_release whose partition
+// read the buffer through the generic proxy. Token lowering keeps it on the
+// resulting arrive only when another partition refills the buffer with TMA,
+// and ProxyFenceInsertion puts a proxy fence before every marked arrive
+// (mbarrier or named barrier), wherever the barrier passes have moved it.
+constexpr static char kFenceGenericReadsAttrName[] = "ttng.fence_generic_reads";
 
 /// Whether the kernel issues paired-CTA (`cta_group::2`) MMA. This is not the
 /// same question as whether it runs on a cluster, which is
@@ -110,6 +116,31 @@ enum class Tcgen05Kind { F16OrTF32, F8F6F4, I8, BlockScaled };
 std::optional<std::string>
 getTcgen05IllegalShapeReason(Tcgen05Kind kind, bool aInTmem, bool bMNMajor,
                              bool twoCTAs, unsigned m, unsigned n);
+
+// The tcgen05 kind that issues an MMA on `t` operands.
+std::optional<Tcgen05Kind> getTcgen05Kind(Type t);
+
+// The K of one tcgen05.mma: 32 bytes, 64 for 8-bit operands with 2x fp8 at
+// blockM=128 when 64 divides `k`, or 96 for FP4 with K=96 when 96 divides it.
+unsigned getTcgen05InstrK(unsigned bitwidth, unsigned blockM, int64_t k,
+                          bool supports2xFp8, bool supportsK96 = false);
+
+// Why an NPOT per-CTA accumulator tile can't be issued as tcgen05 tiles of
+// blockM x min(blockN, N) x instruction K, or nullopt if it can. NPOT M, NPOT N
+// at blockM=64 and the block-scaled NPOT N that
+// getNpotTMemScalesUnsupportedReason rejects aren't lowered.
+std::optional<std::string> getNpotMMAv5TileUnsupportedReason(
+    Tcgen05Kind kind, bool aInTmem, bool bMNMajor, bool twoCTAs,
+    unsigned blockM, unsigned blockN, ArrayRef<int64_t> ctaShape, int64_t k,
+    unsigned bitwidth, bool supportsK96 = false);
+
+// Why TMA can't copy NPOT tile `ty` as whole getTMABlockShape boxes, or nullopt
+// if it can. An all-pow2 tile always can.
+std::optional<std::string> getNpotTMAUnsupportedReason(gpu::MemDescType ty,
+                                                       gpu::TMAMode mode);
+
+// Return the declared MMA N, restricted to a true N subview.
+unsigned getMMAv5InstructionN(gpu::MemDescType type);
 
 // Returns the required ordering of repeated TMEM scale blocks for one
 // tcgen05 scaled-MMA operand.

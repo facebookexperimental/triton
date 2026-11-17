@@ -19,6 +19,12 @@ module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-
 
 // -----
 
+// wgmma's N may be NPOT only while one warpgroup spans N.
+// expected-error@+1 {{NVIDIA MMA instrShape with an NPOT M or N is not yet supported, got instrShape = [16, 96, 16]}}
+#mma = #ttg.nvidia_mma<{versionMajor = 3, warpsPerCTA = [4, 2], instrShape = [16, 96, 16]}>
+
+// -----
+
 // Power-of-two control.
 #mma = #ttg.nvidia_mma<{versionMajor = 2, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
 module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {

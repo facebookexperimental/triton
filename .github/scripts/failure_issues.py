@@ -1,26 +1,6 @@
 #!/usr/bin/env python3
-"""Reopen and close CI failure issues filed by report-nightly-failure.yml.
-
-  failure_issues.py reopen --title T --labels a,b --summary S --sha SHA --run-url U
-      If the failure's last issue was auto-closed within a week and failed with the same error, reopen it instead
-      of filing a new one. An issue a person closed is never reopened. After MAX_REOPENS reopens, the next
-      recurrence labels it flaky. Writes action=reopened|skip|file to GITHUB_OUTPUT: skip when the issue
-      already records a newer failing or passing run, so an older run cannot wind its status back. On file, or on
-      any error, the report step files or updates the issue as before.
-
-  failure_issues.py reconcile --prefix P --labels a,b --failures JSON --run-url U
-      Close this job's open issues whose failure no longer appears. Leaves flaky issues for a person to close, and
-      issues a newer run reported: pushes run concurrently, so an older run can finish after a newer one.
-
-  failure_issues.py group --prefix P --labels a,b --sha SHA --run-url U
-      Group this job's issues under one parent per commit where failures were first seen, assigned to that
-      commit's author. Issues this run filed join the parent for SHA; issues already open keep their parent. A
-      parent reopens when one of its issues reopens, and closes when only flaky issues are left open.
-
-GITHUB_REPOSITORY, GITHUB_RUN_ID and GITHUB_REF_NAME come from the Actions environment.
-"""
+"""File one issue per CI failure episode and close it only after verified recovery."""
 import argparse
-import datetime as dt
 import json
 import os
 import re
@@ -28,9 +8,8 @@ import subprocess
 import sys
 from urllib.parse import quote
 
-BOT = "github-actions[bot]"
-WINDOW = dt.timedelta(days=7)
-MAX_REOPENS = 2
+from test_results import decode_recovery
+
 FLAKY = "flaky"
 PARENT = "ci-parent"
 
@@ -45,21 +24,6 @@ def gh(method, path, fields=None, paginate=False):
     return [x for page in data for x in page] if paginate else data
 
 
-NUMBER = re.compile(r"0x[0-9a-fA-F]+|[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?")
-
-
-def same_error(a, b):
-    """Whether two failure summaries describe the same error: equal once numbers are masked."""
-    norm = lambda s: " ".join(NUMBER.sub("N", s or "").split())
-    return norm(a) == norm(b)
-
-
-def summary_of(body):
-    """The summary of the last failure an issue body recorded."""
-    m = re.search(r"^### Summary\n```\n(.*?)\n```", body or "", re.M | re.S)
-    return m[1] if m else ""
-
-
 def run_id_of(body):
     """The newest run recorded as failing or resolving the issue; 0 if absent."""
     runs = re.findall(r"(?:^\| Run \| \S*/actions/runs/|<!-- ci-resolved run=)(\d+)", body or "", re.M)
@@ -72,67 +36,31 @@ def record_resolution(body, run_id):
     return f"{body}\n\n<!-- ci-resolved run={run_id} -->\n"
 
 
-def record_failure(body, sha, run_url):
-    """The body with its status table pointing at this failing run."""
-    body = re.sub(r"^\| SHA \| .*$", f"| SHA | `{sha}` |", body or "", flags=re.M)
-    return re.sub(r"^\| Run \| .*$", f"| Run | {run_url} |", body, flags=re.M)
+def decide(api, repo, title, labels, run_id):
+    issues = api("GET", f"repos/{repo}/issues?labels={quote(','.join(labels))}&state=all&per_page=100", paginate=True)
+    newer = any(i["title"] == title and "pull_request" not in i and run_id_of(i.get("body")) > run_id for i in issues)
+    return "skip" if newer else "file"
 
 
-def decide(api, repo, title, labels, summary, now, run_id):
-    """("reopen", (issue, reopens, flaky)), ("skip", None) when the issue records a newer run, or
-    ("file", None) to leave filing to the report step."""
-    # List, never search: the search index can miss an issue for hours, and a missed issue gets filed twice.
-    # A close inside the reopen window updates the issue, so `since` keeps every closed issue that can matter.
-    since = (now - WINDOW).isoformat().replace("+00:00", "Z")
-    base = f"repos/{repo}/issues?labels={quote(','.join(labels))}&per_page=100"
-    found = (api("GET", f"{base}&state=open", paginate=True) +
-             api("GET", f"{base}&state=closed&since={since}", paginate=True))
-    issues = [i for i in found if i["title"] == title and "pull_request" not in i]
-    open_issues = [i for i in issues if i["state"] == "open"]
-    if open_issues:
-        return ("skip" if any(run_id_of(i["body"]) > run_id for i in open_issues) else "file"), None
-    closed = [i for i in issues if i.get("closed_at")]
-    if not closed:
-        return "file", None
-    # Only the most recently closed issue counts: a person's close stands even if an older one was the bot's.
-    issue = api("GET", f"repos/{repo}/issues/{max(closed, key=lambda i: i['closed_at'])['number']}")
-    if run_id_of(issue["body"]) > run_id:
-        return "skip", None
-    if (issue.get("closed_by") or {}).get("login") != BOT:
-        return "file", None
-    if now - dt.datetime.fromisoformat(issue["closed_at"].replace("Z", "+00:00")) > WINDOW:
-        return "file", None
-    if not same_error(summary_of(issue.get("body")), summary):
-        return "file", None
-    events = api("GET", f"repos/{repo}/issues/{issue['number']}/events?per_page=100")
-    reopens = sum(e["event"] == "reopened" and (e.get("actor") or {}).get("login") == BOT for e in events)
-    return "reopen", (issue, reopens, reopens >= MAX_REOPENS)
+def recovered(body, proof):
+    if not proof["complete"]:
+        return False
+    raw = re.search(r"^### Raw failing test IDs\n```\n(.*?)\n```", body or "", re.M | re.S)
+    ids = set(raw[1].splitlines()) if raw else set()
+    if ids and ids <= set(proof["passed"]):
+        return True
+    norm = re.search(r"^\| Normalized failing identity \| `([^`]+)` \|", body or "", re.M)
+    return bool(norm and norm[1] in proof["resolved"])
 
 
-def reopen(api, repo, issue, reopens, flaky, sha, run_url, reopened):
-    """Reopen the issue for this failing run. Calls reopened() once the issue is open again."""
-    number = issue["number"]
-    api("PATCH", f"repos/{repo}/issues/{number}",
-        {"state": "open", "body": record_failure(issue["body"], sha, run_url)})
-    reopened()
-    if flaky:
-        api("POST", f"repos/{repo}/issues/{number}/labels", {"labels": [FLAKY]})
-        body = (f"🔁 Failed again in {run_url} after {reopens} reopens; labeled `{FLAKY}`. Passing runs no longer "
-                "close this issue: close it by hand once the test is fixed.")
-    else:
-        body = f"🔁 Failed again in {run_url}; reopened ({reopens + 1} of {MAX_REOPENS})."
-    api("POST", f"repos/{repo}/issues/{number}/comments", {"body": body})
-
-
-def reconcile(api, repo, prefix, labels, failures_json, run_url, run_id):
+def reconcile(api, repo, prefix, labels, failures_json, run_url, run_id, recovery=""):
     """Close this job's recovered issues; returns the numbers closed."""
     try:
         failures = json.loads((failures_json or "").strip() or "[]")
-    except ValueError as e:
-        print(f"::warning::Could not parse failures; closing nothing: {e}")
+        proof = decode_recovery(recovery)
+    except (ValueError, KeyError) as e:
+        print(f"::warning::Could not parse test results; closing nothing: {e}")
         return []
-    # A job-level fallback item (compile error, timeout, missing JUnit XML) means this run has no per-test
-    # signal, and closing now could resolve a real failure during an infra outage.
     if any(isinstance(f, dict) and f.get("fallback") is True for f in failures):
         print("Fallback failure present (no per-test signal); closing nothing.")
         return []
@@ -143,14 +71,14 @@ def reconcile(api, repo, prefix, labels, failures_json, run_url, run_id):
         if "pull_request" in issue or not issue["title"].startswith(prefix) or issue["title"] in still_failing:
             continue
         if any(l["name"] == FLAKY for l in issue["labels"]):
-            continue  # a person closes flaky issues
-        if run_id_of(issue["body"]) > run_id:
-            continue  # a newer run reported it after this run started
+            continue
+        if run_id_of(issue["body"]) > run_id or not recovered(issue["body"], proof):
+            continue
         api(
             "POST", f"repos/{repo}/issues/{issue['number']}/comments", {
                 "body":
-                f"✅ Auto-closing: this failure identity no longer appears in the latest run ({run_url}). "
-                "A new issue will be filed automatically if it recurs."
+                f"Auto-closing after the previously failing tests passed in {run_url}. "
+                "A new failure after this recovery will get a new issue."
             })
         api("PATCH", f"repos/{repo}/issues/{issue['number']}",
             {"state": "closed", "state_reason": "completed", "body": record_resolution(issue["body"], run_id)})
@@ -181,7 +109,7 @@ def find_or_create_parent(api, repo, sha, job, branch, run_url, open_parents):
             open_parents.append(parent)
         head, _, jobs = parent["title"].partition(": ")
         names, on, rest = jobs.partition(" on ")
-        if jobs and job not in names.split(", "):  # a person may have retitled it
+        if jobs and job not in names.split(", "):
             title = f"{head}: {names}, {job}{on}{rest}"
             api("PATCH", f"repos/{repo}/issues/{parent['number']}", {"title": title})
             parent["title"] = title
@@ -202,7 +130,7 @@ def find_or_create_parent(api, repo, sha, job, branch, run_url, open_parents):
     fields = {"title": title, "body": body, "labels": [PARENT]}
     try:
         parent = api("POST", f"repos/{repo}/issues", dict(fields, assignees=[author] if author else []))
-    except subprocess.CalledProcessError:  # the author cannot be assigned: mention them instead
+    except subprocess.CalledProcessError:
         parent = api("POST", f"repos/{repo}/issues", dict(fields, body=f"@{author} {body}" if author else body))
     open_parents.append(parent)
     return parent
@@ -221,11 +149,9 @@ def group(api, repo, prefix, labels, sha, branch, run_url):
         for i in new:
             try:
                 api("POST", f"repos/{repo}/issues/{parent['number']}/sub_issues", {"sub_issue_id": i["id"]})
-            except subprocess.CalledProcessError as e:  # a parent holds at most 100; the rest stay unparented
+            except subprocess.CalledProcessError as e:
                 print(f"::warning::Could not attach #{i['number']} to #{parent['number']}: {e}")
                 break
-    # A sub-issue that failed again (reopened within the reopen window) reopens its parent; a flaky one does not,
-    # since a parent closes while flaky sub-issues stay open.
     flaky = lambda i: any(l["name"] == FLAKY for l in i["labels"])
     for url in {i["parent_issue_url"] for i in issues if i.get("parent_issue_url") and not flaky(i)}:
         parent = api("GET", "repos/" + url.split("/repos/", 1)[1])
@@ -247,51 +173,36 @@ def group(api, repo, prefix, labels, sha, branch, run_url):
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("reopen")
-    r.add_argument("--title", required=True)
-    r.add_argument("--summary", default="")
-    r.add_argument("--sha", required=True)
+    check = sub.add_parser("check")
+    check.add_argument("--title", required=True)
     c = sub.add_parser("reconcile")
     c.add_argument("--prefix", required=True)
     c.add_argument("--failures", default="")
+    c.add_argument("--recovery", default="")
     g = sub.add_parser("group")
     g.add_argument("--prefix", required=True)
     g.add_argument("--sha", required=True)
-    for s in (r, c, g):
+    g.add_argument("--branch", default=os.environ.get("GITHUB_REF_NAME", "main"))
+    for s in (check, c, g):
         s.add_argument("--labels", required=True)
         s.add_argument("--run-url", required=True)
     a = p.parse_args()
     repo = os.environ["GITHUB_REPOSITORY"]
     labels = [l.strip() for l in a.labels.split(",") if l.strip()]
     if a.cmd == "group":
-        group(gh, repo, a.prefix, labels, a.sha, os.environ.get("GITHUB_REF_NAME", "main"), a.run_url)
+        group(gh, repo, a.prefix, labels, a.sha, a.branch, a.run_url)
         return
+    run_id = int(os.environ["GITHUB_RUN_ID"])
     if a.cmd == "reconcile":
-        reconcile(gh, repo, a.prefix, labels, a.failures, a.run_url, int(os.environ["GITHUB_RUN_ID"]))
+        reconcile(gh, repo, a.prefix, labels, a.failures, a.run_url, run_id, a.recovery)
         return
-
-    def output(action):
-        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-            f.write(f"action={action}\n")
-
     try:
-        action, found = decide(gh, repo, a.title, labels, a.summary, dt.datetime.now(dt.timezone.utc),
-                               int(os.environ["GITHUB_RUN_ID"]))
+        action = decide(gh, repo, a.title, labels, run_id)
     except (subprocess.CalledProcessError, KeyError, ValueError) as e:
-        print(f"::warning::Reopen check failed; filing as usual: {e}")
-        action, found = "file", None
-    if action != "reopen":
-        output(action)
-        return
-    done = []
-    try:
-        reopen(gh, repo, *found, a.sha, a.run_url, reopened=lambda: (output("reopened"), done.append(True)))
-        print(f"Reopened #{found[0]['number']}{' as flaky' if found[2] else ''}: {a.title}")
-    except subprocess.CalledProcessError as e:
-        # Before the issue reopened, let the report step file; after, it is open and filing would duplicate it.
-        print(f"::warning::Reopen did not finish: {e}")
-        if not done:
-            output("file")
+        print(f"::warning::Stale check failed; filing as usual: {e}")
+        action = "file"
+    with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+        f.write(f"action={action}\n")
 
 
 if __name__ == "__main__":

@@ -64,7 +64,19 @@ def pytest_collection_modifyitems(config, items):
     known = pytest.mark.skip(reason=_KNOWN_FAIL_REASON)
     for item in items:
         filename = item.path.name
+        if filename == "test_core.py" and item.name.split("[", 1)[0] in (
+            "test_fp6_tma_store_contiguous",
+            "test_fp6_tma_mma_operand",
+        ):
+            continue
         if filename in _VERSION_SKEW_FILES:
+            # Exemption: test_standard_scan (upstream #12007) exercises only core
+            # scan ops (cumsum/cumprod) through the pinned frontend, so it may pass
+            # where pointer-layout tests cannot. Exempted so touched-file coverage
+            # can run. TODO(gluon-ci): revisit after the frontend re-sync.
+            if filename == "test_lowerings.py" and getattr(
+                    item, "originalname", item.name) == "test_standard_scan":
+                continue
             item.add_marker(skew)
             continue
         if any(sub in item.nodeid for sub in _KNOWN_FAIL_SUBSTRINGS):

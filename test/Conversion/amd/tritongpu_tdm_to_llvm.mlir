@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 --convert-builtin-func-to-llvm | FileCheck %s
+// RUN: triton-opt %s --split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250-strict --convert-builtin-func-to-llvm | FileCheck %s --check-prefix=STRICT
 
 // The intrinsic inserted at kernel entry survives function lowering,
 // including when the kernel calls a device function.
@@ -202,6 +203,9 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 16 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: tdm_load_multicast
+  // STRICT-LABEL: tdm_load_multicast
+  // STRICT-NOT: llvm.mlir.constant(4369 : i32)
+  // STRICT: "llvm.amdgcn.tensor.load.to.lds"
   tt.func public @tdm_load_multicast(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %c_shape = arith.constant 128 : i32
     %c_stride0 = arith.constant 128 : i64

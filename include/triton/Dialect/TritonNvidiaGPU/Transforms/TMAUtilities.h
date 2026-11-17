@@ -13,12 +13,12 @@ constexpr inline int TMA_ALIGN = 128;
 
 inline bool isFp4Padded(Attribute encoding) {
   auto mmaEnc = dyn_cast<gpu::NVMMASharedEncodingAttr>(encoding);
-  return mmaEnc && mmaEnc.getFp4Padded();
+  return mmaEnc && mmaEnc.isPaddedFp4();
 }
 
 inline bool isFp6Padded(Attribute encoding) {
   auto mmaEnc = dyn_cast<gpu::NVMMASharedEncodingAttr>(encoding);
-  return mmaEnc && mmaEnc.getFp6Padded();
+  return mmaEnc && mmaEnc.isPaddedFp6();
 }
 
 triton::gpu::SharedEncodingTrait
@@ -42,7 +42,7 @@ inline SmallVector<int64_t> getTMABlockShape(Attribute encoding,
   auto mmaEnc = cast<gpu::NVMMASharedEncodingAttr>(encoding);
   return triton::gpu::getTMABlockShape(
       shapePerCTA, mmaEnc.getElementBitWidth(), mmaEnc.getSwizzlingByteWidth(),
-      mmaEnc.getFp4Padded(), mmaEnc.getTransposed(), packedSize, mode);
+      mmaEnc.isPaddedFp4(), mmaEnc.getTransposed(), packedSize, mode);
 }
 
 inline SmallVector<int64_t> getTMABlockShape(triton::gpu::MemDescType ty,
@@ -50,13 +50,6 @@ inline SmallVector<int64_t> getTMABlockShape(triton::gpu::MemDescType ty,
                                              gpu::TMAMode mode) {
   auto shapePerCTA = gpu::getShapePerCTA(ty);
   return getTMABlockShape(ty.getEncoding(), shapePerCTA, packedSize, mode);
-}
-
-// TMA lowering splits each tile dimension into strided1D(shapePerCTA / box,
-// box) messages. getTMABlockShape's box splits a dimension into a power-of-two
-// count of power-of-two boxes exactly when the dimension is a power of 2.
-inline bool hasPow2TMAMessages(triton::gpu::MemDescType ty) {
-  return llvm::all_of(gpu::getShapePerCTA(ty), llvm::isPowerOf2_64);
 }
 
 inline SmallVector<int64_t> getTMABlockShape(triton::TensorDescInterface ty,

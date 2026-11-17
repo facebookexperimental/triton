@@ -2,8 +2,12 @@
 
 Persistent grouped GEMM with packed and pointer-table TDM kernels.
 
-- `amd_grouped_gemm_gfx1250_test.py`: kernels, host interfaces, tests, and
-  single-shape benchmark CLI.
+- `amd_grouped_gemm_gfx1250_test.py`: phase-0 and packed-tensor kernels,
+  tuning entry points, tests, and single-shape benchmark CLI.
+- The shared TDM implementation, the pointer-table list kernel, and the
+  gfx950-compatible host interface below live in
+  `third_party/tlx/ops/kernels/grouped_gemm/gfx1250.py`, which backs
+  `tlx.ops.grouped_gemm` on gfx1250. The tutorial imports them.
 - `bench.py`: shape sweep for both kernels, with process isolation and CSV output.
 
 ## gfx950-compatible interface

@@ -182,16 +182,16 @@ struct TritonExpandDimsPattern
     Attribute _argEncoding = argType.getEncoding();
     if (!_argEncoding)
       return failure();
-    // A Product result keeps the converter's layout and the operand takes its
-    // slice, as below.
-    auto productTy =
+    // A mixed-radix result keeps the converter's layout and the operand takes
+    // its slice, as below.
+    auto mixedRadixTy =
         cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
-    if (!triton::gpu::isRadix2Encoding(productTy.getEncoding())) {
+    if (!triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding())) {
       auto sliceTy =
           argType.cloneWithEncoding(triton::gpu::SliceEncodingAttr::get(
               getContext(), op.getAxis(),
               cast<triton::gpu::DistributedEncodingTrait>(
-                  productTy.getEncoding())));
+                  mixedRadixTy.getEncoding())));
       auto src = triton::gpu::ConvertLayoutOp::create(
           rewriter, op.getLoc(), sliceTy, adaptor.getSrc());
       addNamedAttrs(rewriter.replaceOpWithNewOp<triton::ExpandDimsOp>(
@@ -257,27 +257,74 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
     int threadsPerWarp = typeConverter->getThreadsPerWarp();
     int numCTAs = typeConverter->getNumCTAs();
     auto rank = origShape.size();
-    SmallVector<unsigned> retSizePerThread(rank, 1);
-    auto numElements = product<int64_t>(origShape);
-    if (numElements / (numWarps * threadsPerWarp) >= 4) {
-      retSizePerThread[rank - 1] = 2;
-      retSizePerThread[rank - 2] = 2;
-    }
-    if (numElements / (numWarps * threadsPerWarp) >= 16) {
-      retSizePerThread[rank - 1] = 4;
-      retSizePerThread[rank - 2] = 4;
-    }
-    retSizePerThread[rank - 1] = std::min(
-        retSizePerThread[rank - 1], static_cast<unsigned>(origShape[rank - 1]));
-    retSizePerThread[rank - 2] = std::min(
-        retSizePerThread[rank - 2], static_cast<unsigned>(origShape[rank - 2]));
-
     SmallVector<unsigned> retOrder(rank);
     for (unsigned i = 0; i < rank; ++i)
       retOrder[i] = rank - 1 - i;
-    Attribute dEncoding = triton::gpu::BlockedEncodingAttr::get(
-        getContext(), origShape, retSizePerThread, retOrder, numWarps,
-        threadsPerWarp, numCTAs);
+    // Up to 4x4 elements per thread, which the ops after the dot (a reduce,
+    // say) inherit.
+    auto getRetSizePerThread = [&]() {
+      SmallVector<unsigned> retSizePerThread(rank, 1);
+      auto numElements = product<int64_t>(origShape);
+      if (numElements / (numWarps * threadsPerWarp) >= 4) {
+        retSizePerThread[rank - 1] = 2;
+        retSizePerThread[rank - 2] = 2;
+      }
+      if (numElements / (numWarps * threadsPerWarp) >= 16) {
+        retSizePerThread[rank - 1] = 4;
+        retSizePerThread[rank - 2] = 4;
+      }
+      retSizePerThread[rank - 1] =
+          std::min(retSizePerThread[rank - 1],
+                   static_cast<unsigned>(origShape[rank - 1]));
+      retSizePerThread[rank - 2] =
+          std::min(retSizePerThread[rank - 2],
+                   static_cast<unsigned>(origShape[rank - 2]));
+      return retSizePerThread;
+    };
+    // The blocked layout of a power-of-two result.
+    auto getDotResultEncoding = [&]() -> Attribute {
+      return triton::gpu::BlockedEncodingAttr::get(
+          getContext(), origShape, getRetSizePerThread(), retOrder, numWarps,
+          threadsPerWarp, numCTAs);
+    };
+    // A dot with an operand layout the blocked layout cannot cover keeps the
+    // converter's operand layouts: only an MMA has them, and accelerate-matmul
+    // picks it. A power-of-two result (only K is uncovered) still takes the
+    // dot's blocked layout, as a power-of-two dot's does.
+    auto mixedRadixTy =
+        cast<RankedTensorType>(typeConverter->convertType(origType));
+    bool mixedRadixResult =
+        !triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding());
+    if (mixedRadixResult ||
+        !triton::gpu::isRadix2Encoding(
+            cast<RankedTensorType>(adaptor.getA().getType()).getEncoding())) {
+      RankedTensorType resTy = mixedRadixTy;
+      if (!mixedRadixResult) {
+        resTy = origType.cloneWithEncoding(getDotResultEncoding());
+      } else {
+        // Every mixed-radix result takes the dense layout: the dot's
+        // sizePerThread on the pow2 parts. The converter built one, so this
+        // cannot fail.
+        auto spt = getRetSizePerThread();
+        for (unsigned i = 0; i < rank; ++i)
+          spt[i] = std::min(spt[i], (unsigned)triton::LinearLayout::twoPartOf(
+                                        (int32_t)origShape[i]));
+        auto dense = triton::gpu::getMixedRadixEncoding(
+            getContext(), origShape, numWarps, threadsPerWarp, numCTAs, spt,
+            retOrder);
+        assert(succeeded(dense) && "converter built one");
+        resTy = origType.cloneWithEncoding(*dense);
+      }
+      Value c = triton::gpu::ConvertLayoutOp::create(rewriter, op.getLoc(),
+                                                     resTy, adaptor.getC());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::DotOp>(
+                        op, resTy, adaptor.getA(), adaptor.getB(), c,
+                        adaptor.getInputPrecision(),
+                        adaptor.getMaxNumImpreciseAcc(), op.getTwoCtas()),
+                    adaptor.getAttributes());
+      return success();
+    }
+    Attribute dEncoding = getDotResultEncoding();
     RankedTensorType retType = origType.cloneWithEncoding(dEncoding);
     // a & b must be of smem layout
     auto aType = cast<RankedTensorType>(adaptor.getA().getType());
@@ -424,16 +471,18 @@ struct TritonBroadcastPattern
     auto srcEncoding = srcType.getEncoding();
     if (!srcEncoding)
       return failure();
-    // A Product result takes the converter's layout, and so does the operand.
-    auto productTy =
+    // A mixed-radix result takes the converter's layout, and so does the
+    // operand.
+    auto mixedRadixTy =
         cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
-    if (!triton::gpu::isRadix2Encoding(productTy.getEncoding())) {
+    if (!triton::gpu::isRadix2Encoding(mixedRadixTy.getEncoding())) {
       auto src = triton::gpu::ConvertLayoutOp::create(
           rewriter, op.getLoc(),
-          srcType.cloneWithEncoding(productTy.getEncoding()), adaptor.getSrc());
-      addNamedAttrs(
-          rewriter.replaceOpWithNewOp<triton::BroadcastOp>(op, productTy, src),
-          adaptor.getAttributes());
+          srcType.cloneWithEncoding(mixedRadixTy.getEncoding()),
+          adaptor.getSrc());
+      addNamedAttrs(rewriter.replaceOpWithNewOp<triton::BroadcastOp>(
+                        op, mixedRadixTy, src),
+                    adaptor.getAttributes());
       return success();
     }
     auto origResultType = cast<RankedTensorType>(op.getType());
@@ -646,6 +695,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::ClampFOp>,
       GenericOpPattern<triton::PreciseSqrtOp>,
       GenericOpPattern<triton::PreciseDivFOp>,
+      GenericOpPattern<triton::ApproxDivFOp>,
       GenericOpPattern<triton::MulhiUIOp>,
       GenericOpPattern<triton::ElementwiseInlineAsmOp>,
       TritonReducePattern,

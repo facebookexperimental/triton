@@ -19,6 +19,7 @@
 #include "mlir/Transforms/RegionUtils.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
+#include "triton/Analysis/BufferRegion.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -1864,7 +1865,7 @@ DenseMap<Channel *, Value> createBufferForAllocs(
   for (auto &item : channelsGroupedByProducers) {
     auto &channels = item.second;
     for (auto c : channels) {
-      assert(!visited.count(c));
+      assert(!visited.contains(c));
       visited.insert(c);
     }
   }
@@ -1887,8 +1888,7 @@ DenseMap<Channel *, Value> createBufferForAllocs(
     }
   }
   for (auto *channelInOrder : orderedChannels) {
-    if (channelsGroupedByProducers.find(channelInOrder) ==
-        channelsGroupedByProducers.end())
+    if (!channelsGroupedByProducers.contains(channelInOrder))
       continue;
     auto &channels = channelsGroupedByProducers[channelInOrder];
     auto *channel = channels.front();
@@ -2846,7 +2846,7 @@ void insertAsyncComm(
     auto producerBlock = frontSrcOp->getBlock();
     Operation *headProducer = nullptr;
     for (auto &op : producerBlock->getOperations()) {
-      if (producerOps.count(&op)) {
+      if (producerOps.contains(&op)) {
         headProducer = &op;
         break;
       }
@@ -2854,7 +2854,7 @@ void insertAsyncComm(
     // Find tail producer
     Operation *tailProducer = nullptr;
     for (auto &op : reverse(producerBlock->getOperations())) {
-      if (producerOps.count(&op)) {
+      if (producerOps.contains(&op)) {
         tailProducer = &op;
         break;
       }
@@ -2876,14 +2876,14 @@ void insertAsyncComm(
     auto consumerBlock = frontDstOp->getBlock();
     Operation *headConsumer = nullptr;
     for (auto &op : consumerBlock->getOperations()) {
-      if (consumerOps.count(&op)) {
+      if (consumerOps.contains(&op)) {
         headConsumer = &op;
         break;
       }
     }
     Operation *tailConsumer = nullptr;
     for (auto &op : reverse(consumerBlock->getOperations())) {
-      if (consumerOps.count(&op)) {
+      if (consumerOps.contains(&op)) {
         tailConsumer = &op;
         break;
       }
@@ -3888,7 +3888,7 @@ void insertAsyncComm(
     for (auto &consumerTaskId : masterChannel->relation.second) {
       // Set up consumer release and producer acquire for channel where consumer
       // is MMAv5.
-      if (commChannel.consumerBarriers.count(consumerTaskId)) {
+      if (commChannel.consumerBarriers.contains(consumerTaskId)) {
         // filter with consumerTaskId
         DenseSet<Operation *> filteredOps;
         for (auto *tCon : actualConsumerOps) {
@@ -4616,6 +4616,9 @@ void insertAsyncComm(
             LDBG("Insert ProducerCommitOp " << masterChannel->uniqID << " ");
             producerCommitPoint->dump();
           });
+          // Tag the commit with the producer task, not the consuming MMA's
+          // (see partition-scheduler-bugs.md #43).
+          builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
           builder.setInsertionPointAfter(producerCommitPoint);
           builder.setLoopScheduleInfoFromOp(producerCommitPoint);
           auto commitOp =
@@ -4946,6 +4949,24 @@ void insertAsyncComm(
         }
         auto consumerReleasePoint = consumerReleaseHeuristic(
             tailProducer, tokenTailConsumer, token.first);
+        // Consumers in this task that read the buffer through the generic
+        // proxy (e.g. a local_load, reached through any memdesc views, or
+        // inside a subtiled region). If the producer refills it with TMA, the
+        // release needs a proxy fence.
+        auto readsSmemGenerically = [](Operation *op) {
+          return op
+              ->walk([](Operation *nested) {
+                return tt::hasSharedAccess(nested, ttg::SharedKind::Generic,
+                                           tt::RW::Read)
+                           ? WalkResult::interrupt()
+                           : WalkResult::advance();
+              })
+              .wasInterrupted();
+        };
+        bool readsGenerically = llvm::any_of(consumerOps, [&](Operation *op) {
+          return llvm::is_contained(getAsyncTaskIds(op), token.first) &&
+                 readsSmemGenerically(op);
+        });
         auto subtiled = getEnclosingSubtiledRegionTile(consumerReleasePoint);
         if (!subtiled)
           subtiled = getEnclosingSubtiledRegionTile(tokenTailConsumer);
@@ -4974,14 +4995,19 @@ void insertAsyncComm(
           } else {
             tileBufIdx = subtiled.addSharedArg(bufferIdx);
           }
-          tileBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-              insertTarget->getLoc(), tileToken, tileBufIdx,
-              WSBarrierAttr::forDstTask(funcOp.getContext(),
-                                        masterChannel->relation.first)
-                  .withGuardedBufferIds(
-                      funcOp.getContext(),
-                      getGuardedBufferIds(masterChannel, tokenMap, bufferMap))
-                  .build(funcOp.getContext()));
+          auto tileReleaseOp =
+              tileBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+                  insertTarget->getLoc(), tileToken, tileBufIdx,
+                  WSBarrierAttr::forDstTask(funcOp.getContext(),
+                                            masterChannel->relation.first)
+                      .withGuardedBufferIds(funcOp.getContext(),
+                                            getGuardedBufferIds(masterChannel,
+                                                                tokenMap,
+                                                                bufferMap))
+                      .build(funcOp.getContext()));
+          if (readsGenerically)
+            tileReleaseOp->setAttr(ttng::kFenceGenericReadsAttrName,
+                                   builder.getUnitAttr());
           LDBG("create inline ConsumerRelease in SubtiledRegionOp "
                << masterChannel->uniqID << " ");
         } else {
@@ -5006,6 +5032,9 @@ void insertAsyncComm(
                                                                   tokenMap,
                                                                   bufferMap))
                         .build(funcOp.getContext()));
+            if (readsGenerically)
+              releaseOp->setAttr(ttng::kFenceGenericReadsAttrName,
+                                 builder.getUnitAttr());
             LLVM_DEBUG({
               LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
               token.second.dump();
@@ -5295,8 +5324,7 @@ static void swapTransposedLocalAllocs(triton::FuncOp &funcOp) {
     auto nonTransposedEncoding = ttg::NVMMASharedEncodingAttr::get(
         encoding.getContext(), encoding.getSwizzlingByteWidth(),
         /*transposed=*/false, encoding.getElementBitWidth(),
-        encoding.getFp4Padded(), encoding.getCGALayout(),
-        encoding.getFp6Padded());
+        encoding.getPadding(), encoding.getCGALayout());
 
     // New alloc type: non-transposed encoding.
     auto newAllocType = ttg::MemDescType::get(
