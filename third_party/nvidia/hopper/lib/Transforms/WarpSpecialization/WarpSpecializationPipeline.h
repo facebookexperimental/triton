@@ -53,6 +53,7 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
                               const MemoryPlannerOptions &options = {});
 
 LogicalResult doBufferAllocation(triton::FuncOp funcOp);
+Value findTensorChannelWithMixedConsumerTasks(triton::FuncOp funcOp);
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp funcOp);
 void removeRedundantTmemZeroStores(triton::FuncOp funcOp);
