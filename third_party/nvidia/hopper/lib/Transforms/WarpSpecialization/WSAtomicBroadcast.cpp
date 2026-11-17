@@ -33,9 +33,13 @@
 
 #include "CodePartitionUtility.h"
 #include "WarpSpecializationPipeline.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
+#include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -388,6 +392,63 @@ static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
 
 } // namespace
 
+// A pre-loop atomic whose result feeds the warp-specialized loop is tagged with
+// every partition, so it would be classified below as an unsupported replicated
+// atomic and WS would bail. It only has to run once, before the loop: untag it
+// so it stays ahead of ttg.warp_specialize and its result reaches the
+// partitions as a capture.
+static LogicalResult
+untagPreLoopAtomics(triton::FuncOp funcOp,
+                    SmallVectorImpl<tt::AtomicRMWOp> &handled) {
+  Block &body = funcOp.getBody().front();
+  Operation *wsLoop = nullptr;
+  for (Operation &op : body)
+    if (isa<scf::ForOp, scf::WhileOp>(op) &&
+        op.hasAttr(tt::kWarpSpecializeAttrName)) {
+      wsLoop = &op;
+      break;
+    }
+  if (!wsLoop)
+    return success();
+  for (tt::AtomicRMWOp atomicOp :
+       llvm::to_vector(body.getOps<tt::AtomicRMWOp>())) {
+    if (!atomicOp->isBeforeInBlock(wsLoop) ||
+        getAsyncTaskIds(atomicOp).size() < 2)
+      continue;
+    // Earlier ops that move into the partitions would run after the atomic.
+    for (Operation *op = &body.front(); op != atomicOp; op = op->getNextNode())
+      if (!getAsyncTaskIds(op).empty() && !isMemoryEffectFree(op)) {
+        LDBG(
+            "reject: pre-loop atomic follows a partition op with side effects");
+        return failure();
+      }
+    // Operand defs that move into the partitions are cloned next to the atomic.
+    SetVector<Operation *> slice;
+    BackwardSliceOptions opts;
+    opts.inclusive = false;
+    (void)getBackwardSlice(atomicOp.getOperation(), &slice, opts);
+    IRMapping mapping;
+    OpBuilder b(atomicOp);
+    for (Operation *op : slice) {
+      if (getAsyncTaskIds(op).empty())
+        continue;
+      if (!isMemoryEffectFree(op) || op->getNumRegions()) {
+        LDBG("reject: pre-loop atomic reads a non-pure partition op");
+        return failure();
+      }
+      Operation *clone = b.clone(*op, mapping);
+      clone->removeAttr(kAsyncTaskIdAttrName);
+      clone->removeAttr(tt::gpu::kPartitionAttrName);
+    }
+    for (OpOperand &operand : atomicOp->getOpOperands())
+      operand.set(mapping.lookupOrDefault(operand.get()));
+    atomicOp->removeAttr(kAsyncTaskIdAttrName);
+    atomicOp->removeAttr(tt::gpu::kPartitionAttrName);
+    handled.push_back(atomicOp);
+  }
+  return success();
+}
+
 // Entry point: handle every cross-partition, run-once, loop-carried "claim the
 // next tile" producer in a dynamic-persistent kernel. Two kinds share the exact
 // same run-once + SMEM-broadcast idea and are handled together here:
@@ -403,9 +464,16 @@ static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
 // of truth for the reject teardown shared with the other AutoWS bail-outs.
 LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
                                      int tilePrefetchDepth) {
+  SmallVector<tt::AtomicRMWOp> outsideHandled;
+  if (failed(untagPreLoopAtomics(funcOp, outsideHandled)))
+    return failure();
+
   // Atomic global tile counter.
   SmallVector<tt::AtomicRMWOp> atomics;
-  funcOp.walk([&](tt::AtomicRMWOp op) { atomics.push_back(op); });
+  funcOp.walk([&](tt::AtomicRMWOp op) {
+    if (!llvm::is_contained(outsideHandled, op))
+      atomics.push_back(op);
+  });
   for (auto atomicOp : atomics) {
     scf::WhileOp whileOp;
     switch (classifyAtomic(atomicOp, whileOp)) {
