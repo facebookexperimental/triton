@@ -139,18 +139,6 @@ def _get_v(vb, slot, wait: tl.constexpr):
 
 
 @triton.jit
-def _put_k(desc, buf, slot, tables, batch, page, STRIDE: tl.constexpr):
-    phys = tl.load(tables + batch * STRIDE + page)
-    tlx.async_amd_descriptor_load(desc, tlx.local_view(buf, slot), [phys * 64, 0], clamp_bounds=True)
-
-
-@triton.jit
-def _put_v(desc, buf, slot, tables, batch, page, STRIDE: tl.constexpr):
-    phys = tl.load(tables + batch * STRIDE + page)
-    tlx.async_amd_descriptor_load(desc, tlx.local_view(buf, slot), [phys * 64, 0], clamp_bounds=True)
-
-
-@triton.jit
 def _put_k_id(desc, buf, slot, phys):
     tlx.async_amd_descriptor_load(desc, tlx.local_view(buf, slot), [phys * 64, 0], clamp_bounds=True)
 

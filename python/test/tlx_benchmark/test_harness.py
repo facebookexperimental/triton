@@ -1039,6 +1039,7 @@ BENCH_MODULES = (
     "bench_moe_routing",
     "bench_norm_residual_norm",
     "bench_norm",
+    "bench_paged_prefill",
     "bench_qk_norm_rope_kv_cache",
     "bench_router_gemm",
     "bench_rmsnorm_cat",

@@ -119,6 +119,47 @@ def test_paged_prefill_runtime_capacity_reuses_binary(shuffled):
     assert all(binary is binaries[0] for binary in binaries)
 
 
+@pytest.mark.parametrize("kv_heads", [4, 16])
+@pytest.mark.parametrize("window", [0, 2048])
+def test_paged_prefill_shuffled_heads_and_query_offset(kv_heads, window):
+    torch.manual_seed(43)
+    offsets, lengths = [5, 5, 70, 839], [0, 129, 2817]
+    q = torch.randn((851, kv_heads * 8, 64), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((3 * 45 + 3, 64, kv_heads, 64), device=q.device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    table = torch.randperm(k.shape[0], device=q.device, dtype=torch.int32)[:3 * 45].reshape(3, 45)
+    # An empty sequence must never dereference its page table or write output.
+    table[0].fill_(-1)
+    for b in (1, 2):
+        k[table[b, lengths[b] // 64].long(), lengths[b] % 64:] = float("nan")
+        v[table[b, lengths[b] // 64].long(), lengths[b] % 64:] = float("nan")
+    kp, vp = _pack_cache(k, v)
+    cu = torch.tensor(offsets, device=q.device, dtype=torch.int32)
+    used = torch.tensor(lengths, device=q.device, dtype=torch.int64)
+    out = torch.full_like(q, float("nan"))
+    _packed_call(q, kp, vp, out, cu, used, table, 769, 2817, window, True)
+    for b in (1, 2):
+        _check(q[offsets[b]:offsets[b + 1]][None], k, v, table[b:b + 1, :triton.cdiv(lengths[b], 64)], lengths[b],
+               window, out[offsets[b]:offsets[b + 1]][None], full=False)
+    assert torch.isnan(out[:offsets[0]]).all()
+    assert torch.isnan(out[offsets[-1]:]).all()
+
+
+@pytest.mark.parametrize("shuffled", [False, True])
+@pytest.mark.parametrize("batch", [0, 2])
+def test_paged_prefill_empty_packed_cache(shuffled, batch):
+    q = torch.empty((0, 16, 64), device="cuda", dtype=torch.bfloat16)
+    k = torch.empty((0, 64, 2, 64), device=q.device, dtype=q.dtype)
+    v = torch.empty_like(k)
+    if shuffled:
+        k, v = _pack_cache(k, v)
+    cu = torch.zeros(batch + 1, device=q.device, dtype=torch.int32)
+    used = torch.zeros(batch, device=q.device, dtype=torch.int32)
+    table = torch.empty((batch, 0), device=q.device, dtype=torch.int32)
+    out = torch.empty_like(q)
+    assert _packed_call(q, k, v, out, cu, used, table, 0, 0, 0, shuffled) is out
+
+
 @pytest.mark.parametrize("window", [0, 2048])
 @pytest.mark.parametrize("sq", [256, 769])
 @pytest.mark.parametrize("q_value,k_value", [(4096, 4224), (65536, 66560), (4128, 6368), (66048, 101888),
@@ -164,6 +205,28 @@ def test_paged_prefill_full_large_values_keep_recovery_guard():
     # The last row has equal probabilities and exact cancellation. Widening
     # the uncentered denominator guard admits a finite but inaccurate PV sum.
     assert torch.count_nonzero(out[0, -1]) == 0
+
+
+@pytest.mark.parametrize("shuffled", [False, True])
+@pytest.mark.parametrize("sk", [2048, 4096])
+def test_paged_prefill_packed_large_values_cancellation(shuffled, sk):
+    q, k, v, table, _ = _inputs(1, 2048, sk)
+    q.fill_(1)
+    k.fill_(5.5)
+    magnitude = (201 / 128) * 2.0**30
+    midpoint = sk // 128
+    v[table[0, :midpoint].long()] = magnitude
+    v[table[0, midpoint:].long()] = -magnitude
+    v[table[0].long(), 63] = 0
+    kp, vp = _pack_cache(k, v) if shuffled else (k, v)
+    cu = torch.tensor([0, 2048], device=q.device, dtype=torch.int32)
+    used = torch.tensor([sk], device=q.device, dtype=torch.int32)
+    out = torch.empty_like(q)
+    _packed_call(q[0], kp, vp, out[0], cu, used, table, 2048, sk, 0, shuffled)
+    assert torch.isfinite(out).all()
+    # The sampled center permits the fast path. FP32 PV accumulation can
+    # leave roundoff at exact cancellation; bound it relative to the input.
+    assert out[0, -1].float().abs().max() < magnitude * 1.0e-6
 
 
 @pytest.mark.parametrize("shuffled", [False, True])
