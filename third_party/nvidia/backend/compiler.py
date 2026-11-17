@@ -16,7 +16,7 @@ from triton._C.libtriton import ir, llvm, nvidia, passes, tlx
 from triton._instrumentation import instrument as _instrument, is_enabled
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.magnon.flags import apply_enabled as _compile_iq_apply_enabled
-from triton.runtime.errors import PTXASError
+from triton.runtime.errors import PTXASError, attach_shared_memory_breakdown
 from triton.tools.compile_trace import run_subprocess
 
 # Auto-TMA host-launcher caps. These MUST stay in lockstep with the C macros of
@@ -1458,6 +1458,7 @@ class CUDABackend(BaseBackend):
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment") or 1
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0
         metadata["profile_scratch_align"] = src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1
+        attach_shared_memory_breakdown(src, metadata)
 
         # Add Triton and LLVM versions to the dumped IR.
         if knobs.compilation.dump_ir:
