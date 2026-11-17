@@ -444,6 +444,28 @@ getNpotDotSlowReason(Operation *dot, ArrayRef<NpotDotOperandAccess> operands,
   return std::nullopt;
 }
 
+bool isNpotMmaEncodedTensorLegal(MLIRContext *ctx, StringRef target,
+                                 RankedTensorType type) {
+  if (auto *legality = lookupNpotTargetLegality(ctx, target))
+    if (auto legal = legality->isMmaEncodedNpotTensorLegal(type))
+      return *legal;
+  if (!target.empty())
+    return false;
+  // No target named (a pass option left unset): the tensor's MMA
+  // encoding is the only signal, so ask every loaded legality; the
+  // one that owns the encoding judges it (a legal judgment is the
+  // only positive answer any of them gives).
+  for (Dialect *dialect : ctx->getLoadedDialects()) {
+    auto *legality = dyn_cast<NpotTargetLegality>(dialect);
+    if (!legality)
+      continue;
+    if (auto legal = legality->isMmaEncodedNpotTensorLegal(type);
+        legal && *legal)
+      return true;
+  }
+  return false;
+}
+
 StringRef getModuleTarget(Operation *op) {
   auto mod = op->getParentOfType<ModuleOp>();
   auto target = mod ? mod->getAttrOfType<StringAttr>("ttg.target") : nullptr;

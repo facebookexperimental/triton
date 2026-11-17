@@ -1627,6 +1627,30 @@ struct NvidiaNpotTargetLegality : public NpotTargetLegality {
                                 StringRef) const override {
     return std::nullopt;
   }
+  // Judged by the instruction-shape producer, so admission and
+  // production cannot disagree: it returns a zero instruction for
+  // shapes it cannot tile. Its v3 path asserts on shapes failing
+  // its own row/column gates, so only ask it about shapes that
+  // pass them.
+  std::optional<bool>
+  isMmaEncodedNpotTensorLegal(RankedTensorType type) const override {
+    auto mma = dyn_cast<gpu::NvidiaMmaEncodingAttr>(type.getEncoding());
+    if (!mma)
+      return std::nullopt;
+    ArrayRef<int64_t> shape = type.getShape();
+    if (shape.size() != 2)
+      return false;
+    int version = mma.getVersionMajor();
+    if (version != 2 && version != 3)
+      return false;
+    if (version == 3 && (shape[0] % 64 != 0 || shape[1] % 8 != 0))
+      return false;
+    auto instr = mmaVersionToInstrShape(version, shape,
+                                        type.getElementType(),
+                                        /*numWarps=*/1);
+    return instr[0] != 0 && instr[1] != 0 &&
+           shape[0] % instr[0] == 0 && shape[1] % instr[1] == 0;
+  }
   // TMA moves the tile through shared memory on the descriptor's layout, the
   // default NVMMA one until OptimizeDescriptorEncoding sets it.
   std::optional<std::string>
