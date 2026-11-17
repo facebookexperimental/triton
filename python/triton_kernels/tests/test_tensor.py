@@ -4,6 +4,7 @@ import sys
 from contextlib import nullcontext
 
 import pytest
+import sympy
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 import triton
@@ -34,6 +35,7 @@ from triton_kernels.tensor_details.layout import (
     HopperMXScaleLayout,
     HopperMXValueLayout,
     StridedLayout,
+    TiledLayout,
 )
 
 _FP4_VALUE_LAYOUTS = [
@@ -159,6 +161,19 @@ def test_layout_storage_shape_matches_conversion(logical_shape, is_fp4, layout, 
 
     assert layout.storage_shape(list(logical_shape), is_fp4) == storage_shape
     assert list(converted.storage.data.shape) == storage_shape
+
+
+@pytest.mark.parametrize(("layout", "expected"), [
+    (BlackwellMXScaleLayout(), [1, 1, 4, 2, 256]),
+    (BlackwellActMXScaleLayout(None), [1, 1, 10, 2, 256]),
+    (HopperMXScaleLayout(-1, 4), [4, 1088]),
+    (HopperMXScaleLayout(-2, 4), [320, 4]),
+    (CDNA4MXScaleLayout(), [1, 512, 2]),
+])
+def test_scale_layout_symbolic_storage_shape(layout, expected):
+    m, n = sympy.symbols("m n", integer=True, nonnegative=True)
+    shape = layout.storage_shape([m, n], False)
+    assert [sympy.sympify(dim).subs({m: 9, n: 33}) for dim in shape] == expected
 
 
 def test_ragged_layout_storage_shape():
@@ -759,3 +774,23 @@ def test_keyed_add_large_key_no_int_overflow():
     # Compare in int64 (CUDA has no uint32 `arange`); values are well within int64.
     expected = (key << 16) | torch.arange(1, BLOCK + 1, dtype=torch.int64, device=device)
     assert torch.equal(out.to(torch.int64), expected)
+
+
+@pytest.mark.parametrize("shape", [(256, 384), (2, 256, 384)])
+@pytest.mark.parametrize("major_dim", [-1, -2])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16])
+@pytest.mark.parametrize("with_out", [False, True])
+def test_tiled_layout_roundtrip(shape, major_dim, dtype, with_out):
+    values = (torch.arange(math.prod(shape)) % 251).to(dtype).reshape(shape)
+    source = wrap_torch_tensor(values)
+    layout = TiledLayout(major_dim)
+    tiled = convert_layout(source, layout)
+    assert convert_layout(tiled, layout) is tiled
+    if with_out:
+        out = wrap_torch_tensor(torch.empty_like(tiled.data), layout=layout)
+        assert convert_layout(source, layout, out=out) is out
+        torch.testing.assert_close(out.data, tiled.data, rtol=0, atol=0)
+        tiled = out
+    restored = convert_layout(tiled, StridedLayout(-1))
+    torch.testing.assert_close(restored.data, values, rtol=0, atol=0)
+    assert tiled.data.numel() == source.data.numel()

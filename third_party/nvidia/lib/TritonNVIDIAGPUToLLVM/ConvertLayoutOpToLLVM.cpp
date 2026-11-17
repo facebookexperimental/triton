@@ -1,3 +1,4 @@
+#include "Allocation.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TargetInfo.h"
 #include "Utility.h"
@@ -35,9 +36,14 @@ struct ConvertLayoutOpSwizzlingConversion
     auto dstTy = op.getType();
     auto *ctx = op.getContext();
 
-    // Modular layouts use the generic conversion path.
-    if (hasNpotShape(srcTy) || hasNpotShape(dstTy))
-      return failure();
+    // Modular layouts use the generic conversion path, except odd tiles.
+    if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+      auto tiles =
+          nvidia_gpu::getMixedRadixTileTransfer(srcTy, dstTy, targetInfo);
+      if (!tiles)
+        return failure();
+      return transferMixedRadixTiles(op, adaptor, *tiles, rewriter);
+    }
 
     LinearLayout conversion = minimalCvtLayout(srcTy, dstTy);
     LinearLayout srcLayout = toLinearLayout(srcTy);
@@ -66,11 +72,13 @@ struct ConvertLayoutOpSwizzlingConversion
     return failure();
   }
 
+  // `inVals` holds `numTiles` transfers of `srcLayout` back to back.
   SmallVector<Value> transferWithinBlockSwizzling(
       Location loc, ConversionPatternRewriter &rewriter,
       const LinearLayout &srcLayout, const LinearLayout &dstLayout,
       ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
-      Operation *sourceOp) const {
+      Operation *sourceOp, int32_t numTiles = 1,
+      int32_t tilesPerRound = 1) const {
     auto *ctx = rewriter.getContext();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     // We handle transformations recursively as they all need a preprocessing
@@ -84,7 +92,7 @@ struct ConvertLayoutOpSwizzlingConversion
       }));
       auto outVals = transferWithinBlockSwizzling(
           loc, rewriter, srcLayout, dstLayout, newInVals, llvmElemTyPtr,
-          smemBase, sourceOp);
+          smemBase, sourceOp, numTiles, tilesPerRound);
       for (auto &v : outVals) {
         v = b.inttoptr(llvmElemTy, v);
       }
@@ -97,11 +105,11 @@ struct ConvertLayoutOpSwizzlingConversion
       auto i8ElemTy = i8_ty;
       auto newInVals = llvm::to_vector(llvm::map_range(
           inVals, [&](Value v) { return b.zext(i8ElemTy, v).getResult(); }));
-      auto outVals =
-          transferWithinBlockSwizzling(loc, rewriter, srcLayout, dstLayout,
-                                       newInVals, i8ElemTy, smemBase, sourceOp);
+      auto outVals = transferWithinBlockSwizzling(
+          loc, rewriter, srcLayout, dstLayout, newInVals, i8ElemTy, smemBase,
+          sourceOp, numTiles, tilesPerRound);
       for (auto &v : outVals) {
-        v = b.trunc(llvmElemTy, v);
+        v = b.trunc(llvmElemTy, v, LLVM::IntegerOverflowFlags::nuw);
       }
       return outVals;
     }
@@ -126,14 +134,18 @@ struct ConvertLayoutOpSwizzlingConversion
     auto reps = LinearLayout::identity1D(nReps, kReg, kReps);
 
     auto totalStoreCvt = srcLayout.invertAndCompose(smem);
-    auto totalLoadCvt = invertAndComposeBlockLocal(smem, dstLayout);
+    auto totalLoadCvt = invertAndComposeLocal(smem, dstLayout, {kBlock});
 
     // The permutation exists by construction of the reps dimension in
     // optimalSwizzling
     auto permStore =
         regPermForDivide(totalStoreCvt, reps, /*left=*/false).value();
     totalStoreCvt = permStore.apply(totalStoreCvt);
-    auto permutedInVals = permStore.apply(inVals);
+    SmallVector<Value> permutedInVals;
+    int32_t valsPerTile = inVals.size() / numTiles;
+    for (int32_t tile = 0; tile < numTiles; ++tile)
+      llvm::append_range(permutedInVals, permStore.apply(inVals.slice(
+                                             tile * valsPerTile, valsPerTile)));
     auto permLoad =
         regPermForDivide(totalLoadCvt, reps, /*left=*/false).value();
     totalLoadCvt = permLoad.apply(totalLoadCvt);
@@ -163,7 +175,7 @@ struct ConvertLayoutOpSwizzlingConversion
 
     auto tileSize = storeCvt.getInDimSize(kReg);
 
-    assert(permutedInVals.size() == tileSize * nReps);
+    assert(permutedInVals.size() == tileSize * nReps * numTiles);
     SmallVector<Value> outVals;
     auto affineOffset = b.i32_val(0);
     auto maskSpanAffineOffset = 0;
@@ -184,54 +196,136 @@ struct ConvertLayoutOpSwizzlingConversion
       return cvt.sublayout(inDims, outDims);
     };
     auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-    for (int i = 0; i < nReps; ++i) {
+    // Each rep of a round is one store/bar/load of that rep of the round's
+    // tiles, at disjoint offsets.
+    int32_t tileElems = storeCvt.getTotalOutDimSize() / nBlock;
+    auto tileBase = [&](int32_t tile) {
+      tile %= tilesPerRound;
+      return tile == 0 ? smemBase
+                       : b.gep(smemBase.getType(), llvmElemTy, smemBase,
+                               b.i32_val(tile * tileElems));
+    };
+    SmallVector<SmallVector<Value>> outValsByTile(numTiles);
+    int32_t numRounds = llvm::divideCeil(numTiles, tilesPerRound);
+    for (int i = 0; i < nReps * numRounds; ++i) {
       if (i > 0)
         emitBarrier();
-      auto tileInVals =
-          to_vector(ArrayRef(permutedInVals).slice(i * tileSize, tileSize));
-      // Store
-      // idxSrc 0: st.shared, idxSrc 1: stmatrix, idxSrc 2: stmatrix.trans
-      if (idxSrc == 0) {
-        lowerLdSt(loc, ctx, storeCvt, tileInVals, llvmElemTy, smemBase,
-                  /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
-                  /*affineBlockOffset=*/Value(), /*maskSpanAffineBlock=*/0,
-                  laneId, warpId, rewriter, targetInfo,
-                  /*maybeMaxVecElems=*/{},
-                  makeSharedStoreEmitter(targetInfo, b.true_val()));
-      } else {
-        assert(idxSrc == 1 || idxSrc == 2);
-        bool transpose = idxSrc == 2;
-        auto storeCvtNoBlock = dropBlock(storeCvt);
-        auto result = lowerLdStMatrix(
-            loc, storeCvtNoBlock, transpose, tileInVals, smemBase, affineOffset,
-            maskSpanAffineOffset, llvmElemTy, rewriter, targetInfo);
-        assert(succeeded(result));
+      int32_t rep = i % nReps, first = i / nReps * tilesPerRound;
+      auto roundTiles =
+          llvm::seq<int32_t>(first, std::min(numTiles, first + tilesPerRound));
+      for (int32_t tile : roundTiles) {
+        auto tileInVals =
+            to_vector(ArrayRef(permutedInVals)
+                          .slice((tile * nReps + rep) * tileSize, tileSize));
+        Value base = tileBase(tile);
+        // Store
+        // idxSrc 0: st.shared, idxSrc 1: stmatrix, idxSrc 2: stmatrix.trans
+        if (idxSrc == 0) {
+          lowerLdSt(loc, ctx, storeCvt, tileInVals, llvmElemTy, base,
+                    /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
+                    /*affineBlockOffset=*/Value(), /*maskSpanAffineBlock=*/0,
+                    laneId, warpId, rewriter, targetInfo,
+                    /*maybeMaxVecElems=*/{},
+                    makeSharedStoreEmitter(targetInfo, b.true_val()));
+        } else {
+          assert(idxSrc == 1 || idxSrc == 2);
+          bool transpose = idxSrc == 2;
+          auto storeCvtNoBlock = dropBlock(storeCvt);
+          auto result = lowerLdStMatrix(
+              loc, storeCvtNoBlock, transpose, tileInVals, base, affineOffset,
+              maskSpanAffineOffset, llvmElemTy, rewriter, targetInfo);
+          assert(succeeded(result));
+        }
       }
       emitBarrier();
-      // Load
-      SmallVector<Value> tileOutVals;
-      // idxDst 0: ld.shared, idxDst 1: ldmatrix, idxDst 2: ldmatrix.trans
-      if (idxDst == 0) {
-        tileOutVals = lowerLdSt(
-            loc, ctx, loadCvt, {}, llvmElemTy, smemBase, /*paddingShifts=*/{},
-            affineOffset, maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
-            /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
-            /*maybeMaxVecElems=*/{}, makeSharedLoadEmitter(targetInfo));
-      } else {
-        assert(idxDst == 1 || idxDst == 2);
-        bool transpose = idxDst == 2;
-        auto loadCvtNoBlock = dropBlock(loadCvt);
-        auto result = lowerLdStMatrix(
-            loc, loadCvtNoBlock, transpose, tileOutVals, smemBase, affineOffset,
-            maskSpanAffineOffset, llvmElemTy, rewriter, targetInfo);
-        assert(succeeded(result));
+      for (int32_t tile : roundTiles) {
+        Value base = tileBase(tile);
+        // Load
+        SmallVector<Value> tileOutVals;
+        // idxDst 0: ld.shared, idxDst 1: ldmatrix, idxDst 2: ldmatrix.trans
+        if (idxDst == 0) {
+          tileOutVals = lowerLdSt(
+              loc, ctx, loadCvt, {}, llvmElemTy, base, /*paddingShifts=*/{},
+              affineOffset, maskSpanAffineOffset,
+              /*affineBlockOffset=*/Value(),
+              /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
+              /*maybeMaxVecElems=*/{}, makeSharedLoadEmitter(targetInfo));
+        } else {
+          assert(idxDst == 1 || idxDst == 2);
+          bool transpose = idxDst == 2;
+          auto loadCvtNoBlock = dropBlock(loadCvt);
+          auto result = lowerLdStMatrix(
+              loc, loadCvtNoBlock, transpose, tileOutVals, base, affineOffset,
+              maskSpanAffineOffset, llvmElemTy, rewriter, targetInfo);
+          assert(succeeded(result));
+        }
+        llvm::append_range(outValsByTile[tile], tileOutVals);
       }
-      llvm::append_range(outVals, tileOutVals);
     }
 
     // Undo the permLoad used to divideRight
-    outVals = permLoad.inverse().apply(outVals);
+    for (auto &vals : outValsByTile)
+      llvm::append_range(outVals, permLoad.inverse().apply(vals));
     return outVals;
+  }
+
+  // Moves each odd tile of a mixed-radix conversion as one pow2 transfer.
+  LogicalResult
+  transferMixedRadixTiles(ConvertLayoutOp op, OpAdaptor adaptor,
+                          const nvidia_gpu::MixedRadixTileTransfer &transfer,
+                          ConversionPatternRewriter &rewriter) const {
+    auto loc = op.getLoc();
+    auto *ctx = op.getContext();
+    auto kReg = str_attr("register");
+    auto srcTy = op.getSrc().getType();
+    auto dstTy = op.getType();
+    auto src = toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
+    auto dst = toLinearLayout(dstTy).removeZeroBasesAlongDim(kReg);
+    auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
+    const MixedRadixSharedTiling &tiles = transfer.tiles;
+    SmallVector<Value> tileVals;
+    for (int32_t tile = 0; tile < transfer.numTiles; ++tile)
+      for (int32_t reg : getTileRegisters(src, tiles.sourceDigits, tile))
+        tileVals.push_back(inVals[reg]);
+    auto outValsByTile = transferWithinBlockSwizzling(
+        loc, rewriter, tiles.sourceTile, tiles.destinationTile, tileVals,
+        getTypeConverter()->convertType(srcTy.getElementType()),
+        LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op), op,
+        transfer.numTiles, transfer.tilesPerRound);
+    SmallVector<Value> outVals(dst.getInDimSize(kReg));
+    auto next = outValsByTile.begin();
+    for (int32_t tile = 0; tile < transfer.numTiles; ++tile)
+      for (int32_t reg : getTileRegisters(dst, tiles.destinationDigits, tile))
+        outVals[reg] = *next++;
+    rewriter.replaceOp(op, packUniqueTensorElements(loc, getTypeConverter(),
+                                                    outVals, rewriter, dstTy));
+    return success();
+  }
+
+  // The registers of `layout` whose `digits` hold the values of `tile`,
+  // digits[0] fastest, in register order.
+  static SmallVector<int32_t> getTileRegisters(const LinearLayout &layout,
+                                               ArrayRef<int32_t> digits,
+                                               int32_t tile) {
+    auto kReg = StringAttr::get(layout.getInDimNames().begin()->getContext(),
+                                "register");
+    ArrayRef<int32_t> radices = layout.getInputRadices(kReg);
+    SmallVector<int32_t> registers;
+    for (int32_t reg = 0; reg < layout.getInDimSize(kReg); ++reg) {
+      SmallVector<int32_t> values;
+      for (int32_t rest = reg, digit = 0; digit < int32_t(radices.size());
+           rest /= radices[digit++])
+        values.push_back(rest % radices[digit]);
+      int32_t rest = tile;
+      bool inTile = true;
+      for (int32_t digit : digits) {
+        inTile &= values[digit] == rest % radices[digit];
+        rest /= radices[digit];
+      }
+      if (inTile)
+        registers.push_back(reg);
+    }
+    return registers;
   }
 
   LogicalResult

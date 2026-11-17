@@ -4,7 +4,7 @@ import torch
 
 import triton
 
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_tdm_pipelined import (
     matmul as _amd_mxfp_gemm_tdm_pipelined,
     pack_scale,
 )

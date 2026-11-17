@@ -53,6 +53,23 @@ memdesc views to its backing `local_alloc` and hoist nested allocations to
 function scope. This makes descriptor buffers canonical before remaining
 tensor channels are discovered and before memory planning.
 
+### Step 0.9: `foldDescriptorLoadMmaBridge`
+
+An exact-layout `local_load -> local_alloc` round trip is removed when the
+second allocation feeds one MMAv5 operation. The descriptor destination then
+serves both its register consumer and MMAv5 directly, so channel discovery
+models one allocation and one lifetime: the producer refills a slot only after
+the register consumer's release (which carries `ttng.fence_generic_reads`, so
+a proxy fence orders its generic reads before the TMA refill) and the MMA
+completion. The fold is limited to one CTA. It rejects views, additional
+writers, more than one register consumer, alignment changes, non-MMA uses, and
+control-flow differences. The descriptor write, register load, bridge, and MMA
+must be ordered in one block; the register load, bridge, and MMA must also
+share one pipeline cadence and distinct single-task roles. The descriptor
+producer may be scheduled at an earlier pipeline stage. Data-partitioned
+slices fold independently, since each slice owns its destination, register
+load, bridge, and MMA. `TRITON_WS_DISABLE_BRIDGE_FOLD=1` disables the fold.
+
 ### Step 1: `collectAsyncChannels`
 
 Walk the function to find cross-partition data dependencies. For each

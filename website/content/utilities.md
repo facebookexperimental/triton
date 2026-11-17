@@ -64,6 +64,67 @@
         y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)
     ```
 
+## AMD packed dot2
+
+> `tlx.amd_packed_dot2` currently requires **[gfx950]**.
+
+```python
+tlx.amd_packed_dot2(lhs, rhs, acc, input_dtype)
+```
+
+Compute one two-element floating-point dot product for every packed register
+element:
+
+```text
+result = lhs[0] * rhs[0] + lhs[1] * rhs[1] + acc
+```
+
+`lhs` and `rhs` are block tensors of `tl.uint32`. Each element stores two
+adjacent 16-bit inputs: bits 0–15 hold element 0 and bits 16–31 hold element 1.
+Because the storage type does not describe the packed values,
+`input_dtype` is required and must be `tl.float16` or `tl.bfloat16`.
+`acc` is an FP32 block tensor. All three operands must have identical shapes;
+the result is an FP32 tensor with that same shape and resolved layout.
+
+| Argument | Contract |
+|----------|----------|
+| `lhs`, `rhs` | Same-shaped `tl.uint32` block tensors containing packed pairs |
+| `acc` | FP32 block tensor with the same shape as `lhs` and `rhs` |
+| `input_dtype` | Required constexpr: `tl.float16` or `tl.bfloat16` |
+
+The operation is register-level and does not broadcast operands. Broadcast
+before the call when one packed input is shared:
+
+```python
+pairs = tl.arange(0, BLOCK_K // 2)
+a = tl.load(a_ptr.to(tl.pointer_type(tl.uint32)) + pairs)
+b = tl.load(b_ptr.to(tl.pointer_type(tl.uint32)) + offsets)
+a = tl.broadcast_to(a[None, :], b.shape)
+
+products = tlx.amd_packed_dot2(
+    b,
+    a,
+    tl.zeros(b.shape, tl.float32),
+    input_dtype=tl.bfloat16,
+)
+result = tl.sum(products, axis=1)
+```
+
+The lowering preserves the operation as an LLVM-visible DOT:
+
+| `input_dtype` | LLVM intrinsic |
+|-----------------|----------------|
+| `tl.float16` | `llvm.amdgcn.fdot2` |
+| `tl.bfloat16` | `llvm.amdgcn.fdot2.f32.bf16` |
+
+LLVM therefore tracks the DOT's register dependencies and inserts wait states
+only when the schedule requires them. Do not wrap this operation in inline
+assembly or add a handwritten `s_nop`.
+
+This is an intra-lane packed arithmetic operation. It is distinct from
+`tlx.amd_dot`, which computes a matrix product through MFMA instructions and
+uses distributed matrix/dot-operand layouts.
+
 ## Rubin packed x4 arithmetic
 
 > `tlx.packed_add4`, `tlx.packed_sub4`, `tlx.packed_mul4`, and `tlx.packed_fma4` require **[sm107+]**.
@@ -121,7 +182,7 @@ The frontend lowers these APIs to `ttng.packed_arith`; the SM107 backend then em
     Prefer these semantic reductions when code only needs an all/any result.
     They do not expose a hardware ballot bit mask.
 
-- `tlx.warp_predicate(predicate, inits, body, args=(), wave_uniform=False)` **[AMD]**
+- `tlx.warp_predicate(predicate, inits, body, args=(), wave_uniform=False)` **[sm100, AMD]**
 
     Executes `body(*inits, *args)` with the hardware execution mask restricted
     to lanes where `predicate` is true. Active lanes receive the values returned
@@ -152,8 +213,26 @@ The frontend lowers these APIs to `ttng.packed_arith`; the SM107 backend then em
     no cross-wave synchronization. Reductions, dots, and layout shuffles are
     allowed only with `wave_uniform=True`, which asserts that every lane in a
     wave observes the same predicate. Cross-warp reductions, nested dynamic
-    control flow, and other nested regions are unsupported. This operation is
-    currently lowered only by the AMD backend.
+    control flow, and other nested regions are unsupported.
+
+    On NVIDIA, the predicate must be a scalar with `wave_uniform=True`, such
+    as the result of `tlx.warp_any`, and `inits` must be empty, so each warp
+    runs or skips the whole body for its effects on tensor memory. The body
+    may contain register math and tensor memory loads and stores; anything
+    else, including mbarrier arrives and waits, is rejected. So is a body
+    that would need a CTA barrier, for example because two warps access the
+    same tensor memory words. A per-warp rescale of a tensor memory
+    accumulator looks like this:
+
+    ```python
+    @triton.jit
+    def rescale(acc, alpha):
+        tlx.local_store(acc, tlx.local_load(acc) * alpha[:, None])
+
+    # Each warp rescales its rows if any of them needs it.
+    tlx.warp_predicate(tlx.warp_any(alpha < 1.0), (), rescale,
+                       args=(acc, alpha), wave_uniform=True)
+    ```
 
 - `tlx.prefetch(pointer, level="L2", mask=None, tensormap=False)` **[sm90+]** issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements `tlx.async_descriptor_prefetch_tensor` (which works on TMA tensor descriptors) by supporting raw pointer tensors.
   Additionally, if `tensormap` is specified to `True`, the API instead does a prefetch of tensor map object (TMA descriptor) and ignores other parameters other than `pointer`.

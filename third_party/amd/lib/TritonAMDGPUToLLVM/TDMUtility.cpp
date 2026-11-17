@@ -36,27 +36,37 @@ Value sequenceGroup0(RewriterBase &rewriter, Location loc, Value group0) {
              rewriter, loc, group0.getType(), ValueRange{group0},
              /*asm_string=*/"", /*constraints=*/"=s,0",
              /*has_side_effects=*/true, /*is_align_stack=*/false,
-             LLVM::TailCallKind::None,
+             LLVM::TailCallKind::None, /*convergent=*/false,
              LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT),
              /*operand_attrs=*/ArrayAttr::get(ctx, {}))
       .getRes();
 }
 
+// Read the 64-bit global address from dwords 2-3 of descriptor group 0.
+Value getTDMGlobalAddr(RewriterBase &rewriter, TritonLLVMOpBuilder &b,
+                       Value group0) {
+  // Build each half in its own statement: argument evaluation order is
+  // unspecified, so nested calls would emit these ops in a compiler-dependent
+  // order.
+  Value lo = b.zext(i64_ty, vecGet(b, group0, 2));
+  Value hi = b.zext(i64_ty, vecGet(b, group0, 3));
+  return b.or_(lo, b.shl(hi, b.i64_val(32)));
+}
+
 // Add `byteOffset` to the 64-bit global address held in group0 dwords [2:3], in
-// place.  Viewing group0 as <2 x i64> and adding to lane 1 is a single i64 add
-// (the i32<->i64 bitcasts are free), saving the scalar-ALU a per-dword
-// decode/repack would cost in the loop.  Adding over the whole word (valid bit
-// included) is safe: the address always stays within the HW-addressable range,
-// so the add never disturbs the valid bit.
+// place, as a single i64 add; the zext/shl/or join and the trunc/lshr split
+// fold into the 64-bit add, so there is no per-dword decode/repack. Adding
+// over the whole word (valid bit included) is safe: the address always stays
+// within the HW-addressable range, so the add never disturbs the valid bit.
+// Scalar dword operations, unlike a <2 x i64> bitcast of the whole group, let
+// LLVM follow the address through later inserts and selects, e.g. to hoist a
+// loop-invariant base address out of a fused load's descriptor selection.
 void advanceGlobalAddr(RewriterBase &rewriter, TritonLLVMOpBuilder &b,
                        Value &group0, Value byteOffset) {
-  auto v2i64 = VectorType::get({2}, i64_ty);
-  auto v4i32 = VectorType::get({4}, i32_ty);
-  Value g0AsI64 = b.bitcast(group0, v2i64);
-  Value addr = b.extract_element(g0AsI64, b.i32_val(1));
+  Value addr = getTDMGlobalAddr(rewriter, b, group0);
   addr = b.add(addr, byteOffset);
-  g0AsI64 = b.insert_element(g0AsI64, addr, b.i32_val(1));
-  group0 = b.bitcast(g0AsI64, v4i32);
+  group0 = vecSet(b, group0, 2, b.trunc(i32_ty, addr));
+  group0 = vecSet(b, group0, 3, b.trunc(i32_ty, b.lshr(addr, b.i64_val(32))));
 }
 
 // Helper to decode a value spanning two 32-bit words
@@ -86,9 +96,9 @@ SmallVector<unsigned> distributeTDMWarps(ArrayRef<int64_t> blockShape,
 //   1. Start with numLogicalPieces warps along partitionDim (one per piece).
 //      If numWarps < numLogicalPieces, use all warps and emit multiple TDM
 //      instructions.
-//   2. Subdivide partition pieces along partitionDim (adding more warps), but
-//      ONLY when partitionDim is not the innermost dimension.
-//   3. Distribute remaining warps to non-partition, non-inner dimensions.
+//   2. Distribute the remaining warps outermost-first over the non-inner
+//      dimensions, subdividing partition pieces along partitionDim in turn,
+//      so that each warp's chunk is contiguous within its piece.
 //
 // The innermost dimension (numDims-1) is never subdivided beyond the initial
 // partition assignment.  TDM writes data as a linear element stream with LDS
@@ -103,8 +113,6 @@ std::pair<SmallVector<unsigned>, unsigned> distributeTDMWarpsAlignToPartition(
   unsigned numDims = blockShape.size();
   unsigned partitionDim = partitionedEnc.getPartitionDim();
   unsigned numLogicalPieces = partitionedEnc.getNumLogicalPieces();
-  int64_t pieceSize =
-      blockShape[partitionDim] / static_cast<int64_t>(numLogicalPieces);
   unsigned innerDim = numDims - 1;
 
   assert(partitionDim < numDims && "partitionDim out of range");
@@ -116,28 +124,20 @@ std::pair<SmallVector<unsigned>, unsigned> distributeTDMWarpsAlignToPartition(
   unsigned numTDMInstructions =
       llvm::divideCeil(numLogicalPieces, warpsAlongPartition);
 
-  // Subdivide partition pieces to absorb more warps, but only when
-  // partitionDim != innerDim.  Subdividing the innermost dimension would
-  // make the per-warp row width narrower than the inner layout row,
-  // misaligning TDM's linear padding with the shared memory row structure.
-  int remainingWarps = numWarps / warpsAlongPartition;
-  if (partitionDim != innerDim) {
-    while (remainingWarps >= 2 &&
-           pieceSize % ((warpsAlongPartition / numLogicalPieces) * 2) == 0 &&
-           static_cast<int64_t>(warpsAlongPartition * 2) <=
-               blockShape[partitionDim]) {
-      warpsAlongPartition *= 2;
-      remainingWarps /= 2;
-    }
-  }
-
   SmallVector<unsigned> warps(numDims, 1);
   warps[partitionDim] = warpsAlongPartition;
 
-  // Distribute remaining warps to non-partition, non-inner dimensions.
-  for (unsigned i = 0; i < numDims && remainingWarps > 1; ++i) {
-    if (i == partitionDim || i == innerDim)
-      continue;
+  // Spread the remaining warps outermost-first, as distributeTDMWarps does.
+  // TDM writes each warp's tile as one contiguous run in its partition piece,
+  // so a dimension may only be split once every outer dimension is down to
+  // one element per warp. Splitting the partition dimension first would give
+  // a warp rows from several outer slices of the piece, e.g. both groups of a
+  // [G, P * r, K] tile partitioned along dim 1, and write them contiguously.
+  // Never split the innermost dimension beyond the initial partition
+  // assignment: the per-warp row width would no longer match the inner
+  // layout's rows, misaligning TDM's linear padding.
+  int remainingWarps = numWarps / warpsAlongPartition;
+  for (unsigned i = 0; i < innerDim && remainingWarps > 1; ++i) {
     while (remainingWarps > 1 &&
            static_cast<int64_t>(warps[i] * 2) <= blockShape[i]) {
       warps[i] *= 2;
@@ -847,15 +847,25 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
   }
 
   Value baseOffset = b.i64_val(0);
+  Value innerDescriptorOffset;
   for (size_t i = 0; i < numDims; ++i) {
     Value dimOffset = b.mul(b.zext(i64_ty, offset[i]), tensorStride[i]);
     baseOffset = b.add(baseOffset, dimOffset);
     // A folded update advances the address without changing bounds. Keep its
     // signed i32 offsets separate from the per-warp offsets until after
     // extension to i64: adding in i32 would change overflow/negative offsets.
-    if (!descriptorOffsets.empty())
-      baseOffset = b.add(baseOffset, b.mul(b.sext(i64_ty, descriptorOffsets[i]),
-                                           tensorStride[i]));
+    if (descriptorOffsets.empty())
+      continue;
+    Value descOffset =
+        b.mul(b.sext(i64_ty, descriptorOffsets[i]), tensorStride[i]);
+    // The innermost offset is applied by a separate, final address add (see
+    // below), so members of a fused load that advance by the same inner
+    // offset (e.g. K) end in the same add, which LLVM can factor out of the
+    // per-wave descriptor selection.
+    if (i == numDims - 1)
+      innerDescriptorOffset = descOffset;
+    else
+      baseOffset = b.add(baseOffset, descOffset);
   }
 
   auto tdmToShared = tdmLayout.invertAndCompose(sharedLayout);
@@ -957,15 +967,19 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
   }
   Value &group0 = groups[0];
   Value &group1 = groups[1];
+  // Advance global_addr by the per-warp byte offset before inserting the LDS
+  // address, which changes with the ring slot, so the advanced address does
+  // not depend on it.
+  Value elementBytes = b.i64_val(elementType.getIntOrFloatBitWidth() / 8);
+  advanceGlobalAddr(rewriter, b, group0, b.mul(baseOffset, elementBytes));
+  if (innerDescriptorOffset)
+    advanceGlobalAddr(rewriter, b, group0,
+                      b.mul(innerDescriptorOffset, elementBytes));
   // Skip re-writing pred when it is exactly the descriptor's existing
   // group0[0].
   if (!predIsInherited)
     group0 = vecSet(b, group0, 0, pred);
   group0 = vecSet(b, group0, 1, ldsAddr);
-  // Advance global_addr by the per-warp byte offset.
-  Value byteOffset =
-      b.mul(baseOffset, b.i64_val(elementType.getIntOrFloatBitWidth() / 8));
-  advanceGlobalAddr(rewriter, b, group0, byteOffset);
 
   // Update group1 with tensor shapes
   Value g1_0 = vecGet(b, group1, 0);
@@ -1751,6 +1765,31 @@ void emitTDMLoadFused(RewriterBase &rewriter, Location loc,
 
   SmallVector<Value, 6> selectedGroups(numGroups);
   for (size_t group = 0; group < numGroups; ++group) {
+    if (group == 0) {
+      // Select group 0's control word, LDS address and 64-bit global address
+      // separately. In a loop the LDS address changes while each member's
+      // base address is invariant; with a whole-vector select LLVM cannot
+      // hoist the invariant part or factor a common advance such as K out of
+      // select(c, a + k, b + k).
+      Value last = filledPerMember[numMembers - 1][0];
+      Value control = vecGet(b, last, 0);
+      Value ldsAddr = vecGet(b, last, 1);
+      Value globalAddr = getTDMGlobalAddr(rewriter, b, last);
+      for (size_t i = numMembers - 1; i-- > 0;) {
+        Value member = filledPerMember[i][0];
+        control = b.select(memberActive[i], vecGet(b, member, 0), control);
+        ldsAddr = b.select(memberActive[i], vecGet(b, member, 1), ldsAddr);
+        globalAddr = b.select(
+            memberActive[i], getTDMGlobalAddr(rewriter, b, member), globalAddr);
+      }
+      Value selected = b.undef(vec_ty(i32_ty, 4));
+      selected = vecSet(b, selected, 0, control);
+      selected = vecSet(b, selected, 1, ldsAddr);
+      selected = vecSet(b, selected, 2, b.trunc(i32_ty, globalAddr));
+      selectedGroups[0] = vecSet(
+          b, selected, 3, b.trunc(i32_ty, b.lshr(globalAddr, b.i64_val(32))));
+      continue;
+    }
     Value selected = filledPerMember[numMembers - 1][group];
     for (size_t i = numMembers - 1; i-- > 0;)
       selected = b.select(memberActive[i], filledPerMember[i][group], selected);

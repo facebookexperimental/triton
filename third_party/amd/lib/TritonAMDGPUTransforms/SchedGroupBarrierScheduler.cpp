@@ -75,21 +75,31 @@ static unsigned mfmaCountOf(Operation *op) {
   auto rt = dyn_cast<RankedTensorType>(op->getResult(0).getType());
   if (!rt || rt.getRank() != 2)
     return 1;
-  auto mma =
-      dyn_cast_or_null<triton::gpu::AMDMfmaEncodingAttr>(rt.getEncoding());
-  if (!mma)
+  SmallVector<unsigned> instr;
+  SmallVector<unsigned> warps;
+  if (auto mfma = dyn_cast_or_null<triton::gpu::AMDMfmaEncodingAttr>(
+          rt.getEncoding())) {
+    instr = llvm::to_vector(mfma.getInstrShape());
+    warps = llvm::to_vector(mfma.getWarpsPerCTA());
+  } else if (auto wmma = dyn_cast_or_null<triton::gpu::AMDWmmaEncodingAttr>(
+                 rt.getEncoding())) {
+    instr = llvm::to_vector(wmma.getInstrShape());
+    warps = triton::gpu::getWarpsPerCTA(rt);
+  } else {
     return 1;
+  }
   auto aT = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
   if (!aT || aT.getRank() < 2)
     return 1;
-  auto instr = mma.getInstrShape();
-  auto warps = mma.getWarpsPerCTA();
   if (instr.size() < 3 || warps.size() < 2)
     return 1;
   int64_t k = aT.getShape()[1];
   if (auto ds = dyn_cast<triton::DotScaledOp>(op))
     if (ds.getAElemType() == triton::ScaleDotElemType::E2M1)
       k *= 2; // two fp4 values per byte
+  if (auto ds = dyn_cast<triton::amdgpu::ScheduledMfmaScaledOp>(op))
+    if (ds.getAFormat() == "e2m1")
+      k *= 2;
   int64_t tileM = std::max<int64_t>(1, (int64_t)instr[0] * warps[0]);
   int64_t tileN = std::max<int64_t>(1, (int64_t)instr[1] * warps[1]);
   int64_t iK = std::max<int64_t>(1, (int64_t)instr[2]);
@@ -148,7 +158,8 @@ static unsigned dsReadCountOf(Operation *op) {
     // backwards for the target BMM and under-counts every B local_load by 2x.
     if (auto dot = dyn_cast_or_null<triton::gpu::DotOperandEncodingAttr>(
             rt.getEncoding()))
-      if (dot.getOpIdx() == 1)
+      if (dot.getOpIdx() == 1 &&
+          isa<triton::gpu::AMDMfmaEncodingAttr>(dot.getParent()))
         accessBytes = 8;
   }
   return accessCount(ty, accessBytes);
@@ -168,22 +179,13 @@ static unsigned dsWriteCountOf(Operation *op) {
 
   LinearLayout regLayout = triton::gpu::toLinearLayout(regTy);
   LinearLayout cvt = LinearLayout::empty();
+  StringAttr kBlock = StringAttr::get(op->getContext(), "block");
   if (triton::gpu::isPaddedEncoding(memTy.getEncoding())) {
-    cvt = triton::invertAndComposeBlockLocal(
-        triton::gpu::paddedLinearLayout(memTy), regLayout);
+    cvt = triton::invertAndComposeLocal(triton::gpu::paddedLinearLayout(memTy),
+                                        regLayout, {kBlock});
   } else {
     LinearLayout sharedLayout = triton::gpu::toLinearLayout(memTy);
-    if (regLayout.isModular()) {
-      auto allocShape = triton::gpu::getAllocationShapePerCTA(memTy);
-      sharedLayout =
-          triton::gpu::toLinearLayout(allocShape, memTy.getEncoding());
-      SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
-      for (StringAttr dim : regLayout.getOutDimNames())
-        paddedOutDims.push_back({dim, sharedLayout.getOutDimSize(dim)});
-      regLayout = LinearLayout(regLayout.getBases(), paddedOutDims,
-                               /*requireSurjective=*/false);
-    }
-    cvt = triton::invertAndComposeBlockLocal(sharedLayout, regLayout);
+    cvt = triton::invertAndComposeLocal(sharedLayout, regLayout, {kBlock});
   }
   cvt = triton::actionRemoveBroadcastedRegs(cvt).apply(cvt);
   std::optional<int> maxVec;
@@ -388,11 +390,18 @@ intraWaveServiceCycles(Operation *op, int32_t mask, unsigned machineCount,
     auto resultTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
     if (!resultTy)
       return 0;
-    auto mma = dyn_cast_or_null<triton::gpu::AMDMfmaEncodingAttr>(
-        resultTy.getEncoding());
-    if (!mma || mma.getInstrShape().empty())
+    unsigned instrM = 0;
+    if (auto mfma = dyn_cast_or_null<triton::gpu::AMDMfmaEncodingAttr>(
+            resultTy.getEncoding())) {
+      if (!mfma.getInstrShape().empty())
+        instrM = mfma.getInstrShape()[0];
+    } else if (auto wmma = dyn_cast_or_null<triton::gpu::AMDWmmaEncodingAttr>(
+                   resultTy.getEncoding())) {
+      if (!wmma.getInstrShape().empty())
+        instrM = wmma.getInstrShape()[0];
+    }
+    if (!instrM)
       return 0;
-    unsigned instrM = mma.getInstrShape()[0];
     unsigned cycles = instrM == 32 ? 32 : instrM == 16 ? 16 : 0;
     return cycles * machineCount;
   }
@@ -447,8 +456,8 @@ static void clearIntraWaveMarker(Operation *op) {
 
 static std::optional<std::pair<int32_t, unsigned>>
 priceIntraWaveOp(Operation *op, triton::AMD::ModuleAxisInfoAnalysis &axisInfo) {
-  if (isa<triton::DotOp, triton::DotScaledOp, triton::amdgpu::ScheduledMfmaOp>(
-          op))
+  if (isa<triton::DotOp, triton::DotScaledOp, triton::amdgpu::ScheduledMfmaOp,
+          triton::amdgpu::ScheduledMfmaScaledOp>(op))
     return std::pair<int32_t, unsigned>{kMaskMFMA, mfmaCountOf(op)};
   if (isa<triton::gpu::LocalLoadOp>(op))
     return std::pair<int32_t, unsigned>{kMaskDSRead, dsReadCountOf(op)};
@@ -1173,7 +1182,9 @@ struct TritonAMDGPUSchedGroupBarrierSchedulerPass
                     b.getI32IntegerAttr(mfmaCover));
     };
     mod.walk([&](Operation *op) {
-      if (isa<triton::DotOp, triton::DotScaledOp>(op))
+      if (isa<triton::DotOp, triton::DotScaledOp,
+              triton::amdgpu::ScheduledMfmaOp,
+              triton::amdgpu::ScheduledMfmaScaledOp>(op))
         annotate(op, kMaskMFMA, mfmaCountOf(op));
       else if (isa<triton::gpu::LocalLoadOp>(op))
         annotate(op, kMaskDSRead, dsReadCountOf(op));

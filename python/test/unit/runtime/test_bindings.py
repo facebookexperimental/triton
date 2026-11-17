@@ -3,6 +3,9 @@ import triton.language as tl
 
 import torch
 import math
+import subprocess
+import sys
+import textwrap
 import pytest
 
 _BLOCK_SIZE = 16
@@ -22,6 +25,89 @@ def test_llvm_ir_to_bitcode_reports_invalid_ir():
 
     with pytest.raises(RuntimeError, match="failed to parse LLVM IR.*expected top-level entity"):
         llvm.to_bitcode("invalid LLVM IR")
+
+
+@pytest.mark.parametrize("dtype", ["i8", "i16", "i32", "i64", "f16", "f32", "f64"])
+@pytest.mark.parametrize("num_elements", [2, 4])
+@pytest.mark.parametrize("enable_nvptx_tti", [False, True])
+@pytest.mark.parametrize("triple", ["", "nvptx64-nvidia-cuda", "amdgcn-amd-amdhsa"])
+@pytest.mark.parametrize("dynamic_indices", [False, True])
+def test_nvptx_tti_vector_load_scalarization(dtype, num_elements, enable_nvptx_tti, triple, dynamic_indices, tmp_path):
+    from triton._C.libtriton import ir, llvm
+
+    vector_type = f"vector<{num_elements}x{dtype}>"
+    instructions = [f"%v = llvm.load %p <alignment = 32> : !llvm.ptr<1> -> {vector_type}"]
+    # Use pointer-width indices so widening costs do not mask the TTI's
+    # extractelement cost when deciding whether to scalarize the load.
+    if dynamic_indices:
+        instructions.append(f"%mask = llvm.mlir.constant({num_elements - 1} : i64) : i64")
+    for index in range(num_elements):
+        if dynamic_indices:
+            instructions.append(f"%i{index} = llvm.and %arg{index}, %mask : i64")
+        else:
+            instructions.append(f"%i{index} = llvm.mlir.constant({index} : i64) : i64")
+        instructions.append(f"%v{index} = llvm.extractelement %v[%i{index} : i64] : {vector_type}")
+    value = "%v0"
+    opcode = "add" if dtype.startswith("i") else "fadd"
+    for index in range(1, num_elements):
+        instructions.append(f"%sum{index} = llvm.{opcode} {value}, %v{index} : {dtype}")
+        value = f"%sum{index}"
+    instructions.append(f"llvm.return {value} : {dtype}")
+    arguments = ["%p: !llvm.ptr<1>"]
+    if dynamic_indices:
+        arguments.extend(f"%arg{index}: i64" for index in range(num_elements))
+    body = "\n".join(instructions)
+    source = tmp_path / "vector_load.mlir"
+    source.write_text(f'''module attributes {{llvm.target_triple = "{triple}"}} {{
+      llvm.func @unpack({", ".join(arguments)}) -> {dtype} {{
+        {body}
+      }}
+    }}''')
+    context = ir.context()
+    ir.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    llvm_context = llvm.context()
+    llvm_module = llvm.to_module(module, llvm_context)
+    llvm.optimize_module(llvm_module, llvm.OPTIMIZE_O3, disable_slp_vectorizer=True, enable_nvptx_tti=enable_nvptx_tti)
+    result = str(llvm_module)
+    llvm_type = {"f16": "half", "f32": "float", "f64": "double"}.get(dtype, dtype)
+    # Whole-register extracts are free only in our NVIDIA TTI. Packed sub-word
+    # elements, dynamic indices, and other targets retain the generic decision.
+    preserve_vector = (enable_nvptx_tti and triple in ("", "nvptx64-nvidia-cuda") and not dynamic_indices
+                       and dtype in ("i32", "i64", "f32", "f64"))
+    if preserve_vector:
+        assert f"load <{num_elements} x {llvm_type}>" in result
+        assert f"load {llvm_type}," not in result
+    else:
+        assert f"load <{num_elements} x {llvm_type}>" not in result
+        assert result.count(f"load {llvm_type},") == num_elements
+
+
+def test_binding_classes_released_at_shutdown():
+    script = textwrap.dedent("""
+        import os
+        from triton._C.libtriton import gluon_ir, ir
+        from triton.experimental.gluon.language import BlockedLayout
+
+        class ShutdownSentinel:
+            def __init__(self, message):
+                self.message = message
+
+            def __del__(self, write=os.write):
+                write(1, self.message)
+
+        ir.builder._shutdown_sentinel = ShutdownSentinel(b"builder released\\n")
+        context = ir.context()
+        ir.load_dialects(context)
+        builder = gluon_ir.GluonOpBuilder(context)
+        layout = BlockedLayout([1], [32], [4], [0])._to_ir(builder)
+        result = builder.to_linear_layout(layout, [128])
+        type(result)._shutdown_sentinel = ShutdownSentinel(b"layout released\\n")
+        del result, layout, builder, context
+    """)
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True)
+    assert set(result.stdout.splitlines()) == {"builder released", "layout released"}, result.stderr
+    assert "nanobind: leaked" not in result.stderr
 
 
 @triton.jit
@@ -137,3 +223,44 @@ def test_python_func_in_visit_call(device):
     x = torch.randn(4, device=device)
     out = torch.zeros_like(x)
     test_py_call_const_kernel[(4, )](x, out, 4, 4)
+
+
+# ttg.shared_memory_breakdown module attribute roundtrip. The C++ side attaches
+# breakdown JSON as a StringAttr; module.get_str_attr exposes it to backends.
+
+_BREAKDOWN_ATTR = "ttg.shared_memory_breakdown"
+
+
+def _parse_test_module(tmp_path, name):
+    from triton._C.libtriton import ir
+
+    source = tmp_path / name
+    source.write_text("module {\n  tt.func public @k() { tt.return }\n}\n")
+    context = ir.context()
+    ir.load_dialects(context)
+    return context, ir.parse_mlir_module(str(source), context)
+
+
+def test_module_get_str_attr_contract(tmp_path):
+    from triton._C.libtriton import ir
+
+    context, module = _parse_test_module(tmp_path, "breakdown.mlir")
+    assert module.get_str_attr(_BREAKDOWN_ATTR) is None
+    module.set_attr(_BREAKDOWN_ATTR, ir.builder(context).get_int32_attr(7))
+    assert module.get_str_attr(_BREAKDOWN_ATTR) is None
+    module.set_attr(_BREAKDOWN_ATTR, ir.builder(context).get_string_attr('{"version": 1}'))
+    assert module.get_str_attr(_BREAKDOWN_ATTR) == '{"version": 1}'
+
+
+def test_breakdown_raw_roundtrip_through_module(tmp_path):
+    import json
+
+    from triton._C.libtriton import ir
+    from triton.runtime.errors import attach_shared_memory_breakdown
+
+    raw = json.dumps({"version": 1, "reserved_bytes": 1024, "functions": [], "reservations": []})
+    context, module = _parse_test_module(tmp_path, "roundtrip.mlir")
+    module.set_attr(_BREAKDOWN_ATTR, ir.builder(context).get_string_attr(raw))
+    metadata = {}
+    attach_shared_memory_breakdown(module, metadata)
+    assert metadata["shared_memory_breakdown"] == raw
