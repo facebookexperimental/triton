@@ -42,8 +42,8 @@ module attributes {test.attr = #wmma} {}
 
 // -----
 
-// A radix-2 digit with an odd Product part is rejected at construction.
-// CHECK: error: invalid radix-2 digit: it has an odd Product contribution
+// A radix-2 digit with an odd mixed-radix part is rejected at construction.
+// CHECK: error: invalid radix-2 digit: it has an odd mixed-radix contribution
 #non_h = #ttg.generic_linear<{
   register = [[3], [2]], lane = [], warp = [], block = [],
   inputRadices = {register = [2, 3], lane = [], warp = [], block = []},

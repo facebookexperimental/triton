@@ -81,3 +81,47 @@ tt.func @dot_k_select(%p: !tt.ptr<f16>) {
   %f = tt.dot %e, %bt, %d : tensor<16x96xf16> * tensor<96x16xf16> -> tensor<16x16xf32>
   tt.return
 }
+
+// -----
+
+// Through a transpose, the source is filled where it is defined and its other
+// uses keep the unfilled value, so the transpose still feeds the dot.
+// CHECK-LABEL: @dot_k_trans
+tt.func @dot_k_trans(%p: !tt.ptr<f16>) {
+  // CHECK: %[[K:.*]] = math.exp %{{.*}} : tensor<16x128xf16>
+  // CHECK-NEXT: %[[Z:.*]] = arith.constant dense<0.000000e+00> : tensor<16x128xf16>
+  // CHECK-NEXT: %[[KS:.*]] = arith.select %{{.*}}, %[[K]], %[[Z]] : tensor<16x128xi1>, tensor<16x128xf16>
+  // CHECK: %[[KA:.*]] = arith.select %{{.*}}, %[[K]], %{{.*}} : tensor<16x128xi1>, tensor<16x128xf16>
+  // CHECK-NEXT: tt.dot %[[KA]]
+  // CHECK: %[[KT:.*]] = tt.trans %[[KS]]
+  // CHECK-NEXT: tt.dot %{{.*}}, %[[KT]]
+  %ptr = tt.splat %p : !tt.ptr<f16> -> tensor<16x96x!tt.ptr<f16>>
+  %x = tt.load %ptr : tensor<16x96x!tt.ptr<f16>>
+  %k = math.exp %x : tensor<16x96xf16>
+  %xt = tt.trans %x {order = array<i32: 1, 0>} : tensor<16x96xf16> -> tensor<96x16xf16>
+  %c = arith.constant dense<0.0> : tensor<16x16xf32>
+  %d = tt.dot %k, %xt, %c : tensor<16x96xf16> * tensor<96x16xf16> -> tensor<16x16xf32>
+  %kt = tt.trans %k {order = array<i32: 1, 0>} : tensor<16x96xf16> -> tensor<96x16xf16>
+  %e = tt.dot %x, %kt, %d : tensor<16x96xf16> * tensor<96x16xf16> -> tensor<16x16xf32>
+  tt.return
+}
+
+// -----
+
+// A pow2 K needs no fill, transposed or not.
+// CHECK-LABEL: @dot_n_trans
+tt.func @dot_n_trans(%p: !tt.ptr<f16>) {
+  // CHECK: %[[K:.*]] = math.exp %{{.*}} : tensor<128x64xf16>
+  // CHECK-NOT: arith.select
+  // CHECK: %[[KT:.*]] = tt.trans %[[K]]
+  // CHECK-NEXT: tt.dot %{{.*}}, %[[KT]]
+  %pa = tt.splat %p : !tt.ptr<f16> -> tensor<16x64x!tt.ptr<f16>>
+  %a = tt.load %pa : tensor<16x64x!tt.ptr<f16>>
+  %pk = tt.splat %p : !tt.ptr<f16> -> tensor<80x64x!tt.ptr<f16>>
+  %x = tt.load %pk : tensor<80x64x!tt.ptr<f16>>
+  %k = math.exp %x : tensor<80x64xf16>
+  %c = arith.constant dense<0.0> : tensor<16x80xf32>
+  %kt = tt.trans %k {order = array<i32: 1, 0>} : tensor<80x64xf16> -> tensor<64x80xf16>
+  %d = tt.dot %a, %kt, %c : tensor<16x64xf16> * tensor<64x80xf16> -> tensor<16x80xf32>
+  tt.return
+}

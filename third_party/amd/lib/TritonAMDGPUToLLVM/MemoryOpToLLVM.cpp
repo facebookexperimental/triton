@@ -3,6 +3,7 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
+#include "Utility.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
@@ -21,6 +22,7 @@
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/AMDGPUAddrSpace.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
 #include <type_traits>
 
 using mlir::triton::amdgpu::ISAFamily;
@@ -475,7 +477,7 @@ public:
 
     auto typeConverter = this->getTypeConverter();
     auto llvmElemTy = typeConverter->convertType(dstTy.getElementType());
-    unsigned bitWidth = llvmElemTy.getIntOrFloatBitWidth();
+    unsigned bitWidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
 
     unsigned logicalBitWidth = bitWidth;
     if constexpr (isPackedTransposed) {
@@ -497,6 +499,18 @@ public:
 
     auto dstLL = triton::gpu::toLinearLayout(dstTy);
     LinearLayout sharedLL = triton::gpu::toLinearLayoutIgnoringPadding(srcTy);
+    // A mixed-radix read is one radix-2 read per odd register value o,
+    // starting at LDS element slabOffsets[o].
+    SmallVector<int32_t> slabOffsets = {0};
+    std::optional<LinearLayout> slabCvt;
+    if (!dstLL.isRadix2()) {
+      std::string reason;
+      FailureOr<LinearLayout> cvt =
+          LLVM::AMD::splitDirectToLdsCopy(dstLL, sharedLL, slabOffsets, reason);
+      if (isPackedTransposed || failed(cvt))
+        return failure();
+      slabCvt = *cvt;
+    }
 
     if constexpr (isPackedTransposed) {
       // Perform factorization and address routing in logical fp4 coordinates.
@@ -528,7 +542,7 @@ public:
       dstLL = LinearLayout::identity1D(2, kReg, *dstPackedDim) * dstLL;
     }
 
-    auto cvtDstLL = dstLL.invertAndCompose(sharedLL);
+    auto cvtDstLL = slabCvt ? *slabCvt : dstLL.invertAndCompose(sharedLL);
     auto kBlock = StringAttr::get(ctx, "block");
     auto maybeSublayout = cvtDstLL.quotient({kBlock});
     if (!maybeSublayout)
@@ -543,7 +557,12 @@ public:
     auto paddingShifts = getPaddedSharedShifts(srcTy.getEncoding(),
                                                srcTy.getElementTypeBitWidth(),
                                                /*offsetInBytes=*/true);
+    if (llvm::any_of(slabOffsets, [&](int32_t offset) {
+          return offset & maskSpanAffineOffset;
+        }))
+      return failure();
 
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
     for (const auto &ldsParams : ldsParamsVec) {
       if (triton::gpu::isPaddedEncoding(srcTy.getEncoding()) &&
           triton::gpu::getMinInterval(srcTy.getEncoding()) <
@@ -552,10 +571,23 @@ public:
       }
 
       SmallVector<Value> values;
-      auto result = lowerDsReadTr(
-          op, ldsParams, loc, cvtDstLL, logicalBitWidth, values, smemBases,
-          affineOffset, maskSpanAffineOffset, paddingShifts, llvmElemTy,
-          coordinateGroups, rewriter, targetInfo);
+      LogicalResult result = success();
+      for (int32_t slabOffset : slabOffsets) {
+        SmallVector<Value> bases = smemBases;
+        if (slabOffset != 0)
+          for (Value &base : bases)
+            base = b.gep(base.getType(), i8_ty, base,
+                         b.i32_val(applyPadding(slabOffset * bitWidth / 8,
+                                                paddingShifts)));
+        SmallVector<Value> slabValues;
+        result = lowerDsReadTr(op, ldsParams, loc, cvtDstLL, logicalBitWidth,
+                               slabValues, bases, affineOffset,
+                               maskSpanAffineOffset, paddingShifts, llvmElemTy,
+                               coordinateGroups, rewriter, targetInfo);
+        if (failed(result))
+          break;
+        llvm::append_range(values, slabValues);
+      }
       if (failed(result))
         continue;
 
@@ -629,7 +661,6 @@ struct LocalAtomicScatterRMWOpConversion
         rmwMask = b.true_val();
 
       Value old = emitter.emitAtomicRMW(rewriter, addr.ptr, value, rmwMask,
-                                        /*sharedMemBase=*/std::nullopt,
                                         /*enableIntraWaveReduce=*/false);
       if (returnOld)
         results.push_back(old);
@@ -2120,6 +2151,12 @@ public:
     auto aTy = cast<RankedTensorType>(op.getA().getType());
     auto bTy = cast<RankedTensorType>(op.getB().getType());
     auto accTy = cast<RankedTensorType>(op.getAcc().getType());
+    if (!aTy.getElementType().isInteger(8))
+      return rewriter.notifyMatchFailure(
+          op, "typed operands use the scaled-dot scheduled lowering");
+    bool packedScales = cast<RankedTensorType>(op.getAScale().getType())
+                            .getElementType()
+                            .isInteger(32);
     auto mfma = cast<triton::gpu::AMDMfmaEncodingAttr>(accTy.getEncoding());
     if (failed(verifyMfmaVersionMatchesTarget(op, mfma,
                                               targetInfo.getISAFamily())))
@@ -2168,6 +2205,11 @@ public:
     auto packScales = [&](Value value, RankedTensorType ty,
                           int64_t repNonK) -> FailureOr<SmallVector<Value>> {
       SmallVector<Value> elems = unpackTensorElements(loc, value, rewriter, ty);
+      if (packedScales) {
+        if (elems.size() != 1)
+          return failure();
+        return elems;
+      }
       if (elems.size() != static_cast<size_t>(repNonK * steps))
         return failure();
       SmallVector<Value> scales;
@@ -2231,13 +2273,18 @@ public:
         for (int64_t m = 0; m < repM; ++m) {
           Value operandA = (*maybeA)[m * steps + step];
           Value operandB = (*maybeB)[n * steps + step];
-          Value scaleA = (*maybeAScale)[m * steps + step];
-          Value scaleB = (*maybeBScale)[n * steps + step];
+          Value scaleA = (*maybeAScale)[packedScales ? 0 : m * steps + step];
+          Value scaleB = (*maybeBScale)[packedScales ? 0 : n * steps + step];
+          int32_t opSelA =
+              packedScales ? op.getAScaleSelectorAttr().getInt() + 2 * step : 0;
+          int32_t opSelB =
+              packedScales ? op.getBScaleSelectorAttr().getInt() + 2 * step : 0;
           int32_t cbsz = matrixFormatCode(op.getAFormat());
           int32_t blgp = matrixFormatCode(op.getBFormat());
           if (mfma.getIsTransposed()) {
             std::swap(operandA, operandB);
             std::swap(scaleA, scaleB);
+            std::swap(opSelA, opSelB);
             std::swap(cbsz, blgp);
           }
           OperationState loweredOp(loc, intrinsicName);
@@ -2254,8 +2301,8 @@ public:
                                  ROCDL::MatrixFormatAttr::get(
                                      rewriter.getContext(),
                                      static_cast<ROCDL::MatrixFormat>(blgp)));
-          loweredOp.addAttribute("opselA", rewriter.getI32IntegerAttr(0));
-          loweredOp.addAttribute("opselB", rewriter.getI32IntegerAttr(0));
+          loweredOp.addAttribute("opselA", rewriter.getI32IntegerAttr(opSelA));
+          loweredOp.addAttribute("opselB", rewriter.getI32IntegerAttr(opSelB));
           updated[m * repN + n] = rewriter.create(loweredOp)->getResult(0);
         }
       }
@@ -2293,7 +2340,7 @@ public:
   LogicalResult
   matchAndRewrite(triton::gpu::BarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (!mlir::triton::amdgpu::isCDNA(targetInfo.getISAFamily()))
+    if (op.isWarp() || !mlir::triton::amdgpu::isCDNA(targetInfo.getISAFamily()))
       return failure();
     // Check no other memory addrspaces are selected.
     // TensorRead/Write are allowed but noop.
@@ -2327,124 +2374,6 @@ public:
 
     rewriter.replaceOpWithNewOp<ROCDL::SBarrierOp>(op);
 
-    return success();
-  }
-
-private:
-  const AMD::TargetInfo &targetInfo;
-};
-
-/// Encodes the waitcnt value for AMDGPU architectures.
-///
-/// Note: This function duplicates the bitpacking logic from AMDGPU backend
-/// (llvm/lib/Target/AMDGPU/Utils/AMDGPUBaseInfo.h), as it's not accessible from
-/// llvm/include. The logic handles different encoding schemes across
-/// various GPU architecture versions (pre-gfx9 to gfx11).
-///
-/// The waitcnt encoding uses different bit positions for each counter
-/// based on the ISA version:
-/// - Vmcnt (vector memory counter): tracks pending vector memory operations
-/// - Expcnt (export counter): tracks pending export operations
-/// - Lgkmcnt (LDS/GDS/scalar memory counter): tracks pending LDS/GDS/scalar
-/// memory ops
-///
-/// Each architecture version has its own bit layout, Vmcnt, Expcnt and Lgkmcnt
-/// are decoded as follows:
-///     Vmcnt = Waitcnt[3:0]        (pre-gfx9)
-///     Vmcnt = Waitcnt[15:14,3:0]  (gfx9,10)
-///     Vmcnt = Waitcnt[15:10]      (gfx11)
-///     Expcnt = Waitcnt[6:4]       (pre-gfx11)
-///     Expcnt = Waitcnt[2:0]       (gfx11)
-///     Lgkmcnt = Waitcnt[11:8]     (pre-gfx10)
-///     Lgkmcnt = Waitcnt[13:8]     (gfx10)
-///     Lgkmcnt = Waitcnt[9:4]      (gfx11)
-static FailureOr<unsigned> encodeWaitcnt(llvm::AMDGPU::IsaVersion isaVersion,
-                                         unsigned vmcnt, unsigned lgkmcnt) {
-  if (isaVersion.Major == 9) {
-    vmcnt = std::min(63u, vmcnt);
-    unsigned expcnt = 0x7;
-    lgkmcnt = std::min(15u, lgkmcnt);
-    unsigned lowBits = vmcnt & 0xF;
-    unsigned highBits = (vmcnt >> 4) << 14;
-    unsigned otherCnts = (expcnt << 4) | (lgkmcnt << 8);
-    return lowBits | highBits | otherCnts;
-  }
-  if (isaVersion.Major == 10) {
-    vmcnt = std::min(63u, vmcnt);
-    unsigned expcnt = 0x7;
-    lgkmcnt = std::min(63u, lgkmcnt);
-    unsigned lowBits = vmcnt & 0xF;
-    unsigned highBits = (vmcnt >> 4) << 14;
-    unsigned otherCnts = (expcnt << 4) | (lgkmcnt << 8);
-    return lowBits | highBits | otherCnts;
-  }
-  if (isaVersion.Major == 11) {
-    vmcnt = std::min(63u, vmcnt);
-    unsigned expcnt = 0x7;
-    lgkmcnt = std::min(63u, lgkmcnt);
-    return (vmcnt << 10) | expcnt | (lgkmcnt << 4);
-  }
-  return failure();
-}
-
-struct MemoryCounterWaitOpConversion
-    : public ConvertOpToLLVMPattern<amdgpu::MemoryCounterWaitOp> {
-  MemoryCounterWaitOpConversion(const LLVMTypeConverter &converter,
-                                const AMD::TargetInfo &targetInfo,
-                                PatternBenefit benefit)
-      : ConvertOpToLLVMPattern(converter, benefit), targetInfo(targetInfo) {}
-
-  LogicalResult
-  matchAndRewrite(amdgpu::MemoryCounterWaitOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    // amdgpu::MemoryCounterWaitOp supports gfx9 onwards
-    auto isaVersion = targetInfo.getIsaVersion();
-
-    /// If major version >= gfx12, lower to
-    ///   * ROCDL::WaitDscntOp if ds is present
-    ///   * ROCDL::WaitLoadcntOp if load is present
-    ///   * ROCDL::WaitStorecntOp if store is present
-    if (isaVersion.Major >= 12) {
-      Location loc = op.getLoc();
-      if (std::optional<int> ds = adaptor.getDs())
-        ROCDL::WaitDscntOp::create(rewriter, loc, *ds);
-
-      if (std::optional<int> load = adaptor.getLoad())
-        ROCDL::WaitLoadcntOp::create(rewriter, loc, *load);
-
-      if (std::optional<int> store = adaptor.getStore())
-        ROCDL::WaitStorecntOp::create(rewriter, loc, *store);
-
-      rewriter.eraseOp(op);
-      return success();
-    }
-
-    /// Otherwise, lower to ROCDL::SWaitcntOp
-    auto getVal = [](Attribute attr) -> unsigned {
-      if (attr)
-        return cast<IntegerAttr>(attr).getInt();
-
-      // This value will be clamped to the maximum value for the target version.
-      return 1024;
-    };
-    unsigned ds = getVal(adaptor.getDsAttr());
-
-    unsigned vmcnt = 1024;
-    Attribute load = adaptor.getLoadAttr();
-    Attribute store = adaptor.getStoreAttr();
-    if (load && store) {
-      vmcnt = getVal(load) + getVal(store);
-    } else if (load) {
-      vmcnt = getVal(load);
-    } else if (store) {
-      vmcnt = getVal(store);
-    }
-
-    FailureOr<unsigned> waitcnt = encodeWaitcnt(isaVersion, vmcnt, ds);
-    if (failed(waitcnt))
-      return op.emitOpError("unsupported chipset");
-
-    rewriter.replaceOpWithNewOp<ROCDL::SWaitcntOp>(op, *waitcnt);
     return success();
   }
 
@@ -2553,6 +2482,124 @@ void mlir::triton::AMD::finalizeScheduledMfmaLowering(
       second.setAsmString("");
   }
 }
+
+/// Encodes the waitcnt value for AMDGPU architectures.
+///
+/// Note: This function duplicates the bitpacking logic from AMDGPU backend
+/// (llvm/lib/Target/AMDGPU/Utils/AMDGPUBaseInfo.h), as it's not accessible from
+/// llvm/include. The logic handles different encoding schemes across
+/// various GPU architecture versions (pre-gfx9 to gfx11).
+///
+/// The waitcnt encoding uses different bit positions for each counter
+/// based on the ISA version:
+/// - Vmcnt (vector memory counter): tracks pending vector memory operations
+/// - Expcnt (export counter): tracks pending export operations
+/// - Lgkmcnt (LDS/GDS/scalar memory counter): tracks pending LDS/GDS/scalar
+/// memory ops
+///
+/// Each architecture version has its own bit layout, Vmcnt, Expcnt and Lgkmcnt
+/// are decoded as follows:
+///     Vmcnt = Waitcnt[3:0]        (pre-gfx9)
+///     Vmcnt = Waitcnt[15:14,3:0]  (gfx9,10)
+///     Vmcnt = Waitcnt[15:10]      (gfx11)
+///     Expcnt = Waitcnt[6:4]       (pre-gfx11)
+///     Expcnt = Waitcnt[2:0]       (gfx11)
+///     Lgkmcnt = Waitcnt[11:8]     (pre-gfx10)
+///     Lgkmcnt = Waitcnt[13:8]     (gfx10)
+///     Lgkmcnt = Waitcnt[9:4]      (gfx11)
+static FailureOr<unsigned> encodeWaitcnt(llvm::AMDGPU::IsaVersion isaVersion,
+                                         unsigned vmcnt, unsigned lgkmcnt) {
+  if (isaVersion.Major == 9) {
+    vmcnt = std::min(63u, vmcnt);
+    unsigned expcnt = 0x7;
+    lgkmcnt = std::min(15u, lgkmcnt);
+    unsigned lowBits = vmcnt & 0xF;
+    unsigned highBits = (vmcnt >> 4) << 14;
+    unsigned otherCnts = (expcnt << 4) | (lgkmcnt << 8);
+    return lowBits | highBits | otherCnts;
+  }
+  if (isaVersion.Major == 10) {
+    vmcnt = std::min(63u, vmcnt);
+    unsigned expcnt = 0x7;
+    lgkmcnt = std::min(63u, lgkmcnt);
+    unsigned lowBits = vmcnt & 0xF;
+    unsigned highBits = (vmcnt >> 4) << 14;
+    unsigned otherCnts = (expcnt << 4) | (lgkmcnt << 8);
+    return lowBits | highBits | otherCnts;
+  }
+  if (isaVersion.Major == 11) {
+    vmcnt = std::min(63u, vmcnt);
+    unsigned expcnt = 0x7;
+    lgkmcnt = std::min(63u, lgkmcnt);
+    return (vmcnt << 10) | expcnt | (lgkmcnt << 4);
+  }
+  return failure();
+}
+
+struct MemoryCounterWaitOpConversion
+    : public ConvertOpToLLVMPattern<amdgpu::MemoryCounterWaitOp> {
+  MemoryCounterWaitOpConversion(const LLVMTypeConverter &converter,
+                                const AMD::TargetInfo &targetInfo,
+                                PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(converter, benefit), targetInfo(targetInfo) {}
+
+  LogicalResult
+  matchAndRewrite(amdgpu::MemoryCounterWaitOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // amdgpu::MemoryCounterWaitOp supports gfx9 onwards
+    auto isaVersion = llvm::AMDGPU::getIsaVersion(targetInfo.getArch());
+
+    /// If major version >= gfx12, lower to
+    ///   * ROCDL::WaitDscntOp if ds is present
+    ///   * ROCDL::WaitLoadcntOp if load is present
+    ///   * ROCDL::WaitStorecntOp if store is present
+    if (isaVersion.Major >= 12) {
+      Location loc = op.getLoc();
+      if (std::optional<int> ds = adaptor.getDs())
+        ROCDL::WaitDscntOp::create(rewriter, loc, *ds);
+
+      if (std::optional<int> load = adaptor.getLoad())
+        ROCDL::WaitLoadcntOp::create(rewriter, loc, *load);
+
+      if (std::optional<int> store = adaptor.getStore())
+        ROCDL::WaitStorecntOp::create(rewriter, loc, *store);
+
+      rewriter.eraseOp(op);
+      return success();
+    }
+
+    /// Otherwise, lower to ROCDL::SWaitcntOp
+    auto getVal = [](Attribute attr) -> unsigned {
+      if (attr)
+        return cast<IntegerAttr>(attr).getInt();
+
+      // This value will be clamped to the maximum value for the target version.
+      return 1024;
+    };
+    unsigned ds = getVal(adaptor.getDsAttr());
+
+    unsigned vmcnt = 1024;
+    Attribute load = adaptor.getLoadAttr();
+    Attribute store = adaptor.getStoreAttr();
+    if (load && store) {
+      vmcnt = getVal(load) + getVal(store);
+    } else if (load) {
+      vmcnt = getVal(load);
+    } else if (store) {
+      vmcnt = getVal(store);
+    }
+
+    FailureOr<unsigned> waitcnt = encodeWaitcnt(isaVersion, vmcnt, ds);
+    if (failed(waitcnt))
+      return op.emitOpError("unsupported chipset");
+
+    rewriter.replaceOpWithNewOp<ROCDL::SWaitcntOp>(op, *waitcnt);
+    return success();
+  }
+
+private:
+  const AMD::TargetInfo &targetInfo;
+};
 
 void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,

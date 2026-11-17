@@ -1,0 +1,117 @@
+from triton.tlx.ops.kernels.mm.gfx950 import (
+    _wg_kernel_register_mi16_wave_grid as _gfx950_register_mi16_wave_grid,
+    _wg_kernel_regular_mi16_wave_grid as _gfx950_regular_mi16_wave_grid,
+    _wg_kernel_regular_mi32_wave_grid as _gfx950_regular_mi32_wave_grid,
+)
+
+
+{{def_kernel("A", "B")}}
+    M: tl.constexpr = {{size("A", 0)}}
+    N: tl.constexpr = {{size("B", 1)}}
+    K: tl.constexpr = {{size("A", 1)}}
+    C = {{output_ptr()}}
+    stride_am: tl.constexpr = {{stride("A", 0)}}
+    stride_ak: tl.constexpr = {{stride("A", 1)}}
+    stride_bk: tl.constexpr = {{stride("B", 0)}}
+    stride_bn: tl.constexpr = {{stride("B", 1)}}
+
+{% if REGISTER_WAVE %}
+{% if TRANSPOSED %}
+    _gfx950_register_mi16_wave_grid(
+        B, A, C, C, N, M, K,
+        stride_bn, stride_bk, stride_ak, stride_am, 0, 0, 1, N,
+{% else %}
+    _gfx950_register_mi16_wave_grid(
+        A, B, C, C, M, N, K,
+        stride_am, stride_ak, stride_bk, stride_bn, 0, 0, N, 1,
+{% endif %}
+        MI_WAVE_TILE_M=MI_WAVE_TILE_M,
+        MI_WAVE_TILE_N=MI_WAVE_TILE_N,
+        WARPS_M=WARPS_M,
+        WARPS_N=WARPS_N,
+        PREFETCH_NEXT=PREFETCH_NEXT,
+        ADD_BIAS=False,
+    )
+{% elif MI32 %}
+{% if TRANSPOSED %}
+    _gfx950_regular_mi32_wave_grid(
+        B, A, C, C, N, M, K,
+        stride_bn, stride_bk, stride_ak, stride_am, 0, 0, 1, N,
+{% else %}
+    _gfx950_regular_mi32_wave_grid(
+        A, B, C, C, M, N, K,
+        stride_am, stride_ak, stride_bk, stride_bn, 0, 0, N, 1,
+{% endif %}
+        MI_WAVE_TILE_M=MI_WAVE_TILE_M,
+        MI_WAVE_TILE_N=MI_WAVE_TILE_N,
+        WARPS_M=WARPS_M,
+        WARPS_N=WARPS_N,
+        DIRECT_TO_LDS=DIRECT_TO_LDS,
+        DIRECT_CHUNK=DIRECT_CHUNK,
+        ADD_BIAS=False,
+    )
+{% else %}
+{% if TRANSPOSED %}
+    _gfx950_regular_mi16_wave_grid(
+        B,
+        A,
+        C,
+        C,
+        N,
+        M,
+        K,
+        stride_bn,
+        stride_bk,
+        stride_ak,
+        stride_am,
+        0,
+        0,
+        1,
+        N,
+{% else %}
+    _gfx950_regular_mi16_wave_grid(
+        A,
+        B,
+        C,
+        C,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        0,
+        0,
+        N,
+        1,
+{% endif %}
+        MI_WAVE_TILE_M=MI_WAVE_TILE_M,
+        MI_WAVE_TILE_N=MI_WAVE_TILE_N,
+        WARPS_M=WARPS_M,
+        WARPS_N=WARPS_N,
+        BLOCK_K=BLOCK_K,
+        LOCAL_STAGES=LOCAL_STAGES,
+        TILES_PER_PROGRAM=TILES_PER_PROGRAM,
+        LINEAR_TILES=LINEAR_TILES,
+        PGR2_OPERANDS=PGR2_OPERANDS,
+        DIRECT_TO_LDS=DIRECT_TO_LDS,
+        REFILL_READ_WINDOW=REFILL_READ_WINDOW,
+        PGR2_LATE_READ_COUNT=PGR2_LATE_READ_COUNT,
+        READ_COVER_SIXTEENTHS=READ_COVER_SIXTEENTHS,
+        DIRECT_CHUNK=DIRECT_CHUNK,
+        PACK_DIRECT_CHUNKS=PACK_DIRECT_CHUNKS,
+        ROW_MAJOR_B_LDS=ROW_MAJOR_B_LDS,
+        ROW_WISE_EPILOGUE=ROW_WISE_EPILOGUE,
+        WIDE_EPILOGUE=WIDE_EPILOGUE,
+        NUM_XCDS=NUM_XCDS,
+        WORKGROUP_MAPPING=WORKGROUP_MAPPING,
+        LOOP_UNROLL_FACTOR=LOOP_UNROLL_FACTOR,
+        SPLIT_K=1,
+        PAIR_BALANCED_SPLIT_K=False,
+        ADD_BIAS=False,
+        XCD_GROUP_SIZE=XCD_GROUP_SIZE,
+        EXACT_LDS=EXACT_LDS,
+        DOT_MODE=DOT_MODE,
+    )
+{% endif %}

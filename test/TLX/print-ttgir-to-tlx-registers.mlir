@@ -111,3 +111,25 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// An empty actualRegisters carries no counts, so the concrete request prints.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: def empty_actual_registers(
+  // CHECK: with tlx.async_task("default"):
+  // CHECK: with tlx.async_task(num_warps=4, registers=48):
+  tt.func public @empty_actual_registers() attributes {noinline = false} {
+    ttg.warp_specialize() attributes {actualRegisters = array<i32>, requestedRegisters = array<i32: 48>}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      %cst = arith.constant dense<1.000000e+00> : tensor<128xf32, #blocked>
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}

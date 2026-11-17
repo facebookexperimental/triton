@@ -31,6 +31,10 @@ case "${TORCHTLX_ARCH:-all}" in
     )
     PERF_FILTER="mm_torchtlx or addmm_torchtlx or bmm_torchtlx"
     ;;
+  gfx1250)
+    ARCH_TESTS=(python/test/unit/tlx_ops/test_torchtlx_flex_attention_gfx1250.py)
+    PERF_FILTER=torchtlx_flex_attention
+    ;;
   all)
     ARCH_TESTS=(
       python/test/unit/tlx_ops/test_torchtlx_mm_sm100.py
@@ -38,11 +42,12 @@ case "${TORCHTLX_ARCH:-all}" in
       python/test/unit/tlx_ops/test_torchtlx_mm_gfx950.py
       python/test/unit/tlx_ops/test_torchtlx_addmm_gfx950.py
       python/test/unit/tlx_ops/test_torchtlx_bmm_gfx950.py
+      python/test/unit/tlx_ops/test_torchtlx_flex_attention_gfx1250.py
     )
     PERF_FILTER=torchtlx
     ;;
   *)
-    echo "[torchtlx] unsupported TORCHTLX_ARCH=${TORCHTLX_ARCH}; expected sm100 or gfx950" >&2
+    echo "[torchtlx] unsupported TORCHTLX_ARCH=${TORCHTLX_ARCH}; expected sm100, gfx950, gfx1250, or all" >&2
     exit 2
     ;;
 esac

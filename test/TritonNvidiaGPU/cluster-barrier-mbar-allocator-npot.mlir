@@ -1,6 +1,6 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s --triton-nvidia-gpu-cluster-barrier-mbar-allocator | FileCheck %s
 
-// A Product convert stays within one CTA, so a partition needs no cluster
+// A mixed-radix convert stays within one CTA, so a partition needs no cluster
 // barrier for it, whether it moves registers or crosses warps.
 #src = #ttg.linear<{register = [[128]], lane = [[1], [2], [4], [8], [16]], warp = [[32], [64]], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [384]}>
 #dst = #ttg.linear<{register = [[128]], lane = [[1], [2], [4], [8], [16]], warp = [[64], [32]], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [384]}>
@@ -8,8 +8,8 @@
 #rdst = #ttg.linear<{register = [[256], [1]], lane = [[2], [4], [8], [16], [32]], warp = [[64], [128]], block = [], inputRadices = {register = [3, 2], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [768]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-NOT: ttg.ws_cluster_barrier_count
-  // CHECK-LABEL: @product_converts_in_partition
-  tt.func @product_converts_in_partition(%p: !tt.ptr<i32>) {
+  // CHECK-LABEL: @mixed_radix_converts_in_partition
+  tt.func @mixed_radix_converts_in_partition(%p: !tt.ptr<i32>) {
     ttg.warp_specialize()
     default {
       %r = tt.make_range {end = 384 : i32, start = 0 : i32} : tensor<384xi32, #src>

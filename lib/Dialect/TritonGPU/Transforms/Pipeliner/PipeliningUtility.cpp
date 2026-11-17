@@ -379,6 +379,11 @@ int mlir::triton::getCopyVecBytes(RankedTensorType registerTy,
   // FIXME: Here we should pass a MemDescType instead of a SharedEncodingTrait!!
   // This is currently broken for memdesc_subslice!
   auto sharedLayout = triton::gpu::toLinearLayout(shape, sharedEnc);
+  // A mixed-radix layout doesn't compose with the shared layout: copy by runs.
+  if (!regLayout.isRadix2())
+    return ttg::getMixedRadixSharedRun(regLayout, sharedLayout.pseudoinvert(),
+                                       registerTy.getElementTypeBitWidth()) *
+           registerTy.getElementTypeBitWidth() / 8;
   auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
   const int vecElems = regToSharedLayout.getNumConsecutiveInOut();
   return vecElems * registerTy.getElementTypeBitWidth() / 8;
@@ -411,9 +416,20 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
   return width >= 32;
 }
 
-bool mlir::triton::hasRadix2Layout(tt::LoadOp load) {
+bool mlir::triton::canPipelineInSharedMemory(tt::LoadOp load) {
   auto ty = dyn_cast<RankedTensorType>(load.getType());
-  return !ty || ttg::toLinearLayout(ty).isRadix2();
+  if (!ty)
+    return true;
+  LinearLayout layout = ttg::toLinearLayout(ty);
+  if (layout.isRadix2())
+    return true;
+  Type type = ty;
+  for (StringRef name : {ttg::AsyncCopyGlobalToLocalOp::getOperationName(),
+                         ttg::LocalLoadOp::getOperationName()})
+    if (ttg::getNpotLayoutUnsupportedReason(
+            OperationName(name, load.getContext()), type))
+      return false;
+  return !getNpotAsyncCopyUnsupportedReason(load, layout);
 }
 
 void mlir::triton::serializeLatencies(ModuleOp module,
@@ -439,10 +455,10 @@ DenseMap<Operation *, int> mlir::triton::deserializeLatencies(Operation *op) {
   auto latencyHelper = TritonDialect::getLoaded(op)->getLatencyAttrHelper();
   op->walk([&](Operation *op) {
     if (auto attr = latencyHelper.getAttr(op)) {
-      // An NPOT Product load is not yet supported in shared memory: drop its
-      // latency so it stays unpipelined.
+      // A load whose shared-memory ops can't lower its layout stays
+      // unpipelined.
       auto load = dyn_cast<tt::LoadOp>(op);
-      if (!load || hasRadix2Layout(load))
+      if (!load || canPipelineInSharedMemory(load))
         opLatency[op] = attr.getInt();
       latencyHelper.removeAttr(op);
     }
@@ -538,7 +554,7 @@ void mlir::triton::combineRedundantWaitOps(
         createWait) {
   llvm::MapVector<Operation *, Operation *> toDelete;
   for (Operation *waitOp : waitOps) {
-    if (toDelete.count(waitOp))
+    if (toDelete.contains(waitOp))
       continue;
     StringRef waitName = waitOp->getName().getStringRef();
     auto getNum = [](Operation *op) {
@@ -892,7 +908,8 @@ static Operation *getUseOfPipelinedOp(
     topLevelUsers.insert(users.begin(), users.end());
   }
   for (Operation *topLevelUser : topLevelUsers) {
-    assert(schedule.count(topLevelUser) && "op user not found in the schedule");
+    assert(schedule.contains(topLevelUser) &&
+           "op user not found in the schedule");
     if (!selectedUser || shouldPrefer(topLevelUser, selectedUser)) {
       selectedUser = topLevelUser;
     }

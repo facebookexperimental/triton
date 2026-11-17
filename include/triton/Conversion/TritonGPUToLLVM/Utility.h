@@ -52,6 +52,8 @@ createLLVMIntrinsicCallOp(OpBuilder &builder, Location loc, StringRef intrinsic,
 
 namespace mlir::triton {
 
+class ModuleAxisInfoAnalysis;
+
 // The address of the descriptor's logical origin in its memory space.
 Value getMemDescAddress(RewriterBase &rewriter, Location loc,
                         const LLVMTypeConverter *typeConverter,
@@ -359,7 +361,7 @@ constexpr int kGlobalScratchBufferOffset = -2;
 constexpr int kSharedMemoryOffset = -3;
 
 // Defined in triton/Analysis/Utility.h.
-struct ProductSharedTiling;
+struct MixedRadixSharedTiling;
 
 namespace triton {
 
@@ -387,17 +389,26 @@ Value emitRedundantThreadPredicate(
     const TargetInfoBase &targetInfo);
 
 // True iff every free-variable digit of `indices` is 0 (mixed radix), so each
-// output of `layout` has one canonical owner.
+// output of `layout` is held by one thread.
 Value emitCanonicalLayoutOwnerPredicate(
     Location loc, RewriterBase &rewriter, const LinearLayout &layout,
     ArrayRef<std::pair<StringAttr, Value>> indices,
     const llvm::MapVector<StringAttr, int32_t> &freeVariableMasks);
 
-// Moves Product `inVals` from `srcLayout` to `dstLayout` through scratch at
-// `smemBase`: each element is stored once, by its canonical owner, then every
-// destination register loads its element. Runs of registers are vectorized.
-// A `tiling` repeats this per tile in one tile of scratch.
-SmallVector<Value> transferProductThroughSharedMemory(
+// Calls `access` per `run` registers of a mixed-radix `regLayout` with the
+// first register, its offset through `toOffset` (the shared layout's
+// pseudoinverse) and the hardware indices that reach it.
+void forEachMixedRadixSharedRun(
+    Location loc, RewriterBase &rewriter, const LinearLayout &regLayout,
+    const LinearLayout &toOffset, int32_t run,
+    function_ref<void(int32_t, Value, ArrayRef<std::pair<StringAttr, Value>>)>
+        access);
+
+// Moves mixed-radix `inVals` from `srcLayout` to `dstLayout` via scratch at
+// `smemBase`: its thread stores each element once, then each destination
+// register loads it, in vector runs. A `tiling` reuses one scratch tile;
+// `transferTile`, if set, moves each tile in place of that transfer.
+SmallVector<Value> transferMixedRadixThroughSharedMemory(
     Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
     const LinearLayout &srcLayout, const LinearLayout &dstLayout,
     ArrayRef<Value> inVals, Type elemTy, Value smemBase,
@@ -405,7 +416,18 @@ SmallVector<Value> transferProductThroughSharedMemory(
     bool blockScope,
     std::optional<std::pair<Value, Value>> distributedCoordinates =
         std::nullopt,
-    const ProductSharedTiling *tiling = nullptr);
+    const MixedRadixSharedTiling *tiling = nullptr,
+    function_ref<SmallVector<Value>(const LinearLayout &, const LinearLayout &,
+                                    ArrayRef<Value>)>
+        transferTile = nullptr);
+
+// Splits `layout` at the non-binary digits that follow the binary ones of
+// `inDim`: layout(x + w * o) == sub(x) + slabs[o] for x < w, the radix-2 size
+// of `inDim`. Returns sub; fails if any other input digit is non-binary or a
+// table is not in odd-part form.
+FailureOr<LinearLayout>
+splitOddOuterDigits(const LinearLayout &layout, StringAttr inDim,
+                    SmallVectorImpl<SmallVector<int32_t>> &slabs);
 
 // Takes two values that may be boolean, or null to represent constant True.
 Value maybeAnd(OpBuilder &builder, Location loc, Value a, Value b);
@@ -819,6 +841,12 @@ Value packLLVector(Location loc, ValueRange vals, RewriterBase &rewriter);
 std::optional<LLVM::AtomicBinOp> matchAtomicOp(RMWOp atomicOp);
 
 std::optional<LLVM::AtomicOrdering> getMemoryOrdering(MemSemantic memOrdering);
+
+/// Choose a legal atomic load/store width using pointer alignment/contiguity
+/// and mask constancy.
+unsigned getAtomicLoadStoreVectorSize(Value ptr, Value mask,
+                                      ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                                      const TargetInfoBase &targetInfo);
 
 /// Emit `bodyBuilder` inline when `pred` is null. Otherwise, emit it only when
 /// `pred` is true and merge its results with `falseValues` in a continuation

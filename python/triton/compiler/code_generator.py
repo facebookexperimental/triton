@@ -1257,18 +1257,25 @@ class CodeGenerator(ast.NodeVisitor):
         pass
 
     def visit_Compare(self, node):
-        if not (len(node.comparators) == 1 and len(node.ops) == 1):
-            raise self._unsupported(node, "simultaneous multiple comparison is not supported")
-        lhs = self.visit(node.left)
-        rhs = self.visit(node.comparators[0])
-        lhs_value = _unwrap_if_constexpr(lhs)
-        rhs_value = _unwrap_if_constexpr(rhs)
-        if type(node.ops[0]) is ast.Is:
-            return constexpr(lhs_value is rhs_value)
-        if type(node.ops[0]) is ast.IsNot:
-            return constexpr(lhs_value is not rhs_value)
-        operator = self._get_operator(node, node.ops[0], "comparison")
-        return self._apply_binary_method(node, operator, lhs, rhs)
+
+        def comparisons():
+            lhs = self.visit(node.left)
+            for op, comparator in zip(node.ops, node.comparators):
+                rhs = self.visit(comparator)
+                if isinstance(op, ast.Is):
+                    yield constexpr(_unwrap_if_constexpr(lhs) is _unwrap_if_constexpr(rhs))
+                elif isinstance(op, ast.IsNot):
+                    yield constexpr(_unwrap_if_constexpr(lhs) is not _unwrap_if_constexpr(rhs))
+                else:
+                    operator = self._get_operator(node, op, "comparison")
+                    yield self._apply_binary_method(node, operator, lhs, rhs)
+                # Reuse the middle operand without evaluating its side effects again.
+                lhs = rhs
+
+        values = comparisons()
+        if len(node.ops) == 1:
+            return next(values)
+        return self._apply_boolean_values(node, self._operators[ast.And], values)
 
     def visit_UnaryOp(self, node):
         operand = self.visit(node.operand)
@@ -1719,7 +1726,7 @@ class CodeGenerator(ast.NodeVisitor):
     def visit_Call(self, node):
         fn = _unwrap_if_constexpr(self.visit(node.func))
         if not isinstance(fn, BoundJITMethod):
-            static_implementation = self.statically_implemented_functions.get(fn)
+            static_implementation = self._get_static_implementation(fn)
             if static_implementation is not None:
                 return static_implementation(self, node)
 
@@ -1744,14 +1751,15 @@ class CodeGenerator(ast.NodeVisitor):
 
     def visit_BoolOp(self, node: ast.BoolOp):
         operator = self._get_operator(node, node.op, "boolean")
-        method_name = operator[0]
+        values = (self.visit(subnode) for subnode in node.values)
+        return self._apply_boolean_values(node, operator, values, warn_non_scalar=True)
 
+    def _apply_boolean_values(self, node, operator, values, warn_non_scalar=False):
+        method_name = operator[0]
         nontrivial_values = []
 
-        for subnode in node.values:
-            # we visit the values in order, executing their side-effects
-            # and possibly early-exiting:
-            value = self.visit(subnode)
+        # Consume values lazily so compile-time short-circuiting skips side effects.
+        for value in values:
             if not _is_dynamic_boolean_operand(value):
                 # this is a constexpr, so we might be able to short-circuit:
                 bv = bool(value)
@@ -1764,7 +1772,7 @@ class CodeGenerator(ast.NodeVisitor):
                 # otherwise, our constexpr has no effect on the output of the
                 # expression so we do not append it to nontrivial_values.
             else:
-                if _is_triton_tensor(value) and value.type.is_block():
+                if warn_non_scalar and _is_triton_tensor(value) and value.type.is_block():
                     lineno = getattr(node, "lineno", None)
                     if lineno is not None:
                         lineno += self.begin_line
@@ -1913,15 +1921,29 @@ class CodeGenerator(ast.NodeVisitor):
 
         return ret
 
-    from ..experimental.gluon import language as ttgl
-
     statically_implemented_functions: Dict[object, Callable[[ast.Call], Any]] = {
         language.core.static_assert: execute_static_assert,
         language.core.static_print: static_executor(print),
-        ttgl.static_assert: execute_static_assert,
-        ttgl.static_print: static_executor(print),
         int: static_executor(int),
         len: static_executor(len),
+    }
+
+    def _get_static_implementation(self, fn):
+        impl = self.statically_implemented_functions.get(fn)
+        # Only Gluon kernels look up Gluon builtins, so plain Triton compiles
+        # never import Gluon.
+        if impl is None and self.is_gluon:
+            impl = _gluon_static_implementations().get(fn)
+        return impl
+
+
+@functools.cache
+def _gluon_static_implementations() -> Dict[object, Callable[[ast.Call], Any]]:
+    from ..experimental.gluon import language as ttgl
+
+    return {
+        ttgl.static_assert: CodeGenerator.execute_static_assert,
+        ttgl.static_print: CodeGenerator.static_executor(print),
     }
 
 

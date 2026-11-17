@@ -5,6 +5,58 @@ from .utility import cuda_parse_arch
 
 
 @tl.builtin
+def amd_packed_dot2(lhs, rhs, acc, input_dtype: tl.constexpr, _semantic=None):
+    """Compute one FP32 dot product from each pair of packed FP16 or BF16 inputs.
+
+    Every ``uint32`` element of ``lhs`` and ``rhs`` contains two values
+    of ``input_dtype``, which must be ``tl.float16`` or ``tl.bfloat16``.
+    The result is ``lhs[0] * rhs[0] + lhs[1] * rhs[1] + acc`` in FP32.
+    Inputs, accumulator, and result have the same tensor shape and layout.
+
+    This emits the matching LLVM AMDGPU fdot2 intrinsic rather than inline
+    assembly, so the backend retains the DOT dependency and hazard semantics.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_packed_dot2 is only supported on AMD (HIP) backends")
+    arch = _semantic.builder.options.arch.split(":", 1)[0]
+    assert arch == "gfx950", f"tlx.amd_packed_dot2 currently requires gfx950, got arch={arch}"
+    input_dtype = tl._unwrap_if_constexpr(input_dtype)
+    assert input_dtype in (tl.float16, tl.bfloat16), f"input_dtype must be tl.float16 or tl.bfloat16, got {input_dtype}"
+    for name, value in (("lhs", lhs), ("rhs", rhs), ("acc", acc)):
+        assert isinstance(value, tl.tensor) and value.type.is_block(), f"{name} must be a distributed tensor"
+    assert lhs.dtype == tl.uint32 and rhs.dtype == tl.uint32, "lhs and rhs must contain packed input pairs as uint32"
+    assert acc.dtype == tl.float32, "acc must be an FP32 tensor"
+    assert lhs.shape == rhs.shape == acc.shape, "lhs, rhs, and acc must have the same shape"
+    handle = _semantic.builder.create_amd_packed_dot2(lhs.handle, rhs.handle, acc.handle,
+                                                      input_dtype.to_ir(_semantic.builder))
+    return tl.tensor(handle, tl.block_type(tl.float32, lhs.shape))
+
+
+@tl.builtin
+def amd_concat(sources, shape, _semantic=None):
+    """Concatenate register fragments without cross-thread movement."""
+    sources = tuple(sources)
+    assert sources, "sources must not be empty"
+    assert all(isinstance(source, tl.tensor) for source in sources), "every source must be a tensor"
+    shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
+    source_shape = [tl._unwrap_if_constexpr(dim) for dim in sources[0].shape]
+    assert len(shape) == len(source_shape), f"shape must have rank {len(source_shape)}, got {len(shape)}"
+    assert all(isinstance(dim, int) and dim > 0 for dim in shape), "shape must contain positive constexpr integers"
+    assert all(
+        list(source.shape) == list(sources[0].shape) and source.dtype == sources[0].dtype
+        for source in sources[1:]), "sources must have identical shapes and dtypes"
+    source_elements = 1
+    result_elements = 1
+    for source_dim, result_dim in zip(source_shape, shape):
+        assert result_dim % source_dim == 0, "every result dimension must be a multiple of the source dimension"
+        source_elements *= source_dim
+        result_elements *= result_dim
+    assert result_elements == len(sources) * source_elements, "result shape must contain every source exactly once"
+    handle = _semantic.builder.create_amd_concat([source.handle for source in sources], shape)
+    return tl.tensor(handle, tl.block_type(sources[0].dtype, shape))
+
+
+@tl.builtin
 def extract_slice(source, shape, offsets, _semantic=None):
     """Extract an aligned register slice without cross-thread movement.
 
@@ -339,30 +391,55 @@ def amd_scheduled_mfma_scaled(
     b_scale,
     a_format: tl.constexpr,
     b_format: tl.constexpr,
+    accumulator_role: tl.constexpr = "transient",
+    accumulator_register_class: tl.constexpr = None,
     initialize: tl.constexpr = False,
+    a_scale_selector: tl.constexpr = None,
+    b_scale_selector: tl.constexpr = None,
     _semantic=None,
 ):
-    """Update native CDNA4 scaled-MFMA fragments from packed FP6 operands.
+    """Update native CDNA4 scaled-MFMA fragments.
 
-    Scaled twin of :func:`amd_scheduled_mfma` for microscaling formats: ``a`` and ``b`` are
-    i8 tensors with logical-value shapes (per lane, the first 24 of every
-    32 K-ordered values are dense-packed code bytes (32/24/16 per step for FP8/FP6/FP4) and the rest zero
-    padding) in opIdx 0/1 dot-operand layouts with ``kWidth`` 8 under an
-    ``amd_mfma_layout`` with instruction shape 16x16x128 or 32x32x64, and
-    ``a_scale``/``b_scale`` are i8 E8M0 tensors of shape [M, logicalK/32] and
-    [N, logicalK/32] in MFMA scale layout order. ``a_format``/``b_format`` are
-    ``"e2m3"`` or ``"e3m2"``. Lowers to native ``v_mfma_scale_f32_*_f8f6f4``
-    ROCDL intrinsics in K-major, N-major, M-minor order with one SSA chain
-    per output fragment. Transient only: use :func:`amd_mfma_commit` for
-    explicit completion boundaries, as with ``amd_scheduled_mfma``.
+    Scaled twin of :func:`amd_scheduled_mfma` for microscaling formats. ``a``
+    and ``b`` may be typed FP8 tensors in matching opIdx 0/1 dot-operand
+    layouts with ``kWidth`` 16, or i8 tensors with logical-value shapes (per
+    lane, the first 24 of every 32 K-ordered values are dense-packed code bytes
+    (32/24/16 per step for FP8/FP6/FP4) and the rest zero padding) in opIdx 0/1
+    dot-operand layouts with ``kWidth`` 8 under an ``amd_mfma_layout`` with
+    instruction shape 16x16x128 or 32x32x64, and
+    ``a_scale``/``b_scale`` are either i8 E8M0 tensors in MFMA scale-layout
+    order or packed i32 words with explicit byte selectors. Typed FP8 operands
+    support transient or persistent accumulator chains and explicit AGPR or
+    VGPR placement. Lowers to native ``v_mfma_scale_f32_*_f8f6f4`` ROCDL
+    intrinsics in K-major, N-major, M-minor order with one SSA chain per output
+    fragment.
     """
     a_format = tl._unwrap_if_constexpr(a_format)
     b_format = tl._unwrap_if_constexpr(b_format)
     initialize = tl._unwrap_if_constexpr(initialize)
+    accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
+    accumulator_register_class = tl._unwrap_if_constexpr(accumulator_register_class)
+    a_scale_selector = tl._unwrap_if_constexpr(a_scale_selector)
+    b_scale_selector = tl._unwrap_if_constexpr(b_scale_selector)
     _formats = ("e4m3", "e5m2", "e2m3", "e3m2", "e2m1")
     assert a_format in _formats, f"a_format must be one of {_formats}, got {a_format!r}"
     assert b_format in _formats, f"b_format must be one of {_formats}, got {b_format!r}"
     assert isinstance(initialize, bool), "initialize must be a constexpr bool"
+    assert accumulator_role in ("transient", "persistent"), \
+        'accumulator_role must be "transient" or "persistent"'
+    assert accumulator_register_class in (None, "agpr", "vgpr"), \
+        'accumulator_register_class must be None, "agpr", or "vgpr"'
+    packed_scales = a_scale.dtype in (tl.int32, tl.uint32)
+    assert packed_scales == (b_scale.dtype in (tl.int32, tl.uint32)), \
+        "scale operands must use matching packing"
+    if packed_scales:
+        selectors = (a_scale_selector, b_scale_selector)
+        assert all(isinstance(selector, int) and not isinstance(selector, bool)
+                   and 0 <= selector <= 3 for selector in selectors), \
+            "packed i32 scales require selectors in [0, 3]"
+    else:
+        assert a_scale_selector is None and b_scale_selector is None, \
+            "i8 scales do not accept packed byte selectors"
     handle = _semantic.builder.create_amd_scheduled_mfma_scaled(
         a.handle,
         b.handle,
@@ -372,9 +449,11 @@ def amd_scheduled_mfma_scaled(
         a_format,
         b_format,
         "none",
-        "transient",
-        "auto",
+        accumulator_role,
+        "auto" if accumulator_register_class is None else accumulator_register_class,
         initialize,
+        -1 if a_scale_selector is None else a_scale_selector,
+        -1 if b_scale_selector is None else b_scale_selector,
     )
     return tl.tensor(handle, acc.type)
 
@@ -910,16 +989,26 @@ def async_dot_scaled(
 @tl.builtin
 def async_dot_wait(
     pendings: tl.constexpr,
-    inp: tl.tensor,
+    inp,
     _semantic=None,
-) -> tl.tensor:
+):
     """
     Wait for completion of prior asynchronous dot operations.
     Each input must be the tensors corresponding to the async dot ops that we're
-    waiting on.
+    waiting on. A tuple of inputs is waited on together and returns a tuple; it
+    may include the shared-memory operands the dots read, which stay live until
+    the wait.
     """
     pendings = tl._unwrap_if_constexpr(pendings)
-    return tl.tensor(_semantic.builder.create_warp_group_dot_wait([inp.handle], pendings)[0], inp.type)
+    inputs = list(inp.values) if isinstance(inp, tl.tuple) else [inp]
+    handles = _semantic.builder.create_warp_group_dot_wait([x.handle for x in inputs], pendings)
+    outputs = []
+    for x, handle in zip(inputs, handles):
+        if isinstance(x, tlx.buffered_tensor):
+            outputs.append(tlx.buffered_tensor(handle, x.dtype, x.shape, x.type.num, x.type.storage, x.type.layout))
+        else:
+            outputs.append(tl.tensor(handle, x.type))
+    return tl.tuple(outputs) if isinstance(inp, tl.tuple) else outputs[0]
 
 
 @tl.builtin

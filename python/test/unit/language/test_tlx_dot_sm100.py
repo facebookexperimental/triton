@@ -2223,13 +2223,14 @@ class TestToMxfp8:
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-@pytest.mark.parametrize("disable_nv_fence_insertion", [False, True])
-def test_async_dot_disable_nv_fence_insertion(device, disable_nv_fence_insertion):
-    """The disable_nv_fence_insertion option drops FenceInsertion's consumer-side fence before the MMA and keeps the
-    kernel's own producer-side fence."""
+@pytest.mark.parametrize("kernel_fence, disable_nv_fence_insertion", [(True, False), (True, True), (False, False)])
+def test_async_dot_disable_nv_fence_insertion(device, kernel_fence, disable_nv_fence_insertion):
+    """FenceInsertion adds a fence before the MMA only when the kernel did not fence its shared-memory writes itself;
+    with disable_nv_fence_insertion it never adds one."""
 
     @triton.jit
-    def kernel(a_ptr, b_ptr, c_ptr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    def kernel(a_ptr, b_ptr, c_ptr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+               KERNEL_FENCE: tl.constexpr):
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
@@ -2237,8 +2238,9 @@ def test_async_dot_disable_nv_fence_insertion(device, disable_nv_fence_insertion
         b_smem = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, 1)[0]
         tlx.local_store(a_smem, tl.load(a_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :]))
         tlx.local_store(b_smem, tl.load(b_ptr + offs_k[:, None] * BLOCK_N + offs_n[None, :]))
-        tlx.fence_async_shared()
-        # A memory op between the kernel's fence and the MMA, so the compiler's fence is not a duplicate.
+        if KERNEL_FENCE:
+            tlx.fence_async_shared()
+        # A memory op between the kernel's fence and the MMA, so duplicate-fence elision cannot drop the compiler's.
         acc_tmem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, 1, tlx.storage_kind.tmem)[0]
         tlx.local_store(acc_tmem, tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32))
         tlx.async_dot(a_smem, b_smem, acc_tmem, mBarriers=[], out_dtype=tl.float32)
@@ -2250,8 +2252,50 @@ def test_async_dot_disable_nv_fence_insertion(device, disable_nv_fence_insertion
     a = torch.randn((M, K), device=device, dtype=torch.float16)
     b = torch.randn((K, N), device=device, dtype=torch.float16)
     c = torch.zeros((M, N), device=device, dtype=torch.float16)
-    compiled = kernel[(1, )](a, b, c, BLOCK_M=M, BLOCK_N=N, BLOCK_K=K,
+    compiled = kernel[(1, )](a, b, c, BLOCK_M=M, BLOCK_N=N, BLOCK_K=K, KERNEL_FENCE=kernel_fence,
                              disable_nv_fence_insertion=disable_nv_fence_insertion)
 
-    assert compiled.asm["ttgir"].count("ttng.fence_async_shared") == (1 if disable_nv_fence_insertion else 2)
+    assert compiled.asm["ttgir"].count("ttng.fence_async_shared") == 1
+    torch.testing.assert_close(c, torch.matmul(a, b))
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("kernel_fence", [True, False])
+def test_async_dot_ws_producer_fence(device, kernel_fence):
+    """A producer partition that fences its shared-memory writes before the mbarrier arrive needs no compiler fence
+    before the MMA in the consumer partition; without that fence the compiler adds one."""
+
+    @triton.jit
+    def kernel(a_ptr, b_ptr, c_ptr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+               KERNEL_FENCE: tl.constexpr):
+        a_smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, 1)[0]
+        b_smem = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, 1)[0]
+        acc_tmem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, 1, tlx.storage_kind.tmem)[0]
+        ab_full = tlx.alloc_barriers(num_barriers=tl.constexpr(1))[0]
+        acc_full = tlx.alloc_barriers(num_barriers=tl.constexpr(1))[0]
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                offs_m = tl.arange(0, BLOCK_M)
+                offs_n = tl.arange(0, BLOCK_N)
+                offs_k = tl.arange(0, BLOCK_K)
+                tlx.local_store(a_smem, tl.load(a_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :]))
+                tlx.local_store(b_smem, tl.load(b_ptr + offs_k[:, None] * BLOCK_N + offs_n[None, :]))
+                if KERNEL_FENCE:
+                    tlx.fence_async_shared()
+                tlx.barrier_arrive(ab_full)
+                tlx.barrier_wait(acc_full, tl.constexpr(0))
+                c = tlx.local_load(acc_tmem).to(tl.float16)
+                tl.store(c_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :], c)
+            with tlx.async_task(num_warps=1):
+                tlx.barrier_wait(ab_full, tl.constexpr(0))
+                tlx.async_dot(a_smem, b_smem, acc_tmem, use_acc=False, mBarriers=[acc_full], out_dtype=tl.float32)
+
+    torch.manual_seed(0)
+    M, N, K = 128, 64, 32
+    a = torch.randn((M, K), device=device, dtype=torch.float16)
+    b = torch.randn((K, N), device=device, dtype=torch.float16)
+    c = torch.zeros((M, N), device=device, dtype=torch.float16)
+    compiled = kernel[(1, )](a, b, c, BLOCK_M=M, BLOCK_N=N, BLOCK_K=K, KERNEL_FENCE=kernel_fence)
+
+    assert compiled.asm["ttgir"].count("ttng.fence_async_shared") == 1
     torch.testing.assert_close(c, torch.matmul(a, b))
