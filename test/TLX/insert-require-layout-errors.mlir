@@ -15,7 +15,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 4 
       %offsets: tensor<128x16xi32, #blocked_incompatible> {tt.contiguity = dense<[1, 16]> : tensor<2xi32>, tt.divisibility = dense<[1, 16]> : tensor<2xi32>}) {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<128x16xbf16, #user_incompatible, #smem_incompatible, mutable>
     // expected-error @+1 {{the inferred offset layout cannot write directly to the destination}}
-    %tok = amdg.buffer_load_to_local %ptr[%offsets] into %alloc {contiguity = 2 : i32} : <bf16>[tensor<128x16xi32, #blocked_incompatible>] -> <128x16xbf16, #user_incompatible, #smem_incompatible, mutable>
+    %tok = amdg.buffer_load_to_local %ptr[%offsets] into %alloc {contiguity = 2 : i32} : !tt.ptr<bf16>[tensor<128x16xi32, #blocked_incompatible>] -> <128x16xbf16, #user_incompatible, #smem_incompatible, mutable>
     tt.return
   }
 }

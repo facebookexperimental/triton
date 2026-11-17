@@ -248,3 +248,66 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %9 : tensor<64x32xf32, #mma1>
   }
 }
+
+// -----
+
+#fp6 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8, fp6Padded = true}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @fp6_descriptor_load
+  // CHECK: ttng.barrier_expect {{.*}}, 12288,
+  // CHECK: ttng.async_tma_copy_global_to_local
+  // CHECK: ttng.wait_barrier
+  // CHECK-NOT: ttg.local_load
+  // CHECK: tt.return
+  tt.func @fp6_descriptor_load(%desc: !tt.tensordesc<128x128xi8, #fp6>, %offset: i32) -> !ttg.memdesc<128x128xi8, #fp6, #smem, mutable> {
+    %value = tt.descriptor_load %desc[%offset, %offset] : !tt.tensordesc<128x128xi8, #fp6> -> tensor<128x128xi8, #blocked>
+    %tile = ttg.local_alloc %value : (tensor<128x128xi8, #blocked>) -> !ttg.memdesc<128x128xi8, #fp6, #smem, mutable>
+    tt.return %tile : !ttg.memdesc<128x128xi8, #fp6, #smem, mutable>
+  }
+
+  // CHECK-LABEL: @fp6_make_descriptor
+  // CHECK: ttng.tensormap_create {{.*}} {elem_type = 15 : i32,
+  tt.func @fp6_make_descriptor(%base: !tt.ptr<i8>, %m: i32, %k: i32, %stride: i64) -> !tt.tensordesc<128x128xi8, #fp6> {
+    %one = arith.constant 1 : i64
+    %desc = tt.make_tensor_descriptor %base, [%m, %k], [%stride, %one] : !tt.ptr<i8>, !tt.tensordesc<128x128xi8, #fp6>
+    tt.return %desc : !tt.tensordesc<128x128xi8, #fp6>
+  }
+}
+
+// -----
+
+#tma_cache_shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#tma_cache_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+!tma_cache_desc = !tt.tensordesc<16x64xf16, #tma_cache_shared>
+!tma_cache_dst = !ttg.memdesc<16x64xf16, #tma_cache_shared, #ttg.shared_memory, mutable>
+!tma_cache_mbar = !ttg.memdesc<1xi64, #tma_cache_bar, #ttg.shared_memory, mutable>
+
+#cache_blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  // CHECK-LABEL: @tma_cache_legacy
+  // CHECK: ttng.async_tma_copy_global_to_local {{.*}} {cachePolicy = #tt.cache_policy<cache_modifier = none, eviction_policy = evict_first>}
+  tt.func @tma_cache_legacy(%desc: !tma_cache_desc, %coord: i32) -> tensor<16x64xf16, #cache_blocked> {
+    %v = tt.descriptor_load %desc[%coord, %coord] {cachePolicy = #tt.cache_policy<cache_modifier = none, eviction_policy = evict_first>} : !tma_cache_desc -> tensor<16x64xf16, #cache_blocked>
+    tt.return %v : tensor<16x64xf16, #cache_blocked>
+  }
+}
+
+// -----
+
+#tma_cache_shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#tma_cache_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+!tma_cache_desc = !tt.tensordesc<16x64xf16, #tma_cache_shared>
+!tma_cache_dst = !ttg.memdesc<16x64xf16, #tma_cache_shared, #ttg.shared_memory, mutable>
+!tma_cache_mbar = !ttg.memdesc<1xi64, #tma_cache_bar, #ttg.shared_memory, mutable>
+
+#cache_blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  // CHECK-LABEL: @tma_cache_fractional
+  // CHECK: ttng.async_tma_copy_global_to_local {{.*}} {cachePolicy = #ttng.cache_policy<l2_primary = evict_last, l2_secondary = evict_first, l2_fraction = 5.000000e-01 : f32>}
+  tt.func @tma_cache_fractional(%desc: !tma_cache_desc, %coord: i32) -> tensor<16x64xf16, #cache_blocked> {
+    %v = tt.descriptor_load %desc[%coord, %coord] {cachePolicy = #ttng.cache_policy<l2_primary = evict_last, l2_secondary = evict_first, l2_fraction = 5.000000e-01 : f32>} : !tma_cache_desc -> tensor<16x64xf16, #cache_blocked>
+    tt.return %v : tensor<16x64xf16, #cache_blocked>
+  }
+}

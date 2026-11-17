@@ -800,7 +800,7 @@ void updateAccumLoopCount(SmallVector<Operation *> &opList,
   }
   for (unsigned i = 0; i < opList.size(); i++) {
     auto *oldOp = opList[i];
-    if (oldToNew.find(oldOp) != oldToNew.end())
+    if (oldToNew.contains(oldOp))
       opList[i] = oldToNew[oldOp];
   }
 }

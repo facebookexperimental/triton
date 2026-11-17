@@ -10,7 +10,7 @@ import json
 import statistics
 from collections import deque
 from functools import cached_property
-from typing import Dict, Tuple, List, Optional
+from typing import Any, Dict, Tuple, List, Optional
 
 from .. import knobs
 from .jit import KernelInterface, JITFunction, _compile_iq_suppress_competition, _hash_fc_opts
@@ -358,6 +358,21 @@ class Autotuner(KernelInterface):
         if restore_value is not None:
             self.restore_value = list(restore_value)
 
+        # `key`, `reset_to_zero` and `restore_value` are all documented as lists of
+        # argument names. A name that is not one is silently dropped from the tuning
+        # key by `run()`, so a typo makes the kernel tune once and never re-tune.
+        for param, names in (("key", self.keys), ("reset_to_zero", self.reset_to_zero), ("restore_value",
+                                                                                         self.restore_value)):
+            unknown = [name for name in names if name not in self.arg_names]
+            if unknown:
+                raise ValueError(f"{param} contains names that are not kernel arguments: "
+                                 f"{', '.join(unknown)}. Valid argument names are: {', '.join(self.arg_names)}.")
+
+        # Populated by the default pre_hook when `restore_value` is set. Initialized here
+        # because a user-supplied pre_hook replaces that default while the default
+        # post_hook, which reads this, stays installed.
+        self.restore_copies: Dict[str, Any] = {}
+
         # Hook to reset or restore for required tensors
         self.pre_hook = lambda kwargs, reset_only=False: 0
         self.post_hook = lambda kwargs, exception: 0
@@ -571,6 +586,7 @@ class Autotuner(KernelInterface):
         # Capture the CompiledKernel the launch returns (run(...) returns it even on a normal
         # launch). `_bench` calls self.fn.run directly, so this is a CompiledKernel with `.asm`.
         captured = []
+        run_errors = []
 
         def kernel_call():
             if config.pre_hook:
@@ -582,6 +598,7 @@ class Autotuner(KernelInterface):
                     **current,
                 )
             except Exception as e:
+                run_errors.append(e)
                 try:
                     self.post_hook(full_nargs, exception=e)
                 finally:
@@ -603,12 +620,12 @@ class Autotuner(KernelInterface):
             if verbose:
                 print(f"Autotuning failed with {e}")
             return [float("inf"), float("inf"), float("inf")]
-        except RuntimeError as e:
-            # Prune an NPOT candidate to inf if it hit a device compile/launch failure so the sweep
-            # continues; pow2 configs (and non-device errors) re-raise.
-            if _npot_runtime_error_prunable(config, e, knobs.language.allow_npot):
+        except Exception as e:
+            # Under the flag, skip an NPOT config whose compile or launch (`self.fn.run`) failed so the
+            # sweep continues; pow2 configs and hook errors re-raise as upstream.
+            if e in run_errors and knobs.language.allow_npot and _config_has_npot_block(config):
                 if verbose:
-                    print(f"Autotuning pruned NPOT config after runtime error: {e}")
+                    print(f"Autotuning skipped NPOT config after compile/launch error: {e}")
                 return [float("inf"), float("inf"), float("inf")]
             raise
         self._last_compiled_kernel = captured[-1] if captured else None
@@ -660,7 +677,7 @@ class Autotuner(KernelInterface):
         """Return C-level AutotuneCacheProxy for fast dispatch if available."""
         # Check if we can use the C-level autotune proxy
         if (native_create_autotune_proxy is not None and getattr(self.fn, 'c_cache', False)
-                and knobs.nvidia.use_autotune_c_cache and knobs.nvidia.use_triton_dispatcher and len(self.configs) > 1
+                and knobs.runtime.use_autotune_c_cache and knobs.runtime.use_triton_dispatcher and len(self.configs) > 1
                 and knobs.autotuning.listener is None and getattr(driver.active, "is_cpu_backend", False) is not True):
             proxy = getattr(self, '_autotune_proxy', None)
             if proxy is None:
@@ -947,7 +964,7 @@ class Autotuner(KernelInterface):
 
                     if knobs.autotuning.listener is not None:
                         jit_fn = self.fn
-                        while not isinstance(jit_fn, JITFunction):
+                        while not inspect.isfunction(jit_fn.fn):
                             jit_fn = jit_fn.fn
                         knobs.autotuning.listener(
                             fn=jit_fn,
@@ -1322,28 +1339,6 @@ def _clone_config(config, **kwargs_override):
 def _config_has_npot_block(config):
     """True if any of the config's BLOCK_* tile sizes is non-power-of-2."""
     return any(isinstance(v, int) and not _is_pow2(v) for k, v in config.kwargs.items() if 'BLOCK' in k.upper())
-
-
-# Markers of a device compile/launch failure (vs a logic bug), matched case-insensitively. The
-# NVIDIA and AMD drivers tag every device RuntimeError with "Triton Error [CUDA]"/"[HIP]"; the rest
-# cover common HW failure signatures (including torch-surfaced wordings).
-_DEVICE_ERROR_MARKERS = (
-    "triton error [cuda]",
-    "triton error [hip]",
-    "out of memory",
-    "misaligned",
-    "illegal memory access",
-    "illegal instruction",
-    "device-side assert",
-)
-
-
-def _npot_runtime_error_prunable(config, err, allow_npot):
-    """Prune only an NPOT config, under the flag, on a device error; else re-raise."""
-    if not (allow_npot and _config_has_npot_block(config)):
-        return False
-    text = str(err).lower()
-    return any(marker in text for marker in _DEVICE_ERROR_MARKERS)
 
 
 def _wave_efficiency(num_tiles, num_units):

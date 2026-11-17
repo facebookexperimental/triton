@@ -489,6 +489,188 @@ def test_tmem_subslice(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
     torch.testing.assert_close(x, ref_out)
 
 
+@triton.jit
+def _tcgen05_fence_before_thread_sync():
+    tl.inline_asm_elementwise("tcgen05.fence::before_thread_sync; mov.u32 $0, 0;", "=r", [], dtype=tl.int32,
+                              is_pure=False, pack=1)
+
+
+@triton.jit
+def _tcgen05_fence_after_thread_sync():
+    tl.inline_asm_elementwise("tcgen05.fence::after_thread_sync; mov.u32 $0, 0;", "=r", [], dtype=tl.int32,
+                              is_pure=False, pack=1)
+
+
+# Register layouts of a row slice held in the TMEM lanes of the 1 or 2 warps that access it.
+# 32x32b (M=128, 32 columns): lane = row, warp = row + 32, registers = columns.
+_ROWS128_ONE_WARP = tl.constexpr(tlx.layout(shape=((32, ), (32, )), stride=((32, ), (1, ))))
+_ROWS128_TWO_WARPS = tl.constexpr(tlx.layout(shape=((32, 2), (32, )), stride=((32, 1024), (1, ))))
+# M=64 (64 columns) keeps 16 rows per warp: lanes 0-15 = rows, lane 16 = the other half of each 16-column block.
+_ROWS64_ONE_WARP = tl.constexpr(tlx.layout(shape=((16, 2), (8, 4)), stride=((64, 8), (1, 16))))
+_ROWS64_TWO_WARPS = tl.constexpr(tlx.layout(shape=((16, 2, 2), (8, 4)), stride=((64, 8, 1024), (1, 16))))
+
+
+@triton.jit
+def _tmem_load_rows(buf, bar, y_ptr, IDX: tl.constexpr, ROWS: tl.constexpr, BLOCK_M: tl.constexpr,
+                    BLOCK_N: tl.constexpr):
+    tlx.barrier_wait(bar, 0)
+    _tcgen05_fence_after_thread_sync()
+    rows = tlx.subslice(buf, IDX * ROWS, ROWS, dim=0)
+    if BLOCK_M == 128:
+        if ROWS == 32:
+            y = tlx.local_load(rows, layout=_ROWS128_ONE_WARP)
+        else:
+            y = tlx.local_load(rows, layout=_ROWS128_TWO_WARPS)
+    else:
+        if ROWS == 16:
+            y = tlx.local_load(rows, layout=_ROWS64_ONE_WARP)
+        else:
+            y = tlx.local_load(rows, layout=_ROWS64_TWO_WARPS)
+    offs = (IDX * ROWS + tl.arange(0, ROWS))[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+    tl.store(y_ptr + offs, y)
+
+
+@triton.jit
+def _tmem_store_row_half(buf, bar, x_ptr, HALF_IDX: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    HALF: tl.constexpr = BLOCK_M // 2
+    offs = (HALF_IDX * HALF + tl.arange(0, HALF))[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+    half = tlx.subslice(buf, HALF_IDX * HALF, HALF, dim=0)
+    if BLOCK_M == 128:
+        tlx.local_store(half, tl.load(x_ptr + offs), layout=_ROWS128_TWO_WARPS)
+    else:
+        tlx.local_store(half, tl.load(x_ptr + offs), layout=_ROWS64_TWO_WARPS)
+    _tcgen05_fence_before_thread_sync()
+    tlx.barrier_arrive(bar)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("BLOCK_M, BLOCK_N", [(128, 32), (64, 64)])
+@pytest.mark.parametrize("num_warps", [4, 8])
+def test_tmem_row_subslice_two_warp_tasks(BLOCK_M, BLOCK_N, num_warps, device):
+    # Each 2-warp task loads the half of the tile held in the TMEM lanes of its own warps (the first task: the first
+    # two lane quadrants, the second: the last two).
+
+    @triton.jit
+    def kernel(x_ptr, y_ptr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, NUM_WARPS: tl.constexpr):
+        buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        bar = tlx.alloc_barriers(num_barriers=tl.constexpr(1))
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                offs = tl.arange(0, BLOCK_M)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+                tlx.local_store(buf[0], tl.load(x_ptr + offs))
+                _tcgen05_fence_before_thread_sync()
+                tlx.barrier_arrive(bar[0])
+            with tlx.async_task(num_warps=2, warp_group_start_id=NUM_WARPS):
+                _tmem_load_rows(buf[0], bar[0], y_ptr, 0, BLOCK_M // 2, BLOCK_M, BLOCK_N)
+            with tlx.async_task(num_warps=2, warp_group_start_id=NUM_WARPS + 2):
+                _tmem_load_rows(buf[0], bar[0], y_ptr, 1, BLOCK_M // 2, BLOCK_M, BLOCK_N)
+
+    x = torch.arange(BLOCK_M * BLOCK_N, dtype=torch.float32, device=device).reshape(BLOCK_M, BLOCK_N)
+    y = torch.full_like(x, -1.0)
+    kernel_info = kernel[(1, )](x, y, BLOCK_M, BLOCK_N, num_warps, num_warps=num_warps)
+    assert kernel_info.asm["ttgir"].count("ttng.tmem_subslice") == 2
+    torch.testing.assert_close(y, x, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("BLOCK_M, BLOCK_N", [(128, 32), (64, 64)])
+@pytest.mark.parametrize("num_warps", [4, 8])
+def test_tmem_row_subslice_one_warp_tasks(BLOCK_M, BLOCK_N, num_warps, device):
+    # Each 1-warp task loads the quarter of the tile held in the TMEM lanes of its own warp.
+
+    @triton.jit
+    def kernel(x_ptr, y_ptr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, NUM_WARPS: tl.constexpr):
+        QUARTER: tl.constexpr = BLOCK_M // 4
+        buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        bar = tlx.alloc_barriers(num_barriers=tl.constexpr(1))
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                offs = tl.arange(0, BLOCK_M)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+                tlx.local_store(buf[0], tl.load(x_ptr + offs))
+                _tcgen05_fence_before_thread_sync()
+                tlx.barrier_arrive(bar[0])
+            with tlx.async_task(num_warps=1, warp_group_start_id=NUM_WARPS):
+                _tmem_load_rows(buf[0], bar[0], y_ptr, 0, QUARTER, BLOCK_M, BLOCK_N)
+            with tlx.async_task(num_warps=1, warp_group_start_id=NUM_WARPS + 1):
+                _tmem_load_rows(buf[0], bar[0], y_ptr, 1, QUARTER, BLOCK_M, BLOCK_N)
+            with tlx.async_task(num_warps=1, warp_group_start_id=NUM_WARPS + 2):
+                _tmem_load_rows(buf[0], bar[0], y_ptr, 2, QUARTER, BLOCK_M, BLOCK_N)
+            with tlx.async_task(num_warps=1, warp_group_start_id=NUM_WARPS + 3):
+                _tmem_load_rows(buf[0], bar[0], y_ptr, 3, QUARTER, BLOCK_M, BLOCK_N)
+
+    x = torch.arange(BLOCK_M * BLOCK_N, dtype=torch.float32, device=device).reshape(BLOCK_M, BLOCK_N)
+    y = torch.full_like(x, -1.0)
+    kernel_info = kernel[(1, )](x, y, BLOCK_M, BLOCK_N, num_warps, num_warps=num_warps)
+    assert kernel_info.asm["ttgir"].count("ttng.tmem_subslice") == 4
+    torch.testing.assert_close(y, x, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("BLOCK_M, BLOCK_N", [(128, 32), (64, 64)])
+@pytest.mark.parametrize("num_warps", [4, 8])
+def test_tmem_row_subslice_two_warp_stores(BLOCK_M, BLOCK_N, num_warps, device):
+    # Each 2-warp task stores the half of the tile held in the TMEM lanes of its own warps; the default task loads the
+    # whole tile back.
+
+    @triton.jit
+    def kernel(x_ptr, y_ptr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, NUM_WARPS: tl.constexpr):
+        buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        bars = tlx.alloc_barriers(num_barriers=tl.constexpr(2))
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                tlx.barrier_wait(bars[0], 0)
+                tlx.barrier_wait(bars[1], 0)
+                _tcgen05_fence_after_thread_sync()
+                offs = tl.arange(0, BLOCK_M)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+                tl.store(y_ptr + offs, tlx.local_load(buf[0]))
+            with tlx.async_task(num_warps=2, warp_group_start_id=NUM_WARPS):
+                _tmem_store_row_half(buf[0], bars[0], x_ptr, 0, BLOCK_M, BLOCK_N)
+            with tlx.async_task(num_warps=2, warp_group_start_id=NUM_WARPS + 2):
+                _tmem_store_row_half(buf[0], bars[1], x_ptr, 1, BLOCK_M, BLOCK_N)
+
+    x = torch.arange(BLOCK_M * BLOCK_N, dtype=torch.float32, device=device).reshape(BLOCK_M, BLOCK_N)
+    y = torch.full_like(x, -1.0)
+    kernel_info = kernel[(1, )](x, y, BLOCK_M, BLOCK_N, num_warps, num_warps=num_warps)
+    assert kernel_info.asm["ttgir"].count("ttng.tmem_subslice") == 2
+    torch.testing.assert_close(y, x, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_tmem_row_subslice_rejects_misaligned_offset(device):
+
+    @triton.jit
+    def kernel(y_ptr):
+        buf = tlx.local_alloc((128, 32), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        layout: tl.constexpr = tlx.layout(shape=((32, ), (32, )), stride=((32, ), (1, )))
+        y = tlx.local_load(tlx.subslice(buf[0], 16, 32, dim=0), layout=layout)
+        tl.store(y_ptr + tl.arange(0, 32)[:, None] * 32 + tl.arange(0, 32)[None, :], y)
+
+    y = torch.empty((32, 32), dtype=torch.float32, device=device)
+    with pytest.raises(RuntimeError, match="A row slice must cover"):
+        kernel[(1, )](y, num_warps=1)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_tmem_row_subslice_rejects_two_cta_block_m64(device):
+    # A 2-CTA accumulator with BLOCK_M=64 keeps the right half of its columns in lanes 64-127, so no group of warps
+    # owns a row slice of it.
+
+    @triton.jit
+    def kernel(y_ptr):
+        a = tlx.local_alloc((64, 64), tl.float16, tl.constexpr(1))
+        b = tlx.local_alloc((64, 32), tl.float16, tl.constexpr(1))
+        acc = tlx.local_alloc((64, 64), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        bar = tlx.alloc_barriers(num_barriers=tl.constexpr(1))
+        tlx.async_dot(a[0], b[0], acc[0], use_acc=False, mBarriers=[bar[0]], two_ctas=True)
+        tlx.barrier_wait(bar[0], 0)
+        y = tlx.local_load(tlx.subslice(acc[0], 0, 32, dim=0))
+        tl.store(y_ptr + tl.arange(0, 32)[:, None] * 64 + tl.arange(0, 64)[None, :], y)
+
+    y = torch.empty((32, 64), dtype=torch.float32, device=device)
+    with pytest.raises(RuntimeError, match="A row slice must cover"):
+        kernel[(2, )](y, ctas_per_cga=(2, 1, 1))
+
+
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 @pytest.mark.parametrize("BLOCK_SIZE_M, BLOCK_SIZE_N", [(64, 64)])
 def test_tmem_op_func(BLOCK_SIZE_M, BLOCK_SIZE_N, device):

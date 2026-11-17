@@ -631,14 +631,9 @@ def _tlx_gfx950_ragged_hstu_attn_fwd_compute(  # noqa C901
             tl.static_assert(ATTN_SCALE_TYPE == "dynamic")
             scale = tl.load(attn_scale + seq_start + offs_m, mask=offs_m < seq_len).to(tl.float32)
 
-        Q_block_ptr = tl.make_block_ptr(
-            base=Q + off_h * stride_qh + seq_start * stride_qm,
-            shape=(seq_len, BLOCK_D_Q),
-            strides=(stride_qm, 1),
-            offsets=(start_m, 0),
-            block_shape=(BLOCK_M, BLOCK_D_Q),
-            order=(1, 0),
-        )
+        Q_base = Q + off_h * stride_qh + seq_start * stride_qm
+        offs_qd = tl.arange(0, BLOCK_D_Q)
+        Q_ptrs = Q_base + offs_m[:, None] * stride_qm + offs_qd[None, :]
         mask_m = offs_m < seq_len
         if ATTN_BIAS_TYPE == "fused" and USE_TIME_BIAS:
             ts_0_ptrs = TS + off_z * stride_ts + offs_m
@@ -653,7 +648,7 @@ def _tlx_gfx950_ragged_hstu_attn_fwd_compute(  # noqa C901
             off_bias = offs_m[:, None] * seq_len + offs_n[None, :]
             bias_ptrs = Bias + bias_start + off_bias
 
-        q = tl.load(Q_block_ptr, boundary_check=(0, ), padding_option="zero")
+        q = tl.load(Q_ptrs, mask=mask_m[:, None], other=0.0)
         acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
         m_i, l_i = forward_softmax_common_preprocess(off_h, num_softmax_heads, BLOCK_M)
 

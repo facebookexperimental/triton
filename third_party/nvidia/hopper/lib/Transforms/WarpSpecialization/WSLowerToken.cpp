@@ -130,12 +130,17 @@ void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
 }
 
 void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
-                              Value bufferEmpty, int numCTAs,
-                              unsigned emptyCnt) {
+                              Value bufferEmpty, int numCTAs, unsigned emptyCnt,
+                              ttnvws::TokenLoadType loadType) {
   auto loc = op.getLoc();
   auto arriveOp = ttng::ArriveBarrierOp::create(
       builder, loc, bufferEmpty, 1, /*pred=*/Value(), /*perThread=*/false,
       op.getConstraintsAttr());
+  // Only a TMA refill writes through the async proxy; ProxyFenceInsertion
+  // places the fence once the barrier passes are done moving the arrive.
+  if (loadType == ttnvws::TokenLoadType::TMALoadOp &&
+      op->hasAttr(ttng::kFenceGenericReadsAttrName))
+    arriveOp->setAttr(ttng::kFenceGenericReadsAttrName, builder.getUnitAttr());
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(arriveOp, op);
@@ -319,7 +324,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
         processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs,
-                                 bufferEmptyCount);
+                                 bufferEmptyCount, loadType);
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {

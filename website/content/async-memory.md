@@ -109,24 +109,38 @@
    ```
 
 
-- `tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier)` **[sm90+]**
+- `tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier, store_reduce="")` **[NVIDIA sm90+]**
 
-   Store a distributed tensor into a buffer in the remote shared memory of a cluster asynchronously. Signals the provided mbarrier when the store completes.
+   Asynchronously store a register-source distributed tensor into cluster shared memory, or atomically reduce it with `store_reduce="add"`, `"min"`, `"max"`, `"and"`, `"or"`, `"xor"`, `"inc"`, or `"dec"`. The default `store_reduce=""` preserves the regular store behavior. ADD, MIN, MAX, AND, OR, and XOR support `int32` and `uint32`; INC and DEC support only `uint32`. Source/destination shapes and element types must match, and the destination must be mutable.
+
+   MIN/MAX use signed comparisons for `int32` and unsigned comparisons for `uint32`. For INC/DEC, each source value is a bound `b`, not an amount to add or subtract: `inc(old, b)` returns zero when `old >= b`, otherwise `old + 1`; `dec(old, b)` returns `b` when `old == 0` or `old > b`, otherwise `old - 1`.
+
+   Reductions require a cluster containing at least two physical CTAs, configured through either `num_ctas` or `ctas_per_cga`. A physical two-CTA launch with logical `num_ctas=1` is supported. `remote_cta_rank` may name a peer CTA or the executing CTA itself; destination and completion barrier are mapped to the same rank.
+
+   Regular stores use `st.async`; reductions use scalar `red.async.relaxed.cluster.shared::cluster.mbarrier::complete_tx::bytes.<op>.<type>`. ADD uses `.add.u32` for both signed and unsigned inputs because their 32-bit sums have the same bit-level result. MIN/MAX use `.s32` or `.u32`; bitwise operations use `.b32`; INC/DEC use `.u32`. These instructions use the **generic proxy**, not the async proxy: asynchronous completion alone does not require `fence("async_shared_cluster")`.
+
+   Each executed reduction completes **4 bytes per unique logical element** on the receiving mbarrier, without an additional arrival. Allocate barriers with `scope="cluster"` for compiler-owned initialization visibility; this does not replace application-owned destination initialization, expected-byte registration, data-ready synchronization, completion waits, or storage lifetime protection. Expected-byte registration can follow transaction completion, but barrier initialization must precede remote use. Wait on the receiving barrier before consuming the result. Keep every participating CTA's destination and barrier storage alive until all remote operations finish, including a final cluster rendezvous before exit or storage reuse.
 
    **Parameters:**
    - `dst`: The destination buffer in local shared memory (will be internally mapped to the remote CTA)
-   - `src`: The source distributed tensor to store
+   - `src`: The register-source distributed tensor; for INC/DEC, each element is a bound
    - `remote_cta_rank`: The rank (unique ID) of the remote CTA within the cluster
-   - `barrier`: mbarrier to signal when the store completes
+   - `barrier`: Mutable local shared-memory mbarrier mapped to the same CTA as `dst` for completion
+   - `store_reduce`: `""` for a regular store, or `"add"`, `"min"`, `"max"`, `"and"`, `"or"`, `"xor"`, `"inc"`, or `"dec"` for a 32-bit integer reduction
 
    **Example:**
    ```python
    # Allocate shared memory buffer and barrier
    buffer = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
-   barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+   barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1, scope="cluster")
 
    # Store to remote CTA's shared memory
    tlx.async_remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1, barrier=barrier[0])
+
+   # Integer register-source reduction after initialization, expected-byte
+   # registration, and a cluster rendezvous (int_buffer matches src_i32).
+   tlx.async_remote_shmem_store(int_buffer[0], src_i32, remote_cta_rank=1,
+                                barrier=barrier[0], store_reduce="add")
    ```
 - `tlx.remote_shmem_copy(dst, src, remote_cta_rank)` **[sm90+]**
 
@@ -236,22 +250,22 @@
    tlx.async_descriptor_load(a_desc, buffer, offsets=[offs_m, offs_k], barrier=mbar)
    ```
 
-- `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)` **[sm90+, gfx950]**
+- `tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)` **[sm90+, gfx942+]**
 
    Load a chunk of data from global memory into a local memory buffer asynchronously.
 
    The operation returns a token object which can be used to track the completion of the operation.
 
-   **MI350X caveat:** When `mask` is provided, callers should also provide `other`—typically `0.0` for numerical kernels. Elements for which `mask=True` are copied from global memory into the destination local buffer. For elements where `mask=False`, `other` is written only if it is provided. Otherwise, the corresponding LDS locations retain unspecified, potentially stale contents from an earlier use of the buffer.
+   On AMD, the non-bulk path uses target-specific direct-to-LDS lowering or a synchronous fallback when the copy cannot be issued directly. Direct transfers require 32 bits per lane on gfx942, 32 or 128 bits on gfx950, or 32, 64, or 128 bits on gfx1250. A supported API does not guarantee a hardware-asynchronous transfer. The `bulk=True` path is NVIDIA-specific; use TDM descriptor loads on gfx1250 for descriptor-based transfers. See the [AMD copy lowering](third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp).
 
-   For example, in FlashAttention, when the sequence length is not a multiple of `BLOCK_N`, the final `V` tile contains masked-out rows. If `other` is omitted, those rows may contain unspecified values, including bit patterns representing NaN or infinity. These values can propagate through the subsequent matrix multiplication and produce incorrect output. Use `other=0.0` for such padded tiles.
+   **Masked copies:** The TLX frontend defaults `other` to `0.0` when `mask` is provided and `other` is omitted. Pass another `other` value explicitly if the masked-out elements need a different fill. This applies to the non-bulk copy path; bulk mode does not accept `mask` or `other`. See the [frontend implementation](third_party/tlx/language/tlx/mem_ops.py).
 
 
-- `tlx.async_load_commit_group(tokens)` **[sm90+, gfx950]**
+- `tlx.async_load_commit_group(tokens)` **[sm90+, gfx942+]**
 
    Commits all prior initiated but uncommitted async_load ops an async group. Optionally, each token represents a tracked async load operation.
 
-- `tlx.async_load_wait_group(pendings, tokens)` **[sm90+, gfx950]**
+- `tlx.async_load_wait_group(pendings, tokens)` **[sm90+, gfx942+]**
 
    Wait for completion of prior asynchronous copy operations. The `pendings` argument indicates the number of in-flight operations not completed.
    Optionally, each token represents a tracked async commit group operation.
@@ -259,7 +273,9 @@
 
 ## `tlx.buffer_load_to_local`
 
-Async load from global memory directly into shared (local) memory, bypassing registers. This is useful for producer warps that prefetch data into shared memory for other warps to consume.
+**[gfx942, gfx950]**
+
+Async load from global memory directly into shared (local) memory, bypassing registers. This is useful for producer warps that prefetch data into shared memory for other warps to consume. Unlike pointer-based `async_load`, this explicit buffer operation is rejected on gfx1250 by the [target verifier](third_party/amd/lib/Dialect/TritonAMDGPU/IR/Dialect.cpp); use the TDM path there.
 
 ```python
 token = tlx.buffer_load_to_local(
@@ -288,7 +304,7 @@ token = tlx.buffer_load_to_local(
 Lowers to `amdg.buffer_load_to_local`, which is eventually lowered to `rocdl.raw.ptr.buffer.load.async.lds` — a single hardware instruction that moves data from global memory to LDS without going through VGPRs.
 
 **Requirements.** The direct-to-LDS copy has the following hardware constraints:
-- **Vector width.** Each thread's load must reach a supported direct-to-LDS width (**32 or 128 bits**). If it can only be vectorized to a smaller width, it cannot be lowered.
+- **Vector width.** Each thread's load must reach **32 bits on gfx942**, or **32 or 128 bits on gfx950**. If it can only be vectorized to a smaller width, it cannot be lowered. These widths come from the [target feature checks](third_party/amd/lib/Dialect/TritonAMDGPU/IR/TargetFeatures.cpp).
 - **Provable pointer/offset alignment.** The compiler must be able to *prove* the alignment that vector width needs.
 - **Mask alignment.** If `mask` is given it must be aligned to the vector width: each group of (vector width) consecutive mask values must be identical. The copy transfers each lane's whole vector in one transaction, so a mask whose `True`/`False` boundary cannot be proven vector-aligned (e.g. `offs < K` for a runtime `K`) forces per-element vectorization and cannot lower.
 

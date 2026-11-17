@@ -9,6 +9,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "tlx/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -172,17 +173,19 @@ static bool retypeWithEncoding(Value v, Attribute enc) {
 // that their generated symbols cannot collide.
 static void privatizeHelperForCall(::mlir::triton::CallOp call,
                                    ::mlir::triton::FuncOp callee,
-                                   StringRef suffix) {
+                                   StringRef suffix,
+                                   SymbolTableCollection &symbolTables) {
+  auto &symbolTable = symbolTables.getSymbolTable(callee->getParentOp());
   OpBuilder b(callee);
   auto clone = cast<::mlir::triton::FuncOp>(b.clone(*callee.getOperation()));
   std::string base = (callee.getSymName() + suffix).str();
   std::string name = base;
   unsigned n = 0;
-  while (SymbolTable::lookupNearestSymbolFrom(
-      call, StringAttr::get(callee.getContext(), name)))
+  while (symbolTable.lookup(name))
     name = base + "_" + std::to_string(n++);
   clone.setSymName(name);
   SymbolTable::setSymbolVisibility(clone, SymbolTable::Visibility::Private);
+  symbolTable.insert(clone);
   call.setCalleeAttr(FlatSymbolRefAttr::get(callee.getContext(), name));
 }
 
@@ -210,7 +213,7 @@ static LogicalResult synchronizeConcreteHelperABI(ModuleOp mod, bool &changed) {
   mod.walk([&](::mlir::triton::CallOp call) {
     if (!llvm::any_of(call.getOperandTypes(), isConcreteDistributed))
       return;
-    auto callee = SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+    auto callee = symbolTables.lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
         call, call.getCalleeAttr());
     if (!callee || callee.getBody().empty())
       return;
@@ -218,13 +221,13 @@ static LogicalResult synchronizeConcreteHelperABI(ModuleOp mod, bool &changed) {
       concreteClones.emplace_back(call, callee);
   });
   for (auto [call, callee] : concreteClones) {
-    privatizeHelperForCall(call, callee, "_tlxabi");
+    privatizeHelperForCall(call, callee, "_tlxabi", symbolTables);
     changed = true;
   }
 
   bool inputConflict = false;
   mod.walk([&](::mlir::triton::CallOp call) {
-    auto callee = SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+    auto callee = symbolTables.lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
         call, call.getCalleeAttr());
     if (!callee || callee.getBody().empty())
       return;
@@ -361,7 +364,7 @@ static LogicalResult synchronizeConcreteHelperABI(ModuleOp mod, bool &changed) {
   }
 
   mod.walk([&](::mlir::triton::CallOp call) {
-    auto callee = SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+    auto callee = symbolTables.lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
         call, call.getCalleeAttr());
     if (!callee)
       return;
@@ -499,7 +502,55 @@ static LogicalResult reconcileEncodingUniformOps(ModuleOp mod, bool &changed) {
       changed = true;
     }
   }
-  return success(!traitConflict);
+  if (traitConflict)
+    return failure();
+
+  SmallVector<triton::amdgpu::ConcatOp> concats;
+  mod.walk([&](triton::amdgpu::ConcatOp op) { concats.push_back(op); });
+  for (auto op : concats) {
+    if (op.getSources().empty() || op.getType().getEncoding())
+      continue;
+    auto sourceTy = cast<RankedTensorType>(op.getSources().front().getType());
+    if (!isa_and_nonnull<ttg::DistributedEncodingTrait>(sourceTy.getEncoding()))
+      continue;
+    op.getResult().setType(
+        op.getType().cloneWithEncoding(sourceTy.getEncoding()));
+    changed = true;
+  }
+
+  // A constant-scale FP8 downcast is elementwise: its input and result share
+  // one encoding. The op carries no same-encoding trait because a scale
+  // operand, when present, has its own compact layout.
+  SmallVector<triton::amdgpu::ScaledDowncastFp8Op> downcasts;
+  mod.walk([&](triton::amdgpu::ScaledDowncastFp8Op op) {
+    if (!op.getScale())
+      downcasts.push_back(op);
+  });
+  for (auto op : downcasts) {
+    auto inputTy = op.getInput().getType();
+    auto outputTy = op.getOutput().getType();
+    Attribute targetEncoding;
+    if (isConcreteDistributed(inputTy))
+      targetEncoding = inputTy.getEncoding();
+    else if (isConcreteDistributed(outputTy))
+      targetEncoding = outputTy.getEncoding();
+    else if (inputTy.getEncoding())
+      targetEncoding = inputTy.getEncoding();
+    if (!targetEncoding)
+      continue;
+    if (outputTy.getEncoding() != targetEncoding) {
+      op.getOutput().setType(outputTy.cloneWithEncoding(targetEncoding));
+      changed = true;
+    }
+    if (inputTy.getEncoding() != targetEncoding) {
+      OpBuilder b(op);
+      op.getInputMutable().assign(RequireLayoutOp::create(
+          b, op.getLoc(), inputTy.cloneWithEncoding(targetEncoding),
+          op.getInput()));
+      changed = true;
+    }
+  }
+  return success();
 }
 
 static LogicalResult reconcileDotLayouts(ModuleOp mod, bool &changed) {
@@ -902,8 +953,55 @@ static bool flowsPreservingEncodingToValue(Value root, Value target) {
   return false;
 }
 
+// Upstream #11759 lets a broadcast result carry a concrete layout where the
+// frontend then inserts an unrealized_conversion_cast to satisfy a pinned
+// elementwise op's same-type constraint (e.g. blocked -> no_verify<mfma> on
+// an accumulator scale). convert_to_ttgpuir has no materialization callback
+// that produces or consumes the TLX wrapper, so the cast survives conversion
+// and fails the pass manager. Replace such casts with an opaque
+// ttg.require_layout: it survives conversion as the durable boundary that
+// tlx-resolve-placeholder-layouts strips (making both sides concrete) before
+// tlx-finalize-user-layouts lowers it to a convert_layout. Casts with a null
+// side keep today's behavior (the converter materializes unencoded sources
+// freely); only concrete-vs-wrapper pairs are bridged.
+static bool replaceWrapperSpanningCasts(ModuleOp mod) {
+  SmallVector<Operation *> casts;
+  mod.walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "builtin.unrealized_conversion_cast")
+      return;
+    if (op->getNumOperands() != 1 || op->getNumResults() != 1)
+      return;
+    auto srcType = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+    auto dstType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    if (!srcType || !dstType || srcType == dstType)
+      return;
+    if (srcType.getShape() != dstType.getShape() ||
+        srcType.getElementType() != dstType.getElementType())
+      return;
+    Attribute srcEnc = srcType.getEncoding();
+    Attribute dstEnc = dstType.getEncoding();
+    if (!srcEnc || !dstEnc)
+      return;
+    if (!isPlaceholderEncoding(srcEnc) && !isPlaceholderEncoding(dstEnc))
+      return;
+    casts.push_back(op);
+  });
+  if (casts.empty())
+    return false;
+  OpBuilder builder(mod.getContext());
+  for (Operation *op : casts) {
+    builder.setInsertionPoint(op);
+    Value boundary = ttg::RequireLayoutOp::create(
+        builder, op->getLoc(), op->getResult(0).getType(), op->getOperand(0));
+    op->getResult(0).replaceAllUsesWith(boundary);
+    op->erase();
+  }
+  return true;
+}
+
 static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
   bool conflict = false;
+  SymbolTableCollection symbolTables;
   // Concrete tlx.require_layout results are explicit local ownership anchors.
   // Track only those anchors and the encoding-uniform results derived from
   // them: an arbitrary concrete tensor type selected elsewhere in TTIR is not
@@ -1005,6 +1103,12 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
       return failure();
     }
 
+    // Frontend-inserted wrapper-spanning casts cannot survive
+    // convert_to_ttgpuir (see replaceWrapperSpanningCasts); replace them
+    // before any handler reads through them. Runs every iteration because a
+    // null side can acquire a concrete layout mid-fixpoint.
+    changed |= replaceWrapperSpanningCasts(mod);
+
     // A helper can establish a pin internally and return it without receiving
     // any pinned argument. The frontend still gives that helper and its call
     // sites encoding-free result types. Synchronize those result ABIs from
@@ -1086,7 +1190,7 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
     // participate in this fixpoint iteration.
     mod.walk([&](::mlir::triton::CallOp call) {
       auto callee =
-          SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+          symbolTables.lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
               call, call.getCalleeAttr());
       if (!callee)
         return;
@@ -1103,6 +1207,7 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
     // tt.calls whose shared helper callee must be privatized (cloned) before it
     // can be specialized. Collected during the walk and applied afterwards, so
     // we never insert into the module while traversing it.
+    SymbolUserMap symbolUsers(symbolTables, mod);
     SmallVector<::mlir::triton::CallOp> pendingClones;
     mod.walk([&](Operation *op) {
       // arith/math elementwise, select, cmp: all same-shape tensor operands and
@@ -1114,13 +1219,51 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
         if (enc) {
           for (Value v : op->getResults())
             changed |= retypeWithEncoding(v, enc);
+          // Upstream #11759 lets a broadcast result carry a concrete layout
+          // that differs from a pinned sibling (e.g. a blocked broadcast
+          // chain feeding an op pinned to no_verify<mfma>). Retyping such a
+          // sibling to the placeholder would lie about its physical data
+          // distribution and forge a wrapper boundary the TTIR->TTGIR
+          // converter cannot materialize. When the physical layouts coincide
+          // (a wrapper-only difference, matching #11759's projection-equality
+          // rule) the retype is free and stays; otherwise bridge the use with
+          // an opaque ttg.require_layout, which survives conversion and is
+          // resolved later (stripped by tlx-resolve-placeholder-layouts, then
+          // lowered to a real convert_layout).
+          Attribute innerEnc = getEffectiveEncoding(enc);
           bool isSelect = isa<arith::SelectOp>(op);
           for (auto en : llvm::enumerate(op->getOperands())) {
+            Value operand = en.value();
             // arith.select's condition (operand 0) must carry the encoding too,
             // but its producer may be un-retypeable (e.g. a tt.call mask), so
             // force a require_layout bridge for it.
             bool isSelectCond = isSelect && en.index() == 0;
-            bridgeOrRetype(en.value(), enc, op, en.index(), isSelectCond);
+            if (auto operandTy =
+                    dyn_cast<RankedTensorType>(operand.getType())) {
+              Attribute operandEnc = operandTy.getEncoding();
+              if (operandEnc && !isPlaceholderEncoding(operandEnc)) {
+                Attribute operandInner = getEffectiveEncoding(operandEnc);
+                bool samePhysical =
+                    innerEnc && operandInner &&
+                    isa_and_nonnull<ttg::DistributedEncodingTrait>(
+                        operandInner) &&
+                    isa_and_nonnull<ttg::DistributedEncodingTrait>(innerEnc) &&
+                    haveSamePhysicalLayout(
+                        operandTy.cloneWithEncoding(operandInner),
+                        operandTy.cloneWithEncoding(innerEnc));
+                if (!samePhysical) {
+                  OpBuilder b(op);
+                  auto bridgeTy = RankedTensorType::get(
+                      operandTy.getShape(), operandTy.getElementType(), enc);
+                  Value bridge = ttg::RequireLayoutOp::create(
+                      b, op->getLoc(), bridgeTy, operand);
+                  op->setOperand(en.index(), bridge);
+                  changed = true;
+                  continue;
+                }
+              }
+            }
+            bridgeOrRetype(operand, enc, op, en.index(), isSelectCond);
           }
           return;
         }
@@ -1415,21 +1558,22 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
           return;
         }
       }
-      // tt.call to a @triton.jit helper carrying a pinned placeholder argument.
-      // Specialize the encoding-stripped callee signature, then let the
-      // fixpoint re-infer its body and synchronize its return/call result
-      // types. The original pin remains authoritative across the function
-      // boundary.
+      // tt.call to a @triton.jit helper carrying a pinned placeholder or a
+      // concrete require_layout anchor. Specialize the encoding-stripped
+      // callee signature, then let the fixpoint re-infer its body and
+      // synchronize its return/call result types. The original pin remains
+      // authoritative across the function boundary.
       if (auto callOp = dyn_cast<::mlir::triton::CallOp>(op)) {
         Attribute enc;
         for (Value a : callOp.getOperands())
           if (auto t = dyn_cast<RankedTensorType>(a.getType()))
-            if (isPlaceholderEncoding(t.getEncoding())) {
+            if (isPlaceholderEncoding(t.getEncoding()) ||
+                concreteLayoutAnchors.contains(a)) {
               enc = t.getEncoding();
               break;
             }
         auto callee =
-            enc ? SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+            enc ? symbolTables.lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
                       callOp, callOp.getCalleeAttr())
                 : ::mlir::triton::FuncOp();
         if (!callee)
@@ -1442,16 +1586,9 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
         // clone a private copy after the walk and point this call at it, so
         // specializing never changes types out from under other callers or
         // toggles a shared callee between two pins across fixpoint iterations.
-        if (auto symUses = SymbolTable::getSymbolUses(callee, mod)) {
-          unsigned useCount = 0;
-          for (const auto &u : *symUses) {
-            (void)u;
-            ++useCount;
-          }
-          if (useCount > 1) {
-            pendingClones.push_back(callOp);
-            return;
-          }
+        if (symbolUsers.getUsers(callee).size() > 1) {
+          pendingClones.push_back(callOp);
+          return;
         }
         // Triton monomorphizes @triton.jit helpers with encoding-stripped
         // (null) signatures, so specialize params (entry block args +
@@ -1463,9 +1600,11 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
             callee.getFunctionType().getInputs().end());
         bool inputsChanged = false;
         for (unsigned i = 0; i < callOp.getNumOperands(); ++i) {
-          Type at = callOp.getOperand(i).getType();
+          Value operand = callOp.getOperand(i);
+          Type at = operand.getType();
           auto rt = dyn_cast<RankedTensorType>(at);
-          if (!rt || !isPlaceholderEncoding(rt.getEncoding()))
+          if (!rt || (!isPlaceholderEncoding(rt.getEncoding()) &&
+                      !concreteLayoutAnchors.contains(operand)))
             continue;
           if (i < newInputs.size() && newInputs[i] != at) {
             newInputs[i] = at;
@@ -1555,13 +1694,23 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
     // cannot change types out from under other callers.
     for (auto callOp : pendingClones) {
       auto callee =
-          SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+          symbolTables.lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
               callOp, callOp.getCalleeAttr());
       if (!callee)
         continue;
-      privatizeHelperForCall(callOp, callee, "_tlxpin");
+      privatizeHelperForCall(callOp, callee, "_tlxpin", symbolTables);
       changed = true;
     }
+    // View inference can resolve a deferred layout to a concrete encoding
+    // during this sweep. Its users (including arith casts) and helper return
+    // ABIs must then participate in the same fixpoint: they were still
+    // encoding-free when the initial concrete reconciliation ran.
+    if (failed(synchronizeConcreteHelperABI(mod, changed)) ||
+        failed(reconcileEncodingUniformOps(mod, changed)) ||
+        failed(reconcileDotLayouts(mod, changed)) ||
+        failed(reconcileRegionCarriedLayouts(mod, changed)) ||
+        failed(reconcileWarpPredicateLayouts(mod, changed)))
+      return failure();
   }
   return success();
 }
@@ -1732,6 +1881,7 @@ public:
       bool hasExclusiveWS = false;
       bool hasNoEndingClusterSync = false;
       bool hasLessRegMMA = false;
+      bool hasNoWsHeaderTidReuse = false;
       std::optional<int32_t> mbarrierTryWaitSuspendNs;
       mod.walk([&](ttg::WarpSpecializeOp op) {
         ++numWarpSpecializeOps;
@@ -1741,6 +1891,8 @@ public:
           hasNoEndingClusterSync = true;
         if (op->hasAttr("tlx.less_reg_mma"))
           hasLessRegMMA = true;
+        if (op->hasAttr("tlx.no_ws_header_tid_reuse"))
+          hasNoWsHeaderTidReuse = true;
         if (auto attr = op->getAttrOfType<IntegerAttr>(
                 "tlx.mbarrier_try_wait_suspend_ns")) {
           int32_t value = attr.getInt();
@@ -1756,6 +1908,11 @@ public:
       // NVIDIA MMA lowering reads this off the module.
       if (hasLessRegMMA)
         mod->setAttr("tlx.less_reg_mma", b.getUnitAttr());
+      // `no_ws_header_tid_reuse`: hacky knob for when PTXAS spills a %tid.x
+      // that is computed in the warp-specialize header and kept live into the
+      // tasks. The NVIDIA warp-specialize lowering reads this off the module.
+      if (hasNoWsHeaderTidReuse)
+        mod->setAttr("tlx.no_ws_header_tid_reuse", b.getUnitAttr());
       if (hasExclusiveWS) {
         if (numWarpSpecializeOps != 1) {
           mod.emitError()

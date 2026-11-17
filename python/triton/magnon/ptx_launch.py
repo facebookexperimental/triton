@@ -13,7 +13,8 @@ Because the PTX is frozen, what we tune is byte-identical to production and the 
 Launch ABI (discovered from third_party/nvidia/backend/driver.py): the kernel params are the
 NON-constexpr, NON-`equal_to_1`-specialized scalar/pointer args in source order, followed by two
 trailing internal pointers -- `global_scratch` then `profile_scratch` -- which are NULL when their
-sizes are 0. The PTX `.visible .entry` param list is authoritative for the count/types; callers
+sizes are 0. A non-zero global scratch (e.g. device-side TMA descriptors from tl.make_tensor_descriptor)
+is recorded in the spec and allocated by the launcher as grid_size * size bytes. The PTX `.visible .entry` param list is authoritative for the count/types; callers
 build `kernel_args` to match and we assert parity against the PTX before launching.
 """
 
@@ -110,6 +111,62 @@ def parse_entry(ptx: str):
     return name, [_param_kind(p) for p in params]
 
 
+def _specialize_ordered_args(ordered_args):
+    """Apply the frontend's param specialization to the bound-order args: drop constexprs and
+    equal_to_1 integer scalars (bool -> int, kept), and return the surviving
+    ("tensor" | "tensordesc" | "scalar", ...) entries in order -- the ones that map onto real kernel
+    params. Shared by build_spec (PTX-driven) and build_spec_from_schema (schema-driven) so the two
+    apply identical specialization."""
+    survivors = []
+    for a in ordered_args:
+        if a[0] == "constexpr":
+            continue
+        if a[0] in ("tensor", "tensordesc"):
+            survivors.append(a)
+        elif a[0] == "scalar":
+            v = a[1]
+            if isinstance(v, bool):
+                survivors.append(("scalar", int(v)))
+            elif isinstance(v, int) and v == 1:
+                continue
+            else:
+                survivors.append(("scalar", v))
+        else:
+            raise NotImplementedError(f"unsupported arg kind {a[0]!r}")
+    return survivors
+
+
+def _is_pointer_type(ty: str) -> bool:
+    """True if a Triton signature type string denotes a global pointer (e.g. '*fp16', '*i8')."""
+    return ty.startswith("*")
+
+
+def _scalar_kind_from_type(ty: str) -> str:
+    """Map a Triton scalar signature type ('i32', 'i64', 'fp32', 'fp64', ...) to a launch-arg kind,
+    matching what _param_kind derives from the PTX param for the same argument."""
+    t = ty.lstrip("*")
+    if t in ("i64", "u64"):
+        return "i64"
+    if t in ("fp64", "f64"):
+        return "f64"
+    if t in ("fp32", "f32"):
+        return "f32"
+    if t and t[0] in ("i", "u"):  # i1/i8/i16/i32/u32/... ride a 32-bit slot
+        return "i32"
+    raise NotImplementedError(f"unsupported scalar schema type {ty!r}")
+
+
+def _scratch(gss: int, gss_align: int, pss: int):
+    """Return (spec["global_scratch"] or None, the two trailing scratch args). A non-zero global
+    scratch becomes a {"global_scratch": true} arg the launcher fills with a per-launch buffer of
+    grid_size * size bytes; profile scratch (proton instrumentation) is not supported."""
+    if pss:
+        raise NotImplementedError(f"non-null profile scratch (size={pss})")
+    if not gss:
+        return None, [{"null": True}, {"null": True}]
+    return {"size": gss, "align": gss_align}, [{"global_scratch": True}, {"null": True}]
+
+
 def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str, ptxas_version: str = "") -> dict:
     """Build the source-free launch spec from a compiled kernel + its (bound-order) call args.
 
@@ -123,26 +180,26 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str, ptxas_version
     Applies Triton's specialization (drop constexprs and `equal_to_1` integer scalars), maps the
     survivors onto the PTX `.entry` param slots -- including expanding each TensorDescriptor into its
     [tensormap, *shape, *strides] params (the TMA ABI, see nvidia/backend/driver.py
-    make_tensordesc_arg) -- and appends the two trailing null scratch pointers. Backing tensors are
-    deduped by `id` so descriptors that share a tensor share one allocation.
+    make_tensordesc_arg) -- and appends the two trailing scratch pointers (see _scratch). Backing tensors
+    are deduped by `id` so descriptors that share a tensor share one allocation.
 
     Cluster shape is read from ``metadata.ctas_per_cga`` ONLY: that is the sole field TLX kernels set to
     request a cluster (the CUDA-native path), and the nvidia backend mirrors it into ``cluster_dims`` in
     ``Metadata.__post_init__`` -- so ctas_per_cga is authoritative and cluster_dims/cluster are not read.
 
-    Raises NotImplementedError for kernels this PTX-direct path does not cover yet (non-null
-    global/profile scratch, multi-CTA/cluster, fp4-padded/im2col TMA, other arg types, or any param
-    mismatch) so the caller fails open and simply does not collect that kernel."""
+    Raises NotImplementedError for kernels this PTX-direct path does not cover yet (non-null profile
+    scratch, multi-CTA/cluster, fp4-padded/im2col TMA, other arg types, or any param mismatch) so the
+    caller fails open and simply does not collect that kernel."""
     name, kinds = parse_entry(ptx)
     gss = int(getattr(metadata, "global_scratch_size", 0) or 0)
+    gss_align = int(getattr(metadata, "global_scratch_align", 1) or 1)
     pss = int(getattr(metadata, "profile_scratch_size", 0) or 0)
     num_ctas = int(getattr(metadata, "num_ctas", 1) or 1)
     # Cluster shape from ctas_per_cga only (see docstring): the field TLX kernels populate; the backend
     # mirrors it into cluster_dims, so ctas_per_cga is authoritative.
     cluster = list(getattr(metadata, "ctas_per_cga", None) or [1, 1, 1])
     tdmeta = list(getattr(metadata, "tensordesc_meta", None) or [])
-    if gss or pss:
-        raise NotImplementedError(f"non-null scratch (global={gss} profile={pss})")
+    global_scratch, scratch_args = _scratch(gss, gss_align, pss)
     # Cluster support is limited to the TLX / CUDA-native path: num_ctas == 1 with the cluster shape
     # carried by the cubin's `.reqnctapercluster` directive, so a plain launch with the total-CTA grid
     # re-forms the clusters (matches the frontend launcher, which sets NO CLUSTER_DIMENSION attr for
@@ -175,22 +232,7 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str, ptxas_version
         return idx
 
     # Specialize: drop constexprs and equal_to_1 int scalars (what Triton removes from kernel params).
-    survivors = []
-    for a in ordered_args:
-        if a[0] == "constexpr":
-            continue
-        if a[0] in ("tensor", "tensordesc"):
-            survivors.append(a)
-        elif a[0] == "scalar":
-            v = a[1]
-            if isinstance(v, bool):
-                survivors.append(("scalar", int(v)))
-            elif isinstance(v, int) and v == 1:
-                continue
-            else:
-                survivors.append(("scalar", v))
-        else:
-            raise NotImplementedError(f"unsupported arg kind {a[0]!r}")
+    survivors = _specialize_ordered_args(ordered_args)
 
     args, tensordescs, ki, tdmi = [], [], 0, 0
 
@@ -245,7 +287,7 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str, ptxas_version
 
     if ki != len(user_kinds):
         raise NotImplementedError(f"param parity: consumed {ki} != {len(user_kinds)} PTX user params")
-    args += [{"null": True}, {"null": True}]  # global_scratch, profile_scratch
+    args += scratch_args
 
     g = [int(grid[0]), int(grid[1]) if len(grid) > 1 else 1, int(grid[2]) if len(grid) > 2 else 1]
     # A clustered launch re-forms clusters from the total-CTA grid via `.reqnctapercluster`; the driver
@@ -267,6 +309,97 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str, ptxas_version
         spec["cluster"] = cluster
     if tensordescs:
         spec["tensordescs"] = tensordescs
+    if global_scratch:
+        spec["global_scratch"] = global_scratch
+    return spec
+
+
+def build_spec_from_schema(schema: dict, ptx: str, grid, ordered_args, ptxas: str) -> dict:
+    """PROTOTYPE alternative to build_spec: source the post-specialization param list from the
+    compiler's Level 0 launch-metadata schema (``kernel.asm["launch_metadata"]``, see the nvidia
+    backend's make_launch_metadata) instead of parsing the PTX .entry and re-deriving specialization.
+    Produces the IDENTICAL spec.json shape as build_spec, so the factory replay path is unchanged.
+
+    Why: build_spec re-implements the frontend's specialization + PTX-param ABI, so the kernel arg
+    list lives in two places and can silently drift. The schema is the compiler's own source of
+    truth -- it carries the entry name, num_warps/num_ctas, shared, cluster_dims, scratch sizes, and
+    the args[] list (Triton types, constants already dropped). This maps captured runtime VALUES
+    (tensor allocations, scalar values from ordered_args) onto schema["args"] 1:1, so no PTX param
+    parsing is needed.
+
+    Scope (prototype): tensor + scalar params only. tensordesc/TMA args raise NotImplementedError --
+    the Level 0 schema lists a descriptor as ONE arg and does not carry the flattened
+    [tensormap, *shape, *strides] leaf kinds (that flattening lives in expand_signature / the Level 1
+    C launcher), so full TMA coverage needs PTX or Level 1, not Level 0 alone. ``arch`` is still read
+    from the PTX .target, which the schema does not carry."""
+    num_ctas = int(schema.get("num_ctas") or 1)
+    cluster = [int(c) for c in (schema.get("cluster_dims") or [1, 1, 1])]
+    gss = int(schema.get("global_scratch_size") or 0)
+    gss_align = int(schema.get("global_scratch_align") or 1)
+    pss = int(schema.get("profile_scratch_size") or 0)
+    num_warps = int(schema.get("num_warps") or 1)
+    shared = int(schema.get("shared_mem") or 0)
+    schema_args = schema.get("args") or []
+
+    global_scratch, scratch_args = _scratch(gss, gss_align, pss)
+    if num_ctas != 1:
+        raise NotImplementedError(f"multi-CTA via num_ctas>1 (num_ctas={num_ctas})")
+    cluster_size = 1
+    for c in cluster:
+        cluster_size *= c
+
+    survivors = _specialize_ordered_args(ordered_args)
+    if len(survivors) != len(schema_args):
+        raise NotImplementedError(
+            f"schema/args parity: {len(schema_args)} schema params != {len(survivors)} runtime args")
+
+    tensors = []
+    _id2idx = {}
+
+    def _tensor_idx(info):
+        key = info.get("id")
+        if key is not None and key in _id2idx:
+            return _id2idx[key]
+        idx = len(tensors)
+        entry = {"shape": list(info["shape"]), "dtype": info["dtype"], "strides": list(info["strides"])}
+        if "pickle_sha256" in info:
+            entry["pickle_sha256"] = info["pickle_sha256"]
+        tensors.append(entry)
+        if key is not None:
+            _id2idx[key] = idx
+        return idx
+
+    args = []
+    for sarg, s in zip(schema_args, survivors, strict=True):
+        ty = str(sarg.get("type", ""))
+        if s[0] == "tensordesc":
+            raise NotImplementedError("tensordesc/TMA: Level 0 schema lacks flattened leaf kinds (needs PTX/Level 1)")
+        if s[0] == "tensor":
+            if not _is_pointer_type(ty):
+                raise NotImplementedError(f"tensor arg mapped to non-pointer schema type {ty!r}")
+            args.append({"t": _tensor_idx(s[1])})
+        else:  # scalar
+            k = _scalar_kind_from_type(ty)
+            args.append({k: int(s[1]) if k in ("i32", "i64") else float(s[1])})
+    args += scratch_args
+
+    g = [int(grid[0]), int(grid[1]) if len(grid) > 1 else 1, int(grid[2]) if len(grid) > 2 else 1]
+    if cluster_size != 1 and any(gd % cd != 0 for gd, cd in zip(g, cluster, strict=True)):
+        raise NotImplementedError(f"grid {g} not divisible by cluster {cluster}")
+    spec = {
+        "entry": schema.get("entry_name") or "",
+        "arch": parse_arch(ptx),
+        "shared": shared,
+        "block": [num_warps * 32, 1, 1],
+        "grid": g,
+        "ptxas": ptxas,
+        "tensors": tensors,
+        "args": args,
+    }
+    if cluster_size != 1:
+        spec["cluster"] = cluster
+    if global_scratch:
+        spec["global_scratch"] = global_scratch
     return spec
 
 
@@ -365,9 +498,11 @@ def load_cubin(cubin: bytes, name: str, shared: int) -> LoadedKernel:
 #     "grid": [4,4,1],
 #     "tensors": [{"shape":[256,256],"dtype":"float16","strides":[256,1]}, ...],
 #     "args": [ {"t":0}, {"t":1}, {"t":2}, {"i32":256}, ..., {"null":true}, {"null":true} ],
+#     "global_scratch": {"size": 128, "align": 128},   # only when the kernel uses global scratch
 #   }
 # "args" is the FINAL kernel-param order (post equal_to_1 / constexpr specialization) including the
-# two trailing null scratch params; {"t":i} is a pointer to tensors[i].
+# two trailing scratch params; {"t":i} is a pointer to tensors[i], {"global_scratch":true} a pointer to
+# a grid_size * global_scratch.size byte buffer (see alloc_global_scratch).
 # --------------------------------------------------------------------------------------
 _DT = {
     "float16": "float16",
@@ -420,8 +555,24 @@ def build_tensormaps(spec, tensors):
     return objs, addrs
 
 
-def kernel_args_from_spec(spec, tensors, tensormap_addrs=None):
-    """Turn the spec's final arg list + allocated tensors (+ tensormap addrs) into launch() args."""
+def alloc_global_scratch(spec, device="cuda"):
+    """Allocate the spec's global scratch: grid_size * size bytes (num_ctas is always 1 here), aligned
+    to `align`, as the Triton launcher does per launch. Returns a uint8 view (KEEP ALIVE across launch)
+    or None when the kernel uses no global scratch."""
+    gs = spec.get("global_scratch")
+    if not gs:
+        return None
+    import torch
+    gx, gy, gz = spec["grid"]
+    size, align = gx * gy * gz * int(gs["size"]), int(gs["align"])
+    buf = torch.zeros(size + align, dtype=torch.uint8, device=device)
+    off = -buf.data_ptr() % align
+    return buf[off:off + size]
+
+
+def kernel_args_from_spec(spec, tensors, tensormap_addrs=None, global_scratch=None):
+    """Turn the spec's final arg list + allocated tensors (+ tensormap addrs, + the
+    alloc_global_scratch buffer) into launch() args."""
     tensormap_addrs = tensormap_addrs or []
     ka = []
     for a in spec["args"]:
@@ -429,6 +580,10 @@ def kernel_args_from_spec(spec, tensors, tensormap_addrs=None):
             ka.append(("ptr", tensors[a["t"]].data_ptr()))
         elif "tma" in a:
             ka.append(("tma", tensormap_addrs[a["tma"]]))
+        elif a.get("global_scratch"):
+            if global_scratch is None:
+                raise ValueError("spec needs a global scratch buffer (see alloc_global_scratch)")
+            ka.append(("ptr", global_scratch.data_ptr()))
         elif a.get("null"):
             ka.append(("null", ))
         elif "i32" in a:

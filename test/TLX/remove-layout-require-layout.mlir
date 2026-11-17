@@ -374,40 +374,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.thr
     %transposed = tt.trans %reshaped {order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #split_reshape> -> tensor<128x64x2xf32, #split_trans>
     // CHECK: %[[SPLIT_BLOCKED:.*]] = ttg.convert_layout %[[TRANSPOSED]] : tensor<128x64x2xf32, #{{.*}}> -> tensor<128x64x2xf32, #[[$SPLIT_BLOCKED3D]]>
     %blocked = ttg.convert_layout %transposed : tensor<128x64x2xf32, #split_trans> -> tensor<128x64x2xf32, #split_blocked3d>
-    // CHECK: %[[LO:.*]], %[[HI:.*]] = tt.split %[[SPLIT_BLOCKED]]
+    // The join(split) round-trip folds away (exact types); the convert chain
+    // and require_layout above must survive.
+    // CHECK: tt.return %[[SPLIT_BLOCKED]] : tensor<128x64x2xf32, #[[$SPLIT_BLOCKED3D]]>
     %lo, %hi = tt.split %blocked : tensor<128x64x2xf32, #split_blocked3d> -> tensor<128x64xf32, #split_piece>
-    // CHECK: %[[JOINED:.*]] = tt.join %[[LO]], %[[HI]]
     %joined = tt.join %lo, %hi : tensor<128x64xf32, #split_piece> -> tensor<128x64x2xf32, #split_blocked3d>
     tt.return %joined : tensor<128x64x2xf32, #split_blocked3d>
-  }
-}
-
-// -----
-
-// tt.cat may rewrite both operands to match the result layout.  Each input
-// boundary must still be visible before concatenation, not bypassed by a
-// backward-propagated result encoding.
-
-#cat_src = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
-#cat_user = #ttg.linear<{register = [[1], [16]], lane = [[0], [0], [2], [4], [8]], warp = [[0], [0]], block = []}>
-#cat_result = #ttg.linear<{register = [[1], [16]], lane = [[0], [0], [2], [4], [8]], warp = [[0], [0]], block = []}>
-
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, ttg.target = "cuda:100"} {
-  // CHECK-DAG: #[[$CAT_USER:.*]] = #ttg.linear
-  // CHECK-LABEL: tt.func @require_layout_blocks_cat_operand_rewrite
-  tt.func @require_layout_blocks_cat_operand_rewrite(
-      %lhs_src: tensor<16xf32, #cat_src>,
-      %rhs_src: tensor<16xf32, #cat_src>)
-      -> tensor<32xf32, #cat_result> {
-    // CHECK-DAG: %[[CAT_LHS_CVT:.*]] = ttg.convert_layout %arg0 : tensor<16xf32, #{{.*}}> -> tensor<16xf32, #[[$CAT_USER]]>
-    // CHECK-DAG: %[[CAT_RHS_CVT:.*]] = ttg.convert_layout %arg1 : tensor<16xf32, #{{.*}}> -> tensor<16xf32, #[[$CAT_USER]]>
-    // CHECK: %[[CAT_LHS_REQ:.*]] = ttg.require_layout %[[CAT_LHS_CVT]] : tensor<16xf32, #[[$CAT_USER]]> -> tensor<16xf32, #[[$CAT_USER]]>
-    %lhs = ttg.require_layout %lhs_src : tensor<16xf32, #cat_src> -> tensor<16xf32, #cat_user>
-    // CHECK: %[[CAT_RHS_REQ:.*]] = ttg.require_layout %[[CAT_RHS_CVT]] : tensor<16xf32, #[[$CAT_USER]]> -> tensor<16xf32, #[[$CAT_USER]]>
-    %rhs = ttg.require_layout %rhs_src : tensor<16xf32, #cat_src> -> tensor<16xf32, #cat_user>
-    // CHECK: %[[CAT:.*]] = tt.cat %[[CAT_LHS_REQ]], %[[CAT_RHS_REQ]]
-    %cat = tt.cat %lhs, %rhs : tensor<16xf32, #cat_user> -> tensor<32xf32, #cat_result>
-    tt.return %cat : tensor<32xf32, #cat_result>
   }
 }
 

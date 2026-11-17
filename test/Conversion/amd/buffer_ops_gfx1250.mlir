@@ -1,4 +1,6 @@
 // RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 | FileCheck %s
+// RUN: not triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 2>&1 | FileCheck %s --check-prefix=CLUSTER-ERROR
+// CLUSTER-ERROR: error: 'amdg.buffer_atomic_rmw' op cluster_scope requires gfx1250
 
 // Test buffer atomic RMW fadd with f32 on gfx1250
 // Verifies correct cache policy with SCOPE_DEV and fence generation
@@ -21,7 +23,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 
     // There should be a single acquire fence after all of the atomics
     // CHECK: llvm.fence syncscope("agent") acquire
-    %ret = amdg.buffer_atomic_rmw fadd, acq_rel, gpu, %values, %arg0[%offset] : tensor<128xf32, #blocked>
+    %ret = amdg.buffer_atomic_rmw fadd, acq_rel, gpu, %values, %arg0[%offset] : !tt.ptr<f32> -> tensor<128xf32, #blocked>
     tt.return
   }
 }
@@ -50,10 +52,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK: rocdl.raw.ptr.buffer.atomic.cmpswap {{.*}}, 17 : i32
     // CHECK: rocdl.raw.ptr.buffer.atomic.cmpswap {{.*}}, 17 : i32
     // CHECK: llvm.fence syncscope("agent") acquire
-    %4 = amdg.buffer_atomic_cas acq_rel, gpu, %cmp, %val, %scalar_ptr[%offsets] : tensor<256xi32, #blocked>
+    %4 = amdg.buffer_atomic_cas acq_rel, gpu, %cmp, %val, %scalar_ptr[%offsets] : !tt.ptr<i32> -> tensor<256xi32, #blocked>
 
     %5 = tt.addptr %arg1, %1 : !tt.ptr<i32>, i32
-    amdg.buffer_store %4, %5[%offsets] : tensor<256xi32, #blocked>
+    amdg.buffer_store %4, %5[%offsets] : !tt.ptr<i32> -> tensor<256xi32, #blocked>
     tt.return
   }
 }
@@ -79,7 +81,62 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     // CHECK: llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"({{.*}}) : (vector<2xbf16>, !llvm.ptr<8>, i32, i32, i32) -> vector<2xbf16>
 
     // CHECK: llvm.fence syncscope("agent") acquire
-    %ret = amdg.buffer_atomic_rmw fadd, acq_rel, gpu, %values, %arg0[%offsets] : tensor<64xbf16, #blocked>
+    %ret = amdg.buffer_atomic_rmw fadd, acq_rel, gpu, %values, %arg0[%offsets] : !tt.ptr<bf16> -> tensor<64xbf16, #blocked>
     tt.return
+  }
+}
+
+// -----
+
+// Eviction policy overrides the temporal hint (TH) while preserving scope:
+// evict_first -> TH_NT(1), evict_last -> TH_HT(2). Bypass (TH=3) is preserved.
+
+#blocked0 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: buffer_load_eviction
+  tt.func @buffer_load_eviction(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %offset : tensor<128xi32, #blocked0>{tt.divisibility=16:i32}) {
+    // evict_first with no modifier: SCOPE_CU(0) | TH_NT(1) = 1
+    // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 1
+    %ret0 = amdg.buffer_load %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = none, eviction_policy = evict_first>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+    // evict_last with no modifier: SCOPE_CU(0) | TH_HT(2) = 2
+    // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 2
+    %ret1 = amdg.buffer_load %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = none, eviction_policy = evict_last>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+    // evict_last with .cg keeps device scope: SCOPE_DEV(16) | TH_HT(2) = 18
+    // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 18
+    %ret2 = amdg.buffer_load %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = cg, eviction_policy = evict_last>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+    // evict_first never weakens the .cv bypass: SCOPE_SYS(24) | TH_LU(3) = 27
+    // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 27
+    %ret3 = amdg.buffer_load %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = cv, eviction_policy = evict_first>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+    // evict_last never weakens the .cv bypass either: SCOPE_SYS(24) | TH_LU(3) = 27
+    // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, {{.*}}, {{.*}}, 27
+    %ret4 = amdg.buffer_load %arg0[%offset] {cachePolicy = #tt.cache_policy<cache_modifier = cv, eviction_policy = evict_last>} : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: buffer_atomic_cluster_no_return
+  tt.func @buffer_atomic_cluster_no_return(%ptr: !tt.ptr<f32>, %offsets: tensor<32xi32, #blocked>, %values: tensor<32xf32, #blocked>) {
+    // CHECK: llvm.mlir.constant(8 : i32)
+    // CHECK: llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"
+    %unused = amdg.buffer_atomic_rmw fadd, relaxed, gpu, %values, %ptr[%offsets] {cluster_scope = true} : !tt.ptr<f32> -> tensor<32xf32, #blocked>
+    tt.return
+  }
+  // CHECK-LABEL: buffer_atomic_cluster_return
+  tt.func @buffer_atomic_cluster_return(%ptr: !tt.ptr<f32>, %offsets: tensor<32xi32, #blocked>, %values: tensor<32xf32, #blocked>) -> tensor<32xf32, #blocked> {
+    // CHECK: llvm.mlir.constant(9 : i32)
+    // CHECK: llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"
+    %old = amdg.buffer_atomic_rmw fadd, relaxed, gpu, %values, %ptr[%offsets] {cluster_scope = true} : !tt.ptr<f32> -> tensor<32xf32, #blocked>
+    tt.return %old : tensor<32xf32, #blocked>
+  }
+  // CHECK-LABEL: buffer_atomic_default_return
+  tt.func @buffer_atomic_default_return(%ptr: !tt.ptr<f32>, %offsets: tensor<32xi32, #blocked>, %values: tensor<32xf32, #blocked>) -> tensor<32xf32, #blocked> {
+    // CHECK: llvm.mlir.constant(17 : i32)
+    // CHECK: llvm.call_intrinsic "llvm.amdgcn.raw.ptr.buffer.atomic.fadd"
+    %old = amdg.buffer_atomic_rmw fadd, relaxed, gpu, %values, %ptr[%offsets] : !tt.ptr<f32> -> tensor<32xf32, #blocked>
+    tt.return %old : tensor<32xf32, #blocked>
   }
 }

@@ -29,11 +29,9 @@ DIAGONAL_LAZY_RESCALE_THRESHOLD = tl.constexpr(4.0)
 DIAGONAL_LAZY_RESCALE_THRESHOLD_FP16 = tl.constexpr(8.0)
 CDNA_WAVE_SIZE = tl.constexpr(64)
 CDNA_MFMA_ROWS_PER_WAVE = tl.constexpr(32)
-_LN_2 = tl.constexpr(0.6931471805599453)
 
 _CLUSTER_PIPELINE_STAGE_COUNT = 4
 _CLUSTER_AUTOTUNE_NUM_WARPS = tuple(range(1, 9))
-_CLUSTER_EXPLICIT_STAGE_PRIORITY_MAX_N = tl.constexpr(512)
 _CLUSTER_STATIC_FP16_K_ROW_MIN_N = 4096
 _CLUSTER_STATIC_BF16_K_ROW_MIN_N = 16384
 _CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS = (("amdgpu-agpr-alloc", "0,0"), )
@@ -154,6 +152,16 @@ def _assume_strides(
 
 
 @triton.jit
+def _i64_strides(stride_z, stride_h, stride_n, stride_d):
+    return (
+        tl.cast(stride_z, tl.int64),
+        tl.cast(stride_h, tl.int64),
+        tl.cast(stride_n, tl.int64),
+        tl.cast(stride_d, tl.int64),
+    )
+
+
+@triton.jit
 def _split_cols(x):
     """Split a matrix into logical column halves without changing values.
 
@@ -179,6 +187,7 @@ def _concat_cols(x0, x1):
 @triton.jit
 def _sum_rows_chain4(x, ROTATE_FINAL: tl.constexpr):
     """Release the MFMA row sum to prevent repeated-RLC N8 relayouts."""
+    CDNA_MFMA_ROWS_PER_WAVE: tl.constexpr = 32
     tl.static_assert(x.shape[0] == CDNA_MFMA_ROWS_PER_WAVE * tlx.num_warps())
     tl.static_assert(x.shape[1] % 4 == 0)
     mma: tl.constexpr = tlx.amd_mfma_layout(
@@ -348,6 +357,7 @@ class SoftmaxState:
     @triton.jit
     def vec1_lazy_max(self, qk, QK_SCALE: tl.constexpr):
         """Advance the lazy softmax frame while retaining the score tile."""
+        LAZY_RESCALE_THRESHOLD: tl.constexpr = 8.0
         m_ij = SoftmaxState._row_max(qk * QK_SCALE)
         score_delta = m_ij - self.m_i
         advance = score_delta > LAZY_RESCALE_THRESHOLD
@@ -910,6 +920,7 @@ def _attn_inner_pipelined(
     # diagonal pruning, but the unmasked steady-state pipeline itself is still
     # a two-slot ping-pong schedule.  Keep that logical depth separate from
     # the allocation depth so lazy softmax can run on the same object.
+    _CLUSTER_EXPLICIT_STAGE_PRIORITY_MAX_N: tl.constexpr = 512
     LAZY_BUF_DEPTH: tl.constexpr = 2
     # N1024 BF16 loses overlap with the stock LLVM scheduler on the extended
     # drain. Keep that class on its established exact-rescale control flow.
@@ -1463,6 +1474,8 @@ def _attn_predicated_causal_tile(
     ENABLE_CLASS_DIAGONAL_LAZY: tl.constexpr,
 ):
     """Consume one diagonal tile for an active wave."""
+    DIAGONAL_LAZY_RESCALE_THRESHOLD: tl.constexpr = 4.0
+    DIAGONAL_LAZY_RESCALE_THRESHOLD_FP16: tl.constexpr = 8.0
     if BLOCK_N == 32:
         k_tile = tlx.local_slice(k_tile, [0, 0], [32, q.shape[1]])
         v_tile = tlx.local_slice(v_tile, [0, 0], [32, q.shape[1]])
@@ -1646,6 +1659,8 @@ def _attn_inner_short(
     PREFIX_DIAGONAL_HANDOFF: tl.constexpr,
 ):
     """Process ranges too short to safely fill the rotated four-stage pipeline."""
+    CDNA_MFMA_ROWS_PER_WAVE: tl.constexpr = 32
+    CDNA_WAVE_SIZE: tl.constexpr = 64
     FOUR_SLOT_PREFIX_HANDOFF: tl.constexpr = (PREFIX_DIAGONAL_HANDOFF and not USE_DIRECT_LOAD and MASK_STEPS
                                               and IS_CAUSAL and q.shape[0] == 256 and q.shape[1] == 128
                                               and BLOCK_N == 64 and BUF_DEPTH == 2 and tlx.num_warps() == 8
@@ -2048,7 +2063,15 @@ def _attn_cluster_tile(
     IS_CAUSAL: tl.constexpr,
     STORE_LSE: tl.constexpr,
     ALLOW_PRESCALE_Q: tl.constexpr,
+    USE_I64_OFFSETS: tl.constexpr = False,
 ):
+    CLUSTER_PIPELINE_STAGES: tl.constexpr = 4
+    _LN_2: tl.constexpr = 0.6931471805599453
+    if USE_I64_OFFSETS:
+        stride_qz, stride_qh, stride_qm, stride_qk = _i64_strides(stride_qz, stride_qh, stride_qm, stride_qk)
+        stride_kz, stride_kh, stride_kn, stride_kk = _i64_strides(stride_kz, stride_kh, stride_kn, stride_kk)
+        stride_vz, stride_vh, stride_vn, stride_vk = _i64_strides(stride_vz, stride_vh, stride_vn, stride_vk)
+        stride_oz, stride_oh, stride_om, stride_ok = _i64_strides(stride_oz, stride_oh, stride_om, stride_ok)
     q_off = off_z * stride_qz + off_h * stride_qh
     k_off = off_z * stride_kz + off_h * stride_kh
     v_off = off_z * stride_vz + off_h * stride_vh
@@ -2818,6 +2841,7 @@ def _attn_fwd_cluster_pipeline(
     LSE=None,
     STORE_LSE: tl.constexpr = False,
     ALLOW_PRESCALE_Q: tl.constexpr = True,
+    USE_I64_OFFSETS: tl.constexpr = False,
 ):
     if STATIC_STRIDE_KN >= 0:
         tile_stride_kn = STATIC_STRIDE_KN
@@ -2918,7 +2942,8 @@ def _attn_fwd_cluster_pipeline(
         v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, ALLOC_BUF_DEPTH)
     QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
     if STORE_LSE:
-        lse_base = LSE + (off_z * H + off_h) * N_CTX
+        lse_row = off_z * H + off_h
+        lse_base = LSE + (lse_row.to(tl.int64) if USE_I64_OFFSETS else lse_row) * N_CTX
     else:
         lse_base = Out
     _attn_cluster_tile(
@@ -2959,6 +2984,7 @@ def _attn_fwd_cluster_pipeline(
         IS_CAUSAL,
         STORE_LSE,
         ALLOW_PRESCALE_Q,
+        USE_I64_OFFSETS,
     )
 
 
@@ -2998,6 +3024,7 @@ def _attn_fwd_cluster_short_causal_pipeline(
     LSE=None,
     STORE_LSE: tl.constexpr = False,
     ALLOW_PRESCALE_Q: tl.constexpr = True,
+    USE_I64_OFFSETS: tl.constexpr = False,
 ):
     tl.static_assert(IS_CAUSAL)
     tl.static_assert(HEAD_DIM == 128)
@@ -3029,7 +3056,8 @@ def _attn_fwd_cluster_short_causal_pipeline(
     query_class = tl.program_id(1)
     off_z = tl.program_id(2)
     if STORE_LSE:
-        lse_base = LSE + (off_z * H + off_h) * N_CTX
+        lse_row = off_z * H + off_h
+        lse_base = LSE + (lse_row.to(tl.int64) if USE_I64_OFFSETS else lse_row) * N_CTX
     else:
         lse_base = Out
     k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, BUF_DEPTH)
@@ -3081,6 +3109,7 @@ def _attn_fwd_cluster_short_causal_pipeline(
                     IS_CAUSAL,
                     STORE_LSE,
                     ALLOW_PRESCALE_Q,
+                    USE_I64_OFFSETS,
                 )
     else:
         # Cloning eight N=1024 classes raises the unified register allocation
@@ -3125,6 +3154,7 @@ def _attn_fwd_cluster_short_causal_pipeline(
             IS_CAUSAL,
             STORE_LSE,
             ALLOW_PRESCALE_Q,
+            USE_I64_OFFSETS,
         )
 
 
@@ -3329,6 +3359,19 @@ def _validate_cluster_tiles(block_m, block_n):
         raise ValueError(f"cluster attention supports BLOCK_N 32 or 64, got {block_n}")
 
 
+def _needs_i64_offsets(shape, stride, block_rows):
+    """Whether a ``(B, H, N, D)`` tensor needs the cluster kernels' int64 offsets.
+
+    It does when an element offset the kernels form reaches 2**31, counting the masked rows of the last
+    ``block_rows``-row tile, or when one of its strides does not fit in int32.
+    """
+    batch, heads, seq, dim = shape
+    stride_b, stride_h, stride_n, stride_d = stride
+    rows = -(-seq // block_rows) * block_rows
+    max_offset = (batch - 1) * stride_b + (heads - 1) * stride_h + (rows - 1) * stride_n + (dim - 1) * stride_d
+    return max(stride) >= 1 << 31 or max_offset >= 1 << 31
+
+
 def flash_attn_cluster_pipeline(
     q,
     k,
@@ -3422,13 +3465,6 @@ def flash_attn_cluster_pipeline(
             launch_meta.setdefault("llvm_fn_attrs", _CLUSTER_SHORT_N1024_LLVM_FN_ATTRS)
     else:
         launch_meta["STATIC_STRIDE_KN"] = static_stride_kn
-        if D == 128 and block_m == 256 and num_warps == 8:
-            # Keeping both MFMA accumulators in VGPRs removes mixed AGPR/VGPR
-            # handoffs; the full-attention object also becomes spill-free.
-            launch_meta.setdefault(
-                "llvm_fn_attrs",
-                _CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS,
-            )
     if causal and D == 128 and block_m == 256 and block_n == 32 and N_CTX == 4096:
         # Reverse assignment wins the N4096 causal object. The spill-free
         # N2048 pruned object instead selects the forward stage-two plan above.
@@ -3440,27 +3476,21 @@ def flash_attn_cluster_pipeline(
             "USE_DIRECT_LOAD": False if use_direct_load is None else use_direct_load,
             "num_warps": num_warps,
         })
+    shape = (B, H, N_CTX, D)
+    q_stride, k_stride, v_stride, o_stride = q.stride(), k.stride(), v.stride(), o.stride()
+    if (_needs_i64_offsets(shape, q_stride, block_m) or _needs_i64_offsets(shape, k_stride, block_n)
+            or _needs_i64_offsets(shape, v_stride, block_n) or _needs_i64_offsets(shape, o_stride, block_m)
+            or _return_lse and _needs_i64_offsets((B, H, N_CTX, 1), (H * N_CTX, N_CTX, 1, 0), block_m)):
+        launch_meta["USE_I64_OFFSETS"] = True
     kernel[grid](
         q,
         k,
         v,
         o,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        o.stride(3),
+        *q_stride,
+        *k_stride,
+        *v_stride,
+        *o_stride,
         B,
         H,
         N_CTX,
@@ -3514,10 +3544,6 @@ def flash_attn_cluster_persistent_pipeline(q, k, v, sm_scale, causal=False, **kw
         **kw,
     }
     launch_meta.setdefault("enable_sched_group_barrier_scheduler", False)
-    if not causal and D == 128 and block_m == 256 and num_warps == 8:
-        # The persistent causal schedule loses overlap with VGPR-only
-        # allocation, while full attention benefits from removing AGPR moves.
-        launch_meta.setdefault("llvm_fn_attrs", _CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS)
     if not use_autotune:
         launch_meta.update({
             "USE_DIRECT_LOAD": False if use_direct_load is None else use_direct_load,

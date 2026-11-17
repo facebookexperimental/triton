@@ -27,8 +27,7 @@ constexpr int patternBenefitNvidiaTensorCoreSubviewPattern = 20;
 
 void populateElementwiseOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    ModuleAxisInfoAnalysis &axisInfoAnalysis, const TargetInfoBase &targetInfo,
-    PatternBenefit benefit);
+    ModuleAxisInfoAnalysis &axisInfoAnalysis, PatternBenefit benefit);
 
 // The given callback is invoked at the end of a successful rewrite. The
 // callback receives 1) the current source op, 2) the number of issued LLVM
@@ -36,7 +35,8 @@ void populateElementwiseOpToLLVMPatterns(
 // callback and, thus, handle backend-specific behaviors.
 void populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
-    RewritePatternSet &patterns, PatternBenefit benefit,
+    RewritePatternSet &patterns, ModuleAxisInfoAnalysis &axisInfoAnalysis,
+    PatternBenefit benefit,
     std::shared_ptr<DistributedCoordinateGroups> coordinateGroups = nullptr);
 
 void populateAssertOpToLLVMPattern(LLVMTypeConverter &typeConverter,
@@ -51,6 +51,7 @@ void populateMakeRangeOpToLLVMPattern(LLVMTypeConverter &typeConverter,
 
 void populateViewOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                   RewritePatternSet &patterns,
+                                  const TargetInfoBase &targetInfo,
                                   PatternBenefit benefit);
 
 void populateMinMaxFOpToLLVMPattern(LLVMTypeConverter &typeConverter,

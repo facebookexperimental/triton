@@ -1,0 +1,249 @@
+name: TLX.ops perf smoke
+# PR smoke gate for bundle (reactor) PRs: benches a small tlx.ops subset on
+# b200 and h100 and compares it against the nearest nightly baseline. Advisory
+# only -- posts a PR comment, never blocks. The full suite, the regression
+# detector, and bisection stay on the nightly workflow.
+
+on:
+  # `branches` matches the PR's target branch. Bundle PRs go from
+  # reactor/sync-train/plan-*/item-* into main, and GitHub has no
+  # trigger-level source-branch filter, so the resolve job's `if:` picks them.
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to bench (defaults to the selected workflow ref)
+        type: string
+        required: false
+        default: ''
+      pr:
+        description: PR number to comment on (blank = no comment)
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-smoke-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  TORCH_VERSION: "2.14.0"
+
+jobs:
+  resolve:
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'reactor/sync-train/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      head: ${{ steps.pick.outputs.head }}
+      pr_head: ${{ steps.pick.outputs.pr_head }}
+      base_date: ${{ steps.pick.outputs.base_date }}
+      pr: ${{ steps.pick.outputs.pr }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Pick head, base date, and PR
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_PR: ${{ inputs.pr }}
+          MERGE_SHA: ${{ github.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            # Bench GitHub's test merge commit: it is what lands, and it is the
+            # commit Fast correctness builds, so the wheel is a cache hit.
+            git fetch --no-tags --quiet origin "${MERGE_SHA}"
+            HEAD="${MERGE_SHA}"; BASE=$(git rev-parse "${MERGE_SHA}^1")
+            PR_HEAD="${HEAD_SHA}"; PR="${PR_NUMBER}"
+          elif [[ -n "${INPUT_PR}" ]]; then
+            HEAD=$(gh pr view "${INPUT_PR}" --json headRefOid --jq .headRefOid)
+            BASE=$(gh pr view "${INPUT_PR}" --json baseRefOid --jq .baseRefOid)
+            PR_HEAD="${HEAD}"; PR="${INPUT_PR}"
+          else
+            HEAD=$(git rev-parse "${INPUT_REF:-HEAD}")
+            BASE=$(git merge-base "${HEAD}" origin/main)
+            PR_HEAD="${HEAD}"; PR=""
+          fi
+          [[ "${HEAD}" =~ ^[0-9a-f]{40}$ ]] || { echo "bad head: ${HEAD}"; exit 1; }
+          [[ "${BASE}" =~ ^[0-9a-f]{40}$ ]] || { echo "bad base: ${BASE}"; exit 1; }
+          {
+            echo "head=${HEAD}"
+            echo "pr_head=${PR_HEAD}"
+            # Nightly summaries are named YYYYMMDD.<platform>.json.
+            echo "base_date=$(git show -s --format=%cd --date=format:%Y%m%d "${BASE}")"
+            echo "pr=${PR}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.head != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.resolve.outputs.head }}
+
+  smoke:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.head != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: b200
+            runner: nvidia-dgx-b200
+            torch_index: https://download.pytorch.org/whl/cu130
+          - platform: h100
+            runner: linux-gcp-h100
+            torch_index: https://download.pytorch.org/whl/cu130
+          # mi350 staged: uncomment after b200/h100 calibrate. The runner pool
+          # is small and shared with correctness + nightly, and the rocm env
+          # needs its own validation run first.
+          # - platform: mi350
+          #   runner: linux-fb-triton-mi350-1
+          #   torch_index: https://download.pytorch.org/whl/rocm7.2
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout suite at the benched commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.head }}
+      - name: Checkout CI actions
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .ci
+          sparse-checkout: .github/actions
+      - name: Set up test environment
+        uses: ./.ci/.github/actions/setup-test-env
+        with:
+          backend: ${{ contains(matrix.torch_index, 'rocm') && 'rocm' || 'cuda' }}
+          arch: ${{ matrix.platform == 'mi350' && 'gfx950' || '' }}
+          torch: torch==${{ env.TORCH_VERSION }}
+          torch-index-url: ${{ matrix.torch_index }}
+          packages: numpy pytest pytest-timeout torchao
+          # Keep the release torch on its bundled ROCm libraries.
+          rocm-lib-path: ""
+      - name: Refresh the linker cache
+        if: ${{ !contains(matrix.torch_index, 'rocm') }}
+        run: sudo ldconfig
+      - name: Install prebuilt Triton
+        uses: ./.ci/.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ needs.build.outputs.wheel_url }}
+          wheel-filename: ${{ needs.build.outputs.wheel_filename }}
+          wheel-sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      - name: Run smoke subset
+        id: run_bench
+        timeout-minutes: 30
+        # The harness asserts an absolute floor against the reference kernel;
+        # this smoke reports a ratio against the nightly instead, in the
+        # compare job's comment. A floor miss must not fail the workflow.
+        continue-on-error: true
+        run: |
+          rm -rf /tmp/tlx_benchmark
+          # mm (380 nightly cases) and norm_fwd (101) are --head trimmed;
+          # flash_attn* are small enough to run nearly whole. fwd-only keeps
+          # the smoke in budget; backward coverage stays nightly.
+          python -m pytest python/test/tlx_benchmark/test_ops_perf.py --import-mode=importlib \
+            -k "bench_mm or bench_flash_attn or bench_norm" --fwd-only --head 8 \
+            -v -s --timeout=1200 --junitxml="${RUNNER_TEMP}/perf-smoke.xml"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlx-ops-perf-smoke-${{ github.run_id }}-${{ matrix.platform }}
+          path: |
+            /tmp/tlx_benchmark/*.json
+            ${{ runner.temp }}/perf-smoke.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  compare:
+    needs: [resolve, build, smoke]
+    if: ${{ !cancelled() && needs.resolve.outputs.head != '' && needs.smoke.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tlx-ops-perf-smoke-${{ github.run_id }}-*
+          path: raw
+      - name: Summarize and compare vs nightly baselines
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.resolve.outputs.head }}
+          PR_HEAD: ${{ needs.resolve.outputs.pr_head }}
+          BASE_DATE: ${{ needs.resolve.outputs.base_date }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+        run: |
+          set -euo pipefail
+          : > verdict.md
+          echo "## TLX.ops perf smoke (advisory)" >> verdict.md
+          echo "" >> verdict.md
+          if [[ "${PR_HEAD}" != "${HEAD_SHA}" ]]; then
+            echo "Merge commit \`${HEAD_SHA:0:12}\` (PR head \`${PR_HEAD:0:12}\`) vs nearest nightly baselines." >> verdict.md
+          else
+            echo "Head \`${HEAD_SHA:0:12}\` vs nearest nightly baselines." >> verdict.md
+          fi
+          gh release download tlx-ops-bench --pattern '*.b200.json' --pattern '*.h100.json' --pattern '*.mi350.json' --dir history
+          TODAY=$(date -u +%Y%m%d)
+          for platform in b200 h100 mi350; do
+            dir="raw/tlx-ops-perf-smoke-${{ github.run_id }}-${platform}"
+            [[ -d "${dir}" ]] || continue  # platform not in the matrix (staged) or uploaded nothing
+            # upload-artifact keeps the bench JSON under tmp/tlx_benchmark/.
+            if [[ -z "$(find "${dir}" -name '*.json' -print -quit)" ]]; then
+              printf '\n### %s\n\nNo bench results (smoke job: %s) — no signal; check the smoke job log.\n' \
+                "${platform}" "${SMOKE_RESULT}" >> verdict.md
+              continue
+            fi
+            python3 .github/scripts/tlx_ops_bench_dashboard.py summarize "${dir}" \
+              --platform "${platform}" --version "0.0.0.dev${TODAY}" --sha "${HEAD_SHA}" --out "pr-${platform}.json"
+            python3 .github/scripts/tlx_ops_perf_smoke_compare.py "pr-${platform}.json" history \
+              --platform "${platform}" --base-date "${BASE_DATE}" --head "${HEAD_SHA}" --out "verdict-${platform}.md"
+            echo "" >> verdict.md
+            cat "verdict-${platform}.md" >> verdict.md
+          done
+          {
+            echo ""
+            echo "Full numbers stay on the nightly suite; smoke covers a \`--head 8 --fwd-only\`"
+            echo "subset (\`bench_mm\`, \`bench_flash_attn*\`, \`bench_norm\`)."
+          } >> verdict.md
+      - name: Comment on PR
+        if: needs.resolve.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.resolve.outputs.pr }}
+        run: |
+          set -euo pipefail
+          # One comment per PR, edited in place on later pushes.
+          MARKER='<!-- tlx-ops-perf-smoke -->'
+          { echo "${MARKER}"; cat verdict.md; } > comment.md
+          CID=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"${MARKER}\"))) | .id" | tail -n 1)
+          if [[ -n "${CID}" ]]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${CID}" -F body=@comment.md > /dev/null
+          else
+            gh pr comment "${PR}" --body-file comment.md
+          fi

@@ -388,7 +388,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     // CHECK: %[[PINNED_HINT_OFFSETS:.*]] = tlx.require_layout %{{.*}} : tensor<32x16xi32, #{{.*}}> -> tensor<32x16xi32, #[[$PINNED_HINT_OFFSET]]>
     // CHECK: %[[PINNED_HINT_MASK:.*]] = tlx.require_layout %{{.*}} : tensor<32x16xi1, #{{.*}}> -> tensor<32x16xi1, #[[$PINNED_HINT_OFFSET]]>
     // CHECK: amdg.buffer_load_to_local %{{.*}}{{\[}}%[[PINNED_HINT_OFFSETS]]{{\]}} mask = %[[PINNED_HINT_MASK]] into %{{.*}} {contiguity = 2 : i32}
-    %tok = amdg.buffer_load_to_local %ptr[%offsets] mask = %mask into %buf {contiguity = 2 : i32} : <bf16>[tensor<32x16xi32, #blocked_hint>] -> <32x16xbf16, #user_hint, #smem_hint, mutable>
+    %tok = amdg.buffer_load_to_local %ptr[%offsets] mask = %mask into %buf {contiguity = 2 : i32} : !tt.ptr<bf16>[tensor<32x16xi32, #blocked_hint>] -> <32x16xbf16, #user_hint, #smem_hint, mutable>
     tt.return
   }
 }
