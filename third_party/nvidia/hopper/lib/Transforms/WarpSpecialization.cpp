@@ -123,23 +123,7 @@ public:
   }
 
   void runOnFuncOp(triton::FuncOp funcOp) {
-    // Warp specialization is enabled for this function if any op carries WS
-    // metadata: an `async_task_id` or `ttg.partition` tag, or a loop marked
-    // with the warp-specialize attribute. A single walk with early-out
-    // suffices.
-    bool enabled = false;
-    funcOp->walk([&](Operation *op) {
-      if (op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName) ||
-          op->getAttrOfType<DenseI32ArrayAttr>(
-              triton::gpu::kPartitionAttrName) ||
-          (isa<scf::ForOp, scf::WhileOp>(op) &&
-           op->hasAttr(mlir::triton::kWarpSpecializeAttrName))) {
-        enabled = true;
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    });
-    if (!enabled)
+    if (!triton::isMetaWarpSpecializedFunc(funcOp))
       return;
 
     int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
@@ -162,7 +146,7 @@ public:
     dumpAfter(moduleOp, "doTaskIdPropagate");
 
     // Final eligibility gate, and the last one before the pipeline starts
-    // rewriting ops. `enabled` above only proves someone *asked* for warp
+    // rewriting ops. The gate above only proves someone *asked* for warp
     // specialization (a `tt.warp_specialize` loop marker). Whether there is
     // anything to specialize is decided by the partitions, which
     // PartitionSchedulingMeta assigns as `ttg.partition` and doTaskIdPropagate
