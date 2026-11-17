@@ -866,6 +866,7 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.kda._decode_shapes",
         "triton.tlx.ops.kernels.fused.linear_rowscale._shapes",
         "triton.tlx.ops.kernels.fused.norm_residual_norm._shapes",
+        "triton.tlx.ops.kernels.fused.rmsnorm_gate._shapes",
         "triton.tlx.ops.kernels.mla_window_attn._shapes",
         "triton.tlx.ops.kernels.mm._shapes",
         "triton.tlx.ops.kernels.moe._routing_shapes",
@@ -920,6 +921,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.kda._decode_shapes": {"gfx950": ("gfx950_1", )},
         "triton.tlx.ops.kernels.fused.linear_rowscale._shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.fused.norm_residual_norm._shapes": {"gfx950": ("gfx950_all", )},
+        "triton.tlx.ops.kernels.fused.rmsnorm_gate._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.mla_window_attn._shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.norm._cat_shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.norm._shapes": {
@@ -1040,6 +1042,7 @@ BENCH_MODULES = (
     "bench_qk_norm_rope_kv_cache",
     "bench_router_gemm",
     "bench_rmsnorm_cat",
+    "bench_rmsnorm_gate",
     "bench_swiglu_ffn",
 )
 

@@ -18,8 +18,9 @@ or one of the fused operators below.
 
 Fused operators (`tlx/ops/kernels/fused/`) run steps that would otherwise be separate kernels in one launch:
 `addmm_mul_add` and `linear_rowscale` fuse an elementwise epilogue into a GEMM, `norm_residual_norm`
-fuses the post-norm, gated residual add and pre-norm of a residual-stream boundary, and
-`qk_norm_rope_kv_cache` fuses the q/k head norm, RoPE, FP8 quantization and paged KV cache write.
+fuses the post-norm, gated residual add and pre-norm of a residual-stream boundary,
+`qk_norm_rope_kv_cache` fuses the q/k head norm, RoPE, FP8 quantization and paged KV cache write, and
+`rmsnorm_gate` fuses a per-head RMSNorm with a sigmoid output gate.
 
 ```
 options:
@@ -85,6 +86,7 @@ options:
 | `linear_rowscale` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 | `norm_residual_norm` | `torch.compile` of the unfused module sequence | speedup >= 0.9x | heuristic |
 | `qk_norm_rope_kv_cache` | `torch.compile` of the eager norm, RoPE and cache scatter | speedup >= 0.9x | heuristic |
+| `rmsnorm_gate` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 
 `paged_prefill` covers BF16 causal GQA8 (16Q/2KV, 32Q/4KV and 128Q/16KV),
 D64, 64-token shuffled pages on gfx1250, globally and with a 2048-token
