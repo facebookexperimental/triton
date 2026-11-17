@@ -215,6 +215,22 @@ public:
       return bailOut(funcOp);
     }
 
+    // With a single partition there is nothing to specialize, and code
+    // partitioning would not thread buffer counters through the loop.
+    Operation *firstMMA = nullptr;
+    funcOp.walk([&](triton::nvidia_gpu::MMAv5OpInterface mmaOp) {
+      firstMMA = mmaOp;
+      return WalkResult::interrupt();
+    });
+    if (firstMMA && getNestedAsyncTaskIds(funcOp).size() == 1) {
+      LDBG("Warp specialization found an MMA kernel with a single partition. "
+           "Skipping.");
+      firstMMA->emitRemark(
+          "meta autoWS placed every op of this MMA kernel in one partition; "
+          "compiling without warp specialization");
+      return bailOut(funcOp);
+    }
+
     // Cross-partition run-once, loop-carried "claim the next tile" support for
     // dynamic-persistent kernels. Handles both the `tt.atomic_rmw` tile counter
     // and the CLC tile-scheduler fetch (`ttng.clc_read`) with the same idea:
