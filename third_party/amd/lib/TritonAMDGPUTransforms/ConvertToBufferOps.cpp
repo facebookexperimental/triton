@@ -213,6 +213,13 @@ Value getBlockStride(Location loc, Value offset, PatternRewriter &rewriter) {
   return nullptr;
 }
 
+// Leave an atomic global when the buffer op's verifier would reject its layout.
+template <typename BufferOp> static bool bufferOpRejects(Operation *op) {
+  OperationName name(BufferOp::getOperationName(), op->getContext());
+  return ttg::getNpotLayoutUnsupportedReason(name, op->getResultTypes())
+      .has_value();
+}
+
 // Buffer ops take Optional<I32> stride. getBlockStride walks the offset chain
 // and returns the splat's scalar source, which may be i64 when the kernel uses
 // i64 indices (e.g. row * stride + col with stride in i64).
@@ -261,6 +268,8 @@ struct ConvertTritonAtomicCASOpToBufferAtomicCAS
     if (!canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
       return rewriter.notifyMatchFailure(op, "canUseBufferOps check failed");
     }
+    if (bufferOpRejects<triton::amdgpu::BufferAtomicCASOp>(op))
+      return rewriter.notifyMatchFailure(op, "layout rejected by buffer op");
 
     switch (scope) {
     case MemSyncScope::GPU:
@@ -361,6 +370,8 @@ struct ConvertTritonAtomicRMWOpToBufferAtomicRMW
     if (!canUseBufferOps(ptr, assumptions, solver, analyzeSmallTensorOfst)) {
       return rewriter.notifyMatchFailure(op, "canUseBufferOps check failed");
     }
+    if (bufferOpRejects<triton::amdgpu::BufferAtomicRMWOp>(op))
+      return rewriter.notifyMatchFailure(op, "layout rejected by buffer op");
 
     // 2. Check the scope. We support GPU and CTA for now (SYSTEM scope is not
     // supported yet)
@@ -500,12 +511,9 @@ private:
   bool analyzeSmallTensorOfst;
 };
 
-// Workaround to allow static_assert(false) on older compilers as it was
-// ill-formed before defect report CWG2518
-// (https://cplusplus.github.io/CWG/issues/2518.html)
-template <typename T> struct always_false : std::false_type {};
-
 template <typename SourceOp>
+  requires llvm::is_one_of<SourceOp, triton::LoadOp,
+                           triton::gpu::AsyncCopyGlobalToLocalOp>::value
 struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
   using OpRewritePattern<SourceOp>::OpRewritePattern;
 
@@ -572,18 +580,13 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
           }
           return triton::amdgpu::BufferLoadOp::create(
               rewriter, op->getLoc(), op.getType(), basePtr, tensorOffset,
-              blockStride, op.getCache(), op.getEvict(), maybeMask, maybeOther,
+              blockStride, op.getCachePolicyAttr(), maybeMask, maybeOther,
               contig);
-        } else if constexpr (std::is_same_v<
-                                 SourceOp,
-                                 triton::gpu::AsyncCopyGlobalToLocalOp>) {
+        } else {
           return triton::amdgpu::BufferLoadToLocalOp::create(
               rewriter, op->getLoc(), op.getType(), op.getResult(), basePtr,
-              tensorOffset, maybeMask, maybeOther, blockStride, op.getCache(),
-              op.getEvict(), op.getContiguity());
-        } else {
-          static_assert(always_false<SourceOp>::value,
-                        "Unsupported type in ConvertTritonLoadToBufferLoad");
+              tensorOffset, maybeMask, maybeOther, blockStride,
+              op.getCachePolicyAttr(), op.getContiguity());
         }
       }();
 
@@ -646,8 +649,8 @@ struct ConvertTritonStoreToBufferStore
           op->getLoc(), op);
 
       rewriter.replaceOpWithNewOp<triton::amdgpu::BufferStoreOp>(
-          op, op.getValue(), basePtr, tensorOffset, blockStride, op.getCache(),
-          op.getEvict(), maybeMask, contig);
+          op, op.getValue(), basePtr, tensorOffset, blockStride,
+          op.getCachePolicyAttr(), maybeMask, contig);
       return success();
     }
     LDBG("Failed to convert: " << op);

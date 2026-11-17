@@ -117,13 +117,13 @@ def TTI_ExperimentalLocalGatherOp : TTI_Op<"experimental_local_gather"> {
 
 def TTI_ExperimentalGSanInitOp : TTI_Op<"experimental_gsan_init"> {
   let summary = "Initialize GSan thread";
-  let arguments = (ins BoolAttr:$acquireStreamClock);
-  let assemblyFormat = "$acquireStreamClock attr-dict";
+  let arguments = (ins);
+  let assemblyFormat = "attr-dict";
 }
 
 def TTI_ExperimentalGSanKernelExitOp
     : TTI_Op<"experimental_gsan_kernel_exit", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
-  let summary = "Publish a completed GSan thread clock to its launch stream";
+  let summary = "Publish a completed GSan thread clock to its launch";
   let arguments = (ins);
   let assemblyFormat = "attr-dict";
 }
@@ -300,6 +300,56 @@ def TTI_ExperimentalGSanTensorAccessOp
           Optional<TT_BoolLike>:$mask, BoolAttr:$isStore);
   let assemblyFormat = [{
     $ptr `,` $isStore (`,` $mask^)? attr-dict `:` type($ptr)
+  }];
+}
+
+def TTI_ExperimentalGSanAtomicLoadOp
+    : TTI_Op<"experimental_gsan_atomic_load", [
+  AtomicOpInterface,
+  SameLoadStoreOperandsAndResultShape,
+  SameLoadStoreOperandsAndResultEncoding,
+  TypesMatchWith<"result matches ptr type", "ptr", "result",
+                 "getPointeeType($_self)">,
+  TypesMatchWith<"mask type matches ptr type", "ptr", "mask",
+                 "getI1SameShape(getPointeeType($_self))",
+                 "($_op.getOperands().size() <= 1) || std::equal_to<>()">
+]> {
+  let summary = "Lower a GSan-instrumented atomic load";
+  let arguments = (ins
+    Arg<TT_PtrLike, "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$ptr,
+    Optional<TT_BoolLike>:$mask,
+    TT_MemSemanticAttr:$sem,
+    TT_MemSyncScopeAttr:$scope
+  );
+  let results = (outs TT_Type:$result);
+  let assemblyFormat = [{
+    $sem `,` $scope `,` $ptr (`,` $mask^)? attr-dict `:`
+    functional-type(operands, $result)
+  }];
+}
+
+def TTI_ExperimentalGSanAtomicStoreOp
+    : TTI_Op<"experimental_gsan_atomic_store", [
+  AtomicOpInterface,
+  SameLoadStoreOperandsShape,
+  SameLoadStoreOperandsEncoding,
+  TypesMatchWith<"value type matches ptr type", "ptr", "value",
+                 "getPointeeType($_self)">,
+  TypesMatchWith<"mask type matches ptr type", "ptr", "mask",
+                 "getI1SameShape(getPointeeType($_self))",
+                 "($_op.getOperands().size() <= 2) || std::equal_to<>()">
+]> {
+  let summary = "Lower a GSan-instrumented atomic store";
+  let arguments = (ins
+    Arg<TT_PtrLike, "", [MemWrite<GlobalMemory>]>:$ptr,
+    TT_Type:$value,
+    Optional<TT_BoolLike>:$mask,
+    TT_MemSemanticAttr:$sem,
+    TT_MemSyncScopeAttr:$scope
+  );
+  let assemblyFormat = [{
+    $sem `,` $scope `,` $ptr `,` $value (`,` $mask^)? attr-dict `:`
+    type($ptr)
   }];
 }
 

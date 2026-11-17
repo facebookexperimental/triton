@@ -113,10 +113,19 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
 
 // -----
 
+
 #shared_a = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
 #shared_b = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#fp6 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8, padding = "b6x16_p32"}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @memdesc_reinterpret_fp6
+  tt.func @memdesc_reinterpret_fp6(%arg: !ttg.memdesc<8x128xi8, #fp6, #smem>) {
+    // CHECK: ttg.memdesc_reinterpret
+    %0 = ttg.memdesc_reinterpret %arg : !ttg.memdesc<8x128xi8, #fp6, #smem> -> !ttg.memdesc<8x64xi16, #shared_a, #smem>
+    tt.return
+  }
+
   // CHECK-LABEL: @memdesc_reinterpret_multibuffer_prefix_subview
   tt.func @memdesc_reinterpret_multibuffer_prefix_subview(%arg0: !ttg.memdesc<3x8x32xf16, #shared_a, #smem, 8x8x32>) {
     // CHECK: ttg.memdesc_reinterpret
@@ -328,7 +337,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @tmem_reinterpret_packed_subview_owns_column
   tt.func @tmem_reinterpret_packed_subview_owns_column(%arg0: !ttg.memdesc<128x4xi8, #tmem, #ttng.tensor_memory, mutable>) {
     %view = ttng.tmem_subslice %arg0 {offset = 0 : i32} : !ttg.memdesc<128x4xi8, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x2xi8, #tmem, #ttng.tensor_memory, mutable, 128x4>
-    %result = ttg.memdesc_reinterpret %view : !ttg.memdesc<128x2xi8, #tmem, #ttng.tensor_memory, mutable, 128x4> -> !ttg.memdesc<128x4xi8, #tmem, #ttng.tensor_memory, mutable>
+    %result = ttg.memdesc_reinterpret %view : !ttg.memdesc<128x2xi8, #tmem, #ttng.tensor_memory, mutable, 128x4> -> !ttg.memdesc<128x4xi8, #ttng.tensor_memory_encoding<blockM = 128, blockN = 4, colStride = 1>, #ttng.tensor_memory, mutable>
     tt.return
   }
 
@@ -338,6 +347,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %indexed = ttg.memdesc_index %stages[%index] : !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable, 5x128x128> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     %result = ttg.memdesc_reinterpret %stages : !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable, 5x128x128> -> !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     %last = ttng.tmem_subslice %stages {offset = 1 : i32, dim = 0 : i32} : !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable, 5x128x128> -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable, 5x128x128>
+    tt.return
+  }
+}
+
+// -----
+
+#tmem128 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 32, colStride = 1>
+#tmem64 = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @tmem_subslice_rows_within_block
+  // CHECK: ttng.tmem_subslice {{.*}} -> !ttg.memdesc<64x32xf32, #{{.*}}, #ttng.tensor_memory, mutable, 128x32>
+  // CHECK: ttng.tmem_subslice {{.*}} -> !ttg.memdesc<32x64xf32, #{{.*}}, #ttng.tensor_memory, mutable, 64x64>
+  tt.func @tmem_subslice_rows_within_block(%m128: !ttg.memdesc<128x32xf32, #tmem128, #ttng.tensor_memory, mutable>, %m64: !ttg.memdesc<64x64xf32, #tmem64, #ttng.tensor_memory, mutable>) {
+    %rows128 = ttng.tmem_subslice %m128 {offset = 64 : i32, dim = 0 : i32} : !ttg.memdesc<128x32xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<64x32xf32, #tmem128, #ttng.tensor_memory, mutable, 128x32>
+    %rows64 = ttng.tmem_subslice %m64 {offset = 32 : i32, dim = 0 : i32} : !ttg.memdesc<64x64xf32, #tmem64, #ttng.tensor_memory, mutable> -> !ttg.memdesc<32x64xf32, #tmem64, #ttng.tensor_memory, mutable, 64x64>
     tt.return
   }
 }
@@ -541,6 +565,57 @@ module attributes {"ttg.target" = "hip:gfx1260", "ttg.num-ctas" = 1 : i32, "ttg.
   tt.func @assert_generic_wmma_slice_layout(%cond: tensor<64xi1, #ttg.slice<{dim = 1, parent = #mma_assert}>>) {
     // CHECK: tt.assert
     tt.assert %cond, "assert generic wmma slice layout" : tensor<64xi1, #ttg.slice<{dim = 1, parent = #mma_assert}>>
+    tt.return
+  }
+}
+
+// -----
+
+// Reshaping a partitioned view keeps its partitions. Folding a group-major
+// view [G, 2 * r, C] (one group along dim 1) into [G * 2 * r, C] gives G groups
+// along dim 0, and the reverse reshape unfolds them again: both keep pieces
+// p, p + 2, ... contiguous in partition p.
+#piece_rows = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [32, 128]}>
+#piece_groups = #ttg.padded_shared<[256:+16] {order = [2, 1, 0], shape = [4, 32, 128]}>
+#part_rows = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 4, partitionDim = 0, partitionLayout = #piece_rows}>
+#part_groups = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 1, partitionLayout = #piece_groups}>
+// Splitting a non-partitioned dimension reshapes each piece.
+#piece_half = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [128, 128]}>
+#piece_split = #ttg.padded_shared<[256:+16] {order = [2, 1, 0], shape = [128, 2, 64]}>
+#part_half = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #piece_half}>
+#part_split = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #piece_split}>
+// Unpadded pieces become shared-linear layouts.
+#piece_swizzled = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#piece_linear = #ttg.shared_linear<{offset = [[1], [2], [4]], block = []}, alignment = 16>
+#part_swizzled = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #piece_swizzled}>
+#part_linear = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #piece_linear}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: memdesc_reshape_partitioned_fold_groups
+  // CHECK: ttg.memdesc_reshape %{{.*}} -> !ttg.memdesc<256x128xi8, #{{.*}}, #smem, mutable>
+  tt.func @memdesc_reshape_partitioned_fold_groups(%d : !ttg.memdesc<4x64x128xi8, #part_groups, #smem, mutable>) {
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<4x64x128xi8, #part_groups, #smem, mutable> -> !ttg.memdesc<256x128xi8, #part_rows, #smem, mutable>
+    tt.return
+  }
+
+  // CHECK-LABEL: memdesc_reshape_partitioned_unfold_groups
+  // CHECK: ttg.memdesc_reshape %{{.*}} -> !ttg.memdesc<4x64x128xi8, #{{.*}}, #smem, mutable>
+  tt.func @memdesc_reshape_partitioned_unfold_groups(%d : !ttg.memdesc<256x128xi8, #part_rows, #smem, mutable>) {
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<256x128xi8, #part_rows, #smem, mutable> -> !ttg.memdesc<4x64x128xi8, #part_groups, #smem, mutable>
+    tt.return
+  }
+
+  // CHECK-LABEL: memdesc_reshape_partitioned_split_inner
+  // CHECK: ttg.memdesc_reshape %{{.*}} -> !ttg.memdesc<256x2x64xi8, #{{.*}}, #smem, mutable>
+  tt.func @memdesc_reshape_partitioned_split_inner(%d : !ttg.memdesc<256x128xi8, #part_half, #smem, mutable>) {
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<256x128xi8, #part_half, #smem, mutable> -> !ttg.memdesc<256x2x64xi8, #part_split, #smem, mutable>
+    tt.return
+  }
+
+  // CHECK-LABEL: memdesc_reshape_partitioned_unpadded
+  // CHECK: ttg.memdesc_reshape %{{.*}} -> !ttg.memdesc<32xi8, #{{.*}}, #smem, mutable>
+  tt.func @memdesc_reshape_partitioned_unpadded(%d : !ttg.memdesc<4x8xi8, #part_swizzled, #smem, mutable>) {
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<4x8xi8, #part_swizzled, #smem, mutable> -> !ttg.memdesc<32xi8, #part_linear, #smem, mutable>
     tt.return
   }
 }

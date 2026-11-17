@@ -59,7 +59,7 @@ static bool isValidTMADestEncoding(Attribute bufferEnc, Attribute descEnc) {
   return descNvmma && descNvmma.getTransposed() == nvmma.getTransposed() &&
          descNvmma.getSwizzlingByteWidth() == nvmma.getSwizzlingByteWidth() &&
          descNvmma.getElementBitWidth() == nvmma.getElementBitWidth() &&
-         descNvmma.getFp4Padded() == nvmma.getFp4Padded();
+         descNvmma.getPadding() == nvmma.getPadding();
 }
 
 static bool isScheduleRematerialization(Operation *op) {
@@ -209,7 +209,7 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
         ttng::getDescriptorLoadBytes(cast<ttg::MemDescType>(buffer.getType()));
     auto nvwsLoad = builder.createWithAsyncTaskIds<ttnvws::DescriptorLoadOp>(
         load.getLoc(), load.getDesc(), load.getIndices(), txCount, buffer,
-        load.getCache(), load.getEvict());
+        load.getCachePolicyAttr());
     nvwsLoad->setAttrs(load->getAttrs());
 
     if (soleStore) {
@@ -393,7 +393,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     auto copyOp =
         builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
             tmaLoad.getLoc(), tmaLoad.getDesc(), tmaLoad.getIndices(),
-            tmaBarrier, pipelineBuffer, pred);
+            tmaBarrier, pipelineBuffer, pred, /*multicast=*/false,
+            tmaLoad.getCachePolicyAttr());
     if (tmaLoad->hasAttr(ttng::AttrTwoCTALoadName))
       copyOp.setTwoCta(true);
     copy = copyOp;

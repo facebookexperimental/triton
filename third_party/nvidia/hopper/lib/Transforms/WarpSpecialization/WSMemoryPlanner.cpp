@@ -1394,6 +1394,19 @@ static unsigned getSmemAllocSizeBytes(ttg::LocalAllocOp alloc) {
                                8);
 }
 
+/// Copy i of a multi-buffered alloc starts at base + i * size. A TMA landing
+/// buffer must start at its encoding's alignment (128 bytes, or the swizzle
+/// period for a swizzled layout), so one whose size is not a multiple of that
+/// (e.g. a 1-D bias tile of 32 bf16 = 64 bytes) must stay single-buffered:
+/// every odd copy would fault with a misaligned address or land in the wrong
+/// swizzle phase.
+static bool isUnalignedTMALoadSlot(Operation *allocOp, unsigned sizeBytes,
+                                   SmallVector<Channel *> &channels) {
+  auto alloc = cast<ttg::LocalAllocOp>(allocOp);
+  return sizeBytes % alloc.getAlignmentOrDefault() != 0 &&
+         isSmemTMAChannel(allocOp, channels);
+}
+
 /// Compute total SMEM usage in bytes across all WSBuffers.
 /// Buffers sharing the same buffer.id (reuse group) contribute
 /// max(sizes) * copies instead of sum(sizes) * copies.
@@ -2393,6 +2406,7 @@ static unsigned allocateSmemBuffersViaSearch(
   // output-store staging is single-store, instead of deferring the whole
   // kernel.
   bool needsFallback = !allocToAnnotation.empty();
+  Operation *unalignedTMALoadSlot = nullptr;
   funcOp->walk([&](Operation *op) {
     if (isa<ttng::SubtiledRegionOp>(op))
       needsFallback = true;
@@ -2406,8 +2420,26 @@ static unsigned allocateSmemBuffersViaSearch(
           ++storeUsers;
       if (storeUsers > 1)
         needsFallback = true; // subtiled staging (K|S) unmodeled
+      // A TMA landing buffer that is not a multiple of 128 bytes must stay
+      // single-buffered (see isUnalignedTMALoadSlot); the search does not
+      // model that cap.
+      if (!unalignedTMALoadSlot &&
+          isUnalignedTMALoadSlot(alloc, getSmemAllocSizeBytes(alloc),
+                                 channels)) {
+        unalignedTMALoadSlot = alloc;
+        needsFallback = true;
+      }
     }
   });
+  // This disables the search for the whole kernel, not just this buffer, so
+  // say so instead of changing the plan quietly.
+  if (unalignedTMALoadSlot)
+    unalignedTMALoadSlot->emitRemark()
+        << "SMEM plan-search: TMA landing buffer \""
+        << getLocName(unalignedTMALoadSlot) << "\" ("
+        << getSmemAllocSizeBytes(cast<ttg::LocalAllocOp>(unalignedTMALoadSlot))
+        << "B) is not a multiple of its TMA alignment and stays "
+           "single-buffered; using the heuristic planner for this kernel";
   if (needsFallback) {
     LDBG("SMEM plan-search: unmodeled feature present, falling back to "
          "heuristic");
@@ -2794,11 +2826,22 @@ static unsigned allocateSmemBuffers(
                         WSBufferPriority::P1_InnermostNonTMA}) {
     // Collect candidate indices at this priority.
     SmallVector<unsigned> candidateIndices;
+    // Candidates before dropping unaligned TMA landing buffers. Grouping is
+    // decided on this count so that dropping such a buffer never turns a
+    // three-buffer set into the two-buffer circular reuse group.
+    unsigned numCandidates = 0;
     for (unsigned i = 0; i < wsBuffers.size(); ++i) {
-      if (wsBuffers[i].isPinned)
+      if (wsBuffers[i].isPinned || wsBuffers[i].priority != priority)
         continue;
-      if (wsBuffers[i].priority == priority)
-        candidateIndices.push_back(i);
+      ++numCandidates;
+      if (isUnalignedTMALoadSlot(wsBuffers[i].allocOp, wsBuffers[i].sizeBytes,
+                                 channels)) {
+        LDBG("Phase 4: WSBuffer["
+             << wsBuffers[i].bufferId << "] is a TMA landing buffer of "
+             << wsBuffers[i].sizeBytes << " bytes; keeping its copy count");
+        continue;
+      }
+      candidateIndices.push_back(i);
     }
     if (candidateIndices.empty())
       continue;
@@ -2817,7 +2860,8 @@ static unsigned allocateSmemBuffers(
 
     // Step 0: Decide grouping upfront.
     bool isReuseGroup = false;
-    if (smemCircularReuse && candidateIndices.size() == 2) {
+    if (smemCircularReuse && numCandidates == 2 &&
+        candidateIndices.size() == 2) {
       isReuseGroup = true;
       auto &bufA = wsBuffers[candidateIndices[0]];
       auto &bufB = wsBuffers[candidateIndices[1]];
@@ -5561,40 +5605,35 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
   return true;
 }
 
-// Collects the single-use layout conversions between `v` and its producer.
-// Returns null if a conversion on the way has another user, since
-// TMemSplitLoadPattern would leave such a conversion in place.
-static Value stripSingleUseConvertLayouts(Value v,
-                                          SmallVectorImpl<Operation *> &cvts) {
-  while (auto cvt = v.getDefiningOp<ttg::ConvertLayoutOp>()) {
-    if (!cvt->hasOneUse())
-      return Value();
-    cvts.push_back(cvt);
-    v = cvt.getSrc();
-  }
-  return v;
-}
-
 static bool isRewrittenBySplitLoad(tt::SplitOp split,
-                                   DenseSet<Operation *> &chainCvts,
+                                   SmallVectorImpl<Operation *> &chainCvts,
                                    bool fromOuterSplit, unsigned depth);
 
 // Whether every use of `v`, looking through single-use layout conversions, is
 // a local_store/local_alloc (which absorb the per-subtile conversion
 // TMemSplitLoadPattern creates) or the reshape of a nested split that the
-// pattern also rewrites.
-static bool feedsOnlySmemOrSplitLoad(Value v, DenseSet<Operation *> &chainCvts,
-                                     unsigned depth) {
+// pattern also rewrites. Every use must be in loop stage `stage`: a use in
+// another stage reads the value through a loop-carried value after
+// pipelining, so the per-subtile conversion would not fold into it. Appends
+// the conversions it looks through to `chainCvts`, which is only meaningful
+// when it returns true.
+static bool feedsOnlySmemOrSplitLoad(Value v,
+                                     SmallVectorImpl<Operation *> &chainCvts,
+                                     int stage, unsigned depth) {
   for (Operation *user : v.getUsers()) {
+    if (getLoopStage(user) != stage)
+      return false;
     if (isa<ttg::LocalStoreOp, ttg::LocalAllocOp>(user))
       continue;
     if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(user)) {
       if (!cvt->hasOneUse() ||
-          !feedsOnlySmemOrSplitLoad(cvt.getResult(), chainCvts, depth))
+          !feedsOnlySmemOrSplitLoad(cvt.getResult(), chainCvts, stage, depth))
         return false;
-      chainCvts.insert(cvt);
+      chainCvts.push_back(cvt);
       continue;
     }
+    // Find the nested split this reshape feeds; isRewrittenBySplitLoad checks
+    // the chain back to `v`.
     auto reshape = dyn_cast<tt::ReshapeOp>(user);
     if (!reshape || !reshape->hasOneUse())
       return false;
@@ -5616,51 +5655,51 @@ static bool feedsOnlySmemOrSplitLoad(Value v, DenseSet<Operation *> &chainCvts,
 }
 
 // Whether TMemSplitLoadPattern will rewrite `split` into per-subtile TMEM
-// loads; mirrors that pattern's match conditions. The whole chain must be in
-// one partition, since a cross-partition channel would hide the tmem_load.
+// loads, removing the layout conversions on the chain, which are appended to
+// `chainCvts` (only meaningful when it returns true). Uses the pattern's own
+// matcher, and additionally requires:
+// - every conversion, reshape and trans on the chain to have one use, since
+//   the pattern leaves an op with other users in place;
+// - the whole chain to be in one partition, since a cross-partition channel
+//   would hide the tmem_load;
+// - the whole chain and the subtile users to be in one loop stage, since a
+//   value crossing stages is carried through the loop after pipelining.
+// A nested split (`fromOuterSplit`) is fed by a result of an outer split that
+// the pattern rewrites into a tmem_load first.
 static bool isRewrittenBySplitLoad(tt::SplitOp split,
-                                   DenseSet<Operation *> &chainCvts,
+                                   SmallVectorImpl<Operation *> &chainCvts,
                                    bool fromOuterSplit, unsigned depth) {
   if (depth > 3)
     return false;
-  SmallVector<Operation *> cvts;
-  Value transResult = stripSingleUseConvertLayouts(split.getSrc(), cvts);
-  auto trans = transResult ? transResult.getDefiningOp<tt::TransOp>() : nullptr;
-  if (!trans || !trans->hasOneUse() ||
-      trans.getOrder() != ArrayRef<int>({0, 2, 1}))
+  auto match = ttng::matchTMemSplitLoad(split);
+  if (!match)
     return false;
-  auto reshape = trans.getSrc().getDefiningOp<tt::ReshapeOp>();
-  if (!reshape || !reshape->hasOneUse())
+  Operation *producer = match->reshapeSrc.getDefiningOp();
+  if (!match->tmemLoad &&
+      !(fromOuterSplit && isa_and_nonnull<tt::SplitOp>(producer)))
     return false;
-  Value reshapeSrc = stripSingleUseConvertLayouts(reshape.getSrc(), cvts);
-  if (!reshapeSrc)
+  if (!match->trans->hasOneUse() || !match->reshape->hasOneUse() ||
+      llvm::any_of(match->cvts,
+                   [](ttg::ConvertLayoutOp cvt) { return !cvt->hasOneUse(); }))
     return false;
-  auto shape = reshape.getResult().getType().getShape();
-  if (shape[0] != cast<RankedTensorType>(reshapeSrc.getType()).getShape()[0] ||
-      shape[2] < 8)
+  // The pattern checks the warp count at the tmem_load once it is in its
+  // partition. Partition warp counts are not assigned yet, so this checks the
+  // count the producer sees now.
+  if (!ttng::isTMemSplitLoadNumWarps(ttg::lookupNumWarps(producer)))
     return false;
-  int numWarps = ttg::lookupNumWarps(split);
-  if (numWarps < 4 || !llvm::isPowerOf2_32(numWarps))
-    return false;
-  Operation *producer = reshapeSrc.getDefiningOp();
-  if (auto tmemLoad = dyn_cast_or_null<ttng::TMEMLoadOp>(producer)) {
-    int mDim = ttg::getShapePerCTA(tmemLoad.getSrc().getType())[0];
-    if (mDim != 64 && mDim != 128)
-      return false;
-  } else if (!fromOuterSplit || !isa_and_nonnull<tt::SplitOp>(producer)) {
-    return false;
-  }
-  SmallVector<Operation *> chainOps(cvts.begin(), cvts.end());
-  chainOps.append({trans, reshape, producer});
+  SmallVector<Operation *> chainOps(match->cvts.begin(), match->cvts.end());
+  chainOps.append({match->trans, match->reshape, producer});
   auto taskIds = getAsyncTaskIds(split);
+  int stage = getLoopStage(split);
   if (llvm::any_of(chainOps, [&](Operation *op) {
-        return getAsyncTaskIds(op) != taskIds;
+        return getAsyncTaskIds(op) != taskIds || getLoopStage(op) != stage;
       }))
     return false;
+  SmallVector<Operation *> cvts(match->cvts.begin(), match->cvts.end());
   for (Value result : split->getResults())
-    if (!feedsOnlySmemOrSplitLoad(result, chainCvts, depth))
+    if (!feedsOnlySmemOrSplitLoad(result, cvts, stage, depth))
       return false;
-  chainCvts.insert(cvts.begin(), cvts.end());
+  chainCvts.append(cvts.begin(), cvts.end());
   return true;
 }
 
@@ -5670,13 +5709,14 @@ static bool isRewrittenBySplitLoad(tt::SplitOp split,
 // largest single op scratch, skipping scratch after the last WS loop (the
 // planned buffers are dead by then). Conversions on an epilogue subtiling
 // chain that TMemSplitLoadPattern rewrites into per-subtile TMEM loads are
-// skipped when the subtiles only feed SMEM. This is an approximation: it
+// skipped when the subtiles only feed SMEM in the same partition and loop
+// stage. This is an approximation: it
 // over-reserves when a later pass shrinks or drops the op
 // (tritongpu-optimize-partition-warps), and under-reserves when several
 // partitions have scratch, since scratch in different warp_specialize regions
 // interferes. An under-reservation fails at launch and Inductor falls back to
 // num_stages=1.
-// TODO: size it exactly, with helpers shared with TMemSplitLoadPattern,
+// TODO: size it exactly, with helpers shared with
 // tritongpu-optimize-partition-warps, canonicalization and
 // AllocateSharedMemoryNv.
 static uint64_t estimateOpScratchBytes(triton::FuncOp funcOp) {
@@ -5711,7 +5751,7 @@ static uint64_t estimateOpScratchBytes(triton::FuncOp funcOp) {
 
   DenseSet<Operation *> splitLoadCvts;
   funcOp->walk([&](tt::SplitOp split) {
-    DenseSet<Operation *> chainCvts;
+    SmallVector<Operation *> chainCvts;
     if (isRewrittenBySplitLoad(split, chainCvts, /*fromOuterSplit=*/false,
                                /*depth=*/0))
       splitLoadCvts.insert(chainCvts.begin(), chainCvts.end());
@@ -5943,6 +5983,20 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
     LLVM_DEBUG(funcOp.dump());
     LLVM_DEBUG(planner.dumpBuffers());
   }
+
+  // Phase 4 keeps unaligned TMA landing buffers single-buffered, but a floor or
+  // annotation (or the original algorithm) can still give one several copies;
+  // every odd copy is then misaligned. Say so at compile time.
+  funcOp->walk([&](ttg::LocalAllocOp alloc) {
+    auto copies = alloc->getAttrOfType<IntegerAttr>("buffer.copy");
+    if (copies && copies.getInt() > 1 &&
+        isUnalignedTMALoadSlot(alloc, getSmemAllocSizeBytes(alloc), channels))
+      alloc.emitWarning()
+          << "TMA landing buffer \"" << getLocName(alloc) << "\" ("
+          << getSmemAllocSizeBytes(alloc) << "B) has " << copies.getInt()
+          << " copies but is not a multiple of its TMA alignment; copies "
+             "after the first are misaligned";
+  });
 
   // Dump combined key ops + channel graph (side by side visualization)
   // Note: Placed before MemoryPlannerTmem to visualize state even if TMEM

@@ -29,4 +29,5 @@ add_triton_library(TritonTransforms
   MLIRSCFTransforms
   TritonIR
   TritonGPUIR
+  TritonAnalysis
 )

@@ -189,9 +189,27 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   Block *switchLoop = b.createBlock(entry);
   b.setInsertionPointToStart(header);
 
-  // This is the absolute thread ID.
-  Value tid = NVVM::ThreadIdXOp::create(b, b.getLoc(), i32_ty);
-  Value wid = b.udiv(tid, b.i32_val(threadsPerWarp));
+  // `tlx.async_tasks(no_ws_header_tid_reuse=True)` is a hacky tuning knob. By
+  // default the warp ID comes from a plain %tid.x read, and LLVM CSEs the
+  // partitions' own %tid.x reads into it, so %tid.x is computed in this header
+  // and kept live all the way into the partitions. For unknown reasons, PTXAS
+  // may then decide to spill it to local memory. With the knob set, %tid.x is
+  // read and turned into the warp ID inside one opaque inline-PTX block, so
+  // each partition reads %tid.x on its own instead.
+  Value wid;
+  auto mod = func->getParentOfType<ModuleOp>();
+  if (mod && mod->hasAttr("tlx.no_ws_header_tid_reuse")) {
+    PTXBuilder widBuilder;
+    auto &widInstr = *widBuilder.create(
+        "{\n mov.u32 $0, %tid.x;\n shr.u32 $0, $0, " +
+        std::to_string(llvm::Log2_32(threadsPerWarp)) + ";\n}");
+    widInstr({widBuilder.newOperand("=r")}, /*onlyAttachMLIRArgs=*/true);
+    wid = widBuilder.launch(b, b.getLoc(), i32_ty, /*hasSideEffect=*/false);
+  } else {
+    // This is the absolute thread ID.
+    Value tid = NVVM::ThreadIdXOp::create(b, b.getLoc(), i32_ty);
+    wid = b.udiv(tid, b.i32_val(threadsPerWarp));
+  }
   // Tell PTXAS this value is warp-uniform.
   wid = targetInfo.shuffleIdx(b, b.getLoc(), wid, 0);
   Value isDefault = b.icmp_ult(wid, b.i32_val(defaultNumWarps));

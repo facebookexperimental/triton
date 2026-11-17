@@ -3,7 +3,6 @@
 
 #include <cstdint>
 #include <numeric>
-#include <optional>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -11,15 +10,12 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/ValueRange.h"
-#include "triton/Tools/ModularArithmetic.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 
 namespace mlir::triton {
-
-struct LinearLayoutSolveResult;
 
 // # High-level overview of linear layouts
 //
@@ -328,14 +324,33 @@ private:
                   /*size=getInDimSizeLog2(inDim)*/>
       bases;
 
-  // Dim sizes are assumed to fit in int32_t, i.e. less than 2^31.
-  // This is a pre-existing upstream type decision.
+  // inputRadices[inDim][i] is the radix of input digit i, whose weight is the
+  // product of the preceding radices (2^i when all are 2). A digit whose radix
+  // is not 2 reaches an out dim only through that out dim's table.
+  llvm::MapVector<StringAttr, std::vector<int32_t>> inputRadices;
+
+  // A non-power-of-two outDim may add tables[outDim].offsets[index] to the XOR
+  // of its other digits' bases, where index is the value of the digits
+  // tables[outDim].digits as a mixed-radix number, first digit low.
+  struct OffsetTable {
+    SmallVector<std::pair<StringAttr, int32_t>> digits;
+    std::vector<int32_t> offsets;
+    bool operator==(const OffsetTable &other) const {
+      return digits == other.digits && offsets == other.offsets;
+    }
+  };
+  // One map keeps sizeof(LinearLayout) under SmallVector's 256-byte limit.
+  llvm::MapVector<StringAttr, OffsetTable> tables;
+
   llvm::MapVector<StringAttr, int32_t /*size*/> outDims;
   int32_t rank = 0;
-  bool cachedIsModular = false;
 
 public:
   using BasesT = decltype(bases);
+  using RadicesT = decltype(inputRadices);
+  using TableDigitsT =
+      llvm::MapVector<StringAttr, SmallVector<std::pair<StringAttr, int32_t>>>;
+  using TableOffsetsT = llvm::MapVector<StringAttr, std::vector<int32_t>>;
 
   LinearLayout() = default;
 
@@ -357,18 +372,6 @@ public:
   static LinearLayout identity1D(int32_t size, StringAttr inDim,
                                  StringAttr outDim) {
     return strided1D(size, /*stride=*/1, inDim, outDim);
-  }
-
-  // Creates a 1D -> 1D layout computing L(x) = (stride * x) % size
-  // for x in [0, 2^ceil(log2(size))).
-  static LinearLayout modularStrided1D(int32_t size, int32_t stride,
-                                       StringAttr inDim, StringAttr outDim);
-
-  // Creates a modular identity layout for non-power-of-2 dimensions.
-  // Computes L(x) = x % size for x in [0, 2^ceil(log2(size))).
-  static LinearLayout modularIdentity1D(int32_t size, StringAttr inDim,
-                                        StringAttr outDim) {
-    return modularStrided1D(size, /*stride=*/1, inDim, outDim);
   }
 
   // Creates a 1D -> 1D layout that maps every input value to 0, i.e. L(x) = 0
@@ -415,11 +418,47 @@ public:
                         ArrayRef<std::pair<StringAttr, int32_t>> outDims,
                         bool requireSurjective);
 
+  // Same, with explicit input radices (one per basis); empty means all 2.
+  // This constructor and its tryCreate allow any positive out-dim size, even
+  // with empty radices.
+  explicit LinearLayout(BasesT bases, RadicesT inputRadices,
+                        ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+                        bool requireSurjective);
+  // Same, with offset tables. Construction normalizes them, so equal
+  // functions compare equal.
+  explicit LinearLayout(BasesT bases, RadicesT inputRadices,
+                        ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+                        TableDigitsT tableDigits, TableOffsetsT tableOffsets,
+                        bool requireSurjective);
+
+  // A mixed-radix output splits each basis at its size's power-of-two factor:
+  // `binary` XORs in for a nonzero digit and `odd` is added digit times. On an
+  // out dim whose table is not in odd-part form, odd is -1.
+  struct BasisContribution {
+    int32_t binary;
+    int32_t odd;
+  };
+  BasisContribution getBasisContribution(StringAttr inDim, int32_t pos,
+                                         StringAttr outDim) const;
+
+  // The largest power of two dividing a positive `size`.
+  static int32_t twoPartOf(int32_t size);
+
   // Factory function that gracefully fails rather than asserts if the layout is
   // not well-formed.
   static std::optional<LinearLayout>
   tryCreate(BasesT bases, ArrayRef<std::pair<StringAttr, int32_t>> outDims,
             bool requireSurjective);
+  // On failure, sets `*diagnostic` to the checkInvariants message.
+  static std::optional<LinearLayout>
+  tryCreate(BasesT bases, RadicesT inputRadices,
+            ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+            bool requireSurjective, std::string *diagnostic = nullptr);
+  static std::optional<LinearLayout>
+  tryCreate(BasesT bases, RadicesT inputRadices,
+            ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+            TableDigitsT tableDigits, TableOffsetsT tableOffsets,
+            bool requireSurjective, std::string *diagnostic = nullptr);
 
   // Construct a LinearLayout from an explicit list of bases.  (This constructor
   // is needed because llvm::MapVector does not have a constructor that accepts
@@ -450,36 +489,15 @@ public:
       ArrayRef<std::pair<StringAttr, std::vector<std::vector<int32_t>>>> bases,
       ArrayRef<std::pair<StringAttr, int32_t>> outDims, bool requireSurjective);
 
-  // For modular (non-power-of-2) layouts, dispatch to modular surjectivity
-  // check
   bool isSurjective() const {
-    if (isModular()) {
-      return isModularSurjective();
-    }
+    if (hasNonPow2OutDim())
+      return rank == getMixedRadixCodomainRank();
     return rank == getTotalOutDimSizeLog2();
   }
-  bool isInjective() const {
-    assert(!isModular() && "isInjective not implemented for modular layouts");
-    return rank == getTotalInDimSizeLog2();
-  }
+  bool isInjective() const { return rank == getTotalInDimSizeLog2(); }
 
   bool isInvertible() const {
-    return isSurjective() && getTotalInDimSize() == getTotalOutDimSizeProduct();
-  }
-
-  // Check surjectivity for modular (non-power-of-2) layouts.
-  // Uses CRT factorization for efficient per-dimension surjectivity checking.
-  bool isModularSurjective() const;
-
-  // Returns true if this layout contains any non-power-of-2 output dimensions.
-  // Modular layouts use ADD+UREM instructions instead of XOR for composition.
-  bool isModular() const { return cachedIsModular; }
-
-  // Returns true if a specific output dimension is non-power-of-2 (modular).
-  // For mixed layouts (e.g. [32, 48]), pow2 dims use XOR while NPOT dims use
-  // ADD+UREM independently (product semimodule GF(2) x Z/N).
-  bool isOutDimModular(StringAttr outDim) const {
-    return !llvm::isPowerOf2_32(getOutDimSize(outDim));
+    return isSurjective() && getTotalInDimSize() == getTotalOutDimSize();
   }
 
   // Remove a dimension of size 1 from the layout.
@@ -487,9 +505,48 @@ public:
   [[nodiscard]] LinearLayout squeezeOuts(StringAttr dim) const;
 
   const BasesT &getBases() const { return bases; }
+  const RadicesT &getInputRadices() const { return inputRadices; }
+  ArrayRef<int32_t> getInputRadices(StringAttr inDim) const {
+    auto it = inputRadices.find(inDim);
+    assert(it != inputRadices.end() && "inDim not found in layout");
+    return it->second;
+  }
+  int32_t getInputRadix(StringAttr inDim, int32_t pos) const {
+    return getInputRadices(inDim)[pos];
+  }
+  // The number of leading radix-2 digits of `inDim`; digit i below it has
+  // weight 2^i.
+  int32_t getNumLeadingRadix2Digits(StringAttr inDim) const {
+    ArrayRef<int32_t> radices = getInputRadices(inDim);
+    return llvm::find_if(radices, [](int32_t radix) { return radix != 2; }) -
+           radices.begin();
+  }
+  // False for a non-binary input digit or a non-Binary output: the radix-2
+  // algorithms below assert it.
+  bool isRadix2() const;
+  ArrayRef<std::pair<StringAttr, int32_t>>
+  getTableDigits(StringAttr outDim) const {
+    auto it = tables.find(outDim);
+    return it == tables.end() ? ArrayRef<std::pair<StringAttr, int32_t>>()
+                              : ArrayRef(it->second.digits);
+  }
+  ArrayRef<int32_t> getTableOffsets(StringAttr outDim) const {
+    auto it = tables.find(outDim);
+    return it == tables.end() ? ArrayRef<int32_t>()
+                              : ArrayRef(it->second.offsets);
+  }
+  // True when every table is one unit odd digit over binary bases below the
+  // size's power-of-two factor, so getBasisContribution describes the layout.
+  bool hasOddPartForm() const;
+  bool hasNonPow2OutDim() const {
+    return !llvm::all_of(llvm::make_second_range(outDims), [](int32_t size) {
+      return llvm::isPowerOf2_32(size);
+    });
+  }
 
   // Get the pos'th basis vector for the inDim -> outDim mapping.
-  // getBasis(inDim, pos) = L(0, ..., inDim = 2^pos, ..., 0).
+  // getBasis(inDim, pos) = L(0, ..., inDim = w, ..., 0), where w is the
+  // product of the radices below pos (2^pos when all radices are 2).
   ArrayRef<int32_t> getBasis(StringAttr inDim, int32_t pos) const {
     auto it = bases.find(inDim);
     assert(it != bases.end());
@@ -532,14 +589,14 @@ public:
   int32_t getNumInDims() const { return bases.size(); }
   int32_t getNumOutDims() const { return outDims.size(); }
 
-  // Asserts if the dimension is not present.
+  // Asserts if the dimension is not present.  This is the number of input
+  // digits, which is log2 of the size only when all radices are 2.
   int32_t getInDimSizeLog2(StringAttr inDim) const;
-  int32_t getInDimSize(StringAttr inDim) const {
-    return 1 << getInDimSizeLog2(inDim);
-  }
+  // The product of the dimension's input radices.
+  int32_t getInDimSize(StringAttr inDim) const;
 
   int32_t getTotalInDimSizeLog2() const;
-  int32_t getTotalInDimSize() const { return 1 << getTotalInDimSizeLog2(); }
+  int32_t getTotalInDimSize() const;
 
   // getOutDimSize(dim) == s means that there exists an input value that will
   // produce each output value in [0,s) (if the layout is surjective).
@@ -557,32 +614,10 @@ public:
   //
   // Asserts if the dimension is not present.
   int32_t getOutDimSizeLog2(StringAttr outDim) const;
-  int32_t getOutDimSize(StringAttr outDim) const {
-    // Return the actual stored size (may be non-power-of-2)
-    auto it = outDims.find(outDim);
-    assert(it != outDims.end() && "outDim not found in layout");
-    return it->second;
-  }
+  int32_t getOutDimSize(StringAttr outDim) const;
 
   int32_t getTotalOutDimSizeLog2() const;
-  int32_t getTotalOutDimSize() const { return 1 << getTotalOutDimSizeLog2(); }
-
-  // Returns the product of all output dimension sizes (works for both pow2
-  // and NPOT dims). Use this instead of getTotalOutDimSize() for mixed layouts.
-  int64_t getTotalOutDimSizeProduct() const {
-    return std::accumulate(getOutDimNames().begin(), getOutDimNames().end(),
-                           int64_t{1}, [&](int64_t acc, StringAttr outDim) {
-                             return acc * getOutDimSize(outDim);
-                           });
-  }
-
-  // Returns the total number of bits needed across all output dimensions.
-  int32_t getTotalOutDimSizeBits() const {
-    return std::accumulate(getOutDimNames().begin(), getOutDimNames().end(), 0,
-                           [&](int32_t acc, StringAttr outDim) {
-                             return acc + getOutDimSizeBits(outDim);
-                           });
-  }
+  int32_t getTotalOutDimSize() const;
 
   // Finds the number of consecutive input elements in the first input dimension
   // that map to consecutive output elements in the first output dimension.
@@ -638,12 +673,7 @@ public:
     if (getNumOutDims() == 0) {
       return reshapeOuts({});
     }
-    // NB: int64_t -> int32_t truncation. Safe for layout sizes < 2^31.
-    auto totalSize = getTotalOutDimSizeProduct();
-    assert(totalSize <= INT32_MAX &&
-           "flattenOuts: total out dim size overflows int32_t");
-    return reshapeOuts(
-        {{*getOutDimNames().begin(), static_cast<int32_t>(totalSize)}});
+    return reshapeOuts({{*getOutDimNames().begin(), getTotalOutDimSize()}});
   }
 
   // Resize an input dimension. Shrinking drops its most-significant bases;
@@ -841,21 +871,23 @@ public:
   // One requirement we *don't* have is that S is injective; we allow two shmem
   // offsets to hold the same 2D index.  If S is not injective,
   // the algorithm chooses the smallest offset for a given (lane, warp).
-  // Requires a supported solution; use tryInvertAndCompose otherwise.
   [[nodiscard]] LinearLayout invertAndCompose(const LinearLayout &outer) const;
 
-  // Recoverable form for callers admitting modular layouts.
-  [[nodiscard]] LinearLayoutSolveResult
-  tryInvertAndCompose(const LinearLayout &outer) const;
+  // compose and invertAndCompose for any radices; on failure, set
+  // `*diagnostic` and return nullopt.
+  std::optional<LinearLayout>
+  tryCompose(const LinearLayout &outer,
+             std::string *diagnostic = nullptr) const;
+  std::optional<LinearLayout>
+  tryInvertAndCompose(const LinearLayout &outer,
+                      std::string *diagnostic = nullptr) const;
 
   // Get the layout that is the inverse of this layout.
   [[nodiscard]] LinearLayout invert() const;
   // Compute and return a psueodinverse of this layout. This is a layout such
   // that `B = A.psuedoinvert()` implies that `A(B(x)) = I`. If `A` is
   // invertible, then this returns `A^-1`.
-  // Requires a supported solution; use tryPseudoinvert otherwise.
   [[nodiscard]] LinearLayout pseudoinvert() const;
-  [[nodiscard]] LinearLayoutSolveResult tryPseudoinvert() const;
 
   // For each in-dim, returns a bitmask of the "free variables" in the layout
   // function.
@@ -873,9 +905,6 @@ public:
 
   std::string toString() const;
 
-  // Build the GF(2) matrix for this layout (public convenience wrapper).
-  std::unique_ptr<uint64_t[]> getGF2Matrix() const { return getMatrix(*this); }
-
   friend bool operator==(const LinearLayout &lhs, const LinearLayout &rhs);
   friend bool operator!=(const LinearLayout &lhs, const LinearLayout &rhs) {
     return !(lhs == rhs);
@@ -883,47 +912,85 @@ public:
   bool equalIgnoringOutDimSizes(const LinearLayout &other) const;
   friend size_t hash_value(const LinearLayout &layout);
 
-  // Returns the number of bits needed to represent this output dimension.
-  // For power-of-2: floor(log2(size)). For NPOT: ceil(log2(size)).
-  int32_t getOutDimSizeBits(StringAttr outDim) const {
-    int32_t size = getOutDimSize(outDim);
-    return llvm::isPowerOf2_32(size) ? llvm::Log2_32(size)
-                                     : llvm::Log2_32(size - 1) + 1;
-  }
-
 private:
+  friend class ColumnAction;
   // Constructor that does not check invariants.  Used by tryCreate.
   struct NoCheckInvariants {};
   LinearLayout(BasesT bases, ArrayRef<std::pair<StringAttr, int32_t>> outDims,
                NoCheckInvariants);
+  LinearLayout(BasesT bases, RadicesT inputRadices,
+               ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+               NoCheckInvariants);
 
   [[nodiscard]] std::optional<std::string>
-  checkInvariants(bool requireSurjective);
+  checkInvariants(bool requireSurjective, bool allowMixedRadixSizes);
+  [[nodiscard]] std::optional<std::string> checkInputRadices() const;
+  // Checks the tables and normalizes them; landed odd-digit bases become
+  // odd-part tables.
+  [[nodiscard]] std::optional<std::string> checkTables();
+  [[nodiscard]] std::optional<std::string> setTables(TableDigitsT digits,
+                                                     TableOffsetsT offsets);
+  // The tables as the constructor takes them.
+  std::pair<TableDigitsT, TableOffsetsT> getTableMaps() const;
+  bool isOddPartOutDim(StringAttr outDim) const;
+  static LinearLayout mixedRadixStrided1D(int32_t size, int32_t stride,
+                                          StringAttr inDim, StringAttr outDim);
+  static std::optional<LinearLayout>
+  fromValues(RadicesT radices, ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+             ArrayRef<std::vector<int32_t>> values, std::string *diagnostic);
+  SmallVector<std::pair<StringAttr, int32_t>>
+  applyMixedRadix(ArrayRef<std::pair<StringAttr, int32_t>> ins) const;
+  LinearLayout
+  reshapeMixedRadixIns(ArrayRef<std::pair<StringAttr, int32_t>> newIns) const;
+  std::optional<LinearLayout> resizeMixedRadixOutDim(StringAttr outDim,
+                                                     int32_t newSize) const;
+  // Builds a layout from its values: fn(ins, outs) sets the out-dim values at
+  // `ins`. The ops below that mix digit values take this path.
+  static std::optional<LinearLayout>
+  fromFunction(RadicesT radices,
+               ArrayRef<std::pair<StringAttr, int32_t>> outDims,
+               function_ref<void(ArrayRef<std::pair<StringAttr, int32_t>>,
+                                 MutableArrayRef<int32_t>)>
+                   fn,
+               std::string *diagnostic = nullptr);
+  static std::optional<LinearLayout>
+  mixedRadixProduct(const LinearLayout &inner, const LinearLayout &outer,
+                    ArrayRef<StringAttr> inDims, ArrayRef<StringAttr> outDims);
+  std::optional<LinearLayout> reshapeMixedRadixOuts(
+      ArrayRef<std::pair<StringAttr, int32_t>> newOutDims) const;
+  std::optional<LinearLayout>
+  concatMixedRadixIns(const LinearLayout &other) const;
+  std::optional<LinearLayout>
+  concatMixedRadixOuts(const LinearLayout &other) const;
+  // `moved` maps each kept digit to its new position in the same in-dim;
+  // the other digits are held at 0.
+  using DigitMap = llvm::DenseMap<std::pair<StringAttr, int32_t>,
+                                  std::pair<StringAttr, int32_t>>;
+  LinearLayout remapDigits(const DigitMap &moved) const;
+  void remapTables(const DigitMap &moved, TableDigitsT &digits,
+                   TableOffsetsT &offsets) const;
+  LinearLayout removeMixedRadixZeroBases(StringAttr stripDim) const;
+  std::optional<LinearLayout> resizeMixedRadixInDim(StringAttr inDim,
+                                                    int32_t newSize) const;
+  llvm::MapVector<StringAttr, int32_t> getMixedRadixFreeVariableMasks() const;
+  size_t hashMixedRadix(size_t seed) const;
+  void sublayoutTables(ArrayRef<StringAttr> inDimNames,
+                       ArrayRef<StringAttr> outDimNames, TableDigitsT &digits,
+                       TableOffsetsT &offsets) const;
+  std::string tablesToString() const;
+  // A mixed-radix output (any size but a power of 2) XORs bases below the
+  // size's largest power-of-two factor and adds the odd part above it.
+  bool isMixedRadixOutDim(StringAttr outDim) const {
+    return !llvm::isPowerOf2_32(getOutDimSize(outDim));
+  }
+  // The binary part's rank plus one per odd-part table; another table counts
+  // only when the layout covers its codomain.
+  int32_t getMixedRadixRank() const;
 
-  // Build a matrix of size sum(outDimSizeBits) x sum(inDimSizeLog2)
-  // representing the bases of the given layout.  This can then be used by
-  // f2reduce.
-  static std::unique_ptr<uint64_t[]> getMatrix(const LinearLayout &layout);
-
-  // Concatenate the GF(2) matrices of two layouts side-by-side for RREF
-  // solving.
-  static std::unique_ptr<uint64_t[]> concatMatrices(const LinearLayout &A,
-                                                    const LinearLayout &B);
-
-  // Modular lstsq: solve AX = B over Z/nZ using CRT factorization.
-  static LinearLayoutSolveResult lstsqModular(const LinearLayout &A,
-                                              const LinearLayout &B);
-
-  // Solve AX = B (least-squares over GF(2) or modular).
-  static LinearLayoutSolveResult lstsq(const LinearLayout &A,
-                                       const LinearLayout &B);
-};
-
-struct LinearLayoutSolveResult {
-  ModularSolveStatus status;
-  std::optional<LinearLayout> layout;
-
-  bool succeeded() const { return status == ModularSolveStatus::Success; }
+  // Binary output bits plus one odd coordinate per mixed-radix output.
+  int32_t getMixedRadixCodomainRank() const;
+  // The GF(2) layout of the bases of the digits outside each out dim's table.
+  LinearLayout binaryPart() const;
 };
 
 inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
@@ -954,16 +1021,25 @@ private:
   SmallVector<size_t> action;
   StringAttr inDim;
   size_t inSizeLog2;
+  // Radix of each input digit; empty means all 2.
+  SmallVector<int32_t> inputRadices;
   bool m_isIdentity = true;
+
+  bool isRadix2() const {
+    return llvm::all_of(inputRadices, [](int32_t r) { return r == 2; });
+  }
+  SmallVector<Value> applyMixedRadix(ValueRange values) const;
+  LinearLayout applyMixedRadix(const LinearLayout &layout) const;
 
 public:
   ColumnAction() = default;
-  ColumnAction(ArrayRef<size_t> action, StringAttr inDim, size_t inSizeLog2)
-      : action(action), inDim(inDim), inSizeLog2(inSizeLog2) {
+  ColumnAction(ArrayRef<size_t> action, StringAttr inDim, size_t inSizeLog2,
+               ArrayRef<int32_t> inputRadices = {})
+      : action(action), inDim(inDim), inSizeLog2(inSizeLog2),
+        inputRadices(inputRadices) {
     auto it = llvm::max_element(action);
     // Assert in the constructor... ugh
     assert(it == action.end() || *it < inSizeLog2);
-    (void)it; // Suppress unused variable warning in opt builds
     // In many cases the action will be the identity, so we save that as an
     // early return
     m_isIdentity = action.size() == inSizeLog2 &&
@@ -1012,6 +1088,8 @@ inline std::ostream &operator<<(std::ostream &os, const ColumnAction &action) {
   os << action.toString();
   return os;
 }
+
+std::unique_ptr<uint64_t[]> getMatrix(const LinearLayout &layout);
 
 // Find X such that X.compose(A) == B, equivalently A * X == B in matrix
 // notation. Returns nullopt when B's image is not contained in A's image or
