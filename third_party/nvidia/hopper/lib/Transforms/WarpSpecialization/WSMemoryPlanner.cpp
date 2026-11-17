@@ -5682,9 +5682,12 @@ static bool isRewrittenBySplitLoad(tt::SplitOp split,
       llvm::any_of(match->cvts,
                    [](ttg::ConvertLayoutOp cvt) { return !cvt->hasOneUse(); }))
     return false;
-  // The pattern checks the warp count at the tmem_load once it is in its
-  // partition. Partition warp counts are not assigned yet, so this checks the
-  // count the producer sees now.
+  // Deliberately conservative: the pattern checks the warp count of the
+  // tmem_load's partition, but partition warp counts are not assigned at
+  // planning time, so this checks the module warp count the producer sees now.
+  // tritongpu-optimize-partition-warps only halves a partition's warps and
+  // keeps at least 4 for a partition with a tmem_load (getMinWarpsForOp), so
+  // a module count that passes here also passes for the partition.
   if (!ttng::isTMemSplitLoadNumWarps(ttg::lookupNumWarps(producer)))
     return false;
   SmallVector<Operation *> chainOps(match->cvts.begin(), match->cvts.end());
