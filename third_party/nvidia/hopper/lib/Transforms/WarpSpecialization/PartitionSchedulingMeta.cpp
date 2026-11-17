@@ -3336,6 +3336,13 @@ void PartitionSchedulingMeta::runOnOperation() {
 
       if (estimatedTotal > kMaxWarps) {
         LDBG("Warp budget exceeded. Skipping warp specialization.");
+        loop->emitWarning()
+            << "skipping warp specialization: the partition schedule needs an "
+               "estimated "
+            << estimatedTotal << " warps (" << numPartitions
+            << " partitions, default partition " << defaultNumWarps
+            << " warps), above the limit of " << kMaxWarps
+            << "; the kernel is compiled without warp specialization";
         removeWarpSpecMetadata(funcOp);
         return;
       }
