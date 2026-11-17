@@ -172,6 +172,35 @@ def test_umulhi_truncated_input(seed_type, dtype):
         pytest.fail("PTX stage not found")
 
 
+@pytest.mark.parametrize("instrumentation_mode", ["", "fpsan"])
+def test_compile_only_nvptx_fabs_preserves_nan_payload(instrumentation_mode):
+    from triton._C.libtriton import llvm
+    from triton.backends.nvidia.compiler import CUDABackend
+
+    llvm.init_targets()
+    backend = CUDABackend(GPUTarget("cuda", 90, 32))
+    options = backend.parse_options({"ptx_version": 93, "instrumentation_mode": instrumentation_mode})
+    source = """
+target triple = "nvptx64-nvidia-cuda"
+declare <4 x float> @llvm.fabs.v4f32(<4 x float>)
+define ptx_kernel void @abs_kernel(ptr addrspace(1) %input, ptr addrspace(1) %output) {
+  %value = load <4 x float>, ptr addrspace(1) %input, align 16
+  %absolute = call <4 x float> @llvm.fabs.v4f32(<4 x float> %value)
+  store <4 x float> %absolute, ptr addrspace(1) %output, align 16
+  ret void
+}
+"""
+    ptx = backend.make_ptx(source, {}, options, 90)
+    if instrumentation_mode == "fpsan":
+        assert "abs.f32" not in ptx
+        masks = re.findall(r"\band\.b32\s+[^;]+,\s*(0x[0-9a-fA-F]+|\d+)\s*;", ptx)
+        assert len(masks) == 4
+        assert all(int(mask, 0) == 0x7FFFFFFF for mask in masks)
+    else:
+        assert len(re.findall(r"\babs\.f32\b", ptx)) == 4
+        assert "and.b32" not in ptx
+
+
 @pytest.mark.parametrize("element_type", ["f32", "f16", "bf16"])
 def test_compile_only_packed_arith_chains(element_type, tmp_path) -> None:
     packed_type = f"{element_type}x2"
@@ -386,8 +415,6 @@ def test_compile_only_dot() -> None:
                r"(.|\n)*"
                r"tcgen05\.relinquish_alloc_permit\.cta_group::1\.sync\.aligned"
                r"(.|\n)*"
-               r"tcgen05\.st\.sync\.aligned\.16x32bx2.x32.b32"
-               r"(.|\n)*"
                r"tcgen05\.mma\.cta_group::1.kind::f16"
                r"(.|\n)*"
                r"tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64"
@@ -398,6 +425,8 @@ def test_compile_only_dot() -> None:
                r"(.|\n)*"
                r"tcgen05.wait::ld.sync.aligned")
     assert re.search(pattern, str(ptx)), "The PTX does not match the expected pattern."
+    # The zero accumulator folds into use_acc = false, so TMEM is not zeroed.
+    assert "tcgen05.st" not in str(ptx)
     assert k.asm["cubin"] != b""
 
 

@@ -3052,7 +3052,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
   // warp-specialized scf.while.
   Operation *loopOp = nullptr;
   Block *loopBody = nullptr;
-  for (Operation *p = mmaOp->getParentOp(); p && !loopOp; p = p->getParentOp()) {
+  for (Operation *p = mmaOp->getParentOp(); p && !loopOp;
+       p = p->getParentOp()) {
     if (auto f = dyn_cast<scf::ForOp>(p)) {
       loopOp = f;
       loopBody = f.getBody();

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from triton._internal_testing import is_hip_cdna4
-from triton.tlx.ops.kernels.moe_mxfp4.gfx950 import moe_mxfp4, prepare_w13, prepare_w2, quantize_rows
+from triton.tlx.ops.kernels.moe_mxfp.gfx950 import moe_mxfp4, prepare_w13, prepare_w2, quantize_rows
 
 requires_gfx950 = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 
