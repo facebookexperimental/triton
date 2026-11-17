@@ -34,7 +34,9 @@ tt.func @dot_192x128(%pa: !tt.ptr<f16>) {
 
 // -----
 
-// B's 48-byte N-major rows take swizzle 0, which no wgmma descriptor matches.
+// The narrowed span is legal for N=24, but exact is slower on
+// multi-tile rows (T298588418), so the pad decision ignores it and
+// pads; the span legality itself stays in getMmaV3BSmemAttrs.
 // CHECK-LABEL: @dot_128x24
 // CHECK: tt.dot {{.*}} -> tensor<128x32xf32>
 tt.func @dot_128x24(%pb: !tt.ptr<f16>) {
@@ -232,7 +234,9 @@ tt.func @dot_128x104_trans_b(%pb: !tt.ptr<f16>, %n: i32, %k: i32, %s: i64) {
 
 // -----
 
-// Control: the same B loaded N-contiguous has 208-byte rows, swizzle 0.
+// Control: the same B loaded N-contiguous takes the pow2 cover; with
+// the span ignored by the pad decision, the dot's own legality drives
+// the pad (before, the loads-and-stores rule did).
 // CHECK-LABEL: @dot_128x104_load
 // CHECK: tt.dot {{.*}} -> tensor<128x128xf32>
 // W8-LABEL: @dot_128x104_load
@@ -303,6 +307,32 @@ tt.func @dot_128x104_trans_b_store(%pb: !tt.ptr<f16>, %pc: !tt.ptr<f16> {tt.divi
   %ptr = tt.addptr %sc, %off : tensor<128x104x!tt.ptr<f16>>, tensor<128x104xi32>
   tt.store %ptr, %h : tensor<128x104x!tt.ptr<f16>>
   tt.return
+}
+
+// -----
+
+// A warp-group dot is the MMA producer for its accumulator encoding:
+// with B an exact shared view and the accumulator in an MMA encoding
+// that is legal at the NPOT shape, the dot keeps its exact shape.
+#s1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#s2 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 104, 16]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @warp_group_dot_104
+  // CHECK: ttng.warp_group_dot {{.*}} -> tensor<64x104xf32, #mma>
+  // W8-LABEL: @warp_group_dot_104
+  // W8: ttng.warp_group_dot {{.*}} -> tensor<64x104xf32, #mma>
+  tt.func @warp_group_dot_104() {
+    %a = ttg.local_alloc : () -> !ttg.memdesc<64x64xbf16, #s1, #smem, mutable>
+    %ba = ttg.local_alloc : () -> !ttg.memdesc<128x64xbf16, #s1, #smem, mutable>
+    %bv = ttg.memdesc_subslice %ba [0, 0] : !ttg.memdesc<128x64xbf16, #s1, #smem, mutable> -> !ttg.memdesc<104x64xbf16, #s1, #smem, mutable, 128x64>
+    %bt = ttg.memdesc_trans %bv {order = array<i32: 1, 0>} : !ttg.memdesc<104x64xbf16, #s1, #smem, mutable, 128x64> -> !ttg.memdesc<64x104xbf16, #s2, #smem, mutable, 64x128>
+    %c = arith.constant dense<0.0> : tensor<64x104xf32>
+    %cr = tlx.require_layout %c : tensor<64x104xf32> -> tensor<64x104xf32, #mma>
+    %d = ttng.warp_group_dot %a, %bt, %cr : !ttg.memdesc<64x64xbf16, #s1, #smem, mutable> * !ttg.memdesc<64x104xbf16, #s2, #smem, mutable, 64x128> -> tensor<64x104xf32, #mma>
+    tt.return
+  }
 }
 
 // -----

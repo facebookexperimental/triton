@@ -5434,7 +5434,8 @@ bool triton::gpu::isMixedRadixLayoutOp(OperationName op) {
          op.hasInterface<triton::MixedRadixLayoutOpInterface>() ||
          isAnyOf<arith::ConstantOp, scf::ForOp, scf::IfOp, scf::WhileOp,
                  scf::YieldOp, scf::ConditionOp, cf::BranchOp, cf::CondBranchOp,
-                 ub::PoisonOp, UnrealizedConversionCastOp>(op);
+                 ub::PoisonOp, UnrealizedConversionCastOp, WarpSpecializeOp,
+                 WarpSpecializePartitionsOp>(op);
 }
 
 std::optional<std::string>

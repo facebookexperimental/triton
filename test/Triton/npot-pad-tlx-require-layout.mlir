@@ -67,3 +67,26 @@ tt.func @require_layout_mma_100() {
   %r = tlx.require_layout %c : tensor<64x100xf32> -> tensor<64x100xf32, #mma>
   tt.return
 }
+
+// -----
+
+// Control for the warp-group dot admission: N=100 with a pow2
+// instrShape is not an exact layout, so the tensor verifier rejects
+// the accumulator before the pad pass.
+#s1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#s2 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 8, 16]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @warp_group_dot_100() {
+    %a = ttg.local_alloc : () -> !ttg.memdesc<64x64xbf16, #s1, #smem, mutable>
+    %ba = ttg.local_alloc : () -> !ttg.memdesc<128x64xbf16, #s1, #smem, mutable>
+    %bv = ttg.memdesc_subslice %ba [0, 0] : !ttg.memdesc<128x64xbf16, #s1, #smem, mutable> -> !ttg.memdesc<100x64xbf16, #s1, #smem, mutable, 128x64>
+    %bt = ttg.memdesc_trans %bv {order = array<i32: 1, 0>} : !ttg.memdesc<100x64xbf16, #s1, #smem, mutable, 128x64> -> !ttg.memdesc<64x100xbf16, #s2, #smem, mutable, 64x128>
+    %c = arith.constant dense<0.0> : tensor<64x100xf32>
+    // expected-error @+1 {{Number of elements must be power-of-two}}
+    %cr = tlx.require_layout %c : tensor<64x100xf32> -> tensor<64x100xf32, #mma>
+    %d = ttng.warp_group_dot %a, %bt, %cr : !ttg.memdesc<64x64xbf16, #s1, #smem, mutable> * !ttg.memdesc<64x100xbf16, #s2, #smem, mutable, 64x128> -> tensor<64x100xf32, #mma>
+    tt.return
+  }
+}

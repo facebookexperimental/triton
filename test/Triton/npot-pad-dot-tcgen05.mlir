@@ -123,8 +123,9 @@ tt.func @loop_f16_n96(%pb: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %pd: !tt.p
 
 // -----
 
-// B's 176-byte N-major rows take swizzle 0, which no tcgen05 descriptor
-// matches; N=96 above is the control.
+// The narrowed span is legal for N=88, but the exact flip is parked
+// (T298588418), so the pad decision ignores it and pads; N=96 is the
+// control.
 // CHECK-LABEL: @dot_f16_128x88
 // CHECK: tt.dot {{.*}} -> tensor<128x128xf32>
 tt.func @dot_f16_128x88(%p: !tt.ptr<f32>) {
