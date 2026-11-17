@@ -143,8 +143,97 @@ static bool hasPaddedLowering(Operation *op) {
          !isa<DescriptorStoreLikeOpInterface>(op);
 }
 
+// An exact shared shape is legal iff its rows tile whole swizzle
+// atoms: the contiguous row bytes are a multiple of the span.
+static bool hasExactSharedShape(gpu::MemDescType type) {
+  // Non-NVMMA shared encodings (AMD) pad: no exact rule yet.
+  auto nvmma = dyn_cast<gpu::NVMMASharedEncodingAttr>(type.getEncoding());
+  if (!nvmma)
+    return false;
+  // The core matrix is 8 rows x 16B: rows are the non-contiguous tile dim.
+  unsigned contig = gpu::getOrder(type).front();
+  unsigned rank = type.getShape().size();
+  unsigned rows = contig == rank - 1 ? rank - 2 : rank - 1;
+  int64_t rowBytes = type.getShape()[contig] *
+                     type.getElementType().getIntOrFloatBitWidth() / 8;
+  unsigned swizzle = nvmma.getSwizzlingByteWidth();
+  if (swizzle == 0)
+    return rowBytes % 16 == 0;
+  return rowBytes % swizzle == 0 && type.getShape()[rows] % 8 == 0;
+}
+
 static bool hasFileLoc(Operation *op) {
   return bool(op->getLoc()->findInstanceOf<FileLineColLoc>());
+}
+
+// Whether an encoded tensor's encoding is legal at its NPOT shape,
+// judged by the encoding's own rules: an MMA encoding by the
+// target's producer, any other encoding by exactness.
+static bool isLegalEncodedNpotTensor(RankedTensorType type,
+                                     MLIRContext *ctx, StringRef target) {
+  if (!touchesNpot(type) || !type.getEncoding())
+    return true;
+  if (isa<gpu::NvidiaMmaEncodingAttr>(type.getEncoding()))
+    return isNpotMmaEncodedTensorLegal(ctx, target, type);
+  return gpu::hasExactNpotLayout(type);
+}
+
+// Whether an NPOT type's shape is decided by an encoding rather than
+// chosen by this pass: an encoded tensor, a memory descriptor, or a
+// descriptor with a shared layout. Unencoded tensors and descriptors
+// over them are retyped freely and never gated here.
+static bool hasGatedEncoding(Type type) {
+  if (!touchesNpot(type))
+    return false;
+  if (auto tensor = dyn_cast<RankedTensorType>(type))
+    return tensor.getEncoding() != nullptr;
+  if (auto desc = dyn_cast<TensorDescType>(type))
+    return desc.getSharedLayout() || desc.getBlockType().getEncoding();
+  return true;
+}
+
+// Whether a gated NPOT type is legal at its shape, judged by its
+// encoding's own rules: an MMA encoding by the producer's instr-shape
+// rules, a shared encoding by whole-swizzle-atom tiling. A linear
+// encoding is the layout this pass prices itself, so a tensor
+// carrying one is never admitted on legality.
+static bool isLegalGatedNpotType(Type type, MLIRContext *ctx,
+                                 StringRef target) {
+  auto legalTensor = [&](RankedTensorType tensor) {
+    return !isa<gpu::LinearEncodingAttr>(tensor.getEncoding()) &&
+           isLegalEncodedNpotTensor(tensor, ctx, target);
+  };
+  if (auto tensor = dyn_cast<RankedTensorType>(type))
+    return legalTensor(tensor);
+  if (auto memdesc = dyn_cast<gpu::MemDescType>(type))
+    return hasExactSharedShape(memdesc);
+  if (auto desc = dyn_cast<TensorDescType>(type))
+    return !desc.getSharedLayout() && legalTensor(desc.getBlockType());
+  return false;
+}
+
+// Whether a memory descriptor is a legal view of its allocation: an
+// extent whose power-of-two cover spans the allocation in every dim,
+// so consumers addressing through the alloc layout (which adds the
+// view's origin) stay inside the buffer. This is the subslice
+// verifier's own rule; a descriptor that is its own allocation has
+// no cover to span and is judged by hasExactSharedShape instead.
+static bool isLegalMemdescView(gpu::MemDescType type) {
+  ArrayRef<int64_t> shape = type.getShape();
+  ArrayRef<int64_t> alloc = type.getAllocShape();
+  if (shape == alloc)
+    return false;
+  for (unsigned d = 0; d < shape.size(); ++d)
+    if (!llvm::isPowerOf2_64(shape[d]) &&
+        llvm::PowerOf2Ceil(shape[d]) < static_cast<uint64_t>(alloc[d]))
+      return false;
+  return true;
+}
+
+// A shared tile is legal at its shape when its rows tile whole
+// swizzle atoms or it is a view whose cover spans its allocation.
+static bool isLegalSharedTile(gpu::MemDescType type) {
+  return hasExactSharedShape(type) || isLegalMemdescView(type);
 }
 
 // Groups the NPOT tensors connected through their ops (a connected component
@@ -240,9 +329,21 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
   auto addTotalInDimSizes = [&](Value v, std::pair<int64_t, int64_t> &sum) {
     if (auto desc = dyn_cast<TensorDescType>(v.getType()))
       return !desc.getSharedLayout();
+    // A memdesc value whose rows tile whole swizzle atoms, or whose
+    // extent's cover spans its allocation, is a legal view; it takes
+    // no part in the register-cost comparison.
+    if (auto memdesc = dyn_cast<gpu::MemDescType>(v.getType()))
+      return isLegalSharedTile(memdesc);
     auto type = dyn_cast<RankedTensorType>(v.getType());
-    if (!type || type.getEncoding())
+    if (!type)
       return false;
+    // A value in a non-linear encoding (an MMA accumulator, an
+    // anchor's result) has its layout fixed by the encoding, not
+    // chosen here: a legal encoding takes no part in the
+    // register-cost comparison and cannot force a pad on its account.
+    if (type.getEncoding())
+      return !isa<gpu::LinearEncodingAttr>(type.getEncoding()) &&
+             isLegalEncodedNpotTensor(type, mod.getContext(), target);
     FailureOr<gpu::LinearEncodingAttr> exact = gpu::getMixedRadixEncoding(
         ctx, type.getShape(), numWarps, threadsPerWarp, numCTAs);
     if (failed(exact))
@@ -380,7 +481,34 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
     auto [first, inserted] = firstOps.try_emplace(leader, op);
     if (!inserted && !hasFileLoc(first->second) && hasFileLoc(op))
       first->second = op;
-    if (!gpu::isMixedRadixLayoutOp(op->getName())) {
+    // The accept-every-layout trait covers tensor anchors only; a
+    // memdesc-only anchor goes through the shared-shape rule instead.
+    bool memdescOnly = llvm::all_of(values, [](Value v) {
+      return isa<gpu::MemDescType>(v.getType());
+    });
+    // A function whose NPOT values are all legal descriptors or
+    // shared tiles chooses no layout; its tensor values pad below.
+    // A descriptor's box is checked by its users, not here.
+    bool legalFunc = isa<FunctionOpInterface>(op) &&
+                     llvm::all_of(values, [&](Value v) {
+                       Type type = v.getType();
+                       return !isa<RankedTensorType>(type) &&
+                              (!hasGatedEncoding(type) ||
+                               isLegalGatedNpotType(type, mod.getContext(), target));
+                     });
+    // A buffer allocation in a legal shared layout is layout-fixed
+    // like an anchor: it does not pad its component on its account.
+    auto alloc = dyn_cast<gpu::LocalAllocOp>(op);
+    bool legalAlloc = alloc && isLegalSharedTile(alloc.getType());
+    if (alloc && alloc.getSrc() && !hasExactSharedShape(alloc.getType())) {
+      pad(leader, op,
+          "NPOT shared allocation rows do not tile whole swizzle atoms");
+    } else if (alloc && alloc.getSrc()) {
+      // Exact shared shape is legal: the alloc keeps its dense shape.
+    } else if ((!gpu::isMixedRadixLayoutOp(op->getName()) ||
+                (op->hasTrait<OpTrait::MixedRadixLayoutTrait>() &&
+                 memdescOnly)) &&
+               !legalFunc && !legalAlloc) {
       pad(leader, op,
           llvm::formatv("NPOT mixed-radix layout is not yet supported on {0}",
                         op->getName()));
@@ -419,7 +547,7 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
   // total in-dim size than its padded layout while the tile it addresses takes
   // less.
   for (auto &[leader, sum] : totalInDimSizes)
-    if (sum.first >= sum.second)
+    if (sum.first >= sum.second && sum.second > 0)
       slowReasons.try_emplace(
           leader, firstOps.lookup(leader),
           llvm::formatv("NPOT tensors pad: their mixed-radix layouts take {0} "
@@ -686,12 +814,19 @@ LogicalResult Padder::accept(Operation *op) {
     llvm::append_range(types, region.getArgumentTypes());
   if (!llvm::any_of(types, touchesNpot))
     return success();
-  if (llvm::any_of(types, [](Type type) {
-        auto desc = dyn_cast<TensorDescType>(type);
-        auto tensor = desc && !desc.getSharedLayout()
-                          ? desc.getBlockType()
-                          : dyn_cast<RankedTensorType>(type);
-        return touchesNpot(type) && !(tensor && !tensor.getEncoding());
+  // A subslice whose extent's cover spans its allocation is a legal
+  // view; it is admitted here because its descriptor is a view of
+  // the alloc layout, not a shape the atom-tiling rule judges.
+  if (auto subslice = dyn_cast<gpu::MemDescSubsliceOp>(op);
+      subslice && isLegalMemdescView(subslice.getType()))
+    return success();
+  // A gated NPOT type that is illegal at its shape admits no op on
+  // it. Legal gated types are admitted at the end, once the ops with
+  // a padded form below have had their say.
+  if (llvm::any_of(types, [&](Type type) {
+        return hasGatedEncoding(type) &&
+               !isLegalGatedNpotType(type, op->getContext(),
+                                     getModuleTarget(op));
       }))
     return op->emitOpError("on an NPOT pointer-to-tensor, descriptor, memory "
                            "descriptor or encoded tensor is unsupported");
@@ -836,6 +971,19 @@ LogicalResult Padder::accept(Operation *op) {
     }
     return success();
   }
+  // An op with no padded form above is admitted when its gated NPOT
+  // types are all legal at their shapes: each encoding's own legality
+  // is the check (an MMA encoding by the producer's instr-shape
+  // rules, a shared encoding by whole-atom tiling), not a list of
+  // ops. Layout anchors, memdesc views and MMA producers take this
+  // path; apply() retypes their values with the component.
+  if (llvm::any_of(types, hasGatedEncoding) &&
+      llvm::all_of(types, [&](Type type) {
+        return !hasGatedEncoding(type) ||
+               isLegalGatedNpotType(type, op->getContext(),
+                                    getModuleTarget(op));
+      }))
+    return success();
   return op->emitOpError("on an NPOT tensor is unsupported");
 }
 

@@ -411,3 +411,46 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+// A TLX layout anchor forwarding a tensor to another layout is a
+// conversion: the same plan check as ttg.convert_layout applies.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+#q96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [[0]], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = [2]}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mixed_radix_anchor_to_cross_cta() {
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
+    // expected-error @+1 {{NPOT mixed-radix conversion with a non-singleton block input in the destination layout is not yet supported}}
+    %c = tlx.require_layout %r : tensor<96xi32, #p96> -> tensor<96xi32, #q96>
+    tt.return
+  }
+}
+
+// -----
+
+// The TTG branch of the same anchor check.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+#q96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [[0]], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = [2]}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mixed_radix_ttg_anchor_to_cross_cta() {
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
+    // expected-error @+1 {{NPOT mixed-radix conversion with a non-singleton block input in the destination layout is not yet supported}}
+    %c = ttg.require_layout %r : tensor<96xi32, #p96> -> tensor<96xi32, #q96>
+    tt.return
+  }
+}
+
+// -----
+
+// An anchor to a non-mixed-radix layout takes the same arm of the
+// anchor plan check as a convert to one.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+#blocked96 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mixed_radix_anchor_to_blocked() {
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
+    // expected-error @+1 {{NPOT conversion to or from a non-mixed-radix layout is not yet supported}}
+    %c = tlx.require_layout %r : tensor<96xi32, #p96> -> tensor<96xi32, #blocked96>
+    tt.return
+  }
+}
