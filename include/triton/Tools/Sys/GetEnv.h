@@ -49,6 +49,7 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "TRITON_AMD_MODULO_SERIALIZE",
     "TRITON_AMD_MODULO_MAX_STAGE",
     "TRITON_AMD_EARLY_LOWER",
+    "TRITON_FORCE_DISABLE_FP_FUSION",
     "TRITON_HIP_USE_ASYNC_COPY",
     "TRITON_HIP_USE_BLOCK_PINGPONG",
     "TRITON_HIP_USE_COEXEC_SCHEDULER",
@@ -69,6 +70,7 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "TRITON_WS_TMA_REDUCE_STAGING_COPIES",
     "USE_IR_LOC",
     "NVPTX_ENABLE_DUMP",
+    "TRITON_PRESERVE_PTX_SOURCE_PATHS",
     "ALLOW_LHS_TMEM_LAYOUT_CONVERSION",
     "TRITON_F32_DEFAULT",
     "TRITON_DUMP_TTGIR_TO_TLX",
@@ -130,10 +132,8 @@ inline const std::set<std::string> CACHE_NEUTRAL_ENV_VARS = {
 namespace tools {
 
 inline void assertIsRecognized(const std::string &env) {
-  bool is_invalidating = CACHE_INVALIDATING_ENV_VARS.find(env.c_str()) !=
-                         CACHE_INVALIDATING_ENV_VARS.end();
-  bool is_neutral =
-      CACHE_NEUTRAL_ENV_VARS.find(env.c_str()) != CACHE_NEUTRAL_ENV_VARS.end();
+  bool is_invalidating = CACHE_INVALIDATING_ENV_VARS.contains(env.c_str());
+  bool is_neutral = CACHE_NEUTRAL_ENV_VARS.contains(env.c_str());
   std::string errmsg = env + "is not recognized. "
                              "Please add it to triton/Tools/Sys/GetEnv.h";
   assert((is_invalidating || is_neutral) && errmsg.c_str());
@@ -161,6 +161,10 @@ inline bool getBoolEnv(const std::string &env) {
                  [](unsigned char c) { return std::tolower(c); });
   return str == "on" || str == "true" || str == "1";
 }
+
+// Whether TRITON_ALLOW_NPOT (knobs.language.allow_npot) opts in to NPOT shapes;
+// every C++ check reads it here.
+inline bool isNpotAllowed() { return getBoolEnv("TRITON_ALLOW_NPOT"); }
 
 inline std::optional<bool> isEnvValueBool(std::string str) {
   std::transform(str.begin(), str.end(), str.begin(),

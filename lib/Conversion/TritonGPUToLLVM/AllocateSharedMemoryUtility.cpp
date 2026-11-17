@@ -141,30 +141,25 @@ void attachAllocationSizeAndOffsetAttr(ModuleOp mod,
                                       allocation.getSharedMemorySize()));
 }
 
-LogicalResult verifyNpotModularOpsSupported(ModuleOp mod) {
-  if (!triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
+static bool lacksNpotPow2AllocShape(Type type) {
+  auto memDesc = dyn_cast<MemDescType>(type);
+  return memDesc && isa<SharedEncodingTrait>(memDesc.getEncoding()) &&
+         !holdsNpotPow2AllocShape(memDesc.getEncoding(),
+                                  memDesc.getAllocShape());
+}
+
+LogicalResult verifyNpotTypesSupported(ModuleOp mod) {
+  if (!triton::tools::isNpotAllowed())
     return success();
-  auto isNpot = [](Type type) {
-    auto tensorTy = dyn_cast<RankedTensorType>(type);
-    return tensorTy && hasNpotShape(tensorTy);
-  };
-  bool rejected = false;
+  bool unsupported = false;
   mod.walk([&](Operation *op) {
-    if (!isa<triton::ReduceOp, triton::ScanOp, triton::HistogramOp,
-             triton::GatherOp>(op))
-      return;
-    // A histogram gates on its input only: NPOT bins over a power-of-two
-    // input are exact.
-    if (llvm::none_of(op->getOperandTypes(), isNpot) &&
-        (isa<triton::HistogramOp>(op) ||
-         llvm::none_of(op->getResultTypes(), isNpot)))
-      return;
-    op->emitError() << "NPOT " << op->getName()
-                    << " operations are not yet supported with modular "
-                       "tensor layouts";
-    rejected = true;
+    if (llvm::any_of(op->getOperandTypes(), lacksNpotPow2AllocShape) ||
+        llvm::any_of(op->getResultTypes(), lacksNpotPow2AllocShape)) {
+      op->emitError() << "NPOT shared memory descriptors are not yet supported";
+      unsupported = true;
+    }
   });
-  return failure(rejected);
+  return failure(unsupported);
 }
 
 } // namespace mlir::triton::gpu

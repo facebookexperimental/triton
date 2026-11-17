@@ -18,10 +18,22 @@ from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-import cloudpickle
-from cloudpickle.cloudpickle import CloudPickler, _extract_code_globals
-
 import triton
+
+try:
+    import cloudpickle
+    from cloudpickle.cloudpickle import CloudPickler, _extract_code_globals
+except ImportError:
+    # cloudpickle is a test-only dependency. Keep this module importable
+    # without it; serialization entry points fail with a clear error below.
+    cloudpickle = None
+    CloudPickler = object
+    _extract_code_globals = None
+
+
+def _require_cloudpickle():
+    if cloudpickle is None:
+        raise ImportError("cloudpickle is required for compile-warmup serialization")
 
 
 class _UnsupportedPreloadError(Exception):
@@ -182,6 +194,7 @@ class _JITFunctionPickler(CloudPickler):
 
 
 def _jit_dumps(obj):
+    _require_cloudpickle()
     function = getattr(obj, "fn", None)
     module = sys.modules.get(function.__module__) if isinstance(function, types.FunctionType) else None
     module_file = getattr(module, "__file__", None)
@@ -261,6 +274,7 @@ def _initialize_preload_worker(triton_key):
 def _preload_worker(module_name, qualified_name, fn_bytes, compile_context_bytes, kernel_repr, instrumentation_mode,
                     environment, cache_dir, trace_directory, phase, test, capture_worker):
     """Load one JIT function and populate the shared disk cache."""
+    _require_cloudpickle()
     previous_capture_worker = os.environ.get("PYTEST_XDIST_WORKER")
     os.environ["PYTEST_XDIST_WORKER"] = capture_worker
     _silence_worker_shutdown_diagnostics()

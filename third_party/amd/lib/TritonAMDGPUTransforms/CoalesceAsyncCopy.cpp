@@ -11,11 +11,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 
-#undef DEBUG_TYPE
-#define DEBUG_TYPE "tritonamdgpu-coalesce-async-copy"
-#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
-#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
-
 namespace ttg = triton::gpu;
 using mlir::triton::amdgpu::ISAFamily;
 
@@ -54,11 +49,13 @@ decomposeAsyncCopyToSync(ttg::AsyncCopyGlobalToLocalOp copyOp,
   // Synchronous global load into registers.
   Value loaded;
   if (mask)
-    loaded = triton::LoadOp::create(rewriter, loc, src, mask, copyOp.getCache(),
-                                    copyOp.getEvict(), copyOp.getIsVolatile());
+    loaded = triton::LoadOp::create(rewriter, loc, src, mask, Value(),
+                                    copyOp.getCachePolicyAttr(),
+                                    copyOp.getIsVolatile());
   else
-    loaded = triton::LoadOp::create(rewriter, loc, src, copyOp.getCache(),
-                                    copyOp.getEvict(), copyOp.getIsVolatile());
+    loaded = triton::LoadOp::create(rewriter, loc, src, Value(), Value(),
+                                    copyOp.getCachePolicyAttr(),
+                                    copyOp.getIsVolatile());
 
   // Preserve `other` (the fill value for masked-out lanes); a masked tt.load
   // leaves those lanes undefined, so select them explicitly.

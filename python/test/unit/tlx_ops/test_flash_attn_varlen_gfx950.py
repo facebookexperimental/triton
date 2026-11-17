@@ -102,13 +102,17 @@ def test_flash_attn_varlen_split_plan():
                 assert bh * (items_per_bh - num_m_blocks) <= MAX_PARTIALS
 
 
+@pytest.mark.parametrize("big_block_n_max_split", [0, 1 << 30])
 @pytest.mark.parametrize(
     "lengths,heads,kv_heads",
     [([1000], 1, 1), ([1000] * 10, 1, 1), ([1200] * 10, 1, 1), ([700, 1200, 950, 801, 1100, 760, 1000], 1, 1),
      ([1000, 640], 4, 2)],
 )
-def test_flash_attn_varlen_causal_split(lengths, heads, kv_heads):
-    """Causal shapes whose query tiles are split by key range and merged."""
+def test_flash_attn_varlen_causal_split(lengths, heads, kv_heads, big_block_n_max_split, monkeypatch):
+    """Causal shapes whose query tiles are split by key range and merged, with 64- and 128-key blocks."""
+    from triton.tlx.ops.kernels.flash_attn_varlen import gfx950
+
+    monkeypatch.setattr(gfx950, "BIG_BLOCK_N_MAX_SPLIT", big_block_n_max_split)
     torch.manual_seed(20)
     _check(lengths, lengths, True, heads=heads, kv_heads=kv_heads)
 
@@ -175,6 +179,56 @@ def test_flash_attn_varlen_strided_qkv():
     out = flash_attn_varlen(q, k, v, cu, cu, max(lengths), max(lengths), causal=True)
     ref = _reference(q, k, v, cu, cu, True, 128**-0.5)
     torch.testing.assert_close(out.float(), ref, **TOLERANCE[torch.float16])
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_varlen_int64_offsets(causal):
+    """Element offsets past 2**31, with Q/K/V as head slices of one packed projection."""
+    from triton.tlx.ops import flash_attn_varlen
+
+    torch.manual_seed(20)
+    heads, kv_heads = 32, 4
+    lengths = [128, 100, 37, 200] * 1128
+    cu = _cu(lengths)
+    qkv = torch.randn(sum(lengths), heads + 2 * kv_heads, 128, device="cuda", dtype=torch.float16)
+    q, k, v = qkv[:, :heads], qkv[:, heads:heads + kv_heads], qkv[:, heads + kv_heads:]
+    out = flash_attn_varlen(q, k, v, cu, cu, max(lengths), max(lengths), causal=causal)
+    # Q/K/V tokens are 40 * 128 elements apart and pass 2**31 at token 419431; the output is contiguous,
+    # 32 * 128 elements per token, and passes it at token 524288. Check the sequences holding those tokens.
+    tokens = torch.tensor([0, 419431, 524288, sum(lengths) - 1], device="cuda", dtype=torch.int32)
+    for b in (torch.searchsorted(cu, tokens, right=True) - 1).tolist():
+        b0, b1 = cu[b].item(), cu[b + 1].item()
+        local = _cu([b1 - b0])
+        ref = _reference(q[b0:b1], k[b0:b1], v[b0:b1], local, local, causal, 128**-0.5)
+        torch.testing.assert_close(out[b0:b1].float(), ref, **TOLERANCE[torch.float16])
+
+
+@pytest.mark.parametrize(
+    "tokens,token_stride,block,expected",
+    [
+        # Contiguous (tokens, 32, 128) and the Q slice of a packed (tokens, 40, 128) projection, with 64- and
+        # 128-row blocks: the largest token count whose offsets fit in int32 and the next one, counting the masked
+        # rows of the last tile.
+        (524225, 4096, 64, False),
+        (524226, 4096, 64, True),
+        (524161, 4096, 128, False),
+        (524162, 4096, 128, True),
+        (419367, 5120, 64, False),
+        (419368, 5120, 64, True),
+        (419303, 5120, 128, False),
+        (419304, 5120, 128, True),
+        # 7825 sequences of 67 tokens: real rows stay below 2**31, which takes 524289 tokens; masked rows reach it.
+        (7825 * 67, 4096, 64, True),
+        # One token whose stride makes the K/V block step, block * token_stride, reach 2**31.
+        (1, 2**25, 64, True),
+        (1, 2**24, 128, True),
+    ],
+)
+def test_flash_attn_varlen_needs_i64_offsets(tokens, token_stride, block, expected):
+    """The int64-offset choice at its threshold, for a `(tokens, 32, 128)` view with the given token stride."""
+    from triton.tlx.ops.kernels.flash_attn_varlen.gfx950 import _needs_i64_offsets
+
+    assert _needs_i64_offsets((tokens, 32, 128), (token_stride, 128, 1), block) == expected
 
 
 def test_flash_attn_varlen_rejects_invalid_inputs():
