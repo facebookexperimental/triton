@@ -121,13 +121,13 @@ from ._normalization import (
 
 __all__ = [
     "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
-    "moe_routing", "norm_residual_norm", "rmsnorm_gate", "router_gemm", "qk_norm_rope_kv_cache", "addmm",
-    "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen", "linear_rowscale",
-    "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn",
-    "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode", "prepare_flash_attn_varlen_backward",
-    "flash_attn_varlen_backward", "paged_attention_decode", "paged_attention_prefill",
-    "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d", "UnsupportedOp",
-    "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "moe_routing", "moe_finalize", "norm_residual_norm", "rmsnorm_gate", "router_gemm", "qk_norm_rope_kv_cache",
+    "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen",
+    "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev",
+    "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "paged_attention_decode",
+    "paged_attention_prefill", "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d",
+    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -842,6 +842,108 @@ def moe_routing(router_logits, correction_bias, topk=8, *, router_multiplier=1.0
     _check_enforced("moe_routing", spec, invariance)
     with torch.cuda.device(router_logits.device):
         return fn(router_logits, correction_bias, topk, router_multiplier, route_scale, eps, num_valid_tokens, out)
+
+
+_MOE_FINALIZE_MAX_H = 8192
+_MOE_FINALIZE_MAX_TOPK = 16
+
+
+def moe_finalize(expert_out, topk_weights, *, row_index=None, topk_ids=None, expert_mask=None, norm_weight=None,
+                 input_scale=True, eps=1e-6, gain_center=0.0, out=None, space=None):
+    """Combine routed expert outputs per token: RMSNorm each slot's expert row, scale it by its routing weight, sum
+    over the top-k slots. BF16. Differentiable in ``expert_out``, ``topk_weights`` and ``norm_weight``.
+
+    Layouts, with ``topk_weights`` fp32 ``(T, K)``:
+
+    - ``row_index`` given: ``expert_out`` is ``(R, H)``, the expert outputs in any row order (for example grouped by
+      expert, as an expert GEMM writes them), and ``row_index`` int32/int64 ``(T, K)`` holds the row of each slot, or
+      -1 for a slot with no row (routed to an expert on another rank). Rows must be in ``[0, R)``.
+    - otherwise ``expert_out`` is ``(T, K, H)``. With ``topk_ids`` int32/int64 ``(T, K)`` and ``expert_mask``
+      bool/int32 ``(E,)``, a slot contributes only when ``0 <= topk_ids[t, k] < E`` and its mask entry is nonzero;
+      without them every slot does.
+
+    A slot that does not contribute is not read. For a contributing slot with row ``x`` (upcast), weight
+    ``w = bf16(norm_weight + gain_center)`` (``norm_weight`` BF16 or FP32 ``(H,)``; ``w = 1`` without one) and
+    ``s = topk_weights[t, k]``, in FP32:
+    ``n = bf16(x * w)`` and ``y = bf16(n * rsqrt(mean(n * n) + eps))`` with ``input_scale``, else
+    ``y = bf16(x * rsqrt(mean(x * x) + eps) * w)``; then ``out[t] = bf16(sum_k bf16(y * s))``, summed in slot order.
+    A token without contributing slots gets zeros. Returns ``out`` (BF16 ``(T, H)``), filling it when passed.
+    ``H`` is at most 8192 and ``K`` at most 16. Batch invariant. Only ``space="heuristic"`` is provided.
+
+    The backward recomputes the norm. The gradient of ``expert_out`` has its shape and is zero for rows that no
+    contributing slot names; with ``row_index`` each row must be named by at most one slot. The gradient of
+    ``topk_weights`` is ``sum(g * y)`` per slot (zero for slots that do not contribute) and that of ``norm_weight`` is
+    accumulated in FP32 and returned in its dtype; ``gain_center`` passes it through unchanged. ``g * s`` and the
+    gradient of the norm input are rounded to BF16, as in the eager chain.
+
+    ``gain_center`` folds the offset of a norm whose weight is stored centered at zero (for example a learnable
+    input scale applied as ``weight + 1``) into the kernel. It needs ``norm_weight``; the default 0 leaves a BF16
+    weight unchanged.
+    ``out`` is forward only: it cannot be combined with inputs that require grad.
+    """
+    import torch
+
+    name = "tlx.ops.moe_finalize"
+    if not isinstance(expert_out, torch.Tensor) or not isinstance(topk_weights, torch.Tensor):
+        raise InvalidInput(f"{name} expects tensor expert_out and topk_weights")
+    if (topk_weights.ndim != 2 or topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous()):
+        raise InvalidInput(f"{name} expects contiguous fp32 topk_weights (T, K); got {tuple(topk_weights.shape)} "
+                           f"{topk_weights.dtype}")
+    T, K = topk_weights.shape
+    if row_index is not None and (topk_ids is not None or expert_mask is not None):
+        raise InvalidInput(f"{name} takes row_index or topk_ids/expert_mask, not both")
+    if (topk_ids is None) != (expert_mask is None):
+        raise InvalidInput(f"{name} expects topk_ids and expert_mask together")
+    want_dims = 2 if row_index is not None else 3
+    if (expert_out.ndim != want_dims or expert_out.dtype != torch.bfloat16 or not expert_out.is_contiguous()
+            or (want_dims == 3 and tuple(expert_out.shape[:2]) != (T, K))):
+        layout = "(R, H) with row_index" if want_dims == 2 else f"({T}, {K}, H)"
+        raise InvalidInput(f"{name} expects a contiguous BF16 expert_out of shape {layout}; got "
+                           f"{tuple(expert_out.shape)} {expert_out.dtype}")
+    H = expert_out.shape[-1]
+    if not 1 <= H <= _MOE_FINALIZE_MAX_H or not 1 <= K <= _MOE_FINALIZE_MAX_TOPK:
+        raise InvalidInput(f"{name} supports 1 <= H <= {_MOE_FINALIZE_MAX_H} and 1 <= K <= "
+                           f"{_MOE_FINALIZE_MAX_TOPK}; got H={H}, K={K}")
+    for arg, t in (("row_index", row_index), ("topk_ids", topk_ids)):
+        if t is not None and (not isinstance(t, torch.Tensor) or t.shape != (T, K)
+                              or t.dtype not in (torch.int32, torch.int64) or not t.is_contiguous()):
+            raise InvalidInput(f"{name} expects a contiguous int32/int64 {arg} of shape ({T}, {K})")
+    if expert_mask is not None and (not isinstance(expert_mask, torch.Tensor) or expert_mask.ndim != 1
+                                    or expert_mask.numel() == 0 or expert_mask.dtype not in (torch.bool, torch.int32)
+                                    or not expert_mask.is_contiguous()):
+        raise InvalidInput(f"{name} expects a contiguous non-empty bool/int32 expert_mask (E,)")
+    if norm_weight is not None and (not isinstance(norm_weight, torch.Tensor) or norm_weight.shape != (H, )
+                                    or norm_weight.dtype not in (torch.bfloat16, torch.float32)
+                                    or not norm_weight.is_contiguous()):
+        raise InvalidInput(f"{name} expects a contiguous BF16 or FP32 norm_weight of shape ({H},)")
+    if (isinstance(gain_center, bool) or not isinstance(gain_center, (int, float)) or not math.isfinite(gain_center)):
+        raise InvalidInput(f"{name} expects a finite Python number gain_center; got {gain_center!r}")
+    if gain_center != 0 and norm_weight is None:
+        raise InvalidInput(f"{name} applies gain_center to norm_weight; pass norm_weight with gain_center")
+    if isinstance(eps, bool) or not isinstance(eps, (int, float)) or not 0 <= eps < float("inf"):
+        raise InvalidInput(f"{name} expects a finite non-negative Python number eps; got {eps!r}")
+    tensors = [t for t in (expert_out, topk_weights, row_index, topk_ids, expert_mask, norm_weight) if t is not None]
+    if out is not None:
+        if (not isinstance(out, torch.Tensor) or out.shape != (T, H) or out.dtype != torch.bfloat16
+                or not out.is_contiguous()):
+            raise InvalidInput(f"{name} expects a contiguous BF16 out of shape ({T}, {H})")
+        if any(torch._C._overlaps(out, t) for t in tensors):
+            raise InvalidInput(f"{name} out must not alias an input")
+        tensors.append(out)
+    if any(t.device != expert_out.device for t in tensors):
+        raise InvalidInput(f"{name} expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("moe_finalize", space)
+    _check_single_config_space("moe_finalize", space_name)
+    fn, spec = impl_for("moe_finalize", device=expert_out.device)
+    check_inputs(spec, dtype=expert_out.dtype, H=H, K=K)
+    check_backward(spec, *tensors)
+    if out is not None and torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
+        raise UnsupportedBackward(f"{name} fills out only without autograd; pass out=None to differentiate")
+    _check_enforced("moe_finalize", spec, invariance)
+    with torch.cuda.device(expert_out.device):
+        return fn(expert_out, topk_weights, row_index, topk_ids, expert_mask, norm_weight, bool(input_scale), eps,
+                  float(gain_center), out)
 
 
 def norm_residual_norm(stream, branch, *, post_weight=None, post_norm_input_scale=False, pre_weight=None, alpha=None,
