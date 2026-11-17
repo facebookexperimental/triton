@@ -265,7 +265,10 @@ public:
     doHoistLoopInvariantTMEMStore(funcOp);
     dumpAfter(moduleOp, "doHoistLoopInvariantTMEMStore");
 
-    if (failed(doMemoryPlanner(funcOp, numStages, smemBudget))) {
+    MemoryPlannerOptions plannerOptions;
+    plannerOptions.generateSubtiledRegion = generateSubtiledRegion;
+    if (failed(
+            doMemoryPlanner(funcOp, numStages, smemBudget, plannerOptions))) {
       signalPassFailure();
       return;
     }
