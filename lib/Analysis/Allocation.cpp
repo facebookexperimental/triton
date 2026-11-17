@@ -30,6 +30,66 @@ static size_t getPartitionIndex(size_t offset, size_t partitionSize) {
 namespace ttng = mlir::triton::nvidia_gpu;
 namespace ttg = mlir::triton::gpu;
 
+// The buffer a TMA store reads, looking through memdesc views.
+static mlir::Value getTMAStoreSourceRoot(mlir::Operation *store) {
+  mlir::Value src =
+      mlir::isa<ttng::AsyncTMACopyLocalToGlobalOp>(store)
+          ? mlir::cast<ttng::AsyncTMACopyLocalToGlobalOp>(store).getSrc()
+          : mlir::cast<ttng::AsyncTMAReduceOp>(store).getSrc();
+  while (mlir::Operation *def = src.getDefiningOp()) {
+    if (!def->hasTrait<mlir::OpTrait::MemDescViewTrait>())
+      break;
+    src = def->getOperand(0);
+  }
+  return src;
+}
+
+static bool isTMAStoreLike(mlir::Operation *op) {
+  return mlir::isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+      op);
+}
+
+// Returns the first later wait that retires `store`, or null. Bulk stores
+// complete in issue order; a token wait with `planned_pending_count = P`
+// retires only stores at least P stores old, like the
+// `async_tma_store_wait {pendings = P}` it lowers to.
+static mlir::Operation *getTMAStoreCompletion(mlir::Operation *store) {
+  llvm::SmallPtrSet<mlir::Operation *, 8> laterStores;
+  // A retiring wait may follow the enclosing loop. Stop at a warp-specialize
+  // partition region, whose warps do not run what follows.
+  for (mlir::Operation *pos = store; pos;) {
+    for (mlir::Block *block = pos->getBlock(); block;
+         block = block->getNextNode()) {
+      auto it = block == pos->getBlock() ? std::next(pos->getIterator())
+                                         : block->begin();
+      for (; it != block->end(); ++it) {
+        mlir::Operation *op = &*it;
+        if (auto wait = mlir::dyn_cast<ttng::TMAStoreWaitOp>(op)) {
+          if (wait.getPendings() <= laterStores.size())
+            return op;
+        } else if (auto wait = mlir::dyn_cast<ttng::TMAStoreTokenWaitOp>(op)) {
+          if (auto planned = wait->getAttrOfType<mlir::IntegerAttr>(
+                  ttng::kPlannedPendingCount)) {
+            if (planned.getInt() <= (int64_t)laterStores.size())
+              return op;
+          } else if (mlir::Operation *def = wait.getToken().getDefiningOp();
+                     def && (def == store || laterStores.contains(def))) {
+            return op;
+          }
+        }
+        if (isTMAStoreLike(op))
+          laterStores.insert(op);
+      }
+    }
+    mlir::Operation *parent = pos->getParentOp();
+    if (!parent || mlir::isa<mlir::FunctionOpInterface,
+                             ttg::WarpSpecializePartitionsOp>(parent))
+      break;
+    pos = parent;
+  }
+  return nullptr;
+}
+
 namespace mlir {
 
 //===----------------------------------------------------------------------===//
@@ -529,24 +589,30 @@ private:
         minId = 0;
         maxId = operationId.size();
       }
-      // For SMEM buffers used by AsyncTMACopyLocalToGlobalOp (early TMA
-      // store lowering), the buffer must remain live until the corresponding
-      // TMAStoreTokenWaitOp completes. SSA liveness only tracks the memdesc
-      // use at the async_tma_copy op, but the TMA hardware continues reading
-      // from the buffer asynchronously until the token wait. Without this
-      // extension, two such buffers can be assigned the same SMEM offset,
-      // causing a data race when the second local_alloc overwrites the first
-      // buffer while the TMA is still reading it.
-      if (hasOpOfAnyTypeInForwardSlice<ttng::AsyncTMACopyLocalToGlobalOp>(
-              defOp)) {
+      // A TMA store keeps reading its SMEM source until a later wait retires
+      // it. When that wait is in another block (CFG loops after SCF-to-CF) or
+      // missing, the store can still be in flight when control comes back
+      // around, so keep the buffer live across its whole region.
+      if (hasOpOfAnyTypeInForwardSlice<ttng::AsyncTMACopyLocalToGlobalOp,
+                                       ttng::AsyncTMAReduceOp>(defOp)) {
         llvm::SetVector<Operation *> forwardSlice;
         getForwardSlice(defOp, &forwardSlice);
         for (Operation *op : forwardSlice) {
-          if (isa<ttng::TMAStoreTokenWaitOp>(op)) {
-            if ((operationId[op] + 1) > maxId) {
-              maxId = operationId[op] + 1;
-            }
+          if (isa<ttng::TMAStoreTokenWaitOp>(op) &&
+              (operationId[op] + 1) > maxId)
+            maxId = operationId[op] + 1;
+          if (!isTMAStoreLike(op) || getTMAStoreSourceRoot(op) != value)
+            continue;
+          Operation *done = getTMAStoreCompletion(op);
+          Region *region = op->getParentRegion();
+          if (!done || done->getBlock() != op->getBlock()) {
+            region->walk([&](Operation *regionOp) {
+              minId = std::min(minId, operationId[regionOp]);
+              maxId = std::max(maxId, operationId[regionOp] + 1);
+            });
           }
+          if (done && (operationId[done] + 1) > maxId)
+            maxId = operationId[done] + 1;
         }
       }
       return Interval(minId, maxId);
