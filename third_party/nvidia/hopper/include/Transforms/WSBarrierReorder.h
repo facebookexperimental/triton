@@ -8,6 +8,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 
 namespace mlir {
 namespace triton {
@@ -476,11 +477,17 @@ inline void optimizeWSBarrierLocations(
            itA->second < itB->second;
   };
   // Barrier arrays used by WS endpoints with more than one peer partition.
-  // Every WS endpoint in the block votes, not just the ones the map holds.
+  // Every WS endpoint in each block the map touches votes, not just the ones
+  // the map holds. InterleaveTMem builds the map from a single block, but scan
+  // every distinct block so a missed peer can never let a same-channel move
+  // through.
   DenseMap<Value, std::optional<int64_t>> peerOfRoot;
   DenseSet<Value> mixedBarrierRoots;
-  if (!barrierToMemOp.empty()) {
-    for (Operation &op : *barrierToMemOp.begin()->first->getBlock()) {
+  llvm::SetVector<Block *> barrierBlocks;
+  for (const auto &entry : barrierToMemOp)
+    barrierBlocks.insert(entry.first->getBlock());
+  for (Block *block : barrierBlocks) {
+    for (Operation &op : *block) {
       Value alloc;
       std::optional<DictionaryAttr> constraints;
       if (auto wait = dyn_cast<WaitBarrierOp>(&op)) {
