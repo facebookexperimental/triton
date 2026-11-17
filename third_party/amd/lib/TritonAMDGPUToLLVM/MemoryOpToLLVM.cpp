@@ -22,6 +22,7 @@
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/AMDGPUAddrSpace.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
 #include <type_traits>
 
 using mlir::triton::amdgpu::ISAFamily;
@@ -2546,7 +2547,7 @@ struct MemoryCounterWaitOpConversion
   matchAndRewrite(amdgpu::MemoryCounterWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     // amdgpu::MemoryCounterWaitOp supports gfx9 onwards
-    auto isaVersion = targetInfo.getIsaVersion();
+    auto isaVersion = llvm::AMDGPU::getIsaVersion(targetInfo.getArch());
 
     /// If major version >= gfx12, lower to
     ///   * ROCDL::WaitDscntOp if ds is present

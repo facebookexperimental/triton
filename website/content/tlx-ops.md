@@ -157,7 +157,7 @@ Run them from `fbsource/fbcode`:
 CUDA_VISIBLE_DEVICES=1 buck2 run @mode/opt -m ovr_config//triton:beta \
   -c fbcode.nvcc_arch=b200a -m ovr_config//third-party/cuda/constraints:12.8 \
   --agent-context direct_call=true --agent-context reason="Check fused weight and bias gradients" \
-  fbsource//third-party/triton/beta/triton:py_tlx_mm_bias_grad_test -- -s --tb=short -v
+  fbsource//third-party/triton/beta/triton:py_tlx_ops_blackwell_test -- -s --tb=short -v
 ```
 
 ### Benchmark against unfused PT2
