@@ -846,6 +846,7 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.mm._shapes",
         "triton.tlx.ops.kernels.moe._routing_shapes",
         "triton.tlx.ops.kernels.norm._shapes",
+        "triton.tlx.ops.kernels.router_gemm._shapes",
         "triton.tlx.ops.kernels.swiglu_ffn._shapes",
     ],
 )
@@ -908,6 +909,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
             "gfx942": ("gfx942_all", ),
         },
         "triton.tlx.ops.kernels.moe._routing_shapes": {"gfx950": ("gfx950_all", )},
+        "triton.tlx.ops.kernels.router_gemm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.swiglu_ffn._shapes": {"sm90": ("sm90_1", )},
     }
     pattern = re.compile(r"^(?:sm|gfx)\d+_(?:[1-9]\d*|all)$")
@@ -1009,6 +1011,7 @@ BENCH_MODULES = (
     "bench_moe_routing",
     "bench_norm_residual_norm",
     "bench_norm",
+    "bench_router_gemm",
     "bench_rmsnorm_cat",
     "bench_swiglu_ffn",
 )

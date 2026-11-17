@@ -3717,7 +3717,11 @@ def test_amd_fa_cluster_selects_static_k_row_stride(dtype, n_ctx, head_dim, caus
 def test_amd_fa_cluster_launch_forwards_static_k_row_stride(monkeypatch, dtype, n_ctx, expected):
     """The public wrapper forwards the selected stride to the compiled kernel."""
     strides = (64 * n_ctx * 263, n_ctx * 263, 263, 1)
-    tensor = SimpleNamespace(shape=(1, 64, n_ctx, 128), dtype=dtype, stride=lambda dim: strides[dim])
+
+    def stride(dim=None):
+        return strides if dim is None else strides[dim]
+
+    tensor = SimpleNamespace(shape=(1, 64, n_ctx, 128), dtype=dtype, stride=stride)
     captured = {}
 
     class CaptureKernel:
