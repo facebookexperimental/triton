@@ -5473,6 +5473,28 @@ static LogicalResult verifyExactNpotLayouts(Operation *op) {
     if (plan && !plan->supported())
       return op->emitError(*plan->unsupportedReason);
   }
+  // Any trait op forwarding one tensor to another with only its
+  // layout changed is a conversion: same plan check. Memdesc anchors
+  // are not tensors here; they go through the shared-shape rule in
+  // the pad pass.
+  if (op->hasTrait<OpTrait::MixedRadixLayoutTrait>() &&
+      op->getNumOperands() == 1 && op->getNumResults() == 1) {
+    auto srcTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+    auto dstTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    if (srcTy && dstTy && srcTy.getShape() == dstTy.getShape() &&
+        srcTy.getElementType() == dstTy.getElementType() &&
+        srcTy.getEncoding() && dstTy.getEncoding() &&
+        srcTy.getEncoding() != dstTy.getEncoding() &&
+        (hasNpotShape(srcTy) || hasNpotShape(dstTy))) {
+      if (!hasExactNpotLayout(srcTy) || !hasExactNpotLayout(dstTy))
+        return op->emitError(
+            "NPOT conversion to or from a non-mixed-radix layout is "
+            "not yet supported");
+      auto plan = getMixedRadixConversionPlan(srcTy, dstTy);
+      if (plan && !plan->supported())
+        return op->emitError(*plan->unsupportedReason);
+    }
+  }
   SmallVector<Type> types(op->getOperandTypes());
   llvm::append_range(types, op->getResultTypes());
   // Other blocks' arguments are their branches' operands.
