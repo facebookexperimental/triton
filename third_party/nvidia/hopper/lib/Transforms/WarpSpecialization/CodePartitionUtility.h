@@ -337,6 +337,15 @@ optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);
+// Pick the single task that writes a buffer read by `consumerTaskIds`, given
+// that the producer op carries more than one task id. Returns -1 when every
+// producer task is co-located with a consumer (no cross-partition channel is
+// needed), and failure() when more than one producer task is not, since a
+// channel has exactly one producer and picking any one of them silently drops
+// the others.
+FailureOr<AsyncTaskId>
+selectCrossPartitionProducerTask(ArrayRef<AsyncTaskId> producerTaskIds,
+                                 ArrayRef<AsyncTaskId> consumerTaskIds);
 // Same-task SMEM records are useful for memory-planner bookkeeping, but code
 // partitioning should only consume cross-partition communication channels.
 void collectAllocChannels(SmallVector<std::unique_ptr<Channel>> &channels,
