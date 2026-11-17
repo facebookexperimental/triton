@@ -236,6 +236,23 @@ static bool isLegalSharedTile(gpu::MemDescType type) {
   return hasExactSharedShape(type) || isLegalMemdescView(type);
 }
 
+// Whether `op` is a metadata-only memdesc view whose result is
+// legal: a trans tiles whole swizzle atoms, any other view is a
+// legal shared tile or a legal view of its allocation. The
+// component walk and Padder::accept admit exactly these, through
+// this one helper so the two cannot drift apart.
+static bool isLegalMemdescViewOp(Operation *op) {
+  if (!op->hasTrait<OpTrait::MemDescViewTrait>() ||
+      op->getNumResults() != 1)
+    return false;
+  auto type = dyn_cast<gpu::MemDescType>(op->getResult(0).getType());
+  if (!type)
+    return false;
+  if (isa<gpu::MemDescTransOp>(op))
+    return hasExactSharedShape(type);
+  return isLegalSharedTile(type);
+}
+
 // Groups the NPOT tensors connected through their ops (a connected component
 // of the def-use graph). A connected component keeps its shape iff its ops
 // lower a mixed-radix layout without an unsupported reason and, unless one has
@@ -327,6 +344,9 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
   // mixed-radix and Blocked layouts to sum; false if v cannot take a
   // mixed-radix layout.
   auto addTotalInDimSizes = [&](Value v, std::pair<int64_t, int64_t> &sum) {
+    if (auto alloc = v.getDefiningOp<gpu::LocalAllocOp>();
+        alloc && alloc.getSrc())
+      return true;
     if (auto desc = dyn_cast<TensorDescType>(v.getType()))
       return !desc.getSharedLayout();
     // A memdesc value whose rows tile whole swizzle atoms, or whose
@@ -397,7 +417,11 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
       return std::nullopt;
     SmallVector<NpotDotOperandAccess, 2> operands;
     for (Value operand : {dot.getA(), dot.getB()}) {
-      auto type = cast<RankedTensorType>(operand.getType());
+      // A dot on shared-memory operands has no tensor cost model
+      // here, so it takes no part in the slow-dot comparison.
+      auto type = dyn_cast<RankedTensorType>(operand.getType());
+      if (!type)
+        return std::nullopt;
       NpotDotOperandAccess &access = operands.emplace_back();
       access.order =
           llvm::to_vector(llvm::reverse(llvm::seq<unsigned>(type.getRank())));
@@ -471,6 +495,25 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
   llvm::MapVector<Value, Accesses> accesses;
   DenseMap<Value, Operation *> firstOps;
   DenseSet<Value> seen, remarked, unpaddable;
+  // A tensor in a non-linear encoding legal at its shape (an MMA
+  // accumulator, an anchor's result) has its layout fixed by its
+  // producer: padding would retype it under an encoding computed for
+  // the NPOT shape. A component holding one takes no pad the pass
+  // chooses, neither the shared-allocation pad nor a cost pad; a
+  // producer-rejected shape still pads through rejects() and fails
+  // its own check in accept().
+  auto hasFixedLayout = [&](Value v) {
+    auto type = dyn_cast<RankedTensorType>(v.getType());
+    return type && type.getEncoding() &&
+           !isa<gpu::LinearEncodingAttr>(type.getEncoding()) &&
+           isLegalEncodedNpotTensor(type, ctx, target);
+  };
+  DenseSet<Value> fixedLeaders;
+  mod.walk([&](Operation *op) {
+    SmallVector<Value> values = npotValues(op);
+    if (!values.empty() && llvm::any_of(values, hasFixedLayout))
+      fixedLeaders.insert(components.getLeaderValue(values.front()));
+  });
   mod.walk([&](Operation *op) {
     SmallVector<Value> values = npotValues(op);
     if (values.empty())
@@ -496,11 +539,24 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
                               (!hasGatedEncoding(type) ||
                                isLegalGatedNpotType(type, mod.getContext(), target));
                      });
+    auto alloc = dyn_cast<gpu::LocalAllocOp>(op);
+    // A metadata-only memdesc view whose result is a legal shared
+    // tile or a legal view of its allocation is layout-fixed.
+    bool legalView = isLegalMemdescViewOp(op);
     // A buffer allocation in a legal shared layout is layout-fixed
     // like an anchor: it does not pad its component on its account.
-    auto alloc = dyn_cast<gpu::LocalAllocOp>(op);
     bool legalAlloc = alloc && isLegalSharedTile(alloc.getType());
-    if (alloc && alloc.getSrc() && !hasExactSharedShape(alloc.getType())) {
+    // An async TMA copy into a legal shared tile is data movement
+    // into a layout-fixed destination, like the views above.
+    bool legalAsyncCopy = false;
+    if (auto copy = dyn_cast<nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(op)) {
+      auto dest = dyn_cast<gpu::MemDescType>(copy.getResult().getType());
+      legalAsyncCopy = dest && isLegalSharedTile(dest);
+    }
+    // Dots skip the generic pad below: tensor dots are judged by
+    // rejects() and TLX dots by their op verifiers.
+    if (alloc && alloc.getSrc() && !hasExactSharedShape(alloc.getType()) &&
+        !fixedLeaders.contains(leader)) {
       pad(leader, op,
           "NPOT shared allocation rows do not tile whole swizzle atoms");
     } else if (alloc && alloc.getSrc()) {
@@ -508,7 +564,8 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
     } else if ((!gpu::isMixedRadixLayoutOp(op->getName()) ||
                 (op->hasTrait<OpTrait::MixedRadixLayoutTrait>() &&
                  memdescOnly)) &&
-               !legalFunc && !legalAlloc) {
+               !isa<DotOpInterface>(op) && !legalView &&
+               !legalAlloc && !legalAsyncCopy && !legalFunc) {
       pad(leader, op,
           llvm::formatv("NPOT mixed-radix layout is not yet supported on {0}",
                         op->getName()));
@@ -554,7 +611,7 @@ ExactComponents::ExactComponents(ModuleOp mod, int numWarps, int threadsPerWarp,
                         "registers x lanes x warps, their pow2 layouts {1}",
                         sum.first, sum.second));
   for (auto &[leader, reason] : slowReasons)
-    if (!unpaddable.contains(leader))
+    if (!unpaddable.contains(leader) && !fixedLeaders.contains(leader))
       pad(leader, reason.first, reason.second);
   for (auto &[leader, reason] : padReasons)
     if (!remarked.contains(leader))
@@ -814,11 +871,32 @@ LogicalResult Padder::accept(Operation *op) {
     llvm::append_range(types, region.getArgumentTypes());
   if (!llvm::any_of(types, touchesNpot))
     return success();
-  // A subslice whose extent's cover spans its allocation is a legal
-  // view; it is admitted here because its descriptor is a view of
-  // the alloc layout, not a shape the atom-tiling rule judges.
-  if (auto subslice = dyn_cast<gpu::MemDescSubsliceOp>(op);
-      subslice && isLegalMemdescView(subslice.getType()))
+  // A metadata-only memdesc view whose result is a legal shared
+  // tile or a legal view of its allocation is admitted here: its
+  // descriptor is a view of the alloc layout, not a shape the
+  // atom-tiling rule judges.
+  if (isLegalMemdescViewOp(op))
+    return success();
+  // An async TMA copy into a legal shared tile is data movement
+  // into a layout-fixed destination, like the views above.
+  if (auto copy = dyn_cast<nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(op)) {
+    auto dest = dyn_cast<gpu::MemDescType>(copy.getResult().getType());
+    if (dest && isLegalSharedTile(dest))
+      return success();
+  }
+  // An alloc in a padded component is retyped to the padded shape below.
+  if (auto alloc = dyn_cast<gpu::LocalAllocOp>(op); alloc && alloc.getSrc())
+    return success();
+  // A load of an alloc retyped above: its result tensor takes the generic
+  // exact/padded retype and layout checks like any other op's result.
+  if (auto load = dyn_cast<gpu::LocalLoadOp>(op);
+      load && load.getSrc().getDefiningOp<gpu::LocalAllocOp>())
+    return success();
+  // A store in a padded component, the third leg of the pair: this op
+  // is only checked when its component pads, and then its source tensor
+  // and destination descriptor are retyped alike, so the destination's
+  // exact-shape legality is not this op's to judge.
+  if (isa<gpu::LocalStoreOp>(op))
     return success();
   // A gated NPOT type that is illegal at its shape admits no op on
   // it. Legal gated types are admitted at the end, once the ops with
@@ -984,19 +1062,45 @@ LogicalResult Padder::accept(Operation *op) {
                                     getModuleTarget(op));
       }))
     return success();
+  // What reaches here with the every-layout trait and
+  // same-typed results only forwards its operands (a wait's
+  // outputs are its inputs, an identity anchor): it imposes
+  // no layout, so it is only retyped. Padded forms above
+  // claim their ops first.
+  if (op->hasTrait<OpTrait::MixedRadixLayoutTrait>() &&
+      op->getNumOperands() == op->getNumResults() &&
+      llvm::equal(op->getOperandTypes(), op->getResultTypes()))
+    return success();
   return op->emitOpError("on an NPOT tensor is unsupported");
 }
 
 void Padder::apply(ModuleOp mod, const ExactComponents &exact) {
+  DenseSet<Value> retyped;
   auto retype = [&](Value value) {
     if (!touchesNpot(value.getType()) || exact.contains(value))
       return;
+    Type before = value.getType();
     if (auto type = dyn_cast<RankedTensorType>(value.getType()))
       value.setType(padded(type));
-    else if (auto desc = dyn_cast<TensorDescType>(value.getType()))
+    else if (auto mem = dyn_cast<gpu::MemDescType>(value.getType())) {
+      auto shape =
+          padded(RankedTensorType::get(mem.getShape(), mem.getElementType()))
+              .getShape();
+      // A view's allocation is the parent buffer: pad its extent
+      // the same way, so the view keeps addressing the padded
+      // allocation instead of dropping to its own shape.
+      auto allocShape = padded(RankedTensorType::get(mem.getAllocShape(),
+                                                     mem.getElementType()))
+                            .getShape();
+      value.setType(gpu::MemDescType::get(
+          shape, mem.getElementType(), mem.getEncoding(), mem.getMemorySpace(),
+          mem.getMutableMemory(), allocShape));
+    } else if (auto desc = dyn_cast<TensorDescType>(value.getType()))
       value.setType(TensorDescType::get(padded(desc.getBlockType()).getShape(),
                                         desc.getElementType(),
                                         desc.getSharedLayout()));
+    if (value.getType() != before)
+      retyped.insert(value);
   };
   mod.walk([&](Operation *op) {
     llvm::for_each(op->getResults(), retype);
@@ -1004,6 +1108,40 @@ void Padder::apply(ModuleOp mod, const ExactComponents &exact) {
       for (Block &block : region)
         llvm::for_each(block.getArguments(), retype);
   });
+  // A view result can pad while its source is invisible to the
+  // component walk (a 160x64 view of a 256x64 allocation touches no
+  // NPOT dim under the buffer-dim convention, so it is never retyped
+  // above). Pad such a source alike, so the view's inferred type
+  // still matches the result the walk already padded.
+  SmallVector<Value> worklist(retyped.begin(), retyped.end());
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    Operation *def = value.getDefiningOp();
+    if (!def || !def->hasTrait<OpTrait::MemDescViewTrait>() ||
+        def->getNumOperands() == 0)
+      continue;
+    Value src = def->getOperand(0);
+    auto mem = dyn_cast<gpu::MemDescType>(src.getType());
+    // A source in an exact component keeps its type: padding it would
+    // retype the exact side's operands. A source that touches no NPOT
+    // dim is in no component, so it is safe to pad (and never inserted
+    // in the component map, so it must not be queried there).
+    if (!mem || (touchesNpot(src.getType()) && exact.contains(src)))
+      continue;
+    auto shape =
+        padded(RankedTensorType::get(mem.getShape(), mem.getElementType()))
+            .getShape();
+    auto allocShape = padded(RankedTensorType::get(mem.getAllocShape(),
+                                                   mem.getElementType()))
+                          .getShape();
+    Type type = gpu::MemDescType::get(shape, mem.getElementType(),
+                                      mem.getEncoding(), mem.getMemorySpace(),
+                                      mem.getMutableMemory(), allocShape);
+    if (type == src.getType())
+      continue;
+    src.setType(type);
+    worklist.push_back(src);
+  }
   for (auto &fixup : fixups)
     fixup();
 }
