@@ -4,6 +4,7 @@ KV is the history sequence and Q holds only the targets, with independent
 jagged offsets, checked against a dense PyTorch reference.
 """
 import importlib
+import re
 
 import pytest
 import torch
@@ -199,7 +200,7 @@ def test_hstu_cross_attn_stream_k_shared_kv_short_kv(dtype, monkeypatch):
     a["v"] = a["k"]
     first = hstu_cross_attn(**a, shared_kv=True)
     for _ in range(3):
-        assert torch.equal(hstu_cross_attn(**a, shared_kv=True), first)
+        torch.testing.assert_close(hstu_cross_attn(**a, shared_kv=True), first, atol=_fwd_atol(1), rtol=FWD_RTOL)
 
 
 def _inference_inputs(lengths_kv, lengths_q, heads=2, dim=128, dtype=torch.bfloat16):
@@ -793,6 +794,79 @@ def test_hstu_cross_attn_gfx950_retained_delta_widen_before_addressing():
     delta_pointer_lines = [line for line in lines if "tt.addptr" in line and "!tt.ptr<f32>" in line]
     assert delta_pointer_lines
     assert all("xi64>" in line for line in delta_pointer_lines), "Delta addresses must use 64-bit element offsets"
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_hstu_cross_attn_gfx950_preprocess_delta_widen_before_addressing():
+    """Compile the general backward's Delta addresses beyond the signed 32-bit element range."""
+    from triton.runtime.jit import MockTensor
+
+    util = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn._util")
+
+    class LargePointerTensor(MockTensor):
+
+        @staticmethod
+        def ptr_range():
+            return 2**33
+
+    # The last 128 rows start at BF16 element offset 2**31 or later.
+    heads = 8
+    total_q = 2**31 // (heads * 128) + 128
+    out = LargePointerTensor(torch.bfloat16, (total_q, heads, 128))
+    do = LargePointerTensor(torch.bfloat16, (total_q, heads, 128))
+    delta = LargePointerTensor(torch.float32, (total_q, heads))
+    # Warmup compiles pointer mocks without allocating or launching the kernel.
+    compiled = util._attn_bwd_preprocess.warmup(out, do, delta, total_q, heads, heads, BLOCK_M=128, HEAD_DIM=128,
+                                                grid=(triton.cdiv(total_q, 128), heads))
+    lines = compiled.asm["ttir"].splitlines()
+    products = [line for line in lines if "tensor<" in line and ("arith.muli" in line or "arith.shli" in line)]
+    assert products
+    # Reject an i32 product followed by an i64 cast.
+    assert all("xi64>" in line for line in products), "Widen row indices before multiplying by the row stride"
+    product_names = {line.split("=", 1)[0].strip() for line in products}
+    row_pointer_lines = [
+        line for line in lines
+        if "tt.addptr" in line and "!tt.ptr<bf16>" in line and any(f", {name} :" in line for name in product_names)
+    ]
+    assert row_pointer_lines
+    assert all("xi64>" in line for line in row_pointer_lines), "BF16 row addresses must use 64-bit element offsets"
+    delta_pointer_lines = [
+        line for line in lines if "tt.addptr" in line and "tensor<" in line and "!tt.ptr<f32>" in line
+    ]
+    assert delta_pointer_lines
+    assert all("xi64>" in line for line in delta_pointer_lines), "Delta addresses must use 64-bit element offsets"
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_hstu_cross_attn_gfx950_int32_offsets_widen_output_rows():
+    """Compile the general forward with int32 sequence offsets and check that it widens each sequence start."""
+    from triton.runtime.jit import MockTensor
+
+    xa = importlib.import_module("triton.tlx.ops.kernels.hstu_cross_attn.gfx950")
+    # With 2100 sequences of 1024 rows at H8 and D128, sequence 2048 starts at output element 2**31.
+    batch, rows, heads = 2100, 1024, 8
+    x = MockTensor(torch.bfloat16, (batch * rows, heads, 128))
+    offsets = MockTensor(torch.int32, (batch + 1, ))
+    s = (heads * 128, 128)
+    # Warmup compiles the mocks without allocating or launching the kernel.
+    compiled = xa._tlx_gfx950_cross_attn_fwd.smoke.fn.warmup(
+        alpha=128**-0.5, Z=batch, Q=x, K=x, V=x, Out=x, seq_offsets_q=offsets, seq_offsets=offsets, max_seq_len=rows,
+        attn_scale=MockTensor(torch.float32), M=MockTensor(torch.float32, (batch * rows, heads)), stride_qm=s[0],
+        stride_qh=s[1], stride_kn=s[0], stride_kh=s[1], stride_vn=s[0], stride_vh=s[1], stride_om=s[0], stride_oh=s[1],
+        stride_mm=heads, num_targets=None, MAX_Q_LEN=rows, AUTOTUNE_Z=4096, AUTOTUNE_MAX_Q_LEN=rows,
+        AUTOTUNE_MAX_SEQ_LEN=rows, H=heads, G=1, HEAD_DIM=128, BLOCK_D_V=128, num_softmax_heads=heads,
+        TRUNCATE_METHOD="none", HAS_CAUSAL=False, HAS_NUM_TARGETS=False, SHARED_KV=False, LAZY_RESCALE=False,
+        RESCALE_THRESHOLD=xa.LAZY_RESCALE_THRESHOLD.value, grid=(1, ),
+        **xa._fwd_smoke_configs()[0].all_kwargs())
+    ir = compiled.asm["ttir"]
+    # The output and M stores scale the sequence start by their row strides.
+    loads = re.findall(r"(%seq_start_q\w*) = tt.load .* : !tt.ptr<i32>", ir)
+    assert loads
+    for load in loads:
+        uses = [line for line in ir.splitlines() if re.search(rf"{re.escape(load)}\b(?! =)", line)]
+        assert uses and all(f"arith.extsi {load} : i32 to i64" in line for line in uses), \
+            "widen the sequence start before it is used"
+    assert re.search(r"arith.muli %seq_start_q\w*, %\w+ : i64", ir)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")

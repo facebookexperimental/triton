@@ -25321,7 +25321,8 @@ def _launch_optimized_inter_wave(a, b, out, kind, plan=None, bias=None):
     if plan is not None:
         if (kind == "inter_wave" and a.dtype == torch.bfloat16
                 and ((a.shape[0], b.shape[1], a.shape[1]) in _BF16_INTER_WAVE_PROMOTIONS or
-                     (a.shape[0], b.shape[1], a.shape[1]) in _BF16_TRANSPOSED_INTER_WAVE_FALLBACKS)
+                     (a.shape[0], b.shape[1], a.shape[1]) in _BF16_TRANSPOSED_INTER_WAVE_FALLBACKS
+                     or _bf16_prefill_inter_wave_plan(a.shape[0], b.shape[1], a.shape[1]) is not None)
                 and (a.data_ptr() % 16 or b.data_ptr() % 16 or a.stride(1) != 1 or b.stride(0) != 1 or a.stride(0) % 8
                      or b.stride(1) % 8)):
             return _launch_register(a, b, bias=bias, out=out)
@@ -25488,6 +25489,138 @@ _BF16_INTER_WAVE_PROMOTIONS = {
         "STORE_CACHE": ".cs",
     },
 }
+
+# Dense-TN prefill projections keyed by (N, K): (min M, plan).  Paired L2-cold
+# medians over M=2048..32768 measured this plan at or above lds(256, 256, 1)
+# throughout each range; below min M the LDS route stays faster.
+_BF16_PREFILL_INTER_WAVE_MAX_M = 32_768
+_BF16_PREFILL_INTER_WAVE_PLANS = {
+    (2560, 8192): (4096, {
+        "TILE": (256, 256), "SPLIT_K": 1, "WARP_GRID": (2, 4), "GROUP_M_OVERRIDE": 2, "NUM_XCDS_OVERRIDE": 8,
+        "STORE_CACHE": ".cs", "SCHED_MFMA_PER_DWORDX4": 2
+    }),
+    (8192, 2048): (2048, {
+        "TILE": (256, 256), "SPLIT_K": 1, "WARP_GRID": (2, 4), "GROUP_M_OVERRIDE": 2, "NUM_XCDS_OVERRIDE": 1,
+        "STORE_CACHE": ".cs", "SCHED_MFMA_PER_DWORDX4": 2
+    }),
+    (4096, 8192): (3072, {
+        "TILE": (256, 256), "SPLIT_K": 1, "WARP_GRID": (2, 4), "GROUP_M_OVERRIDE": 2, "NUM_XCDS_OVERRIDE": 8,
+        "WORKGROUP_MAPPING": 8, "STORE_CACHE": ".cs", "SCHED_MFMA_PER_DWORDX4": 2, "CACHE_A_CG": True
+    }),
+    (8192, 4096): (2048, {
+        "TILE": (256, 256), "SPLIT_K": 1, "WARP_GRID": (2, 4), "GROUP_M_OVERRIDE": 2, "NUM_XCDS_OVERRIDE": 1,
+        "STORE_CACHE": ".cs", "SCHED_MFMA_PER_DWORDX4": 2
+    }),
+}
+
+
+def _bf16_prefill_inter_wave_plan(m, n, k):
+    entry = _BF16_PREFILL_INTER_WAVE_PLANS.get((n, k))
+    if entry is None or not entry[0] <= m <= _BF16_PREFILL_INTER_WAVE_MAX_M:
+        return None
+    return entry[1]
+
+
+def _k8192_prefill_wave_grid(mi_m, mi_n, warps_m, warps_n, **overrides):
+    options = dict(local_stages=2, pgr2_operands=True, direct_to_lds=True, direct_chunk=128, refill_read_window=0,
+                   read_cover_sixteenths=8, loop_unroll_factor=2, num_xcds=8, workgroup_mapping=8, dot_mode="logical",
+                   sink_insts_to_avoid_spills=True, disable_unclustered_high_rp_reschedule=True)
+    options.update(overrides)
+    return _wg_regular_wave_grid_plan(mi_m, mi_n, warps_m, warps_n, 64, **options)
+
+
+# K=8192 tiles chosen per M by device rounds x measured L2-cold cost per round
+# (µs, N=2560 and N=4096 agree within 2%).  The MT256x256 inter-wave plan is
+# the reference; a wave-grid tile must beat it by the margin to be selected.
+_BF16_K8192_PREFILL_INTER_WAVE_ROUND_US = 171.0
+_BF16_K8192_PREFILL_WAVE_GRID_MARGIN = 0.97
+_BF16_K8192_PREFILL_WAVE_GRIDS = (
+    ((160, 256), 134.0, _k8192_prefill_wave_grid(5, 8, 2, 2)),
+    ((256, 160), 142.0, _k8192_prefill_wave_grid(8, 5, 2, 2)),
+    ((256, 176), 147.0, _k8192_prefill_wave_grid(4, 11, 4, 1, loop_unroll_factor=4)),
+    ((192, 256), 160.0, _k8192_prefill_wave_grid(6, 8, 2, 2)),
+)
+
+
+def _bf16_k8192_prefill_wave_grid_plan(m, n):
+    if n not in (2560, 4096) or not 4096 <= m <= 16384:
+        return None
+
+    def rounds(block_m, block_n):
+        return triton.cdiv(triton.cdiv(m, block_m) * triton.cdiv(n, block_n), NUM_CU)
+
+    best_cost = rounds(256, 256) * _BF16_K8192_PREFILL_INTER_WAVE_ROUND_US * _BF16_K8192_PREFILL_WAVE_GRID_MARGIN
+    best = None
+    for (block_m, block_n), round_us, plan in _BF16_K8192_PREFILL_WAVE_GRIDS:
+        cost = rounds(block_m, block_n) * round_us
+        if cost < best_cost:
+            best_cost, best = cost, plan
+    return best
+
+
+# MT256x256 inter-wave fills exact device rounds every 4096 rows at N=4096 and
+# every 25.6 row tiles at N=2560 (6400 rows for one round, 13056 for two).  A
+# row remainder runs best as a separate Split-K launch instead of a mostly idle
+# extra round.  Paired runs
+# against hipBLASLt, split vs single launch:
+#   N=4096: 16-768 rows 1.12-1.24x vs 1.01-1.11x, 896-1024 rows 1.01-1.10x vs
+#     0.93-1.02x, 1280-1536 rows 1.12-1.21x vs 1.03-1.09x, 1792-2048 rows
+#     0.99-1.14x vs 0.91-1.04x; at 3072 rows one launch wins.
+#   N=2560: 1-768 rows 1.10-1.26x vs 0.96-0.98x, 1024-1792 rows 1.07-1.12x vs
+#     0.97-1.01x, 1954-2816 rows 1.08-1.15x vs 1.01-1.07x; at 3328 rows one
+#     launch wins.
+def _k8192_prefill_tail_wave_grid(mi_m, mi_n, split_k):
+    return "wave_grid", _k8192_prefill_wave_grid(mi_m, mi_n, 2, 2, split_k=split_k, reduce_tile=(32, 128),
+                                                 reduce_warps=4)
+
+
+def _k8192_prefill_tail_inter_wave(n, split_k):
+    return "inter_wave", dict(_BF16_PREFILL_INTER_WAVE_PLANS[(n, 8192)][1], SPLIT_K=split_k)
+
+
+# N -> (max head rows, ((max tail rows, tail dispatch), ...))
+_BF16_K8192_PREFILL_ROW_SPLITS = {
+    4096: (16384, (
+        (192, _k8192_prefill_tail_wave_grid(6, 8, 16)),
+        (768, _k8192_prefill_tail_wave_grid(6, 8, 4)),
+        (1024, _k8192_prefill_tail_inter_wave(4096, 4)),
+        (1536, _k8192_prefill_tail_wave_grid(6, 8, 2)),
+        (2048, _k8192_prefill_tail_inter_wave(4096, 2)),
+    )),
+    2560: (13056, (
+        (64, _k8192_prefill_tail_wave_grid(5, 8, 16)),
+        (256, _k8192_prefill_tail_wave_grid(5, 8, 8)),
+        (768, _k8192_prefill_tail_wave_grid(5, 8, 4)),
+        (1536, _k8192_prefill_tail_inter_wave(2560, 4)),
+        (1792, _k8192_prefill_tail_wave_grid(5, 8, 2)),
+        (2816, _k8192_prefill_tail_inter_wave(2560, 2)),
+    )),
+}
+
+
+def _bf16_k8192_prefill_row_split(m, n):
+    entry = _BF16_K8192_PREFILL_ROW_SPLITS.get(n)
+    if entry is None:
+        return None
+    max_head, tails = entry
+    columns = n // 256
+    full_rounds = triton.cdiv(m, 256) * columns // NUM_CU
+    head_m = min(full_rounds * NUM_CU // columns * 256, max_head)
+    tail = m - head_m
+    if head_m == 0 or tail <= 0:
+        return None
+    for max_tail, tail_dispatch in tails:
+        if tail <= max_tail:
+            return head_m, ("inter_wave", _BF16_PREFILL_INTER_WAVE_PLANS[(n, 8192)][1]), tail_dispatch
+    return None
+
+
+def _launch_row_split(a, b, out, plan, bias=None):
+    split_m, head, tail = plan
+    _launch_dispatch(a[:split_m], b, out[:split_m], head, bias=None if bias is None else bias[:split_m])
+    _launch_dispatch(a[split_m:], b, out[split_m:], tail, bias=None if bias is None else bias[split_m:])
+    return out
+
 
 _BF16_STREAMK_PROMOTIONS = {}
 
@@ -25721,6 +25854,9 @@ def _dispatch_plan(m, n, k, dtype, element_size, *, invariance=None):
                 # LDS each check (or force) the fixed schedule.
             else:
                 return "inter_wave", promotion
+        prefill = _bf16_prefill_inter_wave_plan(m, n, k)
+        if prefill is not None and fixed is None:
+            return "inter_wave", prefill
         if _supports_short_k_register(m, n, k, dtype):
             return "short_k_register", None
     if dtype == torch.bfloat16 and wave_grid_plan is not None and (fixed is None
@@ -26435,6 +26571,14 @@ def _cached_optimized_geometry_config(m, n, k, dtype, element_size, a_strides, b
             or not _offsets_fit_signed_i32(m, n, k, element_size, a_strides, b_strides)):
         return None
     shape = (m, n, k)
+    if (dtype == torch.bfloat16 and k == 8192 and b_strides[0] == 1 and a_strides[0] % 8 == 0
+            and b_strides[1] % 8 == 0):
+        row_split = _bf16_k8192_prefill_row_split(m, n)
+        if row_split is not None:
+            return "row_split", row_split
+        prefill = _bf16_k8192_prefill_wave_grid_plan(m, n)
+        if prefill is not None:
+            return "wave_grid", prefill
     if dtype == torch.bfloat16 and shape == (2_048, 9_216, 2_304):
         # WGM4 and transient accumulators shorten the current transposed
         # direct-PGR2 schedule. Two independent 63-round cold-cache runs
@@ -26905,6 +27049,8 @@ def _full_dispatch_candidates(m, n, k, dtype, element_size, a_strides, b_strides
 
 def _launch_dispatch(a, b, out, dispatch, bias=None):
     path, plan = dispatch
+    if path == "row_split":
+        return _launch_row_split(a, b, out, plan, bias=bias)
     if bias is not None and path in ("gemv", "split_register"):
         return _launch_register(a, b, bias=bias, out=out)
     if path == "split_register":
@@ -27189,6 +27335,8 @@ def mm(a, b, *, out=None, space="heuristic", invariance=None):
     # Keep this catalog hot path inline: ``tlx.ops.mm`` already validated the
     # inputs, and another Python call is material for the small-M kernels.
     path, plan = dispatch
+    if path == "row_split":
+        return _launch_row_split(a, b, out, plan)
     if path == "split_register":
         return _launch_split_register(a, b, out, _normalize_split_register_plan(plan))
     if path == "gemv":

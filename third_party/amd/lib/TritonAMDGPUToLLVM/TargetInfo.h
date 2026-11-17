@@ -15,8 +15,6 @@ class TargetInfo : public mlir::triton::TargetInfoBase {
 public:
   explicit TargetInfo(std::optional<StringRef> arch) : targetFeatures(arch) {}
 
-  llvm::AMDGPU::IsaVersion getIsaVersion() const;
-
   StringRef getArch() const { return targetFeatures.getArch(); }
   StringRef getBaseArch() const { return targetFeatures.getBaseArch(); }
   amdgpu::ISAFamily getISAFamily() const {
@@ -110,6 +108,10 @@ public:
 
   void assertFail(RewriterBase &rewriter, Location loc, StringRef message,
                   StringRef file, StringRef func, int line) const override;
+
+  bool requiresAssertTrap() const override { return true; }
+
+  void assertTrap(RewriterBase &rewriter, Location loc) const override;
 
   int getSharedAddressSpace() const override;
 
