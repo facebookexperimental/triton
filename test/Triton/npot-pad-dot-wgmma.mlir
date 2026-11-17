@@ -304,3 +304,55 @@ tt.func @dot_128x104_trans_b_store(%pb: !tt.ptr<f16>, %pc: !tt.ptr<f16> {tt.divi
   tt.store %ptr, %h : tensor<128x104x!tt.ptr<f16>>
   tt.return
 }
+
+// -----
+
+// A warp-group dot's accumulator is released to an unencoded tensor
+// and waited on after the loop (T298865930). The accumulator's MMA
+// encoding is legal at 160, so the component is layout-fixed: the
+// epilogue's shared staging and bias load must not cost-pad it under
+// an encoding computed for 160, and the wait on the unencoded
+// accumulator is only ever retyped.
+#s3 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#s4 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#mma160 = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 160, 16]}>
+#smem2 = #ttg.shared_memory
+#swz = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @warp_group_dot_wait_160
+  // CHECK: ttng.warp_group_dot {{.*}} -> tensor<64x160xf32,
+  // CHECK: ttng.warp_group_dot_wait {{.*}} : tensor<64x160xf32, #
+  // CHECK: ttng.warp_group_dot_wait {{.*}} : tensor<64x160xf32>
+  // CHECK-NOT: tensor<64x256xf32
+  // W8-LABEL: @warp_group_dot_wait_160
+  // W8: ttng.warp_group_dot {{.*}} -> tensor<64x160xf32,
+  // W8: ttng.warp_group_dot_wait {{.*}} : tensor<64x160xf32, #
+  // W8: ttng.warp_group_dot_wait {{.*}} : tensor<64x160xf32>
+  // W8-NOT: tensor<64x256xf32
+  tt.func @warp_group_dot_wait_160(%pc: !tt.ptr<f32>, %pbias: !tt.ptr<f32>) {
+    %a = ttg.local_alloc : () -> !ttg.memdesc<64x64xbf16, #s3, #smem2, mutable>
+    %bt = ttg.local_alloc : () -> !ttg.memdesc<64x160xbf16, #s4, #smem2, mutable>
+    %c = arith.constant dense<0.0> : tensor<64x160xf32>
+    %cr = tlx.require_layout %c : tensor<64x160xf32> -> tensor<64x160xf32, #mma160>
+    %d0 = ttng.warp_group_dot %a, %bt, %cr : !ttg.memdesc<64x64xbf16, #s3, #smem2, mutable> * !ttg.memdesc<64x160xbf16, #s4, #smem2, mutable> -> tensor<64x160xf32, #mma160>
+    %r0 = tlx.release_layout %d0 {relaxed = true} : tensor<64x160xf32, #mma160> -> tensor<64x160xf32>
+    %lb = arith.constant 0 : index
+    %ub = arith.constant 3 : index
+    %step = arith.constant 1 : index
+    %acc = scf.for %i = %lb to %ub step %step iter_args(%it = %r0) -> (tensor<64x160xf32>) {
+      %in = tlx.require_layout %it : tensor<64x160xf32> -> tensor<64x160xf32, #mma160>
+      %d = ttng.warp_group_dot %a, %bt, %in : !ttg.memdesc<64x64xbf16, #s3, #smem2, mutable> * !ttg.memdesc<64x160xbf16, #s4, #smem2, mutable> -> tensor<64x160xf32, #mma160>
+      %wi = ttng.warp_group_dot_wait %d {pendings = 1 : i32} : tensor<64x160xf32, #mma160>
+      %r = tlx.release_layout %wi {relaxed = true} : tensor<64x160xf32, #mma160> -> tensor<64x160xf32>
+      scf.yield %r : tensor<64x160xf32>
+    }
+    %w = ttng.warp_group_dot_wait %acc {pendings = 0 : i32} : tensor<64x160xf32>
+    %buf = ttg.local_alloc %w : (tensor<64x160xf32>) -> !ttg.memdesc<64x160xf32, #swz, #smem2, mutable>
+    %sb = tt.splat %pbias : !tt.ptr<f32> -> tensor<64x160x!tt.ptr<f32>>
+    %bias = tt.load %sb : tensor<64x160x!tt.ptr<f32>>
+    %sum = arith.addf %w, %bias : tensor<64x160xf32>
+    %sc = tt.splat %pc : !tt.ptr<f32> -> tensor<64x160x!tt.ptr<f32>>
+    tt.store %sc, %sum : tensor<64x160x!tt.ptr<f32>>
+    tt.return
+  }
+}
