@@ -342,6 +342,15 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d["H"] in (4096, 8192, 16384),
     ),
     OpSpec(
+        op="rmsnorm_gate",
+        arch="gfx950",
+        variant="eight_heads_per_program",
+        impl="triton.tlx.ops.kernels.fused.rmsnorm_gate.gfx950:rmsnorm_gate",
+        dtypes=_BF16,
+        # The summation order is that of 32 two-element lanes per 64-element head; a program owns 8 heads.
+        accepts=lambda d: d["head_dim"] == 64 and d["H"] > 0 and d["H"] % 8 == 0,
+    ),
+    OpSpec(
         op="moe",
         arch="gfx950",
         variant="heuristic",
@@ -357,6 +366,27 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="wave_rows",
         impl="triton.tlx.ops.kernels.moe.routing_gfx950:moe_routing",
         dtypes=frozenset({"float32"}),
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="qk_norm_rope_kv_cache",
+        arch="gfx950",
+        variant="token_rows",
+        impl="triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache.gfx950:qk_norm_rope_kv_cache",
+        dtypes=_BF16,
+        # One program holds a token's q and k heads: power-of-two tiles of at most 4096 elements each.
+        accepts=lambda d: (all(n > 0 and n & (n - 1) == 0 for n in (d["HQ"], d["HK"], d["D"])) and 16 <= d["D"] <= 256
+                           and d["HQ"] * d["D"] <= 4096 and d["HK"] * d["D"] <= 4096),
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="router_gemm",
+        arch="gfx950",
+        variant="bf16x3_split_k",
+        impl="triton.tlx.ops.kernels.router_gemm.gfx950:router_gemm",
+        dtypes=_BF16,
+        # GEMV loads and split-K partitions are powers of two that divide E and K.
+        accepts=lambda d: d["E"] > 0 and d["E"] % 16 == 0 and d["K"] > 0 and d["K"] % 1024 == 0,
         requires=frozenset(),
     ),
     OpSpec(
