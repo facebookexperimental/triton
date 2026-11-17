@@ -180,7 +180,9 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   if (isa<LLVM::AssumeOp, ttng::FenceAsyncSharedOp>(op))
     return op;
-  if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op))
+  // Waits only retire already-issued async work, so running one in a
+  // predicated-off iteration is harmless.
+  if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp, ttng::TMAStoreWaitOp>(op))
     return op;
   if (op->hasTrait<OpTrait::LocalLoadTrait>())
     return op;
