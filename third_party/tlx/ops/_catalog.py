@@ -342,6 +342,15 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d["H"] in (4096, 8192, 16384),
     ),
     OpSpec(
+        op="rmsnorm_gate",
+        arch="gfx950",
+        variant="eight_heads_per_program",
+        impl="triton.tlx.ops.kernels.fused.rmsnorm_gate.gfx950:rmsnorm_gate",
+        dtypes=_BF16,
+        # The summation order is that of 32 two-element lanes per 64-element head; a program owns 8 heads.
+        accepts=lambda d: d["head_dim"] == 64 and d["H"] > 0 and d["H"] % 8 == 0,
+    ),
+    OpSpec(
         op="moe",
         arch="gfx950",
         variant="heuristic",

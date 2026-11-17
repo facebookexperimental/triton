@@ -121,8 +121,8 @@ from ._normalization import (
 
 __all__ = [
     "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
-    "moe_routing", "norm_residual_norm", "router_gemm", "qk_norm_rope_kv_cache", "addmm", "addmm_mul_add",
-    "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen", "linear_rowscale",
+    "moe_routing", "norm_residual_norm", "rmsnorm_gate", "router_gemm", "qk_norm_rope_kv_cache", "addmm",
+    "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen", "linear_rowscale",
     "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn",
     "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode", "prepare_flash_attn_varlen_backward",
     "flash_attn_varlen_backward", "paged_attention_decode", "paged_attention_prefill",
@@ -1064,6 +1064,54 @@ def qk_norm_rope_kv_cache(q, k, v, k_cache, v_cache, slot_mapping, *, eps, q_sca
     with torch.cuda.device(q.device):
         return fn(q, k, v, k_cache, v_cache, slot_mapping, eps, q_scale, positions, cos_sin_cache, rope_bf16,
                   slot_remap, k_scale, v_scale, q_out_scale, q_out)
+
+
+def rmsnorm_gate(x, gate, *, head_dim=64, eps=1e-6, out=None, space=None):
+    """Per-head RMSNorm without a weight, times a sigmoid gate. Forward only.
+
+    For each token and each ``head_dim``-element head of ``x``, in FP32:
+    ``out = bf16(x * rstd * sigmoid(gate))`` with ``rstd = 1 / sqrt(sum(x * x) / head_dim + eps)``. The sum adds
+    adjacent element pairs and then folds the pair sums in halves (pair ``i`` plus pair ``i + 16``, then ``+ 8``,
+    ``+ 4``, ``+ 2``, ``+ 1``), the order of a plain Triton kernel with 32 two-element lanes per head, so the result
+    is bitwise that kernel's. A row's result does not depend on the batch.
+
+    Shapes: ``x`` and ``gate`` BF16 ``(T, H * head_dim)``, each with a contiguous last dimension and any row stride
+    (``gate`` can be a column slice of a wider projection output). ``head_dim`` must be 64 and ``H`` a multiple of 8.
+    Returns a BF16 ``(T, H * head_dim)`` tensor; ``out`` (contiguous last dimension, any row stride, not overlapping
+    the inputs) is filled and returned when passed. Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    if not isinstance(x, torch.Tensor) or not isinstance(gate, torch.Tensor):
+        raise InvalidInput("tlx.ops.rmsnorm_gate expects tensor x and gate")
+    if (x.ndim != 2 or gate.shape != x.shape or x.dtype != torch.bfloat16 or gate.dtype != torch.bfloat16
+            or x.stride(1) != 1 or gate.stride(1) != 1):
+        raise InvalidInput("tlx.ops.rmsnorm_gate expects BF16 x and gate of one (T, N) shape with contiguous rows; "
+                           f"got {tuple(x.shape)} {x.dtype} and {tuple(gate.shape)} {gate.dtype}")
+    T, N = x.shape
+    if not isinstance(head_dim, int) or head_dim <= 0 or N % head_dim:
+        raise InvalidInput(f"tlx.ops.rmsnorm_gate expects head_dim to divide the row width {N}; got {head_dim!r}")
+    if not 0 < eps < math.inf:
+        raise InvalidInput(f"tlx.ops.rmsnorm_gate expects a positive finite eps; got {eps!r}")
+    outputs = []
+    if out is not None:
+        if (not isinstance(out, torch.Tensor) or out.shape != (T, N) or out.dtype != torch.bfloat16
+                or out.stride(1) != 1):
+            raise InvalidInput(f"tlx.ops.rmsnorm_gate expects a BF16 out of shape ({T}, {N}) with contiguous rows")
+        if any(torch._C._overlaps(out, t) for t in (x, gate)):
+            raise InvalidInput("tlx.ops.rmsnorm_gate out must not alias x or gate")
+        outputs.append(out)
+    if any(t.device != x.device for t in (gate, *outputs)):
+        raise InvalidInput("tlx.ops.rmsnorm_gate expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("rmsnorm_gate", space)
+    _check_single_config_space("rmsnorm_gate", space_name)
+    fn, spec = impl_for("rmsnorm_gate", device=x.device)
+    check_inputs(spec, dtype=x.dtype, head_dim=head_dim, H=N // head_dim)
+    check_backward(spec, x, gate, *outputs)
+    _check_enforced("rmsnorm_gate", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, gate, float(eps), out)
 
 
 def addmm(input, a, b, *, out=None, space=None):
