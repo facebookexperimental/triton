@@ -13,6 +13,14 @@ from mm_test_utils import REL_PRECISION, run_mm_case, run_mm_invariance_case
 
 pytestmark = pytest.mark.skipif(not is_hopper(), reason="Requires sm90")
 
+
+@pytest.fixture(autouse=True)
+def _pin_num_sms(monkeypatch):
+    # Heuristic picks and prune expectations below assume a full H100 (132
+    # SMs); CI workers may be MIG slices with fewer.
+    monkeypatch.setattr(sm90, "_get_num_sms", lambda: 132)
+
+
 ARCH = "sm90"
 COOPERATIVE_CONFIGS = (
     (128, 256, 3, 1),
