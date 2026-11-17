@@ -10,6 +10,7 @@ import torch
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "gsan_fine_granularity(reason): requires sub-16-byte GSan tracking")
+    config.addinivalue_line("markers", "slow: long-running case that pull-request CI skips")
     # If pytest-sugar is not active, enable instafail
     if not config.pluginmanager.hasplugin("sugar"):
         config.option.instafail = True

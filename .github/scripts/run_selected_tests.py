@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 
-def command(plan, workers, junit, stop_on_failure=False):
+def command(plan, workers, junit, pull_request=False):
     files = plan["files"]
     if not files:
         raise ValueError("An allocated test step has no selected files")
@@ -19,8 +19,8 @@ def command(plan, workers, junit, stop_on_failure=False):
         args.extend(["-k", plan["k"]])
     if workers > 1:
         args.extend(["-n", str(workers), "--dist", "worksteal"])
-    if stop_on_failure:
-        args.append("--maxfail=1")
+    if pull_request:
+        args.extend(["--maxfail=1", "-m", "not slow"])
     return args
 
 
@@ -33,9 +33,10 @@ def main():
     repo = Path(__file__).resolve().parents[2]
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([str(repo), str(repo / "python/test/unit/tlx_ops"), env.get("PYTHONPATH", "")])
-    # A PR reports its first failure sooner; pushes and schedules run every test so issue filing sees every failure.
-    stop = os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
-    subprocess.run(command(plan, args.workers, args.junit, stop), cwd=repo, env=env, check=True)
+    # A PR stops at its first failure and skips slow cases; pushes and schedules run every test so issue filing sees
+    # every failure.
+    pull_request = os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
+    subprocess.run(command(plan, args.workers, args.junit, pull_request), cwd=repo, env=env, check=True)
 
 
 if __name__ == "__main__":
