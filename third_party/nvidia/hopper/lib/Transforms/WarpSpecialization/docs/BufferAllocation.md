@@ -74,6 +74,17 @@ ordering anchor for the consumer partition. Since `createBuffer` inserts
 each descriptor-store group so the producer-side `local_store` sequence
 matches the TMA-store sequence.
 
+Streamlining moves each op right after its last SSA operand, with two
+memory-order guards: an op is not hoisted across another op touching the same
+underlying buffer (`hoistsAcrossMemoryOp`), and a TMA staging write
+(`local_alloc` with a source, read by a TMA store or reduce) is not hoisted
+across any TMA store or reduce (`hoistsStagingWriteAcrossTMAOp`). The memory
+planner later folds a descriptor's staging allocs into a ring of K copies whose
+store waits are placed relative to the TMA ops, so the writes must stay
+interleaved with them; otherwise, with more subtiles than copies, a later
+subtile overwrites a slot before an earlier TMA store has read it. A staging
+write that would cross a TMA op is left where it is.
+
 ### Step 3: `createBuffer`
 
 The core step. For each channel (grouped by producer), create or hoist
