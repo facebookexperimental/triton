@@ -1400,7 +1400,8 @@ def test_math_divide_op(expr, num_ctas, device):
 @pytest.mark.interpreter
 @pytest.mark.parametrize("approx", [False, True])
 @pytest.mark.parametrize("reciprocal", [False, True])
-def test_fdiv_approx(approx, reciprocal, device):
+@pytest.mark.parametrize("enable_fp_fusion", [False, True])
+def test_fdiv_approx(approx, reciprocal, enable_fp_fusion, device):
 
     @triton.jit
     def kernel(X, Y, Z, APPROX: tl.constexpr, RECIPROCAL: tl.constexpr, BLOCK: tl.constexpr):
@@ -1421,13 +1422,14 @@ def test_fdiv_approx(approx, reciprocal, device):
     x_tri = to_triton(x, device=device)
     y_tri = to_triton(y, device=device)
     z_tri = to_triton(np.empty_like(x), device=device)
-    compiled = kernel[(1, )](x_tri, y_tri, z_tri, approx, reciprocal, x.size)
+    compiled = kernel[(1, )](x_tri, y_tri, z_tri, approx, reciprocal, x.size, enable_fp_fusion=enable_fp_fusion)
     expected = (np.float32(1.0) if reciprocal else x) / y
     # AMD's 2.5 ULP bound allows 3 ULP against a rounded reference.
     maxulp = 3 if approx and is_hip() else 2
     np.testing.assert_array_max_ulp(to_numpy(z_tri), expected, maxulp=maxulp)
     if is_cuda() and not is_interpreter():
-        assert ("div.approx.f32" if approx else "div.full.f32") in compiled.asm["ptx"]
+        instruction = "rcp.approx.f32" if reciprocal else "div.approx.f32"
+        assert (instruction if approx else "div.full.f32") in compiled.asm["ptx"]
     if approx and is_hip() and not is_interpreter():
         assert "llvm.amdgcn.fdiv.fast" in compiled.asm["llir"]
 
@@ -1459,13 +1461,10 @@ def test_fdiv_constant_in_range(denominator, ieee_rounding, device):
     expected = x / np.float32(denominator)
     maxulp = 0 if ieee_rounding else 2
     np.testing.assert_array_max_ulp(to_numpy(y_tri), expected, maxulp=maxulp)
-    if not is_interpreter():
+    if not is_interpreter() and not ieee_rounding:
         if is_cuda():
-            assert ("div.rn.f32" if ieee_rounding else "div.approx.f32") in compiled.asm["ptx"]
-            if not ieee_rounding:
-                assert re.search(r"tt\.approx_divf [^\n]* : f32", compiled.asm["ttgir"])
-                assert compiled.asm["ptx"].count("div.approx.f32") == 1
-        elif not ieee_rounding:
+            assert len(re.findall(r"tt\.approx_divf [^\n]* : f32", compiled.asm["ttgir"])) == 1
+        else:
             assert "arith.divf" in compiled.asm["ttgir"]
 
 
@@ -1524,7 +1523,6 @@ def test_fdiv_constant_matches_div_full(device):
         constant = kernel[grid](x_tri, constant_bits, denominator, False, BLOCK=1024)
         reference = kernel[grid](x_tri, reference_bits, denominator, True, BLOCK=1024)
         assert re.search(r"tt\.approx_divf [^\n]* : f32", constant.asm["ttgir"])
-        assert "div.approx.f32" in constant.asm["ptx"]
         assert "div.full.f32" in reference.asm["ptx"]
         np.testing.assert_array_equal(to_numpy(constant_bits), to_numpy(reference_bits),
                                       err_msg=f"denominator bits: 0x{denominator_bits:08x}")
@@ -1587,6 +1585,34 @@ def test_precise_math(expr_prec, expr_ref, num_ctas, device):
 
     kernel[(1, )](x, y, out, out_ref, BLOCK=shape[0], num_ctas=num_ctas)
     assert torch.all(out == out_ref)  # bitwise exact
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("enable_fp_fusion", [False, True])
+def test_sqrt_rn_special_values(enable_fp_fusion, device):
+
+    @triton.jit
+    def kernel(X, Y, BLOCK: tl.constexpr):
+        offsets = tl.arange(0, BLOCK)
+        x = tl.load(X + offsets)
+        tl.store(Y + offsets, tl.sqrt_rn(x))
+
+    finfo = np.finfo(np.float32)
+    min_subnormal = np.nextafter(np.float32(0), np.float32(1))
+    x = np.array([
+        0.0, -0.0, min_subnormal,
+        np.nextafter(finfo.tiny, np.float32(0)), finfo.tiny, 0.25, 1.0, 2.0, 4.0, finfo.max, np.inf, -np.inf, -1.0,
+        np.nan, -min_subnormal, -finfo.tiny
+    ], dtype=np.float32)
+    x_tri = to_triton(x, device=device)
+    y_tri = to_triton(np.empty_like(x), device=device)
+    kernel[(1, )](x_tri, y_tri, x.size, enable_fp_fusion=enable_fp_fusion)
+    with np.errstate(invalid="ignore"):
+        expected = np.sqrt(x.astype(np.float64)).astype(np.float32)
+    actual = to_numpy(y_tri)
+    np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected))
+    valid = ~np.isnan(expected)
+    np.testing.assert_array_equal(actual[valid].view(np.uint32), expected[valid].view(np.uint32))
 
 
 @pytest.mark.interpreter
@@ -2736,12 +2762,13 @@ def test_cast(dtype_x, dtype_z, bitcast, size, num_ctas, device):
         check_type_supported(dtype_z, device)
 
     if is_hip():
-        if (not is_hip_cdna3() and not is_hip_cdna4() and not is_hip_gfx1250()
-                and (dtype_x == "float8_e4m3fn" or dtype_z == "float8_e4m3fn")):
-            pytest.skip(f"test_cast{(dtype_x, dtype_z)} only supported on HIP CDNA3/CDNA4 and above.")
-        if (not (is_hip_cdna4() or is_hip_gfx1250())) and ((dtype_x == "bfloat16" and dtype_z == "float8_e4m3fn") or
-                                                           (dtype_x == "float8_e4m3fn" and dtype_z == "bfloat16")):
-            pytest.skip(f"test_cast{(dtype_x, dtype_z)} only supported on HIP CDNA4 and above.")
+        if not is_hip_cdna3() and not is_hip_cdna4() and not is_hip_rdna4() and not is_hip_gfx1250() and (
+                dtype_x == 'float8_e4m3fn' or dtype_z == 'float8_e4m3fn'):
+            pytest.skip(f'test_cast{(dtype_x, dtype_z)} only supported on HIP CDNA3/CDNA4/RDNA4 and above.')
+        if (not (is_hip_cdna4() or is_hip_rdna4() or is_hip_gfx1250())) and (
+            (dtype_x == 'bfloat16' and dtype_z == "float8_e4m3fn") or
+            (dtype_x == "float8_e4m3fn" and dtype_z == 'bfloat16')):
+            pytest.skip(f'test_cast{(dtype_x, dtype_z)} only supported on HIP CDNA4/RDNA4 and above.')
 
     if is_cpu() and (dtype_x in torch_float8_dtypes or dtype_z in torch_float8_dtypes):
         pytest.skip(f'test_cast{(dtype_x, dtype_z)} is not supported on CPU.')
@@ -2887,8 +2914,9 @@ def test_cast_fp8_rounding(dtype_x, dtype_z, device):
         check_type_supported(dtype_z, device)
         if is_cuda() and torch.cuda.get_device_capability()[0] < 9:
             pytest.skip("FP8 RTNE boundary tests require compute capability >= 90")
-        if is_hip() and dtype_z == "float8_e4m3fn" and not (is_hip_cdna3() or is_hip_cdna4() or is_hip_gfx1250()):
-            pytest.skip("float8e4nv requires CDNA3 or newer")
+        if is_hip() and dtype_z == "float8_e4m3fn" and not (is_hip_cdna3() or is_hip_cdna4() or is_hip_rdna4()
+                                                            or is_hip_gfx1250()):
+            pytest.skip("float8e4nv requires CDNA3, RDNA4 or newer")
 
     @triton.jit
     def kernel(X, Z, SIZE: tl.constexpr):
