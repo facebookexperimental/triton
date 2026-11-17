@@ -150,6 +150,45 @@ class TestTorchTLXEpilogueFusion(TestCase):
         env.start()
         self.addCleanup(env.stop)
 
+    def test_manual_output_templates_veto_epilogue_fusion(self):
+        from torch._inductor import ir
+        from triton.language.extra.tlx.inductor import choices, mm_templates
+
+        manual_templates = tuple(template for template in vars(mm_templates).values()
+                                 if getattr(template, "tlx_manual_output", False))
+        self.assertTrue(manual_templates)
+        self.assertEqual(
+            choices._TLX_NO_EPILOGUE_FUSION_TEMPLATE_NAMES,
+            frozenset(template.name for template in manual_templates),
+        )
+
+        node2 = mock.Mock()
+        node2.get_nodes.return_value = ()
+        for template in manual_templates:
+            with self.subTest(template=template.name):
+                template_node = SimpleNamespace(annotations={"ktc": SimpleNamespace(template=template)}, )
+                scheduler_node = mock.Mock()
+                scheduler_node.is_template.return_value = True
+                scheduler_node.get_template_node.return_value = template_node
+                node1 = mock.Mock()
+                node1.get_nodes.return_value = (scheduler_node, )
+                self.assertTrue(choices._has_tlx_no_epilogue_fusion_candidate(node1, node2))
+
+                class MultiTemplateBuffer:
+
+                    def __init__(self):
+                        self.choices = (SimpleNamespace(name=f"triton_{template.name}_0"), )
+
+                scheduler_node.get_template_node.return_value = MultiTemplateBuffer()
+                with mock.patch.object(ir, "MultiTemplateBuffer", MultiTemplateBuffer):
+                    self.assertTrue(choices._has_tlx_no_epilogue_fusion_candidate(node1, node2))
+
+                scheduler_node.get_template_node.return_value = MultiTemplateBuffer()
+                scheduler_node.get_template_node.return_value.choices = (SimpleNamespace(
+                    name=f"triton_prefix_{template.name}_0"), )
+                with mock.patch.object(ir, "MultiTemplateBuffer", MultiTemplateBuffer):
+                    self.assertFalse(choices._has_tlx_no_epilogue_fusion_candidate(node1, node2))
+
     @unittest.skipIf(
         not has_datacenter_blackwell_tma_device(),
         "Need Blackwell with device-side TMA support in Triton",
@@ -193,6 +232,8 @@ class TestTorchTLXEpilogueFusion(TestCase):
                     "triton.tlx_mode": "force",
                     "force_disable_caches": True,
                     "enable_caching_generated_triton_templates": False,
+                    # Checks the fused codegen: pick now, so the epilogue fuses without a profitability benchmark.
+                    "benchmark_template_fusion": False,
                 }),
                 tlx_config.patch(use_heuristic_config=use_heuristic_config, ),
         ):
@@ -366,6 +407,42 @@ class TestTorchTLXEpilogueFusion(TestCase):
             generated_code_str,
             "Fully internal intermediate should still fuse into the TLX kernel.",
         )
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(
+        not (has_tlx() and _HAS_BLACKWELL_TUTORIAL),
+        "TLX Blackwell tutorial not available",
+    )
+    def test_fp32_matmul_row_bias_bf16_epilogue_is_fused(self):
+        """An fp32 mm whose fused epilogue loads a row bias and stores bf16.
+
+        The output dtype differs from the operand dtype, and the bias load is
+        indexed by the renamed epilogue range symbol alone.
+        """
+
+        def linear_bf16_out(x, weight, bias):
+            return (x.float() @ weight.float().t() + bias.float()).to(torch.bfloat16)
+
+        m, k, n = 1152, 1024, 2048
+        x = torch.randn(m, k, device=GPU_TYPE, dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device=GPU_TYPE, dtype=torch.bfloat16) * 0.01
+        bias = torch.randn(n, device=GPU_TYPE, dtype=torch.bfloat16)
+
+        with (
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "enable_caching_generated_triton_templates": False,
+                }),
+                tlx_config.patch(use_heuristic_config=False),
+        ):
+            actual, code = run_and_get_code(torch.compile(linear_bf16_out), x, weight, bias)
+
+        torch.testing.assert_close(actual, linear_bf16_out(x, weight, bias), atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem_fused_tlx", "\n".join(code))
 
     @unittest.skipIf(
         not has_datacenter_blackwell_tma_device(),
@@ -1314,6 +1391,51 @@ class TestTorchTLXEpilogueFusion(TestCase):
 
         torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
         self._assert_reduction_epilogue_fused(code, fused=False)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe GEMM template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not supports_template_epilogue_fusion(),
+        "torch lacks the template fusion codegen API (old ROCm nightly)",
+    )
+    def test_tlx_matmul_norm_cpp_wrapper_autotune_at_compile_time(self):
+        """The fused norm compiles under the C++ wrapper with compile-time autotuning.
+
+        That codegen builds example args for every kernel call and recognizes a
+        workspace only by its name (``^(workspace|semaphore)``, see
+        ``PythonWrapperCodegen._generate_kernel_call_helper``); a row-stat
+        workspace named otherwise hit "V.graph.get_buffer(arg) and raw_arg can't
+        be None at the same time" (AOTI lowering of an MI350 ads model).
+        """
+        norm_kind, (m, k, n) = GEMM_NORM_TEST_CASES[0]
+        dtype = torch.bfloat16
+        inputs = (
+            torch.randn((m, k), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, k), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, ), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, ), device=GPU_TYPE, dtype=dtype),
+            torch.randn((n, ), device=GPU_TYPE, dtype=dtype),
+        )
+
+        def matmul_norm(x, weight, gemm_bias, scale, norm_bias):
+            return _normalize(torch.addmm(gemm_bias, x, weight.t()), scale, norm_bias, norm_kind)
+
+        with torch.no_grad():
+            expected = matmul_norm(*inputs)
+            with config.patch({
+                    **self._FORCE_CONFIG,
+                    "cpp_wrapper": True,
+                    "triton.autotune_at_compile_time": True,
+            }):
+                actual, code = run_and_get_code(torch.compile(matmul_norm, fullgraph=True), *inputs)
+
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        source = "\n".join(code)
+        self.assertIn("_row_consumer", source)
+        self.assertIn("workspace_row_stats_", source)
 
 
 def is_gfx942():

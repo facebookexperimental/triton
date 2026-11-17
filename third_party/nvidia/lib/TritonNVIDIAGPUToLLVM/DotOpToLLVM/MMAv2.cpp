@@ -7,7 +7,6 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
-#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/SmallVector.h"
 
 using namespace mlir;
@@ -104,6 +103,8 @@ ValueTableV2 getValuesFromDotOperandLayoutStruct(
       std::min<int>(numRegisters.k, elemsPerThread[order[0]] / kWidth);
 
   int size = elems.size();
+  int tileSize = kWidth * outerSize * kTileSize;
+  assert(size % tileSize == 0);
   // Reorder scalar entries in elems into MMA operand registers:
   //   element: scalar within a packed operand (32 bits, or 64 bits for fp64).
   //   k: packed operand position within a contiguous kWidth group.
@@ -126,21 +127,22 @@ ValueTableV2 getValuesFromDotOperandLayoutStruct(
   //   tile=0, k=0 -> [(0,1), (4,5),  (8,9),  (12,13)]
   //   tile=0, k=1 -> [(2,3), (6,7), (10,11), (14,15)]
   //   tile=1 uses the same pattern, adding 16 to each scalar index.
-  auto mapping =
-      LinearLayout::identity1D(size, reg, reg)
-          .reshapeIns(
-              {{str_attr("element"), numElemsPerVec},
-               {str_attr("k"), kWidth / numElemsPerVec},
-               {str_attr("outer"), outerSize},
-               {str_attr("kTiles"), kTileSize},
-               {str_attr("tile"), size / (kWidth * outerSize * kTileSize)}})
-          .transposeIns({str_attr("element"), str_attr("outer"),
-                         str_attr("kTiles"), str_attr("k"), str_attr("tile")})
-          .reshapeIns({{reg, size}});
+  // The tile count can be NPOT, so map one tile and add the tile offset.
+  auto mapping = LinearLayout::identity1D(tileSize, reg, reg)
+                     .reshapeIns({{str_attr("element"), numElemsPerVec},
+                                  {str_attr("k"), kWidth / numElemsPerVec},
+                                  {str_attr("outer"), outerSize},
+                                  {str_attr("kTiles"), kTileSize}})
+                     .transposeIns({str_attr("element"), str_attr("outer"),
+                                    str_attr("kTiles"), str_attr("k")})
+                     .reshapeIns({{reg, tileSize}});
 
   SmallVector<Value> mmaElems;
-  for (int i = 0; i < size; ++i)
-    mmaElems.push_back(elems[mapping.apply({{reg, i}})[0].second]);
+  for (int i = 0; i < size; ++i) {
+    int tileStart = i - i % tileSize;
+    mmaElems.push_back(
+        elems[tileStart + mapping.apply({{reg, i % tileSize}})[0].second]);
+  }
 
   // Restore only the repeated slots required by the native MMA operands.
   dot = DotOperandEncodingAttr::get(ctx, dot.getOpIdx(), dot.getParent(),
@@ -655,35 +657,22 @@ LogicalResult convertMMAImpl(
   assert(repA[0] == repB[0]);
   int repM = repA[1], repN = repB[2], repK = repA[2];
   int repBatch = repA[0];
-  // Under TRITON_ALLOW_NPOT an NPOT K gives modular operands whose struct holds
-  // PowerOf2Ceil(K) / kTile K-reps per outer rep (the tail wraps k mod K).
-  // Unpack with that padded count so outer reps align; MMAs use the true repK.
-  int repKStruct = repK;
-  int64_t kSize = aShapePerCTA.back();
-  if (!llvm::isPowerOf2_64(kSize) &&
-      mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT")) {
-    SmallVector<int64_t> aPadded(aShapePerCTA.begin(), aShapePerCTA.end());
-    aPadded.back() = llvm::PowerOf2Ceil(kSize);
-    repKStruct =
-        cast<NvidiaMmaEncodingAttr>(dotOpA.getParent())
-            .getRepForOperand(aPadded, bitwidth, kWidth, dotOpA.getOpIdx())[2];
-  }
 
   // We can reuse the same iteration order in
   // getValuesFromDotOperandLayoutStruct as both a and b are K-major
   assert(dotOpA.getRepOrder() == getOrderForDotOperand(dotOpA.getOpIdx(),
                                                        aShapePerCTA.size(),
                                                        /*kContig=*/true));
-  auto ha = getValuesFromDotOperandLayoutStruct(
-      typeConverter, loc, rewriter, llvmA, repBatch, repM, repKStruct,
-      aTensorTy, numRegisters);
+  auto ha = getValuesFromDotOperandLayoutStruct(typeConverter, loc, rewriter,
+                                                llvmA, repBatch, repM, repK,
+                                                aTensorTy, numRegisters);
 
   assert(dotOpB.getRepOrder() == getOrderForDotOperand(dotOpB.getOpIdx(),
                                                        bShapePerCTA.size(),
                                                        /*kContig=*/true));
-  auto hb = getValuesFromDotOperandLayoutStruct(
-      typeConverter, loc, rewriter, llvmB, repBatch, repN, repKStruct,
-      bTensorTy, numRegisters);
+  auto hb = getValuesFromDotOperandLayoutStruct(typeConverter, loc, rewriter,
+                                                llvmB, repBatch, repN, repK,
+                                                bTensorTy, numRegisters);
 
   int bitwidthRet = dTensorTy.getElementType().getIntOrFloatBitWidth();
   auto numMmaRets = bitwidthRet == 64 ? 2 : bitwidthRet / 8;
@@ -796,7 +785,7 @@ LogicalResult convertMMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
 
   TensorCoreType mmaType = getMmaTypeDot(op, aTensorTy, bTensorTy, dTensorTy);
   const auto &instrMap = isTuring ? mmaInstrPtxTuring : mmaInstrPtxAmpere;
-  if (instrMap.find(mmaType) == instrMap.end())
+  if (!instrMap.contains(mmaType))
     return op.emitError(
         "unsupported MMA instruction for the given operand/result types");
 
@@ -830,7 +819,7 @@ LogicalResult convertMMADotScaled(triton::DotScaledOp op,
 
   TensorCoreType mmaType =
       getMmaTypeDotScaled(op, aTensorTy, bTensorTy, dTensorTy);
-  if (mmaInstrPtxScaled.find(mmaType) == mmaInstrPtxScaled.end())
+  if (!mmaInstrPtxScaled.contains(mmaType))
     return op.emitError(
         "unsupported MMA instruction for the given operand/result types");
 

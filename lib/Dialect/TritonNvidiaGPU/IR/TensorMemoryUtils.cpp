@@ -238,15 +238,13 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
       auto col = reps.getBasis(kLane, 4, kCol);
       secondHalfOffset = (row << 16) | col;
       if (*secondHalfOffset == 0) {
-        // The Buck toolchain still needs a nonzero second-half offset when
-        // writing only 16 scale elements; the allocation is padded for this.
-        if (!isScales) {
-          if (emitError)
-            emitError()
-                << "Only supported for scales as we pad the allocation.";
-          return failure();
-        }
-        secondHalfOffset = 1;
+        // Both halves share one address, which is exact when the lanes
+        // broadcast: distinct in-shape lanes would sit at distinct addresses,
+        // so a zero offset on a valid layout means shared values. The Buck
+        // toolchain still needs a nonzero second-half offset when writing
+        // only 16 scale elements; the allocation is padded for this.
+        if (isScales)
+          secondHalfOffset = 1;
       }
       // We "quotient it out", meaning we remove the last basis from reps
       auto basis = reps.getBases();
@@ -270,19 +268,62 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
   return info;
 }
 
-FailureOr<TMemLdStEncodingInfo>
-computeTMemLdStEncodingInfo(RankedTensorType regTy, MemDescType memTy,
-                            int maxnreg,
-                            std::function<InFlightDiagnostic()> emitError) {
+std::optional<std::string>
+getNpotTMemScalesUnsupportedReason(int64_t mn, bool pow2K, bool oneCTA) {
+  if (!oneCTA)
+    return std::string("its scales' NPOT TMEM plan is 1-CTA only");
+  if (!pow2K)
+    return std::string("its scales can't also have an NPOT K");
+  // A TMEM scale column holds 32 MN rows, so a row chunk must start one.
+  int64_t c = LinearLayout::twoPartOf(mn);
+  if (c % 32 != 0)
+    return ("its scales' pow2 row chunks of " + Twine(c) +
+            " split a 32-row TMEM scale column")
+        .str();
+  return std::nullopt;
+}
+
+FailureOr<MemDescType>
+getNpotTMemChunkType(MemDescType memTy,
+                     std::function<InFlightDiagnostic()> emitError) {
+  ArrayRef<int64_t> shape = memTy.getShape().take_back(2);
+  auto enc = dyn_cast<TensorMemoryEncodingAttr>(memTy.getEncoding());
+  auto scales = dyn_cast<TensorMemoryScalesEncodingAttr>(memTy.getEncoding());
+  bool oneCTA = scales && scales.getCtaMode() == TensorMemoryCTAMode::DEFAULT &&
+                getNumCTAs(scales) == 1;
+  int d = scales && !llvm::isPowerOf2_64(shape[0]) ? 0 : 1;
+  std::optional<std::string> reason;
+  if (d == 0)
+    reason = getNpotTMemScalesUnsupportedReason(
+        shape[0], llvm::isPowerOf2_64(shape[1]), oneCTA);
+  // blockM=64 keeps NPOT N off: its unused TMEM columns per warp are unproven.
+  else if (!llvm::isPowerOf2_64(shape[0]) ||
+           !(enc ? enc.getBlockM() == 128 &&
+                       enc.getCtaMode() == TensorMemoryCTAMode::DEFAULT &&
+                       enc.getCGALayout().getCTASplitNum()[1] == 1
+                 : oneCTA))
+    reason = "";
+  if (reason) {
+    if (emitError) {
+      auto diag = emitError()
+                  << "NPOT TMEM load/store is not yet supported for " << memTy;
+      if (!reason->empty())
+        diag << ": " << *reason;
+    }
+    return failure();
+  }
+  SmallVector<int64_t> chunk(shape);
+  chunk[d] = LinearLayout::twoPartOf(shape[d]);
+  return MemDescType::get(chunk, memTy.getElementType(), memTy.getEncoding(),
+                          memTy.getMemorySpace(), memTy.getMutableMemory(),
+                          memTy.getAllocShape());
+}
+
+FailureOr<LinearLayout>
+computeTMemLdStLayout(RankedTensorType regTy, MemDescType memTy,
+                      std::function<InFlightDiagnostic()> emitError) {
   auto memLayout = toLinearLayout(memTy);
   auto regLayout = toLinearLayout(regTy);
-  if (regLayout.isModular()) {
-    SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
-    for (auto dim : regLayout.getOutDimNames())
-      paddedOutDims.push_back({dim, memLayout.getOutDimSize(dim)});
-    regLayout = LinearLayout(regLayout.getBases(), paddedOutDims,
-                             /*requireSurjective=*/false);
-  }
   auto *ctx = regTy.getContext();
   auto S = [ctx](StringRef str) { return StringAttr::get(ctx, str); };
   auto kBlock = S("block");
@@ -344,10 +385,170 @@ computeTMemLdStEncodingInfo(RankedTensorType regTy, MemDescType memTy,
     bases[kWarp][i] = {32 << i, 0};
   cvt = LinearLayout(std::move(bases), cvt.getOutDims(),
                      /*isSurjective=*/cvt.isSurjective());
+  return cvt;
+}
 
+FailureOr<TMemLdStEncodingInfo>
+computeTMemLdStEncodingInfo(RankedTensorType regTy, MemDescType memTy,
+                            int maxnreg,
+                            std::function<InFlightDiagnostic()> emitError) {
+  // An NPOT N = c * q (q odd) takes the plan of its pow2 chunk of c columns
+  // (rows d=0 for NPOT MN scales), and the outermost register digit, of radix
+  // q, steps reps across chunks.
+  if (!llvm::all_of(regTy.getShape(), llvm::isPowerOf2_64)) {
+    auto chunkTy = getNpotTMemChunkType(memTy, emitError);
+    if (failed(chunkTy))
+      return failure();
+    auto *ctx = regTy.getContext();
+    auto kReg = StringAttr::get(ctx, "register");
+    LinearLayout regLayout = toLinearLayout(regTy);
+    int d = chunkTy->getDimSize(0) == regTy.getDimSize(0) ? 1 : 0;
+    // Four scale bytes share a 32-bit TMEM column, so a K chunk can't move
+    // alone: the pow2 alloc shape moves instead, with its registers past K
+    // padded or dropped.
+    if (d == 1 && isa<TensorMemoryScalesEncodingAttr>(memTy.getEncoding())) {
+      auto paddedTy = MemDescType::get(
+          getNpotPow2AllocShape(memTy.getShape()), memTy.getElementType(),
+          memTy.getEncoding(), memTy.getMemorySpace(), memTy.getMutableMemory(),
+          memTy.getAllocShape());
+      std::optional<LinearLayout> paddedLayout =
+          getDistributedLayoutForTmemLdSt(
+              paddedTy, TMemAccessAtom::I32x32b,
+              regLayout.getInDimSize(StringAttr::get(ctx, "warp")));
+      // At 8 warps the pow2 alloc shape puts its second warpgroup on a K column
+      // the NPOT K lacks, so it takes regTy's warp basis in place of the
+      // matching register.
+      if (paddedLayout) {
+        auto bases = paddedLayout->getBases();
+        auto want = regLayout.getBases().lookup(StringAttr::get(ctx, "warp"));
+        for (auto [w, basis] :
+             llvm::zip(bases[StringAttr::get(ctx, "warp")], want))
+          if (auto it = llvm::find(bases[kReg], basis); it != bases[kReg].end())
+            std::swap(*it, w);
+        paddedLayout =
+            LinearLayout(std::move(bases), paddedLayout->getOutDims(),
+                         paddedLayout->isSurjective());
+      }
+      SmallVector<int32_t> paddedRegs;
+      // Padded register r and register paddedRegs[r] must name the same element
+      // in every thread, so the lane, warp and block maps must agree.
+      if (paddedLayout && regTy.getShape() == memTy.getShape() &&
+          llvm::all_of(regLayout.getInDimNames(), [&](StringAttr dim) {
+            return dim == kReg || regLayout.getBases().lookup(dim) ==
+                                      paddedLayout->getBases().lookup(dim);
+          })) {
+        DenseMap<std::pair<int32_t, int32_t>, int32_t> regOf;
+        auto elementOf = [&](const LinearLayout &ll, int32_t reg) {
+          SmallVector<std::pair<StringAttr, int32_t>> ins;
+          for (StringAttr dim : ll.getInDimNames())
+            ins.push_back({dim, dim == kReg ? reg : 0});
+          auto out = ll.apply(ins);
+          return std::make_pair(out[0].second, out[1].second);
+        };
+        for (int32_t r = 0; r < regLayout.getInDimSize(kReg); ++r)
+          regOf[elementOf(regLayout, r)] = r;
+        for (int32_t r = 0; r < paddedLayout->getInDimSize(kReg); ++r)
+          paddedRegs.push_back(
+              regOf.lookup_or(elementOf(*paddedLayout, r), -1));
+        if (llvm::count_if(paddedRegs, [](int32_t r) { return r >= 0; }) !=
+            regLayout.getInDimSize(kReg))
+          paddedRegs.clear();
+      }
+      if (paddedRegs.empty()) {
+        if (emitError)
+          emitError() << "NPOT TMEM scale load/store is not yet supported for "
+                      << regTy;
+        return failure();
+      }
+      auto paddedRegTy = RankedTensorType::get(
+          paddedTy.getShape(), regTy.getElementType(),
+          LinearEncodingAttr::get(ctx, std::move(*paddedLayout)));
+      auto info = computeTMemLdStEncodingInfo(paddedRegTy, paddedTy, maxnreg,
+                                              emitError);
+      if (succeeded(info))
+        info->npotPaddedRegs = std::move(paddedRegs);
+      return info;
+    }
+    auto dims = to_vector(regLayout.getOutDimNames());
+    ArrayRef<int64_t> chunkShape = chunkTy->getShape();
+    int64_t c = chunkShape[d];
+    int32_t q = regTy.getDimSize(d) / c;
+    int32_t numBinary = regLayout.getNumLeadingRadix2Digits(kReg);
+    auto bases = regLayout.getBases();
+    bases[kReg].resize(numBinary);
+    auto chunkLayout = LinearLayout::tryCreate(
+        std::move(bases), {{dims[0], chunkShape[0]}, {dims[1], chunkShape[1]}},
+        /*requireSurjective=*/false);
+    int32_t odd = 0;
+    // A general offset table hides the odd digit's step from its basis.
+    if (regLayout.hasOddPartForm() && chunkLayout &&
+        regTy.getShape() == memTy.getShape().take_back(2) &&
+        regLayout.getInDimSizeLog2(kReg) == numBinary + 1 &&
+        regLayout.getInDimSize(kReg) == q << numBinary)
+      odd = regLayout.getBasisContribution(kReg, numBinary, dims[d]).odd;
+    if (odd == 0) {
+      if (emitError)
+        emitError() << "NPOT TMEM load/store is not yet supported for register "
+                       "layout "
+                    << regLayout.toString();
+      return failure();
+    }
+    auto chunkRegTy = RankedTensorType::get(
+        chunkShape, regTy.getElementType(),
+        LinearEncodingAttr::get(ctx, std::move(*chunkLayout)));
+    auto info =
+        computeTMemLdStEncodingInfo(chunkRegTy, *chunkTy, maxnreg, emitError);
+    if (failed(info))
+      return failure();
+    // Register block k is chunk k * odd mod q. Its memory column offset adds to
+    // the chunk's own columns, which can pass q chunk widths (M blocks), so the
+    // offsets go in a table, bounded by q chunk extents.
+    int32_t numDigits = info->reps.getInDimSizeLog2(kReg);
+    auto kCol = StringAttr::get(ctx, "col");
+    auto repsBases = info->reps.getBases();
+    auto radices = info->reps.getInputRadices();
+    auto outDims = info->reps.getOutDims();
+    repsBases[kReg].push_back({0, 0});
+    radices[kReg].push_back(q);
+    outDims[1].second *= q;
+    llvm::MapVector<StringAttr, SmallVector<std::pair<StringAttr, int32_t>>>
+        tableDigits;
+    llvm::MapVector<StringAttr, std::vector<int32_t>> tableOffsets;
+    tableDigits[kCol] = {{kReg, numDigits}};
+    for (int32_t k = 0; k < q; ++k)
+      tableOffsets[kCol].push_back(getTMemSubSliceOffset(
+          memTy, int32_t(k * odd % q * c), memTy.getRank() - 2 + d));
+    std::string diagnostic;
+    auto reps = LinearLayout::tryCreate(
+        std::move(repsBases), std::move(radices), outDims,
+        std::move(tableDigits), std::move(tableOffsets),
+        /*requireSurjective=*/false, &diagnostic);
+    if (!reps) {
+      if (emitError)
+        emitError() << "NPOT TMEM load/store is not yet supported: "
+                    << diagnostic;
+      return failure();
+    }
+    info->reps = std::move(*reps);
+    SmallVector<size_t> action;
+    for (const auto &basis :
+         info->perm.apply(LinearLayout::identity1D(1 << numDigits, kReg, kReg))
+             .getBases()
+             .lookup(kReg))
+      action.push_back(llvm::Log2_32(basis[0]));
+    action.push_back(numDigits);
+    SmallVector<int32_t> permRadices(numDigits, 2);
+    permRadices.push_back(q);
+    info->perm = ColumnAction(action, kReg, numDigits + 1, permRadices);
+    return info;
+  }
+
+  auto layout = computeTMemLdStLayout(regTy, memTy, emitError);
+  if (failed(layout))
+    return failure();
   bool isScales = isa<TensorMemoryScalesEncodingAttr>(memTy.getEncoding());
   int bitwidth = memTy.getElementTypeBitWidth();
-  return lowerTMemLdSt(cvt, maxnreg, bitwidth, isScales, emitError);
+  return lowerTMemLdSt(*layout, maxnreg, bitwidth, isScales, emitError);
 }
 
 FailureOr<LinearLayout> getTMemLdStMessageLayout(MLIRContext *ctx,
@@ -366,8 +567,8 @@ FailureOr<LinearLayout> getTMemLdStMessageLayout(MLIRContext *ctx,
 }
 
 FailureOr<SmallVector<DenseSet<uint32_t>>>
-getTMemLdStWarpAddresses(RankedTensorType regTy, MemDescType memTy, int maxnreg,
-                         uint32_t baseAddress) {
+getTMemLdStThreadAddresses(RankedTensorType regTy, MemDescType memTy,
+                           int maxnreg, uint32_t baseAddress) {
   auto info = computeTMemLdStEncodingInfo(regTy, memTy, maxnreg);
   if (failed(info))
     return failure();
@@ -403,20 +604,29 @@ getTMemLdStWarpAddresses(RankedTensorType regTy, MemDescType memTy, int maxnreg,
   if (failed(messageLayout))
     return failure();
 
-  SmallVector<uint32_t> messageOffsets;
+  // A 16x32bx2 message layout covers 16 lanes. Lanes 16-31 access the same
+  // offsets as lanes 0-15, moved by the second-half offset.
+  constexpr int32_t numLanes = 32;
+  int32_t numMessageLanes = messageLayout->getInDimSize(kLane);
+  if (numMessageLanes != (info->secondHalfOffset ? numLanes / 2 : numLanes))
+    return failure();
+  SmallVector<SmallVector<uint32_t>> messageOffsetsByLane(numLanes);
   for (int32_t messageReg = 0; messageReg < messageLayout->getInDimSize(kReg);
        ++messageReg) {
-    for (int32_t lane = 0; lane < messageLayout->getInDimSize(kLane); ++lane) {
+    for (int32_t lane = 0; lane < numMessageLanes; ++lane) {
       auto [row, col] =
           getRowCol(messageLayout->apply({{kReg, messageReg}, {kLane, lane}}));
       if (!row || !col)
         return failure();
-      messageOffsets.push_back(encode(*row, *col));
+      messageOffsetsByLane[lane].push_back(encode(*row, *col));
+      if (info->secondHalfOffset)
+        messageOffsetsByLane[lane + numMessageLanes].push_back(
+            encode(*row, *col) + *info->secondHalfOffset);
     }
   }
 
-  SmallVector<DenseSet<uint32_t>> addressesByWarp;
-  addressesByWarp.resize(reps.getInDimSize(kWarp));
+  SmallVector<DenseSet<uint32_t>> addressesByThread(reps.getInDimSize(kWarp) *
+                                                    numLanes);
   for (int32_t warp = 0; warp < reps.getInDimSize(kWarp); ++warp) {
     // Keep this warp-base calculation synchronized with lowerTMemLdSt.
     uint32_t warpOffset = (warp & 3) << (5 + 16);
@@ -428,7 +638,6 @@ getTMemLdStWarpAddresses(RankedTensorType regTy, MemDescType memTy, int maxnreg,
       warpOffset += encode(*row, *col);
     }
 
-    DenseSet<uint32_t> addresses;
     for (int32_t reg = 0; reg < reps.getInDimSize(kReg);
          reg += info->numRegsPerMessage) {
       auto [messageRow, messageCol] =
@@ -437,22 +646,26 @@ getTMemLdStWarpAddresses(RankedTensorType regTy, MemDescType memTy, int maxnreg,
         return failure();
       uint32_t messageOffset = encode(*messageRow, *messageCol);
 
-      for (uint32_t inMessageOffset : messageOffsets) {
-        uint32_t address =
-            baseAddress + warpOffset + messageOffset + inMessageOffset;
-        addresses.insert(address);
-        if (info->secondHalfOffset)
-          addresses.insert(address + *info->secondHalfOffset);
+      for (int32_t lane = 0; lane < numLanes; ++lane) {
+        DenseSet<uint32_t> &addresses =
+            addressesByThread[warp * numLanes + lane];
+        for (uint32_t inMessageOffset : messageOffsetsByLane[lane])
+          addresses.insert(baseAddress + warpOffset + messageOffset +
+                           inMessageOffset);
       }
     }
-    addressesByWarp[warp] = std::move(addresses);
   }
-  return addressesByWarp;
+  return addressesByThread;
 }
 
 bool supportsTMemLoadReduce(RankedTensorType regTy, MemDescType memTy,
                             int maxnreg,
                             std::function<InFlightDiagnostic()> emitError) {
+  if (!llvm::all_of(regTy.getShape(), llvm::isPowerOf2_64)) {
+    if (emitError)
+      emitError() << "NPOT tmem_load reduction is not yet supported";
+    return false;
+  }
   auto encodingInfo = computeTMemLdStEncodingInfo(regTy, memTy, maxnreg);
   if (failed(encodingInfo)) {
     if (emitError)

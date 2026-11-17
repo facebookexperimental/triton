@@ -60,6 +60,31 @@ def NVWSAssignStagePhase : Pass<"nvws-assign-stage-phase", "mlir::ModuleOp"> {
   ];
 }
 
+def NVWSInsertSemas : Pass<"nvws-insert-semas", "mlir::ModuleOp"> {
+  let summary = "Insert semaphore ops for ownership transfer.";
+
+  let description = [{
+    Access-DAG-driven SMEM/TMEM semaphore insertion for ownership transfer
+    between warp-specialized partitions.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+
+  let options = [
+    Option<"useMetaPartitioner", "use-meta-partitioner",
+           "bool", /*default*/"false",
+           "If true, InsertSemas is running after the NVWS meta partitioner">,
+    Option<"numStages", "num-stages", "int32_t", /*default*/"3",
+           "default semaphore depth used for stage planning; must match "
+           "nvws-semaphore-optimize --num-stages">
+  ];
+}
+
 def NVWSSemaphoreOptimize
     : Pass<"nvws-semaphore-optimize", "mlir::ModuleOp"> {
   let summary = "Optimize NVWS semaphore topology before stage assignment.";

@@ -6,8 +6,6 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/StrUtil.h"
-#include "triton/Tools/Sys/GetEnv.h"
-#include "llvm/ADT/bit.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "tritongpu-coalesce"
@@ -94,9 +92,6 @@ buildCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
     // width when a related unaligned load selects a wider layout.
     perThread = std::min(perThread, opPerThread);
   }
-  // Blocked params must be pow2; the modular layout carries the NPOT remainder.
-  if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT"))
-    perThread = llvm::bit_floor(perThread);
   SmallVector<unsigned> sizePerThread(refTensorType.getRank(), 1);
   sizePerThread[order[0]] = perThread;
   return BlockedEncodingAttr::get(op->getContext(), refTensorType.getShape(),

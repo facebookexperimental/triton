@@ -1163,8 +1163,7 @@ def bmm(a, b):
     GMN = triton.cdiv(M, bm) * triton.cdiv(N, BLOCK_N)
     NT = Bs * GMN
     c = torch.empty((Bs, M, N), device=a.device, dtype=a.dtype)
-    attrs = (("amdgpu-agpr-alloc", "0,0"), )
-    common = dict(num_warps=8, num_stages=1, matrix_instr_nonkdim=32, llvm_fn_attrs=attrs)
+    common = dict(num_warps=8, num_stages=1, matrix_instr_nonkdim=32)
     st = (a.stride(0), a.stride(1), a.stride(2), b.stride(0), b.stride(1), b.stride(2), c.stride(0), c.stride(1),
           c.stride(2))
     if M == 40 and N == 256 and K == 1956:

@@ -59,7 +59,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // CHECK: [[NARROW_LAYOUT:#.*]] = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 // CHECK: [[WIDE_LAYOUT:#.*]] = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
-tt.func public @load_tensors_two_types(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg3: i32) {
+tt.func public @load_tensors_two_types(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg3: i32 {tt.divisibility = 16 : i32}) {
     %c1024_i32 = arith.constant 1024 : i32
     %0 = tt.get_program_id x : i32
     %1 = arith.muli %0, %c1024_i32 : i32
@@ -93,7 +93,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // CHECK-NOT: sizePerThread = [4]
 // CHECK: #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 // CHECK-NOT: sizePerThread = [4]
-tt.func public @load_tensors_two_types(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg3: i32) {
+tt.func public @load_tensors_two_types(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg3: i32 {tt.divisibility = 16 : i32}) {
     %c1024_i32 = arith.constant 1024 : i32
     %0 = tt.get_program_id x : i32
     %1 = arith.muli %0, %c1024_i32 : i32
@@ -332,6 +332,188 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK: %[[COALESCED_PTRS:.*]] = ttg.convert_layout %[[RELEASED]] : tensor<1024x!tt.ptr<f32>, #[[$RELEASED_LAYOUT]]> -> tensor<1024x!tt.ptr<f32>, #[[$COALESCED]]>
     // CHECK: tt.load %[[COALESCED_PTRS]] : tensor<1024x!tt.ptr<f32>, #[[$COALESCED]]>
     %loaded = tt.load %released : tensor<1024x!tt.ptr<f32>, #released>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// CHECK-DAG: [[$ATOMIC_VEC16:#.*]] = #ttg.blocked<{sizePerThread = [16], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// CHECK-DAG: [[$ATOMIC_VEC8:#.*]] = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// CHECK-DAG: [[$ATOMIC_VEC4:#.*]] = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// CHECK-DAG: [[$ATOMIC_VEC2:#.*]] = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @atomic_load_store_i8
+  // CHECK: tt.atomic_load acquire, gpu, %{{.*}} : (tensor<2048x!tt.ptr<i8>, [[$ATOMIC_VEC16]]>) -> tensor<2048xi8, [[$ATOMIC_VEC16]]>
+  // CHECK: tt.atomic_store release, gpu, %{{.*}}, %{{.*}} : tensor<2048x!tt.ptr<i8>, [[$ATOMIC_VEC16]]>
+  tt.func @atomic_load_store_i8(%ptrs: tensor<2048x!tt.ptr<i8>, #blocked> {tt.contiguity = 2048 : i32, tt.divisibility = 16 : i32}) {
+    %loaded = tt.atomic_load acquire, gpu, %ptrs : (tensor<2048x!tt.ptr<i8>, #blocked>) -> tensor<2048xi8, #blocked>
+    tt.atomic_store release, gpu, %ptrs, %loaded : tensor<2048x!tt.ptr<i8>, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: @atomic_load_store_f16
+  // CHECK: tt.atomic_load acquire, gpu, %{{.*}} : (tensor<2048x!tt.ptr<f16>, [[$ATOMIC_VEC8]]>) -> tensor<2048xf16, [[$ATOMIC_VEC8]]>
+  // CHECK: tt.atomic_store release, gpu, %{{.*}}, %{{.*}} : tensor<2048x!tt.ptr<f16>, [[$ATOMIC_VEC8]]>
+  tt.func @atomic_load_store_f16(%ptrs: tensor<2048x!tt.ptr<f16>, #blocked> {tt.contiguity = 2048 : i32, tt.divisibility = 16 : i32}) {
+    %loaded = tt.atomic_load acquire, gpu, %ptrs : (tensor<2048x!tt.ptr<f16>, #blocked>) -> tensor<2048xf16, #blocked>
+    tt.atomic_store release, gpu, %ptrs, %loaded : tensor<2048x!tt.ptr<f16>, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: @atomic_load_store_i32
+  // CHECK: tt.atomic_load acquire, gpu, %{{.*}} : (tensor<2048x!tt.ptr<i32>, [[$ATOMIC_VEC4]]>) -> tensor<2048xi32, [[$ATOMIC_VEC4]]>
+  // CHECK: tt.atomic_store release, gpu, %{{.*}}, %{{.*}} : tensor<2048x!tt.ptr<i32>, [[$ATOMIC_VEC4]]>
+  tt.func @atomic_load_store_i32(%ptrs: tensor<2048x!tt.ptr<i32>, #blocked> {tt.contiguity = 2048 : i32, tt.divisibility = 16 : i32}) {
+    %loaded = tt.atomic_load acquire, gpu, %ptrs : (tensor<2048x!tt.ptr<i32>, #blocked>) -> tensor<2048xi32, #blocked>
+    tt.atomic_store release, gpu, %ptrs, %loaded : tensor<2048x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: @atomic_load_store_i64
+  // CHECK: tt.atomic_load acquire, gpu, %{{.*}} : (tensor<2048x!tt.ptr<i64>, [[$ATOMIC_VEC2]]>) -> tensor<2048xi64, [[$ATOMIC_VEC2]]>
+  // CHECK: tt.atomic_store release, gpu, %{{.*}}, %{{.*}} : tensor<2048x!tt.ptr<i64>, [[$ATOMIC_VEC2]]>
+  tt.func @atomic_load_store_i64(%ptrs: tensor<2048x!tt.ptr<i64>, #blocked> {tt.contiguity = 2048 : i32, tt.divisibility = 16 : i32}) {
+    %loaded = tt.atomic_load acquire, gpu, %ptrs : (tensor<2048x!tt.ptr<i64>, #blocked>) -> tensor<2048xi64, #blocked>
+    tt.atomic_store release, gpu, %ptrs, %loaded : tensor<2048x!tt.ptr<i64>, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: @atomic_load_store_alignment
+  // CHECK: tt.atomic_load relaxed, gpu, %{{.*}} : (tensor<2048x!tt.ptr<i32>, [[$ATOMIC_VEC2]]>) -> tensor<2048xi32, [[$ATOMIC_VEC2]]>
+  // CHECK: tt.atomic_store relaxed, gpu, %{{.*}}, %{{.*}} : tensor<2048x!tt.ptr<i32>, [[$ATOMIC_VEC2]]>
+  tt.func @atomic_load_store_alignment(%ptrs: tensor<2048x!tt.ptr<i32>, #blocked> {tt.contiguity = 2048 : i32, tt.divisibility = 8 : i32}) {
+    %loaded = tt.atomic_load relaxed, gpu, %ptrs : (tensor<2048x!tt.ptr<i32>, #blocked>) -> tensor<2048xi32, #blocked>
+    tt.atomic_store relaxed, gpu, %ptrs, %loaded : tensor<2048x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// CHECK: [[$ATOMIC_AMD:#.*]] = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @atomic_load_store_amd
+  // CHECK: tt.atomic_load acquire, gpu, %{{.*}} : (tensor<2048x!tt.ptr<i32>, [[$ATOMIC_AMD]]>) -> tensor<2048xi32, [[$ATOMIC_AMD]]>
+  // CHECK: tt.atomic_store release, gpu, %{{.*}}, %{{.*}} : tensor<2048x!tt.ptr<i32>, [[$ATOMIC_AMD]]>
+  tt.func @atomic_load_store_amd(%ptrs: tensor<2048x!tt.ptr<i32>, #blocked> {tt.contiguity = 2048 : i32, tt.divisibility = 16 : i32}) {
+    %loaded = tt.atomic_load acquire, gpu, %ptrs : (tensor<2048x!tt.ptr<i32>, #blocked>) -> tensor<2048xi32, #blocked>
+    tt.atomic_store release, gpu, %ptrs, %loaded : tensor<2048x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// CHECK: [[$ATOMIC_DEFAULT:#.*]] = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @atomic_load_store_without_target
+  // CHECK: tt.atomic_load relaxed, gpu, %{{.*}} : (tensor<2048x!tt.ptr<i32>, [[$ATOMIC_DEFAULT]]>) -> tensor<2048xi32, [[$ATOMIC_DEFAULT]]>
+  // CHECK: tt.atomic_store relaxed, gpu, %{{.*}}, %{{.*}} : tensor<2048x!tt.ptr<i32>, [[$ATOMIC_DEFAULT]]>
+  tt.func @atomic_load_store_without_target(%ptrs: tensor<2048x!tt.ptr<i32>, #blocked> {tt.contiguity = 2048 : i32, tt.divisibility = 16 : i32}) {
+    %loaded = tt.atomic_load relaxed, gpu, %ptrs : (tensor<2048x!tt.ptr<i32>, #blocked>) -> tensor<2048xi32, #blocked>
+    tt.atomic_store relaxed, gpu, %ptrs, %loaded : tensor<2048x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// The sizePerThread must divide a contiguity that is not a power of two, so
+// that no vector straddles two contiguous runs. A contiguity of 0 gives 1.
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+// CHECK-DAG: [[$SPT1:#.*]] = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+// CHECK-DAG: [[$SPT2:#.*]] = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+// CHECK-DAG: [[$SPT4:#.*]] = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @load_store_contiguity_3
+  // CHECK: tt.load %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT1]]>
+  // CHECK: tt.store %{{.*}}, %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT1]]>
+  tt.func @load_store_contiguity_3(%ptrs: tensor<128x!tt.ptr<f32>, #blocked> {tt.contiguity = 3 : i32, tt.divisibility = 16 : i32}) {
+    %v = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.store %ptrs, %v : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: @load_store_contiguity_6
+  // CHECK: tt.load %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT2]]>
+  // CHECK: tt.store %{{.*}}, %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT2]]>
+  tt.func @load_store_contiguity_6(%ptrs: tensor<128x!tt.ptr<f32>, #blocked> {tt.contiguity = 6 : i32, tt.divisibility = 16 : i32}) {
+    %v = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.store %ptrs, %v : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: @load_store_contiguity_4
+  // CHECK: tt.load %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT4]]>
+  // CHECK: tt.store %{{.*}}, %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT4]]>
+  tt.func @load_store_contiguity_4(%ptrs: tensor<128x!tt.ptr<f32>, #blocked> {tt.contiguity = 4 : i32, tt.divisibility = 16 : i32}) {
+    %v = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.store %ptrs, %v : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: @load_store_contiguity_0
+  // CHECK: tt.load %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT1]]>
+  // CHECK: tt.store %{{.*}}, %{{.*}} : tensor<128x!tt.ptr<f32>, [[$SPT1]]>
+  tt.func @load_store_contiguity_0(%ptrs: tensor<128x!tt.ptr<f32>, #blocked> {tt.contiguity = 0 : i32, tt.divisibility = 16 : i32}) {
+    %v = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.store %ptrs, %v : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// The store lowering caps a masked store at its mask's alignment. With a
+// runtime bound of unknown divisibility the store gets one element per thread
+// and the load keeps its wider layout. A bound divisible by 16 changes nothing.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// CHECK-DAG: [[$NARROW:#.*]] = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+// CHECK-DAG: [[$WIDE:#.*]] = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @store_mask_unaligned
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f16>, [[$WIDE]]>
+  // CHECK: tt.store {{.*}} : tensor<1024x!tt.ptr<f16>, [[$NARROW]]>
+  tt.func public @store_mask_unaligned(%in: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %out: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %n: i32) {
+    %c1024_i32 = arith.constant 1024 : i32
+    %pid = tt.get_program_id x : i32
+    %start = arith.muli %pid, %c1024_i32 : i32
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %starts = tt.splat %start : i32 -> tensor<1024xi32, #blocked>
+    %offs = arith.addi %starts, %range : tensor<1024xi32, #blocked>
+    %bound = tt.splat %n : i32 -> tensor<1024xi32, #blocked>
+    %mask = arith.cmpi slt, %offs, %bound : tensor<1024xi32, #blocked>
+    %in_base = tt.splat %in : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %in_ptrs = tt.addptr %in_base, %offs : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    %x = tt.load %in_ptrs, %mask : tensor<1024x!tt.ptr<f16>, #blocked>
+    %out_base = tt.splat %out : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %out_ptrs = tt.addptr %out_base, %offs : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    tt.store %out_ptrs, %x, %mask : tensor<1024x!tt.ptr<f16>, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: @store_mask_aligned
+  // CHECK: tt.load {{.*}} : tensor<1024x!tt.ptr<f16>, [[$WIDE]]>
+  // CHECK: tt.store {{.*}} : tensor<1024x!tt.ptr<f16>, [[$WIDE]]>
+  tt.func public @store_mask_aligned(%in: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %out: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %n: i32 {tt.divisibility = 16 : i32}) {
+    %c1024_i32 = arith.constant 1024 : i32
+    %pid = tt.get_program_id x : i32
+    %start = arith.muli %pid, %c1024_i32 : i32
+    %range = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32, #blocked>
+    %starts = tt.splat %start : i32 -> tensor<1024xi32, #blocked>
+    %offs = arith.addi %starts, %range : tensor<1024xi32, #blocked>
+    %bound = tt.splat %n : i32 -> tensor<1024xi32, #blocked>
+    %mask = arith.cmpi slt, %offs, %bound : tensor<1024xi32, #blocked>
+    %in_base = tt.splat %in : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %in_ptrs = tt.addptr %in_base, %offs : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    %x = tt.load %in_ptrs, %mask : tensor<1024x!tt.ptr<f16>, #blocked>
+    %out_base = tt.splat %out : !tt.ptr<f16> -> tensor<1024x!tt.ptr<f16>, #blocked>
+    %out_ptrs = tt.addptr %out_base, %offs : tensor<1024x!tt.ptr<f16>, #blocked>, tensor<1024xi32, #blocked>
+    tt.store %out_ptrs, %x, %mask : tensor<1024x!tt.ptr<f16>, #blocked>
     tt.return
   }
 }

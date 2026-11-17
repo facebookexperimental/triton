@@ -63,3 +63,93 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// A module whose only warp_specialize came from AutoWS (tagged with
+// ttg.warp_specialize.tag) is lowered with direct warp-ID dispatch: each worker
+// runs its partition once and exits. TLX gets that lowering only through
+// async_tasks(exclusive=True); without it the workers sit in a dispatch loop
+// until the kernel ends, about 3% on a short AutoWS Flash Attention launch.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: def single_autows_region(
+  // CHECK: with tlx.async_tasks(exclusive=True):
+  tt.func public @single_autows_region(%n: i32) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    ttg.warp_specialize()
+    default {
+      scf.for %i = %c0_i32 to %n step %c1_i32 : i32 {
+        %cst = arith.constant dense<1.000000e+00> : tensor<128xf32, #blocked>
+      } {ttg.warp_specialize.tag = 0 : i32}
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      %cst = arith.constant dense<1.000000e+00> : tensor<128xf32, #blocked>
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// TLX's own exclusive=True is recorded on the module and round-trips.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.single-warp-specialize" = true, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: def exclusive_tlx_region(
+  // CHECK: with tlx.async_tasks(exclusive=True):
+  tt.func public @exclusive_tlx_region() attributes {noinline = false} {
+    ttg.warp_specialize()
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      %cst = arith.constant dense<1.000000e+00> : tensor<128xf32, #blocked>
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// Direct dispatch needs the module's only warp_specialize; with two, both keep
+// the dispatch loop even if AutoWS produced them.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: def two_autows_regions(
+  // CHECK: with tlx.async_tasks():
+  // CHECK: with tlx.async_tasks():
+  tt.func public @two_autows_regions(%n: i32) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    ttg.warp_specialize()
+    default {
+      scf.for %i = %c0_i32 to %n step %c1_i32 : i32 {
+        %cst = arith.constant dense<1.000000e+00> : tensor<128xf32, #blocked>
+      } {ttg.warp_specialize.tag = 0 : i32}
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      %cst = arith.constant dense<1.000000e+00> : tensor<128xf32, #blocked>
+      ttg.warp_return
+    } : () -> ()
+    ttg.warp_specialize()
+    default {
+      scf.for %i = %c0_i32 to %n step %c1_i32 : i32 {
+        %cst = arith.constant dense<1.000000e+00> : tensor<128xf32, #blocked>
+      } {ttg.warp_specialize.tag = 1 : i32}
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      %cst = arith.constant dense<1.000000e+00> : tensor<128xf32, #blocked>
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}

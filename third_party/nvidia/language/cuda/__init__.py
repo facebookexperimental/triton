@@ -1,7 +1,8 @@
 from . import inline_ptx_lib
 from . import libdevice
 
-from .utils import (globaltimer, num_threads, num_warps, smid, convert_custom_float8_sm70, convert_custom_float8_sm80)
+from .utils import (globaltimer, num_threads, num_warps, smid, convert_custom_float8_sm70, convert_custom_float8_sm80,
+                    round_f32_to_tf32)
 from .gdc import (gdc_launch_dependents, gdc_wait)
 
 from ._experimental_tma import *  # noqa: F403
@@ -19,6 +20,7 @@ __all__ = [
     "gdc_launch_dependents",
     "gdc_wait",
     *_tma_all,
+    "round_f32_to_tf32",
 ]
 
 del _tma_all

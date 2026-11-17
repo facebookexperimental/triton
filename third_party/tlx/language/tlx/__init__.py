@@ -77,11 +77,14 @@ from .mem_ops import (
     update_tensor_descriptor,
 )
 from .mma_ops import (
+    amd_concat,
     amd_dot,
+    amd_packed_dot2,
     amd_mfma_commit,
     amd_register_class_anchor,
     amd_register_resident,
     amd_scheduled_mfma,
+    amd_scheduled_mfma_scaled,
     async_dot,
     async_dot_scaled,
     async_dot_wait,
@@ -93,7 +96,7 @@ from .mma_ops import (
     release_layout,
     tcgen05_commit,
 )
-from .packed_arith import packed_add4, packed_fma4, packed_mul4, packed_sub4
+from .packed_arith import packed_add2, packed_add4, packed_exp2, packed_fma4, packed_mul4, packed_sub4
 from .types import (
     async_token,
     buffered_tensor,
@@ -155,6 +158,8 @@ __all__ = [
     "async_tasks",
     "async_task",
     # packed arithmetic
+    "packed_add2",
+    "packed_exp2",
     "packed_add4",
     "packed_sub4",
     "packed_mul4",
@@ -180,11 +185,14 @@ __all__ = [
     "nv_mma_shared_layout_encoding",
     "storage_kind",
     "layout",
+    "amd_concat",
     "amd_dot",
+    "amd_packed_dot2",
     "amd_mfma_commit",
     "amd_register_class_anchor",
     "amd_register_resident",
     "amd_scheduled_mfma",
+    "amd_scheduled_mfma_scaled",
     "extract_slice",
     "rematerialized_range",
     "release_layout",

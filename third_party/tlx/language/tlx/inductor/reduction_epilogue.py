@@ -466,7 +466,7 @@ def _workspace(kernel: TritonTemplateKernel, plan: TlxReductionEpiloguePlan, par
         count=sum(_STAT_SLOTS[r.reduction_type] for r in plan.reductions) * rows * nblocks,
         zero_mode=WorkspaceZeroMode.UNINITIALIZED,
         device=kernel.output_node.get_device(),
-        outer_name=WorkspaceArg.unique_name("row_stats_ws_"),
+        outer_name=WorkspaceArg.unique_name("workspace_row_stats_"),
         inner_name="row_stats_ws",
         dtype=torch.float32,
     )

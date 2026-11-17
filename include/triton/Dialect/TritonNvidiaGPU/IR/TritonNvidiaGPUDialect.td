@@ -33,6 +33,7 @@ def TritonNvidiaGPU_Dialect : Dialect {
   let useStrictPropertiesInAssemblyFormat = 0;
 
   let hasOperationAttrVerify = 1;
+  let hasCanonicalizer = 1;
 
   let description = [{
     Triton Nvidia GPU Dialect.

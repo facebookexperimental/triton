@@ -13,12 +13,12 @@ constexpr inline int TMA_ALIGN = 128;
 
 inline bool isFp4Padded(Attribute encoding) {
   auto mmaEnc = dyn_cast<gpu::NVMMASharedEncodingAttr>(encoding);
-  return mmaEnc && mmaEnc.getFp4Padded();
+  return mmaEnc && mmaEnc.isPaddedFp4();
 }
 
 inline bool isFp6Padded(Attribute encoding) {
   auto mmaEnc = dyn_cast<gpu::NVMMASharedEncodingAttr>(encoding);
-  return mmaEnc && mmaEnc.getFp6Padded();
+  return mmaEnc && mmaEnc.isPaddedFp6();
 }
 
 triton::gpu::SharedEncodingTrait
@@ -42,7 +42,7 @@ inline SmallVector<int64_t> getTMABlockShape(Attribute encoding,
   auto mmaEnc = cast<gpu::NVMMASharedEncodingAttr>(encoding);
   return triton::gpu::getTMABlockShape(
       shapePerCTA, mmaEnc.getElementBitWidth(), mmaEnc.getSwizzlingByteWidth(),
-      mmaEnc.getFp4Padded(), mmaEnc.getTransposed(), packedSize, mode);
+      mmaEnc.isPaddedFp4(), mmaEnc.getTransposed(), packedSize, mode);
 }
 
 inline SmallVector<int64_t> getTMABlockShape(triton::gpu::MemDescType ty,

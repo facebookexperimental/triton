@@ -87,7 +87,7 @@ def _attn_bwd_preprocess(
     HEAD_DIM: tl.constexpr,
 ):
     off_h = tl.program_id(1)
-    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
     masks = offs_m < total_seq_len_q
     offs_n = tl.arange(0, HEAD_DIM)
     o = tl.load(
@@ -121,7 +121,7 @@ def backward_d_silu_activation(
     scale,
     valid_mask_trans,
 ):
-    dqk_trans = dact_qk_trans * pT * (1 + qk_trans * (1 - pT)) * scale[None, :]
+    dqk_trans = dact_qk_trans * pT * (1 + qk_trans * (1 - pT)) * scale[None]
     dqk_trans = tl.where(valid_mask_trans, dqk_trans, 0)
     return dqk_trans
 
@@ -139,7 +139,7 @@ def backward_silu_activation(qk_trans, alpha, valid_mask_trans, dtype_k, scale):
     masked_alpha = tl.where(valid_mask_trans, alpha, 0.0)
     qk_trans = qk_trans * masked_alpha
     pT = fast_silu(qk_trans, MULT_BY_X=False)
-    silu_trans = qk_trans * pT * scale[None, :]
+    silu_trans = qk_trans * pT * scale[None]
     act_qk_trans = silu_trans.to(dtype_k)
     return qk_trans, act_qk_trans, pT
 
