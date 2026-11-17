@@ -360,6 +360,16 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="router_gemm",
+        arch="gfx950",
+        variant="bf16x3_split_k",
+        impl="triton.tlx.ops.kernels.router_gemm.gfx950:router_gemm",
+        dtypes=_BF16,
+        # GEMV loads and split-K partitions are powers of two that divide E and K.
+        accepts=lambda d: d["E"] > 0 and d["E"] % 16 == 0 and d["K"] > 0 and d["K"] % 1024 == 0,
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="mm_torchtlx",
         arch="sm90",
         variant="inductor_hopper_gemm_ws",

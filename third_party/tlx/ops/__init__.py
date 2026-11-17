@@ -121,7 +121,7 @@ from ._normalization import (
 
 __all__ = [
     "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
-    "moe_routing", "norm_residual_norm", "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn",
+    "moe_routing", "norm_residual_norm", "router_gemm", "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn",
     "flash_attn_mxfp8", "flash_attn_varlen", "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn",
     "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill",
     "kda_recurrent_decode", "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward",
@@ -904,6 +904,53 @@ def norm_residual_norm(stream, branch, *, post_weight=None, post_norm_input_scal
     with torch.cuda.device(branch.device):
         return fn(stream, branch, post_weight, bool(post_norm_input_scale), pre_weight, alpha, beta, post_eps, pre_eps,
                   bool(pre_norm_bf16), out, new_stream)
+
+
+def router_gemm(x, weight, *, out=None, space=None):
+    """MoE router logits in fp32: ``x.float() @ weight.T`` for a bf16 ``x`` and an fp32 ``weight``. Forward only.
+
+    Every product is exact (each fp32 weight element is the exact sum of three bf16 values, multiplied by the bf16
+    ``x`` on bf16 matrix cores) and accumulated in fp32, so the logits match an fp32 GEMM on the upcast ``x`` up to
+    the order of the fp32 additions, which depends on the token count's bucket. Pass the bf16 hidden states, not
+    their fp32 upcast; the weight stays fp32 and may be updated in place.
+
+    Shapes: ``x (T, K)`` bf16 with unit column stride, ``weight (E, K)`` fp32 contiguous; returns or fills
+    ``out (T, E)`` fp32 contiguous. ``E`` must be a multiple of 16 and ``K`` a multiple of 1024.
+    Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    if not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor):
+        raise InvalidInput("tlx.ops.router_gemm expects tensor x and weight")
+    if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1]:
+        raise InvalidInput("tlx.ops.router_gemm expects x (T, K) and weight (E, K); got "
+                           f"{tuple(x.shape)} and {tuple(weight.shape)}")
+    T, K = x.shape
+    E = weight.shape[0]
+    if weight.dtype != torch.float32:
+        raise InvalidInput(f"tlx.ops.router_gemm expects an fp32 weight; got {weight.dtype}")
+    if not weight.is_contiguous() or (T > 1 and x.stride(0) < K) or (K > 1 and x.stride(1) != 1):
+        raise InvalidInput("tlx.ops.router_gemm expects a contiguous weight and x with unit column stride and rows "
+                           "that do not overlap")
+    tensors = [x, weight]
+    if out is not None:
+        if (not isinstance(out, torch.Tensor) or out.shape != (T, E) or out.dtype != torch.float32
+                or not out.is_contiguous()):
+            raise InvalidInput(f"tlx.ops.router_gemm expects out as a contiguous fp32 ({T}, {E}) tensor")
+        if torch._C._overlaps(out, x) or torch._C._overlaps(out, weight):
+            raise InvalidInput("tlx.ops.router_gemm out must not alias x or weight")
+        tensors.append(out)
+    if any(t.device != x.device for t in tensors):
+        raise InvalidInput("tlx.ops.router_gemm expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("router_gemm", space)
+    _check_single_config_space("router_gemm", space_name)
+    fn, spec = impl_for("router_gemm", device=x.device)
+    check_inputs(spec, dtype=x.dtype, E=E, K=K)
+    check_backward(spec, *tensors)
+    _check_enforced("router_gemm", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, weight, out)
 
 
 def addmm(input, a, b, *, out=None, space=None):
