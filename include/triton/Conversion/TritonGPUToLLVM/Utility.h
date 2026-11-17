@@ -397,10 +397,11 @@ Value emitCanonicalLayoutOwnerPredicate(
 
 // Calls `access` per `run` registers of a mixed-radix `regLayout` with the
 // first register, its offset through `toOffset` (the shared layout's
-// pseudoinverse) and the hardware indices that reach it.
+// pseudoinverse) and the hardware indices that reach it. A view passes its
+// logical offsets as `origin`, which are added to the coordinates first.
 void forEachMixedRadixSharedRun(
     Location loc, RewriterBase &rewriter, const LinearLayout &regLayout,
-    const LinearLayout &toOffset, int32_t run,
+    const LinearLayout &toOffset, int32_t run, ArrayRef<Value> origin,
     function_ref<void(int32_t, Value, ArrayRef<std::pair<StringAttr, Value>>)>
         access);
 
