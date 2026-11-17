@@ -10,6 +10,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
@@ -672,6 +673,8 @@ enum class ThreadSyncKind {
   // Each thread publishes its own effects. The barrier completes only after
   // every thread has arrived.
   ThreadPublication,
+  // The operation does not observe another thread's memory.
+  Independent,
   // Completions only establish completion or acquire state; they do
   // not access payload or consume another completion's unpublished effects.
   Completion,
@@ -705,6 +708,10 @@ struct ThreadSyncInfo {
 };
 
 ThreadSyncInfo getThreadSyncInfo(Operation *op) {
+  // Prints go to the host and an assert only aborts. They often run under a
+  // thread-zero branch, where a barrier would deadlock.
+  if (isa<triton::PrintOp, triton::AssertOp>(op))
+    return {ThreadSyncKind::Independent};
   // Acquires and proxy fences do not consume payload. Wait deps only keep
   // allocations live; each thread fences its own completed accesses.
   if (isa<ttng::WaitBarrierOp>(op))
@@ -730,19 +737,20 @@ ThreadSyncInfo getThreadSyncInfo(Operation *op) {
     // SM90.
     return {ThreadSyncKind::Ordinary, ThreadIssuer::Warp0Leader};
   }
-  if (auto arrive = dyn_cast<ttng::ArriveBarrierOp>(op);
-      arrive && arrive.getPerThread())
+  if (ttng::arrivesFromEveryThread(op))
     return {ThreadSyncKind::ThreadPublication};
   if (auto barrier = dyn_cast<triton::gpu::MBarrierOpInterface>(op);
       barrier && barrier.isPerWarp())
     return {ThreadSyncKind::WarpPublication};
   if (isa<ttng::ArriveBarrierOp, ttng::BarrierExpectOp>(op)) {
-    auto fromCTA = isa<ttng::ArriveBarrierOp>(op)
-                       ? cast<ttng::ArriveBarrierOp>(op).getFromCTA()
-                       : cast<ttng::BarrierExpectOp>(op).getFromCTA();
-    // Nonidentity routing may use several lanes to signal the peer CTAs.
+    auto arrive = dyn_cast<ttng::ArriveBarrierOp>(op);
+    auto fromCTA = arrive ? arrive.getFromCTA()
+                          : cast<ttng::BarrierExpectOp>(op).getFromCTA();
+    // Nonidentity routing may use several lanes to signal the peer CTAs, and
+    // a predicated per-thread arrival comes from the threads it selects.
+    bool fromThread0 = !fromCTA && !(arrive && arrive.getPerThread());
     return {ThreadSyncKind::Publication,
-            !fromCTA ? ThreadIssuer::Thread0 : ThreadIssuer::Unknown};
+            fromThread0 ? ThreadIssuer::Thread0 : ThreadIssuer::Unknown};
   }
   // MMAs and commits are issued by the same full-mask election in warp zero,
   // so a commit tracks every earlier MMA of its region.
@@ -755,22 +763,45 @@ ThreadSyncInfo getThreadSyncInfo(Operation *op) {
   return {};
 }
 
-// The operation cannot take effect before every thread of its region reaches
-// it, so the threads have finished their earlier waits, fences and arrivals.
-// Unlike a barrier, this does not order memory.
-bool waitsForWholeRegion(Operation *op) {
-  // Every thread arrives, and the barrier completes only after all of them do.
-  // Named barriers are aligned, so each warp arrives as a whole.
-  if (auto arrive = dyn_cast<ttng::ArriveBarrierOp>(op))
-    return arrive.getPerThread();
-  if (isa<ttng::NamedBarrierArriveOp, ttng::NamedBarrierWaitOp>(op))
+// Whether pending thread effects must rendezvous before `demands`.
+bool requiresThreadSyncFor(const BlockInfo::ThreadSyncState &sync,
+                           const BlockInfo::ThreadDemandState &demands,
+                           bool hasSharedAccesses) {
+  if (!demands.hasDemand)
+    return false;
+  // Waits, fences and arrivals only have to finish before another thread's
+  // publication, or before a notification can let a peer advance a waited
+  // phase. Private counter updates are already ordered by the slice hazards.
+  if (demands.mayIssueAhead && !sync.syncIssuers.empty() &&
+      ((!demands.publicationIssuers.empty() &&
+        !sync.syncIssuers.hasSameKnownIssuer(demands.publicationIssuers)) ||
+       (sync.peerWaitNeedsSync && demands.mayNotifyPeer)))
     return true;
-  // These issue under a full-mask elect.sync, which waits until every lane of
-  // the warp executes it.
-  return isa<ttng::MMAv5OpInterface, ttng::TCGen5CommitOp,
-             ttng::AsyncTMACopyGlobalToLocalOp,
-             ttng::AsyncTMACopyLocalToGlobalOp>(op) &&
-         triton::gpu::maybeLookupNumWarps(op) == 1;
+  if (sync.effectIssuers.empty())
+    return false;
+  return sync.completion == CompletionSync::All ||
+         (sync.completion == CompletionSync::Shared &&
+          (hasSharedAccesses || demands.hasDemandBeyondGlobalReads)) ||
+         (!demands.publicationIssuers.empty() &&
+          !sync.effectIssuers.hasSameKnownIssuer(demands.publicationIssuers));
+}
+
+// A barrier initialization or invalidation is pending.
+bool hasPendingBarrierLifetime(const BlockInfo &pending) {
+  return llvm::any_of(pending.syncWriteSlices, [](const auto &entry) {
+    return llvm::any_of(entry.second, [](Operation *op) {
+      return isa<ttng::InitBarrierOp, ttng::InvalBarrierOp>(op);
+    });
+  });
+}
+
+// Whether the slice hazards can miss a pending barrier initialization or
+// invalidation. An MMA with completion barriers is modeled as completing every
+// pending effect, and a per-thread arrival records no slices.
+bool missesBarrierLifetime(Operation *op) {
+  if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(op))
+    return !mma.getCompletionBarriers().empty();
+  return ttng::arrivesFromEveryThread(op);
 }
 
 // Effects that only synchronize. Their mbarrier updates and proxy ordering
@@ -858,6 +889,189 @@ bool haveSameThreadSyncIssuer(Operation *lhs, Operation *rhs) {
 
 } // namespace
 
+bool DivergentControlFlow::isLoopBranch(Operation *branch) {
+  // A branch inside a loop that can leave it decides whether to repeat the
+  // loop. A branch whose paths all stay in the loop only skips part of an
+  // iteration, even when one of them goes straight back to the header:
+  // canonicalization threads the empty merge block of an if at the end of a
+  // loop body into the header.
+  Block *block = branch->getBlock();
+  Region *region = block->getParent();
+  if (region->hasOneBlock())
+    return false;
+  std::unique_ptr<CFGLoopInfo> &regionLoops = loops[region];
+  if (!regionLoops)
+    regionLoops = std::make_unique<CFGLoopInfo>(dominance.getDomTree(region));
+  CFGLoop *loop = regionLoops->getLoopFor(block);
+  return loop && llvm::any_of(branch->getSuccessors(), [&](Block *successor) {
+           return !loop->contains(successor);
+         });
+}
+
+ArrayRef<Block *> DivergentControlFlow::getSkippableBlocks(Operation *branch) {
+  auto it = skippableBlocks.find(branch);
+  if (it != skippableBlocks.end())
+    return it->second;
+  // The paths meet again at the first block that post-dominates the branch.
+  Block *block = branch->getBlock();
+  SmallVector<Block *> worklist(branch->getSuccessors());
+  DenseSet<Block *> seen{block};
+  SmallVector<Block *> skippable;
+  while (!worklist.empty()) {
+    Block *next = worklist.pop_back_val();
+    if (!seen.insert(next).second || postDominance.postDominates(next, block))
+      continue;
+    skippable.push_back(next);
+    llvm::append_range(worklist, next->getSuccessors());
+  }
+  return skippableBlocks[branch] = std::move(skippable);
+}
+
+void DivergentControlFlow::findDivergentValues() {
+  DenseSet<Value> divergent;
+  SmallVector<Value> worklist;
+  auto add = [&](Value value) {
+    if (divergent.insert(value).second)
+      worklist.push_back(value);
+  };
+  auto addArguments = [&](Block *block) {
+    for (BlockArgument argument : block->getArguments())
+      add(argument);
+  };
+  // A device function can be called with values that differ between threads.
+  auto funcOp = cast<FunctionOpInterface>(function);
+  if (!triton::isKernel(funcOp) && !funcOp.getFunctionBody().empty())
+    addArguments(&funcOp.getFunctionBody().front());
+  // A warp vote or ballot is the same in every lane of a warp, but can differ
+  // between the warps even when its operands do not.
+  function->walk([&](Operation *op) {
+    if (isa<gpu::ThreadIdOp, gpu::LaneIdOp, triton::gpu::WarpIdOp,
+            triton::gpu::WarpVoteOp, ttng::VoteBallotSyncOp,
+            triton::ElementwiseInlineAsmOp, CallOpInterface>(op))
+      for (Value result : op->getResults())
+        add(result);
+  });
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      for (Value result : user->getResults())
+        add(result);
+      if (auto branch = dyn_cast<BranchOpInterface>(user)) {
+        bool forwarded = false;
+        for (auto [index, successor] : llvm::enumerate(user->getSuccessors())) {
+          SuccessorOperands operands = branch.getSuccessorOperands(index);
+          for (BlockArgument argument : successor->getArguments()) {
+            if (operands.getOperandIndex(argument.getArgNumber()) ==
+                use.getOperandNumber()) {
+              add(argument);
+              forwarded = true;
+            }
+          }
+        }
+        if (forwarded)
+          continue;
+        // A divergent condition decides which values reach the blocks where
+        // the paths meet again.
+        if (isLoopBranch(user)) {
+          for (Block *successor : user->getSuccessors())
+            addArguments(successor);
+          continue;
+        }
+        ArrayRef<Block *> skippable = getSkippableBlocks(user);
+        DenseSet<Block *> inside(skippable.begin(), skippable.end());
+        inside.insert(user->getBlock());
+        for (Block *block : inside)
+          for (Block *successor : block->getSuccessors())
+            if (!inside.contains(successor))
+              addArguments(successor);
+        continue;
+      }
+      // Each partition receives a capture as the matching region argument.
+      if (isa<triton::gpu::WarpSpecializePartitionsOp>(user)) {
+        for (Region &region : user->getRegions())
+          if (!region.empty())
+            add(region.getArgument(use.getOperandNumber()));
+        continue;
+      }
+      // Structured control flow forwards values to its regions and results.
+      Operation *parent = isa<RegionBranchTerminatorOpInterface>(user)
+                              ? user->getParentOp()
+                              : user;
+      if (isa<RegionBranchOpInterface>(parent)) {
+        for (Value result : parent->getResults())
+          add(result);
+        for (Region &region : parent->getRegions())
+          if (!region.empty())
+            addArguments(&region.front());
+      }
+    }
+  }
+  divergentValues = std::move(divergent);
+}
+
+bool DivergentControlFlow::mayDiverge(Value value) {
+  if (!divergentValues)
+    findDivergentValues();
+  return divergentValues->contains(value);
+}
+
+bool DivergentControlFlow::isDivergentBranch(Operation *op) {
+  Value condition;
+  if (auto ifOp = dyn_cast<scf::IfOp>(op))
+    condition = ifOp.getCondition();
+  else if (auto switchOp = dyn_cast<scf::IndexSwitchOp>(op))
+    condition = switchOp.getArg();
+  else if (auto branch = dyn_cast<cf::CondBranchOp>(op))
+    condition = branch.getCondition();
+  else if (auto switchOp = dyn_cast<cf::SwitchOp>(op))
+    condition = switchOp.getFlag();
+  else
+    return false;
+  return mayDiverge(condition) &&
+         (isa<scf::IfOp, scf::IndexSwitchOp>(op) || !isLoopBranch(op));
+}
+
+void DivergentControlFlow::walkSkippable(
+    Operation *op, function_ref<void(Operation *)> visit) {
+  if (isa<scf::IfOp, scf::IndexSwitchOp>(op)) {
+    for (Region &region : op->getRegions())
+      region.walk(visit);
+    return;
+  }
+  // The visitor may query other branches, which can grow the cache.
+  SmallVector<Block *> blocks(getSkippableBlocks(op));
+  for (Block *block : blocks)
+    for (Operation &nested : *block)
+      nested.walk(visit);
+}
+
+bool DivergentControlFlow::isUnderDivergentBranch(Operation *op) {
+  if (!divergentBlocks) {
+    DenseSet<Block *> blocks;
+    function->walk([&](Operation *branch) {
+      if (isa<cf::CondBranchOp, cf::SwitchOp>(branch) &&
+          isDivergentBranch(branch))
+        for (Block *block : getSkippableBlocks(branch))
+          blocks.insert(block);
+    });
+    divergentBlocks = std::move(blocks);
+  }
+  // Stop at the function body or at a warp-specialized region, which every
+  // thread of its warps enters.
+  for (Operation *parent = op->getParentOp(); parent;
+       op = parent, parent = op->getParentOp()) {
+    if (divergentBlocks->contains(op->getBlock()) ||
+        (isa<scf::IfOp, scf::IndexSwitchOp>(parent) &&
+         isDivergentBranch(parent)))
+      return true;
+    if (isa<FunctionOpInterface, triton::gpu::WarpSpecializeOp,
+            triton::gpu::WarpSpecializePartitionsOp>(parent))
+      return false;
+  }
+  return false;
+}
+
 bool IssuerSummary::hasSameKnownIssuer(const IssuerSummary &other) const {
   return issuer && issuer->kind != ThreadIssuer::Unknown && *this == other;
 }
@@ -911,11 +1125,6 @@ bool MembarAnalysis::mayNotifyPeer(Operation *op) {
   if (isa<triton::gpu::LocalStoreOp, triton::gpu::LocalAllocOp,
           ttng::TMEMStoreOp, ttng::TMEMAllocOp>(op))
     return false;
-  // Prints go to the host and an assert only aborts, so no peer observes
-  // either. They often run under a thread-zero branch, where a CTA barrier
-  // would deadlock.
-  if (isa<triton::PrintOp, triton::AssertOp>(op))
-    return false;
   auto effects = getEffectsRecursively(op);
   return !effects || llvm::any_of(*effects, [&](const auto &effect) {
     return isa<MemoryEffects::Write>(effect.getEffect()) &&
@@ -925,28 +1134,11 @@ bool MembarAnalysis::mayNotifyPeer(Operation *op) {
 
 bool MembarAnalysis::requiresThreadSync(const BlockInfo &pending,
                                         const BlockInfo &effects) {
-  const auto &sync = pending.threadSync;
-  const auto &demands = effects.threadDemands;
-  if (!demands.hasDemand)
-    return false;
-  // Waits, fences and arrivals only have to finish before another thread's
-  // publication, or before a notification can let a peer advance a waited
-  // phase. Private counter updates are already ordered by the slice hazards.
-  if (!sync.syncIssuers.empty() && demands.mayIssueAhead &&
-      ((!demands.publicationIssuers.empty() &&
-        !sync.syncIssuers.hasSameKnownIssuer(demands.publicationIssuers)) ||
-       (sync.peerWaitNeedsSync && demands.mayNotifyPeer)))
-    return true;
-  if (sync.effectIssuers.empty())
-    return false;
   // The maps also include implicit scratch and translated callee accesses.
   bool hasSharedAccesses =
       !effects.syncReadSlices.empty() || !effects.syncWriteSlices.empty();
-  return sync.completion == CompletionSync::All ||
-         (sync.completion == CompletionSync::Shared &&
-          (hasSharedAccesses || demands.hasDemandBeyondGlobalReads)) ||
-         (!demands.publicationIssuers.empty() &&
-          !sync.effectIssuers.hasSameKnownIssuer(demands.publicationIssuers));
+  return requiresThreadSyncFor(pending.threadSync, effects.threadDemands,
+                               hasSharedAccesses);
 }
 
 Operation *MembarAnalysis::syncIfNeeded(Operation *op, const BlockInfo &effects,
@@ -967,7 +1159,11 @@ Operation *MembarAnalysis::syncIfNeeded(Operation *op, const BlockInfo &effects,
            (filter && filter(before, after, beforeIsRead, afterIsRead,
                              allocation, beforeSlice, afterSlice));
   };
-  if (!requiresThreadSync(pending, effects) &&
+  // Every thread must observe a barrier initialization or invalidation before
+  // it next uses the barrier, even when the slice hazards cannot see that use.
+  bool barrierLifetimeHazard = !cluster && missesBarrierLifetime(op) &&
+                               hasPendingBarrierLifetime(pending);
+  if (!barrierLifetimeHazard && !requiresThreadSync(pending, effects) &&
       !pending.isIntersected(effects, canSkip, &allocation, sliceFilter))
     return nullptr;
   // The barrier clears incoming state. The operation's own effects still
@@ -1130,23 +1326,25 @@ void MembarAnalysis::addThreadDemand(BlockInfo &effects, Operation *op) {
         IssuerSummary{getThreadIssuer(op)};
 }
 
-void MembarAnalysis::update(Operation *op, MembarInfo *membarInfo,
-                            FuncMapT *funcMap, OpBuilder *builder) {
-  if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op);
-      barrier && barrier.isWarp()) {
-    membarInfo->syncWarps();
-    return;
-  }
-  // Replace any provisional decision whenever this operation is revisited.
-  scratchSyncOps.erase(op);
-  if (isa<CallOpInterface>(op)) {
-    auto forgetStageLoop = [](const AllocationSlice &slice) {
-      return slice.forgetStageLoop();
-    };
-    membarInfo->pending = membarInfo->pending.mapSlices(forgetStageLoop);
-    membarInfo->entryBlockInfo =
-        membarInfo->entryBlockInfo.mapSlices(forgetStageLoop);
-  }
+// The operation cannot take effect before every thread of its region reaches
+// it, so the threads have finished their earlier waits, fences and arrivals.
+// Unlike a barrier, this does not order memory.
+bool MembarAnalysis::waitsForWholeRegion(Operation *op) {
+  // A named barrier completes only after every thread it counts arrives. That
+  // includes the whole region only if every thread of the region executes it.
+  if (isa<ttng::NamedBarrierArriveOp, ttng::NamedBarrierWaitOp>(op))
+    return ttng::countsEveryThread(op) &&
+           !divergence.isUnderDivergentBranch(op);
+  // The lanes of a single warp leave a wait loop together because its branch
+  // is uniform, and an elected lane issues these only after every lane has
+  // executed the earlier fences and arrivals.
+  return isa<ttng::MMAv5OpInterface, ttng::TCGen5CommitOp,
+             ttng::AsyncTMACopyGlobalToLocalOp,
+             ttng::AsyncTMACopyLocalToGlobalOp>(op) &&
+         triton::gpu::maybeLookupNumWarps(op) == 1;
+}
+
+BlockInfo MembarAnalysis::getOperationEffects(Operation *op) {
   auto sync = getThreadSyncInfo(op);
   // Region control flow is visited by the dataflow engine. Its children
   // contribute their own effects; implicit scratch belongs to this op. So does
@@ -1175,6 +1373,63 @@ void MembarAnalysis::update(Operation *op, MembarInfo *membarInfo,
   }
   if (isReturn && isa<FunctionOpInterface>(op->getParentOp()))
     addThreadDemand(effects, op);
+  return effects;
+}
+
+bool MembarAnalysis::requiresSyncBeforeBranch(Operation *branch,
+                                              const BlockInfo &pending) {
+  bool pendingLifetime = hasPendingBarrierLifetime(pending);
+  if ((!hasIssuedEffects(pending.threadSync) && !pendingLifetime) ||
+      !divergence.isDivergentBranch(branch))
+    return false;
+  auto it = branchDemands.find(branch);
+  if (it == branchDemands.end()) {
+    SmallVector<GuardedDemand> demands;
+    divergence.walkSkippable(branch, [&](Operation *op) {
+      // Barriers that this analysis inserts must not change the summary.
+      if (isa<triton::gpu::BarrierOp, ttng::ClusterBarrierOp>(op))
+        return;
+      GuardedDemand demand{getOperationEffects(op).threadDemands,
+                           missesBarrierLifetime(op)};
+      if (demand.threadDemands.hasDemand || demand.missesBarrierLifetime)
+        demands.push_back(demand);
+    });
+    it = branchDemands.try_emplace(branch, std::move(demands)).first;
+  }
+  // Slice hazards of the guarded operations are not checked here.
+  return llvm::any_of(it->second, [&](const GuardedDemand &demand) {
+    return (pendingLifetime && demand.missesBarrierLifetime) ||
+           requiresThreadSyncFor(pending.threadSync, demand.threadDemands,
+                                 /*hasSharedAccesses=*/false);
+  });
+}
+
+void MembarAnalysis::update(Operation *op, MembarInfo *membarInfo,
+                            FuncMapT *funcMap, OpBuilder *builder) {
+  if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op);
+      barrier && barrier.isWarp()) {
+    membarInfo->syncWarps();
+    return;
+  }
+  // Replace any provisional decision whenever this operation is revisited.
+  scratchSyncOps.erase(op);
+  if (isa<CallOpInterface>(op)) {
+    auto forgetStageLoop = [](const AllocationSlice &slice) {
+      return slice.forgetStageLoop();
+    };
+    membarInfo->pending = membarInfo->pending.mapSlices(forgetStageLoop);
+    membarInfo->entryBlockInfo =
+        membarInfo->entryBlockInfo.mapSlices(forgetStageLoop);
+  }
+  // A divergent branch can skip what it guards in only some threads of the
+  // region, and a barrier those threads skip deadlocks. Synchronize before the
+  // branch if a guarded operation needs pending thread effects finished.
+  if (builder && requiresSyncBeforeBranch(op, membarInfo->pending)) {
+    builder->setInsertionPoint(op);
+    insertBarrier(op, builder);
+    membarInfo->sync();
+  }
+  BlockInfo effects = getOperationEffects(op);
 
   // Finish completions that block every memory demand once before a loop.
   // Shared-copy completions can still overlap independent global reads.
@@ -1279,10 +1534,9 @@ void MembarAnalysis::updateMemoryEffects(Operation *op, MembarInfo *membarInfo,
 
   // Intra-function dependencies
   // Explicit buffer
-  auto arrive = dyn_cast<triton::nvidia_gpu::ArriveBarrierOp>(op);
   // Per-thread mbarrier arrival has release semantics; thread order and the
   // wait already synchronize its SMEM ops. Cluster barriers still need effects.
-  bool isPerThreadArrive = !cluster && arrive && arrive.getPerThread();
+  bool isPerThreadArrive = !cluster && ttng::arrivesFromEveryThread(op);
   if (!isPerThreadArrive) {
     for (const auto &access : triton::getMemoryAccesses(op)) {
       Value value = access.value;
