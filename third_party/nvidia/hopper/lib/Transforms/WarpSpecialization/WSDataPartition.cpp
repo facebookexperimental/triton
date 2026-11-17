@@ -1725,32 +1725,35 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
   } else if (isa<DescriptorLoadOp, DescriptorStoreOp>(op)) {
     SmallVector<int64_t> shape;
     Value coordVal;
+    unsigned coordOperandIdx;
     if (auto loadOp = dyn_cast<DescriptorLoadOp>(op)) {
       sliceOp(loadOp.getDesc(), offset, mappings, reverseMappings,
               partitionScheme);
       coordVal = loadOp.getIndices()[dim];
+      coordOperandIdx = loadOp.getIndicesMutable()[dim].getOperandNumber();
       shape = getShape(loadOp.getResult());
     } else if (auto storeOp = dyn_cast<DescriptorStoreOp>(op)) {
       sliceOp(storeOp.getDesc(), offset, mappings, reverseMappings,
               partitionScheme);
       coordVal = storeOp.getIndices()[dim];
+      coordOperandIdx = storeOp.getIndicesMutable()[dim].getOperandNumber();
       shape = getShape(storeOp.getSrc());
-    }
-    auto newCoordVal = coordVal;
-    if (offset) {
-      if (auto *defOp = coordVal.getDefiningOp())
-        builder.setInsertionPointAfter(defOp);
-      else
-        builder.setInsertionPoint(op);
-      Value offsetVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-          op->getLoc(), offset * shape[dim] / numOfPartitions, 32);
-      newCoordVal = builder.createWithAsyncTaskIds<arith::AddIOp>(
-          op->getLoc(), coordVal, offsetVal);
-      mappings.map(coordVal, newCoordVal);
-      reverseMappings.map(newCoordVal, coordVal);
     }
 
     newOp = cloneAndSetResultType(op);
+    if (offset) {
+      // Shift only this op's operand: mapping coordVal would leak the offset
+      // into later clones that use the same scalar and into a shared index.
+      if (auto *defOp = coordVal.getDefiningOp())
+        builder.setInsertionPointAfter(defOp);
+      else
+        builder.setInsertionPoint(newOp);
+      Value offsetVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+          op->getLoc(), offset * shape[dim] / numOfPartitions, 32);
+      Value newCoordVal = builder.createWithAsyncTaskIds<arith::AddIOp>(
+          op->getLoc(), coordVal, offsetVal);
+      newOp->setOperand(coordOperandIdx, newCoordVal);
+    }
     if (isa<DescriptorLoadOp>(op)) {
       // map load result
       auto v = op->getResult(0);
