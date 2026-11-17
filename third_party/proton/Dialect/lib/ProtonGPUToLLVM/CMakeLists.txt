@@ -10,6 +10,7 @@ add_triton_library(ProtonGPUToLLVM
     ProtonIR
     ProtonGPUIR
     ProtonAnalysis
+    TritonAnalysis
 )
 
 add_subdirectory(ProtonNvidiaGPUToLLVM)

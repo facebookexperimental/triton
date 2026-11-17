@@ -45,6 +45,28 @@ static void printOffsets(mlir::OpAsmPrinter &p, mlir::Operation *op,
 
 namespace mlir::triton::gpu {
 
+void InlineAsmOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  if (getPure())
+    return;
+  effects.emplace_back(MemoryEffects::Read::get());
+  effects.emplace_back(MemoryEffects::Write::get());
+}
+
+Speculation::Speculatability InlineAsmOp::getSpeculatability() {
+  return getPure() ? Speculation::Speculatable : Speculation::NotSpeculatable;
+}
+
+LogicalResult InlineAsmOp::verify() {
+  for (Type type : llvm::concat<Type>(getOperandTypes(), getResultTypes())) {
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    if (tensor &&
+        !isa_and_present<DistributedEncodingTrait>(tensor.getEncoding()))
+      return emitOpError("requires explicit distributed tensor layouts");
+  }
+  return verifyInlineAsmOperands(*this, getPure());
+}
+
 namespace {
 
 template <typename T> bool hasEncoding(Value value) {
@@ -396,9 +418,10 @@ struct CanonicalizeConvertFromConvert
       // We insert at the point of the original op as there could be ops with
       // memory side-effects between the LocalLoad op and the ConvertLayout op.
       rewriter.setInsertionPoint(arg);
-      auto replacement = rewriter.replaceOpWithNewOp<LocalLoadOp>(
-          op, op->getResult(0).getType(), sharedLoad.getSrc(),
-          sharedLoad.getToken());
+      auto replacement = LocalLoadOp::create(
+          rewriter, sharedLoad.getLoc(), op->getResult(0).getType(),
+          sharedLoad.getSrc(), sharedLoad.getToken());
+      rewriter.replaceOp(op, replacement);
       // Preserve backend optimization metadata such as
       // ttg.amdg.syncedViaAsyncWait. Dropping it here makes the replacement
       // load conservatively wait for unrelated async LDS writes.
@@ -460,6 +483,13 @@ LogicalResult ConvertLayoutOp::verify() {
   if (!getForceWarpShuffle())
     return success();
 
+  if (auto plan = getMixedRadixConversionPlan(getSrc().getType(), getType())) {
+    if (plan->transfer == MixedRadixConversionTransfer::Shared)
+      return emitOpError(
+          "NPOT mixed-radix conversion through shared memory is not "
+          "yet supported with force_warp_shuffle");
+    return success();
+  }
   auto conversion = minimalCvtLayout(getSrc().getType(), getType());
   auto dims = conversion.getInDimNames();
   auto warp = StringAttr::get(getContext(), "warp");
@@ -629,6 +659,9 @@ MemDescTransOp::inferReturnTypes(MLIRContext *context,
 LogicalResult MemDescReshapeOp::verify() {
   MemDescType dstType = getResult().getType();
   MemDescType srcType = getSrc().getType();
+  if (NVMMASharedEncodingAttr::isPackedFp6(srcType.getEncoding()) ||
+      NVMMASharedEncodingAttr::isPackedFp6(dstType.getEncoding()))
+    return emitOpError("cannot reshape an opaque packed FP6 tile");
   if (product(dstType.getShape()) != product(srcType.getShape())) {
     return emitError(
         "number of src and dst elements of reshape must be the same");
@@ -739,6 +772,8 @@ static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
                                                    Attribute srcEnc,
                                                    ArrayRef<int64_t> dstShape,
                                                    Attribute &dstEnc) {
+  if (NVMMASharedEncodingAttr::isPackedFp6(srcEnc))
+    return failure();
   auto *ctx = srcEnc.getContext();
   // TODO Delete this once SharedLinearEncodingAttr is more widely supported.
   if (auto mmaEncoding = dyn_cast<NVMMASharedEncodingAttr>(srcEnc)) {
@@ -755,7 +790,7 @@ static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
         auto candidateEncoding = NVMMASharedEncodingAttr::get(
             ctx, mmaEncoding.getSwizzlingByteWidth(),
             mmaEncoding.getTransposed(), mmaEncoding.getElementBitWidth(),
-            mmaEncoding.getFp4Padded(), CGALayout);
+            mmaEncoding.getPadding(), CGALayout);
         auto srcLL = toLinearLayout(srcShape, srcEnc);
         auto dstLL = toLinearLayout(dstShape, candidateEncoding);
         if (reshapeLayout(ctx, srcLL, dstShape) == dstLL) {
@@ -800,6 +835,10 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
 
   Attribute dstEncoding;
   if (Attribute srcEnc = srcTy.getEncoding()) {
+    if (!llvm::equal(getNpotPow2AllocShape(srcTy.getShape()),
+                     srcTy.getShape()) ||
+        !llvm::equal(getNpotPow2AllocShape(dstShape), dstShape))
+      return emitOptionalError(loc, "NPOT reshape is not yet supported");
     if (failed(inferMemDescReshapeOpEncoding(srcTy.getShape(), srcEnc, dstShape,
                                              dstEncoding)))
       return emitOptionalError(loc, "cannot infer the encoding of a reshaped ",
@@ -818,6 +857,8 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
 }
 
 LogicalResult MemDescReinterpretOp::verify() {
+  if (failed(verifyNpotPow2AllocViewOperands(*this)))
+    return failure();
   auto srcTy = getSrc().getType();
   auto dstTy = getType();
 
@@ -944,6 +985,12 @@ LogicalResult MemDescReinterpretOp::verify() {
   if (!srcIsLayoutSubview)
     return success();
 
+  // The byte footprint below is exact only for complete FP6 packing atoms.
+  if (NVMMASharedEncodingAttr::isPackedFp6(srcEnc) &&
+      srcTy.getDimSize(getOrder(srcTy).front()) % 16 != 0)
+    return emitOpError("cannot reinterpret an FP6 subview that splits a "
+                       "16-value packing atom");
+
   // Remember that we disallow dstTy that's a subview.
   // A destination without a subview owns its entire physical allocation, even
   // when its layout has zero bases. Compare its physical footprint against the
@@ -1060,7 +1107,7 @@ LogicalResult verifyMemoryOpTypes(Operation *op, ShapedType srcTy,
 }
 
 LogicalResult verifyAllocOp(Operation *op, Value src, MemDescType dstTy) {
-  if (dstTy.getShape() != dstTy.getAllocShape())
+  if (dstTy.getShape() != dstTy.getAllocShape() && !isNpotPow2AllocView(dstTy))
     return op->emitOpError("result shape and its alloc shape must match");
 
   if (!src) {
@@ -1090,6 +1137,15 @@ static LogicalResult verifySharedMemoryRank(Operation *op,
 }
 
 LogicalResult LocalAllocOp::verify() {
+  if (getSrc() &&
+      NVMMASharedEncodingAttr::isPackedFp6(getType().getEncoding())) {
+    auto load = getSrc().getDefiningOp<triton::DescriptorLoadOp>();
+    // Descriptor loads consumed only by this allocation lower directly to TMA.
+    if (!load || !getSrc().hasOneUse() ||
+        load.getDesc().getType().getSharedLayout() != getType().getEncoding())
+      return emitOpError(
+          "FP6 MMA tiles cannot be accessed as register byte lanes");
+  }
   if (!isa<SharedMemorySpaceAttr>(getType().getMemorySpace()))
     return emitOpError("should create a buffer of shared memory");
   if (getSrc() && failed(verifySharedMemoryRank(*this, getSrc().getType(),
@@ -1100,6 +1156,9 @@ LogicalResult LocalAllocOp::verify() {
 
 // LocalStoreOp
 LogicalResult LocalStoreOp::verify() {
+  if (NVMMASharedEncodingAttr::isPackedFp6(getDst().getType().getEncoding()))
+    return emitOpError(
+        "FP6 MMA tiles cannot be accessed as register byte lanes");
   if (!getDst().getType().getMutableMemory())
     return emitOpError("Cannot store into immutable memory");
   if (failed(verifySharedMemoryRank(*this, getSrc().getType(),
@@ -1190,16 +1249,47 @@ LogicalResult AsyncRemoteShmemStoreOp::verify() {
   return success();
 }
 
+// Mixed-radix lowerings address runs through the buffer's pow2 alloc layout, so
+// it must have no padding or partitions. A local_load XORs in a view's origin,
+// which adds only on pow2 subslice extents; an async copy runs from the base.
+static std::optional<std::string>
+getMixedRadixBufferUnsupportedReason(MemDescType type, bool pow2Views) {
+  Attribute enc = type.getEncoding();
+  auto shape = dropPipeliningDim(type.getShape(), enc);
+  auto allocShape = dropPipeliningDim(type.getAllocShape(), enc);
+  if (isa<PaddedSharedEncodingAttr, PartitionedSharedEncodingAttr>(enc) ||
+      (shape != allocShape && !pow2Views))
+    return std::string("NPOT mixed-radix access to a padded, partitioned or "
+                       "partial buffer is not yet supported");
+  for (auto [size, allocSize] : llvm::zip_equal(shape, allocShape))
+    if (size != allocSize && !llvm::isPowerOf2_64(size))
+      return std::string(
+          "NPOT mixed-radix access to a view with an NPOT subslice "
+          "extent is not yet supported");
+  return std::nullopt;
+}
+
 // LocalLoadOp
 LogicalResult LocalLoadOp::verify() {
+  if (NVMMASharedEncodingAttr::isPackedFp6(getSrc().getType().getEncoding()))
+    return emitOpError(
+        "FP6 MMA tiles cannot be accessed as register byte lanes");
   if (failed(verifySharedMemoryRank(*this, getType(), getSrc().getType(),
                                     "result")))
     return failure();
+  if (hasExactNpotLayout(getType()))
+    if (std::optional<std::string> reason =
+            getMixedRadixBufferUnsupportedReason(getSrc().getType(),
+                                                 /*pow2Views=*/true))
+      return emitError(*reason);
   return verifyMemoryOpTypes(*this, getSrc().getType(), getType());
 }
 
 // LocalGatherOp
 LogicalResult LocalGatherOp::verify() {
+  if (NVMMASharedEncodingAttr::isPackedFp6(getSrc().getType().getEncoding()))
+    return emitOpError(
+        "FP6 MMA tiles cannot be accessed as register byte lanes");
   auto srcTy = getSrc().getType();
   auto indicesTy = cast<RankedTensorType>(getIndices().getType());
   auto dstTy = cast<RankedTensorType>(getType());
@@ -1392,6 +1482,11 @@ LogicalResult AsyncCopyGlobalToLocalOp::verify() {
       return emitOpError("non-bulk mode requires src to be a ranked tensor of "
                          "pointers");
   }
+  if (succeeded(getExactNpotOperandLayout(*this)))
+    if (std::optional<std::string> reason =
+            getMixedRadixBufferUnsupportedReason(getResult().getType(),
+                                                 /*pow2Views=*/false))
+      return emitError(*reason);
   return success();
 }
 
@@ -1433,8 +1528,10 @@ LogicalResult MemDescIndexOp::verify() {
     return emitError("result shape must equal to srcShape[1:]");
   }
 
-  if (dropPipeliningDim(srcTy.getAllocShape(), srcTy.getEncoding()) !=
-      layoutShape) {
+  auto layoutAllocShape =
+      dropPipeliningDim(srcTy.getAllocShape(), srcTy.getEncoding());
+  bool hasPow2AllocView = isNpotPow2AllocView(srcTy);
+  if (layoutAllocShape != layoutShape && !hasPow2AllocView) {
     return emitError(
         "We only support memdesc_index of a multibuffer-prefix subview");
   }
@@ -1449,7 +1546,8 @@ LogicalResult MemDescIndexOp::verify() {
     return emitError("src and dst must have the same type of encoding");
   }
 
-  if (dstTy.getAllocShape() != dstTy.getShape()) {
+  if (dstTy.getAllocShape() !=
+      (hasPow2AllocView ? layoutAllocShape : dstTy.getShape())) {
     return emitError("alloc shape must match shape for the result");
   }
 
@@ -1515,6 +1613,12 @@ LogicalResult MemDescSubsliceOp::verify() {
   }
   auto layoutRank = dropPipeliningDim(getOffsets(), srcEnc).size();
   auto prefixRank = getOffsets().size() - layoutRank;
+  if (NVMMASharedEncodingAttr::isPackedFp6(srcEnc)) {
+    unsigned inner = getOrder(srcTy).front();
+    if (getOffsets()[inner] % 16 || dstTy.getDimSize(inner) % 16)
+      return emitOpError(
+          "FP6 subviews must preserve complete 16-value packing atoms");
+  }
 
   SetVector<int> splitDims{};
   for (int i = 0; i < srcTy.getRank(); i++) {
@@ -1604,11 +1708,6 @@ LogicalResult MemDescDynamicSubsliceOp::verify() {
   Attribute srcEnc = srcTy.getEncoding();
   if (!isa<SharedEncodingTrait>(srcEnc))
     return emitError("source and result must use a shared-memory encoding");
-  Attribute concreteSrcEnc = triton::unwrapTlxWrappers(srcEnc);
-  if (isa<PartitionedSharedEncodingAttr>(concreteSrcEnc))
-    return emitError(
-        "dynamic subslices do not support partitioned shared encodings");
-
   bool slicesAnyDimension = false;
   for (int dim = 0; dim < srcTy.getRank(); ++dim) {
     int64_t srcSize = srcTy.getDimSize(dim);
@@ -2165,6 +2264,8 @@ LogicalResult WarpVoteOp::verify() {
 //===----------------------------------------------------------------------===//
 
 void BarrierOp::print(OpAsmPrinter &p) {
+  if (isWarp())
+    p << " warp";
   // print "all" instead of  "local|global_read|global_write|tensor|all"
   if (getAddrSpace() == AddrSpace::All) {
     p << " all";
@@ -2174,6 +2275,9 @@ void BarrierOp::print(OpAsmPrinter &p) {
 }
 
 ParseResult BarrierOp::parse(OpAsmParser &parser, OperationState &result) {
+  auto scope = succeeded(parser.parseOptionalKeyword("warp"))
+                   ? BarrierScope::Warp
+                   : BarrierScope::CTA;
   auto parseAddrSpace = [&]() -> FailureOr<AddrSpace> {
     std::string keyword;
     if (parser.parseKeywordOrString(&keyword))
@@ -2203,7 +2307,15 @@ ParseResult BarrierOp::parse(OpAsmParser &parser, OperationState &result) {
 
   result.addAttribute("addrSpace",
                       AddrSpaceAttr::get(parser.getContext(), addrSpaceRet));
+  result.addAttribute("scope",
+                      BarrierScopeAttr::get(parser.getContext(), scope));
 
+  return success();
+}
+
+LogicalResult BarrierOp::verify() {
+  if (isWarp() && getAddrSpace() != AddrSpace::Local)
+    return emitOpError("warp scope supports only the local address space");
   return success();
 }
 

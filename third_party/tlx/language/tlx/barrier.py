@@ -49,6 +49,32 @@ def cluster_barrier(_semantic=None):
 
 
 @tl.builtin
+def amd_cluster_arrive(_semantic=None):
+    """Signal the AMD cluster barrier without waiting.
+
+    This does not synchronize the workgroup or fence its memory accesses.
+    Pair each arrival with :func:`amd_cluster_wait` before another arrival.
+    All threads and all CTAs in the cluster must execute the same sequence.
+    Independent computation can execute between arrival and wait.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_cluster_arrive is only supported on AMD (HIP) backends")
+    _semantic.builder.create_amd_cluster_arrive()
+
+
+@tl.builtin
+def amd_cluster_wait(_semantic=None):
+    """Wait for the preceding :func:`amd_cluster_arrive` on AMD.
+
+    This does not replace workgroup synchronization or memory completion
+    waits. Use :func:`cluster_barrier` for a full cluster synchronization.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_cluster_wait is only supported on AMD (HIP) backends")
+    _semantic.builder.create_amd_cluster_wait()
+
+
+@tl.builtin
 def cond_barrier(pred: tl.tensor, _semantic=None):
     """
     Conditionally execute a workgroup barrier (AMD only).
@@ -302,8 +328,19 @@ def named_barrier_wait(
         arrive_count (int): Total number of threads required to flip the
             barrier phase, including threads executing both `named_barrier_wait`
             and `named_barrier_arrive`. Both calls must use the same count.
+
+    On AMD, only gfx1250 and only the workgroup barrier are supported:
+    ``bar`` must be 0 and ``arrive_count`` must cover every thread of the
+    workgroup. An arrive followed by a wait forms a split workgroup barrier:
+    shared-memory accesses before the arrive are visible after the wait, and
+    independent work between them overlaps the rendezvous. The pair must be in
+    the same block with no shared-memory access or other barrier between them.
     """
 
+    if _semantic.builder.options.backend_name == "hip":
+        _validate_amd_workgroup_barrier(bar, arrive_count, _semantic)
+        _semantic.builder.create_amd_workgroup_barrier_wait()
+        return
     _validate_named_barrier_id(bar)
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
     arrive_count_handle = _semantic._convert_elem_to_ir_value(arrive_count, require_i64=False)
@@ -328,11 +365,40 @@ def named_barrier_arrive(
         arrive_count (int): Total number of threads required to flip the
             barrier phase, including threads executing both `named_barrier_wait`
             and `named_barrier_arrive`. Both calls must use the same count.
+
+    On AMD, only gfx1250 and only the workgroup barrier are supported:
+    ``bar`` must be 0 and ``arrive_count`` must cover every thread of the
+    workgroup. An arrive followed by a wait forms a split workgroup barrier:
+    shared-memory accesses before the arrive are visible after the wait, and
+    independent work between them overlaps the rendezvous. The pair must be in
+    the same block with no shared-memory access or other barrier between them.
     """
+    if _semantic.builder.options.backend_name == "hip":
+        _validate_amd_workgroup_barrier(bar, arrive_count, _semantic)
+        _semantic.builder.create_amd_workgroup_barrier_signal()
+        return
     _validate_named_barrier_id(bar)
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
     arrive_count_handle = _semantic._convert_elem_to_ir_value(arrive_count, require_i64=False)
     _semantic.builder.create_named_barrier_arrive(bar_handle, arrive_count_handle)
+
+
+def _validate_amd_workgroup_barrier(bar, arrive_count, _semantic) -> None:
+    barrier_id = tl._unwrap_if_constexpr(bar)
+    count = tl._unwrap_if_constexpr(arrive_count)
+    options = _semantic.builder.options
+    # Older AMD targets have no s_barrier_signal / s_barrier_wait. The arch
+    # string can carry target features (e.g. "gfx1250:sramecc+:xnack-"), so
+    # compare only the processor name before the first ":".
+    arch = options.arch.split(":", 1)[0]
+    if arch != "gfx1250":
+        raise ValueError(f"tlx.named_barrier_arrive / named_barrier_wait require gfx1250 on AMD, got {arch}; "
+                         "use tlx.workgroup_barrier() for a full workgroup barrier")
+    num_threads = options.num_warps * options.warp_size
+    if not isinstance(barrier_id, int) or barrier_id != 0:
+        raise ValueError("AMD named barriers only support the workgroup barrier (ID 0)")
+    if not isinstance(count, int) or count != num_threads:
+        raise ValueError(f"AMD workgroup barrier arrive_count must be the workgroup size ({num_threads})")
 
 
 def _validate_named_barrier_id(bar) -> None:
@@ -361,6 +427,30 @@ def amd_sched_barrier(mask: tl.constexpr = 0, _semantic=None):
     assert isinstance(mask, int), f"mask must be a constexpr integer, got {type(mask).__name__}"
     assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
     _semantic.builder.create_amd_sched_barrier(mask)
+
+
+@tl.builtin
+def amd_sched_group_barrier(mask: tl.constexpr, size: tl.constexpr, sync_id: tl.constexpr = 0, _semantic=None):
+    """Constrain the relative order of AMD instruction groups.
+
+    Markers with the same ``sync_id`` describe a sequence of groups. Each
+    group contains up to ``size`` instructions matching the LLVM AMDGPU
+    scheduling-class ``mask``; for example, 0x8 selects MFMA/WMMA and 0x100
+    selects LDS reads. Data dependencies still take precedence.
+
+    This emits ``llvm.amdgcn.sched.group.barrier`` and adds no runtime fence
+    or synchronization between waves. Do not combine it with ``amd_iglp_opt``
+    in the same scheduling region.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_sched_group_barrier is only supported on AMD (HIP) backends")
+    mask, size, sync_id = (tl._unwrap_if_constexpr(value) for value in (mask, size, sync_id))
+    for name, value in (("mask", mask), ("size", size), ("sync_id", sync_id)):
+        assert isinstance(value, int) and not isinstance(value, bool), f"{name} must be a constexpr integer"
+    assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
+    assert 0 <= size < 1 << 31, "size must be a non-negative signed 32-bit integer"
+    assert 0 <= sync_id < 1 << 31, "sync_id must be a non-negative signed 32-bit integer"
+    _semantic.builder.create_amd_sched_group_barrier(mask, size, sync_id)
 
 
 @tl.builtin

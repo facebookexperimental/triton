@@ -41,8 +41,9 @@
 // CHECK-DAG: tlx.local_trans(
 // CHECK-DAG: tlx.subslice(
 
-// Verify warp specialization uses Python-like async_tasks syntax
-// CHECK-DAG: with tlx.async_tasks():
+// Verify warp specialization uses Python-like async_tasks syntax. The kernel's
+// only warp_specialize came from AutoWS, so it keeps direct warp-ID dispatch.
+// CHECK-DAG: with tlx.async_tasks(exclusive=True):
 // CHECK-DAG: with tlx.async_task("default"):
 // CHECK-DAG: with tlx.async_task(num_warps=
 
@@ -1080,6 +1081,15 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
   // CHECK: tlx.async_descriptor_store_wait(1)
   tt.func public @planned_store_wait(%tok: !ttg.async.token) {
     ttng.async_tma_store_token_wait %tok {planned_pending_count = 1 : i32} : !ttg.async.token
+    tt.return
+  }
+
+  // CHECK: def read_only_store_wait(
+  // CHECK: tlx.async_descriptor_store_wait(0)
+  // CHECK: tlx.async_descriptor_store_wait(1, read_only=True)
+  tt.func public @read_only_store_wait() {
+    ttng.async_tma_store_wait {pendings = 0 : i32}
+    ttng.async_tma_store_wait {pendings = 1 : i32, read_only}
     tt.return
   }
 

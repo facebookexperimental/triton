@@ -61,11 +61,19 @@ GEO = tuple(
             for key, default in zip(NormShape._fields, (0, 0, 'plain', 'layer', 'fwd', 'default', 1, False))
         })
     for c in _geo_cases())
+# gfx950: the 4096-wide pre-expert RMSNorm of an MoE layer with an 8192 residual stream, decode then prefill.
 FOCUS_SUITES = (FocusSuite(name='sm100_1', op='norm_fwd', shapes=GEO),
                 FocusSuite(name='sm90_1', op='norm_fwd',
-                           shapes=tuple(s for s in GEO if s.family in ('plain', 'softmax'))))
-FOCUS = FocusRegistry('norm_fwd', FOCUS_SUITES, {'sm100': ('sm100_1', ), 'sm90': ('sm90_1', )})
-CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *GEO)))
+                           shapes=tuple(s for s in GEO if s.family in ('plain', 'softmax'))),
+                FocusSuite(name='gfx950_1', op='norm_fwd',
+                           shapes=tuple(NormShape(m, 4096, norm='rms') for m in (1, 4, 8, 9, 12, 16, 18))),
+                FocusSuite(
+                    name='gfx950_2', op='norm_fwd', shapes=tuple(
+                        NormShape(m, 4096, norm='rms') for m in (27, 64, 151, 512, 1024, 2048, 4096, 8192, 16384))),
+                FocusSuite(name='gfx950_all', op='norm_fwd', includes=('gfx950_1', 'gfx950_2')))
+FOCUS = FocusRegistry('norm_fwd', FOCUS_SUITES,
+                      {'sm100': ('sm100_1', ), 'sm90': ('sm90_1', ), 'gfx950': ('gfx950_all', )})
+CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 
 
 def label(shape):

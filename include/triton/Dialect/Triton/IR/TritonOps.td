@@ -165,6 +165,27 @@ def TT_PreciseDivFOp
   let assemblyFormat = "$x `,` $y attr-dict `:` type($x)";
 }
 
+def TT_ApproxDivFOp
+    : TT_Op<"approx_divf", [Elementwise, SameOperandsAndResultType, Pure]> {
+  let summary = "Approximate division for 32-bit floating point types";
+
+  let description = [{
+        Divides x by y with approximate accuracy. On NVIDIA, this lowers to
+        div.approx.f32, with a maximum error of 2 ULP for denominators whose
+        magnitude is in [2^-126, 2^126]. Results outside this range may differ
+        from full-range division. On AMD, this lowers to llvm.amdgcn.fdiv.fast,
+        with a maximum error of 2.5 ULP and no support for denormal inputs or
+        results.
+    }];
+
+  let arguments = (ins AnyTypeOf<[F32, RankedTensorOf<[F32]>]>:$x,
+      AnyTypeOf<[F32, RankedTensorOf<[F32]>]>:$y);
+
+  let results = (outs AnyTypeOf<[F32, RankedTensorOf<[F32]>]>:$result);
+
+  let assemblyFormat = "$x `,` $y attr-dict `:` type($x)";
+}
+
 def TT_MulhiUIOp
     : TT_Op<"mulhiui", [Elementwise, SameOperandsAndResultType, Pure]> {
   let summary = "Most significant N bits of the 2N-bit product of two integers";
@@ -204,6 +225,7 @@ def TT_LoadOp
     : TT_Op<"load",
             [SameLoadStoreOperandsAndResultShape,
              SameLoadStoreOperandsAndResultEncoding, AttrSizedOperandSegments,
+             MixedRadixLayoutTrait,
              DeclareOpInterfaceMethods<PredicatedOpInterface>,
              DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
              DeclareOpInterfaceMethods<InferTypeOpInterface>,
@@ -251,6 +273,7 @@ def TT_LoadOp
 def TT_StoreOp
     : TT_Op<
           "store", [SameLoadStoreOperandsShape, SameLoadStoreOperandsEncoding,
+                    MixedRadixLayoutTrait,
                     DeclareOpInterfaceMethods<PredicatedOpInterface>,
                     TypesMatchWith<"value type matches ptr type", "ptr",
                                    "value", "getPointeeType($_self)">,
@@ -362,6 +385,7 @@ def TT_AtomicStoreOp : TT_Op<"atomic_store", [
     }];
 
     let hasVerifier = 1;
+    let hasCanonicalizeMethod = 1;
 }
 
 def TT_AtomicPollOp : TT_Op<"atomic_poll", [
@@ -406,6 +430,8 @@ def TT_AtomicRMWOp
             [AtomicOpInterface, SameOperandsAndResultShape,
              SameOperandsAndResultEncoding,
              DeclareOpInterfaceMethods<PredicatedOpInterface>,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>,
              TypesMatchWith<"ptr type matches value type", "val", "ptr",
                             "getPointerTypeSameShape($_self)">,
              TypesMatchWith<
@@ -439,6 +465,8 @@ def TT_AtomicCASOp
     : TT_Op<"atomic_cas",
             [AtomicOpInterface, SameOperandsAndResultShape,
              SameOperandsAndResultEncoding,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>,
              TypesMatchWith<"ptr type matches cmp type", "cmp", "ptr",
                             "getPointerTypeSameShape($_self)">,
              TypesMatchWith<"ptr type matches value type", "val", "ptr",
@@ -475,7 +503,8 @@ def TT_AtomicCASOp
 // Shape Manipulation Ops
 //
 def TT_SplatOp : TT_Op<"splat", [Pure, SameOperandsAndResultElementType,
-                                 SameOperandsAndResultEncoding]> {
+                                 SameOperandsAndResultEncoding,
+                                 MixedRadixLayoutTrait]> {
   let summary = "splat";
 
   let arguments = (ins TT_Type:$src);
@@ -501,7 +530,8 @@ def TT_UnsplatOp
 def TT_ExpandDimsOp
     : TT_Op<"expand_dims", [Pure,
                             DeclareOpInterfaceMethods<InferTypeOpInterface>,
-                            SameOperandsAndResultElementType]> {
+                            SameOperandsAndResultElementType,
+                            MixedRadixLayoutTrait]> {
   let summary = "expand_dims";
 
   let arguments = (ins TT_Tensor:$src, I32Attr:$axis);
@@ -514,7 +544,9 @@ def TT_ExpandDimsOp
   let hasFolder = 1;
 }
 
-def TT_ReshapeOp : TT_Op<"reshape", [Pure, SameOperandsAndResultElementType]> {
+def TT_ReshapeOp : TT_Op<"reshape", [Pure, SameOperandsAndResultElementType,
+                                     MixedRadixLayoutTrait,
+                                     EfficientLayoutOpInterface]> {
   let summary = "reinterpret a tensor to a different shape. It may change "
                 "elements order if the attribute is set.";
   let description = [{
@@ -544,13 +576,16 @@ def TT_ReshapeOp : TT_Op<"reshape", [Pure, SameOperandsAndResultElementType]> {
 }
 
 def TT_BroadcastOp : TT_Op<"broadcast", [Pure, SameOperandsAndResultElementType,
-                                         SameOperandsAndResultEncoding]> {
+                                         MixedRadixLayoutTrait]> {
   let summary = "broadcast a tensor";
 
   let description = [{
       For a given tensor, broadcast changes one or more dimensions with size 1
       to a new size, e.g. tensor<1x32x1xf32> -> tensor<2x32x4xf32>.  You cannot
       change the size of a non-1 dimension.
+      After projecting the result layout onto the source shape, the layouts
+      must match up to repeated registers. Broadcasting cannot permute registers
+      or move data between threads.
     }];
 
   let arguments = (ins TT_Tensor:$src);
@@ -583,9 +618,12 @@ def TT_JoinOp : TT_Op<"join", [Pure, SameTypeOperands]> {
   let hasFolder = 1;
 }
 
-def TT_SplitOp : TT_Op<"split", [Pure, InferTypeOpAdaptorWithIsCompatible,
-                                 TypesMatchWith<"outLHS and outRHS types match",
-                                                "outLHS", "outRHS", "$_self">,
+def TT_SplitOp : TT_Op<"split", [
+  Pure,
+  SameResultsType,
+  InferTypeOpAdaptorWithIsCompatible,
+  TypesMatchWith<"outLHS and outRHS types match",
+                  "outLHS", "outRHS", "$_self">,
 ]> {
   let summary = "splits a tensor into two, along its last dimension";
   let description = [{
@@ -604,7 +642,8 @@ def TT_SplitOp : TT_Op<"split", [Pure, InferTypeOpAdaptorWithIsCompatible,
 
 def TT_TransOp : TT_Op<"trans", [Pure, TransposeOpInterface,
                                  InferTensorTypeOpWithLayoutEquivalence,
-                                 SameOperandsAndResultElementType]> {
+                                 SameOperandsAndResultElementType,
+                                 MixedRadixLayoutTrait]> {
 
   let summary = "rearrange the dimensions of a tensor";
   let description = [{
@@ -689,6 +728,7 @@ def TT_GetNumProgramsOp : TT_Op<"get_num_programs", [Pure]> {
 def TT_DotOp
     : TT_Op<"dot", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>,
                     DeclareOpInterfaceMethods<DotOpInterface>,
+                    MixedRadixLayoutTrait,
                     TypesMatchWith<"result's type matches accumulator's type",
                                    "d", "c", "$_self">]> {
   let summary = "dot";
@@ -728,6 +768,7 @@ def TT_DotScaledOp
             [Pure, AttrSizedOperandSegments,
              DeclareOpInterfaceMethods<DotOpInterface, ["verifyDims",
                                                         "verifyOutputDims"]>,
+             MixedRadixLayoutTrait,
              TypesMatchWith<"result's type matches accumulator's type", "d",
                             "c", "$_self">]> {
   let summary = "dot_scaled";
@@ -781,7 +822,9 @@ def TT_DotScaledOp
 def TT_ReduceOp
     : TT_Op<"reduce", [Pure, SameOperandsShape, SameOperandsEncoding,
                        SingleBlock,
-                       DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+                       DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                       DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                           ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "Reduction using generic combination algorithm";
   let arguments = (ins Variadic<TT_Tensor>:$srcs, I32Attr:$axis,
       OptionalAttr<StrAttr>:$reduction_ordering);
@@ -801,6 +844,11 @@ def TT_ReduceOp
       // indicating that the reduction has a defined ordering that must be
       // preserved by compiler passes.
       bool hasDefinedOrdering();
+
+      // Proves that exchanging the two input tuples preserves every result,
+      // comparing pure expression DAGs modulo commutative operand order.
+      // Returns false when the proof fails or the region is unsupported.
+      bool isCommutative();
     }];
 }
 
@@ -817,7 +865,9 @@ def TT_ReduceReturnOp : TT_Op<"reduce.return", [HasParent<"ReduceOp">, Pure,
 def TT_ScanOp
     : TT_Op<"scan", [Pure, SameOperandsAndResultEncoding,
                      SameOperandsAndResultShape, SingleBlock,
-                     DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+                     DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                     DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                         ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "Associative scan using generic combination algorithm";
   let arguments = (ins Variadic<TT_Tensor>:$srcs, I32Attr:$axis,
       BoolAttr:$reverse, OptionalAttr<StrAttr>:$reduction_ordering);
@@ -832,6 +882,11 @@ def TT_ScanOp
   let extraClassDeclaration = [{
       llvm::SmallVector<RankedTensorType> getInputTypes();
       llvm::SmallVector<Type> getElementTypes();
+      // Per dim, the extent a thread's contiguous registers, then its lanes and
+      // warps cover when they step through it as a blocked layout's do, else
+      // std::nullopt.
+      static std::optional<llvm::SmallVector<unsigned>>
+      getBlockedTile(const ::mlir::triton::LinearLayout &layout);
     }];
 }
 
@@ -897,7 +952,7 @@ def TT_ExternElementwiseOp
 //
 // Make Range Op
 //
-def TT_MakeRangeOp : TT_Op<"make_range", [Pure]> {
+def TT_MakeRangeOp : TT_Op<"make_range", [Pure, MixedRadixLayoutTrait]> {
   let summary = "make range";
 
   let description = [{
@@ -939,7 +994,7 @@ def TT_ElementwiseInlineAsmOp
 
   let arguments = (ins StrAttr:$asm_string, StrAttr:$constraints,
       BoolAttr:$pure, I32Attr:$packed_element,
-      Variadic<AnyTypeOf<[TT_Type]>>:$args);
+      Variadic<AnyType>:$args);
   let results = (outs Variadic<TT_Type>:$result);
 
   let assemblyFormat = [{
@@ -957,7 +1012,8 @@ def TT_HistogramOp
                           TypesMatchWith<"mask type matches src type", "src",
                                          "mask", "getI1SameShape($_self)",
                                          "($_op.getOperands().size() <= 1) || "
-                                         "std::equal_to<>()">]> {
+                                         "std::equal_to<>()">,
+                          MixedRadixLayoutTrait]> {
   let summary = "return a histogram of the inputs.";
   let description = [{
     Return the histogram of the input tensor. The number of bins is equal to
@@ -978,7 +1034,8 @@ def TT_HistogramOp
 // Gather Op
 //
 def TT_GatherOp
-    : TT_Op<"gather", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+    : TT_Op<"gather", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                       MixedRadixLayoutTrait, EfficientLayoutOpInterface]> {
   let summary = "local gather operation";
   let description = [{
     Gather elements from the input tensor using the indices tensor along a
@@ -1009,7 +1066,8 @@ def TT_GatherOp
 // Print Op
 //
 def TT_PrintOp : TT_Op<"print", [SameVariadicOperandSize,
-                                 MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+                                 MemoryEffects<[MemWrite<GlobalMemory>]>,
+                                 MixedRadixLayoutTrait]> {
   let arguments = (ins StrAttr:$prefix, BoolAttr:$hex,
       Variadic<AnyTypeOf<[TT_Type]>>:$args, DenseI32ArrayAttr:$isSigned);
   let summary = "Device-side print, as in CUDA for debugging";
@@ -1025,7 +1083,8 @@ def TT_PrintOp : TT_Op<"print", [SameVariadicOperandSize,
 //
 // Assert Op
 //
-def TT_AssertOp : TT_Op<"assert", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+def TT_AssertOp : TT_Op<"assert", [MemoryEffects<[MemWrite<GlobalMemory>]>,
+                                   MixedRadixLayoutTrait]> {
   let summary = "Device-side assert, as in CUDA for correctness checking";
   let description = [{
     `tt.assert` takes a condition tensor and a message string.
@@ -1042,7 +1101,7 @@ def TT_MakeTensorDescOp
     : TT_Op<"make_tensor_descriptor", [AttrSizedOperandSegments,
                                        DeclareOpInterfaceMethods<
                                            MemoryEffectsOpInterface>,
-]> {
+                                       MixedRadixLayoutTrait]> {
   let summary = "Make a tensor descriptor type with meta information of the "
                 "parent tensor and block size";
 
@@ -1158,10 +1217,11 @@ def CallOp : TT_Op<"call", [CallOpInterface,
   }];
 }
 
-def FuncOp
-    : TT_Op<"func", [AffineScope, AutomaticAllocationScope, CallableOpInterface,
-                     FunctionOpInterface, IsolatedFromAbove, OpAsmOpInterface,
-                     HasParent<"ModuleOp">]> {
+def FuncOp : TT_Op<"func", [
+    AffineScope, AutomaticAllocationScope, CallableOpInterface,
+    SymbolName, SymbolVisibility, FunctionOpInterface, IsolatedFromAbove,
+    OpAsmOpInterface, HasParent<"ModuleOp">
+]> {
   let summary = "An operation with a name containing a single `SSACFG` region";
   let description = [{
     Operations within the function cannot implicitly capture values defined
@@ -1287,7 +1347,10 @@ def ReturnOp
 }
 
 def TT_DescriptorLoadOp
-    : TT_Op<"descriptor_load", [TT_DescriptorLoadLikeOpInterface]> {
+    : TT_Op<"descriptor_load",
+            [TT_DescriptorLoadLikeOpInterface,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "Load from descriptor";
   let description = [{
     This operation will be lowered to Nvidia TMA load operation on targets supporting it.
@@ -1310,7 +1373,10 @@ def TT_DescriptorLoadOp
 }
 
 def TT_DescriptorStoreOp
-    : TT_Op<"descriptor_store", [TT_DescriptorStoreLikeOpInterface]> {
+    : TT_Op<"descriptor_store",
+            [TT_DescriptorStoreLikeOpInterface,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "store value based on descriptor";
   let description = [{
     This operation will be lowered to Nvidia TMA store operation on targets supporting it.
@@ -1334,7 +1400,10 @@ def TT_DescriptorStoreOp
 }
 
 def TT_DescriptorReduceOp
-    : TT_Op<"descriptor_reduce", [TT_DescriptorStoreLikeOpInterface]> {
+    : TT_Op<"descriptor_reduce",
+            [TT_DescriptorStoreLikeOpInterface,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "performs a reducing store operation based on a descriptor";
   let description = [{
     This operation will be lowered to Nvidia TMA store operation on targets supporting it.
@@ -1354,7 +1423,10 @@ def TT_DescriptorReduceOp
 }
 
 def TT_DescriptorGatherOp
-    : TT_Op<"descriptor_gather", [TT_DescriptorLoadLikeOpInterface]> {
+    : TT_Op<"descriptor_gather",
+            [TT_DescriptorLoadLikeOpInterface,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "gather multiple rows from a descriptor into a single tensor";
   let description = [{
     The `tt.descriptor_gather` op will be lowered to NVIDIA TMA
@@ -1379,7 +1451,10 @@ def TT_DescriptorGatherOp
 }
 
 def TT_DescriptorScatterOp
-    : TT_Op<"descriptor_scatter", [TT_DescriptorStoreLikeOpInterface]> {
+    : TT_Op<"descriptor_scatter",
+            [TT_DescriptorStoreLikeOpInterface,
+             DeclareOpInterfaceMethods<MixedRadixLayoutOpInterface,
+                                       ["getMixedRadixUnsupportedReason"]>]> {
   let summary = "scatter multiple rows to a descriptor from a single tensor";
   let description = [{
     The `tt.descriptor_scatter` op will be lowered to NVIDIA TMA

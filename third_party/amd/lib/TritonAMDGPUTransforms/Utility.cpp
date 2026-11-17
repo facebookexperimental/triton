@@ -1,5 +1,8 @@
 #include "Utility.h"
 
+#include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
+#include "amd/lib/TritonAMDGPUToLLVM/TargetInfo.h"
+#include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
@@ -302,7 +305,9 @@ ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
     padding = elemsPer8Bytes;
   }
 
-  unsigned contigLanes = contigDim / vecSize;
+  // Clamped to [1, warpSize]: a row wider than a warp still counts as one row
+  // per warp below, and a row narrower than a vector cannot make it zero.
+  unsigned contigLanes = std::clamp(contigDim / vecSize, 1u, warpSize);
   unsigned wrap = std::min(contigDim, elemPerBankRow) / padding;
   // wrap == 0 means padding > contigDim, which is not a valid configuration
   if (wrap == 0) {
@@ -580,6 +585,103 @@ getTDMGatherScatterIndexEncoding(Operation *op, RankedTensorType indicesType) {
   auto parentEnc = ttg::BlockedEncodingAttr::get(ctx, sizePerThread, tPerWarp,
                                                  warpsPerCTA, order, cgaLayout);
   return ttg::SliceEncodingAttr::get(ctx, /*dim=*/0, parentEnc);
+}
+
+SmallVector<unsigned> getLoadSharedOrder(ttg::TensorOrMemDesc srcTy,
+                                         const tt::AMD::TargetInfo &targetInfo,
+                                         bool useAsyncCopy) {
+  auto order = ttg::getOrderForMemory(srcTy);
+  if (useAsyncCopy && !targetInfo.supportsDirectToLdsScatter()) {
+    // For architectures that don't support scattering into LDS we must
+    // ensure that each warp writes a contiguous memory chunk. This requires
+    // the shared memory order to follow the thread order, while preserving
+    // the fastest dimension from the memory order if it's contiguous > 1 to
+    // keep vectorization.
+    auto srcTensorTy = cast<RankedTensorType>(srcTy);
+    auto regOrder = triton::gpu::getOrder(srcTensorTy);
+    auto threadOrder = triton::gpu::getThreadOrder(srcTensorTy);
+
+    SetVector<unsigned> orderSet;
+
+    auto regContig = triton::gpu::getContigPerThread(srcTensorTy)[regOrder[0]];
+    unsigned elemBitWidth = srcTy.getElementType().getIntOrFloatBitWidth();
+    unsigned finalRegContig = tt::AMD::fitToValidDirectToLdsVecSize(
+        regContig, elemBitWidth, targetInfo);
+    // We only apply the order change if we find a vector size which works
+    // for async copy.
+    if (finalRegContig > 0) {
+      // Preserve the fastest reg dim for contig > 1 to keep vectorization.
+      if (finalRegContig > 1)
+        orderSet.insert(order[0]);
+      orderSet.insert(threadOrder.begin(), threadOrder.end());
+      order = orderSet.takeVector();
+    }
+  }
+  return order;
+}
+
+ttg::SharedEncodingTrait getDotOperandSharedEncoding(
+    const TargetFeatures &targetFeatures, ttg::TensorOrMemDesc srcTy,
+    ArrayRef<unsigned> order, ttg::DotOperandEncodingAttr dotOpEnc,
+    bool canUseAsyncCopy) {
+  unsigned bitWidth = srcTy.getElementType().getIntOrFloatBitWidth();
+  SmallVector<unsigned> sharedOrder;
+  int rank = order.size();
+  // TODO rework this when shared -> dotOperand conversions support
+  // arbitrary shared memory ordering
+  if (rank == 3) {
+    // Move the batch dimension (dim #0) to be the last so that it will be
+    // the slowest varying dimension.
+    for (unsigned i = 0; i < rank; ++i)
+      if (order[i] != 0)
+        sharedOrder.emplace_back(order[i]);
+    sharedOrder.emplace_back(0);
+  } else {
+    sharedOrder = llvm::to_vector(order);
+  }
+  ttg::SharedEncodingTrait sharedEnc = composePaddedLayout(
+      targetFeatures, dotOpEnc.getOpIdx(), dotOpEnc.getKWidth(), srcTy,
+      sharedOrder, dotOpEnc, canUseAsyncCopy);
+  if (!sharedEnc) {
+    sharedEnc = ttg::SwizzledSharedEncodingAttr::get(
+        srcTy.getContext(), dotOpEnc, srcTy.getShape(), sharedOrder,
+        ttg::getCGALayout(srcTy.getEncoding()), bitWidth, /*needTrans=*/false);
+  }
+  return sharedEnc;
+}
+
+bool canLoadDirectToLdsInPipeline(RankedTensorType srcTy,
+                                  ttg::SharedEncodingTrait sharedEnc,
+                                  const tt::AMD::TargetInfo &targetInfo) {
+  // Compute the final vecSize we can use for the combination of
+  // sourceEncoding and sharedEncoding. We can only use AsyncCopy if the
+  // target supports the requested or a smaller vecSize because we cannot
+  // stride when loading directly to lds on GFX9
+  auto regLayout = triton::gpu::toLinearLayout(srcTy);
+  // It's the allocation so we trim the multibuffer dimension
+  auto srcShape = srcTy.getShape();
+  if (!regLayout.isRadix2()) {
+    unsigned elemBitWidth = tt::getPointeeBitWidth(srcTy);
+    unsigned vecSize = std::max(128u / elemBitWidth, 1u);
+    return !LLVM::AMD::getNpotDirectToLdsUnsupportedReason(
+        targetInfo, regLayout, elemBitWidth, sharedEnc, srcShape, vecSize);
+  }
+  triton::LinearLayout sharedLayout;
+  auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(sharedEnc);
+  if (paddedEnc) {
+    sharedLayout = paddedEnc.getLinearComponent();
+  } else {
+    sharedLayout = triton::gpu::toLinearLayout(srcShape, sharedEnc);
+  }
+  auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
+
+  unsigned elemBitWidth = tt::getPointeeBitWidth(srcTy);
+  unsigned vecSize = regToSharedLayout.getNumConsecutiveInOut();
+  if (paddedEnc)
+    vecSize = std::min(vecSize, paddedEnc.getMinInterval());
+
+  return tt::AMD::fitToValidDirectToLdsVecSize(vecSize, elemBitWidth,
+                                               targetInfo) != 0;
 }
 
 ttg::SharedEncodingTrait getEncodingFromDescriptor(Operation *op,

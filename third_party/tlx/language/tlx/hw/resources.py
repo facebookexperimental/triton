@@ -368,8 +368,8 @@ class BlackwellWSGemmModel:
         smem_a = (tile.block_m * tile.block_k * OPERAND_ELEM_BYTES * tile.num_smem_buffers)
         smem_b = (tile.block_k * (tile.block_n // tile.num_ctas) * OPERAND_ELEM_BYTES * tile.num_smem_buffers)
         # The template double-buffers the staging tile even with one MMA group.
-        smem_epilog = (max(tile.num_mma_groups, 2) * tile.block_m_per_group * tile.slice_size * tile.out_elem_bytes
-                       if charge_epilogue else 0)
+        smem_epilog = (max(tile.num_mma_groups, 2) * tile.block_m_per_group * tile.slice_size *
+                       tile.out_elem_bytes if charge_epilogue else 0)
         # In 2-CTA mode each CTA allocates its own copy of the barriers.
         smem_barriers = (tile.num_smem_buffers * tile.num_mma_groups * MBARRIER_BYTES *
                          (2 if tile.num_ctas == 2 else 1))

@@ -7,6 +7,7 @@
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 
 namespace mlir {
@@ -42,22 +43,8 @@ public:
   };
 
   explicit ReduceOpHelper(triton::ReduceOp op)
-      : op(op.getOperation()), axis(op.getAxis()) {
-    auto firstTy = cast<RankedTensorType>(op.getOperands()[0].getType());
-    srcTy = firstTy;
-    srcShape = firstTy.getShape();
-    srcEncoding = firstTy.getEncoding();
-    srcElementTypes = op.getElementTypes();
-
-    for (const auto &t : op.getInputTypes()) {
-      if (t.getShape() != srcShape) {
-        op.emitError() << "shape mismatch";
-      }
-      if (t.getEncoding() != srcEncoding) {
-        op.emitError() << "encoding mismatch";
-      }
-    }
-  }
+      : op(op), srcTy(op.getInputTypes().front()), srcShape(srcTy.getShape()),
+        srcEncoding(srcTy.getEncoding()), axis(op.getAxis()) {}
 
   ArrayRef<int64_t> getSrcShape() { return srcShape; }
 
@@ -86,24 +73,31 @@ public:
 
   bool isReduceWithinCTA();
 
-  // Callback to allow backends to specify target-specific getter for scratch
+  // Callback to allow backends to specify a target-specific getter for scratch
   // elements.
   using GetNumScratchElemsFn = std::function<unsigned(
       const triton::LinearLayout &src, const triton::LinearLayout &dst,
       unsigned bitwidth)>;
 
+  // Allocation size for the whole reduction: the maximum sizeInBytes returned
+  // by getScratchConfig across its inter-warp/CTA reduction stages.
   unsigned
   getScratchSizeInBytes(GetNumScratchElemsFn numScratchElemsGetter = nullptr);
 
   InThreadVectorizeOpKind
-  getInThreadVectorizeOpKind(unsigned axisPack,
-                             bool supportBitwidth16Elementwise,
+  getInThreadVectorizeOpKind(bool supportBitwidth16Elementwise,
                              bool supportBitwidth32Elementwise);
 
-  static Value createInThreadVectorizedCombineOp(OpBuilder &builder,
-                                                 Location loc,
-                                                 InThreadVectorizeOpKind kind,
-                                                 Value lhs, Value rhs);
+  struct ScratchConfig {
+    SmallVector<unsigned> offsets;
+    unsigned sizeInBytes = 0;
+  };
+
+  // Byte offsets in operand order and total storage for one layout conversion.
+  ScratchConfig
+  getScratchConfig(const triton::LinearLayout &src,
+                   const triton::LinearLayout &dst,
+                   GetNumScratchElemsFn numScratchElemsGetter = nullptr);
 
   static triton::ColumnAction
   moveAxisBasesToFront(const triton::LinearLayout &layout, int axis,
@@ -112,8 +106,9 @@ public:
   static triton::LinearLayout reducedRegLaneLayout(RankedTensorType srcTy,
                                                    int axis);
 
-  static triton::LinearLayout getInterLayout(const triton::LinearLayout &layout,
-                                             int axis);
+  static triton::LinearLayout
+  getInterWarpReductionLayout(const triton::LinearLayout &layout,
+                              unsigned axis);
 
   static triton::LinearLayout
   zeroBasesAlongDimAndReorder(const triton::LinearLayout &layout, int axis,
@@ -128,7 +123,6 @@ private:
   RankedTensorType srcTy;
   ArrayRef<int64_t> srcShape;
   Attribute srcEncoding;
-  SmallVector<Type> srcElementTypes;
   int axis;
 };
 
@@ -174,6 +168,8 @@ public:
   unsigned getNumOperands() { return scanOp.getNumOperands(); }
   SmallVector<Type> getElementTypes() { return srcElementTypes; }
   SmallVector<unsigned> getOrder() { return order; }
+  // The source register of each blocked index; empty for a Blocked source.
+  ArrayRef<unsigned> getBlockedToSrc() { return blockedToSrc; }
   Region &getCombineOp();
 
 private:
@@ -183,6 +179,7 @@ private:
   llvm::ArrayRef<int64_t> srcShape;
   SmallVector<Type> srcElementTypes;
   SmallVector<unsigned> order;
+  SmallVector<unsigned> blockedToSrc;
 };
 
 // Helper class for lowering `tt.gather` operations. This class shares lowering
@@ -233,6 +230,97 @@ struct DecomposedWarpConversion {
   int nPack;
 };
 
+enum class MixedRadixConversionTransfer {
+  Register,
+  Warp,
+  Shared,
+};
+
+// Register digits both layouts share, each alone setting its out dim's odd
+// part or one binary bit. A Shared transfer loops over them, as the pow2 path
+// loops over reps, moving one tile per value.
+struct MixedRadixSharedTiling {
+  SmallVector<int32_t> sourceDigits;
+  SmallVector<int32_t> destinationDigits;
+  triton::LinearLayout sourceTile;
+  triton::LinearLayout destinationTile;
+};
+
+// The odd tiles of a Shared transfer: each NPOT out dim's odd part peeled off
+// both layouts. nullopt unless that leaves pow2 tile layouts.
+std::optional<MixedRadixSharedTiling>
+getMixedRadixSharedTiles(const triton::LinearLayout &src,
+                         const triton::LinearLayout &dst);
+
+// Elements per shared access on `dim` when it is a tile's fastest dim.
+int32_t getMixedRadixSharedRunLength(const triton::LinearLayout &layout,
+                                     int32_t dim, unsigned bitwidth);
+
+// The odd tiles of a Shared transfer that transposes: each side has a vector
+// but no dim keeps one on both, so a single shared order leaves a side scalar.
+std::optional<MixedRadixSharedTiling>
+getMixedRadixTransposeTiles(const triton::LinearLayout &src,
+                            const triton::LinearLayout &dst, unsigned bitwidth);
+
+// The pow2 padding of a mixed-radix `layout`: each digit of odd radix r becomes
+// ceil(log2 r) binary digits, so each out dim pads to its next power of two.
+triton::LinearLayout padMixedRadixLayout(const triton::LinearLayout &layout);
+
+// Built only by the factories, so no plan is default or partial: unsupported
+// (`unsupportedReason` only), shared (Shared transfer) or factored (Register or
+// Warp transfer, with the register/lane permutation factors).
+struct MixedRadixConversionPlan {
+  static MixedRadixConversionPlan unsupported(std::string unsupportedReason);
+  static MixedRadixConversionPlan
+  shared(triton::MixedRadixConversionScope scope,
+         llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks);
+  // Register transfer and scope when `map.laneMap` is the identity,
+  // otherwise Warp.
+  static MixedRadixConversionPlan
+  factored(llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+           triton::MixedRadixConversionInputMap map);
+
+  std::optional<MixedRadixConversionTransfer> transfer;
+  std::optional<triton::MixedRadixConversionScope> scope;
+  std::optional<std::string> unsupportedReason;
+  llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks;
+  // pReg takes a source register to its destination register in
+  // destinationRegisterOrder's input order; shuffleMap takes a destination
+  // lane to its source lane.
+  std::optional<DecomposedWarpConversion> warpFactors;
+  std::optional<triton::ColumnAction> destinationRegisterOrder;
+  // Set by getMixedRadixConversionPlan, which knows the element bitwidth.
+  std::optional<MixedRadixSharedTiling> sharedTiling;
+
+  bool supported() const { return !unsupportedReason.has_value(); }
+
+private:
+  MixedRadixConversionPlan(
+      std::optional<MixedRadixConversionTransfer> transfer,
+      std::optional<triton::MixedRadixConversionScope> scope,
+      std::optional<std::string> unsupportedReason,
+      llvm::MapVector<StringAttr, int32_t> sourceFreeVariableMasks,
+      std::optional<DecomposedWarpConversion> warpFactors,
+      std::optional<triton::ColumnAction> destinationRegisterOrder);
+};
+
+// Plan a mixed-radix conversion in closed form. A failed preflight gives a
+// unsupported plan; a register/lane map gives a factored plan, else a shared
+// one.
+MixedRadixConversionPlan
+planMixedRadixLayoutConversion(const triton::LinearLayout &srcLayout,
+                               const triton::LinearLayout &dstLayout,
+                               ArrayRef<int64_t> logicalShape);
+
+// The plan of a convert with a mixed-radix layout on either side, else nullopt.
+std::optional<MixedRadixConversionPlan>
+getMixedRadixConversionPlan(RankedTensorType srcTy, RankedTensorType dstTy);
+
+// Scratch bytes of a convert with a mixed-radix layout, else nullopt: one tile
+// (the whole tensor if untiled) for a Shared plan, 0 for the other plans.
+std::optional<unsigned>
+getMixedRadixConversionScratchBytes(triton::gpu::ConvertLayoutOp op);
+
 // Produces a warp-local decomposition.
 //
 // For permutation cases, the numbers of register and lane basis vectors may
@@ -277,9 +365,8 @@ getReshapeDecomposition(ArrayRef<int64_t> srcShape, ArrayRef<int64_t> dstShape);
 // If shape is empty, it means no shared memory is needed.
 unsigned getNumScratchElements(ArrayRef<unsigned> shape);
 
-bool supportWMMA(triton::DotOp op);
-
-bool supportMMA(triton::DotOp op, int version);
+bool supportMMA(triton::DotOp op, int version,
+                std::optional<int> knownNumWarps = std::nullopt);
 
 bool supportMMA(triton::DotOpInterface op, int version);
 
@@ -304,10 +391,6 @@ bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy);
 // The conversion requires data exchange through shared memory.
 bool cvtNeedsSharedMemory(triton::gpu::ConvertLayoutOp op);
 
-// TODO: Move utility functions that belong to ConvertLayoutOp to class
-// ConvertLayoutOpHelper in the future
-bool shouldUseDistSmem(Attribute srcLayout, Attribute dstLayout);
-
 /// Create a basic DataFlowSolver with constant and dead code analysis included.
 std::unique_ptr<DataFlowSolver> createDataFlowSolver();
 
@@ -324,10 +407,16 @@ bool hasOpOfAnyTypeInForwardSlice(Operation *liveOp) {
   return false;
 }
 
+// A mixed-radix conversion answers from its plan.
+bool isCvtDimSync(RankedTensorType srcTy, RankedTensorType dstTy,
+                  StringAttr dim);
+
 bool isCvtDimSync(const triton::LinearLayout &srcLayout,
                   const triton::LinearLayout &dstLayout, StringAttr dim);
 
 namespace triton {
+
+bool canUseWarpBallotHistogram(HistogramOp op);
 
 struct BarrierStages {
   // Stages are independent: for example, a release atomic with scratch has
@@ -345,6 +434,10 @@ struct BarrierStages {
 // broadcast barrier at that scope supplies the post-atomic rendezvous itself.
 BarrierStages getAtomicBarrierStages(MemSemantic semantic,
                                      bool hasResultBarrier);
+
+// Lane bits to clear when shuffling an atomic result from its issuing lane.
+// Returns nullopt when broadcasting the result requires shared memory.
+std::optional<int32_t> getAtomicResultShuffleMask(Value result);
 
 // Whether distributing an atomic result requires communication between CTAs.
 bool atomicResultHasCTABroadcast(Operation *op);

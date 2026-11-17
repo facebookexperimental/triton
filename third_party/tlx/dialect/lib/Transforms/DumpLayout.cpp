@@ -22,16 +22,26 @@
 // If the layout is not representable as a CuTe layout (e.g. an unsupported
 // swizzle), the pass falls back to the raw linear-layout string.
 //
+// The pass also emits a remark for every convert_layout that must go through
+// shared memory (shown with MLIR_ENABLE_DIAGNOSTICS=remarks). When a
+// shared-memory load feeds the conversion, a note on that load suggests a
+// layout that may remove the conversion.
+//
 //===----------------------------------------------------------------------===//
 
 #include "IR/Dialect.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Pass/Pass.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LinearLayout.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -103,11 +113,19 @@ static SmallVector<int64_t> rowMajorStrides(ArrayRef<int64_t> shape) {
   return rm;
 }
 
-// Emit `type`'s layout as a CuTe integer-strided Shape:Stride layout. Returns
-// false if the layout is not integer-strided (e.g. it uses XOR swizzling, which
-// is linear over GF(2) but not over the integers).
-static bool emitCuteStrided(ttg::TensorOrMemDesc type, const LinearLayout &ll,
-                            llvm::raw_ostream &os) {
+// CuTe modes of a layout: thread/value groups for a register tensor, a single
+// flat group for a buffer. `blockModes` is the part of `threadModes` that comes
+// from the CTA (block) dim.
+struct CuteModes {
+  SmallVector<Mode> threadModes, valueModes, flatModes;
+  size_t blockModes = 0;
+};
+
+// Collect `type`'s layout as CuTe integer-strided modes. Returns false if the
+// layout is not integer-strided (e.g. it uses XOR swizzling, which is linear
+// over GF(2) but not over the integers).
+static bool collectCuteModes(ttg::TensorOrMemDesc type, const LinearLayout &ll,
+                             CuteModes &out) {
   MLIRContext *ctx = type.getContext();
   ArrayRef<int64_t> shape = type.getShape();
   int rank = shape.size();
@@ -140,36 +158,153 @@ static bool emitCuteStrided(ttg::TensorOrMemDesc type, const LinearLayout &ll,
     collapseModes(bitStrides, modes);
   };
 
-  bool isTensor = isa<RankedTensorType>(type);
-  SmallVector<Mode> threadModes, valueModes, flatModes;
-  if (isTensor) {
-    for (StringRef d : {"lane", "warp", "block"})
-      modesFor(d, threadModes);
-    modesFor("register", valueModes);
+  if (isa<RankedTensorType>(type)) {
+    modesFor("lane", out.threadModes);
+    modesFor("warp", out.threadModes);
+    size_t beforeBlock = out.threadModes.size();
+    modesFor("block", out.threadModes);
+    out.blockModes = out.threadModes.size() - beforeBlock;
+    modesFor("register", out.valueModes);
   } else {
-    for (StringRef d : {"offset", "block"})
-      modesFor(d, flatModes);
+    modesFor("offset", out.flatModes);
+    modesFor("block", out.flatModes);
   }
+  return faithful;
+}
 
-  if (!faithful)
+// Emit `type`'s layout as a CuTe integer-strided Shape:Stride layout. Returns
+// false if the layout is not integer-strided.
+static bool emitCuteStrided(ttg::TensorOrMemDesc type, const LinearLayout &ll,
+                            llvm::raw_ostream &os) {
+  CuteModes m;
+  if (!collectCuteModes(type, ll, m))
     return false;
-
-  if (isTensor) {
+  if (isa<RankedTensorType>(type)) {
     os << "(";
-    printGroup(os, threadModes, true);
+    printGroup(os, m.threadModes, true);
     os << ",";
-    printGroup(os, valueModes, true);
+    printGroup(os, m.valueModes, true);
     os << "):(";
-    printGroup(os, threadModes, false);
+    printGroup(os, m.threadModes, false);
     os << ",";
-    printGroup(os, valueModes, false);
+    printGroup(os, m.valueModes, false);
     os << ")";
   } else {
-    printGroup(os, flatModes, true);
+    printGroup(os, m.flatModes, true);
     os << ":";
-    printGroup(os, flatModes, false);
+    printGroup(os, m.flatModes, false);
   }
   return true;
+}
+
+// Spell a single-CTA register layout as a `tlx.layout(shape=..., stride=...)`
+// expression, which uses the same (thread, value) Shape:Stride convention.
+// Returns false if the layout has no such spelling.
+static bool emitTlxLayout(RankedTensorType type, llvm::raw_ostream &os) {
+  CuteModes m;
+  if (!collectCuteModes(cast<ttg::TensorOrMemDesc>(type),
+                        ttg::toLinearLayout(type), m) ||
+      m.blockModes != 0)
+    return false;
+  auto print = [&](ArrayRef<Mode> modes, bool wantSize) {
+    os << "(";
+    for (size_t i = 0; i < modes.size(); ++i)
+      os << (i ? ", " : "") << (wantSize ? modes[i].first : modes[i].second);
+    if (modes.size() == 1)
+      os << ",";
+    os << ")";
+  };
+  os << "tlx.layout(shape=(";
+  print(m.threadModes, true);
+  os << ", ";
+  print(m.valueModes, true);
+  os << "), stride=(";
+  print(m.threadModes, false);
+  os << ", ";
+  print(m.valueModes, false);
+  os << "))";
+  return true;
+}
+
+static std::string cuteOrEncoding(RankedTensorType type) {
+  std::string buf;
+  llvm::raw_string_ostream os(buf);
+  if (!emitCuteStrided(cast<ttg::TensorOrMemDesc>(type),
+                       ttg::toLinearLayout(type), os))
+    os << type.getEncoding();
+  return buf;
+}
+
+// Follow single-operand elementwise ops (e.g. extf) back to a shared-memory
+// load, which could produce its value directly in any register layout.
+static ttg::LocalLoadOp traceToLocalLoad(Value v) {
+  for (int depth = 0; depth < 8; ++depth) {
+    Operation *def = v.getDefiningOp();
+    if (!def)
+      return nullptr;
+    if (auto load = dyn_cast<ttg::LocalLoadOp>(def))
+      return load;
+    if (!def->hasTrait<OpTrait::Elementwise>() || def->getNumOperands() != 1)
+      return nullptr;
+    v = def->getOperand(0);
+  }
+  return nullptr;
+}
+
+// Remark on a convert_layout that exchanges data through shared memory.
+// Suggest the destination layout for a load feeding the conversion, or the
+// source layout for a peer load. Other users and downstream layout constraints
+// may still require conversions.
+static void remarkSharedMemoryConvert(ttg::ConvertLayoutOp cvt) {
+  RankedTensorType srcTy = cvt.getSrc().getType();
+  RankedTensorType dstTy = cvt.getType();
+  // NPOT conversion diagnostics are not supported.
+  if (hasNpotShape(srcTy) || hasNpotShape(dstTy))
+    return;
+  if (!cvtNeedsSharedMemory(cvt))
+    return;
+  bool inLoop = cvt->getParentOfType<LoopLikeOpInterface>() != nullptr;
+  std::string shape;
+  llvm::raw_string_ostream shapeOs(shape);
+  for (int64_t dim : dstTy.getShape())
+    shapeOs << dim << "x";
+  shapeOs << dstTy.getElementType();
+  InFlightDiagnostic diag = cvt.emitRemark()
+                            << "convert_layout through shared memory"
+                            << (inLoop ? " inside a loop" : "") << " for "
+                            << shape << ": from " << cuteOrEncoding(srcTy)
+                            << " to " << cuteOrEncoding(dstTy);
+
+  auto suggest = [&](ttg::LocalLoadOp load, RankedTensorType wanted) {
+    auto loadTy = cast<RankedTensorType>(load.getType());
+    if (hasNpotShape(loadTy))
+      return;
+    Diagnostic &note = diag.attachNote(load.getLoc());
+    note << "loading this shared-memory value in layout "
+         << cuteOrEncoding(loadTy.cloneWithEncoding(wanted.getEncoding()))
+         << " may remove the conversion";
+    std::string tlx;
+    llvm::raw_string_ostream os(tlx);
+    if (emitTlxLayout(loadTy.cloneWithEncoding(wanted.getEncoding()), os))
+      note << "; in TLX: tlx.local_load(..., layout=" << tlx << ")";
+  };
+
+  if (ttg::LocalLoadOp load = traceToLocalLoad(cvt.getSrc())) {
+    suggest(load, dstTy);
+    return;
+  }
+  llvm::SmallSetVector<Operation *, 4> seen;
+  for (Operation *user : cvt->getUsers()) {
+    if (!user->hasTrait<OpTrait::Elementwise>())
+      continue;
+    for (Value peer : user->getOperands()) {
+      if (peer == cvt.getResult())
+        continue;
+      ttg::LocalLoadOp load = traceToLocalLoad(peer);
+      if (load && seen.insert(load.getOperation()))
+        suggest(load, srcTy);
+    }
+  }
 }
 
 // Emit a swizzled shared buffer as `Swizzle<B,M,S> o (base):(stride)`, derived
@@ -330,6 +465,13 @@ public:
 
     for (DumpLayoutOp op : toErase)
       op->erase();
+
+    std::string diagnostics =
+        triton::tools::getStrEnv("MLIR_ENABLE_DIAGNOSTICS");
+    SmallVector<StringRef> enabledDiagnostics;
+    StringRef(diagnostics).split(enabledDiagnostics, ',');
+    if (llvm::is_contained(enabledDiagnostics, StringRef("remarks")))
+      m.walk([](ttg::ConvertLayoutOp cvt) { remarkSharedMemoryConvert(cvt); });
   }
 };
 

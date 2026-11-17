@@ -1,10 +1,401 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/GenericSwizzling.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 
+#include <array>
+
 namespace mlir::triton {
+
+namespace {
+
+// Bit offsets of each out dim's binary part in one uint64, sized for the wider
+// of the two layouts (same out-dim order); the last entry is the total width.
+std::optional<SmallVector<int32_t>> getBinaryOffsets(const LinearLayout &a,
+                                                     const LinearLayout &b) {
+  SmallVector<int32_t> offsets = {0};
+  for (StringAttr outDim : a.getOutDimNames()) {
+    auto width = [&](const LinearLayout &layout) {
+      return static_cast<int32_t>(llvm::countr_zero(
+          static_cast<uint32_t>(layout.getOutDimSize(outDim))));
+    };
+    offsets.push_back(offsets.back() + std::max(width(a), width(b)));
+  }
+  if (offsets.back() > 64)
+    return std::nullopt;
+  return offsets;
+}
+
+// The radix-2 digits of a Binary or mixed-radix layout as GF(2) columns in
+// in-dim and digit order. A column in the span of earlier columns is free, as
+// in getFreeVariableMasks, and its kernel vector touches only earlier pivots.
+struct BinaryColumns {
+  SmallVector<std::pair<StringAttr, int32_t>> digits;
+  SmallVector<uint64_t> images;
+  SmallVector<int32_t> freeColumns;
+  SmallVector<uint64_t> kernels;
+  std::array<uint64_t, 64> pivotImage{};
+  std::array<uint64_t, 64> pivotCombo{};
+
+  uint64_t reduce(uint64_t &image) const {
+    uint64_t combo = 0;
+    for (int bit = 63; bit >= 0; --bit) {
+      if ((image >> bit & 1) && pivotImage[bit]) {
+        image ^= pivotImage[bit];
+        combo ^= pivotCombo[bit];
+      }
+    }
+    return combo;
+  }
+
+  // The preimage with every free column zero, or nullopt outside the image.
+  std::optional<uint64_t> preimage(uint64_t image) const {
+    uint64_t combo = reduce(image);
+    if (image != 0)
+      return std::nullopt;
+    return combo;
+  }
+};
+
+std::optional<BinaryColumns> getBinaryColumns(const LinearLayout &layout,
+                                              ArrayRef<int32_t> offsets) {
+  if (!layout.hasOddPartForm())
+    return std::nullopt;
+  BinaryColumns columns;
+  for (StringAttr inDim : layout.getInDimNames()) {
+    for (auto [pos, radix] : llvm::enumerate(layout.getInputRadices(inDim))) {
+      if (radix != 2)
+        continue;
+      if (columns.digits.size() == 64)
+        return std::nullopt;
+      uint64_t image = 0;
+      for (auto [index, outDim] : llvm::enumerate(layout.getOutDimNames())) {
+        int32_t binary = layout.getBasisContribution(inDim, pos, outDim).binary;
+        if (binary != 0)
+          image |= static_cast<uint64_t>(binary) << offsets[index];
+      }
+      uint64_t self = uint64_t{1} << columns.digits.size();
+      columns.digits.push_back({inDim, static_cast<int32_t>(pos)});
+      columns.images.push_back(image);
+      uint64_t combo = columns.reduce(image) ^ self;
+      if (image == 0) {
+        columns.freeColumns.push_back(columns.digits.size() - 1);
+        columns.kernels.push_back(combo);
+        continue;
+      }
+      int lead = 63 - llvm::countl_zero(image);
+      columns.pivotImage[lead] = image;
+      columns.pivotCombo[lead] = combo;
+    }
+  }
+  return columns;
+}
+
+// The odd digit owning each out dim's odd coordinate, with its coefficient.
+struct OddOwner {
+  StringAttr inDim;
+  int32_t pos;
+  int32_t coefficient;
+};
+
+// Returns nullopt if some odd digit owns no coordinate (a zero digit).
+std::optional<SmallVector<std::optional<OddOwner>>>
+getOddOwners(const LinearLayout &layout) {
+  if (!layout.hasOddPartForm())
+    return std::nullopt;
+  SmallVector<std::optional<OddOwner>> owners(layout.getNumOutDims());
+  for (StringAttr inDim : layout.getInDimNames()) {
+    for (auto [pos, radix] : llvm::enumerate(layout.getInputRadices(inDim))) {
+      if (radix == 2)
+        continue;
+      bool owns = false;
+      for (auto [index, outDim] : llvm::enumerate(layout.getOutDimNames())) {
+        int32_t odd = layout.getBasisContribution(inDim, pos, outDim).odd;
+        if (odd == 0)
+          continue;
+        owners[index] = OddOwner{inDim, static_cast<int32_t>(pos), odd};
+        owns = true;
+      }
+      if (!owns)
+        return std::nullopt;
+    }
+  }
+  return owners;
+}
+
+// The inverse of `a` modulo `m` by extended Euclid, or nullopt for a non-unit.
+std::optional<int64_t> inverseUnit(int64_t a, int64_t m) {
+  // Invariant: s * a == r (mod m) for both (r, s) pairs.
+  int64_t r0 = m, s0 = 0, r1 = a % m, s1 = 1;
+  while (r1 != 0) {
+    int64_t q = r0 / r1;
+    std::tie(r0, r1) = std::make_pair(r1, r0 - q * r1);
+    std::tie(s0, s1) = std::make_pair(s1, s0 - q * s1);
+  }
+  if (r0 != 1)
+    return std::nullopt;
+  return (s0 % m + m) % m;
+}
+
+bool isRegisterOrLane(StringAttr inDim) {
+  return inDim == "register" || inDim == "lane";
+}
+
+bool hasOddOutsideRegister(const LinearLayout &layout) {
+  return llvm::any_of(layout.getInDimNames(), [&](StringAttr dim) {
+    return dim != "register" &&
+           llvm::any_of(layout.getInputRadices(dim),
+                        [](int32_t radix) { return radix != 2; });
+  });
+}
+
+} // namespace
+
+bool coversAllLogicalOutputs(const LinearLayout &layout,
+                             ArrayRef<int64_t> logicalShape) {
+  if (logicalShape.size() != layout.getNumOutDims())
+    return false;
+  if (logicalShape.empty())
+    return true;
+  auto outDimNames = llvm::to_vector(layout.getOutDimNames());
+  if (outDimNames != standardOutDimNames(outDimNames.front().getContext(),
+                                         static_cast<int>(logicalShape.size())))
+    return false;
+  auto offsets = getBinaryOffsets(layout, layout);
+  if (!offsets)
+    return false;
+  auto columns = getBinaryColumns(layout, *offsets);
+  if (!columns)
+    return false;
+  // The image is the binary span plus each owned odd coordinate's whole odd
+  // part, so the box needs a preimage of each binary unit below its extent,
+  // and an odd owner once the extent passes the binary part.
+  for (auto [d, outDim] : llvm::enumerate(outDimNames)) {
+    int64_t extent = logicalShape[d];
+    int32_t size = layout.getOutDimSize(outDim);
+    if (extent <= 0 || extent > size)
+      return false;
+    int32_t binarySize = LinearLayout::twoPartOf(size);
+    if (extent > binarySize) {
+      bool oddOwned = false;
+      for (StringAttr inDim : layout.getInDimNames())
+        for (int32_t i = 0; i < layout.getInDimSizeLog2(inDim); ++i)
+          oddOwned |= layout.getInputRadix(inDim, i) != 2 &&
+                      layout.getBasisContribution(inDim, i, outDim).odd != 0;
+      if (!oddOwned)
+        return false;
+      extent = binarySize;
+    }
+    for (int32_t bit = 0; (int64_t{1} << bit) < extent; ++bit)
+      if (!columns->preimage(uint64_t{1} << ((*offsets)[d] + bit)))
+        return false;
+  }
+  return true;
+}
+
+std::optional<LinearLayout>
+alignMixedRadixConversionOutDims(const LinearLayout &srcLayout,
+                                 const LinearLayout &dstLayout,
+                                 ArrayRef<int64_t> logicalShape) {
+  auto outDims = to_vector(srcLayout.getOutDimNames());
+  if (outDims.size() != logicalShape.size() ||
+      dstLayout.getNumOutDims() != srcLayout.getNumOutDims())
+    return std::nullopt;
+  if (!outDims.empty() &&
+      outDims != standardOutDimNames(outDims.front().getContext(),
+                                     static_cast<int>(outDims.size())))
+    return std::nullopt;
+  if (!llvm::all_of(outDims,
+                    [&](StringAttr dim) { return dstLayout.hasOutDim(dim); }))
+    return std::nullopt;
+  return dstLayout.transposeOuts(outDims);
+}
+
+bool hasMixedRadixConversionInputDims(const LinearLayout &layout) {
+  return llvm::all_of(layout.getInDimNames(), [&](StringAttr dim) {
+    return isRegisterOrLane(dim) || dim == "warp" ||
+           (dim == "block" && layout.getInDimSize(dim) == 1);
+  });
+}
+
+MixedRadixConversionScope
+classifyMixedRadixConversionScope(const LinearLayout &srcLayout,
+                                  const LinearLayout &dstLayout,
+                                  ArrayRef<int64_t> logicalShape) {
+  auto offsets = getBinaryOffsets(srcLayout, dstLayout);
+  if (!offsets || hasOddOutsideRegister(srcLayout) ||
+      hasOddOutsideRegister(dstLayout))
+    return MixedRadixConversionScope::Block;
+  // Coverage bounds the columns, so both exist.
+  auto src = *getBinaryColumns(srcLayout, *offsets);
+  auto dst = *getBinaryColumns(dstLayout, *offsets);
+
+  auto outDims = to_vector(srcLayout.getOutDimNames());
+  // Odd digits sit in registers, so the lane and warp owners are GF(2)-linear
+  // in the low output bits and the destination kernel. Checking one generator
+  // per in-bounds bit and kernel vector is exact.
+  using Owner = std::pair<uint64_t, uint64_t>;
+  auto owner = [](const BinaryColumns &columns, uint64_t combo) {
+    Owner laneAndWarp{0, 0};
+    for (auto [column, digit] : llvm::enumerate(columns.digits)) {
+      if (!(combo >> column & 1))
+        continue;
+      if (digit.first == "lane")
+        laneAndWarp.first ^= uint64_t{1} << digit.second;
+      else if (digit.first == "warp")
+        laneAndWarp.second ^= uint64_t{1} << digit.second;
+    }
+    return laneAndWarp;
+  };
+  MixedRadixConversionScope scope = MixedRadixConversionScope::Register;
+  auto widen = [&](Owner source, Owner destination) {
+    if (source.second != destination.second)
+      scope = MixedRadixConversionScope::Block;
+    else if (source.first != destination.first &&
+             scope == MixedRadixConversionScope::Register)
+      scope = MixedRadixConversionScope::Warp;
+  };
+  for (uint64_t kernel : dst.kernels)
+    widen({0, 0}, owner(dst, kernel));
+  for (auto [index, extent] : llvm::enumerate(logicalShape)) {
+    int32_t width = (*offsets)[index + 1] - (*offsets)[index];
+    for (int32_t bit = 0; bit < width && (int64_t{1} << bit) < extent; ++bit) {
+      auto image = [&, dim = index](const LinearLayout &layout) -> uint64_t {
+        int32_t size = layout.getOutDimSize(outDims[dim]);
+        if (bit >= llvm::countr_zero(static_cast<uint32_t>(size)))
+          return 0;
+        return uint64_t{1} << ((*offsets)[dim] + bit);
+      };
+      // Coverage gives each in-bounds bit a preimage.
+      widen(owner(src, *src.preimage(image(srcLayout))),
+            owner(dst, *dst.preimage(image(dstLayout))));
+    }
+  }
+  return scope;
+}
+
+std::optional<MixedRadixConversionInputMap>
+mapMixedRadixConversionInputs(const LinearLayout &a, const LinearLayout &b) {
+  auto inDims = to_vector(b.getInDimNames());
+  auto registerDim = llvm::find(inDims, "register");
+  auto laneDim = llvm::find(inDims, "lane");
+  if (a.getOutDims() != b.getOutDims() ||
+      !llvm::equal(a.getInDimNames(), inDims) || registerDim == inDims.end() ||
+      laneDim == inDims.end() || hasOddOutsideRegister(a) ||
+      hasOddOutsideRegister(b) || llvm::any_of(inDims, [&](StringAttr dim) {
+        return a.getInDimSize(dim) != b.getInDimSize(dim);
+      }))
+    return std::nullopt;
+  auto offsets = getBinaryOffsets(a, b);
+  if (!offsets)
+    return std::nullopt;
+  auto aColumns = getBinaryColumns(a, *offsets);
+  auto bColumns = getBinaryColumns(b, *offsets);
+  auto aOwners = getOddOwners(a);
+  auto bOwners = getOddOwners(b);
+  // Equal column and kernel counts give equal ranks, so a preimage of every
+  // `b` column below proves the binary images equal.
+  if (!aColumns || !bColumns || !aOwners || !bOwners ||
+      aColumns->digits.size() != bColumns->digits.size() ||
+      aColumns->kernels.size() != bColumns->kernels.size())
+    return std::nullopt;
+
+  // values[inDim][pos]: the L output that `b`'s digit maps to. Each in dim's
+  // radix-2 `a` digits, in order, are the low bits of that output.
+  llvm::SmallDenseMap<StringAttr, SmallVector<int32_t>> values;
+  for (StringAttr inDim : inDims)
+    values[inDim].assign(b.getInDimSizeLog2(inDim), 0);
+  SmallVector<int32_t> aBit;
+  for (auto [column, digit] : llvm::enumerate(aColumns->digits)) {
+    bool sameDim =
+        column > 0 && aColumns->digits[column - 1].first == digit.first;
+    aBit.push_back(sameDim ? aBit.back() + 1 : 0);
+  }
+  // Binary digits: the canonical preimage; the k-th free `b` column takes the
+  // k-th `a` kernel vector, so the map is a bijection.
+  SmallVector<uint64_t> columnMap;
+  for (uint64_t image : bColumns->images) {
+    auto preimage = aColumns->preimage(image);
+    if (!preimage)
+      return std::nullopt;
+    columnMap.push_back(*preimage);
+  }
+  for (auto [k, column] : llvm::enumerate(bColumns->freeColumns))
+    columnMap[column] ^= aColumns->kernels[k];
+  for (auto [column, digit] : llvm::enumerate(bColumns->digits)) {
+    auto [inDim, pos] = digit;
+    for (auto [aColumn, aDigit] : llvm::enumerate(aColumns->digits)) {
+      if (!(columnMap[column] >> aColumn & 1))
+        continue;
+      if (aDigit.first != inDim)
+        return std::nullopt;
+      values[inDim][pos] |= 1 << aBit[aColumn];
+    }
+  }
+  // Odd digits: both own each odd coordinate from a register, and b's
+  // coefficient is f times a's, so the digit maps to f on L's top digit.
+  StringAttr kReg = *registerDim;
+  int64_t registerTwoPart = LinearLayout::twoPartOf(a.getInDimSize(kReg));
+  for (auto [index, outDim] : llvm::enumerate(a.getOutDimNames())) {
+    const auto &aOwner = (*aOwners)[index];
+    const auto &bOwner = (*bOwners)[index];
+    if (aOwner.has_value() != bOwner.has_value())
+      return std::nullopt;
+    if (!aOwner)
+      continue;
+    int32_t size = a.getOutDimSize(outDim);
+    int64_t oddPart = size / LinearLayout::twoPartOf(size);
+    auto inverse = inverseUnit(aOwner->coefficient, oddPart);
+    if (!inverse)
+      return std::nullopt;
+    int64_t factor = *inverse * bOwner->coefficient % oddPart;
+    values[kReg][bOwner->pos] = static_cast<int32_t>(factor * registerTwoPart);
+  }
+  // Every other input dimension must map to itself.
+  for (StringAttr inDim : inDims) {
+    if (isRegisterOrLane(inDim))
+      continue;
+    for (auto [pos, value] : llvm::enumerate(values[inDim]))
+      if (value != 1 << pos)
+        return std::nullopt;
+  }
+
+  auto makeFactor = [&](StringAttr dim) -> std::optional<LinearLayout> {
+    ArrayRef<int32_t> radices = b.getInputRadices(dim);
+    LinearLayout::BasesT bases;
+    LinearLayout::RadicesT inputRadices;
+    auto &dimBases = bases[dim];
+    for (int32_t value : values[dim])
+      dimBases.push_back({value});
+    inputRadices[dim].assign(radices.begin(), radices.end());
+    // Surjective onto an equal-size input: a bijection. Two odd register
+    // digits share one odd part, which the mixed-radix checks reject.
+    return LinearLayout::tryCreate(std::move(bases), std::move(inputRadices),
+                                   {{dim, a.getInDimSize(dim)}},
+                                   /*requireSurjective=*/true);
+  };
+  auto registerMap = makeFactor(kReg);
+  auto laneMap = makeFactor(*laneDim);
+  if (!registerMap || !laneMap)
+    return std::nullopt;
+
+  // registerOrder: output digit j, a's flat digit j, is input digit action[j].
+  ArrayRef<int32_t> radices = a.getInputRadices(kReg);
+  SmallVector<int32_t> oddLastRadices;
+  llvm::copy_if(radices, std::back_inserter(oddLastRadices),
+                [](int32_t radix) { return radix == 2; });
+  SmallVector<size_t> action;
+  size_t binary = 0, odd = oddLastRadices.size();
+  llvm::copy_if(radices, std::back_inserter(oddLastRadices),
+                [](int32_t radix) { return radix != 2; });
+  for (int32_t radix : radices)
+    action.push_back(radix == 2 ? binary++ : odd++);
+  return MixedRadixConversionInputMap{
+      std::move(*registerMap), std::move(*laneMap),
+      ColumnAction(action, kReg, radices.size(), oddLastRadices)};
+}
 
 static bool checkSquareSublayout(const LinearLayout &ll,
                                  ArrayRef<StringAttr> dimNames,
@@ -80,41 +471,46 @@ LinearLayout invertAndComposeLocal(const LinearLayout &A, const LinearLayout &B,
                       /*requireSurjective=*/false);
 }
 
-LinearLayout
-ensureLayoutNotLargerThan(const LinearLayout &layout,
-                          const llvm::SmallDenseMap<StringAttr, int64_t> &shape,
-                          bool broadcastRegisters) {
+// Under TRITON_ALLOW_NPOT an NPOT extent is held by its pow2 alloc shape; the
+// coordinates past the extent are dead.
+static int64_t getPow2AllocSize(int64_t size) {
+  if (!mlir::triton::tools::isNpotAllowed())
+    return size;
+  return llvm::PowerOf2Ceil(size);
+}
+
+LinearLayout ensureLayoutNotLargerThan(const LinearLayout &layout,
+                                       ArrayRef<StringAttr> dimNames,
+                                       ArrayRef<int64_t> shape,
+                                       bool broadcastRegisters) {
   assert(shape.size() == layout.getNumOutDims());
+  assert(dimNames.size() == shape.size());
+  assert(llvm::SmallDenseSet<StringAttr>(dimNames.begin(), dimNames.end())
+                 .size() == dimNames.size() &&
+         "duplicate dimension names given");
   if (shape.empty()) {
     return layout;
   }
-  MLIRContext *ctx = shape.begin()->first.getContext();
+  MLIRContext *ctx = dimNames.front().getContext();
   auto bases = layout.getBases();
   auto kRegister = StringAttr::get(ctx, "register");
   std::set<int32_t> broadcastedDims;
 
+  // Positional shape lookup by output-dim name (names map 1:1 to sizes).
+  auto desiredSizeFor = [&](StringAttr outDimName) {
+    auto it = llvm::find(dimNames, outDimName);
+    assert(it != dimNames.end());
+    return getPow2AllocSize(shape[it - dimNames.begin()]);
+  };
+
   for (auto outDim : llvm::enumerate(layout.getOutDimNames())) {
     auto outDimName = outDim.value();
-    // actualSize/desiredSize are the true (possibly NPOT) sizes; span/
-    // shrinkTarget are their pow2-rounded counterparts used for basis counting.
     int32_t actualSize = layout.getOutDimSize(outDimName);
-    int32_t desiredSize = shape.lookup(outDimName);
+    int32_t desiredSize = desiredSizeFor(outDimName);
     if (actualSize <= desiredSize) {
       continue;
     }
-    // NPOT desiredSize: shrink to the next pow2 and let the out-dim clamp below
-    // set the real size; modular reduction handles the overshoot at lowering.
-    // Zeroing the boundary basis instead would drop real elements. Pow2: no-op.
-    int32_t shrinkTarget =
-        llvm::isPowerOf2_32(desiredSize)
-            ? desiredSize
-            : static_cast<int32_t>(llvm::NextPowerOf2(desiredSize));
-    // Count the shrink against the pow2 basis span, not the NPOT out-dim size
-    // (else a basis terminates early). Identity for pow2 actualSize.
-    int32_t span = llvm::isPowerOf2_32(actualSize)
-                       ? actualSize
-                       : static_cast<int32_t>(llvm::NextPowerOf2(actualSize));
-    assert(span % shrinkTarget == 0);
+    assert(actualSize % desiredSize == 0);
     // <inDimName, basisIdx, outValue>
     std::vector<std::tuple<StringAttr, int, int>> sortedBases;
     for (auto [inDimName, basis] : bases) {
@@ -130,7 +526,7 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
     // From the largest basis to the smallest.
     llvm::sort(sortedBases,
                [](auto a, auto b) { return std::get<2>(a) > std::get<2>(b); });
-    for (size_t i = 0; i < sortedBases.size() && span > shrinkTarget;) {
+    for (size_t i = 0; i < sortedBases.size() && actualSize > desiredSize;) {
       int outValue = std::get<2>(sortedBases[i]);
       do {
         auto inDimName = std::get<0>(sortedBases[i]);
@@ -142,75 +538,85 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
         }
       } while (i < sortedBases.size() &&
                std::get<2>(sortedBases[i]) == outValue);
-      // Duplicate bases encode the same output bit and shrink the span only
+      // Duplicate bases encode the same output bit and halve actualSize only
       // after every copy has been removed.
-      span >>= 1;
+      actualSize >>= 1;
     }
   }
+  auto radices = layout.getInputRadices();
   if (!broadcastRegisters) {
     std::vector<std::vector<int32_t>> newBasesRegister;
+    std::vector<int32_t> newRadicesRegister;
     for (auto [idx, basis] : llvm::enumerate(bases[kRegister])) {
       if (broadcastedDims.find(idx) == broadcastedDims.end()) {
         newBasesRegister.push_back(std::move(basis));
+        newRadicesRegister.push_back(radices[kRegister][idx]);
       }
     }
     bases[kRegister] = std::move(newBasesRegister);
+    radices[kRegister] = std::move(newRadicesRegister);
   }
   auto outDims = layout.getOutDims();
   for (auto &[outDim, outDimSize] : outDims) {
-    outDimSize = std::min<int32_t>(outDimSize, shape.lookup(outDim));
+    outDimSize = std::min<int32_t>(outDimSize, desiredSizeFor(outDim));
   }
 
-  return LinearLayout(std::move(bases), std::move(outDims),
+  return LinearLayout(std::move(bases), std::move(radices), std::move(outDims),
                       /*requireSurjective=*/false);
 }
 
-// For each out-dim d, ensure the layout's out-size (i.e. its codomain) is no
-// smaller than shape[d].  Do this by increasing the size of the layout's inputs
-// along its most-minor dimension ("register" for register layouts, "offset" for
-// shared layouts).
-//
-// This function is invariant to the order of the layout's input dimensions, but
-// it cares about the order of the output dims, which should be minor-to-major.
-LinearLayout ensureLayoutNotSmallerThan(
-    const LinearLayout &layout,
-    const llvm::SmallDenseMap<StringAttr, int64_t> &shape) {
+LinearLayout
+ensureLayoutNotLargerThan(const LinearLayout &layout,
+                          const llvm::SmallDenseMap<StringAttr, int64_t> &shape,
+                          bool broadcastRegisters) {
+  SmallVector<StringAttr> dimNames;
+  SmallVector<int64_t> sizes;
+  for (auto &[dim, size] : shape) {
+    dimNames.push_back(dim);
+    sizes.push_back(size);
+  }
+  return ensureLayoutNotLargerThan(layout, dimNames, sizes, broadcastRegisters);
+}
+
+LinearLayout ensureLayoutNotSmallerThan(const LinearLayout &layout,
+                                        ArrayRef<StringAttr> dimNames,
+                                        ArrayRef<int64_t> shape,
+                                        StringAttr inDim) {
   assert(shape.size() == layout.getNumOutDims());
+  llvm::SmallDenseMap<StringAttr, int64_t> namedDims;
+  for (auto [dimName, length] : llvm::zip_equal(dimNames, shape))
+    namedDims[dimName] = length;
+  assert(namedDims.size() == shape.size() && "duplicate dimension names given");
   if (shape.empty()) {
     return layout;
   }
 
-  StringAttr kDim = *layout.getInDimNames().begin();
-  assert(kDim == "register" || kDim == "offset");
+  assert(layout.hasInDim(inDim));
 
   LinearLayout ret = layout;
   for (StringAttr outDimName : layout.getOutDimNames()) {
     int32_t actualSize = layout.getOutDimSize(outDimName);
-    int32_t desiredSize = shape.lookup(outDimName);
-    // Already covers the shape. This also handles a modular NPOT actualSize
-    // (e.g. re-lowering an already-built modular LinearEncodingAttr whose
-    // out-dim equals the shape): such a layout needs no growth, and the
-    // pow2 grow path below does not apply to it. Symmetric with
-    // ensureLayoutNotLargerThan's true-size early-exit.
-    if (actualSize >= desiredSize)
-      continue;
-    // Only a pow2 layout can still be too small here; grow it to the next
-    // pow2 >= an NPOT desiredSize (else desiredSize/actualSize floors, e.g.
-    // 192/128 == 1, and the register dim never grows, dropping real
-    // elements). A later ensureLayoutNotLargerThan clamps to the true NPOT
-    // size. Pow2: no-op.
-    assert(llvm::isPowerOf2_32(actualSize));
-    int32_t growTarget =
-        llvm::isPowerOf2_32(desiredSize)
-            ? desiredSize
-            : static_cast<int32_t>(llvm::NextPowerOf2(desiredSize));
-    if (actualSize >= growTarget)
-      continue;
-    assert(growTarget % actualSize == 0);
-    ret *= LinearLayout::identity1D(growTarget / actualSize, kDim, outDimName);
+    int32_t desiredSize = getPow2AllocSize(namedDims.lookup(outDimName));
+    assert(actualSize > desiredSize || desiredSize % actualSize == 0);
+    ret *=
+        LinearLayout::identity1D(desiredSize / actualSize, inDim, outDimName);
     assert(ret.getOutDimSize(outDimName) >= desiredSize);
   }
   return ret;
+}
+
+LinearLayout ensureLayoutNotSmallerThan(
+    const LinearLayout &layout,
+    const llvm::SmallDenseMap<StringAttr, int64_t> &shape) {
+  StringAttr kDim = *layout.getInDimNames().begin();
+  assert(kDim == "register" || kDim == "offset");
+  SmallVector<StringAttr> dimNames;
+  SmallVector<int64_t> sizes;
+  for (auto &[dim, size] : shape) {
+    dimNames.push_back(dim);
+    sizes.push_back(size);
+  }
+  return ensureLayoutNotSmallerThan(layout, dimNames, sizes, kDim);
 }
 
 // Returns ["dim0", "dim1", ..., "dim<rank-1>"].
@@ -238,13 +644,6 @@ standardOutDimPairs(MLIRContext *ctx, ArrayRef<int64_t> dstShape) {
 // Returns a 1D -> ND layout into [dim0, dim1, ...] that's equivalent to
 // creating a 1D -> 1D mapping of size product(shape) and then reshaping to
 // permute(shape, order).
-LinearLayout identity1DForShape(int32_t size, StringAttr inDim,
-                                StringAttr outDim) {
-  if (size == 0 || llvm::isPowerOf2_32(size))
-    return LinearLayout::identity1D(size, inDim, outDim);
-  return LinearLayout::modularIdentity1D(size, inDim, outDim);
-}
-
 LinearLayout identityStandardND(StringAttr inDimName, ArrayRef<unsigned> shape,
                                 ArrayRef<unsigned> order) {
   assert(shape.size() == order.size());
@@ -258,7 +657,7 @@ LinearLayout identityStandardND(StringAttr inDimName, ArrayRef<unsigned> shape,
   for (int i = 0; i < shape.size(); i++) {
     // Start with the most-minor dimension, which is order[0].
     int dim = order[i];
-    ret *= identity1DForShape(shape[dim], inDimName, outDimNames[dim]);
+    ret *= LinearLayout::identity1D(shape[dim], inDimName, outDimNames[dim]);
   }
   return ret;
 }
@@ -358,16 +757,38 @@ LinearLayout renameLinearLayoutDims(
   auto outRenames = getRenames(layout.getOutDimNames(), outDimRenames);
 
   LinearLayout::BasesT bases;
+  LinearLayout::RadicesT radices;
   for (auto [inDim, inDimBases] : layout.getBases()) {
     StringAttr renamed = inRenames.lookup(inDim);
     bases.insert({renamed ? renamed : inDim, inDimBases});
+    radices.insert(
+        {renamed ? renamed : inDim, layout.getInputRadices().lookup(inDim)});
   }
   SmallVector<std::pair<StringAttr, int32_t>> outDims;
   for (auto [outDim, size] : layout.getOutDims()) {
     StringAttr renamed = outRenames.lookup(outDim);
     outDims.push_back({renamed ? renamed : outDim, size});
   }
-  return LinearLayout(std::move(bases), outDims,
+  if (layout.hasOddPartForm())
+    return LinearLayout(std::move(bases), std::move(radices), outDims,
+                        /*requireSurjective=*/layout.isSurjective());
+  // A general offset table is keyed by dim names, so it is renamed with them.
+  llvm::MapVector<StringAttr, SmallVector<std::pair<StringAttr, int32_t>>>
+      digits;
+  llvm::MapVector<StringAttr, std::vector<int32_t>> offsets;
+  for (StringAttr outDim : layout.getOutDimNames()) {
+    if (layout.getTableDigits(outDim).empty())
+      continue;
+    StringAttr renamed = outRenames.lookup(outDim);
+    renamed = renamed ? renamed : outDim;
+    for (auto [inDim, pos] : layout.getTableDigits(outDim)) {
+      StringAttr inRenamed = inRenames.lookup(inDim);
+      digits[renamed].push_back({inRenamed ? inRenamed : inDim, pos});
+    }
+    offsets[renamed] = layout.getTableOffsets(outDim).vec();
+  }
+  return LinearLayout(std::move(bases), std::move(radices), outDims,
+                      std::move(digits), std::move(offsets),
                       /*requireSurjective=*/layout.isSurjective());
 }
 
@@ -395,7 +816,7 @@ std::optional<ColumnAction> regPermForDivide(const LinearLayout &A,
   llvm::DenseMap<StringAttr, unsigned> log2QuotSize;
   for (StringAttr out : A.getOutDimNames()) {
     log2QuotSize[out] =
-        A.getOutDimSizeBits(out) - BBroadcast.getOutDimSizeBits(out);
+        A.getOutDimSizeLog2(out) - BBroadcast.getOutDimSizeLog2(out);
     if (log2QuotSize[out] < 0)
       return std::nullopt;
   }
@@ -456,7 +877,8 @@ ColumnAction actionRemoveBroadcastedRegs(const LinearLayout &layout) {
       permOrder.push_back(i);
     }
   }
-  return ColumnAction(permOrder, kReg, bases.size());
+  return ColumnAction(permOrder, kReg, bases.size(),
+                      layout.getInputRadices(kReg));
 }
 std::pair<int64_t, ColumnAction>
 actionAdditiveStrides(const LinearLayout &layout, const LinearLayout addrLayout,
@@ -535,6 +957,23 @@ SmallVector<Value> broadcastAs(const SmallVector<Value> &values,
   auto kReg = *layout.getInDimNames().begin();
   assert(kReg.str() == "register");
   uint32_t broadcastMask = layout.getFreeVariableMasks().lookup(kReg);
+  auto radices = layout.getInputRadices(kReg);
+  if (llvm::any_of(radices, [](int32_t radix) { return radix != 2; })) {
+    // A unique register is the mixed-radix number of the unmasked digits.
+    SmallVector<Value> ret;
+    for (int32_t i = 0; i < layout.getInDimSize(kReg); ++i) {
+      int32_t rest = i, srcIdx = 0, weight = 1;
+      for (auto [digit, radix] : llvm::enumerate(radices)) {
+        if (!(broadcastMask & (1u << digit))) {
+          srcIdx += rest % radix * weight;
+          weight *= radix;
+        }
+        rest /= radix;
+      }
+      ret.push_back(values[srcIdx]);
+    }
+    return ret;
+  }
   assert((layout.getInDimSize(kReg) / (1 << llvm::popcount(broadcastMask))) ==
          values.size());
 
@@ -590,11 +1029,11 @@ SmallVector<StringAttr> supremum(const SmallVector<StringAttr> &x,
     }
     int candX = INF, candY = INF;
     if (i < x.size()) {
-      if (posY.count(x[i]) && posY[x[i]] >= j)
+      if (posY.contains(x[i]) && posY[x[i]] >= j)
         candX = posY[x[i]];
     }
     if (j < y.size()) {
-      if (posX.count(y[j]) && posX[y[j]] >= i)
+      if (posX.contains(y[j]) && posX[y[j]] >= i)
         candY = posX[y[j]];
     }
     if (i < x.size() && candX == INF) {
@@ -624,6 +1063,12 @@ SmallVector<StringAttr> supremum(const SmallVector<StringAttr> &x,
 
 LinearLayout reshapeLayout(MLIRContext *ctx, LinearLayout layout,
                            ArrayRef<int64_t> shape) {
+  // reshapeOuts needs pow2 out dims.
+  if (layout.hasNonPow2OutDim()) {
+    std::optional<LinearLayout> reshaped = tryReshapeLayout(ctx, layout, shape);
+    assert(reshaped && "the reshape splits a non-pow2 index digit");
+    return *reshaped;
+  }
   int rank = shape.size();
   auto srcOutDims = to_vector(layout.getOutDimNames());
   std::reverse(srcOutDims.begin(), srcOutDims.end());
@@ -632,6 +1077,71 @@ LinearLayout reshapeLayout(MLIRContext *ctx, LinearLayout layout,
   return layout.transposeOuts(srcOutDims)
       .reshapeOuts(newOutDims)
       .transposeOuts(standardOutDimNames(ctx, rank));
+}
+
+namespace {
+// The digits of a row-major index into `shape`, least significant first: each
+// dim's binary digits, then one odd digit if its size is not a power of two.
+struct IndexDigits {
+  SmallVector<int32_t> radices;
+  SmallVector<int32_t> dimOf;
+  SmallVector<int32_t> firstOf;
+};
+
+IndexDigits getIndexDigits(ArrayRef<int64_t> shape) {
+  IndexDigits digits;
+  digits.firstOf.resize(shape.size());
+  for (int dim = shape.size() - 1; dim >= 0; --dim) {
+    digits.firstOf[dim] = digits.radices.size();
+    int32_t size = shape[dim];
+    int32_t twoPart = LinearLayout::twoPartOf(size);
+    digits.radices.append(llvm::Log2_32(twoPart), 2);
+    if (size != twoPart)
+      digits.radices.push_back(size / twoPart);
+    digits.dimOf.resize(digits.radices.size(), dim);
+  }
+  return digits;
+}
+} // namespace
+
+std::optional<LinearLayout> tryReshapeLayout(MLIRContext *ctx,
+                                             const LinearLayout &layout,
+                                             ArrayRef<int64_t> shape) {
+  if (!layout.hasOddPartForm())
+    return std::nullopt;
+  auto srcDims = to_vector(layout.getOutDimNames());
+  SmallVector<int64_t> srcShape;
+  for (StringAttr dim : srcDims)
+    srcShape.push_back(layout.getOutDimSize(dim));
+  IndexDigits src = getIndexDigits(srcShape);
+  IndexDigits dst = getIndexDigits(shape);
+  if (src.radices != dst.radices)
+    return std::nullopt;
+  // Each coefficient keeps its digit; an odd digit sits above its new dim's
+  // binary digits, so its coefficient is scaled by their weight.
+  LinearLayout::BasesT bases;
+  for (const auto &[inDim, inDimBases] : layout.getBases()) {
+    auto &newBases = bases[inDim];
+    for (int32_t digit = 0, e = inDimBases.size(); digit < e; ++digit) {
+      std::vector<int32_t> basis(shape.size(), 0);
+      for (auto [i, outDim] : llvm::enumerate(srcDims)) {
+        auto [binary, odd] = layout.getBasisContribution(inDim, digit, outDim);
+        int32_t numBinary = llvm::Log2_32(
+            LinearLayout::twoPartOf(layout.getOutDimSize(outDim)));
+        for (int32_t pos = 0; pos <= numBinary; ++pos) {
+          int32_t coeff = pos < numBinary ? (binary >> pos) & 1 : odd;
+          if (coeff == 0)
+            continue;
+          int32_t flat = src.firstOf[i] + pos;
+          int32_t dim = dst.dimOf[flat];
+          basis[dim] += coeff << (flat - dst.firstOf[dim]);
+        }
+      }
+      newBases.push_back(std::move(basis));
+    }
+  }
+  return LinearLayout(std::move(bases), layout.getInputRadices(),
+                      standardOutDimPairs(ctx, shape), layout.isSurjective());
 }
 
 LinearLayout transposeLinearLayout(LinearLayout layout, ArrayRef<int> order) {
@@ -647,6 +1157,15 @@ LinearLayout transposeLinearLayout(LinearLayout layout, ArrayRef<int> order) {
       }
       b = std::move(newB);
     }
+  }
+  if (!layout.isRadix2()) {
+    // NPOT sizes are not inferable from bases: each dim takes its source's.
+    auto names = to_vector(layout.getOutDimNames());
+    SmallVector<std::pair<StringAttr, int32_t>> outDims;
+    for (auto [name, src] : llvm::zip_equal(names, order))
+      outDims.push_back({name, layout.getOutDimSize(names[src])});
+    return LinearLayout(std::move(namedBases), layout.getInputRadices(),
+                        outDims, /*requireSurjective=*/false);
   }
   return LinearLayout(std::move(namedBases),
                       to_vector(layout.getOutDimNames()));
@@ -689,11 +1208,14 @@ largestVectorisation(MLIRContext *ctx, const LinearLayout &cvt, int bitwidth,
 std::optional<LinearLayout> getReps(const LinearLayout &cvt,
                                     const LinearLayout &tile) {
 
-  // Ensure tile out-dims are subset of cvt out-dims.
-  for (auto od : tile.getOutDimNames())
+  // The full tile must fit even when cvt is a view of it.
+  for (auto od : tile.getOutDimNames()) {
     assert(cvt.hasOutDim(od) && "tile out-dims must be contained in cvt");
+    if (tile.getOutDimSize(od) > cvt.getOutDimSize(od))
+      return std::nullopt;
+  }
 
-  // Build a per-out-dimension mask by OR-ing all tile bases that touch it.
+  // Include bases outside the view so repetitions cannot overlap the full tile.
   llvm::SmallDenseMap<StringAttr, int32_t> tileMaskPerOutDim;
   auto tileInDims = llvm::to_vector(tile.getInDimNames());
   for (StringAttr od : cvt.getOutDimNames())
@@ -705,13 +1227,7 @@ std::optional<LinearLayout> getReps(const LinearLayout &cvt,
   LinearLayout::BasesT repsBases;
   for (StringAttr id : cvt.getInDimNames()) {
     int inA = cvt.getInDimSizeLog2(id);
-    int inB = tile.hasInDim(id) ? tile.getInDimSizeLog2(id) : 0;
-    if (inB > inA) {
-      return std::nullopt;
-    }
-
-    std::vector<std::vector<int32_t>> basesForDim;
-    basesForDim.reserve(inA);
+    int inB = tile.hasInDim(id) ? std::min(inA, tile.getInDimSizeLog2(id)) : 0;
 
     // 1) Validate the starting bases match exactly.
     for (int i = 0; i < inB; ++i) {
@@ -740,17 +1256,9 @@ std::optional<LinearLayout> getReps(const LinearLayout &cvt,
     }
 
     // 3) Emit reps bases: first inB as all-zeros; remainder copied from cvt.
-    for (int i = 0; i < inB; ++i) {
-      std::vector<int32_t> zero(cvt.getNumOutDims(), 0);
-      basesForDim.push_back(std::move(zero));
-    }
-    for (int i = inB; i < inA; ++i) {
-      std::vector<int32_t> keep;
-      keep.reserve(cvt.getNumOutDims());
-      for (StringAttr od : cvt.getOutDimNames())
-        keep.push_back(cvt.getBasis(id, i, od));
-      basesForDim.push_back(std::move(keep));
-    }
+    auto basesForDim = cvt.getBases().lookup(id);
+    for (int i = 0; i < inB; ++i)
+      std::fill(basesForDim[i].begin(), basesForDim[i].end(), 0);
 
     repsBases[id] = std::move(basesForDim);
   }

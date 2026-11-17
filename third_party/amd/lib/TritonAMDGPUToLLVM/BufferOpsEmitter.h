@@ -2,7 +2,6 @@
 #define TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_BUFFEROPSEMITTER_H_
 
 #include "TargetInfo.h"
-#include "TritonAMDGPUToLLVM/GCNAsmFormat.h"
 
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
@@ -64,7 +63,7 @@ struct BufferEmitter {
 
   // Create a resource descriptor that points to the area of memory we want to
   // load from
-  Value createResourceDescriptor(Value basePtr, Value inferredStride = nullptr);
+  Value createResourceDescriptor(Value basePtr);
 
   // Emit a predicated rocdl.raw.ptr.buffer.load
   Value emitLoad(Type type, Value rsrcDesc, Value offset, Value pred,
@@ -82,7 +81,7 @@ struct BufferEmitter {
 
   // Emit a predicated rocdl.raw.ptr.buffer.atomic.* RMWOp
   Value emitAtomicRMW(RMWOp rmwType, Type type, Value rsrcDesc, Value offset,
-                      Value data, Value pred, bool hasUsers);
+                      Value data, Value pred, bool hasUsers, bool clusterScope);
 
   // Emit a predicated rocdl.raw.ptr.buffer.atomic.cmpswap
   Value emitAtomicCAS(Type type, Value rsrcDesc, Value offset, Value casCmpVal,
@@ -101,8 +100,8 @@ private:
 
   // Fill buffer atomics arguments
   void fillCommonArgsAtomics(Type type, Value rsrcDesc, Value vOffsetElems,
-                             Value pred, bool hasUsers, int32_t &aux,
-                             SmallVector<Value> &args);
+                             Value pred, bool hasUsers, bool clusterScope,
+                             int32_t &aux, SmallVector<Value> &args);
 
   // Given a type, the buffer type can be either the same type
   // or a packed version. E.g., a vector of 8xfp16 can be bitcasted to

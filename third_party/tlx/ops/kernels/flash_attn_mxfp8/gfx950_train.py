@@ -17,9 +17,12 @@ scale 0.5 and N=1024/2048/4096/8192, causal or noncausal, a specialized
 backward shares square32 Q/K/dO quantization and materializes FP8 dS for reuse
 by the Q owner. It also supports N8192 noncausal at scale 1.3. Each gradient
 has a single writer and accumulates deterministically in FP32. Whole, aligned
-storage is required. Temporary storage is 128*N*N + 128*(N//32)**2 + 34816*N
+storage is required. Full-gradient temporary storage is 128*N*N + 128*(N//32)**2 + 34816*N
 bytes, up to 8 GiB + 280 MiB at N8192, excluding gradients and saved inputs.
-Causal calls allocate the same dense workspace. Other configurations use the
+Causal calls allocate the same dense workspace. Backward computes only requested gradients.
+Calls without dQ omit the dQ consumer and dense dS workspace.
+V-only calls also omit V quantization, Delta, dP, and dS.
+Other configurations use the
 general implementation; allocation or kernel failures are not retried.
 """
 
@@ -498,6 +501,7 @@ class _MXFP8Attention(torch.autograd.Function):
         from .gfx950_bwd_shared import (_SAVED_QK_ARENA_FORMAT, _check_saved_qk_backward_tensors, _saved_qk_arena_views,
                                         _try_launch_backward_shared_square)
 
+        needs_input_grad = ctx.needs_input_grad[:3]
         if ctx.saved_format == _SAVED_QK_ARENA_FORMAT:
             q, k, v, qk_arena, out, lse = ctx.saved_tensors
             if qk_arena.device != q.device or q.shape != k.shape or q.shape != v.shape:
@@ -520,7 +524,8 @@ class _MXFP8Attention(torch.autograd.Function):
             # O come from the same hardware-exp forward. Keep BF16 V/dO for
             # backward preparation rather than requantizing saved FP8 data.
             shared_args = (q_fp8, k_fp8, q_scale, k_scale, v, do_bf16, out, lse, ctx.sm_scale)
-            shared_grads = _try_launch_backward_shared_square(*shared_args, causal=ctx.causal, lse_split=lse_split)
+            shared_grads = _try_launch_backward_shared_square(*shared_args, causal=ctx.causal, lse_split=lse_split,
+                                                              needs_input_grad=needs_input_grad)
             if shared_grads is not None:
                 dq, dk, dv = shared_grads
                 return dq, dk, dv, None, None
@@ -536,14 +541,15 @@ class _MXFP8Attention(torch.autograd.Function):
                                  k_dq_scale), (v_bwd,
                                                v_scale), (do_fp8,
                                                           do_scale), (do_dv, do_dv_scale) = (quantize_backward_operands(
-                                                              q, k, v, do_bf16, transpose_storage=True))
-            dq = torch.empty_like(q)
-            dk = torch.empty_like(k)
-            dv = torch.empty_like(v)
-            delta = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
+                                                              q, k, v, do_bf16, transpose_storage=True,
+                                                              needs_input_grad=needs_input_grad))
+            dq, dk, dv = (torch.empty_like(tensor) if needed else None
+                          for tensor, needed in zip((q, k, v), needs_input_grad))
+            delta = (torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
+                     if any(needs_input_grad[:2]) else None)
             launch_backward(do_fp8, do_dv, q_fp8, q_dk, k_fp8, k_dq, v_bwd, out, lse, q_scale, q_dk_scale, k_scale,
                             k_dq_scale, v_scale, do_scale, do_dv_scale, ctx.sm_scale, do_bf16, dq, dk, dv, delta,
-                            causal=ctx.causal, lse_split=lse_split)
+                            causal=ctx.causal, lse_split=lse_split, needs_input_grad=needs_input_grad)
         return dq, dk, dv, None, None
 
 

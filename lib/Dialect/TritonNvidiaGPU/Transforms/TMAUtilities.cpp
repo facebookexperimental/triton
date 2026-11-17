@@ -34,14 +34,16 @@ int64_t getDescriptorLoadBytes(Operation *op, RankedTensorType tensorType,
                                Value desc) {
   auto encoding = getEncodingFromDescriptor(op, tensorType, desc);
   auto shapePerCTA = ttg::getShapePerCTA(encoding, tensorType.getShape());
-  return product(shapePerCTA) *
-         getIntOrFloatOrPtrBitWidth(tensorType.getElementType()) / 8;
+  int64_t bytes = product(shapePerCTA) *
+                  getIntOrFloatOrPtrBitWidth(tensorType.getElementType()) / 8;
+  return isFp6Padded(encoding) ? bytes * 3 / 4 : bytes;
 }
 
 int64_t getDescriptorLoadBytes(ttg::MemDescType memDescType) {
   auto shapePerCTA = ttg::getShapePerCTA(memDescType);
-  return product(shapePerCTA) *
-         getIntOrFloatOrPtrBitWidth(memDescType.getElementType()) / 8;
+  int64_t bytes = product(shapePerCTA) *
+                  getIntOrFloatOrPtrBitWidth(memDescType.getElementType()) / 8;
+  return isFp6Padded(memDescType.getEncoding()) ? bytes * 3 / 4 : bytes;
 }
 
 Value sextI16ToI32Indices(Value indices, OpBuilder &builder, Location loc) {
@@ -54,7 +56,7 @@ Value sextI16ToI32Indices(Value indices, OpBuilder &builder, Location loc) {
 
 bool hasCGABroadcast(ttg::MemDescType memDescType) {
   auto kBlock = StringAttr::get(memDescType.getContext(), "block");
-  return ttg::toLinearLayout(memDescType)
+  return ttg::toLinearLayoutIgnoringPadding(memDescType)
              .getFreeVariableMasks()
              .lookup(kBlock) != 0;
 }
@@ -80,6 +82,10 @@ FailureOr<int> getTMASwizzleMode(Location loc, tt::TensorDescInterface ty) {
                              "supports 128-byte swizzling, but got "
                           << swizzleBytes;
   }
+
+  if (isFp6Padded(encoding) && swizzleBytes != 0 && swizzleBytes != 128)
+    return emitError(loc)
+           << "fp6 padded TMA operands require 0/128-byte swizzling";
 
   int32_t swizzleMode = 0;
   if (swizzleBytes == 128) {
@@ -118,6 +124,9 @@ FailureOr<int> getTMAElementType(Location loc, tt::TensorDescInterface ty) {
   auto encoding = ty.getSharedLayout();
   bool fp4Padded = isFp4Padded(encoding);
 
+  auto mma = dyn_cast_if_present<gpu::NVMMASharedEncodingAttr>(encoding);
+  if (mma && mma.isPaddedFp6())
+    return TMA_B6X16_P32;
   if (fp4Padded)
     return TMA_B4X16_P64;
 
@@ -164,7 +173,7 @@ LogicalResult createTMADesc(Value tmaPtr, MakeTensorDescOp op,
   auto encoding = op.getType().getSharedLayout();
   auto mmaEncoding =
       llvm::dyn_cast_or_null<gpu::NVMMASharedEncodingAttr>(encoding);
-  bool fp4Padded = mmaEncoding && mmaEncoding.getFp4Padded();
+  bool fp4Padded = mmaEncoding && mmaEncoding.isPaddedFp4();
 
   auto shapePerCTA = gpu::getShapePerCTA(encoding, op.getType().getShape());
   // MakeTensorDescOp creates tiled descriptors (not im2col)

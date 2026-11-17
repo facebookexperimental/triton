@@ -2,8 +2,11 @@
 
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "triton/Analysis/CallGraph.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
 namespace mlir::triton::gpu {
@@ -15,6 +18,7 @@ using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
+constexpr int32_t kMinRegisters = 24;
 constexpr int32_t kMinRegistersForAssertOrPrint = 32;
 
 static bool regionUsesAssertOrPrint(Region &region) {
@@ -115,6 +119,38 @@ static void padToMaxWarpGroups(WarpSpecializeOp op, int numExtraWarpGroups) {
   partitions.erase();
 }
 
+static LogicalResult annotateWarpIdOffsets(ModuleOp mod) {
+  triton::CallGraph<int> callGraph(mod);
+  DenseMap<FunctionOpInterface, int> offsets;
+  for (auto root : callGraph.getRoots())
+    offsets[root] = 0;
+
+  LogicalResult result = success();
+  callGraph.walk(
+      [&](CallOpInterface call, FunctionOpInterface callee) {
+        auto caller = call->getParentOfType<FunctionOpInterface>();
+        int start = getWarpGroupStartWarpId(call->getBlock())
+                        .value_or(offsets.lookup(caller));
+        // Equal-sized partitions can share a helper when their starts have
+        // the same remainder modulo the helper's warp count.
+        int offset = start % lookupNumWarps(callee);
+        auto [it, inserted] = offsets.try_emplace(callee, offset);
+        if (!inserted && it->second != offset) {
+          call.emitError("callee is used with incompatible warp ID offsets");
+          result = failure();
+        }
+      },
+      [](FunctionOpInterface) {});
+  if (failed(result))
+    return failure();
+
+  Builder b(mod.getContext());
+  for (auto [func, offset] : offsets)
+    if (!isKernel(func))
+      func->setAttr(AttrWarpIdOffsetName, b.getI32IntegerAttr(offset));
+  return success();
+}
+
 namespace {
 struct AllocateWarpGroups
     : public mlir::triton::gpu::impl::TritonGPUAllocateWarpGroupsBase<
@@ -191,6 +227,9 @@ struct AllocateWarpGroups
       op.setWarpGroupStartIds(startIds);
     });
 
+    if (failed(annotateWarpIdOffsets(mod)))
+      return signalPassFailure();
+
     Builder b(&getContext());
     mod->setAttr("ttg.total-num-warps",
                  b.getI32IntegerAttr(baseNumWarps + numExtraWarpGroups * 4));
@@ -251,8 +290,11 @@ struct AllocateWarpGroups
       SmallVector<WarpGroupPartition> orderedPartitions;
       for (auto [startId, partition, estRegs, numWarps] : llvm::zip(
                startIds, op.getPartitionRegions(), requestedRegisters, arr)) {
-        int minRegs =
-            minRegistersForRegion(*partition, laterInstrumentation, estRegs);
+        // Preserve beta's -1 unspecified sentinel: clamp only explicitly
+        // requested (positive) estimates up to NVVM's legal minimum.
+        int minRegs = minRegistersForRegion(
+            *partition, laterInstrumentation,
+            estRegs > 0 ? std::max(estRegs, kMinRegisters) : estRegs);
         orderedPartitions.push_back({startId, partition, minRegs, numWarps});
       }
       llvm::sort(orderedPartitions,
@@ -340,7 +382,7 @@ struct AllocateWarpGroups
       if (sharingThreads > 0) {
         sharedRegs = remainingRegs / sharingThreads;
         sharedRegs = sharedRegs / 8 * 8;
-        int minSharedRegs = 24;
+        int minSharedRegs = kMinRegisters;
         if (defaultRegs < 0)
           minSharedRegs = minRegistersForRegion(
               op.getDefaultRegion(), laterInstrumentation, minSharedRegs);

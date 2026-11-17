@@ -72,7 +72,7 @@ __all__ = [
 
 @constexpr_function
 def cdiv(x: int, y: int):
-    return (x + y - 1) // y
+    return (x + (y - 1)) // y
 
 
 @constexpr_function

@@ -66,6 +66,7 @@ from ._core import (
     num_ctas,
     histogram,
     inline_asm_elementwise,
+    inline_asm,
     join,
     load,
     map_elementwise,
@@ -129,7 +130,11 @@ from ._math import (
     ceil,
 )
 from ._standard import (
+    all,
+    any,
     cdiv,
+    cumprod,
+    cumsum,
     full_like,
     max,
     min,

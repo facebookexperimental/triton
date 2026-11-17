@@ -17,6 +17,7 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <bit>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -376,7 +377,7 @@ std::pair<SmallVector<Value>, SmallVector<Value>> lowerTMemLdSt(
 
   Value warpId = WarpIdOp::create(rewriter, loc);
   // Keep this warp-base calculation synchronized with
-  // getTMemLdStWarpAddresses.
+  // getTMemLdStThreadAddresses.
   // Map warpId to rows 32 and 64.
   auto warpIdInGroup = b.and_(warpId, b.i32_val(3));
   tmemBase = b.add(tmemBase, b.shl(warpIdInGroup, b.i32_val(5 + 16)));
@@ -484,6 +485,25 @@ lowerTMemLdStFromTypes(
       computeTMemLdStEncodingInfo(regTy, memTy, maxnreg, diag);
   if (failed(encodingInfoOr))
     return failure();
+  ArrayRef<int32_t> paddedRegs = encodingInfoOr->npotPaddedRegs;
+  if (!paddedRegs.empty()) {
+    SmallVector<Value> paddedVals;
+    for (int32_t r : vals.empty() ? ArrayRef<int32_t>() : paddedRegs)
+      paddedVals.push_back(
+          r < 0 ? LLVM::ZeroOp::create(rewriter, loc, llvmElemTy) : vals[r]);
+    auto result =
+        lowerTMemLdStFromInfo(loc, rewriter, *encodingInfoOr, pred, llvmElemTy,
+                              paddedVals, tmemBase, redOp, useAbs, useNaN);
+    if (vals.empty() && !result.first.empty()) {
+      SmallVector<Value> outVals(
+          llvm::count_if(paddedRegs, [](int32_t r) { return r >= 0; }));
+      for (auto [paddedReg, r] : llvm::enumerate(paddedRegs))
+        if (r >= 0)
+          outVals[r] = result.first[paddedReg];
+      result.first = std::move(outVals);
+    }
+    return result;
+  }
   return lowerTMemLdStFromInfo(loc, rewriter, *encodingInfoOr, pred, llvmElemTy,
                                vals, tmemBase, redOp, useAbs, useNaN);
 }
@@ -566,7 +586,6 @@ struct TensorMemoryLoadOpConversion
 
     Value resultStruct = packUniqueTensorElements(
         loc, getTypeConverter(), resultVals, rewriter, op.getType());
-    // TMEM waits are inserted at the TTGIR level for memory ordering.
 
     // tcgen05.ld.red honors true register dependencies without a wait.
     if (redOp)
@@ -686,15 +705,15 @@ createBlockedScalesSMEMDescriptor(ConversionPatternRewriter &rewriter,
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   static_assert(sizeof(NVIDIA::SMEMDescriptor) == 8,
                 "Descriptor size should be 64 bits.");
-  NVIDIA::SMEMDescriptor desc;
-  desc.descriptor = 1ULL << 46;
+  NVIDIA::SMEMDescriptor desc =
+      std::bit_cast<NVIDIA::SMEMDescriptor>(1ULL << 46);
   desc.swizzlingMode = 0;                    // No swizzling for now
   desc.leadDimensionBaseOffset = 16 >> 4;    // 16 bytes
   desc.strideDimensionBaseOffset = 128 >> 4; // 8 x 16 bytes
   // See matrix-descriptor-encode(x) function in the ptx doc.
   // matrix-descriptor-encode(addr) = (addr & 0x3FFFF) >> 4
   auto smemAddr = b.ptrtoint(i64_ty, baseSrc);
-  return b.add(b.int_val(64, desc.descriptor),
+  return b.add(b.int_val(64, std::bit_cast<uint64_t>(desc)),
                b.lshr(b.shl(smemAddr, b.int_val(64, 46)), b.int_val(64, 50)));
 }
 
@@ -782,9 +801,11 @@ static LogicalResult copySharedToTmem(ConversionPatternRewriter &rewriter,
     if (col & holeMask)
       continue;
     auto desc = loader->smemLoad(0, logicalCol, rewriter, loc);
+    if (failed(desc))
+      return failure();
     auto tmemAddr =
         b.add(b.ptrtoint(i32_ty, baseDst), b.i32_val(col * bitwidth / 32));
-    createTcgen05Cp(rewriter, loc, tmemAddr, desc, pred, atom, twoCTAs);
+    createTcgen05Cp(rewriter, loc, tmemAddr, *desc, pred, atom, twoCTAs);
     logicalCol += instrShape[1];
   }
   return success();

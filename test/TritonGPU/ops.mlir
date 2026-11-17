@@ -113,10 +113,19 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
 
 // -----
 
+
 #shared_a = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
 #shared_b = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#fp6 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8, padding = "b6x16_p32"}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @memdesc_reinterpret_fp6
+  tt.func @memdesc_reinterpret_fp6(%arg: !ttg.memdesc<8x128xi8, #fp6, #smem>) {
+    // CHECK: ttg.memdesc_reinterpret
+    %0 = ttg.memdesc_reinterpret %arg : !ttg.memdesc<8x128xi8, #fp6, #smem> -> !ttg.memdesc<8x64xi16, #shared_a, #smem>
+    tt.return
+  }
+
   // CHECK-LABEL: @memdesc_reinterpret_multibuffer_prefix_subview
   tt.func @memdesc_reinterpret_multibuffer_prefix_subview(%arg0: !ttg.memdesc<3x8x32xf16, #shared_a, #smem, 8x8x32>) {
     // CHECK: ttg.memdesc_reinterpret
@@ -328,7 +337,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @tmem_reinterpret_packed_subview_owns_column
   tt.func @tmem_reinterpret_packed_subview_owns_column(%arg0: !ttg.memdesc<128x4xi8, #tmem, #ttng.tensor_memory, mutable>) {
     %view = ttng.tmem_subslice %arg0 {offset = 0 : i32} : !ttg.memdesc<128x4xi8, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x2xi8, #tmem, #ttng.tensor_memory, mutable, 128x4>
-    %result = ttg.memdesc_reinterpret %view : !ttg.memdesc<128x2xi8, #tmem, #ttng.tensor_memory, mutable, 128x4> -> !ttg.memdesc<128x4xi8, #tmem, #ttng.tensor_memory, mutable>
+    %result = ttg.memdesc_reinterpret %view : !ttg.memdesc<128x2xi8, #tmem, #ttng.tensor_memory, mutable, 128x4> -> !ttg.memdesc<128x4xi8, #ttng.tensor_memory_encoding<blockM = 128, blockN = 4, colStride = 1>, #ttng.tensor_memory, mutable>
     tt.return
   }
 
@@ -338,6 +347,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %indexed = ttg.memdesc_index %stages[%index] : !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable, 5x128x128> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     %result = ttg.memdesc_reinterpret %stages : !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable, 5x128x128> -> !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     %last = ttng.tmem_subslice %stages {offset = 1 : i32, dim = 0 : i32} : !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable, 5x128x128> -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable, 5x128x128>
+    tt.return
+  }
+}
+
+// -----
+
+#tmem128 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 32, colStride = 1>
+#tmem64 = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @tmem_subslice_rows_within_block
+  // CHECK: ttng.tmem_subslice {{.*}} -> !ttg.memdesc<64x32xf32, #{{.*}}, #ttng.tensor_memory, mutable, 128x32>
+  // CHECK: ttng.tmem_subslice {{.*}} -> !ttg.memdesc<32x64xf32, #{{.*}}, #ttng.tensor_memory, mutable, 64x64>
+  tt.func @tmem_subslice_rows_within_block(%m128: !ttg.memdesc<128x32xf32, #tmem128, #ttng.tensor_memory, mutable>, %m64: !ttg.memdesc<64x64xf32, #tmem64, #ttng.tensor_memory, mutable>) {
+    %rows128 = ttng.tmem_subslice %m128 {offset = 64 : i32, dim = 0 : i32} : !ttg.memdesc<128x32xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<64x32xf32, #tmem128, #ttng.tensor_memory, mutable, 128x32>
+    %rows64 = ttng.tmem_subslice %m64 {offset = 32 : i32, dim = 0 : i32} : !ttg.memdesc<64x64xf32, #tmem64, #ttng.tensor_memory, mutable> -> !ttg.memdesc<32x64xf32, #tmem64, #ttng.tensor_memory, mutable, 64x64>
     tt.return
   }
 }
