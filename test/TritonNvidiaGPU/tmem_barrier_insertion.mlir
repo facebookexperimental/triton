@@ -611,6 +611,55 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 
+  // The analyses walk into a predicated region: a thread-local
+  // read-modify-write there gets its waits inside the region, and the yield,
+  // like any CFG edge, completes the store before leaving it. A CTA barrier
+  // would be rejected by the verifier.
+  // WAIT-LABEL: @ld_then_st_warp_predicate
+  // WAIT: ttg.warp_predicate
+  // WAIT-NEXT: ttng.tmem_load
+  // WAIT-NEXT: ttng.tmem_wait load
+  // WAIT-NEXT: ttng.tmem_store
+  // WAIT-NEXT: ttng.tmem_wait store
+  // WAIT-NEXT: ttg.predicate_yield
+  // WAIT-NEXT: }
+  // WAIT-NEXT: tt.return
+  tt.func @ld_then_st_warp_predicate(%pred: i1) {
+    %true = arith.constant true
+    %c0 = arith.constant 0 : i32
+    %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<2x128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.barrier local
+    %acc = ttg.memdesc_index %0[%c0] : !ttg.memdesc<2x128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.warp_predicate %pred () {
+      %1 = ttng.tmem_load %acc : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      ttng.tmem_store %1, %acc, %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+      ttg.predicate_yield
+    } {wave_uniform} : (i1) -> ()
+    tt.return
+  }
+
+  // A predicated region's body runs on threads of its parent region, so a
+  // store before the region and a load of the same words inside it by the same
+  // threads need a wait but no CTA barrier.
+  // WAIT-LABEL: @st_then_ld_across_warp_predicate
+  // WAIT: ttng.tmem_store
+  // WAIT-NEXT: ttng.tmem_wait store
+  // WAIT-NEXT: ttg.warp_predicate
+  // WAIT-NEXT: ttng.tmem_load
+  // WAIT-NEXT: ttng.tmem_wait load
+  // WAIT-NEXT: ttg.predicate_yield
+  tt.func @st_then_ld_across_warp_predicate(%pred: i1, %data: tensor<128x128xf32, #blocked>) {
+    %true = arith.constant true
+    %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.barrier local
+    ttng.tmem_store %data, %0, %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.warp_predicate %pred () {
+      %1 = ttng.tmem_load %0 : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      ttg.predicate_yield
+    } {wave_uniform} : (i1) -> ()
+    tt.return
+  }
+
   // The wait for the thread-local hazard on %y also completes the load of %x,
   // but only in each thread, and TMEM wait insertion stops tracking that load.
   // The store to %x2 writes rows that other threads of the same warp loaded, as
