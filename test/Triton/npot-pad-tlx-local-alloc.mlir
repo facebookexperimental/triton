@@ -89,3 +89,25 @@ tt.func @memdesc_trans_100(%v: !ttg.memdesc<100x64xf16, #swz, #smem, mutable, 12
   %t = ttg.memdesc_trans %v {order = array<i32: 1, 0>} : !ttg.memdesc<100x64xf16, #swz, #smem, mutable, 128x64> -> !ttg.memdesc<64x100xf16, #swzT, #smem, mutable, 64x128>
   tt.return
 }
+
+// -----
+
+#smem9 = #ttg.shared_memory
+#swizzled128_9 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+
+// An epilogue staging subslice whose extent's cover spans its
+// allocation is a legal view of the alloc layout: the [64,160] slice
+// of the [64,256] slot keeps its exact shape.
+// CHECK-LABEL: @subslice_view_160
+tt.func @subslice_view_160(%pa: !tt.ptr<f16>, %po: !tt.ptr<f16>) {
+  %sa = tt.splat %pa : !tt.ptr<f16> -> tensor<64x160x!tt.ptr<f16>>
+  %a = tt.load %sa : tensor<64x160x!tt.ptr<f16>>
+  %slot = ttg.local_alloc : () -> !ttg.memdesc<64x256xf16, #swizzled128_9, #smem9, mutable>
+  // CHECK: ttg.memdesc_subslice %{{.*}} : !ttg.memdesc<64x256xf16, #{{.*}}, #{{.*}}, mutable> -> !ttg.memdesc<64x160xf16, #{{.*}}, #{{.*}}, mutable, 64x256>
+  %v = ttg.memdesc_subslice %slot [0, 0] : !ttg.memdesc<64x256xf16, #swizzled128_9, #smem9, mutable> -> !ttg.memdesc<64x160xf16, #swizzled128_9, #smem9, mutable, 64x256>
+  ttg.local_store %a, %v : tensor<64x160xf16> -> !ttg.memdesc<64x160xf16, #swizzled128_9, #smem9, mutable, 64x256>
+  %r = ttg.local_load %v : !ttg.memdesc<64x160xf16, #swizzled128_9, #smem9, mutable, 64x256> -> tensor<64x160xf16>
+  %so = tt.splat %po : !tt.ptr<f16> -> tensor<64x160x!tt.ptr<f16>>
+  tt.store %so, %r : tensor<64x160x!tt.ptr<f16>>
+  tt.return
+}

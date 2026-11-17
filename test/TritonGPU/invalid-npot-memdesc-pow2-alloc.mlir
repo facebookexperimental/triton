@@ -1,4 +1,7 @@
 // RUN: env TRITON_ALLOW_NPOT=1 triton-opt --split-input-file %s --verify-diagnostics
+// RUN: env -u TRITON_ALLOW_NPOT not triton-opt --split-input-file %s 2>&1 | FileCheck %s --check-prefix=OFF
+// OFF: error: shape must have power-of-2 and non-zero dimensions; got 64, 24
+// OFF: error: We don't support splitting along the swizzling pattern
 
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CGALayout = [[1, 0]]>
 #tmem_space = #ttng.tensor_memory
@@ -151,6 +154,73 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   tt.func @swizzled_subslice_of_extent6_split4(%arg0: !ttg.memdesc<6x64xf16, #shared, #smem, mutable>) {
     // expected-error @+1 {{NPOT memdesc extent split across CTAs is not yet supported}}
     %0 = ttg.memdesc_subslice %arg0 [0, 0] : !ttg.memdesc<6x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<2x64xf16, #shared, #smem, mutable, 6x64>
+    tt.return
+  }
+}
+
+// -----
+
+#swz = #ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // A split that lands inside a swizzle phase rejects: rows 2-3 of this
+  // pattern carry phase 1, so no pow2 offset step addresses them.
+  tt.func @phase_split_subslice() {
+    %a = ttg.local_alloc : () -> !ttg.memdesc<16x64xf16, #swz, #smem, mutable>
+    // expected-error @+1 {{We don't support splitting along the swizzling pattern}}
+    %v = ttg.memdesc_subslice %a [2, 0]
+        : !ttg.memdesc<16x64xf16, #swz, #smem, mutable>
+        -> !ttg.memdesc<2x64xf16, #swz, #smem, mutable, 16x64>
+    tt.return
+  }
+}
+
+// -----
+
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // An NPOT prefix whose pow2 cover does not span the alloc is not
+  // addressable by the mixed-radix consumer and rejects in the verifier.
+  tt.func @npot_prefix_beyond_cover_subslice() {
+    %a = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+    // expected-error @+1 {{We don't support splitting along the swizzling pattern}}
+    %v = ttg.memdesc_subslice %a [0, 0]
+        : !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+        -> !ttg.memdesc<64x24xf16, #nvmma, #smem, mutable, 64x128>
+    tt.return
+  }
+}
+
+// -----
+
+#swz = #ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // An NPOT first-dim prefix at the start of its pow2-cover alloc is
+  // admitted with the flag on (see npot-memdesc-verifier.mlir); flag off,
+  // the gate closes and the split rejects like upstream.
+  tt.func @npot_first_dim_prefix_subslice(%a: !ttg.memdesc<16x8xf16, #swz, #smem, mutable>) {
+    %v = ttg.memdesc_subslice %a [0, 0]
+        : !ttg.memdesc<16x8xf16, #swz, #smem, mutable>
+        -> !ttg.memdesc<12x8xf16, #swz, #smem, mutable, 16x8>
+    tt.return
+  }
+}
+
+// -----
+
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // The NPOT-prefix exemption is only for a view at the start of its
+  // alloc: the same extent at a nonzero offset splits the pattern.
+  tt.func @npot_prefix_at_offset_subslice() {
+    %a = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+    // expected-error @+1 {{We don't support splitting along the swizzling pattern}}
+    %v = ttg.memdesc_subslice %a [0, 8]
+        : !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+        -> !ttg.memdesc<64x104xf16, #nvmma, #smem, mutable, 64x128>
     tt.return
   }
 }

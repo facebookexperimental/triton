@@ -413,6 +413,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 
 // -----
+
+// The rebuild guard in getExactNpotLayout: a linear layout written for
+// another shape is not exact, and checking that must fail cleanly here
+// rather than crash inside toLinearLayout on the mismatched shape.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mismatched_linear_layout_constant() {
+    // expected-error @+1 {{NPOT mixed-radix layout is not yet supported on arith.constant}}
+    %c = arith.constant dense<0> : tensor<192xi32, #p96>
+    tt.return
+  }
+}
+
+// -----
+
 // A TLX layout anchor forwarding a tensor to another layout is a
 // conversion: the same plan check as ttg.convert_layout applies.
 #p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
