@@ -3511,6 +3511,22 @@ static void getSubtiledChannelEndpoints(Operation *allocOp,
   }
 }
 
+FailureOr<AsyncTaskId>
+selectCrossPartitionProducerTask(ArrayRef<AsyncTaskId> producerTaskIds,
+                                 ArrayRef<AsyncTaskId> consumerTaskIds) {
+  DenseSet<AsyncTaskId> consumerTaskIdSet(consumerTaskIds.begin(),
+                                          consumerTaskIds.end());
+  AsyncTaskId producerTaskId = -1;
+  for (AsyncTaskId id : producerTaskIds) {
+    if (consumerTaskIdSet.contains(id))
+      continue;
+    if (producerTaskId != -1)
+      return failure();
+    producerTaskId = id;
+  }
+  return producerTaskId;
+}
+
 static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
                                SmallVector<std::unique_ptr<Channel>> &channels,
                                bool includeSameTaskSmemChannels) {
@@ -3678,15 +3694,16 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
 
   AsyncTaskId producerTaskId = -1;
   if (producerTaskIds.size() > 1) {
-    DenseSet<int> consumerTaskIdSet(consumerTaskIds.begin(),
-                                    consumerTaskIds.end());
-    for (auto id : producerTaskIds) {
-      if (!consumerTaskIdSet.contains(id)) {
-        assert(producerTaskId == -1 &&
-               "Multiple cross-partition producers encountered");
-        producerTaskId = id;
-      }
-    }
+    FailureOr<AsyncTaskId> selected =
+        selectCrossPartitionProducerTask(producerTaskIds, consumerTaskIds);
+    // hasMultipleCrossPartitionProducers rejects warp specialization before
+    // the pipeline starts rewriting, for the cases it can predict. Anything
+    // that still reaches here cannot be bailed out of anymore, and keeping an
+    // arbitrary producer miscompiles, so fail loudly in every build type.
+    if (failed(selected))
+      llvm::report_fatal_error(
+          "Multiple cross-partition producers encountered");
+    producerTaskId = *selected;
     if (producerTaskId == -1)
       return;
   } else {

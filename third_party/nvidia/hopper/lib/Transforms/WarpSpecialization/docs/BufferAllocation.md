@@ -23,6 +23,20 @@ decided later by the memory planner. Code partitioning then uses
 [accumulation counters](AccumulationCounters.md) to index into
 multi-buffered allocations.
 
+## Pre-check: multiple cross-partition producers
+
+Before `doConvertDescriptorLoadsToNVWS` (which cannot be undone),
+`WarpSpecialization.cpp` calls `hasMultipleCrossPartitionProducers(funcOp)`.
+It predicts the `local_store` that `createLocalAlloc` will create for each
+register channel. That store takes the task ids of the channel source's
+defining op, which for an `scf.for`/`scf.if` result is every task of its
+body. If more than one of those tasks is not a consumer of the buffer,
+`createAllocChannel` could not pick a single producer, so warp
+specialization is rejected with a warning instead. Any case the pre-check
+misses stops at a fatal error in `createAllocChannel` rather than keeping an
+arbitrary producer. Test:
+`test/Hopper/WarpSpecialization/ws-bail-multiple-cross-partition-producers.mlir`.
+
 ## Algorithm
 
 ### Step 0: `swapTransposedLocalAllocs`
