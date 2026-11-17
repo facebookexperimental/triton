@@ -1117,6 +1117,13 @@ static bool closeOverDescriptorLoadUsers(DataPartitionScheme &partitionScheme) {
           partitionScheme.skipPartitioning = true;
           return true;
         }
+        // Any other descriptor comes from an in-kernel op such as
+        // make_tensor_descriptor or reinterpret_tensor_descriptor. sliceOp
+        // clones that op with a sliced block type for the partitioned loads
+        // and leaves the original in place. The load that stays outside the
+        // closure keeps the full-size original descriptor, so its block type
+        // still matches its result and verification passes. Only a function
+        // argument is retyped in place, which is why it alone has to bail out.
         continue;
       }
       partitionScheme = trial;
