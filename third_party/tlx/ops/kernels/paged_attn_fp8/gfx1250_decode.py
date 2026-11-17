@@ -295,7 +295,7 @@ def _matrix_decode(
     K_LOAD_LAYOUT: tl.constexpr,
     V_LOAD_LAYOUT: tl.constexpr,
     SINGLE_TILE: tl.constexpr,
-    PRELOAD_PAIR: tl.constexpr,
+    PREFETCH_PAIR: tl.constexpr,
 ):
     task = tl.program_id(0)
     kvh = tl.program_id(1)
@@ -343,7 +343,7 @@ def _matrix_decode(
         kbuf = tlx.local_alloc((1, PAGE_SIZE * D), K.dtype.element_ty, 2)
         vbuf = tlx.local_alloc((1, PAGE_SIZE * D), V.dtype.element_ty, 2)
         _issue_kv_page(kd, vdsc, BT, kbuf, vbuf, seq, bst, kvh, lo, hi, 0, HQ // G, PAGE_SIZE)
-        if PRELOAD_PAIR:
+        if PREFETCH_PAIR:
             # Queue K0/V0/K1/V1 before computing page0. Its first K/V waits
             # leave three/two copies pending; page1 resumes the normal loop.
             if lo + BN < hi:
@@ -361,7 +361,7 @@ def _matrix_decode(
         slot = pos % PAGE_SIZE
         if TDM:
             buffer_slot = (((start - lo) // BN) % 2).to(tl.int32)
-            if PRELOAD_PAIR and start == lo and start + BN < hi:
+            if PREFETCH_PAIR and start == lo and start + BN < hi:
                 tlx.async_amd_descriptor_wait(3)
             else:
                 tlx.async_amd_descriptor_wait(1 if tlx.num_warps() == 1 else 0)
@@ -369,7 +369,7 @@ def _matrix_decode(
             if tlx.num_warps() != 1:
                 vr = tlx.local_load(tlx.local_view(vbuf, buffer_slot), layout=V_LOAD_LAYOUT,
                                     relaxed=tlx.num_warps() == 1)
-            if (not PRELOAD_PAIR or start != lo) and (tlx.num_warps() != 1 or (not SINGLE_TILE and start + BN < hi)):
+            if (not PREFETCH_PAIR or start != lo) and (tlx.num_warps() != 1 or (not SINGLE_TILE and start + BN < hi)):
                 _issue_kv_page(kd, vdsc, BT, kbuf, vbuf, seq, bst, kvh, start + BN, hi, 1 - buffer_slot, HQ // G,
                                PAGE_SIZE, LOAD_V=tlx.num_warps() != 1)
             kval = kr.reshape((D // 16, PAGE_SIZE, 16)).trans(1, 0, 2).reshape((PAGE_SIZE, D))
@@ -412,14 +412,14 @@ def _matrix_decode(
         l = l * alpha + tl.sum(p, 1)
         acc *= alpha[:, None]
         if TDM and tlx.num_warps() == 1:
-            if PRELOAD_PAIR and start == lo and start + BN < hi:
+            if PREFETCH_PAIR and start == lo and start + BN < hi:
                 tlx.async_amd_descriptor_wait(2)
             elif not SINGLE_TILE and start + BN < hi:
                 tlx.async_amd_descriptor_wait(1)
             else:
                 tlx.async_amd_descriptor_wait(0)
             vr = tlx.local_load(tlx.local_view(vbuf, buffer_slot), layout=V_LOAD_LAYOUT, relaxed=tlx.num_warps() == 1)
-            if (not PRELOAD_PAIR or start != lo) and not SINGLE_TILE and start + BN < hi:
+            if (not PREFETCH_PAIR or start != lo) and not SINGLE_TILE and start + BN < hi:
                 _issue_kv_page(kd, vdsc, BT, kbuf, vbuf, seq, bst, kvh, start + BN, hi, 1 - buffer_slot, HQ // G,
                                PAGE_SIZE, LOAD_K=False)
             vval = vr.reshape((PAGE_SIZE // 16, D, 16)).trans(0, 2, 1).reshape((PAGE_SIZE, D))
@@ -546,7 +546,7 @@ def _merge(PART, LSE, OUT, D: tl.constexpr, SPLITS: tl.constexpr, BS: tl.constex
 
 
 def decode(q, k, v, lengths, table, ks, vs, *, q_scale, query_length, causal, window_size, sm_scale, num_splits,
-           variant, out=None, workspace=None, block_n=64, block_m=16, num_warps=4, preload_pair=True):
+           variant, out=None, workspace=None, block_n=64, block_m=16, num_warps=4, prefetch_pair=True):
     """Launch the selected matrix/vector path or an eligible window fast path.
 
     The window branches below are specializations of matrix_tdm_flat, not
@@ -556,8 +556,8 @@ def decode(q, k, v, lengths, table, ks, vs, *, q_scale, query_length, causal, wi
     _merge; normalized partials use FP16 views at >=8 splits while softmax,
     log-sum-exp and merge arithmetic remain FP32.
 
-    preload_pair queues the first two KV pages before computation for eligible
-    single-token decode configurations.
+    prefetch_pair primes the pipeline with two KV pages in the prologue before
+    computation begins for eligible single-token decode configurations.
     """
     tokens, heads, dim = q.shape
     hkv, page_size = k.shape[1], k.shape[3]
@@ -597,10 +597,10 @@ def decode(q, k, v, lengths, table, ks, vs, *, q_scale, query_length, causal, wi
         visible_bound = min(table.shape[1] * page_size, window_size + page_size -
                             1) if window_size else table.shape[1] * page_size
         single_tile = variant == "matrix_tdm_flat" and query_length == 1 and num_warps == 1 and visible_bound <= num_splits * block_n
-        preload_pair_enabled = (preload_pair and variant == "matrix_tdm_flat" and num_warps == 1 and not single_tile
-                                and q.dtype == torch.bfloat16 and window_size == 0 and query_length == 1
-                                and visible_bound >= 8192
-                                and ((page_size == 64 and hkv <= 2) or heads == hkv and hkv >= 64))
+        prefetch_pair_enabled = (prefetch_pair and variant == "matrix_tdm_flat" and num_warps == 1 and not single_tile
+                                 and q.dtype == torch.bfloat16 and window_size == 0 and query_length == 1
+                                 and visible_bound >= 8192
+                                 and ((page_size == 64 and hkv <= 2) or heads == hkv and hkv >= 64))
         if (variant == "matrix_tdm_flat" and query_length == 1 and 0 < window_size <= page_size
                 and (page_size == 128 or dim == 64 and heads == hkv and hkv >= 32) and num_splits == 1
                 and q.dtype == torch.bfloat16):
@@ -622,7 +622,7 @@ def decode(q, k, v, lengths, table, ks, vs, *, q_scale, query_length, causal, wi
                                          num_splits, block_m, block_n, q.dtype == torch.float8_e4m3fn, causal,
                                          window_size, rows, fp8_qk, variant == "matrix_precise",
                                          variant == "matrix_tdm_flat", k.shape[0], kload, vload, single_tile,
-                                         preload_pair_enabled, num_warps=num_warps, matrix_instr_nonkdim=16)
+                                         prefetch_pair_enabled, num_warps=num_warps, matrix_instr_nonkdim=16)
     if num_splits > 1:
         # Dimension tiles spread sparse merges across more CUs. D64 needs
         # enough partitions to amortize the extra workgroup setup.
