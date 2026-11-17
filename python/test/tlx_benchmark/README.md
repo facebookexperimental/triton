@@ -13,7 +13,7 @@ python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
-`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, `router_gemm`,
+`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, `moe_finalize`, `router_gemm`,
 or one of the fused operators below.
 
 Fused operators (`tlx/ops/kernels/fused/`) run steps that would otherwise be separate kernels in one launch:
@@ -76,6 +76,7 @@ options:
 | `moe` | none (FlyDSL's Muse MoE ships with aiter) | absolute floor, currently unset -> reports only | heuristic |
 | `moe_routing` | `torch.compile` of the eager routing | speedup >= 0.9x | heuristic |
 | `router_gemm` | `F.linear` on the fp32 upcast (hipBLASLt fp32) | speedup >= 0.9x | heuristic |
+| `moe_finalize` | unfused Triton finalize; backward: `torch.compile` of the eager finalize | speedup >= 0.9x | heuristic |
 
 ### Fused operators
 

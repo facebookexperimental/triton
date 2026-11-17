@@ -361,6 +361,15 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="moe_finalize",
+        arch="sm100",
+        variant="slot_tile",
+        impl="triton.tlx.ops.kernels.moe_finalize.sm100:moe_finalize",
+        dtypes=_BF16,
+        requires=frozenset(),
+        supports_backward=True,
+    ),
+    OpSpec(
         op="moe_routing",
         arch="gfx950",
         variant="wave_rows",
