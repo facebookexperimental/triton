@@ -36,12 +36,19 @@
 // Staging task (3) releases the SAME token on the wait of its last TMA store,
 // with a constant buffer index.
 // CHECK: ttng.async_tma_store_token_wait %{{[a-zA-Z0-9_]+}} nvws_token %[[WAR_TOK]][%{{[a-zA-Z0-9_]+}}] {async_task_id = array<i32: 3>
+// The token rides on the LAST store wait: no later wait or TMA store in the body.
+// CHECK-NOT: ttng.async_tma_store_token_wait
+// CHECK-NOT: ttng.async_tma_copy_local_to_global
+// CHECK: scf.yield {async_task_id = array<i32: 3>}
 
 // CLC keeps the persistent loop as scf.while. Its AutoWS accumulation counter
 // must drive the same dedicated cross-tile token and alternating phase.
 // WHILE-LABEL: @_attn_bwd_persist
 // WHILE: nvws.producer_acquire %[[WHILE_WAR:[a-zA-Z0-9_]+]], %{{[a-zA-Z0-9_]+}}, %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 2>, constraints = {WSBarrier = {{{.*}}dstTask = 3 : i32{{.*}}}}} : tensor<1x!nvws.token>, i32, i1
 // WHILE: ttng.async_tma_store_token_wait %{{[a-zA-Z0-9_]+}} nvws_token %[[WHILE_WAR]][%{{[a-zA-Z0-9_]+}}] {async_task_id = array<i32: 3>
+// WHILE-NOT: ttng.async_tma_store_token_wait
+// WHILE-NOT: ttng.async_tma_copy_local_to_global
+// WHILE: scf.yield {async_task_id = array<i32: 3>}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
