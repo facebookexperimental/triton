@@ -1,7 +1,9 @@
 """Tests for CI failure episodes and verified recovery."""
 import json
+import os
 import re
 import subprocess
+import sys
 from urllib.parse import parse_qs, urlsplit
 import xml.etree.ElementTree as ET
 
@@ -203,30 +205,36 @@ def test_a_job_level_fallback_is_not_a_pass():
 
 
 def test_a_crash_is_reported_against_the_test_that_was_running(tmp_path, monkeypatch, capsys):
-    # A crash keeps pytest from writing JUnit XML; the report must still name the test and the signal.
-    log = tmp_path / "pytest.log"
-    log.write_text("\n".join([
-        "t/test_ops.py::test_op[bench_a] ",
-        "input  ref TF/s  tlx TF/s",
-        "PASSED",
-        "t/test_ops.py::test_op[bench_b] SKIPPED",
-        "t/test_ops.py::test_op[bench_c] ",
-        "Fatal Python error: Segmentation fault",
-        "Current thread 0x00007f0e (most recent call first):",
-        '  File "/w/ops/_shapes.py", line 87 in inputs',
-        '  File "/w/t/bench_c.py", line 78 in prepare',
+    # A crash keeps pytest from writing JUnit XML; the report must still name the test pytest was running and the
+    # signal, even when the test's own -s output looks like a node id.
+    pytest_plugins = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pytest_plugins")
+    (tmp_path / "test_ops.py").write_text("\n".join([
+        "import os, signal",
+        "def test_ok(): pass",
+        "def test_crash():",
+        "    print('\\nfake/test_other.py::test_wrong', flush=True)",
+        "    os.kill(os.getpid(), signal.SIGSEGV)",
+        "def test_after(): pass",
     ]))
+    running, log = tmp_path / "running", tmp_path / "pytest.log"
+    env = dict(os.environ, PYTEST_RUNNING_TEST_FILE=str(running), PYTHONPATH=pytest_plugins)
+    with open(log, "w") as out:
+        status = subprocess.run([
+            sys.executable, "-X", "faulthandler", "-m", "pytest", "test_ops.py", "-p", "running_test", "-p",
+            "no:cacheprovider", "-v", "-s"
+        ], cwd=tmp_path, env=env, stdout=out, stderr=subprocess.STDOUT).returncode
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
     monkeypatch.setattr("sys.argv", [
         "parse", "--junit",
-        str(tmp_path / "missing.xml"), "--workflow", "W", "--job", "j", "--failed", "--log",
-        str(log), "--exit-code", "139"
+        str(tmp_path / "missing.xml"), "--workflow", "W", "--job", "j", "--failed", "--running-test",
+        str(running), "--log",
+        str(log), "--exit-code",
+        str(128 - status if status < 0 else status)
     ])
     junit.main()
     [item] = json.loads(capsys.readouterr().out)
-    assert item["issue_title"] == "[nightly] W / j / SIGSEGV in t.test_ops::test_op[bench_c]"
-    assert item["raw_failure_ids"] == "t.test_ops::test_op[bench_c]"
-    assert "inputs (_shapes.py:87)" in item["summary"]
+    assert item["issue_title"] == "[nightly] W / j / SIGSEGV in test_ops::test_crash"
+    assert "test_crash (test_ops.py:5)" in item["summary"]
     assert item["fallback"] is True
 
 

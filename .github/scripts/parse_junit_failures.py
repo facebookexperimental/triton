@@ -39,9 +39,6 @@ PARAM_SUFFIX = re.compile(r"\[.*\]$")
 # Fraction of a step's timeout budget at which a still-passing suite is reported.
 SLOW_THRESHOLD = 0.8
 
-# pytest -v prints a test's node id when it starts and its outcome, at the start of a line, when it ends.
-TEST_START = re.compile(r"^(\S+\.py::\S+)")
-TEST_OUTCOME = re.compile(r"^\s*(PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS)\b")
 TOP_FRAME = re.compile(r'File "([^"]+)", line (\d+) in (\w+)')
 
 
@@ -165,25 +162,30 @@ def crash_cause(exit_code):
     return f"exit {exit_code}"
 
 
-def crashed_test(log_path):
-    """The test pytest was running when it died, and the top frame faulthandler printed, from its -v output."""
+def running_test(path):
+    """The node id pytest_plugins/running_test.py left behind: the test that was running if pytest died."""
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def innermost_frame(log_path):
+    """The innermost Python frame of the thread faulthandler dumped as current."""
     try:
         with open(log_path, errors="replace") as fh:
             lines = fh.read().splitlines()
     except OSError:
-        return "", ""
-    running, frame, in_dump = "", "", False
-    for line in lines:
-        start = TEST_START.match(line)
-        if start:
-            running, line = start[1], line[start.end():]
-        if running and TEST_OUTCOME.match(line):
-            running = ""
+        return ""
+    for i, line in enumerate(lines):
         if line.startswith("Current thread "):
-            in_dump = True
-        elif in_dump and not frame and (top := TOP_FRAME.search(line)):
-            frame = f"{top[3]} ({os.path.basename(top[1])}:{top[2]})"
-    return running, frame
+            for later in lines[i + 1:]:
+                top = TOP_FRAME.search(later)
+                if top:
+                    return f"{top[3]} ({os.path.basename(top[1])}:{top[2]})"
+            return ""
+    return ""
 
 
 def build_crash_item(node_id, cause, frame, workflow, job):
@@ -375,7 +377,8 @@ def main():
         help=("Step timeout budget for a JUnit XML, e.g. /tmp/tlx-core.xml=30. "
               "Repeatable. Enables near-timeout reporting for that file."),
     )
-    parser.add_argument("--log", default="", help="pytest -v output, to name the test that was running if it died")
+    parser.add_argument("--running-test", default="", help="file pytest_plugins/running_test.py writes")
+    parser.add_argument("--log", default="", help="pytest output, for the faulthandler frame if it died")
     parser.add_argument("--exit-code", type=int, help="pytest's exit status, to name the signal that killed it")
     parser.add_argument(
         "--slow-threshold",
@@ -391,8 +394,9 @@ def main():
         failures, missing_paths = collect_failures(args.junit)
         items = build_items(failures, args.workflow, args.job)
         if not items and missing_paths:
-            node_id, frame = crashed_test(args.log) if args.log else ("", "")
+            node_id = running_test(args.running_test) if args.running_test else ""
             if node_id:
+                frame = innermost_frame(args.log) if args.log else ""
                 items.append(build_crash_item(node_id, crash_cause(args.exit_code), frame, args.workflow, args.job))
             else:
                 items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
