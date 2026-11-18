@@ -5,9 +5,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 
-using ::mlir::triton::gpu::AMDMfmaEncodingAttr;
 using ::mlir::triton::gpu::ConvertLayoutOp;
-using ::triton::gpu::LinearEncodingAttr;
 
 namespace {
 

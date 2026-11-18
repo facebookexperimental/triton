@@ -1074,12 +1074,79 @@ static bool getForwardSliceToPartition(Value v,
 
 // Compute a closure of all ops originated from
 // or being dependent on by the root op.
+static bool getForwardClosureToPartition(Value root,
+                                         DataPartitionScheme &partitionScheme,
+                                         unsigned currentDim);
+
+// A descriptor load reached backward from the dot can have other register
+// users, e.g. a row reduction over the same A tile. Leaving them unsliced
+// makes the rewrite keep a full-size load of a descriptor whose block type it
+// has already sliced, which fails verification. Pull those users into the
+// closure. When that is impossible for a function-argument descriptor, which
+// the rewrite slices, skip data partitioning instead.
+static bool closeOverDescriptorLoadUsers(DataPartitionScheme &partitionScheme) {
+  for (bool changed = true; changed;) {
+    changed = false;
+    SmallVector<Operation *> loads;
+    for (Operation *op : partitionScheme.ops)
+      if (isa<DescriptorLoadOp>(op))
+        loads.push_back(op);
+    for (Operation *load : loads) {
+      unsigned dim = partitionScheme.opPartitionDims[load];
+      if (dim == DataPartitionScheme::noOpPartitionDim)
+        continue;
+      Value result = load->getResult(0);
+      if (llvm::all_of(result.getUsers(), [&](Operation *user) {
+            return partitionScheme.ops.contains(user);
+          }))
+        continue;
+      DataPartitionScheme trial = partitionScheme;
+      bool closed = getForwardClosureToPartition(result, trial, dim) &&
+                    trial.partitionIsCompatible();
+      if (trial.skipPartitioning) {
+        partitionScheme.skipPartitioning = true;
+        return true;
+      }
+      if (!closed) {
+        auto desc =
+            dyn_cast<BlockArgument>(cast<DescriptorLoadOp>(load).getDesc());
+        if (desc && isa<triton::FuncOp>(desc.getOwner()->getParentOp())) {
+          load->emitWarning()
+              << "skipping data partitioning because a register user of this "
+                 "descriptor load cannot be partitioned with it";
+          partitionScheme.skipPartitioning = true;
+          return true;
+        }
+        // Any other descriptor comes from an in-kernel op such as
+        // make_tensor_descriptor or reinterpret_tensor_descriptor. sliceOp
+        // clones that op with a sliced block type for the partitioned loads
+        // and leaves the original in place. The load that stays outside the
+        // closure keeps the full-size original descriptor, so its block type
+        // still matches its result and verification passes. Only a function
+        // argument is retyped in place, which is why it alone has to bail out.
+        continue;
+      }
+      partitionScheme = trial;
+      changed = true;
+    }
+  }
+  return true;
+}
+
 static bool getSliceToPartition(Value root,
                                 DataPartitionScheme &partitionScheme,
                                 unsigned currentDim) {
   if (!getBackwardSliceToPartition(root, partitionScheme, currentDim)) {
     return false;
   }
+  if (!getForwardClosureToPartition(root, partitionScheme, currentDim))
+    return false;
+  return closeOverDescriptorLoadUsers(partitionScheme);
+}
+
+static bool getForwardClosureToPartition(Value root,
+                                         DataPartitionScheme &partitionScheme,
+                                         unsigned currentDim) {
   DataPartitionScheme forwardPartitionScheme = partitionScheme;
   DenseSet<Value> seen;
   bool forwardSuccess = getForwardSliceToPartition(root, forwardPartitionScheme,
@@ -1725,32 +1792,38 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
   } else if (isa<DescriptorLoadOp, DescriptorStoreOp>(op)) {
     SmallVector<int64_t> shape;
     Value coordVal;
+    unsigned coordOperandIdx;
     if (auto loadOp = dyn_cast<DescriptorLoadOp>(op)) {
       sliceOp(loadOp.getDesc(), offset, mappings, reverseMappings,
               partitionScheme);
       coordVal = loadOp.getIndices()[dim];
+      coordOperandIdx = loadOp.getIndicesMutable()[dim].getOperandNumber();
       shape = getShape(loadOp.getResult());
     } else if (auto storeOp = dyn_cast<DescriptorStoreOp>(op)) {
       sliceOp(storeOp.getDesc(), offset, mappings, reverseMappings,
               partitionScheme);
       coordVal = storeOp.getIndices()[dim];
+      coordOperandIdx = storeOp.getIndicesMutable()[dim].getOperandNumber();
       shape = getShape(storeOp.getSrc());
-    }
-    auto newCoordVal = coordVal;
-    if (offset) {
-      if (auto *defOp = coordVal.getDefiningOp())
-        builder.setInsertionPointAfter(defOp);
-      else
-        builder.setInsertionPoint(op);
-      Value offsetVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-          op->getLoc(), offset * shape[dim] / numOfPartitions, 32);
-      newCoordVal = builder.createWithAsyncTaskIds<arith::AddIOp>(
-          op->getLoc(), coordVal, offsetVal);
-      mappings.map(coordVal, newCoordVal);
-      reverseMappings.map(newCoordVal, coordVal);
     }
 
     newOp = cloneAndSetResultType(op);
+    if (offset) {
+      // Shift only this op's operand: mapping coordVal would leak the offset
+      // into later clones that use the same scalar and into a shared index.
+      // Start from the clone's operand, i.e. this partition's copy of the
+      // coordinate when the scalar itself was sliced, not the original op.
+      Value baseCoordVal = newOp->getOperand(coordOperandIdx);
+      if (auto *defOp = baseCoordVal.getDefiningOp())
+        builder.setInsertionPointAfter(defOp);
+      else
+        builder.setInsertionPoint(newOp);
+      Value offsetVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+          op->getLoc(), offset * shape[dim] / numOfPartitions, 32);
+      Value newCoordVal = builder.createWithAsyncTaskIds<arith::AddIOp>(
+          op->getLoc(), baseCoordVal, offsetVal);
+      newOp->setOperand(coordOperandIdx, newCoordVal);
+    }
     if (isa<DescriptorLoadOp>(op)) {
       // map load result
       auto v = op->getResult(0);

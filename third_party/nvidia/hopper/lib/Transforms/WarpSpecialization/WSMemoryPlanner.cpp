@@ -853,11 +853,12 @@ static std::string getLocName(Operation *op) {
 
 /// Priority levels for SMEM multi-buffering candidates.
 enum class WSBufferPriority {
-  P0_InnermostTMA = 0, // innermost loop + TMA channel
-  P1_InnermostNonTMA,  // innermost loop, non-TMA
-  P2_InnerTMAStaging,  // TMA staging buffer inside the innermost loop (e.g. dq)
-  P3_OuterTMAStaging,  // TMA staging buffer outside loops (e.g. dk, dv)
-  P4_Other,            // outside loop / non-innermost (regular epilogue)
+  P0_ComputedMMAOperand = 0, // computed SMEM tile consumed by an MMA
+  P1_InnermostTMA,           // innermost loop + TMA channel
+  P2_InnermostNonTMA,        // innermost loop, non-TMA
+  P3_InnerTMAStaging, // TMA staging buffer inside the innermost loop (e.g. dq)
+  P4_OuterTMAStaging, // TMA staging buffer outside loops (e.g. dk, dv)
+  P5_Other,           // outside loop / non-innermost (regular epilogue)
 };
 
 /// A wrapper around one ttg.local_alloc op for the new SMEM allocation.
@@ -1259,6 +1260,43 @@ static bool isSmemTMAChannel(Operation *alloc,
   return isa<ttnvws::DescriptorLoadOp>(srcOp);
 }
 
+/// True for an SMEM channel holding a computed, descriptor-fed MMA operand.
+/// Buffering it hides the computation and source loads at the narrow tile size.
+static bool
+isDescriptorFedComputedMMAOperandChannel(Operation *alloc,
+                                         SmallVector<Channel *> &channels) {
+  if (isSmemTMAChannel(alloc, channels))
+    return false;
+  Channel *ch = findChannelForOp(alloc, channels);
+  if (!ch || ch->channelKind != DataChannelKind::SMEMAlloc)
+    return false;
+  DenseSet<Operation *> consumers;
+  (void)getAllAcutalUsersForChannel(ch, consumers, alloc);
+  if (!llvm::any_of(consumers, [](Operation *op) {
+        return isa<ttng::MMAv5OpInterface>(op);
+      }))
+    return false;
+
+  Operation *producer = ch->getSrcOp();
+  if (!producer)
+    return false;
+  SmallVector<Value> worklist(producer->getOperands());
+  DenseSet<Value> seen;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    if (auto localLoad = value.getDefiningOp<ttg::LocalLoadOp>()) {
+      if (Operation *sourceAlloc = localLoad.getSrc().getDefiningOp();
+          sourceAlloc && isSmemTMAChannel(sourceAlloc, channels))
+        return true;
+    }
+    if (Operation *def = value.getDefiningOp())
+      llvm::append_range(worklist, def->getOperands());
+  }
+  return false;
+}
+
 /// Helper to read the loop.stage attribute from an op. Returns -1 if absent.
 static int getLoopStage(Operation *op) {
   auto attr = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
@@ -1430,7 +1468,7 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
   return total;
 }
 
-/// Group P2_Other WSBuffers by their original load op (or by compatible
+/// Group P5_Other WSBuffers by their original load op (or by compatible
 /// type/size for TMA store staging buffers) and assign the same buffer.id
 /// to buffers within each group.
 static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
@@ -1489,7 +1527,7 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
       }
       continue;
     }
-    if (buf.priority != WSBufferPriority::P4_Other)
+    if (buf.priority != WSBufferPriority::P5_Other)
       continue;
     Channel *ch = findChannelForOp(buf.allocOp, channels);
     Operation *origLoad = findOriginalLoadForChannel(ch);
@@ -1524,13 +1562,13 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
                "TMA staging per-(descriptor,load-or-task,block) fusion");
 }
 
-/// Phase 3.7: Iterative copy increase for fused P2_Other groups.
+/// Phase 3.7: Iterative copy increase for fused P5_Other groups.
 /// Epilogue buffers merged in Phase 3.5 share a single bufferId but are
 /// left at numCopies=1 by Phase 4. Increase copies uniformly for each
 /// fused group while staying within the SMEM budget.
 /// Phase 3.7: Iterative copy increase for fused groups eligible for epilogue-
 /// style budget bumping. Inner-loop TMA staging is tried first (highest pay-
-/// off per slot), then outer-loop TMA staging, then regular P4_Other groups.
+/// off per slot), then outer-loop TMA staging, then regular P5_Other groups.
 // Optional cap on the fused TMA-staging pipeline depth, exposing staging copies
 // as a search/autotune axis. TRITON_WS_STAGING_COPIES=K bounds Phase 3.7's bump
 // target to min(numBuffers, K); the K|S divisibility and budget checks still
@@ -1569,9 +1607,9 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
     tmaReduceNumBuffers = copies;
   // Eligible priority tiers, in the order Phase 3.7 should try to bump them.
   static const WSBufferPriority kPhase45Order[] = {
-      WSBufferPriority::P2_InnerTMAStaging, // dq \u2014 highest payoff per slot
-      WSBufferPriority::P3_OuterTMAStaging, // dk / dv
-      WSBufferPriority::P4_Other,           // regular epilogue / non-innermost
+      WSBufferPriority::P3_InnerTMAStaging, // dq \u2014 highest payoff per slot
+      WSBufferPriority::P4_OuterTMAStaging, // dk / dv
+      WSBufferPriority::P5_Other,           // regular epilogue / non-innermost
   };
   auto isEligible = [&](WSBufferPriority p) {
     for (auto q : kPhase45Order)
@@ -2527,6 +2565,32 @@ static bool isFedByDescriptorLoad(Value stored) {
   });
 }
 
+static std::optional<unsigned>
+getRequestedDescriptorBufferDepth(ttg::LocalAllocOp alloc) {
+  SmallVector<Value> worklist = {alloc.getResult()};
+  DenseSet<Value> visited;
+  std::optional<unsigned> requestedDepth;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    for (Operation *user : value.getUsers()) {
+      if (auto load = dyn_cast<ttnvws::DescriptorLoadOp>(user)) {
+        auto depth =
+            load->getAttrOfType<IntegerAttr>(tt::kRequestedBufferDepthAttrName);
+        if (depth)
+          requestedDepth = static_cast<unsigned>(depth.getInt());
+        continue;
+      }
+      if (user->hasTrait<OpTrait::MemDescViewTrait>())
+        for (Value result : user->getResults())
+          if (isa<ttg::MemDescType>(result.getType()))
+            worklist.push_back(result);
+    }
+  }
+  return requestedDepth;
+}
+
 static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
@@ -2550,7 +2614,7 @@ static unsigned allocateSmemBuffers(
     buf.isCrossStage = isSmemCrossStage(alloc, channels);
     buf.bufferId = nextBufferId++;
     buf.numCopies = 1;
-    buf.priority = WSBufferPriority::P4_Other;
+    buf.priority = WSBufferPriority::P5_Other;
     buf.isAllocated = true; // default: every buffer gets dedicated SMEM
 
     // Check for annotation-based pre-assignment.
@@ -2569,11 +2633,17 @@ static unsigned allocateSmemBuffers(
       // WSAtomicBroadcast stamped the requested tile-prefetch depth on the
       // alloc. Pin the buffer to it so the planner honors the depth exactly and
       // accounts for the extra copies against the SMEM budget, instead of
-      // leaving this non-innermost (P4_Other) channel single-buffered.
+      // leaving this non-innermost (P5_Other) channel single-buffered.
       buf.numCopies = copies.getInt();
       buf.minCopies = copies.getInt();
       buf.isPinned = true;
       LDBG("Phase 1: WSBuffer pinned by atomic-broadcast depth: numCopies="
+           << buf.numCopies);
+    } else if (auto depth = getRequestedDescriptorBufferDepth(alloc)) {
+      buf.numCopies = *depth;
+      buf.minCopies = *depth;
+      buf.isPinned = true;
+      LDBG("Phase 1: WSBuffer pinned by operand depth: numCopies="
            << buf.numCopies);
     }
 
@@ -2687,14 +2757,17 @@ static unsigned allocateSmemBuffers(
     if (buf.isPinned)
       continue;
     if (buf.tmaStaging > 0) {
-      buf.priority = buf.isInnermost ? WSBufferPriority::P2_InnerTMAStaging
-                                     : WSBufferPriority::P3_OuterTMAStaging;
+      buf.priority = buf.isInnermost ? WSBufferPriority::P3_InnerTMAStaging
+                                     : WSBufferPriority::P4_OuterTMAStaging;
+    } else if (buf.isInnermost && isDescriptorFedComputedMMAOperandChannel(
+                                      buf.allocOp, channels)) {
+      buf.priority = WSBufferPriority::P0_ComputedMMAOperand;
     } else if (buf.isInnermost && buf.isTMA) {
-      buf.priority = WSBufferPriority::P0_InnermostTMA;
+      buf.priority = WSBufferPriority::P1_InnermostTMA;
     } else if (buf.isInnermost) {
-      buf.priority = WSBufferPriority::P1_InnermostNonTMA;
+      buf.priority = WSBufferPriority::P2_InnermostNonTMA;
     } else {
-      buf.priority = WSBufferPriority::P4_Other;
+      buf.priority = WSBufferPriority::P5_Other;
     }
     LDBG("Phase 3: WSBuffer["
          << buf.bufferId << "] priority=" << static_cast<int>(buf.priority)
@@ -2704,7 +2777,7 @@ static unsigned allocateSmemBuffers(
     LLVM_DEBUG(buf.allocOp->dump());
   }
 
-  // ── Phase 3.5: Merge P4_Other buffers from the same original load ───
+  // ── Phase 3.5: Merge P5_Other buffers from the same original load ───
   // Epilogue buffers (e.g., from splitting a tmem_load result into sub-tiles
   // stored to separate SMEM buffers) have disjoint liveness and can share
   // the same buffer.id to reduce SMEM usage before the copy increase pass.
@@ -2814,16 +2887,31 @@ static unsigned allocateSmemBuffers(
   // TMA store/reduce staging is on the output critical path. Reserve its
   // legal copy depth before discretionary P0/P1 operand buffering consumes
   // the remaining budget (notably FA-bwd dQ versus the small m/Di buffers).
+  // Reserve the bytes for computed MMA operands' full depth first: they sit on
+  // every MMA's input path, so staging must not take their slots.
+  unsigned epilogueBudget = smemBudget;
+  for (const auto &buf : wsBuffers) {
+    if (buf.isPinned ||
+        buf.priority != WSBufferPriority::P0_ComputedMMAOperand ||
+        buf.numCopies >= numBuffers)
+      continue;
+    uint64_t reserve =
+        uint64_t(numBuffers - buf.numCopies) * uint64_t(buf.sizeBytes);
+    epilogueBudget = reserve < epilogueBudget
+                         ? epilogueBudget - static_cast<unsigned>(reserve)
+                         : 0;
+  }
   increaseFusedEpilogueCopies(wsBuffers, channels, funcOp, numBuffers,
-                              smemBudget);
+                              epilogueBudget);
 
   LDBG("Phase 3.7 epilogue copies complete: totalSmem="
        << computeTotalSmem(wsBuffers));
 
   // ── Phase 4: Iterative copy increase ────────────────────────────────
-  // Process P0 then P1. P2 is never increased.
-  for (auto priority : {WSBufferPriority::P0_InnermostTMA,
-                        WSBufferPriority::P1_InnermostNonTMA}) {
+  // Computed MMA tiles first: they are narrower than their descriptor sources.
+  for (auto priority : {WSBufferPriority::P0_ComputedMMAOperand,
+                        WSBufferPriority::P1_InnermostTMA,
+                        WSBufferPriority::P2_InnermostNonTMA}) {
     // Collect candidate indices at this priority.
     SmallVector<unsigned> candidateIndices;
     // Candidates before dropping unaligned TMA landing buffers. Grouping is
@@ -5605,17 +5693,121 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
   return true;
 }
 
+static bool isRewrittenBySplitLoad(tt::SplitOp split,
+                                   SmallVectorImpl<Operation *> &chainCvts,
+                                   bool fromOuterSplit, unsigned depth);
+
+// Whether every use of `v`, looking through single-use layout conversions, is
+// a local_store/local_alloc (which absorb the per-subtile conversion
+// TMemSplitLoadPattern creates) or the reshape of a nested split that the
+// pattern also rewrites. Every use must be in loop stage `stage`: a use in
+// another stage reads the value through a loop-carried value after
+// pipelining, so the per-subtile conversion would not fold into it. Appends
+// the conversions it looks through to `chainCvts`, which is only meaningful
+// when it returns true.
+static bool feedsOnlySmemOrSplitLoad(Value v,
+                                     SmallVectorImpl<Operation *> &chainCvts,
+                                     int stage, unsigned depth) {
+  for (Operation *user : v.getUsers()) {
+    if (getLoopStage(user) != stage)
+      return false;
+    if (isa<ttg::LocalStoreOp, ttg::LocalAllocOp>(user))
+      continue;
+    if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(user)) {
+      if (!cvt->hasOneUse() ||
+          !feedsOnlySmemOrSplitLoad(cvt.getResult(), chainCvts, stage, depth))
+        return false;
+      chainCvts.push_back(cvt);
+      continue;
+    }
+    // Find the nested split this reshape feeds; isRewrittenBySplitLoad checks
+    // the chain back to `v`.
+    auto reshape = dyn_cast<tt::ReshapeOp>(user);
+    if (!reshape || !reshape->hasOneUse())
+      return false;
+    auto trans = dyn_cast<tt::TransOp>(*reshape->user_begin());
+    if (!trans || !trans->hasOneUse())
+      return false;
+    Operation *next = *trans->user_begin();
+    while (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(next)) {
+      if (!cvt->hasOneUse())
+        return false;
+      next = *cvt->user_begin();
+    }
+    auto inner = dyn_cast<tt::SplitOp>(next);
+    if (!inner || !isRewrittenBySplitLoad(inner, chainCvts,
+                                          /*fromOuterSplit=*/true, depth + 1))
+      return false;
+  }
+  return true;
+}
+
+// Whether TMemSplitLoadPattern will rewrite `split` into per-subtile TMEM
+// loads, removing the layout conversions on the chain, which are appended to
+// `chainCvts` (only meaningful when it returns true). Uses the pattern's own
+// matcher, and additionally requires:
+// - every conversion, reshape and trans on the chain to have one use, since
+//   the pattern leaves an op with other users in place;
+// - the whole chain to be in one partition, since a cross-partition channel
+//   would hide the tmem_load;
+// - the whole chain and the subtile users to be in one loop stage, since a
+//   value crossing stages is carried through the loop after pipelining.
+// A nested split (`fromOuterSplit`) is fed by a result of an outer split that
+// the pattern rewrites into a tmem_load first.
+static bool isRewrittenBySplitLoad(tt::SplitOp split,
+                                   SmallVectorImpl<Operation *> &chainCvts,
+                                   bool fromOuterSplit, unsigned depth) {
+  if (depth > 3)
+    return false;
+  auto match = ttng::matchTMemSplitLoad(split);
+  if (!match)
+    return false;
+  Operation *producer = match->reshapeSrc.getDefiningOp();
+  if (!match->tmemLoad &&
+      !(fromOuterSplit && isa_and_nonnull<tt::SplitOp>(producer)))
+    return false;
+  if (!match->trans->hasOneUse() || !match->reshape->hasOneUse() ||
+      llvm::any_of(match->cvts,
+                   [](ttg::ConvertLayoutOp cvt) { return !cvt->hasOneUse(); }))
+    return false;
+  // Deliberately conservative: the pattern checks the warp count of the
+  // tmem_load's partition, but partition warp counts are not assigned at
+  // planning time, so this checks the module warp count the producer sees now.
+  // tritongpu-optimize-partition-warps only halves a partition's warps and
+  // keeps at least 4 for a partition with a tmem_load (getMinWarpsForOp), so
+  // a module count that passes here also passes for the partition.
+  if (!ttng::isTMemSplitLoadNumWarps(ttg::lookupNumWarps(producer)))
+    return false;
+  SmallVector<Operation *> chainOps(match->cvts.begin(), match->cvts.end());
+  chainOps.append({match->trans, match->reshape, producer});
+  auto taskIds = getAsyncTaskIds(split);
+  int stage = getLoopStage(split);
+  if (llvm::any_of(chainOps, [&](Operation *op) {
+        return getAsyncTaskIds(op) != taskIds || getLoopStage(op) != stage;
+      }))
+    return false;
+  SmallVector<Operation *> cvts(match->cvts.begin(), match->cvts.end());
+  for (Value result : split->getResults())
+    if (!feedsOnlySmemOrSplitLoad(result, cvts, stage, depth))
+      return false;
+  chainCvts.append(cvts.begin(), cvts.end());
+  return true;
+}
+
 // Op scratch (layout conversions, reductions, ...) is placed by
 // AllocateSharedMemoryNv after planning, and the planned buffers are live from
 // function entry through the warp_specialize. Reserve one slot sized to the
 // largest single op scratch, skipping scratch after the last WS loop (the
-// planned buffers are dead by then). This is an approximation: it over-reserves
-// when a later pass shrinks or drops the op (TMemSplitLoadPattern subtiling,
-// tritongpu-optimize-partition-warps), and under-reserves when several
+// planned buffers are dead by then). Conversions on an epilogue subtiling
+// chain that TMemSplitLoadPattern rewrites into per-subtile TMEM loads are
+// skipped when the subtiles only feed SMEM in the same partition and loop
+// stage. This is an approximation: it
+// over-reserves when a later pass shrinks or drops the op
+// (tritongpu-optimize-partition-warps), and under-reserves when several
 // partitions have scratch, since scratch in different warp_specialize regions
 // interferes. An under-reservation fails at launch and Inductor falls back to
 // num_stages=1.
-// TODO: size it exactly, with helpers shared with TMemSplitLoadPattern,
+// TODO: size it exactly, with helpers shared with
 // tritongpu-optimize-partition-warps, canonicalization and
 // AllocateSharedMemoryNv.
 static uint64_t estimateOpScratchBytes(triton::FuncOp funcOp) {
@@ -5648,10 +5840,21 @@ static uint64_t estimateOpScratchBytes(triton::FuncOp funcOp) {
   if (!lastWSAnchor)
     return 0;
 
+  DenseSet<Operation *> splitLoadCvts;
+  funcOp->walk([&](tt::SplitOp split) {
+    SmallVector<Operation *> chainCvts;
+    if (isRewrittenBySplitLoad(split, chainCvts, /*fromOuterSplit=*/false,
+                               /*depth=*/0))
+      splitLoadCvts.insert(chainCvts.begin(), chainCvts.end());
+  });
+
   uint64_t peak = 0;
   funcOp->walk([&](Operation *op) {
     // Tensor-map scratch is reserved separately.
     if (isa<ttng::TensormapCreateOp>(op))
+      return;
+    // TMemSplitLoadPattern removes conversions on a subtiling chain.
+    if (splitLoadCvts.contains(op))
       return;
     // Canonicalization folds a conversion into local_store/local_alloc users.
     if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(op);

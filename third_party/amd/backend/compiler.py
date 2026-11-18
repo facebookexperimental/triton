@@ -1,4 +1,5 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
+from triton.runtime.errors import attach_shared_memory_breakdown
 from triton._C.libtriton import ir, passes, llvm, amd, tlx
 from triton import knobs
 from triton._instrumentation import instrument as _instrument, is_enabled
@@ -1185,6 +1186,7 @@ class HIPBackend(BaseBackend):
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
         metadata["profile_scratch_size"] = (src.get_int_attr("ttg.profile_scratch_memory_size") or 0)
         metadata["profile_scratch_align"] = (src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1)
+        attach_shared_memory_breakdown(src, metadata)
 
         amd.cleanup_bitcode_metadata(llvm_mod)
         # Add Triton and LLVM versions to the dumped IR.

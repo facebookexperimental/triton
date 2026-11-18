@@ -174,3 +174,54 @@ def test_grouped_gemm_rejects_invalid_space_name():
         tlx_grouped_gemm([a], [b], space="typo")
     with pytest.raises(InvalidInput, match="does not provide"):
         tlx_grouped_gemm([a], [b], space=Space("full"))
+
+
+@pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
+@pytest.mark.parametrize("kv_fp8", [False, True])
+@pytest.mark.parametrize("shuffled", [False, True])
+def test_paged_prefill_backend_cache_contract(monkeypatch, arch, kv_fp8, shuffled):
+    from contextlib import nullcontext
+    import torch
+    import triton.tlx.ops as ops
+    from triton.tlx.ops._catalog import spec_for
+
+    q = torch.empty((8, 16, 64), dtype=torch.bfloat16)
+    shape = (1, 2, 8, 64, 8) if shuffled else (1, 64, 2, 64)
+    k = torch.empty(shape, dtype=torch.float8_e4m3fn if kv_fp8 else q.dtype)
+    v = torch.empty_like(k)
+    out = torch.empty_like(q)
+    cu = torch.tensor([0, 8], dtype=torch.int32)
+    used = torch.tensor([64], dtype=torch.int64)
+    table = torch.zeros((1, 1), dtype=torch.int32)
+    k_scale = torch.tensor([0.5]) if kv_fp8 else None
+    v_scale = torch.tensor([0.25]) if kv_fp8 else None
+    calls = []
+
+    def backend(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(ops, "impl_for", lambda *args, **kwargs: (backend, spec_for("paged_attention_prefill", arch)))
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+
+    def call():
+        return ops.paged_attention_prefill(q, k, v, out, cu, 8, used, 64, 0.125, True, (-1, -1), table, 0, None,
+                                           k_scale, v_scale, shuffled_kv_cache=shuffled)
+
+    if (kv_fp8 and (shuffled or arch == "gfx1250")) or (shuffled and arch != "gfx1250"):
+        with pytest.raises(InvalidInput):
+            call()
+        assert not calls
+        return
+
+    assert call() is out
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    if arch == "gfx1250":
+        assert args[4] is used
+        assert kwargs["shuffled_kv_cache"] == shuffled
+        assert "k_descale" not in kwargs and "v_descale" not in kwargs
+    else:
+        assert args[4].dtype == torch.int32
+        assert torch.equal(args[4], used.to(torch.int32))
+        assert kwargs["k_descale"] is k_scale and kwargs["v_descale"] is v_scale
+        assert "shuffled_kv_cache" not in kwargs
