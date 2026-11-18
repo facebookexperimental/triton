@@ -412,6 +412,15 @@ struct ArriveBarrierOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     bool isPerThread = op.getPerThread();
+    bool isPerWarp = op.getPerWarp();
+    unsigned count = op.getCount();
+    if (isPerWarp) {
+      unsigned numWarps = ttg::lookupNumWarps(op);
+      if (count % numWarps != 0)
+        return op.emitOpError(
+            "per_warp count must be divisible by the warp count");
+      count /= numWarps;
+    }
     auto barrierTy = op.getAlloc().getType();
     // Compute the shared-memory base before any barrier so the lead (non-
     // perThread) path emits the barrier sync after the address extraction, as
@@ -425,8 +434,11 @@ struct ArriveBarrierOpConversion
     // but an arrive can follow TMEM accesses which have no MemBar equivalent.
     // perThread arrives are per-thread (no leader pattern) and must NOT emit a
     // CTA-wide barrier -- doing so would deadlock under warp specialization
-    // where not all threads of the CTA reach the arrive.
-    if (!isPerThread)
+    // where not all threads of the CTA reach the arrive. A per_warp arrive
+    // only synchronizes the lanes of each warp, and each warp then arrives.
+    if (isPerWarp)
+      LLVM::NVIDIA::createSyncWarp(loc, rewriter);
+    else if (!isPerThread)
       ttg::BarrierOp::create(rewriter, loc, ttg::AddrSpace::Local);
 
     // A barrier physically in cluster shared memory must be signalled with
@@ -466,7 +478,8 @@ struct ArriveBarrierOpConversion
       auto voidTy = void_ty(getContext());
       ptxBuilder.launch(rewriter, loc, voidTy);
     } else {
-      // Leader pattern: only thread 0 arrives.
+      // Leader pattern: only thread 0 (or lane 0 of each warp for per_warp)
+      // arrives.
       //
       // MultiCTA broadcast (#9475): when several CTAs broadcast into the same
       // barrier, each CTA's leader arrives on the lead CTA's barrier with
@@ -479,7 +492,8 @@ struct ArriveBarrierOpConversion
       Value barrierPtr = LLVM::NVIDIA::getLeaderAddress(
           loc, rewriter, smemObj.getBase(), barrierTy);
 
-      Value id = getThreadId(rewriter, loc);
+      Value id = isPerWarp ? getLaneId(rewriter, loc)
+                           : getThreadId(rewriter, loc);
       Value pred = b.icmp_eq(id, b.i32_val(0));
       if (op.getPred())
         pred = b.and_(pred, adaptor.getPred());
@@ -508,8 +522,8 @@ struct ArriveBarrierOpConversion
         if (multicastMask)
           ptxAsm << ".multicast::cluster::32b";
         ptxAsm << ".b64 _, [$1]";
-        if (op.getCount() > 1)
-          ptxAsm << ", " << op.getCount();
+        if (count > 1)
+          ptxAsm << ", " << count;
         if (multicastMask)
           ptxAsm << ", $2";
         ptxAsm << ";";

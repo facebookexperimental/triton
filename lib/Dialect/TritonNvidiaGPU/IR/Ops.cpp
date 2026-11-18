@@ -565,6 +565,14 @@ LogicalResult ArriveBarrierOp::verify() {
     return failure();
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
+  if (getPerWarp()) {
+    if (getPerThread())
+      return emitOpError("per_warp cannot be combined with perThread");
+    if (isMulticast())
+      return emitOpError("per_warp cannot be combined with multicast");
+    if (gpu::lookupNumWarps(*this) <= 1)
+      return emitOpError("per_warp requires multiple warps");
+  }
   if (isMulticast()) {
     if (getPerThread())
       return emitOpError("multicast arrive does not support perThread");
@@ -970,6 +978,82 @@ LogicalResult AsyncTMACopyLocalToGlobalOp::verify() {
   if (failed(verifyDescriptorLoadStoreOp(*this, getDesc().getType(), srcType)))
     return failure();
   return verifyAsyncTMAStoreOp(*this, getDesc(), srcType);
+}
+
+// -- AsyncStoreOp --
+FailureOr<std::string> AsyncStoreOp::getReducePtxType(DescriptorReduceKind kind,
+                                                      Type elementType,
+                                                      bool isSigned) {
+  bool isInt32 = elementType.isInteger(32);
+  bool isInt64 = elementType.isInteger(64);
+  bool isF16OrBF16 = elementType.isF16() || elementType.isBF16();
+  std::string width = isInt32 ? "32" : "64";
+  switch (kind) {
+  case DescriptorReduceKind::ADD:
+    // Integer ADD is the same on signed and unsigned bits; 64-bit only has u64.
+    if (isInt32)
+      return std::string(isSigned ? "s32" : "u32");
+    if (isInt64)
+      return std::string("u64");
+    if (elementType.isF32())
+      return std::string("f32");
+    if (elementType.isF64())
+      return std::string("f64");
+    if (isF16OrBF16)
+      return std::string(elementType.isF16() ? "noftz.f16" : "noftz.bf16");
+    break;
+  case DescriptorReduceKind::MIN:
+  case DescriptorReduceKind::MAX:
+    if (isInt32 || isInt64)
+      return (isSigned ? "s" : "u") + width;
+    if (isF16OrBF16)
+      return std::string(elementType.isF16() ? "f16" : "bf16");
+    break;
+  case DescriptorReduceKind::AND:
+  case DescriptorReduceKind::OR:
+  case DescriptorReduceKind::XOR:
+    if (isInt32 || isInt64)
+      return "b" + width;
+    break;
+  case DescriptorReduceKind::INC:
+  case DescriptorReduceKind::DEC:
+    if (isInt32 && !isSigned)
+      return std::string("u32");
+    break;
+  case DescriptorReduceKind::NONE:
+    break;
+  }
+  return failure();
+}
+
+LogicalResult AsyncStoreOp::verify() {
+  if (getStoreReduce() == DescriptorReduceKind::NONE)
+    return success();
+  Type srcElemTy = getSrc().getType().getElementType();
+  Type dstElemTy = cast<PointerType>(getDst().getType()).getPointeeType();
+  if (srcElemTy != dstElemTy)
+    return emitOpError("reduction source and destination element types must "
+                       "match, got ")
+           << srcElemTy << " and " << dstElemTy;
+  if (failed(getReducePtxType(getStoreReduce(), srcElemTy,
+                              getStoreReduceSigned())))
+    return emitOpError("unsupported reduce kind ")
+           << stringifyDescriptorReduceKind(getStoreReduce())
+           << " for element type " << srcElemTy
+           << (getStoreReduceSigned() ? " (signed)" : "");
+  return success();
+}
+
+void AsyncStoreOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Read::get(), &getSrcMutable(),
+                       SharedMemory::get());
+  if (getStoreReduce() != DescriptorReduceKind::NONE)
+    effects.emplace_back(MemoryEffects::Read::get(), &getDstMutable(),
+                         GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getDstMutable(),
+                       GlobalMemory::get());
 }
 
 // -- AsyncTMAReduceOp --
