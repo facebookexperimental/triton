@@ -33,6 +33,7 @@ class OpSpec:
     default_space: str = "heuristic"  # used when the caller passes space=None
     invariant_vocab: frozenset = frozenset()  # canonical dim names a BitwiseInvarianceSpec may use
     enforces_invariance: bool = False  # the impl prunes schedules per the resolved spec
+    supports_window: bool = False  # flash_attn_varlen: the impl takes max_seqlen_k= and window_size=
 
     def __str__(self) -> str:
         return f"{self.op}/{self.arch} ({self.variant})"
@@ -380,6 +381,16 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="moe_router_topk_align",
+        arch="gfx950",
+        variant="three_launches",
+        impl="triton.tlx.ops.kernels.fused.moe_router_topk_align.gfx950:moe_router_topk_align",
+        dtypes=_BF16,
+        # router_gemm's GEMV loads and split-K partitions divide E and K; moe_routing holds up to 1024 experts.
+        accepts=lambda d: 0 < d["E"] <= 1024 and d["E"] % 16 == 0 and d["K"] > 0 and d["K"] % 1024 == 0,
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="router_gemm",
         arch="gfx950",
         variant="bf16x3_split_k",
@@ -584,6 +595,18 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
         requires=frozenset({"tma"}),
         supports_backward=False,
+    ),
+    OpSpec(
+        op="flash_attn_varlen",
+        arch="sm100",
+        variant="jfa_ws_clc",
+        impl="triton.tlx.ops.kernels.flash_attn_varlen.sm100:flash_attn_varlen",
+        invariant_vocab=_VARLEN_DIMS,
+        dtypes=_FP16,
+        accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
+        requires=frozenset({"tma", "tmem"}),
+        supports_backward=True,
+        supports_window=True,
     ),
     OpSpec(
         op="mla_window_attn",

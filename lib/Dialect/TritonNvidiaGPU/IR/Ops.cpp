@@ -922,8 +922,13 @@ TypedValue<MemDescType> WaitBarrierOp::getBarrier() { return getAlloc(); }
 LogicalResult ArriveBarrierOp::verify() {
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
-  if (getPerWarp() && gpu::lookupNumWarps(*this) <= 1)
-    return emitOpError("per_warp requires multiple warps");
+  // Frontends can set per_warp before the op is placed under a warp count, so
+  // only check it once the count is known.
+  if (getPerWarp()) {
+    std::optional<int> numWarps = gpu::maybeLookupNumWarps(*this);
+    if (numWarps && *numWarps <= 1)
+      return emitOpError("per_warp requires multiple warps");
+  }
   if (isMulticast()) {
     if (getPerThread())
       return emitOpError("multicast arrive does not support perThread");

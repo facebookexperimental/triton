@@ -50,7 +50,7 @@ public:
   bool isSameThread(Operation *lhsOp, Operation *rhsOp,
                     Allocation *allocation) {
     // Function summaries and different WS regions may have different issuers.
-    if (lhsOp->getParentRegion() != rhsOp->getParentRegion() ||
+    if (getIssuerRegion(lhsOp) != getIssuerRegion(rhsOp) ||
         lhsOp->getParentOfType<FunctionOpInterface>() !=
             allocation->getOperation())
       return false;
@@ -87,6 +87,15 @@ public:
   }
 
 private:
+  // The region whose threads issue `op`. A predicated region's body runs on
+  // threads of the region that contains it, which access the same words there.
+  static Region *getIssuerRegion(Operation *op) {
+    Region *region = op->getParentRegion();
+    while (isa<gpu::WarpPredicateOp>(region->getParentOp()))
+      region = region->getParentOp()->getParentRegion();
+    return region;
+  }
+
   struct Info {
     // (row, word column) -> (lane, warp).
     LinearLayout threads;
@@ -204,8 +213,10 @@ static TMemBoundary getTMemBoundary(Operation *op) {
   // Defer completion at CTA barriers until a hazard or boundary needs it.
   if (isa<gpu::BarrierOp>(op))
     return TMemBoundary::None;
-  // SCF has been lowered. Complete accesses before every CFG and WS edge.
-  if (isa<BranchOpInterface, gpu::WarpSpecializeOp,
+  // SCF has been lowered. Complete accesses before every CFG and WS edge,
+  // including entering or skipping a predicated region, which lowers to a
+  // conditional branch on NVIDIA. Its yield is ReturnLike.
+  if (isa<BranchOpInterface, gpu::WarpPredicateOp, gpu::WarpSpecializeOp,
           gpu::WarpSpecializePartitionsOp, gpu::WarpYieldOp, gpu::WarpReturnOp>(
           op) ||
       op->hasTrait<OpTrait::ReturnLike>())
