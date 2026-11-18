@@ -128,7 +128,7 @@ __all__ = [
     "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
     "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "paged_attention_decode",
     "paged_attention_prefill", "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d",
-    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space", "paged_prefill"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -229,6 +229,42 @@ def mm(a, b, *, out=None, space=None):
     if out is None:
         return fn(a, b, space=space_name, invariance=invariance)
     return fn(a, b, out=out, space=space_name, invariance=invariance)
+
+
+def paged_prefill(q, k, v, tables, *, kv_length=None, window=0, space=None):
+    """BF16 causal GQA prefill over 64-token KV pages, forward only.
+
+    Q is contiguous ``[B, SQ, 8 * KVH, 64]``; K/V are contiguous
+    ``[physical_pages, 64, KVH, 64]`` with 16-byte-aligned bases. The contiguous
+    int32 table is ``[B, logical_pages]``. Callers provide valid physical page
+    IDs and finite cache contents for every token through ``kv_length``;
+    unused slots in the final page are ignored. All sequences share lengths.
+
+    ``kv_length`` defaults to SQ and may include a cached prefix; causal
+    alignment is bottom-right. ``window=0`` is global, and ``window=2048``
+    includes self plus the preceding 2047 tokens. Scale is fixed to 1/sqrt(64).
+    Returns BF16 Q-shaped output; neither appends KV nor returns LSE.
+
+    Only gfx1250 is supported. ``space=None`` or ``"heuristic"`` uses frozen
+    configurations without autotuning. FP32 dot products and intermediate
+    weighted-value sums must remain finite.
+    The fast path normalizes the BF16 probabilities used by PV, accumulating
+    in FP32; abnormal ranges replay stable online softmax on the device.
+    """
+    import torch
+
+    if not all(isinstance(t, torch.Tensor) for t in (q, k, v, tables)):
+        raise InvalidInput("tlx.ops.paged_prefill expects tensor inputs")
+    if not q.is_cuda or any(t.device != q.device for t in (k, v, tables)):
+        raise InvalidInput("tlx.ops.paged_prefill expects inputs on one GPU")
+    space_name, invariance = _normalize_space_arg("paged_prefill", space)
+    _check_single_config_space("paged_prefill", space_name)
+    fn, spec = impl_for("paged_prefill", device=q.device)
+    check_inputs(spec, dtype=q.dtype)
+    check_backward(spec, q, k, v)
+    _check_enforced("paged_prefill", spec, invariance)
+    with torch.cuda.device(q.device):
+        return fn(q, k, v, tables, kv_length=kv_length, window=window)
 
 
 def int4_embedding(weights, weights_offsets, indices, offsets, D, *, out=None, space=None):
@@ -1912,29 +1948,53 @@ def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
     ``max_seqlen_q`` and ``max_seqlen_k`` bound every sequence's query rows and keys.
     The result is written into ``out``, which is returned.
 
-    Supported subset: causal, BF16/FP16 Q with K/V of Q's dtype or FP8 (e4m3fn) K/V with one-element float32
-    ``k_descale`` / ``v_descale`` (K/V = stored value * descale), no softcap, no Q scales or FP4, no ALiBi,
-    ``qq_bias`` or sinks, the linear (unshuffled) cache, and ``skip_reduce=False``; anything else raises
-    ``InvalidInput``.
+    On gfx1250, the supported shape is BF16 GQA8, head dimension 64, page 64,
+    scale 0.125, and window 0 or 2048. It also accepts AITER's shuffled 5-D
+    cache: K ``[blocks, kv_heads, 8, 64, 8]`` and V
+    ``[blocks, kv_heads, 8, 64, 8]`` with dimension order
+    ``[block, head, D/8, token, D%8]`` and
+    ``[block, head, token/8, D, token%8]``, respectively. All tensors must be
+    contiguous; Q/K/V/output bases must be 16-byte aligned, and output must
+    not share storage with any input. Lengths are read from device metadata;
+    they and both host bounds must fit int32. Changing lengths or physical
+    cache capacity reuses the compiled kernel for the selected tile/layout.
+
+    Callers provide monotonic, nonnegative ``cu_seqlens_q`` offsets within Q's
+    token capacity, with each difference at most ``max_seqlen_q`` and no
+    greater than its ``seqused_k`` entry. Each KV length is nonnegative and
+    at most ``max_seqlen_k``. Referenced page IDs must be valid and logical
+    cache values finite; unused final-page slots are ignored. Metadata values
+    are not copied to the host for validation. Empty sequences are skipped;
+    output rows outside the packed offsets are left untouched.
+    On gfx1250, FP32 dot products and intermediate weighted-value sums must
+    remain finite, as for ``paged_prefill``.
+
+    Supported subset: causal, BF16/FP16 Q, no softcap, no Q scales or FP4,
+    no ALiBi, ``qq_bias`` or sinks, and ``skip_reduce=False``. On gfx950, the
+    linear cache accepts K/V of Q's dtype or FP8 (e4m3fn) K/V with one-element
+    float32 ``k_descale`` / ``v_descale`` (stored value * descale). gfx1250 has
+    the BF16 restrictions above. Unsupported options raise ``InvalidInput``.
     """
     import torch
     name = "tlx.ops.paged_attention_prefill"
     unsupported = {
         "causal=False": not causal, "softcap": bool(softcap), "q_descale": q_descale is not None, "q_scales": q_scales
         is not None, "alibi_slopes": alibi_slopes is not None, "output_scale": output_scale is not None, "qq_bias":
-        qq_bias is not None, "sinks": sinks is not None, "shuffled_kv_cache": bool(shuffled_kv_cache), "skip_reduce":
-        bool(skip_reduce)
+        qq_bias is not None, "sinks": sinks is not None, "skip_reduce": bool(skip_reduce)
     }
     if any(unsupported.values()):
         raise InvalidInput(f"{name} does not support {[key for key, bad in unsupported.items() if bad]}")
-    if q.ndim != 3 or k.ndim != 4 or v.shape != k.shape:
-        raise InvalidInput(f"{name} expects (tokens, q_heads, head_dim) q and 4-D (blocks, page, kv_heads, head_dim) "
-                           f"k/v; got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
+    if q.ndim != 3 or k.ndim != (5 if shuffled_kv_cache else 4):
+        layout = "5-D shuffled" if shuffled_kv_cache else "4-D (blocks, page, kv_heads, head_dim)"
+        raise InvalidInput(f"{name} expects (tokens, q_heads, head_dim) q and {layout} k/v; "
+                           f"got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}")
     kv_fp8 = k.dtype == torch.float8_e4m3fn
     if v.dtype != k.dtype or not (kv_fp8 or k.dtype == q.dtype):
         raise InvalidInput(f"{name} expects k/v of q's dtype, or float8_e4m3fn k/v; got q {q.dtype}, k {k.dtype}, "
                            f"v {v.dtype}")
     _check_kv_descales(name, kv_fp8, k_descale, v_descale, q.device)
+    if kv_fp8 and shuffled_kv_cache:
+        raise InvalidInput(f"{name} supports FP8 K/V only in the linear cache")
 
     # FP8 tiles load through int32 buffer offsets, so bound the largest offset the strides reach, not numel().
     def fp8_loadable(t):
@@ -1944,10 +2004,20 @@ def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
     if kv_fp8 and not (fp8_loadable(k) and fp8_loadable(v)):
         raise InvalidInput(f"{name} expects FP8 k/v with 16-byte aligned base pointers and strides, each spanning "
                            "under 2**31 elements")
-    if k.shape[3] != q.shape[2] or q.stride(2) != 1 or k.stride(3) != 1 or v.stride(3) != 1:
-        raise InvalidInput(f"{name} expects one head_dim, contiguous in q and k/v")
-    if (cu_seqlens_q.dtype != torch.int32 or block_table.dtype != torch.int32 or block_table.ndim != 2
-            or seqused_k.dtype not in (torch.int32, torch.int64)):
+    if shuffled_kv_cache:
+        x = 16 // q.element_size()
+        blocks, num_kv_heads, d_outer, page, inner = k.shape
+        if (inner != x or d_outer * x != q.shape[2] or page % x
+                or v.shape != (blocks, num_kv_heads, page // x, q.shape[2], x)):
+            raise InvalidInput(f"{name} expects matching AITER shuffled 5-D K/V caches")
+    else:
+        num_kv_heads = k.shape[2]
+        if (v.shape != k.shape or k.shape[3] != q.shape[2] or k.stride(3) != 1 or v.stride(3) != 1):
+            raise InvalidInput(f"{name} expects one head_dim, contiguous in k/v")
+    if q.stride(2) != 1:
+        raise InvalidInput(f"{name} expects contiguous head_dim in q")
+    if (cu_seqlens_q.dtype != torch.int32 or cu_seqlens_q.ndim != 1 or block_table.dtype != torch.int32
+            or block_table.ndim != 2 or seqused_k.ndim != 1 or seqused_k.dtype not in (torch.int32, torch.int64)):
         raise InvalidInput(f"{name} expects int32 cu_seqlens_q, 2-D int32 block_table and int32/int64 seqused_k")
     if cu_seqlens_q.shape != (seqused_k.shape[0] + 1, ) or block_table.shape[0] != seqused_k.shape[0]:
         raise InvalidInput(f"{name} expects cu_seqlens_q of batch + 1 entries and one seqused_k entry and "
@@ -1956,7 +2026,6 @@ def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
         raise InvalidInput(f"{name} expects all tensors on one device")
     if out.shape != q.shape or out.dtype != q.dtype or out.stride(2) != 1:
         raise InvalidInput(f"{name} expects out to match q's shape and dtype")
-    num_kv_heads = k.shape[2]
     if num_kv_heads == 0 or q.shape[1] % num_kv_heads:
         raise InvalidInput(f"{name}: {num_kv_heads} KV heads must divide {q.shape[1]} query heads")
     for arg, value in (("max_seqlen_q", max_seqlen_q), ("max_seqlen_k", max_seqlen_k)):
@@ -1969,13 +2038,19 @@ def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
     space_name, invariance = _normalize_space_arg("paged_attention_prefill", space)
     _check_single_config_space("paged_attention_prefill", space_name)
     fn, spec = impl_for("paged_attention_prefill", device=q.device)
+    if kv_fp8 and spec.arch == "gfx1250":
+        raise InvalidInput(f"{name} on gfx1250 requires BF16 Q/K/V")
+    if shuffled_kv_cache and spec.arch != "gfx1250":
+        raise InvalidInput(f"{name} shuffled_kv_cache is supported only on gfx1250")
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2], GROUP=q.shape[1] // num_kv_heads)
     check_backward(spec, q, k, v)
     _check_enforced("paged_attention_prefill", spec, invariance)
     with torch.cuda.device(q.device):
-        fn(q, k, v, cu_seqlens_q, seqused_k.to(torch.int32), block_table, max_seqlen_q, sm_scale=float(softmax_scale),
-           sliding_window=int(window_size[0]) + 1, out=out, max_context_len=max_seqlen_k, k_descale=k_descale,
-           v_descale=v_descale)
+        kwargs = ({"shuffled_kv_cache": shuffled_kv_cache}
+                  if spec.arch == "gfx1250" else {"k_descale": k_descale, "v_descale": v_descale})
+        lengths = seqused_k if spec.arch == "gfx1250" else seqused_k.to(torch.int32)
+        fn(q, k, v, cu_seqlens_q, lengths, block_table, max_seqlen_q, sm_scale=float(softmax_scale),
+           sliding_window=int(window_size[0]) + 1, out=out, max_context_len=max_seqlen_k, **kwargs)
     return out
 
 

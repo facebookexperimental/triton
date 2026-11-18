@@ -100,6 +100,14 @@ _NORM_AUTOGRAD = frozenset([
 # A missing (op, arch) is deferred, not an error -- the op raises on that arch.
 CATALOG: tuple[OpSpec, ...] = (
     OpSpec(
+        op="paged_prefill",
+        arch="gfx1250",
+        variant="tdm_wmma",
+        impl="triton.tlx.ops.kernels.paged_prefill.gfx1250:paged_prefill",
+        invariant_vocab=_ATTN_DIMS,
+        dtypes=_BF16,
+    ),
+    OpSpec(
         op="mm",
         arch="sm90",
         variant="ws_cooperative",
@@ -741,6 +749,14 @@ CATALOG: tuple[OpSpec, ...] = (
         impl="triton.tlx.ops.kernels.paged_attn.gfx950_prefill:paged_attention_prefill",
         dtypes=_FP16,
         accepts=lambda d: d["HEAD_DIM"] == 64 and d["GROUP"] <= 256 and d["GROUP"] & (d["GROUP"] - 1) == 0,
+    ),
+    OpSpec(
+        op="paged_attention_prefill",
+        arch="gfx1250",
+        variant="tlx_wmma",
+        impl="triton.tlx.ops.kernels.paged_prefill.gfx1250:paged_attention_prefill",
+        dtypes=_BF16,
+        accepts=lambda d: d["HEAD_DIM"] == 64 and d["GROUP"] == 8,
     ),
     OpSpec(
         op="paged_attention_decode_workspace",
