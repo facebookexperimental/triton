@@ -1,0 +1,221 @@
+name: TLX.ops perf smoke (one platform)
+# Called by tlx-ops-perf-smoke.yml once per GPU platform. A platform's report
+# job needs only its own bench job, so its section of the PR comment is posted
+# as soon as that runner finishes, however long another platform's runner takes.
+#
+# bench runs the PR's code on the GPU runner with read-only tokens: it measures
+# the PR's base and merge commit back to back on one GPU, alternating which
+# goes first. report posts from a GitHub-hosted runner.
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: Platform name used in the comment and artifacts (b200, h100, mi350)
+        type: string
+        required: true
+      runner:
+        description: runs-on label of the platform's GPU runners
+        type: string
+        required: true
+      torch_index:
+        description: PyTorch wheel index matching the runner's GPU stack
+        type: string
+        required: true
+      head:
+        description: Commit to bench (the PR's test merge commit); its harness measures both wheels
+        type: string
+        required: true
+      pr_head:
+        description: The PR's head commit, for the comment
+        type: string
+        required: true
+      base:
+        description: Commit to compare against on the same GPU (the merge commit's first parent)
+        type: string
+        required: true
+      base_date:
+        description: The base commit's date (YYYYMMDD), to pick the nightly baseline shown as context
+        type: string
+        required: true
+      pr:
+        description: PR number to comment on (blank = job summary only)
+        type: string
+        required: false
+        default: ''
+      note:
+        description: Line for the comment header, e.g. which platforms are paused
+        type: string
+        required: false
+        default: ''
+      rounds:
+        description: Alternating base/head rounds
+        type: number
+        required: false
+        default: 3
+      head_wheel_url:
+        type: string
+        required: true
+      head_wheel_filename:
+        type: string
+        required: true
+      head_wheel_sha256:
+        type: string
+        required: false
+        default: ''
+      base_wheel_url:
+        description: Blank when the base wheel did not build; the report then compares with the nightly only
+        type: string
+        required: false
+        default: ''
+      base_wheel_filename:
+        type: string
+        required: false
+        default: ''
+      base_wheel_sha256:
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  TORCH_VERSION: "2.14.0"
+
+jobs:
+  bench:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout suite at the benched commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head }}
+      - name: Checkout CI actions and scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .ci
+          sparse-checkout: |
+            .github/actions
+            .github/scripts
+      - name: Set up test environment
+        uses: ./.ci/.github/actions/setup-test-env
+        with:
+          backend: ${{ contains(inputs.torch_index, 'rocm') && 'rocm' || 'cuda' }}
+          arch: ${{ inputs.platform == 'mi350' && 'gfx950' || '' }}
+          torch: torch==${{ env.TORCH_VERSION }}
+          torch-index-url: ${{ inputs.torch_index }}
+          packages: numpy pytest pytest-timeout torchao
+          # Keep the release torch on its bundled ROCm libraries.
+          rocm-lib-path: ""
+      - name: Refresh the linker cache
+        if: ${{ !contains(inputs.torch_index, 'rocm') }}
+        run: sudo ldconfig
+      # The action installs the wheel it fetches; the bench reinstalls the two
+      # wheels in turn, so each is moved aside once fetched.
+      - name: Fetch the head wheel
+        uses: ./.ci/.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ inputs.head_wheel_url }}
+          wheel-filename: ${{ inputs.head_wheel_filename }}
+          wheel-sha256: ${{ inputs.head_wheel_sha256 }}
+      - name: Keep the head wheel
+        run: mkdir -p "${RUNNER_TEMP}/ab/head" && mv "${RUNNER_TEMP}"/prebuilt-wheel/*.whl "${RUNNER_TEMP}/ab/head/"
+      - name: Fetch the base wheel
+        if: inputs.base_wheel_url != ''
+        uses: ./.ci/.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ inputs.base_wheel_url }}
+          wheel-filename: ${{ inputs.base_wheel_filename }}
+          wheel-sha256: ${{ inputs.base_wheel_sha256 }}
+      - name: Keep the base wheel
+        if: inputs.base_wheel_url != ''
+        run: mkdir -p "${RUNNER_TEMP}/ab/base" && mv "${RUNNER_TEMP}"/prebuilt-wheel/*.whl "${RUNNER_TEMP}/ab/base/"
+      - name: Bench base and head on one GPU
+        timeout-minutes: 50
+        # The harness also asserts an absolute floor against the reference
+        # kernel. This job reports a ratio instead, so a floor miss must not
+        # fail it; a run that measured nothing shows up in the report.
+        continue-on-error: true
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          ROUNDS: ${{ inputs.rounds }}
+        run: |
+          set -euo pipefail
+          BASE_WHEEL=$(find "${RUNNER_TEMP}/ab/base" -name '*.whl' 2>/dev/null | head -n 1)
+          HEAD_WHEEL=$(find "${RUNNER_TEMP}/ab/head" -name '*.whl' | head -n 1)
+          python .ci/.github/scripts/tlx_ops_perf_smoke_ab.py bench --platform "${PLATFORM}" --repo . \
+            --base-wheel "${BASE_WHEEL}" --head-wheel "${HEAD_WHEEL}" --rounds "${ROUNDS}" \
+            --out "${RUNNER_TEMP}/perf-smoke"
+      # Only the sanitized results.json: the raw harness artifacts carry the
+      # runner's host name, GPU UUID and process list.
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlx-ops-perf-smoke-${{ github.run_id }}-${{ inputs.platform }}
+          path: |
+            ${{ runner.temp }}/perf-smoke/results.json
+            ${{ runner.temp }}/perf-smoke/raw/*/*/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  report:
+    needs: bench
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+      - name: Download results
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: tlx-ops-perf-smoke-${{ github.run_id }}-${{ inputs.platform }}
+          path: results
+      - name: Compare base and head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM: ${{ inputs.platform }}
+          HEAD_SHA: ${{ inputs.head }}
+          PR_HEAD: ${{ inputs.pr_head }}
+          BASE_SHA: ${{ inputs.base }}
+          BASE_DATE: ${{ inputs.base_date }}
+          BENCH_STATUS: ${{ needs.bench.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          mkdir -p history
+          gh release download tlx-ops-bench --pattern "*.${PLATFORM}.json" --dir history \
+            || echo "no nightly summaries for ${PLATFORM}"
+          python3 .github/scripts/tlx_ops_perf_smoke_ab.py report --results results/results.json \
+            --platform "${PLATFORM}" --history history --base-date "${BASE_DATE}" --base "${BASE_SHA}" \
+            --head "${HEAD_SHA}" --pr-head "${PR_HEAD}" --run-url "${RUN_URL}" --bench-status "${BENCH_STATUS}" \
+            --out-md section.md --out-json verdict.json
+          cat section.md >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload verdict
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlx-ops-perf-smoke-${{ github.run_id }}-${{ inputs.platform }}-verdict
+          path: verdict.json
+          retention-days: 14
+      - name: Update the PR comment
+        if: inputs.pr != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+          PLATFORM: ${{ inputs.platform }}
+          HEAD_SHA: ${{ inputs.head }}
+          NOTE: ${{ inputs.note }}
+        run: |
+          python3 .github/scripts/tlx_ops_perf_smoke_comment.py --repo "${GITHUB_REPOSITORY}" --pr "${PR}" \
+            --platform "${PLATFORM}" --head "${HEAD_SHA}" --section section.md --note "${NOTE}"
