@@ -727,6 +727,22 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: 1 <= d.get("KEY_DIM", 0) <= 128 and 1 <= d.get("VALUE_DIM", 0) <= 128,
     ),
     OpSpec(
+        op="paged_attention_decode_fp8",
+        arch="gfx1250",
+        variant="per_head_wmma_tdm",
+        impl="triton.tlx.ops.kernels.paged_attn_fp8.gfx1250_decode:paged_attention_decode_fp8",
+        dtypes=frozenset({"bfloat16", "float8_e4m3fn"}),
+        invariant_vocab=_VARLEN_DIMS,
+        accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
+    ),
+    OpSpec(
+        op="paged_attention_decode_fp8_workspace",
+        arch="gfx1250",
+        variant="per_head_wmma_tdm",
+        impl="triton.tlx.ops.kernels.paged_attn_fp8.gfx1250_decode:paged_attention_decode_fp8_workspace",
+        dtypes=frozenset({"bfloat16", "float8_e4m3fn"}),
+    ),
+    OpSpec(
         op="paged_attention_decode",
         arch="gfx950",
         variant="split_k_mfma",
