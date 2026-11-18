@@ -626,10 +626,16 @@ class CompiledKernel:
                 self._run = wrap_launcher(self, run)
             except ImportError:  # fail-open: launch unwrapped
                 pass
+        # Backends may reserve additional shared memory at launch time.
+        # Read from the unwrapped launcher: the compile_iq wrapper is a plain
+        # function without the launcher's attributes.
+        shared = getattr(run, "shared", self.metadata.shared)
         # not enough shared memory to run the kernel
-        max_shared = _max_shared_mem(device, utils)
-        if self.metadata.shared > max_shared:
-            raise_(OutOfResources(self.metadata.shared, max_shared, "shared memory"))
+        max_shared = max_shared_mem(device)
+        if shared > max_shared:
+            raise_(
+                OutOfResources(shared, max_shared, "shared memory",
+                               getattr(self.metadata, "shared_memory_breakdown", None)))
         if hasattr(self.metadata, "tmem_size") and self.metadata.tmem_size is not None:
             # Use blackwell max tmem size for now, this should be moved in device properties
             max_tmem_size = 512  # tmem size in number of columns
@@ -642,7 +648,7 @@ class CompiledKernel:
         # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`
         self._unload_module = utils.unload_module
         self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = utils.load_binary(
-            self.name, self.kernel, self.metadata.shared, device)
+            self.name, self.kernel, shared, device)
         self._module_pid = os.getpid()
         warp_size = self.metadata.warp_size
         if self.metadata.num_warps * warp_size > self.n_max_threads:
@@ -651,6 +657,7 @@ class CompiledKernel:
             knobs.runtime.kernel_load_end_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
 
         # Create C dispatcher if enabled and schema is available.
+        self._launch_shared = shared
         self._build_dispatcher()
 
     def _build_dispatcher(self):
@@ -660,6 +667,7 @@ class CompiledKernel:
         self._dispatcher = None
         self._dispatch_arg_indices = None
         self._num_kernel_args = None
+        self._dispatcher_launch = None
         if (knobs.runtime.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
                 and "launch_metadata" in self.asm):
             try:
@@ -673,7 +681,10 @@ class CompiledKernel:
                 # Auto-TMA kernels carry compiler-synthesized descriptor params
                 # that only the variadic CudaLauncher injects; skip the dispatcher
                 # (fast path) for them so they fall back to the working launcher.
-                if schema.get("auto_tma_recipes"):
+                # The dispatcher launches with the schema's static shared size, so a launcher
+                # that reserves more at launch time (max_occupancy) keeps the launcher path.
+                if schema.get("auto_tma_recipes") or getattr(self, "_launch_shared",
+                                                             schema["shared_mem"]) != schema["shared_mem"]:
                     dispatcher = None
                 else:
                     dispatcher = make_triton_dispatcher(schema, self.function)
@@ -682,6 +693,7 @@ class CompiledKernel:
                     self._dispatcher = dispatcher
                     self._dispatch_arg_indices = indices
                     self._num_kernel_args = len(schema["args"])
+                    self._dispatcher_launch = getattr(self._run, "launch", None)
             except (KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError) as e:
                 logger.warning("Triton dispatcher creation failed for %s: %s", self.name, e)
 
@@ -692,12 +704,10 @@ class CompiledKernel:
         min median) and only the winner is kept as the live function -- plain stays in the pool, so
         this can never be slower than baseline. In-memory only; the compile cache keeps its plain cubin.
 
-        Idempotency: the A/B re-launches the kernel on the user's buffers, so it assumes the kernel is
-        safe to re-run (overwrite outputs). This is the same contract as autotuning; a non-idempotent
-        kernel (accumulate / atomics / in-place) needs a restore/reset opt-in.
+        Idempotency: the A/B runs on copies of the launch args (magnon.consume.scratch_args), so
+        in-place / accumulating kernels never touch the caller's buffers. When the args cannot be
+        copied safely, the A/B is skipped and plain is kept.
 
-        TODO(compile_iq): expose an idempotency opt-in surface (env/registry/kwarg) for bare @jit
-        kernels that lack @autotune's restore_value/reset_to_zero; default assumes overwrite-safe.
         TODO(compile_iq): optional cross-process winner cache (key sha256(PTX) x arch x acf_sha ->
         plain|acf) so later processes skip re-benchmarking; today the winner is in-memory per process.
         TODO(compile_iq): ACF-wedge protection deferred to a separate PR -- the A/B piggybacks on
@@ -726,7 +736,12 @@ class CompiledKernel:
                     print(f"[compile_iq.freewin] {self.name}: FORCE-APPLY -> kept acf "
                           "(competition skipped)", flush=True)
                 return
-            bargs = tuple(bound_args.values())
+            from triton.magnon.consume import scratch_args
+
+            # Run the A/B on copies so in-place / accumulating kernels never touch the caller's buffers.
+            bargs = scratch_args(bound_args.values())
+            if bargs is None:
+                return  # cannot copy safely: keep plain (the finally unloads the ACF module)
 
             def _call(func):
                 self._run(grid_0, grid_1, grid_2, stream, func, self.packed_metadata, None, None, None, *bargs)
@@ -809,8 +824,10 @@ class CompiledKernel:
             return runner
 
         dispatcher = getattr(self, '_dispatcher', None)
+        # The dispatcher replicates launcher.launch; a replaced launch must not be bypassed.
         if (knobs.runtime.use_triton_dispatcher and dispatcher is not None and not callable(grid)
-                and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook):
+                and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook
+                and getattr(self._run, "launch", None) is self._dispatcher_launch):
             # Try to create a _TritonJITRunner for maximum speed
             try:
                 from triton.backends.nvidia.triton_dispatcher_factory import _load_module

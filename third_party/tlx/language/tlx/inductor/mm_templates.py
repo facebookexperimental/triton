@@ -2,7 +2,11 @@ from pathlib import Path
 
 from torch._inductor import config as inductor_config
 from torch._inductor.kernel.mm_common import mm_grid  # noqa: F401
-from torch._inductor.select_algorithm import SymbolicGridFn, TritonTemplate
+from torch._inductor.select_algorithm import (
+    ExternKernelChoice,
+    SymbolicGridFn,
+    TritonTemplate,
+)
 from torch._inductor.utils import load_template
 
 from ..hw.target import current_target, is_rocm
@@ -11,6 +15,31 @@ from ..hw.target import current_target, is_rocm
 # resources of the triton beta python library), so load them from here rather
 # than from the OSS inductor template dir.
 _TLX_TEMPLATE_DIR = Path(__file__).parent
+
+
+def _gfx950_mm_out(a, b, *, out, **_ignored):
+    from triton.tlx.ops import mm
+
+    return mm(a, b, out=out, space="heuristic")
+
+
+gfx950_mm_extern = ExternKernelChoice.lookup("tlx_gfx950_mm") or ExternKernelChoice(
+    _gfx950_mm_out,
+    name="tlx_gfx950_mm",
+)
+
+
+def _gfx950_family_extern(name: str) -> ExternKernelChoice:
+    return ExternKernelChoice.lookup(name) or ExternKernelChoice(
+        _gfx950_mm_out,
+        name=name,
+    )
+
+
+gfx950_mm_streamk_extern = _gfx950_family_extern("tlx_gfx950_mm_streamk")
+gfx950_mm_ragged_n_extern = _gfx950_family_extern("tlx_gfx950_mm_ragged_n")
+gfx950_mm_m192n256_extern = _gfx950_family_extern("tlx_gfx950_mm_m192n256")
+gfx950_mm_hybrid_n160_extern = _gfx950_family_extern("tlx_gfx950_mm_hybrid_n160")
 
 
 def load_tlx_template(name: str) -> str:
@@ -70,6 +99,43 @@ def _gfx942_mm_grid_split_k(m, n, meta, *, cdiv):
 @SymbolicGridFn
 def _mm_grid_local_split_u(m, n, meta, *, cdiv):
     return (cdiv(n, meta["TILE_N"]), 1, 1)
+
+
+@SymbolicGridFn
+def _mm_grid_register(m, n, meta, *, cdiv):
+    if meta.get("TRANSPOSED", False):
+        m, n = n, m
+    return (cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"]), 1, 1)
+
+
+@SymbolicGridFn
+def _mm_grid_wave_grid(m, n, meta, *, cdiv):
+    if meta.get("TRANSPOSED", False):
+        m, n = n, m
+    instr = meta.get("INSTR_M", 16)
+    block_m = instr * meta["MI_WAVE_TILE_M"] * meta["WARPS_M"]
+    block_n = instr * meta["MI_WAVE_TILE_N"] * meta["WARPS_N"]
+    tiles = cdiv(m, block_m) * cdiv(n, block_n)
+    return (cdiv(tiles, meta["TILES_PER_PROGRAM"]), 1, 1)
+
+
+@SymbolicGridFn
+def _mm_grid_fragmented_register(m, n, meta, *, cdiv):
+    block_m = meta["M_HEAD"] + meta["M_TAIL"]
+    return (cdiv(n, block_m) * cdiv(m, meta["BLOCK_N"]), 1, 1)
+
+
+@SymbolicGridFn
+def _mm_grid_fragmented_m(m, n, meta, *, cdiv):
+    if meta.get("TRANSPOSED", False):
+        m, n = n, m
+    block_m = meta["M0"] + meta["M1"] + meta.get("M2", 0)
+    return (cdiv(m, block_m) * cdiv(n, meta["BLOCK_N"]), 1, 1)
+
+
+@SymbolicGridFn
+def _mm_grid_short_k(m, n, meta, *, cdiv):
+    return (cdiv(m, 64) * cdiv(n, 64), 1, 1)
 
 
 @SymbolicGridFn
@@ -152,15 +218,63 @@ gfx950_mm_interwave_template = TritonTemplate(
     source=load_tlx_template("gfx950_addmm_interwave"),
 )
 
+gfx950_mm_lds_template = TritonTemplate(
+    name="tlx_gfx950_mm_lds",
+    grid=_mm_grid_split_k,
+    source=load_tlx_template("gfx950_mm_lds"),
+)
+
+gfx950_mm_fragmented_register_template = TritonTemplate(
+    name="tlx_gfx950_mm_fragmented_register",
+    grid=_mm_grid_fragmented_register,
+    source=load_tlx_template("gfx950_mm_fragmented_register"),
+)
+gfx950_mm_fragmented_register_template.tlx_manual_output = True
+
+gfx950_mm_fragmented_m_template = TritonTemplate(
+    name="tlx_gfx950_mm_fragmented_m",
+    grid=_mm_grid_fragmented_m,
+    source=load_tlx_template("gfx950_mm_fragmented_m"),
+)
+gfx950_mm_fragmented_m_template.tlx_manual_output = True
+
+gfx950_mm_short_k_template = TritonTemplate(
+    name="tlx_gfx950_mm_short_k",
+    grid=_mm_grid_short_k,
+    source=load_tlx_template("gfx950_mm_short_k"),
+)
+gfx950_mm_short_k_template.tlx_manual_output = True
+
+gfx950_mm_row_major_direct_template = TritonTemplate(
+    name="tlx_gfx950_mm_row_major_direct",
+    grid=_mm_grid_fixed_programs,
+    source=load_tlx_template("gfx950_mm_row_major_direct"),
+)
+gfx950_mm_row_major_direct_template.tlx_manual_output = True
+
+gfx950_mm_wave_grid_template = TritonTemplate(
+    name="tlx_gfx950_mm_wave_grid",
+    grid=_mm_grid_wave_grid,
+    source=load_tlx_template("gfx950_mm_wave_grid"),
+)
+gfx950_mm_wave_grid_template.tlx_manual_output = True
+
 gfx950_mm_local_split_u_template = TritonTemplate(
     name="tlx_gfx950_mm_local_split_u",
     grid=_mm_grid_local_split_u,
     source=load_tlx_template("gfx950_mm_local_split_u"),
 )
 
+gfx950_mm_cached_b_template = TritonTemplate(
+    name="tlx_gfx950_mm_cached_b",
+    grid=_mm_grid_fixed_programs,
+    source=load_tlx_template("gfx950_mm_cached_b"),
+)
+gfx950_mm_cached_b_template.tlx_manual_output = True
+
 gfx950_mm_register_template = TritonTemplate(
     name="tlx_gfx950_mm_register",
-    grid=mm_grid,
+    grid=_mm_grid_register,
     source=load_tlx_template("gfx950_mm_register"),
 )
 
@@ -212,12 +326,13 @@ gfx950_addmm_persistent_warppipe_template = TritonTemplate(
 
 # Templates whose every output store goes through reduction_store_output.
 for _template in (
-    gfx942_mm_template,
-    gfx942_addmm_template,
-    gfx950_addmm_warppipe_template,
-    gfx950_addmm_persistent_warppipe_template,
-    gfx950_mm_interwave_template,
-    gfx950_addmm_interwave_template,
+        hopper_gemm_small_k_template,
+        gfx942_mm_template,
+        gfx942_addmm_template,
+        gfx950_addmm_warppipe_template,
+        gfx950_addmm_persistent_warppipe_template,
+        gfx950_mm_interwave_template,
+        gfx950_addmm_interwave_template,
 ):
     _template.tlx_row_partials = True
 
@@ -237,15 +352,18 @@ def append_tlx(templates, op_name, kernel_inputs):
 
 def _append_tlx_hopper(templates, op_name):
     if op_name == "addmm":
-        # tuned_addmm issues several get_template_configs calls; only the unified
-        # one (with the stock mm_template) passes the bias expanded to [M, N],
-        # which the template epilogue indexes in 2-D.
-        from torch._inductor.kernel.mm import mm_template
+        # tuned_addmm issues several get_template_configs calls: join the unified one
+        # (with the stock mm_template) or, without max_autotune, the ATen-only one.
+        # tlx_kernel_inputs expands the latter's bias to the [M, N] the epilogue indexes.
+        from torch._inductor.kernel.mm import aten_addmm, mm_template
 
-        if mm_template.uid not in {getattr(t, "uid", None) for t in templates}:
+        uids = {getattr(t, "uid", None) for t in templates}
+        default_set = not (inductor_config.max_autotune or inductor_config.max_autotune_gemm) and aten_addmm.uid in uids
+        if mm_template.uid not in uids and not default_set:
             return templates
     elif op_name != "mm":
         return templates
+    # Each tuned_mm path makes a single "mm" get_template_configs call, so mm needs no uid gate.
     for template in (hopper_gemm_ws_template, hopper_gemm_small_k_template):
         if template not in templates:
             templates.append(template)
@@ -264,20 +382,28 @@ def _append_tlx_amd(templates, op_name):
         if mm_template.uid not in uids and not default_set:
             return templates
         if current_target().is_gfx942:
-            template = (
-                gfx942_mm_template
-                if op_name == "mm"
-                else gfx942_addmm_template
-            )
+            template = (gfx942_mm_template if op_name == "mm" else gfx942_addmm_template)
             if template.uid not in uids:
                 templates.append(template)
             return templates
         if op_name == "mm":
             for template in (
-                gfx950_mm_interwave_template,
-                gfx950_mm_local_split_u_template,
-                gfx950_mm_register_template,
-                gfx950_mm_persistent_template,
+                    gfx950_mm_extern,
+                    gfx950_mm_streamk_extern,
+                    gfx950_mm_ragged_n_extern,
+                    gfx950_mm_m192n256_extern,
+                    gfx950_mm_hybrid_n160_extern,
+                    gfx950_mm_cached_b_template,
+                    gfx950_mm_interwave_template,
+                    gfx950_mm_lds_template,
+                    gfx950_mm_fragmented_register_template,
+                    gfx950_mm_fragmented_m_template,
+                    gfx950_mm_wave_grid_template,
+                    gfx950_mm_short_k_template,
+                    gfx950_mm_row_major_direct_template,
+                    gfx950_mm_local_split_u_template,
+                    gfx950_mm_register_template,
+                    gfx950_mm_persistent_template,
             ):
                 if template.uid not in uids:
                     templates.append(template)
@@ -311,8 +437,10 @@ def _append_tlx_amd(templates, op_name):
 
 
 def tlx_kernel_inputs(template, kernel_inputs, op_name):
-    """Expand default addmm bias inputs for the AMD TLX addmm template epilogues."""
+    """Expand default addmm bias inputs for the TLX addmm template epilogues."""
     if op_name != "addmm" or template not in (
+            hopper_gemm_ws_template,
+            hopper_gemm_small_k_template,
             gfx942_addmm_template,
             gfx950_addmm_interwave_template,
             gfx950_addmm_warppipe_template,
@@ -328,7 +456,8 @@ def tlx_kernel_inputs(template, kernel_inputs, op_name):
 
     return MMKernelInputs(
         [ExpandView.create(bias, size), mat1, mat2],
-        scalars=kernel_inputs._scalars, out_dtype=kernel_inputs.out_dtype(),
+        scalars=kernel_inputs._scalars,
+        out_dtype=kernel_inputs.out_dtype(),
     )
 
 

@@ -142,21 +142,19 @@ jobs:
             echo "__SUSPECTS_EOF__"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Reopen a recently auto-closed issue, or skip a stale report
-        id: reopen
+      - name: Skip a stale report
+        id: check
         env:
           GH_TOKEN: ${{ github.token }}
           TITLE: ${{ inputs.issue_title }}
           LABELS: ${{ inputs.labels }}
-          SUMMARY: ${{ inputs.summary }}
-          SHA: ${{ inputs.sha }}
           RUN_URL: ${{ inputs.run_url }}
         run: |
-          python3 .github/scripts/failure_issues.py reopen --title "$TITLE" --labels "$LABELS" \
-            --summary "$SUMMARY" --sha "$SHA" --run-url "$RUN_URL"
+          python3 .github/scripts/failure_issues.py check --title "$TITLE" --labels "$LABELS" \
+            --run-url "$RUN_URL"
 
       - name: Create or update nightly failure issue
-        if: steps.reopen.outputs.action != 'reopened' && steps.reopen.outputs.action != 'skip'
+        if: steps.check.outputs.action == 'file'
         uses: actions/github-script@v7
         with:
           script: |
@@ -264,20 +262,30 @@ jobs:
             const header = "> Auto-filed by nightly CI. Do not edit the title — it is the dedup key.\n";
             const fullBody = [header, blame, "", meta, "", status].join("\n");
 
-            // Find an existing OPEN issue with the exact same title + labels. List, never search: the search
-            // index can miss an issue for hours, and a missed issue gets filed twice.
-            const open = await github.paginate(github.rest.issues.listForRepo, {
+            // List, never search: the search index can miss an issue for hours.
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
               owner: context.repo.owner, repo: context.repo.repo,
-              state: "open", labels: labels.join(","), per_page: 100,
+              state: "all", labels: labels.join(","), per_page: 100,
             });
-            const existing = open.find(i => i.title === title && !i.pull_request);
+            const matching = issues.filter(i => i.title === title && !i.pull_request);
+            const recordedRun = body => Math.max(0, ...Array.from((body || "").matchAll(/(?:^\| Run \| \S*\/actions\/runs\/|<!-- ci-resolved run=)(\d+)/gm), m => Number(m[1])));
+            if (matching.some(i => recordedRun(i.body) > context.runId)) {
+              core.info("Skipped stale report");
+              return;
+            }
+            const existing = matching.find(i => i.state === "open");
 
             if (existing) {
               // Preserve the blame section + metadata (possibly edited by the bisect
               // job); only refresh the status table below the STATUS marker.
               const old = existing.body || "";
+              const previousIds = old.match(/^### Raw failing test IDs\n```\n([\s\S]*?)\n```/m);
+              const episodeIds = [...new Set([...(previousIds ? previousIds[1].split("\n") : []), ...rawList])];
+              const episodeStatus = episodeIds.length
+                ? status.replace(rawBlock, "```\n" + episodeIds.join("\n") + "\n```")
+                : status;
               const idx = old.indexOf(STATUS);
-              const body = idx >= 0 ? old.slice(0, idx) + status : fullBody;
+              const body = idx >= 0 ? old.slice(0, idx) + episodeStatus : fullBody;
               await github.rest.issues.update({
                 owner: context.repo.owner, repo: context.repo.repo,
                 issue_number: existing.number, body,

@@ -841,8 +841,15 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.kda._prefill_shapes",
         "triton.tlx.ops.kernels.kda._decode_shapes",
         "triton.tlx.ops.kernels.fused.linear_rowscale._shapes",
+        "triton.tlx.ops.kernels.fused.moe_router_topk_align._shapes",
+        "triton.tlx.ops.kernels.fused.norm_residual_norm._shapes",
+        "triton.tlx.ops.kernels.fused.rmsnorm_gate._shapes",
         "triton.tlx.ops.kernels.mla_window_attn._shapes",
         "triton.tlx.ops.kernels.mm._shapes",
+        "triton.tlx.ops.kernels.moe._routing_shapes",
+        "triton.tlx.ops.kernels.norm._shapes",
+        "triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache._shapes",
+        "triton.tlx.ops.kernels.router_gemm._shapes",
         "triton.tlx.ops.kernels.swiglu_ffn._shapes",
     ],
 )
@@ -890,14 +897,25 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
         "triton.tlx.ops.kernels.kda._prefill_shapes": {"gfx950": ("gfx950_1", )},
         "triton.tlx.ops.kernels.kda._decode_shapes": {"gfx950": ("gfx950_1", )},
         "triton.tlx.ops.kernels.fused.linear_rowscale._shapes": {"sm90": ("sm90_1", )},
+        "triton.tlx.ops.kernels.fused.norm_residual_norm._shapes": {"gfx950": ("gfx950_all", )},
+        "triton.tlx.ops.kernels.fused.rmsnorm_gate._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.mla_window_attn._shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.norm._cat_shapes": {"sm90": ("sm90_1", )},
+        "triton.tlx.ops.kernels.norm._shapes": {
+            "sm100": ("sm100_1", ),
+            "sm90": ("sm90_1", ),
+            "gfx950": ("gfx950_all", ),
+        },
         "triton.tlx.ops.kernels.mm._shapes": {
             "sm90": ("sm90_baseline", "sm90_1"),
             "sm100": ("sm100_1", ),
             "gfx950": ("gfx950_all", ),
             "gfx942": ("gfx942_all", ),
         },
+        "triton.tlx.ops.kernels.fused.moe_router_topk_align._shapes": {"gfx950": ("gfx950_all", )},
+        "triton.tlx.ops.kernels.moe._routing_shapes": {"gfx950": ("gfx950_all", )},
+        "triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache._shapes": {"gfx950": ("gfx950_all", )},
+        "triton.tlx.ops.kernels.router_gemm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.swiglu_ffn._shapes": {"sm90": ("sm90_1", )},
     }
     pattern = re.compile(r"^(?:sm|gfx)\d+_(?:[1-9]\d*|all)$")
@@ -915,7 +933,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
     assert mm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_addmm", "gfx950_4")
 
     addmm = importlib.import_module("triton.tlx.ops.kernels.addmm._shapes").FOCUS
-    assert addmm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2", "gfx942_3")
+    assert addmm.suite("gfx942_all").includes == ("gfx942_1", "gfx942_2", "gfx942_3", "gfx942_4")
     assert addmm.suite("gfx950_all").includes == ("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_4")
 
     bmm = importlib.import_module("triton.tlx.ops.kernels.bmm._shapes").FOCUS
@@ -996,7 +1014,14 @@ BENCH_MODULES = (
     "bench_mla_window_attn",
     "bench_mm",
     "bench_mm_mxfp8",
+    "bench_moe_router_topk_align",
+    "bench_moe_routing",
+    "bench_norm_residual_norm",
+    "bench_norm",
+    "bench_qk_norm_rope_kv_cache",
+    "bench_router_gemm",
     "bench_rmsnorm_cat",
+    "bench_rmsnorm_gate",
     "bench_swiglu_ffn",
 )
 
@@ -1290,6 +1315,24 @@ def test_all_is_the_default_so_an_op_that_says_nothing_is_unchanged(monkeypatch)
 def test_none_skips_every_cold_pass(monkeypatch):
     seen = _cold_flags(_FakeBench(cold_compile="none"), monkeypatch)
     assert not any(cold for _, cold in seen)
+
+
+def test_prepared_graph_compile_time_reaches_verdict(monkeypatch):
+    from types import SimpleNamespace
+    import torch
+    from _harness import driver
+
+    compile_stat = CompileStat(t_cold_s=121.0, n_compiles=1, cap_s=120.0)
+    bench = SimpleNamespace(prepare=lambda case, space: driver.Prepared(lambda: None, compile_stat=compile_stat))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(driver, "measure", lambda *a, **kw: summarize([1.0]))
+    monkeypatch.setattr(driver, "host_overhead_us", lambda fn: 0.0)
+    monkeypatch.setattr(driver, "cold_compile",
+                        lambda *a, **kw: pytest.fail("must not time a graph replay as compilation"))
+    result = driver.run_case(bench, _case(), space="heuristic", cold=False)
+    assert result.t_cold_s == compile_stat.t_cold_s
+    assert result.status == Status.PIP
 
 
 def test_an_explicit_mode_overrides_the_ops_own(monkeypatch):
@@ -1820,3 +1863,48 @@ def test_gfx1250_governor_does_not_guess_clock_or_power_policy(monkeypatch):
     governor._govern_amd(governor.device)
     assert not calls
     assert governor.skipped
+
+
+def test_gfx1250_attention_focus_cases_share_workload_suites(monkeypatch):
+    from _harness import driver
+    import bench_flash_attn as standalone
+    import bench_torchtlx_flex_attention as flex
+    from triton.tlx.ops.kernels.flash_attn._shapes import FOCUS
+
+    monkeypatch.setattr(driver, "arch", lambda: "gfx1250")
+    expected = {(s.batch, s.heads, s.context, s.head_dim)
+                for s in FOCUS.shapes("gfx1250")
+                if s.head_dim == 128 and not s.causal}
+    for bench in (standalone, flex):
+        cases = bench.cases()
+        assert {case.shape[:4] for case in cases} == expected
+        assert {case.dtype for case in cases} == {"float16", "bfloat16"}
+        assert {case.direction for case in cases} == {"fwd"}
+
+
+@pytest.mark.parametrize("arch", ["gfx1250", "gfx950", "sm100"])
+def test_flex_first_use_cost_is_measured_on_every_arch(monkeypatch, tmp_path, arch):
+    import contextlib
+    import torch
+    import bench_torchtlx_flex_attention as flex
+    from _harness import driver
+
+    tensor = torch.zeros((1, 2, 128, 128))
+    measured = []
+
+    def measure_first_use(fn):
+        fn()
+        measured.append(True)
+        return CompileStat(t_cold_s=2.0)
+
+    monkeypatch.setattr(driver, "arch", lambda: arch)
+    monkeypatch.setattr(flex, "ARTIFACT_DIR", tmp_path)
+    monkeypatch.setattr(flex, "flex_adapter", contextlib.nullcontext)
+    monkeypatch.setattr(flex, "inputs", lambda *a, **kw: ((tensor, tensor, tensor), None, None))
+    monkeypatch.setattr(flex, "compile_arm", lambda *a, **kw: (lambda: tensor, tensor))
+    monkeypatch.setattr(flex, "cold_compile", measure_first_use)
+    case = Case(flex.OP, arch, "float16", (1, 2, 128, 128, "noop"))
+    prepared = flex.prepare(case, "heuristic")
+    assert measured == [True]
+    assert prepared.compile_stat.t_cold_s == 2.0
+    assert prepared.extra["cold_start_scope"] == "inductor_graph_compile_and_capture"

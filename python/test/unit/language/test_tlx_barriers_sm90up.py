@@ -391,6 +391,128 @@ def test_alloc_warp_barrier(BLOCK_SIZE, num_warps, device):
                          llir), (f"Unexpected bar.sync before mbarrier.arrive in LLIR:\n{llir}")
 
 
+@triton.jit
+def _arrive_per_warp(bar):
+    # Called from tasks with different warp counts; each must count its own warps.
+    tlx.barrier_arrive(bar, per_warp=True)
+
+
+@triton.jit
+def tlx_square_per_warp_arrive(
+    x_ptr,
+    z_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+    CONSUMER_WARPS: tl.constexpr,
+):
+    """
+    Producer and consumer hand an SMEM buffer over with per-warp arrives: each warp
+    syncs its own lanes and one of them arrives, so neither task syncs all its warps.
+    The buffer is released by the consumer's warps and a 1-warp task's leader arrive.
+    """
+    full = tlx.local_view(tlx.alloc_barriers(num_barriers=1, arrive_count=NUM_WARPS), 0)
+    empty = tlx.local_view(tlx.alloc_barriers(num_barriers=1, arrive_count=CONSUMER_WARPS + 1), 0)
+    smem = tlx.local_view(tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1), 0)
+
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            tlx.local_store(smem, tl.load(x_ptr + offsets, mask=offsets < n_elements))
+            _arrive_per_warp(full)
+            tlx.barrier_wait(empty, 0)
+
+        with tlx.async_task(num_warps=CONSUMER_WARPS):
+            tlx.barrier_wait(full, 0)
+            offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            data = tlx.local_load(smem)
+            tl.store(z_ptr + offsets, data * data, mask=offsets < n_elements)
+            _arrive_per_warp(empty)
+
+        with tlx.async_task(num_warps=1):
+            tlx.barrier_wait(full, 0)
+            tlx.barrier_arrive(empty)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_barrier_arrive_per_warp(device):
+    torch.manual_seed(0)
+    x = torch.rand(98432, device=device)
+    z = torch.empty_like(x)
+    BLOCK_SIZE, NUM_WARPS, CONSUMER_WARPS = 1024, 4, 2
+    grid = (triton.cdiv(x.numel(), BLOCK_SIZE), )
+    kernel = tlx_square_per_warp_arrive[grid](x, z, x.numel(), BLOCK_SIZE, NUM_WARPS, CONSUMER_WARPS,
+                                              num_warps=NUM_WARPS)
+    torch.testing.assert_close(z, x * x)
+
+    # Each task's arrive counts its own warps, though both go through one helper.
+    ttgir = kernel.asm["ttgir"]
+    assert re.search(rf"ttng\.arrive_barrier %\S+, {NUM_WARPS} {{per_warp}}", ttgir), ttgir
+    assert re.search(rf"ttng\.arrive_barrier %\S+, {CONSUMER_WARPS} {{per_warp}}", ttgir), ttgir
+    # Each per-warp arrive comes from one lane after a warp sync, with no CTA barrier in front of it.
+    lines = [line.strip() for line in kernel.asm["ptx"].split("\n") if not re.match(r"\s*(\.loc\b|//|$)", line)]
+    arrives = [i for i, line in enumerate(lines) if "mbarrier.arrive" in line]
+    assert len(arrives) == 3, "\n".join(lines)
+    for i in arrives:
+        assert lines[i].startswith("@%p"), lines[i]
+        sync = next(line for line in reversed(lines[:i]) if re.match(r"(bar|barrier)(\.cta)?\.(warp\.)?sync", line))
+        assert sync.startswith("bar.warp.sync"), f"expected bar.warp.sync before {lines[i]}, got {sync}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_barrier_arrive_per_warp_remote(device):
+
+    @triton.jit
+    def kernel(output_ptr):
+        # Both CTAs arrive once per warp on CTA 0's barrier: 4 warps * 2 CTAs.
+        bar = tlx.local_view(tlx.alloc_barriers(num_barriers=1, arrive_count=4 * 2), 0)
+        tlx.fence_mbarrier_init_cluster()
+        tlx.cluster_barrier()
+        tlx.barrier_arrive(bar, remote_cta_rank=0, per_warp=True)
+        if tlx.cluster_cta_rank() == 0:
+            tlx.barrier_wait(bar, phase=0)
+        if tlx.thread_id(0) == 0:
+            pid = tl.program_id(0)
+            tl.store(output_ptr + pid, pid + 1)
+
+    output = torch.zeros(2, dtype=torch.int32, device=device)
+    compiled = kernel[(2, )](output, num_warps=4, ctas_per_cga=(2, 1, 1))
+    torch.testing.assert_close(output, torch.tensor([1, 2], dtype=torch.int32, device=device))
+
+    ptx = compiled.asm["ptx"]
+    assert re.findall(r"mbarrier\.init\.shared::cta\.b64 \[[^\]]+\], (\d+);", ptx) == ["8"], ptx
+    lines = [line.strip() for line in ptx.split("\n") if not re.match(r"\s*(\.loc\b|//|$)", line)]
+    arrive = next(i for i, line in enumerate(lines) if "mbarrier.arrive" in line and "shared::cluster" in line)
+    sync = next(line for line in reversed(lines[:arrive]) if re.match(r"(bar|barrier)(\.cta)?\.(warp\.)?sync", line))
+    assert sync.startswith("bar.warp.sync"), f"expected bar.warp.sync before {lines[arrive]}, got {sync}"
+
+
+def test_barrier_arrive_per_warp_rejects_warp_barrier():
+
+    @triton.jit
+    def kernel():
+        bars = tlx.alloc_warp_barrier(num_barriers=tl.constexpr(1), num_warps=4)
+        tlx.barrier_arrive(tlx.local_view(bars, 0), per_warp=True)
+
+    with pytest.raises(triton.CompilationError, match="per_warp is not supported for warp barriers"):
+        run_parser(kernel, target=GPUTarget("cuda", 100, 32))
+
+
+def test_barrier_arrive_per_warp_rejects_cta_mask():
+
+    @triton.jit
+    def kernel():
+        bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=4)
+        tlx.barrier_arrive(tlx.local_view(bars, 0), cta_mask=1, per_warp=True)
+
+    with pytest.raises(triton.CompilationError, match="per_warp cannot be combined with cta_mask"):
+        run_parser(
+            kernel,
+            kwargs={"ctas_per_cga": (2, 1, 1)},
+            target=GPUTarget("cuda", 103, 32),
+        )
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
 def test_barrier_live_range(device):
 
@@ -423,16 +545,13 @@ def test_barrier_live_range(device):
     kernel = bar_live_kernel[(2, 1)]()
     ptx = kernel.asm["ptx"]
 
-    # e.g. extract %1 and 1 from "mbarrier.init.shared::cta.b64 [%r1], 1;"
+    # e.g. extract %1 from "mbarrier.init.shared::cta.b64 [%r1], 1;". Per-warp arrival may raise an
+    # init count to the warp count, so identify the three barriers by their init instructions.
     pattern = r"mbarrier\.init\..*\.b64 \[(%r\d+)\], (\d+);"
     matches = re.findall(pattern, ptx)
-
-    arrive_count_to_reg = {int(arrive_count): reg for reg, arrive_count in matches}
-    assert len(arrive_count_to_reg) == 3, f"Expected 3 mbarrier init, got ptx: \n{ptx}"
+    assert len(matches) == 3, f"Expected 3 mbarrier init, got ptx: \n{ptx}"
     # Make sure they all have different registers (different SMEM addresses)
-    assert arrive_count_to_reg[1] != arrive_count_to_reg[2], f"invalid reuse of SMEM, full ptx: \n{ptx}"
-    assert arrive_count_to_reg[2] != arrive_count_to_reg[3], f"invalid reuse of SMEM, full ptx: \n{ptx}"
-    assert arrive_count_to_reg[1] != arrive_count_to_reg[3], f"invalid reuse of SMEM, full ptx: \n{ptx}"
+    assert len({reg for reg, _ in matches}) == 3, f"invalid reuse of SMEM, full ptx: \n{ptx}"
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")

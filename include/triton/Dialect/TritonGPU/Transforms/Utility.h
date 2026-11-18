@@ -35,6 +35,13 @@ class SwizzledSharedEncodingAttr;
 // bounds, including triangular nests; resolve warp-specialize captures.
 bool haveEquivalentWarpSpecializeLoopNests(ArrayRef<scf::ForOp> lhs,
                                            ArrayRef<scf::ForOp> rhs);
+
+// True when `op` implements EfficientLayoutOpInterface and has pinned its
+// result layout.
+inline bool hasEfficientLayout(Operation *op) {
+  auto iface = dyn_cast_if_present<EfficientLayoutOpInterface>(op);
+  return iface && iface.getEfficientLayout();
+}
 } // namespace gpu
 } // namespace triton
 
@@ -490,6 +497,11 @@ SmallVector<Value> getTiedArgs(Operation *op, int resultIdx);
 
 // Get a boolean if the Value is an arith::ConstantOp
 std::optional<bool> getBoolFromConstant(Value cst);
+
+// The descriptor load a tensor-level value comes from, walking back
+// through convert_layout and single-operand view ops, or null. A 2-CTA
+// MMA's B must trace to one: Transform2CTALoads splits only that load.
+DescriptorLoadOp getTwoCTADescriptorLoad(Value value);
 
 } // namespace mlir::triton
 
