@@ -30,6 +30,26 @@ uint8_t getProxyFenceScope(Operation *op) {
   return cluster ? kClusterScope : kCTAScope;
 }
 
+// Whether a TMA load may write another CTA's shared memory: it multicasts, or
+// its destination layout spans CTAs (the lowering may then target a peer
+// through mapa). Otherwise it writes only the issuing CTA's shared memory.
+bool mayWritePeerSmem(TMALoadLikeOpInterface load) {
+  auto copy = dyn_cast<AsyncTMACopyGlobalToLocalOp>(load.getOperation());
+  return load.getMulticast() || (copy && copy.getMulticastTargets()) ||
+         gpu::lookupNumCTAs(load) > 1;
+}
+
+// Whether a release reaches a barrier outside the arriving CTA.
+bool isRemoteArrive(Operation *op) {
+  auto arrive = dyn_cast<ArriveBarrierOp>(op);
+  if (!arrive)
+    return false;
+  return isa<SharedClusterMemorySpaceAttr>(
+             arrive.getAlloc().getType().getMemorySpace()) ||
+         arrive.getFromCTA() || arrive.getMulticastCTA() != 0 ||
+         gpu::lookupNumCTAs(op) > 1;
+}
+
 using BufferAccess = const BufferRegionFootprint *;
 
 struct ProxyBlockInfo {
@@ -63,12 +83,44 @@ struct ProxyBlockInfo {
   }
 };
 
+// Async-proxy shared-memory writes of a function, recorded at cluster scope
+// so that a CTA-scope fence (which leaves the cluster bit of a generic access
+// in place) does not hide the reads it fenced from the matching below.
+struct AsyncWrites {
+  // Every async-proxy shared-memory write.
+  ProxyBlockInfo::Frontier all;
+  // The writes that may come from, or land in, another CTA: multicast or
+  // cross-CTA TMA loads and every non-TMA-load async writer (e.g. a remote
+  // shared-memory copy).
+  ProxyBlockInfo::Frontier peer;
+};
+
 struct ProxyFenceFunctionAnalysis
     : public PostOrderFunctionAnalysis<ProxyBlockInfo> {
   using FuncMapT = PostOrderFunctionAnalysis<ProxyBlockInfo>::FuncMapT;
 
-  ProxyFenceFunctionAnalysis(BufferRegionAnalysis &regions, uint8_t scopes)
-      : regions(regions), scopes(scopes) {}
+  ProxyFenceFunctionAnalysis(BufferRegionAnalysis &regions, uint8_t scopes,
+                             const AsyncWrites &refills)
+      : regions(regions), scopes(scopes), refills(refills) {}
+
+  // Scope of the fence before a marked release. The refill that follows the
+  // release is issued by the producer after it observes the arrive, so the
+  // fence must order the reads fenced here before that TMA write. When the
+  // arrive stays in this CTA and every async write that may touch the buffers
+  // accessed since the last cluster-scope fence is a TMA load into this CTA's
+  // own shared memory, the reads, the release, the acquire and the write all
+  // stay inside one CTA and shared::cta suffices. If those buffers cannot be
+  // matched to a refill, keep the module scope.
+  uint8_t getReleaseFenceScope(Operation *op,
+                               const ProxyBlockInfo &state) const {
+    if (!(scopes & kClusterScope))
+      return kCTAScope;
+    if (isRemoteArrive(op) ||
+        state.generic.hasHazard(refills.peer, kClusterScope) ||
+        !state.generic.hasHazard(refills.all, kClusterScope))
+      return kClusterScope;
+    return kCTAScope;
+  }
 
   void applyEffects(Operation *op, const ProxyBlockInfo &effects,
                     ProxyBlockInfo &state, OpBuilder &builder) {
@@ -101,11 +153,16 @@ struct ProxyFenceFunctionAnalysis
     // The release may have been promoted to a named barrier by now.
     if (isa<ArriveBarrierOp, NamedBarrierArriveOp>(op) &&
         op->hasAttr(kFenceGenericReadsAttrName)) {
-      uint8_t scope = scopes & kClusterScope ? kClusterScope : kCTAScope;
-      if (!isa_and_nonnull<FenceAsyncSharedOp>(op->getPrevNode())) {
+      uint8_t scope = getReleaseFenceScope(op, *state);
+      // Reuse a fence already in place (this pass revisits loop bodies),
+      // widening it when cluster scope is needed.
+      auto prevFence = dyn_cast_or_null<FenceAsyncSharedOp>(op->getPrevNode());
+      if (!prevFence) {
         builder->setInsertionPoint(op);
         FenceAsyncSharedOp::create(*builder, op->getLoc(),
                                    scope == kClusterScope);
+      } else if (scope == kClusterScope && !prevFence.getBCluster()) {
+        prevFence.setBCluster(true);
       }
       state->fenceGeneric(scope);
     }
@@ -160,6 +217,7 @@ struct ProxyFenceFunctionAnalysis
 
   BufferRegionAnalysis &regions;
   uint8_t scopes;
+  const AsyncWrites &refills;
 };
 
 } // namespace
@@ -192,9 +250,34 @@ struct ProxyFenceInsertionPass
     if (failed(solver->initializeAndRun(module)))
       return signalPassFailure();
 
-    ProxyFenceFunctionAnalysis::runModule(module, [&](FunctionOpInterface) {
-      return ProxyFenceFunctionAnalysis(*regions, scopes);
+    // Footprints are per allocation frame, so collect async writes per
+    // function. Every function gets an entry up front: the analyses keep
+    // references.
+    DenseMap<Operation *, AsyncWrites> refills;
+    module.walk([&](FunctionOpInterface func) {
+      AsyncWrites &writes = refills[func];
+      func.walk([&](Operation *op) {
+        auto record = [&](Value value, bool peer) {
+          BufferAccess footprint = regions->getFootprint(value);
+          writes.all.addWrite(footprint, kClusterScope);
+          if (peer)
+            writes.peer.addWrite(footprint, kClusterScope);
+        };
+        if (auto load = dyn_cast<TMALoadLikeOpInterface>(op)) {
+          record(load.getResult(), mayWritePeerSmem(load));
+          return;
+        }
+        for (const MemoryAccess &access : getMemoryAccesses(op))
+          if (access.isWrite && access.isShared(gpu::SharedKind::Async))
+            record(access.value, /*peer=*/true);
+      });
     });
+
+    ProxyFenceFunctionAnalysis::runModule(
+        module, [&](FunctionOpInterface func) {
+          return ProxyFenceFunctionAnalysis(*regions, scopes,
+                                            refills.find(func)->second);
+        });
   }
 };
 
