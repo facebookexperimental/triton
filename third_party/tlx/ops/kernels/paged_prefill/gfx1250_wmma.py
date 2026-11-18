@@ -54,6 +54,19 @@ def _scale_online(scores):
 
 
 @triton.jit
+def _mask_v(v, key_start, SK):
+    # An inferred tail-mask layout can propagate back to V loads and add
+    # LDS conversions. Keep four-wave masking in the dot-operand layout.
+    if tlx.num_warps() == 4:
+        layout: tl.constexpr = tlx.dot_operand_layout(1, WMMA_FOUR, k_width=8)
+        idx = tlx.require_layout(tl.arange(0, 64), tlx.slice_layout(layout, 1))
+        v = tlx.require_layout(v, layout)
+    else:
+        idx = tl.arange(0, 64)
+    return tl.where((key_start + idx)[:, None] < SK, v, 0.0)
+
+
+@triton.jit
 def _consume(
     q,
     k,
@@ -84,7 +97,7 @@ def _consume(
     if SK % 64:
         # Zero masked values too: an unwritten final-page slot may hold NaN,
         # and zero probability alone does not prevent 0 * NaN in PV.
-        v = tl.where((key_start + tl.arange(0, 64))[:, None] < SK, v, 0.0)
+        v = _mask_v(v, key_start, SK)
     if FIXED:
         p = tl.exp2(scores - maximum[:, None])
         denom = _dot(p.to(q.dtype), tl.full((64, 16), 1.0, q.dtype), denom)
@@ -177,9 +190,12 @@ def _view_v(vb, slot, SHUFFLED: tl.constexpr):
     if SHUFFLED:
         view = tlx.local_reshape(tlx.local_view(vb, slot), [8, 64, 8])
         view = tlx.local_trans(view, [0, 2, 1])
-        return tlx.local_load(tlx.local_reshape(view, [64, 64]))
+        v = tlx.local_load(tlx.local_reshape(view, [64, 64]))
     else:
-        return tlx.local_load(tlx.local_view(vb, slot))
+        v = tlx.local_load(tlx.local_view(vb, slot))
+    if tlx.num_warps() == 4:
+        v = tlx.require_layout(v, tlx.dot_operand_layout(1, WMMA_FOUR, k_width=8))
+    return v
 
 
 @triton.jit
@@ -462,7 +478,7 @@ def _pass(
         )
         v = _get_v(vb, slot, 0, SHUFFLED)
         if SK % 64:
-            v = tl.where(((end_page - 1) * 64 + tl.arange(0, 64))[:, None] < SK, v, 0.0)
+            v = _mask_v(v, (end_page - 1) * 64, SK)
         denom = _dot(p, tl.full((64, 16), 1.0, q.dtype), denom)
         acc = _dot(p, v, acc)
     elif PIPE:

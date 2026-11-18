@@ -182,6 +182,34 @@ def test_paged_prefill_large_equal_logits_keep_page_weights(window, sq, q_value,
     torch.testing.assert_close(out.double(), expected, atol=0.003, rtol=0.005)
 
 
+@pytest.mark.parametrize("shuffled", [False, True])
+def test_paged_prefill_packed_qk_cancellation_keeps_page_weights(shuffled):
+    sq, sk, window = 4097, 8192, 2048
+    q, k, v, table, _ = _inputs(1, sq, sk)
+    q.fill_(2.0**15)
+    k.fill_(2.0**15)
+    k[..., 32:] = -(2.0**15)
+    v.zero_()
+    # Every dot product is exactly zero, but its first K=32 partial sum
+    # would erase a small nonzero accumulator seed in FP32. Distinct values
+    # at the window edges expose unequal weighting of boundary/interior pages.
+    for page in (96, 97, 126, 127):
+        v[table[0, page].long()] = 1
+    kp, vp = _pack_cache(k, v) if shuffled else (k, v)
+    cu = torch.tensor([0, sq], device=q.device, dtype=torch.int32)
+    used = torch.tensor([sk], device=q.device, dtype=torch.int32)
+    out = torch.full_like(q, float("nan"))
+    _packed_call(q[0], kp, vp, out[0], cu, used, table, sq, sk, window, shuffled)
+    pages = torch.arange(sk, device=q.device) // 64
+    values = ((pages == 96) | (pages == 97) | (pages == 126) | (pages == 127)).double()
+    prefix_sum = torch.cat((torch.zeros(1, device=q.device, dtype=torch.float64), values.cumsum(0)))
+    end = torch.arange(sq, device=q.device) + sk - sq + 1
+    start = (end - window).clamp_min(0)
+    expected = ((prefix_sum[end] - prefix_sum[start]) / (end - start))[None, :, None, None].expand_as(out)
+    torch.testing.assert_close(out.double(), expected, atol=0.003, rtol=0.005)
+    torch.testing.assert_close(out[0, -1], torch.full_like(out[0, -1], 0.125), atol=0, rtol=0)
+
+
 def test_paged_prefill_packed_rejects_metadata_rank_and_output_alias():
     q, k, v, table, _ = _inputs(1, 65, 129)
     cu = torch.tensor([0, 65], device=q.device, dtype=torch.int32)
