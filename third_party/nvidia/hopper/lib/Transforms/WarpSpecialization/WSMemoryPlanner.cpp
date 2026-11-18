@@ -1297,6 +1297,46 @@ isDescriptorFedComputedMMAOperandChannel(Operation *alloc,
   return false;
 }
 
+/// The TMA rings a descriptor-fed computed MMA operand depends on: the
+/// descriptor tiles its producer reads, and the other operand of each MMA that
+/// consumes it.
+static void collectComputedMMAOperandFeeds(Operation *alloc,
+                                           SmallVector<Channel *> &channels,
+                                           DenseSet<Operation *> &feeds) {
+  Channel *ch = findChannelForOp(alloc, channels);
+  if (!ch)
+    return;
+  if (Operation *producer = ch->getSrcOp()) {
+    SmallVector<Value> worklist(producer->getOperands());
+    DenseSet<Value> seen;
+    while (!worklist.empty()) {
+      Value value = worklist.pop_back_val();
+      if (!seen.insert(value).second)
+        continue;
+      if (auto localLoad = value.getDefiningOp<ttg::LocalLoadOp>()) {
+        if (Operation *sourceAlloc = localLoad.getSrc().getDefiningOp();
+            sourceAlloc && isSmemTMAChannel(sourceAlloc, channels))
+          feeds.insert(sourceAlloc);
+      }
+      if (Operation *def = value.getDefiningOp())
+        llvm::append_range(worklist, def->getOperands());
+    }
+  }
+  DenseSet<Operation *> consumers;
+  (void)getAllAcutalUsersForChannel(ch, consumers, alloc);
+  for (Operation *op : consumers) {
+    auto mma = dyn_cast<ttng::MMAv5OpInterface>(op);
+    if (!mma)
+      continue;
+    for (Value operand : {mma.getA(), mma.getB()}) {
+      Operation *operandAlloc = traceBackToAlloc(operand);
+      if (operandAlloc && operandAlloc != alloc &&
+          isSmemTMAChannel(operandAlloc, channels))
+        feeds.insert(operandAlloc);
+    }
+  }
+}
+
 /// Helper to read the loop.stage attribute from an op. Returns -1 if absent.
 static int getLoopStage(Operation *op) {
   auto attr = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
@@ -2883,23 +2923,62 @@ static unsigned allocateSmemBuffers(
                                      << " - preserving correctness floors");
   }
 
+  // ── Phase 3.65: Double-buffer the TMA rings of computed MMA operands ──
+  // A descriptor-fed computed MMA operand waits on TMA rings: the descriptor
+  // tiles it is computed from and the MMA's other operand. Deepening the
+  // computed tile while one of those rings is single-buffered can serialize
+  // that ring's refill against its consumer; on a 2-CTA fused GEMM (e97, B200)
+  // that plan was 23% slower than double-buffering the rings first. Give these
+  // rings two copies, in usage order, while the budget allows. Circular reuse
+  // regroups the innermost TMA rings in Phase 4, so it keeps the old order.
+  if (numBuffers >= 2 && !smemCircularReuse) {
+    DenseSet<Operation *> feeds;
+    for (const auto &buf : wsBuffers)
+      if (!buf.isPinned &&
+          buf.priority == WSBufferPriority::P0_ComputedMMAOperand)
+        collectComputedMMAOperandFeeds(buf.allocOp, channels, feeds);
+    SmallVector<unsigned> floorIndices;
+    for (unsigned i = 0; i < wsBuffers.size(); ++i) {
+      const WSBuffer &buf = wsBuffers[i];
+      if (!buf.isPinned && buf.priority == WSBufferPriority::P1_InnermostTMA &&
+          buf.numCopies < 2 && feeds.contains(buf.allocOp) &&
+          !isUnalignedTMALoadSlot(buf.allocOp, buf.sizeBytes, channels))
+        floorIndices.push_back(i);
+    }
+    llvm::stable_sort(floorIndices, [&](unsigned a, unsigned b) {
+      return getWSBufferUsageOrder(wsBuffers[a], channels, opOrder) <
+             getWSBufferUsageOrder(wsBuffers[b], channels, opOrder);
+    });
+    for (unsigned i : floorIndices) {
+      WSBuffer &buf = wsBuffers[i];
+      unsigned saved = buf.numCopies;
+      buf.numCopies = 2;
+      if (computeTotalSmem(wsBuffers) > smemBudget)
+        buf.numCopies = saved;
+      LDBG("Phase 3.65: TMA ring of a computed MMA operand: WSBuffer["
+           << buf.bufferId << "] copies=" << buf.numCopies);
+    }
+  }
+
   // ── Phase 3.7: Reserve fused epilogue staging depth ─────────────────
   // TMA store/reduce staging is on the output critical path. Reserve its
   // legal copy depth before discretionary P0/P1 operand buffering consumes
   // the remaining budget (notably FA-bwd dQ versus the small m/Di buffers).
-  // Reserve the bytes for computed MMA operands' full depth first: they sit on
-  // every MMA's input path, so staging must not take their slots.
+  // Reserve the bytes for the depth computed MMA operands can still reach
+  // first: they sit on every MMA's input path, so staging must not take their
+  // slots.
   unsigned epilogueBudget = smemBudget;
+  unsigned plannedSmem = computeTotalSmem(wsBuffers);
   for (const auto &buf : wsBuffers) {
     if (buf.isPinned ||
         buf.priority != WSBufferPriority::P0_ComputedMMAOperand ||
-        buf.numCopies >= numBuffers)
+        buf.numCopies >= numBuffers || buf.sizeBytes == 0)
       continue;
-    uint64_t reserve =
-        uint64_t(numBuffers - buf.numCopies) * uint64_t(buf.sizeBytes);
-    epilogueBudget = reserve < epilogueBudget
-                         ? epilogueBudget - static_cast<unsigned>(reserve)
-                         : 0;
+    unsigned room =
+        epilogueBudget > plannedSmem ? epilogueBudget - plannedSmem : 0;
+    unsigned extra = std::min(numBuffers - buf.numCopies,
+                              static_cast<unsigned>(room / buf.sizeBytes));
+    epilogueBudget -= extra * buf.sizeBytes;
   }
   increaseFusedEpilogueCopies(wsBuffers, channels, funcOp, numBuffers,
                               epilogueBudget);

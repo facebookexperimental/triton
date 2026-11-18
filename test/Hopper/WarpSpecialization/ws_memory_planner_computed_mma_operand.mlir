@@ -1,11 +1,23 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=4 smem-alloc-algo=1 smem-budget=232448 reserve-auxiliary-smem=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=4 smem-alloc-algo=1 smem-budget=232448 reserve-auxiliary-smem=1 smem-circular-reuse=1" | FileCheck %s --check-prefix=CIRC
 
-// A computed BF16 MMA operand gets its four copies before the TMA staging ring grows.
+// The TMA rings a computed BF16 MMA operand waits on (the FP32 source tiles and
+// the MMA's TMA-loaded B operand) get two copies before the computed tile is
+// deepened, and the staging reserve only holds the depth the computed tile can
+// still reach.
 // CHECK-LABEL: @triton_tem_fused__to_copy_mm_mul_sigmoid_0
-// CHECK: ttg.local_alloc {buffer.copy = 4 : i32, buffer.id = [[BID:[0-9]+]] : i32} : () -> !ttg.memdesc<64x128xbf16
-// CHECK-COUNT-2: ttg.local_alloc {{.*}}buffer.copy = 2 : i32{{.*}}buffer.tmaStaging = 1 : i32{{.*}}!ttg.memdesc<128x64xf32
-// CHECK: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32} : () -> !ttg.memdesc<64x128xbf16
-// CHECK-COUNT-2: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32} : () -> !ttg.memdesc<64x128xf32
+// CHECK: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = [[BID:[0-9]+]] : i32} : () -> !ttg.memdesc<64x128xbf16
+// CHECK-COUNT-2: ttg.local_alloc {{.*}}buffer.copy = 1 : i32{{.*}}buffer.tmaStaging = 1 : i32{{.*}}!ttg.memdesc<128x64xf32
+// CHECK: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = {{[0-9]+}} : i32} : () -> !ttg.memdesc<64x128xbf16
+// CHECK-COUNT-2: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = {{[0-9]+}} : i32} : () -> !ttg.memdesc<64x128xf32
+
+// Circular reuse regroups the innermost TMA rings in Phase 4, so the TMA-ring
+// floor is skipped and the computed tile is deepened first.
+// CIRC-LABEL: @triton_tem_fused__to_copy_mm_mul_sigmoid_0
+// CIRC: ttg.local_alloc {buffer.copy = 4 : i32, buffer.id = {{[0-9]+}} : i32} : () -> !ttg.memdesc<64x128xbf16
+// CIRC-COUNT-2: ttg.local_alloc {{.*}}buffer.copy = 2 : i32{{.*}}buffer.tmaStaging = 1 : i32{{.*}}!ttg.memdesc<128x64xf32
+// CIRC: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = {{[0-9]+}} : i32} : () -> !ttg.memdesc<64x128xbf16
+// CIRC-COUNT-2: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32} : () -> !ttg.memdesc<64x128xf32
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [8, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 4, 2], threadsPerWarp = [2, 16, 1], warpsPerCTA = [8, 1, 1], order = [2, 1, 0]}>
