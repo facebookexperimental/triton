@@ -34,6 +34,7 @@
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Transforms/LocationSnapshot.h"
 
+#include "triton/Analysis/Allocation.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Gluon/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -870,6 +871,21 @@ void init_triton_ir(py::module_ &m) {
   // dynamic_attr is used to transfer ownership of the MLIR context to the
   // module
   py::class_<ModuleOp, OpState>(m, "module", py::dynamic_attr())
+      .def("get_shared_memory_breakdown",
+           [](ModuleOp &self) -> py::object {
+             auto value = triton::getSharedMemoryBreakdown(self);
+             if (!value)
+               return py::none();
+             return py::str(value->data(), value->size());
+           })
+      .def("get_str_attr",
+           [](ModuleOp &self, const std::string &name) -> py::object {
+             auto attr = self->getAttrOfType<StringAttr>(name);
+             if (!attr)
+               return py::none();
+             auto value = attr.getValue();
+             return py::str(value.data(), value.size());
+           })
       .def("dump", &ModuleOp::dump)
       .def("str",
            [](ModuleOp &self) -> std::string {
