@@ -1077,7 +1077,7 @@ class TestTorchTLXEpilogueFusion(TestCase):
             )
         self._assert_reduction_epilogue_fused(code)
         self.assertRegex("\n".join(code), r"range\(0, (?:[3-9]|[1-9][0-9]+), 2\)")
-        self.assertIn("range(0, 5120, 4096)", "\n".join(code))
+        self.assertIn("range(0, 5120, 1024)", "\n".join(code))
 
     @unittest.skipIf(not is_gfx950() or not has_tlx() or not supports_template_epilogue_fusion(),
                      "Need gfx950 template fusion")

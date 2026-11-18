@@ -4314,6 +4314,10 @@ class AutoWSLoopOptions(base_value):
     smem_budget: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.smem_budget", "int32"))
     smem_circular_reuse: bool | constexpr | None = field(default=None,
                                                          metadata=_loop_attr("tt.smem_circular_reuse", "bool_opt"))
+    lhs_buffer_depth: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.lhs_buffer_depth", "int32"))
+    rhs_buffer_depth: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.rhs_buffer_depth", "int32"))
+    smem_operand_ring_first: bool | constexpr | None = field(
+        default=None, metadata=_loop_attr("tt.smem_operand_ring_first", "bool_opt"))
 
 
 @dataclass(eq=False)
@@ -4353,6 +4357,10 @@ class range(AutoWSLoopOptions):
         The compiler will attempt to partition memory, MMA, and vector
         operations in the loop into separate async partitions. This will
         increase the total number of warps required by the kernel.
+    :param lhs_buffer_depth: Requested shared-memory buffering depth for the
+        left-hand operand of each dot in a warp-specialized loop.
+    :param rhs_buffer_depth: Requested shared-memory buffering depth for the
+        right-hand operand of each dot in a warp-specialized loop.
     :param disable_licm: Tells the compiler it shouldn't hoist loop invariant
         code outside the loop. This is often useful to avoid creating long liveranges
         within a loop.

@@ -25,6 +25,10 @@ static constexpr AutoWSLoopAttrInfo kAutoWSLoopAttrs[] = {
     {"tt.smem_alloc_algo", AutoWSLoopAttrPropagation::ForwardToInnerLoop},
     {"tt.smem_budget", AutoWSLoopAttrPropagation::ForwardToInnerLoop},
     {"tt.smem_circular_reuse", AutoWSLoopAttrPropagation::ForwardToInnerLoop},
+    {"tt.lhs_buffer_depth", AutoWSLoopAttrPropagation::ForwardToInnerLoop},
+    {"tt.rhs_buffer_depth", AutoWSLoopAttrPropagation::ForwardToInnerLoop},
+    {"tt.smem_operand_ring_first",
+     AutoWSLoopAttrPropagation::ForwardToInnerLoop},
 };
 
 ArrayRef<AutoWSLoopAttrInfo> getAutoWSLoopAttrs() { return kAutoWSLoopAttrs; }
