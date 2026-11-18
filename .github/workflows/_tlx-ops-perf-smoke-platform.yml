@@ -86,7 +86,7 @@ env:
 jobs:
   bench:
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       id-token: write
       contents: read
@@ -137,10 +137,11 @@ jobs:
         if: inputs.base_wheel_url != ''
         run: mkdir -p "${RUNNER_TEMP}/ab/base" && mv "${RUNNER_TEMP}"/prebuilt-wheel/*.whl "${RUNNER_TEMP}/ab/base/"
       - name: Bench base and head on one GPU
-        timeout-minutes: 50
-        # The harness also asserts an absolute floor against the reference
-        # kernel. This job reports a ratio instead, so a floor miss must not
-        # fail it; a run that measured nothing shows up in the report.
+        # Each side's first round compiles and autotunes from a cold cache (about 12 min on B200,
+        # 1.5 min on H100); later rounds reuse that side's cache.
+        timeout-minutes: 75
+        # A kernel that errors on either side fails its pytest run; the report
+        # job turns that into a "not compared" line, so it must not fail here.
         continue-on-error: true
         env:
           PLATFORM: ${{ inputs.platform }}

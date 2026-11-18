@@ -80,6 +80,28 @@ def test_head_only_error_is_a_problem():
     assert ab.verdict_for([row], True) == "INVESTIGATE"
 
 
+def test_failures_collapse_per_op_and_message():
+    err = "RuntimeError: PassManager::run failed: descriptor block and tensor element types must match"
+    keys = [f"flash_attn_mxfp8/sm100/bfloat16/case{i}" for i in range(3)]
+    res = results([[case(key=k) for k in keys + [KEY]]] * 2,
+                  [[case(key=k, status="error", tflops=None, notes=[err])
+                    for k in keys] + [case(status="error", tflops=None, notes=["wrong answer"])]] * 2)
+    rows = ab.compare(res, 0.05)
+    assert ab.problems_line(rows) == (
+        f"**Not compared:** `flash_attn_mxfp8/sm100` 3 of 3 cases fail on head only: {err}; "
+        f"`{KEY}` fails on head only: wrong answer")
+    groups = {g["group"]: g for g in ab.summarize_groups(rows)}
+    assert groups["flash_attn_mxfp8/sm100"]["problems"] == 3 and groups["flash_attn_mxfp8/sm100"]["cases"] == 0
+    assert len(ab.shorten("x" * 500)) == 200
+
+
+def test_nightly_age():
+    assert ab.nightly_age("20261117", "20261112") == "; it is 5 days older than the base commit"
+    assert ab.nightly_age("20261117", "20261116") == ""
+    assert ab.nightly_age("20261117", "20261118") == "; it is 1 day newer than the base commit"
+    assert ab.nightly_age("", "20261118") == ""
+
+
 def test_base_only_error_is_not_compared_and_passes():
     res = results([[case(status="error", tflops=None)]] * 2, [[case()]] * 2)
     row = rows_by_key(res)[KEY]
@@ -162,7 +184,7 @@ def test_report_end_to_end(tmp_path):
             "[run](https://run).") in md
     assert "Base `aaaaaaaaaaaa` vs merge `bbbbbbbbbbbb` (PR head `cccccccccccc`), 3 rounds" in md
     assert f"**Slower (1):** `{KEY}` 0.900× (rounds 0.890–0.910)" in md
-    assert "| `mm/sm90` | 1 | 0.900× | 0.900× | 0.900× | 1 | 0 |" in md
+    assert "| `mm/sm90` | 1 | 0.900× | 0.900× | 0.900× | 1 | 0 | 0 |" in md
     # Base is what the nightly measured, so it carries the runner context; head moved by the PR would not.
     assert "This runner measures base at 1.000× the nightly `20261116.h100.json` (median over cases)." in md
     assert f"| `{KEY}` | 20.0 | 22.2 | 0.900× | 0.890–0.910 | 0.900× |" in md

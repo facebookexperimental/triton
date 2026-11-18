@@ -21,6 +21,7 @@ moves by at least --threshold and every round moves the same way.
 import argparse
 import base64
 import csv
+import datetime
 import hashlib
 import io
 import json
@@ -323,7 +324,7 @@ def summarize_groups(rows):
             "best": max(ratios) if ratios else None,
             "slower": sum(r["state"] == "slower" for r in members),
             "faster": sum(r["state"] == "faster" for r in members),
-            "problems": sum(r["state"] in ("head-error", "base-error", "unmeasured") for r in members),
+            "problems": sum(r["state"] in PROBLEMS for r in members),
         })
     return out
 
@@ -433,6 +434,47 @@ def flagged_line(rows, state, title):
     return f"**{title} ({len(hits)}):** " + "; ".join(clauses)
 
 
+PROBLEMS = {"head-error": "fail on head only", "base-error": "fail on base only", "unmeasured": "not measured"}
+
+
+def shorten(text, limit=200):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def problems_line(rows):
+    """Cases that could not be compared, one clause per op, state and first note."""
+    buckets = {}
+    for r in rows:
+        if r["state"] in PROBLEMS:
+            buckets.setdefault((r["group"], r["state"], r["notes"][0] if r["notes"] else ""), []).append(r)
+    if not buckets:
+        return None
+    clauses = []
+    for (group, state, note), members in sorted(buckets.items()):
+        if len(members) == 1:
+            who = f"`{members[0]['key']}` {PROBLEMS[state].replace('fail ', 'fails ')}"
+        else:
+            total = sum(r["group"] == group for r in rows)
+            who = f"`{group}` {len(members)} of {total} cases {PROBLEMS[state]}"
+        clauses.append(who + (f": {shorten(note)}" if note else ""))
+    return "**Not compared:** " + "; ".join(clauses)
+
+
+def nightly_age(base_date, nightly_date):
+    """'; it is N days older than the base commit' when the nightly is more than a day off, else ''."""
+    try:
+        days = (datetime.date.fromisoformat(f"{base_date[:4]}-{base_date[4:6]}-{base_date[6:8]}") -
+                datetime.date.fromisoformat(f"{nightly_date[:4]}-{nightly_date[4:6]}-{nightly_date[6:8]}")).days
+    except (TypeError, ValueError):
+        return ""
+    if days > 1:
+        return f"; it is {days} days older than the base commit"
+    if days < 0:
+        return f"; it is {-days} day{'s' if days < -1 else ''} newer than the base commit"
+    return ""
+
+
 def render(args, results, rows, groups, verdict, has_ab, baseline_date, context):
     rounds = max([r["round"] for r in results.get("runs", [])] or [0])
     lines = [f"### {args.platform}: {verdict}", ""]
@@ -468,14 +510,9 @@ def render(args, results, rows, groups, verdict, has_ab, baseline_date, context)
         line = flagged_line(rows, state, title)
         if line:
             lines += ["", line]
-    problems = [r for r in rows if r["state"] in ("head-error", "base-error", "unmeasured")]
-    if problems:
-        desc = {"head-error": "fails on head only", "base-error": "fails on base only", "unmeasured": "not measured"}
-        lines += [
-            "", "**Not compared:** " + "; ".join(f"`{r['key']}` {desc[r['state']]}" +
-                                                 (f" ({r['notes'][0]})" if r["notes"] else "")
-                                                 for r in problems[:8]) + (" …" if len(problems) > 8 else "")
-        ]
+    line = problems_line(rows)
+    if line:
+        lines += ["", line]
     only = {state: [r for r in rows if r["state"] == state] for state in ("only-head", "only-base")}
     if has_ab and (only["only-head"] or only["only-base"]):
         lines += [
@@ -484,11 +521,12 @@ def render(args, results, rows, groups, verdict, has_ab, baseline_date, context)
         ]
     if has_ab and groups:
         lines += [
-            "", "| op | cases | geomean | worst | best | slower | faster |", "|---|---:|---:|---:|---:|---:|---:|"
+            "", "| op | cases | geomean | worst | best | slower | faster | not compared |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|"
         ]
         for g in groups:
             lines.append(f"| `{g['group']}` | {g['cases']} | {fmt_ratio(g['geomean'])} | {fmt_ratio(g['worst'])} | "
-                         f"{fmt_ratio(g['best'])} | {g['slower']} | {g['faster']} |")
+                         f"{fmt_ratio(g['best'])} | {g['slower']} | {g['faster']} | {g['problems']} |")
     side, runner_ratio = context
     if baseline_date and runner_ratio is not None:
         what = "base" if side == "base" else f"the {label} commit"
@@ -496,7 +534,8 @@ def render(args, results, rows, groups, verdict, has_ab, baseline_date, context)
                "column is for reference." if side == "base" else "")
         lines += [
             "", f"This runner measures {what} at {fmt_ratio(runner_ratio)} the nightly "
-            f"`{baseline_date}.{args.platform}.json` (median over cases). {gap}".rstrip()
+            f"`{baseline_date}.{args.platform}.json` (median over cases{nightly_age(args.base_date, baseline_date)}). "
+            f"{gap}".rstrip()
         ]
     elif not baseline_date:
         lines += ["", f"No nightly baseline for {args.platform} on the release."]
