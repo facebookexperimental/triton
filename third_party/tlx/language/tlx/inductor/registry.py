@@ -1000,8 +1000,11 @@ def _host_tma_operands(kernel_inputs) -> dict[str, bool]:
         return {"HOST_SIDE_TMA": False, "HOST_TMA_A": False, "HOST_TMA_B": False}
     launch_dims = getattr(triton_heuristics, "HOST_TMA_SYMBOLIC_DIMS", False) and not V.graph.cpp_wrapper
     dim_types = (int, sympy.Integer, sympy.Symbol) if launch_dims else (int, sympy.Integer)
-    a_host, b_host = (all(isinstance(dim, dim_types)
-                          for dim in (*mat.get_size(), *mat.get_stride()))
+    # The prologue offsets an input with a storage offset (`B = arg_B + 96`), which a
+    # host descriptor cannot take, so build that one on the device.
+    a_host, b_host = (mat.get_layout().offset == 0
+                      and all(isinstance(dim, dim_types)
+                              for dim in (*mat.get_size(), *mat.get_stride()))
                       for mat in kernel_inputs.mat1mat2())
     return {"HOST_SIDE_TMA": a_host or b_host, "HOST_TMA_A": a_host, "HOST_TMA_B": b_host}
 
