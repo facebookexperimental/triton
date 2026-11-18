@@ -630,7 +630,7 @@ def pr_view(runs, asof, main, branch="main"):
             latest[key] = run
     out = []
     for run in sorted(latest.values(), key=lambda r: r["created_at"], reverse=True):
-        jobs = _test_jobs(run)
+        jobs = [(g, j) for g, j in _test_jobs(run) if j["conclusion"] in RAN]
         fails = {(g, job_key(j["name"]), f["id"]) for g, j in jobs for s in j["steps"] for f in s.get("failures") or []}
         outcome = run_outcome(run)
         row = {
@@ -638,23 +638,23 @@ def pr_view(runs, asof, main, branch="main"):
             "branch": run.get("pr_branch") or run.get("branch"), "t": run["created_at"], "gpus":
             sorted({g
                     for g, j in jobs
-                    if j["conclusion"] in RAN},
-                   key=TEST_PLATFORMS.index), "n_failed": len(fails), "whose": None, "note": ""
+                    if j["conclusion"] in RAN}, key=TEST_PLATFORMS.index), "n_failed": len(fails), "whose": None,
+            "note": "", "pending": outcome is None
         }
-        if outcome is None:
-            row["result"] = "running"
-        elif fails:
+        if fails:
             row["result"] = "tests"
             if fails <= on_main:
                 row["whose"], row["note"] = "main", f"all {len(fails)} also fail on {branch}"
             else:
                 row["whose"] = "author"
-        elif outcome in ("setup", "build"):
-            row["result"] = outcome if outcome == "build" else "setup"
-            row["whose"] = "author" if outcome == "build" else "ci"
-            row["note"] = _build_failure(run) or next((setup_step(j) for _, j in jobs if setup_step(j)), "")
+        elif outcome in ("setup", "build") or (outcome is None and
+                                               (_build_failure(run) or any(setup_step(j) for _, j in jobs))):
+            build = _build_failure(run)
+            row["result"] = "build" if build else "setup"
+            row["whose"] = "author" if build else "ci"
+            row["note"] = build or next((setup_step(j) for _, j in jobs if setup_step(j)), "")
         else:
-            row["result"] = outcome
+            row["result"] = outcome or "running"
         out.append(row)
     return out
 
@@ -702,8 +702,8 @@ def nightly_view(runs, asof, bench):
 
 def gpu_nightly_view(runs, asof, wf="gpu-tests-nightly.yml"):
     """The latest run of a daily GPU workflow per GPU: result and failing tests; and passes over the last 7 days."""
-    nights = sorted((r for r in runs if r.get("wf") == wf and r.get("status") == "completed"
-                     and r.get("jobs") is not None and r["created_at"] <= asof), key=lambda r: r["created_at"])
+    nights = sorted((r for r in runs if r.get("wf") == wf and r.get("jobs") is not None and r["created_at"] <= asof),
+                    key=lambda r: r["created_at"])
     week_ago = iso(t(asof) - dt.timedelta(days=7))
     out = {}
     for gpu in GPUS:

@@ -372,6 +372,39 @@ def test_bench_card_shows_the_latest_run_per_gpu():
     assert (v["B200"]["passed_7"], v["B200"]["runs_7"]) == (0, 2) and set(v) == {"B200"}
 
 
+@pytest.mark.parametrize("workflow", ["gpu-tests-nightly.yml", "nightly-tlx-ops-bench.yml"])
+def test_finished_platform_results_survive_another_platform_waiting(workflow):
+    if workflow == r.BENCH_WF:
+        first = bench_run(1, "mi350")
+        failed = bench_run(2, "mi350", "test_op_perf[bench_mm]")
+        waiting = job("b200 / bench")
+    else:
+        first = nightly(1, tb("mi350"))
+        failed = nightly(2, tb("mi350", "gemm"))
+        waiting = tb("b200")
+    waiting.update(status="queued", conclusion=None, completed_at=None, steps=[])
+    failed.update(status="queued", conclusion=None)
+    failed["jobs"].append(waiting)
+    view = r.gpu_nightly_view([first, failed], stamp(23), workflow)
+    assert view["MI350"]["result"] == "test"
+    assert view["MI350"]["t"] == stamp(2)
+    assert view["MI350"]["fails"]
+    assert view["MI350"]["runs_7"] == 2
+
+
+@pytest.mark.parametrize("setup", [False, True])
+def test_pr_finished_failure_survives_another_platform_waiting(setup):
+    failed = job("mi350 / mi350-tlx-test", step("Install prebuilt Triton", "failure")) if setup else tlx(
+        "test_signal", gpu="mi350")
+    waiting = {**tlx(), "status": "queued", "conclusion": None, "completed_at": None, "steps": []}
+    pending = run(2, [failed, waiting], event="pull_request", status="queued")
+    view = r.pr_view([pending], stamp(23), main([]))[0]
+    assert view["result"] == ("setup" if setup else "tests")
+    assert view["pending"] is True
+    assert view["gpus"] == ["MI350"]
+    assert view["n_failed"] == (0 if setup else 1)
+
+
 def test_bench_step_maps_to_a_group():
     """A failed bench is a test result, not a setup failure, so the bench workflow's step needs a group."""
     import os
