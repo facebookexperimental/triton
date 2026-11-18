@@ -11,7 +11,8 @@ def _gfx1250_available():
                 and (torch.cuda.get_device_properties(0).gcnArchName.split(':')[0] == 'gfx1250'))
 
 
-def _make_test_inputs(lengths, hq=16, hkv=2, dim=64, page=64, query_length=1, fp8_q=False, seed=182):
+def _make_test_inputs(lengths, hq=16, hkv=2, dim=64, page=64, query_length=1, fp8_q=False, seed=182,
+                      max_context_len=None):
     """Quantize with distinct per-head scales, shuffle pages, poison unused slots."""
     torch.manual_seed(seed)
     batch = len(lengths)
@@ -37,6 +38,14 @@ def _make_test_inputs(lengths, hq=16, hkv=2, dim=64, page=64, query_length=1, fp
     kp = k.reshape(blocks, hkv, page, dim // 16, 16).permute(0, 1, 3, 2, 4).contiguous()
     vp = v.reshape(blocks, hkv, page // 16, 16, dim).permute(0, 1, 2, 4, 3).contiguous()
     contexts = torch.tensor(lengths, device='cuda', dtype=torch.int32)
+    if max_context_len is not None:
+        # Capacity is metadata, not allocated/active KV. Unreferenced entries
+        # must never be dereferenced, even with many empty split partitions.
+        capacity = torch.full((batch, triton.cdiv(max_context_len, page)), -1, device='cuda', dtype=table.dtype)
+        for seq, length in enumerate(lengths):
+            active_pages = triton.cdiv(length, page)
+            capacity[seq, :active_pages] = table[seq, :active_pages]
+        table = capacity
     return (q, kp, vp, contexts, table, ks, vs, qscale, max_len, k, v)
 
 
@@ -417,6 +426,41 @@ def test_fp8_public_workspace_graph_replay(splits, dim, window, page):
         lengths.copy_(torch.tensor(replay_lengths, device=lengths.device, dtype=lengths.dtype))
         graph.replay()
         expected = _reference(q, kd, vd, table, replay_lengths, ks, vs, qs, 1, True, window)
+        torch.testing.assert_close(out.float(), expected, atol=5e-4, rtol=1e-2)
+
+
+@pytest.mark.skipif(not _gfx1250_available(), reason='Requires gfx1250')
+@pytest.mark.parametrize('fp8_q', [False, True], ids=['bf16-q', 'fp8-q'])
+@pytest.mark.parametrize('bound', [8192, 262144])
+@pytest.mark.parametrize('hq,hkv,dim,page', [(16, 2, 64, 64), (16, 2, 128, 128), (32, 32, 64, 128), (32, 32, 128, 64)])
+def test_fp8_kv_decode_ragged_large_bound_graph(fp8_q, bound, hq, hkv, dim, page):
+    # A fixed graph bound can greatly exceed all actual lengths. Most requests
+    # are short, one crosses several pages, and some become empty on replay.
+    original = [0, 1, 63, 64, 65, 127, 128, 129] + [67] * 23 + [513]
+    x = _make_test_inputs(original, hq=hq, hkv=hkv, dim=dim, page=page, fp8_q=fp8_q, max_context_len=bound)
+    q, k, v, lengths, table, ks, vs, qs, _, kd, vd = x
+    work = paged_attention_decode_fp8_workspace(q, k, v, table, max_context_len=bound)
+    out = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
+
+    def call():
+        return paged_attention_decode_fp8(q, k, v, lengths, table, ks, vs, q_scale=qs, max_context_len=bound, out=out,
+                                          workspace=work)
+
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    # Keep graph, block table, workspace and context addresses fixed. Poisoned
+    # scratch and NaN cache tails expose stale merges and reads past active KV.
+    for active in [original, [min(n, 17) for n in original], [0] * len(original), original]:
+        lengths.copy_(torch.tensor(active, device=lengths.device, dtype=lengths.dtype))
+        out.fill_(float('nan'))
+        if work is not None:
+            for buffer in work:
+                buffer.fill_(float('nan'))
+        graph.replay()
+        expected = _reference(q, kd, vd, table, active, ks, vs, qs, 1, True, 0)
+        assert torch.isfinite(out).all()
         torch.testing.assert_close(out.float(), expected, atol=5e-4, rtol=1e-2)
 
 
