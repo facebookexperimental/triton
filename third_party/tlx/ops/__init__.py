@@ -64,6 +64,7 @@ enforce it yet raises `UnsupportedOp` rather than being silently ignored.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
 
@@ -180,6 +181,12 @@ def _check_single_config_space(op, space_name):
 def _mm_impl_for_device(device):
     """Cache the stable device-to-implementation lookup on the MM hot path."""
     return impl_for("mm", device=device)
+
+
+@functools.lru_cache(maxsize=None)
+def _flash_attn_varlen_impl_for_device(device):
+    """Cache the device-to-implementation lookup, which otherwise re-queries device properties on every call."""
+    return impl_for("flash_attn_varlen", device=device)
 
 
 def mm(a, b, *, out=None, space=None):
@@ -1396,16 +1403,21 @@ def flash_attn_mxfp8(q, k, v, causal=False, sm_scale=None, *, space="full", p_ex
 
 
 def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None, causal=False, *,
-                      space=None):
-    """Forward-only attention over packed ``(tokens, heads, HEAD_DIM)`` fp16/bf16 sequences.
+                      window_size=(-1, -1), space=None):
+    """Attention over packed ``(tokens, heads, HEAD_DIM)`` fp16/bf16 sequences.
 
     Sequence ``b`` owns query rows ``cu_seqlens_q[b]:cu_seqlens_q[b + 1]`` and
     key/value rows ``cu_seqlens_k[b]:cu_seqlens_k[b + 1]``; both offset tensors
     are int32 ``(batch + 1,)``. ``max_seqlen_q`` must bound every query length
-    (it sizes the grid); ``max_seqlen_k`` is accepted for flash-attn API
+    (it sizes the grid); ``max_seqlen_k`` must bound every key length on sm100
+    (it sizes the backward grid) and is otherwise accepted for flash-attn API
     parity. K/V may have fewer heads than Q (GQA) if they divide its head count.
     Causal masking is bottom-right aligned: query ``i`` sees keys
     ``j <= i + k_len - q_len``, and a query row that sees no key returns zeros.
+    ``window_size=(left, right)`` (sm100 only) further limits query ``i`` to keys
+    ``i + k_len - q_len - left <= j <= i + k_len - q_len + right``, as in
+    flash-attn; ``-1`` leaves a side unbounded and ``causal`` sets ``right`` to 0.
+    sm100 is differentiable; sm90 and gfx950 are forward-only.
     `sm_scale` defaults to `HEAD_DIM ** -0.5` and must be positive and finite.
     Returns the output only (no log-sum-exp). Output rows not covered by ``cu_seqlens_q`` are left
     uninitialized.
@@ -1429,11 +1441,22 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
     _check_single_config_space("flash_attn_varlen", space_name)
     if sm_scale is not None and not 0 < sm_scale < math.inf:
         raise InvalidInput(f"tlx.ops.flash_attn_varlen expects a positive finite sm_scale; got {sm_scale!r}")
-    fn, spec = impl_for("flash_attn_varlen", device=q.device)
+    window_size = tuple(int(w) for w in window_size)
+    if len(window_size) != 2 or min(window_size) < -1:
+        raise InvalidInput(f"tlx.ops.flash_attn_varlen expects window_size=(left, right) with -1 for unbounded; "
+                           f"got {window_size!r}")
+    fn, spec = _flash_attn_varlen_impl_for_device(q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2])
     check_backward(spec, q, k, v)
     _check_enforced("flash_attn_varlen", spec, invariance)
-    with torch.cuda.device(q.device):
+    # Entering torch.cuda.device costs microseconds per call; skip it when q is already on the current device.
+    on_current = q.device.index == torch.cuda.current_device()
+    with contextlib.nullcontext() if on_current else torch.cuda.device(q.device):
+        if spec.supports_window:
+            return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), sm_scale, bool(causal),
+                      max_seqlen_k=int(max_seqlen_k), window_size=window_size)
+        if window_size != (-1, -1):
+            raise UnsupportedOp(f"tlx.ops.flash_attn_varlen does not support window_size on {spec.arch}")
         return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), sm_scale, bool(causal))
 
 
