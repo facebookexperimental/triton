@@ -621,7 +621,7 @@ bool containsLocalBarrier(Operation *op) {
   if (isa<triton::nvidia_gpu::ClusterWaitOp>(op))
     return true;
   if (auto arrive = dyn_cast<triton::nvidia_gpu::ArriveBarrierOp>(op))
-    return !arrive.getPerThread();
+    return !arrive.getPerThread() && !arrive.getPerWarp();
   if (isa<triton::gpu::WarpSpecializePartitionsOp>(op))
     return true;
   if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op))
@@ -770,8 +770,10 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     // semantics, so no CTA-wide bar.sync is needed before a perThread arrive.
     // Each thread's program order guarantees its own SMEM ops are visible
     // before its arrive, and the mbarrier accumulates all arrivals before
-    // releasing the waiter.
-    bool isPerThreadArrive = arrive && arrive.getPerThread();
+    // releasing the waiter. A per_warp arrive is the same at warp granularity:
+    // its bar.warp.sync orders the lanes' accesses before their warp's arrive.
+    bool isPerThreadArrive =
+        arrive && (arrive.getPerThread() || arrive.getPerWarp());
 
     if (!isPerThreadArrive) {
       if (auto memoryEffectOpInterface =

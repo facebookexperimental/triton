@@ -541,6 +541,13 @@ def TTNG_ArriveBarrierOp
 
     The operation accepts an optional predicate.
 
+    With `per_warp`, each warp of the executing region synchronizes its own
+    lanes and then one of its lanes arrives, instead of the region
+    synchronizing before a single thread arrives. `count` remains the total
+    decrement of the arrive and must be divisible by the region's warp count;
+    each warp contributes an equal share. `per_warp` cannot be combined with
+    `perThread` or multicast.
+
     Example:
 
     ```mlir
@@ -555,7 +562,7 @@ def TTNG_ArriveBarrierOp
                "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
           I32Attr:$count, DefaultValuedOptionalAttr<I32Attr, "0">:$ctaMask,
           Optional<I1>:$pred, UnitAttr:$perThread,
-          OptionalAttr<DictionaryAttr>:$constraints);
+          OptionalAttr<DictionaryAttr>:$constraints, UnitAttr:$per_warp);
 
   let assemblyFormat = [{
     $alloc `,` $count (`,` $pred^)? attr-dict `:` qualified(type($alloc))
@@ -563,28 +570,28 @@ def TTNG_ArriveBarrierOp
 
   let builders =
       [OpBuilder<(ins "Value":$alloc, "uint32_t":$count), [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), /*perThread=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), /*perThread=*/false, /*constraints=*/DictionaryAttr(), /*per_warp=*/false);
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred), [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr(), /*per_warp=*/false);
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "uint32_t":$ctaMask,
                      "Value":$pred),
                  [{
-      return build($_builder, $_state, alloc, count, ctaMask, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, ctaMask, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr(), /*per_warp=*/false);
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "bool":$perThread), [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), perThread, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), perThread, /*constraints=*/DictionaryAttr(), /*per_warp=*/false);
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
                      "bool":$perThread),
                  [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, /*constraints=*/DictionaryAttr(), /*per_warp=*/false);
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
                      "bool":$perThread, "DictionaryAttr":$constraints),
                  [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, constraints);
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, constraints, /*per_warp=*/false);
     }]>];
 
   let extraClassDeclaration = [{

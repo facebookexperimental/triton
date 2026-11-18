@@ -565,6 +565,14 @@ LogicalResult ArriveBarrierOp::verify() {
     return failure();
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
+  if (getPerWarp()) {
+    if (getPerThread())
+      return emitOpError("per_warp cannot be combined with perThread");
+    if (isMulticast())
+      return emitOpError("per_warp cannot be combined with multicast");
+    if (gpu::lookupNumWarps(*this) <= 1)
+      return emitOpError("per_warp requires multiple warps");
+  }
   if (isMulticast()) {
     if (getPerThread())
       return emitOpError("multicast arrive does not support perThread");
