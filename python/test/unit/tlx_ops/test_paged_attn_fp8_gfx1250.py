@@ -196,6 +196,57 @@ def test_fp8_kv_decode_peaked_and_workspace(fp8_q, splits, seed, dim):
 
 
 @pytest.mark.skipif(not _gfx1250_available(), reason='Requires gfx1250')
+@pytest.mark.parametrize('fp8_q', [False, True], ids=['bf16-q', 'fp8-q'])
+@pytest.mark.parametrize('dim', [64, 128], ids=['D64', 'D128'])
+@pytest.mark.parametrize('page', [64, 128], ids=['P64', 'P128'])
+@pytest.mark.parametrize('splits', [None, 4, 8, 12], ids=['auto', 'split4', 'split8', 'split12'])
+@pytest.mark.parametrize('workspace_mode', ['allocated', 'provided', 'graph'])
+def test_fp8_kv_decode_partial_cancellation(fp8_q, dim, page, splits, workspace_mode):
+    # Q=K=0 gives uniform attention. The first two pages sum to one;
+    # FP16 partition means round away that residual before the FP32 merge.
+    length, hq, hkv = 8 * page, 16, 2
+    x = _make_test_inputs([length], hq=hq, hkv=hkv, dim=dim, page=page, fp8_q=fp8_q)
+    q, _, _, contexts, table, _, _, qs, _, k, v = x
+    q = torch.zeros(q.shape, device=q.device, dtype=q.dtype)
+    k = torch.zeros(k.shape, device=q.device).to(torch.float8_e4m3fn)
+    vf = torch.zeros(v.shape, device=q.device)
+    first, second = table[0, :2].tolist()
+    vf[first, :, :page - 1, 0] = 256.
+    vf[first, :, page - 1, 0] = 1.
+    vf[second, :, :page - 1, 0] = -256.
+    v = vf.to(torch.float8_e4m3fn)
+    blocks = k.shape[0]
+    kp = k.reshape(blocks, hkv, page, dim // 16, 16).permute(0, 1, 3, 2, 4).contiguous()
+    vp = v.reshape(blocks, hkv, page // 16, 16, dim).permute(0, 1, 2, 4, 3).contiguous()
+    ks = torch.tensor([1., 2.], device=q.device)
+    vs = torch.tensor([1., 8.], device=q.device)
+    plan = dict(max_context_len=length, num_splits=splits)
+    workspace = None if workspace_mode == 'allocated' else paged_attention_decode_fp8_workspace(
+        q, kp, vp, table, **plan)
+    out = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
+    expected = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+    expected[0, :, 0] = vs.repeat_interleave(hq // hkv) / length
+
+    def call():
+        return paged_attention_decode_fp8(q, kp, vp, contexts, table, ks, vs, q_scale=qs, out=out, workspace=workspace,
+                                          **plan)
+
+    call()
+    if workspace_mode == 'graph':
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+        # Reused scratch must preserve the residual and reset empty rows.
+        for active in [length, 0, length]:
+            contexts.fill_(active)
+            graph.replay()
+            reference = expected if active else torch.zeros_like(expected)
+            torch.testing.assert_close(out.float(), reference, atol=5e-4, rtol=1e-2)
+    else:
+        torch.testing.assert_close(out.float(), expected, atol=5e-4, rtol=1e-2)
+
+
+@pytest.mark.skipif(not _gfx1250_available(), reason='Requires gfx1250')
 @pytest.mark.parametrize('dim', [64, 128])
 @pytest.mark.parametrize('page', [64, 128])
 @pytest.mark.parametrize('fp8_q', [False, True])

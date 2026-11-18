@@ -2052,8 +2052,8 @@ def paged_attention_decode_fp8_workspace(query, key_cache, value_cache, block_ta
 
     Planning arguments must match ``paged_attention_decode_fp8``. Returned
     capacity shapes are ``[tokens, query_heads, splits, D]`` for partial values
-    and ``[tokens, query_heads, splits]`` for log-sum-exp. Treat both buffers as
-    opaque: the backend may use narrower views inside the FP32 allocation.
+    and ``[tokens, query_heads, splits]`` for log-sum-exp. Both partial values
+    and log-sum-exp retain FP32 precision; treat their contents as opaque.
     No device metadata values are read back and no quantization or attention
     is run. Allocate this workspace and output before graph capture.
     """

@@ -16,7 +16,7 @@ Execution paths
   packed head/page bytes into double-buffered LDS on page sizes 64/128;
   ``matrix`` uses masked loads for other supported page sizes. The internal
   ``matrix_precise`` control uses compensated BF16 PV. Split partitions
-  write normalized partial values and log-sum-exp for ``_merge``; a single
+  write FP32 normalized partial values and log-sum-exp for ``_merge``; a single
   split writes the output directly.
 * ``_small_window_decode`` specializes a window no larger than one page.
   Its block-uniform alignment check permits one page-sized QK/softmax/PV
@@ -174,8 +174,7 @@ def _vector_decode(
         acc = acc * alpha + tl.sum(p[:, None] * v, 0)
         l = l * alpha + tl.sum(p, 0)
         m = next_m
-    output_scale = 1.0 if SPLITS > 1 and PART.dtype.element_ty == tl.float16 else vs
-    value = acc * output_scale / tl.maximum(l, 1.0e-20)
+    value = acc * vs / tl.maximum(l, 1.0e-20)
     if SPLITS == 1:
         tl.store(OUT + (token * HQ + head) * D + d, value)
     else:
@@ -436,8 +435,7 @@ def _matrix_decode(
             acc += tl.dot((p * 32768.0).to(tl.float16), v)
         m = next_m
     numerator_scale: tl.constexpr = 1.0 if PRECISE_PV else 1.0 / 32768.0
-    output_scale = 1.0 if SPLITS > 1 and PART.dtype.element_ty == tl.float16 else vs
-    value = acc * (output_scale * numerator_scale) / tl.maximum(l[:, None], 1.0e-20)
+    value = acc * (vs * numerator_scale) / tl.maximum(l[:, None], 1.0e-20)
     if SPLITS == 1:
         tl.store(OUT + (token[:, None] * HQ + head[:, None]) * D + d[None, :], value, row_valid[:, None])
     else:
@@ -526,8 +524,7 @@ def _window_decode(Q, K, V, KS, VS, BT, LEN, OUT, scale, QST: tl.constexpr, QSH:
 
 
 @triton.jit
-def _merge(PART, LSE, OUT, D: tl.constexpr, SPLITS: tl.constexpr, BS: tl.constexpr, VS, HQ: tl.constexpr,
-           G: tl.constexpr, BD: tl.constexpr):
+def _merge(PART, LSE, OUT, D: tl.constexpr, SPLITS: tl.constexpr, BS: tl.constexpr, BD: tl.constexpr):
     row = tl.program_id(0)
     s = tl.arange(0, BS)
     if BD == D:
@@ -540,8 +537,6 @@ def _merge(PART, LSE, OUT, D: tl.constexpr, SPLITS: tl.constexpr, BS: tl.constex
     p = tl.exp2(lse - m)
     vals = tl.load(PART + (row * SPLITS + s[:, None]) * D + d[None, :], s[:, None] < SPLITS, other=0.0)
     value = tl.sum(vals * p[:, None], 0) / tl.maximum(tl.sum(p, 0), 1.0e-20)
-    if PART.dtype.element_ty == tl.float16:
-        value *= tl.load(VS + (row % HQ) // G)
     tl.store(OUT + row * D + d, value)
 
 
@@ -553,8 +548,9 @@ def decode(q, k, v, lengths, table, ks, vs, *, q_scale, query_length, causal, wi
     independent public variants. Their runtime guards fall back to masked
     _matrix_decode without reading context lengths on the host. See the
     module docstring for path/layout semantics. Multi-split paths then call
-    _merge; normalized partials use FP16 views at >=8 splits while softmax,
-    log-sum-exp and merge arithmetic remain FP32.
+    _merge; normalized partials, softmax, log-sum-exp and merge arithmetic
+    remain FP32. Keeping partials in FP32 preserves small residuals when
+    positive and negative partitions cancel.
 
     prefetch_pair primes the pipeline with two KV pages in the prologue before
     computation begins for eligible single-token decode configurations.
@@ -569,7 +565,7 @@ def decode(q, k, v, lengths, table, ks, vs, *, q_scale, query_length, causal, wi
     mid_shape, lse_shape = (tokens, heads, num_splits, dim), (tokens, heads, num_splits)
     if workspace is None:
         if num_splits > 1:
-            mid = torch.empty(mid_shape, device=q.device, dtype=torch.float16 if num_splits >= 8 else torch.float32)
+            mid = torch.empty(mid_shape, device=q.device, dtype=torch.float32)
             lse = torch.empty(lse_shape, device=q.device, dtype=torch.float32)
         else:
             mid = lse = out  # constexpr dead pointers, never dereferenced
@@ -579,8 +575,6 @@ def decode(q, k, v, lengths, table, ks, vs, *, q_scale, query_length, causal, wi
                 or mid.device != q.device or lse.device != q.device or not mid.is_contiguous()
                 or not lse.is_contiguous()):
             raise ValueError("workspace must be contiguous FP32 partial/LSE tensors for this workload")
-        if num_splits >= 8:
-            mid = mid.view(torch.float16)
     strides = (*q.stride(), table.stride(0), *k.stride()[:4], *v.stride()[:4])
     if variant in ("vector", "vector_page"):
         kl, vl = _vector_layouts(block_n, dim, num_warps)
@@ -629,7 +623,7 @@ def decode(q, k, v, lengths, table, ks, vs, *, q_scale, query_length, causal, wi
         merge_d = 32 if (tokens * heads <= 32 and q.dtype == torch.bfloat16 and num_splits >= 16 and
                          (dim == 128 or dim == 64 and query_length == 1 and group > 1 and num_splits >= 128)) else dim
         _merge[(tokens * heads, triton.cdiv(dim, merge_d))](
-            mid, lse, out, dim, num_splits, triton.next_power_of_2(num_splits), vs, heads, group, merge_d,
+            mid, lse, out, dim, num_splits, triton.next_power_of_2(num_splits), merge_d,
             num_warps=(1 if num_splits * merge_d <= 8192 else 4 if num_splits * merge_d <= 32768 else 8))
     return out
 
