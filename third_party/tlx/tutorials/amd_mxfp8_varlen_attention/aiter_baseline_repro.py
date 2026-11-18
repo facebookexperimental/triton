@@ -424,6 +424,9 @@ def run_case(
     metadata = forward._metadata(
         cu_q, cu_kv, case.total_q, case.total_kv, 128
     )
+    work_schedule = forward.prepare_work_schedule(
+        q_lengths, kv_lengths, q.device, block_m=128
+    )
 
     class TlxComplete:
         name = "tlx_complete"
@@ -437,6 +440,7 @@ def run_case(
                 cu_kv,
                 SOFTMAX_SCALE,
                 block_m=128,
+                work_schedule=work_schedule,
             )
 
     class TlxPrepare:
@@ -460,6 +464,7 @@ def run_case(
                 SOFTMAX_SCALE,
                 kv_state=state,
                 block_m=128,
+                work_schedule=work_schedule,
             )
 
     class AiterForward:
@@ -499,6 +504,7 @@ def run_case(
         SOFTMAX_SCALE,
         backward_state=True,
         block_m=128,
+        work_schedule=work_schedule,
     )
 
     class TlxBackward:

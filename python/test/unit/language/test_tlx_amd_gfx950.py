@@ -3296,7 +3296,7 @@ def mxfp8_varlen_forward_module():
         ([1, 31, 33, 129], [1, 127, 129, 257]),
     ],
 )
-def test_mxfp8_scheduled_forward_matches_unscheduled(
+def test_mxfp8_scheduled_forward_is_order_independent(
     mxfp8_varlen_forward_module,
     block_m,
     fast_exp,
@@ -3330,6 +3330,25 @@ def test_mxfp8_scheduled_forward_matches_unscheduled(
         cu_q, cu_k, q.shape[0], k.shape[0], block_m
     )
     state = fwd.prepare_kv(k, v, cu_k, meta)
+    with pytest.raises(ValueError, match="requires a prepared work_schedule"):
+        fwd.forward(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            128**-0.5,
+            kv_state=state,
+            block_m=block_m,
+            fast_exp=fast_exp,
+        )
+    schedule = fwd.prepare_work_schedule(
+        query_lengths,
+        key_lengths,
+        q.device,
+        num_ctas=8,
+        block_m=block_m,
+    )
     expected, expected_lse, _ = fwd.forward(
         q,
         k,
@@ -3338,14 +3357,14 @@ def test_mxfp8_scheduled_forward_matches_unscheduled(
         cu_k,
         128**-0.5,
         kv_state=state,
-        block_m=block_m,
         fast_exp=fast_exp,
+        work_schedule=schedule,
     )
     schedule = fwd.prepare_work_schedule(
         query_lengths,
         key_lengths,
         q.device,
-        num_ctas=8,
+        num_ctas=16,
         block_m=block_m,
     )
     actual, actual_lse, _ = fwd.forward(
@@ -3396,8 +3415,10 @@ def test_mxfp8_scheduled_long_preserves_q_pipeline(
         cu_k,
         128**-0.5,
         kv_state=state,
-        block_m=128,
-        num_ctas=8,
+        work_schedule=schedule,
+    )
+    schedule = fwd.prepare_work_schedule(
+        [128], [4096], q.device, num_ctas=16
     )
     actual, actual_lse, _ = fwd.forward(
         q,
