@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-partition-scheduling-meta="merge-epilogue separate-epilogue-store" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-partition-scheduling-meta="merge-epilogue separate-epilogue-store" -verify-diagnostics -o /dev/null
 
 // Tests that the proactive warp budget estimate in PartitionSchedulingMeta
 // skips warp specialization when the schedule would exceed the hardware
@@ -6,7 +7,8 @@
 //
 // With num_warps=8, FA forward creates partitions with TMEM ops (4 warps
 // each). Estimated total (8 default + 4+4+1+1 = 18) exceeds the 16-warp
-// hardware limit. The pass should strip all partition annotations.
+// hardware limit. The pass should strip all partition annotations and warn
+// that the kernel is compiled without warp specialization.
 //
 // CHECK-NOT: ttg.partition
 // CHECK-NOT: tt.warp_specialize
@@ -92,6 +94,7 @@ tt.func public @fa_forward_data_partition_split(
   %acc_1_init = ttng.tmem_store %cst_zero_2d, %acc_1[%acc_1_tok], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
 
   // Main attention loop
+  // expected-warning-re @below {{skipping warp specialization: the partition schedule needs an estimated {{[0-9]+}} warps}}
   %loop:8 = scf.for %i = %c0_i32 to %n_iters step %c1_i32
       iter_args(
         %l_i_0 = %cst_one, %m_i_0 = %cst_neg_inf,
