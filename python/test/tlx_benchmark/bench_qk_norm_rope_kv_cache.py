@@ -76,6 +76,9 @@ def prepare(case: Case, space: str) -> Prepared:
 
     shape = QKNormRopeShape(*case.shape)
     args = inputs(shape)
+    # INVARIANT: every case gets a compiled reference. Dynamo stops recompiling a function after 8 shapes and runs
+    # it eagerly, and the harness's back-to-back replays of that many-kernel graph crash the HIP 7.2 runtime.
+    torch._dynamo.reset()
     ref_compiled = torch.compile(reference, dynamic=False)
     q_out = torch.empty(shape.tokens, shape.q_heads * shape.head_dim, device="cuda",
                         dtype=torch.float8_e4m3fn if shape.q_fp8 else torch.bfloat16)
