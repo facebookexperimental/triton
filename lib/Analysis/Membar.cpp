@@ -1086,9 +1086,13 @@ void MembarAnalysis::update(Operation *op, MembarInfo *membarInfo,
   }
   auto sync = getThreadSyncInfo(op);
   // Region control flow is visited by the dataflow engine. Its children
-  // contribute their own effects; implicit scratch belongs to this op.
-  bool controlFlow = isa<BranchOpInterface, RegionBranchOpInterface,
-                         RegionBranchTerminatorOpInterface>(op);
+  // contribute their own effects; implicit scratch belongs to this op. So does
+  // a predicated region when the analysis walks into it; otherwise the region
+  // is opaque and carries its body's effects itself.
+  bool controlFlow =
+      isa<BranchOpInterface, RegionBranchOpInterface,
+          RegionBranchTerminatorOpInterface>(op) ||
+      (isa<triton::gpu::WarpPredicateOp>(op) && analyzesPredicatedRegions());
   bool isReturn = op->hasTrait<OpTrait::ReturnLike>();
   // Cluster barriers contribute synchronization stages, not payload effects.
   // Scheduling-only fences (e.g. AMD rocdl.sched.barrier) carry no memory

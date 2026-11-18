@@ -380,6 +380,16 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="moe_router_topk_align",
+        arch="gfx950",
+        variant="three_launches",
+        impl="triton.tlx.ops.kernels.fused.moe_router_topk_align.gfx950:moe_router_topk_align",
+        dtypes=_BF16,
+        # router_gemm's GEMV loads and split-K partitions divide E and K; moe_routing holds up to 1024 experts.
+        accepts=lambda d: 0 < d["E"] <= 1024 and d["E"] % 16 == 0 and d["K"] > 0 and d["K"] % 1024 == 0,
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="router_gemm",
         arch="gfx950",
         variant="bf16x3_split_k",

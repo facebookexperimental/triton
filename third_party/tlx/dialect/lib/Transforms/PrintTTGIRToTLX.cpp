@@ -2807,16 +2807,31 @@ void printSimplifiedOp(
       printLocComment(op, os);
       return;
     }
-    os << "tlx.barrier_arrive("
-       << barrierArriveTarget(op->getOperand(0), argSubstitutionMap);
     // count is required on this op, but tolerate its absence on hand-written
     // IR rather than crash; 1 is the value the op defaults to anyway.
     auto countAttr = op->getAttrOfType<IntegerAttr>("count");
     int64_t count = countAttr ? countAttr.getInt() : 1;
+    bool perWarp = op->hasAttr("per_warp");
+    if (perWarp) {
+      // The op counts the whole task; TLX counts each warp.
+      std::optional<int> numWarps = ttg::maybeLookupNumWarps(op);
+      if (!numWarps || count % *numWarps != 0) {
+        op->emitError("per_warp arrive_barrier whose count does not split "
+                      "across its warps does not round-trip to TLX");
+        os << "# unsupported: per_warp arrive_barrier (count=" << count << ")";
+        printLocComment(op, os);
+        return;
+      }
+      count /= *numWarps;
+    }
+    os << "tlx.barrier_arrive("
+       << barrierArriveTarget(op->getOperand(0), argSubstitutionMap);
     if (count != 1)
       os << ", " << count;
     if (op->getNumOperands() >= 2 && !isConstantTrue(op->getOperand(1)))
       os << ", pred=" << getValueName(op->getOperand(1), argSubstitutionMap);
+    if (perWarp)
+      os << ", per_warp=True";
     os << ")";
     printLocComment(op, os);
     return;
