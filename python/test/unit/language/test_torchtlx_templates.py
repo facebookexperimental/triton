@@ -175,7 +175,7 @@ class TestTLXReductionEpilogue(TestCase):
             reduction_epilogue.can_fuse_reduction_epilogue.return_value = True
             split_k = mock.Mock(_tlx_row_partials=True, _tlx_split_k=2)
             unsplit = mock.Mock(_tlx_row_partials=True, _tlx_split_k=1)
-            template = mock.Mock()
+            template = mock.Mock(spec=ir.MultiTemplateBuffer)
             node = mock.Mock()
             node.get_template_node.return_value = template
             with mock.patch.dict("os.environ", {"TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE": "force"}):
