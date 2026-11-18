@@ -40,7 +40,7 @@ with tlx.async_tasks():
 | `tlx.alloc_warp_barrier(num_barriers, num_warps=1, num_arrivals=1)` | Allocate SMEM barriers whose software arrivals are performed independently by every participating thread. The initialized count is `num_warps * 32 * num_arrivals`. | NVIDIA |
 | `tlx.barrier_expect_bytes(bar, bytes, pred=None)` | Set expected transaction byte count on barrier | Both |
 | `tlx.barrier_wait(bar, phase, pred=None)` | Wait until barrier phase flips (LOCAL mbarrier only) | Both |
-| `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None)` | Signal arrival at barrier. `remote_cta_rank` signals a barrier in a remote CTA — **only valid when ctas_per_cga > 1**, causes "Unexpected buffer remote view in 1cta mode" otherwise. Guard with `if USE_2CTA:` when kernel supports both modes. | Both |
+| `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None, per_warp=False)` | Signal arrival at barrier. `remote_cta_rank` signals a barrier in a remote CTA — **only valid when ctas_per_cga > 1**, causes "Unexpected buffer remote view in 1cta mode" otherwise. Guard with `if USE_2CTA:` when kernel supports both modes. `per_warp=True` (NVIDIA, not on warp barriers): each warp syncs its own lanes and one lane arrives with `arrive_count`, so the barrier counts `arrive_count * task warps` for it. | Both |
 | `tlx.cluster_barrier()` | Full cluster-wide synchronization barrier | Both |
 
 **Ordinary barrier count rules:**
@@ -70,6 +70,13 @@ The initialized count is:
 ```text
 expected arrivals per phase = num_warps * 32 * num_arrivals
 ```
+
+`barrier_arrive(..., per_warp=True)` on an ordinary `alloc_barriers` barrier is the
+FA4-style middle ground: each warp syncs only its own lanes and one lane arrives, so
+the task-wide sync of a leader arrive goes away with one mbarrier arrival per warp
+instead of per thread. The barrier counts `arrive_count` for each warp of the
+arriving task, and per-warp and leader arrives can share a barrier: a barrier
+released by a 4-warp task per warp and by a leader arrive counts `4 + 1` per CTA.
 
 Here `num_warps` is the number of warps in each participating task replica, and
 `num_arrivals` is the number of such all-thread arrival events targeting the same
