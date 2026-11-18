@@ -15,7 +15,10 @@ from triton.runtime import _allocation
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import (
     GPUDriver,
+    TensorDescABI,
     decompose_descriptor,
+    expand_signature,
+    get_kernel_argument_layout,
     wrap_handle_tensordesc_impl,
 )
 
@@ -284,69 +287,6 @@ def build_kernel_signature_from_schema(schema):
     return triton.runtime.driver.active.utils.build_signature_metadata(flat_types)
 
 
-def expand_signature(signature, tensordesc_meta):
-    output = []
-    tensordesc_idx = 0
-    # Expand tensor descriptor arguments into either nvTmaDesc, shape and
-    # strides, or base pointer, shape and strides depending on whether the
-    # kernel was lowered to use the nvTmaDesc or not.
-    for sig in signature:
-        if isinstance(sig, str) and sig.startswith("tensordesc"):
-            meta = tensordesc_meta[tensordesc_idx] if tensordesc_meta else None
-            tensordesc_idx += 1
-
-            match = re.match("tensordesc<([^[>]*)\\[([^]]*)\\]", sig)
-            dtype = match.group(1)
-            shape = match.group(2)
-            ndim = shape.count(",") + 1
-
-            if meta is None:
-                output.append("*" + dtype)
-                # Currently the host side tensor descriptors get passed in as a
-                # tensor desc, shape, and strides. We have no way to use these
-                # shape and strides when processing tensor descriptors which is
-                # why we provide our own decomposition above. Sadly this means
-                # we have to pass the shape and strides twice.
-                for _ in range(2 * ndim):
-                    output.append("i64")
-                output.append("i1")
-                output.append("i1")
-            else:
-                output.append("nvTmaDesc")
-
-            for _ in range(ndim):
-                output.append("i32")
-            for _ in range(ndim):
-                output.append("i64")
-        else:
-            output.append(sig)
-
-    assert not tensordesc_meta or tensordesc_idx == len(tensordesc_meta)
-    return output
-
-
-def make_kernel_signature(signature):
-    """
-    Creates a kernel signature in C to be able to efficiently extract
-    arguments in the launcher.
-    """
-
-    def _flatten_signature(sig, output):
-        # Flatten tuples
-        if isinstance(sig, tuple):
-            for x in sig:
-                _flatten_signature(x, output)
-        else:
-            output.append(sig)
-
-    flat_signature = []
-    for sig in signature:
-        _flatten_signature(sig, flat_signature)
-    kernel_signature = [x for x in flat_signature if x != "constexpr"]
-
-    return triton.runtime.driver.active.utils.build_signature_metadata(kernel_signature)
-
-
 def annotate_arguments(signature):
     """
     This recreates the signature with annotations as C objects which can then
@@ -449,11 +389,9 @@ def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
 class CudaLauncher(object):
 
     def __init__(self, src, metadata):
-        constants = src.constants if hasattr(src, "constants") else dict()
-        arg_idx = lambda x: (src.fn.arg_names.index(x), ) if isinstance(x, str) else x
-        constants = {arg_idx(idx): value for idx, value in constants.items()}
-        signature = {idx: value for idx, value in src.signature.items()}
+        signature = dict(src.signature)
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
+        tensordesc_abi = TensorDescABI.CUDA_TMA if tensordesc_meta else TensorDescABI.DECOMPOSED
 
         self.gsan_enabled = is_enabled(metadata, "gsan")
         self.shared = metadata.shared
@@ -471,11 +409,11 @@ class CudaLauncher(object):
             signature["_gsan_launch_table_ptr"] = "*i8"
             signature["_gsan_launch_index"] = "i64"
 
-        launcher = triton.runtime.driver.active.utils.launch
-
+        utils = triton.runtime.driver.active.utils
+        expanded_signature = expand_signature(signature.values(), tensordesc_abi)
         # kernel_signature + arg_annotations are both derived from the object
         # signature (src.signature): expand_signature flattens tensordescs, then
-        # make_kernel_signature / annotate_arguments walk the actual argument-type
+        # get_kernel_argument_layout / annotate_arguments walk the actual argument-type
         # OBJECTS via isinstance(...). A NamedTuple *is* a tuple, so it flattens
         # structurally like any other tuple -- no reliance on str(ty). Deriving the
         # signature from the Level 0 schema's stringified types is a repr blind
@@ -484,11 +422,11 @@ class CudaLauncher(object):
         # mis-flattens it. For every non-NamedTuple case this is byte-identical to
         # the old schema path (asserted by
         # test_launch_metadata.py::test_schema_derived_signature_matches_legacy).
-        expanded_signature = expand_signature(signature.values(), tensordesc_meta)
-        self.kernel_signature = make_kernel_signature(expanded_signature)
+        self.kernel_signature = utils.build_signature_metadata(
+            [ty for _, ty in get_kernel_argument_layout(signature.values(), tensordesc_abi)])
         self.arg_annotations = annotate_arguments(expanded_signature)
-
-        self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
+        self.num_ctas = getattr(metadata, "num_ctas", 1)
+        self.launch = wrap_handle_tensordesc(utils.launch, signature, tensordesc_meta)
         # Compiler-synthesized auto-TMA descriptors (PromoteLoadToTMA): the
         # launcher builds each CUtensorMap host-side from existing scalar args
         # via the launch.h recipe core and injects it (no device global scratch).

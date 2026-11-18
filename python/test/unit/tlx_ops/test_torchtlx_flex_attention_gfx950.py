@@ -98,6 +98,8 @@ def test_flex_adapter_routes_backend_options(monkeypatch, benchmark, backend):
     from torch._inductor import config
     from torch._inductor.runtime import triton_heuristics
 
+    if not hasattr(triton_heuristics, "tlx_only_cuda_options"):
+        pytest.skip("requires torch with triton_heuristics.tlx_only_cuda_options")
     monkeypatch.setattr(triton_heuristics, "tlx_only_cuda_options", lambda: [])
     monkeypatch.setattr(triton_heuristics.CachingAutotuner, "_create_compile_meta", lambda self, cfg: {"num_warps": 4})
     original_choices = config.inductor_choices_class

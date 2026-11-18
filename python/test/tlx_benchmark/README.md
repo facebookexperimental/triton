@@ -13,12 +13,15 @@ python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
-`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, or one of the
-fused operators below.
+`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, `router_gemm`,
+or one of the fused operators below.
 
 Fused operators (`tlx/ops/kernels/fused/`) run steps that would otherwise be separate kernels in one launch:
-`addmm_mul_add` and `linear_rowscale` fuse an elementwise epilogue into a GEMM, and `norm_residual_norm`
-fuses the post-norm, gated residual add and pre-norm of a residual-stream boundary.
+`addmm_mul_add` and `linear_rowscale` fuse an elementwise epilogue into a GEMM, `norm_residual_norm`
+fuses the post-norm, gated residual add and pre-norm of a residual-stream boundary,
+`qk_norm_rope_kv_cache` fuses the q/k head norm, RoPE, FP8 quantization and paged KV cache write,
+`rmsnorm_gate` fuses a per-head RMSNorm with a sigmoid output gate, and `moe_router_topk_align` fuses the router
+GEMM, sigmoid top-k and expert-aligned slot sort of an MoE layer.
 
 ```
 options:
@@ -73,6 +76,7 @@ options:
 | `rmsnorm_cat` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 | `moe` | none (FlyDSL's Muse MoE ships with aiter) | absolute floor, currently unset -> reports only | heuristic |
 | `moe_routing` | `torch.compile` of the eager routing | speedup >= 0.9x | heuristic |
+| `router_gemm` | `F.linear` on the fp32 upcast (hipBLASLt fp32) | speedup >= 0.9x | heuristic |
 
 ### Fused operators
 
@@ -81,6 +85,9 @@ options:
 | `addmm_mul_add` | `torch.addmm` + `torch.addcmul` | speedup >= 0.9x | heuristic |
 | `linear_rowscale` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 | `norm_residual_norm` | `torch.compile` of the unfused module sequence | speedup >= 0.9x | heuristic |
+| `moe_router_topk_align` | `router_gemm` + `moe_routing` + the `moe` slot sort (separate launches) | speedup >= 0.9x | heuristic |
+| `qk_norm_rope_kv_cache` | `torch.compile` of the eager norm, RoPE and cache scatter | speedup >= 0.9x | heuristic |
+| `rmsnorm_gate` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 
 The direct `mm` provider has a `heuristic_config`, so its default is a single
 analytically chosen config. The TorchTLX providers use Inductor's template
