@@ -257,6 +257,30 @@ tt.func @no_barrier_before_perthread_arrive(%arg: tensor<32x16xf16, #blocked_pt>
 
 // -----
 
+// A per_warp arrive synchronizes only the lanes of each warp before the warp
+// arrives, so like a perThread arrive it needs no CTA barrier before it.
+
+#shared_pw = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#blocked_pw = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#A_SHARED_pw = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 1024 : i32} {
+// CHECK-LABEL: @no_barrier_before_per_warp_arrive
+tt.func @no_barrier_before_per_warp_arrive(%arg: tensor<32x16xf16, #blocked_pw>) {
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<32x16xf16, #A_SHARED_pw, #ttg.shared_memory, mutable>
+  %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_pw, #ttg.shared_memory, mutable>
+  //      CHECK: ttg.local_store
+  // CHECK-NEXT: ttng.arrive_barrier
+  //  CHECK-NOT: ttg.barrier local
+  //      CHECK: tt.return
+  ttg.local_store %arg, %alloc : tensor<32x16xf16, #blocked_pw> -> !ttg.memdesc<32x16xf16, #A_SHARED_pw, #ttg.shared_memory, mutable>
+  ttng.arrive_barrier %barrier, 4 {per_warp} : !ttg.memdesc<1xi64, #shared_pw, #ttg.shared_memory, mutable>
+  tt.return
+}
+}
+
+// -----
+
 // A regular arrive is a synchronization point whose physical CTA barrier is
 // emitted during lowering. Membar must not insert a duplicate barrier, but it
 // must retain the arrive's dependency for a subsequent wait.
