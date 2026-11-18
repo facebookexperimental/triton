@@ -80,8 +80,9 @@ to their sum, a single barrier wait covers all loads.
 Fused loads must also agree on their issue protocol: a barrier group is either
 entirely ordinary per-CTA loads or entirely cooperative 2-CTA loads. Mixing the
 two would route ordinary completion to the pair leader while computing its
-expected byte count with per-CTA semantics. `optimizeTMALoads` asserts this
-invariant before materializing the shared barrier.
+expected byte count with per-CTA semantics. `optimizeTMALoads` rejects a mixed
+group with an error (see the fallbacks under
+[2-CTA Cooperative Loads](#2-cta-cooperative-loads-and-triton_disable_2cta_cooperative_loads)).
 
 ### 2-CTA Cooperative Loads and `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS`
 
