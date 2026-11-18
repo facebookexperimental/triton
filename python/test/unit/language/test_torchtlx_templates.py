@@ -5843,9 +5843,9 @@ def _rel_l2(out, ref):
 class TestSdpaToFlex(TestCase):
     """tlx_config.sdpa_to_flex: SDPA flash attention lowered through flex on sm90.
 
-    Eligible calls (sm90, bf16/fp16, D in {80, 96}, Lq <= 32, no dropout, not causal)
-    must reach the flex template in fwd and bwd and match stock PT2; others keep the
-    aten fallback.
+    Eligible calls (sm90, tlx_mode, bf16/fp16, D in {80, 96}, Lq <= 32, no dropout, not
+    causal) must reach the flex template in fwd and bwd and match stock PT2; others keep
+    the aten fallback.
     The flag is set process-wide because the lazy backward compile reads it.
     """
 
@@ -5917,6 +5917,11 @@ class TestSdpaToFlex(TestCase):
         _, _, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
         self.assertRegex(code, _SDPA_FWD_CALL)
 
+        q, kv = self._inputs(8, 32, 200, 80)
+        with config.patch({"triton.tlx_mode": None}):
+            _, _, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
+        self.assertRegex(code, _SDPA_FWD_CALL)
+
         # Causal with Lq == Lkv so SDPA still picks a fused kernel.
         q, kv = self._inputs(8, 32, 32, 80)
         _, _, code = self._compile_fw_bw(
@@ -5930,6 +5935,30 @@ class TestSdpaToFlex(TestCase):
         q, kv = self._inputs(8, 64, 1536, 80)
         _, _, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
         self.assertRegex(code, _SDPA_FWD_CALL)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_fwd_scoped_tlx_mode_keeps_bwd_routed(self):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        q, kv = self._inputs(8, 32, 200, 80)
+        ref, ref_grads, _ = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=False)
+        q = q.detach().requires_grad_(True)
+        kv = kv.detach().requires_grad_(True)
+        saved = tlx_config.sdpa_to_flex
+        tlx_config.sdpa_to_flex = True
+        try:
+            torch._dynamo.reset()
+            with config.patch({"force_disable_caches": True}):
+                with config.patch({"triton.tlx_mode": "allow"}):
+                    out = torch.compile(self._sdpa_shared_kv)(q, kv)
+                with config.patch({"triton.tlx_mode": None}):
+                    _, code = run_and_get_code(lambda: out.sum().backward())
+        finally:
+            tlx_config.sdpa_to_flex = saved
+        self.assertNotRegex("\n".join(code), _SDPA_BWD_CALL)
+        for got, want in zip((out, q.grad, kv.grad), (ref, *ref_grads)):
+            self.assertLessEqual(_rel_l2(got, want), 1e-2)
 
     @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
     @unittest.skipIf(not has_tlx(), "TLX not available")
