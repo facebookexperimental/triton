@@ -338,14 +338,25 @@ def _pass(
             first_scores = _scores(q, k, rows, first_page, first_q, last_q, SQ, SK, WINDOW, BM, SPLIT_MASK)
         if SAMPLED:
             first_max = tl.max(first_scores, 1)
-            reference_page = tl.maximum(first_page, (first_q + 1) // 64 - 1)
-            _put_k_id(kd, kb, 0, tl.load(Tables + batch * TABLE_STRIDE + reference_page), PAGE_ROWS)
-            reference_k = _get_k(kb, 0, 0, SHUFFLED)
+            if WINDOW:
+                # Both left-edge pages are already queued. Reuse their QK
+                # scores for the reference and the two peeled iterations.
+                reference_page = first_page + 1
+                reference_k = _get_k(kb, 1, 1, SHUFFLED)
+            else:
+                reference_page = tl.maximum(first_page, (first_q + 1) // 64 - 1)
+                _put_k_id(kd, kb, 0, tl.load(Tables + batch * TABLE_STRIDE + reference_page), PAGE_ROWS)
+                reference_k = _get_k(kb, 0, 0, SHUFFLED)
             if BM // GROUP <= 64:
                 reference_scores = _dot(q, reference_k, tl.zeros((BM, 64), tl.float32)) * (0.125 * 1.4426950408889634)
             else:
                 reference_scores = _scores(q, reference_k, rows, reference_page, first_q, last_q, SQ, SK, WINDOW, BM,
                                            True)
+            if WINDOW:
+                keys = reference_page * 64 + tl.arange(0, 64)
+                reference_scores = tl.where(keys[None, :] > rows[:, None] + SK - SQ - WINDOW, reference_scores,
+                                            -float("inf"))
+                next_scores = reference_scores
             maximum = tl.maximum(first_max, tl.max(reference_scores, 1))
             maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
             maximum = tl.minimum(tl.maximum(maximum + 16.0, -64.0), 64.0)
@@ -353,7 +364,8 @@ def _pass(
         p, denom = _finish(first_scores, denom, maximum, BM, q.dtype)
         _put_k_id(kd, kb, 0, phys2, PAGE_ROWS)
         _put_v_id(vd, vb, 1, phys1, PAGE_ROWS)
-        k = _get_k(kb, 1, 3, SHUFFLED)
+        if not (WINDOW and SAMPLED):
+            k = _get_k(kb, 1, 3, SHUFFLED)
         slot = 0
         body_begin = first_page
         if WINDOW:
@@ -361,12 +373,13 @@ def _pass(
             # then has no masks or per-iteration visibility branches, even
             # when runtime lengths place a query tile across a page boundary.
             next_phys = tl.load(Tables + batch * TABLE_STRIDE + first_page + 3)
-            if BM // GROUP <= 64:
-                next_scores = _dot(q, k, tl.zeros((BM, 64), tl.float32)) * (0.125 * 1.4426950408889634)
-                keys = (first_page + 1) * 64 + tl.arange(0, 64)
-                next_scores = tl.where(keys[None, :] > rows[:, None] + SK - SQ - WINDOW, next_scores, -float("inf"))
-            else:
-                next_scores = _scores(q, k, rows, first_page + 1, first_q, last_q, SQ, SK, WINDOW, BM, True)
+            if not SAMPLED:
+                if BM // GROUP <= 64:
+                    next_scores = _dot(q, k, tl.zeros((BM, 64), tl.float32)) * (0.125 * 1.4426950408889634)
+                    keys = (first_page + 1) * 64 + tl.arange(0, 64)
+                    next_scores = tl.where(keys[None, :] > rows[:, None] + SK - SQ - WINDOW, next_scores, -float("inf"))
+                else:
+                    next_scores = _scores(q, k, rows, first_page + 1, first_q, last_q, SQ, SK, WINDOW, BM, True)
             v = _get_v(vb, 0, 2, SHUFFLED)
             _put_k_id(kd, kb, 1, next_phys, PAGE_ROWS)
             denom = _dot(p, tl.full((64, 16), 1.0, q.dtype), denom)
