@@ -3093,7 +3093,17 @@ static unsigned allocateSmemBuffers(
   SmallVector<WSBuffer> preCopyBuffers = wsBuffers;
   unsigned preCopyNextBufferId = nextBufferId;
   runCopyPhases(smemBudget);
+  // Only worth it when an outer staging slot is large (e.g. a 128x32 fp32 or
+  // 128x64 bf16 subtile): small slots overlap the stores cheaply and measured
+  // slower once traded for operand depth.
+  unsigned maxOuterStagingSlot = 0;
+  for (const auto &buf : preCopyBuffers)
+    if (!buf.isPinned &&
+        (buf.priority == WSBufferPriority::P3_OuterTMAStaging ||
+         buf.priority == WSBufferPriority::P4_Other))
+      maxOuterStagingSlot = std::max(maxOuterStagingSlot, buf.sizeBytes);
   if (outerEpilogueBudget < smemBudget && !mmaOperandIdx.empty() &&
+      maxOuterStagingSlot >= 16384 &&
       minMMAOperandCopies() < operandDepthGoal &&
       !funcOp->hasAttr("ttg.ws_memory_plan_invalid")) {
     SmallVector<WSBuffer> defaultPlan = wsBuffers;
