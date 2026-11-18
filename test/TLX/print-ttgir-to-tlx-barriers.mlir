@@ -130,6 +130,50 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.arrive_barrier %bar, 1 {perThread} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     tt.return
   }
+
+  // per_warp is a property of the arrive: one lane of each warp arrives. The
+  // op counts the whole task; TLX counts per warp, so 4 over 4 warps is 1.
+  // CHECK-LABEL: def per_warp_arrive(
+  // CHECK: tlx.alloc_barriers(1, 4)
+  // CHECK: tlx.barrier_arrive({{[a-z_0-9]+}}, per_warp=True)  #
+  tt.func public @per_warp_arrive() attributes {noinline = false} {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %bar, 4 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.arrive_barrier %bar, 4 {per_warp} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+
+  // The warps are the arriving partition's.
+  // CHECK-LABEL: def per_warp_arrive_in_partition(
+  // CHECK: tlx.alloc_barriers(1, 6)
+  // CHECK: with tlx.async_task(num_warps=2
+  // CHECK: tlx.barrier_arrive({{[a-z_0-9]+}}, 3, per_warp=True)  #
+  tt.func public @per_warp_arrive_in_partition() attributes {noinline = false} {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %bar, 6 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttg.warp_specialize(%bar)
+    default {
+      ttg.warp_yield
+    }
+    partition0(%arg0: !ttg.memdesc<1xi64, #shared, #smem, mutable>) num_warps(2) {
+      ttng.arrive_barrier %arg0, 6 {per_warp} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      ttg.warp_return
+    } : (!ttg.memdesc<1xi64, #shared, #smem, mutable>) -> ()
+    tt.return
+  }
+
+  // Per-warp and leader arrives can share a barrier: 4 warps and a leader.
+  // CHECK-LABEL: def mixed_per_warp_and_leader_arrives(
+  // CHECK: tlx.alloc_barriers(1, 5)
+  // CHECK: tlx.barrier_arrive({{[a-z_0-9]+}}, per_warp=True)  #
+  // CHECK: tlx.barrier_arrive({{[a-z_0-9]+}})  #
+  tt.func public @mixed_per_warp_and_leader_arrives() attributes {noinline = false} {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %bar, 5 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.arrive_barrier %bar, 4 {per_warp} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.arrive_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
 }
 
 // -----
@@ -174,6 +218,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %v1 = ttg.memdesc_index %bar[%c1_i32] : !ttg.memdesc<2x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.init_barrier %v0, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.init_barrier %v1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+
+  // A per_warp count TLX cannot split across the warps has no spelling.
+  // CHECK-LABEL: def per_warp_count_not_split(
+  // CHECK: # unsupported: per_warp arrive_barrier (count=6)
+  tt.func public @per_warp_count_not_split() attributes {noinline = false} {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %bar, 6 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // expected-error @+1 {{per_warp arrive_barrier whose count does not split across its warps does not round-trip to TLX}}
+    ttng.arrive_barrier %bar, 6 {per_warp} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     tt.return
   }
 }
