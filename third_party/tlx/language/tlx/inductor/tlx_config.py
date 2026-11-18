@@ -45,10 +45,10 @@ allow_min_speedup: float = float(
 # toggling it around a compile call pairs a flex forward with an FA2 backward.
 sdpa_to_flex: bool = os.environ.get("TORCHINDUCTOR_TLX_SDPA_TO_FLEX", "0") == "1"
 
-# Experimental: extends every gfx942 INNER reduction's persistent threshold.
-# Coverage so far is limited to the SwishWithNorm fusion benchmarks.
+# Extends the persistent threshold of gfx942 INNER reductions under tlx_mode;
+# each such reduction is timed against its looped kernel. Set to 0 to opt out.
 gfx942_persistent_inner_reductions: bool = (
-    os.environ.get("TORCHINDUCTOR_TLX_GFX942_PERSISTENT_INNER_REDUCTIONS", "0") == "1"
+    os.environ.get("TORCHINDUCTOR_TLX_GFX942_PERSISTENT_INNER_REDUCTIONS", "1") == "1"
 )
 
 @contextmanager
