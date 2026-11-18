@@ -372,9 +372,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
 #s8 = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 8, order = [1, 0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func @mixed_radix_pow2_alloc_view(%d: !ttg.memdesc<128x96xf16, #s8, #smem, mutable, 128x128>) {
+  tt.func @mixed_radix_pow2_alloc_view(%d: !ttg.memdesc<128x96xf16, #s8, #smem, mutable, 128x256>) {
     // expected-error @+1 {{NPOT mixed-radix access to a view with an NPOT subslice extent is not yet supported}}
-    %v = ttg.local_load %d : !ttg.memdesc<128x96xf16, #s8, #smem, mutable, 128x128> -> tensor<128x96xf16, #p>
+    %v = ttg.local_load %d : !ttg.memdesc<128x96xf16, #s8, #smem, mutable, 128x256> -> tensor<128x96xf16, #p>
+    tt.return
+  }
+}
+
+// -----
+
+#p = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [32, 0], [64, 0], [0, 32]], lane = [[0, 8], [0, 16], [1, 0], [2, 0], [4, 0]], warp = [[8, 0], [16, 0]], block = [], inputRadices = {register = [2, 2, 2, 2, 2, 3], lane = [2, 2, 2, 2, 2], warp = [2, 2], block = []}, outDimSizes = [128, 96]}>
+#s8 = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 8, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mixed_radix_pow2_alloc_view_store(%d: !ttg.memdesc<128x96xf16, #s8, #smem, mutable, 128x256>) {
+    %v = arith.constant dense<0.000000e+00> : tensor<128x96xf16, #p>
+    // expected-error @+1 {{NPOT mixed-radix access to a view with an NPOT subslice extent is not yet supported}}
+    ttg.local_store %v, %d : tensor<128x96xf16, #p> -> !ttg.memdesc<128x96xf16, #s8, #smem, mutable, 128x256>
     tt.return
   }
 }
@@ -394,6 +408,49 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %b2 = arith.constant dense<1.0> : tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>
     %c2 = arith.constant dense<0.0> : tensor<128x128xf32, #mma>
     %d2 = tt.dot %a, %b2, %c2 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>> -> tensor<128x128xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+// A TLX layout anchor forwarding a tensor to another layout is a
+// conversion: the same plan check as ttg.convert_layout applies.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+#q96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [[0]], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = [2]}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mixed_radix_anchor_to_cross_cta() {
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
+    // expected-error @+1 {{NPOT mixed-radix conversion with a non-singleton block input in the destination layout is not yet supported}}
+    %c = tlx.require_layout %r : tensor<96xi32, #p96> -> tensor<96xi32, #q96>
+    tt.return
+  }
+}
+
+// -----
+
+// The TTG branch of the same anchor check.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+#q96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [[0]], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = [2]}, outDimSizes = [96]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mixed_radix_ttg_anchor_to_cross_cta() {
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
+    // expected-error @+1 {{NPOT mixed-radix conversion with a non-singleton block input in the destination layout is not yet supported}}
+    %c = ttg.require_layout %r : tensor<96xi32, #p96> -> tensor<96xi32, #q96>
+    tt.return
+  }
+}
+
+// -----
+
+// An anchor to a non-mixed-radix layout takes the same arm of the
+// anchor plan check as a convert to one.
+#p96 = #ttg.linear<{register = [[32]], lane = [[1], [2], [4], [8], [16]], warp = [], block = [], inputRadices = {register = [3], lane = [2, 2, 2, 2, 2], warp = [], block = []}, outDimSizes = [96]}>
+#blocked96 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @mixed_radix_anchor_to_blocked() {
+    %r = tt.make_range {end = 96 : i32, start = 0 : i32} : tensor<96xi32, #p96>
+    // expected-error @+1 {{NPOT conversion to or from a non-mixed-radix layout is not yet supported}}
+    %c = tlx.require_layout %r : tensor<96xi32, #p96> -> tensor<96xi32, #blocked96>
     tt.return
   }
 }
