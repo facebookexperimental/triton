@@ -5898,6 +5898,16 @@ class TestSdpaToFlex(TestCase):
         def fn(q, k):
             return torch.nn.functional.scaled_dot_product_attention(q, k, k if v is None else v)
 
+        from torch.nn.attention import sdpa_kernel
+
+        try:
+            with sdpa_kernel(sdpa_backend):
+                fn(q, kv)
+        except RuntimeError as e:
+            if "No available kernel" not in str(e):
+                raise
+            self.skipTest(f"no {backend} SDPA kernel for these inputs on this build")
+
         out, grads, code = self._compile_fw_bw(fn, q, kv, routed=True, backend=sdpa_backend)
         ref, ref_grads, ref_code = self._compile_fw_bw(fn, q, kv, routed=False, backend=sdpa_backend)
         self.assertRegex(code, rf"triton_tem_fused_\w*scaled_dot_product_{backend}_attention_backward")
