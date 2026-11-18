@@ -43,6 +43,9 @@ struct MemoryPlannerOptions {
   bool smemCircularReuse = false;
   bool smemPlanSearch = false;
   bool reserveAuxiliarySmem = true;
+  // Subtiled regions are generated after planning (their staging rotation
+  // tolerates any copy count).
+  bool generateSubtiledRegion = false;
 };
 
 // Plans SMEM/TMEM allocation (multi-buffering, liveness). Production passes
