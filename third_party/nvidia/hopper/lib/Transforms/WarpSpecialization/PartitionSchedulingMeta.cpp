@@ -42,11 +42,11 @@ inline bool isEpilogueStoreOp(Operation *op) {
 }
 
 // A TMAStoreTokenWaitOp that waits on an async_tma_reduce / descriptor_reduce.
-// Such a wait must live in the SAME partition as its reduce (the reduction
-// partition), not the epilogue-store partition: otherwise doCodePartition
-// clones the reduce into the store partition to satisfy the mis-placed wait,
-// reducing e.g. reduce_dq into global twice (double-count / stale-staging
-// garbage). See T279388065.
+// Such a wait must live in the SAME partition as its reduce (usually the
+// reduction partition), not the epilogue-store partition: otherwise
+// doCodePartition clones the reduce into the store partition to satisfy the
+// mis-placed wait, reducing e.g. reduce_dq into global twice (double-count /
+// stale-staging garbage). See T279388065.
 inline bool isReduceTokenWait(Operation *op) {
   if (!isa<ttng::TMAStoreTokenWaitOp>(op))
     return false;
@@ -1275,7 +1275,8 @@ static Partition *scheduleUsers(LoopLikeOpInterface loop,
 
 // Schedule post-loop operations (operations outside and after the loop) into
 // the appropriate partition. Epilogue store ops and their transitive users
-// (e.g., TMAStoreTokenWaitOp) go to the epilogue partition. All other post-loop
+// (e.g., TMAStoreTokenWaitOp) go to the epilogue partition, except that a TMA
+// reduce's token wait goes to its reduce's partition. All other post-loop
 // ops (e.g., tmem_load for accumulator reads, arithmetic for normalization) go
 // to the default partition. This prevents TMEM ops from landing in the
 // epilogue, which would force it to use 4 warps (TMEM lane coverage
@@ -1379,7 +1380,13 @@ schedulePostLoopOps(LoopLikeOpInterface loop, PartitionSet &schedule,
 
     { // Schedule post-loop op (override earlier phase assignments)
       Partition *target = nullptr;
-      if (isEpilogueStoreOp(user)) {
+      if (isReduceTokenWait(user)) {
+        // Keep a reduce's token_wait with its reduce (see isReduceTokenWait);
+        // this walk has already scheduled the reduce.
+        auto ids = safeGetPartitionIds(user->getOperand(0).getDefiningOp());
+        target = ids.size() == 1 ? schedule.getPartition(ids[0])
+                                 : getEpilogueTarget(user);
+      } else if (isEpilogueStoreOp(user)) {
         target = getStoreTarget(user);
       } else {
         bool hasStoreInput = false;
@@ -1799,7 +1806,8 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   if (mmas.empty() && layout.epilogueStorePartition) {
     for (auto loop : loops) {
       getLoopBodyRegion(loop).walk([&](Operation *op) {
-        if (isEpilogueStoreOp(op))
+        // A reduce's token_wait stays with its reduce (isReduceTokenWait).
+        if (isEpilogueStoreOp(op) && !isReduceTokenWait(op))
           tryScheduleOp(layout.epilogueStorePartition, op);
       });
     }
