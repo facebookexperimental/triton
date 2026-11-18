@@ -1989,8 +1989,11 @@ def paged_attention_decode_fp8(query, key_cache, value_cache, context_lens, bloc
     with the same planning arguments for graph capture. Allocate both before
     capture; workspace planning uses the same query/cache shapes, context
     bound, query length, sliding window and optional split override as attention.
-    Explicit split counts override the heuristic. Only the ``heuristic`` search
-    space is supported; implementation/architecture choices remain private.
+    Automatic batched single-token decode may choose active splits per request
+    from device context lengths within a fixed graph/workspace capacity. Short
+    requests can bypass split scratch and merge while long requests retain
+    partition parallelism. Explicit split counts override this policy. Only the
+    ``heuristic`` search space is supported; implementation choices remain private.
     """
     import torch
     batch, kv_heads = _check_fp8_paged_kv(query, key_cache, value_cache, block_tables, max_context_len=max_context_len,

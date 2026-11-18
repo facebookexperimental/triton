@@ -14,8 +14,10 @@ sets the graph/scheduling bound and block-table capacity. ``--compare-bounds``
 compares tight and configured bounds on identical Q/K/V and block tables.
 ``--split-sweep`` adds explicit split controls alongside automatic selection.
 ``one-long`` keeps all but the last request short; ``--context-lengths`` accepts
-an exact comma-separated vector instead of a generated profile. Timings remain
-warm-cache graph measurements, including empty split work and the merge.
+an exact comma-separated vector instead of a generated profile. Automatic batched decode can use fewer splits per request from device lengths;
+reported selected splits describe workspace/grid capacity. Empty workgroup counts
+use that runtime policy. Timings remain warm-cache graph measurements, including
+inactive partition dispatch and any merge.
 Input generation, FP8 quantization, cache packing and the independent
 CPU float64 correctness gate run outside timing. The measured call includes the public
 operator's attention and split merge. Useful KV TB/s counts unique active K/V
@@ -148,19 +150,46 @@ def main():
                 # Analytical launch/partition counts for the selected config,
                 # not profiler counters. Runtime partitions use actual lengths.
                 count, bn = config['num_splits'], config['block_n']
+                chunk = config.get('split_chunk', 0)
                 tasks_per_seq = a.heads if config['variant'].startswith('vector') else (
                     a.kv_heads * triton.cdiv(group, config['block_m']))
                 nonempty = 0
+                work_items = 0
+                sequence_work = []
                 for n in active_lengths:
                     begin = max(0, n - a.window) if a.window else 0
                     if config['variant'] in ('matrix_tdm_flat', 'vector_page'):
                         begin = begin // a.page_size * a.page_size
                     active = max(0, n - begin)
-                    span = triton.cdiv(active, count * bn) * bn
+                    if config.get('split_target'):
+                        group_size = config['sequence_group']
+                        first_seq = len(sequence_work) // group_size * group_size
+                        live = sum(length > 512 for length in active_lengths[first_seq:first_seq + group_size])
+                        budget = max(1, config['split_target'] // max(1, live * tasks_per_seq))
+                        active_count = 1 if n <= 512 else min(count, triton.cdiv(n, chunk), budget)
+                    else:
+                        active_count = (1 if n <= 512 else min(count, triton.cdiv(n, chunk))) if chunk else count
+                    work_items += active_count * tasks_per_seq
+                    sequence_work.append(active_count * tasks_per_seq)
+                    span = triton.cdiv(active, active_count * bn) * bn
                     nonempty += (triton.cdiv(active, span) if span else 0) * tasks_per_seq
-                total = a.batch * tasks_per_seq * count
-                diagnostics = dict(partition_ctas=total, nonempty_partition_ctas=nonempty,
-                                   empty_partition_ctas=total - nonempty)
+                if config.get('partition_grid'):
+                    # A bounded block can execute several packed work items;
+                    # work-item counts and physical workgroups differ here.
+                    group_size = config.get('sequence_group', a.batch)
+                    group_grid = config['partition_grid']
+                    grid = group_grid * triton.cdiv(a.batch, group_size)
+                    idle = sum(
+                        max(0, group_grid - sum(sequence_work[i:i + group_size]))
+                        for i in range(0, a.batch, group_size))
+                    diagnostics = dict(partition_ctas=grid, partition_work_items=work_items,
+                                       nonempty_partition_work_items=nonempty, idle_partition_ctas=idle)
+                else:
+                    total = a.batch * tasks_per_seq * count
+                    diagnostics = dict(partition_ctas=total, nonempty_partition_ctas=nonempty,
+                                       empty_partition_ctas=total - nonempty)
+            if config.get('split_chunk'):
+                diagnostics['active_splits_per_sequence'] = [n // tasks_per_seq for n in sequence_work]
             measurements.append(
                 dict(
                     call=call, max_context_len=context_bound, requested_splits=splits, selected_config=config,

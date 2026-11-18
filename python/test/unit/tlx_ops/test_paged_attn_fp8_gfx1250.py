@@ -432,7 +432,8 @@ def test_fp8_public_workspace_graph_replay(splits, dim, window, page):
 @pytest.mark.skipif(not _gfx1250_available(), reason='Requires gfx1250')
 @pytest.mark.parametrize('fp8_q', [False, True], ids=['bf16-q', 'fp8-q'])
 @pytest.mark.parametrize('bound', [8192, 262144])
-@pytest.mark.parametrize('hq,hkv,dim,page', [(16, 2, 64, 64), (16, 2, 128, 128), (32, 32, 64, 128), (32, 32, 128, 64)])
+@pytest.mark.parametrize('hq,hkv,dim,page', [(16, 2, 64, 64), (16, 2, 128, 128), (32, 32, 64, 128), (32, 32, 128, 64),
+                                             (6, 2, 64, 64)])
 def test_fp8_kv_decode_ragged_large_bound_graph(fp8_q, bound, hq, hkv, dim, page):
     # A fixed graph bound can greatly exceed all actual lengths. Most requests
     # are short, one crosses several pages, and some become empty on replay.
@@ -461,6 +462,114 @@ def test_fp8_kv_decode_ragged_large_bound_graph(fp8_q, bound, hq, hkv, dim, page
         graph.replay()
         expected = _reference(q, kd, vd, table, active, ks, vs, qs, 1, True, 0)
         assert torch.isfinite(out).all()
+        torch.testing.assert_close(out.float(), expected, atol=5e-4, rtol=1e-2)
+
+
+@pytest.mark.skipif(not _gfx1250_available(), reason='Requires gfx1250')
+@pytest.mark.parametrize('fp8_q', [False, True])
+@pytest.mark.parametrize('dim', [64, 128])
+@pytest.mark.parametrize('page', [64, 128])
+@pytest.mark.parametrize('metadata_dtype', [torch.int32, torch.int64])
+def test_fp8_kv_decode_batched_partial_cancellation(fp8_q, dim, page, metadata_dtype):
+    # Positive and negative active partitions sum to one. Rounded FP16 partition
+    # means would lose that residual. Other requests remain empty.
+    length, batch, hq, hkv = 1024, 32, 16, 2
+    x = _make_test_inputs([length] + [0] * (batch - 1), dim=dim, page=page, fp8_q=fp8_q, max_context_len=262144)
+    q, _, _, contexts, table, _, _, qs, _, k, v = x
+    q = torch.zeros_like(q)
+    k = torch.zeros(k.shape, device=q.device).to(torch.float8_e4m3fn)
+    vf = torch.zeros(v.shape, device=q.device)
+    logical = torch.zeros((length, hkv, dim), device=q.device)
+    logical[:511, :, 0] = 256.
+    logical[511, :, 0] = 1.
+    logical[512:1023, :, 0] = -256.
+    ids = table[0, :length // page].long()
+    vf[ids] = logical.reshape(-1, page, hkv, dim).permute(0, 2, 1, 3)
+    v = vf.to(torch.float8_e4m3fn)
+    blocks = k.shape[0]
+    kp = k.reshape(blocks, hkv, page, dim // 16, 16).permute(0, 1, 3, 2, 4).contiguous()
+    vp = v.reshape(blocks, hkv, page // 16, 16, dim).permute(0, 1, 2, 4, 3).contiguous()
+    contexts, table = contexts.to(metadata_dtype), table.to(metadata_dtype)
+    ks = torch.tensor([1., 2.], device=q.device)
+    vs = torch.tensor([1., 8.], device=q.device)
+    plan = dict(max_context_len=262144)
+    work = paged_attention_decode_fp8_workspace(q, kp, vp, table, **plan)
+    out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+
+    def call():
+        paged_attention_decode_fp8(q, kp, vp, contexts, table, ks, vs, q_scale=qs, out=out, workspace=work, **plan)
+
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for active in [length, 128, 0, length]:
+        contexts[0] = active
+        out.fill_(float('nan'))
+        if work is not None:
+            for buffer in work:
+                buffer.fill_(float('nan'))
+        graph.replay()
+        expected = torch.zeros(out.shape, device=q.device, dtype=torch.float32)
+        if active:
+            expected[0, :, 0] = vs.repeat_interleave(hq // hkv) * (1. / length if active == length else 256.)
+        torch.testing.assert_close(out.float(), expected, atol=5e-4, rtol=1e-2)
+
+
+@pytest.mark.skipif(not _gfx1250_available(), reason='Requires gfx1250')
+@pytest.mark.parametrize('fp8_q', [False, True])
+@pytest.mark.parametrize('dim', [64, 128])
+@pytest.mark.parametrize('page', [64, 128])
+def test_fp8_kv_decode_batched_work_replay(fp8_q, dim, page):
+    # Exercise work reuse across requests and pages. Zero logits give exact
+    # uniform-attention means over distinct quantized per-sequence/page labels.
+    batch, hq, hkv, length, bound = 65, 16, 2, 32768, 262144
+    pages = length // page
+    blocks = batch * pages
+    q = torch.zeros((batch, hq, dim * (2 if dim == 128 else 1)), device='cuda',
+                    dtype=torch.float8_e4m3fn if fp8_q else torch.bfloat16)
+    if dim == 128:
+        q = q[..., ::2]
+    k = torch.zeros((blocks, hkv, dim // 16, page, 16), device='cuda').to(torch.float8_e4m3fn)
+    dtype = torch.int64 if fp8_q else torch.int32
+    table = torch.full((batch, bound // page), -1, device='cuda', dtype=dtype)
+    table[:, :pages] = torch.randperm(blocks, device='cuda').reshape(batch, pages).to(dtype)
+    labels = (1 + torch.arange(batch, device='cuda')[:, None] % 17 +
+              torch.arange(pages, device='cuda')[None, :] % 7).to(torch.float8_e4m3fn).float()
+    ids = table[:, :pages].long().flatten()
+    vf = torch.empty((blocks, hkv, page // 16, dim, 16), device='cuda')
+    vf[ids, 0] = 2. * labels.flatten()[:, None, None, None]
+    vf[ids, 1] = 4. * labels.flatten()[:, None, None, None]
+    v = vf.to(torch.float8_e4m3fn)
+    label_reference = labels.cpu().double()
+    del vf
+    lengths = torch.full((batch, ), length, device='cuda', dtype=dtype)
+    ks = torch.tensor([1., 2.], device='cuda')
+    vs = torch.tensor([.5, 2.], device='cuda')
+    qs = torch.linspace(.02, .06, hq, device='cuda') if fp8_q else None
+    work = paged_attention_decode_fp8_workspace(q, k, v, table, max_context_len=bound)
+    out = torch.empty(q.shape, device='cuda', dtype=torch.bfloat16)
+
+    def call():
+        paged_attention_decode_fp8(q, k, v, lengths, table, ks, vs, q_scale=qs, max_context_len=bound, out=out,
+                                   workspace=work)
+
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for active in [[length] * batch, [[length, 1, 67, 128][i % 4] for i in range(batch)], [length] * batch]:
+        lengths.copy_(torch.tensor(active, device='cuda', dtype=dtype))
+        out.fill_(float('nan'))
+        if work is not None:
+            for buffer in work:
+                buffer.fill_(float('nan'))
+        graph.replay()
+        active_cpu = torch.tensor(active)
+        visible = (active_cpu[:, None] - torch.arange(pages)[None, :] * page).clamp(0, page)
+        mean = (label_reference * visible).sum(1) / active_cpu.clamp_min(1)
+        factors = torch.tensor([1., 8.], device='cuda').repeat_interleave(hq // hkv)
+        expected = (mean.to(device='cuda', dtype=torch.float32)[:, None, None] * factors[None, :, None]).expand_as(out)
         torch.testing.assert_close(out.float(), expected, atol=5e-4, rtol=1e-2)
 
 
