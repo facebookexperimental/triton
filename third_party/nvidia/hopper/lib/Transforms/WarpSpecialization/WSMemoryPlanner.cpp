@@ -1575,7 +1575,7 @@ enum class StagingCopiesPass {
 static void increaseFusedEpilogueCopies(
     SmallVector<WSBuffer> &wsBuffers, SmallVector<Channel *> &channels,
     triton::FuncOp funcOp, unsigned numBuffers, unsigned smemBudget,
-    StagingCopiesPass pass, bool alignCrossPartitionStaging) {
+    StagingCopiesPass pass, bool skipUnalignedStaging) {
   // Staging-depth search axis: cap the bump target (K|S/budget still enforced).
   if (unsigned cap = getStagingCopiesCap())
     numBuffers = std::min(numBuffers, cap);
@@ -1794,19 +1794,23 @@ static void increaseFusedEpilogueCopies(
           tryCopies++;
           continue;
         }
-        // Cross-partition staging past its reserve: keep the slot rotation
-        // aligned with the subtiles of a tile (K | S or S | K). Otherwise a
-        // tile's subtiles land on different slots each tile, the store-wait
-        // tokens rotate by a fraction of an iteration, and the program-order
-        // count of some waits drops to 0. Subtiled regions (generated after
-        // planning) rotate their slots by a flattened per-subtile counter
-        // instead, so any depth works there.
+        // Cross-partition staging past its reserve: skip depths above the
+        // subtile count S that are not a multiple of it (a performance rule;
+        // any depth is correct). Such a ring wraps across tiles at a different
+        // subtile each time, and with each tile's prologue stores guarded
+        // separately the program-order count of some store waits falls to 0
+        // (EPILOGUE_SUBTILE=2: 3 copies drain one wait and run 18% slower
+        // than 2 copies; EPILOGUE_SUBTILE=4: 3 copies keep every wait at 2
+        // and beat 2 copies).
+        // Kernels that get subtiled regions after planning rotate staging by a
+        // flattened per-subtile counter and keep the previous growth.
         if (pass == StagingCopiesPass::GrowCrossPartition &&
-            alignCrossPartitionStaging && subtileCount % tryCopies != 0 &&
+            skipUnalignedStaging && tryCopies > subtileCount &&
             tryCopies % subtileCount != 0) {
           LDBG("Phase 4.6:     bufferId="
                << bufferId << " skip copies=" << tryCopies
-               << " (not aligned with subtileCount=" << subtileCount << ")");
+               << " (above subtileCount=" << subtileCount
+               << " and not a multiple of it)");
           tryCopies++;
           continue;
         }
@@ -2429,13 +2433,13 @@ static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
-    unsigned annotationMaxId, bool alignCrossPartitionStaging);
+    unsigned annotationMaxId, bool skipUnalignedStaging);
 
 static unsigned allocateSmemBuffersViaSearch(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
-    unsigned annotationMaxId, bool alignCrossPartitionStaging) {
+    unsigned annotationMaxId, bool skipUnalignedStaging) {
   // Safety fallback: the search does not yet model (a) annotation /
   // atomic-broadcast pins, (b) subtiled-region groups, or (c) *multi-store*
   // TMA-staging buffers (S>1 subtiles rotating through the buffer, which carry
@@ -2485,7 +2489,7 @@ static unsigned allocateSmemBuffersViaSearch(
          "heuristic");
     return allocateSmemBuffers(funcOp, channels, numBuffers, smemBudget,
                                smemCircularReuse, allocToAnnotation,
-                               annotationMaxId, alignCrossPartitionStaging);
+                               annotationMaxId, skipUnalignedStaging);
   }
 
   SmemBufferModel model(funcOp, channels, numBuffers);
@@ -2508,7 +2512,7 @@ static unsigned allocateSmemBuffersViaSearch(
     LDBG("SMEM plan-search: no plan found, falling back to heuristic");
     return allocateSmemBuffers(funcOp, channels, numBuffers, smemBudget,
                                smemCircularReuse, allocToAnnotation,
-                               annotationMaxId, alignCrossPartitionStaging);
+                               annotationMaxId, skipUnalignedStaging);
   }
 
   // Normalize each plan's block copies to the value that will actually be
@@ -2571,7 +2575,7 @@ static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
-    unsigned annotationMaxId, bool alignCrossPartitionStaging) {
+    unsigned annotationMaxId, bool skipUnalignedStaging) {
   // ── Phase 1: Create WSBuffers ───────────────────────────────────────
   SmallVector<WSBuffer> wsBuffers;
   // Start non-pinned buffer IDs past all annotation IDs (SMEM + TMEM)
@@ -2856,7 +2860,7 @@ static unsigned allocateSmemBuffers(
   // the remaining budget (notably FA-bwd dQ versus the small m/Di buffers).
   increaseFusedEpilogueCopies(wsBuffers, channels, funcOp, numBuffers,
                               smemBudget, StagingCopiesPass::Reserve,
-                              alignCrossPartitionStaging);
+                              skipUnalignedStaging);
 
   LDBG("Phase 3.7 epilogue copies complete: totalSmem="
        << computeTotalSmem(wsBuffers));
@@ -3060,7 +3064,7 @@ static unsigned allocateSmemBuffers(
   // ── Phase 4.6: Grow cross-partition staging with the remaining budget ─
   increaseFusedEpilogueCopies(wsBuffers, channels, funcOp, numBuffers,
                               smemBudget, StagingCopiesPass::GrowCrossPartition,
-                              alignCrossPartitionStaging);
+                              skipUnalignedStaging);
   LDBG("Phase 4.6 cross-partition staging copies complete: totalSmem="
        << computeTotalSmem(wsBuffers));
 

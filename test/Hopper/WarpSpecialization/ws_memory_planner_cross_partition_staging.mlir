@@ -1,11 +1,13 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=8 smem-budget=232448" | FileCheck %s --check-prefix=CLC
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=4 smem-budget=232448" | FileCheck %s --check-prefix=FULL
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=4 smem-budget=150000" | FileCheck %s --check-prefix=TIGHT
+// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-budget=232448" | FileCheck %s --check-prefix=NS3
 
 // Cross-partition TMA output staging (separate epilogue-store partition) gets
 // at most two copies before the operand rings are buffered; it only grows
 // further, to a depth aligned with its subtile count, with the budget the
-// operand rings leave. Real planner input of persistent bf16 GEMMs.
+// operand rings leave, skipping depths above the subtile count that are not a
+// multiple of it. Real planner input of persistent bf16 GEMMs.
 
 // 128x128x128 CLC GEMM, num_stages=8, EPILOGUE_SUBTILE=2. Reserving staging
 // up to num_stages first gave staging 8 / A 1 / B 1 (every operand ring
@@ -14,6 +16,12 @@
 // CLC-DAG: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 0 : i32, buffer.tmaStaging = 1 : i32} : () -> !ttg.memdesc<128x64xbf16
 // CLC-DAG: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 2 : i32} : () -> !ttg.memdesc<128x128xbf16
 // CLC-DAG: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 3 : i32} : () -> !ttg.memdesc<128x128xbf16
+// At num_stages=3 the operand rings reach 3 and staging stays at 2: 3 copies
+// would be above its 2 subtiles without being a multiple of them.
+// NS3-LABEL: @clc_gemm_staging_reserve
+// NS3-DAG: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 0 : i32, buffer.tmaStaging = 1 : i32} : () -> !ttg.memdesc<128x64xbf16
+// NS3-DAG: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 2 : i32} : () -> !ttg.memdesc<128x128xbf16
+// NS3-DAG: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 3 : i32} : () -> !ttg.memdesc<128x128xbf16
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
@@ -123,8 +131,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // 128x128x64 GEMM, num_stages=4, EPILOGUE_SUBTILE=4. With room for both, the
 // operand rings reach num_stages and staging then grows to 4 (FULL). Under a
 // tight budget the operand rings keep num_stages and staging stays at its
-// reserve; 3 copies are skipped because they do not divide the 4 subtiles
-// (TIGHT).
+// reserve (TIGHT). At num_stages=3, 3 copies of its 4 subtiles are kept
+// (NS3).
 // FULL-LABEL: @gemm_staging_grows_after_operands
 // FULL-COUNT-4: ttg.local_alloc {buffer.copy = 4 : i32, buffer.id = 0 : i32, buffer.tmaStaging = 1 : i32}
 // FULL: ttg.local_alloc {buffer.copy = 4 : i32, buffer.id = 4 : i32} : () -> !ttg.memdesc<128x64xbf16
@@ -133,6 +141,10 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // TIGHT-COUNT-4: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 0 : i32, buffer.tmaStaging = 1 : i32}
 // TIGHT: ttg.local_alloc {buffer.copy = 4 : i32, buffer.id = 4 : i32} : () -> !ttg.memdesc<128x64xbf16
 // TIGHT: ttg.local_alloc {buffer.copy = 4 : i32, buffer.id = 5 : i32} : () -> !ttg.memdesc<128x64xbf16
+// NS3-LABEL: @gemm_staging_grows_after_operands
+// NS3-COUNT-4: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32, buffer.tmaStaging = 1 : i32}
+// NS3: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 4 : i32} : () -> !ttg.memdesc<128x64xbf16
+// NS3: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 5 : i32} : () -> !ttg.memdesc<128x64xbf16
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
 #linear1 = #ttg.linear<{register = [[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [0, 0, 16], [0, 0, 32], [0, 1, 0]], lane = [[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [16, 0, 0]], warp = [[32, 0, 0], [64, 0, 0]], block = []}>
