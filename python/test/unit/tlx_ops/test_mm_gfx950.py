@@ -551,6 +551,64 @@ def test_mm_bf16_odd_k_production_shape():
     _assert_range_result(actual, a @ b)
 
 
+@pytest.mark.parametrize("n,k,min_m", [(2560, 8192, 4096), (8192, 2048, 2048), (4096, 8192, 3072), (8192, 4096, 2048)])
+def test_mm_bf16_prefill_inter_wave_m_range(n, k, min_m):
+    for m in (min_m - 1, 32769):
+        assert _gfx950._dispatch_plan(m, n, k, torch.bfloat16, 2)[0] != "inter_wave"
+    for m in (min_m, 8354):
+        path, plan = _gfx950._dispatch_plan(m, n, k, torch.bfloat16, 2)
+        assert path == "inter_wave"
+        assert plan["SPLIT_K"] == 1
+        torch.manual_seed(m + n + k)
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+        b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).T
+        if _gfx950._bf16_k8192_prefill_wave_grid_plan(m, n) is None or k != 8192:
+            assert _gfx950._dispatch_for(a, b) == (path, plan)
+        _assert_range_result(tlx_ops.mm(a, b), a @ b)
+    m = min_m
+    a = torch.randn((m, k + 8), device="cuda", dtype=torch.bfloat16)[:, 8:]
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).T
+    assert a.data_ptr() % 16 == 0 and a.stride(0) == k + 8
+    _assert_range_result(tlx_ops.mm(a, b), a @ b)
+
+
+@pytest.mark.parametrize("m,n,tile", [
+    (8354, 2560, 6400),
+    (6401, 2560, 6400),
+    (8192, 2560, 6400),
+    (4096, 2560, (256, 160)),
+    (5120, 2560, None),
+    (9728, 2560, (192, 256)),
+    (8354, 4096, 8192),
+    (4097, 4096, 4096),
+    (9216, 4096, 8192),
+    (8192, 4096, None),
+    (4608, 4096, 4096),
+    (6144, 4096, 4096),
+    (7168, 4096, None),
+])
+def test_mm_bf16_k8192_prefill_wave_grid_selector(m, n, tile):
+    k = 8192
+    torch.manual_seed(m + n)
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).T
+    path, plan = _gfx950._dispatch_for(a, b)
+    if tile is None:
+        assert path == "inter_wave"
+    elif isinstance(tile, int):
+        assert path == "row_split"
+        assert plan[0] == tile
+    else:
+        assert path == "wave_grid"
+        assert (16 * plan["mi_wave_tile_m"] * plan["warps_m"], 16 * plan["mi_wave_tile_n"] * plan["warps_n"]) == tile
+    _assert_range_result(tlx_ops.mm(a, b), a @ b)
+    bias = torch.randn((n, ), device="cuda", dtype=torch.bfloat16)
+    _assert_range_result(tlx_ops.addmm(bias, a, b), torch.addmm(bias, a, b))
+    unaligned = torch.randn((m * k + 1, ), device="cuda", dtype=torch.bfloat16)[1:].view(m, k)
+    assert _gfx950._dispatch_for(unaligned, b)[0] == "inter_wave"
+    _assert_range_result(tlx_ops.mm(unaligned, b), unaligned @ b)
+
+
 def test_mm_split_k_production_plans_keep_fp32_workspace():
     tables = (
         _gfx950._wg_REGULAR_WAVE_GRID_SPECIALIZATIONS,
@@ -4387,6 +4445,19 @@ def test_mm_cached_b_rejects_i32_offset_overflow():
     b_strides = (2**26, 1)
     assert _gfx950._optimized_geometry_config(m, n, k, torch.bfloat16, 2, (k, 1), b_strides) is None
     assert _gfx950.heuristic_config(m, n, k, torch.bfloat16, 2, (k, 1), b_strides)[0] == "register"
+
+
+@pytest.mark.parametrize("m,n,k,dtype,b_strides,store_cache", [
+    (819200, 1024, 192, torch.bfloat16, (1, 192), ""),
+    (819200, 1024, 192, torch.float16, (1, 192), ""),
+    (2252800, 256, 256, torch.float16, (256, 1), ""),
+    (2252800, 256, 256, torch.float16, (1, 256), ""),
+    (524288, 512, 192, torch.bfloat16, (512, 1), ".cs"),
+])
+def test_mm_cached_b_store_cache(m, n, k, dtype, b_strides, store_cache):
+    path, plan = _gfx950._optimized_geometry_config(m, n, k, dtype, 2, (k, 1), b_strides)
+    assert path == "cached_b_lds"
+    assert plan.get("STORE_CACHE", ".cs") == store_cache
 
 
 @pytest.mark.parametrize("m,n,k", [

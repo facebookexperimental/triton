@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 from gpu_test_selection import PATH_FILTERS, bump_ref, changed_paths, passed_push_run, select_platforms
-from wheel_cache import BUCKET, LEASE_SECONDS, RETENTION_SECONDS, WheelCache
+from wheel_cache import BUCKET, LEASE_SECONDS, RETENTION_SECONDS, WheelCache, supplied_wheel
 
 ROOT = Path(__file__).resolve().parents[2]
 FILTERS = json.loads(PATH_FILTERS.read_text())
@@ -226,6 +226,310 @@ def test_cache_access_denied_does_not_bypass_lock(cache, monkeypatch):
     assert s3.objects == {}
 
 
+@pytest.mark.parametrize("state", ["missing", "building", "ready", "expired", "malformed", "denied"])
+def test_fork_lookup_reuses_only_ready_wheels_and_never_writes(cache, monkeypatch, state):
+    # Fork PRs have no credentials: lookup reuses a ready wheel, and anything else is a local build, not a lease.
+    producer, s3, now = cache
+    _, lease = producer.acquire("trusted")
+    if state == "missing":
+        s3.objects.clear()
+    elif state in ("ready", "expired"):
+        producer.publish(lease, upload(producer))
+        if state == "expired":
+            now[0] += RETENTION_SECONDS
+    elif state == "malformed":
+        s3.put_object(Bucket=BUCKET, Key=producer.key, Body=b'{"status": "ready"}')
+    elif state == "denied":
+        monkeypatch.setattr(s3, "get_object", lambda **kwargs: s3.fail("AccessDenied"))
+    before = dict(s3.objects)
+    monkeypatch.setattr(s3, "put_object", lambda **kwargs: pytest.fail("fork lookup wrote to the cache"))
+    reused = WheelCache(s3, producer.identity, clock=producer.clock, sleep=producer.sleep).lookup()
+    assert (reused is not None) == (state == "ready")
+    assert s3.objects == before
+
+
+def test_supplied_wheel_is_reused_only_for_the_exact_build():
+    # A consumer skips its own build only for a wheel of exactly the identity it would build, with a usable source.
+    identity = {"repository": "owner/repo", "sha": "a" * 40, "abi": "cp312", "platform": "Linux-X64", "recipe": "r"}
+    artifact = {"identity": identity, "url": "", "filename": "fbtriton.whl", "sha256": "b" * 64, "artifact": "run_1"}
+    s3_wheel = artifact | {"url": "https://example.org/fbtriton.whl", "artifact": ""}
+    for wheel in (artifact, s3_wheel):
+        assert supplied_wheel(json.dumps(wheel), identity) == wheel
+    for field in identity:
+        assert supplied_wheel(json.dumps(artifact), identity | {field: "other"}) is None
+    for damage in ({"filename": ""}, {"sha256": "b" * 63}, {"artifact": ""}, {"url": "http://example.org/w.whl"}):
+        assert supplied_wheel(json.dumps(artifact | damage), identity) is None
+    assert supplied_wheel("", identity) is None
+
+
+def followup_fixture():
+    from fast_followup import PRODUCER_WORKFLOW
+    repo, head, merge, base = "owner/triton", "1" * 40, "2" * 40, "3" * 40
+    identity = {"repository": repo, "sha": merge, "abi": "cp312", "platform": "Linux-X64", "recipe": "r"}
+    event = {
+        "workflow_run": {
+            "id": 7, "run_attempt": 2, "event": "pull_request", "conclusion": "success", "path": PRODUCER_WORKFLOW,
+            "repository": {"full_name": repo}, "head_sha": head, "head_branch": "feat", "head_repository":
+            {"full_name": "fork/triton", "owner": {"login": "fork"}}
+        }
+    }
+    manifest = {
+        "version": 1, "repository": repo, "run_id": 7, "run_attempt": 2, "pr_number": 5, "pr_head_sha": head,
+        "test_merge_sha": merge, "wheel":
+        {"identity": identity, "url": "", "filename": "fbtriton.whl", "sha256": "b" * 64, "artifact": "run_7"}
+    }
+    pr = {
+        "number": 5, "state": "open", "head": {"sha": head, "ref": "feat", "repo": {"full_name": "fork/triton"}},
+        "base": {"ref": "main", "repo": {"full_name": repo}}
+    }
+    return repo, event, manifest, pr, identity, (merge, base, head)
+
+
+def test_followup_accepts_only_the_exact_current_producer():
+    # A follow-up tests the source and wheel of exactly the successful Fast run and attempt that triggered it, while
+    # that attempt, the PR head and GitHub's test merge commit are still current, with the wheel's identity recomputed
+    # from the recipe at that merge commit. Realistic breaks: trusting the event or manifest without the live API
+    # (an old event after a re-run, or a fork-chosen merge commit), or checking the wheel against the default
+    # branch's recipe instead of the merge commit's.
+    import copy
+    from fast_followup import Rejected, verify
+    repo, event, manifest, pr, identity, (merge, base, head) = followup_fixture()
+
+    def check(event=event, manifest=manifest, pr=pr, parents=(merge, base, head), on_base=(base, ), recipe=identity,
+              live=None, current_merge=merge, logged_merge=merge):
+        live = {**event["workflow_run"], "status": "completed", **(live or {})}
+        job = {
+            "id":
+            11, "name":
+            "select", "run_attempt":
+            2, "conclusion":
+            "success", "steps": [{
+                "name": "Run actions/checkout@v6", "started_at": "2026-11-13T01:00:00Z", "completed_at":
+                "2026-11-13T01:00:02Z"
+            }]
+        }
+
+        def text(path):
+            assert path == f"repos/{repo}/actions/jobs/11/logs"
+            return ("2026-11-13T01:00:01Z [command]/usr/bin/git log -1 --format=%H\n"
+                    f"2026-11-13T01:00:01Z {logged_merge}\n")
+
+        def api(path):
+            if "/jobs?" in path:
+                return {"total_count": 1, "jobs": [job]}
+            if path == f"repos/{repo}/actions/runs/7":
+                return live
+            if path != f"repos/{repo}/pulls/5":  # another PR, e.g. one a fork's manifest names
+                return {**pr, "number": int(path.rsplit("/", 1)[1]), "head": {**pr["head"], "ref": "other"}}
+            return {**pr, "merge_commit_sha": current_merge}
+
+        def git(*args):
+            if args[0] == "rev-list":
+                return " ".join(parents)
+            if args[0] == "merge-base" and args[2] not in on_base:
+                raise subprocess.CalledProcessError(1, args)
+            return ""
+
+        return verify(event, manifest, repo, api, git, lambda sha: recipe if sha == merge else None, text)
+
+    result = check()
+    assert (result["status"], result["merge"], result["base"], result["fork"]) == ("ok", merge, base, True)
+    assert result["wheel"] == manifest["wheel"]
+
+    def changed(value, path, new):
+        value = copy.deepcopy(value)
+        *keys, last = path
+        target = value
+        for key in keys:
+            target = target[key]
+        target[last] = new
+        return value
+
+    rejected = [
+        {"manifest": changed(manifest, ["run_attempt"], 1)},
+        {"manifest": changed(manifest, ["run_id"], 8)},
+        {"manifest": changed(manifest, ["pr_number"], 6)},
+        {"manifest": changed(manifest, ["version"], 2)},
+        {"event": changed(event, ["workflow_run", "conclusion"], "failure")},
+        {"event": changed(event, ["workflow_run", "event"], "workflow_dispatch")},
+        {"event": changed(event, ["workflow_run", "path"], ".github/workflows/other.yml")},
+        {"event": changed(event, ["workflow_run", "repository", "full_name"], "other/triton")},
+        {"parents": (merge, base, "4" * 40)},
+        {"parents": (merge, base)},
+        {"on_base": ()},
+    ]
+    for case in rejected:
+        with pytest.raises(Rejected):
+            check(**case)
+    # These checks may finish after the PR is closed for landing; an unchanged closed PR is still its source.
+    assert check(pr=pr | {"state": "closed"})["status"] == "ok"
+    for case in (changed(pr, ["head", "repo", "full_name"], "other/triton"), changed(pr, ["head", "ref"], "other")):
+        with pytest.raises(Rejected):
+            check(pr=case)
+    assert check(pr=changed(pr, ["head", "sha"], "4" * 40))["status"] == "stale"
+    # Base-only movement must not suppress full tests of the completed Fast source.
+    assert check(live={"run_attempt": 3})["status"] == "stale"
+    for current_merge in ("5" * 40, None):
+        assert check(current_merge=current_merge)["merge"] == merge
+        with pytest.raises(Rejected, match="producer checkout"):
+            check(current_merge=current_merge, logged_merge="6" * 40)
+    for live in ({"conclusion": "failure"}, {"status":
+                                             "in_progress"}, {"head_sha":
+                                                              "4" * 40}, {"path": ".github/workflows/other.yml"}):
+        with pytest.raises(Rejected):
+            check(live=live)
+    other_recipe = check(recipe=identity | {"recipe": "default-branch recipe"})
+    assert other_recipe["status"] == "ok" and other_recipe["wheel"] is None and other_recipe["wheel_reason"]
+
+
+def test_untrusted_producer_archives_cannot_replace_trusted_files(tmp_path):
+    # A follow-up downloads artifacts that a fork's Fast run uploaded, in a job holding the repository's token. It may
+    # take only the one expected file from such an archive, at the path it chose; extra entries or paths must not land
+    # anywhere, least of all over the trusted scripts it runs next. Realistic break: going back to `unzip`/extractall.
+    import zipfile
+    from fast_followup import MANIFEST_FILE, Rejected, extract_member
+
+    trusted = tmp_path / "workspace/.github/scripts/fast_followup.py"
+    trusted.parent.mkdir(parents=True)
+    trusted.write_text("trusted")
+    dest = tmp_path / "temp/manifest" / MANIFEST_FILE
+
+    def archive(*members):
+        path = tmp_path / "artifact.zip"
+        with zipfile.ZipFile(path, "w") as zf:
+            for name in members:
+                zf.writestr(name, "fork content")
+        return path
+
+    assert extract_member(archive(MANIFEST_FILE), MANIFEST_FILE, dest).read_text() == "fork content"
+    dest.unlink()
+    for members in ((MANIFEST_FILE, "../workspace/.github/scripts/fast_followup.py"),
+                    ("../workspace/.github/scripts/fast_followup.py", ), (f"sub/{MANIFEST_FILE}", ), ()):
+        with pytest.raises(Rejected):
+            extract_member(archive(*members), MANIFEST_FILE, dest)
+        assert not dest.exists() and trusted.read_text() == "trusted"
+    with pytest.raises(Rejected):
+        extract_member(archive("../x.whl"), "../x.whl", dest)
+    followup = (ROOT / ".github/workflows/_fast-followup.yml").read_text()
+    assert "unzip" not in followup and "extractall" not in followup
+
+
+def test_fast_writes_its_manifest_with_the_standard_library_only(tmp_path):
+    # Fast correctness's result job installs no Python packages, so writing the manifest must not import boto3 or
+    # botocore. Realistic break: importing wheel_cache at the top of fast_followup.py.
+    import os
+    import sys
+    code = ("import sys; sys.modules.update(boto3=None, botocore=None); import fast_followup as f, os; "
+            "f.main()")
+    env = os.environ | {
+        "PYTHONPATH": str(ROOT / ".github/scripts"), "GITHUB_REPOSITORY": "o/r", "GITHUB_RUN_ID": "1",
+        "GITHUB_RUN_ATTEMPT": "1", "PR_NUMBER": "2", "PR_HEAD_SHA": "a" * 40, "GITHUB_SHA": "b" * 40, "WHEEL": "",
+        "GITHUB_OUTPUT": str(tmp_path / "output")
+    }
+    out = tmp_path / "m.json"
+    result = subprocess.run(
+        [sys.executable, "-c", code, "manifest", "--out", str(out)], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(out.read_text())["run_attempt"] == 1
+
+
+def test_followup_artifacts_are_pinned_to_the_producer_run():
+    # Follow-ups take the manifest and wheel artifacts of exactly the producer run and name, never a similar name or
+    # another run's. Realistic break: a prefix or latest-artifact match.
+    from fast_followup import find_artifact, manifest_name
+    name = manifest_name(1)
+    artifacts = [
+        {"id": 1, "name": manifest_name(10), "workflow_run": {"id": 7}},
+        {"id": 2, "name": name, "workflow_run": {"id": 8}},
+        {"id": 3, "name": name, "workflow_run": {"id": 7}, "expired": True},
+    ]
+    assert find_artifact(lambda path: {"artifacts": artifacts}, "o/r", 7, name) is None
+    found = artifacts + [{"id": 4, "name": name, "workflow_run": {"id": 7}}]
+    assert find_artifact(lambda path: {"artifacts": found}, "o/r", 7, name) == 4
+
+
+def test_followups_never_run_pr_code_with_write_or_oidc_tokens():
+    # workflow_run follow-ups get the repository's token and OIDC even for a fork's PR. So jobs that check out the
+    # PR's commit or install its wheel hold read-only tokens without persisted credentials, the PR head is never
+    # built, a fork's base build uses no credentials, and a cached base allocates no builder. Realistic break:
+    # restoring `id-token: write` on a GPU test job or the snapshot job, or building the head in a follow-up.
+    def workflow(name):
+        return yaml.load((ROOT / f".github/workflows/{name}.yml").read_text(), Loader=yaml.BaseLoader)
+
+    full, trace = workflow("gpu-tests"), workflow("tlx-codegen-trace")
+    read_only = ({}, {"contents": "read"}, {"contents": "read", "actions": "read"})
+    pr_code_jobs = [trace["jobs"]["snapshot"]]
+    for platform in FILTERS:
+        assert "id-token" not in full["jobs"][platform]["permissions"]
+        pr_code_jobs += [job for job in workflow(platform)["jobs"].values() if "steps" in job]
+    for job in pr_code_jobs:
+        assert job.get("permissions", {}) in read_only
+        for step in job["steps"]:
+            if str(step.get("uses", "")).startswith("actions/checkout"):
+                assert step["with"]["persist-credentials"] == "false"
+    run = {
+        "github.event_name": "workflow_run", "needs.resolve.result": "success", "needs.resolve.outputs.head": "a",
+        "needs.resolve.outputs.head_wheel": "{}"
+    }
+    assert not workflow_condition(trace["jobs"]["build-head"]["if"], run)
+    assert not workflow_condition(trace["jobs"]["build-head"]["if"], run | {"needs.resolve.outputs.head_wheel": ""})
+    assert trace["jobs"]["build-base"]["with"]["read_only_cache"] == "${{ needs.resolve.outputs.fork == 'true' }}"
+    assert not workflow_condition(trace["jobs"]["build-base"]["if"], run | {"needs.resolve.outputs.base_wheel": "{}"})
+    assert workflow_condition(trace["jobs"]["build-base"]["if"], run | {"needs.resolve.outputs.base_wheel": ""})
+
+
+def test_codegen_sides_install_their_own_wheel_when_head_has_no_url():
+    # Each side installs its own wheel: a head wheel without a URL (a fork PR's artifact) must not borrow the base
+    # wheel's S3 URL, whether the head wheel was supplied by Fast correctness or built by the trace.
+    import re
+    trace = yaml.load((ROOT / ".github/workflows/tlx-codegen-trace.yml").read_text(), Loader=yaml.BaseLoader)
+    action = yaml.load((ROOT / ".github/actions/install-prebuilt-triton/action.yml").read_text(),
+                       Loader=yaml.BaseLoader)
+    snapshot = trace["jobs"]["snapshot"]
+    install = next(s for s in snapshot["steps"] if s.get("name", "").startswith("Install prebuilt Triton"))
+    routes = {s["name"]: s["if"] for s in action["runs"]["steps"] if s["name"].startswith("Download")}
+
+    def evaluate(template, context):
+        # Just enough of the expression language for these values: names, ==, !=, &&, || and fromJSON(...).field.
+        def expression(match):
+            text = re.sub(r"fromJSON\(matrix\.wheel\)\.(\w+)",
+                          lambda m: repr(json.loads(context["matrix.wheel"])[m[1]]), match[1])
+            text = re.sub(r"\b(?:matrix|github|inputs|needs)\.[\w.-]+", lambda m: repr(context[m[0]]), text)
+            return str(eval(text.replace("&&", " and ").replace("||", " or "), {"__builtins__": {}}))
+
+        return re.sub(r"\$\{\{(.*?)\}\}", expression, template if "${{" in template else "${{ " + template + " }}")
+
+    fork_pr = {
+        "github.run_id": "1", "github.event_name": "pull_request", "github.repository": "owner/triton",
+        "github.event.pull_request.head.repo.full_name": "fork/triton"
+    }
+    base = {"url": "https://example.org/base.whl", "filename": "base.whl", "sha256": "b" * 64, "artifact": ""}
+    for head_artifact in ("run_1", "run_1_head"):  # Fast correctness's head wheel, or the trace's own build
+        head = {"url": "", "filename": "head.whl", "sha256": "a" * 64, "artifact": head_artifact}
+        supplied = head_artifact == "run_1"
+        context = fork_pr | {
+            "needs.resolve.outputs.head_wheel": json.dumps(head) if supplied else "",
+            "needs.resolve.outputs.base_wheel": ""
+        }
+        for side, wheel in (("head", {} if supplied else head), ("base", base)):
+            context[f"needs.build-{side}.outputs.wheel"] = json.dumps(wheel) if wheel else ""
+            for field in ("url", "filename", "sha256"):
+                context[f"needs.build-{side}.outputs.wheel_{field}"] = wheel.get(field, "")
+        entries = snapshot["strategy"]["matrix"]["include"]
+        assert [entry["side"] for entry in entries] == ["head", "base"]
+        for entry, expected in zip(entries, (head, base)):
+            side = {"matrix.side": entry["side"], "matrix.wheel": evaluate(entry.get("wheel", "''"), context)}
+            inputs = {key: evaluate(value, context | side) for key, value in install["with"].items()}
+            assert (inputs["wheel-filename"], inputs["wheel-sha256"]) == (expected["filename"], expected["sha256"])
+            action_context = context | {f"inputs.{key}": value for key, value in inputs.items()}
+            taken = [name for name, condition in routes.items() if evaluate(condition, action_context) == "True"]
+            if expected["url"]:
+                assert taken == ["Download prebuilt Triton wheel from S3"] and inputs["wheel-url"] == expected["url"]
+            else:
+                assert taken == ["Download prebuilt Triton wheel from GitHub artifacts"]
+                assert inputs["artifact-name"] == expected["artifact"]
+
+
 @pytest.mark.parametrize("build_repository", [None, "triton-lang/triton"])
 def test_cache_identity_uses_workflow_tooling_for_old_source_refs(tmp_path, monkeypatch, build_repository):
     import wheel_cache
@@ -317,31 +621,23 @@ def test_build_source_checkout_after_sparse_tooling(tmp_path, monkeypatch):
     assert (runner_temp / "wheel-ci/workflows/build.yml").read_text() == files[".github/workflows/build.yml"]
 
 
-@pytest.mark.parametrize("results,selected,success", [
-    ({"select": "success", "build": "skipped", "h100": "skipped"}, False, True),
-    ({"select": "success", "build": "failure", "h100": "skipped"}, True, False),
-    ({"select": "success", "build": "success", "h100": "failure"}, True, False),
-    ({"select": "success", "build": "success", "h100": "success"}, True, True),
-    ({"select": "failure", "build": "skipped", "h100": "skipped"}, False, False),
-])
-def test_aggregate_gate_rejects_failed_build_and_selected_tests(results, selected, success):
-    import os
-    import sys
-
-    parent = yaml.load((ROOT / ".github/workflows/gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
-    gate = parent["jobs"]["gpu-tests"]
-    assert gate["if"].startswith("always()")
-    script = gate["steps"][0]["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-    needs = {name: {"result": result} for name, result in results.items()}
-    needs["select"]["outputs"] = {
-        "build": str(selected).lower(), "h100": str(selected).lower(), "b200": "false", "mi350": "false", "cpu": "false"
-    }
-    needs["cpu-tests"] = {"result": "skipped"}
-    for platform in ("b200", "mi350"):
-        needs[platform] = {"result": "skipped"}
-    result = subprocess.run([sys.executable, "-c", script],
-                            env=os.environ | {"NEEDS": json.dumps(needs), "EVENT_NAME": "push"}, capture_output=True)
-    assert (result.returncode == 0) == success, result.stderr.decode()
+def test_final_check_covers_every_job():
+    # The GPU tests check stands for the whole run: a failed or cancelled job anywhere fails it, and skipped jobs
+    # (unselected or turned-off platforms) do not. Realistic breaks: adding a job without listing it in the final
+    # job's needs, or a fail condition that misses one result.
+    import itertools
+    full = yaml.load((ROOT / ".github/workflows/gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
+    final = full["jobs"]["gpu-tests"]
+    assert set(final["needs"]) == set(full["jobs"]) - {"gpu-tests"}
+    fail = next(step for step in final["steps"] if step.get("run") == "exit 1")
+    assert final["steps"].index(fail) == 0
+    owner = {"github.repository_owner": "facebookexperimental"}
+    for results in itertools.product(("success", "skipped", "failure", "cancelled"), repeat=len(final["needs"])):
+        context = owner | {f"needs.{job}.result": result for job, result in zip(final["needs"], results)}
+        assert workflow_condition(final["if"], context)
+        # A step condition sees its job's earlier steps, not the needs, so pass only the result list.
+        failed = workflow_condition(fail["if"], {"needs.*.result": results})
+        assert failed == any(result in ("failure", "cancelled") for result in results)
 
 
 def test_workflows_share_one_build_and_pin_all_checkouts():
@@ -354,7 +650,7 @@ def test_workflows_share_one_build_and_pin_all_checkouts():
     for platform in FILTERS:
         caller = parent["jobs"][platform]
         assert caller["needs"] == ["select", "build"]
-        assert caller["with"]["wheel_url"] == "${{ inputs.wheel_url || needs.build.outputs.wheel_url }}"
+        assert caller["with"]["wheel_url"] == "${{ needs.build.outputs.wheel_url }}"
         child = workflow(platform)
         assert set(child["on"]) == {"workflow_call"}
         assert "concurrency" not in child
@@ -391,7 +687,6 @@ def test_execution_dependencies_keep_full_suites_on_the_gpu(changed):
     from gpu_test_selection import SUITES, test_plan as plan_tests
     suites = json.loads(SUITES.read_text())
     plan = plan_tests(["lib/Analysis/Allocation.cpp", changed], ROOT, FILTERS, suites)
-    assert not plan["cpu"]
     assert plan["gpu"]["b200"]["gluon"]["files"] == ["python/test/gluon"]
     assert plan["gpu"]["mi350"]["gluon"]["files"] == ["python/test/gluon"]
     assert plan["gpu"]["b200"]["codegen"]["files"]
@@ -400,54 +695,9 @@ def test_execution_dependencies_keep_full_suites_on_the_gpu(changed):
 def test_fixture_only_changes_do_not_skip_tests():
     from gpu_test_selection import SUITES, test_plan as plan_tests
     plan = plan_tests(["python/test/conftest.py"], ROOT, FILTERS, json.loads(SUITES.read_text()))
-    assert not plan["cpu"]
     for platform in plan["gpu"].values():
         assert platform["core"]["files"] and platform["correctness"]["files"]
     assert plan["gpu"]["h100"]["runtime"]["files"]
-
-
-def test_cpu_consumers_still_require_the_wheel():
-    from gpu_test_selection import SUITES, test_plan as plan_tests
-    suites = json.loads(SUITES.read_text())
-    suites["reviewed_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    plan = plan_tests(["lib/Analysis/Allocation.cpp"], ROOT, FILTERS, suites)
-    assert plan["cpu"]["codegen"]["files"]
-    assert plan["build"]
-
-
-def test_new_gluon_tests_and_reenabled_files_keep_gpu_coverage(tmp_path):
-    from gpu_test_selection import SUITES, cpu_eligible
-    spec = json.loads(SUITES.read_text())["cpu"]["gluon"]
-    directory = tmp_path / "python/test/gluon"
-    directory.mkdir(parents=True)
-    for path in spec["files"]:
-        (tmp_path / path).write_text("")
-    for filename in spec["gluon_skip_files"]:
-        (directory / filename).write_text("")
-    original = (ROOT / "python/test/gluon/conftest.py").read_text()
-    fixture = directory / "conftest.py"
-    fixture.write_text(original)
-    assert cpu_eligible(["lib/Analysis/Allocation.cpp"], tmp_path, spec)
-    extra = directory / "new_test.py"
-    extra.write_text("")
-    assert not cpu_eligible(["lib/Analysis/Allocation.cpp"], tmp_path, spec)
-    extra.unlink()
-    fixture.write_text(original.replace("collect_ignore = sorted(_VERSION_SKEW_FILES)", "collect_ignore = []"))
-    assert not cpu_eligible(["lib/Analysis/Allocation.cpp"], tmp_path, spec)
-
-
-@pytest.mark.parametrize("result", ["failure", "cancelled", "skipped"])
-def test_cpu_failure_reaches_the_final_check(result):
-    import os
-    import sys
-    parent = yaml.load((ROOT / ".github/workflows/gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
-    script = parent["jobs"]["gpu-tests"]["steps"][0]["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-    needs = {name: {"result": "success"} for name in ("select", "build", "h100", "b200", "mi350")}
-    needs["cpu-tests"] = {"result": result}
-    needs["select"]["outputs"] = {name: "true" for name in ("build", "h100", "b200", "mi350", "cpu")}
-    proc = subprocess.run([sys.executable, "-c", script], env=os.environ | {"NEEDS": json.dumps(needs)},
-                          capture_output=True)
-    assert proc.returncode != 0
 
 
 def test_execution_preserves_the_selected_expression():
@@ -460,69 +710,16 @@ def test_execution_preserves_the_selected_expression():
         command({"files": [], "k": ""}, 1, "results.xml")
 
 
-def test_cpu_routing_cannot_hide_new_gpu_only_skips(tmp_path):
-    from run_selected_tests import check_cpu_skips
-    report = tmp_path / "results.xml"
-    report.write_text('<testsuite><testcase><skipped message="requires a CUDA GPU"/></testcase></testsuite>')
-    with pytest.raises(ValueError, match="Unexpected skip"):
-        check_cpu_skips({"allowed_skips": []}, report)
-    report.write_text('<testsuite><testcase><skipped message="known target limitation"/></testcase></testsuite>')
-    check_cpu_skips({"allowed_skips": ["known target limitation"]}, report)
-
-
-def test_cpu_dependency_changes_remain_invalid_after_commit(tmp_path):
-    from gpu_test_selection import reviewed_changes
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    helper = tmp_path / "helper.py"
-    helper.write_text("value = 1\n")
-    subprocess.run(["git", "add", "helper.py"], cwd=tmp_path, check=True)
-    commit = ["git", "-c", "user.name=CI", "-c", "user.email=ci@example.invalid", "commit", "-qm", "test"]
-    subprocess.run(commit, cwd=tmp_path, check=True)
-    reviewed = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=tmp_path, text=True).strip()
-    assert reviewed_changes(tmp_path, reviewed, ["helper.py"]) == []
-    helper.write_text("value = 2\n")
-    subprocess.run(["git", "add", "helper.py"], cwd=tmp_path, check=True)
-    subprocess.run(commit, cwd=tmp_path, check=True)
-    assert reviewed_changes(tmp_path, reviewed, ["helper.py"]) == ["helper.py"]
-
-
-def test_cpu_eligibility_rejects_an_overridden_ignore_policy(tmp_path):
-    from gpu_test_selection import SUITES, cpu_eligible
-    spec = json.loads(SUITES.read_text())["cpu"]["gluon"]
-    directory = tmp_path / "python/test/gluon"
-    directory.mkdir(parents=True)
-    for path in spec["files"]:
-        (tmp_path / path).write_text("")
-    for name in spec["gluon_skip_files"]:
-        (directory / name).write_text("")
-    source = (ROOT / "python/test/gluon/conftest.py").read_text()
-    (directory / "conftest.py").write_text(source + "\ncollect_ignore = []\n")
-    assert not cpu_eligible(["lib/Analysis/Allocation.cpp"], tmp_path, spec)
-
-
-@pytest.mark.parametrize("paths,offload,placement,gpu_jobs,reason", [
-    (["lib/Analysis/Allocation.cpp"], True, "CPU", 6, "match the CPU audit"),
-    (["python/triton/runtime/jit.py"], True, "GPU", 6, "current diff changes Python"),
-    (["README.md"], True, "Not selected", 0, "No work for this suite"),
-    (["lib/Analysis/Allocation.cpp"], False, "GPU", 6, "CPU offload is disabled"),
-])
-def test_run_summary_explains_actual_placement(paths, offload, placement, gpu_jobs, reason):
+@pytest.mark.parametrize("paths,gpu_jobs", [(["lib/Analysis/Allocation.cpp"], 6), (["README.md"], 0)])
+def test_run_summary_explains_actual_placement(paths, gpu_jobs):
     from gpu_test_selection import SUITES, selection_summary, test_plan as plan_tests
-    suites = json.loads(SUITES.read_text())
-    suites["reviewed_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    suites["cpu"]["gluon"]["dependencies"].append("lib/")
-    plan = plan_tests(paths, ROOT, FILTERS, suites, offload=offload)
-    summary = selection_summary(plan, suites, "tested-sha", "Selection note")
+    plan = plan_tests(paths, ROOT, FILTERS, json.loads(SUITES.read_text()))
+    summary = selection_summary(plan, "tested-sha", "Selection note")
     assert f"Planned GPU jobs: {gpu_jobs}." in summary
-    assert f"| codegen | {placement} |" in summary
-    assert reason in summary and "Selection note" in summary
+    assert "Selection note" in summary
     assert "Selected commit: `tested-sha`." in summary
     assert "Tested commit:" not in summary
     assert "not collected test cases" in summary
-    for name in suites["cpu"]["gluon"]["gluon_skip_files"]:
-        assert f"`{name}`" in summary
-    assert "does not introduce these exclusions" in summary
-    assert "not a new skip decision" in summary
 
 
 def test_unreadable_kernel_test_retains_full_coverage(tmp_path):
@@ -535,92 +732,84 @@ def test_unreadable_kernel_test_retains_full_coverage(tmp_path):
     assert plan["correctness_mode"] == "all"
 
 
-@pytest.mark.parametrize("policy", [None, "def broken(", "_VERSION_SKEW_FILES = unknown"])
-def test_unreadable_gluon_audit_only_blocks_gluon_cpu_placement(tmp_path, policy):
-    from gpu_test_selection import SUITES, cpu_ineligible_reason
-    suites = json.loads(SUITES.read_text())
-    spec = suites["cpu"]["gluon"]
-    directory = tmp_path / "python/test/gluon"
-    directory.mkdir(parents=True)
-    for path in spec["files"]:
-        (tmp_path / path).write_text("")
-    for name in spec["gluon_skip_files"]:
-        (directory / name).write_text("")
-    if policy is not None:
-        (directory / "conftest.py").write_text(policy)
-    assert cpu_ineligible_reason(["lib/Analysis/Allocation.cpp"], tmp_path, spec) is not None
-    assert cpu_ineligible_reason(["lib/Analysis/Allocation.cpp"], tmp_path, suites["cpu"]["codegen"]) is None
-
-
 def workflow_condition(expression, context):
     import re
     expression = expression.removeprefix('${{').removesuffix('}}').strip()
     has_status = 'cancelled()' in expression or 'always()' in expression
-    if not has_status and any(value != 'success' for key, value in context.items() if key.endswith('.result')):
+    if not has_status and any(
+            value != 'success' for key, value in context.items() if key.endswith('.result') and isinstance(value, str)):
         return False
     expression = expression.replace('!cancelled()', str(not context.get('cancelled', False)))
     expression = expression.replace('always()', 'True').replace('&&', ' and ').replace('||', ' or ')
-    expression = re.sub(r'(github\.event_name|(?:needs|steps)\.[\w-]+\.(?:result|outputs\.[\w]+))',
-                        lambda match: repr(context[match.group()]), expression)
+    expression = re.sub(r"contains\(needs\.\*\.result, '(\w+)'\)",
+                        lambda match: repr(match.group(1) in context['needs.*.result']), expression)
+    expression = re.sub(r"contains\(vars\.(\w+), '(\w+)'\)",
+                        lambda match: repr(match.group(2) in context.get('vars.' + match.group(1), '')), expression)
+    expression = re.sub(r'!(?!=)', ' not ', expression)
+    expression = re.sub(
+        r'(github\.(?:event_name|repository_owner|event\.[\w.]+)|(?:needs|steps)\.[\w-]+\.(?:result|outputs\.[\w]+))',
+        lambda match: repr(context[match.group()]), expression)
     return eval(expression, {'__builtins__': {}}, {})
 
 
-@pytest.mark.parametrize('gate', ['success', 'failure', 'cancelled', 'skipped'])
-def test_pr_full_allocation_requires_the_verified_fast_gate(gate):
-    fast = yaml.load((ROOT / '.github/workflows/fast-gpu-tests.yml').read_text(), Loader=yaml.BaseLoader)
+def test_build_runs_only_for_successful_selection():
     full = yaml.load((ROOT / '.github/workflows/gpu-tests.yml').read_text(), Loader=yaml.BaseLoader)
-    call = fast['jobs']['full']
-    assert call['uses'] == './.github/workflows/gpu-tests.yml'
-    assert fast['jobs']['result']['name'] == 'Fast correctness'
-    context = {'github.event_name': 'pull_request', 'needs.result.result': gate, 'needs.build.result': 'skipped'}
-    assert workflow_condition(call['if'], context) == (gate == 'success')
-    assert not workflow_condition(call['if'], context | {'cancelled': True})
-    assert not workflow_condition(call['if'], context | {'github.event_name': 'workflow_dispatch'})
-    assert 'pull_request' not in full['on'] and {'push', 'schedule', 'workflow_dispatch'} <= set(full['on'])
-    for key in ('commit', 'wheel_url', 'wheel_filename', 'wheel_sha256'):
-        assert call['with'][key] == '${{ needs.build.outputs.' + key + ' }}'
-    assert not workflow_condition(
-        full['jobs']['build']['if'],
-        {'github.event_name': 'pull_request', 'needs.select.outputs.build': 'true', 'needs.select.result': 'success'})
-    for platform in ('h100', 'b200', 'mi350', 'cpu'):
-        worker = full['jobs']['cpu-tests' if platform == 'cpu' else platform]
-        context = {
-            'github.event_name': 'pull_request', 'needs.select.result': 'success', 'needs.build.result': 'skipped',
-            f'needs.select.outputs.{platform}': 'true'
+    build = full['jobs']['build']
+    for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+        run = {'github.event_name': event, 'needs.select.result': 'success', 'needs.select.outputs.build': 'true'}
+        assert workflow_condition(build['if'], run)
+        assert not workflow_condition(build['if'], run | {'needs.select.outputs.build': 'false'})
+        assert not workflow_condition(build['if'], run | {'needs.select.result': 'failure'})
+
+
+def test_gpu_tests_run_on_the_change_and_feed_the_codegen_trace():
+    # GPU tests run on the PR itself, so every platform is a check on the PR. The codegen trace follows a
+    # successful run and only after verifying it. Realistic break: making GPU tests depend on another workflow again.
+    def workflow(name):
+        return yaml.load((ROOT / f'.github/workflows/{name}.yml').read_text(), Loader=yaml.BaseLoader)
+
+    full, trace, followup = (workflow(name) for name in ('gpu-tests', 'tlx-codegen-trace', '_fast-followup'))
+    assert set(full['on']) == {'pull_request', 'push', 'schedule', 'workflow_dispatch'}
+    assert full['on']['push']['branches'] == ['main']
+    assert trace['on']['workflow_run'] == {'workflows': [full['name']], 'types': ['completed']}
+    # The run the trace follows must publish the manifest the trace looks for, without adding a PR check.
+    manifest = [
+        job for job in full['jobs'].values()
+        if any('fast_followup.py manifest' in step.get('run', '') for step in job.get('steps', []))
+    ]
+    assert manifest == [full['jobs']['gpu-tests']]
+    produced = {'github.event.workflow_run.conclusion': 'success', 'github.event.workflow_run.event': 'pull_request'}
+    assert workflow_condition(followup['jobs']['verify']['if'], produced)
+    for change in ({'github.event.workflow_run.conclusion':
+                    'failure'}, {'github.event.workflow_run.event': 'workflow_dispatch'}):
+        assert not workflow_condition(followup['jobs']['verify']['if'], produced | change)
+    run = {'github.event_name': 'workflow_run', 'github.repository_owner': 'facebookexperimental'}
+    for status in ('ok', 'stale', 'none', ''):
+        context = run | {
+            'needs.followup.result': 'success' if status else 'skipped', 'needs.followup.outputs.status': status
         }
-        assert workflow_condition(worker['if'], context)
-        assert not workflow_condition(worker['if'], context | {'needs.select.result': 'failure'})
-        assert not workflow_condition(worker['if'], context | {'cancelled': True})
-        assert not workflow_condition(worker['if'], context | {f'needs.select.outputs.{platform}': 'false'})
+        assert workflow_condition(trace['jobs']['resolve']['if'], context) == (status == 'ok')
 
 
-@pytest.mark.parametrize('fork,url,valid', [(False, 'https://example.org/w.whl', True), (False, '', False),
-                                            (True, '', True)])
-def test_shared_full_wheel_validates_source_and_fork_artifact_identity(fork, url, valid):
-    import os
-    import sys
+@pytest.mark.parametrize('skip', ['', 'h100', 'b200', 'mi350', 'b200,mi350', 'h100, b200', 'h100,b200,mi350'])
+def test_platform_skip_variable_stops_only_named_platforms(skip):
+    # GPU_CI_SKIP_PLATFORMS stops the platforms it names and leaves every other selected platform running.
+    # Realistic breaks: one shared condition, or a name check that matches another platform.
     full = yaml.load((ROOT / '.github/workflows/gpu-tests.yml').read_text(), Loader=yaml.BaseLoader)
-    step = next(s for s in full['jobs']['select']['steps'] if s.get('name') == 'Validate shared wheel source')
-    source = step['run'].split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
-    env = os.environ | {
-        'COMMIT': 'a' * 40, 'EXPECTED': 'a' * 40, 'WHEEL_URL': url, 'WHEEL_FILENAME': 'fbtriton.whl', 'WHEEL_SHA256':
-        'b' * 64, 'IS_FORK_PR': str(fork).lower()
-    }
-
-    def run(extra):
-        return subprocess.run([sys.executable, '-c', source], env=env | extra, capture_output=True).returncode
-
-    assert (run({}) == 0) == valid
-    assert run({'COMMIT': 'c' * 40}) != 0
-    assert run({'WHEEL_SHA256': ''}) != 0
-    assert run({'WHEEL_FILENAME': ''}) != 0
-    assert not workflow_condition(step['if'],
-                                  {'github.event_name': 'pull_request', 'steps.select.outputs.build': 'false'})
+    named = {item.strip() for item in skip.split(',') if item.strip()}
+    for platform in ('h100', 'b200', 'mi350'):
+        context = {
+            'needs.select.result': 'success', 'needs.build.result': 'success', f'needs.select.outputs.{platform}':
+            'true', 'vars.GPU_CI_SKIP_PLATFORMS': skip
+        }
+        assert workflow_condition(full['jobs'][platform]['if'], context) == (platform not in named)
+        unselected = context | {f'needs.select.outputs.{platform}': 'false'}
+        assert not workflow_condition(full['jobs'][platform]['if'], unselected)
 
 
-def test_fast_automatic_runs_are_pr_only():
+def test_fast_runs_only_on_manual_dispatch():
     workflow = yaml.load((ROOT / ".github/workflows/fast-gpu-tests.yml").read_text(), Loader=yaml.BaseLoader)
-    assert set(workflow["on"]) == {"pull_request", "workflow_dispatch"}
+    assert set(workflow["on"]) == {"workflow_dispatch"}
 
 
 @pytest.mark.parametrize("paths,expected", [
@@ -949,3 +1138,116 @@ def test_fast_collection_cannot_silently_remove_a_touched_function(tmp_path, tes
     gaps = verify_manifests([manifest])
     assert gaps and gaps[0]["details"][0]["status"] == "missing"
     assert "test_touched" in gaps[0]["target"]
+
+
+@pytest.mark.parametrize("event_name,requested,expected", [
+    ("workflow_dispatch", "h100,mi350,cpu", ("h100", "mi350", "cpu")),
+    ("workflow_dispatch", " b200, b200 ", ("b200", )),
+    ("workflow_dispatch", "cpu", ("cpu", )),
+    ("workflow_dispatch", "", None),
+    ("pull_request", "h100", None),
+    ("push", "h100", None),
+    ("schedule", "h100", None),
+    ("workflow_run", "h100", None),
+])
+def test_platform_allowlist_is_manual_only(event_name, requested, expected):
+    from gpu_test_selection import manual_platforms
+    assert manual_platforms(event_name, {"inputs": {"platforms": requested}}) == expected
+    assert manual_platforms(event_name, {}) is None
+
+
+@pytest.mark.parametrize("requested", ["h100,unknown", "h100,", ",", "true"])
+def test_manual_platform_allowlist_rejects_invalid_names(requested):
+    from gpu_test_selection import manual_platforms
+    with pytest.raises(ValueError, match="comma-separated list"):
+        manual_platforms("workflow_dispatch", {"inputs": {"platforms": requested}})
+
+
+@pytest.mark.parametrize("script", ["fast_tests.py", "gpu_test_selection.py"])
+@pytest.mark.parametrize("requested", ["h100,mi350,cpu", "b200", "cpu"])
+def test_manual_platform_allowlist_preserves_requested_work(tmp_path, script, requested):
+    import os
+    import sys
+
+    outputs = []
+    for index, platforms in enumerate(("", requested)):
+        event, output, summary = (tmp_path / f"{name}-{index}" for name in ("event", "output", "summary"))
+        event.write_text(json.dumps({"inputs": {"platforms": platforms}}))
+        command = [sys.executable, str(ROOT / ".github/scripts" / script)]
+        if script == "fast_tests.py":
+            command.append("select")
+        subprocess.run(
+            command, cwd=ROOT, env=os.environ | {
+                "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(output),
+                "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_REPOSITORY": "facebookexperimental/triton"
+            }, check=True, capture_output=True, text=True)
+        outputs.append(dict(line.split("=", 1) for line in output.read_text().splitlines()))
+        assert 'this run does not cover B200' in summary.read_text()
+        if platforms:
+            assert f"Manual platform list: {platforms}" in summary.read_text()
+            assert "Other platforms are not covered" in summary.read_text()
+    normal, limited = outputs
+    assert normal['b200'] == limited['b200'] == 'false'
+    workers = ("h100", "b200", "mi350", "cpu") if script == "fast_tests.py" else ("h100", "b200", "mi350")
+    for platform in workers:
+        plan = json.loads(limited[f"{platform}_plan"])
+        if platform in requested.split(","):
+            assert limited[platform] == normal[platform]
+            assert plan == json.loads(normal[f"{platform}_plan"])
+        else:
+            assert limited[platform] == "false"
+            if script == "fast_tests.py":
+                assert not plan["baseline"] and not plan["touched"]
+            else:
+                assert all(not suite["files"] for suite in plan.values())
+    assert (limited["build"] == "true") == any(limited[platform] == "true" for platform in workers)
+
+
+def test_trigger_skips_only_paths_selection_skips_everywhere():
+    # A change that does not start the workflow can never be tested, so the trigger may skip only paths the selector
+    # skips on every platform. Realistic break: a trigger rule that skips a path some platform's rules re-include,
+    # such as a README inside a test action.
+    from gpu_test_selection import matches
+    full = yaml.load((ROOT / '.github/workflows/gpu-tests.yml').read_text(), Loader=yaml.SafeLoader)
+    trigger = full[True]['pull_request']['paths']
+    assert full[True]['push']['paths'] == trigger
+
+    def included(path, rules):
+        result = False
+        for rule in rules:
+            if matches(path, rule.removeprefix('!')):
+                result = not rule.startswith('!')
+        return result
+
+    def witnesses(rule):
+        pattern = rule.removeprefix('!')
+        concrete = pattern.replace('**/', 'd/').replace('**', 'd/e').replace('*', 'w')
+        directory = pattern.split('*')[0].rstrip('/')
+        found = {concrete}
+        for leaf in ('README.md', 'notes.md', 'x.py', 'x.mlir'):
+            found.add(f'{directory}/{leaf}' if directory else leaf)
+        return found
+
+    rules = trigger + [rule for patterns in FILTERS.values() for rule in patterns]
+    paths = {path for rule in rules for path in witnesses(rule)}
+    paths |= set(subprocess.check_output(['git', 'ls-files'], cwd=ROOT, text=True).splitlines())
+    skipped = sorted(path for path in paths if not included(path, trigger))
+    assert skipped, 'the trigger skips nothing'
+    for path in skipped:
+        assert not any(included(path, patterns) for patterns in FILTERS.values()), f'trigger skips selected {path}'
+
+
+@pytest.mark.parametrize("event,stops", [("pull_request", True), ("push", False), ("schedule", False),
+                                         ("workflow_dispatch", False)])
+def test_only_pull_requests_stop_at_the_first_failure(monkeypatch, event, stops):
+    # A PR reports its first failure sooner, while pushes and schedules must run every selected test so issue filing
+    # sees every failure. Realistic breaks: stopping every run early, or losing the stop on PRs.
+    import sys
+    import run_selected_tests
+    calls = []
+    monkeypatch.setattr(run_selected_tests.subprocess, "run", lambda argv, **kwargs: calls.append(argv))
+    monkeypatch.setattr(sys, "argv", ["run_selected_tests.py", "--workers", "8", "--junit", "r.xml"])
+    monkeypatch.setenv("TEST_SUITE", json.dumps({"files": ["python/test/unit/runtime/"], "k": ""}))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", event)
+    run_selected_tests.main()
+    assert ("--maxfail=1" in calls[0]) == stops

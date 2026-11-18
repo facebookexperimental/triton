@@ -37,9 +37,10 @@ def test_sanitizer_transient_artifact_failure_retries_with_cached_jobs(tmp_path)
     assert sum("/jobs" in call for call in api.calls) == 1
 
 
-def fake_api(runs_by_wf, jobs_by_id, remaining=5000, pulls=None):
+def fake_api(runs_by_wf, jobs_by_id, remaining=5000, pulls=None, action_runs=None):
     calls = []
     pulls = pulls or {}
+    action_runs = action_runs or {}
 
     def api(path):
         calls.append(path)
@@ -48,6 +49,10 @@ def fake_api(runs_by_wf, jobs_by_id, remaining=5000, pulls=None):
         if "/jobs" in path:
             rid = int(path.split("/runs/")[1].split("/")[0])
             return [{"jobs": jobs_by_id[rid]}]
+        if "/actions/runs/" in path and "/attempts/" in path:
+            rid = int(path.split("/runs/")[1].split("/")[0])
+            attempt = int(path.rsplit("/", 1)[1])
+            return [action_runs[(rid, attempt)]]
         if "/pulls" in path:
             return [pulls[path.split("/pulls", 1)[1]]]
         wf = path.split("/workflows/")[1].split("/")[0]
@@ -106,8 +111,8 @@ def no_get(path):
 
 
 def collect(tmp_path, runs, jobs=JOBS, since="2026-10-12T00:00:00Z", now=NOW, logs=None, pulls=None, remaining=5000,
-            get=no_get):
-    api, text = fake_api(runs, jobs, remaining, pulls), fake_text(logs or {})
+            get=no_get, action_runs=None):
+    api, text = fake_api(runs, jobs, remaining, pulls, action_runs), fake_text(logs or {})
     state = ch.collect(str(tmp_path), since, now, api=api, text=text, get=get)
     return state, api, text
 
@@ -280,7 +285,7 @@ def test_selector_output_remains_readable_by_dashboard(tmp_path):
     outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
     selected = ch.logs.parse_selection(proc.stdout)
     assert selected is not None, "Dashboard cannot parse the selector's real output"
-    for key in ("h100", "b200", "mi350", "build", "cpu"):
+    for key in ("h100", "b200", "mi350", "build"):
         assert selected[key] == (outputs[key] == "true")
     assert selected["fallback"] is False
 
@@ -296,6 +301,112 @@ def checkout_job(jid, name):
             "name": "Checkout", "conclusion": "success", "started_at": "2026-10-12T01:01:00Z", "completed_at":
             "2026-10-12T01:02:00Z"
         }])
+
+
+def followup_log(**changes):
+    source = {
+        "status": "ok", "merge": "2" * 40, "base": "3" * 40, "pr": 4855, "pr_head": "1" * 40, "base_ref": "main",
+        "head_ref": "feature", "head_repo": "alice/triton", "fork": True, "producer_run_id": 7, "producer_attempt": 2,
+        "wheel_reason": ""
+    } | changes
+    return "\n".join(f"2026-10-12T01:01:30Z {line}" for line in json.dumps(source, indent=2).splitlines())
+
+
+def followup_pr(head_repo="alice/triton", head_ref="feature", base_repo=ch.REPO, base_ref="main"):
+    return {
+        "number": 4855, "user": {"login":
+                                 "carol"}, "head": {"sha": "9" * 40, "ref": head_ref, "repo": {"full_name": head_repo}},
+        "base": {"ref": base_ref, "repo": {"full_name": base_repo}}
+    }
+
+
+def followup_pulls(pr=None):
+    return {
+        "/4855": pr or followup_pr(),
+        "?head=alice:feature&state=all": [{"number": 4855}, {"number": 4999}],
+    }
+
+
+def followup_collection_fixture(selected_sha="2" * 40, producer_head="1" * 40):
+    producer = gh_run(7, "2026-10-12T00:30:00Z", event="pull_request", run_attempt=2, head_sha=producer_head,
+                      head_branch="feature", pull_requests=[], path=".github/workflows/fast-gpu-tests.yml",
+                      repository={"full_name":
+                                  ch.REPO}, head_repository={"full_name": "alice/triton", "owner": {"login": "alice"}})
+    full = gh_run(8, "2026-10-12T01:00:00Z", event="workflow_run", head_sha="d" * 40, head_branch="main",
+                  title=f"GPU tests for Fast run 999 attempt 9 (PR head {'9' * 40})")
+    verify = gh_job(
+        80, "followup / verify", steps=[{
+            "name": "Verify the producer", "conclusion": "success", "started_at": "2026-10-12T01:01:00Z",
+            "completed_at": "2026-10-12T01:02:00Z"
+        }])
+    verify["labels"] = ["ubuntu-latest"]
+    select = checkout_job(81, "select")
+    select["steps"][0]["name"] = "Checkout the PR's test merge commit"
+    worker = gh_job(82, "b200 / b200-tlx-test")
+    aggregate = gh_job(83, "GPU tests")
+    aggregate["labels"] = ["ubuntu-latest"]
+    return full, producer, [verify, select, worker, aggregate], {80: followup_log(), 81: source_log(selected_sha)}
+
+
+def test_collect_correlates_independent_full_run_from_verified_producer_and_selected_merge(tmp_path):
+    full, producer, jobs, log = followup_collection_fixture()
+    _, api, text = collect(tmp_path, {"gpu-tests.yml": [full]}, {8: jobs}, logs=log, pulls=followup_pulls(),
+                           action_runs={(7, 2): producer})
+    stored = ch.load_runs(str(tmp_path))[8]
+    assert stored["event"] == "workflow_run" and stored["head_sha"] == "d" * 40
+    assert (stored["followup_producer_run_id"], stored["followup_producer_attempt"]) == (7, 2)
+    assert (stored["pr"], stored["author"], stored["pr_head_sha"], stored["pr_branch"]) == (4855, "carol", "1" * 40,
+                                                                                            "feature")
+    assert stored["tested_sha"] == stored["followup_merge"] == "2" * 40
+    assert [item["source"] for item in stored["tested_sha_provenance"]
+            ] == ["API-verified Fast producer and test merge", "selected test merge checkout log"]
+    assert any("/actions/runs/7/attempts/2" in call for call in api.calls)
+    assert any("/pulls/4855" in call for call in api.calls) and not any("/pulls?head=" in call for call in api.calls)
+    assert text.calls.count("repos/facebookexperimental/triton/actions/jobs/80/logs") == 1
+
+
+@pytest.mark.parametrize("producer_head,selected_sha", [("4" * 40, "2" * 40), ("1" * 40, "4" * 40)])
+def test_collect_does_not_verify_a_wrong_producer_or_selected_merge(tmp_path, producer_head, selected_sha):
+    full, producer, jobs, log = followup_collection_fixture(selected_sha, producer_head)
+    collect(tmp_path, {"gpu-tests.yml": [full]}, {8: jobs}, logs=log, pulls=followup_pulls(), action_runs={(7, 2):
+                                                                                                           producer})
+    stored = ch.load_runs(str(tmp_path))[8]
+    assert stored["tested_sha"] is None
+    if producer_head != "1" * 40:
+        assert stored.get("followup_status") is None and stored.get("pr") is None
+    else:
+        assert stored["followup_status"] == "ok" and {item["sha"]
+                                                      for item in stored["tested_sha_provenance"]
+                                                      } == {"2" * 40, "4" * 40}
+
+
+@pytest.mark.parametrize("pr", [followup_pr(head_repo="other/triton"), followup_pr(head_ref="reused-feature")])
+def test_collect_rejects_exact_pr_with_wrong_verified_repository_or_ref(tmp_path, pr):
+    full, producer, jobs, log = followup_collection_fixture()
+    collect(tmp_path, {"gpu-tests.yml": [full]}, {8: jobs}, logs=log, pulls=followup_pulls(pr), action_runs={(7, 2):
+                                                                                                             producer})
+    stored = ch.load_runs(str(tmp_path))[8]
+    assert stored.get("followup_status") is None and stored.get("pr") is None and stored["tested_sha"] is None
+
+
+@pytest.mark.parametrize("workflow,event", [
+    ("gpu-tests.yml", "push"),
+    ("gpu-tests.yml", "pull_request"),
+    ("gpu-tests.yml", "schedule"),
+    ("gpu-tests-nightly.yml", "schedule"),
+    ("nightly-tlx-ops-bench.yml", "workflow_run"),
+    ("fast-gpu-tests.yml", "workflow_dispatch"),
+])
+def test_collect_completed_gpu_jobs_before_the_workflow_finishes(tmp_path, workflow, event):
+    raw = gh_run(1, "2026-10-12T01:00:00Z", status="in_progress", conclusion=None, event=event, head_branch="main")
+    finished = gh_job(10, "h100 / h100-tlx-test") | {"status": "completed"}
+    waiting = gh_job(11, "b200 / b200-tlx-test",
+                     conclusion=None) | {"status": "queued", "started_at": None, "completed_at": None, "steps": []}
+    collect(tmp_path, {workflow: [raw]}, {1: [finished, waiting]})
+    stored = ch.load_runs(str(tmp_path))[1]
+    assert stored["status"] == "in_progress"
+    assert stored["jobs"][0]["conclusion"] == "success"
+    assert [job["status"] for job in stored["jobs"]] == ["completed", "queued"]
 
 
 def test_collect_hydrates_running_fast_parent_and_preserves_source_evidence(tmp_path):
@@ -441,7 +552,7 @@ def test_collect_stores_completed_runs_with_jobs_and_keeps_cursor_at_running(tmp
         "gpu-tests.yml": [gh_run(1, "2026-10-12T01:00:00Z"),
                           gh_run(2, "2026-10-12T02:00:00Z", "in_progress", None)]
     }
-    state, _, _ = collect(tmp_path, runs)
+    state, _, _ = collect(tmp_path, runs, {**JOBS, 2: []})
     stored = ch.load_runs(str(tmp_path))
     job = stored[1]["jobs"][0]
     assert job["steps"] == [{
@@ -449,7 +560,7 @@ def test_collect_stores_completed_runs_with_jobs_and_keeps_cursor_at_running(tmp
         "2026-10-12T01:04:00Z"
     }]
     assert job["created_at"] == "2026-10-12T00:59:00Z" and "runner_name" not in job
-    assert stored[2]["jobs"] is None and state["cursor"] == "2026-10-12T02:00:00Z"
+    assert stored[2]["jobs"] == [] and state["cursor"] == "2026-10-12T02:00:00Z"
     assert json.loads((tmp_path / "state.json").read_text())["collected_at"] == NOW
     assert (tmp_path / "changed.txt").read_text().split() == [str(tmp_path / "runs-2026-10.jsonl.gz")]
 

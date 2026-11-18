@@ -134,7 +134,7 @@ def _run_amd_fa_cluster_regression_isolated(test_name):
     env[_AMD_FA_CLUSTER_REGRESSION_WORKER] = test_name
     env["DISABLE_LLVM_OPT"] = "disable-machine-sink"
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-s", "--tb=short", f"{__file__}::{test_name}"],
+        [sys.executable, "-m", "pytest", "--import-mode=importlib", "-s", "--tb=short", f"{__file__}::{test_name}"],
         check=False,
         capture_output=True,
         env=env,

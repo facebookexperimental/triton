@@ -377,7 +377,7 @@ std::pair<SmallVector<Value>, SmallVector<Value>> lowerTMemLdSt(
 
   Value warpId = WarpIdOp::create(rewriter, loc);
   // Keep this warp-base calculation synchronized with
-  // getTMemLdStWarpAddresses.
+  // getTMemLdStThreadAddresses.
   // Map warpId to rows 32 and 64.
   auto warpIdInGroup = b.and_(warpId, b.i32_val(3));
   tmemBase = b.add(tmemBase, b.shl(warpIdInGroup, b.i32_val(5 + 16)));
@@ -586,7 +586,6 @@ struct TensorMemoryLoadOpConversion
 
     Value resultStruct = packUniqueTensorElements(
         loc, getTypeConverter(), resultVals, rewriter, op.getType());
-    // TMEM waits are inserted at the TTGIR level for memory ordering.
 
     // tcgen05.ld.red honors true register dependencies without a wait.
     if (redOp)

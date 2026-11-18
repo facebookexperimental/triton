@@ -19,6 +19,7 @@ from torch._inductor.scheduler import BaseSchedulerNode, Scheduler, WhyNoFuse
 from torch._inductor.select_algorithm import ExternKernelChoice
 from torch.utils._ordered_set import OrderedSet
 
+from . import mm_templates as _mm_templates  # noqa: F401
 from . import tlx_config
 
 if TYPE_CHECKING:
@@ -39,6 +40,20 @@ _TLX_WS_GEMM_TEMPLATE_NAMES = frozenset({
     "tlx_blackwell_gemm_ws",
     "tlx_hopper_gemm_ws",
 })
+
+_TLX_NO_EPILOGUE_FUSION_TEMPLATE_NAMES = frozenset(
+    template.name
+    for template in vars(_mm_templates).values()
+    if getattr(template, "tlx_manual_output", False)
+)
+
+
+def _template_name_from_choice(choice: object) -> str:
+    name = getattr(choice, "name", "")
+    base, separator, suffix = name.rpartition("_")
+    if separator and suffix.isdecimal() and base.startswith("triton_"):
+        return base.removeprefix("triton_")
+    return name
 
 
 def _has_tlx_ws_gemm_candidate(
@@ -63,6 +78,32 @@ def _has_tlx_ws_gemm_candidate(
         if template_node is None:
             continue
         if _is_tlx_ws_gemm_template(template_node):
+            return True
+    return False
+
+
+def _has_tlx_no_epilogue_fusion_candidate(
+    node1: BaseSchedulerNode,
+    node2: BaseSchedulerNode,
+) -> bool:
+    from torch._inductor import ir
+
+    for snode in (*node1.get_nodes(), *node2.get_nodes()):
+        if not snode.is_template():
+            continue
+        template_node = snode.get_template_node()
+        if template_node is None:
+            continue
+        if isinstance(template_node, ir.MultiTemplateBuffer):
+            if any(
+                _template_name_from_choice(choice)
+                in _TLX_NO_EPILOGUE_FUSION_TEMPLATE_NAMES
+                for choice in template_node.choices
+            ):
+                return True
+        ktc = getattr(template_node, "annotations", {}).get("ktc")
+        template = getattr(ktc, "template", None)
+        if getattr(template, "name", None) in _TLX_NO_EPILOGUE_FUSION_TEMPLATE_NAMES:
             return True
     return False
 
@@ -125,9 +166,10 @@ class TLXInductorChoices(InductorChoices):
         buffer saved for backward). Otherwise the GEMM output stays
         materialized and the pointwise work runs separately.
 
-        Only node1 (producer side) writes are examined: node2's final outputs
-        become the fused kernel's TMA store target and are correctly
-        materialized even when they are graph outputs.
+        node2 may keep at most one live write: it becomes the single TMA store
+        target and is materialized even when it is a graph output. A second
+        live write (e.g. a GELU-backward epilogue that also recomputes gelu(x)
+        for a wgrad) would be dropped.
 
         This hook is graph-level, not per-candidate: a proposed group
         containing an affected TLX GEMM candidate is conservatively rejected
@@ -143,6 +185,8 @@ class TLXInductorChoices(InductorChoices):
             return False
         if config.triton.tlx_mode is None:
             return True
+        if _has_tlx_no_epilogue_fusion_candidate(node1, node2):
+            return False
         if not _has_tlx_ws_gemm_candidate(node1, node2):
             return True
         from torch._inductor.dependencies import Dep
@@ -150,24 +194,35 @@ class TLXInductorChoices(InductorChoices):
         fused_node_names = OrderedSet(
             node.get_name() for node in (*node1.get_nodes(), *node2.get_nodes())
         )
-        for dep in node1.read_writes.writes:
-            if not isinstance(dep, Dep):
-                continue
-            write_name = scheduler.mutation_renames.get(dep.name, dep.name)
-            if write_name not in scheduler.name_to_buf:
-                WhyNoFuse(node1, node2)(
-                    "TLX WS GEMM epilogue would drop unknown buffer %s",
-                    write_name,
-                )
-                return False
-            if not scheduler.can_buffer_be_removed_through_fusion(
-                write_name, fused_node_names
-            ):
-                WhyNoFuse(node1, node2)(
-                    "TLX WS GEMM epilogue would drop live intermediate %s",
-                    write_name,
-                )
-                return False
+        live = {}
+        for node in (node1, node2):
+            live[node] = []
+            for dep in node.read_writes.writes:
+                if not isinstance(dep, Dep):
+                    continue
+                write_name = scheduler.mutation_renames.get(dep.name, dep.name)
+                if write_name not in scheduler.name_to_buf:
+                    WhyNoFuse(node1, node2)(
+                        "TLX WS GEMM epilogue would drop unknown buffer %s",
+                        write_name,
+                    )
+                    return False
+                if not scheduler.can_buffer_be_removed_through_fusion(
+                    write_name, fused_node_names
+                ):
+                    live[node].append(write_name)
+        if live[node1]:
+            WhyNoFuse(node1, node2)(
+                "TLX WS GEMM epilogue would drop live intermediate %s",
+                live[node1][0],
+            )
+            return False
+        if len(live[node2]) > 1:
+            WhyNoFuse(node1, node2)(
+                "TLX WS GEMM epilogue stores one output, not %s",
+                live[node2],
+            )
+            return False
         return True
 
     def _finalize_template_configs(

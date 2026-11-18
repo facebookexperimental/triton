@@ -89,19 +89,11 @@ def test_ordered_parent_exposes_fast_pass_before_full_and_retains_failure():
     parent = {**fast, 'status': 'in_progress', 'conclusion': None, 'updated_at': stamp(8)}
     pending = [{**j, 'name': 'full / ' + j['name'], 'conclusion': None, 'completed_at': None} for j in full['jobs'][1:]]
     parent['jobs'] = fast['jobs'] + pending
-    assert r.fast_result(parent) == 'passed'
     projected = list(r.comparison_runs([parent]))
     assert projected[0]['updated_at'] == stamp(2)
-    view = r.fast_full_view([parent], stamp(9))
-    assert view['counts']['pending'] == 1 and view['fast_attempts'] == view['full_attempts'] == 1
-    assert view['comparable'] == 0
     failed = fail_comparison(full)
     parent.update(status='completed', conclusion='failure', updated_at=stamp(10))
     parent['jobs'] = fast['jobs'] + [{**j, 'name': 'full / ' + j['name']} for j in failed['jobs'][1:]]
-    assert r.fast_result(parent) == 'passed'
-    view = r.fast_full_view([parent], stamp(11))
-    assert view['counts']['test'] == view['comparable'] == 1 and view['rate'] == 1
-    assert view['records'][0]['gaps'][0]['fast']['id'] == view['records'][0]['gaps'][0]['full']['id'] == 1
     assert r.pr_view([parent], stamp(11), r.main_view([], stamp(11)))[0]['result'] == 'test'
     failed_snapshot = {**parent}
     retry_full = comparison_run(1)
@@ -110,15 +102,6 @@ def test_ordered_parent_exposes_fast_pass_before_full_and_retains_failure():
     parent['jobs'] = fast['jobs'] + [{**j, 'name': 'full / ' + j['name']} for j in retry_full['jobs'][1:]]
     parent['conclusion'] = 'success'
     assert r.pr_view([parent], stamp(11), r.main_view([], stamp(11)))[0]['result'] == 'passed'
-    assert r.fast_full_view([parent], stamp(11))['counts']['test'] == 1
-
-
-def test_ordered_cancellation_preserves_only_completed_fast_signal():
-    fast = comparison_run(1, r.FAST_WF)
-    cancelled = {**fast, 'status': 'completed', 'conclusion': 'cancelled', 'jobs': fast['jobs'][:-1]}
-    assert r.fast_result(cancelled) == 'cancelled'
-    cancelled['jobs'] = fast['jobs']
-    assert r.fast_result(cancelled) == 'passed'
 
 
 def test_partial_physical_jobs_do_not_report_known_idle_time():
@@ -141,103 +124,34 @@ def test_ordered_resources_count_physical_jobs_once_and_exclude_cpu():
     assert r.job_key('full / mi350 / mi350-tlx-test') == 'mi350-tlx-test'
     views = list(r.comparison_runs([parent]))
     assert len(views) == 2 and all(v['id'] == parent['id'] for v in views)
-    assert r.fast_full_view([parent, parent], stamp(11))['comparable'] == 1
 
 
-def test_fast_full_pairs_only_the_same_pr_and_actual_checkout():
+def independent_full(fast, h=2, tested_sha=None, **changes):
+    full = comparison_run(h, tested_sha=tested_sha or fast["tested_sha"], pr=fast["pr"])
+    full.update({
+        "event": "workflow_run", "head_sha": "de" *
+        20, "branch": "main", "pr_head_sha": fast["head_sha"], "pr_branch": "feature", "followup_status": "ok",
+        "followup_producer_run_id": fast["id"], "followup_producer_attempt": fast.get("run_attempt", 1), "base": "main"
+    } | changes)
+    return full
+
+
+def test_independent_full_run_keeps_event_and_reaches_pr_views_and_accounting():
     fast = comparison_run(1, r.FAST_WF)
-    full = fail_comparison(comparison_run(2))
-    v = r.fast_full_view([fast, full], stamp(23))
-    assert v["counts"]["test"] == v["comparable"] == v["candidate_prs"] == 1
-    assert v["rate"] == 1
-    row = v["records"][0]
-    assert row["sha"] == "ab" * 20 and row["gaps"][0]["failures"][0]["platform"] == "MI350"
-    assert row["gaps"][0]["failures"][0]["id"].endswith("[False]")
-    assert row["gaps"][0]["fast"]["url"] == "u1/attempts/1"
-    assert row["gaps"][0]["full"]["url"] == "u2/attempts/1"
-    other_pr = {**full, "pr": 4856, "head_sha": fast["head_sha"]}
-    assert r.fast_full_view([fast, other_pr], stamp(23))["comparable"] == 0
+    full = independent_full(fast)
+    pr = r.pr_view([full], stamp(23), r.main_view([], stamp(23)))[0]
+    assert full["event"] == "workflow_run" and pr["result"] == "passed" and pr["branch"] == "feature"
+    assert r.trigger_event(full) == "pull_request" and r.gpu_minutes(full) == 10
+    ops = r.ops_view([full], stamp(23))
+    assert ops["per_run"][-1]["PR"]["n"] == 1
+    assert r.usage_view([full], stamp(23))["triggers"][-1]["MI350"]["PR"] == 0.17
 
 
-@pytest.mark.parametrize("sha,expected", [(None, "unverified_version"), ("cd" * 20, "missing_pair")])
-def test_fast_full_head_match_does_not_verify_checkout(sha, expected):
-    fast = comparison_run(1, r.FAST_WF, tested_sha=sha)
-    full = fail_comparison(comparison_run(2, tested_sha=None if sha is None else "ab" * 20))
-    fast["head_sha"] = full["head_sha"] = "ef" * 20
-    v = r.fast_full_view([fast, full], stamp(23))
-    assert v["comparable"] == v["counts"]["test"] == 0 and v["rate"] is None
-    assert v["counts"][expected] > 0
-
-
-@pytest.mark.parametrize("state", ["pending", "cancelled", "build", "setup", "unknown", "error"])
-def test_fast_full_non_test_outcomes_are_not_candidates(state):
-    fast, full = comparison_run(1, r.FAST_WF), comparison_run(2)
-    if state == "pending":
-        full.update(status="in_progress", conclusion=None, jobs=None)
-    elif state == "cancelled":
-        full["conclusion"] = "cancelled"
-    elif state == "build":
-        full["jobs"][0]["conclusion"] = "failure"
-        full["jobs"][0]["steps"][0]["conclusion"] = "failure"
-        full["conclusion"] = full["jobs"][-1]["conclusion"] = "failure"
-    elif state == "setup":
-        full["jobs"][1] = job("mi350 / mi350-tlx-test", step("Install prebuilt Triton", "failure"),
-                              step(CORE, "skipped"))
-        full["conclusion"] = full["jobs"][-1]["conclusion"] = "failure"
-    else:
-        fail_comparison(full, "error")
-        if state == "unknown":
-            full["jobs"][1]["steps"][0].pop("test_failures")
-    v = r.fast_full_view([fast, full], stamp(23))
-    assert v["counts"]["test"] == 0 and not v["records"][0]["gaps"]
-    assert v["counts"]["execution_error" if state == "error" else state] == 1
-    assert v["comparable"] == 0 and v["rate"] is None
-
-
-def test_fast_full_denominator_requires_full_test_verdict():
-    fast, full = comparison_run(1, r.FAST_WF), fail_comparison(comparison_run(2))
-    other_fast, setup = comparison_run(3, r.FAST_WF, tested_sha="cd" * 20), comparison_run(4, tested_sha="cd" * 20)
-    setup["jobs"][1] = job("mi350 / mi350-tlx-test", step("Install prebuilt Triton", "failure"))
-    setup["conclusion"] = setup["jobs"][-1]["conclusion"] = "failure"
-    v = r.fast_full_view([fast, full, other_fast, setup], stamp(23))
-    assert v["counts"]["test"] == v["counts"]["setup"] == 1
-    assert v["comparable"] == 1 and v["rate"] == 1
-
-
-def test_fast_full_skipped_fast_work_is_not_a_validated_pass():
-    fast = comparison_run(1, r.FAST_WF)
-    fast["jobs"][1]["conclusion"] = fast["jobs"][1]["steps"][0]["conclusion"] = "skipped"
-    v = r.fast_full_view([fast, fail_comparison(comparison_run(2))], stamp(23))
-    assert v["counts"]["not_required"] == 1 and v["counts"]["test"] == v["comparable"] == 0
-
-
-def test_fast_full_retains_historical_gap_and_latest_retry_resolution():
-    fast, failed = comparison_run(1, r.FAST_WF), fail_comparison(comparison_run(2))
-    retry = comparison_run(2)
-    retry.update(run_attempt=2, updated_at=stamp(20), attempts=[failed])
-    v = r.fast_full_view([fast, retry, retry], stamp(23))
-    assert v["counts"]["test"] == v["comparable"] == v["candidate_prs"] == 1
-    assert v["full_attempts"] == 2 and v["fast_attempts"] == 1 and len(v["records"]) == 1
-    row = v["records"][0]
-    assert row["latest"] == "passed" and row["gaps"][0]["full"]["attempt"] == 1 and row["full"]["attempt"] == 2
-    next_fast, next_full = comparison_run(5, r.FAST_WF, tested_sha="cd" * 20), comparison_run(6, tested_sha="cd" * 20)
-    v = r.fast_full_view([fast, retry, next_fast, next_full], stamp(23))
-    assert v["counts"]["test"] == v["counts"]["passed"] == v["candidate_prs"] == 1
-    assert v["comparable"] == 2 and v["rate"] == 0.5
-    historical = next(row for row in v["records"] if row["gaps"])
-    assert historical["latest_pr_result"] == "passed" and historical["latest_pr_full"]["id"] == next_full["id"]
-
-
-def test_fast_full_window_and_full_only_health_remain_distinct():
+def test_page_data_keeps_main_and_pr_views():
     fast, full = comparison_run(1, r.FAST_WF), fail_comparison(comparison_run(2))
     v = r.page_data([fast, full], stamp(23), {})["branches"]["main"]
-    assert v["fast_full"]["counts"]["test"] == 1
     assert v["main"] == r.main_view([full], stamp(23))
     assert v["pr"] == r.pr_view([full], stamp(23), v["main"])
-    v = r.fast_full_view([fast, full], "2026-10-20T00:00:00Z")
-    assert v["counts"]["test"] == 0 and len(v["records"]) == 1
-    assert sum(d["counts"]["test"] for d in v["trend"]) == 1
-    assert r.fast_full_view([fast, full], "2026-11-20T00:00:00Z")["records"] == []
 
 
 def test_mi350_core_step_keeps_its_name_before_the_rename():
@@ -458,6 +372,39 @@ def test_bench_card_shows_the_latest_run_per_gpu():
     assert (v["B200"]["passed_7"], v["B200"]["runs_7"]) == (0, 2) and set(v) == {"B200"}
 
 
+@pytest.mark.parametrize("workflow", ["gpu-tests-nightly.yml", "nightly-tlx-ops-bench.yml"])
+def test_finished_platform_results_survive_another_platform_waiting(workflow):
+    if workflow == r.BENCH_WF:
+        first = bench_run(1, "mi350")
+        failed = bench_run(2, "mi350", "test_op_perf[bench_mm]")
+        waiting = job("b200 / bench")
+    else:
+        first = nightly(1, tb("mi350"))
+        failed = nightly(2, tb("mi350", "gemm"))
+        waiting = tb("b200")
+    waiting.update(status="queued", conclusion=None, completed_at=None, steps=[])
+    failed.update(status="queued", conclusion=None)
+    failed["jobs"].append(waiting)
+    view = r.gpu_nightly_view([first, failed], stamp(23), workflow)
+    assert view["MI350"]["result"] == "test"
+    assert view["MI350"]["t"] == stamp(2)
+    assert view["MI350"]["fails"]
+    assert view["MI350"]["runs_7"] == 2
+
+
+@pytest.mark.parametrize("setup", [False, True])
+def test_pr_finished_failure_survives_another_platform_waiting(setup):
+    failed = job("mi350 / mi350-tlx-test", step("Install prebuilt Triton", "failure")) if setup else tlx(
+        "test_signal", gpu="mi350")
+    waiting = {**tlx(), "status": "queued", "conclusion": None, "completed_at": None, "steps": []}
+    pending = run(2, [failed, waiting], event="pull_request", status="queued")
+    view = r.pr_view([pending], stamp(23), main([]))[0]
+    assert view["result"] == ("setup" if setup else "tests")
+    assert view["pending"] is True
+    assert view["gpus"] == ["MI350"]
+    assert view["n_failed"] == (0 if setup else 1)
+
+
 def test_bench_step_maps_to_a_group():
     """A failed bench is a test result, not a setup failure, so the bench workflow's step needs a group."""
     import os
@@ -632,7 +579,7 @@ def test_page_data_has_one_section_per_tab():
     data = r.page_data([push(1, tlx())], stamp(23), {})
     assert set(data) == {"asof", "branches", "occupancy"}
     assert all(
-        set(v) == {"main", "lit", "nightly", "pr", "fast_full", "sanitizer", "ops", "usage", "bump"}
+        set(v) == {"main", "lit", "nightly", "pr", "sanitizer", "ops", "usage", "bump"}
         for v in data["branches"].values())
 
 
@@ -727,6 +674,27 @@ def test_grid_marks_gpus_skipped_by_selection_and_runs_in_progress():
     assert [p["cells"]["H100"] for p in v["pushes"]] == ["na", "skip", "running"]
 
 
+def test_each_gpu_of_a_push_in_progress_shows_its_own_jobs():
+    h100 = tlx(gpu="h100")
+    queued = {**tlx(), "status": "queued", "conclusion": None, "steps": []}
+    running = {**tlx(gpu="mi350"), "status": "in_progress", "conclusion": None}
+    stuck = push(1, h100, queued, running, status="in_progress", conclusion=None)
+    stuck["select"] = {"h100": True, "b200": True, "mi350": True, "build": True}
+    never_ran = {**tlx(), "conclusion": "cancelled", "steps": []}
+    skipped = push(2, tlx(gpu="h100"), never_ran, conclusion="cancelled")
+    skipped["select"] = {"h100": True, "b200": False, "mi350": False, "build": True}
+    v = main([stuck, skipped])
+    assert [p["cells"]
+            for p in v["pushes"]] == [{"H100": "pass", "B200": "waiting", "MI350": "running", "CPU": "running"},
+                                      {"H100": "pass", "B200": "norunner", "MI350": "skip", "CPU": "na"}]
+
+
+def test_a_gpu_job_that_never_got_a_runner_keeps_its_known_failures():
+    never_ran = {**tlx(), "conclusion": "cancelled", "steps": []}
+    v = main([push(1, tlx("t1")), push(2, tlx("t1")), push(3, never_ran, conclusion="cancelled")])
+    assert v["gpus"]["B200"]["verdict"] == "known" and items(v, "B200", "known") == {("t1", "01")}
+
+
 def test_lit_run_in_progress_shows_as_running():
     v = r.lit_view([lit(1), run(2, [], wf="compiler.yml", status="in_progress", conclusion=None)], stamp(23))
     assert [p["cell"] for p in v["pushes"]] == ["pass", "running"] and v["verdict"] == "passing"
@@ -804,6 +772,32 @@ def test_concurrency_stops_at_a_run_whose_jobs_are_not_stored_yet():
     c = r.concurrency_view([push(1, span("b200", 10, 0, 10, 30)), pending], "2026-10-12T23:00:00Z")
     hours = {x["day"]: x for x in c["hours"]}
     assert hours["2026-10-12 10:00"]["B200"]["peak"] == 1 and hours["2026-10-12 21:00"]["B200"]["peak"] is None
+
+
+@pytest.mark.parametrize("workflow", [
+    "gpu-tests.yml",
+    "fast-gpu-tests.yml",
+    "gpu-tests-nightly.yml",
+    "nightly-tlx-ops-bench.yml",
+])
+def test_unavailable_gpu_does_not_hide_other_gpus_or_report_queued_jobs_as_running(workflow):
+    queued = span("b200", 10, 0, 10, 30)
+    queued.update(status="queued", conclusion=None, completed_at=None, steps=[])
+    active = span("h100", 22, 30, 23, 0)
+    active.update(status="in_progress", conclusion=None, completed_at=None)
+    pending = run(10, [queued, active, span("mi350", 22, 10, 22, 20)], wf=workflow, status="in_progress")
+    now = stamp(23)
+    occupancy = r.occupancy_view([pending], now)
+    end = r.t(occupancy["t0"]) + r.dt.timedelta(minutes=len(occupancy["gpus"]["MI350"]["run"]) * r.OCC_CELL_MIN)
+    assert end == r.t(now)
+    assert sum(occupancy["gpus"]["MI350"]["busy"]) == 10
+    assert occupancy["gpus"]["B200"]["run"][-1] == 0
+    assert occupancy["gpus"]["B200"]["wpart"][-1] == 15
+    assert occupancy["gpus"]["H100"]["run"][-1] == 1
+    hour = r.concurrency_view([pending], now)["hours"][-2]
+    assert hour["B200"] == {"peak": 0, "mean": 0.0, "wait_peak": 1}
+    assert hour["MI350"]["peak"] == 1
+    assert hour["H100"]["peak"] == 1 and hour["H100"]["mean"] == 0.5
 
 
 def test_page_data_shares_concurrency_across_branches():

@@ -309,6 +309,13 @@ unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
                    axisInfoAnalysis.getMaskAlignment(load.getMask(), order[0]));
     alignment = std::max(alignment, unalignedAlignment);
   }
+  // The store lowering splits a masked store into accesses no wider than the
+  // mask's alignment, so a wider layout only spreads each warp's writes over
+  // more memory sectors.
+  if (auto store = dyn_cast<triton::StoreOp>(op); store && store.getMask())
+    alignment =
+        std::min(alignment,
+                 axisInfoAnalysis.getMaskAlignment(store.getMask(), order[0]));
   unsigned maxElementsPerThread = getMaxElementsPerThread(op, maxVecBits);
   unsigned currPerThread = std::min(alignment, maxElementsPerThread);
   LDBG("elemNumBytes: " << elemNumBytes
@@ -913,10 +920,8 @@ bool canBeRematerialized(Operation *op) {
     return !isExpensiveLocalLoad(op);
   if (isa<AtomicOpInterface, DotOpInterface>(op))
     return false;
-  if (auto gather = dyn_cast<GatherOp>(op))
-    return !gather.getEfficientLayout();
-  if (auto reshape = dyn_cast<ReshapeOp>(op))
-    return !reshape.getEfficientLayout();
+  if (ttg::hasEfficientLayout(op))
+    return false;
 
   if (isa<scf::WhileOp, scf::ConditionOp>(op))
     return false;
@@ -2300,6 +2305,18 @@ std::optional<bool> getBoolFromConstant(Value cst) {
     return boolAttr.getValue();
   }
   return std::nullopt;
+}
+
+DescriptorLoadOp getTwoCTADescriptorLoad(Value value) {
+  while (Operation *op = value.getDefiningOp()) {
+    if (auto load = dyn_cast<DescriptorLoadOp>(op))
+      return load;
+    if ((!isa<ttg::ConvertLayoutOp>(op) && !isView(op)) ||
+        op->getNumOperands() != 1)
+      return {};
+    value = op->getOperand(0);
+  }
+  return {};
 }
 
 } // namespace mlir::triton

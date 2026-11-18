@@ -182,6 +182,18 @@ def stage_runs(run):
     return views
 
 
+def is_pr_comparison_run(run):
+    """A full-test record tied to a PR without rewriting its original Actions event."""
+    return run.get("event") == "pull_request" or (run.get("wf") == "gpu-tests.yml"
+                                                  and run.get("event") == "workflow_run"
+                                                  and run.get("followup_status") == "ok")
+
+
+def trigger_event(run):
+    """Dashboard trigger class. Verified workflow_run full tests consume PR GPU capacity."""
+    return "pull_request" if is_pr_comparison_run(run) else run.get("event")
+
+
 def comparison_runs(runs):
     for run in runs:
         for attempt in [*run.get("attempts", []), run]:
@@ -300,7 +312,7 @@ def slow_test_run(run):
 
 def tracked_branch(run):
     """The tracked branch a run counts for: a PR's base, a bump branch's target, else the branch it ran on."""
-    if run["event"] == "pull_request":
+    if is_pr_comparison_run(run):
         return run.get("base") or "main"
     branch = run.get("branch") or "main"
     if branch.startswith(BUMP_PREFIX):
@@ -310,15 +322,20 @@ def tracked_branch(run):
 
 
 def _pushes(runs, branch):
+    """Push runs with their jobs collected, finished or not: a GPU's jobs count once they finish."""
     return sorted((r for r in runs if r.get("wf") == "gpu-tests.yml" and r["event"] == "push" and (
-        r.get("branch") or "main") == branch and r.get("jobs") is not None and r.get("status") == "completed"),
-                  key=lambda r: r["created_at"])
+        r.get("branch") or "main") == branch and r.get("jobs") is not None), key=lambda r: r["created_at"])
 
 
-def _running(runs, wf, branch, asof):
-    return sorted((r for r in runs if r.get("wf") == wf and r["event"] == "push" and (
-        r.get("branch") or "main") == branch and r.get("status") != "completed" and r["created_at"] <= asof),
-                  key=lambda r: r["created_at"])
+def _running(runs, wf, branch, asof, uncollected=False):
+    """Push runs still in progress; with uncollected, only those whose jobs were not collected yet."""
+
+    def keep(r):
+        return (r.get("wf") == wf and r["event"] == "push" and (r.get("branch") or "main") == branch
+                and r.get("status") != "completed" and r["created_at"] <= asof
+                and not (uncollected and r.get("jobs") is not None))
+
+    return sorted(filter(keep, runs), key=lambda r: r["created_at"])
 
 
 def _commit(run):
@@ -334,6 +351,8 @@ def _history(pushes):
     blame = collections.defaultdict(lambda: collections.defaultdict(set))
     for i, run in enumerate(pushes):
         for gpu, j in _test_jobs(run):
+            if j["conclusion"] is None:  # not finished
+                continue
             for s in j["steps"]:
                 res = step_result(j, s)
                 if res is None:
@@ -390,13 +409,14 @@ def main_view(runs, asof, branch="main"):
     # the latest push that ran the job.
     retire = iso(t(asof) - dt.timedelta(days=RETIRE_DAYS))
     latest_steps = {}
+    # A job cancelled before a runner picked it up has no steps: it neither retires nor clears its failures.
     for run in pushes:
         for gpu, j in _test_jobs(run):
-            if j["conclusion"] in RAN and run["created_at"] >= retire:
+            if j["conclusion"] in RAN and j["steps"] and run["created_at"] >= retire:
                 latest_steps[(gpu, job_key(j["name"]))] = {group_of(s["name"]) for s in j["steps"]} - {None}
     gpus = {}
     for gpu in TEST_PLATFORMS:
-        ran = [r for r in pushes if any(g == gpu and j["conclusion"] in RAN for g, j in _test_jobs(r))]
+        ran = [r for r in pushes if any(g == gpu and j["conclusion"] in RAN and j["steps"] for g, j in _test_jobs(r))]
         out = {"verdict": "none", "new": [], "known": [], **(_commit(ran[-1]) if ran else {})}
         for unit, fails in state.items():
             if unit[0] != gpu or unit[2] not in latest_steps.get(unit[:2], ()):
@@ -424,20 +444,30 @@ def main_view(runs, asof, branch="main"):
     for i in range(max(0, len(pushes) - PUSH_GRID), len(pushes)):
         run, cells = pushes[i], {}
         broken = _build_failure(run)
+        select = run.get("select") or {}
         for gpu in TEST_PLATFORMS:
             jobs = [j for g, j in _test_jobs(run) if g == gpu and j["conclusion"] in RAN]
+            # Jobs not finished yet; a GPU whose jobs were not created yet waits on the run's earlier jobs.
+            unfinished = [j for g, j in _test_jobs(run) if g == gpu and j["conclusion"] is None]
             st = seen[i].get(gpu, set())
-            if broken or not jobs:
-                # skip: path selection did not pick this GPU, so nothing it tests changed.
-                cells[gpu] = "skip" if not broken and (run.get("select") or {}).get(gpu.lower()) is False else "na"
+            if broken:
+                cells[gpu] = "na"
             elif "new" in st:
                 cells[gpu] = "new"
             elif "known" in st:
                 cells[gpu] = "known"
+            elif unfinished:
+                cells[gpu] = "running" if any(j.get("status") != "queued" for j in unfinished) else "waiting"
+            elif not jobs:
+                # skip: path selection did not pick this GPU, so nothing it tests changed.
+                cells[gpu] = ("skip" if select.get(gpu.lower()) is False else
+                              "running" if run.get("status") != "completed" else "na")
             elif any(setup_step(j) for j in jobs):
                 cells[gpu] = "setup"
             elif not any(step_result(j, s) for j in jobs for s in j["steps"]):
-                cells[gpu] = "na"  # e.g. cancelled before any test step finished: no result, not a pass
+                # No result, not a pass. A job cancelled before any step started never got a runner.
+                cells[gpu] = "norunner" if all(j["conclusion"] == "cancelled" and not j["steps"]
+                                               for j in jobs) else "na"
             else:
                 cells[gpu] = "pass"
         known_since = {
@@ -451,19 +481,20 @@ def main_view(runs, asof, branch="main"):
             **_commit(run), "title": run.get("title", ""), "url": run.get("url"), "cells": cells, "since": known_since
         })
 
-    # Push runs still in progress have no result yet; they show as running so a missing cell is never ambiguous.
+    # Push runs whose jobs were not collected yet show as running, so a missing cell is never ambiguous.
     grid += [{
         **_commit(r), "title": r.get("title", ""), "url": r.get("url"), "cells": {g: "running"
                                                                                   for g in TEST_PLATFORMS}
     }
-             for r in _running(runs, "gpu-tests.yml", branch, asof)]
+             for r in _running(runs, "gpu-tests.yml", branch, asof, uncollected=True)]
     steps = _step_grid(pushes, max(0, len(pushes) - PUSH_GRID), units, blame, since)
     setup = [{
         "sha": r.get("head_sha") or "", "t": r["created_at"], "gpu": g, "job": job_key(j["name"]), "step": setup_step(j)
     } for r in pushes[-SETUP_WINDOW:] for g, j in _test_jobs(r) if setup_step(j)]
     build = None
-    if pushes and _build_failure(pushes[-1]):
-        build = {**_commit(pushes[-1]), "step": _build_failure(pushes[-1])}
+    done = [r for r in pushes if r.get("status") == "completed"]
+    if done and _build_failure(done[-1]):
+        build = {**_commit(done[-1]), "step": _build_failure(done[-1])}
     return {"gpus": gpus, "build": build, "pushes": grid, "steps": steps, "setup": setup}
 
 
@@ -591,219 +622,45 @@ def pr_view(runs, asof, main, branch="main"):
     on_main = {(i["gpu"], i["job"], i["id"]) for g in main["gpus"].values() for i in g["new"] + g["known"]}
     latest = {}
     for run in comparison_runs(runs):
-        if run.get("wf") != "gpu-tests.yml" or run["event"] != "pull_request" or not (since <= run["created_at"] <=
-                                                                                      asof):
+        if run.get("wf") != "gpu-tests.yml" or not is_pr_comparison_run(run) or not (since <= run["created_at"] <=
+                                                                                     asof):
             continue
         key = run.get("pr") or ("branch", run.get("branch"))
         if key not in latest or _attempt_order(run) > _attempt_order(latest[key]):
             latest[key] = run
     out = []
     for run in sorted(latest.values(), key=lambda r: r["created_at"], reverse=True):
-        jobs = _test_jobs(run)
+        jobs = [(g, j) for g, j in _test_jobs(run) if j["conclusion"] in RAN]
         fails = {(g, job_key(j["name"]), f["id"]) for g, j in jobs for s in j["steps"] for f in s.get("failures") or []}
         outcome = run_outcome(run)
         row = {
             "pr": run.get("pr"), "title": run.get("title", ""), "author": run.get("author"), "url": run.get("url"),
-            "branch": run.get("branch"), "t": run["created_at"], "gpus":
+            "branch": run.get("pr_branch") or run.get("branch"), "t": run["created_at"], "gpus":
             sorted({g
                     for g, j in jobs
-                    if j["conclusion"] in RAN},
-                   key=TEST_PLATFORMS.index), "n_failed": len(fails), "whose": None, "note": ""
+                    if j["conclusion"] in RAN}, key=TEST_PLATFORMS.index), "n_failed": len(fails), "whose": None,
+            "note": "", "pending": outcome is None
         }
-        if outcome is None:
-            row["result"] = "running"
-        elif fails:
+        if fails:
             row["result"] = "tests"
             if fails <= on_main:
                 row["whose"], row["note"] = "main", f"all {len(fails)} also fail on {branch}"
             else:
                 row["whose"] = "author"
-        elif outcome in ("setup", "build"):
-            row["result"] = outcome if outcome == "build" else "setup"
-            row["whose"] = "author" if outcome == "build" else "ci"
-            row["note"] = _build_failure(run) or next((setup_step(j) for _, j in jobs if setup_step(j)), "")
+        elif outcome in ("setup", "build") or (outcome is None and
+                                               (_build_failure(run) or any(setup_step(j) for _, j in jobs))):
+            build = _build_failure(run)
+            row["result"] = "build" if build else "setup"
+            row["whose"] = "author" if build else "ci"
+            row["note"] = build or next((setup_step(j) for _, j in jobs if setup_step(j)), "")
         else:
-            row["result"] = outcome
+            row["result"] = outcome or "running"
         out.append(row)
     return out
 
 
-FAST_FULL_KINDS = ("passed", "test", "build", "setup", "execution_error", "unknown", "pending", "cancelled",
-                   "missing_pair", "unverified_version", "not_required", "fast_not_passed")
-
-
-def _aggregate(run, name):
-    return next((j for j in run.get("jobs") or [] if j["name"] == name), None)
-
-
-def fast_result(run):
-    """A green aggregate validates tests only when a selected worker actually ran them."""
-    if run.get("wf") == FAST_WF and run.get("event") == "pull_request":
-        run = stage_runs(run)[0]
-    if run.get("status") != "completed" or run.get("jobs") is None:
-        return "pending"
-    if run.get("conclusion") == "cancelled":
-        return "cancelled"
-    aggregate = _aggregate(run, "Fast correctness")
-    if not aggregate or aggregate["conclusion"] != "success" or run_outcome(run) != "passed":
-        return "fast_not_passed"
-    workers = _test_jobs(run)
-    if any(s["name"] == "Run fast correctness tests" and s["conclusion"] == "success"
-           for _, j in workers
-           for s in j["steps"]):
-        return "passed"
-    if workers and all(j["conclusion"] == "skipped" for _, j in workers):
-        return "not_required"
-    return "unknown"
-
-
-def full_result(run):
-    """The full aggregate with an identified pytest failure, or a non-test outcome."""
-    if run.get("status") != "completed" or run.get("jobs") is None:
-        return "pending"
-    outcome = run_outcome(run)
-    if outcome in ("cancelled", "build"):
-        return outcome
-    aggregate = _aggregate(run, SUMMARY_JOB) or _aggregate(run, "teststatus")
-    if not aggregate:
-        return "unknown"
-    jobs = _test_jobs(run)
-    if aggregate["conclusion"] == "success" and outcome == "passed":
-        return "passed" if any(step_result(j, s) == "pass" for _, j in jobs for s in j["steps"]) else "not_required"
-    if aggregate["conclusion"] != "failure":
-        return "unknown"
-    if any(
-            group_of(s["name"]) and s["conclusion"] == "failure" and any(f["kind"] == "failed"
-                                                                         for f in s.get("test_failures", []))
-            for _, j in jobs
-            for s in j["steps"]):
-        return "test"
-    if any(f["kind"] == "error" for f in _comparison_failures(run)):
-        return "execution_error"
-    if any(setup_step(j) and INFRA_STEP.search(setup_step(j)) for _, j in jobs):
-        return "setup"
-    return "unknown"
-
-
 def _attempt_order(run):
     return (run["created_at"], run["id"], run.get("run_attempt", 1))
-
-
-def _comparison_run(run):
-    attempt = run.get("run_attempt", 1)
-    return {
-        "id":
-        run["id"], "attempt":
-        attempt, "t":
-        run["created_at"], "updated_at":
-        run.get("updated_at") or run["created_at"], "url":
-        (f"{run.get('url', '')}/job/{run['stage_job']}"
-         if run.get("stage_job") else f"{run.get('url', '')}/attempts/{attempt}"), "provenance":
-        run.get("tested_sha_provenance", [])
-    }
-
-
-def _comparison_failures(run):
-    return [{**f, "platform": platform, "job": job_key(j["name"]), "step": s["name"]}
-            for platform, j in _test_jobs(run)
-            for s in j["steps"] if group_of(s["name"]) for f in s.get("test_failures", [])]
-
-
-def fast_full_view(runs, asof):
-    """One record per PR and tested revision, with historical gaps and the latest retry result.
-
-    Missing checkout evidence groups only unverified observations by PR tip. Those
-    observations never pair with verified revisions or enter the denominator.
-    """
-    lo = iso(t(asof) - dt.timedelta(days=30))
-    attempts = {}
-    for run in comparison_runs(runs):
-        if run.get("wf") not in (FAST_WF, "gpu-tests.yml") or run["event"] != "pull_request":
-            continue
-        for item in [*run.get("attempts", []), run]:
-            if lo <= item["created_at"] <= asof and (item.get("updated_at") or item["created_at"]) <= asof:
-                attempts[(item["wf"], item["id"], item.get("run_attempt", 1))] = item
-    groups = collections.defaultdict(lambda: {FAST_WF: [], "gpu-tests.yml": []})
-    for item in sorted(attempts.values(), key=_attempt_order):
-        sha = item.get("tested_sha")
-        verified = bool(item.get("pr") and sha and re.fullmatch(r"[0-9a-f]{40}", sha))
-        key = (item.get("pr"), "verified" if verified else "unverified", sha if verified else item.get("head_sha"))
-        # Unknown PR identity must never join another run, even at the same tip.
-        if not item.get("pr"):
-            key += (item["id"], )
-        groups[key][item["wf"]].append(item)
-    rows = []
-    for key, workflows in groups.items():
-        fasts, fulls = workflows[FAST_WF], workflows["gpu-tests.yml"]
-        fast, full = (fasts[-1] if fasts else None), (fulls[-1] if fulls else None)
-        fresult, result = fast_result(fast) if fast else None, full_result(full) if full else None
-        passing = [item for item in fasts if fast_result(item) == "passed"]
-        completed = [item for item in fulls if full_result(item) in ("passed", "test")]
-        verified = key[1] == "verified"
-        comparable = verified and bool(passing and completed)
-        gaps = []
-        if verified and passing:
-            for item in fulls:
-                if full_result(item) != "test":
-                    continue
-                before = [candidate for candidate in passing if _attempt_order(candidate) <= _attempt_order(item)]
-                paired_fast = before[-1] if before else passing[0]
-                gaps.append({
-                    "fast": _comparison_run(paired_fast), "full": _comparison_run(item), "failures":
-                    _comparison_failures(item)
-                })
-        if fresult in ("not_required", "fast_not_passed", "unknown", "cancelled", "pending"):
-            latest = fresult
-        elif not fast or not full:
-            latest = "missing_pair"
-        elif result in ("pending", "cancelled", "not_required"):
-            latest = result
-        elif not verified:
-            latest = "unverified_version"
-        else:
-            latest = result
-        # Historical evidence is counted once per revision. A retry can resolve
-        # its latest state without deleting the original candidate.
-        kind = "test" if gaps else latest
-        sample = fast or full
-        rows.append({
-            "pr": key[0], "sha": key[2] if verified else None, "head_sha": sample.get("head_sha"), "verified": verified,
-            "t": min(item["created_at"] for item in fasts + fulls), "kind": kind, "latest": latest, "comparable":
-            comparable, "fast": _comparison_run(fast) if fast else None, "full":
-            _comparison_run(full) if full else None, "fast_attempts": len(fasts), "full_attempts": len(fulls), "gaps":
-            gaps, "failures": _comparison_failures(full) if full else []
-        })
-    latest_pr = {}
-    for item in sorted(attempts.values(), key=_attempt_order):
-        if item["wf"] == "gpu-tests.yml" and item.get("pr"):
-            latest_pr[item["pr"]] = item
-    for row in rows:
-        latest = latest_pr.get(row["pr"])
-        row["latest_pr_full"] = _comparison_run(latest) if latest else None
-        row["latest_pr_result"] = full_result(latest) if latest else None
-    rows.sort(key=lambda item: (item["t"], item["pr"] or 0, item["sha"] or item["head_sha"] or ""), reverse=True)
-
-    def counts(items):
-        kinds = collections.Counter(item["kind"] for item in items)
-        n = sum(item["comparable"] for item in items)
-        candidates = [item for item in items if item["gaps"]]
-        return {
-            "counts": {kind: kinds[kind]
-                       for kind in FAST_FULL_KINDS}, "revisions": sum(item["verified"] for item in items),
-            "observations": len(items), "unverified_observations": sum(not item["verified"] for item in items),
-            "unique_prs": len({item["pr"]
-                               for item in items
-                               if item["pr"]}), "candidate_prs": len({item["pr"]
-                                                                      for item in candidates}), "comparable": n, "rate":
-            round(len(candidates) / n, 4) if n else None, "fast_attempts": sum(item["fast_attempts"] for item in items),
-            "full_attempts": sum(item["full_attempts"] for item in items)
-        }
-
-    week = iso(t(asof) - dt.timedelta(days=7))
-    return {
-        "days": 7, "retention_days": 30, **counts([item for item in rows if item["t"] >= week]), "records": rows,
-        "trend": [{"day": day, **counts([item for item in rows if item["t"][:10] == day])} for day in ops_days(t(asof))]
-    }
 
 
 def nightly_view(runs, asof, bench):
@@ -845,8 +702,8 @@ def nightly_view(runs, asof, bench):
 
 def gpu_nightly_view(runs, asof, wf="gpu-tests-nightly.yml"):
     """The latest run of a daily GPU workflow per GPU: result and failing tests; and passes over the last 7 days."""
-    nights = sorted((r for r in runs if r.get("wf") == wf and r.get("status") == "completed"
-                     and r.get("jobs") is not None and r["created_at"] <= asof), key=lambda r: r["created_at"])
+    nights = sorted((r for r in runs if r.get("wf") == wf and r.get("jobs") is not None and r["created_at"] <= asof),
+                    key=lambda r: r["created_at"])
     week_ago = iso(t(asof) - dt.timedelta(days=7))
     out = {}
     for gpu in GPUS:
@@ -905,8 +762,9 @@ def _outcome_days(gpu_runs, days, outcome, minutes):
             counts[d][k] += 1
         # Only runs whose tests ran to the end: cancelled, setup- and build-failed runs stopped early, so their GPU
         # time understates what a run costs.
-        if h > 0 and k in ("passed", "test") and r["event"] in PER_RUN_EVENTS:
-            per_run[d][r["event"]].append(h * 60)
+        event = trigger_event(r)
+        if h > 0 and k in ("passed", "test") and event in PER_RUN_EVENTS:
+            per_run[d][event].append(h * 60)
     return {
         "gpu_hours": [{"day": d, **{k: round(v, 1)
                                     for k, v in hours[d].items()}}
@@ -946,27 +804,39 @@ def _occupancy(spans, lo, hi):
     return peak, round(area / (hi - lo).total_seconds(), 2)
 
 
-def concurrency_view(runs, asof):
-    """GPU jobs running and waiting for a runner at once, per GPU type, per day (OPS_DAYS) and per hour
-    (OPS_HOURS): the peak and the time-weighted mean. All tracked branches and triggers count, since they share
-    the runners. Jobs of a run are stored once it completes, so the counts end where the oldest recent run without
-    jobs began: after that they would read low, and are left out."""
+def _resource_horizon(runs, asof):
     now = t(asof)
-    running, waiting = {g: [] for g in GPUS}, {g: [] for g in GPUS}
     recent = iso(now - dt.timedelta(hours=OPS_HOURS))
-    horizon = min([
+    return min([
         t(r["created_at"]) for r in runs if r.get("wf") in GPU_RUN_WORKFLOWS and recent <= r["created_at"] <= asof and
-        (r.get("jobs") is None or any(not j.get("completed_at") and j.get("conclusion") != "skipped"
-                                      for j in r["jobs"]))
+        (r.get("jobs") is None or any(j["conclusion"] is None and j.get("status") not in ("queued", "in_progress")
+                                      for _, j in _gpu_jobs(r)))
     ] + [now])
+
+
+def _resource_spans(runs, asof):
+    now = t(asof)
     for r in runs:
         if r.get("wf") not in GPU_RUN_WORKFLOWS or r["created_at"] > asof:
             continue
-        for g, j in _gpu_jobs(r):
-            if _ran(j):
-                running[g].append((t(j["started_at"]), t(j["completed_at"])))
-                if j.get("created_at"):
-                    waiting[g].append((t(j["created_at"]), t(j["started_at"])))
+        for gpu, j in _gpu_jobs(r):
+            if _ran(j) or (j.get("status") == "in_progress" and j.get("started_at")):
+                yield gpu, t(j.get("created_at") or j["started_at"]), t(
+                    j["started_at"]), t(j["completed_at"]) if j.get("completed_at") else now
+            elif j.get("status") == "queued" and j["conclusion"] is None and j.get("created_at"):
+                yield gpu, t(j["created_at"]), None, now
+
+
+def concurrency_view(runs, asof):
+    """Running and queued GPU jobs per day and hour, including unfinished workflows. Missing job snapshots remain
+    unknown rather than reporting idle runners."""
+    now = t(asof)
+    running, waiting = {g: [] for g in GPUS}, {g: [] for g in GPUS}
+    horizon = _resource_horizon(runs, asof)
+    for gpu, queued, started, ended in _resource_spans(runs, asof):
+        if started is not None:
+            running[gpu].append((started, ended))
+        waiting[gpu].append((queued, started or ended))
 
     def buckets(labels, width):
         out = []
@@ -1080,7 +950,7 @@ def ops_view(runs, asof):
     finished = [r for r in recent if run_outcome(r) in ("passed", "test", "setup", "build")]
     setups = [r for r in finished if run_outcome(r) == "setup"]
     queue = queue_view(gpu_runs, now)
-    prs = [r for r in recent if r["event"] == "pull_request"]
+    prs = [r for r in recent if trigger_event(r) == "pull_request"]
 
     steps = collections.defaultdict(lambda: {"n": 0, "triggers": collections.Counter()})
     for r in gpu_runs:
@@ -1091,7 +961,7 @@ def ops_view(runs, asof):
             if name:
                 e = steps[(name, gpu)]
                 e["n"] += 1
-                e["triggers"][r["event"]] += 1
+                e["triggers"][trigger_event(r)] += 1
     setup_steps = sorted(({"step": k[0], "gpu": k[1], "n": v["n"], "triggers": dict(v["triggers"])}
                           for k, v in steps.items()), key=lambda x: -x["n"])
     return {
@@ -1132,7 +1002,8 @@ def queue_view(gpu_runs, now):
                 by_hour[_hour(j["created_at"])][g].append(q)
             if r["created_at"] >= week_ago:
                 week[g].append(q)
-        if jobs and r["event"] == "pull_request" and r["created_at"] >= week_ago and run_outcome(r) != "cancelled":
+        if jobs and trigger_event(r) == "pull_request" and r["created_at"] >= week_ago and run_outcome(
+                r) != "cancelled":
             g, j = max(jobs, key=lambda gj: gj[1]["completed_at"])
             last[g] += 1
             pr_wait.append(mins(j["created_at"], j["started_at"]))
@@ -1171,9 +1042,10 @@ def select_view(runs, asof):
         key=lambda r: r["created_at"])
     by_day, anomalies = {d: {} for d in days}, []
     for r in recent:
+        event = trigger_event(r)
         sel, base = r.get("select"), {
-            "event": r["event"], "sha": r.get("head_sha") or "", "t": r["created_at"], "url": r.get("url"), "pr":
-            r.get("pr")
+            "event": event, "sha": r.get("tested_sha") or r.get("head_sha") or "", "t": r["created_at"], "url":
+            r.get("url"), "pr": r.get("pr")
         }
         if any(j["name"] == "select" and j["conclusion"] == "failure" for j in r["jobs"]):
             anomalies.append({**base, "kind": "failed", "detail": "select job failed"})
@@ -1182,7 +1054,7 @@ def select_view(runs, asof):
             continue
         gpus = [g for g in GPUS if sel.get(g.lower())]
         e = by_day[r["created_at"][:10]].setdefault(
-            r["event"], {
+            event, {
                 "runs": 0, "gpus": dict.fromkeys("0123", 0), "build_skipped": 0, "fallback": 0, "per_gpu":
                 dict.fromkeys(GPUS, 0)
             })
@@ -1194,7 +1066,7 @@ def select_view(runs, asof):
             e["per_gpu"][g] += 1
         if sel.get("fallback"):
             anomalies.append({**base, "kind": "fallback", "detail": "changed paths unavailable, ran every suite"})
-        elif r["event"] in ("schedule", "workflow_dispatch") and len(gpus) < len(GPUS):
+        elif event in ("schedule", "workflow_dispatch") and len(gpus) < len(GPUS):
             missing = ", ".join(g for g in GPUS if g not in gpus)
             anomalies.append({**base, "kind": "partial", "detail": f"full run skipped {missing}"})
     return {"days": [{"day": d, "triggers": by_day[d]} for d in days], "anomalies": anomalies}
@@ -1230,7 +1102,7 @@ def usage_view(runs, asof):
                 act[g][d][activity_of(s["name"])] += m
                 counted += m
             act[g][d]["Setup & overhead"] += max(0.0, total - counted)
-            trig[g][d][USAGE_TRIGGERS.get(r["event"], "nightly & manual")] += total
+            trig[g][d][USAGE_TRIGGERS.get(trigger_event(r), "nightly & manual")] += total
     return {
         "days": [{"day": d, **{g: {k: round(v / 60, 2)
                                    for k, v in act[g][d].items()}
@@ -1259,26 +1131,17 @@ def occupancy_view(runs, asof):
     Per cell: the most jobs running, exact busy runner-minutes, idle minutes (no job running), minutes with every
     runner busy, runner capacity (pool minutes), and minutes and job-minutes of waiting with every runner busy (full)
     or not (part). A job waits from WAIT_GRACE_MIN after it was queued until it started. Every branch and trigger
-    counts, since they share the runners. As in concurrency_view, cells stop where the oldest recent run without
-    stored jobs began."""
+    counts, since they share the runners. Queued and running jobs extend to the snapshot time; only missing job
+    snapshots shorten the grid."""
     now = t(asof)
     first = now.astimezone(OCC_TZ).date() - dt.timedelta(days=OPS_DAYS - 1)
     lo = dt.datetime.combine(first, dt.time(), OCC_TZ).astimezone(dt.timezone.utc)
-    recent = iso(now - dt.timedelta(hours=OPS_HOURS))
-    hi = min([
-        t(r["created_at"]) for r in runs if r.get("wf") in GPU_RUN_WORKFLOWS and recent <= r["created_at"] <= asof and
-        (r.get("jobs") is None or any(not j.get("completed_at") and j.get("conclusion") != "skipped"
-                                      for j in r["jobs"]))
-    ] + [now])
+    hi = _resource_horizon(runs, asof)
     n = max(0, int((hi - lo).total_seconds() // 60))
     n -= n % OCC_CELL_MIN
     spans = {g: [] for g in GPUS}
-    for r in runs:
-        if r.get("wf") not in GPU_RUN_WORKFLOWS or r["created_at"] > asof:
-            continue
-        for g, j in _gpu_jobs(r):
-            if _ran(j):
-                spans[g].append((t(j.get("created_at") or j["started_at"]), t(j["started_at"]), t(j["completed_at"])))
+    for gpu, queued, started, ended in _resource_spans(runs, asof):
+        spans[gpu].append((queued, started or ended, ended))
     minute = lambda x: int((x - lo).total_seconds() // 60)
 
     def most_at_once(intervals):
@@ -1347,9 +1210,8 @@ def page_data(runs, asof, bench, bump=None):
         # The bench dashboard's perf events come from main's nightly bench.
         branches[b] = {
             "main": main, "lit": lit_view(rs, asof, b), "nightly": nightly_view(rs, asof, bench if b == "main" else {}),
-            "pr": pr_view(rs, asof, main, b), "fast_full": fast_full_view(rs, asof), "sanitizer":
-            sanitizer.view(rs, asof), "ops": {**ops_view(rs, asof), "concurrency":
-                                              concurrency}, "usage": usage_view(rs, asof), "bump": bump_view(
-                                                  ((bump or {}).get("lines") or {}).get(b))
+            "pr": pr_view(rs, asof, main, b), "sanitizer": sanitizer.view(rs, asof), "ops":
+            {**ops_view(rs, asof), "concurrency": concurrency}, "usage": usage_view(rs, asof), "bump": bump_view(
+                 ((bump or {}).get("lines") or {}).get(b))
         }
     return {"asof": asof, "branches": branches, "occupancy": occupancy_view(runs, asof)}

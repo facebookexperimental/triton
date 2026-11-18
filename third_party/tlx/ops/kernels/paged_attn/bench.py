@@ -42,6 +42,7 @@ def _check_aiter_available():
 _AITER_AVAILABLE = _check_aiter_available()
 DECODE_METHODS = (
     "aiter_common",
+    "aiter_unified",
     "sglang",
     "sglang_tlx",
     "aiter_gluon",
@@ -49,11 +50,18 @@ DECODE_METHODS = (
     "tlx_5d_streaming",
     "tlx_gluon_compat",
     "tlx",
+    "tlx_nhd",
 )
+# Providers that read SGLang's page-major token pool, [blocks, page, kv_heads, dim].
+NHD_METHODS = ("aiter_unified", "tlx_nhd")
 # PR #2306 target comparison: standalone AITER common/HIP, SGLang's actual
 # vectorized-5D wrapper (which calls AITER Gluon), and native TLX 5D.
 DEFAULT_DECODE_VERSIONS = ["aiter_common", "sglang", "tlx_5d"] if _AITER_AVAILABLE else ["tlx_5d"]
-CORRECTNESS_METHODS = ("tlx", "aiter_gluon") if _AITER_AVAILABLE else ("tlx", )
+CORRECTNESS_METHODS = ("tlx", "tlx_nhd", "aiter_gluon", "aiter_unified") if _AITER_AVAILABLE else ("tlx", "tlx_nhd")
+
+
+def _cache_layout(provider):
+    return "4d" if provider == "tlx" else "nhd" if provider in NHD_METHODS else "5d"
 
 
 def _make_decode_fn(
@@ -70,14 +78,16 @@ def _make_decode_fn(
     num_kv_heads,
     query_group_size,
     head_dim,
+    sliding_window=0,
 ):
-    expected_ndim = 4 if provider == "tlx" else 5
+    expected_ndim = 5 if _cache_layout(provider) == "5d" else 4
     assert kc.ndim == vc.ndim == expected_ndim
-    if provider in ("tlx", "tlx_5d", "tlx_5d_streaming", "tlx_gluon_compat"):
+    if provider in ("tlx", "tlx_nhd", "tlx_5d", "tlx_5d_streaming", "tlx_gluon_compat"):
         streaming_kv = True if provider == "tlx_5d_streaming" else None
         # None lets the production TLX provider select its tuned B1 path;
         # True retains an explicit provider for controlled comparisons.
         gluon_compat = True if provider == "tlx_gluon_compat" else None
+        kv_layout = "NHD" if provider == "tlx_nhd" else "HND"
         config = _get_pa_decode_config(
             q,
             kc,
@@ -87,6 +97,8 @@ def _make_decode_fn(
             max_context_len=max_context_len,
             streaming_kv=streaming_kv,
             gluon_compat=gluon_compat,
+            sliding_window=sliding_window,
+            kv_layout=kv_layout,
         )
         workspace = _allocate_pa_decode_workspace(q, kc, config)
 
@@ -105,6 +117,8 @@ def _make_decode_fn(
                 gluon_compat=gluon_compat,
                 workspace=workspace,
                 config=config,
+                sliding_window=sliding_window,
+                kv_layout=kv_layout,
             )
 
         return _run_tlx
@@ -113,6 +127,19 @@ def _make_decode_fn(
         return None
 
     num_seqs = q.shape[0] // qlen
+    if provider == "aiter_unified":
+        # SGLang's aiter backend decode and target-verify call.
+        from aiter.ops.triton.attention.unified_attention import unified_attention
+
+        cu_seqlens_q = torch.arange(0, num_seqs + 1, dtype=torch.int32, device=q.device) * qlen
+        window_size = (sliding_window - 1, 0) if sliding_window else (-1, -1)
+        return lambda: unified_attention(q=q, k=kc, v=vc, out=out, cu_seqlens_q=cu_seqlens_q, max_seqlen_q=qlen,
+                                         seqused_k=ctx, max_seqlen_k=bt.shape[1] * kc.shape[1], softmax_scale=sm_scale,
+                                         causal=True, window_size=window_size, block_table=bt, softcap=0.0, q_descale=
+                                         None, k_descale=None, v_descale=None, sinks=None)
+    if sliding_window:
+        raise ValueError(f"{provider} is benchmarked without a sliding window")
+
     context_partition_size = 256
     max_context_partition_num = math.ceil(int(ctx.max().item()) / context_partition_size)
 
@@ -248,6 +275,8 @@ def create_benchmark(
     warmup_ms=100,
     rep_ms=200,
     shared_page_pool=False,
+    num_kv_heads=NUM_KV_HEADS,
+    sliding_window=0,
 ):
     if qlen != 1 and any(provider in versions for provider in ("sglang", "sglang_tlx")):
         raise ValueError("SGLang's vectorized_5d decode wrapper only supports query_length=1")
@@ -262,13 +291,14 @@ def create_benchmark(
             line_vals=line_vals,
             line_names=line_names,
             ylabel="TB/s (effective HBM read)",
-            plot_name=(f"paged-decode-performance-bf16-d{head_dim}-p{page_size}-qlen{qlen}" +
+            plot_name=(f"paged-decode-performance-bf16-d{head_dim}-p{page_size}-qlen{qlen}-kvh{num_kv_heads}" +
+                       (f"-w{sliding_window}" if sliding_window else "") +
                        ("-shared-pool" if shared_page_pool else "")),
             args={},
         ))
     def benchmark(BATCH, N_CTX, provider):
         sm_scale = 1.0 / (head_dim**0.5)
-        num_q_heads = NUM_KV_HEADS * QUERY_GROUP_SIZE
+        num_q_heads = num_kv_heads * QUERY_GROUP_SIZE
         # Give each sequence distinct physical pages. A small shared page pool
         # unrealistically turns a long-context decode benchmark into an L2 test.
         pool_pages = None
@@ -280,13 +310,13 @@ def create_benchmark(
             BATCH,
             [N_CTX] * BATCH,
             num_q_heads,
-            NUM_KV_HEADS,
+            num_kv_heads,
             head_dim,
             page_size,
             query_length=qlen,
             device=DEVICE,
             pool_pages=pool_pages,
-            cache_layout="4d" if provider == "tlx" else "5d",
+            cache_layout=_cache_layout(provider),
         )
         out = torch.empty_like(q)
         fn = _make_decode_fn(
@@ -300,20 +330,23 @@ def create_benchmark(
             sm_scale,
             qlen,
             N_CTX,
-            NUM_KV_HEADS,
+            num_kv_heads,
             QUERY_GROUP_SIZE,
             head_dim,
+            sliding_window,
         )
         if fn is None:
             return float("nan"), float("nan"), float("nan")
         quantiles = [0.5, 0.2, 0.8]
         ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles, warmup=warmup_ms, rep=rep_ms)
 
-        # Decode reads the whole KV cache once (K + V, bf16): report effective
+        # Decode reads each attended key and value once (bf16): report effective
         # HBM read bandwidth, the meaningful metric for this memory-bound op.
-        # Use actual tensor sizes: with pool_pages sharing, multiple sequences
-        # map to the same physical pages, so BATCH*N_CTX overcounts HBM bytes.
-        kv_bytes = (kc.numel() + vc.numel()) * kc.element_size()
+        # Use actual tensor sizes as the cap: with pool_pages sharing, multiple
+        # sequences map to the same physical pages, so BATCH*N_CTX overcounts.
+        keys = min(N_CTX, sliding_window + qlen - 1) if sliding_window else N_CTX
+        kv_bytes = min((kc.numel() + vc.numel()) * kc.element_size(),
+                       2 * BATCH * keys * num_kv_heads * head_dim * kc.element_size())
         tbps = lambda ms: kv_bytes * 1e-12 / (ms * 1e-3)
         return tbps(ms), tbps(max_ms), tbps(min_ms)
 
@@ -321,12 +354,15 @@ def create_benchmark(
 
 
 @pytest.mark.parametrize("provider", CORRECTNESS_METHODS)
-@pytest.mark.parametrize("query_length", [1, 2, 3, 4], ids=lambda q: f"qlen{q}")
+@pytest.mark.parametrize("query_length", [1, 2, 3, 4, 8], ids=lambda q: f"qlen{q}")
 @pytest.mark.parametrize("batch, n_ctx", get_x_values())
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 def test_correctness(batch, n_ctx, query_length, provider):
+    if provider == "aiter_gluon" and query_length > 4:
+        pytest.skip("pa_decode_gluon is compared at MTP query lengths only")
     sm_scale = 1.0 / (HEAD_DIM**0.5)
     ctx_lens = [n_ctx] * batch
+    cache_layout = _cache_layout(provider)
     query, key_cache, value_cache, context_lens, block_tables = _build_inputs(
         batch,
         ctx_lens,
@@ -336,7 +372,7 @@ def test_correctness(batch, n_ctx, query_length, provider):
         PAGE_SIZE,
         query_length=query_length,
         device=DEVICE,
-        cache_layout="4d" if provider == "tlx" else "5d",
+        cache_layout=cache_layout,
     )
     out = torch.empty_like(query)
     fn = _make_decode_fn(
@@ -358,7 +394,7 @@ def test_correctness(batch, n_ctx, query_length, provider):
         pytest.skip(f"{provider} not available")
     fn()
     ref = _ref_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale, NUM_Q_HEADS, NUM_KV_HEADS,
-                      query_length)
+                      query_length, kv_layout="NHD" if cache_layout == "nhd" else "HND")
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
@@ -376,12 +412,14 @@ if __name__ == "__main__":
         type=int,
         nargs="+",
         default=[1],
-        help="Query lengths to sweep (multi-token prediction: 1-4).",
+        help="Query lengths to sweep (1 decode, 2-8 speculative verification).",
     )
     parser.add_argument("--warmup-ms", type=int, default=100, help="Warmup time per benchmark point.")
     parser.add_argument("--rep-ms", type=int, default=200, help="Measurement time per benchmark point.")
     parser.add_argument("--head-dims", type=int, nargs="+", default=[64])
     parser.add_argument("--page-sizes", type=int, nargs="+", default=[16])
+    parser.add_argument("--kv-heads", type=int, default=NUM_KV_HEADS, help="KV heads, with 8 query heads each.")
+    parser.add_argument("--sliding-window", type=int, default=0, help="Keys per query row; 0 is full attention.")
     parser.add_argument(
         "--shared-page-pool",
         "--use_cache_pool",
@@ -408,6 +446,8 @@ if __name__ == "__main__":
                         args.warmup_ms,
                         args.rep_ms,
                         args.shared_page_pool,
+                        args.kv_heads,
+                        args.sliding_window,
                     )
                     if len(versions) > 1:
                         df = report.run(return_df=True)
@@ -415,6 +455,9 @@ if __name__ == "__main__":
                         baseline = f"tlx_5d ({ylabel})"
                         if "tlx" in versions and "tlx_5d" in versions:
                             df["tlx_5d/tlx speedup"] = (df[baseline] / df[f"tlx ({ylabel})"])
+                        if "aiter_unified" in versions and "tlx_nhd" in versions:
+                            df["tlx_nhd/aiter_unified speedup"] = (df[f"tlx_nhd ({ylabel})"] /
+                                                                   df[f"aiter_unified ({ylabel})"])
                         aiter_col = f"aiter_common ({ylabel})"
                         if "aiter_common" in versions and "tlx_5d" in versions:
                             df["tlx_5d/aiter_common speedup"] = (df[baseline] / df[aiter_col])

@@ -269,8 +269,7 @@ def test_grouped_gemm_mxfp8_gfx950_quadrant_large_input_offsets(operand):
     out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
     pid_m, pid_n = (128, 0) if operand == "a" else (0, 128)
     _mxfp8_quadrant_test_tile[(1, )](x, w, out, xs, ws, m, n, k, pid_m, pid_n, N_ALIGNED=False, K_MAJOR=False,
-                                     num_warps=8, matrix_instr_nonkdim=16,
-                                     llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ))
+                                     num_warps=8, matrix_instr_nonkdim=16)
     tile = out[32768:] if operand == "a" else out[:, 32768:]
     expected = torch.full_like(tile, k)
     torch.testing.assert_close(tile, expected, atol=0, rtol=0)
@@ -287,7 +286,7 @@ def test_grouped_gemm_mxfp8_gfx950_quadrant_large_output_offsets():
     xs, ws = prepare_scales(x_scale, w_scale, gm=m, g=1, n=n, k=k, sf_layout="natural", k_major_chunks=True)
     out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
     _mxfp8_quadrant_test_tile[(1, )](x, w, out, xs, ws, m, n, k, 128, 0, N_ALIGNED=True, K_MAJOR=True, num_warps=8,
-                                     matrix_instr_nonkdim=16, llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ))
+                                     matrix_instr_nonkdim=16)
     tile = out[32768:, :256]
     torch.testing.assert_close(tile, torch.full_like(tile, k), atol=0, rtol=0)
 

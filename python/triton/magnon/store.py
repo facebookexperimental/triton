@@ -10,6 +10,9 @@ PINNED (hash-key design): kernel identity is sha256(PTX) x arch. PTX subsumes th
 dtype/alignment specialization, but NOT runtime shape (M,N,K). The ptxas version scopes the artifact
 (an ACF is only valid for the ptxas that produced it), so different toolchains keep distinct ACFs for
 the same kernel instead of colliding. If per-shape ACFs are wanted later, extend the key with shape.
+
+The factory also writes nested per-kernel dirs, $COMPILE_IQ_STORE/<arch>/<ptx_sha256[:16]>/...; see
+acf_path.
 """
 
 import hashlib
@@ -67,7 +70,19 @@ def ptx_sha256(ptx: str) -> str:
     return hashlib.sha256(normalize_ptx(ptx).encode("utf-8")).hexdigest()
 
 
+def _remote_store():
+    try:
+        from .fb import remote_store
+    except ImportError:  # fb/ is not exported to GitHub
+        return None
+    return remote_store
+
+
 def store_root() -> str:
+    remote = _remote_store()
+    mirror = remote.mirror_root() if remote is not None else None
+    if mirror is not None:
+        return mirror
     return os.environ.get("COMPILE_IQ_STORE", os.path.expanduser("~/.compile_iq/store"))
 
 
@@ -89,6 +104,9 @@ def acf_path(ptx_sha: str, arch: str, ptxas_version: str = "") -> str:
     # different toolchains coexist. Falls back to legacy untagged "<sha>.acf" when no version is given.
     # The factory also writes nested per-kernel dirs, "<arch>/<sha[:16]>/<sha[:16] or sha>.<ptxas>.acf";
     # an existing nested ACF wins, otherwise the flat path is returned.
+    remote = _remote_store()
+    if remote is not None:
+        remote.ensure_synced(arch)
     suffix = f".{_ptxas_tag(ptxas_version)}.acf" if ptxas_version else ".acf"
     root = os.path.join(store_root(), arch)
     nested = os.path.join(root, ptx_sha[:16])

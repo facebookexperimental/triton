@@ -37,16 +37,17 @@ jobs:
       SETUP_SCRIPT: /workspace/setup_instance.sh
     timeout-minutes: 240
     permissions:
-      id-token: write
       contents: read
       actions: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
       - name: Tune Nvidia GPU
         id: gpu_health
         # Also a health check: a runner whose GPU stopped responding fails here instead of hanging a later step.
@@ -83,7 +84,7 @@ jobs:
         uses: ./.github/actions/run-selected-tests
         with:
           suite: ${{ toJSON(fromJSON(inputs.plan).core) }}
-          workers: "4"
+          workers: "12"
           junit: /tmp/tlx-core.xml
           setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Run TLX tutorial correctness tests
@@ -93,7 +94,7 @@ jobs:
         uses: ./.github/actions/run-selected-tests
         with:
           suite: ${{ toJSON(fromJSON(inputs.plan).correctness) }}
-          workers: "4"
+          workers: "12"
           junit: /tmp/tlx-correctness.xml
           setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Run device-agnostic TLX codegen tests
@@ -113,6 +114,7 @@ jobs:
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
           job: b200-tlx-test
+          completed-junit: ${{ (steps.run_core_tests.outcome == 'success' || steps.run_core_tests.outcome == 'failure') && '/tmp/tlx-core.xml' || '' }} ${{ (steps.run_correctness_tests.outcome == 'success' || steps.run_correctness_tests.outcome == 'failure') && '/tmp/tlx-correctness.xml' || '' }} ${{ (steps.run_codegen_tests.outcome == 'success' || steps.run_codegen_tests.outcome == 'failure') && '/tmp/tlx-codegen.xml' || '' }}
           failed: ${{ job.status != 'success' }}
           bucket: b200-tlx-job-failed
           junit: ${{ fromJSON(inputs.plan).core.files[0] != null && '/tmp/tlx-core.xml' || '' }} ${{ fromJSON(inputs.plan).correctness.files[0] != null && '/tmp/tlx-correctness.xml' || '' }} ${{ fromJSON(inputs.plan).codegen.files[0] != null && '/tmp/tlx-codegen.xml' || '' }}
@@ -131,15 +133,16 @@ jobs:
       TORCHTLX_ARCH: sm100
     timeout-minutes: 90
     permissions:
-      id-token: write
       contents: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
       - name: Tune Nvidia GPU
         id: gpu_health
         # Also a health check: a runner whose GPU stopped responding fails here instead of hanging a later step.
@@ -238,16 +241,17 @@ jobs:
       SETUP_SCRIPT: /workspace/setup_instance.sh
     timeout-minutes: 60
     permissions:
-      id-token: write
       contents: read
       actions: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
       - name: Tune Nvidia GPU
         id: gpu_health
         # Also a health check: a runner whose GPU stopped responding fails here instead of hanging a later step.
@@ -288,6 +292,7 @@ jobs:
         with:
           workflow: ${{ env.GPU_WORKFLOW_NAME }}
           job: b200-gluon-test
+          completed-junit: ${{ (steps.run_gluon.outcome == 'success' || steps.run_gluon.outcome == 'failure') && '/tmp/gluon.xml' || '' }}
           failed: ${{ job.status != 'success' }}
           bucket: b200-gluon-job-failed
           junit: /tmp/gluon.xml
@@ -309,6 +314,7 @@ jobs:
       job: b200-tlx-test
       result: ${{ needs.b200-tlx-test.result }}
       failures: ${{ needs.b200-tlx-test.outputs.failures }}
+      recovery: ${{ needs.b200-tlx-test.outputs.recovery }}
       sha: ${{ inputs.ref }}
       platform: b200
 
@@ -341,5 +347,6 @@ jobs:
       job: b200-gluon-test
       result: ${{ needs.b200-gluon-test.result }}
       failures: ${{ needs.b200-gluon-test.outputs.failures }}
+      recovery: ${{ needs.b200-gluon-test.outputs.recovery }}
       sha: ${{ inputs.ref }}
       platform: b200
