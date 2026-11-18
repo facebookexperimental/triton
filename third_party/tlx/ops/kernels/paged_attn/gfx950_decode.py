@@ -15,11 +15,15 @@ while QK/softmax remains register-distributed.  Its qlen1/group8
 ``gluon_compat`` specialization pins Gluon's exact packed load ownership, so
 the final K/V MFMA conversions are register-only rather than LDS round trips.
 
-Scope: bf16/fp16 KV cache, GQA, and MTP query_length in 1..4 (causal across the
-query positions). Not covered: FP8, sliding window, ALiBi, sinks, per-token
-quantization. The kernel accepts either contiguous 4-D K/V caches
-``[num_blocks, num_kv_heads, PAGE_SIZE, HEAD_DIM]`` or AITER-compatible packed
-5-D caches::
+Scope: bf16/fp16 KV cache, and float8_e4m3fn KV (optionally with an FP8 query) with per-tensor dequant scales on
+the 4-D caches; GQA, sliding windows, and query_length in 1..8
+(causal across the query positions), which covers MTP and speculative
+verification. Not covered: FP8 on the packed 5-D cache, ALiBi, sinks, per-token quantization. The kernel
+accepts 4-D K/V caches in either head-major ``HND`` order
+``[num_blocks, num_kv_heads, PAGE_SIZE, HEAD_DIM]`` or page-major ``NHD`` order
+``[num_blocks, PAGE_SIZE, num_kv_heads, HEAD_DIM]`` (SGLang's token pool viewed
+by page, as ``unified_attention`` reads it), or AITER-compatible packed 5-D
+caches::
 
     K: [num_blocks, num_kv_heads, HEAD_DIM / X, PAGE_SIZE, X]
     V: [num_blocks, num_kv_heads, PAGE_SIZE / X, HEAD_DIM, X]
@@ -123,6 +127,35 @@ def _make_v_shared_layout():
 
 
 @triton.jit
+def _online_softmax_step(q, kt, v, m_i, l_i, acc, tile_page0, end_page, ctx_len, vis_limit, window, row_page, offs_n,
+                         m_qpos, PAGE_SIZE: tl.constexpr, BLOCK_N: tl.constexpr, PAGES_PER_TILE: tl.constexpr,
+                         HAS_WINDOW: tl.constexpr):
+    qk = tl.dot(q, kt)  # q pre-scaled -> qk already in log2 units
+    # An interior tile fully at/below the causal limit skips
+    # the per-element visibility compare + select; only boundary tiles pay.
+    tile_max_abs = tile_page0 * PAGE_SIZE + (BLOCK_N - 1)
+    is_full = (tile_max_abs <= vis_limit) & ((tile_page0 + PAGES_PER_TILE) <= end_page)
+    if HAS_WINDOW:
+        is_full = is_full & (tile_page0 * PAGE_SIZE >= ctx_len - window)
+    if is_full:
+        qks = qk
+    else:
+        page_ok = (tile_page0 + row_page) < end_page
+        kt_abs = tile_page0 * PAGE_SIZE + offs_n
+        vis = page_ok[None, :] & (kt_abs[None, :] <= (vis_limit + m_qpos[:, None]))
+        if HAS_WINDOW:
+            vis = vis & (kt_abs[None, :] > (vis_limit + m_qpos[:, None] - window))
+        qks = tl.where(vis, qk, float("-inf"))
+    m_ij = tl.max(qks, 1)
+    m_new = tl.maximum(m_i, m_ij)
+    p = tl.math.exp2(qks - m_new[:, None])
+    alpha = tl.math.exp2(m_i - m_new)
+    l_i = l_i * alpha + tl.sum(p, 1)
+    acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+    return m_new, l_i, acc
+
+
+@triton.jit
 def _pa_decode_partition_kernel(
     Q,  # [num_tokens, num_q_heads, HEAD_DIM]
     Kc,  # [num_blocks, num_kv_heads, PAGE_SIZE, HEAD_DIM]
@@ -132,6 +165,9 @@ def _pa_decode_partition_kernel(
     Mid,  # [num_seqs, num_kv_heads, NUM_SPLITS, M_POW2, HEAD_DIM] (fp32)
     Lse,  # [num_seqs, num_kv_heads, NUM_SPLITS, M_POW2] (fp32)
     Out,  # [num_tokens, num_q_heads, HEAD_DIM] (used only when FUSED)
+    QDescale,  # [1] fp32, read only when Q_FP8
+    KDescale,  # [1] fp32, read only when KV_FP8
+    VDescale,  # [1] fp32, read only when KV_FP8
     sm_scale,
     num_splits,  # runtime int (== grid dim 2)
     window,  # keys per query row, including itself; used only when HAS_WINDOW
@@ -178,6 +214,8 @@ def _pa_decode_partition_kernel(
     V_LAYOUT: tl.constexpr,
     QK_SOFTMAX_LAYOUT: tl.constexpr,
     STREAMING_KV: tl.constexpr,
+    DIRECT_KV: tl.constexpr,
+    KV_STAGES: tl.constexpr,
     STREAM_WARPS: tl.constexpr,
     GLUON_COMPAT: tl.constexpr,
     GLUON_K_LOAD_LAYOUT: tl.constexpr,
@@ -185,6 +223,8 @@ def _pa_decode_partition_kernel(
     GLUON_Q_SHARED_LAYOUT: tl.constexpr,
     GLUON_P_SHARED_LAYOUT: tl.constexpr,
     HAS_WINDOW: tl.constexpr,
+    Q_FP8: tl.constexpr,
+    KV_FP8: tl.constexpr,
 ):
     seq = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -218,12 +258,21 @@ def _pa_decode_partition_kernel(
     q = tl.reshape(q, (M_POW2, HEAD_DIM))
 
     QK_SCALE = sm_scale * 1.44269504089  # 1/log(2), for exp2-based softmax
+    # FP8 K/V (and Q) are upcast to the output dtype; their per-tensor scales fold into Q's prescale and the
+    # partial output, so the MFMAs stay BF16/FP16.
+    if KV_FP8:
+        cdt: tl.constexpr = Out.dtype.element_ty
+        QK_SCALE = QK_SCALE * tl.load(KDescale)
+    else:
+        cdt: tl.constexpr = Kc.dtype.element_ty
+    if Q_FP8:
+        QK_SCALE = QK_SCALE * tl.load(QDescale)
     # The general path pre-scales Q once.  The compatibility path deliberately
     # follows Gluon and scales the score tile after QK.
     if GLUON_COMPAT:
         q = q.to(Kc.dtype.element_ty)
     else:
-        q = (q.to(tl.float32) * QK_SCALE).to(Kc.dtype.element_ty)
+        q = (q.to(tl.float32) * QK_SCALE).to(cdt)
     m_qpos = offs_m // GROUP_POW2  # query position per row
     vis_limit = ctx_len - QLEN  # min visible abs key index over rows (m_qpos >= 0)
 
@@ -264,6 +313,8 @@ def _pa_decode_partition_kernel(
         else:
             q_register = tlx.require_layout(q, qk_lhs_layout, pin=False)
         acc = tlx.zeros((M_POW2, HEAD_DIM), tl.float32, layout=pv_mfma_layout)
+    elif DIRECT_KV:
+        acc = tl.zeros([M_POW2, HEAD_DIM], tl.float32)
     else:
         acc = tl.zeros([M_POW2, HEAD_DIM], tl.float32)
         k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), Kc.dtype.element_ty, BUFFER_DEPTH)
@@ -472,7 +523,7 @@ def _pa_decode_partition_kernel(
             acc = acc * alpha_acc + pv
             m_i = m_new
 
-    if not STREAMING_KV and num_tiles > 0:
+    if not STREAMING_KV and not DIRECT_KV and num_tiles > 0:
         physical = tl.load(BlockTables + seq * stride_bt_s +
                            tl.where(row_page < end_page - start_page, start_page + row_page, end_page - 1) *
                            stride_bt_p).to(tl.int64)
@@ -501,8 +552,8 @@ def _pa_decode_partition_kernel(
         for tidx in tl.range(0, num_tiles):
             slot = tidx % BUFFER_DEPTH
             tlx.async_load_wait_group(0)
-            kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, slot)))
-            v = tlx.local_load(tlx.local_view(v_buf, slot))
+            kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, slot))).to(cdt)
+            v = tlx.local_load(tlx.local_view(v_buf, slot)).to(cdt)
 
             nxt = tidx + 1
             if nxt < num_tiles:
@@ -532,29 +583,37 @@ def _pa_decode_partition_kernel(
                 tlx.async_load_commit_group([ntok_k, ntok_v])
 
             tile_page0 = start_page + tidx * PAGES_PER_TILE
-            qk = tl.dot(q, kt)  # q pre-scaled -> qk already in log2 units
-            # An interior tile fully at/below the causal limit skips
-            # the per-element visibility compare + select; only boundary tiles pay.
-            tile_max_abs = tile_page0 * PAGE_SIZE + (BLOCK_N - 1)
-            is_full = (tile_max_abs <= vis_limit) & ((tile_page0 + PAGES_PER_TILE) <= end_page)
-            if HAS_WINDOW:
-                is_full = is_full & (tile_page0 * PAGE_SIZE >= ctx_len - window)
-            if is_full:
-                qks = qk
+            m_i, l_i, acc = _online_softmax_step(q, kt, v, m_i, l_i, acc, tile_page0, end_page, ctx_len, vis_limit,
+                                                 window, row_page, offs_n, m_qpos, PAGE_SIZE, BLOCK_N, PAGES_PER_TILE,
+                                                 HAS_WINDOW)
+
+    if DIRECT_KV and num_tiles > 0:
+        if KV_FP8:
+            # Load FP8 K/V 8 elements per lane (the element ownership BF16 tiles load with) and pin the upcast
+            # tensor there, so every later layout conversion is the BF16 path's, on BF16 data.
+            kv_layout: tl.constexpr = tlx.layout(shape=((8, 8, STREAM_WARPS), (8, BLOCK_N // (8 * STREAM_WARPS))),
+                                                 stride=((8, HEAD_DIM, 8 * HEAD_DIM), (1, 8 * STREAM_WARPS * HEAD_DIM)))
+        # K/V go straight from HBM to registers; the loop pipeliner keeps KV_STAGES - 1 tiles in flight.
+        for tidx in tl.range(0, num_tiles, num_stages=KV_STAGES):
+            tile_page0 = start_page + tidx * PAGES_PER_TILE
+            page_of_row = tile_page0 + row_page
+            physical = tl.load(BlockTables + seq * stride_bt_s +
+                               tl.where(page_of_row < end_page, page_of_row, end_page - 1) * stride_bt_p).to(tl.int64)
+            k_off = physical[:, None] * stride_kc_b + kv_head * stride_kc_h + row_in_page[:, None] * stride_kc_p + \
+                offs_d[None, :] * stride_kc_d
+            v_off = physical[:, None] * stride_vc_b + kv_head * stride_vc_h + row_in_page[:, None] * stride_vc_p + \
+                offs_d[None, :] * stride_vc_d
+            if KV_FP8:
+                k = tlx.require_layout(
+                    tl.load(Kc + tl.max_contiguous(k_off, (1, 8)), cache_modifier=".cg").to(cdt), kv_layout)
+                v = tlx.require_layout(
+                    tl.load(Vc + tl.max_contiguous(v_off, (1, 8)), cache_modifier=".cg").to(cdt), kv_layout)
             else:
-                page_ok = (tile_page0 + row_page) < end_page
-                kt_abs = tile_page0 * PAGE_SIZE + offs_n
-                vis = page_ok[None, :] & (kt_abs[None, :] <= (vis_limit + m_qpos[:, None]))
-                if HAS_WINDOW:
-                    vis = vis & (kt_abs[None, :] > (vis_limit + m_qpos[:, None] - window))
-                qks = tl.where(vis, qk, float("-inf"))
-            m_ij = tl.max(qks, 1)
-            m_new = tl.maximum(m_i, m_ij)
-            p = tl.math.exp2(qks - m_new[:, None])
-            alpha = tl.math.exp2(m_i - m_new)
-            l_i = l_i * alpha + tl.sum(p, 1)
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-            m_i = m_new
+                k = tl.load(Kc + k_off, cache_modifier=".cg")
+                v = tl.load(Vc + v_off, cache_modifier=".cg")
+            m_i, l_i, acc = _online_softmax_step(q, tl.trans(k), v, m_i, l_i, acc, tile_page0, end_page, ctx_len,
+                                                 vis_limit, window, row_page, offs_n, m_qpos, PAGE_SIZE, BLOCK_N,
+                                                 PAGES_PER_TILE, HAS_WINDOW)
 
     has_kv = l_i > 0.0
     if STREAMING_KV:
@@ -565,6 +624,8 @@ def _pa_decode_partition_kernel(
         o_part = tl.where(has_kv_acc, acc / denom_acc, zero_acc)
     else:
         o_part = tl.where(has_kv[:, None], acc / tl.where(has_kv[:, None], l_i[:, None], 1.0), 0.0)
+    if KV_FP8:
+        o_part = o_part * tl.load(VDescale)
 
     if FUSED:
         # Single split -> o_part is already the final normalized output, so
@@ -909,6 +970,9 @@ class PagedDecodeConfig:
     group_pow2: int
     m_pow2: int
     sliding_window: int
+    kv_layout: str
+    direct_kv: bool = False
+    kv_stages: int = 1
 
     @property
     def fused(self):
@@ -924,23 +988,34 @@ class PagedDecodeConfig:
         )
 
 
-def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_length=1, num_splits=None,
-                         max_context_len=None, num_warps=None, waves_per_eu=None, streaming_kv=None, block_n=None,
-                         gluon_compat=None, sliding_window=0):
-    """Select the exact launch and workspace configuration without launching."""
-    num_tokens, num_q_heads, head_dim = query.shape
+def kv_cache_geometry(key_cache, value_cache, head_dim, kv_layout="HND"):
+    """Return ``(num_blocks, num_kv_heads, page_size)`` of a 4-D or packed 5-D cache."""
     assert key_cache.ndim == value_cache.ndim and key_cache.ndim in (4, 5)
-    cache_5d = key_cache.ndim == 5
-    num_blocks, num_kv_heads = key_cache.shape[:2]
+    assert kv_layout in ("HND", "NHD")
     cache_pack_x = 16 // key_cache.element_size()
-    if cache_5d:
-        page_size = key_cache.shape[3]
+    if key_cache.ndim == 5:
+        assert kv_layout == "HND", "packed 5-D caches are head-major"
+        num_blocks, num_kv_heads, _, page_size, _ = key_cache.shape
         assert key_cache.shape == (num_blocks, num_kv_heads, head_dim // cache_pack_x, page_size, cache_pack_x)
         assert value_cache.shape == (num_blocks, num_kv_heads, page_size // cache_pack_x, head_dim, cache_pack_x)
     else:
-        page_size = key_cache.shape[2]
+        if kv_layout == "HND":
+            num_blocks, num_kv_heads, page_size, _ = key_cache.shape
+        else:
+            num_blocks, page_size, num_kv_heads, _ = key_cache.shape
         assert key_cache.shape[3] == head_dim
         assert value_cache.shape == key_cache.shape
+    return num_blocks, num_kv_heads, page_size
+
+
+def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_length=1, num_splits=None,
+                         max_context_len=None, num_warps=None, waves_per_eu=None, streaming_kv=None, block_n=None,
+                         gluon_compat=None, sliding_window=0, kv_layout="HND", direct_kv=None, kv_stages=None):
+    """Select the exact launch and workspace configuration without launching."""
+    num_tokens, num_q_heads, head_dim = query.shape
+    cache_5d = key_cache.ndim == 5
+    cache_pack_x = 16 // key_cache.element_size()
+    num_blocks, num_kv_heads, page_size = kv_cache_geometry(key_cache, value_cache, head_dim, kv_layout)
 
     assert num_tokens % query_length == 0
     num_seqs = num_tokens // query_length
@@ -982,8 +1057,11 @@ def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_leng
                              (query_length == 4 and ((num_seqs >= 32 and max_context_len >= 8192) or
                                                      (num_seqs >= 8 and max_context_len >= 32768)))))
     short_streaming = streaming_kv and query_length == 1 and (block_n == 128 or (block_n is None and short_qlen1))
+    # Few-program page-major verify (<= 16 sequence x KV-head programs): four warps and ~512 split programs.
+    small_verify = (kv_layout == "NHD" and not cache_5d and not streaming_kv and query_length > 1
+                    and num_seqs * num_kv_heads <= 16 and num_warps is None and num_splits is None)
     if num_warps is None:
-        num_warps = (2 if short_streaming else 4) if streaming_kv else (2 if query_length > 1 else 4)
+        num_warps = (2 if short_streaming else 4) if streaming_kv else (4 if small_verify or query_length == 1 else 2)
     if streaming_kv:
         assert cache_5d and query_length in (1, 4) and head_dim == 64
         expected_warps = 2 if short_streaming else 4
@@ -995,7 +1073,22 @@ def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_leng
     group_pow2 = _next_pow2(query_group_size) if gluon_compat else max(16 // qlen_pow2, _next_pow2(query_group_size))
     m_pow2 = qlen_pow2 * group_pow2
     assert m_pow2 >= (8 if gluon_compat else 16), f"M_POW2={m_pow2} is too small for the selected MFMA path"
-    assert query_length * query_group_size <= 64
+    assert m_pow2 <= 64, f"query_length={query_length} x group={query_group_size} pads to M_POW2={m_pow2} > 64"
+
+    # Page-major single-token decode on full-attention layers: direct-to-register K/V loads beat the LDS
+    # pipeline. Tile width and pipeline depth were tuned at 2 and 8 KV heads, batch 1-64, context 8K-100K.
+    auto_direct = (direct_kv is None and kv_layout == "NHD" and not cache_5d and head_dim == 64 and query_length == 1
+                   and not sliding_window and not streaming_kv and not gluon_compat and block_n is None)
+    if auto_direct:
+        direct_kv = True
+        if num_kv_heads > 2:
+            block_n, kv_stages = 128, 1
+        elif num_seqs == 1:
+            block_n, kv_stages = 128, 2
+        else:
+            block_n, kv_stages = 64, 3
+    if direct_kv:
+        assert not cache_5d and not streaming_kv and not gluon_compat, "direct_kv is the 4-D LDS-free path"
 
     if block_n is None:
         if streaming_kv:
@@ -1024,6 +1117,15 @@ def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_leng
     elif num_splits is None:
         if gluon_compat and num_seqs == 1 and max_context_len in (8192, 32768):
             num_splits = 32
+        elif small_verify:
+            num_splits = min(128, _next_pow2(512 // (num_seqs * num_kv_heads)))
+        elif auto_direct:
+            # ~512 programs, plus enough splits that none walks more than ~64 tiles.
+            ctx_keys = max_pages * page_size if max_context_len is None else min(max_context_len, max_pages * page_size)
+            tiles = max(1, -(-ctx_keys // block_n))
+            progs = num_seqs * num_kv_heads
+            fill = _next_pow2(512 // progs) if progs < 512 else 1
+            num_splits = min(128, max(fill, _next_pow2(max(1, tiles // 64))))
         elif streaming_kv:
             medium_decode = (query_length == 1 and num_seqs == 8 and max_context_len is not None
                              and 32768 <= max_context_len < 131072)
@@ -1072,6 +1174,9 @@ def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_leng
         group_pow2=group_pow2,
         m_pow2=m_pow2,
         sliding_window=sliding_window,
+        kv_layout=kv_layout,
+        direct_kv=bool(direct_kv),
+        kv_stages=kv_stages or 1,
     )
 
 
@@ -1085,7 +1190,7 @@ def allocate_pa_decode_workspace(query, key_cache, config):
     while retaining the padded strides.
     """
     num_seqs = query.shape[0] // config.query_length
-    shapes = config.workspace_shapes(num_seqs, key_cache.shape[1], query.shape[2])
+    shapes = config.workspace_shapes(num_seqs, query.shape[1] // config.query_group_size, query.shape[2])
     if shapes is None:
         return None
     mid_shape, lse_shape = shapes
@@ -1102,8 +1207,8 @@ def allocate_pa_decode_workspace(query, key_cache, config):
 
 def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
                   query,  # [num_tokens, num_q_heads, HEAD_DIM]
-                  key_cache,  # 4-D NHD or packed 5-D [block, head, dim/X, page, X]
-                  value_cache,  # 4-D NHD or packed 5-D [block, head, page/X, dim, X]
+                  key_cache,  # 4-D HND/NHD or packed 5-D [block, head, dim/X, page, X]
+                  value_cache,  # 4-D HND/NHD or packed 5-D [block, head, page/X, dim, X]
                   context_lens,  # [num_seqs] int32
                   block_tables,  # [num_seqs, max_pages] int32
                   sm_scale, query_length=1, num_splits=None, max_context_len=None, num_warps=None, waves_per_eu=None,
@@ -1113,11 +1218,19 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
                   workspace=None,  # Optional reusable (mid, lse) float32 tensors for split decode
                   config=None,  # Optional cached PagedDecodeConfig; bypasses host-side reselection
                   sliding_window=0,  # Keys per query row, including itself; 0 attends to the whole context
+                  kv_layout="HND",  # 4-D cache order: HND [block, head, page, dim] or NHD [block, page, head, dim]
+                  k_descale=None,  # [1] fp32 dequant scales for a float8_e4m3fn 4-D cache: K/V = stored * descale
+                  v_descale=None,  # [1] fp32, as k_descale
+                  q_descale=None,  # [1] fp32 dequant scale for a float8_e4m3fn query
                   ):
     num_tokens, num_q_heads, head_dim = query.shape
-    assert key_cache.ndim == value_cache.ndim and key_cache.ndim in (4, 5)
     cache_5d = key_cache.ndim == 5
-    num_blocks, num_kv_heads = key_cache.shape[:2]
+    kv_fp8 = key_cache.dtype == torch.float8_e4m3fn
+    q_fp8 = query.dtype == torch.float8_e4m3fn
+    assert not (kv_fp8 and cache_5d), "FP8 K/V is supported on the 4-D (HND/NHD) cache only"
+    assert not kv_fp8 or (k_descale is not None and v_descale is not None)
+    assert not q_fp8 or (kv_fp8 and q_descale is not None)
+    num_blocks, num_kv_heads, cache_page_size = kv_cache_geometry(key_cache, value_cache, head_dim, kv_layout)
     if config is None:
         config = get_pa_decode_config(
             query,
@@ -1133,6 +1246,7 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
             block_n=block_n,
             gluon_compat=gluon_compat,
             sliding_window=sliding_window,
+            kv_layout=kv_layout,
         )
     else:
         assert isinstance(config, PagedDecodeConfig)
@@ -1144,6 +1258,7 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
         assert block_n is None or config.block_n == block_n
         assert not gluon_compat or config.gluon_compat
         assert config.sliding_window == sliding_window
+        assert config.kv_layout == kv_layout
 
     page_size = config.page_size
     cache_pack_x = config.cache_pack_x
@@ -1164,21 +1279,19 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
     assert num_tokens % query_length == 0
     assert num_q_heads % num_kv_heads == 0
     assert query_group_size == num_q_heads // num_kv_heads
+    assert page_size == cache_page_size
     if cache_5d:
-        assert page_size == key_cache.shape[3]
-        assert key_cache.shape == (num_blocks, num_kv_heads, head_dim // cache_pack_x, page_size, cache_pack_x)
-        assert value_cache.shape == (num_blocks, num_kv_heads, page_size // cache_pack_x, head_dim, cache_pack_x)
         # Keep stride names semantic: kc_p addresses page and kc_d addresses
         # packed head-dimension groups. V's dim 2 addresses token groups.
         key_cache_strides = (key_cache.stride(0), key_cache.stride(1), key_cache.stride(3), key_cache.stride(2),
                              key_cache.stride(4))
         value_cache_strides = tuple(value_cache.stride(i) for i in range(5))
     else:
-        assert page_size == key_cache.shape[2]
-        assert key_cache.shape[3] == head_dim
-        assert value_cache.shape == key_cache.shape
-        key_cache_strides = (*key_cache.stride(), 0)
-        value_cache_strides = (*value_cache.stride(), 0)
+        # The 4-D path addresses (block, head, page, dim) through strides, so
+        # page-major NHD only swaps the head and page strides.
+        order = (0, 1, 2, 3) if kv_layout == "HND" else (0, 2, 1, 3)
+        key_cache_strides = (*(key_cache.stride(i) for i in order), 0)
+        value_cache_strides = (*(value_cache.stride(i) for i in order), 0)
 
     # One-shot fused path: with a single split the partition output is already
     # the final normalized result, so write it straight to `output` and skip both
@@ -1189,8 +1302,6 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
         mid_strides = (0, 0, 0, 0, 0)
         lse_strides = (0, 0, 0, 0)
     else:
-        import torch
-
         mid_shape = (num_seqs, num_kv_heads, num_splits, m_pow2, head_dim)
         lse_shape = (num_seqs, num_kv_heads, num_splits, m_pow2)
         if workspace is None:
@@ -1224,6 +1335,9 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
         mid,
         lse,
         output,
+        q_descale if q_fp8 else output,
+        k_descale if kv_fp8 else output,
+        v_descale if kv_fp8 else output,
         sm_scale,
         num_splits,
         sliding_window,
@@ -1256,6 +1370,8 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
         QK_SOFTMAX_LAYOUT=_make_qk_softmax_layout(block_n if streaming_kv else 64, m_pow2, num_warps if streaming_kv
                                                   else 4) if not gluon_compat else _make_gluon_qk_layout(block_n),
         STREAMING_KV=streaming_kv,
+        DIRECT_KV=config.direct_kv,
+        KV_STAGES=config.kv_stages,
         STREAM_WARPS=num_warps,
         GLUON_COMPAT=gluon_compat,
         GLUON_K_LOAD_LAYOUT=_make_gluon_k_load_layout(page_size),
@@ -1263,6 +1379,8 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
         GLUON_Q_SHARED_LAYOUT=_make_gluon_shared_layout(8, 16),
         GLUON_P_SHARED_LAYOUT=_make_gluon_shared_layout(8, 8),
         HAS_WINDOW=sliding_window > 0,
+        Q_FP8=q_fp8,
+        KV_FP8=kv_fp8,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
     )
@@ -1298,18 +1416,22 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
 
 
 def paged_attention_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale, query_length,
-                           sliding_window, max_context_len, out, workspace):
+                           sliding_window, max_context_len, out, workspace, kv_layout, k_descale=None, v_descale=None,
+                           q_descale=None):
     if out is None:
-        out = torch.empty_like(query)
+        # An FP8 query writes the output in BF16.
+        out = torch.empty(query.shape, dtype=torch.bfloat16 if query.dtype == torch.float8_e4m3fn else query.dtype,
+                          device=query.device)
     return pa_decode_tlx(out, query, key_cache, value_cache, context_lens, block_tables, sm_scale,
                          query_length=query_length, max_context_len=max_context_len, workspace=workspace,
-                         sliding_window=sliding_window)
+                         sliding_window=sliding_window, kv_layout=kv_layout, k_descale=k_descale, v_descale=v_descale,
+                         q_descale=q_descale)
 
 
 def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, query_length, sliding_window,
-                                     max_context_len):
+                                     max_context_len, kv_layout):
     config = get_pa_decode_config(query, key_cache, value_cache, block_tables, query_length=query_length,
-                                  max_context_len=max_context_len, sliding_window=sliding_window)
+                                  max_context_len=max_context_len, sliding_window=sliding_window, kv_layout=kv_layout)
     return allocate_pa_decode_workspace(query, key_cache, config)
 
 
@@ -1319,8 +1441,9 @@ def build_inputs(num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_s
     """Build paged decode inputs. If ``pool_pages`` is set, physical pages are
     drawn from a shared pool of that size (bounds memory for large sweeps); the
     dense reference uses the same ``block_tables`` so correctness is unaffected.
-    ``cache_layout="5d"`` allocates and initializes packed storage natively;
-    it never constructs or repacks a 4-D cache.
+    ``cache_layout`` is ``"4d"`` (head-major HND), ``"nhd"`` (page-major) or
+    ``"5d"``, which allocates and initializes packed storage natively; it never
+    constructs or repacks a 4-D cache.
     """
     import torch
 
@@ -1335,9 +1458,10 @@ def build_inputs(num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_s
     max_pages = (max(ctx_lens) + page_size - 1) // page_size
     distinct = num_seqs * max_pages
     total_pages = distinct if pool_pages is None else min(distinct, pool_pages)
-    assert cache_layout in ("4d", "5d")
-    if cache_layout == "4d":
-        cache_shape = (total_pages, num_kv_heads, page_size, head_dim)
+    assert cache_layout in ("4d", "nhd", "5d")
+    if cache_layout in ("4d", "nhd"):
+        cache_shape = ((total_pages, num_kv_heads, page_size, head_dim) if cache_layout == "4d" else
+                       (total_pages, page_size, num_kv_heads, head_dim))
         key_cache = torch.empty(cache_shape, dtype=dtype, device=device).normal_().mul_(0.2)
         value_cache = torch.empty(cache_shape, dtype=dtype, device=device).normal_().mul_(0.2)
     else:
@@ -1357,12 +1481,21 @@ def build_inputs(num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_s
 
 
 def ref_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads, num_kv_heads,
-               query_length, sliding_window=0):
-    """Dense fp32 reference: gather K/V from the page table, causal over qlen, optionally windowed."""
+               query_length, sliding_window=0, kv_layout="HND", k_descale=None, v_descale=None, q_descale=None):
+    """Dense fp32 reference: gather K/V from the page table, causal over qlen, optionally windowed. FP8 inputs are
+    dequantized with their descales first."""
     import torch
+
+    if key_cache.dtype == torch.float8_e4m3fn:
+        key_cache = key_cache.float() * (1.0 if k_descale is None else float(k_descale.item()))
+        value_cache = value_cache.float() * (1.0 if v_descale is None else float(v_descale.item()))
+    if query.dtype == torch.float8_e4m3fn:
+        query = query.float() * (1.0 if q_descale is None else float(q_descale.item()))
 
     if key_cache.ndim == 5:
         key_cache, value_cache = unpack_5d_kv_cache(key_cache, value_cache)
+    elif kv_layout == "NHD":
+        key_cache, value_cache = key_cache.transpose(1, 2), value_cache.transpose(1, 2)
     head_dim = query.shape[-1]
     page_size = key_cache.shape[2]
     group = num_q_heads // num_kv_heads

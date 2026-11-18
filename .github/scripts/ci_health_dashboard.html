@@ -138,12 +138,6 @@ table.l1l2{table-layout:fixed}table.l1l2 th:first-child{width:90px}table.l1l2 tr
 <div class="shead"><h2>Pull requests</h2><span class="q">Directional signal, earlier</span><span class="owner">Owner: PR author</span></div>
 <div class="callout"><b>A red PR is the PR author's to fix.</b> These results do not count toward main's health. Two exceptions: a failure that also fails on main is not the author's (tagged <span class="tag main">fails on main</span>), and a setup failure is CI's (tagged <span class="tag ci">setup: CI</span>, counted on the Operations tab).</div>
 <div class="card"><h3>Latest full run of each PR, last 24 h</h3><div id="p-list"></div></div>
-<div class="card"><h3>Fast pass / full failure, last 7 days</h3><div class="grid4" id="p-pair-tiles"></div><div id="p-pair-counts"></div>
-<p class="note">Comparable revisions share the same PR and exact source checkout SHA from selector and build logs. The rate is historical candidate revisions divided by completed comparable revisions with a validated fast pass and a full pass or identified test failure. It is not regression recall. Build and setup failures and execution errors are not test gaps and do not enter the rate. Pending, cancelled, unverified and not-required observations stay separate. Stored observations are shown for 30 days; older runs without checkout evidence remain unverified. Retry and legacy evidence refresh is limited to PR runs created in the last 7 days; older rows show their latest collected state.</p>
-<details><summary>Daily trend, last 30 days</summary><div id="p-pair-trend"></div></details>
-<h3>Candidate revisions and latest collected retry state</h3><div id="p-pair-gaps"></div>
-<p class="note">A later full pass does not erase a historical candidate. These observations do not prove that the PR caused a failure, or whether it is flaky. Test IDs retain their parameters; both workflow attempts link to their evidence.</p>
-<details><summary>Other comparison observations</summary><div id="p-pair-other"></div></details></div>
 </section>
 
 <section id="ops" role="tabpanel" hidden>
@@ -328,19 +322,6 @@ function renderPR(list,branch="main"){
   const R={tests:p=>`<span class="${p.whose==="main"?"warn":"bad"}">✕ ${p.n_failed} test${p.n_failed>1?"s":""}</span>`,setup:()=>`<span class="infra">⚠ setup</span>`,build:()=>`<span class="bad">✕ build</span>`,passed:()=>`<span class="ok">✓</span>`,running:()=>`<span class="na">running</span>`,cancelled:()=>`<span class="na">cancelled</span>`};
   const W={author:`<span class="tag own">author</span>`,main:`<span class="tag main">fails on ${esc(branch)}</span>`,ci:`<span class="tag ci">setup: CI</span>`};
   $("p-list").innerHTML=table(["PR","Author","Test platforms","Result","Whose"],list.map(p=>[`${p.pr?pr(p.pr):esc(p.branch)} <a href="${esc(p.url)}">${esc(p.title.slice(0,70))}</a><br><span class="muted">${ago(p.t)}</span>`,who(p.author),p.gpus.length?p.gpus.join(" · "):`<span class="na">none</span>`,(R[p.result]||(()=>esc(p.result)))(p),`${W[p.whose]||""} ${esc(p.note)}`]));
-}
-
-function renderFastFull(v){
-  const K={passed:"Fast pass / full pass",test:"Fast pass / full test-fail candidate",build:"Full build failure",setup:"Full setup failure",execution_error:"Full execution error",unknown:"Unknown result",pending:"Pending",cancelled:"Cancelled",missing_pair:"Missing pair",unverified_version:"Unverified source version",not_required:"Not required",fast_not_passed:"Fast did not pass"};
-  if(!v){$("p-pair-tiles").innerHTML="<p class=\"empty\">No comparison data collected.</p>";return}
-  const rate=v.rate==null?"Unavailable":(100*v.rate).toFixed(1)+"%";
-  $("p-pair-tiles").innerHTML=tile("Candidate revisions",v.counts.test,`${v.candidate_prs} unique PRs`,v.counts.test?"warn":"")+tile("Completed comparable revisions",v.comparable,"Validated fast pass and exact checkout evidence")+tile("Candidate rate",rate,`${v.counts.test} / ${v.comparable} comparable revisions`)+tile("Workflow attempts",`${v.fast_attempts} / ${v.full_attempts}`,"Fast / full, separate from revision counts");
-  $("p-pair-counts").innerHTML=table(["Observation","Count, last 7 days"],Object.entries(K).map(([k,label])=>[label,v.counts[k]]),[1]);
-  $("p-pair-trend").innerHTML=table(["UTC day","Comparable revisions","Candidate revisions","Unique candidate PRs"],v.trend.filter(d=>d.observations).map(d=>[esc(d.day),d.comparable,d.counts.test,d.candidate_prs]),[1,2,3]);
-  const F={passed:"Full passed",test:"Full tests failed",build:"Full build failed",setup:"Full setup failed",execution_error:"Full execution error",unknown:"Unknown full result",pending:"Full pending",cancelled:"Full cancelled",not_required:"Full not required"};
-  const link=(a,label)=>a?`<a href="${esc(a.url)}">${label}, attempt ${a.attempt}</a><br><span class="muted">${esc(a.updated_at.replace("T"," "))}</span>`:"Missing";
-  $("p-pair-gaps").innerHTML=table(["PR / tested revision","Platform / failed test","Evidence","Latest collected state"],v.records.filter(p=>p.gaps.length).flatMap(p=>p.gaps.map(g=>[`${pr(p.pr)}<br>${sha(p.sha)}<br><span class="muted">${esc(p.t)}</span>`,g.failures.map(f=>`${esc(f.platform)} · ${esc(f.kind)}<br>${testId(f.id)}<br><span class="muted">${esc(f.t)}</span>`).join("<br>"),`${link(g.fast,"Fast pass")}<br>${link(g.full,"Full failure")}`,`${esc(K[p.latest]||p.latest)}${p.latest==="passed"?"<br>Historical candidate retained":""}<br>${link(p.full,"Latest revision full")}<br>Latest collected PR full: ${esc(F[p.latest_pr_result]||p.latest_pr_result)}<br>${link(p.latest_pr_full,"Latest PR full")}`])));
-  $("p-pair-other").innerHTML=table(["PR / source version","Latest collected observation","Fast attempt","Full attempt","Test evidence"],v.records.filter(p=>!p.gaps.length).map(p=>[`${pr(p.pr)}<br>${p.verified?sha(p.sha):"Unverified checkout"}<br><span class="muted">${esc(p.t)}</span>`,esc(K[p.latest]||p.latest),link(p.fast,"Fast"),link(p.full,"Full"),p.failures.map(f=>`${esc(f.platform)} · ${esc(f.kind)}<br>${testId(f.id)}<br><span class="muted">${esc(f.t)}</span>`).join("<br>")]));
 }
 
 const GPUS=["H100","B200","MI350"];
@@ -605,7 +586,7 @@ function renderBranches(d){
     $("branch-sel").innerHTML=Object.keys(d.branches).map(b=>`<button type="button" data-b="${esc(b)}" aria-pressed="${b===cur}">${esc(b)}</button>`).join("");
     for(const b of $("branch-sel").querySelectorAll("button"))b.onclick=()=>{BRANCH=b.dataset.b;saveView();draw()};
     $("m-q").textContent=`Did a push to ${cur} break something new?`;
-    const v=d.branches[cur];renderMain(v.main,renderLit(v.lit),cur);renderNightly(v.nightly);renderPerf(v.nightly);renderPR(v.pr,cur);renderFastFull(v.fast_full);renderSanitizer(v.sanitizer);renderOps(v.ops,v.usage,d.occupancy);renderLLVM(v.bump,cur)};
+    const v=d.branches[cur];renderMain(v.main,renderLit(v.lit),cur);renderNightly(v.nightly);renderPerf(v.nightly);renderPR(v.pr,cur);renderSanitizer(v.sanitizer);renderOps(v.ops,v.usage,d.occupancy);renderLLVM(v.bump,cur)};
   draw()}
 
 function show(id){if(!$(id)||!$(id).matches("section"))id="main";

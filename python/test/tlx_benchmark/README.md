@@ -13,11 +13,15 @@ python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`, `paged_decode`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
-`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, or one of the
-fused operators below.
+`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, `router_gemm`,
+or one of the fused operators below.
 
-Fused operators fuse an elementwise epilogue into a GEMM (`tlx/ops/kernels/fused/`): `addmm_mul_add`,
-`linear_rowscale`.
+Fused operators (`tlx/ops/kernels/fused/`) run steps that would otherwise be separate kernels in one launch:
+`addmm_mul_add` and `linear_rowscale` fuse an elementwise epilogue into a GEMM, `norm_residual_norm`
+fuses the post-norm, gated residual add and pre-norm of a residual-stream boundary,
+`qk_norm_rope_kv_cache` fuses the q/k head norm, RoPE, FP8 quantization and paged KV cache write,
+`rmsnorm_gate` fuses a per-head RMSNorm with a sigmoid output gate, and `moe_router_topk_align` fuses the router
+GEMM, sigmoid top-k and expert-aligned slot sort of an MoE layer.
 
 ```
 options:
@@ -73,6 +77,7 @@ options:
 | `paged_decode` | none | full FP64 check; throughput and latency reporting | heuristic |
 | `moe` | none (FlyDSL's Muse MoE ships with aiter) | absolute floor, currently unset -> reports only | heuristic |
 | `moe_routing` | `torch.compile` of the eager routing | speedup >= 0.9x | heuristic |
+| `router_gemm` | `F.linear` on the fp32 upcast (hipBLASLt fp32) | speedup >= 0.9x | heuristic |
 
 ### Fused operators
 
@@ -80,6 +85,10 @@ options:
 |----|-----------|------|---------------|
 | `addmm_mul_add` | `torch.addmm` + `torch.addcmul` | speedup >= 0.9x | heuristic |
 | `linear_rowscale` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
+| `norm_residual_norm` | `torch.compile` of the unfused module sequence | speedup >= 0.9x | heuristic |
+| `moe_router_topk_align` | `router_gemm` + `moe_routing` + the `moe` slot sort (separate launches) | speedup >= 0.9x | heuristic |
+| `qk_norm_rope_kv_cache` | `torch.compile` of the eager norm, RoPE and cache scatter | speedup >= 0.9x | heuristic |
+| `rmsnorm_gate` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 
 The direct `mm` provider has a `heuristic_config`, so its default is a single
 analytically chosen config. The TorchTLX providers use Inductor's template
@@ -332,7 +341,8 @@ inside the measured window. Build the tensors in `prepare` and capture them.
 `test_ops_perf.py` picks the new file up automatically.
 
 `bench_norm.py` covers the GEO plain, saved-state, MXFP8, MXFP4, NVFP4,
-fused/jagged and softmax requests. It replays CUDA graphs for both providers;
+fused/jagged and softmax requests, and on gfx950 the forward RMSNorm (`norm_fwd`
+with `norm='rms'`). It replays CUDA graphs for both providers;
 quantized cases report latency without a torch quantization speedup.
 
 ### BF16 paged decode on gfx1250

@@ -7,10 +7,10 @@
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @mn_major_b_n96
+  // CHECK-DAG: llvm.mlir.constant(32767 : i32)
+  // CHECK-DAG: llvm.mlir.constant(33554432 : i32)
   // CHECK: llvm.bitcast %{{.*}} : vector<2xi32> to i64
-  // CHECK: llvm.mlir.constant(32767 : i32)
-  // CHECK-NEXT: llvm.and
-  // CHECK-NEXT: llvm.mlir.constant(33554432 : i32)
+  // CHECK: llvm.and
   // CHECK: tcgen05.mma.cta_group::1.kind::f16
   tt.func @mn_major_b_n96(%a: !ttg.memdesc<128x64xf16, #a, #ttg.shared_memory>,
                           %b: !ttg.memdesc<64x96xf16, #b, #ttg.shared_memory, 64x128>,
@@ -20,10 +20,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 
   // CHECK-LABEL: @mn_major_b_n128
+  // CHECK-DAG: llvm.mlir.constant(32767 : i32)
+  // CHECK-DAG: llvm.mlir.constant(33554432 : i32)
   // CHECK: llvm.bitcast %{{.*}} : vector<2xi32> to i64
-  // CHECK: llvm.mlir.constant(32767 : i32)
-  // CHECK-NEXT: llvm.and
-  // CHECK-NEXT: llvm.mlir.constant(33554432 : i32)
+  // CHECK: llvm.and
   // CHECK: tcgen05.mma.cta_group::1.kind::f16
   tt.func @mn_major_b_n128(%a: !ttg.memdesc<128x64xf16, #a, #ttg.shared_memory>,
                            %b: !ttg.memdesc<64x128xf16, #b, #ttg.shared_memory>,

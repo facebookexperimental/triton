@@ -1,7 +1,6 @@
 """Decide whether a pull request runs the TLX codegen trace.
 
-Fast correctness uses this to build the trace's base wheel alongside its head
-wheel; tlx-codegen-trace.yml uses it to gate the trace itself.
+tlx-codegen-trace.yml uses it to gate the trace.
 Usage: codegen_trace.py BASE HEAD (prints true or false).
 """
 import os

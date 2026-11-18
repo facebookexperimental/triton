@@ -33,6 +33,7 @@ class OpSpec:
     default_space: str = "heuristic"  # used when the caller passes space=None
     invariant_vocab: frozenset = frozenset()  # canonical dim names a BitwiseInvarianceSpec may use
     enforces_invariance: bool = False  # the impl prunes schedules per the resolved spec
+    supports_window: bool = False  # flash_attn_varlen: the impl takes max_seqlen_k= and window_size=
 
     def __str__(self) -> str:
         return f"{self.op}/{self.arch} ({self.variant})"
@@ -58,6 +59,18 @@ def _linear_rowscale_accepts(d):
     return 0 < d["K"] <= 512 and d["K"] % 8 == 0 and d["N"] > 0 and d["N"] % 8 == 0
 
 
+def _pow2(x):
+    return 1 << (x - 1).bit_length()
+
+
+def _paged_decode_gfx950_accepts(d):
+    # The kernel pads QLEN and GROUP to powers of two (GROUP to at least 16 // QLEN) and supports at most 64 padded
+    # rows; QLEN=5, GROUP=12 has 60 real rows but pads to 8 x 16.
+    qlen, group = d["QLEN"], d["GROUP"]
+    return (d["HEAD_DIM"] in (64, 128) and 1 <= qlen <= 8 and group >= 1
+            and _pow2(qlen) * max(16 // _pow2(qlen), _pow2(group)) <= 64)
+
+
 _NORM_MODULES = {
     'sm100': ['layernorm', 'layernorm_add', 'rmsnorm', 'norm_fwd', 'norm_bwd', 'norm_backward_from_normalized'],
     '_softmax': ['softmax', 'softmax_fwd', 'softmax_bwd'], '_fp4': [
@@ -74,8 +87,9 @@ _NORM_MODULES = {
         'rmsnorm_backward_quantize_dx_mxfp8', 'rmsnorm_backward_quantize_dx_mxfp8_precomputed',
         'rmsnorm_backward_quantize_dx_mxfp8_bf16_precomputed',
         'rmsnorm_backward_quantize_dx_mxfp8_from_output_recompute_q_precomputed'
-    ]
+    ], 'gfx950': ['rmsnorm', 'norm_fwd']
 }
+_NORM_ARCHES = {'sm100': ('sm90', 'sm100'), '_softmax': ('sm90', 'sm100'), 'gfx950': ('gfx950', )}
 _NORM_AUTOGRAD = frozenset([
     'layernorm', 'layernorm_add', 'rmsnorm', 'softmax', 'layernorm_mxfp8_with_backward',
     'layernorm_mxfp8_gdpa_with_backward'
@@ -319,6 +333,25 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="norm_residual_norm",
+        arch="gfx950",
+        variant="row_per_program",
+        impl="triton.tlx.ops.kernels.fused.norm_residual_norm.gfx950:norm_residual_norm",
+        dtypes=_BF16,
+        # One 8-wave program holds the row in registers as 8-element lanes over 4096-element chunks, in one
+        # tl.arange, so H must be a power of two.
+        accepts=lambda d: d["H"] in (4096, 8192, 16384),
+    ),
+    OpSpec(
+        op="rmsnorm_gate",
+        arch="gfx950",
+        variant="eight_heads_per_program",
+        impl="triton.tlx.ops.kernels.fused.rmsnorm_gate.gfx950:rmsnorm_gate",
+        dtypes=_BF16,
+        # The summation order is that of 32 two-element lanes per 64-element head; a program owns 8 heads.
+        accepts=lambda d: d["head_dim"] == 64 and d["H"] > 0 and d["H"] % 8 == 0,
+    ),
+    OpSpec(
         op="moe",
         arch="gfx950",
         variant="heuristic",
@@ -334,6 +367,37 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="wave_rows",
         impl="triton.tlx.ops.kernels.moe.routing_gfx950:moe_routing",
         dtypes=frozenset({"float32"}),
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="qk_norm_rope_kv_cache",
+        arch="gfx950",
+        variant="token_rows",
+        impl="triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache.gfx950:qk_norm_rope_kv_cache",
+        dtypes=_BF16,
+        # One program holds a token's q and k heads: power-of-two tiles of at most 4096 elements each.
+        accepts=lambda d: (all(n > 0 and n & (n - 1) == 0 for n in (d["HQ"], d["HK"], d["D"])) and 16 <= d["D"] <= 256
+                           and d["HQ"] * d["D"] <= 4096 and d["HK"] * d["D"] <= 4096),
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="moe_router_topk_align",
+        arch="gfx950",
+        variant="three_launches",
+        impl="triton.tlx.ops.kernels.fused.moe_router_topk_align.gfx950:moe_router_topk_align",
+        dtypes=_BF16,
+        # router_gemm's GEMV loads and split-K partitions divide E and K; moe_routing holds up to 1024 experts.
+        accepts=lambda d: 0 < d["E"] <= 1024 and d["E"] % 16 == 0 and d["K"] > 0 and d["K"] % 1024 == 0,
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="router_gemm",
+        arch="gfx950",
+        variant="bf16x3_split_k",
+        impl="triton.tlx.ops.kernels.router_gemm.gfx950:router_gemm",
+        dtypes=_BF16,
+        # GEMV loads and split-K partitions are powers of two that divide E and K.
+        accepts=lambda d: d["E"] > 0 and d["E"] % 16 == 0 and d["K"] > 0 and d["K"] % 1024 == 0,
         requires=frozenset(),
     ),
     OpSpec(
@@ -533,6 +597,18 @@ CATALOG: tuple[OpSpec, ...] = (
         supports_backward=False,
     ),
     OpSpec(
+        op="flash_attn_varlen",
+        arch="sm100",
+        variant="jfa_ws_clc",
+        impl="triton.tlx.ops.kernels.flash_attn_varlen.sm100:flash_attn_varlen",
+        invariant_vocab=_VARLEN_DIMS,
+        dtypes=_FP16,
+        accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
+        requires=frozenset({"tma", "tmem"}),
+        supports_backward=True,
+        supports_window=True,
+    ),
+    OpSpec(
         op="mla_window_attn",
         arch="sm90",
         variant="overlapped_row_blocks",
@@ -671,7 +747,7 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="split_k_mfma",
         impl="triton.tlx.ops.kernels.paged_attn.gfx950_decode:paged_attention_decode",
         dtypes=_FP16,
-        accepts=lambda d: (d["HEAD_DIM"] in (64, 128) and 1 <= d["QLEN"] <= 4 and d["QLEN"] * d["GROUP"] <= 64),
+        accepts=_paged_decode_gfx950_accepts,
     ),
     OpSpec(
         op="paged_attention_prefill",
@@ -706,10 +782,10 @@ CATALOG: tuple[OpSpec, ...] = (
 
 CATALOG += tuple(
     OpSpec(op=op, arch=arch, variant="row_norm", impl=f"triton.tlx.ops.kernels.norm.{module}:{op}", dtypes=frozenset(
-        {"float16", "bfloat16", "float32"}), supports_backward=op in _NORM_AUTOGRAD)
+        {"float16", "bfloat16", "float32"}), supports_backward=op in _NORM_AUTOGRAD and arch != "gfx950")
     for module, names in _NORM_MODULES.items()
     for op in names
-    for arch in (("sm90", "sm100") if module in ("sm100", "_softmax") else ("sm100", )))
+    for arch in _NORM_ARCHES.get(module, ("sm100", )))
 
 _BY_KEY = {(s.op, s.arch): s for s in CATALOG}
 assert len(_BY_KEY) == len(CATALOG), "duplicate (op, arch) in CATALOG"

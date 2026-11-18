@@ -1,6 +1,5 @@
 name: Fast Triton correctness
 on:
-  pull_request:
   workflow_dispatch:
     inputs:
       platforms:
@@ -165,20 +164,3 @@ jobs:
       - name: Verify touched-test coverage across platforms
         if: needs.select.outputs.build == 'true'
         run: python3 .github/scripts/fast_tests.py verify --evidence "${RUNNER_TEMP}/fast-evidence"
-      # GPU full tests and the TLX codegen trace are separate workflows that start when this run succeeds
-      # (workflow_run). They take this run's head wheel through this manifest and verify it; see fast_followup.py.
-      - name: Write the follow-up manifest
-        if: github.event_name == 'pull_request'
-        id: followup
-        env:
-          WHEEL: ${{ needs.build.outputs.wheel }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 .github/scripts/fast_followup.py manifest --out "${RUNNER_TEMP}/followup/fast-followup.json"
-      - name: Upload the follow-up manifest
-        if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.followup.outputs.name }}
-          path: ${{ runner.temp }}/followup/fast-followup.json
-          if-no-files-found: error
