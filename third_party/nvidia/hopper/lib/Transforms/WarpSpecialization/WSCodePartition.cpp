@@ -5284,12 +5284,19 @@ static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
 //   %a = local_alloc %val -> memdesc<#shared_nontransposed>
 //   %b = memdesc_trans %a  -> memdesc<#shared_transposed>
 //   mmav5 %b, ...          (operand A)
+//
+// FP32 operands are left alone: a transposed TF32 operand would need 128B
+// swizzle with 32B atomicity, which is not supported (see
+// AccelerateMatmul.cpp), so AccelerateMatmul picks the transposed alloc
+// precisely so that the MMA reads a non-transposed operand.
 static void swapTransposedLocalAllocs(triton::FuncOp &funcOp) {
   SmallVector<ttg::LocalAllocOp> toSwap;
   funcOp.walk([&](ttg::LocalAllocOp allocOp) {
     if (!allocOp.getSrc())
       return;
     auto memDescType = cast<ttg::MemDescType>(allocOp.getType());
+    if (memDescType.getElementType().isF32())
+      return;
     auto encoding =
         dyn_cast<ttg::NVMMASharedEncodingAttr>(memDescType.getEncoding());
     if (!encoding || !encoding.getTransposed())

@@ -121,13 +121,13 @@ from ._normalization import (
 
 __all__ = [
     "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
-    "moe_routing", "norm_residual_norm", "rmsnorm_gate", "router_gemm", "qk_norm_rope_kv_cache", "addmm",
-    "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen", "linear_rowscale",
-    "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn",
-    "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode", "prepare_flash_attn_varlen_backward",
-    "flash_attn_varlen_backward", "paged_attention_decode", "paged_attention_prefill",
-    "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d", "UnsupportedOp",
-    "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space", "paged_prefill"
+    "moe_routing", "moe_router_topk_align", "norm_residual_norm", "rmsnorm_gate", "router_gemm",
+    "qk_norm_rope_kv_cache", "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8",
+    "flash_attn_varlen", "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn",
+    "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "paged_attention_decode",
+    "paged_attention_prefill", "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d",
+    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space", "paged_prefill"
 ]
 __all__ += [
     'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
@@ -987,6 +987,70 @@ def router_gemm(x, weight, *, out=None, space=None):
     _check_enforced("router_gemm", spec, invariance)
     with torch.cuda.device(x.device):
         return fn(x, weight, out)
+
+
+def moe_router_topk_align(x, weight, correction_bias, topk=8, *, num_local_experts, local_expert_start=0, block_m,
+                          router_multiplier=1.0, route_scale=1.0, eps=0.0, space=None):
+    """The MoE routing front end: router logits, sigmoid top-k, and the expert-aligned slot order of the local experts.
+    Forward only.
+
+    Returns what ``router_gemm``, then ``moe_routing``, then the slot sort inside ``tlx.ops.moe`` return, bit for bit:
+    ``logits = router_gemm(x, weight)`` (fp32, exact products), ``(topk_weights, topk_ids) = moe_routing(logits,
+    correction_bias, topk, ...)``, and the routed slots of the experts ``[local_expert_start, local_expert_start +
+    num_local_experts)`` sorted by local expert into ``block_m``-padded blocks. It runs as three launches: the top-k
+    kernel adds the router GEMM's split-K partials itself, so the GEMM's reduction launch and the logits round trip
+    are gone. The logits are not returned.
+
+    Returns ``(topk_weights, topk_ids, sorted_ids, expert_ids, num_tokens_post_padded)``: fp32 and int32 ``(T, topk)``;
+    ``sorted_ids`` int32 of length ``cap = ceil((T * topk + num_local_experts * (block_m - 1)) / block_m) * block_m``,
+    holding flat slot indices ``token * topk + slot``, in slot order within an expert, and ``T * topk`` in padding
+    positions; ``expert_ids`` int32 ``(cap / block_m,)``, the local expert of each block, ``-1`` past the last; and
+    ``num_tokens_post_padded`` int32 ``(1,)``, the number of positions in used blocks. Slots routed to other ranks'
+    experts are left out. Shapes and dtypes otherwise as ``router_gemm`` and ``moe_routing``; ``block_m`` must be a
+    power of two of at least 16. Graph-capturable: nothing is read on the host.
+    Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    if not all(isinstance(t, torch.Tensor) for t in (x, weight, correction_bias)):
+        raise InvalidInput("tlx.ops.moe_router_topk_align expects tensors x, weight and correction_bias")
+    if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1] or correction_bias.shape != weight.shape[:1]:
+        raise InvalidInput("tlx.ops.moe_router_topk_align expects x (T, K), weight (E, K) and correction_bias (E,); "
+                           f"got {tuple(x.shape)}, {tuple(weight.shape)} and {tuple(correction_bias.shape)}")
+    T, K = x.shape
+    E = weight.shape[0]
+    if (x.dtype != torch.bfloat16 or weight.dtype != torch.float32 or correction_bias.dtype != torch.float32
+            or not weight.is_contiguous() or not correction_bias.is_contiguous() or (T > 1 and x.stride(0) < K)
+            or (K > 1 and x.stride(1) != 1)):
+        raise InvalidInput("tlx.ops.moe_router_topk_align expects bf16 x with unit column stride and rows that do not "
+                           "overlap, a contiguous fp32 weight and a contiguous fp32 correction_bias")
+    for name, value in (("topk", topk), ("num_local_experts", num_local_experts),
+                        ("local_expert_start", local_expert_start), ("block_m", block_m)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise InvalidInput(f"tlx.ops.moe_router_topk_align expects an int {name}; got {value!r}")
+    if not 1 <= topk <= min(E, _MOE_ROUTING_MAX_TOPK):
+        raise InvalidInput(f"tlx.ops.moe_router_topk_align supports 1 <= topk <= min(E, {_MOE_ROUTING_MAX_TOPK}); got "
+                           f"topk={topk}, E={E}")
+    if not 1 <= num_local_experts <= E or not 0 <= local_expert_start <= E - num_local_experts:
+        raise InvalidInput(f"tlx.ops.moe_router_topk_align expects local experts within [0, {E}); got start "
+                           f"{local_expert_start} and count {num_local_experts}")
+    if block_m < 16 or block_m & (block_m - 1):
+        raise InvalidInput(f"tlx.ops.moe_router_topk_align expects a power-of-two block_m >= 16; got {block_m}")
+    for name, value in (("router_multiplier", router_multiplier), ("route_scale", route_scale), ("eps", eps)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise InvalidInput(f"tlx.ops.moe_router_topk_align expects a Python number for {name}; got {value!r}")
+    if any(t.device != x.device for t in (weight, correction_bias)):
+        raise InvalidInput("tlx.ops.moe_router_topk_align expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("moe_router_topk_align", space)
+    _check_single_config_space("moe_router_topk_align", space_name)
+    fn, spec = impl_for("moe_router_topk_align", device=x.device)
+    check_inputs(spec, dtype=x.dtype, E=E, K=K, topk=topk)
+    check_backward(spec, x, weight, correction_bias)
+    _check_enforced("moe_router_topk_align", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, weight, correction_bias, topk, num_local_experts, local_expert_start, block_m, router_multiplier,
+                  route_scale, eps)
 
 
 def qk_norm_rope_kv_cache(q, k, v, k_cache, v_cache, slot_mapping, *, eps, q_scale=1.0, positions=None,
