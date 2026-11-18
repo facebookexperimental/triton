@@ -2054,4 +2054,27 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     ttng.arrive_barrier %empty, 1 {ttng.fence_generic_reads} : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
     tt.return
   }
+
+  // A release that guards a CTA-local TMA buffer and the CLC response buffer:
+  // clc_try_cancel writes the response through the async proxy and, in a
+  // cluster launch, may write it into every CTA of the cluster, so the release
+  // keeps cluster scope.
+  // CHECK-LABEL: @two_cta_clc_response_release
+  tt.func @two_cta_clc_response_release(%desc: !tt.tensordesc<128xbf16, #shared>, %full: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %empty: !ttg.memdesc<1xi64, #barrier, #smem, mutable>) {
+    %c0 = arith.constant 0 : i32
+    %true = arith.constant true
+    %buf = ttg.local_alloc {allocation.offset = 32768 : i32} : () -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%c0] %buf, %full, %true : !tt.tensordesc<128xbf16, #shared>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    %v = ttg.local_load %buf : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+    %result = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<2xi64, #barrier, #smem, mutable>
+    %bar = ttg.local_alloc {allocation.offset = 16 : i32} : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttng.clc_try_cancel %result, %bar : !ttg.memdesc<2xi64, #barrier, #smem, mutable>, !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %response = ttng.clc_load_result %result : !ttg.memdesc<2xi64, #barrier, #smem, mutable> -> i128
+    "test.keep"(%v, %response) : (tensor<128xbf16, #blocked>, i128) -> ()
+    // CHECK: "test.keep"
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = true}
+    // CHECK-NEXT: ttng.arrive_barrier
+    ttng.arrive_barrier %empty, 1 {ttng.fence_generic_reads} : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    tt.return
+  }
 }
