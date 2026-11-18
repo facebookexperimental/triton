@@ -191,11 +191,10 @@ def test_status_vocabulary_is_exactly_the_four_documented():
     assert {s.value for s in Status} == {"ok", "pip", "noisy", "error"}
 
 
-def test_noisy_is_not_a_failure_but_pip_and_error_are():
+def test_only_a_broken_or_wrong_kernel_fails_the_run():
     from _harness.report import FAILING
 
-    assert Status.NOISY not in FAILING
-    assert set(FAILING) == {Status.PIP, Status.ERROR}
+    assert set(FAILING) == {Status.ERROR}
 
 
 def test_diagnostic_reference_reports_speedup_without_enforcing_the_floor():

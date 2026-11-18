@@ -8,6 +8,9 @@
       benchmark fields are copied.
   prune KEEP
       Keep the last KEEP nights of summaries on that release.
+  report SUMMARY [--regressions FILE]
+      Markdown for the run summary: the commit's TLX test status, cases below
+      the perf floor or in error, and the night's regressions.
   render OUTDIR [--from DIR]
       Write OUTDIR/index.html from every summary on the release (or in DIR,
       for a local preview), for pages.yml to mount at /bench/. The page is
@@ -27,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from urllib.parse import urlencode
 
 REPO = os.environ.get("GITHUB_REPOSITORY", "facebookexperimental/triton")
 TAG = "tlx-ops-bench"
@@ -538,6 +542,75 @@ def page_data(runs):
     }
 
 
+#: Cases listed under each op table's fold in the run summary; the rest are counted.
+REPORT_ROWS = 20
+
+
+def _cell(text, limit=160):
+    """One line of free text, safe inside a Markdown table cell: a multi-line note keeps its first line and the
+    source line a Triton CompilationError points its caret at."""
+    lines = [l.strip() for l in (text or "").strip().splitlines() if l.strip()]
+    if len(lines) > 2 and set(lines[-1]) == {"^"}:
+        lines = [lines[0], lines[-2]]
+    line = " ".join(lines[:2])
+    line = line.replace("|", "\\|")
+    return line if len(line) <= limit else line[:limit - 1] + "…"
+
+
+def report(args):
+    with open(args.summary) as fh:
+        night = json.load(fh)
+    lines = [f"### {night['platform'].upper()} · {night['version']} · `{night['sha'][:12]}`", ""]
+    ci = night.get("ci")
+    if ci:
+        status = f"[{ci['tlx_test']}]({ci['run']})" if ci.get("run") else ci["tlx_test"]
+        lines += [f"TLX tests on this commit: {status}", ""]
+    bad = {}
+    for op, o in sorted(night["ops"].items()):
+        cases = [c for c in o["cases"] if c["status"] in ("pip", "error")]
+        if cases:
+            bad[op] = (len(o["cases"]), cases)
+    if bad:
+        lines += [
+            "| Op | Cases | Below the perf floor | Worst speedup | In error |", "| --- | ---: | ---: | ---: | ---: |"
+        ]
+        for op, (total, cases) in bad.items():
+            pip = [c for c in cases if c["status"] == "pip"]
+            worst = min((c["speedup"] for c in pip if c.get("speedup")), default=None)
+            lines.append(f"| {op} | {total} | {len(pip)} | {f'{worst:.3f}x' if worst else '-'} | "
+                         f"{sum(c['status'] == 'error' for c in cases)} |")
+        rows = sorted(((op, c) for op, (_, cases) in bad.items() for c in cases), key=lambda r:
+                      (r[1]["status"] != "error", r[1].get("speedup") or 0))
+        lines += [
+            "", "<details><summary>Cases</summary>", "", "| Op | Case | Status | Speedup | Note |",
+            "| --- | --- | --- | ---: | --- |"
+        ]
+        for op, c in rows[:REPORT_ROWS]:
+            speedup = f"{c['speedup']:.3f}x" if c.get("speedup") else "-"
+            lines.append(f"| {op} | `{c['key'].split('/', 2)[-1]}` | {c['status']} | {speedup} | "
+                         f"{_cell((c.get('notes') or [''])[0])} |")
+        if len(rows) > REPORT_ROWS:
+            lines.append(f"| | {len(rows) - REPORT_ROWS} more in the summary JSON | | | |")
+        lines += ["", "</details>", ""]
+    alerts = []
+    if args.regressions and os.path.exists(args.regressions):
+        with open(args.regressions) as fh:
+            alerts = json.load(fh)
+    if alerts:
+        lines += ["| Regression | Cases | Worst loss | Issue |", "| --- | ---: | ---: | --- |"]
+        for a in alerts:
+            numbers = [a["bisect_issue"]] if a.get("bisect_issue") else a.get("tracked_by", [])
+            title = f"[perf-regression] {a['platform']} / {a['op']} / {a['direction']}"
+            search = f"https://github.com/{REPO}/issues?{urlencode({'q': f'is:issue in:title \"{title}\"'})}"
+            issue = ", ".join(f"#{n}" for n in numbers) if numbers else f"[search]({search})"
+            worst = min(c["ratio"] for c in a["cases"])
+            lines.append(f"| {a['op']} / {a['direction']} | {len(a['cases'])} | {1 - worst:.1%} | {issue} |")
+        lines.append("")
+    if not bad and not alerts:
+        lines += ["No case below the perf floor or in error, and no regressions.", ""]
+    print("\n".join(lines))
+
+
 def render(args):
     runs = read_summaries(args.source) if args.source else load_summaries()
     payload = page_data(runs)
@@ -566,11 +639,14 @@ def main():
     s.add_argument("--ci-run", default="", help="the gpu-tests.yml run --ci comes from")
     p = sub.add_parser("prune")
     p.add_argument("keep", type=int)
+    rep = sub.add_parser("report")
+    rep.add_argument("summary")
+    rep.add_argument("--regressions", help="the regression detector's output for this night")
     r = sub.add_parser("render")
     r.add_argument("outdir")
     r.add_argument("--from", dest="source", help="read summaries from this directory instead of the release")
     args = parser.parse_args()
-    {"summarize": summarize, "prune": prune, "render": render}[args.cmd](args)
+    {"summarize": summarize, "prune": prune, "report": report, "render": render}[args.cmd](args)
 
 
 if __name__ == "__main__":

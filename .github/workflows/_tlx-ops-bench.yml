@@ -216,6 +216,13 @@ jobs:
           gh release download tlx-ops-bench --pattern '*.${{ inputs.platform }}.json' --dir history
           python3 .github/scripts/tlx_ops_bench_regressions.py history \
             --platform '${{ inputs.platform }}' --date "${DATE}" --out regressions.json --file-issues
+      - name: Write the run summary
+        if: always()
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 .github/scripts/tlx_ops_bench_dashboard.py report "${VERSION##*.dev}.${{ inputs.platform }}.json" \
+            --regressions regressions.json >> "$GITHUB_STEP_SUMMARY"
       - name: Upload regression evidence
         if: always()
         uses: actions/upload-artifact@v4
