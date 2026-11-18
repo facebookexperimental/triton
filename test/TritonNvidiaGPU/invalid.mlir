@@ -492,6 +492,20 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// TLX sets per_warp while building the kernel, before any warp count is
+// attached, so the verifier must accept an unknown warp count.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module {
+  tt.func @arrive_barrier_per_warp_unknown_warps() {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.arrive_barrier %bar, 4 {per_warp} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [8, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 8}>
 #shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -1668,6 +1682,58 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %axis1: tensor<4x128xi8, #fp4_axis1>) {
     // expected-error @below {{'ttng.packed_arith' op requires every fp4 operand to have the result shape with the same single dimension halved}}
     %0 = ttng.packed_arith mul %axis0, %axis1 : (tensor<2x256xi8, #fp4_axis0>, tensor<4x128xi8, #fp4_axis1>) -> tensor<4x256xf8E4M3FN, #result>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_store_reduce_rejects_type_mismatch(%dst: !tt.ptr<f16>, %size: i32) {
+    %src = ttg.local_alloc : () -> !ttg.memdesc<128xf32, #shared, #smem, mutable>
+    // expected-error @below {{reduction source and destination element types must match, got 'f32' and 'f16'}}
+    ttng.async_store %src, %dst, %size {store_reduce = 1 : i32} : !ttg.memdesc<128xf32, #shared, #smem, mutable>, !tt.ptr<f16>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_store_reduce_rejects_unsupported_kind(%dst: !tt.ptr<f32>, %size: i32) {
+    %src = ttg.local_alloc : () -> !ttg.memdesc<128xf32, #shared, #smem, mutable>
+    // expected-error @below {{unsupported reduce kind max for element type 'f32'}}
+    ttng.async_store %src, %dst, %size {store_reduce = 3 : i32} : !ttg.memdesc<128xf32, #shared, #smem, mutable>, !tt.ptr<f32>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func @arrive_barrier_per_warp_per_thread() {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // expected-error @below {{per_warp cannot be combined with perThread}}
+    ttng.arrive_barrier %bar, 4 {per_warp, perThread} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:100"} {
+  tt.func @arrive_barrier_per_warp_single_warp() {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // expected-error @below {{per_warp requires multiple warps}}
+    ttng.arrive_barrier %bar, 1 {per_warp} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     tt.return
   }
 }

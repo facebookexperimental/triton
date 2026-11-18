@@ -3,6 +3,7 @@
 
 #include "mlir/IR/Operation.h"
 #include "triton/Analysis/Allocation.h"
+#include "triton/Analysis/Membar.h"
 
 namespace mlir {
 class DialectRegistry;
@@ -34,6 +35,22 @@ MembarScratchSync getWarpLocalScratchSync();
 // ttg.barrier that a tlx.workgroup_barrier interposes. Attaching via a dialect
 // extension keeps the core Membar analysis free of any ROCDL dependency.
 void registerSchedulingBarrierExternalModel(DialectRegistry &registry);
+
+class AMDMembarAnalysis : public MembarAnalysis {
+public:
+  using MembarAnalysis::MembarAnalysis;
+
+protected:
+  // AMD kernels synchronize the LDS they use inside ttg.warp_predicate
+  // themselves, so keep predicated regions opaque here as they were before
+  // NVIDIA lowered them. Walking in adds barriers that the kernel's own already
+  // cover and can place a barrier inside a region.
+  // TODO: Check whether we should enable walking into the region for AMD
+  // lowering.
+  bool analyzesPredicatedRegions() const override { return false; }
+};
+
+using AMDModuleMembarAnalysis = ModuleMembarOrFenceAnalysis<AMDMembarAnalysis>;
 } // namespace mlir::triton::AMD
 
 #endif

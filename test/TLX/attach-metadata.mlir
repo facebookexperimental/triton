@@ -243,6 +243,26 @@ module {
     tt.return
   }
 }
+
+// -----
+
+// A `tlx.no_ws_header_tid_reuse` marker on the warp_specialize op is propagated
+// to the module (NVIDIA target), where the warp-specialize lowering reads it.
+// CHECK: module attributes {
+// CHECK-SAME: tlx.no_ws_header_tid_reuse
+module {
+  tt.func @kernel_no_ws_header_tid_reuse() {
+    ttg.warp_specialize() attributes {tlx.no_ws_header_tid_reuse}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(1) {
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
 //--- cuda-helper-abi.mlir
 
 // Frontend helper signatures have no tensor encodings.

@@ -43,6 +43,11 @@ protected:
     return state;
   }
 
+  /// Whether to walk into `ttg.warp_predicate` bodies as a branch region that
+  /// either runs or is skipped. Otherwise the predicated op is opaque
+  /// straight-line code whose body effects the analysis does not see.
+  virtual bool analyzesPredicatedRegions() const { return true; }
+
 private:
   void resolve(FunctionOpInterface function, FuncMapT *funcMap,
                OpBuilder *builder) {
@@ -85,7 +90,9 @@ private:
         // effects.
         update(&operation, &state, funcMap, builder);
         if (operation.hasTrait<OpTrait::IsTerminator>() ||
-            isa<RegionBranchOpInterface>(operation)) {
+            isa<RegionBranchOpInterface>(operation) ||
+            (isa<gpu::WarpPredicateOp>(operation) &&
+             analyzesPredicatedRegions())) {
           visitTerminator(&operation, successors);
           break;
         }
@@ -137,6 +144,20 @@ private:
       // Collect the block successors of the branch.
       for (Block *successor : operation->getSuccessors())
         successors.emplace_back(successor, Block::iterator());
+      return;
+    }
+
+    // A predicated region runs its body or skips it, then continues after
+    // itself. Its body yields back to the same continuation.
+    if (isa<gpu::WarpPredicateOp>(operation)) {
+      successors.emplace_back(&operation->getRegion(0).front(),
+                              Block::iterator());
+      successors.emplace_back(operation->getBlock(), operation->getIterator());
+      return;
+    }
+    if (isa<gpu::PredicateYieldOp>(operation)) {
+      Operation *parent = operation->getParentOp();
+      successors.emplace_back(parent->getBlock(), parent->getIterator());
       return;
     }
 

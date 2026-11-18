@@ -406,8 +406,8 @@ struct ConvertTritonAMDGPUToLLVM
     if (targetInfo.requiresAliasInfoForAsyncOps())
       AMD::annotateLocalLoadsSyncedViaAsyncWait(mod);
 
-    ModuleMembarAnalysis membarPass(allocation, AMD::membarFilter,
-                                    AMD::getWarpLocalScratchSync());
+    AMD::AMDModuleMembarAnalysis membarPass(allocation, AMD::membarFilter,
+                                            AMD::getWarpLocalScratchSync());
     membarPass.run();
     materializeDeferredSchedGroupBarriers(mod);
 

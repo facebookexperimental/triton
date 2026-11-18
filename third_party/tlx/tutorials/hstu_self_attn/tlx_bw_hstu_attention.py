@@ -5215,7 +5215,7 @@ class _AttentionFunction(torch.autograd.Function):
             stride_mm=stride_mm,
             num_softmax_heads=num_softmax_heads,
             num_targets=num_targets,
-            causal=True,
+            causal=causal,
             max_attn_len=max_attn_len,
             full_attn_size=full_attn_size,
             contextual_seq_len=contextual_seq_len,
@@ -5319,6 +5319,8 @@ def tlx_bw_hstu_mha(
     contextual_seq_len: int = 0,
     causal: bool = True,
 ) -> torch.Tensor:
+    if not causal:
+        raise ValueError("tlx_bw_hstu_mha is causal-only; causal=False is not implemented")
     return _AttentionFunction.apply(
         max_seq_len,
         alpha,

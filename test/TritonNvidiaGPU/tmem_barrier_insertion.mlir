@@ -166,6 +166,68 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
       !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
     tt.return
   }
+  // The analysis walks into a predicated region. A warp-local
+  // read-modify-write there needs no CTA barrier, which the verifier would
+  // reject inside the region anyway.
+  // CHECK-LABEL: @ld_then_st_warp_predicate
+  // CHECK: ttg.warp_predicate
+  // CHECK-NEXT: ttng.tmem_load
+  // CHECK-NEXT: ttng.tmem_store
+  // CHECK-NEXT: ttg.predicate_yield
+  tt.func @ld_then_st_warp_predicate(%pred: i1) {
+    %true = arith.constant true
+    %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.barrier local
+    ttg.warp_predicate %pred () {
+      %1 = ttng.tmem_load %0 : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      ttng.tmem_store %1, %0, %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+      ttg.predicate_yield
+    } {wave_uniform} : (i1) -> ()
+    tt.return
+  }
+
+  // A predicated region's body runs on the threads of its parent region, so a
+  // store before it and a warp-local load inside it need no CTA barrier.
+  // CHECK-LABEL: @st_then_ld_across_warp_predicate
+  // CHECK: ttng.tmem_store
+  // CHECK-NEXT: ttg.warp_predicate
+  // CHECK-NEXT: ttng.tmem_load
+  tt.func @st_then_ld_across_warp_predicate(%pred: i1, %data: tensor<128x128xf32, #blocked>) {
+    %true = arith.constant true
+    %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.barrier local
+    ttng.tmem_store %data, %0, %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.warp_predicate %pred () {
+      %1 = ttng.tmem_load %0 : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      ttg.predicate_yield
+    } {wave_uniform} : (i1) -> ()
+    tt.return
+  }
+
+  // A store inside a predicated region is visible to the analysis, so an MMA
+  // after the region gets its CTA barrier outside the region.
+  // CHECK-LABEL: @st_in_warp_predicate_then_mma
+  // CHECK: ttng.tmem_store
+  // CHECK-NEXT: ttg.predicate_yield
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttng.tc_gen5_mma
+  tt.func @st_in_warp_predicate_then_mma(%pred: i1, %arg0: tensor<128x128xf32, #blocked>,
+                                         %arg1: !ttg.memdesc<128x128xf16, #shared_a, #ttg.shared_memory>,
+                                         %arg2: !ttg.memdesc<128x128xf16, #shared_b, #ttg.shared_memory>) {
+    %false = arith.constant false
+    %true = arith.constant true
+    %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    ttg.barrier local
+    ttg.warp_predicate %pred () {
+      ttng.tmem_store %arg0, %0, %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+      ttg.predicate_yield
+    } {wave_uniform} : (i1) -> ()
+    ttng.tc_gen5_mma %arg1, %arg2, %0, %false, %true :
+      !ttg.memdesc<128x128xf16, #shared_a, #ttg.shared_memory>,
+      !ttg.memdesc<128x128xf16, #shared_b, #ttg.shared_memory>,
+      !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
+    tt.return
+  }
 
   // CHECK-LABEL: @mma_then_alloc
   // CHECK: ttng.tc_gen5_mma
@@ -345,11 +407,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 
-  // Same allocation, same buffer index: the views do alias and the WAR still
-  // needs ordering.
+  // Same allocation, same buffer index: the views alias, but a constant buffer
+  // index resolves to a static address, and each address is accessed by the
+  // same warp on both ends, so program order and the waits that follow every
+  // TMEM load and store suffice.
   // CHECK-LABEL: @ld_then_st_same_buffer
   // CHECK: ttng.tmem_load
-  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.tmem_store
   tt.func @ld_then_st_same_buffer(%arg0: tensor<128x128xf32, #blocked>) {
     %true = arith.constant true
@@ -580,4 +643,5 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
     ttng.tmem_store %arg0, %1, %true : tensor<128x64xf32, #blocked64_8> -> !ttg.memdesc<128x64xf32, #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>, #ttng.tensor_memory, mutable, 128x128>
     tt.return
   }
+
 }

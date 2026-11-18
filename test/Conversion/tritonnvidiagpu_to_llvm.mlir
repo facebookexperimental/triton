@@ -121,6 +121,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 
+  // CHECK-LABEL: arrive_barrier_per_warp
+  tt.func @arrive_barrier_per_warp(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>) {
+    // CHECK-NOT: nvvm.barrier
+    // CHECK: nvvm.bar.warp.sync
+    // CHECK: [[TID:%.*]] = nvvm.read.ptx.sreg.tid.x
+    // CHECK: [[LANE:%.*]] = llvm.urem
+    // CHECK: [[IS_ZERO:%.*]] = llvm.icmp "eq" [[LANE]]
+    // CHECK: "@$0 mbarrier.arrive.shared::cta.b64 _, [$1], 2;", "b,r" [[IS_ZERO]]
+    ttng.arrive_barrier %alloc, 8 {per_warp} : !ttg.memdesc<1xi64, #shared0, #smem>
+    tt.return
+  }
+
   // CHECK-LABEL: arrive_barrier_named
   tt.func @arrive_barrier_named(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>, %pred: i1) {
     %c9_i32 = arith.constant 9 : i32

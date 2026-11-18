@@ -72,13 +72,14 @@ def num_warps(_semantic=None):
 
 @tl.builtin
 def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semantic=None, _generator=None):
-    """Execute ``body`` under an AMD per-lane execution predicate.
+    """Execute ``body`` under a per-lane execution predicate.
 
     A scalar predicate supplies the execution bit for the current physical
     lane. For a tensor predicate, elements owned by one lane are OR-reduced to
     that lane's execution bit. A wavefront skips ``body`` when none of its
     lanes are active. Active lanes receive the values returned by
-    ``body(*inits, *args)``; inactive lanes keep ``inits``. The body must be an
+    ``body(*inits, *args)``; inactive lanes keep ``inits``. With no ``inits``,
+    the body returns nothing and is run only for its effects. The body must be an
     ``@triton.jit`` function containing straight-line computation without
     cross-wave synchronization. Bodies containing reductions, dots, or layout
     shuffles must pass ``wave_uniform=True`` to declare that the predicate has
@@ -88,8 +89,12 @@ def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semanti
     match each carried tensor or a common leading shape (for example, one row
     predicate for row-major matrices).
 
-    This operation has no cross-wave synchronization and is currently lowered
-    only by the AMD backend.
+    This operation has no cross-wave synchronization, so compilation fails if
+    the body needs a CTA barrier. NVIDIA so far supports only effects-only
+    bodies (no ``inits``) under a scalar ``wave_uniform=True`` predicate such as
+    ``tlx.warp_any(...)``, containing register math and tensor memory loads and
+    stores. Other operations, such as mbarrier arrives and waits, are not yet
+    supported in the body on NVIDIA.
     """
     if isinstance(inits, tl.tensor):
         inits = (inits, )
@@ -100,8 +105,6 @@ def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semanti
 
     inits = builtins.list(inits)
     args = builtins.list(args)
-    if not inits:
-        raise ValueError("warp_predicate requires at least one carried value")
     if not all(isinstance(value, tl.tensor) for value in inits):
         raise TypeError("warp_predicate carried values must be tensors")
 
@@ -113,12 +116,19 @@ def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semanti
         raise TypeError(f"warp_predicate wave_uniform must be a bool, got {type(wave_uniform).__name__}")
 
     builder = _semantic.builder
+    # Moving the insertion point into the detached body block and back resets
+    # the builder location, so restore the caller's location for the body call
+    # and for the op, whose diagnostics should point at this call.
+    loc = builder.get_loc()
     block = builder.new_block()
     insertion_point = builder.get_insertion_point()
     try:
         builder.set_insertion_point_to_start(block)
+        builder.set_loc(loc)
         body_result = _generator.call_JitFunction(body, inits + args, kwargs={})
-        if isinstance(body_result, tl.tensor):
+        if body_result is None or (isinstance(body_result, tl.constexpr) and body_result.value is None):
+            results = []
+        elif isinstance(body_result, tl.tensor):
             results = [body_result]
         elif isinstance(body_result, (builtins.tuple, builtins.list, tl.tuple)):
             results = builtins.list(body_result)
@@ -134,6 +144,7 @@ def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semanti
         builder.create_predicate_yield_op([result.handle for result in results])
     finally:
         builder.restore_insertion_point(insertion_point)
+        builder.set_loc(loc)
 
     result_types = [result.type.to_ir(builder) for result in results]
     op = builder.create_warp_predicate_op(
