@@ -216,25 +216,23 @@ def test_a_crash_is_reported_against_the_test_that_was_running(tmp_path, monkeyp
         "    os.kill(os.getpid(), signal.SIGSEGV)",
         "def test_after(): pass",
     ]))
-    running, log = tmp_path / "running", tmp_path / "pytest.log"
-    env = dict(os.environ, PYTEST_RUNNING_TEST_FILE=str(running), PYTHONPATH=pytest_plugins)
-    with open(log, "w") as out:
-        status = subprocess.run([
-            sys.executable, "-X", "faulthandler", "-m", "pytest", "test_ops.py", "-p", "running_test", "-p",
-            "no:cacheprovider", "-v", "-s"
-        ], cwd=tmp_path, env=env, stdout=out, stderr=subprocess.STDOUT).returncode
+    outputs = tmp_path / "github_output"
+    env = dict(os.environ, GITHUB_OUTPUT=str(outputs), PYTHONPATH=pytest_plugins)
+    status = subprocess.run(
+        [sys.executable, "-m", "pytest", "test_ops.py", "-p", "running_test", "-p", "no:cacheprovider", "-v", "-s"],
+        cwd=tmp_path, env=env, capture_output=True).returncode
+    # GitHub Actions keeps the last value written for a key.
+    running = [line.split("=", 1)[1] for line in outputs.read_text().splitlines() if line.startswith("running_test=")]
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
     monkeypatch.setattr("sys.argv", [
         "parse", "--junit",
-        str(tmp_path / "missing.xml"), "--workflow", "W", "--job", "j", "--failed", "--running-test",
-        str(running), "--log",
-        str(log), "--exit-code",
+        str(tmp_path / "missing.xml"), "--workflow", "W", "--job", "j", "--failed", "--crashed-test", running[-1],
+        "--exit-code",
         str(128 - status if status < 0 else status)
     ])
     junit.main()
     [item] = json.loads(capsys.readouterr().out)
     assert item["issue_title"] == "[nightly] W / j / SIGSEGV in test_ops::test_crash"
-    assert "test_crash (test_ops.py:5)" in item["summary"]
     assert item["fallback"] is True
 
 

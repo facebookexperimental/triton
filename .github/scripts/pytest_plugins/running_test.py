@@ -1,15 +1,16 @@
-"""pytest plugin: keep the node id of the running test in $PYTEST_RUNNING_TEST_FILE.
+"""pytest plugin: publish the running test as the step output ``running_test``.
 
-pytest writes no JUnit XML if the process dies, so this file is what names the test a crash happened in.
+pytest writes no JUnit XML if the process dies. GitHub Actions keeps the last value written for a key, so after a
+crash ``running_test`` names the test pytest died in, and it is empty when every test finished.
 """
 import os
 
 
-def _record(text):
-    path = os.environ.get("PYTEST_RUNNING_TEST_FILE")
+def _record(nodeid):
+    path = os.environ.get("GITHUB_OUTPUT")
     if path:
-        with open(path, "w") as fh:
-            fh.write(text)
+        with open(path, "a") as fh:
+            fh.write(f"running_test={nodeid}\n")
 
 
 def pytest_runtest_logstart(nodeid, location):

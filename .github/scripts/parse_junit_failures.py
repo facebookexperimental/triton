@@ -39,8 +39,6 @@ PARAM_SUFFIX = re.compile(r"\[.*\]$")
 # Fraction of a step's timeout budget at which a still-passing suite is reported.
 SLOW_THRESHOLD = 0.8
 
-TOP_FRAME = re.compile(r'File "([^"]+)", line (\d+) in (\w+)')
-
 
 def normalize(node_id: str) -> str:
     return PARAM_SUFFIX.sub("", node_id)
@@ -162,39 +160,11 @@ def crash_cause(exit_code):
     return f"exit {exit_code}"
 
 
-def running_test(path):
-    """The node id pytest_plugins/running_test.py left behind: the test that was running if pytest died."""
-    try:
-        with open(path) as fh:
-            return fh.read().strip()
-    except OSError:
-        return ""
-
-
-def innermost_frame(log_path):
-    """The innermost Python frame of the thread faulthandler dumped as current."""
-    try:
-        with open(log_path, errors="replace") as fh:
-            lines = fh.read().splitlines()
-    except OSError:
-        return ""
-    for i, line in enumerate(lines):
-        if line.startswith("Current thread "):
-            for later in lines[i + 1:]:
-                top = TOP_FRAME.search(later)
-                if top:
-                    return f"{top[3]} ({os.path.basename(top[1])}:{top[2]})"
-            return ""
-    return ""
-
-
-def build_crash_item(node_id, cause, frame, workflow, job):
+def build_crash_item(node_id, cause, workflow, job):
     """The test that was running when pytest died, reported under its own identity."""
     module, _, name = node_id.partition("::")
     rid = f"{module.removesuffix('.py').replace('/', '.')}::{name}"
     summary = f"pytest died ({cause}) while running {node_id}, before writing JUnit XML."
-    if frame:
-        summary += f" Innermost Python frame: {frame}."
     is_external, reason = classify(summary)
     return {
         "normalized_failure_id": rid,
@@ -377,8 +347,7 @@ def main():
         help=("Step timeout budget for a JUnit XML, e.g. /tmp/tlx-core.xml=30. "
               "Repeatable. Enables near-timeout reporting for that file."),
     )
-    parser.add_argument("--running-test", default="", help="file pytest_plugins/running_test.py writes")
-    parser.add_argument("--log", default="", help="pytest output, for the faulthandler frame if it died")
+    parser.add_argument("--crashed-test", default="", help="node id pytest_plugins/running_test.py left set")
     parser.add_argument("--exit-code", type=int, help="pytest's exit status, to name the signal that killed it")
     parser.add_argument(
         "--slow-threshold",
@@ -394,10 +363,8 @@ def main():
         failures, missing_paths = collect_failures(args.junit)
         items = build_items(failures, args.workflow, args.job)
         if not items and missing_paths:
-            node_id = running_test(args.running_test) if args.running_test else ""
-            if node_id:
-                frame = innermost_frame(args.log) if args.log else ""
-                items.append(build_crash_item(node_id, crash_cause(args.exit_code), frame, args.workflow, args.job))
+            if args.crashed_test:
+                items.append(build_crash_item(args.crashed_test, crash_cause(args.exit_code), args.workflow, args.job))
             else:
                 items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
         if not items and args.failed:

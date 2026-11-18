@@ -36,12 +36,8 @@ inputs:
     description: Space-separated <xml>=<timeout-minutes> pairs; reports passing steps close to timing out
     required: false
     default: ""
-  running-test:
-    description: File pytest_plugins/running_test.py writes; names the test that was running if pytest died
-    required: false
-    default: ""
-  pytest-log:
-    description: pytest output; gives the faulthandler frame if pytest died
+  crashed-test:
+    description: The running_test output of pytest_plugins/running_test.py; names the test pytest died in
     required: false
     default: ""
   exit-code:
@@ -83,8 +79,7 @@ runs:
         COMPLETED_LIT: ${{ inputs.completed-lit }}
         BUDGET: ${{ inputs.budget }}
         LIT_LOG: ${{ inputs.lit-log }}
-        RUNNING_TEST: ${{ inputs.running-test }}
-        PYTEST_LOG: ${{ inputs.pytest-log }}
+        CRASHED_TEST: ${{ inputs.crashed-test }}
         EXIT_CODE: ${{ inputs.exit-code }}
         GPU_UNHEALTHY: ${{ inputs.gpu-unhealthy }}
         SETUP_SCRIPT: ${{ inputs.setup-script }}
@@ -101,8 +96,7 @@ runs:
         else
           for b in ${BUDGET}; do ARGS+=(--budget "${b}"); done
           [[ "${GPU_UNHEALTHY}" != true ]] || ARGS+=(--gpu-unhealthy)
-          [[ -z "${RUNNING_TEST}" ]] || ARGS+=(--running-test "${RUNNING_TEST}")
-          [[ -z "${PYTEST_LOG}" ]] || ARGS+=(--log "${PYTEST_LOG}")
+          [[ -z "${CRASHED_TEST}" ]] || ARGS+=(--crashed-test "${CRASHED_TEST}")
           [[ -z "${EXIT_CODE}" ]] || ARGS+=(--exit-code "${EXIT_CODE}")
           # shellcheck disable=SC2086  # JUNIT is a space-separated list
           python3 "${SCRIPTS}/parse_junit_failures.py" --junit ${JUNIT} "${ARGS[@]}" --completed-junit ${COMPLETED_JUNIT} > /dev/null
