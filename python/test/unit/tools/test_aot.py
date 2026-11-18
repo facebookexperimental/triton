@@ -29,6 +29,15 @@ elif is_hip():
         return ["amdhip64"]
 
 
+def runtime_env(tmp_dir):
+    env = os.environ.copy()
+    library_path = [tmp_dir, *library_dirs()]
+    if inherited_library_path := env.get("LD_LIBRARY_PATH"):
+        library_path.append(inherited_library_path)
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(library_path)
+    return env
+
+
 kernel_utils_src = """
 import triton
 
@@ -416,8 +425,7 @@ def test_compile_link_matmul_no_specialization():
         a, b, a_path, b_path, c_path = generate_matmul_test_data(tmp_dir, M, N, K)
 
         # run test case
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = tmp_dir
+        env = runtime_env(tmp_dir)
         subprocess.run(["./test", a_path, b_path, c_path], env=env, check=True, cwd=tmp_dir)
 
         # read data and compare against reference
@@ -449,8 +457,7 @@ def test_compile_link_matmul():
         a, b, a_path, b_path, c_path = generate_matmul_test_data(tmp_dir, M, N, K)
 
         # run test case
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = tmp_dir
+        env = runtime_env(tmp_dir)
         subprocess.run(["./test", a_path, b_path, c_path], env=env, check=True, cwd=tmp_dir)
 
         # read data and compare against reference
@@ -483,8 +490,7 @@ def test_launcher_has_no_available_kernel():
         a, b, a_path, b_path, c_path = generate_matmul_test_data(tmp_dir, M, N, K)
 
         # run test case
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = tmp_dir
+        env = runtime_env(tmp_dir)
         result = subprocess.run(
             ["./test", a_path, b_path, c_path],
             env=env,
@@ -531,8 +537,7 @@ def test_compile_link_autotune_matmul():
             test_name = f"test_{algo_id}"
             gen_test_bin(tmp_dir, M, N, K, exe=test_name, algo_id=algo_id)
 
-            env = os.environ.copy()
-            env["LD_LIBRARY_PATH"] = tmp_dir
+            env = runtime_env(tmp_dir)
             subprocess.run(
                 [f"./{test_name}", a_path, b_path, c_path],
                 check=True,

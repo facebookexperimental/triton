@@ -1068,4 +1068,39 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     } : (i32, i32, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<3x128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<3x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<3x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !tt.ptr<bf16>, !tt.ptr<bf16>, !tt.ptr<bf16>, !tt.ptr<bf16>, !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable>, f32, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>) -> ()
     tt.return
   }
+
+  // CHECK: def read_only_store_wait(
+  // CHECK: tlx.async_descriptor_store_wait(0)
+  // CHECK: tlx.async_descriptor_store_wait(1, read_only=True)
+  tt.func public @read_only_store_wait() {
+    ttng.async_tma_store_wait {pendings = 0 : i32}
+    ttng.async_tma_store_wait {pendings = 1 : i32, read_only}
+    tt.return
+  }
+
+  // per_warp: the op counts the whole task; TLX counts per warp, so 4 over 4
+  // warps is 1.
+  // CHECK: def per_warp_arrive(
+  // CHECK: tlx.barrier_arrive({{[a-z_0-9]+}}, per_warp=True)  #
+  tt.func public @per_warp_arrive() {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.arrive_barrier %bar, 4 {per_warp} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+
+  // The warps are the arriving partition's.
+  // CHECK: def per_warp_arrive_in_partition(
+  // CHECK: tlx.barrier_arrive({{[a-z_0-9]+}}, 3, per_warp=True)  #
+  tt.func public @per_warp_arrive_in_partition() {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttg.warp_specialize(%bar)
+    default {
+      ttg.warp_yield
+    }
+    partition0(%arg0: !ttg.memdesc<1xi64, #shared, #smem, mutable>) num_warps(2) {
+      ttng.arrive_barrier %arg0, 6 {per_warp} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      ttg.warp_return
+    } : (!ttg.memdesc<1xi64, #shared, #smem, mutable>) -> ()
+    tt.return
+  }
 }

@@ -1448,6 +1448,31 @@ void printSimplifiedOp(
     return;
   }
 
+  // ttng.arrive_barrier {per_warp}: the op counts the whole task; TLX counts
+  // each warp.
+  if (opName == "ttng.arrive_barrier" && op->hasAttr("per_warp")) {
+    auto countAttr = op->getAttrOfType<IntegerAttr>("count");
+    int64_t count = countAttr ? countAttr.getInt() : 1;
+    std::optional<int> numWarps = ttg::maybeLookupNumWarps(op);
+    if (!numWarps || count % *numWarps != 0) {
+      op->emitError("per_warp arrive_barrier whose count does not split "
+                    "across its warps does not round-trip to TLX");
+      os << "# unsupported: per_warp arrive_barrier (count=" << count << ")";
+      printLocComment(op, os);
+      return;
+    }
+    count /= *numWarps;
+    os << "tlx.barrier_arrive("
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    if (count != 1)
+      os << ", " << count;
+    if (op->getNumOperands() >= 2)
+      os << ", pred=" << getValueName(op->getOperand(1), argSubstitutionMap);
+    os << ", per_warp=True)";
+    printLocComment(op, os);
+    return;
+  }
+
   // ttng.wait_barrier: emit barrier_wait(bar, phase) without pred
   if (opName == "ttng.wait_barrier" && op->getNumOperands() >= 2) {
     os << "tlx.barrier_wait("
@@ -1539,7 +1564,10 @@ void printSimplifiedOp(
     int pendings = 0;
     if (auto pendingsAttr = op->getAttrOfType<IntegerAttr>("pendings"))
       pendings = pendingsAttr.getInt();
-    os << "tlx.async_descriptor_store_wait(" << pendings << ")";
+    os << "tlx.async_descriptor_store_wait(" << pendings;
+    if (op->hasAttr("read_only"))
+      os << ", read_only=True";
+    os << ")";
     printLocComment(op, os);
     return;
   }

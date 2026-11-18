@@ -23,6 +23,32 @@ def _get_region_replica_id_stack() -> List[int]:
     return _tlx_state.region_replica_id_stack
 
 
+def _get_region_num_warps_stack() -> List[int]:
+    """Get the thread-local stack of the warp counts of the async regions being compiled."""
+    if not hasattr(_tlx_state, 'region_num_warps_stack'):
+        _tlx_state.region_num_warps_stack = []
+    return _tlx_state.region_num_warps_stack
+
+
+def get_current_num_warps(builder) -> int:
+    """The number of warps of the code being compiled: its async task's, or the kernel's outside any."""
+    stack = _get_region_num_warps_stack()
+    # None for a task that does not declare num_warps.
+    return stack[-1] if stack else builder.options.num_warps
+
+
+def region_mangle_suffix(builder) -> str:
+    """Suffix for helpers called from an async task whose warp count differs from the kernel's.
+
+    A helper can depend on its caller's warp count, as a per-warp barrier_arrive does, so it is
+    compiled once per warp count rather than reused across tasks with different ones.
+    """
+    stack = _get_region_num_warps_stack()
+    if stack and stack[-1] and stack[-1] != builder.options.num_warps:
+        return f"__tlx_warps{stack[-1]}"
+    return ""
+
+
 def _get_sub_region_has_exception() -> bool:
     """Get the thread-local sub_region_has_exception flag."""
     if not hasattr(_tlx_state, 'sub_region_has_exception'):
@@ -169,6 +195,7 @@ def visit_withAsyncTasks(self, node):
     no_ending_cluster_sync = False
     mbarrier_try_wait_suspend_ns = None
     less_reg_mma = False
+    no_ws_header_tid_reuse = False
     for kw in getattr(ws_context, "keywords", []):
         if kw.arg == "exclusive":
             exclusive = bool(_unwrap_if_constexpr(self.visit(kw.value)))
@@ -180,6 +207,8 @@ def visit_withAsyncTasks(self, node):
                 raise ValueError("mbarrier_try_wait_suspend_ns must be a non-negative integer")
         elif kw.arg == "less_reg_mma":
             less_reg_mma = bool(_unwrap_if_constexpr(self.visit(kw.value)))
+        elif kw.arg == "no_ws_header_tid_reuse":
+            no_ws_header_tid_reuse = bool(_unwrap_if_constexpr(self.visit(kw.value)))
 
     with enter_sub_region(self) as sr:
         liveins, _ = sr
@@ -305,6 +334,8 @@ def visit_withAsyncTasks(self, node):
             )
         if less_reg_mma:
             ws_op.set_attr("tlx.less_reg_mma", self.builder.get_unit_attr())
+        if no_ws_header_tid_reuse:
+            ws_op.set_attr("tlx.no_ws_header_tid_reuse", self.builder.get_unit_attr())
 
         # dry visit async task body to calculate captures
         index = 0
@@ -343,14 +374,20 @@ def visit_withAsyncTasks(self, node):
         index = 0
         for stmt in stmts:
             task = _get_async_task(self, stmt)
+            # Default replicas run with the kernel's warps, like the default region.
+            task_num_warps = self.builder.options.num_warps if task.is_default else task.num_warps
             if task.is_default:
                 region_replica_id_stack.append(0)
+                _get_region_num_warps_stack().append(task_num_warps)
                 task_body = ws_op.get_default_region()
 
                 block = self.builder.create_block_with_parent(task_body, [])
                 self.builder.set_insertion_point_to_start(block)
-                with enter_sub_region(self):
-                    self.visit(stmt)
+                try:
+                    with enter_sub_region(self):
+                        self.visit(stmt)
+                finally:
+                    _get_region_num_warps_stack().pop()
 
                 self.builder.create_warp_yield_op()
                 region_replica_id_stack.pop()
@@ -359,14 +396,18 @@ def visit_withAsyncTasks(self, node):
 
             for i in range(replicate_start, task.replicate):
                 region_replica_id_stack.append(i)
+                _get_region_num_warps_stack().append(task_num_warps)
 
                 task_body = ws_op.get_partition_region(index)
                 index += 1
 
                 block = self.builder.create_block_with_parent(task_body, [])
                 self.builder.set_insertion_point_to_start(block)
-                with enter_sub_region(self):
-                    self.visit(stmt)
+                try:
+                    with enter_sub_region(self):
+                        self.visit(stmt)
+                finally:
+                    _get_region_num_warps_stack().pop()
 
                 for name in captures:
                     val = liveins[name]
