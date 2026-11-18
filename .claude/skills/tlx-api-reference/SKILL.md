@@ -39,7 +39,7 @@ with tlx.async_tasks():
 | `tlx.alloc_barriers(num_barriers, arrive_count=1)` | Allocate SMEM barriers and initialize with arrive count | Both |
 | `tlx.barrier_expect_bytes(bar, bytes, pred=None)` | Set expected transaction byte count on barrier | Both |
 | `tlx.barrier_wait(bar, phase, pred=None)` | Wait until barrier phase flips (LOCAL mbarrier only) | Both |
-| `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None)` | Signal arrival at barrier. `remote_cta_rank` signals a barrier in a remote CTA — **only valid when ctas_per_cga > 1**, causes "Unexpected buffer remote view in 1cta mode" otherwise. Guard with `if USE_2CTA:` when kernel supports both modes. | Both |
+| `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None, per_warp=False)` | Signal arrival at barrier. `remote_cta_rank` signals a barrier in a remote CTA — **only valid when ctas_per_cga > 1**, causes "Unexpected buffer remote view in 1cta mode" otherwise. Guard with `if USE_2CTA:` when kernel supports both modes. `per_warp=True` (NVIDIA, not on warp barriers): each warp syncs its own lanes and one lane arrives with `arrive_count`, so the barrier counts `arrive_count * task warps` for it. | Both |
 | `tlx.cluster_barrier()` | Full cluster-wide synchronization barrier | Both |
 
 **arrive_count rules:**
@@ -51,6 +51,10 @@ with tlx.async_tasks():
   `remote_cta_rank`), use `arrive_count=NUM_CTAS`.
 - `barrier_arrive` inside `tlx.async_task`: `arrive_count` = number of warp groups
 - `barrier_arrive` outside `tlx.async_task`: `arrive_count=1` (only tid==0 arrives)
+- `barrier_arrive(..., per_warp=True)`: each warp syncs only its own lanes and one lane
+  arrives, so the barrier counts `arrive_count` for each warp of the arriving task.
+  Per-warp and leader arrives can share a barrier: one released by a 4-warp task per
+  warp and by a leader arrive counts `4 + 1` per CTA.
 
 ### Named barriers (hardware-allocated, indices 0–15)
 

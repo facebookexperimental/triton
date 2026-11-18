@@ -570,7 +570,10 @@ LogicalResult ArriveBarrierOp::verify() {
       return emitOpError("per_warp cannot be combined with perThread");
     if (isMulticast())
       return emitOpError("per_warp cannot be combined with multicast");
-    if (gpu::lookupNumWarps(*this) <= 1)
+    // Frontends can set per_warp before the op is placed under a warp count,
+    // so only check it once the count is known.
+    std::optional<int> numWarps = gpu::maybeLookupNumWarps(*this);
+    if (numWarps && *numWarps <= 1)
       return emitOpError("per_warp requires multiple warps");
   }
   if (isMulticast()) {

@@ -843,17 +843,20 @@ void init_triton_tlx_ir(py::module &&m) {
              else
                self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount);
            })
-      .def("create_warp_barrier_arrive",
-           [](TritonOpBuilder &self, Value mbarrierLoc, int arriveCount,
-              std::optional<Value> pred) -> void {
-             if (pred.has_value())
-               self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount,
-                                                  pred.value(),
-                                                  /*perThread=*/true);
-             else
-               self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount,
-                                                  /*perThread=*/true);
-           })
+      .def(
+          "create_warp_barrier_arrive",
+          [](TritonOpBuilder &self, Value mbarrierLoc, int arriveCount,
+             std::optional<Value> pred, bool perWarp) -> void {
+            // Every thread arrives, or with perWarp one lane of each warp
+            // after syncing its warp; then the count is the total of the task
+            // and lowering splits it across the warps.
+            auto arrive = self.create<ttng::ArriveBarrierOp>(
+                mbarrierLoc, arriveCount, pred.value_or(Value()),
+                /*perThread=*/!perWarp);
+            arrive.setPerWarp(perWarp);
+          },
+          py::arg("mbarrierLoc"), py::arg("arriveCount"),
+          py::arg("pred").none(), py::arg("perWarp") = false)
       .def("create_named_barrier_wait",
            [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
              self.create<ttng::NamedBarrierWaitOp>(barrier, numThreads);
