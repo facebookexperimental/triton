@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Publish and render the tlx.ops nightly perf dashboard.
 
-  summarize DIR --platform P --version V --sha S --out FILE
+  summarize DIR --platform P --version V --sha S --out FILE [--ci C --ci-run URL]
       Condense one platform's python/test/tlx_benchmark artifacts into the
       public summary uploaded to the 'tlx-ops-bench' release. Raw artifacts
       carry the runner's hostname, GPU UUID and process list, so only
@@ -46,7 +46,9 @@ BENCH_SCRIPT = {
     "bench_kda_decode.py"
 }
 #: Per-platform fields the page shows in its version panel, taken from the latest night.
-PLATFORM_FIELDS = ("gpu", "driver", "torch", "runtime", "triton", "governed", "timing", "version", "sha")
+PLATFORM_FIELDS = ("gpu", "driver", "torch", "runtime", "triton", "governed", "timing", "version", "sha", "ci")
+#: The LLVM builds the wheel pins, as cmake/<name>-info.json.
+LLVM_PINS = ("llvm", "amd-llvm", "meta-llvm", "meta-amd-llvm")
 #: A case's night-over-night TLX TFLOP/s change that makes a perf event, if the night after still holds it.
 EVENT_THRESHOLD = 0.10
 #: Changed cases listed per op and direction in one event; the rest are counted.
@@ -142,6 +144,7 @@ def summarize(args):
         "governed": (env.get("governed") or {}).get("applied", []),
         "timing": {k: env.get(k)
                    for k in ("latency_mode", "replicates")},
+        "ci": {"tlx_test": args.ci, "run": args.ci_run} if args.ci else None,
         "ops": ops,
     }
     with open(args.out, "w") as fh:
@@ -283,6 +286,22 @@ def env_changes(a, b):
     return changes
 
 
+def llvm_pin(sha, name):
+    try:
+        out = subprocess.run(["git", "show", f"{sha}:cmake/{name}-info.json"], capture_output=True, text=True,
+                             check=True, cwd=REPO_ROOT).stdout
+        info = json.loads(out)
+    except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
+        return None
+    return f"{info['llvm_hash'][:8]}-{info['build_number']}"
+
+
+def llvm_changes(a, b):
+    """LLVM pins (cmake/*llvm-info.json) that differ between two nights' commits, as {field, from, to}."""
+    pins = ((name, llvm_pin(a["sha"], name), llvm_pin(b["sha"], name)) for name in LLVM_PINS)
+    return [{"field": f"{name} pin", "from": x or "none", "to": y or "none"} for name, x, y in pins if x != y]
+
+
 def latency_us(case):
     """One call's time from its throughput, where the op's FLOPs are known from its inputs.
 
@@ -330,7 +349,8 @@ def events(nights):
         before = nights[i - 1]
         found = commits(before["sha"], night["sha"])
         entry.update(prev=before["date"], range=f"{before['sha'][:9]}..{night['sha'][:9]}",
-                     commits=None if found is None else len(found), env=env_changes(before, night),
+                     commits=None if found is None else len(found),
+                     env=env_changes(before, night) + llvm_changes(before, night),
                      compare=f"https://github.com/{REPO}/compare/{before['sha'][:12]}...{night['sha'][:12]}")
         for op in sorted(cases[i - 1].keys() | cases[i].keys()):
             a, b = cases[i - 1].get(op, {}), cases[i].get(op, {})
@@ -410,9 +430,9 @@ def overview_data(runs):
                     op.get("reason")
                 })
         platforms.append({
-            "platform": platform, "date": latest["date"], "version": latest.get("version"), "sha": latest["sha"],
-            "source": f"https://github.com/{REPO}/releases/download/{TAG}/{latest['date']}.{platform}.json", "rows":
-            rows
+            "platform": platform, "date": latest["date"], "version": latest.get("version"), "sha": latest["sha"], "ci":
+            latest.get("ci"), "source":
+            f"https://github.com/{REPO}/releases/download/{TAG}/{latest['date']}.{platform}.json", "rows": rows
         })
     return platforms
 
@@ -447,7 +467,8 @@ def overview_svg(platforms):
     for p in platforms:
         date = p["date"]
         text(20, y + 23, f"{p['platform'].upper()} · {date[:4]}-{date[4:6]}-{date[6:]}", "heading")
-        text(340, y + 23, f"{p['version'] or ''} · {p['sha'][:12]}")
+        tests = f" · TLX tests {p['ci']['tlx_test']}" if p.get("ci") else ""
+        text(340, y + 23, f"{p['version'] or ''} · {p['sha'][:12]}{tests}")
         for x, heading in [(20, "Operation / direction"), (300, "Reference"), (650, "Compared / cases"),
                            (788, "Geomean speedup")]:
             text(x, y + 51, heading)
@@ -541,6 +562,8 @@ def main():
     s.add_argument("dir")
     for flag in ("--platform", "--version", "--sha", "--out"):
         s.add_argument(flag, required=True)
+    s.add_argument("--ci", default="", help="conclusion of the platform's TLX tests on --sha")
+    s.add_argument("--ci-run", default="", help="the gpu-tests.yml run --ci comes from")
     p = sub.add_parser("prune")
     p.add_argument("keep", type=int)
     r = sub.add_parser("render")
