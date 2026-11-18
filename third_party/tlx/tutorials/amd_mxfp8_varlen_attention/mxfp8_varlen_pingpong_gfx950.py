@@ -901,7 +901,6 @@ def _mxfp8_varlen_kernel(  # noqa: TR001
 # Triton TR001: BLOCK_M is a host-selected production contract.
 def _mxfp8_varlen_extended_kernel(  # noqa: TR001
     Q,
-    QScales,
     WorkOrder,
     K8,
     V8,
@@ -923,7 +922,6 @@ def _mxfp8_varlen_extended_kernel(  # noqa: TR001
     MFMA_PRIO: tl.constexpr,
     SOFTMAX_PRIO: tl.constexpr,
     FAST_EXP: tl.constexpr,
-    PREQUANTIZED_Q: tl.constexpr,
     USE_WORK_ORDER: tl.constexpr,
     REUSE_METADATA: tl.constexpr,
     SCHEDULE_ITEMS: tl.constexpr,
@@ -963,10 +961,6 @@ def _mxfp8_varlen_extended_kernel(  # noqa: TR001
     )
     q_layout: tl.constexpr = tlx.dot_operand_layout(0, mfma, k_width=16)
     q_local = tlx.require_layout(q_off.to(tl.int32), q_layout)
-    scale_layout: tl.constexpr = tlx.layout(
-        shape=((32, 2, tlx.num_warps()), (1,)),
-        stride=((2, 1, 64), (1,)),
-    )
     k_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [(1024, 16)], core._K_LDS_BASES, [D, HN]
     )
@@ -1030,48 +1024,22 @@ def _mxfp8_varlen_extended_kernel(  # noqa: TR001
             )
         q_base = Q + q0.to(tl.int64) * ROW + head * D
         q_mask = q_local < q_rows * ROW
-        if PREQUANTIZED_Q:
-            q_lo = tlx.require_layout(
-                tlx.buffer_load(q_base, q_local, q_mask, 0.0, contiguity=16),
-                q_layout,
+        q_reg0 = tlx.buffer_load(
+            q_base, q_local, q_mask, 0.0, contiguity=8
+        )
+        q_reg1 = tlx.buffer_load(
+            q_base + HD, q_local, q_mask, 0.0, contiguity=8
+        )
+        tlx.amd_sched_barrier(0)
+        if not REUSE_METADATA:
+            k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(
+                K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off
             )
-            q_hi = tlx.require_layout(
-                tlx.buffer_load(q_base + HD, q_local, q_mask, 0.0, contiguity=16),
-                q_layout,
-            )
-            if not REUSE_METADATA:
-                k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(
-                    K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off
-                )
-            scale_base = QScales + q0.to(tl.int64) * HEADS * 4 + head * 4
-            scale_offsets = (
-                offs_mm[:, None] * (HEADS * 4) + tl.arange(0, 2)[None, :]
-            )
-            scale_mask = (offs_mm < q_rows)[:, None]
-            qs_lo = tlx.require_layout(
-                tl.load(scale_base + scale_offsets, scale_mask, 0), scale_layout
-            )
-            qs_hi = tlx.require_layout(
-                tl.load(scale_base + scale_offsets + 2, scale_mask, 0),
-                scale_layout,
-            )
-        else:
-            q_reg0 = tlx.buffer_load(
-                q_base, q_local, q_mask, 0.0, contiguity=8
-            )
-            q_reg1 = tlx.buffer_load(
-                q_base + HD, q_local, q_mask, 0.0, contiguity=8
-            )
-            tlx.amd_sched_barrier(0)
-            if not REUSE_METADATA:
-                k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(
-                    K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off
-                )
-            tlx.amd_sched_barrier(0)
-            q_lo, qs_lo = core._quantize_q_half(q_reg0)
-            q_lo = tlx.require_layout(q_lo, q_layout)
-            q_hi, qs_hi = core._quantize_q_half(q_reg1)
-            q_hi = tlx.require_layout(q_hi, q_layout)
+        tlx.amd_sched_barrier(0)
+        q_lo, qs_lo = core._quantize_q_half(q_reg0)
+        q_lo = tlx.require_layout(q_lo, q_layout)
+        q_hi, qs_hi = core._quantize_q_half(q_reg1)
+        q_hi = tlx.require_layout(q_hi, q_layout)
         if FAST_EXP:
             qs_lo = (tl.maximum(qs_lo, 9) - 9).to(tl.uint8)
             qs_hi = (tl.maximum(qs_hi, 9) - 9).to(tl.uint8)
@@ -1474,102 +1442,6 @@ def prepare_kv(k, v, cu_seqlens_k, meta, backward=False):
     return (k8, ks, v8, vs, *extra) if backward else (k8, ks, v8, vs)
 
 
-@triton.jit
-def _prepare_q_forward(Q, Q8, QS, CuQ, HEADS: tl.constexpr):
-    sequence = tl.program_id(0)
-    head = tl.program_id(1)
-    first = tl.load(CuQ + sequence)
-    last = tl.load(CuQ + sequence + 1)
-    rows = tl.arange(0, 64)
-    columns = tl.arange(0, 128)
-    for start in range(first, last, 64):
-        row = start + rows
-        base = start.to(tl.int64) * (HEADS * 128) + head * 128
-        offsets = (
-            rows[:, None] * (HEADS * 128) + columns[None, :]
-        )
-        values = tlx.buffer_load(
-            Q + base,
-            offsets,
-            (row < last)[:, None],
-            0.0,
-            contiguity=8,
-        )
-        magnitude = (
-            (values.to(tl.uint16, bitcast=True) & 0x7FFF)
-            .reshape((2, 32, 4, 32))
-        )
-        maximum_bits = tl.max(tl.max(magnitude, 3), 1)
-        maximum = (
-            maximum_bits.to(tl.uint16)
-            .to(tl.bfloat16, bitcast=True)
-            .to(tl.float32)
-        )
-        byte = core._mx_scale(maximum)
-        scale = (byte << 23).to(tl.float32, bitcast=True)
-        scale = tl.broadcast_to(
-            scale[:, None, :, None], (2, 32, 4, 32)
-        ).reshape((64, 128))
-        tlx.buffer_store(
-            core._to_e4m3(values, scale),
-            Q8 + base,
-            offsets,
-            (row < last)[:, None],
-        )
-        scale_offsets = (
-            row.to(tl.int64)[:, None] * (HEADS * 4)
-            + head * 4
-            + tl.arange(0, 4)[None, :]
-        )
-        scales = tl.broadcast_to(
-            byte[:, None, :], (2, 32, 4)
-        ).reshape((64, 4)).to(tl.uint8)
-        tl.store(QS + scale_offsets, scales, (row < last)[:, None])
-
-
-def prepare_q(q, cu_seqlens_q):
-    """Prepare packed E4M3 Q and row-wise E8M0 scales."""
-    if (
-        q.ndim != 3
-        or q.shape[1:] != (_HEADS, _HEAD_DIM)
-        or q.dtype != torch.bfloat16
-        or not q.is_contiguous()
-    ):
-        raise ValueError("Requires contiguous BF16 [tokens, 4, 128] Q")
-    _check_offsets(cu_seqlens_q, q.device)
-    q8 = torch.empty(
-        q.shape, dtype=torch.float8_e4m3fn, device=q.device
-    )
-    scales = torch.empty(
-        (q.shape[0], _HEADS, 4), dtype=torch.uint8, device=q.device
-    )
-    cast(Any, _prepare_q_forward)[
-        (cu_seqlens_q.numel() - 1, _HEADS)
-    ](
-        q,
-        q8,
-        scales,
-        cu_seqlens_q,
-        HEADS=_HEADS,
-        num_warps=1,
-        num_stages=1,
-    )
-    return q8, scales
-
-
-def _check_offsets(offsets, device):
-    if (
-        offsets.ndim != 1
-        or offsets.numel() < 2
-        or offsets.dtype != torch.int32
-        or not offsets.is_contiguous()
-        or offsets.device != device
-    ):
-        raise ValueError(
-            "Requires contiguous int32 sequence offsets on the input device"
-        )
-
-
 @dataclass(frozen=True)
 class ForwardWorkSchedule:
     item_order: torch.Tensor
@@ -1663,105 +1535,6 @@ def _check_work_schedule(
         )
 
 
-def forward_prequantized(
-    q8,
-    q_scales,
-    k8,
-    k_scales,
-    v8,
-    v_scales,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    sm_scale,
-    *,
-    total_kv,
-    fast_exp=False,
-    num_ctas=None,
-    block_m=128,
-    work_schedule=None,
-):
-    """Return output and natural-log LSE from prepared MXFP8 inputs."""
-    if (
-        q8.ndim != 3
-        or q8.shape[1:] != (_HEADS, _HEAD_DIM)
-        or q8.dtype != torch.float8_e4m3fn
-        or not q8.is_contiguous()
-    ):
-        raise ValueError("Requires contiguous E4M3 [tokens, 4, 128] Q")
-    device = q8.device
-    _check_offsets(cu_seqlens_q, device)
-    _check_offsets(cu_seqlens_k, device)
-    if cu_seqlens_q.shape != cu_seqlens_k.shape:
-        raise ValueError(
-            "Query and key sequence offsets must have the same shape"
-        )
-    if (
-        not isinstance(total_kv, int)
-        or total_kv < 0
-        or not math.isfinite(sm_scale)
-    ):
-        raise ValueError(
-            "total_kv must be nonnegative and sm_scale must be finite"
-        )
-    if block_m not in (64, 128, 256):
-        raise ValueError("block_m must be 64, 128, or 256")
-    if num_ctas is not None and (num_ctas < 8 or num_ctas % 8):
-        raise ValueError("num_ctas must be a positive multiple of eight")
-    batch = cu_seqlens_k.numel() - 1
-    _check_work_schedule(
-        work_schedule, q8, total_kv, batch, block_m, num_ctas
-    )
-    npad = (
-        triton.cdiv(total_kv + (_PAD - 1) * batch, _PAD) + 1
-    ) * _PAD
-    tensors = (
-        (q_scales, (q8.shape[0], _HEADS, 4), torch.uint8),
-        (k8, (_HEADS, npad, _HEAD_DIM), torch.float8_e4m3fn),
-        (
-            v8,
-            (_HEADS, npad // 64, _HEAD_DIM, 64),
-            torch.float8_e4m3fn,
-        ),
-        (k_scales, (_HEADS, npad, 4), torch.uint8),
-        (v_scales, (_HEADS, npad, 4), torch.uint8),
-    )
-    for tensor, shape, dtype in tensors:
-        if (
-            tensor.shape != shape
-            or tensor.dtype != dtype
-            or not tensor.is_contiguous()
-            or tensor.device != device
-        ):
-            raise ValueError(
-                "Prepared payloads and scales must match the documented "
-                "shapes, dtypes, and device"
-            )
-    meta = _metadata(
-        cu_seqlens_q,
-        cu_seqlens_k,
-        q8.shape[0],
-        total_kv,
-        block_m,
-    )
-    return _launch_extended_forward(
-        q8,
-        q_scales,
-        k8,
-        k_scales,
-        v8,
-        v_scales,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        sm_scale,
-        meta,
-        block_m,
-        fast_exp,
-        num_ctas,
-        True,
-        work_schedule,
-    )
-
-
 def _check(q, k, v, sm_scale, kv_contiguous=True):
     for t in (q, k, v):
         if (
@@ -1815,7 +1588,6 @@ def forward(
     if work_schedule is not None:
         out, lse = _launch_extended_forward(
             q,
-            None,
             k8,
             ks,
             v8,
@@ -1827,7 +1599,6 @@ def forward(
             block_m,
             fast_exp,
             num_ctas,
-            False,
             work_schedule,
         )
         return out, lse, kv_state
@@ -1873,7 +1644,6 @@ def forward(
 
 def _launch_extended_forward(
     q,
-    q_scales,
     k8,
     ks,
     v8,
@@ -1885,7 +1655,6 @@ def _launch_extended_forward(
     block_m,
     fast_exp,
     num_ctas,
-    prequantized,
     work_schedule,
 ):
     batch = cu_seqlens_k.numel() - 1
@@ -1901,7 +1670,6 @@ def _launch_extended_forward(
         grid = work_schedule.num_ctas
     cast(Any, _mxfp8_varlen_extended_kernel)[(grid,)](
         q,
-        q_scales if q_scales is not None else q,
         work_schedule.item_order if work_schedule is not None else q,
         k8,
         v8,
@@ -1921,7 +1689,6 @@ def _launch_extended_forward(
         HEADS=_HEADS,
         BLOCK_M=block_m,
         FAST_EXP=fast_exp,
-        PREQUANTIZED_Q=prequantized,
         USE_WORK_ORDER=work_schedule is not None,
         REUSE_METADATA=(
             work_schedule is not None

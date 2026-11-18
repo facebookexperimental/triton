@@ -3288,7 +3288,6 @@ def mxfp8_varlen_forward_module():
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 @pytest.mark.parametrize("block_m", [64, 128, 256])
 @pytest.mark.parametrize("fast_exp", [False, True])
-@pytest.mark.parametrize("scheduled", [False, True])
 @pytest.mark.parametrize(
     "query_lengths,key_lengths",
     [
@@ -3297,14 +3296,12 @@ def mxfp8_varlen_forward_module():
         ([1, 31, 33, 129], [1, 127, 129, 257]),
     ],
 )
-def test_mxfp8_prequantized_forward_matches_fused_quantization(
+def test_mxfp8_scheduled_forward_matches_unscheduled(
     mxfp8_varlen_forward_module,
     block_m,
     fast_exp,
-    scheduled,
     query_lengths,
     key_lengths,
-    monkeypatch,
 ):
     fwd = mxfp8_varlen_forward_module
     torch.manual_seed(19)
@@ -3333,7 +3330,6 @@ def test_mxfp8_prequantized_forward_matches_fused_quantization(
         cu_q, cu_k, q.shape[0], k.shape[0], block_m
     )
     state = fwd.prepare_kv(k, v, cu_k, meta)
-    q8, scales = fwd.prepare_q(q, cu_q)
     expected, expected_lse, _ = fwd.forward(
         q,
         k,
@@ -3345,48 +3341,23 @@ def test_mxfp8_prequantized_forward_matches_fused_quantization(
         block_m=block_m,
         fast_exp=fast_exp,
     )
-    kwargs = {}
-    if scheduled:
-        schedule = fwd.prepare_work_schedule(
-            query_lengths,
-            key_lengths,
-            q.device,
-            num_ctas=8,
-            block_m=block_m,
-        )
-        kwargs["work_schedule"] = schedule
-        scheduled_out, scheduled_lse, _ = fwd.forward(
-            q,
-            k,
-            v,
-            cu_q,
-            cu_k,
-            128**-0.5,
-            kv_state=state,
-            fast_exp=fast_exp,
-            work_schedule=schedule,
-        )
-        assert torch.equal(scheduled_out, expected)
-        assert torch.equal(scheduled_lse, expected_lse)
-
-    def unexpected_preparation(*args, **kwargs):
-        raise AssertionError(
-            "The prepared-input entry point must not prepare operands"
-        )
-
-    monkeypatch.setattr(fwd, "prepare_q", unexpected_preparation)
-    monkeypatch.setattr(fwd, "prepare_kv", unexpected_preparation)
-    actual, actual_lse = fwd.forward_prequantized(
-        q8,
-        scales,
-        *state,
+    schedule = fwd.prepare_work_schedule(
+        query_lengths,
+        key_lengths,
+        q.device,
+        num_ctas=8,
+        block_m=block_m,
+    )
+    actual, actual_lse, _ = fwd.forward(
+        q,
+        k,
+        v,
         cu_q,
         cu_k,
         128**-0.5,
-        total_kv=k.shape[0],
-        block_m=block_m,
+        kv_state=state,
         fast_exp=fast_exp,
-        **kwargs,
+        work_schedule=schedule,
     )
     assert torch.equal(actual, expected)
     assert torch.equal(actual_lse, expected_lse)
@@ -3440,165 +3411,3 @@ def test_mxfp8_scheduled_long_preserves_q_pipeline(
     )
     assert torch.equal(actual, expected)
     assert torch.equal(actual_lse, expected_lse)
-    q8, q_scales = fwd.prepare_q(q, cu_q)
-    prepared, prepared_lse = fwd.forward_prequantized(
-        q8,
-        q_scales,
-        *state,
-        cu_q,
-        cu_k,
-        128**-0.5,
-        total_kv=4096,
-        work_schedule=schedule,
-    )
-    assert torch.equal(prepared, expected)
-    assert torch.equal(prepared_lse, expected_lse)
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_mxfp8_prequantized_forward_uses_independent_row_scales(
-    mxfp8_varlen_forward_module,
-):
-    fwd = mxfp8_varlen_forward_module
-    cu_q = torch.tensor([0, 3], device="cuda", dtype=torch.int32)
-    cu_k = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
-    q = torch.zeros((3, 4, 128), device="cuda", dtype=torch.bfloat16)
-    q[:, :, 0] = 1
-    q8 = q.to(torch.float8_e4m3fn)
-    scales = torch.full(
-        (3, 4, 4), 127, device="cuda", dtype=torch.uint8
-    )
-    scales[:, :, 0] = torch.tensor(
-        [126, 127, 128], device="cuda", dtype=torch.uint8
-    )[:, None]
-    k = torch.zeros((2, 4, 128), device="cuda", dtype=torch.bfloat16)
-    k[1, :, 0] = 1
-    v = torch.zeros_like(k)
-    v[1] = 1
-    state = fwd.prepare_kv(
-        k, v, cu_k, fwd._metadata(cu_q, cu_k, 3, 2, 128)
-    )
-    out, lse = fwd.forward_prequantized(
-        q8, scales, *state, cu_q, cu_k, 1.0, total_kv=2
-    )
-    logits = torch.tensor([0.5, 1.0, 2.0], device="cuda")
-    expected = logits.sigmoid()[:, None, None].expand_as(out)
-    torch.testing.assert_close(
-        out.float(), expected, atol=0.01, rtol=0.01
-    )
-    torch.testing.assert_close(
-        lse,
-        torch.logaddexp(logits, torch.zeros_like(logits))[
-            None, :
-        ].expand_as(lse),
-        atol=0.01,
-        rtol=0.01,
-    )
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-@pytest.mark.parametrize(
-    "condition",
-    [
-        "query_dtype",
-        "scale_shape",
-        "scale_dtype",
-        "scale_stride",
-        "offset_dtype",
-        "block_m",
-        "num_ctas",
-        "schedule_grid",
-        "schedule_tile",
-        "schedule_lengths",
-    ],
-)
-def test_mxfp8_prequantized_forward_rejects_invalid_input(
-    mxfp8_varlen_forward_module, condition
-):
-    fwd = mxfp8_varlen_forward_module
-    cu = torch.tensor([0, 16], device="cuda", dtype=torch.int32)
-    q = torch.zeros((16, 4, 128), device="cuda", dtype=torch.bfloat16)
-    q8, scales = fwd.prepare_q(q, cu)
-    state = fwd.prepare_kv(
-        q, q, cu, fwd._metadata(cu, cu, 16, 16, 128)
-    )
-    kwargs = {"total_kv": 16}
-    offsets = cu
-    if condition == "query_dtype":
-        q8 = q
-    elif condition == "scale_shape":
-        scales = scales[:, :, :2]
-    elif condition == "scale_dtype":
-        scales = scales.to(torch.int32)
-    elif condition == "scale_stride":
-        scales = torch.empty(
-            (16, 4, 8), device="cuda", dtype=torch.uint8
-        )[:, :, :4]
-    elif condition == "offset_dtype":
-        offsets = cu.to(torch.int64)
-    elif condition == "block_m":
-        kwargs["block_m"] = 96
-    elif condition == "num_ctas":
-        kwargs["num_ctas"] = 7
-    elif condition.startswith("schedule_"):
-        kwargs["work_schedule"] = fwd.prepare_work_schedule(
-            [16], [16], q.device, num_ctas=8
-        )
-        if condition == "schedule_grid":
-            kwargs["num_ctas"] = 16
-        elif condition == "schedule_tile":
-            kwargs["block_m"] = 64
-        elif condition == "schedule_lengths":
-            kwargs["work_schedule"] = fwd.prepare_work_schedule(
-                [17], [16], q.device, num_ctas=8
-            )
-    with pytest.raises(ValueError):
-        fwd.forward_prequantized(
-            q8, scales, *state, offsets, cu, 1.0, **kwargs
-        )
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-@pytest.mark.parametrize("fast_exp", [False, True])
-def test_mxfp8_prequantized_forward_lse_uses_natural_log(
-    mxfp8_varlen_forward_module, fast_exp
-):
-    fwd = mxfp8_varlen_forward_module
-    cu_q = torch.tensor([0, 3], device="cuda", dtype=torch.int32)
-    cu_k = torch.tensor([0, 5], device="cuda", dtype=torch.int32)
-    q = torch.zeros((3, 4, 128), device="cuda", dtype=torch.bfloat16)
-    k = torch.zeros((5, 4, 128), device="cuda", dtype=torch.bfloat16)
-    q8, scales = fwd.prepare_q(q, cu_q)
-    state = fwd.prepare_kv(
-        k, k, cu_k, fwd._metadata(cu_q, cu_k, 3, 5, 128)
-    )
-    fused_out, fused_lse, _ = fwd.forward(
-        q,
-        k,
-        k,
-        cu_q,
-        cu_k,
-        128**-0.5,
-        kv_state=state,
-        block_m=128,
-        fast_exp=fast_exp,
-    )
-    out, lse = fwd.forward_prequantized(
-        q8,
-        scales,
-        *state,
-        cu_q,
-        cu_k,
-        128**-0.5,
-        total_kv=5,
-        fast_exp=fast_exp,
-    )
-    assert torch.equal(fused_out, out)
-    assert torch.equal(fused_lse, lse)
-    assert torch.equal(out, torch.zeros_like(q))
-    torch.testing.assert_close(
-        lse,
-        torch.full_like(lse, math.log(5)),
-        atol=1e-5,
-        rtol=1e-5,
-    )
