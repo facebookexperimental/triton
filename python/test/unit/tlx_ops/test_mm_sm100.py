@@ -177,7 +177,7 @@ def test_heuristic_splits_k_for_large_outputs_only_when_full_tiles_leave_sms_idl
 def test_group_size_fits_padded_cluster_grid(M, N):
     block_m = 256
     num_ctas = 2
-    group_size = sm100._select_group_size_m(M, N, block_m, num_ctas)
+    group_size = sm100.select_group_size_m(M, N, block_m, num_ctas)
     padded_tiles = sm100._padded_num_pid_m(M, block_m, num_ctas)
     assert num_ctas <= group_size <= padded_tiles
     assert group_size % num_ctas == 0

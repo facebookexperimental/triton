@@ -90,7 +90,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                 "BLOCK_SIZE_M": 256,
                 "BLOCK_SIZE_N": 128,
                 "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
+                "GROUP_SIZE_M": select_group_size_m(M, N, 256, num_ctas=2),
                 "NUM_SMEM_BUFFERS": 2,
                 "NUM_TMEM_BUFFERS": 2,
                 "NUM_MMA_GROUPS": 2,
@@ -110,7 +110,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 128,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
+                    "GROUP_SIZE_M": select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 2,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -126,7 +126,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 64,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
+                    "GROUP_SIZE_M": select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 4,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -170,7 +170,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                     "BLOCK_SIZE_M": block_m,
                     "BLOCK_SIZE_N": block_n,
                     "BLOCK_SIZE_K": block_k,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, block_m),
+                    "GROUP_SIZE_M": select_group_size_m(M, N, block_m),
                     "NUM_SMEM_BUFFERS": 4,
                     "NUM_TMEM_BUFFERS": 2,
                     "NUM_MMA_GROUPS": 2,
@@ -187,7 +187,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                     "BLOCK_SIZE_M": block_m,
                     "BLOCK_SIZE_N": block_n,
                     "BLOCK_SIZE_K": block_k,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, block_m),
+                    "GROUP_SIZE_M": select_group_size_m(M, N, block_m),
                     "NUM_SMEM_BUFFERS": 4,
                     "NUM_TMEM_BUFFERS": 3,
                     "NUM_MMA_GROUPS": 2,
@@ -205,7 +205,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
             "BLOCK_SIZE_M": 256,
             "BLOCK_SIZE_N": 256,
             "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+            "GROUP_SIZE_M": select_group_size_m(M, N, 256),
             "NUM_SMEM_BUFFERS": 3,
             "NUM_TMEM_BUFFERS": 1,
             "NUM_MMA_GROUPS": 2,
@@ -355,7 +355,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
                 "BLOCK_SIZE_M": bm,
                 "BLOCK_SIZE_N": bn,
                 "BLOCK_SIZE_K": bk,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, bm, num_ctas),
+                "GROUP_SIZE_M": select_group_size_m(M, N, bm, num_ctas),
                 "NUM_SMEM_BUFFERS": num_smem_buffers,
                 "NUM_TMEM_BUFFERS": num_tmem_buffers,
                 "NUM_MMA_GROUPS": num_mma_groups,
@@ -370,7 +370,7 @@ def get_heuristic_config(M, N, K, num_sms=148, *, invariance=None):
     return best_config
 
 
-def _select_group_size_m(M, N, block_m, num_ctas=1):
+def select_group_size_m(M, N, block_m, num_ctas=1):
     """
     Select GROUP_SIZE_M based on the golden rule for tile scheduling.
 
