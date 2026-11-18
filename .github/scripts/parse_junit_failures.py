@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sys
 import xml.etree.ElementTree as ET
 
@@ -37,6 +38,11 @@ PARAM_SUFFIX = re.compile(r"\[.*\]$")
 
 # Fraction of a step's timeout budget at which a still-passing suite is reported.
 SLOW_THRESHOLD = 0.8
+
+# pytest -v prints a test's node id when it starts and its outcome, at the start of a line, when it ends.
+TEST_START = re.compile(r"^(\S+\.py::\S+)")
+TEST_OUTCOME = re.compile(r"^\s*(PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS)\b")
+TOP_FRAME = re.compile(r'File "([^"]+)", line (\d+) in (\w+)')
 
 
 def normalize(node_id: str) -> str:
@@ -141,6 +147,61 @@ def build_missing_junit_item(missing_paths, workflow, job):
         "summary": summary,
         "repro": "",
         # Job-level fallback: no per-test signal -> reconcile must not close.
+        "fallback": True,
+        "external_dep": is_external,
+        "external_dep_reason": reason,
+    }
+
+
+def crash_cause(exit_code):
+    """What ended pytest, from its exit status: the signal name for 128 + N, else the status itself."""
+    if exit_code is None:
+        return "crash"
+    if exit_code > 128:
+        try:
+            return signal.Signals(exit_code - 128).name
+        except ValueError:
+            pass
+    return f"exit {exit_code}"
+
+
+def crashed_test(log_path):
+    """The test pytest was running when it died, and the top frame faulthandler printed, from its -v output."""
+    try:
+        with open(log_path, errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return "", ""
+    running, frame, in_dump = "", "", False
+    for line in lines:
+        start = TEST_START.match(line)
+        if start:
+            running, line = start[1], line[start.end():]
+        if running and TEST_OUTCOME.match(line):
+            running = ""
+        if line.startswith("Current thread "):
+            in_dump = True
+        elif in_dump and not frame and (top := TOP_FRAME.search(line)):
+            frame = f"{top[3]} ({os.path.basename(top[1])}:{top[2]})"
+    return running, frame
+
+
+def build_crash_item(node_id, cause, frame, workflow, job):
+    """The test that was running when pytest died, reported under its own identity."""
+    module, _, name = node_id.partition("::")
+    rid = f"{module.removesuffix('.py').replace('/', '.')}::{name}"
+    summary = f"pytest died ({cause}) while running {node_id}, before writing JUnit XML."
+    if frame:
+        summary += f" Innermost Python frame: {frame}."
+    is_external, reason = classify(summary)
+    return {
+        "normalized_failure_id": rid,
+        "raw_failure_ids": rid,
+        "issue_title": f"[nightly] {workflow} / {job} / {cause} in {rid}",
+        "job_name": job,
+        "summary": summary,
+        "repro": f"python -m pytest '{node_id}' -v -s",
+        # No JUnit XML from this run -> reconcile must not close anything on it.
         "fallback": True,
         "external_dep": is_external,
         "external_dep_reason": reason,
@@ -314,6 +375,8 @@ def main():
         help=("Step timeout budget for a JUnit XML, e.g. /tmp/tlx-core.xml=30. "
               "Repeatable. Enables near-timeout reporting for that file."),
     )
+    parser.add_argument("--log", default="", help="pytest -v output, to name the test that was running if it died")
+    parser.add_argument("--exit-code", type=int, help="pytest's exit status, to name the signal that killed it")
     parser.add_argument(
         "--slow-threshold",
         type=float,
@@ -328,7 +391,11 @@ def main():
         failures, missing_paths = collect_failures(args.junit)
         items = build_items(failures, args.workflow, args.job)
         if not items and missing_paths:
-            items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
+            node_id, frame = crashed_test(args.log) if args.log else ("", "")
+            if node_id:
+                items.append(build_crash_item(node_id, crash_cause(args.exit_code), frame, args.workflow, args.job))
+            else:
+                items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
         if not items and args.failed:
             items.append(build_bucket_item(args.bucket, args.workflow, args.job))
         # Appended after the fallback guards: a slow-step item must not suppress the

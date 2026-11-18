@@ -202,6 +202,34 @@ def test_a_job_level_fallback_is_not_a_pass():
     assert api.writes == []
 
 
+def test_a_crash_is_reported_against_the_test_that_was_running(tmp_path, monkeypatch, capsys):
+    # A crash keeps pytest from writing JUnit XML; the report must still name the test and the signal.
+    log = tmp_path / "pytest.log"
+    log.write_text("\n".join([
+        "t/test_ops.py::test_op[bench_a] ",
+        "input  ref TF/s  tlx TF/s",
+        "PASSED",
+        "t/test_ops.py::test_op[bench_b] SKIPPED",
+        "t/test_ops.py::test_op[bench_c] ",
+        "Fatal Python error: Segmentation fault",
+        "Current thread 0x00007f0e (most recent call first):",
+        '  File "/w/ops/_shapes.py", line 87 in inputs',
+        '  File "/w/t/bench_c.py", line 78 in prepare',
+    ]))
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    monkeypatch.setattr("sys.argv", [
+        "parse", "--junit",
+        str(tmp_path / "missing.xml"), "--workflow", "W", "--job", "j", "--failed", "--log",
+        str(log), "--exit-code", "139"
+    ])
+    junit.main()
+    [item] = json.loads(capsys.readouterr().out)
+    assert item["issue_title"] == "[nightly] W / j / SIGSEGV in t.test_ops::test_op[bench_c]"
+    assert item["raw_failure_ids"] == "t.test_ops::test_op[bench_c]"
+    assert "inputs (_shapes.py:87)" in item["summary"]
+    assert item["fallback"] is True
+
+
 def test_slow_steps_need_a_completed_passing_suite_under_budget(tmp_path):
     old = dict(issue(7, title=PREFIX + "slow-step:result"), body=body(ids=(), norm="slow-step:result"))
     for status, seconds, expected in (("passed", 49, []), ("skipped", 1, []), ("passed", 1, [7])):
