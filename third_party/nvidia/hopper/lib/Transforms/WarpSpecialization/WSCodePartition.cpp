@@ -587,6 +587,26 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
       return false;
     };
 
+    // A TMA staging write has no memdesc operand, so hoistsAcrossMemoryOp
+    // misses it. The staging allocs later share a ring of K copies, so a write
+    // hoisted above an earlier TMA op can overwrite a slot that op still reads.
+    auto isTMAStoreLike = [](Operation *op) {
+      return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(op);
+    };
+    auto hoistsStagingWriteAcrossTMAOp = [&](Operation *op,
+                                             Operation *insertAfter) {
+      auto alloc = dyn_cast<ttg::LocalAllocOp>(op);
+      if (!alloc || !alloc.getSrc() || !insertAfter->isBeforeInBlock(op))
+        return false;
+      if (llvm::none_of(op->getUsers(), isTMAStoreLike))
+        return false;
+      for (Operation *cur = insertAfter->getNextNode(); cur && cur != op;
+           cur = cur->getNextNode())
+        if (isTMAStoreLike(cur))
+          return true;
+      return false;
+    };
+
     // Streamline ops on a channel chain.
     // Starting with producers with smaller task ids, moving forward
     // dependencies of the consumer ops close to the them.
@@ -599,7 +619,8 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
             continue;
           // push depOp to be right after its operands
           auto lastOpndOp = lastInBlockOperand(depOp);
-          if (lastOpndOp && !hoistsAcrossMemoryOp(depOp, lastOpndOp))
+          if (lastOpndOp && !hoistsAcrossMemoryOp(depOp, lastOpndOp) &&
+              !hoistsStagingWriteAcrossTMAOp(depOp, lastOpndOp))
             depOp->moveAfter(lastOpndOp);
         }
       }
