@@ -43,10 +43,9 @@ jobs:
       ci_h100: ${{ steps.pick.outputs.ci_h100 }}
       ci_mi350: ${{ steps.pick.outputs.ci_mi350 }}
     steps:
-      - name: Checkout main
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
       - name: Pick the commit to bench
         id: pick
