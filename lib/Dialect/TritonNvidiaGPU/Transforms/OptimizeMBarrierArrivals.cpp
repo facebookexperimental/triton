@@ -5,6 +5,7 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/MBarrierUtilities.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -323,9 +324,11 @@ void prepareMBarrierArrivals(ModuleOp mod, BufferRegionAnalysis &regions,
       return;
     for (BarrierExpectOp expect : uses.expects)
       expect.setPerWarp(true);
-    // Every thread already arrives for itself in a per-thread arrival.
+    // A predicated per-thread arrival comes only from the threads it selects,
+    // so it cannot stand in for every thread of a warp.
     for (ArriveBarrierOp arrive : uses.arrivals)
-      if (gpu::lookupNumWarps(arrive) > 1 && !arrive.getPerThread())
+      if (gpu::lookupNumWarps(arrive) > 1 &&
+          (!arrive.getPerThread() || arrivesFromEveryThread(arrive)))
         arrive.setPerWarp(true);
   });
 }

@@ -26,12 +26,14 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // Each thread releases its own TMEM reads with a per-thread arrival, and a
   // named barrier is its own rendezvous, so neither needs a CTA barrier. The
-  // per-thread arrival is not rewritten into a per-warp one.
+  // per-thread arrival becomes a per-warp one, which only needs its warp to
+  // meet first.
   // CHECK-LABEL: @tmem_load_then_perthread_arrive
-  // CHECK: ttng.init_barrier %{{.*}}, 128 :
+  // CHECK: ttng.init_barrier %{{.*}}, 512 :
   // CHECK: ttng.tmem_load
   // CHECK-NEXT: ttng.tmem_wait load
-  // CHECK-NEXT: ttng.arrive_barrier %{{.*}}, 1 {perThread} :
+  // CHECK-NEXT: ttg.barrier warp local
+  // CHECK-NEXT: ttng.arrive_barrier %{{.*}}, 4 {perThread, per_warp} :
   // CHECK-NEXT: ttng.wait_barrier_named
   // CHECK-NEXT: tt.return
   tt.func @tmem_load_then_perthread_arrive(%tmem: !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>) -> tensor<128x128xf32, #blocked> {

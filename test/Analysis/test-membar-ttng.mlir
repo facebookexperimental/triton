@@ -1932,3 +1932,77 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+#store_layout = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#store_layout_x2 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#store_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+!store_buf = !ttg.memdesc<128xf32, #store_shared, #ttg.shared_memory, mutable>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // Every execution of one register-to-shared store writes each address from
+  // the same thread. Into a view fixed for the whole kernel, the next
+  // iteration's write needs no rendezvous.
+  // CHECK-LABEL: @repeated_local_store
+  tt.func @repeated_local_store(%value: tensor<128xf32, #store_layout>, %count: i32) {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %buf = ttg.local_alloc : () -> !store_buf
+    // CHECK-NOT: ttg.barrier
+    // CHECK: ttg.local_store
+    // CHECK-NOT: ttg.barrier
+    // CHECK: tt.return
+    scf.for %i = %zero to %count step %one : i32 {
+      ttg.local_store %value, %buf : tensor<128xf32, #store_layout> -> !store_buf
+    }
+    tt.return
+  }
+
+  // Two stores with different layouts map an address to different threads.
+  // CHECK-LABEL: @alternating_local_stores
+  tt.func @alternating_local_stores(%a: tensor<128xf32, #store_layout>, %b: tensor<128xf32, #store_layout_x2>, %count: i32) {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %buf = ttg.local_alloc : () -> !store_buf
+    // CHECK: ttg.barrier local
+    // CHECK-NEXT: ttg.local_store %{{.*}} : tensor<128xf32, #{{.*}}> -> !ttg.memdesc
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: ttg.local_store
+    scf.for %i = %zero to %count step %one : i32 {
+      ttg.local_store %a, %buf : tensor<128xf32, #store_layout> -> !store_buf
+      ttg.local_store %b, %buf : tensor<128xf32, #store_layout_x2> -> !store_buf
+    }
+    tt.return
+  }
+
+  // A device function can be called with different views, so its repeated
+  // store keeps the rendezvous.
+  // CHECK-LABEL: @repeated_local_store_device
+  tt.func private @repeated_local_store_device(%value: tensor<128xf32, #store_layout>, %count: i32) {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %buf = ttg.local_alloc : () -> !store_buf
+    // CHECK: ttg.barrier local
+    // CHECK-NEXT: ttg.local_store
+    scf.for %i = %zero to %count step %one : i32 {
+      ttg.local_store %value, %buf : tensor<128xf32, #store_layout> -> !store_buf
+    }
+    tt.return
+  }
+
+  // A view computed inside the loop is not proven fixed.
+  // CHECK-LABEL: @repeated_local_store_view_in_loop
+  tt.func @repeated_local_store_view_in_loop(%value: tensor<128xf32, #store_layout>, %count: i32) {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %bufs = ttg.local_alloc : () -> !ttg.memdesc<1x128xf32, #store_shared, #ttg.shared_memory, mutable>
+    // CHECK: ttg.barrier local
+    // CHECK-NEXT: ttg.local_store
+    scf.for %i = %zero to %count step %one : i32 {
+      %view = ttg.memdesc_index %bufs[%zero] : !ttg.memdesc<1x128xf32, #store_shared, #ttg.shared_memory, mutable> -> !store_buf
+      ttg.local_store %value, %view : tensor<128xf32, #store_layout> -> !store_buf
+    }
+    tt.return
+  }
+}

@@ -737,11 +737,13 @@ ThreadSyncInfo getThreadSyncInfo(Operation *op) {
     // SM90.
     return {ThreadSyncKind::Ordinary, ThreadIssuer::Warp0Leader};
   }
-  if (ttng::arrivesFromEveryThread(op))
-    return {ThreadSyncKind::ThreadPublication};
+  // A per-thread arrival converted to per-warp arrival keeps the warp-scope
+  // rendezvous of the per-warp form.
   if (auto barrier = dyn_cast<triton::gpu::MBarrierOpInterface>(op);
       barrier && barrier.isPerWarp())
     return {ThreadSyncKind::WarpPublication};
+  if (ttng::arrivesFromEveryThread(op))
+    return {ThreadSyncKind::ThreadPublication};
   if (isa<ttng::ArriveBarrierOp, ttng::BarrierExpectOp>(op)) {
     auto arrive = dyn_cast<ttng::ArriveBarrierOp>(op);
     auto fromCTA = arrive ? arrive.getFromCTA()
@@ -810,6 +812,32 @@ bool carriesNoPayload(Operation *op) {
   return isa<ttng::WaitBarrierOp, ttng::FenceAsyncSharedOp,
              ttng::ArriveBarrierOp, ttng::BarrierExpectOp,
              ttng::TCGen5CommitOp>(op);
+}
+
+// Whether `before` and `after` are two executions of one register-to-shared
+// store into a view that is fixed for the whole kernel or warp-specialized
+// region. Every execution writes each address from the same threads, and each
+// of them orders its own writes by program order, so the last write to an
+// address always comes from the latest execution.
+bool isRepeatedLocalStore(Operation *before, Operation *after,
+                          bool beforeIsRead, bool afterIsRead) {
+  if (before != after || beforeIsRead || afterIsRead)
+    return false;
+  auto store = dyn_cast<triton::gpu::LocalStoreOp>(before);
+  if (!store)
+    return false;
+  // The view must be computed once, before any control flow of a kernel or
+  // warp-specialized region, so every execution writes the same addresses.
+  Operation *def = store.getDst().getDefiningOp();
+  Region *region = before->getParentRegion();
+  if (!def || def->getParentRegion() != region ||
+      def->getBlock() != &region->front())
+    return false;
+  Operation *parent = region->getParentOp();
+  if (auto func = dyn_cast<FunctionOpInterface>(parent))
+    return triton::isKernel(func);
+  return isa<triton::gpu::WarpSpecializeOp,
+             triton::gpu::WarpSpecializePartitionsOp>(parent);
 }
 
 bool hasIssuedEffects(const BlockInfo::ThreadSyncState &sync) {
@@ -1156,6 +1184,7 @@ Operation *MembarAnalysis::syncIfNeeded(Operation *op, const BlockInfo &effects,
     return (hasIssuedEffects(pending.threadSync) &&
             hasIssuedEffects(effects.threadSync) &&
             haveSameThreadSyncIssuer(before, after)) ||
+           isRepeatedLocalStore(before, after, beforeIsRead, afterIsRead) ||
            (filter && filter(before, after, beforeIsRead, afterIsRead,
                              allocation, beforeSlice, afterSlice));
   };
