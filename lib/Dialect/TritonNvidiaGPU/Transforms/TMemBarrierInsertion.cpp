@@ -107,6 +107,17 @@ static std::optional<uint32_t> getTMemBaseAddress(Value value) {
       value = reinterpret.getSrc();
       continue;
     }
+    // A constant buffer index moves the base by whole buffers, as in the
+    // MemDescIndexOp lowering. A dynamic index keeps the CTA barrier.
+    if (auto index = dyn_cast<ttg::MemDescIndexOp>(defOp)) {
+      APInt idx;
+      if (!matchPattern(index.getIndex(), m_ConstantInt(&idx)))
+        return std::nullopt;
+      offset += static_cast<uint32_t>(idx.getZExtValue()) *
+                getTmemAllocSizes(index.getType()).numCols;
+      value = index.getSrc();
+      continue;
+    }
     return std::nullopt;
   }
   return std::nullopt;

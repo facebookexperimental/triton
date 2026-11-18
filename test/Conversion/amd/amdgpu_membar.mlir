@@ -458,3 +458,44 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// AMD membar keeps ttg.warp_predicate bodies opaque (see the TODO in
+// AMDMembarAnalysis), so LDS accesses inside them add no barrier on either
+// side; AMD kernels synchronize them themselves. NVIDIA membar walks in.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: warp_predicate_read_then_store
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.warp_predicate
+  // CHECK-NOT: ttg.barrier
+  // CHECK: ttg.local_store
+  tt.func @warp_predicate_read_then_store(%pred: i1, %v: tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked> {
+    %buf = ttg.local_alloc %v : (tensor<256xf32, #blocked>) -> !ttg.memdesc<256xf32, #shared, #smem, mutable>
+    ttg.barrier local
+    %r = ttg.warp_predicate %pred (%v) {
+      %x = ttg.local_load %buf : !ttg.memdesc<256xf32, #shared, #smem, mutable> -> tensor<256xf32, #blocked>
+      ttg.predicate_yield %x : tensor<256xf32, #blocked>
+    } {wave_uniform} : (i1, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    ttg.local_store %v, %buf : tensor<256xf32, #blocked> -> !ttg.memdesc<256xf32, #shared, #smem, mutable>
+    tt.return %r : tensor<256xf32, #blocked>
+  }
+
+  // CHECK-LABEL: warp_predicate_store_then_read
+  // CHECK: ttg.local_store
+  // CHECK-NEXT: ttg.warp_predicate
+  // CHECK-NOT: ttg.barrier
+  // CHECK: ttg.predicate_yield
+  tt.func @warp_predicate_store_then_read(%pred: i1, %v: tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked> {
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<256xf32, #shared, #smem, mutable>
+    ttg.local_store %v, %buf : tensor<256xf32, #blocked> -> !ttg.memdesc<256xf32, #shared, #smem, mutable>
+    %r = ttg.warp_predicate %pred (%v) {
+      %x = ttg.local_load %buf : !ttg.memdesc<256xf32, #shared, #smem, mutable> -> tensor<256xf32, #blocked>
+      ttg.predicate_yield %x : tensor<256xf32, #blocked>
+    } {wave_uniform} : (i1, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return %r : tensor<256xf32, #blocked>
+  }
+}
