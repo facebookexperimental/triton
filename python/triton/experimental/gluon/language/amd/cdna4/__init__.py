@@ -26,7 +26,7 @@ __all__ = [
 
 
 @builtin
-def mfma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, cd_regclass=None, _semantic=None):
+def mfma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, cd_regclass=None, packed=False, _semantic=None):
     """
     AMD Scaled MFMA operation.
 
@@ -52,6 +52,12 @@ def mfma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, cd_regclass=Non
         cd_regclass (str, optional): Experimental. Register class for the accumulator input (C)
             and result (D) of the scaled MFMA instructions, as for ``mfma``: ``"a"`` for AGPRs or
             ``"v"`` for VGPRs. ``None`` (default) leaves the choice to the compiler.
+        packed (bool): Operands already hold per-segment packed FP6
+            bytes (24 packed + 8 padding per 32-code fragment chunk);
+            the ScaledMFMA lowering consumes them directly instead of
+            dense-packing codes. Requires at least one ``e2m3``/``e3m2``
+            operand, and each FP6 operand's layout must have
+            ``k_width=32`` so that a lane's 32 codes are contiguous in K.
     """
     layout = acc.type.layout
     assert isinstance(layout, AMDMFMALayout), "Expected layout to be an instance of AMDMFMALayout"
@@ -67,8 +73,17 @@ def mfma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, cd_regclass=Non
     assert a_format in {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}, f"Unsupported lhs_format: {a_format}"
     assert b_format in {"e2m1", "e2m3", "e3m2", "e4m3", "e5m2"}, f"Unsupported rhs_format: {b_format}"
 
+    packed = _unwrap_if_constexpr(packed)
+    if packed:
+        fp6_formats = {"e2m3", "e3m2"}
+        assert a_format in fp6_formats or b_format in fp6_formats, \
+            f"packed=True requires an e2m3/e3m2 operand, got {a_format} and {b_format}"
+        for name, fmt, operand in (("lhs", a_format, a), ("rhs", b_format, b)):
+            assert fmt not in fp6_formats or operand.type.layout.k_width == 32, \
+                f"packed=True requires k_width=32 for the FP6 {name}, got {operand.type.layout.k_width}"
+
     cd_regclass = _check_cd_regclass(cd_regclass, acc)
-    ret = _mma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, get_mfma_scale_layout, _semantic)
+    ret = _mma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, get_mfma_scale_layout, _semantic, packed=packed)
     _set_cd_regclass(ret.handle, cd_regclass, _semantic)
     return ret
 
