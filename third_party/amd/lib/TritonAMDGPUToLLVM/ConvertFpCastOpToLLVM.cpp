@@ -2699,6 +2699,10 @@ struct FpToFpOpConversion
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
+    if (op.getRounding() == RoundingMode::RS && op->hasAttr("sr_ieee")) {
+      op.emitOpError("SR stores are not supported on AMD");
+      return {};
+    }
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto srcElementType = getElementTypeOrSelf(op.getSrc());
     auto dstElementType = getElementTypeOrSelf(op.getResult());
