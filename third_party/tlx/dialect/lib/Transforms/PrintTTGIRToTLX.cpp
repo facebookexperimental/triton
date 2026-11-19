@@ -697,6 +697,21 @@ getValueName(Value v,
       // Otherwise the cast is erased: fall through to the transparent list.
     }
 
+    // A widened i1 is the one width cast Triton does not leave implicit: a
+    // bool stays a bool in Python, so where it seeds a loop-carried integer
+    // the loop's type check rejects it, and arithmetic on it changes meaning.
+    if (auto ext = dyn_cast<arith::ExtUIOp>(defOp);
+        ext && getElementType(ext.getIn().getType()).isInteger(1)) {
+      std::string operand =
+          getValueName(ext.getIn(), argSubstitutionMap, inlineConstants);
+      std::string dtype = getElementTypeName(getElementType(v.getType()));
+      if (operand == "None")
+        return operand;
+      if (!isPythonIdentifier(operand))
+        return "tl.cast(" + operand + ", " + dtype + ")";
+      return operand + ".to(" + dtype + ")";
+    }
+
     // Layout- and shape-only ops, plus the width/index casts Triton leaves
     // implicit. The float element-type casts are still listed: the block above
     // intercepts them whenever their dtype is nameable, so reaching one here
