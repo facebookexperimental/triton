@@ -45,6 +45,7 @@ class StochasticRoundingSpec:
     sites: tuple[SRStoreSpec, ...] = ()
     ownership: str = "checked"
     overflow: str = "satfinite"
+    entropy: str = "element"
 
     def __post_init__(self):
         sites = (self.site, ) if self.site is not None else tuple(self.sites)
@@ -57,6 +58,8 @@ class StochasticRoundingSpec:
         object.__setattr__(self, "sites", () if self.site is not None else sites)
         if self.overflow not in ("ieee", "satfinite"):
             raise ValueError("SR overflow must be ieee or satfinite")
+        if self.entropy not in ("element", "packed8"):
+            raise ValueError("SR entropy must be element or packed8")
         if self.ownership not in ("checked", "declared"):
             raise ValueError("SR ownership must be checked or declared")
         if not isinstance(self.prng, str) or self.prng not in _PHILOX_ROUNDS:
@@ -284,7 +287,7 @@ class StochasticRoundingKernel(KernelInterface):
         kwargs.update(sr_mode="enabled" if state.enabled else "plain",
                       sr_site=",".join(f"{site.name}={site.site_id}" for site in self.spec.store_specs),
                       sr_rounds=_PHILOX_ROUNDS[self.spec.prng], sr_ownership=self.spec.ownership,
-                      sr_overflow=self.spec.overflow)
+                      sr_overflow=self.spec.overflow, sr_entropy=self.spec.entropy)
         if state.enabled:
             values = dict(zip(self.arg_names, args))
             values.update(kwargs)

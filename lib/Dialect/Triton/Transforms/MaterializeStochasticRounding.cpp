@@ -287,7 +287,7 @@ public:
   }
 
   Value generate(SrStoreOp store, FuncOp function, int rounds,
-                 Value dynamicSeed) {
+                 Value dynamicSeed, bool packed) {
     OpBuilder entryBuilder(function.getContext());
     entryBuilder.setInsertionPointAfter(dynamicSeed.getDefiningOp());
     EntropyBuilder uniformEntropy(entryBuilder, store);
@@ -297,8 +297,11 @@ public:
         function.getArgument(2),
         uniformEntropy.constant(b.getI64Type(), store.getSiteId()),
         0x747269746f6e5302ULL);
-    Value c0 = low(store.getLogicalIndex(), lane32);
-    Value c1 = high(store.getLogicalIndex(), lane32);
+    Value index = store.getLogicalIndex();
+    if (packed)
+      index = arith::ShRUIOp::create(b, loc, index, constant(lane64, 3));
+    Value c0 = low(index, lane32);
+    Value c1 = high(index, lane32);
     Value c2 = splat(low(invocation, b.getI32Type()));
     Value c3 = splat(high(invocation, b.getI32Type()));
     Value k0 = low(seed, b.getI32Type()), k1 = high(seed, b.getI32Type());
@@ -323,7 +326,24 @@ public:
                                    constant(b.getI32Type(), 0xbb67ae85));
       }
     }
-    return c0;
+    if (!packed)
+      return c0;
+    Value slice = arith::AndIOp::create(
+        b, loc, low(store.getLogicalIndex(), lane32), constant(lane32, 7));
+    auto bitSet = [&](uint32_t bit) {
+      return arith::CmpIOp::create(
+          b, loc, arith::CmpIPredicate::ne,
+          arith::AndIOp::create(b, loc, slice, constant(lane32, bit)),
+          constant(lane32, 0));
+    };
+    Value first = arith::SelectOp::create(b, loc, bitSet(2), c1, c0);
+    Value second = arith::SelectOp::create(b, loc, bitSet(2), c3, c2);
+    Value word = arith::SelectOp::create(b, loc, bitSet(4), second, first);
+    Value shift = arith::MulIOp::create(
+        b, loc, arith::AndIOp::create(b, loc, slice, constant(lane32, 1)),
+        constant(lane32, 16));
+    word = arith::ShRUIOp::create(b, loc, word, shift);
+    return arith::AndIOp::create(b, loc, word, constant(lane32, 0xffff));
   }
 };
 
@@ -342,7 +362,8 @@ struct TritonMaterializeStochasticRounding
     SmallVector<StringRef> entries;
     StringRef(site).split(entries, ',');
     bool invalid = (mode != "plain" && mode != "enabled") ||
-                   (ownership != "checked" && ownership != "declared");
+                   (ownership != "checked" && ownership != "declared") ||
+                   (entropyMode != "element" && entropyMode != "packed8");
     for (auto entry : entries) {
       auto [name, number] = entry.split('=');
       int32_t id = 0;
@@ -440,7 +461,8 @@ struct TritonMaterializeStochasticRounding
           dynamicSeed = LoadOp::create(seedBuilder, store.getLoc(),
                                        function.getArgument(0));
         }
-        auto random = entropy.generate(store, function, rounds, dynamicSeed);
+        auto random = entropy.generate(store, function, rounds, dynamicSeed,
+                                       entropyMode == "packed8");
         if ((computeCapability == 100 || computeCapability == 103) &&
             ptxVersion >= 87) {
           auto conversion = FpToFpOp::create(

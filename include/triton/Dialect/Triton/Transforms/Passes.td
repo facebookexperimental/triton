@@ -243,7 +243,8 @@ def TritonMaterializeStochasticRounding : Pass<"triton-materialize-stochastic-ro
     Option<"rounds", "rounds", "int32_t", "10", "Philox round count">,
     Option<"computeCapability", "compute-capability", "int32_t", "0", "NVIDIA architecture">,
     Option<"ptxVersion", "ptx-version", "int32_t", "0", "PTX version">,
-    Option<"ownership", "ownership", "std::string", "\"checked\"", "checked or declared output ownership">
+    Option<"ownership", "ownership", "std::string", "\"checked\"", "checked or declared output ownership">,
+    Option<"entropyMode", "entropy", "std::string", "\"element\"", "element or packed8 entropy mapping">
   ];
 }
 
