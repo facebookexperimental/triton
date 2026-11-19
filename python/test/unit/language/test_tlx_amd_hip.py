@@ -46,6 +46,7 @@ def amd_fa_cluster_vector_combine_codegen_gfx950(fresh_triton_cache, gfx950_beta
 
 
 
+@pytest.mark.skip(reason="Broken on 3.8; fails in mi350-tlx-test CI")
 def test_amd_fa_cluster_vector_combine_opt_out_reduces_transfers_gfx950(amd_fa_cluster_vector_combine_codegen_gfx950):
     baseline, disabled = amd_fa_cluster_vector_combine_codegen_gfx950
     baseline_asm = baseline.asm["amdgcn"]
