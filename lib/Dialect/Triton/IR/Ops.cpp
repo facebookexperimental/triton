@@ -1618,11 +1618,9 @@ LogicalResult FpToFpOp::verify() {
 
 LogicalResult SrStoreOp::verify() {
   auto ptrTy = cast<PointerType>(getElementTypeOrSelf(getPtr()));
-  if (!ptrTy.getPointeeType().isBF16() ||
-      ptrTy.getAddressSpace() != PtrAddrSpace::Global ||
-      !getElementTypeOrSelf(getValue()).isF32())
-    return emitOpError(
-        "requires an FP32 value and ordinary BF16 global pointers");
+  if (!isa<FloatType>(ptrTy.getPointeeType()) ||
+      ptrTy.getAddressSpace() != PtrAddrSpace::Global)
+    return emitOpError("requires ordinary floating-point global pointers");
   if (getSite().empty() || getSiteId() < 0)
     return emitOpError("requires a named site with a nonnegative numeric ID");
   return success();
