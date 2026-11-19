@@ -1246,11 +1246,11 @@ getNativeScaledMfmaUnsupportedReason(tt::DotScaledOp dot, int mfmaVersion,
   };
   if (!supportsTypes(dot.getAElemType()) || !supportsTypes(dot.getBElemType()))
     return StringRef("NYI: unsupported mx type");
-  // fp6 (groups of 16 values per 12 bytes) cannot tile the MFMA K
-  // dimension today; route it to the decompose (upcast) path instead
-  // of the native instruction.
-  if (isMXFP6ScaleType(dot.getAElemType()) ||
-      isMXFP6ScaleType(dot.getBElemType()))
+  // A K=128 tile of unpacked FP6 codes lowers natively; other K
+  // still uses the decompose upcast.
+  if ((isMXFP6ScaleType(dot.getAElemType()) ||
+       isMXFP6ScaleType(dot.getBElemType())) &&
+      dot.getA().getType().getShape().back() != 128)
     return StringRef("fp6 uses decompose upcast");
   if (numWarps == 1)
     return StringRef("num_warps==1 is not supported");

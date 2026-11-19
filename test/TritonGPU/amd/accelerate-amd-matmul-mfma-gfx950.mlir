@@ -408,3 +408,31 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
     tt.return %dot : tensor<64x128xf32, #nested_pin>
   }
 }
+
+// -----
+
+// Manual K=96 blocked FP6 (TLX native kernel feeds unpacked codes in a
+// K=128 tile): stays a native scaled dot instead of decomposing.
+// CHECK-LABEL: mfma_dot_scaled_fp6_native_k96
+// CHECK-NOT: tt.fp_to_fp
+// CHECK: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2
+// CHECK-NOT: tt.dot {{.*}}xbf16
+// MFMA16-LABEL: mfma_dot_scaled_fp6_native_k96
+// MFMA16-NOT: tt.fp_to_fp
+// MFMA16: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [2, 2], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @mfma_dot_scaled_fp6_native_k96(
+      %arg0: tensor<128x128xi8, #blocked>,
+      %arg1: tensor<128x128xi8, #blocked>,
+      %arg2: tensor<128x4xi8, #blocked1>,
+      %arg3: tensor<128x4xi8, #blocked1>,
+      %arg4: tensor<128x128x!tt.ptr<f32>, #blocked>
+      ) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    %1 = tt.dot_scaled %arg0 scale %arg2, %arg1 scale %arg3, %cst lhs = e2m3 rhs = e3m2 {fastMath = false} : tensor<128x128xi8, #blocked>, tensor<128x4xi8, #blocked1> * tensor<128x128xi8, #blocked>, tensor<128x4xi8, #blocked1> -> tensor<128x128xf32, #blocked>
+    tt.store %arg4, %1 : tensor<128x128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
