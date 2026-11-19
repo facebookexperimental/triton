@@ -2082,6 +2082,34 @@ def _check_work_schedule(schedule, q, total_kv, batch, block_m, num_ctas):
                          "and grid")
 
 
+_AUTOMATIC_SCHEDULES: dict[tuple[Any, ...], tuple[Any, Any, ForwardWorkSchedule]] = {}
+
+
+def _automatic_work_schedule(cu_seqlens_q, cu_seqlens_k, device, *, num_ctas, block_m):
+    """Create the balanced schedule used by the public forward paths."""
+    key = (
+        id(cu_seqlens_q),
+        cu_seqlens_q._version,
+        id(cu_seqlens_k),
+        cu_seqlens_k._version,
+        block_m,
+        num_ctas,
+    )
+    hit = _AUTOMATIC_SCHEDULES.get(key)
+    if hit is not None and hit[0]() is cu_seqlens_q and hit[1]() is cu_seqlens_k:
+        return hit[2]
+    query_lengths = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).detach().cpu().tolist()
+    key_lengths = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).detach().cpu().tolist()
+    if num_ctas is None:
+        work_items = sum(triton.cdiv(q, block_m) * _HEADS for q, k in zip(query_lengths, key_lengths) if k)
+        num_ctas = min(512, max(8, triton.cdiv(work_items, 8) * 8))
+    schedule = prepare_work_schedule(query_lengths, key_lengths, device, num_ctas=num_ctas, block_m=block_m)
+    if len(_AUTOMATIC_SCHEDULES) >= 64:
+        _AUTOMATIC_SCHEDULES.pop(next(iter(_AUTOMATIC_SCHEDULES)))
+    _AUTOMATIC_SCHEDULES[key] = (weakref.ref(cu_seqlens_q), weakref.ref(cu_seqlens_k), schedule)
+    return schedule
+
+
 def forward_prequantized(
     q8,
     q_scales,
@@ -2115,6 +2143,14 @@ def forward_prequantized(
     if num_ctas is not None and (num_ctas < 8 or num_ctas % 8):
         raise ValueError("num_ctas must be a positive multiple of eight")
     batch = cu_seqlens_k.numel() - 1
+    if work_schedule is None:
+        work_schedule = _automatic_work_schedule(
+            cu_seqlens_q,
+            cu_seqlens_k,
+            device,
+            num_ctas=num_ctas,
+            block_m=block_m,
+        )
     _check_work_schedule(work_schedule, q8, total_kv, batch, block_m, num_ctas)
     npad = (triton.cdiv(total_kv + (_PAD - 1) * batch, _PAD) + 1) * _PAD
     tensors = (
@@ -2152,7 +2188,6 @@ def forward_prequantized(
         meta,
         block_m,
         fast_exp,
-        num_ctas,
         True,
         work_schedule,
     )
@@ -2195,30 +2230,19 @@ def forward(
         block_m = 128
     if block_m != 128:
         raise ValueError("The packed MXFP8 TLX op exposes only the 4-wave BLOCK_M=128 path")
+    if work_schedule is None:
+        work_schedule = _automatic_work_schedule(
+            cu_seqlens_q,
+            cu_seqlens_k,
+            q.device,
+            num_ctas=num_ctas,
+            block_m=block_m,
+        )
     _check_work_schedule(work_schedule, q, k.shape[0], batch, block_m, num_ctas)
     meta = _metadata(cu_seqlens_q, cu_seqlens_k, q.shape[0], k.shape[0], block_m)
     if kv_state is None:
         kv_state = prepare_kv(k, v, cu_seqlens_k, meta, backward=backward_state)
     k8, ks, v8, vs = kv_state[:4]
-    if work_schedule is not None:
-        out, lse = _launch_extended_forward(
-            q,
-            None,
-            k8,
-            ks,
-            v8,
-            vs,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            sm_scale,
-            meta,
-            block_m,
-            fast_exp,
-            num_ctas,
-            False,
-            work_schedule,
-        )
-        return out, lse, kv_state
     out, lse = _launch_extended_forward(
         q,
         None,
@@ -2232,7 +2256,6 @@ def forward(
         meta,
         block_m,
         fast_exp,
-        num_ctas,
         False,
         work_schedule,
     )
@@ -2277,24 +2300,20 @@ def _launch_extended_forward(
     meta,
     block_m,
     fast_exp,
-    num_ctas,
     prequantized,
     work_schedule,
 ):
     batch = cu_seqlens_k.numel() - 1
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     lse = torch.empty((_HEADS, q.shape[0]), dtype=torch.float32, device=q.device)
-    ctas = 256 * (256 // block_m)
-    grid = num_ctas or min(ctas, triton.cdiv(meta["item_capacity"] * _HEADS, 8) * 8)
-    if work_schedule is not None:
-        grid = work_schedule.num_ctas
+    grid = work_schedule.num_ctas
     cast(
         Any,
         _mxfp8_varlen_extended_kernel_8w if block_m == 256 else _mxfp8_varlen_extended_kernel_4,
     )[(grid, )](
         q,
         q_scales if q_scales is not None else q,
-        work_schedule.item_order if work_schedule is not None else q,
+        work_schedule.item_order,
         k8,
         v8,
         ks,
@@ -2314,12 +2333,12 @@ def _launch_extended_forward(
         BLOCK_M=block_m,
         FAST_EXP=fast_exp,
         PREQUANTIZED_Q=prequantized,
-        USE_WORK_ORDER=work_schedule is not None,
-        REUSE_METADATA=(work_schedule is not None and work_schedule.total_kv < 4096 * batch),
-        SCHEDULE_ITEMS=(work_schedule.item_order.numel() if work_schedule is not None else 0),
+        USE_WORK_ORDER=True,
+        REUSE_METADATA=work_schedule.total_kv < 4096 * batch,
+        SCHEDULE_ITEMS=work_schedule.item_order.numel(),
         **{**_LAUNCH_OPTIONS, "num_warps": block_m // 32},
     )
-    if work_schedule is None or work_schedule.needs_empty_fill:
+    if work_schedule.needs_empty_fill:
         cast(Any, _fill_empty)[(batch, )](
             out,
             lse,
