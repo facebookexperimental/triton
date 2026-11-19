@@ -928,14 +928,12 @@ static void lowerLoop(scf::ForOp forOp,
                                   load, axisInfoAnalysis, targetFeatures,
                                   targetInfo, useAsyncCopy)
                                   .value_or(nullptr);
-        // local_store can't take a mixed-radix layout, so only an async copy
-        // can fill an NPOT stage; otherwise the load stays in registers.
+        // Only an async copy fills an NPOT stage: a local_store stage is
+        // not used for mixed-radix loads, so they stay in registers.
         auto loadOp = dyn_cast<tt::LoadOp>(load);
-        if (sharedEncoding && loadOp &&
-            ttg::getNpotLayoutUnsupportedReason(
-                OperationName(ttg::LocalStoreOp::getOperationName(),
-                              load->getContext()),
-                load->getResultTypes()) &&
+        auto loadTy =
+            loadOp ? dyn_cast<RankedTensorType>(loadOp.getType()) : nullptr;
+        if (sharedEncoding && loadTy && ttg::hasExactNpotLayout(loadTy) &&
             !(useAsyncCopy &&
               canBeConvertedToAsyncLoad(2, loadOp, sharedEncoding,
                                         axisInfoAnalysis, targetInfo)))
