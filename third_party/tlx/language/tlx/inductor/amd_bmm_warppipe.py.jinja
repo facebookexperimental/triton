@@ -28,10 +28,12 @@
     stride_bq = {{stride("B", 0)}}
     stride_bk = {{stride("B", 1)}}
     stride_bn = {{stride("B", 2)}}
-    tl.assume(stride_am > 0)
-    tl.assume(stride_ak > 0)
-    tl.assume(stride_bk > 0)
-    tl.assume(stride_bn > 0)
+    # >= 0, not > 0: a size-1 or broadcast dim gets a literal 0 stride, and a false assume
+    # makes the whole kernel unreachable (it compiles to a lone s_trap).
+    tl.assume(stride_am >= 0)
+    tl.assume(stride_ak >= 0)
+    tl.assume(stride_bk >= 0)
+    tl.assume(stride_bn >= 0)
 
     pid = tl.program_id(0).to(INDEX_DTYPE)
     grid_m = (M + BLOCK_M - 1) // BLOCK_M
