@@ -1937,8 +1937,13 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.thr
 
 #store_layout = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #store_layout_x2 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#rows = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#lane_copies = #ttg.slice<{dim = 1, parent = #rows}>
+#register_copies = #ttg.linear<{register = [[0]], lane = [[1], [2], [4], [8], [16]], warp = [[32], [64]], block = []}>
 #store_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 !store_buf = !ttg.memdesc<128xf32, #store_shared, #ttg.shared_memory, mutable>
+!store_bufs = !ttg.memdesc<2x128xf32, #store_shared, #ttg.shared_memory, mutable>
+!small_buf = !ttg.memdesc<32xf32, #store_shared, #ttg.shared_memory, mutable>
 
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // Every execution of one register-to-shared store writes each address from
@@ -2005,6 +2010,113 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.thr
     }
     tt.return
   }
+
+  // Only the barrier between two executions of one store is dropped. A load in
+  // another layout reads what other threads wrote, so it still waits for the
+  // store, and the next store still waits for the load.
+  // CHECK-LABEL: @repeated_local_store_then_load
+  tt.func @repeated_local_store_then_load(%value: tensor<128xf32, #store_layout>, %count: i32) {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %init = arith.constant dense<0.0> : tensor<128xf32, #store_layout_x2>
+    %buf = ttg.local_alloc : () -> !store_buf
+    // CHECK: ttg.barrier local
+    // CHECK-NEXT: ttg.local_store
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: ttg.local_load
+    %sum = scf.for %i = %zero to %count step %one iter_args(%acc = %init) -> (tensor<128xf32, #store_layout_x2>) : i32 {
+      ttg.local_store %value, %buf : tensor<128xf32, #store_layout> -> !store_buf
+      %x = ttg.local_load %buf : !store_buf -> tensor<128xf32, #store_layout_x2>
+      %next = arith.addf %acc, %x : tensor<128xf32, #store_layout_x2>
+      scf.yield %next : tensor<128xf32, #store_layout_x2>
+    }
+    tt.return
+  }
+
+  // A view computed at the top of a warp-specialized region is fixed for that
+  // region, as in the FA kernels. Both the default region and a partition
+  // qualify.
+  // CHECK-LABEL: @repeated_local_store_warp_specialize
+  tt.func @repeated_local_store_warp_specialize(%count: i32) {
+    %bufs = ttg.local_alloc : () -> !store_bufs
+    // CHECK: default
+    // CHECK-NOT: ttg.barrier
+    // CHECK: ttg.local_store
+    // CHECK-NOT: ttg.barrier
+    // CHECK: partition0
+    // CHECK-NOT: ttg.barrier
+    // CHECK: ttg.local_store
+    // CHECK-NOT: ttg.barrier
+    // CHECK: tt.return
+    ttg.warp_specialize(%bufs, %count)
+    default {
+      %zero = arith.constant 0 : i32
+      %one = arith.constant 1 : i32
+      %value = arith.constant dense<1.0> : tensor<128xf32, #store_layout>
+      %view = ttg.memdesc_index %bufs[%zero] : !store_bufs -> !store_buf
+      scf.for %i = %zero to %count step %one : i32 {
+        ttg.local_store %value, %view : tensor<128xf32, #store_layout> -> !store_buf
+      }
+      ttg.warp_yield
+    }
+    partition0(%b: !store_bufs, %n: i32) num_warps(4) {
+      %zero = arith.constant 0 : i32
+      %one = arith.constant 1 : i32
+      %value = arith.constant dense<2.0> : tensor<128xf32, #store_layout>
+      %view = ttg.memdesc_index %b[%one] : !store_bufs -> !store_buf
+      scf.for %i = %zero to %n step %one : i32 {
+        ttg.local_store %value, %view : tensor<128xf32, #store_layout> -> !store_buf
+      }
+      ttg.warp_return
+    } : (!store_bufs, i32) -> ()
+    tt.return
+  }
+
+  // Every thread that holds a copy of an element writes it. One warp's write
+  // from an earlier execution can land after another warp's write from a
+  // later one, so the barrier stays.
+  // CHECK-LABEL: @repeated_local_store_copies_in_warps
+  tt.func @repeated_local_store_copies_in_warps(%value: tensor<32xf32, #store_layout>, %count: i32) {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %buf = ttg.local_alloc : () -> !small_buf
+    // CHECK: ttg.barrier local
+    // CHECK-NEXT: ttg.local_store
+    scf.for %i = %zero to %count step %one : i32 {
+      ttg.local_store %value, %buf : tensor<32xf32, #store_layout> -> !small_buf
+    }
+    tt.return
+  }
+
+  // The same holds for copies in different lanes of one warp.
+  // CHECK-LABEL: @repeated_local_store_copies_in_lanes
+  tt.func @repeated_local_store_copies_in_lanes(%value: tensor<32xf32, #lane_copies>, %count: i32) {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %buf = ttg.local_alloc : () -> !small_buf
+    // CHECK: ttg.barrier local
+    // CHECK-NEXT: ttg.local_store
+    scf.for %i = %zero to %count step %one : i32 {
+      ttg.local_store %value, %buf : tensor<32xf32, #lane_copies> -> !small_buf
+    }
+    tt.return
+  }
+
+  // Copies that one thread holds are stored once, by that thread.
+  // CHECK-LABEL: @repeated_local_store_copies_in_registers
+  tt.func @repeated_local_store_copies_in_registers(%value: tensor<128xf32, #register_copies>, %count: i32) {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %buf = ttg.local_alloc : () -> !store_buf
+    // CHECK-NOT: ttg.barrier
+    // CHECK: ttg.local_store
+    // CHECK-NOT: ttg.barrier
+    // CHECK: tt.return
+    scf.for %i = %zero to %count step %one : i32 {
+      ttg.local_store %value, %buf : tensor<128xf32, #register_copies> -> !store_buf
+    }
+    tt.return
+  }
 }
 
 // -----
@@ -2035,6 +2147,92 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.thr
       ttng.arrive_barrier_named %id, %c64 : !ttng.named_barrier_id, i32
       ttg.warp_return
     } : (!barrier, i32) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+#bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+!barrier = !ttg.memdesc<1xi64, #bar, #ttg.shared_memory, mutable>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // The synchronization before an outer divergent branch accounts for
+  // everything a nested divergent branch may skip, so neither branch needs
+  // another one.
+  // CHECK-LABEL: @wait_before_nested_divergent_branches
+  // SCF-LABEL: @wait_before_nested_divergent_branches
+  tt.func public @wait_before_nested_divergent_branches(%ptr: !tt.ptr<i32>, %phase: i32) {
+    %ready = ttg.local_alloc : () -> !barrier
+    ttg.warp_specialize(%ready, %ptr, %phase)
+    default {
+      ttg.warp_yield
+    }
+    partition0(%r: !barrier, %p: !tt.ptr<i32>, %ph: i32) num_warps(4) {
+      %c0 = arith.constant 0 : i32
+      %c1 = arith.constant 1 : i32
+      %c64 = arith.constant 64 : i32
+      %tid = gpu.thread_id x
+      %tid_i32 = arith.index_cast %tid : index to i32
+      %low = arith.cmpi slt, %tid_i32, %c64 : i32
+      %first = arith.cmpi eq, %tid_i32, %c0 : i32
+      // CHECK: partition0
+      // CHECK: ttng.wait_barrier
+      // CHECK-NEXT: ttg.barrier local
+      // CHECK-NEXT: cf.cond_br
+      // CHECK-NOT: ttg.barrier
+      // CHECK: tt.store
+      // SCF: partition0
+      // SCF: ttng.wait_barrier
+      // SCF-NEXT: ttg.barrier local
+      // SCF-NEXT: scf.if
+      // SCF-NEXT: scf.if
+      // SCF-NEXT: tt.store
+      ttng.wait_barrier %r, %ph : !barrier
+      scf.if %low {
+        scf.if %first {
+          tt.store %p, %c1 : !tt.ptr<i32>
+        }
+      }
+      ttg.warp_return
+    } : (!barrier, !tt.ptr<i32>, i32) -> ()
+    tt.return
+  }
+
+  // Not handled yet. Only the threads that take the outer branch wait, and no
+  // CTA barrier is reached by exactly those threads. Membar puts the
+  // rendezvous inside the outer branch, which the other threads never reach,
+  // so a kernel must not wait and then notify a peer under nested
+  // thread-dependent branches.
+  // CHECK-LABEL: @wait_inside_divergent_branch
+  tt.func public @wait_inside_divergent_branch(%ptr: !tt.ptr<i32>, %phase: i32) {
+    %ready = ttg.local_alloc : () -> !barrier
+    ttg.warp_specialize(%ready, %ptr, %phase)
+    default {
+      ttg.warp_yield
+    }
+    partition0(%r: !barrier, %p: !tt.ptr<i32>, %ph: i32) num_warps(4) {
+      %c0 = arith.constant 0 : i32
+      %c1 = arith.constant 1 : i32
+      %c64 = arith.constant 64 : i32
+      %tid = gpu.thread_id x
+      %tid_i32 = arith.index_cast %tid : index to i32
+      %low = arith.cmpi slt, %tid_i32, %c64 : i32
+      %first = arith.cmpi eq, %tid_i32, %c0 : i32
+      // CHECK: partition0
+      // CHECK: cf.cond_br
+      // CHECK: ttng.wait_barrier
+      // CHECK-NEXT: ttg.barrier local
+      // CHECK-NEXT: cf.cond_br
+      // CHECK: tt.store
+      scf.if %low {
+        ttng.wait_barrier %r, %ph : !barrier
+        scf.if %first {
+          tt.store %p, %c1 : !tt.ptr<i32>
+        }
+      }
+      ttg.warp_return
+    } : (!barrier, !tt.ptr<i32>, i32) -> ()
     tt.return
   }
 }

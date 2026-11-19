@@ -28,7 +28,7 @@ upstream pick conflicts in these files, resolve it so every rule survives.
 | A pending barrier init or inval is synchronized before an MMA completion or a per-thread arrival | `missesBarrierLifetime` | `@init_before_mma_completion`, `@sync_before_divergent_branches` |
 | A predicated per-thread arrival does not arrive for every thread | `arrivesFromEveryThread` | `@predicated_perthread_arrive`, `@tmem_load_then_predicated_perthread_arrive` |
 | A named barrier is a rendezvous only if its count covers the region | `countsEveryThread` | `@partial_named_barrier_after_wait`, `@tmem_load_then_partial_named_barrier` |
-| Two executions of one store into a view fixed for the region need no barrier | `isRepeatedLocalStore` | `@repeated_local_store` |
+| Two executions of one store into a view fixed for the region need no barrier, when each element lives in one thread | `isRepeatedLocalStore`, `storesEachAddressFromOneThread` | `@repeated_local_store`, `@repeated_local_store_copies_in_warps`, `@repeated_local_store_copies_in_lanes` |
 | Per-thread arrivals from every thread become per-warp arrivals, and a converted arrival is a per-warp publication | `prepareMBarrierArrivals`, `getThreadSyncInfo` | `@tmem_load_then_perthread_arrive` |
 | TMEM barrier insertion: a per-thread arrival from every thread, or a named barrier that counts every thread, completes each thread's own TMEM accesses | `getTMemBoundary` | `@tmem_load_then_perthread_arrive_on_argument`, `@tmem_load_then_perthread_arrive` |
 | `clc_query_cancel` only reads its response | `TritonNvidiaGPUOps.td` | `@notifications_after_waits` |

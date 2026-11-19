@@ -814,17 +814,39 @@ bool carriesNoPayload(Operation *op) {
              ttng::TCGen5CommitOp>(op);
 }
 
+// Whether a store writes each address from a single thread. The lowering
+// stores the copies that one thread holds once, but every thread that holds a
+// copy of an element writes it.
+bool storesEachAddressFromOneThread(triton::gpu::LocalStoreOp store) {
+  auto srcTy = cast<RankedTensorType>(store.getSrc().getType());
+  if (!isa_and_nonnull<triton::gpu::DistributedEncodingTrait>(
+          srcTy.getEncoding()))
+    return false;
+  MLIRContext *ctx = store.getContext();
+  auto kReg = StringAttr::get(ctx, "register");
+  auto kLane = StringAttr::get(ctx, "lane");
+  auto kWarp = StringAttr::get(ctx, "warp");
+  triton::LinearLayout layout =
+      triton::gpu::toLinearLayout(srcTy).removeZeroBasesAlongDim(kReg);
+  return layout
+      .sublayout({kReg, kLane, kWarp}, llvm::to_vector(layout.getOutDimNames()))
+      .isInjective();
+}
+
 // Whether `before` and `after` are two executions of one register-to-shared
 // store into a view that is fixed for the whole kernel or warp-specialized
-// region. Every execution writes each address from the same threads, and each
-// of them orders its own writes by program order, so the last write to an
-// address always comes from the latest execution.
+// region. When the stored layout gives each element to one thread, every
+// execution writes each address from that same thread, which orders its own
+// writes by program order, so the last write to an address always comes from
+// the latest execution. A layout that replicates elements across lanes or
+// warps does not qualify: each copy is written, and one thread's write from an
+// earlier execution can land after another thread's write from a later one.
 bool isRepeatedLocalStore(Operation *before, Operation *after,
                           bool beforeIsRead, bool afterIsRead) {
   if (before != after || beforeIsRead || afterIsRead)
     return false;
   auto store = dyn_cast<triton::gpu::LocalStoreOp>(before);
-  if (!store)
+  if (!store || !storesEachAddressFromOneThread(store))
     return false;
   // The view must be computed once, before any control flow of a kernel or
   // warp-specialized region, so every execution writes the same addresses.
