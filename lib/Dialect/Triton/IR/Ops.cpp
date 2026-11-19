@@ -1616,6 +1616,18 @@ LogicalResult FpToFpOp::verify() {
   return success();
 }
 
+LogicalResult SrStoreOp::verify() {
+  auto ptrTy = cast<PointerType>(getElementTypeOrSelf(getPtr()));
+  if (!ptrTy.getPointeeType().isBF16() ||
+      ptrTy.getAddressSpace() != PtrAddrSpace::Global ||
+      !getElementTypeOrSelf(getValue()).isF32())
+    return emitOpError(
+        "requires an FP32 value and ordinary BF16 global pointers");
+  if (getSite().empty() || getSiteId() != 0)
+    return emitOpError("requires a named site with site_id zero in ABI v1");
+  return success();
+}
+
 //-- BitcastOp --
 OpFoldResult BitcastOp::fold(FoldAdaptor adaptor) {
   if (getSrc().getType() == getType())
