@@ -1,3 +1,4 @@
+#include "StochasticStoreOwnership.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
@@ -10,26 +11,6 @@ namespace mlir::triton {
 #define GEN_PASS_DEF_TRITONMATERIALIZESTOCHASTICROUNDING
 #include "triton/Dialect/Triton/Transforms/Passes.h.inc"
 namespace {
-
-struct AffineIndex {
-  int64_t constant = 0;
-  DenseMap<Value, int64_t> terms;
-};
-
-bool add(AffineIndex &dst, const AffineIndex &src, int64_t scale = 1) {
-  int64_t value;
-  if (llvm::MulOverflow(src.constant, scale, value) ||
-      llvm::AddOverflow(dst.constant, value, dst.constant))
-    return false;
-  for (auto [symbol, coefficient] : src.terms) {
-    if (llvm::MulOverflow(coefficient, scale, value) ||
-        llvm::AddOverflow(dst.terms[symbol], value, dst.terms[symbol]))
-      return false;
-    if (dst.terms[symbol] == 0)
-      dst.terms.erase(symbol);
-  }
-  return true;
-}
 
 std::optional<AffineIndex> affine(Value value) {
   APInt integer;
@@ -160,16 +141,19 @@ bool proveOwnership(SrStoreOp store) {
     return false;
   if (auto tensor = dyn_cast<RankedTensorType>(store.getPtr().getType())) {
     int64_t lanes = 1;
-    for (auto [stride, extent] : dimensions)
-      if (llvm::MulOverflow(lanes, extent, lanes))
-        return false;
-    if (lanes < tensor.getNumElements())
+    for (auto [symbol, coefficient] : offset.terms)
+      if (auto range = symbol.getDefiningOp<MakeRangeOp>())
+        if (llvm::MulOverflow(lanes, int64_t(range.getEnd() - range.getStart()),
+                              lanes))
+          return false;
+    if (lanes != tensor.getNumElements())
       return false;
   }
   bool conflictingStore = false;
   store->getParentOfType<FuncOp>().walk([&](Operation *other) {
     if (other == store.getOperation())
       return;
+    conflictingStore |= isa<CallOp>(other);
     if (auto effects = dyn_cast<MemoryEffectOpInterface>(other)) {
       SmallVector<MemoryEffects::EffectInstance> instances;
       effects.getEffects(instances);
@@ -185,23 +169,23 @@ bool containsLoop(Operation *op) {
       .wasInterrupted();
 }
 
-// Inserts after the logical index and after the last loop that precedes the
-// store in its block.
-void setEntropyInsertionPoint(OpBuilder &builder, SrStoreOp store) {
-  auto *index = store.getLogicalIndex().getDefiningOp();
-  if (index && index->getBlock() != store->getBlock())
-    index = nullptr;
-  for (Operation *op = store->getPrevNode(); op != index;
-       op = op->getPrevNode()) {
+// Inserts before the first entry-block op that holds an SR store and after the
+// last loop that precedes it.
+void setSeedInsertionPoint(OpBuilder &builder, FuncOp function) {
+  Block &entry = function.getBody().front();
+  Operation *anchor = entry.getTerminator();
+  function.walk([&](SrStoreOp store) {
+    Operation *ancestor = entry.findAncestorOpInBlock(*store.getOperation());
+    if (ancestor && ancestor->isBeforeInBlock(anchor))
+      anchor = ancestor;
+  });
+  for (Operation *op = anchor->getPrevNode(); op; op = op->getPrevNode()) {
     if (containsLoop(op)) {
       builder.setInsertionPointAfter(op);
       return;
     }
   }
-  if (index)
-    builder.setInsertionPointAfter(index);
-  else
-    builder.setInsertionPointToStart(store->getBlock());
+  builder.setInsertionPointToStart(&entry);
 }
 
 class EntropyBuilder {
@@ -255,11 +239,16 @@ public:
     return mix(xorWith(mix(xorWith(a, constant(a.getType(), domain))), c));
   }
   Value generate(SrStoreOp store, FuncOp function, int rounds) {
-    Value dynamicSeed = LoadOp::create(b, loc, function.getArgument(0));
-    Value seed =
-        hash(function.getArgument(1), dynamicSeed, 0x747269746f6e5301ULL);
-    Value invocation = hash(function.getArgument(2),
-                            constant(b.getI64Type(), 0), 0x747269746f6e5302ULL);
+    OpBuilder entryBuilder(function.getContext());
+    setSeedInsertionPoint(entryBuilder, function);
+    EntropyBuilder uniformEntropy(entryBuilder, store);
+    Value dynamicSeed =
+        LoadOp::create(entryBuilder, loc, function.getArgument(0));
+    Value seed = uniformEntropy.hash(function.getArgument(1), dynamicSeed,
+                                     0x747269746f6e5301ULL);
+    Value invocation = uniformEntropy.hash(
+        function.getArgument(2), uniformEntropy.constant(b.getI64Type(), 0),
+        0x747269746f6e5302ULL);
     Value c0 = low(store.getLogicalIndex(), lane32);
     Value c1 = high(store.getLogicalIndex(), lane32);
     Value c2 = splat(low(invocation, b.getI32Type()));
@@ -309,11 +298,20 @@ struct TritonMaterializeStochasticRounding
       return;
     }
     auto store = stores[0];
-    if (mode == "enabled" && !proveOwnership(store)) {
+    if (mode == "enabled" && !proveOwnership(store) &&
+        !proveLaunchOwnership(store)) {
       store.emitOpError(
           "cannot prove injective matching pointer and logical indices");
       signalPassFailure();
       return;
+    }
+    if (mode == "enabled") {
+      auto *next = store->getNextNode();
+      while (next && !next->hasTrait<OpTrait::IsTerminator>() &&
+             isMemoryEffectFree(next)) {
+        store->moveAfter(next);
+        next = store->getNextNode();
+      }
     }
     OpBuilder builder(store);
     auto valueType = getPointeeType(store.getPtr().getType());
@@ -340,8 +338,21 @@ struct TritonMaterializeStochasticRounding
         signalPassFailure();
         return;
       }
+      for (unsigned arg = 3; arg < function.getNumArguments(); ++arg) {
+        auto constraint =
+            function.getArgAttrOfType<IntegerAttr>(arg, "tt.sr_value");
+        auto type = dyn_cast<IntegerType>(function.getArgument(arg).getType());
+        if (!constraint || !type)
+          continue;
+        OpBuilder entryBuilder(function.getContext());
+        entryBuilder.setInsertionPointToStart(&function.getBody().front());
+        auto constant = arith::ConstantOp::create(
+            entryBuilder, store.getLoc(), type,
+            entryBuilder.getIntegerAttr(type, constraint.getInt()));
+        function.getArgument(arg).replaceAllUsesWith(constant);
+      }
       OpBuilder entropyBuilder(&getContext());
-      setEntropyInsertionPoint(entropyBuilder, store);
+      entropyBuilder.setInsertionPoint(store);
       EntropyBuilder entropy(entropyBuilder, store);
       auto random = entropy.generate(store, function, rounds);
       auto conversion = FpToFpOp::create(
