@@ -393,9 +393,13 @@ bool proveLaunchOwnership(SrStoreOp store) {
       for (auto &effect : instances) {
         if (!isa<MemoryEffects::Write>(effect.getEffect()))
           continue;
-        auto ordinary = dyn_cast<StoreOp>(other);
-        conflict |= !ordinary || !proof.base(ordinary.getPtr()) ||
-                    proof.base(ordinary.getPtr()) == base;
+        Value pointer;
+        if (auto ordinary = dyn_cast<StoreOp>(other))
+          pointer = ordinary.getPtr();
+        else if (auto annotated = dyn_cast<SrStoreOp>(other))
+          pointer = annotated.getPtr();
+        conflict |=
+            !pointer || !proof.base(pointer) || proof.base(pointer) == base;
       }
     }
   });
