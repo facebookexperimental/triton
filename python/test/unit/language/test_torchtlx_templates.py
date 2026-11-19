@@ -3795,6 +3795,24 @@ HEURISTIC_CONFIG_CASES = [
             "SPLIT_K": 1,
         },
     ),
+    # Rule 1b via alt-tiling (torchTLX-only): AI>1.5, N<1024 unaligned, m_tiles>74.
+    # tlx.ops would pick Rule 3 here.
+    (
+        "rule_1b_alt_tiling",
+        32768,
+        257,
+        4096,
+        {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "NUM_CTAS": 2,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_SMEM_BUFFERS": 2,
+            "INTERLEAVE_EPILOGUE": 1,
+            "SPLIT_K": 1,
+        },
+    ),
     # Rule 3: tall_m, saturated, AI>1.5, no alt-tiling, K>N*2
     (
         "rule_3",
@@ -3860,6 +3878,23 @@ HEURISTIC_CONFIG_CASES = [
             "NUM_MMA_GROUPS": 2,
             "EPILOGUE_SUBTILE": 8,
             "SPLIT_K": 4,
+            "INTERLEAVE_EPILOGUE": 1,
+        },
+    ),
+    # Rule 5 at SPLIT_K=1 (torchTLX-only): k_tiles=4 is too few to split.
+    # tlx.ops would fall through to its candidate scorer here.
+    (
+        "rule_5_no_split_k",
+        1025,
+        1024,
+        256,
+        {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "NUM_CTAS": 1,
+            "EPILOGUE_SUBTILE": 8,
+            "SPLIT_K": 1,
             "INTERLEAVE_EPILOGUE": 1,
         },
     ),

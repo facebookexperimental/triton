@@ -419,33 +419,6 @@ def _warppipe_tile_fits(
     return resources.AMD_WARP_PIPE.validate(cfg, smem_margin=margin)
 
 
-def _select_group_size_m(M: int, N: int, block_m: int) -> int:
-    """
-    Select GROUP_SIZE_M based on the golden rule for tile scheduling.
-
-    GROUP_SIZE_M controls how tiles are traversed:
-    - GROUP_SIZE_M = 1: Column-major (sweep M first), reuses B tiles
-    - GROUP_SIZE_M = large: Row-major (sweep N first), reuses A tiles
-
-    Golden rule:
-    - When M >> N: Use small GROUP_SIZE_M to reuse B (smaller dimension)
-    - When N >> M: Use large GROUP_SIZE_M to reuse A (smaller dimension)
-    - When M ~ N: Use moderate GROUP_SIZE_M for L2 locality
-    """
-    num_m_tiles = (M + block_m - 1) // block_m
-    ratio = M / max(N, 1)
-
-    if ratio > 10:
-        # M >> N: sweep M, reuse B
-        return 1
-    elif ratio < 0.1:
-        # N >> M: sweep N, reuse A
-        return min(64, num_m_tiles)
-    else:
-        # Balanced: moderate group size for L2 locality
-        return min(8, num_m_tiles)
-
-
 def _is_config_valid(
     config: dict[str, Any],
     tma_epilogue_store: bool = False,
@@ -508,12 +481,14 @@ def get_heuristic_config(
     Select optimal GEMM config based on problem shape characteristics.
 
     This implements heuristic rules for TLX Blackwell GEMM kernel configuration.
-    Rules are evaluated in order (first match wins).
+    Rules are evaluated in order (first match wins). Rules 1b (AI <= 1.5), 3, 4
+    and 7 come from tlx.ops ``sm100.get_heuristic_config``; the rest are torchTLX
+    overlays on it.
 
     Heuristic Rules Index:
     ----------------------
     Rule 0: Fallback (Candidate Scoring)
-        - Condition: No single-config rule matches, or block size validation fails
+        - Condition: Block size or resource validation fails
         - Config: Selected via _candidate_scorer_evaluate()
         - Use case: Edge cases and shapes not covered by explicit rules
 
@@ -561,6 +536,8 @@ def get_heuristic_config(
         dict: Configuration parameters for the TLX GEMM kernel,
         or None if no valid config can be determined.
     """
+    from triton.tlx.ops.kernels.mm import sm100
+
     if num_sms is None:
         num_sms = current_target().num_sms
 
@@ -602,12 +579,12 @@ def get_heuristic_config(
             elif N < 1024 and N % 256 != 0:
                 use_alt_tiling = True
 
-        # Rule 1a/1b: Tall-M Low-AI, or high-AI with suboptimal BN=256
-        if arithmetic_intensity <= 1.5 or use_alt_tiling:
+        # Rule 1a/1b: high-AI with suboptimal BN=256. AI <= 1.5 is tlx.ops Rule 1b.
+        if use_alt_tiling:
             m_tiles_256 = _math.ceil(M / 256)
             # Rule 1a: Moderate-M — use BM=128 1-CTA to avoid 2-CTA
             # coordination overhead and improve tile granularity.
-            if use_alt_tiling and m_tiles_256 <= num_sms // 2:
+            if m_tiles_256 <= num_sms // 2:
                 config = {
                     "BLOCK_SIZE_M": 128,
                     "BLOCK_SIZE_N": 256,
@@ -634,34 +611,6 @@ def get_heuristic_config(
                     "SPLIT_K": 1,
                     "INTERLEAVE_EPILOGUE": 1,
                 }
-        # Rule 3: Tall-M High-AI, K > N*2 — large BLOCK_K for fewer K-iterations
-        elif K > N * 2:
-            config = {
-                "BLOCK_SIZE_M": 256,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 128,
-                "NUM_SMEM_BUFFERS": 2,
-                "NUM_TMEM_BUFFERS": 1,
-                "NUM_MMA_GROUPS": 2,
-                "EPILOGUE_SUBTILE": 4,
-                "NUM_CTAS": 2,
-                "SPLIT_K": 1,
-                "INTERLEAVE_EPILOGUE": 0,
-            }
-        # Rule 4: Tall-M High-AI, K <= N*2 — more SMEM buffers, interleaved epilogue
-        else:
-            config = {
-                "BLOCK_SIZE_M": 256,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 64,
-                "NUM_SMEM_BUFFERS": 4,
-                "NUM_TMEM_BUFFERS": 1,
-                "NUM_MMA_GROUPS": 2,
-                "EPILOGUE_SUBTILE": 4,
-                "NUM_CTAS": 2,
-                "SPLIT_K": 1,
-                "INTERLEAVE_EPILOGUE": 1,
-            }
 
     # Characteristic 2: Undersaturated shapes — use split-K to improve parallelism.
     # The template writes fp32 partials to a workspace; a separate reduction
@@ -706,27 +655,13 @@ def get_heuristic_config(
             "INTERLEAVE_EPILOGUE": 1,
         }
 
-    # Rule 7: GPU-Saturated General (Wide-N)
-    elif gpu_saturated:
-        config = {
-            "BLOCK_SIZE_M": 256,
-            "BLOCK_SIZE_N": 256,
-            "BLOCK_SIZE_K": 64,
-            "NUM_SMEM_BUFFERS": 3,
-            "NUM_TMEM_BUFFERS": 1,
-            "NUM_MMA_GROUPS": 2,
-            "EPILOGUE_SUBTILE": 4,
-            "NUM_CTAS": 1,
-            "SPLIT_K": 1,
-            "INTERLEAVE_EPILOGUE": 1,
-        }
-
-    # Rule 0: Fallback (Candidate Scoring)
+    # Rules 1b (AI <= 1.5), 3, 4 and 7: every remaining shape is saturated, so
+    # tlx.ops returns one of these rules and never reaches its own scorer.
     if config is None:
-        config = _candidate_scorer_evaluate(M, N, K, num_sms)
-
-    if config is None:
-        return None
+        config = sm100.get_heuristic_config(M, N, K, num_sms)
+        if config is None:
+            return None
+        config.pop("pre_hook", None)
 
     # Validate block sizes don't exceed problem dimensions
     block_n = config["BLOCK_SIZE_N"]
@@ -751,12 +686,8 @@ def get_heuristic_config(
     # Post-process: add GROUP_SIZE_M and ctas_per_cga
     block_m = config["BLOCK_SIZE_M"]
     num_ctas = config["NUM_CTAS"]
-    config["GROUP_SIZE_M"] = _select_group_size_m(M, N, block_m)
-    # GROUP_SIZE_M must be a multiple of NUM_CTAS so that consecutive
-    # tile_ids (paired CTAs in a cluster) map to the same pid_n.
-    if num_ctas > 1:
-        gsm = config["GROUP_SIZE_M"]
-        config["GROUP_SIZE_M"] = ((gsm + num_ctas - 1) // num_ctas) * num_ctas
+    # A multiple of NUM_CTAS, so paired CTAs in a cluster map to the same pid_n.
+    config["GROUP_SIZE_M"] = sm100.select_group_size_m(M, N, block_m, num_ctas)
     config["ctas_per_cga"] = (num_ctas, 1, 1) if num_ctas > 1 else None
 
     return config
