@@ -14,18 +14,18 @@ from triton._internal_testing import is_hip_cdna4
 def test_mm_mxfp6_gfx950_catalog_entry():
     from triton.tlx.ops._catalog import CATALOG, has_impl
 
-    # Held until the gfx950 numerics fix lands: no catalog entry, so
-    # MI350 callers get UnsupportedOp instead of silent wrong results.
     specs = [spec for spec in CATALOG if spec.op == "mm_mxfp6" and spec.arch == "gfx950"]
-    assert len(specs) == 0
-    assert not has_impl("mm_mxfp6", "gfx950")
+    assert len(specs) == 1
+    assert specs[0].impl == "triton.tlx.ops.kernels.mm_mxfp6.gfx950:mm_mxfp6"
+    assert has_impl("mm_mxfp6", "gfx950")
 
 
 def test_mm_mxfp6_gfx950_catalog_resolves_implementation():
-    from triton.tlx.ops._catalog import UnsupportedOp, impl_for
+    from triton.tlx.ops._catalog import impl_for
 
-    with pytest.raises(UnsupportedOp, match="no implementation for arch='gfx950'"):
-        impl_for("mm_mxfp6", arch="gfx950")
+    impl, spec = impl_for("mm_mxfp6", arch="gfx950")
+    assert impl.__name__ == "mm_mxfp6"
+    assert spec.arch == "gfx950"
 
 
 def test_mm_mxfp6_gfx950_rejects_blocked_scales_and_bad_space():
@@ -55,7 +55,6 @@ def _packed_ones(rows, K, code, device):
 @pytest.mark.parametrize("space", ["heuristic", "full"])
 def test_mm_mxfp6_gfx950_ones(space):
     from triton.tlx import ops
-    from triton.tlx.ops._catalog import UnsupportedOp
 
     device = "cuda"
     M = N = K = 128
@@ -64,6 +63,22 @@ def test_mm_mxfp6_gfx950_ones(space):
     b = _packed_ones(N, K, 12, device)
     scales_a = torch.full((M, K // 32), 127, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu)
     scales_b = torch.full((N, K // 32), 127, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu)
-    # Held until the gfx950 numerics fix lands (see catalog note).
-    with pytest.raises(UnsupportedOp):
-        ops.mm_mxfp6(a, scales_a, b, scales_b, space=space)
+    out = ops.mm_mxfp6(a, scales_a, b, scales_b, space=space)
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), torch.full((M, N), float(K), device=device))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("K", [128, 256, 1024])
+def test_mm_mxfp6_gfx950_native_ones(K):
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6
+
+    device = "cuda"
+    M = N = 128
+    a = _packed_ones(M, K, 8, device)
+    b = _packed_ones(N, K, 12, device)
+    scales_a = torch.full((M, K // 32), 127, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu)
+    scales_b = torch.full((N, K // 32), 127, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu)
+    out = mm_mxfp6(a, scales_a, b, scales_b, space="heuristic")
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), torch.full((M, N), float(K), device=device))
