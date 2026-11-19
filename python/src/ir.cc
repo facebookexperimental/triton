@@ -886,6 +886,21 @@ void init_triton_ir(py::module_ &m) {
              auto value = attr.getValue();
              return py::str(value.data(), value.size());
            })
+      .def("validate_stochastic_rounding",
+           [](ModuleOp &self, const std::string &backend) {
+             bool unsupported = false;
+             self.walk([&](FpToFpOp op) {
+               if (op.getRounding() == RoundingMode::RS && backend != "cuda" &&
+                   (backend != "hip" || op->hasAttr("sr_ieee"))) {
+                 op.emitOpError("stochastic rounding is not supported on ")
+                     << backend;
+                 unsupported = true;
+               }
+             });
+             if (unsupported)
+               throw std::runtime_error(
+                   "unsupported stochastic rounding target");
+           })
       .def("dump", &ModuleOp::dump)
       .def("str",
            [](ModuleOp &self) -> std::string {

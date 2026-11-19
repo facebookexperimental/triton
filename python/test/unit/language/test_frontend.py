@@ -4,8 +4,11 @@ import itertools
 import re
 import triton
 import triton.language as tl
+import triton.language.extra.tlx as tlx
 from triton.experimental import gluon
 from triton._filecheck import filecheck_test, run_filecheck_test, run_parser
+from triton._C.libtriton import ir
+from triton.backends.compiler import GPUTarget
 from triton.compiler.code_generator import CodeGenerator
 from triton.runtime.jit import MockTensor
 from triton.compiler.errors import CompilationError
@@ -2177,3 +2180,72 @@ def test_amd_tdm_load_partitioned_destination():
     text = run_parser(kernel, kwargs={"num_warps": 8}, target=GPUTarget("hip", "gfx1250", 32)).str_nodebug()
     assert "#ttg.partitioned_shared" in text
     assert "amdg.async_tdm_copy_global_to_local" in text
+
+
+def test_stochastic_rounding_generic_cast_requires_entropy():
+
+    @triton.jit
+    def kernel():
+        anchor(tl.full((), 1.5, tl.float32).to(tl.bfloat16, fp_downcast_rounding="rs"))
+
+    with pytest.raises(CompilationError, match="requires explicit random bits"):
+        run_parser(kernel)
+
+
+@pytest.mark.parametrize("arch, dtype", [
+    ("gfx942", tl.float8e4b8),
+    ("gfx942", tl.float8e5b16),
+    ("gfx950", tl.bfloat16),
+    ("gfx950", tl.float16),
+    ("gfx950", tl.float8e4nv),
+    ("gfx950", tl.float8e5),
+    ("gfx1250", tl.bfloat16),
+    ("gfx1250", tl.float16),
+    ("gfx1250", tl.float8e4nv),
+    ("gfx1250", tl.float8e5),
+], ids=str)
+def test_stochastic_rounding_amd_legacy_conversion(arch, dtype):
+
+    @triton.jit
+    def kernel(Input, Output, DTYPE: tl.constexpr):
+        index = tl.arange(0, 32)
+        value = tl.load(Input + index)
+        entropy = tl.full((32, ), 0x12345678, tl.uint32)
+        tl.store(Output + index, tlx.stoch_round(value, DTYPE, entropy))
+
+    target = GPUTarget("hip", arch, 32 if arch == "gfx1250" else 64)
+    module = run_parser(kernel, args=(MockTensor(tl.float32), MockTensor(dtype), dtype), target=target)
+    assert "rounding = rs" in module.str_nodebug()
+    module.validate_stochastic_rounding("hip")
+
+
+@pytest.mark.parametrize("backend", ["cpu", "tileir"])
+def test_stochastic_rounding_legacy_conversion_unsupported_backend(backend):
+
+    @triton.jit
+    def kernel(Input, Output):
+        index = tl.arange(0, 32)
+        value = tl.load(Input + index)
+        entropy = tl.full((32, ), 0x12345678, tl.uint32)
+        tl.store(Output + index, tlx.stoch_round(value, tl.bfloat16, entropy))
+
+    module = run_parser(kernel, args=(MockTensor(tl.float32), MockTensor(tl.bfloat16)))
+    with pytest.raises(RuntimeError, match="unsupported stochastic rounding target"):
+        module.validate_stochastic_rounding(backend)
+
+
+def test_stochastic_rounding_amd_annotated_conversion_rejected(tmp_path):
+    source = tmp_path / "annotated_sr.ttir"
+    source.write_text("""
+module {
+  tt.func @annotated_sr(%value: tensor<32xf32>, %entropy: tensor<32xi32>) {
+    %rounded = tt.fp_to_fp %value, rbits = %entropy : tensor<32xi32>, rounding = rs {sr_ieee} : tensor<32xf32> -> tensor<32xbf16>
+    tt.return
+  }
+}
+""")
+    context = ir.context()
+    ir.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    with pytest.raises(RuntimeError, match="unsupported stochastic rounding target"):
+        module.validate_stochastic_rounding("hip")
