@@ -65,6 +65,37 @@ def scratch_args(args):
     return out
 
 
+def ab_keeps_acf(name, launch, plain, acf, args) -> bool:
+    """The no-regression plain-vs-ACF A/B shared by every launch path: True to keep the ACF twin.
+
+    `launch(function, args)` launches one function handle with positional `args`. Both handles are
+    benchmarked on copies of `args` (scratch_args) with the autotuner's benchmarker and warmup/rep,
+    and the ACF is kept only if its median is faster; when the args cannot be copied safely, plain is
+    kept. TRITON_COMPILE_IQ_FORCE_APPLY keeps the ACF without benchmarking (smoke tests set it so a
+    store HIT applies deterministically regardless of in-process measurement noise)."""
+    debug = os.environ.get("TRITON_COMPILE_IQ_DEBUG")
+    if os.environ.get("TRITON_COMPILE_IQ_FORCE_APPLY"):
+        if debug:
+            print(f"[compile_iq.freewin] {name}: FORCE-APPLY -> kept acf (competition skipped)", flush=True)
+        return True
+    bargs = scratch_args(args)
+    if bargs is None:
+        return False
+    from triton import knobs
+    from triton.runtime.driver import driver
+
+    benchmarker = driver.active.get_benchmarker()
+    warmup, rep = knobs.autotuning.warmup, knobs.autotuning.rep
+    plain_ms = benchmarker(lambda: launch(plain, bargs), warmup=warmup, rep=rep, quantiles=(0.5, 0.2, 0.8))[0]
+    acf_ms = benchmarker(lambda: launch(acf, bargs), warmup=warmup, rep=rep, quantiles=(0.5, 0.2, 0.8))[0]
+    keep = acf_ms < plain_ms
+    if debug:
+        print(
+            f"[compile_iq.freewin] {name}: plain={plain_ms:.4f}ms acf={acf_ms:.4f}ms "
+            f"-> kept {'acf' if keep else 'plain'}", flush=True)
+    return keep
+
+
 def acf_args_for(ptx: str, arch: str | None, ptxas_version: str) -> list[str]:
     """['--apply-controls=<stored.acf>'] if the store has an ACF for this PTX and ptxas supports it
     (>=13.3), else []. Points ptxas straight at the stored ACF file -- no temp copy to leak."""

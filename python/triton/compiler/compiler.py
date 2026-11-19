@@ -736,39 +736,16 @@ class CompiledKernel:
             plain_function = self.function
             acf_module, acf_function, _, _, _ = driver.active.utils.load_binary(self.name, acf_cubin,
                                                                                 self.metadata.shared, device)
-            # Force-apply knob (default off): install the ACF twin without running the plain-vs-ACF
-            # competition. Production keeps the no-regression A/B; smoke tests set this so a store HIT
-            # deterministically applies regardless of in-process measurement noise.
-            if os.environ.get("TRITON_COMPILE_IQ_FORCE_APPLY"):
-                self._compile_iq_adopt(acf_module, acf_function, acf_cubin)
-                acf_module = None
-                if os.environ.get("TRITON_COMPILE_IQ_DEBUG"):
-                    print(f"[compile_iq.freewin] {self.name}: FORCE-APPLY -> kept acf "
-                          "(competition skipped)", flush=True)
-                return
-            from triton.magnon.consume import scratch_args
+            from triton.magnon.consume import ab_keeps_acf
 
-            # Run the A/B on copies so in-place / accumulating kernels never touch the caller's buffers.
-            bargs = scratch_args(bound_args.values())
-            if bargs is None:
-                return  # cannot copy safely: keep plain (the finally unloads the ACF module)
+            def _call(func, args):
+                self._run(grid_0, grid_1, grid_2, stream, func, self.packed_metadata, None, None, None, *args)
 
-            def _call(func):
-                self._run(grid_0, grid_1, grid_2, stream, func, self.packed_metadata, None, None, None, *bargs)
-
-            benchmarker = driver.active.get_benchmarker()
-            warmup, rep = knobs.autotuning.warmup, knobs.autotuning.rep
-            plain_ms = benchmarker(lambda: _call(plain_function), warmup=warmup, rep=rep, quantiles=(0.5, 0.2, 0.8))[0]
-            acf_ms = benchmarker(lambda: _call(acf_function), warmup=warmup, rep=rep, quantiles=(0.5, 0.2, 0.8))[0]
-            winner = "acf" if acf_ms < plain_ms else "plain"
-            if winner == "acf":
+            # The A/B runs on copies so in-place / accumulating kernels never touch the caller's buffers.
+            if ab_keeps_acf(self.name, _call, plain_function, acf_function, list(bound_args.values())):
                 # ACF wins -> make the twin the live kernel (in-memory only; compile cache untouched).
                 self._compile_iq_adopt(acf_module, acf_function, acf_cubin)
                 acf_module = None
-            if os.environ.get("TRITON_COMPILE_IQ_DEBUG"):
-                print(
-                    f"[compile_iq.freewin] {self.name}: plain={plain_ms:.4f}ms acf={acf_ms:.4f}ms "
-                    f"-> kept {winner}", flush=True)
         except Exception as e:  # never break the user's launch
             if os.environ.get("TRITON_COMPILE_IQ_DEBUG"):
                 print(f"[compile_iq.freewin] {self.name}: error (fail-open, kept plain): "
