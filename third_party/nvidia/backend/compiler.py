@@ -872,6 +872,8 @@ class CUDABackend(BaseBackend):
             min_dot_size(self.target),
             "post_ast_lowering":
             post_ast_lowering,
+            "get_ptx_version":
+            functools.partial(get_ptx_version_from_options, options, self.target.arch),
         }
         return codegen_fns
 
