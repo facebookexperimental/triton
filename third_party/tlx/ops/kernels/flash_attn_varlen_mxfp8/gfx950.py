@@ -590,12 +590,14 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
             v_ptr,
             ks_ptr,
             vs_ptr,
-            ka[1],
-            kb[1],
+            # No K refill: the item has no further QK tile, and the next
+            # item's first K tile is issued into these buffers below.
+            None,
+            None,
             va[1],
             vb[1],
-            ksa[1],
-            ksb[1],
+            None,
+            None,
             vsa[1],
             vsb[1],
             0,
