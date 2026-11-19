@@ -1822,8 +1822,10 @@ def _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, q
     if (query.dtype == fp8 and not kv_fp8) or (kv_fp8 and key_cache.ndim != 4):
         raise InvalidInput("tlx.ops.paged_attention_decode supports a float8_e4m3fn query only with float8_e4m3fn "
                            "K/V, and FP8 K/V only on a 4-D cache")
-    if context_lens.dtype != torch.int32 or block_tables.dtype != torch.int32 or block_tables.ndim != 2:
-        raise InvalidInput("tlx.ops.paged_attention_decode expects int32 context_lens and 2-D int32 block_tables")
+    if context_lens.dtype not in (torch.int32, torch.int64):
+        raise InvalidInput("tlx.ops.paged_attention_decode expects int32 or int64 context_lens")
+    if block_tables.dtype != torch.int32 or block_tables.ndim != 2:
+        raise InvalidInput("tlx.ops.paged_attention_decode expects 2-D int32 block_tables")
     if any(t.device != query.device for t in (key_cache, value_cache, context_lens, block_tables)):
         raise InvalidInput("tlx.ops.paged_attention_decode expects all tensors on one device")
     num_kv_heads = key_cache.shape[2 if kv_layout == "NHD" else 1]
@@ -1846,7 +1848,8 @@ def _decode_compute_dtype(query, out):
 
 def paged_attention_decode(query, key_cache, value_cache, context_lens, block_tables, *, sm_scale=None, query_length=1,
                            sliding_window=0, max_context_len=None, out=None, workspace=None, kv_layout="HND",
-                           k_descale=None, v_descale=None, q_descale=None, space=None):
+                           k_descale=None, v_descale=None, q_descale=None, out_gate=None, out_norm_eps=1e-6,
+                           space=None):
     """Forward-only GQA decode attention over a paged K/V cache.
 
     ``query`` is ``(num_seqs * query_length, q_heads, head_dim)``; sequence ``s``
@@ -1858,7 +1861,8 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     kv_heads, head_dim)``, or the AITER-packed 5-D layout from
     ``allocate_paged_kv_cache_5d``. A positive ``sliding_window`` limits each
     query row to its last ``sliding_window`` keys, itself included; pages before
-    the earliest window are never read. ``max_context_len`` bounds every context and
+    the earliest window are never read. ``context_lens`` may be int32 or int64.
+    ``max_context_len`` bounds every context and
     picks the split-K plan; pass it, and a buffer from
     ``paged_attention_decode_workspace``, to keep launches graph-capturable.
 
@@ -1866,6 +1870,11 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     / ``v_descale`` tensors (K/V = stored value * descale). The query may then be
     BF16/FP16, or ``float8_e4m3fn`` with ``q_descale``; an FP8 query writes a
     BF16 output unless ``out`` is FP16.
+
+    Output norm and gate: with a BF16 ``out_gate`` of shape ``(tokens, q_heads * 64)`` (contiguous last dimension,
+    any row stride, so a column slice of a projection output) and head_dim 64, the result is
+    ``rmsnorm_gate(attention, out_gate, eps=out_norm_eps)`` of the BF16 attention output, bitwise, applied in the
+    split-K reduce (the plan then has at least two splits; build the workspace with ``norm_gate=True``).
     """
     import torch
     group = _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length, kv_layout)
@@ -1887,14 +1896,26 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
                             or out.dtype not in (torch.bfloat16, torch.float16)):
         raise InvalidInput("tlx.ops.paged_attention_decode expects out to match query's shape, dtype and device "
                            "(BF16/FP16 for an FP8 query)")
+    if out_gate is not None:
+        rows, q_heads, head_dim = query.shape
+        if (not isinstance(out_gate, torch.Tensor) or head_dim != 64 or out_dtype != torch.bfloat16
+                or out_gate.dtype != torch.bfloat16 or out_gate.shape != (rows, q_heads * 64) or out_gate.stride(1) != 1
+                or out_gate.device != query.device):
+            raise InvalidInput(f"{name} expects head_dim 64, a BF16 output and a BF16 out_gate of shape "
+                               f"({rows}, {q_heads * 64}) with a contiguous last dimension")
+        if not 0 < out_norm_eps < math.inf:
+            raise InvalidInput(f"{name} expects a positive finite out_norm_eps; got {out_norm_eps!r}")
+        if out is not None and torch._C._overlaps(out, out_gate):
+            raise InvalidInput(f"{name} out must not alias out_gate")
     fn, spec = impl_for("paged_attention_decode", device=query.device)
     check_inputs(spec, dtype=out_dtype, HEAD_DIM=query.shape[2], QLEN=query_length, GROUP=group)
-    check_backward(spec, query, key_cache, value_cache)
+    check_backward(spec, query, key_cache, value_cache, out, out_gate, k_descale, v_descale, q_descale)
     _check_enforced("paged_attention_decode", spec, invariance)
+    gate_kwargs = {} if out_gate is None else dict(out_gate=out_gate, out_norm_eps=float(out_norm_eps))
     with torch.cuda.device(query.device):
         return fn(query, key_cache, value_cache, context_lens, block_tables, float(sm_scale), int(query_length),
                   int(sliding_window), max_context_len, out, workspace, kv_layout, k_descale=k_descale,
-                  v_descale=v_descale, q_descale=q_descale)
+                  v_descale=v_descale, q_descale=q_descale, **gate_kwargs)
 
 
 def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k, softmax_scale, causal,
@@ -1971,7 +1992,7 @@ def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
     _check_single_config_space("paged_attention_prefill", space_name)
     fn, spec = impl_for("paged_attention_prefill", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2], GROUP=q.shape[1] // num_kv_heads)
-    check_backward(spec, q, k, v)
+    check_backward(spec, q, k, v, out, k_descale, v_descale)
     _check_enforced("paged_attention_prefill", spec, invariance)
     with torch.cuda.device(q.device):
         fn(q, k, v, cu_seqlens_q, seqused_k.to(torch.int32), block_table, max_seqlen_q, sm_scale=float(softmax_scale),
@@ -1981,16 +2002,16 @@ def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
 
 
 def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, *, query_length=1, sliding_window=0,
-                                     max_context_len=None, kv_layout="HND"):
+                                     max_context_len=None, kv_layout="HND", norm_gate=False):
     """Reusable FP32 split-K workspace for ``paged_attention_decode`` with the same
-    arguments, or None when the plan needs none."""
+    arguments (``norm_gate=True`` for calls with ``out_gate``), or None when the plan needs none."""
     _check_sliding_window("paged_attention_decode_workspace", sliding_window)
     fn, spec = impl_for("paged_attention_decode_workspace", device=query.device)
     check_inputs(spec, dtype=_decode_compute_dtype(query, None))
     import torch
     with torch.cuda.device(query.device):
         return fn(query, key_cache, value_cache, block_tables, int(query_length), int(sliding_window), max_context_len,
-                  kv_layout)
+                  kv_layout, bool(norm_gate))
 
 
 def allocate_paged_kv_cache_5d(num_blocks, num_kv_heads, page_size, head_dim, *, dtype, device):
