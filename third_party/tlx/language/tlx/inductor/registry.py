@@ -4722,3 +4722,8 @@ install_reduction_epilogue()
 # tlx_config.sdpa_to_flex is on (no-op otherwise).
 
 register_sdpa_to_flex()
+
+# Lower eligible (K, 1) convolutions to GEMMs when tlx_config.conv1d_to_mm is on.
+from .conv1d_to_mm import register_conv1d_to_mm  # noqa: E402
+
+register_conv1d_to_mm()

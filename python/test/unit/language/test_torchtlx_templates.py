@@ -6759,5 +6759,100 @@ class TestWarppipeInt32Gate(TestCase):
             ))
 
 
+@instantiate_parametrized_tests
+class TestConv1dToMm(TestCase):
+    """tlx_config.conv1d_to_mm: (K, 1) convs lowered to GEMMs and fused pointwise ops.
+
+    Eligible convs must drop the extern conv kernels that the lowering replaces and
+    match stock PT2 in the forward output and every grad.
+    """
+
+    def _compile_fw_bw(self, module, fn, x, routed):
+        x = x.detach().requires_grad_(True)
+        module.zero_grad(set_to_none=True)
+        torch._dynamo.reset()
+        with tlx_config.patch(conv1d_to_mm=routed), config.patch(
+            {"force_disable_caches": True, "triton.tlx_mode": "allow"}):
+            out, code = run_fw_bw_and_get_code(lambda: fn(x))
+        grads = [x.grad] + [p.grad for p in module.parameters()]
+        return out, grads, "\n".join(code)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("C,L,K,P,groups,channels_last", (
+        (96, 200, 3, 0, 1, True),
+        (96, 250, 3, 1, 1, True),
+        (96, 250, 1, 0, 1, False),
+        (96, 250, 3, 1, 96, False),
+        (64, 129, 3, 1, 64, False),
+    ))
+    def test_routes_eligible(self, C, L, K, P, groups, channels_last):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        torch.manual_seed(0)
+        conv = torch.nn.Conv2d(C, C, (K, 1), padding=(P, 0), groups=groups)
+        conv = conv.to(GPU_TYPE, torch.bfloat16)
+        x = torch.randn(64, C, L, 1, device=GPU_TYPE, dtype=torch.bfloat16)
+        if channels_last:
+            conv = conv.to(memory_format=torch.channels_last)
+            x = x.to(memory_format=torch.channels_last)
+        fn = torch.compile(lambda t: torch.nn.functional.gelu(conv(t)))
+
+        out, grads, code = self._compile_fw_bw(conv, fn, x, routed=True)
+        ref, ref_grads, ref_code = self._compile_fw_bw(conv, fn, x, routed=False)
+        self.assertIn("convolution_backward", ref_code)
+        if groups > 1:
+            self.assertNotRegex(code, r"extern_kernels\.convolution|aten\.convolution_backward\.default\(")
+        elif K == 1:
+            self.assertNotIn("aten.convolution_backward.default(", code)
+        else:
+            self.assertRegex(code, r"extern_kernels\.mm\(|triton_tem_fused")
+        for got, want in zip((out, *grads), (ref, *ref_grads)):
+            self.assertLessEqual(_rel_l2(got, want), 1e-2)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("C,K,W", ((32, (3, 3), 16), (128, (3, 1), 1)))
+    def test_ineligible_keeps_conv(self, C, K, W):
+        """A 2-D kernel, and a dense conv on 64-channel multiples where cuDNN is faster."""
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        torch.manual_seed(0)
+        padding = (1, 1) if K[1] == 3 else (1, 0)
+        conv = torch.nn.Conv2d(C, C, K, padding=padding).to(GPU_TYPE, torch.bfloat16)
+        x = torch.randn(4, C, 16, W, device=GPU_TYPE, dtype=torch.bfloat16)
+        _, _, code = self._compile_fw_bw(conv, torch.compile(conv), x, routed=True)
+        self.assertIn("convolution_backward", code)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_prod_wgrad_vs_fp64(self):
+        """IG-CTR dense (3, 1) wgrad at L=2500: within 2x of stock's error against fp64."""
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        torch.manual_seed(0)
+        n, c, length, k = 1365, 96, 2500, 3
+        conv = torch.nn.Conv2d(c, c, (k, 1), bias=False).to(GPU_TYPE, torch.bfloat16)
+        conv = conv.to(memory_format=torch.channels_last)
+        x = torch.randn(n, c, length, 1, device=GPU_TYPE, dtype=torch.bfloat16)
+        x = x.to(memory_format=torch.channels_last)
+        g = torch.randn(n, c, length - k + 1, 1, device=GPU_TYPE, dtype=torch.bfloat16)
+        g = g.to(memory_format=torch.channels_last)
+
+        def wgrad(routed):
+            conv.zero_grad(set_to_none=True)
+            torch._dynamo.reset()
+            with tlx_config.patch(conv1d_to_mm=routed), config.patch(
+                {"force_disable_caches": True, "triton.tlx_mode": "allow"}):
+                torch.compile(conv)(x).backward(g)
+            return conv.weight.grad
+
+        routed, stock = wgrad(True), wgrad(False)
+        xs, gs = x[..., 0].double(), g[..., 0].double()
+        lo = length - k + 1
+        ref = torch.stack([torch.einsum("nol,ncl->oc", gs, xs[:, :, i:i + lo]) for i in range(k)], dim=2).unsqueeze(-1)
+        self.assertLessEqual(_rel_l2(routed, ref), max(1e-3, 2 * _rel_l2(stock, ref)))
+
+
 if __name__ == "__main__":
     run_tests()
