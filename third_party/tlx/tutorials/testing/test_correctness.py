@@ -9,7 +9,7 @@ import torch
 import triton
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from triton._internal_testing import (is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_cdna4, is_hip_gfx1250)
+from triton._internal_testing import (is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_cdna4, is_hip_cdna5)
 
 from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor
 
@@ -839,9 +839,12 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX, causal):
     desc_v = TensorDescriptor(v, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block)
     desc_o = TensorDescriptor(o, shape=[y_dim, head_dim], strides=[head_dim, 1], block_shape=dummy_block)
     desc_m = TensorDescriptor(M, shape=[y_dim], strides=[1], block_shape=[1])
-    desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_5d)
-    desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_5d)
-    desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_5d)
+    # E8M0 scale bits must travel as u8 bytes: the packed-scale tmem_copy path
+    # only recognizes i8/u8 tiles. The view preserves bits/shape/strides and
+    # the reference tensors are untouched.
+    desc_q_scale = TensorDescriptor.from_tensor(q_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_k_scale = TensorDescriptor.from_tensor(k_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_v_scale = TensorDescriptor.from_tensor(v_scale.view(torch.uint8), block_shape=dummy_5d)
     nargs = {
         **fwd_config,
         "HEAD_DIM": head_dim,
@@ -1327,7 +1330,7 @@ def test_amd_fa_bwd_d64(B, Hq, Hkv, N_CTX, causal):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16], ids=["fp16"])
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 def test_amd_tdm_gemm_pipelined(dtype):
     Gemm.run_test(_amd_tdm_gemm_pipelined, Gemm.CONFIGS["amd_tdm_gemm_pipelined"], dtype=dtype)
 
@@ -1491,7 +1494,7 @@ def _init_fp8_e5m2(rows, cols):
 
 
 @pytest.mark.parametrize("TRANSPOSE_B", [False])
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
     torch.manual_seed(0)
     M = N = 256
@@ -1527,14 +1530,14 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
     ("e2m1", 256, 3, 3, True),
     ("e2m1", 256, 3, 4, False),
 ])
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 def test_amd_mxfp_persistent_short_k_stages(dtype_b, block_k, buffers, k_iters, cross_tile_prefetch):
     _check_amd_mxfp_persistent(dtype_b, buffers, k_iters, cross_tile_prefetch, block_k)
 
 
 @pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
 @pytest.mark.parametrize("mode", ["none", "balanced", "chunked"])
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 def test_amd_mxfp_persistent_xcd_remap(dtype_b, block_k, mode):
     # Seventeen programs exercise both uneven XCD ranges and chunked tails;
     # nine M tiles with group-M=8 also exercise the final short M group.
@@ -1546,7 +1549,7 @@ def test_amd_mxfp_persistent_xcd_remap(dtype_b, block_k, mode):
 @pytest.mark.parametrize("k_iters", [3, 5])
 @pytest.mark.parametrize("cluster_size,multicast,group_m", [(2, True, 8), (4, True, 4), (4, True, 8), (4, False, 4)])
 @pytest.mark.parametrize("remap_mode", ["none", "chunked"])
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 def test_amd_mxfp_persistent_multicast(dtype_b, block_k, k_iters, cluster_size, multicast, group_m, remap_mode):
     # Distinct data/scales catch wrong recipients. Two tiles/program exercise
     # cross-tile prefetch (BK128) and reusing A's LDS for C (BK256). K=3 has no
@@ -1566,7 +1569,7 @@ def test_amd_mxfp_persistent_multicast(dtype_b, block_k, k_iters, cluster_size, 
     (4, "none", 4, True),
     (3, "chunked", 4, True),
 ])
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 def test_amd_mxfp_persistent_cluster_barrier_interval(dtype_b, block_k, k_iters, interval, remap_mode, group_m,
                                                       multicast):
     _check_amd_mxfp_persistent(

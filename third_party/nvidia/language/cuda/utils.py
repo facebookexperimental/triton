@@ -9,8 +9,9 @@ def globaltimer(_semantic=None):
 
 @core.extern
 def smid(_semantic=None):
-    return core.inline_asm_elementwise("mov.u32 $0, %smid;", "=r", [], dtype=core.int32, is_pure=True, pack=1,
-                                       _semantic=_semantic)
+    return core.extern_elementwise("", "", [], {
+        (): ("llvm.nvvm.read.ptx.sreg.smid", core.int32),
+    }, is_pure=True, _semantic=_semantic)
 
 
 @core.extern
@@ -39,6 +40,44 @@ def round_f32_to_tf32(x, rounding: core.constexpr, _semantic=None):
     intrinsic = f"llvm.nvvm.f2tf32.{rounding}"
     return core.extern_elementwise("", "", [x], {
         (core.float32, ): (intrinsic, core.float32),
+    }, is_pure=True, _semantic=_semantic)
+
+
+@core.extern
+def min_xorsign_abs_f32(a, b, propagate_nan: core.constexpr = core.PropagateNan.NONE, _semantic=None):
+    """Minimum magnitude with XORed signs and optional NaN propagation."""
+    propagate_nan = core._unwrap_if_constexpr(propagate_nan)
+    if propagate_nan == core.PropagateNan.ALL:
+        symbol = "llvm.nvvm.fmin.nan.xorsign.abs.f"
+    elif propagate_nan == core.PropagateNan.NONE:
+        symbol = "llvm.nvvm.fmin.xorsign.abs.f"
+    else:
+        raise ValueError(f"Unexpected propagate_nan {propagate_nan}")
+    return core.extern_elementwise("", "", [a, b], {
+        (core.float32, core.float32): (symbol, core.float32),
+    }, is_pure=True, _semantic=_semantic)
+
+
+@core.extern
+def max_xorsign_abs_f32(a, b, propagate_nan: core.constexpr = core.PropagateNan.NONE, _semantic=None):
+    """Maximum magnitude with XORed signs and optional NaN propagation."""
+    propagate_nan = core._unwrap_if_constexpr(propagate_nan)
+    if propagate_nan == core.PropagateNan.ALL:
+        symbol = "llvm.nvvm.fmax.nan.xorsign.abs.f"
+    elif propagate_nan == core.PropagateNan.NONE:
+        symbol = "llvm.nvvm.fmax.xorsign.abs.f"
+    else:
+        raise ValueError(f"Unexpected propagate_nan {propagate_nan}")
+    return core.extern_elementwise("", "", [a, b], {
+        (core.float32, core.float32): (symbol, core.float32),
+    }, is_pure=True, _semantic=_semantic)
+
+
+@core.extern
+def exp2_ftz(x, _semantic=None):
+    """Approximate 2**x with flush-to-zero behavior."""
+    return core.extern_elementwise("", "", [x], {
+        (core.float32, ): ("llvm.nvvm.ex2.approx.ftz.f32", core.float32),
     }, is_pure=True, _semantic=_semantic)
 
 

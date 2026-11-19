@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 from triton._C.libtriton import ir
 from triton._filecheck import run_parser
-from triton._internal_testing import is_blackwell_ultra, is_hip, is_hip_gfx1250, is_hopper_or_newer
+from triton._internal_testing import is_blackwell_ultra, is_hip, is_hip_cdna5, is_hopper_or_newer
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 from triton.compiler.compiler import make_backend
@@ -167,7 +167,7 @@ def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
 
 
 # Unit test for arrive/wait
-@pytest.mark.skipif(not (is_hip_gfx1250() or is_hopper_or_newer()), reason="Need Hopper or newer or AMD gfx1250")
+@pytest.mark.skipif(not (is_hip_cdna5() or is_hopper_or_newer()), reason="Need Hopper or newer or AMD CDNA5")
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 def test_wait_arrive_non_ws(BLOCK_SIZE, device):
     expected_arrival_count = 4 if is_hip() else 1

@@ -1950,6 +1950,26 @@ struct NegFOpPattern : public OpRewritePattern<arith::NegFOp> {
   }
 };
 
+struct AbsFOpPattern : public OpRewritePattern<math::AbsFOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(math::AbsFOp op,
+                                PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto inputI = embedToInt(rewriter, loc, op.getOperand());
+    // Use integer abs to preserve NaN bits.
+    auto absI = math::AbsIOp::create(rewriter, loc, inputI);
+    unsigned width =
+        getElementTypeOrSelf(inputI.getType()).getIntOrFloatBitWidth();
+    auto mask = getIntConstantLike(rewriter, loc, inputI.getType(),
+                                   (uint64_t{1} << (width - 1)) - 1);
+    // Map INT_MIN (negative zero) to zero.
+    auto result = arith::AndIOp::create(rewriter, loc, absI, mask);
+    rewriter.replaceOp(op, unembedToFloat(rewriter, loc, result, op.getType()));
+    return success();
+  }
+};
+
 struct DivFOpPattern : public OpRewritePattern<arith::DivFOp> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(arith::DivFOp op,
@@ -3393,19 +3413,20 @@ public:
     bool sharedClusterState = ttg::lookupNumCTAs(getOperation()) > 1;
     TmemScratchManager scratch(sharedClusterState);
     RewritePatternSet patterns(&getContext());
-    patterns.add<
-        BinaryFloatToIntPattern<arith::AddFOp, arith::AddIOp>,
-        BinaryFloatToIntPattern<arith::SubFOp, arith::SubIOp>,
-        BinaryFloatToIntPattern<arith::MulFOp, arith::MulIOp>,
-        BinaryFloatToIntPattern<arith::MinimumFOp, arith::MinSIOp>,
-        BinaryFloatToIntPattern<arith::MaximumFOp, arith::MaxSIOp>,
-        BinaryFloatToIntPattern<arith::MinNumFOp, arith::MinSIOp>,
-        BinaryFloatToIntPattern<arith::MaxNumFOp, arith::MaxSIOp>,
-        NegFOpPattern, DivFOpPattern, TritonDivFOpPattern<tt::PreciseDivFOp>,
-        TritonDivFOpPattern<tt::ApproxDivFOp>, RemFOpPattern, ClampFOpPattern,
-        FmaPattern, ExpOpPattern, Exp2OpPattern, CosOpPattern, SinOpPattern,
-        ExtFOpPattern, TruncFOpPattern, FpToFpPattern, Fp4ToFpPattern,
-        PackedArithPattern, DotPattern, DotScaledPattern>(&getContext());
+    patterns
+        .add<BinaryFloatToIntPattern<arith::AddFOp, arith::AddIOp>,
+             BinaryFloatToIntPattern<arith::SubFOp, arith::SubIOp>,
+             BinaryFloatToIntPattern<arith::MulFOp, arith::MulIOp>,
+             BinaryFloatToIntPattern<arith::MinimumFOp, arith::MinSIOp>,
+             BinaryFloatToIntPattern<arith::MaximumFOp, arith::MaxSIOp>,
+             BinaryFloatToIntPattern<arith::MinNumFOp, arith::MinSIOp>,
+             BinaryFloatToIntPattern<arith::MaxNumFOp, arith::MaxSIOp>,
+             ClampFOpPattern, NegFOpPattern, AbsFOpPattern, DivFOpPattern,
+             TritonDivFOpPattern<tt::PreciseDivFOp>,
+             TritonDivFOpPattern<tt::ApproxDivFOp>, RemFOpPattern, FmaPattern,
+             ExpOpPattern, Exp2OpPattern, CosOpPattern, SinOpPattern,
+             ExtFOpPattern, TruncFOpPattern, FpToFpPattern, Fp4ToFpPattern,
+             PackedArithPattern, DotPattern, DotScaledPattern>(&getContext());
     patterns.add<UnaryPattern<math::LogOp>>(&getContext(), UnaryOpId::Log);
     patterns.add<UnaryPattern<math::Log2Op>>(&getContext(), UnaryOpId::Log2);
     patterns.add<UnaryPattern<math::SqrtOp>>(&getContext(), UnaryOpId::Sqrt);

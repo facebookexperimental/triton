@@ -75,6 +75,10 @@ class TritonSemantic(Generic[TensorTy]):
 
     def computation_type_impl(self, a_ty: tl.dtype, a_is_scalar: bool, b_ty: tl.dtype, b_is_scalar: bool,
                               div_or_mod: bool) -> tl.dtype:
+        if a_ty in (tl.float4e2m1x2, tl.float8e8m0fnu) or b_ty in (tl.float4e2m1x2, tl.float8e8m0fnu):
+            if a_ty != b_ty:
+                raise TypeError(f"Implicit promotion between {a_ty} and {b_ty} is not supported")
+            return a_ty
         # 0) For scalars we follow semantics similar to PyTorch, namely:
         # - If the scalar is of a lower or equal kind (bool < uint < int < fp),
         #   it doesn't participate in the promotion
@@ -620,9 +624,7 @@ class TritonSemantic(Generic[TensorTy]):
     def arange(self, start: int, end: int, *, ret_ty: tl.block_type = None) -> TensorTy:
         if not isinstance(start, int) or not isinstance(end, int):
             raise ValueError("arange's arguments must be of type tl.constexpr")
-        is_start_int64 = bool(start >> 32)
-        is_end_int64 = bool(end >> 32)
-        if is_start_int64 or is_end_int64:
+        if start < -2**31 or end > 2**31 - 1:
             raise ValueError("arange must fit in int32")
         if end <= start:
             raise ValueError("arange's end argument must be greater than the start argument")
@@ -1495,6 +1497,8 @@ class TritonSemantic(Generic[TensorTy]):
         return self.make_tensor(handle, expected.type.with_element_ty(tl.int1))
 
     def atomic_cas(self, ptr: TensorTy, cmp: TensorTy, val: TensorTy, sem: str, scope: str) -> TensorTy:
+        ptr, cmp, _ = self._atomic_typechecking_impl(ptr, cmp, None, "cas")
+        ptr, val, _ = self._atomic_typechecking_impl(ptr, val, None, "cas")
         sem = self._str_to_sem(sem)
         scope = self._str_to_scope(scope)
         element_ty = ptr.type.scalar.element_ty
@@ -1851,14 +1855,17 @@ class TritonSemantic(Generic[TensorTy]):
 
     def _bitcast_to_fp_type(self, val: TensorTy, float_format: str):
         """
-        If float_format is subbyte, make sure it's packed as uint8 and return it.
+        If float_format is subbyte, make sure it's packed as uint8 (or the native fp4 pair type for e2m1) and return it.
         Otherwise, return a tensor (perhaps bitcasting) of the specified float format.
         """
         triton_ty = {"e5m2": tl.float8e5, "e4m3": tl.float8e4nv, "bf16": tl.bfloat16, "fp16":
                      tl.float16}.get(float_format)
         if triton_ty is None:
             assert float_format in ("e2m1", "e2m3", "e3m2"), f"Internal Error: Unexpected float format: {float_format}"
-            assert val.dtype == tl.uint8, f"{float_format} format must be packed as uint8. Got {val.dtype}"
+            allowed = [tl.uint8]
+            if float_format == "e2m1":
+                allowed.append(tl.float4e2m1x2)
+            assert val.dtype in allowed, f"{float_format} format must be packed as uint8. Got {val.dtype}"
             return val
         if val.dtype == triton_ty:
             return val

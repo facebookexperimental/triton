@@ -4,14 +4,14 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
+from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _cdna5_gemm
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton.tlx.ops.kernels.grouped_gemm import gfx1250 as _gfx1250_grouped_ops
 from triton.tlx.ops.kernels.mm_mxfp8 import gfx1250 as _gfx1250_mxfp_ops
 from triton.tools.mxfp import MXScaleTensor
-from triton._internal_testing import is_hip_gfx1250
+from triton._internal_testing import is_hip_cdna5
 
 
 @triton.jit
@@ -175,7 +175,7 @@ def _local_reshape_kernel(
     tl.store(output_ptr + output_offsets, result)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("M, N", [(32, 32), (64, 128)])
 def test_async_amd_desc_load_correctness_gfx1250(device, M, N):
     """async_amd_descriptor_load produces correct results on gfx1250."""
@@ -201,7 +201,7 @@ def _async_amd_desc_warp_token_wait_kernel(src, dst, n):
         tlx.async_amd_descriptor_wait(tokens=[token1])
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("iterations", [1, 3])
 def test_async_amd_desc_token_wait_warp_pipeline_gfx1250(device, iterations):
     import re
@@ -215,7 +215,7 @@ def test_async_amd_desc_token_wait_warp_pipeline_gfx1250(device, iterations):
     torch.testing.assert_close(dst, src[:32].expand(iterations, -1, -1))
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 def test_async_amd_desc_load_fused_correctness_gfx1250(device):
     rows, cols = 16, 32
     a = torch.randn((rows, cols), device=device, dtype=torch.float16)
@@ -225,7 +225,7 @@ def test_async_amd_desc_load_fused_correctness_gfx1250(device):
     torch.testing.assert_close(output, torch.stack((a, b)), rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("row_offset,col_offset", [(-32, 0), (0, -32), (0, 64), (96, 96)])
 @pytest.mark.parametrize("clamp,set_bounds,pred", [(False, False, True), (True, False, True), (False, True, True),
                                                    (False, False, False)])
@@ -253,7 +253,7 @@ def test_tdm_fused_positioned_offsets(device, row_offset, col_offset, clamp, set
         torch.testing.assert_close(output[index], expected)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 def test_update_tensor_descriptor_roundtrip_gfx1250(device):
     x = torch.randn((32, 32), dtype=torch.float16, device=device)
     y = torch.empty_like(x)
@@ -261,7 +261,7 @@ def test_update_tensor_descriptor_roundtrip_gfx1250(device):
     torch.testing.assert_close(x, y)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("M, N", [(32, 32), (64, 128)])
 def test_async_amd_desc_store_correctness_gfx1250(device, M, N):
     """TDM load → store round-trip produces correct results on gfx1250."""
@@ -271,7 +271,7 @@ def test_async_amd_desc_store_correctness_gfx1250(device, M, N):
     torch.testing.assert_close(x, y)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 def test_local_reshape_correctness_gfx1250(device):
     """End-to-end: local_reshape reinterprets a flat LDS buffer as a 2D tile."""
     rows, cols = 8, 8
@@ -333,7 +333,7 @@ def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
     return kernel
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
 def test_wait_arrive_non_ws_gfx1250(BLOCK_SIZE, device):
     # Four waves per workgroup all arrive on the one barrier.
@@ -406,7 +406,7 @@ def _tdm_copy_view_kernel(input_ptr, other_ptr, output_ptr, row, VIEW: tl.conste
         tl.store(output_ptr + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :], values)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize(
     "view, padded",
     [("full", True), ("compatible_transpose", True), ("reshape", True), ("slice", True), ("dynamic_slice", True),
@@ -451,7 +451,7 @@ def _tdm_reused_descriptor_kernel(input_ptr, output_ptr, FUSED: tl.constexpr):
     tl.store(output_ptr + tl.arange(0, 32)[:, None] * 128 + tl.arange(0, 128)[None, :], values)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("fused", [False, True])
 def test_tdm_descriptor_reuse_different_allocations_gfx1250(device, fused):
     x = torch.randn((32, 128), device=device, dtype=torch.float16)
@@ -460,19 +460,19 @@ def test_tdm_descriptor_reuse_different_allocations_gfx1250(device, fused):
     torch.testing.assert_close(output, x + x, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("M,N,K", [(128, 128, 64), (256, 256, 128), (512, 512, 256)])
 def test_gfx1250_matmul_tdm_pipelined(M, N, K):
     torch.manual_seed(0)
     a = torch.randn((M, K), device=triton.runtime.driver.active.get_active_torch_device(), dtype=torch.float16)
     b = torch.randn((K, N), device=triton.runtime.driver.active.get_active_torch_device(), dtype=torch.float16)
 
-    triton_out = _gfx1250_gemm.matmul(a, b, config={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32})
+    triton_out = _cdna5_gemm.matmul(a, b, config={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32})
     torch_out = torch.matmul(a, b)
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("TRANSPOSE_B", [False, True])
 def test_gfx1250_matmul_tdm_pipelined_single_warp_per_simd_schedule(TRANSPOSE_B):
     torch.manual_seed(0)
@@ -482,7 +482,7 @@ def test_gfx1250_matmul_tdm_pipelined_single_warp_per_simd_schedule(TRANSPOSE_B)
     if TRANSPOSE_B:
         b = b.T.contiguous()
 
-    triton_out = _gfx1250_gemm.matmul_tdm_pipelined_single_warp_per_simd_schedule(
+    triton_out = _cdna5_gemm.matmul_tdm_pipelined_single_warp_per_simd_schedule(
         a,
         b,
         TRANSPOSE_B=TRANSPOSE_B,
@@ -492,7 +492,7 @@ def test_gfx1250_matmul_tdm_pipelined_single_warp_per_simd_schedule(TRANSPOSE_B)
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("TRANSPOSE_B", [False, True])
 @pytest.mark.parametrize("SEED", [0, 7])
 @pytest.mark.parametrize(
@@ -562,7 +562,7 @@ def test_gfx1250_mxgemm_tdm_pipelined(TRANSPOSE_B, SEED, M, N, K, SCHEDULE, DTYP
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("DTYPE_B", ["float8_e4m3", "float4"])
 @pytest.mark.parametrize("TILES_PER_WARP", [(1, 1), (2, 1), (1, 2), (2, 2)])
 def test_gfx1250_mxgemm_tdm_tiles_per_warp(DTYPE_B, TILES_PER_WARP):
@@ -607,7 +607,7 @@ def _mxgemm_ring_phase_params():
     return params
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("K_ITERS,NUM_BUFFERS,CROSS_TILE_PREFETCH,DTYPE_B,BLOCK_K,CLUSTER_SIZE",
                          _mxgemm_ring_phase_params())
 def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH, DTYPE_B, BLOCK_K, CLUSTER_SIZE,
@@ -652,7 +652,7 @@ def test_mxgemm_persistent_ring_phase(K_ITERS, NUM_BUFFERS, CROSS_TILE_PREFETCH,
         torch.testing.assert_close(out.cpu().float(), ref, atol=2e-3, rtol=1e-3)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 7, 9, 10])
 @pytest.mark.parametrize("buffers", [3, 4])
 @pytest.mark.parametrize("cluster_size", [1, 4])
@@ -665,7 +665,7 @@ def test_mxgemm_static_slot_unroll_ring_phase(k_iters, buffers, cluster_size):
                                       CLUSTER_LAYOUT="2x2" if cluster_size == 4 else "linear", STATIC_SLOT_UNROLL=True)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("k_iters", [4, 5, 6, 7, 9, 13])
 @pytest.mark.parametrize("cluster_size", [1, 4])
 @pytest.mark.parametrize("overlap_peel,out_dtype", [(False, "fp32"), (True, "fp16")])
@@ -681,7 +681,7 @@ def test_mxgemm_merged_handoff_barrier_ring_phase(k_iters, cluster_size, overlap
                                       MERGED_HANDOFF_BARRIER=True)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("k_iters", [6, 9, 13, 18, 21])
 @pytest.mark.parametrize("buffers", [3, 4])
 @pytest.mark.parametrize("interval", [2, 4, 8])
@@ -696,7 +696,7 @@ def test_mxgemm_static_cluster_steps_ring_phase(k_iters, buffers, interval):
                                       STATIC_CLUSTER_STEPS=True)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("k_iters", [3, 4, 5, 6, 7, 9, 13])
 @pytest.mark.parametrize("cluster_size", [1, 4])
 @pytest.mark.parametrize("schedule", ["merged", "static3", "dynamic3", "dynamic4"])
@@ -717,7 +717,7 @@ def test_mxgemm_wave256_scales_ring_phase(k_iters, cluster_size, schedule):
                                       STATIC_CLUSTER_STEPS=merged and cluster_size > 1, SCALE_LAYOUT="wave256")
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("k_iters", [3, 4, 5, 9])
 @pytest.mark.parametrize("cluster_size", [1, 4])
 @pytest.mark.parametrize("static_slot_unroll", [False, True])
@@ -729,7 +729,7 @@ def test_mxgemm_output_c_slots_ring_phase(k_iters, cluster_size, static_slot_unr
                                       STATIC_SLOT_UNROLL=static_slot_unroll, OUTPUT_C_SLOTS=3)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("schedule,k_iters", [(schedule, k)
                                               for schedule in ("static", "dynamic")
                                               for k in (4, 5, 6, 9)] + [("4buf", k) for k in (5, 6, 7, 10)])
@@ -747,7 +747,7 @@ def test_mxgemm_overlap_peel_ring_phase(schedule, k_iters, cluster_size):
                                       OVERLAP_PEEL=True)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("schedule,slots,k_iters",
                          [("static", 6, k)
                           for k in (4, 5, 9)] + [("static", 3, 5)] + [("dynamic", 6, k)
@@ -766,7 +766,7 @@ def test_mxgemm_fp16_output_ring_phase(schedule, slots, k_iters, cluster_size):
                                       OUT_DTYPE="fp16")
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("schedule", ["a8w4-bench", "a8w4-prefetch", "a8w4-prefetch-cluster", "a8w4-two-buffers"])
 def test_mxgemm_fp16_output_a8w4_ring_phase(schedule):
     # BK256 C aliases A input slots; FP16 slots hold twice the rows at the
@@ -780,7 +780,7 @@ def test_mxgemm_fp16_output_a8w4_ring_phase(schedule):
     test_mxgemm_persistent_ring_phase(k_iters, buffers, prefetch, "float4", 256, cluster, OUT_DTYPE="fp16", **extra)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 def test_mxgemm_fp16_output_nonpersistent():
     # The nonpersistent kernel converts before its direct store.
     M, N, K = (512, 512, 1024)
@@ -801,7 +801,7 @@ def test_mxgemm_fp16_output_nonpersistent():
     torch.testing.assert_close(result.cpu().float(), expected, atol=2e-3, rtol=1e-3)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("k_iters", [3, 4, 5, 9])
 @pytest.mark.parametrize("dtype_b,block_k", [("float8_e4m3", 128), ("float4", 256)])
 @pytest.mark.parametrize("schedule", ["2x2", "split", "early", "combined"])
@@ -815,7 +815,7 @@ def test_mxgemm_cluster_and_output_schedule_ring_phase(k_iters, dtype_b, block_k
                                       in ("early", "combined"), CLUSTER_BARRIER_INTERVAL=1 if k_iters == 5 else 4)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("k_iters", [4, 5, 9])
 @pytest.mark.parametrize("layout", ["4x2", "2x4", "4x4"])
 @pytest.mark.parametrize("schedule", ["a8w8", "a8w8-4buf", "a8w4"])
@@ -885,7 +885,7 @@ def _mxfp_cluster_tile_ids(output, NUM_M: tl.constexpr, NUM_N: tl.constexpr, PRO
         tile += PROGRAMS
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("num_m,num_n,programs", [(16, 8, 32), (12, 8, 32), (16, 8, 64), (12, 16, 64)])
 @pytest.mark.parametrize("group_m", [4, 8])
 @pytest.mark.parametrize("remap", [0, 2])
@@ -905,7 +905,7 @@ def test_mxgemm_cluster_2x2_tile_coverage(num_m, num_n, programs, group_m, remap
     assert torch.equal(cols[:, 2], cols[:, 0] + 1)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("layout", ["4x2", "2x4", "4x4", "8x2", "2x8"])
 @pytest.mark.parametrize("num_m,num_n,programs", [(16, 16, 32), (8, 16, 64), (16, 8, 128), (16, 16, 256)])
 @pytest.mark.parametrize("remap", [0, 2])
@@ -1181,7 +1181,7 @@ def test_tdm_fused_multicast_distributed_compiles(num_ctas, split_m, mask_mode):
     _check_tdm_fused_multicast_codegen(compiled.asm["llir"], num_ctas, split_m, mask_mode)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("num_ctas,split_m", [(2, 1), (4, 1), (4, 2)])
 @pytest.mark.parametrize("mask_mode", ["inferred", "explicit", "explicit_b", "disabled"])
 def test_tdm_fused_multicast_distributed_correctness(device, num_ctas, split_m, mask_mode):
@@ -1320,7 +1320,7 @@ def test_amd_cluster_barrier_compiles(arch, cluster_size, split):
     assert ("s_barrier_wait -3" in compiled.asm["amdgcn"]) == multi_cta
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 def test_amd_independent_cluster_launch_grid_and_cache():
     output = torch.empty((8, ), device="cuda", dtype=torch.int32)
     pid = torch.arange(8, dtype=torch.int32)
@@ -1333,7 +1333,7 @@ def test_amd_independent_cluster_launch_grid_and_cache():
         _amd_independent_cluster_ids[(3, )](output, ctas_per_cga=(4, 1, 1))
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("cluster_size,multicast", [(1, False), (2, True), (4, True), (4, False)])
 @pytest.mark.parametrize("group_size", [1, 2])
 @pytest.mark.parametrize("interface", ["packed", "list"])
@@ -1361,7 +1361,7 @@ def test_grouped_gemm_multicast_correctness(cluster_size, multicast, group_size,
         torch.testing.assert_close(outputs[group].cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("block_m,block_n,depth,staging,cross,k", [
     (128, 128, 2, 0, False, 256),
     (128, 128, 3, 0, False, 384),
@@ -1411,7 +1411,7 @@ def test_grouped_gemm_list_ragged_m(block_m, block_n, depth, staging, cross, k):
         torch.testing.assert_close(out.cpu(), packed[offsets[index]:offsets[index + 1]], atol=0, rtol=0)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("staging,cross", [(0, False), (0, True), (1, True)])
 def test_grouped_gemm_list_gfx950_metadata(staging, cross):
     from triton.tlx.ops.kernels.grouped_gemm import gfx950
@@ -1435,7 +1435,7 @@ def test_grouped_gemm_list_gfx950_metadata(staging, cross):
         torch.testing.assert_close(output.cpu(), (a.float() @ b.float().T).half(), atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("n", [1, 129, 256, 257])
 @pytest.mark.parametrize("block_m,block_n,depth,staging,cross,k,prefetch", [
     (256, 256, 2, 0, False, 256, 0),
@@ -1503,7 +1503,7 @@ def test_grouped_gemm_list_tails_preserve_output_config(staging, cross, tdm_stor
     assert compiled.metadata.global_scratch_size == 0
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("staging,cross", [(0, False), (0, True), (1, True)])
 @pytest.mark.parametrize("tails", [False, True])
 def test_grouped_gemm_list_device_metadata_updates(staging, cross, tails):
@@ -1750,7 +1750,7 @@ def test_grouped_gemm_interface_selects_cluster(ms, n, num_sm, config, expected)
                 auto_cluster=False)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("cluster_size", [None, 2, 1])
 def test_grouped_gemm_interface_multicast_launch(cluster_size, monkeypatch):
     torch.manual_seed(1250)
@@ -1778,7 +1778,7 @@ def test_grouped_gemm_interface_multicast_launch(cluster_size, monkeypatch):
         torch.testing.assert_close(out.cpu(), (x.float() @ w.float().T).half(), atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("ms,n", [([0, 1, 255, 257], 257), ([256, 512], 256), ([0, 0], 1)])
 def test_grouped_gemm_interface_list_api(ms, n):
     torch.manual_seed(1250)
@@ -1790,7 +1790,7 @@ def test_grouped_gemm_interface_list_api(ms, n):
         torch.testing.assert_close(out.cpu(), (x.float() @ w.float().T).half(), atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("config,k", [
     ({}, 512),
     ({"CROSS_TILE_PREFETCH": False}, 384),
@@ -1914,7 +1914,7 @@ def test_grouped_gemm_list_rejects_layout(condition):
         _gfx1250_grouped.grouped_gemm_tdm_list([a], [b])
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("block_m,staging,cross", [(128, 0, False), (256, 0, True), (256, 1, True)])
 @pytest.mark.parametrize("m_tiles", [[0, 1, 0, 0, 0, 0, 2, 0], [0, 0, 0]])
 def test_grouped_gemm_list_empty_m(block_m, staging, cross, m_tiles):
@@ -1967,7 +1967,7 @@ def _tdm_multicast_skew_kernel(a_ptr, b_ptr, out_ptr, CLUSTER_SIZE: tl.constexpr
         tl.store(out_ptr + (pid * ITERS + i) * 1024 + offsets, value)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("cluster_size", [2, 4])
 @pytest.mark.parametrize("before_load", [False, True])
 def test_tdm_multicast_skew_without_cluster_barriers(device, cluster_size, before_load):
@@ -2017,7 +2017,7 @@ def _partitioned_tdm_reshape_kernel(x_ptr, output_ptr, ROWS: tl.constexpr, K: tl
         tl.store(output_ptr + offsets, x)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("group_major", [True, False])
 @pytest.mark.parametrize("ROWS, R", [(256, 128), (256, 64)])
 @pytest.mark.parametrize("num_warps", [2, 4, 8])
@@ -2080,7 +2080,7 @@ def _tdm_partitioned_views_kernel(input_ptr, output_ptr, PARTITION_DIM: tl.const
         tl.store(output_ptr + (stage * 2 + 1) * SIZE * SIZE + offsets, tlx.local_load(b))
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason='Requires gfx1250')
+@pytest.mark.skipif(not is_hip_cdna5(), reason='Requires CDNA5')
 @pytest.mark.parametrize('partition_dim', [0, 1])
 @pytest.mark.parametrize('view', ['full', 'transpose', 'slice', 'dynamic'])
 @pytest.mark.parametrize('fused', [False, True])
@@ -2126,7 +2126,7 @@ def test_partitioned_shared_permute_preserves_bases():
     assert transposed.make_permute([1, 0]).partition_layout.offset_bases == inner.offset_bases
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize(
     "overrides",
     [dict(block_m=64),
@@ -2202,7 +2202,7 @@ def _attention_backward_policies():
     return rows
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize(
     "num_warps,use_tdm,delayed,bm,bn,stages,fence_mask,q_splits,packed_dq,full_policy,outer_m,pingpong,spread_dq,log2_lse,cache_score_k,tile_major,partition_lds,front_regions,bridge_regions",
     _attention_backward_policies())
@@ -2254,7 +2254,7 @@ def test_attention_backward_delayed_gqa(num_warps, use_tdm, delayed, bm, bn, sta
             assert nrmse < 0.008, (name, nrmse.item())
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("packed_dq", [False, True])
 @pytest.mark.parametrize("shape", [(1, 4, 4, 512), (4, 16, 16, 1024), (2, 16, 16, 2048), (1, 16, 16, 4096),
                                    (1, 8, 2, 1024), (2, 6, 2, 512), (1, 64, 8, 2048), (1, 4, 4, 8192), (1, 8, 2, 8192),
@@ -2303,7 +2303,7 @@ def test_attention_backward_cluster_correctness(shape, packed_dq, monkeypatch):
         assert all(nrmse(value, ref) <= 1e-4 for value, ref in zip(actual[1:], production_kv))
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 def test_attention_backward_cluster_workspace_validation():
     import dataclasses
     from triton.tlx.ops.kernels.flash_attn.gfx1250_bwd import _select_config_base as select_config, allocate_workspace, fa_backward
@@ -2318,7 +2318,7 @@ def test_attention_backward_cluster_workspace_validation():
         fa_backward(q, q, q, q, q, lse, config=config, workspace=wrong)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("slices", [2, 4])
 @pytest.mark.parametrize("packed", [False, True])
 def test_attention_backward_convert_slices(slices, packed):
@@ -2340,7 +2340,7 @@ def test_attention_backward_convert_slices(slices, packed):
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("slices", [1, 2, 4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("block_m", [64, 128, 256])
@@ -2357,7 +2357,7 @@ def test_attention_backward_zero_dq_slices_tail(slices, dtype, block_m):
     torch.testing.assert_close(storage[elements:], torch.full_like(storage[elements:], -123.0), atol=0, rtol=0)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 def test_attention_backward_split_preprocess_order(monkeypatch):
     from triton.tlx.ops.kernels.flash_attn import gfx1250_bwd as backward
 
@@ -2419,7 +2419,7 @@ def _attention_backward_occ1_pad_k(config):
     return dataclasses.replace(config, occ1_pad_k=pad_k) if config.occ1 else config
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("packed_dq", [False, True])
 @pytest.mark.parametrize("dq_slices", [1, 2, 4])
 @pytest.mark.parametrize("partials", [False, True])
@@ -2462,7 +2462,7 @@ def test_attention_backward_convert_vectorized(packed_dq, dq_slices, partials, b
         assert torch.isnan(dk).all() and torch.isnan(dv).all()
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("packed_dq", [False, True])
 @pytest.mark.parametrize("shape,q_splits", [
     ((1, 4, 4, 512), 1),
@@ -2539,7 +2539,7 @@ def _attention_backward_causal_config(packed_dq, q_splits=1):
                                occ1_k_bands=0 if q_splits == 4 else 1)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("packed_dq", [False, True])
 @pytest.mark.parametrize("shape,q_splits", [
     ((1, 1, 1, 512), 1),
@@ -2588,7 +2588,7 @@ def test_attention_backward_causal_correctness(shape, q_splits, packed_dq, monke
         assert all(nrmse(value, ref) < 0.012 for value, ref in zip(actual, expected))
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("changes", [dict(q_splits=3), dict(q_splits=4), dict(tail_splits=3), dict(occ1=False)])
 def test_attention_backward_causal_validation(changes):
     import dataclasses
@@ -2603,7 +2603,7 @@ def test_attention_backward_causal_validation(changes):
         fa_backward(q, k, v, o, do, lse, causal=True, config=config)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("packed_dq", [False, True])
 @pytest.mark.parametrize("kv_slices", [2, 3, 4])
 def test_attention_backward_convert_split_stores(packed_dq, kv_slices):
@@ -2627,7 +2627,7 @@ def test_attention_backward_convert_split_stores(packed_dq, kv_slices):
     assert torch.count_nonzero(dq).item() == 0
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("block,size,kv_size,slices,packed_dq", [
     pytest.param(block, group * 8192, 8192, slices, packed,
                  id=f"b{block}-g{group}-s{slices}-{'packed' if packed else 'fp32'}")
@@ -2673,7 +2673,7 @@ def test_attention_backward_convert_balanced_partials(block, size, kv_size, slic
     assert torch.equal(dv, expected_dv.bfloat16())
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("packed_dq", [False, True])
 @pytest.mark.parametrize("kv_slices", [2, 3, 4])
 def test_attention_backward_convert_compact_tail(packed_dq, kv_slices):
@@ -2701,7 +2701,7 @@ def test_attention_backward_convert_compact_tail(packed_dq, kv_slices):
     assert torch.equal(dv[prefix:], values[1].bfloat16())
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 @pytest.mark.parametrize("packed_dq", [False, True])
 @pytest.mark.parametrize("shape", [(1, 4, 4, 512), (2, 4, 4, 512), (1, 8, 1, 512), (2, 8, 1, 512), (13, 16, 16, 512),
                                    (13, 64, 8, 512), (16, 64, 8, 512)])

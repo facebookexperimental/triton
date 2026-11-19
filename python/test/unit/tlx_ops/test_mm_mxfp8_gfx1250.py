@@ -5,9 +5,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from triton._internal_testing import is_hip_gfx1250, swizzle_scale_to_5d
+from triton._internal_testing import is_hip_cdna5, swizzle_scale_to_5d
 
-requires_gfx1250 = pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+requires_gfx1250 = pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 
 
 def _inputs(m, n, k, *, sf_layout):

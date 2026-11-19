@@ -1,6 +1,6 @@
 #include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "TritonAMDGPUTransforms/Passes.h" // IWYU pragma: keep
-#include "amd/lib/TritonAMDGPUTransforms/PipelineUtility.h"
+#include "amd/lib/TritonAMDGPUTransforms/Pipeliner/PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
@@ -191,7 +191,8 @@ void combineWaitOps(ModuleOp moduleOp, bool useAsyncCopy) {
       });
 }
 
-struct PipelinePass : impl::TritonAMDGPUPipelineBase<PipelinePass> {
+struct TritonAMDGPUPipelinePass
+    : impl::TritonAMDGPUPipelineBase<TritonAMDGPUPipelinePass> {
   using Base::Base;
 
   void runOnOperation() override {

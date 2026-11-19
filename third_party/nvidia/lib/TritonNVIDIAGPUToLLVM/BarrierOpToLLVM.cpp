@@ -87,13 +87,10 @@ struct GridDependencyOpConversion : public ConvertOpToLLVMPattern<OpTy> {
   LogicalResult
   matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    PTXBuilder ptxBuilder;
-    if constexpr (std::is_same_v<OpTy, triton::GridDependencyWaitOp>)
-      (*ptxBuilder.create("griddepcontrol.wait"))();
-    else
-      (*ptxBuilder.create("griddepcontrol.launch_dependents"))();
-    ptxBuilder.launch(rewriter, op.getLoc(), void_ty(rewriter.getContext()));
-    rewriter.eraseOp(op);
+    auto kind = std::is_same_v<OpTy, triton::GridDependencyWaitOp>
+                    ? NVVM::GridDepActionKind::wait
+                    : NVVM::GridDepActionKind::launch_dependents;
+    rewriter.replaceOpWithNewOp<NVVM::GriddepcontrolOp>(op, kind);
     return success();
   }
 };
@@ -967,18 +964,9 @@ struct CLCIsCanceledOpConversion
       return op.emitError("CLC operations require SM100+ (Blackwell)");
     }
 
-    auto loc = op.getLoc();
-    std::string ptxAsm =
-        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 $0, $1;";
-    PTXBuilder ptxBuilder;
-    auto &clcOp = *ptxBuilder.create(ptxAsm);
-    auto *resultOp = ptxBuilder.newOperand("=b");
-    auto *clcResultOp = ptxBuilder.newOperand(adaptor.getClcResult(), "q");
-    clcOp({resultOp, clcResultOp}, /*onlyAttachMLIRArgs=*/true);
-
-    Value result =
-        ptxBuilder.launch(rewriter, loc, i1_ty, /*hasSideEffects=*/false);
-    rewriter.replaceOp(op, result);
+    rewriter.replaceOpWithNewOp<NVVM::ClusterLaunchControlQueryCancelOp>(
+        op, NVVM::ClusterLaunchControlQueryType::IS_CANCELED,
+        adaptor.getClcResult());
 
     return success();
   }
@@ -1002,26 +990,20 @@ struct CLCGetProgramIdOpConversion
 
     auto loc = op.getLoc();
 
-    using namespace llvm::Intrinsic;
-    constexpr std::pair<ID, int> queries[] = {
-        {nvvm_clusterlaunchcontrol_query_cancel_get_first_ctaid_x,
-         kMaxGriddimx},
-        {nvvm_clusterlaunchcontrol_query_cancel_get_first_ctaid_y,
-         kMaxGriddimy},
-        {nvvm_clusterlaunchcontrol_query_cancel_get_first_ctaid_z,
-         kMaxGriddimz}};
-    auto [intrinsic, maxGridDim] = queries[static_cast<unsigned>(op.getDim())];
-    auto call = LLVM::createLLVMIntrinsicCallOp(
-        rewriter, loc, llvm::Intrinsic::getName(intrinsic), op.getType(),
-        adaptor.getClcResult());
-    // A successful cancellation returns a raw CTA coordinate in [0,
-    // maxGridDim).
-    auto range =
-        LLVM::ConstantRangeAttr::get(rewriter.getContext(), 32, 0, maxGridDim);
-    auto resultAttrs = rewriter.getDictionaryAttr(
-        rewriter.getNamedAttr(LLVM::LLVMDialect::getRangeAttrName(), range));
-    call.setResAttrsAttr(rewriter.getArrayAttr(resultAttrs));
-    Value result = call.getResult(0);
+    auto queryType = [&] {
+      switch (op.getDim()) {
+      case ProgramIDDim::X:
+        return NVVM::ClusterLaunchControlQueryType::GET_FIRST_CTA_ID_X;
+      case ProgramIDDim::Y:
+        return NVVM::ClusterLaunchControlQueryType::GET_FIRST_CTA_ID_Y;
+      case ProgramIDDim::Z:
+        return NVVM::ClusterLaunchControlQueryType::GET_FIRST_CTA_ID_Z;
+      }
+      llvm::llvm_unreachable_internal("Invalid program id dim");
+    }();
+
+    Value result = NVVM::ClusterLaunchControlQueryCancelOp::create(
+        rewriter, loc, queryType, adaptor.getClcResult());
 
     PhysicalClusterInfo cluster = getPhysicalClusterInfo(op);
     if (cluster.hasPerCTAProgramIds) {
