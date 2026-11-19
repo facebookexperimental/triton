@@ -18,6 +18,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ..._invariance import BitwiseInvarianceSpec, gemm_fixed_split_k
 from . import _sm100_core as _core
+from . import sm100_skinny as _skinny
 
 _FIXED_SPEC = BitwiseInvarianceSpec.dims("K")
 
@@ -1485,6 +1486,12 @@ def mm(a, b, *, out=None, space="full", invariance=None):
         c = out
     else:
         c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+    # Decode-sized M only streams B, which the M-tiled schedule below cannot do at
+    # the HBM rate. Its split-K order varies with the shape, so it is not used
+    # under a fixed-schedule invariance spec.
+    if gemm_fixed_split_k(invariance) is None and _skinny.eligible(a, b, out):
+        return _skinny.mm(a, b, c, space=space)
 
     # A column-major operand's .T is a row-major view of the same memory, so the
     # descriptor flips and the MMA operand is recovered by a metadata-only
