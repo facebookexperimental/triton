@@ -2006,3 +2006,35 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+#bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+!barrier = !ttg.memdesc<1xi64, #bar, #ttg.shared_memory, mutable>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // A named barrier that counts fewer threads than its region can complete
+  // before some of them leave an earlier wait, so the wait still needs a
+  // rendezvous before it.
+  // CHECK-LABEL: @partial_named_barrier_after_wait
+  tt.func @partial_named_barrier_after_wait(%phase: i32) {
+    %ready = ttg.local_alloc : () -> !barrier
+    ttg.warp_specialize(%ready, %phase)
+    default {
+      ttg.warp_yield
+    }
+    partition0(%r: !barrier, %p: i32) num_warps(4) {
+      %c12 = arith.constant 12 : i32
+      %c64 = arith.constant 64 : i32
+      %id = ttng.user_named_barrier_id %c12 : i32
+      // CHECK: partition0
+      // CHECK: ttng.wait_barrier
+      // CHECK-NEXT: ttg.barrier local
+      // CHECK-NEXT: ttng.arrive_barrier_named
+      ttng.wait_barrier %r, %p : !barrier
+      ttng.arrive_barrier_named %id, %c64 : !ttng.named_barrier_id, i32
+      ttg.warp_return
+    } : (!barrier, i32) -> ()
+    tt.return
+  }
+}

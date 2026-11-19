@@ -1905,3 +1905,34 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return %value : tensor<128x128xf32, #blocked>
   }
 }
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // A named barrier that counts fewer threads than the region is not its
+  // rendezvous. Release the TMEM reads before it.
+  // CHECK-LABEL: @tmem_load_then_partial_named_barrier
+  // CHECK: ttng.tmem_load
+  // CHECK-NEXT: ttng.tmem_wait load
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttng.arrive_barrier_named
+  tt.func @tmem_load_then_partial_named_barrier(%tmem: !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>) -> tensor<128x128xf32, #blocked> {
+    %c12 = arith.constant 12 : i32
+    %c64 = arith.constant 64 : i32
+    %id = ttng.user_named_barrier_id %c12 : i32
+    %value = ttng.tmem_load %tmem : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    ttng.arrive_barrier_named %id, %c64 : !ttng.named_barrier_id, i32
+    tt.return %value : tensor<128x128xf32, #blocked>
+  }
+
+  // A per-thread arrival that every thread performs releases each thread's
+  // own TMEM reads, also on a barrier argument that the per-warp conversion
+  // does not rewrite.
+  // CHECK-LABEL: @tmem_load_then_perthread_arrive_on_argument
+  // CHECK: ttng.tmem_load
+  // CHECK-NEXT: ttng.tmem_wait load
+  // CHECK-NEXT: ttng.arrive_barrier %{{.*}}, 1 {perThread} :
+  tt.func @tmem_load_then_perthread_arrive_on_argument(%tmem: !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>, %bar: !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>) -> tensor<128x128xf32, #blocked> {
+    %value = ttng.tmem_load %tmem : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    ttng.arrive_barrier %bar, 1 {perThread} : !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>
+    tt.return %value : tensor<128x128xf32, #blocked>
+  }
+}
