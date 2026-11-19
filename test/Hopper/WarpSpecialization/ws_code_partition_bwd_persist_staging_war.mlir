@@ -34,8 +34,9 @@
 // The token guards both matched staging pairs (target + staging buffer ids).
 // CHECK: nvws.producer_acquire %[[WAR_TOK:[a-zA-Z0-9_]+]], %{{[a-zA-Z0-9_]+}}, %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 2>, constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 3>, dstTask = 3 : i32, guardedBufferIds = array<i32: 3, 4, 22, 24>, maxRegionId = 3 : i32, minRegionId = 3 : i32, parentId = 1 : i32}}} : tensor<1x!nvws.token>, i32, i1
 // Staging task (3) releases the SAME token on the wait of its last TMA store,
-// with a constant buffer index.
-// CHECK: ttng.async_tma_store_token_wait %{{[a-zA-Z0-9_]+}} nvws_token %[[WAR_TOK]][%{{[a-zA-Z0-9_]+}}] {async_task_id = array<i32: 3>
+// with a constant buffer index, rotated at most one iteration and never past a
+// wait_barrier.
+// CHECK: ttng.async_tma_store_token_wait %{{[a-zA-Z0-9_]+}} nvws_token %[[WAR_TOK]][%{{[a-zA-Z0-9_]+}}] {async_task_id = array<i32: 3>, can_rotate_by_buffer_count = 1 : i32, tma_store_wait_before_wait_barrier}
 // The token rides on the LAST store wait: no later wait or TMA store in the body.
 // CHECK-NOT: ttng.async_tma_store_token_wait
 // CHECK-NOT: ttng.async_tma_copy_local_to_global
