@@ -601,6 +601,40 @@ class InterpreterBuilder:
         mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)
         return self.create_masked_store(ptr, val, mask, cache_policy)
 
+    def create_sr_store(self, ptr, value, index, mask, site, cache, eviction):
+        from ._sr_reference import bf16_bits, random_bits
+        from .stochastic_rounding import _interpreter_launch, _PHILOX_ROUNDS
+
+        launch = _interpreter_launch.get()
+        if launch is None:
+            raise ValueError("sr_store requires the stochastic rounding decorator")
+        spec, state, written = launch
+        declaration = next((entry for entry in spec.store_specs if entry.name == site), None)
+        if declaration is None:
+            raise ValueError(f"undeclared SR site: {site}")
+        if mask is None:
+            mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)
+        target = ptr.get_element_ty()
+        if state.enabled:
+            addresses = ptr.data[mask.data].flatten().tolist()
+            if len(set(addresses)) != len(addresses) or any(address in written for address in addresses):
+                raise ValueError("SR interpreter requires non-overlapping writes")
+            written.update(addresses)
+        if state.enabled and value.dtype == tl.float32 and target == tl.bfloat16:
+            bits = value.data.view(np.uint32).flatten()
+            indices = index.data.flatten()
+            step = int(state.dynamic_seed.item())
+            rounded = [
+                bf16_bits(
+                    int(value),
+                    random_bits(int(logical), state.base_seed, step, state.invocation_offset, _PHILOX_ROUNDS[spec.prng],
+                                declaration.site_id)) for value, logical in zip(bits, indices)
+            ]
+            value = TensorHandle(np.array(rounded, dtype=np.uint16).reshape(value.data.shape), target)
+        else:
+            value = self.cast_impl(value, target)
+        return self.create_masked_store(ptr, value, mask, None)
+
     def create_masked_load(self, ptrs, mask, other, cache_policy, is_volatile):
         dtype_tt = ptrs.get_element_ty()
         dtype_np = _get_np_dtype(dtype_tt)
