@@ -598,10 +598,12 @@ struct FpToFpOpConversion
       Value entropy = b.or_(b.and_(operands[i][1], b.i32_val(0xffff)),
                             b.shl(upper, b.i32_val(16)));
       PTXBuilder builder;
-      // sr_store follows IEEE conversion, including finite overflow to
-      // infinity. Bit-exact tests:
-      // python/test/unit/language/test_stochastic_rounding.py.
-      auto &cvt = *builder.create("cvt.rs.bf16x2.f32 $0, $1, $2, $3;");
+      // Saturated stores restore input infinities in TTIR before the write.
+      // Bit-exact tests: python/test/unit/language/test_stochastic_rounding.py.
+      auto &cvt =
+          *builder.create(op->hasAttr("sr_satfinite")
+                              ? "cvt.rs.satfinite.bf16x2.f32 $0, $1, $2, $3;"
+                              : "cvt.rs.bf16x2.f32 $0, $1, $2, $3;");
       cvt({builder.newOperand("=r", "r"), builder.newOperand(second, "r"),
            builder.newOperand(first, "r"), builder.newOperand(entropy, "r")},
           /*onlyAttachMLIRArgs=*/true);

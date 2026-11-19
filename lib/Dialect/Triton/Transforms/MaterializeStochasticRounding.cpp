@@ -262,6 +262,18 @@ public:
         arith::AndIOp::create(b, loc, random, constant(lane32, 0xffff));
     Value rounded = arith::AddIOp::create(b, loc, bits, entropy);
     rounded = arith::ShRUIOp::create(b, loc, rounded, constant(lane32, 16));
+    if (store->hasAttr("sr_satfinite")) {
+      Value magnitude =
+          arith::AndIOp::create(b, loc, rounded, constant(lane32, 0x7fff));
+      Value overflow =
+          arith::CmpIOp::create(b, loc, arith::CmpIPredicate::uge, magnitude,
+                                constant(lane32, 0x7f80));
+      Value maximum = arith::OrIOp::create(
+          b, loc,
+          arith::AndIOp::create(b, loc, rounded, constant(lane32, 0x8000)),
+          constant(lane32, 0x7f7f));
+      rounded = arith::SelectOp::create(b, loc, overflow, maximum, rounded);
+    }
     Value original = arith::ShRUIOp::create(b, loc, bits, constant(lane32, 16));
     original = arith::SelectOp::create(b, loc, nan, constant(lane32, 0x7fff),
                                        original);
@@ -436,6 +448,26 @@ struct TritonMaterializeStochasticRounding
               RoundingModeAttr::get(&getContext(), RoundingMode::RS));
           conversion->setAttr("sr_ieee", builder.getUnitAttr());
           converted = conversion;
+          if (store->hasAttr("sr_satfinite")) {
+            conversion->setAttr("sr_satfinite", builder.getUnitAttr());
+            Type integerType = builder.getI32Type();
+            if (auto tensor =
+                    dyn_cast<RankedTensorType>(store.getValue().getType()))
+              integerType = tensor.clone(builder.getI32Type());
+            Value bits = BitcastOp::create(builder, store.getLoc(), integerType,
+                                           store.getValue());
+            Value exponent = arith::AndIOp::create(
+                builder, store.getLoc(), bits,
+                entropy.constant(integerType, 0x7f800000));
+            Value special = arith::CmpIOp::create(
+                builder, store.getLoc(), arith::CmpIPredicate::eq, exponent,
+                entropy.constant(integerType, 0x7f800000));
+            Value original = FpToFpOp::create(
+                builder, store.getLoc(), valueType, store.getValue(),
+                RoundingModeAttr::get(&getContext(), RoundingMode::RTNE));
+            converted = arith::SelectOp::create(builder, store.getLoc(),
+                                                special, original, converted);
+          }
         } else {
           converted = entropy.softwareRound(store, random);
         }
