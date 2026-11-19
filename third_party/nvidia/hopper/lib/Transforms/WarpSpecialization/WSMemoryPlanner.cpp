@@ -2937,10 +2937,11 @@ static unsigned allocateSmemBuffers(
   // deepens the shallowest operand ring (e.g. an fp32 epilogue ring taking 4
   // slots and leaving A/B at 1).
   unsigned outerEpilogueBudget = epilogueBudget;
-  // A ring deeper than the K loop's trip count buys little, so the goal is
-  // capped by it (e.g. K = 2 * BLOCK_K keeps the deeper epilogue ring).
+  // A ring deeper than its K loop's trip count buys little, so each operand's
+  // goal is capped by that loop (e.g. K = 2 * BLOCK_K keeps the deeper
+  // epilogue ring).
   SmallVector<unsigned> mmaOperandIdx;
-  unsigned operandDepthGoal = numBuffers;
+  SmallVector<unsigned> operandDepthGoal;
   for (unsigned i = 0; i < wsBuffers.size(); ++i) {
     const auto &buf = wsBuffers[i];
     if (buf.isPinned || buf.priority != WSBufferPriority::P1_InnermostTMA)
@@ -2948,34 +2949,38 @@ static unsigned allocateSmemBuffers(
     Operation *mma = getTMAFedMMAOperandConsumer(buf.allocOp, channels);
     if (!mma || isUnalignedTMALoadSlot(buf.allocOp, buf.sizeBytes, channels))
       continue;
-    mmaOperandIdx.push_back(i);
+    unsigned goal = numBuffers;
     if (auto forOp = mma->getParentOfType<scf::ForOp>())
       if (auto tripCount = forOp.getStaticTripCount())
-        operandDepthGoal = std::min<uint64_t>(
-            operandDepthGoal, std::max<uint64_t>(1, tripCount->getZExtValue()));
+        goal = std::min<uint64_t>(
+            goal, std::max<uint64_t>(1, tripCount->getZExtValue()));
+    mmaOperandIdx.push_back(i);
+    operandDepthGoal.push_back(goal);
   }
-  for (unsigned i : mmaOperandIdx) {
+  for (auto [i, goal] : llvm::zip(mmaOperandIdx, operandDepthGoal)) {
     const auto &buf = wsBuffers[i];
-    if (buf.numCopies >= operandDepthGoal)
+    if (buf.numCopies >= goal)
       continue;
-    uint64_t reserve =
-        uint64_t(operandDepthGoal - buf.numCopies) * uint64_t(buf.sizeBytes);
+    uint64_t reserve = uint64_t(goal - buf.numCopies) * uint64_t(buf.sizeBytes);
     outerEpilogueBudget =
         reserve < outerEpilogueBudget
             ? outerEpilogueBudget - static_cast<unsigned>(reserve)
             : 0;
   }
-  // Per-operand depth. Operands in one circular reuse group share its copies:
-  // a group of 2N-1 copies gives each of two members N slots.
+  // Shallowest operand depth, each capped at its goal; the operand-first plan
+  // is tried only while this is below the smallest goal. Operands in one
+  // circular reuse group share its copies: a group of 2N-1 copies gives each
+  // of two members N slots.
   auto minMMAOperandCopies = [&]() {
     unsigned m = std::numeric_limits<unsigned>::max();
-    for (unsigned i : mmaOperandIdx) {
+    for (auto [i, goal] : llvm::zip(mmaOperandIdx, operandDepthGoal)) {
       unsigned sharers = llvm::count_if(wsBuffers, [&](const WSBuffer &b) {
         return !b.isPinned && b.bufferId == wsBuffers[i].bufferId;
       });
       // Defensive: operands here are never pinned, so they count themselves.
       sharers = std::max(1u, sharers);
-      m = std::min(m, (wsBuffers[i].numCopies + sharers - 1) / sharers);
+      unsigned depth = (wsBuffers[i].numCopies + sharers - 1) / sharers;
+      m = std::min(m, std::min(depth, goal));
     }
     return m;
   };
@@ -3197,7 +3202,8 @@ static unsigned allocateSmemBuffers(
                            "TMA-fed MMAv5 operand ring";
   unsigned defaultMin = minMMAOperandCopies();
   if (smemOperandRingFirst && outerEpilogueBudget < epilogueBudget &&
-      !mmaOperandIdx.empty() && defaultMin < operandDepthGoal &&
+      !mmaOperandIdx.empty() &&
+      defaultMin < *llvm::min_element(operandDepthGoal) &&
       !funcOp->hasAttr("ttg.ws_memory_plan_invalid")) {
     SmallVector<WSBuffer> defaultPlan = wsBuffers;
     unsigned defaultNextBufferId = nextBufferId;
