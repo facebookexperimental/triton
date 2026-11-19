@@ -348,6 +348,30 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d["H"] in (4096, 8192, 16384),
     ),
     OpSpec(
+        op="all_reduce",
+        arch="gfx950",
+        variant="one_or_two_shot",
+        impl="triton.tlx.ops.kernels.collectives.all_reduce.gfx950:all_reduce",
+        dtypes=_BF16,
+        # tl.arange over the ranks needs a power of two; one node has at most 8 GPUs.
+        accepts=lambda d: d["world"] in (2, 4, 8),
+    ),
+    OpSpec(
+        op="all_reduce_workspace",
+        arch="gfx950",
+        variant="symmetric_input_uncached_signals",
+        impl="triton.tlx.ops.kernels.collectives.all_reduce.gfx950:Workspace",
+    ),
+    OpSpec(
+        op="all_reduce_norm_residual_norm",
+        arch="gfx950",
+        variant="fused_one_shot",
+        impl=
+        "triton.tlx.ops.kernels.collectives.fused.all_reduce_norm_residual_norm.gfx950:all_reduce_norm_residual_norm",
+        dtypes=_BF16,
+        accepts=lambda d: d["world"] in (2, 4, 8) and d["H"] in (4096, 8192, 16384),
+    ),
+    OpSpec(
         op="rmsnorm_gate",
         arch="gfx950",
         variant="eight_heads_per_program",
