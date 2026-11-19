@@ -363,7 +363,9 @@ triton_construct_tma_desc(CUtensorMap *desc, const triton_tma_recipe_t *recipe,
     } else {
       swizzle_mode = CU_TENSOR_MAP_SWIZZLE_32B;
     }
-    int swz_bytes = (swizzle_mode == CU_TENSOR_MAP_SWIZZLE_128B)  ? 128
+    int swz_bytes = (swizzle_mode == CU_TENSOR_MAP_SWIZZLE_128B ||
+                     swizzle_mode == CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B)
+                        ? 128
                     : (swizzle_mode == CU_TENSOR_MAP_SWIZZLE_64B) ? 64
                     : (swizzle_mode == CU_TENSOR_MAP_SWIZZLE_32B) ? 32
                                                                   : 0;

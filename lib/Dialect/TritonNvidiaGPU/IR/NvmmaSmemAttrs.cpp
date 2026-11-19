@@ -52,12 +52,26 @@ getNvmmaSmemAttrs(const LinearLayout &nvmmaSmemLL, unsigned bitwidth) {
   // other sw=0 interpretation (nvmma_shared<sw=0> as a flat TMA destination) is
   // not supported here.
   std::optional<std::pair<NvmmaSmemAttrs, LinearLayout>> overlapping;
-  for (bool fp4Padded : {false, true}) {
-    for (unsigned swizzling : {0u, 32u, 64u, 128u}) {
+  struct Candidate {
+    bool fp4Padded;
+    unsigned swizzling;
+    bool swizzleAtom32B;
+  };
+  SmallVector<Candidate> candidates;
+  for (bool fp4Padded : {false, true})
+    for (unsigned swizzling : {0u, 32u, 64u, 128u})
+      candidates.push_back({fp4Padded, swizzling, false});
+  // Only an MN-major TF32 operand needs the 32B-atomicity swizzle.
+  if (bitwidth == 32)
+    candidates.push_back({false, 128u, true});
+  for (auto [fp4Padded, swizzling, swizzleAtom32B] : candidates) {
+    {
       for (bool transposed : {false, true}) {
         auto enc = ttg::NVMMASharedEncodingAttr::get(
-            ctx, swizzling, transposed, std::max(8u, bitwidth), fp4Padded,
-            ttg::CGAEncodingAttr::get1CTALayout(ctx, /*rank=*/2));
+            ctx, swizzling, transposed, std::max(8u, bitwidth),
+            fp4Padded ? ttg::NVMmaPadding::Fp4 : ttg::NVMmaPadding::None,
+            ttg::CGAEncodingAttr::get1CTALayout(ctx, /*rank=*/2),
+            swizzleAtom32B);
         auto coreMatrixLL =
             ttg::getCoreMatrixLinearLayout(enc, /*disableSwizzle=*/false);
         auto coreDims = llvm::to_vector(coreMatrixLL.getOutDimNames());
@@ -69,7 +83,7 @@ getNvmmaSmemAttrs(const LinearLayout &nvmmaSmemLL, unsigned bitwidth) {
         if (transposed)
           coreMatrixLL = transposeLinearLayout(coreMatrixLL, {1, 0});
         auto candidateLL = coreMatrixLL.pseudoinvert();
-        NvmmaSmemAttrs attrs{swizzling, transposed, fp4Padded};
+        NvmmaSmemAttrs attrs{swizzling, transposed, fp4Padded, swizzleAtom32B};
         if (getReps(nvmmaSmemLL, candidateLL))
           return std::make_pair(attrs, std::move(candidateLL));
         if (!overlapping && attrs.isCompatibleWith(nvmmaSmemLL, candidateLL))
@@ -163,7 +177,7 @@ std::optional<NvmmaSmemAttrs> getNvmmaSmemAttrs(ttg::MemDescType memTy) {
     return std::nullopt;
   if (auto nvmma = dyn_cast<ttg::NVMMASharedEncodingAttr>(encoding))
     return NvmmaSmemAttrs{nvmma.getSwizzlingByteWidth(), nvmma.getTransposed(),
-                          nvmma.isPaddedFp4()};
+                          nvmma.isPaddedFp4(), nvmma.getSwizzleAtom32B()};
   return getMmaOperandSmemAttrs(memTy);
 }
 

@@ -1594,3 +1594,33 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 4 : i32, "ttg.num-
     tt.return %d : tensor<8x128x128xf32, #blocked>
   }
 }
+
+// -----
+
+// MN-major TF32 operands use 128B swizzling with 32B atomicity; an operand
+// whose contiguous dim is narrower than 128 bytes falls back to K-major.
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blockedT = #ttg.blocked<{sizePerThread = [4, 1], threadsPerWarp = [8, 4], warpsPerCTA = [1, 4], order = [0, 1]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-DAG: #[[$B_ATOM:.+]] = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32, swizzleAtom32B = true}>
+  // CHECK-DAG: #[[$A_ATOM:.+]] = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 32, swizzleAtom32B = true}>
+  // CHECK-DAG: #[[$B_KMAJOR:.+]] = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 32}>
+  // CHECK-LABEL: @tf32_mn_major_operands
+  // CHECK-DAG: ttg.local_alloc %arg1 : (tensor<32x128xf32, #{{.+}}>) -> !ttg.memdesc<32x128xf32, #[[$B_ATOM]], #smem>
+  // CHECK-DAG: ttg.local_alloc %arg0 : (tensor<128x32xf32, #{{.+}}>) -> !ttg.memdesc<128x32xf32, #[[$A_ATOM]], #smem>
+  // CHECK: ttng.tc_gen5_mma
+  tt.func @tf32_mn_major_operands(%a: tensor<128x32xf32, #blockedT>, %b: tensor<32x128xf32, #blocked>, %c: tensor<128x128xf32, #blocked>) -> tensor<128x128xf32, #blocked> {
+    %a_cvt = ttg.convert_layout %a : tensor<128x32xf32, #blockedT> -> tensor<128x32xf32, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>
+    %b_cvt = ttg.convert_layout %b : tensor<32x128xf32, #blocked> -> tensor<32x128xf32, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>
+    %d = tt.dot %a_cvt, %b_cvt, %c, inputPrecision = tf32 : tensor<128x32xf32, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<32x128xf32, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<128x128xf32, #blocked>
+    tt.return %d : tensor<128x128xf32, #blocked>
+  }
+  // CHECK-LABEL: @tf32_mn_major_narrow_b
+  // CHECK: ttg.local_alloc %arg1 : (tensor<32x16xf32, #{{.+}}>) -> !ttg.memdesc<32x16xf32, #[[$B_KMAJOR]], #smem>
+  tt.func @tf32_mn_major_narrow_b(%a: tensor<128x32xf32, #blocked>, %b: tensor<32x16xf32, #blocked>, %c: tensor<128x16xf32, #blocked>) -> tensor<128x16xf32, #blocked> {
+    %a_cvt = ttg.convert_layout %a : tensor<128x32xf32, #blocked> -> tensor<128x32xf32, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>
+    %b_cvt = ttg.convert_layout %b : tensor<32x16xf32, #blocked> -> tensor<32x16xf32, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>
+    %d = tt.dot %a_cvt, %b_cvt, %c, inputPrecision = tf32 : tensor<128x32xf32, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<32x16xf32, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<128x16xf32, #blocked>
+    tt.return %d : tensor<128x16xf32, #blocked>
+  }
+}

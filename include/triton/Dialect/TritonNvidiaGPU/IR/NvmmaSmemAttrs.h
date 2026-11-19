@@ -13,6 +13,7 @@ struct NvmmaSmemAttrs {
   unsigned swizzlingByteWidth = 0;
   bool transposed = false;
   bool fp4Padded = false;
+  bool swizzleAtom32B = false;
 
   bool isCompatibleWith(const LinearLayout &layout,
                         const LinearLayout &tile) const;
