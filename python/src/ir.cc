@@ -1803,9 +1803,12 @@ void init_triton_ir(py::module_ &m) {
       .def("create_sr_store",
            [](TritonOpBuilder &self, Value ptr, Value value, Value index,
               std::optional<Value> mask, const std::string &site,
-              CacheModifier cache, EvictionPolicy evict) {
-             self.create<SrStoreOp>(ptr, value, index, mask.value_or(Value()),
-                                    site, 0, cache, evict);
+              CacheModifier cache, EvictionPolicy evict, bool satfinite) {
+             auto store = self.create<SrStoreOp>(ptr, value, index,
+                                                 mask.value_or(Value()), site,
+                                                 0, cache, evict);
+             if (satfinite)
+               store->setAttr("sr_satfinite", self.getBuilder().getUnitAttr());
            })
       .def("create_store",
            [](TritonOpBuilder &self, Value &ptrs, Value &value,

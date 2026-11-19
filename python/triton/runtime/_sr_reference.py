@@ -32,11 +32,16 @@ def random_bits(logical_index, base_seed, dynamic_seed, invocation_offset=0, rou
     return counter[0]
 
 
-def bf16_bits(fp32_bits, entropy):
+def bf16_bits(fp32_bits, entropy, overflow="ieee"):
     """IEEE BF16: preserve infinities/zeros/subnormals, canonicalize NaNs."""
     bits = fp32_bits & _MASK32
     if bits & 0x7fffffff > 0x7f800000:
         return 0x7fff
     if bits & 0x7fffffff == 0x7f800000:
         return bits >> 16
-    return ((bits + (entropy & 0xffff)) >> 16) & 0xffff
+    rounded = ((bits + (entropy & 0xffff)) >> 16) & 0xffff
+    if overflow == "satfinite" and rounded & 0x7fff >= 0x7f80:
+        rounded = (rounded & 0x8000) | 0x7f7f
+    elif overflow not in ("ieee", "satfinite"):
+        raise ValueError("SR overflow must be ieee or satfinite")
+    return rounded
