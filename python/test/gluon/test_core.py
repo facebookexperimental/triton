@@ -2965,10 +2965,10 @@ def test_amd_mfma_scaled_fp6(device='cuda'):
         mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True,
                                                              warps_per_cta=[2, 2])
         a_load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [8, 8], [4, 1], [1, 0])
-        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=16)
+        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=32)
         a_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(a_layout, [M, K // 32])
         b_load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [32, 2], [4, 1], [1, 0])
-        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=16)
+        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=32)
         b_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(b_layout, [N, K // 32])
 
         a_offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, a_load_layout))[:, None]
@@ -3010,6 +3010,80 @@ def test_amd_mfma_scaled_fp6(device='cuda'):
     torch.testing.assert_close(out.float(), a_ref @ b_ref.T, rtol=2e-2, atol=5.0)
     assert 'v_mfma_scale_f32_16x16x128_f8f6f4' in compiled.asm['amdgcn']
     assert 'v_mfma_f32_16x16x32_bf16' not in compiled.asm['amdgcn']
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires CDNA4")
+def test_amd_mfma_scaled_fp6_packed(device='cuda'):
+    # Packed producer: global storage is dense-packed (96 bytes per
+    # 128 codes); loads address per-fragment packed bytes directly
+    # and the lowering consumes them (amdg.fp6_packed), with no
+    # unpack/repack round trip.
+    M, N, K = 32, 32, 128
+
+    @gluon.jit
+    def kernel(out_ptr, a_ptr, b_ptr, a_scale_ptr, b_scale_ptr,
+               M: ttgl.constexpr, N: ttgl.constexpr, K: ttgl.constexpr):
+        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True,
+                                                             warps_per_cta=[2, 2])
+        a_load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [8, 8], [4, 1], [1, 0])
+        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=32)
+        a_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(a_layout, [M, K // 32])
+        b_load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [32, 2], [4, 1], [1, 0])
+        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=32)
+        b_scale_layout: ttgl.constexpr = ttgl.amd.cdna4.get_mfma_scale_layout(b_layout, [N, K // 32])
+
+        # With k_width=32 each lane's fragment is one consecutive
+        # 32-code segment; its packed bytes are the segment's dense
+        # 24-byte block.
+        a_offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, a_load_layout))[:, None]
+        a_offs_k = ttgl.arange(0, K, layout=ttgl.SliceLayout(0, a_load_layout))[None, :]
+        # The 8 padding bytes after each 24-byte block are masked: for the
+        # last block they would read past the end of the packed row.
+        a_byte = (a_offs_k // 32) * 24 + (a_offs_k % 32)
+        a = ttgl.amd.cdna4.buffer_load(a_ptr, a_offs_m * (K * 3 // 4) + a_byte, mask=(a_offs_k % 32) < 24, other=0)
+        a = ttgl.convert_layout(a, a_layout)
+        b_offs_k = ttgl.arange(0, K, layout=ttgl.SliceLayout(1, b_load_layout))[:, None]
+        b_offs_n = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, b_load_layout))[None, :]
+        b_byte = (b_offs_k // 32) * 24 + (b_offs_k % 32)
+        b = ttgl.amd.cdna4.buffer_load(b_ptr, b_byte * N + b_offs_n, mask=(b_offs_k % 32) < 24, other=0)
+        b = ttgl.convert_layout(b, b_layout)
+        a_scale_offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, a_scale_layout))[:, None]
+        a_scale_offs_k = ttgl.arange(0, K // 32, layout=ttgl.SliceLayout(0, a_scale_layout))[None, :]
+        a_scale = ttgl.amd.cdna4.buffer_load(a_scale_ptr, a_scale_offs_m * (K // 32) + a_scale_offs_k)
+        b_scale_offs_n = ttgl.arange(0, N, layout=ttgl.SliceLayout(1, b_scale_layout))[:, None]
+        b_scale_offs_k = ttgl.arange(0, K // 32, layout=ttgl.SliceLayout(0, b_scale_layout))[None, :]
+        b_scale = ttgl.amd.cdna4.buffer_load(b_scale_ptr, b_scale_offs_n * (K // 32) + b_scale_offs_k)
+        zero = ttgl.zeros([M, N], dtype=ttgl.float32, layout=mfma_layout)
+        c = ttgl.amd.cdna4.mfma_scaled(a, a_scale, "e2m3", b, b_scale, "e3m2", zero, packed=True)
+        c = c.to(ttgl.bfloat16)
+        out_offs_m = ttgl.arange(0, M)[:, None]
+        out_offs_n = ttgl.arange(0, N)[None, :]
+        ttgl.amd.cdna4.buffer_store(c, out_ptr, out_offs_m * N + out_offs_n)
+
+    def _pack_dense(codes):
+        rows, k = codes.shape
+        groups = codes.reshape(rows, k // 4, 4).int()
+        packed = torch.stack([
+            groups[..., 0] | (groups[..., 1] << 6),
+            (groups[..., 1] >> 2) | (groups[..., 2] << 4),
+            (groups[..., 2] >> 4) | (groups[..., 3] << 2),
+        ], dim=-1)
+        return packed.reshape(rows, k * 3 // 4).to(torch.uint8)
+
+    torch.manual_seed(0)
+    a_mx = MXFP6Tensor(size=(M, K), device=device, e=2).random()
+    a = _pack_dense(a_mx.data)
+    b_codes = MXFP6Tensor(size=(N, K), device=device, e=3).random()
+    b = _pack_dense(b_codes.data).T.contiguous()
+    b_ref_t = b_codes.to(torch.float32)
+    a_scale_mx = MXScaleTensor(size=(M, K // 32)).random(1 / 32, 32)
+    b_scale_mx = MXScaleTensor(size=(N, K // 32)).random(1 / 32, 32)
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    compiled = kernel[(1, )](out, a, b, a_scale_mx.data.to(device), b_scale_mx.data.to(device), M, N, K, num_warps=4)
+    a_ref = a_mx.to(torch.float32) * a_scale_mx.to(torch.float32).repeat_interleave(32, dim=1).to(device)
+    b_ref = b_ref_t * b_scale_mx.to(torch.float32).repeat_interleave(32, dim=1).to(device)
+    torch.testing.assert_close(out.float(), a_ref @ b_ref.T, rtol=2e-2, atol=5.0)
+    assert 'v_mfma_scale_f32_16x16x128_f8f6f4' in compiled.asm['amdgcn']
 
 
 def test_math_fast_expf():
