@@ -3211,7 +3211,7 @@ static unsigned allocateSmemBuffers(
     LDBG("Phase 4: min MMA operand copies default="
          << defaultMin << " operand-first=" << operandFirstMin);
     if (operandFirstMin <= defaultMin) {
-      wsBuffers = std::move(defaultPlan);
+      wsBuffers = defaultPlan;
       nextBufferId = defaultNextBufferId;
     }
   }
