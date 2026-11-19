@@ -14,13 +14,21 @@ python python/test/tlx_benchmark/bench_{op}.py
 `{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
 `kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, `router_gemm`,
-or one of the fused operators below.
+or one of the fused operators or collectives below.
 
 Fused operators (`tlx/ops/kernels/fused/`) run steps that would otherwise be separate kernels in one launch:
 `addmm_mul_add` and `linear_rowscale` fuse an elementwise epilogue into a GEMM, `norm_residual_norm`
 fuses the post-norm, gated residual add and pre-norm of a residual-stream boundary,
-`qk_norm_rope_kv_cache` fuses the q/k head norm, RoPE, FP8 quantization and paged KV cache write, and
-`rmsnorm_gate` fuses a per-head RMSNorm with a sigmoid output gate.
+`qk_norm_rope_kv_cache` fuses the q/k head norm, RoPE, FP8 quantization and paged KV cache write,
+`rmsnorm_gate` fuses a per-head RMSNorm with a sigmoid output gate, and `moe_router_topk_align` fuses the router
+GEMM, sigmoid top-k and expert-aligned slot sort of an MoE layer.
+
+Collectives (`tlx/ops/kernels/collectives/`) are multi-GPU ops. `collectives/all_reduce/` holds `all_reduce`, and
+`collectives/fused/` holds the collectives fused with the op that consumes their result: `all_reduce_norm_residual_norm`
+feeds the all-reduced branch into the `norm_residual_norm` boundary. The single-process harness cannot drive a
+collective, so their benchmarks fork one rank per GPU when run directly:
+`python python/test/tlx_benchmark/bench_all_reduce.py [--suite gfx950_1]` times `all_reduce` against RCCL, and
+`bench_all_reduce_norm_residual_norm.py` times the fused op against `all_reduce` followed by `norm_residual_norm`.
 
 ```
 options:
@@ -84,8 +92,16 @@ options:
 | `addmm_mul_add` | `torch.addmm` + `torch.addcmul` | speedup >= 0.9x | heuristic |
 | `linear_rowscale` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 | `norm_residual_norm` | `torch.compile` of the unfused module sequence | speedup >= 0.9x | heuristic |
+| `moe_router_topk_align` | `router_gemm` + `moe_routing` + the `moe` slot sort (separate launches) | speedup >= 0.9x | heuristic |
 | `qk_norm_rope_kv_cache` | `torch.compile` of the eager norm, RoPE and cache scatter | speedup >= 0.9x | heuristic |
 | `rmsnorm_gate` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
+
+### Collectives (`kernels/collectives/`)
+
+| op | reference | gate | default space |
+|----|-----------|------|---------------|
+| `all_reduce` | RCCL all-reduce (multi-rank main) | reports only | heuristic |
+| `all_reduce_norm_residual_norm` | `all_reduce` + `norm_residual_norm` (multi-rank main) | reports only | heuristic |
 
 The direct `mm` provider has a `heuristic_config`, so its default is a single
 analytically chosen config. The TorchTLX providers use Inductor's template
@@ -169,6 +185,9 @@ pip: speedup < 0.9, or TFLOP/s under an op's absolute floor when it has no
      no heuristic raise it, see above)
 noisy: CV% > 3%
 ok: everything else
+
+Only `error` fails the run. `pip` and `noisy` are reported and published; the
+nightly regression detector tracks throughput over time.
 
 A benchmark may set `REFERENCE_GATE = False` when its reference validates the
 same numerical result but does not use an equivalent storage or instruction

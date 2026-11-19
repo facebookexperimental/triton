@@ -1008,27 +1008,28 @@ public:
                  isMXFP6ScaleType(dotOp.getBElemType());
     if (isFp6 && !isa_and_nonnull<ttg::BlockedEncodingAttr>(
                      dotOp.getType().getEncoding())) {
-      // A K=128 FP6 dot lowers natively as one 16x16x128 step or two
-      // 32x32x64 steps (96-byte packed K, 128 logical values); wider
-      // or NPOT FP6 decomposes. This is the only native FP6 shape, and
-      // it is the same set the MFMA lowering guard accepts, so a
-      // 32x32x64 dot arrives natively here rather than decomposing,
-      // and a K=256 dot decomposes in both places.
+      // A K=64/128 FP6 dot lowers natively (one 16x16x128 step, or
+      // one/two 32x32x64 steps); wider or NPOT FP6 decomposes. This
+      // is the native FP6 set at this point in the stack, so a
+      // 32x32x64 dot arrives natively here rather than decomposing.
       if (auto mfmaEnc = dyn_cast<ttg::AMDMfmaEncodingAttr>(
               dotOp.getType().getEncoding())) {
         ArrayRef<unsigned> instr = mfmaEnc.getInstrShape();
         // K is A's last dim and B's first dim; validate whichever
         // operand(s) are FP6, not just A.
         bool aNative = !isMXFP6ScaleType(dotOp.getAElemType()) ||
-                       dotOp.getA().getType().getShape().back() == 128;
+                       dotOp.getA().getType().getShape().back() == 128 ||
+                       dotOp.getA().getType().getShape().back() == 64;
         bool bNative = !isMXFP6ScaleType(dotOp.getBElemType()) ||
-                       dotOp.getB().getType().getShape().front() == 128;
+                       dotOp.getB().getType().getShape().front() == 128 ||
+                       dotOp.getB().getType().getShape().front() == 64;
         bool instrNative =
             (instr[0] == 16 && instr[1] == 16 && instr[2] == 128) ||
-            (instr[0] == 32 && instr[1] == 32 && instr[2] == 64);
+            (instr[0] == 32 && instr[1] == 32 && instr[2] == 64) ||
+            instr[2] == 64;
         if (instrNative && aNative && bNative)
           return rewriter.notifyMatchFailure(
-              dotOp, "fp6 K=128 MFMA layout uses native ScaledMFMA");
+              dotOp, "fp6 K=64/128 MFMA layout uses native ScaledMFMA");
       }
       if ((isMXFP6ScaleType(dotOp.getAElemType()) && !dotOp.getLhsKPack()) ||
           (isMXFP6ScaleType(dotOp.getBElemType()) && !dotOp.getRhsKPack()))
@@ -1246,12 +1247,14 @@ getNativeScaledMfmaUnsupportedReason(tt::DotScaledOp dot, int mfmaVersion,
   };
   if (!supportsTypes(dot.getAElemType()) || !supportsTypes(dot.getBElemType()))
     return StringRef("NYI: unsupported mx type");
-  // fp6 (groups of 16 values per 12 bytes) cannot tile the MFMA K
-  // dimension today; route it to the decompose (upcast) path instead
-  // of the native instruction.
+  // A K=64/128 tile of unpacked FP6 codes lowers natively; other K
+  // still uses the decompose upcast.
   if (isMXFP6ScaleType(dot.getAElemType()) ||
-      isMXFP6ScaleType(dot.getBElemType()))
-    return StringRef("fp6 uses decompose upcast");
+      isMXFP6ScaleType(dot.getBElemType())) {
+    int64_t tileK = dot.getA().getType().getShape().back();
+    if (tileK != 128 && tileK != 64)
+      return StringRef("fp6 uses decompose upcast");
+  }
   if (numWarps == 1)
     return StringRef("num_warps==1 is not supported");
   return std::nullopt;

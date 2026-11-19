@@ -33,6 +33,7 @@ class OpSpec:
     default_space: str = "heuristic"  # used when the caller passes space=None
     invariant_vocab: frozenset = frozenset()  # canonical dim names a BitwiseInvarianceSpec may use
     enforces_invariance: bool = False  # the impl prunes schedules per the resolved spec
+    supports_window: bool = False  # flash_attn_varlen: the impl takes max_seqlen_k= and window_size=
 
     def __str__(self) -> str:
         return f"{self.op}/{self.arch} ({self.variant})"
@@ -284,10 +285,15 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: all(ptr % (32 if i in (0, 2) else 16) == 0 for i, ptr in enumerate(d["base_ptrs"])),
         requires=frozenset({"tma", "tmem"}),
     ),
-    # No gfx950 mm_mxfp6 entry yet: the decompose backend in
-    # kernels/mm_mxfp6/gfx950.py is not numerically correct at this
-    # revision, so MI350 callers get UnsupportedOp instead of silent
-    # wrong results. Register it once the fixing diff lands.
+    OpSpec(
+        op="mm_mxfp6",
+        arch="gfx950",
+        variant="native_scaled_mfma",
+        impl="triton.tlx.ops.kernels.mm_mxfp6.gfx950:mm_mxfp6",
+        invariant_vocab=_GEMM_DIMS,
+        dtypes=frozenset({"uint8"}),
+        requires=frozenset(),
+    ),
     OpSpec(
         op="grouped_gemm_mxfp8",
         arch="sm100",
@@ -342,6 +348,30 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d["H"] in (4096, 8192, 16384),
     ),
     OpSpec(
+        op="all_reduce",
+        arch="gfx950",
+        variant="one_or_two_shot",
+        impl="triton.tlx.ops.kernels.collectives.all_reduce.gfx950:all_reduce",
+        dtypes=_BF16,
+        # tl.arange over the ranks needs a power of two; one node has at most 8 GPUs.
+        accepts=lambda d: d["world"] in (2, 4, 8),
+    ),
+    OpSpec(
+        op="all_reduce_workspace",
+        arch="gfx950",
+        variant="symmetric_input_uncached_signals",
+        impl="triton.tlx.ops.kernels.collectives.all_reduce.gfx950:Workspace",
+    ),
+    OpSpec(
+        op="all_reduce_norm_residual_norm",
+        arch="gfx950",
+        variant="fused_one_shot",
+        impl=
+        "triton.tlx.ops.kernels.collectives.fused.all_reduce_norm_residual_norm.gfx950:all_reduce_norm_residual_norm",
+        dtypes=_BF16,
+        accepts=lambda d: d["world"] in (2, 4, 8) and d["H"] in (4096, 8192, 16384),
+    ),
+    OpSpec(
         op="rmsnorm_gate",
         arch="gfx950",
         variant="eight_heads_per_program",
@@ -377,6 +407,16 @@ CATALOG: tuple[OpSpec, ...] = (
         # One program holds a token's q and k heads: power-of-two tiles of at most 4096 elements each.
         accepts=lambda d: (all(n > 0 and n & (n - 1) == 0 for n in (d["HQ"], d["HK"], d["D"])) and 16 <= d["D"] <= 256
                            and d["HQ"] * d["D"] <= 4096 and d["HK"] * d["D"] <= 4096),
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="moe_router_topk_align",
+        arch="gfx950",
+        variant="three_launches",
+        impl="triton.tlx.ops.kernels.fused.moe_router_topk_align.gfx950:moe_router_topk_align",
+        dtypes=_BF16,
+        # router_gemm's GEMV loads and split-K partitions divide E and K; moe_routing holds up to 1024 experts.
+        accepts=lambda d: 0 < d["E"] <= 1024 and d["E"] % 16 == 0 and d["K"] > 0 and d["K"] % 1024 == 0,
         requires=frozenset(),
     ),
     OpSpec(
@@ -586,6 +626,18 @@ CATALOG: tuple[OpSpec, ...] = (
         supports_backward=False,
     ),
     OpSpec(
+        op="flash_attn_varlen",
+        arch="sm100",
+        variant="jfa_ws_clc",
+        impl="triton.tlx.ops.kernels.flash_attn_varlen.sm100:flash_attn_varlen",
+        invariant_vocab=_VARLEN_DIMS,
+        dtypes=_FP16,
+        accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
+        requires=frozenset({"tma", "tmem"}),
+        supports_backward=True,
+        supports_window=True,
+    ),
+    OpSpec(
         op="mla_window_attn",
         arch="sm90",
         variant="overlapped_row_blocks",
@@ -702,6 +754,22 @@ CATALOG: tuple[OpSpec, ...] = (
         invariant_vocab=_KDA_DIMS,
         dtypes=_BF16,
         accepts=lambda d: 1 <= d.get("KEY_DIM", 0) <= 128 and 1 <= d.get("VALUE_DIM", 0) <= 128,
+    ),
+    OpSpec(
+        op="paged_attention_decode_fp8",
+        arch="gfx1250",
+        variant="per_head_wmma_tdm",
+        impl="triton.tlx.ops.kernels.paged_attn_fp8.gfx1250_decode:paged_attention_decode_fp8",
+        dtypes=frozenset({"bfloat16", "float8_e4m3fn"}),
+        invariant_vocab=_VARLEN_DIMS,
+        accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
+    ),
+    OpSpec(
+        op="paged_attention_decode_fp8_workspace",
+        arch="gfx1250",
+        variant="per_head_wmma_tdm",
+        impl="triton.tlx.ops.kernels.paged_attn_fp8.gfx1250_decode:paged_attention_decode_fp8_workspace",
+        dtypes=frozenset({"bfloat16", "float8_e4m3fn"}),
     ),
     OpSpec(
         op="paged_attention_decode",

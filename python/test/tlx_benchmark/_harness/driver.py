@@ -252,6 +252,11 @@ def run_case(bench, case: Case, *, space: str, cold: bool = True, latency_mode: 
 
     if latency_mode not in LATENCY_MODES:
         raise ValueError(f"latency_mode must be one of {LATENCY_MODES}, got {latency_mode!r}")
+    # INVARIANT: a case never times an uncompiled torch.compile reference. Dynamo runs a function eagerly once it
+    # has been recompiled 8 times, which a bench that compiles one reference function per case reaches on its 9th
+    # case; the reset gives every case its own budget and the flag turns any overrun into an error.
+    torch._dynamo.reset()
+    torch._dynamo.config.fail_on_recompile_limit_hit = True
     prep = bench.prepare(case, space)
 
     # Cold pass first, on its own fresh Triton cache. For a backward case
