@@ -2623,6 +2623,118 @@ class TestTLXTemplates(TestCase):
         self.assertIn("tlx.async_load", src)  # aligned-K async path
         self.assertIn("a_reg = tl.load", src)  # register-path fallback load
 
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_amd_stride_assume_nonnegative_source(self):
+        """Inductor bakes a size-1 or broadcast operand dim in as a literal 0 stride, so a strict
+        `tl.assume(stride > 0)` folds to `llvm.assume(false)` and the kernel compiles to a lone
+        `s_trap 2`. Source check -- no GPU needed."""
+        from triton.language.extra.tlx.inductor.mm_templates import load_tlx_template
+
+        for name in (
+                "gfx942_mm_register",
+                "gfx950_addmm_interwave",
+                "gfx950_addmm_persistent_warppipe",
+                "gfx950_addmm_warppipe",
+                "gfx950_bmm_warppipe",
+                "gfx950_mm_local_split_u",
+                "gfx950_mm_persistent",
+                "gfx950_mm_register",
+        ):
+            src = load_tlx_template(name)
+            self.assertIsNone(re.search(r"tl\.assume\(stride_\w+ > 0\)", src), name)
+            self.assertIn("tl.assume(stride_am >= 0)", src)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe bmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_bmm_warppipe_zero_stride_m(self):
+        """M=1 bmm whose A has a 0 stride on the size-1 M dim, with a dynamic batch (the faulting
+        production bmm: batch=8*s, m=1, n=32, k=4 -> register path). With a strict stride assume
+        every launch of the TLX candidate trapped (HSA_STATUS_ERROR_EXCEPTION, SIGABRT)."""
+        batch, M, K, N = 24576, 1, 4, 32
+        a = torch.randn(batch * K, device=GPU_TYPE, dtype=torch.float16).as_strided((batch, M, K), (K, 0, 1))
+        b = torch.randn(batch, K, N, device=GPU_TYPE, dtype=torch.float16)
+        torch._dynamo.mark_dynamic(a, 0)
+        torch._dynamo.mark_dynamic(b, 0)
+
+        def bmm(a, b):
+            return torch.bmm(a, b)
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+                # With coordinate descent on, the bmm decomposition turns an m == 1 bmm into mul+sum.
+                "coordinate_descent_tuning": False,
+        }):
+            c_actual, code = run_and_get_code(torch.compile(bmm), a, b)
+
+        c_expected = torch.bmm(a.float(), b.float()).to(torch.float16)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_addmm_warppipe_broadcast_a(self):
+        """addmm whose A is a broadcast row (stride_am == 0). With a strict stride assume every
+        TLX addmm candidate compiled to a lone `s_trap 2` and its benchmark launch aborted the
+        process. Odd K selects the register path (USE_ASYNC=0)."""
+        M, K, N = 512, 255, 256
+        a = torch.randn(1, K, device=GPU_TYPE, dtype=torch.float16).expand(M, K)
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=torch.float16)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=torch.float16)
+
+        def addmm(bias, a, w):
+            return torch.addmm(bias, a, w.t())
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+        }):
+            c_actual, code = run_and_get_code(torch.compile(addmm), bias, a, w)
+
+        c_expected = (a.float() @ w.t().float() + bias.float()).to(torch.float16)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX mm templates",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_mm_broadcast_a(self):
+        """mm whose A is a broadcast row (stride_am == 0); the gfx950 register, local-split-U and
+        persistent mm templates used to trap on it like the warp-pipe templates."""
+        M, K, N = 512, 256, 256
+        a = torch.randn(1, K, device=GPU_TYPE, dtype=torch.float16).expand(M, K)
+        b = torch.randn(K, N, device=GPU_TYPE, dtype=torch.float16)
+
+        def mm(a, b):
+            return torch.mm(a, b)
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+        }):
+            c_actual, code = run_and_get_code(torch.compile(mm), a, b)
+
+        c_expected = (a.float() @ b.float()).to(torch.float16)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem", "\n".join(code))
+
     @unittest.skipIf(
         not is_gfx950(),
         "Need AMD MI350X (gfx950) for the TLX persistent warp-pipe addmm template",
