@@ -1,6 +1,6 @@
 add_triton_ut(
   NAME TestTritonAnalysis
-  SRCS UtilityTest.cpp
+  SRCS UtilityTest.cpp CallGraphTest.cpp
   LIBS
     TritonAnalysis
     TritonIR
