@@ -406,6 +406,97 @@ bool proveLaunchOwnership(SrStoreOp store) {
   return base && !conflict;
 }
 
+bool structuralIndex(Value value, DenseSet<Value> &varying,
+                     bool uniformLoads = false) {
+  APInt integer;
+  if (matchPattern(value, m_ConstantInt(&integer)))
+    return true;
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    if (isa<FuncOp>(argument.getOwner()->getParentOp()))
+      return isa<IntegerType>(value.getType());
+    auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
+    if (!loop || argument != loop.getInductionVar())
+      return false;
+    varying.insert(value);
+    return true;
+  }
+  auto *op = value.getDefiningOp();
+  if (!op)
+    return false;
+  if (isa<MakeRangeOp, GetProgramIdOp>(op)) {
+    varying.insert(value);
+    return true;
+  }
+  if (auto load = dyn_cast<LoadOp>(op))
+    return uniformLoads && isa<IntegerType>(load.getType()) &&
+           isa<PointerType>(load.getPtr().getType());
+  if (!isa<SplatOp, BroadcastOp, ExpandDimsOp, arith::ExtSIOp, arith::ExtUIOp,
+           arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp,
+           arith::DivUIOp, arith::MinSIOp, arith::MinUIOp>(op))
+    return false;
+  return llvm::all_of(op->getOperands(), [&](Value operand) {
+    return structuralIndex(operand, varying, uniformLoads);
+  });
+}
+
+Value declaredPointerBase(Value pointer, DenseSet<Value> &varying) {
+  auto *op = pointer.getDefiningOp();
+  if (op && isa<SplatOp, BroadcastOp, ExpandDimsOp, BitcastOp>(op))
+    return declaredPointerBase(op->getOperand(0), varying);
+  if (auto addptr = pointer.getDefiningOp<AddPtrOp>()) {
+    if (!structuralIndex(addptr.getOffset(), varying, true))
+      return {};
+    return declaredPointerBase(addptr.getPtr(), varying);
+  }
+  auto argument = dyn_cast<BlockArgument>(pointer);
+  return argument && isa<FuncOp>(argument.getOwner()->getParentOp()) ? pointer
+                                                                     : Value();
+}
+
+bool proveDeclaredOwnership(SrStoreOp store) {
+  DenseSet<Value> physical, logical;
+  auto base = declaredPointerBase(store.getPtr(), physical);
+  if (!base || !structuralIndex(store.getLogicalIndex(), logical) ||
+      physical != logical)
+    return false;
+  for (Operation *parent = store->getParentOp(); !isa<FuncOp>(parent);
+       parent = parent->getParentOp()) {
+    auto loop = dyn_cast<scf::ForOp>(parent);
+    APInt step;
+    DenseSet<Value> bounds;
+    if (!loop || !physical.contains(loop.getInductionVar()) ||
+        !matchPattern(loop.getStep(), m_ConstantInt(&step)) ||
+        step.getSExtValue() <= 0 ||
+        !structuralIndex(loop.getLowerBound(), bounds, true) ||
+        !structuralIndex(loop.getUpperBound(), bounds, true))
+      return false;
+  }
+  bool invalid = false;
+  store->getParentOfType<FuncOp>().walk([&](Operation *other) {
+    if (other == store.getOperation())
+      return;
+    if (isa<CallOp>(other))
+      invalid = true;
+    if (auto effects = dyn_cast<MemoryEffectOpInterface>(other)) {
+      SmallVector<MemoryEffects::EffectInstance> instances;
+      effects.getEffects(instances);
+      for (auto &effect : instances) {
+        if (!isa<MemoryEffects::Write>(effect.getEffect()))
+          continue;
+        Value pointer;
+        if (auto ordinary = dyn_cast<StoreOp>(other))
+          pointer = ordinary.getPtr();
+        else if (auto annotated = dyn_cast<SrStoreOp>(other))
+          pointer = annotated.getPtr();
+        DenseSet<Value> dimensions;
+        invalid |= !pointer || pointer == store.getPtr() ||
+                   !declaredPointerBase(pointer, dimensions);
+      }
+    }
+  });
+  return !invalid;
+}
+
 } // namespace
 } // namespace mlir::triton
 #endif
