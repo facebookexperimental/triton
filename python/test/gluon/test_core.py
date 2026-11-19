@@ -2955,13 +2955,15 @@ def test_amd_mfma_scaled(M, N, K, a_type, b_type, cd_regclass, has_scale, device
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires CDNA4")
-def test_amd_mfma_scaled_fp6(device='cuda'):
+@pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("b_format", ["e2m3", "e3m2"])
+def test_amd_mfma_scaled_fp6(a_format, b_format, device='cuda'):
     # Manual K=96 (one 16x16x128 step) lowers natively; wider FP6 decomposes.
     M, N, K = 32, 32, 128
 
     @gluon.jit
-    def kernel(out_ptr, a_ptr, b_ptr, a_scale_ptr, b_scale_ptr,
-               M: ttgl.constexpr, N: ttgl.constexpr, K: ttgl.constexpr):
+    def kernel(out_ptr, a_ptr, b_ptr, a_scale_ptr, b_scale_ptr, M: ttgl.constexpr, N: ttgl.constexpr, K: ttgl.constexpr,
+               A_FORMAT: ttgl.constexpr, B_FORMAT: ttgl.constexpr):
         mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True,
                                                              warps_per_cta=[2, 2])
         a_load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [8, 8], [4, 1], [1, 0])
@@ -2986,34 +2988,42 @@ def test_amd_mfma_scaled_fp6(device='cuda'):
         b_scale_offs_k = ttgl.arange(0, K // 32, layout=ttgl.SliceLayout(0, b_scale_layout))[None, :]
         b_scale = ttgl.amd.cdna4.buffer_load(b_scale_ptr, b_scale_offs_n * (K // 32) + b_scale_offs_k)
         zero = ttgl.zeros([M, N], dtype=ttgl.float32, layout=mfma_layout)
-        c = ttgl.amd.cdna4.mfma_scaled(a, a_scale, "e2m3", b, b_scale, "e3m2", zero)
+        c = ttgl.amd.cdna4.mfma_scaled(a, a_scale, A_FORMAT, b, b_scale, B_FORMAT, zero)
         c = c.to(ttgl.bfloat16)
         out_offs_m = ttgl.arange(0, M)[:, None]
         out_offs_n = ttgl.arange(0, N)[None, :]
         ttgl.amd.cdna4.buffer_store(c, out_ptr, out_offs_m * N + out_offs_n)
 
     torch.manual_seed(0)
-    a_mx = MXFP6Tensor(size=(M, K), device=device, e=2).random()
+    a_mx = MXFP6Tensor(size=(M, K), device=device, e=2 if a_format == "e2m3" else 3).random()
     # No padding: operands carry one code per byte; the ScaledMFMA
     # lowering dense-packs each lane's 32 codes into 24 bytes.
     a = a_mx.data
     # B operand for the kernel is [K, N]: transpose its codes.
-    b_codes = MXFP6Tensor(size=(N, K), device=device, e=3).random()
+    b_codes = MXFP6Tensor(size=(N, K), device=device, e=2 if b_format == "e2m3" else 3).random()
     b = b_codes.data.T.contiguous()
     b_ref_t = b_codes.to(torch.float32)
     a_scale_mx = MXScaleTensor(size=(M, K // 32)).random(1 / 32, 32)
     b_scale_mx = MXScaleTensor(size=(N, K // 32)).random(1 / 32, 32)
     out = torch.empty((M, N), dtype=torch.bfloat16, device=device)
-    compiled = kernel[(1, )](out, a, b, a_scale_mx.data.to(device), b_scale_mx.data.to(device), M, N, K, num_warps=4)
+    compiled = kernel[(1, )](out, a, b, a_scale_mx.data.to(device), b_scale_mx.data.to(device), M, N, K, a_format,
+                             b_format, num_warps=4)
     a_ref = a_mx.to(torch.float32) * a_scale_mx.to(torch.float32).repeat_interleave(32, dim=1).to(device)
     b_ref = b_ref_t * b_scale_mx.to(torch.float32).repeat_interleave(32, dim=1).to(device)
     torch.testing.assert_close(out.float(), a_ref @ b_ref.T, rtol=2e-2, atol=5.0)
-    assert 'v_mfma_scale_f32_16x16x128_f8f6f4' in compiled.asm['amdgcn']
+    instructions = [line for line in compiled.asm['amdgcn'].splitlines() if 'v_mfma' in line]
+    cbsz = 2 if b_format == "e2m3" else 3
+    blgp = 2 if a_format == "e2m3" else 3
+    assert instructions
+    assert all('v_mfma_scale_f32_16x16x128_f8f6f4' in line and f'cbsz:{cbsz}' in line and f'blgp:{blgp}' in line
+               for line in instructions)
     assert 'v_mfma_f32_16x16x32_bf16' not in compiled.asm['amdgcn']
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires CDNA4")
-def test_amd_mfma_scaled_fp6_packed(device='cuda'):
+@pytest.mark.parametrize("a_format", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("b_format", ["e2m3", "e3m2"])
+def test_amd_mfma_scaled_fp6_packed(a_format, b_format, device='cuda'):
     # Packed producer: global storage is dense-packed (96 bytes per
     # 128 codes); loads address per-fragment packed bytes directly
     # and the lowering consumes them (amdg.fp6_packed), with no
@@ -3021,8 +3031,8 @@ def test_amd_mfma_scaled_fp6_packed(device='cuda'):
     M, N, K = 32, 32, 128
 
     @gluon.jit
-    def kernel(out_ptr, a_ptr, b_ptr, a_scale_ptr, b_scale_ptr,
-               M: ttgl.constexpr, N: ttgl.constexpr, K: ttgl.constexpr):
+    def kernel(out_ptr, a_ptr, b_ptr, a_scale_ptr, b_scale_ptr, M: ttgl.constexpr, N: ttgl.constexpr, K: ttgl.constexpr,
+               A_FORMAT: ttgl.constexpr, B_FORMAT: ttgl.constexpr):
         mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True,
                                                              warps_per_cta=[2, 2])
         a_load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [8, 8], [4, 1], [1, 0])
@@ -3054,7 +3064,7 @@ def test_amd_mfma_scaled_fp6_packed(device='cuda'):
         b_scale_offs_k = ttgl.arange(0, K // 32, layout=ttgl.SliceLayout(0, b_scale_layout))[None, :]
         b_scale = ttgl.amd.cdna4.buffer_load(b_scale_ptr, b_scale_offs_n * (K // 32) + b_scale_offs_k)
         zero = ttgl.zeros([M, N], dtype=ttgl.float32, layout=mfma_layout)
-        c = ttgl.amd.cdna4.mfma_scaled(a, a_scale, "e2m3", b, b_scale, "e3m2", zero, packed=True)
+        c = ttgl.amd.cdna4.mfma_scaled(a, a_scale, A_FORMAT, b, b_scale, B_FORMAT, zero, packed=True)
         c = c.to(ttgl.bfloat16)
         out_offs_m = ttgl.arange(0, M)[:, None]
         out_offs_n = ttgl.arange(0, N)[None, :]
@@ -3071,19 +3081,25 @@ def test_amd_mfma_scaled_fp6_packed(device='cuda'):
         return packed.reshape(rows, k * 3 // 4).to(torch.uint8)
 
     torch.manual_seed(0)
-    a_mx = MXFP6Tensor(size=(M, K), device=device, e=2).random()
+    a_mx = MXFP6Tensor(size=(M, K), device=device, e=2 if a_format == "e2m3" else 3).random()
     a = _pack_dense(a_mx.data)
-    b_codes = MXFP6Tensor(size=(N, K), device=device, e=3).random()
+    b_codes = MXFP6Tensor(size=(N, K), device=device, e=2 if b_format == "e2m3" else 3).random()
     b = _pack_dense(b_codes.data).T.contiguous()
     b_ref_t = b_codes.to(torch.float32)
     a_scale_mx = MXScaleTensor(size=(M, K // 32)).random(1 / 32, 32)
     b_scale_mx = MXScaleTensor(size=(N, K // 32)).random(1 / 32, 32)
     out = torch.empty((M, N), dtype=torch.bfloat16, device=device)
-    compiled = kernel[(1, )](out, a, b, a_scale_mx.data.to(device), b_scale_mx.data.to(device), M, N, K, num_warps=4)
+    compiled = kernel[(1, )](out, a, b, a_scale_mx.data.to(device), b_scale_mx.data.to(device), M, N, K, a_format,
+                             b_format, num_warps=4)
     a_ref = a_mx.to(torch.float32) * a_scale_mx.to(torch.float32).repeat_interleave(32, dim=1).to(device)
     b_ref = b_ref_t * b_scale_mx.to(torch.float32).repeat_interleave(32, dim=1).to(device)
     torch.testing.assert_close(out.float(), a_ref @ b_ref.T, rtol=2e-2, atol=5.0)
-    assert 'v_mfma_scale_f32_16x16x128_f8f6f4' in compiled.asm['amdgcn']
+    instructions = [line for line in compiled.asm['amdgcn'].splitlines() if 'v_mfma' in line]
+    cbsz = 2 if b_format == "e2m3" else 3
+    blgp = 2 if a_format == "e2m3" else 3
+    assert instructions
+    assert all('v_mfma_scale_f32_16x16x128_f8f6f4' in line and f'cbsz:{cbsz}' in line and f'blgp:{blgp}' in line
+               for line in instructions)
 
 
 def test_math_fast_expf():
