@@ -733,12 +733,12 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
 
   template <typename Op, typename Adaptor>
   LogicalResult convertScaledDot(Op op, Adaptor adaptor) const {
-    // FP6 lowers natively only for K=128: one 16x16x128 step or two
-    // 32x32x64 steps (96-byte packed K, 128 logical values). Wider
-    // dots (e.g. K=256) must decompose earlier - fail cleanly, never
-    // crash. This is the same supported set as the native gate in
-    // AccelerateAMDMatmul.cpp, stated in both places so neither pass
-    // can silently drift from the other.
+    // FP6 lowers natively only for K=64/128: one 16x16x128 step, or
+    // one/two 32x32x64 steps (96-byte packed K for 128 logical
+    // values). Wider dots (e.g. K=256) must decompose earlier - fail
+    // cleanly, never crash. This is the same supported set as the
+    // native gate in AccelerateAMDMatmul.cpp, stated in both places
+    // so neither pass can silently drift from the other.
     if (isMXFP6ScaleType(scaledElemType(op, true)) ||
         isMXFP6ScaleType(scaledElemType(op, false))) {
       ArrayRef<unsigned> instr = mfmaLayout.getInstrShape();
@@ -746,19 +746,23 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
       // operand(s) are FP6, not just A.
       bool aNative =
           !isMXFP6ScaleType(scaledElemType(op, true)) ||
-          cast<RankedTensorType>(op.getA().getType()).getShape().back() == 128;
+          cast<RankedTensorType>(op.getA().getType()).getShape().back() ==
+              128 ||
+          cast<RankedTensorType>(op.getA().getType()).getShape().back() == 64;
       bool bNative =
           !isMXFP6ScaleType(scaledElemType(op, false)) ||
-          cast<RankedTensorType>(op.getB().getType()).getShape().front() == 128;
+          cast<RankedTensorType>(op.getB().getType()).getShape().front() ==
+              128 ||
+          cast<RankedTensorType>(op.getB().getType()).getShape().front() == 64;
       bool instrNative =
           (instr[0] == 16 && instr[1] == 16 && instr[2] == 128) ||
-          (instr[0] == 32 && instr[1] == 32 && instr[2] == 64);
+          (instr[0] == 32 && instr[1] == 32 && instr[2] == 64) ||
+          instr[2] == 64;
       if (!instrNative || !aNative || !bNative)
         return op.emitError(
-            "native ScaledMFMA for FP6 only supports K=128 as one "
-            "16x16x128 step or two 32x32x64 steps (96-byte packed K, "
-            "128 logical values) yet; decompose the scaled dot before "
-            "LLVM lowering");
+            "native ScaledMFMA for FP6 only supports K=64/128 as "
+            "16x16x128 or 32x32x64 steps yet; decompose the scaled "
+            "dot before LLVM lowering");
     }
     // Check if this dot has come with priority set by setprio.
     auto setPrioOp = dyn_cast_or_null<ROCDL::SetPrioOp>(op->getPrevNode());
