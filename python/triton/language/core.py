@@ -2233,8 +2233,9 @@ def sr_store(pointer, value, logical_index, site, mask=None, cache_modifier="", 
 
     Requires a kernel decorated with ``triton_stochastic_rounding``. Pointer
     and logical index must be matching, injective affine global indices. ABI
-    v1 supports one site, a one-dimensional launch, and seven or ten Philox
-    rounds. Masked lanes never store and do not advance another lane's stream.
+    v1 supports declared named sites that each occur exactly once, a
+    one-dimensional launch, and seven or ten Philox rounds. Masked lanes never
+    store and do not advance another lane's stream.
     """
     pointer = _semantic.to_tensor(pointer)
     value = _semantic.to_tensor(value)
