@@ -15,8 +15,8 @@ from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6 as mm_mxfp6_gfx950
 #       fbsource//third-party/triton/beta/triton:py_tlx_mm_mxfp6_perf -- \
 #       --shapes small --compare-mxfp8
 # On gfx950 (MI350X), the same binary dispatches to the CDNA4 backend;
-# use the imported AMD shape set:
-#   ... :py_tlx_mm_mxfp6_perf -- --shapes external
+# use the upstream README performance shapes:
+#   ... :py_tlx_mm_mxfp6_perf -- --shapes readme --split-k 4
 #
 # Prefix with third_party/tlx/denoise.sh for clock-locked numbers.
 
@@ -229,6 +229,27 @@ EXTERNAL_M2048 = [
     (4096, 3072, 105728),
 ]
 SHAPE_SETS["external"] = EXTERNAL_M2048
+
+# Performance-table dimensions from the upstream README:
+# https://github.com/eeezio/mxfp6-gemm/blob/53d78c5d0f78d165bcb9aaf51e8d14b4b5d064cc/README.md
+# README timings use E2M3 x E2M3 inputs and FP16 output.
+SHAPE_SETS["readme"] = [
+    (2048, 4096, 8192),
+    (2048, 8192, 8192),
+    (4096, 4096, 8192),
+    (4096, 8192, 8192),
+    (8192, 8192, 8192),
+    (2048, 1024, 12288),
+    (2048, 1024, 16128),
+    (2048, 1024, 105728),
+    (2048, 512, 6144),
+    (2048, 6144, 16128),
+    (2048, 6144, 512),
+    (2048, 6144, 4096),
+    (2048, 6144, 105728),
+    (1024, 12288, 105728),
+    (4096, 3072, 105728),
+]
 SHAPE_SETS["split_k"] = [
     (256, 256, 16384),
     (128, 1024, 64512),
@@ -281,8 +302,10 @@ if __name__ == "__main__":
     parser.add_argument("--M", type=int, default=None)
     parser.add_argument("--N", type=int, default=None)
     parser.add_argument("--K", type=int, default=None)
-    parser.add_argument("--shapes", type=str, default="small", choices=list(SHAPE_SETS),
-                        help="full includes all supported synthetic and Blackwell GEMM focus shapes")
+    parser.add_argument(
+        "--shapes", type=str, default="small", choices=list(SHAPE_SETS),
+        help="full includes supported synthetic and Blackwell focus shapes; "
+        "readme uses the upstream mxfp6-gemm README performance tables")
     parser.add_argument("--space", type=str, default="full", choices=["full", "heuristic"])
     parser.add_argument("--split-k", type=int, default=1, choices=[1, 2, 4, 8, 16],
                         help="compare an opt-in gfx950 native split-K candidate; --check/--ones check that candidate")
