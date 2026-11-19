@@ -212,6 +212,14 @@ public:
   virtual std::optional<std::string>
   getDescriptorUnsupportedReason(Operation *op, const LinearLayout &layout,
                                  StringRef target) const = 0;
+
+  // Whether an MMA-encoded NPOT tensor is legal at its shape on this
+  // target, or std::nullopt when this target does not own the tensor's
+  // MMA encoding and cannot judge it.
+  virtual std::optional<bool>
+  isMmaEncodedNpotTensorLegal(RankedTensorType type) const {
+    return std::nullopt;
+  }
 };
 
 // The ttg.target of `op`'s module, or "" if it has none.
@@ -232,6 +240,12 @@ getNpotDotSlowReason(Operation *dot, ArrayRef<NpotDotOperandAccess> operands,
 // The same for a global-to-shared async `copy` of mixed-radix `layout`.
 std::optional<std::string>
 getNpotAsyncCopyUnsupportedReason(Operation *copy, const LinearLayout &layout);
+
+// Whether the NpotTargetLegality matching `target` judges an
+// MMA-encoded NPOT tensor legal at its shape; without one that can
+// judge it, no.
+bool isNpotMmaEncodedTensorLegal(MLIRContext *ctx, StringRef target,
+                                 RankedTensorType type);
 
 // Whether store `op` takes getMixedRadixVector's predicated vector: unless its
 // value is computed elementwise from a tt.load (also through control flow),

@@ -282,7 +282,7 @@ tt.func @multi_buffer(%x: tensor<64xf32>) -> tensor<64xf32> {
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 tt.func @multi_buffer_npot_tile() {
-  // expected-remark @+2 {{NPOT mixed-radix layout is not yet supported for !ttg.memdesc<2x96xf32}}
+  // expected-remark @+2 {{NPOT mixed-radix layout is not yet supported on ttg.local_alloc}}
   // expected-error @+1 {{'ttg.local_alloc' op on an NPOT pointer-to-tensor, descriptor, memory descriptor or encoded tensor is unsupported}}
   %a = ttg.local_alloc : () -> !ttg.memdesc<2x96xf32, #shared, #smem, mutable>
   tt.return

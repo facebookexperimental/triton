@@ -2415,6 +2415,11 @@ namespace {
 struct AmdNpotTargetLegality : public tt::NpotTargetLegality {
   using NpotTargetLegality::NpotTargetLegality;
   StringRef getTargetPrefix() const override { return "hip"; }
+  // AMD owns no Nvidia MMA encoding, so it judges none legal.
+  std::optional<bool>
+  isMmaEncodedNpotTensorLegal(RankedTensorType) const override {
+    return false;
+  }
   std::optional<std::string>
   getDotUnsupportedReason(Operation *op, const tt::LinearLayout &,
                           StringRef target, int numWarps,
