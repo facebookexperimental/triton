@@ -1588,6 +1588,20 @@ struct NvidiaNpotTargetLegality : public NpotTargetLegality {
   std::optional<std::string>
   getDotUnsupportedReason(Operation *op, const LinearLayout &, StringRef target,
                           int numWarps, int) const override {
+    // A warp-group dot already picked wgmma: exact when the shape checks
+    // below pass (BlockedToMMA separately checks warps and B tiling).
+    if (auto wg = dyn_cast<nvidia_gpu::WarpGroupDotOp>(op)) {
+      ArrayRef<int64_t> shape = wg.getType().getShape();
+      int64_t k = wg.getA().getType().getShape().back();
+      auto instr = mmaVersionToInstrShape(3, {shape[0], shape[1]},
+                                          wg.getA().getType().getElementType(),
+                                          numWarps);
+      if (isNpotMmaEncodedTensorLegal(op->getContext(), target, wg.getType()) &&
+          instr[2] != 0 && k % instr[2] == 0)
+        return std::nullopt;
+      return ("NPOT warp-group dot shape is not yet supported on " + target)
+          .str();
+    }
     // Exact only where BlockedToMMA picks wgmma or mma.sync alone; f64 takes
     // FMA on some targets.
     auto dot = dyn_cast<DotOp>(op);
@@ -1626,6 +1640,29 @@ struct NvidiaNpotTargetLegality : public NpotTargetLegality {
   getAsyncCopyUnsupportedReason(Operation *, const LinearLayout &,
                                 StringRef) const override {
     return std::nullopt;
+  }
+  // Judged by the instruction-shape producer, so admission and
+  // production cannot disagree: it returns a zero instruction for
+  // shapes it cannot tile. Its v3 path asserts on shapes failing
+  // its own row/column gates, so only ask it about shapes that
+  // pass them.
+  std::optional<bool>
+  isMmaEncodedNpotTensorLegal(RankedTensorType type) const override {
+    auto mma = dyn_cast<gpu::NvidiaMmaEncodingAttr>(type.getEncoding());
+    if (!mma)
+      return std::nullopt;
+    ArrayRef<int64_t> shape = type.getShape();
+    if (shape.size() != 2)
+      return false;
+    int version = mma.getVersionMajor();
+    if (version != 2 && version != 3)
+      return false;
+    if (version == 3 && (shape[0] % 64 != 0 || shape[1] % 8 != 0))
+      return false;
+    auto instr = mmaVersionToInstrShape(version, shape, type.getElementType(),
+                                        /*numWarps=*/1);
+    return instr[0] != 0 && instr[1] != 0 && shape[0] % instr[0] == 0 &&
+           shape[1] % instr[1] == 0;
   }
   // TMA moves the tile through shared memory on the descriptor's layout, the
   // default NVMMA one until OptimizeDescriptorEncoding sets it.

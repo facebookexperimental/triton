@@ -270,3 +270,23 @@ tt.func @atomic_cas_join(%ptr: !tt.ptr<i32>) {
   %r = tt.atomic_cas acq_rel, gpu, %p, %v, %v : (tensor<96x!tt.ptr<i32>>, tensor<96xi32>, tensor<96xi32>) -> tensor<96xi32>
   tt.return
 }
+
+// -----
+
+// An identity reshape may reorder its elements, so it is no
+// pass-through: when its component pads, allow_reorder clears.
+// CHECK-LABEL: @sum_reshape_reorder
+tt.func @sum_reshape_reorder(%ptr: !tt.ptr<f32>) {
+  // expected-remark @+1 {{NPOT tensors pad: their mixed-radix layouts take 1152 registers x lanes x warps, their pow2 layouts 384}}
+  %p = tt.splat %ptr : !tt.ptr<f32> -> tensor<96x!tt.ptr<f32>>
+  %x = tt.load %p : tensor<96x!tt.ptr<f32>>
+  %r = tt.reshape %x allow_reorder : tensor<96xf32> -> tensor<96xf32>
+  // CHECK: tt.reshape %{{[^ ]*}} : tensor<128xf32> -> tensor<128xf32>
+  // CHECK-NOT: allow_reorder
+  %s = "tt.reduce"(%r) <{axis = 0 : i32}> ({
+  ^bb0(%a: f32, %b: f32):
+    %c = arith.addf %a, %b : f32
+    tt.reduce.return %c : f32
+  }) : (tensor<96xf32>) -> f32
+  tt.return
+}

@@ -7,6 +7,7 @@
 #tmem_space = #ttng.tensor_memory
 #smem = #ttg.shared_memory
 #shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 4, order = [1, 0]}>
+#swz = #ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 4, order = [1, 0]}>
 #nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #nvmma_i8 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
 #sl = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [1, 0], [2, 0], [4, 0]]}, alignment = 16>
@@ -66,4 +67,24 @@ module {
   tt.func @runtime_enlarged_pow2_alloc(%view: !nvmma_runtime_view) {
     tt.return
   }
+
+  // An NPOT-extent view at the start of its pow2-cover alloc (the logical
+  // tile NpotPad's alloc rule produces) keeps the swizzle pattern.
+  tt.func @npot_extent_prefix_subslice() {
+    %a = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+    %v = ttg.memdesc_subslice %a [0, 0]
+        : !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+        -> !ttg.memdesc<64x104xf16, #nvmma, #smem, mutable, 64x128>
+    tt.return
+  }
+
+  // The same exemption on the first dim, up to its pow2 cover; the
+  // flag-off rejection is pinned in invalid-npot-memdesc-pow2-alloc.mlir.
+  tt.func @npot_first_dim_prefix_subslice(%a: !ttg.memdesc<16x8xf16, #swz, #smem, mutable>) {
+    %v = ttg.memdesc_subslice %a [0, 0]
+        : !ttg.memdesc<16x8xf16, #swz, #smem, mutable>
+        -> !ttg.memdesc<12x8xf16, #swz, #smem, mutable, 16x8>
+    tt.return
+  }
+
 }

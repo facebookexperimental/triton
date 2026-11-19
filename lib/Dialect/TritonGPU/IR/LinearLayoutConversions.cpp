@@ -1501,11 +1501,15 @@ LinearLayout TritonGPUDialect::toLinearLayout(ArrayRef<int64_t> shape,
     result = distributed.toLinearLayout(shape);
   } else {
     SmallVector<int64_t> pow2AllocShape = getNpotPow2AllocShape(shape);
-    assert(llvm::all_of(pow2AllocShape,
+    // With NPOT off the shape is used as-is: a memdesc's leading dimension
+    // may be NPOT (e.g. a staging extent), so only the NPOT-on rounding is
+    // required to land on power-of-two extents.
+    assert(!triton::tools::isNpotAllowed() ||
+           llvm::all_of(pow2AllocShape,
                         [](int64_t dim) {
                           return llvm::isPowerOf2_32(dim) && dim >= 1;
                         }) &&
-           "shape must be a postive power of 2");
+               "shape must be a postive power of 2");
     if (auto shared = dyn_cast<SharedEncodingTrait>(layout)) {
       FailureOr<LinearLayout> dense = failure();
       // A padded layout has no linear layout, dense or not.
@@ -1719,7 +1723,10 @@ LinearLayout combineCtaCgaWithShape(LinearLayout ctaLayout,
   ctaLayout = ensureLayoutNotLargerThan(ctaLayout, outDimNames, shapePerCTA);
 
   LinearLayout ret = (ctaLayout * cgaLayout).transposeOuts(outDimNames);
-  assert(llvm::equal(ret.getOutDimSizes(), layoutShape));
+  // With NPOT off the layout is built on the shape as-is, whose leading
+  // dimension may be NPOT; only the NPOT-on pow2 cover must match exactly.
+  assert(!triton::tools::isNpotAllowed() ||
+         llvm::equal(ret.getOutDimSizes(), layoutShape));
   return ret;
 }
 

@@ -328,7 +328,7 @@ Value emitCanonicalLayoutOwnerPredicate(
 
 void forEachMixedRadixSharedRun(
     Location loc, RewriterBase &rewriter, const LinearLayout &regLayout,
-    const LinearLayout &toOffset, int32_t run,
+    const LinearLayout &toOffset, int32_t run, ArrayRef<Value> origin,
     function_ref<void(int32_t, Value, ArrayRef<std::pair<StringAttr, Value>>)>
         access) {
   MLIRContext *ctx = rewriter.getContext();
@@ -342,10 +342,12 @@ void forEachMixedRadixSharedRun(
                               : dim == str_attr("lane") ? laneId
                               : dim == str_attr("warp") ? warpId
                                                         : b.i32_val(0)});
-    Value offset = applyLinearLayout(
-                       loc, rewriter, toOffset,
-                       applyLinearLayout(loc, rewriter, regLayout, indices))[0]
-                       .second;
+    auto coords = applyLinearLayout(loc, rewriter, regLayout, indices);
+    assert((origin.empty() || origin.size() == coords.size()) &&
+           "origin must have one offset per coordinate");
+    for (auto [i, start] : llvm::enumerate(origin))
+      coords[i].second = b.add(coords[i].second, start);
+    Value offset = applyLinearLayout(loc, rewriter, toOffset, coords)[0].second;
     access(reg, offset, indices);
   }
 }

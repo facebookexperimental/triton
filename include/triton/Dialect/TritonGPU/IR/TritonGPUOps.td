@@ -75,7 +75,8 @@ def TTG_ConvertLayoutOp
 def TTG_RequireLayoutOp
     : TTG_Op<"require_layout", [SameOperandsAndResultShape,
                                 SameOperandsAndResultElementType,
-                                AxisInfoPassthroughTrait, Pure]> {
+                                AxisInfoPassthroughTrait, MixedRadixLayoutTrait,
+                                Pure]> {
   let summary = "preserve a user-requested layout boundary";
 
   let description = [{
@@ -96,7 +97,8 @@ def TTG_RequireLayoutOp
 def TTG_ReleaseLayoutOp
     : TTG_Op<"release_layout", [SameOperandsAndResultShape,
                                 SameOperandsAndResultElementType,
-                                AxisInfoPassthroughTrait, Pure]> {
+                                AxisInfoPassthroughTrait, MixedRadixLayoutTrait,
+                                Pure]> {
   let summary = "end a user-requested layout region";
 
   let description = [{
@@ -497,7 +499,7 @@ def TTG_LocalLoadOp
   let hasVerifier = 1;
 }
 
-def TTG_LocalStoreOp : TTG_Op<"local_store"> {
+def TTG_LocalStoreOp : TTG_Op<"local_store", [MixedRadixLayoutTrait]> {
   let summary = "Store a distributed tensor into a buffer in local memory";
 
   let description = [{
