@@ -2227,6 +2227,40 @@ def full(shape, value, dtype, _semantic=None):
     return _semantic.full(shape, value, dtype)
 
 
+@builtin
+def sr_store(pointer, value, logical_index, site, mask=None, cache_modifier="", eviction_policy="", _semantic=None):
+    """Mark one final FP32-to-BF16 global write for stochastic rounding.
+
+    Requires a kernel decorated with ``triton_stochastic_rounding``. Pointer
+    and logical index must be matching, injective affine global indices. ABI
+    v1 supports one site, a one-dimensional launch, and seven or ten Philox
+    rounds. Masked lanes never store and do not advance another lane's stream.
+    """
+    pointer = _semantic.to_tensor(pointer)
+    value = _semantic.to_tensor(value)
+    logical_index = _semantic.to_tensor(logical_index)
+    site = _unwrap_if_constexpr(site)
+    if not isinstance(site, str) or not site:
+        raise ValueError("sr_store requires a nonempty compile-time site name")
+    if not pointer.dtype.is_ptr() or pointer.dtype.element_ty != bfloat16 or value.dtype != float32:
+        raise ValueError("sr_store requires ordinary BF16 pointers and an FP32 value")
+    if pointer.shape != value.shape or pointer.shape != logical_index.shape:
+        raise ValueError("sr_store pointer, value and logical_index must have the same shape")
+    if not logical_index.dtype.is_int():
+        raise ValueError("sr_store logical_index must be integer")
+    index_type = int64 if logical_index.dtype.is_int_signed() else uint64
+    logical_index = _semantic.cast(logical_index, index_type)
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+        if mask.dtype != int1:
+            raise ValueError("sr_store mask must be boolean")
+        mask = _semantic.broadcast_impl_shape(mask, pointer.shape)
+    cache = _semantic._str_to_store_cache_modifier(_unwrap_if_constexpr(cache_modifier))
+    eviction = _semantic._str_to_eviction_policy(_unwrap_if_constexpr(eviction_policy))
+    return _semantic.builder.create_sr_store(pointer.handle, value.handle, logical_index.handle,
+                                             None if mask is None else mask.handle, site, cache, eviction)
+
+
 # -----------------------
 # Shape Manipulation
 # -----------------------
