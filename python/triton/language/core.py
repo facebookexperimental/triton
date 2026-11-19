@@ -2243,8 +2243,8 @@ def sr_store(pointer, value, logical_index, site, mask=None, cache_modifier="", 
     site = _unwrap_if_constexpr(site)
     if not isinstance(site, str) or not site:
         raise ValueError("sr_store requires a nonempty compile-time site name")
-    if not pointer.dtype.is_ptr() or pointer.dtype.element_ty != bfloat16 or value.dtype != float32:
-        raise ValueError("sr_store requires ordinary BF16 pointers and an FP32 value")
+    if not pointer.dtype.is_ptr() or not pointer.dtype.element_ty.is_floating() or not value.dtype.is_floating():
+        raise ValueError("sr_store requires ordinary floating-point pointers and values")
     if pointer.shape != value.shape or pointer.shape != logical_index.shape:
         raise ValueError("sr_store pointer, value and logical_index must have the same shape")
     if not logical_index.dtype.is_int():
