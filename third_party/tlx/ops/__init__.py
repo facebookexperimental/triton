@@ -122,13 +122,14 @@ from ._normalization import (
 
 __all__ = [
     "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
-    "moe_routing", "moe_router_topk_align", "norm_residual_norm", "rmsnorm_gate", "router_gemm",
-    "qk_norm_rope_kv_cache", "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8",
-    "flash_attn_varlen", "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn",
-    "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
-    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "paged_attention_decode",
-    "paged_attention_prefill", "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d",
-    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "moe_routing", "moe_router_topk_align", "norm_residual_norm", "all_reduce", "all_reduce_workspace",
+    "all_reduce_norm_residual_norm", "rmsnorm_gate", "router_gemm", "qk_norm_rope_kv_cache", "addmm", "addmm_mul_add",
+    "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen", "linear_rowscale",
+    "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn",
+    "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode", "prepare_flash_attn_varlen_backward",
+    "flash_attn_varlen_backward", "paged_attention_decode", "paged_attention_prefill",
+    "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d", "UnsupportedOp",
+    "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'paged_attention_decode_fp8', 'paged_attention_decode_fp8_workspace', 'compute_norm_nvfp4_global_scale',
@@ -852,6 +853,46 @@ def moe_routing(router_logits, correction_bias, topk=8, *, router_multiplier=1.0
         return fn(router_logits, correction_bias, topk, router_multiplier, route_scale, eps, num_valid_tokens, out)
 
 
+def _check_boundary_inputs(op, stream, branch, post_weight, pre_weight, alpha, beta, out, new_stream):
+    """Validate a residual-stream boundary call; returns its tensors (inputs, then given outputs) and ``H``."""
+    import torch
+
+    if not isinstance(stream, torch.Tensor) or not isinstance(branch, torch.Tensor):
+        raise InvalidInput(f"tlx.ops.{op} expects tensor stream and branch")
+    if (stream.ndim != 2 or stream.shape != branch.shape or stream.dtype != torch.float32
+            or branch.dtype != torch.bfloat16 or not stream.is_contiguous() or not branch.is_contiguous()):
+        raise InvalidInput(f"tlx.ops.{op} expects contiguous FP32 stream and BF16 branch of one "
+                           f"(T, H) shape; got {tuple(stream.shape)} {stream.dtype} and {tuple(branch.shape)} "
+                           f"{branch.dtype}")
+    T, H = branch.shape
+    for name, w in (("post_weight", post_weight), ("pre_weight", pre_weight)):
+        if w is not None and (not isinstance(w, torch.Tensor) or w.shape != (H, ) or w.dtype != torch.bfloat16
+                              or not w.is_contiguous()):
+            raise InvalidInput(f"tlx.ops.{op} expects a contiguous BF16 {name} of shape ({H},)")
+    if (alpha is None) != (beta is None):
+        raise InvalidInput(f"tlx.ops.{op} expects alpha and beta together")
+    if alpha is not None and any(not isinstance(g, torch.Tensor) or g.shape not in (
+        (H, ), (1, )) or g.dtype != torch.float32 or not g.is_contiguous() or g.shape != alpha.shape
+                                 for g in (alpha, beta)):
+        raise InvalidInput(f"tlx.ops.{op} expects contiguous FP32 alpha and beta of shape ({H},) "
+                           "or (1,)")
+    inputs = tuple(t for t in (stream, branch, post_weight, pre_weight, alpha, beta) if t is not None)
+    outputs = []
+    for name, buf, dtype in (("out", out, torch.bfloat16), ("new_stream", new_stream, torch.float32)):
+        if buf is None:
+            continue
+        if not isinstance(buf, torch.Tensor) or buf.shape != (T, H) or buf.dtype != dtype or not buf.is_contiguous():
+            raise InvalidInput(f"tlx.ops.{op} expects a contiguous {dtype} {name} of shape "
+                               f"({T}, {H})")
+        if any(torch._C._overlaps(buf, t) for t in (*inputs, *outputs)):
+            raise InvalidInput(f"tlx.ops.{op} {name} must not alias an input or output")
+        outputs.append(buf)
+    if any(t.device != branch.device for t in (*inputs, *outputs)):
+        raise InvalidInput(f"tlx.ops.{op} expects all tensors on one device")
+
+    return (*inputs, *outputs), H
+
+
 def norm_residual_norm(stream, branch, *, post_weight=None, post_norm_input_scale=False, pre_weight=None, alpha=None,
                        beta=None, post_eps=1e-6, pre_eps=1e-6, pre_norm_bf16=False, out=None, new_stream=None,
                        space=None):
@@ -870,48 +911,97 @@ def norm_residual_norm(stream, branch, *, post_weight=None, post_norm_input_scal
     """
     import torch
 
-    if not isinstance(stream, torch.Tensor) or not isinstance(branch, torch.Tensor):
-        raise InvalidInput("tlx.ops.norm_residual_norm expects tensor stream and branch")
-    if (stream.ndim != 2 or stream.shape != branch.shape or stream.dtype != torch.float32
-            or branch.dtype != torch.bfloat16 or not stream.is_contiguous() or not branch.is_contiguous()):
-        raise InvalidInput("tlx.ops.norm_residual_norm expects contiguous FP32 stream and BF16 branch of one "
-                           f"(T, H) shape; got {tuple(stream.shape)} {stream.dtype} and {tuple(branch.shape)} "
-                           f"{branch.dtype}")
-    T, H = branch.shape
-    for name, w in (("post_weight", post_weight), ("pre_weight", pre_weight)):
-        if w is not None and (not isinstance(w, torch.Tensor) or w.shape != (H, ) or w.dtype != torch.bfloat16
-                              or not w.is_contiguous()):
-            raise InvalidInput(f"tlx.ops.norm_residual_norm expects a contiguous BF16 {name} of shape ({H},)")
-    if (alpha is None) != (beta is None):
-        raise InvalidInput("tlx.ops.norm_residual_norm expects alpha and beta together")
-    if alpha is not None and any(not isinstance(g, torch.Tensor) or g.shape not in (
-        (H, ), (1, )) or g.dtype != torch.float32 or not g.is_contiguous() or g.shape != alpha.shape
-                                 for g in (alpha, beta)):
-        raise InvalidInput(f"tlx.ops.norm_residual_norm expects contiguous FP32 alpha and beta of shape ({H},) "
-                           "or (1,)")
-    inputs = tuple(t for t in (stream, branch, post_weight, pre_weight, alpha, beta) if t is not None)
-    outputs = []
-    for name, buf, dtype in (("out", out, torch.bfloat16), ("new_stream", new_stream, torch.float32)):
-        if buf is None:
-            continue
-        if not isinstance(buf, torch.Tensor) or buf.shape != (T, H) or buf.dtype != dtype or not buf.is_contiguous():
-            raise InvalidInput(f"tlx.ops.norm_residual_norm expects a contiguous {dtype} {name} of shape "
-                               f"({T}, {H})")
-        if any(torch._C._overlaps(buf, t) for t in (*inputs, *outputs)):
-            raise InvalidInput(f"tlx.ops.norm_residual_norm {name} must not alias an input or output")
-        outputs.append(buf)
-    if any(t.device != branch.device for t in (*inputs, *outputs)):
-        raise InvalidInput("tlx.ops.norm_residual_norm expects all tensors on one device")
-
+    tensors, H = _check_boundary_inputs("norm_residual_norm", stream, branch, post_weight, pre_weight, alpha, beta, out,
+                                        new_stream)
     space_name, invariance = _normalize_space_arg("norm_residual_norm", space)
     _check_single_config_space("norm_residual_norm", space_name)
     fn, spec = impl_for("norm_residual_norm", device=branch.device)
     check_inputs(spec, dtype=branch.dtype, H=H)
-    check_backward(spec, *inputs, *outputs)
+    check_backward(spec, *tensors)
     _check_enforced("norm_residual_norm", spec, invariance)
     with torch.cuda.device(branch.device):
         return fn(stream, branch, post_weight, bool(post_norm_input_scale), pre_weight, alpha, beta, post_eps, pre_eps,
                   bool(pre_norm_bf16), out, new_stream)
+
+
+def all_reduce_workspace(max_numel, *, group=None):
+    """Peer-mapped buffers for ``all_reduce`` and ``all_reduce_norm_residual_norm`` on the current device.
+
+    Collective over ``group`` (default: the world group of an initialized ``torch.distributed`` with one GPU per
+    rank on one node). ``workspace.input(*shape)`` returns a view of the symmetric BF16 input buffer, which holds
+    ``max_numel`` elements; write the local partial into it and pass that view to the op. Calls on one workspace
+    must not overlap: issue them from one stream or order the streams, and give each concurrent stream its own
+    workspace. A failure during setup raises on every rank.
+    ``workspace.close()``, called on every rank of the group, releases the peer mappings; later calls raise.
+    """
+    import torch
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    fn, spec = impl_for("all_reduce_workspace", device=device)
+    with torch.cuda.device(device):
+        return fn(int(max_numel), group)
+
+
+def _check_all_reduce_input(op, x, workspace):
+    import torch
+
+    if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16 or not x.is_contiguous():
+        raise InvalidInput(f"tlx.ops.{op} expects a contiguous BF16 tensor")
+    if getattr(workspace, "closed", False):
+        raise InvalidInput(f"tlx.ops.{op} got a closed workspace")
+    if not hasattr(workspace, "holds") or not workspace.holds(x):
+        raise InvalidInput(f"tlx.ops.{op} expects the input to be workspace.input(...) of its workspace")
+
+
+def all_reduce(x, workspace, *, out=None, space=None):
+    """Sum of ``x`` over the ranks of ``workspace``'s group, returned on every rank. Forward only.
+
+    ``x`` is BF16 and must be ``workspace.input(*x.shape)``. Each element is the FP32 sum of the ranks' values in rank
+    order, rounded to BF16, so every rank gets the same bits for every token count. Returns ``out`` (BF16, the
+    shape of ``x``), filling it when passed. Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    _check_all_reduce_input("all_reduce", x, workspace)
+    if out is not None and (not isinstance(out, torch.Tensor) or out.shape != x.shape or out.dtype != x.dtype
+                            or not out.is_contiguous() or out.device != x.device or out.data_ptr() % 16
+                            or torch._C._overlaps(out, x)):
+        raise InvalidInput(f"tlx.ops.all_reduce expects a contiguous, 16-byte aligned BF16 out of shape "
+                           f"{tuple(x.shape)} that does not alias the input")
+    space_name, invariance = _normalize_space_arg("all_reduce", space)
+    _check_single_config_space("all_reduce", space_name)
+    fn, spec = impl_for("all_reduce", device=x.device)
+    check_inputs(spec, dtype=x.dtype, world=workspace.world)
+    check_backward(spec, x, out)
+    _check_enforced("all_reduce", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, workspace, out)
+
+
+def all_reduce_norm_residual_norm(stream, branch, workspace, *, post_weight=None, post_norm_input_scale=False,
+                                  pre_weight=None, alpha=None, beta=None, post_eps=1e-6, pre_eps=1e-6,
+                                  pre_norm_bf16=False, out=None, new_stream=None, space=None):
+    """``norm_residual_norm`` of ``stream`` and ``all_reduce(branch)``. Forward only.
+
+    ``branch`` is this rank's BF16 partial and must be ``workspace.input(T, H)``; the other arguments and the
+    returns are those of ``norm_residual_norm``. The result is bitwise equal to ``all_reduce`` followed by
+    ``norm_residual_norm``, on every rank. Decode-sized calls run as one kernel. Only
+    ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    _check_all_reduce_input("all_reduce_norm_residual_norm", branch, workspace)
+    tensors, H = _check_boundary_inputs("all_reduce_norm_residual_norm", stream, branch, post_weight, pre_weight, alpha,
+                                        beta, out, new_stream)
+    space_name, invariance = _normalize_space_arg("all_reduce_norm_residual_norm", space)
+    _check_single_config_space("all_reduce_norm_residual_norm", space_name)
+    fn, spec = impl_for("all_reduce_norm_residual_norm", device=branch.device)
+    check_inputs(spec, dtype=branch.dtype, H=H, world=workspace.world)
+    check_backward(spec, *tensors)
+    _check_enforced("all_reduce_norm_residual_norm", spec, invariance)
+    with torch.cuda.device(branch.device):
+        return fn(stream, branch, workspace, post_weight, bool(post_norm_input_scale), pre_weight, alpha, beta,
+                  post_eps, pre_eps, bool(pre_norm_bf16), out, new_stream)
 
 
 def router_gemm(x, weight, *, out=None, space=None):

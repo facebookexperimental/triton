@@ -829,6 +829,8 @@ def test_focus_suite_can_union_other_suites():
     "module_name",
     [
         "triton.tlx.ops.kernels.addmm._shapes",
+        "triton.tlx.ops.kernels.collectives.all_reduce._shapes",
+        "triton.tlx.ops.kernels.collectives.fused.all_reduce_norm_residual_norm._shapes",
         "triton.tlx.ops.kernels.fused.addmm_mul_add._shapes",
         "triton.tlx.ops.kernels.bmm._shapes",
         "triton.tlx.ops.kernels.flash_attn._shapes",
@@ -870,6 +872,8 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
             "gfx942": ("gfx942_all", ),
             "gfx950": ("gfx950_all", ),
         },
+        "triton.tlx.ops.kernels.collectives.all_reduce._shapes": {"gfx950": ("gfx950_all", )},
+        "triton.tlx.ops.kernels.collectives.fused.all_reduce_norm_residual_norm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.fused.addmm_mul_add._shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.flash_attn._shapes": {
@@ -1000,6 +1004,8 @@ def test_focus_suite_op_mismatch_is_rejected_explicitly():
 BENCH_MODULES = (
     "bench_addmm",
     "bench_addmm_mul_add",
+    "bench_all_reduce",
+    "bench_all_reduce_norm_residual_norm",
     "bench_flash_attn",
     "bench_flash_attn_mxfp8",
     "bench_flash_attn_varlen",
