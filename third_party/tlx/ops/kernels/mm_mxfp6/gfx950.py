@@ -1,6 +1,7 @@
 """MXFP6 GEMM backend for gfx950 (CDNA4): ``a @ b.T`` as BF16.
 
-``a`` is E2M3 and ``b`` is E3M2, both dense-packed uint8 (groups of
+``a_format`` and ``b_format`` independently select E2M3 or E3M2.
+Both operands are dense-packed uint8 (groups of
 16 codes per 12 bytes, K padded to the unpacked width; shapes count
 logical values in multiples of 16). The only implementation is the
 native scaled-MFMA kernel; ``space`` selects its launch config
@@ -15,6 +16,7 @@ here through the catalog instead of getting ``UnsupportedOp``.
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.tlx as tlx
 
 from ..._catalog import InvalidInput
 
@@ -48,7 +50,11 @@ def _gemm_mxfp6_native_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     SPLIT_K: tl.constexpr = 1,
+    A_FORMAT: tl.constexpr = "e2m3",
+    B_FORMAT: tl.constexpr = "e3m2",
 ):
+    tl.static_assert(A_FORMAT == "e2m3" or A_FORMAT == "e3m2", "unsupported A_FORMAT")
+    tl.static_assert(B_FORMAT == "e2m3" or B_FORMAT == "e3m2", "unsupported B_FORMAT")
     # Native scaled-MFMA path (manual 96-byte packed K, 128 logical values): load each dense 96-byte
     # tile, unpack its 128 codes in-kernel, and feed unpacked codes to
     # tl.dot_scaled; the compiler dense-packs per lane for the
@@ -100,14 +106,14 @@ def _gemm_mxfp6_native_kernel(
         as_ptrs += BLOCK_SIZE_K // 32
         bs_ptrs += BLOCK_SIZE_K // 32
         na_codes, nb_codes, nsa, nsb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs)
-        acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc)
+        acc = tlx.dot_scaled(a_codes, sa, A_FORMAT, b_codes, sb, B_FORMAT, acc, fp6_packed=True)
         a_codes, b_codes, sa, sb = na_codes, nb_codes, nsa, nsb
         a_bptrs += BLOCK_SIZE_K * 3 // 4
         b_bptrs += BLOCK_SIZE_K * 3 // 4
         as_ptrs += BLOCK_SIZE_K // 32
         bs_ptrs += BLOCK_SIZE_K // 32
         na_codes, nb_codes, nsa, nsb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs)
-        acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc)
+        acc = tlx.dot_scaled(a_codes, sa, A_FORMAT, b_codes, sb, B_FORMAT, acc, fp6_packed=True)
         a_codes, b_codes, sa, sb = na_codes, nb_codes, nsa, nsb
     if (num_k_tiles - 1) % 2 == 1:
         a_bptrs += BLOCK_SIZE_K * 3 // 4
@@ -115,9 +121,9 @@ def _gemm_mxfp6_native_kernel(
         as_ptrs += BLOCK_SIZE_K // 32
         bs_ptrs += BLOCK_SIZE_K // 32
         na_codes, nb_codes, nsa, nsb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs)
-        acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc)
+        acc = tlx.dot_scaled(a_codes, sa, A_FORMAT, b_codes, sb, B_FORMAT, acc, fp6_packed=True)
         a_codes, b_codes, sa, sb = na_codes, nb_codes, nsa, nsb
-    acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc)
+    acc = tlx.dot_scaled(a_codes, sa, A_FORMAT, b_codes, sb, B_FORMAT, acc, fp6_packed=True)
 
     c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
     if SPLIT_K > 1:
@@ -176,25 +182,27 @@ def _prune_full_configs(configs, named_args, **kwargs):
     ]
 
 
-_kernel_full = triton.autotune(configs=_full_configs(), key=["M", "N", "K", "SPLIT_K"],
+_kernel_full = triton.autotune(configs=_full_configs(), key=["M", "N", "K", "SPLIT_K", "A_FORMAT", "B_FORMAT"],
                                prune_configs_by={"early_config_prune": _prune_full_configs})(_gemm_mxfp6_native_kernel)
 
 
-def _launch_full(a, a_scale, b, b_scale, out, split_k=1):
+def _launch_full(a, a_scale, b, b_scale, out, split_k=1, a_format="e2m3", b_format="e3m2"):
     M, K = a.shape
     N = b.shape[0]
 
     def grid(meta):
         return (triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]), split_k)
 
-    _kernel_full[grid](a, b, out, a_scale, b_scale, M, N, K, SPLIT_K=split_k)
+    _kernel_full[grid](a, b, out, a_scale, b_scale, M, N, K, SPLIT_K=split_k, A_FORMAT=a_format, B_FORMAT=b_format)
     return out
 
 
-def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full", split_k=1):
+def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full", split_k=1, a_format="e2m3",
+             b_format="e3m2"):
     """``a @ b.T`` for pre-quantized MXFP6 operands on gfx950, as BF16.
 
-    ``a`` is E2M3 and ``b`` is E3M2, both dense-packed uint8 (groups
+    ``a_format`` and ``b_format`` independently select "e2m3" or "e3m2"
+    (defaulting to E2M3 A and E3M2 B), both dense-packed uint8 (groups
     of 16 codes per 12 bytes, K padded to the unpacked width). Inputs
     are validated
     by ``tlx.ops.mm_mxfp6``. ``space`` is "full" (autotune, the
@@ -204,6 +212,8 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     ``split_k`` partitions whole MFMA K tiles. FP32 partials are
     reduced before the single BF16 conversion.
     """
+    if a_format not in ("e2m3", "e3m2") or b_format not in ("e2m3", "e3m2"):
+        raise InvalidInput("a_format and b_format must each be 'e2m3' or 'e3m2'")
     if sf_layout != "natural":
         raise InvalidInput(f"gfx950 mm_mxfp6 only supports sf_layout='natural'; got {sf_layout!r}")
     if space not in ("heuristic", "full"):
@@ -245,11 +255,13 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
                 BLOCK_SIZE_K=meta["BLOCK_SIZE_K"],
                 GROUP_SIZE_M=meta["GROUP_SIZE_M"],
                 SPLIT_K=split_k,
+                A_FORMAT=a_format,
+                B_FORMAT=b_format,
                 num_warps=meta["num_warps"],
                 num_stages=1,
             )
         else:
-            _launch_full(a, a_scale, b, b_scale, target, split_k)
+            _launch_full(a, a_scale, b, b_scale, target, split_k, a_format, b_format)
         if split_k > 1:
             _reduce_split_k[(triton.cdiv(M * N, 1024), )](target, out, M * N, split_k, 1024)
         return out

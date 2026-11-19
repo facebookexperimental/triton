@@ -1223,6 +1223,8 @@ getNativeScaledMfmaUnsupportedReason(tt::DotScaledOp dot, int mfmaVersion,
   // still uses the decompose upcast.
   if (isMXFP6ScaleType(dot.getAElemType()) ||
       isMXFP6ScaleType(dot.getBElemType())) {
+    if (!dot->hasAttr(triton::amdgpu::kFp6PackedAttrName))
+      return StringRef("dense fp6 uses decompose upcast");
     int64_t tileK = dot.getA().getType().getShape().back();
     if (tileK != 128 && tileK != 64)
       return StringRef("fp6 uses decompose upcast");
@@ -1419,9 +1421,7 @@ public:
     auto newDot = triton::DotScaledOp::create(
         rewriter, dotOp.getLoc(), newRetType, a, b, newAcc, newAScale,
         newBScale, aElemType, bElemType, dotOp.getFastMath());
-    // The TLX native kernel presents FP6 operands as per-segment
-    // packed bytes; consume them directly in ScaledMFMA lowering.
-    if (isMXFP6ScaleType(aElemType) || isMXFP6ScaleType(bElemType))
+    if (dotOp->hasAttr(triton::amdgpu::kFp6PackedAttrName))
       newDot->setAttr(triton::amdgpu::kFp6PackedAttrName,
                       rewriter.getUnitAttr());
 
