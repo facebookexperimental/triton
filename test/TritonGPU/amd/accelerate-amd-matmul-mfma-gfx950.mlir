@@ -431,7 +431,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %arg4: tensor<128x128x!tt.ptr<f32>, #blocked>
       ) {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
-    %1 = tt.dot_scaled %arg0 scale %arg2, %arg1 scale %arg3, %cst lhs = e2m3 rhs = e3m2 {fastMath = false} : tensor<128x128xi8, #blocked>, tensor<128x4xi8, #blocked1> * tensor<128x128xi8, #blocked>, tensor<128x4xi8, #blocked1> -> tensor<128x128xf32, #blocked>
+    %1 = tt.dot_scaled %arg0 scale %arg2, %arg1 scale %arg3, %cst lhs = e2m3 rhs = e3m2 {amdg.fp6_packed, fastMath = false} : tensor<128x128xi8, #blocked>, tensor<128x4xi8, #blocked1> * tensor<128x128xi8, #blocked>, tensor<128x4xi8, #blocked1> -> tensor<128x128xf32, #blocked>
     tt.store %arg4, %1 : tensor<128x128x!tt.ptr<f32>, #blocked>
     tt.return
   }
@@ -458,7 +458,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %arg4: tensor<256x256x!tt.ptr<f32>, #blocked>
       ) {
     %cst = arith.constant dense<0.000000e+00> : tensor<256x256xf32, #blocked>
-    %1 = tt.dot_scaled %arg0 scale %arg2, %arg1 scale %arg3, %cst lhs = e2m3 rhs = e3m2 {fastMath = false} : tensor<256x64xi8, #blocked>, tensor<256x2xi8, #blocked1> * tensor<64x256xi8, #blocked>, tensor<256x2xi8, #blocked1> -> tensor<256x256xf32, #blocked>
+    %1 = tt.dot_scaled %arg0 scale %arg2, %arg1 scale %arg3, %cst lhs = e2m3 rhs = e3m2 {amdg.fp6_packed, fastMath = false} : tensor<256x64xi8, #blocked>, tensor<256x2xi8, #blocked1> * tensor<64x256xi8, #blocked>, tensor<256x2xi8, #blocked1> -> tensor<256x256xf32, #blocked>
     tt.store %arg4, %1 : tensor<256x256x!tt.ptr<f32>, #blocked>
     tt.return
   }
