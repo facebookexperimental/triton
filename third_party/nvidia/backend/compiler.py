@@ -237,6 +237,8 @@ def _check_reg_auto_ws_alignment(name: str, value: Optional[int]) -> None:
 
 @dataclass(frozen=True)
 class CUDAOptions:
+    sr_launch: tuple = ()
+    sr_grid: int = 0
     sr_mode: str = ""
     sr_site: str = ""
     sr_rounds: int = 10
@@ -416,6 +418,7 @@ class CUDABackend(BaseBackend):
 
         args = {"arch": knobs.runtime.override_arch or f"sm{self.target.arch}"}
         args.update({k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
+        args["sr_launch"] = tuple(tuple(item) for item in args.get("sr_launch", ()))
         if args.get("instrumentation_mode", ""):
             # Instrumentation can require more registers than the user-specified limit.
             args["maxnreg"] = None
@@ -896,6 +899,8 @@ class CUDABackend(BaseBackend):
 
             warnings.warn(warning_msg, stacklevel=2)
 
+        if opt.sr_mode == "enabled":
+            mod.set_attr("tt.sr_grid", ir.builder(mod.context).get_int32_attr(opt.sr_grid))
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)
