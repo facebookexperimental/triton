@@ -311,3 +311,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %v : tensor<16x64xf16, #cache_blocked>
   }
 }
+
+// -----
+
+// A descriptor with 32-byte swizzle atomicity encodes
+// CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B (4).
+#atom = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32, swizzleAtom32B = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: make_tensor_descriptor_swizzle_atom32b
+  // CHECK: ttng.tensormap_create {{.*}} swizzle_mode = 4 : i32
+  tt.func public @make_tensor_descriptor_swizzle_atom32b(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: i32 {tt.divisibility = 16 : i32}, %arg2: i32 {tt.divisibility = 16 : i32}) -> !tt.tensordesc<32x128xf32, #atom> {
+    %c1_i64 = arith.constant 1 : i64
+    %0 = arith.extsi %arg2 : i32 to i64
+    %1 = tt.make_tensor_descriptor %arg0, [%arg1, %arg2], [%0, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<32x128xf32, #atom>
+    tt.return %1 : !tt.tensordesc<32x128xf32, #atom>
+  }
+}

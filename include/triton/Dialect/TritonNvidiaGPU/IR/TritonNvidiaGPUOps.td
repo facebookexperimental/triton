@@ -1739,7 +1739,7 @@ def TTNG_TensormapCreateOp
       ConfinedAttr<I32Attr, [IntNonNegative, IntMaxValue<15>]>:$elem_type,
       ConfinedAttr<I32Attr, [IntNonNegative,
                              IntMaxValue<2>]>:$interleave_layout,
-      ConfinedAttr<I32Attr, [IntNonNegative, IntMaxValue<3>]>:$swizzle_mode,
+      ConfinedAttr<I32Attr, [IntNonNegative, IntMaxValue<4>]>:$swizzle_mode,
       ConfinedAttr<I32Attr, [IntNonNegative, IntMaxValue<1>]>:$fill_mode);
   let extraClassDeclaration = [{
       int32_t getRank() {

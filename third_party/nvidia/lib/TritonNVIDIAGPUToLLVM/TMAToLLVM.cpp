@@ -285,8 +285,16 @@ struct TensormapCreateOpConversion
     tensormap_replace_elemtype(loc, ctx, rewriter, smemBase, op.getElemType());
     tensormap_replace_interleave_layout(loc, ctx, rewriter, smemBase,
                                         op.getInterleaveLayout());
-    tensormap_replace_swizzle_mode(loc, ctx, rewriter, smemBase,
-                                   op.getSwizzleMode());
+    // Swizzle mode 4 means CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B here (PTX's
+    // own value 4 is the 96B swizzle, which Triton never emits).
+    if (op.getSwizzleMode() == 4) {
+      tensormap_replace_swizzle_mode(loc, ctx, rewriter, smemBase, 3);
+      tensormap_replace_generic(loc, ctx, rewriter, "swizzle_atomicity",
+                                smemBase, 1);
+    } else {
+      tensormap_replace_swizzle_mode(loc, ctx, rewriter, smemBase,
+                                     op.getSwizzleMode());
+    }
     tensormap_replace_fill_mode(loc, ctx, rewriter, smemBase, op.getFillMode());
     rewriter.setInsertionPointToStart(continuationBlock);
     // Make thread zero's field updates visible to the collective copy.

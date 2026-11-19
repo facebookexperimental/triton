@@ -2017,3 +2017,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     tt.return %r : f32
   }
 }
+
+// -----
+
+// swizzle_mode 4 (CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B) sets the 128B swizzle
+// mode and 32B swizzle atomicity.
+// CHECK-LABEL: device_tensormap_create_swizzle_atom32b
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @device_tensormap_create_swizzle_atom32b(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %arg2: i32 {tt.divisibility = 16 : i32}) {
+    %c32_i32 = arith.constant 32 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c1024_i64 = arith.constant 1024 : i64
+    // CHECK: tensormap.replace.tile.swizzle_mode.shared::cta.b1024.b32 [ $0 + 0 ], 0x3;
+    // CHECK: tensormap.replace.tile.swizzle_atomicity.shared::cta.b1024.b32 [ $0 + 0 ], 0x1;
+    ttng.tensormap_create %arg1, %arg0, [%c32_i32, %c32_i32], [%arg2, %arg2], [%c1024_i64], [%c1_i32, %c1_i32] {elem_type = 7 : i32, fill_mode = 0 : i32, interleave_layout = 0 : i32, swizzle_mode = 4 : i32, allocation.offset = 0 : i32} : (!tt.ptr<i8>, !tt.ptr<f32>, i32, i32, i32, i32, i64, i32, i32) -> ()
+    tt.return
+  }
+}
