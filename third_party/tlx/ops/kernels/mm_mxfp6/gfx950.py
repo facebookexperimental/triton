@@ -29,6 +29,25 @@ def _fp6_codes_from_bytes(b0, b1, b2):
 
 
 @triton.jit
+def _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+               BLOCK_SIZE_K: tl.constexpr):
+    a0 = tl.load(a_bptrs)
+    a1 = tl.load(a_bptrs + 1)
+    a2 = tl.load(a_bptrs + 2)
+    av0, av1, av2, av3 = _fp6_codes_from_bytes(a0, a1, a2)
+    a_codes = tl.reshape(tl.join(tl.join(av0, av1), tl.join(av2, av3)), (BLOCK_SIZE_M, BLOCK_SIZE_K)).to(tl.uint8)
+    b0 = tl.load(b_bptrs)
+    b1 = tl.load(b_bptrs + 1)
+    b2 = tl.load(b_bptrs + 2)
+    bv0, bv1, bv2, bv3 = _fp6_codes_from_bytes(b0, b1, b2)
+    b_codes = tl.reshape(tl.permute(tl.join(tl.join(bv0, bv1), tl.join(bv2, bv3)), (0, 2, 3, 1)),
+                         (BLOCK_SIZE_K, BLOCK_SIZE_N)).to(tl.uint8)
+    sa = tl.load(as_ptrs)
+    sb = tl.load(bs_ptrs)
+    return a_codes, b_codes, sa, sb
+
+
+@triton.jit
 def _gemm_mxfp6_native_kernel(
     a_ptr,
     b_ptr,
@@ -42,7 +61,6 @@ def _gemm_mxfp6_native_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    NUM_STAGES: tl.constexpr,
 ):
     # Native scaled-MFMA path (manual 96-byte packed K, 128 logical values): load each dense 96-byte
     # tile, unpack its 128 codes in-kernel, and feed unpacked codes to
@@ -68,26 +86,40 @@ def _gemm_mxfp6_native_kernel(
     as_ptrs = as_ptr + offs_m[:, None] * (K // 32) + offs_sk[None, :]
     bs_ptrs = bs_ptr + offs_n[:, None] * (K // 32) + offs_sk[None, :]
 
+    # Manual staging: at most two tiles live (the compiler pipeliner
+    # kept three and spilled), so compiler pipelining is off.
+    a_codes, b_codes, sa, sb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
+
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for _ in tl.range(0, K // BLOCK_SIZE_K, num_stages=NUM_STAGES):
-        a0 = tl.load(a_bptrs)
-        a1 = tl.load(a_bptrs + 1)
-        a2 = tl.load(a_bptrs + 2)
-        av0, av1, av2, av3 = _fp6_codes_from_bytes(a0, a1, a2)
-        a_codes = tl.reshape(tl.join(tl.join(av0, av1), tl.join(av2, av3)), (BLOCK_SIZE_M, BLOCK_SIZE_K)).to(tl.uint8)
-        b0 = tl.load(b_bptrs)
-        b1 = tl.load(b_bptrs + 1)
-        b2 = tl.load(b_bptrs + 2)
-        bv0, bv1, bv2, bv3 = _fp6_codes_from_bytes(b0, b1, b2)
-        b_codes = tl.reshape(tl.permute(tl.join(tl.join(bv0, bv1), tl.join(bv2, bv3)), (0, 2, 3, 1)),
-                             (BLOCK_SIZE_K, BLOCK_SIZE_N)).to(tl.uint8)
-        sa = tl.load(as_ptrs)
-        sb = tl.load(bs_ptrs)
-        acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc)
+    # Manual unroll x2: two staged steps per body, plus at most one
+    # remainder step; the final tile dots after the loop.
+    for _ in tl.range(1, K // BLOCK_SIZE_K - 1, 2, num_stages=1):
         a_bptrs += BLOCK_SIZE_K * 3 // 4
         b_bptrs += BLOCK_SIZE_K * 3 // 4
         as_ptrs += BLOCK_SIZE_K // 32
         bs_ptrs += BLOCK_SIZE_K // 32
+        na_codes, nb_codes, nsa, nsb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, BLOCK_SIZE_M, BLOCK_SIZE_N,
+                                                  BLOCK_SIZE_K)
+        acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc)
+        a_codes, b_codes, sa, sb = na_codes, nb_codes, nsa, nsb
+        a_bptrs += BLOCK_SIZE_K * 3 // 4
+        b_bptrs += BLOCK_SIZE_K * 3 // 4
+        as_ptrs += BLOCK_SIZE_K // 32
+        bs_ptrs += BLOCK_SIZE_K // 32
+        na_codes, nb_codes, nsa, nsb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, BLOCK_SIZE_M, BLOCK_SIZE_N,
+                                                  BLOCK_SIZE_K)
+        acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc)
+        a_codes, b_codes, sa, sb = na_codes, nb_codes, nsa, nsb
+    if (K // BLOCK_SIZE_K - 1) % 2 == 1:
+        a_bptrs += BLOCK_SIZE_K * 3 // 4
+        b_bptrs += BLOCK_SIZE_K * 3 // 4
+        as_ptrs += BLOCK_SIZE_K // 32
+        bs_ptrs += BLOCK_SIZE_K // 32
+        na_codes, nb_codes, nsa, nsb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, BLOCK_SIZE_M, BLOCK_SIZE_N,
+                                                  BLOCK_SIZE_K)
+        acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc)
+        a_codes, b_codes, sa, sb = na_codes, nb_codes, nsa, nsb
+    acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc)
 
     c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
     tl.store(c_ptrs, acc.to(tl.bfloat16))
@@ -103,7 +135,6 @@ def _heuristic_config(M, N, K):
         "BLOCK_SIZE_N": block_n,
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 8,
-        "NUM_STAGES": 3 if K >= 1024 else 2,
         "num_warps": 8,
     }
 
@@ -115,7 +146,7 @@ def _full_configs():
         (128, 256, 128),
         (256, 128, 128),
     ):
-        for num_stages in (2, 3):
+        for num_stages in (1, ):
             configs.append(
                 triton.Config(
                     {
@@ -123,9 +154,9 @@ def _full_configs():
                         "BLOCK_SIZE_N": block_n,
                         "BLOCK_SIZE_K": block_k,
                         "GROUP_SIZE_M": 8,
-                        "NUM_STAGES": num_stages,
                     },
                     num_warps=8,
+                    num_stages=num_stages,
                 ))
     return configs
 
@@ -179,8 +210,8 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
                 BLOCK_SIZE_N=meta["BLOCK_SIZE_N"],
                 BLOCK_SIZE_K=meta["BLOCK_SIZE_K"],
                 GROUP_SIZE_M=meta["GROUP_SIZE_M"],
-                NUM_STAGES=meta["NUM_STAGES"],
                 num_warps=meta["num_warps"],
+                num_stages=1,
             )
             return out
         return _launch_full(a, a_scale, b, b_scale, out)
