@@ -196,6 +196,12 @@ struct NVGPUWSTMAStoreLoweringPass
 static constexpr const char *kCanRotateByBufferCount =
     "can_rotate_by_buffer_count";
 static constexpr const char *kCLCPersistentLoop = "ttg.clc_persistent";
+// Set on a TMA store wait whose barrier release gates the producer of data
+// that later wait_barriers of the same task wait for (WSCodePartition's
+// cross-tile staging-reuse release). doTMAStoreWaitReorder never moves such a
+// wait past a wait_barrier.
+static constexpr const char *kBeforeWaitBarrier =
+    "tma_store_wait_before_wait_barrier";
 
 static bool isTMAStoreLikeOp(Operation *op) {
   return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(op);
@@ -455,6 +461,7 @@ void doValidateTMAStoreAnnotations(triton::FuncOp funcOp) {
     auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
     if (!tmaOp) {
       waitOp->removeAttr(kCanRotateByBufferCount);
+      waitOp->removeAttr(kBeforeWaitBarrier);
       waitOp->removeAttr(ttng::kPlannedPendingCount);
       return;
     }
@@ -462,6 +469,7 @@ void doValidateTMAStoreAnnotations(triton::FuncOp funcOp) {
     auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
     if (!allocOp) {
       waitOp->removeAttr(kCanRotateByBufferCount);
+      waitOp->removeAttr(kBeforeWaitBarrier);
       waitOp->removeAttr(ttng::kPlannedPendingCount);
       return;
     }
@@ -508,6 +516,31 @@ findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
   }
 
   return nullptr;
+}
+
+// The first scheduled wait_barrier after `tmaStore` and before `target` in
+// linearized schedule order, with its stage.
+struct WaitBarrierBefore {
+  Operation *op;
+  int stage;
+};
+static std::optional<WaitBarrierBefore>
+findFirstWaitBarrierBefore(scf::ForOp forOp, const tt::CoarseSchedule &schedule,
+                           Operation *tmaStore, Operation *target,
+                           int maxStages) {
+  auto it = schedule.linearized(forOp, tmaStore);
+  it.setMaxStages(maxStages);
+  ++it;
+  while (!it.isEnd()) {
+    Operation *op = *it;
+    int stage = it.currStage();
+    ++it;
+    if (op == target)
+      return std::nullopt;
+    if (isa<ttng::WaitBarrierOp>(op))
+      return WaitBarrierBefore{op, stage};
+  }
+  return std::nullopt;
 }
 
 // Best-effort reordering of annotated TMA store waits. Every case where a
@@ -680,6 +713,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
     }
     if (insertBefore == waitOp.getOperation()) {
       waitOp->removeAttr(kCanRotateByBufferCount);
+      waitOp->removeAttr(kBeforeWaitBarrier);
       if (!target)
         lastTailWait[body] = waitOp;
       continue;
@@ -692,6 +726,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
       lastTailWait[body] = waitOp;
     waitOp->moveBefore(insertBefore);
     waitOp->removeAttr(kCanRotateByBufferCount);
+    waitOp->removeAttr(kBeforeWaitBarrier);
   }
 
   // CLC epilogues live directly in an scf.while rather than an scf.for. Their
@@ -834,6 +869,22 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
           insertionTarget = waitBarrier;
         }
 
+        // The release this wait carries gates the producer of what a later
+        // wait_barrier of this task waits for (e.g. the loader refilling an
+        // operand ring that hosts staging, before the next tile's accumulator
+        // wait). Moving the wait past that wait_barrier would deadlock, so it
+        // stops at the first one. (Its pending count is derived at lowering
+        // from program order; waits with barriers carry no planned one.)
+        if (waitOp->hasAttr(kBeforeWaitBarrier)) {
+          if (auto first = findFirstWaitBarrierBefore(
+                  forOp, schedule, tmaStore, insertionTarget,
+                  schedule.getNumStages() + k)) {
+            insertionTarget = first->op;
+            targetStage = first->stage;
+            targetWriter = nullptr;
+          }
+        }
+
         // A same-iteration reuse does not need software-pipeline expansion to
         // realize the rotation. Keep the block order consistent with the
         // coarse schedule so loops that are deliberately not pipelined (for
@@ -902,6 +953,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
 
       if (!erasedWait) {
         waitOp->removeAttr(kCanRotateByBufferCount);
+        waitOp->removeAttr(kBeforeWaitBarrier);
         waitOp.trySetPlannedPendingCount(k - 1);
       }
       changed = true;
@@ -919,6 +971,11 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
           drain->setAttr("async_task_id", taskIds);
       }
     }
+  });
+
+  // The mark only steers this pass; drop it from waits it left in place.
+  funcOp.walk([](ttng::TMAStoreTokenWaitOp waitOp) {
+    waitOp->removeAttr(kBeforeWaitBarrier);
   });
 }
 
