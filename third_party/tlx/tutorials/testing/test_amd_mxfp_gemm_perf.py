@@ -10,7 +10,7 @@ from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_tdm
 )
 from triton.tools.mxfp import MXScaleTensor
 
-from triton._internal_testing import is_hip_gfx1250
+from triton._internal_testing import is_hip_cdna5
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -84,7 +84,7 @@ if __name__ == "__main__":
     parser.add_argument("--transpose-b", action="store_true", help="Benchmark the transposed-B layout")
     args = parser.parse_args()
 
-    if is_hip_gfx1250():
+    if is_hip_cdna5():
         versions = args.version if args.version else list(MATMUL_METHODS.keys())
         print(f"Running benchmarks for: {versions} (transpose_b={args.transpose_b})")
         benchmark = create_benchmark(versions, transpose_b=args.transpose_b)

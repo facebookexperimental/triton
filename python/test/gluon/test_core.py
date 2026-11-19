@@ -1269,6 +1269,37 @@ def test_async_copy_mbarrier(copy_vec, cache_policy):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer")
+@pytest.mark.parametrize("num_ctas", [2, 4])
+@pytest.mark.parametrize("batch", [2, 4])
+@pytest.mark.parametrize("two_ctas, simultaneous", [(False, False), (True, False), (False, True)])
+def test_mbarrier_dynamic_index_gsan(fresh_knobs, num_ctas, two_ctas, batch, simultaneous):
+    from triton.experimental.gsan import create_mem_pool
+
+    @gluon.jit
+    def kernel(BATCH: ttgl.constexpr, TWO_CTAS: ttgl.constexpr, SIMULTANEOUS: ttgl.constexpr):
+        barriers = mbarrier.allocate_mbarrier(batch=BATCH, two_ctas=TWO_CTAS)
+        if SIMULTANEOUS:
+            for i in range(BATCH):
+                mbarrier.init(barriers.index(i), count=1)
+            for i in range(BATCH):
+                barrier = barriers.index(i)
+                mbarrier.arrive(barrier)
+                mbarrier.wait(barrier, phase=0)
+                mbarrier.invalidate(barrier)
+        else:
+            for repeat in range(2):
+                for i in range(BATCH):
+                    barrier = barriers.index(i)
+                    mbarrier.init(barrier, count=1)
+                    mbarrier.invalidate(barrier)
+
+    triton.knobs.compilation.instrumentation_mode = "gsan"
+    with torch.cuda.use_mem_pool(create_mem_pool()):
+        kernel[(1, )](batch, two_ctas, simultaneous, num_warps=1, num_ctas=num_ctas)
+        torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer")
 def test_warp_specialize_noinline_ids():
 
     @gluon.jit
@@ -4105,7 +4136,8 @@ def test_packed_arith_reduction(dtype):
     torch.testing.assert_close(out_b, b.sum(dim=1), atol=0, rtol=0)
     suffix = {torch.float32: "f32x2", torch.float16: "f16x2", torch.bfloat16: "bf16x2"}[dtype]
     assert "ttng.packed_arith add" in compiled.asm["ttgir"]
-    assert f"add.{suffix}" in compiled.asm["ptx"]
+    modifier = "" if dtype == torch.float32 else ".rn"
+    assert f"add{modifier}.{suffix}" in compiled.asm["ptx"]
     if dtype == torch.float32:
         assert "prmt.b32" not in compiled.asm["ptx"]
 
@@ -4178,7 +4210,7 @@ def test_packed_arith(op, dtype):
     torch.testing.assert_close(ref, out, atol=tolerance, rtol=tolerance)
 
     suffix = {torch.float32: "f32x2", torch.float16: "f16x2", torch.bfloat16: "bf16x2"}[dtype]
-    modifier = ".rn" if op_name == "fma" else ""
+    modifier = ".rn" if op_name == "fma" or (dtype != torch.float32 and op_name in ("add", "sub")) else ""
     assert f"{op_name}{modifier}.{suffix}" in compiled.asm["ptx"]
     assert f"ttng.packed_arith {op_name}" in compiled.asm["ttgir"]
 
