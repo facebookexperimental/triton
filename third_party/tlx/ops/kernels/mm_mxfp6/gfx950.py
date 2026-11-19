@@ -144,6 +144,18 @@ def _full_configs():
                     num_warps=8,
                     num_stages=num_stages,
                 ))
+    # 128x128x128 is fastest at 4 warps (the heuristic default).
+    configs.append(
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 8,
+            },
+            num_warps=4,
+            num_stages=1,
+        ))
     return configs
 
 
@@ -181,22 +193,16 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
         out = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     with torch.cuda.device(a.device):
         if space == "heuristic":
-            # Start from the BF16 default tile (256x256x64); the
-            # 128-wide K tile overflowed registers in this kernel.
-            # The kernel has no bounds masking, so the 256-wide M/N
-            # tile is only valid when it divides M/N; small shapes
-            # (e.g. the 128 ones test) use a 128-wide tile at the
-            # same K=64 to stay exact.
-            if M % 256 == 0 and N % 256 == 0:
-                block_m, block_n = 256, 256
-            else:
-                block_m, block_n = 128, 128
+            # Default from the MI350 warp sweep: 128x128x128 at 4
+            # warps spills zero and beats the 256-wide tile; K=64
+            # shapes keep the 64-deep tile (whole 32x32x64 steps).
+            block_k = 128 if K % 128 == 0 else 64
             meta = {
-                "BLOCK_SIZE_M": block_m,
-                "BLOCK_SIZE_N": block_n,
-                "BLOCK_SIZE_K": 64,
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": block_k,
                 "GROUP_SIZE_M": 8,
-                "num_warps": 8,
+                "num_warps": 4,
             }
             grid = (triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]), )
             _gemm_mxfp6_native_kernel[grid](
