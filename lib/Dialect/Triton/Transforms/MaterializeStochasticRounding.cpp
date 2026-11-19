@@ -329,7 +329,8 @@ struct TritonMaterializeStochasticRounding
     llvm::StringMap<int32_t> declarations;
     SmallVector<StringRef> entries;
     StringRef(site).split(entries, ',');
-    bool invalid = mode != "plain" && mode != "enabled";
+    bool invalid = (mode != "plain" && mode != "enabled") ||
+                   (ownership != "checked" && ownership != "declared");
     for (auto entry : entries) {
       auto [name, number] = entry.split('=');
       int32_t id = 0;
@@ -362,7 +363,8 @@ struct TritonMaterializeStochasticRounding
           getElementTypeOrSelf(getPointeeType(store.getPtr().getType()))
               .isBF16();
       if (mode == "enabled" && eligible && !proveOwnership(store) &&
-          !proveLaunchOwnership(store)) {
+          !proveLaunchOwnership(store) &&
+          !(ownership == "declared" && proveDeclaredOwnership(store))) {
         store.emitOpError(
             "cannot prove injective matching pointer and logical indices");
         signalPassFailure();
