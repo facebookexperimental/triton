@@ -241,6 +241,7 @@ class CUDAOptions:
     sr_grid: int = 0
     sr_mode: str = ""
     sr_ownership: str = "checked"
+    sr_overflow: str = "satfinite"
     sr_site: str = ""
     sr_rounds: int = 10
     num_warps: int = 4

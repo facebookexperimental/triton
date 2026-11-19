@@ -44,6 +44,7 @@ class StochasticRoundingSpec:
     prng: str = "philox4x32-10"
     sites: tuple[SRStoreSpec, ...] = ()
     ownership: str = "checked"
+    overflow: str = "satfinite"
 
     def __post_init__(self):
         sites = (self.site, ) if self.site is not None else tuple(self.sites)
@@ -54,6 +55,8 @@ class StochasticRoundingSpec:
         if len({site.name for site in sites}) != len(sites) or len({site.site_id for site in sites}) != len(sites):
             raise ValueError("SR site names and numeric IDs must be unique")
         object.__setattr__(self, "sites", () if self.site is not None else sites)
+        if self.overflow not in ("ieee", "satfinite"):
+            raise ValueError("SR overflow must be ieee or satfinite")
         if self.ownership not in ("checked", "declared"):
             raise ValueError("SR ownership must be checked or declared")
         if not isinstance(self.prng, str) or self.prng not in _PHILOX_ROUNDS:
@@ -280,7 +283,8 @@ class StochasticRoundingKernel(KernelInterface):
             raise ValueError("SR variant options and seed arguments are owned by the proxy")
         kwargs.update(sr_mode="enabled" if state.enabled else "plain",
                       sr_site=",".join(f"{site.name}={site.site_id}" for site in self.spec.store_specs),
-                      sr_rounds=_PHILOX_ROUNDS[self.spec.prng], sr_ownership=self.spec.ownership)
+                      sr_rounds=_PHILOX_ROUNDS[self.spec.prng], sr_ownership=self.spec.ownership,
+                      sr_overflow=self.spec.overflow)
         if state.enabled:
             values = dict(zip(self.arg_names, args))
             values.update(kwargs)

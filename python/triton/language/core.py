@@ -2258,8 +2258,10 @@ def sr_store(pointer, value, logical_index, site, mask=None, cache_modifier="", 
         mask = _semantic.broadcast_impl_shape(mask, pointer.shape)
     cache = _semantic._str_to_store_cache_modifier(_unwrap_if_constexpr(cache_modifier))
     eviction = _semantic._str_to_eviction_policy(_unwrap_if_constexpr(eviction_policy))
+    options = getattr(_semantic.builder, "options", None)
+    satfinite = getattr(options, "sr_overflow", "satfinite") == "satfinite"
     return _semantic.builder.create_sr_store(pointer.handle, value.handle, logical_index.handle,
-                                             None if mask is None else mask.handle, site, cache, eviction)
+                                             None if mask is None else mask.handle, site, cache, eviction, satfinite)
 
 
 # -----------------------
