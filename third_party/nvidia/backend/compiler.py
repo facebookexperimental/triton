@@ -237,6 +237,9 @@ def _check_reg_auto_ws_alignment(name: str, value: Optional[int]) -> None:
 
 @dataclass(frozen=True)
 class CUDAOptions:
+    sr_mode: str = ""
+    sr_site: str = ""
+    sr_rounds: int = 10
     num_warps: int = 4
     num_ctas: int = 1
     num_stages: int = 3
@@ -913,6 +916,8 @@ class CUDABackend(BaseBackend):
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
+        passes.ttir.add_materialize_stochastic_rounding(pm, opt.sr_mode, opt.sr_site, opt.sr_rounds, capability,
+                                                        get_ptx_version_from_options(opt, capability))
         passes.ttir.add_triton_licm(pm)
         passes.ttir.add_uplift_while_to_for(pm)
         passes.common.add_canonicalizer(pm)
