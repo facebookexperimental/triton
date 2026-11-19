@@ -886,6 +886,21 @@ void init_triton_ir(py::module_ &m) {
              auto value = attr.getValue();
              return py::str(value.data(), value.size());
            })
+      .def("validate_stochastic_rounding",
+           [](ModuleOp &self, const std::string &backend) {
+             bool unsupported = false;
+             self.walk([&](FpToFpOp op) {
+               if (op.getRounding() == RoundingMode::RS && backend != "cuda" &&
+                   (backend != "hip" || op->hasAttr("sr_ieee"))) {
+                 op.emitOpError("stochastic rounding is not supported on ")
+                     << backend;
+                 unsupported = true;
+               }
+             });
+             if (unsupported)
+               throw std::runtime_error(
+                   "unsupported stochastic rounding target");
+           })
       .def("dump", &ModuleOp::dump)
       .def("str",
            [](ModuleOp &self) -> std::string {
@@ -1047,11 +1062,12 @@ void init_triton_ir(py::module_ &m) {
           ret::reference)
       .def(
           "set_arg_attr",
-          [](FuncOp &self, int arg_no, const std::string &name, int val) {
+          [](FuncOp &self, int arg_no, const std::string &name, int64_t val) {
             if (arg_no >= self.getNumArguments())
               throw py::index_error("Function argument index out of range");
             // set arg attributes "name" to value "val"
-            auto attrTy = IntegerType::get(self.getContext(), 32);
+            auto attrTy = IntegerType::get(
+                self.getContext(), name.starts_with("tt.sr_") ? 64 : 32);
             self.setArgAttr(arg_no, name, IntegerAttr::get(attrTy, val));
           },
           ret::reference)
@@ -1783,6 +1799,16 @@ void init_triton_ir(py::module_ &m) {
               bool isVolatile) -> Value {
              return self.create<LoadOp>(ptrs, Value(), Value(), cachePolicy,
                                         isVolatile);
+           })
+      .def("create_sr_store",
+           [](TritonOpBuilder &self, Value ptr, Value value, Value index,
+              std::optional<Value> mask, const std::string &site,
+              CacheModifier cache, EvictionPolicy evict, bool satfinite) {
+             auto store = self.create<SrStoreOp>(ptr, value, index,
+                                                 mask.value_or(Value()), site,
+                                                 0, cache, evict);
+             if (satfinite)
+               store->setAttr("sr_satfinite", self.getBuilder().getUnitAttr());
            })
       .def("create_store",
            [](TritonOpBuilder &self, Value &ptrs, Value &value,

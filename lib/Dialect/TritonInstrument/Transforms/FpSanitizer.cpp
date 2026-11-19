@@ -3364,6 +3364,16 @@ public:
       return;
     }
 
+    auto srValidation = getOperation().walk([&](tt::FpToFpOp op) {
+      if (op.getRounding() != tt::RoundingMode::RS)
+        return WalkResult::advance();
+      op.emitOpError("stochastic rounding is not supported by FpSanitizer");
+      return WalkResult::interrupt();
+    });
+    if (srValidation.wasInterrupted()) {
+      signalPassFailure();
+      return;
+    }
     bool fpSanErrorEmitted = false;
     ScopedDiagnosticHandler diagnosticHandler(
         &getContext(), [&](Diagnostic &diagnostic) {

@@ -122,23 +122,25 @@ from ._normalization import (
 
 __all__ = [
     "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
-    "moe_routing", "moe_router_topk_align", "norm_residual_norm", "rmsnorm_gate", "router_gemm",
-    "qk_norm_rope_kv_cache", "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8",
-    "flash_attn_varlen", "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn",
-    "hstu_attn_dev", "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
-    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "paged_attention_decode",
-    "paged_attention_prefill", "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d",
-    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "moe_routing", "moe_router_topk_align", "norm_residual_norm", "all_reduce", "all_reduce_workspace",
+    "all_reduce_norm_residual_norm", "rmsnorm_gate", "router_gemm", "qk_norm_rope_kv_cache", "addmm", "addmm_mul_add",
+    "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen", "linear_rowscale",
+    "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn",
+    "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode", "prepare_flash_attn_varlen_backward",
+    "flash_attn_varlen_backward", "paged_attention_decode", "paged_attention_prefill",
+    "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d", "UnsupportedOp",
+    "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
-    'compute_norm_nvfp4_global_scale', 'layernorm', 'layernorm_add', 'layernorm_backward',
-    'layernorm_backward_from_x_norm', 'layernorm_mxfp4', 'layernorm_mxfp8_gdpa_precomputed_no_normalized',
-    'layernorm_mxfp8_gdpa_with_backward', 'layernorm_mxfp8_quantize', 'layernorm_mxfp8_quantize_numerics_preserving',
-    'layernorm_mxfp8_with_backward', 'layernorm_nvfp4_backward_from_x_norm_padded_dy', 'layernorm_nvfp4_quantize',
-    'layernorm_nvfp4_quantize_inplace', 'layernorm_nvfp4_quantize_q0_jagged_transpose',
-    'layernorm_nvfp4_quantize_q0_jagged_transpose_inplace', 'norm_backward_from_normalized', 'norm_bwd', 'norm_fwd',
-    'norm_quant_mxfp8_fwd', 'nvfp4_quantize_normalized', 'rmsnorm', 'rmsnorm_backward', 'rmsnorm_backward_from_x_norm',
-    'rmsnorm_backward_quantize_dx_mxfp8', 'rmsnorm_backward_quantize_dx_mxfp8_bf16_precomputed',
+    'paged_attention_decode_fp8', 'paged_attention_decode_fp8_workspace', 'compute_norm_nvfp4_global_scale',
+    'layernorm', 'layernorm_add', 'layernorm_backward', 'layernorm_backward_from_x_norm', 'layernorm_mxfp4',
+    'layernorm_mxfp8_gdpa_precomputed_no_normalized', 'layernorm_mxfp8_gdpa_with_backward', 'layernorm_mxfp8_quantize',
+    'layernorm_mxfp8_quantize_numerics_preserving', 'layernorm_mxfp8_with_backward',
+    'layernorm_nvfp4_backward_from_x_norm_padded_dy', 'layernorm_nvfp4_quantize', 'layernorm_nvfp4_quantize_inplace',
+    'layernorm_nvfp4_quantize_q0_jagged_transpose', 'layernorm_nvfp4_quantize_q0_jagged_transpose_inplace',
+    'norm_backward_from_normalized', 'norm_bwd', 'norm_fwd', 'norm_quant_mxfp8_fwd', 'nvfp4_quantize_normalized',
+    'rmsnorm', 'rmsnorm_backward', 'rmsnorm_backward_from_x_norm', 'rmsnorm_backward_quantize_dx_mxfp8',
+    'rmsnorm_backward_quantize_dx_mxfp8_bf16_precomputed',
     'rmsnorm_backward_quantize_dx_mxfp8_from_output_recompute_q_precomputed',
     'rmsnorm_backward_quantize_dx_mxfp8_precomputed', 'rmsnorm_mxfp4', 'rmsnorm_mxfp8_quantize',
     'rmsnorm_mxfp8_quantize_3232_2pass', 'rmsnorm_nvfp4_quantize', 'softmax', 'softmax_bwd', 'softmax_fwd'
@@ -851,6 +853,46 @@ def moe_routing(router_logits, correction_bias, topk=8, *, router_multiplier=1.0
         return fn(router_logits, correction_bias, topk, router_multiplier, route_scale, eps, num_valid_tokens, out)
 
 
+def _check_boundary_inputs(op, stream, branch, post_weight, pre_weight, alpha, beta, out, new_stream):
+    """Validate a residual-stream boundary call; returns its tensors (inputs, then given outputs) and ``H``."""
+    import torch
+
+    if not isinstance(stream, torch.Tensor) or not isinstance(branch, torch.Tensor):
+        raise InvalidInput(f"tlx.ops.{op} expects tensor stream and branch")
+    if (stream.ndim != 2 or stream.shape != branch.shape or stream.dtype != torch.float32
+            or branch.dtype != torch.bfloat16 or not stream.is_contiguous() or not branch.is_contiguous()):
+        raise InvalidInput(f"tlx.ops.{op} expects contiguous FP32 stream and BF16 branch of one "
+                           f"(T, H) shape; got {tuple(stream.shape)} {stream.dtype} and {tuple(branch.shape)} "
+                           f"{branch.dtype}")
+    T, H = branch.shape
+    for name, w in (("post_weight", post_weight), ("pre_weight", pre_weight)):
+        if w is not None and (not isinstance(w, torch.Tensor) or w.shape != (H, ) or w.dtype != torch.bfloat16
+                              or not w.is_contiguous()):
+            raise InvalidInput(f"tlx.ops.{op} expects a contiguous BF16 {name} of shape ({H},)")
+    if (alpha is None) != (beta is None):
+        raise InvalidInput(f"tlx.ops.{op} expects alpha and beta together")
+    if alpha is not None and any(not isinstance(g, torch.Tensor) or g.shape not in (
+        (H, ), (1, )) or g.dtype != torch.float32 or not g.is_contiguous() or g.shape != alpha.shape
+                                 for g in (alpha, beta)):
+        raise InvalidInput(f"tlx.ops.{op} expects contiguous FP32 alpha and beta of shape ({H},) "
+                           "or (1,)")
+    inputs = tuple(t for t in (stream, branch, post_weight, pre_weight, alpha, beta) if t is not None)
+    outputs = []
+    for name, buf, dtype in (("out", out, torch.bfloat16), ("new_stream", new_stream, torch.float32)):
+        if buf is None:
+            continue
+        if not isinstance(buf, torch.Tensor) or buf.shape != (T, H) or buf.dtype != dtype or not buf.is_contiguous():
+            raise InvalidInput(f"tlx.ops.{op} expects a contiguous {dtype} {name} of shape "
+                               f"({T}, {H})")
+        if any(torch._C._overlaps(buf, t) for t in (*inputs, *outputs)):
+            raise InvalidInput(f"tlx.ops.{op} {name} must not alias an input or output")
+        outputs.append(buf)
+    if any(t.device != branch.device for t in (*inputs, *outputs)):
+        raise InvalidInput(f"tlx.ops.{op} expects all tensors on one device")
+
+    return (*inputs, *outputs), H
+
+
 def norm_residual_norm(stream, branch, *, post_weight=None, post_norm_input_scale=False, pre_weight=None, alpha=None,
                        beta=None, post_eps=1e-6, pre_eps=1e-6, pre_norm_bf16=False, out=None, new_stream=None,
                        space=None):
@@ -869,48 +911,97 @@ def norm_residual_norm(stream, branch, *, post_weight=None, post_norm_input_scal
     """
     import torch
 
-    if not isinstance(stream, torch.Tensor) or not isinstance(branch, torch.Tensor):
-        raise InvalidInput("tlx.ops.norm_residual_norm expects tensor stream and branch")
-    if (stream.ndim != 2 or stream.shape != branch.shape or stream.dtype != torch.float32
-            or branch.dtype != torch.bfloat16 or not stream.is_contiguous() or not branch.is_contiguous()):
-        raise InvalidInput("tlx.ops.norm_residual_norm expects contiguous FP32 stream and BF16 branch of one "
-                           f"(T, H) shape; got {tuple(stream.shape)} {stream.dtype} and {tuple(branch.shape)} "
-                           f"{branch.dtype}")
-    T, H = branch.shape
-    for name, w in (("post_weight", post_weight), ("pre_weight", pre_weight)):
-        if w is not None and (not isinstance(w, torch.Tensor) or w.shape != (H, ) or w.dtype != torch.bfloat16
-                              or not w.is_contiguous()):
-            raise InvalidInput(f"tlx.ops.norm_residual_norm expects a contiguous BF16 {name} of shape ({H},)")
-    if (alpha is None) != (beta is None):
-        raise InvalidInput("tlx.ops.norm_residual_norm expects alpha and beta together")
-    if alpha is not None and any(not isinstance(g, torch.Tensor) or g.shape not in (
-        (H, ), (1, )) or g.dtype != torch.float32 or not g.is_contiguous() or g.shape != alpha.shape
-                                 for g in (alpha, beta)):
-        raise InvalidInput(f"tlx.ops.norm_residual_norm expects contiguous FP32 alpha and beta of shape ({H},) "
-                           "or (1,)")
-    inputs = tuple(t for t in (stream, branch, post_weight, pre_weight, alpha, beta) if t is not None)
-    outputs = []
-    for name, buf, dtype in (("out", out, torch.bfloat16), ("new_stream", new_stream, torch.float32)):
-        if buf is None:
-            continue
-        if not isinstance(buf, torch.Tensor) or buf.shape != (T, H) or buf.dtype != dtype or not buf.is_contiguous():
-            raise InvalidInput(f"tlx.ops.norm_residual_norm expects a contiguous {dtype} {name} of shape "
-                               f"({T}, {H})")
-        if any(torch._C._overlaps(buf, t) for t in (*inputs, *outputs)):
-            raise InvalidInput(f"tlx.ops.norm_residual_norm {name} must not alias an input or output")
-        outputs.append(buf)
-    if any(t.device != branch.device for t in (*inputs, *outputs)):
-        raise InvalidInput("tlx.ops.norm_residual_norm expects all tensors on one device")
-
+    tensors, H = _check_boundary_inputs("norm_residual_norm", stream, branch, post_weight, pre_weight, alpha, beta, out,
+                                        new_stream)
     space_name, invariance = _normalize_space_arg("norm_residual_norm", space)
     _check_single_config_space("norm_residual_norm", space_name)
     fn, spec = impl_for("norm_residual_norm", device=branch.device)
     check_inputs(spec, dtype=branch.dtype, H=H)
-    check_backward(spec, *inputs, *outputs)
+    check_backward(spec, *tensors)
     _check_enforced("norm_residual_norm", spec, invariance)
     with torch.cuda.device(branch.device):
         return fn(stream, branch, post_weight, bool(post_norm_input_scale), pre_weight, alpha, beta, post_eps, pre_eps,
                   bool(pre_norm_bf16), out, new_stream)
+
+
+def all_reduce_workspace(max_numel, *, group=None):
+    """Peer-mapped buffers for ``all_reduce`` and ``all_reduce_norm_residual_norm`` on the current device.
+
+    Collective over ``group`` (default: the world group of an initialized ``torch.distributed`` with one GPU per
+    rank on one node). ``workspace.input(*shape)`` returns a view of the symmetric BF16 input buffer, which holds
+    ``max_numel`` elements; write the local partial into it and pass that view to the op. Calls on one workspace
+    must not overlap: issue them from one stream or order the streams, and give each concurrent stream its own
+    workspace. A failure during setup raises on every rank.
+    ``workspace.close()``, called on every rank of the group, releases the peer mappings; later calls raise.
+    """
+    import torch
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    fn, spec = impl_for("all_reduce_workspace", device=device)
+    with torch.cuda.device(device):
+        return fn(int(max_numel), group)
+
+
+def _check_all_reduce_input(op, x, workspace):
+    import torch
+
+    if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16 or not x.is_contiguous():
+        raise InvalidInput(f"tlx.ops.{op} expects a contiguous BF16 tensor")
+    if getattr(workspace, "closed", False):
+        raise InvalidInput(f"tlx.ops.{op} got a closed workspace")
+    if not hasattr(workspace, "holds") or not workspace.holds(x):
+        raise InvalidInput(f"tlx.ops.{op} expects the input to be workspace.input(...) of its workspace")
+
+
+def all_reduce(x, workspace, *, out=None, space=None):
+    """Sum of ``x`` over the ranks of ``workspace``'s group, returned on every rank. Forward only.
+
+    ``x`` is BF16 and must be ``workspace.input(*x.shape)``. Each element is the FP32 sum of the ranks' values in rank
+    order, rounded to BF16, so every rank gets the same bits for every token count. Returns ``out`` (BF16, the
+    shape of ``x``), filling it when passed. Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    _check_all_reduce_input("all_reduce", x, workspace)
+    if out is not None and (not isinstance(out, torch.Tensor) or out.shape != x.shape or out.dtype != x.dtype
+                            or not out.is_contiguous() or out.device != x.device or out.data_ptr() % 16
+                            or torch._C._overlaps(out, x)):
+        raise InvalidInput(f"tlx.ops.all_reduce expects a contiguous, 16-byte aligned BF16 out of shape "
+                           f"{tuple(x.shape)} that does not alias the input")
+    space_name, invariance = _normalize_space_arg("all_reduce", space)
+    _check_single_config_space("all_reduce", space_name)
+    fn, spec = impl_for("all_reduce", device=x.device)
+    check_inputs(spec, dtype=x.dtype, world=workspace.world)
+    check_backward(spec, x, out)
+    _check_enforced("all_reduce", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, workspace, out)
+
+
+def all_reduce_norm_residual_norm(stream, branch, workspace, *, post_weight=None, post_norm_input_scale=False,
+                                  pre_weight=None, alpha=None, beta=None, post_eps=1e-6, pre_eps=1e-6,
+                                  pre_norm_bf16=False, out=None, new_stream=None, space=None):
+    """``norm_residual_norm`` of ``stream`` and ``all_reduce(branch)``. Forward only.
+
+    ``branch`` is this rank's BF16 partial and must be ``workspace.input(T, H)``; the other arguments and the
+    returns are those of ``norm_residual_norm``. The result is bitwise equal to ``all_reduce`` followed by
+    ``norm_residual_norm``, on every rank. Decode-sized calls run as one kernel. Only
+    ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    _check_all_reduce_input("all_reduce_norm_residual_norm", branch, workspace)
+    tensors, H = _check_boundary_inputs("all_reduce_norm_residual_norm", stream, branch, post_weight, pre_weight, alpha,
+                                        beta, out, new_stream)
+    space_name, invariance = _normalize_space_arg("all_reduce_norm_residual_norm", space)
+    _check_single_config_space("all_reduce_norm_residual_norm", space_name)
+    fn, spec = impl_for("all_reduce_norm_residual_norm", device=branch.device)
+    check_inputs(spec, dtype=branch.dtype, H=H, world=workspace.world)
+    check_backward(spec, *tensors)
+    _check_enforced("all_reduce_norm_residual_norm", spec, invariance)
+    with torch.cuda.device(branch.device):
+        return fn(stream, branch, workspace, post_weight, bool(post_norm_input_scale), pre_weight, alpha, beta,
+                  post_eps, pre_eps, bool(pre_norm_bf16), out, new_stream)
 
 
 def router_gemm(x, weight, *, out=None, space=None):
@@ -1821,8 +1912,10 @@ def _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, q
     if (query.dtype == fp8 and not kv_fp8) or (kv_fp8 and key_cache.ndim != 4):
         raise InvalidInput("tlx.ops.paged_attention_decode supports a float8_e4m3fn query only with float8_e4m3fn "
                            "K/V, and FP8 K/V only on a 4-D cache")
-    if context_lens.dtype != torch.int32 or block_tables.dtype != torch.int32 or block_tables.ndim != 2:
-        raise InvalidInput("tlx.ops.paged_attention_decode expects int32 context_lens and 2-D int32 block_tables")
+    if context_lens.dtype not in (torch.int32, torch.int64):
+        raise InvalidInput("tlx.ops.paged_attention_decode expects int32 or int64 context_lens")
+    if block_tables.dtype != torch.int32 or block_tables.ndim != 2:
+        raise InvalidInput("tlx.ops.paged_attention_decode expects 2-D int32 block_tables")
     if any(t.device != query.device for t in (key_cache, value_cache, context_lens, block_tables)):
         raise InvalidInput("tlx.ops.paged_attention_decode expects all tensors on one device")
     num_kv_heads = key_cache.shape[2 if kv_layout == "NHD" else 1]
@@ -1845,7 +1938,8 @@ def _decode_compute_dtype(query, out):
 
 def paged_attention_decode(query, key_cache, value_cache, context_lens, block_tables, *, sm_scale=None, query_length=1,
                            sliding_window=0, max_context_len=None, out=None, workspace=None, kv_layout="HND",
-                           k_descale=None, v_descale=None, q_descale=None, space=None):
+                           k_descale=None, v_descale=None, q_descale=None, out_gate=None, out_norm_eps=1e-6,
+                           space=None):
     """Forward-only GQA decode attention over a paged K/V cache.
 
     ``query`` is ``(num_seqs * query_length, q_heads, head_dim)``; sequence ``s``
@@ -1857,7 +1951,8 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     kv_heads, head_dim)``, or the AITER-packed 5-D layout from
     ``allocate_paged_kv_cache_5d``. A positive ``sliding_window`` limits each
     query row to its last ``sliding_window`` keys, itself included; pages before
-    the earliest window are never read. ``max_context_len`` bounds every context and
+    the earliest window are never read. ``context_lens`` may be int32 or int64.
+    ``max_context_len`` bounds every context and
     picks the split-K plan; pass it, and a buffer from
     ``paged_attention_decode_workspace``, to keep launches graph-capturable.
 
@@ -1865,6 +1960,11 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     / ``v_descale`` tensors (K/V = stored value * descale). The query may then be
     BF16/FP16, or ``float8_e4m3fn`` with ``q_descale``; an FP8 query writes a
     BF16 output unless ``out`` is FP16.
+
+    Output norm and gate: with a BF16 ``out_gate`` of shape ``(tokens, q_heads * 64)`` (contiguous last dimension,
+    any row stride, so a column slice of a projection output) and head_dim 64, the result is
+    ``rmsnorm_gate(attention, out_gate, eps=out_norm_eps)`` of the BF16 attention output, bitwise, applied in the
+    split-K reduce (the plan then has at least two splits; build the workspace with ``norm_gate=True``).
     """
     import torch
     group = _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length, kv_layout)
@@ -1886,14 +1986,26 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
                             or out.dtype not in (torch.bfloat16, torch.float16)):
         raise InvalidInput("tlx.ops.paged_attention_decode expects out to match query's shape, dtype and device "
                            "(BF16/FP16 for an FP8 query)")
+    if out_gate is not None:
+        rows, q_heads, head_dim = query.shape
+        if (not isinstance(out_gate, torch.Tensor) or head_dim != 64 or out_dtype != torch.bfloat16
+                or out_gate.dtype != torch.bfloat16 or out_gate.shape != (rows, q_heads * 64) or out_gate.stride(1) != 1
+                or out_gate.device != query.device):
+            raise InvalidInput(f"{name} expects head_dim 64, a BF16 output and a BF16 out_gate of shape "
+                               f"({rows}, {q_heads * 64}) with a contiguous last dimension")
+        if not 0 < out_norm_eps < math.inf:
+            raise InvalidInput(f"{name} expects a positive finite out_norm_eps; got {out_norm_eps!r}")
+        if out is not None and torch._C._overlaps(out, out_gate):
+            raise InvalidInput(f"{name} out must not alias out_gate")
     fn, spec = impl_for("paged_attention_decode", device=query.device)
     check_inputs(spec, dtype=out_dtype, HEAD_DIM=query.shape[2], QLEN=query_length, GROUP=group)
-    check_backward(spec, query, key_cache, value_cache)
+    check_backward(spec, query, key_cache, value_cache, out, out_gate, k_descale, v_descale, q_descale)
     _check_enforced("paged_attention_decode", spec, invariance)
+    gate_kwargs = {} if out_gate is None else dict(out_gate=out_gate, out_norm_eps=float(out_norm_eps))
     with torch.cuda.device(query.device):
         return fn(query, key_cache, value_cache, context_lens, block_tables, float(sm_scale), int(query_length),
                   int(sliding_window), max_context_len, out, workspace, kv_layout, k_descale=k_descale,
-                  v_descale=v_descale, q_descale=q_descale)
+                  v_descale=v_descale, q_descale=q_descale, **gate_kwargs)
 
 
 def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k, softmax_scale, causal,
@@ -1970,7 +2082,7 @@ def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
     _check_single_config_space("paged_attention_prefill", space_name)
     fn, spec = impl_for("paged_attention_prefill", device=q.device)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[2], GROUP=q.shape[1] // num_kv_heads)
-    check_backward(spec, q, k, v)
+    check_backward(spec, q, k, v, out, k_descale, v_descale)
     _check_enforced("paged_attention_prefill", spec, invariance)
     with torch.cuda.device(q.device):
         fn(q, k, v, cu_seqlens_q, seqused_k.to(torch.int32), block_table, max_seqlen_q, sm_scale=float(softmax_scale),
@@ -1980,16 +2092,16 @@ def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
 
 
 def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, *, query_length=1, sliding_window=0,
-                                     max_context_len=None, kv_layout="HND"):
+                                     max_context_len=None, kv_layout="HND", norm_gate=False):
     """Reusable FP32 split-K workspace for ``paged_attention_decode`` with the same
-    arguments, or None when the plan needs none."""
+    arguments (``norm_gate=True`` for calls with ``out_gate``), or None when the plan needs none."""
     _check_sliding_window("paged_attention_decode_workspace", sliding_window)
     fn, spec = impl_for("paged_attention_decode_workspace", device=query.device)
     check_inputs(spec, dtype=_decode_compute_dtype(query, None))
     import torch
     with torch.cuda.device(query.device):
         return fn(query, key_cache, value_cache, block_tables, int(query_length), int(sliding_window), max_context_len,
-                  kv_layout)
+                  kv_layout, bool(norm_gate))
 
 
 def allocate_paged_kv_cache_5d(num_blocks, num_kv_heads, page_size, head_dim, *, dtype, device):
@@ -2007,3 +2119,153 @@ def reshape_and_cache_5d(key, value, key_cache, value_cache, slot_mapping):
     fn, spec = impl_for("reshape_and_cache_5d", device=key.device)
     check_inputs(spec, dtype=key.dtype)
     return fn(key, value, key_cache, value_cache, slot_mapping)
+
+
+def _check_fp8_paged_kv(query, key_cache, value_cache, block_tables, *, max_context_len, query_length, sliding_window,
+                        num_splits):
+    import torch
+    if query.ndim != 3 or query.shape[0] == 0 or query.shape[1] == 0 or query.shape[2] not in (64, 128):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects nonempty Q [tokens, heads, D64/D128]")
+    if query.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects BF16 or E4M3FN Q")
+    if key_cache.ndim != 5 or value_cache.ndim != 5:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects packed 5-D K/V caches")
+    blocks, kv_heads, groups, page, x = key_cache.shape
+    if (blocks == 0 or kv_heads == 0 or query.shape[1] % kv_heads or x != 16 or groups * x != query.shape[2]
+            or page < 16 or page % 16):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: invalid packed K layout or head grouping")
+    if value_cache.shape != (blocks, kv_heads, page // x, query.shape[2], x):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: invalid packed V layout")
+    if key_cache.dtype != torch.float8_e4m3fn or value_cache.dtype != torch.float8_e4m3fn:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 requires plain E4M3FN K/V")
+    if not key_cache.is_contiguous() or not value_cache.is_contiguous():
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 requires contiguous packed K/V")
+    if isinstance(query_length,
+                  bool) or not isinstance(query_length, int) or query_length < 1 or query.shape[0] % query_length:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: query_length must divide the query token count")
+    if isinstance(max_context_len, bool) or not isinstance(max_context_len, int) or max_context_len < 1:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects a positive integer max_context_len")
+    batch = query.shape[0] // query_length
+    if (block_tables.ndim != 2 or block_tables.shape[0] != batch or block_tables.stride(1) != 1
+            or block_tables.dtype not in (torch.int32, torch.int64)
+            or block_tables.shape[1] < (max_context_len + page - 1) // page):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: block table capacity/layout must cover max_context_len")
+    if any(t.device != query.device for t in (key_cache, value_cache, block_tables)):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects all inputs on the query device")
+    _check_sliding_window("paged_attention_decode_fp8", sliding_window)
+    if num_splits is not None and (isinstance(num_splits, bool) or not isinstance(num_splits, int)
+                                   or not 1 <= num_splits <= 1024):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects num_splits in [1, 1024]")
+    return batch, kv_heads
+
+
+def paged_attention_decode_fp8(query, key_cache, value_cache, context_lens, block_tables, k_scale, v_scale, *,
+                               max_context_len, q_scale=None, query_length=1, causal=True, sliding_window=0,
+                               sm_scale=None, num_splits=None, out=None, workspace=None, space=None):
+    """Forward-only attention over packed E4M3FN KV with per-head multipliers.
+
+    Q is ``[batch * query_length, query_heads, D]``, BF16 or E4M3FN; D is 64/128.
+    K is ``[blocks, kv_heads, D/16, page_size, 16]`` and V is
+    ``[blocks, kv_heads, page_size/16, D, 16]``, contiguous E4M3FN.
+    ``page_size`` counts cached tokens per physical KV block and is a positive
+    multiple of 16; the inner 16 is a separate packing factor. ``block_tables``
+    maps each sequence's logical page to a physical block id: token t uses
+    entry ``t // page_size`` and within-page offset ``t % page_size``.
+    Separate FP32 ``k_scale``/``v_scale`` vectors have one multiplier per KV
+    head; FP8 Q requires an FP32 ``q_scale`` per query head. Scale values must be positive
+    and finite and inputs finite. This is not E8M0 block-scaled MXFP8.
+
+    ``context_lens`` includes the queries' K/V. Causal queries align with the
+    context's final positions; noncausal query sets share the whole cache.
+    A positive ``sliding_window`` includes the current key and requires causal
+    attention. Empty/fully masked rows produce zero. Context lengths must be
+    in ``[0, max_context_len]`` and referenced page ids valid; these device-side
+    value preconditions are not copied to the host for inspection.
+
+    Returns contiguous BF16 with Q's shape, before output projection. ``out``
+    can supply that allocation. Reuse ``paged_attention_decode_fp8_workspace``
+    with the same planning arguments for graph capture. Allocate both before
+    capture; workspace planning uses the same query/cache shapes, context
+    bound, query length, sliding window and optional split override as attention.
+    Automatic batched single-token decode may choose active splits per request
+    from device context lengths within a fixed graph/workspace capacity. Short
+    requests can bypass split scratch and merge while long requests retain
+    partition parallelism. Explicit split counts override this policy. Only the
+    ``heuristic`` search space is supported; implementation choices remain private.
+    """
+    import torch
+    batch, kv_heads = _check_fp8_paged_kv(query, key_cache, value_cache, block_tables, max_context_len=max_context_len,
+                                          query_length=query_length, sliding_window=sliding_window,
+                                          num_splits=num_splits)
+    if (context_lens.shape != (batch, ) or context_lens.dtype not in (torch.int32, torch.int64)
+            or not context_lens.is_contiguous() or context_lens.device != query.device):
+        raise InvalidInput(
+            "tlx.ops.paged_attention_decode_fp8 expects integer context_lens [batch] on the query device")
+    if not isinstance(causal, bool) or (sliding_window and not causal):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: sliding windows require causal=True")
+    if query.dtype == torch.float8_e4m3fn and q_scale is None:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: FP8 Q requires per-query-head q_scale")
+    if query.dtype == torch.bfloat16 and q_scale is not None:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8: q_scale applies only to FP8 Q")
+    for name, scale, heads in (("k_scale", k_scale, kv_heads), ("v_scale", v_scale, kv_heads), ("q_scale", q_scale,
+                                                                                                query.shape[1])):
+        if name == "q_scale" and scale is None:
+            continue
+        if (not isinstance(scale, torch.Tensor) or scale.shape != (heads, ) or scale.dtype != torch.float32
+                or scale.device != query.device or not scale.is_contiguous()):
+            raise InvalidInput(
+                f"tlx.ops.paged_attention_decode_fp8: {name} must be contiguous FP32 [{heads}] on the query device")
+    sm_scale = query.shape[2]**-.5 if sm_scale is None else sm_scale
+    if not isinstance(sm_scale, (int, float)) or isinstance(sm_scale, bool) or not 0 < sm_scale < math.inf:
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects positive finite sm_scale")
+    if out is not None and (out.shape != query.shape or out.dtype != torch.bfloat16 or out.device != query.device
+                            or not out.is_contiguous()):
+        raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects contiguous BF16 out with Q's shape/device")
+    if workspace is not None:
+        if not isinstance(workspace, (tuple, list)) or len(workspace) != 2:
+            raise InvalidInput("tlx.ops.paged_attention_decode_fp8 workspace must be a partial/LSE pair")
+        partial, lse = workspace
+        if (not isinstance(partial, torch.Tensor) or not isinstance(lse, torch.Tensor) or partial.ndim != 4
+                or lse.ndim != 3 or partial.shape[:2] != query.shape[:2] or partial.shape[-1] != query.shape[-1]
+                or partial.shape[:-1] != lse.shape
+                or any(t.dtype != torch.float32 or t.device != query.device or not t.is_contiguous()
+                       for t in workspace)):
+            raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects contiguous FP32 partial/LSE workspace for Q")
+    space_name, invariance = _normalize_space_arg("paged_attention_decode_fp8", space)
+    _check_single_config_space("paged_attention_decode_fp8", space_name)
+    fn, spec = impl_for("paged_attention_decode_fp8", device=query.device)
+    check_inputs(spec, dtype=query.dtype, HEAD_DIM=query.shape[2])
+    check_backward(spec, query, key_cache, value_cache, k_scale, v_scale, q_scale)
+    _check_enforced("paged_attention_decode_fp8", spec, invariance)
+    with torch.cuda.device(query.device):
+        try:
+            return fn(query, key_cache, value_cache, context_lens, block_tables, k_scale, v_scale,
+                      max_context_len=max_context_len, q_scale=q_scale, query_length=query_length, causal=causal,
+                      sliding_window=sliding_window, sm_scale=float(sm_scale), num_splits=num_splits, out=out,
+                      workspace=workspace)
+        except ValueError as error:
+            raise InvalidInput(f"tlx.ops.paged_attention_decode_fp8: {error}") from error
+
+
+def paged_attention_decode_fp8_workspace(query, key_cache, value_cache, block_tables, *, max_context_len,
+                                         query_length=1, sliding_window=0, num_splits=None, space=None):
+    """Allocate reusable opaque FP32 split buffers, or None for a single split.
+
+    Planning arguments must match ``paged_attention_decode_fp8``. Returned
+    capacity shapes are ``[tokens, query_heads, splits, D]`` for partial values
+    and ``[tokens, query_heads, splits]`` for log-sum-exp. Both partial values
+    and log-sum-exp retain FP32 precision; treat their contents as opaque.
+    No device metadata values are read back and no quantization or attention
+    is run. Allocate this workspace and output before graph capture.
+    """
+    import torch
+    _check_fp8_paged_kv(query, key_cache, value_cache, block_tables, max_context_len=max_context_len,
+                        query_length=query_length, sliding_window=sliding_window, num_splits=num_splits)
+    name, invariance = _normalize_space_arg("paged_attention_decode_fp8_workspace", space)
+    _check_single_config_space("paged_attention_decode_fp8_workspace", name)
+    fn, spec = impl_for("paged_attention_decode_fp8_workspace", device=query.device)
+    check_inputs(spec, dtype=query.dtype)
+    _check_enforced("paged_attention_decode_fp8_workspace", spec, invariance)
+    with torch.cuda.device(query.device):
+        return fn(query, key_cache, value_cache, block_tables, max_context_len=max_context_len,
+                  query_length=query_length, sliding_window=sliding_window, num_splits=num_splits)

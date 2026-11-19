@@ -41,6 +41,10 @@ struct L2Cache : public SideEffects::Resource::Base<L2Cache> {
 } // namespace mlir::triton::amd
 
 namespace mlir::triton::amdgpu {
+/// Unit attribute on a scaled dot whose FP6 operands are already packed per
+/// 32-code segment: 24 packed bytes followed by 8 padding bytes per lane.
+constexpr llvm::StringLiteral kFp6PackedAttrName = "amdg.fp6_packed";
+
 /// Returns the number of dwords for a TDM tensor descriptor based on rank.
 /// 2D tensors: group0 (4) + group1 (8) = 12 dwords
 /// 3D-5D tensors: group0 (4) + group1 (8) + group2 (4) + group3 (4) = 20 dwords

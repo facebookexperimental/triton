@@ -833,7 +833,7 @@ class TritonSemantic(Generic[TensorTy]):
         if rounding_mode == "rtz":
             return ir.ROUNDING_MODE.RTZ
         if rounding_mode == "rs":
-            return ir.ROUNDING_MODE.RS
+            raise ValueError("Stochastic rounding requires explicit random bits; use tlx.stoch_round or tl.sr_store.")
         raise ValueError(f"Invalid rounding mode: {rounding_mode}. Supported rounding modes are 'rtne' and 'rtz'.")
 
     def bitcast(self, input: TensorTy, dst_ty: tl.dtype) -> TensorTy:
