@@ -1,3 +1,4 @@
+#include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "TritonAMDGPUTransforms/WmmaGroup.h"
@@ -671,8 +672,11 @@ struct MfmaDotPlan {
   unsigned kWidth;
 
   ttg::DotOperandEncodingAttr getOperandEncoding(unsigned opIdx) const {
-    return ttg::DotOperandEncodingAttr::get(enc.getContext(), opIdx, enc,
-                                            withScale ? kWidth / 2 : kWidth);
+    // FP6 fragments must keep one consecutive 32-code scale group per lane.
+    bool fp6 = isa<Float6E2M3FNType, Float6E3M2FNType>(
+        opIdx == 0 ? instr.aElementType : instr.bElementType);
+    return ttg::DotOperandEncodingAttr::get(
+        enc.getContext(), opIdx, enc, withScale && !fp6 ? kWidth / 2 : kWidth);
   }
 };
 
@@ -1415,6 +1419,11 @@ public:
     auto newDot = triton::DotScaledOp::create(
         rewriter, dotOp.getLoc(), newRetType, a, b, newAcc, newAScale,
         newBScale, aElemType, bElemType, dotOp.getFastMath());
+    // The TLX native kernel presents FP6 operands as per-segment
+    // packed bytes; consume them directly in ScaledMFMA lowering.
+    if (isMXFP6ScaleType(aElemType) || isMXFP6ScaleType(bElemType))
+      newDot->setAttr(triton::amdgpu::kFp6PackedAttrName,
+                      rewriter.getUnitAttr());
 
     rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(dotOp, oldRetType,
                                                       newDot);
