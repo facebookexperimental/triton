@@ -125,20 +125,6 @@ def _gemm_mxfp6_native_kernel(
     tl.store(c_ptrs, acc.to(tl.bfloat16))
 
 
-def _heuristic_config(M, N, K):
-    if N % 256 == 0:
-        block_m, block_n = 128, 256
-    else:
-        block_m, block_n = 128, 128
-    return {
-        "BLOCK_SIZE_M": block_m,
-        "BLOCK_SIZE_N": block_n,
-        "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 8,
-        "num_warps": 8,
-    }
-
-
 def _full_configs():
     configs = []
     for block_m, block_n, block_k in (
@@ -195,7 +181,23 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
         out = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     with torch.cuda.device(a.device):
         if space == "heuristic":
-            meta = _heuristic_config(M, N, K)
+            # Start from the BF16 default tile (256x256x64); the
+            # 128-wide K tile overflowed registers in this kernel.
+            # The kernel has no bounds masking, so the 256-wide M/N
+            # tile is only valid when it divides M/N; small shapes
+            # (e.g. the 128 ones test) use a 128-wide tile at the
+            # same K=64 to stay exact.
+            if M % 256 == 0 and N % 256 == 0:
+                block_m, block_n = 256, 256
+            else:
+                block_m, block_n = 128, 128
+            meta = {
+                "BLOCK_SIZE_M": block_m,
+                "BLOCK_SIZE_N": block_n,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "num_warps": 8,
+            }
             grid = (triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]), )
             _gemm_mxfp6_native_kernel[grid](
                 a,
