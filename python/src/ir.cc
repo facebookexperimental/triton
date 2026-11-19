@@ -1799,6 +1799,13 @@ void init_triton_ir(py::module_ &m) {
              return self.create<LoadOp>(ptrs, Value(), Value(), cachePolicy,
                                         isVolatile);
            })
+      .def("create_sr_store",
+           [](TritonOpBuilder &self, Value ptr, Value value, Value index,
+              std::optional<Value> mask, const std::string &site,
+              CacheModifier cache, EvictionPolicy evict) {
+             self.create<SrStoreOp>(ptr, value, index, mask.value_or(Value()),
+                                    site, 0, cache, evict);
+           })
       .def("create_store",
            [](TritonOpBuilder &self, Value &ptrs, Value &value,
               Attribute cachePolicy) -> void {
