@@ -1062,11 +1062,12 @@ void init_triton_ir(py::module_ &m) {
           ret::reference)
       .def(
           "set_arg_attr",
-          [](FuncOp &self, int arg_no, const std::string &name, int val) {
+          [](FuncOp &self, int arg_no, const std::string &name, int64_t val) {
             if (arg_no >= self.getNumArguments())
               throw py::index_error("Function argument index out of range");
             // set arg attributes "name" to value "val"
-            auto attrTy = IntegerType::get(self.getContext(), 32);
+            auto attrTy = IntegerType::get(
+                self.getContext(), name.starts_with("tt.sr_") ? 64 : 32);
             self.setArgAttr(arg_no, name, IntegerAttr::get(attrTy, val));
           },
           ret::reference)
