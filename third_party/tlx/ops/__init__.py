@@ -1462,14 +1462,16 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
         return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), sm_scale, bool(causal))
 
 
-def flash_attn_varlen_mxfp8(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scale=None, causal=False, *,
-                            fast_exp=False, space=None):
+def flash_attn_varlen_mxfp8(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None,
+                            causal=False, *, fast_exp=False, space=None):
     """Forward-only packed MXFP8 attention using the gfx950 4-wave kernel.
 
     Q/K/V are contiguous BF16 ``(tokens, 4, 128)`` tensors with one sequence
     per pair of int32 cumulative-length arrays. This op is noncausal and
-    requires MHA with exactly four heads. ``max_seqlen_q`` is accepted for API
-    parity and ``sm_scale`` defaults to ``128**-0.5``.
+    requires MHA with exactly four heads. ``max_seqlen_q`` and ``max_seqlen_k``
+    are accepted for API parity. ``sm_scale`` defaults to ``128**-0.5`` and
+    ``fast_exp`` enables the approximate exponentiation path. The cumulative
+    sequence-offset tensors must not be modified in place while reused.
     """
     import torch
 
@@ -1477,12 +1479,12 @@ def flash_attn_varlen_mxfp8(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, s
         raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 is noncausal")
     if any(t.ndim != 3 for t in (q, k, v)):
         raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 expects rank-3 Q/K/V tensors")
-    if q.shape != k.shape or q.shape != v.shape or q.shape[1:] != (4, 128):
+    if k.shape != v.shape or any(t.shape[1:] != (4, 128) for t in (q, k, v)):
         raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 expects Q/K/V shape (tokens, 4, 128)")
     if any(t.dtype != torch.bfloat16 or not t.is_contiguous() for t in (q, k, v)):
         raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 expects contiguous BF16 Q/K/V")
     if (cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1 or cu_seqlens_q.shape != cu_seqlens_k.shape
-            or cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32
+            or cu_seqlens_q.numel() < 2 or cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32
             or not cu_seqlens_q.is_contiguous() or not cu_seqlens_k.is_contiguous()):
         raise InvalidInput("tlx.ops.flash_attn_varlen_mxfp8 expects contiguous int32 sequence offsets")
     if any(t.device != q.device for t in (k, v, cu_seqlens_q, cu_seqlens_k)):
@@ -1497,7 +1499,7 @@ def flash_attn_varlen_mxfp8(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, s
     _check_enforced("flash_attn_varlen_mxfp8", spec, invariance)
     scale = 128**-0.5 if sm_scale is None else sm_scale
     with torch.cuda.device(q.device):
-        return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), scale, fast_exp=fast_exp)
+        return fn(q, k, v, cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q), int(max_seqlen_k), scale, fast_exp=fast_exp)
 
 
 def _check_lora(name, proj, d_model, out_features):

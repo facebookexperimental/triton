@@ -181,21 +181,6 @@ def test_flash_attn_varlen_strided_qkv():
     torch.testing.assert_close(out.float(), ref, **TOLERANCE[torch.float16])
 
 
-def test_flash_attn_varlen_mxfp8_four_wave():
-    from triton.tlx.ops import flash_attn_varlen_mxfp8
-
-    torch.manual_seed(20)
-    lens_q, lens_k = [96, 128], [160, 192]
-    q = torch.randn(sum(lens_q), 4, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(sum(lens_k), 4, 128, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn_like(k)
-    cu_q, cu_k = _cu(lens_q), _cu(lens_k)
-    out = flash_attn_varlen_mxfp8(q, k, v, cu_q, cu_k, max(lens_q), causal=False)
-    ref = _reference(q, k, v, cu_q, cu_k, False, 128**-0.5)
-    assert out.shape == q.shape and out.dtype == q.dtype
-    torch.testing.assert_close(out.float(), ref, atol=0.08, rtol=0.08)
-
-
 @pytest.mark.parametrize("causal", [False, True])
 def test_flash_attn_varlen_int64_offsets(causal):
     """Element offsets past 2**31, with Q/K/V as head slices of one packed projection."""

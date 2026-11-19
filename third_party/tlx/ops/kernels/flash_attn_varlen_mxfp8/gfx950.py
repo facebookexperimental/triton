@@ -7,8 +7,10 @@ quantizes K and V into head-major buffers in which every sequence starts at
 a multiple of 256 keys and is zero-padded to one, in the layouts the core
 reads (K row-major with permuted scale words, V transposed with keys
 reordered inside 32-key groups). Q is quantized in registers. Work items are
-(256-row query tile, head) pairs, walked by a persistent grid; keys past the
-sequence end get -1e30 scores, which only the last two 128-key tiles need.
+128-row query-tile/head pairs, cost-balanced by a persistent grid; keys past
+the sequence end get -1e30 scores, which only the last two 128-key tiles need.
+The sequence-offset tensors must not be modified in place while their prepared
+metadata and work schedule are reused.
 """
 
 from __future__ import annotations
@@ -27,13 +29,12 @@ from . import mxfp8_attention_core_gfx950 as core
 
 _HEADS = 4
 _HEAD_DIM = 128
+_BLOCK_M = 128
 _PAD = 256
 _PREP_ROWS = 64
 _LOG2E = 1.4426950408889634
 
 _LAUNCH_OPTIONS = {
-    "MFMA_PRIO": 1,
-    "SOFTMAX_PRIO": 0,
     "num_warps": 4,
     "num_stages": 1,
     "llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"), ("amdgpu-ieee", "false")),
@@ -153,8 +154,6 @@ def _prepare_kv(
     KS,
     V8,
     VS,
-    VR8,
-    VRS,
     CuKV,
     CuPad,
     TileSequence,
@@ -162,19 +161,10 @@ def _prepare_kv(
     BATCH,
     NPAD,
     HEADS: tl.constexpr,
-    BACKWARD: tl.constexpr,
 ):
-    """One padded 64-key tile of one sequence and head; with BACKWARD, also V
-    in the K layout for the MXFP8 backward."""
+    """Quantize one padded 64-key tile of one sequence and head."""
     tile = tl.program_id(0)
     head = tl.program_id(1).to(tl.int64)
-    if BACKWARD and tile >= CAPACITY:
-        # Four extra programs zero the spare last 256 keys, which serve the
-        # backward's work items without keys.
-        dst = head * NPAD + NPAD - 256 + (tile - CAPACITY) * 64
-        _rows_tile(K, K8, KS, 0, dst, 0, 0, HEADS)
-        _rows_tile(V, VR8, VRS, 0, dst, 0, 0, HEADS)
-        return
     sequence = tl.load(TileSequence + tile, mask=tile < CAPACITY, other=BATCH)
     if sequence >= BATCH:
         return
@@ -186,8 +176,6 @@ def _prepare_kv(
     src = (first + key).to(tl.int64) * (HEADS * 128) + head * 128
     dst = head * NPAD + pad_start + row
     _prepare_tile(K, V, K8, KS, V8, VS, src, dst, -key, length - key, HEADS)
-    if BACKWARD:
-        _rows_tile(V, VR8, VRS, src, dst, -key, length - key, HEADS)
 
 
 @triton.jit
@@ -247,658 +235,6 @@ def _mask_front(s0, s1, front):
         s0 + tl.minimum(keys, 0).to(tl.float32) * 1e30,
         s1 + tl.minimum(keys + 64, 0).to(tl.float32) * 1e30,
     )
-
-
-@triton.jit
-def _four_stage_phase_8w(
-    q_lo,
-    q_hi,
-    qs_lo,
-    qs_hi,
-    kA0,
-    kA1,
-    kB0,
-    kB1,
-    sA0,
-    sA1,
-    sB0,
-    sB1,
-    ka,
-    kb,
-    ksa,
-    ksb,
-    va,
-    vb,
-    vsa,
-    vsb,
-    p0,
-    p1,
-    m_i,
-    l_i,
-    acc0,
-    acc1,
-    acc2,
-    acc3,
-    s0,
-    s1,
-    t,
-    n_tiles,
-    k_ptr,
-    v_ptr,
-    ks_ptr,
-    vs_ptr,
-    c_qk,
-    qk_scale,
-    K_READ: tl.constexpr,
-    V_READ: tl.constexpr,
-    K_WRITE: tl.constexpr,
-    V_WRITE: tl.constexpr,
-    MFMA_PRIO: tl.constexpr,
-    SOFTMAX_PRIO: tl.constexpr,
-    FAST_EXP: tl.constexpr,
-):
-    HN: tl.constexpr = 64
-    D: tl.constexpr = 128
-    k_step = 128 * D
-    v_step = 128 * D
-    ks_step = 128
-    k_n1 = HN * D
-    v_n1 = HN * D
-    ks_n1 = HN
-    OFF: tl.constexpr = core._score_offset(FAST_EXP)
-
-    with tlx.warp_pipeline_stage("compute1"):
-        s0, s1, l_i = core._compute_qk_rowsum(
-            q_lo,
-            q_hi,
-            qs_lo,
-            qs_hi,
-            kA0,
-            kA1,
-            kB0,
-            kB1,
-            sA0,
-            sA1,
-            sB0,
-            sB1,
-            p0,
-            p1,
-            l_i,
-            (OFF - m_i) * c_qk,
-            qk_scale,
-        )
-
-    with tlx.warp_pipeline_stage("memory1"):
-        if t + 1 < n_tiles:
-            core._issue_k_tile(
-                k_ptr,
-                ks_ptr,
-                tlx.local_view(ka, K_WRITE),
-                tlx.local_view(kb, K_WRITE),
-                tlx.local_view(ksa, K_WRITE),
-                tlx.local_view(ksb, K_WRITE),
-                t + 1,
-                k_step,
-                ks_step,
-                k_n1,
-                ks_n1,
-            )
-        v_ops = core._load_v_operands(
-            tlx.local_view(va, V_READ),
-            tlx.local_view(vb, V_READ),
-            tlx.local_view(vsa, V_READ),
-            tlx.local_view(vsb, V_READ),
-        )
-
-    with tlx.warp_pipeline_stage("compute2"):
-        acc0, acc1, acc2, acc3 = core._compute_pv(
-            p0,
-            p1,
-            *v_ops,
-            acc0,
-            acc1,
-            acc2,
-            acc3,
-        )
-        s0, s1, tmax0, tmax1, tshift, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax_stats(
-            s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale, FAST_EXP)
-    tlx.async_load_wait_group(2)
-    with tlx.warp_pipeline_stage("memory2"):
-        core._issue_v_tile(
-            v_ptr,
-            vs_ptr,
-            tlx.local_view(va, V_WRITE),
-            tlx.local_view(vb, V_WRITE),
-            tlx.local_view(vsa, V_WRITE),
-            tlx.local_view(vsb, V_WRITE),
-            t,
-            v_step,
-            ks_step,
-            v_n1,
-            ks_n1,
-        )
-        p0, p1 = core._pingpong_softmax_quantize(s0, s1, tmax0, tmax1, tshift, FAST_EXP)
-        k_next: tl.constexpr = (K_READ + 1) % 2
-        k_ops = core._load_k_operands(
-            tlx.local_view(ka, k_next),
-            tlx.local_view(kb, k_next),
-            tlx.local_view(ksa, k_next),
-            tlx.local_view(ksb, k_next),
-        )
-    tlx.async_load_wait_group(2)
-
-    return (
-        s0,
-        s1,
-        p0,
-        p1,
-        m_i,
-        l_i,
-        acc0,
-        acc1,
-        acc2,
-        acc3,
-        k_ops[0],
-        k_ops[1],
-        k_ops[2],
-        k_ops[3],
-        k_ops[4],
-        k_ops[5],
-        k_ops[6],
-        k_ops[7],
-    )
-
-
-@triton.jit
-def _mfma_softmax_loop_8w(
-    q_lo,
-    q_hi,
-    qs_lo,
-    qs_hi,
-    kA0,
-    kA1,
-    kB0,
-    kB1,
-    sA0,
-    sA1,
-    sB0,
-    sB1,
-    ka,
-    kb,
-    ksa,
-    ksb,
-    va,
-    vb,
-    vsa,
-    vsb,
-    s0,
-    s1,
-    p0,
-    p1,
-    m_i,
-    l_i,
-    acc0,
-    acc1,
-    acc2,
-    acc3,
-    n_tiles,
-    k_ptr,
-    v_ptr,
-    ks_ptr,
-    vs_ptr,
-    c_qk,
-    qk_scale,
-    MFMA_PRIO: tl.constexpr,
-    SOFTMAX_PRIO: tl.constexpr,
-    FAST_EXP: tl.constexpr,
-    TWO_PHASE_AHEAD: tl.constexpr = False,
-):
-    OFF: tl.constexpr = core._score_offset(FAST_EXP)
-    HN: tl.constexpr = 64
-    D: tl.constexpr = 128
-    k_step = 128 * D
-    v_step = 128 * D
-    ks_step = 128
-    k_n1 = HN * D
-    v_n1 = HN * D
-    ks_n1 = HN
-    if TWO_PHASE_AHEAD:
-        for it in tl.range(0, (n_tiles - 2) // 2, num_stages=1):
-            t = 2 * it + 2
-            (
-                s0,
-                s1,
-                p0,
-                p1,
-                m_i,
-                l_i,
-                acc0,
-                acc1,
-                acc2,
-                acc3,
-                kA0,
-                kA1,
-                kB0,
-                kB1,
-                sA0,
-                sA1,
-                sB0,
-                sB1,
-            ) = _four_stage_phase_8w(
-                q_lo,
-                q_hi,
-                qs_lo,
-                qs_hi,
-                kA0,
-                kA1,
-                kB0,
-                kB1,
-                sA0,
-                sA1,
-                sB0,
-                sB1,
-                ka,
-                kb,
-                ksa,
-                ksb,
-                va,
-                vb,
-                vsa,
-                vsb,
-                p0,
-                p1,
-                m_i,
-                l_i,
-                acc0,
-                acc1,
-                acc2,
-                acc3,
-                s0,
-                s1,
-                t,
-                n_tiles,
-                k_ptr,
-                v_ptr,
-                ks_ptr,
-                vs_ptr,
-                c_qk,
-                qk_scale,
-                K_READ=1,
-                V_READ=0,
-                K_WRITE=1,
-                V_WRITE=0,
-                MFMA_PRIO=MFMA_PRIO,
-                SOFTMAX_PRIO=SOFTMAX_PRIO,
-                FAST_EXP=FAST_EXP,
-            )
-            t = 2 * it + 3
-            (
-                s0,
-                s1,
-                p0,
-                p1,
-                m_i,
-                l_i,
-                acc0,
-                acc1,
-                acc2,
-                acc3,
-                kA0,
-                kA1,
-                kB0,
-                kB1,
-                sA0,
-                sA1,
-                sB0,
-                sB1,
-            ) = _four_stage_phase_8w(
-                q_lo,
-                q_hi,
-                qs_lo,
-                qs_hi,
-                kA0,
-                kA1,
-                kB0,
-                kB1,
-                sA0,
-                sA1,
-                sB0,
-                sB1,
-                ka,
-                kb,
-                ksa,
-                ksb,
-                va,
-                vb,
-                vsa,
-                vsb,
-                p0,
-                p1,
-                m_i,
-                l_i,
-                acc0,
-                acc1,
-                acc2,
-                acc3,
-                s0,
-                s1,
-                t,
-                n_tiles,
-                k_ptr,
-                v_ptr,
-                ks_ptr,
-                vs_ptr,
-                c_qk,
-                qk_scale,
-                K_READ=0,
-                V_READ=1,
-                K_WRITE=0,
-                V_WRITE=1,
-                MFMA_PRIO=MFMA_PRIO,
-                SOFTMAX_PRIO=SOFTMAX_PRIO,
-                FAST_EXP=FAST_EXP,
-            )
-        return s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3
-
-        for it in tl.range(0, (n_tiles - 2) // 2, num_stages=1):
-            tlx.async_load_wait_group(2)
-            with tlx.warp_pipeline_stage("mfma", priority=MFMA_PRIO):
-                t = 2 * it + 2
-                k_read = (t - 1) % 3
-                v_read = (t - 2) % 3
-                k_write = (t + 1) % 3
-                v_write = t % 3
-                kw_a = tlx.local_view(ka, k_write)
-                kw_b = tlx.local_view(kb, k_write)
-                ksw_a = tlx.local_view(ksa, k_write)
-                ksw_b = tlx.local_view(ksb, k_write)
-                vw_a = tlx.local_view(va, v_write)
-                vw_b = tlx.local_view(vb, v_write)
-                vsw_a = tlx.local_view(vsa, v_write)
-                vsw_b = tlx.local_view(vsb, v_write)
-                core._issue_k_tile(
-                    k_ptr,
-                    ks_ptr,
-                    kw_a,
-                    kw_b,
-                    ksw_a,
-                    ksw_b,
-                    t + 1,
-                    k_step,
-                    ks_step,
-                    k_n1,
-                    ks_n1,
-                )
-                core._issue_v_tile(
-                    v_ptr,
-                    vs_ptr,
-                    vw_a,
-                    vw_b,
-                    vsw_a,
-                    vsw_b,
-                    t,
-                    v_step,
-                    ks_step,
-                    v_n1,
-                    ks_n1,
-                )
-                kr_a = tlx.local_view(ka, k_read)
-                kr_b = tlx.local_view(kb, k_read)
-                ksr_a = tlx.local_view(ksa, k_read)
-                ksr_b = tlx.local_view(ksb, k_read)
-                vr_a = tlx.local_view(va, v_read)
-                vr_b = tlx.local_view(vb, v_read)
-                vsr_a = tlx.local_view(vsa, v_read)
-                vsr_b = tlx.local_view(vsb, v_read)
-                s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
-                    q_lo,
-                    q_hi,
-                    qs_lo,
-                    qs_hi,
-                    kr_a,
-                    kr_b,
-                    ksr_a,
-                    ksr_b,
-                    vr_a,
-                    vr_b,
-                    vsr_a,
-                    vsr_b,
-                    p0,
-                    p1,
-                    acc0,
-                    acc1,
-                    acc2,
-                    acc3,
-                    l_i,
-                    (OFF - m_i) * c_qk,
-                    qk_scale,
-                    k_ptr,
-                    v_ptr,
-                    ks_ptr,
-                    vs_ptr,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    t + 1,
-                    t,
-                    k_step,
-                    v_step,
-                    ks_step,
-                    k_n1,
-                    v_n1,
-                    ks_n1,
-                    True,
-                    TWO_PHASE_AHEAD=True,
-                )
-            with tlx.warp_pipeline_stage("softmax", priority=SOFTMAX_PRIO):
-                p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2,
-                                                                                  acc3, qk_scale, FAST_EXP)
-            tlx.async_load_wait_group(2)
-            with tlx.warp_pipeline_stage("mfma", priority=MFMA_PRIO):
-                t = 2 * it + 3
-                k_read = (t - 1) % 3
-                v_read = (t - 2) % 3
-                k_write = (t + 1) % 3
-                v_write = t % 3
-                kw_a = tlx.local_view(ka, k_write)
-                kw_b = tlx.local_view(kb, k_write)
-                ksw_a = tlx.local_view(ksa, k_write)
-                ksw_b = tlx.local_view(ksb, k_write)
-                vw_a = tlx.local_view(va, v_write)
-                vw_b = tlx.local_view(vb, v_write)
-                vsw_a = tlx.local_view(vsa, v_write)
-                vsw_b = tlx.local_view(vsb, v_write)
-                core._issue_k_tile(
-                    k_ptr,
-                    ks_ptr,
-                    kw_a,
-                    kw_b,
-                    ksw_a,
-                    ksw_b,
-                    tl.minimum(t + 1, n_tiles - 1),
-                    k_step,
-                    ks_step,
-                    k_n1,
-                    ks_n1,
-                )
-                core._issue_v_tile(
-                    v_ptr,
-                    vs_ptr,
-                    vw_a,
-                    vw_b,
-                    vsw_a,
-                    vsw_b,
-                    t,
-                    v_step,
-                    ks_step,
-                    v_n1,
-                    ks_n1,
-                )
-                kr_a = tlx.local_view(ka, k_read)
-                kr_b = tlx.local_view(kb, k_read)
-                ksr_a = tlx.local_view(ksa, k_read)
-                ksr_b = tlx.local_view(ksb, k_read)
-                vr_a = tlx.local_view(va, v_read)
-                vr_b = tlx.local_view(vb, v_read)
-                vsr_a = tlx.local_view(vsa, v_read)
-                vsr_b = tlx.local_view(vsb, v_read)
-                s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
-                    q_lo,
-                    q_hi,
-                    qs_lo,
-                    qs_hi,
-                    kr_a,
-                    kr_b,
-                    ksr_a,
-                    ksr_b,
-                    vr_a,
-                    vr_b,
-                    vsr_a,
-                    vsr_b,
-                    p0,
-                    p1,
-                    acc0,
-                    acc1,
-                    acc2,
-                    acc3,
-                    l_i,
-                    (OFF - m_i) * c_qk,
-                    qk_scale,
-                    k_ptr,
-                    v_ptr,
-                    ks_ptr,
-                    vs_ptr,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    tl.minimum(t + 1, n_tiles - 1),
-                    t,
-                    k_step,
-                    v_step,
-                    ks_step,
-                    k_n1,
-                    v_n1,
-                    ks_n1,
-                    True,
-                    TWO_PHASE_AHEAD=True,
-                )
-            with tlx.warp_pipeline_stage("softmax", priority=SOFTMAX_PRIO):
-                p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2,
-                                                                                  acc3, qk_scale, FAST_EXP)
-        return s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3
-
-    for it in tl.range(0, (n_tiles - 2) // 2, num_stages=1):
-        with tlx.warp_pipeline_stage("mfma", priority=MFMA_PRIO):
-            t = 2 * it + 2
-            s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
-                q_lo,
-                q_hi,
-                qs_lo,
-                qs_hi,
-                ka[0],
-                kb[0],
-                ksa[0],
-                ksb[0],
-                va[0],
-                vb[0],
-                vsa[0],
-                vsb[0],
-                p0,
-                p1,
-                acc0,
-                acc1,
-                acc2,
-                acc3,
-                l_i,
-                (OFF - m_i) * c_qk,
-                qk_scale,
-                k_ptr,
-                v_ptr,
-                ks_ptr,
-                vs_ptr,
-                ka[1],
-                kb[1],
-                va[1],
-                vb[1],
-                ksa[1],
-                ksb[1],
-                vsa[1],
-                vsb[1],
-                t,
-                t - 1,
-                k_step,
-                v_step,
-                ks_step,
-                k_n1,
-                v_n1,
-                ks_n1,
-                True,
-            )
-        tlx.async_load_wait_group(0)
-        with tlx.warp_pipeline_stage("softmax", priority=SOFTMAX_PRIO):
-            p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3,
-                                                                              qk_scale, FAST_EXP)
-        with tlx.warp_pipeline_stage("mfma", priority=MFMA_PRIO):
-            t = 2 * it + 3
-            s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
-                q_lo,
-                q_hi,
-                qs_lo,
-                qs_hi,
-                ka[1],
-                kb[1],
-                ksa[1],
-                ksb[1],
-                va[1],
-                vb[1],
-                vsa[1],
-                vsb[1],
-                p0,
-                p1,
-                acc0,
-                acc1,
-                acc2,
-                acc3,
-                l_i,
-                (OFF - m_i) * c_qk,
-                qk_scale,
-                k_ptr,
-                v_ptr,
-                ks_ptr,
-                vs_ptr,
-                ka[0],
-                kb[0],
-                va[0],
-                vb[0],
-                ksa[0],
-                ksb[0],
-                vsa[0],
-                vsb[0],
-                t,
-                t - 1,
-                k_step,
-                v_step,
-                ks_step,
-                k_n1,
-                v_n1,
-                ks_n1,
-                True,
-            )
-        tlx.async_load_wait_group(0)
-        with tlx.warp_pipeline_stage("softmax", priority=SOFTMAX_PRIO):
-            p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3,
-                                                                              qk_scale, FAST_EXP)
-    return s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3
 
 
 @triton.jit
@@ -971,12 +307,12 @@ def _mfma_softmax_loop_4w(
             v_ptr,
             ks_ptr,
             vs_ptr,
-            None,
-            None,
+            ka[1],
+            kb[1],
             va[1],
             vb[1],
-            None,
-            None,
+            ksa[1],
+            ksb[1],
             vsa[1],
             vsb[1],
             t,
@@ -987,10 +323,9 @@ def _mfma_softmax_loop_4w(
             k_n1,
             v_n1,
             ks_n1,
-            False,
         )
-        p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3,
-                                                                          qk_scale, FAST_EXP)
+        p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
+                                                                 FAST_EXP)
         t = 2 * it + 3
         s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
             q_lo,
@@ -1034,10 +369,9 @@ def _mfma_softmax_loop_4w(
             k_n1,
             v_n1,
             ks_n1,
-            False,
         )
-        p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3,
-                                                                          qk_scale, FAST_EXP)
+        p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
+                                                                 FAST_EXP)
     return s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3
 
 
@@ -1064,13 +398,10 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     qk_scale,
     HEADS: tl.constexpr,
     BLOCK_M: tl.constexpr,
-    MFMA_PRIO: tl.constexpr,
-    SOFTMAX_PRIO: tl.constexpr,
     FAST_EXP: tl.constexpr,
     PREQUANTIZED_Q: tl.constexpr,
-    USE_WORK_ORDER: tl.constexpr,
     REUSE_METADATA: tl.constexpr,
-    SCHEDULE_ITEMS: tl.constexpr,
+    USE_WORK_ORDER: tl.constexpr,
 ):
     HN: tl.constexpr = 64
     HD: tl.constexpr = 64
@@ -1079,8 +410,6 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     pid = tl.program_id(0)
     n_ctas = tl.num_programs(0)
     n_items = tl.load(CuQTile + BATCH) * HEADS
-    if USE_WORK_ORDER and n_items != SCHEDULE_ITEMS:
-        return
     base = pid % 8 * (n_ctas // 8) + pid // 8
     if base >= n_items:
         return
@@ -1152,7 +481,7 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
         ks_n1,
     )
     for w in tl.range(0, n_mine, num_stages=1):
-        if not REUSE_METADATA:
+        if not (REUSE_METADATA and USE_WORK_ORDER):
             item = base + w * n_ctas
             if USE_WORK_ORDER:
                 item = tl.load(WorkOrder + item)
@@ -1169,7 +498,7 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
                 tlx.buffer_load(q_base + HD, q_local, q_mask, 0.0, contiguity=16),
                 q_layout,
             )
-            if not REUSE_METADATA:
+            if not (REUSE_METADATA and USE_WORK_ORDER):
                 k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off)
             scale_base = QScales + q0.to(tl.int64) * HEADS * 4 + head * 4
             scale_offsets = (offs_mm[:, None] * (HEADS * 4) + tl.arange(0, 2)[None, :])
@@ -1183,7 +512,7 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
             q_reg0 = tlx.buffer_load(q_base, q_local, q_mask, 0.0, contiguity=8)
             q_reg1 = tlx.buffer_load(q_base + HD, q_local, q_mask, 0.0, contiguity=8)
             tlx.amd_sched_barrier(0)
-            if not REUSE_METADATA:
+            if not (REUSE_METADATA and USE_WORK_ORDER):
                 k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off)
             tlx.amd_sched_barrier(0)
             q_lo, qs_lo = core._quantize_q_half(q_reg0)
@@ -1200,7 +529,7 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
         tlx.async_load_wait_group(2)
         s0, s1 = core._qk_first(q_lo, q_hi, qs_lo, qs_hi, ka[1], kb[1], ksa[1], ksb[1], qk_scale)
         s0, s1 = _mask_front(s0, s1, front)
-        p0, p1, m_i, l_i = core._pingpong_softmax_first(s0, s1, FAST_EXP)
+        p0, p1, m_i, l_i = core._softmax_first(s0, s1, FAST_EXP)
         s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = _mfma_softmax_loop_4w(
             q_lo,
             q_hi,
@@ -1277,7 +606,6 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
             k_n1,
             v_n1,
             ks_n1,
-            False,
             tail,
         )
         nxt = tl.where(w + 1 < n_mine, item + n_ctas, item)
@@ -1315,8 +643,8 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
             ks_n1,
         )
         tlx.async_load_wait_group(2)
-        p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3,
-                                                                          qk_scale, FAST_EXP)
+        p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
+                                                                 FAST_EXP)
         acc0, acc1, acc2, acc3, l_i = core._pv_last(p0, p1, va[1], vb[1], vsa[1], vsb[1], acc0, acc1, acc2, acc3, l_i)
         row_layout: tl.constexpr = tlx.slice_layout(mfma, 1)
         total = tlx.require_layout(tl.sum(l_i, 1), row_layout)
@@ -1347,429 +675,7 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
             (acc3 * scale).to(tl.bfloat16),
             mask=o_mask,
         )
-        if REUSE_METADATA:
-            item = nxt
-            head, q0, q_rows = n_head, n_q0, n_q_rows
-            front, tail, pad_start, n_tiles = (
-                n_front,
-                n_tail,
-                n_pad_start,
-                n_tiles_next,
-            )
-            k_ptr, v_ptr, ks_ptr, vs_ptr = nk_ptr, nv_ptr, nks_ptr, nvs_ptr
-    tlx.async_load_wait_group(0)
-
-
-@triton.jit
-# Triton TR001: BLOCK_M is a host-selected production contract.
-def _mxfp8_varlen_extended_kernel_8w(  # noqa: TR001
-    Q,
-    QScales,
-    WorkOrder,
-    K8,
-    V8,
-    KS,
-    VS,
-    Out,
-    Lse,
-    CuQ,
-    CuKV,
-    CuPad,
-    CuQTile,
-    ItemTile,
-    BATCH,
-    TOTAL_Q,
-    NPAD,
-    qk_scale,
-    HEADS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    MFMA_PRIO: tl.constexpr,
-    SOFTMAX_PRIO: tl.constexpr,
-    FAST_EXP: tl.constexpr,
-    PREQUANTIZED_Q: tl.constexpr,
-    USE_WORK_ORDER: tl.constexpr,
-    REUSE_METADATA: tl.constexpr,
-    SCHEDULE_ITEMS: tl.constexpr,
-):
-    HN: tl.constexpr = 64
-    HD: tl.constexpr = 64
-    D: tl.constexpr = 128
-    ROW: tl.constexpr = HEADS * D
-    pid = tl.program_id(0)
-    n_ctas = tl.num_programs(0)
-    n_items = tl.load(CuQTile + BATCH) * HEADS
-    if USE_WORK_ORDER and n_items != SCHEDULE_ITEMS:
-        return
-    base = pid % 8 * (n_ctas // 8) + pid // 8
-    if base >= n_items:
-        return
-    n_mine = (n_items - base + n_ctas - 1) // n_ctas
-    offs_d = tl.arange(0, D)
-    offs_hd = tl.arange(0, HD)
-    offs_n = tl.arange(0, HN)
-    offs_mm = tl.arange(0, BLOCK_M)
-    C: tl.constexpr = core._score_scale(FAST_EXP)
-    OFF: tl.constexpr = core._score_offset(FAST_EXP)
-    c_qk = C / qk_scale
-    k_off = offs_d[:, None] + offs_n[None, :] * D
-    v_off = offs_n[:, None] + offs_d[None, :] * HN
-    ks_off = offs_n[:, None]
-    q_off = offs_mm[:, None] * ROW + offs_hd[None, :]
-    k_step = 128 * D
-    v_step = 128 * D
-    ks_step = 128
-    k_n1 = HN * D
-    v_n1 = HN * D
-    ks_n1 = HN
-    mfma: tl.constexpr = tlx.amd_mfma_layout(4, [32, 32, 64], True, [tlx.num_warps(), 1])
-    q_layout: tl.constexpr = tlx.dot_operand_layout(0, mfma, k_width=16)
-    q_local = tlx.require_layout(q_off.to(tl.int32), q_layout)
-    scale_layout: tl.constexpr = tlx.layout(
-        shape=((32, 2, tlx.num_warps()), (1, )),
-        stride=((2, 1, 64), (1, )),
-    )
-    k_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(1024, 16)], core._K_LDS_BASES, [D, HN])
-    v_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(1024, 16)], core._V_LDS_BASES, [HN, D])
-    ka = tlx.local_alloc((D, HN), tl.float8e4nv, 2, layout=k_layout)
-    kb = tlx.local_alloc((D, HN), tl.float8e4nv, 2, layout=k_layout)
-    va = tlx.local_alloc((HN, D), tl.float8e4nv, 2, layout=v_layout)
-    vb = tlx.local_alloc((HN, D), tl.float8e4nv, 2, layout=v_layout)
-    ksa = tlx.local_alloc((HN, 1), tl.int32, 2)
-    ksb = tlx.local_alloc((HN, 1), tl.int32, 2)
-    vsa = tlx.local_alloc((HN, 1), tl.int32, 2)
-    vsb = tlx.local_alloc((HN, 1), tl.int32, 2)
-    item = base
-    if USE_WORK_ORDER:
-        item = tl.load(WorkOrder + base)
-    head, q0, q_rows, front, tail, pad_start, n_tiles = _item(item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS, BLOCK_M)
-    k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off)
-    core._issue_k_tile(
-        k_ptr,
-        ks_ptr,
-        ka[0],
-        kb[0],
-        ksa[0],
-        ksb[0],
-        0,
-        k_step,
-        ks_step,
-        k_n1,
-        ks_n1,
-    )
-    core._issue_k_tile(
-        k_ptr,
-        ks_ptr,
-        ka[1],
-        kb[1],
-        ksa[1],
-        ksb[1],
-        1,
-        k_step,
-        ks_step,
-        k_n1,
-        ks_n1,
-    )
-    core._issue_v_tile(
-        v_ptr,
-        vs_ptr,
-        va[0],
-        vb[0],
-        vsa[0],
-        vsb[0],
-        0,
-        v_step,
-        ks_step,
-        v_n1,
-        ks_n1,
-    )
-    core._issue_v_tile(
-        v_ptr,
-        vs_ptr,
-        va[1],
-        vb[1],
-        vsa[1],
-        vsb[1],
-        1,
-        v_step,
-        ks_step,
-        v_n1,
-        ks_n1,
-    )
-    for w in tl.range(0, n_mine, num_stages=1):
-        if not REUSE_METADATA:
-            item = base + w * n_ctas
-            if USE_WORK_ORDER:
-                item = tl.load(WorkOrder + item)
-            head, q0, q_rows, front, tail, pad_start, n_tiles = _item(item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS,
-                                                                      BLOCK_M)
-        q_base = Q + q0.to(tl.int64) * ROW + head * D
-        q_mask = q_local < q_rows * ROW
-        if PREQUANTIZED_Q:
-            q_lo = tlx.require_layout(
-                tlx.buffer_load(q_base, q_local, q_mask, 0.0, contiguity=16),
-                q_layout,
-            )
-            q_hi = tlx.require_layout(
-                tlx.buffer_load(q_base + HD, q_local, q_mask, 0.0, contiguity=16),
-                q_layout,
-            )
-            if not REUSE_METADATA:
-                k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off)
-            scale_base = QScales + q0.to(tl.int64) * HEADS * 4 + head * 4
-            scale_offsets = (offs_mm[:, None] * (HEADS * 4) + tl.arange(0, 2)[None, :])
-            scale_mask = (offs_mm < q_rows)[:, None]
-            qs_lo = tlx.require_layout(tl.load(scale_base + scale_offsets, scale_mask, 0), scale_layout)
-            qs_hi = tlx.require_layout(
-                tl.load(scale_base + scale_offsets + 2, scale_mask, 0),
-                scale_layout,
-            )
-        else:
-            q_reg0 = tlx.buffer_load(q_base, q_local, q_mask, 0.0, contiguity=8)
-            q_reg1 = tlx.buffer_load(q_base + HD, q_local, q_mask, 0.0, contiguity=8)
-            tlx.amd_sched_barrier(0)
-            if not REUSE_METADATA:
-                k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off)
-            tlx.amd_sched_barrier(0)
-            q_lo, qs_lo = core._quantize_q_half(q_reg0)
-            q_lo = tlx.require_layout(q_lo, q_layout)
-            q_hi, qs_hi = core._quantize_q_half(q_reg1)
-            q_hi = tlx.require_layout(q_hi, q_layout)
-        if FAST_EXP:
-            qs_lo = (tl.maximum(qs_lo, 9) - 9).to(tl.uint8)
-            qs_hi = (tl.maximum(qs_hi, 9) - 9).to(tl.uint8)
-        acc0 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
-        acc1 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
-        acc2 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
-        acc3 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
-        tlx.async_load_wait_group(2)
-        s0, s1 = core._qk_first(q_lo, q_hi, qs_lo, qs_hi, ka[0], kb[0], ksa[0], ksb[0], qk_scale)
-        tl.debug_barrier()
-        if n_tiles > 2:
-            core._issue_k_tile(
-                k_ptr,
-                ks_ptr,
-                ka[0],
-                kb[0],
-                ksa[0],
-                ksb[0],
-                2,
-                k_step,
-                ks_step,
-                k_n1,
-                ks_n1,
-            )
-        s0, s1 = _mask_front(s0, s1, front)
-        p0, p1, m_i, l_i = core._pingpong_softmax_first(s0, s1, FAST_EXP)
-        kA0, kA1, kB0, kB1, sA0, sA1, sB0, sB1 = core._load_k_operands(ka[1], kb[1], ksa[1], ksb[1])
-        s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = _mfma_softmax_loop_8w(
-            q_lo,
-            q_hi,
-            qs_lo,
-            qs_hi,
-            kA0,
-            kA1,
-            kB0,
-            kB1,
-            sA0,
-            sA1,
-            sB0,
-            sB1,
-            ka,
-            kb,
-            ksa,
-            ksb,
-            va,
-            vb,
-            vsa,
-            vsb,
-            s0,
-            s1,
-            p0,
-            p1,
-            m_i,
-            l_i,
-            acc0,
-            acc1,
-            acc2,
-            acc3,
-            n_tiles,
-            k_ptr,
-            v_ptr,
-            ks_ptr,
-            vs_ptr,
-            c_qk,
-            qk_scale,
-            MFMA_PRIO=MFMA_PRIO,
-            SOFTMAX_PRIO=SOFTMAX_PRIO,
-            FAST_EXP=FAST_EXP,
-            TWO_PHASE_AHEAD=True,
-        )
-        k_final_slot = (n_tiles - 1) % 2
-        v_final_slot = (n_tiles - 2) % 2
-        k_final_a = tlx.local_view(ka, k_final_slot)
-        k_final_b = tlx.local_view(kb, k_final_slot)
-        ks_final_a = tlx.local_view(ksa, k_final_slot)
-        ks_final_b = tlx.local_view(ksb, k_final_slot)
-        v_final_a = tlx.local_view(va, v_final_slot)
-        v_final_b = tlx.local_view(vb, v_final_slot)
-        vs_final_a = tlx.local_view(vsa, v_final_slot)
-        vs_final_b = tlx.local_view(vsb, v_final_slot)
-        s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
-            q_lo,
-            q_hi,
-            qs_lo,
-            qs_hi,
-            k_final_a,
-            k_final_b,
-            ks_final_a,
-            ks_final_b,
-            v_final_a,
-            v_final_b,
-            vs_final_a,
-            vs_final_b,
-            p0,
-            p1,
-            acc0,
-            acc1,
-            acc2,
-            acc3,
-            l_i,
-            (OFF - m_i) * c_qk,
-            qk_scale,
-            k_ptr,
-            v_ptr,
-            ks_ptr,
-            vs_ptr,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            0,
-            n_tiles - 1,
-            k_step,
-            v_step,
-            ks_step,
-            k_n1,
-            v_n1,
-            ks_n1,
-            True,
-            tail,
-        )
-        # Resolve the next persistent item early so its K copies overlap this
-        # item's final softmax and PV.
-        nxt = tl.where(w + 1 < n_mine, item + n_ctas, item)
-        if USE_WORK_ORDER:
-            next_slot = base + tl.where(w + 1 < n_mine, w + 1, w) * n_ctas
-            nxt = tl.load(WorkOrder + next_slot)
-        n_head, n_q0, n_q_rows, n_front, n_tail, n_pad_start, n_tiles_next = _item(nxt, ItemTile, CuQTile, CuQ, CuKV,
-                                                                                   CuPad, HEADS, BLOCK_M)
-        nk_ptr, nv_ptr, nks_ptr, nvs_ptr = _kv_pointers(K8, V8, KS, VS, n_head, n_pad_start, NPAD, k_off, v_off, ks_off)
-        core._issue_k_tile(
-            nk_ptr,
-            nks_ptr,
-            ka[0],
-            kb[0],
-            ksa[0],
-            ksb[0],
-            0,
-            k_step,
-            ks_step,
-            k_n1,
-            ks_n1,
-        )
-        core._issue_k_tile(
-            nk_ptr,
-            nks_ptr,
-            ka[1],
-            kb[1],
-            ksa[1],
-            ksb[1],
-            1,
-            k_step,
-            ks_step,
-            k_n1,
-            ks_n1,
-        )
-        p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._pingpong_softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3,
-                                                                          qk_scale, FAST_EXP)
-        v_last_slot = (n_tiles - 1) % 2
-        # Wait for final V while leaving the next item's two K groups in flight.
-        tlx.async_load_wait_group(2)
-        acc0, acc1, acc2, acc3, l_i = core._pv_last(
-            p0,
-            p1,
-            tlx.local_view(va, v_last_slot),
-            tlx.local_view(vb, v_last_slot),
-            tlx.local_view(vsa, v_last_slot),
-            tlx.local_view(vsb, v_last_slot),
-            acc0,
-            acc1,
-            acc2,
-            acc3,
-            l_i,
-        )
-        # These V groups complete the four-group prologue for the next item.
-        core._issue_v_tile(
-            nv_ptr,
-            nvs_ptr,
-            va[0],
-            vb[0],
-            vsa[0],
-            vsb[0],
-            0,
-            v_step,
-            ks_step,
-            v_n1,
-            ks_n1,
-        )
-        core._issue_v_tile(
-            nv_ptr,
-            nvs_ptr,
-            va[1],
-            vb[1],
-            vsa[1],
-            vsb[1],
-            1,
-            v_step,
-            ks_step,
-            v_n1,
-            ks_n1,
-        )
-        row_layout: tl.constexpr = tlx.slice_layout(mfma, 1)
-        total = tlx.require_layout(tl.sum(l_i, 1), row_layout)
-        scale = (1.0 / total)[:, None]
-        valid = offs_mm < q_rows
-        lse = (tlx.require_layout(m_i, row_layout) - 4.0 + tl.log2(total)) * 0.6931471805599453
-        tl.store(Lse + head * TOTAL_Q + q0 + offs_mm, lse, mask=valid)
-        offs_c = tl.arange(0, 32)
-        o_rows = Out + (q0.to(tl.int64) + offs_mm[:, None]) * ROW + head * D
-        o_mask = valid[:, None]
-        tl.store(
-            o_rows + offs_c[None, :],
-            (acc0 * scale).to(tl.bfloat16),
-            mask=o_mask,
-        )
-        tl.store(
-            o_rows + offs_c[None, :] + 32,
-            (acc1 * scale).to(tl.bfloat16),
-            mask=o_mask,
-        )
-        tl.store(
-            o_rows + offs_c[None, :] + 64,
-            (acc2 * scale).to(tl.bfloat16),
-            mask=o_mask,
-        )
-        tl.store(
-            o_rows + offs_c[None, :] + 96,
-            (acc3 * scale).to(tl.bfloat16),
-            mask=o_mask,
-        )
-        # Carry the metadata matching the K/V copies already in flight.
-        if REUSE_METADATA:
+        if REUSE_METADATA and USE_WORK_ORDER:
             item = nxt
             head, q0, q_rows = n_head, n_q0, n_q_rows
             front, tail, pad_start, n_tiles = (
@@ -1920,11 +826,14 @@ def _build_metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad)
     }
 
 
-def prepare_kv(k, v, cu_seqlens_k, meta, backward=False):
+def prepare_kv(k, v, cu_seqlens_k, meta=None):
     """Quantize packed K and V into the core's padded head-major layouts.
 
-    Returns (k8, ks, v8, vs), followed with backward by V in the K layout
-    (vr8, vrs)."""
+    ``meta`` is optional for callers preparing a reusable K/V state directly.
+    """
+    if meta is None:
+        dummy_cu_q = torch.zeros_like(cu_seqlens_k)
+        meta = _build_metadata(dummy_cu_q, cu_seqlens_k, 0, k.shape[0], _BLOCK_M, _PAD)
     npad = meta["npad"]
     device = k.device
     k8 = torch.empty((_HEADS, npad, _HEAD_DIM), device=device, dtype=torch.float8_e4m3fn)
@@ -1932,16 +841,13 @@ def prepare_kv(k, v, cu_seqlens_k, meta, backward=False):
     v8 = torch.empty((_HEADS, npad // 64, _HEAD_DIM, 64), device=device, dtype=torch.float8_e4m3fn)
     ks = torch.empty((_HEADS, npad, 4), device=device, dtype=torch.uint8)
     vs = torch.empty_like(ks)
-    extra = (torch.empty_like(k8), torch.empty_like(ks)) if backward else (k8, ks)
-    prepare_attrs = () if backward else (("amdgpu-waves-per-eu", "2,2"), )
-    cast(Any, _prepare_kv)[(meta["tile_capacity"] + 4 * backward, _HEADS)](
+    cast(Any, _prepare_kv)[(meta["tile_capacity"], _HEADS)](
         k,
         v,
         k8,
         ks,
         v8,
         vs,
-        *extra,
         cu_seqlens_k,
         meta["cu_pad"],
         meta["tile_sequence"],
@@ -1949,12 +855,105 @@ def prepare_kv(k, v, cu_seqlens_k, meta, backward=False):
         cu_seqlens_k.numel() - 1,
         npad,
         HEADS=_HEADS,
-        BACKWARD=backward,
         num_warps=1,
         num_stages=1,
-        llvm_fn_attrs=prepare_attrs,
+        llvm_fn_attrs=(("amdgpu-waves-per-eu", "2,2"), ),
     )
-    return (k8, ks, v8, vs, *extra) if backward else (k8, ks, v8, vs)
+    return k8, ks, v8, vs
+
+
+def _check_offsets(offsets, device):
+    if (offsets.ndim != 1 or offsets.numel() < 2 or offsets.dtype != torch.int32 or not offsets.is_contiguous()
+            or offsets.device != device):
+        raise ValueError("Requires contiguous int32 sequence offsets on the input device")
+
+
+@dataclass(frozen=True)
+class ForwardWorkSchedule:
+    item_order: torch.Tensor
+    num_ctas: int
+    total_q: int
+    total_kv: int
+    batch: int
+    needs_empty_fill: bool = True
+    item_count: int | None = None
+
+
+def prepare_work_schedule(
+    query_lengths,
+    key_lengths,
+    device,
+    *,
+    num_ctas=512,
+):
+    """Build a reusable KV-cost-balanced persistent work schedule."""
+    if num_ctas < 8 or num_ctas % 8:
+        raise ValueError("Requires a multiple of eight CTAs")
+    if not isinstance(query_lengths, (list, tuple)) or not isinstance(key_lengths, (list, tuple)):
+        raise ValueError("Requires CPU lists or tuples of sequence lengths")
+    if len(query_lengths) != len(key_lengths) or not query_lengths:
+        raise ValueError("Query and key lengths must have the same nonzero batch size")
+    if any(not isinstance(n, int) or n < 0 for n in (*query_lengths, *key_lengths)):
+        raise ValueError("Sequence lengths must be nonnegative integers")
+    costs = []
+    for q_length, k_length in zip(query_lengths, key_lengths):
+        if k_length:
+            costs.extend([triton.cdiv(k_length, _PAD)] * (triton.cdiv(q_length, _BLOCK_M) * _HEADS))
+    count = len(costs)
+    capacities = [triton.cdiv(count - base, num_ctas) for base in range(min(num_ctas, count))]
+    bins = [(0, base, 0) for base in range(len(capacities))]
+    heapq.heapify(bins)
+    order = [0] * count
+    for item in sorted(range(count), key=lambda index: (-costs[index], index)):
+        load, base, assigned = heapq.heappop(bins)
+        order[base + assigned * num_ctas] = item
+        assigned += 1
+        if assigned < capacities[base]:
+            heapq.heappush(bins, (load + costs[item], base, assigned))
+    return ForwardWorkSchedule(
+        torch.tensor(order, dtype=torch.int32, device=device),
+        num_ctas,
+        sum(query_lengths),
+        sum(key_lengths),
+        len(query_lengths),
+        any(q_length > 0 and k_length == 0 for q_length, k_length in zip(query_lengths, key_lengths)),
+        count,
+    )
+
+
+def _check_work_schedule(schedule, q, total_kv, batch, num_ctas):
+    if schedule is None:
+        return
+    if (schedule.total_q != q.shape[0] or schedule.total_kv != total_kv or schedule.batch != batch
+            or (num_ctas is not None and num_ctas != schedule.num_ctas) or schedule.item_order.device != q.device):
+        raise ValueError("Work schedule must match the input lengths, device, and grid")
+
+
+_AUTOMATIC_SCHEDULES: dict[tuple[Any, ...], tuple[Any, Any, ForwardWorkSchedule]] = {}
+
+
+def _automatic_work_schedule(cu_seqlens_q, cu_seqlens_k, device, *, num_ctas):
+    """Create the balanced schedule used by the public forward paths."""
+    key = (
+        id(cu_seqlens_q),
+        cu_seqlens_q._version,
+        id(cu_seqlens_k),
+        cu_seqlens_k._version,
+        num_ctas,
+    )
+    hit = _AUTOMATIC_SCHEDULES.get(key)
+    if hit is not None and hit[0]() is cu_seqlens_q and hit[1]() is cu_seqlens_k:
+        return hit[2]
+    query_lengths = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).detach().cpu().tolist()
+    key_lengths = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).detach().cpu().tolist()
+    if num_ctas is None:
+        work_items = sum(triton.cdiv(q, _BLOCK_M) * _HEADS for q, k in zip(query_lengths, key_lengths) if k)
+        num_ctas = min(512, max(8, triton.cdiv(work_items, 8) * 8))
+    schedule = prepare_work_schedule(query_lengths, key_lengths, device, num_ctas=num_ctas)
+    if len(_AUTOMATIC_SCHEDULES) >= 64:
+        _AUTOMATIC_SCHEDULES.pop(next(iter(_AUTOMATIC_SCHEDULES)))
+    _AUTOMATIC_SCHEDULES[key] = (weakref.ref(cu_seqlens_q), weakref.ref(cu_seqlens_k), schedule)
+    return schedule
 
 
 @triton.jit
@@ -2012,104 +1011,6 @@ def prepare_q(q, cu_seqlens_q):
     return q8, scales
 
 
-def _check_offsets(offsets, device):
-    if (offsets.ndim != 1 or offsets.numel() < 2 or offsets.dtype != torch.int32 or not offsets.is_contiguous()
-            or offsets.device != device):
-        raise ValueError("Requires contiguous int32 sequence offsets on the input device")
-
-
-@dataclass(frozen=True)
-class ForwardWorkSchedule:
-    item_order: torch.Tensor
-    num_ctas: int
-    block_m: int
-    total_q: int
-    total_kv: int
-    batch: int
-    needs_empty_fill: bool = True
-
-
-def prepare_work_schedule(
-    query_lengths,
-    key_lengths,
-    device,
-    *,
-    num_ctas=512,
-    block_m=128,
-):
-    """Build a reusable KV-cost-balanced persistent work schedule."""
-    if num_ctas < 8 or num_ctas % 8 or block_m not in (64, 128, 256):
-        raise ValueError("Requires a multiple of eight CTAs and block_m 64, 128, or 256")
-    if not isinstance(query_lengths, (list, tuple)) or not isinstance(key_lengths, (list, tuple)):
-        raise ValueError("Requires CPU lists or tuples of sequence lengths")
-    if len(query_lengths) != len(key_lengths) or not query_lengths:
-        raise ValueError("Query and key lengths must have the same nonzero batch size")
-    if any(not isinstance(n, int) or n < 0 for n in (*query_lengths, *key_lengths)):
-        raise ValueError("Sequence lengths must be nonnegative integers")
-    costs = []
-    for q_length, k_length in zip(query_lengths, key_lengths):
-        if k_length:
-            costs.extend([triton.cdiv(k_length, _PAD)] * (triton.cdiv(q_length, block_m) * _HEADS))
-    count = len(costs)
-    capacities = [triton.cdiv(count - base, num_ctas) for base in range(min(num_ctas, count))]
-    bins = [(0, base, 0) for base in range(len(capacities))]
-    heapq.heapify(bins)
-    order = [0] * count
-    for item in sorted(range(count), key=lambda index: (-costs[index], index)):
-        load, base, assigned = heapq.heappop(bins)
-        order[base + assigned * num_ctas] = item
-        assigned += 1
-        if assigned < capacities[base]:
-            heapq.heappush(bins, (load + costs[item], base, assigned))
-    return ForwardWorkSchedule(
-        torch.tensor(order, dtype=torch.int32, device=device),
-        num_ctas,
-        block_m,
-        sum(query_lengths),
-        sum(key_lengths),
-        len(query_lengths),
-        any(q_length > 0 and k_length == 0 for q_length, k_length in zip(query_lengths, key_lengths)),
-    )
-
-
-def _check_work_schedule(schedule, q, total_kv, batch, block_m, num_ctas):
-    if schedule is None:
-        return
-    if (schedule.total_q != q.shape[0] or schedule.total_kv != total_kv or schedule.batch != batch
-            or schedule.block_m != block_m or (num_ctas is not None and num_ctas != schedule.num_ctas)
-            or schedule.item_order.device != q.device):
-        raise ValueError("Work schedule must match the input lengths, device, tile size, "
-                         "and grid")
-
-
-_AUTOMATIC_SCHEDULES: dict[tuple[Any, ...], tuple[Any, Any, ForwardWorkSchedule]] = {}
-
-
-def _automatic_work_schedule(cu_seqlens_q, cu_seqlens_k, device, *, num_ctas, block_m):
-    """Create the balanced schedule used by the public forward paths."""
-    key = (
-        id(cu_seqlens_q),
-        cu_seqlens_q._version,
-        id(cu_seqlens_k),
-        cu_seqlens_k._version,
-        block_m,
-        num_ctas,
-    )
-    hit = _AUTOMATIC_SCHEDULES.get(key)
-    if hit is not None and hit[0]() is cu_seqlens_q and hit[1]() is cu_seqlens_k:
-        return hit[2]
-    query_lengths = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).detach().cpu().tolist()
-    key_lengths = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).detach().cpu().tolist()
-    if num_ctas is None:
-        work_items = sum(triton.cdiv(q, block_m) * _HEADS for q, k in zip(query_lengths, key_lengths) if k)
-        num_ctas = min(512, max(8, triton.cdiv(work_items, 8) * 8))
-    schedule = prepare_work_schedule(query_lengths, key_lengths, device, num_ctas=num_ctas, block_m=block_m)
-    if len(_AUTOMATIC_SCHEDULES) >= 64:
-        _AUTOMATIC_SCHEDULES.pop(next(iter(_AUTOMATIC_SCHEDULES)))
-    _AUTOMATIC_SCHEDULES[key] = (weakref.ref(cu_seqlens_q), weakref.ref(cu_seqlens_k), schedule)
-    return schedule
-
-
 def forward_prequantized(
     q8,
     q_scales,
@@ -2124,7 +1025,6 @@ def forward_prequantized(
     total_kv,
     fast_exp=False,
     num_ctas=None,
-    block_m=128,
     work_schedule=None,
 ):
     """Return output and natural-log LSE from prepared MXFP8 inputs."""
@@ -2138,8 +1038,6 @@ def forward_prequantized(
         raise ValueError("Query and key sequence offsets must have the same shape")
     if (not isinstance(total_kv, int) or total_kv < 0 or not math.isfinite(sm_scale)):
         raise ValueError("total_kv must be nonnegative and sm_scale must be finite")
-    if block_m not in (64, 128, 256):
-        raise ValueError("block_m must be 64, 128, or 256")
     if num_ctas is not None and (num_ctas < 8 or num_ctas % 8):
         raise ValueError("num_ctas must be a positive multiple of eight")
     batch = cu_seqlens_k.numel() - 1
@@ -2149,10 +1047,10 @@ def forward_prequantized(
             cu_seqlens_k,
             device,
             num_ctas=num_ctas,
-            block_m=block_m,
         )
-    _check_work_schedule(work_schedule, q8, total_kv, batch, block_m, num_ctas)
-    npad = (triton.cdiv(total_kv + (_PAD - 1) * batch, _PAD) + 1) * _PAD
+    _check_work_schedule(work_schedule, q8, total_kv, batch, num_ctas)
+    meta = _metadata(cu_seqlens_q, cu_seqlens_k, q8.shape[0], total_kv, _BLOCK_M)
+    npad = meta["npad"]
     tensors = (
         (q_scales, (q8.shape[0], _HEADS, 4), torch.uint8),
         (k8, (_HEADS, npad, _HEAD_DIM), torch.float8_e4m3fn),
@@ -2168,13 +1066,6 @@ def forward_prequantized(
         if (tensor.shape != shape or tensor.dtype != dtype or not tensor.is_contiguous() or tensor.device != device):
             raise ValueError("Prepared payloads and scales must match the documented "
                              "shapes, dtypes, and device")
-    meta = _metadata(
-        cu_seqlens_q,
-        cu_seqlens_k,
-        q8.shape[0],
-        total_kv,
-        block_m,
-    )
     return _launch_extended_forward(
         q8,
         q_scales,
@@ -2186,7 +1077,6 @@ def forward_prequantized(
         cu_seqlens_k,
         sm_scale,
         meta,
-        block_m,
         fast_exp,
         True,
         work_schedule,
@@ -2213,35 +1103,28 @@ def forward(
     fast_exp=False,
     kv_state=None,
     num_ctas=None,
-    block_m=None,
-    backward_state=False,
     work_schedule=None,
 ):
     """Return (out, lse, kv_state); lse is natural-log FP32 [4, total_q].
 
-    Query tiles have 256 rows (8 warps), or 128 (4 warps) when sequences
-    average under 256 queries and 4096 keys. Sequences with no keys get zero
-    output rows and -inf LSE. With backward_state, kv_state also carries the
-    K/V operands of tlx_mxfp8_varlen_backward_gfx950.backward."""
+    Query tiles have 128 rows on four warps. Sequences with no keys get zero
+    output rows and -inf LSE. The sequence-offset tensors must not be
+    modified in place while their prepared metadata and work schedule are
+    reused."""
     # With a given kv_state, K and V only supply their shape.
     _check(q, k, v, sm_scale, kv_contiguous=kv_state is None)
     batch = cu_seqlens_k.numel() - 1
-    if block_m is None:
-        block_m = 128
-    if block_m != 128:
-        raise ValueError("The packed MXFP8 TLX op exposes only the 4-wave BLOCK_M=128 path")
     if work_schedule is None:
         work_schedule = _automatic_work_schedule(
             cu_seqlens_q,
             cu_seqlens_k,
             q.device,
             num_ctas=num_ctas,
-            block_m=block_m,
         )
-    _check_work_schedule(work_schedule, q, k.shape[0], batch, block_m, num_ctas)
-    meta = _metadata(cu_seqlens_q, cu_seqlens_k, q.shape[0], k.shape[0], block_m)
+    _check_work_schedule(work_schedule, q, k.shape[0], batch, num_ctas)
+    meta = _metadata(cu_seqlens_q, cu_seqlens_k, q.shape[0], k.shape[0], _BLOCK_M)
     if kv_state is None:
-        kv_state = prepare_kv(k, v, cu_seqlens_k, meta, backward=backward_state)
+        kv_state = prepare_kv(k, v, cu_seqlens_k, meta)
     k8, ks, v8, vs = kv_state[:4]
     out, lse = _launch_extended_forward(
         q,
@@ -2254,7 +1137,6 @@ def forward(
         cu_seqlens_k,
         sm_scale,
         meta,
-        block_m,
         fast_exp,
         False,
         work_schedule,
@@ -2269,10 +1151,12 @@ def flash_attn_varlen_mxfp8(
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
+    max_seqlen_k,
     sm_scale,
     *,
     fast_exp=False,
 ):
+    del max_seqlen_k
     del max_seqlen_q
     out, _, _ = forward(
         q,
@@ -2282,7 +1166,6 @@ def flash_attn_varlen_mxfp8(
         cu_seqlens_k,
         sm_scale,
         fast_exp=fast_exp,
-        block_m=128,
     )
     return out
 
@@ -2298,7 +1181,6 @@ def _launch_extended_forward(
     cu_seqlens_k,
     sm_scale,
     meta,
-    block_m,
     fast_exp,
     prequantized,
     work_schedule,
@@ -2307,10 +1189,11 @@ def _launch_extended_forward(
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     lse = torch.empty((_HEADS, q.shape[0]), dtype=torch.float32, device=q.device)
     grid = work_schedule.num_ctas
-    cast(
-        Any,
-        _mxfp8_varlen_extended_kernel_8w if block_m == 256 else _mxfp8_varlen_extended_kernel_4,
-    )[(grid, )](
+    kernel = cast(Any, _mxfp8_varlen_extended_kernel_4)
+    use_work_order = (work_schedule.item_count is not None
+                      and work_schedule.item_count == work_schedule.item_order.numel()
+                      and not work_schedule.needs_empty_fill)
+    kernel[(grid, )](
         q,
         q_scales if q_scales is not None else q,
         work_schedule.item_order,
@@ -2330,13 +1213,12 @@ def _launch_extended_forward(
         meta["npad"],
         sm_scale * _LOG2E,
         HEADS=_HEADS,
-        BLOCK_M=block_m,
+        BLOCK_M=_BLOCK_M,
         FAST_EXP=fast_exp,
         PREQUANTIZED_Q=prequantized,
-        USE_WORK_ORDER=True,
         REUSE_METADATA=work_schedule.total_kv < 4096 * batch,
-        SCHEDULE_ITEMS=work_schedule.item_order.numel(),
-        **{**_LAUNCH_OPTIONS, "num_warps": block_m // 32},
+        USE_WORK_ORDER=use_work_order,
+        **_LAUNCH_OPTIONS,
     )
     if work_schedule.needs_empty_fill:
         cast(Any, _fill_empty)[(batch, )](
