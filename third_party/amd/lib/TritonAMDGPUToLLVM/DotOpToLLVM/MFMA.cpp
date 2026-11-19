@@ -699,6 +699,27 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     return packed;
   }
 
+  // Consume a per-segment packed FP6 chunk directly instead of
+  // dense-packing codes. Byte contract for an `amdg.fp6_packed` operand:
+  // each lane chunk is 32 bytes, 24 packed bytes (32 codes, LSB first)
+  // followed by 8 padding bytes, so the padding is the last two i32 words.
+  Value dropFp6Padding(Value padded) const {
+    auto paddedTy = dyn_cast<VectorType>(padded.getType());
+    assert(paddedTy &&
+           paddedTy.getNumElements() * paddedTy.getElementTypeBitWidth() ==
+               256 &&
+           "amdg.fp6_packed chunk must be 32 bytes per lane");
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    Value words = b.bitcast(padded, vec_ty(i32_ty, 8));
+    auto packedTy = vec_ty(i32_ty, 6);
+    Value packed = b.undef(packedTy);
+    for (int i = 0; i < 6; ++i)
+      packed = b.insert_element(packedTy, packed,
+                                b.extract_element(i32_ty, words, b.i32_val(i)),
+                                b.i32_val(i));
+    return packed;
+  }
+
   static Value scaledAcc(triton::DotScaledOp op) { return op.getC(); }
   static Value scaledAcc(triton::amdgpu::ScheduledMfmaScaledOp op) {
     return op.getAcc();
@@ -932,12 +953,13 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
                                     : static_cast<int>(bKBase),
         bTensorTy, bTensorTy.getElementType(), allowXF32,
         /*preserveBF16=*/false, /*isConstantScale=*/false, kTailFill);
+    bool fp6Packed = op->hasAttr(triton::amdgpu::kFp6PackedAttrName);
     if (isMXFP6ScaleType(aElemType))
       for (auto &[key, val] : operandA)
-        val = packFp6Operand(val);
+        val = fp6Packed ? dropFp6Padding(val) : packFp6Operand(val);
     if (isMXFP6ScaleType(bElemType))
       for (auto &[key, val] : operandB)
-        val = packFp6Operand(val);
+        val = fp6Packed ? dropFp6Padding(val) : packFp6Operand(val);
 
     // Scales have the same replica distributions as their corresponding
     // operands.
