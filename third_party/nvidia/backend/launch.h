@@ -238,6 +238,12 @@ typedef CUresult (*triton_cuTensorMapEncodeTiled_fn)(
 
 static triton_cuTensorMapEncodeTiled_fn g_triton_tma_encode_fn = NULL;
 
+typedef CUresult (*triton_cuCtxGetDevice_fn)(CUdevice *);
+typedef CUresult (*triton_cuDeviceGetAttribute_fn)(int *, CUdevice_attribute,
+                                                   CUdevice);
+static triton_cuCtxGetDevice_fn g_triton_ctx_get_device_fn = NULL;
+static triton_cuDeviceGetAttribute_fn g_triton_device_get_attribute_fn = NULL;
+
 /* Shared libcuda handle for constructor-time symbol resolution. Intentionally
  * never dlclose'd: the library stays mapped for the process lifetime (same
  * pattern as triton_init_launch_kernel_ex above). */
@@ -267,6 +273,10 @@ __attribute__((constructor)) static void triton_init_cuda_symbols(void) {
     return;
   g_triton_tma_encode_fn = (triton_cuTensorMapEncodeTiled_fn)dlsym(
       g_triton_libcuda, "cuTensorMapEncodeTiled");
+  g_triton_ctx_get_device_fn =
+      (triton_cuCtxGetDevice_fn)dlsym(g_triton_libcuda, "cuCtxGetDevice");
+  g_triton_device_get_attribute_fn = (triton_cuDeviceGetAttribute_fn)dlsym(
+      g_triton_libcuda, "cuDeviceGetAttribute");
   triton_cuDriverGetVersion_fn ver_fn = (triton_cuDriverGetVersion_fn)dlsym(
       g_triton_libcuda, "cuDriverGetVersion");
   int v = 0;
@@ -280,6 +290,49 @@ static inline triton_cuTensorMapEncodeTiled_fn triton_get_tma_encode(void) {
 
 static inline int triton_get_driver_version(void) {
   return g_triton_driver_version;
+}
+
+/* cuTensorMapEncodeTiled requires 128 FP6 values. SM103 also accepts 64
+ * for a b6p2x16 store. Encode the unswizzled narrow map here. */
+static inline CUresult triton_encode_fp6_store_box64(
+    CUtensorMap *desc, uint64_t global_address, int rank, int swizzle,
+    int padding, int elem_size, const cuuint64_t *shape,
+    const cuuint64_t *strides, const cuuint32_t *box) {
+  if (!g_triton_ctx_get_device_fn || !g_triton_device_get_attribute_fn)
+    return CUDA_ERROR_NOT_FOUND;
+  CUdevice device;
+  int major, minor;
+  TRITON_CUDA_CHECK(g_triton_ctx_get_device_fn(&device));
+  TRITON_CUDA_CHECK(g_triton_device_get_attribute_fn(
+      &major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+  TRITON_CUDA_CHECK(g_triton_device_get_attribute_fn(
+      &minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
+  if (major != 10 || minor != 3)
+    return CUDA_ERROR_NOT_SUPPORTED;
+  if (rank < 2 || rank > TRITON_MAX_TMA_DIMS || swizzle || padding ||
+      elem_size != 1 || !global_address || global_address % 16 || !shape[0] ||
+      shape[0] % 64 || shape[0] > (1ULL << 32) || box[0] != 64)
+    return CUDA_ERROR_INVALID_VALUE;
+  uint32_t words[32] = {0};
+  words[0] = (uint32_t)global_address;
+  words[1] = global_address >> 32;
+  words[2] = 0x680 | ((uint32_t)(rank - 1) << 4); /* Tiled FP6, no swizzle. */
+  words[8] = shape[0] - 1;
+  words[13] = 63U << 24;
+  for (int i = 0; i < rank - 1; ++i) {
+    uint64_t dim = shape[i + 1], stride = strides[i];
+    uint32_t outer_box = box[i + 1];
+    if (!dim || dim > (1ULL << 32) || !stride || stride % 16 ||
+        stride / 16 > UINT32_MAX || !outer_box || outer_box > 256)
+      return CUDA_ERROR_INVALID_VALUE;
+    words[3 + i] = stride >> 4;
+    words[9 + i] = dim - 1;
+    words[14] |= (outer_box - 1) << (8 * i);
+  }
+  TRITON_STATIC_ASSERT(sizeof(words) == sizeof(CUtensorMap),
+                       "unexpected tensor map size");
+  memcpy(desc, words, sizeof(words));
+  return CUDA_SUCCESS;
 }
 
 /**
@@ -300,6 +353,8 @@ triton_construct_tma_desc(CUtensorMap *desc, const triton_tma_recipe_t *recipe,
     return CUDA_ERROR_NOT_FOUND;
 
   int rank = recipe->ndim;
+  if (rank < 1 || rank > TRITON_MAX_TMA_DIMS)
+    return CUDA_ERROR_INVALID_VALUE;
   CUdeviceptr base_ptr;
   memcpy(&base_ptr, (const char *)args_buf + recipe->ptr_offset,
          sizeof(base_ptr));
@@ -373,6 +428,12 @@ triton_construct_tma_desc(CUtensorMap *desc, const triton_tma_recipe_t *recipe,
   CUtensorMapFloatOOBfill fill =
       recipe->fill_mode ? CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
                         : CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
+
+  if (recipe->elem_type == CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B &&
+      box_dim[0] == 64)
+    return triton_encode_fp6_store_box64(desc, base_ptr, rank, swizzle_mode,
+                                         recipe->fill_mode, recipe->elem_size,
+                                         global_dim, global_strides, box_dim);
 
   CUresult r =
       encode_fn(desc, (CUtensorMapDataType)recipe->elem_type, (cuuint32_t)rank,
