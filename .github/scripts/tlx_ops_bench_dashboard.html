@@ -977,9 +977,10 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
     const kv = $("ver-kv");
     kv.textContent = "";
     const rows = [
-      ["fbtriton nightly", p.version],
+      ["Version", p.version],
       ["triton.__version__", p.triton],
       ["Commit", null],
+      ["TLX tests on commit", p.ci ? undefined : "not recorded"],
       ["PyTorch", p.torch],
       ["GPU runtime", p.runtime || "–"],
       ["Driver", p.driver || "–"],
@@ -995,6 +996,9 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospac
         const a = el("a", {href: `${REPO}/commit/${p.sha}`});
         a.append(el("code", {}, p.sha.slice(0, 12)));
         dd.append(a);
+      } else if (v === undefined) {
+        dd.append(p.ci.run ? el("a", {href: p.ci.run, target: "_blank", rel: "noopener"}, p.ci.tlx_test) : p.ci.tlx_test);
+        if (p.ci.tlx_test !== "success") dd.style.color = "var(--critical)";
       } else dd.textContent = v;
       kv.append(dd);
     }

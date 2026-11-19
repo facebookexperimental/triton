@@ -172,6 +172,9 @@ pip: speedup < 0.9, or TFLOP/s under an op's absolute floor when it has no
 noisy: CV% > 3%
 ok: everything else
 
+Only `error` fails the run. `pip` and `noisy` are reported and published; the
+nightly regression detector tracks throughput over time.
+
 A benchmark may set `REFERENCE_GATE = False` when its reference validates the
 same numerical result but does not use an equivalent storage or instruction
 contract. The harness still measures and reports the ratio, while only

@@ -110,7 +110,8 @@ def test_skipped_operator_remains_visible_alongside_measurements(tmp_path):
     ET.ElementTree(suite).write(tmp_path / "bench.xml")
     out = tmp_path / "summary.json"
     dash.summarize(
-        SimpleNamespace(dir=str(tmp_path), platform="mi350", version="3.9.0.dev20261029", sha="a" * 40, out=str(out)))
+        SimpleNamespace(dir=str(tmp_path), platform="mi350", version="3.9.0.dev20261029", sha="a" * 40, out=str(out),
+                        ci="", ci_run=""))
     summary = json.loads(out.read_text())
     ops = summary["ops"]
     assert ops["addmm"]["reason"] == "no implementation"
