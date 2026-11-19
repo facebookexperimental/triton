@@ -1597,6 +1597,12 @@ void FpToFpOp::print(OpAsmPrinter &p) {
 }
 
 LogicalResult FpToFpOp::verify() {
+  if (getRounding() == RoundingMode::RS) {
+    if (!getRbits())
+      return emitOpError("stochastic rounding requires an rbits operand");
+  } else if (getRbits()) {
+    return emitOpError("rbits is only allowed with stochastic rounding");
+  }
   auto dstType = getType();
   auto srcType = getSrc().getType();
   if (auto dstTensorType = dyn_cast<RankedTensorType>(dstType))
