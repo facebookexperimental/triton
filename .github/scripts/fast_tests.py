@@ -136,6 +136,17 @@ def fast_plan(paths, repo, filters, suites, narrow):
     return selected, plans
 
 
+def parameter_values(item):
+    callspec = getattr(item, "callspec", None)
+    values = set()
+    for name, value in (callspec.params.items() if callspec else ()):
+        try:
+            values.add((name, repr(value)))
+        except ValueError:
+            values.add((name, callspec.indices[name]))
+    return values
+
+
 def target_matches(nodeid, target):
     return nodeid == target or nodeid.startswith(target + "[")
 
@@ -248,41 +259,64 @@ class FastCollection:
     def pytest_runtestloop(self, session):
         if session.testsfailed or session.config.option.collectonly:
             return None
+        candidates = {}
+        for item in session.items:
+            if item.nodeid not in self.baseline and item.nodeid.split("[", 1)[0] in self.functions:
+                candidates.setdefault(item.nodeid.split("[", 1)[0], []).append(item)
+        covered = {function: set() for function in self.functions}
         for item in session.items:
             function = item.nodeid.split("[", 1)[0]
-            state = self.functions.get(function)
-            baseline = item.nodeid in self.baseline
-            if not baseline and state:
-                if state["status"] in ("passed", "failed"):
-                    continue
-                if state["attempts"] >= MAX_CANDIDATES:
-                    state["status"] = "limit_reached"
-                    continue
-                state["attempts"] += 1
-            session.config.hook.pytest_runtest_protocol(item=item, nextitem=None)
-            reports = self.reports.get(item.nodeid, [])
-            failed = any(report.failed for report in reports)
-            excluded = next((report for report in reports if report.skipped or hasattr(report, "wasxfail")), None)
-            passed = any(report.when == "call" and report.passed
-                         for report in reports) and not failed and excluded is None
-            if failed:
-                if state:
-                    state["status"] = "failed"
-            elif passed:
-                self.selected.append(item.nodeid)
-                if state:
-                    state.update(status="passed", passed=item.nodeid)
-            elif excluded is not None and not baseline:
-                reason = str(excluded.longrepr)
-                self.exclusions.append({"nodeid": item.nodeid, "phase": "runtime", "reason": reason})
-                if state:
-                    state["reason"] = reason
-            if baseline and not passed and state:
-                state["status"] = "failed"
+            if item.nodeid in self.baseline:
+                self.run_item(session, item, function, covered)
+            elif function in candidates:
+                self.sample(session, function, candidates.pop(function), covered)
         for state in self.functions.values():
             if state["status"] == "pending" and state["reason"]:
                 state["status"] = "runtime_unavailable"
         return True
+
+    def sample(self, session, function, items, covered):
+        """Sample until each parameter value passes, no case adds one, a case fails, or the limit is hit."""
+        state = self.functions[function]
+        values = {item: parameter_values(item) for item in items}
+
+        def gain(item):
+            return len(values[item] - covered[function])
+
+        while items and state["status"] != "failed":
+            item = max(items, key=gain)
+            if state["status"] == "passed" and not gain(item):
+                return
+            if state["attempts"] >= MAX_CANDIDATES:
+                state["status"] = "limit_reached"
+                return
+            items.remove(item)
+            state["attempts"] += 1
+            self.run_item(session, item, function, covered)
+
+    def run_item(self, session, item, function, covered):
+        state = self.functions.get(function)
+        baseline = item.nodeid in self.baseline
+        session.config.hook.pytest_runtest_protocol(item=item, nextitem=None)
+        reports = self.reports.get(item.nodeid, [])
+        failed = any(report.failed for report in reports)
+        excluded = next((report for report in reports if report.skipped or hasattr(report, "wasxfail")), None)
+        passed = any(report.when == "call" and report.passed for report in reports) and not failed and excluded is None
+        if failed:
+            if state:
+                state["status"] = "failed"
+        elif passed:
+            self.selected.append(item.nodeid)
+            if state:
+                state.update(status="passed", passed=item.nodeid)
+                covered[function] |= parameter_values(item)
+        elif excluded is not None and not baseline:
+            reason = str(excluded.longrepr)
+            self.exclusions.append({"nodeid": item.nodeid, "phase": "runtime", "reason": reason})
+            if state:
+                state["reason"] = reason
+        if baseline and not passed and state:
+            state["status"] = "failed"
 
     def manifest(self):
         return {
