@@ -28,8 +28,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/Dominance.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LLVM.h"
@@ -775,8 +775,8 @@ Value createReuseView(OpBuilder &builder, TMEMAllocOp representative,
       builder, duplicate.getLoc(), representative.getResult(), view.offset,
       view.sliceSize, representativeType.getRank() - 1);
   auto reinterpretType = createReinterpretType(builder, duplicateType);
-  auto reinterpret = MemDescReinterpretOp::create(
-      builder, duplicate.getLoc(), reinterpretType, subSlice);
+  auto reinterpret = MemDescReinterpretOp::create(builder, duplicate.getLoc(),
+                                                  reinterpretType, subSlice);
   assignStageCluster(subSlice, getPartitionWsTagIds(duplicate),
                      getStageCluster(duplicate), builder);
   assignStageCluster(reinterpret, getPartitionWsTagIds(duplicate),

@@ -139,8 +139,7 @@ public:
     for (Value operand : op->getOperands())
       if (Operation *def = operand.getDefiningOp())
         include(def);
-    if (auto it = memoryPredecessors.find(op);
-        it != memoryPredecessors.end())
+    if (auto it = memoryPredecessors.find(op); it != memoryPredecessors.end())
       for (Operation *predecessor : it->second)
         include(predecessor);
 
@@ -148,8 +147,8 @@ public:
     if (!complete)
       return std::nullopt;
     int64_t latency = model.getLatency(op).latency;
-    int64_t ready = std::min(
-        kMaxReadiness, start + std::max<int64_t>(latency, 0));
+    int64_t ready =
+        std::min(kMaxReadiness, start + std::max<int64_t>(latency, 0));
     memo[op] = ready;
     return ready;
   }
@@ -214,8 +213,7 @@ static LogicalResult orderGroupsInBlock(FuncOp func, Block &functionBlock) {
   }
 
   ReadinessScorer scorer(memoryPredecessors);
-  auto summarizeReadiness = [&](unsigned group,
-                                Operation *consumer)
+  auto summarizeReadiness = [&](unsigned group, Operation *consumer)
       -> std::optional<std::pair<int64_t, StageCluster>> {
     auto it = incomingByGroup[group].find(consumer);
     if (it == incomingByGroup[group].end() || it->second.empty())
@@ -225,8 +223,7 @@ static LogicalResult orderGroupsInBlock(FuncOp func, Block &functionBlock) {
     for (Operation *writer : it->second) {
       std::optional<int64_t> ready = scorer.score(writer);
       StageCluster schedule = getStageCluster(writer);
-      if (!ready || !schedule ||
-          (commonSchedule && commonSchedule != schedule))
+      if (!ready || !schedule || (commonSchedule && commonSchedule != schedule))
         return std::nullopt;
       commonSchedule = schedule;
       readyTime = std::max(readyTime, *ready);
@@ -251,8 +248,7 @@ static LogicalResult orderGroupsInBlock(FuncOp func, Block &functionBlock) {
             std::abs(lhsReadiness->first - rhsReadiness->first) <
                 kMinReadinessGap)
           continue;
-        unsigned before =
-            lhsReadiness->first > rhsReadiness->first ? lhs : rhs;
+        unsigned before = lhsReadiness->first > rhsReadiness->first ? lhs : rhs;
         auto key = std::minmax(lhs, rhs);
         PairPreference &preference = preferences[key];
         if (!preference.before)

@@ -261,7 +261,8 @@ struct SlotPair {
 };
 
 // Emission returns a reuse distance for each requested release after assigning
-// handoff offsets. The scheduler uses those distances to finish its loop models.
+// handoff offsets. The scheduler uses those distances to finish its loop
+// models.
 struct DeferredSchedules {
   DenseSet<const Node *> handoffs;
   DenseSet<Operation *> scheduledOps;

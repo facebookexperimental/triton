@@ -121,7 +121,8 @@ static LogicalResult packLoopEpilogue(scf::ForOp loop) {
 
     if (!tma.getToken().hasOneUse())
       return success();
-    auto wait = dyn_cast<ttng::TMAStoreTokenWaitOp>(*tma.getToken().user_begin());
+    auto wait =
+        dyn_cast<ttng::TMAStoreTokenWaitOp>(*tma.getToken().user_begin());
     if (!wait || wait->getBlock() != body ||
         !tma->isBeforeInBlock(wait.getOperation()) ||
         !wait.getBarriers().empty() || !wait.getBarrierPreds().empty() ||

@@ -278,7 +278,8 @@ void init_triton_nvidia_passes_nvws(py::module_ &m) {
                      mlir::triton::createNVWSAssignStagePhase);
   ADD_PASS_WRAPPER_0("add_insert_tmem_aref",
                      mlir::triton::createNVWSInsertTmemAref);
-  ADD_PASS_WRAPPER_0("add_insert_allocas", mlir::triton::createNVWSInsertAllocas);
+  ADD_PASS_WRAPPER_0("add_insert_allocas",
+                     mlir::triton::createNVWSInsertAllocas);
   ADD_PASS_WRAPPER_0("add_insert_semas", mlir::triton::createNVWSInsertSemas);
   ADD_PASS_WRAPPER_0("add_semaphore_optimize",
                      mlir::triton::createNVWSSemaphoreOptimize);

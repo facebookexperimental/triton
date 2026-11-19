@@ -104,8 +104,7 @@ void init_triton_passes_ttgpuir(py::module_ &m) {
         options.smemBudget = smemBudget;
         pm.addPass(createTritonGPUAutomaticWarpSpecialization(options));
       },
-      py::arg("pm"), py::arg("num_stages"),
-      py::arg("use_semaphores") = false,
+      py::arg("pm"), py::arg("num_stages"), py::arg("use_semaphores") = false,
       py::arg("use_meta_partitioner") = false, py::arg("smem_budget") = 0);
   ADD_PASS_WRAPPER_0("add_prefetch", createTritonGPUPrefetch);
   ADD_PASS_WRAPPER_0("add_accelerate_matmul", createTritonGPUAccelerateMatmul);

@@ -166,10 +166,9 @@ getExpandDimsInputTensorType(RankedTensorType tensorType) {
     return std::nullopt;
 
   if (isa<BlockedEncodingAttr>(tensorType.getEncoding())) {
-    auto sliceEnc =
-        SliceEncodingAttr::get(tensorType.getContext(), 1,
-                               cast<DistributedEncodingTrait>(
-                                   (*expandedType).getEncoding()));
+    auto sliceEnc = SliceEncodingAttr::get(
+        tensorType.getContext(), 1,
+        cast<DistributedEncodingTrait>((*expandedType).getEncoding()));
     return RankedTensorType::get(tensorType.getShape(),
                                  tensorType.getElementType(), sliceEnc);
   }
@@ -192,7 +191,8 @@ bool isEligibleSsaTmemTensor(RankedTensorType tensorType) {
 
 bool useSsaTmemChannel(Value value, RankedTensorType tensorType) {
   return triton::tools::getBoolEnv("NVWS_USE_SSA_TMEM") &&
-         hasBlackwellOrNewerTarget(value) && isEligibleSsaTmemTensor(tensorType);
+         hasBlackwellOrNewerTarget(value) &&
+         isEligibleSsaTmemTensor(tensorType);
 }
 
 MemDescType getTmemDescType(RankedTensorType tensorType) {
@@ -274,21 +274,21 @@ Value prepareRank1TmemStoreSrc(OpBuilder &builder, Location loc, Value src,
     assert(!compatibleLayouts.empty() && "no TMEM-compatible layout found");
     auto compatibleType =
         expandedType.cloneWithEncoding(compatibleLayouts.front());
-    storeSrc = createInto<ConvertLayoutOp>(
-        builder, loc, partitions, stageCluster, wsTag, compatibleType, storeSrc);
+    storeSrc =
+        createInto<ConvertLayoutOp>(builder, loc, partitions, stageCluster,
+                                    wsTag, compatibleType, storeSrc);
   }
   return storeSrc;
 }
 
 void createRank1TmemStore(OpBuilder &builder, Location loc, Value src,
                           Value dataBuf, const SetVector<int> &partitions,
-                          StageCluster stageCluster,
-                          std::optional<int> wsTag) {
+                          StageCluster stageCluster, std::optional<int> wsTag) {
   auto tmemDesc = cast<MemDescType>(dataBuf.getType());
   Value storeSrc = prepareRank1TmemStoreSrc(builder, loc, src, partitions,
                                             stageCluster, wsTag, tmemDesc);
-  auto pred = createInto<arith::ConstantIntOp>(
-      builder, loc, partitions, stageCluster, wsTag, true, 1);
+  auto pred = createInto<arith::ConstantIntOp>(builder, loc, partitions,
+                                               stageCluster, wsTag, true, 1);
   createInto<TMEMStoreOp>(builder, loc, partitions, stageCluster, wsTag, Type(),
                           dataBuf, Value(), storeSrc, pred);
 }
@@ -305,16 +305,15 @@ static void copyTmemInitPlacementAttrs(Operation *from, Operation *to) {
 
 static bool isTmemInitPlacementAttr(StringRef name) {
   return name == kPartitionAttrName || name == kLoopStageAttrName ||
-         name == kLoopClusterAttrName ||
-         name == kWarpSpecializeTagAttrName || name == "async_task_id";
+         name == kLoopClusterAttrName || name == kWarpSpecializeTagAttrName ||
+         name == "async_task_id";
 }
 
 static bool isTmemMemDescAlias(Operation *op) {
   StringRef name = op->getName().getStringRef();
   return name == "ttg.memdesc_index" || name == "ttg.memdesc_subview" ||
          name == "ttg.memdesc_subslice" || name == "ttg.memdesc_trans" ||
-         name == "ttg.memdesc_reinterpret" ||
-         name == "ttg.memdesc_reshape";
+         name == "ttg.memdesc_reinterpret" || name == "ttg.memdesc_reshape";
 }
 
 static bool isUsedInMultiplePartitions(TMEMAllocOp alloc) {
@@ -414,8 +413,7 @@ void normalizeSourcefulTmemAlloc(TMEMAllocOp alloc) {
 Value createRank1TmemLoad(OpBuilder &builder, Location loc,
                           RankedTensorType resultType, Value dataBuf,
                           const SetVector<int> &partitions,
-                          StageCluster stageCluster,
-                          std::optional<int> wsTag) {
+                          StageCluster stageCluster, std::optional<int> wsTag) {
   auto tmemDesc = cast<MemDescType>(dataBuf.getType());
   auto expandedType = *getExpandedRank1TensorType(resultType);
   auto compatibleLayouts =
@@ -429,9 +427,9 @@ Value createRank1TmemLoad(OpBuilder &builder, Location loc,
   auto reshape = createInto<triton::ReshapeOp>(
       builder, loc, partitions, stageCluster, wsTag, resultType.getShape(),
       load.getResult());
-  auto converted = createInto<ConvertLayoutOp>(
-      builder, loc, partitions, stageCluster, wsTag, resultType,
-      reshape.getResult());
+  auto converted =
+      createInto<ConvertLayoutOp>(builder, loc, partitions, stageCluster, wsTag,
+                                  resultType, reshape.getResult());
   return converted.getResult();
 }
 
@@ -501,11 +499,11 @@ CommunicationBuffer createCommunicationBuffer(
     Attribute SharedMemorySpace =
         SharedMemorySpaceAttr::get(tensorType.getContext());
     Operation *defOp = tensorResult ? tensorResult.getDefiningOp() : nullptr;
-    Attribute encoding =
-        encodingOverride ? encodingOverride
-                         : (defOp && !isa<scf::ForOp>(defOp)
-                                ? getSharedEncoding(defOp)
-                                : getSharedEncoding(tensorType));
+    Attribute encoding = encodingOverride
+                             ? encodingOverride
+                             : (defOp && !isa<scf::ForOp>(defOp)
+                                    ? getSharedEncoding(defOp)
+                                    : getSharedEncoding(tensorType));
     return MemDescType::get(tensorType.getShape(), tensorType.getElementType(),
                             encoding, SharedMemorySpace);
   };
@@ -556,9 +554,9 @@ CommunicationBuffer createCommunicationBuffer(
 
   auto baseTypes = TypeArrayAttr::get(builder.getContext(), {allocBufType});
   auto semaTy = SemaphoreType::get(builder.getContext(), baseTypes);
-  auto empty = SemaphoreCreateOp::create(
-      builder, loc, semaTy, alloc->getResults(),
-      getPhysicalStageMask(semaTy.getNumStages()));
+  auto empty =
+      SemaphoreCreateOp::create(builder, loc, semaTy, alloc->getResults(),
+                                getPhysicalStageMask(semaTy.getNumStages()));
   auto full =
       SemaphoreCreateOp::create(builder, loc, semaTy, alloc->getResults());
   return CommunicationBuffer{empty, full, alloc->getResult(0),
@@ -629,8 +627,7 @@ StageCluster getStageClusterForProducer(Value producedValue) {
 }
 
 Value createStage0BufferView(OpBuilder &builder, Location loc, Value alloc,
-                             bool mutableMemory,
-                             bool hasStageDimension,
+                             bool mutableMemory, bool hasStageDimension,
                              const SetVector<int> &partitions,
                              StageCluster stageCluster,
                              std::optional<int> wsTag) {
@@ -643,10 +640,9 @@ Value createStage0BufferView(OpBuilder &builder, Location loc, Value alloc,
 
   auto viewType = MemDescType::get(
       allocBufType.getShape().drop_front(), allocBufType.getElementType(),
-      allocBufType.getEncoding(), allocBufType.getMemorySpace(),
-      mutableMemory);
-  auto zero = createInto<arith::ConstantIntOp>(
-      builder, loc, partitions, stageCluster, wsTag, 0, 32);
+      allocBufType.getEncoding(), allocBufType.getMemorySpace(), mutableMemory);
+  auto zero = createInto<arith::ConstantIntOp>(builder, loc, partitions,
+                                               stageCluster, wsTag, 0, 32);
   return createInto<MemDescIndexOp>(builder, loc, partitions, stageCluster,
                                     wsTag, viewType, alloc, zero)
       .getResult();
@@ -676,15 +672,15 @@ createSemaphoreProducer(OpBuilder &builder, CommunicationBuffer &sema,
     token = acquire.getToken();
 
     // Get buffer view.
-    auto bufOp = createInto<SemaphoreBufferOp>(
-        builder, loc, producerPartitions, stageCluster, wsTag, sema.empty,
-        TypeRange{dataBufType}, token);
+    auto bufOp = createInto<SemaphoreBufferOp>(builder, loc, producerPartitions,
+                                               stageCluster, wsTag, sema.empty,
+                                               TypeRange{dataBufType}, token);
     dataBuf = bufOp.getBuffers()[0];
   } else {
-    dataBuf = createStage0BufferView(builder, loc, sema.alloc,
-                                     /*mutableMemory=*/true,
-                                     sema.hasStageDimension,
-                                     producerPartitions, stageCluster, wsTag);
+    dataBuf =
+        createStage0BufferView(builder, loc, sema.alloc,
+                               /*mutableMemory=*/true, sema.hasStageDimension,
+                               producerPartitions, stageCluster, wsTag);
   }
 
   auto producerKind = AsyncOp::NONE;
@@ -731,9 +727,9 @@ createSemaphoreProducer(OpBuilder &builder, CommunicationBuffer &sema,
     }
   } else if (isa<FloatType, IntegerType>(result.getType())) {
     auto tensorType = getTensorTypeFromScalar(builder, result);
-    auto splatOp = createInto<triton::SplatOp>(
-        builder, loc, producerPartitions, stageCluster, wsTag, tensorType,
-        result);
+    auto splatOp =
+        createInto<triton::SplatOp>(builder, loc, producerPartitions,
+                                    stageCluster, wsTag, tensorType, result);
     createInto<LocalStoreOp>(builder, loc, producerPartitions, stageCluster,
                              wsTag, splatOp, dataBuf);
     producerKind = AsyncOp::NONE;
@@ -949,11 +945,10 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
         TypeRange{bufferType}, token);
     dataBuf = bufOp.getBuffers()[0];
   } else {
-    dataBuf = createStage0BufferView(builder, loc, sema.alloc,
-                                     /*mutableMemory=*/false,
-                                     sema.hasStageDimension,
-                                     consumerPartitions, stageClusterEnter,
-                                     wsTag);
+    dataBuf =
+        createStage0BufferView(builder, loc, sema.alloc,
+                               /*mutableMemory=*/false, sema.hasStageDimension,
+                               consumerPartitions, stageClusterEnter, wsTag);
   }
 
   auto consumers = getTransitiveConsumers(results, consumerPartitions);
@@ -981,8 +976,8 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
       loadOp = loaded.getDefiningOp();
     } else {
       auto localLoadOp = createInto<LocalLoadOp>(
-          builder, loc, consumerPartitions, stageCluster, wsTag, result.getType(),
-          dataBuf);
+          builder, loc, consumerPartitions, stageCluster, wsTag,
+          result.getType(), dataBuf);
       loaded = localLoadOp.getResult();
       loadOp = localLoadOp;
     }
@@ -1012,11 +1007,11 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
     } else if (isa<FloatType, IntegerType>(result.getType())) {
       auto tensorType = getTensorTypeFromScalar(builder, result);
       auto localLoadOp = createInto<LocalLoadOp>(
-          builder, loc, consumerPartitions, stageClusterEnter, wsTag, tensorType,
-          dataBuf);
-      auto scalar = createInto<triton::UnsplatOp>(
           builder, loc, consumerPartitions, stageClusterEnter, wsTag,
-          localLoadOp);
+          tensorType, dataBuf);
+      auto scalar =
+          createInto<triton::UnsplatOp>(builder, loc, consumerPartitions,
+                                        stageClusterEnter, wsTag, localLoadOp);
       for (auto use : uses) {
         use->set(scalar);
       }
@@ -1042,8 +1037,7 @@ void createSemaphoreConsumer(OpBuilder &builder, scf::ForOp loop,
   // Cross-release: consumer releases empty semaphore
   auto rel = createInto<SemaphoreReleaseOp>(
       builder, loc, consumerPartitions, stageClusterExit, wsTag, sema.empty,
-      token,
-      builder.getArrayAttr(asyncKinds));
+      token, builder.getArrayAttr(asyncKinds));
   rel.setArriveCountAttr(builder.getI32IntegerAttr(1));
 }
 
@@ -1275,9 +1269,8 @@ public:
   void runOnOperation() override {
     InsertCommunicationOptions options;
     options.createSemaphores = false;
-    getOperation().walk([&](triton::FuncOp func) {
-      runOnFunction(func, options);
-    });
+    getOperation().walk(
+        [&](triton::FuncOp func) { runOnFunction(func, options); });
   }
 };
 

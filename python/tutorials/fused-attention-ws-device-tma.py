@@ -216,7 +216,7 @@ configs = [
         maxRegAutoWS=152,  # Preserve the tuned compute-partition budget.
         pre_hook=_host_descriptor_pre_hook,
         # ir_override=f"/home/mren/OpenSource/tritonbench/override/_attn_fwd_persist.ttgir"
-#    ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
+        #    ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
     ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
 ]
 
@@ -1576,10 +1576,10 @@ BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []
 for HEAD_DIM in [128]:  #64, 128]:
-#    for baseVariant in ["ws", "ws_persistent"]:
-#    for baseVariant in ["ws"]:
+    #    for baseVariant in ["ws", "ws_persistent"]:
+    #    for baseVariant in ["ws"]:
     for baseVariant in ["ws_persistent"]:
-        for mode in ["fwd"]: #, "bwd"]:
+        for mode in ["fwd"]:  #, "bwd"]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],
@@ -1648,10 +1648,12 @@ if __name__ == "__main__":
         import sys
         print("Test op fp16...")
         sys.stdout.flush()
-        test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws_persistent", provider="triton-fp16", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
+        test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws_persistent",
+                provider="triton-fp16", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
         print("Test op fp8...")
         sys.stdout.flush()
-        test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws_persistent", provider="triton-fp8", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
+        test_op(Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="fwd", baseVariant="ws_persistent",
+                provider="triton-fp8", SUBTILING=True, VECT_MUL=1, FADD2_REDUCE=False, bwd_config_idx=0)
         print("Running benchmarks...")
         bench_flash_attention.run(print_data=True)
     else:

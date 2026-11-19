@@ -1024,8 +1024,8 @@ private:
         Node *channel = regionChannelFor(region, info.owner);
         if (!channel)
           continue;
-        bool hasAsyncClose = llvm::any_of(
-            g.nodesOfKind(Node::Release), [&](Node *release) {
+        bool hasAsyncClose =
+            llvm::any_of(g.nodesOfKind(Node::Release), [&](Node *release) {
               return withinRegion(release, region) && release->sat &&
                      findChannel(release->sat) == findChannel(channel) &&
                      hasAsyncPayload(release->payloads);

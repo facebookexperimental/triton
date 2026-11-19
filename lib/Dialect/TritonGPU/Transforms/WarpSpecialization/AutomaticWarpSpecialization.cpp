@@ -48,8 +48,7 @@ static bool hasWarpSpecializeLoop(FuncOp func) {
 // still owns an explicit pass pipeline and MetaToNVWSConvert remains a pure
 // representation conversion.
 struct MetaRemoveRedundantTmemZeroStores
-    : PassWrapper<MetaRemoveRedundantTmemZeroStores,
-                  OperationPass<ModuleOp>> {
+    : PassWrapper<MetaRemoveRedundantTmemZeroStores, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
       MetaRemoveRedundantTmemZeroStores)
 
@@ -63,8 +62,7 @@ struct MetaRemoveRedundantTmemZeroStores
 
 struct MetaValidateTMAStoreAnnotations
     : PassWrapper<MetaValidateTMAStoreAnnotations, OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
-      MetaValidateTMAStoreAnnotations)
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MetaValidateTMAStoreAnnotations)
 
   void runOnOperation() override {
     getOperation().walk([&](FuncOp func) {
@@ -210,9 +208,8 @@ void AutomaticWarpSpecialization::runOnOperation() {
 
 LogicalResult AutomaticWarpSpecialization::runSemaphorePipeline() {
   bool enabled = false;
-  getOperation().walk([&](FuncOp func) {
-    enabled |= hasWarpSpecializeLoop(func);
-  });
+  getOperation().walk(
+      [&](FuncOp func) { enabled |= hasWarpSpecializeLoop(func); });
   if (!enabled)
     return success();
 

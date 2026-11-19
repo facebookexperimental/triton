@@ -64,7 +64,7 @@ def _assert_clc_ws_ir(compiled):
 @pytest.mark.skipif(is_hip(), reason="checks NVIDIA compiler pipeline selection")
 @pytest.mark.disable_warmup(reason="checks compiler pipeline dispatch without a JIT launch")
 def test_warp_specialize_pipeline_flag_precedence(use_meta_ws, use_semaphores, use_nvws_meta, expected, monkeypatch,
-                                                fresh_compilation_knobs):
+                                                  fresh_compilation_knobs):
     from triton._C.libtriton import nvidia as nvidia_lib, passes
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource

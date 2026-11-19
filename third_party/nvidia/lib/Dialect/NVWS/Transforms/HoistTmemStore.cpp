@@ -484,7 +484,8 @@ SetVector<int> getFallbackTmemOwnerPartition(ttng::TMEMAllocOp alloc) {
 class NVWSHoistTmemStore
     : public impl::NVWSHoistTmemStoreBase<NVWSHoistTmemStore> {
 public:
-  using impl::NVWSHoistTmemStoreBase<NVWSHoistTmemStore>::NVWSHoistTmemStoreBase;
+  using impl::NVWSHoistTmemStoreBase<
+      NVWSHoistTmemStore>::NVWSHoistTmemStoreBase;
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();

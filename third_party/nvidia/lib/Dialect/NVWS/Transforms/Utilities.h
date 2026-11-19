@@ -51,7 +51,7 @@ gpu::MemDescType getArefMultiBufferedType(gpu::MemDescType arefBufType,
 int getArefDepth(gpu::MemDescType bufTy);
 
 gpu::MemDescType getSemaphoreMultiBufferedType(gpu::MemDescType bufType,
-                                              int depth);
+                                               int depth);
 
 LoopLikeOpInterface getOuterWSLoop(LoopLikeOpInterface loop);
 } // namespace mlir::triton::nvws

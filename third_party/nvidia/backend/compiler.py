@@ -947,8 +947,8 @@ class CUDABackend(BaseBackend):
         # default-planner semaphore path. Both opt-ins are Blackwell-only.
         use_nvws_meta = capability // 10 >= 10 and knobs.nvidia.use_nvws_meta
         use_meta_ws = knobs.nvidia.use_meta_ws and not use_nvws_meta
-        use_nvws_semaphores = use_nvws_meta or (capability // 10 >= 10 and
-                                               knobs.nvidia.use_nvws_semaphores and not use_meta_ws)
+        use_nvws_semaphores = use_nvws_meta or (capability // 10 >= 10 and knobs.nvidia.use_nvws_semaphores
+                                                and not use_meta_ws)
         ran_meta_nvws = False
 
         # Set maxnreg on all kernels, if it was provided.
