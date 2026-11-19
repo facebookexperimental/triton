@@ -1154,6 +1154,9 @@ LogicalResult LocalAllocOp::verify() {
   return verifyAllocOp(*this, getSrc(), getType());
 }
 
+static std::optional<std::string>
+getMixedRadixBufferUnsupportedReason(MemDescType type, bool pow2Views);
+
 // LocalStoreOp
 LogicalResult LocalStoreOp::verify() {
   if (NVMMASharedEncodingAttr::isPackedFp6(getDst().getType().getEncoding()))
@@ -1164,6 +1167,11 @@ LogicalResult LocalStoreOp::verify() {
   if (failed(verifySharedMemoryRank(*this, getSrc().getType(),
                                     getDst().getType(), "source")))
     return failure();
+  if (hasExactNpotLayout(getSrc().getType()))
+    if (std::optional<std::string> reason =
+            getMixedRadixBufferUnsupportedReason(getDst().getType(),
+                                                 /*pow2Views=*/true))
+      return emitError(*reason);
   return verifyMemoryOpTypes(*this, getSrc().getType(), getDst().getType());
 }
 
@@ -1249,9 +1257,18 @@ LogicalResult AsyncRemoteShmemStoreOp::verify() {
   return success();
 }
 
+// Whether an extent's pow2 cover spans its alloc extent, as mixed-radix
+// addressing requires; pow2 extents trivially span.
+static bool npotExtentSpansAlloc(int64_t size, int64_t allocSize) {
+  return llvm::isPowerOf2_64(size) ||
+         llvm::PowerOf2Ceil(size) >= static_cast<uint64_t>(allocSize);
+}
+
 // Mixed-radix lowerings address runs through the buffer's pow2 alloc layout, so
-// it must have no padding or partitions. A local_load XORs in a view's origin,
-// which adds only on pow2 subslice extents; an async copy runs from the base.
+// it must have no padding or partitions. A local_load or local_store adds a
+// view's origin to its coordinates, and an async copy runs from the base. A run
+// is vetted on coordinate bits from an extent's pow2 part (which a subslice
+// origin is a multiple of) up to the extent, so these must cover the alloc.
 static std::optional<std::string>
 getMixedRadixBufferUnsupportedReason(MemDescType type, bool pow2Views) {
   Attribute enc = type.getEncoding();
@@ -1262,7 +1279,7 @@ getMixedRadixBufferUnsupportedReason(MemDescType type, bool pow2Views) {
     return std::string("NPOT mixed-radix access to a padded, partitioned or "
                        "partial buffer is not yet supported");
   for (auto [size, allocSize] : llvm::zip_equal(shape, allocShape))
-    if (size != allocSize && !llvm::isPowerOf2_64(size))
+    if (!npotExtentSpansAlloc(size, allocSize))
       return std::string(
           "NPOT mixed-radix access to a view with an NPOT subslice "
           "extent is not yet supported");
