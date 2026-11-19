@@ -8,7 +8,6 @@ add_triton_library(NVWSTransforms
   MetaToNVWSConvert.cpp
   PackEpilogueSlices.cpp
   OrderBufferGroups.cpp
-  StripPartitionAttrsOutsideWS.cpp
   InsertAref.cpp
   InsertAllocas.cpp
   InsertSemas.cpp

@@ -13,7 +13,6 @@
 // RUN: triton-opt %t/insert_allocas_sourceful_tmem.mlir -allow-unregistered-dialect --nvws-insert-allocas | FileCheck %t/insert_allocas_sourceful_tmem.mlir
 // RUN: triton-opt %t/pack_epilogue_slices.mlir --nvws-pack-epilogue-slices | FileCheck %t/pack_epilogue_slices.mlir
 // RUN: triton-opt %t/order_buffer_groups.mlir --nvws-order-buffer-groups | FileCheck %t/order_buffer_groups.mlir
-// RUN: triton-opt %t/strip_partition_attrs_outside_ws.mlir --nvws-strip-partition-attrs-outside-ws | FileCheck %t/strip_partition_attrs_outside_ws.mlir
 // RUN: triton-opt %t/automatic_loads.mlir -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops --tritongpu-automatic-warp-specialization="num-stages=2 use-semaphores=true" | FileCheck %t/automatic_loads.mlir --check-prefixes=CHECK,AUTO --implicit-check-not=nvws.aref --implicit-check-not=nvws.semaphore --implicit-check-not=tt.descriptor_load
 // RUN: triton-opt %t/automatic_loads.mlir -tritongpu-hoist-tmem-alloc -nvgpu-ws-data-partition=num-warp-groups=1 -tritongpu-assign-latencies -tritongpu-schedule-loops --tritongpu-automatic-warp-specialization="num-stages=2 use-meta-partitioner=true smem-budget=232448" | FileCheck %t/automatic_loads.mlir --check-prefixes=CHECK,META --implicit-check-not=nvws.aref --implicit-check-not=nvws.semaphore --implicit-check-not=tt.descriptor_load
 
@@ -1644,31 +1643,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
     tt.return
   }
 }
-
-//--- strip_partition_attrs_outside_ws.mlir
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @strip_partition_attrs_outside_ws(%arg0: i32) {
-    %c0_i32 = arith.constant 0 : i32
-    %c1_i32 = arith.constant 1 : i32
-    %outside = arith.addi %arg0, %c1_i32 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : i32
-    %loop = scf.for %iv = %c0_i32 to %outside step %c1_i32 iter_args(%arg1 = %outside) -> (i32) : i32 {
-      %inside = arith.addi %arg1, %c1_i32 {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32} : i32
-      scf.yield %inside : i32
-    } {tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32}
-    %after = arith.muli %loop, %c1_i32 {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : i32
-    tt.return
-  }
-}
-
-// CHECK-LABEL: @strip_partition_attrs_outside_ws
-// CHECK: arith.constant 0 : i32
-// CHECK-NEXT: arith.constant 1 : i32
-// CHECK-NEXT: arith.addi %arg0, %{{.*}} : i32
-// CHECK: arith.addi
-// CHECK-SAME: ttg.partition = array<i32: 1>
-// CHECK-SAME: ttg.warp_specialize.tag = 0 : i32
-// CHECK: } {tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32], ttg.warp_specialize.tag = 0 : i32}
-// CHECK-NEXT: arith.muli %{{.*}}, %{{.*}} : i32
 
 //--- automatic_loads.mlir
 #indices_layout_parent = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>

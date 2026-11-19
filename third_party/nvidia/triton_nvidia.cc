@@ -292,8 +292,6 @@ void init_triton_nvidia_passes_nvws(py::module_ &m) {
                      mlir::triton::createNVWSPackEpilogueSlices);
   ADD_PASS_WRAPPER_0("add_order_buffer_groups",
                      mlir::triton::createNVWSOrderBufferGroups);
-  ADD_PASS_WRAPPER_0("add_strip_partition_attrs_outside_ws",
-                     mlir::triton::createNVWSStripPartitionAttrsOutsideWS);
 }
 
 void init_triton_hopper_passes(py::module_ &m) {

@@ -11,7 +11,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
-#include <cstdlib>
 
 using namespace mlir;
 using namespace triton;
@@ -150,11 +149,6 @@ std::unique_ptr<Pass> createVerifyWarpSpecializationPartitionsPass() {
   return std::make_unique<VerifyWarpSpecializationPartitions>();
 }
 
-static bool useMetaNVWSAllocas() {
-  const char *value = std::getenv("TRITON_NVWS_USE_META_NVWS_ALLOCAS");
-  return value && StringRef(value) == "1";
-}
-
 } // namespace
 
 void AutomaticWarpSpecialization::runOnOperation() {
@@ -242,19 +236,7 @@ LogicalResult AutomaticWarpSpecialization::runSemaphorePipeline() {
     metaPM.addPass(createNVGPUTestWSTaskIdPropagate(taskIdOptions));
     metaPM.addPass(std::make_unique<MetaRemoveRedundantTmemZeroStores>());
 
-    if (useMetaNVWSAllocas()) {
-      // Change only allocation materialization: convert Meta task ownership to
-      // NVWS, then use the existing NVWS InsertAllocas implementation.
-      metaPM.addPass(createNVWSMetaToNVWSConvert());
-      metaPM.addPass(createNVWSInsertAllocas());
-    } else {
-      // Original Meta allocation materialization.
-      // This existing pass converts ordinary descriptor loads before
-      // allocating their buffers. Meta gather conversion is separate work.
-      metaPM.addPass(createNVGPUTestWSBufferAllocation());
-    }
-
-    // Everything after allocation materialization is identical for both paths.
+    metaPM.addPass(createNVGPUTestWSBufferAllocation());
     metaPM.addPass(createNVGPUTestWSHoistTMEMStore());
     // Pack each data-partitioned merged-epilogue producer/store slice before
     // planning so MemoryPlanner sees the shortened register live ranges.
@@ -277,8 +259,7 @@ LogicalResult AutomaticWarpSpecialization::runSemaphorePipeline() {
     if (failed(metaPM.run(getOperation())))
       return failure();
 
-    // Convert the completed physical plan. The optional NVWS allocation
-    // path has run memory planning since its earlier ownership conversion.
+    // Convert the completed Meta memory plan to NVWS.
     addPassWithPartitionVerifier(createNVWSMetaToNVWSConvert());
     // InsertSemas emits co-located blocking waits in buffer-group discovery
     // order. Make that order an explicit latency policy rather than inheriting

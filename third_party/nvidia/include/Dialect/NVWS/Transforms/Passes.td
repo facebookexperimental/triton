@@ -353,20 +353,4 @@ def NVWSPackEpilogueSlices
   ];
 }
 
-def NVWSStripPartitionAttrsOutsideWS
-    : Pass<"nvws-strip-partition-attrs-outside-ws", "mlir::triton::FuncOp"> {
-  let summary = "Strip partition attrs outside tt.warp_specialize loops.";
-
-  let description = [{
-    Removes internal warp-specialization partition attributes from operations
-    outside tt.warp_specialize loops while preserving the attributes on the
-    loop itself and operations nested inside it.
-  }];
-
-  let dependentDialects = [
-    "mlir::triton::TritonDialect",
-    "mlir::triton::gpu::TritonGPUDialect"
-  ];
-}
-
 #endif // NVWS_PASSES
