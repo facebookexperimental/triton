@@ -423,16 +423,16 @@ def _check_mm_mxfp6_scales(a_scale, b_scale, *, M, N, K, sf_layout):
                            f"got {a_scale.numel()} and {b_scale.numel()}")
 
 
-def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
+def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full", a_format="e2m3", b_format="e3m2"):
     """``a @ b.T`` over pre-quantized MXFP6 inputs, returning BF16 ``[M, N]``.
 
-    ``a`` is contiguous dense-packed E2M3 ``[M, K]`` and ``b`` is contiguous
-    dense-packed E3M2 ``[N, K]`` (K-major, as for a linear weight), both uint8
+    ``a`` is contiguous dense-packed ``[M, K]`` and ``b`` is contiguous
+    dense-packed ``[N, K]`` (K-major, as for a linear weight), both uint8
     with groups of 16 codes per 12 bytes LSB-first and the K dim padded to
     the unpacked width; M, N and K must be multiples of 128. The format
-    pairing is fixed (E2M3 A x E3M2 B) to the validated ``mxf8f6f4``
-    configuration; other pairings are not exposed yet. Each run of 32
-    values along K
+    arguments ``a_format`` and ``b_format`` independently select "e2m3"
+    or "e3m2", defaulting to E2M3 A x E3M2 B. They specialize the kernel
+    as constexpr arguments. Each run of 32 values along K
     has one E8M0 scale. ``sf_layout="natural"`` takes ``[M, K // 32]`` and
     ``[N, K // 32]`` scales; ``"cublas_blocked"`` takes the swizzled byte
     layout returned by torchao's ``MXTensor.to_mx(..., is_swizzled_scales=True)``.
@@ -446,6 +446,8 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     """
     import torch
 
+    if a_format not in ("e2m3", "e3m2") or b_format not in ("e2m3", "e3m2"):
+        raise InvalidInput("tlx.ops.mm_mxfp6 a_format and b_format must each be 'e2m3' or 'e3m2'")
     tensors = (a, a_scale, b, b_scale)
     if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
         raise InvalidInput("tlx.ops.mm_mxfp6 expects tensor inputs")
@@ -487,7 +489,7 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     tma_tensors = tensors if out is None else (*tensors, out)
     check_inputs(spec, dtype=a.dtype, base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors))
     check_backward(spec, *tensors, out)
-    return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space)
+    return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space, a_format=a_format, b_format=b_format)
 
 
 def grouped_gemm(group_a, group_b, *, space=None):
