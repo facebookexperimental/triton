@@ -601,7 +601,7 @@ class InterpreterBuilder:
         mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)
         return self.create_masked_store(ptr, val, mask, cache_policy)
 
-    def create_sr_store(self, ptr, value, index, mask, site, cache, eviction):
+    def create_sr_store(self, ptr, value, index, mask, site, cache, eviction, satfinite):
         from ._sr_reference import bf16_bits, random_bits
         from .stochastic_rounding import _interpreter_launch, _PHILOX_ROUNDS
 
@@ -628,7 +628,7 @@ class InterpreterBuilder:
                 bf16_bits(
                     int(value),
                     random_bits(int(logical), state.base_seed, step, state.invocation_offset, _PHILOX_ROUNDS[spec.prng],
-                                declaration.site_id)) for value, logical in zip(bits, indices)
+                                declaration.site_id), spec.overflow) for value, logical in zip(bits, indices)
             ]
             value = TensorHandle(np.array(rounded, dtype=np.uint16).reshape(value.data.shape), target)
         else:
