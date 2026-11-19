@@ -575,6 +575,47 @@ struct FpToFpOpConversion
     return outVals;
   }
 
+  SmallVector<Value> lowerSrStore(FpToFpOp op,
+                                  ConversionPatternRewriter &rewriter,
+                                  MultipleOperandsRange operands,
+                                  Location loc) const {
+    if ((computeCapability != 100 && computeCapability != 103) ||
+        ptxVersion < 87) {
+      op.emitOpError("SR stores require Blackwell and PTX 8.7 or newer");
+      return {};
+    }
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    SmallVector<Value> result;
+    constexpr unsigned packSize = 2;
+    for (unsigned i = 0; i < operands.size(); i += packSize) {
+      Value first = operands[i][0];
+      Value second =
+          i + 1 < operands.size() ? operands[i + 1][0] : b.undef(f32_ty);
+      Value upper = i + 1 < operands.size() ? operands[i + 1][1] : b.i32_val(0);
+      // Each element uses the low 16 bits of its own Philox r0. Adjacent
+      // elements' entropy is packed separately, without XOR mixing.
+      // Legacy TLX's original mixing remains unchanged.
+      Value entropy = b.or_(b.and_(operands[i][1], b.i32_val(0xffff)),
+                            b.shl(upper, b.i32_val(16)));
+      PTXBuilder builder;
+      // sr_store follows IEEE conversion, including finite overflow to
+      // infinity. Bit-exact tests:
+      // python/test/unit/language/test_stochastic_rounding.py.
+      auto &cvt = *builder.create("cvt.rs.bf16x2.f32 $0, $1, $2, $3;");
+      cvt({builder.newOperand("=r", "r"), builder.newOperand(second, "r"),
+           builder.newOperand(first, "r"), builder.newOperand(entropy, "r")},
+          /*onlyAttachMLIRArgs=*/true);
+      auto elementType = getTypeConverter()->convertType(bf16_ty);
+      auto packed =
+          builder.launch(rewriter, loc, vec_ty(elementType, packSize), false);
+      for (unsigned lane = 0; lane < packSize && i + lane < operands.size();
+           ++lane)
+        result.push_back(
+            b.extract_element(elementType, packed, b.i32_val(lane)));
+    }
+    return result;
+  }
+
   SmallVector<Value> createDestOps(FpToFpOp op, OpAdaptor adaptor,
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
@@ -585,6 +626,8 @@ struct FpToFpOpConversion
     auto roundingMode = op.getRounding();
 
     if (roundingMode.has_value() && roundingMode.value() == RoundingMode::RS) {
+      if (op->hasAttr("sr_ieee"))
+        return lowerSrStore(op, rewriter, operands, loc);
       return lowerFpToFpWithStochRounding(op, adaptor, rewriter, elemTy, loc);
     }
 
