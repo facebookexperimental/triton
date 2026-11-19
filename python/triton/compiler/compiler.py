@@ -390,6 +390,8 @@ def compile(src, target=None, options=None, _env_vars=None):
     module_map = backend.get_module_map()
     try:
         module = src.make_ir(target, options, codegen_fns, module_map, context)
+        if not isinstance(module, str):
+            module.validate_stochastic_rounding(target.backend)
     except Exception as e:
         filter_traceback(e)
         raise
