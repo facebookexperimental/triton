@@ -628,7 +628,8 @@ class InterpreterBuilder:
                 bf16_bits(
                     int(value),
                     random_bits(int(logical), state.base_seed, step, state.invocation_offset, _PHILOX_ROUNDS[spec.prng],
-                                declaration.site_id), spec.overflow) for value, logical in zip(bits, indices)
+                                declaration.site_id, entropy=spec.entropy), spec.overflow)
+                for value, logical in zip(bits, indices)
             ]
             value = TensorHandle(np.array(rounded, dtype=np.uint16).reshape(value.data.shape), target)
         else:
