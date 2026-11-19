@@ -67,6 +67,9 @@ def pytest_collection_modifyitems(config, items):
         if filename == "test_core.py" and item.name.split("[", 1)[0] in (
             "test_fp6_tma_store_contiguous",
             "test_fp6_tma_mma_operand",
+            "test_fp6_tma_store_noinline",
+            "test_fp6_tma_store_reshaped_source_sm100",
+            "test_fp6_host_descriptor_shape_only",
         ):
             continue
         if filename in _VERSION_SKEW_FILES:
