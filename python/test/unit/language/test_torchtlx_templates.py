@@ -496,6 +496,34 @@ class TestTLXTemplates(TestCase):
         code_str = "\n".join(code)
         self.assertIn("triton_tem", code_str)
 
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe bmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("dynamic", (False, True))
+    def test_tlx_bmm_warppipe_zero_stride(self, dynamic: bool):
+        """Broadcast A (strides [0, 0, 1]) must not fault or miscompute (T298853186).
+
+        The template used to assume every stride > 0; a false tl.assume on stride_am == 0 caused
+        HSA_STATUS_ERROR_EXCEPTION 0x1016 (static) or wrong results (dynamic).
+        """
+        a = torch.randn(1, 1, 3, device=GPU_TYPE, dtype=torch.float16).as_strided((3072, 1, 3), (0, 0, 1))
+        b = torch.randn(3, 3072, 2048, device=GPU_TYPE, dtype=torch.float16).permute(1, 0, 2)
+
+        with (config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+        }), ):
+            c_actual, code = run_and_get_code(torch.compile(lambda x, y: torch.bmm(x, y), dynamic=dynamic), a, b)
+
+        c_expected = torch.bmm(a.float(), b.float()).half()
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem", "\n".join(code))
+
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_bmm_warppipe_dual_path_source(self):
         """The non-persistent bmm template carries BOTH branches: the async_load direct-to-LDS path
