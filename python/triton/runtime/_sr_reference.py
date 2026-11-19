@@ -15,12 +15,12 @@ def _domain_hash(a, b, domain):
     return _mix64(_mix64(a ^ domain) ^ b)
 
 
-def random_bits(logical_index, base_seed, dynamic_seed, invocation_offset=0, rounds=10):
+def random_bits(logical_index, base_seed, dynamic_seed, invocation_offset=0, rounds=10, site_id=0):
     """Return Philox r0; signed indices are interpreted modulo 2**64."""
     if rounds not in (7, 10):
         raise ValueError("ABI v1 supports seven or ten Philox rounds")
     seed = _domain_hash(base_seed, dynamic_seed, 0x747269746f6e5301)
-    invocation = _domain_hash(invocation_offset, 0, 0x747269746f6e5302)
+    invocation = _domain_hash(invocation_offset, site_id, 0x747269746f6e5302)
     index = logical_index & _MASK64
     counter = (index & _MASK32, index >> 32, invocation & _MASK32, invocation >> 32)
     key0, key1 = seed & _MASK32, seed >> 32

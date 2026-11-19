@@ -1623,8 +1623,8 @@ LogicalResult SrStoreOp::verify() {
       !getElementTypeOrSelf(getValue()).isF32())
     return emitOpError(
         "requires an FP32 value and ordinary BF16 global pointers");
-  if (getSite().empty() || getSiteId() != 0)
-    return emitOpError("requires a named site with site_id zero in ABI v1");
+  if (getSite().empty() || getSiteId() < 0)
+    return emitOpError("requires a named site with a nonnegative numeric ID");
   return success();
 }
 
