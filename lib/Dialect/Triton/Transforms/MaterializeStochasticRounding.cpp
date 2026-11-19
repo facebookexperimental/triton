@@ -249,6 +249,31 @@ public:
   Value hash(Value a, Value c, uint64_t domain) {
     return mix(xorWith(mix(xorWith(a, constant(a.getType(), domain))), c));
   }
+  Value softwareRound(SrStoreOp store, Value random) {
+    Value bits = BitcastOp::create(b, loc, lane32, store.getValue());
+    Value magnitude =
+        arith::AndIOp::create(b, loc, bits, constant(lane32, 0x7fffffff));
+    Value special =
+        arith::CmpIOp::create(b, loc, arith::CmpIPredicate::uge, magnitude,
+                              constant(lane32, 0x7f800000));
+    Value nan = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ugt,
+                                      magnitude, constant(lane32, 0x7f800000));
+    Value entropy =
+        arith::AndIOp::create(b, loc, random, constant(lane32, 0xffff));
+    Value rounded = arith::AddIOp::create(b, loc, bits, entropy);
+    rounded = arith::ShRUIOp::create(b, loc, rounded, constant(lane32, 16));
+    Value original = arith::ShRUIOp::create(b, loc, bits, constant(lane32, 16));
+    original = arith::SelectOp::create(b, loc, nan, constant(lane32, 0x7fff),
+                                       original);
+    rounded = arith::SelectOp::create(b, loc, special, original, rounded);
+    Type lane16 = b.getI16Type();
+    if (auto tensor = dyn_cast<RankedTensorType>(lane32))
+      lane16 = tensor.clone(b.getI16Type());
+    rounded = arith::TruncIOp::create(b, loc, lane16, rounded);
+    return BitcastOp::create(b, loc, getPointeeType(store.getPtr().getType()),
+                             rounded);
+  }
+
   Value generate(SrStoreOp store, FuncOp function, int rounds,
                  Value dynamicSeed) {
     OpBuilder entryBuilder(function.getContext());
@@ -332,7 +357,11 @@ struct TritonMaterializeStochasticRounding
     }
     DenseMap<Operation *, Value> dynamicSeeds;
     for (auto store : stores) {
-      if (mode == "enabled" && !proveOwnership(store) &&
+      bool eligible =
+          getElementTypeOrSelf(store.getValue()).isF32() &&
+          getElementTypeOrSelf(getPointeeType(store.getPtr().getType()))
+              .isBF16();
+      if (mode == "enabled" && eligible && !proveOwnership(store) &&
           !proveLaunchOwnership(store)) {
         store.emitOpError(
             "cannot prove injective matching pointer and logical indices");
@@ -350,25 +379,26 @@ struct TritonMaterializeStochasticRounding
       OpBuilder builder(store);
       auto valueType = getPointeeType(store.getPtr().getType());
       Value converted;
-      if (mode == "plain") {
-        converted = FpToFpOp::create(
-            builder, store.getLoc(), valueType, store.getValue(),
-            RoundingModeAttr::get(&getContext(), RoundingMode::RTNE));
+      if (mode == "plain" || !eligible) {
+        if (valueType == store.getValue().getType())
+          converted = store.getValue();
+        else
+          converted = FpToFpOp::create(
+              builder, store.getLoc(), valueType, store.getValue(),
+              RoundingModeAttr::get(&getContext(), RoundingMode::RTNE));
       } else {
         auto function = store->getParentOfType<FuncOp>();
         auto signature = function.getFunctionType();
         auto seedPointer = signature.getNumInputs() >= 3
                                ? dyn_cast<PointerType>(signature.getInput(0))
                                : PointerType();
-        if ((computeCapability != 100 && computeCapability != 103) ||
-            ptxVersion < 87 || (rounds != 7 && rounds != 10) || !seedPointer ||
+        if ((rounds != 7 && rounds != 10) || !seedPointer ||
             !seedPointer.getPointeeType().isInteger(64) ||
             seedPointer.getAddressSpace() != PtrAddrSpace::Global ||
             !signature.getInput(1).isInteger(64) ||
             !signature.getInput(2).isInteger(64)) {
-          store.emitOpError("enabled ABI v1 requires sm100/sm103, PTX 8.7, 7 "
-                            "or 10 rounds and "
-                            "three seed arguments (ptr<i64>, i64, i64)");
+          store.emitOpError("enabled ABI v1 requires 7 or 10 rounds and three "
+                            "seed arguments (ptr<i64>, i64, i64)");
           signalPassFailure();
           return;
         }
@@ -397,11 +427,16 @@ struct TritonMaterializeStochasticRounding
                                        function.getArgument(0));
         }
         auto random = entropy.generate(store, function, rounds, dynamicSeed);
-        auto conversion = FpToFpOp::create(
-            builder, store.getLoc(), valueType, store.getValue(), random,
-            RoundingModeAttr::get(&getContext(), RoundingMode::RS));
-        conversion->setAttr("sr_ieee", builder.getUnitAttr());
-        converted = conversion;
+        if ((computeCapability == 100 || computeCapability == 103) &&
+            ptxVersion >= 87) {
+          auto conversion = FpToFpOp::create(
+              builder, store.getLoc(), valueType, store.getValue(), random,
+              RoundingModeAttr::get(&getContext(), RoundingMode::RS));
+          conversion->setAttr("sr_ieee", builder.getUnitAttr());
+          converted = conversion;
+        } else {
+          converted = entropy.softwareRound(store, random);
+        }
       }
       Attribute cachePolicy;
       if (store.getCache() != CacheModifier::NONE ||

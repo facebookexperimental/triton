@@ -11,7 +11,8 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from triton.language import bfloat16, float32
+from triton.language import bfloat16, float32, dtype
+from .. import knobs
 from .autotuner import Autotuner, Heuristics
 from .jit import JITFunction, KernelInterface
 
@@ -31,8 +32,9 @@ class SRStoreSpec:
             raise ValueError("SR sites require nonempty names without comma or equals")
         if type(self.site_id) is not int or not 0 <= self.site_id < 1 << 31:
             raise ValueError("SR site IDs must be nonnegative i32 integers")
-        if self.source_dtype != float32 or self.destination_dtype != bfloat16:
-            raise ValueError("ABI v1 supports FP32 to BF16 only")
+        if any(not isinstance(value, dtype) or not value.is_floating()
+               for value in (self.source_dtype, self.destination_dtype)):
+            raise ValueError("SR store dtype declarations must be floating point")
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,7 @@ class StochasticRoundingState:
 _state: contextvars.ContextVar[StochasticRoundingState | None] = contextvars.ContextVar(
     "triton_stochastic_rounding", default=None)
 _provider: Callable[[StochasticRoundingKernel], StochasticRoundingState] | None = None
+_interpreter_launch = contextvars.ContextVar("sr_interpreter_launch", default=None)
 
 
 def set_stochastic_rounding_provider(
@@ -99,7 +102,7 @@ def _validate_state(base_seed, dynamic_seed, invocation_offset):
     for value in (base_seed, invocation_offset):
         if type(value) is not int or not 0 <= value < 1 << 64:
             raise ValueError("SR base seed and invocation offset must be uint64 integers")
-    if (dynamic_seed is None or not getattr(dynamic_seed, "is_cuda", False)
+    if (dynamic_seed is None or (not knobs.runtime.interpret and not getattr(dynamic_seed, "is_cuda", False))
             or str(dynamic_seed.dtype) not in ("torch.int64", "torch.uint64") or dynamic_seed.numel() != 1
             or not dynamic_seed.is_contiguous()):
         raise ValueError("SR dynamic seed must be one contiguous CUDA int64/uint64 element")
@@ -208,6 +211,10 @@ def _adapt_callback(callback):
 def _clone_kernel(kernel, enabled):
     if isinstance(kernel, JITFunction):
         return _clone_jit(kernel, enabled)
+    if knobs.runtime.interpret:
+        from .interpreter import InterpretedFunction
+        if isinstance(kernel, InterpretedFunction):
+            return kernel
     if isinstance(kernel, Heuristics):
         child = _clone_kernel(kernel.fn, enabled)
         return Heuristics(child, child.arg_names, {k: _adapt_callback(v) for k, v in kernel.values.items()})
@@ -259,6 +266,12 @@ class StochasticRoundingKernel(KernelInterface):
     def _launch(self, grid, args, kwargs, warmup):
         state = _resolve_state(self)
         child = self._enabled if state.enabled else self._plain
+        if knobs.runtime.interpret:
+            token = _interpreter_launch.set((self.spec, state, set()))
+            try:
+                return child.run(*args, grid=grid, warmup=warmup, **kwargs)
+            finally:
+                _interpreter_launch.reset(token)
         kwargs = dict(kwargs)
         if any(name.startswith("sr_") or name in _SEED_ARGS for name in kwargs):
             raise ValueError("SR variant options and seed arguments are owned by the proxy")
