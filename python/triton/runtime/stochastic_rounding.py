@@ -1,4 +1,5 @@
 """Experimental single-site stochastic rounding and CUDA graph seed policy."""
+
 from __future__ import annotations
 
 import ast
@@ -251,6 +252,13 @@ class StochasticRoundingKernel(KernelInterface):
         kwargs.update(sr_mode="enabled" if state.enabled else "plain", sr_site=self.spec.site.name,
                       sr_rounds=_PHILOX_ROUNDS[self.spec.prng])
         if state.enabled:
+            values = dict(zip(self.arg_names, args))
+            values.update(kwargs)
+            kwargs["sr_launch"] = tuple(
+                sorted((name, value)
+                       for name, value in values.items()
+                       if name in self.arg_names and type(value) is int and -(1 << 63) <= value < (1 << 63)))
+            kwargs["sr_grid"] = 0 if callable(grid) else grid[0]
             args = (state.dynamic_seed, state.base_seed, state.invocation_offset, *args)
         if state.enabled and not warmup:
             _validate_buffers(args, kwargs)
