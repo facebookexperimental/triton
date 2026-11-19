@@ -5,6 +5,7 @@
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/MathExtras.h"
 
 namespace mlir::triton {
@@ -158,7 +159,17 @@ bool proveOwnership(SrStoreOp store) {
       SmallVector<MemoryEffects::EffectInstance> instances;
       effects.getEffects(instances);
       for (auto &effect : instances)
-        conflictingStore |= isa<MemoryEffects::Write>(effect.getEffect());
+        if (isa<MemoryEffects::Write>(effect.getEffect())) {
+          AffineIndex otherOffset;
+          Value pointer;
+          if (auto ordinary = dyn_cast<StoreOp>(other))
+            pointer = ordinary.getPtr();
+          else if (auto annotated = dyn_cast<SrStoreOp>(other))
+            pointer = annotated.getPtr();
+          auto otherBase =
+              pointer ? pointerBase(pointer, otherOffset) : Value();
+          conflictingStore |= !otherBase || otherBase == base;
+        }
     }
   });
   return !conflictingStore;
@@ -238,16 +249,16 @@ public:
   Value hash(Value a, Value c, uint64_t domain) {
     return mix(xorWith(mix(xorWith(a, constant(a.getType(), domain))), c));
   }
-  Value generate(SrStoreOp store, FuncOp function, int rounds) {
+  Value generate(SrStoreOp store, FuncOp function, int rounds,
+                 Value dynamicSeed) {
     OpBuilder entryBuilder(function.getContext());
-    setSeedInsertionPoint(entryBuilder, function);
+    entryBuilder.setInsertionPointAfter(dynamicSeed.getDefiningOp());
     EntropyBuilder uniformEntropy(entryBuilder, store);
-    Value dynamicSeed =
-        LoadOp::create(entryBuilder, loc, function.getArgument(0));
     Value seed = uniformEntropy.hash(function.getArgument(1), dynamicSeed,
                                      0x747269746f6e5301ULL);
     Value invocation = uniformEntropy.hash(
-        function.getArgument(2), uniformEntropy.constant(b.getI64Type(), 0),
+        function.getArgument(2),
+        uniformEntropy.constant(b.getI64Type(), store.getSiteId()),
         0x747269746f6e5302ULL);
     Value c0 = low(store.getLogicalIndex(), lane32);
     Value c1 = high(store.getLogicalIndex(), lane32);
@@ -290,85 +301,117 @@ struct TritonMaterializeStochasticRounding
     getOperation().walk([&](SrStoreOp op) { stores.push_back(op); });
     if (mode.empty() && stores.empty())
       return;
-    if ((mode != "plain" && mode != "enabled") || stores.size() != 1 ||
-        stores[0].getSite() != site) {
-      getOperation().emitError(
-          "requires exactly one declared SR site and plain or enabled mode");
-      signalPassFailure();
-      return;
+    llvm::StringMap<int32_t> declarations;
+    SmallVector<StringRef> entries;
+    StringRef(site).split(entries, ',');
+    bool invalid = mode != "plain" && mode != "enabled";
+    for (auto entry : entries) {
+      auto [name, number] = entry.split('=');
+      int32_t id = 0;
+      invalid |= name.empty() ||
+                 (!number.empty() && number.getAsInteger(10, id)) || id < 0;
+      invalid |= !declarations.try_emplace(name, id).second;
     }
-    auto store = stores[0];
-    if (mode == "enabled" && !proveOwnership(store) &&
-        !proveLaunchOwnership(store)) {
-      store.emitOpError(
-          "cannot prove injective matching pointer and logical indices");
-      signalPassFailure();
-      return;
-    }
-    if (mode == "enabled") {
-      auto *next = store->getNextNode();
-      while (next && !next->hasTrait<OpTrait::IsTerminator>() &&
-             isMemoryEffectFree(next)) {
-        store->moveAfter(next);
-        next = store->getNextNode();
+    llvm::StringMap<unsigned> counts;
+    for (auto store : stores) {
+      auto declaration = declarations.find(store.getSite());
+      if (declaration == declarations.end()) {
+        invalid = true;
+        continue;
       }
+      store.setSiteId(declaration->second);
+      ++counts[store.getSite()];
     }
-    OpBuilder builder(store);
-    auto valueType = getPointeeType(store.getPtr().getType());
-    Value converted;
-    if (mode == "plain") {
-      converted = FpToFpOp::create(
-          builder, store.getLoc(), valueType, store.getValue(),
-          RoundingModeAttr::get(&getContext(), RoundingMode::RTNE));
-    } else {
-      auto function = store->getParentOfType<FuncOp>();
-      auto signature = function.getFunctionType();
-      auto seedPointer = signature.getNumInputs() >= 3
-                             ? dyn_cast<PointerType>(signature.getInput(0))
-                             : PointerType();
-      if ((computeCapability != 100 && computeCapability != 103) ||
-          ptxVersion < 87 || (rounds != 7 && rounds != 10) || !seedPointer ||
-          !seedPointer.getPointeeType().isInteger(64) ||
-          seedPointer.getAddressSpace() != PtrAddrSpace::Global ||
-          !signature.getInput(1).isInteger(64) ||
-          !signature.getInput(2).isInteger(64)) {
+    for (auto &entry : declarations)
+      invalid |= counts.lookup(entry.getKey()) != 1;
+    if (invalid) {
+      getOperation().emitError("requires exactly one declared SR site instance "
+                               "per name and plain or enabled mode");
+      signalPassFailure();
+      return;
+    }
+    DenseMap<Operation *, Value> dynamicSeeds;
+    for (auto store : stores) {
+      if (mode == "enabled" && !proveOwnership(store) &&
+          !proveLaunchOwnership(store)) {
         store.emitOpError(
-            "enabled ABI v1 requires sm100/sm103, PTX 8.7, 7 or 10 rounds and "
-            "three seed arguments (ptr<i64>, i64, i64)");
+            "cannot prove injective matching pointer and logical indices");
         signalPassFailure();
         return;
       }
-      for (unsigned arg = 3; arg < function.getNumArguments(); ++arg) {
-        auto constraint =
-            function.getArgAttrOfType<IntegerAttr>(arg, "tt.sr_value");
-        auto type = dyn_cast<IntegerType>(function.getArgument(arg).getType());
-        if (!constraint || !type)
-          continue;
-        OpBuilder entryBuilder(function.getContext());
-        entryBuilder.setInsertionPointToStart(&function.getBody().front());
-        auto constant = arith::ConstantOp::create(
-            entryBuilder, store.getLoc(), type,
-            entryBuilder.getIntegerAttr(type, constraint.getInt()));
-        function.getArgument(arg).replaceAllUsesWith(constant);
+      if (mode == "enabled") {
+        auto *next = store->getNextNode();
+        while (next && !next->hasTrait<OpTrait::IsTerminator>() &&
+               isMemoryEffectFree(next)) {
+          store->moveAfter(next);
+          next = store->getNextNode();
+        }
       }
-      OpBuilder entropyBuilder(&getContext());
-      entropyBuilder.setInsertionPoint(store);
-      EntropyBuilder entropy(entropyBuilder, store);
-      auto random = entropy.generate(store, function, rounds);
-      auto conversion = FpToFpOp::create(
-          builder, store.getLoc(), valueType, store.getValue(), random,
-          RoundingModeAttr::get(&getContext(), RoundingMode::RS));
-      conversion->setAttr("sr_ieee", builder.getUnitAttr());
-      converted = conversion;
+      OpBuilder builder(store);
+      auto valueType = getPointeeType(store.getPtr().getType());
+      Value converted;
+      if (mode == "plain") {
+        converted = FpToFpOp::create(
+            builder, store.getLoc(), valueType, store.getValue(),
+            RoundingModeAttr::get(&getContext(), RoundingMode::RTNE));
+      } else {
+        auto function = store->getParentOfType<FuncOp>();
+        auto signature = function.getFunctionType();
+        auto seedPointer = signature.getNumInputs() >= 3
+                               ? dyn_cast<PointerType>(signature.getInput(0))
+                               : PointerType();
+        if ((computeCapability != 100 && computeCapability != 103) ||
+            ptxVersion < 87 || (rounds != 7 && rounds != 10) || !seedPointer ||
+            !seedPointer.getPointeeType().isInteger(64) ||
+            seedPointer.getAddressSpace() != PtrAddrSpace::Global ||
+            !signature.getInput(1).isInteger(64) ||
+            !signature.getInput(2).isInteger(64)) {
+          store.emitOpError("enabled ABI v1 requires sm100/sm103, PTX 8.7, 7 "
+                            "or 10 rounds and "
+                            "three seed arguments (ptr<i64>, i64, i64)");
+          signalPassFailure();
+          return;
+        }
+        for (unsigned arg = 3; arg < function.getNumArguments(); ++arg) {
+          auto constraint =
+              function.getArgAttrOfType<IntegerAttr>(arg, "tt.sr_value");
+          auto type =
+              dyn_cast<IntegerType>(function.getArgument(arg).getType());
+          if (!constraint || !type)
+            continue;
+          OpBuilder entryBuilder(function.getContext());
+          entryBuilder.setInsertionPointToStart(&function.getBody().front());
+          auto constant = arith::ConstantOp::create(
+              entryBuilder, store.getLoc(), type,
+              entryBuilder.getIntegerAttr(type, constraint.getInt()));
+          function.getArgument(arg).replaceAllUsesWith(constant);
+        }
+        OpBuilder entropyBuilder(&getContext());
+        entropyBuilder.setInsertionPoint(store);
+        EntropyBuilder entropy(entropyBuilder, store);
+        auto &dynamicSeed = dynamicSeeds[function.getOperation()];
+        if (!dynamicSeed) {
+          OpBuilder seedBuilder(function.getContext());
+          setSeedInsertionPoint(seedBuilder, function);
+          dynamicSeed = LoadOp::create(seedBuilder, store.getLoc(),
+                                       function.getArgument(0));
+        }
+        auto random = entropy.generate(store, function, rounds, dynamicSeed);
+        auto conversion = FpToFpOp::create(
+            builder, store.getLoc(), valueType, store.getValue(), random,
+            RoundingModeAttr::get(&getContext(), RoundingMode::RS));
+        conversion->setAttr("sr_ieee", builder.getUnitAttr());
+        converted = conversion;
+      }
+      Attribute cachePolicy;
+      if (store.getCache() != CacheModifier::NONE ||
+          store.getEvict() != EvictionPolicy::NORMAL)
+        cachePolicy = CachePolicyAttr::get(&getContext(), store.getCache(),
+                                           store.getEvict());
+      StoreOp::create(builder, store.getLoc(), store.getPtr(), converted,
+                      store.getMask(), cachePolicy);
+      store.erase();
     }
-    Attribute cachePolicy;
-    if (store.getCache() != CacheModifier::NONE ||
-        store.getEvict() != EvictionPolicy::NORMAL)
-      cachePolicy = CachePolicyAttr::get(&getContext(), store.getCache(),
-                                         store.getEvict());
-    StoreOp::create(builder, store.getLoc(), store.getPtr(), converted,
-                    store.getMask(), cachePolicy);
-    store.erase();
   }
 };
 } // namespace

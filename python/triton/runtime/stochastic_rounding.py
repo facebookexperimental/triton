@@ -1,4 +1,4 @@
-"""Experimental single-site stochastic rounding and CUDA graph seed policy."""
+"""Experimental annotated stochastic rounding and CUDA graph seed policy."""
 
 from __future__ import annotations
 
@@ -27,23 +27,36 @@ class SRStoreSpec:
     site_id: int = 0
 
     def __post_init__(self):
-        if not isinstance(self.name, str) or not self.name or self.site_id != 0:
-            raise ValueError("ABI v1 requires one named site with site_id zero")
+        if not isinstance(self.name, str) or not self.name or any(c in self.name for c in ",="):
+            raise ValueError("SR sites require nonempty names without comma or equals")
+        if type(self.site_id) is not int or not 0 <= self.site_id < 1 << 31:
+            raise ValueError("SR site IDs must be nonnegative i32 integers")
         if self.source_dtype != float32 or self.destination_dtype != bfloat16:
             raise ValueError("ABI v1 supports FP32 to BF16 only")
 
 
 @dataclass(frozen=True)
 class StochasticRoundingSpec:
-    site: SRStoreSpec
+    site: SRStoreSpec | None = None
     version: int = 1
     prng: str = "philox4x32-10"
+    sites: tuple[SRStoreSpec, ...] = ()
 
     def __post_init__(self):
-        if not isinstance(self.site, SRStoreSpec) or self.version != 1:
-            raise ValueError("requires a single SRStoreSpec and ABI version one")
+        sites = (self.site, ) if self.site is not None else tuple(self.sites)
+        if self.site is not None and self.sites:
+            raise ValueError("specify site or sites, not both")
+        if not sites or any(not isinstance(site, SRStoreSpec) for site in sites) or self.version != 1:
+            raise ValueError("requires SRStoreSpec declarations and ABI version one")
+        if len({site.name for site in sites}) != len(sites) or len({site.site_id for site in sites}) != len(sites):
+            raise ValueError("SR site names and numeric IDs must be unique")
+        object.__setattr__(self, "sites", () if self.site is not None else sites)
         if not isinstance(self.prng, str) or self.prng not in _PHILOX_ROUNDS:
             raise ValueError("ABI v1 supports philox4x32-7 or philox4x32-10")
+
+    @property
+    def store_specs(self):
+        return (self.site, ) if self.site is not None else self.sites
 
 
 @dataclass(frozen=True)
@@ -249,7 +262,8 @@ class StochasticRoundingKernel(KernelInterface):
         kwargs = dict(kwargs)
         if any(name.startswith("sr_") or name in _SEED_ARGS for name in kwargs):
             raise ValueError("SR variant options and seed arguments are owned by the proxy")
-        kwargs.update(sr_mode="enabled" if state.enabled else "plain", sr_site=self.spec.site.name,
+        kwargs.update(sr_mode="enabled" if state.enabled else "plain",
+                      sr_site=",".join(f"{site.name}={site.site_id}" for site in self.spec.store_specs),
                       sr_rounds=_PHILOX_ROUNDS[self.spec.prng])
         if state.enabled:
             values = dict(zip(self.arg_names, args))
