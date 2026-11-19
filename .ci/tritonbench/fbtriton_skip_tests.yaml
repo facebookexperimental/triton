@@ -70,6 +70,13 @@ rms_norm:
   report: true
   disabled_devices:
     - hip
+# flash_attn_varlen/gfx950 accepts only HEAD_DIM=128, but the operator's smoke
+# input uses HEAD_DIM=64, so the TLX backend raises InvalidInput on MI350.
+tlx_flash_attention_varlen:
+  report: true
+  backends: tlx_ops_flash_attn_varlen
+  disabled_devices:
+    - hip
 # ============ TODO: errors in CI ============
 launch_latency:
   backends: nop_triton_kernel_autotuned,nop_triton_kernel_autotuned_nocache
