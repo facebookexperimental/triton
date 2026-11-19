@@ -18726,6 +18726,63 @@ _BF16_M27_QKV_SPLIT_REGISTER_PLAN = _normalize_split_register_plan({
 })
 
 
+def _decode_range_plan(block_m, block_n, block_k, num_warps, num_stages):
+    return MappingProxyType(
+        dict(_fixed_register_plan(block_m, block_n, block_k, 4, 8, num_warps, num_stages), CACHE_B_CG=True,
+             regclass_priority_trumps_globalness=False))
+
+
+def _decode_split_plan(block_m, block_n, block_k, split_k, num_warps, num_stages):
+    return _normalize_split_register_plan(
+        dict(_fixed_register_plan(block_m, block_n, block_k, 4, 1, num_warps, num_stages), SPLIT_K=split_k, GROUP_M=4,
+             NUM_XCDS=1, CACHE_B=True, ACCUMULATE_IN_DOT=False, SERIAL_REDUCE=True))
+
+
+# Decode-sized BF16 projections, A[M, K] row-major times B = W[N, K].T (the Muse Spark TP8 QKV + output gate, o_proj,
+# pre- and post-expert shapes), M = 2..64. Each (N, K) maps to (largest M, path, plan) buckets in increasing M.
+# Measured on MI350X with cold weights (rotating copies over twice the 256 MiB MALL) and HIP-graph replay. These
+# shapes are weight-read bound. The unsplit register kernel was fastest at the smaller M of every shape (13-14 us,
+# about 5 TB/s, for the 64 MiB pre/post-expert weights: what a plain 64 MiB streaming read reaches) and at every M of
+# 8192 x 1024; split-K was fastest from M = 9 (2304 x 8192), 17 (4096 x 8192) and 33 (8192 x 4096).
+_BF16_DECODE_PROJECTION_PLANS = {
+    # QKV + output gate.
+    (2304, 8192): (
+        (8, "range_register", _decode_range_plan(16, 16, 512, 2, 3)),
+        (16, "split_register", _decode_split_plan(16, 32, 128, 16, 2, 2)),
+        (32, "split_register", _decode_split_plan(32, 32, 128, 8, 4, 2)),
+        (64, "split_register", _decode_split_plan(64, 64, 128, 4, 2, 3)),
+    ),
+    # o_proj.
+    (8192, 1024): (
+        (16, "range_register", _decode_range_plan(16, 32, 256, 2, 3)),
+        (32, "range_register", _decode_range_plan(32, 32, 256, 4, 3)),
+        (64, "range_register", _decode_range_plan(32, 32, 256, 4, 2)),
+    ),
+    # Pre-expert projection.
+    (4096, 8192): (
+        (16, "range_register", _decode_range_plan(16, 16, 512, 2, 3)),
+        (32, "split_register", _decode_split_plan(32, 64, 128, 8, 4, 2)),
+        (64, "split_register", _decode_split_plan(64, 64, 128, 8, 2, 2)),
+    ),
+    # Post-expert projection.
+    (8192, 4096): (
+        (16, "range_register", _decode_range_plan(16, 32, 256, 2, 3)),
+        (32, "range_register", _decode_range_plan(32, 32, 256, 4, 3)),
+        (64, "split_register", _decode_split_plan(64, 64, 128, 4, 4, 2)),
+    ),
+}
+
+
+def _decode_projection_dispatch(m, n, k):
+    """Return the measured (path, plan) for a decode-sized TN projection, or None outside the table."""
+    if not 2 <= m <= 64:
+        return None
+    for max_m, path, plan in _BF16_DECODE_PROJECTION_PLANS.get((n, k), ()):
+        if m <= max_m:
+            return path, plan
+    return None
+
+
 @triton.jit
 def _split_register_kernel(
     a_ptr,
@@ -18907,6 +18964,12 @@ _SPLIT_REGISTER_HOST_KEYS = frozenset({
 })
 
 
+def _split_register_fallback_plan():
+    """The unsplit range-register plan that split-register routes fall back to."""
+    return dict(_fixed_register_plan(32, 16, 512, 4, 8, 2, 3), CACHE_B_CG=True,
+                regclass_priority_trumps_globalness=False)
+
+
 def _launch_split_register(a, b, out, plan, *, fallback_plan=None, workspace=None):
     """Launch the canonical register Split-K route with FP32 partials.
 
@@ -18947,8 +19010,7 @@ def _launch_split_register(a, b, out, plan, *, fallback_plan=None, workspace=Non
             raise InvalidInput("split-register requires K slices of at least 32 elements")
     elif (tail or a.data_ptr() % 16 or b.data_ptr() % 16 or slice_len < 4 * block_k or slice_len % block_k):
         if fallback_plan is None:
-            fallback_plan = dict(_fixed_register_plan(32, 16, 512, 4, 8, 2, 3), CACHE_B_CG=True,
-                                 regclass_priority_trumps_globalness=False)
+            fallback_plan = _split_register_fallback_plan()
         return _launch_range_register_plan(a, b, out=out, config=fallback_plan)
     # The FP32 workspace holds one (M, N) slab per split; validate the total
     # offset bound before allocating, as the original shared-core route did.
@@ -19033,6 +19095,10 @@ def _range_family_candidates(m, n, k, dtype, element_size, a_strides, b_strides)
             if (n, k) == (2304, 8192):
                 return (("split_register", _BF16_M27_QKV_SPLIT_REGISTER_PLAN), ("range_register", plan))
             return (("range_register", plan), )
+    if dtype == torch.bfloat16 and a_strides == (k, 1) and b_strides == (1, k):
+        dispatch = _decode_projection_dispatch(m, n, k)
+        if dispatch is not None:
+            return (dispatch, )
     if not 128 <= k <= 4096 or n < 128:
         return ()
     if dtype == torch.bfloat16 and a_strides == (k, 1) and b_strides == (1, k):
@@ -27361,7 +27427,10 @@ def _launch_dispatch(a, b, out, dispatch, bias=None):
     path, plan = dispatch
     if path == "row_split":
         return _launch_row_split(a, b, out, plan, bias=bias)
-    if bias is not None and path in ("gemv", "split_register"):
+    if bias is not None and path == "split_register":
+        # The split partials carry no bias: run the fixed unsplit plan instead of autotuning on the first call.
+        return _launch_range_register_plan(a, b, bias=bias, config=_split_register_fallback_plan(), out=out)
+    if bias is not None and path == "gemv":
         return _launch_register(a, b, bias=bias, out=out)
     if path == "split_register":
         return _launch_split_register(a, b, out, _normalize_split_register_plan(plan))
