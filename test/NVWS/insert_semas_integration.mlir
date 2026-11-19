@@ -172,6 +172,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 #smem = #ttg.shared_memory
 #tm = #ttng.tensor_memory
+#out_shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+!out = !ttg.memdesc<128x128xf32, #out_shared, #smem, mutable>
 !acc = !ttg.memdesc<128x128xf32, #tmem, #tm, mutable>
 !tile = tensor<128x128xf32, #reg>
 !lhs = !ttg.memdesc<128x64xf16, #shared, #smem>
@@ -207,6 +209,80 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       %after = ttg.local_load %buffer {ttg.partition = array<i32: 2>} : !ttg.memdesc<1xi32, #shared1, #smem, mutable> -> tensor<1xi32, #reg1>
       "consume_final"(%after) {ttg.partition = array<i32: 2>} : (tensor<1xi32, #reg1>) -> ()
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // LOWER-LABEL: @in_place_accumulator_slot
+  tt.func @in_place_accumulator_slot(%lhs: !lhs, %rhs: !rhs, %bias: !tile,
+                                     %output: !out, %lb: i32, %ub: i32, %step: i32) {
+    %true = arith.constant true
+    // LOWER: [[ACC:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<4x128x128xf32,
+    %acc, %init = ttng.tmem_alloc {buffer.copy = 4 : i32, buffer.id = 4 : i32} : () -> (!acc, !ttg.async.token)
+    // LOWER: scf.for {{.*}} iter_args([[PREV_SLOT:%[^ ]+]] =
+    scf.for %i = %lb to %ub step %step iter_args(%token = %init) -> (!ttg.async.token) : i32 {
+      // Only the initialization advances the accumulator slot for this tile.
+      // LOWER: [[ONE:%.*]] = arith.constant {{.*}} 1 : i32
+      // LOWER: [[NEXT_SLOT:%.*]] = arith.addi [[PREV_SLOT]], [[ONE]]
+      // LOWER: [[SLOT:%.*]] = arith.select {{%.*}}, {{%.*}}, [[NEXT_SLOT]]
+      // LOWER: [[INIT_VIEW:%.*]] = ttg.memdesc_index [[ACC]][[[SLOT]]]
+      // LOWER: ttng.tmem_store {{%.*}}, [[INIT_VIEW]][]
+      %w = ttng.tmem_store %bias, %acc[%token], %true {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : !tile -> !acc
+      // LOWER: [[MMA_VIEW:%.*]] = ttg.memdesc_index [[ACC]][[[SLOT]]]
+      // LOWER: ttng.tc_gen5_mma {{%.*}}, {{%.*}}, [[MMA_VIEW]][]
+      %u = ttng.tc_gen5_mma %lhs, %rhs, %acc[%w], %true, %true {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+      // LOWER: [[READ_VIEW:%.*]] = ttg.memdesc_index [[ACC]][[[SLOT]]]
+      // LOWER: ttng.tmem_load [[READ_VIEW]][]
+      %value, %read = ttng.tmem_load %acc[%u] {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !acc -> !tile
+      ttg.local_store %value, %output {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !tile -> !out
+      // LOWER: scf.yield {{.*}} [[SLOT]],
+      scf.yield {ttg.partition = array<i32: 2>} %read : !ttg.async.token
+    } {tt.warp_specialize, tt.scheduled_max_stage = 2 : i32, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.outputs = [array<i32: 2>], ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // LOWER-LABEL: @loop_carried_accumulator_slot
+  tt.func @loop_carried_accumulator_slot(%lhs: !lhs, %rhs: !rhs, %output: !out,
+                                         %lb: i32, %ub: i32, %step: i32) {
+    %true = arith.constant true
+    // LOWER: [[ACC:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<4x128x128xf32,
+    %acc, %init = ttng.tmem_alloc {buffer.copy = 4 : i32, buffer.id = 4 : i32} : () -> (!acc, !ttg.async.token)
+    // With no fresh acquire, reuse the incoming slot on the next iteration.
+    // LOWER: [[ENTRY_SLOT:%.*]] = arith.constant 3 : i32
+    // LOWER: scf.for
+    scf.for %i = %lb to %ub step %step iter_args(%token = %init, %use_d = %true) -> (!ttg.async.token, i1) : i32 {
+      %continued = arith.cmpi ne, %i, %lb {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : i32
+      // LOWER: [[FIRST:%.*]] = ttg.memdesc_index [[ACC]][[[ENTRY_SLOT]]]
+      // LOWER: ttng.tc_gen5_mma {{%.*}}, {{%.*}}, [[FIRST]][]
+      %w = ttng.tc_gen5_mma %lhs, %rhs, %acc[%token], %continued, %true {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : !lhs, !rhs, !acc
+      // LOWER: [[SECOND:%.*]] = ttg.memdesc_index [[ACC]][[[ENTRY_SLOT]]]
+      // LOWER: ttng.tc_gen5_mma {{%.*}}, {{%.*}}, [[SECOND]][]
+      %u = ttng.tc_gen5_mma %lhs, %rhs, %acc[%w], %use_d, %true {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !lhs, !rhs, !acc
+      // LOWER: [[READ:%.*]] = ttg.memdesc_index [[ACC]][[[ENTRY_SLOT]]]
+      // LOWER: ttng.tmem_load [[READ]][]
+      %value, %read = ttng.tmem_load %acc[%u] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !acc -> !tile
+      ttg.local_store %value, %output {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tile -> !out
+      %next = arith.xori %use_d, %true {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1, 2>} : i1
+      scf.yield {ttg.partition = array<i32: 0, 1, 2>} %read, %next : !ttg.async.token, i1
+    } {tt.warp_specialize, tt.scheduled_max_stage = 2 : i32, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.outputs = [array<i32: 2>, array<i32: 1, 2>], ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+
+  // LOWER-LABEL: @two_slot_reuse_cluster
+  tt.func @two_slot_reuse_cluster(%bias: !tile, %output: !out, %lb: i32, %ub: i32, %step: i32) {
+    %true = arith.constant true
+    %acc, %init = ttng.tmem_alloc {buffer.copy = 2 : i32, buffer.id = 4 : i32} : () -> (!acc, !ttg.async.token)
+    scf.for %i = %lb to %ub step %step iter_args(%token = %init) -> (!ttg.async.token) : i32 {
+      // Reuse after two iterations moves the producer and its wait and buffer view into cluster 1.
+      // LOWER: ttng.wait_barrier {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32
+      // LOWER: [[WRITE_VIEW:%.*]] = ttg.memdesc_index {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32
+      // LOWER: ttng.tmem_store {{%.*}}, [[WRITE_VIEW]][], {{%.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32
+      %w = ttng.tmem_store %bias, %acc[%token], %true {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : !tile -> !acc
+      // LOWER: [[VALUE:%.*]], {{%.*}} = ttng.tmem_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 2 : i32
+      %value, %read = ttng.tmem_load %acc[%w] {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !acc -> !tile
+      // LOWER: ttg.local_store [[VALUE]], {{%.*}} {loop.cluster = 1 : i32, loop.stage = 2 : i32
+      ttg.local_store %value, %output {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>} : !tile -> !out
+      scf.yield {ttg.partition = array<i32: 2>} %read : !ttg.async.token
+    } {tt.warp_specialize, tt.scheduled_max_stage = 2 : i32, ttg.partition = array<i32: 0, 2>, ttg.partition.outputs = [array<i32: 2>], ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
     tt.return
   }
 }

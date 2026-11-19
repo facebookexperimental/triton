@@ -66,11 +66,7 @@ LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner,
     if (failed(buildSyncDag(g, useMetaPartitioner, semaphoreOptimizeNumStages,
                             numTmemBlocks)))
       return failure();
-  SmallVector<ScheduleUpdate> scheduleUpdates;
-  if (failed(finalizeSyncSchedule(candidate, scheduleUpdates)))
-    return failure();
-  dumpSyncDags(candidate, funcOp);
-  return emitIR(funcOp, candidate, scheduleUpdates);
+  return scheduleAndEmit(funcOp, candidate);
 }
 } // namespace
 
