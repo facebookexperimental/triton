@@ -240,6 +240,7 @@ class CUDAOptions:
     sr_launch: tuple = ()
     sr_grid: int = 0
     sr_mode: str = ""
+    sr_ownership: str = "checked"
     sr_site: str = ""
     sr_rounds: int = 10
     num_warps: int = 4
@@ -922,7 +923,7 @@ class CUDABackend(BaseBackend):
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
         passes.ttir.add_materialize_stochastic_rounding(pm, opt.sr_mode, opt.sr_site, opt.sr_rounds, capability,
-                                                        get_ptx_version_from_options(opt, capability))
+                                                        get_ptx_version_from_options(opt, capability), opt.sr_ownership)
         passes.ttir.add_triton_licm(pm)
         passes.ttir.add_uplift_while_to_for(pm)
         passes.common.add_canonicalizer(pm)
