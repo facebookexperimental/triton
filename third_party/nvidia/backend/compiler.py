@@ -122,7 +122,9 @@ def get_ptx_version_from_options(options, arch: int):
 
 def get_llvm_flags():
     """LLVM command line flags used throughout NVIDIA LLVM lowering."""
-    return ["nvptx-mad-wide-opt", "nvptx-short-ptr"]
+    # IR optimization runs without the NVPTX target, so SLP's cost model makes
+    # vector div/rem look cheaper than scalar and seeds vector trees from them.
+    return ["nvptx-mad-wide-opt", "nvptx-short-ptr", "slp-vectorize-poor-throughput=false"]
 
 
 @functools.lru_cache()
