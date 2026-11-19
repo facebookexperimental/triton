@@ -293,7 +293,7 @@ static inline int triton_get_driver_version(void) {
 }
 
 /* cuTensorMapEncodeTiled requires 128 FP6 values. SM103 also accepts 64
- * for a b6p2x16 store. Encode just that unswizzled 2D map here. */
+ * for a b6p2x16 store. Encode the unswizzled narrow map here. */
 static inline CUresult triton_encode_fp6_store_box64(
     CUtensorMap *desc, uint64_t global_address, int rank, int swizzle,
     int padding, int elem_size, const cuuint64_t *shape,
@@ -309,21 +309,26 @@ static inline CUresult triton_encode_fp6_store_box64(
       &minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
   if (major != 10 || minor != 3)
     return CUDA_ERROR_NOT_SUPPORTED;
-  if (rank != 2 || swizzle || padding || elem_size != 1 || !global_address ||
-      global_address % 16 || !shape[0] || shape[0] % 64 ||
-      shape[0] > (1ULL << 32) || !shape[1] || shape[1] > (1ULL << 32) ||
-      !strides[0] || strides[0] % 16 || strides[0] / 16 > UINT32_MAX ||
-      box[0] != 64 || !box[1] || box[1] > 256)
+  if (rank < 2 || rank > TRITON_MAX_TMA_DIMS || swizzle || padding ||
+      elem_size != 1 || !global_address || global_address % 16 || !shape[0] ||
+      shape[0] % 64 || shape[0] > (1ULL << 32) || box[0] != 64)
     return CUDA_ERROR_INVALID_VALUE;
   uint32_t words[32] = {0};
   words[0] = (uint32_t)global_address;
   words[1] = global_address >> 32;
-  words[2] = 0x690; /* Tiled 2D FP6, no swizzle. */
-  words[3] = strides[0] >> 4;
+  words[2] = 0x680 | ((uint32_t)(rank - 1) << 4); /* Tiled FP6, no swizzle. */
   words[8] = shape[0] - 1;
-  words[9] = shape[1] - 1;
   words[13] = 63U << 24;
-  words[14] = box[1] - 1;
+  for (int i = 0; i < rank - 1; ++i) {
+    uint64_t dim = shape[i + 1], stride = strides[i];
+    uint32_t outer_box = box[i + 1];
+    if (!dim || dim > (1ULL << 32) || !stride || stride % 16 ||
+        stride / 16 > UINT32_MAX || !outer_box || outer_box > 256)
+      return CUDA_ERROR_INVALID_VALUE;
+    words[3 + i] = stride >> 4;
+    words[9 + i] = dim - 1;
+    words[14] |= (outer_box - 1) << (8 * i);
+  }
   TRITON_STATIC_ASSERT(sizeof(words) == sizeof(CUtensorMap),
                        "unexpected tensor map size");
   memcpy(desc, words, sizeof(words));
@@ -348,6 +353,8 @@ triton_construct_tma_desc(CUtensorMap *desc, const triton_tma_recipe_t *recipe,
     return CUDA_ERROR_NOT_FOUND;
 
   int rank = recipe->ndim;
+  if (rank < 1 || rank > TRITON_MAX_TMA_DIMS)
+    return CUDA_ERROR_INVALID_VALUE;
   CUdeviceptr base_ptr;
   memcpy(&base_ptr, (const char *)args_buf + recipe->ptr_offset,
          sizeof(base_ptr));
