@@ -1597,6 +1597,12 @@ void FpToFpOp::print(OpAsmPrinter &p) {
 }
 
 LogicalResult FpToFpOp::verify() {
+  if (getRounding() == RoundingMode::RS) {
+    if (!getRbits())
+      return emitOpError("stochastic rounding requires an rbits operand");
+  } else if (getRbits()) {
+    return emitOpError("rbits is only allowed with stochastic rounding");
+  }
   auto dstType = getType();
   auto srcType = getSrc().getType();
   if (auto dstTensorType = dyn_cast<RankedTensorType>(dstType))
@@ -1607,6 +1613,16 @@ LogicalResult FpToFpOp::verify() {
       (!getRounding().has_value())) {
     return emitError("Rounding mode is required for FP downcast");
   }
+  return success();
+}
+
+LogicalResult SrStoreOp::verify() {
+  auto ptrTy = cast<PointerType>(getElementTypeOrSelf(getPtr()));
+  if (!isa<FloatType>(ptrTy.getPointeeType()) ||
+      ptrTy.getAddressSpace() != PtrAddrSpace::Global)
+    return emitOpError("requires ordinary floating-point global pointers");
+  if (getSite().empty() || getSiteId() < 0)
+    return emitOpError("requires a named site with a nonnegative numeric ID");
   return success();
 }
 

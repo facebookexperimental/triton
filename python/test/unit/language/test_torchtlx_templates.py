@@ -175,7 +175,7 @@ class TestTLXReductionEpilogue(TestCase):
             reduction_epilogue.can_fuse_reduction_epilogue.return_value = True
             split_k = mock.Mock(_tlx_row_partials=True, _tlx_split_k=2)
             unsplit = mock.Mock(_tlx_row_partials=True, _tlx_split_k=1)
-            template = mock.Mock()
+            template = mock.Mock(spec=ir.MultiTemplateBuffer)
             node = mock.Mock()
             node.get_template_node.return_value = template
             with mock.patch.dict("os.environ", {"TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE": "force"}):
@@ -668,6 +668,14 @@ class TestTLXTemplates(TestCase):
             self.assertIs(_tlx_registry._is_gfx950(), True)
             self.assertIs(_tlx_registry._is_gfx942(), True)
 
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_blackwell_gemm_ws_grid_pads_m_tiles_to_cluster(self):
+        # M=6202 has 25 M tiles of 256; a 2-CTA grid must be a whole number of clusters.
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+
+        meta = {"BLOCK_M": 256, "BLOCK_N": 128, "NUM_SMS": 148, "NUM_CTAS": 2}
+        self.assertEqual(_tlx_mm._persistent_mm_grid_split_k(6202, 384, meta), (78, 1, 1))
+
     @staticmethod
     @contextlib.contextmanager
     def _force_warppipe_split_k_choice():
@@ -840,6 +848,56 @@ class TestTLXTemplates(TestCase):
                 config.patch({"triton.tlx_mode": mode}),
         ):
             self.assertEqual(heuristic.should_run(inputs), accepted)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_matmul_ws_fp32_operand_layout(self):
+        # tcgen05.mma rejects transposed FP32 SMEM operands: FP32 needs K-inner A and B.
+        from torch._inductor.kernel_inputs import MMKernelInputs
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        m = k = n = 256
+        device = torch.device("cuda")
+        graph = mock.Mock(sizevars=SizeVarAllocator(), unaligned_buffers=set())
+        heuristic = object.__new__(_tlx_registry.BlackwellGemmWSConfigHeuristic)
+
+        def should_run(a_strides):
+            return heuristic.should_run(
+                MMKernelInputs([
+                    ir.Buffer(name="a", layout=ir.FixedLayout(device, torch.float32, [m, k], a_strides)),
+                    ir.Buffer(name="b", layout=ir.FixedLayout(device, torch.float32, [k, n], (1, k))),
+                ]))
+
+        with (
+                V.set_graph_handler(graph),
+                mock.patch("torch.utils._triton.has_triton_tma_device", return_value=True),
+                mock.patch.object(_tlx_registry, "_mm_allow_tf32", return_value=True),
+                config.patch({"triton.tlx_mode": "allow"}),
+        ):
+            self.assertTrue(should_run((k, 1)))
+            self.assertFalse(should_run((1, m)))
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_matmul_ws_smem_check_scales_with_operand_bytes(self):
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        heuristic = _tlx_registry.BlackwellGemmWSConfigHeuristic
+        tile = (128, 128, 64, 4, 2, 1, 1, 2)  # BM, BN, BK, smem, tmem, groups, ctas, subtile
+        self.assertTrue(heuristic._is_valid_config_with_margin(*tile))
+        self.assertFalse(heuristic._is_valid_config_with_margin(*tile, 4))
+        template_kwargs = {
+            "BLOCK_M": 128,
+            "BLOCK_N": 256,
+            "BLOCK_K": 32,
+            "NUM_SMEM_BUFFERS": 3,
+            "NUM_TMEM_BUFFERS": 1,
+            "NUM_MMA_GROUPS": 1,
+            "NUM_CTAS": 1,
+            "EPILOGUE_SUBTILE": 1,
+            "SPLIT_K": 1,
+        }
+        tma = [kw["TMA_EPILOGUE_STORE"] for kw in heuristic._yield_tma_variants(template_kwargs)]
+        tma_fp32 = [kw["TMA_EPILOGUE_STORE"] for kw in heuristic._yield_tma_variants(template_kwargs, 4)]
+        self.assertEqual((tma, tma_fp32), ([1], [0]))
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_amd_mm_template_is_registered_once(self):
@@ -3745,6 +3803,24 @@ HEURISTIC_CONFIG_CASES = [
             "SPLIT_K": 1,
         },
     ),
+    # Rule 1b via alt-tiling (torchTLX-only): AI>1.5, N<1024 unaligned, m_tiles>74.
+    # tlx.ops would pick Rule 3 here.
+    (
+        "rule_1b_alt_tiling",
+        32768,
+        257,
+        4096,
+        {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "NUM_CTAS": 2,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_SMEM_BUFFERS": 2,
+            "INTERLEAVE_EPILOGUE": 1,
+            "SPLIT_K": 1,
+        },
+    ),
     # Rule 3: tall_m, saturated, AI>1.5, no alt-tiling, K>N*2
     (
         "rule_3",
@@ -3810,6 +3886,23 @@ HEURISTIC_CONFIG_CASES = [
             "NUM_MMA_GROUPS": 2,
             "EPILOGUE_SUBTILE": 8,
             "SPLIT_K": 4,
+            "INTERLEAVE_EPILOGUE": 1,
+        },
+    ),
+    # Rule 5 at SPLIT_K=1 (torchTLX-only): k_tiles=4 is too few to split.
+    # tlx.ops would fall through to its candidate scorer here.
+    (
+        "rule_5_no_split_k",
+        1025,
+        1024,
+        256,
+        {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "NUM_CTAS": 1,
+            "EPILOGUE_SUBTILE": 8,
+            "SPLIT_K": 1,
             "INTERLEAVE_EPILOGUE": 1,
         },
     ),
@@ -5843,9 +5936,9 @@ def _rel_l2(out, ref):
 class TestSdpaToFlex(TestCase):
     """tlx_config.sdpa_to_flex: SDPA flash attention lowered through flex on sm90.
 
-    Eligible calls (sm90, bf16/fp16, D in {80, 96}, Lq <= 32, no dropout, not causal)
-    must reach the flex template in fwd and bwd and match stock PT2; others keep the
-    aten fallback.
+    Eligible calls (sm90, tlx_mode, bf16/fp16, D in {80, 96}, Lq <= 32, no dropout, not
+    causal) must reach the flex template in fwd and bwd and match stock PT2; others keep
+    the aten fallback.
     The flag is set process-wide because the lazy backward compile reads it.
     """
 
@@ -5898,6 +5991,16 @@ class TestSdpaToFlex(TestCase):
         def fn(q, k):
             return torch.nn.functional.scaled_dot_product_attention(q, k, k if v is None else v)
 
+        from torch.nn.attention import sdpa_kernel
+
+        try:
+            with sdpa_kernel(sdpa_backend):
+                fn(q, kv)
+        except RuntimeError as e:
+            if "No available kernel" not in str(e):
+                raise
+            self.skipTest(f"no {backend} SDPA kernel for these inputs on this build")
+
         out, grads, code = self._compile_fw_bw(fn, q, kv, routed=True, backend=sdpa_backend)
         ref, ref_grads, ref_code = self._compile_fw_bw(fn, q, kv, routed=False, backend=sdpa_backend)
         self.assertRegex(code, rf"triton_tem_fused_\w*scaled_dot_product_{backend}_attention_backward")
@@ -5917,6 +6020,11 @@ class TestSdpaToFlex(TestCase):
         _, _, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
         self.assertRegex(code, _SDPA_FWD_CALL)
 
+        q, kv = self._inputs(8, 32, 200, 80)
+        with config.patch({"triton.tlx_mode": None}):
+            _, _, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
+        self.assertRegex(code, _SDPA_FWD_CALL)
+
         # Causal with Lq == Lkv so SDPA still picks a fused kernel.
         q, kv = self._inputs(8, 32, 32, 80)
         _, _, code = self._compile_fw_bw(
@@ -5930,6 +6038,30 @@ class TestSdpaToFlex(TestCase):
         q, kv = self._inputs(8, 64, 1536, 80)
         _, _, code = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=True)
         self.assertRegex(code, _SDPA_FWD_CALL)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_fwd_scoped_tlx_mode_keeps_bwd_routed(self):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        q, kv = self._inputs(8, 32, 200, 80)
+        ref, ref_grads, _ = self._compile_fw_bw(self._sdpa_shared_kv, q, kv, routed=False)
+        q = q.detach().requires_grad_(True)
+        kv = kv.detach().requires_grad_(True)
+        saved = tlx_config.sdpa_to_flex
+        tlx_config.sdpa_to_flex = True
+        try:
+            torch._dynamo.reset()
+            with config.patch({"force_disable_caches": True}):
+                with config.patch({"triton.tlx_mode": "allow"}):
+                    out = torch.compile(self._sdpa_shared_kv)(q, kv)
+                with config.patch({"triton.tlx_mode": None}):
+                    _, code = run_and_get_code(lambda: out.sum().backward())
+        finally:
+            tlx_config.sdpa_to_flex = saved
+        self.assertNotRegex("\n".join(code), _SDPA_BWD_CALL)
+        for got, want in zip((out, q.grad, kv.grad), (ref, *ref_grads)):
+            self.assertLessEqual(_rel_l2(got, want), 1e-2)
 
     @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
     @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -6633,6 +6765,101 @@ class TestWarppipeInt32Gate(TestCase):
                 use_async=False,
                 persistent=True,
             ))
+
+
+@instantiate_parametrized_tests
+class TestConv1dToMm(TestCase):
+    """tlx_config.conv1d_to_mm: (K, 1) convs lowered to GEMMs and fused pointwise ops.
+
+    Eligible convs must drop the extern conv kernels that the lowering replaces and
+    match stock PT2 in the forward output and every grad.
+    """
+
+    def _compile_fw_bw(self, module, fn, x, routed):
+        x = x.detach().requires_grad_(True)
+        module.zero_grad(set_to_none=True)
+        torch._dynamo.reset()
+        with tlx_config.patch(conv1d_to_mm=routed), config.patch(
+            {"force_disable_caches": True, "triton.tlx_mode": "allow"}):
+            out, code = run_fw_bw_and_get_code(lambda: fn(x))
+        grads = [x.grad] + [p.grad for p in module.parameters()]
+        return out, grads, "\n".join(code)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("C,L,K,P,groups,channels_last", (
+        (96, 200, 3, 0, 1, True),
+        (96, 250, 3, 1, 1, True),
+        (96, 250, 1, 0, 1, False),
+        (96, 250, 3, 1, 96, False),
+        (64, 129, 3, 1, 64, False),
+    ))
+    def test_routes_eligible(self, C, L, K, P, groups, channels_last):
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        torch.manual_seed(0)
+        conv = torch.nn.Conv2d(C, C, (K, 1), padding=(P, 0), groups=groups)
+        conv = conv.to(GPU_TYPE, torch.bfloat16)
+        x = torch.randn(64, C, L, 1, device=GPU_TYPE, dtype=torch.bfloat16)
+        if channels_last:
+            conv = conv.to(memory_format=torch.channels_last)
+            x = x.to(memory_format=torch.channels_last)
+        fn = torch.compile(lambda t: torch.nn.functional.gelu(conv(t)))
+
+        out, grads, code = self._compile_fw_bw(conv, fn, x, routed=True)
+        ref, ref_grads, ref_code = self._compile_fw_bw(conv, fn, x, routed=False)
+        self.assertIn("convolution_backward", ref_code)
+        if groups > 1:
+            self.assertNotRegex(code, r"extern_kernels\.convolution|aten\.convolution_backward\.default\(")
+        elif K == 1:
+            self.assertNotIn("aten.convolution_backward.default(", code)
+        else:
+            self.assertRegex(code, r"extern_kernels\.mm\(|triton_tem_fused")
+        for got, want in zip((out, *grads), (ref, *ref_grads)):
+            self.assertLessEqual(_rel_l2(got, want), 1e-2)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("C,K,W", ((32, (3, 3), 16), (128, (3, 1), 1)))
+    def test_ineligible_keeps_conv(self, C, K, W):
+        """A 2-D kernel, and a dense conv on 64-channel multiples where cuDNN is faster."""
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        torch.manual_seed(0)
+        padding = (1, 1) if K[1] == 3 else (1, 0)
+        conv = torch.nn.Conv2d(C, C, K, padding=padding).to(GPU_TYPE, torch.bfloat16)
+        x = torch.randn(4, C, 16, W, device=GPU_TYPE, dtype=torch.bfloat16)
+        _, _, code = self._compile_fw_bw(conv, torch.compile(conv), x, routed=True)
+        self.assertIn("convolution_backward", code)
+
+    @unittest.skipIf(not is_hopper(), "Need H100 (sm90)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_prod_wgrad_vs_fp64(self):
+        """IG-CTR dense (3, 1) wgrad at L=2500: within 2x of stock's error against fp64."""
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        torch.manual_seed(0)
+        n, c, length, k = 1365, 96, 2500, 3
+        conv = torch.nn.Conv2d(c, c, (k, 1), bias=False).to(GPU_TYPE, torch.bfloat16)
+        conv = conv.to(memory_format=torch.channels_last)
+        x = torch.randn(n, c, length, 1, device=GPU_TYPE, dtype=torch.bfloat16)
+        x = x.to(memory_format=torch.channels_last)
+        g = torch.randn(n, c, length - k + 1, 1, device=GPU_TYPE, dtype=torch.bfloat16)
+        g = g.to(memory_format=torch.channels_last)
+
+        def wgrad(routed):
+            conv.zero_grad(set_to_none=True)
+            torch._dynamo.reset()
+            with tlx_config.patch(conv1d_to_mm=routed), config.patch(
+                {"force_disable_caches": True, "triton.tlx_mode": "allow"}):
+                torch.compile(conv)(x).backward(g)
+            return conv.weight.grad
+
+        routed, stock = wgrad(True), wgrad(False)
+        xs, gs = x[..., 0].double(), g[..., 0].double()
+        lo = length - k + 1
+        ref = torch.stack([torch.einsum("nol,ncl->oc", gs, xs[:, :, i:i + lo]) for i in range(k)], dim=2).unsqueeze(-1)
+        self.assertLessEqual(_rel_l2(routed, ref), max(1e-3, 2 * _rel_l2(stock, ref)))
 
 
 if __name__ == "__main__":

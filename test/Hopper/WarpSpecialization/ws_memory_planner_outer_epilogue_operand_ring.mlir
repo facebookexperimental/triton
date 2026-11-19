@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=200000" | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=0 smem-budget=200000" 2>&1 | FileCheck %s --check-prefix=ALGO0
 
 // With `tt.smem_operand_ring_first`, an outer-loop epilogue ring does not take
 // SMEM from the TMA-fed MMA operand ring of the inner K loop. Operands:
@@ -6,6 +7,7 @@
 // operands keep 3 copies and the epilogue 1. Without the attribute the default
 // order is unchanged: the epilogue takes 3 copies and the operands get 2.
 
+// ALGO0: remark: tt.smem_operand_ring_first is ignored with tt.smem_alloc_algo=0
 // CHECK-LABEL: @outer_epilogue_after_operand_ring
 // CHECK: ttg.local_alloc {buffer.copy = 3 : i32{{.*}}128x64xf16
 // CHECK: ttg.local_alloc {buffer.copy = 3 : i32{{.*}}64x256xf16

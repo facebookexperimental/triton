@@ -1297,23 +1297,6 @@ isDescriptorFedComputedMMAOperandChannel(Operation *alloc,
   return false;
 }
 
-/// True when a warp-specialized loop requests the operand-ring-first SMEM plan
-/// via `tt.smem_operand_ring_first`; the closest loop that sets it wins.
-static bool requestsOperandRingFirst(triton::FuncOp funcOp) {
-  bool requested = false;
-  funcOp->walk([&](LoopLikeOpInterface wsLoop) {
-    if (!wsLoop->hasAttr(tt::kWarpSpecializeAttrName))
-      return;
-    for (Operation *loop = wsLoop; loop; loop = loop->getParentOp())
-      if (auto attr =
-              loop->getAttrOfType<BoolAttr>("tt.smem_operand_ring_first")) {
-        requested |= attr.getValue();
-        break;
-      }
-  });
-  return requested;
-}
-
 /// Return the MMA consuming a TMA-fed SMEM channel (the operand ring of a GEMM
 /// main loop), or nullptr.
 static Operation *
@@ -2465,12 +2448,14 @@ static void dumpMemPlans(ArrayRef<wsplan::Plan> plans, StringRef pool,
 static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
+    bool smemOperandRingFirst,
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
     unsigned annotationMaxId);
 
 static unsigned allocateSmemBuffersViaSearch(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
+    bool smemOperandRingFirst,
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
     unsigned annotationMaxId) {
   // Safety fallback: the search does not yet model (a) annotation /
@@ -2521,8 +2506,8 @@ static unsigned allocateSmemBuffersViaSearch(
     LDBG("SMEM plan-search: unmodeled feature present, falling back to "
          "heuristic");
     return allocateSmemBuffers(funcOp, channels, numBuffers, smemBudget,
-                               smemCircularReuse, allocToAnnotation,
-                               annotationMaxId);
+                               smemCircularReuse, smemOperandRingFirst,
+                               allocToAnnotation, annotationMaxId);
   }
 
   SmemBufferModel model(funcOp, channels, numBuffers);
@@ -2544,9 +2529,12 @@ static unsigned allocateSmemBuffersViaSearch(
   if (plans.empty()) {
     LDBG("SMEM plan-search: no plan found, falling back to heuristic");
     return allocateSmemBuffers(funcOp, channels, numBuffers, smemBudget,
-                               smemCircularReuse, allocToAnnotation,
-                               annotationMaxId);
+                               smemCircularReuse, smemOperandRingFirst,
+                               allocToAnnotation, annotationMaxId);
   }
+  if (smemOperandRingFirst)
+    funcOp.emitRemark()
+        << "tt.smem_operand_ring_first is ignored by the SMEM plan search";
 
   // Normalize each plan's block copies to the value that will actually be
   // emitted, so the dump reflects reality (not the raw CopySolver count) and
@@ -2633,6 +2621,7 @@ getRequestedDescriptorBufferDepth(ttg::LocalAllocOp alloc) {
 static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
+    bool smemOperandRingFirst,
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
     unsigned annotationMaxId = 0) {
   // ── Phase 1: Create WSBuffers ───────────────────────────────────────
@@ -2984,6 +2973,8 @@ static unsigned allocateSmemBuffers(
       unsigned sharers = llvm::count_if(wsBuffers, [&](const WSBuffer &b) {
         return !b.isPinned && b.bufferId == wsBuffers[i].bufferId;
       });
+      // Defensive: operands here are never pinned, so they count themselves.
+      sharers = std::max(1u, sharers);
       m = std::min(m, (wsBuffers[i].numCopies + sharers - 1) / sharers);
     }
     return m;
@@ -3201,19 +3192,21 @@ static unsigned allocateSmemBuffers(
   SmallVector<WSBuffer> preCopyBuffers = wsBuffers;
   unsigned preCopyNextBufferId = nextBufferId;
   runCopyPhases(epilogueBudget);
-  if (outerEpilogueBudget < epilogueBudget && !mmaOperandIdx.empty() &&
-      requestsOperandRingFirst(funcOp) &&
-      minMMAOperandCopies() < operandDepthGoal &&
+  if (smemOperandRingFirst && mmaOperandIdx.empty())
+    funcOp.emitRemark() << "tt.smem_operand_ring_first is ignored: no unpinned "
+                           "TMA-fed MMAv5 operand ring";
+  unsigned defaultMin = minMMAOperandCopies();
+  if (smemOperandRingFirst && outerEpilogueBudget < epilogueBudget &&
+      !mmaOperandIdx.empty() && defaultMin < operandDepthGoal &&
       !funcOp->hasAttr("ttg.ws_memory_plan_invalid")) {
     SmallVector<WSBuffer> defaultPlan = wsBuffers;
     unsigned defaultNextBufferId = nextBufferId;
-    unsigned defaultMin = minMMAOperandCopies();
     wsBuffers = preCopyBuffers;
     nextBufferId = preCopyNextBufferId;
     runCopyPhases(outerEpilogueBudget);
     // Give outer-loop staging whatever the operand ring could not use.
     increaseFusedEpilogueCopies(wsBuffers, channels, funcOp, numBuffers,
-                                smemBudget, smemBudget);
+                                epilogueBudget, smemBudget);
     unsigned operandFirstMin = minMMAOperandCopies();
     LDBG("Phase 4: min MMA operand copies default="
          << defaultMin << " operand-first=" << operandFirstMin);
@@ -6109,6 +6102,7 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
   int effectiveSmemAllocAlgo = options.smemAllocAlgo;
   unsigned effectiveSmemBudget = smemBudget;
   bool effectiveSmemCircularReuse = options.smemCircularReuse;
+  bool effectiveSmemOperandRingFirst = false;
   bool hasSmemAllocAlgoAttr = false;
   funcOp->walk([&](LoopLikeOpInterface wsLoop) {
     if (!wsLoop->hasAttr(tt::kWarpSpecializeAttrName))
@@ -6131,8 +6125,15 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
         effectiveSmemBudget = static_cast<unsigned>(attr.getInt());
       if (auto attr = loop->getAttrOfType<BoolAttr>("tt.smem_circular_reuse"))
         effectiveSmemCircularReuse = attr.getValue();
+      if (auto attr =
+              loop->getAttrOfType<BoolAttr>("tt.smem_operand_ring_first"))
+        effectiveSmemOperandRingFirst = attr.getValue();
     }
   });
+  if (effectiveSmemOperandRingFirst && effectiveSmemAllocAlgo != 1)
+    funcOp.emitRemark() << "tt.smem_operand_ring_first is ignored with "
+                           "tt.smem_alloc_algo="
+                        << effectiveSmemAllocAlgo;
 
   unsigned bufferId;
   if (effectiveSmemAllocAlgo == 1) {
@@ -6169,15 +6170,16 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
           annotationMaxId = std::max(annotationMaxId, ann.bufferId + 1);
     }
 
-    bufferId = smemPlanSearch
-                   ? allocateSmemBuffersViaSearch(
-                         funcOp, channels, numBuffers, effectiveSmemBudget,
-                         effectiveSmemCircularReuse, smemAllocAnnotations,
-                         annotationMaxId)
-                   : allocateSmemBuffers(funcOp, channels, numBuffers,
-                                         effectiveSmemBudget,
-                                         effectiveSmemCircularReuse,
-                                         smemAllocAnnotations, annotationMaxId);
+    bufferId =
+        smemPlanSearch
+            ? allocateSmemBuffersViaSearch(
+                  funcOp, channels, numBuffers, effectiveSmemBudget,
+                  effectiveSmemCircularReuse, effectiveSmemOperandRingFirst,
+                  smemAllocAnnotations, annotationMaxId)
+            : allocateSmemBuffers(
+                  funcOp, channels, numBuffers, effectiveSmemBudget,
+                  effectiveSmemCircularReuse, effectiveSmemOperandRingFirst,
+                  smemAllocAnnotations, annotationMaxId);
     if (funcOp->hasAttr("ttg.ws_memory_plan_invalid")) {
       funcOp->removeAttr("ttg.ws_memory_plan_invalid");
       return failure();

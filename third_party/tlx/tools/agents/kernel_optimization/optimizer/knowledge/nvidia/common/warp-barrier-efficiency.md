@@ -25,6 +25,8 @@ num_warps * 32 * num_arrivals
 
 `num_warps` is the number of warps in one arriving task replica. `num_arrivals` is the number of all-thread arrival events targeting the same barrier in one phase, including replicated consumer tasks when each replica arrives once. Derive both values from the ledger; do not copy an ordinary barrier's logical arrival count into a warp-barrier allocation.
 
+A middle ground keeps the ordinary barrier and arrives with `tlx.barrier_arrive(..., per_warp=True)`: each warp synchronizes only its own lanes and one lane arrives, so a warp does not wait for its siblings, with one mbarrier arrival per warp rather than per thread. The barrier counts `arrive_count` for each warp of the arriving task, so raise its allocation count by the task's warp count, and per-warp and leader arrives can share one barrier. This also applies to cross-CTA barriers signalled through `remote_cta_rank`, where the count is the per-CTA total times the CTAs.
+
 Consult `.claude/skills/tlx-api-reference/SKILL.md` and nearby same-architecture kernels before using `tlx.alloc_warp_barrier`. Reuse a demonstrated topology rather than inventing an arrival protocol.
 
 ## Select Only Safe Candidates

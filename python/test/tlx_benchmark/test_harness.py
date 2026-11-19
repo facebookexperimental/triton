@@ -191,11 +191,10 @@ def test_status_vocabulary_is_exactly_the_four_documented():
     assert {s.value for s in Status} == {"ok", "pip", "noisy", "error"}
 
 
-def test_noisy_is_not_a_failure_but_pip_and_error_are():
+def test_only_a_broken_or_wrong_kernel_fails_the_run():
     from _harness.report import FAILING
 
-    assert Status.NOISY not in FAILING
-    assert set(FAILING) == {Status.PIP, Status.ERROR}
+    assert set(FAILING) == {Status.ERROR}
 
 
 def test_diagnostic_reference_reports_speedup_without_enforcing_the_floor():
@@ -830,6 +829,8 @@ def test_focus_suite_can_union_other_suites():
     "module_name",
     [
         "triton.tlx.ops.kernels.addmm._shapes",
+        "triton.tlx.ops.kernels.collectives.all_reduce._shapes",
+        "triton.tlx.ops.kernels.collectives.fused.all_reduce_norm_residual_norm._shapes",
         "triton.tlx.ops.kernels.fused.addmm_mul_add._shapes",
         "triton.tlx.ops.kernels.bmm._shapes",
         "triton.tlx.ops.kernels.flash_attn._shapes",
@@ -841,6 +842,7 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.kda._prefill_shapes",
         "triton.tlx.ops.kernels.kda._decode_shapes",
         "triton.tlx.ops.kernels.fused.linear_rowscale._shapes",
+        "triton.tlx.ops.kernels.fused.moe_router_topk_align._shapes",
         "triton.tlx.ops.kernels.fused.norm_residual_norm._shapes",
         "triton.tlx.ops.kernels.fused.rmsnorm_gate._shapes",
         "triton.tlx.ops.kernels.mla_window_attn._shapes",
@@ -870,6 +872,8 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
             "gfx942": ("gfx942_all", ),
             "gfx950": ("gfx950_all", ),
         },
+        "triton.tlx.ops.kernels.collectives.all_reduce._shapes": {"gfx950": ("gfx950_all", )},
+        "triton.tlx.ops.kernels.collectives.fused.all_reduce_norm_residual_norm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.fused.addmm_mul_add._shapes": {"sm90": ("sm90_1", )},
         "triton.tlx.ops.kernels.bmm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.flash_attn._shapes": {
@@ -911,6 +915,7 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
             "gfx950": ("gfx950_all", ),
             "gfx942": ("gfx942_all", ),
         },
+        "triton.tlx.ops.kernels.fused.moe_router_topk_align._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.moe._routing_shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.router_gemm._shapes": {"gfx950": ("gfx950_all", )},
@@ -999,6 +1004,8 @@ def test_focus_suite_op_mismatch_is_rejected_explicitly():
 BENCH_MODULES = (
     "bench_addmm",
     "bench_addmm_mul_add",
+    "bench_all_reduce",
+    "bench_all_reduce_norm_residual_norm",
     "bench_flash_attn",
     "bench_flash_attn_mxfp8",
     "bench_flash_attn_varlen",
@@ -1012,6 +1019,7 @@ BENCH_MODULES = (
     "bench_mla_window_attn",
     "bench_mm",
     "bench_mm_mxfp8",
+    "bench_moe_router_topk_align",
     "bench_moe_routing",
     "bench_norm_residual_norm",
     "bench_norm",
