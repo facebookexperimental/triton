@@ -10,7 +10,8 @@ from lit.llvm import llvm_config
 # name: The name of this test suite
 config.name = "CUDA_TILE"
 
-config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
+# LLVM 23 rejects the deprecated external-shell mode by default.
+config.test_format = lit.formats.ShTest(False)
 
 # suffixes: A list of file extensions to treat as test files.
 config.suffixes = [".mlir", ".c", ".py"]
