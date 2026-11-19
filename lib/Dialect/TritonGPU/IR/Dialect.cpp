@@ -3310,6 +3310,7 @@ Attribute NVMMASharedEncodingAttr::parse(AsmParser &parser, Type type) {
   bool transposed = false;
   bool fp4Padded = false;
   bool fp6Padded = false;
+  bool swizzleAtom32B = false;
   NVMmaPadding padding = NVMmaPadding::None;
   unsigned elementBitWidth;
   unsigned layoutRank;
@@ -3341,6 +3342,9 @@ Attribute NVMMASharedEncodingAttr::parse(AsmParser &parser, Type type) {
         return {};
     } else if (attr.getName() == "fp6Padded") {
       if (parseBool(parser, attr, fp6Padded, "fp6Padded").failed())
+        return {};
+    } else if (attr.getName() == "swizzleAtom32B") {
+      if (parseBool(parser, attr, swizzleAtom32B, "swizzleAtom32B").failed())
         return {};
     } else if (attr.getName() == "CGALayout") {
       cgaAttr = attr.getValue();
@@ -3385,7 +3389,7 @@ Attribute NVMMASharedEncodingAttr::parse(AsmParser &parser, Type type) {
       fp4Padded   ? NVMmaPadding::Fp4
       : fp6Padded ? NVMmaPadding::B6x16P32
                   : padding,
-      *CGALayout);
+      *CGALayout, swizzleAtom32B);
 }
 
 void NVMMASharedEncodingAttr::print(AsmPrinter &printer) const {
@@ -3399,6 +3403,8 @@ void NVMMASharedEncodingAttr::print(AsmPrinter &printer) const {
     // Print only in this case to reduce the noise for the more common case.
     printer << ", fp4Padded = true";
   }
+  if (getSwizzleAtom32B())
+    printer << ", swizzleAtom32B = true";
   unsigned rank = getCGALayout().getCTAOrder().size();
   auto *ctx = getContext();
   auto defaultLayout = CGAEncodingAttr::get1CTALayout(ctx, rank);
@@ -3414,7 +3420,8 @@ LogicalResult
 NVMMASharedEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                                 unsigned swizzlingByteWidth, bool transposed,
                                 unsigned elementBitWidth, NVMmaPadding padding,
-                                CGAEncodingAttr CGALayout) {
+                                CGAEncodingAttr CGALayout,
+                                bool swizzleAtom32B) {
   if ((padding == NVMmaPadding::B6x16P32 || padding == NVMmaPadding::B6P2x16) &&
       elementBitWidth != 8)
     return emitError() << "FP6 shared layouts require byte storage";
@@ -3422,13 +3429,17 @@ NVMMASharedEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
     return emitError() << "elementBitWidth must be non-zero";
   if (!llvm::is_contained({0, 32, 64, 128}, swizzlingByteWidth))
     return emitError() << "swizzlingByteWidth must be 0, 32, 64, or 128";
+  if (swizzleAtom32B &&
+      (swizzlingByteWidth != 128 || padding != NVMmaPadding::None))
+    return emitError()
+           << "swizzleAtom32B requires unpadded 128-byte swizzling";
   return success();
 }
 
 int NVMMASharedEncodingAttr::getVec() const {
   if (getSwizzlingByteWidth() == 0)
     return 1;
-  return 128 / getElementBitWidth();
+  return (getSwizzleAtom32B() ? 256 : 128) / getElementBitWidth();
 }
 
 int NVMMASharedEncodingAttr::getPerPhase() const {
@@ -3440,11 +3451,11 @@ int NVMMASharedEncodingAttr::getPerPhase() const {
 int NVMMASharedEncodingAttr::getMaxPhase() const {
   if (getSwizzlingByteWidth() == 0)
     return 1;
-  return getSwizzlingByteWidth() / 16;
+  return getSwizzlingByteWidth() / (getSwizzleAtom32B() ? 32 : 16);
 }
 
 int32_t NVMMASharedEncodingAttr::getAlignment() const {
-  return 128 * getMaxPhase();
+  return getSwizzleAtom32B() ? 1024 : 128 * getMaxPhase();
 }
 
 //===----------------------------------------------------------------------===//
@@ -3953,7 +3964,8 @@ struct TritonGPUInferLayoutInterface
         CGAEncodingAttr cgaLayout = permuteCGALayout(enc.getCGALayout(), order);
         resultEncoding = NVMMASharedEncodingAttr::get(
             ctx, enc.getSwizzlingByteWidth(), !enc.getTransposed(),
-            enc.getElementBitWidth(), enc.getPadding(), cgaLayout);
+            enc.getElementBitWidth(), enc.getPadding(), cgaLayout,
+            enc.getSwizzleAtom32B());
         return success();
       }
     }

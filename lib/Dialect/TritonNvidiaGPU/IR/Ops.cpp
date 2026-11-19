@@ -1126,7 +1126,8 @@ static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
     if (!descEnc || descEnc.getTransposed() != nvmma.getTransposed() ||
         descEnc.getSwizzlingByteWidth() != nvmma.getSwizzlingByteWidth() ||
         descEnc.getElementBitWidth() != nvmma.getElementBitWidth() ||
-        descEnc.isPaddedFp4() != nvmma.isPaddedFp4()) {
+        descEnc.isPaddedFp4() != nvmma.isPaddedFp4() ||
+        descEnc.getSwizzleAtom32B() != nvmma.getSwizzleAtom32B()) {
       return op->emitOpError("TMA descriptor layout must match shared layout, "
                              "but got descriptor layout ")
              << descEnc << " and shared memory layout " << nvmma;

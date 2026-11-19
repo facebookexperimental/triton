@@ -174,7 +174,9 @@ getSharedMemoryMMAOperand(Value v, mlir::PatternRewriter &rewriter, int opIdx,
                           bool allowTranspose, bool isMMAv5Fp4Padded = false,
                           bool forceTranspose = false,
                           Operation *op = nullptr /*only for diagnostic*/,
-                          bool pow2AllocSwizzle = false) {
+                          bool pow2AllocSwizzle = false,
+                          bool tf32SwizzleAtom32B = false,
+                          bool twoCTASplitB = false) {
   OpBuilder::InsertionGuard g(rewriter);
   Value arg = v;
   while (auto cvtOp = arg.getDefiningOp<ConvertLayoutOp>())
@@ -182,6 +184,25 @@ getSharedMemoryMMAOperand(Value v, mlir::PatternRewriter &rewriter, int opIdx,
   auto argType = cast<RankedTensorType>(arg.getType());
   assert(argType.getEncoding() && "unexpected tensor type");
   auto order = getOrderForMemory(argType);
+
+  // tcgen05 reads an MN-major TF32 operand only with 128B swizzling and 32B
+  // atomicity. Use it when the operand is MN-major and its contiguous dim fills
+  // a 128B swizzle; otherwise force the K-major order.
+  bool useAtom32B = false;
+  if (tf32SwizzleAtom32B) {
+    bool mnMajor = order.size() == 2 && order[0] == (opIdx == 0 ? 0u : 1u);
+    // A 2-CTA B operand is later split along N, so each CTA's half must still
+    // fill the 128B swizzle.
+    SmallVector<int64_t> probeShape(argType.getShape());
+    if (twoCTASplitB && opIdx == 1 && probeShape.size() == 2)
+      probeShape[1] /= 2;
+    auto probe = NVMMASharedEncodingAttr::get(
+        argType.getContext(), probeShape, order,
+        getCGALayout(argType.getEncoding()), argType.getElementType(),
+        /*fp4Padded=*/false);
+    useAtom32B = mnMajor && probe.getSwizzlingByteWidth() == 128;
+    allowTranspose = useAtom32B;
+  }
 
   // If the MMA op doesn't support transpose pick the layout expected by the MMA
   // op.
@@ -218,6 +239,11 @@ getSharedMemoryMMAOperand(Value v, mlir::PatternRewriter &rewriter, int opIdx,
   auto newLayout = NVMMASharedEncodingAttr::get(
       argType.getContext(), swizzleShape, newOrder, CGALayout,
       argType.getElementType(), isMMAv5Fp4Padded);
+  if (useAtom32B)
+    newLayout = NVMMASharedEncodingAttr::get(
+        argType.getContext(), newLayout.getSwizzlingByteWidth(),
+        newLayout.getTransposed(), newLayout.getElementBitWidth(),
+        NVMmaPadding::None, CGALayout, /*swizzleAtom32B=*/true);
   auto newType = MemDescType::get(argType.getShape(), argType.getElementType(),
                                   newLayout, SharedMemorySpace);
   rewriter.setInsertionPointAfterValue(arg);
@@ -832,12 +858,13 @@ public:
         b = splitBOperand(b, rewriter);
       }
     }
-    // TF32 transpose is only supported with 128 swizzle mode with 32B
-    // atomicity. As we currently don't support this layout we disallow
-    // transpose for TF32 inputs.
-    bool allowTranspose = !dotOp.getA().getType().getElementType().isF32();
-    a = getSharedMemoryMMAOperand(a, rewriter, 0, allowTranspose);
-    b = getSharedMemoryMMAOperand(b, rewriter, 1, allowTranspose);
+    // A transposed TF32 operand needs 128B swizzling with 32B atomicity.
+    bool isF32 = dotOp.getA().getType().getElementType().isF32();
+    a = getSharedMemoryMMAOperand(a, rewriter, 0, /*allowTranspose=*/!isF32,
+                                  false, false, nullptr, false, isF32);
+    b = getSharedMemoryMMAOperand(b, rewriter, 1, /*allowTranspose=*/!isF32,
+                                  false, false, nullptr, false, isF32,
+                                  useTwoCTAs);
     MLIRContext *context = dotOp->getContext();
     auto instrShape = mmaVersionToInstrShape(
         versionMajor, retShapePerCTA, oldAType.getElementType(), numWarps);

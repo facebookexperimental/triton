@@ -102,3 +102,8 @@
 
 // expected-error@+1 {{elementBitWidth must be 32 or 64}}
 #mfma = #ttg.amd_mfma<{version = 2, warpsPerCTA = [1, 1, 1], instrShape = [16, 16, 16], isTransposed = false, elementBitWidth = 16}>
+
+// -----
+
+// expected-error@+1 {{swizzleAtom32B requires unpadded 128-byte swizzling}}
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 32, swizzleAtom32B = true}>

@@ -21,7 +21,9 @@ struct SMEMDescriptor {
   uint64_t reserved2 : 3;
   uint64_t matrixBaseOffset : 3;
   uint64_t leadDimensionAbsoluteMode : 1;
-  uint64_t reserved3 : 9;
+  uint64_t reserved3 : 8;
+  // tcgen05 only: with swizzlingMode == 0, 128B swizzling with 32B atomicity.
+  uint64_t swizzleAtom32B : 1;
   uint64_t swizzlingMode : 2;
 };
 
@@ -31,6 +33,7 @@ struct MMASMEMDescriptor {
   int32_t bitwidth;
   bool transposed;
   bool fp4Padded;
+  bool swizzleAtom32B = false;
 };
 
 struct MemDescOperand {
@@ -396,6 +399,9 @@ private:
     int swizzling = attrs.swizzlingByteWidth;
     bool transposed = attrs.transposed;
     bool fp4Padded = attrs.fp4Padded;
+    // wgmma has no 32-byte-atomicity swizzle mode.
+    if (attrs.swizzleAtom32B && mmaVersion != 5)
+      return failure();
 
     // The PTX docs are wrong in subtle ways:
     // 1) LBO can be specified for kContig && swizzled != 0
@@ -468,7 +474,10 @@ private:
       desc.swizzlingMode = 2;
       break;
     case 128:
-      desc.swizzlingMode = 1;
+      if (attrs.swizzleAtom32B)
+        desc.swizzleAtom32B = 1;
+      else
+        desc.swizzlingMode = 1;
       break;
     default:
       llvm_unreachable("Unsupported swizzling size.");
@@ -477,7 +486,8 @@ private:
                              /* .swizzlingByteWidth = */ swizzling,
                              /* .bitwidth = */ bitwidth,
                              /* .transposed = */ transposed,
-                             /* .fp4Padded = */ fp4Padded};
+                             /* .fp4Padded = */ fp4Padded,
+                             /* .swizzleAtom32B = */ attrs.swizzleAtom32B};
   }
 };
 
