@@ -1206,12 +1206,11 @@ def test_mxgemm_bench_defaults_and_overrides():
 
     # Defaults: 4x4 clusters with an eight-block barrier interval and chunked
     # XCD remapping of whole clusters for both variants, each with FP32 and
-    # then FP16 output. FP32 MX8xMX8 uses a four-stage ring with two C slots
-    # from K=16384, static slot unroll from K=8192, and the overlap peel with
-    # three stages. FP16 MX8xMX8 up to K=16384 uses the four-stage static loop
-    # with the merged handoff barrier, static cluster steps, two C slots, and
-    # the overlap peel. MX8xMX4 splits cluster barriers and starts C stores
-    # early.
+    # then FP16 output. MX8xMX8 up to K=16384 (FP32 from K=8192) uses the
+    # four-stage static loop with the merged handoff barrier, static cluster
+    # steps, two C slots, and the overlap peel. FP32 at K=4096 keeps three
+    # stages with the overlap peel, and K=32768 uses a four-stage ring with two
+    # C slots. MX8xMX4 splits cluster barriers and starts C stores early.
     _, shapes, variants = bench.parse_benchmark_args(["--dry-run"])
     assert [(variant, args.out_dtype) for variant, _, args in variants] == [("mx8xmx8", "fp32"), ("mx8xmx8", "fp16"),
                                                                             ("mx8xmx4", "fp32"), ("mx8xmx4", "fp16")]
@@ -1223,7 +1222,7 @@ def test_mxgemm_bench_defaults_and_overrides():
             assert cmd[cmd.index("--cluster_barrier_interval") + 1] == "8"
             assert cmd[cmd.index("--xcd_remap") + 1] == "chunked"
             a8w8 = variant == "mx8xmx8"
-            merged = a8w8 and args.out_dtype == "fp16" and shape[2] <= 16384
+            merged = a8w8 and shape[2] <= 16384 and (args.out_dtype == "fp16" or shape[2] >= 8192)
             four_stage = a8w8 and (shape[2] >= 16384 or merged)
             assert cmd[cmd.index("-BK") + 1] == ("128" if a8w8 else "256")
             assert cmd[cmd.index("--num_buffers") + 1] == ("4" if four_stage else "3")

@@ -12,15 +12,14 @@ persistent programs, group-M 8, 16-workgroup clusters in a 4x4 tile layout
 with multicast inputs and a cluster barrier every eight K blocks, and chunked
 XCD remapping of whole clusters (eight XCDs, chunk two).
 
-- mx8xmx8 (FP8 E4M3 B) uses BK128 with cross-tile prefetch. With FP32
-  output below K=16384 it uses three input stages and three dedicated C
-  slots, overlaps each next tile's first K step with the C epilogue, and from
-  K=8192 unrolls the steady loop by the ring depth. With FP16 output up to
-  K=16384 it uses four input stages, two C slots, the static unrolled loop,
-  the overlapped first K step, one split workgroup barrier per K step
-  (--merged-handoff-barrier), and tests the cluster rendezvous only in the
-  unrolled steps that can reach it (--static-cluster-steps). Otherwise
-  (FP32 from K=16384, FP16 at K=32768) it uses four stages and two C slots.
+- mx8xmx8 (FP8 E4M3 B) uses BK128 with cross-tile prefetch. With FP16
+  output up to K=16384, and FP32 output from K=8192 to K=16384, it uses four
+  input stages, two C slots, the static unrolled loop, the overlapped first K
+  step, one split workgroup barrier per K step (--merged-handoff-barrier),
+  and tests the cluster rendezvous only in the unrolled steps that can reach
+  it (--static-cluster-steps). FP32 output at K=4096 uses three input stages
+  and three dedicated C slots and overlaps each next tile's first K step with
+  the C epilogue. At K=32768 it uses four stages and two C slots.
   --scale-layout wave256 packs its scales so each wave reads both 128-row
   quadrants' scales with one LDS load.
 - mx8xmx4 (FP4 E2M1 B) uses BK256 with three input stages, stages C in
@@ -49,12 +48,13 @@ VARIANT_DTYPES_B = {"mx8xmx8": "float8_e4m3", "mx8xmx4": "float4"}
 OUT_DTYPES = ("fp32", "fp16")
 GRID_CLUSTER_LAYOUTS = {"2x2": (2, 2), "4x2": (4, 2), "2x4": (2, 4), "4x4": (4, 4), "8x2": (8, 2), "2x8": (2, 8)}
 # MX8xMX8 defaults by K: static slot unroll from STATIC_SLOT_UNROLL_MIN_K,
-# and a four-stage ring with two C slots from FOUR_BUFFER_MIN_K. FP16 output
-# up to MERGED_FP16_MAX_K uses the four-stage static loop with the merged
-# handoff barrier instead.
+# and a four-stage ring with two C slots from FOUR_BUFFER_MIN_K. Up to
+# MERGED_MAX_K, FP16 output (and FP32 output from STATIC_SLOT_UNROLL_MIN_K)
+# uses the four-stage static loop with the merged handoff barrier instead.
+# FP32 at K=4096 is faster on the three-stage ring.
 STATIC_SLOT_UNROLL_MIN_K = 8192
 FOUR_BUFFER_MIN_K = 16384
-MERGED_FP16_MAX_K = 16384
+MERGED_MAX_K = 16384
 DEFAULT_OUTPUT_C_SLOTS = {"fp32": 3, "fp16": 6}
 RESULT_RE = re.compile(r"execution time:\s*([0-9.eE+-]+)\s*ms,\s*([0-9.eE+-]+)\s*TFLOPS")
 
@@ -99,9 +99,9 @@ def _case_args(args, case):
         resolved.static_slot_unroll = bool(args.static_slot_unroll)
         resolved.overlap_peel = bool(args.overlap_peel)
         return resolved
-    if (args.out_dtype == "fp16" and args.num_buffers is None and args.output_c_slots is None
-            and args.static_slot_unroll is None and args.merged_handoff_barrier is not False and k // args.block_k > 4
-            and k <= MERGED_FP16_MAX_K):
+    merged_min_k = args.block_k * 5 if args.out_dtype == "fp16" else STATIC_SLOT_UNROLL_MIN_K
+    if (args.num_buffers is None and args.output_c_slots is None and args.static_slot_unroll is None
+            and args.merged_handoff_barrier is not False and merged_min_k <= k <= MERGED_MAX_K):
         resolved.num_buffers = 4
         resolved.static_slot_unroll = True
         resolved.merged_handoff_barrier = True
@@ -227,8 +227,8 @@ def parse_benchmark_args(argv=None):
         "MX8xMX8)")
     parser.add_argument(
         "--merged-handoff-barrier", action=argparse.BooleanOptionalAction, default=None,
-        help="four-stage static loop with one split workgroup barrier per K step (default: FP16 MX8xMX8 up to "
-        f"K={MERGED_FP16_MAX_K})")
+        help="four-stage static loop with one split workgroup barrier per K step (default: MX8xMX8 up to "
+        f"K={MERGED_MAX_K}, FP32 output from K={STATIC_SLOT_UNROLL_MIN_K})")
     parser.add_argument(
         "--static-cluster-steps", action=argparse.BooleanOptionalAction, default=None,
         help="test the cluster rendezvous only in unrolled steps that can reach it (default: with the merged "
