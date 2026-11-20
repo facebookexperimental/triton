@@ -99,6 +99,59 @@ def test_mm_skinny_full_space(M, N, K):
     torch.testing.assert_close(out.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
 
 
+def test_mm_skinny_back_to_back_in_graph():
+    """Under programmatic dependent launch the second GEMM starts before the first finishes; its A (the first's
+    output) must still be read only after the first completes, including on CUDA-graph replay."""
+    x = operand(4, 8192, (8192, 1), torch.bfloat16)
+    w1 = operand(4096, 8192, (8192, 1), torch.bfloat16) * 8192**-0.5
+    w2 = operand(2048, 4096, (4096, 1), torch.bfloat16) * 4096**-0.5
+    h = torch.empty(4, 4096, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty(4, 2048, device="cuda", dtype=torch.bfloat16)
+
+    def chain():
+        sm100.mm(x, w1.T, out=h, space="heuristic")
+        sm100.mm(h, w2.T, out=y, space="heuristic")
+
+    chain()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        chain()
+    for seed in range(3):
+        x.copy_(torch.randn(x.shape, device="cuda", generator=torch.Generator("cuda").manual_seed(seed)))
+        graph.replay()
+        ref = (x.float() @ w1.float().T).to(torch.bfloat16).float() @ w2.float().T
+        precision = REL_PRECISION[torch.bfloat16]
+        torch.testing.assert_close(y.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
+def test_mm_skinny_b_written_by_previous_kernel():
+    """The first GEMM triggers early launch before it stores its output; when that output is the second GEMM's
+    W, the second must still load W only after the first completes, including on CUDA-graph replay."""
+    x = operand(64, 4096, (4096, 1), torch.bfloat16)
+    w1 = operand(512, 4096, (4096, 1), torch.bfloat16) * 4096**-0.5
+    a = operand(4, 512, (512, 1), torch.bfloat16)
+    w2 = torch.empty(64, 512, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty(4, 64, device="cuda", dtype=torch.bfloat16)
+    assert sm100._skinny.eligible(x, w1.T) and sm100._skinny.eligible(a, w2.T)
+
+    def chain():
+        sm100.mm(x, w1.T, out=w2, space="heuristic")
+        sm100.mm(a, w2.T, out=y, space="heuristic")
+
+    chain()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        chain()
+    for seed in range(5):
+        x.copy_(torch.randn(x.shape, device="cuda", generator=torch.Generator("cuda").manual_seed(seed)))
+        graph.replay()
+        ref = a.float() @ (x.float() @ w1.float().T).to(torch.bfloat16).float().T
+        precision = REL_PRECISION[torch.bfloat16]
+        torch.testing.assert_close(y.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
 def test_mm_skinny_declines_row_major_b():
     a = operand(8, 4096, (4096, 1), torch.bfloat16)
     b = operand(4096, 4608, (4608, 1), torch.bfloat16)
