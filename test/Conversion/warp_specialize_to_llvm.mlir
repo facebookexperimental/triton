@@ -14,8 +14,11 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
   // CHECK-DAG: [[C64:%.*]] = llvm.mlir.constant(64 : i32)
   // CHECK-DAG: [[C128:%.*]] = llvm.mlir.constant(128 : i32)
 
+  // The worker barrier retains its convergence contract when assigned a
+  // private ID. A barrier without that contract stays non-aligned.
+  // CHECK: nvvm.barrier id = [[C2]] number_of_threads = [[C128]]{{$}}
   // CHECK: nvvm.barrier id = [[C2]] number_of_threads = [[C128]] aligned = false
-  // CHECK: nvvm.barrier id = [[C3]] number_of_threads = [[C64]] aligned = false
+  // CHECK: nvvm.barrier id = [[C3]] number_of_threads = [[C64]]{{$}}
   // CHECK: bar.warp.sync
 
   // CHECK: bb{{[0-9]+}}:
@@ -29,6 +32,7 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
   }
   partition0() num_warps(4) {
     nvvm.barrier
+    nvvm.barrier aligned = false
     ttg.warp_return
   }
   partition1() num_warps(2) {
