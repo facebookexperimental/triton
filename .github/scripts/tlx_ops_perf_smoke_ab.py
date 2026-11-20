@@ -344,7 +344,7 @@ def summarize_groups(rows):
             "best": max(ratios) if ratios else None,
             "slower": sum(r["state"] == "slower" for r in members),
             "faster": sum(r["state"] == "faster" for r in members),
-            "problems": sum(r["state"] in PROBLEMS for r in members),
+            "problems": sum(r["state"] in ("head-error", "base-error", "unmeasured") for r in members),
         })
     return out
 
@@ -403,14 +403,77 @@ def verdict_for(rows, has_ab):
     return "INVESTIGATE" if sum(r < 0.80 for r in ratios) >= 2 or any(r < 0.60 for r in ratios) else "PASS"
 
 
-def fmt_ratio(value):
-    return f"{value:.3f}×" if value is not None else "-"
+DISPLAY = {"b200": "B200", "h100": "H100", "mi350": "MI350"}
+#: What a kernel that could not be compared shows instead of a change.
+PROBLEMS = {
+    "head-error": "fails on this PR",
+    "base-error": "fails on base",
+    "unmeasured": "not measured",
+    "only-head": "new on this PR",
+}
+
+
+def display_name(platform):
+    return DISPLAY.get(platform, platform.upper())
+
+
+def op_name(group):
+    """'flash_attn_varlen/sm90' -> 'flash_attn_varlen': each section already names its GPU."""
+    return group.split("/")[0]
+
+
+def plural(count, word):
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def change_pct(ratio):
+    """Throughput change in percent: a head/base ratio of 0.81 is -19."""
+    return (ratio - 1) * 100
+
+
+def change_text(ratio):
+    """'19% slower', '6% faster' or 'no change' for a head/base throughput ratio."""
+    if ratio is None:
+        return "-"
+    change = change_pct(ratio)
+    if round(abs(change)) == 0:
+        return "no change"
+    return f"{abs(change):.0f}% {'faster' if change > 0 else 'slower'}"
+
+
+def signed_pct(ratio):
+    """'+3%', '−8%' or '0%' for a head/base throughput ratio."""
+    value = round(change_pct(ratio))
+    return "0%" if value == 0 else f"{'+' if value > 0 else '−'}{abs(value)}%"
+
+
+def range_text(low, high):
+    """The runs' spread for a table cell: '−8% to +8%', or one value when they round alike."""
+    low_text, high_text = signed_pct(low), signed_pct(high)
+    return low_text if low_text == high_text else f"{low_text} to {high_text}"
+
+
+def range_words(low, high):
+    """The runs' spread in words: 'from 8% slower to 8% faster'."""
+    return f"from {change_text(low)} to {change_text(high)}"
+
+
+def by_how_much(ratios):
+    """'by 7%' or 'by 19–26%' for flagged ratios that all moved one way."""
+    amounts = sorted(round(abs(change_pct(r))) for r in ratios)
+    return f"by {amounts[0]}%" if amounts[0] == amounts[-1] else f"by {amounts[0]}–{amounts[-1]}%"
+
+
+def within(ratios):
+    """'within ±3%' for unflagged ratios."""
+    spread = max((abs(change_pct(r)) for r in ratios), default=0)
+    return f"within ±{max(1, math.ceil(spread - 1e-9))}%"  # 1e-9: (0.99 - 1) * 100 is 1.0000000000000009
 
 
 def fmt_us(value):
     if value is None:
         return "-"
-    return f"{value:.1f}" if value < 1000 else f"{value:,.0f}"
+    return f"{value:.1f} µs" if value < 1000 else f"{value:,.0f} µs"
 
 
 def env_line(env, device=None):
@@ -421,7 +484,7 @@ def env_line(env, device=None):
         vendor = "AMD " if device.get("vendor") == "amd" else ""
         arch = f" ({device['arch']})" if device.get("arch") else ""
         name = f"{vendor}{device['name']}{arch}"
-    parts = [f"`{name}`" if name else None]
+    parts = [name]
     driver = env.get("driver") or device.get("driver")
     if driver:
         parts.append(f"driver {driver}")
@@ -443,7 +506,7 @@ def env_line(env, device=None):
 
 
 def noise_line(rows):
-    """How far the rounds of one case disagree on this runner: the noise the 5% threshold sits on."""
+    """How far the runs of one kernel disagree on this GPU: the noise the threshold sits on."""
     spreads = sorted(((r["ratio_max"] - r["ratio_min"]) / r["ratio"], r["key"])
                      for r in rows
                      if r["ratio"] is not None and r["pairs"] >= 2)
@@ -451,55 +514,86 @@ def noise_line(rows):
         return None
     median = statistics.median(value for value, _ in spreads)
     widest, key = spreads[-1]
-    count = f"{len(spreads)} case{'s' if len(spreads) != 1 else ''}"
-    return f"Round-to-round spread on this GPU: median {median:.1%} across {count}, widest {widest:.1%} (`{key}`)."
+    return (f"**Noise on this GPU:** the runs of one kernel typically differ by {median:.1%}; "
+            f"the most was {widest:.0%} (`{key}`).")
 
 
-def flagged_line(rows, state, title):
-    """One clause per op: its cases when there are one or two, else a count and range."""
-    hits = [r for r in rows if r["state"] == state]
-    if not hits:
-        return None
-    clauses = []
-    for group in sorted({r["group"] for r in hits}):
-        members = sorted((r for r in hits if r["group"] == group), key=lambda r: r["ratio"], reverse=state == "faster")
-        if len(members) <= 2:
-            clauses += [
-                f"`{r['key']}` {fmt_ratio(r['ratio'])} (rounds {r['ratio_min']:.3f}–{r['ratio_max']:.3f})"
-                for r in members
-            ]
-        else:
-            compared = sum(r["group"] == group and r["ratio"] is not None for r in rows)
-            low, high = min(r["ratio"] for r in members), max(r["ratio"] for r in members)
-            clauses.append(f"`{group}` {len(members)} of {compared} cases, {fmt_ratio(low)} to {fmt_ratio(high)}")
-    return f"**{title} ({len(hits)}):** " + "; ".join(clauses)
+def headline(rows, verdict, has_ab):
+    """The section title's verdict, in words."""
+    if verdict == "NO SIGNAL":
+        return "⚪", "no result"
+    if not has_ab:
+        if verdict == "INVESTIGATE":
+            return "⚠️", "kernels far below the nightly (no base to compare)"
+        return "✅", "no large slowdowns vs the nightly (no base to compare)"
+    count = {state: sum(r["state"] == state for r in rows) for state in ("slower", "head-error", "faster")}
+    parts = []
+    if count["slower"]:
+        parts.append(f"{plural(count['slower'], 'kernel')} slower")
+    if count["head-error"]:
+        parts.append(f"{plural(count['head-error'], 'kernel')} fail on this PR")
+    if parts:
+        return ("❌" if count["head-error"] else "⚠️"), ", ".join(parts)
+    if count["faster"]:
+        return "✅", f"no slowdowns, {plural(count['faster'], 'kernel')} faster"
+    return "✅", "no slowdowns found"
 
 
-PROBLEMS = {"head-error": "fail on head only", "base-error": "fail on base only", "unmeasured": "not measured"}
+def findings(rows, threshold):
+    """Plain bullets: what moved or broke, per op, then how close the rest stayed."""
+    lines = []
+    for group in sorted({r["group"] for r in rows}):
+        members = [r for r in rows if r["group"] == group and r["state"] != "only-base"]
+        name = f"**{op_name(group)}**"
+        for state, words in (("head-error", "fail on this PR but run on base"), ("slower", "slower"),
+                             ("faster", "faster"), ("base-error", "fail on base but run on this PR"),
+                             ("unmeasured", "could not be measured on both sides")):
+            hits = [r for r in members if r["state"] == state]
+            if not hits:
+                continue
+            line = f"- {name}: {len(hits)} of {plural(len(members), 'kernel')} {words}"
+            if state in ("slower", "faster"):
+                line += f", {by_how_much([r['ratio'] for r in hits])}"
+                if len(hits) <= 2:
+                    line += " (" + ", ".join(f"`{r['key']}`" for r in hits) + ")"
+                line += ". Every run agreed."
+            else:
+                note = next((r["notes"][0] for r in hits if r["notes"]), "")
+                line += f": `{shorten(note)}`" if note else "."
+            lines.append(line)
+    same = [r for r in rows if r["state"] == "same"]
+    if same:
+        # Moved past the threshold but the runs disagreed: noise, and worth saying so.
+        noisy = [r for r in same if abs(change_pct(r["ratio"])) >= threshold * 100]
+        quiet = [r["ratio"] for r in same if r not in noisy]
+        who = f"The other {len(same)} kernels" if lines else f"All {len(same)} kernels"
+        line = f"{who} are {within(quiet)} of base"
+        if noisy:
+            line += ", except " + ", ".join(f"`{r['key']}` ({change_text(r['ratio'])}, but its runs ranged "
+                                            f"{range_words(r['ratio_min'], r['ratio_max'])}, so that is noise)"
+                                            for r in noisy)
+        lines.append(("- " if lines else "") + line + ".")
+    return lines
 
 
-def shorten(text, limit=200):
-    text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[:limit - 1] + "…"
-
-
-def problems_line(rows):
-    """Cases that could not be compared, one clause per op, state and first note."""
-    buckets = {}
-    for r in rows:
-        if r["state"] in PROBLEMS:
-            buckets.setdefault((r["group"], r["state"], r["notes"][0] if r["notes"] else ""), []).append(r)
-    if not buckets:
-        return None
-    clauses = []
-    for (group, state, note), members in sorted(buckets.items()):
-        if len(members) == 1:
-            who = f"`{members[0]['key']}` {PROBLEMS[state].replace('fail ', 'fails ')}"
-        else:
-            total = sum(r["group"] == group for r in rows)
-            who = f"`{group}` {len(members)} of {total} cases {PROBLEMS[state]}"
-        clauses.append(who + (f": {shorten(note)}" if note else ""))
-    return "**Not compared:** " + "; ".join(clauses)
+def group_result(members):
+    """One table cell: what happened to an op's kernels."""
+    parts = []
+    failing = [r for r in members if r["state"] == "head-error"]
+    if failing:
+        parts.append(f"❌ {len(failing)} fail on this PR")
+    for state in ("slower", "faster"):
+        hits = [r for r in members if r["state"] == state]
+        if hits:
+            icon = "⚠️" if state == "slower" else "✅"
+            parts.append(f"{icon} {len(hits)} {state}, {by_how_much([r['ratio'] for r in hits])}")
+    other = [r for r in members if r["state"] in ("base-error", "unmeasured")]
+    if other:
+        parts.append(f"{len(other)} not compared")
+    same = [r["ratio"] for r in members if r["state"] == "same"]
+    if same:
+        parts.append(f"{'✅ ' if not parts else ''}{'the rest ' if parts else ''}{within(same)}")
+    return "; ".join(parts) or "-"
 
 
 def nightly_age(base_date, nightly_date):
@@ -516,89 +610,114 @@ def nightly_age(base_date, nightly_date):
     return ""
 
 
-def render(args, results, rows, groups, verdict, has_ab, baseline_date, context):
-    rounds = max([r["round"] for r in results.get("runs", [])] or [0])
-    lines = [f"### {args.platform}: {verdict}", ""]
-    merged = bool(args.pr_head) and args.pr_head != args.head
-    # On pull_request runs HEAD is GitHub's test merge commit; a manual run benches the PR head itself.
-    label = "merge" if merged else "head"
-    head_note = f" (PR head `{args.pr_head[:12]}`)" if merged else ""
-    meta = env_line(results.get("env") or {}, results.get("device"))
-    run = f"[run]({args.run_url})" if args.run_url else ""
-    lines.append(". ".join(p for p in (meta, run) if p) + ("." if meta or run else ""))
-    lines.append("")
-    if not results.get("runs"):
-        status = f" (bench job: {args.bench_status})" if args.bench_status else ""
-        lines.append(f"No bench results for {label} `{args.head[:12]}`{head_note}{status}: no signal. "
-                     "Check the bench job log.")
-        return "\n".join(lines) + "\n"
-    failed_runs = [r for r in results.get("runs", []) if r.get("error")]
-    if has_ab:
-        lines.append(
-            f"Base `{args.base[:12]}` vs {label} `{args.head[:12]}`{head_note}, {rounds} rounds alternating on one GPU. "
-            f"A case is flagged when its median head/base throughput ratio moves at least {args.threshold:.0%} "
-            f"and every round agrees.")
-        noise = noise_line(rows)
-        if noise:
-            lines.append(noise)
-    else:
-        lines.append(
-            f"{label.capitalize()} `{args.head[:12]}`{head_note} only: the base wheel did not run, so there is no "
-            "same-runner A/B. Compared with the nightly instead, which also carries main's own changes and "
-            "runner-to-runner noise (flags below 0.80×).")
-    if failed_runs:
-        lines.append("")
-        lines.append("Runs that produced nothing: " +
-                     "; ".join(f"{r['side']} round {r['round']}: {r['error']}" for r in failed_runs) + ".")
-    for state, title in (("slower", "Slower"), ("faster", "Faster")):
-        line = flagged_line(rows, state, title)
-        if line:
-            lines += ["", line]
-    line = problems_line(rows)
-    if line:
-        lines += ["", line]
-    only = {state: [r for r in rows if r["state"] == state] for state in ("only-head", "only-base")}
-    if has_ab and (only["only-head"] or only["only-base"]):
-        lines += [
-            "", f"Cases on one side only (the case list changed): {len(only['only-head'])} new on head, "
-            f"{len(only['only-base'])} gone from head."
-        ]
-    if has_ab and groups:
-        lines += [
-            "", "| op | cases | geomean | worst | best | slower | faster | not compared |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|"
-        ]
-        for g in groups:
-            lines.append(f"| `{g['group']}` | {g['cases']} | {fmt_ratio(g['geomean'])} | {fmt_ratio(g['worst'])} | "
-                         f"{fmt_ratio(g['best'])} | {g['slower']} | {g['faster']} | {g['problems']} |")
-    side, runner_ratio = context
-    if baseline_date and runner_ratio is not None:
-        what = "base" if side == "base" else f"the {label} commit"
-        gap = ("That gap is the runner and the day, which the same-runner ratios above cancel; the vs nightly "
-               "column is for reference." if side == "base" else "")
-        lines += [
-            "", f"This runner measures {what} at {fmt_ratio(runner_ratio)} the nightly "
-            f"`{baseline_date}.{args.platform}.json` (median over cases{nightly_age(args.base_date, baseline_date)}). "
-            f"{gap}".rstrip()
-        ]
-    elif not baseline_date:
-        lines += ["", f"No nightly baseline for {args.platform} on the release."]
+def shorten(text, limit=300):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def kernel_table(rows, has_ab):
+    """The collapsed per-kernel table, slowest and broken first."""
     table = sorted((r for r in rows if r["state"] != "only-base"), key=lambda r:
                    (r["ratio"] is not None, r["ratio"] if r["ratio"] is not None else 0, r["key"]))
-    if table:
-        shown = table[:MAX_TABLE_ROWS]
-        lines += [
-            "", f"<details><summary>Per-case numbers ({len(table)}, slowest first)</summary>", "",
-            "| case | base µs | head µs | head/base | rounds | vs nightly |", "|---|---:|---:|---:|---:|---:|"
+    if not table:
+        return []
+    shown = table[:MAX_TABLE_ROWS]
+    if has_ab:
+        lines = [
+            f"<details><summary>All {len(table)} kernels, slowest first</summary>", "",
+            "| Kernel | Base | This PR | Change | Range over runs |", "|---|---:|---:|---|---|"
         ]
         for r in shown:
-            spread = f"{r['ratio_min']:.3f}–{r['ratio_max']:.3f}" if r["ratio"] is not None else r["state"]
-            lines.append(
-                f"| `{r['key']}` | {fmt_us(r['base_us'])} | {fmt_us(r['head_us'])} | {fmt_ratio(r['ratio'])} | "
-                f"{spread} | {fmt_ratio(r['nightly_ratio'])} |")
-        if len(table) > len(shown):
-            lines.append(f"\n{len(table) - len(shown)} more in the run's `results.json` artifact.")
-        lines += ["", f"Throughput ratio: above 1 means the {label} commit is faster.", "", "</details>"]
+            if r["ratio"] is None:
+                change, spread = f"{'❌ ' if r['state'] == 'head-error' else ''}{PROBLEMS.get(r['state'], r['state'])}", ""
+            else:
+                icon = {"slower": "⚠️ ", "faster": "✅ "}.get(r["state"], "")
+                change, spread = icon + change_text(r["ratio"]), range_text(r["ratio_min"], r["ratio_max"])
+            lines.append(f"| `{r['key']}` | {fmt_us(r['base_us'])} | {fmt_us(r['head_us'])} | {change} | {spread} |")
+    else:
+        lines = [
+            f"<details><summary>All {len(table)} kernels, slowest first</summary>", "",
+            "| Kernel | This PR | vs nightly |", "|---|---:|---|"
+        ]
+        for r in sorted(table, key=lambda r:
+                        (r["nightly_ratio"] is not None, r["nightly_ratio"] or 0, r["key"]))[:MAX_TABLE_ROWS]:
+            lines.append(f"| `{r['key']}` | {fmt_us(r['head_us'])} | {change_text(r['nightly_ratio'])} |")
+    if len(table) > len(shown):
+        lines.append(f"\n{len(table) - len(shown)} more in the run's `results.json` artifact.")
+    return lines + ["", "</details>"]
+
+
+def method_lines(args, results, rows, has_ab, baseline_date, context, merged):
+    """The collapsed 'how this was measured' notes."""
+    rounds = max([r["round"] for r in results.get("runs", [])] or [0])
+    gpu = env_line(results.get("env") or {}, results.get("device"))
+    lines = [f"- **GPU:** {gpu}." if gpu else "- **GPU:** not recorded."]
+    pr = f"this PR `{args.head[:12]}`"
+    if merged:
+        pr += f" (GitHub's merge of PR head `{args.pr_head[:12]}` into base)"
+    if has_ab:
+        lines += [
+            f"- **Compared:** base `{args.base[:12]}` and {pr}.",
+            f"- **Method:** each kernel ran {rounds} times on each side, back to back on one GPU, alternating which "
+            "side went first. *Change* is the median over the runs, in throughput: 10% slower means 10% less work "
+            f"per second. A kernel is flagged only when it changed by {args.threshold:.0%} or more and every run "
+            "agreed on the direction.",
+        ]
+        noise = noise_line(rows)
+        if noise:
+            lines.append(f"- {noise}")
+    else:
+        lines.append(f"- **Compared:** {pr} with the nightly benchmark, because the base build did not run. That "
+                     "also includes other changes on main and machine-to-machine noise, so only kernels below 80% of "
+                     "the nightly count.")
+    side, runner_ratio = context
+    if baseline_date and runner_ratio is not None:
+        what = "base" if side == "base" else "this PR"
+        gap = change_text(runner_ratio)
+        gap = "within 1% of" if gap == "no change" else f"{gap} than"
+        lines.append(f"- **Nightly reference:** this machine measured {what} {gap} the nightly "
+                     f"`{baseline_date}.{args.platform}.json` (median over kernels"
+                     f"{nightly_age(args.base_date, baseline_date)}).")
+    elif not baseline_date:
+        lines.append(f"- **Nightly reference:** none for {args.platform} on the release.")
+    failed_runs = [r for r in results.get("runs", []) if r.get("error")]
+    if failed_runs:
+        lines.append("- **Runs that produced nothing:** " +
+                     "; ".join(f"{r['side']} run {r['round']}: {r['error']}" for r in failed_runs) + ".")
+    only = {state: sum(r["state"] == state for r in rows) for state in ("only-head", "only-base")}
+    if has_ab and (only["only-head"] or only["only-base"]):
+        lines.append(f"- **Kernel list changed:** {only['only-head']} new on this PR, {only['only-base']} gone.")
+    if args.run_url:
+        lines.append(f"- [Workflow run]({args.run_url})")
+    return lines
+
+
+def render(args, results, rows, groups, verdict, has_ab, baseline_date, context):
+    icon, title = headline(rows, verdict, has_ab)
+    lines = [f"### {icon} {display_name(args.platform)}: {title}", ""]
+    merged = bool(args.pr_head) and args.pr_head != args.head
+    if not results.get("runs"):
+        status = f" (bench job: {args.bench_status})" if args.bench_status else ""
+        run = f" See the [workflow run]({args.run_url})." if args.run_url else ""
+        lines.append(f"The benchmark produced no results{status}, so there is nothing to compare.{run}")
+        return "\n".join(lines) + "\n"
+    if has_ab:
+        lines += findings(rows, args.threshold)
+        if groups:
+            lines += ["", "| Kernel family | Count | Result |", "|---|---:|---|"]
+            for g in groups:
+                members = [r for r in rows if r["group"] == g["group"] and r["state"] != "only-base"]
+                lines.append(f"| `{op_name(g['group'])}` | {len(members)} | {group_result(members)} |")
+    else:
+        low = sum(r["nightly_ratio"] is not None and r["nightly_ratio"] < 0.80 for r in rows)
+        line = f"{plural(low, 'kernel')} below 80% of the nightly." if low else "No kernel is below 80% of the nightly."
+        if low and verdict == "PASS":
+            line += " It takes two such kernels, or one below 60%, to flag this looser comparison."
+        lines.append(line)
+    lines += [""] + kernel_table(rows, has_ab)
+    lines += ["", "<details><summary>How this was measured</summary>", ""]
+    lines += method_lines(args, results, rows, has_ab, baseline_date, context, merged)
+    lines += ["", "</details>"]
     return "\n".join(lines) + "\n"
 
 

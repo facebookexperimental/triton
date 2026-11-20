@@ -95,7 +95,7 @@ jobs:
               NOTE="${NOTE:+${NOTE}, }${platform}"
             fi
           done
-          [[ -z "${NOTE}" ]] || NOTE="Skipped while its runners are paused (GPU_CI_SKIP_PLATFORMS): ${NOTE}."
+          [[ -z "${NOTE}" ]] || NOTE="Not run on ${NOTE}: its CI runners are paused (GPU_CI_SKIP_PLATFORMS)."
           {
             echo "head=${HEAD}"
             echo "pr_head=${PR_HEAD}"

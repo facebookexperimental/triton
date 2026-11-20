@@ -30,9 +30,10 @@ ORDER = ("b200", "h100", "mi350")
 SECTION = re.compile(
     r"<!-- tlx-ops-perf-smoke:(?P<platform>[a-z0-9]+) head=(?P<head>[0-9a-f]+) -->\n"
     r"(?P<body>.*?)\n<!-- /tlx-ops-perf-smoke:(?P=platform) -->", re.S)
-INTRO = ("Same-runner A/B of a small tlx.ops subset (`bench_mm`, `bench_flash_attn*`, `bench_norm`; "
-         "`--head 8 --fwd-only`): each GPU benches the PR's base and head back to back on one GPU and "
-         "updates its own section when it finishes. Advisory only. Full numbers stay on the nightly suite.")
+INTRO = ("Checks whether this PR makes tlx.ops kernels slower or breaks them: the first 8 shapes of matmul, "
+         "attention and norm, forward only. Each GPU times them for the PR's base and for the PR, on the same "
+         "machine, and fills in its own section below when it finishes. Advisory only: it never blocks the PR, "
+         "and the full benchmark stays in the nightly run.")
 
 
 def parse_sections(body):

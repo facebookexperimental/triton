@@ -87,12 +87,43 @@ def test_failures_collapse_per_op_and_message():
                   [[case(key=k, status="error", tflops=None, notes=[err])
                     for k in keys] + [case(status="error", tflops=None, notes=["wrong answer"])]] * 2)
     rows = ab.compare(res, 0.05)
-    assert ab.problems_line(rows) == (
-        f"**Not compared:** `flash_attn_mxfp8/sm100` 3 of 3 cases fail on head only: {err}; "
-        f"`{KEY}` fails on head only: wrong answer")
+    assert ab.findings(rows, 0.05) == [
+        f"- **flash_attn_mxfp8**: 3 of 3 kernels fail on this PR but run on base: `{err}`",
+        "- **mm**: 1 of 1 kernel fail on this PR but run on base: `wrong answer`",
+    ]
+    assert ab.headline(rows, ab.verdict_for(rows, True), True) == ("❌", "4 kernels fail on this PR")
     groups = {g["group"]: g for g in ab.summarize_groups(rows)}
     assert groups["flash_attn_mxfp8/sm100"]["problems"] == 3 and groups["flash_attn_mxfp8/sm100"]["cases"] == 0
-    assert len(ab.shorten("x" * 500)) == 200
+    assert len(ab.shorten("x" * 500)) == 300
+
+
+def test_changes_read_as_words():
+    assert [ab.change_text(r) for r in (0.81, 1.06, 0.997, None)] == ["19% slower", "6% faster", "no change", "-"]
+    # No "-0%": a spread that rounds to zero reads 0%, and an all-equal spread is one value.
+    assert ab.range_text(0.997, 1.004) == "0%"
+    assert ab.range_text(0.92, 1.08) == "−8% to +8%"
+    assert ab.range_words(0.92, 1.08) == "from 8% slower to 8% faster"
+    assert ab.within([0.99, 1.004]) == "within ±1%" and ab.within([0.97, 1.02]) == "within ±3%"
+
+
+def test_noisy_move_is_called_noise_not_a_change():
+    other = "flash_attn/sm90/bfloat16/4x48x1024x128xFalse"
+    res = results([[case(), case(key=other)]] * 3,
+                  [[case(tflops=92), case(key=other)], [case(tflops=108), case(key=other)],
+                   [case(tflops=94), case(key=other)]])
+    rows = ab.compare(res, 0.05)
+    assert ab.headline(rows, ab.verdict_for(rows, True), True) == ("✅", "no slowdowns found")
+    assert ab.findings(rows, 0.05) == [
+        f"All 2 kernels are within ±1% of base, except `{KEY}` (6% slower, but its runs ranged from 8% slower to "
+        "8% faster, so that is noise)."
+    ]
+
+
+def test_faster_only_still_passes():
+    res = results([[case()]] * 3, [[case(tflops=110)], [case(tflops=109)], [case(tflops=111)]])
+    rows = ab.compare(res, 0.05)
+    assert ab.headline(rows, ab.verdict_for(rows, True), True) == ("✅", "no slowdowns, 1 kernel faster")
+    assert ab.group_result(rows) == "✅ 1 faster, by 10%"
 
 
 def test_nightly_age():
@@ -179,16 +210,21 @@ def test_report_end_to_end(tmp_path):
     write_nightly(tmp_path, "20261116", "h100", 100.0)
     ab.report(report_args(tmp_path))
     md = (tmp_path / "section.md").read_text()
-    assert md.startswith("### h100: INVESTIGATE\n")
-    assert ("`NVIDIA H100 80GB HBM3`, driver 580.82.07, CUDA 13.0, torch 2.14.0+cu130, clock locked at 1980 MHz. "
-            "[run](https://run).") in md
-    assert "Base `aaaaaaaaaaaa` vs merge `bbbbbbbbbbbb` (PR head `cccccccccccc`), 3 rounds" in md
-    assert f"Round-to-round spread on this GPU: median 2.2% across 1 case, widest 2.2% (`{KEY}`)." in md
-    assert f"**Slower (1):** `{KEY}` 0.900× (rounds 0.890–0.910)" in md
-    assert "| `mm/sm90` | 1 | 0.900× | 0.900× | 0.900× | 1 | 0 | 0 |" in md
+    # The verdict and what moved come first, in words; numbers and setup follow, collapsed.
+    assert md.startswith("### ⚠️ H100: 1 kernel slower\n\n"
+                         f"- **mm**: 1 of 1 kernel slower, by 10% (`{KEY}`). Every run agreed.\n")
+    assert "| `mm` | 1 | ⚠️ 1 slower, by 10% |" in md
+    assert f"| `{KEY}` | 20.0 µs | 22.2 µs | ⚠️ 10% slower | −11% to −9% |" in md
+    assert md.index("<details><summary>All 1 kernels") < md.index("<details><summary>How this was measured")
+    assert ("- **GPU:** NVIDIA H100 80GB HBM3, driver 580.82.07, CUDA 13.0, torch 2.14.0+cu130, clock locked at "
+            "1980 MHz.") in md
+    assert ("- **Compared:** base `aaaaaaaaaaaa` and this PR `bbbbbbbbbbbb` (GitHub's merge of PR head "
+            "`cccccccccccc` into base).") in md
+    assert "each kernel ran 3 times on each side" in md and "changed by 5% or more" in md
+    assert f"typically differ by 2.2%; the most was 2% (`{KEY}`)." in md
     # Base is what the nightly measured, so it carries the runner context; head moved by the PR would not.
-    assert "This runner measures base at 1.000× the nightly `20261116.h100.json` (median over cases)." in md
-    assert f"| `{KEY}` | 20.0 | 22.2 | 0.900× | 0.890–0.910 | 0.900× |" in md
+    assert "this machine measured base within 1% of the nightly `20261116.h100.json` (median over kernels)." in md
+    assert "- [Workflow run](https://run)" in md
     verdict = json.loads((tmp_path / "verdict.json").read_text())
     assert verdict["verdict"] == "INVESTIGATE" and verdict["same_runner"] is True
 
@@ -197,16 +233,17 @@ def test_flagged_cases_collapse_per_op():
     keys = [f"flash_attn_varlen/sm90/bfloat16/case{i}" for i in range(3)]
     res = results([[case(key=k) for k in keys + [KEY]]] * 3,
                   [[case(key=k, tflops=75 + i) for i, k in enumerate(keys)] + [case(tflops=80)]] * 3)
-    line = ab.flagged_line(ab.compare(res, 0.05), "slower", "Slower")
-    assert line == ("**Slower (4):** `flash_attn_varlen/sm90` 3 of 3 cases, 0.750× to 0.770×; "
-                    f"`{KEY}` 0.800× (rounds 0.800–0.800)")
+    assert ab.findings(ab.compare(res, 0.05), 0.05) == [
+        "- **flash_attn_varlen**: 3 of 3 kernels slower, by 23–25%. Every run agreed.",
+        f"- **mm**: 1 of 1 kernel slower, by 20% (`{KEY}`). Every run agreed.",
+    ]
 
 
 def test_report_without_results_says_no_signal(tmp_path):
     ab.report(report_args(tmp_path, bench_status="failure"))
     md = (tmp_path / "section.md").read_text()
-    assert md.startswith("### h100: NO SIGNAL\n")
-    assert "(bench job: failure)" in md
+    assert md.startswith("### ⚪ H100: no result\n")
+    assert "The benchmark produced no results (bench job: failure), so there is nothing to compare." in md
 
 
 def test_report_head_only(tmp_path):
@@ -215,13 +252,15 @@ def test_report_head_only(tmp_path):
     write_nightly(tmp_path, "20261116", "h100", 100.0)
     ab.report(report_args(tmp_path))
     md = (tmp_path / "section.md").read_text()
-    assert "the base wheel did not run, so there is no same-runner A/B" in md
-    assert "| head/base |" in md and "0.710×" in md
-    assert "This runner measures the merge commit at 0.710× the nightly" in md
+    assert md.startswith("### ✅ H100: no large slowdowns vs the nightly (no base to compare)\n")
+    assert "1 kernel below 80% of the nightly. It takes two such kernels" in md
+    assert "| Kernel | This PR | vs nightly |" in md and "29% slower" in md
+    assert "because the base build did not run" in md
+    assert "this machine measured this PR 29% slower than the nightly" in md
     # A manual run benches the PR head itself, so the section must not call it a merge commit.
     ab.report(report_args(tmp_path, pr_head="b" * 40))
     md = (tmp_path / "section.md").read_text()
-    assert "Head `bbbbbbbbbbbb` only:" in md and "merge" not in md
+    assert "this PR `bbbbbbbbbbbb` with the nightly" in md and "merge" not in md
 
 
 def test_sanitize_drops_host_identity(tmp_path):
@@ -248,7 +287,7 @@ def test_sanitize_drops_host_identity(tmp_path):
 
 def test_env_line_reports_rocm_and_unlocked_clocks():
     env = {"gpu": "AMD Instinct MI350X", "torch": "2.14.0+rocm7.2", "cuda": None, "governed": ["NUMA node 1 (64 CPUs)"]}
-    assert ab.env_line(env) == "`AMD Instinct MI350X`, ROCm 7.2, torch 2.14.0+rocm7.2, clock not locked (noisier)"
+    assert ab.env_line(env) == "AMD Instinct MI350X, ROCm 7.2, torch 2.14.0+rocm7.2, clock not locked (noisier)"
     assert ab.env_line({**env, "governed": ["perf determinism 1900 MHz"]}).endswith("clock locked at 1900 MHz")
     assert "clock" not in ab.env_line({**env, "governed": None})
 
@@ -257,10 +296,10 @@ def test_env_line_takes_the_amd_gpu_from_the_device():
     # The harness records no GPU name or driver on AMD; the bench's own device lookup fills them in.
     env = {"gpu": None, "driver": None, "torch": "2.14.0+rocm7.2", "cuda": None, "governed": ["NUMA node 0 (128 CPUs)"]}
     device = {"index": 4, "name": "MI350X", "vendor": "amd", "arch": "gfx950", "driver": "6.14.14"}
-    assert ab.env_line(env, device) == ("`AMD MI350X (gfx950)`, driver 6.14.14, ROCm 7.2, torch 2.14.0+rocm7.2, "
+    assert ab.env_line(env, device) == ("AMD MI350X (gfx950), driver 6.14.14, ROCm 7.2, torch 2.14.0+rocm7.2, "
                                         "clock not locked (noisier)")
     nvidia = {"gpu": "NVIDIA H100 80GB HBM3", "driver": "580.82.07", "cuda": "13.0", "torch": "2.14.0+cu130"}
-    assert ab.env_line(nvidia, {"name": "NVIDIA H100", "vendor": "nvidia"}).startswith("`NVIDIA H100 80GB HBM3`")
+    assert ab.env_line(nvidia, {"name": "NVIDIA H100", "vendor": "nvidia"}).startswith("NVIDIA H100 80GB HBM3,")
 
 
 def test_describe_gpu_parses_the_harness_pick(monkeypatch):
