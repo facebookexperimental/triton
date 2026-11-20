@@ -431,13 +431,13 @@ def test_addmm_k282_register_plan_matches_rotating_winner():
     from triton.tlx.ops.kernels.addmm import gfx950 as addmm_gfx950
 
     plan = addmm_gfx950._mm._FP16_TRANSPOSED_REGISTER_PLANS[(256, 282, 282)]
-    assert (plan["BLOCK_M"], plan["BLOCK_N"], plan["BLOCK_K"]) == (32, 16, 128)
-    assert plan["GROUP_M"] == 1
+    assert (plan["BLOCK_M"], plan["BLOCK_N"], plan["BLOCK_K"]) == (32, 32, 128)
+    assert plan["GROUP_M"] == 8
     assert plan["NUM_XCDS"] == 1
     assert plan["num_warps"] == 4
     assert plan["num_stages"] == 3
-    assert plan["waves_per_eu"] == 2
-    assert plan["llvm_fn_attrs"] == (("amdgpu-sched-strategy", "iterative-maxocc"), )
+    assert plan["waves_per_eu"] == 0
+    assert "llvm_fn_attrs" not in plan
 
 
 def test_addmm_k359_vector_bias_uses_four_wave_winner(monkeypatch):
