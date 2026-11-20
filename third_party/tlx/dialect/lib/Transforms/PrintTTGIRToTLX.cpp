@@ -2118,6 +2118,16 @@ void printSimplifiedOp(
         if (info.singleBuffer)
           os << ", 0)";
         printLocComment(op, os);
+        // An initialized allocation (Triton's TMA-store staging buffer) has no
+        // TLX spelling; it is an allocation followed by a store into it.
+        if (op->getNumOperands() == 1 && op->getNumResults() == 1) {
+          for (unsigned i = 0; i < indent; ++i)
+            os << "  ";
+          os << "tlx.local_store("
+             << getValueName(op->getResult(0), argSubstitutionMap) << ", "
+             << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+          printLocComment(op, os);
+        }
         return;
       }
     }
@@ -3698,10 +3708,13 @@ void printBlock(Block &block, llvm::raw_ostream &os,
             // Strip trailing newline and print as comment
             while (!line.empty() && (line.back() == '\n' || line.back() == ' '))
               line.pop_back();
-            if (!line.empty()) {
+            // An op may print more than one line; comment out each.
+            SmallVector<StringRef> lines;
+            StringRef(line).split(lines, '\n', -1, /*KeepEmpty=*/false);
+            for (StringRef l : lines) {
               for (unsigned i = 0; i < indent; ++i)
                 os << "  ";
-              os << "  # " << line << "\n";
+              os << "  # " << l << "\n";
             }
           }
         }
@@ -3876,10 +3889,13 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
             lineOs.flush();
             while (!line.empty() && (line.back() == '\n' || line.back() == ' '))
               line.pop_back();
-            if (!line.empty()) {
+            // An op may print more than one line; comment out each.
+            SmallVector<StringRef> lines;
+            StringRef(line).split(lines, '\n', -1, /*KeepEmpty=*/false);
+            for (StringRef l : lines) {
               for (unsigned i = 0; i < indent; ++i)
                 os << "  ";
-              os << "  # " << line << "\n";
+              os << "  # " << l << "\n";
             }
           }
         }
