@@ -100,6 +100,33 @@ def test_flash_attn_varlen_mxfp8_prequantized():
     torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
 
 
+@pytest.mark.parametrize("lens_k,fast", [([384, 640], False), ([4096, 5000], True)])
+def test_flash_attn_varlen_mxfp8_default_fast_exp(lens_k, fast):
+    """Without fast_exp, sequences averaging 4096 keys or more get the approximate exponential."""
+    from triton.tlx.ops import flash_attn_varlen_mxfp8
+    from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
+
+    torch.manual_seed(20)
+    lens_q = [320, 512]
+    q = torch.randn(sum(lens_q), 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(lens_k), 4, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    cu_q, cu_k = _cu(lens_q), _cu(lens_k)
+    scale = 128**-0.5
+
+    kv_state = gfx950.prepare_kv(k, v, cu_k)
+    out, lse, _ = gfx950.forward(q, k, v, cu_q, cu_k, scale, kv_state=kv_state)
+    for explicit in (False, True):
+        out_e, lse_e, _ = gfx950.forward(q, k, v, cu_q, cu_k, scale, fast_exp=explicit, kv_state=kv_state)
+        assert torch.equal(lse, lse_e) == (explicit == fast)
+        assert torch.equal(out, out_e) == (explicit == fast)
+    torch.testing.assert_close(flash_attn_varlen_mxfp8(q, k, v, cu_q, cu_k, max(lens_q), max(lens_k)), out, atol=0,
+                               rtol=0)
+    ref, ref_lse = _reference(q, k, v, cu_q, cu_k, scale)
+    torch.testing.assert_close(out.float(), ref, atol=0.08, rtol=0.08)
+    torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
+
+
 def test_flash_attn_varlen_mxfp8_rejects_invalid_inputs():
     from triton.tlx.ops import InvalidInput, flash_attn_varlen_mxfp8
 

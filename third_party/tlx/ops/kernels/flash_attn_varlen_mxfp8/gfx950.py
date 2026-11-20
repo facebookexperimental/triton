@@ -30,6 +30,10 @@ from . import mxfp8_attention_core_gfx950 as core
 _HEADS = 4
 _HEAD_DIM = 128
 _BLOCK_M = 128
+# Sequences averaging at least this many keys are long: the kernel then reads
+# each work item's metadata again instead of carrying it over from the prefetch,
+# and the approximate exponential is the default.
+_LONG_KV = 4096
 _PAD = 256
 _PREP_ROWS = 64
 _LOG2E = 1.4426950408889634
@@ -1043,11 +1047,13 @@ def forward_prequantized(
     sm_scale,
     *,
     total_kv,
-    fast_exp=False,
+    fast_exp=None,
     num_ctas=None,
     work_schedule=None,
 ):
-    """Return output and natural-log LSE from prepared MXFP8 inputs."""
+    """Return output and natural-log LSE from prepared MXFP8 inputs.
+
+    ``fast_exp`` is as in ``forward``."""
     if (q8.ndim != 3 or q8.shape[1:] != (_HEADS, _HEAD_DIM) or q8.dtype != torch.float8_e4m3fn
             or not q8.is_contiguous()):
         raise ValueError("Requires contiguous E4M3 [tokens, 4, 128] Q")
@@ -1120,14 +1126,16 @@ def forward(
     cu_seqlens_k,
     sm_scale,
     *,
-    fast_exp=False,
+    fast_exp=None,
     kv_state=None,
     num_ctas=None,
     work_schedule=None,
 ):
     """Return (out, lse, kv_state); lse is natural-log FP32 [4, total_q].
 
-    Query tiles have 128 rows on four warps. Sequences with no keys get zero
+    Query tiles have 128 rows on four warps. ``fast_exp`` selects the
+    approximate exponential; left as None, it is used when the sequences
+    average at least 4096 keys. Sequences with no keys get zero
     output rows and -inf LSE. The sequence-offset tensors must not be
     modified in place while their prepared metadata and work schedule are
     reused."""
@@ -1174,7 +1182,7 @@ def flash_attn_varlen_mxfp8(
     max_seqlen_k,
     sm_scale,
     *,
-    fast_exp=False,
+    fast_exp=None,
 ):
     del max_seqlen_k
     del max_seqlen_q
@@ -1209,6 +1217,9 @@ def _launch_extended_forward(
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     lse = torch.empty((_HEADS, q.shape[0]), dtype=torch.float32, device=q.device)
     grid = work_schedule.num_ctas
+    long_kv = work_schedule.total_kv >= _LONG_KV * batch
+    if fast_exp is None:
+        fast_exp = long_kv
     kernel = cast(Any, _mxfp8_varlen_extended_kernel_4)
     use_work_order = (work_schedule.item_count is not None
                       and work_schedule.item_count == work_schedule.item_order.numel()
@@ -1236,7 +1247,7 @@ def _launch_extended_forward(
         BLOCK_M=_BLOCK_M,
         FAST_EXP=fast_exp,
         PREQUANTIZED_Q=prequantized,
-        REUSE_METADATA=work_schedule.total_kv < 4096 * batch,
+        REUSE_METADATA=not long_kv,
         USE_WORK_ORDER=use_work_order,
         **_LAUNCH_OPTIONS,
     )

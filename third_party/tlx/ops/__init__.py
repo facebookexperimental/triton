@@ -1463,14 +1463,15 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
 
 
 def flash_attn_varlen_mxfp8(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None,
-                            causal=False, *, fast_exp=False, space=None):
+                            causal=False, *, fast_exp=None, space=None):
     """Forward-only packed MXFP8 attention using the gfx950 4-wave kernel.
 
     Q/K/V are contiguous BF16 ``(tokens, 4, 128)`` tensors with one sequence
     per pair of int32 cumulative-length arrays. This op is noncausal and
     requires MHA with exactly four heads. ``max_seqlen_q`` and ``max_seqlen_k``
     are accepted for API parity. ``sm_scale`` defaults to ``128**-0.5`` and
-    ``fast_exp`` enables the approximate exponentiation path. The cumulative
+    ``fast_exp`` selects the approximate exponentiation path; by default it is
+    used when the sequences average at least 4096 keys. The cumulative
     sequence-offset tensors must not be modified in place while reused.
     """
     import torch
