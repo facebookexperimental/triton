@@ -798,7 +798,12 @@ def _p_matmul(
                         tl.static_assert(NBITS % NDIMS == 0, "Permutation requires equally sized dimensions")
                         CHUNK_SIZE: tl.constexpr = 1 << (NBITS // NDIMS)
                         out_view = out_view.reshape((CHUNK_SIZE,) * NDIMS).permute(MAXABS_PERMUTE_SEQUENCE)
-                    out_view = tl.reshape(out_view, [out.numel // THREADS_PER_BLOCK, THREADS_PER_BLOCK])
+                        out_view = tl.reshape(out_view, [out.numel // THREADS_PER_BLOCK, THREADS_PER_BLOCK])
+                    else:
+                        # No explicit permutation requested: keep the historical
+                        # reorder-freedom so the absmax reshape stays layout-free
+                        # and needs no shared-memory scratch (regression fix).
+                        out_view = tl.reshape(out_view, [out.numel // THREADS_PER_BLOCK, THREADS_PER_BLOCK], can_reorder=True)
                     local_absmax = tl.maximum(local_absmax, nan_propagating_absmax_reduce(out_view, axis=0))
 
                 if PER_BATCH_OUT_SCALE:
