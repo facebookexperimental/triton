@@ -24,12 +24,14 @@ _SOURCE_LOCATION = re.compile(r";\s*(?P<file>.+?):(?P<line>\d+):(?P<column>\d+)\
 _FORMAT_WIDTH = re.compile(r"_format_(?P<d16>d16(?:_hi)?_)?(?P<channels>x|xy|xyz|xyzw)$")
 _TTGIR_BLOCKED_LAYOUT = re.compile(r"^(?P<name>#\w+) = #ttg\.blocked<\{sizePerThread = \[(?P<sizes>[\d, ]+)\].*"
                                    r"order = \[(?P<order>[\d, ]+)\]")
-_TTGIR_LINEAR_LAYOUT = re.compile(r"^(?P<name>#\w+) = #ttg\.linear<\{register = \[(?P<bases>.*?)\], lane = ")
+_TTGIR_LINEAR_LAYOUT = re.compile(r"^(?P<name>#\w+) = #ttg\.linear<\{register = \[(?P<bases>.*?)\], "
+                                  r"lane = \[(?P<lane_bases>.*?)\], warp = ")
 _TTGIR_LOCATION = re.compile(r'^\s*(?P<name>#loc\d+) = loc\("(?P<file>[^"]+)":(?P<line>\d+):(?P<column>\d+)\)')
 _TTGIR_CALLSITE_LOCATION = re.compile(
     r"^\s*(?P<name>#loc\d+) = loc\(callsite\((?P<callee>#loc\d+) at (?P<caller>#loc\d+)\)\)")
 _TTGIR_POINTER_LAYOUT = re.compile(r": !tt\.ptr<(?P<dtype>[^>]+)>\[tensor<.*?,\s*(?P<layout>#\w+)>\]")
-_TTGIR_BUFFER_LOAD_RESULT = re.compile(r": !tt\.ptr<(?P<dtype>[^>]+)>\s*->\s*tensor<[^,>]+,\s*(?P<layout>#\w+)>")
+_TTGIR_BUFFER_LOAD_RESULT = re.compile(
+    r": !tt\.ptr<(?P<dtype>[^>]+)>\s*->\s*tensor<(?P<tensor>[^,>]+),\s*(?P<layout>#\w+)>")
 _TTGIR_BUFFER_STORE_RESULT = re.compile(
     r"amdg\.buffer_store\b.*?: !tt\.ptr<(?P<dtype>[^>]+)>\s*->\s*tensor<[^,>]+,\s*(?P<layout>#\w+)>")
 _TTGIR_OPERATION_LOCATION = re.compile(r"loc\((?P<location>#loc\d+)\)\s*$")
@@ -348,6 +350,22 @@ def _linear_layout_contiguity_by_dimension(bases: list[list[int]]) -> list[int]:
     return result
 
 
+def _linear_layout_owned_extent_by_dimension(bases: list[list[int]]) -> list[int]:
+    rank = len(bases[0]) if bases else 0
+    result = []
+    for dimension in range(rank):
+        values = {
+            basis[dimension]
+            for basis in bases
+            if basis[dimension] and not any(value for index, value in enumerate(basis) if index != dimension)
+        }
+        extent = 1
+        while extent in values:
+            extent *= 2
+        result.append(extent)
+    return result
+
+
 def _ttgir_layout_info(lines: list[str]) -> dict[str, dict[str, Any]]:
     layouts = {}
     for line in lines:
@@ -365,11 +383,17 @@ def _ttgir_layout_info(lines: list[str]) -> dict[str, dict[str, Any]]:
         linear = _TTGIR_LINEAR_LAYOUT.match(line)
         if linear:
             bases = ast.literal_eval(f"[{linear.group('bases')}]")
+            lane_bases = ast.literal_eval(f"[{linear.group('lane_bases')}]")
             by_dimension = _linear_layout_contiguity_by_dimension(bases)
+            lane_by_dimension = _linear_layout_contiguity_by_dimension(lane_bases)
             layouts[linear.group("name")] = {
                 "kind": "linear",
                 "contiguous_elements_per_lane": max(by_dimension, default=1),
                 "last_dimension_contiguous_elements_per_lane": (by_dimension[-1] if by_dimension else 1),
+                "register_contiguity_by_dimension": by_dimension,
+                "lane_contiguity_by_dimension": lane_by_dimension,
+                "register_owned_extent_by_dimension": _linear_layout_owned_extent_by_dimension(bases),
+                "lane_owned_extent_by_dimension": _linear_layout_owned_extent_by_dimension(lane_bases),
             }
     return layouts
 
@@ -462,6 +486,48 @@ def _ttgir_explicit_contiguity_caps(ttgir: str) -> list[dict[str, Any]]:
             candidates[key]["static_occurrences"] += 1
         else:
             candidates[key] = candidate
+    return list(candidates.values())
+
+
+def _ttgir_packed_byte_load_candidates(ttgir: str) -> list[dict[str, Any]]:
+    lines = ttgir.splitlines()
+    layouts = _ttgir_layout_info(lines)
+    locations = _ttgir_source_locations(lines)
+    candidates: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for line_number, line in enumerate(lines, start=1):
+        if "amdg.buffer_load" not in line or "amdg.buffer_load_to_local" in line:
+            continue
+        result = _TTGIR_BUFFER_LOAD_RESULT.search(line)
+        location = _TTGIR_OPERATION_LOCATION.search(line)
+        if not result or result.group("dtype") not in ("i8", "ui8"):
+            continue
+        layout = layouts.get(result.group("layout"))
+        if not layout or layout["kind"] != "linear":
+            continue
+        tensor_shape = result.group("tensor").rsplit("x", 1)[0]
+        dimensions = [int(value) for value in tensor_shape.split("x")]
+        register_owned = layout["register_owned_extent_by_dimension"]
+        lane_owned = layout["lane_owned_extent_by_dimension"]
+        if (not dimensions or dimensions[-1] != 4 or not register_owned or not lane_owned or register_owned[-1] != 1
+                or lane_owned[-1] < 4):
+            continue
+        source_location = locations.get(location.group("location")) if location else None
+        key = (source_location, result.group("layout"))
+        if key in candidates:
+            candidates[key]["static_occurrences"] += 1
+            continue
+        candidates[key] = {
+            "line": line_number,
+            "source_location": source_location,
+            "dtype": result.group("dtype"),
+            "layout": result.group("layout"),
+            "logical_shape": dimensions,
+            "bytes_per_word": 4,
+            "static_occurrences": 1,
+            "classification": "cross_lane_packed_byte_word",
+            "confidence": "needs_word_alignment_and_performance_proof",
+            "unproven_requirements": ["word_alignment", "consecutive_addresses", "lane_redistribution_cost"],
+        }
     return list(candidates.values())
 
 
@@ -566,6 +632,22 @@ def _add_ttgir_evidence(report: dict[str, Any], ttgir: str) -> None:
                                                          for candidate in contiguity_caps)
     report["explicit_contiguity_already_wide_count"] = (report["explicit_contiguity_cap_count"] -
                                                         report["explicit_contiguity_unresolved_count"])
+    packed_byte_candidates = _ttgir_packed_byte_load_candidates(ttgir)
+    for candidate in packed_byte_candidates:
+        source_opcodes = report["source_opcode_counts"].get(candidate["source_location"], {})
+        isa_corroboration_scope = "source_location"
+        if not source_opcodes:
+            source_opcodes = report["opcode_counts"]
+            isa_corroboration_scope = "kernel"
+        candidate["scalar_byte_load_instruction_count"] = sum(
+            count for opcode, count in source_opcodes.items()
+            if "_load_" in opcode and _memory_width_bytes(opcode) == 1)
+        candidate["isa_corroboration_scope"] = isa_corroboration_scope
+        candidate["corroborated_by_scalar_byte_isa"] = candidate["scalar_byte_load_instruction_count"] > 0
+    report["packed_byte_load_candidates"] = packed_byte_candidates
+    report["packed_byte_load_candidate_count"] = len(packed_byte_candidates)
+    report["packed_byte_load_unresolved_count"] = sum(candidate["corroborated_by_scalar_byte_isa"]
+                                                      for candidate in packed_byte_candidates)
     store_candidates = _ttgir_store_width_candidates(ttgir)
     for candidate in store_candidates:
         candidate_bytes = candidate["candidate_bytes_per_lane"]
@@ -598,7 +680,8 @@ def _add_ttgir_evidence(report: dict[str, Any], ttgir: str) -> None:
     report["direct_to_lds_ir_lane_saturated_count"] = saturated
     report["direct_to_lds_unresolved_count"] = report["direct_to_lds_opportunity_count"] - saturated
     report["potential_widening_count"] = (report["merge_opportunity_count"] + report["direct_to_lds_unresolved_count"] +
-                                          report["explicit_contiguity_unresolved_count"])
+                                          report["explicit_contiguity_unresolved_count"] +
+                                          report["packed_byte_load_unresolved_count"])
 
 
 def analyze_amdgcn_memory_width(assembly: str) -> dict[str, Any]:
@@ -675,6 +758,9 @@ def analyze_amdgcn_memory_width(assembly: str) -> dict[str, Any]:
         "explicit_contiguity_unresolved_count": 0,
         "explicit_contiguity_already_wide_count": 0,
         "explicit_contiguity_caps": [],
+        "packed_byte_load_candidate_count": 0,
+        "packed_byte_load_unresolved_count": 0,
+        "packed_byte_load_candidates": [],
         "store_width_candidate_count": 0,
         "store_width_unresolved_count": 0,
         "store_layout_conversion_count": 0,
@@ -713,6 +799,8 @@ def _new_corpus_summary() -> dict[str, Any]:
         "explicit_contiguity_hot_loop_cap_count": 0,
         "explicit_contiguity_unresolved_count": 0,
         "explicit_contiguity_already_wide_count": 0,
+        "packed_byte_load_candidate_count": 0,
+        "packed_byte_load_unresolved_count": 0,
         "store_width_candidate_count": 0,
         "store_width_unresolved_count": 0,
         "store_layout_conversion_count": 0,
@@ -743,6 +831,8 @@ def _add_kernel_to_summary(summary: dict[str, Any], report: dict[str, Any]) -> N
             "explicit_contiguity_hot_loop_cap_count",
             "explicit_contiguity_unresolved_count",
             "explicit_contiguity_already_wide_count",
+            "packed_byte_load_candidate_count",
+            "packed_byte_load_unresolved_count",
             "store_width_candidate_count",
             "store_width_unresolved_count",
             "store_layout_conversion_count",
@@ -840,6 +930,14 @@ def analyze_dump_directory(directory: pathlib.Path, index_path: pathlib.Path | N
         ),
         reverse=True,
     )
+    packed_byte_ranked = sorted(
+        (kernel for kernel in kernels if kernel["report"]["packed_byte_load_unresolved_count"] > 0),
+        key=lambda item: (
+            item["report"]["packed_byte_load_unresolved_count"],
+            item["report"]["hot_loop_excess_issue_count"],
+        ),
+        reverse=True,
+    )
     store_width_ranked = sorted(
         (kernel for kernel in kernels if kernel["report"]["store_width_unresolved_count"] > 0),
         key=lambda item: (
@@ -856,6 +954,7 @@ def analyze_dump_directory(directory: pathlib.Path, index_path: pathlib.Path | N
         "top_potential_widening": ranked,
         "top_hot_loop_layout_headroom": hot_loop_ranked,
         "top_explicit_contiguity_caps": contiguity_cap_ranked,
+        "top_packed_byte_load_candidates": packed_byte_ranked,
         "top_store_width_candidates": store_width_ranked,
     }
 
@@ -900,6 +999,8 @@ def _format_report(report: dict[str, Any]) -> str:
         f"  explicit contiguity caps: {report['explicit_contiguity_cap_count']}",
         f"  explicit contiguity caps with narrow ISA: {report['explicit_contiguity_unresolved_count']}",
         f"  explicit contiguity caps already widened by codegen: {report['explicit_contiguity_already_wide_count']}",
+        f"  packed-byte load candidates: {report['packed_byte_load_candidate_count']}",
+        f"  packed-byte candidates with scalar-byte ISA: {report['packed_byte_load_unresolved_count']}",
         f"  store-width candidates: {report['store_width_candidate_count']}",
         f"  store-width candidates with narrow ISA: {report['store_width_unresolved_count']}",
         f"  stores requiring output layout conversion: {report['store_layout_conversion_count']}",
@@ -950,6 +1051,8 @@ def _format_corpus_report(corpus: dict[str, Any], top: int) -> str:
         f"  explicit contiguity cap occurrences: {overall['explicit_contiguity_cap_static_occurrences']}",
         f"  explicit contiguity caps with narrow ISA: {overall['explicit_contiguity_unresolved_count']}",
         f"  explicit contiguity caps already widened by codegen: {overall['explicit_contiguity_already_wide_count']}",
+        f"  packed-byte load candidates: {overall['packed_byte_load_candidate_count']}",
+        f"  packed-byte candidates with scalar-byte ISA: {overall['packed_byte_load_unresolved_count']}",
         f"  store-width candidates: {overall['store_width_candidate_count']}",
         f"  store-width unresolved: {overall['store_width_unresolved_count']}",
         f"  store layout conversions: {overall['store_layout_conversion_count']}",
@@ -966,6 +1069,7 @@ def _format_corpus_report(corpus: dict[str, Any], top: int) -> str:
                      f"unresolved={summary['direct_to_lds_unresolved_count']} "
                      f"contiguity_caps={summary['explicit_contiguity_cap_count']} "
                      f"contiguity_unresolved={summary['explicit_contiguity_unresolved_count']} "
+                     f"packed_byte_unresolved={summary['packed_byte_load_unresolved_count']} "
                      f"store_unresolved={summary['store_width_unresolved_count']} "
                      f"hot_loop_candidates={summary['hot_loop_layout_candidate_count']}")
     lines.append("  top unresolved widening kernels:")

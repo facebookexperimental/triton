@@ -1343,8 +1343,20 @@ def _gemm_interwave(A, B, C, WORKSPACE, LOCKS, SA, SB, M: tl.constexpr, N: tl.co
 
 
 @triton.jit
+def _unpack_e8m0_scale_word(words):
+    halves = tl.join(words.to(tl.uint16), (words >> 16).to(tl.uint16))
+    return tl.reshape(tl.join(halves.to(tl.uint8), (halves >> 8).to(tl.uint8)), (words.shape[0], 4))
+
+
+def _pack_scale_words(k, a_scale, b_scale):
+    # The measured odd K-tile pipeline regressed; uint32 scale loads also require naturally aligned bases.
+    return k % 256 == 0 and a_scale.data_ptr() % 4 == 0 and b_scale.data_ptr() % 4 == 0
+
+
+@triton.jit
 def _gemm_generic(A, B, C, SA, SB, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, BM: tl.constexpr,
-                  BN: tl.constexpr, BK: tl.constexpr, GROUP_M: tl.constexpr, CUBLAS_BLOCKED: tl.constexpr):
+                  BN: tl.constexpr, BK: tl.constexpr, GROUP_M: tl.constexpr, CUBLAS_BLOCKED: tl.constexpr,
+                  PACK_SCALE_WORDS: tl.constexpr):
     """Compute complete 128-aligned tiles; the backend rejects partial dimensions."""
     pid = tl.program_id(0)
     gn: tl.constexpr = N // BN
@@ -1355,31 +1367,49 @@ def _gemm_generic(A, B, C, SA, SB, M: tl.constexpr, N: tl.constexpr, K: tl.const
     ar = pm * BM + tl.arange(0, BM)
     br = pn * BN + tl.arange(0, BN)
     kk = tl.arange(0, BK)
-    sg = tl.arange(0, BK // 32)
     a_off = ar[:, None] * K + kk[None, :]
     b_off = kk[:, None] + br[None, :] * K
-    if CUBLAS_BLOCKED:
-        sa_off = (ar[:, None] // 128) * (K // 128) * 512 + (ar[:, None] % 32) * 16
-        sa_off += (ar[:, None] % 128 // 32) * 4 + sg[None, :]
-        sb_off = (br[:, None] // 128) * (K // 128) * 512 + (br[:, None] % 32) * 16
-        sb_off += (br[:, None] % 128 // 32) * 4 + sg[None, :]
-        scale_step: tl.constexpr = 512
+    if PACK_SCALE_WORDS:
+        if CUBLAS_BLOCKED:
+            sa_word_off = (ar // 128) * (K // 128) * 128 + (ar % 32) * 4 + ar % 128 // 32
+            sb_word_off = (br // 128) * (K // 128) * 128 + (br % 32) * 4 + br % 128 // 32
+            scale_step: tl.constexpr = 512
+        else:
+            sa_word_off = ar * (K // 128)
+            sb_word_off = br * (K // 128)
+            scale_step: tl.constexpr = BK // 32
+        scale_word_step: tl.constexpr = scale_step // 4
+        sa_words = SA.to(tl.pointer_type(tl.uint32))
+        sb_words = SB.to(tl.pointer_type(tl.uint32))
     else:
-        sa_off = ar[:, None] * (K // 32) + sg[None, :]
-        sb_off = br[:, None] * (K // 32) + sg[None, :]
-        scale_step: tl.constexpr = BK // 32
+        sg = tl.arange(0, BK // 32)
+        if CUBLAS_BLOCKED:
+            sa_off = (ar[:, None] // 128) * (K // 128) * 512 + (ar[:, None] % 32) * 16
+            sa_off += (ar[:, None] % 128 // 32) * 4 + sg[None, :]
+            sb_off = (br[:, None] // 128) * (K // 128) * 512 + (br[:, None] % 32) * 16
+            sb_off += (br[:, None] % 128 // 32) * 4 + sg[None, :]
+            scale_step: tl.constexpr = 512
+        else:
+            sa_off = ar[:, None] * (K // 32) + sg[None, :]
+            sb_off = br[:, None] * (K // 32) + sg[None, :]
+            scale_step: tl.constexpr = BK // 32
     acc = tl.zeros((BM, BN), tl.float32)
     for kt in tl.range(K // BK, num_stages=1):
         a = tlx.buffer_load(A + kt * BK, a_off)
         b = tlx.buffer_load(B + kt * BK, b_off)
-        sa = tlx.buffer_load(SA + kt * scale_step, sa_off)
-        sb = tlx.buffer_load(SB + kt * scale_step, sb_off)
+        if PACK_SCALE_WORDS:
+            sa = _unpack_e8m0_scale_word(tlx.buffer_load(sa_words + kt * scale_word_step, sa_word_off))
+            sb = _unpack_e8m0_scale_word(tlx.buffer_load(sb_words + kt * scale_word_step, sb_word_off))
+        else:
+            sa = tlx.buffer_load(SA + kt * scale_step, sa_off)
+            sb = tlx.buffer_load(SB + kt * scale_step, sb_off)
         acc = tlx.dot_scaled(a, sa, "e4m3", b, sb, "e4m3", acc)
     tlx.buffer_store(acc.to(tl.bfloat16), C, ar[:, None] * N + br[None, :])
 
 
 @triton.jit
-def _gemm_m_masked(A, B, C, SA, SB, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, CUBLAS_BLOCKED: tl.constexpr):
+def _gemm_m_masked(A, B, C, SA, SB, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, CUBLAS_BLOCKED: tl.constexpr,
+                   PACK_SCALE_WORDS: tl.constexpr):
     block: tl.constexpr = 128
     grid_n: tl.constexpr = triton.cdiv(N, block)
     grid_m: tl.constexpr = triton.cdiv(M, block)
@@ -1391,21 +1421,34 @@ def _gemm_m_masked(A, B, C, SA, SB, M: tl.constexpr, N: tl.constexpr, K: tl.cons
     rows = pm * block + tl.arange(0, block)
     cols = pn * block + tl.arange(0, block)
     kk = tl.arange(0, block)
-    groups = tl.arange(0, block // 32)
     row_mask = rows < M
     col_mask = cols < N
     a_off = rows[:, None] * K + kk[None, :]
     b_off = kk[:, None] + cols[None, :] * K
-    if CUBLAS_BLOCKED:
-        sa_off = ((rows[:, None] // 128) * (K // 128) * 512 + (rows[:, None] % 32) * 16 +
-                  (rows[:, None] % 128 // 32) * 4 + groups[None, :])
-        sb_off = ((cols[:, None] // 128) * (K // 128) * 512 + (cols[:, None] % 32) * 16 +
-                  (cols[:, None] % 128 // 32) * 4 + groups[None, :])
-        scale_step: tl.constexpr = 512
+    if PACK_SCALE_WORDS:
+        if CUBLAS_BLOCKED:
+            sa_word_off = (rows // 128) * (K // 128) * 128 + (rows % 32) * 4 + rows % 128 // 32
+            sb_word_off = (cols // 128) * (K // 128) * 128 + (cols % 32) * 4 + cols % 128 // 32
+            scale_step: tl.constexpr = 512
+        else:
+            sa_word_off = rows * (K // 128)
+            sb_word_off = cols * (K // 128)
+            scale_step: tl.constexpr = block // 32
+        scale_word_step: tl.constexpr = scale_step // 4
+        sa_words = SA.to(tl.pointer_type(tl.uint32))
+        sb_words = SB.to(tl.pointer_type(tl.uint32))
     else:
-        sa_off = rows[:, None] * (K // 32) + groups[None, :]
-        sb_off = cols[:, None] * (K // 32) + groups[None, :]
-        scale_step: tl.constexpr = block // 32
+        groups = tl.arange(0, block // 32)
+        if CUBLAS_BLOCKED:
+            sa_off = ((rows[:, None] // 128) * (K // 128) * 512 + (rows[:, None] % 32) * 16 +
+                      (rows[:, None] % 128 // 32) * 4 + groups[None, :])
+            sb_off = ((cols[:, None] // 128) * (K // 128) * 512 + (cols[:, None] % 32) * 16 +
+                      (cols[:, None] % 128 // 32) * 4 + groups[None, :])
+            scale_step: tl.constexpr = 512
+        else:
+            sa_off = rows[:, None] * (K // 32) + groups[None, :]
+            sb_off = cols[:, None] * (K // 32) + groups[None, :]
+            scale_step: tl.constexpr = block // 32
     acc = tl.zeros((block, block), tl.float32)
     for kt in tl.range(K // block, num_stages=1):
         a = tlx.buffer_load(A + kt * block, a_off, mask=row_mask[:, None], other=0.0)
@@ -1415,13 +1458,14 @@ def _gemm_m_masked(A, B, C, SA, SB, M: tl.constexpr, N: tl.constexpr, K: tl.cons
             mask=col_mask[None, :],
             other=0.0,
         )
-        sa = tlx.buffer_load(SA + kt * scale_step, sa_off, mask=row_mask[:, None], other=127)
-        sb = tlx.buffer_load(
-            SB + kt * scale_step,
-            sb_off,
-            mask=col_mask[:, None],
-            other=127,
-        )
+        if PACK_SCALE_WORDS:
+            sa = _unpack_e8m0_scale_word(
+                tlx.buffer_load(sa_words + kt * scale_word_step, sa_word_off, mask=row_mask, other=0x7F7F7F7F))
+            sb = _unpack_e8m0_scale_word(
+                tlx.buffer_load(sb_words + kt * scale_word_step, sb_word_off, mask=col_mask, other=0x7F7F7F7F))
+        else:
+            sa = tlx.buffer_load(SA + kt * scale_step, sa_off, mask=row_mask[:, None], other=127)
+            sb = tlx.buffer_load(SB + kt * scale_step, sb_off, mask=col_mask[:, None], other=127)
         acc = tlx.dot_scaled(a, sa, "e4m3", b, sb, "e4m3", acc)
     offsets = rows[:, None] * N + cols[None, :]
     tlx.buffer_store(
@@ -1656,6 +1700,7 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                 n,
                 k,
                 sf_layout == "cublas_blocked",
+                _pack_scale_words(k, a_scale, b_scale),
                 num_warps=4,
                 num_stages=1,
                 matrix_instr_nonkdim=16,
@@ -2187,8 +2232,9 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
         return _gemm_generic[(triton.cdiv(m, 128) * triton.cdiv(n, 128), )](a, b, out, a_scale.view(torch.uint8),
                                                                             b_scale.view(torch.uint8), m, n, k, 128,
                                                                             128, 128, 4, sf_layout == "cublas_blocked",
-                                                                            num_warps=4, num_stages=1,
-                                                                            matrix_instr_nonkdim=16,
+                                                                            _pack_scale_words(k, a_scale,
+                                                                                              b_scale), num_warps=4,
+                                                                            num_stages=1, matrix_instr_nonkdim=16,
                                                                             disable_unclustered_high_rp_reschedule=True)
 
 
@@ -2261,6 +2307,7 @@ def mm_mxfp(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="heu
         n,
         k,
         sf_layout == "cublas_blocked",
+        _pack_scale_words(k, a_scale, b_scale),
         num_warps=4,
         num_stages=1,
         matrix_instr_nonkdim=16,

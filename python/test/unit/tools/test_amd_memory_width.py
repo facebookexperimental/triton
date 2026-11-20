@@ -251,6 +251,26 @@ def test_ttgir_labels_kernel_level_isa_corroboration():
     assert candidate["isa_corroboration_scope"] == "kernel"
 
 
+def test_ttgir_reports_cross_lane_packed_byte_words():
+    assembly = "buffer_load_ubyte v0, v1, s[0:3], 0 offen ; /tmp/gfx950.py:100:3\n"
+    ttgir = """\
+#linear = #ttg.linear<{register = [[32, 0], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp = [[16, 0], [0, 0]], block = []}>
+%0 = amdg.buffer_load %ptr[%offsets] : !tt.ptr<i8> -> tensor<128x4xi8, #linear> loc(#loc1)
+#loc1 = loc("/tmp/gfx950.py":100:3)
+"""
+    result = amd_memory_width.analyze_amdgcn_memory_width(assembly)
+
+    amd_memory_width._add_ttgir_evidence(result, ttgir)
+
+    assert result["packed_byte_load_candidate_count"] == 1
+    assert result["packed_byte_load_unresolved_count"] == 1
+    candidate = result["packed_byte_load_candidates"][0]
+    assert candidate["logical_shape"] == [128, 4]
+    assert candidate["classification"] == "cross_lane_packed_byte_word"
+    assert candidate["isa_corroboration_scope"] == "source_location"
+    assert candidate["corroborated_by_scalar_byte_isa"]
+
+
 def test_ttgir_does_not_rank_contiguity_cap_when_isa_is_already_wide():
     assembly = "buffer_load_dwordx4 v[0:3], v0, s[0:3], 0 offen\n"
     ttgir = """\
