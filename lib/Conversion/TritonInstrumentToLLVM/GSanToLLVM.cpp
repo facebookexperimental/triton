@@ -642,8 +642,7 @@ public:
 
     auto sem = op.getSem();
     auto scope = op.getScope();
-    insertAtomicOrderingBarriers(op, sem, !atomicResultHasOrderingBarrier(op),
-                                 rewriter, *targetInfo);
+    insertAtomicOrderingBarriers(op, sem, rewriter, *targetInfo);
     StringRef syncScope = targetInfo->getAtomicSyncScope(scope);
 
     TritonLLVMOpBuilder b(loc, rewriter);
@@ -694,8 +693,8 @@ public:
     if (sem == MemSemantic::ACQUIRE)
       LLVM::FenceOp::create(rewriter, loc, LLVM::AtomicOrdering::acquire,
                             syncScope);
-    finalizeAtomicResults(op, rewriter, resultVals, valueElemTy, b, threadPred,
-                          *targetInfo, getTypeConverter());
+    finalizeAtomicResults(op, rewriter, resultVals, threadPred, *targetInfo,
+                          getTypeConverter());
     return success();
   }
 };
@@ -726,8 +725,7 @@ public:
 
     auto sem = op.getSem();
     auto scope = op.getScope();
-    insertAtomicOrderingBarriers(op, sem, /*emitBarrierAfter=*/true, rewriter,
-                                 *targetInfo);
+    insertAtomicOrderingBarriers(op, sem, rewriter, *targetInfo);
     StringRef syncScope = targetInfo->getAtomicSyncScope(scope);
 
     TritonLLVMOpBuilder b(loc, rewriter);
@@ -858,8 +856,7 @@ public:
     auto rmwOp = op.getAtomicRmwOp();
     auto sem = op.getSem();
     auto scope = op.getScope();
-    insertAtomicOrderingBarriers(op, sem, !atomicResultHasOrderingBarrier(op),
-                                 rewriter, *targetInfo);
+    insertAtomicOrderingBarriers(op, sem, rewriter, *targetInfo);
 
     TritonLLVMOpBuilder b(loc, rewriter);
     Value llPtr = adaptor.getPtr();
@@ -911,8 +908,8 @@ public:
       resultVals[i] = *old;
     }
 
-    finalizeAtomicResults(op, rewriter, resultVals, valueElemTy, b, threadPred,
-                          *targetInfo, getTypeConverter());
+    finalizeAtomicResults(op, rewriter, resultVals, threadPred, *targetInfo,
+                          getTypeConverter());
     return success();
   }
 };
@@ -941,8 +938,7 @@ public:
 
     auto sem = op.getSem();
     auto scope = op.getScope();
-    insertAtomicOrderingBarriers(op, sem, !atomicResultHasOrderingBarrier(op),
-                                 rewriter, *targetInfo);
+    insertAtomicOrderingBarriers(op, sem, rewriter, *targetInfo);
 
     TritonLLVMOpBuilder b(loc, rewriter);
     Value llPtr = adaptor.getPtr();
@@ -993,8 +989,8 @@ public:
       resultVals[i] = old;
     }
 
-    finalizeAtomicResults(op, rewriter, resultVals, valueElemTy, b, threadPred,
-                          *targetInfo, getTypeConverter());
+    finalizeAtomicResults(op, rewriter, resultVals, threadPred, *targetInfo,
+                          getTypeConverter());
     return success();
   }
 };

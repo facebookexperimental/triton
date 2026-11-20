@@ -879,6 +879,8 @@ struct TensorMemoryCopyOpConversion
       pred =
           b.and_(pred, LLVM::NVIDIA::createLeaderCTAPredicate(loc, rewriter));
     }
+    if (adaptor.getPred())
+      pred = TritonLLVMOpBuilder(loc, rewriter).and_(pred, adaptor.getPred());
     if (isa<TensorMemoryScalesEncodingAttr>(
             op.getDst().getType().getEncoding())) {
       copyScales(rewriter, loc, typeConverter, op, adaptor.getSrc(),

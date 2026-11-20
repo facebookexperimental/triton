@@ -252,7 +252,15 @@ def test_line_info_ir_source(monkeypatch, status, tmp_path, fresh_triton_cache):
     file_lines = extract_file_lines(command, anchor, separator, kernel_info.asm[obj_kind])
     if status == "ttir":
         assert check_file_lines(file_lines, "<source>/test.py", 8, should_contain=False)
-        assert check_file_lines(file_lines, "<source>/test.ttir", 3)
+        if obj_kind == "cubin":
+            # NVIDIA: scalar loads no longer emit bitcasts (#12319), so SASS
+            # maps to the precise op lines (func/load/store) instead of the
+            # module line.
+            assert check_file_lines(file_lines, "<source>/test.ttir", 4)
+            assert check_file_lines(file_lines, "<source>/test.ttir", 5)
+            assert check_file_lines(file_lines, "<source>/test.ttir", 6)
+        else:
+            assert check_file_lines(file_lines, "<source>/test.ttir", 3)
     else:
         # The scalar load may be folded into the store, dropping line 8 debug
         # info. This already happened on AMD and now also happens on NVIDIA with

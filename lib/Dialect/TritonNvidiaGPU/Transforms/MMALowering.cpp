@@ -120,7 +120,7 @@ struct TCGen5MMAScaleSharedToTmemConversion
   // N of the MMA operation (for LHS or RHS respectively).
   FailureOr<bool> lowerScaleToTmem(
       OpOperand &operand, PatternRewriter &rewriter, int rows,
-      TensorMemoryScalesBlockRepOrder blockRepOrder,
+      TensorMemoryScalesBlockRepOrder blockRepOrder, Value pred,
       TensorMemoryCTAMode ctaMode = TensorMemoryCTAMode::DEFAULT) const {
     Location loc = operand.getOwner()->getLoc();
     MLIRContext *context = operand.getOwner()->getContext();
@@ -175,7 +175,7 @@ struct TCGen5MMAScaleSharedToTmemConversion
                                          operand.getOwner(), rewriter)))
         return failure();
     } else {
-      TMEMCopyOp::create(rewriter, loc, operand.get(), tmemAlloc);
+      TMEMCopyOp::create(rewriter, loc, operand.get(), tmemAlloc, pred);
     }
     operand.set(tmemAlloc);
     return true;
@@ -288,8 +288,9 @@ struct TCGen5MMAScaleSharedToTmemConversion
       // reads stale peer SMEM.
       if (rhsPublicationWait)
         rewriter.setInsertionPointAfter(rhsPublicationWait);
-      FailureOr<bool> changed = lowerScaleToTmem(
-          op.getAScaleMutable(), rewriter, blockM, aScaleBlockRepOrder);
+      FailureOr<bool> changed =
+          lowerScaleToTmem(op.getAScaleMutable(), rewriter, blockM,
+                           aScaleBlockRepOrder, op.getPred());
       rewriter.setInsertionPoint(op);
       if (failed(changed))
         return failure();
@@ -304,7 +305,7 @@ struct TCGen5MMAScaleSharedToTmemConversion
         rewriter.setInsertionPoint(rhsPublicationBarrier);
       FailureOr<bool> changed =
           lowerScaleToTmem(op.getBScaleMutable(), rewriter, blockN,
-                           bScaleBlockRepOrder, bScaleCTAMode);
+                           bScaleBlockRepOrder, op.getPred(), bScaleCTAMode);
       rewriter.setInsertionPoint(op);
       if (failed(changed))
         return failure();

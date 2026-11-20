@@ -27,8 +27,9 @@ class ModuleAllocation;
 } // namespace mlir
 
 namespace mlir::triton::gpu {
+class MemDescType;
 enum class SharedKind : uint32_t;
-}
+} // namespace mlir::triton::gpu
 
 namespace mlir::triton {
 
@@ -302,6 +303,18 @@ bool hasSharedAccess(Operation *op,
                      std::optional<gpu::SharedKind> kind = std::nullopt,
                      std::optional<RW> rw = std::nullopt);
 
+struct MemDescSubsliceOffsets {
+  uint32_t storageOffset = 0;
+  uint32_t byteOffset = 0;
+  uint32_t partitionOffset = 0;
+  uint32_t ctaOffset = 0;
+};
+
+/// Map a shared-memory subslice's logical offsets to unpadded physical offsets.
+MemDescSubsliceOffsets
+getMemDescSubsliceUnpaddedOffsets(gpu::MemDescType type,
+                                  llvm::ArrayRef<int64_t> offsets);
+
 //===----------------------------------------------------------------------===//
 // BufferRegionAnalysis (Sparse Forward Dataflow)
 //===----------------------------------------------------------------------===//
@@ -369,6 +382,13 @@ public:
 
   void calculateUsedBufferRegions(Operation *op);
 
+  /// Compose a subview using physical offsets and its result type.
+  BufferRegionView getSubView(Type type, const BufferRegionView &view,
+                              uint32_t storageOffset = 0,
+                              uint32_t byteOffset = 0,
+                              uint32_t partitionOffset = 0,
+                              uint32_t ctaOffset = 0);
+
   // ------------------------------
   // Required overrides
   // ------------------------------
@@ -397,11 +417,6 @@ private:
   /// linear layout. None without allocation analysis results.
   std::optional<BufferRegionView>
   getWholeAllocView(Value allocation, llvm::ArrayRef<uint32_t> offsets);
-  BufferRegionView getSubView(Type type, const BufferRegionView &view,
-                              uint32_t storageOffset = 0,
-                              uint32_t byteOffset = 0,
-                              uint32_t partitionOffset = 0,
-                              uint32_t ctaOffset = 0);
   // Global registry of all regions
   std::set<BufferRegion> usedBufferRegions[NUM_REGION_TYPES];
   bool usedUnknownBufferRegions[NUM_REGION_TYPES] = {};

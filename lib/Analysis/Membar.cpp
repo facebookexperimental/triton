@@ -1166,8 +1166,8 @@ bool MembarAnalysis::isRegionLocal(Value value) {
 
 bool MembarAnalysis::mayNotifyPeer(Operation *op) {
   // Nested operations are checked separately; region scratch is private.
-  if (isa<RegionBranchOpInterface, triton::AtomicLoadOp, triton::AtomicPollOp>(
-          op))
+  if (isa<RegionBranchOpInterface, triton::AtomicLoadOp, triton::AtomicPollOp,
+          triton::gpu::ThreadHandoffOp>(op))
     return false;
   // A weak shared or tensor memory store cannot release a peer. The peer
   // observes it only after a barrier, which is checked as a notification
@@ -1285,6 +1285,8 @@ triton::BarrierStages getLocalBarrierStages(Operation *op,
   }
 
   if (auto atomic = dyn_cast<triton::AtomicOpInterface>(op)) {
+    if (op->getParentOfType<triton::gpu::ThreadScopeOp>())
+      return stages;
     // Atomic result broadcast uses a scratch write, rendezvous, and read for
     // every memory semantic, including relaxed.
     return triton::getAtomicBarrierStages(atomic.getMemSemantic(),
@@ -1342,6 +1344,11 @@ triton::BarrierStages MembarAnalysis::getBarrierStages(Operation *op) {
 }
 
 bool MembarAnalysis::hasThreadEffects(Operation *op) {
+  // A handoff only accesses its private scratch, modeled separately below.
+  if (isa<triton::gpu::ThreadHandoffOp>(op))
+    return false;
+  // ThreadPredicateOp retains unknown effects so pending waits finish before
+  // entering its restricted region, while every enclosing thread participates.
   auto effects = getEffectsRecursively(op);
   return !effects || llvm::any_of(*effects, [](const auto &effect) {
     return !isa<triton::gpu::SharedMemory>(effect.getResource()) ||

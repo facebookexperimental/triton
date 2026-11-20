@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 from triton import knobs
 from triton._C.libtriton import ir, llvm, nvidia, passes, tlx
 from triton._instrumentation import instrument as _instrument, is_enabled
+from triton._utils import is_power_of_two
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.magnon.flags import apply_enabled as _compile_iq_apply_enabled
 from triton.runtime.errors import PTXASError, attach_shared_memory_breakdown
@@ -323,15 +324,18 @@ class CUDAOptions:
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
         if not extern_libs.get("libdevice", None):
             extern_libs["libdevice"] = knobs.nvidia.libdevice_path or str(default_libdir / "libdevice.10.bc")
-        if is_enabled(self, "gsan"):
-            gsan_lib = default_libdir / "gsan.ll"
+        profiling = is_enabled(self, "gsan-profile")
+        if profiling and self.instrumentation_mode.strip() != "gsan-profile":
+            raise ValueError("gsan-profile must run separately from other instrumentation")
+        if is_enabled(self, "gsan") or profiling:
+            gsan_lib = default_libdir / ("gsan-profile.ll" if profiling else "gsan.ll")
             if not gsan_lib.exists():
                 raise FileNotFoundError(f"GSan runtime is missing at {gsan_lib}. "
                                         "Rebuild Triton to generate it.")
             extern_libs["gsan"] = str(gsan_lib)
 
         object.__setattr__(self, "extern_libs", tuple(extern_libs.items()))
-        assert (self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0), "num_warps must be a power of 2"
+        assert is_power_of_two(self.num_warps), "num_warps must be a power of 2"
         _check_reg_auto_ws_alignment("minRegAutoWS", self.minRegAutoWS)
         _check_reg_auto_ws_alignment("maxRegAutoWS", self.maxRegAutoWS)
 
@@ -357,6 +361,9 @@ class CUDAOptions:
             raise ValueError("a cluster must be requested exactly one way: either num_ctas, or ctas_per_cga "
                              f"(optionally mirrored in cluster_dims). Got num_ctas={self.num_ctas}, "
                              f"ctas_per_cga={self.ctas_per_cga}, cluster_dims={self.cluster_dims}")
+
+        # Validate raw num_ctas: the mirroring below normalizes it to 1.
+        assert is_power_of_two(self.num_ctas), "num_ctas must be a power of 2"
 
         # ctas_per_cga regroups grid CTAs rather than spawning them, so it is
         # incompatible with the multiplicative semantics of num_ctas. Mirror it
@@ -464,7 +471,7 @@ class CUDABackend(BaseBackend):
 
         args["enable_fp_fusion"] = knobs.language.fp_fusion_enabled(args.get("enable_fp_fusion"))
 
-        args["max_num_imprecise_acc_default"] = 2**30 if capability == 90 else 0
+        args["max_num_imprecise_acc_default"] = 2**30 if capability in (89, 90) else 0
 
         return CUDAOptions(**args)
 
@@ -1333,12 +1340,14 @@ class CUDABackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
 
-        if is_enabled(options, "gsan"):
+        if is_enabled(options, "gsan") or is_enabled(options, "gsan-profile"):
             # GSan introduces layout conversions, so it must run before shared-memory allocation.
             passes.ttgpuir.add_global_sanitizer(pm)
 
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
         passes.ttgpuir.add_allocate_warp_groups(pm, is_enabled(options, "consan"))
+        if not any(is_enabled(options, mode) for mode in ("gsan", "consan")):
+            passes.ttgpuir.add_optimize_thread_regions(pm)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
         if is_enabled(options, "consan"):
@@ -1467,6 +1476,7 @@ class CUDABackend(BaseBackend):
             disable_slp_vectorizer=(capability == 80) or (not use_slp_vectorizer),
             expand_masked_div_rem=True,
             nvptx_compute_capability=0 if use_slp_vectorizer else capability,
+            enable_nvptx_tti=True,
         )
 
         # Get some metadata

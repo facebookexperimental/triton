@@ -4,13 +4,13 @@ add_subdirectory(include)
 add_subdirectory(lib)
 if(TRITON_BUILD_PYTHON_MODULE)
   if(TRITON_BUILD_NVIDIA_GSAN_RUNTIME)
-  set(GSAN_RUNTIME_SRC "${triton_SOURCE_DIR}/python/triton/experimental/gsan/src/GSanLibrary.cu")
-  set(GSAN_RUNTIME_HDRS
-    "${triton_SOURCE_DIR}/python/triton/experimental/gsan/src/GSan.h"
-    "${triton_SOURCE_DIR}/python/triton/experimental/gsan/src/Hash.cuh"
-    "${CMAKE_CURRENT_SOURCE_DIR}/clang_cuda_shims/assert.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/clang_cuda_shims/curand_mtgp32_kernel.h")
-  set(GSAN_RUNTIME_IR "${CMAKE_CURRENT_SOURCE_DIR}/backend/lib/gsan.ll")
+    set(GSAN_RUNTIME_DIR "${triton_SOURCE_DIR}/python/triton/experimental/gsan/src")
+    set(GSAN_RUNTIME_HDRS
+      "${GSAN_RUNTIME_DIR}/GSan.h"
+      "${GSAN_RUNTIME_DIR}/Compat.h"
+      "${GSAN_RUNTIME_DIR}/TMA.cuh"
+      "${GSAN_RUNTIME_DIR}/AllocationProfile.h"
+      "${GSAN_RUNTIME_DIR}/Hash.cuh")
 
   find_program(TRITON_GSAN_CLANGXX NAMES clang++
                PATHS "${LLVM_SYSPATH}/bin"
@@ -32,6 +32,13 @@ if(TRITON_BUILD_PYTHON_MODULE)
   if(APPLE AND CMAKE_OSX_SYSROOT)
     list(APPEND GSAN_RUNTIME_PLATFORM_FLAGS -isysroot "${CMAKE_OSX_SYSROOT}")
   endif()
+
+  set(TRITON_GSAN_INCLUDE_FLAGS "")
+  foreach(include_path IN ITEMS "${TRITON_CUDACRT_PATH}" "${TRITON_CUDART_PATH}")
+    if(NOT "${include_path}" STREQUAL "")
+      list(APPEND TRITON_GSAN_INCLUDE_FLAGS "-I${include_path}")
+    endif()
+  endforeach()
 
   set(GSAN_RUNTIME_TOOLCHAIN_FLAGS)
   # Detect the right include directory for C++ stdlib.
@@ -55,30 +62,43 @@ if(TRITON_BUILD_PYTHON_MODULE)
     endif()
   endif()
 
-  add_custom_command(
-      OUTPUT "${GSAN_RUNTIME_IR}"
-      COMMAND "${CMAKE_COMMAND}" -E make_directory
-              "${PROJECT_SOURCE_DIR}/third_party/nvidia/backend/lib"
-      COMMAND "${TRITON_GSAN_CLANGXX}"
-              -x cuda
-              -std=c++17 -O3 -S -emit-llvm
-              --cuda-device-only
-              -nocudalib
-              --no-cuda-version-check
-              -fno-exceptions
-              -fcuda-flush-denormals-to-zero
-              --cuda-gpu-arch=sm_80
-              --cuda-feature=+ptx70
-              -Wno-unknown-cuda-version
-              ${GSAN_RUNTIME_TOOLCHAIN_FLAGS}
-              ${GSAN_RUNTIME_PLATFORM_FLAGS}
-              -isystem "${CMAKE_CURRENT_SOURCE_DIR}/clang_cuda_shims"
-              -isystem "${CMAKE_CURRENT_SOURCE_DIR}/backend/include"
-              "${GSAN_RUNTIME_SRC}" -o "${GSAN_RUNTIME_IR}"
-      DEPENDS "${GSAN_RUNTIME_SRC}" ${GSAN_RUNTIME_HDRS}
-      COMMENT "Building GSan runtime"
-      VERBATIM)
-  add_custom_target(TritonNVIDIAGSanRuntime ALL DEPENDS "${GSAN_RUNTIME_IR}")
+    # Keep both runtimes on the same compiler flags and dependency set.
+    # They share the instrumentation ABI and descriptor decoder.
+    set(GSAN_RUNTIME_IRS "")
+    foreach(runtime IN ITEMS gsan gsan-profile)
+      if(runtime STREQUAL "gsan-profile")
+        set(runtime_src "${GSAN_RUNTIME_DIR}/AllocationProfile.cu")
+      else()
+        set(runtime_src "${GSAN_RUNTIME_DIR}/GSanLibrary.cu")
+      endif()
+      set(runtime_ir "${CMAKE_CURRENT_SOURCE_DIR}/backend/lib/${runtime}.ll")
+      add_custom_command(
+          OUTPUT "${runtime_ir}"
+          COMMAND "${CMAKE_COMMAND}" -E make_directory
+                  "${CMAKE_CURRENT_SOURCE_DIR}/backend/lib"
+          COMMAND "${TRITON_GSAN_CLANGXX}"
+                  -x cuda
+                  -std=c++17 -O3 -S -emit-llvm
+                  --cuda-device-only
+                  -nocudalib
+                  --no-cuda-version-check
+                  -fno-exceptions
+                  -fcuda-flush-denormals-to-zero
+                  --cuda-gpu-arch=sm_80
+                  --cuda-feature=+ptx70
+                  -Wno-unknown-cuda-version
+                  ${GSAN_RUNTIME_TOOLCHAIN_FLAGS}
+                  ${GSAN_RUNTIME_PLATFORM_FLAGS}
+                  ${TRITON_GSAN_INCLUDE_FLAGS}
+                  -isystem "${CMAKE_CURRENT_SOURCE_DIR}/clang_cuda_shims"
+                  -isystem "${CMAKE_CURRENT_SOURCE_DIR}/backend/include"
+                  "${runtime_src}" -o "${runtime_ir}"
+          DEPENDS "${runtime_src}" ${GSAN_RUNTIME_HDRS}
+          COMMENT "Building ${runtime} runtime"
+          VERBATIM)
+      list(APPEND GSAN_RUNTIME_IRS "${runtime_ir}")
+    endforeach()
+    add_custom_target(TritonNVIDIAGSanRuntime ALL DEPENDS ${GSAN_RUNTIME_IRS})
   endif()
 
   add_triton_plugin(TritonNVIDIA ${CMAKE_CURRENT_SOURCE_DIR}/triton_nvidia.cc LINK_LIBS TritonNVIDIAGPUToLLVM NVGPUToLLVM)
