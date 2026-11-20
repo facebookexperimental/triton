@@ -10,6 +10,10 @@ with a deep TMA ring, and the CLUSTER K-slices of an N-block run as one thread-b
 - epilogue (default, 4 warps): peers (cluster rank > 0) st.async their FP32 accumulator into the leader's slot
   (DSMEM, counted in bytes on the leader's mbarrier); the leader adds them and stores C^T's tile. There is no
   workspace, counter or second launch.
+
+The kernel is launched with programmatic dependent launch: its prologue overlaps the previous kernel when that
+kernel triggers early launch. The producer waits on earlier kernels before its first load and the epilogue before
+it writes C, since A, W and C may all be in use by them.
 """
 
 import functools
@@ -54,6 +58,7 @@ def skinny_mm_kernel(a_desc, w_desc, c_ptr, M, N, stride_cm, BN: tl.constexpr, B
                 if rank == 0:
                     tlx.barrier_expect_bytes(red_bar[0], (CLUSTER - 1) * BN * BMP * 4)
             tlx.barrier_wait(acc_bar[0], 0)
+            tl.extra.cuda.gdc_wait()  # C may still be in use by an earlier kernel
             acc = tlx.local_load(acc_tmem[0])
             offs_n = n0 + tl.arange(0, BN)
             offs_m = tl.arange(0, BMP)
@@ -82,6 +87,7 @@ def skinny_mm_kernel(a_desc, w_desc, c_ptr, M, N, stride_cm, BN: tl.constexpr, B
             tlx.tcgen05_commit(acc_bar[0])
 
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA loads
+            tl.extra.cuda.gdc_wait()  # A and W may come from earlier kernels
             for i in range(0, K_ITERS):
                 s = i % NUM_STAGES
                 tlx.barrier_wait(empty_bars[s], ((i // NUM_STAGES) & 1) ^ 1)
@@ -89,6 +95,7 @@ def skinny_mm_kernel(a_desc, w_desc, c_ptr, M, N, stride_cm, BN: tl.constexpr, B
                 tlx.async_descriptor_load(w_desc, w_bufs[s], [n0, k_base + i * BK], full_bars[s],
                                           eviction_policy="evict_first")
                 tlx.async_descriptor_load(a_desc, a_bufs[s], [0, k_base + i * BK], full_bars[s])
+            tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -157,7 +164,7 @@ def _launch(a, w, c, cfg):
     kwargs = dict(ctas_per_cga=(cluster, 1, 1)) if cluster > 1 else {}
     skinny_mm_kernel[((N // BLOCK_N) * cluster, )](a_desc, w_desc, c, M, N, c.stride(0), BN=BLOCK_N, BK=BLOCK_K,
                                                    BMP=bmp, CLUSTER=cluster, K_ITERS=K // (BLOCK_K * cluster),
-                                                   NUM_STAGES=cfg["NUM_STAGES"], num_warps=4, **kwargs)
+                                                   NUM_STAGES=cfg["NUM_STAGES"], num_warps=4, launch_pdl=True, **kwargs)
 
 
 @functools.lru_cache(maxsize=None)
