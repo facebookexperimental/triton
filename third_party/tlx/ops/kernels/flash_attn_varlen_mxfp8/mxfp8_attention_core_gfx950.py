@@ -27,6 +27,10 @@ from ..flash_attn_mxfp8.gfx950 import (
     _to_e4m3,
 )
 
+# LDS address-bit bases of one 64-key half tile, the same as
+# flash_attn_mxfp8.gfx950's: K is stored [feature 128, key 64] with a key's
+# features contiguous, V [key 64, feature 128] with a feature's keys contiguous
+# (V comes transposed).
 _K_LDS_BASES = tl.constexpr([
     [1, 0],
     [2, 0],
@@ -58,13 +62,14 @@ _V_LDS_BASES = tl.constexpr([
     [0, 64],
 ])
 
-# The softmax sees scores t = (x - m_i + OFF) * C, x the log2-domain logit and
-# m_i the stale row max; P = 2**(x - m_i + 4) stays below 2**8 while the max
-# holds, and each 32-key block of it then gets its own E8M0 scale. With the
-# bit-trick exp, C = 2**-9 comes from lowering Q's E8M0 scales and OFF = 127 + 4
-# makes t the bf16 exponent position scaled for v_cvt_pknorm_u16_f32
-# (65535 / 2**16 slope error, common to P and its sum). With the hardware exp,
-# t is the exponent itself.
+# Score convention of the softmax helpers below, with C = _score_scale and
+# OFF = _score_offset. The softmax sees scores t = (x - m_i + OFF) * C, x the
+# log2-domain logit and m_i the stale row max; P = 2**(x - m_i + 4) stays below
+# 2**8 while the max holds, and each 32-key block of it then gets its own E8M0
+# scale. With the bit-trick exp, C = 2**-9 comes from lowering Q's E8M0 scales
+# and OFF = 127 + 4 makes t the bf16 exponent position scaled for
+# v_cvt_pknorm_u16_f32 (65535 / 2**16 slope error, common to P and its sum).
+# With the hardware exp, C = 1 and OFF = 4: t is the exponent itself.
 
 
 @triton.jit
@@ -101,7 +106,10 @@ def _p_half(s, tmax, FAST_EXP: tl.constexpr):
 
 @triton.jit
 def _softmax_first(s0, s1, FAST_EXP: tl.constexpr):
-    # First tile: no offset in the scores yet (t = x * C).
+    # P of an item's first tile from the scores of its two 64-key halves, which
+    # carry no offset yet (t = x * C). Returns (p0, p1, m_i, l_i): the two
+    # halves of P as _p_half pairs, the row max in the log2 domain and zeroed
+    # row sums [row, block half].
     C: tl.constexpr = _score_scale(FAST_EXP)
     OFF: tl.constexpr = _score_offset(FAST_EXP)
     tmax0 = _block_max(s0)
@@ -117,6 +125,11 @@ def _softmax_first(s0, s1, FAST_EXP: tl.constexpr):
 
 @triton.jit
 def _softmax_stats(s0, s1, mi, li, a0, a1, a2, a3, qk_scale, FAST_EXP: tl.constexpr):
+    # The online-softmax update ahead of P's quantization. s0 arrives as t and
+    # s1 still lacks its multiply by qk_scale (see _mfma_stage). Returns the
+    # scores, their per-block maxima and the per-row shift tshift the maxima
+    # still need, with the row max mi, the row sums li and the PV accumulators
+    # rescaled where a row's max rose.
     C: tl.constexpr = _score_scale(FAST_EXP)
     OFF: tl.constexpr = _score_offset(FAST_EXP)
     vote: tl.constexpr = tlx.layout(shape=((32, 2, s0.shape[0] // 32), (1, )), stride=((1, 0, 32), (1, )))
@@ -124,21 +137,27 @@ def _softmax_stats(s0, s1, mi, li, a0, a1, a2, a3, qk_scale, FAST_EXP: tl.conste
     tmax0, tmax1 = _block_max(s0), _block_max(s1)
     row = tl.maximum(tl.max(tmax0, 1), tl.max(tmax1, 1))
     tshift = tl.zeros_like(row)
+    # A warp rescales only when one of its rows passes the stale max by more
+    # than 4 (P would reach 2**8); it then moves each row whose max rose to its
+    # new max.
     if tlx.warp_any(tlx.require_layout(row > (OFF + 4.0) * C, vote)):
-        # Keep the rescaling threshold aligned with the score reduction.
+        # The same shift in the scores' layout (up) and, below, in the block
+        # maxima's (tshift).
         up = tl.maximum(tl.maximum(tl.max(s0, 1), tl.max(s1, 1)) - OFF * C, 0.0)
         alpha = tl.math.exp2(up * (-1.0 / C))[:, None]
         a0, a1, a2, a3 = a0 * alpha, a1 * alpha, a2 * alpha, a3 * alpha
         s0, s1 = s0 - up[:, None], s1 - up[:, None]
         mi = mi + up * (1.0 / C)
         tshift = -tl.maximum(row - OFF * C, 0.0)
-        # With no rescaling, tshift is zero and this multiply is an identity.
+        # A row whose max did not rise has tshift zero: its multiply is an
+        # identity.
         li = li * tl.math.exp2(tshift * (1.0 / C))[:, None]
     return s0, s1, tmax0, tmax1, tshift, mi, li, a0, a1, a2, a3
 
 
 @triton.jit
 def _softmax_quantize(s0, s1, tmax0, tmax1, tshift, FAST_EXP: tl.constexpr):
+    # Both 64-key halves of P from _softmax_stats' scores and block maxima.
     p0, p1 = (
         _p_half(s0, tmax0 + tshift[:, None], FAST_EXP),
         _p_half(s1, tmax1 + tshift[:, None], FAST_EXP),
@@ -148,6 +167,8 @@ def _softmax_quantize(s0, s1, tmax0, tmax1, tshift, FAST_EXP: tl.constexpr):
 
 @triton.jit
 def _softmax(s0, s1, mi, li, a0, a1, a2, a3, qk_scale, FAST_EXP: tl.constexpr):
+    # One tile's softmax: the online update, then P in MXFP8. Returns
+    # (p0, p1, mi, li, a0, a1, a2, a3).
     s0, s1, tmax0, tmax1, tshift, mi, li, a0, a1, a2, a3 = _softmax_stats(s0, s1, mi, li, a0, a1, a2, a3, qk_scale,
                                                                           FAST_EXP)
     p0, p1 = _softmax_quantize(s0, s1, tmax0, tmax1, tshift, FAST_EXP)
@@ -156,6 +177,10 @@ def _softmax(s0, s1, mi, li, a0, a1, a2, a3, qk_scale, FAST_EXP: tl.constexpr):
 
 @triton.jit
 def _quantize_q_half(values):
+    # One 64-feature half of a BF16 query tile to MXFP8 in registers, by
+    # _mx_scale's rule per 32x32 (row, feature) tile. Returns (E4M3 in the QK
+    # MFMA's A operand layout, E8M0 [row, feature block] in the layout the
+    # scaled MFMA takes its scales in).
     rows: tl.constexpr = values.shape[0]
     grouped = tl.reshape(values, (rows // 32, 32, 2, 32))
     magnitude = (grouped.to(tl.uint16, bitcast=True) & 0x7FFF).to(tl.uint16)
@@ -177,6 +202,8 @@ def _quantize_q_half(values):
 
 @triton.jit
 def _pv_last(p0, p1, va, vb, vsa, vsb, acc0, acc1, acc2, acc3, l_i):
+    # PV and P's row sums for an item's last tile, which has no QK left to
+    # interleave. Returns (acc0, acc1, acc2, acc3, l_i).
     ones = _rowsum_b()
     t0 = tl.dot(
         _as_rowsum_a(p0[0]),
@@ -224,6 +251,12 @@ def _issue_tile(
     v_n1,
     ks_n1,
 ):
+    # Issues the global->LDS copies of K tile kt and V tile vt, with their E8M0
+    # words, as two commit groups: the first 64-key halves (ka, va, ksa, vsa),
+    # then the second (kb, vb, ksb, vsb), which lie k_n1, v_n1 and ks_n1 further
+    # on. The K destinations may be None (no K tile left to fetch); the V
+    # destinations may not, as the commits sit with them.
+    #
     # V's packed E8M0 words go with V; they are laid out like K's, so they
     # share its offsets and steps.
     if ka is not None:
@@ -271,6 +304,7 @@ def _ld_ks(ksbuf, RELAXED: tl.constexpr = True):
 
 @triton.jit
 def _ld_v(vbuf, c: tl.constexpr, RELAXED: tl.constexpr = True):
+    # One 32-feature chunk of a V half tile.
     return tlx.local_load(tlx.local_slice(vbuf, [0, 32 * c], [vbuf.shape[0], 32]), relaxed=RELAXED)
 
 
@@ -356,13 +390,24 @@ def _mfma_stage(
     # behind the last PV MFMAs, and s1 is multiplied during the softmax update;
     # splitting the multiplies keeps both parts short.
     #
+    # The operands come from one LDS slot: K tile j + 1 and V tile j, each as
+    # two 64-key halves (ka, kb, va, vb) with their E8M0 words (ksa, ksb, vsa,
+    # vsb). At most two commit groups are outstanding on entry, the slot's
+    # first halves and its second: the wait for one outstanding group lets the
+    # first halves land. The stage then issues two more groups, K tile kt and
+    # V tile vt into the other slot (kd_*, vd_*, ksd_*, vsd_*) through
+    # _issue_tile, so the wait for two outstanding groups ahead of the second
+    # halves' reads lets those land.
+    #
     # P's row sums go first: they need only registers, so the matrix cores get
-    # work right after the scheduling barrier, and the first reads and the
-    # next tile's global->LDS copies issue behind them. Their block scales are
-    # applied after the first QK MFMA, when the sums are in.
+    # work as the stage starts, and the first reads and the next tile's
+    # global->LDS copies issue behind them. Their block scales are applied after
+    # the first QK MFMA, when the sums are in.
     #
     # With rem, keys of the QK tile at or past rem start at -1e30 or less
     # (arithmetic: selects would take an SGPR pair per element).
+    #
+    # Returns (s0, s1, acc0, acc1, acc2, acc3, l_i).
     init = tl.broadcast_to(offset[:, None], (q_lo.shape[0], ka.shape[1]))
     init_b = init
     if rem is not None:
@@ -449,6 +494,9 @@ def _mfma_stage(
 
 @triton.jit
 def _qk_first(q_lo, q_hi, qs_lo, qs_hi, ka, kb, ksa, ksb, qk_scale):
+    # QK of an item's first tile: no PV to interleave and no offset yet, so
+    # the accumulators start at zero and both halves leave multiplied by
+    # qk_scale.
     kA0 = _ld_k(ka, 0)
     kA1 = _ld_k(ka, 1)
     kB0 = _ld_k(kb, 0)

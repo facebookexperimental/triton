@@ -1,14 +1,16 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
-"""Packed-varlen MXFP8 attention forward on the 4-wave ping-pong core.
+"""Packed-varlen MXFP8 attention forward on the 4-wave scaled-MFMA core.
 
 Packed [tokens, 4, 128] BF16 Q/K/V, non-causal. One preparation kernel
-quantizes K and V into head-major buffers in which every sequence starts at
-a multiple of 256 keys and is zero-padded to one, in the layouts the core
-reads (K row-major with permuted scale words, V transposed with keys
-reordered inside 32-key groups). Q is quantized in registers. Work items are
-128-row query-tile/head pairs, cost-balanced by a persistent grid; keys past
-the sequence end get -1e30 scores, which only the last two 128-key tiles need.
+quantizes K and V into head-major buffers in which every sequence owns a span
+of zero-padded keys that starts at a multiple of 256 keys and is a multiple of
+256 keys long, in the layouts the core reads (K row-major with permuted scale
+words, V transposed with keys reordered inside 32-key groups). Q is quantized
+in registers, or ahead of time for ``forward_prequantized``. Work items are
+128-row query-tile/head pairs, cost-balanced over a persistent grid. The
+padding sits at both ends of a span (see ``_front``), so only an item's first
+and last 128-key tiles hold padding keys, which get scores of -1e30 or less.
 The sequence-offset tensors must not be modified in place while their prepared
 metadata and work schedule are reused.
 """
@@ -34,14 +36,21 @@ _BLOCK_M = 128
 # each work item's metadata again instead of carrying it over from the prefetch,
 # and the approximate exponential is the default.
 _LONG_KV = 4096
+# Each sequence's keys are padded to a multiple of two 128-key tiles: the
+# kernel takes the tiles in pairs, one per LDS slot.
 _PAD = 256
+# Keys per program of the K/V preparation kernel.
 _PREP_ROWS = 64
 _LOG2E = 1.4426950408889634
 
 _LAUNCH_OPTIONS = {
     "num_warps": 4,
     "num_stages": 1,
+    # VGPR-only register allocation, and no IEEE mode: max then needs no
+    # canonicalizing v_max x, x of its operands.
     "llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"), ("amdgpu-ieee", "false")),
+    # core._mfma_stage places its own scheduling barriers. Set explicitly: an
+    # unset option follows the environment knob.
     "enable_sched_group_barrier_scheduler": False,
     "sched_group_barrier_mfma_per_dwordx4": 4,
 }
@@ -193,6 +202,11 @@ def _item(
     HEADS: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
+    """Work item ``item``: one head of one BLOCK_M-row query tile.
+
+    Returns (head, first query row, query rows left in the sequence, padding
+    keys ahead of the sequence, valid keys of the last 128-key tile, start of
+    the sequence's padded key span, number of 128-key tiles in it)."""
     tile = item // HEADS
     sequence = tl.load(ItemTile + tile)
     q0 = tl.load(CuQ + sequence) + (tile - tl.load(CuQTile + sequence)) * BLOCK_M
@@ -216,6 +230,8 @@ def _item(
 
 @triton.jit
 def _kv_pointers(K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off):
+    """Per-element pointers to the first 64-key half of a padded key span, for
+    K, V and their E8M0 scales taken as one int32 word per key."""
     key = head * NPAD + pad_start
     return (
         K8 + key * 128 + k_off,
@@ -274,6 +290,14 @@ def _mfma_softmax_loop_4w(
     qk_scale,
     FAST_EXP: tl.constexpr,
 ):
+    """An item's middle tiles, two per iteration.
+
+    On entry P holds tile 0 and LDS slot 0 holds K tile 1 and V tile 0. Each
+    stage takes QK of the next tile and PV of the current one from one slot
+    while it refills the other, so the slots alternate; the softmax of the new
+    scores follows. On exit the scores and P are those of tile n_tiles - 2, and
+    slot 0 holds K tile n_tiles - 1 and V tile n_tiles - 2 for the caller's
+    last stage."""
     OFF: tl.constexpr = core._score_offset(FAST_EXP)
     HN: tl.constexpr = 64
     D: tl.constexpr = 128
@@ -424,6 +448,21 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     REUSE_METADATA: tl.constexpr,
     USE_WORK_ORDER: tl.constexpr,
 ):
+    """Persistent 4-wave forward: each program walks its share of the work items.
+
+    Q is BF16 and quantized here, or with PREQUANTIZED_Q E4M3 with its E8M0
+    bytes in QScales. K8, V8, KS and VS are prepare_kv's buffers, and CuPad,
+    CuQTile and ItemTile are _metadata's tables. qk_scale is the softmax scale
+    in the log2 domain. With USE_WORK_ORDER the items come in WorkOrder's order,
+    else in index order; REUSE_METADATA then also carries the metadata read for
+    an item's prefetch over to the item instead of reading it again.
+
+    An item's tiles alternate between two LDS slots. QK of tile 0 comes first,
+    masked ahead of the sequence start, then core._mfma_stage takes QK of tile
+    j + 1 with PV of tile j for every later tile, the last one masked past the
+    sequence end, and core._pv_last closes with PV of the last tile. The next
+    item's first copies are issued behind the last stage, so they land during
+    the item's epilogue."""
     HN: tl.constexpr = 64
     HD: tl.constexpr = 64
     D: tl.constexpr = 128
@@ -475,6 +514,8 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     head, q0, q_rows, front, tail, pad_start, n_tiles = _item_uniform(item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS,
                                                                       BLOCK_M)
     k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off)
+    # The first item's opening copies, as three commit groups: K tile 0 into
+    # slot 1, then the two halves of K tile 1 and V tile 0 into slot 0.
     tlx.async_load(k_ptr, ka[1])
     tlx.async_load(k_ptr + k_n1, kb[1])
     tlx.async_load(ks_ptr, ksa[1])
@@ -548,6 +589,7 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
         acc1 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
         acc2 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
         acc3 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
+        # K tile 0 is in slot 1; only slot 0's two groups may be outstanding.
         tlx.async_load_wait_group(2)
         s0, s1 = core._qk_first(q_lo, q_hi, qs_lo, qs_hi, ka[1], kb[1], ksa[1], ksb[1], qk_scale)
         s0, s1 = _mask_front(s0, s1, front)
@@ -584,6 +626,8 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
             qk_scale,
             FAST_EXP=FAST_EXP,
         )
+        # The last stage: QK of the last tile, masked past its tail valid keys,
+        # with PV of the tile before it. V's last tile goes to slot 1.
         k_final_a, k_final_b = ka[0], kb[0]
         ks_final_a, ks_final_b = ksa[0], ksb[0]
         s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
@@ -632,6 +676,10 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
             ks_n1,
             tail,
         )
+        # The next item's opening copies, in the same three groups as the
+        # first item's; after the last item they repeat it and go unread. Slot
+        # 1's K buffers have no reader left in this item, and the last stage
+        # has issued all of this item's reads of slot 0.
         nxt = tl.where(w + 1 < n_mine, item + n_ctas, item)
         if USE_WORK_ORDER:
             next_slot = base + tl.where(w + 1 < n_mine, w + 1, w) * n_ctas
@@ -666,6 +714,7 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
             v_n1,
             ks_n1,
         )
+        # V's last tile and the next item's K tile 0 are in slot 1.
         tlx.async_load_wait_group(2)
         p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
                                                                  FAST_EXP)
@@ -674,6 +723,7 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
         total = tlx.require_layout(tl.sum(l_i, 1), row_layout)
         scale = (1.0 / total)[:, None]
         valid = offs_mm < q_rows
+        # P is 2**(x - m_i + 4) with either exponential.
         lse = (tlx.require_layout(m_i, row_layout) - 4.0 + tl.log2(total)) * 0.6931471805599453
         tl.store(Lse + head * TOTAL_Q + q0 + offs_mm, lse, mask=valid)
         offs_c = tl.arange(0, 32)
@@ -709,6 +759,7 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
                 n_tiles_next,
             )
             k_ptr, v_ptr, ks_ptr, vs_ptr = nk_ptr, nv_ptr, nks_ptr, nvs_ptr
+    # The copies issued after the last item must land before the program ends.
     tlx.async_load_wait_group(0)
 
 
@@ -780,7 +831,7 @@ def _fill_empty(Out, Lse, CuQ, CuKV, TOTAL_Q, HEADS: tl.constexpr, ROWS: tl.cons
                 tl.store(Lse + head * TOTAL_Q + row, float("-inf"), mask=row < hi)
 
 
-# Metadata per (cu_seqlens_q, cu_seqlens_k, sizes): the block's layers reuse
+# Metadata per (cu_seqlens_q, cu_seqlens_k, sizes): a model's layers reuse
 # the same sequence offsets, so each set is built once. Entries hold weak
 # references and are checked against tensor identity and version.
 _METADATA: dict[tuple[Any, ...], tuple[Any, Any, dict[str, Any]]] = {}
@@ -809,6 +860,8 @@ def _metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad=_PAD):
 
 
 def _build_metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad):
+    """Build _metadata's tables on the device, without reading the offsets on
+    the host: the table sizes are upper bounds from the totals."""
     batch = cu_seqlens_k.numel() - 1
     device = cu_seqlens_k.device
     tile_capacity = total_kv // _PREP_ROWS + batch * pad // _PREP_ROWS
@@ -853,7 +906,9 @@ def _build_metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad)
 def prepare_kv(k, v, cu_seqlens_k, meta=None):
     """Quantize packed K and V into the core's padded head-major layouts.
 
-    ``meta`` is optional for callers preparing a reusable K/V state directly.
+    Returns ``(k8, k_scales, v8, v_scales)``, the ``kv_state`` that ``forward``
+    accepts. ``meta`` is optional for callers preparing a reusable K/V state
+    directly.
     """
     if meta is None:
         dummy_cu_q = torch.zeros_like(cu_seqlens_k)
@@ -887,6 +942,7 @@ def prepare_kv(k, v, cu_seqlens_k, meta=None):
 
 
 def _check_offsets(offsets, device):
+    """Require contiguous int32 cumulative offsets on the input device."""
     if (offsets.ndim != 1 or offsets.numel() < 2 or offsets.dtype != torch.int32 or not offsets.is_contiguous()
             or offsets.device != device):
         raise ValueError("Requires contiguous int32 sequence offsets on the input device")
@@ -894,6 +950,16 @@ def _check_offsets(offsets, device):
 
 @dataclass(frozen=True)
 class ForwardWorkSchedule:
+    """Assignment of work items to the persistent grid.
+
+    ``item_order[base + n * num_ctas]`` is the n-th work item of the program
+    with slot ``base``. ``total_q``, ``total_kv`` and ``batch`` identify the
+    lengths the schedule was built for. ``needs_empty_fill`` is set when a
+    sequence has queries but no keys, and ``item_count`` is the number of work
+    items; the kernel follows ``item_order`` only when it covers every item
+    and no sequence needs the empty fill, and otherwise takes the items in
+    index order."""
+
     item_order: torch.Tensor
     num_ctas: int
     total_q: int
@@ -910,7 +976,12 @@ def prepare_work_schedule(
     *,
     num_ctas=512,
 ):
-    """Build a reusable KV-cost-balanced persistent work schedule."""
+    """Build a reusable KV-cost-balanced persistent work schedule.
+
+    Every program gets a fixed share of the work items. The items are taken
+    longest key span first, each going to the least loaded program that still
+    has room. The lengths are host lists, so building a schedule does not read
+    device memory."""
     if num_ctas < 8 or num_ctas % 8:
         raise ValueError("Requires a multiple of eight CTAs")
     if not isinstance(query_lengths, (list, tuple)) or not isinstance(key_lengths, (list, tuple)):
@@ -946,6 +1017,7 @@ def prepare_work_schedule(
 
 
 def _check_work_schedule(schedule, q, total_kv, batch, num_ctas):
+    """Reject a schedule built for other lengths, another device or grid."""
     if schedule is None:
         return
     if (schedule.total_q != q.shape[0] or schedule.total_kv != total_kv or schedule.batch != batch
@@ -957,7 +1029,11 @@ _AUTOMATIC_SCHEDULES: dict[tuple[Any, ...], tuple[Any, Any, ForwardWorkSchedule]
 
 
 def _automatic_work_schedule(cu_seqlens_q, cu_seqlens_k, device, *, num_ctas):
-    """Create the balanced schedule used by the public forward paths."""
+    """Create the balanced schedule used by the public forward paths.
+
+    Reading the lengths synchronizes with the device, so schedules are cached
+    like _metadata's tables. With num_ctas None the grid is one program per
+    work item, rounded up to a multiple of eight and capped at 512."""
     key = (
         id(cu_seqlens_q),
         cu_seqlens_q._version,
@@ -982,6 +1058,9 @@ def _automatic_work_schedule(cu_seqlens_q, cu_seqlens_k, device, *, num_ctas):
 
 @triton.jit
 def _prepare_q_forward(Q, Q8, QS, CuQ, HEADS: tl.constexpr):
+    """Quantize one sequence and head of Q, 64 rows at a time: E4M3 in Q8 at
+    Q's offsets, and in QS one E8M0 byte per row and 32 features, shared by
+    the rows of a 32-row block counted from the sequence start."""
     sequence = tl.program_id(0)
     head = tl.program_id(1)
     first = tl.load(CuQ + sequence)
@@ -1017,7 +1096,10 @@ def _prepare_q_forward(Q, Q8, QS, CuQ, HEADS: tl.constexpr):
 
 
 def prepare_q(q, cu_seqlens_q):
-    """Prepare packed E4M3 Q and row-wise E8M0 scales."""
+    """Prepare packed E4M3 Q and row-wise E8M0 scales.
+
+    Returns ``(q8, q_scales)`` for ``forward_prequantized``: E4M3
+    ``[tokens, 4, 128]`` and uint8 ``[tokens, 4, 4]``."""
     if (q.ndim != 3 or q.shape[1:] != (_HEADS, _HEAD_DIM) or q.dtype != torch.bfloat16 or not q.is_contiguous()):
         raise ValueError("Requires contiguous BF16 [tokens, 4, 128] Q")
     _check_offsets(cu_seqlens_q, q.device)
@@ -1053,7 +1135,9 @@ def forward_prequantized(
 ):
     """Return output and natural-log LSE from prepared MXFP8 inputs.
 
-    ``fast_exp`` is as in ``forward``."""
+    ``q8`` and ``q_scales`` are ``prepare_q``'s outputs, the K/V payloads and
+    scales ``prepare_kv``'s, and ``total_kv`` is the number of key rows before
+    padding. ``fast_exp`` is as in ``forward``."""
     if (q8.ndim != 3 or q8.shape[1:] != (_HEADS, _HEAD_DIM) or q8.dtype != torch.float8_e4m3fn
             or not q8.is_contiguous()):
         raise ValueError("Requires contiguous E4M3 [tokens, 4, 128] Q")
@@ -1110,6 +1194,8 @@ def forward_prequantized(
 
 
 def _check(q, k, v, sm_scale, kv_contiguous=True):
+    """Validate forward's BF16 inputs; K and V may be non-contiguous when a
+    prepared kv_state stands in for their data."""
     for t in (q, k, v):
         if (t.ndim != 3 or t.shape[1:] != (_HEADS, _HEAD_DIM) or t.dtype != torch.bfloat16
                 or not (t.is_contiguous() or (t is not q and not kv_contiguous))):
@@ -1184,6 +1270,8 @@ def flash_attn_varlen_mxfp8(
     *,
     fast_exp=None,
 ):
+    """Catalog entry point of ``tlx.ops.flash_attn_varlen_mxfp8``: ``forward``'s
+    output alone. The maximum lengths are unused."""
     del max_seqlen_k
     del max_seqlen_q
     out, _, _ = forward(
@@ -1213,6 +1301,9 @@ def _launch_extended_forward(
     prequantized,
     work_schedule,
 ):
+    """Launch the attention kernel, then the fill for sequences with queries
+    but no keys. Returns (out, lse). ``q`` is BF16, or E4M3 with ``q_scales``
+    when ``prequantized``."""
     batch = cu_seqlens_k.numel() - 1
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     lse = torch.empty((_HEADS, q.shape[0]), dtype=torch.float32, device=q.device)

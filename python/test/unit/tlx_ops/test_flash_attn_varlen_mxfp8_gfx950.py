@@ -14,6 +14,8 @@ def _cu(lengths):
 
 
 def _reference(q, k, v, cu_q, cu_k, scale):
+    """FP32 attention per sequence: (out, natural-log LSE [heads, tokens]).
+    Query rows of a sequence with no keys stay zero with -inf LSE."""
     out = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
     lse = torch.full((q.shape[1], q.shape[0]), float("-inf"), device=q.device)
     for b in range(cu_q.numel() - 1):
@@ -33,16 +35,24 @@ def _reference(q, k, v, cu_q, cu_k, scale):
 @pytest.mark.parametrize(
     "lens_q,lens_k,fast_exp",
     [
+        # Two 128-key tiles per sequence, padded at the end only.
         ([96, 128], [160, 192], False),
+        # Several query tiles; the last key tile is all padding.
         ([320, 512], [384, 640], False),
+        # Sequences averaging at least 4096 keys, with the exact exponential.
         ([320, 512], [4096, 5000], False),
+        # Empty sequences, and queries with no keys.
         ([0, 320, 0, 128], [0, 384, 0, 0], False),
+        # The approximate exponential on short sequences.
         ([320, 512], [384, 640], True),
+        # Padding ahead of each sequence as well as behind it.
         ([320, 512, 320], [100, 300, 4100], True),
+        # Queries with no keys, and keys with no queries.
         ([128, 0, 320], [0, 300, 100], False),
     ],
 )
 def test_flash_attn_varlen_mxfp8_four_wave(lens_q, lens_k, fast_exp):
+    """The public op against FP32 attention over ragged and empty sequences."""
     from triton.tlx.ops import flash_attn_varlen_mxfp8
 
     torch.manual_seed(20)
@@ -67,6 +77,7 @@ def test_flash_attn_varlen_mxfp8_four_wave(lens_q, lens_k, fast_exp):
 
 
 def test_flash_attn_varlen_mxfp8_prequantized():
+    """Q quantized ahead of time gives the same bits as Q quantized in the kernel."""
     from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
 
     torch.manual_seed(20)
@@ -128,6 +139,7 @@ def test_flash_attn_varlen_mxfp8_default_fast_exp(lens_k, fast):
 
 
 def test_flash_attn_varlen_mxfp8_rejects_invalid_inputs():
+    """Mismatched K/V shapes and empty offset tensors raise InvalidInput."""
     from triton.tlx.ops import InvalidInput, flash_attn_varlen_mxfp8
 
     q = torch.randn(8, 4, 128, device="cuda", dtype=torch.bfloat16)
