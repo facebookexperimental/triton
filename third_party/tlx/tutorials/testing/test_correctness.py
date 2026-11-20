@@ -11,8 +11,6 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from triton._internal_testing import (is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_cdna4, is_hip_cdna5)
 
-from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor
-
 from triton.language.extra.tlx.tutorials.ikbo.ikbo_lce_triton import (
     create_inputs as _ikbo_lce_create_inputs,
     ikbo_lce as _ikbo_lce,
@@ -114,10 +112,6 @@ if is_hip():
         matmul as _amd_gemm_v7_slice, )
     from triton.language.extra.tlx.tutorials.gfx9_gemm.a16w16.v9_beyond_hotloop.matmul_kernel import (
         matmul as _amd_gemm_v9_beyond_hotloop, )
-    from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_tdm_pipelined import (
-        matmul as _amd_mxfp_gemm_tdm_pipelined,
-        pack_scale as _amd_mxfp_pack_scale,
-    )
     from triton.language.extra.tlx.tutorials.gfx950_gdpa import (
         gdpa as _gfx950_gdpa,
         gdpa_ref as _gfx950_gdpa_ref,
@@ -270,18 +264,6 @@ class Gemm:
             "GROUP_M": 8,
             "NUM_BUFFERS": 3,
             "num_warps": 8,
-        },
-        "amd_mxfp_gemm_tdm_pipelined": {
-            "BLOCK_M": 128,
-            "BLOCK_N": 128,
-            "BLOCK_K": 128,
-            "GROUP_SIZE_M": 8,
-            "NUM_BUFFERS": 2,
-            "DTYPE_A": "e5m2",
-            "DTYPE_B": "e5m2",
-            "SCALE_BLOCK": 32,
-            "num_warps": 4,
-            "waves_per_eu": 1,
         },
         "amd_gemm_pipelined": {
             "BLOCK_SIZE_M": 128,
@@ -1470,140 +1452,6 @@ def test_shared_a_bmm_production_dispatches_at_group_boundaries(batch, m, n, k, 
     expected = torch.bmm(a, b)
     atol = 5e-1 if dtype == torch.bfloat16 else 2e-2
     torch.testing.assert_close(actual, expected, atol=atol, rtol=2e-2)
-
-
-# =============================================================================
-# AMD MXFP TDM GEMM Tests (gfx1250)
-# =============================================================================
-
-
-def _mxfp_e8m0_to_float32(scale):
-    scale = scale.view(torch.uint8).to(torch.int32)
-    scale = scale << 23
-    return scale.view(torch.float32)
-
-
-def _torch_gemm_mxfp(a, b, a_scale, b_scale, scale_block, M, N, K):
-    a_scale_f32 = _mxfp_e8m0_to_float32(a_scale).repeat_interleave(scale_block, dim=1)[:M, :K]
-    b_scale_f32 = _mxfp_e8m0_to_float32(b_scale).repeat_interleave(scale_block, dim=1).T.contiguous()[:K, :N]
-    return torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32)
-
-
-def _init_fp8_e5m2(rows, cols):
-    return torch.randint(20, 40, (rows, cols), dtype=torch.uint8).view(torch.float8_e5m2)
-
-
-@pytest.mark.parametrize("TRANSPOSE_B", [False])
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
-def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
-    torch.manual_seed(0)
-    M = N = 256
-    K = 512
-    scale_block = Gemm.CONFIGS["amd_mxfp_gemm_tdm_pipelined"]["SCALE_BLOCK"]
-    a = _init_fp8_e5m2(M, K)
-    b = _init_fp8_e5m2(K, N)
-    a_scale = MXScaleTensor(size=(M, triton.cdiv(K, scale_block))).random(high=32.0).data
-    b_scale = MXScaleTensor(size=(N, triton.cdiv(K, scale_block))).random(high=32.0).data
-    ref = _torch_gemm_mxfp(a, b, a_scale, b_scale, scale_block, M, N, K)
-
-    a_scale = _amd_mxfp_pack_scale(a_scale)
-    b_scale = _amd_mxfp_pack_scale(b_scale)
-    a_d = a.contiguous().to(DEVICE)
-    b_d = (b.T.contiguous() if TRANSPOSE_B else b.contiguous()).to(DEVICE)
-
-    config = Gemm.CONFIGS["amd_mxfp_gemm_tdm_pipelined"].copy()
-    config["TRANSPOSE_B"] = TRANSPOSE_B
-    out = _amd_mxfp_gemm_tdm_pipelined(a_d, b_d, a_scale.to(DEVICE), b_scale.to(DEVICE), config=config)
-    torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
-
-
-@pytest.mark.parametrize("dtype_b,block_k,buffers,k_iters,cross_tile_prefetch", [
-    ("e4m3", 128, 2, 3, True),
-    ("e4m3", 128, 3, 4, True),
-    ("e4m3", 128, 3, 5, True),
-    ("e4m3", 128, 3, 8, False),
-    ("e4m3", 128, 4, 4, True),
-    ("e4m3", 128, 4, 5, True),
-    ("e4m3", 256, 2, 2, False),
-    ("e4m3", 256, 2, 3, False),
-    ("e2m1", 256, 2, 3, False),
-    ("e2m1", 256, 3, 3, True),
-    ("e2m1", 256, 3, 4, False),
-])
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
-def test_amd_mxfp_persistent_short_k_stages(dtype_b, block_k, buffers, k_iters, cross_tile_prefetch):
-    _check_amd_mxfp_persistent(dtype_b, buffers, k_iters, cross_tile_prefetch, block_k)
-
-
-@pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
-@pytest.mark.parametrize("mode", ["none", "balanced", "chunked"])
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
-def test_amd_mxfp_persistent_xcd_remap(dtype_b, block_k, mode):
-    # Seventeen programs exercise both uneven XCD ranges and chunked tails;
-    # nine M tiles with group-M=8 also exercise the final short M group.
-    _check_amd_mxfp_persistent(dtype_b, 3, 5, block_k == 128, block_k, M=2304, N=768,
-                               extra_config=dict(NUM_PROGRAMS=17, GROUP_SIZE_M=8, XCD_REMAP=mode))
-
-
-@pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
-@pytest.mark.parametrize("k_iters", [3, 5])
-@pytest.mark.parametrize("cluster_size,multicast,group_m", [(2, True, 8), (4, True, 4), (4, True, 8), (4, False, 4)])
-@pytest.mark.parametrize("remap_mode", ["none", "chunked"])
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
-def test_amd_mxfp_persistent_multicast(dtype_b, block_k, k_iters, cluster_size, multicast, group_m, remap_mode):
-    # Distinct data/scales catch wrong recipients. Two tiles/program exercise
-    # cross-tile prefetch (BK128) and reusing A's LDS for C (BK256). K=3 has no
-    # steady loop; K=5 rotates the three-slot ring at the tile boundary.
-    _check_amd_mxfp_persistent(
-        dtype_b, 3, k_iters, block_k == 128, block_k, M=2048, N=1024,
-        extra_config=dict(NUM_PROGRAMS=16, GROUP_SIZE_M=group_m, XCD_REMAP=remap_mode, CLUSTER_SIZE=cluster_size,
-                          CLUSTER_MULTICAST=multicast))
-
-
-@pytest.mark.parametrize("dtype_b,block_k", [("e4m3", 128), ("e2m1", 256)])
-@pytest.mark.parametrize("k_iters", [3, 10])
-@pytest.mark.parametrize("interval,remap_mode,group_m,multicast", [
-    (0, "none", 8, True),
-    (0, "chunked", 4, True),
-    (0, "none", 8, False),
-    (4, "none", 4, True),
-    (3, "chunked", 4, True),
-])
-@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
-def test_amd_mxfp_persistent_cluster_barrier_interval(dtype_b, block_k, k_iters, interval, remap_mode, group_m,
-                                                      multicast):
-    _check_amd_mxfp_persistent(
-        dtype_b, 3, k_iters, block_k == 128, block_k, M=2048, N=1024,
-        extra_config=dict(NUM_PROGRAMS=16, GROUP_SIZE_M=group_m, XCD_REMAP=remap_mode, CLUSTER_SIZE=4,
-                          CLUSTER_MULTICAST=multicast, CLUSTER_BARRIER_INTERVAL=interval))
-
-
-def _check_amd_mxfp_persistent(dtype_b, buffers, k_iters, cross_tile_prefetch, block_k, M=768, N=512,
-                               extra_config=None):
-    # Three output tiles per program, including a short final M group. Exercise
-    # both an empty steady loop and a K count that rotates the ring's phase.
-    torch.manual_seed(123)
-    K = block_k * k_iters
-    a = (torch.randn(M, K) * 0.5).to(torch.float8_e4m3fn)
-    if dtype_b == "e2m1":
-        b_mx = MXFP4Tensor(size=(N, K)).random()
-        b, b_ref = b_mx.to_packed_tensor(dim=1), b_mx.to(torch.float32)
-    else:
-        b = (torch.randn(N, K) * 0.5).to(torch.float8_e4m3fn)
-        b_ref = b.float()
-    a_scale = torch.randint(125, 130, (M, K // 32), dtype=torch.uint8)
-    b_scale = torch.randint(125, 130, (N, K // 32), dtype=torch.uint8)
-    a_ref = a.float() * _mxfp_e8m0_to_float32(a_scale).repeat_interleave(32, dim=1)
-    b_ref *= _mxfp_e8m0_to_float32(b_scale).repeat_interleave(32, dim=1)
-    ref = a_ref @ b_ref.T
-    config = dict(BLOCK_M=256, BLOCK_N=256, BLOCK_K=block_k, NUM_BUFFERS=buffers, DTYPE_A="e4m3", DTYPE_B=dtype_b,
-                  TRANSPOSE_B=True, SCHEDULE="sliceMNK", TDM_FUSION="partial", PERSISTENT=True, NUM_PROGRAMS=2,
-                  GROUP_SIZE_M=2, CROSS_TILE_PREFETCH=cross_tile_prefetch)
-    config.update(extra_config or {})
-    out = _amd_mxfp_gemm_tdm_pipelined(a.to(DEVICE), b.to(DEVICE),
-                                       _amd_mxfp_pack_scale(a_scale).to(DEVICE),
-                                       _amd_mxfp_pack_scale(b_scale).to(DEVICE), config=config)
-    torch.testing.assert_close(out.cpu(), ref, atol=2e-3, rtol=1e-4)
 
 
 # =============================================================================

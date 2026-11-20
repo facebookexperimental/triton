@@ -37,7 +37,7 @@ Ops with no heuristic yet -- flash_attn on sm90/sm100/gfx950, flash_attn_mxfp8, 
 kimi_delta_attention -- still default to "full". Their remaining space is "smoke", which selects for
 lowering-path coverage rather than speed, so defaulting to it would quietly
 ship a bad config. Each needs its own `heuristic_config` before it can offer a
-fast first call. `mm_mxfp8` defaults to "full" on sm100 because its tuned configs are measurably
+fast first call. `mm_mxfp` defaults to "full" on sm100 because its tuned configs are measurably
 faster; gfx950 uses "heuristic". Pass `space="heuristic"` for a fast first call.
 `mm_mxfp6` also defaults to "full" because its tuned configs are measurably faster.
 `hstu_cross_attn` on gfx950 defaults to "curated": at head dims 64 and 128 it
@@ -121,7 +121,7 @@ from ._normalization import (
 )
 
 __all__ = [
-    "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp8", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
+    "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
     "moe_routing", "moe_router_topk_align", "norm_residual_norm", "all_reduce", "all_reduce_workspace",
     "all_reduce_norm_residual_norm", "rmsnorm_gate", "router_gemm", "qk_norm_rope_kv_cache", "addmm", "addmm_mul_add",
     "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen", "linear_rowscale",
@@ -292,11 +292,11 @@ def mm_bias_grad(dout, input_act, *, out=None, space=None):
     return fn(dout, input_act, out=out, space=spec.default_space if space is None else space)
 
 
-def _check_mm_mxfp8_scales(a_scale, b_scale, *, M, N, K, sf_layout):
+def _check_mm_mxfp_scales(a_scale, b_scale, *, M, N, K, sf_layout):
     if sf_layout == "natural":
         expected_a, expected_b = (M, K // 32), (N, K // 32)
         if a_scale.shape != expected_a or b_scale.shape != expected_b:
-            raise InvalidInput("tlx.ops.mm_mxfp8 natural scales must have exact shapes "
+            raise InvalidInput("tlx.ops.mm_mxfp natural scales must have exact shapes "
                                f"a_scale={expected_a}, b_scale={expected_b}; got "
                                f"a_scale={tuple(a_scale.shape)}, b_scale={tuple(b_scale.shape)}")
         return
@@ -310,26 +310,27 @@ def _check_mm_mxfp8_scales(a_scale, b_scale, *, M, N, K, sf_layout):
                           (2048, 32768, 6144),
                       } else ((N + 95) // 96) * 128 * (K // 32))
         if a_scale.numel() != expected_a or b_scale.numel() != expected_b:
-            raise InvalidInput("tlx.ops.mm_mxfp8 mfma_preshuffled scales must contain exactly "
+            raise InvalidInput("tlx.ops.mm_mxfp mfma_preshuffled scales must contain exactly "
                                f"{expected_a} a-scale and {expected_b} b-scale bytes; "
                                f"got {a_scale.numel()} and {b_scale.numel()}")
         return
     if sf_layout != "cublas_blocked":
-        raise InvalidInput("tlx.ops.mm_mxfp8 sf_layout must be 'natural', 'cublas_blocked', "
+        raise InvalidInput("tlx.ops.mm_mxfp sf_layout must be 'natural', 'cublas_blocked', "
                            "or 'mfma_preshuffled'; "
                            f"got {sf_layout!r}")
     # Each 128x4 atom includes padded rows when M or N is ragged.
     expected_a = ((M + 127) // 128) * 128 * (K // 32)
     expected_b = ((N + 127) // 128) * 128 * (K // 32)
     if a_scale.numel() != expected_a or b_scale.numel() != expected_b:
-        raise InvalidInput("tlx.ops.mm_mxfp8 cublas_blocked scales must contain exactly "
+        raise InvalidInput("tlx.ops.mm_mxfp cublas_blocked scales must contain exactly "
                            f"{expected_a} a-scale and {expected_b} b-scale bytes; "
                            f"got {a_scale.numel()} and {b_scale.numel()}")
 
 
-def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space=None):
-    """``a @ b.T`` over pre-quantized MXFP8 inputs, returning BF16 ``[M, N]``.
+def mm_mxfp(a, a_scale, b, b_scale, *, a_dtype="e4m3", b_dtype="e4m3", out=None, sf_layout="natural", space=None):
+    """``a @ b.T`` over pre-quantized MX inputs, returning BF16 ``[M, N]``.
 
+    ``a_dtype`` and ``b_dtype`` name the MX element formats; every backend supports only ``"e4m3"`` today.
     ``a`` is contiguous E4M3 ``[M, K]`` and ``b`` is contiguous E4M3 ``[N, K]``
     (K-major, as for a linear weight); K must be a multiple of 128.
     M and N may be ragged on gfx950; sm100 still requires 128-aligned rows,
@@ -352,56 +353,59 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space=Non
     """
     import torch
 
+    if (a_dtype, b_dtype) != ("e4m3", "e4m3"):
+        raise UnsupportedOp("tlx.ops.mm_mxfp supports only a_dtype='e4m3' and b_dtype='e4m3'; "
+                            f"got a_dtype={a_dtype!r}, b_dtype={b_dtype!r}")
     tensors = (a, a_scale, b, b_scale)
     if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
-        raise InvalidInput("tlx.ops.mm_mxfp8 expects tensor inputs")
+        raise InvalidInput("tlx.ops.mm_mxfp expects tensor inputs")
     if a.ndim != 2 or b.ndim != 2:
-        raise InvalidInput("tlx.ops.mm_mxfp8 expects rank-2 a and b; "
+        raise InvalidInput("tlx.ops.mm_mxfp expects rank-2 a and b; "
                            f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     M, K = a.shape
     N, b_k = b.shape
     if b_k != K:
-        raise InvalidInput("tlx.ops.mm_mxfp8 reduction dimensions must match; "
+        raise InvalidInput("tlx.ops.mm_mxfp reduction dimensions must match; "
                            f"got a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}")
     if min(M, N, K) <= 0 or K % 128:
-        raise InvalidInput("tlx.ops.mm_mxfp8 requires positive M and N and K divisible by 128; "
+        raise InvalidInput("tlx.ops.mm_mxfp requires positive M and N and K divisible by 128; "
                            f"got M={M}, N={N}, K={K}")
     if (M % 128 or N % 128) and (a.device.type != "cuda" or _target(a.device).key != "gfx950"):
-        raise InvalidInput("tlx.ops.mm_mxfp8 requires M and N divisible by 128 outside gfx950; "
+        raise InvalidInput("tlx.ops.mm_mxfp requires M and N divisible by 128 outside gfx950; "
                            f"got M={M}, N={N}")
     if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
-        raise InvalidInput("tlx.ops.mm_mxfp8 expects E4M3 a and b; "
+        raise InvalidInput("tlx.ops.mm_mxfp expects E4M3 a and b; "
                            f"got a.dtype={a.dtype}, b.dtype={b.dtype}")
     valid_scale_dtypes = ((torch.uint8, torch.float8_e8m0fnu) if sf_layout == "mfma_preshuffled" else
                           (torch.float8_e8m0fnu, ))
     if a_scale.dtype not in valid_scale_dtypes or b_scale.dtype not in valid_scale_dtypes:
-        raise InvalidInput("tlx.ops.mm_mxfp8 expects E8M0 a_scale and b_scale; "
+        raise InvalidInput("tlx.ops.mm_mxfp expects E8M0 a_scale and b_scale; "
                            f"got a_scale.dtype={a_scale.dtype}, b_scale.dtype={b_scale.dtype}")
     if not all(tensor.is_contiguous() for tensor in tensors):
-        raise InvalidInput("tlx.ops.mm_mxfp8 expects all inputs to be contiguous")
+        raise InvalidInput("tlx.ops.mm_mxfp expects all inputs to be contiguous")
     if a.device.type != "cuda" or any(tensor.device != a.device for tensor in tensors[1:]):
-        raise InvalidInput("tlx.ops.mm_mxfp8 expects all inputs on the same CUDA device; "
+        raise InvalidInput("tlx.ops.mm_mxfp expects all inputs on the same CUDA device; "
                            f"got {[tensor.device for tensor in tensors]}")
-    _check_mm_mxfp8_scales(a_scale, b_scale, M=M, N=N, K=K, sf_layout=sf_layout)
+    _check_mm_mxfp_scales(a_scale, b_scale, M=M, N=N, K=K, sf_layout=sf_layout)
     if out is not None:
         if not isinstance(out, torch.Tensor):
-            raise InvalidInput("tlx.ops.mm_mxfp8 expects out to be a tensor or None")
+            raise InvalidInput("tlx.ops.mm_mxfp expects out to be a tensor or None")
         if out.shape != (M, N) or out.dtype != torch.bfloat16 or out.device != a.device or not out.is_contiguous():
-            raise InvalidInput("tlx.ops.mm_mxfp8 out must be contiguous BF16 [M, N] on a's device; "
+            raise InvalidInput("tlx.ops.mm_mxfp out must be contiguous BF16 [M, N] on a's device; "
                                f"got shape={tuple(out.shape)}, dtype={out.dtype}, device={out.device}")
         if any(torch._C._overlaps(out, tensor) for tensor in tensors):
-            raise InvalidInput("tlx.ops.mm_mxfp8 out must not overlap any input")
-    space_name, invariance = _normalize_space_arg("mm_mxfp8", space)
+            raise InvalidInput("tlx.ops.mm_mxfp out must not overlap any input")
+    space_name, invariance = _normalize_space_arg("mm_mxfp", space)
     if space_name is not None and space_name not in ("heuristic", "full"):
-        raise InvalidInput(f"tlx.ops.mm_mxfp8 does not provide space={space_name!r}")
+        raise InvalidInput(f"tlx.ops.mm_mxfp does not provide space={space_name!r}")
 
-    fn, spec = impl_for("mm_mxfp8", device=a.device)
+    fn, spec = impl_for("mm_mxfp", device=a.device)
     if space_name is None:
         space_name = spec.default_space
     tma_tensors = tensors if out is None else (*tensors, out)
     check_inputs(spec, dtype=a.dtype, base_ptrs=tuple(tensor.data_ptr() for tensor in tma_tensors))
     check_backward(spec, *tensors, out)
-    _check_enforced("mm_mxfp8", spec, invariance)
+    _check_enforced("mm_mxfp", spec, invariance)
     return fn(a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, space=space_name)
 
 

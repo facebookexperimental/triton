@@ -1,4 +1,4 @@
-"""Blackwell (sm100) MXFP8 GEMM -- the ``tlx.ops.mm_mxfp8`` implementation.
+"""Blackwell (sm100) MXFP8 GEMM -- the ``tlx.ops.mm_mxfp`` implementation.
 
 Promoted from ``tutorials/blackwell_gemm_ws_mxfp8.py``, which is now frozen.
 
@@ -1500,13 +1500,17 @@ def _gemm_mxfp8_ws_kernel(  # noqa: TR001
 
 
 def _scale_5d(scale, rows, K, sf_layout):
-    """View or pack E8M0 scales into the cuBLAS-blocked 5D tile layout."""
+    """View or pack E8M0 scales into the cuBLAS-blocked 5D tile layout, as raw bytes.
+
+    The kernel stages scales in ``tl.uint8`` shared memory, so the TMA descriptor
+    must be ``uint8`` as well.
+    """
     k_chunks = K // (4 * VEC_SIZE)
+    scale = scale.view(torch.uint8)
     if sf_layout == "natural":
         # row = row_group * 32 + row_lane; within a 512-byte atom,
         # dest = row_lane * 16 + row_group * 4 + col.
-        packed = scale.view(torch.uint8).view(rows // 128, 4, 32, k_chunks, 4).permute(0, 3, 2, 1, 4).contiguous()
-        scale = packed.view(torch.float8_e8m0fnu)
+        scale = scale.view(rows // 128, 4, 32, k_chunks, 4).permute(0, 3, 2, 1, 4).contiguous()
     elif sf_layout != "cublas_blocked":
         raise ValueError(f"unsupported sf_layout {sf_layout!r}; expected 'natural' or 'cublas_blocked'")
     return scale.reshape(1, rows // 128, k_chunks, 2, 256)
@@ -1596,10 +1600,10 @@ def _run_config(a, a_scale, b, b_scale, meta, *, out=None, sf_layout="natural"):
                        num_sms=_num_sms(a.device.index))
 
 
-def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
+def mm_mxfp(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
     """``a @ b.T`` for pre-quantized MXFP8 operands on Blackwell, as BF16.
 
-    Inputs are validated by ``tlx.ops.mm_mxfp8``. ``space`` is "full"
+    Inputs are validated by ``tlx.ops.mm_mxfp``. ``space`` is "full"
     (autotune, the default) or "heuristic" (one shape-picked config).
     """
     if space not in ("heuristic", "full"):
@@ -1612,4 +1616,4 @@ def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
         return _launch(kernel, a, a_scale, b, b_scale, out=out, sf_layout=sf_layout, num_sms=num_sms)
 
 
-__all__ = ["mm_mxfp8"]
+__all__ = ["mm_mxfp"]

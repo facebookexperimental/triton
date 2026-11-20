@@ -1,6 +1,8 @@
 """Benchmark the persistent gfx1250 MXFP8 x MXFP8 and MXFP8 x MXFP4 GEMM.
 
-Each case runs in a separate process through amd_mxfp_gemm_tdm_pipelined.py.
+Each case runs in a separate process through ``bench_gfx1250.py --single``,
+which runs one shape with every ``mxgemm_tdm_pipelined`` option (``--single
+--help``).
 By default both variants run at 8192x8192x4096, 8192x8192x8192,
 16384x16384x16384, and 32768x32768x32768, first with FP32 and then with FP16
 output.
@@ -36,6 +38,11 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+import torch
+import triton
+from triton.tlx.ops.kernels.mm_mxfp import gfx1250
+from triton.tools.mxfp import MXScaleTensor
 
 DEFAULT_CASES = ((8192, 8192, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (32768, 32768, 32768))
 VARIANT_DTYPES_B = {"mx8xmx8": "float8_e4m3", "mx8xmx4": "float4"}
@@ -118,7 +125,8 @@ def _command(args, case, dtype_b):
     m, n, k = case
     command = [
         sys.executable,
-        str(Path(__file__).resolve().with_name("amd_mxfp_gemm_tdm_pipelined.py")),
+        str(Path(__file__).resolve()),
+        "--single",
         "-M",
         str(m),
         "-N",
@@ -356,5 +364,155 @@ def main(argv=None):
     return int(any(row["status"] != "ok" for row in results))
 
 
+def run_single(argv=None):
+    """Run one shape through ``mxgemm_tdm_pipelined`` with every launcher option."""
+    parser = argparse.ArgumentParser(description="Run one gfx1250 MXFP GEMM shape")
+    parser.add_argument("-M", type=int, default=2048, help="problem M size")
+    parser.add_argument("-N", type=int, default=1024, help="problem N size")
+    parser.add_argument("-K", type=int, default=8192, help="problem K size")
+    parser.add_argument("-BM", type=int, default=256, help="BLOCK_M")
+    parser.add_argument("-BN", type=int, default=256, help="BLOCK_N")
+    parser.add_argument("-BK", type=int, default=256, help="BLOCK_K")
+    parser.add_argument("--num_buffers", type=int, default=3, choices=[2, 3, 4])
+    parser.add_argument("--group_size_m", type=int, default=8, choices=[1, 2, 4, 8])
+    parser.add_argument("--dtype_a", type=str, default="float8_e4m3", choices=tuple(gfx1250.DTYPE_TO_TRITON))
+    parser.add_argument("--dtype_b", type=str, default="float4", choices=tuple(gfx1250.DTYPE_TO_TRITON))
+    parser.add_argument("--scale_preshuffled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--with_a_scale", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--transpose_b", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--schedule", type=str, default="sliceMNK",
+                        choices=["baseline", "sliceK", "sliceNK", "sliceMNK"])
+    parser.add_argument("--tdm_fusion", type=str, default="partial", choices=["none", "2way", "4way", "partial"])
+    parser.add_argument("--partial_tdm", action="store_true",
+                        help="Alias for --tdm_fusion partial, matching the Gluon CLI spelling")
+    parser.add_argument("--tdm_split", action="store_true")
+    parser.add_argument("--persistent", action="store_true", help="use the persistent sliceMNK kernel")
+    parser.add_argument("--output_c_slots", type=int, default=None,
+                        help="dedicated BK128 output staging slots (default: 2)")
+    parser.add_argument(
+        "--static_slot_unroll", action="store_true",
+        help="unroll the three- or four-buffer BK128 steady loop by its ring depth with "
+        "loop-invariant slots")
+    parser.add_argument("--merged_handoff_barrier", action="store_true",
+                        help="four-buffer static loop: one workgroup barrier per K step, split around the C01 WMMAs")
+    parser.add_argument("--static_cluster_steps", action="store_true",
+                        help="static loop: test the cluster rendezvous only in unrolled steps that can hit it")
+    parser.add_argument(
+        "--scale_layout", choices=("block128", "wave256"), default="block128",
+        help="preshuffled scale format; wave256 reads both quadrants' scales with one ds_load_b128 per wave "
+        "(persistent A8W8 BK128)")
+    parser.add_argument("--overlap_peel", action="store_true",
+                        help="run each next tile's first K step inside the BK128 output epilogue")
+    parser.add_argument("--out_dtype", choices=OUT_DTYPES, default="fp32",
+                        help="C element type; FP16 converts the FP32 accumulators before storing")
+    parser.add_argument("--num_programs", type=int, default=None, help="persistent workgroup count (default: CU count)")
+    parser.add_argument("--xcd_remap", choices=tuple(gfx1250.XCD_REMAP_MODES), default="none")
+    parser.add_argument("--num_xcds", type=int, default=8)
+    parser.add_argument("--xcd_chunk", type=int, default=2)
+    parser.add_argument("--cluster_size", type=int, choices=(1, 2, 4, 8, 16), default=1)
+    parser.add_argument("--cluster_layout", choices=("linear", ) + tuple(GRID_CLUSTER_LAYOUTS), default="linear",
+                        help="map clusters to R M tiles by C N tiles with RxC (2x2 for four CTAs)")
+    parser.add_argument("--split_cluster_barrier", action="store_true",
+                        help="overlap periodic cluster rendezvous with independent steady-loop matrix work")
+    parser.add_argument("--early_c_stores", action="store_true",
+                        help="interleave final quadrant dots and output stores")
+    parser.add_argument("--cluster_barrier_interval", type=int, default=1,
+                        help="align cluster requests every N input K blocks; 0 disables all cluster barriers")
+    parser.add_argument("--cluster_multicast", action=argparse.BooleanOptionalAction, default=True,
+                        help="share data and scales within a cluster; disable to keep only cluster synchronization")
+    parser.add_argument(
+        "--cross_tile_prefetch", action=argparse.BooleanOptionalAction, default=True,
+        help="prefetch next-tile inputs during the K tail, or overlap C retirement with BK256 FP4 refills")
+    parser.add_argument("--l2_prefetch_distance", type=int, default=-1,
+                        help="Prefetch distance in K iterations; -1 disables L2 prefetch")
+    parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
+    parser.add_argument("--benchmark_warmup_seconds", type=float, default=0.0,
+                        help="repeat timing batches for this long before measuring")
+    parser.add_argument("--benchmark_duration_seconds", type=float, default=0.0,
+                        help="report the median timing batch over this period (0: one batch)")
+    parser.add_argument("--benchmark_num_iters", type=int, default=32,
+                        help="timing repetition budget in milliseconds (not an iteration count)")
+    parser.add_argument("--tiles_per_warp", nargs=2, type=int, choices=(1, 2), default=(2, 2), metavar=("M", "N"),
+                        help="WMMA tiles per warp in M and N (default: 2 2)")
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args(argv)
+
+    torch.manual_seed(args.seed)
+    a = gfx1250._init_data(args.dtype_a, args.M, args.K)
+    b = gfx1250._init_data(args.dtype_b, args.K, args.N)
+    if args.with_a_scale:
+        a_scale = MXScaleTensor(size=(args.M, triton.cdiv(args.K, 32))).random(high=32.0).data
+    else:
+        a_scale = None
+    b_scale = MXScaleTensor(size=(args.N, triton.cdiv(args.K, 32))).random(high=32.0).data
+
+    a_scale_input = (gfx1250.pack_scale(a_scale, layout=args.scale_layout)
+                     if args.scale_preshuffled and a_scale is not None else a_scale)
+    b_scale_input = gfx1250.pack_scale(b_scale, layout=args.scale_layout) if args.scale_preshuffled else b_scale
+    if args.dtype_a == "float4":
+        a = a.to_packed_tensor(dim=1)
+    if args.dtype_b == "float4":
+        b = b.to_packed_tensor(dim=0)
+
+    a_d = a.data.contiguous().cuda() if args.dtype_a == "float4" else a.contiguous().cuda()
+    if args.dtype_b == "float4":
+        b_d = b.data.T.contiguous().cuda() if args.transpose_b else b.data.contiguous().cuda()
+    else:
+        b_d = b.T.contiguous().cuda() if args.transpose_b else b.contiguous().cuda()
+    a_scale_d = a_scale_input.cuda() if a_scale_input is not None else None
+    b_scale_d = b_scale_input.cuda()
+
+    gfx1250.mxgemm_tdm_pipelined(
+        a_d,
+        b_d,
+        a_scale_d,
+        b_scale_d,
+        args.BM,
+        args.BN,
+        args.BK,
+        args.transpose_b,
+        args.num_buffers,
+        gfx1250.DTYPE_TO_TRITON[args.dtype_a],
+        gfx1250.DTYPE_TO_TRITON[args.dtype_b],
+        args.scale_preshuffled,
+        args.with_a_scale,
+        args.schedule,
+        args.l2_prefetch_distance,
+        args.M,
+        args.N,
+        args.K,
+        "partial" if args.partial_tdm else args.tdm_fusion,
+        args.tdm_split,
+        args.group_size_m,
+        None if args.benchmark_mode == "none" else args.benchmark_mode,
+        args.benchmark_num_iters,
+        BENCHMARK_WARMUP_SECONDS=args.benchmark_warmup_seconds,
+        BENCHMARK_DURATION_SECONDS=args.benchmark_duration_seconds,
+        PERSISTENT=args.persistent,
+        NUM_PROGRAMS=args.num_programs,
+        CROSS_TILE_PREFETCH=args.cross_tile_prefetch,
+        XCD_REMAP=args.xcd_remap,
+        NUM_XCDS=args.num_xcds,
+        XCD_CHUNK=args.xcd_chunk,
+        CLUSTER_SIZE=args.cluster_size,
+        CLUSTER_MULTICAST=args.cluster_multicast,
+        CLUSTER_BARRIER_INTERVAL=args.cluster_barrier_interval,
+        CLUSTER_LAYOUT=args.cluster_layout,
+        SPLIT_CLUSTER_BARRIER=args.split_cluster_barrier,
+        EARLY_C_STORES=args.early_c_stores,
+        STATIC_SLOT_UNROLL=args.static_slot_unroll,
+        OUTPUT_C_SLOTS=args.output_c_slots,
+        OVERLAP_PEEL=args.overlap_peel,
+        MERGED_HANDOFF_BARRIER=args.merged_handoff_barrier,
+        STATIC_CLUSTER_STEPS=args.static_cluster_steps,
+        SCALE_LAYOUT=args.scale_layout,
+        OUT_DTYPE=args.out_dtype,
+        TILES_PER_WARP=tuple(args.tiles_per_warp),
+    )
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if sys.argv[1:2] == ["--single"]:
+        run_single(sys.argv[2:])
+    else:
+        raise SystemExit(main())

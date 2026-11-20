@@ -65,7 +65,7 @@ options:
 | op | reference | gate | default space |
 |----|-----------|------|---------------|
 | `mm` | `torch.matmul` | speedup >= 0.9x | heuristic |
-| `mm_mxfp8` | `torch.mm` on pre-dequantized BF16 inputs | reports ratio only; non-equivalent reference | heuristic |
+| `mm_mxfp` | `torch.mm` on pre-dequantized BF16 inputs | reports ratio only; non-equivalent reference | heuristic |
 | `addmm` | `torch.addmm` | speedup >= 0.9x | heuristic |
 | `mm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `addmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
