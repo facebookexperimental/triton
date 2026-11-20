@@ -430,6 +430,16 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="router_gemm",
+        arch="sm100",
+        variant="bf16x3_split_k",
+        impl="triton.tlx.ops.kernels.router_gemm.sm100:router_gemm",
+        dtypes=_BF16,
+        # The gfx950 kernels with sm100 configs: the same powers of two divide E and K.
+        accepts=lambda d: d["E"] > 0 and d["E"] % 16 == 0 and d["K"] > 0 and d["K"] % 1024 == 0,
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="mm_torchtlx",
         arch="sm90",
         variant="inductor_hopper_gemm_ws",
