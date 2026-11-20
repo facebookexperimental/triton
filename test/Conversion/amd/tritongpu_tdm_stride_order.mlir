@@ -137,7 +137,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %c_shape = arith.constant 128 : i32
     %c_stride = arith.constant 128 : i64
     %c_stride1 = arith.constant 1 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape, %c_shape, %c_shape], [%c_stride, %c_stride, %c_stride, %c_stride1] : <bf16>, <1x16x1x64xbf16, #shared>
+    %0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape, %c_shape, %c_shape], [%c_stride, %c_stride, %c_stride, %c_stride1] : !tt.ptr<bf16>, !tt.tensordesc<1x16x1x64xbf16, #shared>
     tt.return
   }
 }
