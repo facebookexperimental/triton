@@ -93,22 +93,39 @@ def install(python, wheel):
         raise RuntimeError(f"{lib} does not match {Path(wheel).name}")
 
 
-def pick_gpu(python, repo):
-    """The physical GPU index the harness would pick, so every run measures on that one GPU.
+def describe_gpu(python, repo, spec):
+    """The GPU the harness picks for SPEC ('auto' or a physical index), as a dict, or None.
 
-    The harness package imports triton, so this only works once a wheel is installed.
+    Every run is then pinned to that one GPU. The dict carries the name and
+    arch the report shows, because the harness records neither on AMD. The
+    harness package imports triton, so this only works once a wheel is installed.
     """
-    code = ("import sys; sys.path.insert(0, 'python/test/tlx_benchmark'); "
-            "from _harness.denoise import select_device; print(select_device('auto').index)")
+    code = ("import json, sys; sys.path.insert(0, 'python/test/tlx_benchmark'); "
+            "from _harness.denoise import select_device; "
+            f"d = select_device({spec!r}); "
+            "print(json.dumps({'index': d.index, 'name': d.name, 'vendor': d.vendor, 'arch': d.arch}))")
     try:
         out = subprocess.run([python, "-c", code], cwd=repo, check=True, capture_output=True, text=True, timeout=120)
-        return str(int(out.stdout.strip().splitlines()[-1]))
+        device = json.loads(out.stdout.strip().splitlines()[-1])
+        int(device["index"])
     except subprocess.CalledProcessError as exc:
         tail = (exc.stderr or "").strip().splitlines()[-1:]
-        print(f"could not pre-select a GPU ({tail[0] if tail else exc}); each run picks its own", file=sys.stderr)
-    except (subprocess.SubprocessError, ValueError, IndexError) as exc:
-        print(f"could not pre-select a GPU ({exc}); each run picks its own", file=sys.stderr)
-    return "auto"
+        print(f"could not identify the GPU ({tail[0] if tail else exc}); each run picks its own", file=sys.stderr)
+        return None
+    except (subprocess.SubprocessError, ValueError, IndexError, KeyError, TypeError) as exc:
+        print(f"could not identify the GPU ({exc}); each run picks its own", file=sys.stderr)
+        return None
+    if device.get("vendor") == "amd":
+        device["driver"] = amd_driver_version()
+    return device
+
+
+def amd_driver_version():
+    """The amdgpu kernel driver version, e.g. '6.14.14', or None."""
+    try:
+        return Path("/sys/module/amdgpu/version").read_text().strip() or None
+    except OSError:
+        return None
 
 
 def sanitize_env(env):
@@ -199,7 +216,7 @@ def bench(args):
     results = {
         "schema": SCHEMA, "platform": args.platform, "rounds": args.rounds, "gpu_index": gpu, "select": args.select,
         "head_cases": args.head_cases, "wheels": {side: w.name if w else None
-                                                  for side, w in wheels.items()}, "env": {}, "runs": []
+                                                  for side, w in wheels.items()}, "env": {}, "device": None, "runs": []
     }
     sides = [side for side in SIDES if wheels[side]]
     for rnd in range(1, args.rounds + 1):
@@ -208,14 +225,17 @@ def bench(args):
         for side in order:
             print(f"== round {rnd}/{args.rounds}: {side} ({wheels[side].name})", flush=True)
             installed = False
-            if gpu == "auto" and not results["runs"]:
-                # Pin the GPU the harness picks for the first run; its picker needs an installed triton.
+            if not results["runs"]:
+                # Identify and pin the GPU before the first run; the harness's picker needs an installed triton.
                 try:
                     install(sys.executable, wheels[side])
                     installed = True
                 except (subprocess.SubprocessError, OSError, RuntimeError, ValueError, StopIteration):
                     pass
-                gpu = results["gpu_index"] = pick_gpu(sys.executable, args.repo)
+                device = describe_gpu(sys.executable, args.repo, gpu)
+                if device:
+                    results["device"] = device
+                    gpu = results["gpu_index"] = str(device["index"])
             record, env = run_side(args, side, rnd, wheels[side], gpu, out, installed)
             results["env"] = results["env"] or env
             results["runs"].append(record)
@@ -393,10 +413,18 @@ def fmt_us(value):
     return f"{value:.1f}" if value < 1000 else f"{value:,.0f}"
 
 
-def env_line(env):
-    parts = [f"`{env['gpu']}`" if env.get("gpu") else None]
-    if env.get("driver"):
-        parts.append(f"driver {env['driver']}")
+def env_line(env, device=None):
+    """GPU, driver, runtime, torch and clock state; DEVICE fills what the harness left out (AMD)."""
+    device = device or {}
+    name = env.get("gpu")
+    if not name and device.get("name"):
+        vendor = "AMD " if device.get("vendor") == "amd" else ""
+        arch = f" ({device['arch']})" if device.get("arch") else ""
+        name = f"{vendor}{device['name']}{arch}"
+    parts = [f"`{name}`" if name else None]
+    driver = env.get("driver") or device.get("driver")
+    if driver:
+        parts.append(f"driver {driver}")
     torch_version = env.get("torch") or ""
     rocm = re.search(r"\+rocm([\d.]+)", torch_version)
     if rocm:
@@ -412,6 +440,19 @@ def env_line(env):
                     None)
         parts.append(f"clock locked at {lock.group(1)} MHz" if lock else "clock not locked (noisier)")
     return ", ".join(p for p in parts if p)
+
+
+def noise_line(rows):
+    """How far the rounds of one case disagree on this runner: the noise the 5% threshold sits on."""
+    spreads = sorted(((r["ratio_max"] - r["ratio_min"]) / r["ratio"], r["key"])
+                     for r in rows
+                     if r["ratio"] is not None and r["pairs"] >= 2)
+    if not spreads:
+        return None
+    median = statistics.median(value for value, _ in spreads)
+    widest, key = spreads[-1]
+    count = f"{len(spreads)} case{'s' if len(spreads) != 1 else ''}"
+    return f"Round-to-round spread on this GPU: median {median:.1%} across {count}, widest {widest:.1%} (`{key}`)."
 
 
 def flagged_line(rows, state, title):
@@ -482,7 +523,7 @@ def render(args, results, rows, groups, verdict, has_ab, baseline_date, context)
     # On pull_request runs HEAD is GitHub's test merge commit; a manual run benches the PR head itself.
     label = "merge" if merged else "head"
     head_note = f" (PR head `{args.pr_head[:12]}`)" if merged else ""
-    meta = env_line(results.get("env") or {})
+    meta = env_line(results.get("env") or {}, results.get("device"))
     run = f"[run]({args.run_url})" if args.run_url else ""
     lines.append(". ".join(p for p in (meta, run) if p) + ("." if meta or run else ""))
     lines.append("")
@@ -497,6 +538,9 @@ def render(args, results, rows, groups, verdict, has_ab, baseline_date, context)
             f"Base `{args.base[:12]}` vs {label} `{args.head[:12]}`{head_note}, {rounds} rounds alternating on one GPU. "
             f"A case is flagged when its median head/base throughput ratio moves at least {args.threshold:.0%} "
             f"and every round agrees.")
+        noise = noise_line(rows)
+        if noise:
+            lines.append(noise)
     else:
         lines.append(
             f"{label.capitalize()} `{args.head[:12]}`{head_note} only: the base wheel did not run, so there is no "

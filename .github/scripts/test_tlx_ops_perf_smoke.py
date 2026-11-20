@@ -183,6 +183,7 @@ def test_report_end_to_end(tmp_path):
     assert ("`NVIDIA H100 80GB HBM3`, driver 580.82.07, CUDA 13.0, torch 2.14.0+cu130, clock locked at 1980 MHz. "
             "[run](https://run).") in md
     assert "Base `aaaaaaaaaaaa` vs merge `bbbbbbbbbbbb` (PR head `cccccccccccc`), 3 rounds" in md
+    assert f"Round-to-round spread on this GPU: median 2.2% across 1 case, widest 2.2% (`{KEY}`)." in md
     assert f"**Slower (1):** `{KEY}` 0.900× (rounds 0.890–0.910)" in md
     assert "| `mm/sm90` | 1 | 0.900× | 0.900× | 0.900× | 1 | 0 | 0 |" in md
     # Base is what the nightly measured, so it carries the runner context; head moved by the PR would not.
@@ -252,6 +253,37 @@ def test_env_line_reports_rocm_and_unlocked_clocks():
     assert "clock" not in ab.env_line({**env, "governed": None})
 
 
+def test_env_line_takes_the_amd_gpu_from_the_device():
+    # The harness records no GPU name or driver on AMD; the bench's own device lookup fills them in.
+    env = {"gpu": None, "driver": None, "torch": "2.14.0+rocm7.2", "cuda": None, "governed": ["NUMA node 0 (128 CPUs)"]}
+    device = {"index": 4, "name": "MI350X", "vendor": "amd", "arch": "gfx950", "driver": "6.14.14"}
+    assert ab.env_line(env, device) == ("`AMD MI350X (gfx950)`, driver 6.14.14, ROCm 7.2, torch 2.14.0+rocm7.2, "
+                                        "clock not locked (noisier)")
+    nvidia = {"gpu": "NVIDIA H100 80GB HBM3", "driver": "580.82.07", "cuda": "13.0", "torch": "2.14.0+cu130"}
+    assert ab.env_line(nvidia, {"name": "NVIDIA H100", "vendor": "nvidia"}).startswith("`NVIDIA H100 80GB HBM3`")
+
+
+def test_describe_gpu_parses_the_harness_pick(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["code"] = cmd[-1]
+        return argparse.Namespace(
+            stdout='log line\n{"index": 4, "name": "MI350X", "vendor": "amd", "arch": "gfx950"}\n')
+
+    monkeypatch.setattr(ab.subprocess, "run", fake_run)
+    monkeypatch.setattr(ab, "amd_driver_version", lambda: "6.14.14")
+    device = ab.describe_gpu("python", ".", "4")
+    assert device == {"index": 4, "name": "MI350X", "vendor": "amd", "arch": "gfx950", "driver": "6.14.14"}
+    assert "select_device('4')" in seen["code"]
+
+    def failing_run(cmd, **kwargs):
+        raise ab.subprocess.CalledProcessError(1, cmd, stderr="RuntimeError: No benchmark GPU discovered")
+
+    monkeypatch.setattr(ab.subprocess, "run", failing_run)
+    assert ab.describe_gpu("python", ".", "auto") is None
+
+
 def test_wheel_digest_matches_installed_file(tmp_path):
     payload = b"\x7fELF fake libtriton"
     digest = "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
@@ -276,7 +308,8 @@ def test_bench_alternates_sides_on_one_gpu(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ab, "run_side", fake_run)
     monkeypatch.setattr(ab, "install", lambda python, wheel: installs.append(str(wheel)))
-    monkeypatch.setattr(ab, "pick_gpu", lambda python, repo: "5")
+    picked = {"index": 5, "name": "NVIDIA H100", "vendor": "nvidia", "arch": None}
+    monkeypatch.setattr(ab, "describe_gpu", lambda python, repo, spec: picked if spec == "auto" else None)
     args = argparse.Namespace(out=str(tmp_path), base_wheel="base.whl", head_wheel="head.whl", gpu="auto", repo=".",
                               platform="h100", rounds=3, select=ab.SMOKE_SELECT, head_cases=8)
     ab.bench(args)
@@ -286,6 +319,7 @@ def test_bench_alternates_sides_on_one_gpu(tmp_path, monkeypatch):
                      (3, "base", "5", False), (3, "head", "5", False)]
     saved = json.loads((tmp_path / "results.json").read_text())
     assert saved["gpu_index"] == "5" and len(saved["runs"]) == 6 and saved["env"] == {"gpu": "H100"}
+    assert saved["device"] == picked
 
 
 def test_bench_without_base_wheel_runs_head_only(tmp_path, monkeypatch):
@@ -293,6 +327,9 @@ def test_bench_without_base_wheel_runs_head_only(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ab, "run_side", lambda args, side, rnd, wheel, gpu, out, installed=False: (calls.append(
             (side, gpu)) or ({"side": side, "round": rnd, "cases": []}, {})))
+    monkeypatch.setattr(ab, "install", lambda python, wheel: None)
+    # An unidentified GPU keeps the requested index.
+    monkeypatch.setattr(ab, "describe_gpu", lambda python, repo, spec: None)
     args = argparse.Namespace(out=str(tmp_path), base_wheel="", head_wheel="head.whl", gpu="2", repo=".",
                               platform="h100", rounds=2, select=ab.SMOKE_SELECT, head_cases=8)
     ab.bench(args)

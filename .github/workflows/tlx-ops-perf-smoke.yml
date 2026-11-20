@@ -6,7 +6,8 @@ name: TLX.ops perf smoke
 # regression detector, and bisection stay on the nightly workflow.
 #
 #   resolve ──► build-head ──┬──► h100   (_tlx-ops-perf-smoke-platform.yml: bench ──► report)
-#           └─► build-base ──┴──► b200   (same)
+#           └─► build-base ──┼──► b200   (same)
+#                            └──► mi350  (same)
 #
 # A platform named in the repository variable GPU_CI_SKIP_PLATFORMS (the switch
 # gpu-tests.yml uses while a runner pool is offline) is skipped here too, and
@@ -89,13 +90,12 @@ jobs:
           [[ "${HEAD}" =~ ^[0-9a-f]{40}$ ]] || { echo "bad head: ${HEAD}"; exit 1; }
           [[ "${BASE}" =~ ^[0-9a-f]{40}$ ]] || { echo "bad base: ${BASE}"; exit 1; }
           NOTE=""
-          for platform in b200 h100; do
+          for platform in b200 h100 mi350; do
             if [[ ",${SKIP_PLATFORMS// /}," == *",${platform},"* ]]; then
               NOTE="${NOTE:+${NOTE}, }${platform}"
             fi
           done
           [[ -z "${NOTE}" ]] || NOTE="Skipped while its runners are paused (GPU_CI_SKIP_PLATFORMS): ${NOTE}."
-          NOTE="${NOTE:+${NOTE} }MI350 is not enabled in this smoke yet."
           {
             echo "head=${HEAD}"
             echo "pr_head=${PR_HEAD}"
@@ -183,7 +183,27 @@ jobs:
       base_wheel_filename: ${{ needs.build-base.outputs.wheel_filename }}
       base_wheel_sha256: ${{ needs.build-base.outputs.wheel_sha256 }}
 
-  # mi350 staged: add a job like the two above (runner linux-fb-triton-mi350-1,
-  # torch_index https://download.pytorch.org/whl/rocm7.2) once its smoke is
-  # calibrated. The runner pool is small and shared with correctness and the
-  # nightly, and the rocm environment needs its own validation run first.
+  mi350:
+    needs: [resolve, build-head, build-base]
+    if: ${{ !cancelled() && needs.build-head.result == 'success' && !contains(vars.GPU_CI_SKIP_PLATFORMS, 'mi350') }}
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    uses: ./.github/workflows/_tlx-ops-perf-smoke-platform.yml
+    with:
+      platform: mi350
+      runner: linux-fb-triton-mi350-1
+      torch_index: https://download.pytorch.org/whl/rocm7.2
+      head: ${{ needs.resolve.outputs.head }}
+      pr_head: ${{ needs.resolve.outputs.pr_head }}
+      base: ${{ needs.resolve.outputs.base }}
+      base_date: ${{ needs.resolve.outputs.base_date }}
+      pr: ${{ needs.resolve.outputs.pr }}
+      note: ${{ needs.resolve.outputs.note }}
+      head_wheel_url: ${{ needs.build-head.outputs.wheel_url }}
+      head_wheel_filename: ${{ needs.build-head.outputs.wheel_filename }}
+      head_wheel_sha256: ${{ needs.build-head.outputs.wheel_sha256 }}
+      base_wheel_url: ${{ needs.build-base.result == 'success' && needs.build-base.outputs.wheel_url || '' }}
+      base_wheel_filename: ${{ needs.build-base.outputs.wheel_filename }}
+      base_wheel_sha256: ${{ needs.build-base.outputs.wheel_sha256 }}
