@@ -124,6 +124,39 @@ def test_skipped_operator_remains_visible_alongside_measurements(tmp_path):
     assert page["nights"][0]["ops"]["addmm"] == []
 
 
+def test_summary_preserves_autotune_choices_and_accepts_older_artifacts(tmp_path):
+    decisions = [{
+        "kernel": "kernels.attention",
+        "phase": "warmup",
+        "key": ["64", "64", "480", "1024", "4"],
+        "config": {"BLOCK_M": 128, "BLOCK_N": 64, "num_warps": 4, "num_stages": 2, "num_ctas": 1},
+        "selection": "cached",
+        "selected_by_case": "serving/Z37",
+        "candidates": [],
+    }]
+    old = {
+        "case": {
+            "op": "hstu_cross_attn", "key": "serving/Z37", "input": "((), {'Z': 37})", "direction": "fwd", "dtype":
+            "bfloat16"
+        },
+        "status": "ok",
+        "tlx": {"mean": 226.0, "p50": 227.0},
+    }
+    new = {
+        **old, "case": {**old["case"], "key": "serving/Z40", "input": "((), {'Z': 40})"}, "best_config":
+        "BM=128 BN=64 w4 s2", "autotune": decisions
+    }
+    (tmp_path / "raw.json").write_text(json.dumps({"env": {}, "results": [old, new]}))
+    out = tmp_path / "summary.json"
+    dash.summarize(
+        SimpleNamespace(dir=str(tmp_path), platform="mi350", version="3.9.0.dev20261118", sha="a" * 40, out=str(out),
+                        ci="", ci_run=""))
+    cases = json.loads(out.read_text())["ops"]["hstu_cross_attn"]["cases"]
+    assert cases[0]["best_config"] is None and cases[0]["autotune"] == []
+    assert cases[1]["best_config"] == new["best_config"] and cases[1]["autotune"] == decisions
+    assert cases[1]["tlx_tflops"] == 226.0 and cases[1]["tlx_p50"] == 227.0
+
+
 def test_overview_uses_valid_comparisons_and_separates_directions():
 
     def case(key, ratio, direction="fwd", status="ok"):

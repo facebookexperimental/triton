@@ -18,6 +18,9 @@ from pathlib import Path
 
 MAX_INT_32 = 2**31 - 1
 
+# Bump for local AMD LLVM changes that affect generated kernels.
+_AMD_CODEGEN_CACHE_VERSION = 1
+
 
 def get_amd_codegen_path() -> str:
     if knobs.amd.codegen_path is not None:
@@ -1279,4 +1282,4 @@ class HIPBackend(BaseBackend):
 
     @functools.lru_cache()
     def hash(self):
-        return f"{self.target}-{get_amd_codegen_revision()}"
+        return f"{self.target}-{get_amd_codegen_revision()}-v{_AMD_CODEGEN_CACHE_VERSION}"

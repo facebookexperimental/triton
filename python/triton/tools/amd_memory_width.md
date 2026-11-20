@@ -39,6 +39,8 @@ The report contains:
 - narrow direct-to-LDS loads; and
 - regular buffer loads whose explicit contiguity is below the contiguous
   elements owned per lane by their preserved result layout;
+- byte-scale loads where four adjacent logical bytes are distributed across
+  lane bases and can be investigated as one packed 32-bit word per row;
 - regular buffer stores whose blocked or linear result layout owns more
   contiguous output elements than the final ISA stores per instruction; and
 - source locations when compiler-emitted `.loc` comments are present.
@@ -64,6 +66,14 @@ and excluded from the unresolved ranking.
 ISA corroboration is source-location-specific when compiler locations match.
 When they do not, the report labels the corroboration scope as `kernel` rather
 than implying that an unrelated narrow instruction came from the capped site.
+
+Packed-byte analysis is a lane-ownership experiment rather than ordinary
+vectorization. It recognizes a logical `[row, 4]` byte quartet whose last
+dimension is supplied by a complete `1, 2` lane basis and has no register
+ownership. The suggested implementation loads one aligned `uint32` per row and
+reinterprets it as two `uint16` and four `uint8` values. This changes which lane
+owns the bytes, so word alignment, address adjacency, redistribution cost, and
+performance remain explicit gates.
 
 Store analysis reads blocked `sizePerThread` and linear-layout register bases
 to derive consecutive output elements owned by each lane. Broadcast and
@@ -135,6 +145,10 @@ and the scale-word copies in the MI32 kernel. Their layouts assign one packed
 word, or four E8M0 bytes, to each copying lane. They have the same conclusion:
 widening requires a kernel layout and ownership change, not a local compiler
 combine.
+
+The same corpus contains 24 source-corroborated packed-byte candidates across
+12 MXFP8 generic kernels: one A-scale and one B-scale quartet in each kernel.
+There are no such candidates in the dense FP16/BF16 MM corpus.
 
 ## Reference-free hot-loop evaluation
 

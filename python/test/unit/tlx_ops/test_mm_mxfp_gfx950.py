@@ -140,6 +140,28 @@ def test_mm_mxfp_gfx950_unaligned_operand_uses_generic_fallback():
     _check_sample(out, (unaligned_a, a_scale, b, b_scale), scale_bytes)
 
 
+@pytest.mark.parametrize("k", [384, 512])
+@pytest.mark.parametrize("sf_layout", ["natural", "cublas_blocked"])
+def test_mm_mxfp_gfx950_generic_scale_word_parity(k, sf_layout):
+    from triton.tlx.ops import mm_mxfp
+    from triton.tlx.ops.kernels.mm_mxfp.gfx950 import _pack_scale_words
+
+    inputs, scale_bytes = _inputs(256, 384, k, sf_layout=sf_layout)
+    a, a_scale, b, b_scale = inputs
+    # K512 would use packed words with aligned scales; K384 retains the measured scalar path.
+    assert _pack_scale_words(k, a_scale, b_scale) == (k == 512)
+    a_scale_backing = torch.empty(a_scale.numel() + 1, dtype=torch.uint8, device=a_scale.device)
+    b_scale_backing = torch.empty(b_scale.numel() + 1, dtype=torch.uint8, device=b_scale.device)
+    unaligned_a_scale = a_scale_backing[1:].view(a_scale.dtype).view_as(a_scale)
+    unaligned_b_scale = b_scale_backing[1:].view(b_scale.dtype).view_as(b_scale)
+    unaligned_a_scale.copy_(a_scale)
+    unaligned_b_scale.copy_(b_scale)
+    assert unaligned_a_scale.data_ptr() % 4 and unaligned_b_scale.data_ptr() % 4
+    assert not _pack_scale_words(k, unaligned_a_scale, unaligned_b_scale)
+    out = mm_mxfp(a, unaligned_a_scale, b, unaligned_b_scale, sf_layout=sf_layout)
+    _check_sample(out, (a, unaligned_a_scale, b, unaligned_b_scale), scale_bytes)
+
+
 def _mfma_preshuffled(scale, repeat):
     rows, groups = scale.shape
     logical_row_chunk = repeat * 32

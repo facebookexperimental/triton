@@ -115,6 +115,8 @@ def summarize(args):
             "tlx_tflops": (r.get("tlx") or {}).get("mean"),
             "tlx_p50": (r.get("tlx") or {}).get("p50"),
             "ref_tflops": (r.get("ref") or {}).get("mean"),
+            "best_config": r.get("best_config"),
+            "autotune": r.get("autotune", []),
             "notes": r.get("notes", []),
         } for r in artifact["results"]]
         op = artifact["results"][0]["case"]["op"]
