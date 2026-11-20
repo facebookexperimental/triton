@@ -1537,6 +1537,18 @@ LogicalResult AsyncCopyGlobalToLocalOp::verify() {
       return emitOpError("non-bulk mode requires src to be a ranked tensor of "
                          "pointers");
   }
+  // #12341, moved from a TableGen trait that unconditionally cast src to a
+  // ranked tensor and crashed on bulk scalar-pointer sources: when src is a
+  // ranked tensor of pointers, its pointee type must match the result element
+  // type. Bulk mode passes a scalar !tt.ptr and copies explicit bytes, so it
+  // keeps the pre-pick behavior (no type check).
+  if (auto srcTensor = dyn_cast<RankedTensorType>(getSrc().getType())) {
+    if (auto ptrTy = dyn_cast<PointerType>(srcTensor.getElementType())) {
+      if (ptrTy.getPointeeType() != getResult().getType().getElementType())
+        return emitOpError(
+            "source pointee type must match the result element type");
+    }
+  }
   if (succeeded(getExactNpotOperandLayout(*this)))
     if (std::optional<std::string> reason =
             getMixedRadixBufferUnsupportedReason(getResult().getType(),

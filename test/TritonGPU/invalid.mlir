@@ -1011,7 +1011,7 @@ tt.func @async_copy_invalid_other_type(%input: tensor<64x64x!tt.ptr<f16>, #block
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 tt.func @async_copy_dtype_mismatch(%input: tensor<64x64x!tt.ptr<f32>, #blocked>,
     %view: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>) {
-  // expected-error @+1 {{failed to verify that source pointee type must match the result element type}}
+  // expected-error @+1 {{'ttg.async_copy_global_to_local' op source pointee type must match the result element type}}
   %token = ttg.async_copy_global_to_local %input, %view : tensor<64x64x!tt.ptr<f32>, #blocked> -> <64x64xf16, #shared, #smem, mutable>
   tt.return
 }

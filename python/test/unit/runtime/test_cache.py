@@ -871,7 +871,7 @@ def _preload_constants(specialization_data, monkeypatch):
     kernel = SimpleNamespace(
         _fn_name="reference_kernel",
         device_caches={0: (None, None, target, backend, None)},
-        _do_compile=lambda key, signature, device, constexprs, options, attrs, warmup: constexprs,
+        _do_compile=lambda key, signature, device, device_key, constexprs, options, attrs, warmup: constexprs,
     )
     monkeypatch.setattr(jit, "driver", SimpleNamespace(active=SimpleNamespace(get_current_device=lambda: 0)))
     return jit.JITFunction.preload(kernel, specialization_data)
