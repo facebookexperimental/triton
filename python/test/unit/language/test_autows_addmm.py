@@ -644,3 +644,108 @@ def test_autows_addmm_tma_store_short_trip_count(num_warps):
         assert "ttng.async_tma_copy_local_to_global" in ttgir
         ref_out = (A.double() @ B.double().T + bias.double()).to(torch.bfloat16)
         torch.testing.assert_close(C, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@triton.jit
+def addmm_kernel_2cta_tma_bias_ws(
+    bias_ptr,
+    A,
+    B,
+    C,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    """Persistent 2-CTA addmm with a subtiled TMA-bias epilogue (the Inductor
+    Blackwell autoWS template's shape)."""
+    SUB: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+    num_pid_m = (tl.cdiv(M, BLOCK_SIZE_M) + 1) // 2 * 2
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_tiles = num_pid_m * num_pid_n
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    a_desc = tl.make_tensor_descriptor(A, [M, K], [K, 1], [BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_desc = tl.make_tensor_descriptor(B, [N, K], [K, 1], [BLOCK_SIZE_N, BLOCK_SIZE_K])
+    c_desc = tl.make_tensor_descriptor(C, [M, N], [N, 1], [BLOCK_SIZE_M, SUB])
+    bias_desc = tl.make_tensor_descriptor(bias_ptr, [N], [1], [SUB])
+    for tile_id in tl.range(tl.program_id(0), num_tiles, NUM_SMS, flatten=False, warp_specialize=True,
+                            data_partition_factor=1, separate_epilogue_store=True):
+        pid_m = tile_id % num_pid_m
+        pid_n = tile_id // num_pid_m
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            a = a_desc.load([offs_am, ki * BLOCK_SIZE_K])
+            b = b_desc.load([offs_bn, ki * BLOCK_SIZE_K])
+            accumulator += tl.dot(a, b.T, two_ctas=True)
+        acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
+        for i in tl.static_range(EPILOGUE_SUBTILE):
+            offs_cn = offs_bn + i * SUB
+            bias = bias_desc.load([offs_cn])[None, :]
+            c_desc.store([offs_am, offs_cn], (acc_slices[i] + bias.to(tl.float32)).to(tl.bfloat16))
+
+
+def _run_2cta_tma_bias_few_k_tiles(k_tiles):
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        BLOCK_M, BLOCK_N, BLOCK_K, EPILOGUE_SUBTILE = 128, 256, 64, 8
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        NUM_SMS -= NUM_SMS % 2
+        # About ten tiles per CTA; with about five the hang does not show.
+        M, N, K = 5888, 8192, k_tiles * BLOCK_K
+        torch.manual_seed(0)
+        bias = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+        A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        C = torch.full((M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+        triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
+        num_tiles = (triton.cdiv(M, BLOCK_M) + 1) // 2 * 2 * (N // BLOCK_N)
+        kernel = addmm_kernel_2cta_tma_bias_ws[(min(NUM_SMS,
+                                                    num_tiles), )](bias, A, B, C, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K,
+                                                                   EPILOGUE_SUBTILE, NUM_SMS, num_warps=4, num_stages=7,
+                                                                   ctas_per_cga=(2, 1, 1))
+        torch.cuda.synchronize()
+        assert "ttg.warp_specialize" in kernel.asm["ttgir"], "Expected warp specialization in IR"
+        assert kernel.metadata.cluster_dims[0] == 2
+        # fp32 reference. The kernel accumulates in fp32 and rounds once to
+        # bf16, so beyond half a bf16 ulp of the reference the error must be
+        # at fp32 accumulation-order level.
+        prev_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            ref = A.float() @ B.float().T + bias.float()
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev_tf32
+        assert not torch.isnan(C).any()
+        half_ulp = (ref.abs().clamp_min(2**-126).log2().floor() - 8).exp2()
+        excess = ((C.float() - ref).abs() - half_ulp).clamp_min(0).max().item()
+        assert excess <= 1e-5 * ref.abs().max().item(), excess
+
+
+@pytest.mark.parametrize("k_tiles", [1, 2])
+@pytest.mark.skipif(not is_blackwell() or torch.cuda.get_device_capability()[0] != 10, reason="Requires sm_100 2-CTA")
+def test_autows_addmm_2cta_tma_bias_few_k_tiles(k_tiles):
+    """With one K tile the K loop folds away and the tile loop is pipelined.
+    The producer partition keeps operand loads at stage 0 and bias loads at
+    the last stage; that skew must not exceed the operand ring depth, or an
+    operand load waits on a slot whose release needs a bias load the loop has
+    not issued yet, and the kernel hangs once each CTA runs several tiles.
+    k_tiles=1 hangs without the fix; k_tiles=2 keeps a K loop and is a
+    no-regression control. Runs in a subprocess so a hang fails the test
+    instead of stalling the suite."""
+    import os
+    import subprocess
+    import sys
+    driver = (f"import sys; sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r}); "
+              f"from test_autows_addmm import _run_2cta_tma_bias_few_k_tiles as run; run({k_tiles}); print('OK')")
+    try:
+        proc = subprocess.run([sys.executable, "-c", driver], capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"2-CTA addmm with k_tiles={k_tiles} hung (no result in 300 s)")
+    assert proc.returncode == 0 and "OK" in proc.stdout, (f"rc={proc.returncode}\n--- stdout ---\n{proc.stdout}\n"
+                                                          f"--- stderr ---\n{proc.stderr}")
