@@ -10,6 +10,8 @@
   report   Anywhere. Compares head with base round by round, adds the nightly
            baseline as context, and writes the platform's markdown section and
            a JSON verdict.
+  relevant Anywhere. Prints whether BASE..HEAD changes anything outside tests,
+           CI and docs, so a head that cannot move performance is not re-run.
 
 Why same-runner: a nightly baseline comes from another day and often another
 runner, so main's own changes and 5-10% runner-to-runner noise sit inside its
@@ -746,9 +748,28 @@ def report(args):
     return 0
 
 
+def perf_irrelevant(path):
+    """Whether a changed path cannot move kernel performance: tests, CI or docs."""
+    parts = path.split("/")
+    return bool({"test", "tests"} & set(parts[:-1])) or parts[0] in (".github", "docs") or path.endswith(".md")
+
+
+def relevant(args):
+    """Print true when a path changed from BASE to HEAD can move performance, else false."""
+    out = subprocess.run(["git", "diff", "--name-only", args.base, args.head], cwd=args.repo, check=True,
+                         capture_output=True, text=True).stdout
+    paths = [line for line in out.splitlines() if line]
+    print("true" if not paths or any(not perf_irrelevant(path) for path in paths) else "false")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
+    v = sub.add_parser("relevant", help="whether BASE..HEAD changes anything that can move performance")
+    v.add_argument("--repo", default=".")
+    v.add_argument("--base", required=True)
+    v.add_argument("--head", required=True)
     b = sub.add_parser("bench", help="run the A/B on this GPU runner")
     b.add_argument("--platform", required=True)
     b.add_argument("--repo", default=".", help="checkout whose python/test/tlx_benchmark harness measures both wheels")
@@ -775,7 +796,7 @@ def main(argv=None):
     r.add_argument("--out-md", required=True)
     r.add_argument("--out-json", default="")
     args = parser.parse_args(argv)
-    return bench(args) if args.command == "bench" else report(args)
+    return {"bench": bench, "report": report, "relevant": relevant}[args.command](args)
 
 
 if __name__ == "__main__":

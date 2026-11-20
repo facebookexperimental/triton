@@ -388,6 +388,63 @@ def test_compose_orders_sections_and_marks_old_heads():
     assert comment.parse_sections(body) == {"b200": ("2" * 40, "### b200: PASS"), "h100": ("1" * 40, "### h100: PASS")}
 
 
+def test_sections_keep_the_pr_head_of_a_merge_commit():
+    merge, pr_head = "1" * 40, "a" * 40
+    body = comment.merge("", "h100", f"{merge} {pr_head}", "### ✅ H100: no slowdowns found")
+    assert f"<!-- tlx-ops-perf-smoke:h100 head={merge} pr_head={pr_head} -->" in body
+    assert comment.parse_sections(body) == {"h100": (f"{merge} {pr_head}", "### ✅ H100: no slowdowns found")}
+    # A section from an older head is marked by its benched commit alone.
+    body = comment.merge(body, "mi350", "2" * 40, "### ✅ MI350: no slowdowns found")
+    assert f"From an older head, not yet re-run for this one: h100 (`{merge[:12]}`)." in body
+
+
+def test_measured_head_is_the_head_every_measured_section_shares():
+    merge, older = "1" * 40, "2" * 40
+    body = comment.merge("", "h100", f"{merge} {'a' * 40}", "### ✅ H100: no slowdowns found")
+    body = comment.merge(body, "mi350", merge, "### ⚠️ MI350: 1 kernel slower")
+    assert comment.measured_head(body) == merge
+    # A section without results does not count; sections that disagree give no head.
+    assert comment.measured_head(comment.merge(body, "b200", older, "### ⚪ B200: no result")) == merge
+    assert comment.measured_head(comment.merge(body, "b200", older, "### ✅ B200: no slowdowns found")) == ""
+    assert comment.measured_head("") == ""
+
+
+def test_note_only_keeps_every_section():
+    body = comment.merge("", "h100", "1" * 40, "### ✅ H100: no slowdowns found", note="b200 paused.")
+    noted = comment.set_note(body, "1" * 40, "Not re-run for PR head `bbbbbbbbbbbb`: only tests changed.")
+    assert comment.parse_sections(noted) == comment.parse_sections(body)
+    assert "Not re-run for PR head `bbbbbbbbbbbb`" in noted and "b200 paused." not in noted
+    assert "From an older head" not in noted
+
+
+def test_relevant_ignores_tests_ci_and_docs(tmp_path, capsys):
+    import subprocess
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "ci@example.com")
+    git("config", "user.name", "ci")
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "a.cpp").write_text("int a;\n")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    (tmp_path / "python" / "test").mkdir(parents=True)
+    (tmp_path / "python" / "test" / "test_a.py").write_text("x = 1\n")
+    (tmp_path / "README.md").write_text("hi\n")
+    git("add", "-A")
+    git("commit", "-qm", "tests only")
+    tests_only = git("rev-parse", "HEAD")
+    (tmp_path / "lib" / "a.cpp").write_text("int b;\n")
+    git("commit", "-qam", "source")
+    source = git("rev-parse", "HEAD")
+    for head, expected in ((tests_only, "false"), (source, "true")):
+        ab.main(["relevant", "--repo", str(tmp_path), "--base", base, "--head", head])
+        assert capsys.readouterr().out.strip() == expected
+
+
 def test_merge_replaces_only_its_own_section():
     body = comment.merge("", "b200", "1" * 40, "### b200: old")
     body = comment.merge(body, "h100", "1" * 40, "### h100: PASS")

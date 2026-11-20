@@ -23,7 +23,7 @@ on:
         type: string
         required: true
       head:
-        description: Commit to bench (the PR's test merge commit); its harness measures both wheels
+        description: Commit to bench (the PR's test merge commit, or the PR head for a manual run); its harness measures both wheels
         type: string
         required: true
       pr_head:
@@ -53,26 +53,12 @@ on:
         type: number
         required: false
         default: 3
-      head_wheel_url:
+      head_wheel:
+        description: The head wheel object (JSON from build.yml or the GPU tests follow-up)
         type: string
         required: true
-      head_wheel_filename:
-        type: string
-        required: true
-      head_wheel_sha256:
-        type: string
-        required: false
-        default: ''
-      base_wheel_url:
-        description: Blank when the base wheel did not build; the report then compares with the nightly only
-        type: string
-        required: false
-        default: ''
-      base_wheel_filename:
-        type: string
-        required: false
-        default: ''
-      base_wheel_sha256:
+      base_wheel:
+        description: The base wheel object; blank when it did not build, and the report then compares with the nightly only
         type: string
         required: false
         default: ''
@@ -88,7 +74,6 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 90
     permissions:
-      id-token: write
       contents: read
     steps:
       - name: Checkout suite at the benched commit
@@ -121,20 +106,22 @@ jobs:
       - name: Fetch the head wheel
         uses: ./.ci/.github/actions/install-prebuilt-triton
         with:
-          wheel-url: ${{ inputs.head_wheel_url }}
-          wheel-filename: ${{ inputs.head_wheel_filename }}
-          wheel-sha256: ${{ inputs.head_wheel_sha256 }}
+          artifact-name: ${{ fromJSON(inputs.head_wheel).artifact }}
+          wheel-url: ${{ fromJSON(inputs.head_wheel).url }}
+          wheel-filename: ${{ fromJSON(inputs.head_wheel).filename }}
+          wheel-sha256: ${{ fromJSON(inputs.head_wheel).sha256 }}
       - name: Keep the head wheel
         run: mkdir -p "${RUNNER_TEMP}/ab/head" && mv "${RUNNER_TEMP}"/prebuilt-wheel/*.whl "${RUNNER_TEMP}/ab/head/"
       - name: Fetch the base wheel
-        if: inputs.base_wheel_url != ''
+        if: inputs.base_wheel != ''
         uses: ./.ci/.github/actions/install-prebuilt-triton
         with:
-          wheel-url: ${{ inputs.base_wheel_url }}
-          wheel-filename: ${{ inputs.base_wheel_filename }}
-          wheel-sha256: ${{ inputs.base_wheel_sha256 }}
+          artifact-name: ${{ fromJSON(inputs.base_wheel || '{}').artifact }}
+          wheel-url: ${{ fromJSON(inputs.base_wheel || '{}').url }}
+          wheel-filename: ${{ fromJSON(inputs.base_wheel || '{}').filename }}
+          wheel-sha256: ${{ fromJSON(inputs.base_wheel || '{}').sha256 }}
       - name: Keep the base wheel
-        if: inputs.base_wheel_url != ''
+        if: inputs.base_wheel != ''
         run: mkdir -p "${RUNNER_TEMP}/ab/base" && mv "${RUNNER_TEMP}"/prebuilt-wheel/*.whl "${RUNNER_TEMP}/ab/base/"
       - name: Bench base and head on one GPU
         # Each side's first round compiles and autotunes from a cold cache (about 12 min on B200,
@@ -216,7 +203,8 @@ jobs:
           PR: ${{ inputs.pr }}
           PLATFORM: ${{ inputs.platform }}
           HEAD_SHA: ${{ inputs.head }}
+          PR_HEAD: ${{ inputs.pr_head }}
           NOTE: ${{ inputs.note }}
         run: |
           python3 .github/scripts/tlx_ops_perf_smoke_comment.py --repo "${GITHUB_REPOSITORY}" --pr "${PR}" \
-            --platform "${PLATFORM}" --head "${HEAD_SHA}" --section section.md --note "${NOTE}"
+            --platform "${PLATFORM}" --head "${HEAD_SHA}" --pr-head "${PR_HEAD}" --section section.md --note "${NOTE}"

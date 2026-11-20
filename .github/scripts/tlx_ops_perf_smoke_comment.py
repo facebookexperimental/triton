@@ -28,19 +28,43 @@ BOT = "github-actions[bot]"
 #: Section order in the comment; a platform not listed sorts after these.
 ORDER = ("b200", "h100", "mi350")
 SECTION = re.compile(
-    r"<!-- tlx-ops-perf-smoke:(?P<platform>[a-z0-9]+) head=(?P<head>[0-9a-f]+) -->\n"
+    r"<!-- tlx-ops-perf-smoke:(?P<platform>[a-z0-9]+) head=(?P<head>[0-9a-f]+)(?: pr_head=(?P<pr_head>[0-9a-f]+))? -->\n"
     r"(?P<body>.*?)\n<!-- /tlx-ops-perf-smoke:(?P=platform) -->", re.S)
+#: A section whose title starts with this has no measurements (the bench produced nothing).
+NO_RESULT = "### ⚪"
 INTRO = ("Checks whether this PR makes tlx.ops kernels slower or breaks them: the first 8 shapes of matmul, "
-         "attention and norm, forward only. Each GPU times them for the PR's base and for the PR, on the same "
-         "machine, and fills in its own section below when it finishes. Advisory only: it never blocks the PR, "
-         "and the full benchmark stays in the nightly run.")
+         "attention and norm, forward only. It runs each time the PR's head passes CI. Each GPU times the kernels "
+         "for the PR's base and for the PR, on the same machine, and fills in its own section below when it "
+         "finishes. Advisory only: it never blocks the PR, and the full benchmark stays in the nightly run.")
 
 
 def parse_sections(body):
-    """{platform: (head, text)} from a comment body; empty for a legacy or foreign body."""
+    """{platform: (head, text)} from a comment body; empty for a legacy or foreign body.
+
+    HEAD is "<benched commit>" or "<benched commit> <PR head>" when the two differ.
+    """
     if not body or not body.startswith(MARKER):
         return {}
-    return {m["platform"]: (m["head"], m["body"]) for m in SECTION.finditer(body)}
+    return {
+        m["platform"]: (f"{m['head']} {m['pr_head']}" if m["pr_head"] else m["head"], m["body"])
+        for m in SECTION.finditer(body)
+    }
+
+
+def benched(head):
+    """The benched commit of a section HEAD ("<commit>" or "<commit> <PR head>")."""
+    return head.split()[0]
+
+
+def measured_head(body):
+    """The benched commit every measured section shares, or '' when they differ or none measured."""
+    heads = {benched(head) for head, text in parse_sections(body).values() if not text.startswith(NO_RESULT)}
+    return heads.pop() if len(heads) == 1 else ""
+
+
+def marker(platform, head):
+    commit, _, pr_head = head.partition(" ")
+    return f"<!-- tlx-ops-perf-smoke:{platform} head={commit}{f' pr_head={pr_head}' if pr_head else ''} -->"
 
 
 def order_key(platform):
@@ -51,19 +75,21 @@ def compose(sections, head, note=""):
     lines = [MARKER, "## TLX.ops perf smoke (advisory)", "", INTRO]
     if note:
         lines += ["", note]
-    stale = [p for p in sorted(sections, key=order_key) if sections[p][0] != head]
+    stale = [p for p in sorted(sections, key=order_key) if benched(sections[p][0]) != benched(head)]
     if stale:
         lines += [
             "", "From an older head, not yet re-run for this one: " +
-            ", ".join(f"{p} (`{sections[p][0][:12]}`)" for p in stale) + "."
+            ", ".join(f"{p} (`{benched(sections[p][0])[:12]}`)" for p in stale) + "."
         ]
     for platform in sorted(sections, key=order_key):
         section_head, text = sections[platform]
-        lines += [
-            "", f"<!-- tlx-ops-perf-smoke:{platform} head={section_head} -->",
-            text.rstrip("\n"), f"<!-- /tlx-ops-perf-smoke:{platform} -->"
-        ]
+        lines += ["", marker(platform, section_head), text.rstrip("\n"), f"<!-- /tlx-ops-perf-smoke:{platform} -->"]
     return "\n".join(lines) + "\n"
+
+
+def set_note(body, head, note):
+    """The comment with only its note replaced, sections kept; for a head that is not re-run."""
+    return compose(parse_sections(body), head, note)
 
 
 def merge(body, platform, head, text, note=""):
@@ -129,19 +155,36 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--pr", required=True, type=int)
-    parser.add_argument("--platform", required=True)
-    parser.add_argument("--head", required=True, help="the benched commit; sections from other heads are marked")
-    parser.add_argument("--section", required=True, help="markdown file with this platform's section")
+    parser.add_argument("--platform", help="the section to write (with --section)")
+    parser.add_argument("--head", help="the benched commit; sections from other heads are marked")
+    parser.add_argument("--pr-head", default="", help="the PR head, when the benched commit is its test merge")
+    parser.add_argument("--section", help="markdown file with this platform's section")
     parser.add_argument("--note", default="", help="line under the intro, e.g. which platforms are paused")
+    parser.add_argument("--measured-head", action="store_true",
+                        help="print the benched commit all measured sections share (blank if none) and exit")
+    parser.add_argument("--note-only", action="store_true", help="replace only the note, keeping every section")
     args = parser.parse_args(argv)
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if not token:
         print("GH_TOKEN is not set", file=sys.stderr)
         return 1
-    with open(args.section) as fh:
-        text = fh.read()
+    gh = GitHub(args.repo, token)
     try:
-        ok = publish(GitHub(args.repo, token), args.pr, args.platform, args.head, text, args.note)
+        if args.measured_head:
+            print(measured_head((gh.find_comment(args.pr) or {}).get("body") or ""))
+            return 0
+        if args.note_only:
+            comment = gh.find_comment(args.pr)
+            if comment:
+                body = comment.get("body") or ""
+                gh.write(args.pr, comment, set_note(body, measured_head(body) or args.head or "", args.note))
+            return 0
+        if not (args.platform and args.head and args.section):
+            parser.error("--platform, --head and --section are required to write a section")
+        with open(args.section) as fh:
+            text = fh.read()
+        head = f"{args.head} {args.pr_head}" if args.pr_head and args.pr_head != args.head else args.head
+        ok = publish(gh, args.pr, args.platform, head, text, args.note)
     except urllib.error.HTTPError as exc:
         print(f"GitHub API error: {exc.code} {exc.reason}", file=sys.stderr)
         return 1

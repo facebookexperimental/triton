@@ -1,24 +1,34 @@
 name: TLX.ops perf smoke
-# PR perf check for bundle (reactor) PRs. On each enabled GPU it benches a
-# small tlx.ops subset for the PR's base and its merge commit, back to back on
-# one GPU, and writes that platform's section of one PR comment as soon as its
-# own runner finishes. Advisory only -- never blocks. The full suite, the
-# regression detector, and bisection stay on the nightly workflow.
+# Perf check for bundle (reactor) PRs. On each enabled GPU it benches a small
+# tlx.ops subset for the PR's base and its head, back to back on one GPU, and
+# writes that platform's section of one PR comment as soon as its own runner
+# finishes. Advisory only -- never blocks. The full suite, the regression
+# detector, and bisection stay on the nightly workflow.
 #
-#   resolve ──► build-head ──┬──► h100   (_tlx-ops-perf-smoke-platform.yml: bench ──► report)
-#           └─► build-base ──┼──► b200   (same)
-#                            └──► mi350  (same)
+# It starts when the PR's GPU tests run succeeds (workflow_run), not on every
+# push, so a head still being repaired costs no GPU time. Like the TLX codegen
+# trace, it runs on the default branch: the PR's test merge commit and head
+# wheel come from _fast-followup.yml's verification, jobs that run PR code get
+# read-only tokens, and only jobs that run default-branch scripts write the
+# comment. A head already measured (a GPU tests re-run), or one whose changes
+# since the last measured head touch only tests, CI or docs, is not re-run.
+# A manual run can bench any PR or ref.
+#
+#   followup ──► resolve ──► build-base ──┬──► h100   (_tlx-ops-perf-smoke-platform.yml: bench ──► report)
+#                       └──► build-head ──┼──► b200   (same; build-head only for manual runs)
+#                                         └──► mi350  (same)
 #
 # A platform named in the repository variable GPU_CI_SKIP_PLATFORMS (the switch
 # gpu-tests.yml uses while a runner pool is offline) is skipped here too, and
 # the comment says so.
+run-name: >-
+  ${{ github.event_name == 'workflow_run' && format('TLX.ops perf smoke for GPU tests run {0} attempt {1} (PR head {2})',
+  github.event.workflow_run.id, github.event.workflow_run.run_attempt, github.event.workflow_run.head_sha) || '' }}
 
 on:
-  # `branches` matches the PR's target branch. Bundle PRs go from
-  # reactor/sync-train/plan-*/item-* into main, and GitHub has no
-  # trigger-level source-branch filter, so the resolve job's `if:` picks them.
-  pull_request:
-    branches: [main]
+  workflow_run:
+    workflows: [Meta Triton GPU Tests]
+    types: [completed]
   workflow_dispatch:
     inputs:
       ref:
@@ -35,16 +45,34 @@ on:
 permissions:
   contents: read
 
+# A newer head of the same bundle branch cancels the older head's run.
 concurrency:
-  group: perf-smoke-${{ github.event.pull_request.number || github.run_id }}
+  group: >-
+    perf-smoke-${{ github.event.workflow_run && format('{0}:{1}', github.event.workflow_run.head_repository.full_name,
+    github.event.workflow_run.head_branch) || inputs.pr || github.run_id }}
   cancel-in-progress: true
 
 jobs:
+  # Bundle branches only; their PRs come from this repository, never a fork.
+  followup:
+    if: >-
+      github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'reactor/sync-train/')
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_fast-followup.yml
+
   resolve:
-    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'reactor/sync-train/')
+    needs: followup
+    if: ${{ !cancelled() && (github.event_name != 'workflow_run' || needs.followup.outputs.status == 'ok') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # Reads the comment to find the last measured head, and notes a head that is not re-run.
+      pull-requests: write
     outputs:
       head: ${{ steps.pick.outputs.head }}
       pr_head: ${{ steps.pick.outputs.pr_head }}
@@ -52,12 +80,16 @@ jobs:
       base_date: ${{ steps.pick.outputs.base_date }}
       pr: ${{ steps.pick.outputs.pr }}
       note: ${{ steps.pick.outputs.note }}
+      head_wheel: ${{ steps.pick.outputs.head != '' && needs.followup.outputs.wheel || '' }}
+      base_wheel: ${{ steps.base.outputs.base_wheel }}
     steps:
-      - name: Checkout main
+      # Default-branch scripts only (the workflow revision for manual runs); the PR's commits are fetched as data.
+      - name: Checkout the workflow revision
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
       - name: Pick head, base, and PR
         id: pick
         env:
@@ -65,22 +97,34 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_REF: ${{ inputs.ref }}
           INPUT_PR: ${{ inputs.pr }}
-          MERGE_SHA: ${{ github.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGE_SHA: ${{ needs.followup.outputs.merge }}
+          MERGE_BASE: ${{ needs.followup.outputs.base }}
+          PR_HEAD_SHA: ${{ needs.followup.outputs.pr_head }}
+          PR_NUMBER: ${{ needs.followup.outputs.pr }}
+          FORK: ${{ needs.followup.outputs.fork }}
+          HEAD_WHEEL: ${{ needs.followup.outputs.wheel }}
+          WHEEL_REASON: ${{ needs.followup.outputs.wheel_reason }}
           SKIP_PLATFORMS: ${{ vars.GPU_CI_SKIP_PLATFORMS }}
         run: |
           set -euo pipefail
-          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            # Bench GitHub's test merge commit against its first parent, the
-            # main commit it merges into: the merge commit is what lands, and
-            # Fast correctness builds it, so its wheel is a cache hit.
+          if [[ "${EVENT_NAME}" == "workflow_run" ]]; then
+            [[ "${FORK}" != true ]] || { echo "Fork PR; bundle PRs come from this repository. Skipping."; exit 0; }
+            if [[ -z "${HEAD_WHEEL}" ]]; then
+              echo "The GPU tests run handed over no head wheel (${WHEEL_REASON:-no reason given}); skipping."
+              exit 0
+            fi
+            # Bench the producer's verified test merge commit against its first
+            # parent: exactly what landing changes on the base branch.
             git fetch --no-tags --quiet origin "${MERGE_SHA}"
-            HEAD="${MERGE_SHA}"; BASE=$(git rev-parse "${MERGE_SHA}^1")
-            PR_HEAD="${HEAD_SHA}"; PR="${PR_NUMBER}"
+            HEAD="${MERGE_SHA}"; BASE="${MERGE_BASE}"
+            PR_HEAD="${PR_HEAD_SHA}"; PR="${PR_NUMBER}"
           elif [[ -n "${INPUT_PR}" ]]; then
-            HEAD=$(gh pr view "${INPUT_PR}" --json headRefOid --jq .headRefOid)
-            BASE=$(gh pr view "${INPUT_PR}" --json baseRefOid --jq .baseRefOid)
+            [[ "${INPUT_PR}" =~ ^[0-9]+$ ]] || { echo "bad pr: ${INPUT_PR}"; exit 1; }
+            # Bench the PR head against the main commit it is built on, so the
+            # comparison holds only the PR's own commits, not main's later ones.
+            git fetch --no-tags --quiet origin "refs/pull/${INPUT_PR}/head"
+            HEAD=$(git rev-parse FETCH_HEAD)
+            BASE=$(git merge-base "${HEAD}" origin/main)
             PR_HEAD="${HEAD}"; PR="${INPUT_PR}"
           else
             HEAD=$(git rev-parse "${INPUT_REF:-HEAD}")
@@ -89,6 +133,24 @@ jobs:
           fi
           [[ "${HEAD}" =~ ^[0-9a-f]{40}$ ]] || { echo "bad head: ${HEAD}"; exit 1; }
           [[ "${BASE}" =~ ^[0-9a-f]{40}$ ]] || { echo "bad base: ${BASE}"; exit 1; }
+          if [[ "${EVENT_NAME}" == "workflow_run" ]]; then
+            LAST=$(python3 .github/scripts/tlx_ops_perf_smoke_comment.py --repo "${GITHUB_REPOSITORY}" --pr "${PR}" \
+              --measured-head) || LAST=""
+            if [[ "${LAST}" == "${HEAD}" ]]; then
+              echo "Head ${HEAD} is already measured (a GPU tests re-run); skipping."
+              exit 0
+            fi
+            if [[ "${LAST}" =~ ^[0-9a-f]{40}$ ]] && git fetch --no-tags --quiet origin "${LAST}" && \
+                [[ $(python3 .github/scripts/tlx_ops_perf_smoke_ab.py relevant --base "${LAST}" --head "${HEAD}") \
+                == false ]]; then
+              echo "Only tests, CI or docs changed since ${LAST}; keeping its results."
+              NOTE="Not re-run for PR head \`${PR_HEAD:0:12}\`: since the measured \`${LAST:0:12}\` it changes only"
+              NOTE+=" tests, CI or docs, so the results below still apply."
+              python3 .github/scripts/tlx_ops_perf_smoke_comment.py --repo "${GITHUB_REPOSITORY}" --pr "${PR}" \
+                --note-only --note "${NOTE}"
+              exit 0
+            fi
+          fi
           NOTE=""
           for platform in b200 h100 mi350; do
             if [[ ",${SKIP_PLATFORMS// /}," == *",${platform},"* ]]; then
@@ -105,10 +167,24 @@ jobs:
             echo "pr=${PR}"
             echo "note=${NOTE}"
           } >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v6
+        if: steps.pick.outputs.head != ''
+        with:
+          python-version: '3.12'
+      - name: Look up the base wheel
+        # A ready cached base wheel skips the base build; a miss builds it in build-base.
+        if: steps.pick.outputs.head != ''
+        id: base
+        env:
+          BASE: ${{ steps.pick.outputs.base }}
+        run: |
+          python -m pip install --quiet 'boto3>=1.36.0'
+          python .github/scripts/wheel_cache.py lookup --sha "${BASE}" --output base_wheel
 
+  # Manual runs only: a pull request's head wheel comes verified from its GPU tests run.
   build-head:
     needs: resolve
-    if: needs.resolve.outputs.head != ''
+    if: github.event_name == 'workflow_dispatch' && needs.resolve.outputs.head != ''
     permissions:
       contents: read
       id-token: write
@@ -117,11 +193,11 @@ jobs:
       ref: ${{ needs.resolve.outputs.head }}
       build_id: perf-smoke-head
 
-  # A failed base build leaves the platforms to compare the head with the
+  # A failed base build falls back to comparing the head with the
   # nightly only, as this smoke did before it had a same-runner base.
   build-base:
     needs: resolve
-    if: needs.resolve.outputs.head != ''
+    if: needs.resolve.outputs.head != '' && needs.resolve.outputs.base_wheel == ''
     permissions:
       contents: read
       id-token: write
@@ -132,13 +208,16 @@ jobs:
 
   # One job per platform rather than a matrix: a job cannot depend on a single
   # matrix leg, so a matrix would hold every platform's report until the
-  # slowest runner finished.
+  # slowest runner finished. No id-token: the bench runs the PR's code.
+
   h100:
     needs: [resolve, build-head, build-base]
-    if: ${{ !cancelled() && needs.build-head.result == 'success' && !contains(vars.GPU_CI_SKIP_PLATFORMS, 'h100') }}
+    if: >-
+      ${{ !cancelled() && needs.resolve.outputs.head != '' &&
+      (needs.resolve.outputs.head_wheel || needs.build-head.outputs.wheel) != '' &&
+      !contains(vars.GPU_CI_SKIP_PLATFORMS, 'h100') }}
     permissions:
       contents: read
-      id-token: write
       pull-requests: write
     uses: ./.github/workflows/_tlx-ops-perf-smoke-platform.yml
     with:
@@ -151,19 +230,17 @@ jobs:
       base_date: ${{ needs.resolve.outputs.base_date }}
       pr: ${{ needs.resolve.outputs.pr }}
       note: ${{ needs.resolve.outputs.note }}
-      head_wheel_url: ${{ needs.build-head.outputs.wheel_url }}
-      head_wheel_filename: ${{ needs.build-head.outputs.wheel_filename }}
-      head_wheel_sha256: ${{ needs.build-head.outputs.wheel_sha256 }}
-      base_wheel_url: ${{ needs.build-base.result == 'success' && needs.build-base.outputs.wheel_url || '' }}
-      base_wheel_filename: ${{ needs.build-base.outputs.wheel_filename }}
-      base_wheel_sha256: ${{ needs.build-base.outputs.wheel_sha256 }}
+      head_wheel: ${{ needs.resolve.outputs.head_wheel || needs.build-head.outputs.wheel }}
+      base_wheel: ${{ needs.resolve.outputs.base_wheel || (needs.build-base.result == 'success' && needs.build-base.outputs.wheel) || '' }}
 
   b200:
     needs: [resolve, build-head, build-base]
-    if: ${{ !cancelled() && needs.build-head.result == 'success' && !contains(vars.GPU_CI_SKIP_PLATFORMS, 'b200') }}
+    if: >-
+      ${{ !cancelled() && needs.resolve.outputs.head != '' &&
+      (needs.resolve.outputs.head_wheel || needs.build-head.outputs.wheel) != '' &&
+      !contains(vars.GPU_CI_SKIP_PLATFORMS, 'b200') }}
     permissions:
       contents: read
-      id-token: write
       pull-requests: write
     uses: ./.github/workflows/_tlx-ops-perf-smoke-platform.yml
     with:
@@ -176,19 +253,17 @@ jobs:
       base_date: ${{ needs.resolve.outputs.base_date }}
       pr: ${{ needs.resolve.outputs.pr }}
       note: ${{ needs.resolve.outputs.note }}
-      head_wheel_url: ${{ needs.build-head.outputs.wheel_url }}
-      head_wheel_filename: ${{ needs.build-head.outputs.wheel_filename }}
-      head_wheel_sha256: ${{ needs.build-head.outputs.wheel_sha256 }}
-      base_wheel_url: ${{ needs.build-base.result == 'success' && needs.build-base.outputs.wheel_url || '' }}
-      base_wheel_filename: ${{ needs.build-base.outputs.wheel_filename }}
-      base_wheel_sha256: ${{ needs.build-base.outputs.wheel_sha256 }}
+      head_wheel: ${{ needs.resolve.outputs.head_wheel || needs.build-head.outputs.wheel }}
+      base_wheel: ${{ needs.resolve.outputs.base_wheel || (needs.build-base.result == 'success' && needs.build-base.outputs.wheel) || '' }}
 
   mi350:
     needs: [resolve, build-head, build-base]
-    if: ${{ !cancelled() && needs.build-head.result == 'success' && !contains(vars.GPU_CI_SKIP_PLATFORMS, 'mi350') }}
+    if: >-
+      ${{ !cancelled() && needs.resolve.outputs.head != '' &&
+      (needs.resolve.outputs.head_wheel || needs.build-head.outputs.wheel) != '' &&
+      !contains(vars.GPU_CI_SKIP_PLATFORMS, 'mi350') }}
     permissions:
       contents: read
-      id-token: write
       pull-requests: write
     uses: ./.github/workflows/_tlx-ops-perf-smoke-platform.yml
     with:
@@ -201,9 +276,5 @@ jobs:
       base_date: ${{ needs.resolve.outputs.base_date }}
       pr: ${{ needs.resolve.outputs.pr }}
       note: ${{ needs.resolve.outputs.note }}
-      head_wheel_url: ${{ needs.build-head.outputs.wheel_url }}
-      head_wheel_filename: ${{ needs.build-head.outputs.wheel_filename }}
-      head_wheel_sha256: ${{ needs.build-head.outputs.wheel_sha256 }}
-      base_wheel_url: ${{ needs.build-base.result == 'success' && needs.build-base.outputs.wheel_url || '' }}
-      base_wheel_filename: ${{ needs.build-base.outputs.wheel_filename }}
-      base_wheel_sha256: ${{ needs.build-base.outputs.wheel_sha256 }}
+      head_wheel: ${{ needs.resolve.outputs.head_wheel || needs.build-head.outputs.wheel }}
+      base_wheel: ${{ needs.resolve.outputs.base_wheel || (needs.build-base.result == 'success' && needs.build-base.outputs.wheel) || '' }}
