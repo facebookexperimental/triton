@@ -3,9 +3,10 @@ name: TLX.ops perf smoke (one platform)
 # job needs only its own bench job, so its section of the PR comment is posted
 # as soon as that runner finishes, however long another platform's runner takes.
 #
-# bench runs the PR's code on the GPU runner with a read-only token: it
-# measures the PR's base and head back to back on one GPU, alternating which
-# goes first. report posts from a GitHub-hosted runner.
+# bench runs on the GPU runner with a read-only token and only ever checks out
+# the commit this run was dispatched on (github.sha): it measures that commit's
+# base and itself back to back on one GPU, alternating which goes first.
+# report posts from a GitHub-hosted runner.
 
 on:
   workflow_call:
@@ -23,7 +24,7 @@ on:
         type: string
         required: true
       head:
-        description: Commit to bench (the dispatched bundle head); its harness measures both wheels
+        description: The benched commit, for the report; always this run's dispatched commit (github.sha)
         type: string
         required: true
       pr_head:
@@ -76,20 +77,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout suite at the benched commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.head }}
-      - name: Checkout CI actions and scripts
+      # The dispatched commit's harness measures both wheels.
+      - name: Checkout the dispatched commit
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
-          path: .ci
-          sparse-checkout: |
-            .github/actions
-            .github/scripts
+          persist-credentials: false
       - name: Set up test environment
-        uses: ./.ci/.github/actions/setup-test-env
+        uses: ./.github/actions/setup-test-env
         with:
           backend: ${{ contains(inputs.torch_index, 'rocm') && 'rocm' || 'cuda' }}
           arch: ${{ inputs.platform == 'mi350' && 'gfx950' || '' }}
@@ -104,7 +99,7 @@ jobs:
       # The action installs the wheel it fetches; the bench reinstalls the two
       # wheels in turn, so each is moved aside once fetched.
       - name: Fetch the head wheel
-        uses: ./.ci/.github/actions/install-prebuilt-triton
+        uses: ./.github/actions/install-prebuilt-triton
         with:
           artifact-name: ${{ fromJSON(inputs.head_wheel).artifact }}
           wheel-url: ${{ fromJSON(inputs.head_wheel).url }}
@@ -114,7 +109,7 @@ jobs:
         run: mkdir -p "${RUNNER_TEMP}/ab/head" && mv "${RUNNER_TEMP}"/prebuilt-wheel/*.whl "${RUNNER_TEMP}/ab/head/"
       - name: Fetch the base wheel
         if: inputs.base_wheel != ''
-        uses: ./.ci/.github/actions/install-prebuilt-triton
+        uses: ./.github/actions/install-prebuilt-triton
         with:
           artifact-name: ${{ fromJSON(inputs.base_wheel || '{}').artifact }}
           wheel-url: ${{ fromJSON(inputs.base_wheel || '{}').url }}
@@ -137,7 +132,7 @@ jobs:
           set -euo pipefail
           BASE_WHEEL=$(find "${RUNNER_TEMP}/ab/base" -name '*.whl' 2>/dev/null | head -n 1)
           HEAD_WHEEL=$(find "${RUNNER_TEMP}/ab/head" -name '*.whl' | head -n 1)
-          python .ci/.github/scripts/tlx_ops_perf_smoke_ab.py bench --platform "${PLATFORM}" --repo . \
+          python .github/scripts/tlx_ops_perf_smoke_ab.py bench --platform "${PLATFORM}" --repo . \
             --base-wheel "${BASE_WHEEL}" --head-wheel "${HEAD_WHEEL}" --rounds "${ROUNDS}" \
             --out "${RUNNER_TEMP}/perf-smoke"
       # Only the sanitized results.json: the raw harness artifacts carry the
