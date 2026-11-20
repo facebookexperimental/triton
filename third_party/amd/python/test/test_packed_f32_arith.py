@@ -80,7 +80,9 @@ def compile_gluon(kernel, signature, constexprs, options=None, aligned=True):
 
 @lru_cache(maxsize=None)
 def compile_for_target(target):
-    return triton.compile(TTIR_PATH, target=target, options={"enable_fp_fusion": True})
+    with triton.knobs.language.scope():
+        triton.knobs.language.allow_fp_fusion = True
+        return triton.compile(TTIR_PATH, target=target, options={"enable_fp_fusion": True})
 
 
 def get_func_body_llir(llir):
