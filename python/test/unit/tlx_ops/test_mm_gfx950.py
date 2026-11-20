@@ -22,6 +22,12 @@ MAX_SECONDS_PER_CASE = 60
 FAILED_SHAPES = set()
 
 
+@pytest.mark.parametrize("block_m,block_k,num_warps", [(48, 64, 4), (16, 20, 4), (16, 64, 3)])
+def test_register_a_load_layout_rejects_non_power_of_two_ownership(block_m, block_k, num_warps):
+    with pytest.raises(AssertionError):
+        _gfx950._register_a_load_layout(block_m, block_k, num_warps)
+
+
 def _assert_range_result(actual, expected):
     assert actual.shape == expected.shape
     tolerance = 1e-2 if actual.dtype == torch.bfloat16 else 1e-3
