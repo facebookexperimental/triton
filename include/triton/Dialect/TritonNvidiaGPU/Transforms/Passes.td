@@ -351,13 +351,16 @@ def TritonNvidiaGPUTestGenerateSubtiledRegionPass
 
 
 def TritonNvidiaGPUMMACollectorReusePass : Pass<"triton-nvidia-mma-collector-reuse", "mlir::ModuleOp"> {
-  let summary = "Share operand A across adjacent tcgen05 MMAs via the collector buffer";
+  let summary = "Share operand A or B across adjacent tcgen05 MMAs via the collector buffer";
 
   let description = [{
     Adjacent async tcgen05 MMAs that read the same shared-memory A operand
     (e.g. one A tile against several N pieces of B) are re-issued one K slice
     at a time with the MMAs inner, and tagged with `.collector::a::fill/use/
     lastuse`, so the TensorCore can read each A slice from shared memory once.
+    On targets with B reuse (SM107), adjacent M=128 MMAs that share B instead
+    (e.g. several M pieces of A against one B tile) are re-issued the same way
+    and tagged with `.collector::b::*`. A sharing is preferred when both apply.
     Accumulation order per accumulator is unchanged.
   }];
 

@@ -86,4 +86,162 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.tc_gen5_mma %a, %b, %d2, %true, %true : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
+
+  // On SM100 a proxy fence still ends an A group, so existing codegen for
+  // TLX dots that share A is unchanged.
+  // CHECK-LABEL: @shared_a_across_fence
+  // CHECK-NOT: collector_a
+  // CHECK: tt.return
+  tt.func public @shared_a_across_fence(
+    %a: !ttg.memdesc<128x64xbf16, #shared, #smem>,
+    %b: !ttg.memdesc<64x128xbf16, #shared, #smem>,
+    %d: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+    %d2: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>) {
+    %true = arith.constant true
+    ttng.tc_gen5_mma %a, %b, %d, %true, %true {is_async} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    ttng.fence_async_shared {bCluster = false}
+    ttng.tc_gen5_mma %a, %b, %d2, %true, %true {is_async} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem64 = #ttng.tensor_memory_encoding<blockM = 64, blockN = 128, colStride = 1>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:107", "ttg.threads-per-warp" = 32 : i32} {
+  // Two M=128 MMAs share B on Rubin: re-issued per 16-wide K slice, B filled
+  // then last-used, the original use_d kept on the first slice only.
+  // CHECK-LABEL: @shared_b
+  // CHECK: %[[PRED:.*]] = arith.constant true
+  // CHECK: %[[ONE:.*]] = arith.constant true
+  // CHECK: %[[B0:.*]] = ttg.memdesc_subslice %[[B:.*]][0, 0]
+  // CHECK: %[[A0:.*]] = ttg.memdesc_subslice %[[A:.*]][0, 0]
+  // CHECK: ttng.tc_gen5_mma %[[A0]], %[[B0]], %[[D:.*]], %[[USE:.*]], %[[PRED]] {is_async, ttng.collector_b = "fill"}
+  // CHECK: %[[A20:.*]] = ttg.memdesc_subslice %[[A2:.*]][0, 0]
+  // CHECK: ttng.tc_gen5_mma %[[A20]], %[[B0]], %[[D2:.*]], %[[USE]], %[[PRED]] {is_async, ttng.collector_b = "lastuse"}
+  // CHECK: %[[B1:.*]] = ttg.memdesc_subslice %[[B]][16, 0]
+  // CHECK: %[[A1:.*]] = ttg.memdesc_subslice %[[A]][0, 16]
+  // CHECK: ttng.tc_gen5_mma %[[A1]], %[[B1]], %[[D]], %[[ONE]], %[[PRED]] {is_async, ttng.collector_b = "fill"}
+  // CHECK-COUNT-4: ttng.tc_gen5_mma
+  // CHECK: ttng.tc_gen5_mma {{.*}}, %[[D2]], %[[ONE]], %[[PRED]] {is_async, ttng.collector_b = "lastuse"}
+  // CHECK-NOT: ttng.tc_gen5_mma
+  // CHECK-NOT: collector_a
+  tt.func public @shared_b(
+    %a: !ttg.memdesc<128x64xbf16, #shared, #smem>,
+    %a2: !ttg.memdesc<128x64xbf16, #shared, #smem>,
+    %b: !ttg.memdesc<64x128xbf16, #shared, #smem>,
+    %d: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+    %d2: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+    %use_d: i1) {
+    %true = arith.constant true
+    ttng.tc_gen5_mma %a, %b, %d, %use_d, %true {is_async} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    ttng.tc_gen5_mma %a2, %b, %d2, %use_d, %true {is_async} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+
+  // Sharing A still takes the A collector on Rubin.
+  // CHECK-LABEL: @shared_a_on_rubin
+  // CHECK: collector_a = "fill"
+  // CHECK-NOT: collector_b
+  // CHECK: tt.return
+  tt.func public @shared_a_on_rubin(
+    %a: !ttg.memdesc<128x64xbf16, #shared, #smem>,
+    %b: !ttg.memdesc<64x128xbf16, #shared, #smem>,
+    %b2: !ttg.memdesc<64x128xbf16, #shared, #smem>,
+    %d: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+    %d2: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>) {
+    %true = arith.constant true
+    ttng.tc_gen5_mma %a, %b, %d, %true, %true {is_async} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    ttng.tc_gen5_mma %a, %b2, %d2, %true, %true {is_async} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+
+  // TLX emits a proxy fence and a CTA barrier before each async_dot; both stay
+  // ahead of the re-issued MMAs.
+  // CHECK-LABEL: @shared_b_with_fences
+  // CHECK: ttng.fence_async_shared
+  // CHECK: ttg.barrier local
+  // CHECK: ttng.fence_async_shared
+  // CHECK: ttg.barrier local
+  // CHECK: collector_b = "fill"
+  // CHECK: collector_b = "lastuse"
+  // CHECK-NOT: ttng.fence_async_shared
+  // CHECK-NOT: ttg.barrier
+  // CHECK: tt.return
+  tt.func public @shared_b_with_fences(
+    %a: !ttg.memdesc<128x64xbf16, #shared, #smem>,
+    %a2: !ttg.memdesc<128x64xbf16, #shared, #smem>,
+    %b: !ttg.memdesc<64x128xbf16, #shared, #smem>,
+    %d: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+    %d2: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>) {
+    %true = arith.constant true
+    ttng.fence_async_shared {bCluster = false}
+    ttg.barrier local
+    ttng.tc_gen5_mma %a, %b, %d, %true, %true {is_async} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    ttng.fence_async_shared {bCluster = false}
+    ttg.barrier local
+    ttng.tc_gen5_mma %a2, %b, %d2, %true, %true {is_async} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+
+  // Two MMAs into one accumulator are not interleaved: the second one's
+  // use_d=false must still discard everything the first one wrote.
+  // CHECK-LABEL: @shared_b_same_acc
+  // CHECK-NOT: collector_b
+  // CHECK: tt.return
+  tt.func public @shared_b_same_acc(
+    %a: !ttg.memdesc<128x64xbf16, #shared, #smem>,
+    %a2: !ttg.memdesc<128x64xbf16, #shared, #smem>,
+    %b: !ttg.memdesc<64x128xbf16, #shared, #smem>,
+    %d: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>) {
+    %true = arith.constant true
+    %false = arith.constant false
+    ttng.tc_gen5_mma %a, %b, %d, %true, %true {is_async} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    ttng.tc_gen5_mma %a2, %b, %d, %false, %true {is_async} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+
+  // M=64 uses half the datapath, which the B collector does not support.
+  // CHECK-LABEL: @shared_b_m64
+  // CHECK-NOT: collector_b
+  // CHECK: tt.return
+  tt.func public @shared_b_m64(
+    %a: !ttg.memdesc<64x64xbf16, #shared, #smem>,
+    %a2: !ttg.memdesc<64x64xbf16, #shared, #smem>,
+    %b: !ttg.memdesc<64x128xbf16, #shared, #smem>,
+    %d: !ttg.memdesc<64x128xf32, #tmem64, #ttng.tensor_memory, mutable>,
+    %d2: !ttg.memdesc<64x128xf32, #tmem64, #ttng.tensor_memory, mutable>) {
+    %true = arith.constant true
+    ttng.tc_gen5_mma %a, %b, %d, %true, %true {is_async} : !ttg.memdesc<64x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<64x128xf32, #tmem64, #ttng.tensor_memory, mutable>
+    ttng.tc_gen5_mma %a2, %b, %d2, %true, %true {is_async} : !ttg.memdesc<64x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<64x128xf32, #tmem64, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:103", "ttg.threads-per-warp" = 32 : i32} {
+  // No B collector before Rubin.
+  // CHECK-LABEL: @shared_b_pre_rubin
+  // CHECK-NOT: collector_b
+  // CHECK: tt.return
+  tt.func public @shared_b_pre_rubin(
+    %a: !ttg.memdesc<128x64xbf16, #shared, #smem>,
+    %a2: !ttg.memdesc<128x64xbf16, #shared, #smem>,
+    %b: !ttg.memdesc<64x128xbf16, #shared, #smem>,
+    %d: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+    %d2: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>) {
+    %true = arith.constant true
+    ttng.tc_gen5_mma %a, %b, %d, %true, %true {is_async} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    ttng.tc_gen5_mma %a2, %b, %d2, %true, %true {is_async} : !ttg.memdesc<128x64xbf16, #shared, #smem>, !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
 }

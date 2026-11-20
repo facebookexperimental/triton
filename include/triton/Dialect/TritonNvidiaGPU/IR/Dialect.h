@@ -86,9 +86,10 @@ unsigned getPackedArithFp4Axis(PackedArithOp op);
 constexpr static char AttrTwoCTAsName[] = "ttng.two-ctas";
 constexpr static char AttrTwoCTALoadName[] = "two_cta_load";
 constexpr static char kPlannedPendingCount[] = "planned_pending_count";
-// tcgen05.mma collector usage for operand A ("fill" / "use" / "lastuse"), set
-// by the MMA collector reuse pass on single-instruction MMAs.
+// tcgen05.mma collector usage for operand A or B ("fill" / "use" / "lastuse"),
+// set by the MMA collector reuse pass on single-instruction MMAs.
 constexpr static char kCollectorAAttrName[] = "ttng.collector_a";
+constexpr static char kCollectorBAttrName[] = "ttng.collector_b";
 // Set by autoWS code partitioning on a nvws.consumer_release whose partition
 // read the buffer through the generic proxy. Token lowering keeps it on the
 // resulting arrive only when another partition refills the buffer with TMA,
