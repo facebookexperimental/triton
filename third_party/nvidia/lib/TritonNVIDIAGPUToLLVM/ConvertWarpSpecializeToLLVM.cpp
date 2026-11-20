@@ -78,10 +78,14 @@ public:
     if (numThreads == 32) {
       LLVM::NVIDIA::createSyncWarp(b.getLoc(), b);
     } else {
-      // Only this warp partition participates, so the barrier is not
-      // CTA-aligned.
+      auto barrier = cast<NVVM::BarrierOp>(&*b.getInsertionPoint());
+      // An implicit aligned barrier synchronizes its whole partition at one
+      // site. Preserve that contract when assigning the partition's private ID.
+      bool aligned = barrier.getAligned() && !barrier.getBarrierId() &&
+                     !barrier.getNumberOfThreads() &&
+                     barrier->getParentOfType<WarpSpecializePartitionsOp>();
       NVVM::BarrierOp::create(b, b.getLoc(), handle, b.i32_val(numThreads),
-                              /*aligned=*/false);
+                              aligned);
     }
   }
 
