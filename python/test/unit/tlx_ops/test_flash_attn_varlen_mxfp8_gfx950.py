@@ -49,6 +49,8 @@ def _reference(q, k, v, cu_q, cu_k, scale):
         ([320, 512, 320], [100, 300, 4100], True),
         # Queries with no keys, and keys with no queries.
         ([128, 0, 320], [0, 300, 100], False),
+        # Maximal padding: the padded sequences fill the K/V buffers exactly.
+        ([64, 200], [257, 1], False),
     ],
 )
 def test_flash_attn_varlen_mxfp8_four_wave(lens_q, lens_k, fast_exp):

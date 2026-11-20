@@ -27,49 +27,10 @@ from ..flash_attn_mxfp8.gfx950 import (
     _to_e4m3,
 )
 
-# LDS address-bit bases of one 64-key half tile, the same as
-# flash_attn_mxfp8.gfx950's: K is stored [feature 128, key 64] with a key's
-# features contiguous, V [key 64, feature 128] with a feature's keys contiguous
-# (V comes transposed).
-_K_LDS_BASES = tl.constexpr([
-    [1, 0],
-    [2, 0],
-    [4, 0],
-    [8, 0],
-    [16, 0],
-    [32, 0],
-    [64, 0],
-    [0, 8],
-    [0, 16],
-    [0, 32],
-    [0, 1],
-    [0, 2],
-    [0, 4],
-])
-_V_LDS_BASES = tl.constexpr([
-    [1, 0],
-    [2, 0],
-    [4, 0],
-    [8, 0],
-    [16, 0],
-    [32, 0],
-    [0, 4],
-    [0, 8],
-    [0, 16],
-    [0, 32],
-    [0, 1],
-    [0, 2],
-    [0, 64],
-])
-
-# Score convention of the softmax helpers below, with C = _score_scale and
-# OFF = _score_offset. The softmax sees scores t = (x - m_i + OFF) * C, x the
-# log2-domain logit and m_i the stale row max; P = 2**(x - m_i + 4) stays below
-# 2**8 while the max holds, and each 32-key block of it then gets its own E8M0
-# scale. With the bit-trick exp, C = 2**-9 comes from lowering Q's E8M0 scales
-# and OFF = 127 + 4 makes t the bf16 exponent position scaled for
-# v_cvt_pknorm_u16_f32 (65535 / 2**16 slope error, common to P and its sum).
-# With the hardware exp, C = 1 and OFF = 4: t is the exponent itself.
+# The softmax helpers below follow flash_attn_mxfp8.gfx950's score convention,
+# described at its _score_scale: they see t = (x - m_i + OFF) * C, x the
+# log2-domain logit and m_i the stale row max, with C = _score_scale and
+# OFF = _score_offset, and P = 2**(x - m_i + 4).
 
 
 @triton.jit
@@ -254,8 +215,7 @@ def _issue_tile(
     # Issues the global->LDS copies of K tile kt and V tile vt, with their E8M0
     # words, as two commit groups: the first 64-key halves (ka, va, ksa, vsa),
     # then the second (kb, vb, ksb, vsb), which lie k_n1, v_n1 and ks_n1 further
-    # on. The K destinations may be None (no K tile left to fetch); the V
-    # destinations may not, as the commits sit with them.
+    # on. The K or the V destinations may be None (no such tile left to fetch).
     #
     # V's packed E8M0 words go with V; they are laid out like K's, so they
     # share its offsets and steps.
@@ -265,14 +225,14 @@ def _issue_tile(
     if va is not None:
         tlx.async_load(v_ptr + vt * v_step, va)
         tlx.async_load(vs_ptr + vt * ks_step, vsa)
-        tlx.async_load_commit_group()
+    tlx.async_load_commit_group()
     if ka is not None:
         tlx.async_load(k_ptr + kt * k_step + k_n1, kb)
         tlx.async_load(ks_ptr + kt * ks_step + ks_n1, ksb)
     if va is not None:
         tlx.async_load(v_ptr + vt * v_step + v_n1, vb)
         tlx.async_load(vs_ptr + vt * ks_step + ks_n1, vsb)
-        tlx.async_load_commit_group()
+    tlx.async_load_commit_group()
 
 
 @triton.jit

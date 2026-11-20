@@ -27,6 +27,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from ..flash_attn_mxfp8.gfx950 import _K_LDS_BASES, _V_LDS_BASES
 from . import mxfp8_attention_core_gfx950 as core
 
 _HEADS = 4
@@ -52,7 +53,6 @@ _LAUNCH_OPTIONS = {
     # core._mfma_stage places its own scheduling barriers. Set explicitly: an
     # unset option follows the environment knob.
     "enable_sched_group_barrier_scheduler": False,
-    "sched_group_barrier_mfma_per_dwordx4": 4,
 }
 
 
@@ -498,8 +498,11 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
         shape=((32, 2, tlx.num_warps()), (1, )),
         stride=((2, 1, 64), (1, )),
     )
-    k_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(1024, 16)], core._K_LDS_BASES, [D, HN])
-    v_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(1024, 16)], core._V_LDS_BASES, [HN, D])
+    # The fixed-length op's LDS layouts of a 64-key half tile: K [feature, key]
+    # with a key's features contiguous, V [key, feature] with a feature's keys
+    # contiguous (V comes transposed).
+    k_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(1024, 16)], _K_LDS_BASES, [D, HN])
+    v_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(1024, 16)], _V_LDS_BASES, [HN, D])
     ka = tlx.local_alloc((D, HN), tl.float8e4nv, 2, layout=k_layout)
     kb = tlx.local_alloc((D, HN), tl.float8e4nv, 2, layout=k_layout)
     va = tlx.local_alloc((HN, D), tl.float8e4nv, 2, layout=v_layout)
@@ -898,8 +901,8 @@ def _build_metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad)
         "cu_q_tile": cu_q_tile,
         "item_tile": item_tile,
         "item_capacity": item_capacity,
-        # One spare tile keeps prefetches of empty work items in bounds.
-        "npad": (triton.cdiv(total_kv + (pad - 1) * batch, pad) + 1) * pad,
+        # An upper bound of the padded key count.
+        "npad": triton.cdiv(total_kv + (pad - 1) * batch, pad) * pad,
     }
 
 
@@ -955,10 +958,10 @@ class ForwardWorkSchedule:
     ``item_order[base + n * num_ctas]`` is the n-th work item of the program
     with slot ``base``. ``total_q``, ``total_kv`` and ``batch`` identify the
     lengths the schedule was built for. ``needs_empty_fill`` is set when a
-    sequence has queries but no keys, and ``item_count`` is the number of work
-    items; the kernel follows ``item_order`` only when it covers every item
-    and no sequence needs the empty fill, and otherwise takes the items in
-    index order."""
+    sequence has queries but no keys; such sequences have no work items and
+    get their rows from a separate fill. ``item_count`` is the number of work
+    items: the kernel follows ``item_order`` only when it covers every item,
+    and otherwise takes the items in index order."""
 
     item_order: torch.Tensor
     num_ctas: int
@@ -1313,8 +1316,7 @@ def _launch_extended_forward(
         fast_exp = long_kv
     kernel = cast(Any, _mxfp8_varlen_extended_kernel_4)
     use_work_order = (work_schedule.item_count is not None
-                      and work_schedule.item_count == work_schedule.item_order.numel()
-                      and not work_schedule.needs_empty_fill)
+                      and work_schedule.item_count == work_schedule.item_order.numel())
     kernel[(grid, )](
         q,
         q_scales if q_scales is not None else q,
@@ -1354,40 +1356,3 @@ def _launch_extended_forward(
             num_warps=4,
         )
     return out, lse
-
-
-def emulate(q, k, v, cu_seqlens_q, cu_seqlens_k, sm_scale):
-    """FP64 reference of the recipe: Q/K scaled per 32x32 tile, V per feature
-    and 32 keys, P per row and 32 keys; key blocks follow the padded layout."""
-
-    def quantize(x, rows, cols, front=0):
-        n, h, d = x.shape
-        g = torch.nn.functional.pad(x.double(), (0, 0, 0, 0, front, (-n - front) % rows))
-        g = g.reshape(-1, rows, h, d // cols, cols)
-        amax = g.abs().amax((1, 4), keepdim=True).float()
-        byte = ((amax / 448.0).view(torch.int32) + 0x7FFFFF) >> 23
-        scale = torch.exp2(byte.double() - 127)
-        data = (g / scale).float().to(torch.float8_e4m3fn).double() * scale
-        return data.reshape(-1, h, d)[front:front + n]
-
-    out = torch.zeros(q.shape, dtype=torch.float64, device=q.device)
-    cq, ck = cu_seqlens_q.tolist(), cu_seqlens_k.tolist()
-    for s in range(len(cq) - 1):
-        qs, ks_, vs_ = q[cq[s]:cq[s + 1]], k[ck[s]:ck[s + 1]], v[ck[s]:ck[s + 1]]
-        n = ks_.shape[0]
-        if qs.shape[0] == 0 or n == 0:
-            continue
-        front = max((n + _PAD - 1) // _PAD * _PAD - n - 128, 0)
-        qd = quantize(qs, 32, 32)
-        kd, vd = quantize(ks_, 32, 32, front), quantize(vs_, 32, 1, front)
-        scores = torch.einsum("qhd,khd->hqk", qd, kd) * sm_scale
-        p = torch.exp(scores - scores.amax(-1, keepdim=True))
-        pp = torch.nn.functional.pad(p, (front, (-n - front) % 32)).unflatten(-1, (-1, 32))
-        amax = pp.amax(-1, keepdim=True).float()
-        byte = ((amax / 448.0).view(torch.int32) + 0x7FFFFF) >> 23
-        scale = torch.exp2(byte.double() - 127)
-        pq = ((pp / scale).float().to(torch.float8_e4m3fn).double() * scale).flatten(-2)
-        pq = pq[..., front:front + n]
-        # The kernel's denominator sums the FP8 probabilities.
-        out[cq[s]:cq[s + 1]] = torch.einsum("hqk,khd->qhd", pq / pq.sum(-1, keepdim=True), vd)
-    return out
