@@ -5575,6 +5575,13 @@ LogicalResult TritonGPUDialect::verifyOperationAttribute(Operation *op,
            << attr.getName()
            << " which is expected only on `module` or `tt.func` ops";
   }
+  // NPOT inputs report tensor-size errors first: with TRITON_ALLOW_NPOT the
+  // warp/CTA counts on a fixture may be intentionally non-pow2 while the
+  // layout error is the diagnostic under test.
+  if (attr.getName() == AttrNumWarpsName && isa<ModuleOp, FuncOp>(op) &&
+      mlir::triton::tools::isNpotAllowed())
+    if (failed(verifyEncodedTensorSizes(op)))
+      return failure();
   if (attr.getName() == AttrNumWarpsName || attr.getName() == AttrNumCTAsName) {
     auto count = dyn_cast<IntegerAttr>(attr.getValue());
     if (!count || !count.getValue().isStrictlyPositive() ||
@@ -5582,9 +5589,6 @@ LogicalResult TritonGPUDialect::verifyOperationAttribute(Operation *op,
       return op->emitOpError("requires ")
              << attr.getName() << " to be a positive power of two";
   }
-  if (attr.getName() == AttrNumWarpsName && isa<ModuleOp, FuncOp>(op) &&
-      mlir::triton::tools::isNpotAllowed())
-    return verifyEncodedTensorSizes(op);
 
   return success();
 }
