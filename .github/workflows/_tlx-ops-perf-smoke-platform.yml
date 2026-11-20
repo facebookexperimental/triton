@@ -3,8 +3,8 @@ name: TLX.ops perf smoke (one platform)
 # job needs only its own bench job, so its section of the PR comment is posted
 # as soon as that runner finishes, however long another platform's runner takes.
 #
-# bench runs the PR's code on the GPU runner with read-only tokens: it measures
-# the PR's base and merge commit back to back on one GPU, alternating which
+# bench runs the PR's code on the GPU runner with a read-only token: it
+# measures the PR's base and head back to back on one GPU, alternating which
 # goes first. report posts from a GitHub-hosted runner.
 
 on:
@@ -23,7 +23,7 @@ on:
         type: string
         required: true
       head:
-        description: Commit to bench (the PR's test merge commit, or the PR head for a manual run); its harness measures both wheels
+        description: Commit to bench (the dispatched bundle head); its harness measures both wheels
         type: string
         required: true
       pr_head:
