@@ -376,6 +376,23 @@ def _mfma_softmax_loop_4w(
 
 
 @triton.jit
+def _item_uniform(item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS: tl.constexpr, BLOCK_M: tl.constexpr):
+    # Work-item metadata is loaded from memory, which leaves each scalar (and
+    # every loop bound and offset derived from it) in a VGPR. The values are
+    # block-uniform, so move them to SGPRs.
+    head, q0, q_rows, front, tail, pad_start, n_tiles = _item(item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS, BLOCK_M)
+    return (
+        tlx.assume_uniform(head),
+        tlx.assume_uniform(q0),
+        tlx.assume_uniform(q_rows),
+        tlx.assume_uniform(front),
+        tlx.assume_uniform(tail),
+        tlx.assume_uniform(pad_start),
+        tlx.assume_uniform(n_tiles),
+    )
+
+
+@triton.jit
 # Triton TR001: BLOCK_M is a host-selected production contract.
 def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     Q,
@@ -409,18 +426,18 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     ROW: tl.constexpr = HEADS * D
     pid = tl.program_id(0)
     n_ctas = tl.num_programs(0)
-    n_items = tl.load(CuQTile + BATCH) * HEADS
-    base = pid % 8 * (n_ctas // 8) + pid // 8
+    n_items = tlx.assume_uniform(tl.load(CuQTile + BATCH)) * HEADS
+    base = tlx.assume_uniform(pid % 8 * (n_ctas // 8) + pid // 8)
     if base >= n_items:
         return
-    n_mine = (n_items - base + n_ctas - 1) // n_ctas
+    n_mine = tlx.assume_uniform((n_items - base + n_ctas - 1) // n_ctas)
     offs_d = tl.arange(0, D)
     offs_hd = tl.arange(0, HD)
     offs_n = tl.arange(0, HN)
     offs_mm = tl.arange(0, BLOCK_M)
     C: tl.constexpr = core._score_scale(FAST_EXP)
     OFF: tl.constexpr = core._score_offset(FAST_EXP)
-    c_qk = C / qk_scale
+    c_qk = tlx.assume_uniform(C / qk_scale)
     k_off = offs_d[:, None] + offs_n[None, :] * D
     v_off = offs_n[:, None] + offs_d[None, :] * HN
     ks_off = offs_n[:, None]
@@ -450,8 +467,9 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     vsb = tlx.local_alloc((HN, 1), tl.int32, 2)
     item = base
     if USE_WORK_ORDER:
-        item = tl.load(WorkOrder + base)
-    head, q0, q_rows, front, tail, pad_start, n_tiles = _item(item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS, BLOCK_M)
+        item = tlx.assume_uniform(tl.load(WorkOrder + base))
+    head, q0, q_rows, front, tail, pad_start, n_tiles = _item_uniform(item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS,
+                                                                      BLOCK_M)
     k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off)
     tlx.async_load(k_ptr, ka[1])
     tlx.async_load(k_ptr + k_n1, kb[1])
@@ -484,9 +502,9 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
         if not (REUSE_METADATA and USE_WORK_ORDER):
             item = base + w * n_ctas
             if USE_WORK_ORDER:
-                item = tl.load(WorkOrder + item)
-            head, q0, q_rows, front, tail, pad_start, n_tiles = _item(item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS,
-                                                                      BLOCK_M)
+                item = tlx.assume_uniform(tl.load(WorkOrder + item))
+            head, q0, q_rows, front, tail, pad_start, n_tiles = _item_uniform(item, ItemTile, CuQTile, CuQ, CuKV, CuPad,
+                                                                              HEADS, BLOCK_M)
         q_base = Q + q0.to(tl.int64) * ROW + head * D
         q_mask = q_local < q_rows * ROW
         if PREQUANTIZED_Q:
@@ -613,9 +631,9 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
         nxt = tl.where(w + 1 < n_mine, item + n_ctas, item)
         if USE_WORK_ORDER:
             next_slot = base + tl.where(w + 1 < n_mine, w + 1, w) * n_ctas
-            nxt = tl.load(WorkOrder + next_slot)
-        n_head, n_q0, n_q_rows, n_front, n_tail, n_pad_start, n_tiles_next = _item(nxt, ItemTile, CuQTile, CuQ, CuKV,
-                                                                                   CuPad, HEADS, BLOCK_M)
+            nxt = tlx.assume_uniform(tl.load(WorkOrder + next_slot))
+        n_head, n_q0, n_q_rows, n_front, n_tail, n_pad_start, n_tiles_next = _item_uniform(
+            nxt, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS, BLOCK_M)
         nk_ptr, nv_ptr, nks_ptr, nvs_ptr = _kv_pointers(K8, V8, KS, VS, n_head, n_pad_start, NPAD, k_off, v_off, ks_off)
         tlx.async_load(nk_ptr, ka[1])
         tlx.async_load(nk_ptr + k_n1, kb[1])
