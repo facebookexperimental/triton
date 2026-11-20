@@ -780,9 +780,6 @@ Value getMemEffectCTAs(ImplicitLocOpBuilder &b, Operation *op) {
     }
     return getLocalMemoryRecipientCTAs(b, messageToShared, broadcastMask);
   }
-  if (auto gatherOp = dyn_cast<ttng::AsyncTMAGatherOp>(op);
-      gatherOp && gatherOp.getMulticast())
-    return getMulticastRecipientCTAs(b, gatherOp.getResult());
   if (isa<ttng::CLCTryCancelOp>(op))
     return allCTAsMask(b);
   if (isa<ttng::MMAv5OpInterface, ttng::TMEMCopyOp, ttng::TMEMShiftOp>(op))
