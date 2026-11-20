@@ -157,6 +157,21 @@ different amounts of work do not belong in one TFLOP/s column. `--fwd-only` /
    per kernel, `name: config` separated by `|`; a kernel that is not autotuned
    reports `-`. Recorded by the harness, so every op has the column.
 
+The raw artifact and published summary also retain an `autotune` list per case.
+Each entry identifies the kernel, preparation or warmup phase, runtime cache key,
+selected compiler options and selection type: `tuned`, `cached`, `fixed` or
+`unobserved`. The config includes launch options such as CTA count and register
+caps, not just the compact best-config label. `ir_override` records only whether
+an override is present, never its private file path.
+`selected_by_case` names the case whose tuning was observed; it is null for an
+unknown origin, such as an existing disk cache or tuning in the cold-compile
+pass outside this recorder. Candidate `timings_ms` are copied only from a genuine
+tuning event. Cached cases never repeat an earlier case's timings as new
+measurements. Non-finite candidate values are null, not zero. This recorder is
+removed before correctness checks and performance timing. A recording failure
+adds an `unobserved` entry with a `recording_error` type, without discarding the
+performance measurement. Older artifacts have no decision records.
+
 ### Common vs op-specific metrics
 
 Everything in 2 and 3 is common and identical for every op: an op is normalised
