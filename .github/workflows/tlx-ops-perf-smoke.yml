@@ -182,9 +182,10 @@ jobs:
           python .github/scripts/wheel_cache.py lookup --sha "${BASE}" --output base_wheel
 
   # Manual runs only: a pull request's head wheel comes verified from its GPU tests run.
+  # `!cancelled()` keeps it from inheriting the skipped followup job's status on manual runs.
   build-head:
     needs: resolve
-    if: github.event_name == 'workflow_dispatch' && needs.resolve.outputs.head != ''
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && needs.resolve.outputs.head != '' }}
     permissions:
       contents: read
       id-token: write
@@ -197,7 +198,7 @@ jobs:
   # nightly only, as this smoke did before it had a same-runner base.
   build-base:
     needs: resolve
-    if: needs.resolve.outputs.head != '' && needs.resolve.outputs.base_wheel == ''
+    if: ${{ !cancelled() && needs.resolve.outputs.head != '' && needs.resolve.outputs.base_wheel == '' }}
     permissions:
       contents: read
       id-token: write
