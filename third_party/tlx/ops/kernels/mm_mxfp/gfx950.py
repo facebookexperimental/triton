@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tlx.ops._catalog import InvalidInput
-from triton.tlx.ops.kernels.mm_mxfp8._shapes import MODEL_LINEAR_SHAPES
+from triton.tlx.ops.kernels.mm_mxfp._shapes import MODEL_LINEAR_SHAPES
 
 _MODEL_LINEAR_SHAPES = frozenset(MODEL_LINEAR_SHAPES)
 
@@ -2192,13 +2192,13 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                                                                             disable_unclustered_high_rp_reschedule=True)
 
 
-def mm_mxfp8(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="heuristic"):
+def mm_mxfp(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="heuristic"):
     if space not in ("heuristic", "full"):
-        raise InvalidInput(f"tlx.ops.mm_mxfp8 on gfx950 does not provide space={space!r}")
+        raise InvalidInput(f"tlx.ops.mm_mxfp on gfx950 does not provide space={space!r}")
     m, k = a.shape
     n = b.shape[0]
     if min(m, n, k) <= 0 or k % 128:
-        raise InvalidInput("tlx.ops.mm_mxfp8 on gfx950 requires positive M and N, with K divisible by 128; "
+        raise InvalidInput("tlx.ops.mm_mxfp on gfx950 requires positive M and N, with K divisible by 128; "
                            f"got M={m}, N={n}, K={k}")
     if max(m * k, n * k, 2 * m * n) >= 2**31:
         raise InvalidInput(

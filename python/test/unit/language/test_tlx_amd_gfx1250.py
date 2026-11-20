@@ -5,12 +5,12 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _cdna5_gemm
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton.tlx.ops.kernels.grouped_gemm import gfx1250 as _gfx1250_grouped_ops
-from triton.tlx.ops.kernels.mm_mxfp8 import gfx1250 as _gfx1250_mxfp_ops
-from triton.tools.mxfp import MXScaleTensor
+from triton.tlx.ops.kernels.mm_mxfp import gfx1250 as _gfx1250_mxfp
+from triton.tlx.ops.kernels.grouped_gemm_mxfp import gfx1250 as _gfx1250_grouped_mxfp_op
+from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor
 from triton._internal_testing import is_hip_cdna5
 
 
@@ -563,6 +563,278 @@ def test_gfx1250_mxgemm_tdm_pipelined(TRANSPOSE_B, SEED, M, N, K, SCHEDULE, DTYP
 
 
 @pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+@pytest.mark.parametrize("dtype_a", ["e4m3", "e2m1"])
+@pytest.mark.parametrize(
+    "group_sizes",
+    [
+        pytest.param((65, 129, 7), id="ragged"),
+        pytest.param((8, ) * 32, id="32-expert-uniform"),
+        pytest.param((64, 64, 64, 64) + (0, ) * 28, id="32-expert-skewed"),
+    ],
+)
+def test_gfx1250_grouped_mxfp_gemm(dtype_a, group_sizes):
+    experts = len(group_sizes)
+    gm, n, k = sum(group_sizes), 640, 512
+    torch.manual_seed(17)
+
+    if dtype_a == "e4m3":
+        a_values = torch.randint(20, 40, (gm, k), dtype=torch.uint8).view(torch.float8_e4m3fn)
+        a_data = a_values
+    else:
+        a_mxfp4 = MXFP4Tensor(size=(gm, k)).random()
+        a_values = a_mxfp4.to(torch.float32)
+        a_data = a_mxfp4.to_packed_tensor(dim=1).data
+    w_mxfp4 = MXFP4Tensor(size=(experts, n, k)).random()
+    w_values = w_mxfp4.to(torch.float32)
+    w_data = w_mxfp4.to_packed_tensor(dim=2).data
+    a_scale = torch.full((gm, k // 32), 127, dtype=torch.uint8)
+    w_scale = torch.full((experts, n, k // 32), 127, dtype=torch.uint8)
+
+    expected = torch.empty((gm, n), dtype=torch.float32)
+    row_start = 0
+    a_f32 = a_values.float()
+    for expert, rows in enumerate(group_sizes):
+        expected[row_start:row_start + rows] = a_f32[row_start:row_start + rows] @ w_values[expert].T
+        row_start += rows
+
+    a_data = a_data.contiguous().cuda()
+    w_data = w_data.contiguous().cuda()
+    split_sizes = torch.tensor(group_sizes, dtype=torch.int32, device="cuda")
+    actual = _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(a_data, a_scale.cuda(), w_data, w_scale.cuda(), split_sizes,
+                                                        x_dtype=dtype_a, validate=True)
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.cpu().float(), expected, rtol=2e-2, atol=2.0)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+@pytest.mark.parametrize(
+    "group_sizes",
+    [(1, 0, 2, 1, 0), (4, 3, 3, 3, 3), (65, 0, 129, 7, 0), (64, ) * 32],
+)
+@pytest.mark.parametrize("preshuffle_b_scale", [False, True])
+@pytest.mark.parametrize("preshuffle_b", [False, True])
+def test_gfx1250_grouped_mxfp_tdm_schedule(group_sizes, preshuffle_b_scale, preshuffle_b):
+    gm, n, k = sum(group_sizes), 256, 512
+    torch.manual_seed(1250)
+
+    a = torch.randint(20, 40, (gm, k), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    w_mxfp4 = MXFP4Tensor(size=(len(group_sizes), n, k)).random()
+    w_values = w_mxfp4.to(torch.float32)
+    w = w_mxfp4.to_packed_tensor(dim=2).data
+    a_scale = torch.full((gm, k // 32), 127, dtype=torch.uint8)
+    w_scale = torch.full((len(group_sizes), n, k // 32), 127, dtype=torch.uint8)
+    if preshuffle_b_scale:
+        w_scale = _gfx1250_grouped_mxfp_op.preshuffle_grouped_weight_scale(w_scale.cuda())
+
+    expected = torch.empty((gm, n), dtype=torch.float32)
+    row_start = 0
+    for expert, rows in enumerate(group_sizes):
+        expected[row_start:row_start + rows] = a.float()[row_start:row_start + rows] @ w_values[expert].T
+        row_start += rows
+
+    split_sizes = torch.tensor(group_sizes, dtype=torch.int32, device="cuda")
+    tile_map = _gfx1250_grouped_mxfp_op.prepare_grouped_gemm_mxfp(split_sizes, gm)
+    w = w.cuda()
+    if preshuffle_b:
+        w = _gfx1250_grouped_mxfp_op.preshuffle_grouped_weight(w)
+    actual = _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(
+        a.cuda(),
+        a_scale.cuda(),
+        w,
+        w_scale.cuda(),
+        split_sizes,
+        x_dtype="e4m3",
+        tile_map=tile_map,
+        w_preshuffled=preshuffle_b,
+        w_scale_preshuffled=preshuffle_b_scale,
+    )
+    torch.testing.assert_close(actual.cpu().float(), expected, rtol=2e-2, atol=0.125)
+
+
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def _random_w4a4_grouped(group_sizes, n, k, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    gm, experts = sum(group_sizes), len(group_sizes)
+
+    def randint(low, high, shape):
+        return torch.randint(low, high, shape, dtype=torch.uint8, device="cuda", generator=gen)
+
+    return (randint(0, 256, (gm, k // 2)), randint(124, 131, (gm, k // 32)), randint(0, 256, (experts, n, k // 2)),
+            randint(124, 131, (experts, n, k // 32)))
+
+
+def _w4a4_grouped_reference(x, x_scale, w, w_scale, group_sizes):
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float64, device=x.device)
+
+    def dequant(packed, scale):
+        values = torch.stack((lut[(packed & 0xF).long()], lut[(packed >> 4).long()]), dim=-1).flatten(-2)
+        return values * torch.exp2(scale.double() - 127).repeat_interleave(32, dim=-1)
+
+    out = torch.zeros((x.shape[0], w.shape[1]), dtype=torch.float64, device=x.device)
+    row = 0
+    for expert, rows in enumerate(group_sizes):
+        if rows:
+            out[row:row +
+                rows] = dequant(x[row:row + rows], x_scale[row:row + rows]) @ dequant(w[expert], w_scale[expert]).T
+        row += rows
+    return out
+
+
+def _run_grouped_w4a4(x, x_scale, w, w_scale, group_sizes, *, w_pre, s_pre, kstep_major=False, **kwargs):
+    if w_pre:
+        w = _gfx1250_grouped_mxfp_op.preshuffle_grouped_weight(w, kstep_major=kstep_major)
+    if s_pre:
+        w_scale = _gfx1250_grouped_mxfp_op.preshuffle_grouped_weight_scale(w_scale, kstep_major=kstep_major)
+    split_sizes = torch.tensor(group_sizes, dtype=torch.int32, device="cuda")
+    return _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(x, x_scale, w, w_scale, split_sizes, w_preshuffled=w_pre,
+                                                      w_scale_preshuffled=s_pre, w_kstep_major=kstep_major, **kwargs)
+
+
+def _assert_close_bf16(actual, expected):
+    torch.testing.assert_close(actual.double(), expected, rtol=1e-2, atol=1.0)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+@pytest.mark.parametrize(
+    "group_sizes, n, k, uniform",
+    [
+        # BLOCK_M=64 tile map; the last M tile and the last N tile both run past the end of X and W.
+        pytest.param((0, 257, 0), 640, 512, False, id="tile-map-final-tail"),
+        # BLOCK_M=32 linear scan; the final group's only tile has 7 rows.
+        pytest.param((65, 0, 129, 7, 0), 640, 512, False, id="linear-scan-final-tail"),
+        pytest.param((64, ) * 8, 1024, 512, True, id="uniform"),
+        # The static ring only applies with preshuffled weights and scales; raw layouts take the uniform loop.
+        pytest.param((64, ) * 32, 1024, 4096, True, id="uniform-static-ring"),
+    ],
+)
+@pytest.mark.parametrize("s_pre", [False, True])
+@pytest.mark.parametrize("w_pre", [False, True])
+def test_gfx1250_grouped_mxfp_w4a4(group_sizes, n, k, uniform, s_pre, w_pre):
+    x, x_scale, w, w_scale = _random_w4a4_grouped(group_sizes, n, k, seed=1250)
+    expected = _w4a4_grouped_reference(x, x_scale, w, w_scale, group_sizes)
+    actual = _run_grouped_w4a4(x, x_scale, w, w_scale, group_sizes, w_pre=w_pre, s_pre=s_pre, uniform_grouped=uniform)
+    _assert_close_bf16(actual, expected)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+# 32 * N / 512 tiles over 2 programs per CU: N=512 gives each program at most one tile, and N=6144/8192 give
+# programs two and three tiles on devices with up to 256 CUs.
+@pytest.mark.parametrize("n", [512, 6144, 8192])
+def test_gfx1250_grouped_mxfp_w4a4_persistent(n):
+    group_sizes = (64, ) * 32
+    x, x_scale, w, w_scale = _random_w4a4_grouped(group_sizes, n, 4096, seed=n)
+    expected = _w4a4_grouped_reference(x, x_scale, w, w_scale, group_sizes)
+    actual = _run_grouped_w4a4(x, x_scale, w, w_scale, group_sizes, w_pre=True, s_pre=True, kstep_major=True,
+                               uniform_grouped=True)
+    _assert_close_bf16(actual, expected)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+def test_gfx1250_grouped_mxfp_w4a4_persistent_graph_replay():
+    group_sizes, n, k = (64, ) * 32, 1024, 4096
+    x, x_scale, w_raw, w_scale = _random_w4a4_grouped(group_sizes, n, k, seed=0)
+    w = _gfx1250_grouped_mxfp_op.preshuffle_grouped_weight(w_raw, kstep_major=True)
+    w_scale_pre = _gfx1250_grouped_mxfp_op.preshuffle_grouped_weight_scale(w_scale, kstep_major=True)
+    split_sizes = torch.tensor(group_sizes, dtype=torch.int32, device="cuda")
+    out = torch.empty((sum(group_sizes), n), dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(x, x_scale, w, w_scale_pre, split_sizes, out=out, w_preshuffled=True,
+                                                   w_scale_preshuffled=True, uniform_grouped=True, w_kstep_major=True)
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for seed in (1, 2):
+        new_x, new_x_scale, _, _ = _random_w4a4_grouped(group_sizes, n, k, seed=seed)
+        x.copy_(new_x)
+        x_scale.copy_(new_x_scale)
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_close_bf16(out, _w4a4_grouped_reference(x, x_scale, w_raw, w_scale, group_sizes))
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+@pytest.mark.parametrize(
+    "group_sizes, uniform, match",
+    [
+        pytest.param((64, 0), False, "sum to the 128 rows of X", id="sum-mismatch"),
+        pytest.param((63, 65) + (64, ) * 30, True, "every group", id="non-uniform"),
+    ],
+)
+def test_gfx1250_grouped_mxfp_rejects_bad_split_sizes(group_sizes, uniform, match):
+    x, x_scale, w, w_scale = _random_w4a4_grouped((64, ) * len(group_sizes), 512, 512, seed=0)
+    split_sizes = torch.tensor(group_sizes, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match=match):
+        _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(x, x_scale, w, w_scale, split_sizes, uniform_grouped=uniform,
+                                                   validate=True)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+def test_gfx1250_grouped_mxfp_zero_rows():
+    x, x_scale, w, w_scale = _random_w4a4_grouped((0, 0), 512, 512, seed=0)
+    split_sizes = torch.zeros(2, dtype=torch.int32, device="cuda")
+    out = _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(x, x_scale, w, w_scale, split_sizes)
+    assert out.shape == (0, 512) and out.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+def test_gfx1250_grouped_mxfp_rejects_stale_tile_map():
+    group_sizes = (300, 300)
+    x, x_scale, w, w_scale = _random_w4a4_grouped(group_sizes, 512, 512, seed=0)
+    split_sizes = torch.tensor(group_sizes, dtype=torch.int32, device="cuda")
+    tile_map = _gfx1250_grouped_mxfp_op.prepare_grouped_gemm_mxfp(split_sizes, 5000)
+    with pytest.raises(ValueError, match="tile_map was built for 5000 rows"):
+        _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(x, x_scale, w, w_scale, split_sizes, tile_map=tile_map)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+@pytest.mark.parametrize(
+    "bad", ["x_strided", "x_scale_shape", "w_scale_preshuffled_flag", "split_dtype", "out_dtype", "x_dtype", "w_dtype"])
+def test_gfx1250_grouped_mxfp_rejects_bad_inputs(bad):
+    group_sizes = (64, 64)
+    x, x_scale, w, w_scale = _random_w4a4_grouped(group_sizes, 512, 512, seed=0)
+    split_sizes = torch.tensor(group_sizes, dtype=torch.int32, device="cuda")
+    kwargs = {}
+    if bad == "x_strided":
+        x = torch.empty((x.shape[0], 2 * x.shape[1]), dtype=x.dtype, device=x.device)[:, ::2]
+    elif bad == "x_scale_shape":
+        x_scale = x_scale[:, :-1].contiguous()
+    elif bad == "w_scale_preshuffled_flag":
+        kwargs["w_scale_preshuffled"] = True
+    elif bad == "split_dtype":
+        split_sizes = split_sizes.long()
+    elif bad == "x_dtype":
+        kwargs["x_dtype"] = "e4m3"
+    elif bad == "w_dtype":
+        kwargs["w_dtype"] = "e4m3"
+    else:
+        kwargs["out"] = torch.empty((sum(group_sizes), 512), dtype=torch.float16, device="cuda")
+    with pytest.raises(ValueError, match="grouped_gemm_mxfp"):
+        _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(x, x_scale, w, w_scale, split_sizes, **kwargs)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+def test_gfx1250_grouped_mxfp_persistent_rejects_too_many_tiles():
+    programs = 2 * torch.cuda.get_device_properties(0).multi_processor_count
+    n = 512 * (3 * programs // 32 + 1)
+    group_sizes, k = (64, ) * 32, 4096
+    x = torch.empty((sum(group_sizes), k // 2), dtype=torch.uint8, device="cuda")
+    x_scale = torch.empty((sum(group_sizes), k // 32), dtype=torch.uint8, device="cuda")
+    w = torch.empty((32, n, k // 2), dtype=torch.uint8, device="cuda")
+    w_scale = torch.empty((32, n // 128, k // 32 * 128), dtype=torch.uint8, device="cuda")
+    split_sizes = torch.tensor(group_sizes, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="at most 3 tiles per program"):
+        _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(x, x_scale, w, w_scale, split_sizes, w_preshuffled=True,
+                                                   w_scale_preshuffled=True, uniform_grouped=True, w_kstep_major=True)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("DTYPE_B", ["float8_e4m3", "float4"])
 @pytest.mark.parametrize("TILES_PER_WARP", [(1, 1), (2, 1), (1, 2), (2, 2)])
 def test_gfx1250_mxgemm_tdm_tiles_per_warp(DTYPE_B, TILES_PER_WARP):
@@ -878,9 +1150,9 @@ def test_mxgemm_persistent_invalid_config(config, match):
 def _mxfp_cluster_tile_ids(output, NUM_M: tl.constexpr, NUM_N: tl.constexpr, PROGRAMS: tl.constexpr,
                            GROUP_M: tl.constexpr, REMAP: tl.constexpr, LAYOUT: tl.constexpr = "2x2"):
     pid = tl.program_id(0)
-    tile = _gfx1250_mxfp_ops._mxgemm_cluster_program_id(pid, PROGRAMS, REMAP, 8, 2, LAYOUT)
+    tile = _gfx1250_mxfp._mxgemm_cluster_program_id(pid, PROGRAMS, REMAP, 8, 2, LAYOUT)
     for step in range(NUM_M * NUM_N // PROGRAMS):
-        off_m, off_n = _gfx1250_mxfp_ops._mxgemm_tile_offsets(tile, NUM_M, NUM_N, GROUP_M, 256, 256, LAYOUT)
+        off_m, off_n = _gfx1250_mxfp._mxgemm_tile_offsets(tile, NUM_M, NUM_N, GROUP_M, 256, 256, LAYOUT)
         tl.store(output + step * PROGRAMS + pid, off_m // 256 * NUM_N + off_n // 256)
         tile += PROGRAMS
 
@@ -930,7 +1202,7 @@ def test_mxgemm_cluster_grid_tile_coverage(layout, num_m, num_n, programs, remap
 
 
 def test_mxgemm_bench_defaults_and_overrides():
-    from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import bench
+    from triton.tlx.ops.kernels.mm_mxfp import bench_gfx1250 as bench
 
     # Defaults: 4x4 clusters with an eight-block barrier interval and chunked
     # XCD remapping of whole clusters for both variants, each with FP32 and

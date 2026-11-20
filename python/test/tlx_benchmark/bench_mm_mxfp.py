@@ -1,4 +1,4 @@
-"""Nightly performance coverage for ``tlx.ops.mm_mxfp8`` on gfx950.
+"""Nightly performance coverage for ``tlx.ops.mm_mxfp`` on gfx950.
 
 The public PyTorch reference multiplies pre-dequantized BF16 operands through
 hipBLASLt. Its throughput is reported for context, but does not gate the run
@@ -13,15 +13,15 @@ import sys
 import torch
 
 from triton._internal_testing import swizzle_scale_to_5d
-from triton.tlx.ops.kernels.mm_mxfp8._shapes import FOCUS as SHAPE_SUITES
-from triton.tlx.ops.kernels.mm_mxfp8._shapes import (LOGICAL_K, MODEL_LINEAR_PRESHUFFLE_REPEATS, MODEL_LINEAR_SHAPES,
-                                                     SYNTHETIC_SHAPES, flops, label)
+from triton.tlx.ops.kernels.mm_mxfp._shapes import FOCUS as SHAPE_SUITES
+from triton.tlx.ops.kernels.mm_mxfp._shapes import (LOGICAL_K, MODEL_LINEAR_PRESHUFFLE_REPEATS, MODEL_LINEAR_SHAPES,
+                                                    SYNTHETIC_SHAPES, flops, label)
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from _harness import Case, Prepared, driver  # noqa: E402
 
-OP = "mm_mxfp8"
+OP = "mm_mxfp"
 REF_NAME = "torch.mm on pre-dequantized BF16 inputs (diagnostic)"
 REFERENCE_GATE = False
 DEFAULT_SPACE = "heuristic"
@@ -108,7 +108,7 @@ def _inputs(m: int, n: int, k: int, sf_layout: str):
 
 
 def prepare(case: Case, space: str) -> Prepared:
-    from triton.tlx.ops import mm_mxfp8
+    from triton.tlx.ops import mm_mxfp
 
     torch.backends.cuda.preferred_blas_library("hipblaslt")
     m, n, k, sf_layout = case.shape
@@ -119,7 +119,7 @@ def prepare(case: Case, space: str) -> Prepared:
     tlx_out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
     ref_out = torch.empty_like(tlx_out)
 
-    tlx_fn = lambda: mm_mxfp8(*inputs, out=tlx_out, sf_layout=sf_layout, space=space)  # noqa: E731
+    tlx_fn = lambda: mm_mxfp(*inputs, out=tlx_out, sf_layout=sf_layout, space=space)  # noqa: E731
     ref_fn = lambda: torch.mm(a_ref, b_ref.T, out=ref_out)  # noqa: E731
 
     def check() -> tuple[bool, str]:

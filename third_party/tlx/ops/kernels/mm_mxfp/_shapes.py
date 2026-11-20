@@ -73,12 +73,12 @@ SYNTHETIC_SHAPES: tuple[tuple[int, int, int], ...] = (
 )
 
 FOCUS_SUITES = (
-    FocusSuite(name="gfx950_1", op="mm_mxfp8", shapes=PRODUCTION_SHAPES),
-    FocusSuite(name="gfx950_short_m", op="mm_mxfp8", shapes=PRODUCTION_SHORT_M_SHAPES),
-    FocusSuite(name="gfx950_model_linears", op="mm_mxfp8", shapes=MODEL_LINEAR_SHAPES),
+    FocusSuite(name="gfx950_1", op="mm_mxfp", shapes=PRODUCTION_SHAPES),
+    FocusSuite(name="gfx950_short_m", op="mm_mxfp", shapes=PRODUCTION_SHORT_M_SHAPES),
+    FocusSuite(name="gfx950_model_linears", op="mm_mxfp", shapes=MODEL_LINEAR_SHAPES),
 )
 DEFAULT_SUITES = {"gfx950": ("gfx950_1", "gfx950_short_m", "gfx950_model_linears")}
-FOCUS = FocusRegistry("mm_mxfp8", FOCUS_SUITES, DEFAULT_SUITES)
+FOCUS = FocusRegistry("mm_mxfp", FOCUS_SUITES, DEFAULT_SUITES)
 
 
 def label(m: int, n: int, k: int, sf_layout: str) -> str:

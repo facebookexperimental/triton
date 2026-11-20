@@ -1018,7 +1018,7 @@ BENCH_MODULES = (
     "bench_linear_rowscale",
     "bench_mla_window_attn",
     "bench_mm",
-    "bench_mm_mxfp8",
+    "bench_mm_mxfp",
     "bench_moe_router_topk_align",
     "bench_moe_routing",
     "bench_norm_residual_norm",
@@ -1058,10 +1058,10 @@ def test_synthetic_cases_are_well_formed_without_a_gpu(module_name):
         assert case.key.count("/") >= 3
 
 
-def test_mm_mxfp8_benchmark_covers_both_public_scale_layouts(monkeypatch):
+def test_mm_mxfp_benchmark_covers_both_public_scale_layouts(monkeypatch):
     import importlib
 
-    bench = importlib.import_module("bench_mm_mxfp8")
+    bench = importlib.import_module("bench_mm_mxfp")
     monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
     cases = bench.cases(synthetic=True)
     assert {case.shape[-1] for case in cases} == {"natural", "cublas_blocked"}
@@ -1070,8 +1070,8 @@ def test_mm_mxfp8_benchmark_covers_both_public_scale_layouts(monkeypatch):
     assert all("'sf_layout':" in case.label for case in cases)
 
 
-def test_mm_mxfp8_benchmark_reports_logical_k_for_padded_shapes():
-    from triton.tlx.ops.kernels.mm_mxfp8._shapes import flops, label
+def test_mm_mxfp_benchmark_reports_logical_k_for_padded_shapes():
+    from triton.tlx.ops.kernels.mm_mxfp._shapes import flops, label
 
     rendered = label(85, 3584, 25600, "natural")
     assert "'K': '25536'" in rendered
@@ -1079,10 +1079,10 @@ def test_mm_mxfp8_benchmark_reports_logical_k_for_padded_shapes():
     assert flops(85, 3584, 25600) == 2 * 85 * 3584 * 25536
 
 
-def test_mm_mxfp8_default_uses_preshuffled_contract_where_supported(monkeypatch):
+def test_mm_mxfp_default_uses_preshuffled_contract_where_supported(monkeypatch):
     import importlib
 
-    bench = importlib.import_module("bench_mm_mxfp8")
+    bench = importlib.import_module("bench_mm_mxfp")
     monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
     model_cases = [case for case in bench.cases() if case.shape[:3] in bench.MODEL_LINEAR_SHAPE_SET]
     assert len(model_cases) == 30
