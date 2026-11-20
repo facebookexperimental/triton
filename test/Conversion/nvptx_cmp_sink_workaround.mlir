@@ -1,4 +1,7 @@
-// RUN: triton-opt %s -split-input-file --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=88' | FileCheck %s
+// RUN: triton-opt %s -split-input-file --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=88' | FileCheck %s --check-prefix=CHECK
+// RUN: triton-opt %s -split-input-file --convert-triton-gpu-to-llvm='compute-capability=107 ptx-version=94' | FileCheck %s --check-prefixes=CHECK,SM107
+// The cluster case is checked only on sm_107, the one target with multicast
+// arrives (PTX 9.4 or later).
 
 // `tlx.async_task(nvptx_cmp_sink_workaround=True)` is a TEMPORARY workaround
 // for NVPTX letting CodeGenPrepare sink compares into the blocks of their
@@ -85,6 +88,43 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       ttng.arrive_barrier %b0, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
       ttg.warp_return
     } : (!ttg.memdesc<1xi64, #shared, #smem, mutable>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// Cluster-scope arrives in a flagged partition.
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1], [2], [4]]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0], [0], [0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 8 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 8 : i32, ttg.target = "cuda:107"} {
+  // SM107-LABEL: @nvptx_cmp_sink_workaround_cluster
+  tt.func @nvptx_cmp_sink_workaround_cluster(%bar: !ttg.memdesc<8xi64, #barrier, #smem, mutable>, %remote: !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>) {
+    ttg.warp_specialize(%bar, %remote) attributes {tlx.nvptx_cmp_sink_workaround = array<i32: 0>, warpGroupStartIds = array<i32: 4>}
+    default {
+      ttg.warp_yield
+    }
+    // SM107: partition0
+    // SM107: [[TRUE:%.*]] = llvm.mlir.constant(true) : i1
+    // SM107: [[LEADER:%.*]] = llvm.inline_asm has_side_effects {{.*}}"setp.eq.u32 $0, $1, 0;", "=b,r"
+    // SM107-NOT: llvm.icmp "eq"
+    // A per-warp arrive on a cluster-memory barrier keeps cluster scope. With
+    // no user predicate, $0 is bound to true but not referenced.
+    // SM107: "{ .reg .pred lane0; .reg .b32 lane; mov.u32 lane, %laneid; setp.eq.u32 lane0, lane, 0; @lane0 mbarrier.arrive.shared::cluster.b64 _, [$1]; }", "b,r" [[TRUE]], %{{.*}} : (i1, !llvm.ptr<7>)
+    // A per-warp multicast arrive: the mask is $2, next to the unused $0.
+    // SM107: "{ .reg .pred lane0; .reg .b32 lane; mov.u32 lane, %laneid; setp.eq.u32 lane0, lane, 0; @lane0 mbarrier.arrive.shared::cluster.multicast::cluster::32b.b64 _, [$1], $2; }", "b,r,r" [[TRUE]], %{{.*}}, %{{.*}} : (i1, !llvm.ptr<3>, i32)
+    // A multicast leader arrive uses the entry predicate as $0 and the mask as $2.
+    // SM107: "@$0 mbarrier.arrive.shared::cluster.multicast::cluster::32b.b64 _, [$1], $2;", "b,r,r" [[LEADER]], %{{.*}}, %{{.*}} : (i1, !llvm.ptr<3>, i32)
+    // SM107-NOT: llvm.icmp "eq"
+    // SM107-NOT: setp.eq.u32 $0
+    // SM107: ttg.warp_return
+    partition0(%b0: !ttg.memdesc<8xi64, #barrier, #smem, mutable>, %r0: !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>) num_warps(4) {
+      ttng.arrive_barrier %r0, 4 {per_warp} : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+      ttng.arrive_barrier %b0, 4 {multicastCTA = 2 : i32, per_warp} : !ttg.memdesc<8xi64, #barrier, #smem, mutable>
+      ttng.arrive_barrier %b0, 1 {multicastCTA = 2 : i32} : !ttg.memdesc<8xi64, #barrier, #smem, mutable>
+      ttg.warp_return
+    } : (!ttg.memdesc<8xi64, #barrier, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>) -> ()
     tt.return
   }
 }
