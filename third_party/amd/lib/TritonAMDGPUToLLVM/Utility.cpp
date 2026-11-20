@@ -792,7 +792,11 @@ getBufferLoadStoreCtrlBits(Operation *op, Attribute cachePolicy,
     if (failed(cm))
       return op->emitOpError(
           "target cache policy is not supported on AMD targets");
-    aux = getCtrlBitsForCacheModifierOnTarget(*cm, isLoad, targetInfo);
+    triton::EvictionPolicy evict = triton::EvictionPolicy::NORMAL;
+    if (auto policyAttr =
+            dyn_cast_if_present<triton::CachePolicyAttr>(cachePolicy))
+      evict = policyAttr.getEvictionPolicy();
+    aux = getCtrlBitsForCacheModifierOnTarget(*cm, evict, isLoad, targetInfo);
   }
   if (scope) {
     // gfx9 encodes the scope of a non-atomic access in SC[1:0]: none = wave,
