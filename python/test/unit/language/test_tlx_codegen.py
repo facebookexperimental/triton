@@ -11,7 +11,7 @@ from triton._C.libtriton import ir
 from triton.backends.compiler import GPUTarget
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
+from triton.tlx.ops.kernels.mm_mxfp import gfx1250 as _gfx1250_mxfp
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton._filecheck import run_parser
@@ -29,9 +29,7 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
 from triton.backends.amd import compiler as amd_compiler
 from triton.tlx.ops.kernels.flash_attn import gfx950 as _amd_fa_cluster_module
-from triton.tlx.ops.kernels.mm_mxfp8 import gfx950 as _amd_mm_mxfp8
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_tdm_pipelined import (
-    mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
+from triton.tlx.ops.kernels.mm_mxfp import gfx950 as _amd_mm_mxfp
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
 from triton.tlx.ops.kernels.flash_attn.gfx950 import (
@@ -799,9 +797,9 @@ def _mxfp8_gfx950_copy_layout_kernel(A, C, COPY: tl.constexpr, ROWS: tl.constexp
 
 
 @pytest.mark.parametrize("copy", [
-    _amd_mm_mxfp8._n256x192_fly_layout_copy,
-    _amd_mm_mxfp8._ns4_fly_layout_copy,
-    _amd_mm_mxfp8._n256x256_fly_layout_copy,
+    _amd_mm_mxfp._n256x192_fly_layout_copy,
+    _amd_mm_mxfp._ns4_fly_layout_copy,
+    _amd_mm_mxfp._n256x256_fly_layout_copy,
 ])
 @pytest.mark.parametrize("rows", [32, 64, 128, 256])
 def test_mxfp8_gfx950_copy_layout_verifies(copy, rows, tmp_path):
@@ -5773,7 +5771,7 @@ def test_require_amd_wmma_layout_compiles_gfx1250():
 def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
     """The mxfp GEMM tutorial kernel should lower to TDM + dot_scaled + WMMA."""
     compiled = compile_for_gfx1250(
-        _amd_mxfp_gemm_kernel,
+        _gfx1250_mxfp.mxgemm_tdm_pipelined_kernel,
         signature={
             "a_ptr": "*fp8e5",
             "b_ptr": "*fp8e5",
@@ -5790,6 +5788,7 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
             "stride_cm": "i64",
             "stride_cn": "i64",
             "stride_scale": "i64",
+            "stride_b_scale": "i64",
         },
         constexprs={
             "DTYPE_A": "e5m2",
@@ -7405,6 +7404,7 @@ def test_gfx1250_mxgemm_tdm_pipelined_compiles(TDM_FUSION):
             "stride_cm": "i64",
             "stride_cn": "i64",
             "stride_scale": "i64",
+            "stride_b_scale": "i64",
         },
         constexprs={
             "DTYPE_A": "e5m2",
@@ -7819,6 +7819,7 @@ def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M, BLOCK_K)
             "stride_cm": "i64",
             "stride_cn": "i64",
             "stride_scale": "i64",
+            "stride_b_scale": "i64",
         },
         constexprs={
             "DTYPE_A": "e4m3",

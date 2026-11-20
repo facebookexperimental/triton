@@ -810,7 +810,7 @@ def TTNG_CLCQueryCancelOp : TTNG_Op<"clc_query_cancel", []> {
   }];
 
   let arguments =
-      (ins Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$clcResAlloc);
+      (ins Arg<TTG_MemDescType, "", GenericSharedRead>:$clcResAlloc);
 
   let results = (outs I32:$ctaIdX, I32:$ctaIdY, I32:$ctaIdZ);
 

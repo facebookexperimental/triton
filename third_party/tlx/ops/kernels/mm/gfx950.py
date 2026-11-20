@@ -2992,9 +2992,11 @@ def _wg_wave_grid_global_load_pgr2_b_half(
                               or (block_n == 160 and m <= block_m) or (block_n == 224 and m <= block_m)
                               or (m == 128 and block_m == 128 and ((block_n == 96 and stride_bn == 4416) or
                                                                    (block_n == 128 and stride_bn == 20926))))
-    load_contiguity: tl.constexpr = (8 if (m == 128 and block_m == 128 and block_n == 128 and block_k == 64
-                                           and a_row_count == 4 and b_group_n == 32 and stride_bk == 1
-                                           and stride_bn == 20926) else half_n // 8)
+    wide_pgr2_b: tl.constexpr = (block_k == 64 and b_group_n == 32 and stride_bk == 1
+                                 and ((block_m == 224 and block_n == 224) or
+                                      (block_m == 256 and block_n == 256 and stride_bn == 1894) or stride_bn == 607
+                                      or stride_bn == 1892 or stride_bn == 6640 or stride_bn == 20926))
+    load_contiguity: tl.constexpr = 8 if wide_pgr2_b else half_n // 8
     if cache_policy != "auto":
         return tlx.buffer_load(b_ptr, offsets, cache=cache_policy, contiguity=load_contiguity)
     if stream_b:
@@ -3267,14 +3269,15 @@ def _wg_wave_grid_global_load_pgr2_b_tail_half(
     stream_b: tl.constexpr = (block_n == 192 or (block_m == 64 and block_n == 64 and m <= 2 * block_m)
                               or (block_m == 64 and block_n == 96 and m <= 2 * block_m)
                               or (block_n == 160 and m <= block_m) or (block_n == 224 and m <= block_m))
+    load_contiguity: tl.constexpr = (8 if stride_bk == 1 and stride_bn == 7104 else half_n // 8)
     if stream_b:
         return tlx.buffer_load(
             b_ptr,
             safe_offsets,
             cache=".cg",
-            contiguity=4,
+            contiguity=load_contiguity,
         )
-    return tlx.buffer_load(b_ptr, safe_offsets, contiguity=half_n // 8)
+    return tlx.buffer_load(b_ptr, safe_offsets, contiguity=load_contiguity)
 
 
 @triton.jit
@@ -26073,10 +26076,7 @@ _COLUMN_MAJOR_B_TRANSPOSED_REGISTER_SHAPES = set()
 
 _FP16_TRANSPOSED_REGISTER_PLANS = {
     (256, 282, 282):
-    MappingProxyType({
-        **_fixed_register_plan(32, 16, 128, 1, 1, 4, 3, waves_per_eu=2),
-        "llvm_fn_attrs": (("amdgpu-sched-strategy", "iterative-maxocc"), ),
-    }),
+    _fixed_register_plan(32, 32, 128, 8, 1, 4, 3),
     (256, 2_048, 359):
     _fixed_register_plan(64, 32, 64, 8, 1, 4, 2),
     (256, 1_024, 2_048):
@@ -27104,7 +27104,19 @@ def _cached_optimized_geometry_config(m, n, k, dtype, element_size, a_strides, b
     if dtype == torch.float16 and shape == (3_072, 3, 1_024):
         return "register", dict(_register_plan_for_shape(m, n, k, dtype), CACHE_A_CG=True)
     if dtype == torch.float16 and shape == (256, 2_048, 359):
-        return "register", _fixed_register_plan(64, 32, 64, 8, 1, 4, 2)
+        return "transposed_wave_grid", _wg_regular_wave_grid_plan(
+            1,
+            2,
+            2,
+            2,
+            64,
+            local_stages=1,
+            pgr2_operands=True,
+            row_wise_epilogue=True,
+            exact_lds=True,
+            dot_mode="persistent",
+            waves_per_eu=1,
+        )
     if dtype == torch.float16 and shape == (1_024, 1_024, 864):
         return "register", _fixed_register_plan(64, 64, 128, 4, 1, 4, 3)
     if dtype == torch.float16 and shape == (3_072, 2_048, 6_144):
@@ -27157,8 +27169,24 @@ def _cached_optimized_geometry_config(m, n, k, dtype, element_size, a_strides, b
     if dtype == torch.float16 and shape == (1_024, 6_144, 4_096) and b_strides[0] == 1:
         return _adjusted_dispatch_plan(m, n, k, dtype, element_size, local_stages=2)
     if dtype == torch.float16 and shape == (3_072, 5_888, 44_536):
-        return _adjusted_dispatch_plan(m, n, k, dtype, element_size, mi_wave_tile_m=6, mi_wave_tile_n=8, num_xcds=2,
-                                       split_k=4)
+        return _adjusted_dispatch_plan(
+            m,
+            n,
+            k,
+            dtype,
+            element_size,
+            mi_wave_tile_m=7,
+            mi_wave_tile_n=7,
+            local_stages=2,
+            exact_lds=False,
+            read_cover_sixteenths=15,
+            num_xcds=2,
+            reverse_local_assignment=True,
+            dot_mode="logical",
+            split_k=2,
+            reduce_tile=(32, 32),
+            reduce_warps=4,
+        )
     if dtype == torch.float16 and shape == (3_072, 128, 44_536):
         return _adjusted_dispatch_plan(m, n, k, dtype, element_size, split_k=8, pair_balanced_split_k=True, num_xcds=2,
                                        workgroup_mapping=2, reverse_local_assignment=True,

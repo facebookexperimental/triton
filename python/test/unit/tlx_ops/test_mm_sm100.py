@@ -66,6 +66,71 @@ def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     run_mm_case(ARCH, M, N, K, a_strides, b_strides, dtype_name)
 
 
+# Decode-sized `x @ W.T` (W [N, K] contiguous) that takes the skinny path: the
+# decode projections of a 4-way tensor-parallel MoE model plus shapes that pick each cluster size.
+# 8192x2048 runs unsplit (cluster 1), which the skinny path only takes up to 32 rows. 1024x8192 is
+# capped below cluster 8 by how many clusters run at once.
+SKINNY_SHAPES = ([(M, N, K, "bf16")
+                  for M in (1, 8, 33, 64)
+                  for N, K in ((4608, 8192), (2048, 4096))] + [(M, 8192, 2048, "bf16") for M in (1, 8, 32)] + [
+                      (16, 1024, 512, "fp16"),
+                      (5, 256, 8192, "bf16"),
+                      (64, 64, 1024, "fp16"),
+                      (1, 1024, 8192, "bf16"),
+                  ])
+
+
+@pytest.mark.parametrize("M, N, K, dtype_name", SKINNY_SHAPES)
+def test_mm_skinny(M, N, K, dtype_name, monkeypatch):
+    launches = []
+    launch = sm100._skinny._launch
+    monkeypatch.setattr(sm100._skinny, "_launch", lambda *args: (launches.append(args), launch(*args)))
+    run_mm_case(ARCH, M, N, K, (K, 1), (1, K), dtype_name, allow_decline=False)
+    assert launches, "tlx.ops.mm did not take the skinny path"
+
+
+@pytest.mark.parametrize("M, N, K", [(1, 4608, 8192), (32, 2048, 4096)])
+def test_mm_skinny_full_space(M, N, K):
+    a = operand(M, K, (K, 1), torch.bfloat16)
+    b = operand(K, N, (1, K), torch.bfloat16)
+    out = sm100.mm(a, b, space="full")
+    ref = a.float() @ b.float()
+    precision = REL_PRECISION[torch.bfloat16]
+    torch.testing.assert_close(out.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
+def test_mm_skinny_declines_row_major_b():
+    a = operand(8, 4096, (4096, 1), torch.bfloat16)
+    b = operand(4096, 4608, (4608, 1), torch.bfloat16)
+    assert not sm100._skinny.eligible(a, b)
+
+
+@pytest.mark.parametrize("M, N, K, expected", [
+    (32, 8192, 2048, True),
+    (33, 8192, 2048, False),
+    (64, 8192, 4096, False),
+    (64, 4608, 8192, True),
+    (64, 2048, 4096, True),
+])
+def test_mm_skinny_defers_unsplit_problems_above_32_rows(M, N, K, expected):
+    """Past 32 rows the WS GEMM keeps problems the skinny path would run without a K split."""
+    a = operand(M, K, (K, 1), torch.bfloat16)
+    b = operand(K, N, (1, K), torch.bfloat16)
+    assert sm100._skinny.eligible(a, b) == expected
+
+
+@pytest.mark.parametrize("N, K", [(256, 8192), (1024, 4096), (1024, 8192), (2048, 4096), (4608, 8192)])
+def test_mm_skinny_heuristic_clusters_run_at_once(N, K):
+    """The heuristic's clusters all run at once, and the next size up would not (or would leave < 4 K steps)."""
+    skinny = sm100._skinny
+    n_blocks = N // skinny.BLOCK_N
+    cluster = skinny.heuristic_config(1, N, K)["CLUSTER"]
+    assert n_blocks <= skinny._max_active_clusters(cluster)
+    bigger = 2 * cluster
+    assert (bigger > 8 or n_blocks > skinny._max_active_clusters(bigger)
+            or K // (skinny.BLOCK_K * bigger) < skinny._MIN_K_STEPS)
+
+
 GEOMETRIES = [
     # No overhang: M is a whole number of tiles and the count already divides
     # NUM_CTAS. These must stay at zero -- they are the canary for the fix

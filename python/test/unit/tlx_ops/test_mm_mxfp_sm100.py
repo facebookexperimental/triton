@@ -1,4 +1,4 @@
-"""Authoritative coverage for ``tlx.ops.mm_mxfp8``.
+"""Authoritative coverage for ``tlx.ops.mm_mxfp``.
 
 The explicit-config cases were migrated from the frozen
 ``tutorials/blackwell_gemm_ws_mxfp8.py`` tests in ``test_correctness.py``.
@@ -49,9 +49,9 @@ B_RESIDENT_FUSED = {
 
 
 def _call(inputs, **kwargs):
-    from triton.tlx.ops import mm_mxfp8
+    from triton.tlx.ops import mm_mxfp
 
-    return mm_mxfp8(*inputs, **kwargs)
+    return mm_mxfp(*inputs, **kwargs)
 
 
 def _replace(inputs, index, value):
@@ -115,19 +115,19 @@ def _assert_invalid_before_resolution(monkeypatch, inputs, match, **kwargs):
         _call(inputs, **kwargs)
 
 
-def test_mm_mxfp8_catalog_entry():
+def test_mm_mxfp_catalog_entry():
     from triton.tlx.ops._catalog import CATALOG, InvalidInput, check_inputs, has_impl
 
-    specs = [spec for spec in CATALOG if spec.op == "mm_mxfp8" and spec.arch == "sm100"]
+    specs = [spec for spec in CATALOG if spec.op == "mm_mxfp" and spec.arch == "sm100"]
     assert len(specs) == 1
     spec = specs[0]
     assert spec.arch == "sm100"
-    assert spec.impl == "triton.tlx.ops.kernels.mm_mxfp8.sm100:mm_mxfp8"
+    assert spec.impl == "triton.tlx.ops.kernels.mm_mxfp.sm100:mm_mxfp"
     assert spec.dtypes == frozenset({"float8_e4m3fn"})
     assert spec.requires == frozenset({"tma", "tmem"})
     assert not spec.supports_backward
-    assert has_impl("mm_mxfp8", "sm100")
-    assert not has_impl("mm_mxfp8", "sm90")
+    assert has_impl("mm_mxfp", "sm100")
+    assert not has_impl("mm_mxfp", "sm90")
 
     check_inputs(spec, dtype=torch.float8_e4m3fn, base_ptrs=(0, 16, 32, 48))
     with pytest.raises(InvalidInput, match="does not support bfloat16"):
@@ -136,31 +136,31 @@ def test_mm_mxfp8_catalog_entry():
         check_inputs(spec, dtype=torch.float8_e4m3fn, base_ptrs=(0, 17, 32, 48))
 
 
-def test_mm_mxfp8_public_signature_export_and_lazy_import():
+def test_mm_mxfp_public_signature_export_and_lazy_import():
     script = """
 import inspect
 import sys
 from triton.tlx import ops
-assert 'triton.tlx.ops.kernels.mm_mxfp8.sm100' not in sys.modules
-assert str(inspect.signature(ops.mm_mxfp8)) == "(a, a_scale, b, b_scale, *, out=None, sf_layout='natural', space=None)"
-assert 'mm_mxfp8' in ops.__all__
+assert 'triton.tlx.ops.kernels.mm_mxfp.sm100' not in sys.modules
+assert str(inspect.signature(ops.mm_mxfp)) == "(a, a_scale, b, b_scale, *, a_dtype='e4m3', b_dtype='e4m3', out=None, sf_layout='natural', space=None)"
+assert 'mm_mxfp' in ops.__all__
 """
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
-def test_mm_mxfp8_catalog_resolves_implementation():
+def test_mm_mxfp_catalog_resolves_implementation():
     from triton.tlx.ops._catalog import impl_for
-    from triton.tlx.ops.kernels.mm_mxfp8.sm100 import mm_mxfp8
+    from triton.tlx.ops.kernels.mm_mxfp.sm100 import mm_mxfp
 
-    implementation, _ = impl_for("mm_mxfp8", arch="sm100")
-    assert implementation is mm_mxfp8
+    implementation, _ = impl_for("mm_mxfp", arch="sm100")
+    assert implementation is mm_mxfp
     assert str(
         inspect.signature(implementation)) == "(a, a_scale, b, b_scale, *, out=None, sf_layout='natural', space='full')"
 
 
-def test_mm_mxfp8_import_builds_no_autotune_space():
+def test_mm_mxfp_import_builds_no_autotune_space():
     from triton.runtime.autotuner import Autotuner
-    from triton.tlx.ops.kernels.mm_mxfp8 import sm100
+    from triton.tlx.ops.kernels.mm_mxfp import sm100
 
     assert not isinstance(sm100._gemm_mxfp8_ws_kernel, Autotuner)
 
@@ -169,15 +169,15 @@ def test_mm_mxfp8_import_builds_no_autotune_space():
     "shape",
     [(128, 128, 128), (256, 256, 256), (128, 128, 4096), (8192, 128, 1024), (128, 8192, 16384), (4096, 4096, 4096)],
 )
-def test_mm_mxfp8_heuristic_config_is_legal(shape):
-    from triton.tlx.ops.kernels.mm_mxfp8 import sm100
+def test_mm_mxfp_heuristic_config_is_legal(shape):
+    from triton.tlx.ops.kernels.mm_mxfp import sm100
 
     for num_sms in (148, 152):
         assert sm100._config_error(sm100.heuristic_config(*shape, num_sms), *shape) is None
 
 
-def test_mm_mxfp8_b_resident_family_only_when_b_fits():
-    from triton.tlx.ops.kernels.mm_mxfp8 import sm100
+def test_mm_mxfp_b_resident_family_only_when_b_fits():
+    from triton.tlx.ops.kernels.mm_mxfp import sm100
 
     assert len(sm100._b_resident_configs(3159936, 384, 384)) == 4
     assert sm100._b_resident_configs(4096, 4096, 4096) == []
@@ -186,8 +186,8 @@ def test_mm_mxfp8_b_resident_family_only_when_b_fits():
 
 
 @pytest.mark.parametrize("shape", [(128, 128, 128), (2048, 128, 1024), (128, 8192, 4096), (4096, 4096, 4096)])
-def test_mm_mxfp8_full_space_prunes_to_legal_configs(shape):
-    from triton.tlx.ops.kernels.mm_mxfp8 import sm100
+def test_mm_mxfp_full_space_prunes_to_legal_configs(shape):
+    from triton.tlx.ops.kernels.mm_mxfp import sm100
 
     M, N, K = shape
     pruned = sm100.preprocess_configs(sm100.get_cuda_autotune_config(), {"M": M, "N": N, "K": K}, NUM_SMS=148)
@@ -216,14 +216,14 @@ def test_mm_mxfp8_full_space_prunes_to_legal_configs(shape):
         ({**OVERLAP, "PEELED_FIRST_K": True}, "does not peel"),
     ],
 )
-def test_mm_mxfp8_config_rejects_unsupported_variants(override, message):
-    from triton.tlx.ops.kernels.mm_mxfp8 import sm100
+def test_mm_mxfp_config_rejects_unsupported_variants(override, message):
+    from triton.tlx.ops.kernels.mm_mxfp import sm100
 
     assert message in sm100._config_error({**sm100.DEFAULT_CONFIG, **override}, 128, 128, 128)
 
 
-def test_mm_mxfp8_natural_scale_packing_matches_cublas_swizzle():
-    from triton.tlx.ops.kernels.mm_mxfp8 import sm100
+def test_mm_mxfp_natural_scale_packing_matches_cublas_swizzle():
+    from triton.tlx.ops.kernels.mm_mxfp import sm100
 
     scale = _e8m0((256, 16), device="cpu", low=0, high=255)
     packed = sm100._scale_5d(scale, 256, 512, "natural")
@@ -232,7 +232,7 @@ def test_mm_mxfp8_natural_scale_packing_matches_cublas_swizzle():
     assert torch.equal(packed.view(torch.uint8), blocked.view(torch.uint8))
 
 
-def test_mm_mxfp8_rejects_types_ranks_and_shapes_before_resolution(monkeypatch):
+def test_mm_mxfp_rejects_types_ranks_and_shapes_before_resolution(monkeypatch):
     inputs = _dummy_inputs()
     _assert_invalid_before_resolution(monkeypatch, _replace(inputs, 0, object()), "tensor inputs")
     _assert_invalid_before_resolution(monkeypatch, _replace(inputs, 0, inputs[0].unsqueeze(0)), "rank-2")
@@ -241,7 +241,7 @@ def test_mm_mxfp8_rejects_types_ranks_and_shapes_before_resolution(monkeypatch):
     _assert_invalid_before_resolution(monkeypatch, _dummy_inputs(n=192), "divisible by 128")
 
 
-def test_mm_mxfp8_rejects_dtypes_layouts_and_devices_before_resolution(monkeypatch):
+def test_mm_mxfp_rejects_dtypes_layouts_and_devices_before_resolution(monkeypatch):
     inputs = _dummy_inputs()
     _assert_invalid_before_resolution(monkeypatch, _replace(inputs, 0, inputs[0].to(torch.bfloat16)), "E4M3")
     _assert_invalid_before_resolution(monkeypatch, _replace(inputs, 1, inputs[1].view(torch.uint8)), "E8M0")
@@ -251,7 +251,7 @@ def test_mm_mxfp8_rejects_dtypes_layouts_and_devices_before_resolution(monkeypat
 
 
 @requires_cuda
-def test_mm_mxfp8_rejects_scales_out_and_space_before_resolution(monkeypatch):
+def test_mm_mxfp_rejects_scales_out_and_space_before_resolution(monkeypatch):
     inputs = _dummy_inputs(device="cuda", m=256, k=256)
     _assert_invalid_before_resolution(monkeypatch, inputs, "sf_layout", sf_layout="blocked")
     _assert_invalid_before_resolution(monkeypatch, _replace(inputs, 1, inputs[1][:128]), "exact shapes")
@@ -267,11 +267,11 @@ def test_mm_mxfp8_rejects_scales_out_and_space_before_resolution(monkeypatch):
 
 
 @requires_cuda
-def test_mm_mxfp8_rejects_unaligned_base_before_launch(monkeypatch):
+def test_mm_mxfp_rejects_unaligned_base_before_launch(monkeypatch):
     from triton.tlx import ops
     from triton.tlx.ops._catalog import CATALOG
 
-    spec = next(spec for spec in CATALOG if (spec.op, spec.arch) == ("mm_mxfp8", "sm100"))
+    spec = next(spec for spec in CATALOG if (spec.op, spec.arch) == ("mm_mxfp", "sm100"))
     monkeypatch.setattr(ops, "impl_for", lambda *args, **kwargs: (pytest.fail, spec))
     inputs = _dummy_inputs(device="cuda")
     storage = torch.zeros(inputs[0].numel() + 1, device="cuda", dtype=torch.float8_e4m3fn)
@@ -282,14 +282,14 @@ def test_mm_mxfp8_rejects_unaligned_base_before_launch(monkeypatch):
 @requires_sm100
 @pytest.mark.parametrize("shape", [(128, 128, 128), (256, 256, 256), (384, 256, 512)], ids=str)
 @pytest.mark.parametrize("sf_layout", ["natural", "cublas_blocked"])
-def test_mm_mxfp8_heuristic(shape, sf_layout):
+def test_mm_mxfp_heuristic(shape, sf_layout):
     inputs, reference = _make_inputs(*shape, sf_layout=sf_layout)
     _assert_correct(_call(inputs, sf_layout=sf_layout, space="heuristic"), reference)
 
 
 @requires_sm100
-def test_mm_mxfp8_heuristic_split_k():
-    from triton.tlx.ops.kernels.mm_mxfp8 import sm100
+def test_mm_mxfp_heuristic_split_k():
+    from triton.tlx.ops.kernels.mm_mxfp import sm100
 
     assert sm100.heuristic_config(128, 128, 4096, 148)["SPLIT_K"] == 8
     inputs, reference = _make_inputs(128, 128, 4096)
@@ -297,7 +297,7 @@ def test_mm_mxfp8_heuristic_split_k():
 
 
 @requires_sm100
-def test_mm_mxfp8_natural_and_blocked_are_bitwise_equal():
+def test_mm_mxfp_natural_and_blocked_are_bitwise_equal():
     natural_inputs, _ = _make_inputs(256, 384, 512)
     blocked_inputs, _ = _make_inputs(256, 384, 512, sf_layout="cublas_blocked")
     assert torch.equal(_call(natural_inputs, space="heuristic"),
@@ -305,13 +305,13 @@ def test_mm_mxfp8_natural_and_blocked_are_bitwise_equal():
 
 
 @requires_sm100
-def test_mm_mxfp8_default_full_space():
+def test_mm_mxfp_default_full_space():
     inputs, reference = _make_inputs(128, 128, 128)
     _assert_correct(_call(inputs), reference)
 
 
 @requires_sm100
-def test_mm_mxfp8_out_identity_and_backward_policy():
+def test_mm_mxfp_out_identity_and_backward_policy():
     from triton.tlx.ops import UnsupportedBackward
 
     inputs, reference = _make_inputs(256, 256, 256)
@@ -395,8 +395,8 @@ def test_mm_mxfp8_out_identity_and_backward_policy():
         "n_inner_async_store",
     ],
 )
-def test_mm_mxfp8_explicit_config(shape, config):
-    from triton.tlx.ops.kernels.mm_mxfp8 import sm100
+def test_mm_mxfp_explicit_config(shape, config):
+    from triton.tlx.ops.kernels.mm_mxfp import sm100
 
     inputs, reference = _make_inputs(*shape)
     _assert_correct(sm100._run_config(*inputs, config), reference)

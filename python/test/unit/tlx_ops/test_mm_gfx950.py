@@ -561,8 +561,14 @@ def test_mm_full_dense_tn_candidates_accuracy(m, n, k):
 @pytest.mark.parametrize(
     "m,n,k",
     [
+        (256, 282, 282),
         (3072, 2048, 797),
+        (256, 2048, 359),
         (3072, 2048, 3965),
+        (4096, 242432, 1894),
+        (3072, 38848, 607),
+        (3072, 242176, 1892),
+        (128, 224, 20926),
         (3072, 128, 44536),
         (3072, 1024, 2048),
         (3072, 4096, 2048),
@@ -701,7 +707,7 @@ def test_mm_n192_uses_bk128_register_plan(dtype):
     _assert_range_result(actual, a @ b)
 
 
-def test_mm_fp16_m256_n2048_uses_untransposed_register_tile():
+def test_mm_fp16_m256_n2048_uses_transposed_compact_pgr2_tile():
     torch.manual_seed(107)
     a = torch.randn((256, 359), device="cuda", dtype=torch.float16)
     b = torch.randn((2048, 359), device="cuda", dtype=torch.float16).T
@@ -714,10 +720,16 @@ def test_mm_fp16_m256_n2048_uses_untransposed_register_tile():
         a.stride(),
         b.stride(),
     )
-    assert path == "register"
-    assert plan["BLOCK_M"] == 64
-    assert plan["BLOCK_N"] == 32
-    assert plan["BLOCK_K"] == 64
+    assert path == "transposed_wave_grid"
+    assert (plan["mi_wave_tile_m"], plan["mi_wave_tile_n"]) == (1, 2)
+    assert (plan["warps_m"], plan["warps_n"]) == (2, 2)
+    assert plan["block_k"] == 64
+    assert plan["local_stages"] == 1
+    assert plan["pgr2_operands"]
+    assert plan["row_wise_epilogue"]
+    assert plan["exact_lds"]
+    assert plan["dot_mode"] == "persistent"
+    assert plan["waves_per_eu"] == 1
     actual = tlx_ops.mm(a, b)
     _assert_range_result(actual, a @ b)
 
@@ -1063,7 +1075,13 @@ def test_mm_fp16_addmm_derived_split_k_shape():
         b.stride(),
     )
     assert path == "transposed_wave_grid"
-    assert plan["split_k"] == 4
+    assert plan["mi_wave_tile_m"] == 7
+    assert plan["mi_wave_tile_n"] == 7
+    assert plan["local_stages"] == 2
+    assert plan["read_cover_sixteenths"] == 15
+    assert plan["reverse_local_assignment"]
+    assert plan["split_k"] == 2
+    assert plan["reduce_tile"] == (32, 32)
     actual = tlx_ops.mm(a, b)
     _assert_range_result(actual, a @ b)
 

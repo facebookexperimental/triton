@@ -987,6 +987,7 @@ struct BufferLoadToLocalOpConversion
 
     RankedTensorType ptrType =
         cast<RankedTensorType>(getPointerTypeWithShape(ptr, offset));
+    unsigned numElems = getTotalElemsPerThread(ptrType);
 
     // We can load N elements at a time if:
     //  1. Every group of N source pointers are contiguous.  For example, if
@@ -1020,6 +1021,32 @@ struct BufferLoadToLocalOpConversion
     if (failed(checkCanLoadDirectToLDS(op, ptrType, dstEnc,
                                        dstTy.getAllocShape(), vec, vecInfo)))
       return failure();
+
+    unsigned elemBitWidth = dstTy.getElementTypeBitWidth();
+    unsigned targetMaxVec = std::max(1u, 128u / elemBitWidth);
+    auto order = triton::gpu::getOrder(ptrType);
+    auto contigPerThread = triton::gpu::getContigPerThread(ptrType);
+    assert(!order.empty() && order.front() < contigPerThread.size());
+    unsigned layoutMaxVec = contigPerThread[order.front()];
+    unsigned usefulMaxVec = std::min({numElems, targetMaxVec, layoutMaxVec});
+    usefulMaxVec = triton::AMD::fitToValidDirectToLdsVecSize(
+        usefulMaxVec, elemBitWidth, targetInfo);
+    if (usefulMaxVec > 0 && vec < usefulMaxVec) {
+      StringRef limiter = "destination LDS layout";
+      if (vecInfo.fromPtr < usefulMaxVec && op.getContiguity() < usefulMaxVec)
+        limiter = "pointer or offset contiguity/alignment proof";
+      else if (mask &&
+               vecInfo.fromMask < std::min(vecInfo.fromPtr, usefulMaxVec))
+        limiter = "mask uniformity";
+      op.emitRemark()
+          << "direct-to-LDS load selected " << vec * elemBitWidth
+          << "-bit transactions; widest useful target-supported width is "
+          << usefulMaxVec * elemBitWidth << " bits; likely limiter: " << limiter
+          << " (pointer/offset=" << vecInfo.fromPtr
+          << " element(s), mask=" << vecInfo.fromMask
+          << ", explicit contiguity=" << op.getContiguity()
+          << ", contiguous elements/thread=" << layoutMaxVec << ")";
+    }
 
     // For swizzled layouts we need to use the non swizzled layout to compute
     // the LDS addresses since we gather into LDS

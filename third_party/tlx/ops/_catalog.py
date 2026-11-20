@@ -241,10 +241,10 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
-        op="mm_mxfp8",
+        op="mm_mxfp",
         arch="sm100",
         variant="ws_mxfp8",
-        impl="triton.tlx.ops.kernels.mm_mxfp8.sm100:mm_mxfp8",
+        impl="triton.tlx.ops.kernels.mm_mxfp.sm100:mm_mxfp",
         invariant_vocab=_GEMM_DIMS,
         dtypes=frozenset({"float8_e4m3fn"}),
         # Row strides are 128-aligned by the M/N/K contract; only the bases vary.
@@ -253,10 +253,10 @@ CATALOG: tuple[OpSpec, ...] = (
         default_space="full",
     ),
     OpSpec(
-        op="mm_mxfp8",
+        op="mm_mxfp",
         arch="gfx950",
         variant="scaled_mfma",
-        impl="triton.tlx.ops.kernels.mm_mxfp8.gfx950:mm_mxfp8",
+        impl="triton.tlx.ops.kernels.mm_mxfp.gfx950:mm_mxfp",
         invariant_vocab=_GEMM_DIMS,
         dtypes=frozenset({"float8_e4m3fn"}),
         # A generic load path handles unaligned base pointers. The fast LDS
@@ -264,10 +264,10 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
-        op="mm_mxfp8",
+        op="mm_mxfp",
         arch="gfx1250",
         variant="persistent_tdm",
-        impl="triton.tlx.ops.kernels.mm_mxfp8.gfx1250:mm_mxfp8",
+        impl="triton.tlx.ops.kernels.mm_mxfp.gfx1250:mm_mxfp",
         invariant_vocab=_GEMM_DIMS,
         dtypes=frozenset({"float8_e4m3fn"}),
         # TDM descriptors need 16-byte-aligned bases; row strides follow from

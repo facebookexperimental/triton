@@ -83,10 +83,10 @@ def case_addmm(space):
     return lambda: ops.addmm(bias, a, b, space=space), lambda: bias.float() + a.float() @ b.float()
 
 
-def case_mm_mxfp8(space):
+def case_mm_mxfp(space):
     m = n = k = 4096
     a, b, a_scale, b_scale = _e4m3(m, k), _e4m3(n, k), _e8m0(m, k // 32), _e8m0(n, k // 32)
-    return (lambda: ops.mm_mxfp8(a, a_scale, b, b_scale, space=space),
+    return (lambda: ops.mm_mxfp(a, a_scale, b, b_scale, space=space),
             lambda: _dequant_mxfp8(a, a_scale) @ _dequant_mxfp8(b, b_scale).T)
 
 
@@ -235,7 +235,7 @@ def case_paged_attention_prefill(space):
 CASES = {
     "mm": case_mm,
     "addmm": case_addmm,
-    "mm_mxfp8": case_mm_mxfp8,
+    "mm_mxfp": case_mm_mxfp,
     "grouped_gemm": case_grouped_gemm,
     "grouped_gemm_mxfp8": case_grouped_gemm_mxfp8,
     "moe": case_moe,
