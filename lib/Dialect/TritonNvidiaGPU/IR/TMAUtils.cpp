@@ -64,9 +64,12 @@ getTMAGatherScatterLayouts(RankedTensorType xOffsetsType,
   unsigned messageSize = blockShape.back();
   assert(shapePerCTA.back() % messageSize == 0);
   unsigned numMessages = shapePerCTA.back() / messageSize;
-  assert(llvm::isPowerOf2_32(numMessages));
-  auto messageToColumn =
-      LinearLayout::strided1D(numMessages, messageSize, message, column);
+  // An NPOT row is whole boxes of the pow2 alloc shape: plan the pow2 alloc
+  // shape's messages and issue the first numMessages. PowerOf2Ceil is a no-op
+  // for pow2 inputs, so pow2 behavior is unchanged.
+  unsigned numMessagesPlanned = llvm::PowerOf2Ceil(numMessages);
+  auto messageToColumn = LinearLayout::strided1D(numMessagesPlanned,
+                                                 messageSize, message, column);
   auto messageToOffset =
       getMessageToPackedOffsetLayout(type, ttg::TMAMode::Tiled);
   auto messageLayout = xOffsets * messageToColumn;
@@ -74,7 +77,8 @@ getTMAGatherScatterLayouts(RankedTensorType xOffsetsType,
   for (auto [bit, basis] : llvm::enumerate(bases[block]))
     basis.back() = messageToOffset.getBasis(block, bit, column);
   auto outDims = messageLayout.getOutDims();
-  outDims[messageLayout.getOutDimIndex(column)].second = type.getShape().back();
+  outDims[messageLayout.getOutDimIndex(column)].second =
+      llvm::PowerOf2Ceil(type.getShape().back());
   messageLayout = LinearLayout(std::move(bases), outDims,
                                /*requireSurjective=*/false);
 
