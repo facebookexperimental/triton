@@ -69,6 +69,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // After loop: release FULL, acquire FULL, buffer, load; no trailing EMPTY release (no further access)
     // CHECK: nvws.semaphore.release [[V8]], [[V13]] [#nvws.async_op<tc5mma>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>} : <[!ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory, mutable>]>, !ttg.async.token
     // CHECK: } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2>, ttg.partition.outputs = [], ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32], ttg.warp_specialize.tag = 9 : i32}
+    // The scales' last asynchronous release has no next loop iteration.
+    // CHECK: nvws.semaphore.acquire [[V8]] {ttg.partition = array<i32: 2>, ttg.warp_specialize.tag = 9 : i32}
     // CHECK: nvws.semaphore.release [[ACC_FULL]], [[ACC_INIT]] [#nvws.async_op<tc5mma>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 9 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token
     // CHECK: [[FINAL:%.*]] = nvws.semaphore.acquire [[ACC_FULL]] : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
     // CHECK: [[FINAL_BUF:%.*]] = nvws.semaphore.buffer [[ACC_FULL]], [[FINAL]] : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable, 1x128x128>
@@ -368,8 +370,51 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       %pv = ttng.tc_gen5_mma %lhs, %v, %acc[%qk], %true, %true {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       "use_token"(%pv) {ttg.partition = array<i32: 1>} : (!ttg.async.token) -> ()
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 3>, ttg.partition.outputs = [], ttg.warp_specialize.tag = 0 : i32}
+    // K and V share EMPTY, but their final releases target different slots.
+    // The exit acquires must not both wait on the final cursor (V's slot).
+    // CHECK: } {{.*}}ttg.warp_specialize.tag = 0
+    // CHECK-DAG: [[K_EXIT_OFFSET:%[-A-Za-z0-9_.$#]+]] = arith.constant {{.*}} -1 : i32
+    // CHECK-DAG: [[V_EXIT_OFFSET:%[-A-Za-z0-9_.$#]+]] = arith.constant {{.*}} 0 : i32
+    // CHECK-DAG: nvws.semaphore.acquire [[EMPTY]]{{\[}}[[K_EXIT_OFFSET]]{{\]}} {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32}
+    // CHECK-DAG: nvws.semaphore.acquire [[EMPTY]]{{\[}}[[V_EXIT_OFFSET]]{{\]}} {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32}
+    // CHECK-NOT: nvws.semaphore.acquire [[EMPTY]]
     // CHECK: tt.return
     // CHECK-NOT: {{ttg\.local_alloc|nvws\.semaphore\.create}}
+    tt.return
+  }
+
+  // CHECK-LABEL: @circular_exit_rebases_early_release
+  tt.func @circular_exit_rebases_early_release(
+      %desc_k: !tt.tensordesc<128x128xf16, #shared>,
+      %desc_v: !tt.tensordesc<128x128xf16, #shared>,
+      %lhs: !ttg.memdesc<128x128xf16, #shared, #smem>,
+      %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %tok: !ttg.async.token) {
+    %false = arith.constant false
+    %true = arith.constant true
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    // CHECK: [[EARLY_EMPTY:%[-A-Za-z0-9_.$#]+]] = nvws.semaphore.create {{.*}} released = 3
+    %k = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 301 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    %v = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 301 : i32, buffer.start = 1 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    scf.for %iv = %c0 to %c1 step %c1 : i32 {
+      nvws.descriptor_load %desc_k[%c0, %c0] 32768 %k {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared>, i32, i32, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      // CHECK: [[K_RELEASE_OFFSET:%[-A-Za-z0-9_.$#]+]] = arith.constant {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} 0 : i32
+      %qk = ttng.tc_gen5_mma %lhs, %k, %acc[%tok], %false, %true {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      // CHECK: nvws.semaphore.release [[EARLY_EMPTY]]{{\[}}[[K_RELEASE_OFFSET]]{{\]}}, {{.*}} [#nvws.async_op<tc5mma>]
+      // CHECK: nvws.descriptor_load
+      nvws.descriptor_load %desc_v[%c0, %c0] 32768 %v {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared>, i32, i32, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      %pv = ttng.tc_gen5_mma %lhs, %v, %acc[%qk], %true, %true {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      "use_token"(%pv) {ttg.partition = array<i32: 1>} : (!ttg.async.token) -> ()
+    } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 3>, ttg.partition.outputs = [], ttg.warp_specialize.tag = 0 : i32}
+    // The K release used offset 0, but V advances the cursor before loop exit.
+    // CHECK: } {{.*}}ttg.warp_specialize.tag = 0
+    // CHECK-DAG: [[EARLY_K_EXIT:%[-A-Za-z0-9_.$#]+]] = arith.constant {{.*}} -1 : i32
+    // CHECK-DAG: [[EARLY_V_EXIT:%[-A-Za-z0-9_.$#]+]] = arith.constant {{.*}} 0 : i32
+    // CHECK-DAG: nvws.semaphore.acquire [[EARLY_EMPTY]]{{\[}}[[EARLY_K_EXIT]]{{\]}} {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32}
+    // CHECK-DAG: nvws.semaphore.acquire [[EARLY_EMPTY]]{{\[}}[[EARLY_V_EXIT]]{{\]}} {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32}
+    // CHECK-NOT: nvws.semaphore.acquire [[EARLY_EMPTY]]
+    // CHECK: tt.return
     tt.return
   }
 }

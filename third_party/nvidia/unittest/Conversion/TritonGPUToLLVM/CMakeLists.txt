@@ -4,5 +4,6 @@ add_triton_ut(
   LIBS
     TritonGPUToLLVM
     TritonNVIDIAGPUToLLVM
+    NVHopperTransforms
     NVGPUIR MLIRUBToLLVM
 )

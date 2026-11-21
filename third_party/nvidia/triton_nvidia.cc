@@ -278,6 +278,21 @@ void init_triton_nvidia_passes_nvws(py::module_ &m) {
                      mlir::triton::createNVWSAssignStagePhase);
   ADD_PASS_WRAPPER_0("add_insert_tmem_aref",
                      mlir::triton::createNVWSInsertTmemAref);
+  ADD_PASS_WRAPPER_0("add_insert_allocas",
+                     mlir::triton::createNVWSInsertAllocas);
+  ADD_PASS_WRAPPER_0("add_insert_semas", mlir::triton::createNVWSInsertSemas);
+  ADD_PASS_WRAPPER_0("add_semaphore_optimize",
+                     mlir::triton::createNVWSSemaphoreOptimize);
+  ADD_PASS_WRAPPER_0("add_assign_semaphore_stage_phase",
+                     mlir::triton::createNVWSAssignSemaphoreStagePhase);
+  ADD_PASS_WRAPPER_0("add_lower_semaphore",
+                     mlir::triton::createNVWSLowerSemaphore);
+  ADD_PASS_WRAPPER_0("add_meta_to_nvws_convert",
+                     mlir::triton::createNVWSMetaToNVWSConvert);
+  ADD_PASS_WRAPPER_0("add_pack_epilogue_slices",
+                     mlir::triton::createNVWSPackEpilogueSlices);
+  ADD_PASS_WRAPPER_0("add_order_buffer_groups",
+                     mlir::triton::createNVWSOrderBufferGroups);
 }
 
 void init_triton_hopper_passes(py::module_ &m) {

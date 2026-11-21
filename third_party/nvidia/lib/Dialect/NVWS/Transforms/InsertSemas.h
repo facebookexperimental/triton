@@ -17,12 +17,14 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include <array>
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <utility>
@@ -197,6 +199,10 @@ struct GroupDag {
   Operation *semaAnchor = nullptr, *physicalBackingAnchor = nullptr;
   bool isTmem() const { return memory == MemKind::Tmem; }
   bool isCircular() const { return circular; }
+  bool isSingleMultibufferedTmem() const {
+    return isTmem() && !isCircular() && pieceTable.members.size() == 1 &&
+           numCopies > 1;
+  }
   ArrayRef<Node *> nodesOfKind(Node::Kind kind) const {
     return nodesByKind[kind];
   }
@@ -238,6 +244,34 @@ inline gpu::MemDescType backingType(const GroupDag &g, const Member &member) {
                                type.getMemorySpace(), true);
 }
 using ScheduleUpdate = std::pair<Operation *, gpu::StageCluster>;
+using CurrentOp = llvm::function_ref<Operation *(Operation *)>;
+using ScheduleOrigin = llvm::PointerUnion<Operation *, const Node *>;
+using NodeScheduleSources =
+    DenseMap<const Node *, SmallVector<ScheduleUpdate, 1>>;
+struct SlotPair {
+  int64_t producer, consumer, advances;
+
+  std::optional<int64_t> reuseDistance(int64_t depth) const {
+    int64_t period = depth / std::gcd(depth, advances);
+    for (int64_t distance = 1; distance <= period; ++distance)
+      if ((consumer + distance * advances - producer) % depth == 0)
+        return distance;
+    return std::nullopt;
+  }
+};
+
+// Emission returns a reuse distance for each requested release after assigning
+// handoff offsets. The scheduler uses those distances to finish its loop
+// models.
+struct DeferredSchedules {
+  DenseSet<const Node *> handoffs;
+  DenseSet<Operation *> scheduledOps;
+  const NodeScheduleSources &protocolSources;
+  llvm::function_ref<LogicalResult(
+      const DenseMap<const Node *, int64_t> &,
+      DenseMap<ScheduleOrigin, gpu::StageCluster> &, CurrentOp)>
+      finish;
+};
 using nvws::buffer::getI64Attr;
 using nvws::buffer::isSupportedAliasOp;
 using nvws::buffer::kBufferCircularAttrName;
@@ -339,9 +373,10 @@ LogicalResult buildAccessDag(GroupDag &g, triton::FuncOp funcOp,
                              Block &functionBlock);
 LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner,
                            int semaphoreOptimizeNumStages, int &numTmemBlocks);
-LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups,
-                                   SmallVectorImpl<ScheduleUpdate> &updates);
+LogicalResult scheduleAndEmit(triton::FuncOp funcOp,
+                              MutableArrayRef<GroupDag> groups);
 LogicalResult emitIR(triton::FuncOp funcOp, ArrayRef<GroupDag> groups,
-                     ArrayRef<ScheduleUpdate> updates);
+                     ArrayRef<ScheduleUpdate> updates,
+                     const DeferredSchedules &deferred);
 } // namespace mlir::triton::nvws_semas
 #endif // NVWS_TRANSFORMS_INSERT_SEMAS_H_

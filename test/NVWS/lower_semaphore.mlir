@@ -1,4 +1,5 @@
 // RUN: split-file %s %t
+// RUN: triton-opt %t/coalesce-tmem.mlir --allow-unregistered-dialect --nvws-lower-semaphore | FileCheck %t/coalesce-tmem.mlir
 // RUN: triton-opt %t/lowering.mlir -split-input-file --allow-unregistered-dialect --nvws-semaphore-optimize --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore | FileCheck %t/lowering.mlir --implicit-check-not=nvws.semaphore
 // RUN: triton-opt %t/arrive-count.mlir -split-input-file --allow-unregistered-dialect --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore | FileCheck %t/arrive-count.mlir --implicit-check-not=nvws.semaphore
 // RUN: triton-opt %t/circular.mlir -split-input-file --allow-unregistered-dialect --nvws-assign-semaphore-stage-phase --nvws-lower-semaphore --cse | FileCheck %t/circular.mlir --implicit-check-not=nvws.semaphore
@@ -1999,6 +2000,29 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       "use"(%v) {ttg.partition = array<i32: 1>} : (tensor<128x64xf16, #blocked>) -> ()
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>}
     ttg.local_dealloc %buf : !ttg.memdesc<1x128x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+//--- coalesce-tmem.mlir
+
+#tmem_base = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem_f16_view = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 2>
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-DAG: #[[TMEM_F16_VIEW:[a-zA-Z0-9_]+]] = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 2>
+  // CHECK: tt.func @coalesce_same_buffer_id_tmem_allocs
+  tt.func @coalesce_same_buffer_id_tmem_allocs() {
+    // CHECK: [[BASE:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32,
+    %base = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32, #tmem_base, #ttng.tensor_memory, mutable>
+    // CHECK-NOT: ttng.tmem_alloc {{.*}}buffer.id = 42
+    // CHECK: [[SUB:%.*]] = ttng.tmem_subslice [[BASE]] {dim = 2 : i32, offset = 0 : i32}
+    // CHECK-SAME: -> !ttg.memdesc<1x128x128xf32,
+    // CHECK-NEXT: [[VIEW:%.*]] = ttg.memdesc_reinterpret [[SUB]]
+    // CHECK-SAME: -> !ttg.memdesc<1x128x128xf16, #[[TMEM_F16_VIEW]], #ttng.tensor_memory, mutable>
+    %alias = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 42 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16, #tmem_base, #ttng.tensor_memory, mutable>
+    "use_base"(%base) : (!ttg.memdesc<1x128x128xf32, #tmem_base, #ttng.tensor_memory, mutable>) -> ()
+    // CHECK: "use_alias"([[VIEW]]) : (!ttg.memdesc<1x128x128xf16, #[[TMEM_F16_VIEW]], #ttng.tensor_memory, mutable>) -> ()
+    "use_alias"(%alias) : (!ttg.memdesc<1x128x128xf16, #tmem_base, #ttng.tensor_memory, mutable>) -> ()
     tt.return
   }
 }

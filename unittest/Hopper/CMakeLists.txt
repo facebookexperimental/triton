@@ -12,6 +12,7 @@ add_triton_ut(
   LIBS
     TritonGPUModuloCore
     TritonGPUTransforms
+    NVHopperTransforms
     TritonNvidiaGPUTransforms
 )
 
@@ -21,6 +22,7 @@ add_triton_ut(
   LIBS
     TritonGPUModuloCore
     TritonGPUTransforms
+    NVHopperTransforms
     TritonNvidiaGPUTransforms
 )
 
@@ -30,6 +32,7 @@ add_triton_ut(
   LIBS
     TritonGPUModuloCore
     TritonGPUTransforms
+    NVHopperTransforms
     TritonNvidiaGPUTransforms
 )
 

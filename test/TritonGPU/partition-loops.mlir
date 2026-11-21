@@ -1,4 +1,5 @@
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-partition-loops -verify-diagnostics -canonicalize | FileCheck %s
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-partition-loops -verify-diagnostics -canonicalize | FileCheck %s --check-prefixes=CHECK,DEFAULT
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-partition-loops=use-semaphores=true -verify-diagnostics -canonicalize | FileCheck %s --check-prefixes=CHECK,SEMAPHORE
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 !ty = tensor<1xi32, #blocked>
@@ -595,6 +596,37 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       "consume"(%selected) {ttg.partition = array<i32: 0, 1>} : (i32) -> ()
       scf.yield {ttg.partition = array<i32: 0, 1>} %keep_going : i1
     } attributes {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [array<i32: 0, 1>], ttg.partition.stages = [0, 0], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @semaphore_partition_schedule
+  tt.func @semaphore_partition_schedule(%lb: i32, %ub: i32, %step: i32) {
+    // CHECK: nvws.warp_group
+    // CHECK: partition0 num_warps(4)
+    // CHECK: scf.for
+    // CHECK: "op_a"
+    // DEFAULT: } {tt.scheduled_max_stage = 4 : i32
+    // SEMAPHORE: } {tt.scheduled_max_stage = 0 : i32
+    // CHECK: partition1 num_warps(4)
+    // CHECK: scf.for
+    // CHECK: scf.for
+    // CHECK: "op_b"
+    // DEFAULT: } {tt.scheduled_max_stage = 4 : i32}
+    // SEMAPHORE: } {tt.scheduled_max_stage = 2 : i32, tt.warp_specialize}
+    // DEFAULT: } {tt.scheduled_max_stage = 4 : i32
+    // SEMAPHORE: } {tt.scheduled_max_stage = 2 : i32
+    scf.for %i = %lb to %ub step %step : i32 {
+      "op_a"(%i) {ttg.partition = array<i32: 0>} : (i32) -> ()
+      scf.for %j = %lb to %ub step %step : i32 {
+        "op_b"(%j) {ttg.partition = array<i32: 1>} : (i32) -> ()
+        scf.yield {ttg.partition = array<i32: 0, 1>}
+      } {tt.scheduled_max_stage = 4 : i32, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = []}
+      scf.yield {ttg.partition = array<i32: 0, 1>}
+    } {tt.scheduled_max_stage = 4 : i32, tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [], ttg.partition.stages = [0, 2], ttg.warp_specialize.tag = 0 : i32}
     tt.return
   }
 }

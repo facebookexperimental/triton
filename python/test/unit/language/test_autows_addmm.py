@@ -354,18 +354,19 @@ def test_autows_addmm_hoist_convert_before_broadcast():
     assert "ttng.async_tma_copy_local_to_global" in ttgir, "Expected TMA store copy in IR"
     assert "ttng.async_tma_store_token_wait" in ttgir, "Expected TMA store token wait in IR"
     assert "tt.descriptor_store" not in ttgir, "Expected descriptor stores to be lowered"
-    assert "can_rotate_by_buffer_count" not in ttgir, "Expected TMA store wait rotation to be resolved"
+    if not triton.knobs.nvidia.use_nvws_meta:
+        assert "can_rotate_by_buffer_count" not in ttgir, "Expected TMA store wait rotation to be resolved"
 
-    unified_waits = re.search(
-        r"ttng\.wait_barrier[^\n]*dstTask = 3[^\n]*\n\s*"
-        r"ttng\.wait_barrier[^\n]*dstTask = 1[^\n]*",
-        ttgir,
-    )
-    assert unified_waits, "Expected adjacent bias-TMA and accumulator-TMEM waits"
-    unified_region = ttgir[unified_waits.end():]
-    tmem_load = unified_region.find("ttng.tmem_load")
-    bias_load = unified_region.find("ttg.local_load")
-    assert 0 <= tmem_load < bias_load, "Expected the TMEM load before the bias load after wait unification"
+        unified_waits = re.search(
+            r"ttng\.wait_barrier[^\n]*dstTask = 3[^\n]*\n\s*"
+            r"ttng\.wait_barrier[^\n]*dstTask = 1[^\n]*",
+            ttgir,
+        )
+        assert unified_waits, "Expected adjacent bias-TMA and accumulator-TMEM waits"
+        unified_region = ttgir[unified_waits.end():]
+        tmem_load = unified_region.find("ttng.tmem_load")
+        bias_load = unified_region.find("ttg.local_load")
+        assert 0 <= tmem_load < bias_load, "Expected the TMEM load before the bias load after wait unification"
 
     # Check that convert_layout on bias happens before broadcast (on 1xN, not MxN)
     cvt_before_bc = re.search(r"convert_layout.*tensor<1x\d+xf32.*\n.*tt\.broadcast.*tensor<1x\d+xf32", ttgir)

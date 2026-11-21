@@ -137,7 +137,7 @@ static bool needsCustomMetaWSEpiloguePeeling(scf::ForOp forOp) {
       .wasInterrupted();
 }
 
-static void expandLoops(ModuleOp moduleOp) {
+static void expandLoops(ModuleOp moduleOp, bool useMetaNVWS) {
   DenseSet<MaskOp> peeledMaskOps;
   auto processPeeledEpilogueOp = [&](RewriterBase &rewriter, Operation *op,
                                      bool isEpilogue) -> Operation * {
@@ -173,7 +173,8 @@ static void expandLoops(ModuleOp moduleOp) {
       hasWarpSpec = true;
     loops.push_back(forOp);
   });
-  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+  bool metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS") && !useMetaNVWS;
+  bool metaLikeWS = metaWS || useMetaNVWS;
   // The partition-type filter below exists to prune the loops that the extra
   // ScheduleLoops re-run re-staged. That re-run only happens on the 2-CTA path
   // (see CUDABackend.make_ttgir). On the 1-CTA path every partition loop still
@@ -200,7 +201,7 @@ static void expandLoops(ModuleOp moduleOp) {
       continue;
     }
     // Skip pipelining when we have a single stage.
-    if (metaWS && schedule.getNumStages() == 1) {
+    if (metaLikeWS && schedule.getNumStages() == 1) {
       continue;
     }
 
@@ -240,7 +241,9 @@ static void expandLoops(ModuleOp moduleOp) {
         !forOp->getParentOfType<triton::gpu::WarpSpecializeOp>() &&
         !keepPredicateStage; // do not peel if we are testing the stage
                              // predication
-    if (metaWS)
+    if (useMetaNVWS && hasWarpSpec)
+      customEpiloguePeeling = true;
+    else if (metaWS)
       customEpiloguePeeling = useCustomMetaWSEpilogue;
 
     if (keepPredicateStage || customEpiloguePeeling) {
@@ -320,7 +323,7 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
     }
 
     // Apply the pipeline expansion.
-    expandLoops(moduleOp);
+    expandLoops(moduleOp, useMetaNVWS);
     if (dumpIntermediateSteps) {
       ::mlir::triton::tools::mlirDumpsOrDbgs()
           << "// -----// SoftwarePipeliner internal IR Dump After: "
@@ -346,7 +349,8 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
       return signalPassFailure();
 
     {
-      auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+      bool metaLikeWS =
+          triton::tools::getBoolEnv("TRITON_USE_META_WS") || useMetaNVWS;
       SmallVector<LoopLikeOpInterface> loops;
       bool hasWarpSpec = false;
       getOperation()->walk([&](scf::ForOp forOp) {
@@ -363,7 +367,7 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
       }
 
       // With Meta's warpspec, we are handling this in AutoWS.
-      if (!metaWS || !hasWarpSpec)
+      if (!metaLikeWS || !hasWarpSpec)
         for (auto loopOp : loops) {
           mlir::triton::pipelineTMAStores(loopOp);
         }

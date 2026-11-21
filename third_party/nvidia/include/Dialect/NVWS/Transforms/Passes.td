@@ -290,6 +290,67 @@ def NVWSHoistTmemStore: Pass<"nvws-hoist-tmem-store", "mlir::ModuleOp"> {
     "mlir::triton::gpu::TritonGPUDialect",
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
   ];
+  let options = [
+    Option<"useSemaphores", "use-semaphores", "bool", /*default*/"false",
+           "Repair ownership and scheduling metadata for semaphore insertion">
+  ];
+
+}
+
+def NVWSInsertAllocas: Pass<"nvws-insert-allocas", "mlir::ModuleOp"> {
+  let summary = "Materialize NVWS communication allocations and accesses.";
+
+  let description = [{
+    Materializes explicit local/TMEM communication buffers and memory accesses
+    for cross-partition SSA values without inserting semaphore operations.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+
+}
+
+def NVWSOrderBufferGroups
+    : Pass<"nvws-order-buffer-groups", "mlir::ModuleOp"> {
+  let summary = "Order NVWS buffer groups by predicted producer readiness";
+
+  let description = [{
+    Orders eligible source-free entry-block TMEM allocation representatives so
+    that InsertSemas processes groups which are predicted to become ready later
+    before groups predicted to become ready earlier.  This makes the order of
+    co-located blocking waits an explicit pre-InsertSemas policy instead of an
+    accidental consequence of memory-planner allocation order.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def NVWSPackEpilogueSlices
+    : Pass<"nvws-pack-epilogue-slices", "mlir::ModuleOp"> {
+  let summary = "Pack data-partitioned epilogue producer/store slices";
+
+  let description = [{
+    Shortens register live ranges in data-partitioned merged epilogues by
+    placing each explicit local_store immediately after its producer slice.
+    This is a scheduling-only optimization over buffers already materialized
+    by Meta buffer allocation and must run before memory planning.
+  }];
+
+  let dependentDialects = [
+    "mlir::scf::SCFDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
 }
 
 #endif // NVWS_PASSES

@@ -1,8 +1,10 @@
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization=num-stages=2 | FileCheck %s --check-prefix=CHECK --check-prefix=BASE --check-prefix=CLEAN
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization=num-stages=2 -tritongpu-pipeline | FileCheck %s --check-prefix=CHECK --check-prefix=PIPELINE --check-prefix=CLEAN
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization=num-stages=2 -tritongpu-pipeline -tritongpu-optimize-partition-warps | FileCheck %s --check-prefix=OPT --check-prefix=CLEAN
-// XFAIL: *
+// RUN: split-file %s %t
+// RUN: triton-opt %t/semaphores.mlir -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization="num-stages=2 use-semaphores=true" | FileCheck %t/semaphores.mlir --check-prefixes=CHECK,BASE,CLEAN
+// RUN: triton-opt %t/semaphores.mlir -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization="num-stages=2 use-semaphores=true" -tritongpu-pipeline | FileCheck %t/semaphores.mlir --check-prefixes=CHECK,PIPELINE,CLEAN
+// RUN: triton-opt %t/semaphores.mlir -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization="num-stages=2 use-semaphores=true" -tritongpu-pipeline -tritongpu-optimize-partition-warps | FileCheck %t/semaphores.mlir --check-prefixes=OPT,CLEAN
+// RUN: triton-opt %t/clc.mlir -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization="num-stages=2 use-semaphores=false" | FileCheck %t/clc.mlir --check-prefix=BASE
 
+//--- semaphores.mlir
 // CLEAN: module
 // CLEAN-NOT: ttg.partition
 // CLEAN-NOT: ttg.warp_specialize.tag
@@ -44,7 +46,7 @@ tt.func @matmul_change_desc_in_prologue(
   // PIPELINE-NOT: tc_gen5_mma
   // CHECK-LABEL: partition1
   // OPT-LABEL: partition1
-  // OPT-SAME: num_warps(2)
+  // OPT-SAME: num_warps(1)
   // BASE-NOT: tt.make_tensor_descriptor
   // BASE-COUNT-2: ttg.global_scratch_alloc {alignment = 128 : i32, nbytes = 384 : i32}
   // BASE-COUNT-2: ttng.tensormap_create
@@ -394,8 +396,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
 
-// -----
-
+//--- clc.mlir
 // AutomaticWS partitions one CLC While and emits a single physical CLC issue.
 #clc_aws_oper = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #clc_aws_acc = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

@@ -94,6 +94,10 @@ MemDescType getArefMultiBufferedType(MemDescType bufTy, int depth) {
                                /*mutableMemory*/ true);
 }
 
+MemDescType getSemaphoreMultiBufferedType(MemDescType bufTy, int depth) {
+  return getArefMultiBufferedType(bufTy, depth);
+}
+
 LoopLikeOpInterface getOuterWSLoop(LoopLikeOpInterface loop) {
   auto wsLoop = loop;
   while (wsLoop && !wsLoop->hasAttr(triton::kWarpSpecializeAttrName)) {
