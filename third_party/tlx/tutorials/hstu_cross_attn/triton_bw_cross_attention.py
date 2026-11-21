@@ -3232,7 +3232,7 @@ def _hstu_attn_bwd_redkv_inner(  # noqa C901
             else:
                 qk_trans = qk_trans * alpha
                 pT = fast_silu(qk_trans, MULT_BY_X=False)
-                silu_trans = qk_trans * pT * scale[None, :]
+                silu_trans = qk_trans * pT * scale[None]
                 act_qk_trans = silu_trans.to(k.dtype)
         if SHARED_KV:
             dk = tl.dot(act_qk_trans, do, allow_tf32=ALLOW_TF32)
@@ -3279,7 +3279,7 @@ def _hstu_attn_bwd_redkv_inner(  # noqa C901
                     valid_mask_trans,
                 )
             else:
-                dqk_trans = (dact_qk_trans * pT * (1 + qk_trans * (1 - pT)) * scale[None, :])
+                dqk_trans = (dact_qk_trans * pT * (1 + qk_trans * (1 - pT)) * scale[None])
         dqk_trans = dqk_trans.to(k.dtype)
         if SHARED_KV:
             dk_attn = tl.dot(dqk_trans, q, allow_tf32=ALLOW_TF32)
