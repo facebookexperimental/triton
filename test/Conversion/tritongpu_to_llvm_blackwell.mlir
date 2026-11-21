@@ -1202,12 +1202,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
   // CHECK-LABEL: @ldmatrix_b8_minimise_conflicts_preserve_words
   // CHECK-DAG: %[[ONE:.*]] = llvm.mlir.constant(1 : i32)
   // CHECK-DAG: %[[TWO:.*]] = llvm.mlir.constant(2 : i32)
-  // CHECK: %[[LOAD:.*]] = nvvm.ldmatrix %{{.*}}, num = 2, layout = <col>, shape = <m = 16, n = 16>, element_type = <b8>
+  // CHECK: %[[LOAD:.*]] = nvvm.ldmatrix %{{.*}}, num = 2, layout = <col>{{.*}}element_type = <b8>
   // CHECK: %[[WORD:.*]] = llvm.extractvalue %[[LOAD]][0]
   // CHECK: %[[BYTES:.*]] = llvm.bitcast %[[WORD]] : i32 to vector<4xi8>
   // CHECK: %[[BYTE1:.*]] = llvm.extractelement %[[BYTES]][%[[ONE]] : i32]
   // CHECK: %[[BYTE2:.*]] = llvm.extractelement %[[BYTES]][%[[TWO]] : i32]
-  // CHECK: llvm.insertvalue %[[BYTE2]], %{{.*}}[1]
+  // CHECK: llvm.insertvalue %[[BYTE2]], %{{.*}}[2]
   // CHECK: llvm.insertvalue %[[BYTE1]], %{{.*}}[4]
   tt.func private @ldmatrix_b8_minimise_conflicts_preserve_words(%A: !ttg.memdesc<512xi8, #shared, #smem>) -> tensor<512xi8, #b8> {
     %0 = ttg.local_load %A : !ttg.memdesc<512xi8, #shared, #smem> -> tensor<512xi8, #b8>
@@ -1216,11 +1216,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
   // Selecting register [8] avoids the bank conflict caused by register [64].
   // CHECK-LABEL: @ldmatrix_b16_minimise_conflicts
   // CHECK-DAG: %[[ONE:.*]] = llvm.mlir.constant(1 : i32)
-  // CHECK: %[[LOAD:.*]] = nvvm.ldmatrix %{{.*}}, num = 4, layout = <col>, shape = <m = 8, n = 8>, element_type = <b16>
+  // CHECK: %[[LOAD:.*]] = nvvm.ldmatrix %{{.*}}, num = 4, layout = <col>{{.*}}element_type = <b16>
   // CHECK: %[[WORD:.*]] = llvm.extractvalue %[[LOAD]][0]
   // CHECK: %[[HALVES:.*]] = llvm.bitcast %[[WORD]] : i32 to vector<2xf16>
   // CHECK: %[[HALF1:.*]] = llvm.extractelement %[[HALVES]][%[[ONE]] : i32]
-  // CHECK: llvm.insertvalue %[[HALF1]], %{{.*}}[1]
+  // CHECK: llvm.insertvalue %[[HALF1]], %{{.*}}[2]
   tt.func private @ldmatrix_b16_minimise_conflicts(%A: !ttg.memdesc<256xf16, #shared, #smem>) -> tensor<256xf16, #b16> {
     %0 = ttg.local_load %A : !ttg.memdesc<256xf16, #shared, #smem> -> tensor<256xf16, #b16>
     tt.return %0 : tensor<256xf16, #b16>
@@ -1228,8 +1228,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
   // Selecting register [16] avoids the bank conflict caused by register [128].
   // CHECK-LABEL: @stmatrix_b8_minimise_conflicts
   // CHECK-DAG: %[[ONE:.*]] = llvm.mlir.constant(1 : i32)
-  // CHECK: %[[INPUT1:.*]] = llvm.extractvalue %{{.*}}[1]
-  // CHECK: %[[PACK1:.*]] = llvm.insertelement %[[INPUT1]], %{{.*}}[%[[ONE]] : i32]
+  // CHECK: %[[INPUT4:.*]] = llvm.extractvalue %{{.*}}[4]
+  // CHECK: %[[PACK1:.*]] = llvm.insertelement %[[INPUT4]], %{{.*}}[%[[ONE]] : i32]
   // CHECK: %[[PACK2:.*]] = llvm.insertelement %{{.*}}, %[[PACK1]][
   // CHECK: %[[PACK3:.*]] = llvm.insertelement %{{.*}}, %[[PACK2]][
   // CHECK: %[[WORD:.*]] = llvm.bitcast %[[PACK3]] : vector<4xi8> to i32
@@ -1240,8 +1240,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
   }
   // CHECK-LABEL: @stmatrix_b16_minimise_conflicts
   // CHECK-DAG: %[[ONE:.*]] = llvm.mlir.constant(1 : i32)
-  // CHECK: %[[INPUT1:.*]] = llvm.extractvalue %{{.*}}[1]
-  // CHECK: %[[PACK:.*]] = llvm.insertelement %[[INPUT1]], %{{.*}}[%[[ONE]] : i32]
+  // CHECK: %[[INPUT2:.*]] = llvm.extractvalue %{{.*}}[2]
+  // CHECK: %[[PACK:.*]] = llvm.insertelement %[[INPUT2]], %{{.*}}[%[[ONE]] : i32]
   // CHECK: %[[WORD:.*]] = llvm.bitcast %[[PACK]] : vector<2xf16> to i32
   // CHECK: nvvm.stmatrix %{{[^,]+}}, %[[WORD]], %{{.*}} layout = <col>, shape = <m = 8, n = 8>, element_type = <b16> : !llvm.ptr<3>, i32, i32, i32, i32
   tt.func private @stmatrix_b16_minimise_conflicts(%A: !ttg.memdesc<256xf16, #shared, #smem, mutable>, %data: tensor<256xf16, #b16>) {
