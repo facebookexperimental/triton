@@ -103,13 +103,32 @@ def _ordered_args(bound_args, constexpr_names, blobs):
 def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
     """Best-effort, source-free task dump. Never raises into the user's launch path."""
     try:
-        kernel_name = getattr(kernel.metadata, "name", getattr(jitfn, "__name__", "kernel"))
+        asm = kernel.asm
+        capture_compiled(
+            ptx=asm["ptx"],
+            metadata=kernel.metadata,
+            asm=asm,
+            kernel_name=getattr(kernel.metadata, "name", getattr(jitfn, "__name__", "kernel")),
+            fn_name=getattr(jitfn, "__name__", None),
+            bound_args=bound_args,
+            constexprs=constexprs,
+            grid=grid,
+        )
+    except Exception as e:  # collection must never break the user's run
+        dlog("collector", f"capture failed: {type(e).__name__}: {e}")
+
+
+def capture_compiled(*, ptx, metadata, asm, kernel_name, fn_name, bound_args, constexprs, grid):
+    """capture() for a kernel described by its parts rather than a CompiledKernel, for launchers that
+    keep only those (see magnon.static). `asm` maps the optional "launch_metadata" / "launcher_src"
+    entries; `bound_args` maps every kernel arg name, in order, to its value (constexpr values are
+    ignored). Never raises into the user's launch path."""
+    try:
         # e.g. "^triton_tem_" keeps Inductor's final template kernels and drops its autotune candidates.
         pattern = os.environ.get("TRITON_COMPILE_IQ_COLLECT_KERNELS")
         if pattern and not re.search(pattern, kernel_name):
             dlog("collector", f"skip {kernel_name} (no match for TRITON_COMPILE_IQ_COLLECT_KERNELS)")
             return
-        ptx = kernel.asm["ptx"]
         sha = ptx_sha256(ptx)
         tdir = os.path.join(task_root(), sha[:16])
         done = os.path.join(tdir, "spec.json")
@@ -127,14 +146,14 @@ def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
         # Imported here so a backend API change fails open inside this try, not at import time.
         from triton.backends.nvidia.compiler import get_ptxas
 
-        ptxas = get_ptxas(kernel.metadata.target.arch)
+        ptxas = get_ptxas(metadata.target.arch)
         blobs = {}
-        spec = ptx_launch.build_spec(ptx, kernel.metadata, tuple(grid),
-                                     _ordered_args(bound_args, constexpr_names, blobs), ptxas.path, ptxas.version)
+        spec = ptx_launch.build_spec(ptx, metadata, tuple(grid), _ordered_args(bound_args, constexpr_names, blobs),
+                                     ptxas.path, ptxas.version)
         spec.update(
             ptx_sha256=sha,
             kernel_name=kernel_name,
-            fn_name=getattr(jitfn, "__name__", None),
+            fn_name=fn_name,
         )
 
         os.makedirs(tdir, exist_ok=True)
@@ -157,7 +176,6 @@ def capture(*, jitfn, kernel, bound_args, signature, constexprs, grid):
         # absence just means the factory falls back to spec.json. Isolated so it can never perturb the
         # already-written spec.json / kernel.ptx.
         try:
-            asm = kernel.asm
             lm = asm["launch_metadata"] if "launch_metadata" in asm else None
             if lm is not None:
                 with open(os.path.join(tdir, "launch_metadata.json"), "w") as f:
