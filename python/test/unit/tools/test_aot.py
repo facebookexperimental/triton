@@ -20,6 +20,14 @@ from triton._internal_testing import is_cuda, is_hip, is_hip_cdna5
 if "TRITON_AMD_CODEGEN_PATH" in os.environ and not os.path.isabs(os.environ["TRITON_AMD_CODEGEN_PATH"]):
     os.environ["TRITON_AMD_CODEGEN_PATH"] = os.path.abspath(os.environ["TRITON_AMD_CODEGEN_PATH"])
 
+# Buck expands $(location) in TRITON_AMD_CODEGEN_PATH to a runfiles-relative
+# path. The AOT helpers below spawn compile.py/link.py children with cwd set to
+# a temp dir, where the relative path no longer resolves (OSError: .so not
+# found). Absolutize eagerly while our own cwd is still the runfiles root so
+# all children inherit a valid path.
+if "TRITON_AMD_CODEGEN_PATH" in os.environ and not os.path.isabs(os.environ["TRITON_AMD_CODEGEN_PATH"]):
+    os.environ["TRITON_AMD_CODEGEN_PATH"] = os.path.abspath(os.environ["TRITON_AMD_CODEGEN_PATH"])
+
 if is_cuda():
     from triton.backends.nvidia.driver import include_dirs, library_dirs
 
