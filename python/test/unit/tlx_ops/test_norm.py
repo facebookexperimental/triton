@@ -11,7 +11,9 @@ import torch
 import triton
 from triton._internal_testing import is_hopper_or_newer
 from triton.tlx import ops
+from triton.tlx.ops.kernels.norm import sm100
 from triton.tlx.ops.kernels.norm._shapes import GEO
+from triton.tlx.ops.kernels.norm.sm100 import _layernorm_fwd_staged
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tlx_benchmark'))
 from bench_norm import _prepare_call
@@ -242,6 +244,34 @@ def test_plain(norm, dtype, m, n):
         torch.testing.assert_close(
             actual.float(), expected.float(), rtol=precision,
             atol=precision * max(1, float(expected.abs().max())) if expected.numel() else precision)
+
+
+@pytest.mark.parametrize("shift", [0, 100])
+def test_staged_layernorm(shift):
+    torch.manual_seed(7)
+    x = (torch.randn((768, 47648), device="cuda") + shift).bfloat16()
+    w, b = [torch.randn(47648, device=x.device, dtype=x.dtype) for _ in range(2)]
+    y = torch.empty_like(x)
+    mean = torch.empty(768, device=x.device, dtype=torch.float32)
+    rstd = torch.empty_like(mean)
+    _layernorm_fwd_staged[(768, )](x, w, b, y, mean, rstd, 47648, 1e-5, num_warps=8, num_stages=1)
+    ref, mu, rr = norm_reference({"family": "plain", "norm": "layer"}, x, w, b)
+    torch.testing.assert_close(y, ref, rtol=0.02, atol=0.04)
+    torch.testing.assert_close(mean, mu, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(rstd, rr, rtol=1e-4, atol=1e-5)
+
+
+def test_staged_layernorm_short_row():
+    torch.manual_seed(7)
+    x = torch.randn((1, 128), device="cuda", dtype=torch.bfloat16)
+    w, b = [torch.randn(128, device=x.device, dtype=x.dtype) for _ in range(2)]
+    y = torch.empty_like(x)
+    mean, rstd = [torch.empty(1, device=x.device, dtype=torch.float32) for _ in range(2)]
+    sm100._layernorm_fwd_staged[(1, )](x, w, b, y, mean, rstd, 128, 1e-5, num_warps=8, num_stages=1)
+    ref, mu, rr = norm_reference({"family": "plain", "norm": "layer"}, x, w, b)
+    torch.testing.assert_close(y, ref, rtol=0.02, atol=0.02)
+    torch.testing.assert_close(mean, mu, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(rstd, rr, rtol=1e-4, atol=1e-5)
 
 
 @pytest.mark.parametrize("norm", ["layer", "rms"])

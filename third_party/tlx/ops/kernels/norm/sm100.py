@@ -12,6 +12,55 @@ _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 @triton.jit
+def _add_moments(a_sum, a_sq, b_sum, b_sq):
+    return a_sum + b_sum, a_sq + b_sq
+
+
+@triton.jit
+def _layernorm_fwd_staged(X, W, B, Y, Mean, Rstd, N: tl.constexpr, eps: tl.constexpr,
+                          BN: tl.constexpr = 2048):
+    row = tl.program_id(0)
+    base = row.to(tl.int64) * N
+    cols = tl.arange(0, BN)[None, :]
+    NTILE: tl.constexpr = tl.cdiv(N, BN)
+    staged = tlx.local_alloc((1, BN), tlx.dtype_of(X), NTILE)
+    shift = tl.load(X + base).to(tl.float32)
+    for k in tl.static_range(NTILE):
+        offsets = k * BN + cols
+        token = tlx.async_load(X + base + offsets, staged[k], mask=offsets < N, other=0.0)
+        tlx.async_load_commit_group([token])
+    sums = tl.zeros([1, BN], tl.float32)
+    squares = tl.zeros([1, BN], tl.float32)
+    for k in tl.static_range(NTILE):
+        if k % 2 == 0:
+            tlx.async_load_wait_group(max(NTILE - 2 - k, 0))
+        x = tlx.local_load(staged[k]).to(tl.float32)
+        centered = tl.where(k * BN + cols < N, x - shift, 0.0)
+        sums += centered
+        squares += centered * centered
+    total, total_sq = tl.reduce((tl.reshape(sums, [BN]), tl.reshape(squares, [BN])), 0, _add_moments)
+    shifted_mean = total / N
+    mean = shifted_mean + shift
+    variance = tl.maximum(total_sq / N - shifted_mean * shifted_mean, 0.0)
+    rstd = 1.0 / tl.sqrt(variance + eps)
+    weight_next = tl.load(W + cols, mask=cols < N, other=0.0)
+    bias_next = tl.load(B + cols, mask=cols < N, other=0.0)
+    for k in tl.static_range(NTILE):
+        weight, bias = weight_next, bias_next
+        if k + 1 < NTILE:
+            offsets = (k + 1) * BN + cols
+            weight_next = tl.load(W + offsets, mask=offsets < N, other=0.0)
+            bias_next = tl.load(B + offsets, mask=offsets < N, other=0.0)
+        x = tlx.local_load(staged[k]).to(tl.float32)
+        y = (x - mean) * rstd * weight.to(tl.float32) + bias.to(tl.float32)
+        tl.store(Y + base + k * BN + cols, y, mask=k * BN + cols < N)
+    if Mean is not None:
+        tl.store(Mean + row, mean)
+    if Rstd is not None:
+        tl.store(Rstd + row, rstd)
+
+
+@triton.jit
 def kernel_rmsnorm_fwd_single_cta(X, Y, W, Rstd_out, row_stride: tl.constexpr, M, N: tl.constexpr, eps,
                                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, SHOULD_MASK_ROW: tl.constexpr,
                                   SHOULD_MASK_COL: tl.constexpr, B=None, Residual=None, Post=None, ResidualWeight=None,
