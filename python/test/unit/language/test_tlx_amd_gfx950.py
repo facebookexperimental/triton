@@ -3302,3 +3302,178 @@ def test_stoch_round_gfx950(dst_dtype, expected_inst):
         diff = torch.abs(b_back[needs_rounding] - a_f32[needs_rounding])
         assert (diff <= ulp).all(), (f"Stochastic rounding error exceeds one ulp: max diff = {diff.max()}, "
                                      f"max ulp = {ulp.max()}")
+
+
+@pytest.fixture(scope="module")
+def mxfp8_varlen_forward_module():
+    import importlib.util
+    from pathlib import Path
+    from types import ModuleType
+
+    directory = Path(__file__).resolve().parents[
+        4
+    ] / "third_party/tlx/tutorials/amd_mxfp8_varlen_attention"
+    package = ModuleType("_test_mxfp8_varlen")
+    package.__path__ = [str(directory)]
+    sys.modules[package.__name__] = package
+    for name in (
+        "mxfp8_attention_core_gfx950",
+        "mxfp8_varlen_pingpong_gfx950",
+    ):
+        spec = importlib.util.spec_from_file_location(
+            f"{package.__name__}.{name}", directory / f"{name}.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        setattr(package, name, module)
+    return module
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("block_m", [64, 128, 256])
+@pytest.mark.parametrize("fast_exp", [False, True])
+@pytest.mark.parametrize(
+    "query_lengths,key_lengths",
+    [
+        ([0, 1, 31, 32, 33, 65, 129], [0, 0, 1, 127, 128, 129, 257]),
+        ([0, 0, 0], [0, 1, 257]),
+        ([1, 31, 33, 129], [1, 127, 129, 257]),
+    ],
+)
+def test_mxfp8_scheduled_forward_is_order_independent(
+    mxfp8_varlen_forward_module,
+    block_m,
+    fast_exp,
+    query_lengths,
+    key_lengths,
+):
+    fwd = mxfp8_varlen_forward_module
+    torch.manual_seed(19)
+    cu_q = torch.tensor(
+        [0, *torch.tensor(query_lengths).cumsum(0).tolist()],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cu_k = torch.tensor(
+        [0, *torch.tensor(key_lengths).cumsum(0).tolist()],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    q = torch.randn(
+        (sum(query_lengths), 4, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        (sum(key_lengths), 4, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    meta = fwd._metadata(
+        cu_q, cu_k, q.shape[0], k.shape[0], block_m
+    )
+    state = fwd.prepare_kv(k, v, cu_k, meta)
+    with pytest.raises(ValueError, match="requires a prepared work_schedule"):
+        fwd.forward(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            128**-0.5,
+            kv_state=state,
+            block_m=block_m,
+            fast_exp=fast_exp,
+        )
+    schedule = fwd.prepare_work_schedule(
+        query_lengths,
+        key_lengths,
+        q.device,
+        num_ctas=8,
+        block_m=block_m,
+    )
+    expected, expected_lse, _ = fwd.forward(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        128**-0.5,
+        kv_state=state,
+        fast_exp=fast_exp,
+        work_schedule=schedule,
+    )
+    schedule = fwd.prepare_work_schedule(
+        query_lengths,
+        key_lengths,
+        q.device,
+        num_ctas=16,
+        block_m=block_m,
+    )
+    actual, actual_lse, _ = fwd.forward(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        128**-0.5,
+        kv_state=state,
+        fast_exp=fast_exp,
+        work_schedule=schedule,
+    )
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_lse, expected_lse)
+    first = 0
+    for nq, nk in zip(query_lengths, key_lengths):
+        if nk == 0:
+            assert (actual[first:first + nq] == 0).all()
+            assert torch.isneginf(
+                actual_lse[:, first:first + nq]
+            ).all()
+        first += nq
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_mxfp8_scheduled_long_preserves_q_pipeline(
+    mxfp8_varlen_forward_module,
+):
+    fwd = mxfp8_varlen_forward_module
+    torch.manual_seed(23)
+    cu_q = torch.tensor([0, 128], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, 4096], device="cuda", dtype=torch.int32)
+    q = torch.randn((128, 4, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((4096, 4, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    state = fwd.prepare_kv(
+        k, v, cu_k, fwd._metadata(cu_q, cu_k, 128, 4096, 128)
+    )
+    schedule = fwd.prepare_work_schedule(
+        [128], [4096], q.device, num_ctas=8
+    )
+    expected, expected_lse, _ = fwd.forward(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        128**-0.5,
+        kv_state=state,
+        work_schedule=schedule,
+    )
+    schedule = fwd.prepare_work_schedule(
+        [128], [4096], q.device, num_ctas=16
+    )
+    actual, actual_lse, _ = fwd.forward(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        128**-0.5,
+        kv_state=state,
+        work_schedule=schedule,
+    )
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_lse, expected_lse)
