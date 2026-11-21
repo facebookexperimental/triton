@@ -133,9 +133,7 @@ def _serialize_for_amd_codegen(src: str, enable_fp_fusion: bool) -> bytes:
         # whereas textual IR has no backwards-compatibility guarantee.
         # Express fusion permission in the IR because newer LLVM versions no
         # longer honor TargetOptions::AllowFPOpFusion during code generation.
-        # Adapt alias-scope domains to the format supported by the
-        # independently pinned AMD code generator.
-        return llvm.to_bitcode(src, enable_fp_fusion, legacy_alias_scopes=True)
+        return llvm.to_bitcode(src, enable_fp_fusion)
     # LLVM commit 5bf967cb132b changed named-barrier intrinsic operands from
     # address space 3 to 15. The bitcode reader rejects the legacy signature
     # before the standalone code generator can upgrade the module, so send
