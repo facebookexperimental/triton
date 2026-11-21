@@ -407,6 +407,136 @@ def events(nights):
     return out
 
 
+EPISODE_RECOVERY = 0.05
+
+
+def case_episodes(series, contexts):
+    records, healthy = [], []
+    active = pending = lifted = recovery = context = None
+
+    def clean_value(case):
+        value = case.get("tlx_tflops") if case else None
+        return value if case and case["status"] in ("ok", "pip") and isinstance(
+            value, (int, float)) and math.isfinite(value) and value > 0 else None
+
+    def update(row, i, value):
+        row.update(last=i, value=value, worst=min(row["worst"], value / row["baseline"]),
+                   peak=max(row["peak"], value / row["baseline"]))
+
+    def begin(kind, i, baseline, base, value, confirmed=None):
+        ratio = value / baseline
+        return {
+            "kind": kind, "start": i, "base": base, "baseline": baseline, "confirmed": confirmed, "recovered": None,
+            "last": i, "value": value, "worst": ratio, "peak": ratio, "end": None, "context_changed": False
+        }
+
+    def close_lift(i):
+        if lifted is not None:
+            samples = [(j, clean_value(c))
+                       for j, c in enumerate(series[lifted["start"]:i + 1], lifted["start"])
+                       if clean_value(c) is not None]
+            lifted.update(end=i, last=samples[-1][0], value=samples[-1][1],
+                          worst=min(v for _, v in samples) / lifted["baseline"],
+                          peak=max(v for _, v in samples) / lifted["baseline"])
+
+    for i, case in enumerate(series):
+        if context is not None and contexts[i] != context:
+            if active is not None:
+                active["context_changed"] = True
+            if lifted is not None:
+                close_lift(i - 1)
+                lifted["context_changed"] = True
+            active = pending = lifted = recovery = None
+            healthy = []
+        context = contexts[i]
+        value = clean_value(case)
+        if value is None:
+            pending = recovery = None
+            continue
+        if active is not None:
+            update(active, i, value)
+            ratio = value / active["baseline"]
+            if ratio >= 1 - EPISODE_RECOVERY:
+                if recovery is not None and recovery[0] == i - 1:
+                    first, first_value = recovery
+                    active.update(recovered=first, end=first)
+                    if min(value, first_value) / active["baseline"] >= 1 + EVENT_THRESHOLD:
+                        lifted = begin("lift", first, active["baseline"], active["base"], first_value, i)
+                        update(lifted, i, value)
+                        records.append(lifted)
+                        healthy = [(first, first_value), (i, value)]
+                    else:
+                        healthy = [(active["base"], active["baseline"])] * 3
+                        if value / active["baseline"] >= 1 + EVENT_THRESHOLD:
+                            pending = ("lift", i, active["baseline"], active["base"], value)
+                    active = recovery = None
+                else:
+                    recovery = (i, value)
+            else:
+                recovery = None
+            continue
+        if not healthy:
+            healthy.append((i, value))
+            continue
+        if lifted is not None:
+            update(lifted, i, value)
+        baseline = statistics.median(v for _, v in healthy)
+        if pending is not None:
+            kind, start, old_base, base_index, first_value = pending
+            ratio = value / old_base
+            held = ratio <= 1 - EVENT_THRESHOLD if kind == "regression" else ratio >= 1 + EVENT_THRESHOLD
+            if held:
+                close_lift(start - 1)
+                row = begin(kind, start, old_base, base_index, first_value, i)
+                update(row, i, value)
+                records.append(row)
+                lifted = None
+                if kind == "regression":
+                    active = row
+                else:
+                    lifted = row
+                    healthy = [(start, first_value), (i, value)]
+                pending = None
+                continue
+            pending = None
+        ratio = value / baseline
+        kind = "regression" if ratio <= 1 - EVENT_THRESHOLD else "lift" if ratio >= 1 + EVENT_THRESHOLD else None
+        if kind:
+            pending = (kind, i, baseline, healthy[-1][0], value)
+        else:
+            if len(healthy) < 3:
+                healthy.append((i, value))
+    if pending is not None:
+        kind, start, baseline, base, value = pending
+        records.append(begin(kind, start, baseline, base, value))
+    return records
+
+
+def episodes(nights, catalog):
+    contexts = [
+        json.dumps({k: n.get(k)
+                    for k in ("gpu", "driver", "torch", "runtime", "governed", "timing")}, sort_keys=True)
+        for n in nights
+    ]
+    streams = {}
+    for i, night in enumerate(nights):
+        for op, data in night["ops"].items():
+            for case in data["cases"]:
+                key = (op, case["key"])
+                if key not in streams:
+                    streams[key] = [None] * len(nights)
+                streams[key][i] = case
+    groups = {}
+    for (op, key), series in streams.items():
+        direction = next(c.get("direction", "") for c in series if c is not None)
+        for row in case_episodes(series, contexts):
+            kind, start = row.pop("kind"), row.pop("start")
+            group = groups.setdefault((op, direction, kind, start),
+                                      {"op": op, "direction": direction, "kind": kind, "start": start, "rows": []})
+            group["rows"].append({"case": catalog[op][key], **row})
+    return sorted(groups.values(), key=lambda g: (g["start"], g["op"], g["direction"], g["kind"]))
+
+
 def overview_data(runs):
     platforms = []
     positive = lambda x: isinstance(x, (int, float)) and math.isfinite(x) and x > 0
@@ -511,6 +641,7 @@ def page_data(runs):
     """
     platforms = {}
     for platform, nights in runs.items():
+        nights = sorted(nights, key=lambda n: n["date"])
         latest = nights[-1]
         catalog = {}  # op -> {case key: index}
         ops = {}
@@ -524,6 +655,11 @@ def page_data(runs):
                     if c["key"] not in index:
                         index[c["key"]] = len(entry["cases"])
                         entry["cases"].append([c["params"], c["direction"], c["dtype"]])
+        episode_cases = {op: [None] * len(index) for op, index in catalog.items()}
+        for night in nights:
+            for op, data in night["ops"].items():
+                for c in data["cases"]:
+                    episode_cases[op][catalog[op][c["key"]]] = [c["params"], c["direction"], c["dtype"], c["key"]]
         encoded = []
         for night in nights:
             runs_by_op = {}
@@ -538,9 +674,13 @@ def page_data(runs):
             encoded.append({"date": night["date"], "ops": runs_by_op})
         meta = {k: latest.get(k) for k in PLATFORM_FIELDS}
         latest_ops = {name: ops[name] for name in latest["ops"]}
-        platforms[platform] = {**meta, "ops": latest_ops, "nights": encoded, "events": events(nights)}
+        platforms[platform] = {
+            **meta, "ops": latest_ops, "nights": encoded, "events": events(nights), "episode_cases": episode_cases,
+            "episodes": episodes(nights, catalog)
+        }
     return {
-        "repo": REPO, "tag": TAG, "threshold": EVENT_THRESHOLD, "platforms": platforms, "overview": overview_data(runs)
+        "repo": REPO, "tag": TAG, "threshold": EVENT_THRESHOLD, "platforms": platforms, "overview": overview_data(runs),
+        "episode_policy": {"threshold": EVENT_THRESHOLD, "recovery": EPISODE_RECOVERY, "confirmation": 2}
     }
 
 
