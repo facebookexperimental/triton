@@ -1,0 +1,7 @@
+[attempt] {'ii': 2, 'L': 5, 'stage': 'joint', 'result': 'unsat', 'seconds': 1.7}
+[attempt] {'ii': 2, 'L': 6, 'stage': 'joint', 'result': 'unsat', 'seconds': 6.9}
+[attempt] {'ii': 3, 'L': 5, 'stage': 'joint', 'result': 'unsat', 'seconds': 3.1}
+[attempt] {'ii': 3, 'L': 6, 'stage': 'joint', 'result': 'sat', 'seconds': 4.0}
+[paper_joint_solver] sat after 15.8s -> solutions/fwd_subtiled_v7.json
+[paper_joint_solver] wrote solutions/fwd_subtiled_v7_ir.json
+[paper_joint_solver] wrote solutions/fwd_subtiled_v7_handoff.json

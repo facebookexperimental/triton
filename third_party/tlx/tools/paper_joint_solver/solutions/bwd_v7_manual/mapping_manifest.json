@@ -1,0 +1,4794 @@
+{
+  "authoring_mode": "agent-assisted-manual-cuda",
+  "build_evidence": {
+    "binary": {
+      "path": null,
+      "sha256": null
+    },
+    "command": null,
+    "cuda_arch": "sm_100a",
+    "disassembly": {
+      "path": null,
+      "sha256": null
+    },
+    "reviewer": null,
+    "source_sha256": null,
+    "status": "pending",
+    "toolchain": null
+  },
+  "coverage": {
+    "ir_edge_count": 44,
+    "ir_instance_count": 74,
+    "ir_instance_dependency_count": 88,
+    "ir_node_count": 37,
+    "ir_steady_state_slot_count": 37,
+    "mapped_edge_count": 0,
+    "mapped_instance_count": 0,
+    "mapped_instance_dependency_count": 0,
+    "mapped_node_count": 0,
+    "mapped_steady_state_slot_count": 0
+  },
+  "cuda_source": {
+    "path": "kernel.cu",
+    "sha256": null
+  },
+  "dependencies": [
+    {
+      "completion_witness": null,
+      "consumer_group": 1,
+      "consumer_lanes": [
+        0
+      ],
+      "distance": 0,
+      "dst": 1,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 0,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 1
+          },
+          "edge_index": 0,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 0
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 1
+          },
+          "edge_index": 0,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 0
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 0,
+      "producer_lanes": [
+        0
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 0,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 2,
+      "consumer_lanes": [
+        0
+      ],
+      "distance": 0,
+      "dst": 3,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 1,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 3
+          },
+          "edge_index": 1,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 2
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 3
+          },
+          "edge_index": 1,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 2
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 0,
+      "producer_lanes": [
+        0
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 2,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 3,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "distance": 0,
+      "dst": 5,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 2,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 5
+          },
+          "edge_index": 2,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 4
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 5
+          },
+          "edge_index": 2,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 4
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 2,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 4,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 4,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "distance": 0,
+      "dst": 6,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 3,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 6
+          },
+          "edge_index": 3,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 5
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 6
+          },
+          "edge_index": 3,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 5
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 3,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 5,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 0,
+      "consumer_lanes": [
+        0
+      ],
+      "distance": 0,
+      "dst": 7,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 4,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 7
+          },
+          "edge_index": 4,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 6
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 7
+          },
+          "edge_index": 4,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 6
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 4,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 6,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 2,
+      "consumer_lanes": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "distance": 0,
+      "dst": 8,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 5,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 8
+          },
+          "edge_index": 5,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 5
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 8
+          },
+          "edge_index": 5,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 5
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 3,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 5,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 0,
+      "consumer_lanes": [
+        1
+      ],
+      "distance": 0,
+      "dst": 9,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 6,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 9
+          },
+          "edge_index": 6,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 8
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 9
+          },
+          "edge_index": 6,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 8
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 2,
+      "producer_lanes": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 8,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 2,
+      "consumer_lanes": [
+        5
+      ],
+      "distance": 0,
+      "dst": 10,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 7,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 10
+          },
+          "edge_index": 7,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 1
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 10
+          },
+          "edge_index": 7,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 1
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 1,
+      "producer_lanes": [
+        0
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 1,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 5,
+      "consumer_lanes": [
+        0
+      ],
+      "distance": 0,
+      "dst": 11,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 8,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 11
+          },
+          "edge_index": 8,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 10
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 11
+          },
+          "edge_index": 8,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 10
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 2,
+      "producer_lanes": [
+        5
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 10,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 2,
+      "consumer_lanes": [
+        0,
+        1,
+        4,
+        6
+      ],
+      "distance": 0,
+      "dst": 12,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 9,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 12
+          },
+          "edge_index": 9,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 11
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 12
+          },
+          "edge_index": 9,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 11
+          }
+        }
+      ],
+      "latency": 2,
+      "producer_group": 5,
+      "producer_lanes": [
+        0
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 11,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 3,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "distance": 0,
+      "dst": 13,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 10,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 13
+          },
+          "edge_index": 10,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 12
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 13
+          },
+          "edge_index": 10,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 12
+          }
+        }
+      ],
+      "latency": 1,
+      "producer_group": 2,
+      "producer_lanes": [
+        0,
+        1,
+        4,
+        6
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 12,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 2,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        7
+      ],
+      "distance": 0,
+      "dst": 14,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 11,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 14
+          },
+          "edge_index": 11,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 7
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 14
+          },
+          "edge_index": 11,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 7
+          }
+        }
+      ],
+      "latency": 1,
+      "producer_group": 0,
+      "producer_lanes": [
+        0
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 7,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 4,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "distance": 0,
+      "dst": 15,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 12,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 15
+          },
+          "edge_index": 12,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 14
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 15
+          },
+          "edge_index": 12,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 14
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 2,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        7
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 14,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 4,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "distance": 0,
+      "dst": 16,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 13,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 16
+          },
+          "edge_index": 13,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 13
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 16
+          },
+          "edge_index": 13,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 13
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 3,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 13,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 4,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "distance": 0,
+      "dst": 16,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 14,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 16
+          },
+          "edge_index": 14,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 15
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 16
+          },
+          "edge_index": 14,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 15
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 4,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 15,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 4,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "distance": 0,
+      "dst": 17,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 15,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 17
+          },
+          "edge_index": 15,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 16
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 17
+          },
+          "edge_index": 15,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 16
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 4,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 16,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 4,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "distance": 0,
+      "dst": 18,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 16,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 18
+          },
+          "edge_index": 16,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 17
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 18
+          },
+          "edge_index": 16,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 17
+          }
+        }
+      ],
+      "latency": 1,
+      "producer_group": 4,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 17,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 5,
+      "consumer_lanes": [
+        0
+      ],
+      "distance": 0,
+      "dst": 19,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 17,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 19
+          },
+          "edge_index": 17,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 18
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 19
+          },
+          "edge_index": 17,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 18
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 4,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 18,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 5,
+      "consumer_lanes": [
+        1
+      ],
+      "distance": 0,
+      "dst": 20,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 18,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 20
+          },
+          "edge_index": 18,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 3
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 20
+          },
+          "edge_index": 18,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 3
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 2,
+      "producer_lanes": [
+        0
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 3,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 2,
+      "consumer_lanes": [
+        6
+      ],
+      "distance": 0,
+      "dst": 21,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 19,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 21
+          },
+          "edge_index": 19,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 20
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 21
+          },
+          "edge_index": 19,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 20
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 5,
+      "producer_lanes": [
+        1
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 20,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 5,
+      "consumer_lanes": [
+        2
+      ],
+      "distance": 0,
+      "dst": 22,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 20,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 22
+          },
+          "edge_index": 20,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 19
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 22
+          },
+          "edge_index": 20,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 19
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 5,
+      "producer_lanes": [
+        0
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 19,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 5,
+      "consumer_lanes": [
+        2
+      ],
+      "distance": 0,
+      "dst": 22,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 21,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 22
+          },
+          "edge_index": 21,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 3
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 22
+          },
+          "edge_index": 21,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 3
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 2,
+      "producer_lanes": [
+        0
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 3,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 5,
+      "consumer_lanes": [
+        0,
+        3,
+        4,
+        5
+      ],
+      "distance": 0,
+      "dst": 23,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 22,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 23
+          },
+          "edge_index": 22,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 9
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 23
+          },
+          "edge_index": 22,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 9
+          }
+        }
+      ],
+      "latency": 1,
+      "producer_group": 0,
+      "producer_lanes": [
+        1
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 9,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 5,
+      "consumer_lanes": [
+        1,
+        3,
+        4,
+        6
+      ],
+      "distance": 0,
+      "dst": 24,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 23,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 24
+          },
+          "edge_index": 23,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 23
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 24
+          },
+          "edge_index": 23,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 23
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 5,
+      "producer_lanes": [
+        0,
+        3,
+        4,
+        5
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 23,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 5,
+      "consumer_lanes": [
+        3,
+        4,
+        6,
+        7
+      ],
+      "distance": 0,
+      "dst": 25,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 24,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 25
+          },
+          "edge_index": 24,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 21
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 25
+          },
+          "edge_index": 24,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 21
+          }
+        }
+      ],
+      "latency": 2,
+      "producer_group": 2,
+      "producer_lanes": [
+        6
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 21,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 2,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        7
+      ],
+      "distance": 0,
+      "dst": 26,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 25,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 26
+          },
+          "edge_index": 25,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 25
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 26
+          },
+          "edge_index": 25,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 25
+          }
+        }
+      ],
+      "latency": 1,
+      "producer_group": 5,
+      "producer_lanes": [
+        3,
+        4,
+        6,
+        7
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 25,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 2,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        7
+      ],
+      "distance": 0,
+      "dst": 26,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 26,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 26
+          },
+          "edge_index": 26,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 24
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 26
+          },
+          "edge_index": 26,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 24
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 5,
+      "producer_lanes": [
+        1,
+        3,
+        4,
+        6
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 24,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 4,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "distance": 0,
+      "dst": 27,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 27,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 27
+          },
+          "edge_index": 27,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 17
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 27
+          },
+          "edge_index": 27,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 17
+          }
+        }
+      ],
+      "latency": 1,
+      "producer_group": 4,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 17,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 4,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "distance": 0,
+      "dst": 27,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 28,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 27
+          },
+          "edge_index": 28,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 26
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 27
+          },
+          "edge_index": 28,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 26
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 2,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        7
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 26,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 2,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        7
+      ],
+      "distance": 0,
+      "dst": 28,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 29,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 28
+          },
+          "edge_index": 29,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 27
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 28
+          },
+          "edge_index": 29,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 27
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 4,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 27,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 6,
+      "consumer_lanes": [
+        0
+      ],
+      "distance": 0,
+      "dst": 29,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 30,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 29
+          },
+          "edge_index": 30,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 28
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 29
+          },
+          "edge_index": 30,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 28
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 2,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        7
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 28,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 6,
+      "consumer_lanes": [
+        1
+      ],
+      "distance": 0,
+      "dst": 30,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 31,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 30
+          },
+          "edge_index": 31,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 29
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 30
+          },
+          "edge_index": 31,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 29
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 6,
+      "producer_lanes": [
+        0
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 29,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 2,
+      "consumer_lanes": [
+        5
+      ],
+      "distance": 0,
+      "dst": 31,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 32,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 31
+          },
+          "edge_index": 32,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 30
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 31
+          },
+          "edge_index": 32,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 30
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 6,
+      "producer_lanes": [
+        1
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 30,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 2,
+      "consumer_lanes": [
+        2,
+        3,
+        6,
+        7
+      ],
+      "distance": 0,
+      "dst": 32,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 33,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 32
+          },
+          "edge_index": 33,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 31
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 32
+          },
+          "edge_index": 33,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 31
+          }
+        }
+      ],
+      "latency": 2,
+      "producer_group": 2,
+      "producer_lanes": [
+        5
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 31,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 5,
+      "consumer_lanes": [
+        1,
+        2,
+        3,
+        7
+      ],
+      "distance": 0,
+      "dst": 33,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 34,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 33
+          },
+          "edge_index": 34,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 32
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 33
+          },
+          "edge_index": 34,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 32
+          }
+        }
+      ],
+      "latency": 1,
+      "producer_group": 2,
+      "producer_lanes": [
+        2,
+        3,
+        6,
+        7
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 32,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 3,
+      "consumer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "distance": 0,
+      "dst": 34,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 35,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 34
+          },
+          "edge_index": 35,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 33
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 34
+          },
+          "edge_index": 35,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 33
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 5,
+      "producer_lanes": [
+        1,
+        2,
+        3,
+        7
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 33,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 5,
+      "consumer_lanes": [
+        7
+      ],
+      "distance": 0,
+      "dst": 35,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 36,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 35
+          },
+          "edge_index": 36,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 34
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 35
+          },
+          "edge_index": 36,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 34
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 3,
+      "producer_lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 34,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 6,
+      "consumer_lanes": [
+        2
+      ],
+      "distance": 0,
+      "dst": 36,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 37,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 36
+          },
+          "edge_index": 37,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 29
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 36
+          },
+          "edge_index": 37,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 29
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 6,
+      "producer_lanes": [
+        0
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 29,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 6,
+      "consumer_lanes": [
+        2
+      ],
+      "distance": 0,
+      "dst": 36,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 38,
+      "instance_dependencies": [
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 0,
+            "node": 36
+          },
+          "edge_index": 38,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 1
+          }
+        },
+        {
+          "carried_distance": 0,
+          "consumer": {
+            "copy": 1,
+            "node": 36
+          },
+          "edge_index": 38,
+          "external": false,
+          "producer": {
+            "copy": 1,
+            "node": 1
+          }
+        }
+      ],
+      "latency": 0,
+      "producer_group": 1,
+      "producer_lanes": [
+        0
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 1,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 5,
+      "consumer_lanes": [
+        0
+      ],
+      "distance": 1,
+      "dst": 11,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 39,
+      "instance_dependencies": [
+        {
+          "carried_distance": 1,
+          "consumer": {
+            "copy": 0,
+            "node": 11
+          },
+          "edge_index": 39,
+          "external": true,
+          "producer": {
+            "copy": -1,
+            "node": 12
+          }
+        },
+        {
+          "carried_distance": 1,
+          "consumer": {
+            "copy": 1,
+            "node": 11
+          },
+          "edge_index": 39,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 12
+          }
+        }
+      ],
+      "latency": 1,
+      "producer_group": 2,
+      "producer_lanes": [
+        0,
+        1,
+        4,
+        6
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 12,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 2,
+      "consumer_lanes": [
+        6
+      ],
+      "distance": 1,
+      "dst": 21,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 40,
+      "instance_dependencies": [
+        {
+          "carried_distance": 1,
+          "consumer": {
+            "copy": 0,
+            "node": 21
+          },
+          "edge_index": 40,
+          "external": true,
+          "producer": {
+            "copy": -1,
+            "node": 25
+          }
+        },
+        {
+          "carried_distance": 1,
+          "consumer": {
+            "copy": 1,
+            "node": 21
+          },
+          "edge_index": 40,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 25
+          }
+        }
+      ],
+      "latency": 1,
+      "producer_group": 5,
+      "producer_lanes": [
+        3,
+        4,
+        6,
+        7
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 25,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 5,
+      "consumer_lanes": [
+        2
+      ],
+      "distance": 1,
+      "dst": 22,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 41,
+      "instance_dependencies": [
+        {
+          "carried_distance": 1,
+          "consumer": {
+            "copy": 0,
+            "node": 22
+          },
+          "edge_index": 41,
+          "external": true,
+          "producer": {
+            "copy": -1,
+            "node": 22
+          }
+        },
+        {
+          "carried_distance": 1,
+          "consumer": {
+            "copy": 1,
+            "node": 22
+          },
+          "edge_index": 41,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 22
+          }
+        }
+      ],
+      "latency": 1,
+      "producer_group": 5,
+      "producer_lanes": [
+        2
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 22,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 2,
+      "consumer_lanes": [
+        5
+      ],
+      "distance": 1,
+      "dst": 31,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 42,
+      "instance_dependencies": [
+        {
+          "carried_distance": 1,
+          "consumer": {
+            "copy": 0,
+            "node": 31
+          },
+          "edge_index": 42,
+          "external": true,
+          "producer": {
+            "copy": -1,
+            "node": 32
+          }
+        },
+        {
+          "carried_distance": 1,
+          "consumer": {
+            "copy": 1,
+            "node": 31
+          },
+          "edge_index": 42,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 32
+          }
+        }
+      ],
+      "latency": 1,
+      "producer_group": 2,
+      "producer_lanes": [
+        2,
+        3,
+        6,
+        7
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 32,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    },
+    {
+      "completion_witness": null,
+      "consumer_group": 6,
+      "consumer_lanes": [
+        2
+      ],
+      "distance": 1,
+      "dst": 36,
+      "dynamic_iteration_relation": null,
+      "epilogue_drain": null,
+      "index": 43,
+      "instance_dependencies": [
+        {
+          "carried_distance": 1,
+          "consumer": {
+            "copy": 0,
+            "node": 36
+          },
+          "edge_index": 43,
+          "external": true,
+          "producer": {
+            "copy": -1,
+            "node": 36
+          }
+        },
+        {
+          "carried_distance": 1,
+          "consumer": {
+            "copy": 1,
+            "node": 36
+          },
+          "edge_index": 43,
+          "external": false,
+          "producer": {
+            "copy": 0,
+            "node": 36
+          }
+        }
+      ],
+      "latency": 1,
+      "producer_group": 6,
+      "producer_lanes": [
+        2
+      ],
+      "program_order_proof": null,
+      "prologue_availability": null,
+      "reviewer": null,
+      "spill_cost": 0,
+      "src": 36,
+      "sync_channel": null,
+      "transport": null,
+      "ws_semantics": true
+    }
+  ],
+  "deviations": [],
+  "nodes": [
+    {
+      "cycle": 0,
+      "group": 0,
+      "group_width": 2,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 0,
+          "node": 0,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 6,
+          "node": 0,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 0,
+      "issue_order": 0,
+      "lanes": [
+        0
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 0,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 0,
+      "op_kind": "tt.descriptor_load",
+      "op_ref": "op_1257373504",
+      "pipeline": "TMA",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 6,
+        "iteration_lag": 0,
+        "node": 0
+      }
+    },
+    {
+      "cycle": 0,
+      "group": 1,
+      "group_width": 1,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 0,
+          "node": 1,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 6,
+          "node": 1,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 1,
+      "issue_order": 0,
+      "lanes": [
+        0
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 1,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 0,
+      "op_kind": "ttg.local_alloc",
+      "op_ref": "op_1257785952",
+      "pipeline": "NONE",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 6,
+        "iteration_lag": 0,
+        "node": 1
+      }
+    },
+    {
+      "cycle": 0,
+      "group": 0,
+      "group_width": 2,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 0,
+          "node": 2,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 6,
+          "node": 2,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 2,
+      "issue_order": 1,
+      "lanes": [
+        0
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 0,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 0,
+      "op_kind": "tt.descriptor_load",
+      "op_ref": "op_1257061424",
+      "pipeline": "TMA",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 6,
+        "iteration_lag": 0,
+        "node": 2
+      }
+    },
+    {
+      "cycle": 0,
+      "group": 2,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 0,
+          "node": 3,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 6,
+          "node": 3,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 3,
+      "issue_order": 0,
+      "lanes": [
+        0
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 2,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 0,
+      "op_kind": "ttg.local_alloc",
+      "op_ref": "op_1257786096",
+      "pipeline": "NONE",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 6,
+        "iteration_lag": 0,
+        "node": 3
+      }
+    },
+    {
+      "cycle": 0,
+      "group": 2,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 0,
+          "node": 4,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 6,
+          "node": 4,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 4,
+      "issue_order": 1,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 2,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 0,
+      "op_kind": "tt.splat",
+      "op_ref": "op_1257775824",
+      "pipeline": "NONE",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 6,
+        "iteration_lag": 0,
+        "node": 4
+      }
+    },
+    {
+      "cycle": 1,
+      "group": 3,
+      "group_width": 4,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 1,
+          "node": 5,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 7,
+          "node": 5,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 5,
+      "issue_order": 0,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 3,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 1,
+      "op_kind": "arith.addi",
+      "op_ref": "op_1257803584",
+      "pipeline": "CUDA",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 7,
+        "iteration_lag": 0,
+        "node": 5
+      }
+    },
+    {
+      "cycle": 1,
+      "group": 4,
+      "group_width": 4,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 1,
+          "node": 6,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 7,
+          "node": 6,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 6,
+      "issue_order": 0,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 4,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 1,
+      "op_kind": "tt.addptr",
+      "op_ref": "op_1257801792",
+      "pipeline": "NONE",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 7,
+        "iteration_lag": 0,
+        "node": 6
+      }
+    },
+    {
+      "cycle": 2,
+      "group": 0,
+      "group_width": 2,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 2,
+          "node": 7,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 8,
+          "node": 7,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 7,
+      "issue_order": 2,
+      "lanes": [
+        0
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 0,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 2,
+      "op_kind": "tt.load",
+      "op_ref": "op_1257788816",
+      "pipeline": "TMA",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 8,
+        "iteration_lag": 0,
+        "node": 7
+      }
+    },
+    {
+      "cycle": 2,
+      "group": 2,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 2,
+          "node": 8,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 8,
+          "node": 8,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 8,
+      "issue_order": 4,
+      "lanes": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 2,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 2,
+      "op_kind": "tt.addptr",
+      "op_ref": "op_1257803184",
+      "pipeline": "NONE",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 8,
+        "iteration_lag": 0,
+        "node": 8
+      }
+    },
+    {
+      "cycle": 3,
+      "group": 0,
+      "group_width": 2,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 3,
+          "node": 9,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 9,
+          "node": 9,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 9,
+      "issue_order": 3,
+      "lanes": [
+        1
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 0,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 3,
+      "op_kind": "tt.load",
+      "op_ref": "op_1257792768",
+      "pipeline": "TMA",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 9,
+        "iteration_lag": 0,
+        "node": 9
+      }
+    },
+    {
+      "cycle": 0,
+      "group": 2,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 0,
+          "node": 10,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 6,
+          "node": 10,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 10,
+      "issue_order": 2,
+      "lanes": [
+        5
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 2,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 0,
+      "op_kind": "ttg.memdesc_trans",
+      "op_ref": "op_1257802112",
+      "pipeline": "NONE",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 6,
+        "iteration_lag": 0,
+        "node": 10
+      }
+    },
+    {
+      "cycle": 0,
+      "group": 5,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 0,
+          "node": 11,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 6,
+          "node": 11,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 11,
+      "issue_order": 0,
+      "lanes": [
+        0
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 5,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 0,
+      "op_kind": "ttng.tc_gen5_mma",
+      "op_ref": "op_1257063168",
+      "pipeline": "TC",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 6,
+        "iteration_lag": 0,
+        "node": 11
+      }
+    },
+    {
+      "cycle": 3,
+      "group": 2,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 3,
+          "node": 12,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 9,
+          "node": 12,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 12,
+      "issue_order": 5,
+      "lanes": [
+        0,
+        1,
+        4,
+        6
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 2,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 3,
+      "op_kind": "ttng.tmem_load",
+      "op_ref": "op_1257785328",
+      "pipeline": "TMEM",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 9,
+        "iteration_lag": 0,
+        "node": 12
+      }
+    },
+    {
+      "cycle": 4,
+      "group": 3,
+      "group_width": 4,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 4,
+          "node": 13,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 10,
+          "node": 13,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 13,
+      "issue_order": 1,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 3,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 4,
+      "op_kind": "arith.mulf",
+      "op_ref": "op_1257789488",
+      "pipeline": "CUDA",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 10,
+        "iteration_lag": 0,
+        "node": 13
+      }
+    },
+    {
+      "cycle": 3,
+      "group": 2,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 3,
+          "node": 14,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 9,
+          "node": 14,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 14,
+      "issue_order": 6,
+      "lanes": [
+        0,
+        1,
+        2,
+        7
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 2,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 3,
+      "op_kind": "tt.expand_dims",
+      "op_ref": "op_1257789840",
+      "pipeline": "NONE",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 9,
+        "iteration_lag": 0,
+        "node": 14
+      }
+    },
+    {
+      "cycle": 4,
+      "group": 4,
+      "group_width": 4,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 4,
+          "node": 15,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 10,
+          "node": 15,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 15,
+      "issue_order": 1,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 4,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 4,
+      "op_kind": "tt.broadcast",
+      "op_ref": "op_1257790048",
+      "pipeline": "NONE",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 10,
+        "iteration_lag": 0,
+        "node": 15
+      }
+    },
+    {
+      "cycle": 5,
+      "group": 4,
+      "group_width": 4,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 5,
+          "node": 16,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 11,
+          "node": 16,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 16,
+      "issue_order": 2,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 4,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 5,
+      "op_kind": "arith.subf",
+      "op_ref": "op_1257790256",
+      "pipeline": "CUDA",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 11,
+        "iteration_lag": 0,
+        "node": 16
+      }
+    },
+    {
+      "cycle": 6,
+      "group": 4,
+      "group_width": 4,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 6,
+          "node": 17,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 12,
+          "node": 17,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 17,
+      "issue_order": 3,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 4,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 0,
+      "op_kind": "math.exp2",
+      "op_ref": "op_1257791312",
+      "pipeline": "SFU",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 6,
+        "iteration_lag": 1,
+        "node": 17
+      }
+    },
+    {
+      "cycle": 7,
+      "group": 4,
+      "group_width": 4,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 7,
+          "node": 18,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 13,
+          "node": 18,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 18,
+      "issue_order": 4,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 4,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 1,
+      "op_kind": "arith.truncf",
+      "op_ref": "op_1257786896",
+      "pipeline": "CUDA",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 7,
+        "iteration_lag": 1,
+        "node": 18
+      }
+    },
+    {
+      "cycle": 8,
+      "group": 5,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 8,
+          "node": 19,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 14,
+          "node": 19,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 19,
+      "issue_order": 5,
+      "lanes": [
+        0
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 5,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 2,
+      "op_kind": "ttng.tmem_alloc",
+      "op_ref": "op_1257813712",
+      "pipeline": "NONE",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 8,
+        "iteration_lag": 1,
+        "node": 19
+      }
+    },
+    {
+      "cycle": 1,
+      "group": 5,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 1,
+          "node": 20,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 7,
+          "node": 20,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 20,
+      "issue_order": 1,
+      "lanes": [
+        1
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 5,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 1,
+      "op_kind": "ttg.memdesc_trans",
+      "op_ref": "op_1257813920",
+      "pipeline": "NONE",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 7,
+        "iteration_lag": 0,
+        "node": 20
+      }
+    },
+    {
+      "cycle": 1,
+      "group": 2,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 1,
+          "node": 21,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 7,
+          "node": 21,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 21,
+      "issue_order": 3,
+      "lanes": [
+        6
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 2,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 1,
+      "op_kind": "ttng.tc_gen5_mma",
+      "op_ref": "op_1257069456",
+      "pipeline": "TC",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 7,
+        "iteration_lag": 0,
+        "node": 21
+      }
+    },
+    {
+      "cycle": 9,
+      "group": 5,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 9,
+          "node": 22,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 15,
+          "node": 22,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 22,
+      "issue_order": 6,
+      "lanes": [
+        2
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 5,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 3,
+      "op_kind": "ttng.tc_gen5_mma",
+      "op_ref": "op_1257071248",
+      "pipeline": "TC",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 9,
+        "iteration_lag": 1,
+        "node": 22
+      }
+    },
+    {
+      "cycle": 4,
+      "group": 5,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 4,
+          "node": 23,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 10,
+          "node": 23,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 23,
+      "issue_order": 2,
+      "lanes": [
+        0,
+        3,
+        4,
+        5
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 5,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 4,
+      "op_kind": "tt.expand_dims",
+      "op_ref": "op_1257816880",
+      "pipeline": "NONE",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 10,
+        "iteration_lag": 0,
+        "node": 23
+      }
+    },
+    {
+      "cycle": 5,
+      "group": 5,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 5,
+          "node": 24,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 11,
+          "node": 24,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 24,
+      "issue_order": 3,
+      "lanes": [
+        1,
+        3,
+        4,
+        6
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 5,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 5,
+      "op_kind": "tt.broadcast",
+      "op_ref": "op_1257802688",
+      "pipeline": "NONE",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 11,
+        "iteration_lag": 0,
+        "node": 24
+      }
+    },
+    {
+      "cycle": 5,
+      "group": 5,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 5,
+          "node": 25,
+          "region": "prologue"
+        },
+        {
+          "copy": 1,
+          "cycle": 11,
+          "node": 25,
+          "region": "steady_state"
+        }
+      ],
+      "instruction_id": 25,
+      "issue_order": 4,
+      "lanes": [
+        3,
+        4,
+        6,
+        7
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 5,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 5,
+      "op_kind": "ttng.tmem_load",
+      "op_ref": "op_1257067456",
+      "pipeline": "TMEM",
+      "stage": 0,
+      "steady_state_slot": {
+        "copy": 1,
+        "cycle": 11,
+        "iteration_lag": 0,
+        "node": 25
+      }
+    },
+    {
+      "cycle": 6,
+      "group": 2,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 6,
+          "node": 26,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 12,
+          "node": 26,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 26,
+      "issue_order": 7,
+      "lanes": [
+        0,
+        1,
+        2,
+        7
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 2,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 0,
+      "op_kind": "arith.subf",
+      "op_ref": "op_1257768320",
+      "pipeline": "CUDA",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 6,
+        "iteration_lag": 1,
+        "node": 26
+      }
+    },
+    {
+      "cycle": 7,
+      "group": 4,
+      "group_width": 4,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 7,
+          "node": 27,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 13,
+          "node": 27,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 27,
+      "issue_order": 5,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 4,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 1,
+      "op_kind": "arith.mulf",
+      "op_ref": "op_1257768576",
+      "pipeline": "CUDA",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 7,
+        "iteration_lag": 1,
+        "node": 27
+      }
+    },
+    {
+      "cycle": 7,
+      "group": 2,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 7,
+          "node": 28,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 13,
+          "node": 28,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 28,
+      "issue_order": 8,
+      "lanes": [
+        0,
+        1,
+        2,
+        7
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 2,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 1,
+      "op_kind": "arith.truncf",
+      "op_ref": "op_1257657136",
+      "pipeline": "CUDA",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 7,
+        "iteration_lag": 1,
+        "node": 28
+      }
+    },
+    {
+      "cycle": 8,
+      "group": 6,
+      "group_width": 4,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 8,
+          "node": 29,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 14,
+          "node": 29,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 29,
+      "issue_order": 0,
+      "lanes": [
+        0
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 6,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 2,
+      "op_kind": "ttg.local_alloc",
+      "op_ref": "op_1257768992",
+      "pipeline": "NONE",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 8,
+        "iteration_lag": 1,
+        "node": 29
+      }
+    },
+    {
+      "cycle": 8,
+      "group": 6,
+      "group_width": 4,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 8,
+          "node": 30,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 14,
+          "node": 30,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 30,
+      "issue_order": 1,
+      "lanes": [
+        1
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 6,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 2,
+      "op_kind": "ttg.memdesc_trans",
+      "op_ref": "op_1257769200",
+      "pipeline": "NONE",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 8,
+        "iteration_lag": 1,
+        "node": 30
+      }
+    },
+    {
+      "cycle": 8,
+      "group": 2,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 8,
+          "node": 31,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 14,
+          "node": 31,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 31,
+      "issue_order": 9,
+      "lanes": [
+        5
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 2,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 2,
+      "op_kind": "ttng.tc_gen5_mma",
+      "op_ref": "op_1256955904",
+      "pipeline": "TC",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 8,
+        "iteration_lag": 1,
+        "node": 31
+      }
+    },
+    {
+      "cycle": 10,
+      "group": 2,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 10,
+          "node": 32,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 16,
+          "node": 32,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 32,
+      "issue_order": 10,
+      "lanes": [
+        2,
+        3,
+        6,
+        7
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 2,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 4,
+      "op_kind": "ttng.tmem_load",
+      "op_ref": "op_1257068128",
+      "pipeline": "TMEM",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 10,
+        "iteration_lag": 1,
+        "node": 32
+      }
+    },
+    {
+      "cycle": 11,
+      "group": 5,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 11,
+          "node": 33,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 17,
+          "node": 33,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 33,
+      "issue_order": 7,
+      "lanes": [
+        1,
+        2,
+        3,
+        7
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 5,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 5,
+      "op_kind": "arith.truncf",
+      "op_ref": "op_1257793168",
+      "pipeline": "CUDA",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 11,
+        "iteration_lag": 1,
+        "node": 33
+      }
+    },
+    {
+      "cycle": 11,
+      "group": 3,
+      "group_width": 4,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 11,
+          "node": 34,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 17,
+          "node": 34,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 34,
+      "issue_order": 2,
+      "lanes": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 3,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 5,
+      "op_kind": "ttg.convert_layout",
+      "op_ref": "op_1257823280",
+      "pipeline": "CUDA",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 11,
+        "iteration_lag": 1,
+        "node": 34
+      }
+    },
+    {
+      "cycle": 11,
+      "group": 5,
+      "group_width": 8,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 11,
+          "node": 35,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 17,
+          "node": 35,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 35,
+      "issue_order": 8,
+      "lanes": [
+        7
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 5,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 5,
+      "op_kind": "tt.descriptor_reduce",
+      "op_ref": "op_1257068768",
+      "pipeline": "NONE",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 11,
+        "iteration_lag": 1,
+        "node": 35
+      }
+    },
+    {
+      "cycle": 10,
+      "group": 6,
+      "group_width": 4,
+      "instances": [
+        {
+          "copy": 0,
+          "cycle": 10,
+          "node": 36,
+          "region": "steady_state"
+        },
+        {
+          "copy": 1,
+          "cycle": 16,
+          "node": 36,
+          "region": "epilogue"
+        }
+      ],
+      "instruction_id": 36,
+      "issue_order": 2,
+      "lanes": [
+        2
+      ],
+      "manual_cuda": {
+        "disassembly_anchor": null,
+        "disassembly_status": "pending",
+        "equivalence_proof": null,
+        "iteration_expression": null,
+        "lane_predicate": null,
+        "machine_realization": null,
+        "operand_allocations": [],
+        "physical_group": 6,
+        "physical_warps": null,
+        "predicate": null,
+        "primitive": null,
+        "region_realization": null,
+        "result_allocations": [],
+        "reviewer": null,
+        "semantic_completion": null,
+        "semantic_lowering": null,
+        "source_anchor": null,
+        "source_status": "pending",
+        "stage_slot_expression": null,
+        "sync_channels": []
+      },
+      "offset": 4,
+      "op_kind": "ttng.tc_gen5_mma",
+      "op_ref": "op_1256951024",
+      "pipeline": "TC",
+      "stage": 1,
+      "steady_state_slot": {
+        "copy": 0,
+        "cycle": 10,
+        "iteration_lag": 1,
+        "node": 36
+      }
+    }
+  ],
+  "physical_groups": [
+    {
+      "dispatch_anchor": null,
+      "entry_predicate": null,
+      "group": 0,
+      "physical_warps": null,
+      "regions": null,
+      "reviewer": null,
+      "thread_mapping": null,
+      "width": 2
+    },
+    {
+      "dispatch_anchor": null,
+      "entry_predicate": null,
+      "group": 1,
+      "physical_warps": null,
+      "regions": null,
+      "reviewer": null,
+      "thread_mapping": null,
+      "width": 1
+    },
+    {
+      "dispatch_anchor": null,
+      "entry_predicate": null,
+      "group": 2,
+      "physical_warps": null,
+      "regions": null,
+      "reviewer": null,
+      "thread_mapping": null,
+      "width": 8
+    },
+    {
+      "dispatch_anchor": null,
+      "entry_predicate": null,
+      "group": 3,
+      "physical_warps": null,
+      "regions": null,
+      "reviewer": null,
+      "thread_mapping": null,
+      "width": 4
+    },
+    {
+      "dispatch_anchor": null,
+      "entry_predicate": null,
+      "group": 4,
+      "physical_warps": null,
+      "regions": null,
+      "reviewer": null,
+      "thread_mapping": null,
+      "width": 4
+    },
+    {
+      "dispatch_anchor": null,
+      "entry_predicate": null,
+      "group": 5,
+      "physical_warps": null,
+      "regions": null,
+      "reviewer": null,
+      "thread_mapping": null,
+      "width": 8
+    },
+    {
+      "dispatch_anchor": null,
+      "entry_predicate": null,
+      "group": 6,
+      "physical_warps": null,
+      "regions": null,
+      "reviewer": null,
+      "thread_mapping": null,
+      "width": 4
+    }
+  ],
+  "pipelined_ir": {
+    "schema_version": "twill-pipelined-warp-ir-v2",
+    "sha256": "75dc1d84370d385293cc90024767c7fe19f2fd848814b68a92ea7e80586aeab7"
+  },
+  "regions": [
+    {
+      "cycle_begin": 0,
+      "cycle_end": 6,
+      "kind": "prologue",
+      "realization": null,
+      "reviewer": null,
+      "source_anchor": null
+    },
+    {
+      "cycle_begin": 6,
+      "cycle_end": 12,
+      "kind": "steady_state",
+      "realization": null,
+      "reviewer": null,
+      "source_anchor": null
+    },
+    {
+      "cycle_begin": 12,
+      "cycle_end": 18,
+      "kind": "epilogue",
+      "realization": null,
+      "reviewer": null,
+      "source_anchor": null
+    }
+  ],
+  "review": {
+    "reviewer": null,
+    "status": "pending"
+  },
+  "schema_version": "twill-manual-cuda-mapping-v1",
+  "status": "manual_completion_required",
+  "target": {
+    "cuda_arch": "sm_100a",
+    "gpu": "B200"
+  }
+}

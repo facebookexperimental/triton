@@ -1,0 +1,2 @@
+[modulo-schedule] Dumped schedule graph (v0.1) to /projects/kzhou6/hwu27/triton-beta-3-paper-solver-wt/third_party/tlx/tools/sched2tlx/examples/case3_FA_fp16_subtiled/schedule_graph.json (1 loop(s))
+[modulo-schedule] Dumped DDG (ddg-0.1) to /projects/kzhou6/hwu27/triton-beta-3-paper-solver-wt/third_party/tlx/tools/sched2tlx/examples/case3_FA_fp16_subtiled/ddg.json (1 loop(s))

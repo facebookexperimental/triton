@@ -1,0 +1,8 @@
+[attempt] {'ii': 5, 'L': 10, 'stage': 'joint', 'result': 'unsat', 'seconds': 0.8}
+[attempt] {'ii': 6, 'L': 9, 'stage': 'joint', 'result': 'unsat', 'seconds': 0.8}
+[attempt] {'ii': 6, 'L': 10, 'stage': 'joint', 'result': 'unsat', 'seconds': 1.3}
+[attempt] {'ii': 6, 'L': 11, 'stage': 'joint', 'result': 'unsat', 'seconds': 1.2}
+[attempt] {'ii': 6, 'L': 12, 'stage': 'joint', 'result': 'sat', 'seconds': 3.0}
+[paper_joint_solver] sat after 7.1s -> solutions/bwd_v7.json
+[paper_joint_solver] wrote solutions/bwd_v7_ir.json
+[paper_joint_solver] wrote solutions/bwd_v7_handoff.json

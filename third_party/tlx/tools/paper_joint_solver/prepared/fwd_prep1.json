@@ -1,0 +1,316 @@
+{
+ "schema_version": "prepared-joint-solution-v1",
+ "provenance": {
+  "model": "paper",
+  "ddg_sha256": "20501ee1daaaeda57da0f050b38c502248577c5f362504cad844b804c197d96d",
+  "solver_sources_sha256": "9c996b45262a0ec33fa2af162414801ce24257eb0b09c9bf723acb287e2f95cd",
+  "normalization_u": 150,
+  "machine": {
+   "capacities": {
+    "TC": 1,
+    "TMA": 1,
+    "TMEM": 1,
+    "SFU": 1,
+    "CUDA": 1
+   },
+   "smem_bytes": 232448,
+   "tmem_cols": 512,
+   "smem_fixed_overhead": 0,
+   "tmem_fixed_cols": 0,
+   "num_warpgroups": 32,
+   "num_warps": 32,
+   "warp_fixed_overhead": 0,
+   "group_widths": [
+    1,
+    2,
+    4,
+    8
+   ],
+   "regs_per_sm": 65536,
+   "regs_fixed_overhead": 0,
+   "regs_per_warp": 8160,
+   "tmem_column_bytes": 512,
+   "barrier_pair_bytes": 16,
+   "spill_cost": 30
+  },
+  "curation_source": {
+   "baseline_graph_sha256": "7b4622046616ea6b951e81091d6c78c02e8a5ac101e1d3198add2ab6e1e8755b",
+   "curator_sources_sha256": "2bef320b1288ea32a96348ecd50399b7ce2b56b561e74bfd328f90a8dcc7eac4",
+   "ddg_sha256": "804efdc8b3f8bf7353ce5e0358e82c904c0a0e9888abe1cf46b9281dd26cece2"
+  },
+  "experiment_inputs": {
+   "allow_cross_warp": true,
+   "num_warps_override": null,
+   "reg_budget": null
+  },
+  "preparation": {
+   "regime": "prepared",
+   "prepared_sources_sha256": "6eab67cdaa298b2e036fb33ba5220834ba16e87caeacf2288d0c51f271091439",
+   "curated_ddg_sha256": "20501ee1daaaeda57da0f050b38c502248577c5f362504cad844b804c197d96d",
+   "raw_ddg_sha256": "804efdc8b3f8bf7353ce5e0358e82c904c0a0e9888abe1cf46b9281dd26cece2",
+   "assumptions": {
+    "a1_pool_members": "one entry per node, non-zero edge latencies, non-zero spills",
+    "a2_issue_width": 128,
+    "a2_elementwise_dialects": [
+     "arith",
+     "math"
+    ],
+    "a3_async_tokens_keep_measured_cost": true,
+    "a4_tmem_functional_unit": "TMEM",
+    "b1_cluster_tolerance": [
+     11,
+     10
+    ],
+    "b2_floor_divisor": 32,
+    "b3_zlp": "paper_joint_solver.normalize.normalize_costs",
+    "b4_second_objective": "maximize sum(C') at F = F*",
+    "b5_u": 150
+   },
+   "health": {
+    "pool_size": 75,
+    "positive_entries": 66,
+    "collapsed_entries": 59,
+    "collapse_ratio": 0.8939,
+    "survivor_spread": 1.0,
+    "distinct_survivors": [
+     1
+    ],
+    "objective_f": 320,
+    "first_stage_sum": 7,
+    "second_stage_sum": 7,
+    "u": 150,
+    "clusters": 13
+   },
+   "b5_u_applied": 150
+  }
+ },
+ "attempts": [
+  {
+   "ii": 1,
+   "stage": "modulo",
+   "result": "unsat"
+  },
+  {
+   "ii": 2,
+   "L": 4,
+   "stage": "joint",
+   "result": "unsat",
+   "seconds": 0.1
+  },
+  {
+   "ii": 3,
+   "L": 4,
+   "stage": "joint",
+   "result": "sat",
+   "seconds": 0.1
+  }
+ ],
+ "wall_s": 0.3,
+ "status": "sat",
+ "satisfiable": true,
+ "ii": 3,
+ "length": 4,
+ "copies": 2,
+ "horizon": 7,
+ "cycles": {
+  "2": 0,
+  "3": 2,
+  "4": 2,
+  "5": 0,
+  "6": 0,
+  "7": 0,
+  "8": 1,
+  "9": 1,
+  "10": 1,
+  "11": 1,
+  "12": 1,
+  "13": 1,
+  "14": 1,
+  "15": 1,
+  "16": 1,
+  "17": 1,
+  "18": 1,
+  "19": 2,
+  "20": 2,
+  "21": 2,
+  "22": 1,
+  "23": 1,
+  "24": 1,
+  "25": 1,
+  "26": 2,
+  "27": 3,
+  "28": 3,
+  "29": 1,
+  "30": 3
+ },
+ "warp_sets": {
+  "2": [
+   0
+  ],
+  "3": [
+   0
+  ],
+  "4": [
+   31
+  ],
+  "5": [
+   31
+  ],
+  "6": [
+   31
+  ],
+  "7": [
+   31
+  ],
+  "8": [
+   4,
+   17,
+   22,
+   29
+  ],
+  "9": [
+   3,
+   10,
+   30,
+   31
+  ],
+  "10": [
+   4,
+   8,
+   16,
+   30
+  ],
+  "11": [
+   12,
+   15,
+   24,
+   27
+  ],
+  "12": [
+   6,
+   17,
+   30,
+   31
+  ],
+  "13": [
+   20,
+   28,
+   30,
+   31
+  ],
+  "14": [
+   1,
+   11,
+   26,
+   28
+  ],
+  "15": [
+   23,
+   27,
+   28,
+   30
+  ],
+  "16": [
+   7,
+   10,
+   17,
+   20
+  ],
+  "17": [
+   19,
+   25,
+   30,
+   31
+  ],
+  "18": [
+   2,
+   3,
+   5,
+   13
+  ],
+  "19": [
+   8,
+   17,
+   29,
+   30
+  ],
+  "20": [
+   8,
+   17,
+   19,
+   20
+  ],
+  "21": [
+   31
+  ],
+  "22": [
+   28,
+   29,
+   30,
+   31
+  ],
+  "23": [
+   4,
+   28,
+   30,
+   31
+  ],
+  "24": [
+   24,
+   26,
+   30,
+   31
+  ],
+  "25": [
+   2,
+   5,
+   11,
+   12
+  ],
+  "26": [
+   24,
+   25,
+   26,
+   27
+  ],
+  "27": [
+   28,
+   29,
+   30,
+   31
+  ],
+  "28": [
+   31
+  ],
+  "29": [
+   1,
+   4,
+   11,
+   18
+  ],
+  "30": [
+   28,
+   29,
+   30,
+   31
+  ]
+ },
+ "stats": {
+  "normalization_u": 150,
+  "normalization_f": 320,
+  "profile": "paper",
+  "num_asserts": 462,
+  "T": 7,
+  "num_warp_sets": 21,
+  "warps_used": 29,
+  "num_warps": 29,
+  "physical_warp_budget": 32,
+  "regs_per_warp": 8160,
+  "smem_capacity": 232448,
+  "tmem_capacity": 512,
+  "tmem_value_count": 3,
+  "peak_tmem_cols": 320,
+  "time_variables": 29,
+  "live_variables": 0
+ }
+}

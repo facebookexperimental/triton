@@ -1,0 +1,50 @@
+[preparation] {"clusters": 16, "collapse_ratio": 0.1607, "collapsed_entries": 18, "distinct_survivors": [1, 2, 3, 4, 7, 10, 14, 22], "first_stage_sum": 16, "objective_f": 348, "pool_size": 129, "positive_entries": 112, "second_stage_sum": 272, "survivor_spread": 22.0, "u": 300}
+[preparation] wrote prepared/fwd_subtiled_prep1.pool.json
+[attempt] {'ii': 1, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 2, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 3, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 4, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 5, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 6, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 7, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 8, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 9, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 10, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 11, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 12, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 13, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 14, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 15, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 16, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 17, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 18, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 19, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 20, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 21, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 22, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 23, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 24, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 25, 'L': 55, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.1}
+[attempt] {'ii': 25, 'L': 56, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.2}
+[attempt] {'ii': 25, 'L': 57, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.3}
+[attempt] {'ii': 25, 'L': 58, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.3}
+[attempt] {'ii': 25, 'L': 59, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.4}
+[attempt] {'ii': 25, 'L': 60, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.4}
+[attempt] {'ii': 25, 'L': 61, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.4}
+[attempt] {'ii': 25, 'L': 62, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.5}
+[attempt] {'ii': 25, 'L': 63, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.5}
+[attempt] {'ii': 25, 'L': 64, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.5}
+[attempt] {'ii': 25, 'L': 65, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.5}
+[attempt] {'ii': 25, 'L': 66, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.6}
+[attempt] {'ii': 25, 'L': 67, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.6}
+[attempt] {'ii': 25, 'L': 68, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.7}
+[attempt] {'ii': 25, 'L': 69, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.7}
+[attempt] {'ii': 25, 'L': 70, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.8}
+[attempt] {'ii': 25, 'L': 71, 'stage': 'joint', 'result': 'unsat', 'seconds': 3.0}
+[attempt] {'ii': 25, 'L': 72, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.9}
+[attempt] {'ii': 25, 'L': 73, 'stage': 'joint', 'result': 'unsat', 'seconds': 3.0}
+[attempt] {'ii': 25, 'L': 74, 'stage': 'joint', 'result': 'unsat', 'seconds': 3.0}
+[attempt] {'ii': 25, 'L': 75, 'stage': 'joint', 'result': 'unsat', 'seconds': 3.0}
+[attempt] {'ii': 26, 'L': 52, 'stage': 'joint', 'result': 'sat', 'seconds': 4.3}
+[prepared] sat after 116.9s -> prepared/fwd_subtiled_prep1.json
+[prepared] wrote prepared/fwd_subtiled_prep1.strategy.json
