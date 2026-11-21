@@ -1682,7 +1682,8 @@ def addmm(input, a, b, *, out=None, space="heuristic"):
     currently forward-only.
 
     TMA-capable inputs run on the warp-specialized kernel, except small
-    outputs, which run faster on the direct-load kernel. Anything else
+    outputs, which run faster on the direct-load kernel, and ``K == 0``
+    reductions, which the WS kernel cannot serve. Anything else
     (misaligned bases, exotic strides, K/N not multiples of 16, or
     broadcastable-but-neither-``(N,)``-nor-``(M, N)`` biases) also falls
     back to the direct-load kernel.
@@ -1707,7 +1708,12 @@ def addmm(input, a, b, *, out=None, space="heuristic"):
         return _launch_direct(input, a, b, c, M, N, K, stride_ym, stride_yn, space)
 
     tma_eligible = _tma_eligible(a, b, bias_2d, c, N, K)
-    if tma_eligible and K != 0 and K <= _TMA_SMALL_MAX_K and M * N < _TMA_SMALL_MAX:
+    if K == 0:
+        # Empty reduction: the WS kernel's K-loop runs zero iterations and
+        # never commits tmem_full, deadlocking the epilogue. The
+        # zero-initialized direct kernel yields just the broadcast bias.
+        return _launch_direct(input, a, b, c, M, N, K, stride_ym, stride_yn, space)
+    if tma_eligible and K <= _TMA_SMALL_MAX_K and M * N < _TMA_SMALL_MAX:
         return _launch_direct(input, a, b, c, M, N, K, stride_ym, stride_yn, space)
     if tma_eligible:
         return _launch_ws(bias_2d, a, b, c, M, N, K, broadcast_y, space)
