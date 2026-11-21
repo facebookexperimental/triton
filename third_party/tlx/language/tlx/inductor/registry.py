@@ -77,6 +77,8 @@ from .mm_templates import (
     hopper_gemm_ws_template,
     gfx942_addmm_template,
     gfx942_mm_template,
+    gfx1250_addmm_tdm_template,
+    gfx1250_mm_tdm_template,
     gfx950_addmm_interwave_template,
     gfx950_addmm_persistent_warppipe_template,
     gfx950_addmm_warppipe_template,
@@ -1678,6 +1680,105 @@ class Gfx942MMTemplateConfigHeuristic(_Gfx942MMTemplateConfigHeuristic):
 class Gfx942AddMMTemplateConfigHeuristic(AddMMConfigMixin, _Gfx942MMTemplateConfigHeuristic):
     """MI300X TorchTLX AddMM using the gfx942 tlx.ops shape heuristic."""
 
+
+
+#: gfx1250 TDM tiles, tuned on one MI450X DPX partition against stock Triton at
+#: af_oba GEMM shapes: (BLOCK_M, BLOCK_N, BLOCK_K, num_warps). Each tile is also
+#: offered with and without WMMA queuing and with both column-major-B LDS paddings.
+_GFX1250_TDM_TILES = ((128, 256, 64, 8), (256, 128, 64, 8), (256, 256, 64, 8), (128, 128, 128, 4))
+_GFX1250_TDM_GROUP_M = 4
+_GFX1250_TDM_NUM_BUFFERS = 2
+_GFX1250_LDS_BYTES = 327680
+
+
+def _gfx1250_tdm_device(device) -> bool:
+    # Not torch's _gfx1250_device_prereqs: it requires ROCm >= 7.14 from
+    # torch.version, but MI450X TheRock builds report the ROCm 7.0 headers torch
+    # was compiled against even though the runtime supports TDM.
+    from torch._inductor.utils import is_gfx1250_arch
+    from torch.utils._triton import has_triton_amd_tdm_device
+
+    if device is None or device.type != "cuda":
+        return False
+    arch = torch.cuda.get_device_properties(device).gcnArchName
+    return is_gfx1250_arch(arch) and has_triton_amd_tdm_device(arch)
+
+
+class _Gfx1250MMTDMTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """MI450X TDM GEMM: row-major A, row- or column-major B, fp16/bf16."""
+
+    def should_run(self, inputs: KernelInputs) -> bool:
+        if config.triton.tlx_mode in ("allow", "force"):
+            return current_target().is_gfx1250
+        return super().should_run(inputs)
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        from torch._inductor.utils import (
+            _tdm_operands_compatible,
+            commit_tdm_operand_layout,
+            TDMGuardMode,
+            tdm_descriptor_row_major,
+        )
+        from torch.utils._ordered_set import OrderedSet
+
+        if not isinstance(kernel_inputs, MMKernelInputs) or not current_target().is_gfx1250:
+            return
+        mat1, mat2 = kernel_inputs.mat1mat2()
+        dtype = mat1.get_dtype()
+        if dtype not in (torch.float16, torch.bfloat16) or mat2.get_dtype() != dtype:
+            return
+        if not _gfx1250_tdm_device(mat1.get_device()):
+            return
+        if not _tdm_operands_compatible([mat1, mat2], OrderedSet([dtype]), TDMGuardMode.BOUNDS):
+            return
+        b_row = tdm_descriptor_row_major(mat2)
+        if tdm_descriptor_row_major(mat1) is not True or b_row is None:
+            return
+        m, n, k = kernel_inputs.mnk_symbolic()
+        if not all(isinstance(v, (int, sympy.Integer)) for v in (n, k)):
+            return
+        k = int(k)
+        itemsize = dtype.itemsize
+        nb = _GFX1250_TDM_NUM_BUFFERS
+        # B_PAD (column-major B only): 1 = [128:+8], 2 = [BLOCK_K:+8] LDS padding.
+        b_pads = (0, ) if b_row else (1, 2)
+        configs = []
+        for bm, bn, bk, num_warps in _GFX1250_TDM_TILES:
+            if k < nb * bk or (bm + bn) * bk * itemsize * nb > _GFX1250_LDS_BYTES:
+                continue
+            for wmma_queuing in (False, True):
+                for b_pad in b_pads:
+                    configs.append(
+                        self.triton_config(
+                            1, num_warps, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=_GFX1250_TDM_GROUP_M,
+                            B_ROW_MAJOR=b_row, NUM_BUFFERS=nb, B_PAD=b_pad,
+                            **({"enable_wmma_queuing": True} if wmma_queuing else {}),
+                        ))
+        if not configs:
+            return
+        commit_tdm_operand_layout(mat1, mat2)
+        for c in configs:
+            yield self._convert_config_to_template_kwargs(c, m, n, k, kernel_inputs.out_dtype())
+
+
+@register_template_heuristic(
+    gfx1250_mm_tdm_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="mm",
+)
+class Gfx1250MMTDMTemplateConfigHeuristic(_Gfx1250MMTDMTemplateConfigHeuristic):
+    """MI450X TorchTLX MM over TDM descriptor loads."""
+
+
+@register_template_heuristic(
+    gfx1250_addmm_tdm_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="addmm",
+)
+class Gfx1250AddMMTDMTemplateConfigHeuristic(AddMMConfigMixin, _Gfx1250MMTDMTemplateConfigHeuristic):
+    """MI450X TorchTLX AddMM over TDM descriptor loads."""
 
 _GFX950_REGISTER_BLOCK_M = 256
 _GFX950_REGISTER_BLOCK_K = 64
@@ -3313,6 +3414,7 @@ _TLX_AMD_BACKEND_OPTIONS = (
     "sink_insts_to_avoid_spills",
     "regclass_priority_trumps_globalness",
     "disable_unclustered_high_rp_reschedule",
+    "enable_wmma_queuing",
 )
 
 
