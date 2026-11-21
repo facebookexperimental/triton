@@ -1,4 +1,5 @@
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -869,6 +870,106 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   }
 }
 
+// The barrier array a wait_barrier in `forOp` cycles through, and the number
+// of slots in it: the array the loop indexes with a loop-varying slot. A
+// barrier the loop does not index with a loop-varying value (a single
+// barrier, or a constant index into an array of per-partition barriers) is a
+// ring of one slot.
+static std::pair<Value, int64_t> getWaitedRing(ttng::WaitBarrierOp wait,
+                                               scf::ForOp forOp) {
+  Value alloc = wait.getAlloc();
+  while (auto index = alloc.getDefiningOp<ttg::MemDescIndexOp>()) {
+    Value slot = index.getIndex();
+    if (!matchPattern(slot, m_Constant()) &&
+        forOp.getRegion().isAncestor(slot.getParentRegion()))
+      return {
+          index.getSrc(),
+          cast<ttg::MemDescType>(index.getSrc().getType()).getShape().front()};
+    alloc = index.getSrc();
+  }
+  return {wait.getAlloc(), 1};
+}
+
+// A loop partitioned out of a warp-specialized loop keeps the stages its ops
+// had in the original loop, and pipelining it skews them: in one iteration of
+// the pipelined loop, a load at stage `sL` fetches data for the tile `sL - sW`
+// iterations older than the one a wait at stage `sW` is for. The wait for
+// tile t needs a slot last used R iterations earlier, where R is the reuse
+// distance of its ring: the number of slots divided by the number of slots
+// the loop takes from that ring per iteration. Another partition releases the
+// slot, and that release can need the data of tile `t - R` from the late load.
+// If `sL - sW > R`, the load has not been issued when the wait blocks,
+// wherever it sits in the loop body, and the partitions can deadlock.
+// `sL - sW == R` can only deadlock if the load also comes after the wait in
+// the body. That case is left alone: FA backward pipelines exactly that shape
+// (a load one stage after a wait on a single-slot ring, placed after it) and
+// does not deadlock, because its release does not depend on that load.
+//
+// This happens when the K loop of a persistent GEMM folds away
+// (K <= BLOCK_K): the tile loop becomes innermost and is pipelined, so the
+// producer partition holds the operand loads at stage 0 and the epilogue loads
+// (e.g. bias) at the last stage, while the memory planner gives the operand
+// rings fewer slots than that skew. The operand load for tile t then waits on
+// the MMA for tile t - R, which waits on the accumulator freed by the epilogue
+// of tile t - R - 1, which waits on a bias load that the skewed loop issues
+// only in a later iteration.
+//
+// Only late loads are checked. This restriction is empirical, not a proof:
+// late non-load ops (MMAs, stores) at the same kind of skew can deadlock in
+// principle, e.g. a late MMA whose completion releases a slot the producer
+// waits on. They are not checked because the check measurably over-fires on
+// them and no hang has been observed: FA backward, the HSTU forward and a
+// persistent addmm with the bias folded into the accumulator pipeline late
+// MMAs/stores over single-slot rings, and flattening those partitions costs
+// 10-40%. The check is also local to one partition: it is conservative when
+// the release depends on the load through a longer chain (as above, through
+// the accumulator), and it does not see skews that are each within bounds in
+// several partitions but add up along a chain between them.
+//
+// TODO: replace this with a dependency-aware check that follows each slot's
+// release through the other partitions. That would cover the cases skipped
+// here (equal skew with the load after the wait, late non-load releasers, and
+// skews summed across partitions) and drop the conservative firing.
+static bool isPartitionStageSkewDeadlockFree(scf::ForOp forOp,
+                                             const CoarseSchedule &schedule,
+                                             ArrayRef<Operation *> latencyOps) {
+  SmallVector<Operation *> loads;
+  SmallVector<ttng::WaitBarrierOp> waits;
+  for (Operation *op : latencyOps) {
+    if (!schedule.contains(op))
+      continue;
+    if (isa<LoadOp, DescriptorLoadLikeOpInterface, AsyncCopyGlobalToLocalOp,
+            ttng::AsyncTMACopyGlobalToLocalOp>(op))
+      loads.push_back(op);
+    else if (auto wait = dyn_cast<ttng::WaitBarrierOp>(op))
+      waits.push_back(wait);
+  }
+  if (loads.empty())
+    return true;
+
+  // Slots taken from each ring per iteration: the distinct slots waited on.
+  DenseMap<Value, DenseSet<Value>> slotsPerRing;
+  for (auto wait : waits)
+    slotsPerRing[getWaitedRing(wait, forOp).first].insert(wait.getAlloc());
+
+  for (auto wait : waits) {
+    auto [ring, numSlots] = getWaitedRing(wait, forOp);
+    int64_t reuse = std::max<int64_t>(
+        1, numSlots / static_cast<int64_t>(slotsPerRing[ring].size()));
+    int waitStage = schedule.find(wait)->second.first;
+    for (Operation *load : loads) {
+      int skew = schedule.find(load)->second.first - waitStage;
+      if (skew > reuse) {
+        LDBG("partition load stage skew " << skew << " vs ring reuse distance "
+                                          << reuse << " at " << *wait
+                                          << "; not pipelining partition");
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 // Get an initial schedule for the loop. This is the base schedule from which
 // the rest of the pass will backward propagate dependencies.
 CoarseSchedule getInitialSchedule(scf::ForOp forOp,
@@ -904,15 +1005,19 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
     // don't need to pipeline the loop. Return a new schedule with everything
     // assigned to the same stage.
     DenseSet<int> latencyStages;
+    SmallVector<Operation *> latencyOps;
     auto ops = forOp.getBody()->without_terminator();
     for (Operation &op : llvm::make_filter_range(ops, isLatencyOp)) {
+      latencyOps.push_back(&op);
       // FIXME: This should assert all latency ops have an assigned stage.
       if (schedule.contains(&op))
         latencyStages.insert(schedule[&op].first);
       else if (useMetaWS)
         assert(false);
     }
-    if (latencyStages.size() <= 1) {
+    if (latencyStages.size() <= 1 ||
+        (useMetaWS &&
+         !isPartitionStageSkewDeadlockFree(forOp, schedule, latencyOps))) {
       CoarseSchedule normalized(/*numStages=*/1);
       auto cluster = normalized.clusters.newAtFront();
       for (Operation &op : ops)
