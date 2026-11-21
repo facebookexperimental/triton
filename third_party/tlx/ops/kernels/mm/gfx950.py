@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.runtime.driver import driver
+from triton.runtime.jit import constexpr_function
 
 from ..._catalog import InvalidInput
 from ..._invariance import gemm_fixed_split_k
@@ -17994,6 +17995,34 @@ def _load_paired_strided_b(b_ptr, rows, cols, k: tl.constexpr, n: tl.constexpr, 
     return tl.where(last, final, value)
 
 
+@constexpr_function
+def _register_a_load_layout(block_m, block_k, num_warps):
+
+    def is_power_of_two(value):
+        return value > 0 and value & (value - 1) == 0
+
+    assert is_power_of_two(block_m)
+    assert block_k % 8 == 0 and is_power_of_two(block_k // 8)
+    assert is_power_of_two(num_warps)
+    strides = (block_k, 1)
+
+    def flatten(coordinates):
+        return sum(coordinate * stride for coordinate, stride in zip(coordinates, strides))
+
+    def bits(value):
+        return [1 << index for index in range(value.bit_length() - 1)]
+
+    rest = [(0, 8 * bit) for bit in bits(block_k // 8)] + [(bit, 0) for bit in bits(block_m)]
+    warp_bits = len(bits(num_warps))
+    rest += [(0, 0)] * max(0, 6 + warp_bits - len(rest))
+    lane = rest[:6]
+    warp = rest[6:6 + warp_bits]
+    register = [(0, 1), (0, 2), (0, 4)] + rest[6 + warp_bits:]
+    threads = tuple(flatten(coordinates) for coordinates in lane + warp)
+    values = tuple(flatten(coordinates) for coordinates in register)
+    return tlx.layout(shape=((2, ) * len(threads), (2, ) * len(values)), stride=(threads, values))
+
+
 @triton.jit
 def _register_matmul_core(
     a_ptr,
@@ -18017,6 +18046,7 @@ def _register_matmul_core(
     CACHE_A_CG: tl.constexpr = False,
     CACHE_B_CG: tl.constexpr = False,
     CACHE_B_TAIL_CG: tl.constexpr = False,
+    A_LOAD_LAYOUT: tl.constexpr = None,
     PACK_B_PAIRS: tl.constexpr = False,
     B_PAIRS_PADDED: tl.constexpr = False,
     USE_I64_A_OFFSETS: tl.constexpr = False,
@@ -18059,13 +18089,24 @@ def _register_matmul_core(
         tail_extent: tl.constexpr = K - full_k_tiles * BLOCK_K
     for k_idx in range(0, full_k_tiles):
         k = k_start + k_idx * BLOCK_K
-        a_ptrs = a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak
+        a_offsets = a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak
         b_ptrs = b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn
-        if MASK_ROWS:
+        if A_LOAD_LAYOUT is not None:
+            load_offsets = tlx.require_layout(a_offsets.to(tl.int32), A_LOAD_LAYOUT, pin=True)
+            if MASK_ROWS:
+                load_mask = tlx.require_layout(tl.broadcast_to(row_mask[:, None], (BLOCK_M, BLOCK_K)), A_LOAD_LAYOUT)
+                a = tlx.buffer_load(a_ptr, load_offsets, mask=load_mask, other=0.0, contiguity=8,
+                                    cache=".cg" if CACHE_A_CG else "")
+            else:
+                a = tlx.buffer_load(a_ptr, load_offsets, contiguity=8, cache=".cg" if CACHE_A_CG else "")
+        elif MASK_ROWS:
+            a_ptrs = a_ptr + a_offsets
             a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0, cache_modifier=".cg" if CACHE_A_CG else "")
         elif CACHE_A_CG:
+            a_ptrs = a_ptr + a_offsets
             a = tl.load(a_ptrs, cache_modifier=".cg")
         else:
+            a_ptrs = a_ptr + a_offsets
             a = tl.load(a_ptrs)
         if PACK_B_PAIRS:
             b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
@@ -18087,11 +18128,19 @@ def _register_matmul_core(
     if tail_extent > 0:
         k = k_start + full_k_tiles * BLOCK_K
         k_mask = offs_k < tail_extent
-        a_ptrs = a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak
+        a_offsets = a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak
         b_ptrs = b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn
-        if MASK_ROWS:
+        if A_LOAD_LAYOUT is not None:
+            a_ptrs = a_ptr + a_offsets
+            load_mask = k_mask[None, :]
+            if MASK_ROWS:
+                load_mask = row_mask[:, None] & load_mask
+            a = tl.load(a_ptrs, mask=load_mask, other=0.0, cache_modifier=".cg" if CACHE_A_CG else "")
+        elif MASK_ROWS:
+            a_ptrs = a_ptr + a_offsets
             a = tl.load(a_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
         else:
+            a_ptrs = a_ptr + a_offsets
             a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
         if PACK_B_PAIRS:
             b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_TAIL_CG, B_PAIRS_PADDED)
