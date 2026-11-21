@@ -1250,8 +1250,9 @@ LogicalResult AsyncRemoteShmemStoreOp::verify() {
 }
 
 // Mixed-radix lowerings address runs through the buffer's pow2 alloc layout, so
-// it must have no padding or partitions. A local_load XORs in a view's origin,
-// which adds only on pow2 subslice extents; an async copy runs from the base.
+// it must have no padding or partitions. A local_load adds a view's origin to
+// its coordinates; its runs stay contiguous on pow2 subslice extents only, and
+// an async copy runs from the base.
 static std::optional<std::string>
 getMixedRadixBufferUnsupportedReason(MemDescType type, bool pow2Views) {
   Attribute enc = type.getEncoding();
