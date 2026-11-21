@@ -9,7 +9,7 @@ import triton.language as tl
 from triton._internal_testing import is_hip_cdna4
 from triton.tlx import ops as tlx_ops
 from triton.tlx.ops import BitwiseInvarianceSpec, InvalidInput, Space, UnsupportedOp
-from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, FOCUS, operand
+from triton.tlx.ops.kernels.mm._shapes import CORRECTNESS_SHAPES, FOCUS, SYNTHETIC, operand
 from triton.tlx.ops.kernels.mm import gfx950 as _gfx950
 
 from mm_test_utils import run_mm_invariance_case
@@ -20,6 +20,9 @@ MAX_SECONDS_PER_CASE = 60
 
 # TODO: Re-enable shapes here when their direct-TLX correctness failures are fixed.
 FAILED_SHAPES = set()
+# PERF: PR CI skips `slow` cases (the full autotune space, and test_mm on other architectures' shapes); pushes and
+# schedules still run them.
+FULL_SPACE = pytest.param("full", marks=pytest.mark.slow)
 
 
 @pytest.mark.parametrize("block_m,block_k,num_warps", [(48, 64, 4), (16, 20, 4), (16, 64, 3)])
@@ -1473,7 +1476,7 @@ def test_mm_range_family_numerics(m, n, k, dtype_name, b_step):
     _assert_range_result(out, expected)
 
 
-@pytest.mark.parametrize("space", ["heuristic", "full"])
+@pytest.mark.parametrize("space", ["heuristic", FULL_SPACE])
 @pytest.mark.parametrize("offset,row_padding", [(0, 0), (1, 0), (0, 1)])
 def test_mm_paired_strided_b_is_batch_invariant(space, offset, row_padding):
     m, n, k = 1536, 640, 768
@@ -1493,7 +1496,7 @@ def test_mm_paired_strided_b_is_batch_invariant(space, offset, row_padding):
         assert torch.equal(actual.view(torch.int16), out[:prefix].view(torch.int16)), (space, prefix)
 
 
-@pytest.mark.parametrize("space", ["heuristic", "full"])
+@pytest.mark.parametrize("space", ["heuristic", FULL_SPACE])
 @pytest.mark.parametrize("offset,padding", [(0, 0), (0, 1), (1, 1), (2, 1)])
 def test_mm_padded_strided_b_storage_and_prefix(space, offset, padding):
     m, n, k = 1536, 640, 768
@@ -1627,7 +1630,7 @@ def test_mm_column_major_cg_compiled_cache_rebinds_inputs():
 
 
 @pytest.mark.parametrize("n,k", [(147585, 2304), (262144, 1664)])
-@pytest.mark.parametrize("space", ["heuristic", "full"])
+@pytest.mark.parametrize("space", ["heuristic", FULL_SPACE])
 def test_mm_streamed_column_major_is_batch_invariant(n, k, space):
     torch.manual_seed(53)
     a = torch.randn((96, k), device="cuda", dtype=torch.bfloat16)
@@ -1662,7 +1665,7 @@ def test_mm_streamed_column_major_offset_inputs(operand, offset):
 
 
 @pytest.mark.parametrize("m,n,k,b_padding", [(9216, 1920, 1792, 8), (10240, 1664, 1536, 0)])
-@pytest.mark.parametrize("space", ["heuristic", "full"])
+@pytest.mark.parametrize("space", ["heuristic", FULL_SPACE])
 def test_mm_column_major_range_is_batch_invariant(m, n, k, b_padding, space):
     torch.manual_seed(47)
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
@@ -1888,7 +1891,7 @@ def test_mm_wave_grid_compiled_cache_rejects_changed_globals(monkeypatch):
         cache.clear()
 
 
-@pytest.mark.parametrize("space", ["heuristic", "full"])
+@pytest.mark.parametrize("space", ["heuristic", FULL_SPACE])
 @pytest.mark.parametrize("n", [240, 256])
 @pytest.mark.parametrize("m,k", [(25601, 1280), (30721, 1536)])
 def test_mm_narrow_direct_range_is_batch_invariant(m, k, n, space):
@@ -1948,7 +1951,12 @@ def test_mm_direct_a_tail_preserves_four_and_eight_wave_loads(warps_n, direct_ch
 
 
 def _cases():
-    return [entry for entry in CORRECTNESS_SHAPES if tuple(entry) not in FAILED_SHAPES]
+    own = {*SYNTHETIC, *FOCUS.shapes("gfx950")}
+    return [
+        entry if entry in own else pytest.param(*entry, marks=pytest.mark.slow)
+        for entry in CORRECTNESS_SHAPES
+        if tuple(entry) not in FAILED_SHAPES
+    ]
 
 
 def _assert_strides(tensor, wanted):
@@ -2577,7 +2585,7 @@ def _bf16_projection_operands(m, n, k, pattern, *, seed, offset=0):
     return a, weight.T
 
 
-@pytest.mark.parametrize("space", ["heuristic", "full"])
+@pytest.mark.parametrize("space", ["heuristic", FULL_SPACE])
 @pytest.mark.parametrize("n,k", [(2304, 8192), (4096, 8192), (8192, 4096)])
 @pytest.mark.parametrize("pattern", ["random", "cancellation"])
 @pytest.mark.parametrize("offset", [0, 1, 2])
@@ -2802,7 +2810,7 @@ def test_mm_regular_wave_grid_odd_mfma_count_numerics(layout):
     assert untouched.isnan().all().item()
 
 
-@pytest.mark.parametrize("space", ["heuristic", "full"])
+@pytest.mark.parametrize("space", ["heuristic", FULL_SPACE])
 @pytest.mark.parametrize("pattern", ["random", "cancellation"])
 @pytest.mark.parametrize("m,n,k,offset,seed,expected_options", [
     (27, 2304, 8192, 1, 97, (32, 16, 512, True, 4, 8, 2, 3, False)),
@@ -2837,7 +2845,7 @@ def test_mm_bf16_projection_numerics_and_launch_options(monkeypatch, space, patt
     assert backing[:, 1::2].isnan().all()
 
 
-@pytest.mark.parametrize("space", ["heuristic", "full"])
+@pytest.mark.parametrize("space", ["heuristic", FULL_SPACE])
 @pytest.mark.parametrize("layout", ["contiguous", "row_pitch", "column_stride", "offset"])
 @pytest.mark.parametrize("pattern", ["random", "cancellation"])
 def test_mm_bf16_qkv_m27_split_register_strided_output(space, layout, pattern):
@@ -3046,7 +3054,7 @@ def test_mm_bf16_projection_m_invariance(monkeypatch, m, n, k, reject_iw):
     run_mm_invariance_case("gfx950", m, n, k, (k, 1), (1, k), "bf16", BitwiseInvarianceSpec.dims("M"))
 
 
-@pytest.mark.parametrize("space_name", ["heuristic", "full"])
+@pytest.mark.parametrize("space_name", ["heuristic", FULL_SPACE])
 def test_mm_bf16_attention_output_m1_invariance(space_name):
     from triton.tlx.ops import Space
 
@@ -3289,7 +3297,7 @@ def test_mm_bf16_qkv_m3840_wave_grid_input_padding(monkeypatch, padded_operand, 
     assert options == [(6, 6, 128, 0, True, "logical", True, 11, 2, 1)]
 
 
-@pytest.mark.parametrize("space", ["heuristic", "full"])
+@pytest.mark.parametrize("space", ["heuristic", FULL_SPACE])
 def test_mm_bf16_qkv_m3840_wave_grid_graph_replay_and_rebinding(monkeypatch, space):
     kernel = _gfx950._wg_kernel_regular_mi16_wave_grid
     warmup = kernel.warmup
@@ -3392,7 +3400,7 @@ def test_mm_bf16_pre_expert_wave_grid_promotion_keeps_invariance(dim):
     run_mm_invariance_case("gfx950", 1920, 4096, 8192, (8192, 1), (1, 8192), "bf16", spec)
 
 
-@pytest.mark.parametrize("space", ["heuristic", "full"])
+@pytest.mark.parametrize("space", ["heuristic", FULL_SPACE])
 @pytest.mark.parametrize("m,n,k,group_m,num_xcds,store_cache", [
     (3840, 4096, 8192, 4, 8, ""),
     (1920, 8192, 4096, 2, 1, ".cs"),
@@ -3421,7 +3429,7 @@ def test_mm_bf16_expert_iw_numerics_and_strided_output(monkeypatch, space, m, n,
     assert backing[:, 1::2].isnan().all()
 
 
-@pytest.mark.parametrize("space", ["heuristic", "full"])
+@pytest.mark.parametrize("space", ["heuristic", FULL_SPACE])
 @pytest.mark.parametrize("m,n,k", [(3840, 4096, 8192), (1920, 8192, 4096), (3840, 8192, 4096)])
 @pytest.mark.parametrize("a_offset,b_offset,padding", [(1, 0, 0), (0, 1, 0), (0, 0, 1)])
 def test_mm_bf16_expert_iw_alignment_and_pitched_storage(space, m, n, k, a_offset, b_offset, padding):
