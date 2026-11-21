@@ -40,15 +40,28 @@ def test_mm_mxfp6_gfx950_rejects_blocked_scales_and_bad_space():
         mm_mxfp6(a, scale, b, scale, space="bogus")
 
 
-def _packed_ones(rows, K, code, device):
-    # Dense-pack `code` (decodes to 1.0) and pad the row to logical width.
-    quads = torch.full((rows, K // 4, 4), code, dtype=torch.int64, device=device)
+def _pack_fp6_dense(codes):
+    rows, K = codes.shape
+    quads = codes.reshape(rows, K // 4, 4).to(torch.int64)
     v0, v1, v2, v3 = (quads[..., i] for i in range(4))
     triples = torch.stack([v0 | ((v1 & 3) << 6), ((v1 >> 2) & 15) | ((v2 & 15) << 4), ((v2 >> 4) & 3) | (v3 << 2)],
                           dim=-1).reshape(rows, -1)
-    packed = torch.zeros((rows, K), dtype=torch.uint8, device=device)
+    packed = torch.zeros((rows, K), dtype=torch.uint8, device=codes.device)
     packed[:, :triples.shape[-1]] = triples.to(torch.uint8)
     return packed
+
+
+def _packed_ones(rows, K, code, device):
+    return _pack_fp6_dense(torch.full((rows, K), code, dtype=torch.uint8, device=device))
+
+
+def _decode_fp6(codes, ebits, bias):
+    mbits = 5 - ebits
+    exponent = (codes >> mbits) & ((1 << ebits) - 1)
+    mantissa = (codes & ((1 << mbits) - 1)).double() / 2**mbits
+    magnitude = torch.where(exponent == 0, mantissa * 2.0**(1 - bias),
+                            (1 + mantissa) * torch.exp2(exponent.double() - bias))
+    return torch.where(codes & 32 != 0, -magnitude, magnitude)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
@@ -66,6 +79,88 @@ def test_mm_mxfp6_gfx950_ones(space):
     out = ops.mm_mxfp6(a, scales_a, b, scales_b, space=space)
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), torch.full((M, N), float(K), device=device))
+
+
+@pytest.mark.parametrize("split_k", [0, 3, 32])
+def test_mm_mxfp6_gfx950_rejects_invalid_split_k(split_k):
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6
+
+    a = torch.zeros((128, 128), dtype=torch.uint8)
+    scales = torch.zeros((128, 4), dtype=torch.float8_e8m0fnu)
+    with pytest.raises(ValueError, match="split_k must"):
+        mm_mxfp6(a, scales, a, scales, split_k=split_k)
+    with pytest.raises(ValueError, match="not exceed"):
+        mm_mxfp6(a, scales, a, scales, split_k=2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("M,N,K,split_k", [
+    (256, 256, 192, 2),
+    (256, 256, 640, 4),
+    (256, 256, 896, 2),
+    (256, 256, 6144, 4),
+    (256, 256, 16128, 8),
+    (128, 256, 640, 4),
+    (256, 128, 896, 2),
+])
+@pytest.mark.parametrize("space", ["heuristic", "full"])
+def test_mm_mxfp6_gfx950_split_k_random(M, N, K, split_k, space):
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6
+
+    if space == "full" and K % 128:
+        pytest.skip("full configs require K=128 tiles")
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    a_codes = torch.randint(0, 64, (M, K), dtype=torch.uint8, device="cuda", generator=generator)
+    b_codes = torch.randint(0, 64, (N, K), dtype=torch.uint8, device="cuda", generator=generator)
+    a, b = _pack_fp6_dense(a_codes), _pack_fp6_dense(b_codes)
+    sa = torch.randint(124, 129, (M, K // 32), dtype=torch.uint8, device="cuda", generator=generator)
+    sb = torch.randint(124, 129, (N, K // 32), dtype=torch.uint8, device="cuda", generator=generator)
+    reference_a = _decode_fp6(a_codes, 2, 1) * torch.exp2(sa.double() - 127).repeat_interleave(32, dim=1)
+    reference_b = _decode_fp6(b_codes, 3, 3) * torch.exp2(sb.double() - 127).repeat_interleave(32, dim=1)
+    reference = reference_a @ reference_b.T
+    out = torch.full((M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+    result = mm_mxfp6(a, sa.view(torch.float8_e8m0fnu), b, sb.view(torch.float8_e8m0fnu), out=out, space=space,
+                      split_k=split_k)
+    assert result is out
+    torch.testing.assert_close(result.double(), reference, atol=1e-1, rtol=1e-2)
+    b.zero_()
+    mm_mxfp6(a, sa.view(torch.float8_e8m0fnu), b, sb.view(torch.float8_e8m0fnu), out=out, space=space, split_k=split_k)
+    assert torch.count_nonzero(out) == 0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+def test_mm_mxfp6_gfx950_split_k_native_mfma():
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import _gemm_mxfp6_native_kernel, _reduce_split_k
+
+    M = N = 128
+    K = 640
+    a = _packed_ones(M, K, 8, "cuda")
+    b = _packed_ones(N, K, 12, "cuda")
+    sa = torch.full((M, K // 32), 127, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+    sb = torch.full((N, K // 32), 127, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+    partials = torch.empty((4, M, N), dtype=torch.float32, device="cuda")
+    kernel = _gemm_mxfp6_native_kernel[(1, 4)](a, b, partials, sa, sb, M, N, K, BLOCK_SIZE_M=128, BLOCK_SIZE_N=128,
+                                               BLOCK_SIZE_K=128, GROUP_SIZE_M=8, SPLIT_K=4, num_warps=4)
+    instructions = [line for line in kernel.asm["amdgcn"].splitlines() if "v_mfma" in line]
+    assert instructions
+    # The transposed MFMA layout places B in cbsz and A in blgp.
+    assert all("v_mfma_scale_f32_" in line and "cbsz:3" in line and "blgp:2" in line for line in instructions)
+    out = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
+    _reduce_split_k[(16, )](partials, out, M * N, 4, 1024)
+    torch.testing.assert_close(out, torch.full_like(out, K), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+def test_mm_mxfp6_gfx950_split_k_large_workspace():
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6
+
+    M, N, K = 32768, 8192, 2048
+    a = _packed_ones(M, K, 8, "cuda")
+    b = _packed_ones(N, K, 12, "cuda")
+    sa = torch.full((M, K // 32), 127, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+    sb = torch.full((N, K // 32), 127, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+    out = mm_mxfp6(a, sa, b, sb, space="heuristic", split_k=16)
+    assert torch.all(out == K).item()
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
