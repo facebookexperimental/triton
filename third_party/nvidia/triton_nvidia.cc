@@ -292,6 +292,8 @@ void init_triton_hopper_passes(py::module_ &m) {
   ADD_PASS_WRAPPER_0("add_sink_broadcast", mlir::createNVGPUSinkBroadcast);
   ADD_PASS_WRAPPER_0("add_tma_store_token_wait_lowering",
                      mlir::createNVGPUTMAStoreTokenWaitLowering);
+  ADD_PASS_WRAPPER_0("add_tma_store_token_wait_annotate_pendings",
+                     mlir::createNVGPUTMAStoreTokenWaitAnnotatePendings);
   ADD_PASS_WRAPPER_0("add_partition_scheduling_meta",
                      mlir::createNVGPUPartitionSchedulingMeta);
   ADD_PASS_WRAPPER_0("add_analyze_2cta_dependencies",

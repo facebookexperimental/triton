@@ -1,6 +1,7 @@
 #include "CodePartitionUtility.h"
 #include "WarpSpecializationPipeline.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -1051,11 +1052,29 @@ countTMAStoresUntilWait(Block *block, Block::iterator from,
   return std::nullopt;
 }
 
+// Branch context that still holds in another iteration of `forOp`: only
+// conditions defined outside the loop keep their value across iterations.
+static ConditionContext getLoopInvariantContext(const ConditionContext &context,
+                                                scf::ForOp forOp) {
+  ConditionContext invariant;
+  for (const ConditionBranch &branch : context)
+    if (forOp.isDefinedOutsideOfLoop(branch.condition))
+      invariant.push_back(branch);
+  return invariant;
+}
+
+// Pendings bound for a token no store produced (ub.poison, e.g. the else
+// value of a guarded prologue store): waiting on it constrains nothing.
+static constexpr int kUnconstrainedPendings = 1 << 20;
+
 static std::optional<int>
 computePendingsFromToken(Value token, ttng::TMAStoreTokenWaitOp waitOp,
                          const ConditionContext &context, unsigned depth = 0) {
   if (depth > 8)
     return std::nullopt;
+
+  if (token.getDefiningOp<ub::PoisonOp>())
+    return kUnconstrainedPendings;
 
   // Direct case: token defined by a TMA store-like op in same block.
   auto directDef = token.getDefiningOp();
@@ -1066,10 +1085,33 @@ computePendingsFromToken(Value token, ttng::TMAStoreTokenWaitOp waitOp,
   }
 
   // If-result case: count after the defining if, excluding the defining if
-  // itself to match direct-token semantics.
+  // itself to match direct-token semantics. A branch that yields a store
+  // defined in it took that branch, so later scf.ifs on the same condition take
+  // it too (a guarded prologue issues each subtile store under the same
+  // condition); a branch that yields poison constrains nothing.
   if (auto ifOp = token.getDefiningOp<scf::IfOp>()) {
-    return countTMAStoresUntilWait(
-        ifOp->getBlock(), std::next(ifOp->getIterator()), waitOp, context);
+    unsigned idx = cast<OpResult>(token).getResultNumber();
+    auto countBranch = [&](Region &region,
+                           bool takeThen) -> std::optional<int> {
+      if (region.empty())
+        return std::nullopt;
+      Block &block = region.front();
+      Value yielded = cast<scf::YieldOp>(block.getTerminator()).getOperand(idx);
+      Operation *def = yielded.getDefiningOp();
+      if (def && isa<ub::PoisonOp>(def))
+        return kUnconstrainedPendings;
+      ConditionContext branchContext = context;
+      if (def && isTMAStoreLikeOp(def) && def->getBlock() == &block)
+        branchContext.push_back({ifOp.getCondition(), takeThen});
+      return countTMAStoresUntilWait(ifOp->getBlock(),
+                                     std::next(ifOp->getIterator()), waitOp,
+                                     branchContext);
+    };
+    std::optional<int> thenCount = countBranch(ifOp.getThenRegion(), true);
+    std::optional<int> elseCount = countBranch(ifOp.getElseRegion(), false);
+    if (!thenCount || !elseCount)
+      return std::nullopt;
+    return std::min(*thenCount, *elseCount);
   }
 
   // Loop result case: the result may come from the loop body yield, or from the
@@ -1107,33 +1149,69 @@ computePendingsFromToken(Value token, ttng::TMAStoreTokenWaitOp waitOp,
     return std::min(loopPath, *initPath);
   }
 
-  // Loop-carried case: token is a block argument of an scf.for body.
+  // Loop-carried case: token is a block argument of an scf.for body. The
+  // token may rotate through several iter_args before reaching the store that
+  // defines it (a staging ring deeper than the stores per iteration), so follow
+  // the yield chain: a chain of H hops means the wait in iteration i guards the
+  // store issued in iteration i - H.
   if (auto blockArg = dyn_cast<BlockArgument>(token)) {
     auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
-    if (!forOp)
-      return std::nullopt;
-
-    unsigned iterArgIdx = blockArg.getArgNumber() - 1;
-    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-    Value yieldedVal = yieldOp.getOperand(iterArgIdx);
-
-    // Trace the yielded value to its defining TMA store-like op.
-    auto defOp = yieldedVal.getDefiningOp();
-    if (!defOp || !isTMAStoreLikeOp(defOp) ||
-        defOp->getBlock() != forOp.getBody())
+    if (!forOp || blockArg.getArgNumber() == 0)
       return std::nullopt;
 
     Block *body = forOp.getBody();
+    auto yieldOp = cast<scf::YieldOp>(body->getTerminator());
+    SmallVector<unsigned> chain;
+    unsigned iterArgIdx = blockArg.getArgNumber() - 1;
+    Operation *defOp = nullptr;
+    while (true) {
+      if (iterArgIdx >= yieldOp.getNumOperands() ||
+          chain.size() > yieldOp.getNumOperands())
+        return std::nullopt;
+      chain.push_back(iterArgIdx);
+      Value yieldedVal = yieldOp.getOperand(iterArgIdx);
+      if (auto arg = dyn_cast<BlockArgument>(yieldedVal)) {
+        if (arg.getOwner() != body || arg.getArgNumber() == 0)
+          return std::nullopt;
+        iterArgIdx = arg.getArgNumber() - 1;
+        continue;
+      }
+      defOp = yieldedVal.getDefiningOp();
+      break;
+    }
+    if (!defOp || !isTMAStoreLikeOp(defOp) || defOp->getBlock() != body)
+      return std::nullopt;
 
-    // Stores after the def until end of loop body (excluding yield).
-    int storesAfterDef = countTMAStoresInRange(std::next(defOp->getIterator()),
-                                               body->end(), context);
+    // Stores from start of loop body until the wait (which may be nested in
+    // a region of the body).
+    std::optional<int> storesBeforeWaitOpt =
+        countTMAStoresUntilWait(body, body->begin(), waitOp, context);
+    if (!storesBeforeWaitOpt)
+      return std::nullopt;
+    int storesBeforeWait = *storesBeforeWaitOpt;
 
-    // Stores from start of loop body until the wait.
-    int storesBeforeWait =
-        countTMAStoresInRange(body->begin(), waitOp->getIterator(), context);
+    // Steady state. Stores issued in earlier iterations are counted with only
+    // the loop-invariant part of the wait's branch context: a condition
+    // computed in the loop body may differ in those iterations.
+    ConditionContext invariantContext = getLoopInvariantContext(context, forOp);
+    int hops = chain.size();
+    int storesPerIter =
+        countTMAStoresInRange(body->begin(), body->end(), invariantContext);
+    int pendings = countTMAStoresInRange(std::next(defOp->getIterator()),
+                                         body->end(), invariantContext) +
+                   (hops - 1) * storesPerIter + storesBeforeWait;
 
-    return storesAfterDef + storesBeforeWait;
+    // The first H iterations wait on tokens that enter through the init
+    // values: iteration j waits on the init value of chain[j]. Each must be
+    // traceable, and the result is the minimum over all paths.
+    for (int j = 0; j < hops; ++j) {
+      std::optional<int> initPath = computePendingsFromToken(
+          forOp.getInitArgs()[chain[j]], waitOp, context, depth + 1);
+      if (!initPath)
+        return std::nullopt;
+      pendings = std::min(pendings, *initPath + j * storesPerIter);
+    }
+    return pendings;
   }
 
   return std::nullopt;
@@ -1146,10 +1224,14 @@ static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
   if (auto planned =
           waitOp->getAttrOfType<IntegerAttr>(ttng::kPlannedPendingCount))
     return planned.getInt();
+  if (auto programOrder =
+          waitOp->getAttrOfType<IntegerAttr>(ttng::kProgramOrderPendingCount))
+    return programOrder.getInt();
 
   ConditionContext context = getConditionContext(waitOp);
-  if (std::optional<int> count =
-          computePendingsFromToken(waitOp.getToken(), waitOp, context))
+  std::optional<int> count =
+      computePendingsFromToken(waitOp.getToken(), waitOp, context);
+  if (count && *count < kUnconstrainedPendings)
     return *count;
 
   // Fallback: unknown pattern, drain all stores.
@@ -1173,6 +1255,33 @@ struct NVGPUTMAStoreTokenWaitLoweringPass
       }
       op.erase();
     }
+  }
+};
+
+// Record the program-order pendings of each token wait while the IR is still
+// in structured (scf) form. The lowering above runs after scf-to-cf, where a
+// loop-carried token is a CFG block argument that computePendingsFromToken
+// cannot trace; it then drains every store (pendings = 0). Waits that carry
+// barriers have no planned count (they need program-order counting), so
+// without this annotation every barrierful wait in a loop is lowered to a full
+// drain.
+#define GEN_PASS_DEF_NVGPUTMASTORETOKENWAITANNOTATEPENDINGS
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+struct NVGPUTMAStoreTokenWaitAnnotatePendingsPass
+    : public impl::NVGPUTMAStoreTokenWaitAnnotatePendingsBase<
+          NVGPUTMAStoreTokenWaitAnnotatePendingsPass> {
+  void runOnOperation() override {
+    getOperation()->walk([&](ttng::TMAStoreTokenWaitOp op) {
+      if (op->hasAttr(ttng::kPlannedPendingCount))
+        return;
+      ConditionContext context = getConditionContext(op);
+      std::optional<int> count =
+          computePendingsFromToken(op.getToken(), op, context);
+      if (count && *count < kUnconstrainedPendings)
+        op->setAttr(ttng::kProgramOrderPendingCount,
+                    Builder(op).getI32IntegerAttr(*count));
+    });
   }
 };
 
