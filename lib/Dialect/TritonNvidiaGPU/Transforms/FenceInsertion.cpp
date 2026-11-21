@@ -75,8 +75,13 @@ public:
         return WalkResult::advance();
 
       OpBuilder builder(dotOp);
+      // A 2-CTA MMA also reads the peer CTA's operand tile through the async
+      // proxy, so the fence has to cover the shared::cluster window, not just
+      // this CTA's shared::cta window (as in ProxyFenceInsertion).
+      auto mmaV5 = dyn_cast<MMAv5OpInterface>(dotOp.getOperation());
+      bool twoCTAs = mmaV5 && mmaV5.getTwoCtas();
       auto fence = FenceAsyncSharedOp::create(builder, dotOp.getLoc(),
-                                              /*bCluster=*/false);
+                                              /*bCluster=*/twoCTAs);
       // If there is all the dependencies are outside of the loop try to hoist
       // the fence.
       while (auto loopOp = fence->getParentOfType<LoopLikeOpInterface>()) {

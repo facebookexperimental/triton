@@ -57,8 +57,34 @@ module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num
     %0 = ttg.local_alloc %arg0 : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem>
     %1 = ttg.local_alloc %arg1 : (tensor<128x64xf16, #blocked2>) -> !ttg.memdesc<128x64xf16, #shared1, #smem>
     %acc_tm = ttng.tmem_alloc %cst : (tensor<128x64xf32, #blocked1>) -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory>
-    // CHECK: ttng.fence_async_shared
+    // CHECK: ttng.fence_async_shared {bCluster = false}
     ttng.tc_gen5_mma %0, %1, %acc_tm, %true, %true : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory>, !ttg.memdesc<128x64xf16, #shared1, #ttg.shared_memory>, !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory>
+    tt.return
+  }
+}
+
+// -----
+
+// A 2-CTA MMA reads the peer CTA's operand tile through the async proxy, so the
+// fence after its generic-proxy writes must cover shared::cluster.
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [8, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 2], order = [0, 1]}>
+#blocked2 = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [16, 2], warpsPerCTA = [1, 8], order = [0, 1]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1, twoCTAs = true>
+module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: matmul_like_fence_mma_v5_two_ctas
+  tt.func public @matmul_like_fence_mma_v5_two_ctas(%arg0: tensor<128x128xf16, #blocked>, %arg1: tensor<128x64xf16, #blocked2>) {
+    %true = arith.constant true
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x64xf32, #blocked1>
+    %0 = ttg.local_alloc %arg0 : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem>
+    %1 = ttg.local_alloc %arg1 : (tensor<128x64xf16, #blocked2>) -> !ttg.memdesc<128x64xf16, #shared1, #smem>
+    %acc_tm = ttng.tmem_alloc %cst : (tensor<128x64xf32, #blocked1>) -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory>
+    // CHECK: ttng.fence_async_shared {bCluster = true}
+    // CHECK-NEXT: ttng.tc_gen5_mma
+    ttng.tc_gen5_mma %0, %1, %acc_tm, %true, %true {two_ctas} : !ttg.memdesc<128x128xf16, #shared, #ttg.shared_memory>, !ttg.memdesc<128x64xf16, #shared1, #ttg.shared_memory>, !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory>
     tt.return
   }
 }
