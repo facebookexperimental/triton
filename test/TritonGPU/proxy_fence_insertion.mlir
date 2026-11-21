@@ -1913,3 +1913,168 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// A 2-CTA kernel (paired tcgen05 MMA, so the module needs cluster-scope
+// fences) whose marked releases guard buffers refilled by non-multicast TMA
+// loads into this CTA's shared memory. The reads, the local release and the
+// refill all stay in one CTA, so the release fence is CTA scope, also when
+// the refill completes on the leader CTA's barrier (two_cta).
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 16, rank = 1}>
+#sharedA = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, twoCTAs = true>
+#smem = #ttg.shared_memory
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttng.two-ctas" = true, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @two_cta_local_refill_release
+  tt.func @two_cta_local_refill_release(%desc: !tt.tensordesc<128xbf16, #shared>, %full: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %empty: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %peer: i32) {
+    %c0 = arith.constant 0 : i32
+    %true = arith.constant true
+    %a = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128x64xbf16, #sharedA, #smem, mutable>
+    %b = ttg.local_alloc {allocation.offset = 16384 : i32} : () -> !ttg.memdesc<64x128xbf16, #sharedA, #smem, mutable>
+    %buf = ttg.local_alloc {allocation.offset = 32768 : i32} : () -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    %buf2 = ttg.local_alloc {allocation.offset = 33024 : i32} : () -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    %acc = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    ttng.tc_gen5_mma %a, %b, %acc, %true, %true, %full[%true] {is_async, two_ctas} : !ttg.memdesc<128x64xbf16, #sharedA, #smem, mutable>, !ttg.memdesc<64x128xbf16, #sharedA, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%c0] %buf, %full, %true : !tt.tensordesc<128xbf16, #shared>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    %leader = ttng.map_to_remote_buffer %full, %peer : !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier, #ttng.shared_cluster_memory, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%c0] %buf2, %leader, %true {two_cta = true} : !tt.tensordesc<128xbf16, #shared>, !ttg.memdesc<1xi64, #barrier, #ttng.shared_cluster_memory, mutable> -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttng.wait_barrier %full, %c0, %true : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %v = ttg.local_load %buf : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+    "test.keep"(%v) : (tensor<128xbf16, #blocked>) -> ()
+    // CHECK: "test.keep"
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = false}
+    // CHECK-NEXT: ttng.arrive_barrier
+    ttng.arrive_barrier %empty, 1 {ttng.fence_generic_reads} : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %w = ttg.local_load %buf2 : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+    "test.keep"(%w) : (tensor<128xbf16, #blocked>) -> ()
+    // CHECK: "test.keep"
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = false}
+    // CHECK-NEXT: ttng.arrive_barrier
+    ttng.arrive_barrier %empty, 1 {ttng.fence_generic_reads} : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    tt.return
+  }
+
+  // A buffer refilled by a multicast TMA load is written by another CTA's
+  // copy, so its release keeps the cluster-scope fence.
+  // CHECK-LABEL: @two_cta_multicast_refill_release
+  tt.func @two_cta_multicast_refill_release(%desc: !tt.tensordesc<128xbf16, #shared>, %full: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %empty: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %mask: i32) {
+    %c0 = arith.constant 0 : i32
+    %true = arith.constant true
+    %buf = ttg.local_alloc {allocation.offset = 49152 : i32} : () -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%c0] %buf, %full, %true, %mask {multicast} : !tt.tensordesc<128xbf16, #shared>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttng.wait_barrier %full, %c0, %true : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %v = ttg.local_load %buf : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+    "test.keep"(%v) : (tensor<128xbf16, #blocked>) -> ()
+    // CHECK: "test.keep"
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = true}
+    // CHECK-NEXT: ttng.arrive_barrier
+    ttng.arrive_barrier %empty, 1 {ttng.fence_generic_reads} : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    tt.return
+  }
+
+  // A release that arrives on a peer CTA's barrier hands the buffer to a
+  // producer in another CTA, so it keeps the cluster-scope fence.
+  // CHECK-LABEL: @two_cta_remote_release
+  tt.func @two_cta_remote_release(%desc: !tt.tensordesc<128xbf16, #shared>, %full: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %empty: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %peer: i32) {
+    %c0 = arith.constant 0 : i32
+    %true = arith.constant true
+    %buf = ttg.local_alloc {allocation.offset = 57344 : i32} : () -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%c0] %buf, %full, %true : !tt.tensordesc<128xbf16, #shared>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttng.wait_barrier %full, %c0, %true : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %v = ttg.local_load %buf : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+    "test.keep"(%v) : (tensor<128xbf16, #blocked>) -> ()
+    %remote = ttng.map_to_remote_buffer %empty, %peer : !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier, #ttng.shared_cluster_memory, mutable>
+    // CHECK: ttng.map_to_remote_buffer
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = true}
+    // CHECK-NEXT: ttng.arrive_barrier
+    ttng.arrive_barrier %remote, 1 {ttng.fence_generic_reads} : !ttg.memdesc<1xi64, #barrier, #ttng.shared_cluster_memory, mutable>
+    tt.return
+  }
+
+  // Reads that no TMA load refills cannot be matched to a producer, so the
+  // release keeps the module scope.
+  // CHECK-LABEL: @two_cta_unmatched_release
+  tt.func @two_cta_unmatched_release(%empty: !ttg.memdesc<1xi64, #barrier, #smem, mutable>) {
+    %buf = ttg.local_alloc {allocation.offset = 40960 : i32} : () -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    %v = ttg.local_load %buf : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+    "test.keep"(%v) : (tensor<128xbf16, #blocked>) -> ()
+    // CHECK: "test.keep"
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = true}
+    // CHECK-NEXT: ttng.arrive_barrier
+    ttng.arrive_barrier %empty, 1 {ttng.fence_generic_reads} : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    tt.return
+  }
+
+  // The pass revisits loop bodies; the CTA fence it placed on the first visit
+  // is reused, not widened or stacked.
+  // CHECK-LABEL: @two_cta_local_refill_release_in_loop
+  tt.func @two_cta_local_refill_release_in_loop(%desc: !tt.tensordesc<128xbf16, #shared>, %full: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %empty: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %n: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %true = arith.constant true
+    %a = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128x64xbf16, #sharedA, #smem, mutable>
+    %b = ttg.local_alloc {allocation.offset = 16384 : i32} : () -> !ttg.memdesc<64x128xbf16, #sharedA, #smem, mutable>
+    %buf = ttg.local_alloc {allocation.offset = 32768 : i32} : () -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    %acc = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    ttng.tc_gen5_mma %a, %b, %acc, %true, %true, %full[%true] {is_async, two_ctas} : !ttg.memdesc<128x64xbf16, #sharedA, #smem, mutable>, !ttg.memdesc<64x128xbf16, #sharedA, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      ttng.async_tma_copy_global_to_local %desc[%c0] %buf, %full, %true : !tt.tensordesc<128xbf16, #shared>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+      ttng.wait_barrier %full, %c0, %true : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+      %v = ttg.local_load %buf : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+      "test.keep"(%v) : (tensor<128xbf16, #blocked>) -> ()
+      // CHECK: "test.keep"
+      // CHECK-NEXT: ttng.fence_async_shared {bCluster = false}
+      // CHECK-NEXT: ttng.arrive_barrier
+      ttng.arrive_barrier %empty, 1 {ttng.fence_generic_reads} : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    }
+    tt.return
+  }
+
+  // One release guards a TMA-refilled buffer and a buffer that the peer CTA
+  // writes with a remote shared-memory copy (async proxy); the remote write
+  // needs cluster scope.
+  // CHECK-LABEL: @two_cta_remote_copy_release
+  tt.func @two_cta_remote_copy_release(%desc: !tt.tensordesc<128xbf16, #shared>, %full: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %empty: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %src: !ttg.memdesc<128xbf16, #shared, #smem, mutable>, %peer: i32) {
+    %c0 = arith.constant 0 : i32
+    %true = arith.constant true
+    %buf = ttg.local_alloc {allocation.offset = 32768 : i32} : () -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    %buf2 = ttg.local_alloc {allocation.offset = 33024 : i32} : () -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%c0] %buf, %full, %true : !tt.tensordesc<128xbf16, #shared>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttg.async_remote_shmem_copy %src, rank %peer, %buf2 barrier %full : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> !ttg.memdesc<128xbf16, #shared, #smem, mutable> barrier_ty !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttng.wait_barrier %full, %c0, %true : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %v = ttg.local_load %buf : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+    %w = ttg.local_load %buf2 : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+    "test.keep"(%v, %w) : (tensor<128xbf16, #blocked>, tensor<128xbf16, #blocked>) -> ()
+    // CHECK: "test.keep"
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = true}
+    // CHECK-NEXT: ttng.arrive_barrier
+    ttng.arrive_barrier %empty, 1 {ttng.fence_generic_reads} : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    tt.return
+  }
+
+  // A release that guards a CTA-local TMA buffer and the CLC response buffer:
+  // clc_try_cancel writes the response through the async proxy and, in a
+  // cluster launch, may write it into every CTA of the cluster, so the release
+  // keeps cluster scope.
+  // CHECK-LABEL: @two_cta_clc_response_release
+  tt.func @two_cta_clc_response_release(%desc: !tt.tensordesc<128xbf16, #shared>, %full: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %empty: !ttg.memdesc<1xi64, #barrier, #smem, mutable>) {
+    %c0 = arith.constant 0 : i32
+    %true = arith.constant true
+    %buf = ttg.local_alloc {allocation.offset = 32768 : i32} : () -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%c0] %buf, %full, %true : !tt.tensordesc<128xbf16, #shared>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<128xbf16, #shared, #smem, mutable>
+    %v = ttg.local_load %buf : !ttg.memdesc<128xbf16, #shared, #smem, mutable> -> tensor<128xbf16, #blocked>
+    %result = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<2xi64, #barrier, #smem, mutable>
+    %bar = ttg.local_alloc {allocation.offset = 16 : i32} : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttng.clc_try_cancel %result, %bar : !ttg.memdesc<2xi64, #barrier, #smem, mutable>, !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    %response = ttng.clc_load_result %result : !ttg.memdesc<2xi64, #barrier, #smem, mutable> -> i128
+    "test.keep"(%v, %response) : (tensor<128xbf16, #blocked>, i128) -> ()
+    // CHECK: "test.keep"
+    // CHECK-NEXT: ttng.fence_async_shared {bCluster = true}
+    // CHECK-NEXT: ttng.arrive_barrier
+    ttng.arrive_barrier %empty, 1 {ttng.fence_generic_reads} : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    tt.return
+  }
+}
