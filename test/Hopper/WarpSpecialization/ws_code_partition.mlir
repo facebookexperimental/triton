@@ -10,8 +10,10 @@
 // autows_addmm_warp_specialization.mlir.
 
 // CHECK-LABEL: @matmul_kernel_one_consumer
-// CHECK: nvws.create_token
-// CHECK: ttg.local_alloc
+// CHECK: nvws.create_token {{.*}}ttg.ws_buffer_ids = array<i32: 0>
+// CHECK: nvws.create_token {{.*}}ttg.ws_buffer_ids = array<i32: 1>
+// CHECK: ttg.local_alloc {{.*}}buffer.id = 0 : i32
+// CHECK: ttg.local_alloc {{.*}}buffer.id = 1 : i32
 // CHECK: ttg.warp_specialize
 // CHECK: default
 // CHECK: scf.for
@@ -146,6 +148,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-LABEL: @_fbgemm_grouped_gemm_fp8_rowwise_ws
 // CHECK-DAG: ttg.local_alloc {{.*}} : () -> !ttg.memdesc<1x64x64xf8E4M3FN, #[[$SHARED]], #smem, mutable>
 // CHECK-DAG: ttg.local_alloc {{.*}} : () -> !ttg.memdesc<1x128x64xf8E4M3FN, #[[$SHARED]], #smem, mutable>
+// CHECK-DAG: ttg.local_alloc {{.*}}ttg.ws_buffer_ids = array<i32: 0>{{.*}}ttg.ws_generated_barrier
 // CHECK: ttg.warp_specialize
 // CHECK: partition0
 // CHECK: ttg.memdesc_trans
