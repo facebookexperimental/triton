@@ -1,6 +1,6 @@
 // Flag ON: NPOT dot-operand / MMA tensors PASS verifyTensorLayout and the
 // module round-trips cleanly (FileCheck the op labels are printed back).
-// RUN: TRITON_ALLOW_NPOT=1 triton-opt --split-input-file %s | FileCheck %s
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt --split-input-file %s | FileCheck %s
 //
 // Flag OFF (default): the same NPOT tensors are REJECTED by verifyTensorLayout
 // with the "not a power of two" diagnostic.

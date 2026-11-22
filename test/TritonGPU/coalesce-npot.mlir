@@ -5,7 +5,7 @@
 // a non-pow2 factor that does not tile the 64-lane warp and is rejected by
 // BlockedEncodingAttr::verify. warpSize is 64 (CDNA).
 //
-// RUN: TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -tritongpu-coalesce | FileCheck %s
+// RUN: env TRITON_ALLOW_NPOT=1 triton-opt %s -split-input-file -tritongpu-coalesce | FileCheck %s
 
 // N=48 contiguous, 8 elems/thread (dot A-operand style). This is the exact case
 // that produced the invalid threadsPerWarp = [10, 6]: the NPOT lane factor

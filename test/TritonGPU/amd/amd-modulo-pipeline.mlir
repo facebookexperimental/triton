@@ -1,10 +1,10 @@
-// RUN: TRITON_ENABLE_AMD_MODULO=1 TRITON_AMD_MODULO_SERIALIZE=1 triton-opt %s \
+// RUN: env TRITON_ENABLE_AMD_MODULO=1 TRITON_AMD_MODULO_SERIALIZE=1 triton-opt %s \
 // RUN:   -split-input-file -tritonamdgpu-dot-decompose-and-schedule 2>&1 | FileCheck %s
 //
-// RUN: TRITON_ENABLE_AMD_MODULO=1 TRITON_AMD_MODULO_SERIALIZE=1 triton-opt %s \
+// RUN: env TRITON_ENABLE_AMD_MODULO=1 TRITON_AMD_MODULO_SERIALIZE=1 triton-opt %s \
 // RUN:   -split-input-file -tritonamdgpu-dot-decompose-and-schedule 2>/dev/null \
 // RUN:   | triton-opt -tritonamdgpu-pipeline | FileCheck %s --check-prefix=EXPAND
-// RUN: TRITON_ENABLE_AMD_MODULO=1 TRITON_AMD_MODULO_SERIALIZE=1 triton-opt %s \
+// RUN: env TRITON_ENABLE_AMD_MODULO=1 TRITON_AMD_MODULO_SERIALIZE=1 triton-opt %s \
 // RUN:   -split-input-file -tritonamdgpu-dot-decompose-and-schedule 2>/dev/null \
 // RUN:   | triton-opt -tritonamdgpu-schedule-loops="num_stages=2" \
 // RUN:   | FileCheck %s --check-prefix=PRESERVE
