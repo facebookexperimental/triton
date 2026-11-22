@@ -66,9 +66,16 @@ struct LLVMOptionSettings {
     set(std::move(name), value ? "true" : "false");
   }
 
+  // Each flag is either `name`, which turns a boolean option on, or
+  // `name=value`.
   void enable(const std::vector<std::string> &flags) {
-    for (const std::string &flag : flags)
-      setFlag(flag, true);
+    for (const std::string &flag : flags) {
+      size_t eq = flag.find('=');
+      if (eq == std::string::npos)
+        setFlag(flag, true);
+      else
+        set(flag.substr(0, eq), flag.substr(eq + 1));
+    }
   }
 
   // DISABLE_LLVM_OPT may hold a comma separated list of LLVM flags to turn on,
