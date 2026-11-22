@@ -17,7 +17,8 @@ on:
         type: string
 
 env:
-  GPU_WORKFLOW_NAME: Meta Triton B200 Tests
+  # Issue-title scope. Off main it names the branch, so branches never share issues.
+  GPU_WORKFLOW_NAME: Meta Triton B200 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
   MAX_JOBS: 32
   TORCHINDUCTOR_TLX_MODE: "off"
   CCACHE_DIR: /tmp/fbtriton-ccache
@@ -26,6 +27,8 @@ env:
 jobs:
   b200-tritonbench-test:
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
     runs-on: nvidia-dgx-b200
     env:
       CONDA_ENV: meta-triton
@@ -92,9 +95,19 @@ jobs:
           . "${SETUP_SCRIPT}"
           export TRITONBENCH_ROOT="${TRITONBENCH_ROOT:-/workspace/tritonbench}"
           bash ./.ci/tritonbench/test-gpu.sh
+      - name: Collect nightly failure (TritonBench)
+        id: parse
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && failure()
+        run: |
+          JOB="b200-tritonbench-test"
+          TITLE="[nightly] ${GPU_WORKFLOW_NAME} / ${JOB} / b200-tritonbench"
+          FAILURES='[{"normalized_failure_id":"b200-tritonbench","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"'"${JOB}"'","summary":"TritonBench tests failed on B200 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
+          echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   b200-tlx-test:
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
     runs-on: nvidia-dgx-b200
     env:
       CONDA_ENV: meta-triton
@@ -146,8 +159,25 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
+      - name: Collect nightly failures (TLX)
+        id: parse
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))))
+        run: |
+          . "${SETUP_SCRIPT}"
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket b200-tlx-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml \
+            --workflow "${GPU_WORKFLOW_NAME}" \
+            --job "b200-tlx-test" \
+            ${FAILED_FLAG}
+
   b200-gluon-test:
     if: "!cancelled() && github.repository_owner == 'facebookexperimental'"
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
     runs-on: nvidia-dgx-b200
     env:
       CONDA_ENV: meta-triton
@@ -186,3 +216,146 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           python -m pytest python/test/gluon/ --import-mode=importlib -v --junitxml=/tmp/gluon.xml
+      - name: Collect nightly failures (Gluon)
+        id: parse
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))))
+        run: |
+          . "${SETUP_SCRIPT}"
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_gluon.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket b200-gluon-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/gluon.xml \
+            --workflow "${GPU_WORKFLOW_NAME}" \
+            --job "b200-gluon-test" \
+            ${FAILED_FLAG}
+
+  report-b200-tritonbench:
+    needs: b200-tritonbench-test
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && needs.b200-tritonbench-test.outputs.failures != '' && needs.b200-tritonbench-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.b200-tritonbench-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: Meta Triton B200 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ inputs.ref }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: b200
+
+  reconcile-b200-tritonbench:
+    needs: b200-tritonbench-test
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && (needs.b200-tritonbench-test.result == 'success' || needs.b200-tritonbench-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: Meta Triton B200 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: b200-tritonbench-test
+      failures: ${{ needs.b200-tritonbench-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
+
+  report-b200-tlx:
+    needs: b200-tlx-test
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && needs.b200-tlx-test.outputs.failures != '' && needs.b200-tlx-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.b200-tlx-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: Meta Triton B200 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ inputs.ref }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: b200
+
+  reconcile-b200-tlx:
+    needs: b200-tlx-test
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && (needs.b200-tlx-test.result == 'success' || needs.b200-tlx-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: Meta Triton B200 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: b200-tlx-test
+      failures: ${{ needs.b200-tlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
+
+  report-b200-gluon:
+    needs: b200-gluon-test
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && needs.b200-gluon-test.outputs.failures != '' && needs.b200-gluon-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.b200-gluon-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: Meta Triton B200 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ inputs.ref }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: b200
+
+  reconcile-b200-gluon:
+    needs: b200-gluon-test
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')))) && (needs.b200-gluon-test.result == 'success' || needs.b200-gluon-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: Meta Triton B200 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+      job_name: b200-gluon-test
+      failures: ${{ needs.b200-gluon-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      sha: ${{ inputs.ref }}
