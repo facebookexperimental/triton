@@ -29,8 +29,30 @@ env:
   CCACHE_MAXSIZE: 2G
 
 jobs:
+  assign-background-groups:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tlx_group: ${{ steps.groups.outputs.tlx_group }}
+      torchtlx_group: ${{ steps.groups.outputs.torchtlx_group }}
+      gluon_group: ${{ steps.groups.outputs.gluon_group }}
+    steps:
+      - name: Checkout workflow revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: groups
+        run: python3 .github/scripts/b200_background_groups.py
+
   b200-tlx-test:
-    if: ${{ !cancelled() && github.repository_owner == 'facebookexperimental' && (fromJSON(inputs.plan).core.files[0] != null || fromJSON(inputs.plan).correctness.files[0] != null || fromJSON(inputs.plan).codegen.files[0] != null) }}
+    needs: assign-background-groups
+    if: ${{ !cancelled() && needs.assign-background-groups.result == 'success' && github.repository_owner == 'facebookexperimental' && (fromJSON(inputs.plan).core.files[0] != null || fromJSON(inputs.plan).correctness.files[0] != null || fromJSON(inputs.plan).codegen.files[0] != null) }}
+    concurrency:
+      group: ${{ needs.assign-background-groups.outputs.tlx_group }}
+      queue: max
+      cancel-in-progress: false
     runs-on: nvidia-dgx-b200
     env:
       CONDA_ENV: meta-triton
@@ -123,8 +145,13 @@ jobs:
           setup-script: ${{ env.SETUP_SCRIPT }}
 
   b200-torchtlx-test:
+    needs: assign-background-groups
     # Temporarily disabled because the TorchTLX environment is brittle.
     if: ${{ false }}
+    concurrency:
+      group: ${{ needs.assign-background-groups.outputs.torchtlx_group }}
+      queue: max
+      cancel-in-progress: false
     runs-on: nvidia-dgx-b200
     env:
       CONDA_ENV: meta-triton
@@ -234,7 +261,12 @@ jobs:
           setup-script: ${{ env.SETUP_SCRIPT }}
 
   b200-gluon-test:
-    if: ${{ !cancelled() && github.repository_owner == 'facebookexperimental' && (fromJSON(inputs.plan).gluon.files[0] != null) }}
+    needs: assign-background-groups
+    if: ${{ !cancelled() && needs.assign-background-groups.result == 'success' && github.repository_owner == 'facebookexperimental' && (fromJSON(inputs.plan).gluon.files[0] != null) }}
+    concurrency:
+      group: ${{ needs.assign-background-groups.outputs.gluon_group }}
+      queue: max
+      cancel-in-progress: false
     runs-on: nvidia-dgx-b200
     env:
       CONDA_ENV: meta-triton
