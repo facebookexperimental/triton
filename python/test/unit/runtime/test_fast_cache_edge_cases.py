@@ -907,6 +907,12 @@ finally:
 class TestHIPJITProxyOptions(TestCase):
     """Check compiler options through the shared HIP proxy."""
 
+    def setUp(self):
+        scope = knobs.compilation.scope()
+        scope.__enter__()
+        self.addCleanup(scope.__exit__, None, None, None)
+        knobs.compilation.always_compile = False
+
     def test_hip_buffer_ops_switch_preserves_compilation_state(self):
 
         @triton.jit(c_cache=True)

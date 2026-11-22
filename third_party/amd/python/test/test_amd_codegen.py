@@ -11,7 +11,7 @@ from triton.backends.amd import compiler
 
 def test_fp_fusion():
     arch = "gfx1250"
-    triple = compiler.amd.get_target_triple(arch)
+    triple = compiler.amd.TARGET_TRIPLE
     source = f'''
 target triple = "{triple}"
 
@@ -109,7 +109,7 @@ def test_strict_target_triple():
 
 def test_named_barrier_address_space():
     arch = "gfx1250"
-    triple = compiler.amd.get_target_triple(arch)
+    triple = compiler.amd.TARGET_TRIPLE
     source = f'''
 target triple = "{triple}"
 
