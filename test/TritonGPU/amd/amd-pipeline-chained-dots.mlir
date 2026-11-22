@@ -1,5 +1,5 @@
 // RUN: triton-opt %s -split-input-file -tritonamdgpu-schedule-loops="num_stages=4" -tritonamdgpu-pipeline="use_async_copy=1 use_pingpong=1" -canonicalize | FileCheck %s
-// RUN: triton-opt %s -split-input-file -tritonamdgpu-schedule-loops="num_stages=4" -tritonamdgpu-pipeline="use_async_copy=1 use_pingpong=1" -canonicalize --tritonamdgpu-block-pingpong="num-stages=4" | FileCheck %s --check-prefix=PINGPONG
+// RUN: triton-opt %s -split-input-file -tritonamdgpu-schedule-loops="num_stages=4" -tritonamdgpu-pipeline="use_async_copy=1 use_pingpong=1" -canonicalize --tritonamdgpu-block-pingpong="num-stages=4" | FileCheck %s --check-prefix=PINGPONG --implicit-check-not=amdg.cond_barrier --implicit-check-not=rocdl.s.barrier --implicit-check-not=rocdl.s.setprio
 // RUN: triton-opt %s -split-input-file -tritonamdgpu-schedule-loops="num_stages=4" -tritonamdgpu-pipeline="use_async_copy=1 use_pingpong=0" -canonicalize --tritonamdgpu-block-pingpong="num-stages=4" | FileCheck %s --check-prefix=NO-PINGPONG
 
 #blocked = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 4], order = [0, 1]}>
@@ -53,10 +53,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
   // PINGPONG-LABEL: tt.func @independent_scaled_dots
   // PINGPONG: scf.for
-  // PINGPONG: rocdl.s.barrier
-  // PINGPONG: tt.dot_scaled
-  // PINGPONG: rocdl.s.setprio
-  // PINGPONG: tt.dot_scaled
+  // PINGPONG-COUNT-2: tt.dot_scaled
   // PINGPONG-NOT: amdg.two_dot_schedule
   // PINGPONG: tt.return
 
