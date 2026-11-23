@@ -211,7 +211,7 @@ void removePipeliningAttributes(ModuleOp moduleOp);
 // dominate it, proves nothing about the trip count.
 bool isLoopTripCountKnownPositive(scf::ForOp loop, DominanceInfo &domInfo);
 
-// FB Change: Meta AutoWS warp-specialization predicates.
+// Meta AutoWS warp-specialization predicates.
 // A loop marked tt.warp_specialize, or an op already assigned to a partition.
 bool requestsMetaWarpSpecialization(Operation *op);
 

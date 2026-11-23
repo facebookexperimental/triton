@@ -997,7 +997,7 @@ bool triton::isLoopTripCountKnownPositive(scf::ForOp loop,
   return false;
 }
 
-// FB Change: Meta AutoWS warp-specialization predicates.
+// Meta AutoWS warp-specialization predicates.
 bool mlir::triton::requestsMetaWarpSpecialization(Operation *op) {
   return op->getAttrOfType<DenseI32ArrayAttr>(ttg::kAsyncTaskIdAttrName) ||
          op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName) ||
