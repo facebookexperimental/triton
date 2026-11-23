@@ -668,6 +668,17 @@ CATALOG: tuple[OpSpec, ...] = (
         supports_window=True,
     ),
     OpSpec(
+        op="window_attn_varlen",
+        arch="sm90",
+        variant="ws_packed_rows",
+        impl="triton.tlx.ops.kernels.window_attn_varlen.sm90:window_attn_varlen",
+        invariant_vocab=_KDA_DIMS,
+        dtypes=_FP16,
+        accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
+        requires=frozenset({"tma"}),
+        supports_backward=False,
+    ),
+    OpSpec(
         op="mla_window_attn",
         arch="sm90",
         variant="overlapped_row_blocks",
