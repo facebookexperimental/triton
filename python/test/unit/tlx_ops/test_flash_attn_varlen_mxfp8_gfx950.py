@@ -140,6 +140,23 @@ def test_flash_attn_varlen_mxfp8_default_fast_exp(lens_k, fast):
     torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
 
 
+def test_flash_attn_varlen_mxfp8_rejects_schedule_for_other_offsets():
+    """Equal aggregate lengths cannot make a schedule reusable across offsets."""
+    from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
+
+    lens_q_a, lens_k_a = [128, 128], [128, 128]
+    lens_q_b, lens_k_b = [64, 192], [64, 192]
+    cu_q_a, cu_k_a = _cu(lens_q_a), _cu(lens_k_a)
+    cu_q_b, cu_k_b = _cu(lens_q_b), _cu(lens_k_b)
+    schedule = gfx950.prepare_work_schedule(lens_q_a, lens_k_a, cu_q_a, cu_k_a)
+    q = torch.randn(sum(lens_q_b), 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(lens_k_b), 4, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    with pytest.raises(ValueError, match="exact input offsets"):
+        gfx950.forward(q, k, v, cu_q_b, cu_k_b, 128**-0.5, work_schedule=schedule)
+
+
 def test_flash_attn_varlen_mxfp8_rejects_invalid_inputs():
     """Mismatched K/V shapes and empty offset tensors raise InvalidInput."""
     from triton.tlx.ops import InvalidInput, flash_attn_varlen_mxfp8

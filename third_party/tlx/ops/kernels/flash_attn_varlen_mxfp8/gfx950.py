@@ -957,17 +957,23 @@ class ForwardWorkSchedule:
 
     ``item_order[base + n * num_ctas]`` is the n-th work item of the program
     with slot ``base``. ``total_q``, ``total_kv`` and ``batch`` identify the
-    lengths the schedule was built for. ``needs_empty_fill`` is set when a
-    sequence has queries but no keys; such sequences have no work items and
-    get their rows from a separate fill. ``item_count`` is the number of work
-    items: the kernel follows ``item_order`` only when it covers every item,
-    and otherwise takes the items in index order."""
+    lengths the schedule was built for. The offset tensors and their versions
+    tie the schedule to the exact per-sequence lengths, not just their totals.
+    ``needs_empty_fill`` is set when a sequence has queries but no keys; such
+    sequences have no work items and get their rows from a separate fill.
+    ``item_count`` is the number of work items: the kernel follows
+    ``item_order`` only when it covers every item, and otherwise takes the
+    items in index order."""
 
     item_order: torch.Tensor
     num_ctas: int
     total_q: int
     total_kv: int
     batch: int
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    cu_seqlens_q_version: int
+    cu_seqlens_k_version: int
     needs_empty_fill: bool = True
     item_count: int | None = None
 
@@ -975,7 +981,8 @@ class ForwardWorkSchedule:
 def prepare_work_schedule(
     query_lengths,
     key_lengths,
-    device,
+    cu_seqlens_q,
+    cu_seqlens_k,
     *,
     num_ctas=512,
 ):
@@ -984,7 +991,8 @@ def prepare_work_schedule(
     Every program gets a fixed share of the work items. The items are taken
     longest key span first, each going to the least loaded program that still
     has room. The lengths are host lists, so building a schedule does not read
-    device memory."""
+    device memory. The schedule is valid only with the immutable offset tensors
+    passed here."""
     if num_ctas < 8 or num_ctas % 8:
         raise ValueError("Requires a multiple of eight CTAs")
     if not isinstance(query_lengths, (list, tuple)) or not isinstance(key_lengths, (list, tuple)):
@@ -993,6 +1001,10 @@ def prepare_work_schedule(
         raise ValueError("Query and key lengths must have the same nonzero batch size")
     if any(not isinstance(n, int) or n < 0 for n in (*query_lengths, *key_lengths)):
         raise ValueError("Sequence lengths must be nonnegative integers")
+    _check_offsets(cu_seqlens_q, cu_seqlens_q.device)
+    _check_offsets(cu_seqlens_k, cu_seqlens_q.device)
+    if cu_seqlens_q.shape != cu_seqlens_k.shape or cu_seqlens_q.numel() != len(query_lengths) + 1:
+        raise ValueError("Offset tensors must match the supplied sequence lengths")
     costs = []
     for q_length, k_length in zip(query_lengths, key_lengths):
         if k_length:
@@ -1009,23 +1021,30 @@ def prepare_work_schedule(
         if assigned < capacities[base]:
             heapq.heappush(bins, (load + costs[item], base, assigned))
     return ForwardWorkSchedule(
-        torch.tensor(order, dtype=torch.int32, device=device),
+        torch.tensor(order, dtype=torch.int32, device=cu_seqlens_q.device),
         num_ctas,
         sum(query_lengths),
         sum(key_lengths),
         len(query_lengths),
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_q._version,
+        cu_seqlens_k._version,
         any(q_length > 0 and k_length == 0 for q_length, k_length in zip(query_lengths, key_lengths)),
         count,
     )
 
 
-def _check_work_schedule(schedule, q, total_kv, batch, num_ctas):
-    """Reject a schedule built for other lengths, another device or grid."""
+def _check_work_schedule(schedule, q, total_kv, batch, num_ctas, cu_seqlens_q, cu_seqlens_k):
+    """Reject a schedule not tied to these exact immutable offsets."""
     if schedule is None:
         return
     if (schedule.total_q != q.shape[0] or schedule.total_kv != total_kv or schedule.batch != batch
-            or (num_ctas is not None and num_ctas != schedule.num_ctas) or schedule.item_order.device != q.device):
-        raise ValueError("Work schedule must match the input lengths, device, and grid")
+            or (num_ctas is not None and num_ctas != schedule.num_ctas) or schedule.item_order.device != q.device
+            or schedule.cu_seqlens_q is not cu_seqlens_q or schedule.cu_seqlens_k is not cu_seqlens_k
+            or schedule.cu_seqlens_q_version != cu_seqlens_q._version
+            or schedule.cu_seqlens_k_version != cu_seqlens_k._version):
+        raise ValueError("Work schedule must match the exact input offsets, device, and grid")
 
 
 _AUTOMATIC_SCHEDULES: dict[tuple[Any, ...], tuple[Any, Any, ForwardWorkSchedule]] = {}
@@ -1052,7 +1071,13 @@ def _automatic_work_schedule(cu_seqlens_q, cu_seqlens_k, device, *, num_ctas):
     if num_ctas is None:
         work_items = sum(triton.cdiv(q, _BLOCK_M) * _HEADS for q, k in zip(query_lengths, key_lengths) if k)
         num_ctas = min(512, max(8, triton.cdiv(work_items, 8) * 8))
-    schedule = prepare_work_schedule(query_lengths, key_lengths, device, num_ctas=num_ctas)
+    schedule = prepare_work_schedule(
+        query_lengths,
+        key_lengths,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        num_ctas=num_ctas,
+    )
     if len(_AUTOMATIC_SCHEDULES) >= 64:
         _AUTOMATIC_SCHEDULES.pop(next(iter(_AUTOMATIC_SCHEDULES)))
     _AUTOMATIC_SCHEDULES[key] = (weakref.ref(cu_seqlens_q), weakref.ref(cu_seqlens_k), schedule)
@@ -1161,7 +1186,15 @@ def forward_prequantized(
             device,
             num_ctas=num_ctas,
         )
-    _check_work_schedule(work_schedule, q8, total_kv, batch, num_ctas)
+    _check_work_schedule(
+        work_schedule,
+        q8,
+        total_kv,
+        batch,
+        num_ctas,
+        cu_seqlens_q,
+        cu_seqlens_k,
+    )
     meta = _metadata(cu_seqlens_q, cu_seqlens_k, q8.shape[0], total_kv, _BLOCK_M)
     npad = meta["npad"]
     tensors = (
@@ -1238,7 +1271,15 @@ def forward(
             q.device,
             num_ctas=num_ctas,
         )
-    _check_work_schedule(work_schedule, q, k.shape[0], batch, num_ctas)
+    _check_work_schedule(
+        work_schedule,
+        q,
+        k.shape[0],
+        batch,
+        num_ctas,
+        cu_seqlens_q,
+        cu_seqlens_k,
+    )
     meta = _metadata(cu_seqlens_q, cu_seqlens_k, q.shape[0], k.shape[0], _BLOCK_M)
     if kv_state is None:
         kv_state = prepare_kv(k, v, cu_seqlens_k, meta)
