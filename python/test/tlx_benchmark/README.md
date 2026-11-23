@@ -20,8 +20,9 @@ Fused operators (`tlx/ops/kernels/fused/`) run steps that would otherwise be sep
 `addmm_mul_add` and `linear_rowscale` fuse an elementwise epilogue into a GEMM, `norm_residual_norm`
 fuses the post-norm, gated residual add and pre-norm of a residual-stream boundary,
 `qk_norm_rope_kv_cache` fuses the q/k head norm, RoPE, FP8 quantization and paged KV cache write,
-`rmsnorm_gate` fuses a per-head RMSNorm with a sigmoid output gate, and `moe_router_topk_align` fuses the router
-GEMM, sigmoid top-k and expert-aligned slot sort of an MoE layer.
+`rmsnorm_gate` fuses a per-head RMSNorm with a sigmoid output gate, `moe_router_topk_align` fuses the router
+GEMM, sigmoid top-k and expert-aligned slot sort of an MoE layer, and `moe_mxfp4_sort_quant` fuses the expert-aligned
+slot sort, MXFP4 activation quantization and scale sort in front of an A4W4 MoE.
 
 Collectives (`tlx/ops/kernels/collectives/`) are multi-GPU ops. `collectives/all_reduce/` holds `all_reduce`, and
 `collectives/fused/` holds the collectives fused with the op that consumes their result: `all_reduce_norm_residual_norm`
@@ -94,6 +95,7 @@ options:
 | `linear_rowscale` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 | `norm_residual_norm` | `torch.compile` of the unfused module sequence | speedup >= 0.9x | heuristic |
 | `moe_router_topk_align` | `router_gemm` + `moe_routing` + the `moe` slot sort (separate launches) | speedup >= 0.9x | heuristic |
+| `moe_mxfp4_sort_quant` | `torch.compile` of the slot sort, MXFP4 row quantization and scale sort | speedup >= 0.9x | heuristic |
 | `qk_norm_rope_kv_cache` | `torch.compile` of the eager norm, RoPE and cache scatter | speedup >= 0.9x | heuristic |
 | `rmsnorm_gate` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 
