@@ -18,6 +18,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ..._invariance import BitwiseInvarianceSpec, gemm_fixed_split_k
 from . import _sm100_core as _core
+from . import sm100_gemv as _gemv
 from . import sm100_skinny as _skinny
 
 _FIXED_SPEC = BitwiseInvarianceSpec.dims("K")
@@ -1469,13 +1470,15 @@ def _tuned_for_fixed(space, shape, fixed):
 _tuned.cache_clear = _tuned_for_fixed.cache_clear
 
 
-def mm(a, b, *, out=None, space="full", invariance=None):
+def mm(a, b, *, out=None, space="full", invariance=None, b_static=False):
     """Matrix multiply ``a @ b`` on Blackwell.
 
     `space` selects the search space -- "full" for perf, "heuristic" (one
     config) for correctness, "smoke" for path coverage. Not exposed on
     `tlx.ops.mm`. `invariance` is the resolved spec; a fixed schedule prunes
     split-K candidates from every space so the K reduction stays uniform.
+    `b_static` promises that no kernel that may still be running writes B; the
+    one-row GEMV then starts reading B before waiting on earlier kernels.
     """
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
@@ -1490,6 +1493,8 @@ def mm(a, b, *, out=None, space="full", invariance=None):
     # Decode-sized M only streams B, which the M-tiled schedule below cannot do at
     # the HBM rate. Its split-K order varies with the shape, so it is not used
     # under a fixed-schedule invariance spec.
+    if gemm_fixed_split_k(invariance) is None and _gemv.eligible(a, b, out):
+        return _gemv.mm(a, b, c, b_static=b_static)
     if gemm_fixed_split_k(invariance) is None and _skinny.eligible(a, b, out):
         return _skinny.mm(a, b, c, space=space)
 

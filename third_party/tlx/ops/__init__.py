@@ -191,7 +191,7 @@ def _flash_attn_varlen_impl_for_device(device):
     return impl_for("flash_attn_varlen", device=device)
 
 
-def mm(a, b, *, out=None, space=None):
+def mm(a, b, *, out=None, space=None, b_static=False):
     """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major.
 
     This op is currently forward-only.
@@ -203,6 +203,11 @@ def mm(a, b, *, out=None, space=None):
     unsupported spaces raise `InvalidInput`. See the module docstring.
     `space=` also accepts a `Space` carrying a `BitwiseInvarianceSpec` over
     the M/N/K vocabulary.
+
+    `b_static=True` promises that no kernel that may still be running when this
+    op launches writes `b` (a model weight, for instance). Implementations may
+    then start reading `b` before waiting on earlier kernels; without it they wait
+    first. It never changes the result of a call that keeps the promise.
     """
     if a.ndim != 2 or b.ndim != 2:
         raise InvalidInput("tlx.ops.mm expects two rank-2 tensors; "
@@ -228,9 +233,10 @@ def mm(a, b, *, out=None, space=None):
     _check_enforced("mm", spec, invariance)
     if space_name is None:
         space_name = spec.default_space
+    promise = {"b_static": True} if b_static else {}
     if out is None:
-        return fn(a, b, space=space_name, invariance=invariance)
-    return fn(a, b, out=out, space=space_name, invariance=invariance)
+        return fn(a, b, space=space_name, invariance=invariance, **promise)
+    return fn(a, b, out=out, space=space_name, invariance=invariance, **promise)
 
 
 def int4_embedding(weights, weights_offsets, indices, offsets, D, *, out=None, space=None):

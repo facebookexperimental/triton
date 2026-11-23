@@ -66,17 +66,17 @@ def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     run_mm_case(ARCH, M, N, K, a_strides, b_strides, dtype_name)
 
 
-# Decode-sized `x @ W.T` (W [N, K] contiguous) that takes the skinny path: the
+# Decode-sized `x @ W.T` (W [N, K] contiguous, 2 to 64 rows; one row takes the GEMV) that takes the skinny path: the
 # decode projections of a 4-way tensor-parallel MoE model plus shapes that pick each cluster size.
 # 8192x2048 runs unsplit (cluster 1), which the skinny path only takes up to 32 rows. 1024x8192 is
 # capped below cluster 8 by how many clusters run at once.
 SKINNY_SHAPES = ([(M, N, K, "bf16")
-                  for M in (1, 8, 33, 64)
-                  for N, K in ((4608, 8192), (2048, 4096))] + [(M, 8192, 2048, "bf16") for M in (1, 8, 32)] + [
+                  for M in (2, 8, 33, 64)
+                  for N, K in ((4608, 8192), (2048, 4096))] + [(M, 8192, 2048, "bf16") for M in (2, 8, 32)] + [
                       (16, 1024, 512, "fp16"),
                       (5, 256, 8192, "bf16"),
                       (64, 64, 1024, "fp16"),
-                      (1, 1024, 8192, "bf16"),
+                      (2, 1024, 8192, "bf16"),
                   ])
 
 
@@ -89,7 +89,7 @@ def test_mm_skinny(M, N, K, dtype_name, monkeypatch):
     assert launches, "tlx.ops.mm did not take the skinny path"
 
 
-@pytest.mark.parametrize("M, N, K", [(1, 4608, 8192), (32, 2048, 4096)])
+@pytest.mark.parametrize("M, N, K", [(2, 4608, 8192), (32, 2048, 4096)])
 def test_mm_skinny_full_space(M, N, K):
     a = operand(M, K, (K, 1), torch.bfloat16)
     b = operand(K, N, (1, K), torch.bfloat16)
@@ -182,6 +182,95 @@ def test_mm_skinny_heuristic_clusters_run_at_once(N, K):
     bigger = 2 * cluster
     assert (bigger > 8 or n_blocks > skinny._max_active_clusters(bigger)
             or K // (skinny.BLOCK_K * bigger) < skinny._MIN_K_STEPS)
+
+
+# One-row `x @ W.T`: the decode shapes the GEMV is tuned for, plus shapes that take its derived configs.
+GEMV_SHAPES = [(8192, 1024), (8192, 2048), (4608, 8192), (2048, 4096), (1024, 8192), (1024, 6144), (4096, 1024),
+               (512, 1536), (96, 256), (64, 128)]
+
+
+@pytest.mark.parametrize("N, K", GEMV_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("b_static", [False, True])
+def test_mm_gemv(N, K, dtype, b_static, monkeypatch):
+    from triton.tlx.ops import mm as tlx_mm
+
+    calls = []
+    run = sm100._gemv.mm
+    monkeypatch.setattr(sm100._gemv, "mm", lambda *args, **kwargs: (calls.append(kwargs), run(*args, **kwargs))[1])
+    x = operand(1, K, (K, 1), dtype)
+    w = operand(N, K, (K, 1), dtype) * K**-0.5
+    out = tlx_mm(x, w.T, b_static=b_static)
+    assert calls == [{"b_static": b_static}], "tlx.ops.mm did not take the GEMV"
+    ref = x.float() @ w.float().T
+    precision = REL_PRECISION[dtype]
+    torch.testing.assert_close(out.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
+def test_mm_gemv_declines_row_major_b():
+    x = operand(1, 4096, (4096, 1), torch.bfloat16)
+    b = operand(4096, 1024, (1024, 1), torch.bfloat16)
+    assert not sm100._gemv.eligible(x, b)
+
+
+def test_mm_gemv_declines_empty_k():
+    x = torch.empty(1, 0, device="cuda", dtype=torch.bfloat16)
+    w = torch.empty(64, 0, device="cuda", dtype=torch.bfloat16)
+    assert not sm100._gemv.eligible(x, w.T)
+
+
+def test_mm_gemv_row_offset_past_int32():
+    """Rows from 131072 on start past 2^31 elements of a K = 16384 W, so their offsets need 64 bits."""
+    from triton.tlx.ops import mm as tlx_mm
+
+    N, K, tail = 131072 + 64, 16384, 64
+    w = torch.zeros(N, K, device="cuda", dtype=torch.bfloat16)
+    w[-tail:] = torch.randn(tail, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    x = operand(1, K, (K, 1), torch.bfloat16)
+    assert sm100._gemv.eligible(x, w.T)
+    out = tlx_mm(x, w.T)
+    ref = x.float() @ w[-tail:].float().T
+    precision = REL_PRECISION[torch.bfloat16]
+    torch.testing.assert_close(out[:, -tail:].float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
+    assert not out[:, :-tail].any()
+
+
+def test_mm_gemv_b_written_by_previous_kernel():
+    """Without `b_static` the GEMV loads W only after the previous kernel completes: here the previous GEMM writes
+    W, including on CUDA-graph replay."""
+    x = operand(64, 4096, (4096, 1), torch.bfloat16)
+    w1 = operand(512, 4096, (4096, 1), torch.bfloat16) * 4096**-0.5
+    a = operand(1, 512, (512, 1), torch.bfloat16)
+    w2 = torch.empty(64, 512, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty(1, 64, device="cuda", dtype=torch.bfloat16)
+    assert sm100._gemv.eligible(a, w2.T)
+
+    def chain():
+        sm100.mm(x, w1.T, out=w2, space="heuristic")
+        sm100.mm(a, w2.T, out=y, space="heuristic")
+
+    chain()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        chain()
+    for seed in range(5):
+        x.copy_(torch.randn(x.shape, device="cuda", generator=torch.Generator("cuda").manual_seed(seed)))
+        graph.replay()
+        ref = a.float() @ (x.float() @ w1.float().T).to(torch.bfloat16).float().T
+        precision = REL_PRECISION[torch.bfloat16]
+        torch.testing.assert_close(y.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
+def test_mm_b_static_is_accepted_off_the_gemv():
+    from triton.tlx.ops import mm as tlx_mm
+
+    a = operand(16, 4096, (4096, 1), torch.bfloat16)
+    w = operand(2048, 4096, (4096, 1), torch.bfloat16) * 4096**-0.5
+    out = tlx_mm(a, w.T, space="heuristic", b_static=True)
+    ref = a.float() @ w.float().T
+    precision = REL_PRECISION[torch.bfloat16]
+    torch.testing.assert_close(out.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
 
 
 GEOMETRIES = [
