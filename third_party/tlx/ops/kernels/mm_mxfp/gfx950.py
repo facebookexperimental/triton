@@ -2222,7 +2222,8 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                 }), schedule_hint="mfma-schedule" if use_mfma_schedule else "",
                 regclass_priority_trumps_globalness=(m, n, k) == (2048, 1024, 24576),
                 llvm_fn_attrs=((("amdgpu-sched-strategy", "iterative-ilp"), ) if (m, n, k) == (2048, 3072, 15360) else
-                               ()))
+                               ()), llvm_cl_opts=(("amdgpu-use-amdgpu-trackers", "false"),
+                                                  ("greedy-compact-slot-indexes", "false")))
             if split_k > 1 and not fused_split_reduce:
                 _reduce_split_k[(m // 32, n // 128)](workspace, out, m, n, split_k, 32, 128, STREAMING=(m, n, k) in {
                     (1024, 6144, 22656),
