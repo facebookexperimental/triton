@@ -3055,6 +3055,7 @@ def mxgemm_tdm_pipelined(
         SCALE_LAYOUT: str = "block128",
         OUT_DTYPE: str = "fp32",
         TILES_PER_WARP: tuple[int, int] = (2, 2),
+        ENABLE_WMMA_QUEUING: bool = False,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with the persistent sliceMNK kernel.
 
@@ -3096,6 +3097,9 @@ def mxgemm_tdm_pipelined(
     independent matrix work and waits just before the refill.
     ``EARLY_C_STORES`` interleaves the final quadrant dots with C stores.
     Both require three buffers with FP8 BK128 or FP4 BK256 tiles.
+    ``ENABLE_WMMA_QUEUING`` passes the HIP option ``enable_wmma_queuing`` to
+    the persistent kernel, which sets SCHED_MODE[2] at kernel entry so WMMAs
+    may queue behind independent scalar and memory work.
 
     ``STATIC_SLOT_UNROLL`` unrolls the three- or four-buffer FP8 BK128
     steady loop by its ring depth, so every step reads a loop-invariant LDS
@@ -3140,10 +3144,10 @@ def mxgemm_tdm_pipelined(
         raise ValueError("SCALE_LAYOUT must be 'block128' or 'wave256'")
     if not PERSISTENT and (CLUSTER_LAYOUT != "linear" or SPLIT_CLUSTER_BARRIER or EARLY_C_STORES or STATIC_SLOT_UNROLL
                            or OUTPUT_C_SLOTS is not None or OVERLAP_PEEL or MERGED_HANDOFF_BARRIER
-                           or STATIC_CLUSTER_STEPS or SCALE_LAYOUT != "block128"):
+                           or STATIC_CLUSTER_STEPS or SCALE_LAYOUT != "block128" or ENABLE_WMMA_QUEUING):
         raise ValueError("CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, EARLY_C_STORES, STATIC_SLOT_UNROLL, "
-                         "OUTPUT_C_SLOTS, OVERLAP_PEEL, MERGED_HANDOFF_BARRIER, STATIC_CLUSTER_STEPS, and "
-                         "SCALE_LAYOUT require PERSISTENT")
+                         "OUTPUT_C_SLOTS, OVERLAP_PEEL, MERGED_HANDOFF_BARRIER, STATIC_CLUSTER_STEPS, "
+                         "SCALE_LAYOUT, and ENABLE_WMMA_QUEUING require PERSISTENT")
     if PERSISTENT:
         if TILES_PER_WARP != (2, 2):
             raise ValueError("persistent MXFP requires TILES_PER_WARP=(2, 2)")
@@ -3206,7 +3210,8 @@ def mxgemm_tdm_pipelined(
                 SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES,
                 STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL, OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL,
                 MERGED_HANDOFF_BARRIER=MERGED_HANDOFF_BARRIER, STATIC_CLUSTER_STEPS=STATIC_CLUSTER_STEPS,
-                SCALE_WAVE256=SCALE_LAYOUT == "wave256", num_warps=4, waves_per_eu=1, ctas_per_cga=(CLUSTER_SIZE, 1, 1))
+                SCALE_WAVE256=SCALE_LAYOUT == "wave256", num_warps=4, waves_per_eu=1, ctas_per_cga=(CLUSTER_SIZE, 1, 1),
+                enable_wmma_queuing=ENABLE_WMMA_QUEUING)
         return mxgemm_tdm_pipelined_kernel[grid](
             a,
             b,
@@ -3289,7 +3294,8 @@ _DEFAULT_CONFIG = {
 _PERSISTENT_CONFIG_KEYS = ("PERSISTENT", "NUM_PROGRAMS", "CROSS_TILE_PREFETCH", "XCD_REMAP", "NUM_XCDS", "XCD_CHUNK",
                            "CLUSTER_SIZE", "CLUSTER_MULTICAST", "CLUSTER_BARRIER_INTERVAL", "CLUSTER_LAYOUT",
                            "SPLIT_CLUSTER_BARRIER", "EARLY_C_STORES", "STATIC_SLOT_UNROLL", "OUTPUT_C_SLOTS",
-                           "OVERLAP_PEEL", "MERGED_HANDOFF_BARRIER", "STATIC_CLUSTER_STEPS", "SCALE_LAYOUT")
+                           "OVERLAP_PEEL", "MERGED_HANDOFF_BARRIER", "STATIC_CLUSTER_STEPS", "SCALE_LAYOUT",
+                           "ENABLE_WMMA_QUEUING")
 
 
 def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: torch.Tensor, config=None) -> torch.Tensor:
@@ -3301,8 +3307,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
     ``PERSISTENT`` selects the persistent kernel; it and the other persistent
     options (``NUM_PROGRAMS``, ``CROSS_TILE_PREFETCH``, ``XCD_REMAP``, cluster
     options, ``STATIC_SLOT_UNROLL``, ``OUTPUT_C_SLOTS``, ``OVERLAP_PEEL``,
-    ``MERGED_HANDOFF_BARRIER``, ``STATIC_CLUSTER_STEPS``, ``SCALE_LAYOUT``) are
-    described in :func:`mxgemm_tdm_pipelined`. ``OUT_DTYPE`` selects FP32 or
+    ``MERGED_HANDOFF_BARRIER``, ``STATIC_CLUSTER_STEPS``, ``SCALE_LAYOUT``,
+    ``ENABLE_WMMA_QUEUING``) are described in :func:`mxgemm_tdm_pipelined`. ``OUT_DTYPE`` selects FP32 or
     FP16 output.
     """
     cfg = dict(_DEFAULT_CONFIG)
@@ -3324,7 +3330,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
             raise ValueError("persistent MXFP requires four warps, one wave per SIMD, and SCALE_BLOCK=32")
     persistent_only = ("CLUSTER_LAYOUT", "SPLIT_CLUSTER_BARRIER", "EARLY_C_STORES", "STATIC_SLOT_UNROLL",
                        "OUTPUT_C_SLOTS", "OVERLAP_PEEL", "MERGED_HANDOFF_BARRIER", "STATIC_CLUSTER_STEPS",
-                       "SCALE_LAYOUT")
+                       "SCALE_LAYOUT", "ENABLE_WMMA_QUEUING")
     if (cfg.get("PERSISTENT", False) or cfg.get("OUT_DTYPE", "fp32") != "fp32"
             or any(key in cfg for key in persistent_only)):
         return mxgemm_tdm_pipelined(a, b, a_scale, b_scale, BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"],

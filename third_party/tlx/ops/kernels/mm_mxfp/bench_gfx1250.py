@@ -23,7 +23,9 @@ XCD remapping of whole clusters (eight XCDs, chunk two).
   --scale-layout wave256 packs its scales so each wave reads both 128-row
   quadrants' scales with one LDS load.
 - mx8xmx4 (FP4 E2M1 B) uses BK256 with three input stages, stages C in
-  retired A stages, and uses split cluster barriers and early C stores.
+  retired A stages, and uses split cluster barriers, early C stores, and
+  WMMA queuing (--enable-wmma-queuing, SCHED_MODE[2]): its WMMAs may then queue
+  behind the split refill barrier's scalar and memory work.
 
 Timing repeats eager batches of --benchmark-num-iters milliseconds: batches
 run for --warmup-seconds, then the median batch over --duration-seconds is
@@ -85,6 +87,10 @@ def _variant_args(args, dtype_b, out_dtype):
         resolved.split_cluster_barrier = fp4 and cluster_barriers
     if resolved.early_c_stores is None:
         resolved.early_c_stores = fp4
+    # WMMA queuing speeds up the FP4 schedule and slows the FP8 one, which is
+    # bound by synchronization and LDS latency.
+    if resolved.enable_wmma_queuing is None:
+        resolved.enable_wmma_queuing = fp4
     return resolved
 
 
@@ -196,6 +202,8 @@ def _command(args, case, dtype_b):
         command.append("--split_cluster_barrier")
     if args.early_c_stores:
         command.append("--early_c_stores")
+    if args.enable_wmma_queuing:
+        command.append("--enable_wmma_queuing")
     if not args.cluster_multicast:
         command.append("--no-cluster_multicast")
     if not args.cross_tile_prefetch:
@@ -243,6 +251,8 @@ def parse_benchmark_args(argv=None):
                         help="split the periodic cluster barrier (default: MX8xMX4)")
     parser.add_argument("--early-c-stores", action=argparse.BooleanOptionalAction, default=None,
                         help="interleave the final quadrant dots with C stores (default: MX8xMX4)")
+    parser.add_argument("--enable-wmma-queuing", action=argparse.BooleanOptionalAction, default=None,
+                        help="set SCHED_MODE[2] so WMMAs may queue behind scalar and memory work (default: MX8xMX4)")
     parser.add_argument("--group-m", type=int, choices=(4, 8), default=8)
     parser.add_argument("--num-programs", type=int, default=256, help="persistent workgroups, capped by the tile count")
     parser.add_argument("--cluster-size", type=int, choices=(1, 2, 4, 8, 16), default=16)
@@ -338,8 +348,9 @@ def main(argv=None):
                  overlap_peel=run_args.overlap_peel, merged_handoff_barrier=run_args.merged_handoff_barrier,
                  static_cluster_steps=run_args.static_cluster_steps, scale_layout=run_args.scale_layout,
                  cross_tile_prefetch=run_args.cross_tile_prefetch, split_cluster_barrier=run_args.split_cluster_barrier,
-                 early_c_stores=run_args.early_c_stores, group_m=run_args.group_m, cluster_size=run_args.cluster_size,
-                 cluster_layout=run_args.cluster_layout, cluster_barrier_interval=run_args.cluster_barrier_interval,
+                 early_c_stores=run_args.early_c_stores, enable_wmma_queuing=run_args.enable_wmma_queuing,
+                 group_m=run_args.group_m, cluster_size=run_args.cluster_size, cluster_layout=run_args.cluster_layout,
+                 cluster_barrier_interval=run_args.cluster_barrier_interval,
                  cluster_multicast=run_args.cluster_multicast, xcd_remap=run_args.xcd_remap, num_xcds=run_args.num_xcds,
                  xcd_chunk=run_args.xcd_chunk, num_programs=run_args.num_programs,
                  benchmark_mode=run_args.benchmark_mode, benchmark_ms=run_args.benchmark_num_iters,
@@ -416,6 +427,8 @@ def run_single(argv=None):
                         help="overlap periodic cluster rendezvous with independent steady-loop matrix work")
     parser.add_argument("--early_c_stores", action="store_true",
                         help="interleave final quadrant dots and output stores")
+    parser.add_argument("--enable_wmma_queuing", action="store_true",
+                        help="set SCHED_MODE[2] so persistent-kernel WMMAs may queue behind scalar and memory work")
     parser.add_argument("--cluster_barrier_interval", type=int, default=1,
                         help="align cluster requests every N input K blocks; 0 disables all cluster barriers")
     parser.add_argument("--cluster_multicast", action=argparse.BooleanOptionalAction, default=True,
@@ -500,6 +513,7 @@ def run_single(argv=None):
         CLUSTER_LAYOUT=args.cluster_layout,
         SPLIT_CLUSTER_BARRIER=args.split_cluster_barrier,
         EARLY_C_STORES=args.early_c_stores,
+        ENABLE_WMMA_QUEUING=args.enable_wmma_queuing,
         STATIC_SLOT_UNROLL=args.static_slot_unroll,
         OUTPUT_C_SLOTS=args.output_c_slots,
         OVERLAP_PEEL=args.overlap_peel,
