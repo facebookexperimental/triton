@@ -1240,9 +1240,9 @@ def test_trigger_skips_only_paths_selection_skips_everywhere():
 
 @pytest.mark.parametrize("event,stops", [("pull_request", True), ("push", False), ("schedule", False),
                                          ("workflow_dispatch", False)])
-def test_only_pull_requests_stop_at_the_first_failure(monkeypatch, event, stops):
-    # A PR reports its first failure sooner, while pushes and schedules must run every selected test so issue filing
-    # sees every failure. Realistic breaks: stopping every run early, or losing the stop on PRs.
+def test_only_pull_requests_stop_early_and_skip_slow_cases(monkeypatch, event, stops):
+    # A PR reports its first failure sooner and skips slow cases, while pushes and schedules must run every selected
+    # test so issue filing sees every failure. Realistic breaks: trimming every run, or losing the trim on PRs.
     import sys
     import run_selected_tests
     calls = []
@@ -1251,4 +1251,6 @@ def test_only_pull_requests_stop_at_the_first_failure(monkeypatch, event, stops)
     monkeypatch.setenv("TEST_SUITE", json.dumps({"files": ["python/test/unit/runtime/"], "k": ""}))
     monkeypatch.setenv("GITHUB_EVENT_NAME", event)
     run_selected_tests.main()
-    assert ("--maxfail=1" in calls[0]) == stops
+    argv = calls[0]
+    assert ("--maxfail=1" in argv) == stops
+    assert any(argv[i:i + 2] == ["-m", "not slow"] for i in range(len(argv))) == stops
