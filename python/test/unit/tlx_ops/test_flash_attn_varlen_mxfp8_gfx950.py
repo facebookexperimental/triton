@@ -140,21 +140,66 @@ def test_flash_attn_varlen_mxfp8_default_fast_exp(lens_k, fast):
     torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
 
 
-def test_flash_attn_varlen_mxfp8_rejects_schedule_for_other_offsets():
-    """Equal aggregate lengths cannot make a schedule reusable across offsets."""
+def test_flash_attn_varlen_mxfp8_graph_capture_new_offsets():
+    """The launch reads no sequence length on the host: offsets first seen
+    while capturing a CUDA graph give the eager result on replay."""
     from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
 
-    lens_q_a, lens_k_a = [128, 128], [128, 128]
-    lens_q_b, lens_k_b = [64, 192], [64, 192]
-    cu_q_a, cu_k_a = _cu(lens_q_a), _cu(lens_k_a)
-    cu_q_b, cu_k_b = _cu(lens_q_b), _cu(lens_k_b)
-    schedule = gfx950.prepare_work_schedule(lens_q_a, lens_k_a, cu_q_a, cu_k_a)
-    q = torch.randn(sum(lens_q_b), 4, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(sum(lens_k_b), 4, 128, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn_like(k)
+    torch.manual_seed(20)
+    scale = 128**-0.5
 
-    with pytest.raises(ValueError, match="exact input offsets"):
-        gfx950.forward(q, k, v, cu_q_b, cu_k_b, 128**-0.5, work_schedule=schedule)
+    def inputs(lens_q, lens_k):
+        q = torch.randn(sum(lens_q), 4, 128, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(sum(lens_k), 4, 128, device="cuda", dtype=torch.bfloat16)
+        return q, k, torch.randn_like(k), _cu(lens_q), _cu(lens_k)
+
+    # Compile every kernel on other offsets with the same totals.
+    gfx950.forward(*inputs([200, 64, 300], [300, 700, 90]), scale)
+    q, k, v, cu_q, cu_k = inputs([64, 300, 200], [700, 90, 300])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse, _ = gfx950.forward(q, k, v, cu_q, cu_k, scale)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    ref, ref_lse = _reference(q, k, v, cu_q, cu_k, scale)
+    torch.testing.assert_close(out.float(), ref, atol=0.08, rtol=0.08)
+    torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
+
+
+@pytest.mark.parametrize("batch", [37, 300])
+def test_flash_attn_varlen_mxfp8_dispatch_order(batch):
+    """The device-built dispatch order lists every query tile once, the two
+    classes carry equal costs, and each class runs its longest items first:
+    the sequences with the most keys."""
+    from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
+
+    generator = torch.Generator().manual_seed(batch)
+    lens_q = torch.randint(0, 400, (batch, ), generator=generator).tolist()
+    lens_k = torch.randint(0, 3000, (batch, ), generator=generator).tolist()
+    lens_q[3], lens_k[5], lens_k[6] = 0, 0, lens_k[7]
+    meta = gfx950._build_metadata(_cu(lens_q), _cu(lens_k), sum(lens_q), sum(lens_k), 128, 256)
+    start = meta["q_tile_start"].tolist()
+    sizes = start[batch:]
+    tiles = [-(-q // 128) for q in lens_q]
+    assert sum(sizes) == sum(tiles) and max(sizes) <= meta["class_capacity"]
+
+    owner = meta["item_tile"][:sum(sizes)].tolist()
+    expected = [None] * sum(sizes)
+    for sequence, count in enumerate(tiles):
+        for tile in range(count):
+            assert expected[start[sequence] + tile] is None
+            expected[start[sequence] + tile] = sequence
+    assert owner == expected
+
+    cost = [count * k for count, k in zip(tiles, lens_k)]
+    loads = []
+    for lo, hi in ((0, sizes[0]), (sizes[0], sum(sizes))):
+        sequences = list(dict.fromkeys(owner[lo:hi]))
+        keys = [lens_k[sequence] for sequence in sequences]
+        assert keys == sorted(keys, reverse=True)
+        loads.append(sum(cost[sequence] for sequence in sequences))
+    assert abs(loads[0] - loads[1]) <= max(cost)
 
 
 def test_flash_attn_varlen_mxfp8_rejects_invalid_inputs():

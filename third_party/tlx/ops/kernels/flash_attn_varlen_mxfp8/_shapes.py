@@ -14,9 +14,8 @@ class FlashAttentionVarlenMXFP8Shape(NamedTuple):
     dtype: str
 
 
-SYNTHETIC: tuple[FlashAttentionVarlenMXFP8Shape, ...] = (
-    FlashAttentionVarlenMXFP8Shape(3, 224, 352, 128, 192, "bf16"),
-)
+SYNTHETIC: tuple[FlashAttentionVarlenMXFP8Shape, ...] = (FlashAttentionVarlenMXFP8Shape(3, 224, 352, 128, 192,
+                                                                                        "bf16"), )
 
 # Production cross-attention aggregates. The original traces retain totals and
 # maxima, not every sequence offset, so inputs use a deterministic long-tail
@@ -37,8 +36,7 @@ GFX950_SHORT = FocusSuite(
             (30576, 264690, 240, 748),
             (30928, 264436, 224, 748),
             (32784, 264520, 240, 748),
-        )
-    ),
+        )),
 )
 GFX950_LONG = FocusSuite(
     name="gfx950_long",
@@ -56,8 +54,7 @@ GFX950_LONG = FocusSuite(
             (30576, 3164659, 240, 16354),
             (30928, 3180031, 224, 16354),
             (32784, 3156939, 240, 16354),
-        )
-    ),
+        )),
 )
 GFX950_PRODUCTION = FocusSuite(
     name="gfx950_production",
@@ -99,15 +96,12 @@ def _lengths(count: int, total: int, maximum: int, seed: int) -> list[int]:
 
 
 def lengths(shape: FlashAttentionVarlenMXFP8Shape) -> tuple[list[int], list[int]]:
-    query_lengths = [
-        16 * value
-        for value in _lengths(
-            shape.batch,
-            shape.total_q // 16,
-            shape.max_q // 16,
-            seed=3,
-        )
-    ]
+    query_lengths = [16 * value for value in _lengths(
+        shape.batch,
+        shape.total_q // 16,
+        shape.max_q // 16,
+        seed=3,
+    )]
     key_lengths = _lengths(shape.batch, shape.total_kv, shape.max_kv, seed=5)
     return query_lengths, key_lengths
 

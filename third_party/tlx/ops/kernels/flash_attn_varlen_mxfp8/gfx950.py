@@ -7,18 +7,29 @@ quantizes K and V into head-major buffers in which every sequence owns a span
 of zero-padded keys that starts at a multiple of 256 keys and is a multiple of
 256 keys long, in the layouts the core reads (K row-major with permuted scale
 words, V transposed with keys reordered inside 32-key groups). Q is quantized
-in registers, or ahead of time for ``forward_prequantized``. Work items are
-128-row query-tile/head pairs, cost-balanced over a persistent grid. The
-padding sits at both ends of a span (see ``_front``), so only an item's first
-and last 128-key tiles hold padding keys, which get scores of -1e30 or less.
+in registers, or ahead of time for ``forward_prequantized``. The padding sits
+at both ends of a span (see ``_front``), so only an item's first and last
+128-key tiles hold padding keys, which get scores of -1e30 or less.
+
+Work items are 128-row query-tile/head pairs, one per workgroup. The launch
+needs no sequence length on the host: the grid is an upper bound from the
+token totals, and device kernels build the tables that map a workgroup to its
+item (``_build_metadata``).
+
+- Workgroups go round-robin to the 8 XCDs. Each XCD takes one head of half
+  of the sequences, so all the query tiles of a (sequence, head) read its K/V
+  through one XCD's L2.
+- The sequences are ranked by descending cost, query tiles times keys, and
+  dealt to the two halves in turn, so the XCDs carry equal loads. Each half
+  goes by descending keys: an XCD starts its longest items first, which keeps
+  the last ones to finish short.
+
 The sequence-offset tensors must not be modified in place while their prepared
-metadata and work schedule are reused.
+metadata is reused.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import heapq
 import math
 import weakref
 from typing import Any, cast
@@ -33,15 +44,17 @@ from . import mxfp8_attention_core_gfx950 as core
 _HEADS = 4
 _HEAD_DIM = 128
 _BLOCK_M = 128
-# Sequences averaging at least this many keys are long: the kernel then reads
-# each work item's metadata again instead of carrying it over from the prefetch,
-# and the approximate exponential is the default.
+# Sequences averaging at least this many keys are long: the approximate
+# exponential is then the default.
 _LONG_KV = 4096
 # Each sequence's keys are padded to a multiple of two 128-key tiles: the
 # kernel takes the tiles in pairs, one per LDS slot.
 _PAD = 256
 # Keys per program of the K/V preparation kernel.
 _PREP_ROWS = 64
+# Larger batches keep the sequences in index order: ranking compares every
+# pair of sequences, and one item is short next to a workgroup slot's share.
+_RANK_MAX_BATCH = 4096
 _LOG2E = 1.4426950408889634
 
 _LAUNCH_OPTIONS = {
@@ -193,23 +206,21 @@ def _prepare_kv(
 
 @triton.jit
 def _item(
-    item,
+    tile,
     ItemTile,
-    CuQTile,
+    QTileStart,
     CuQ,
     CuKV,
     CuPad,
-    HEADS: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
-    """Work item ``item``: one head of one BLOCK_M-row query tile.
+    """The BLOCK_M-row query tile at position ``tile`` of the dispatch order.
 
-    Returns (head, first query row, query rows left in the sequence, padding
-    keys ahead of the sequence, valid keys of the last 128-key tile, start of
-    the sequence's padded key span, number of 128-key tiles in it)."""
-    tile = item // HEADS
+    Returns (first query row, query rows left in the sequence, padding keys
+    ahead of the sequence, valid keys of the last 128-key tile, start of the
+    sequence's padded key span, number of 128-key tiles in it)."""
     sequence = tl.load(ItemTile + tile)
-    q0 = tl.load(CuQ + sequence) + (tile - tl.load(CuQTile + sequence)) * BLOCK_M
+    q0 = tl.load(CuQ + sequence) + (tile - tl.load(QTileStart + sequence)) * BLOCK_M
     q_rows = tl.load(CuQ + sequence + 1) - q0
     kv_len = tl.load(CuKV + sequence + 1) - tl.load(CuKV + sequence)
     pad_start = tl.load(CuPad + sequence)
@@ -218,7 +229,6 @@ def _item(
     # Valid keys of the last tile.
     tail = 128 - (padded - kv_len - front)
     return (
-        (item % HEADS).to(tl.int64),
         q0,
         q_rows,
         front,
@@ -404,13 +414,12 @@ def _mfma_softmax_loop_4w(
 
 
 @triton.jit
-def _item_uniform(item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS: tl.constexpr, BLOCK_M: tl.constexpr):
+def _item_uniform(tile, ItemTile, QTileStart, CuQ, CuKV, CuPad, BLOCK_M: tl.constexpr):
     # Work-item metadata is loaded from memory, which leaves each scalar (and
     # every loop bound and offset derived from it) in a VGPR. The values are
     # block-uniform, so move them to SGPRs.
-    head, q0, q_rows, front, tail, pad_start, n_tiles = _item(item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS, BLOCK_M)
+    q0, q_rows, front, tail, pad_start, n_tiles = _item(tile, ItemTile, QTileStart, CuQ, CuKV, CuPad, BLOCK_M)
     return (
-        tlx.assume_uniform(head),
         tlx.assume_uniform(q0),
         tlx.assume_uniform(q_rows),
         tlx.assume_uniform(front),
@@ -425,7 +434,6 @@ def _item_uniform(item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS: tl.constexpr
 def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     Q,
     QScales,
-    WorkOrder,
     K8,
     V8,
     KS,
@@ -435,7 +443,7 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     CuQ,
     CuKV,
     CuPad,
-    CuQTile,
+    QTileStart,
     ItemTile,
     BATCH,
     TOTAL_Q,
@@ -445,35 +453,38 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     BLOCK_M: tl.constexpr,
     FAST_EXP: tl.constexpr,
     PREQUANTIZED_Q: tl.constexpr,
-    REUSE_METADATA: tl.constexpr,
-    USE_WORK_ORDER: tl.constexpr,
 ):
-    """Persistent 4-wave forward: each program walks its share of the work items.
+    """4-wave forward of one work item, a head of a query tile, per workgroup.
 
     Q is BF16 and quantized here, or with PREQUANTIZED_Q E4M3 with its E8M0
     bytes in QScales. K8, V8, KS and VS are prepare_kv's buffers, and CuPad,
-    CuQTile and ItemTile are _metadata's tables. qk_scale is the softmax scale
-    in the log2 domain. With USE_WORK_ORDER the items come in WorkOrder's order,
-    else in index order; REUSE_METADATA then also carries the metadata read for
-    an item's prefetch over to the item instead of reading it again.
+    QTileStart and ItemTile are _metadata's tables. qk_scale is the softmax
+    scale in the log2 domain.
 
-    An item's tiles alternate between two LDS slots. QK of tile 0 comes first,
+    Workgroups go round-robin to the 8 XCDs. Each XCD takes one head of one
+    of the two classes of query tiles in _metadata's dispatch order, front to
+    back: the query tiles of a (sequence, head) read its K/V through one XCD's
+    L2, the XCDs get equal loads, and each starts its longest items first. The
+    grid is an upper bound of the class sizes; the workgroups past a class's
+    end exit.
+
+    The item's tiles alternate between two LDS slots. QK of tile 0 comes first,
     masked ahead of the sequence start, then core._mfma_stage takes QK of tile
     j + 1 with PV of tile j for every later tile, the last one masked past the
-    sequence end, and core._pv_last closes with PV of the last tile. The next
-    item's first copies are issued behind the last stage, so they land during
-    the item's epilogue."""
+    sequence end, and core._pv_last closes with PV of the last tile."""
     HN: tl.constexpr = 64
     HD: tl.constexpr = 64
     D: tl.constexpr = 128
     ROW: tl.constexpr = HEADS * D
+    tl.static_assert(HEADS == 4)
     pid = tl.program_id(0)
-    n_ctas = tl.num_programs(0)
-    n_items = tlx.assume_uniform(tl.load(CuQTile + BATCH)) * HEADS
-    base = tlx.assume_uniform(pid % 8 * (n_ctas // 8) + pid // 8)
-    if base >= n_items:
+    xcd = pid % 8
+    group = xcd // HEADS
+    position = pid // 8
+    if position >= tl.load(QTileStart + BATCH + group):
         return
-    n_mine = tlx.assume_uniform((n_items - base + n_ctas - 1) // n_ctas)
+    tile = tlx.assume_uniform(position + group * tl.load(QTileStart + BATCH))
+    head = tlx.assume_uniform((xcd % HEADS).to(tl.int64))
     offs_d = tl.arange(0, D)
     offs_hd = tl.arange(0, HD)
     offs_n = tl.arange(0, HN)
@@ -511,14 +522,20 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
     ksb = tlx.local_alloc((HN, 1), tl.int32, 2)
     vsa = tlx.local_alloc((HN, 1), tl.int32, 2)
     vsb = tlx.local_alloc((HN, 1), tl.int32, 2)
-    item = base
-    if USE_WORK_ORDER:
-        item = tlx.assume_uniform(tl.load(WorkOrder + base))
-    head, q0, q_rows, front, tail, pad_start, n_tiles = _item_uniform(item, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS,
-                                                                      BLOCK_M)
+    q0, q_rows, front, tail, pad_start, n_tiles = _item_uniform(tile, ItemTile, QTileStart, CuQ, CuKV, CuPad, BLOCK_M)
+    if n_tiles == 0:
+        # A sequence with queries but no keys: zero output and -inf LSE.
+        no_keys = offs_mm < q_rows
+        tl.store(Lse + head * TOTAL_Q + q0 + offs_mm, tl.full([BLOCK_M], float("-inf"), tl.float32), mask=no_keys)
+        tl.store(
+            Out + (q0.to(tl.int64) + offs_mm[:, None]) * ROW + head * D + offs_d[None, :],
+            tl.zeros([BLOCK_M, D], tl.bfloat16),
+            mask=no_keys[:, None],
+        )
+        return
     k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off)
-    # The first item's opening copies, as three commit groups: K tile 0 into
-    # slot 1, then the two halves of K tile 1 and V tile 0 into slot 0.
+    # The opening copies, as three commit groups: K tile 0 into slot 1, then
+    # the two halves of K tile 1 and V tile 0 into slot 0.
     tlx.async_load(k_ptr, ka[1])
     tlx.async_load(k_ptr + k_n1, kb[1])
     tlx.async_load(ks_ptr, ksa[1])
@@ -546,258 +563,284 @@ def _mxfp8_varlen_extended_kernel_4(  # noqa: TR001
         v_n1,
         ks_n1,
     )
-    for w in tl.range(0, n_mine, num_stages=1):
-        if not (REUSE_METADATA and USE_WORK_ORDER):
-            item = base + w * n_ctas
-            if USE_WORK_ORDER:
-                item = tlx.assume_uniform(tl.load(WorkOrder + item))
-            head, q0, q_rows, front, tail, pad_start, n_tiles = _item_uniform(item, ItemTile, CuQTile, CuQ, CuKV, CuPad,
-                                                                              HEADS, BLOCK_M)
-        q_base = Q + q0.to(tl.int64) * ROW + head * D
-        q_mask = q_local < q_rows * ROW
-        if PREQUANTIZED_Q:
-            q_lo = tlx.require_layout(
-                tlx.buffer_load(q_base, q_local, q_mask, 0.0, contiguity=16),
-                q_layout,
-            )
-            q_hi = tlx.require_layout(
-                tlx.buffer_load(q_base + HD, q_local, q_mask, 0.0, contiguity=16),
-                q_layout,
-            )
-            if not (REUSE_METADATA and USE_WORK_ORDER):
-                k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off)
-            scale_base = QScales + q0.to(tl.int64) * HEADS * 4 + head * 4
-            scale_offsets = (offs_mm[:, None] * (HEADS * 4) + tl.arange(0, 2)[None, :])
-            scale_mask = (offs_mm < q_rows)[:, None]
-            qs_lo = tlx.require_layout(tl.load(scale_base + scale_offsets, scale_mask, 0), scale_layout)
-            qs_hi = tlx.require_layout(
-                tl.load(scale_base + scale_offsets + 2, scale_mask, 0),
-                scale_layout,
-            )
-        else:
-            q_reg0 = tlx.buffer_load(q_base, q_local, q_mask, 0.0, contiguity=8)
-            q_reg1 = tlx.buffer_load(q_base + HD, q_local, q_mask, 0.0, contiguity=8)
-            tlx.amd_sched_barrier(0)
-            if not (REUSE_METADATA and USE_WORK_ORDER):
-                k_ptr, v_ptr, ks_ptr, vs_ptr = _kv_pointers(K8, V8, KS, VS, head, pad_start, NPAD, k_off, v_off, ks_off)
-            tlx.amd_sched_barrier(0)
-            q_lo, qs_lo = core._quantize_q_half(q_reg0)
-            q_lo = tlx.require_layout(q_lo, q_layout)
-            q_hi, qs_hi = core._quantize_q_half(q_reg1)
-            q_hi = tlx.require_layout(q_hi, q_layout)
-        if FAST_EXP:
-            qs_lo = (tl.maximum(qs_lo, 9) - 9).to(tl.uint8)
-            qs_hi = (tl.maximum(qs_hi, 9) - 9).to(tl.uint8)
-        acc0 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
-        acc1 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
-        acc2 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
-        acc3 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
-        # K tile 0 is in slot 1; only slot 0's two groups may be outstanding.
-        tlx.async_load_wait_group(2)
-        s0, s1 = core._qk_first(q_lo, q_hi, qs_lo, qs_hi, ka[1], kb[1], ksa[1], ksb[1], qk_scale)
-        s0, s1 = _mask_front(s0, s1, front)
-        p0, p1, m_i, l_i = core._softmax_first(s0, s1, FAST_EXP)
-        s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = _mfma_softmax_loop_4w(
-            q_lo,
-            q_hi,
-            qs_lo,
-            qs_hi,
-            ka,
-            kb,
-            ksa,
-            ksb,
-            va,
-            vb,
-            vsa,
-            vsb,
-            s0,
-            s1,
-            p0,
-            p1,
-            m_i,
-            l_i,
-            acc0,
-            acc1,
-            acc2,
-            acc3,
-            n_tiles,
-            k_ptr,
-            v_ptr,
-            ks_ptr,
-            vs_ptr,
-            c_qk,
-            qk_scale,
-            FAST_EXP=FAST_EXP,
+    q_base = Q + q0.to(tl.int64) * ROW + head * D
+    q_mask = q_local < q_rows * ROW
+    if PREQUANTIZED_Q:
+        q_lo = tlx.require_layout(
+            tlx.buffer_load(q_base, q_local, q_mask, 0.0, contiguity=16),
+            q_layout,
         )
-        # The last stage: QK of the last tile, masked past its tail valid keys,
-        # with PV of the tile before it. V's last tile goes to slot 1.
-        k_final_a, k_final_b = ka[0], kb[0]
-        ks_final_a, ks_final_b = ksa[0], ksb[0]
-        s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
-            q_lo,
-            q_hi,
-            qs_lo,
-            qs_hi,
-            k_final_a,
-            k_final_b,
-            ks_final_a,
-            ks_final_b,
-            va[0],
-            vb[0],
-            vsa[0],
-            vsb[0],
-            p0,
-            p1,
-            acc0,
-            acc1,
-            acc2,
-            acc3,
-            l_i,
-            (OFF - m_i) * c_qk,
-            qk_scale,
-            k_ptr,
-            v_ptr,
-            ks_ptr,
-            vs_ptr,
-            # No K refill: the item has no further QK tile, and the next
-            # item's first K tile is issued into these buffers below.
-            None,
-            None,
-            va[1],
-            vb[1],
-            None,
-            None,
-            vsa[1],
-            vsb[1],
-            0,
-            n_tiles - 1,
-            k_step,
-            v_step,
-            ks_step,
-            k_n1,
-            v_n1,
-            ks_n1,
-            tail,
+        q_hi = tlx.require_layout(
+            tlx.buffer_load(q_base + HD, q_local, q_mask, 0.0, contiguity=16),
+            q_layout,
         )
-        # The next item's opening copies, in the same three groups as the
-        # first item's; after the last item they repeat it and go unread. Slot
-        # 1's K buffers have no reader left in this item, and the last stage
-        # has issued all of this item's reads of slot 0.
-        nxt = tl.where(w + 1 < n_mine, item + n_ctas, item)
-        if USE_WORK_ORDER:
-            next_slot = base + tl.where(w + 1 < n_mine, w + 1, w) * n_ctas
-            nxt = tlx.assume_uniform(tl.load(WorkOrder + next_slot))
-        n_head, n_q0, n_q_rows, n_front, n_tail, n_pad_start, n_tiles_next = _item_uniform(
-            nxt, ItemTile, CuQTile, CuQ, CuKV, CuPad, HEADS, BLOCK_M)
-        nk_ptr, nv_ptr, nks_ptr, nvs_ptr = _kv_pointers(K8, V8, KS, VS, n_head, n_pad_start, NPAD, k_off, v_off, ks_off)
-        tlx.async_load(nk_ptr, ka[1])
-        tlx.async_load(nk_ptr + k_n1, kb[1])
-        tlx.async_load(nks_ptr, ksa[1])
-        tlx.async_load(nks_ptr + ks_n1, ksb[1])
-        tlx.async_load_commit_group()
-        core._issue_tile(
-            nk_ptr,
-            nv_ptr,
-            nks_ptr,
-            nvs_ptr,
-            ka[0],
-            kb[0],
-            va[0],
-            vb[0],
-            ksa[0],
-            ksb[0],
-            vsa[0],
-            vsb[0],
-            1,
-            0,
-            k_step,
-            v_step,
-            ks_step,
-            k_n1,
-            v_n1,
-            ks_n1,
+        scale_base = QScales + q0.to(tl.int64) * HEADS * 4 + head * 4
+        scale_offsets = (offs_mm[:, None] * (HEADS * 4) + tl.arange(0, 2)[None, :])
+        scale_mask = (offs_mm < q_rows)[:, None]
+        qs_lo = tlx.require_layout(tl.load(scale_base + scale_offsets, scale_mask, 0), scale_layout)
+        qs_hi = tlx.require_layout(
+            tl.load(scale_base + scale_offsets + 2, scale_mask, 0),
+            scale_layout,
         )
-        # V's last tile and the next item's K tile 0 are in slot 1.
-        tlx.async_load_wait_group(2)
-        p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
-                                                                 FAST_EXP)
-        acc0, acc1, acc2, acc3, l_i = core._pv_last(p0, p1, va[1], vb[1], vsa[1], vsb[1], acc0, acc1, acc2, acc3, l_i)
-        row_layout: tl.constexpr = tlx.slice_layout(mfma, 1)
-        total = tlx.require_layout(tl.sum(l_i, 1), row_layout)
-        scale = (1.0 / total)[:, None]
-        valid = offs_mm < q_rows
-        # P is 2**(x - m_i + 4) with either exponential.
-        lse = (tlx.require_layout(m_i, row_layout) - 4.0 + tl.log2(total)) * 0.6931471805599453
-        tl.store(Lse + head * TOTAL_Q + q0 + offs_mm, lse, mask=valid)
-        offs_c = tl.arange(0, 32)
-        o_rows = Out + (q0.to(tl.int64) + offs_mm[:, None]) * ROW + head * D
-        o_mask = valid[:, None]
-        tl.store(
-            o_rows + offs_c[None, :],
-            (acc0 * scale).to(tl.bfloat16),
-            mask=o_mask,
-        )
-        tl.store(
-            o_rows + offs_c[None, :] + 32,
-            (acc1 * scale).to(tl.bfloat16),
-            mask=o_mask,
-        )
-        tl.store(
-            o_rows + offs_c[None, :] + 64,
-            (acc2 * scale).to(tl.bfloat16),
-            mask=o_mask,
-        )
-        tl.store(
-            o_rows + offs_c[None, :] + 96,
-            (acc3 * scale).to(tl.bfloat16),
-            mask=o_mask,
-        )
-        if REUSE_METADATA and USE_WORK_ORDER:
-            item = nxt
-            head, q0, q_rows = n_head, n_q0, n_q_rows
-            front, tail, pad_start, n_tiles = (
-                n_front,
-                n_tail,
-                n_pad_start,
-                n_tiles_next,
-            )
-            k_ptr, v_ptr, ks_ptr, vs_ptr = nk_ptr, nv_ptr, nks_ptr, nvs_ptr
-    # The copies issued after the last item must land before the program ends.
+    else:
+        q_reg0 = tlx.buffer_load(q_base, q_local, q_mask, 0.0, contiguity=8)
+        q_reg1 = tlx.buffer_load(q_base + HD, q_local, q_mask, 0.0, contiguity=8)
+        tlx.amd_sched_barrier(0)
+        q_lo, qs_lo = core._quantize_q_half(q_reg0)
+        q_lo = tlx.require_layout(q_lo, q_layout)
+        q_hi, qs_hi = core._quantize_q_half(q_reg1)
+        q_hi = tlx.require_layout(q_hi, q_layout)
+    if FAST_EXP:
+        qs_lo = (tl.maximum(qs_lo, 9) - 9).to(tl.uint8)
+        qs_hi = (tl.maximum(qs_hi, 9) - 9).to(tl.uint8)
+    acc0 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
+    acc1 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
+    acc2 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
+    acc3 = tl.zeros([BLOCK_M, 32], dtype=tl.float32)
+    # K tile 0 is in slot 1; only slot 0's two groups may be outstanding.
+    tlx.async_load_wait_group(2)
+    s0, s1 = core._qk_first(q_lo, q_hi, qs_lo, qs_hi, ka[1], kb[1], ksa[1], ksb[1], qk_scale)
+    s0, s1 = _mask_front(s0, s1, front)
+    p0, p1, m_i, l_i = core._softmax_first(s0, s1, FAST_EXP)
+    s0, s1, p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = _mfma_softmax_loop_4w(
+        q_lo,
+        q_hi,
+        qs_lo,
+        qs_hi,
+        ka,
+        kb,
+        ksa,
+        ksb,
+        va,
+        vb,
+        vsa,
+        vsb,
+        s0,
+        s1,
+        p0,
+        p1,
+        m_i,
+        l_i,
+        acc0,
+        acc1,
+        acc2,
+        acc3,
+        n_tiles,
+        k_ptr,
+        v_ptr,
+        ks_ptr,
+        vs_ptr,
+        c_qk,
+        qk_scale,
+        FAST_EXP=FAST_EXP,
+    )
+    # The last stage: QK of the last tile, masked past its tail valid keys,
+    # with PV of the tile before it. V's last tile goes to slot 1.
+    k_final_a, k_final_b = ka[0], kb[0]
+    ks_final_a, ks_final_b = ksa[0], ksb[0]
+    s0, s1, acc0, acc1, acc2, acc3, l_i = core._mfma_stage(
+        q_lo,
+        q_hi,
+        qs_lo,
+        qs_hi,
+        k_final_a,
+        k_final_b,
+        ks_final_a,
+        ks_final_b,
+        va[0],
+        vb[0],
+        vsa[0],
+        vsb[0],
+        p0,
+        p1,
+        acc0,
+        acc1,
+        acc2,
+        acc3,
+        l_i,
+        (OFF - m_i) * c_qk,
+        qk_scale,
+        k_ptr,
+        v_ptr,
+        ks_ptr,
+        vs_ptr,
+        # No K refill: the item has no further QK tile.
+        None,
+        None,
+        va[1],
+        vb[1],
+        None,
+        None,
+        vsa[1],
+        vsb[1],
+        0,
+        n_tiles - 1,
+        k_step,
+        v_step,
+        ks_step,
+        k_n1,
+        v_n1,
+        ks_n1,
+        tail,
+    )
+    # V's last tile, in slot 1.
     tlx.async_load_wait_group(0)
+    p0, p1, m_i, l_i, acc0, acc1, acc2, acc3 = core._softmax(s0, s1, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
+                                                             FAST_EXP)
+    acc0, acc1, acc2, acc3, l_i = core._pv_last(p0, p1, va[1], vb[1], vsa[1], vsb[1], acc0, acc1, acc2, acc3, l_i)
+    row_layout: tl.constexpr = tlx.slice_layout(mfma, 1)
+    total = tlx.require_layout(tl.sum(l_i, 1), row_layout)
+    scale = (1.0 / total)[:, None]
+    valid = offs_mm < q_rows
+    # P is 2**(x - m_i + 4) with either exponential.
+    lse = (tlx.require_layout(m_i, row_layout) - 4.0 + tl.log2(total)) * 0.6931471805599453
+    tl.store(Lse + head * TOTAL_Q + q0 + offs_mm, lse, mask=valid)
+    offs_c = tl.arange(0, 32)
+    o_rows = Out + (q0.to(tl.int64) + offs_mm[:, None]) * ROW + head * D
+    o_mask = valid[:, None]
+    tl.store(
+        o_rows + offs_c[None, :],
+        (acc0 * scale).to(tl.bfloat16),
+        mask=o_mask,
+    )
+    tl.store(
+        o_rows + offs_c[None, :] + 32,
+        (acc1 * scale).to(tl.bfloat16),
+        mask=o_mask,
+    )
+    tl.store(
+        o_rows + offs_c[None, :] + 64,
+        (acc2 * scale).to(tl.bfloat16),
+        mask=o_mask,
+    )
+    tl.store(
+        o_rows + offs_c[None, :] + 96,
+        (acc3 * scale).to(tl.bfloat16),
+        mask=o_mask,
+    )
+
+
+@triton.jit
+# Triton TR001: BLOCK_M matches the host-selected attention tile.
+def _rank(CuQ, CuKV, CostRank, BATCH, BLOCK_M: tl.constexpr, BLOCK: tl.constexpr):  # noqa: TR001
+    """Each sequence's rank by descending cost, query tiles times keys: each
+    program counts the sequences ahead of its own."""
+    sequence = tl.program_id(0)
+    cost = _cost(CuQ, CuKV, sequence, BLOCK_M)
+    rank = 0
+    for start in range(0, BATCH, BLOCK):
+        other = start + tl.arange(0, BLOCK)
+        valid = other < BATCH
+        kv = tl.load(CuKV + other + 1, valid, 0) - tl.load(CuKV + other, valid, 0)
+        q = tl.load(CuQ + other + 1, valid, 0) - tl.load(CuQ + other, valid, 0)
+        other_cost = ((q + BLOCK_M - 1) // BLOCK_M).to(tl.int64) * kv
+        ahead = (other_cost > cost) | ((other_cost == cost) & (other < sequence))
+        rank += tl.sum((ahead & valid).to(tl.int32), 0)
+    tl.store(CostRank + sequence, rank)
+
+
+@triton.jit
+def _order(CuKV, CostRank, SeqByRank, BATCH, BLOCK: tl.constexpr):
+    """The dealing order of the sequences. The classes take the cost ranks as
+    0, 1, 1, 0, 0, 1, 1, 0, ..., which gives them equal costs; within its
+    class a sequence goes by descending keys, the length of its items. Each
+    program counts the sequences of its class ahead of its own and takes the
+    class's slot of that number."""
+    sequence = tl.program_id(0)
+    second = ((tl.load(CostRank + sequence) + 1) & 2) != 0
+    keys = tl.load(CuKV + sequence + 1) - tl.load(CuKV + sequence)
+    place = 0
+    for start in range(0, BATCH, BLOCK):
+        other = start + tl.arange(0, BLOCK)
+        valid = other < BATCH
+        same = (((tl.load(CostRank + other, valid, 0) + 1) & 2) != 0) == second
+        kv = tl.load(CuKV + other + 1, valid, 0) - tl.load(CuKV + other, valid, 0)
+        ahead = (kv > keys) | ((kv == keys) & (other < sequence))
+        place += tl.sum((ahead & same & valid).to(tl.int32), 0)
+    pair = place % 2
+    tl.store(SeqByRank + place // 2 * 4 + tl.where(second, 1 + pair, 3 * pair), sequence)
+
+
+@triton.jit
+def _cost(CuQ, CuKV, sequence, BLOCK_M: tl.constexpr):
+    kv = tl.load(CuKV + sequence + 1) - tl.load(CuKV + sequence)
+    q = tl.load(CuQ + sequence + 1) - tl.load(CuQ + sequence)
+    return ((q + BLOCK_M - 1) // BLOCK_M).to(tl.int64) * kv
+
+
+@triton.jit
+def _ranked_tiles(CuQ, SeqByRank, start, BATCH, BLOCK_M: tl.constexpr, BLOCK: tl.constexpr):
+    """BLOCK sequences from SeqByRank's slot ``start``: (sequence, in range,
+    query tiles, in class 1). The classes take the slots as 0, 1, 1, 0, ..."""
+    rank = start + tl.arange(0, BLOCK)
+    valid = rank < BATCH
+    sequence = tl.load(SeqByRank + rank, valid, 0)
+    q = tl.load(CuQ + sequence + 1, valid, 0) - tl.load(CuQ + sequence, valid, 0)
+    return sequence, valid, (q + BLOCK_M - 1) // BLOCK_M, ((rank + 1) & 2) != 0
 
 
 @triton.jit
 # Triton TR001: BLOCK_M matches the host-selected attention tile.
 def _offsets(  # noqa: TR001
-        CuQ,
-        CuKV,
-        CuPad,
-        CuQTile,
-        BATCH,
-        BLOCK_M: tl.constexpr,
-        PAD: tl.constexpr,
-        BLOCK: tl.constexpr,
+    CuQ,
+    CuKV,
+    CuPad,
+    SeqByRank,
+    QTileStart,
+    BATCH,
+    BLOCK_M: tl.constexpr,
+    PAD: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
-    """Prefix sums of padded key counts and of query tiles, in one program."""
+    """Prefix sums of padded key counts, and the dispatch order of the query
+    tiles, in one program.
+
+    The sequences are dealt in SeqByRank's order to two classes. A class
+    lists the query tiles of its sequences in that order, and class 1's
+    positions follow class 0's. QTileStart holds each sequence's first
+    position, then the two class sizes."""
     tl.store(CuPad, 0)
-    tl.store(CuQTile, 0)
     pad_carry = 0
-    tile_carry = 0
     for start in range(0, BATCH, BLOCK):
         sequence = start + tl.arange(0, BLOCK)
         valid = sequence < BATCH
         kv = tl.load(CuKV + sequence + 1, valid, 0) - tl.load(CuKV + sequence, valid, 0)
-        q = tl.load(CuQ + sequence + 1, valid, 0) - tl.load(CuQ + sequence, valid, 0)
         padded = (kv + PAD - 1) // PAD * PAD
-        tiles = tl.where(kv > 0, (q + BLOCK_M - 1) // BLOCK_M, 0)
         tl.store(CuPad + sequence + 1, tl.cumsum(padded, 0) + pad_carry, valid)
-        tl.store(CuQTile + sequence + 1, tl.cumsum(tiles, 0) + tile_carry, valid)
         pad_carry += tl.sum(padded, 0)
-        tile_carry += tl.sum(tiles, 0)
+    size0 = 0
+    size1 = 0
+    for start in range(0, BATCH, BLOCK):
+        sequence, valid, tiles, second = _ranked_tiles(CuQ, SeqByRank, start, BATCH, BLOCK_M, BLOCK)
+        size0 += tl.sum(tl.where(second, 0, tiles), 0)
+        size1 += tl.sum(tl.where(second, tiles, 0), 0)
+    tl.store(QTileStart + BATCH, size0)
+    tl.store(QTileStart + BATCH + 1, size1)
+    carry0 = 0
+    carry1 = size0
+    for start in range(0, BATCH, BLOCK):
+        sequence, valid, tiles, second = _ranked_tiles(CuQ, SeqByRank, start, BATCH, BLOCK_M, BLOCK)
+        tiles0 = tl.where(second, 0, tiles)
+        tiles1 = tiles - tiles0
+        first = tl.where(second, tl.cumsum(tiles1, 0) - tiles1 + carry1, tl.cumsum(tiles0, 0) - tiles0 + carry0)
+        tl.store(QTileStart + sequence, first, valid)
+        carry0 += tl.sum(tiles0, 0)
+        carry1 += tl.sum(tiles1, 0)
 
 
 @triton.jit
-def _owners(CuPad, CuQTile, TileSequence, ItemTile, TILE_CAPACITY, BATCH, BLOCK: tl.constexpr):
+# Triton TR001: BLOCK_M matches the host-selected attention tile.
+def _owners(  # noqa: TR001
+    CuQ,
+    CuPad,
+    QTileStart,
+    TileSequence,
+    ItemTile,
+    TILE_CAPACITY,
+    BATCH,
+    BLOCK_M: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
     """Sequence of every 64-key preparation tile and query tile;
     program BATCH marks the unused preparation tiles."""
     sequence = tl.program_id(0)
@@ -808,30 +851,11 @@ def _owners(CuPad, CuQTile, TileSequence, ItemTile, TILE_CAPACITY, BATCH, BLOCK:
     for start in range(first, last, BLOCK):
         tl.store(TileSequence + start + lanes, owner, start + lanes < last)
     if sequence < BATCH:
-        last = tl.load(CuQTile + sequence + 1)
-        for start in range(tl.load(CuQTile + sequence), last, BLOCK):
+        q = tl.load(CuQ + sequence + 1) - tl.load(CuQ + sequence)
+        first = tl.load(QTileStart + sequence)
+        last = first + (q + BLOCK_M - 1) // BLOCK_M
+        for start in range(first, last, BLOCK):
             tl.store(ItemTile + start + lanes, owner, start + lanes < last)
-
-
-@triton.jit(do_not_specialize=["TOTAL_Q"])
-def _fill_empty(Out, Lse, CuQ, CuKV, TOTAL_Q, HEADS: tl.constexpr, ROWS: tl.constexpr):
-    """Zero output and -inf LSE for a sequence with queries but no keys."""
-    sequence = tl.program_id(0)
-    if tl.load(CuKV + sequence + 1) == tl.load(CuKV + sequence):
-        lo = tl.load(CuQ + sequence)
-        hi = tl.load(CuQ + sequence + 1)
-        rows = tl.arange(0, ROWS)
-        cols = tl.arange(0, HEADS * 128)
-        zeros = tl.zeros((ROWS, HEADS * 128), tl.bfloat16)
-        for start in range(lo, hi, ROWS):
-            row = start + rows
-            tl.store(
-                Out + row.to(tl.int64)[:, None] * (HEADS * 128) + cols[None, :],
-                zeros,
-                mask=(row < hi)[:, None],
-            )
-            for head in tl.static_range(HEADS):
-                tl.store(Lse + head * TOTAL_Q + row, float("-inf"), mask=row < hi)
 
 
 # Metadata per (cu_seqlens_q, cu_seqlens_k, sizes): a model's layers reuse
@@ -841,7 +865,8 @@ _METADATA: dict[tuple[Any, ...], tuple[Any, Any, dict[str, Any]]] = {}
 
 
 def _metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad=_PAD):
-    """Device tables: padded key offsets, prep tiles and query-tile items."""
+    """Device tables: padded key offsets, prep tiles, and the query tiles in
+    dispatch order."""
     key = (
         id(cu_seqlens_q),
         cu_seqlens_q._version,
@@ -870,14 +895,30 @@ def _build_metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad)
     tile_capacity = total_kv // _PREP_ROWS + batch * pad // _PREP_ROWS
     item_capacity = total_q // block_m + batch
     cu_pad = torch.empty(batch + 1, device=device, dtype=torch.int32)
-    cu_q_tile = torch.empty_like(cu_pad)
+    q_tile_start = torch.empty(batch + 2, device=device, dtype=torch.int32)
     tile_sequence = torch.empty(tile_capacity, device=device, dtype=torch.int32)
     item_tile = torch.empty(item_capacity, device=device, dtype=torch.int32)
+    if batch <= _RANK_MAX_BATCH:
+        cost_rank = torch.empty(batch, device=device, dtype=torch.int32)
+        seq_by_rank = torch.empty(batch, device=device, dtype=torch.int32)
+        cast(Any, _rank)[(batch, )](
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cost_rank,
+            batch,
+            BLOCK_M=block_m,
+            BLOCK=256,
+            num_warps=1,
+        )
+        cast(Any, _order)[(batch, )](cu_seqlens_k, cost_rank, seq_by_rank, batch, BLOCK=256, num_warps=1)
+    else:
+        seq_by_rank = torch.arange(batch, device=device, dtype=torch.int32)
     cast(Any, _offsets)[(1, )](
         cu_seqlens_q,
         cu_seqlens_k,
         cu_pad,
-        cu_q_tile,
+        seq_by_rank,
+        q_tile_start,
         batch,
         BLOCK_M=block_m,
         PAD=pad,
@@ -885,12 +926,14 @@ def _build_metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad)
         num_warps=4,
     )
     cast(Any, _owners)[(batch + 1, )](
+        cu_seqlens_q,
         cu_pad,
-        cu_q_tile,
+        q_tile_start,
         tile_sequence,
         item_tile,
         tile_capacity,
         batch,
+        BLOCK_M=block_m,
         BLOCK=256,
         num_warps=1,
     )
@@ -898,9 +941,10 @@ def _build_metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad)
         "cu_pad": cu_pad,
         "tile_sequence": tile_sequence,
         "tile_capacity": tile_capacity,
-        "cu_q_tile": cu_q_tile,
+        "q_tile_start": q_tile_start,
         "item_tile": item_tile,
-        "item_capacity": item_capacity,
+        # Upper bounds: a class has at most half of the sequences, rounded up.
+        "class_capacity": total_q // block_m + triton.cdiv(batch, 2),
         # An upper bound of the padded key count.
         "npad": triton.cdiv(total_kv + (pad - 1) * batch, pad) * pad,
     }
@@ -949,139 +993,6 @@ def _check_offsets(offsets, device):
     if (offsets.ndim != 1 or offsets.numel() < 2 or offsets.dtype != torch.int32 or not offsets.is_contiguous()
             or offsets.device != device):
         raise ValueError("Requires contiguous int32 sequence offsets on the input device")
-
-
-@dataclass(frozen=True)
-class ForwardWorkSchedule:
-    """Assignment of work items to the persistent grid.
-
-    ``item_order[base + n * num_ctas]`` is the n-th work item of the program
-    with slot ``base``. ``total_q``, ``total_kv`` and ``batch`` identify the
-    lengths the schedule was built for. The offset tensors and their versions
-    tie the schedule to the exact per-sequence lengths, not just their totals.
-    ``needs_empty_fill`` is set when a sequence has queries but no keys; such
-    sequences have no work items and get their rows from a separate fill.
-    ``item_count`` is the number of work items: the kernel follows
-    ``item_order`` only when it covers every item, and otherwise takes the
-    items in index order."""
-
-    item_order: torch.Tensor
-    num_ctas: int
-    total_q: int
-    total_kv: int
-    batch: int
-    cu_seqlens_q: torch.Tensor
-    cu_seqlens_k: torch.Tensor
-    cu_seqlens_q_version: int
-    cu_seqlens_k_version: int
-    needs_empty_fill: bool = True
-    item_count: int | None = None
-
-
-def prepare_work_schedule(
-    query_lengths,
-    key_lengths,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    *,
-    num_ctas=512,
-):
-    """Build a reusable KV-cost-balanced persistent work schedule.
-
-    Every program gets a fixed share of the work items. The items are taken
-    longest key span first, each going to the least loaded program that still
-    has room. The lengths are host lists, so building a schedule does not read
-    device memory. The schedule is valid only with the immutable offset tensors
-    passed here."""
-    if num_ctas < 8 or num_ctas % 8:
-        raise ValueError("Requires a multiple of eight CTAs")
-    if not isinstance(query_lengths, (list, tuple)) or not isinstance(key_lengths, (list, tuple)):
-        raise ValueError("Requires CPU lists or tuples of sequence lengths")
-    if len(query_lengths) != len(key_lengths) or not query_lengths:
-        raise ValueError("Query and key lengths must have the same nonzero batch size")
-    if any(not isinstance(n, int) or n < 0 for n in (*query_lengths, *key_lengths)):
-        raise ValueError("Sequence lengths must be nonnegative integers")
-    _check_offsets(cu_seqlens_q, cu_seqlens_q.device)
-    _check_offsets(cu_seqlens_k, cu_seqlens_q.device)
-    if cu_seqlens_q.shape != cu_seqlens_k.shape or cu_seqlens_q.numel() != len(query_lengths) + 1:
-        raise ValueError("Offset tensors must match the supplied sequence lengths")
-    costs = []
-    for q_length, k_length in zip(query_lengths, key_lengths):
-        if k_length:
-            costs.extend([triton.cdiv(k_length, _PAD)] * (triton.cdiv(q_length, _BLOCK_M) * _HEADS))
-    count = len(costs)
-    capacities = [triton.cdiv(count - base, num_ctas) for base in range(min(num_ctas, count))]
-    bins = [(0, base, 0) for base in range(len(capacities))]
-    heapq.heapify(bins)
-    order = [0] * count
-    for item in sorted(range(count), key=lambda index: (-costs[index], index)):
-        load, base, assigned = heapq.heappop(bins)
-        order[base + assigned * num_ctas] = item
-        assigned += 1
-        if assigned < capacities[base]:
-            heapq.heappush(bins, (load + costs[item], base, assigned))
-    return ForwardWorkSchedule(
-        torch.tensor(order, dtype=torch.int32, device=cu_seqlens_q.device),
-        num_ctas,
-        sum(query_lengths),
-        sum(key_lengths),
-        len(query_lengths),
-        cu_seqlens_q,
-        cu_seqlens_k,
-        cu_seqlens_q._version,
-        cu_seqlens_k._version,
-        any(q_length > 0 and k_length == 0 for q_length, k_length in zip(query_lengths, key_lengths)),
-        count,
-    )
-
-
-def _check_work_schedule(schedule, q, total_kv, batch, num_ctas, cu_seqlens_q, cu_seqlens_k):
-    """Reject a schedule not tied to these exact immutable offsets."""
-    if schedule is None:
-        return
-    if (schedule.total_q != q.shape[0] or schedule.total_kv != total_kv or schedule.batch != batch
-            or (num_ctas is not None and num_ctas != schedule.num_ctas) or schedule.item_order.device != q.device
-            or schedule.cu_seqlens_q is not cu_seqlens_q or schedule.cu_seqlens_k is not cu_seqlens_k
-            or schedule.cu_seqlens_q_version != cu_seqlens_q._version
-            or schedule.cu_seqlens_k_version != cu_seqlens_k._version):
-        raise ValueError("Work schedule must match the exact input offsets, device, and grid")
-
-
-_AUTOMATIC_SCHEDULES: dict[tuple[Any, ...], tuple[Any, Any, ForwardWorkSchedule]] = {}
-
-
-def _automatic_work_schedule(cu_seqlens_q, cu_seqlens_k, device, *, num_ctas):
-    """Create the balanced schedule used by the public forward paths.
-
-    Reading the lengths synchronizes with the device, so schedules are cached
-    like _metadata's tables. With num_ctas None the grid is one program per
-    work item, rounded up to a multiple of eight and capped at 512."""
-    key = (
-        id(cu_seqlens_q),
-        cu_seqlens_q._version,
-        id(cu_seqlens_k),
-        cu_seqlens_k._version,
-        num_ctas,
-    )
-    hit = _AUTOMATIC_SCHEDULES.get(key)
-    if hit is not None and hit[0]() is cu_seqlens_q and hit[1]() is cu_seqlens_k:
-        return hit[2]
-    query_lengths = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).detach().cpu().tolist()
-    key_lengths = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).detach().cpu().tolist()
-    if num_ctas is None:
-        work_items = sum(triton.cdiv(q, _BLOCK_M) * _HEADS for q, k in zip(query_lengths, key_lengths) if k)
-        num_ctas = min(512, max(8, triton.cdiv(work_items, 8) * 8))
-    schedule = prepare_work_schedule(
-        query_lengths,
-        key_lengths,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        num_ctas=num_ctas,
-    )
-    if len(_AUTOMATIC_SCHEDULES) >= 64:
-        _AUTOMATIC_SCHEDULES.pop(next(iter(_AUTOMATIC_SCHEDULES)))
-    _AUTOMATIC_SCHEDULES[key] = (weakref.ref(cu_seqlens_q), weakref.ref(cu_seqlens_k), schedule)
-    return schedule
 
 
 @triton.jit
@@ -1158,8 +1069,6 @@ def forward_prequantized(
     *,
     total_kv,
     fast_exp=None,
-    num_ctas=None,
-    work_schedule=None,
 ):
     """Return output and natural-log LSE from prepared MXFP8 inputs.
 
@@ -1176,25 +1085,6 @@ def forward_prequantized(
         raise ValueError("Query and key sequence offsets must have the same shape")
     if (not isinstance(total_kv, int) or total_kv < 0 or not math.isfinite(sm_scale)):
         raise ValueError("total_kv must be nonnegative and sm_scale must be finite")
-    if num_ctas is not None and (num_ctas < 8 or num_ctas % 8):
-        raise ValueError("num_ctas must be a positive multiple of eight")
-    batch = cu_seqlens_k.numel() - 1
-    if work_schedule is None:
-        work_schedule = _automatic_work_schedule(
-            cu_seqlens_q,
-            cu_seqlens_k,
-            device,
-            num_ctas=num_ctas,
-        )
-    _check_work_schedule(
-        work_schedule,
-        q8,
-        total_kv,
-        batch,
-        num_ctas,
-        cu_seqlens_q,
-        cu_seqlens_k,
-    )
     meta = _metadata(cu_seqlens_q, cu_seqlens_k, q8.shape[0], total_kv, _BLOCK_M)
     npad = meta["npad"]
     tensors = (
@@ -1223,9 +1113,9 @@ def forward_prequantized(
         cu_seqlens_k,
         sm_scale,
         meta,
+        total_kv,
         fast_exp,
         True,
-        work_schedule,
     )
 
 
@@ -1250,8 +1140,6 @@ def forward(
     *,
     fast_exp=None,
     kv_state=None,
-    num_ctas=None,
-    work_schedule=None,
 ):
     """Return (out, lse, kv_state); lse is natural-log FP32 [4, total_q].
 
@@ -1259,27 +1147,9 @@ def forward(
     approximate exponential; left as None, it is used when the sequences
     average at least 4096 keys. Sequences with no keys get zero
     output rows and -inf LSE. The sequence-offset tensors must not be
-    modified in place while their prepared metadata and work schedule are
-    reused."""
+    modified in place while their prepared metadata is reused."""
     # With a given kv_state, K and V only supply their shape.
     _check(q, k, v, sm_scale, kv_contiguous=kv_state is None)
-    batch = cu_seqlens_k.numel() - 1
-    if work_schedule is None:
-        work_schedule = _automatic_work_schedule(
-            cu_seqlens_q,
-            cu_seqlens_k,
-            q.device,
-            num_ctas=num_ctas,
-        )
-    _check_work_schedule(
-        work_schedule,
-        q,
-        k.shape[0],
-        batch,
-        num_ctas,
-        cu_seqlens_q,
-        cu_seqlens_k,
-    )
     meta = _metadata(cu_seqlens_q, cu_seqlens_k, q.shape[0], k.shape[0], _BLOCK_M)
     if kv_state is None:
         kv_state = prepare_kv(k, v, cu_seqlens_k, meta)
@@ -1295,9 +1165,9 @@ def forward(
         cu_seqlens_k,
         sm_scale,
         meta,
+        k.shape[0],
         fast_exp,
         False,
-        work_schedule,
     )
     return out, lse, kv_state
 
@@ -1341,27 +1211,24 @@ def _launch_extended_forward(
     cu_seqlens_k,
     sm_scale,
     meta,
+    total_kv,
     fast_exp,
     prequantized,
-    work_schedule,
 ):
-    """Launch the attention kernel, then the fill for sequences with queries
-    but no keys. Returns (out, lse). ``q`` is BF16, or E4M3 with ``q_scales``
-    when ``prequantized``."""
+    """Launch the attention kernel. Returns (out, lse). ``q`` is BF16, or E4M3
+    with ``q_scales`` when ``prequantized``."""
     batch = cu_seqlens_k.numel() - 1
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     lse = torch.empty((_HEADS, q.shape[0]), dtype=torch.float32, device=q.device)
-    grid = work_schedule.num_ctas
-    long_kv = work_schedule.total_kv >= _LONG_KV * batch
     if fast_exp is None:
-        fast_exp = long_kv
+        fast_exp = total_kv >= _LONG_KV * batch
+    # One workgroup per work item: per XCD, a head of a class of query tiles.
+    # The class sizes are only known on the device.
+    grid = 8 * meta["class_capacity"]
     kernel = cast(Any, _mxfp8_varlen_extended_kernel_4)
-    use_work_order = (work_schedule.item_count is not None
-                      and work_schedule.item_count == work_schedule.item_order.numel())
     kernel[(grid, )](
         q,
         q_scales if q_scales is not None else q,
-        work_schedule.item_order,
         k8,
         v8,
         ks,
@@ -1371,7 +1238,7 @@ def _launch_extended_forward(
         cu_seqlens_q,
         cu_seqlens_k,
         meta["cu_pad"],
-        meta["cu_q_tile"],
+        meta["q_tile_start"],
         meta["item_tile"],
         batch,
         q.shape[0],
@@ -1381,19 +1248,6 @@ def _launch_extended_forward(
         BLOCK_M=_BLOCK_M,
         FAST_EXP=fast_exp,
         PREQUANTIZED_Q=prequantized,
-        REUSE_METADATA=not long_kv,
-        USE_WORK_ORDER=use_work_order,
         **_LAUNCH_OPTIONS,
     )
-    if work_schedule.needs_empty_fill:
-        cast(Any, _fill_empty)[(batch, )](
-            out,
-            lse,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            q.shape[0],
-            HEADS=_HEADS,
-            ROWS=8,
-            num_warps=4,
-        )
     return out, lse

@@ -1,8 +1,8 @@
 """L2 performance coverage for ``tlx.ops.flash_attn_varlen_mxfp8``.
 
-K/V preparation and the host-built work schedule are reusable state and stay
-outside the measured closure. Correctness is covered by the op's L1 tests; this
-benchmark tracks the prepared attention core without a reference provider.
+K/V preparation is reusable state and stays outside the measured closure.
+Correctness is covered by the op's L1 tests; this benchmark tracks the prepared
+attention core without a reference provider.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import sys
 import torch
 from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8._shapes import FOCUS as SHAPE_SUITES
 from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8._shapes import (SYNTHETIC, FlashAttentionVarlenMXFP8Shape, flops,
-                                                                   inputs, label, lengths)
+                                                                    inputs, label, lengths)
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -40,8 +40,7 @@ def cases(synthetic: bool = False, suites=None) -> list[Case]:
             dtype=str(DTYPES[entry.dtype]).removeprefix("torch."),
             shape=tuple(entry[:-1]),
             label=label(*entry),
-        )
-        for entry in shapes(synthetic, suites)
+        ) for entry in shapes(synthetic, suites)
     ]
 
 
@@ -54,12 +53,6 @@ def prepare(case: Case, space: str) -> Prepared:
     q, k, v, cu_q, cu_k = inputs(query_lengths, key_lengths, getattr(torch, case.dtype))
     metadata = gfx950._metadata(cu_q, cu_k, q.shape[0], k.shape[0], 128)
     kv_state = gfx950.prepare_kv(k, v, cu_k, metadata)
-    schedule = gfx950.prepare_work_schedule(
-        query_lengths,
-        key_lengths,
-        cu_q,
-        cu_k,
-    )
 
     def tlx_fwd():
         return gfx950.forward(
@@ -70,7 +63,6 @@ def prepare(case: Case, space: str) -> Prepared:
             cu_k,
             128**-0.5,
             kv_state=kv_state,
-            work_schedule=schedule,
         )[0]
 
     return Prepared(
