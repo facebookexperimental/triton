@@ -429,6 +429,17 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="moe_mxfp4_sort_quant",
+        arch="gfx950",
+        variant="one_launch",
+        impl="triton.tlx.ops.kernels.fused.moe_mxfp4_sort_quant.gfx950:moe_mxfp4_sort_quant",
+        dtypes=_BF16,
+        # Decode-sized calls: every program recomputes the routing layout over all T tokens (T * topk <= 512).
+        accepts=lambda d: 0 < d["T"] <= 64 and d["K"] % 256 == 0 and 0 < d["topk"] <= 8 and 0 < d["E_local"] <= 64 and
+        d["block_m"] == 32,
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="router_gemm",
         arch="gfx950",
         variant="bf16x3_split_k",

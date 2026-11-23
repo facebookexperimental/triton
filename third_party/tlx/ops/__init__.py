@@ -122,14 +122,14 @@ from ._normalization import (
 
 __all__ = [
     "mm", "mm_bias_grad", "int4_embedding", "mm_mxfp", "mm_mxfp6", "grouped_gemm", "grouped_gemm_mxfp8", "moe",
-    "moe_routing", "moe_finalize", "moe_router_topk_align", "norm_residual_norm", "all_reduce", "all_reduce_workspace",
-    "all_reduce_norm_residual_norm", "rmsnorm_gate", "router_gemm", "qk_norm_rope_kv_cache", "addmm", "addmm_mul_add",
-    "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen", "linear_rowscale",
-    "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev", "hstu_cross_attn",
-    "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode", "prepare_flash_attn_varlen_backward",
-    "flash_attn_varlen_backward", "paged_attention_decode", "paged_attention_prefill",
-    "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d", "UnsupportedOp",
-    "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
+    "moe_routing", "moe_finalize", "moe_router_topk_align", "moe_mxfp4_sort_quant", "norm_residual_norm", "all_reduce",
+    "all_reduce_workspace", "all_reduce_norm_residual_norm", "rmsnorm_gate", "router_gemm", "qk_norm_rope_kv_cache",
+    "addmm", "addmm_mul_add", "addmm_mul_add_launch", "flash_attn", "flash_attn_mxfp8", "flash_attn_varlen",
+    "linear_rowscale", "linear_rowscale_launch", "rmsnorm_cat", "swiglu_ffn", "mla_window_attn", "hstu_attn_dev",
+    "hstu_cross_attn", "kimi_delta_attention", "kda_paged_prefill", "kda_recurrent_decode",
+    "prepare_flash_attn_varlen_backward", "flash_attn_varlen_backward", "paged_attention_decode",
+    "paged_attention_prefill", "paged_attention_decode_workspace", "allocate_paged_kv_cache_5d", "reshape_and_cache_5d",
+    "UnsupportedOp", "UnsupportedBackward", "InvalidInput", "BitwiseInvarianceSpec", "Space"
 ]
 __all__ += [
     'paged_attention_decode_fp8', 'paged_attention_decode_fp8_workspace', 'compute_norm_nvfp4_global_scale',
@@ -1220,6 +1220,65 @@ def moe_router_topk_align(x, weight, correction_bias, topk=8, *, num_local_exper
     with torch.cuda.device(x.device):
         return fn(x, weight, correction_bias, topk, num_local_experts, local_expert_start, block_m, router_multiplier,
                   route_scale, eps)
+
+
+def moe_mxfp4_sort_quant(x, topk_ids, *, num_local_experts, local_expert_start=0, num_experts, block_m=32, space=None):
+    """The decode-sized prologue of an MXFP4 (A4W4) routed MoE in one launch: the expert-aligned slot sort, the
+    per-row MXFP4 quantization of the activations and the scale sort that AITER's A4W4 stage kernels read. Forward
+    only.
+
+    Bit-exact with AITER's ``moe_sorting`` (with the expert mask of the local experts), ``dynamic_mxfp4_quant``
+    (round-up amax, scale ``2^(floor(log2(amax)) - 2)``, RNE E2M1, unshuffled) and ``moe_mxfp4_sort`` on every byte the
+    stage kernels read. Returns ``(x_fp4, sorted_ids, sorted_expert_ids, num_valid_ids, sorted_scales)``:
+
+    - ``x_fp4`` uint8 ``(T, K / 2)``, two E2M1 values per byte (even element in the low nibble), in token order;
+    - ``sorted_ids`` int32 of length ``cap = T * topk + num_experts * block_m - topk`` (AITER's allocation), the routed
+      slots of experts ``[local_expert_start, local_expert_start + num_local_experts)`` grouped by local expert
+      (ascending) into ``block_m``-row blocks, tokens ascending within an expert, each entry ``token | slot << 24`` and
+      padding ``T | topk << 24``; entries past ``num_valid_ids[0]`` are not written;
+    - ``sorted_expert_ids`` int32 ``(ceil(cap / block_m),)``, the local expert of each used block;
+    - ``num_valid_ids`` int32 ``(2,)``: the number of positions in used blocks, and ``T``;
+    - ``sorted_scales`` uint8 ``(ceil(cap / 32) * 32, K / 32)``, the E8M0 scale of each sorted row in
+      ``moe_mxfp4_sort``'s 32 x 8 tiles; rows of padding slots are not written (the GEMMs never use them for a real
+      token's output).
+
+    ``x`` is bf16 ``(T, K)`` with unit column stride, ``1 <= T <= 64`` and ``K % 256 == 0``; ``topk_ids`` int32
+    ``(T, topk)`` with ``1 <= topk <= 8``, contiguous global expert ids, a token's ids distinct, ids outside the local
+    range skipped; ``1 <= num_local_experts <= 64``; ``block_m`` is 32. Graph-capturable: launch shapes depend only on
+    ``T``, nothing is read on the host. Rows are quantized independently, so a row's bytes do not depend on the batch.
+    Only ``space="heuristic"`` is provided.
+    """
+    import torch
+
+    if not isinstance(x, torch.Tensor) or not isinstance(topk_ids, torch.Tensor):
+        raise InvalidInput("tlx.ops.moe_mxfp4_sort_quant expects tensors x and topk_ids")
+    if x.ndim != 2 or topk_ids.ndim != 2 or topk_ids.shape[0] != x.shape[0]:
+        raise InvalidInput("tlx.ops.moe_mxfp4_sort_quant expects x (T, K) and topk_ids (T, topk); got "
+                           f"{tuple(x.shape)} and {tuple(topk_ids.shape)}")
+    T, K = x.shape
+    topk = topk_ids.shape[1]
+    if (x.dtype != torch.bfloat16 or (K > 1 and x.stride(1) != 1) or (T > 1 and x.stride(0) < K)
+            or topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous()):
+        raise InvalidInput("tlx.ops.moe_mxfp4_sort_quant expects bf16 x with unit column stride and rows that do not "
+                           "overlap, and contiguous int32 topk_ids")
+    for name, value in (("num_local_experts", num_local_experts), ("local_expert_start", local_expert_start),
+                        ("num_experts", num_experts), ("block_m", block_m)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise InvalidInput(f"tlx.ops.moe_mxfp4_sort_quant expects an int {name}; got {value!r}")
+    if not 1 <= num_local_experts <= num_experts or not 0 <= local_expert_start <= num_experts - num_local_experts:
+        raise InvalidInput(f"tlx.ops.moe_mxfp4_sort_quant expects local experts within [0, {num_experts}); got start "
+                           f"{local_expert_start} and count {num_local_experts}")
+    if topk_ids.device != x.device:
+        raise InvalidInput("tlx.ops.moe_mxfp4_sort_quant expects all tensors on one device")
+
+    space_name, invariance = _normalize_space_arg("moe_mxfp4_sort_quant", space)
+    _check_single_config_space("moe_mxfp4_sort_quant", space_name)
+    fn, spec = impl_for("moe_mxfp4_sort_quant", device=x.device)
+    check_inputs(spec, dtype=x.dtype, T=T, K=K, topk=topk, E_local=num_local_experts, block_m=block_m)
+    check_backward(spec, x)
+    _check_enforced("moe_mxfp4_sort_quant", spec, invariance)
+    with torch.cuda.device(x.device):
+        return fn(x, topk_ids, local_expert_start, num_local_experts, num_experts, block_m)
 
 
 def qk_norm_rope_kv_cache(q, k, v, k_cache, v_cache, slot_mapping, *, eps, q_scale=1.0, positions=None,
