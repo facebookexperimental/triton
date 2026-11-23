@@ -27700,7 +27700,7 @@ def _range_winner_is_stable(a, b, out, candidates, timings, winner, use_cache):
     return sorted(cold[1])[4] <= sorted(cold[0])[4] * _COLD_RECHECK_TOLERANCE
 
 
-def mm(a, b, *, out=None, space="heuristic", invariance=None):
+def mm(a, b, *, out=None, space="heuristic", invariance=None, b_static=False):
     """Run the trusted gfx950 entry selected after ``tlx.ops.mm`` validation.
 
     A fixed schedule prunes the K-splitting dispatch families so the K
