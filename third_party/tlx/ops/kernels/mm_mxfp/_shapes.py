@@ -76,8 +76,14 @@ FOCUS_SUITES = (
     FocusSuite(name="gfx950_1", op="mm_mxfp", shapes=PRODUCTION_SHAPES),
     FocusSuite(name="gfx950_short_m", op="mm_mxfp", shapes=PRODUCTION_SHORT_M_SHAPES),
     FocusSuite(name="gfx950_model_linears", op="mm_mxfp", shapes=MODEL_LINEAR_SHAPES),
+    # The synthetic shapes are the sm100 export set: the production shapes
+    # are gfx950-sized and have no sm100 tuning coverage.
+    FocusSuite(name="sm100_1", op="mm_mxfp", shapes=SYNTHETIC_SHAPES),
 )
-DEFAULT_SUITES = {"gfx950": ("gfx950_1", "gfx950_short_m", "gfx950_model_linears")}
+DEFAULT_SUITES = {
+    "gfx950": ("gfx950_1", "gfx950_short_m", "gfx950_model_linears"),
+    "sm100": ("sm100_1", ),
+}
 FOCUS = FocusRegistry("mm_mxfp", FOCUS_SUITES, DEFAULT_SUITES)
 
 
