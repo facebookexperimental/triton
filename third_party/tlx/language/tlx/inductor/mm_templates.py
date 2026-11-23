@@ -327,6 +327,21 @@ gfx950_addmm_persistent_warppipe_template = TritonTemplate(
     source=load_tlx_template("gfx950_addmm_persistent_warppipe"),
 )
 
+# MI450X (gfx1250) TDM GEMM ported from tutorials/amd_tdm_gemm_pipelined.py.
+# mm and addmm share the kernel source; addmm gets its bias expanded to [M, N]
+# by tlx_kernel_inputs.
+gfx1250_mm_tdm_template = TritonTemplate(
+    name="tlx_gfx1250_mm_tdm",
+    grid=mm_grid,
+    source="# tlx_gfx1250_mm_tdm\n" + load_tlx_template("gfx1250_mm_tdm"),
+)
+
+gfx1250_addmm_tdm_template = TritonTemplate(
+    name="tlx_gfx1250_addmm_tdm",
+    grid=mm_grid,
+    source="# tlx_gfx1250_addmm_tdm\n" + load_tlx_template("gfx1250_mm_tdm"),
+)
+
 # Templates whose every output store goes through reduction_store_output.
 for _template in (
         hopper_gemm_small_k_template,
@@ -389,6 +404,15 @@ def _append_tlx_amd(templates, op_name):
             if template.uid not in uids:
                 templates.append(template)
             return templates
+        if current_target().is_gfx1250:
+            template = (
+                gfx1250_mm_tdm_template
+                if op_name == "mm"
+                else gfx1250_addmm_tdm_template
+            )
+            if template.uid not in uids:
+                templates.append(template)
+            return templates
         if op_name == "mm":
             for template in (
                     gfx950_mm_extern,
@@ -445,6 +469,7 @@ def tlx_kernel_inputs(template, kernel_inputs, op_name):
             hopper_gemm_ws_template,
             hopper_gemm_small_k_template,
             gfx942_addmm_template,
+            gfx1250_addmm_tdm_template,
             gfx950_addmm_interwave_template,
             gfx950_addmm_warppipe_template,
             gfx950_addmm_persistent_warppipe_template,

@@ -66,6 +66,11 @@ def is_gfx942() -> bool:
     return current_target().is_gfx942
 
 
+def is_gfx1250() -> bool:
+    """True on AMD MI450X (gfx1250), where the TDM TorchTLX GEMM runs."""
+    return current_target().is_gfx1250
+
+
 def is_hopper() -> bool:
     """True on an H100, where local-buffer retention uses SMEM."""
     return current_target().is_hopper
@@ -1037,6 +1042,32 @@ class TestTLXTemplates(TestCase):
         torch.testing.assert_close(actual, fn(*args), atol=0.05, rtol=0.05)
         # Inductor names a kernel lowered from a TLX template triton_tem_fused_tlx_<op>.
         self.assertIn(f"tem_fused_tlx_{op_name}", "\n".join(code))
+
+    @unittest.skipIf(not is_gfx1250(), "Need AMD MI450X (gfx1250)")
+    @parametrize("op_name", ("mm", "addmm"))
+    @parametrize("col_major_b", (False, True))
+    def test_tlx_gfx1250_tdm_template(self, op_name, col_major_b) -> None:
+        # M is ragged so the TDM bounds check has to zero-fill the last row tile.
+        m, n, k = 1000, 1024, 512
+        torch.manual_seed(0)
+        a = torch.randn((m, k), device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn((n, k), device=GPU_TYPE, dtype=torch.float16).t() if col_major_b else torch.randn(
+            (k, n), device=GPU_TYPE, dtype=torch.float16)
+        if op_name == "mm":
+            args, fn = (a, b), torch.mm
+        else:
+            args, fn = (torch.randn((n, ), device=GPU_TYPE, dtype=torch.float16), a, b), torch.addmm
+        torch._dynamo.reset()
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "max_autotune": True,
+                "fx_graph_cache": False,
+                "fx_graph_remote_cache": False,
+        }):
+            compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+            actual, code = run_and_get_code(compiled, *args)
+        torch.testing.assert_close(actual, fn(*args), atol=0.05, rtol=0.05)
+        self.assertIn(f"tlx_gfx1250_{op_name}_tdm", "\n".join(code))
 
     @unittest.skipIf(not is_gfx942(), "Need AMD MI300X (gfx942)")
     @parametrize("shape", ((440, 4096, 1093), (902, 4096, 1091), (440, 4096, 2048), (2020, 4096, 1091),
