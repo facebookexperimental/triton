@@ -7557,6 +7557,11 @@ def _compile_gfx1250_mxgemm_persistent(dtype_b, num_buffers, block_k, c_type="*f
                   XCD_REMAP_MODE=0, NUM_XCDS=8, XCD_CHUNK=2, CLUSTER_SIZE=1, CLUSTER_MULTICAST=True,
                   CLUSTER_BARRIER_INTERVAL=1, CLUSTER_LAYOUT="linear")
     config.update(constants)
+    # ASTSource does not apply parameter defaults; constexprs the caller leaves
+    # out would otherwise arrive as None.
+    for param in kernel.params:
+        if param.is_constexpr and param.has_default and param.name not in config:
+            config[param.name] = param.default
     src = ASTSource(kernel, signature=signature, attrs=attrs, constexprs=config)
     compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32),
                               options=dict(num_warps=4, waves_per_eu=1, ctas_per_cga=(config["CLUSTER_SIZE"], 1, 1)))
