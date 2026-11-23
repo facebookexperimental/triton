@@ -70,6 +70,25 @@ void tensormap_replace_attr(Location loc, MLIRContext *ctx,
                                    descPtr, Value(), IntegerAttr(), newVal);
 }
 
+// Copies `ptr` through an opaque move so that `tensormap.replace` addresses the
+// descriptor through a register. When LLVM folds the address into a constant
+// shared-memory symbol offset, ptxas stops using the uniform datapath for the
+// surrounding index math in register-limited warp partitions: the TLX sm100
+// `flash_attn_varlen` forward, which builds a descriptor per tile, spilled and
+// ran 25% slower.
+static Value opaqueSharedAddress(ConversionPatternRewriter &rewriter,
+                                 Location loc, Value ptr) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  PTXBuilder ptxBuilder;
+  auto &mov = *ptxBuilder.create("mov.b64 $0, $1;");
+  mov({ptxBuilder.newOperand("=l"),
+       ptxBuilder.newOperand(b.ptrtoint(i64_ty, ptr), "l")},
+      /*onlyAttachMLIRArgs=*/true);
+  Value addr =
+      ptxBuilder.launch(rewriter, loc, i64_ty, /*hasSideEffect=*/false);
+  return b.inttoptr(ptr.getType(), addr);
+}
+
 struct TensormapFenceproxyAcquireOpConversion
     : public ConvertOpToLLVMPattern<ttng::TensormapFenceproxyAcquireOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
@@ -149,20 +168,21 @@ struct TensormapCreateOpConversion
         createIfBlock(rewriter, loc, isLeader);
     (void)previousBlock;
     rewriter.setInsertionPointToStart(updateBlock);
+    Value descAddr = opaqueSharedAddress(rewriter, loc, smemBase);
     tensormap_replace_generic(loc, ctx, rewriter,
-                              NVVM::TensormapField::GLOBAL_ADDRESS, smemBase,
+                              NVVM::TensormapField::GLOBAL_ADDRESS, descAddr,
                               adaptor.getGlobalAddress());
     if (op.getRank() > 1)
       tensormap_replace_generic(loc, ctx, rewriter, NVVM::TensormapField::RANK,
-                                smemBase, b.i32_val(op.getRank() - 1));
+                                descAddr, b.i32_val(op.getRank() - 1));
     for (int i = 0; i < op.getRank(); ++i) {
       tensormap_replace_generic(loc, ctx, rewriter,
-                                NVVM::TensormapField::BOX_DIM, smemBase,
+                                NVVM::TensormapField::BOX_DIM, descAddr,
                                 op.getBoxDim()[i], i);
     }
     for (int i = 0; i < op.getRank(); ++i) {
       tensormap_replace_generic(loc, ctx, rewriter,
-                                NVVM::TensormapField::GLOBAL_DIM, smemBase,
+                                NVVM::TensormapField::GLOBAL_DIM, descAddr,
                                 op.getGlobalDim()[i], i);
     }
     for (int i = 0; i + 1 < op.getRank(); ++i) {
@@ -172,29 +192,29 @@ struct TensormapCreateOpConversion
         strideVal = b.ashr(strideVal, b.i64_val(4));
       }
       tensormap_replace_generic(loc, ctx, rewriter,
-                                NVVM::TensormapField::GLOBAL_STRIDE, smemBase,
+                                NVVM::TensormapField::GLOBAL_STRIDE, descAddr,
                                 strideVal, i);
     }
     for (int i = 0; i < op.getRank(); ++i) {
       tensormap_replace_generic(loc, ctx, rewriter,
-                                NVVM::TensormapField::ELEMENT_STRIDE, smemBase,
+                                NVVM::TensormapField::ELEMENT_STRIDE, descAddr,
                                 op.getElementStride()[i], i);
     }
     tensormap_replace_attr(
-        loc, ctx, rewriter, NVVM::TensormapField::ELEMTYPE, smemBase,
+        loc, ctx, rewriter, NVVM::TensormapField::ELEMTYPE, descAddr,
         NVVM::TensormapElemtypeAttr::get(
             ctx, static_cast<NVVM::TensormapElemtype>(op.getElemType())));
     tensormap_replace_attr(
-        loc, ctx, rewriter, NVVM::TensormapField::INTERLEAVE_LAYOUT, smemBase,
+        loc, ctx, rewriter, NVVM::TensormapField::INTERLEAVE_LAYOUT, descAddr,
         NVVM::TensormapInterleaveLayoutAttr::get(
             ctx, static_cast<NVVM::TensormapInterleaveLayout>(
                      op.getInterleaveLayout())));
     tensormap_replace_attr(
-        loc, ctx, rewriter, NVVM::TensormapField::SWIZZLE_MODE, smemBase,
+        loc, ctx, rewriter, NVVM::TensormapField::SWIZZLE_MODE, descAddr,
         NVVM::TensormapSwizzleModeAttr::get(
             ctx, static_cast<NVVM::TensormapSwizzleMode>(op.getSwizzleMode())));
     tensormap_replace_attr(
-        loc, ctx, rewriter, NVVM::TensormapField::FILL_MODE, smemBase,
+        loc, ctx, rewriter, NVVM::TensormapField::FILL_MODE, descAddr,
         NVVM::TensormapFillModeAttr::get(
             ctx, static_cast<NVVM::TensormapFillMode>(op.getFillMode())));
     rewriter.setInsertionPointToStart(continuationBlock);
