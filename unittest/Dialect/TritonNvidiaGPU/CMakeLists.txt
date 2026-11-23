@@ -6,6 +6,7 @@ add_triton_ut(
     TritonGPUIR
     TritonNvidiaGPUIR
     TritonGPUTransforms
+    NVHopperTransforms
     TritonNvidiaGPUTransforms
 )
 
@@ -17,5 +18,6 @@ add_triton_ut(
     TritonGPUIR
     TritonNvidiaGPUIR
     TritonGPUTransforms
+    NVHopperTransforms
     TritonNvidiaGPUTransforms
 )

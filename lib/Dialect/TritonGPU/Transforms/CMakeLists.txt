@@ -46,6 +46,7 @@ add_triton_library(TritonGPUTransforms
 
   DEPENDS
   TritonGPUTransformsIncGen
+  NVHopperTransformsIncGen
 
   LINK_LIBS PUBLIC
   MLIRTransforms

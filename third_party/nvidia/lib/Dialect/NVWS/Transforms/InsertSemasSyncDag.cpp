@@ -713,6 +713,7 @@ public:
     if (hadError || failed(resolveDeferredEntries()))
       return failure();
     if (remainingEdges.empty() && placed.supplies.empty()) {
+      drainTerminalAsyncChannels();
       if (failed(verifyRegionDrains()))
         return failure();
       if (failed(formSemaphores()))
@@ -1009,6 +1010,32 @@ private:
     uniteChannels(drain, channel);
     regionDrains.push_back({anchor, channel, owner, drain, {}});
     return regionDrains.back();
+  }
+  void drainTerminalAsyncChannels() {
+    for (Node *region : g.nodesOfKind(Node::For)) {
+      if (!gpu::hasWarpSpecializeTag(region->op) || region->flow)
+        continue;
+      auto pieces = sortedPieceInfo(region);
+      if (llvm::any_of(pieces, [&](const auto &piece) {
+            return pieceTouchedAfter(g, region, piece.first);
+          }))
+        continue;
+      for (const auto &[_, info] : pieces) {
+        Node *channel = regionChannelFor(region, info.owner);
+        if (!channel)
+          continue;
+        bool hasAsyncClose =
+            llvm::any_of(g.nodesOfKind(Node::Release), [&](Node *release) {
+              return withinRegion(release, region) && release->sat &&
+                     findChannel(release->sat) == findChannel(channel) &&
+                     hasAsyncPayload(release->payloads);
+            });
+        // The next iteration normally acquires this channel. On loop exit,
+        // observe its final async release before the barriers are destroyed.
+        if (hasAsyncClose)
+          getOrCreateRegionDrain(region, info.owner, channel, nullptr);
+      }
+    }
   }
   LogicalResult verifyRegionDrains() {
     for (auto [index, entry] : llvm::enumerate(regionDrains)) {
@@ -2404,7 +2431,7 @@ static LogicalResult verifySyncDag(GroupDag &g) {
   });
   return result;
 }
-using ScheduleCache = DenseMap<int64_t, gpu::StageCluster>;
+using ScheduleCache = DenseMap<int64_t, Operation *>;
 using ScheduleEdge = std::pair<Operation *, Operation *>;
 struct OwnerScheduleConstraint {
   Owner producerOwner, consumerOwner;
@@ -2417,6 +2444,15 @@ struct OwnerScheduleConstraint {
 struct LoopScheduleModel {
   SmallVector<ScheduleEdge, 4> clusterEdges;
   SmallVector<OwnerScheduleConstraint, 4> ownerConstraints;
+  struct DeferredEdge {
+    unsigned constraint;
+    const Node *release;
+  };
+  SmallVector<DeferredEdge> deferredEdges;
+  // Preserve original SSA dependencies and block order through emission.
+  llvm::MapVector<Operation *, std::pair<int, int>> operations;
+  SmallVector<ScheduleEdge, 4> operandEdges;
+  DenseSet<ScheduleEdge> ssaOrdered;
 };
 struct SlotSchedule {
   int64_t advancesPerIteration = 0;
@@ -2518,7 +2554,27 @@ static LogicalResult assignCircularStageOffsets(PhysicalSets &physical) {
         return semaError(member.allocOp)
                << "circular consumer appears before producer";
     }
-    auto assignProtocolOffset = [](Node *n, Node *Node::*step) {
+    auto assignProtocolOffset = [&](GroupDag *group, Node *n,
+                                    Node *Node::*step) {
+      Node *anchor = n->scheduleAnchor;
+      if (n->kind == Node::Acquire && anchor->isRegion() &&
+          anchor->parent == n->parent && precedesInChain(anchor, n)) {
+        // A region-exit acquire observes this group's last produced slot.
+        // Rebase it against the final cursor of the entire physical ring;
+        // the release-site offset may precede advances by another group.
+        std::optional<int64_t> slot, cursor;
+        for (const SlotEvent &event : ordered) {
+          if (!anchor->op->isProperAncestor(event.node->op))
+            continue;
+          cursor = slots.baseOrdinalByEvent.lookup(event.node);
+          if (event.group == group)
+            slot = slots.ordinalByAccess.lookup(event.node);
+        }
+        if (slot && cursor) {
+          n->stageOffset = *slot - *cursor;
+          return;
+        }
+      }
       if (n->scheduleAnchor->bufferStageOffset) {
         n->stageOffset = n->scheduleAnchor->bufferStageOffset;
         return;
@@ -2532,9 +2588,9 @@ static LogicalResult assignCircularStageOffsets(PhysicalSets &physical) {
     };
     for (GroupDag *g : set) {
       for (Node *acquire : g->nodesOfKind(Node::Acquire))
-        assignProtocolOffset(acquire, &Node::next);
+        assignProtocolOffset(g, acquire, &Node::next);
       for (Node *release : g->nodesOfKind(Node::Release))
-        assignProtocolOffset(release, &Node::prev);
+        assignProtocolOffset(g, release, &Node::prev);
     }
   }
   return success();
@@ -2592,9 +2648,6 @@ static int64_t positiveMod(int64_t value, int64_t modulus) {
   int64_t remainder = value % modulus;
   return remainder < 0 ? remainder + modulus : remainder;
 }
-struct SlotPair {
-  int64_t producer, consumer, advances;
-};
 static std::optional<SlotPair> findSlotPair(const SlotSchedule &slots,
                                             Node *producer, Node *consumer) {
   auto producerIt = slots.ordinalByAccess.find(producer);
@@ -2607,23 +2660,31 @@ static std::optional<SlotPair> findSlotPair(const SlotSchedule &slots,
                   slots.advancesPerIteration};
 }
 static std::optional<int64_t>
-computeLoopCarriedDistance(const SlotSchedule &slots,
-                           int64_t numSemaphoreCopies, Node *producer,
-                           Node *consumer) {
-  if (numSemaphoreCopies == 1)
-    return 1; // one slot: a loop-carried pair spans exactly one iteration
-  std::optional<SlotPair> pair = findSlotPair(slots, producer, consumer);
-  if (!pair)
-    return std::nullopt;
-  int64_t orbit =
-      numSemaphoreCopies / std::gcd(numSemaphoreCopies, pair->advances);
-  for (int64_t distance = 1; distance <= orbit; ++distance)
-    if (positiveMod(pair->consumer + distance * pair->advances,
-                    numSemaphoreCopies) ==
-        positiveMod(pair->producer, numSemaphoreCopies))
-      return distance;
-  return std::nullopt;
+computeLoopCarriedDistance(const SlotSchedule &slots, int64_t depth,
+                           Node *producer, Node *consumer) {
+  if (depth == 1)
+    return 1;
+  auto pair = findSlotPair(slots, producer, consumer);
+  return pair ? pair->reuseDistance(depth) : std::nullopt;
 }
+
+// A group whose acquires execute directly in this loop has one fixed stride.
+// Acquires outside this loop belong to other iterations or schedules.
+static bool hasDirectAcquireSequence(const GroupDag &group, const Node *release,
+                                     scf::ForOp loop) {
+  const Node *body = release->parent;
+  const Node *source = release->tokenSource;
+  bool localToken =
+      source->kind == Node::Acquire
+          ? source->parent == body
+          : source->flow && (source == body || source->parent == body);
+  if (!localToken)
+    return false;
+  return llvm::none_of(group.nodesOfKind(Node::Acquire), [&](Node *acquire) {
+    return loop->isProperAncestor(acquire->parent->op);
+  });
+}
+
 static bool isAliasedMultibufferedGroup(const GroupDag &group) {
   if (group.isCircular() || group.pieceTable.members.size() < 2 ||
       group.numSemaphoreCopies <= 1)
@@ -2766,7 +2827,18 @@ static void assignAliasedEntryReleasedMasks(PhysicalSets &physical,
   }
 }
 
-static LogicalResult solveOwnerScheduleConstraints(LoopScheduleModel &model) {
+static bool alreadySSAOrdered(Operation *producer, Operation *consumer) {
+  SetVector<Operation *> slice;
+  BackwardSliceOptions options;
+  options.omitBlockArguments = true;
+  options.filter = [&](Operation *op) {
+    return op->getBlock() == consumer->getBlock();
+  };
+  (void)getBackwardSlice(consumer, &slice, options);
+  return slice.contains(producer);
+}
+static LogicalResult solveOwnerScheduleConstraints(LoopScheduleModel &model,
+                                                   CurrentOp currentOp) {
   auto &constraints = model.ownerConstraints;
   DenseMap<int64_t, int64_t> offset;
   for (const OwnerScheduleConstraint &constraint : constraints) {
@@ -2808,7 +2880,7 @@ static LogicalResult solveOwnerScheduleConstraints(LoopScheduleModel &model) {
     for (unsigned edgeIndex : cycle)
       cycleDelay += constraints[edgeIndex].requiredDelay();
     const OwnerScheduleConstraint &first = constraints[cycle.front()];
-    InFlightDiagnostic diag = semaError(first.producer)
+    InFlightDiagnostic diag = semaError(currentOp(first.producer))
                               << "fixed loop.stage assignments form an "
                                  "unsatisfiable semaphore handoff cycle";
     diag << " (cycle requires " << cycleDelay
@@ -2816,10 +2888,11 @@ static LogicalResult solveOwnerScheduleConstraints(LoopScheduleModel &model) {
          << ")";
     for (unsigned edgeIndex : llvm::reverse(cycle)) {
       const OwnerScheduleConstraint &constraint = constraints[edgeIndex];
-      diag.attachNote(constraint.consumer->getLoc())
+      diag.attachNote(currentOp(constraint.consumer)->getLoc())
           << "handoff "
-          << ownerStr(constraint.producer, constraint.producerOwner) << " -> "
-          << ownerStr(constraint.consumer, constraint.consumerOwner)
+          << ownerStr(currentOp(constraint.producer), constraint.producerOwner)
+          << " -> "
+          << ownerStr(currentOp(constraint.consumer), constraint.consumerOwner)
           << " has producer loop.stage " << constraint.producerStage
           << ", consumer loop.stage " << constraint.consumerStage
           << ", loop-carried dependency distance " << constraint.distance
@@ -2847,16 +2920,7 @@ static LogicalResult solveOwnerScheduleConstraints(LoopScheduleModel &model) {
     }
     return false;
   };
-  auto alreadySSAOrdered = [](Operation *producer, Operation *consumer) {
-    SetVector<Operation *> slice;
-    BackwardSliceOptions options;
-    options.omitBlockArguments = true;
-    options.filter = [&](Operation *op) {
-      return op->getBlock() == consumer->getBlock();
-    };
-    (void)getBackwardSlice(consumer, &slice, options);
-    return slice.contains(producer);
-  };
+
   for (const OwnerScheduleConstraint &constraint : constraints) {
     bool tight = isTight(constraint);
     // A raw zero-delay handoff can still have slack after solving the owner
@@ -2866,8 +2930,14 @@ static LogicalResult solveOwnerScheduleConstraints(LoopScheduleModel &model) {
     bool orders = tight && (constraint.requiredDelay() == 0 ||
                             hasTightPath(ownerKey(constraint.consumerOwner),
                                          ownerKey(constraint.producerOwner)));
-    if (orders && !alreadySSAOrdered(constraint.producer, constraint.consumer))
-      model.clusterEdges.emplace_back(constraint.producer, constraint.consumer);
+    if (orders) {
+      ScheduleEdge edge{constraint.producer, constraint.consumer};
+      bool ordered = model.deferredEdges.empty()
+                         ? alreadySSAOrdered(edge.first, edge.second)
+                         : model.ssaOrdered.contains(edge);
+      if (!ordered)
+        model.clusterEdges.push_back(edge);
+    }
   }
   return success();
 }
@@ -2906,46 +2976,57 @@ static LogicalResult addSyncScheduleEdges(
             gpu::getStageCluster(consumerAnchor);
         if (!producerSchedule || !consumerSchedule)
           break;
+        LoopScheduleModel &model = modelsByLoop[loop.getOperation()];
         int64_t distance = acquire->recurrenceDistance.value_or(0);
         if (!acquire->recurrenceDistance &&
             !precedesInChain(release, acquire)) {
-          const SlotSchedule &slots =
-              computeSlotSchedule(physical[physicalKey(group)], loop);
-          std::optional<int64_t> loopCarriedDistance =
-              computeLoopCarriedDistance(slots, group.numSemaphoreCopies,
-                                         release->scheduleAnchor,
-                                         acquire->scheduleAnchor);
-          if (!loopCarriedDistance) {
-            InFlightDiagnostic diag =
-                semaError(producerAnchor)
-                << "cannot determine loop-carried dependency distance for a "
-                   "physical buffer slot";
-            diag.attachNote(consumerAnchor->getLoc())
-                << "next token ownership starts here";
-            return failure();
+          if (group.isSingleMultibufferedTmem() &&
+              release->parent == acquire->parent &&
+              release->parent->op == loop.getOperation() &&
+              hasDirectAcquireSequence(group, release, loop)) {
+            // The acquire's token users determine whether the TMEM cursor
+            // advances. Those users exist only after renderChain.
+            model.deferredEdges.push_back(
+                {static_cast<unsigned>(model.ownerConstraints.size()),
+                 release});
+          } else {
+            const SlotSchedule &slots =
+                computeSlotSchedule(physical[physicalKey(group)], loop);
+            std::optional<int64_t> loopCarriedDistance =
+                computeLoopCarriedDistance(slots, group.numSemaphoreCopies,
+                                           release->scheduleAnchor,
+                                           acquire->scheduleAnchor);
+            if (!loopCarriedDistance) {
+              InFlightDiagnostic diag =
+                  semaError(producerAnchor)
+                  << "cannot determine loop-carried dependency distance for a "
+                     "physical buffer slot";
+              diag.attachNote(consumerAnchor->getLoc())
+                  << "next token ownership starts here";
+              return failure();
+            }
+            distance = *loopCarriedDistance;
           }
-          distance = *loopCarriedDistance;
         }
-        modelsByLoop[loop.getOperation()].ownerConstraints.push_back(
-            OwnerScheduleConstraint{
-                release->owner, acquire->owner, producerAnchor, consumerAnchor,
-                producerSchedule->first, consumerSchedule->first, distance});
+        model.ownerConstraints.push_back(OwnerScheduleConstraint{
+            release->owner, acquire->owner, producerAnchor, consumerAnchor,
+            producerSchedule->first, consumerSchedule->first, distance});
         break;
       }
     }
   }
   return success();
 }
-static LogicalResult
-legalizeLoopSchedule(scf::ForOp loop, ArrayRef<ScheduleEdge> edges,
-                     SmallVectorImpl<ScheduleUpdate> &updates) {
-  SmallVector<ScheduleEdge> constraints(edges.begin(), edges.end());
-  DenseMap<Operation *, int64_t> cluster;
+static void collectLoopSchedule(scf::ForOp loop, LoopScheduleModel &model) {
+  if (!model.deferredEdges.empty())
+    for (const auto &edge : model.ownerConstraints)
+      if (alreadySSAOrdered(edge.producer, edge.consumer))
+        model.ssaOrdered.insert({edge.producer, edge.consumer});
   for (Operation &consumer : loop.getBody()->without_terminator()) {
     gpu::StageCluster schedule = gpu::getStageCluster(&consumer);
     if (!schedule)
       continue;
-    cluster[&consumer] = schedule->second;
+    model.operations.insert({&consumer, *schedule});
     for (Value operand : getNestedOperands(&consumer)) {
       auto [producer, distance] =
           triton::getDefiningOpAndDistance(loop, operand);
@@ -2957,11 +3038,26 @@ legalizeLoopSchedule(scf::ForOp loop, ArrayRef<ScheduleEdge> edges,
       gpu::StageCluster producerSchedule = gpu::getStageCluster(producer);
       if (producerSchedule &&
           producerSchedule->first == schedule->first + distance)
-        constraints.emplace_back(producer, &consumer);
+        model.operandEdges.emplace_back(producer, &consumer);
     }
   }
+}
+
+static LogicalResult
+legalizeLoopSchedule(scf::ForOp loop, const LoopScheduleModel &model,
+                     SmallVectorImpl<ScheduleUpdate> &updates,
+                     CurrentOp currentOp) {
+  DenseMap<Operation *, int64_t> cluster;
+  for (auto &[op, schedule] : model.operations)
+    cluster[op] = schedule.second;
+  auto precedes = [&](Operation *a, Operation *b) {
+    return model.operations.find(a) < model.operations.find(b);
+  };
+  SmallVector<ScheduleEdge, 8> constraints(model.clusterEdges.begin(),
+                                           model.clusterEdges.end());
+  llvm::append_range(constraints, model.operandEdges);
   for (auto [producer, consumer] : constraints) {
-    if (producer->isBeforeInBlock(consumer))
+    if (precedes(producer, consumer))
       continue;
     cluster[producer] =
         std::min(cluster.lookup(producer), cluster.lookup(consumer) - 1);
@@ -2970,7 +3066,7 @@ legalizeLoopSchedule(scf::ForOp loop, ArrayRef<ScheduleEdge> edges,
     bool changed = false;
     for (auto [producer, consumer] : constraints) {
       int64_t required =
-          cluster.lookup(producer) + !producer->isBeforeInBlock(consumer);
+          cluster.lookup(producer) + !precedes(producer, consumer);
       if (cluster.lookup(consumer) >= required)
         continue;
       cluster[consumer] = required;
@@ -2983,25 +3079,26 @@ legalizeLoopSchedule(scf::ForOp loop, ArrayRef<ScheduleEdge> edges,
                                 << "cyclic loop.cluster constraints";
       if (shouldDumpDag())
         for (auto [producer, consumer] : constraints)
-          diag.attachNote(producer->getLoc())
-              << producer->getName() << " (cluster " << cluster.lookup(producer)
-              << ") -> " << consumer->getName() << " (cluster "
+          diag.attachNote(currentOp(producer)->getLoc())
+              << currentOp(producer)->getName() << " (cluster "
+              << cluster.lookup(producer) << ") -> "
+              << currentOp(consumer)->getName() << " (cluster "
               << cluster.lookup(consumer) << ")";
       return failure();
     }
   }
   int64_t rebase = 0;
   for (auto [op, legalized] : cluster)
-    rebase = std::max(rebase, gpu::getStageCluster(op)->second - legalized);
+    rebase = std::max(rebase, model.operations.lookup(op).second - legalized);
   for (auto [op, legalized] : cluster) {
-    gpu::StageCluster oldSchedule = gpu::getStageCluster(op);
+    auto oldSchedule = model.operations.lookup(op);
     assert(legalized <= std::numeric_limits<int32_t>::max() - rebase &&
            "legalized loop.cluster must fit i32");
     int64_t newCluster = legalized + rebase;
-    if (newCluster == oldSchedule->second)
+    if (newCluster == oldSchedule.second)
       continue;
     updates.emplace_back(
-        op, std::make_pair(oldSchedule->first, static_cast<int>(newCluster)));
+        op, std::make_pair(oldSchedule.first, static_cast<int>(newCluster)));
   }
   return success();
 }
@@ -3012,60 +3109,81 @@ static gpu::StageCluster finalSchedule(Operation *op,
       return schedule;
   return gpu::getStageCluster(op);
 }
-static gpu::StageCluster
-scheduleAtOwnerBoundary(const Node *n, gpu::StageCluster schedule,
-                        ArrayRef<ScheduleUpdate> updates) {
-  if (!schedule || findScheduleAnchor(n->next))
-    return schedule;
+// Usually a semaphore operation inherits the schedule of one original op.
+// A tail acquire takes the latest cluster of its owner in the same stage.
+static void assignNodeSchedule(Node *n, Operation *source, bool atBoundary,
+                               ArrayRef<ScheduleUpdate> updates,
+                               const DenseSet<Operation *> &deferredOps,
+                               NodeScheduleSources &sources) {
+  if (!source)
+    return;
+  auto schedule = finalSchedule(source, updates);
+  if (!schedule)
+    return;
+
+  SmallVector<ScheduleUpdate, 1> inputs;
+  bool deferred = deferredOps.contains(source);
+  if (!deferredOps.empty())
+    inputs.emplace_back(source, schedule);
   auto forOp = dyn_cast<scf::ForOp>(n->parent->op);
-  if (!forOp || !forOp->hasAttr(triton::kScheduledMaxStageAttrName))
-    return schedule;
-  auto [stage, cluster] = *schedule;
-  for (Operation &op : forOp.getBody()->without_terminator()) {
-    gpu::StageCluster candidate = finalSchedule(&op, updates);
-    if (candidate && candidate->first == stage && gpu::hasPartition(&op) &&
-        gpu::getPartitionIds(&op).contains(n->owner->first))
-      cluster = std::max(cluster, candidate->second);
+  if (atBoundary && !findScheduleAnchor(n->next) && forOp &&
+      forOp->hasAttr(triton::kScheduledMaxStageAttrName)) {
+    for (Operation &op : forOp.getBody()->without_terminator()) {
+      auto candidate = finalSchedule(&op, updates);
+      if (!candidate || candidate->first != schedule->first ||
+          !gpu::hasPartition(&op) ||
+          !gpu::getPartitionIds(&op).contains(n->owner->first))
+        continue;
+      schedule->second = std::max(schedule->second, candidate->second);
+      if (!deferredOps.empty())
+        inputs.emplace_back(&op, candidate);
+      deferred |= deferredOps.contains(&op);
+    }
   }
-  return std::make_pair(stage, cluster);
+  n->stageCluster = schedule;
+  if (deferred)
+    sources.try_emplace(n, std::move(inputs));
 }
 static void assignSyncScheduleChain(Node *head, ScheduleCache &cache,
-                                    ArrayRef<ScheduleUpdate> updates) {
+                                    ArrayRef<ScheduleUpdate> updates,
+                                    const DenseSet<Operation *> &deferredOps,
+                                    NodeScheduleSources &sources) {
   for (Node *n = head; n; n = n->next) {
     switch (n->kind) {
     case Node::Acquire: {
       if (!n->owner)
         break;
-      gpu::StageCluster boundary =
-          scheduleAtOwnerBoundary(n, cache.lookup(ownerKey(n->owner)), updates);
-      if (n->recurrenceDistance && n->next && n->next->kind == Node::Exit)
-        n->stageCluster = boundary;
-      else {
-        Operation *anchor = findScheduleAnchor(n->scheduleAnchor);
-        n->stageCluster = anchor ? finalSchedule(anchor, updates) : boundary;
-      }
+      Operation *anchor = nullptr;
+      if (!(n->recurrenceDistance && n->next && n->next->kind == Node::Exit))
+        anchor = findScheduleAnchor(n->scheduleAnchor);
+      assignNodeSchedule(n, anchor ? anchor : cache.lookup(ownerKey(n->owner)),
+                         !anchor, updates, deferredOps, sources);
       break;
     }
     case Node::Release:
       if (n->owner)
-        n->stageCluster = cache.lookup(ownerKey(n->owner));
+        assignNodeSchedule(n, cache.lookup(ownerKey(n->owner)), false, updates,
+                           deferredOps, sources);
       break;
     case Node::Access:
       if (n->owner)
-        cache[ownerKey(n->owner)] = finalSchedule(
-            n->completionAnchor ? n->completionAnchor : n->op, updates);
+        cache[ownerKey(n->owner)] =
+            n->completionAnchor ? n->completionAnchor : n->op;
       break;
     case Node::For: {
       ScheduleCache body = cache;
-      assignSyncScheduleChain(n->children[0], body, updates);
+      assignSyncScheduleChain(n->children[0], body, updates, deferredOps,
+                              sources);
       if (!gpu::hasWarpSpecializeTag(n->op))
         cache = std::move(body);
       break;
     }
     case Node::If: {
       ScheduleCache thenCache = cache, elseCache = cache;
-      assignSyncScheduleChain(n->children[0], thenCache, updates);
-      assignSyncScheduleChain(n->children[1], elseCache, updates);
+      assignSyncScheduleChain(n->children[0], thenCache, updates, deferredOps,
+                              sources);
+      assignSyncScheduleChain(n->children[1], elseCache, updates, deferredOps,
+                              sources);
       cache = std::move(thenCache);
       for (auto &[key, stageCluster] : elseCache)
         cache.try_emplace(key, stageCluster);
@@ -3205,8 +3323,8 @@ static LogicalResult planPhysicalResources(MutableArrayRef<GroupDag> groups) {
   }
   return success();
 }
-LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups,
-                                   SmallVectorImpl<ScheduleUpdate> &updates) {
+LogicalResult scheduleAndEmit(triton::FuncOp funcOp,
+                              MutableArrayRef<GroupDag> groups) {
   llvm::MapVector<Operation *, LoopScheduleModel> modelsByLoop;
   PhysicalSets physical;
   for (GroupDag &group : groups)
@@ -3220,18 +3338,67 @@ LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups,
     assignAliasedEntryReleasedMasks(physical, group);
   if (failed(addSyncScheduleEdges(groups, physical, modelsByLoop)))
     return failure();
+  SmallVector<ScheduleUpdate> updates;
+  NodeScheduleSources sources;
+  auto finish = [&](const DenseMap<const Node *, int64_t> &distances,
+                    DenseMap<ScheduleOrigin, gpu::StageCluster> &changed,
+                    CurrentOp currentOp) -> LogicalResult {
+    SmallVector<ScheduleUpdate> lateUpdates;
+    for (auto &[loopOp, model] : modelsByLoop) {
+      for (const auto &edge : model.deferredEdges)
+        model.ownerConstraints[edge.constraint].distance =
+            distances.at(edge.release);
+      if (failed(solveOwnerScheduleConstraints(model, currentOp)) ||
+          failed(legalizeLoopSchedule(cast<scf::ForOp>(currentOp(loopOp)),
+                                      model, lateUpdates, currentOp)))
+        return failure();
+    }
+
+    // Use the same original scheduling anchors as in the early calculation,
+    // including every same-owner candidate for a loop-boundary acquire.
+    for (auto &[op, value] : lateUpdates)
+      changed[op] = value;
+    if (!changed.empty())
+      for (const auto &[node, inputs] : sources) {
+        gpu::StageCluster schedule;
+        for (const auto &[origin, initial] : inputs) {
+          auto found = changed.find(origin);
+          auto value = found == changed.end() ? initial : found->second;
+          if (!schedule || value->second > schedule->second)
+            schedule = value;
+        }
+        if (schedule != node->stageCluster)
+          changed.try_emplace(node, schedule);
+      }
+    return success();
+  };
+
+  DeferredSchedules deferred{{}, {}, sources, finish};
   for (auto &[loopOp, model] : modelsByLoop) {
     auto loop = cast<scf::ForOp>(loopOp);
-    if (failed(solveOwnerScheduleConstraints(model)) ||
-        failed(legalizeLoopSchedule(loop, model.clusterEdges, updates))) {
+    collectLoopSchedule(loop, model);
+    if (!model.deferredEdges.empty()) {
+      for (const auto &edge : model.deferredEdges)
+        deferred.handoffs.insert(edge.release);
+      for (auto &entry : model.operations)
+        deferred.scheduledOps.insert(entry.first);
+      continue;
+    }
+    auto identity = [](Operation *op) { return op; };
+    if (failed(solveOwnerScheduleConstraints(model, identity)) ||
+        failed(legalizeLoopSchedule(loop, model, updates, identity))) {
       dumpSyncDagTrees(groups);
       return failure();
     }
   }
+  // Only affected loop models must survive emission.
+  modelsByLoop.remove_if(
+      [](const auto &entry) { return entry.second.deferredEdges.empty(); });
   for (GroupDag &g : groups)
     for (Node *head : g.root->children) {
       ScheduleCache cache;
-      assignSyncScheduleChain(head, cache, updates);
+      assignSyncScheduleChain(head, cache, updates, deferred.scheduledOps,
+                              sources);
     }
   if (failed(planPhysicalResources(groups)))
     return failure();
@@ -3240,7 +3407,8 @@ LogicalResult finalizeSyncSchedule(MutableArrayRef<GroupDag> groups,
       return failure();
     g.seal();
   }
-  return success();
+  dumpSyncDags(groups, funcOp);
+  return emitIR(funcOp, groups, updates, deferred);
 }
 
 LogicalResult buildSyncDag(GroupDag &g, bool useMetaPartitioner,

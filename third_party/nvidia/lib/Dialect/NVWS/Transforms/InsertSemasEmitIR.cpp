@@ -187,6 +187,15 @@ void dumpSyncDags(MutableArrayRef<GroupDag> groups, triton::FuncOp func) {
 }
 
 struct EmitCtx {
+  explicit EmitCtx(const DeferredSchedules &deferred) : deferred(deferred) {
+    for (Operation *op : deferred.scheduledOps)
+      scheduleOrigins[op] = op;
+  }
+  const DeferredSchedules &deferred;
+  // Only populated when a loop's cluster order depends on the emitted
+  // acquires. A replacement/derived op inherits its source's final schedule.
+  DenseMap<Operation *, ScheduleOrigin> scheduleOrigins;
+  DenseMap<Operation *, Operation *> replacements;
   triton::FuncOp func;
   Value poison; // the single function-level ub.poison token (contract E)
   Type tokenType;
@@ -214,10 +223,24 @@ struct EmitCtx {
     assert(nodeOps.count(node) && "unindexed SYNC-DAG node");
     return nodeOps.lookup(node);
   }
+  void inheritSchedule(Operation *source, Operation *derived) {
+    if (auto origin = scheduleOrigins.lookup(source))
+      scheduleOrigins[derived] = origin;
+  }
+  void bindProtocolOp(const Node *node, Operation *op) {
+    nodeOps[node] = op;
+    if (deferred.protocolSources.contains(node))
+      scheduleOrigins[op] = node;
+  }
   void replaceOp(Operation *oldOp, Operation *newOp) {
     for (auto &entry : nodeOps)
       if (entry.second == oldOp)
         entry.second = newOp;
+    if (!deferred.handoffs.empty()) {
+      replacements[oldOp] = newOp;
+      inheritSchedule(oldOp, newOp);
+      scheduleOrigins.erase(oldOp);
+    }
   }
   ArrayRef<Value> backing(const GroupDag &g) const {
     return backings.find(g.physicalBacking)->second;
@@ -330,7 +353,7 @@ static ArrayAttr asyncOpsAttr(MLIRContext *ctx, const Node *rel) {
     elems.push_back(nvws::AsyncOpAttr::get(ctx, p));
   return ArrayAttr::get(ctx, elems);
 }
-static Value materializeI32Before(Operation *op, int64_t value);
+static Value materializeI32Before(EmitCtx &ctx, Operation *op, int64_t value);
 static void nukeGroupTokens(EmitCtx &ctx, const GroupDag &g) {
   auto nukeOp = [&](Operation *op) {
     Value token;
@@ -506,10 +529,9 @@ getTmemMemberSlice(gpu::MemDescType source, const Member &member,
   return std::nullopt;
 }
 
-static Value emitTmemMemberView(OpBuilder &b, Location loc, const GroupDag &g,
-                                MemberId memberId, Value buffer,
-                                const Owner &owner,
-                                gpu::StageCluster stageCluster) {
+static Value emitTmemMemberView(EmitCtx &ctx, OpBuilder &b, Operation *source,
+                                const GroupDag &g, MemberId memberId,
+                                Value buffer, const Owner &owner) {
   const Member &member = g.pieceTable.members[memberId];
   if (!g.isTmem() || member.backingPrimary == memberId)
     return buffer;
@@ -523,12 +545,17 @@ static Value emitTmemMemberView(OpBuilder &b, Location loc, const GroupDag &g,
   auto slice = getTmemMemberSlice(cast<gpu::MemDescType>(buffer.getType()),
                                   member, primary);
   assert(slice && "TMEM member slice must be validated before emission");
+  Location loc = source->getLoc();
+  gpu::StageCluster stageCluster = gpu::getStageCluster(source);
   Value view = emitInto<nvidia_gpu::TMEMSubSliceOp>(
       b, loc, owner, stageCluster, buffer, slice->offset, slice->size,
       cast<gpu::MemDescType>(buffer.getType()).getRank() - 1);
-  if (!sameViewType(view.getType(), target))
+  ctx.inheritSchedule(source, view.getDefiningOp());
+  if (!sameViewType(view.getType(), target)) {
     view = emitInto<gpu::MemDescReinterpretOp>(b, loc, owner, stageCluster,
                                                target, view);
+    ctx.inheritSchedule(source, view.getDefiningOp());
+  }
   return view;
 }
 static Value emitMixedCopyLocalView(OpBuilder &b, Location loc, Value owner,
@@ -636,10 +663,14 @@ static void materializeTokenlessMembers(EmitCtx &ctx,
           zero.getDefiningOp()->setAttr(name, attr);
           view->setAttr(name, attr);
         }
-      Value memberView = emitTmemMemberView(
-          b, member.allocOp->getLoc(), *group, index, view.getResult(),
-          resolveOwner(member.allocOp), gpu::getStageCluster(member.allocOp));
+      ctx.inheritSchedule(member.allocOp, zero.getDefiningOp());
+      ctx.inheritSchedule(member.allocOp, view);
+      Value memberView =
+          emitTmemMemberView(ctx, b, member.allocOp, *group, index, view,
+                             resolveOwner(member.allocOp));
       member.allocOp->getResult(0).replaceAllUsesWith(memberView);
+      if (!ctx.deferred.handoffs.empty())
+        ctx.replaceOp(member.allocOp, memberView.getDefiningOp());
       member.allocOp->erase();
     }
   }
@@ -796,6 +827,7 @@ static void rewriteRegionLayouts(EmitCtx &ctx, ArrayRef<GroupDag> groups) {
       // for planned loop slots; drop-only loops and all ifs retain attributes.
       if (nSlots == 0 || isa<scf::IfOp>(newOp))
         newYield->setAttrs(yield->getAttrs());
+      ctx.scheduleOrigins.erase(yield);
       yield.erase();
     }
 
@@ -899,10 +931,11 @@ static Value getView(EmitCtx &ctx, const GroupDag &g, RenderState &rs,
     auto buf = emitInto<nvws::SemaphoreBufferOp>(
         b, accessOp->getLoc(), owner, stageCluster, source.sema,
         TypeRange(types), source.value);
+    ctx.inheritSchedule(accessOp, buf);
     if (node->releasedViewRelease)
       ctx.exactReuseBufferOps.insert(buf.getOperation());
     if (node->bufferStageOffset)
-      buf.setStage(materializeI32Before(buf, *node->bufferStageOffset));
+      buf.setStage(materializeI32Before(ctx, buf, *node->bufferStageOffset));
     rs.view =
         RenderState::ViewBundle{source.ref.producer,
                                 source.ref.sema,
@@ -916,8 +949,8 @@ static Value getView(EmitCtx &ctx, const GroupDag &g, RenderState &rs,
   }
   Value base = bundle->buffers[touch.member];
   OpBuilder b(accessOp);
-  Value cur = emitTmemMemberView(b, accessOp->getLoc(), g, touch.member, base,
-                                 owner, stageCluster);
+  Value cur =
+      emitTmemMemberView(ctx, b, accessOp, g, touch.member, base, owner);
   for (const AliasStep &step : touch.alias) {
     Operation *old = step.op;
     if (old->getName().getStringRef() == "ttg.memdesc_index" &&
@@ -928,6 +961,7 @@ static Value getView(EmitCtx &ctx, const GroupDag &g, RenderState &rs,
       mapping.map(operand, idx == step.operandIdx ? cur : operand);
     Value source = cur;
     Operation *cloned = b.clone(*old, mapping);
+    ctx.inheritSchedule(old, cloned);
     refreshAliasResultTypes(cloned, source);
     cur = cloned->getResult(0);
   }
@@ -948,9 +982,11 @@ static Operation *renderAccess(EmitCtx &ctx, const GroupDag &g, Node *n,
       auto pidsc = std::make_pair(n->owner, gpu::getStageCluster(op));
       auto vTrue = emitInto<arith::ConstantOp>(
           b, op->getLoc(), n->owner, pidsc.second, b.getBoolAttr(true));
+      ctx.inheritSchedule(op, vTrue);
       anchor = emitInto<nvidia_gpu::TMEMStoreOp>(b, op->getLoc(), n->owner,
                                                  pidsc.second, Type(), view,
                                                  Value(), ta.getSrc(), vTrue);
+      ctx.inheritSchedule(op, anchor);
       ta.getResult().replaceUsesWithIf(view, [&](OpOperand &use) {
         return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) &&
                use.getOwner() != view.getDefiningOp() &&
@@ -968,10 +1004,12 @@ static Operation *renderAccess(EmitCtx &ctx, const GroupDag &g, Node *n,
                 cast<gpu::MemDescType>(view.getType()).getShape(),
                 src.getType()),
             src);
+        ctx.inheritSchedule(op, splat);
         src = splat.getResult();
       }
       anchor = emitInto<gpu::LocalStoreOp>(b, op->getLoc(), n->owner,
                                            gpu::getStageCluster(op), src, view);
+      ctx.inheritSchedule(op, anchor);
       la.getResult().replaceUsesWithIf(view, [&](OpOperand &use) {
         return !isa<nvws::SemaphoreCreateOp>(use.getOwner()) &&
                !g.accessNodeOps.contains(use.getOwner());
@@ -1159,9 +1197,9 @@ static LogicalResult renderChain(EmitCtx &ctx, const GroupDag &g, Node *head,
       auto acq = emitInto<nvws::SemaphoreAcquireOp>(
           b, before ? before->getLoc() : ctx.func.getLoc(), n->owner,
           n->stageCluster, ctx.semaphore(g, n->sema), ctx.tokenType);
+      ctx.bindProtocolOp(n, acq);
       if (n->stageOffset)
-        acq.setStage(materializeI32Before(acq, *n->stageOffset));
-      ctx.nodeOps[n] = acq;
+        acq.setStage(materializeI32Before(ctx, acq, *n->stageOffset));
       rs.recordToken(acq.getToken(), ctx.semaphore(g, n->sema),
                      TokenRef{n, n->sema, *n->producedTokenOwner});
       rs.clearViews();
@@ -1180,9 +1218,9 @@ static LogicalResult renderChain(EmitCtx &ctx, const GroupDag &g, Node *head,
           b, lastReal ? lastReal->getLoc() : ctx.func.getLoc(), n->owner,
           n->stageCluster, ctx.semaphore(g, n->sema), source->value,
           asyncOpsAttr(b.getContext(), n));
+      ctx.bindProtocolOp(n, rel);
       if (n->stageOffset)
-        rel.setStage(materializeI32Before(rel, *n->stageOffset));
-      ctx.nodeOps[n] = rel;
+        rel.setStage(materializeI32Before(ctx, rel, *n->stageOffset));
       rel.setArriveCountAttr(b.getI32IntegerAttr(n->count));
       lastReal = rel;
       break;
@@ -1203,11 +1241,12 @@ static LogicalResult renderChain(EmitCtx &ctx, const GroupDag &g, Node *head,
   return success();
 }
 
-static Value materializeI32Before(Operation *op, int64_t value) {
+static Value materializeI32Before(EmitCtx &ctx, Operation *op, int64_t value) {
   OpBuilder b(op);
   auto cst = emitInto<arith::ConstantOp>(b, op->getLoc(), resolveOwner(op),
                                          gpu::getStageCluster(op),
                                          b.getI32IntegerAttr(value));
+  ctx.inheritSchedule(op, cst);
   return cst.getResult();
 }
 
@@ -1415,16 +1454,47 @@ planFreshHandoffProtocol(const GroupDag &group,
       .run();
 }
 
+static std::optional<int64_t> deferredHandoffDistance(
+    const EmitCtx &ctx, const Node *handoff, int64_t depth,
+    const DenseMap<const Node *, bool> &freshWriteAcquires) {
+  auto release = cast<nvws::SemaphoreReleaseOp>(ctx.op(handoff));
+  auto acquire = cast<nvws::SemaphoreAcquireOp>(ctx.op(handoff->sat));
+  // An explicit offset is relative to the cursor at that op. Otherwise a
+  // release uses its token's slot; a loop iter_arg carries the entry cursor.
+  Operation *source = release.getStage() ? release.getOperation()
+                                         : release.getToken().getDefiningOp();
+  auto offset = [](Value stage) -> int64_t {
+    return stage ? stage.getDefiningOp<arith::ConstantIntOp>().value() : 0;
+  };
+  assert((!source || source->getBlock() == acquire->getBlock()) &&
+         "expected a loop-local token");
+  SlotPair pair{offset(release.getStage()), offset(acquire.getStage()), 0};
+  for (auto [node, fresh] : freshWriteAcquires) {
+    if (!fresh)
+      continue;
+    Operation *write = ctx.op(node);
+    if (write->getBlock() != acquire->getBlock())
+      continue;
+    ++pair.advances;
+    if (source && (write == source || write->isBeforeInBlock(source)))
+      ++pair.producer;
+    if (write == acquire || write->isBeforeInBlock(acquire))
+      ++pair.consumer;
+  }
+  return pair.reuseDistance(depth);
+}
+
 static LogicalResult
-finalizeFreshHandoffProtocols(EmitCtx &ctx, ArrayRef<const GroupDag *> groups) {
+finalizeFreshHandoffProtocols(EmitCtx &ctx, ArrayRef<const GroupDag *> groups,
+                              DenseMap<const Node *, int64_t> &distances) {
   for (const GroupDag *group : groups) {
-    if (!group->isTmem() || group->isCircular() ||
-        group->pieceTable.members.size() != 1 || group->numCopies <= 1)
+    if (!group->isSingleMultibufferedTmem())
       continue;
     SmallVector<Value, 4> semaphores;
     for (const Sema &sema : group->semas)
       semaphores.push_back(ctx.semaphores.lookup(&sema));
 
+    SmallVector<const Node *> deferredReleases;
     DenseMap<const Node *, bool> freshWriteAcquires;
     auto classifyAcquire = [&](Node *node) -> FailureOr<bool> {
       if (auto it = freshWriteAcquires.find(node);
@@ -1443,36 +1513,39 @@ finalizeFreshHandoffProtocols(EmitCtx &ctx, ArrayRef<const GroupDag *> groups) {
       Node *acquire = release->sat;
       if (!acquire || acquire->kind != Node::Acquire)
         continue;
+      if (ctx.deferred.handoffs.contains(release))
+        deferredReleases.push_back(release);
       FailureOr<bool> fresh = classifyAcquire(acquire);
       if (failed(fresh))
         return semaError(ctx.func)
                << "emitter lost an acquire needed by stage replay";
       hasFreshHandoff |= *fresh;
     }
-    if (!hasFreshHandoff)
+    if (!hasFreshHandoff && deferredReleases.empty())
       continue;
 
     for (Node *node : group->nodesOfKind(Node::Acquire))
       if (failed(classifyAcquire(node)))
         return semaError(ctx.func)
                << "emitter lost an acquire needed by stage replay";
-
     DenseMap<const Node *, int64_t> stageOffsets;
     SmallVector<uint32_t> releasedMasks;
-    if (failed(planFreshHandoffProtocol(*group, freshWriteAcquires,
-                                        stageOffsets, releasedMasks)))
-      return failure();
+    if (hasFreshHandoff) {
+      if (failed(planFreshHandoffProtocol(*group, freshWriteAcquires,
+                                          stageOffsets, releasedMasks)))
+        return failure();
 
+      if (releasedMasks.size() != group->semas.size())
+        return semaError(ctx.func) << "stage replay produced incomplete masks";
+    }
     for (auto [node, offset] : stageOffsets) {
       auto stageOp =
           dyn_cast_or_null<nvws::SemaphoreStageInterface>(ctx.op(node));
       if (!stageOp)
         return semaError(ctx.func)
                << "emitter lost a relay needed by stage replay";
-      stageOp.setStage(materializeI32Before(stageOp, offset));
+      stageOp.setStage(materializeI32Before(ctx, stageOp, offset));
     }
-    if (releasedMasks.size() != group->semas.size())
-      return semaError(ctx.func) << "stage replay produced incomplete masks";
     for (auto [sid, mask] : llvm::enumerate(releasedMasks)) {
       auto create =
           ctx.semaphore(*group, sid).getDefiningOp<nvws::SemaphoreCreateOp>();
@@ -1484,6 +1557,19 @@ finalizeFreshHandoffProtocols(EmitCtx &ctx, ArrayRef<const GroupDag *> groups) {
         create.setReleasedMaskAttr(
             IntegerAttr::get(IntegerType::get(ctx.func.getContext(), 32),
                              static_cast<int32_t>(mask)));
+    }
+    for (const Node *release : deferredReleases) {
+      auto distance = deferredHandoffDistance(
+          ctx, release, group->numSemaphoreCopies, freshWriteAcquires);
+      if (!distance) {
+        auto diag = semaError(ctx.op(release))
+                    << "cannot determine loop-carried dependency distance for "
+                       "a physical buffer slot";
+        diag.attachNote(ctx.op(release->sat)->getLoc())
+            << "next token ownership starts here";
+        return failure();
+      }
+      distances.try_emplace(release, *distance);
     }
   }
   return success();
@@ -1703,7 +1789,8 @@ verifyEmittedIR(triton::FuncOp func,
 }
 
 LogicalResult emitIR(triton::FuncOp funcOp, ArrayRef<GroupDag> groups,
-                     ArrayRef<ScheduleUpdate> updates) {
+                     ArrayRef<ScheduleUpdate> updates,
+                     const DeferredSchedules &deferred) {
   for (const GroupDag &g : groups)
     assert(g.isSealed() && "EmitIR requires sealed SYNC-DAGs");
   // Validate all TMEM views before replacing allocations or token plumbing.
@@ -1727,7 +1814,7 @@ LogicalResult emitIR(triton::FuncOp funcOp, ArrayRef<GroupDag> groups,
   OpBuilder scheduleBuilder(funcOp.getContext());
   for (auto [op, schedule] : updates)
     gpu::setStageCluster(scheduleBuilder, op, schedule);
-  EmitCtx ctx;
+  EmitCtx ctx(deferred);
   ctx.func = funcOp;
   ctx.tokenType = gpu::AsyncTokenType::get(funcOp.getContext());
   {
@@ -1753,8 +1840,21 @@ LogicalResult emitIR(triton::FuncOp funcOp, ArrayRef<GroupDag> groups,
     if (failed(renderChain(ctx, *group, group->root->children[0], rs)))
       return failure();
   }
-  if (failed(finalizeFreshHandoffProtocols(ctx, activeGroups)))
+  DenseMap<const Node *, int64_t> distances;
+  if (failed(finalizeFreshHandoffProtocols(ctx, activeGroups, distances)))
     return failure();
+  if (!deferred.handoffs.empty()) {
+    DenseMap<ScheduleOrigin, gpu::StageCluster> schedules;
+    auto currentOp = [&](Operation *original) {
+      auto it = ctx.replacements.find(original);
+      return it == ctx.replacements.end() ? original : it->second;
+    };
+    if (failed(deferred.finish(distances, schedules, currentOp)))
+      return failure();
+    for (auto [op, origin] : ctx.scheduleOrigins)
+      if (auto it = schedules.find(origin); it != schedules.end())
+        gpu::setStageCluster(scheduleBuilder, op, it->second);
+  }
   SmallVector<Operation *> aliasOps;
   ctx.func.walk<WalkOrder::PreOrder>([&](Operation *op) {
     if (isSupportedAliasOp(op))

@@ -6,6 +6,7 @@ add_triton_ut(
     TritonGPUIR
     TritonNvidiaGPUIR
     TritonGPUTransforms
+    NVHopperTransforms
     TritonNvidiaGPUTransforms
     TritonTools
     LLVMSupport
@@ -19,6 +20,7 @@ add_triton_ut(
     TritonGPUIR
     TritonGPUToLLVM
     TritonGPUTransforms
+    NVHopperTransforms
     TritonNvidiaGPUTransforms
 )
 add_triton_ut(
@@ -27,6 +29,7 @@ add_triton_ut(
   LIBS
     TritonGPUIR
     TritonGPUTransforms
+    NVHopperTransforms
     TritonNvidiaGPUTransforms
 )
 
@@ -36,6 +39,7 @@ add_triton_ut(
   LIBS
     TritonGPUIR
     TritonGPUTransforms
+    NVHopperTransforms
     TritonNvidiaGPUTransforms
 )
 
@@ -47,6 +51,7 @@ add_triton_ut(
     TritonGPUIR
     TritonNvidiaGPUIR
     TritonGPUTransforms
+    NVHopperTransforms
     TritonNvidiaGPUTransforms
     TritonTools
     LLVMSupport
