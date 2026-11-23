@@ -20,9 +20,11 @@ import hashlib
 import math
 import operator
 from pathlib import Path
+from weakref import WeakKeyDictionary
 
 import torch
-from torch._inductor import ir
+from torch._guards import TracingContext
+from torch._inductor import config, ir
 from torch._inductor.ir import ExternKernel
 from torch._inductor.lowering import lowerings
 from torch._inductor.virtualized import V
@@ -51,6 +53,18 @@ def _static_int(x):
         return None
 
 
+# The lazily compiled bwd reads the Inductor config at backward time, so a tlx_mode
+# scoped to the fwd call would flip its routing. Both run under the same TracingContext:
+# the fwd records the gate there and its bwd reuses it.
+_TLX_MODE_GATE: WeakKeyDictionary[TracingContext, bool] = WeakKeyDictionary()
+
+
+def _tlx_mode_gate() -> bool:
+    on = config.triton.tlx_mode is not None
+    ctx = TracingContext.try_get()
+    return on if ctx is None else _TLX_MODE_GATE.setdefault(ctx, on)
+
+
 def eligible(query, key, value, dropout_p, is_causal) -> bool:
     """Shared by fwd and bwd so the logsumexp producer and consumer always agree.
 
@@ -58,7 +72,7 @@ def eligible(query, key, value, dropout_p, is_causal) -> bool:
     saved-activation hooks (e.g. fp8 quantization) can split an aliased K=V into
     separate backward nodes.
     """
-    if not tlx_config.sdpa_to_flex:
+    if not tlx_config.sdpa_to_flex or not _tlx_mode_gate():
         return False
     if dropout_p != 0.0 or is_causal:
         return False

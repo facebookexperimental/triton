@@ -1179,10 +1179,11 @@ def test_manual_platform_allowlist_preserves_requested_work(tmp_path, script, re
         subprocess.run(
             command, cwd=ROOT, env=os.environ | {
                 "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(output),
-                "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_REPOSITORY": "facebookexperimental/triton"
+                "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_REPOSITORY": "facebookexperimental/triton",
+                "GPU_CI_SKIP_PLATFORMS": "b200"
             }, check=True, capture_output=True, text=True)
         outputs.append(dict(line.split("=", 1) for line in output.read_text().splitlines()))
-        assert 'this run does not cover B200' in summary.read_text()
+        assert 'GPU_CI_SKIP_PLATFORMS skips b200' in summary.read_text()
         if platforms:
             assert f"Manual platform list: {platforms}" in summary.read_text()
             assert "Other platforms are not covered" in summary.read_text()
@@ -1235,3 +1236,19 @@ def test_trigger_skips_only_paths_selection_skips_everywhere():
     assert skipped, 'the trigger skips nothing'
     for path in skipped:
         assert not any(included(path, patterns) for patterns in FILTERS.values()), f'trigger skips selected {path}'
+
+
+@pytest.mark.parametrize("event,stops", [("pull_request", True), ("push", False), ("schedule", False),
+                                         ("workflow_dispatch", False)])
+def test_only_pull_requests_stop_at_the_first_failure(monkeypatch, event, stops):
+    # A PR reports its first failure sooner, while pushes and schedules must run every selected test so issue filing
+    # sees every failure. Realistic breaks: stopping every run early, or losing the stop on PRs.
+    import sys
+    import run_selected_tests
+    calls = []
+    monkeypatch.setattr(run_selected_tests.subprocess, "run", lambda argv, **kwargs: calls.append(argv))
+    monkeypatch.setattr(sys, "argv", ["run_selected_tests.py", "--workers", "8", "--junit", "r.xml"])
+    monkeypatch.setenv("TEST_SUITE", json.dumps({"files": ["python/test/unit/runtime/"], "k": ""}))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", event)
+    run_selected_tests.main()
+    assert ("--maxfail=1" in calls[0]) == stops

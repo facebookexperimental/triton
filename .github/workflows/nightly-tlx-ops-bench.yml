@@ -1,20 +1,21 @@
 name: Nightly TLX.ops Bench
 # Runs the tlx.ops perf suite (python/test/tlx_benchmark) on B200, H100 and
-# MI350 for the commit each published nightly selects, which already passed the
-# correctness checks the nightly is gated on. It installs the wheel build.yml
-# makes for that commit: usually the cached one its GPU tests ran on, rebuilt
-# from the same commit if the cache has expired or the build recipe changed.
+# MI350 for a main commit picked from gpu-tests.yml's push runs
+# (tlx_ops_bench_pick.py). It installs the wheel build.yml makes for that
+# commit, usually the one its GPU tests ran on. The commit's TLX test results
+# are recorded with each platform's summary, not required to be green.
+# GPU_CI_SKIP_PLATFORMS (for example "b200") skips a platform here too.
 on:
   schedule:
-    - cron: '0 7,8 * * *'
+    - cron: '0 14 * * *'
   workflow_dispatch:
     inputs:
-      version:
-        description: "fbtriton nightly version, e.g. 3.8.0.dev20260923 (blank = latest published)"
+      date:
+        description: "Night to bench, YYYYMMDD (blank = today); picks main as of that night's Pacific midnight"
         required: false
         default: ""
       sha:
-        description: "Commit that version was built from (required when version is set)"
+        description: "Main commit to bench instead of picking one"
         required: false
         default: ""
 
@@ -27,7 +28,6 @@ concurrency:
 
 jobs:
   resolve:
-    # A schedule selects the latest published wheel; dispatches still require a main commit.
     if: >-
       github.repository_owner == 'facebookexperimental' &&
       (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
@@ -38,50 +38,25 @@ jobs:
     outputs:
       version: ${{ steps.pick.outputs.version }}
       sha: ${{ steps.pick.outputs.sha }}
+      run_url: ${{ steps.pick.outputs.run_url }}
+      ci_b200: ${{ steps.pick.outputs.ci_b200 }}
+      ci_h100: ${{ steps.pick.outputs.ci_h100 }}
+      ci_mi350: ${{ steps.pick.outputs.ci_mi350 }}
     steps:
-      - name: Checkout main
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
-      - name: Pick the wheel to bench
+      - name: Pick the commit to bench
         id: pick
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
-          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DATE: ${{ inputs.date }}
           INPUT_SHA: ${{ inputs.sha }}
-        run: |
-          set -euo pipefail
-          if [[ "${EVENT_NAME}" == schedule ]]; then
-            MIDNIGHT=$(python3 -c 'import datetime; from zoneinfo import ZoneInfo; print(int(datetime.datetime.now(ZoneInfo("America/Los_Angeles")).hour in (0, 1)))')
-            [[ "${MIDNIGHT}" == 1 ]] || { echo "Outside the Pacific midnight window; nothing to bench."; exit 0; }
-          fi
-          if [[ -n "${INPUT_VERSION}" ]]; then
-            [[ -n "${INPUT_SHA}" ]] || { echo "sha is required when version is set"; exit 1; }
-            VERSION="${INPUT_VERSION}"
-            SHA="${INPUT_SHA}"
-          else
-            gh release download nightly --pattern latest.json --output latest.json
-            VERSION=$(jq -r .version latest.json)
-            SHA=$(jq -r .commit latest.json)
-          fi
-          # Whatever its source (latest.json or a dispatch input), only a main commit is ever checked out downstream.
-          [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "not a full commit sha: ${SHA}"; exit 1; }
-          [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}$ ]] || { echo "not a nightly version: ${VERSION}"; exit 1; }
-          git merge-base --is-ancestor "${SHA}" origin/main || { echo "${SHA} is not on main"; exit 1; }
-          if [[ "${EVENT_NAME}" == schedule ]]; then
-            DATE="${VERSION##*.dev}"
-            COMPLETE=$(gh release view tlx-ops-bench --json assets --jq '.assets[].name' \
-              | python3 -c 'import sys; date=sys.argv[1]; names=set(sys.stdin.read().splitlines()); print(int(all(f"{date}.{p}.json" in names for p in ("b200", "h100", "mi350"))))' "${DATE}")
-            [[ "${COMPLETE}" != 1 ]] || { echo "${VERSION} already has all platform summaries; nothing to bench."; exit 0; }
-          fi
-          echo "Benching ${VERSION} (${SHA})"
-          {
-            echo "version=${VERSION}"
-            echo "sha=${SHA}"
-          } >> "$GITHUB_OUTPUT"
+          SKIP_PLATFORMS: ${{ vars.GPU_CI_SKIP_PLATFORMS }}
+        run: python3 .github/scripts/tlx_ops_bench_pick.py
 
   build:
     needs: resolve
@@ -95,7 +70,7 @@ jobs:
 
   b200:
     needs: [resolve, build]
-    if: needs.resolve.outputs.version != ''
+    if: needs.resolve.outputs.version != '' && !contains(vars.GPU_CI_SKIP_PLATFORMS, 'b200')
     permissions:
       id-token: write
       contents: write   # publish: the dashboard's release
@@ -111,10 +86,12 @@ jobs:
       wheel_url: ${{ needs.build.outputs.wheel_url }}
       wheel_filename: ${{ needs.build.outputs.wheel_filename }}
       wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      ci_status: ${{ needs.resolve.outputs.ci_b200 }}
+      ci_run: ${{ needs.resolve.outputs.run_url }}
 
   h100:
     needs: [resolve, build]
-    if: needs.resolve.outputs.version != ''
+    if: needs.resolve.outputs.version != '' && !contains(vars.GPU_CI_SKIP_PLATFORMS, 'h100')
     permissions:
       id-token: write
       contents: write   # publish: the dashboard's release
@@ -130,10 +107,12 @@ jobs:
       wheel_url: ${{ needs.build.outputs.wheel_url }}
       wheel_filename: ${{ needs.build.outputs.wheel_filename }}
       wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      ci_status: ${{ needs.resolve.outputs.ci_h100 }}
+      ci_run: ${{ needs.resolve.outputs.run_url }}
 
   mi350:
     needs: [resolve, build]
-    if: needs.resolve.outputs.version != ''
+    if: needs.resolve.outputs.version != '' && !contains(vars.GPU_CI_SKIP_PLATFORMS, 'mi350')
     permissions:
       id-token: write
       contents: write   # publish: the dashboard's release
@@ -149,6 +128,8 @@ jobs:
       wheel_url: ${{ needs.build.outputs.wheel_url }}
       wheel_filename: ${{ needs.build.outputs.wheel_filename }}
       wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+      ci_status: ${{ needs.resolve.outputs.ci_mi350 }}
+      ci_run: ${{ needs.resolve.outputs.run_url }}
 
   prune:
     needs: [resolve, b200, h100, mi350]

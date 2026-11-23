@@ -11,7 +11,7 @@ from triton._C.libtriton import ir
 from triton.backends.compiler import GPUTarget
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials import amd_tdm_gemm_pipelined as _gfx1250_gemm
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250 import amd_mxfp_gemm_tdm_pipelined as _gfx1250_mxfp
+from triton.tlx.ops.kernels.mm_mxfp import gfx1250 as _gfx1250_mxfp
 from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250 import (
     amd_grouped_gemm_gfx1250_test as _gfx1250_grouped, )
 from triton._filecheck import run_parser
@@ -29,9 +29,7 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
 from triton.backends.amd import compiler as amd_compiler
 from triton.tlx.ops.kernels.flash_attn import gfx950 as _amd_fa_cluster_module
-from triton.tlx.ops.kernels.mm_mxfp8 import gfx950 as _amd_mm_mxfp8
-from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_gfx1250.amd_mxfp_gemm_tdm_pipelined import (
-    mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
+from triton.tlx.ops.kernels.mm_mxfp import gfx950 as _amd_mm_mxfp
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
 from triton.tlx.ops.kernels.flash_attn.gfx950 import (
@@ -799,9 +797,9 @@ def _mxfp8_gfx950_copy_layout_kernel(A, C, COPY: tl.constexpr, ROWS: tl.constexp
 
 
 @pytest.mark.parametrize("copy", [
-    _amd_mm_mxfp8._n256x192_fly_layout_copy,
-    _amd_mm_mxfp8._ns4_fly_layout_copy,
-    _amd_mm_mxfp8._n256x256_fly_layout_copy,
+    _amd_mm_mxfp._n256x192_fly_layout_copy,
+    _amd_mm_mxfp._ns4_fly_layout_copy,
+    _amd_mm_mxfp._n256x256_fly_layout_copy,
 ])
 @pytest.mark.parametrize("rows", [32, 64, 128, 256])
 def test_mxfp8_gfx950_copy_layout_verifies(copy, rows, tmp_path):
@@ -3717,7 +3715,11 @@ def test_amd_fa_cluster_selects_static_k_row_stride(dtype, n_ctx, head_dim, caus
 def test_amd_fa_cluster_launch_forwards_static_k_row_stride(monkeypatch, dtype, n_ctx, expected):
     """The public wrapper forwards the selected stride to the compiled kernel."""
     strides = (64 * n_ctx * 263, n_ctx * 263, 263, 1)
-    tensor = SimpleNamespace(shape=(1, 64, n_ctx, 128), dtype=dtype, stride=lambda dim: strides[dim])
+
+    def stride(dim=None):
+        return strides if dim is None else strides[dim]
+
+    tensor = SimpleNamespace(shape=(1, 64, n_ctx, 128), dtype=dtype, stride=stride)
     captured = {}
 
     class CaptureKernel:
@@ -5769,7 +5771,7 @@ def test_require_amd_wmma_layout_compiles_gfx1250():
 def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
     """The mxfp GEMM tutorial kernel should lower to TDM + dot_scaled + WMMA."""
     compiled = compile_for_gfx1250(
-        _amd_mxfp_gemm_kernel,
+        _gfx1250_mxfp.mxgemm_tdm_pipelined_kernel,
         signature={
             "a_ptr": "*fp8e5",
             "b_ptr": "*fp8e5",
@@ -5786,6 +5788,7 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
             "stride_cm": "i64",
             "stride_cn": "i64",
             "stride_scale": "i64",
+            "stride_b_scale": "i64",
         },
         constexprs={
             "DTYPE_A": "e5m2",
@@ -7401,6 +7404,7 @@ def test_gfx1250_mxgemm_tdm_pipelined_compiles(TDM_FUSION):
             "stride_cm": "i64",
             "stride_cn": "i64",
             "stride_scale": "i64",
+            "stride_b_scale": "i64",
         },
         constexprs={
             "DTYPE_A": "e5m2",
@@ -7714,7 +7718,11 @@ def test_gfx1250_mxgemm_persistent_staging_overlaps_loads(dtype_b, num_buffers, 
         scales_first = num_buffers == 3
         assert sum("s_add_nc_u64" in inst for inst in body) <= (3 if scales_first else 2)
     wait = next(i for i, inst in enumerate(body) if "s_wait_tensorcnt" in inst)
-    load = next(i for i, inst in enumerate(body) if i > wait and "ds_load_b128" in inst)
+    # Start at the stage wait. A8W4 waits before its split refill barrier, so
+    # the next operand reads can wrap to the top of the loop in assembly order.
+    body = body[wait:] + body[:wait]
+    wait = 0
+    load = next(i for i, inst in enumerate(body) if "ds_load_b128" in inst)
     # A periodic cluster barrier can put the refill block before the compute
     # block in assembly order. Do not count the next iteration's WMMAs as
     # overlap: independent matrix work must remain in the refill block itself.
@@ -7815,6 +7823,7 @@ def test_gfx1250_mxgemm_tdm_split_compiles(DTYPE_B, TDM_SPLIT, BLOCK_M, BLOCK_K)
             "stride_cm": "i64",
             "stride_cn": "i64",
             "stride_scale": "i64",
+            "stride_b_scale": "i64",
         },
         constexprs={
             "DTYPE_A": "e4m3",
