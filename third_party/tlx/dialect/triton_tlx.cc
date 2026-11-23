@@ -512,7 +512,7 @@ void init_triton_tlx_ir(py::module_ &m) {
            })
       .def("create_tmem_copy",
            [](TritonOpBuilder &self, Value src, Value dst) {
-             self.create<ttng::TMEMCopyOp>(src, dst);
+             self.create<ttng::TMEMCopyOp>(src, dst, Value());
            })
       .def("create_tmem_shift",
            [](TritonOpBuilder &self, Value buffer) {
@@ -1882,7 +1882,8 @@ void init_triton_tlx_ir(py::module_ &m) {
             return self.create<ttag::BufferLoadOp>(
                 resultType, ptr, offsets, Value() /*stride*/,
                 buildCachePolicy(self.getBuilder(), cache),
-                mask.value_or(Value()), other.value_or(Value()), contiguity);
+                mask.value_or(Value()), other.value_or(Value()), contiguity,
+                /*soffset=*/Value(), /*scope=*/tt::MemSyncScopeAttr());
           },
           py::arg("ptr"), py::arg("offsets"), py::arg("mask").none(),
           py::arg("other").none(), py::arg("cache"), py::arg("contiguity"))
@@ -1894,7 +1895,8 @@ void init_triton_tlx_ir(py::module_ &m) {
             return self.create<ttag::BufferStoreOp>(
                 storedValue, ptr, offsets, Value() /*stride*/,
                 buildCachePolicy(self.getBuilder(), cache),
-                mask.value_or(Value()), contiguity);
+                mask.value_or(Value()), contiguity,
+                /*soffset=*/Value(), /*scope=*/tt::MemSyncScopeAttr());
           },
           py::arg("storedValue"), py::arg("ptr"), py::arg("offsets"),
           py::arg("mask").none(), py::arg("cache"), py::arg("contiguity"))
@@ -1919,7 +1921,8 @@ void init_triton_tlx_ir(py::module_ &m) {
             return self.create<ttag::BufferLoadToLocalOp>(
                 dest, ptr, offsets, mask.value_or(Value()),
                 other.value_or(Value()), Value() /*stride*/,
-                buildCachePolicy(self.getBuilder(), cache), contiguity);
+                buildCachePolicy(self.getBuilder(), cache), contiguity,
+                /*soffset=*/Value(), /*scope=*/tt::MemSyncScopeAttr());
           },
           py::arg("dest"), py::arg("ptr"), py::arg("offsets"),
           py::arg("mask").none(), py::arg("other").none(), py::arg("cache"),

@@ -4092,13 +4092,29 @@ struct TritonGPUInferLayoutInterface
     if (aEncoding.getKWidth() != bEncoding.getKWidth())
       return op->emitError("mismatching kWidth between A and B operands");
 
+    auto dotOp = cast<DotOpInterface>(op);
+
+    // With WMMA v2+, each instruction takes K from 2 lanes per row. If a lane's
+    // kWidth contiguous K elements exceed its share of one instruction, the
+    // chunk is split across consecutive instructions, so K must cover it.
+    if (auto wmmaEnc = dyn_cast<AMDWmmaEncodingAttr>(aEncoding.getParent());
+        wmmaEnc && wmmaEnc.getVersion() >= 2) {
+      constexpr int64_t kLanesPerInstrK = 2;
+      int64_t chunkK = aEncoding.getKWidth() * kLanesPerInstrK;
+      int64_t kDim =
+          cast<RankedTensorType>(dotOp.getA().getType()).getShape().back();
+      if (chunkK > wmmaEnc.getInstrShape()[2] && kDim < chunkK)
+        return op->emitError("WMMA dot operand kWidth = ")
+               << aEncoding.getKWidth() << " requires K >= " << chunkK
+               << ", but K = " << kDim;
+    }
+
     // Check if we have already selected an MMA version for Nvidia. If so,
     // validate that the encodings are correct and compatible.
     auto mmaAEncoding =
         dyn_cast_or_null<NvidiaMmaEncodingAttr>(aEncoding.getParent());
     auto mmaBEncoding =
         dyn_cast_or_null<NvidiaMmaEncodingAttr>(bEncoding.getParent());
-    auto dotOp = cast<DotOpInterface>(op);
     auto resEnc = cast<RankedTensorType>(dotOp.getD().getType()).getEncoding();
     auto mmaResEncoding = dyn_cast<NvidiaMmaEncodingAttr>(resEnc);
     if (mmaAEncoding || mmaBEncoding || mmaResEncoding) {
@@ -5575,9 +5591,20 @@ LogicalResult TritonGPUDialect::verifyOperationAttribute(Operation *op,
            << attr.getName()
            << " which is expected only on `module` or `tt.func` ops";
   }
+  // NPOT inputs report tensor-size errors first: with TRITON_ALLOW_NPOT the
+  // warp/CTA counts on a fixture may be intentionally non-pow2 while the
+  // layout error is the diagnostic under test.
   if (attr.getName() == AttrNumWarpsName && isa<ModuleOp, FuncOp>(op) &&
       mlir::triton::tools::isNpotAllowed())
-    return verifyEncodedTensorSizes(op);
+    if (failed(verifyEncodedTensorSizes(op)))
+      return failure();
+  if (attr.getName() == AttrNumWarpsName || attr.getName() == AttrNumCTAsName) {
+    auto count = dyn_cast<IntegerAttr>(attr.getValue());
+    if (!count || !count.getValue().isStrictlyPositive() ||
+        !count.getValue().isPowerOf2())
+      return op->emitOpError("requires ")
+             << attr.getName() << " to be a positive power of two";
+  }
 
   return success();
 }

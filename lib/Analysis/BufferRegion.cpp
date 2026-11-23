@@ -328,17 +328,13 @@ bool reachesNPOTLinearLayoutAssert(Type type) {
          !isNpotPow2Allocation(ty) && !isNpotDenseAllocation(ty);
 }
 
-struct MemDescSubsliceOffsets {
-  uint32_t storageOffset = 0;
-  uint32_t byteOffset = 0;
-  uint32_t partitionOffset = 0;
-  uint32_t ctaOffset = 0;
-};
+} // namespace
+
+namespace mlir::triton {
 
 MemDescSubsliceOffsets
-getMemDescSubsliceUnpaddedOffsets(ttg::MemDescSubsliceOp op) {
-  auto srcTy = op.getSrc().getType();
-  auto offsets = op.getOffsets();
+getMemDescSubsliceUnpaddedOffsets(ttg::MemDescType srcTy,
+                                  ArrayRef<int64_t> offsets) {
   if (offsets.empty())
     return MemDescSubsliceOffsets{};
 
@@ -347,7 +343,7 @@ getMemDescSubsliceUnpaddedOffsets(ttg::MemDescSubsliceOp op) {
   auto layoutRank = layoutOffsets.size();
   mlir::triton::LinearLayout layout = ttg::toLinearLayoutIgnoringPadding(srcTy);
 
-  MLIRContext *ctx = op->getContext();
+  MLIRContext *ctx = srcTy.getContext();
   SmallVector<StringAttr> dimNames =
       mlir::triton::standardOutDimNames(ctx, layoutRank);
   SmallVector<std::pair<StringAttr, int32_t>> logicalOffsets;
@@ -394,10 +390,6 @@ getMemDescSubsliceUnpaddedOffsets(ttg::MemDescSubsliceOp op) {
                                 static_cast<uint32_t>(byteOffset),
                                 partitionOffset, blockOffset};
 }
-
-} // namespace
-
-namespace mlir::triton {
 
 AddressSet AddressSet::fromRange(uint32_t begin, uint32_t length) {
   uint64_t end = static_cast<uint64_t>(begin) + length;
@@ -814,7 +806,7 @@ BufferRegionAnalysis::getScratchFootprint(Operation *op) {
       getOperationId(op->getParentOfType<FunctionOpInterface>());
   AddressSet addresses = AddressSet::fromRange(base, length);
   unsigned numCTAs = ttg::lookupNumCTAs(op);
-  uint32_t broadcastMask = getAtomicScratchBroadcastMask(op).value_or(0);
+  uint32_t broadcastMask = getResultScratchBroadcastMask(op).value_or(0);
   for (unsigned cta = 0; cta < numCTAs; ++cta)
     if (!(cta & broadcastMask))
       region.ctaAddresses.emplace_back(cta, addresses);
@@ -951,8 +943,9 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     if (reachesNPOTLinearLayoutAssert(memdescSubsliceOp.getSrc().getType()) ||
         reachesNPOTLinearLayoutAssert(memdescSubsliceOp.getType()))
       return propagateRegions(RegionInfo::getPessimisticValueState());
-    MemDescSubsliceOffsets relativeOffset =
-        getMemDescSubsliceUnpaddedOffsets(memdescSubsliceOp);
+    MemDescSubsliceOffsets relativeOffset = getMemDescSubsliceUnpaddedOffsets(
+        memdescSubsliceOp.getSrc().getType(),
+        llvm::to_vector_of<int64_t>(memdescSubsliceOp.getOffsets()));
     for (const BufferRegionView &view : in.views)
       regionInfo.views.insert(
           getSubView(memdescSubsliceOp.getType(), view,

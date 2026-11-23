@@ -596,11 +596,13 @@ class language_knobs(base_knobs):
     fp32_default: env_opt_str = env_opt_str("TRITON_F32_DEFAULT")
     default_fp_fusion: env_bool = env_bool("TRITON_DEFAULT_FP_FUSION", True)
     force_disable_fp_fusion: env_bool = env_bool("TRITON_FORCE_DISABLE_FP_FUSION")
+    allow_fp_fusion: env_bool = env_bool("TRITON_ALLOW_FP_FUSION")
     strict_reduction_ordering: env_bool = env_bool("TRITON_STRICT_REDUCTION_ORDERING")
     allow_npot: env_bool = env_bool("TRITON_ALLOW_NPOT")
 
     def fp_fusion_enabled(self, requested: Optional[bool]) -> bool:
-        return not self.force_disable_fp_fusion and (self.default_fp_fusion if requested is None else requested)
+        return self.allow_fp_fusion and not self.force_disable_fp_fusion and (self.default_fp_fusion
+                                                                              if requested is None else requested)
 
 
 class nvidia_knobs(base_knobs):
@@ -723,6 +725,7 @@ class nvidia_knobs(base_knobs):
 
 class amd_knobs(base_knobs):
     codegen_path: env_opt_str = env_opt_str("TRITON_AMD_CODEGEN_PATH")
+    bitcode_path: env_opt_str = env_opt_str("TRITON_AMD_BITCODE_PATH")
     use_buffer_ops: env_bool = env_bool("AMDGCN_USE_BUFFER_OPS", True)
     # Note: This requires use_buffer_ops be true to have any effect
     use_buffer_atomics: env_bool = env_bool("AMDGCN_USE_BUFFER_ATOMICS", True)

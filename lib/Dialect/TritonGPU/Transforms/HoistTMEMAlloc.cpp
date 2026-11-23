@@ -90,11 +90,15 @@ public:
     if (valueFromTMEM == kUnknown) {
       return failure();
     }
+    // The store predicate is a scalar i1, so only a uniform condition can be
+    // folded into it. A splatted condition is uniform; use its scalar source.
     Value pred = select.getCondition();
     // Keep the TMEM store predicate scalar so data partitioning can trace and
     // slice the reduction that produced it, and so it can later become the
     // condition of an scf.if.
     pred = extractScalarOrigin(pred);
+    if (!pred.getType().isInteger(1))
+      return failure();
     // In case the false operand is overwriting, we need to negate the predicate
     // (owerwrite when select would be false)
     if (valueFromTMEM == kTrue) {
