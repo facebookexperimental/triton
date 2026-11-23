@@ -232,7 +232,12 @@ and none of the load indices depend on that program-ID axis. This proves
 axis-aligned recipient groups; it does not yet symbolically compare arbitrary
 tile expressions between CTA ranks.
 
-The implementation flows through the compiler as follows:
+**Status: planning only.** Steps 1 and 2 below are implemented. Steps 3 and 4
+are the planned lowering and are not implemented yet: no descriptor-load
+lowering reads `tt.multicast_axes` or sets `multicastTargets`, so
+`multicast=True` changes no generated code today.
+
+The compiler flow is as follows:
 
 1. The Python frontend resolves each
    `TensorDescriptor.load(..., multicast=...)` policy against the selected
@@ -247,12 +252,12 @@ The implementation flows through the compiler as follows:
    the proven broadcast axes in the internal `tt.multicast_axes` attribute.
    The load retains its `multicast` policy and carries `tt.multicast_axes`
    only when the planner proves a valid multicast plan.
-3. TMA lowering and software-pipelining preserve that attribute, allocate a
+3. *(Planned, not implemented.)* TMA lowering and software-pipelining preserve that attribute, allocate a
    local completion barrier in every recipient CTA, and insert cluster barriers
    around the multicast transaction. Loads with different broadcast axes are
    kept in different pipeline groups. Native and Meta warp-specialized lowering
    carry the same plan through their load partitions and memory channels.
-4. TMA lowering derives a rank-dependent recipient mask from the cluster shape
+4. *(Planned, not implemented.)* TMA lowering derives a rank-dependent recipient mask from the cluster shape
    and broadcast axes, stores it in `multicastTargets`, and predicates the copy
    on the lowest-ranked CTA in each group. The elected CTA issues
    `cp.async.bulk.tensor...multicast::cluster`; hardware completes the
@@ -262,13 +267,16 @@ The implementation flows through the compiler as follows:
 The planner accepts only tiled `tt.descriptor_load` operations, an exact
 power-of-two physical cluster shape containing 2 to 16 CTAs, and index/control-flow
 expressions whose program-ID dependencies it can prove. It understands CLC
-schedule results and cluster-uniform `scf.for`/`scf.while` control flow, and it
-preserves plans through Meta AutoWS channels. It conservatively rejects
+schedule results and cluster-uniform `scf.for`/`scf.while` control flow. A loop
+whose bounds depend on a program-ID axis with cluster extent greater than one,
+such as a static persistent loop starting at `program_id(0)` under a
+`(2,1,1)` cluster, is cluster-divergent and rejected. It conservatively rejects
 memory-derived or atomic tile IDs, cluster-divergent control flow, and
 unsupported expression kinds. It currently selects every proven broadcast axis
 and has no cost model or user-facing optimization remarks. Selection can be
-inspected in TTGIR through `tt.multicast_axes`, on lowered TMA operations through
-`multicastTargets`, and in PTX through `.multicast::cluster`.
+inspected in TTGIR through `tt.multicast_axes`. Once steps 3 and 4 land, it
+will also be visible on lowered TMA operations through `multicastTargets` and
+in PTX through `.multicast::cluster`.
 
 The internal attribute is a compiler contract, not a user API. Standard Triton
 users grant permission through the kernel option or load override; they do not
@@ -342,18 +350,22 @@ tile = desc.load(offsets, multicast=True)   # permit for this load
 tile = desc.load(offsets, multicast=False)  # prohibit for this load
 ```
 
-`True` grants permission; it does not guarantee that multicast is emitted. The
-initial compiler implementation supports tiled descriptor loads with an exact
-`ctas_per_cga` shape. Gather, im2col, preferred/fallback cluster shapes, CLC tile
-IDs, atomic work-stealing tile IDs, Meta AutoWS schedules, and other non-static
-or unsupported schedules fall back to ordinary per-CTA loads. Native
-`tl.range(..., warp_specialize=True)` schedules are supported when their load
-indices and surrounding control flow satisfy the static dependency analysis.
+`True` grants permission; it does not guarantee that multicast is emitted. The planner considers
+tiled descriptor loads with an exact `ctas_per_cga` shape. It records no plan
+for gather, im2col, preferred/fallback cluster shapes, atomic work-stealing tile
+IDs, or other schedules whose program-ID dependencies it cannot prove. For a CLC
+result, only the validity bit counts as cluster-uniform; its tile coordinates
+depend on the matching program-ID axis, like `tl.program_id`. The plan is computed before warp
+specialization, so it is recorded the same way for native and Meta AutoWS
+schedules. Native `tl.range(..., warp_specialize=True)` schedules are planned
+when their load indices and surrounding control flow satisfy the static
+dependency analysis.
 
 The initial profitability rule selects every legal equivalence group with more
-than one recipient. The backend records compiler-derived broadcast axes on the
-load, elects the lowest-ranked CTA in each group, and derives the 16-bit target
-mask; standard Triton does not expose that mask to users.
+than one recipient. The planner records the compiler-derived broadcast axes on
+the load. The backend will elect the lowest-ranked CTA
+in each group and derive the 16-bit target mask; standard Triton does not
+expose that mask to users.
 
 ### Global opt-in
 

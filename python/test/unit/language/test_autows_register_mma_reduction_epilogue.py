@@ -1,5 +1,5 @@
 """autoWS persistent GEMM whose dot stays a register tt.dot (BLOCK_M=32) with a
-row-reduction epilogue (partition-scheduler bug #47)."""
+row-reduction epilogue (partition-scheduler bug #48)."""
 
 import pytest
 import torch

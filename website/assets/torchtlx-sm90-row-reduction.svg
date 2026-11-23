@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 860" role="img" aria-labelledby="title description" style="background:#ffffff" font-family="Helvetica, Arial, sans-serif">
+  <title id="title">LayerNorm-backward dx on H100: stock PT2 vs torchTLX full-row fusion</title>
+  <desc id="description">Three panels. 1: dataflow. Stock PT2 runs a cuBLAS mm that writes the [M,N] result to HBM and a reduction kernel that reads it back, 6 full-tensor HBM passes; torchTLX runs one GEMM template whose tile holds whole rows, 4 passes. 2: GPU kernel time per call from torch.profiler. M=307200: 223.2 us stock vs 148.8 us torchTLX, 1.50x. M=1536000: 1087.3 us vs 730.7 us, 1.49x. 3: generated code. Stock launches cuBLAS plus a persistent reduction that reloads the mm result; torchTLX launches one template kernel that keeps the mm result in registers and reduces it there.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#5b6475"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1000" height="860" fill="#ffffff"/>
+  <text x="16" y="28" font-size="17" font-weight="700" fill="#1d2330">LayerNorm-backward dx on H100 (bf16, K = N = 128): stock PT2 vs torchTLX</text>
+
+  <!-- 1. Dataflow -->
+  <text x="16" y="60" font-size="15" font-weight="700" fill="#1d2330">1. Dataflow</text>
+  <text x="16" y="84" font-size="13" font-weight="700" fill="#1d2330">Stock PT2: 2 kernels, 6 HBM passes</text>
+  <rect x="16" y="94" width="130" height="46" rx="6" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="81" y="122" font-size="13" fill="#1d2330" text-anchor="middle">grad_out [M,K]</text>
+  <rect x="186" y="94" width="150" height="46" rx="6" fill="#e3ecfb" stroke="#2f6fd6"/>
+  <text x="261" y="114" font-size="13" fill="#1d2330" text-anchor="middle">cuBLAS mm</text>
+  <text x="261" y="131" font-size="11" fill="#5b6475" text-anchor="middle">read 1, write 1</text>
+  <rect x="376" y="94" width="140" height="46" rx="6" fill="#fde8e3" stroke="#c2412d"/>
+  <text x="446" y="114" font-size="13" fill="#1d2330" text-anchor="middle">mm result [M,N]</text>
+  <text x="446" y="131" font-size="11" fill="#c2412d" text-anchor="middle">HBM round trip</text>
+  <rect x="556" y="94" width="230" height="46" rx="6" fill="#e3ecfb" stroke="#2f6fd6"/>
+  <text x="671" y="114" font-size="13" fill="#1d2330" text-anchor="middle">reduction kernel</text>
+  <text x="671" y="131" font-size="11" fill="#5b6475" text-anchor="middle">read 3, write 1</text>
+  <rect x="826" y="94" width="150" height="46" rx="6" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="901" y="122" font-size="13" fill="#1d2330" text-anchor="middle">dx [M,N]</text>
+  <line x1="146" y1="117" x2="184" y2="117" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <line x1="336" y1="117" x2="374" y2="117" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <line x1="516" y1="117" x2="554" y2="117" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <line x1="786" y1="117" x2="824" y2="117" stroke="#5b6475" marker-end="url(#arrow)"/>
+
+  <text x="16" y="172" font-size="13" font-weight="700" fill="#1d2330">torchTLX full-row fusion: 1 kernel, 4 HBM passes</text>
+  <rect x="16" y="182" width="130" height="46" rx="6" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="81" y="210" font-size="13" fill="#1d2330" text-anchor="middle">grad_out [M,K]</text>
+  <rect x="186" y="182" width="600" height="46" rx="6" fill="#dff3e7" stroke="#1f8a4c"/>
+  <text x="486" y="202" font-size="13" fill="#1d2330" text-anchor="middle">hopper_gemm_small_k, BLOCK_N = N: wgmma tile in registers</text>
+  <text x="486" y="219" font-size="11" fill="#1f8a4c" text-anchor="middle">2 x tl.sum(axis=1) + final expression; read 3 (grad_out, residual, x_hat), write 1</text>
+  <rect x="826" y="182" width="150" height="46" rx="6" fill="#eef2f7" stroke="#9aa6b8"/>
+  <text x="901" y="210" font-size="13" fill="#1d2330" text-anchor="middle">dx [M,N]</text>
+  <line x1="146" y1="205" x2="184" y2="205" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <line x1="786" y1="205" x2="824" y2="205" stroke="#5b6475" marker-end="url(#arrow)"/>
+  <text x="16" y="252" font-size="12" fill="#5b6475">One pass = one [M,128] bf16 tensor; rstd [M,1], W and ln_weight are small. 6 / 4 passes = 1.5x predicted.</text>
+
+  <!-- 2. Kernel time -->
+  <text x="16" y="292" font-size="15" font-weight="700" fill="#1d2330">2. GPU kernel time per call (torch.profiler, per-launch medians)</text>
+  <text x="16" y="318" font-size="13" font-weight="700" fill="#1d2330">M = 307200 (1 px = 0.5 us)</text>
+  <text x="16" y="345" font-size="13" fill="#1d2330">stock PT2</text>
+  <rect x="110" y="329" width="154.4" height="24" fill="#2f6fd6"/>
+  <text x="187.2" y="346" font-size="12" fill="#ffffff" text-anchor="middle">cuBLAS mm 77.2</text>
+  <rect x="264.4" y="329" width="292" height="24" fill="#9aa6b8"/>
+  <text x="410.4" y="346" font-size="12" fill="#1d2330" text-anchor="middle">reduction kernel 146.0</text>
+  <text x="566" y="346" font-size="13" fill="#1d2330">223.2 us</text>
+  <text x="16" y="377" font-size="13" fill="#1d2330">torchTLX</text>
+  <rect x="110" y="361" width="297.6" height="24" fill="#1f8a4c"/>
+  <text x="258.8" y="378" font-size="12" fill="#ffffff" text-anchor="middle">fused GEMM + epilogue 148.8</text>
+  <text x="418" y="378" font-size="13" font-weight="700" fill="#1f8a4c">148.8 us (1.50x)</text>
+
+  <text x="16" y="414" font-size="13" font-weight="700" fill="#1d2330">M = 1536000 (1 px = 2.5 us)</text>
+  <text x="16" y="441" font-size="13" fill="#1d2330">stock PT2</text>
+  <rect x="110" y="425" width="99.4" height="24" fill="#2f6fd6"/>
+  <text x="159.7" y="442" font-size="12" fill="#ffffff" text-anchor="middle">cuBLAS 248.5</text>
+  <rect x="209.4" y="425" width="47.8" height="24" fill="#6f9be6"/>
+  <text x="233.3" y="442" font-size="11" fill="#ffffff" text-anchor="middle">119.5</text>
+  <rect x="257.2" y="425" width="283.2" height="24" fill="#9aa6b8"/>
+  <text x="398.8" y="442" font-size="12" fill="#1d2330" text-anchor="middle">reduction kernel 708.1</text>
+  <text x="550" y="442" font-size="13" fill="#1d2330">1087.3 us</text>
+  <text x="16" y="473" font-size="13" fill="#1d2330">torchTLX</text>
+  <rect x="110" y="457" width="292.3" height="24" fill="#1f8a4c"/>
+  <text x="256.2" y="474" font-size="12" fill="#ffffff" text-anchor="middle">fused GEMM + epilogue 730.7</text>
+  <text x="412" y="474" font-size="13" font-weight="700" fill="#1f8a4c">730.7 us (1.49x)</text>
+
+  <rect x="700" y="331" width="14" height="14" fill="#2f6fd6"/>
+  <text x="722" y="343" font-size="12" fill="#1d2330">cuBLAS mm (extern kernel)</text>
+  <rect x="700" y="355" width="14" height="14" fill="#9aa6b8"/>
+  <text x="722" y="367" font-size="12" fill="#1d2330">Inductor persistent reduction</text>
+  <rect x="700" y="379" width="14" height="14" fill="#1f8a4c"/>
+  <text x="722" y="391" font-size="12" fill="#1d2330">torchTLX fused template</text>
+  <text x="700" y="419" font-size="11" fill="#5b6475">20 profiled calls after 20 warm-up calls.</text>
+  <text x="700" y="434" font-size="11" fill="#5b6475">All kernels move 2.0-2.2 TB/s, so the</text>
+  <text x="700" y="449" font-size="11" fill="#5b6475">speedup is the traffic removed.</text>
+  <text x="16" y="506" font-size="12" fill="#5b6475">The fused kernel runs within 2-3% of the stock reduction kernel alone, so the whole cuBLAS mm leaves the timeline.</text>
+
+  <!-- 3. Generated code -->
+  <text x="16" y="546" font-size="15" font-weight="700" fill="#1d2330">3. Generated code (TORCH_LOGS=output_code, M = 307200, excerpts)</text>
+  <rect x="16" y="558" width="476" height="246" rx="6" fill="#f6f8fb" stroke="#9aa6b8"/>
+  <text x="28" y="580" font-size="13" font-weight="700" fill="#1d2330">Stock PT2: cuBLAS mm + persistent reduction</text>
+  <rect x="508" y="558" width="476" height="246" rx="6" fill="#f2faf5" stroke="#1f8a4c"/>
+  <text x="520" y="580" font-size="13" font-weight="700" fill="#1d2330">torchTLX: one fused template kernel</text>
+  <rect x="22" y="665" width="464" height="16" fill="#fde8e3"/>
+  <rect x="514" y="729" width="464" height="16" fill="#dff3e7"/>
+  <g font-family="Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="10.5" fill="#1d2330" xml:space="preserve" style="white-space:pre">
+    <text x="28" y="602" fill="#5b6475"># call(): 2 launches, mm result goes through HBM</text>
+    <text x="28" y="617">extern_kernels.mm(arg0_1, arg1_1, out=buf0)  # cuBLAS</text>
+    <text x="28" y="632">triton_per_fused_..._0.run(buf3, arg2_1, ...)</text>
+    <text x="28" y="662" fill="#5b6475"># reduction kernel</text>
+    <text x="28" y="677">tmp0 = tl.load(in_out_ptr0 + ...)   # mm result, from HBM</text>
+    <text x="28" y="692">tmp1 = tl.load(in_ptr0 + ...)       # grad_residual</text>
+    <text x="28" y="707">tmp4 = tl.load(in_ptr1 + r0_1)      # ln_weight</text>
+    <text x="28" y="722">tmp10 = tl.load(in_ptr2 + ...)      # x_hat</text>
+    <text x="28" y="737">tmp16 = tl.load(in_ptr3 + x0)       # rstd</text>
+    <text x="28" y="752">tmp9 = tl.sum(tmp7, 1)[:, None]     # sum(g)</text>
+    <text x="28" y="767">tmp15 = tl.sum(tmp13, 1)[:, None]   # sum(g * x_hat)</text>
+    <text x="28" y="782">tl.store(in_out_ptr0 + ..., tmp24)  # dx</text>
+
+    <text x="520" y="602" fill="#5b6475"># call(): 1 launch, mm result stays in registers</text>
+    <text x="520" y="617">triton_tem_fused_..._mm_..._0.run(arg0_1, ..., buf3, ws)</text>
+    <text x="520" y="647" fill="#5b6475"># fused kernel: 128x128x64 tile, 8 warps, 3 stages</text>
+    <text x="520" y="662">for k in range(0, tl.cdiv(K, BLOCK_K)):  # 2 iterations</text>
+    <text x="520" y="677">    a = desc_a.load([offs_m, offs_k])    # TMA</text>
+    <text x="520" y="692">    b = desc_b.load([offs_k, offs_n])    # TMA</text>
+    <text x="520" y="707">    acc = tl.dot(a, b, acc)              # wgmma</text>
+    <text x="520" y="741">tlx_raw = acc.to(tl.bfloat16).to(tl.float32)</text>
+    <text x="520" y="756">tlx_red0_0 = tl.sum(tl.where(mask, tlx_src0_6, 0.0), axis=1)</text>
+    <text x="520" y="771">tlx_red1_0 = tl.sum(tl.where(mask, tlx_src1_9, 0.0), axis=1)</text>
+    <text x="520" y="786">tl.store(out_ptr0 + idx_m * 128 + idx_n, ..., mask=mask)</text>
+  </g>
+  <text x="520" y="725" font-size="10.5" fill="#5b6475" font-family="Menlo, Consolas, 'DejaVu Sans Mono', monospace" xml:space="preserve" style="white-space:pre"># epilogue: reduce the tile in registers, store dx</text>
+  <text x="16" y="828" font-size="12" fill="#5b6475">Compiled torchTLX kernel: TTGIR has 4 tt.load (Triton CSE merges repeated epilogue loads), 6 TMA copies and 1 tt.store;</text>
+  <text x="16" y="846" font-size="12" fill="#5b6475">PTX stores dx with st.global.v4.b32 (no TMA store). Both arms round the mm result to bf16 before reducing (rel-L2 1e-7).</text>
+</svg>

@@ -124,7 +124,7 @@ are unaffected. Mechanics:
 - **Register dot + TMA reduce**: a TMA reduce creates the reduction partition
   through `hasReduction` regardless of the anchor, so with a register `tt.dot`
   and an epilogue partition `getInitialSchedule` returns no schedule and the
-  loop is not specialized (partition-scheduler bug #47).
+  loop is not specialized (partition-scheduler bug #48).
 - **Reduction first → index 0**: the reduction branch fires for
   `hasReduction || hasComputeAnchor`, and because it runs before the
   load/epilogue_store branches it gets index 0 (the default 4-warp group), so

@@ -816,12 +816,12 @@ def _gemm_mxfp8_ws_kernel(  # noqa: TR001
     )
     a_scale_tiles = tlx.local_alloc(
         (1, REP_M, REP_K, 2, 256),
-        tl.uint8,
+        tlx.dtype_of(a_scale_desc),
         NUM_SMEM_BUFFERS,
     )
     b_scale_tiles = tlx.local_alloc(
         (1, REP_N, REP_K, 2, 256),
-        tl.uint8,
+        tlx.dtype_of(b_scale_desc),
         NUM_SMEM_BUFFERS,
     )
     accumulators = tlx.local_alloc(

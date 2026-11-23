@@ -33,6 +33,7 @@ class CPUOptions:
     num_warps: int = 0
     num_stages: int = 0
     num_ctas: int = 0
+    warp_size: int = 1
     # Max number of threads to be used for a kernel call.
     # Zero value is used to utilize all available CPU cores.
     num_cpu_threads: int = 0
@@ -68,7 +69,7 @@ class CPUOptions:
     # GPU-only knobs do not affect the generated x86 code. num_cpu_threads is
     # launch metadata, so it must remain in the key until launch options are
     # stored separately from cached compiler metadata.
-    _RUNTIME_ONLY_FIELDS = frozenset({"num_warps", "num_stages", "num_ctas"})
+    _RUNTIME_ONLY_FIELDS = frozenset({"num_warps", "num_stages", "num_ctas", "warp_size"})
 
     def hash(self):
         hash_dict = {k: v for k, v in self.__dict__.items() if k not in self._RUNTIME_ONLY_FIELDS}
