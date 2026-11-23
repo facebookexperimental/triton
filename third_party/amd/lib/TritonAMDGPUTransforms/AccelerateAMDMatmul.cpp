@@ -671,8 +671,13 @@ struct MfmaDotPlan {
   unsigned kWidth;
 
   ttg::DotOperandEncodingAttr getOperandEncoding(unsigned opIdx) const {
+    Type operandType = opIdx == 0 ? instr.aElementType : instr.bElementType;
+    unsigned operandKWidth =
+        withScale && !isa<Float6E2M3FNType, Float6E3M2FNType>(operandType)
+            ? kWidth / 2
+            : kWidth;
     return ttg::DotOperandEncodingAttr::get(enc.getContext(), opIdx, enc,
-                                            withScale ? kWidth / 2 : kWidth);
+                                            operandKWidth);
   }
 };
 
