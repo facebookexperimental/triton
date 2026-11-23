@@ -1,6 +1,6 @@
 """Authoritative coverage for ``tlx.ops.mm_mxfp6``.
 
-Mirrored from ``test_mm_mxfp8_sm100.py``: same catalog, signature, config,
+Mirrored from ``test_mm_mxfp_sm100.py``: same catalog, signature, config,
 and validation coverage, with E2M3 (A) / E3M2 (B) dense-packed uint8 operands
 and an fp6-aware reference.
 """

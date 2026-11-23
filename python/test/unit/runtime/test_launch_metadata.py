@@ -12,11 +12,8 @@ import torch
 import triton
 import triton.language as tl
 from triton import knobs
-from triton.backends.nvidia.driver import (
-    build_kernel_signature_from_schema,
-    expand_signature,
-    make_kernel_signature,
-)
+from triton.backends.nvidia.driver import build_kernel_signature_from_schema
+from triton.backends.driver import TensorDescABI, get_kernel_argument_layout
 from triton._internal_testing import is_cuda
 from triton.compiler.compiler import ASTSource, compile as triton_compile, make_backend
 from triton.knobs import HookChain
@@ -480,20 +477,21 @@ def multi_type_kernel(ptr_fp32, ptr_fp16, scalar_i32, scalar_i64, scalar_fp32, N
     }, {"BLOCK": 256}),
 ])
 def test_schema_derived_signature_matches_legacy(kernel, signature, constexprs):
-    """kernel_signature from Level 0 schema must match legacy expand_signature path.
+    """kernel_signature from Level 0 schema must match legacy get_kernel_argument_layout path.
 
     This validates that build_kernel_signature_from_schema() produces the exact
-    same byte sequence as the old make_kernel_signature(expand_signature(...)) path.
+    same byte sequence as the reference get_kernel_argument_layout(...) + build_signature_metadata path.
     """
     compiled = _compile_kernel(kernel, signature=signature, constexprs=constexprs)
     src = compiled.src
     md = compiled.metadata
 
-    # Legacy path: expand_signature → make_kernel_signature
+    # Legacy path: get_kernel_argument_layout → build_signature_metadata
     sig = {idx: value for idx, value in src.signature.items()}
     tensordesc_meta = getattr(md, "tensordesc_meta", None)
-    expanded = expand_signature(sig.values(), tensordesc_meta)
-    legacy_signature = make_kernel_signature(expanded)
+    abi = TensorDescABI.CUDA_TMA if tensordesc_meta else TensorDescABI.DECOMPOSED
+    legacy_types = [ty for _, ty in get_kernel_argument_layout(tuple(sig.values()), abi)]
+    legacy_signature = triton.runtime.driver.active.utils.build_signature_metadata(legacy_types)
 
     # Schema path: make_launch_metadata → build_kernel_signature_from_schema
     backend = make_backend(md.target)
@@ -502,7 +500,7 @@ def test_schema_derived_signature_matches_legacy(kernel, signature, constexprs):
 
     assert schema_signature == legacy_signature, (f"Schema-derived signature differs from legacy!\n"
                                                   f"  schema args: {[a['type'] for a in schema['args']]}\n"
-                                                  f"  expanded sig: {expanded}\n"
+                                                  f"  legacy types: {legacy_types}\n"
                                                   f"  schema bytes: {list(schema_signature)}\n"
                                                   f"  legacy bytes: {list(legacy_signature)}")
 
@@ -536,15 +534,16 @@ def test_schema_derived_signature_tensordesc(tensordesc_type, tensordesc_meta, o
     # Schema path
     schema_signature = build_kernel_signature_from_schema(schema)
 
-    # Legacy path: build equivalent flat signature list
+    # Reference path: get_kernel_argument_layout → build_signature_metadata over equivalent flat signature list
     sig_values = [tensordesc_type] + [a["type"] for a in other_args]
-    expanded = expand_signature(sig_values, tensordesc_meta or None)
-    legacy_signature = make_kernel_signature(expanded)
+    abi = TensorDescABI.CUDA_TMA if tensordesc_meta else TensorDescABI.DECOMPOSED
+    legacy_types = [ty for _, ty in get_kernel_argument_layout(tuple(sig_values), abi)]
+    legacy_signature = triton.runtime.driver.active.utils.build_signature_metadata(legacy_types)
 
     assert schema_signature == legacy_signature, (f"Schema-derived signature differs from legacy for tensordesc!\n"
                                                   f"  tensordesc_type: {tensordesc_type}\n"
                                                   f"  tensordesc_meta: {tensordesc_meta}\n"
-                                                  f"  expanded sig: {expanded}\n"
+                                                  f"  legacy types: {legacy_types}\n"
                                                   f"  schema bytes: {list(schema_signature)}\n"
                                                   f"  legacy bytes: {list(legacy_signature)}")
 
