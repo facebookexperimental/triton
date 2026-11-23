@@ -141,8 +141,8 @@ def test_flash_attn_varlen_mxfp8_default_fast_exp(lens_k, fast):
 
 
 def test_flash_attn_varlen_mxfp8_graph_capture_new_offsets():
-    """The launch reads no sequence length on the host: offsets first seen
-    while capturing a CUDA graph give the eager result on replay."""
+    """Offsets first seen while capturing a CUDA graph give the eager result
+    on replay."""
     from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
 
     torch.manual_seed(20)

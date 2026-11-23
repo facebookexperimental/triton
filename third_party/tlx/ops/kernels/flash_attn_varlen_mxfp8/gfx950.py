@@ -11,10 +11,9 @@ in registers, or ahead of time for ``forward_prequantized``. The padding sits
 at both ends of a span (see ``_front``), so only an item's first and last
 128-key tiles hold padding keys, which get scores of -1e30 or less.
 
-Work items are 128-row query-tile/head pairs, one per workgroup. The launch
-needs no sequence length on the host: the grid is an upper bound from the
-token totals, and device kernels build the tables that map a workgroup to its
-item (``_build_metadata``).
+Work items are 128-row query-tile/head pairs, one per workgroup. The grid is
+an upper bound from the token totals, and device kernels build the tables
+that map a workgroup to its item (``_build_metadata``).
 
 - Workgroups go round-robin to the 8 XCDs. Each XCD takes one head of half
   of the sequences, so all the query tiles of a (sequence, head) read its K/V
@@ -888,8 +887,8 @@ def _metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad=_PAD):
 
 
 def _build_metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad):
-    """Build _metadata's tables on the device, without reading the offsets on
-    the host: the table sizes are upper bounds from the totals."""
+    """Build _metadata's tables on the device. The table sizes are upper
+    bounds from the totals."""
     batch = cu_seqlens_k.numel() - 1
     device = cu_seqlens_k.device
     tile_capacity = total_kv // _PREP_ROWS + batch * pad // _PREP_ROWS
