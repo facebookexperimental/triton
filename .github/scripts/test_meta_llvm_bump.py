@@ -1,3 +1,8 @@
+import hashlib
+import json
+
+import pytest
+
 from meta_llvm_bump import (bot_branch_for, commit_message, decide, failed_body, issue_body, issue_marker,
                             issue_release, issue_result, issue_title, oai_pins, pick_tracking, pr_body,
                             parse_sha256_file, release_for, render, same_tree_chain, variants, verdict, verify_state)
@@ -245,3 +250,95 @@ def test_pick_tracking_keeps_newest_and_returns_duplicates():
     assert [d["number"] for d in dups] == [4136, 4133]
     assert pick_tracking(issues, "release/3.8.x")[0]["number"] == 4134
     assert pick_tracking(issues[-1:], "main") == (None, [])
+
+
+BRANCH_PLATFORMS = ["almalinux-arm64", "almalinux-x64", "ubuntu-arm64", "ubuntu-x64"]
+BRANCH_TREE = "b" * 40
+
+
+def _branch_tip(sha=NEW):
+    return {"sha": sha, "commit": {"tree": {"sha": BRANCH_TREE}}}
+
+
+def _branch_bundle(kind, sha=NEW):
+    prefix = "llvm" if kind == "core" else "amd-llvm"
+    stem = f"{prefix}-{sha[:8]}"
+    record = {
+        "schema_version": 1,
+        "kind": kind,
+        "llvm_repository": "facebookexperimental/llvm-project",
+        "llvm_sha": sha,
+        "llvm_tree": BRANCH_TREE,
+        "build_number": 1,
+    }
+    content = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+    assets = [{"name": f"{stem}-1.source.json", "digest": "sha256:" + hashlib.sha256(content.encode()).hexdigest()}]
+    for platform in BRANCH_PLATFORMS:
+        name = f"{stem}-{platform}-1.tar.gz"
+        digest = hashlib.sha256(name.encode()).hexdigest()
+        checksum = f"{digest}  {name}\n"
+        assets += [{"name": name, "digest": f"sha256:{digest}"},
+                   {"name": f"{name}.sha256", "digest": "sha256:" + hashlib.sha256(checksum.encode()).hexdigest()}]
+    return assets
+
+
+@pytest.mark.parametrize("kind", ["core", "amd"])
+def test_branch_bundles_pin_the_full_sha_without_a_manifest_change(kind):
+    from select_meta_llvm_branches import branch_requests
+
+    assert branch_requests({kind: _branch_tip()}, [],
+                           BRANCH_PLATFORMS) == [{"kind": kind, "llvm_sha": NEW, "build_number": "1"}]
+
+
+@pytest.mark.parametrize("kind", ["core", "amd"])
+def test_branch_bundles_stop_retrying_only_after_complete_publication(kind):
+    from select_meta_llvm_branches import branch_requests
+
+    assets = _branch_bundle(kind)
+    assert branch_requests({kind: _branch_tip()}, assets, BRANCH_PLATFORMS) == []
+    for missing in assets:
+        partial = [asset for asset in assets if asset is not missing]
+        assert branch_requests({kind: _branch_tip()}, partial,
+                               BRANCH_PLATFORMS) == [{"kind": kind, "llvm_sha": NEW, "build_number":
+                                                      "1"}], missing["name"]
+
+
+@pytest.mark.parametrize("kind", ["core", "amd"])
+def test_branch_bundles_retry_the_same_request_then_follow_a_new_head(kind):
+    from select_meta_llvm_branches import branch_requests
+
+    tips = {kind: _branch_tip()}
+    first = branch_requests(tips, [], BRANCH_PLATFORMS)
+    assert branch_requests(tips, [], BRANCH_PLATFORMS) == first
+    tips[kind] = _branch_tip(SYNC)
+    assert branch_requests(tips, _branch_bundle(kind),
+                           BRANCH_PLATFORMS) == [{"kind": kind, "llvm_sha": SYNC, "build_number": "1"}]
+    assert first[0]["llvm_sha"] == NEW
+
+
+def test_branch_bundles_do_not_confuse_core_and_amd_publication():
+    from select_meta_llvm_branches import branch_requests
+
+    tips = {"core": _branch_tip(), "amd": _branch_tip()}
+    assert branch_requests(tips, _branch_bundle("core"),
+                           BRANCH_PLATFORMS) == [{"kind": "amd", "llvm_sha": NEW, "build_number": "1"}]
+
+
+@pytest.mark.parametrize("kind", ["core", "amd"])
+def test_branch_bundles_require_the_selected_sources(kind):
+    from select_meta_llvm_branches import branch_requests
+
+    assets = _branch_bundle(kind)
+    assets[0]["digest"] = "sha256:" + "0" * 64
+    with pytest.raises(ValueError, match="source provenance differs"):
+        branch_requests({kind: _branch_tip()}, assets, BRANCH_PLATFORMS)
+
+
+@pytest.mark.parametrize("kind", ["core", "amd"])
+def test_branch_bundles_require_checksum_agreement(kind):
+    from select_meta_llvm_branches import branch_requests
+
+    assets = _branch_bundle(kind)
+    assets[2]["digest"] = "sha256:" + "0" * 64
+    with pytest.raises(ValueError, match="checksum differs"):
+        branch_requests({kind: _branch_tip()}, assets, BRANCH_PLATFORMS)
