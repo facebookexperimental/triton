@@ -29,9 +29,13 @@ GFX950_2 = FocusSuite(
     shapes=tuple(RouterGemmShape(t, 256, 8192) for t in (128, 151, 256, 512, 1024, 2048, 4096, 8192, 16384)),
 )
 GFX950_ALL = FocusSuite(name="gfx950_all", op="router_gemm", includes=("gfx950_1", "gfx950_2"))
+# The same router on Blackwell.
+SM100_1 = FocusSuite(name="sm100_1", op="router_gemm", shapes=GFX950_1.shapes)
+SM100_2 = FocusSuite(name="sm100_2", op="router_gemm", shapes=GFX950_2.shapes)
+SM100_ALL = FocusSuite(name="sm100_all", op="router_gemm", includes=("sm100_1", "sm100_2"))
 
-FOCUS_SUITES = (GFX950_1, GFX950_2, GFX950_ALL)
-DEFAULT_SUITES = {"gfx950": ("gfx950_all", )}
+FOCUS_SUITES = (GFX950_1, GFX950_2, GFX950_ALL, SM100_1, SM100_2, SM100_ALL)
+DEFAULT_SUITES = {"gfx950": ("gfx950_all", ), "sm100": ("sm100_all", )}
 FOCUS = FocusRegistry("router_gemm", FOCUS_SUITES, DEFAULT_SUITES)
 CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
 

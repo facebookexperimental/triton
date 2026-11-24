@@ -172,6 +172,35 @@ def test_umulhi_truncated_input(seed_type, dtype):
         pytest.fail("PTX stage not found")
 
 
+@pytest.mark.parametrize("instrumentation_mode", ["", "fpsan"])
+def test_compile_only_nvptx_fabs_preserves_nan_payload(instrumentation_mode):
+    from triton._C.libtriton import llvm
+    from triton.backends.nvidia.compiler import CUDABackend
+
+    llvm.init_targets()
+    backend = CUDABackend(GPUTarget("cuda", 90, 32))
+    options = backend.parse_options({"ptx_version": 93, "instrumentation_mode": instrumentation_mode})
+    source = """
+target triple = "nvptx64-nvidia-cuda"
+declare <4 x float> @llvm.fabs.v4f32(<4 x float>)
+define ptx_kernel void @abs_kernel(ptr addrspace(1) %input, ptr addrspace(1) %output) {
+  %value = load <4 x float>, ptr addrspace(1) %input, align 16
+  %absolute = call <4 x float> @llvm.fabs.v4f32(<4 x float> %value)
+  store <4 x float> %absolute, ptr addrspace(1) %output, align 16
+  ret void
+}
+"""
+    ptx = backend.make_ptx(source, {}, options, 90)
+    if instrumentation_mode == "fpsan":
+        assert "abs.f32" not in ptx
+        masks = re.findall(r"\band\.b32\s+[^;]+,\s*(0x[0-9a-fA-F]+|\d+)\s*;", ptx)
+        assert len(masks) == 4
+        assert all(int(mask, 0) == 0x7FFFFFFF for mask in masks)
+    else:
+        assert len(re.findall(r"\babs\.f32\b", ptx)) == 4
+        assert "and.b32" not in ptx
+
+
 @pytest.mark.parametrize("element_type", ["f32", "f16", "bf16"])
 def test_compile_only_packed_arith_chains(element_type, tmp_path) -> None:
     packed_type = f"{element_type}x2"
@@ -590,10 +619,12 @@ def test_compile_only_dot_mxfp6_sm100(block_k: int, monkeypatch) -> None:
 
 @pytest.mark.parametrize("nonkdim", [16, 32])
 def test_compile_only_dot_mxfp6_gfx950(nonkdim: int) -> None:
-    # MXFP6 decomposes to a plain bf16 dot on gfx950: native
-    # v_mfma_scale_*_f8f6f4 cannot tile the factor-3 packed K. The kernel must
-    # still reach plain v_mfma_f32 instructions. Storage is dense (4 values
-    # per 3 bytes); BLOCK_K is the logical width.
+    # MXFP6 stays native on gfx950 for blocked K=128 tiles: the kernel
+    # unpacks its dense factor-3-packed K in-register and feeds the
+    # unpacked codes to `tl.dot_scaled`, which lowers to native
+    # v_mfma_scale_*_f8f6f4 instead of decomposing to a plain bf16 dot.
+    # Storage is dense (4 values per 3 bytes); BLOCK_K is the logical
+    # width.
 
     k = triton.compile(
         triton.compiler.ASTSource(
@@ -614,8 +645,8 @@ def test_compile_only_dot_mxfp6_gfx950(nonkdim: int) -> None:
         options={"matrix_instr_nonkdim": nonkdim},
     )
     amdgcn = k.asm["amdgcn"]
-    assert re.search(r"v_mfma_f32_", amdgcn), "The AMDGCN does not contain plain v_mfma_f32 instructions."
-    assert "f8f6f4" not in amdgcn, "The AMDGCN unexpectedly uses the native f8f6f4 instruction."
+    assert re.search(r"v_mfma_scale_f32_", amdgcn), "The AMDGCN does not contain scaled v_mfma_scale_f32 instructions."
+    assert not re.search(r"v_mfma_f32_", amdgcn), "The AMDGCN unexpectedly contains plain v_mfma_f32 instructions."
 
 
 def test_compile_only_dot_mxfp6_gfx1250(monkeypatch) -> None:
