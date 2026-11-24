@@ -21,6 +21,8 @@ class MoeShape(NamedTuple):
 
 SYNTHETIC: tuple[MoeShape,
                  ...] = tuple(MoeShape(tokens, 256, 256, 384, 8, 32, 4, 8, "bf16") for tokens in (1, 64, 4090))
+SYNTHETIC_FP8 = tuple(MoeShape(t, 256, 256, 256, 4, 4, 2, 0, "fp8") for t in (17, 128, 513))
+FP8_SCALES = (0.5, 0.25, 0.0625, 0.125)
 
 
 def _muse_spark_open(tokens: int) -> MoeShape:
@@ -38,10 +40,13 @@ GFX950_2 = FocusSuite(
 )
 GFX950_ALL = FocusSuite(name="gfx950_all", op="moe", includes=("gfx950_1", "gfx950_2"))
 
-FOCUS_SUITES = (GFX950_1, GFX950_2, GFX950_ALL)
-DEFAULT_SUITES = {"gfx950": ("gfx950_all", )}
+GFX1250_1 = FocusSuite(name="gfx1250_1", op="moe",
+                       shapes=tuple(MoeShape(t, 256, 256, 256, 4, 4, 2, 0, "fp8") for t in (128, 512, 2048, 8192)))
+
+FOCUS_SUITES = (GFX950_1, GFX950_2, GFX950_ALL, GFX1250_1)
+DEFAULT_SUITES = {"gfx950": ("gfx950_all", ), "gfx1250": ("gfx1250_1", )}
 FOCUS = FocusRegistry("moe", FOCUS_SUITES, DEFAULT_SUITES)
-CORRECTNESS_SHAPES = tuple(dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())))
+CORRECTNESS_SHAPES = tuple(s for s in dict.fromkeys((*SYNTHETIC, *FOCUS.all_shapes())) if s.dtype == "bf16")
 
 
 def label(shape: MoeShape) -> str:
@@ -56,16 +61,19 @@ def flops(local_rows: int, K: int, I: int, H: int) -> int:
 
 def inputs(shape: MoeShape, seed: int = 0, device="cuda"):
     """``x``, ``topk_weights``, ``topk_ids``, ``w13``, ``w2``, ``post_norm_weight``; each token routes to ``topk``
-    distinct experts drawn uniformly from all ``num_experts``, with normalized weights."""
+    distinct experts drawn uniformly from all ``num_experts``, with normalized weights.
+    Plain FP8 suites use FP8_SCALES and return no post-normalization weight.
+    """
     import torch
 
-    dtype = {"bf16": torch.bfloat16}[shape.dtype]
+    dtype = {"bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}[shape.dtype]
     gen = torch.Generator(device=device).manual_seed(seed)
     E, K, I, H = shape.local_experts, shape.K, shape.I, shape.H
-    w13 = (torch.randn(E, 2 * I, K, device=device, generator=gen) * 0.02).to(dtype)
-    w2 = (torch.randn(E, H, I, device=device, generator=gen) * 0.02).to(dtype)
-    norm = (torch.randn(H, device=device, generator=gen) * 0.1).to(dtype)
-    x = torch.randn(shape.tokens, K, device=device, generator=gen).to(dtype)
+    std = 0.5 if shape.dtype == "fp8" else 0.02
+    w13 = (torch.randn(E, 2 * I, K, device=device, generator=gen) * std).to(dtype)
+    w2 = (torch.randn(E, H, I, device=device, generator=gen) * std).to(dtype)
+    norm = None if shape.dtype == "fp8" else (torch.randn(H, device=device, generator=gen) * 0.1).to(dtype)
+    x = (torch.randn(shape.tokens, K, device=device, generator=gen) * (0.5 if shape.dtype == "fp8" else 1.)).to(dtype)
     ids = torch.rand(shape.tokens, shape.num_experts, device=device, generator=gen).argsort(dim=1)[:, :shape.topk]
     weights = torch.rand(shape.tokens, shape.topk, device=device, generator=gen)
     return x, weights / weights.sum(dim=1, keepdim=True), ids.to(torch.int32), w13, w2, norm

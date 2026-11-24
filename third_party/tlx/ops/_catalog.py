@@ -400,6 +400,14 @@ CATALOG: tuple[OpSpec, ...] = (
         supports_backward=True,
     ),
     OpSpec(
+        op="moe",
+        arch="gfx1250",
+        variant="fp8_tdm",
+        impl="triton.tlx.ops.kernels.moe.gfx1250:moe",
+        dtypes=frozenset({"float8_e4m3fn"}),
+        accepts=lambda d: all(256 <= d[dim] <= 8192 and d[dim] % 256 == 0 for dim in ("K", "I", "H")),
+    ),
+    OpSpec(
         op="moe_routing",
         arch="gfx950",
         variant="wave_rows",

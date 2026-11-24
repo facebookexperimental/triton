@@ -18,6 +18,32 @@ out = tlx_mm(a, b)
 `tlx.ops` infers the architecture from the input tensors and dispatches to the
 matching registered implementation.
 
+### FP8 routed MoE on MI450-mc
+
+```python
+from triton.tlx.ops import moe
+
+output = moe(x_fp8, topk_weights, topk_ids, w13_fp8, w2_fp8,
+             fp8_scales=(0.5, 0.25, 0.0625, 0.125))
+```
+
+The gfx1250 path uses plain E4M3FN FP8 activations and weights with four Python
+scalar dequantization multipliers `(input, gate_up_weight, intermediate, down_weight)`.
+The example values above are synthetic. SiLU(gate) times up is divided by the
+intermediate scale and rounded to FP8; the down projection rounds to BF16
+before router weighting. The FP32 combine sums in router-slot order and writes BF16.
+Calls include GPU route grouping and gate/up weight interleaving; graph replay
+observes updated tensor contents, while scales and shapes stay fixed.
+
+Supported inputs are contiguous `x (T,K)`, `w13 (E,2I,K)`, `w2 (E,H,I)`,
+FP32 router weights and int32/int64 IDs `(T,topk)`. `K/I/H` are multiples of
+256 from 256 through 8192; `E<=16`, top-k is 2 or 4, and `T*topk<=32768`.
+Payload bases are 16-byte aligned. Empty batches, duplicate routes and remote
+experts are supported; `expert_start` selects the local range. This forward-only
+path provides `space="heuristic"`, optional BF16 `out=`, and no post-normalization.
+The existing gfx950 BF16 path retains its contract. The `gfx1250_1` MoE benchmark
+suite covers synthetic prefill sizes 128, 512, 2048 and 8192.
+
 ## Structure
 
 ```

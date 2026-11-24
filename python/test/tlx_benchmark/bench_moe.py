@@ -13,7 +13,7 @@ import sys
 
 import torch
 from triton.tlx.ops.kernels.moe._shapes import FOCUS as SHAPE_SUITES
-from triton.tlx.ops.kernels.moe._shapes import SYNTHETIC, MoeShape, flops, inputs, label
+from triton.tlx.ops.kernels.moe._shapes import FP8_SCALES, SYNTHETIC, SYNTHETIC_FP8, MoeShape, flops, inputs, label
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -25,11 +25,13 @@ DEFAULT_SPACE = "heuristic"
 EXTRA_COLUMNS = (("local rows", "local_rows"), )
 COLD_COMPILE = "first"
 
-DTYPES = {"bf16": torch.bfloat16}
+DTYPES = {"bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}
 
 
 def shapes(synthetic: bool = False, suites=None) -> list:
-    return list(SYNTHETIC if synthetic else SHAPE_SUITES.shapes(driver.arch(), suites))
+    if synthetic:
+        return list(SYNTHETIC_FP8 if driver.arch() == "gfx1250" else SYNTHETIC)
+    return list(SHAPE_SUITES.shapes(driver.arch(), suites))
 
 
 def cases(synthetic: bool = False, suites=None) -> list[Case]:
@@ -72,11 +74,12 @@ def prepare(case: Case, space: str) -> Prepared:
     local = (ids >= shape.expert_start) & (ids < shape.expert_start + shape.local_experts)
     local_rows = int(local.sum())
     _LOCAL_ROWS[tuple(case.shape)] = local_rows
-    out = torch.empty(shape.tokens, shape.H, device="cuda", dtype=x.dtype)
+    out = torch.empty(shape.tokens, shape.H, device="cuda", dtype=torch.bfloat16)
+    kwargs = {"fp8_scales": FP8_SCALES} if shape.dtype == "fp8" else {}
 
     def tlx_call():
         return moe(x, weights, ids, w13, w2, expert_start=shape.expert_start, post_norm_weight=norm, out=out,
-                   space=space)
+                   space=space, **kwargs)
 
     return Prepared(
         tlx_fn=_graphed(tlx_call),

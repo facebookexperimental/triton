@@ -721,8 +721,8 @@ _MOE_MAX_FINALIZE_TILE = 1 << 16
 
 
 def moe(x, topk_weights, topk_ids, w13, w2, *, expert_start=0, post_norm_weight=None, post_norm_eps=1e-6,
-        post_norm_gain=0.0, out=None, space=None):
-    """Routed SiLU-gated mixture of experts over precomputed top-k routing. Forward only, bf16.
+        post_norm_gain=0.0, out=None, space=None, fp8_scales=None):
+    """Routed SiLU-gated mixture of experts over precomputed top-k routing. Forward only.
 
     For each token ``t`` returns ``sum_k topk_weights[t, k] * f(y_k)`` where, for local expert
     ``e = topk_ids[t, k] - expert_start``, ``y_k = (silu(x[t] @ w13[e, :I].T) * (x[t] @ w13[e, I:].T)) @ w2[e].T``.
@@ -735,6 +735,15 @@ def moe(x, topk_weights, topk_ids, w13, w2, *, expert_start=0, post_norm_weight=
     of 128, ``E <= 512`` and ``next_pow2(topk) * next_pow2(H) <= 2**16``. Ids are never read on the host, so
     the call is graph-capturable.
     Only ``space="heuristic"`` is provided.
+
+    On gfx1250, contiguous FP8 E4M3FN x/w13/w2 take ``fp8_scales=(sx, sw13, sh, sw2)``:
+    four positive finite Python scalar dequantization multipliers. The first GEMM applies ``sx*sw13``;
+    SiLU(gate)*up is divided by ``sh`` and rounded to FP8 before the second GEMM applies ``sh*sw2``.
+    Each expert output rounds to BF16 before router weighting; the FP32 combine sums in route-slot order.
+    This path supports top-k 2 or 4, up to 16 local experts and 32768 route slots, K/I/H multiples of 256
+    up to 8192, FP32 router weights, and no post-normalization. It includes GPU route preparation and
+    gate/up weight interleaving on every call, including graph replay. Scales are graph constants.
+    Other architectures retain their existing BF16 contract; FP8 is plain scalar-scaled FP8, not MXFP8.
     """
     import torch
 
@@ -779,6 +788,15 @@ def moe(x, topk_weights, topk_ids, w13, w2, *, expert_start=0, post_norm_weight=
         extra.append(out)
     if any(t.device != x.device for t in (*tensors, *extra)):
         raise InvalidInput("tlx.ops.moe expects all tensors on one device")
+    is_fp8 = x.dtype == torch.float8_e4m3fn
+    if is_fp8 != (fp8_scales is not None):
+        raise InvalidInput("tlx.ops.moe requires fp8_scales exactly when x/w13/w2 are float8_e4m3fn")
+    if is_fp8:
+        if (not isinstance(fp8_scales, (tuple, list)) or len(fp8_scales) != 4 or any(
+                isinstance(s, bool) or not isinstance(s, (int, float)) or not 0 < s < math.inf for s in fp8_scales)):
+            raise InvalidInput("tlx.ops.moe fp8_scales must contain four positive finite Python scalars")
+        if post_norm_weight is not None:
+            raise InvalidInput("tlx.ops.moe FP8 does not support post-normalization")
 
     space_name, invariance = _normalize_space_arg("moe", space)
     _check_single_config_space("moe", space_name)
@@ -787,6 +805,9 @@ def moe(x, topk_weights, topk_ids, w13, w2, *, expert_start=0, post_norm_weight=
     check_backward(spec, *tensors, *extra)
     _check_enforced("moe", spec, invariance)
     with torch.cuda.device(x.device):
+        if is_fp8:
+            return fn(x, topk_weights, topk_ids, w13, w2, expert_start=expert_start, out=out,
+                      fp8_scales=tuple(float(s) for s in fp8_scales))
         return fn(x, topk_weights, topk_ids, w13, w2, expert_start, post_norm_weight, post_norm_eps, post_norm_gain,
                   out)
 
