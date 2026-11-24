@@ -140,6 +140,18 @@ increase look free even when reuse realization must reject the alias and
 materialize a separate allocation, which can make the final physical layout
 exceed the planner budget.
 
+#### Opt-in: operand ring before outer staging
+
+The warp-specialized loop (or an enclosing loop) can set `tt.smem_operand_ring_first` (`tl.range(...,
+smem_operand_ring_first=True)`). The planner then also builds a plan in which
+outer-loop staging (P4/P5 tiers) only grows from the budget left once the
+TMA-fed MMA operands reach `min(num_stages, K-loop trip count)` copies, and
+keeps it if it deepens the shallowest MMA operand ring. This helps when large
+staging slots (for example a fused fp32 cast) would leave the operand ring at
+1-2 copies; small bf16 slots usually overlap their stores cheaply and are
+better left at the default. Inner-loop staging keeps first claim. Blackwell
+(MMAv5) only.
+
 #### `K | S` cap for same-partition (wait_group-drained) staging
 
 A staging group holds **S** subtiles (`S = indices.size()`, the fused

@@ -4352,6 +4352,8 @@ class AutoWSLoopOptions(base_value):
                                                          metadata=_loop_attr("tt.smem_circular_reuse", "bool_opt"))
     lhs_buffer_depth: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.lhs_buffer_depth", "int32"))
     rhs_buffer_depth: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.rhs_buffer_depth", "int32"))
+    smem_operand_ring_first: bool | constexpr | None = field(
+        default=None, metadata=_loop_attr("tt.smem_operand_ring_first", "bool_opt"))
 
 
 @dataclass(eq=False)

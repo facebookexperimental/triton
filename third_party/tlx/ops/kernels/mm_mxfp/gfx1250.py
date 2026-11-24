@@ -21,6 +21,11 @@ split workgroup barrier per K step, and each next tile's first K step
 overlaps the current tile's C stores. Larger K uses the dynamic four-stage
 loop. Two or three K tiles use a matching shorter ring.
 
+With ``NUM_GROUPS > 0`` the persistent kernel computes a grouped GEMM for
+``tlx.ops.kernels.grouped_gemm_mxfp``: a device tile map gives each 256-row
+tile its group and rows, B and its scales hold every group's weights, and C
+stores stop at each group's last row.
+
 Scales use the cuBLAS 128x4 blocked byte order (``block128``): blocked inputs
 are consumed in place and natural ``[rows, K // 32]`` scales are packed on
 every call.
@@ -698,6 +703,52 @@ def _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_M: tl.constexpr, BM: tl.const
 
 
 @triton.jit
+def _mxgemm_rows_after(rows, skip: tl.constexpr):
+    # Valid rows of a grouped tile below its first `skip` rows.
+    if rows is None:
+        result = None
+    else:
+        result = rows - skip
+    return result
+
+
+@triton.jit
+def _mxgemm_grouped_tile(tile, num_m, num_n, tile_meta0, tile_meta1, a_rows, N: tl.constexpr, GROUP_M: tl.constexpr,
+                         BM: tl.constexpr, BN: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr = "linear"):
+    # Grouped GEMM: M tile i is entry i of the tile map (group start row and
+    # rows, group and BM tile within it). Returns the tile's first A/C row,
+    # its B row (group * N + column), its row in the tile-ordered A scales,
+    # its valid rows (may exceed BM), and its C column. Tiles past the map
+    # (next-tile lookups at the end) use in-bounds zero coordinates.
+    valid = tile < num_m * num_n
+    m, n = _mxgemm_tile_offsets(tl.where(valid, tile, 0), num_m, num_n, GROUP_M, BM, BN, CLUSTER_LAYOUT=CLUSTER_LAYOUT)
+    entry = tl.where(valid, m // BM, 0)
+    meta0 = tl.load(tile_meta0 + entry, mask=valid, other=0)
+    meta1 = tl.load(tile_meta1 + entry, mask=valid, other=0)
+    local = (meta1 >> 32).to(tl.int32)
+    group = (meta1 & 0xFFFFFFFF).to(tl.int32)
+    rows = (meta0 >> 32).to(tl.int32) - local * BM
+    # Cluster padding tiles (no rows) read A past its last row: the TDM fills
+    # zeros without memory traffic, and their WMMAs on zeros draw less power.
+    off_m = tl.where(rows > 0, (meta0 & 0xFFFFFFFF).to(tl.int32) + local * BM, a_rows)
+    n = tl.where(valid, n, 0)
+    return off_m, group * N + n, entry * (BM // 128), rows, n
+
+
+@triton.jit
+def _mxgemm_tile(tile, num_m, num_n, tile_meta0, tile_meta1, a_rows, N: tl.constexpr, GROUP_M: tl.constexpr,
+                 BM: tl.constexpr, BN: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr, GROUPED: tl.constexpr):
+    # (A/C row, B row, A-scale row, valid rows, C column) of a tile. Without
+    # groups, the A-scale row and valid rows are None (whole tiles of A).
+    if GROUPED:
+        return _mxgemm_grouped_tile(tile, num_m, num_n, tile_meta0, tile_meta1, a_rows, N, GROUP_M, BM, BN,
+                                    CLUSTER_LAYOUT)
+    else:
+        off_m, off_n = _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_M, BM, BN, CLUSTER_LAYOUT=CLUSTER_LAYOUT)
+        return off_m, off_n, None, None, off_n
+
+
+@triton.jit
 def _mxgemm_cluster_arrive(k, CLUSTER_SIZE: tl.constexpr, INTERVAL: tl.constexpr):
     if CLUSTER_SIZE > 1 and INTERVAL > 0:
         if k % INTERVAL == 0:
@@ -713,22 +764,30 @@ def _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_b
                             FUSION: tl.constexpr, CLUSTER_SIZE: tl.constexpr, CLUSTER_MULTICAST: tl.constexpr,
                             GROUP_SIZE_M: tl.constexpr, XCD_REMAP_MODE: tl.constexpr,
                             CLUSTER_BARRIER_INTERVAL: tl.constexpr, CLUSTER_LAYOUT: tl.constexpr = "linear",
-                            SPLIT_CLUSTER_BARRIER: tl.constexpr = False, CLUSTER_STEP: tl.constexpr = None):
+                            SPLIT_CLUSTER_BARRIER: tl.constexpr = False, CLUSTER_STEP: tl.constexpr = None,
+                            a_srow=None):
     # CLUSTER_STEP: None tests k % CLUSTER_BARRIER_INTERVAL at run time;
     # False when the caller proves k can never be a rendezvous step.
+    # a_srow: grouped tiles read A scales at this row of the tile-ordered
+    # scales, and their A rows may extend past the last row of A.
     # Keep the K coordinate independent of the LDS ring slot. Adding (k - slot)
     # here and slot in the loader hides the invariant per-wave global base
     # from LLVM and repeats descriptor address work inside the K loop.
     if mxgemm_desc_group_rows(a_desc) != 0:
+        tl.static_assert(a_srow is None, "grouped tiles need unpartitioned A and B")
         ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m // mxgemm_desc_group_rows(a_desc), 0, 0],
                                           clamp_bounds=False)
         bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n // mxgemm_desc_group_rows(b_desc), 0, 0],
                                           clamp_bounds=False)
     else:
-        ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, 0], clamp_bounds=False)
+        # Grouped tiles: rows past A's end read zeros; the C store drops them.
+        ad = tlx.update_tensor_descriptor(a_desc, add_offsets=[off_m, 0], clamp_bounds=a_srow is not None)
         bd = tlx.update_tensor_descriptor(b_desc, add_offsets=[off_n, 0], clamp_bounds=False)
     SROWS: tl.constexpr = 256 if mxgemm_scale_cols(bs_desc) == BK // 32 * 256 else 128
-    asd = tlx.update_tensor_descriptor(as_desc, add_offsets=[off_m // SROWS, 0], clamp_bounds=False)
+    if a_srow is None:
+        asd = tlx.update_tensor_descriptor(as_desc, add_offsets=[off_m // SROWS, 0], clamp_bounds=False)
+    else:
+        asd = tlx.update_tensor_descriptor(as_desc, add_offsets=[a_srow, 0], clamp_bounds=False)
     bsd = tlx.update_tensor_descriptor(bs_desc, add_offsets=[off_n // SROWS, 0], clamp_bounds=False)
     if CLUSTER_SIZE > 1:
         if CLUSTER_BARRIER_INTERVAL == 1:
@@ -844,7 +903,7 @@ def _mxgemm_defer_bottom_k_step(c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc
                                 CLUSTER_SIZE: tl.constexpr, CLUSTER_MULTICAST: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
                                 XCD_REMAP_MODE: tl.constexpr, CLUSTER_BARRIER_INTERVAL: tl.constexpr,
                                 CLUSTER_LAYOUT: tl.constexpr, SPLIT_CLUSTER_BARRIER: tl.constexpr,
-                                MERGED_BARRIER: tl.constexpr = False, CLUSTER_STEP: tl.constexpr = None):
+                                MERGED_BARRIER: tl.constexpr = False, CLUSTER_STEP: tl.constexpr = None, a_srow=None):
     # One steady BK128 step of the deferred-bottom schedule. This matches the
     # DEFER_BOTTOM body of the persistent kernel's dynamic-slot K loop.
     # Pin every dot to the output store's native WMMA layout. A peeled step
@@ -918,7 +977,7 @@ def _mxgemm_defer_bottom_k_step(c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc
         _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n,
                                 i + BUFFERS, slot, BK, DA, DB, BUFFERS, FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST,
                                 GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
-                                SPLIT_CLUSTER_BARRIER=True, CLUSTER_STEP=CLUSTER_STEP)
+                                SPLIT_CLUSTER_BARRIER=True, CLUSTER_STEP=CLUSTER_STEP, a_srow=a_srow)
         last_b00, last_sb00 = b00, sb00
         a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BM, BK, DA, BUFFERS, RELAXED=True, BOTH=W256)
         c10 = _mxgemm_native_dot(a10, sa10, "e4m3", last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
@@ -950,7 +1009,7 @@ def _mxgemm_defer_bottom_k_step(c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc
         _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n,
                                 i + BUFFERS, slot, BK, DA, DB, BUFFERS, FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST,
                                 GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
-                                SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, CLUSTER_STEP=CLUSTER_STEP)
+                                SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, CLUSTER_STEP=CLUSTER_STEP, a_srow=a_srow)
         tlx.async_amd_descriptor_wait((BUFFERS - 1) * LOADS)
         a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BM, BK, DA, BUFFERS)
         if not PREFETCH_B_AFTER_C10:
@@ -1032,8 +1091,10 @@ def _mxgemm_c_slot_wait(PENDINGS: tl.constexpr):
 
 
 @triton.jit
-def _mxgemm_c_tdm_store(desc, view, offsets):
-    tlx.async_amd_descriptor_store(desc, view, offsets, clamp_bounds=False)
+def _mxgemm_c_tdm_store(desc, view, offsets, CLAMP: tl.constexpr = False):
+    # CLAMP counts the descriptor's bounds from its base, so a grouped tile's
+    # row limit holds for every chunk; otherwise they start at each chunk.
+    tlx.async_amd_descriptor_store(desc, view, offsets, clamp_bounds=CLAMP)
 
 
 @triton.jit
@@ -1041,10 +1102,12 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
                              INSTR_M: tl.constexpr, c_buf=None, C_ROWS: tl.constexpr = 64, C_SLOTS: tl.constexpr = 2,
                              QUADRANT: tl.constexpr = 0, C_COLS: tl.constexpr = 128,
                              INITIAL_C_SLOTS_FREE: tl.constexpr = False, EXTRA_PENDING: tl.constexpr = 0,
-                             PART_BEGIN: tl.constexpr = 0, PART_END: tl.constexpr = None):
+                             PART_BEGIN: tl.constexpr = 0, PART_END: tl.constexpr = None, c_rows=None):
     # EXTRA_PENDING: TDM operations issued after older chunks that each slot
     # reuse may leave pending. PART_BEGIN/PART_END store a subrange of the
     # 64-row chunks. Both apply to dedicated 64-row slots only.
+    # c_rows: store only the first c_rows rows (grouped tiles end at their
+    # group's last row).
     # Pin values so output extraction stays in registers. Direct stores also
     # pin their offsets below to avoid an implicit LDS transpose.
     WARP_BASES: tl.constexpr = ((0, 2), (2, 0))
@@ -1055,14 +1118,18 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
     base = c_ptr + off_m.to(tl.int64) * stride_cm + off_n
     if c_buf is not None:
         tl.static_assert(BM == 128 and BN == 128 and INSTR_M == 16)
-        desc = tl.make_tensor_descriptor(base, [BM, BN], [stride_cm, tl.constexpr(1)], [C_ROWS, C_COLS])
+        if c_rows is None:
+            desc = tl.make_tensor_descriptor(base, [BM, BN], [stride_cm, tl.constexpr(1)], [C_ROWS, C_COLS])
+        else:
+            desc = tl.make_tensor_descriptor(base, [tl.minimum(tl.maximum(c_rows, 0), BM), BN],
+                                             [stride_cm, tl.constexpr(1)], [C_ROWS, C_COLS])
         tl.static_assert(C_ROWS == 64 or (EXTRA_PENDING == 0 and PART_BEGIN == 0 and PART_END is None))
         if C_ROWS == 128 and C_COLS == 128:
             if not INITIAL_C_SLOTS_FREE or QUADRANT >= C_SLOTS:
                 _mxgemm_c_slot_wait(C_SLOTS - 1)
             view = _mxgemm_c_slot(c_buf, QUADRANT % C_SLOTS, C_ROWS, C_COLS)
             tlx.local_store(view, acc)
-            _mxgemm_c_tdm_store(desc, view, [0, 0])
+            _mxgemm_c_tdm_store(desc, view, [0, 0], c_rows is not None)
         elif C_ROWS == 128:
             tl.static_assert(C_COLS == 64 and C_SLOTS == 2)
             # A packed-FP4 B stage holds half a quadrant. Split the
@@ -1073,7 +1140,7 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
                     _mxgemm_c_slot_wait(1)
                 view = _mxgemm_c_slot(c_buf, part, C_ROWS, C_COLS)
                 tlx.local_store(view, left if part == 0 else right)
-                _mxgemm_c_tdm_store(desc, view, [0, part * C_COLS])
+                _mxgemm_c_tdm_store(desc, view, [0, part * C_COLS], c_rows is not None)
         else:
             tl.static_assert(C_ROWS == 64 and C_SLOTS >= 2 and (C_COLS == 64 or C_COLS == 128))
             PARTS: tl.constexpr = 2 * (BN // C_COLS)
@@ -1099,8 +1166,9 @@ def _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, BM: tl.constex
                     row, col = (part // 2) * 64, (part % 2) * 64
                 view = c_buf[(QUADRANT * PARTS + part) % C_SLOTS]
                 tlx.local_store(view, chunk)
-                _mxgemm_c_tdm_store(desc, view, [row, col])
+                _mxgemm_c_tdm_store(desc, view, [row, col], c_rows is not None)
     else:
+        tl.static_assert(c_rows is None, "grouped tiles store C through LDS staging")
         offsets = tl.arange(0, BM)[:, None] * stride_cm + tl.arange(0, BN)[None, :]
         offsets = tlx.require_amd_wmma_layout(offsets, warp_bases=WARP_BASES, reg_bases=((0, 1), (1, 0)),
                                               instr_shape=(INSTR_M, 16, 128))
@@ -1114,7 +1182,7 @@ def _mxgemm_overlap_store(c_ptr, acc, off_m, off_n, stride_cm, c_buf, C_SLOTS: t
                           DA: tl.constexpr, DB: tl.constexpr, BUFFERS: tl.constexpr, FUSION: tl.constexpr,
                           CLUSTER_SIZE: tl.constexpr, CLUSTER_MULTICAST: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
                           XCD_REMAP_MODE: tl.constexpr, CLUSTER_BARRIER_INTERVAL: tl.constexpr,
-                          CLUSTER_LAYOUT: tl.constexpr):
+                          CLUSTER_LAYOUT: tl.constexpr, c_rows=None, next_srow=None):
     # Store one 128x128 C quadrant through dedicated 64-row slots. Before
     # chunk REFILL_CHUNK (after the last chunk when it equals 4 * PARTS),
     # refill the next tile's stage-0 slot with stage BUFFERS. TDM operations
@@ -1124,17 +1192,19 @@ def _mxgemm_overlap_store(c_ptr, acc, off_m, off_n, stride_cm, c_buf, C_SLOTS: t
     SPLIT: tl.constexpr = REFILL_CHUNK - QUADRANT * PARTS
     if SPLIT > 0:
         _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, 128, 128, 16, c_buf, 64, C_SLOTS, QUADRANT,
-                                 C_COLS, True, PART_END=SPLIT if SPLIT < PARTS else PARTS)
+                                 C_COLS, True, PART_END=SPLIT if SPLIT < PARTS else PARTS, c_rows=c_rows)
     if (SPLIT >= 0 and SPLIT < PARTS) or (QUADRANT == 3 and SPLIT == PARTS):
         _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m, next_n, BUFFERS,
                                 n_phase, BK, DA, DB, BUFFERS, FUSION, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
-                                XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT)
+                                XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT,
+                                a_srow=next_srow)
     if SPLIT < PARTS:
         _mxgemm_persistent_store(c_ptr, acc, off_m, off_n, stride_cm, 128, 128, 16, c_buf, 64, C_SLOTS, QUADRANT,
-                                 C_COLS, True, EXTRA_PENDING=LOADS, PART_BEGIN=SPLIT if SPLIT > 0 else 0)
+                                 C_COLS, True, EXTRA_PENDING=LOADS, PART_BEGIN=SPLIT if SPLIT > 0 else 0, c_rows=c_rows)
 
 
-@triton.jit
+# Grouped launches pass the row counts at run time; one compile serves every count.
+@triton.jit(do_not_specialize=["a_rows", "a_scale_rows"])
 def mxgemm_tdm_persistent_kernel(
     a_ptr,
     b_ptr,
@@ -1172,8 +1242,22 @@ def mxgemm_tdm_persistent_kernel(
     MERGED_HANDOFF_BARRIER: tl.constexpr = False,
     STATIC_CLUSTER_STEPS: tl.constexpr = False,
     SCALE_WAVE256: tl.constexpr = False,
+    NUM_GROUPS: tl.constexpr = 0,
+    tile_meta0=None,
+    tile_meta1=None,
+    tile_count=None,
+    a_rows=None,
+    a_scale_rows=None,
 ):
-    """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring."""
+    """Full-tile, transposed-B sliceMNK GEMM with a persistent TDM ring.
+
+    With NUM_GROUPS > 0 it computes a grouped GEMM: C[rows of g] = A[rows of g] @ B[g].T, with B
+    [NUM_GROUPS * N, K] and its scales [NUM_GROUPS * N // 128, K // 32 * 128]. A has a_rows rows (pass M=0);
+    tile_meta0/tile_meta1/tile_count is a BLOCK_M tile map from prepare_grouped_gemm_mxfp, and A's
+    a_scale_rows scale rows are tile-ordered: map entry i's BLOCK_M rows in block128 order at row
+    i * BLOCK_M // 128. With clusters, each group's map entries start at a multiple of the cluster rows
+    and fill whole cluster rows, and the map has whole GROUP_SIZE_M groups of entries.
+    """
     tl.static_assert(BLOCK_M % 128 == 0 and BLOCK_N % 128 == 0 and (BLOCK_K == 128 or BLOCK_K == 256))
     tl.static_assert(NUM_BUFFERS >= 2 and NUM_PROGRAMS > 0 and GROUP_SIZE_M > 0)
     tl.static_assert(CLUSTER_SIZE == 1 or CLUSTER_SIZE == 2 or CLUSTER_SIZE == 4 or CLUSTER_SIZE == 8
@@ -1196,6 +1280,19 @@ def mxgemm_tdm_persistent_kernel(
         tl.static_assert(GROUP_SIZE_M == 4 or GROUP_SIZE_M == 8)
         tl.static_assert(NUM_PROGRAMS % 16 == 0)
     DB: tl.constexpr = 2 if DTYPE_B == "e2m1" else 1
+    GROUPED_TILES: tl.constexpr = NUM_GROUPS > 0
+    if GROUPED_TILES:
+        # Grouped tiles start at any row, end at their group's last row, and
+        # read B from their group. The A8W8 BK128 and A8W4 BK256 schedules and
+        # the tile-ordered A scales support this. Grid clusters share B only
+        # within one group's cluster rows (see the docstring).
+        tl.static_assert(M == 0, "grouped GEMM takes its rows from a_rows and the tile map; pass M=0")
+        tl.static_assert((BLOCK_K == 128 and DB == 1) or (BLOCK_K == 256 and DB == 2),
+                         "grouped GEMM requires A8W8 256x256x128 or A8W4 256x256x256 tiles")
+        tl.static_assert((CROSS_TILE_PREFETCH or DB == 2) and (CLUSTER_SIZE == 1 or CLUSTER_LAYOUT != "linear")
+                         and (DB == 2 or not (EARLY_C_STORES or SPLIT_CLUSTER_BARRIER)) and not SCALE_WAVE256,
+                         "grouped GEMM supports the block128-scale schedules with grid clusters")
+    B_ROWS: tl.constexpr = NUM_GROUPS * N if GROUPED_TILES else N
     OUTPUT_REUSE: tl.constexpr = BLOCK_K == 256
     # C buffers that alias input ring slots keep the input slot pitch: a
     # narrower C type allocates C_ROW_SCALE times the rows per slot.
@@ -1242,9 +1339,14 @@ def mxgemm_tdm_persistent_kernel(
     if SCALE_WAVE256:
         tl.static_assert(BLOCK_K == 128 and DB == 1, "wave256 scales require A8W8 256x256x128 tiles")
     SC_ROWS: tl.constexpr = 256 if SCALE_WAVE256 else 128
-    as_desc = tl.make_tensor_descriptor(a_scale, [M // SC_ROWS, K // 32 * SC_ROWS],
-                                        [stride_as, tl.constexpr(1)], [BLOCK_M // SC_ROWS, BLOCK_K // 32 * SC_ROWS])
-    bs_desc = tl.make_tensor_descriptor(b_scale, [N // SC_ROWS, K // 32 * SC_ROWS],
+    if GROUPED_TILES:
+        # One BLOCK_M block per tile-map entry.
+        as_desc = tl.make_tensor_descriptor(a_scale, [a_scale_rows, K // 32 * SC_ROWS],
+                                            [stride_as, tl.constexpr(1)], [BLOCK_M // SC_ROWS, BLOCK_K // 32 * SC_ROWS])
+    else:
+        as_desc = tl.make_tensor_descriptor(a_scale, [M // SC_ROWS, K // 32 * SC_ROWS],
+                                            [stride_as, tl.constexpr(1)], [BLOCK_M // SC_ROWS, BLOCK_K // 32 * SC_ROWS])
+    bs_desc = tl.make_tensor_descriptor(b_scale, [B_ROWS // SC_ROWS, K // 32 * SC_ROWS],
                                         [stride_bs, tl.constexpr(1)], [BLOCK_N // SC_ROWS, BLOCK_K // 32 * SC_ROWS])
     # With the static-slot loop, alternate 64-row pieces of A and B between
     # two 64 KiB LDS partitions so the waves of a quadrant, which read
@@ -1253,7 +1355,8 @@ def mxgemm_tdm_persistent_kernel(
     # R = 2 * PIECE_ROWS let each issuing wave fill one partition with one TDM
     # instruction. Smaller pieces give each wave pair only one partition half,
     # which unbalances the waves.
-    PIECE_ROWS: tl.constexpr = 64 if STATIC_SLOT_UNROLL else 0
+    # Grouped tiles start at any row, so they keep A and B unpartitioned.
+    PIECE_ROWS: tl.constexpr = 64 if STATIC_SLOT_UNROLL and not GROUPED_TILES else 0
     if PIECE_ROWS:
         tl.static_assert(DB == 1 and BLOCK_K == 128, "partitioned A/B requires A8W8 BK128")
         R: tl.constexpr = 2 * PIECE_ROWS
@@ -1268,8 +1371,10 @@ def mxgemm_tdm_persistent_kernel(
         b_buf = tlx.local_alloc((BLOCK_N // R, R, BLOCK_K // DB), tlx.dtype_of(b_ptr), NUM_BUFFERS,
                                 layout=_partitioned_operand_shared_layout([BLOCK_N // R, R, BLOCK_K // DB]))
     else:
-        a_desc = tl.make_tensor_descriptor(a_ptr, [M, K], [stride_am, tl.constexpr(1)], [BLOCK_M, BLOCK_K])
-        b_desc = tl.make_tensor_descriptor(b_ptr, [N, K // DB], [stride_bn, tl.constexpr(1)], [BLOCK_N, BLOCK_K // DB])
+        a_desc = tl.make_tensor_descriptor(a_ptr, [a_rows if GROUPED_TILES else M, K],
+                                           [stride_am, tl.constexpr(1)], [BLOCK_M, BLOCK_K])
+        b_desc = tl.make_tensor_descriptor(b_ptr, [B_ROWS, K // DB], [stride_bn, tl.constexpr(1)],
+                                           [BLOCK_N, BLOCK_K // DB])
         a_buf = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NUM_BUFFERS,
                                 layout=operand_shared_layout([BLOCK_M, BLOCK_K]))
         b_buf = tlx.local_alloc((BLOCK_N, BLOCK_K // DB), tlx.dtype_of(b_ptr), NUM_BUFFERS,
@@ -1302,19 +1407,28 @@ def mxgemm_tdm_persistent_kernel(
             c_buf = tlx.local_alloc((128, BLOCK_N // 2), tlx.dtype_of(c_ptr), NUM_BUFFERS, reuse=a_buf)
     else:
         c_buf = tlx.local_alloc((C_ROWS, C_COLS), tlx.dtype_of(c_ptr), C_SLOTS)
-    num_m, num_n = M // BLOCK_M, N // BLOCK_N
+    if GROUPED_TILES:
+        num_m = tl.load(tile_count).to(tl.int32)
+    else:
+        num_m = M // BLOCK_M
+    num_n = N // BLOCK_N
     total_tiles = num_m * num_n
     k_iters = K // BLOCK_K
     tl.assume(k_iters >= NUM_BUFFERS)
     tile = _mxgemm_cluster_program_id(tl.program_id(0), NUM_PROGRAMS, XCD_REMAP_MODE, NUM_XCDS, XCD_CHUNK,
                                       CLUSTER_LAYOUT)
+    if GROUPED_TILES:
+        # Grouped launches use one program per CU for any row count; those
+        # without a tile must not load or compute.
+        if tile >= total_tiles:
+            return
     phase = 0
-    off_m, off_n = _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_SIZE_M, BLOCK_M, BLOCK_N,
-                                        CLUSTER_LAYOUT=CLUSTER_LAYOUT)
+    off_m, off_n, a_srow, c_rows, c_n = _mxgemm_tile(tile, num_m, num_n, tile_meta0, tile_meta1, a_rows, N,
+                                                     GROUP_SIZE_M, BLOCK_M, BLOCK_N, CLUSTER_LAYOUT, GROUPED_TILES)
     for p in tl.static_range(NUM_BUFFERS):
         _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n, p, p,
                                 BLOCK_K, 1, DB, NUM_BUFFERS, "partial", CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
-                                XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT)
+                                XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT, a_srow=a_srow)
 
     if OVERLAP_PEEL:
         # Every later tile's zero-accumulator first K step runs inside the
@@ -1329,20 +1443,20 @@ def mxgemm_tdm_persistent_kernel(
         a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, 0, 0, 0, BLOCK_M, BLOCK_K, 1, NUM_BUFFERS, BOTH=W256_PEEL_STEP)
         b00, sb00 = _mxgemm_persistent_b(b_buf, bs_buf, 0, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS, BOTH=W256_PEEL_STEP)
         c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
+            tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32), tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32),
             tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32), tl.zeros(
-                (BLOCK_M // 2, BLOCK_N // 2), tl.float32), tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32),
-            tl.zeros((BLOCK_M // 2, BLOCK_N // 2),
-                     tl.float32), a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf,
-            off_m, off_n, 0, 0, 1, BLOCK_M, BLOCK_N, BLOCK_K, 1, DB, DTYPE_B, NUM_BUFFERS, "partial", LOADS,
-            GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE,
-            CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF_BARRIER)
+                (BLOCK_M // 2, BLOCK_N // 2), tl.float32), a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc,
+            a_buf, b_buf, as_buf, bs_buf, off_m, off_n, 0, 0, 1, BLOCK_M, BLOCK_N, BLOCK_K, 1, DB, DTYPE_B, NUM_BUFFERS,
+            "partial", LOADS, GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M,
+            XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER,
+            MERGED_BARRIER=MERGED_HANDOFF_BARRIER, a_srow=a_srow)
         if W256_PEEL_STEP:
             sa00, _ = _mxgemm_scale_quads(sa00, False)
             sb00, _ = _mxgemm_scale_quads(sb00, True)
 
     while tile < total_tiles:
-        off_m, off_n = _mxgemm_tile_offsets(tile, num_m, num_n, GROUP_SIZE_M, BLOCK_M, BLOCK_N,
-                                            CLUSTER_LAYOUT=CLUSTER_LAYOUT)
+        off_m, off_n, a_srow, c_rows, c_n = _mxgemm_tile(tile, num_m, num_n, tile_meta0, tile_meta1, a_rows, N,
+                                                         GROUP_SIZE_M, BLOCK_M, BLOCK_N, CLUSTER_LAYOUT, GROUPED_TILES)
         if not OVERLAP_PEEL:
             c00 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
             c01 = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
@@ -1389,7 +1503,7 @@ def mxgemm_tdm_persistent_kernel(
                     bs_buf, off_m, off_n, j, slots[j], slots[(j + 1) % NUM_BUFFERS], BLOCK_M, BLOCK_N, BLOCK_K, 1, DB,
                     DTYPE_B, NUM_BUFFERS, "partial", LOADS, GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE,
                     CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT,
-                    SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF_BARRIER)
+                    SPLIT_CLUSTER_BARRIER, MERGED_BARRIER=MERGED_HANDOFF_BARRIER, a_srow=a_srow)
             REST: tl.constexpr = STEADY_STEPS - PEEL
             UNROLLED_END: tl.constexpr = PEEL + REST - REST % NUM_BUFFERS
             for i in tl.range(PEEL, UNROLLED_END, NUM_BUFFERS):
@@ -1405,7 +1519,8 @@ def mxgemm_tdm_persistent_kernel(
                         GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER,
                         MERGED_BARRIER=MERGED_HANDOFF_BARRIER, CLUSTER_STEP=_mxgemm_can_be_cluster_step(
                             PEEL + j +
-                            NUM_BUFFERS, NUM_BUFFERS, CLUSTER_BARRIER_INTERVAL) if STATIC_CLUSTER_STEPS else None)
+                            NUM_BUFFERS, NUM_BUFFERS, CLUSTER_BARRIER_INTERVAL) if STATIC_CLUSTER_STEPS else None,
+                        a_srow=a_srow)
             for j in tl.static_range(REST % NUM_BUFFERS):
                 c00, c01, c10, c11, a00, sa00, b00, sb00 = _mxgemm_defer_bottom_k_step(
                     c00, c01, c10, c11, a00, sa00, b00, sb00, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf,
@@ -1413,7 +1528,7 @@ def mxgemm_tdm_persistent_kernel(
                     slots[(UNROLLED_END + j + 1) % NUM_BUFFERS], BLOCK_M, BLOCK_N, BLOCK_K, 1, DB, DTYPE_B, NUM_BUFFERS,
                     "partial", LOADS, GROUPED_PREFETCH, PREFETCH_B_AFTER_C10, CLUSTER_SIZE, CLUSTER_MULTICAST,
                     GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER,
-                    MERGED_BARRIER=MERGED_HANDOFF_BARRIER)
+                    MERGED_BARRIER=MERGED_HANDOFF_BARRIER, a_srow=a_srow)
             slot = slots[STEADY_STEPS % NUM_BUFFERS]
             if W256_STEP:
                 sa00, _ = _mxgemm_scale_quads(sa00, False)
@@ -1453,7 +1568,8 @@ def mxgemm_tdm_persistent_kernel(
             _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, off_m, off_n,
                                     i + NUM_BUFFERS, slot, BLOCK_K, 1, DB, NUM_BUFFERS, "partial", CLUSTER_SIZE,
                                     CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
-                                    CLUSTER_LAYOUT=CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER)
+                                    CLUSTER_LAYOUT=CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER,
+                                    a_srow=a_srow)
             if not A8W4_SPLIT_HANDOFF:
                 tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
             a00, sa00 = _mxgemm_persistent_a(a_buf, as_buf, next_slot, 0, 0, BLOCK_M, BLOCK_K, 1, NUM_BUFFERS,
@@ -1488,8 +1604,11 @@ def mxgemm_tdm_persistent_kernel(
         tlx.amd_sched_barrier()
         next_tile = tile + NUM_PROGRAMS
         has_next = next_tile < total_tiles
-        next_m, next_n = _mxgemm_tile_offsets(tl.minimum(next_tile, total_tiles - 1), num_m, num_n, GROUP_SIZE_M,
-                                              BLOCK_M, BLOCK_N, CLUSTER_LAYOUT=CLUSTER_LAYOUT)
+        # The next tile's rows and C column are unused here.
+        next_m, next_n, next_srow, next_rows, next_c_n = _mxgemm_tile(tl.minimum(next_tile,
+                                                                                 total_tiles - 1), num_m, num_n,
+                                                                      tile_meta0, tile_meta1, a_rows, N, GROUP_SIZE_M,
+                                                                      BLOCK_M, BLOCK_N, CLUSTER_LAYOUT, GROUPED_TILES)
         tlx.amd_sched_barrier()
         # Keep one tail body for three-stage A8W8. Repeating the entire
         # compute/refill body for each ring slot increases the code footprint
@@ -1508,7 +1627,7 @@ def mxgemm_tdm_persistent_kernel(
                     _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m,
                                             next_n, j, slot, BLOCK_K, 1, DB, NUM_BUFFERS, "partial", CLUSTER_SIZE,
                                             CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
-                                            CLUSTER_LAYOUT=CLUSTER_LAYOUT)
+                                            CLUSTER_LAYOUT=CLUSTER_LAYOUT, a_srow=next_srow)
                 if j < NUM_BUFFERS - 1:
                     if CROSS_TILE_PREFETCH and has_next:
                         tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
@@ -1537,7 +1656,7 @@ def mxgemm_tdm_persistent_kernel(
                     _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m,
                                             next_n, NUM_BUFFERS - 1, slot, BLOCK_K, 1, DB, NUM_BUFFERS, "partial",
                                             CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE,
-                                            CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT)
+                                            CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT, a_srow=next_srow)
         else:
             for j in tl.static_range(NUM_BUFFERS):
                 slot = (phase + steady_end + j) % NUM_BUFFERS
@@ -1560,7 +1679,7 @@ def mxgemm_tdm_persistent_kernel(
                     _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m,
                                             next_n, j, slot, BLOCK_K, 1, DB, NUM_BUFFERS, "partial", CLUSTER_SIZE,
                                             CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
-                                            CLUSTER_LAYOUT=CLUSTER_LAYOUT)
+                                            CLUSTER_LAYOUT=CLUSTER_LAYOUT, a_srow=next_srow)
                 if j < NUM_BUFFERS - 1:
                     if CROSS_TILE_PREFETCH and not OUTPUT_REUSE and has_next:
                         tlx.async_amd_descriptor_wait((NUM_BUFFERS - 1) * LOADS)
@@ -1631,12 +1750,13 @@ def mxgemm_tdm_persistent_kernel(
                 nb00, nsb00 = _mxgemm_persistent_b(b_buf, bs_buf, n_phase, 0, 0, BLOCK_N, BLOCK_K, DB, NUM_BUFFERS)
                 for q in tl.static_range(4):
                     acc = c00 if q == 0 else (c01 if q == 1 else (c10 if q == 2 else c11))
-                    _mxgemm_overlap_store(c_ptr, acc, off_m + (q // 2) * (BLOCK_M // 2),
-                                          off_n + (q % 2) * (BLOCK_N // 2), stride_cm, output_buf, C_SLOTS, q, C_COLS,
-                                          REFILL_CHUNK, LOADS, a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf,
-                                          bs_buf, next_m, next_n, n_phase, BLOCK_K, 1, DB, NUM_BUFFERS, "partial",
-                                          CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE,
-                                          CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT)
+                    _mxgemm_overlap_store(c_ptr, acc, off_m + (q // 2) * (BLOCK_M // 2), c_n + (q % 2) * (BLOCK_N // 2),
+                                          stride_cm, output_buf, C_SLOTS, q, C_COLS, REFILL_CHUNK, LOADS, a_desc,
+                                          b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m, next_n,
+                                          n_phase, BLOCK_K, 1, DB, NUM_BUFFERS, "partial", CLUSTER_SIZE,
+                                          CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE, CLUSTER_BARRIER_INTERVAL,
+                                          CLUSTER_LAYOUT, c_rows=_mxgemm_rows_after(c_rows, (q // 2) * (BLOCK_M // 2)),
+                                          next_srow=next_srow)
                     tlx.amd_sched_barrier()
                     zero = tl.zeros((BLOCK_M // 2, BLOCK_N // 2), tl.float32)
                     if q == 0:
@@ -1656,18 +1776,20 @@ def mxgemm_tdm_persistent_kernel(
                 # and the refill are younger.
                 tlx.async_amd_descriptor_wait((NUM_BUFFERS - 2) * LOADS + C_CHUNKS + LOADS)
             else:
-                _mxgemm_persistent_store(c_ptr, c00, off_m, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2, 16,
-                                         output_buf, C_ROWS, C_SLOTS, 0, C_COLS, INITIAL_C_SLOTS_FREE)
-                _mxgemm_persistent_store(c_ptr, c01, off_m, off_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2, BLOCK_N // 2,
-                                         16, output_buf, C_ROWS, C_SLOTS, 1, C_COLS, INITIAL_C_SLOTS_FREE)
-                _mxgemm_persistent_store(c_ptr, c10, off_m + BLOCK_M // 2, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2,
-                                         16, output_buf, C_ROWS, C_SLOTS, 2, C_COLS, INITIAL_C_SLOTS_FREE)
-                _mxgemm_persistent_store(c_ptr, c11, off_m + BLOCK_M // 2, off_n + BLOCK_N // 2, stride_cm,
-                                         BLOCK_M // 2, BLOCK_N // 2, 16, output_buf, C_ROWS, C_SLOTS, 3, C_COLS,
-                                         INITIAL_C_SLOTS_FREE)
+                _mxgemm_persistent_store(c_ptr, c00, off_m, c_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2, 16, output_buf,
+                                         C_ROWS, C_SLOTS, 0, C_COLS, INITIAL_C_SLOTS_FREE, c_rows=c_rows)
+                _mxgemm_persistent_store(c_ptr, c01, off_m, c_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2, BLOCK_N // 2,
+                                         16, output_buf, C_ROWS, C_SLOTS, 1, C_COLS, INITIAL_C_SLOTS_FREE,
+                                         c_rows=c_rows)
+                _mxgemm_persistent_store(c_ptr, c10, off_m + BLOCK_M // 2, c_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2,
+                                         16, output_buf, C_ROWS, C_SLOTS, 2, C_COLS, INITIAL_C_SLOTS_FREE,
+                                         c_rows=_mxgemm_rows_after(c_rows, BLOCK_M // 2))
+                _mxgemm_persistent_store(c_ptr, c11, off_m + BLOCK_M // 2, c_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2,
+                                         BLOCK_N // 2, 16, output_buf, C_ROWS, C_SLOTS, 3, C_COLS, INITIAL_C_SLOTS_FREE,
+                                         c_rows=_mxgemm_rows_after(c_rows, BLOCK_M // 2))
         else:
-            _mxgemm_persistent_store(c_ptr, c00, off_m, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2, 16, output_buf,
-                                     C_ROWS, C_SLOTS, 0, C_COLS, INITIAL_C_SLOTS_FREE)
+            _mxgemm_persistent_store(c_ptr, c00, off_m, c_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2, 16, output_buf,
+                                     C_ROWS, C_SLOTS, 0, C_COLS, INITIAL_C_SLOTS_FREE, c_rows=c_rows)
         if EARLY_C_STORES:
             # Keep each completed quadrant's transfer ahead of the next
             # quadrant's independent matrix work. Do not drain A/B here.
@@ -1678,8 +1800,8 @@ def mxgemm_tdm_persistent_kernel(
                 c01 = dot(a00, sa00, "e4m3", b01, sb01, DTYPE_B, c01, tiles_per_warp=[2, 2])
             tlx.amd_sched_barrier()
         if not OVERLAP_PEEL:
-            _mxgemm_persistent_store(c_ptr, c01, off_m, off_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2, BLOCK_N // 2, 16,
-                                     output_buf, C_ROWS, C_SLOTS, 1, C_COLS, INITIAL_C_SLOTS_FREE)
+            _mxgemm_persistent_store(c_ptr, c01, off_m, c_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2, BLOCK_N // 2, 16,
+                                     output_buf, C_ROWS, C_SLOTS, 1, C_COLS, INITIAL_C_SLOTS_FREE, c_rows=c_rows)
         if EARLY_C_STORES:
             tlx.amd_sched_barrier()
             if BLOCK_K == 256:
@@ -1688,8 +1810,9 @@ def mxgemm_tdm_persistent_kernel(
                 c10 = dot(a10, sa10, "e4m3", last_b00, last_sb00, DTYPE_B, c10, tiles_per_warp=[2, 2])
             tlx.amd_sched_barrier()
         if not OVERLAP_PEEL:
-            _mxgemm_persistent_store(c_ptr, c10, off_m + BLOCK_M // 2, off_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2, 16,
-                                     output_buf, C_ROWS, C_SLOTS, 2, C_COLS, INITIAL_C_SLOTS_FREE)
+            _mxgemm_persistent_store(c_ptr, c10, off_m + BLOCK_M // 2, c_n, stride_cm, BLOCK_M // 2, BLOCK_N // 2, 16,
+                                     output_buf, C_ROWS, C_SLOTS, 2, C_COLS, INITIAL_C_SLOTS_FREE,
+                                     c_rows=_mxgemm_rows_after(c_rows, BLOCK_M // 2))
             if EARLY_C_STORES:
                 tlx.amd_sched_barrier()
                 if BLOCK_K == 256:
@@ -1697,8 +1820,9 @@ def mxgemm_tdm_persistent_kernel(
                 else:
                     c11 = dot(a10, sa10, "e4m3", b01, sb01, DTYPE_B, c11, tiles_per_warp=[2, 2])
                 tlx.amd_sched_barrier()
-            _mxgemm_persistent_store(c_ptr, c11, off_m + BLOCK_M // 2, off_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2,
-                                     BLOCK_N // 2, 16, output_buf, C_ROWS, C_SLOTS, 3, C_COLS, INITIAL_C_SLOTS_FREE)
+            _mxgemm_persistent_store(c_ptr, c11, off_m + BLOCK_M // 2, c_n + BLOCK_N // 2, stride_cm, BLOCK_M // 2,
+                                     BLOCK_N // 2, 16, output_buf, C_ROWS, C_SLOTS, 3, C_COLS, INITIAL_C_SLOTS_FREE,
+                                     c_rows=_mxgemm_rows_after(c_rows, BLOCK_M // 2))
         if OUTPUT_REUSE and not CROSS_TILE_PREFETCH:
             tlx.async_amd_descriptor_wait(0)
         tlx.amd_sched_barrier()
@@ -1721,7 +1845,7 @@ def mxgemm_tdm_persistent_kernel(
                 _mxgemm_persistent_load(a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, next_m, next_n,
                                         p, (phase + p) % NUM_BUFFERS, BLOCK_K, 1, DB, NUM_BUFFERS, "partial",
                                         CLUSTER_SIZE, CLUSTER_MULTICAST, GROUP_SIZE_M, XCD_REMAP_MODE,
-                                        CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT)
+                                        CLUSTER_BARRIER_INTERVAL, CLUSTER_LAYOUT=CLUSTER_LAYOUT, a_srow=next_srow)
     tlx.async_amd_descriptor_wait(0)
     if CLUSTER_SIZE > 1 and CLUSTER_BARRIER_INTERVAL > 0:
         tlx.async_amd_descriptor_wait(0)
@@ -3055,6 +3179,7 @@ def mxgemm_tdm_pipelined(
         SCALE_LAYOUT: str = "block128",
         OUT_DTYPE: str = "fp32",
         TILES_PER_WARP: tuple[int, int] = (2, 2),
+        ENABLE_WMMA_QUEUING: bool = False,
 ) -> torch.Tensor:
     """Run MXFP GEMM, optionally with the persistent sliceMNK kernel.
 
@@ -3096,6 +3221,9 @@ def mxgemm_tdm_pipelined(
     independent matrix work and waits just before the refill.
     ``EARLY_C_STORES`` interleaves the final quadrant dots with C stores.
     Both require three buffers with FP8 BK128 or FP4 BK256 tiles.
+    ``ENABLE_WMMA_QUEUING`` passes the HIP option ``enable_wmma_queuing`` to
+    the persistent kernel, which sets SCHED_MODE[2] at kernel entry so WMMAs
+    may queue behind independent scalar and memory work.
 
     ``STATIC_SLOT_UNROLL`` unrolls the three- or four-buffer FP8 BK128
     steady loop by its ring depth, so every step reads a loop-invariant LDS
@@ -3140,10 +3268,10 @@ def mxgemm_tdm_pipelined(
         raise ValueError("SCALE_LAYOUT must be 'block128' or 'wave256'")
     if not PERSISTENT and (CLUSTER_LAYOUT != "linear" or SPLIT_CLUSTER_BARRIER or EARLY_C_STORES or STATIC_SLOT_UNROLL
                            or OUTPUT_C_SLOTS is not None or OVERLAP_PEEL or MERGED_HANDOFF_BARRIER
-                           or STATIC_CLUSTER_STEPS or SCALE_LAYOUT != "block128"):
+                           or STATIC_CLUSTER_STEPS or SCALE_LAYOUT != "block128" or ENABLE_WMMA_QUEUING):
         raise ValueError("CLUSTER_LAYOUT, SPLIT_CLUSTER_BARRIER, EARLY_C_STORES, STATIC_SLOT_UNROLL, "
-                         "OUTPUT_C_SLOTS, OVERLAP_PEEL, MERGED_HANDOFF_BARRIER, STATIC_CLUSTER_STEPS, and "
-                         "SCALE_LAYOUT require PERSISTENT")
+                         "OUTPUT_C_SLOTS, OVERLAP_PEEL, MERGED_HANDOFF_BARRIER, STATIC_CLUSTER_STEPS, "
+                         "SCALE_LAYOUT, and ENABLE_WMMA_QUEUING require PERSISTENT")
     if PERSISTENT:
         if TILES_PER_WARP != (2, 2):
             raise ValueError("persistent MXFP requires TILES_PER_WARP=(2, 2)")
@@ -3206,7 +3334,8 @@ def mxgemm_tdm_pipelined(
                 SPLIT_CLUSTER_BARRIER=SPLIT_CLUSTER_BARRIER, EARLY_C_STORES=EARLY_C_STORES,
                 STATIC_SLOT_UNROLL=STATIC_SLOT_UNROLL, OUTPUT_C_SLOTS=OUTPUT_C_SLOTS, OVERLAP_PEEL=OVERLAP_PEEL,
                 MERGED_HANDOFF_BARRIER=MERGED_HANDOFF_BARRIER, STATIC_CLUSTER_STEPS=STATIC_CLUSTER_STEPS,
-                SCALE_WAVE256=SCALE_LAYOUT == "wave256", num_warps=4, waves_per_eu=1, ctas_per_cga=(CLUSTER_SIZE, 1, 1))
+                SCALE_WAVE256=SCALE_LAYOUT == "wave256", num_warps=4, waves_per_eu=1, ctas_per_cga=(CLUSTER_SIZE, 1, 1),
+                enable_wmma_queuing=ENABLE_WMMA_QUEUING)
         return mxgemm_tdm_pipelined_kernel[grid](
             a,
             b,
@@ -3289,7 +3418,8 @@ _DEFAULT_CONFIG = {
 _PERSISTENT_CONFIG_KEYS = ("PERSISTENT", "NUM_PROGRAMS", "CROSS_TILE_PREFETCH", "XCD_REMAP", "NUM_XCDS", "XCD_CHUNK",
                            "CLUSTER_SIZE", "CLUSTER_MULTICAST", "CLUSTER_BARRIER_INTERVAL", "CLUSTER_LAYOUT",
                            "SPLIT_CLUSTER_BARRIER", "EARLY_C_STORES", "STATIC_SLOT_UNROLL", "OUTPUT_C_SLOTS",
-                           "OVERLAP_PEEL", "MERGED_HANDOFF_BARRIER", "STATIC_CLUSTER_STEPS", "SCALE_LAYOUT")
+                           "OVERLAP_PEEL", "MERGED_HANDOFF_BARRIER", "STATIC_CLUSTER_STEPS", "SCALE_LAYOUT",
+                           "ENABLE_WMMA_QUEUING")
 
 
 def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: torch.Tensor, config=None) -> torch.Tensor:
@@ -3301,8 +3431,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
     ``PERSISTENT`` selects the persistent kernel; it and the other persistent
     options (``NUM_PROGRAMS``, ``CROSS_TILE_PREFETCH``, ``XCD_REMAP``, cluster
     options, ``STATIC_SLOT_UNROLL``, ``OUTPUT_C_SLOTS``, ``OVERLAP_PEEL``,
-    ``MERGED_HANDOFF_BARRIER``, ``STATIC_CLUSTER_STEPS``, ``SCALE_LAYOUT``) are
-    described in :func:`mxgemm_tdm_pipelined`. ``OUT_DTYPE`` selects FP32 or
+    ``MERGED_HANDOFF_BARRIER``, ``STATIC_CLUSTER_STEPS``, ``SCALE_LAYOUT``,
+    ``ENABLE_WMMA_QUEUING``) are described in :func:`mxgemm_tdm_pipelined`. ``OUT_DTYPE`` selects FP32 or
     FP16 output.
     """
     cfg = dict(_DEFAULT_CONFIG)
@@ -3324,7 +3454,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, a_scale: torch.Tensor, b_scale: tor
             raise ValueError("persistent MXFP requires four warps, one wave per SIMD, and SCALE_BLOCK=32")
     persistent_only = ("CLUSTER_LAYOUT", "SPLIT_CLUSTER_BARRIER", "EARLY_C_STORES", "STATIC_SLOT_UNROLL",
                        "OUTPUT_C_SLOTS", "OVERLAP_PEEL", "MERGED_HANDOFF_BARRIER", "STATIC_CLUSTER_STEPS",
-                       "SCALE_LAYOUT")
+                       "SCALE_LAYOUT", "ENABLE_WMMA_QUEUING")
     if (cfg.get("PERSISTENT", False) or cfg.get("OUT_DTYPE", "fp32") != "fp32"
             or any(key in cfg for key in persistent_only)):
         return mxgemm_tdm_pipelined(a, b, a_scale, b_scale, BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"],

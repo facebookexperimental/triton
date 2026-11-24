@@ -270,6 +270,8 @@ class CUDAOptions:
     )
     enable_fp_fusion: bool = True
     sched4reg: bool = False
+    # Run LLVM SLP instead of the target-aware NVPTX vectorizer for this kernel.
+    use_slp_vectorizer: bool = False
     # Disable LLVM loop strength reduction for this kernel's code generation.
     disable_lsr: bool = False
     enable_reflect_ftz: bool = True  # ftz in libdevice
@@ -1473,7 +1475,7 @@ class CUDABackend(BaseBackend):
             llvm.link_extern_libs(llvm_mod, paths)
 
         # Opt in to LLVM SLP instead of the target-aware NVPTX vectorizer.
-        use_slp_vectorizer = knobs.nvidia.use_slp_vectorizer
+        use_slp_vectorizer = knobs.nvidia.use_slp_vectorizer or options.use_slp_vectorizer
         llvm.optimize_module(
             llvm_mod,
             llvm.OPTIMIZE_O3,

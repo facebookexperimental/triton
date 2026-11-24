@@ -738,3 +738,25 @@ def test_fp8_compiles_for_multiple_architectures_cuda():
     src = ASTSource(fn=fp8_convert, signature={"src": "*fp32", "dst": "*fp8e5"}, constexprs={})
     triton.compile(src, target=GPUTarget("cuda", 90, 32))
     triton.compile(src, target=GPUTarget("cuda", 80, 32))
+
+
+def test_compile_only_use_slp_vectorizer_option(monkeypatch) -> None:
+    # The per-kernel option must select the same LLVM vectorizer as the
+    # TRITON_USE_SLP_VECTORIZER knob, and differ from the default
+    # target-aware NVPTX vectorizer on a kernel where the two disagree.
+
+    @triton.jit
+    def bf16_mad_kernel(x_ptr, y_ptr):
+        offsets = tl.arange(0, 512)
+        x = tl.load(x_ptr + offsets).to(tl.float32)
+        tl.store(y_ptr + offsets, (x * 1.5 + x).to(tl.bfloat16))
+
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    src = ASTSource(fn=bf16_mad_kernel, signature={"x_ptr": "*bf16", "y_ptr": "*bf16"})
+    target = GPUTarget("cuda", 90, 32)
+    default = triton.compile(src, target=target).asm["llir"]
+    option = triton.compile(src, target=target, options={"use_slp_vectorizer": True}).asm["llir"]
+    monkeypatch.setenv("TRITON_USE_SLP_VECTORIZER", "1")
+    knob = triton.compile(src, target=target).asm["llir"]
+    assert option == knob
+    assert option != default
