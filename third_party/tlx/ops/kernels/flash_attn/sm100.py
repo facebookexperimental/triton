@@ -9,6 +9,8 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2
 from triton.language.extra.subtile_ops import _split_n_2D
+from triton.language.target_info import current_target
+from triton.runtime.jit import constexpr_function
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -339,6 +341,22 @@ def _ex2_emu_f32x2(x):
     )
 
 
+@constexpr_function
+def _fwd_has_tmem_ld_red():
+    # tcgen05.ld.red: sm_103 and newer, except sm_12x (TargetFeatures::supportLdRed). With it, FuseTMemLoadReduce
+    # folds a row max that directly reduces a TMEM load into the load itself.
+    target = current_target()
+    return target is not None and target.backend == "cuda" and target.arch >= 103 and target.arch // 10 != 12
+
+
+@constexpr_function
+def _fwd_p_arrives_per_warp():
+    # The softmax's per-warp P arrives (#5120) were tuned on sm_100. On sm_103 the leader arrive measures 0.2%
+    # faster (B4 H48 S8192 D128 bf16, config 25).
+    target = current_target()
+    return target is not None and target.backend == "cuda" and target.arch == 100
+
+
 @triton.jit
 def _softmax_inner_loop(
     qk_fulls,
@@ -388,10 +406,15 @@ def _softmax_inner_loop(
         # -> FA4 handles one row per thread (32 threads per warp * 4)
         # -> use fmax_reduce(one row of qk, m_i[0])
         # -> m_i|m_ij = row_max[0] * scale
-        # Reduce each row in 2 independent chains, like FA4's fmax_reduce (which uses 4): a single chain over the row is
-        # 64 dependent 3-input maxes, and the exp2s, alpha and the first P chunk all wait for it. 2 chains measured
-        # faster than 4 or 8 here. Max is exact, so the result does not change.
-        row_max = tl.max(tl.max(tl.reshape(qk, [qk.shape[0], BLOCK_N // 2, 2]), 1), 1)
+        # Without tcgen05.ld.red, reduce each row in 2 independent chains, like FA4's fmax_reduce (which uses 4): a
+        # single chain over the row is 64 dependent 3-input maxes, and the exp2s, alpha and the first P chunk all wait
+        # for it. 2 chains measured faster than 4 or 8 on sm_100. With tcgen05.ld.red (sm_103), a plain row max is
+        # folded into the TMEM load of S (see _fwd_has_tmem_ld_red) and costs no instructions; the reshape for 2 chains
+        # would block that, and measured 4.9% slower there. Max is exact, so the result does not change.
+        if _fwd_has_tmem_ld_red():
+            row_max = tl.max(qk, 1)
+        else:
+            row_max = tl.max(tl.max(tl.reshape(qk, [qk.shape[0], BLOCK_N // 2, 2]), 1), 1)
         if RESCALE_OPT:
             m_ij = tl.maximum(m_i, row_max)
         else:
@@ -461,14 +484,16 @@ def _softmax_inner_loop(
                     p_bar = tlx.local_view(acc_fulls, qk_buf)
                 else:
                     p_bar = tlx.local_view(p_fulls, qk_buf * 3 + k - 1)
-                # As in FA4, each warp publishes its rows of P as soon as it has stored them, without waiting for the
-                # other softmax warps. A warp barrier already has every thread arrive.
+                # On sm_100, as in FA4, each warp publishes its rows of P as soon as it has stored them, without
+                # waiting for the other softmax warps (see _fwd_p_arrives_per_warp). A warp barrier already has every
+                # thread arrive.
                 if USE_2CTA:
                     # The TMEM store completes before this readiness token; it does
                     # not publish ordinary SMEM to the peer CTA.
-                    tlx.barrier_arrive(p_bar, 1, remote_cta_rank=0, per_warp=not USE_WARP_BARRIER)
+                    tlx.barrier_arrive(p_bar, 1, remote_cta_rank=0, per_warp=(not USE_WARP_BARRIER)
+                                       and _fwd_p_arrives_per_warp())
                 else:
-                    tlx.barrier_arrive(p_bar, per_warp=not USE_WARP_BARRIER)
+                    tlx.barrier_arrive(p_bar, per_warp=(not USE_WARP_BARRIER) and _fwd_p_arrives_per_warp())
             p_slices = p_slices + (p_i, )
 
         # As in FA4, acquire the alpha buffer for the next iteration here, off the S -> P path,
@@ -1338,9 +1363,11 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
         p_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS * 3, num_warps=4)
         acc_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=8)
     else:
-        # The softmax's 4 warps arrive on P per warp; acc_fulls also takes the correction's leader arrive.
-        p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * 3, arrive_count=4 * NUM_CTAS)
-        acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=(4 + 1) * NUM_CTAS)
+        # The softmax arrives on P once per warp (4 per CTA) on sm_100 and once per CTA elsewhere; see
+        # _fwd_p_arrives_per_warp. acc_fulls also takes the correction's leader arrive.
+        P_ARRIVES: tl.constexpr = 4 if _fwd_p_arrives_per_warp() else 1
+        p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * 3, arrive_count=P_ARRIVES * NUM_CTAS)
+        acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=(P_ARRIVES + 1) * NUM_CTAS)
     # Intra-CTA barriers: always use fast warp barriers (no cross-CTA traffic).
     # The softmax statistics go through SMEM, as in FA4 (sScale). Each iteration the softmax stores alpha and arrives
     # on named barrier ALPHA_BAR_ID + cid, and the correction arrives on alpha_empties after reading it. At the end
