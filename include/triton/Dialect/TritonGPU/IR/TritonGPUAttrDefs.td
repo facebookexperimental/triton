@@ -177,7 +177,7 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
                        "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
                        "CGAEncodingAttr":$CGALayout, "Type":$eltTy),
                    [{
-      unsigned bitwidth = eltTy.getIntOrFloatBitWidth();
+      unsigned bitwidth = ::mlir::getIntOrFloatOrPtrBitWidth(eltTy);
       return get(context, dotOpEnc, shape, order, CGALayout, bitwidth);
     }]>,
 
@@ -186,7 +186,7 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
                        "CGAEncodingAttr":$CGALayout, "Type":$eltTy,
                        "bool":$needTrans),
                    [{
-      unsigned bitwidth = eltTy.getIntOrFloatBitWidth();
+      unsigned bitwidth = ::mlir::getIntOrFloatOrPtrBitWidth(eltTy);
       return get(context, dotOpEnc, shape, order, CGALayout, bitwidth, needTrans);
     }]>,
   ];
@@ -474,7 +474,7 @@ def NVMMASharedEncodingAttr
                        "CGAEncodingAttr":$CGALayout, "Type":$eltTy,
                        "NVMmaPadding":$padding),
                    [{
-      unsigned eleBitWidth = eltTy.getIntOrFloatBitWidth();
+      unsigned eleBitWidth = ::mlir::getIntOrFloatOrPtrBitWidth(eltTy);
       unsigned swizzlingByteWidth = getDefaultSwizzlingByteWidth(
           shape, order, CGALayout, eleBitWidth, padding == NVMmaPadding::Fp4);
       bool transposed = order.size() > 1 && order[0] == 0;
@@ -940,7 +940,6 @@ available on AMD Instinct GPUs of CDNA architectures.
 
 It is characterized by the following parameters:
 - `version`: The GPU architecture:
-  - 1: gfx908: CDNA1
   - 2: gfx90a: CDNA2
   - 3: gfx942: CDNA3
   - 4: gfx950: CDNA4
@@ -1111,7 +1110,7 @@ It is characterized by the following parameters:
 - `version` indicates the GPU architecture:
   - 1: RDNA3; e.g., gfx1100, gfx1101
   - 2: RDNA4; e.g., gfx1200, gfx1201
-  - 3: gfx1250
+  - 3: CDNA5; e.g., gfx1250
 - `ctaLayout` indicates the warp layout in the block. This is a generalization
    compared to previous warp layout representation using warpsPerCTA and tilesPerWarp
    parameters.
@@ -1241,7 +1240,7 @@ warpsPerCTA  = [2, 2], tilesPerWarp = [2, 2]
 but with a different ordering of repetitions.
 
 The motivation for this broader formulation comes from the need to describe swizzled warp
-layouts, which help avoid LDS partition conflicts on architectures such as gfx1250.
+layouts, which help avoid LDS partition conflicts on architectures such as CDNA5.
 A valid example of such swizzled configuration is:
 
 ctaLayout = {reg = [[2, 0]], warps = [[2, 1], [1, 0]]}
@@ -1463,7 +1462,7 @@ vecIdx (index of the element in the quad; this is always along the k-dim)
       if (!parentAttr || (!parentAttr.isAmpere() && !parentAttr.isHopper()))
         return $_get(context, opIdx, parent, 0);
       // For MMAV2 and V3
-      unsigned bitwidth = eltTy.getIntOrFloatBitWidth();
+      unsigned bitwidth = ::mlir::getIntOrFloatOrPtrBitWidth(eltTy);
       unsigned kWidth = std::max(32 / bitwidth, 1u);
       return $_get(context, opIdx, parent, kWidth);
     }]>];
