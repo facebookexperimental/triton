@@ -19414,6 +19414,21 @@ def _iw_grouped_tile_coords(
 
 
 @triton.jit
+def _iw_gpu_barrier(slot):
+    """Workgroup barrier after which this workgroup's earlier global stores are complete.
+
+    ``tl.debug_barrier()`` orders memory only within the workgroup, and the ``.wt``
+    partial-tile stores lower to buffer stores that do not wait for completion. So
+    each wave first waits for its own global stores (``s_waitcnt vmcnt(0)``) and
+    then meets the other waves at the barrier: a store issued after this call, such
+    as wave 0's ready flag, cannot become visible to another workgroup before the
+    partial tile. The asm takes a scalar so that it keeps no extra VGPR live.
+    """
+    tl.inline_asm_elementwise("s_waitcnt vmcnt(0)", "=s,0,~{memory}", [slot], dtype=slot.dtype, is_pure=False, pack=1)
+    tl.debug_barrier()
+
+
+@triton.jit
 def _iw_wait_for_streamk_partial(locks_ptr, slot, ready_value):
     """Wait until one producer has published its partial tile."""
     while tl.load(locks_ptr + slot, cache_modifier=".cv", volatile=True) != ready_value:
@@ -19658,7 +19673,9 @@ def _iw_streamk_kernel(
         tl.store(partial_bl_ptr, acc_bl, cache_modifier=".wt")
         tl.store(partial_tr_ptr, acc_tr, cache_modifier=".wt")
         tl.store(partial_br_ptr, acc_br, cache_modifier=".wt")
-        tl.debug_barrier()
+        # Every wave must finish its partial stores before the barrier, or the
+        # ready flag that wave 0 stores after it can become visible first.
+        _iw_gpu_barrier(stream_pid)
         tl.store(locks_ptr + stream_pid, ready_value, cache_modifier=".wt")
 
         # Cooperatively reduce the tile, assigning consecutive output quadrants to
@@ -19784,7 +19801,9 @@ def _iw_streamk_kernel(
                 tl.store(partial_bl_ptr, acc_bl, cache_modifier=".wt")
                 tl.store(partial_tr_ptr, acc_tr, cache_modifier=".wt")
                 tl.store(partial_br_ptr, acc_br, cache_modifier=".wt")
-                tl.debug_barrier()
+                # Every wave must finish its partial stores before the barrier, or the
+                # ready flag that wave 0 stores after it can become visible first.
+                _iw_gpu_barrier(logical_pid)
                 tl.store(locks_ptr + logical_pid, ready_value, cache_modifier=".wt")
             else:
                 # The program owning the first work unit of a tile collects the
