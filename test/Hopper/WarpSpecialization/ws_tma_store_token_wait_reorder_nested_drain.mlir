@@ -1,8 +1,9 @@
 // RUN: triton-opt %s --nvgpu-test-tma-store-token-wait-reorder | FileCheck %s
 // RUN: triton-opt %s --nvgpu-test-tma-store-token-wait-reorder --tritongpu-pipeline=num-stages=2 | FileCheck %s --check-prefix=PIPE
 
-// Reduced from MRS e59: each staging writer gets a queue-wide wait in its own
-// stage, and the queue is drained once after the outer loop.
+// Reduced from a rank-3 epilogue streamed in j chunks: each staging writer gets
+// a queue-wide wait in its own stage, and the queue is drained once after the
+// outer loop.
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
