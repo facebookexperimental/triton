@@ -1260,7 +1260,8 @@ def matmul(a, b, bias, a_ragged_metadata: RaggedTensorMetadata | None = None,
         batch_size = 1
 
     opt_flags = make_opt_flags(out_dtype, a.dtype, b.dtype, precision_config, batch_size, M, N, b.shape[-2],
-                               a_ragged_metadata, False, False, False, False, False, block_k=block_k)
+                               a_ragged_metadata, False, False, False, False, False, block_k=block_k,
+                               intermediate_out_dtype=out_dtype)
 
     opt_flags.block_m = block_m
     opt_flags.block_n = block_n
@@ -1274,7 +1275,7 @@ def matmul(a, b, bias, a_ragged_metadata: RaggedTensorMetadata | None = None,
 
     # init output
     allocation = init_allocation(a, b, precision_config, fused_activation, gather_indx, scatter_indx, batch_size, 1,
-                                 opt_flags)
+                                 opt_flags, intermediate_out_dtype=out_dtype)
     memory = apply_allocation(allocation, None)
     # (1, batch_dim, M, N // fused_activation.specs)
     out_matmul = memory["scratchpad"].get("matmul", memory["output"])
@@ -1284,7 +1285,7 @@ def matmul(a, b, bias, a_ragged_metadata: RaggedTensorMetadata | None = None,
     if ragged_dimension == "M":
         grid_m = a_ragged_metadata.n_blocks(a_ragged_metadata.n_slices, M, opt_flags.block_m)
     grid_n = triton.cdiv(N, opt_flags.block_n)
-    grid = grid_m * grid_n
+    grid = batch_size * grid_m * grid_n
 
     n_slices = max(1, b.shape[0]) if a_ragged_metadata is None else a_ragged_metadata.n_slices
     n_valid_slices = b.shape[0] if ragged_dimension == "M" else n_slices
@@ -1337,6 +1338,28 @@ def matmul(a, b, bias, a_ragged_metadata: RaggedTensorMetadata | None = None,
         out_final = out_final.squeeze(0)
 
     return out_final, k
+
+
+@pytest.mark.parametrize("broadcast", [False, True])
+def test_matmul_dense_batch_all_experts(broadcast):
+    """Launch every expert batch, including when all experts share one input."""
+    experts, m, n, k = 4, 17, 256, 256
+    x = (torch.randn((1 if broadcast else experts, m, k), device="cuda") * .5).to(torch.float8_e4m3fn)
+    w = (torch.randn((experts, n, k), device="cuda") * .5).to(torch.float8_e4m3fn)
+    actual, _ = matmul(x[0] if broadcast else x, w.transpose(1, 2), None,
+                       precision_config=PrecisionConfig(out_dtype=torch.float32), block_m=32, block_n=128, block_k=256,
+                       num_buffers=1, num_warps=4)
+    expected = []
+    scale = torch.ones((), device="cuda")
+    for expert in range(experts):
+        a = torch.zeros((32, k), device="cuda", dtype=x.dtype)
+        a[:m] = x[0 if broadcast else expert]
+        expected.append(
+            torch._scaled_mm(a, w[expert].t(), scale_a=scale, scale_b=scale, out_dtype=torch.float32,
+                             use_fast_accum=False)[:m])
+    expected = torch.stack(expected)
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
 
 
 @pytest.mark.parametrize("m, n, k", [(300, 400, 416), (128, 128, 512)])
