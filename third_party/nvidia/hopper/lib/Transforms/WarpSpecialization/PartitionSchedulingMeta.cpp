@@ -1894,6 +1894,9 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   // Exception: no-MMA reduction kernels (mmas.empty()) have no Phase 5 to fall
   // back on, so the load-user walk is exactly how the reduction (default)
   // partition gets its tensor compute — run it even when default==reduction.
+  SmallVector<
+      std::tuple<Operation *, LoopLikeOpInterface, SetVector<Operation *>>>
+      nonMMALoads;
   if (defaultPartition &&
       (!layout.reductionPartition || defaultPartition != reductionPartition ||
        mmas.empty())) {
@@ -1902,6 +1905,22 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
       if (!parentLoop) {
         // Skip pre-loop ops that don't have a parent loop
         continue;
+      }
+      // A load that never reaches an MMA (e.g. a per-tile epilogue input) may
+      // be combined with the accumulator. Defer its users until after Phase 5
+      // so they can stay with the accumulator instead of forcing an
+      // accumulator handoff into the default partition. tmem_copy has no
+      // results, so a scale load feeding a scaled MMA through it counts as
+      // reaching the MMA.
+      if (!mmas.empty()) {
+        SetVector<Operation *> slice;
+        getForwardSlice(loadOrAlloc, &slice);
+        if (llvm::none_of(slice, [](Operation *op) {
+              return isMMAOp(op) || isa<ttng::TMEMCopyOp>(op);
+            })) {
+          nonMMALoads.push_back({loadOrAlloc, parentLoop, std::move(slice)});
+          continue;
+        }
       }
       scheduleUsers(parentLoop, schedule, defaultPartition, loadOrAlloc);
     }
@@ -2190,6 +2209,43 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
         if (it != dpIdToPartition.end())
           tryScheduleOp(it->second, &op);
       }
+    }
+  }
+
+  // Users of the deferred non-MMA loads join the partition that combines the
+  // input with an accumulator: a scheduled op in the load's slice that also
+  // uses an accumulator read (tmem_load, or a WarpGroupDot result). If no such
+  // op exists, or the input meets accumulators in more than one partition
+  // (data partitioning), the users keep the default route.
+  if (!nonMMALoads.empty()) {
+    SetVector<Operation *> accSlice;
+    mainLoop->walk([&](Operation *op) {
+      if (isa<ttng::TMEMLoadOp, ttng::WarpGroupDotOp>(op)) {
+        // getForwardSlice drops its root, so add the read after it.
+        getForwardSlice(op, &accSlice);
+        accSlice.insert(op);
+      }
+    });
+    for (auto &[load, loop, slice] : nonMMALoads) {
+      SetVector<Partition *> dests;
+      for (Operation *op : slice) {
+        if (!accSlice.contains(op))
+          continue;
+        auto ids = safeGetPartitionIds(op);
+        if (ids.size() != 1)
+          continue;
+        Partition *p = schedule.getPartition(ids.front());
+        if (p && p != layout.loadPartition)
+          dests.insert(p);
+      }
+      if (dests.size() != 1) {
+        scheduleUsers(loop, schedule, defaultPartition, load);
+        continue;
+      }
+      for (Operation *op : slice)
+        if (!op->hasTrait<OpTrait::IsTerminator>() && loop->isAncestor(op) &&
+            op->getParentRegion() == load->getParentRegion())
+          tryScheduleOp(dests.front(), op);
     }
   }
 
