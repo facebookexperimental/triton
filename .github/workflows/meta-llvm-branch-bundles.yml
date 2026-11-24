@@ -3,18 +3,41 @@ name: Meta LLVM branch bundles
 on:
   schedule:
     - cron: '17 * * * *'
+  push:
+    branches: [main]
+    paths:
+      - cmake/meta-llvm-build-info.json
+      - cmake/meta-amd-llvm-build-info.json
   workflow_dispatch:
     inputs:
       kind:
-        description: LLVM branches to check
+        description: LLVM kinds to check
         type: choice
         default: all
         options: [all, core, amd]
+      request_source:
+        description: Track source branches or read explicit build manifests
+        type: choice
+        default: branches
+        options: [branches, manifests]
+      publish:
+        description: Publish validated immutable bundle assets
+        type: boolean
+        default: true
+      create_candidate_pr:
+        description: Create a real draft candidate PR with the native workflow token
+        type: boolean
+        default: false
+      candidate_base_sha:
+        description: Full Triton main commit used as the candidate baseline
+        type: string
+        default: ''
   pull_request:
     paths:
-      - .github/scripts/select_meta_llvm_branches.py
+      - .github/scripts/select_meta_llvm_builds.py
       - .github/scripts/meta_llvm_assets.py
       - .github/scripts/meta_llvm_ready.py
+      - .github/scripts/meta_llvm_bump.py
       - .github/scripts/test_meta_llvm_bump.py
       - .github/workflows/meta-llvm-branch-bundles.yml
       - .github/workflows/meta-llvm-build.yml
@@ -46,6 +69,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.2
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v7
         with:
@@ -55,8 +79,15 @@ jobs:
         id: requests
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
           KIND: ${{ inputs.kind || 'all' }}
-        run: python3 .github/scripts/select_meta_llvm_branches.py
+          REQUEST_SOURCE: ${{ inputs.request_source || 'branches' }}
+          CREATE_CANDIDATE_PR: ${{ inputs.create_candidate_pr }}
+          CANDIDATE_BASE_SHA: ${{ inputs.candidate_base_sha }}
+          PUBLISH: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+        run: python3 .github/scripts/select_meta_llvm_builds.py
 
   build:
     name: Build ${{ matrix.request.kind }} branch bundle
@@ -74,12 +105,12 @@ jobs:
       kind: ${{ matrix.request.kind }}
       llvm_sha: ${{ matrix.request.llvm_sha }}
       build_number: ${{ matrix.request.build_number }}
-      publish: true
+      publish: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
 
   ready-issues:
     name: File validated bundle readiness issues
     needs: [select, build]
-    if: ${{ !cancelled() && needs.select.result == 'success' }}
+    if: ${{ !cancelled() && needs.select.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -99,14 +130,30 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATES: ${{ needs.select.outputs.candidates }}
-        shell: python
-        run: |
-          import json, os, subprocess
-          failures = []
-          for candidate in json.loads(os.environ['CANDIDATES']):
-              env = dict(os.environ, CANDIDATE=json.dumps(candidate))
-              result = subprocess.run(['python3', '.github/scripts/meta_llvm_ready.py', 'issue'], env=env)
-              if result.returncode:
-                  failures.append(candidate['kind'])
-          if failures:
-              raise RuntimeError('Readiness notification failed for ' + ', '.join(failures))
+        run: python3 .github/scripts/meta_llvm_ready.py issue
+
+  candidate-prs:
+    name: Create draft LLVM candidate PRs
+    needs: [select, build]
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.create_candidate_pr && inputs.publish && needs.select.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: meta-llvm-candidate-prs
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - run: python3 -m pip install PyYAML
+      - name: Create real candidate branches and draft PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATES: ${{ needs.select.outputs.candidates }}
+          CANDIDATE_BASE_SHA: ${{ inputs.candidate_base_sha }}
+        run: python3 .github/scripts/meta_llvm_ready.py pr

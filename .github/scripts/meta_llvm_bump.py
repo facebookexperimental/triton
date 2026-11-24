@@ -223,6 +223,65 @@ def verdict(latest):
     return "ready" if all(run["conclusion"] == "success" for run in latest.values()) else "failed"
 
 
+def candidate_text(kind, old, source, validation_run, base_sha):
+    """Draft-candidate text in the updater's Summary/Test Plan format."""
+    sha, build = source['llvm_sha'], source['build_number']
+    path = 'cmake/meta-amd-llvm-info.json' if kind == 'amd' else 'cmake/meta-llvm-info.json'
+    title = f'[Meta LLVM] {kind} bundle candidate: {old["llvm_hash"][:8]} to {sha[:8]}'
+    problem = (f'Triton main selects the {kind} SDK at {old["llvm_hash"][:12]}. The tracked LLVM branch has a newer '
+               'validated bundle, but its compatibility with the Triton consumer has not yet been checked.')
+    solution = 'This proposes the published SDK as a draft candidate for consumer correctness and performance validation.'
+    command = f'$ python3 -m json.tool {path} >/dev/null'
+    test = 'JSON parse and published source/archive digest checks passed.'
+    marker = f'<!-- llvm-candidate beta/{kind}/{sha}/{build}/{base_sha} -->'
+    body = '\n'.join([
+        '# Summary:',
+        '',
+        '**Problem**',
+        '',
+        problem,
+        '',
+        '**Solution**',
+        '',
+        solution,
+        '',
+        '# Test Plan:',
+        '',
+        'The source, tree and platform digests match the published SDK validation record.',
+        '',
+        '```',
+        command,
+        test,
+        '```',
+        '',
+        *_job_block([('Published SDK validation', validation_run), ('Triton correctness', 'Not run'),
+                     ('A/B performance', 'Not run'), ('Source-base equivalence', 'Not verified')]),
+        '',
+        'Source comparison: ' + compare_url('facebookexperimental/llvm-project', old['llvm_hash'], sha) + '.',
+        '',
+        marker,
+    ])
+    commit = '\n'.join([
+        title,
+        '',
+        'Summary:',
+        '**Problem**',
+        '',
+        textwrap.fill(problem, 72),
+        '',
+        '**Solution**',
+        '',
+        textwrap.fill(solution, 72),
+        '',
+        'Test Plan:',
+        '',
+        command,
+        test,
+        'Consumer correctness, performance and source-base checks have not run.',
+    ])
+    return title, commit, body
+
+
 def _date(release):
     return release["published_at"][:10]
 

@@ -336,7 +336,7 @@ def _ready_fixture(kind):
 @pytest.mark.parametrize('kind', ['core', 'amd'])
 def test_ready_issue_requires_complete_validated_publication(monkeypatch, kind):
     import meta_llvm_ready as ready
-    from select_meta_llvm_branches import branch_requests
+    from select_meta_llvm_builds import branch_requests
 
     assets, receipt, candidate = _ready_fixture(kind)
     writes = []
@@ -387,6 +387,9 @@ def test_readiness_issue_reuses_candidate_after_timeout_or_close(monkeypatch, cl
     def api(path, **kwargs):
         if '/branches/' in path: return {'commit': _branch_tip()}
         if '/labels/' in path: return {'name': ready.LABEL}
+        if kwargs.get('method') == 'POST':
+            result = create(['gh', 'api', path], input=json.dumps(kwargs['payload']))
+            raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
         return pages
 
     def create(command, **kwargs):
