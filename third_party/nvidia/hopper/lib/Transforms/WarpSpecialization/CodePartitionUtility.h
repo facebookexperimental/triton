@@ -333,12 +333,13 @@ struct TMAConsumerWaitInfo {
   Operation *insertionPoint;
 };
 
-Operation *optimizeTMALoads(
-    OpBuilderWithAsyncTaskIds &builder,
-    SmallVector<triton::nvws::DescriptorLoadOp> &tmaLoads, Value barrierAlloc,
-    Value bufferIdx, Value bufferIdxExtract, Value phase,
-    Operation *headProducer, ArrayRef<TMAConsumerWaitInfo> consumerWaits,
-    DictionaryAttr consumerWaitConstraints = {});
+Operation *
+optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
+                 SmallVector<triton::nvws::DescriptorLoadOp> &tmaLoads,
+                 Value barrierAlloc, Value bufferIdx, Value bufferIdxExtract,
+                 Value phase, Operation *headProducer,
+                 ArrayRef<TMAConsumerWaitInfo> consumerWaits,
+                 DictionaryAttr consumerWaitConstraints = {});
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);
