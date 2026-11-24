@@ -67,8 +67,18 @@ def _paged_decode_gfx950_accepts(d):
     # The kernel pads QLEN and GROUP to powers of two (GROUP to at least 16 // QLEN) and supports at most 64 padded
     # rows; QLEN=5, GROUP=12 has 60 real rows but pads to 8 x 16.
     qlen, group = d["QLEN"], d["GROUP"]
+    # Per-tensor FP8 scales on 4-D caches only, causal rows, automatic splits, int32 block tables.
+    if (d.get("PER_HEAD_SCALES") or not d.get("CAUSAL", True) or d.get("SPLITS") is not None or d.get("BT_INT64")
+            or (d.get("KV_FP8") and d.get("KV_NDIM") == 5)):
+        return False
     return (d["HEAD_DIM"] in (64, 128) and 1 <= qlen <= 8 and group >= 1
             and _pow2(qlen) * max(16 // _pow2(qlen), _pow2(group)) <= 64)
+
+
+def _paged_decode_packed_fp8_accepts(d):
+    """Packed 5-D FP8 K/V (per-head or per-tensor scales), D 64/128, no output gate."""
+    return (d.get("KV_NDIM") == 5 and bool(d.get("KV_FP8")) and d.get("HEAD_DIM") in (64, 128)
+            and not d.get("OUT_GATE"))
 
 
 _NORM_MODULES = {
@@ -797,20 +807,21 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: 1 <= d.get("KEY_DIM", 0) <= 128 and 1 <= d.get("VALUE_DIM", 0) <= 128,
     ),
     OpSpec(
-        op="paged_attention_decode_fp8",
+        op="paged_attention_decode",
         arch="gfx1250",
         variant="per_head_wmma_tdm",
-        impl="triton.tlx.ops.kernels.paged_attn_fp8.gfx1250_decode:paged_attention_decode_fp8",
-        dtypes=frozenset({"bfloat16", "float8_e4m3fn"}),
+        impl="triton.tlx.ops.kernels.paged_attn_fp8.gfx1250_decode:paged_attention_decode",
+        dtypes=_BF16,
         invariant_vocab=_VARLEN_DIMS,
-        accepts=lambda d: d.get("HEAD_DIM") in (64, 128),
+        accepts=_paged_decode_packed_fp8_accepts,
     ),
     OpSpec(
-        op="paged_attention_decode_fp8_workspace",
+        op="paged_attention_decode_workspace",
         arch="gfx1250",
         variant="per_head_wmma_tdm",
-        impl="triton.tlx.ops.kernels.paged_attn_fp8.gfx1250_decode:paged_attention_decode_fp8_workspace",
-        dtypes=frozenset({"bfloat16", "float8_e4m3fn"}),
+        impl="triton.tlx.ops.kernels.paged_attn_fp8.gfx1250_decode:paged_attention_decode_workspace",
+        dtypes=_BF16,
+        accepts=_paged_decode_packed_fp8_accepts,
     ),
     OpSpec(
         op="paged_attention_decode",

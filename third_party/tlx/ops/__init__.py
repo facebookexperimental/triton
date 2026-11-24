@@ -2104,16 +2104,30 @@ def _check_sliding_window(op, sliding_window):
         raise InvalidInput(f"tlx.ops.{op} expects a non-negative int sliding_window; got {sliding_window!r}")
 
 
-def _check_kv_descales(name, kv_fp8, k_descale, v_descale, device):
+def _check_descale(name, arg, t, heads, device):
+    """A float32 descale on ``device``: one element (per tensor) or a contiguous ``[heads]`` vector (per head).
+    Returns True for per head."""
     import torch
+    if not isinstance(t, torch.Tensor) or t.dtype != torch.float32 or t.device != device:
+        raise InvalidInput(f"{name} expects {arg} as a float32 tensor on the query's device")
+    if t.numel() == 1:
+        return False
+    if t.shape != (heads, ) or not t.is_contiguous():
+        raise InvalidInput(f"{name} expects {arg} with one element or a contiguous [{heads}] per-head vector; got "
+                           f"shape {tuple(t.shape)}")
+    return True
+
+
+def _check_kv_descales(name, kv_fp8, k_descale, v_descale, device, kv_heads):
+    """Validates K/V descales; returns True when either is per head."""
     if not kv_fp8:
         if k_descale is not None or v_descale is not None:
             raise InvalidInput(f"{name}: k_descale / v_descale apply only to a float8_e4m3fn K/V cache")
-        return
-    for arg, t in (("k_descale", k_descale), ("v_descale", v_descale)):
-        if t is None or t.numel() != 1 or t.dtype != torch.float32 or t.device != device:
-            raise InvalidInput(f"{name} expects a one-element float32 {arg} tensor on the query's device with an "
-                               f"FP8 K/V cache")
+        return False
+    if k_descale is None or v_descale is None:
+        raise InvalidInput(f"{name} expects k_descale and v_descale with an FP8 K/V cache")
+    k_per_head = _check_descale(name, "k_descale", k_descale, kv_heads, device)
+    return _check_descale(name, "v_descale", v_descale, kv_heads, device) or k_per_head
 
 
 def _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length, kv_layout):
@@ -2130,13 +2144,22 @@ def _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, q
     if value_cache.dtype != key_cache.dtype or not (kv_fp8 or key_cache.dtype == query.dtype):
         raise InvalidInput("tlx.ops.paged_attention_decode expects K/V caches of the query's dtype, or "
                            "float8_e4m3fn K/V caches")
-    if (query.dtype == fp8 and not kv_fp8) or (kv_fp8 and key_cache.ndim != 4):
+    if query.dtype == fp8 and not kv_fp8:
         raise InvalidInput("tlx.ops.paged_attention_decode supports a float8_e4m3fn query only with float8_e4m3fn "
-                           "K/V, and FP8 K/V only on a 4-D cache")
+                           "K/V")
+    if kv_fp8 and key_cache.ndim == 5:
+        blocks, kv_heads, groups, page, x = key_cache.shape
+        if (x != 16 or groups * x != query.shape[2] or page % 16
+                or value_cache.shape != (blocks, kv_heads, page // 16, query.shape[2], 16)
+                or not key_cache.is_contiguous() or not value_cache.is_contiguous()):
+            raise InvalidInput("tlx.ops.paged_attention_decode expects packed FP8 caches K (blocks, kv_heads, "
+                               "head_dim / 16, page, 16) and V (blocks, kv_heads, page / 16, head_dim, 16), "
+                               f"contiguous; got k={tuple(key_cache.shape)}, v={tuple(value_cache.shape)}")
     if context_lens.dtype not in (torch.int32, torch.int64):
         raise InvalidInput("tlx.ops.paged_attention_decode expects int32 or int64 context_lens")
-    if block_tables.dtype != torch.int32 or block_tables.ndim != 2:
-        raise InvalidInput("tlx.ops.paged_attention_decode expects 2-D int32 block_tables")
+    if block_tables.dtype not in (torch.int32, torch.int64) or block_tables.ndim != 2 or block_tables.stride(1) != 1:
+        raise InvalidInput("tlx.ops.paged_attention_decode expects 2-D int32 or int64 block_tables with contiguous "
+                           "rows")
     if any(t.device != query.device for t in (key_cache, value_cache, context_lens, block_tables)):
         raise InvalidInput("tlx.ops.paged_attention_decode expects all tensors on one device")
     num_kv_heads = key_cache.shape[2 if kv_layout == "NHD" else 1]
@@ -2147,6 +2170,19 @@ def _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, q
         raise InvalidInput(f"tlx.ops.paged_attention_decode: {query.shape[0]} query tokens must be "
                            f"{context_lens.shape[0]} sequences x query_length={query_length}")
     return query.shape[1] // num_kv_heads
+
+
+def _paged_decode_dims(query, key_cache, kv_layout, query_length, group, block_tables, *, per_head=False, causal=True,
+                       num_splits=None, out_gate=False):
+    """Catalog dims of a paged decode call; each backend's ``accepts`` picks the combinations it runs."""
+    import torch
+    if key_cache.ndim == 5:
+        page = key_cache.shape[3]
+    else:
+        page = key_cache.shape[1 if kv_layout == "NHD" else 2]
+    return dict(HEAD_DIM=query.shape[2], QLEN=query_length, GROUP=group, KV_NDIM=key_cache.ndim, KV_LAYOUT=kv_layout,
+                KV_FP8=key_cache.dtype == torch.float8_e4m3fn, PAGE_SIZE=page, PER_HEAD_SCALES=per_head, CAUSAL=causal,
+                SPLITS=num_splits, OUT_GATE=out_gate, BT_INT64=block_tables.dtype == torch.int64)
 
 
 def _decode_compute_dtype(query, out):
@@ -2160,7 +2196,7 @@ def _decode_compute_dtype(query, out):
 def paged_attention_decode(query, key_cache, value_cache, context_lens, block_tables, *, sm_scale=None, query_length=1,
                            sliding_window=0, max_context_len=None, out=None, workspace=None, kv_layout="HND",
                            k_descale=None, v_descale=None, q_descale=None, out_gate=None, out_norm_eps=1e-6,
-                           space=None):
+                           causal=True, num_splits=None, space=None):
     """Forward-only GQA decode attention over a paged K/V cache.
 
     ``query`` is ``(num_seqs * query_length, q_heads, head_dim)``; sequence ``s``
@@ -2171,16 +2207,26 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     kv_heads, page, head_dim)`` or page-major ``kv_layout="NHD"`` ``(blocks, page,
     kv_heads, head_dim)``, or the AITER-packed 5-D layout from
     ``allocate_paged_kv_cache_5d``. A positive ``sliding_window`` limits each
-    query row to its last ``sliding_window`` keys, itself included; pages before
-    the earliest window are never read. ``context_lens`` may be int32 or int64.
+    query row to its last ``sliding_window`` keys, itself included, and requires
+    ``causal``; pages before the earliest window are never read. With
+    ``causal=False`` every query row of a sequence attends to its whole context.
+    ``context_lens`` and ``block_tables`` may be int32 or int64.
     ``max_context_len`` bounds every context and
     picks the split-K plan; pass it, and a buffer from
     ``paged_attention_decode_workspace``, to keep launches graph-capturable.
+    ``num_splits`` overrides the automatic split count.
 
-    FP8: 4-D ``float8_e4m3fn`` K/V caches take one-element float32 ``k_descale``
-    / ``v_descale`` tensors (K/V = stored value * descale). The query may then be
-    BF16/FP16, or ``float8_e4m3fn`` with ``q_descale``; an FP8 query writes a
-    BF16 output unless ``out`` is FP16.
+    FP8: ``float8_e4m3fn`` K/V caches take float32 ``k_descale`` / ``v_descale``
+    (K/V = stored value * descale), each one element (per tensor) or one per KV
+    head. The query may then be BF16/FP16, or ``float8_e4m3fn`` with
+    ``q_descale`` (one element or one per query head); an FP8 query writes a
+    BF16 output unless ``out`` is FP16. FP8 caches are 4-D, or packed 5-D: K
+    ``(blocks, kv_heads, head_dim / 16, page, 16)`` and V ``(blocks, kv_heads,
+    page / 16, head_dim, 16)``.
+
+    Not every combination runs on every architecture (layout, scale granularity,
+    ``causal=False``, ``num_splits`` and ``out_gate`` depend on the backend); an
+    unsupported one raises ``InvalidInput``.
 
     Output norm and gate: with a BF16 ``out_gate`` of shape ``(tokens, q_heads * 64)`` (contiguous last dimension,
     any row stride, so a column slice of a projection output) and head_dim 64, the result is
@@ -2190,11 +2236,19 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
     import torch
     group = _check_paged_kv(query, key_cache, value_cache, context_lens, block_tables, query_length, kv_layout)
     name = "tlx.ops.paged_attention_decode"
-    _check_kv_descales(name, key_cache.dtype == torch.float8_e4m3fn, k_descale, v_descale, query.device)
+    kv_heads = query.shape[1] // group
+    per_head = _check_kv_descales(name, key_cache.dtype == torch.float8_e4m3fn, k_descale, v_descale, query.device,
+                                  kv_heads)
     q_fp8 = query.dtype == torch.float8_e4m3fn
-    if q_fp8 != (q_descale is not None) or (q_fp8 and (q_descale.numel() != 1 or q_descale.dtype != torch.float32
-                                                       or q_descale.device != query.device)):
-        raise InvalidInput(f"{name} expects a one-element float32 q_descale exactly when the query is float8_e4m3fn")
+    if q_fp8 != (q_descale is not None):
+        raise InvalidInput(f"{name} expects q_descale exactly when the query is float8_e4m3fn")
+    if q_fp8:
+        per_head = _check_descale(name, "q_descale", q_descale, query.shape[1], query.device) or per_head
+    if not isinstance(causal, bool) or (sliding_window and not causal):
+        raise InvalidInput(f"{name} expects a bool causal, and causal=True with a sliding window")
+    if num_splits is not None and (isinstance(num_splits, bool) or not isinstance(num_splits, int)
+                                   or not 1 <= num_splits <= 1024):
+        raise InvalidInput(f"{name} expects num_splits in [1, 1024]")
     out_dtype = _decode_compute_dtype(query, out)
     space_name, invariance = _normalize_space_arg("paged_attention_decode", space)
     _check_single_config_space("paged_attention_decode", space_name)
@@ -2219,14 +2273,20 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
         if out is not None and torch._C._overlaps(out, out_gate):
             raise InvalidInput(f"{name} out must not alias out_gate")
     fn, spec = impl_for("paged_attention_decode", device=query.device)
-    check_inputs(spec, dtype=out_dtype, HEAD_DIM=query.shape[2], QLEN=query_length, GROUP=group)
+    check_inputs(
+        spec, dtype=out_dtype,
+        **_paged_decode_dims(query, key_cache, kv_layout, query_length, group, block_tables, per_head=per_head,
+                             causal=causal, num_splits=num_splits, out_gate=out_gate is not None))
     check_backward(spec, query, key_cache, value_cache, out, out_gate, k_descale, v_descale, q_descale)
     _check_enforced("paged_attention_decode", spec, invariance)
     gate_kwargs = {} if out_gate is None else dict(out_gate=out_gate, out_norm_eps=float(out_norm_eps))
     with torch.cuda.device(query.device):
-        return fn(query, key_cache, value_cache, context_lens, block_tables, float(sm_scale), int(query_length),
-                  int(sliding_window), max_context_len, out, workspace, kv_layout, k_descale=k_descale,
-                  v_descale=v_descale, q_descale=q_descale, **gate_kwargs)
+        try:
+            return fn(query, key_cache, value_cache, context_lens, block_tables, float(sm_scale), int(query_length),
+                      int(sliding_window), max_context_len, out, workspace, kv_layout, k_descale=k_descale,
+                      v_descale=v_descale, q_descale=q_descale, causal=causal, num_splits=num_splits, **gate_kwargs)
+        except ValueError as error:
+            raise InvalidInput(f"{name}: {error}") from error
 
 
 def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k, softmax_scale, causal,
@@ -2313,16 +2373,23 @@ def paged_attention_prefill(q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
 
 
 def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, *, query_length=1, sliding_window=0,
-                                     max_context_len=None, kv_layout="HND", norm_gate=False):
+                                     max_context_len=None, kv_layout="HND", norm_gate=False, num_splits=None):
     """Reusable FP32 split-K workspace for ``paged_attention_decode`` with the same
     arguments (``norm_gate=True`` for calls with ``out_gate``), or None when the plan needs none."""
+    import torch
     _check_sliding_window("paged_attention_decode_workspace", sliding_window)
     fn, spec = impl_for("paged_attention_decode_workspace", device=query.device)
-    check_inputs(spec, dtype=_decode_compute_dtype(query, None))
-    import torch
+    group = query.shape[1] // key_cache.shape[2 if kv_layout == "NHD" else 1]
+    check_inputs(
+        spec, dtype=_decode_compute_dtype(query, None),
+        **_paged_decode_dims(query, key_cache, kv_layout, query_length, group, block_tables, num_splits=num_splits,
+                             out_gate=bool(norm_gate)))
     with torch.cuda.device(query.device):
-        return fn(query, key_cache, value_cache, block_tables, int(query_length), int(sliding_window), max_context_len,
-                  kv_layout, bool(norm_gate))
+        try:
+            return fn(query, key_cache, value_cache, block_tables, int(query_length), int(sliding_window),
+                      max_context_len, kv_layout, bool(norm_gate), num_splits=num_splits)
+        except ValueError as error:
+            raise InvalidInput(f"tlx.ops.paged_attention_decode_workspace: {error}") from error
 
 
 def allocate_paged_kv_cache_5d(num_blocks, num_kv_heads, page_size, head_dim, *, dtype, device):
@@ -2384,6 +2451,8 @@ def paged_attention_decode_fp8(query, key_cache, value_cache, context_lens, bloc
                                max_context_len, q_scale=None, query_length=1, causal=True, sliding_window=0,
                                sm_scale=None, num_splits=None, out=None, workspace=None, space=None):
     """Forward-only attention over packed E4M3FN KV with per-head multipliers.
+
+    The per-head-scale, packed-cache form of ``paged_attention_decode``, which it calls.
 
     Q is ``[batch * query_length, query_heads, D]``, BF16 or E4M3FN; D is 64/128.
     K is ``[blocks, kv_heads, D/16, page_size, 16]`` and V is
@@ -2452,20 +2521,11 @@ def paged_attention_decode_fp8(query, key_cache, value_cache, context_lens, bloc
                 or any(t.dtype != torch.float32 or t.device != query.device or not t.is_contiguous()
                        for t in workspace)):
             raise InvalidInput("tlx.ops.paged_attention_decode_fp8 expects contiguous FP32 partial/LSE workspace for Q")
-    space_name, invariance = _normalize_space_arg("paged_attention_decode_fp8", space)
-    _check_single_config_space("paged_attention_decode_fp8", space_name)
-    fn, spec = impl_for("paged_attention_decode_fp8", device=query.device)
-    check_inputs(spec, dtype=query.dtype, HEAD_DIM=query.shape[2])
-    check_backward(spec, query, key_cache, value_cache, k_scale, v_scale, q_scale)
-    _check_enforced("paged_attention_decode_fp8", spec, invariance)
-    with torch.cuda.device(query.device):
-        try:
-            return fn(query, key_cache, value_cache, context_lens, block_tables, k_scale, v_scale,
-                      max_context_len=max_context_len, q_scale=q_scale, query_length=query_length, causal=causal,
-                      sliding_window=sliding_window, sm_scale=float(sm_scale), num_splits=num_splits, out=out,
-                      workspace=workspace)
-        except ValueError as error:
-            raise InvalidInput(f"tlx.ops.paged_attention_decode_fp8: {error}") from error
+    return paged_attention_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale=float(sm_scale),
+                                  query_length=query_length, sliding_window=sliding_window,
+                                  max_context_len=max_context_len, out=out, workspace=workspace, k_descale=k_scale,
+                                  v_descale=v_scale, q_descale=q_scale, causal=causal, num_splits=num_splits,
+                                  space=space)
 
 
 def paged_attention_decode_fp8_workspace(query, key_cache, value_cache, block_tables, *, max_context_len,
@@ -2479,14 +2539,10 @@ def paged_attention_decode_fp8_workspace(query, key_cache, value_cache, block_ta
     No device metadata values are read back and no quantization or attention
     is run. Allocate this workspace and output before graph capture.
     """
-    import torch
     _check_fp8_paged_kv(query, key_cache, value_cache, block_tables, max_context_len=max_context_len,
                         query_length=query_length, sliding_window=sliding_window, num_splits=num_splits)
     name, invariance = _normalize_space_arg("paged_attention_decode_fp8_workspace", space)
     _check_single_config_space("paged_attention_decode_fp8_workspace", name)
-    fn, spec = impl_for("paged_attention_decode_fp8_workspace", device=query.device)
-    check_inputs(spec, dtype=query.dtype)
-    _check_enforced("paged_attention_decode_fp8_workspace", spec, invariance)
-    with torch.cuda.device(query.device):
-        return fn(query, key_cache, value_cache, block_tables, max_context_len=max_context_len,
-                  query_length=query_length, sliding_window=sliding_window, num_splits=num_splits)
+    return paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, query_length=query_length,
+                                            sliding_window=sliding_window, max_context_len=max_context_len,
+                                            num_splits=num_splits)
