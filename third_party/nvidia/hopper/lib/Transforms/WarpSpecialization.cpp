@@ -177,6 +177,43 @@ public:
     unsigned numWarpGroups =
         isBlackwell ? kNumWarpGroupsBlackwell : kNumWarpGroupsHopper;
 
+    // A loop that asked for warp specialization but got no partitions
+    // (PartitionSchedulingMeta skipped it) next to one that did: task-id
+    // propagation would give the skipped loop every task, so code partitioning
+    // would clone it into every partition and each side effect in it (a TMA
+    // reduce, an atomic) would run once per partition. Its ops cannot be safely
+    // placed in one partition either, since nothing orders them after the
+    // other partitions' writes. Leave the whole function unspecialized. This
+    // must run before doTaskIdPropagate, which tags the skipped loop.
+    auto hasPartitionTag = [](Operation *root) {
+      return root
+          ->walk([](Operation *op) {
+            if (op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName) ||
+                op->getAttrOfType<DenseI32ArrayAttr>(
+                    triton::gpu::kPartitionAttrName))
+              return WalkResult::interrupt();
+            return WalkResult::advance();
+          })
+          .wasInterrupted();
+    };
+    if (hasPartitionTag(funcOp)) {
+      bool hasUnpartitionedWSLoop = false;
+      funcOp->walk([&](Operation *op) {
+        if (isa<scf::ForOp, scf::WhileOp>(op) &&
+            op->hasAttr(mlir::triton::kWarpSpecializeAttrName) &&
+            !hasPartitionTag(op)) {
+          hasUnpartitionedWSLoop = true;
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+      if (hasUnpartitionedWSLoop) {
+        LDBG("A warp-specialize loop has no partitions while another loop in "
+             "the function does. Skipping.");
+        return bailOut(funcOp);
+      }
+    }
+
     if (failed(doTaskIdPropagate(funcOp))) {
       signalPassFailure();
       return;
