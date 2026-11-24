@@ -2170,3 +2170,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 }
+
+// -----
+
+// An MN-major TF32 B operand with 32B swizzle atomicity sets descriptor bit 61
+// (tcgen05 swizzling mode 1, 0x20000000 in the high word) and a 512-byte SBO
+// (4-row atoms); the K-major A operand keeps the 128B mode (0x40000000).
+#a = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+#b = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32, swizzleAtom32B = true}>
+#bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @tc_gen5_mma_tf32_mn_major_b
+  // CHECK-DAG: llvm.mlir.constant(536887328 : i32) : i32
+  // CHECK-DAG: llvm.mlir.constant(1073758272 : i32) : i32
+  // CHECK-COUNT-4: tcgen05.mma.cta_group::1.kind::tf32
+  tt.func @tc_gen5_mma_tf32_mn_major_b(%a: !ttg.memdesc<128x32xf32, #a, #ttg.shared_memory>,
+                       %b: !ttg.memdesc<32x128xf32, #b, #ttg.shared_memory>,
+                       %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+                       %useAcc: i1,
+                       %pred: i1,
+                       %barrier: !ttg.memdesc<1xi64, #bar, #ttg.shared_memory>,
+                       %barrierPred: i1) {
+    ttng.tc_gen5_mma %a, %b, %c, %useAcc, %pred, %barrier[%barrierPred] {is_async} :
+       !ttg.memdesc<128x32xf32, #a, #ttg.shared_memory>,
+       !ttg.memdesc<32x128xf32, #b, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<1xi64, #bar, #ttg.shared_memory>
+    tt.return
+  }
+}

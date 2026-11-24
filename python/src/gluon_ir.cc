@@ -631,7 +631,8 @@ void init_gluon_ir(py::module_ &m) {
              return self.getChecked<ttg::NVMMASharedEncodingAttr>(
                  self.getContext(), swizzleByteWidth, transposed,
                  elementBitwidth, *mode,
-                 buildCgaLayoutAttr(self.getContext(), cgaBases, rank));
+                 buildCgaLayoutAttr(self.getContext(), cgaBases, rank),
+                 /*swizzleAtom32B=*/false);
            })
       .def("get_auto_layout",
            [](GluonOpBuilder &self) -> Attribute {

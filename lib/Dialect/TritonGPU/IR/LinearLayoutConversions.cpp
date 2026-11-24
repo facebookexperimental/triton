@@ -166,7 +166,8 @@ LinearLayout getCoreMatrixLinearLayout(NVMMASharedEncodingAttr shared,
   int perPhase = shared.getPerPhase();
   int maxPhase = shared.getMaxPhase();
 
-  int tileRows = 8;
+  // A 32-byte-atomicity swizzle atom is 4 rows of 128 bytes.
+  int tileRows = shared.getSwizzleAtom32B() ? 4 : 8;
   int tileCols = 8 * std::max(16, tileWidthBytes) / elemBitWidth;
   bool isFp4Padded = shared.isPaddedFp4();
 
