@@ -42,8 +42,8 @@ def _compile(monkeypatch, use_meta_ws, warp_specialize):
     _matmul.device_caches.clear()
     with triton.knobs.compilation.scope():
         triton.knobs.compilation.always_compile = True
-        kernel = _matmul.warmup(a, b, c, M, N, K, BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
-                                WARP_SPECIALIZE=warp_specialize, num_warps=4, num_stages=3, grid=(1, ))
+        kernel = _matmul.warmup(a, b, c, M, N, K, BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, WARP_SPECIALIZE=warp_specialize,
+                                num_warps=4, num_stages=3, grid=(1, ))
     return kernel.asm["ttgir"]
 
 
