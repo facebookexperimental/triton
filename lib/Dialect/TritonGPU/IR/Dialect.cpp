@@ -3416,12 +3416,10 @@ void NVMMASharedEncodingAttr::print(AsmPrinter &printer) const {
   printer << "}>";
 }
 
-LogicalResult
-NVMMASharedEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
-                                unsigned swizzlingByteWidth, bool transposed,
-                                unsigned elementBitWidth, NVMmaPadding padding,
-                                CGAEncodingAttr CGALayout,
-                                bool swizzleAtom32B) {
+LogicalResult NVMMASharedEncodingAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, unsigned swizzlingByteWidth,
+    bool transposed, unsigned elementBitWidth, NVMmaPadding padding,
+    CGAEncodingAttr CGALayout, bool swizzleAtom32B) {
   if ((padding == NVMmaPadding::B6x16P32 || padding == NVMmaPadding::B6P2x16) &&
       elementBitWidth != 8)
     return emitError() << "FP6 shared layouts require byte storage";
@@ -3431,8 +3429,7 @@ NVMMASharedEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
     return emitError() << "swizzlingByteWidth must be 0, 32, 64, or 128";
   if (swizzleAtom32B &&
       (swizzlingByteWidth != 128 || padding != NVMmaPadding::None))
-    return emitError()
-           << "swizzleAtom32B requires unpadded 128-byte swizzling";
+    return emitError() << "swizzleAtom32B requires unpadded 128-byte swizzling";
   return success();
 }
 
@@ -5372,7 +5369,8 @@ struct TensorModel
     return cast<RankedTensorType>(pointer).getRank();
   }
   int64_t getElementTypeBitWidth(Type pointer) const {
-    return cast<RankedTensorType>(pointer).getElementTypeBitWidth();
+    return getIntOrFloatOrPtrBitWidth(
+        cast<RankedTensorType>(pointer).getElementType());
   }
 };
 
@@ -5392,7 +5390,7 @@ struct MemDescModel
     return cast<MemDescType>(pointer).getShape().size();
   }
   int64_t getElementTypeBitWidth(Type pointer) const {
-    return cast<MemDescType>(pointer).getElementType().getIntOrFloatBitWidth();
+    return cast<MemDescType>(pointer).getElementTypeBitWidth();
   }
 };
 } // namespace

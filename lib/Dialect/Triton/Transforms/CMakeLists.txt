@@ -3,6 +3,7 @@ mlir_tablegen(TritonCombine.inc -gen-rewriters)
 add_public_tablegen_target(TritonCombineIncGen)
 
 add_triton_library(TritonTransforms
+  MaterializeStochasticRounding.cpp
   Combine.cpp
   CudaWarningsPass.cpp
   LoopAwareCSE.cpp
