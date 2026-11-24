@@ -1,4 +1,4 @@
-"""Decide whether cmake/meta-llvm-info.json should move to a newer fork release (pure, unit-tested).
+"""Pure helpers for Meta LLVM bundle bumps: release lookup, manifest rendering and PR/issue text.
 
 The Meta LLVM fork publishes immutable releases named llvm-<sha8>-<build> whose
 assets are llvm-<sha8>-<suffix>-<build>.tar.gz plus a .sha256 file each. A
@@ -11,17 +11,6 @@ import re
 import textwrap
 
 _TAG = re.compile(r"^llvm-([0-9a-f]{8})-([0-9]+)$")
-
-
-def oai_pins(llvm_info, llvm_build_info):
-    """OAI core revisions a fork build may sit on.
-
-    Which manifest is authoritative differs per branch: on main llvm-build-info.json
-    leads llvm-info.json until OAI publishes; on release/3.8.x llvm-build-info.json is
-    a stale leftover and llvm-info.json is the pin. Each branch's build_helpers.py
-    enforces its own rule, so accept either and flag only a pin matching neither.
-    """
-    return {info["llvm_hash"] for info in (llvm_info, llvm_build_info) if info}
 
 
 def same_tree_chain(commits):
@@ -92,34 +81,18 @@ def render(meta, release, sha256sums, repository):
     return updated
 
 
-def decide(meta, pins, chain, release, required):
-    """One of ("pin-moved"|"no-release"|"incomplete"|"current"|"bump", detail)."""
-    if meta["based_on_oai_llvm_hash"] not in pins:
-        return "pin-moved", (f"meta-llvm-info.json is based on {meta['based_on_oai_llvm_hash'][:12]} but OAI pins "
-                             f"{', '.join(sorted(p[:12] for p in pins))}")
-    if release is None:
-        return "no-release", f"no release yet for fork tip {chain[0][:12]}"
-    missing = sorted(set(required) - set(variants(release)))
-    if missing:
-        return "incomplete", f"{release['tag_name']} lacks {', '.join(missing)}"
-    if meta["llvm_hash"] == release["target_commitish"] and set(meta["sha256sum"]) >= set(variants(release)):
-        return "current", f"already pins {release['tag_name']}"
-    return "bump", release["tag_name"]
-
-
 def _bump_text(repo, target, fork, fork_branch, meta, new, release=None):
     """(problem, solution, test plan, log header) prose shared by the commit message and the PR body."""
     old_tag = meta["release_base_url"].rsplit("/", 1)[-1]
-    tip, base = new["llvm_hash"], new["based_on_oai_llvm_hash"]
+    tip = new["llvm_hash"]
     tag = new["release_base_url"].rsplit("/", 1)[-1]
     published = f" (published {_date(release)})" if release else ""
-    return (
-        f"{repo}@{target} tracks the Meta LLVM fork branch {fork}@{fork_branch}. It pins {old_tag}, but the "
-        "fork branch has a newer published release.",
-        f"This points cmake/meta-llvm-info.json at {tag}{published}, built from fork tip {tip[:12]} on the same OAI "
-        f"pin {base[:12]}.", "The pinned digests match the release's .sha256 assets and GitHub's asset digests "
-        f"({', '.join(sorted(new['sha256sum']))}).",
-        f"Fork changes in this bump ({meta['llvm_hash'][:12]}...{tip[:12]}):")
+    return (f"{repo}@{target} tracks the Meta LLVM fork branch {fork}@{fork_branch}. It pins {old_tag}, but the "
+            "fork branch has a newer published release.",
+            f"This points cmake/meta-llvm-info.json at {tag}{published}, built from fork tip {tip[:12]}.",
+            "The pinned digests match the release's .sha256 assets and GitHub's asset digests "
+            f"({', '.join(sorted(new['sha256sum']))}).",
+            f"Fork changes in this bump ({meta['llvm_hash'][:12]}...{tip[:12]}):")
 
 
 def commit_message(title, repo, target, fork, fork_branch, meta, new, log, width=72):
