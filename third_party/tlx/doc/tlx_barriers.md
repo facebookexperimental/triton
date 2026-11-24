@@ -306,6 +306,14 @@ while !done:
   *tlx.alloc_barrier* can be set to achieve the desired phase change
   behavior.
 
+  By default (NVIDIA) the arrive is task-collective: one thread of the
+  calling task arrives, and the compiler orders every earlier shared- and
+  tensor-memory access of the task's threads before it, inserting a
+  task-wide barrier and `tcgen05.wait` where needed. A task that reads a
+  TMEM or SMEM buffer and then releases it with *barrier_arrive* needs no
+  barrier of its own. Global-memory writes are not ordered for other CTAs;
+  use a GPU-scope fence or release atomic for those.
+
   With *per_warp=True* (NVIDIA), each warp of the arriving task
   synchronizes its own lanes and one of its lanes arrives with
   *arrive_count*, instead of the whole task synchronizing before one
