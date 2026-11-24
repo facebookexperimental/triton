@@ -304,7 +304,7 @@ static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
       auto targetFeatures = amdgpu::TargetFeatures::fromModuleOp(
           localLoadOp->getParentOfType<ModuleOp>());
       using amdgpu::ISAFamily;
-      if (llvm::is_contained({ISAFamily::CDNA4, ISAFamily::GFX1250},
+      if (llvm::is_contained({ISAFamily::CDNA4, ISAFamily::CDNA5},
                              targetFeatures.getISAFamily())) {
         // A subview retains the parent allocation shape in its MemDescType.
         // Build inferred padding against that allocation, because the padded
@@ -820,7 +820,7 @@ static void materializeDotUserTensorConstraints(ModuleOp m,
 // default `local_alloc(...)` (no explicit `layout=`), the alloc's encoding
 // is the generic non-swizzled `SwizzledSharedEncoding(maxPhase=1)` — which
 // the TDM op verifier accepts but which produces wrong LDS data on real
-// gfx1250 hardware. We anchor a `tlx.require_layout` on the buffer operand
+// CDNA5 hardware. We anchor a `tlx.require_layout` on the buffer operand
 // of every TDM copy so `tlx-propagate-layout` rewrites the source
 // `local_alloc` (and any subview / loop-carrier chain) to the
 // descriptor-compatible encoding.

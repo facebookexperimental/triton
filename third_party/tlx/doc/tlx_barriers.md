@@ -275,6 +275,7 @@ while !done:
 | Implicit arrive of an *tlx.barrier_expect_bytes* | 1 | Only one thread modifies the barrier arrival count after completion of a transaction |
 | *tlx.barrier_arrive* on NV within a *tlx.async_task* region | Number of warp groups | Only one thread per MMA group modifies the barrier arrival count on arrive |
 | *tlx.barrier_arrive* on NV outside a *tlx.async_task* region | 1 | Only tid == 0 modifies the barrier arrival count on arrive |
+| *tlx.barrier_arrive(..., per_warp=True)* on NV | Warps of the arriving task | One lane of each warp arrives after a warp-local sync |
 | *tlx.barrier_arrive* on AMD | num_warps that execute *tlx.barrier_arrive* | One thread per wave(warp) increments the barrier count |
 
 - ***tlx.barrier_expect_bytes(bar, bytes)***
@@ -304,6 +305,42 @@ while !done:
   barrier_arrive() with *arrive_count=1*. The *arrive_count* of
   *tlx.alloc_barrier* can be set to achieve the desired phase change
   behavior.
+
+  With *per_warp=True* (NVIDIA), each warp of the arriving task
+  synchronizes its own lanes and one of its lanes arrives with
+  *arrive_count*, instead of the whole task synchronizing before one
+  thread arrives, as FA4 does. The barrier then counts *arrive_count*
+  for each warp of the task, and per-warp and leader arrives can share a
+  barrier. Not supported on warp barriers or with *cta_mask*.
+
+  The three arrival styles:
+
+  | Style | Allocate | Arrive | Barrier counts per arrive |
+  |:---|:---|:---|:---|
+  | Leader | `tlx.alloc_barriers(n, arrive_count=N)` | `tlx.barrier_arrive(bar, c)` | c; the task synchronizes, then one thread arrives |
+  | Per warp | `tlx.alloc_barriers(n, arrive_count=N)` | `tlx.barrier_arrive(bar, c, per_warp=True)` | c * task warps; each warp synchronizes, then one lane arrives |
+  | Per thread | `tlx.alloc_warp_barrier(n, num_warps=W, num_arrivals=A)` | `tlx.barrier_arrive(bar, c)` | c * task threads; every thread arrives, the barrier counts W * 32 * A |
+
+  For leader and per-warp arrives, N is the sum over a phase of what each
+  arrive counts, times the number of CTAs for a barrier signalled from
+  every CTA of a cluster. A barrier released by a 4-warp task per warp and
+  by a leader arrive in each of two CTAs is allocated with
+  `arrive_count=(4 + 1) * 2`. All three wait with `tlx.barrier_wait`.
+
+  `tlx.async_task(..., nvptx_cmp_sink_workaround=True)` (NVIDIA) is a
+  temporary workaround for an NVPTX backend issue. It changes where leader
+  and per-warp arrives in that task compute their `tid == 0` and
+  `lane == 0` predicates, not what the arrives do. NVPTX lets
+  CodeGenPrepare sink compares into the blocks of their users, so the
+  compare of a leader arrive after a loop moves back next to the arrive
+  and keeps the 32-bit thread id live across the loop. A per-warp
+  arrive's lane predicate is instead hoisted out of the loop by LICM and
+  stays live across it. Either can perturb the ptxas schedule of a hot
+  loop: the FA forward softmax is about 3% faster with both avoided, and
+  avoiding only one gains little. With the flag, the task's per-warp
+  arrives test `%laneid` inside their own asm and its leader arrives share
+  one predicate built at the task entry. Only that task's arrives are
+  affected. Remove the flag once NVPTX stops sinking compares.
 
   | TLX [<u>barriers</u>](https://github.com/facebookexperimental/triton/blob/tlx/third_party/tlx/language/tlx/barrier.py) | MLIR | PTX |
   |----|----|----|

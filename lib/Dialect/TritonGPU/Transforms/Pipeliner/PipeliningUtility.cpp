@@ -389,7 +389,7 @@ int mlir::triton::getCopyVecBytes(RankedTensorType registerTy,
            registerTy.getElementTypeBitWidth() / 8;
   auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
   const int vecElems = regToSharedLayout.getNumConsecutiveInOut();
-  return vecElems * registerTy.getElementTypeBitWidth() / 8;
+  return vecElems * getIntOrFloatOrPtrBitWidth(registerTy.getElementType()) / 8;
 }
 
 bool mlir::triton::canBeConvertedToAsyncLoad(
@@ -403,11 +403,9 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
   unsigned width = 0;
   if (tensorTy) {
     auto ty = cast<tt::PointerType>(tensorTy.getElementType()).getPointeeType();
-    width = vec * ty.getIntOrFloatBitWidth();
+    width = vec * getIntOrFloatOrPtrBitWidth(ty);
   } else {
-    width = cast<tt::PointerType>(ptr.getType())
-                .getPointeeType()
-                .getIntOrFloatBitWidth();
+    width = tt::getPointeeBitWidth(ptr.getType());
   }
 
   // We do not pipeline all loads for the following reasons:
@@ -530,7 +528,7 @@ bool mlir::triton::canPipelineTMALoad(Operation *op) {
   auto sharedEncoding = getSharedEncoding(op);
   int64_t stageSizeInBits =
       ttg::getAllocationElems(sharedEncoding, tensorTy.getShape()) *
-      tensorTy.getElementTypeBitWidth();
+      getIntOrFloatOrPtrBitWidth(tensorTy.getElementType());
   return stageSizeInBits % (ttng::TMA_ALIGN * 8) == 0;
 }
 
