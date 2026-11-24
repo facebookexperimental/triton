@@ -205,8 +205,10 @@ def _iw_load(dst, src, data_off, sdst, ssrc, scale_off):
 def _gemm_mxfp6_interwave(A, B, C, SA, SB, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, K_TILES: tl.constexpr,
                           SPLIT_K: tl.constexpr, GROUP_M: tl.constexpr, A_FORMAT: tl.constexpr, B_FORMAT: tl.constexpr):
     tl.static_assert(K_TILES >= 2)
+    # A 16-byte pad per 1024-byte direct-to-LDS chunk spreads the 16 rows of an
+    # MFMA tile over distinct 16-byte LDS bank offsets.
     tile_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [[1024, 32]],
+        [[1024, 16]],
         [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0],
          [16, 0]],
         [128, 128],
