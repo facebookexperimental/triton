@@ -3,16 +3,15 @@ import json
 
 import pytest
 
-from meta_llvm_bump import (bot_branch_for, commit_message, decide, failed_body, issue_body, issue_marker,
-                            issue_release, issue_result, issue_title, oai_pins, pick_tracking, pr_body,
-                            parse_sha256_file, release_for, render, same_tree_chain, variants, verdict, verify_state)
+from meta_llvm_bump import (bot_branch_for, commit_message, failed_body, issue_body, issue_marker, issue_release,
+                            issue_result, issue_title, pick_tracking, pr_body, parse_sha256_file, release_for, render,
+                            same_tree_chain, variants, verdict, verify_state)
 
 OLD = "1889ed344a2ea019320c1a49fc5b7103d0d9468d"
 NEW = "3dd0e43fed8836e77165a4f066b983efe1f13a82"
 SYNC = "aaaaaaaa00000000000000000000000000000000"
 BASE = "5f07f818b51b786b0a87b4e514882600ecba112f"
 META = {
-    "based_on_oai_llvm_hash": BASE,
     "llvm_hash": OLD,
     "llvm_repository": "https://github.com/facebookexperimental/llvm-project",
     "build_number": 1,
@@ -28,12 +27,6 @@ def _release(sha, build, suffixes):
         name = f"llvm-{sha[:8]}-{suffix}-{build}.tar.gz"
         assets += [{"name": name}, {"name": f"{name}.sha256"}]
     return {"tag_name": tag, "target_commitish": sha, "assets": assets}
-
-
-def test_oai_pins_accepts_either_manifest():
-    # main: llvm-build-info.json leads llvm-info.json; release/3.8.x: llvm-build-info.json is a stale leftover.
-    assert oai_pins({"llvm_hash": "info"}, {"llvm_hash": "build"}) == {"info", "build"}
-    assert oai_pins({"llvm_hash": "info"}, None) == {"info"}
 
 
 def test_same_tree_chain_skips_empty_sync_commits():
@@ -73,29 +66,8 @@ def test_render_keeps_key_order_and_unrelated_keys():
                  "facebookexperimental/llvm-project")
     assert list(out) == list(META)
     assert out["llvm_hash"] == NEW
-    assert out["based_on_oai_llvm_hash"] == BASE
     assert out["release_base_url"].endswith("/releases/download/llvm-3dd0e43f-1")
     assert list(out["sha256sum"]) == ["almalinux-x64", "ubuntu-x64"]
-
-
-def test_decide():
-    four = ["almalinux-arm64", "almalinux-x64", "ubuntu-arm64", "ubuntu-x64"]
-    full = _release(NEW, 1, four)
-    assert decide(META, {"f" * 40}, [NEW], full, four)[0] == "pin-moved"
-    assert decide(META, {"f" * 40, BASE}, [NEW], full, four)[0] == "bump"
-    assert decide(META, {BASE}, [NEW], None, four)[0] == "no-release"
-    assert decide(META, {BASE}, [NEW], _release(NEW, 1, four[:2]),
-                  four) == ("incomplete", "llvm-3dd0e43f-1 lacks ubuntu-arm64, ubuntu-x64")
-    assert decide(META, {BASE}, [NEW], full, four) == ("bump", "llvm-3dd0e43f-1")
-    current = {**META, "llvm_hash": NEW, "sha256sum": dict.fromkeys(four, "0" * 64)}
-    assert decide(current, {BASE}, [NEW], full, four)[0] == "current"
-
-
-def test_decide_bumps_when_release_adds_platforms():
-    # Same commit, but the release gained ubuntu variants since the last bump.
-    two = ["almalinux-arm64", "almalinux-x64"]
-    pinned = {**META, "llvm_hash": NEW}
-    assert decide(pinned, {BASE}, [NEW], _release(NEW, 1, two + ["ubuntu-x64"]), two)[0] == "bump"
 
 
 def test_commit_message_plain_wrapped_bare_labels():

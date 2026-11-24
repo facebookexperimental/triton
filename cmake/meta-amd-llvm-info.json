@@ -1,5 +1,4 @@
 {
-  "based_on_oai_llvm_hash": "d26ff26ef4e94a4de9ce5228ef5b32b5290cca8f",
   "llvm_hash": "59389489a96e93658d0dc9d5ba9cba3b9d7748ac",
   "llvm_repository": "https://github.com/facebookexperimental/llvm-project",
   "build_number": 1,
