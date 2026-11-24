@@ -315,6 +315,32 @@ def TritonAMDGPUCoalesceAsyncCopy
   ];
 }
 
+def TritonAMDGPUFoldLDSStagingOverBudget
+    : Pass<"tritonamdgpu-fold-lds-staging-over-budget", "mlir::ModuleOp"> {
+  let summary = "Fold dot-operand LDS staging back to convert_layout when the "
+                "kernel exceeds the LDS budget";
+
+  let description = [{
+    ReduceDataDuplication stages dot-operand conversions through LDS (an
+    immutable local_alloc of a register tensor read back by local_loads).
+    Plain Triton keeps that staging, because its swizzled read is cheaper than
+    a generic shared-memory convert_layout. Staging buffers can have
+    overlapping lifetimes, unlike convert_layout scratch. If the kernel no
+    longer fits in LDS, this pass replaces every such staging with a
+    convert_layout. It does nothing within budget, and skips TLX and
+    warp-pipelined modules, whose staging late TLX layout propagation handles.
+    The budget check is an estimate taken before the late scheduling passes.
+  }];
+
+  let dependentDialects = [];
+
+  let options =
+      [Option<"gfxArch", "gfx-arch", "std::string", /*default=*/"std::string{}",
+              "GFX architecture name, e.g., gfx942, gfx950; defaults to the "
+              "module's ttg.target">,
+  ];
+}
+
 def TritonAMDGPUUpdateAsyncWaitCount
     : Pass<"tritonamdgpu-update-async-wait-count", "mlir::ModuleOp"> {
   let summary = "Adjust async wait count to allow prefetching over multiple "
