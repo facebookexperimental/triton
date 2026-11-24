@@ -12,7 +12,6 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
-#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Debug.h"
@@ -223,7 +222,6 @@ public:
                      size_t partitionSize)
       : operation(operation), funcAllocMap(funcAllocMap),
         allocation(allocation), scratchSizeGetter(scratchSizeGetter),
-        useMetaWSLifetimeWorkaround(tools::getBoolEnv("TRITON_USE_META_WS")),
         partitionSize(partitionSize) {
     run();
   }
@@ -495,8 +493,7 @@ private:
       auto minId = std::numeric_limits<size_t>::max();
       auto maxId = std::numeric_limits<size_t>::min();
       llvm::for_each(liveOperations, [&](Operation *liveOp) {
-        if (useMetaWSLifetimeWorkaround && liveOp &&
-            isa<mlir::triton::gpu::WarpSpecializeOp>(liveOp)) {
+        if (liveOp && isa<mlir::triton::gpu::WarpSpecializeOp>(liveOp)) {
           minId = 0;
           if ((operationId[liveOp] + 1) > maxId) {
             maxId = operationId[liveOp] + 1;
@@ -913,7 +910,6 @@ private:
   Allocation *allocation;
   BufferRangeMapT bufferRange;
   AllocationAnalysisScratchSizeFn scratchSizeGetter;
-  bool useMetaWSLifetimeWorkaround;
   size_t partitionSize;
 };
 
