@@ -1469,7 +1469,9 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
 
 def paged_attention_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale, query_length,
                            sliding_window, max_context_len, out, workspace, kv_layout, k_descale=None, v_descale=None,
-                           q_descale=None, out_gate=None, out_norm_eps=1e-6):
+                           q_descale=None, out_gate=None, out_norm_eps=1e-6, causal=True, num_splits=None):
+    # The catalog admits only causal rows and automatic splits here.
+    assert causal and num_splits is None
     if out is None:
         # An FP8 query writes the output in BF16.
         out = torch.empty(query.shape, dtype=torch.bfloat16 if query.dtype == torch.float8_e4m3fn else query.dtype,
@@ -1481,7 +1483,8 @@ def paged_attention_decode(query, key_cache, value_cache, context_lens, block_ta
 
 
 def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, query_length, sliding_window,
-                                     max_context_len, kv_layout, norm_gate=False):
+                                     max_context_len, kv_layout, norm_gate=False, num_splits=None):
+    assert num_splits is None
     config = get_pa_decode_config(query, key_cache, value_cache, block_tables, query_length=query_length,
                                   max_context_len=max_context_len, sliding_window=sliding_window, kv_layout=kv_layout,
                                   norm_gate=norm_gate)
