@@ -75,7 +75,9 @@ bool canUnifyWaitLocations(WaitBarrierOp earlier, WaitBarrierOp later) {
     if (!op || !canRaiseWSWaitPast(later, op))
       return false;
 
-    if (isBarrierLikeOp(op))
+    // A proxy fence attached to a release (see WSLowerToken) only orders the
+    // reads before it; waiting earlier does not affect it.
+    if (isBarrierLikeOp(op) || isa<FenceAsyncSharedOp>(op))
       continue;
     if (!isAllowedRegionOp(op) && !isBarrierBookkeepingOp(op))
       return false;
