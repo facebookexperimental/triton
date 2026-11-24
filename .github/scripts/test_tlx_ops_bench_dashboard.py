@@ -110,7 +110,8 @@ def test_skipped_operator_remains_visible_alongside_measurements(tmp_path):
     ET.ElementTree(suite).write(tmp_path / "bench.xml")
     out = tmp_path / "summary.json"
     dash.summarize(
-        SimpleNamespace(dir=str(tmp_path), platform="mi350", version="3.9.0.dev20261029", sha="a" * 40, out=str(out)))
+        SimpleNamespace(dir=str(tmp_path), platform="mi350", version="3.9.0.dev20261029", sha="a" * 40, out=str(out),
+                        ci="", ci_run=""))
     summary = json.loads(out.read_text())
     ops = summary["ops"]
     assert ops["addmm"]["reason"] == "no implementation"
@@ -121,6 +122,39 @@ def test_skipped_operator_remains_visible_alongside_measurements(tmp_path):
     assert page["ops"]["addmm"]["reason"] == "no implementation"
     assert page["ops"]["addmm"]["cases"] == []
     assert page["nights"][0]["ops"]["addmm"] == []
+
+
+def test_summary_preserves_autotune_choices_and_accepts_older_artifacts(tmp_path):
+    decisions = [{
+        "kernel": "kernels.attention",
+        "phase": "warmup",
+        "key": ["64", "64", "480", "1024", "4"],
+        "config": {"BLOCK_M": 128, "BLOCK_N": 64, "num_warps": 4, "num_stages": 2, "num_ctas": 1},
+        "selection": "cached",
+        "selected_by_case": "serving/Z37",
+        "candidates": [],
+    }]
+    old = {
+        "case": {
+            "op": "hstu_cross_attn", "key": "serving/Z37", "input": "((), {'Z': 37})", "direction": "fwd", "dtype":
+            "bfloat16"
+        },
+        "status": "ok",
+        "tlx": {"mean": 226.0, "p50": 227.0},
+    }
+    new = {
+        **old, "case": {**old["case"], "key": "serving/Z40", "input": "((), {'Z': 40})"}, "best_config":
+        "BM=128 BN=64 w4 s2", "autotune": decisions
+    }
+    (tmp_path / "raw.json").write_text(json.dumps({"env": {}, "results": [old, new]}))
+    out = tmp_path / "summary.json"
+    dash.summarize(
+        SimpleNamespace(dir=str(tmp_path), platform="mi350", version="3.9.0.dev20261118", sha="a" * 40, out=str(out),
+                        ci="", ci_run=""))
+    cases = json.loads(out.read_text())["ops"]["hstu_cross_attn"]["cases"]
+    assert cases[0]["best_config"] is None and cases[0]["autotune"] == []
+    assert cases[1]["best_config"] == new["best_config"] and cases[1]["autotune"] == decisions
+    assert cases[1]["tlx_tflops"] == 226.0 and cases[1]["tlx_p50"] == 227.0
 
 
 def test_overview_uses_valid_comparisons_and_separates_directions():
@@ -226,3 +260,182 @@ def test_chart_units_follow_the_selected_measurements(tmp_path, input_value, gro
     per_case = "TLX vs reference" if has_reference else "TLX"
     assert f'aria-label="norm_fwd: {per_case} TFLOP/s per case, latest night"' in result.stdout
     assert not re.search(r'(?:cx|cy|points|x|y)="[^"]*(?:NaN|Infinity)', result.stdout)
+
+
+@pytest.mark.parametrize("values,kind,start,recovered", [
+    ([100, 100, 120, 120, 121], "lift", 2, None),
+    ([100, 100, 80, 80, 88, 92], "regression", 2, None),
+    ([100, 100, 80, 80, 92, 96, 97], "regression", 2, 5),
+])
+def test_episodes_compare_with_the_pre_change_level(values, kind, start, recovered):
+    series = [timed("x", v) for v in values]
+    rows = dash.case_episodes(series, ["same"] * len(series))
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["kind"], row["start"], row["recovered"]) == (kind, start, recovered)
+    assert row["baseline"] == 100 and row["confirmed"] == 3
+    assert row["last"] == len(values) - 1
+
+
+def test_recovery_is_not_a_lift_unless_it_exceeds_the_healthy_level():
+    series = [timed("x", v) for v in [100, 80, 80, 100, 100]]
+    rows = dash.case_episodes(series, ["same"] * len(series))
+    assert len(rows) == 1 and rows[0]["recovered"] == 3
+    series[-2:] = [timed("x", 120), timed("x", 120)]
+    rows = dash.case_episodes(series, ["same"] * len(series))
+    assert [r["kind"] for r in rows] == ["regression", "lift"]
+    assert rows[1]["baseline"] == 100 and rows[1]["start"] == 3
+
+
+@pytest.mark.parametrize("bad", [None, timed("x", 100, status="noisy"), timed("x", 100, status="error")])
+def test_missing_or_untrusted_measurements_cannot_confirm_recovery(bad):
+    series = [timed("x", 100), timed("x", 80), timed("x", 80), timed("x", 100), bad, timed("x", 100)]
+    row = dash.case_episodes(series, ["same"] * len(series))[0]
+    assert row["recovered"] is None and row["baseline"] == 100
+    series.append(timed("x", 100))
+    assert dash.case_episodes(series, ["same"] * len(series))[0]["recovered"] == 5
+
+
+@pytest.mark.parametrize("values,kind", [
+    ([100, 100, 100, 96, 92, 88, 84], "regression"),
+    ([100, 100, 100, 104, 108, 112, 116], "lift"),
+])
+def test_gradual_movements_do_not_redefine_the_normal_baseline(values, kind):
+    series = [timed("x", v) for v in values]
+    rows = dash.case_episodes(series, ["same"] * len(series))
+    assert len(rows) == 1 and rows[0]["kind"] == kind
+    assert rows[0]["baseline"] == 100 and rows[0]["start"] == 5 and rows[0]["confirmed"] == 6
+
+
+@pytest.mark.parametrize("values,lift_start", [
+    ([100, 80, 80, 100, 120, 120], 4),
+    ([100, 80, 80, 100, 100, 120, 120], 5),
+])
+def test_a_lift_on_the_recovery_boundary_keeps_the_healthy_baseline(values, lift_start):
+    series = [timed("x", v) for v in values]
+    rows = dash.case_episodes(series, ["same"] * len(series))
+    assert [r["kind"] for r in rows] == ["regression", "lift"]
+    assert rows[0]["recovered"] == 3
+    assert rows[1]["baseline"] == 100 and rows[1]["start"] == lift_start
+    assert rows[1]["confirmed"] == lift_start + 1
+
+
+def test_reference_only_changes_are_not_tlx_movements():
+    series = [{**timed("x", 100), "speedup": ratio, "ref_tflops": 100 / ratio} for ratio in [1, 1, 2, 2]]
+    assert dash.case_episodes(series, ["same"] * len(series)) == []
+
+
+def test_a_later_lift_does_not_rewrite_the_earlier_lift():
+    series = [timed("x", v) for v in [100, 120, 120, 120, 150, 150]]
+    rows = dash.case_episodes(series, ["same"] * len(series))
+    assert len(rows) == 2
+    assert rows[0]["end"] == 3 and rows[0]["peak"] == 1.2
+    assert rows[1]["start"] == 4 and rows[1]["baseline"] == 120
+
+
+def test_a_transient_drop_does_not_become_a_completed_episode():
+    series = [timed("x", v) for v in [100, 80, 100, 100]]
+    assert dash.case_episodes(series, ["same"] * len(series)) == []
+    series = [timed("x", 100), timed("x", 80)]
+    row = dash.case_episodes(series, ["same"] * len(series))[0]
+    assert row["confirmed"] is None and row["recovered"] is None
+
+
+def test_an_environment_change_does_not_recover_an_old_regression():
+    series = [timed("x", v) for v in [100, 80, 80, 100, 100]]
+    rows = dash.case_episodes(series, ["old", "old", "old", "new", "new"])
+    assert len(rows) == 1 and rows[0]["recovered"] is None
+    assert rows[0]["context_changed"] and rows[0]["last"] == 2
+
+
+def test_episode_membership_is_not_truncated_or_hidden_by_partial_recovery():
+    nights = []
+    for i in range(5):
+        cases = [timed(str(k), 100 if i == 0 or i >= 3 and k < 74 else 80) for k in range(75)]
+        nights.append(bench_night(f"2026110{i + 1}", "a" * 40, *cases))
+    catalog = {"mm": {c["key"]: i for i, c in enumerate(nights[0]["ops"]["mm"]["cases"])}}
+    groups = dash.episodes(nights, catalog)
+    assert len(groups) == 1
+    rows = groups[0]["rows"]
+    assert len(rows) == 75 and len({r["case"] for r in rows}) == 75
+    assert sum(r["recovered"] is not None for r in rows) == 74
+    assert rows[-1]["recovered"] is None and rows[-1]["baseline"] == 100
+
+
+def test_episode_plot_does_not_use_measurements_from_a_later_context(tmp_path, monkeypatch):
+    chrome = os.environ.get("CHROME_BIN") or shutil.which("chromium") or shutil.which("google-chrome")
+    if not chrome:
+        pytest.skip("Chromium is needed to check episode plots")
+    monkeypatch.setattr(dash, "commits", lambda a, b: [])
+    source = tmp_path / "summaries"
+    source.mkdir()
+    for i, value in enumerate([100, 80, 80, 100, 100]):
+        case = {**timed("x", value), "direction": "fwd", "dtype": "bf16", "speedup": 1, "ref_tflops": 100, "notes": []}
+        night = bench_night(f"2026110{i + 1}", "a" * 40, case, driver="570" if i < 3 else "575")
+        night["schema"] = 2
+        (source / f"{night['date']}.b200.json").write_text(json.dumps(night))
+    site = tmp_path / "site"
+    dash.render(SimpleNamespace(source=str(source), outdir=str(site)))
+    result = subprocess.run([
+        chrome,
+        "--headless",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-background-networking",
+        f"--user-data-dir={tmp_path / 'chrome'}",
+        "--virtual-time-budget=1500",
+        "--dump-dom",
+        (site / "index.html").as_uri() + "#tab=episodes",
+    ], capture_output=True, text=True, check=True, timeout=30)
+    assert "last joint point 2026-11-03: −20.0%" in result.stdout
+    assert re.search(r'<span class="ep-b ep-b-warn">[^<]*unresolved[^<]*</span>', result.stdout)
+    assert not re.search(r'(?:cx|cy|points)="[^"]*(?:NaN|Infinity)', result.stdout)
+
+
+@pytest.mark.parametrize("values,expected_text,lift_count", [
+    ([100, 120, 120, 80], "latest downturn · awaiting confirmation", 1),
+    ([100, 120, 120, 150, 150], "1 input · 1 op(s) · 1 GPU(s)", 2),
+])
+def test_lift_summaries_distinguish_current_measurements_and_unique_inputs(tmp_path, monkeypatch, values, expected_text,
+                                                                           lift_count):
+    chrome = os.environ.get("CHROME_BIN") or shutil.which("chromium") or shutil.which("google-chrome")
+    if not chrome:
+        pytest.skip("Chromium is needed to check episode summaries")
+    monkeypatch.setattr(dash, "commits", lambda a, b: [])
+    source = tmp_path / "summaries"
+    source.mkdir()
+    for i, value in enumerate(values):
+        case = {**timed("x", value), "direction": "fwd", "dtype": "bf16", "speedup": 1, "ref_tflops": 100, "notes": []}
+        night = bench_night(f"2026110{i + 1}", "a" * 40, case)
+        night["schema"] = 2
+        (source / f"{night['date']}.b200.json").write_text(json.dumps(night))
+    site = tmp_path / "site"
+    dash.render(SimpleNamespace(source=str(source), outdir=str(site)))
+    result = subprocess.run([
+        chrome,
+        "--headless",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-background-networking",
+        f"--user-data-dir={tmp_path / 'chrome'}",
+        "--virtual-time-budget=1500",
+        "--dump-dom",
+        (site / "index.html").as_uri() + "#tab=episodes",
+    ], capture_output=True, text=True, check=True, timeout=30)
+    section = re.search(
+        r'<div class="tiles ep-tiles" id="ep-tiles">(.*?)<div id="ep-sections">(.*?)</section>\s*</div>', result.stdout,
+        re.S)
+    assert section is not None and expected_text in section.group(0)
+    assert f'<div class="k">Lifts</div><div class="v">{lift_count}</div>' in section.group(1)
+
+
+def test_historical_episode_inputs_remain_addressable_after_an_op_disappears(monkeypatch):
+    monkeypatch.setattr(dash, "commits", lambda a, b: [])
+    case = {**timed("x", 100), "direction": "fwd", "dtype": "bf16", "speedup": 1, "ref_tflops": 100, "notes": []}
+    nights = [bench_night(f"2026110{i + 1}", "a" * 40, {**case, "tlx_tflops": v}) for i, v in enumerate([100, 80, 80])]
+    nights.append({**bench_night("20261104", "a" * 40), "ops": {}})
+    p = dash.page_data({"b200": nights})["platforms"]["b200"]
+    assert p["ops"] == {}
+    row = p["episodes"][0]["rows"][0]
+    assert p["episode_cases"]["mm"][row["case"]][3] == case["key"]
+    assert row["last"] == 2 and row["recovered"] is None

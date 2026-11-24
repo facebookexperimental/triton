@@ -8,14 +8,14 @@ from torch._inductor import config
 from torch._inductor.choices import InductorChoices
 from torch._inductor.utils import run_and_get_code
 from torch.nn.attention.flex_attention import AuxRequest, create_block_mask, flex_attention
-from triton._internal_testing import is_hip_gfx1250
+from triton._internal_testing import is_hip_cdna5
 from triton.tlx.ops.kernels.flash_attn._shapes import CORRECTNESS_SHAPES
 
 
 @pytest.fixture
 def runner(monkeypatch):
-    if not is_hip_gfx1250():
-        pytest.skip("requires gfx1250")
+    if not is_hip_cdna5():
+        pytest.skip("requires CDNA5")
     if not hasattr(InductorChoices, "append_flex_attention_choices"):
         pytest.skip("requires the FlexAttention choices hook")
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "tlx_benchmark"))

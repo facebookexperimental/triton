@@ -567,8 +567,11 @@ convertDotImpl(const LLVMTypeConverter &typeConverter,
     // the consumer warp group executes it while the cluster barrier expects
     // all threads.
     // - In non-TLX non-WS 2cta mode, we keep the cluster sync.
-    // Region::getParentOfType includes the region's own op, so an MMA directly
-    // in the warp_specialize default region counts as warp-specialized.
+    // The default region belongs to ttg.warp_specialize itself; the partition
+    // regions sit one level deeper, under ttg.warp_specialize.partitions.
+    // Region::getParentOfType includes the region's own op, so an MMA whose
+    // block is directly in the default region also counts. (Calling
+    // getParentOfType on the block's parent op would skip warp_specialize.)
     bool hasExplicitCTASync =
         tlxPairedMMA ||
         rewriter.getInsertionBlock()

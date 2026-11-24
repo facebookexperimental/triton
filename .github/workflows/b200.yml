@@ -84,7 +84,7 @@ jobs:
         uses: ./.github/actions/run-selected-tests
         with:
           suite: ${{ toJSON(fromJSON(inputs.plan).core) }}
-          workers: "4"
+          workers: "12"
           junit: /tmp/tlx-core.xml
           setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Run TLX tutorial correctness tests
@@ -94,7 +94,7 @@ jobs:
         uses: ./.github/actions/run-selected-tests
         with:
           suite: ${{ toJSON(fromJSON(inputs.plan).correctness) }}
-          workers: "4"
+          workers: "12"
           junit: /tmp/tlx-correctness.xml
           setup-script: ${{ env.SETUP_SCRIPT }}
       - name: Run device-agnostic TLX codegen tests
