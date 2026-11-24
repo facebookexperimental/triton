@@ -2092,16 +2092,21 @@ void init_triton_ir(py::module_ &m) {
              std::optional<mlir::Value> &lhs_scale, ScaleDotElemType lhs_format,
              mlir::Value &rhs, std::optional<mlir::Value> &rhs_scale,
              ScaleDotElemType rhs_format, bool fast_math, bool lhs_k_pack,
-             bool rhs_k_pack, mlir::Value &c, bool two_ctas) -> mlir::Value {
-            return self.create<DotScaledOp>(
+             bool rhs_k_pack, mlir::Value &c, bool two_ctas,
+             bool fp6_packed) -> mlir::Value {
+            mlir::Value result = self.create<DotScaledOp>(
                 c.getType(), lhs, rhs, c, lhs_scale.value_or(Value()),
                 rhs_scale.value_or(Value()), lhs_format, rhs_format, fast_math,
                 lhs_k_pack, rhs_k_pack, two_ctas);
+            if (fp6_packed)
+              result.getDefiningOp()->setAttr(
+                  "amdg.fp6_packed", mlir::UnitAttr::get(lhs.getContext()));
+            return result;
           },
           py::arg("lhs"), py::arg("lhs_scale").none(), py::arg("lhs_format"),
           py::arg("rhs"), py::arg("rhs_scale").none(), py::arg("rhs_format"),
           py::arg("fast_math"), py::arg("lhs_k_pack"), py::arg("rhs_k_pack"),
-          py::arg("c"), py::arg("two_ctas"))
+          py::arg("c"), py::arg("two_ctas"), py::arg("fp6_packed") = false)
       .def("create_floor",
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::FloorOp>(val);
