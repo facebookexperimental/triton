@@ -3,7 +3,7 @@ import argparse
 import torch
 import triton
 from triton._internal_testing import is_blackwell, is_hip_cdna4
-from triton.tlx.ops import mm_mxfp6, mm_mxfp8
+from triton.tlx.ops import mm_mxfp6, mm_mxfp
 from triton.tlx.ops.kernels.mm._shapes import FOCUS, SYNTHETIC
 
 # Benchmarks for the TLX MXFP6 GEMM op (A=E2M3, B=E3M2).
@@ -96,7 +96,7 @@ def _check_mxfp8_ones(m, n, k, device):
     a_scale = torch.full((m, k // 32), 127, device=device, dtype=torch.uint8).view(torch.float8_e8m0fnu)
     b_scale = torch.full((n, k // 32), 127, device=device, dtype=torch.uint8).view(torch.float8_e8m0fnu)
     out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
-    actual = mm_mxfp8(a, a_scale, b, b_scale, out=out, space="heuristic")
+    actual = mm_mxfp(a, a_scale, b, b_scale, out=out, space="heuristic")
     print(f"mxfp8-ones[{m},{n},{k}]: min={actual.float().min().item()} "
           f"max={actual.float().max().item()} mean={actual.float().mean().item()} (expect {k})")
     torch.testing.assert_close(actual.float(), torch.full((m, n), float(k), device=device), atol=1e-1, rtol=1e-2)
@@ -177,9 +177,9 @@ def _check_correct(m, n, k, device, space, compare_mxfp8=False):
           f"{(actual.float() - reference).abs().max().item():.4f}")
     if compare_mxfp8:
         a, b = _to_mxfp8(a, b)
-        actual = mm_mxfp8(a, a_scale, b, b_scale, out=out, space=space)
+        actual = mm_mxfp(a, a_scale, b, b_scale, out=out, space=space)
         torch.testing.assert_close(actual.float(), reference, atol=1e-1, rtol=1e-2)
-        print(f"OK  mm_mxfp8[{m}, {n}, {k}] space={space}: max err "
+        print(f"OK  mm_mxfp[{m}, {n}, {k}] space={space}: max err "
               f"{(actual.float() - reference).abs().max().item():.4f}")
 
 
@@ -241,7 +241,7 @@ def create_benchmark(shapes, space, warmup, rep, compare_mxfp8=False):
         op = mm_mxfp6
         if provider == "tlx_mxfp8":
             a, b = _to_mxfp8(a, b)
-            op = mm_mxfp8
+            op = mm_mxfp
         # With space="full" the first call autotunes (slow); do_bench warmup
         # covers it so only the best config is timed.
         fn = lambda: op(a, a_scale, b, b_scale, out=out, space=space)
@@ -273,7 +273,7 @@ if __name__ == "__main__":
     parser.add_argument("--negate-b", action="store_true",
                         help="with --ones, fill B with -1 (every output must equal -K)")
     parser.add_argument("--mxfp8-sanity", action="store_true",
-                        help="run the known-good mm_mxfp8 ones check instead (harness validation)")
+                        help="run the known-good mm_mxfp ones check instead (harness validation)")
     parser.add_argument("--probe", action="store_true", help="sweep single-element probes across K to map coverage")
     parser.add_argument("--probe-side", type=str, default="both", choices=["both", "a", "b"],
                         help="probe one side at a time (other side all ones)")
@@ -287,7 +287,7 @@ if __name__ == "__main__":
         print("Skipping benchmarks, no Blackwell or gfx950 GPU found.")
         raise SystemExit(0)
     if on_gfx950 and args.compare_mxfp8:
-        print("Skipping --compare-mxfp8 on gfx950: mm_mxfp8 has no gfx950 backend.")
+        print("Skipping --compare-mxfp8 on gfx950: mm_mxfp has no gfx950 backend.")
         raise SystemExit(0)
 
     if args.M is not None and args.N is not None and args.K is not None:

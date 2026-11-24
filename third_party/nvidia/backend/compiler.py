@@ -16,7 +16,7 @@ from triton._C.libtriton import ir, llvm, nvidia, passes, tlx
 from triton._instrumentation import instrument as _instrument, is_enabled
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.magnon.flags import apply_enabled as _compile_iq_apply_enabled
-from triton.runtime.errors import PTXASError
+from triton.runtime.errors import PTXASError, attach_shared_memory_breakdown
 from triton.tools.compile_trace import run_subprocess
 
 # Auto-TMA host-launcher caps. These MUST stay in lockstep with the C macros of
@@ -113,10 +113,7 @@ def min_dot_size(target: GPUTarget):
 
 
 def get_ptxas(arch: int) -> knobs.NvidiaTool:
-    if arch < 90:
-        return knobs.nvidia.ptxas
-    # The ptxas-blackwell name is misleading; keep it until legacy ptxas is removed.
-    return knobs.nvidia.ptxas_blackwell
+    return knobs.nvidia.ptxas
 
 
 @functools.lru_cache()
@@ -158,6 +155,8 @@ def get_ptx_version_from_options(options, arch: int):
     if ptx_version is None:
         cuda_version = get_ptxas(arch).version
         ptx_version = ptx_get_version(cuda_version)
+    if arch == 107 and ptx_version < 94:
+        raise ValueError("SM107 requires PTX 9.4 or later")
     return ptx_version
 
 
@@ -175,7 +174,7 @@ def get_features(options, arch: int):
     # To check if a newer PTX version is supported, increase this value
     # and run a test.  If it's not supported, LLVM will print a warning
     # like "+ptx8.4 is not a recognized feature for this target".
-    llvm_ptx_version = min(90, ptx_version)
+    llvm_ptx_version = min(94, ptx_version)
     features = f"+ptx{llvm_ptx_version}"
     return features
 
@@ -238,6 +237,14 @@ def _check_reg_auto_ws_alignment(name: str, value: Optional[int]) -> None:
 
 @dataclass(frozen=True)
 class CUDAOptions:
+    sr_launch: tuple = ()
+    sr_grid: int = 0
+    sr_mode: str = ""
+    sr_ownership: str = "checked"
+    sr_overflow: str = "satfinite"
+    sr_entropy: str = "element"
+    sr_site: str = ""
+    sr_rounds: int = 10
     num_warps: int = 4
     num_ctas: int = 1
     num_stages: int = 3
@@ -263,6 +270,8 @@ class CUDAOptions:
     )
     enable_fp_fusion: bool = True
     sched4reg: bool = False
+    # Disable LLVM loop strength reduction for this kernel's code generation.
+    disable_lsr: bool = False
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
     launch_cluster: bool = False  # Blackwell cluster launcher
@@ -414,6 +423,7 @@ class CUDABackend(BaseBackend):
 
         args = {"arch": knobs.runtime.override_arch or f"sm{self.target.arch}"}
         args.update({k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
+        args["sr_launch"] = tuple(tuple(item) for item in args.get("sr_launch", ()))
         if args.get("instrumentation_mode", ""):
             # Instrumentation can require more registers than the user-specified limit.
             args["maxnreg"] = None
@@ -873,6 +883,8 @@ class CUDABackend(BaseBackend):
             min_dot_size(self.target),
             "post_ast_lowering":
             post_ast_lowering,
+            "get_ptx_version":
+            functools.partial(get_ptx_version_from_options, options, self.target.arch),
         }
         return codegen_fns
 
@@ -894,6 +906,8 @@ class CUDABackend(BaseBackend):
 
             warnings.warn(warning_msg, stacklevel=2)
 
+        if opt.sr_mode == "enabled":
+            mod.set_attr("tt.sr_grid", ir.builder(mod.context).get_int32_attr(opt.sr_grid))
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)
@@ -914,6 +928,9 @@ class CUDABackend(BaseBackend):
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
+        passes.ttir.add_materialize_stochastic_rounding(pm, opt.sr_mode, opt.sr_site, opt.sr_rounds, capability,
+                                                        get_ptx_version_from_options(opt, capability), opt.sr_ownership,
+                                                        opt.sr_entropy)
         passes.ttir.add_triton_licm(pm)
         passes.ttir.add_uplift_while_to_for(pm)
         passes.common.add_canonicalizer(pm)
@@ -1428,13 +1445,9 @@ class CUDABackend(BaseBackend):
             raise RuntimeError(
                 "Address Sanitizer Error: Address sanitizer is currently only supported on the AMD backend")
         llvm_mod = llvm.to_module(mod, context)
-        if capability == 107:
-            cap_llvm = 100
-        else:
-            cap_llvm = capability
 
-        proc = sm_arch_from_capability(cap_llvm)
-        features = get_features(options, cap_llvm)
+        proc = sm_arch_from_capability(capability)
+        features = get_features(options, capability)
         triple = 'nvptx64-nvidia-cuda'
         flags = get_llvm_flags()
         llvm.attach_datalayout(llvm_mod, triple, proc, features, flags, abi="shortptr")
@@ -1445,12 +1458,18 @@ class CUDABackend(BaseBackend):
             paths = [path for (name, path) in options.extern_libs]
             llvm.link_extern_libs(llvm_mod, paths)
 
-        # Work around ptxas rejecting PTX generated by the LLVM SLP vectorizer on sm_80.
+        # Opt in to LLVM SLP instead of the target-aware NVPTX vectorizer.
+        use_slp_vectorizer = knobs.nvidia.use_slp_vectorizer
         llvm.optimize_module(
-            llvm_mod, llvm.OPTIMIZE_O3,
+            llvm_mod,
+            llvm.OPTIMIZE_O3,
             # Same LLVM flags as make_ptx: compilations sharing a process only
             # run in parallel while their flag sets are identical.
-            flags=flags, disable_slp_vectorizer=capability == 80, expand_masked_div_rem=True)
+            flags=flags,
+            disable_slp_vectorizer=(capability == 80) or (not use_slp_vectorizer),
+            expand_masked_div_rem=True,
+            nvptx_compute_capability=0 if use_slp_vectorizer else capability,
+        )
 
         # Get some metadata
         # warp-specialization mutates num_warps
@@ -1463,6 +1482,7 @@ class CUDABackend(BaseBackend):
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment") or 1
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0
         metadata["profile_scratch_align"] = src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1
+        attach_shared_memory_breakdown(src, metadata)
 
         # Add Triton and LLVM versions to the dumped IR.
         if knobs.compilation.dump_ir:
@@ -1477,13 +1497,8 @@ class CUDABackend(BaseBackend):
 
         triple = "nvptx64-nvidia-cuda"
 
-        if capability == 107:
-            cap_llvm = 100
-        else:
-            cap_llvm = capability
-
-        proc = sm_arch_from_capability(cap_llvm)
-        features = get_features(opt, cap_llvm)
+        proc = sm_arch_from_capability(capability)
+        features = get_features(opt, capability)
         flags = get_llvm_flags()
         if opt.enable_nvptx_v2i32:
             flags.append("nvptx-v2i32")

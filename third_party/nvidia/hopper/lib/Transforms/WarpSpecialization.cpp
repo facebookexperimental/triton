@@ -47,6 +47,28 @@ static OpPrintingFlags getOpPrintingFlagsWithLoc() {
   return flags;
 }
 
+// Returns an MMAv5 accumulator user nested in a region of the MMA's scf.for
+// (e.g. a flattened loop's epilogue tmem_load in an scf.if), or null.
+// handleOperandD treats every non-direct-child user as coming after the loop.
+static Operation *findNestedOperandDUser(triton::FuncOp funcOp) {
+  namespace ttng = triton::nvidia_gpu;
+  Operation *nestedUser = nullptr;
+  funcOp.walk([&](ttng::MMAv5OpInterface mmaOp) {
+    auto allocOp = mmaOp.getAccumulator().getDefiningOp<ttng::TMEMAllocOp>();
+    auto forOp = mmaOp->getParentOfType<scf::ForOp>();
+    if (!allocOp || !forOp)
+      return WalkResult::advance();
+    for (Operation *user : allocOp.getResult().getUsers()) {
+      if (user->getParentOp() != forOp && forOp->isProperAncestor(user)) {
+        nestedUser = user;
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  return nestedUser;
+}
+
 static LogicalResult cleanupWarpSpecializedLoops(Operation *op) {
   runDeadIterArgElimination(op);
   RewritePatternSet patterns(op->getContext());
@@ -192,6 +214,14 @@ public:
       return bailOut(funcOp);
     }
 
+    // A register-staged MMA operand is written and read asynchronously by the
+    // MMA's own partition with no barrier between them.
+    if (hasRegisterStagedMMAOperand(funcOp)) {
+      LDBG("Warp specialization does not support register-staged MMA "
+           "operands. Skipping.");
+      return bailOut(funcOp);
+    }
+
     // Code partitioning cannot yet place communication channels in both sides
     // of an IfOp. An IfOp whose complete then/else region belongs to one task
     // does not need such a channel, however, and specialization already knows
@@ -212,6 +242,14 @@ public:
     if (hasUnsupportedElse) {
       LDBG("Warp specialization only supports else blocks contained in one "
            "task. Skipping.");
+      return bailOut(funcOp);
+    }
+
+    if (Operation *nestedUser = findNestedOperandDUser(funcOp)) {
+      nestedUser->emitWarning(
+          "meta autoWS does not support an MMA accumulator used inside a "
+          "nested region of its loop (e.g. a flattened persistent loop); "
+          "compiling without warp specialization");
       return bailOut(funcOp);
     }
 

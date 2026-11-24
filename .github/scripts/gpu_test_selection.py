@@ -707,12 +707,15 @@ def main():
                 for suite in groups.values():
                     suite["files"] = []
         selection_note = f"Manual platform list: {','.join(platforms)}. Other platforms are not covered by this run."
-    for suite in plan["gpu"]["b200"].values():
-        suite["files"] = []
+    skipped = [platform for platform in plan["gpu"] if platform in os.environ.get("GPU_CI_SKIP_PLATFORMS", "")]
+    for platform in skipped:
+        for suite in plan["gpu"][platform].values():
+            suite["files"] = []
     plan["build"] = any(suite["files"] for groups in plan["gpu"].values() for suite in groups.values())
-    disabled_note = "B200 temporarily disabled: runner offline; this run does not cover B200."
-    selection_note = (selection_note + "\n\n" if selection_note else "") + disabled_note
-    print(f"::warning::{disabled_note}")
+    if skipped:
+        skip_note = f"GPU_CI_SKIP_PLATFORMS skips {','.join(skipped)}; this run does not cover them."
+        selection_note = (selection_note + "\n\n" if selection_note else "") + skip_note
+        print(f"::warning::{skip_note}")
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     print(json.dumps(plan, indent=2))
     selection = {platform: any(step["files"] for step in steps.values()) for platform, steps in plan["gpu"].items()}

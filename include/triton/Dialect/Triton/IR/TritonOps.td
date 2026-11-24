@@ -308,6 +308,20 @@ def TT_StoreOp
   let hasCanonicalizer = 1;
 }
 
+def TT_SrStoreOp : TT_Op<"sr_store", [SameOperandsShape,
+    SameOperandsEncoding]> {
+  let summary = "Validated single-site FP32 to BF16 stochastic store";
+  let arguments = (ins Arg<TT_PtrLike, "", [MemWrite<GlobalMemory>]>:$ptr,
+      TT_FloatLike:$value, TT_I64Like:$logical_index,
+      Optional<TT_BoolLike>:$mask, StrAttr:$site,
+      DefaultValuedAttr<I32Attr, "0">:$site_id,
+      DefaultValuedAttr<TT_CacheModifierAttr, "triton::CacheModifier::NONE">:$cache,
+      DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict);
+  let assemblyFormat = "$ptr `,` $value `,` $logical_index (`,` $mask^)? "
+      "attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 //
 // Atomic Ops
 //
@@ -781,10 +795,9 @@ def TT_DotScaledOp
     }];
 
   let arguments = (ins
-      // inputs are floats if we have a type for them, otherwise (fp4),
-      // they are packed in pairs in an I8Tensor
-      RankedTensorOf<[TT_Float, I8]>:$a,
-      RankedTensorOf<[TT_Float, I8]>:$b, TT_FloatTensor:$c,
+      // FP4 inputs are packed pairs, with I8Tensor retained for compatibility.
+      RankedTensorOf<[TT_Float, I8, TT_FP4E2M1x2]>:$a,
+      RankedTensorOf<[TT_Float, I8, TT_FP4E2M1x2]>:$b, TT_FloatTensor:$c,
       Optional<RankedTensorOf<[TT_Float, I8]>>:$a_scale,
       Optional<RankedTensorOf<[TT_Float, I8]>>:$b_scale,
       TT_ScaleDotElemTypeAttr:$a_elem_type,

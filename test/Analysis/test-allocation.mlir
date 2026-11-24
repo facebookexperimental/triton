@@ -1,5 +1,6 @@
-// RUN: triton-opt %s -allow-unregistered-dialect -test-print-allocation -verify-diagnostics -o /dev/null
-// RUN: triton-opt %s -allow-unregistered-dialect -test-print-allocation="get-scratch-size-function=ValidConstant" 2>&1 | FileCheck %s --check-prefix=CHECK-128
+// RUN: env TRITON_USE_META_WS=0 triton-opt %s -allow-unregistered-dialect -test-print-allocation -verify-diagnostics -o /dev/null
+// RUN: env TRITON_USE_META_WS=0 triton-opt %s -allow-unregistered-dialect -test-print-allocation="get-scratch-size-function=ValidConstant" 2>&1 | FileCheck %s --check-prefix=CHECK-128
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s -allow-unregistered-dialect -test-print-allocation -o /dev/null 2>&1 | FileCheck %s --check-prefix=META
 
 // Check there are no lines with a size different to 128 and we have at least a line with size 128.
 
@@ -936,6 +937,45 @@ tt.func @two_different_ws() {
     ttg.local_alloc : () -> !ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>
     ttg.warp_return
   } : () -> ()
+  tt.return
+}
+
+// Without MetaWS, sequential warp-specialize operations reuse explicit
+// buffers. MetaWS retains conservative explicit-buffer lifetimes. Capture
+// scratch remains operation-local in both modes.
+// META-LABEL: sequential_warp_specialize_liveness
+// META: offset = 0, size = 16
+// META: scratch offset = 32, size = 12
+// META: offset = 16, size = 16
+// META: scratch offset = 0, size = 12
+// META: size = 45
+// expected-remark @below {{sequential_warp_specialize_liveness}}
+// expected-remark @below {{size = 29}}
+// expected-remark @below {{scratch offset = 28, size = 1}}
+tt.func @sequential_warp_specialize_liveness() {
+  // expected-remark @below {{offset = 0, size = 16}}
+  %first = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>
+  // expected-remark @below {{scratch offset = 16, size = 12}}
+  ttg.warp_specialize(%first)
+  default {
+    ttg.warp_yield
+  }
+  partition0(%arg0: !ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>) num_warps(1) {
+    "use"(%arg0) : (!ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>) -> ()
+    ttg.warp_return
+  } : (!ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>) -> ()
+
+  // expected-remark @below {{offset = 0, size = 16}}
+  %second = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>
+  // expected-remark @below {{scratch offset = 16, size = 12}}
+  ttg.warp_specialize(%second)
+  default {
+    ttg.warp_yield
+  }
+  partition0(%arg0: !ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>) num_warps(1) {
+    "use"(%arg0) : (!ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>) -> ()
+    ttg.warp_return
+  } : (!ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>) -> ()
   tt.return
 }
 
