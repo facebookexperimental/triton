@@ -600,7 +600,13 @@ static PyObject *fillTMADescriptorTiled(PyObject *self, PyObject *args) {
   blockSizeFast = PySequence_Fast(blockSize, "blockSize must be a sequence");
   if (!blockSizeFast)
     goto cleanup;
-  int rank = PySequence_Fast_GET_SIZE(blockSizeFast);
+  Py_ssize_t blockRank = PySequence_Fast_GET_SIZE(blockSizeFast);
+  if (blockRank < 1 || blockRank > 5) {
+    PyErr_SetString(PyExc_ValueError,
+                    "tensor map rank must be between 1 and 5");
+    goto cleanup;
+  }
+  int rank = (int)blockRank;
 
   for (int i = 0; i < rank; ++i) {
     PyObject *item = PySequence_Fast_GET_ITEM(blockSizeFast, i);
