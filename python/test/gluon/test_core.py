@@ -1269,6 +1269,37 @@ def test_async_copy_mbarrier(copy_vec, cache_policy):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer")
+@pytest.mark.parametrize("num_ctas", [2, 4])
+@pytest.mark.parametrize("batch", [2, 4])
+@pytest.mark.parametrize("two_ctas, simultaneous", [(False, False), (True, False), (False, True)])
+def test_mbarrier_dynamic_index_gsan(fresh_knobs, num_ctas, two_ctas, batch, simultaneous):
+    from triton.experimental.gsan import create_mem_pool
+
+    @gluon.jit
+    def kernel(BATCH: ttgl.constexpr, TWO_CTAS: ttgl.constexpr, SIMULTANEOUS: ttgl.constexpr):
+        barriers = mbarrier.allocate_mbarrier(batch=BATCH, two_ctas=TWO_CTAS)
+        if SIMULTANEOUS:
+            for i in range(BATCH):
+                mbarrier.init(barriers.index(i), count=1)
+            for i in range(BATCH):
+                barrier = barriers.index(i)
+                mbarrier.arrive(barrier)
+                mbarrier.wait(barrier, phase=0)
+                mbarrier.invalidate(barrier)
+        else:
+            for repeat in range(2):
+                for i in range(BATCH):
+                    barrier = barriers.index(i)
+                    mbarrier.init(barrier, count=1)
+                    mbarrier.invalidate(barrier)
+
+    triton.knobs.compilation.instrumentation_mode = "gsan"
+    with torch.cuda.use_mem_pool(create_mem_pool()):
+        kernel[(1, )](batch, two_ctas, simultaneous, num_warps=1, num_ctas=num_ctas)
+        torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer")
 def test_warp_specialize_noinline_ids():
 
     @gluon.jit
@@ -4105,7 +4136,8 @@ def test_packed_arith_reduction(dtype):
     torch.testing.assert_close(out_b, b.sum(dim=1), atol=0, rtol=0)
     suffix = {torch.float32: "f32x2", torch.float16: "f16x2", torch.bfloat16: "bf16x2"}[dtype]
     assert "ttng.packed_arith add" in compiled.asm["ttgir"]
-    assert f"add.{suffix}" in compiled.asm["ptx"]
+    modifier = "" if dtype == torch.float32 else ".rn"
+    assert f"add{modifier}.{suffix}" in compiled.asm["ptx"]
     if dtype == torch.float32:
         assert "prmt.b32" not in compiled.asm["ptx"]
 
@@ -4178,7 +4210,7 @@ def test_packed_arith(op, dtype):
     torch.testing.assert_close(ref, out, atol=tolerance, rtol=tolerance)
 
     suffix = {torch.float32: "f32x2", torch.float16: "f16x2", torch.bfloat16: "bf16x2"}[dtype]
-    modifier = ".rn" if op_name == "fma" else ""
+    modifier = ".rn" if op_name == "fma" or (dtype != torch.float32 and op_name in ("add", "sub")) else ""
     assert f"{op_name}{modifier}.{suffix}" in compiled.asm["ptx"]
     assert f"ttng.packed_arith {op_name}" in compiled.asm["ttgir"]
 
@@ -4893,6 +4925,62 @@ def test_convert_auto_layout_to_coalesced_layout():
         XBLOCK, YBLOCK, num_warps=4)
 
     torch.testing.assert_close(output, ref)
+
+
+@pytest.mark.skipif(not is_ampere_or_newer(), reason="Requires Ampere or newer")
+@pytest.mark.parametrize("operation", ["ld", "st"])
+@pytest.mark.parametrize("dtype, transpose, reg_bases, lane_bases", [
+    pytest.param(torch.int8, True, [128, 32, 64, 8, 512, 1024], [16, 256, 1, 2, 4], id="b8-transpose-nonadditive"),
+    pytest.param(torch.int8, True, [32, 64, 8, 128, 512], [16, 256, 1, 2, 4], id="b8-transpose-load-packed"),
+    pytest.param(torch.int8, True, [32, 8, 64, 128, 512], [16, 256, 1, 2, 4], id="b8-transpose-store-packed"),
+    pytest.param(torch.float16, True, [8], [16, 32, 1, 2, 4], id="b16-transpose-x1"),
+    pytest.param(torch.float16, True, [64, 32, 128, 256], [8, 16, 1, 2, 4], id="b16-transpose-bank-conflict"),
+    pytest.param(torch.int8, False, [128, 1, 2, 256, 512], [4, 8, 16, 32, 64], id="b8-packed"),
+    pytest.param(torch.float16, False, [64, 1, 128, 256], [2, 4, 8, 16, 32], id="b16"),
+    pytest.param(torch.float32, False, [32, 64, 128], [1, 2, 4, 8, 16], id="b32"),
+])
+def test_ldstmatrix_register_order(operation, dtype, transpose, reg_bases, lane_bases):
+    is_b8 = dtype == torch.int8 and transpose
+    if operation == "st" and torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("stmatrix requires SM90 or newer")
+    if is_b8 and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("ldmatrix/stmatrix.b8 requires SM100 or newer")
+
+    @gluon.jit
+    def kernel(inp, out, N: ttgl.constexpr, store_layout: ttgl.constexpr, load_layout: ttgl.constexpr,
+               shared_layout: ttgl.constexpr):
+        offsets = ttgl.arange(0, N, layout=store_layout)
+        values = ttgl.load(inp + offsets)
+        smem = ttgl.allocate_shared_memory(inp.dtype.element_ty, [N], shared_layout)
+        smem.store(values)
+        values = smem.load(load_layout)
+        offsets = ttgl.arange(0, N, layout=load_layout)
+        ttgl.store(out + offsets, values)
+
+    size = 32 << len(reg_bases)
+    shared_bases = [[1 << i] for i in range(size.bit_length() - 1)]
+    if size > 512:
+        # Exercise composition with the additive-stride register permutation.
+        shared_bases[9][0] ^= 16
+    shared_layout = ttgl.SharedLinearLayout(shared_bases)
+    layout = ttgl.DistributedLinearLayout(reg_bases=[[b] for b in reg_bases], lane_bases=[[b] for b in lane_bases],
+                                          warp_bases=[], block_bases=[], shape=[size])
+    blocked = ttgl.BlockedLayout([1], [32], [1], [0])
+    store_layout, load_layout = (layout, blocked) if operation == "st" else (blocked, layout)
+    inp = torch.randint(0, 127, (size, ), dtype=torch.int32, device="cuda").to(dtype)
+    out = torch.empty_like(inp)
+    compiled = kernel[(1, )](inp, out, size, store_layout, load_layout, shared_layout, num_warps=1)
+    torch.testing.assert_close(out, inp, atol=0, rtol=0)
+
+    shape, bitwidth = "m8n8", 16
+    if is_b8:
+        shape, bitwidth = ("m16n16", 8) if operation == "ld" else ("m16n8", 8)
+    bytes_per_matrix = 256 if is_b8 and operation == "ld" else 128
+    total_bytes = size * inp.element_size()
+    count = min(total_bytes, 512) // bytes_per_matrix
+    trans = r"\.trans" if transpose else ""
+    opcode = rf"{operation}matrix\.sync\.aligned\.(?:{shape}\.x{count}|x{count}\.{shape}){trans}\.shared\.b{bitwidth}"
+    assert len(re.findall(opcode, compiled.asm["ptx"])) == total_bytes // (bytes_per_matrix * count)
 
 
 @gluon.jit

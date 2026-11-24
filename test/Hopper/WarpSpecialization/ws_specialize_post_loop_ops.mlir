@@ -164,3 +164,39 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return
   }
 }
+
+// -----
+
+// An untagged post-loop store followed by an untagged load of the same buffer
+// that a specialized op depends on: the load has to stay ahead of the
+// warp_specialize op, so the store stays ahead too, or the load would read the
+// buffer before the store writes it. Both are reported. The specialized user
+// touches no memory, so only the pinned load keeps the store ahead.
+
+// CHECK-LABEL: @post_loop_store_before_pinned_load
+// CHECK: tt.store %arg0
+// CHECK: ttg.warp_specialize
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @post_loop_store_before_pinned_load(%a: tensor<128x!tt.ptr<f32>, #blocked>, %b: tensor<128x!tt.ptr<f32>, #blocked>, %out: tensor<128x!tt.ptr<f32>, #blocked>, %n: index) {
+    %c0 = arith.constant {async_task_id = array<i32: 0, 1>} 0 : index
+    %c1 = arith.constant {async_task_id = array<i32: 0, 1>} 1 : index
+    %one = arith.constant {async_task_id = array<i32: 0>} dense<1.0> : tensor<128xf32, #blocked>
+    %alloc = ttg.local_alloc {async_task_id = array<i32: 0>, buffer.copy = 1 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128xf32, #shared, #smem, mutable>
+    scf.for %iv = %c0 to %n step %c1 {
+      tt.store %b, %one {async_task_id = array<i32: 0>} : tensor<128x!tt.ptr<f32>, #blocked>
+      ttg.local_store %one, %alloc {async_task_id = array<i32: 0>} : tensor<128xf32, #blocked> -> !ttg.memdesc<128xf32, #shared, #smem, mutable>
+      %loaded = ttg.local_load %alloc {async_task_id = array<i32: 1>} : !ttg.memdesc<128xf32, #shared, #smem, mutable> -> tensor<128xf32, #blocked>
+      tt.store %b, %loaded {async_task_id = array<i32: 1>} : tensor<128x!tt.ptr<f32>, #blocked>
+    } {async_task_id = array<i32: 0, 1>, tt.warp_specialize, ttg.partition.stages = [0 : i32, 0 : i32], ttg.partition.types = ["compute", "compute"]}
+    // DIAG: ws_specialize_post_loop_ops.mlir:[[@LINE+1]]:{{.*}} warning: {{.*}}stays ahead of the partitions
+    tt.store %a, %one : tensor<128x!tt.ptr<f32>, #blocked>
+    // DIAG: ws_specialize_post_loop_ops.mlir:[[@LINE+1]]:{{.*}} warning: {{.*}}stays ahead of the partitions
+    %v = tt.load %a : tensor<128x!tt.ptr<f32>, #blocked>
+    %w = arith.addf %v, %one {async_task_id = array<i32: 0>} : tensor<128xf32, #blocked>
+    tt.return
+  }
+}

@@ -744,8 +744,10 @@ static bool mayConflict(Operation *a, Operation *b) {
 // they have to run after the partitions finish: move them after `wsOp`. An
 // untagged op has to stay ahead of `wsOp` when a specialized op depends on it
 // (directly or through other untagged ops), or when moving it past a later
-// specialized op may reorder their memory accesses. Warn if such an op
-// touches memory, since it then runs before the loop's writes land.
+// specialized op, or past a later untagged op that has to stay ahead, may
+// reorder their memory accesses. The walk runs back to front, so the ops after
+// `op` are all decided by the time `op` is. Warn if such an op touches memory,
+// since it then runs before the loop's writes land.
 static void moveUntaggedPostLoopOps(Block *block, ttg::WarpSpecializeOp wsOp,
                                     const DenseSet<Operation *> &opsInList) {
   auto loopIt = llvm::find_if(*block, [](Operation &op) {
@@ -774,12 +776,13 @@ static void moveUntaggedPostLoopOps(Block *block, ttg::WarpSpecializeOp wsOp,
           Operation *user = block->findAncestorOpInBlock(*u);
           return user && (opsInList.count(user) || pinned.count(user));
         });
-    bool conflictsWithLaterSpecializedOp = llvm::any_of(
+    bool conflictsWithLaterPinnedOrSpecializedOp = llvm::any_of(
         llvm::make_range(std::next(op->getIterator()), wsOp->getIterator()),
         [&](Operation &later) {
-          return opsInList.count(&later) && mayConflict(op, &later);
+          return (opsInList.count(&later) || pinned.count(&later)) &&
+                 mayConflict(op, &later);
         });
-    if (neededBySpecializedOp || conflictsWithLaterSpecializedOp)
+    if (neededBySpecializedOp || conflictsWithLaterPinnedOrSpecializedOp)
       pinned.insert(op);
   }
 
@@ -790,9 +793,10 @@ static void moveUntaggedPostLoopOps(Block *block, ttg::WarpSpecializeOp wsOp,
     }
     if (tt::mayReadOrWriteMemory(op))
       op->emitWarning("this op runs after the warp-specialized loop but a "
-                      "later warp-specialized op depends on it or may access "
-                      "the same memory, so it stays ahead of the partitions "
-                      "and may not see the loop's writes");
+                      "later op (warp-specialized, or itself kept ahead of the "
+                      "partitions) depends on it or may access the same "
+                      "memory, so it stays ahead of the partitions and may "
+                      "not see the loop's writes");
   }
 }
 
