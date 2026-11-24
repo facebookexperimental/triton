@@ -5,6 +5,7 @@ import shutil
 import sys
 import triton
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from triton._C.libtriton import get_cache_invalidating_env_vars  # type: ignore[attr-defined]
 from triton._internal_testing import is_hip
 
@@ -74,7 +75,7 @@ def test_knobs_utils(fresh_knobs) -> None:
     }
 
 
-# Beta enables expert scheduling on gfx1250 by default; upstream does not.
+# Beta enables expert scheduling on CDNA5 by default; upstream does not.
 @pytest.mark.parametrize(
     ("arch", "enable_fp_fusion", "disable_opt", "expected_flags", "disable_optimization", "extra_options"), [
         ("gfx90a", True, None, [], False, {}),
@@ -340,6 +341,74 @@ def test_nvidia_register_pressure_scheduler_concurrent():
     assert results == [expected[policy] for policy in scheduling_policies]
 
 
+def _loop_strength_reduction_kernel():
+    from triton.backends.compiler import GPUTarget
+    from triton.backends.nvidia import compiler
+
+    compiler.llvm.init_targets()
+    backend = compiler.CUDABackend(GPUTarget("cuda", 90, 32))
+    source = '''
+target triple = "nvptx64-nvidia-cuda"
+define ptx_kernel void @lsr_kernel(ptr addrspace(1) %out, i64 %stride, i64 %count) {
+entry:
+  %empty = icmp eq i64 %count, 0
+  br i1 %empty, label %exit, label %loop
+loop:
+  %i = phi i64 [0, %entry], [%next, %loop]
+  %index = mul i64 %i, %stride
+  %ptr = getelementptr i32, ptr addrspace(1) %out, i64 %index
+  %value = trunc i64 %i to i32
+  store i32 %value, ptr addrspace(1) %ptr, align 4
+  %next = add nuw i64 %i, 1
+  %done = icmp eq i64 %next, %count
+  br i1 %done, label %exit, label %loop
+exit:
+  ret void
+}
+'''
+    return backend, source
+
+
+@pytest.mark.skipif(is_hip(), reason="NVPTX code generation is unavailable on AMD")
+def test_nvidia_lsr_hook():
+    backend, source = _loop_strength_reduction_kernel()
+    default_options = backend.parse_options({"ptx_version": 80})
+    enabled_options = backend.parse_options({"ptx_version": 80, "disable_lsr": False})
+    disabled_options = backend.parse_options({"ptx_version": 80, "disable_lsr": True})
+
+    assert default_options.hash() == enabled_options.hash()
+    assert enabled_options.hash() != disabled_options.hash()
+    enabled = backend.make_ptx(source, {}, enabled_options, 90)
+    disabled = backend.make_ptx(source, {}, disabled_options, 90)
+    assert enabled != disabled
+    assert backend.make_ptx(source, {}, default_options, 90) == enabled
+
+
+@pytest.mark.skipif(is_hip(), reason="NVPTX code generation is unavailable on AMD")
+def test_nvidia_lsr_concurrent():
+    backend, source = _loop_strength_reduction_kernel()
+
+    def emit(policy):
+        disable_lsr, sched4reg = policy
+        options = backend.parse_options({"ptx_version": 80, "disable_lsr": disable_lsr, "sched4reg": sched4reg})
+        return backend.make_ptx(source, {}, options, 90)
+
+    policies = [(False, False), (True, False), (False, True), (True, True)]
+    expected = {policy: emit(policy) for policy in policies}
+    assert expected[False, False] != expected[True, False]
+    barrier = Barrier(8, timeout=30)
+
+    def concurrent_emit(policy):
+        barrier.wait()
+        return emit(policy)
+
+    policies *= 8
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(concurrent_emit, policies))
+    assert results == [expected[policy] for policy in policies]
+    assert emit((False, False)) == expected[False, False]
+
+
 def test_knobs_scope(fresh_knobs, monkeypatch):
     fresh_knobs.amd.use_buffer_atomics = True
 
@@ -566,7 +635,7 @@ def test_amd_llvm_options_concurrent():
 
     compiler.llvm.init_targets()
     source = _amd_scheduler_kernel()
-    # gfx950 codegen needs a process-wide LLVM option that gfx1250 codegen must
+    # gfx950 codegen needs a process-wide LLVM option that CDNA5 codegen must
     # not see, and every HSACO link resets all LLVM options.
     backends = {
         arch: compiler.HIPBackend(GPUTarget("hip", arch, warp_size))
