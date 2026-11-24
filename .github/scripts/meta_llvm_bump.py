@@ -223,16 +223,15 @@ def verdict(latest):
     return "ready" if all(run["conclusion"] == "success" for run in latest.values()) else "failed"
 
 
-def candidate_text(kind, old, source, validation_run, base_sha):
+def candidate_text(kind, old, source, ready_url, base_sha):
     """Draft-candidate text in the updater's Summary/Test Plan format."""
     sha, build = source['llvm_sha'], source['build_number']
-    path = 'cmake/meta-amd-llvm-info.json' if kind == 'amd' else 'cmake/meta-llvm-info.json'
     title = f'[Meta LLVM] {kind} bundle candidate: {old["llvm_hash"][:8]} to {sha[:8]}'
-    problem = (f'Triton main selects the {kind} SDK at {old["llvm_hash"][:12]}. The tracked LLVM branch has a newer '
-               'validated bundle, but its compatibility with the Triton consumer has not yet been checked.')
+    problem = (
+        f'Triton at {base_sha[:12]} selects the {kind} SDK at {old["llvm_hash"][:12]}. The tracked LLVM branch has '
+        'a validated bundle that has not yet been checked with this Triton consumer.')
     solution = 'This proposes the published SDK as a draft candidate for consumer correctness and performance validation.'
-    command = f'$ python3 -m json.tool {path} >/dev/null'
-    test = 'JSON parse and published source/archive digest checks passed.'
+    test = 'The source, tree and platform digests match the published SDK validation record.'
     marker = f'<!-- llvm-candidate beta/{kind}/{sha}/{build}/{base_sha} -->'
     body = '\n'.join([
         '# Summary:',
@@ -247,15 +246,11 @@ def candidate_text(kind, old, source, validation_run, base_sha):
         '',
         '# Test Plan:',
         '',
-        'The source, tree and platform digests match the published SDK validation record.',
-        '',
-        '```',
-        command,
         test,
-        '```',
         '',
-        *_job_block([('Published SDK validation', validation_run), ('Triton correctness', 'Not run'),
-                     ('A/B performance', 'Not run')]),
+        f'SDK validation provenance: [completion record]({ready_url}).',
+        '',
+        *_job_block([('Triton correctness', 'Not run'), ('A/B performance', 'Not run')]),
         '',
         'Source comparison: ' + compare_url('facebookexperimental/llvm-project', old['llvm_hash'], sha) + '.',
         '',
@@ -275,8 +270,7 @@ def candidate_text(kind, old, source, validation_run, base_sha):
         '',
         'Test Plan:',
         '',
-        command,
-        test,
+        textwrap.fill(test, 72),
         'Consumer correctness and performance checks have not run.',
     ])
     return title, commit, body

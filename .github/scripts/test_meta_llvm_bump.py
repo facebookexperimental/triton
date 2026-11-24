@@ -336,7 +336,7 @@ def _ready_fixture(kind):
 @pytest.mark.parametrize('kind', ['core', 'amd'])
 def test_ready_issue_requires_complete_validated_publication(monkeypatch, kind):
     import meta_llvm_ready as ready
-    from select_meta_llvm_builds import branch_requests
+    from select_meta_llvm_builds import pending_builds
 
     assets, receipt, candidate = _ready_fixture(kind)
     writes = []
@@ -352,7 +352,7 @@ def test_ready_issue_requires_complete_validated_publication(monkeypatch, kind):
     monkeypatch.setattr(ready, 'read_json_asset', lambda *args: receipt)
     monkeypatch.setattr(ready.subprocess, 'run', lambda *args, **kwargs: writes.append(args))
     monkeypatch.setattr(ready, 'release_assets', lambda *args: ({'id': 1}, assets))
-    assert branch_requests({kind: _branch_tip()}, assets, BRANCH_PLATFORMS) == []
+    assert pending_builds(ready.REPOSITORY, [candidate], assets, BRANCH_PLATFORMS) == []
     assert ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS) == existing_url
 
     for missing in assets:
@@ -361,10 +361,8 @@ def test_ready_issue_requires_complete_validated_publication(monkeypatch, kind):
         for digest in (None, 'sha256:' + hashlib.sha256(b'').hexdigest()):
             variants.append(partial + [dict(missing, state='starter', size=0, digest=digest)])
         for incomplete in variants:
-            expected = [] if missing['name'].endswith('.ready.json') else [{
-                'kind': kind, 'llvm_sha': NEW, 'build_number': '1'
-            }]
-            assert branch_requests({kind: _branch_tip()}, incomplete, BRANCH_PLATFORMS) == expected
+            expected = [{'kind': kind, 'llvm_sha': NEW, 'build_number': '1'}]
+            assert pending_builds(ready.REPOSITORY, [candidate], incomplete, BRANCH_PLATFORMS) == expected
             monkeypatch.setattr(ready, 'release_assets', lambda *args: ({'id': 1}, incomplete))
             with pytest.raises(ready.BundleNotReady):
                 ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS)
@@ -473,3 +471,36 @@ def test_failed_intent_upload_cannot_adopt_an_earlier_claim(monkeypatch):
     with pytest.raises(subprocess.CalledProcessError):
         ready.claim_issue_creation(ready.REPOSITORY, 'amd', NEW, 1, marker)
     assert len(calls) == 1 and calls[0][:3] == ['gh', 'release', 'upload']
+
+
+def test_explicit_validation_is_not_skipped_for_a_complete_bundle(monkeypatch):
+    import meta_llvm_ready as ready
+    from select_meta_llvm_builds import pending_builds
+    assets, receipt, candidate = _ready_fixture('amd')
+    monkeypatch.setattr(ready, 'read_json_asset', lambda *args: receipt)
+    assert pending_builds(ready.REPOSITORY, [candidate], assets, BRANCH_PLATFORMS) == []
+    assert pending_builds(ready.REPOSITORY, [candidate], assets, BRANCH_PLATFORMS,
+                          validate_existing=True) == [{'kind': 'amd', 'llvm_sha': NEW, 'build_number': '1'}]
+
+
+def test_closed_candidate_is_not_recreated_on_retry(monkeypatch):
+    import meta_llvm_ready as ready
+    assets, receipt, candidate = _ready_fixture('amd')
+    base = 'b' * 40
+    monkeypatch.setattr(ready, 'validated_candidate', lambda *args: ({a['name']: a for a in assets}, receipt))
+    monkeypatch.setattr(ready, 'read_manifest', lambda *args: dict(META))
+    calls = []
+
+    def api(path, **kwargs):
+        calls.append(kwargs)
+        if '/compare/' in path:
+            return {'status': 'ahead'}
+        if '/git/ref/' in path:
+            return None
+        assert '/pulls?' in path
+        return [[{'state': 'closed', 'draft': True}]]
+
+    monkeypatch.setattr(ready, 'github_json', api)
+    with pytest.raises(ValueError, match='closed or changed'):
+        ready.ensure_candidate_pr(ready.REPOSITORY, candidate, BRANCH_PLATFORMS, base)
+    assert all('method' not in call for call in calls)

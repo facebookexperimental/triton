@@ -26,20 +26,23 @@ def build_requests(paths, root=Path('.')):
     return requests
 
 
-def branch_requests(tips, assets, platforms):
-    assets = published_assets(assets)
+def pending_builds(repo, candidates, raw_assets, platforms, validate_existing=False):
+    from meta_llvm_ready import ready_receipt
+
+    assets = published_assets(raw_assets)
     requests = []
-    for kind, tip in tips.items():
-        sha, tree = tip['sha'], tip['commit']['tree']['sha']
+    for candidate in candidates:
+        kind, sha, tree, build = candidate['kind'], candidate['llvm_sha'], candidate['llvm_tree'], int(
+            candidate['build_number'])
         if re.fullmatch(r'[0-9a-f]{40}', sha) is None:
-            raise ValueError(f'{BRANCHES[kind]}: expected a full immutable LLVM SHA')
-        if not bundle_complete(kind, sha, tree, assets, platforms):
-            requests.append({'kind': kind, 'llvm_sha': sha, 'build_number': str(BUILD_NUMBER)})
+            raise ValueError(f'{kind}: expected a full immutable LLVM SHA')
+        if (validate_existing or not bundle_complete(kind, sha, tree, assets, platforms, build)
+                or ready_receipt(repo, kind, sha, tree, build, assets, platforms) is None):
+            requests.append({key: candidate[key] for key in ('kind', 'llvm_sha', 'build_number')})
     return requests
 
 
 def main():
-    from meta_llvm_ready import ready_receipt
 
     event = os.environ.get('EVENT_NAME', 'workflow_dispatch')
     kind = os.environ.get('KIND') or 'all'
@@ -69,14 +72,8 @@ def main():
     platforms = required_platforms()
     repo = os.environ['GITHUB_REPOSITORY']
     _, raw = release_assets(repo, 'meta-llvm')
-    assets = published_assets(raw)
-    requests = []
-    for candidate in candidates:
-        k, sha, tree, build = candidate['kind'], candidate['llvm_sha'], candidate['llvm_tree'], int(
-            candidate['build_number'])
-        if (not bundle_complete(k, sha, tree, assets, platforms, build)
-                or ready_receipt(repo, k, sha, tree, build, assets, platforms) is None):
-            requests.append({key: candidate[key] for key in ('kind', 'llvm_sha', 'build_number')})
+    validate_existing = event == 'workflow_dispatch' and os.environ.get('PUBLISH') == 'false'
+    requests = pending_builds(repo, candidates, raw, platforms, validate_existing)
     print(json.dumps(requests))
     with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
         output.write('requests=' + json.dumps(requests) + '\n')
