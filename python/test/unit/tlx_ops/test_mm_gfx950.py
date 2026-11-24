@@ -22,6 +22,12 @@ MAX_SECONDS_PER_CASE = 60
 FAILED_SHAPES = set()
 
 
+@pytest.mark.parametrize("block_m,block_k,num_warps", [(48, 64, 4), (16, 20, 4), (16, 64, 3)])
+def test_register_a_load_layout_rejects_non_power_of_two_ownership(block_m, block_k, num_warps):
+    with pytest.raises(AssertionError):
+        _gfx950._register_a_load_layout(block_m, block_k, num_warps)
+
+
 def _assert_range_result(actual, expected):
     assert actual.shape == expected.shape
     tolerance = 1e-2 if actual.dtype == torch.bfloat16 else 1e-3
@@ -122,6 +128,63 @@ def test_mm_split_register_graph_replay():
     for _ in range(3):
         graph.replay()
     torch.testing.assert_close(out, (a.float() @ b.float()).to(a.dtype), atol=0, rtol=0)
+
+
+_DECODE_PROJECTIONS = [(2304, 8192), (8192, 1024), (4096, 8192), (8192, 4096)]
+
+
+@pytest.mark.parametrize("n,k", _DECODE_PROJECTIONS)
+@pytest.mark.parametrize("m", [2, 3, 8, 13, 16, 17, 31, 32, 48, 64])
+def test_mm_bf16_decode_projection_dispatch_exact(m, n, k):
+    """Decode-sized projections take the measured plan, and integer inputs give the exactly rounded product."""
+    torch.manual_seed(m * 7 + n)
+    a = torch.randint(-2, 3, (m, k), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-2, 3, (n, k), device="cuda").to(torch.bfloat16).T
+    assert _gfx950._dispatch_for(a, b) == _gfx950._decode_projection_dispatch(m, n, k)
+    backing = torch.full((m, 2 * n), float("nan"), device="cuda", dtype=a.dtype)
+    out = backing[:, ::2]
+    assert tlx_ops.mm(a, b, out=out) is out
+    torch.testing.assert_close(out, (a.float() @ b.float()).to(a.dtype), atol=0, rtol=0)
+    assert backing[:, 1::2].isnan().all()
+
+
+@pytest.mark.parametrize("n,k", _DECODE_PROJECTIONS)
+def test_mm_bf16_decode_projection_plan_buckets(n, k):
+    """Every M in 2..64 has a plan, M = 1 and 27 keep their dedicated plans, and M > 64 is outside the table."""
+    rows = (k, 1), (1, k)
+    for m in range(2, 65):
+        dispatch = _gfx950._range_family_candidates(m, n, k, torch.bfloat16, 2, *rows)[0]
+        if m == 27 and (n, k) in _gfx950._BF16_M27_REGISTER_CONFIGS:
+            continue
+        assert dispatch == _gfx950._decode_projection_dispatch(m, n, k) is not None
+    assert _gfx950._decode_projection_dispatch(1, n, k) is None
+    assert _gfx950._decode_projection_dispatch(65, n, k) is None
+    assert _gfx950._decode_projection_dispatch(16, n + 16, k) is None
+
+
+def test_mm_bf16_decode_projection_unaligned_input_falls_back():
+    m, n, k = 16, 2304, 8192
+    torch.manual_seed(173)
+    a = torch.randn(m * k + 1, device="cuda", dtype=torch.bfloat16)[1:].view(m, k)
+    b = torch.randn((n, k), device="cuda", dtype=a.dtype).T
+    assert _gfx950._decode_projection_dispatch(m, n, k)[0] == "split_register"
+    assert _gfx950._dispatch_for(a, b)[0] != "split_register"
+    out = tlx_ops.mm(a, b)
+    expected = (a.float() @ b.float()).to(a.dtype)
+    torch.testing.assert_close(out, expected, atol=8e-3 * expected.abs().max().item(), rtol=8e-3)
+
+
+@pytest.mark.parametrize("m,n,k", [(16, 2304, 8192), (32, 4096, 8192), (48, 8192, 4096)])
+def test_addmm_bf16_decode_projection_split_bucket_uses_fixed_plan(m, n, k, monkeypatch):
+    """addmm with a bias on a split-register bucket runs one fixed unsplit plan, not the register autotuner."""
+    torch.manual_seed(m + n)
+    a = torch.randint(-2, 3, (m, k), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-2, 3, (n, k), device="cuda").to(torch.bfloat16).T
+    bias = torch.randint(-4, 5, (n, ), device="cuda").to(torch.bfloat16)
+    assert _gfx950._dispatch_for(a, b)[0] == "split_register"
+    monkeypatch.setattr(_gfx950, "_launch_register", lambda *args, **kwargs: pytest.fail("autotuned register launch"))
+    out = tlx_ops.addmm(bias, a, b)
+    torch.testing.assert_close(out, (a.float() @ b.float() + bias.float()).to(a.dtype), atol=0, rtol=0)
 
 
 def test_mm_split_register_cached_public_dispatch():
@@ -504,8 +567,14 @@ def test_mm_full_dense_tn_candidates_accuracy(m, n, k):
 @pytest.mark.parametrize(
     "m,n,k",
     [
+        (256, 282, 282),
         (3072, 2048, 797),
+        (256, 2048, 359),
         (3072, 2048, 3965),
+        (4096, 242432, 1894),
+        (3072, 38848, 607),
+        (3072, 242176, 1892),
+        (128, 224, 20926),
         (3072, 128, 44536),
         (3072, 1024, 2048),
         (3072, 4096, 2048),
@@ -644,7 +713,7 @@ def test_mm_n192_uses_bk128_register_plan(dtype):
     _assert_range_result(actual, a @ b)
 
 
-def test_mm_fp16_m256_n2048_uses_untransposed_register_tile():
+def test_mm_fp16_m256_n2048_uses_transposed_compact_pgr2_tile():
     torch.manual_seed(107)
     a = torch.randn((256, 359), device="cuda", dtype=torch.float16)
     b = torch.randn((2048, 359), device="cuda", dtype=torch.float16).T
@@ -657,10 +726,16 @@ def test_mm_fp16_m256_n2048_uses_untransposed_register_tile():
         a.stride(),
         b.stride(),
     )
-    assert path == "register"
-    assert plan["BLOCK_M"] == 64
-    assert plan["BLOCK_N"] == 32
-    assert plan["BLOCK_K"] == 64
+    assert path == "transposed_wave_grid"
+    assert (plan["mi_wave_tile_m"], plan["mi_wave_tile_n"]) == (1, 2)
+    assert (plan["warps_m"], plan["warps_n"]) == (2, 2)
+    assert plan["block_k"] == 64
+    assert plan["local_stages"] == 1
+    assert plan["pgr2_operands"]
+    assert plan["row_wise_epilogue"]
+    assert plan["exact_lds"]
+    assert plan["dot_mode"] == "persistent"
+    assert plan["waves_per_eu"] == 1
     actual = tlx_ops.mm(a, b)
     _assert_range_result(actual, a @ b)
 
@@ -1006,7 +1081,13 @@ def test_mm_fp16_addmm_derived_split_k_shape():
         b.stride(),
     )
     assert path == "transposed_wave_grid"
-    assert plan["split_k"] == 4
+    assert plan["mi_wave_tile_m"] == 7
+    assert plan["mi_wave_tile_n"] == 7
+    assert plan["local_stages"] == 2
+    assert plan["read_cover_sixteenths"] == 15
+    assert plan["reverse_local_assignment"]
+    assert plan["split_k"] == 2
+    assert plan["reduce_tile"] == (32, 32)
     actual = tlx_ops.mm(a, b)
     _assert_range_result(actual, a @ b)
 
@@ -1618,7 +1699,7 @@ def test_mm_small_m_deep_k_preserves_incumbent_dispatch(m, n, k):
 @pytest.mark.parametrize("m,n,k", [
     (1, 1024, 512),
     (16, 8192, 512),
-    (16, 8192, 4096),
+    (16, 8192, 2048),
     (27, 1536, 1024),
     (27, 8192, 512),
     (32, 4096, 4096),

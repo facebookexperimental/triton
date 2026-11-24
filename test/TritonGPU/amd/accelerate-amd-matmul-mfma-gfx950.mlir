@@ -416,10 +416,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
 // CHECK-LABEL: mfma_dot_scaled_fp6_native_k96
 // CHECK-NOT: tt.fp_to_fp
 // CHECK: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2
+// CHECK-SAME: #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 32}>
+// CHECK-SAME: #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 32}>
 // CHECK-NOT: tt.dot {{.*}}xbf16
 // MFMA16-LABEL: mfma_dot_scaled_fp6_native_k96
 // MFMA16-NOT: tt.fp_to_fp
 // MFMA16: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2
+// MFMA16-SAME: #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 32}>
+// MFMA16-SAME: #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 32}>
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
@@ -445,6 +449,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-LABEL: mfma_dot_scaled_fp6_native_k64
 // CHECK-NOT: tt.fp_to_fp
 // CHECK: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2
+// CHECK-SAME: #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 32}>
+// CHECK-SAME: #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 32}>
 // MFMA16-LABEL: mfma_dot_scaled_fp6_native_k64
 // MFMA16: tt.dot {{.*}} : tensor<256x64xbf16, #ttg.dot_op<{opIdx = 0, parent = {{.*}}, kWidth = 8}>> * tensor<64x256xbf16, #ttg.dot_op<{opIdx = 1, parent = {{.*}}, kWidth = 8}>> -> tensor<256x256xf32, {{.*}}>
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [2, 2], order = [1, 0]}>

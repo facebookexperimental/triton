@@ -1060,6 +1060,15 @@ class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
 class HopperGemmWSAddMMConfigHeuristic(AddMMConfigMixin, HopperGemmWSConfigHeuristic):
     """addmm on the SM90 WS template; the bias rides the template's epilogue."""
 
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        # The bias is loaded through the same per-slice SMEM scratch as a fused
+        # epilogue input, which the deepest rings (e.g. 128x256 at 4 stages) do
+        # not leave room for: they fail to launch with OutOfResources.
+        for meta in super()._get_template_configs_impl(kernel_inputs, op_name):
+            if meta["SPLIT_K"] == 1:
+                meta["NUM_STAGES"] = _hopper_ws_fused_epilogue_stages(meta)
+            yield meta
+
 
 @register_template_heuristic(hopper_gemm_small_k_template.uid, "cuda", register=not IS_ROCM, op_name="mm")
 class HopperGemmSmallKConfigHeuristic(HopperGemmWSConfigHeuristic):

@@ -1297,22 +1297,23 @@ isDescriptorFedComputedMMAOperandChannel(Operation *alloc,
   return false;
 }
 
-/// Return the MMA consuming a TMA-fed SMEM channel (the operand ring of a GEMM
-/// main loop), or nullptr.
-static Operation *
-getTMAFedMMAOperandConsumer(Operation *alloc,
-                            SmallVector<Channel *> &channels) {
+/// Return the MMAs consuming a TMA-fed SMEM channel (the operand ring of a GEMM
+/// main loop); empty if there are none.
+static SmallVector<Operation *>
+getTMAFedMMAOperandConsumers(Operation *alloc,
+                             SmallVector<Channel *> &channels) {
+  SmallVector<Operation *> mmas;
   if (!isSmemTMAChannel(alloc, channels))
-    return nullptr;
+    return mmas;
   Channel *ch = findChannelForOp(alloc, channels);
   if (!ch)
-    return nullptr;
+    return mmas;
   DenseSet<Operation *> consumers;
   (void)getAllAcutalUsersForChannel(ch, consumers, alloc);
   for (Operation *op : consumers)
     if (isa<ttng::MMAv5OpInterface>(op))
-      return op;
-  return nullptr;
+      mmas.push_back(op);
+  return mmas;
 }
 
 /// Helper to read the loop.stage attribute from an op. Returns -1 if absent.
@@ -2946,14 +2947,22 @@ static unsigned allocateSmemBuffers(
     const auto &buf = wsBuffers[i];
     if (buf.isPinned || buf.priority != WSBufferPriority::P1_InnermostTMA)
       continue;
-    Operation *mma = getTMAFedMMAOperandConsumer(buf.allocOp, channels);
-    if (!mma || isUnalignedTMALoadSlot(buf.allocOp, buf.sizeBytes, channels))
+    SmallVector<Operation *> mmas =
+        getTMAFedMMAOperandConsumers(buf.allocOp, channels);
+    if (mmas.empty() ||
+        isUnalignedTMALoadSlot(buf.allocOp, buf.sizeBytes, channels))
       continue;
-    unsigned goal = numBuffers;
-    if (auto forOp = mma->getParentOfType<scf::ForOp>())
-      if (auto tripCount = forOp.getStaticTripCount())
-        goal = std::min<uint64_t>(
-            goal, std::max<uint64_t>(1, tripCount->getZExtValue()));
+    // With several MMA consumers, take the largest per-loop cap so the goal
+    // does not depend on the consumer set's iteration order.
+    unsigned goal = 0;
+    for (Operation *mma : mmas) {
+      unsigned cap = numBuffers;
+      if (auto forOp = mma->getParentOfType<scf::ForOp>())
+        if (auto tripCount = forOp.getStaticTripCount())
+          cap = std::min<uint64_t>(
+              cap, std::max<uint64_t>(1, tripCount->getZExtValue()));
+      goal = std::max(goal, cap);
+    }
     mmaOperandIdx.push_back(i);
     operandDepthGoal.push_back(goal);
   }
