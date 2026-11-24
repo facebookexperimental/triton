@@ -37,7 +37,7 @@ _VERSION_SKEW_FILES = {
     "test_consan.py",
 }
 # FP6 cases use buffer_load/store with explicit distributed layouts.
-_COMPATIBLE_CORE_TESTS = {"test_amd_mfma_scaled_fp6", "test_amd_mfma_scaled_fp6_packed", "test_fp6_tma_store_contiguous", "test_fp6_tma_mma_operand"}
+_COMPATIBLE_CORE_TESTS = {"test_amd_mfma_scaled_fp6", "test_amd_mfma_scaled_fp6_packed", "test_fp6_tma_store_contiguous", "test_fp6_tma_mma_operand", "test_fp6_tma_store_noinline", "test_fp6_tma_store_reshaped_source_sm100", "test_fp6_host_descriptor_shape_only"}
 collect_ignore = sorted(_VERSION_SKEW_FILES - {"test_core.py"})
 
 # Individual frontend/layout cases that don't pass on the pinned build:
