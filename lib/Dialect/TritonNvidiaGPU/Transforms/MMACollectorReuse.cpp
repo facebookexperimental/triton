@@ -2,6 +2,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/TargetFeatures.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 
 namespace mlir {
@@ -17,6 +18,12 @@ namespace {
 
 // K extent of one f16/bf16 tcgen05.mma instruction.
 constexpr int64_t kInstK = 16;
+
+enum class SharedOperand { A, B };
+
+Value getShared(TCGen5MMAOp op, SharedOperand shared) {
+  return shared == SharedOperand::A ? op.getA() : op.getB();
+}
 
 bool isEligible(TCGen5MMAOp op) {
   if (!op.getIsAsync() || op.getAccDep() || op.getToken())
@@ -40,9 +47,16 @@ bool isEligible(TCGen5MMAOp op) {
   return dPerCTA[0] == tmemEnc.getBlockM() && dPerCTA[1] <= tmemEnc.getBlockN();
 }
 
-bool sameIssue(TCGen5MMAOp a, TCGen5MMAOp b) {
-  return a.getA() == b.getA() && a.getPred() == b.getPred() &&
-         a.getTwoCtas() == b.getTwoCtas() &&
+// The B collector needs the full 128-row (per CTA) datapath.
+bool isEligibleForB(TCGen5MMAOp op) {
+  return isEligible(op) &&
+         cast<TensorMemoryEncodingAttr>(op.getD().getType().getEncoding())
+                 .getBlockM() == 128;
+}
+
+bool sameIssue(TCGen5MMAOp a, TCGen5MMAOp b, SharedOperand shared) {
+  return getShared(a, shared) == getShared(b, shared) &&
+         a.getPred() == b.getPred() && a.getTwoCtas() == b.getTwoCtas() &&
          a.getMulticast() == b.getMulticast() &&
          a.getIsUnsigned() == b.getIsUnsigned() &&
          a->getDiscardableAttrDictionary() == b->getDiscardableAttrDictionary();
@@ -68,13 +82,14 @@ Value sliceDim(OpBuilder &b, Location loc, Value v, int dim, int64_t off,
   return ttg::MemDescSubsliceOp::create(b, loc, sliceTy, v, offsets);
 }
 
-// Re-issue `group` (MMAs sharing A) K slice by K slice, with the ops inner, so
-// the instructions that read the same A slice are adjacent and can share it
-// through the TensorCore collector buffer. Each accumulator still sums its K
-// slices in the original order, so results are unchanged. All completion
-// barriers move to the last instruction; a commit tracks every prior MMA, so
-// they only fire later, never earlier.
-void reissue(MutableArrayRef<TCGen5MMAOp> group) {
+// Re-issue `group` (MMAs sharing A or B) K slice by K slice, with the ops
+// inner, so the instructions that read the same slice of the shared operand
+// are adjacent and can share it through the TensorCore collector buffer. The
+// group's accumulators are distinct values (see scanGroup), so each still sums
+// its K slices in the original order. All completion barriers move to the last
+// instruction; a commit tracks every prior MMA, so they only fire later, never
+// earlier.
+void reissue(MutableArrayRef<TCGen5MMAOp> group, SharedOperand shared) {
   TCGen5MMAOp last = group.back();
   OpBuilder b(last);
   Location loc = last.getLoc();
@@ -88,10 +103,16 @@ void reissue(MutableArrayRef<TCGen5MMAOp> group) {
   }
   Value trueVal = arith::ConstantIntOp::create(b, loc, 1, 1);
 
+  bool sharesA = shared == SharedOperand::A;
+  StringRef attrName = sharesA ? kCollectorAAttrName : kCollectorBAttrName;
   for (int64_t k = 0; k < numK; ++k) {
-    Value aK = sliceDim(b, loc, group.front().getA(), 1, k * kInstK, kInstK);
+    Value sharedK = sliceDim(b, loc, getShared(group.front(), shared),
+                             sharesA ? 1 : 0, k * kInstK, kInstK);
     for (auto [j, op] : llvm::enumerate(group)) {
-      Value bK = sliceDim(b, loc, op.getB(), 0, k * kInstK, kInstK);
+      Value aK = sharesA ? sharedK
+                         : sliceDim(b, loc, op.getA(), 1, k * kInstK, kInstK);
+      Value bK = sharesA ? sliceDim(b, loc, op.getB(), 0, k * kInstK, kInstK)
+                         : sharedK;
       bool isLastInst = k == numK - 1 && j == group.size() - 1;
       auto newOp = TCGen5MMAOp::create(
           b, op.getLoc(), /*token=*/Type(), aK, bK, op.getD(),
@@ -105,41 +126,74 @@ void reissue(MutableArrayRef<TCGen5MMAOp> group) {
       StringRef usage = j == 0                  ? "fill"
                         : j == group.size() - 1 ? "lastuse"
                                                 : "use";
-      newOp->setAttr(kCollectorAAttrName, StringAttr::get(ctx, usage));
+      newOp->setAttr(attrName, StringAttr::get(ctx, usage));
     }
   }
   for (TCGen5MMAOp op : group)
     op->erase();
 }
 
-void processBlock(Block &block) {
-  SmallVector<SmallVector<TCGen5MMAOp>> groups;
+// Collect the MMAs after `it` that share `shared` with it. Returns the group
+// and the position where the scan stopped.
+std::pair<SmallVector<TCGen5MMAOp>, Block::iterator>
+scanGroup(Block &block, Block::iterator it, SharedOperand shared) {
+  auto eligible = [&](TCGen5MMAOp op) {
+    return shared == SharedOperand::A ? isEligible(op) : isEligibleForB(op);
+  };
+  auto first = cast<TCGen5MMAOp>(&*it);
+  SmallVector<TCGen5MMAOp> group{first};
+  // Interleaving K slices of two MMAs into one accumulator would let a later
+  // use_d=false op drop only its first slice. Overlapping views of one TMEM
+  // allocation are not detected.
+  // TODO: compare the underlying TMEM allocations if B reuse is extended to
+  // contexts where accumulators can alias (e.g. subslices of one allocation).
+  auto writesNewAcc = [&](TCGen5MMAOp mma) {
+    return llvm::none_of(
+        group, [&](TCGen5MMAOp op) { return op.getD() == mma.getD(); });
+  };
+  auto scan = std::next(it);
+  for (; scan != block.end(); ++scan) {
+    Operation *op = &*scan;
+    if (auto mma = dyn_cast<TCGen5MMAOp>(op)) {
+      if (!eligible(mma) || !sameIssue(first, mma, shared) ||
+          !writesNewAcc(mma))
+        break;
+      group.push_back(mma);
+      continue;
+    }
+    // Ops in between are only moved past by the re-issue, so they must not
+    // order with the MMAs. For B sharing (SM107 only), proxy fences and CTA
+    // barriers may stay ahead of the MMAs: delaying an async issue past them
+    // only adds ordering. A sharing keeps stopping at them so SM100/SM103
+    // codegen is unchanged until that is validated on hardware.
+    if (shared == SharedOperand::B &&
+        isa<FenceAsyncSharedOp, triton::gpu::BarrierOp>(op))
+      continue;
+    if (op->hasTrait<OpTrait::IsTerminator>() || !isMemoryEffectFree(op))
+      break;
+  }
+  return {std::move(group), scan};
+}
+
+void processBlock(Block &block, bool reuseB) {
+  SmallVector<std::pair<SmallVector<TCGen5MMAOp>, SharedOperand>> groups;
   for (auto it = block.begin(); it != block.end(); ++it) {
     auto first = dyn_cast<TCGen5MMAOp>(&*it);
     if (!first || !isEligible(first))
       continue;
-    SmallVector<TCGen5MMAOp> group{first};
-    auto scan = std::next(it);
-    for (; scan != block.end(); ++scan) {
-      Operation *op = &*scan;
-      if (auto mma = dyn_cast<TCGen5MMAOp>(op)) {
-        if (!isEligible(mma) || !sameIssue(first, mma))
-          break;
-        group.push_back(mma);
-        continue;
-      }
-      // Ops in between are only moved past by the re-issue, so they must not
-      // order with the MMAs.
-      if (op->hasTrait<OpTrait::IsTerminator>() || !isMemoryEffectFree(op))
-        break;
+    auto [group, scan] = scanGroup(block, it, SharedOperand::A);
+    SharedOperand shared = SharedOperand::A;
+    if (group.size() == 1 && reuseB && isEligibleForB(first)) {
+      std::tie(group, scan) = scanGroup(block, it, SharedOperand::B);
+      shared = SharedOperand::B;
     }
     if (group.size() > 1) {
       it = std::prev(scan);
-      groups.push_back(std::move(group));
+      groups.push_back({std::move(group), shared});
     }
   }
-  for (auto &group : groups)
-    reissue(group);
+  for (auto &[group, shared] : groups)
+    reissue(group, shared);
 }
 
 } // namespace
@@ -152,10 +206,13 @@ public:
       TritonNvidiaGPUMMACollectorReusePassBase;
 
   void runOnOperation() override {
+    ModuleOp mod = getOperation();
+    bool reuseB = mod->hasAttr(triton::gpu::AttrTargetName) &&
+                  TargetFeatures::fromModuleOp(mod).supportsReuseB();
     SmallVector<Block *> blocks;
-    getOperation().walk([&](Block *block) { blocks.push_back(block); });
+    mod.walk([&](Block *block) { blocks.push_back(block); });
     for (Block *block : blocks)
-      processBlock(*block);
+      processBlock(*block, reuseB);
   }
 };
 
