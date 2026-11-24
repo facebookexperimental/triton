@@ -359,7 +359,7 @@ def _compute_offsets(
         if TRUNCATE_METHOD == "keep_last":
             seq_start_kv = seq_start_kv + (seq_len_kv - truncated_len)
         seq_len_kv = truncated_len
-    seq_start_q = tl.load(seq_offsets_q + off_z)
+    seq_start_q = tl.load(seq_offsets_q + off_z).to(tl.int64)
     seq_end_q = tl.load(seq_offsets_q + off_z + 1)
     seq_len_q = (seq_end_q - seq_start_q).to(tl.int32)
 
