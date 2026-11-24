@@ -99,7 +99,7 @@ static void expandLoops(ModuleOp moduleOp) {
       hasWarpSpec = true;
     loops.push_back(forOp);
   });
-  auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+  auto metaWS = triton::isMetaWSEnabled(moduleOp);
 
   for (scf::ForOp forOp : loops) {
     CoarseSchedule schedule;
@@ -228,7 +228,7 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
       return signalPassFailure();
 
     {
-      auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+      auto metaWS = triton::isMetaWSEnabled(getOperation());
       SmallVector<scf::ForOp> loops;
       bool hasWarpSpec = false;
       getOperation()->walk([&](scf::ForOp forOp) {

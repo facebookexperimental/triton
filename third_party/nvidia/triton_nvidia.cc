@@ -8,6 +8,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "llvm/IR/Constants.h"
@@ -321,6 +322,10 @@ void init_triton_nvidia(py::module &&m) {
   init_triton_nvidia_passes_ttgpuir(passes.def_submodule("ttgpuir"));
   init_triton_nvidia_passes_ttnvgpuir(passes.def_submodule("ttnvgpuir"));
   init_triton_hopper_passes(passes.def_submodule("hopper"));
+
+  m.def("requests_warp_specialization", [](mlir::ModuleOp &mod) {
+    return mlir::triton::requestsMetaWarpSpecialization(mod);
+  });
 
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {

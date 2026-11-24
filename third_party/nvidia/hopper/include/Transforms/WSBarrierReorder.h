@@ -4,6 +4,7 @@
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -94,6 +95,28 @@ inline bool isBarrierLikeOp(Operation *op) {
 
 inline bool isNamedBarrierOp(Operation *op) {
   return isa<NamedBarrierArriveOp, NamedBarrierWaitOp>(op);
+}
+
+// Token lowering puts a proxy fence directly before the arrive that releases a
+// TMA-filled buffer read through the generic proxy (see WSLowerToken). The
+// fence belongs to the arrive: it must stay after the reads the arrive guards
+// and before the arrive, so every arrive move carries it along.
+inline FenceAsyncSharedOp getAttachedFence(ArriveBarrierOp arrive) {
+  return dyn_cast_or_null<FenceAsyncSharedOp>(arrive->getPrevNode());
+}
+
+inline void moveArriveBefore(ArriveBarrierOp arrive, Operation *insertPt) {
+  FenceAsyncSharedOp fence = getAttachedFence(arrive);
+  arrive->moveBefore(insertPt);
+  if (fence)
+    fence->moveBefore(arrive);
+}
+
+inline void moveArriveAfter(ArriveBarrierOp arrive, Operation *anchor) {
+  FenceAsyncSharedOp fence = getAttachedFence(arrive);
+  arrive->moveAfter(anchor);
+  if (fence)
+    fence->moveBefore(arrive);
 }
 
 inline bool canAdvanceWSBarrier(std::optional<DictionaryAttr> constraints,
@@ -199,7 +222,7 @@ inline bool sinkWSArrives(Block &block) {
       insertPt = cur->getNextNode();
     }
     if (insertPt != arrive->getNextNode()) {
-      arrive->moveBefore(insertPt);
+      moveArriveBefore(arrive, insertPt);
       changed = true;
     }
   }
@@ -261,7 +284,10 @@ buildBarrierToMemoryOpMap(Block &block) {
     if (auto arrive = dyn_cast<ArriveBarrierOp>(&op)) {
       if (!hasWSBarrierConstraints(arrive.getConstraints()))
         continue;
-      for (auto *cur = arrive->getPrevNode(); cur; cur = cur->getPrevNode()) {
+      Operation *start = arrive->getPrevNode();
+      if (getAttachedFence(arrive))
+        start = start->getPrevNode();
+      for (auto *cur = start; cur; cur = cur->getPrevNode()) {
         if (isNamedBarrierOp(cur))
           break;
         if (isMemoryOp(cur)) {
@@ -285,26 +311,100 @@ buildBarrierToMemoryOpMap(Block &block) {
   return map;
 }
 
+// Record each op's position in the block before any reordering, so that
+// optimizeWSBarrierLocations can tell which ops a barrier originally guarded.
+inline DenseMap<Operation *, unsigned> buildOriginalBlockOrder(Block &block) {
+  DenseMap<Operation *, unsigned> order;
+  unsigned idx = 0;
+  for (auto &op : block)
+    order[&op] = idx++;
+  return order;
+}
+
 // After tmem_load sinking, relocate WS barriers back to optimal positions
 // relative to their associated memory ops. Arrives go right after their memory
 // op, or after later same-block operand definitions required by SSA. Waits go
 // right before their memory op. Skips moves that would break SSA dominance.
+//
+// The associated memory op is only the nearest one when the map was built, and
+// sinking can reorder the other ops the barrier guards. So a wait moving down
+// stops at the first op on the same buffer that originally followed it, and an
+// arrive moving up stops at the last op on the same buffer that originally
+// preceded it. Otherwise, when a subtile is read twice and the two reads sink
+// by different amounts, one read ends up outside the wait/arrive pair. "Same
+// buffer" compares memdesc roots, so every slot and view of one allocation
+// counts. When the memory op has no memdesc operand, any side-effecting op
+// counts. Ops with regions, and ops missing from `originalOrder`, are treated
+// as guarded.
 inline void optimizeWSBarrierLocations(
-    const DenseMap<Operation *, Operation *> &barrierToMemOp) {
+    const DenseMap<Operation *, Operation *> &barrierToMemOp,
+    const DenseMap<Operation *, unsigned> &originalOrder) {
+  auto memDescRoots = [](Operation *op) {
+    DenseSet<Value> roots;
+    for (Value operand : op->getOperands())
+      if (isa<triton::gpu::MemDescType>(operand.getType()))
+        roots.insert(mlir::getMemDescRoot(operand));
+    return roots;
+  };
+  auto touchesBuffer = [&](Operation *op, const DenseSet<Value> &roots) {
+    if (roots.empty() || op->getNumRegions() != 0)
+      return true;
+    return llvm::any_of(memDescRoots(op),
+                        [&](Value root) { return roots.contains(root); });
+  };
+  auto isGuarded = [&](Operation *op, Operation *barrier, bool isWait,
+                       const DenseSet<Value> &roots) {
+    if (isMemoryEffectFree(op) || !touchesBuffer(op, roots))
+      return false;
+    auto it = originalOrder.find(op);
+    if (it == originalOrder.end())
+      return true;
+    unsigned barrierPos = originalOrder.lookup(barrier);
+    return isWait ? it->second > barrierPos : it->second < barrierPos;
+  };
   for (auto [barrier, memOp] : barrierToMemOp) {
     if (barrier->getBlock() != memOp->getBlock())
       continue;
+    DenseSet<Value> roots = memDescRoots(memOp);
     if (auto arrive = dyn_cast<ArriveBarrierOp>(barrier)) {
       Operation *anchor = getArriveAnchorAfterOperands(arrive, memOp);
-      if (barrier->getPrevNode() != anchor) {
+      FenceAsyncSharedOp fence = getAttachedFence(arrive);
+      Operation *first = fence ? fence.getOperation() : barrier;
+      if (anchor->isBeforeInBlock(first)) {
+        for (auto *cur = first->getPrevNode(); cur != anchor;
+             cur = cur->getPrevNode()) {
+          // Never move an arrive above another release's proxy fence, nor
+          // between that fence and its arrive.
+          if (isa<FenceAsyncSharedOp>(cur)) {
+            Operation *next = cur->getNextNode();
+            anchor = isa<ArriveBarrierOp>(next) ? next : cur;
+            break;
+          }
+          if (isGuarded(cur, barrier, /*isWait=*/false, roots)) {
+            anchor = cur;
+            break;
+          }
+        }
+      }
+      if (first->getPrevNode() != anchor) {
         Operation *target = anchor->getNextNode();
         if (!wouldBreakOperandDominance(barrier, target))
-          barrier->moveAfter(anchor);
+          moveArriveAfter(arrive, anchor);
       }
     } else {
-      if (barrier->getNextNode() != memOp) {
-        if (!wouldBreakOperandDominance(barrier, memOp))
-          barrier->moveBefore(memOp);
+      Operation *target = memOp;
+      if (barrier->isBeforeInBlock(memOp)) {
+        for (auto *cur = barrier->getNextNode(); cur != memOp;
+             cur = cur->getNextNode()) {
+          if (isGuarded(cur, barrier, /*isWait=*/true, roots)) {
+            target = cur;
+            break;
+          }
+        }
+      }
+      if (barrier->getNextNode() != target) {
+        if (!wouldBreakOperandDominance(barrier, target))
+          barrier->moveBefore(target);
       }
     }
   }

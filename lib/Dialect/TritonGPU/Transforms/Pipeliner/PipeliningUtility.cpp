@@ -18,6 +18,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include <queue>
@@ -183,7 +184,11 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   if (op->hasTrait<OpTrait::LocalLoadTrait>())
     return op;
-  if (isa<ttg::LocalStoreOp>(op))
+  // Under warp specialization a local_store may write a buffer that another
+  // partition reads under an mbarrier handshake. The paired wait_barrier is
+  // predicated, so the store must be too (wrapped in scf.if below).
+  if (isa<ttg::LocalStoreOp>(op) &&
+      !op->getParentOfType<ttg::WarpSpecializeOp>())
     return op;
   if (isa<ttng::TMEMAllocOp, ttng::TMEMLoadOp>(op))
     return op;
@@ -217,7 +222,8 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   // iterations of a dynamic loop: executing a store/reduce/scatter for an
   // iteration past the real trip count would corrupt the output (e.g. a
   // spurious atomic add for a TMA reduce). Guard them with scf.if(pred).
-  if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
+  if (isa<ttg::LocalStoreOp>(op) ||
+      isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
           ttng::AsyncTMAScatterOp, ttng::TMAStoreTokenWaitOp>(op)) {
     rewriter.setInsertionPoint(op);
     bool hasResults = op->getNumResults() > 0;
@@ -855,4 +861,53 @@ void triton::removePipeliningAttributes(ModuleOp moduleOp) {
     op->removeAttr(mlir::triton::kLoopClusterAttrName);
     op->removeAttr(mlir::triton::kScheduledMaxStageAttrName);
   });
+}
+
+// FB Change: Meta AutoWS warp-specialization predicates.
+// release/3.8.x keeps these attribute names in pass-local headers
+// (hopper WarpSpecialization/Utility.h, WarpSpecialization/PartitionAttrs.h),
+// so spell them here.
+static constexpr char kMetaWSAsyncTaskIdAttrName[] = "async_task_id";
+static constexpr char kMetaWSPartitionAttrName[] = "ttg.partition";
+
+bool mlir::triton::requestsMetaWarpSpecialization(Operation *op) {
+  return op->getAttrOfType<DenseI32ArrayAttr>(kMetaWSAsyncTaskIdAttrName) ||
+         op->getAttrOfType<DenseI32ArrayAttr>(kMetaWSPartitionAttrName) ||
+         (isa<scf::ForOp, scf::WhileOp>(op) &&
+          op->hasAttr(kWarpSpecializeAttrName));
+}
+
+static bool containsMetaWarpSpecializationRequest(Operation *root) {
+  return root
+      ->walk([](Operation *op) {
+        return triton::requestsMetaWarpSpecialization(op)
+                   ? WalkResult::interrupt()
+                   : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+bool mlir::triton::isMetaWarpSpecializedFunc(triton::FuncOp funcOp) {
+  return containsMetaWarpSpecializationRequest(funcOp);
+}
+
+bool mlir::triton::requestsMetaWarpSpecialization(ModuleOp mod) {
+  return mod
+      ->walk([](Operation *op) {
+        return isa<ttg::WarpSpecializeOp>(op) ||
+                       triton::requestsMetaWarpSpecialization(op)
+                   ? WalkResult::interrupt()
+                   : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+bool mlir::triton::isMetaWSEnabled(Operation *op) {
+  auto mod = dyn_cast<ModuleOp>(op);
+  if (!mod)
+    mod = op->getParentOfType<ModuleOp>();
+  if (mod)
+    if (auto attr = mod->getAttrOfType<BoolAttr>("ttg.use_meta_ws"))
+      return attr.getValue();
+  return triton::tools::getBoolEnv("TRITON_USE_META_WS");
 }

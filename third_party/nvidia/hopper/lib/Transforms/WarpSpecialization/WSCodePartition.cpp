@@ -4114,6 +4114,13 @@ void insertAsyncComm(
             LDBG("Insert ProducerCommitOp " << masterChannel->uniqID << " ");
             producerCommitPoint->dump();
           });
+          // The commit belongs to the producer task. Don't inherit the task
+          // ids the builder was last left with: the guard-channel operand-D
+          // path above leaves them on the consuming MMA, and a commit tagged
+          // with the consumer's task is dropped as a same-partition pair when
+          // tokens are lowered, so the MMA no longer waits for the
+          // tmem_store.
+          builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
           builder.setInsertionPointAfter(producerCommitPoint);
           builder.setLoopScheduleInfoFromOp(producerCommitPoint);
           auto commitOp =
@@ -4308,6 +4315,24 @@ void insertAsyncComm(
         }
         auto consumerReleasePoint = consumerReleaseHeuristic(
             tailProducer, tokenTailConsumer, token.first);
+        // Consumers in this task that read the buffer through the generic
+        // proxy: a local_load, reached through memdesc views or nested in a
+        // region (e.g. a subtiled region). If the producer refills the buffer
+        // with TMA, the release needs a proxy fence.
+        std::function<bool(Operation *)> readsSmemGenerically =
+            [&](Operation *op) {
+              if (op->walk([](ttg::LocalLoadOp) {
+                      return WalkResult::interrupt();
+                    }).wasInterrupted())
+                return true;
+              if (op->hasTrait<OpTrait::MemDescViewTrait>())
+                return llvm::any_of(op->getUsers(), readsSmemGenerically);
+              return false;
+            };
+        bool readsGenerically = llvm::any_of(consumerOps, [&](Operation *op) {
+          return llvm::is_contained(getAsyncTaskIds(op), token.first) &&
+                 readsSmemGenerically(op);
+        });
         auto subtiled = getEnclosingSubtiledRegionTile(consumerReleasePoint);
         if (!subtiled)
           subtiled = getEnclosingSubtiledRegionTile(tokenTailConsumer);
@@ -4336,11 +4361,15 @@ void insertAsyncComm(
           } else {
             tileBufIdx = subtiled.addSharedArg(bufferIdx);
           }
-          tileBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-              insertTarget->getLoc(), tileToken, tileBufIdx,
-              WSBarrierAttr::forDstTask(funcOp.getContext(),
-                                        masterChannel->relation.first)
-                  .build(funcOp.getContext()));
+          auto tileReleaseOp =
+              tileBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+                  insertTarget->getLoc(), tileToken, tileBufIdx,
+                  WSBarrierAttr::forDstTask(funcOp.getContext(),
+                                            masterChannel->relation.first)
+                      .build(funcOp.getContext()));
+          if (readsGenerically)
+            tileReleaseOp->setAttr(kGenericSmemReadsAttrName,
+                                   builder.getUnitAttr());
           LDBG("create inline ConsumerRelease in SubtiledRegionOp "
                << masterChannel->uniqID << " ");
         } else {
@@ -4361,6 +4390,9 @@ void insertAsyncComm(
                     WSBarrierAttr::forDstTask(funcOp.getContext(),
                                               masterChannel->relation.first)
                         .build(funcOp.getContext()));
+            if (readsGenerically)
+              releaseOp->setAttr(kGenericSmemReadsAttrName,
+                                 builder.getUnitAttr());
             LLVM_DEBUG({
               LDBG("create ConsumerRelease " << masterChannel->uniqID << " ");
               token.second.dump();
