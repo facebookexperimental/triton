@@ -3,7 +3,8 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
+
+from meta_llvm_assets import github_json, published_assets, release_assets
 
 BRANCHES = {
     "core": "triton_beta",
@@ -52,7 +53,7 @@ def bundle_complete(kind, sha, tree, assets, platforms):
 
 
 def branch_requests(tips, assets, platforms):
-    assets = {asset["name"]: asset for asset in assets}
+    assets = published_assets(assets)
     requests = []
     for kind, tip in tips.items():
         sha, tree = tip["sha"], tip["commit"]["tree"]["sha"]
@@ -61,18 +62,6 @@ def branch_requests(tips, assets, platforms):
         if not bundle_complete(kind, sha, tree, assets, platforms):
             requests.append({"kind": kind, "llvm_sha": sha, "build_number": str(BUILD_NUMBER)})
     return requests
-
-
-def github_json(path, *, missing_ok=False, paginate=False):
-    command = ["gh", "api", path]
-    if paginate:
-        command += ["--paginate", "--slurp"]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode:
-        if missing_ok and "HTTP 404" in result.stderr:
-            return None
-        result.check_returncode()
-    return json.loads(result.stdout)
 
 
 def main():
@@ -88,11 +77,7 @@ def main():
     kinds = BRANCHES if kind == "all" else {kind: BRANCHES[kind]}
     tips = {kind: github_json(f"repos/{FORK}/branches/{branch}")["commit"] for kind, branch in kinds.items()}
     repo = os.environ["GITHUB_REPOSITORY"]
-    release = github_json(f"repos/{repo}/releases/tags/meta-llvm", missing_ok=True)
-    assets = []
-    if release is not None:
-        pages = github_json(f"repos/{repo}/releases/{release['id']}/assets?per_page=100", paginate=True)
-        assets = [asset for page in pages for asset in page]
+    _, assets = release_assets(repo, "meta-llvm")
     requests = branch_requests(tips, assets, platforms)
     print(json.dumps(requests))
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:

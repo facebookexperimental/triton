@@ -13,6 +13,7 @@ on:
   pull_request:
     paths:
       - .github/scripts/select_meta_llvm_branches.py
+      - .github/scripts/meta_llvm_assets.py
       - .github/scripts/test_meta_llvm_bump.py
       - .github/workflows/meta-llvm-branch-bundles.yml
       - .github/workflows/meta-llvm-build.yml

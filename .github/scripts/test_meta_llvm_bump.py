@@ -279,15 +279,9 @@ def _branch_bundle(kind, sha=NEW):
         checksum = f"{digest}  {name}\n"
         assets += [{"name": name, "digest": f"sha256:{digest}"},
                    {"name": f"{name}.sha256", "digest": "sha256:" + hashlib.sha256(checksum.encode()).hexdigest()}]
+    for asset_id, asset in enumerate(assets, 1):
+        asset.update(id=asset_id, state="uploaded", size=1)
     return assets
-
-
-@pytest.mark.parametrize("kind", ["core", "amd"])
-def test_branch_bundles_pin_the_full_sha_without_a_manifest_change(kind):
-    from select_meta_llvm_branches import branch_requests
-
-    assert branch_requests({kind: _branch_tip()}, [],
-                           BRANCH_PLATFORMS) == [{"kind": kind, "llvm_sha": NEW, "build_number": "1"}]
 
 
 @pytest.mark.parametrize("kind", ["core", "amd"])
@@ -296,49 +290,52 @@ def test_branch_bundles_stop_retrying_only_after_complete_publication(kind):
 
     assets = _branch_bundle(kind)
     assert branch_requests({kind: _branch_tip()}, assets, BRANCH_PLATFORMS) == []
-    for missing in assets:
-        partial = [asset for asset in assets if asset is not missing]
-        assert branch_requests({kind: _branch_tip()}, partial,
-                               BRANCH_PLATFORMS) == [{"kind": kind, "llvm_sha": NEW, "build_number":
-                                                      "1"}], missing["name"]
+    for index, asset in enumerate(assets):
+        partial = assets[:index]
+        expected = [{"kind": kind, "llvm_sha": NEW, "build_number": "1"}]
+        assert branch_requests({kind: _branch_tip()}, partial, BRANCH_PLATFORMS) == expected
+        for digest in (None, "sha256:" + hashlib.sha256(b"").hexdigest()):
+            starter = dict(asset, state="starter", size=0, digest=digest)
+            assert branch_requests({kind: _branch_tip()}, partial + [starter], BRANCH_PLATFORMS) == expected
 
 
-@pytest.mark.parametrize("kind", ["core", "amd"])
-def test_branch_bundles_retry_the_same_request_then_follow_a_new_head(kind):
-    from select_meta_llvm_branches import branch_requests
+@pytest.mark.parametrize("status", [404, 502])
+def test_release_lookup_only_not_found_means_absent(monkeypatch, status):
+    import subprocess
+    import meta_llvm_assets
 
-    tips = {kind: _branch_tip()}
-    first = branch_requests(tips, [], BRANCH_PLATFORMS)
-    assert branch_requests(tips, [], BRANCH_PLATFORMS) == first
-    tips[kind] = _branch_tip(SYNC)
-    assert branch_requests(tips, _branch_bundle(kind),
-                           BRANCH_PLATFORMS) == [{"kind": kind, "llvm_sha": SYNC, "build_number": "1"}]
-    assert first[0]["llvm_sha"] == NEW
-
-
-def test_branch_bundles_do_not_confuse_core_and_amd_publication():
-    from select_meta_llvm_branches import branch_requests
-
-    tips = {"core": _branch_tip(), "amd": _branch_tip()}
-    assert branch_requests(tips, _branch_bundle("core"),
-                           BRANCH_PLATFORMS) == [{"kind": "amd", "llvm_sha": NEW, "build_number": "1"}]
+    result = subprocess.CompletedProcess([], 1, "", f"gh: request failed (HTTP {status})")
+    monkeypatch.setattr(meta_llvm_assets.subprocess, "run", lambda *args, **kwargs: result)
+    if status == 404:
+        assert meta_llvm_assets.release_assets("facebookexperimental/triton", "meta-llvm") == (None, [])
+    else:
+        with pytest.raises(subprocess.CalledProcessError):
+            meta_llvm_assets.release_assets("facebookexperimental/triton", "meta-llvm")
 
 
-@pytest.mark.parametrize("kind", ["core", "amd"])
-def test_branch_bundles_require_the_selected_sources(kind):
-    from select_meta_llvm_branches import branch_requests
+@pytest.mark.parametrize("current_state", ["starter", "uploaded"])
+def test_recovery_never_deletes_uploaded_or_unrelated_assets(monkeypatch, current_state):
+    import meta_llvm_assets
 
-    assets = _branch_bundle(kind)
-    assets[0]["digest"] = "sha256:" + "0" * 64
-    with pytest.raises(ValueError, match="source provenance differs"):
-        branch_requests({kind: _branch_tip()}, assets, BRANCH_PLATFORMS)
+    published = dict(_branch_bundle("core")[0], id=101)
+    pending = dict(_branch_bundle("core")[2], id=102, state="starter", size=0, digest=None)
+    unrelated = dict(_branch_bundle("amd")[0], id=103, state="starter", size=0, digest=None)
+    current = dict(
+        _branch_bundle("core")[2], id=102, state=current_state, size=0 if current_state == "starter" else 1,
+        digest=None if current_state == "starter" else _branch_bundle("core")[2]["digest"])
+    calls = []
 
+    def github(path, **kwargs):
+        calls.append((path, kwargs))
+        if kwargs.get("method") == "DELETE":
+            return None
+        return {101: published, 102: current, 103: unrelated}[int(path.rsplit("/", 1)[1])]
 
-@pytest.mark.parametrize("kind", ["core", "amd"])
-def test_branch_bundles_require_checksum_agreement(kind):
-    from select_meta_llvm_branches import branch_requests
-
-    assets = _branch_bundle(kind)
-    assets[2]["digest"] = "sha256:" + "0" * 64
-    with pytest.raises(ValueError, match="checksum differs"):
-        branch_requests({kind: _branch_tip()}, assets, BRANCH_PLATFORMS)
+    monkeypatch.setattr(meta_llvm_assets, "github_json", github)
+    meta_llvm_assets.recover_starters("facebookexperimental/triton", [published, pending, unrelated],
+                                      {published["name"], pending["name"]})
+    path = "repos/facebookexperimental/triton/releases/assets/102"
+    expected = [(path, {})]
+    if current_state == "starter":
+        expected.append((path, {"method": "DELETE"}))
+    assert calls == expected
