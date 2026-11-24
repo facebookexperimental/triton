@@ -4,11 +4,14 @@ import itertools
 import re
 import triton
 import triton.language as tl
+import triton.language.extra.tlx as tlx
 from triton.experimental import gluon
 from triton._filecheck import filecheck_test, run_filecheck_test, run_parser
+from triton._C.libtriton import ir
+from triton.backends.compiler import GPUTarget
 from triton.compiler.code_generator import CodeGenerator
 from triton.runtime.jit import MockTensor
-from triton.compiler.errors import CompilationError
+from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
 import pytest
 from typing import NamedTuple
 
@@ -42,6 +45,40 @@ def anchor(v):
     pass
 
 
+@pytest.mark.parametrize("op", ["min", "max"])
+@pytest.mark.parametrize("return_indices", [False, True])
+@pytest.mark.parametrize("dtype", [tl.float32, tl.int32])
+@pytest.mark.parametrize("propagate_nan, valid", [
+    (tl.PropagateNan.NONE, True),
+    (tl.PropagateNan.ALL, True),
+    (None, False),
+    (False, False),
+    (True, False),
+    (0, False),
+    (1, False),
+    ("NONE", False),
+    (tl.PropagateNan, False),
+])
+def test_min_max_propagate_nan_type(op, return_indices, dtype, propagate_nan, valid):
+
+    @triton.jit
+    def kernel(OP: tl.constexpr, RETURN_INDICES: tl.constexpr, DTYPE: tl.constexpr, PROPAGATE_NAN: tl.constexpr):
+        x = tl.full((32, ), 1, DTYPE)
+        if OP == "min":
+            tl.min(x, 0, return_indices=RETURN_INDICES, propagate_nan=PROPAGATE_NAN)
+        else:
+            tl.max(x, 0, return_indices=RETURN_INDICES, propagate_nan=PROPAGATE_NAN)
+
+    args = (op, return_indices, dtype, propagate_nan)
+    if valid:
+        run_parser(kernel, args=args)
+    else:
+        with pytest.raises(CompilationError) as error:
+            run_parser(kernel, args=args)
+        assert isinstance(error.value.__cause__, CompileTimeAssertionFailure)
+        assert "propagate_nan must be a PropagateNan enum value" in str(error.value.__cause__)
+
+
 @pytest.mark.parametrize("scalar", [True, False])
 @pytest.mark.parametrize("src_dtype, dst_dtype", [(tl.bfloat16, tl.float16), (tl.float16, tl.bfloat16)])
 def test_fp16_bf16_cast(scalar, src_dtype, dst_dtype):
@@ -58,6 +95,29 @@ def test_fp16_bf16_cast(scalar, src_dtype, dst_dtype):
         anchor(y)
 
     run_filecheck_test(kernel, args=(MockTensor(src_dtype), scalar, dst_dtype))
+
+
+@pytest.mark.parametrize("dtype, ir_type", [(tl.float4e2m1x2, "!tt.fp4e2m1x2"), (tl.float8e8m0fnu, "f8E8M0FNU")])
+def test_native_float_types(dtype, ir_type):
+    assert dtype.primitive_bitwidth == 8 and dtype.itemsize == 1 and dtype != tl.uint8
+    assert dtype.is_floating() and dtype.kind() == tl.dtype.KIND.FLOATING
+
+    @triton.jit
+    def kernel(source, output, DTYPE: tl.constexpr, MIXED: tl.constexpr = False):
+        offsets = tl.arange(0, 32)
+        value = tl.load(source + offsets)
+        value = value.to(tl.uint8, bitcast=True).to(DTYPE, bitcast=True)
+        value = tl.where(offsets < 16, value, 1.0 if MIXED else value)
+        tl.static_assert(value.dtype == DTYPE)
+        tl.store(output + offsets, value)
+
+    args = (MockTensor(dtype), MockTensor(dtype), dtype)
+    module = run_parser(kernel, args=args)
+    assert module.verify()
+    text = module.str_nodebug()
+    assert ir_type in text and all(op in text for op in ("tt.bitcast", "tt.load", "tt.store"))
+    with pytest.raises(CompilationError, match="Implicit promotion"):
+        run_parser(kernel, args=(*args, True))
 
 
 def test_store_int_to_bool():
@@ -444,6 +504,16 @@ def test_bfloat16_promotion_reduction(op, return_indices, tie_break_left):
             tl.static_assert(result.dtype == tl.float32)
 
     run_parser(kernel, args=(op, return_indices, tie_break_left))
+
+
+@filecheck_test
+@triton.jit
+def test_operand_buffer_depth_loop_options():
+    # CHECK: scf.for
+    # CHECK: } {tt.lhs_buffer_depth = 3 : i32
+    # CHECK-SAME: tt.rhs_buffer_depth = 2 : i32
+    for i in tl.range(0, 4, warp_specialize=True, lhs_buffer_depth=3, rhs_buffer_depth=2):
+        anchor(i)
 
 
 @triton.aggregate
@@ -2167,3 +2237,72 @@ def test_amd_tdm_load_partitioned_destination():
     text = run_parser(kernel, kwargs={"num_warps": 8}, target=GPUTarget("hip", "gfx1250", 32)).str_nodebug()
     assert "#ttg.partitioned_shared" in text
     assert "amdg.async_tdm_copy_global_to_local" in text
+
+
+def test_stochastic_rounding_generic_cast_requires_entropy():
+
+    @triton.jit
+    def kernel():
+        anchor(tl.full((), 1.5, tl.float32).to(tl.bfloat16, fp_downcast_rounding="rs"))
+
+    with pytest.raises(CompilationError, match="requires explicit random bits"):
+        run_parser(kernel)
+
+
+@pytest.mark.parametrize("arch, dtype", [
+    ("gfx942", tl.float8e4b8),
+    ("gfx942", tl.float8e5b16),
+    ("gfx950", tl.bfloat16),
+    ("gfx950", tl.float16),
+    ("gfx950", tl.float8e4nv),
+    ("gfx950", tl.float8e5),
+    ("gfx1250", tl.bfloat16),
+    ("gfx1250", tl.float16),
+    ("gfx1250", tl.float8e4nv),
+    ("gfx1250", tl.float8e5),
+], ids=str)
+def test_stochastic_rounding_amd_legacy_conversion(arch, dtype):
+
+    @triton.jit
+    def kernel(Input, Output, DTYPE: tl.constexpr):
+        index = tl.arange(0, 32)
+        value = tl.load(Input + index)
+        entropy = tl.full((32, ), 0x12345678, tl.uint32)
+        tl.store(Output + index, tlx.stoch_round(value, DTYPE, entropy))
+
+    target = GPUTarget("hip", arch, 32 if arch == "gfx1250" else 64)
+    module = run_parser(kernel, args=(MockTensor(tl.float32), MockTensor(dtype), dtype), target=target)
+    assert "rounding = rs" in module.str_nodebug()
+    module.validate_stochastic_rounding("hip")
+
+
+@pytest.mark.parametrize("backend", ["cpu", "tileir"])
+def test_stochastic_rounding_legacy_conversion_unsupported_backend(backend):
+
+    @triton.jit
+    def kernel(Input, Output):
+        index = tl.arange(0, 32)
+        value = tl.load(Input + index)
+        entropy = tl.full((32, ), 0x12345678, tl.uint32)
+        tl.store(Output + index, tlx.stoch_round(value, tl.bfloat16, entropy))
+
+    module = run_parser(kernel, args=(MockTensor(tl.float32), MockTensor(tl.bfloat16)))
+    with pytest.raises(RuntimeError, match="unsupported stochastic rounding target"):
+        module.validate_stochastic_rounding(backend)
+
+
+def test_stochastic_rounding_amd_annotated_conversion_rejected(tmp_path):
+    source = tmp_path / "annotated_sr.ttir"
+    source.write_text("""
+module {
+  tt.func @annotated_sr(%value: tensor<32xf32>, %entropy: tensor<32xi32>) {
+    %rounded = tt.fp_to_fp %value, rbits = %entropy : tensor<32xi32>, rounding = rs {sr_ieee} : tensor<32xf32> -> tensor<32xbf16>
+    tt.return
+  }
+}
+""")
+    context = ir.context()
+    ir.load_dialects(context)
+    module = ir.parse_mlir_module(str(source), context)
+    with pytest.raises(RuntimeError, match="unsupported stochastic rounding target"):
+        module.validate_stochastic_rounding("hip")

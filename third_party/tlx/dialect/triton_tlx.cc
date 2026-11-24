@@ -1081,17 +1081,17 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def(
           "create_warp_barrier_arrive",
           [](TritonOpBuilder &self, Value mbarrierLoc, int arriveCount,
-             std::optional<Value> pred) -> void {
-            if (pred.has_value())
-              self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount,
-                                                 pred.value(),
-                                                 /*perThread=*/true);
-            else
-              self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount,
-                                                 /*perThread=*/true);
+             std::optional<Value> pred, bool perWarp) -> void {
+            // Every thread arrives, or with perWarp one lane of each warp
+            // after syncing its warp; then the count is the total of the task
+            // and lowering splits it across the warps.
+            auto arrive = self.create<ttng::ArriveBarrierOp>(
+                mbarrierLoc, arriveCount, pred.value_or(Value()),
+                /*perThread=*/!perWarp);
+            arrive.setPerWarp(perWarp);
           },
           py::arg("mbarrierLoc"), py::arg("arriveCount"),
-          py::arg("pred").none())
+          py::arg("pred").none(), py::arg("perWarp") = false)
       .def("create_named_barrier_wait",
            [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
              Value barrierId = self.create<ttng::UserNamedBarrierIdOp>(barrier);
@@ -1412,6 +1412,10 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("src"), py::arg("newElementType"), py::arg("newShape"),
           py::arg("newEncoding") = std::nullopt)
+      .def("get_dense_i32_array_attr",
+           [](TritonOpBuilder &self, std::vector<int32_t> values) -> Attribute {
+             return self.getBuilder().getDenseI32ArrayAttr(values);
+           })
       .def("get_memdesc_type",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding,

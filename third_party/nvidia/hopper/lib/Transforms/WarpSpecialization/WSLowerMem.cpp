@@ -121,6 +121,64 @@ getTMAWritableEncoding(tt::DescriptorLoadOp load, RankedTensorType tensorType,
   return std::nullopt;
 }
 
+// Scope: MMAv5 operands whose shared-memory copy is written by the MMA's own
+// partition from a descriptor load or gather.
+//  - An alloc with no async task is outside the warp-specialized loop: it is
+//    written once before the partitions start, so it cannot race.
+//  - Pointer-load (tt.load) sources are not checked. A persistent MMAv5 GEMM
+//    with pointer-load operands currently fails in code partitioning
+//    (handleOperandD asserts) before it could race; revisit this check once
+//    that compiles.
+//  - Hopper warp_group_dot is not affected: WGMMAPipeline keeps a dot
+//    synchronous (warp_group_dot_wait 0) unless its shared operands are
+//    multi-buffered or loop-invariant, so a register-staged operand is never
+//    overwritten while a wgmma still reads it.
+bool hasRegisterStagedMMAOperand(triton::FuncOp funcOp) {
+  bool found = false;
+  funcOp.walk([&](ttng::MMAv5OpInterface mma) {
+    SmallVector<AsyncTaskId> mmaTasks = getAsyncTaskIds(mma);
+    for (Value operand : {mma.getA(), mma.getB()}) {
+      while (auto trans = operand.getDefiningOp<ttg::MemDescTransOp>())
+        operand = trans.getSrc();
+      auto alloc = operand.getDefiningOp<ttg::LocalAllocOp>();
+      if (!alloc || !alloc.getSrc())
+        continue;
+      if (!llvm::any_of(getAsyncTaskIds(alloc), [&](AsyncTaskId id) {
+            return llvm::is_contained(mmaTasks, id);
+          }))
+        continue;
+      Value src = alloc.getSrc();
+      while (auto cvt = src.getDefiningOp<ttg::ConvertLayoutOp>())
+        src = cvt.getSrc();
+      // A gather is never lowered to a TMA copy into its alloc, so the alloc
+      // is always filled from registers.
+      if (src.getDefiningOp<tt::DescriptorGatherOp>()) {
+        found = true;
+        return WalkResult::interrupt();
+      }
+      auto load = src.getDefiningOp<tt::DescriptorLoadOp>();
+      if (!load)
+        continue;
+      // Mirror doConvertDescriptorLoadsToNVWS: the TMA copy lands in the alloc
+      // only when the alloc is the load's sole user and a legal destination.
+      auto tensorType = dyn_cast<RankedTensorType>(load.getType());
+      Attribute descEnc =
+          cast<tt::TensorDescType>(load.getDesc().getType()).getSharedLayout();
+      bool fused = tensorType && load->hasOneUse() &&
+                   *load->user_begin() == alloc.getOperation() &&
+                   getTMAWritableEncoding(
+                       load, tensorType,
+                       cast<ttg::MemDescType>(alloc.getType()), descEnc);
+      if (!fused) {
+        found = true;
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  return found;
+}
+
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
   // Schedule rematerialization can leave dead per-task clones attached to a
   // descriptor load. Remove only dead layout-rematerialization chains before

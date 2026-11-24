@@ -66,6 +66,213 @@ def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     run_mm_case(ARCH, M, N, K, a_strides, b_strides, dtype_name)
 
 
+# Decode-sized `x @ W.T` (W [N, K] contiguous, 2 to 64 rows; one row takes the GEMV) that takes the skinny path: the
+# decode projections of a 4-way tensor-parallel MoE model plus shapes that pick each cluster size.
+# 8192x2048 runs unsplit (cluster 1), which the skinny path only takes up to 32 rows. 1024x8192 is
+# capped below cluster 8 by how many clusters run at once.
+SKINNY_SHAPES = ([(M, N, K, "bf16")
+                  for M in (2, 8, 33, 64)
+                  for N, K in ((4608, 8192), (2048, 4096))] + [(M, 8192, 2048, "bf16") for M in (2, 8, 32)] + [
+                      (16, 1024, 512, "fp16"),
+                      (5, 256, 8192, "bf16"),
+                      (64, 64, 1024, "fp16"),
+                      (2, 1024, 8192, "bf16"),
+                  ])
+
+
+@pytest.mark.parametrize("M, N, K, dtype_name", SKINNY_SHAPES)
+def test_mm_skinny(M, N, K, dtype_name, monkeypatch):
+    launches = []
+    launch = sm100._skinny._launch
+    monkeypatch.setattr(sm100._skinny, "_launch", lambda *args: (launches.append(args), launch(*args)))
+    run_mm_case(ARCH, M, N, K, (K, 1), (1, K), dtype_name, allow_decline=False)
+    assert launches, "tlx.ops.mm did not take the skinny path"
+
+
+@pytest.mark.parametrize("M, N, K", [(2, 4608, 8192), (32, 2048, 4096)])
+def test_mm_skinny_full_space(M, N, K):
+    a = operand(M, K, (K, 1), torch.bfloat16)
+    b = operand(K, N, (1, K), torch.bfloat16)
+    out = sm100.mm(a, b, space="full")
+    ref = a.float() @ b.float()
+    precision = REL_PRECISION[torch.bfloat16]
+    torch.testing.assert_close(out.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
+def test_mm_skinny_back_to_back_in_graph():
+    """Under programmatic dependent launch the second GEMM starts before the first finishes; its A (the first's
+    output) must still be read only after the first completes, including on CUDA-graph replay."""
+    x = operand(4, 8192, (8192, 1), torch.bfloat16)
+    w1 = operand(4096, 8192, (8192, 1), torch.bfloat16) * 8192**-0.5
+    w2 = operand(2048, 4096, (4096, 1), torch.bfloat16) * 4096**-0.5
+    h = torch.empty(4, 4096, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty(4, 2048, device="cuda", dtype=torch.bfloat16)
+
+    def chain():
+        sm100.mm(x, w1.T, out=h, space="heuristic")
+        sm100.mm(h, w2.T, out=y, space="heuristic")
+
+    chain()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        chain()
+    for seed in range(3):
+        x.copy_(torch.randn(x.shape, device="cuda", generator=torch.Generator("cuda").manual_seed(seed)))
+        graph.replay()
+        ref = (x.float() @ w1.float().T).to(torch.bfloat16).float() @ w2.float().T
+        precision = REL_PRECISION[torch.bfloat16]
+        torch.testing.assert_close(y.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
+def test_mm_skinny_b_written_by_previous_kernel():
+    """The first GEMM triggers early launch before it stores its output; when that output is the second GEMM's
+    W, the second must still load W only after the first completes, including on CUDA-graph replay."""
+    x = operand(64, 4096, (4096, 1), torch.bfloat16)
+    w1 = operand(512, 4096, (4096, 1), torch.bfloat16) * 4096**-0.5
+    a = operand(4, 512, (512, 1), torch.bfloat16)
+    w2 = torch.empty(64, 512, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty(4, 64, device="cuda", dtype=torch.bfloat16)
+    assert sm100._skinny.eligible(x, w1.T) and sm100._skinny.eligible(a, w2.T)
+
+    def chain():
+        sm100.mm(x, w1.T, out=w2, space="heuristic")
+        sm100.mm(a, w2.T, out=y, space="heuristic")
+
+    chain()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        chain()
+    for seed in range(5):
+        x.copy_(torch.randn(x.shape, device="cuda", generator=torch.Generator("cuda").manual_seed(seed)))
+        graph.replay()
+        ref = a.float() @ (x.float() @ w1.float().T).to(torch.bfloat16).float().T
+        precision = REL_PRECISION[torch.bfloat16]
+        torch.testing.assert_close(y.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
+def test_mm_skinny_declines_row_major_b():
+    a = operand(8, 4096, (4096, 1), torch.bfloat16)
+    b = operand(4096, 4608, (4608, 1), torch.bfloat16)
+    assert not sm100._skinny.eligible(a, b)
+
+
+@pytest.mark.parametrize("M, N, K, expected", [
+    (32, 8192, 2048, True),
+    (33, 8192, 2048, False),
+    (64, 8192, 4096, False),
+    (64, 4608, 8192, True),
+    (64, 2048, 4096, True),
+])
+def test_mm_skinny_defers_unsplit_problems_above_32_rows(M, N, K, expected):
+    """Past 32 rows the WS GEMM keeps problems the skinny path would run without a K split."""
+    a = operand(M, K, (K, 1), torch.bfloat16)
+    b = operand(K, N, (1, K), torch.bfloat16)
+    assert sm100._skinny.eligible(a, b) == expected
+
+
+@pytest.mark.parametrize("N, K", [(256, 8192), (1024, 4096), (1024, 8192), (2048, 4096), (4608, 8192)])
+def test_mm_skinny_heuristic_clusters_run_at_once(N, K):
+    """The heuristic's clusters all run at once, and the next size up would not (or would leave < 4 K steps)."""
+    skinny = sm100._skinny
+    n_blocks = N // skinny.BLOCK_N
+    cluster = skinny.heuristic_config(1, N, K)["CLUSTER"]
+    assert n_blocks <= skinny._max_active_clusters(cluster)
+    bigger = 2 * cluster
+    assert (bigger > 8 or n_blocks > skinny._max_active_clusters(bigger)
+            or K // (skinny.BLOCK_K * bigger) < skinny._MIN_K_STEPS)
+
+
+# One-row `x @ W.T`: the decode shapes the GEMV is tuned for, plus shapes that take its derived configs.
+GEMV_SHAPES = [(8192, 1024), (8192, 2048), (4608, 8192), (2048, 4096), (1024, 8192), (1024, 6144), (4096, 1024),
+               (512, 1536), (96, 256), (64, 128)]
+
+
+@pytest.mark.parametrize("N, K", GEMV_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("b_static", [False, True])
+def test_mm_gemv(N, K, dtype, b_static, monkeypatch):
+    from triton.tlx.ops import mm as tlx_mm
+
+    calls = []
+    run = sm100._gemv.mm
+    monkeypatch.setattr(sm100._gemv, "mm", lambda *args, **kwargs: (calls.append(kwargs), run(*args, **kwargs))[1])
+    x = operand(1, K, (K, 1), dtype)
+    w = operand(N, K, (K, 1), dtype) * K**-0.5
+    out = tlx_mm(x, w.T, b_static=b_static)
+    assert calls == [{"b_static": b_static}], "tlx.ops.mm did not take the GEMV"
+    ref = x.float() @ w.float().T
+    precision = REL_PRECISION[dtype]
+    torch.testing.assert_close(out.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
+def test_mm_gemv_declines_row_major_b():
+    x = operand(1, 4096, (4096, 1), torch.bfloat16)
+    b = operand(4096, 1024, (1024, 1), torch.bfloat16)
+    assert not sm100._gemv.eligible(x, b)
+
+
+def test_mm_gemv_declines_empty_k():
+    x = torch.empty(1, 0, device="cuda", dtype=torch.bfloat16)
+    w = torch.empty(64, 0, device="cuda", dtype=torch.bfloat16)
+    assert not sm100._gemv.eligible(x, w.T)
+
+
+def test_mm_gemv_row_offset_past_int32():
+    """Rows from 131072 on start past 2^31 elements of a K = 16384 W, so their offsets need 64 bits."""
+    from triton.tlx.ops import mm as tlx_mm
+
+    N, K, tail = 131072 + 64, 16384, 64
+    w = torch.zeros(N, K, device="cuda", dtype=torch.bfloat16)
+    w[-tail:] = torch.randn(tail, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    x = operand(1, K, (K, 1), torch.bfloat16)
+    assert sm100._gemv.eligible(x, w.T)
+    out = tlx_mm(x, w.T)
+    ref = x.float() @ w[-tail:].float().T
+    precision = REL_PRECISION[torch.bfloat16]
+    torch.testing.assert_close(out[:, -tail:].float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
+    assert not out[:, :-tail].any()
+
+
+def test_mm_gemv_b_written_by_previous_kernel():
+    """Without `b_static` the GEMV loads W only after the previous kernel completes: here the previous GEMM writes
+    W, including on CUDA-graph replay."""
+    x = operand(64, 4096, (4096, 1), torch.bfloat16)
+    w1 = operand(512, 4096, (4096, 1), torch.bfloat16) * 4096**-0.5
+    a = operand(1, 512, (512, 1), torch.bfloat16)
+    w2 = torch.empty(64, 512, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty(1, 64, device="cuda", dtype=torch.bfloat16)
+    assert sm100._gemv.eligible(a, w2.T)
+
+    def chain():
+        sm100.mm(x, w1.T, out=w2, space="heuristic")
+        sm100.mm(a, w2.T, out=y, space="heuristic")
+
+    chain()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        chain()
+    for seed in range(5):
+        x.copy_(torch.randn(x.shape, device="cuda", generator=torch.Generator("cuda").manual_seed(seed)))
+        graph.replay()
+        ref = a.float() @ (x.float() @ w1.float().T).to(torch.bfloat16).float().T
+        precision = REL_PRECISION[torch.bfloat16]
+        torch.testing.assert_close(y.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
+def test_mm_b_static_is_accepted_off_the_gemv():
+    from triton.tlx.ops import mm as tlx_mm
+
+    a = operand(16, 4096, (4096, 1), torch.bfloat16)
+    w = operand(2048, 4096, (4096, 1), torch.bfloat16) * 4096**-0.5
+    out = tlx_mm(a, w.T, space="heuristic", b_static=True)
+    ref = a.float() @ w.float().T
+    precision = REL_PRECISION[torch.bfloat16]
+    torch.testing.assert_close(out.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
 GEOMETRIES = [
     # No overhang: M is a whole number of tiles and the count already divides
     # NUM_CTAS. These must stay at zero -- they are the canary for the fix
@@ -177,7 +384,7 @@ def test_heuristic_splits_k_for_large_outputs_only_when_full_tiles_leave_sms_idl
 def test_group_size_fits_padded_cluster_grid(M, N):
     block_m = 256
     num_ctas = 2
-    group_size = sm100._select_group_size_m(M, N, block_m, num_ctas)
+    group_size = sm100.select_group_size_m(M, N, block_m, num_ctas)
     padded_tiles = sm100._padded_num_pid_m(M, block_m, num_ctas)
     assert num_ctas <= group_size <= padded_tiles
     assert group_size % num_ctas == 0

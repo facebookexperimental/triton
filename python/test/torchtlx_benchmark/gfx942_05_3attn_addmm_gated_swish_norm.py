@@ -14,12 +14,16 @@ _COMMON_CONFIG: dict[str, object] = {"force_disable_caches": True}
 BASELINE_CONFIG: dict[str, object] = {**_COMMON_CONFIG, "triton.tlx_mode": None}
 CANDIDATE_CONFIG: dict[str, object] = {**_COMMON_CONFIG, "triton.tlx_mode": "allow"}
 
-# Expert x_ff fc0-fc2 at the median batch (VG 930419186521793).
+# Expert x_ff fc0-fc2 at the median batch (VG 930419186521793) and the PG benchmark batch.
 SHAPES = (
     {"m": 902, "k": 7552, "n": 4096, "residual": False, "dtype": "fp16"},
     {"m": 902, "k": 6656, "n": 4096, "residual": False, "dtype": "fp16"},
     {"m": 902, "k": 4096, "n": 2048, "residual": False, "dtype": "fp16"},
     {"m": 902, "k": 2048, "n": 4096, "residual": True, "dtype": "fp16"},
+    {"m": 2020, "k": 7552, "n": 4096, "residual": False, "dtype": "fp16"},
+    {"m": 2020, "k": 6656, "n": 4096, "residual": False, "dtype": "fp16"},
+    {"m": 2020, "k": 4096, "n": 2048, "residual": False, "dtype": "fp16"},
+    {"m": 2020, "k": 2048, "n": 4096, "residual": True, "dtype": "fp16"},
 )
 M = SHAPES[0]["m"]
 K = SHAPES[0]["k"]

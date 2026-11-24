@@ -8,10 +8,20 @@ from triton.tlx.ops import InvalidInput, UnsupportedBackward
 from triton.tlx.ops import moe as tlx_moe
 from triton.tlx.ops._catalog import CATALOG
 from triton.tlx.ops.kernels.moe._shapes import CORRECTNESS_SHAPES, inputs, label
+from triton.tlx.ops.kernels.moe import gfx950 as _gfx950
 
 requires_gfx950 = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 
 SMALL = dict(K=256, I=256, H=384, E=8, E_total=32, topk=4)
+
+
+@pytest.mark.parametrize("rows,wide", [(160, False), (161, True), (384, True), (385, False)])
+def test_wide_a_ownership_is_config_scoped(rows, wide):
+    gate, down = _gfx950.pick_config(rows)
+    assert gate.get("WIDE_A_OWNERSHIP", False) is wide
+    assert down.get("WIDE_A_OWNERSHIP", False) is wide
+    if wide:
+        assert gate["num_warps"] == down["num_warps"] == 2
 
 
 def _weights(dims, seed=0):
@@ -151,7 +161,7 @@ def test_strided_weights_match_contiguous():
 # The register engine reads x through its strides; the quad engine (4000 tokens here) copies x only when its rows
 # are not unit-stride and 16-byte aligned.
 @requires_gfx950
-@pytest.mark.parametrize("T", [3, 300, 4000])
+@pytest.mark.parametrize("T", [3, 27, 300, 4000])
 @pytest.mark.parametrize("layout", ["row_pad8", "row_pad4", "col_stride2", "transposed"])
 def test_strided_x_matches_contiguous(T, layout):
     dims = dict(K=256, I=256, H=512, E=8, E_total=32, topk=8)

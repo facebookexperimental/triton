@@ -73,8 +73,9 @@ def _quantize_head(X, Out, Scale, stride_xz, stride_xh, stride_xn, stride_xd, H,
     # and E4M3 data x / 2**(byte - 127). PACK_K writes the scales in
     # quantize_mxfp8_head's pack_k order. The outputs are read once, by the
     # attention kernel, so the stores stream past the caches.
-    pid_bh = tl.program_id(1)
-    offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Tensor bases can exceed signed-i32 offsets even when one tile is small.
+    pid_bh = tl.program_id(1).to(tl.int64)
+    offs_n = tl.program_id(0).to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
     offs_b = tl.arange(0, HEAD_DIM // 32)
     rows = offs_n[:, None] < N_CTX
@@ -240,11 +241,15 @@ def _mxfp8_fa_fwd(
     NUM_STAGES: tl.constexpr,
     CAUSAL: tl.constexpr,
     EVEN_N: tl.constexpr,
+    USE_I64_OFFSETS: tl.constexpr = False,
 ):
     SCALE_K: tl.constexpr = HEAD_DIM // 32
     tl.static_assert(BLOCK_M % BLOCK_N == 0)
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
+    if USE_I64_OFFSETS:
+        # Set by _needs_i64_offsets: int64 head bases, int32 offsets within a head.
+        off_hz = off_hz.to(tl.int64)
     off_z = off_hz // H
     off_h = off_hz % H
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -949,11 +954,13 @@ def _mxfp8_fa_fwd_pingpong(
     FAST_EXP: tl.constexpr,
     CAUSAL: tl.constexpr,
     ZERO_SCALE: tl.constexpr,
+    USE_I64_OFFSETS: tl.constexpr = False,
 ):
     # N_CTX % (2 * BLOCK_N) == 0 (causal: % (2 * BLOCK_M)), contiguous [row, 4]
     # Q scales, K from quantize_mxfp8_head(pack_k=True), V and its scales from
     # quantize_mxfp8_v(transposed=True) (V's strides given as for [key, head],
-    # its scales strided like K's).
+    # its scales strided like K's). USE_I64_OFFSETS (set by _needs_i64_offsets)
+    # makes the head bases int64; offsets within a head stay int32.
     # Persistent: each workgroup loops over (Q tile, head) items. Two warp
     # groups run one stage apart: one issues QK(j + 1) and PV(j) while the
     # other does softmax(j + 1). Each K/V tile is two key
@@ -1033,6 +1040,8 @@ def _mxfp8_fa_fwd_pingpong(
     # the softmax after it stores this item's output and starts the next.
     # Pair -1 ends an empty item before the first.
     n_start, n_hz = _item(base, 0, stride_item, n_m, CAUSAL)
+    if USE_I64_OFFSETS:
+        n_hz = n_hz.to(tl.int64)
     n_z = n_hz // H
     n_h = n_hz % H
     _issue_q(Q + n_z * stride_qb + n_h * stride_qh + n_start * BLOCK_M * stride_qm + q_off,
@@ -1062,7 +1071,7 @@ def _mxfp8_fa_fwd_pingpong(
         n_pairs = n_mine * (N_CTX // (2 * BLOCK_N))
     w = -1
     start_m = 0
-    o_off = 0
+    o_off = tl.cast(0, tl.int64) if USE_I64_OFFSETS else 0
     k = 0 if CAUSAL else N_CTX // (2 * BLOCK_N) - 1
     # The first step's operands for pair r; the softmax steps work them out
     # for the step after them, off the matrix cores' critical path. Each tile
@@ -1101,6 +1110,8 @@ def _mxfp8_fa_fwd_pingpong(
                 start_m = n_start
                 o_off = n_z * stride_ob + n_h * stride_oh + n_start * BLOCK_M * stride_om
                 n_start, n_hz = _item(base, tl.minimum(w + 1, n_mine - 1), stride_item, n_m, CAUSAL)
+                if USE_I64_OFFSETS:
+                    n_hz = n_hz.to(tl.int64)
                 n_z = n_hz // H
                 n_h = n_hz % H
                 nkh = n_z * stride_kb + n_h * stride_kh
@@ -1148,9 +1159,9 @@ def _quantize_v(V, Out, Scale, stride_vb, stride_vh, stride_vn, stride_vd, H, N_
     # V to MXFP8 along the keys (a 32-key block per column), by
     # _quantize_head's rule. TRANSPOSED writes quantize_mxfp8_v's
     # transposed layout; otherwise [key, head] data and [key block, head]
-    # scales.
-    pid_bh = tl.program_id(1)
-    offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    # scales. Offsets are int64, as in _quantize_head.
+    pid_bh = tl.program_id(1).to(tl.int64)
+    offs_n = tl.program_id(0).to(tl.int64) * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
     if TRANSPOSED:
         src_n = (offs_n & ~20) | (((offs_n >> 2) & 1) << 4) | (((offs_n >> 4) & 1) << 2)
@@ -1254,6 +1265,19 @@ def _quantize_qkv(q, k, v, pingpong):
     return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
 
 
+def _needs_i64_offsets(block, *operands):
+    """Whether the attention kernels can form an element offset of 2**31 into
+    an operand, where int32 offsets wrap. Each operand is the [batch, head,
+    row, inner] extents the kernels address it over and its strides in that
+    order. They address whole ``block``-row tiles, so the masked rows of a
+    partial last tile count, and the ping-pong kernel forms the offset of the
+    tile after a head's last one: one more tile of rows bounds both."""
+    for (z, h, n, d), (sz, sh, sn, sd) in operands:
+        if (z - 1) * sz + (h - 1) * sh + (n - 1 + block) * sn + (d - 1) * sd >= 1 << 31:
+            return True
+    return False
+
+
 def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm_scale, *, fast_exp=True):
     """Launch on already-quantized inputs: ``q_fp8`` and ``q_scale`` from
     ``quantize_mxfp8_head(q)``, K from ``quantize_mxfp8_head(k,
@@ -1275,6 +1299,11 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
             raise ValueError("V's scales must be laid out like K's")
         n_units = n_ctx // cfg["block_m"] // (2 if causal else 1) * batch * heads
         grid = (min(n_units, _NUM_CUS), )
+        sq, sk, so = q_fp8.stride(), k_fp8.stride(), out.stride()
+        # V's strides as for [key, head].
+        vb, vh, vd, vn = v_fp8.stride()
+        sv = (vb, vh, vn, vd)
+        sqs, sks, svs = q_scale.stride(), k_scale.stride(), v_scale.stride()
         args = (
             q_fp8,
             k_fp8,
@@ -1283,30 +1312,13 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
             k_scale,
             v_scale,
             out,
-            q_fp8.stride(0),
-            q_fp8.stride(1),
-            q_fp8.stride(2),
-            q_fp8.stride(3),
-            k_fp8.stride(0),
-            k_fp8.stride(1),
-            k_fp8.stride(2),
-            k_fp8.stride(3),
-            v_fp8.stride(0),
-            v_fp8.stride(1),
-            v_fp8.stride(3),
-            v_fp8.stride(2),
-            q_scale.stride(0),
-            q_scale.stride(1),
-            q_scale.stride(2),
-            k_scale.stride(0),
-            k_scale.stride(1),
-            k_scale.stride(2),
-            v_scale.stride(0),
-            v_scale.stride(1),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            out.stride(3),
+            *sq,
+            *sk,
+            *sv,
+            *sqs[:3],
+            *sks[:3],
+            *svs[:2],
+            *so,
             batch,
             heads,
             n_ctx,
@@ -1333,10 +1345,22 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
             enable_sched_group_barrier_scheduler=True,
             sched_group_barrier_mfma_per_dwordx4=4,
         )
+        rows, words = (batch, heads, n_ctx, _HEAD_DIM), (batch, heads, n_ctx, 1)
+        if _needs_i64_offsets(cfg["block_m"], (rows, sq), (rows, sk), (rows, sv), (rows, so), (words, sqs),
+                              (words, sks), (words, svs)):
+            kwargs["USE_I64_OFFSETS"] = True
         _mxfp8_fa_fwd_pingpong[grid](*args, **kwargs)
         return out
     grid = (triton.cdiv(n_ctx, cfg["block_m"]), batch * heads)
     v_scale = v_scale.contiguous()
+    sq, sk, sv, so = q_fp8.stride(), k_fp8.stride(), v_fp8.stride(), out.stride()
+    sqs, sks, svs = q_scale.stride(), k_scale.stride(), v_scale.stride()
+    rows, scales = (batch, heads, n_ctx, _HEAD_DIM), (batch, heads, n_ctx, _HEAD_DIM // 32)
+    # Passed only when set: each keyword adds host time to every launch.
+    i64 = {}
+    if _needs_i64_offsets(cfg["block_m"], (rows, sq), (rows, sk), (rows, sv), (rows, so), (scales, sqs), (scales, sks),
+                          ((batch, heads, triton.cdiv(n_ctx, 32), _HEAD_DIM), svs)):
+        i64["USE_I64_OFFSETS"] = True
     _mxfp8_fa_fwd[grid](
         q_fp8,
         k_fp8,
@@ -1345,31 +1369,13 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
         k_scale,
         v_scale,
         out,
-        q_fp8.stride(0),
-        q_fp8.stride(1),
-        q_fp8.stride(2),
-        q_fp8.stride(3),
-        k_fp8.stride(0),
-        k_fp8.stride(1),
-        k_fp8.stride(2),
-        k_fp8.stride(3),
-        v_fp8.stride(0),
-        v_fp8.stride(1),
-        v_fp8.stride(2),
-        v_fp8.stride(3),
-        q_scale.stride(0),
-        q_scale.stride(1),
-        q_scale.stride(2),
-        k_scale.stride(0),
-        k_scale.stride(1),
-        k_scale.stride(2),
-        v_scale.stride(0),
-        v_scale.stride(1),
-        v_scale.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        out.stride(3),
+        *sq,
+        *sk,
+        *sv,
+        *sqs[:3],
+        *sks[:3],
+        *svs[:3],
+        *so,
         heads,
         n_ctx,
         qk_scale,
@@ -1382,6 +1388,7 @@ def _launch_quantized(q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale, causal, sm
         num_warps=cfg["num_warps"],
         num_stages=1,
         llvm_fn_attrs=(("amdgpu-ieee", "false"), ),
+        **i64,
     )
     return out
 
