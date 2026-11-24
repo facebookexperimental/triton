@@ -87,13 +87,10 @@ struct GridDependencyOpConversion : public ConvertOpToLLVMPattern<OpTy> {
   LogicalResult
   matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    PTXBuilder ptxBuilder;
-    if constexpr (std::is_same_v<OpTy, triton::GridDependencyWaitOp>)
-      (*ptxBuilder.create("griddepcontrol.wait"))();
-    else
-      (*ptxBuilder.create("griddepcontrol.launch_dependents"))();
-    ptxBuilder.launch(rewriter, op.getLoc(), void_ty(rewriter.getContext()));
-    rewriter.eraseOp(op);
+    auto kind = std::is_same_v<OpTy, triton::GridDependencyWaitOp>
+                    ? NVVM::GridDepActionKind::wait
+                    : NVVM::GridDepActionKind::launch_dependents;
+    rewriter.replaceOpWithNewOp<NVVM::GriddepcontrolOp>(op, kind);
     return success();
   }
 };
@@ -466,10 +463,55 @@ struct WaitBarrierOpConversion
   }
 };
 
+// TEMPORARY workaround for an NVPTX backend issue, enabled per task with
+// `tlx.async_task(nvptx_cmp_sink_workaround=True)`.
+//
+// NVPTX keeps the default `TargetLowering::hasMultipleConditionRegisters()`
+// (false), so CodeGenPrepare sinks compares into the blocks of their users,
+// even out of a loop preheader that LICM hoisted them to. A leader arrive
+// after a loop then gets its `tid == 0` compare back next to the arrive, and
+// the 32-bit thread id stays live across the loop instead of a predicate. A
+// per-warp arrive's lane-0 predicate is instead hoisted by LICM and stays
+// live across the loop. The FA forward softmax only gets its fast ptxas
+// schedule when neither happens: avoiding one alone gains little, avoiding
+// both about 3%. In a flagged task, per-warp arrives test %laneid inside
+// their own asm, and leader arrives share one predicate built at the task's
+// region entry. Arrives routed by `fromCTA` keep their own lane predicates.
+// Remove this once NVPTX stops sinking compares.
+//
+// Returns the warp-specialize region whose arrives take the workaround, or
+// null if the arrive is not in a flagged task.
+static Region *getNvptxCmpSinkWorkaroundRegion(Operation *op) {
+  for (Region *r = op->getParentRegion(); r;
+       r = r->getParentOp()->getParentRegion()) {
+    Operation *parent = r->getParentOp();
+    ttg::WarpSpecializeOp ws;
+    int32_t index;
+    if (auto partitions = dyn_cast<ttg::WarpSpecializePartitionsOp>(parent)) {
+      ws = dyn_cast<ttg::WarpSpecializeOp>(partitions->getParentOp());
+      index = r->getRegionNumber();
+    } else if ((ws = dyn_cast<ttg::WarpSpecializeOp>(parent)) &&
+               r == &ws.getDefaultRegion()) {
+      index = -1; // the default task
+    } else {
+      continue;
+    }
+    auto flagged = ws ? ws->getAttrOfType<DenseI32ArrayAttr>(
+                            "tlx.nvptx_cmp_sink_workaround")
+                      : DenseI32ArrayAttr();
+    if (flagged && llvm::is_contained(flagged.asArrayRef(), index))
+      return r;
+    return nullptr;
+  }
+  return nullptr;
+}
+
 struct ArriveBarrierOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ArriveBarrierOp> {
   const NVIDIA::TargetInfo *targetInfo;
   bool supportsMBarrierMulticast;
+  // Leader predicates of the nvptx_cmp_sink_workaround regions, one per region.
+  mutable llvm::DenseMap<Region *, Value> regionLeaderPreds;
 
   ArriveBarrierOpConversion(LLVMTypeConverter &typeConverter,
                             PatternBenefit benefit,
@@ -557,6 +599,8 @@ struct ArriveBarrierOpConversion
       Value id = op.getPerWarp() ? getLaneId(rewriter, loc)
                                  : getThreadId(rewriter, loc);
       Value pred;
+      Region *workaroundRegion = getNvptxCmpSinkWorkaroundRegion(op);
+      bool laneTestInAsm = false;
       Value fromCTAMulticastMask;
       // An identity fromCTA (num_ctas - 1) is a no-op that canonicalization
       // removes; treat it as absent here so a coexisting multicastCTA (which
@@ -575,15 +619,44 @@ struct ArriveBarrierOpConversion
         barrierPtr = lowering.barrierPtr;
         fromCTAMulticastMask = lowering.multicastMask;
         isCrossClusterBarrier = true;
+      } else if (workaroundRegion && op.getPerWarp()) {
+        // nvptx_cmp_sink_workaround: the arrive's asm tests %laneid itself.
+        laneTestInAsm = true;
+        pred = op.getPred() ? adaptor.getPred() : b.true_val();
+      } else if (workaroundRegion) {
+        // nvptx_cmp_sink_workaround: build `tid == 0` once at the region entry
+        // with a side-effecting setp, which CodeGenPrepare cannot sink.
+        Value &leader = regionLeaderPreds[workaroundRegion];
+        if (!leader) {
+          OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(&workaroundRegion->front());
+          Value tid = getThreadId(rewriter, loc);
+          PTXBuilder setpBuilder;
+          auto &setp = *setpBuilder.create<>("setp.eq.u32 $0, $1, 0;");
+          setp({setpBuilder.newOperand("=b"), setpBuilder.newOperand(tid, "r")},
+               /*onlyAttachMLIRArgs=*/true);
+          leader =
+              setpBuilder.launch(rewriter, loc, i1_ty, /*hasSideEffect=*/true);
+        }
+        pred = leader;
       } else {
         pred = b.icmp_eq(id, b.i32_val(0));
       }
-      if (op.getPred())
+      if (op.getPred() && !laneTestInAsm)
         pred = b.and_(pred, adaptor.getPred());
 
       auto emitArrive = [&](Value targetBarrier, Value multicastMask = {}) {
         std::stringstream ptxAsm;
-        ptxAsm << "@$0 mbarrier.arrive.";
+        if (laneTestInAsm) {
+          ptxAsm
+              << "{ .reg .pred lane0; .reg .b32 lane; mov.u32 lane, %laneid; "
+                 "setp.eq.u32 lane0, lane, 0; ";
+          if (op.getPred())
+            ptxAsm << "and.pred lane0, lane0, $0; ";
+          ptxAsm << "@lane0 mbarrier.arrive.";
+        } else {
+          ptxAsm << "@$0 mbarrier.arrive.";
+        }
         ptxAsm << (isRemoteBarrier || isCrossClusterBarrier || op.isMulticast()
                        ? "shared::cluster"
                        : "shared::cta");
@@ -595,6 +668,8 @@ struct ArriveBarrierOpConversion
         if (multicastMask)
           ptxAsm << ", $2";
         ptxAsm << ";";
+        if (laneTestInAsm)
+          ptxAsm << " }";
 
         PTXBuilder ptxBuilder;
         SmallVector<PTXBuilder::Operand *, 3> operands = {
@@ -967,18 +1042,9 @@ struct CLCIsCanceledOpConversion
       return op.emitError("CLC operations require SM100+ (Blackwell)");
     }
 
-    auto loc = op.getLoc();
-    std::string ptxAsm =
-        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 $0, $1;";
-    PTXBuilder ptxBuilder;
-    auto &clcOp = *ptxBuilder.create(ptxAsm);
-    auto *resultOp = ptxBuilder.newOperand("=b");
-    auto *clcResultOp = ptxBuilder.newOperand(adaptor.getClcResult(), "q");
-    clcOp({resultOp, clcResultOp}, /*onlyAttachMLIRArgs=*/true);
-
-    Value result =
-        ptxBuilder.launch(rewriter, loc, i1_ty, /*hasSideEffects=*/false);
-    rewriter.replaceOp(op, result);
+    rewriter.replaceOpWithNewOp<NVVM::ClusterLaunchControlQueryCancelOp>(
+        op, NVVM::ClusterLaunchControlQueryType::IS_CANCELED,
+        adaptor.getClcResult());
 
     return success();
   }
@@ -1002,26 +1068,20 @@ struct CLCGetProgramIdOpConversion
 
     auto loc = op.getLoc();
 
-    using namespace llvm::Intrinsic;
-    constexpr std::pair<ID, int> queries[] = {
-        {nvvm_clusterlaunchcontrol_query_cancel_get_first_ctaid_x,
-         kMaxGriddimx},
-        {nvvm_clusterlaunchcontrol_query_cancel_get_first_ctaid_y,
-         kMaxGriddimy},
-        {nvvm_clusterlaunchcontrol_query_cancel_get_first_ctaid_z,
-         kMaxGriddimz}};
-    auto [intrinsic, maxGridDim] = queries[static_cast<unsigned>(op.getDim())];
-    auto call = LLVM::createLLVMIntrinsicCallOp(
-        rewriter, loc, llvm::Intrinsic::getName(intrinsic), op.getType(),
-        adaptor.getClcResult());
-    // A successful cancellation returns a raw CTA coordinate in [0,
-    // maxGridDim).
-    auto range =
-        LLVM::ConstantRangeAttr::get(rewriter.getContext(), 32, 0, maxGridDim);
-    auto resultAttrs = rewriter.getDictionaryAttr(
-        rewriter.getNamedAttr(LLVM::LLVMDialect::getRangeAttrName(), range));
-    call.setResAttrsAttr(rewriter.getArrayAttr(resultAttrs));
-    Value result = call.getResult(0);
+    auto queryType = [&] {
+      switch (op.getDim()) {
+      case ProgramIDDim::X:
+        return NVVM::ClusterLaunchControlQueryType::GET_FIRST_CTA_ID_X;
+      case ProgramIDDim::Y:
+        return NVVM::ClusterLaunchControlQueryType::GET_FIRST_CTA_ID_Y;
+      case ProgramIDDim::Z:
+        return NVVM::ClusterLaunchControlQueryType::GET_FIRST_CTA_ID_Z;
+      }
+      llvm::llvm_unreachable_internal("Invalid program id dim");
+    }();
+
+    Value result = NVVM::ClusterLaunchControlQueryCancelOp::create(
+        rewriter, loc, queryType, adaptor.getClcResult());
 
     PhysicalClusterInfo cluster = getPhysicalClusterInfo(op);
     if (cluster.hasPerCTAProgramIds) {

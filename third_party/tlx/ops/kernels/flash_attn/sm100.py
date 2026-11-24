@@ -374,6 +374,7 @@ def _softmax_inner_loop(
     RESCALE_OPT: tl.constexpr,
     ALPHA_BAR_ID: tl.constexpr,
     USE_2CTA: tl.constexpr = False,
+    USE_WARP_BARRIER: tl.constexpr = False,
     EX2_EMU_FREQ: tl.constexpr = 0,
     EX2_EMU_START_FRG: tl.constexpr = 1,
 ):
@@ -464,12 +465,14 @@ def _softmax_inner_loop(
                     tlx.subslice(tlx.local_view(p_tiles, qk_buf * NUM_MMA_SLICES + 1), BLOCK_N // 4 * (k - 1),
                                  BLOCK_N // 4), p_i.to(out_dtype))
                 p_bar = tlx.local_view(p_fulls, qk_buf * 3 + k)
+            # As in FA4, each warp publishes its rows of P as soon as it has stored them, without waiting for the
+            # other softmax warps. A warp barrier already has every thread arrive.
             if USE_2CTA:
                 # The TMEM store completes before this readiness token; it does
                 # not publish ordinary SMEM to the peer CTA.
-                tlx.barrier_arrive(p_bar, 1, remote_cta_rank=0)
+                tlx.barrier_arrive(p_bar, 1, remote_cta_rank=0, per_warp=not USE_WARP_BARRIER)
             else:
-                tlx.barrier_arrive(p_bar)
+                tlx.barrier_arrive(p_bar, per_warp=not USE_WARP_BARRIER)
             p_slices = p_slices + (p_i, )
 
         # As in FA4, acquire the alpha buffer for the next iteration here, off the S -> P path,
@@ -1321,7 +1324,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
     qk_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     acc_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
-    # Cross-CTA barriers: must use mbarriers for 2-CTA (arrive_count=NUM_CTAS).
+    # Cross-CTA barriers: must use mbarriers for 2-CTA, whose counts scale with NUM_CTAS.
     # As in FA4, the softmax publishes P in chunks of 1/2, 1/4 and 1/4 of BLOCK_N. The first chunk shares acc_fulls with
     # the correction's "O rescaled" (FA4's P_full_O_rescaled); p_fulls[3 * g + 1] and p_fulls[3 * g + 2] signal the
     # other two.
@@ -1329,8 +1332,9 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
         p_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS * 3, num_warps=4)
         acc_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=8)
     else:
-        p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * 3, arrive_count=NUM_CTAS)
-        acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=2 * NUM_CTAS)
+        # The softmax's 4 warps arrive on P per warp; acc_fulls also takes the correction's leader arrive.
+        p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * 3, arrive_count=4 * NUM_CTAS)
+        acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=(4 + 1) * NUM_CTAS)
     # Intra-CTA barriers: always use fast warp barriers (no cross-CTA traffic).
     # The softmax statistics go through SMEM, as in FA4 (sScale). Each iteration the softmax stores alpha and arrives
     # on named barrier ALPHA_BAR_ID + cid, and the correction arrives on alpha_empties after reading it. At the end
@@ -1466,8 +1470,11 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                 clc_phase_consumer ^= 1
 
         # softmax groups
+        # nvptx_cmp_sink_workaround: TEMPORARY. Keeps the CLC arrive's `tid == 0` predicate before the softmax loop
+        # (NVPTX would sink it after the loop) and the P arrives' lane-0 test inside it (LICM would hoist it). ptxas
+        # schedules the softmax loop about 3% faster with both.
         with tlx.async_task(num_warps=4, registers=256 if (USE_2CTA and HEAD_DIM >= 256) else 184,
-                            replicate=NUM_GROUPS_PER_CTA):
+                            replicate=NUM_GROUPS_PER_CTA, nvptx_cmp_sink_workaround=True):
             accum_cnt_qk = 0
             tile_count = 0
             tile_id = start_pid
@@ -1529,6 +1536,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         RESCALE_OPT=RESCALE_OPT,
                         ALPHA_BAR_ID=ALPHA_BAR_ID,
                         USE_2CTA=USE_2CTA,
+                        USE_WARP_BARRIER=USE_WARP_BARRIER,
                         EX2_EMU_FREQ=10,
                     )
                 if STAGE & 2:
@@ -1557,6 +1565,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         RESCALE_OPT=RESCALE_OPT,
                         ALPHA_BAR_ID=ALPHA_BAR_ID,
                         USE_2CTA=USE_2CTA,
+                        USE_WARP_BARRIER=USE_WARP_BARRIER,
                     )
 
                 # prepare l_i for the epilog
