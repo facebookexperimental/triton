@@ -54,7 +54,14 @@ public:
 
 protected:
   triton::BarrierStages getBarrierStages(Operation *op) override;
+  // AMD kernels synchronize the LDS they use inside ttg.warp_predicate
+  // themselves, so keep predicated regions opaque here as they were before
+  // NVIDIA lowered them. Walking in adds barriers that the kernel's own already
+  // cover (gfx950 short-causal FA) and can place a barrier inside a region.
+  // TODO: Check whether we should enable walking into the region for AMD
+  // lowering.
+  bool analyzesPredicatedRegions() const override { return false; }
 };
 } // namespace mlir::triton::AMD
 
-#endif
+#endif // TRITON_THIRD_PARTY_AMD_INCLUDE_TRITONAMDGPUTOLLVM_MEMBARUTILITY_H_

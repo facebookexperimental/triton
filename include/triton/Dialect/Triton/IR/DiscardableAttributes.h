@@ -14,6 +14,10 @@ inline constexpr StringLiteral kScheduledMaxStageAttrName =
     "tt.scheduled_max_stage";
 inline constexpr StringLiteral kDataPartitionFactorAttrName =
     "tt.data_partition_factor";
+inline constexpr StringLiteral kLhsBufferDepthAttrName = "tt.lhs_buffer_depth";
+inline constexpr StringLiteral kRhsBufferDepthAttrName = "tt.rhs_buffer_depth";
+inline constexpr StringLiteral kRequestedBufferDepthAttrName =
+    "tt.requested_buffer_depth";
 
 // AutoWS annotation on an MMA op: a JSON object carrying the desired schedule
 // and, optionally, the channels the operands travel through, e.g.
