@@ -199,7 +199,7 @@ ReduceOpHelper::getInThreadVectorizeOpKind(bool supportBitwidth16Elementwise,
     return InThreadVectorizeOpKind::None;
 
   Type elemTy = srcTy.getElementType();
-  unsigned bitwidth = elemTy.getIntOrFloatBitWidth();
+  unsigned bitwidth = getIntOrFloatOrPtrBitWidth(elemTy);
   if (bitwidth == 16 && !supportBitwidth16Elementwise)
     return InThreadVectorizeOpKind::None;
   if (bitwidth == 32 && !supportBitwidth32Elementwise)
@@ -593,7 +593,7 @@ unsigned ScanLoweringHelper::getScratchSizeInBytes() {
     return 0;
   unsigned elementSizeInBytes = 0;
   for (const auto &ty : srcElementTypes) {
-    elementSizeInBytes += ceil<unsigned>(ty.getIntOrFloatBitWidth(), 8);
+    elementSizeInBytes += ceil<unsigned>(getIntOrFloatOrPtrBitWidth(ty), 8);
   }
   return elementSizeInBytes * getScratchSizeInElems();
 }
@@ -1432,7 +1432,8 @@ unsigned GatherLoweringHelper::getScratchSizeInBytes() {
   // is written back to shared memory.
   RankedTensorType srcType = gatherOp.getSrc().getType();
   return product(srcType.getShape()) *
-         ceil<unsigned>(srcType.getElementTypeBitWidth(), 8);
+         ceil<unsigned>(getIntOrFloatOrPtrBitWidth(srcType.getElementType()),
+                        8);
 }
 
 bool GatherLoweringHelper::isWarpLocal() {

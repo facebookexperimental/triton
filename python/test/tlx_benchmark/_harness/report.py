@@ -14,10 +14,10 @@ _MARK = {
     Status.ERROR: "ERROR",
 }
 
-#: Statuses that fail the run. ``NOISY`` is deliberately absent: it is not a
-#: claim that the code is slow, only that the machine would not hold still, and
-#: failing on it would train people to ignore the suite.
-FAILING = (Status.PIP, Status.ERROR)
+#: Statuses that fail the run: a broken or wrong kernel. ``PIP`` and ``NOISY``
+#: are reported, not failed: a perf verdict is tracked night over night by the
+#: regression detector, and failing on one would train people to ignore the suite.
+FAILING = (Status.ERROR, )
 
 
 def _tf(value) -> str:
@@ -149,7 +149,7 @@ def render(results: Sequence[Result], env: dict, json_path: Optional[str] = None
     noisy = _details(results, (Status.NOISY, ))
     if noisy:
         out.extend(("", "Noisy data:", *noisy))
-    bad = failures(results)
-    if bad:
-        out.extend(("", "Issues:", *_details(bad, FAILING)))
+    issues = _details(results, (Status.PIP, Status.ERROR))
+    if issues:
+        out.extend(("", "Issues:", *issues))
     return "\n".join(out)
