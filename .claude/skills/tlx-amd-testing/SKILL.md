@@ -31,7 +31,13 @@ Each kernel is an importable module under `third_party/tlx/tutorials/`.
 | `ikbo/ikbo_fa_triton.py` | IKBO Flash Attention | `test_ikbo_fa` | `test_amd_ikbo_fa_perf.py` | none (any HIP/CUDA) |
 | `ikbo/ikbo_lce_triton.py` | IKBO LCE (logit cross-entropy — **not** attention) | `test_ikbo_lce` | `test_amd_ikbo_lce_perf.py` | none (any HIP/CUDA) |
 | `amd_tdm_gemm_pipelined.py` | GEMM (TDM) | `test_amd_tdm_gemm_pipelined` | — | `is_hip_gfx1250` |
-| `amd_mxfp_gemm_gfx1250/amd_mxfp_gemm_tdm_pipelined.py` | GEMM (MXFP, TDM) | `test_amd_mxfp_gemm_tdm_pipelined` | `test_amd_mxfp_gemm_perf.py` | `is_hip_gfx1250` |
+
+The gfx1250 MXFP GEMM kernels live in `tlx.ops`, not in the tutorials:
+`ops/kernels/mm_mxfp/gfx1250.py` (tests in
+`python/test/unit/tlx_ops/test_mm_mxfp_gfx1250.py` and
+`python/test/unit/language/test_tlx_amd_gfx1250.py`, benchmarks in
+`ops/kernels/mm_mxfp/bench_gfx1250.py`) and the grouped MXFP GEMM in
+`ops/kernels/grouped_gemm_mxfp/gfx1250.py`.
 
 `gfx950` = CDNA4 = MI350-class (`is_hip_cdna4()`). `gfx942` = CDNA3 = MI300X-class
 (`is_hip_cdna3()`). `gfx1250` is a separate, newer target (`is_hip_gfx1250()`). On

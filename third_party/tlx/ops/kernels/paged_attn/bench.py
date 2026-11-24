@@ -51,9 +51,11 @@ DECODE_METHODS = (
     "tlx_gluon_compat",
     "tlx",
     "tlx_nhd",
+    "tlx_nhd_rmsnorm_gate",
+    "tlx_nhd_out_gate",
 )
 # Providers that read SGLang's page-major token pool, [blocks, page, kv_heads, dim].
-NHD_METHODS = ("aiter_unified", "tlx_nhd")
+NHD_METHODS = ("aiter_unified", "tlx_nhd", "tlx_nhd_rmsnorm_gate", "tlx_nhd_out_gate")
 # PR #2306 target comparison: standalone AITER common/HIP, SGLang's actual
 # vectorized-5D wrapper (which calls AITER Gluon), and native TLX 5D.
 DEFAULT_DECODE_VERSIONS = ["aiter_common", "sglang", "tlx_5d"] if _AITER_AVAILABLE else ["tlx_5d"]
@@ -122,6 +124,22 @@ def _make_decode_fn(
             )
 
         return _run_tlx
+
+    if provider in ("tlx_nhd_rmsnorm_gate", "tlx_nhd_out_gate"):
+        # Attention plus the output RMSNorm x sigmoid gate (head_dim 64): tlx.ops.rmsnorm_gate after the decode, or
+        # out_gate, which applies it in the split-K reduce.
+        from triton.tlx.ops import paged_attention_decode, paged_attention_decode_workspace, rmsnorm_gate
+
+        tokens = q.shape[0]
+        gate = torch.randn(tokens, q.shape[1] * head_dim, device=q.device, dtype=torch.bfloat16)
+        plan = dict(query_length=qlen, sliding_window=sliding_window, max_context_len=max_context_len, kv_layout="NHD")
+        workspace = paged_attention_decode_workspace(q, kc, vc, bt, norm_gate=True, **plan)
+        kwargs = dict(plan, sm_scale=sm_scale, out=out, workspace=workspace)
+        if provider == "tlx_nhd_out_gate":
+            return lambda: paged_attention_decode(q, kc, vc, ctx, bt, out_gate=gate, **kwargs)
+        normed = torch.empty_like(gate)
+        return lambda: rmsnorm_gate(
+            paged_attention_decode(q, kc, vc, ctx, bt, **kwargs).view(tokens, -1), gate, out=normed)
 
     if not _AITER_AVAILABLE:
         return None
@@ -455,6 +473,9 @@ if __name__ == "__main__":
                         baseline = f"tlx_5d ({ylabel})"
                         if "tlx" in versions and "tlx_5d" in versions:
                             df["tlx_5d/tlx speedup"] = (df[baseline] / df[f"tlx ({ylabel})"])
+                        if "tlx_nhd_rmsnorm_gate" in versions and "tlx_nhd_out_gate" in versions:
+                            df["out_gate/rmsnorm_gate speedup"] = (df[f"tlx_nhd_out_gate ({ylabel})"] /
+                                                                   df[f"tlx_nhd_rmsnorm_gate ({ylabel})"])
                         if "aiter_unified" in versions and "tlx_nhd" in versions:
                             df["tlx_nhd/aiter_unified speedup"] = (df[f"tlx_nhd ({ylabel})"] /
                                                                    df[f"aiter_unified ({ylabel})"])

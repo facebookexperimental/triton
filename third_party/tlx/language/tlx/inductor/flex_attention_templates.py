@@ -202,7 +202,7 @@ def _blackwell_flex_fwd_eligible(query, key, value) -> bool:
     return can_use_tma(query, key, value)
 
 
-def _blackwell_flex_fwd_configs(configs):
+def _flex_fwd_base_configs(configs):
     """The stock autotune configs, then any of ``configs`` not among them.
 
     max_autotune only widens the stock list, so this base list is the same with it
@@ -240,7 +240,7 @@ def _append_tlx_flex_nvidia(
     if not _blackwell_flex_fwd_eligible(*input_nodes[:3]):
         return
 
-    configs = _blackwell_flex_fwd_configs(configs)
+    configs = _flex_fwd_base_configs(configs)
     num_sms = current_target().num_sms
 
     def tlx_options():
@@ -414,9 +414,7 @@ def _append_tlx_flex_amd(
     query,
     mutated_inputs,
 ):
-    """Append the offline gfx950 forward choice; max_autotune adds stock-derived tiles."""
-    from torch._inductor import config
-
+    """Append the offline gfx950 forward choice, then stock-derived tiles."""
     if not configs:
         return
     base = original_kernel_options.copy()
@@ -459,11 +457,10 @@ def _append_tlx_flex_amd(
     block_n = fit(64, base["SPARSE_KV_BLOCK_SIZE"])
     if block_m and block_n:
         append(block_m, block_n, num_warps=4, waves_per_eu=0, matrix_instr_nonkdim=min(32, block_m, block_n), kpack=1)
-    if config.max_autotune:
-        for conf in configs:
-            if (fit(conf.block_m, base["SPARSE_Q_BLOCK_SIZE"]) == conf.block_m
-                    and fit(conf.block_n, base["SPARSE_KV_BLOCK_SIZE"]) == conf.block_n):
-                append(conf.block_m, conf.block_n, num_warps=min(8, max(1, conf.block_m // 32)))
+    for conf in _flex_fwd_base_configs(configs):
+        if (fit(conf.block_m, base["SPARSE_Q_BLOCK_SIZE"]) == conf.block_m
+                and fit(conf.block_n, base["SPARSE_KV_BLOCK_SIZE"]) == conf.block_n):
+            append(conf.block_m, conf.block_n, num_warps=min(8, max(1, conf.block_m // 32)))
 
 
 def _gfx1250_fixed_reference_eligible(subgraphs):
