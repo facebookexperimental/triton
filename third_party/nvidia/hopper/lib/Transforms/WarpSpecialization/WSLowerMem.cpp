@@ -290,8 +290,7 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
       Operation *earliestUser = nullptr;
       auto scheduleKey = [](Operation *op) {
         auto stage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
-        auto cluster =
-            op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+        auto cluster = op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
         return std::make_pair(stage ? stage.getInt() : INT_MAX,
                               cluster ? cluster.getInt() : INT_MAX);
       };
