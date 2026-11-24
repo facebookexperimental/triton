@@ -356,7 +356,7 @@ def test_fp8_api_dispatch_and_forward_only(monkeypatch):
 
     def dispatch(op, *, device):
         assert device == torch.device('cpu')
-        assert op == 'paged_attention_decode_fp8'
+        assert op == 'paged_attention_decode'
         return implementation, OpSpec(op, 'gfx1250', 'per_head_wmma_tdm', 'unused')
 
     monkeypatch.setattr(ops, 'impl_for', dispatch)
@@ -368,8 +368,11 @@ def test_fp8_api_dispatch_and_forward_only(monkeypatch):
     assert calls == []
     with torch.no_grad():
         assert paged_attention_decode_fp8(*x, max_context_len=64, space='heuristic') is sentinel
-    assert calls[0][1]['sm_scale'] == 64**-.5
-    assert calls[0][1]['num_splits'] is None
+    args, kwargs = calls[0]
+    # paged_attention_decode's backend call: (q, k, v, lengths, table, sm_scale, query_length, window, ...).
+    assert args[5] == 64**-.5
+    assert kwargs['num_splits'] is None and kwargs['causal'] is True
+    assert kwargs['k_descale'] is x[5] and kwargs['v_descale'] is x[6]
 
 
 @pytest.mark.parametrize('splits', [1, 4, 8])
@@ -377,7 +380,7 @@ def test_fp8_workspace_public_planning_without_device_launch(splits, monkeypatch
     from contextlib import nullcontext
     import triton.tlx.ops as ops
     from triton.tlx.ops._catalog import impl_for
-    implementation, spec = impl_for('paged_attention_decode_fp8_workspace', arch='gfx1250')
+    implementation, spec = impl_for('paged_attention_decode_workspace', arch='gfx1250')
     monkeypatch.setattr(ops, 'impl_for', lambda op, *, device: (implementation, spec))
     monkeypatch.setattr(torch.cuda, 'device', lambda device: nullcontext())
     q, k, v, _, table, _, _ = _cpu_inputs()
@@ -390,12 +393,67 @@ def test_fp8_workspace_public_planning_without_device_launch(splits, monkeypatch
         assert all(t.dtype == torch.float32 and t.device == q.device for t in buffers)
 
 
-def test_fp8_catalog_is_gfx1250_only():
-    from triton.tlx.ops._catalog import CATALOG, impl_for
-    for op in ['paged_attention_decode_fp8', 'paged_attention_decode_fp8_workspace']:
-        assert [s.arch for s in CATALOG if s.op == op] == ['gfx1250']
-        with pytest.raises(UnsupportedOp):
-            impl_for(op, arch='gfx950')
+def test_fp8_decode_is_unified_in_catalog():
+    from triton.tlx.ops._catalog import CATALOG
+    assert not [s for s in CATALOG if s.op.startswith('paged_attention_decode_fp8')]
+    for op in ['paged_attention_decode', 'paged_attention_decode_workspace']:
+        assert {'gfx950', 'gfx1250', 'sm100'} <= {s.arch for s in CATALOG if s.op == op}
+
+
+def _decode_dims(**change):
+    dims = dict(HEAD_DIM=64, QLEN=1, GROUP=8, KV_NDIM=5, KV_LAYOUT='HND', KV_FP8=True, PAGE_SIZE=64,
+                PER_HEAD_SCALES=True, CAUSAL=True, SPLITS=None, OUT_GATE=False, BT_INT64=False)
+    dims.update(change)
+    return dims
+
+
+def test_paged_decode_accepts_split_by_backend():
+    from triton.tlx.ops._catalog import _paged_decode_gfx950_accepts, _paged_decode_packed_fp8_accepts
+    assert _paged_decode_packed_fp8_accepts(_decode_dims())
+    assert _paged_decode_packed_fp8_accepts(_decode_dims(PER_HEAD_SCALES=False, CAUSAL=False, SPLITS=4))
+    assert not _paged_decode_packed_fp8_accepts(_decode_dims(KV_NDIM=4))
+    assert not _paged_decode_packed_fp8_accepts(_decode_dims(KV_FP8=False))
+    assert not _paged_decode_packed_fp8_accepts(_decode_dims(OUT_GATE=True))
+    four_d = dict(KV_NDIM=4, PER_HEAD_SCALES=False)
+    assert _paged_decode_gfx950_accepts(_decode_dims(**four_d))
+    assert _paged_decode_gfx950_accepts(_decode_dims(KV_NDIM=5, KV_FP8=False, PER_HEAD_SCALES=False))
+    for change in [dict(PER_HEAD_SCALES=True), dict(CAUSAL=False), dict(SPLITS=4), dict(BT_INT64=True)]:
+        assert not _paged_decode_gfx950_accepts(_decode_dims(**{**four_d, **change}))
+    assert not _paged_decode_gfx950_accepts(_decode_dims(PER_HEAD_SCALES=False))
+
+
+def test_paged_decode_forwards_unified_arguments(monkeypatch):
+    from contextlib import nullcontext
+    import triton.tlx.ops as ops
+    from triton.tlx.ops._catalog import OpSpec, _paged_decode_packed_fp8_accepts
+    calls = []
+
+    def dispatch(op, *, device):
+        spec = OpSpec(op, 'gfx1250', 'per_head_wmma_tdm', 'unused', accepts=_paged_decode_packed_fp8_accepts)
+        return (lambda *args, **kwargs: calls.append((args, kwargs))), spec
+
+    monkeypatch.setattr(ops, 'impl_for', dispatch)
+    monkeypatch.setattr(torch.cuda, 'device', lambda device: nullcontext())
+    q, k, v, lengths, table, _, _ = _cpu_inputs(fp8_q=True)
+    one = torch.ones(1)
+    ops.paged_attention_decode(q, k, v, lengths, table.long(), k_descale=one, v_descale=one, q_descale=one,
+                               max_context_len=64, causal=False, num_splits=4)
+    args, kwargs = calls[0]
+    assert args[8] == 64 and kwargs['causal'] is False and kwargs['num_splits'] == 4
+    assert kwargs['k_descale'] is one and kwargs['q_descale'] is one
+    with pytest.raises(InvalidInput, match='causal'):
+        ops.paged_attention_decode(q, k, v, lengths, table, k_descale=one, v_descale=one, q_descale=one,
+                                   max_context_len=64, causal=False, sliding_window=16)
+    with pytest.raises(InvalidInput, match='k_descale'):
+        ops.paged_attention_decode(q, k, v, lengths, table, k_descale=torch.ones(3), v_descale=one, q_descale=one,
+                                   max_context_len=64)
+
+
+def test_packed_fp8_scales_broadcast_per_head():
+    from triton.tlx.ops.kernels.paged_attn_fp8.gfx1250_decode import _per_head
+    assert torch.equal(_per_head(torch.tensor([0.5]), 4), torch.full((4, ), 0.5))
+    vector = torch.arange(4.)
+    assert _per_head(vector, 4) is vector
 
 
 @pytest.mark.skipif(not _gfx1250_available(), reason='Requires gfx1250')

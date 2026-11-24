@@ -869,3 +869,32 @@ def paged_attention_decode_fp8_workspace(query, key_cache, value_cache, block_ta
     tokens, heads, dim = query.shape
     return (torch.empty((tokens, heads, splits, dim), dtype=torch.float32, device=query.device),
             torch.empty((tokens, heads, splits), dtype=torch.float32, device=query.device))
+
+
+def _per_head(scale, heads):
+    """A [heads] FP32 scale vector: one-element (per-tensor) scales broadcast to every head."""
+    return scale.reshape(1).expand(heads).contiguous() if scale.numel() == 1 else scale
+
+
+def paged_attention_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale, query_length,
+                           sliding_window, max_context_len, out, workspace, kv_layout, k_descale=None, v_descale=None,
+                           q_descale=None, causal=True, num_splits=None):
+    """``tlx.ops.paged_attention_decode`` on gfx1250: packed 5-D FP8 K/V (the catalog admits nothing else here)."""
+    if max_context_len is None:
+        raise ValueError("packed FP8 decode needs max_context_len")
+    kv_heads, q_heads = key_cache.shape[1], query.shape[1]
+    q_scale = None if q_descale is None else _per_head(q_descale, q_heads)
+    return paged_attention_decode_fp8(query, key_cache, value_cache, context_lens, block_tables,
+                                      _per_head(k_descale, kv_heads), _per_head(v_descale, kv_heads),
+                                      max_context_len=max_context_len, q_scale=q_scale, query_length=query_length,
+                                      causal=causal, sliding_window=sliding_window, sm_scale=sm_scale,
+                                      num_splits=num_splits, out=out, workspace=workspace)
+
+
+def paged_attention_decode_workspace(query, key_cache, value_cache, block_tables, query_length, sliding_window,
+                                     max_context_len, kv_layout, norm_gate=False, num_splits=None):
+    if max_context_len is None:
+        raise ValueError("packed FP8 decode needs max_context_len")
+    return paged_attention_decode_fp8_workspace(query, key_cache, value_cache, block_tables,
+                                                max_context_len=max_context_len, query_length=query_length,
+                                                sliding_window=sliding_window, num_splits=num_splits)
