@@ -38,7 +38,7 @@ from .errors import (
 )
 
 from triton.language.extra.tlx.compiler.dispatch import TLX_WITH_DISPATCH
-from triton.language.extra.tlx.compiler.code_generator import visit_withWarpPipelineStage
+from triton.language.extra.tlx.compiler.code_generator import region_mangle_suffix, visit_withWarpPipelineStage
 
 WITH_DISPATCH = {}  # central registry for all 'with' handlers
 
@@ -1616,6 +1616,7 @@ class CodeGenerator(ast.NodeVisitor):
         # mangle
         caller_context = caller_context or self.caller_context
         fn_name = mangle_fn(get_full_name(fn), [arg.type for arg in args_val], args_cst, caller_context)
+        fn_name += region_mangle_suffix(self.builder)
         # generate function def if necessary
         if not self.module.has_function(fn_name):
             # If the callee is not set, we use the same debug setting as the caller
