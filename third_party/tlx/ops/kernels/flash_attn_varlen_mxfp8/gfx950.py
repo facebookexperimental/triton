@@ -305,7 +305,13 @@ def _mfma_softmax_loop_4w(
     qk_scale,
     FAST_EXP: tl.constexpr,
 ):
-    """An item's middle tiles, two per iteration.
+    """Main loop of the online-softmax attention over a work item's 128-key
+    tiles. Each step computes the scores QK^T of the next tile, adds P V of
+    the current tile into the output accumulator, and updates the softmax
+    with the new scores (running row max and row sum, rescaling the
+    accumulator). The kernel's prologue computes QK^T and the softmax of the
+    first tile and its epilogue finishes the last two tiles; this loop covers
+    the tiles in between, two per iteration, one from each LDS slot.
 
     On entry P holds tile 0 and LDS slot 0 holds K tile 1 and V tile 0. Each
     stage takes QK of the next tile and PV of the current one from one slot
