@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.runtime.driver import driver
+from triton.runtime.jit import constexpr_function
 
 from ..._catalog import InvalidInput
 from ..._invariance import gemm_fixed_split_k
@@ -2992,9 +2993,11 @@ def _wg_wave_grid_global_load_pgr2_b_half(
                               or (block_n == 160 and m <= block_m) or (block_n == 224 and m <= block_m)
                               or (m == 128 and block_m == 128 and ((block_n == 96 and stride_bn == 4416) or
                                                                    (block_n == 128 and stride_bn == 20926))))
-    load_contiguity: tl.constexpr = (8 if (m == 128 and block_m == 128 and block_n == 128 and block_k == 64
-                                           and a_row_count == 4 and b_group_n == 32 and stride_bk == 1
-                                           and stride_bn == 20926) else half_n // 8)
+    wide_pgr2_b: tl.constexpr = (block_k == 64 and b_group_n == 32 and stride_bk == 1
+                                 and ((block_m == 224 and block_n == 224) or
+                                      (block_m == 256 and block_n == 256 and stride_bn == 1894) or stride_bn == 607
+                                      or stride_bn == 1892 or stride_bn == 6640 or stride_bn == 20926))
+    load_contiguity: tl.constexpr = 8 if wide_pgr2_b else half_n // 8
     if cache_policy != "auto":
         return tlx.buffer_load(b_ptr, offsets, cache=cache_policy, contiguity=load_contiguity)
     if stream_b:
@@ -3267,14 +3270,15 @@ def _wg_wave_grid_global_load_pgr2_b_tail_half(
     stream_b: tl.constexpr = (block_n == 192 or (block_m == 64 and block_n == 64 and m <= 2 * block_m)
                               or (block_m == 64 and block_n == 96 and m <= 2 * block_m)
                               or (block_n == 160 and m <= block_m) or (block_n == 224 and m <= block_m))
+    load_contiguity: tl.constexpr = (8 if stride_bk == 1 and stride_bn == 7104 else half_n // 8)
     if stream_b:
         return tlx.buffer_load(
             b_ptr,
             safe_offsets,
             cache=".cg",
-            contiguity=4,
+            contiguity=load_contiguity,
         )
-    return tlx.buffer_load(b_ptr, safe_offsets, contiguity=half_n // 8)
+    return tlx.buffer_load(b_ptr, safe_offsets, contiguity=load_contiguity)
 
 
 @triton.jit
@@ -17991,6 +17995,34 @@ def _load_paired_strided_b(b_ptr, rows, cols, k: tl.constexpr, n: tl.constexpr, 
     return tl.where(last, final, value)
 
 
+@constexpr_function
+def _register_a_load_layout(block_m, block_k, num_warps):
+
+    def is_power_of_two(value):
+        return value > 0 and value & (value - 1) == 0
+
+    assert is_power_of_two(block_m)
+    assert block_k % 8 == 0 and is_power_of_two(block_k // 8)
+    assert is_power_of_two(num_warps)
+    strides = (block_k, 1)
+
+    def flatten(coordinates):
+        return sum(coordinate * stride for coordinate, stride in zip(coordinates, strides))
+
+    def bits(value):
+        return [1 << index for index in range(value.bit_length() - 1)]
+
+    rest = [(0, 8 * bit) for bit in bits(block_k // 8)] + [(bit, 0) for bit in bits(block_m)]
+    warp_bits = len(bits(num_warps))
+    rest += [(0, 0)] * max(0, 6 + warp_bits - len(rest))
+    lane = rest[:6]
+    warp = rest[6:6 + warp_bits]
+    register = [(0, 1), (0, 2), (0, 4)] + rest[6 + warp_bits:]
+    threads = tuple(flatten(coordinates) for coordinates in lane + warp)
+    values = tuple(flatten(coordinates) for coordinates in register)
+    return tlx.layout(shape=((2, ) * len(threads), (2, ) * len(values)), stride=(threads, values))
+
+
 @triton.jit
 def _register_matmul_core(
     a_ptr,
@@ -18014,6 +18046,7 @@ def _register_matmul_core(
     CACHE_A_CG: tl.constexpr = False,
     CACHE_B_CG: tl.constexpr = False,
     CACHE_B_TAIL_CG: tl.constexpr = False,
+    A_LOAD_LAYOUT: tl.constexpr = None,
     PACK_B_PAIRS: tl.constexpr = False,
     B_PAIRS_PADDED: tl.constexpr = False,
     USE_I64_A_OFFSETS: tl.constexpr = False,
@@ -18056,13 +18089,24 @@ def _register_matmul_core(
         tail_extent: tl.constexpr = K - full_k_tiles * BLOCK_K
     for k_idx in range(0, full_k_tiles):
         k = k_start + k_idx * BLOCK_K
-        a_ptrs = a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak
+        a_offsets = a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak
         b_ptrs = b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn
-        if MASK_ROWS:
+        if A_LOAD_LAYOUT is not None:
+            load_offsets = tlx.require_layout(a_offsets.to(tl.int32), A_LOAD_LAYOUT, pin=True)
+            if MASK_ROWS:
+                load_mask = tlx.require_layout(tl.broadcast_to(row_mask[:, None], (BLOCK_M, BLOCK_K)), A_LOAD_LAYOUT)
+                a = tlx.buffer_load(a_ptr, load_offsets, mask=load_mask, other=0.0, contiguity=8,
+                                    cache=".cg" if CACHE_A_CG else "")
+            else:
+                a = tlx.buffer_load(a_ptr, load_offsets, contiguity=8, cache=".cg" if CACHE_A_CG else "")
+        elif MASK_ROWS:
+            a_ptrs = a_ptr + a_offsets
             a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0, cache_modifier=".cg" if CACHE_A_CG else "")
         elif CACHE_A_CG:
+            a_ptrs = a_ptr + a_offsets
             a = tl.load(a_ptrs, cache_modifier=".cg")
         else:
+            a_ptrs = a_ptr + a_offsets
             a = tl.load(a_ptrs)
         if PACK_B_PAIRS:
             b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_CG, B_PAIRS_PADDED)
@@ -18084,11 +18128,19 @@ def _register_matmul_core(
     if tail_extent > 0:
         k = k_start + full_k_tiles * BLOCK_K
         k_mask = offs_k < tail_extent
-        a_ptrs = a_ptr + a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak
+        a_offsets = a_rows[:, None] * stride_am + (k + a_cols[None, :]) * stride_ak
         b_ptrs = b_ptr + (k + b_rows[:, None]) * stride_bk + b_cols[None, :] * stride_bn
-        if MASK_ROWS:
+        if A_LOAD_LAYOUT is not None:
+            a_ptrs = a_ptr + a_offsets
+            load_mask = k_mask[None, :]
+            if MASK_ROWS:
+                load_mask = row_mask[:, None] & load_mask
+            a = tl.load(a_ptrs, mask=load_mask, other=0.0, cache_modifier=".cg" if CACHE_A_CG else "")
+        elif MASK_ROWS:
+            a_ptrs = a_ptr + a_offsets
             a = tl.load(a_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
         else:
+            a_ptrs = a_ptr + a_offsets
             a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
         if PACK_B_PAIRS:
             b = _load_paired_strided_b(b_ptr, k + b_rows, b_cols, K, N, stride_bk, CACHE_B_TAIL_CG, B_PAIRS_PADDED)
@@ -18726,6 +18778,63 @@ _BF16_M27_QKV_SPLIT_REGISTER_PLAN = _normalize_split_register_plan({
 })
 
 
+def _decode_range_plan(block_m, block_n, block_k, num_warps, num_stages):
+    return MappingProxyType(
+        dict(_fixed_register_plan(block_m, block_n, block_k, 4, 8, num_warps, num_stages), CACHE_B_CG=True,
+             regclass_priority_trumps_globalness=False))
+
+
+def _decode_split_plan(block_m, block_n, block_k, split_k, num_warps, num_stages):
+    return _normalize_split_register_plan(
+        dict(_fixed_register_plan(block_m, block_n, block_k, 4, 1, num_warps, num_stages), SPLIT_K=split_k, GROUP_M=4,
+             NUM_XCDS=1, CACHE_B=True, ACCUMULATE_IN_DOT=False, SERIAL_REDUCE=True))
+
+
+# Decode-sized BF16 projections, A[M, K] row-major times B = W[N, K].T (the Muse Spark TP8 QKV + output gate, o_proj,
+# pre- and post-expert shapes), M = 2..64. Each (N, K) maps to (largest M, path, plan) buckets in increasing M.
+# Measured on MI350X with cold weights (rotating copies over twice the 256 MiB MALL) and HIP-graph replay. These
+# shapes are weight-read bound. The unsplit register kernel was fastest at the smaller M of every shape (13-14 us,
+# about 5 TB/s, for the 64 MiB pre/post-expert weights: what a plain 64 MiB streaming read reaches) and at every M of
+# 8192 x 1024; split-K was fastest from M = 9 (2304 x 8192), 17 (4096 x 8192) and 33 (8192 x 4096).
+_BF16_DECODE_PROJECTION_PLANS = {
+    # QKV + output gate.
+    (2304, 8192): (
+        (8, "range_register", _decode_range_plan(16, 16, 512, 2, 3)),
+        (16, "split_register", _decode_split_plan(16, 32, 128, 16, 2, 2)),
+        (32, "split_register", _decode_split_plan(32, 32, 128, 8, 4, 2)),
+        (64, "split_register", _decode_split_plan(64, 64, 128, 4, 2, 3)),
+    ),
+    # o_proj.
+    (8192, 1024): (
+        (16, "range_register", _decode_range_plan(16, 32, 256, 2, 3)),
+        (32, "range_register", _decode_range_plan(32, 32, 256, 4, 3)),
+        (64, "range_register", _decode_range_plan(32, 32, 256, 4, 2)),
+    ),
+    # Pre-expert projection.
+    (4096, 8192): (
+        (16, "range_register", _decode_range_plan(16, 16, 512, 2, 3)),
+        (32, "split_register", _decode_split_plan(32, 64, 128, 8, 4, 2)),
+        (64, "split_register", _decode_split_plan(64, 64, 128, 8, 2, 2)),
+    ),
+    # Post-expert projection.
+    (8192, 4096): (
+        (16, "range_register", _decode_range_plan(16, 32, 256, 2, 3)),
+        (32, "range_register", _decode_range_plan(32, 32, 256, 4, 3)),
+        (64, "split_register", _decode_split_plan(64, 64, 128, 4, 4, 2)),
+    ),
+}
+
+
+def _decode_projection_dispatch(m, n, k):
+    """Return the measured (path, plan) for a decode-sized TN projection, or None outside the table."""
+    if not 2 <= m <= 64:
+        return None
+    for max_m, path, plan in _BF16_DECODE_PROJECTION_PLANS.get((n, k), ()):
+        if m <= max_m:
+            return path, plan
+    return None
+
+
 @triton.jit
 def _split_register_kernel(
     a_ptr,
@@ -18907,6 +19016,12 @@ _SPLIT_REGISTER_HOST_KEYS = frozenset({
 })
 
 
+def _split_register_fallback_plan():
+    """The unsplit range-register plan that split-register routes fall back to."""
+    return dict(_fixed_register_plan(32, 16, 512, 4, 8, 2, 3), CACHE_B_CG=True,
+                regclass_priority_trumps_globalness=False)
+
+
 def _launch_split_register(a, b, out, plan, *, fallback_plan=None, workspace=None):
     """Launch the canonical register Split-K route with FP32 partials.
 
@@ -18947,8 +19062,7 @@ def _launch_split_register(a, b, out, plan, *, fallback_plan=None, workspace=Non
             raise InvalidInput("split-register requires K slices of at least 32 elements")
     elif (tail or a.data_ptr() % 16 or b.data_ptr() % 16 or slice_len < 4 * block_k or slice_len % block_k):
         if fallback_plan is None:
-            fallback_plan = dict(_fixed_register_plan(32, 16, 512, 4, 8, 2, 3), CACHE_B_CG=True,
-                                 regclass_priority_trumps_globalness=False)
+            fallback_plan = _split_register_fallback_plan()
         return _launch_range_register_plan(a, b, out=out, config=fallback_plan)
     # The FP32 workspace holds one (M, N) slab per split; validate the total
     # offset bound before allocating, as the original shared-core route did.
@@ -19033,6 +19147,10 @@ def _range_family_candidates(m, n, k, dtype, element_size, a_strides, b_strides)
             if (n, k) == (2304, 8192):
                 return (("split_register", _BF16_M27_QKV_SPLIT_REGISTER_PLAN), ("range_register", plan))
             return (("range_register", plan), )
+    if dtype == torch.bfloat16 and a_strides == (k, 1) and b_strides == (1, k):
+        dispatch = _decode_projection_dispatch(m, n, k)
+        if dispatch is not None:
+            return (dispatch, )
     if not 128 <= k <= 4096 or n < 128:
         return ()
     if dtype == torch.bfloat16 and a_strides == (k, 1) and b_strides == (1, k):
@@ -26007,10 +26125,7 @@ _COLUMN_MAJOR_B_TRANSPOSED_REGISTER_SHAPES = set()
 
 _FP16_TRANSPOSED_REGISTER_PLANS = {
     (256, 282, 282):
-    MappingProxyType({
-        **_fixed_register_plan(32, 16, 128, 1, 1, 4, 3, waves_per_eu=2),
-        "llvm_fn_attrs": (("amdgpu-sched-strategy", "iterative-maxocc"), ),
-    }),
+    _fixed_register_plan(32, 32, 128, 8, 1, 4, 3),
     (256, 2_048, 359):
     _fixed_register_plan(64, 32, 64, 8, 1, 4, 2),
     (256, 1_024, 2_048):
@@ -27038,7 +27153,19 @@ def _cached_optimized_geometry_config(m, n, k, dtype, element_size, a_strides, b
     if dtype == torch.float16 and shape == (3_072, 3, 1_024):
         return "register", dict(_register_plan_for_shape(m, n, k, dtype), CACHE_A_CG=True)
     if dtype == torch.float16 and shape == (256, 2_048, 359):
-        return "register", _fixed_register_plan(64, 32, 64, 8, 1, 4, 2)
+        return "transposed_wave_grid", _wg_regular_wave_grid_plan(
+            1,
+            2,
+            2,
+            2,
+            64,
+            local_stages=1,
+            pgr2_operands=True,
+            row_wise_epilogue=True,
+            exact_lds=True,
+            dot_mode="persistent",
+            waves_per_eu=1,
+        )
     if dtype == torch.float16 and shape == (1_024, 1_024, 864):
         return "register", _fixed_register_plan(64, 64, 128, 4, 1, 4, 3)
     if dtype == torch.float16 and shape == (3_072, 2_048, 6_144):
@@ -27091,8 +27218,24 @@ def _cached_optimized_geometry_config(m, n, k, dtype, element_size, a_strides, b
     if dtype == torch.float16 and shape == (1_024, 6_144, 4_096) and b_strides[0] == 1:
         return _adjusted_dispatch_plan(m, n, k, dtype, element_size, local_stages=2)
     if dtype == torch.float16 and shape == (3_072, 5_888, 44_536):
-        return _adjusted_dispatch_plan(m, n, k, dtype, element_size, mi_wave_tile_m=6, mi_wave_tile_n=8, num_xcds=2,
-                                       split_k=4)
+        return _adjusted_dispatch_plan(
+            m,
+            n,
+            k,
+            dtype,
+            element_size,
+            mi_wave_tile_m=7,
+            mi_wave_tile_n=7,
+            local_stages=2,
+            exact_lds=False,
+            read_cover_sixteenths=15,
+            num_xcds=2,
+            reverse_local_assignment=True,
+            dot_mode="logical",
+            split_k=2,
+            reduce_tile=(32, 32),
+            reduce_warps=4,
+        )
     if dtype == torch.float16 and shape == (3_072, 128, 44_536):
         return _adjusted_dispatch_plan(m, n, k, dtype, element_size, split_k=8, pair_balanced_split_k=True, num_xcds=2,
                                        workgroup_mapping=2, reverse_local_assignment=True,
@@ -27361,7 +27504,10 @@ def _launch_dispatch(a, b, out, dispatch, bias=None):
     path, plan = dispatch
     if path == "row_split":
         return _launch_row_split(a, b, out, plan, bias=bias)
-    if bias is not None and path in ("gemv", "split_register"):
+    if bias is not None and path == "split_register":
+        # The split partials carry no bias: run the fixed unsplit plan instead of autotuning on the first call.
+        return _launch_range_register_plan(a, b, bias=bias, config=_split_register_fallback_plan(), out=out)
+    if bias is not None and path == "gemv":
         return _launch_register(a, b, bias=bias, out=out)
     if path == "split_register":
         return _launch_split_register(a, b, out, _normalize_split_register_plan(plan))
@@ -27554,7 +27700,7 @@ def _range_winner_is_stable(a, b, out, candidates, timings, winner, use_cache):
     return sorted(cold[1])[4] <= sorted(cold[0])[4] * _COLD_RECHECK_TOLERANCE
 
 
-def mm(a, b, *, out=None, space="heuristic", invariance=None):
+def mm(a, b, *, out=None, space="heuristic", invariance=None, b_static=False):
     """Run the trusted gfx950 entry selected after ``tlx.ops.mm`` validation.
 
     A fixed schedule prunes the K-splitting dispatch families so the K

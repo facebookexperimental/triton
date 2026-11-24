@@ -609,6 +609,7 @@ class nvidia_knobs(base_knobs):
     ptxas: env_nvidia_tool = env_nvidia_tool("ptxas")
 
     dump_nvptx: env_bool = env_bool("NVPTX_ENABLE_DUMP")
+    use_slp_vectorizer: env_bool = env_bool("TRITON_USE_SLP_VECTORIZER", False)
     disable_ptxas_opt: env_bool = env_bool("DISABLE_PTXAS_OPT")
     ptxas_options: env_opt_str = env_opt_str("PTXAS_OPTIONS")
     mock_ptx_version: env_opt_str = env_opt_str("TRITON_MOCK_PTX_VERSION")
@@ -737,8 +738,6 @@ class amd_knobs(base_knobs):
     use_coexec_scheduler: env_opt_bool = env_opt_bool("TRITON_HIP_USE_COEXEC_SCHEDULER")
     use_expert_scheduling: env_opt_bool = env_opt_bool("TRITON_HIP_USE_EXPERT_SCHEDULING")
     enable_ttgir_schedule: env_bool = env_bool("TRITON_AMD_TTGIR_SCHEDULE")
-
-    scalarize_packed_fops: env_bool = env_bool("AMDGCN_SCALARIZE_PACKED_FOPS")
 
     # Path to dump MIR files for debugging/analysis
     dump_mir: env_opt_str = env_opt_str("TRITON_DUMP_MIR")

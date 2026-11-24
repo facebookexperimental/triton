@@ -99,6 +99,42 @@ class _Nvml:
             return None
         return sm.value, reasons.value
 
+    def count(self) -> int:
+        n = ctypes.c_uint()
+        if self.lib is None or self.lib.nvmlDeviceGetCount_v2(ctypes.byref(n)) != 0:
+            return 0
+        return n.value
+
+    def by_index(self, index: int):
+        if self.lib is None:
+            return None
+        h = ctypes.c_void_p()
+        if self.lib.nvmlDeviceGetHandleByIndex_v2(ctypes.c_uint(index), ctypes.byref(h)) != 0:
+            return None
+        return h
+
+    def text(self, fn: str, *args) -> Optional[str]:
+        buf = ctypes.create_string_buffer(96)
+        if self.lib is None or getattr(self.lib, fn)(*args, buf, ctypes.c_uint(len(buf))) != 0:
+            return None
+        return buf.value.decode()
+
+    def uint(self, fn: str, *args) -> Optional[int]:
+        v = ctypes.c_uint()
+        if self.lib is None or getattr(self.lib, fn)(*args, ctypes.byref(v)) != 0:
+            return None
+        return v.value
+
+
+class _NvmlMemory(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+
+class _NvmlPci(ctypes.Structure):
+    _fields_ = [("bus_id_legacy", ctypes.c_char * 16), ("domain", ctypes.c_uint), ("bus", ctypes.c_uint),
+                ("device", ctypes.c_uint), ("pci_device_id", ctypes.c_uint), ("pci_subsystem_id", ctypes.c_uint),
+                ("bus_id", ctypes.c_char * 32)]
+
 
 _nvml: Optional[_Nvml] = None
 
@@ -201,14 +237,74 @@ def gpu_uuid(device: int = 0) -> Optional[str]:
     # `device` is a physical index (see `driver.device_index`). Asking torch for
     # it breaks once the visibility variable pins GPU N: torch then sees one
     # device, the lookup fails, and every helper silently falls back to GPU 0.
-    return _smi(["-i", str(device), "--query-gpu=uuid", "--format=csv,noheader"]) or None
+    uuid = _smi(["-i", str(device), "--query-gpu=uuid", "--format=csv,noheader"])
+    if uuid is None and shutil.which("nvidia-smi") is None:
+        h = nvml().by_index(device)
+        uuid = nvml().text("nvmlDeviceGetUUID", h) if h is not None else None
+    return uuid or None
+
+
+def _nvml_state(uuid: Optional[str], device: int) -> GpuState:
+    """`gpu_state` without nvidia-smi: containers mount the driver's NVML but not its tools."""
+    n = nvml()
+    h = n.handle(uuid) if uuid else n.by_index(device)
+    if h is None:
+        return GpuState(available=False)
+
+    def watts(fn: str) -> Optional[float]:
+        mw = n.uint(fn, h)
+        return None if mw is None else mw / 1000
+
+    lo, hi = ctypes.c_uint(), ctypes.c_uint()
+    max_limit = hi.value / 1000 if n.lib.nvmlDeviceGetPowerManagementLimitConstraints(
+        h, ctypes.byref(lo), ctypes.byref(hi)) == 0 else None
+    persistence = n.uint("nvmlDeviceGetPersistenceMode", h)
+    sample = n.sample(h)
+    return GpuState(
+        available=True,
+        index=n.uint("nvmlDeviceGetIndex", h),
+        uuid=n.text("nvmlDeviceGetUUID", h),
+        name=n.text("nvmlDeviceGetName", h),
+        driver=n.text("nvmlSystemGetDriverVersion"),
+        sm_clock_mhz=sample[0] if sample else None,
+        max_sm_clock_mhz=n.uint("nvmlDeviceGetMaxClockInfo", h, _NVML_CLOCK_SM),
+        power_draw_w=watts("nvmlDeviceGetPowerUsage"),
+        power_limit_w=watts("nvmlDeviceGetPowerManagementLimit"),
+        max_power_limit_w=max_limit,
+        temperature_c=n.uint("nvmlDeviceGetTemperature", h, 0),
+        persistence_mode=None if persistence is None else ("Enabled" if persistence else "Disabled"),
+        event_reasons=sample[1] if sample else None,
+    )
+
+
+def _nvml_bus(uuid: Optional[str], device: int) -> Optional[str]:
+    n = nvml()
+    h = n.handle(uuid) if uuid else n.by_index(device)
+    pci = _NvmlPci()
+    if h is None or n.lib.nvmlDeviceGetPciInfo_v3(h, ctypes.byref(pci)) != 0:
+        return None
+    return pci.bus_id.decode().lower()
+
+
+def _nvml_devices() -> list:
+    n = nvml()
+    found = []
+    for index in range(n.count()):
+        h = n.by_index(index)
+        if h is None:
+            continue
+        mem = _NvmlMemory()
+        used = mem.used / 2**20 if n.lib.nvmlDeviceGetMemoryInfo(h, ctypes.byref(mem)) == 0 else 0.0
+        name = n.text("nvmlDeviceGetName", h) or f"NVIDIA GPU {index}"
+        found.append(Device(NVIDIA, index, name, n.text("nvmlDeviceGetUUID", h), used))
+    return found
 
 
 def gpu_state(uuid: Optional[str] = None, device: int = 0) -> GpuState:
     uuid = uuid or gpu_uuid(device)
     out = _smi([f"--query-gpu={_QUERY}", "--format=csv,noheader,nounits"])
     if out is None:
-        return GpuState(available=False)
+        return _nvml_state(uuid, device) if shutil.which("nvidia-smi") is None else GpuState(available=False)
     for line in out.splitlines():
         f = [x.strip() for x in line.split(",")]
         if len(f) != _QUERY_FIELDS or (uuid is not None and f[1] != uuid):
@@ -268,10 +364,10 @@ def parse_cpulist(text: str) -> set[int]:
 def numa_node(uuid: Optional[str] = None, device: int = 0) -> Optional[int]:
     uuid = uuid or gpu_uuid(device)
     out = _smi(["--query-gpu=uuid,pci.bus_id", "--format=csv,noheader"])
-    if not out:
-        return None
     bus = None
-    for line in out.splitlines():
+    if out is None and shutil.which("nvidia-smi") is None:
+        bus = _nvml_bus(uuid, device)
+    for line in (out or "").splitlines():
         f = [x.strip() for x in line.split(",")]
         if len(f) == 2 and (uuid is None or f[0] == uuid):
             bus = f[1].lower()
@@ -281,7 +377,7 @@ def numa_node(uuid: Optional[str] = None, device: int = 0) -> Optional[int]:
     # nvidia-smi prints an eight-digit PCI domain; sysfs uses four.
     bus = re.sub(r"^[0-9a-f]{4}([0-9a-f]{4}:)", r"\1", bus)
     try:
-        with open(f"/sys/bus/pci/devices/{bus}/numa_node") as fh:
+        with open(f"{_PCI_DEVICES}/{bus}/numa_node") as fh:
             node = int(fh.read().strip())
     except (OSError, ValueError):
         return None
@@ -334,10 +430,13 @@ def check(device: int = 0) -> list[str]:
     if not state.available:
         return ["nvidia-smi unavailable: cannot verify NUMA, tenancy, or the GPU operating point"]
 
-    others = foreign_processes(uuid, device)
-    if others:
-        who = ", ".join(f"pid {p['pid']} ({p['used_mib']:.0f} MiB)" for p in others)
-        problems.append(f"{len(others)} other process(es) on this GPU: {who}")
+    if shutil.which("nvidia-smi") is None:
+        problems.append("nvidia-smi unavailable: cannot verify tenancy")
+    else:
+        others = foreign_processes(uuid, device)
+        if others:
+            who = ", ".join(f"pid {p['pid']} ({p['used_mib']:.0f} MiB)" for p in others)
+            problems.append(f"{len(others)} other process(es) on this GPU: {who}")
 
     node = numa_node(uuid, device)
     if numa_bound(node) is False:
@@ -547,7 +646,8 @@ def _rocm(args: list[str]) -> Optional[str]:
 
 
 def vendor() -> Optional[str]:
-    if _smi(["--query-gpu=index", "--format=csv,noheader"]) is not None:
+    smi = _smi(["--query-gpu=index", "--format=csv,noheader"])
+    if smi is not None or (shutil.which("nvidia-smi") is None and nvml().count() > 0):
         return NVIDIA
     if _rocm(["--showid"]) is not None:
         return AMD
@@ -557,9 +657,11 @@ def vendor() -> Optional[str]:
 def list_devices() -> list[Device]:
     which = vendor()
     if which == NVIDIA:
-        out = _smi(["--query-gpu=index,name,uuid,memory.used", "--format=csv,noheader,nounits"]) or ""
+        out = _smi(["--query-gpu=index,name,uuid,memory.used", "--format=csv,noheader,nounits"])
+        if out is None and shutil.which("nvidia-smi") is None:
+            return _nvml_devices()
         found = []
-        for line in out.splitlines():
+        for line in (out or "").splitlines():
             f = [x.strip() for x in line.split(",")]
             if len(f) == 4:
                 found.append(Device(NVIDIA, int(f[0]), f[1], f[2], _num(f[3]) or 0.0))

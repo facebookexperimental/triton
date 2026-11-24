@@ -1315,7 +1315,7 @@ def _cold_gpu_time(fn, calls=10, reps=5):
     return diffs[reps // 2] / calls
 
 
-def mm(a, b, *, out=None, space="full", invariance=None):
+def mm(a, b, *, out=None, space="full", invariance=None, b_static=False):
     """Compute ``a @ b`` with the Hopper cooperative persistent GEMM.
 
     `invariance` is the resolved spec; a fixed schedule prunes split-K

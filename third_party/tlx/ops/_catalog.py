@@ -241,10 +241,10 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
-        op="mm_mxfp8",
+        op="mm_mxfp",
         arch="sm100",
         variant="ws_mxfp8",
-        impl="triton.tlx.ops.kernels.mm_mxfp8.sm100:mm_mxfp8",
+        impl="triton.tlx.ops.kernels.mm_mxfp.sm100:mm_mxfp",
         invariant_vocab=_GEMM_DIMS,
         dtypes=frozenset({"float8_e4m3fn"}),
         # Row strides are 128-aligned by the M/N/K contract; only the bases vary.
@@ -253,10 +253,10 @@ CATALOG: tuple[OpSpec, ...] = (
         default_space="full",
     ),
     OpSpec(
-        op="mm_mxfp8",
+        op="mm_mxfp",
         arch="gfx950",
         variant="scaled_mfma",
-        impl="triton.tlx.ops.kernels.mm_mxfp8.gfx950:mm_mxfp8",
+        impl="triton.tlx.ops.kernels.mm_mxfp.gfx950:mm_mxfp",
         invariant_vocab=_GEMM_DIMS,
         dtypes=frozenset({"float8_e4m3fn"}),
         # A generic load path handles unaligned base pointers. The fast LDS
@@ -264,10 +264,10 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
-        op="mm_mxfp8",
+        op="mm_mxfp",
         arch="gfx1250",
         variant="persistent_tdm",
-        impl="triton.tlx.ops.kernels.mm_mxfp8.gfx1250:mm_mxfp8",
+        impl="triton.tlx.ops.kernels.mm_mxfp.gfx1250:mm_mxfp",
         invariant_vocab=_GEMM_DIMS,
         dtypes=frozenset({"float8_e4m3fn"}),
         # TDM descriptors need 16-byte-aligned bases; row strides follow from
@@ -348,6 +348,30 @@ CATALOG: tuple[OpSpec, ...] = (
         accepts=lambda d: d["H"] in (4096, 8192, 16384),
     ),
     OpSpec(
+        op="all_reduce",
+        arch="gfx950",
+        variant="one_or_two_shot",
+        impl="triton.tlx.ops.kernels.collectives.all_reduce.gfx950:all_reduce",
+        dtypes=_BF16,
+        # tl.arange over the ranks needs a power of two; one node has at most 8 GPUs.
+        accepts=lambda d: d["world"] in (2, 4, 8),
+    ),
+    OpSpec(
+        op="all_reduce_workspace",
+        arch="gfx950",
+        variant="symmetric_input_uncached_signals",
+        impl="triton.tlx.ops.kernels.collectives.all_reduce.gfx950:Workspace",
+    ),
+    OpSpec(
+        op="all_reduce_norm_residual_norm",
+        arch="gfx950",
+        variant="fused_one_shot",
+        impl=
+        "triton.tlx.ops.kernels.collectives.fused.all_reduce_norm_residual_norm.gfx950:all_reduce_norm_residual_norm",
+        dtypes=_BF16,
+        accepts=lambda d: d["world"] in (2, 4, 8) and d["H"] in (4096, 8192, 16384),
+    ),
+    OpSpec(
         op="rmsnorm_gate",
         arch="gfx950",
         variant="eight_heads_per_program",
@@ -365,6 +389,15 @@ CATALOG: tuple[OpSpec, ...] = (
         # Tiles have no K/N tail; 256-wide N tiles fall back to 128 when they do not divide I or H.
         accepts=lambda d: all(d[dim] > 0 and d[dim] % 128 == 0 for dim in ("K", "I", "H")),
         requires=frozenset(),
+    ),
+    OpSpec(
+        op="moe_finalize",
+        arch="sm100",
+        variant="slot_tile",
+        impl="triton.tlx.ops.kernels.moe_finalize.sm100:moe_finalize",
+        dtypes=_BF16,
+        requires=frozenset(),
+        supports_backward=True,
     ),
     OpSpec(
         op="moe_routing",
@@ -396,12 +429,33 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="moe_mxfp4_sort_quant",
+        arch="gfx950",
+        variant="one_launch",
+        impl="triton.tlx.ops.kernels.fused.moe_mxfp4_sort_quant.gfx950:moe_mxfp4_sort_quant",
+        dtypes=_BF16,
+        # Decode-sized calls: every program recomputes the routing layout over all T tokens (T * topk <= 512).
+        accepts=lambda d: 0 < d["T"] <= 64 and d["K"] % 256 == 0 and 0 < d["topk"] <= 8 and 0 < d["E_local"] <= 64 and
+        d["block_m"] == 32,
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="router_gemm",
         arch="gfx950",
         variant="bf16x3_split_k",
         impl="triton.tlx.ops.kernels.router_gemm.gfx950:router_gemm",
         dtypes=_BF16,
         # GEMV loads and split-K partitions are powers of two that divide E and K.
+        accepts=lambda d: d["E"] > 0 and d["E"] % 16 == 0 and d["K"] > 0 and d["K"] % 1024 == 0,
+        requires=frozenset(),
+    ),
+    OpSpec(
+        op="router_gemm",
+        arch="sm100",
+        variant="bf16x3_split_k",
+        impl="triton.tlx.ops.kernels.router_gemm.sm100:router_gemm",
+        dtypes=_BF16,
+        # The gfx950 kernels with sm100 configs: the same powers of two divide E and K.
         accepts=lambda d: d["E"] > 0 and d["E"] % 16 == 0 and d["K"] > 0 and d["K"] % 1024 == 0,
         requires=frozenset(),
     ),

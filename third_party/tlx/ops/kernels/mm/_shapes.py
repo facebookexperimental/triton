@@ -753,6 +753,16 @@ FOCUS_SUITES = (
         ),
     ),
     FocusSuite(
+        # Muse Spark TP8 decode projections (QKV + output gate, o_proj, pre- and post-expert): BF16 A[M, K] times
+        # contiguous W[N, K].T at decode batch sizes and the speculative-verify range.
+        name="gfx950_5",
+        op="mm",
+        shapes=tuple(
+            MMShape(m, n, k, (k, 1), (1, k), "bf16")
+            for n, k in ((2304, 8192), (8192, 1024), (4096, 8192), (8192, 4096))
+            for m in (2, 4, 8, 16, 32, 64)),
+    ),
+    FocusSuite(
         name="gfx942_2",
         op="mm",
         includes=("gfx950_2", ),
@@ -765,7 +775,7 @@ FOCUS_SUITES = (
     FocusSuite(
         name="gfx950_all",
         op="mm",
-        includes=("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_addmm", "gfx950_4"),
+        includes=("gfx950_1", "gfx950_2", "gfx950_3", "gfx950_addmm", "gfx950_4", "gfx950_5"),
     ),
 )
 

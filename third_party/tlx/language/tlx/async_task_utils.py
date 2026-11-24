@@ -41,6 +41,16 @@ class async_task:
         self.num_regs = None
         self.replicate = None
         self.warp_group_start_id = None
+        # TEMPORARY workaround for an NVPTX backend issue. NVPTX lets
+        # CodeGenPrepare sink compares into the blocks of their users, so a
+        # leader arrive after a loop keeps the 32-bit thread id live across the
+        # loop instead of its `tid == 0` predicate, and LICM keeps a per-warp
+        # arrive's hoisted lane-0 predicate live across the loop too. Either can
+        # perturb the ptxas schedule of a hot loop. With this set, the task's
+        # per-warp arrives test %laneid inside their own asm, and its leader
+        # arrives share one predicate built at the task entry. Only affects this
+        # task's barrier arrives; remove once NVPTX stops sinking compares.
+        self.nvptx_cmp_sink_workaround = bool(core._unwrap_if_constexpr(kwargs.get("nvptx_cmp_sink_workaround", False)))
         if args:
             assert len(args) == 1
             if core._unwrap_if_constexpr(args[0]) == "default":

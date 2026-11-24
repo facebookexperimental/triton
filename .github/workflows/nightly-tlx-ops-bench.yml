@@ -7,7 +7,7 @@ name: Nightly TLX.ops Bench
 # GPU_CI_SKIP_PLATFORMS (for example "b200") skips a platform here too.
 on:
   schedule:
-    - cron: '0 7,8 * * *'
+    - cron: '0 14 * * *'
   workflow_dispatch:
     inputs:
       date:
