@@ -755,8 +755,11 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
     bool changed = false;
     bool needsFinalQueueDrain = false;
     SmallVector<Attribute> finalDrainTaskIds;
+    // Tasks with a planned-count wait moved to a later iteration's stage.
+    SmallVector<Attribute> crossIterationTaskIds;
     for (auto waitOp : waits) {
       bool erasedWait = false;
+      bool rotatedAcrossIterations = false;
       auto attr = waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
       if (!attr)
         continue;
@@ -852,6 +855,20 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
           continue;
         }
 
+        // Read before the schedule is modified.
+        int writerStage = -1;
+        int storesBeforeWriter = 0;
+        if (targetWriter && !sameIteration) {
+          auto writerIt = schedule.find(targetWriter);
+          if (writerIt != schedule.end())
+            writerStage = writerIt->second.first;
+          auto walk = schedule.linearized(forOp, tmaStore);
+          walk.setMaxStages(schedule.getNumStages() + k);
+          for (++walk; !walk.isEnd() && *walk != targetWriter; ++walk)
+            if (isTMAStoreLikeOp(*walk))
+              ++storesBeforeWriter;
+        }
+
         // Split the cluster at the insertion target only after all safety
         // checks pass, so a rejected move leaves the schedule untouched.
         auto targetCluster =
@@ -892,6 +909,22 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
           needsFinalQueueDrain = true;
         } else {
           schedule.insert(waitOp, targetStage, waitCluster);
+          rotatedAcrossIterations = !sameIteration;
+          // The rotated wait is a stage after the writer, so the prologue has
+          // no copy of it and a run's first writes could race the previous
+          // run's last stores. Give the writer its own queue-wide wait.
+          if (rotatedAcrossIterations && targetWriter && writerStage >= 0 &&
+              k > 1 && waitOp.getBarriers().empty() &&
+              waitOp.getBarrierPreds().empty() &&
+              waitOp.getNvwsTokens().empty() &&
+              waitOp.getNvwsTokenIndices().empty()) {
+            OpBuilder builder(targetWriter);
+            auto queueWait = ttng::TMAStoreWaitOp::create(
+                builder, waitOp.getLoc(), std::min(k - 1, storesBeforeWriter));
+            if (Attribute taskIds = waitOp->getAttr(kAsyncTaskIdAttrName))
+              queueWait->setAttr(kAsyncTaskIdAttrName, taskIds);
+            schedule.insert(queueWait, writerStage, waitCluster);
+          }
         }
       } else {
         // Target not found; leave the schedule unchanged for this wait.
@@ -903,12 +936,47 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
       if (!erasedWait) {
         waitOp->removeAttr(kCanRotateByBufferCount);
         waitOp.trySetPlannedPendingCount(k - 1);
+        // Only a nonzero planned count leaves stores in flight; waits carrying
+        // barriers or tokens keep counting in program order.
+        Attribute taskIds = waitOp->getAttr(kAsyncTaskIdAttrName);
+        if (rotatedAcrossIterations && k > 1 &&
+            waitOp->hasAttr(ttng::kPlannedPendingCount) &&
+            !llvm::is_contained(crossIterationTaskIds, taskIds))
+          crossIterationTaskIds.push_back(taskIds);
       }
       changed = true;
     }
 
     if (changed)
       schedule.serialize(forOp);
+
+    // The drain copies keep the rotated count, leaving K-1 stores in flight
+    // at loop exit; drain them once after the outermost enclosing loop.
+    if (!crossIterationTaskIds.empty()) {
+      Operation *exitAnchor = forOp;
+      for (Operation *p = forOp->getParentOp();
+           p && isa<LoopLikeOpInterface, scf::IfOp>(p); p = p->getParentOp())
+        if (isa<LoopLikeOpInterface>(p))
+          exitAnchor = p;
+      for (Attribute taskIds : crossIterationTaskIds) {
+        if (exitAnchor == forOp) {
+          if (!llvm::is_contained(finalDrainTaskIds, taskIds))
+            finalDrainTaskIds.push_back(taskIds);
+          needsFinalQueueDrain = true;
+          continue;
+        }
+        auto next =
+            dyn_cast_or_null<ttng::TMAStoreWaitOp>(exitAnchor->getNextNode());
+        if (next && next.getPendings() == 0 &&
+            next->getAttr(kAsyncTaskIdAttrName) == taskIds)
+          continue;
+        OpBuilder exit(exitAnchor->getContext());
+        exit.setInsertionPointAfter(exitAnchor);
+        auto drain = ttng::TMAStoreWaitOp::create(exit, forOp.getLoc(), 0);
+        if (taskIds)
+          drain->setAttr(kAsyncTaskIdAttrName, taskIds);
+      }
+    }
 
     if (needsFinalQueueDrain) {
       OpBuilder builder(forOp);
