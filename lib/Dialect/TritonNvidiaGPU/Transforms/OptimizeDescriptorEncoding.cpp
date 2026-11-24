@@ -4,6 +4,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -32,7 +33,10 @@ struct UseInfo {
 
 static bool isTMACompatibleEncoding(Attribute enc) {
   if (auto nvmma = dyn_cast<ttg::NVMMASharedEncodingAttr>(enc)) {
-    return !nvmma.getTransposed();
+    // Only 128-byte swizzling is supported for padded FP4 TMA descriptors.
+    // MMA operands can still use padded layouts with smaller swizzles.
+    return !nvmma.getTransposed() &&
+           (!nvmma.isPaddedFp4() || nvmma.getSwizzlingByteWidth() == 128);
   }
   return false;
 }
@@ -58,31 +62,36 @@ static Attribute getCompatibleSharedEncoding(Attribute enc,
     return succeeded(candidateLayout) && *candidateLayout == sharedLinearLayout;
   };
 
-  SmallVector<ttg::NVMMASharedEncodingAttr> preferredCandidates;
   // TMA descriptors only support non-transposed layouts. Preserve Triton's
   // default shape/order-based choice when it already matches this
   // shared_linear layout. The full candidate scan below is only a fallback for
   // equivalent non-transposed layouts not selected by the heuristic builder.
-  for (bool fp4Padded : {false, true}) {
-    auto preferred = ttg::NVMMASharedEncodingAttr::get(
-        ctx, shape, order, cgaLayout, elementType, fp4Padded);
-    preferredCandidates.push_back(preferred);
-    if (isEquivalent(preferred))
-      return preferred;
+  unsigned elementBitWidth = std::max(8u, elementType.getIntOrFloatBitWidth());
+  unsigned preferredSwizzle =
+      ttg::NVMMASharedEncodingAttr::getDefaultSwizzlingByteWidth(
+          shape, order, cgaLayout, elementBitWidth, /*fp4Padded=*/false);
+  auto preferred = ttg::NVMMASharedEncodingAttr::get(
+      ctx, preferredSwizzle, /*transposed=*/false, elementBitWidth,
+      /*fp4Padded=*/false, cgaLayout);
+  if (isEquivalent(preferred))
+    return preferred;
+
+  for (unsigned swizzle : {0u, 32u, 64u, 128u}) {
+    if (swizzle == preferredSwizzle)
+      continue;
+    auto candidate = ttg::NVMMASharedEncodingAttr::get(
+        ctx, swizzle, /*transposed=*/false, elementBitWidth,
+        /*fp4Padded=*/false, cgaLayout);
+    if (isEquivalent(candidate))
+      return candidate;
   }
 
-  unsigned elementBitWidth = std::max(8u, elementType.getIntOrFloatBitWidth());
-  for (bool fp4Padded : {false, true}) {
-    for (unsigned swizzle : {0u, 32u, 64u, 128u}) {
-      auto candidate = ttg::NVMMASharedEncodingAttr::get(
-          ctx, swizzle, /*transposed=*/false, elementBitWidth, fp4Padded,
-          cgaLayout);
-      if (llvm::is_contained(preferredCandidates, candidate))
-        continue;
-      if (isEquivalent(candidate))
-        return candidate;
-    }
-  }
+  // Only 128-byte swizzling is supported for padded FP4 TMA descriptors.
+  auto fp4Padded = ttg::NVMMASharedEncodingAttr::get(
+      ctx, /*swizzlingByteWidth=*/128, /*transposed=*/false, elementBitWidth,
+      /*fp4Padded=*/true, cgaLayout);
+  if (isEquivalent(fp4Padded))
+    return fp4Padded;
 
   return {};
 }
@@ -177,6 +186,17 @@ std::optional<UseInfo> getUseInfo(Operation *op) {
     info.cgaLayout = ttg::getCGALayout(info.desiredSharedEncoding);
     auto shape = load.getResult().getType().getShape();
     auto rank = load.getDesc().getType().getBlockType().getRank();
+    info.shape = expandToRank(shape, rank);
+    return info;
+  }
+  if (auto gather = dyn_cast<ttng::AsyncTMAGatherOp>(op)) {
+    info.descriptor = cast<TypedValue<TensorDescType>>(gather.getDesc());
+    info.desiredSharedEncoding = gather.getResult().getType().getEncoding();
+    assert(isTMACompatibleEncoding(info.desiredSharedEncoding) &&
+           "expecting TMA compatible encoding");
+    info.cgaLayout = ttg::getCGALayout(info.desiredSharedEncoding);
+    auto shape = gather.getResult().getType().getShape();
+    auto rank = gather.getDesc().getType().getBlockType().getRank();
     info.shape = expandToRank(shape, rank);
     return info;
   }
@@ -374,18 +394,29 @@ Attribute getFallbackSharedEncoding(RankedTensorType tensorType,
   } else if (cgaLayout.getRank() != tensorType.getRank())
     cgaLayout = ttg::updateCGALayoutForShape(cgaLayout, shape);
 
+  if (isFP6(tensorType.getElementType()))
+    return ttg::NVMMASharedEncodingAttr::get(
+        ctx, 0, false, 8, ttg::NVMmaPadding::B6P2x16, cgaLayout);
   return ttg::NVMMASharedEncodingAttr::get(ctx, shape, order, cgaLayout,
                                            tensorType.getElementType(),
                                            /*fp4Padded*/ false);
 }
 
 TensorDescType getTensorDescTypeWithEncoding(Operation *op,
-                                             RankedTensorType existingTy,
+                                             TensorDescType descTy,
                                              Attribute encoding) {
-  auto sharedEnc = cast<triton::gpu::SharedEncodingTrait>(encoding);
-  encoding = ttg::updateEncodingForShape(op, sharedEnc, existingTy);
-  return TensorDescType::get(existingTy.getShape(), existingTy.getElementType(),
-                             encoding);
+  auto previous = dyn_cast_if_present<ttg::NVMMASharedEncodingAttr>(
+      descTy.getSharedLayout());
+  if (previous && previous.isPaddedFp6())
+    encoding = previous;
+  auto layout =
+      ttg::updateEncodingForShape(op, cast<ttg::SharedEncodingTrait>(encoding),
+                                  descTy.getSignlessBlockType());
+  Type elemTy = descTy.getElementType();
+  if (auto mma = dyn_cast<ttg::NVMMASharedEncodingAttr>(layout);
+      mma && mma.getPadding() == ttg::NVMmaPadding::B6P2x16 && isFP6(elemTy))
+    elemTy = IntegerType::get(descTy.getContext(), 8, IntegerType::Unsigned);
+  return TensorDescType::get(descTy.getShape(), elemTy, layout);
 }
 
 //===----------------------------------------------------------------------===//
@@ -641,8 +672,8 @@ LogicalResult assignMemoryLayouts(FuncOp &func) {
                                                 einfo->shape, numCTAs);
       }
     }
-    desc.setType(getTensorDescTypeWithEncoding(desc.getDefiningOp(), existingTy,
-                                               newEncoding));
+    desc.setType(getTensorDescTypeWithEncoding(desc.getDefiningOp(),
+                                               desc.getType(), newEncoding));
   }
 
   SmallVector<Type> argTys(func.getBlocks().front().getArgumentTypes());
@@ -651,8 +682,7 @@ LogicalResult assignMemoryLayouts(FuncOp &func) {
     if (auto descTy = dyn_cast<TensorDescType>(resultTy)) {
       auto encoding =
           getFallbackSharedEncoding(descTy.getBlockType(), {}, {}, numCTAs);
-      resultTys[i] = getTensorDescTypeWithEncoding(
-          nullptr, descTy.getBlockType(), encoding);
+      resultTys[i] = getTensorDescTypeWithEncoding(nullptr, descTy, encoding);
     }
   }
   func.setFunctionType(FunctionType::get(ctx, argTys, resultTys));

@@ -10,8 +10,8 @@ from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
     matmul as _amd_gemm_warp_pipeline, )
 from triton.language.extra.tlx.tutorials.amd_gemm_pipelined import (
     matmul as _amd_gemm_pipelined, )
-from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
-    matmul as _amd_gemm_interwave,
+from triton.tlx.ops.kernels.mm.gfx950 import (
+    _lds_matmul as _amd_gemm_interwave,
     streamk_matmul as _amd_gemm_interwave_streamk,
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel_split_m import (

@@ -1,0 +1,109 @@
+from pathlib import Path
+
+from ..contracts import (
+    BlastRadius,
+    CandidateChange,
+    CandidateSubmission,
+    ChangeScope,
+    ExperimentKind,
+    KernelTarget,
+)
+from ..decision_maker import DecisionMaker, KernelOptimizer
+from ..decision_maker.profiling import native_profiler_for_backend
+from ..decision_maker.targets import expected_cuda_major, resolve_target_paths
+from ..optimizer import CandidateProposal
+from ..optimizer.knowledge import knowledge_paths
+
+
+def test_public_roles_have_one_implementation() -> None:
+    assert DecisionMaker is KernelOptimizer
+
+
+def test_candidate_can_describe_composed_and_experimental_changes() -> None:
+    proposal = CandidateProposal(
+        source="kernel source",
+        change_scopes=frozenset({ChangeScope.CONFIG, ChangeScope.KERNEL, ChangeScope.COMPILER}),
+        experiment_kind=ExperimentKind.IR_OVERRIDE,
+        blast_radius=BlastRadius.COMPILER,
+        changes=(
+            CandidateChange(ChangeScope.CONFIG, "adjust launch configuration"),
+            CandidateChange(ChangeScope.KERNEL, "change data movement"),
+            CandidateChange(ChangeScope.COMPILER, "scope the confirmed lowering change"),
+        ),
+        experiment_payload={"override": "schedule-a"},
+    )
+    assert isinstance(proposal, CandidateSubmission)
+    assert proposal.change_scopes == frozenset(ChangeScope)
+    assert proposal.experiment_kind is ExperimentKind.IR_OVERRIDE
+
+
+def test_target_registry_resolves_vendor_architecture_bundle() -> None:
+    harness, cases, target = resolve_target_paths(Path("gemm.py"), None, None, None, "b200")
+    assert harness.parts[-5:] == (
+        "targets",
+        "nvidia",
+        "blackwell",
+        "gemm",
+        "harness.py",
+    )
+    assert cases.name == "cases.json"
+    assert target.name == "target.json"
+    assert expected_cuda_major("B200") == 10
+    assert expected_cuda_major("H100") == 9
+
+    harness, cases, target = resolve_target_paths(
+        Path("amd_gemm_warp_pipeline.py"), None, None, None, "gfx950", "gemm"
+    )
+    assert harness.parts[-5:] == (
+        "targets",
+        "amd",
+        "gfx950",
+        "gemm",
+        "harness.py",
+    )
+    assert cases.name == "cases.json"
+    assert target.name == "target.json"
+
+
+def test_platform_registries_select_knowledge_and_profiler() -> None:
+    target = KernelTarget(backend="cuda", architecture="B200")
+    paths = knowledge_paths(target)
+    assert any("knowledge/common" in str(path) for path in paths)
+    assert any("knowledge/nvidia/common" in str(path) for path in paths)
+    assert any("knowledge/nvidia/blackwell" in str(path) for path in paths)
+    assert any(path.name == "overlapping-tmem-accumulators.md" for path in paths)
+    assert any(path.name == "memory-bound-and-autotune-selection.md" for path in paths)
+    assert not any(
+        path.name == "overlapping-tmem-accumulators.md"
+        for path in knowledge_paths(KernelTarget(backend="cuda", architecture="H100"))
+    )
+    hopper_paths = knowledge_paths(KernelTarget(backend="cuda", architecture="H100"))
+    assert any("knowledge/nvidia/hopper" in str(path) for path in hopper_paths)
+    assert any(path.name == "hopper-machine-limits.md" for path in hopper_paths)
+    assert any(
+        path.name == "hopper-warp-spec-producer-consumer.md" for path in hopper_paths
+    )
+    assert any(
+        path.name == "hopper-warp-spec-geometry-retune.md" for path in hopper_paths
+    )
+    assert any(
+        path.name == "hopper-warp-spec-consumer-patterns.md" for path in hopper_paths
+    )
+    assert any(
+        path.name == "hopper-warp-spec-pipeline-overlap.md" for path in hopper_paths
+    )
+    assert not any("knowledge/nvidia/hopper" in str(path) for path in paths)
+    assert native_profiler_for_backend("cuda") == "ncu"
+
+    amd_paths = knowledge_paths(KernelTarget(backend="hip", architecture="gfx950"))
+    assert any("knowledge/amd/common" in str(path) for path in amd_paths)
+    gfx942_paths = knowledge_paths(
+        KernelTarget(
+            backend="hip",
+            architecture="gfx942",
+            optimization_skills=("optimize-amd-gemm", ),
+        )
+    )
+    assert any("knowledge/amd/cdna3" in str(path) for path in gfx942_paths)
+    assert any("knowledge/amd/gemm" in str(path) for path in gfx942_paths)
+    assert native_profiler_for_backend("hip") == "rocprofv3"

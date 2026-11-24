@@ -1,0 +1,227 @@
+name: TLX.ops perf smoke
+# Perf check for bundle (reactor) PRs. On each enabled GPU it benches a small
+# tlx.ops subset for the PR's base and its head, back to back on one GPU, and
+# writes that platform's section of one PR comment as soon as its own runner
+# finishes. Advisory only -- never blocks. The full suite, the regression
+# detector, and bisection stay on the nightly workflow.
+#
+# It runs once per OSS-green head, not on every push: the sync train dispatches
+# it on the bundle branch itself (`gh workflow run --ref <bundle branch> -f
+# pr=<N>`) when that head passes CI, so a head still being repaired costs no GPU
+# time. It benches the dispatched commit against the main commit it is built
+# on. A newer dispatch on the same branch cancels the older one.
+#
+# Why a dispatch on the bundle branch and not a workflow_run follow-up: the
+# bench runs the bundle's code, mostly upstream commits, on self-hosted GPU
+# runners. A workflow_run job runs in the default branch's context, where that
+# code could write to main's Actions cache. A run dispatched on the bundle
+# branch has only that branch's scope, like the branch's own push runs.
+#
+# A head already measured, or one whose changes since the last measured head
+# touch only tests, CI or docs, is not re-run; the comment says so. Anyone with
+# write access can dispatch it on a PR's branch by hand the same way.
+#
+#   resolve ──► build-head ──┬──► h100   (_tlx-ops-perf-smoke-platform.yml: bench ──► report)
+#           └─► build-base ──┼──► b200   (same)
+#                            └──► mi350  (same)
+#
+# A platform named in the repository variable GPU_CI_SKIP_PLATFORMS (the switch
+# gpu-tests.yml uses while a runner pool is offline) is skipped here too, and
+# the comment says so.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: The PR whose head branch this run is dispatched on, to comment on (blank = job summary only)
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Reads the comment to find the last measured head, and notes a head that is not re-run.
+      pull-requests: write
+    outputs:
+      head: ${{ steps.pick.outputs.head }}
+      pr_head: ${{ steps.pick.outputs.pr_head }}
+      base: ${{ steps.pick.outputs.base }}
+      base_date: ${{ steps.pick.outputs.base_date }}
+      pr: ${{ steps.pick.outputs.pr }}
+      note: ${{ steps.pick.outputs.note }}
+    steps:
+      - name: Checkout the dispatched commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Pick head, base, and PR
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_PR: ${{ inputs.pr }}
+          SKIP_PLATFORMS: ${{ vars.GPU_CI_SKIP_PLATFORMS }}
+        run: |
+          set -euo pipefail
+          # Bench the dispatched commit against the main commit it is built on,
+          # so the comparison holds only its own commits, not main's later ones.
+          HEAD="${GITHUB_SHA}"
+          BASE=$(git merge-base "${HEAD}" origin/main)
+          PR=""
+          if [[ -n "${INPUT_PR}" ]]; then
+            [[ "${INPUT_PR}" =~ ^[0-9]+$ ]] || { echo "bad pr: ${INPUT_PR}"; exit 1; }
+            read -r PR_BRANCH PR_HEAD_NOW < <(gh pr view "${INPUT_PR}" --json headRefName,headRefOid \
+              --jq '"\(.headRefName) \(.headRefOid)"')
+            if [[ "${PR_BRANCH}" != "${GITHUB_REF_NAME}" ]]; then
+              echo "PR ${INPUT_PR} is from ${PR_BRANCH}, not ${GITHUB_REF_NAME}; dispatch on the PR's own branch."
+              exit 1
+            fi
+            if [[ "${PR_HEAD_NOW}" != "${HEAD}" ]]; then
+              echo "PR ${INPUT_PR} moved on to ${PR_HEAD_NOW}; a run for that head measures it. Skipping."
+              exit 0
+            fi
+            PR="${INPUT_PR}"
+            LAST=$(python3 .github/scripts/tlx_ops_perf_smoke_comment.py --repo "${GITHUB_REPOSITORY}" --pr "${PR}" \
+              --measured-head) || LAST=""
+            if [[ "${LAST}" == "${HEAD}" ]]; then
+              echo "Head ${HEAD} is already measured; skipping."
+              exit 0
+            fi
+            # An older head force-pushed away is unreachable from any ref, so fetch it by SHA.
+            if [[ "${LAST}" =~ ^[0-9a-f]{40}$ ]] && { git cat-file -e "${LAST}^{commit}" 2>/dev/null || \
+                git fetch --no-tags --quiet origin "${LAST}"; } && \
+                [[ $(python3 .github/scripts/tlx_ops_perf_smoke_ab.py relevant --base "${LAST}" --head "${HEAD}") \
+                == false ]]; then
+              echo "Only tests, CI or docs changed since ${LAST}; keeping its results."
+              NOTE="Not re-run for PR head \`${HEAD:0:12}\`: since the measured \`${LAST:0:12}\` it changes only"
+              NOTE+=" tests, CI or docs, so the results below still apply."
+              python3 .github/scripts/tlx_ops_perf_smoke_comment.py --repo "${GITHUB_REPOSITORY}" --pr "${PR}" \
+                --note-only --note "${NOTE}"
+              exit 0
+            fi
+          fi
+          [[ "${BASE}" =~ ^[0-9a-f]{40}$ ]] || { echo "bad base: ${BASE}"; exit 1; }
+          NOTE=""
+          for platform in b200 h100 mi350; do
+            if [[ ",${SKIP_PLATFORMS// /}," == *",${platform},"* ]]; then
+              NOTE="${NOTE:+${NOTE}, }${platform}"
+            fi
+          done
+          [[ -z "${NOTE}" ]] || NOTE="Not run on ${NOTE}: its CI runners are paused (GPU_CI_SKIP_PLATFORMS)."
+          {
+            echo "head=${HEAD}"
+            echo "pr_head=${HEAD}"
+            echo "base=${BASE}"
+            # Nightly summaries are named YYYYMMDD.<platform>.json.
+            echo "base_date=$(git show -s --format=%cd --date=format:%Y%m%d "${BASE}")"
+            echo "pr=${PR}"
+            echo "note=${NOTE}"
+          } >> "$GITHUB_OUTPUT"
+
+  build-head:
+    needs: resolve
+    if: needs.resolve.outputs.head != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ github.sha }}
+      build_id: perf-smoke-head
+
+  # A failed base build falls back to comparing the head with the
+  # nightly only, as this smoke did before it had a same-runner base.
+  build-base:
+    needs: resolve
+    if: needs.resolve.outputs.head != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.resolve.outputs.base }}
+      build_id: perf-smoke-base
+
+  # One job per platform rather than a matrix: a job cannot depend on a single
+  # matrix leg, so a matrix would hold every platform's report until the
+  # slowest runner finished. No id-token: the bench runs the PR's code.
+
+  h100:
+    needs: [resolve, build-head, build-base]
+    if: >-
+      ${{ !cancelled() && needs.resolve.outputs.head != '' &&
+      needs.build-head.result == 'success' && needs.build-head.outputs.wheel != '' &&
+      !contains(vars.GPU_CI_SKIP_PLATFORMS, 'h100') }}
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/_tlx-ops-perf-smoke-platform.yml
+    with:
+      platform: h100
+      runner: linux-gcp-h100
+      torch_index: https://download.pytorch.org/whl/cu130
+      head: ${{ github.sha }}
+      pr_head: ${{ needs.resolve.outputs.pr_head }}
+      base: ${{ needs.resolve.outputs.base }}
+      base_date: ${{ needs.resolve.outputs.base_date }}
+      pr: ${{ needs.resolve.outputs.pr }}
+      note: ${{ needs.resolve.outputs.note }}
+      head_wheel: ${{ needs.build-head.outputs.wheel }}
+      base_wheel: ${{ needs.build-base.result == 'success' && needs.build-base.outputs.wheel || '' }}
+
+  b200:
+    needs: [resolve, build-head, build-base]
+    if: >-
+      ${{ !cancelled() && needs.resolve.outputs.head != '' &&
+      needs.build-head.result == 'success' && needs.build-head.outputs.wheel != '' &&
+      !contains(vars.GPU_CI_SKIP_PLATFORMS, 'b200') }}
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/_tlx-ops-perf-smoke-platform.yml
+    with:
+      platform: b200
+      runner: nvidia-dgx-b200
+      torch_index: https://download.pytorch.org/whl/cu130
+      head: ${{ github.sha }}
+      pr_head: ${{ needs.resolve.outputs.pr_head }}
+      base: ${{ needs.resolve.outputs.base }}
+      base_date: ${{ needs.resolve.outputs.base_date }}
+      pr: ${{ needs.resolve.outputs.pr }}
+      note: ${{ needs.resolve.outputs.note }}
+      head_wheel: ${{ needs.build-head.outputs.wheel }}
+      base_wheel: ${{ needs.build-base.result == 'success' && needs.build-base.outputs.wheel || '' }}
+
+  mi350:
+    needs: [resolve, build-head, build-base]
+    if: >-
+      ${{ !cancelled() && needs.resolve.outputs.head != '' &&
+      needs.build-head.result == 'success' && needs.build-head.outputs.wheel != '' &&
+      !contains(vars.GPU_CI_SKIP_PLATFORMS, 'mi350') }}
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/_tlx-ops-perf-smoke-platform.yml
+    with:
+      platform: mi350
+      runner: linux-fb-triton-mi350-1
+      torch_index: https://download.pytorch.org/whl/rocm7.2
+      head: ${{ github.sha }}
+      pr_head: ${{ needs.resolve.outputs.pr_head }}
+      base: ${{ needs.resolve.outputs.base }}
+      base_date: ${{ needs.resolve.outputs.base_date }}
+      pr: ${{ needs.resolve.outputs.pr }}
+      note: ${{ needs.resolve.outputs.note }}
+      head_wheel: ${{ needs.build-head.outputs.wheel }}
+      base_wheel: ${{ needs.build-base.result == 'success' && needs.build-base.outputs.wheel || '' }}

@@ -2,15 +2,28 @@
 #include "AtomicRMWOpsEmitter.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
+#include "TritonAMDGPUTransforms/MfmaGroup.h"
+#include "Utility.h"
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/AMDGPUAddrSpace.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
+#include <type_traits>
 
 using mlir::triton::amdgpu::ISAFamily;
 using ::mlir::triton::gpu::MemDescType;
@@ -30,19 +43,432 @@ static LLVM::FenceOp createAMDGPUMemoryFence(OpBuilder &builder, Location loc,
   return fence;
 }
 
-class TransLocalLoadOpConversion
-    : public ConvertOpToLLVMPattern<triton::gpu::LocalLoadOp> {
+// Creates and returns the result Value of a single ds_read_tr* op for the
+// given (isaFamily, logicalBitWidth).
+static Value createDsReadTr(Operation *op, RewriterBase &rewriter, Location loc,
+                            Value vecAddr, VectorType vTy, ISAFamily isaFamily,
+                            unsigned logicalBitWidth) {
+  // tr16 instructions return vectors of bf16/f16 while tr8 and tr4
+  // instructions return vectors of i32. Generate the corresponding i32 vector
+  // type.
+  const auto physicalBitWidth =
+      getIntOrFloatOrPtrBitWidth(vTy.getElementType());
+  const auto numElemsI32 = (vTy.getNumElements() * physicalBitWidth / 32);
+  const auto vTyI32 = VectorType::get(numElemsI32, i32_ty);
+
+  // CDNA5 uses opaque LLVM intrinsic calls; their results cannot be cast to
+  // AliasAnalysisOpInterface, so no no-alias scope is attached.
+  auto callIntrinsic = [&](StringRef name, VectorType retTy) -> Value {
+    return LLVM::createLLVMIntrinsicCallOp(rewriter, loc, name, {retTy},
+                                           {vecAddr})
+        .getResult(0);
+  };
+
+  switch (isaFamily) {
+  case ISAFamily::CDNA5:
+    if (logicalBitWidth == 16)
+      return callIntrinsic("llvm.amdgcn.ds.load.tr16.b128", vTy);
+    if (logicalBitWidth == 8)
+      return callIntrinsic("llvm.amdgcn.ds.load.tr8.b64", vTyI32);
+    if (logicalBitWidth == 4)
+      return callIntrinsic("llvm.amdgcn.ds.load.tr4.b64", vTyI32);
+    return {};
+  case ISAFamily::CDNA4: {
+    Value dsReadTr;
+    if (logicalBitWidth == 16)
+      dsReadTr = ROCDL::ds_read_tr16_b64::create(rewriter, loc, vTy, vecAddr);
+    else if (logicalBitWidth == 8)
+      dsReadTr = ROCDL::ds_read_tr8_b64::create(rewriter, loc, vTyI32, vecAddr);
+    else if (logicalBitWidth == 4)
+      dsReadTr = ROCDL::ds_read_tr4_b64::create(rewriter, loc, vTyI32, vecAddr);
+    else
+      return {};
+    AMD::addLocalLoadNoAliasScope(
+        op, cast<LLVM::AliasAnalysisOpInterface>(dsReadTr.getDefiningOp()));
+    return dsReadTr;
+  }
+  default:
+    return {};
+  }
+}
+
+// Emits a single ds_read_tr* operation at `vecAddr` and unpacks the loaded
+// vector into individual element Values. Returns an empty vector if the ISA
+// family does not support a ds_read_tr* instruction.
+SmallVector<Value> emitDsReadTr(Operation *op, Location loc, Value vecAddr,
+                                VectorType vTy, Type llvmElemTy,
+                                unsigned logicalBitWidth,
+                                ConversionPatternRewriter &rewriter,
+                                const ::triton::AMD::TargetInfo &targetInfo) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  const auto physicalBitWidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
+  assert(physicalBitWidth == 16 || physicalBitWidth == 8);
+
+  Value dsReadTr = createDsReadTr(op, rewriter, loc, vecAddr, vTy,
+                                  targetInfo.getISAFamily(), logicalBitWidth);
+  if (!dsReadTr)
+    return {};
+
+  Value vecVal = b.bitcast(dsReadTr, vTy);
+  SmallVector<Value> loadedVals;
+  for (int v = 0; v < vTy.getNumElements(); v++)
+    loadedVals.push_back(b.extract_element(llvmElemTy, vecVal, b.i32_val(v)));
+  return loadedVals;
+}
+
+LogicalResult lowerDsReadTr(
+    Operation *op, ::triton::AMD::TargetInfo::LDSTransLoadParams ldsParams,
+    Location loc, LinearLayout cvt, unsigned logicalBitWidth,
+    SmallVector<Value> &vals, ArrayRef<Value> smemBases, Value affineOffset,
+    uint64_t maskSpanAffineOffset,
+    ArrayRef<std::pair<unsigned, unsigned>> paddingShifts, Type llvmElemTy,
+    const std::shared_ptr<DistributedCoordinateGroups> &coordinateGroups,
+    ConversionPatternRewriter &rewriter,
+    const ::triton::AMD::TargetInfo &targetInfo) {
+
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto *ctx = rewriter.getContext();
+
+  auto S = [ctx](StringRef v) { return StringAttr::get(ctx, v); };
+  auto kReg = S("register");
+  auto kLane = S("lane");
+  auto kWarp = S("warp");
+  auto kOffset = S("offset");
+  auto kBlock = S("block");
+  auto kAddr = S("addr");
+  auto kPartition = S("partition");
+  auto smemPtrTy = ptr_ty(ctx, 3);
+  auto bitWidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
+  auto logicalMaskSpanAffineOffset =
+      maskSpanAffineOffset * (bitWidth / logicalBitWidth);
+
+  assert(!smemBases.empty() && "expected at least one smem base");
+  LinearLayout cvtLayout = cvt;
+  LinearLayout partitionLayout;
+  Value basesVec;
+  const bool isPartitioned = smemBases.size() > 1;
+
+  if (isPartitioned) {
+    assert(cvtLayout.hasOutDim(kPartition) &&
+           cvtLayout.getOutDimSize(kPartition) ==
+               static_cast<int32_t>(smemBases.size()) &&
+           "smemBases size must match partition dimension size");
+    auto inDimNames = llvm::to_vector(cvtLayout.getInDimNames());
+    partitionLayout = cvtLayout.sublayout(inDimNames, {kPartition});
+    SmallVector<StringAttr> outDims =
+        llvm::to_vector(cvtLayout.getOutDimNames());
+    llvm::erase(outDims, kPartition);
+    cvtLayout = cvtLayout.sublayout(inDimNames, outDims);
+    basesVec = LLVM::buildBasePtrVector(loc, rewriter, smemBases);
+  }
+
+  // A ds_read_trK_bN instruction takes one LDS base address from each of the
+  // lanes in a warp, reads N / K contiguous K-bit elements from each base, and
+  // distributes the elements along the lanes in a manner that can be described
+  // by a bijective linear map
+  //
+  //                           F: R ⊕ L  ->  C ⊕ A,
+  //
+  // where R and L are the destination register and lane index spaces, and C and
+  // A are the contiguous-offset and address-providing lane index spaces.
+  //
+  // The LinearLayout `fullTile` describes this map. Its `tile` factor maps the
+  // first t := log2(N / K) bases of L to C. The bases mapped to A are an order-
+  // preserving interleaving of the bases of R and the remaining bases of L:
+  //
+  //                   R[0:a], L[t:t + b], R[a:t], L[t + b:p],
+  //
+  // where p := log2(lanesPerWarp), and a and b are instruction-specific
+  // parameters.
+  auto tile = LinearLayout::identity1D(ldsParams.tileSize, kLane, kOffset);
+  const unsigned numInstrRegBits = llvm::Log2_32(ldsParams.tileSize);
+  const unsigned numAddrLaneBits =
+      llvm::Log2_32(targetInfo.getWarpSize()) - numInstrRegBits;
+  auto fullTile =
+      tile *
+      LinearLayout::identity1D(1 << ldsParams.leadingRegBases, kReg, kAddr) *
+      LinearLayout::identity1D(1 << ldsParams.leadingLaneBases, kLane, kAddr) *
+      LinearLayout::identity1D(
+          1 << (numInstrRegBits - ldsParams.leadingRegBases), kReg, kAddr) *
+      LinearLayout::identity1D(
+          1 << (numAddrLaneBits - ldsParams.leadingLaneBases), kLane, kAddr) *
+      LinearLayout::identity1D(1, kWarp, kAddr);
+
+  if (cvtLayout.getInDimSize(kReg) < fullTile.getInDimSize(kReg)) {
+    return failure();
+  }
+
+  auto maybeQuot = divideLeft(cvtLayout, tile);
+  if (!maybeQuot.has_value()) {
+    return failure();
+  }
+
+  // From here on we perform the lowering
+  auto reps = zerosLike(tile) * maybeQuot.value();
+
+  // Sanity check
+  assert(fullTile.getInDimSize(kReg) * logicalBitWidth ==
+         ldsParams.instBitWidth);
+
+  // If we are lowering a subslice, the subslice offsets shall not touch the
+  // contiguous part of the tile
+  if (logicalMaskSpanAffineOffset & (tile.getOutDimSize(kOffset) - 1)) {
+    return failure();
+  }
+
+  // fullTile.invert() is a map from kOffset, kAddr into kReg, kLane, kWarp
+  // addrToOffset gives us a map from kAddr into kOffset, which is the map of
+  // the addresses each lane should hold
+  auto addrToOffset = fullTile.invert().compose(reps);
+  // sanity check
+  assert(addrToOffset.getInDimSizeLog2(kAddr) >= 3 &&
+         addrToOffset.getInDimSizeLog2(kAddr) <= 6);
+
+  // ds_read_tr* shuffles data across lanes so the lane issuing the load
+  // matches the kAddr decomposition of fullTile. Using addrToOffset's
+  // kAddr bases as the kLane bases of this layout lets us use laneId
+  // to get the LDS offset each lane should read.
+  LinearLayout addrLayout =
+      LinearLayout({{kLane, addrToOffset.getBases().lookup(kAddr)},
+                    {kWarp, reps.getBases().lookup(kWarp)}},
+                   {{kOffset, reps.getOutDimSize(kOffset)}}, false);
+
+  if (logicalBitWidth == 4) {
+    // Writing out the corresponding abstract maps for the above LinearLayouts:
+    //
+    // `cvtLayout`:                    G    :         D      ->     S
+    // `tile * maybeQuot`:          T ⊕ Q  :     L_C ⊕ D'  ->   C ⊕ S'
+    // `reps`:                      0 ⊕ Q  :     L_C ⊕ D'  ->   C ⊕ S'
+    // `addrLayout`: (0 ⊕ Q) o F^{-1} o i_A:         A      ->   C ⊕ S',
+    //
+    // we see that `reps` and `addrLayout`, though constructed using nibble
+    // coordinates, only have byte-aligned outputs. This allows us to safely
+    // convert to byte coordinates by halving the nibble-offset values with
+    // `logicalToI8` and dropping the low `kReg` basis in our layouts.
+    auto logicalToI8 = LinearLayout::zeros1D(2, kOffset, kOffset) *
+                       LinearLayout::identity1D(reps.getOutDimSize(kOffset) / 2,
+                                                kOffset, kOffset);
+    reps = reps.compose(logicalToI8);
+    addrLayout = addrLayout.compose(logicalToI8);
+
+    auto numLogicalRegBases = reps.getInDimSizeLog2(kReg);
+    ColumnAction dropNibbleBasis(
+        llvm::to_vector(llvm::seq<size_t>(1, numLogicalRegBases)), kReg,
+        numLogicalRegBases);
+    reps = dropNibbleBasis.apply(reps);
+    if (isPartitioned)
+      partitionLayout = dropNibbleBasis.apply(partitionLayout);
+  }
+
+  // Matrix accesses are CTA-local. Model that with a trivial block output so
+  // additive stride analysis always compares (offset, block) components.
+  reps =
+      reps.reshapeOuts({{kOffset, reps.getOutDimSize(kOffset)}, {kBlock, 1}});
+  addrLayout = addrLayout.reshapeOuts(reps.getOutDims());
+
+  // Compute the bits that are moved by one instruction
+  // Compute elements for which we can swap the xor by an add
+  auto elemsPerInstr = ldsParams.instBitWidth / bitWidth;
+  auto [nAdditive, permStrides] =
+      actionAdditiveStrides(reps, addrLayout, maskSpanAffineOffset,
+                            /*maskSpanBlocks=*/0, elemsPerInstr);
+  reps = permStrides.apply(reps);
+  if (isPartitioned) {
+    partitionLayout = permStrides.apply(partitionLayout);
+
+    // One ds_read_tr* instruction produces `elemsPerInstr` consecutive
+    // physical values along kReg from a single LDS base pointer. We only
+    // select a partition once per instruction, so all of those register
+    // positions must map to the same partition. For a LinearLayout that holds
+    // iff the low log2(elemsPerInstr) register bases contribute 0 to
+    // kPartition. Bail out if not, so a generic lowering can take over.
+    for (unsigned pos = 0; pos < llvm::Log2_32(elemsPerInstr); ++pos) {
+      if (partitionLayout.getBasis(kReg, pos, kPartition) != 0)
+        return failure();
+    }
+
+    // partitionLayout's kLane is the destination lane which is the lane that
+    // owns the loaded data in the destination tensor. The laneId is the
+    // source lane issuing the load. For ds_read_tr* the hardware shuffles
+    // data across lanes, so the two differ: we need to remap.
+    //
+    // Example: ds_load_tr8_b64 on CDNA5, from the test
+    // `ds_transpose_partitioned_remaps_lane`.
+    //
+    //  fullTile:
+    //   - lane=1 -> (1, 0)
+    //     lane=2 -> (2, 0)
+    //     lane=4 -> (4, 0)
+    //     lane=8 -> (0, 4)
+    //     lane=16 -> (0, 16)
+    //   - register=1 -> (0, 1)
+    //     register=2 -> (0, 2)
+    //     register=4 -> (0, 8)
+    //   where out dims are: [offset (size 8), addr (size 32)]
+    //
+    // `addr` is the non-contiguous part of the source lane's access.
+    // `lane` in the inverse tile is the destination lane after the hardware
+    // transpose. `fullTile.invert().sublayout({kAddr}, {kLane})` gives:
+    //
+    //   - addr=1 -> (0)
+    //     addr=2 -> (0)
+    //     addr=4 -> (8)
+    //     addr=8 -> (0)
+    //     addr=16 -> (16)
+    //   where out dims are: [lane (size 32)]
+    //
+    // Then rename the input dimension from `addr` to `lane` so the map can
+    // compose with partitionLayout.
+    //
+    // For this test, partitionLayout would choose the partition from the
+    // destination-lane basis `lane=8`:
+    //
+    //   - register=1 -> (0)
+    //     ...
+    //     register=32 -> (0)
+    //   - lane=1 -> (0)
+    //     lane=2 -> (0)
+    //     lane=4 -> (0)
+    //     lane=8 -> (1)
+    //     lane=16 -> (0)
+    //   - warp=1 -> (0)
+    //     warp=2 -> (0)
+    //   where out dims are: [partition (size 2)]
+    //
+    // Querying this with the runtime source lane asks for the partition of
+    // the wrong lane. Composing with laneRemap rewrites the partition basis
+    // through the transpose:
+    //
+    //   - register=1 -> (0)
+    //     ...
+    //     register=32 -> (0)
+    //   - lane=1 -> (0)
+    //     lane=2 -> (0)
+    //     lane=4 -> (1)
+    //     lane=8 -> (0)
+    //     lane=16 -> (0)
+    //   - warp=1 -> (0)
+    //     warp=2 -> (0)
+    //   where out dims are: [partition (size 2)]
+    //
+    // Destination basis `lane=8` is reached from source basis `addr=4`, so
+    // each source lane selects the LDS base expected by its destination lane.
+
+    auto regIdentity = LinearLayout::identity1D(
+        partitionLayout.getInDimSize(kReg), kReg, kReg);
+    auto srcToDstLaneMap =
+        fullTile.invert().sublayout({kAddr}, {kLane}).renameInDim(kAddr, kLane);
+    auto warpIdentity = LinearLayout::identity1D(
+        partitionLayout.getInDimSize(kWarp), kWarp, kWarp);
+    auto laneRemap = regIdentity * srcToDstLaneMap * warpIdentity;
+    partitionLayout = laneRemap.compose(partitionLayout);
+  }
+
+  // Perform computation in bytes, LLVM optimises this better
+  auto i8Tile =
+      zerosLike(LinearLayout::identity1D(bitWidth / 8, kReg, kOffset));
+  auto i8AddrLayout = i8Tile * addrLayout;
+
+  auto outDims = llvm::to_vector(i8AddrLayout.getOutDimNames());
+  bool rematerializeLane = i8AddrLayout.hasInDim(kLane) &&
+                           !i8AddrLayout.sublayoutIsZero({kLane}, outDims);
+  bool rematerializeWarp = i8AddrLayout.hasInDim(kWarp) &&
+                           !i8AddrLayout.sublayoutIsZero({kWarp}, outDims);
+  auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+  if (auto group = op->getAttrOfType<IntegerAttr>(
+          "tlx.rematerialize_coordinates_group")) {
+    std::tie(laneId, warpId) =
+        coordinateGroups->getOrCreate(op, group.getInt(), rematerializeLane,
+                                      rematerializeWarp, rewriter, targetInfo);
+  } else if (op->hasAttr("tlx.rematerialize_coordinates")) {
+    if (rematerializeLane)
+      laneId =
+          targetInfo.rematerializeDistributedCoordinate(rewriter, loc, laneId);
+    if (rematerializeWarp)
+      warpId =
+          targetInfo.rematerializeDistributedCoordinate(rewriter, loc, warpId);
+  }
+  auto regBase =
+      applyLinearLayout(
+          loc, rewriter, i8AddrLayout,
+          {{kReg, b.i32_val(0)}, {kLane, laneId}, {kWarp, warpId}})[0]
+          .second;
+
+  // It's fine that we don't compute the offset in bytes as affineOffset
+  // will be folded into a constant
+  auto affineOffsetI8 = b.mul(affineOffset, b.i32_val(bitWidth / 8));
+  bool hasPadding = !paddingShifts.empty();
+  Value paddedAffineOffsetI8 = b.i32_val(0);
+  if (hasPadding && maskSpanAffineOffset != 0) {
+    // `maskSpanAffineOffset != 0` indicates the affine offsets come from
+    // MemDescSubsliceOp, whose verifier guarantees that the affine offsets
+    // are bitwise disjoint from other offset contributors. Padding can thus
+    // be applied separately. This helps LLVM reuse base pointers.
+    paddedAffineOffsetI8 =
+        applyPadding(loc, rewriter, affineOffsetI8, paddingShifts);
+  } else {
+    regBase = b.xor_(regBase, affineOffsetI8);
+  }
+
+  auto vecTy = vec_ty(llvmElemTy, elemsPerInstr);
+  for (int i = 0; i < reps.getInDimSize(kReg); i += nAdditive) {
+    auto regIdx = reps.apply({{kReg, i}, {kLane, 0}, {kWarp, 0}})[0].second;
+    auto regIdxI8 = regIdx * (bitWidth / 8);
+    Value offset = b.xor_(regBase, b.i32_val(regIdxI8));
+
+    if (hasPadding) {
+      offset = applyPadding(loc, rewriter, offset, paddingShifts);
+      if (maskSpanAffineOffset != 0)
+        offset = b.add(offset, paddedAffineOffsetI8);
+    }
+
+    for (int i2 = 0; i2 < nAdditive; i2 += elemsPerInstr) {
+      // all these constants will go as immediate values to ds_read_tr
+      auto regIdxAdd =
+          reps.apply({{kReg, i2}, {kLane, 0}, {kWarp, 0}})[0].second;
+      auto regIdxAddI8 = regIdxAdd * (bitWidth / 8);
+      // `actionAdditiveStrides` forces `regIdxAddI8` and `offset` to be
+      // bitwise disjoint, so we can calculate their padding contributions
+      // separately.
+      regIdxAddI8 = applyPadding(regIdxAddI8, paddingShifts);
+      Value innerOffset = b.add(offset, b.i32_val(regIdxAddI8));
+      Value smemBaseVal = smemBases[0];
+      if (isPartitioned) {
+        auto partOut = applyLinearLayout(
+            loc, rewriter, partitionLayout,
+            {{kReg, b.i32_val(i + i2)}, {kLane, laneId}, {kWarp, warpId}});
+        smemBaseVal = b.extract_element(basesVec, partOut[0].second);
+      }
+      auto vecAddr = b.gep(smemPtrTy, i8_ty, smemBaseVal, innerOffset,
+                           LLVM::GEPNoWrapFlags::inbounds);
+      llvm::append_range(vals,
+                         emitDsReadTr(op, loc, vecAddr, vecTy, llvmElemTy,
+                                      logicalBitWidth, rewriter, targetInfo));
+    }
+  }
+  // apply all the inverse permutations in the reverse order
+  assert(vals.size() == reps.getInDimSize(kReg));
+  vals = permStrides.inverse().apply(vals);
+
+  return success();
+}
+
+template <typename OpTy>
+class TransLocalLoadOpConversion : public ConvertOpToLLVMPattern<OpTy> {
+  static constexpr bool isPackedTransposed =
+      std::is_same_v<OpTy, triton::amdgpu::LocalLoadPackedTransposedOp>;
+
 public:
   TransLocalLoadOpConversion(
       const LLVMTypeConverter &converter, const AMD::TargetInfo &targetInfo,
       PatternBenefit benefit,
       std::shared_ptr<DistributedCoordinateGroups> coordinateGroups)
-      : ConvertOpToLLVMPattern<triton::gpu::LocalLoadOp>(converter, benefit),
+      : ConvertOpToLLVMPattern<OpTy>(converter, benefit),
         targetInfo(targetInfo), coordinateGroups(std::move(coordinateGroups)) {}
-  using OpAdaptor = typename triton::gpu::LocalLoadOp::Adaptor;
+  using OpAdaptor = typename OpTy::Adaptor;
 
   LogicalResult
-  matchAndRewrite(triton::gpu::LocalLoadOp op, OpAdaptor adaptor,
+  matchAndRewrite(OpTy op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto ctx = rewriter.getContext();
     auto loc = op.getLoc();
@@ -51,32 +477,78 @@ public:
 
     auto typeConverter = this->getTypeConverter();
     auto llvmElemTy = typeConverter->convertType(dstTy.getElementType());
-    unsigned bitWidth = llvmElemTy.getIntOrFloatBitWidth();
+    unsigned bitWidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
 
-    // FP4 is represented as i8 and, when packed along K, can be
-    // transposed using ds_read_tr8 which doesn't change packing.
-    if (bitWidth != 16 && bitWidth != 8) {
-      return failure();
+    unsigned logicalBitWidth = bitWidth;
+    if constexpr (isPackedTransposed) {
+      // FP4 is represented as packed elements inside i8 values.
+      if (bitWidth != 8)
+        return failure();
+      logicalBitWidth = 4;
+    } else {
+      // FP4 is represented as i8 and, when packed along K, can be
+      // transposed using ds_read_tr8 which doesn't change packing.
+      if (bitWidth != 16 && bitWidth != 8)
+        return failure();
     }
-    auto ldsParamsVec = targetInfo.queryLDSTransLoadParams(bitWidth);
+    auto ldsParamsVec = targetInfo.queryLDSTransLoadParams(logicalBitWidth);
     if (ldsParamsVec.empty())
       return failure();
     if (SharedMemoryObject::getMaskSpanOffsetsAndBlocks(srcTy).second != 0)
       return failure();
 
-    LinearLayout sharedLL;
-    if (triton::gpu::isPaddedEncoding(srcTy.getEncoding())) {
-      sharedLL = triton::gpu::paddedLinearLayout(srcTy);
-    } else {
-      sharedLL = triton::gpu::toLinearLayout(srcTy);
+    auto dstLL = triton::gpu::toLinearLayout(dstTy);
+    LinearLayout sharedLL = triton::gpu::toLinearLayoutIgnoringPadding(srcTy);
+    // A mixed-radix read is one radix-2 read per odd register value o,
+    // starting at LDS element slabOffsets[o].
+    SmallVector<int32_t> slabOffsets = {0};
+    std::optional<LinearLayout> slabCvt;
+    if (!dstLL.isRadix2()) {
+      std::string reason;
+      FailureOr<LinearLayout> cvt =
+          LLVM::AMD::splitDirectToLdsCopy(dstLL, sharedLL, slabOffsets, reason);
+      if (isPackedTransposed || failed(cvt))
+        return failure();
+      slabCvt = *cvt;
     }
-    LinearLayout cvtDstLL =
-        triton::gpu::toLinearLayout(dstTy).invertAndCompose(sharedLL);
+
+    if constexpr (isPackedTransposed) {
+      // Perform factorization and address routing in logical fp4 coordinates.
+      std::optional<StringAttr> srcPackedDim;
+      std::optional<StringAttr> dstPackedDim;
+      auto srcShape = srcTy.getShape();
+      auto dstShape = dstTy.getShape();
+      assert(srcShape.size() == dstShape.size());
+      auto outDimNames = llvm::to_vector(sharedLL.getOutDimNames());
+
+      for (unsigned dim = 0; dim < srcShape.size(); ++dim) {
+        if (srcShape[dim] * 2 == dstShape[dim]) {
+          srcPackedDim = outDimNames[dim];
+          continue;
+        }
+        if (dstShape[dim] * 2 == srcShape[dim]) {
+          dstPackedDim = outDimNames[dim];
+          continue;
+        }
+        if (srcShape[dim] != dstShape[dim])
+          return failure();
+      }
+      if (!srcPackedDim || !dstPackedDim)
+        return failure();
+
+      auto kReg = str_attr("register");
+      auto kOffset = str_attr("offset");
+      sharedLL = LinearLayout::identity1D(2, kOffset, *srcPackedDim) * sharedLL;
+      dstLL = LinearLayout::identity1D(2, kReg, *dstPackedDim) * dstLL;
+    }
+
+    auto cvtDstLL = slabCvt ? *slabCvt : dstLL.invertAndCompose(sharedLL);
     auto kBlock = StringAttr::get(ctx, "block");
     auto maybeSublayout = cvtDstLL.quotient({kBlock});
     if (!maybeSublayout)
       return failure();
     cvtDstLL = maybeSublayout.value();
+
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                          llvmElemTy, rewriter);
     SmallVector<Value> smemBases = llvm::to_vector(smemObj.getBases());
@@ -85,19 +557,37 @@ public:
     auto paddingShifts = getPaddedSharedShifts(srcTy.getEncoding(),
                                                srcTy.getElementTypeBitWidth(),
                                                /*offsetInBytes=*/true);
+    if (llvm::any_of(slabOffsets, [&](int32_t offset) {
+          return offset & maskSpanAffineOffset;
+        }))
+      return failure();
 
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
     for (const auto &ldsParams : ldsParamsVec) {
       if (triton::gpu::isPaddedEncoding(srcTy.getEncoding()) &&
           triton::gpu::getMinInterval(srcTy.getEncoding()) <
-              ldsParams.tileSize) {
+              ldsParams.instBitWidth / bitWidth) {
         continue;
       }
 
-      llvm::SmallVector<Value> values;
-      auto result =
-          lowerDsReadTr(op, ldsParams, loc, cvtDstLL, values, smemBases,
-                        affineOffset, maskSpanAffineOffset, paddingShifts,
-                        llvmElemTy, rewriter, targetInfo);
+      SmallVector<Value> values;
+      LogicalResult result = success();
+      for (int32_t slabOffset : slabOffsets) {
+        SmallVector<Value> bases = smemBases;
+        if (slabOffset != 0)
+          for (Value &base : bases)
+            base = b.gep(base.getType(), i8_ty, base,
+                         b.i32_val(applyPadding(slabOffset * bitWidth / 8,
+                                                paddingShifts)));
+        SmallVector<Value> slabValues;
+        result = lowerDsReadTr(op, ldsParams, loc, cvtDstLL, logicalBitWidth,
+                               slabValues, bases, affineOffset,
+                               maskSpanAffineOffset, paddingShifts, llvmElemTy,
+                               coordinateGroups, rewriter, targetInfo);
+        if (failed(result))
+          break;
+        llvm::append_range(values, slabValues);
+      }
       if (failed(result))
         continue;
 
@@ -111,550 +601,8 @@ public:
   }
 
 private:
-  LogicalResult
-  lowerDsReadTr(triton::gpu::LocalLoadOp op,
-                ::triton::AMD::TargetInfo::LDSTransLoadParams ldsParams,
-                Location loc, LinearLayout cvt, SmallVector<Value> &vals,
-                ArrayRef<Value> smemBases, Value affineOffset,
-                uint64_t maskSpanAffineOffset,
-                ArrayRef<std::pair<unsigned, unsigned>> paddingShifts,
-                Type llvmElemTy, ConversionPatternRewriter &rewriter,
-                const ::triton::AMD::TargetInfo &targetInfo) const {
-
-    auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto *ctx = rewriter.getContext();
-
-    auto S = [ctx](StringRef v) { return StringAttr::get(ctx, v); };
-    auto kReg = S("register");
-    auto kLane = S("lane");
-    auto kWarp = S("warp");
-    auto kOffset = S("offset");
-    auto kBlock = S("block");
-    auto kAddr = S("addr");
-    auto kPartition = S("partition");
-    auto smemPtrTy = ptr_ty(ctx, 3);
-    auto bitWidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
-
-    assert(!smemBases.empty() && "expected at least one smem base");
-    LinearLayout cvtLayout = cvt;
-    LinearLayout partitionLayout;
-    Value basesVec;
-    const bool isPartitioned = smemBases.size() > 1;
-
-    if (isPartitioned) {
-      assert(cvtLayout.hasOutDim(kPartition) &&
-             cvtLayout.getOutDimSize(kPartition) ==
-                 static_cast<int32_t>(smemBases.size()) &&
-             "smemBases size must match partition dimension size");
-      auto inDimNames = llvm::to_vector(cvtLayout.getInDimNames());
-      partitionLayout = cvtLayout.sublayout(inDimNames, {kPartition});
-      SmallVector<StringAttr> outDims =
-          llvm::to_vector(cvtLayout.getOutDimNames());
-      llvm::erase(outDims, kPartition);
-      cvtLayout = cvtLayout.sublayout(inDimNames, outDims);
-      basesVec = LLVM::buildBasePtrVector(loc, rewriter, smemBases);
-    }
-
-    // Map onto offsets (contiguous part) and addr (non-contiguous part)
-    LinearLayout fullTile;
-    // Contiguous tile
-    LinearLayout tile;
-    // ds_read_tr*_b64 performs a cooperative transposed load across 16
-    // threads. The instruction processes an Nx16 tile (N=4 for 16-bit, N=8 for
-    // 8-bit). The loaded tile is re-packed/transposed where lane i will
-    // receive the i-th column.
-    //
-    // Loaded tile layout (input):     Register layout (output after transpose):
-    //     K0  K1  ... K15               R0  R1  R2  R3
-    // M0[ ............... ]    =>  T0 [ .   .   .   . ]
-    // M1[ ............... ]        T1 [ .   .   .   . ]
-    // M2[ ............... ]        ...
-    // M3[ ............... ]        T15[ .   .   .   . ]
-    //
-    // Each lane loads 64 contiguous bits from LDS. After the transpose,
-    // lane i receives column i from the input (elements strided by 16
-    // the loaded tile).
-    //
-    // For example with N=4 (16-bit):
-    // - Lane 0 receives elements from column 0: originally at [t0,t4,t8,t12]
-    // - Lane 1 receives elements from column 1: originally at [t0,t4,t8,t12]
-    //   These are the second 16 bits loaded by the same lanes before repacking
-    // - Lane 4 receives elements from column 4: originally at [t1,t5,t9,t13]
-    //
-    // Note that there is no restriction on where elements are loaded
-    // from, only that each lane needs to load 64 contiguous bits from shared
-    // memory. We require N number of lanes to be contiguous since they read
-    // consecutive 64 bits loaded from the same lanes.
-    tile = LinearLayout::identity1D(ldsParams.tileSize, kLane, kOffset);
-    const auto isaFamily = targetInfo.getISAFamily();
-    const unsigned missingLanes =
-        targetInfo.getWarpSize() / tile.getInDimSize(kLane);
-    unsigned otherLanes = 1;
-    if (isaFamily == ISAFamily::CDNA4) {
-      otherLanes = (bitWidth == 8) ? 2 : 4;
-    } else if (ldsParams.tileKind ==
-               AMD::TargetInfo::TileKind::DoubleContiguity) {
-      otherLanes = 2;
-    }
-
-    switch (ldsParams.tileKind) {
-    case AMD::TargetInfo::TileKind::DoubleContiguity:
-      fullTile =
-          tile * LinearLayout::identity1D(ldsParams.tileSize / 2, kReg, kAddr) *
-          LinearLayout::identity1D(otherLanes, kLane, kAddr) *
-          LinearLayout::identity1D(2, kReg, kAddr) *
-          LinearLayout::identity1D(missingLanes / otherLanes, kLane, kAddr);
-      break;
-    case AMD::TargetInfo::TileKind::Standard:
-      fullTile =
-          tile * LinearLayout::identity1D(otherLanes, kLane, kAddr) *
-          LinearLayout::identity1D(ldsParams.tileSize, kReg, kAddr) *
-          LinearLayout::identity1D(missingLanes / otherLanes, kLane, kAddr);
-      break;
-    }
-    // Add warp dimension so we can invert and compose with reps later
-    fullTile *= LinearLayout::identity1D(1, kWarp, kAddr);
-
-    if (cvtLayout.getInDimSize(kReg) < fullTile.getInDimSize(kReg))
-      return failure();
-
-    auto maybeQuot = divideLeft(cvtLayout, tile);
-    if (!maybeQuot.has_value())
-      return failure();
-
-    // From here on we perform the lowering
-    auto reps = zerosLike(tile) * maybeQuot.value();
-
-    // Sanity check
-    assert(fullTile.getInDimSize(kReg) * bitWidth == ldsParams.instBitWidth);
-
-    // If we are lowering a subslice, the subslice offsets shall not touch the
-    // contiguous part of the tile
-    if (maskSpanAffineOffset & (tile.getOutDimSize(kOffset) - 1))
-      return failure();
-
-    // fullTile.invert() is a map from kOffset, kAddr into kReg, kLane, kWarp
-    // addrToOffset gives us a map from kAddr into kOffset, which is the map of
-    // the addresses each lane should hold
-    auto addrToOffset = fullTile.invert().compose(reps);
-    // sanity check
-    assert(addrToOffset.getInDimSizeLog2(kAddr) >= 3 &&
-           addrToOffset.getInDimSizeLog2(kAddr) <= 6);
-
-    // ds_read_tr* shuffles data across lanes so the lane issuing the load
-    // matches the kAddr decomposition of fullTile. Using addrToOffset's
-    // kAddr bases as the kLane bases of this layout lets us use laneId
-    // to get the LDS offset each lane should read.
-    LinearLayout addrLayout =
-        LinearLayout({{kLane, addrToOffset.getBases().lookup(kAddr)},
-                      {kWarp, reps.getBases().lookup(kWarp)}},
-                     {{kOffset, reps.getOutDimSize(kOffset)}}, false);
-
-    // Matrix accesses are CTA-local. Model that with a trivial block output so
-    // additive stride analysis always compares (offset, block) components.
-    reps =
-        reps.reshapeOuts({{kOffset, reps.getOutDimSize(kOffset)}, {kBlock, 1}});
-    addrLayout = addrLayout.reshapeOuts(reps.getOutDims());
-
-    // Compute the bits that are moved by one instruction
-    // Compute elements for which we can swap the xor by an add
-    auto [nAdditive, permStrides] = actionAdditiveStrides(
-        reps, addrLayout, maskSpanAffineOffset, /*maskSpanBlocks=*/0,
-        fullTile.getInDimSize(kReg));
-    reps = permStrides.apply(reps);
-    if (isPartitioned) {
-      partitionLayout = permStrides.apply(partitionLayout);
-
-      // One ds_read_tr* instruction produces `fullTile.getInDimSize(kReg)`
-      // consecutive register values from a single LDS base pointer. We only
-      // select a partition once per instruction, so all of those register
-      // positions must map to the same partition. For a LinearLayout that holds
-      // iff the low log2(elemsPerInstr) register bases contribute 0 to
-      // kPartition. Bail out if not, so a generic lowering can take over.
-      const unsigned numInstrRegBits =
-          llvm::Log2_32(fullTile.getInDimSize(kReg));
-      for (unsigned pos = 0; pos < numInstrRegBits; ++pos) {
-        if (partitionLayout.getBasis(kReg, pos, kPartition) != 0)
-          return failure();
-      }
-
-      // partitionLayout's kLane is the destination lane which is the lane that
-      // owns the loaded data in the destination tensor. The laneId is the
-      // source lane issuing the load. For ds_read_tr* the hardware shuffles
-      // data across lanes, so the two differ: we need to remap.
-      //
-      // Example: ds_load_tr8_b64 on gfx1250 (DoubleContiguity), from the test
-      // `ds_transpose_partitioned_uses_double_contiguity`.
-      //
-      //  fullTile:
-      //   - lane=1 -> (1, 0)
-      //     lane=2 -> (2, 0)
-      //     lane=4 -> (4, 0)
-      //     lane=8 -> (0, 4)
-      //     lane=16 -> (0, 16)
-      //   - register=1 -> (0, 1)
-      //     register=2 -> (0, 2)
-      //     register=4 -> (0, 8)
-      //   where out dims are: [offset (size 8), addr (size 32)]
-      //
-      // `addr` is the non-contiguous part of the source lane's access.
-      // `lane` in the inverse tile is the destination lane after the hardware
-      // transpose. `fullTile.invert().sublayout({kAddr}, {kLane})` gives:
-      //
-      //   - addr=1 -> (0)
-      //     addr=2 -> (0)
-      //     addr=4 -> (8)
-      //     addr=8 -> (0)
-      //     addr=16 -> (16)
-      //   where out dims are: [lane (size 32)]
-      //
-      // Then rename the input dimension from `addr` to `lane` so the map can
-      // compose with partitionLayout.
-      //
-      // For this test, partitionLayout would choose the partition from the
-      // destination-lane basis `lane=8`:
-      //
-      //   - register=1 -> (0)
-      //     ...
-      //     register=32 -> (0)
-      //   - lane=1 -> (0)
-      //     lane=2 -> (0)
-      //     lane=4 -> (0)
-      //     lane=8 -> (1)
-      //     lane=16 -> (0)
-      //   - warp=1 -> (0)
-      //     warp=2 -> (0)
-      //   where out dims are: [partition (size 2)]
-      //
-      // Querying this with the runtime source lane asks for the partition of
-      // the wrong lane. Composing with laneRemap rewrites the partition basis
-      // through the transpose:
-      //
-      //   - register=1 -> (0)
-      //     ...
-      //     register=32 -> (0)
-      //   - lane=1 -> (0)
-      //     lane=2 -> (0)
-      //     lane=4 -> (1)
-      //     lane=8 -> (0)
-      //     lane=16 -> (0)
-      //   - warp=1 -> (0)
-      //     warp=2 -> (0)
-      //   where out dims are: [partition (size 2)]
-      //
-      // Destination basis `lane=8` is reached from source basis `addr=4`, so
-      // each source lane selects the LDS base expected by its destination lane.
-
-      auto regIdentity = LinearLayout::identity1D(
-          partitionLayout.getInDimSize(kReg), kReg, kReg);
-      auto srcToDstLaneMap = fullTile.invert()
-                                 .sublayout({kAddr}, {kLane})
-                                 .renameInDim(kAddr, kLane);
-      auto warpIdentity = LinearLayout::identity1D(
-          partitionLayout.getInDimSize(kWarp), kWarp, kWarp);
-      auto laneRemap = regIdentity * srcToDstLaneMap * warpIdentity;
-      partitionLayout = laneRemap.compose(partitionLayout);
-    }
-
-    // Perform computation in bytes, LLVM optimises this better
-    assert(bitWidth >= 8);
-    auto i8Tile =
-        zerosLike(LinearLayout::identity1D(bitWidth / 8, kReg, kOffset));
-    auto i8AddrLayout = i8Tile * addrLayout;
-
-    auto outDims = llvm::to_vector(i8AddrLayout.getOutDimNames());
-    bool rematerializeLane = i8AddrLayout.hasInDim(kLane) &&
-                             !i8AddrLayout.sublayoutIsZero({kLane}, outDims);
-    bool rematerializeWarp = i8AddrLayout.hasInDim(kWarp) &&
-                             !i8AddrLayout.sublayoutIsZero({kWarp}, outDims);
-    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-    if (auto group = op->getAttrOfType<IntegerAttr>(
-            "tlx.rematerialize_coordinates_group")) {
-      std::tie(laneId, warpId) = coordinateGroups->getOrCreate(
-          op, group.getInt(), rematerializeLane, rematerializeWarp, rewriter,
-          targetInfo);
-    } else if (op->hasAttr("tlx.rematerialize_coordinates")) {
-      if (rematerializeLane)
-        laneId = targetInfo.rematerializeDistributedCoordinate(rewriter, loc,
-                                                               laneId);
-      if (rematerializeWarp)
-        warpId = targetInfo.rematerializeDistributedCoordinate(rewriter, loc,
-                                                               warpId);
-    }
-    auto regBase =
-        applyLinearLayout(
-            loc, rewriter, i8AddrLayout,
-            {{kReg, b.i32_val(0)}, {kLane, laneId}, {kWarp, warpId}})[0]
-            .second;
-
-    // It's fine that we don't compute the offset in bytes as affineOffset
-    // will be folded into a constant
-    auto affineOffsetI8 = b.mul(affineOffset, b.i32_val(bitWidth / 8));
-    bool hasPadding = !paddingShifts.empty();
-    Value paddedAffineOffsetI8 = b.i32_val(0);
-    if (hasPadding && maskSpanAffineOffset != 0) {
-      // `maskSpanAffineOffset != 0` indicates the affine offsets come from
-      // MemDescSubsliceOp, whose verifier guarantees that the affine offsets
-      // are bitwise disjoint from other offset contributors. Padding can thus
-      // be applied separately. This helps LLVM reuse base pointers.
-      paddedAffineOffsetI8 =
-          applyPadding(loc, rewriter, affineOffsetI8, paddingShifts);
-    } else {
-      regBase = b.xor_(regBase, affineOffsetI8);
-    }
-
-    // Elements per op
-    auto elemsPerInstr = fullTile.getInDimSize(kReg);
-    auto elemsPerVec = ldsParams.instBitWidth / bitWidth;
-    auto vecTy = vec_ty(llvmElemTy, elemsPerVec);
-    for (int i = 0; i < cvtLayout.getInDimSize(kReg); i += nAdditive) {
-      auto regIdx = reps.apply({{kReg, i}, {kLane, 0}, {kWarp, 0}})[0].second;
-      auto regIdxI8 = regIdx * (bitWidth / 8);
-      Value offset = b.xor_(regBase, b.i32_val(regIdxI8));
-      if (hasPadding) {
-        offset = applyPadding(loc, rewriter, offset, paddingShifts);
-        if (maskSpanAffineOffset != 0)
-          offset = b.add(offset, paddedAffineOffsetI8);
-      }
-      for (int i2 = 0; i2 < nAdditive; i2 += elemsPerInstr) {
-        // all these constants will go as immediate values to ds_read_tr
-        auto regIdxAdd =
-            reps.apply({{kReg, i2}, {kLane, 0}, {kWarp, 0}})[0].second;
-        auto regIdxAddI8 = regIdxAdd * (bitWidth / 8);
-        // `actionAdditiveStrides` forces `regIdxAddI8` and `offset` to be
-        // bitwise disjoint, so we can calculate their padding contributions
-        // separately.
-        regIdxAddI8 = applyPadding(regIdxAddI8, paddingShifts);
-        Value innerOffset = b.add(offset, b.i32_val(regIdxAddI8));
-        Value smemBaseVal = smemBases[0];
-        if (isPartitioned) {
-          auto partOut = applyLinearLayout(
-              loc, rewriter, partitionLayout,
-              {{kReg, b.i32_val(i + i2)}, {kLane, laneId}, {kWarp, warpId}});
-          smemBaseVal = b.extract_element(basesVec, partOut[0].second);
-        }
-        auto vecAddr = b.gep(smemPtrTy, i8_ty, smemBaseVal, innerOffset,
-                             LLVM::GEPNoWrapFlags::inbounds);
-        llvm::append_range(vals,
-                           emitDsReadTr(op, loc, vecAddr, vecTy, llvmElemTy,
-                                        rewriter, targetInfo));
-      }
-    }
-    // apply all the inverse permutations in the reverse order
-    assert(vals.size() == cvtLayout.getInDimSize(kReg));
-    vals = permStrides.inverse().apply(vals);
-
-    return success();
-  }
-
-  // Emits a single ds_read_tr* operation at `vecAddr` and unpacks the loaded
-  // vector into individual element Values. Returns an empty vector if the ISA
-  // family does not support a ds_read_tr* instruction.
-  SmallVector<Value>
-  emitDsReadTr(triton::gpu::LocalLoadOp op, Location loc, Value vecAddr,
-               VectorType vTy, Type llvmElemTy,
-               ConversionPatternRewriter &rewriter,
-               const ::triton::AMD::TargetInfo &targetInfo) const {
-    auto b = TritonLLVMOpBuilder(loc, rewriter);
-    const auto bitWidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
-    assert(bitWidth == 16 || bitWidth == 8);
-
-    Value dsReadTr = createDsReadTr(op, rewriter, loc, vecAddr, vTy,
-                                    targetInfo.getISAFamily(), bitWidth);
-    if (!dsReadTr)
-      return {};
-
-    Value vecVal = b.bitcast(dsReadTr, vTy);
-    SmallVector<Value> loadedVals;
-    for (int v = 0; v < vTy.getNumElements(); v++)
-      loadedVals.push_back(b.extract_element(llvmElemTy, vecVal, b.i32_val(v)));
-    return loadedVals;
-  }
-
-  // Creates and returns the result Value of a single ds_read_tr* op for the
-  // given (isaFamily, bitWidth).
-  static Value createDsReadTr(triton::gpu::LocalLoadOp op,
-                              RewriterBase &rewriter, Location loc,
-                              Value vecAddr, VectorType vTy,
-                              ISAFamily isaFamily, unsigned bitWidth) {
-    // tr16 instructions return vectors of bf16/f16 while "tr8" instructions
-    // return vectors of i32. Generate the corresponding i32 vector type.
-    const auto numElemsI32 = (vTy.getNumElements() * bitWidth / 32);
-    const auto vTyI32 = VectorType::get(numElemsI32, i32_ty);
-
-    // GFX1250 uses opaque LLVM intrinsic calls; their results cannot be cast to
-    // AliasAnalysisOpInterface, so no no-alias scope is attached.
-    auto callIntrinsic = [&](StringRef name, VectorType retTy) -> Value {
-      return LLVM::createLLVMIntrinsicCallOp(rewriter, loc, name, {retTy},
-                                             {vecAddr})
-          .getResult(0);
-    };
-
-    switch (isaFamily) {
-    case ISAFamily::GFX1250:
-      if (bitWidth == 16)
-        return callIntrinsic("llvm.amdgcn.ds.load.tr16.b128", vTy);
-      return callIntrinsic("llvm.amdgcn.ds.load.tr8.b64", vTyI32);
-    case ISAFamily::CDNA4: {
-      Value dsReadTr;
-      if (bitWidth == 16)
-        dsReadTr = ROCDL::ds_read_tr16_b64::create(rewriter, loc, vTy, vecAddr);
-      else
-        dsReadTr =
-            ROCDL::ds_read_tr8_b64::create(rewriter, loc, vTyI32, vecAddr);
-      AMD::addLocalLoadNoAliasScope(
-          op, cast<LLVM::AliasAnalysisOpInterface>(dsReadTr.getDefiningOp()));
-      return dsReadTr;
-    }
-    default:
-      return {};
-    }
-  }
-
-private:
   const AMD::TargetInfo &targetInfo;
   std::shared_ptr<DistributedCoordinateGroups> coordinateGroups;
-};
-
-class LocalLoadPackedTransposedOpConversion
-    : public ConvertOpToLLVMPattern<
-          triton::amdgpu::LocalLoadPackedTransposedOp> {
-public:
-  LocalLoadPackedTransposedOpConversion(const LLVMTypeConverter &converter,
-                                        const AMD::TargetInfo &targetInfo,
-                                        PatternBenefit benefit = 2)
-      : ConvertOpToLLVMPattern<triton::amdgpu::LocalLoadPackedTransposedOp>(
-            converter, benefit),
-        targetInfo(targetInfo) {}
-  using OpAdaptor =
-      typename triton::amdgpu::LocalLoadPackedTransposedOp::Adaptor;
-
-  LogicalResult
-  matchAndRewrite(triton::amdgpu::LocalLoadPackedTransposedOp op,
-                  OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    MemDescType srcTy = op.getSrc().getType();
-    RankedTensorType dstTy = op.getType();
-    auto typeConverter = this->getTypeConverter();
-    auto llvmElemTy = typeConverter->convertType(dstTy.getElementType());
-    unsigned bitWidth = llvmElemTy.getIntOrFloatBitWidth();
-
-    // FP4 is represented as i8 and
-    if (bitWidth != 8) {
-      return failure();
-    }
-    // FP4 packed along M/N are not supported yet on GFX1250
-    if (targetInfo.getISAFamily() == ISAFamily::GFX1250) {
-      return failure();
-    }
-
-    return lowerSharedToDotOperandTransLL(op, adaptor, typeConverter, rewriter);
-  }
-
-private:
-  LogicalResult
-  lowerSharedToDotOperandTransLL(triton::amdgpu::LocalLoadPackedTransposedOp op,
-                                 OpAdaptor adaptor,
-                                 const LLVMTypeConverter *typeConverter,
-                                 ConversionPatternRewriter &rewriter) const {
-    auto ctx = rewriter.getContext();
-    auto loc = op.getLoc();
-    auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto kReg = str_attr("register");
-    auto kLane = str_attr("lane");
-    auto kWarp = str_attr("warp");
-    auto kBlock = str_attr("block");
-    auto kOffset = str_attr("offset");
-    auto dstTy = cast<RankedTensorType>(op.getType());
-    auto srcTy = cast<MemDescType>(op.getSrc().getType());
-    if (SharedMemoryObject::getMaskSpanOffsetsAndBlocks(srcTy).second != 0)
-      return failure();
-    auto llvmElemTy = typeConverter->convertType(dstTy.getElementType());
-    auto bitWidth = llvmElemTy.getIntOrFloatBitWidth();
-    auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
-                                                         llvmElemTy, rewriter);
-    mlir::Type retTy = dstTy;
-    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-    auto affineOffset = smemObj.getShmemOffset(loc, rewriter, srcTy);
-    auto maskSpanAffineOffset = smemObj.getMaskSpanOffsets(srcTy);
-    auto paddingShifts = getPaddedSharedShifts(srcTy.getEncoding(), bitWidth,
-                                               /*offsetInBytes=*/true);
-
-    auto shape = srcTy.getShape();
-    auto ldsParamsVec = targetInfo.queryLDSTransLoadParams(bitWidth);
-    if (ldsParamsVec.size() != 1)
-      return failure();
-    const auto ldsTransLoadParams = &ldsParamsVec[0];
-    // FP4 are packed into i8 so the real bitWidth is different
-    auto llBitWidth = 4;
-    auto ldsTransLayout = triton::gpu::chooseDsReadTrLayout(
-        dstTy.getEncoding(), shape, llBitWidth,
-        ldsTransLoadParams->instBitWidth,
-        ldsTransLoadParams->numLanesInShuffleGroup);
-
-    // Check that we have computed a layout
-    if (!ldsTransLayout) {
-      return failure();
-    }
-    auto regLayout =
-        ldsTransLayout->removeZeroBasesAlongDim(str_attr("register"));
-
-    auto smemPtrTy = ptr_ty(ctx, 3);
-    auto paddedEnc =
-        dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(srcTy.getEncoding());
-    LinearLayout cvt = LinearLayout::empty();
-    if (paddedEnc) {
-      const auto &sharedLL = paddedEnc.getLinearComponent();
-      cvt = regLayout.invertAndCompose(sharedLL);
-    } else {
-      auto sharedLL = triton::gpu::toLinearLayout(srcTy);
-      cvt = regLayout.invertAndCompose(sharedLL);
-    }
-    // Check that we will be able to vectorize the load.
-    // Need to have exactly ldsTransLoadParams->tileSize,
-    // otherwise we can't use ds_read_tr
-    auto [elemsPerVec, permutation] =
-        largestVectorisation(ctx, cvt, bitWidth, ldsTransLoadParams->tileSize);
-
-    if (paddedEnc)
-      elemsPerVec = std::min<int>(elemsPerVec, paddedEnc.getMinInterval());
-
-    if (elemsPerVec != ldsTransLoadParams->tileSize)
-      return failure();
-
-    assert(cvt.isTrivialOver({kBlock}) && "NYI");
-    auto lowerInst = [&](RewriterBase &rewriter, Location loc,
-                         ArrayRef<Value> inVals, Value vecAddr, int idx,
-                         VectorType vTy, Value ctaId) -> SmallVector<Value> {
-      assert(!ctaId && "NYI");
-      auto numElemsI32 = (vTy.getNumElements() * bitWidth / 32);
-      auto vTyI32 = VectorType::get(numElemsI32, i32_ty);
-      Value dsReadTr =
-          ROCDL::ds_read_tr4_b64::create(rewriter, loc, vTyI32, vecAddr);
-      Value vecVal = b.bitcast(dsReadTr, vTy);
-      SmallVector<Value> loadedVals;
-      for (int v = 0; v < vTy.getNumElements(); v++) {
-        loadedVals.push_back(
-            b.extract_element(llvmElemTy, vecVal, b.i32_val(v)));
-      }
-
-      return loadedVals;
-    };
-
-    SmallVector<Value> outVals = lowerLdSt(
-        loc, rewriter.getContext(), cvt, {}, // Input for store, output for load
-        llvmElemTy, smemObj.getBase(), paddingShifts, affineOffset,
-        maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
-        /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
-        ldsTransLoadParams->tileSize, lowerInst);
-    Value result =
-        packUniqueTensorElements(loc, typeConverter, outVals, rewriter, retTy);
-    rewriter.replaceOp(op, result);
-    return success();
-  }
-
-private:
-  const AMD::TargetInfo &targetInfo;
 };
 
 struct LocalAtomicScatterRMWOpConversion
@@ -713,7 +661,6 @@ struct LocalAtomicScatterRMWOpConversion
         rmwMask = b.true_val();
 
       Value old = emitter.emitAtomicRMW(rewriter, addr.ptr, value, rmwMask,
-                                        /*sharedMemBase=*/std::nullopt,
                                         /*enableIntraWaveReduce=*/false);
       if (returnOld)
         results.push_back(old);
@@ -724,9 +671,8 @@ struct LocalAtomicScatterRMWOpConversion
       return success();
     }
 
-    finalizeTensorAtomicResults(op, info.valuesTy, rewriter, results,
-                                info.llvmElemTy, b, info.threadPred, targetInfo,
-                                getTypeConverter());
+    finalizeAtomicResults(op, rewriter, results, info.llvmElemTy, b,
+                          info.threadPred, targetInfo, getTypeConverter());
     return success();
   }
 
@@ -737,6 +683,7 @@ private:
 static FailureOr<SmallVector<Value>>
 packMfmaDotOperandFragments(Value value, RankedTensorType tensorTy,
                             unsigned opIdx, ArrayRef<int64_t> expectedRep,
+                            int64_t kBase,
                             const LLVMTypeConverter *typeConverter,
                             ConversionPatternRewriter &rewriter, Location loc) {
   auto dotEncoding =
@@ -754,7 +701,6 @@ packMfmaDotOperandFragments(Value value, RankedTensorType tensorTy,
   if (rep != expectedRep)
     return failure();
 
-  constexpr int64_t kBase = 8;
   int64_t batch = rep[0];
   int64_t nonKRep = rep[opIdx == 0 ? 1 : 2];
   int64_t kRep = rep[opIdx == 0 ? 2 : 1];
@@ -789,10 +735,74 @@ packMfmaDotOperandFragments(Value value, RankedTensorType tensorTy,
   return fragments;
 }
 
+// Passes an MFMA occupies the matrix pipeline for, per LLVM's schedule model
+static FailureOr<int> getMfmaNumPasses(ArrayRef<unsigned> instrShape) {
+  if (instrShape == ArrayRef<unsigned>({32, 32, 8}) ||
+      instrShape == ArrayRef<unsigned>({32, 32, 16}))
+    return 16;
+  if (instrShape == ArrayRef<unsigned>({16, 16, 16}) ||
+      instrShape == ArrayRef<unsigned>({16, 16, 32}))
+    return 8;
+  // Scaled CDNA4 shapes move twice the operand bytes of their unscaled
+  // counterparts (32 i8 values per lane-step), so they occupy the pipeline
+  // for twice as many passes. Over-waiting at a commit boundary is safe;
+  // under-waiting would reintroduce the result-read hazard.
+  if (instrShape == ArrayRef<unsigned>({16, 16, 128}))
+    return 16;
+  if (instrShape == ArrayRef<unsigned>({32, 32, 64}))
+    return 32;
+  return failure();
+}
+
+// Wait states between an MFMA writing its destination and any consumer reading
+// it
+static FailureOr<int> getMfmaDrainWaitStates(ISAFamily isaFamily,
+                                             ArrayRef<unsigned> instrShape) {
+  FailureOr<int> numPasses = getMfmaNumPasses(instrShape);
+  if (failed(numPasses))
+    return failure();
+  if (isaFamily == ISAFamily::CDNA3)
+    return *numPasses + 3;
+  // CDNA4 adds one wait state, except for 2-pass instructions.
+  if (isaFamily == ISAFamily::CDNA4)
+    return *numPasses + 3 + (*numPasses != 2 ? 1 : 0);
+  return failure();
+}
+
+struct ScheduledMfmaLoweringInfo {
+  StringRef intrinsicName;
+  // K elements one lane feeds into a single MFMA; sets fragment width.
+  int64_t kBase;
+  // The gfx90a+ bf16 `_1k` intrinsics take packed i16 vectors.
+  bool intrinsicOperandsAreI16;
+};
+
+static FailureOr<ScheduledMfmaLoweringInfo>
+getScheduledMfmaLoweringInfo(Location loc,
+                             triton::gpu::AMDMfmaEncodingAttr mfma,
+                             Type aElemType, Type bElemType) {
+  // Reuse the backend-wide intrinsic table so this path cannot drift from the
+  // intrinsic the ordinary dot lowering picks for the same layout.
+  ArrayRef<unsigned> instrShape = mfma.getInstrShape();
+  FailureOr<MfmaIntrinsic> intrinsic = MfmaIntrinsic::get(
+      loc, mfma.getVersion(), instrShape[0], instrShape[1], instrShape[2],
+      aElemType, bElemType, /*withScale=*/false, /*useTF32=*/false);
+  if (failed(intrinsic))
+    return failure();
+
+  bool intrinsicOperandsAreI16 =
+      intrinsic->name == ROCDL::mfma_f32_32x32x8bf16_1k::getOperationName() ||
+      intrinsic->name == ROCDL::mfma_f32_16x16x16bf16_1k::getOperationName();
+  return ScheduledMfmaLoweringInfo{intrinsic->name,
+                                   static_cast<int64_t>(intrinsic->kBase),
+                                   intrinsicOperandsAreI16};
+}
+
 static FailureOr<Value>
 constrainMfmaFragmentRegisterClass(Value fragment, StringRef registerClass,
                                    ConversionPatternRewriter &rewriter,
-                                   Location loc) {
+                                   Location loc, bool hasSideEffects = false,
+                                   LLVM::InlineAsmOp *pin = nullptr) {
   auto fragmentTy = cast<VectorType>(fragment.getType());
   unsigned elementBitWidth =
       getIntOrFloatOrPtrBitWidth(fragmentTy.getElementType());
@@ -811,9 +821,11 @@ constrainMfmaFragmentRegisterClass(Value fragment, StringRef registerClass,
   std::string constraints = outputConstraint.str() + ",0";
   auto identity = LLVM::InlineAsmOp::create(
       rewriter, loc, registerVectorTy, ValueRange{packed}, "", constraints,
-      /*has_side_effects=*/false,
-      /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-      operandAttrs);
+      hasSideEffects,
+      /*is_align_stack=*/false, LLVM::TailCallKind::None, /*convergent=*/false,
+      asmDialect, operandAttrs);
+  if (pin)
+    *pin = identity;
   Value constrained = b.bitcast(identity->getResult(0), fragmentTy);
   return constrained;
 }
@@ -821,68 +833,269 @@ constrainMfmaFragmentRegisterClass(Value fragment, StringRef registerClass,
 // Build an asm snippet providing exactly `waitStates` MFMA wait states.
 //
 // `s_nop N` provides N+1 wait states, and N is a 4-bit field, so a single
-// instruction covers at most 16. Two are always enough here: the largest
-// requirement LLVM models for gfx950 is 20 wait states
-// (GFX940_XDL_N_PassWritesVGPROverlappedSrcABWaitStates for a 16-pass MFMA).
+// instruction covers at most 16. Scaled 32x32x64 commits need 36 states,
+// so emit as many full 16-state nops as required plus one remainder.
 //
 //    1  ->  "s_nop 0"
 //    4  ->  "s_nop 3"
 //   16  ->  "s_nop 15"
 //   18  ->  "s_nop 15\ns_nop 1"
 //   20  ->  "s_nop 15\ns_nop 3"
+//   36  ->  "s_nop 15\ns_nop 15\ns_nop 3"
 static std::string mfmaWaitStateAsm(int waitStates) {
   // A non-positive count would silently emit no padding at all, which is the
   // exact hazard this padding exists to prevent.
-  assert(waitStates > 0 && waitStates <= 32 &&
-         "MFMA wait states must be positive and fit in two s_nops");
-  if (waitStates <= 16)
-    return "s_nop " + std::to_string(waitStates - 1);
-  return "s_nop 15\ns_nop " + std::to_string(waitStates - 16 - 1);
+  assert(waitStates > 0 && waitStates <= 48 &&
+         "MFMA wait states must be positive and fit in three s_nops");
+  std::string asmText;
+  int remaining = waitStates;
+  while (remaining > 16) {
+    if (!asmText.empty())
+      asmText += "\n";
+    asmText += "s_nop 15";
+    remaining -= 16;
+  }
+  if (!asmText.empty())
+    asmText += "\n";
+  asmText += "s_nop " + std::to_string(remaining - 1);
+  return asmText;
 }
 
-// Drain the MFMA pipeline before `fragment` is read by anything else.
-//
-// The scheduled-MFMA lowering emits `v_mfma_*` inside an `asm sideeffect`
-// block so it can pin the accumulator's register class. AMDGPU's hazard
-// recognizer matches on `SIInstrInfo::isMAI()` and therefore cannot see an
-// MFMA hidden inside `INLINEASM`: it never inserts the mandatory wait states
-// between the MFMA writing its destination and the first consumer reading it.
-// (The `transient` path lowers to the ROCDL intrinsic and gets them for free --
-// LLVM emits e.g. `s_nop 7` before a `buffer_store` of a 16x16x32 result.)
-// Without this drain the consumer reads the destination registers before the
-// MFMA has written them, yielding garbage or NaN.
-//
-// This is emitted once per accumulator chain, not per MFMA: back-to-back MFMAs
-// forwarding srcC need no padding, so the chain itself is not serialized.
-//
-// `waitStates` mirrors LLVM's MFMA*WritesAGPRAccVgprReadWaitStates for gfx950.
-static FailureOr<Value>
-drainMfmaPipeline(Value fragment, StringRef registerClass, int waitStates,
-                  ConversionPatternRewriter &rewriter, Location loc) {
-  auto fragmentTy = cast<VectorType>(fragment.getType());
-  unsigned elementBitWidth =
-      getIntOrFloatOrPtrBitWidth(fragmentTy.getElementType());
-  int64_t totalBitWidth = fragmentTy.getNumElements() * elementBitWidth;
-  if (totalBitWidth <= 0 || totalBitWidth % 32 != 0)
-    return failure();
+// LLVM can forward a stored MFMA destination into a later load, including by
+// promoting private allocations. Preserve that dependency in the consumer
+// analysis even though the lowered IR has no SSA edge between store and load.
+class MfmaMemoryForwarding {
+public:
+  explicit MfmaMemoryForwarding(LLVM::LLVMFuncOp function)
+      : function(function), aliases(function) {
+    function.walk([&](Operation *op) {
+      if (!isa_and_nonnull<LLVM::LLVMDialect>(op->getDialect()) ||
+          op->getNumRegions() || isa<LLVM::InlineAsmOp>(op))
+        return;
+      // Inline assembly's hidden memory accesses cannot be promoted into SSA;
+      // its explicit register operands are handled by the normal value walk.
+      // Missing effect interfaces (e.g. masked loads) remain conservative.
+      auto effects = dyn_cast<MemoryEffectOpInterface>(op);
+      if (!effects || effects.hasEffect<MemoryEffects::Read>())
+        readers.push_back(op);
+    });
+  }
 
-  std::string waitAsm = mfmaWaitStateAsm(waitStates);
-  auto registerVectorTy = vec_ty(i32_ty, totalBitWidth / 32);
-  TritonLLVMOpBuilder b(loc, rewriter);
-  Value packed = b.bitcast(fragment, registerVectorTy);
-  auto *ctx = rewriter.getContext();
-  auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
-  // Tie the result to the input so the drain stays on the accumulator's SSA
-  // chain and keeps the accumulator in its pinned register class.
-  std::string constraints =
-      (registerClass == "agpr" ? std::string("=a") : std::string("=v")) + ",0";
-  auto drain = LLVM::InlineAsmOp::create(
-      rewriter, loc, registerVectorTy, ValueRange{packed}, waitAsm, constraints,
-      /*has_side_effects=*/true,
-      /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-      ArrayAttr::get(ctx, {}));
-  Value drained = b.bitcast(drain->getResult(0), fragmentTy);
-  return drained;
+  // Returns true for a memory escape that needs completion, otherwise appends
+  // possible reloads. Cache edges once per store, shared by all result pins.
+  bool appendReloads(LLVM::StoreOp store, SmallVectorImpl<Value> &worklist) {
+    auto [it, inserted] = forwarding.try_emplace(store);
+    auto &uses = it->second;
+    if (inserted) {
+      // Kernels are unreferenced external definitions. Callable helpers can
+      // expose stored values to an inlined caller outside this local walk.
+      uses.escapes =
+          function.getLinkage() != LLVM::Linkage::External ||
+          !SymbolTable::symbolKnownUseEmpty(function, function->getParentOp());
+      for (Operation *reader : readers) {
+        if (!mayExecuteAfter(reader, store))
+          continue;
+        if (auto load = dyn_cast<LLVM::LoadOp>(reader)) {
+          if (!disjointAddressSpaces(store.getAddr(), load.getAddr()) &&
+              !aliases.alias(store.getAddr(), load.getAddr()).isNo())
+            uses.loads.push_back(load.getResult());
+        } else if (aliases.getModRef(reader, store.getAddr()).isRef()) {
+          // Calls, copies, and unmodeled reads can expose the stored bytes
+          // after inlining or memory optimization. Do not lose that path.
+          uses.escapes = true;
+        }
+      }
+    }
+    llvm::append_range(worklist, uses.loads);
+    return uses.escapes;
+  }
+
+private:
+  bool mayExecuteAfter(Operation *reader, Operation *store) {
+    // Flat CFG reachability does not model region exits or enclosing loops.
+    if (reader->getParentRegion() != &function.getBody() ||
+        store->getParentRegion() != &function.getBody())
+      return true;
+    Block *from = store->getBlock();
+    Block *to = reader->getBlock();
+    // isReachable starts at successors, so reaching the same block requires
+    // a real backedge. Acyclic epilogue stores cannot feed earlier loads.
+    return (from == to && store->isBeforeInBlock(reader)) ||
+           from->isReachable(to);
+  }
+
+  static bool disjointAddressSpaces(Value lhs, Value rhs) {
+    unsigned a = cast<LLVM::LLVMPointerType>(lhs.getType()).getAddressSpace();
+    unsigned b = cast<LLVM::LLVMPointerType>(rhs.getType()).getAddressSpace();
+    // Only global, shared, and private are pairwise disjoint. Flat, constant,
+    // and buffer/resource spaces must not be excluded by their number alone.
+    auto isDistinctSpace = [](unsigned space) {
+      return llvm::is_contained({llvm::AMDGPUAS::GLOBAL_ADDRESS,
+                                 llvm::AMDGPUAS::LOCAL_ADDRESS,
+                                 llvm::AMDGPUAS::PRIVATE_ADDRESS},
+                                space);
+    };
+    return a != b && isDistinctSpace(a) && isDistinctSpace(b);
+  }
+
+  struct ForwardedUses {
+    SmallVector<Value> loads;
+    bool escapes = false;
+  };
+  LLVM::LLVMFuncOp function;
+  AliasAnalysis aliases;
+  SmallVector<Operation *> readers;
+  DenseMap<Operation *, ForwardedUses> forwarding;
+};
+
+// Native consumers are visible to LLVM's hazard recognizer, but an instruction
+// in inline asm is not. Follow result identities through the lowered IR because
+// LLVM can fold even arithmetic (for example, adding zero) back to the MFMA
+// destination. A later MFMA starts a new chain with its own result pin.
+// Strengthen an explicit commit reached by a persistent result instead of
+// draining every producer separately. Keep its register constraints: a live
+// operand handoff can complete the results without moving them into AGPRs.
+static bool needsOpaqueConsumerDrain(
+    Operation *pin, int requiredWait,
+    DenseMap<Operation *, int> &commitWaitStates,
+    DenseMap<Operation *, std::unique_ptr<MfmaMemoryForwarding>>
+        &memoryForwarding) {
+  SmallVector<Value> worklist(pin->getResults());
+  llvm::SmallDenseSet<Value, 16> visited;
+  // Visit all paths even after finding an escape, so commit strengthening
+  // does not depend on use-list order. The escape still guards this root.
+  bool needsDrain = false;
+  auto appendRegionSuccessors = [&](RegionBranchOpInterface branch,
+                                    RegionBranchPoint point, OpOperand &use) {
+    RegionBranchSuccessorMapping mapping;
+    branch.getSuccessorOperandInputMapping(mapping, point);
+    auto found = mapping.find(&use);
+    if (found != mapping.end())
+      llvm::append_range(worklist, found->second);
+  };
+
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    for (OpOperand &use : value.getUses()) {
+      Operation *consumer = use.getOwner();
+      if (consumer->getName().getStringRef().starts_with("rocdl.mfma."))
+        continue;
+
+      if (auto inlineAsm = dyn_cast<LLVM::InlineAsmOp>(consumer)) {
+        auto commit = commitWaitStates.find(consumer);
+        if (commit != commitWaitStates.end()) {
+          if (commit->second < requiredWait) {
+            inlineAsm.setAsmString(mfmaWaitStateAsm(requiredWait));
+            commit->second = requiredWait;
+          }
+          // Only this value path is complete. Other uses can bypass the
+          // boundary and still require a guard at the producer.
+          continue;
+        } else if (!inlineAsm.getAsmString().empty()) {
+          needsDrain = true;
+          continue;
+        }
+        llvm::append_range(worklist, consumer->getResults());
+        continue;
+      }
+
+      // Calls and returns can hide a consumer outside this conversion. Invoke
+      // also implements BranchOpInterface, so check it before CFG forwarding.
+      if (isa<LLVM::CallOp, LLVM::CallIntrinsicOp, LLVM::InvokeOp,
+              LLVM::ReturnOp>(consumer)) {
+        needsDrain = true;
+        continue;
+      }
+
+      if (auto store = dyn_cast<LLVM::StoreOp>(consumer)) {
+        if (use.getOperandNumber() != 0)
+          continue;
+        auto function = store->getParentOfType<LLVM::LLVMFuncOp>();
+        if (!function) {
+          needsDrain = true;
+          continue;
+        }
+        auto &memory = memoryForwarding[function];
+        if (!memory)
+          memory = std::make_unique<MfmaMemoryForwarding>(function);
+        if (memory->appendReloads(store, worklist))
+          needsDrain = true;
+        continue;
+      }
+
+      if (auto branch = dyn_cast<BranchOpInterface>(consumer)) {
+        for (unsigned i = 0; i < consumer->getNumSuccessors(); ++i) {
+          SuccessorOperands operands = branch.getSuccessorOperands(i);
+          OperandRange forwarded = operands.getForwardedOperands();
+          if (forwarded.empty())
+            continue;
+          unsigned begin = forwarded.getBeginOperandIndex();
+          unsigned index = use.getOperandNumber();
+          if (index >= begin && index - begin < forwarded.size())
+            worklist.push_back(consumer->getSuccessor(i)->getArgument(
+                operands.getProducedOperandCount() + index - begin));
+        }
+        continue;
+      }
+
+      // warp_predicate has capture-only regions and no region branch
+      // interface. Its init values bypass the body on inactive lanes.
+      if (auto predicate = dyn_cast<triton::gpu::WarpPredicateOp>(consumer)) {
+        unsigned index = use.getOperandNumber();
+        if (index != 0)
+          worklist.push_back(predicate.getResult(index - 1));
+        continue;
+      }
+      if (auto yield = dyn_cast<triton::gpu::PredicateYieldOp>(consumer)) {
+        worklist.push_back(
+            yield->getParentOp()->getResult(use.getOperandNumber()));
+        continue;
+      }
+
+      // This includes warp_specialize partition captures and warp_yield, as
+      // well as SCF loop-carried values and conditional results.
+      if (auto branch = dyn_cast<RegionBranchOpInterface>(consumer)) {
+        appendRegionSuccessors(branch, RegionBranchPoint::parent(), use);
+        continue;
+      }
+      if (auto terminator =
+              dyn_cast<RegionBranchTerminatorOpInterface>(consumer)) {
+        auto parent =
+            dyn_cast<RegionBranchOpInterface>(consumer->getParentOp());
+        if (!parent) {
+          needsDrain = true;
+          continue;
+        }
+        appendRegionSuccessors(parent, RegionBranchPoint(terminator), use);
+        continue;
+      }
+
+      // Aggregates, vector operations, casts, selects, and native arithmetic
+      // can all preserve the destination through LLVM optimization.
+      if (consumer->getNumRegions() == 0 &&
+          (isa_and_nonnull<LLVM::LLVMDialect, ROCDL::ROCDLDialect>(
+               consumer->getDialect()) ||
+           isa<UnrealizedConversionCastOp>(consumer))) {
+        if (isa_and_nonnull<LLVM::LLVMDialect>(consumer->getDialect())) {
+          auto effects = dyn_cast<MemoryEffectOpInterface>(consumer);
+          // Masked/scattered stores and other unmodeled writers cannot be
+          // treated as dead ends just because they have no SSA results.
+          if (!effects || effects.hasEffect<MemoryEffects::Write>()) {
+            needsDrain = true;
+            continue;
+          }
+        }
+        llvm::append_range(worklist, consumer->getResults());
+        continue;
+      }
+
+      // An unmodeled operation or region may let the destination escape.
+      needsDrain = true;
+    }
+  }
+  return needsDrain;
 }
 
 class RematerializedRangeOpConversion
@@ -1008,7 +1221,7 @@ public:
                           /*asm_string=*/"", constraints,
                           /*has_side_effects=*/false,
                           /*is_align_stack=*/false, LLVM::TailCallKind::None,
-                          asmDialect, operandAttrs)
+                          /*convergent=*/false, asmDialect, operandAttrs)
                           .getRes();
 
     SmallVector<Value> constrainedElements;
@@ -1030,15 +1243,15 @@ public:
   }
 };
 
-class RegisterHandoffOpConversion
-    : public ConvertOpToLLVMPattern<triton::amdgpu::RegisterHandoffOp> {
+class RegisterClassAnchorOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::RegisterClassAnchorOp> {
 public:
   using ConvertOpToLLVMPattern<
-      triton::amdgpu::RegisterHandoffOp>::ConvertOpToLLVMPattern;
-  using OpAdaptor = triton::amdgpu::RegisterHandoffOp::Adaptor;
+      triton::amdgpu::RegisterClassAnchorOp>::ConvertOpToLLVMPattern;
+  using OpAdaptor = triton::amdgpu::RegisterClassAnchorOp::Adaptor;
 
   LogicalResult
-  matchAndRewrite(triton::amdgpu::RegisterHandoffOp op, OpAdaptor adaptor,
+  matchAndRewrite(triton::amdgpu::RegisterClassAnchorOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto *ctx = rewriter.getContext();
@@ -1080,7 +1293,7 @@ public:
                             /*asm_string=*/"", constraints,
                             /*has_side_effects=*/true,
                             /*is_align_stack=*/false, LLVM::TailCallKind::None,
-                            asmDialect, operandAttrs)
+                            /*convergent=*/false, asmDialect, operandAttrs)
                             .getRes();
       if (elementsPerRegister == 1) {
         constrainedElements.push_back(asmResult);
@@ -1098,6 +1311,257 @@ public:
   }
 };
 
+// Validate the encoding version against targetInfo in the lowering
+static LogicalResult verifyMfmaVersionMatchesTarget(
+    Operation *op, triton::gpu::AMDMfmaEncodingAttr mfma, ISAFamily isaFamily) {
+  if (!llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4}, isaFamily))
+    return op->emitOpError(
+        "is supported only on CDNA3 (gfx942) and CDNA4 (gfx950)");
+  unsigned expected = isaFamily == ISAFamily::CDNA3 ? 3 : 4;
+  if (mfma.getVersion() != expected)
+    return op->emitOpError() << "carries a version " << mfma.getVersion()
+                             << " MFMA layout, which does not match the CDNA"
+                             << expected << " target";
+  return success();
+}
+
+// `auto` derives storage from the role alone, identically on every target.
+// Targets that cannot honor it reject it in the verifier.
+static StringRef resolveAccumulatorStorage(triton::amdgpu::ScheduledMfmaOp op) {
+  StringRef storage = op.getAccumulatorRegisterClass();
+  if (storage != "auto")
+    return storage;
+  return op.getAccumulatorRole() == "persistent" ? "agpr" : "vgpr";
+}
+
+// Return the first accumulator reaching this boundary that its producer pinned
+// into AGPRs, or null if none is provably AGPR-resident.
+static triton::amdgpu::ScheduledMfmaOp
+findAgprResidentAccumulator(triton::amdgpu::MfmaCommitOp op, size_t &index) {
+  for (auto [inputIndex, input] : llvm::enumerate(op.getInputs())) {
+    if (!cast<RankedTensorType>(input.getType()).getElementType().isF32())
+      continue;
+    auto producer = input.getDefiningOp<triton::amdgpu::ScheduledMfmaOp>();
+    if (producer && resolveAccumulatorStorage(producer) == "agpr") {
+      index = inputIndex;
+      return producer;
+    }
+  }
+  return nullptr;
+}
+
+// Prove register-class-stable inputs without looking through an uncompleted
+// native MFMA. Persistent result pins terminate the walk, including at loop
+// backedges; unknown producers and cycles consisting only of forwarding fail
+// closed. Constants can seed an accumulator before its first update.
+static bool hasPinnedCommitInput(Value value, StringRef outputConstraint,
+                                 const AMD::ScheduledMfmaLoweringState &state,
+                                 ConversionPatternRewriter &rewriter,
+                                 bool accumulator,
+                                 llvm::DenseSet<Value> &active, bool &sawPin) {
+  if (!active.insert(value).second)
+    return false;
+  auto finish = [&](bool result) {
+    active.erase(value);
+    return result;
+  };
+  auto recurse = [&](Value input) {
+    return hasPinnedCommitInput(input, outputConstraint, state, rewriter,
+                                accumulator, active, sawPin);
+  };
+  // CFG operands can still reference source values pending dialect-conversion
+  // replacement. Follow the compiler's mapping, never infer a result pin from
+  // a source op or an IR attribute. An unmapped materialization fails closed.
+  if (isa<RankedTensorType>(value.getType()) &&
+      !value.getDefiningOp<UnrealizedConversionCastOp>()) {
+    Value converted = rewriter.getRemappedValue(value);
+    return finish(converted && converted != value && recurse(converted));
+  }
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    bool sawIncoming = false;
+    for (Block *predecessor : argument.getOwner()->getPredecessors()) {
+      auto branch = dyn_cast<BranchOpInterface>(predecessor->getTerminator());
+      if (!branch)
+        return finish(false);
+      for (auto [index, successor] : llvm::enumerate(branch->getSuccessors())) {
+        if (successor != argument.getOwner())
+          continue;
+        SuccessorOperands operands = branch.getSuccessorOperands(index);
+        unsigned arg = argument.getArgNumber();
+        unsigned produced = operands.getProducedOperandCount();
+        ValueRange forwarded = operands.getForwardedOperands();
+        if (arg < produced || arg - produced >= forwarded.size() ||
+            !recurse(forwarded[arg - produced]))
+          return finish(false);
+        sawIncoming = true;
+      }
+    }
+    return finish(sawIncoming);
+  }
+  Operation *producer = value.getDefiningOp();
+  if (!producer)
+    return finish(false);
+  if (auto assembly = dyn_cast<LLVM::InlineAsmOp>(producer)) {
+    if (!assembly.getAsmString().empty())
+      return finish(false);
+    SmallVector<StringRef> constraints;
+    assembly.getConstraints().split(constraints, ',');
+    unsigned groups = 1;
+    if (auto tuple = dyn_cast<LLVM::LLVMStructType>(value.getType()))
+      groups = tuple.getBody().size();
+    if (constraints.size() != 2 * groups)
+      return finish(false);
+    for (unsigned index = 0; index < groups; ++index)
+      if (constraints[index] != outputConstraint ||
+          constraints[groups + index] != std::to_string(index))
+        return finish(false);
+    if (accumulator && !llvm::any_of(state.resultPins, [&](auto pin) {
+          return pin.first == producer;
+        }))
+      return finish(false);
+    sawPin = true;
+    return finish(true);
+  }
+  if (auto extract = dyn_cast<LLVM::ExtractValueOp>(producer)) {
+    Value container = extract.getContainer();
+    while (auto insert = container.getDefiningOp<LLVM::InsertValueOp>()) {
+      if (insert.getPosition() == extract.getPosition())
+        return finish(recurse(insert.getValue()));
+      container = insert.getContainer();
+    }
+    return finish(recurse(container));
+  }
+  if (auto extract = dyn_cast<LLVM::ExtractElementOp>(producer))
+    return finish(recurse(extract.getVector()));
+  if (auto insert = dyn_cast<LLVM::InsertValueOp>(producer))
+    return finish(recurse(insert.getContainer()) && recurse(insert.getValue()));
+  if (auto insert = dyn_cast<LLVM::InsertElementOp>(producer))
+    return finish(recurse(insert->getOperand(0)) &&
+                  recurse(insert->getOperand(1)));
+  if (isa<LLVM::BitcastOp, UnrealizedConversionCastOp>(producer))
+    return finish(producer->getNumOperands() == 1 &&
+                  recurse(producer->getOperand(0)));
+  return finish(isa<LLVM::ConstantOp, LLVM::UndefOp>(producer));
+}
+
+static bool canAnchorAdjacentCommit(
+    triton::amdgpu::MfmaCommitOp first, triton::amdgpu::MfmaCommitOp second,
+    ValueRange firstInputs, ValueRange secondInputs,
+    const AMD::ScheduledMfmaLoweringState &state,
+    ConversionPatternRewriter &rewriter, const AMD::TargetInfo &targetInfo) {
+  if (targetInfo.getArch() != "gfx950" || !second ||
+      first->getNextNode() != second.getOperation())
+    return false;
+  int firstWait = 0;
+  int secondWait = 0;
+  bool secondHasAccumulator = false;
+  bool secondHasOperand = false;
+  DominanceInfo dominance(first->getParentOp());
+  auto prove = [&](Value source, Value converted, bool isSecond) {
+    auto tensor = cast<RankedTensorType>(source.getType());
+    bool accumulator = tensor.getElementType().isF32();
+    auto mfma =
+        dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(tensor.getEncoding());
+    if (accumulator) {
+      if (!mfma || mfma.getVersion() != 4)
+        return false;
+      FailureOr<int> wait = getMfmaDrainWaitStates(targetInfo.getISAFamily(),
+                                                   mfma.getInstrShape());
+      if (failed(wait))
+        return false;
+      int &required = isSecond ? secondWait : firstWait;
+      required = std::max(required, *wait);
+      secondHasAccumulator |= isSecond;
+    } else {
+      auto dot =
+          dyn_cast<triton::gpu::DotOperandEncodingAttr>(tensor.getEncoding());
+      auto parent =
+          dot ? dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(dot.getParent())
+              : triton::gpu::AMDMfmaEncodingAttr();
+      if (!isSecond || !parent || parent.getVersion() != 4)
+        return false;
+      secondHasOperand = true;
+    }
+    if (!dominance.dominates(converted, first.getOperation()))
+      return false;
+    llvm::DenseSet<Value> active;
+    bool sawPin = false;
+    StringRef constraint = accumulator && isSecond ? "=v" : "=a";
+    return hasPinnedCommitInput(converted, constraint, state, rewriter,
+                                accumulator, active, sawPin) &&
+           sawPin;
+  };
+  for (auto [source, converted] : llvm::zip(first.getInputs(), firstInputs))
+    if (!prove(source, converted, false))
+      return false;
+  for (auto [source, converted] : llvm::zip(second.getInputs(), secondInputs))
+    if (!prove(source, converted, true))
+      return false;
+  return secondHasAccumulator && secondHasOperand && firstWait >= secondWait;
+}
+
+// Recognize only a compiler-owned boundary whose complete input tuple is the
+// register-class-identical suffix returned by an earlier combined boundary.
+// This is an SSA dependency through the full delay, not an adjacency fact.
+static LLVM::InlineAsmOp
+getAnchoringCommit(LLVM::InlineAsmOp second,
+                   const DenseMap<Operation *, int> &commits) {
+  LLVM::InlineAsmOp first;
+  unsigned begin = 0;
+  for (auto [index, input] : llvm::enumerate(second.getOperands())) {
+    auto extract = input.getDefiningOp<LLVM::ExtractValueOp>();
+    if (!extract || extract.getPosition().size() != 1)
+      return nullptr;
+    auto producer = extract.getContainer().getDefiningOp<LLVM::InlineAsmOp>();
+    if (!producer || !commits.contains(producer))
+      return nullptr;
+    if (!first) {
+      first = producer;
+      begin = extract.getPosition().front();
+    }
+    if (producer != first || extract.getPosition().front() != begin + index)
+      return nullptr;
+  }
+  if (!first || begin == 0 || first->getBlock() != second->getBlock() ||
+      !first->isBeforeInBlock(second) ||
+      begin + second.getNumOperands() != first.getNumOperands())
+    return nullptr;
+  for (Operation *op = first->getNextNode(); op != second.getOperation();
+       op = op->getNextNode())
+    if (!isa<LLVM::ExtractValueOp>(op))
+      return nullptr;
+  SmallVector<StringRef> firstConstraints;
+  SmallVector<StringRef> secondConstraints;
+  first.getConstraints().split(firstConstraints, ',');
+  second.getConstraints().split(secondConstraints, ',');
+  auto isTiedCommit = [](ArrayRef<StringRef> constraints, unsigned count) {
+    if (constraints.size() != 2 * count + 1 ||
+        constraints.back() != "~{memory}")
+      return false;
+    for (unsigned index = 0; index < count; ++index)
+      if (constraints[count + index] != std::to_string(index))
+        return false;
+    return true;
+  };
+  if (!isTiedCommit(firstConstraints, first.getNumOperands()) ||
+      !isTiedCommit(secondConstraints, second.getNumOperands()))
+    return nullptr;
+  for (unsigned index = 0; index < begin; ++index)
+    if (firstConstraints[index] != "=a")
+      return nullptr;
+  bool sawVgpr = false;
+  bool sawAgpr = false;
+  for (unsigned index = 0; index < second.getNumOperands(); ++index) {
+    StringRef constraint = secondConstraints[index];
+    if ((constraint != "=v" && constraint != "=a") ||
+        firstConstraints[begin + index] != constraint)
+      return nullptr;
+    sawVgpr |= constraint == "=v";
+    sawAgpr |= constraint == "=a";
+  }
+  return sawVgpr && sawAgpr ? first : nullptr;
+}
+
 class MfmaCommitOpConversion
     : public ConvertOpToLLVMPattern<triton::amdgpu::MfmaCommitOp> {
 public:
@@ -1105,20 +1569,71 @@ public:
 
   MfmaCommitOpConversion(const LLVMTypeConverter &converter,
                          const AMD::TargetInfo &targetInfo,
+                         AMD::ScheduledMfmaLoweringState &scheduledMfmaState,
                          PatternBenefit benefit)
       : ConvertOpToLLVMPattern<triton::amdgpu::MfmaCommitOp>(converter,
                                                              benefit),
-        targetInfo(targetInfo) {}
+        targetInfo(targetInfo), scheduledMfmaState(scheduledMfmaState) {}
 
   LogicalResult
   matchAndRewrite(triton::amdgpu::MfmaCommitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (targetInfo.getISAFamily() != ISAFamily::CDNA4)
-      return op.emitOpError("is supported only on CDNA4 (gfx950)");
+    if (!llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4},
+                            targetInfo.getISAFamily()))
+      return op.emitOpError(
+          "is supported only on CDNA3 (gfx942) and CDNA4 (gfx950)");
+    for (Value input : op.getInputs()) {
+      auto tensorTy = cast<RankedTensorType>(input.getType());
+      Attribute encoding = tensorTy.getEncoding();
+      auto mfma = dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(encoding);
+      if (auto dot = dyn_cast<triton::gpu::DotOperandEncodingAttr>(encoding))
+        mfma = dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(dot.getParent());
+      if (mfma && failed(verifyMfmaVersionMatchesTarget(
+                      op, mfma, targetInfo.getISAFamily())))
+        return failure();
+    }
     auto loc = op.getLoc();
     auto *ctx = rewriter.getContext();
     auto typeConverter = getTypeConverter();
     TritonLLVMOpBuilder b(loc, rewriter);
+
+    // Capture adjacency before replacing either source operation. Anchor the
+    // complete second tuple as tied outputs of the first full-delay boundary;
+    // adjacency alone cannot stop its pure native MFMA producers from sinking.
+    auto second =
+        dyn_cast_or_null<triton::amdgpu::MfmaCommitOp>(op->getNextNode());
+    DominanceInfo dominance(op->getParentOp());
+    bool canRemapSecond =
+        targetInfo.getArch() == "gfx950" && second &&
+        llvm::all_of(op.getInputs(),
+                     [](Value input) {
+                       return cast<RankedTensorType>(input.getType())
+                           .getElementType()
+                           .isF32();
+                     }) &&
+        llvm::any_of(second.getInputs(),
+                     [](Value input) {
+                       return !cast<RankedTensorType>(input.getType())
+                                   .getElementType()
+                                   .isF32();
+                     }) &&
+        llvm::all_of(second.getInputs(), [&](Value input) {
+          return dominance.dominates(input, op.getOperation());
+        });
+    SmallVector<Value> secondInputs;
+    bool shareDrain =
+        canRemapSecond &&
+        succeeded(
+            rewriter.getRemappedValues(second.getInputs(), secondInputs)) &&
+        canAnchorAdjacentCommit(op, second, adaptor.getInputs(), secondInputs,
+                                scheduledMfmaState, rewriter, targetInfo);
+    SmallVector<Value> sources(op.getInputs());
+    SmallVector<Value> convertedInputs(adaptor.getInputs());
+    unsigned firstInputCount = sources.size();
+    if (shareDrain) {
+      llvm::append_range(sources, second.getInputs());
+      llvm::append_range(convertedInputs, secondInputs);
+    }
 
     auto packGroups =
         [&](Value value, RankedTensorType tensorTy, unsigned registersPerGroup,
@@ -1162,8 +1677,16 @@ public:
     bool hasLiveDependency = llvm::any_of(op.getInputs(), [](Value input) {
       return !cast<RankedTensorType>(input.getType()).getElementType().isF32();
     });
-    for (auto [source, converted] :
-         llvm::zip(op.getInputs(), adaptor.getInputs())) {
+    size_t agprInputIndex = 0;
+    if (hasLiveDependency && findAgprResidentAccumulator(op, agprInputIndex))
+      return op.emitOpError()
+             << "input " << agprInputIndex
+             << " is an AGPR-resident accumulator committed alongside a live "
+                "dot operand. The AGPR read is materialized ahead of this "
+                "boundary's hazard padding; pin the accumulator with "
+                "accumulator_register_class=\"vgpr\"";
+    for (auto [inputIndex, source] : llvm::enumerate(sources)) {
+      Value converted = convertedInputs[inputIndex];
       auto tensorTy = cast<RankedTensorType>(source.getType());
       Type elementVectorTy;
       Type registerVectorTy;
@@ -1175,7 +1698,8 @@ public:
             cast<triton::gpu::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
         ArrayRef<unsigned> instr = mfma.getInstrShape();
         registersPerGroup = instr[0] * instr[1] / warpSize;
-        outputConstraint = hasLiveDependency ? "=v" : "=a";
+        outputConstraint =
+            hasLiveDependency || inputIndex >= firstInputCount ? "=v" : "=a";
       } else {
         auto dot =
             cast<triton::gpu::DotOperandEncodingAttr>(tensorTy.getEncoding());
@@ -1220,9 +1744,31 @@ public:
       constraints += "," + std::to_string(index);
     constraints += ",~{memory}";
 
-    // CDNA4 requires six wait states between the final MFMA write and the
-    // first general vector use of its result.
-    constexpr StringLiteral waitAsm = "s_nop 5";
+    // gfx950 uses the established six-state transient handoff when this
+    // boundary also carries a live dot operand. CDNA3 still needs its full,
+    // layout-specific result-read delay. A persistent epilogue likewise uses
+    // the largest target-specific delay carried by the boundary.
+    bool useGfx950LiveDependencyHandoff =
+        targetInfo.getISAFamily() == ISAFamily::CDNA4 && hasLiveDependency;
+    int waitStates = 6;
+    if (!useGfx950LiveDependencyHandoff) {
+      waitStates = 0;
+      for (Value input : op.getInputs()) {
+        auto tensorTy = cast<RankedTensorType>(input.getType());
+        if (!tensorTy.getElementType().isF32())
+          continue;
+        auto mfma =
+            cast<triton::gpu::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
+        FailureOr<int> drainWaitStates = getMfmaDrainWaitStates(
+            targetInfo.getISAFamily(), mfma.getInstrShape());
+        if (failed(drainWaitStates))
+          return rewriter.notifyMatchFailure(
+              op, "commit boundary carries an MFMA layout with no modeled "
+                  "result-read hazard requirement");
+        waitStates = std::max(waitStates, *drainWaitStates);
+      }
+    }
+    std::string waitAsm = mfmaWaitStateAsm(waitStates);
 
     Type resultTy = outputTypes.front();
     if (outputTypes.size() != 1)
@@ -1230,10 +1776,10 @@ public:
     auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
     auto operandAttrs = ArrayAttr::get(ctx, {});
     auto inlineAsm = LLVM::InlineAsmOp::create(
-        rewriter, loc, resultTy, operands, waitAsm.str(), constraints,
+        rewriter, loc, resultTy, operands, waitAsm, constraints,
         /*has_side_effects=*/true,
-        /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-        operandAttrs);
+        /*is_align_stack=*/false, LLVM::TailCallKind::None,
+        /*convergent=*/false, asmDialect, operandAttrs);
     Value constrained = inlineAsm->getResult(0);
 
     auto getConstrainedGroup = [&](size_t index) {
@@ -1242,14 +1788,66 @@ public:
                  : b.extract_val(outputTypes[index], constrained, index);
     };
 
+    // Retain the second boundary's original register classes, tuple, memory
+    // clobber, and side effects. Its operands are exclusively values returned
+    // after the first delay, so no copy can read an uncompleted original dV.
+    SmallVector<Value> secondGroups;
+    Value secondConstrained;
+    size_t secondFirstGroup =
+        shareDrain ? firstGroupIndices[firstInputCount] : 0;
+    if (shareDrain) {
+      SmallVector<Type> secondOutputTypes;
+      std::string secondConstraints;
+      for (size_t input = firstInputCount; input < sources.size(); ++input) {
+        StringRef constraint = cast<RankedTensorType>(sources[input].getType())
+                                       .getElementType()
+                                       .isF32()
+                                   ? "=v"
+                                   : "=a";
+        for (size_t group = 0; group < inputGroups[input].size(); ++group) {
+          size_t index = firstGroupIndices[input] + group;
+          if (!secondConstraints.empty())
+            secondConstraints += ",";
+          secondConstraints += constraint;
+          secondGroups.push_back(getConstrainedGroup(index));
+          secondOutputTypes.push_back(outputTypes[index]);
+        }
+      }
+      for (size_t index = 0; index < secondGroups.size(); ++index)
+        secondConstraints += "," + std::to_string(index);
+      secondConstraints += ",~{memory}";
+      Type secondResultTy = secondOutputTypes.front();
+      if (secondOutputTypes.size() != 1)
+        secondResultTy =
+            LLVM::LLVMStructType::getLiteral(ctx, secondOutputTypes);
+      auto secondAsm = LLVM::InlineAsmOp::create(
+          rewriter, second.getLoc(), secondResultTy, secondGroups, waitAsm,
+          secondConstraints, /*has_side_effects=*/true,
+          /*is_align_stack=*/false, LLVM::TailCallKind::None,
+          /*convergent=*/false, asmDialect, operandAttrs);
+      secondConstrained = secondAsm.getRes();
+      // Keep this boundary recognizable until every reaching root has been
+      // analyzed and both delays have been strengthened by the finalizer.
+      scheduledMfmaState.commitWaitStates[secondAsm] = waitStates;
+    }
+
     SmallVector<Value> results;
     for (size_t inputIndex = 0; inputIndex < inputGroups.size(); ++inputIndex) {
       SmallVector<Value> elements;
       Type elementVectorTy = elementVectorTypes[inputIndex];
       auto vectorTy = cast<VectorType>(elementVectorTy);
       for (size_t group = 0; group < inputGroups[inputIndex].size(); ++group) {
-        Value registerGroup =
-            getConstrainedGroup(firstGroupIndices[inputIndex] + group);
+        size_t groupIndex = firstGroupIndices[inputIndex] + group;
+        Value registerGroup;
+        if (shareDrain && inputIndex >= firstInputCount) {
+          size_t index = groupIndex - secondFirstGroup;
+          registerGroup = secondGroups.size() == 1
+                              ? secondConstrained
+                              : b.extract_val(outputTypes[groupIndex],
+                                              secondConstrained, index);
+        } else {
+          registerGroup = getConstrainedGroup(groupIndex);
+        }
         Value elementGroup = b.bitcast(registerGroup, elementVectorTy);
         for (int64_t index = 0; index < vectorTy.getNumElements(); ++index)
           elements.push_back(b.extract_element(vectorTy.getElementType(),
@@ -1257,14 +1855,19 @@ public:
       }
       results.push_back(packTensorElements(
           loc, typeConverter, elements, rewriter,
-          cast<RankedTensorType>(op.getOutputs()[inputIndex].getType())));
+          cast<RankedTensorType>(sources[inputIndex].getType())));
     }
-    rewriter.replaceOp(op, results);
+    if (shareDrain)
+      rewriter.replaceOp(second,
+                         ValueRange(results).drop_front(firstInputCount));
+    rewriter.replaceOp(op, ValueRange(results).take_front(firstInputCount));
+    scheduledMfmaState.commitWaitStates[inlineAsm] = waitStates;
     return success();
   }
 
 private:
   const AMD::TargetInfo &targetInfo;
+  AMD::ScheduledMfmaLoweringState &scheduledMfmaState;
 };
 
 class ScheduledMfmaOpConversion
@@ -1274,22 +1877,33 @@ public:
 
   ScheduledMfmaOpConversion(const LLVMTypeConverter &converter,
                             const AMD::TargetInfo &targetInfo,
+                            AMD::ScheduledMfmaLoweringState &scheduledMfmaState,
                             PatternBenefit benefit)
       : ConvertOpToLLVMPattern<triton::amdgpu::ScheduledMfmaOp>(converter,
                                                                 benefit),
-        targetInfo(targetInfo) {}
+        targetInfo(targetInfo), scheduledMfmaState(scheduledMfmaState) {}
 
   LogicalResult
   matchAndRewrite(triton::amdgpu::ScheduledMfmaOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (targetInfo.getISAFamily() != ISAFamily::CDNA4)
-      return op.emitOpError("is supported only on CDNA4 (gfx950)");
     auto loc = op.getLoc();
     auto typeConverter = getTypeConverter();
     auto aTy = cast<RankedTensorType>(op.getA().getType());
     auto bTy = cast<RankedTensorType>(op.getB().getType());
     auto accTy = cast<RankedTensorType>(op.getAcc().getType());
     auto mfma = cast<triton::gpu::AMDMfmaEncodingAttr>(accTy.getEncoding());
+    if (failed(verifyMfmaVersionMatchesTarget(op, mfma,
+                                              targetInfo.getISAFamily())))
+      return failure();
+    ArrayRef<unsigned> instrShape = mfma.getInstrShape();
+    FailureOr<ScheduledMfmaLoweringInfo> maybeInfo =
+        getScheduledMfmaLoweringInfo(loc, mfma, aTy.getElementType(),
+                                     bTy.getElementType());
+    if (failed(maybeInfo))
+      return op.emitOpError(
+          "has no supported native lowering for this target, element type, "
+          "and instruction shape");
+    const ScheduledMfmaLoweringInfo &info = *maybeInfo;
     auto aDot = cast<triton::gpu::DotOperandEncodingAttr>(aTy.getEncoding());
     auto bDot = cast<triton::gpu::DotOperandEncodingAttr>(bTy.getEncoding());
 
@@ -1297,15 +1911,16 @@ public:
         mfma.getRepForOperand(aTy.getShape(), aDot.getKWidth(), 0);
     SmallVector<int64_t> bRep =
         mfma.getRepForOperand(bTy.getShape(), bDot.getKWidth(), 1);
-    FailureOr<SmallVector<Value>> maybeA = packMfmaDotOperandFragments(
-        adaptor.getA(), aTy, /*opIdx=*/0, aRep, typeConverter, rewriter, loc);
-    FailureOr<SmallVector<Value>> maybeB = packMfmaDotOperandFragments(
-        adaptor.getB(), bTy, /*opIdx=*/1, bRep, typeConverter, rewriter, loc);
+    FailureOr<SmallVector<Value>> maybeA =
+        packMfmaDotOperandFragments(adaptor.getA(), aTy, /*opIdx=*/0, aRep,
+                                    info.kBase, typeConverter, rewriter, loc);
+    FailureOr<SmallVector<Value>> maybeB =
+        packMfmaDotOperandFragments(adaptor.getB(), bTy, /*opIdx=*/1, bRep,
+                                    info.kBase, typeConverter, rewriter, loc);
     int64_t numRepM = aRep[1];
     int64_t numRepN = bRep[2];
-    constexpr int64_t kBase = 8;
-    int64_t numRepK = aRep[2] * aDot.getKWidth() / kBase;
-    int64_t numRepKB = bRep[1] * bDot.getKWidth() / kBase;
+    int64_t numRepK = aRep[2] * aDot.getKWidth() / info.kBase;
+    int64_t numRepKB = bRep[1] * bDot.getKWidth() / info.kBase;
     if (failed(maybeA) || failed(maybeB) || numRepK <= 0 ||
         numRepK != numRepKB ||
         maybeA->size() != static_cast<size_t>(numRepM * numRepK) ||
@@ -1313,7 +1928,6 @@ public:
       return rewriter.notifyMatchFailure(
           op, "operands do not match the verified native MFMA grid");
 
-    ArrayRef<unsigned> instrShape = mfma.getInstrShape();
     constexpr int64_t warpSize = 64;
     int64_t elemsPerFragment = instrShape[0] * instrShape[1] / warpSize;
     SmallVector<int64_t> strides =
@@ -1344,48 +1958,50 @@ public:
 
     StringRef aStorage = op.getResidentOperand() == "lhs" ? "agpr" : "vgpr";
     StringRef bStorage = op.getResidentOperand() == "rhs" ? "agpr" : "vgpr";
-    StringRef accumulatorStorage = op.getAccumulatorRegisterClass();
-    if (accumulatorStorage == "auto")
-      accumulatorStorage =
-          op.getAccumulatorRole() == "persistent" ? "agpr" : "vgpr";
+    StringRef accumulatorStorage = resolveAccumulatorStorage(op);
 
-    auto inputConstraint = [](StringRef registerClass) -> StringRef {
-      return registerClass == "agpr" ? "a" : "v";
-    };
-    StringRef outputConstraint = accumulatorStorage == "agpr" ? "=a" : "=&v";
     Value zeroFragment;
-    if (op.getAccumulatorRole() == "transient" && op.getInitialize()) {
+    if (op.getInitialize()) {
       Attribute zeroAttr = rewriter.getZeroAttr(accElemTy);
       auto zeroElements =
           DenseElementsAttr::get(cast<ShapedType>(fragmentTy), zeroAttr);
       zeroFragment =
           LLVM::ConstantOp::create(rewriter, loc, fragmentTy, zeroElements);
     }
-    auto *ctx = rewriter.getContext();
-    auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
-    auto operandAttrs = ArrayAttr::get(ctx, {});
-    bool isF16 = aTy.getElementType().isF16();
-    bool is32x32 = instrShape == ArrayRef<unsigned>({32, 32, 16});
-    std::string mfmaAsmPrefix =
-        is32x32 ? (isF16 ? "v_mfma_f32_32x32x16_f16 $0, $1, $2, "
-                         : "v_mfma_f32_32x32x16_bf16 $0, $1, $2, ")
-                : (isF16 ? "v_mfma_f32_16x16x32_f16 $0, $1, $2, "
-                         : "v_mfma_f32_16x16x32_bf16 $0, $1, $2, ");
-    StringRef mfmaIntrinsicName =
-        is32x32 ? (isF16 ? ROCDL::mfma_f32_32x32x16_f16::getOperationName()
-                         : ROCDL::mfma_f32_32x32x16_bf16::getOperationName())
-                : (isF16 ? ROCDL::mfma_f32_16x16x32_f16::getOperationName()
-                         : ROCDL::mfma_f32_16x16x32_bf16::getOperationName());
-    bool useLatencyAwareIntrinsic = op.getAccumulatorRole() == "transient";
+    bool isPersistent = op.getAccumulatorRole() == "persistent";
+    bool orderOperandPins =
+        scheduledMfmaState.operandOrderEligibleOps.contains(op.getOperation());
+    int drainWaitStates = 0;
+    if (isPersistent) {
+      FailureOr<int> requiredWait =
+          getMfmaDrainWaitStates(targetInfo.getISAFamily(), instrShape);
+      if (failed(requiredWait))
+        return rewriter.notifyMatchFailure(
+            op, "persistent MFMA layout has no modeled result-read hazard "
+                "requirement");
+      drainWaitStates = *requiredWait;
+    }
+    bool pinAccumulatorInput = isPersistent && !op.getInitialize() &&
+                               !matchPattern(op.getAcc(), m_Constant());
 
     SmallVector<Value> updatedFragments = accumulatorFragments;
-    // Keep one SSA chain per output fragment while making source order
-    // explicit across the grid. Round-robin the K slices over independent
-    // output fragments so persistent inline-assembly chains expose enough
-    // distance between dependent MFMAs. Native intrinsics expose transient
-    // chains to AMDGPU's MFMA hazard recognizer and machine scheduler. Direct
-    // inline assembly preserves the requested register class for persistent
-    // chains.
+    if (pinAccumulatorInput) {
+      for (Value &fragment : updatedFragments) {
+        FailureOr<Value> constrainedC = constrainMfmaFragmentRegisterClass(
+            fragment, accumulatorStorage, rewriter, loc,
+            /*hasSideEffects=*/true);
+        if (failed(constrainedC))
+          return rewriter.notifyMatchFailure(
+              op, "native MFMA accumulator must pack into complete 32-bit "
+                  "registers");
+        fragment = *constrainedC;
+      }
+    }
+
+    // Keep one SSA chain per output fragment and retain K/N/M source order.
+    // Native intrinsics expose every chain to AMDGPU's hazard recognizer and
+    // scheduler. Empty C/D pins constrain persistent storage at the boundaries
+    // of the grid; the arithmetic itself stays visible to LLVM.
     for (int64_t k = 0; k < numRepK; ++k) {
       for (int64_t n = 0; n < numRepN; ++n) {
         for (int64_t m = 0; m < numRepM; ++m) {
@@ -1393,102 +2009,75 @@ public:
           Value current = updatedFragments[accumulatorIndex];
           Value operandA = (*maybeA)[m * numRepK + k];
           Value operandB = (*maybeB)[n * numRepK + k];
-          // The MFMA inline asm below already constrains ordinary operands to
-          // VGPRs.  Pre-constrain only the resident-operand path, where one
-          // input must be moved to AGPRs before issuing the instruction.
-          if (!useLatencyAwareIntrinsic &&
-              (aStorage == "agpr" || bStorage == "agpr")) {
+          // "unconstrained" leaves persistent operand classes to LLVM. An
+          // operand pin consumes its input, so a pin on a freshly loaded LDS
+          // operand forces the load wait at the pin rather than at the MFMA.
+          if (isPersistent && op.getResidentOperand() != "unconstrained") {
+            LLVM::InlineAsmOp pinA, pinB;
             FailureOr<Value> constrainedA = constrainMfmaFragmentRegisterClass(
-                operandA, aStorage, rewriter, loc);
+                operandA, aStorage, rewriter, loc, /*hasSideEffects=*/false,
+                &pinA);
             FailureOr<Value> constrainedB = constrainMfmaFragmentRegisterClass(
-                operandB, bStorage, rewriter, loc);
+                operandB, bStorage, rewriter, loc, /*hasSideEffects=*/false,
+                &pinB);
             if (failed(constrainedA) || failed(constrainedB))
               return rewriter.notifyMatchFailure(
                   op, "native MFMA operands must pack into complete 32-bit "
                       "registers");
+            // Share repeated fragments through CSE, then order the surviving
+            // pins only when both original operands came entirely from LDS.
+            if (orderOperandPins)
+              for (LLVM::InlineAsmOp pin : {pinA, pinB})
+                pin->setAttr(triton::AMD::kScheduledMfmaOperandPinAttrName,
+                             rewriter.getUnitAttr());
             operandA = *constrainedA;
             operandB = *constrainedB;
           }
-          StringRef aRegisterClass = aStorage;
-          StringRef bRegisterClass = bStorage;
-          if (mfma.getIsTransposed()) {
+          if (mfma.getIsTransposed())
             std::swap(operandA, operandB);
-            std::swap(aRegisterClass, bRegisterClass);
-          }
 
-          bool zeroThisInstruction = op.getInitialize() && k == 0;
-          if (useLatencyAwareIntrinsic) {
-            OperationState loweredOp(loc, mfmaIntrinsicName);
-            loweredOp.addTypes(fragmentTy);
-            Value intrinsicAcc = zeroThisInstruction ? zeroFragment : current;
-            loweredOp.addOperands({operandA, operandB, intrinsicAcc});
-            loweredOp.addAttribute("cbsz", rewriter.getI32IntegerAttr(0));
-            loweredOp.addAttribute("abid", rewriter.getI32IntegerAttr(0));
-            // For `blgp`: f64 MFMA uses negation flags, while other MFMA ops
-            // use B-lane permutation flags.
-            MLIRContext *ctx = rewriter.getContext();
-            if (cast<VectorType>(fragmentTy).getElementType().isF64()) {
-              loweredOp.addAttribute("blgp",
-                                     ROCDL::MFMANegModifierAttr::get(
-                                         ctx, ROCDL::MFMANegModifier::none));
-            } else {
-              loweredOp.addAttribute("blgp", ROCDL::MFMAPermBAttr::get(
-                                                 ctx, ROCDL::MFMAPermB::none));
-            }
-            current = rewriter.create(loweredOp)->getResult(0);
-          } else {
-            std::string constraints = outputConstraint.str();
-            constraints += "," + inputConstraint(aRegisterClass).str();
-            constraints += "," + inputConstraint(bRegisterClass).str();
-            SmallVector<Value> asmOperands{operandA, operandB};
-            if (!zeroThisInstruction) {
-              asmOperands.push_back(current);
-              constraints += ",0";
-            }
-            // The hazard recognizer cannot see this MFMA (it lives inside an
-            // `asm sideeffect` block), so it will not pad a preceding VALU
-            // write of srcA/srcB or of EXEC. Per LLVM's checkMAIHazards90A
-            // that needs `LegacyVALUNotDotWritesVGPRWaitStates` (2) and
-            // `VALUWritesExecWaitStates` (4) respectively; 4 covers both. An
-            // exact same-register srcC forward from the previous MFMA in the
-            // chain is explicitly not a hazard, so this does not serialize
-            // the accumulation chain.
-            std::string mfmaAsm =
-                mfmaWaitStateAsm(/*waitStates=*/4) + "\n" + mfmaAsmPrefix;
-            mfmaAsm += zeroThisInstruction ? "0" : "$0";
-            auto inlineAsm = LLVM::InlineAsmOp::create(
-                rewriter, loc, fragmentTy, asmOperands, mfmaAsm, constraints,
-                /*has_side_effects=*/true,
-                /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-                operandAttrs);
-            current = inlineAsm->getResult(0);
+          if (info.intrinsicOperandsAreI16) {
+            auto packedTy = vec_ty(i16_ty, info.kBase);
+            operandA = b.bitcast(operandA, packedTy);
+            operandB = b.bitcast(operandB, packedTy);
           }
-          updatedFragments[accumulatorIndex] = current;
+          OperationState loweredOp(loc, info.intrinsicName);
+          loweredOp.addTypes(fragmentTy);
+          bool zeroThisInstruction = op.getInitialize() && k == 0;
+          Value intrinsicAcc = zeroThisInstruction ? zeroFragment : current;
+          loweredOp.addOperands({operandA, operandB, intrinsicAcc});
+          loweredOp.addAttribute("cbsz", rewriter.getI32IntegerAttr(0));
+          loweredOp.addAttribute("abid", rewriter.getI32IntegerAttr(0));
+          // For `blgp`: f64 MFMA uses negation flags, while other MFMA ops
+          // use B-lane permutation flags.
+          Attribute blgpAttr =
+              cast<VectorType>(fragmentTy).getElementType().isF64()
+                  ? Attribute(ROCDL::MFMANegModifierAttr::get(
+                        rewriter.getContext(), ROCDL::MFMANegModifier::none))
+                  : Attribute(ROCDL::MFMAPermBAttr::get(
+                        rewriter.getContext(), ROCDL::MFMAPermB::none));
+          loweredOp.addAttribute("blgp", blgpAttr);
+          updatedFragments[accumulatorIndex] =
+              rewriter.create(loweredOp)->getResult(0);
         }
       }
     }
 
-    if (!useLatencyAwareIntrinsic) {
-      // The consumer is unknown at this point, so use the largest requirement
-      // LLVM models for reading an MFMA destination on gfx950:
-      // `GFX940_XDL_N_PassWritesVGPROverlappedSrcABWaitStates` is
-      // `NumPasses + 3 + 1` = 20 for a 16-pass MFMA, which exceeds both
-      // `MFMA32x32WritesAGPRAccVgprReadWaitStates` (18) and the function's own
-      // `MaxWaitStates` (19). Sizing the drain for the worst consumer keeps it
-      // sufficient on its own, rather than relying on the next MFMA's input
-      // padding to make up a shortfall.
-      for (int64_t n = 0; n < numRepN; ++n) {
-        for (int64_t m = 0; m < numRepM; ++m) {
-          int64_t accumulatorIndex = m * numRepN + n;
-          FailureOr<Value> drained = drainMfmaPipeline(
-              updatedFragments[accumulatorIndex], accumulatorStorage,
-              /*waitStates=*/20, rewriter, loc);
-          if (failed(drained))
-            return rewriter.notifyMatchFailure(
-                op, "MFMA accumulator fragment must pack into complete 32-bit "
-                    "registers");
-          updatedFragments[accumulatorIndex] = *drained;
-        }
+    SmallVector<LLVM::InlineAsmOp> resultPins;
+    if (isPersistent) {
+      for (Value &fragment : updatedFragments) {
+        // Anchor each completed K chain to side-effect ordering while keeping
+        // its arithmetic in native MFMAs.
+        LLVM::InlineAsmOp pin;
+        FailureOr<Value> constrainedD = constrainMfmaFragmentRegisterClass(
+            fragment, accumulatorStorage, rewriter, loc,
+            /*hasSideEffects=*/true, &pin);
+        if (failed(constrainedD))
+          return rewriter.notifyMatchFailure(
+              op,
+              "native MFMA result must pack into complete 32-bit registers");
+        fragment = *constrainedD;
+        resultPins.push_back(pin);
       }
     }
 
@@ -1504,6 +2093,233 @@ public:
     }
     Value result = packTensorElements(loc, typeConverter, elements, rewriter,
                                       op.getResult().getType());
+    rewriter.replaceOp(op, result);
+    for (LLVM::InlineAsmOp pin : resultPins)
+      scheduledMfmaState.resultPins.emplace_back(pin, drainWaitStates);
+    return success();
+  }
+
+private:
+  const AMD::TargetInfo &targetInfo;
+  AMD::ScheduledMfmaLoweringState &scheduledMfmaState;
+};
+
+// Scaled twin of ScheduledMfmaOpConversion for microscaling formats. The
+// verifier guarantees the transient contract, CDNA4 scaled instruction shapes,
+// kWidth=8 packed-byte windows (24 bytes per native step), and one E8M0
+// byte per tile-step in MFMA scale layout order, so lowering only packs
+// fragments and emits the native ROCDL scaled MFMA intrinsic.
+class ScheduledMfmaScaledOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::ScheduledMfmaScaledOp> {
+public:
+  using OpAdaptor = triton::amdgpu::ScheduledMfmaScaledOp::Adaptor;
+
+  ScheduledMfmaScaledOpConversion(const LLVMTypeConverter &converter,
+                                  const AMD::TargetInfo &targetInfo,
+                                  PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<triton::amdgpu::ScheduledMfmaScaledOp>(converter,
+                                                                      benefit),
+        targetInfo(targetInfo) {}
+
+  // Packed bytes one lane feeds per 32-value step, and the ROCDL
+  // MatrixFormat code, per microscaling format. The operand window is
+  // always 32 i8 slots; bytes past the packed count are zero padding.
+  static int64_t packedBytesPerStep(StringRef format) {
+    if (format == "e4m3" || format == "e5m2")
+      return 32;
+    if (format == "e2m3" || format == "e3m2")
+      return 24;
+    return 16; // e2m1
+  }
+  static int32_t matrixFormatCode(StringRef format) {
+    // Mirrors getMfmaF8F6F4MatrixFormat in DotOpToLLVM/MFMA.cpp.
+    if (format == "e4m3")
+      return 0;
+    if (format == "e5m2")
+      return 1;
+    if (format == "e2m3")
+      return 2;
+    if (format == "e3m2")
+      return 3;
+    return 4; // e2m1
+  }
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::ScheduledMfmaScaledOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto aTy = cast<RankedTensorType>(op.getA().getType());
+    auto bTy = cast<RankedTensorType>(op.getB().getType());
+    auto accTy = cast<RankedTensorType>(op.getAcc().getType());
+    if (!aTy.getElementType().isInteger(8))
+      return rewriter.notifyMatchFailure(
+          op, "typed operands use the scaled-dot scheduled lowering");
+    bool packedScales = cast<RankedTensorType>(op.getAScale().getType())
+                            .getElementType()
+                            .isInteger(32);
+    auto mfma = cast<triton::gpu::AMDMfmaEncodingAttr>(accTy.getEncoding());
+    if (failed(verifyMfmaVersionMatchesTarget(op, mfma,
+                                              targetInfo.getISAFamily())))
+      return failure();
+    ArrayRef<unsigned> instrShape = mfma.getInstrShape();
+    int64_t logicalK = aTy.getShape()[1];
+    int64_t steps = logicalK / instrShape[2];
+    ArrayRef<unsigned> warpsPerCTA = mfma.getWarpsPerCTA();
+    int64_t repM = aTy.getShape()[0] / (instrShape[0] * warpsPerCTA[0]);
+    int64_t repN = bTy.getShape()[1] / (instrShape[1] * warpsPerCTA[1]);
+
+    TritonLLVMOpBuilder b(loc, rewriter);
+    auto packOperand = [&](Value value, RankedTensorType ty, int64_t repNonK,
+                           StringRef format) -> FailureOr<SmallVector<Value>> {
+      int64_t validBytes = packedBytesPerStep(format);
+      SmallVector<Value> elems = unpackTensorElements(loc, value, rewriter, ty);
+      // Per step a lane holds 32 i8 values in K order: the first 24 are
+      // the packed bytes of 32 FP6 codes, the last 8 are zero padding.
+      SmallVector<int64_t> strides = computeStrides({1, repNonK, steps, 32});
+      if (elems.size() != static_cast<size_t>(repNonK * steps * 32))
+        return failure();
+      auto byteVecTy = vec_ty(i8_ty, validBytes);
+      auto dwordVecTy = vec_ty(i32_ty, validBytes / 4);
+      SmallVector<Value> fragments;
+      for (int64_t nonK = 0; nonK < repNonK; ++nonK) {
+        for (int64_t step = 0; step < steps; ++step) {
+          Value fragment = b.undef(byteVecTy);
+          for (int64_t byte = 0; byte < validBytes; ++byte) {
+            int64_t index = linearize({0, nonK, step, byte}, strides);
+            fragment = b.insert_element(byteVecTy, fragment, elems[index],
+                                        b.i32_val(byte));
+          }
+          fragments.push_back(b.bitcast(fragment, dwordVecTy));
+        }
+      }
+      return fragments;
+    };
+    FailureOr<SmallVector<Value>> maybeA =
+        packOperand(adaptor.getA(), aTy, repM, op.getAFormat());
+    FailureOr<SmallVector<Value>> maybeB =
+        packOperand(adaptor.getB(), bTy, repN, op.getBFormat());
+    if (failed(maybeA) || failed(maybeB))
+      return rewriter.notifyMatchFailure(
+          op, "operands do not match the verified packed MFMA grid");
+
+    auto packScales = [&](Value value, RankedTensorType ty,
+                          int64_t repNonK) -> FailureOr<SmallVector<Value>> {
+      SmallVector<Value> elems = unpackTensorElements(loc, value, rewriter, ty);
+      if (packedScales) {
+        if (elems.size() != 1)
+          return failure();
+        return elems;
+      }
+      if (elems.size() != static_cast<size_t>(repNonK * steps))
+        return failure();
+      SmallVector<Value> scales;
+      for (int64_t nonK = 0; nonK < repNonK; ++nonK)
+        for (int64_t step = 0; step < steps; ++step)
+          scales.push_back(LLVM::ZExtOp::create(rewriter, loc, i32_ty,
+                                                elems[nonK * steps + step]));
+      return scales;
+    };
+    FailureOr<SmallVector<Value>> maybeAScale =
+        packScales(adaptor.getAScale(),
+                   cast<RankedTensorType>(op.getAScale().getType()), repM);
+    FailureOr<SmallVector<Value>> maybeBScale =
+        packScales(adaptor.getBScale(),
+                   cast<RankedTensorType>(op.getBScale().getType()), repN);
+    if (failed(maybeAScale) || failed(maybeBScale))
+      return rewriter.notifyMatchFailure(
+          op, "scales do not match the verified packed MFMA grid");
+
+    constexpr int64_t warpSize = 64;
+    int64_t elemsPerFragment = instrShape[0] * instrShape[1] / warpSize;
+    SmallVector<int64_t> accStrides =
+        computeStrides({1, repM, repN, elemsPerFragment});
+    SmallVector<Value> accElems =
+        unpackTensorElements(loc, adaptor.getAcc(), rewriter, accTy);
+    if (accElems.size() != static_cast<size_t>(repM * repN * elemsPerFragment))
+      return rewriter.notifyMatchFailure(
+          op, "accumulator element count does not match its MFMA grid");
+    Type accElemTy = getTypeConverter()->convertType(accTy.getElementType());
+    auto fragmentTy = vec_ty(accElemTy, elemsPerFragment);
+    SmallVector<Value> accFragments;
+    for (int64_t m = 0; m < repM; ++m) {
+      for (int64_t n = 0; n < repN; ++n) {
+        Value fragment = b.undef(fragmentTy);
+        for (int64_t index = 0; index < elemsPerFragment; ++index) {
+          int64_t linearIndex = linearize({0, m, n, index}, accStrides);
+          fragment = b.insert_element(fragmentTy, fragment,
+                                      accElems[linearIndex], b.i32_val(index));
+        }
+        accFragments.push_back(fragment);
+      }
+    }
+
+    Value zeroFragment;
+    if (op.getInitialize()) {
+      Attribute zeroAttr = rewriter.getZeroAttr(accElemTy);
+      auto zeroElements =
+          DenseElementsAttr::get(cast<ShapedType>(fragmentTy), zeroAttr);
+      zeroFragment =
+          LLVM::ConstantOp::create(rewriter, loc, fragmentTy, zeroElements);
+    }
+
+    StringRef intrinsicName =
+        instrShape[2] == 128
+            ? ROCDL::mfma_scale_f32_16x16x128_f8f6f4::getOperationName()
+            : ROCDL::mfma_scale_f32_32x32x64_f8f6f4::getOperationName();
+
+    SmallVector<Value> updated = accFragments;
+    for (int64_t step = 0; step < steps; ++step) {
+      for (int64_t n = 0; n < repN; ++n) {
+        for (int64_t m = 0; m < repM; ++m) {
+          Value operandA = (*maybeA)[m * steps + step];
+          Value operandB = (*maybeB)[n * steps + step];
+          Value scaleA = (*maybeAScale)[packedScales ? 0 : m * steps + step];
+          Value scaleB = (*maybeBScale)[packedScales ? 0 : n * steps + step];
+          int32_t opSelA =
+              packedScales ? op.getAScaleSelectorAttr().getInt() + 2 * step : 0;
+          int32_t opSelB =
+              packedScales ? op.getBScaleSelectorAttr().getInt() + 2 * step : 0;
+          int32_t cbsz = matrixFormatCode(op.getAFormat());
+          int32_t blgp = matrixFormatCode(op.getBFormat());
+          if (mfma.getIsTransposed()) {
+            std::swap(operandA, operandB);
+            std::swap(scaleA, scaleB);
+            std::swap(opSelA, opSelB);
+            std::swap(cbsz, blgp);
+          }
+          OperationState loweredOp(loc, intrinsicName);
+          loweredOp.addTypes(fragmentTy);
+          Value accIn = (op.getInitialize() && step == 0)
+                            ? zeroFragment
+                            : updated[m * repN + n];
+          loweredOp.addOperands({operandA, operandB, accIn, scaleA, scaleB});
+          loweredOp.addAttribute("cbsz",
+                                 ROCDL::MatrixFormatAttr::get(
+                                     rewriter.getContext(),
+                                     static_cast<ROCDL::MatrixFormat>(cbsz)));
+          loweredOp.addAttribute("blgp",
+                                 ROCDL::MatrixFormatAttr::get(
+                                     rewriter.getContext(),
+                                     static_cast<ROCDL::MatrixFormat>(blgp)));
+          loweredOp.addAttribute("opselA", rewriter.getI32IntegerAttr(opSelA));
+          loweredOp.addAttribute("opselB", rewriter.getI32IntegerAttr(opSelB));
+          updated[m * repN + n] = rewriter.create(loweredOp)->getResult(0);
+        }
+      }
+    }
+
+    for (int64_t m = 0; m < repM; ++m) {
+      for (int64_t n = 0; n < repN; ++n) {
+        Value fragment = updated[m * repN + n];
+        for (int64_t index = 0; index < elemsPerFragment; ++index) {
+          int64_t linearIndex = linearize({0, m, n, index}, accStrides);
+          accElems[linearIndex] =
+              b.extract_element(accElemTy, fragment, b.i32_val(index));
+        }
+      }
+    }
+    Value result = packTensorElements(loc, getTypeConverter(), accElems,
+                                      rewriter, op.getResult().getType());
     rewriter.replaceOp(op, result);
     return success();
   }
@@ -1524,7 +2340,13 @@ public:
   LogicalResult
   matchAndRewrite(triton::gpu::BarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (targetInfo.getIsaVersion().Major < 9)
+    // A local-only fence omits the vector cache invalidate. This is safe only
+    // when all waves share one L0, so an acquire in one wave covers the others.
+    auto isaFamily = targetInfo.getISAFamily();
+    bool workgroupSharesOneL0 =
+        mlir::triton::amdgpu::isCDNA(isaFamily) ||
+        (mlir::triton::amdgpu::isRDNA(isaFamily) && targetInfo.isCuMode());
+    if (op.isWarp() || !workgroupSharesOneL0)
       return failure();
     // Check no other memory addrspaces are selected.
     // TensorRead/Write are allowed but noop.
@@ -1564,6 +2386,108 @@ public:
 private:
   const AMD::TargetInfo &targetInfo;
 };
+
+} // namespace
+
+void mlir::triton::AMD::finalizeScheduledMfmaLowering(
+    const ScheduledMfmaLoweringState &state) {
+  SmallVector<std::pair<Operation *, int>> needsDrain;
+  DenseMap<Operation *, std::unique_ptr<MfmaMemoryForwarding>> memoryForwarding;
+  DenseMap<Operation *, int> functionWaitStates;
+  DenseMap<Operation *, bool> functionNeedsDrain;
+  // Shared commits take the largest requirement among their reaching roots.
+  // Transient-only handoffs have no persistent result pin and keep their
+  // original delay. This deliberately also strengthens persistent commits
+  // whose outputs have only native consumers or no consumers.
+  DenseMap<Operation *, int> commitWaitStates = state.commitWaitStates;
+  auto isNativeInstruction = [](StringRef name) {
+    // These lower to native instructions on the supported targets. Exp2 is
+    // also emitted as a direct LLVM call by the elementwise conversion.
+    return llvm::is_contained(
+        {"llvm.amdgcn.perm", "llvm.amdgcn.permlane16.swap",
+         "llvm.amdgcn.permlane32.swap", "llvm.amdgcn.readfirstlane",
+         "llvm.amdgcn.ds.permute", "llvm.amdgcn.ds.bpermute",
+         "llvm.amdgcn.raw.ptr.buffer.atomic.fadd", "llvm.amdgcn.wave.barrier",
+         "llvm.amdgcn.exp2.f32", "llvm.exp2.f32"},
+        name);
+  };
+  for (auto [pin, requiredWait] : state.resultPins) {
+    auto function = pin->getParentOfType<LLVM::LLVMFuncOp>();
+    bool crossesCallBoundary = !function;
+    if (function) {
+      auto entry = functionNeedsDrain.try_emplace(function);
+      bool &needsFunctionDrain = entry.first->second;
+      if (entry.second) {
+        // Callable helpers must complete before returning. Kernels have no
+        // symbol uses and external linkage at this conversion stage.
+        needsFunctionDrain = function.getLinkage() != LLVM::Linkage::External ||
+                             !SymbolTable::symbolKnownUseEmpty(
+                                 function, function->getParentOp());
+        function.walk([&](Operation *op) {
+          // Coroutine intrinsics can introduce calls or helper functions in
+          // LLVM's later coroutine lowering despite having dedicated MLIR ops.
+          if (isa<LLVM::InvokeOp>(op) ||
+              op->getName().getStringRef().starts_with("llvm.intr.coro."))
+            needsFunctionDrain = true;
+          if (auto call = dyn_cast<LLVM::CallOp>(op)) {
+            auto callee = call.getCallee();
+            if (!callee || !isNativeInstruction(*callee))
+              needsFunctionDrain = true;
+          }
+          if (auto call = dyn_cast<LLVM::CallIntrinsicOp>(op)) {
+            // Unknown intrinsics may lower to calls (including some amdgcn
+            // intrinsics), so keep their boundary covered conservatively.
+            if (!isNativeInstruction(call.getIntrin()))
+              needsFunctionDrain = true;
+          }
+        });
+      }
+      crossesCallBoundary = needsFunctionDrain;
+      int &waitStates = functionWaitStates[function];
+      waitStates = std::max(waitStates, requiredWait);
+    }
+    // A call can reuse registers even without consuming the MFMA result. Keep
+    // its full destination tuple live until completion on either side of a
+    // call/return, including when LLVM moves otherwise independent operations.
+    if (crossesCallBoundary ||
+        needsOpaqueConsumerDrain(pin, requiredWait, commitWaitStates,
+                                 memoryForwarding))
+      needsDrain.emplace_back(pin, requiredWait);
+  }
+
+  // A dead destination can be reused by an unrelated inline-assembly output
+  // while its native MFMA is still in flight. SSA consumer analysis cannot see
+  // that physical-register WAW hazard (or a reused source's WAR hazard).
+  // Keep completion inside the opaque instruction sequence: pure assembly can
+  // move across other operations during LLVM optimization. Function scope also
+  // covers backedges and values or partial fragments eliminated later by LLVM.
+  // Empty register pins and compiler-owned commits emit no register writes.
+  // The latter retain their separately modeled completion contract.
+  for (auto [function, waitStates] : functionWaitStates) {
+    std::string completion = mfmaWaitStateAsm(waitStates) + "\n";
+    function->walk([&](LLVM::InlineAsmOp assembly) {
+      if (assembly.getAsmString().empty() ||
+          commitWaitStates.contains(assembly))
+        return;
+      assembly.setAsmString(completion + assembly.getAsmString().str());
+    });
+  }
+
+  // Analyze every root before changing result pins: otherwise an upgraded pin
+  // could appear to be an opaque consumer of a different root. Commits remain
+  // recognizable by their map entries while their delays are strengthened.
+  for (auto [pin, requiredWait] : needsDrain)
+    cast<LLVM::InlineAsmOp>(pin).setAsmString(mfmaWaitStateAsm(requiredWait));
+
+  // Consumer analysis and opaque/call guards are unchanged. Only now can an
+  // explicitly anchored second boundary share the finalized first delay.
+  for (auto [op, waitStates] : commitWaitStates) {
+    auto second = cast<LLVM::InlineAsmOp>(op);
+    auto first = getAnchoringCommit(second, commitWaitStates);
+    if (first && commitWaitStates.lookup(first) >= waitStates)
+      second.setAsmString("");
+  }
+}
 
 /// Encodes the waitcnt value for AMDGPU architectures.
 ///
@@ -1629,7 +2553,7 @@ struct MemoryCounterWaitOpConversion
   matchAndRewrite(amdgpu::MemoryCounterWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     // amdgpu::MemoryCounterWaitOp supports gfx9 onwards
-    auto isaVersion = targetInfo.getIsaVersion();
+    auto isaVersion = llvm::AMDGPU::getIsaVersion(targetInfo.getArch());
 
     /// If major version >= gfx12, lower to
     ///   * ROCDL::WaitDscntOp if ds is present
@@ -1683,27 +2607,29 @@ private:
   const AMD::TargetInfo &targetInfo;
 };
 
-} // namespace
-
 void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     const TargetInfo &targetInfo, PatternBenefit benefit,
-    std::shared_ptr<DistributedCoordinateGroups> coordinateGroups) {
+    std::shared_ptr<DistributedCoordinateGroups> coordinateGroups,
+    ScheduledMfmaLoweringState &scheduledMfmaState) {
   PatternBenefit transBenefit = PatternBenefit(benefit.getBenefit() + 1);
   PatternBenefit barrierBenefit = PatternBenefit(benefit.getBenefit() + 1);
 
-  patterns.add<TransLocalLoadOpConversion>(typeConverter, targetInfo,
-                                           transBenefit, coordinateGroups);
-  patterns.add<LocalLoadPackedTransposedOpConversion>(typeConverter, targetInfo,
-                                                      benefit);
+  patterns.add<TransLocalLoadOpConversion<triton::gpu::LocalLoadOp>>(
+      typeConverter, targetInfo, transBenefit, coordinateGroups);
+  patterns.add<
+      TransLocalLoadOpConversion<triton::amdgpu::LocalLoadPackedTransposedOp>>(
+      typeConverter, targetInfo, benefit, coordinateGroups);
   patterns.add<LocalAtomicScatterRMWOpConversion>(typeConverter, targetInfo,
                                                   benefit.getBenefit() + 1);
   patterns.add<RematerializedRangeOpConversion>(typeConverter, targetInfo,
                                                 transBenefit);
-  patterns.add<RegisterResidentOpConversion, RegisterHandoffOpConversion>(
+  patterns.add<RegisterResidentOpConversion, RegisterClassAnchorOpConversion>(
       typeConverter, transBenefit);
   patterns.add<MfmaCommitOpConversion, ScheduledMfmaOpConversion>(
-      typeConverter, targetInfo, transBenefit);
+      typeConverter, targetInfo, scheduledMfmaState, transBenefit);
+  patterns.add<ScheduledMfmaScaledOpConversion>(typeConverter, targetInfo,
+                                                transBenefit);
   patterns.add<BarrierOpConversion, MemoryCounterWaitOpConversion>(
       typeConverter, targetInfo, barrierBenefit);
 }

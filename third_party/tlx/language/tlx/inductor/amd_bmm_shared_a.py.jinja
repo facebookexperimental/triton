@@ -1,0 +1,431 @@
+import triton.language.extra.tlx as tlx
+
+{{def_kernel("A", "B")}}
+    # gfx950 shared-LHS BMM candidates ported from amd_bmm_shared_a.py.
+    # A is [BATCH, M, K] with stride_aq == 0, B is row-major [BATCH, K, N].
+    M = {{size("A", -2)}}
+    N = {{size("B", -1)}}
+    K = {{size("A", -1)}}
+    BATCH = {{size("A", 0)}}
+    stride_aq = {{stride("A", 0)}}
+    stride_am = {{stride("A", 1)}}
+    stride_ak = {{stride("A", 2)}}
+    stride_bq = {{stride("B", 0)}}
+    stride_bk = {{stride("B", 1)}}
+    stride_bn = {{stride("B", 2)}}
+
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    grid_mn = grid_m * grid_n
+    num_tiles = BATCH * grid_mn
+    pidf = tl.program_id(0).to(INDEX_DTYPE)
+
+    # The standalone kernel's _chip mapping. BATCH_GROUP controls how many
+    # batches of the same output tile are issued consecutively.
+    aligned = (num_tiles // (BATCH_GROUP * grid_mn)) * (BATCH_GROUP * grid_mn)
+    if pidf < aligned:
+        group = pidf % BATCH_GROUP
+        local_pid = pidf // BATCH_GROUP
+        pidf = ((local_pid // grid_mn) * BATCH_GROUP * grid_mn
+                + group * grid_mn + local_pid % grid_mn)
+
+    batch_id = pidf // grid_mn
+    pid = pidf % grid_mn
+    A = A + batch_id.to(tl.int64) * stride_aq
+    B = B + batch_id.to(tl.int64) * stride_bq
+
+{% if KERNEL_KIND == 40 %}
+    # 40x256x1956: one 64x256 MI32 tile. Duplicate the 24 invalid A rows
+    # during loads and mask them only at the output.
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4, instr_shape=[32, 32, 16], transposed=True,
+        warps_per_cta=[1, 4])
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    raw_m = tl.arange(0, 64)
+    rm = tl.where(raw_m < M, raw_m, raw_m - M)
+    rn = tl.arange(0, 256)
+    rk = tl.arange(0, 32)
+    ao = rm[:, None] * stride_am
+    bo = rn[None, :] * stride_bn
+    a_buf = tlx.local_alloc((64, 32), tl.float16, 2)
+    b_buf = tlx.local_alloc((32, 256), tl.float16, 2)
+    tlx.local_store(tlx.local_view(a_buf, 0),
+                    tl.load(A + ao + rk[None, :] * stride_ak))
+    tlx.local_store(tlx.local_view(b_buf, 0),
+                    tl.load(B + rk[:, None] * stride_bk + bo,
+                            cache_modifier=".cg"))
+    tl.debug_barrier()
+    acc = tlx.zeros((64, 256), tl.float32, layout=mma)
+    full_tiles = K // 32
+    for k in tl.range(0, full_tiles - 1, loop_unroll_factor=2):
+        cur = k % 2
+        nxt = (k + 1) % 2
+        av = tlx.require_layout(
+            tlx.local_load(tlx.local_view(a_buf, cur)), dot0, pin=False)
+        bv = tlx.require_layout(
+            tlx.local_load(tlx.local_view(b_buf, cur)), dot1, pin=False)
+        kp = (k + 1) * 32
+        next_a = tl.load(A + ao + (kp + rk[None, :]) * stride_ak)
+        next_b = tl.load(B + (kp + rk[:, None]) * stride_bk + bo,
+                         cache_modifier=".cg")
+        acc = tl.dot(av, bv, acc)
+        tlx.local_store(tlx.local_view(a_buf, nxt), next_a)
+        tlx.local_store(tlx.local_view(b_buf, nxt), next_b)
+        tl.debug_barrier()
+    cur = (full_tiles - 1) % 2
+    av = tlx.require_layout(
+        tlx.local_load(tlx.local_view(a_buf, cur)), dot0, pin=False)
+    bv = tlx.require_layout(
+        tlx.local_load(tlx.local_view(b_buf, cur)), dot1, pin=False)
+    acc = tl.dot(av, bv, acc)
+    tail = full_tiles * 32
+    km = tail + rk < K
+    nxt = full_tiles % 2
+    tail_a = tl.load(A + ao + (tail + rk[None, :]) * stride_ak,
+                     mask=km[None, :], other=0.0)
+    tail_b = tl.load(B + (tail + rk[:, None]) * stride_bk + bo,
+                     mask=km[:, None], other=0.0, cache_modifier=".cg")
+    tlx.local_store(tlx.local_view(a_buf, nxt), tail_a)
+    tlx.local_store(tlx.local_view(b_buf, nxt), tail_b)
+    tl.debug_barrier()
+    av = tlx.require_layout(
+        tlx.local_load(tlx.local_view(a_buf, nxt)), dot0, pin=False)
+    bv = tlx.require_layout(
+        tlx.local_load(tlx.local_view(b_buf, nxt)), dot1, pin=False)
+    acc = tl.dot(av, bv, acc)
+    idx_q = batch_id
+    idx_m = raw_m[:, None]
+    idx_n = rn[None, :]
+    mask = (idx_m < M) & (idx_n < N)
+    out = acc.to(tl.float16)
+    {{store_output(("idx_q", "idx_m", "idx_n"), "out", "mask", val_shape=("64", "256"), output_layout="mma")}}
+
+{% elif KERNEL_KIND == 262 %}
+    # 262x256x294: two 144x256 MI16 tiles represented as 128+16 rows.
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4, instr_shape=[16, 16, 32], transposed=True,
+        warps_per_cta=[1, 4])
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    pm = pid
+    r128 = tl.arange(0, 128)
+    r16 = tl.arange(0, 16)
+    rn = tl.arange(0, 256)
+    rk = tl.arange(0, 32)
+    raw_m0 = pm * 144 + r128
+    raw_m1 = pm * 144 + 128 + r16
+    rm0 = tl.where(raw_m0 < M, raw_m0, raw_m0 - M)
+    rm1 = tl.where(raw_m1 < M, raw_m1, raw_m1 - M)
+    ao0 = rm0[:, None] * stride_am
+    ao1 = rm1[:, None] * stride_am
+    bo = rn[None, :] * stride_bn
+    a0_buf = tlx.local_alloc((128, 32), tl.float16, 2)
+    a1_buf = tlx.local_alloc((16, 32), tl.float16, 2)
+    b_layout: tl.constexpr = tlx.swizzled_layout(4, 3, 5)
+    b_buf = tlx.local_alloc((32, 256), tl.float16, 2, layout=b_layout)
+    tlx.local_store(tlx.local_view(a0_buf, 0),
+                    tl.load(A + ao0 + rk[None, :] * stride_ak))
+    tlx.local_store(tlx.local_view(a1_buf, 0),
+                    tl.load(A + ao1 + rk[None, :] * stride_ak))
+    tlx.local_store(tlx.local_view(b_buf, 0),
+                    tl.load(B + rk[:, None] * stride_bk + bo))
+    tl.debug_barrier()
+    acc0 = tlx.zeros((128, 256), tl.float32, layout=mma)
+    acc1 = tlx.zeros((16, 256), tl.float32, layout=mma)
+    full_tiles = K // 32
+    for k in tl.range(0, full_tiles - 1):
+        cur = k % 2
+        nxt = (k + 1) % 2
+        av0 = tlx.require_layout(
+            tlx.local_load(tlx.local_view(a0_buf, cur)), dot0, pin=False)
+        av1 = tlx.require_layout(
+            tlx.local_load(tlx.local_view(a1_buf, cur)), dot0, pin=False)
+        bv = tlx.require_layout(
+            tlx.local_load(tlx.local_view(b_buf, cur)), dot1, pin=False)
+        kp = (k + 1) * 32
+        next_a0 = tl.load(A + ao0 + (kp + rk[None, :]) * stride_ak)
+        next_a1 = tl.load(A + ao1 + (kp + rk[None, :]) * stride_ak)
+        next_b = tl.load(B + (kp + rk[:, None]) * stride_bk + bo)
+        acc0 = tl.dot(av0, bv, acc0)
+        acc1 = tl.dot(av1, bv, acc1)
+        tlx.local_store(tlx.local_view(a0_buf, nxt), next_a0)
+        tlx.local_store(tlx.local_view(a1_buf, nxt), next_a1)
+        tlx.local_store(tlx.local_view(b_buf, nxt), next_b)
+        tl.debug_barrier()
+    cur = (full_tiles - 1) % 2
+    av0 = tlx.require_layout(
+        tlx.local_load(tlx.local_view(a0_buf, cur)), dot0, pin=False)
+    av1 = tlx.require_layout(
+        tlx.local_load(tlx.local_view(a1_buf, cur)), dot0, pin=False)
+    bv = tlx.require_layout(
+        tlx.local_load(tlx.local_view(b_buf, cur)), dot1, pin=False)
+    acc0 = tl.dot(av0, bv, acc0)
+    acc1 = tl.dot(av1, bv, acc1)
+    tail = full_tiles * 32
+    km = tail + rk < K
+    nxt = full_tiles % 2
+    tail_a0 = tl.load(A + ao0 + (tail + rk[None, :]) * stride_ak,
+                      mask=km[None, :], other=0.0)
+    tail_a1 = tl.load(A + ao1 + (tail + rk[None, :]) * stride_ak,
+                      mask=km[None, :], other=0.0)
+    tail_b = tl.load(B + (tail + rk[:, None]) * stride_bk + bo,
+                     mask=km[:, None], other=0.0)
+    tlx.local_store(tlx.local_view(a0_buf, nxt), tail_a0)
+    tlx.local_store(tlx.local_view(a1_buf, nxt), tail_a1)
+    tlx.local_store(tlx.local_view(b_buf, nxt), tail_b)
+    tl.debug_barrier()
+    av0 = tlx.require_layout(
+        tlx.local_load(tlx.local_view(a0_buf, nxt)), dot0, pin=False)
+    av1 = tlx.require_layout(
+        tlx.local_load(tlx.local_view(a1_buf, nxt)), dot0, pin=False)
+    bv = tlx.require_layout(
+        tlx.local_load(tlx.local_view(b_buf, nxt)), dot1, pin=False)
+    acc0 = tl.dot(av0, bv, acc0)
+    acc1 = tl.dot(av1, bv, acc1)
+    idx_q = batch_id
+    idx_m0 = raw_m0[:, None]
+    idx_m1 = raw_m1[:, None]
+    idx_n = rn[None, :]
+    mask0 = (idx_m0 < M) & (idx_n < N)
+    mask1 = (idx_m1 < M) & (idx_n < N)
+    out0 = acc0.to(tl.float16)
+    out1 = acc1.to(tl.float16)
+    {{store_output(("idx_q", "idx_m0", "idx_n"), "out0", "mask0", val_shape=("128", "256"), output_layout="mma")}}
+    {{store_output(("idx_q", "idx_m1", "idx_n"), "out1", "mask1", val_shape=("16", "256"), output_layout="mma")}}
+
+{% elif KERNEL_KIND == 448 %}
+    # 448x160x931: two 224x160 tiles, expressed as a Jinja-generated 7x5
+    # grid of independent 32x32 MI16 streams. Rendering produces the same
+    # explicit operation order as the standalone oracle.
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4, instr_shape=[16, 16, 32], transposed=True,
+        warps_per_cta=[2, 2])
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    pm = pid
+    r = tl.arange(0, 32)
+{% for mi in range(7) %}
+    a{{mi}} = tlx.local_alloc((32, 32), tl.float16, 2)
+{% endfor %}
+{% for nj in range(5) %}
+    b{{nj}} = tlx.local_alloc((32, 32), tl.float16, 2)
+{% endfor %}
+{% for mi in range(7) %}
+    rm{{mi}} = pm * 224 + r + {{mi * 32}}
+{% endfor %}
+{% for nj in range(5) %}
+    rn{{nj}} = r + {{nj * 32}}
+{% endfor %}
+{% for mi in range(7) %}
+    tlx.local_store(tlx.local_view(a{{mi}}, 0),
+                    tl.load(A + rm{{mi}}[:, None] * stride_am
+                            + r[None, :] * stride_ak))
+{% endfor %}
+{% for nj in range(5) %}
+    tlx.local_store(tlx.local_view(b{{nj}}, 0),
+                    tl.load(B + r[:, None] * stride_bk
+                            + rn{{nj}}[None, :] * stride_bn))
+{% endfor %}
+    tl.debug_barrier()
+    z = tlx.zeros((32, 32), tl.float32, layout=mma)
+{% for mi in range(7) %}
+{% for nj in range(5) %}
+    c{{mi}}{{nj}} = z
+{% endfor %}
+{% endfor %}
+    full_tiles = K // 32
+    for k in tl.range(0, full_tiles - 1):
+        cur = k % 2
+        nxt = (k + 1) % 2
+{% for mi in range(7) %}
+        av{{mi}} = tlx.require_layout(
+            tlx.local_load(tlx.local_view(a{{mi}}, cur)), dot0, pin=False)
+{% endfor %}
+        kp = (k + 1) * 32
+{% for mi in range(7) %}
+        na{{mi}} = tl.load(A + rm{{mi}}[:, None] * stride_am
+                           + (kp + r[None, :]) * stride_ak)
+{% endfor %}
+{% for nj in range(5) %}
+        nb{{nj}} = tl.load(B + (kp + r[:, None]) * stride_bk
+                           + rn{{nj}}[None, :] * stride_bn)
+{% endfor %}
+{% for nj in range(5) %}
+        bv{{nj}} = tlx.require_layout(
+            tlx.local_load(tlx.local_view(b{{nj}}, cur)), dot1, pin=False)
+{% for mi in range(7) %}
+        c{{mi}}{{nj}} = tl.dot(av{{mi}}, bv{{nj}}, c{{mi}}{{nj}})
+{% endfor %}
+{% endfor %}
+{% for mi in range(7) %}
+        tlx.local_store(tlx.local_view(a{{mi}}, nxt), na{{mi}})
+{% endfor %}
+{% for nj in range(5) %}
+        tlx.local_store(tlx.local_view(b{{nj}}, nxt), nb{{nj}})
+{% endfor %}
+        tl.debug_barrier()
+    cur = (full_tiles - 1) % 2
+    nxt = full_tiles % 2
+{% for mi in range(7) %}
+    av{{mi}} = tlx.require_layout(
+        tlx.local_load(tlx.local_view(a{{mi}}, cur)), dot0, pin=False)
+{% endfor %}
+    kp = full_tiles * 32
+    km = kp + r < K
+{% for mi in range(7) %}
+    na{{mi}} = tl.load(A + rm{{mi}}[:, None] * stride_am
+                       + (kp + r[None, :]) * stride_ak,
+                       mask=km[None, :], other=0.0)
+{% endfor %}
+{% for nj in range(5) %}
+    nb{{nj}} = tl.load(B + (kp + r[:, None]) * stride_bk
+                       + rn{{nj}}[None, :] * stride_bn,
+                       mask=km[:, None], other=0.0)
+{% endfor %}
+{% for nj in range(5) %}
+    bv{{nj}} = tlx.require_layout(
+        tlx.local_load(tlx.local_view(b{{nj}}, cur)), dot1, pin=False)
+{% for mi in range(7) %}
+    c{{mi}}{{nj}} = tl.dot(av{{mi}}, bv{{nj}}, c{{mi}}{{nj}})
+{% endfor %}
+{% endfor %}
+{% for mi in range(7) %}
+    tlx.local_store(tlx.local_view(a{{mi}}, nxt), na{{mi}})
+{% endfor %}
+{% for nj in range(5) %}
+    tlx.local_store(tlx.local_view(b{{nj}}, nxt), nb{{nj}})
+{% endfor %}
+    tl.debug_barrier()
+{% for mi in range(7) %}
+    av{{mi}} = tlx.require_layout(
+        tlx.local_load(tlx.local_view(a{{mi}}, nxt)), dot0, pin=False)
+{% endfor %}
+{% for nj in range(5) %}
+    bv{{nj}} = tlx.require_layout(
+        tlx.local_load(tlx.local_view(b{{nj}}, nxt)), dot1, pin=False)
+{% for mi in range(7) %}
+    c{{mi}}{{nj}} = tl.dot(av{{mi}}, bv{{nj}}, c{{mi}}{{nj}})
+{% endfor %}
+{% endfor %}
+    idx_q = batch_id
+{% for mi in range(7) %}
+    idx_m{{mi}} = rm{{mi}}[:, None]
+{% endfor %}
+{% for nj in range(5) %}
+    idx_n{{nj}} = rn{{nj}}[None, :]
+{% endfor %}
+    store_mask = tl.full((32, 32), 1, tl.int1)
+{% for mi in range(7) %}
+{% for nj in range(5) %}
+    out{{mi}}{{nj}} = c{{mi}}{{nj}}.to(tl.float16)
+    {{store_output(("idx_q", "idx_m" ~ mi, "idx_n" ~ nj), "out" ~ mi ~ nj, "store_mask", val_shape=("32", "32"), output_layout="mma")}}
+{% endfor %}
+{% endfor %}
+
+{% elif KERNEL_KIND == 1195 %}
+    # 1195x256x2309: 256x256 MI16 macro tile with 2x2 operand
+    # decomposition and shared-A batch grouping.
+    HM: tl.constexpr = 128
+    HN: tl.constexpr = 128
+    BK: tl.constexpr = 64
+    pm = pid // grid_n
+    pn = pid % grid_n
+    b_bases: tl.constexpr = (
+        (0, 1), (0, 2), (0, 4), (0, 8), (0, 16), (0, 32), (0, 64),
+        (16, 0), (32, 0), (1, 0), (2, 0), (4, 0), (8, 0))
+    b_sh: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)], b_bases, [BK, HN])
+    buf_a_lo = tlx.local_alloc((HM, BK), tl.float16, 2)
+    buf_a_hi = tlx.local_alloc((HM, BK), tl.float16, 2)
+    buf_b_lo = tlx.local_alloc((BK, HN), tl.float16, 2, layout=b_sh)
+    buf_b_hi = tlx.local_alloc((BK, HN), tl.float16, 2, layout=b_sh)
+    om_lo = (pm * 256 + tl.arange(0, HM)) % M
+    om_hi = (pm * 256 + HM + tl.arange(0, HM)) % M
+    on_lo = (pn * 256 + tl.arange(0, HN)) % N
+    on_hi = (pn * 256 + HN + tl.arange(0, HN)) % N
+    ok = tl.arange(0, BK)
+    ao_lo = om_lo[:, None] * stride_am
+    ao_hi = om_hi[:, None] * stride_am
+    bo_lo = on_lo[None, :] * stride_bn
+    bo_hi = on_hi[None, :] * stride_bn
+    nf = K // BK
+    tlx.local_store(tlx.local_view(buf_a_lo, 0),
+                    tl.load(A + ao_lo + ok[None, :] * stride_ak))
+    tlx.local_store(tlx.local_view(buf_a_hi, 0),
+                    tl.load(A + ao_hi + ok[None, :] * stride_ak))
+    tlx.local_store(tlx.local_view(buf_b_lo, 0),
+                    tl.load(B + ok[:, None] * stride_bk + bo_lo))
+    tlx.local_store(tlx.local_view(buf_b_hi, 0),
+                    tl.load(B + ok[:, None] * stride_bk + bo_hi))
+    tl.debug_barrier()
+    c00 = tl.zeros((HM, HN), dtype=tl.float32)
+    c10 = tl.zeros((HM, HN), dtype=tl.float32)
+    c01 = tl.zeros((HM, HN), dtype=tl.float32)
+    c11 = tl.zeros((HM, HN), dtype=tl.float32)
+    for k in tl.range(0, nf - 1):
+        cur = k % 2
+        nxt = (k + 1) % 2
+        kp = (k + 1) * BK
+        a_lo = tlx.local_load(tlx.local_view(buf_a_lo, cur))
+        b_lo = tlx.local_load(tlx.local_view(buf_b_lo, cur))
+        next_a_lo = tl.load(A + ao_lo + (kp + ok[None, :]) * stride_ak)
+        tlx.buffer_load_to_local(tlx.local_view(buf_b_lo, nxt), B,
+                                 (kp + ok[:, None]) * stride_bk + bo_lo)
+        c00 = tl.dot(a_lo, b_lo, c00)
+        a_hi = tlx.local_load(tlx.local_view(buf_a_hi, cur))
+        next_a_hi = tl.load(A + ao_hi + (kp + ok[None, :]) * stride_ak)
+        c10 = tl.dot(a_hi, b_lo, c10)
+        b_hi = tlx.local_load(tlx.local_view(buf_b_hi, cur))
+        tlx.buffer_load_to_local(tlx.local_view(buf_b_hi, nxt), B,
+                                 (kp + ok[:, None]) * stride_bk + bo_hi)
+        c01 = tl.dot(a_lo, b_hi, c01)
+        c11 = tl.dot(a_hi, b_hi, c11)
+        tlx.local_store(tlx.local_view(buf_a_lo, nxt), next_a_lo)
+        tlx.local_store(tlx.local_view(buf_a_hi, nxt), next_a_hi)
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(0)
+        tl.debug_barrier()
+    last = (nf - 1) % 2
+    a_lo = tlx.local_load(tlx.local_view(buf_a_lo, last))
+    a_hi = tlx.local_load(tlx.local_view(buf_a_hi, last))
+    b_lo = tlx.local_load(tlx.local_view(buf_b_lo, last))
+    b_hi = tlx.local_load(tlx.local_view(buf_b_hi, last))
+    c00 = tl.dot(a_lo, b_lo, c00)
+    c01 = tl.dot(a_lo, b_hi, c01)
+    c10 = tl.dot(a_hi, b_lo, c10)
+    c11 = tl.dot(a_hi, b_hi, c11)
+    for kt in tl.range(nf * BK, K, BK):
+        km = kt + ok < K
+        ta_lo = tl.load(A + ao_lo + (kt + ok[None, :]) * stride_ak,
+                        mask=km[None, :], other=0.0)
+        ta_hi = tl.load(A + ao_hi + (kt + ok[None, :]) * stride_ak,
+                        mask=km[None, :], other=0.0)
+        tb_lo = tl.load(B + (kt + ok[:, None]) * stride_bk + bo_lo,
+                        mask=km[:, None], other=0.0)
+        tb_hi = tl.load(B + (kt + ok[:, None]) * stride_bk + bo_hi,
+                        mask=km[:, None], other=0.0)
+        c00 = tl.dot(ta_lo, tb_lo, c00)
+        c01 = tl.dot(ta_lo, tb_hi, c01)
+        c10 = tl.dot(ta_hi, tb_lo, c10)
+        c11 = tl.dot(ta_hi, tb_hi, c11)
+    c_layout: tl.constexpr = tlx.layout(
+        shape=((16, 16), (8, 8)), stride=((8, 128), (1, 2048)))
+    out00 = tlx.require_layout(c00.to(tl.float16), c_layout)
+    out01 = tlx.require_layout(c01.to(tl.float16), c_layout)
+    out10 = tlx.require_layout(c10.to(tl.float16), c_layout)
+    out11 = tlx.require_layout(c11.to(tl.float16), c_layout)
+    idx_q = batch_id
+    idx_m0 = (pm * 256 + tl.arange(0, HM))[:, None]
+    idx_m1 = (pm * 256 + HM + tl.arange(0, HM))[:, None]
+    idx_n0 = (pn * 256 + tl.arange(0, HN))[None, :]
+    idx_n1 = (pn * 256 + HN + tl.arange(0, HN))[None, :]
+    mask00 = (idx_m0 < M) & (idx_n0 < N)
+    mask01 = (idx_m0 < M) & (idx_n1 < N)
+    mask10 = (idx_m1 < M) & (idx_n0 < N)
+    mask11 = (idx_m1 < M) & (idx_n1 < N)
+    {{store_output(("idx_q", "idx_m0", "idx_n0"), "out00", "mask00", val_shape=("128", "128"), output_layout="c_layout")}}
+    {{store_output(("idx_q", "idx_m0", "idx_n1"), "out01", "mask01", val_shape=("128", "128"), output_layout="c_layout")}}
+    {{store_output(("idx_q", "idx_m1", "idx_n0"), "out10", "mask10", val_shape=("128", "128"), output_layout="c_layout")}}
+    {{store_output(("idx_q", "idx_m1", "idx_n1"), "out11", "mask11", val_shape=("128", "128"), output_layout="c_layout")}}
+{% endif %}

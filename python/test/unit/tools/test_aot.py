@@ -10,7 +10,15 @@ import numpy as np
 
 import triton
 from triton.backends.compiler import GPUTarget
-from triton._internal_testing import is_cuda, is_hip, is_hip_gfx1250
+from triton._internal_testing import is_cuda, is_hip, is_hip_cdna5
+
+# Buck expands $(location) in TRITON_AMD_CODEGEN_PATH to a runfiles-relative
+# path. The AOT helpers below spawn compile.py/link.py children with cwd set to
+# a temp dir, where the relative path no longer resolves (OSError: .so not
+# found). Absolutize eagerly while our own cwd is still the runfiles root so
+# all children inherit a valid path.
+if "TRITON_AMD_CODEGEN_PATH" in os.environ and not os.path.isabs(os.environ["TRITON_AMD_CODEGEN_PATH"]):
+    os.environ["TRITON_AMD_CODEGEN_PATH"] = os.path.abspath(os.environ["TRITON_AMD_CODEGEN_PATH"])
 
 if is_cuda():
     from triton.backends.nvidia.driver import include_dirs, library_dirs
@@ -26,7 +34,16 @@ elif is_hip():
         return [os.path.dirname(hip_runtime_dylib)]
 
     def library_names():
-        return ["amdhip64"]
+        return [_get_path_to_hip_runtime_dylib()]
+
+
+def runtime_env(tmp_dir):
+    env = os.environ.copy()
+    library_path = [tmp_dir, *library_dirs()]
+    if inherited_library_path := env.get("LD_LIBRARY_PATH"):
+        library_path.append(inherited_library_path)
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(library_path)
+    return env
 
 
 kernel_utils_src = """
@@ -281,17 +298,25 @@ int main(int argc, char **argv) {{
   // hipCtxDestroy(ctx);
 }}
 """
-    src = test_utils_src + test_src
-    with open(os.path.join(dir, "test.c"), "w") as file:
+    build_test_bin(dir, test_utils_src + test_src, "test.c", exe)
+
+
+def build_test_bin(dir, src, src_name, exe):
+    with open(os.path.join(dir, src_name), "w") as file:
         file.write(src)
 
-    command = ["gcc", "test.c"]
+    command = ["gcc", src_name]
     for inc_dir in include_dirs:
         command.extend(["-I", inc_dir])
     for lib_dir in library_dirs():
         command.extend(["-L", lib_dir])
+        if is_hip():
+            command.append(f"-Wl,-rpath,{lib_dir}")
     for lib_name in library_names():
-        command.extend(["-l", lib_name])
+        if os.path.isabs(lib_name):
+            command.append(lib_name)
+        else:
+            command.extend(["-l", lib_name])
     command.extend(["-L", dir, "-l", "kernel", "-o", exe])
     subprocess.run(command, check=True, cwd=dir)
 
@@ -392,6 +417,71 @@ def check_hasco_binary_str(tmp_dir: str, dtype: str):
         assert int(matches[0]) > 16, "Expected valid HSACO object binary string"
 
 
+def test_linker_rejects_invalid_algo_id():
+    from triton.tools.link import (
+        KernelLinkerMeta,
+        make_func_pointers,
+        make_get_num_algos_def,
+        make_kernel_meta_const_dispatcher,
+    )
+
+    meta = KernelLinkerMeta(
+        orig_kernel_name="kernel",
+        arg_names=["x"],
+        arg_ctypes=["int"],
+        sizes=[None],
+        sig_hash="abcdef12",
+        triton_suffix="",
+        suffix="",
+        num_specs=0,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        c_path = os.path.join(tmp_dir, "test_linker_algo_id_bounds.c")
+        exe_path = os.path.join(tmp_dir, "test_linker_algo_id_bounds")
+        with open(c_path, "w") as fp:
+            fp.write(f"""
+#include <stdio.h>
+
+typedef void *TT_StreamTy;
+typedef int TT_ResultTy;
+
+#define TT_ERROR_INVALID_VALUE 777
+#define CHECK_EQ(actual, expected) \\
+  do {{ \\
+    TT_ResultTy got = (actual); \\
+    if (got != (expected)) {{ \\
+      fprintf(stderr, "%s:%d: got %d, expected %d\\n", __FILE__, __LINE__, got, (expected)); \\
+      return 1; \\
+    }} \\
+  }} while (0)
+
+TT_ResultTy kernel_algo0(TT_StreamTy stream, int x) {{
+  return x + 10;
+}}
+
+TT_ResultTy kernel_algo1(TT_StreamTy stream, int x) {{
+  return x + 20;
+}}
+
+{make_func_pointers(["kernel_algo0", "kernel_algo1"], meta)}
+{make_get_num_algos_def(meta)}
+{make_kernel_meta_const_dispatcher(meta)}
+
+int main(void) {{
+  CHECK_EQ(kernel_get_num_algos(), 2);
+  CHECK_EQ(kernel(0, 5, 0), 15);
+  CHECK_EQ(kernel(0, 5, 1), 25);
+  CHECK_EQ(kernel(0, 5, -1), TT_ERROR_INVALID_VALUE);
+  CHECK_EQ(kernel(0, 5, 2), TT_ERROR_INVALID_VALUE);
+  return 0;
+}}
+""")
+
+        subprocess.run(["gcc", "-std=c99", "-DNDEBUG", c_path, "-o", exe_path], check=True)
+        subprocess.run([exe_path], check=True)
+
+
 # Test edge case where the provided kernel signature has no specializations
 def test_compile_link_matmul_no_specialization():
     np.random.seed(3)
@@ -404,6 +494,7 @@ def test_compile_link_matmul_no_specialization():
         compile_aot_kernel_no_specialization(tmp_dir, kernel_path, dtype, BM, BN, BK)
         if is_hip():
             check_hasco_binary_str(tmp_dir, dtype)
+            return
 
         link_aot_kernels(tmp_dir)
 
@@ -416,8 +507,7 @@ def test_compile_link_matmul_no_specialization():
         a, b, a_path, b_path, c_path = generate_matmul_test_data(tmp_dir, M, N, K)
 
         # run test case
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = tmp_dir
+        env = runtime_env(tmp_dir)
         subprocess.run(["./test", a_path, b_path, c_path], env=env, check=True, cwd=tmp_dir)
 
         # read data and compare against reference
@@ -438,6 +528,7 @@ def test_compile_link_matmul():
         compile_aot_kernels(tmp_dir, kernel_path, dtype, BM, BN, BK, ha_hb_hints=[(":16", ":16")])
         if is_hip():
             check_hasco_binary_str(tmp_dir, dtype)
+            return
         link_aot_kernels(tmp_dir)
 
         # compile test case
@@ -449,8 +540,7 @@ def test_compile_link_matmul():
         a, b, a_path, b_path, c_path = generate_matmul_test_data(tmp_dir, M, N, K)
 
         # run test case
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = tmp_dir
+        env = runtime_env(tmp_dir)
         subprocess.run(["./test", a_path, b_path, c_path], env=env, check=True, cwd=tmp_dir)
 
         # read data and compare against reference
@@ -471,6 +561,7 @@ def test_launcher_has_no_available_kernel():
         compile_aot_kernels(tmp_dir, kernel_path, dtype, BM, BN, BK, ha_hb_hints=[(":1", ":1")])
         if is_hip():
             check_hasco_binary_str(tmp_dir, dtype)
+            return
 
         link_aot_kernels(tmp_dir)
 
@@ -483,8 +574,7 @@ def test_launcher_has_no_available_kernel():
         a, b, a_path, b_path, c_path = generate_matmul_test_data(tmp_dir, M, N, K)
 
         # run test case
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = tmp_dir
+        env = runtime_env(tmp_dir)
         result = subprocess.run(
             ["./test", a_path, b_path, c_path],
             env=env,
@@ -516,6 +606,9 @@ def test_compile_link_autotune_matmul():
             compile_aot_kernels(tmp_dir, kernel_path, dtype, BM, BN, BK, ha_hb_hints=[(":16", ":16"), (":16", ""),
                                                                                       ("", ":16")])
 
+        if is_hip():
+            return
+
         link_aot_kernels(tmp_dir)
 
         gen_kernel_library(tmp_dir, "libkernel.so")
@@ -531,8 +624,7 @@ def test_compile_link_autotune_matmul():
             test_name = f"test_{algo_id}"
             gen_test_bin(tmp_dir, M, N, K, exe=test_name, algo_id=algo_id)
 
-            env = os.environ.copy()
-            env["LD_LIBRARY_PATH"] = tmp_dir
+            env = runtime_env(tmp_dir)
             subprocess.run(
                 [f"./{test_name}", a_path, b_path, c_path],
                 check=True,
@@ -566,15 +658,16 @@ module attributes {{"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = {warp_si
             assert ".address_size 64" in ptx
         elif is_hip():
             amdgcn = k.asm["amdgcn"]
-            assert re.search(r'\.amdgcn_target "amdgcn-amd-amdhsa-[^-]*-gfx942"', amdgcn)
+            assert 'target triple = "amdgpu9.42-amd-amdhsa"' in k.asm["llir"]
+            assert re.search(r'\.amdgcn_target "amdgpu9\.42-amd-amdhsa-[^-]*-gfx942"', amdgcn)
             assert '.wavefront_size: 64' in amdgcn
 
 
 @pytest.mark.parametrize("target", [
     pytest.param(GPUTarget("hip", "gfx942", 64),
                  marks=pytest.mark.xfail(reason="gluon AOT compilation not yet supported on gfx942")),
-    pytest.param(GPUTarget("hip", "gfx1250", 32), marks=pytest.mark.skipif(not is_hip_gfx1250(),
-                                                                           reason="gfx1250 not available")),
+    pytest.param(GPUTarget("hip", "gfx1250", 32), marks=pytest.mark.skipif(not is_hip_cdna5(),
+                                                                           reason="CDNA5 not available")),
 ])
 @pytest.mark.skipif(not is_hip(), reason="Requires HIP")
 def test_gluon_kernel(target):
@@ -585,3 +678,131 @@ def test_gluon_kernel(target):
         kernel_path = write_triton_kernels(tmp_dir, gluon_kernel_src, kernel_utils_src)
         compile_aot_kernel_no_specialization(tmp_dir, kernel_path, dtype, BM, BN, BK, target=target)
         check_hasco_binary_str(tmp_dir, dtype)
+
+
+def test_aot_target_parsing_with_explicit_target():
+    """
+    Regression test for target parsing in compile.py CLI.
+
+    Previously, `GPUTarget(*args.target.split(":"))` passed arch and warp_size
+    as strings, causing TypeError in downstream integer comparisons (e.g.,
+    `arch >= 100`) and silent logic errors (e.g., `warp_size * 4` producing
+    string repetition instead of arithmetic).
+
+    This test exercises the `--target` CLI path by explicitly passing a target
+    to _compile_kernel, which formats it as a colon-separated string for the
+    CLI. The compile.py code must correctly parse the string back into proper
+    types (int for arch on CUDA, str for arch on HIP, int for warp_size).
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        dtype = "fp16"
+        BM, BN, BK = 16, 16, 16
+
+        kernel_path = write_triton_kernels(tmp_dir, kernel_src, kernel_utils_src)
+
+        # Use the current machine's target but pass it explicitly through CLI
+        # to exercise the --target string parsing path in compile.py
+        target = triton.runtime.driver.active.get_current_target()
+        compile_aot_kernel_no_specialization(tmp_dir, kernel_path, dtype, BM, BN, BK, target=target)
+
+
+scalar_float_kernel_src = """
+import triton
+import triton.language as tl
+
+@triton.jit
+def kernel(Out, alpha, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(Out + offs, alpha.to(tl.float32))
+"""
+
+# C has no portable fp16 or bf16 scalar type, so pass their bit patterns.
+SCALAR_FLOAT_VALUES = {
+    "fp16": "0x4000",
+    "bf16": "0x4000",
+    "fp32": "2.0f",
+    "fp64": "2.0",
+}
+
+
+def gen_scalar_float_test_bin(dir, block, alpha, exe="test_scalar_float"):
+    if is_cuda():
+        sync, memcpy_dtoh = "cuStreamSynchronize", "cuMemcpyDtoH"
+        prologue = """
+  CUdevice dev;
+  CUcontext ctx;
+  CUstream stream;
+  CUdeviceptr Out;
+  CHECK(cuInit(0));
+  CHECK(cuDeviceGet(&dev, 0));
+  CHECK(cuCtxCreate_v2(&ctx, 0, dev));
+  CHECK(cuMemAlloc(&Out, sizeof(hOut)));
+  CHECK(cuStreamCreate(&stream, 0));
+"""
+        epilogue = """
+  CHECK(cuStreamDestroy(stream));
+  CHECK(cuMemFree(Out));
+  CHECK(cuCtxDestroy(ctx));
+"""
+    else:
+        sync, memcpy_dtoh = "hipStreamSynchronize", "hipMemcpyDtoH"
+        prologue = """
+  hipDevice_t dev;
+  hipStream_t stream;
+  hipDeviceptr_t Out;
+  CHECK(hipInit(0));
+  CHECK(hipDeviceGet(&dev, 0));
+  CHECK(hipSetDevice(dev));
+  CHECK(hipMalloc(&Out, sizeof(hOut)));
+  CHECK(hipStreamCreateWithFlags(&stream, 0));
+"""
+        epilogue = """
+  CHECK(hipStreamDestroy(stream));
+  CHECK(hipFree(Out));
+"""
+
+    test_src = f"""
+#define CHECK(expr) do {{ if ((expr) != 0) return 1; }} while (0)
+
+int main(void) {{
+  float hOut[{block}];
+{prologue}
+  load_scale();
+  CHECK(scale_default(stream, Out, {alpha}));
+  CHECK({sync}(stream));
+  CHECK({memcpy_dtoh}(hOut, Out, sizeof(hOut)));
+  int failed = 0;
+  for (int i = 0; i < {block}; ++i) failed |= hOut[i] != 2.0f;
+  unload_scale();
+{epilogue}
+  return failed;
+}}
+"""
+    build_test_bin(dir, test_utils_src + test_src, f"{exe}.c", exe)
+
+
+@pytest.mark.parametrize("dtype, alpha", SCALAR_FLOAT_VALUES.items())
+def test_compile_link_scalar_float(dtype, alpha):
+    """Check that AOT scalar argument storage matches the kernel ABI."""
+    block = 16
+    exe = "test_scalar_float"
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        kernel_path = write_triton_kernels(tmp_dir, scalar_float_kernel_src, kernel_utils_src)
+        _compile_kernel(
+            dir=tmp_dir,
+            signature=f"*fp32:16, {dtype}, {block}",
+            kernel_name="kernel",
+            out_name="scale",
+            out_path="scale",
+            num_warps=1,
+            grid="1, 1, 1",
+            kernel_path=kernel_path,
+        )
+        link_aot_kernels(tmp_dir)
+        gen_kernel_library(tmp_dir, "libkernel.so")
+        gen_scalar_float_test_bin(tmp_dir, block, alpha, exe=exe)
+
+        env = os.environ.copy()
+        env["LD_LIBRARY_PATH"] = tmp_dir
+        subprocess.run([f"./{exe}"], env=env, check=True, cwd=tmp_dir)

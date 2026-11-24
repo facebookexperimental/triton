@@ -14,10 +14,10 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @tmem_split_load_m64
   tt.func public @tmem_split_load_m64(%arg0: !ttg.memdesc<64x128xf32, #tmem, #ttng.tensor_memory, mutable>) -> (tensor<64x64xf32, #blocked>, tensor<64x64xf32, #blocked>) {
-    // CHECK: %[[S0:.+]] = ttng.tmem_subslice %{{.+}} {N = 0 : i32}
+    // CHECK: %[[S0:.+]] = ttng.tmem_subslice %{{.+}} {offset = 0 : i32}
     // CHECK: %[[L0:.+]] = ttng.tmem_load %[[S0]] : !ttg.memdesc<64x64xf32
     // CHECK: %[[C0:.+]] = ttg.convert_layout %[[L0]]
-    // CHECK: %[[S1:.+]] = ttng.tmem_subslice %{{.+}} {N = 64 : i32}
+    // CHECK: %[[S1:.+]] = ttng.tmem_subslice %{{.+}} {offset = 64 : i32}
     // CHECK: %[[L1:.+]] = ttng.tmem_load %[[S1]] : !ttg.memdesc<64x64xf32
     // CHECK: %[[C1:.+]] = ttg.convert_layout %[[L1]]
     // CHECK: tt.return %[[C0]], %[[C1]]

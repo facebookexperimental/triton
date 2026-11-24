@@ -1,5 +1,5 @@
-#ifndef TRITONGPU_PASSES
-#define TRITONGPU_PASSES
+#ifndef TRITONAMDGPU_PASSES
+#define TRITONAMDGPU_PASSES
 
 include "mlir/Pass/PassBase.td"
 
@@ -42,7 +42,8 @@ def TritonAMDGPUAccelerateMatmul
     (e.g., AMD matrix cores)
   }];
 
-  let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect"];
+  let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect",
+                           "mlir::math::MathDialect"];
 
   let options =
       [Option<"gfxArch", "gfx-arch", "std::string", /*default=*/"std::string{}",
@@ -52,12 +53,16 @@ def TritonAMDGPUAccelerateMatmul
        Option<"kPack", "kPack", "int32_t", /*default*/ "1", "KWidth / kBase">];
 }
 
-def TritonAMDGPUOptimizeEpilogue
-    : Pass<"tritonamdgpu-optimize-epilogue", "mlir::ModuleOp"> {
-  let summary = "Optimize epilogue: (1) Store accumulators directly without "
-                "going thorough SMEM in epilogue.";
+def TritonAMDGPUOptimizeEpilogue : Pass<"tritonamdgpu-optimize-epilogue", "mlir::ModuleOp"> {
+  let summary = "Store MMA accumulators directly, avoiding shared memory";
 
   let description = [{
+    For a tt.store whose value is converted from an MFMA/WMMA layout to a
+    blocked layout, optionally followed by single-operand elementwise ops, this
+    pass moves the layout conversion to the pointer and mask operands so that
+    the value is stored directly from the MMA layout. This avoids the shared
+    memory round trip of the layout conversion. When possible, the store layout
+    is further adjusted to enable wide 128-bit global stores.
   }];
 
   let dependentDialects = [];
@@ -70,7 +75,7 @@ def TritonAMDGPUHoistLayoutConversions
   let description = [{
   This pass tries to hoist a convert_layout op out of the loop if 1) its dst is a tensor
   of dotOperand layout, and 2) its src is defined out of the loop.
-  The rational is as follows:
+  The rationale is as follows:
   1. When the defining op of the src is out of the loop, it means the src is loop-invariant.
      Then we can potentially hoist this convert_layout op, since it's also loop-invariant.
   2. The drawback of this LICM is higher register pressure. However, on AMD GPUs, we have
@@ -86,6 +91,10 @@ def TritonAMDGPUSinkLayoutConversions
   let description = [{
     This pass sinks layout conversions after the last dealloc but before the first use in their block.
     This helps to avoid unnecessary shared memory allocation.
+    It also moves conversions between amdg.cond_barrier(p) and a following
+    amdg.cond_barrier(~p) in the same block after the closing barrier, where both
+    warp groups are back in phase. Barriers whose predicates are not provably
+    complementary are left alone.
   }];
 
   let dependentDialects = [];
@@ -174,24 +183,27 @@ def TritonAMDGPUConvertToBufferOps
     : Pass<"tritonamdgpu-convert-buffer-ops", "mlir::ModuleOp"> {
   let summary = "Convert memory operations to buffer operations";
 
-  let description = "This pass converts memory and atomic operations (e.g., "
-                    "tt.load/tt.store/tt.atomic_rmw) to  amdgpu buffer "
-                    "operations, if possible";
+  let description = [{
+    This pass converts memory and atomic operations (e.g., tt.load/tt.store/
+    tt.atomic_rmw) to amdgpu buffer operations, if possible.
+  }];
 
   let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect"];
 
-  let options =
-      [Option<"gfxArch", "gfx-arch", "std::string", /*default=*/"std::string{}",
-              "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
-       Option<"allowBufferAtomics", "allow-buffer-atomics", "bool",
-              /*default*/ "true",
-              "Allow buffer atomic operations when the hardware supports it.">,
-       Option<"analyzeSmallTensorOfst", "analyze-small-tensor-ofst", "bool",
-              /*default=*/"false",
-              "Whether to still analyze index range for tensors whose base has "
-              "tt.pointer_range = 32 specialization. If false load/store from "
-              "such tensors will go down buffer ops without analzying index "
-              "range.">];
+  let options = [
+    Option<"gfxArch", "gfx-arch",
+           "std::string", /*default=*/"std::string{}",
+           "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
+    Option<"allowBufferAtomics", "allow-buffer-atomics",
+           "bool", /*default*/"true",
+           "Allow buffer atomic operations when the hardware supports it.">,
+    Option<"analyzeSmallTensorOfst", "analyze-small-tensor-ofst",
+          "bool", /*default=*/"false",
+           "Whether to still analyze index range for tensors whose base has "
+           "tt.pointer_range = 32 specialization. If false load/store from "
+           "such tensors will go down buffer ops without analyzing index "
+           "range.">
+  ];
 }
 
 def TritonAMDGPUOptimizeBufferOpPtr
@@ -210,14 +222,15 @@ def TritonAMDGPUBlockPingpong
                 "better utilize matrix core";
 
   let description = [{
-    This pass reorder instructions to interleave instructions from two warps on the same SIMD unit.
-    We call this a ping-pong scheduling pattern, where two warps run concurrently in the synchronized fashion
+    This pass reorders instructions to interleave instructions from two warps
+    on the same SIMD unit. We call this a ping-pong scheduling pattern, where
+    two warps run concurrently in the synchronized fashion.
     This block ping-pong pattern could be beneficial under few conditions including
     occupancy and number of warps.
   }];
 
-  let dependentDialects =
-      ["mlir::ROCDL::ROCDLDialect, mlir::triton::amdgpu::TritonAMDGPUDialect"];
+  let dependentDialects = ["mlir::ROCDL::ROCDLDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect"];
 
   let options = [Option<"numStages", "num-stages", "int32_t", /*default*/ "2",
                         "Number of Pipeline stages">,
@@ -233,7 +246,7 @@ def TritonAMDGPUInThreadTranspose
   let description = [{
     Pass looks for inefficient load->local_store->local_load chains.
     In particular, this pass optimizes dot operand loading from shared memory
-    in cases when operand is stored in global memory in non-K-continous way.
+    in cases when operand is stored in global memory in non-K-contiguous way.
 
     ```
       #blocked = #ttg.blocked<{sizePerThread = [1, 8], ..., order = [1, 0]}>
@@ -267,7 +280,8 @@ def TritonAMDGPUInThreadTranspose
     ```
 
     After transformation tt.load stays coalesced, because optimization do not change anything across fastest dimension.
-    local_alloc is vectorized and uses swizzled memory, number of bank conflics reduced
+    local_alloc is vectorized and uses swizzled memory, number of bank
+    conflicts reduced.
     local_load is vectorized, because shared memory order matches destination layout register order.
 
     This pass introduces two ttg.convert_layouts to properly cover cases when between ttg.load and ttg.local_alloc/ttg.local_store
@@ -386,16 +400,47 @@ def TritonAMDGPUConvertToTensorOps
   }];
 }
 
-def TritonAMDGPUWarpPipeline
-    : Pass<"tritonamdgpu-warp-pipeline", "mlir::ModuleOp"> {
-  let summary = "partition and pipeline";
+def TritonAMDGPUPreserveWarpPipelineOwners
+    : Pass<"tritonamdgpu-preserve-warp-pipeline-owners", "mlir::ModuleOp"> {
+  let summary = "Preserve warp-pipeline loop ownership across loop folding";
 
   let description = [{
-    This pass reorder instructions to interleave instructions from two warps on the same SIMD unit.
+    Add internal begin/end markers around loops that directly own warp-pipeline
+    stage borders.  The markers survive loop folding and unrolling, allowing
+    the late warp-pipeline pass to recover the original owner scope.  Stage
+    borders on statically single-trip loops are removed because phase-shifting
+    one iteration cannot overlap loop iterations.
   }];
 
-  let dependentDialects =
-      ["mlir::ROCDL::ROCDLDialect, mlir::triton::amdgpu::TritonAMDGPUDialect"];
+  let dependentDialects = ["mlir::ROCDL::ROCDLDialect"];
+}
+
+def TritonAMDGPUNormalizeWarpPipeline
+    : Pass<"tritonamdgpu-normalize-warp-pipeline", "mlir::ModuleOp"> {
+  let summary = "Place compiler-generated inputs inside warp-pipeline stages";
+
+  let description = [{
+    Run after layout propagation and loop unrolling, before warp-pipeline
+    stage construction. Keep operations inside explicit begin/end markers in
+    their stages. Assign operations outside those markers to the latest stage
+    that dominates every use. Move only pure scalar operations and layout
+    conversions that need no shared memory. Keep operand order and stay in the
+    same block and owner scope. Report an error if no legal stage exists.
+  }];
+}
+
+def TritonAMDGPUWarpPipeline: Pass<"tritonamdgpu-warp-pipeline", "mlir::ModuleOp"> {
+  let summary = "Partition loops into warp-pipeline stages";
+
+  let description = [{
+    This pass groups the operations between warp-pipeline border markers into
+    pipeline stage clusters, each materialized as an scf.execute_region. The
+    clusters are later lowered by the convert-warp-pipeline pass, which staggers
+    warps across the stages with conditional barriers.
+  }];
+
+  let dependentDialects = ["mlir::ROCDL::ROCDLDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect"];
 }
 
 def TritonAMDGPUFpSanitizer
@@ -448,8 +493,7 @@ def TritonAMDGPUDotDecomposeAndSchedule
 
 def TritonAMDGPUSchedGroupBarrierScheduler
     : Pass<"tritonamdgpu-sched-group-barrier-scheduler", "mlir::ModuleOp"> {
-  let summary =
-      "Price TTGIR operations for AMD sched_group_barrier scheduling";
+  let summary = "Price TTGIR operations for AMD sched_group_barrier scheduling";
 
   let description = [{
     Runs at the end of the AMD TTGIR pipeline, after transformations that can
@@ -463,18 +507,40 @@ def TritonAMDGPUSchedGroupBarrierScheduler
     region.
   }];
 
-  let options = [
-    Option<"mfmaPerDwordx4", "mfma-per-dwordx4", "unsigned", /*default=*/"4",
-           "MFMA cover for a 128-bit VMEM read; narrower reads scale down.">,
-    Option<"requiredRegionCount", "required-region-count", "unsigned",
-           /*default=*/"0",
-           "Schedule only blocks with this many Membar-delimited regions; "
-           "zero accepts any region count.">,
+  let options =
+      [Option<"mfmaPerDwordx4", "mfma-per-dwordx4", "unsigned", /*default=*/"4",
+              "MFMA cover for a 128-bit VMEM read; narrower reads scale down.">,
+       Option<"requiredRegionCount", "required-region-count", "unsigned",
+              /*default=*/"0",
+              "Schedule only blocks with this many Membar-delimited regions; "
+              "zero accepts any region count.">,
   ];
 
   let dependentDialects = ["mlir::triton::TritonDialect",
                            "mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::amdgpu::TritonAMDGPUDialect"];
+}
+
+def TritonAMDGPUIntraWavePipeline
+    : Pass<"tritonamdgpu-intra-wave-pipeline", "mlir::ModuleOp"> {
+  let summary =
+      "Lower explicit TLX intra-wave regions to AMD scheduling groups";
+
+  let description = [{
+    Consumes either one unpaired mixed region or two adjacent regions with the
+    same explicit pair emitted by
+    tlx.warp_pipeline_stage(scope="intra_wave"). The source defines the
+    complete memory/compute cover set; this pass validates or partitions the
+    window, derives the machine-instruction counts represented by its TTGIR
+    operations, and emits sched_group_barrier constraints. It does not split
+    or phase-shift warp groups and does not add operations from outside the
+    explicit regions.
+  }];
+
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect",
+                           "mlir::ROCDL::ROCDLDialect"];
 }
 
 #endif

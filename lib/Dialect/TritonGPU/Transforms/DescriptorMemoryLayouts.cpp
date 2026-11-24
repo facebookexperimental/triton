@@ -41,7 +41,7 @@ CGAEncodingAttr updateCGALayoutForShape(CGAEncodingAttr cgaLayout,
     }
     return CGAEncodingAttr::get(ctx, std::move(ll));
   }
-  // For rank-reducing loads, we need to rank-increase the CTA Layout
+  // For rank-reducing loads, we need to rank-increase the CGA layout.
   auto rankDiff = rank - cgaLayout.getRank();
   for (unsigned i = 0; i < rankDiff; ++i) {
     assert(shape[i] == 1 && "Should only happen for rank-reducing loads");
@@ -54,12 +54,21 @@ CGAEncodingAttr updateCGALayoutForShape(CGAEncodingAttr cgaLayout,
     ll = LinearLayout::identity1D(1, kBlock, standardOuts[i]) * ll;
   }
   // Rename out dims to dim0..dimn-1
-  auto dimSizes = ll.getOutDims();
-  for (auto [i, dim] : llvm::enumerate(standardOuts)) {
-    dimSizes[i].first = dim;
+  SmallVector<std::pair<StringAttr, StringAttr>> renames;
+  for (auto [oldDim, newDim] :
+       llvm::zip_equal(ll.getOutDimNames(), standardOuts)) {
+    renames.push_back({oldDim, newDim});
   }
-  ll = LinearLayout(ll.getBases(), dimSizes, false);
+  ll = renameLinearLayoutDims(ll, {}, renames);
   return CGAEncodingAttr::get(ctx, std::move(ll));
+}
+
+bool isPartitionedEncodingCompatibleWithShape(
+    PartitionedSharedEncodingAttr encoding, ArrayRef<int64_t> shape) {
+  auto pieceLayout = cast<LayoutEncodingTrait>(encoding.getPartitionLayout());
+  unsigned dim = encoding.getPartitionDim();
+  return pieceLayout.getRank() == shape.size() && dim < shape.size() &&
+         shape[dim] % encoding.getNumLogicalPieces() == 0;
 }
 
 SharedEncodingTrait updateEncodingForShape(Operation *op,
@@ -67,6 +76,24 @@ SharedEncodingTrait updateEncodingForShape(Operation *op,
                                            RankedTensorType tensorType) {
   auto ctx = encoding.getContext();
   auto cgaLayout = getCGALayout(encoding);
+  if (auto partitioned = dyn_cast<PartitionedSharedEncodingAttr>(encoding)) {
+    // Descriptors get partitioned encodings only from allocations whose
+    // layout fits the descriptor's shape; descriptor layout selection skips
+    // the rest and the TDM verifier reports them.
+    assert(isPartitionedEncodingCompatibleWithShape(partitioned,
+                                                    tensorType.getShape()) &&
+           "tensor descriptor shape does not fit its shared memory partitions");
+    auto pieceShape = llvm::to_vector(tensorType.getShape());
+    unsigned dim = partitioned.getPartitionDim();
+    pieceShape[dim] /= partitioned.getNumLogicalPieces();
+    auto pieceType =
+        RankedTensorType::get(pieceShape, tensorType.getElementType());
+    auto pieceEncoding =
+        updateEncodingForShape(op, partitioned.getPartitionLayout(), pieceType);
+    return PartitionedSharedEncodingAttr::get(
+        ctx, partitioned.getNumPartitions(), partitioned.getNumGroups(), dim,
+        pieceEncoding);
+  }
   if (auto nvmmaEnc = dyn_cast<NVMMASharedEncodingAttr>(encoding)) {
     auto existingCga = nvmmaEnc.getCGALayout();
     if (!existingCga)
@@ -75,7 +102,7 @@ SharedEncodingTrait updateEncodingForShape(Operation *op,
     auto newCgaEnc = updateCGALayoutForShape(cgaLayout, tensorType.getShape());
     return NVMMASharedEncodingAttr::get(
         ctx, nvmmaEnc.getSwizzlingByteWidth(), nvmmaEnc.getTransposed(),
-        nvmmaEnc.getElementBitWidth(), nvmmaEnc.getFp4Padded(), newCgaEnc);
+        nvmmaEnc.getElementBitWidth(), nvmmaEnc.getPadding(), newCgaEnc);
   }
   if (auto swizEnc = dyn_cast<SwizzledSharedEncodingAttr>(encoding)) {
     auto existingCga = swizEnc.getCGALayout();
@@ -123,15 +150,21 @@ SharedEncodingTrait updateEncodingForShape(Operation *op,
   llvm::report_fatal_error(msg);
 }
 
-// Build shared encoding for a tensor descriptor by applying callback to adjust
-// for block shape of the descriptor
 static TensorDescType getTensorDescTypeWithEncoding(Operation *op,
-                                                    RankedTensorType existingTy,
+                                                    TensorDescType descTy,
                                                     Attribute encoding) {
-  auto sharedEnc = cast<SharedEncodingTrait>(encoding);
-  encoding = updateEncodingForShape(op, sharedEnc, existingTy);
-  return TensorDescType::get(existingTy.getShape(), existingTy.getElementType(),
-                             encoding);
+  // Preserve packing when layout assignment runs on a byte-typed descriptor.
+  auto previous =
+      dyn_cast_if_present<NVMMASharedEncodingAttr>(descTy.getSharedLayout());
+  if (previous && previous.isPaddedFp6())
+    encoding = previous;
+  auto layout = updateEncodingForShape(op, cast<SharedEncodingTrait>(encoding),
+                                       descTy.getSignlessBlockType());
+  Type elemTy = descTy.getElementType();
+  if (auto mma = dyn_cast<NVMMASharedEncodingAttr>(layout);
+      mma && mma.getPadding() == NVMmaPadding::B6P2x16 && isFP6(elemTy))
+    elemTy = IntegerType::get(descTy.getContext(), 8, IntegerType::Unsigned);
+  return TensorDescType::get(descTy.getShape(), elemTy, layout);
 }
 
 struct UseInfo {
@@ -465,7 +498,7 @@ void AssignDescriptorMemoryLayouts::runOnFunction(FuncOp &func) {
       newEncoding = getFallbackSharedEncoding(existingTy, einfo->cgaLayout,
                                               einfo->shape, numCTAs);
     }
-    desc.setType(getTensorDescTypeWithEncoding(desc.getDefiningOp(), existingTy,
+    desc.setType(getTensorDescTypeWithEncoding(desc.getDefiningOp(), descTy,
                                                newEncoding));
   }
 
@@ -476,8 +509,7 @@ void AssignDescriptorMemoryLayouts::runOnFunction(FuncOp &func) {
       auto existingTy =
           RankedTensorType::get(descTy.getShape(), descTy.getElementType());
       auto encoding = getFallbackSharedEncoding(existingTy, {}, {}, numCTAs);
-      resultTys[i] =
-          getTensorDescTypeWithEncoding(nullptr, existingTy, encoding);
+      resultTys[i] = getTensorDescTypeWithEncoding(nullptr, descTy, encoding);
     }
   }
   func.setFunctionType(FunctionType::get(ctx, argTys, resultTys));

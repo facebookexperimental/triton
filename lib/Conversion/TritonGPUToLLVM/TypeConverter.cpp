@@ -3,6 +3,7 @@
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/Support/NVPTXAddrSpace.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -21,7 +22,17 @@ TritonGPUToLLVMTypeConverter::TritonGPUToLLVMTypeConverter(
     const TargetInfoBase &targetInfo, const DataLayoutAnalysis *analysis)
     : LLVMTypeConverter(ctx, options, analysis) {
   addConversion([ctx](triton::PointerType type) -> std::optional<Type> {
-    return LLVM::LLVMPointerType::get(ctx, type.getAddressSpace());
+    switch (type.getAddressSpace()) {
+    case triton::PtrAddrSpace::Global:
+    // Constant is AMD-specific; map to global here.
+    case triton::PtrAddrSpace::Constant:
+      return LLVM::LLVMPointerType::get(ctx,
+                                        llvm::NVPTXAS::ADDRESS_SPACE_GLOBAL);
+    case triton::PtrAddrSpace::Descriptor:
+      return LLVM::LLVMPointerType::get(ctx,
+                                        llvm::NVPTXAS::ADDRESS_SPACE_GENERIC);
+    }
+    llvm_unreachable("unknown PtrAddrSpace");
   });
   addConversion([ctx](TensorDescType type) -> std::optional<Type> {
     return LLVM::LLVMPointerType::get(ctx, 0);
@@ -30,6 +41,9 @@ TritonGPUToLLVMTypeConverter::TritonGPUToLLVMTypeConverter(
       [ctx](nvidia_gpu::TensorDescIm2ColType type) -> std::optional<Type> {
         return LLVM::LLVMPointerType::get(ctx, 0);
       });
+  addConversion([ctx](nvidia_gpu::NamedBarrierIdType type) -> Type {
+    return IntegerType::get(ctx, 32);
+  });
   addConversion([&](RankedTensorType type) -> std::optional<Type> {
     return convertTritonTensorType(type, targetInfo);
   });
@@ -41,7 +55,10 @@ TritonGPUToLLVMTypeConverter::TritonGPUToLLVMTypeConverter(
   });
 
   convertFP8Type<mlir::Float8E4M3FNUZType, mlir::Float8E4M3FNType,
-                 mlir::Float8E5M2Type, mlir::Float8E5M2FNUZType>();
+                 mlir::Float8E5M2Type, mlir::Float8E5M2FNUZType,
+                 mlir::Float8E8M0FNUType>();
+  addConversion(
+      [ctx](PackedFloat4E2M1Type) -> Type { return IntegerType::get(ctx, 8); });
 }
 
 Type TritonGPUToLLVMTypeConverter::convertTritonTensorType(

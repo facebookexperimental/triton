@@ -3,12 +3,14 @@ mlir_tablegen(TritonCombine.inc -gen-rewriters)
 add_public_tablegen_target(TritonCombineIncGen)
 
 add_triton_library(TritonTransforms
+  MaterializeStochasticRounding.cpp
   Combine.cpp
   CudaWarningsPass.cpp
   LoopAwareCSE.cpp
   LoopInvariantCodeMotion.cpp
   LoopPeeling.cpp
   LoopUnroll.cpp
+  NpotPad.cpp
   ReorderBroadcast.cpp
   RewriteTensorDescriptorToPointer.cpp
   SimplifySingleTripWhile.cpp
@@ -27,4 +29,6 @@ add_triton_library(TritonTransforms
   MLIRSCFToControlFlow
   MLIRSCFTransforms
   TritonIR
+  TritonGPUIR
+  TritonAnalysis
 )

@@ -51,6 +51,8 @@ public:
     return std::nullopt;
   }
 
+  bool barrierWritesInvalidate() const override { return true; }
+
   std::optional<WaitOpInfo>
   getWaitOpInfo(Operation *op, const tti::AuxDataMap &auxData) const override {
     // On asyncmark targets (CDNA3/CDNA4), ttg::AsyncWaitOp is kept as-is
@@ -92,6 +94,17 @@ public:
     return nullptr;
   }
 
+  SmallVector<Operation *>
+  createInitClusterBarrier(ImplicitLocOpBuilder &b) const override {
+    auto arrive = ttag::ClusterBarrierArriveOp::create(b, b.getLoc());
+    auto wait = ttag::ClusterBarrierWaitOp::create(b, b.getLoc());
+    return {arrive.getOperation(), wait.getOperation()};
+  }
+
+  bool hasUnsummarizableCalleeState(Operation *op) const override {
+    return isa<ttag::ClusterBarrierArriveOp, ttag::ClusterBarrierWaitOp>(op);
+  }
+
   std::optional<MemEffectsOpInfo>
   getMemEffectsOpInfo(Operation *op) const override {
     bool isAsyncCopy =
@@ -99,7 +112,7 @@ public:
     if (isAsyncCopy || isTMAOp(op)) {
       auto baseInfo = ConSanTargetHooks::getMemEffectsOpInfo(op);
       if (!baseInfo)
-        return std::nullopt;
+        return std::optional<MemEffectsOpInfo>{};
       MemEffectsOpInfo info = std::move(*baseInfo);
       Value barrier;
       if (auto barrierOp = dyn_cast<ttg::MBarrierOpInterface>(op))
@@ -113,7 +126,7 @@ public:
             isAsyncCopy ? tti::CommitKind::AsyncCp : tti::CommitKind::TmaStore;
         info.implicitCommit = !isAsyncCopy;
       }
-      return info;
+      return std::optional<MemEffectsOpInfo>{std::move(info)};
     }
     // AMD ArriveBarrierOp: Explicit barrier arrival.
     // Arrive is per-THREAD when called explicitly (unlike TDM which
@@ -127,7 +140,7 @@ public:
       int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
       int totalCount = (int)arriveOp.getCount() * numWarps * threadsPerWarp;
       info.barriers.push_back({arriveOp.getBarrier(), nullptr, totalCount});
-      return info;
+      return std::optional<MemEffectsOpInfo>{std::move(info)};
     }
 
     return ConSanTargetHooks::getMemEffectsOpInfo(op);

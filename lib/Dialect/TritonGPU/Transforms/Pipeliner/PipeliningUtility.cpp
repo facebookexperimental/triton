@@ -10,6 +10,7 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Analysis/AxisInfo.h"
+#include "triton/Dialect/Triton/IR/OpInterfaces.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -183,7 +184,11 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   if (op->hasTrait<OpTrait::LocalLoadTrait>())
     return op;
-  if (isa<ttg::LocalStoreOp>(op))
+  // Under warp specialization a local_store may write a buffer that another
+  // partition reads under an mbarrier handshake. The paired wait_barrier is
+  // predicated, so the store must be too (wrapped in scf.if below).
+  if (isa<ttg::LocalStoreOp>(op) &&
+      !op->getParentOfType<ttg::WarpSpecializeOp>())
     return op;
   if (isa<ttng::TMEMAllocOp, ttng::TMEMLoadOp>(op))
     return op;
@@ -209,12 +214,31 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     predicatedOp.setPredicateOperand(mask);
     return op;
   }
+  // Dots (tt.dot, ttng.warp_group_dot, ...): predicate by executing
+  // conditionally and forwarding the accumulator input on the inactive path.
+  // Mirrors streamPredication in the AMD pipeline.
+  if (auto dotOp = dyn_cast<tt::DotOpInterface>(op)) {
+    rewriter.setInsertionPoint(op);
+    auto loc = dotOp->getLoc();
+    auto ifOp = scf::IfOp::create(rewriter, loc, dotOp->getResult(0).getType(),
+                                  pred, /*withElseRegion=*/true);
+    auto thenB = ifOp.getThenBodyBuilder();
+    auto yield = scf::YieldOp::create(thenB, loc, dotOp->getResult(0));
+    dotOp->moveBefore(yield);
+    auto elseB = ifOp.getElseBodyBuilder();
+    scf::YieldOp::create(elseB, loc, dotOp->getOperand(2));
+    // Redirect external uses to the scf.if result, but not the then-yield we
+    // just created, which must keep forwarding the dot's own result.
+    dotOp->getResult(0).replaceAllUsesExcept(ifOp->getResult(0), yield);
+    return ifOp;
+  }
   // Ops without a built-in pred operand: wrap in scf.if.
   //
-  // Synchronous descriptor loads/gathers and the TMA "store" family have no
-  // mask/pred operand, so they cannot be masked in place. They must be
-  // predicated when the pipeliner peels prologue/epilogue iterations of a
-  // dynamic loop. Guard them with scf.if(pred); result-producing operations
+  // Synchronous descriptor loads/gathers, descriptor stores/reductions/
+  // scatters, and the TMA "store" family have no mask/pred operand, so they
+  // cannot be masked in place. They must be predicated when the pipeliner
+  // peels prologue/epilogue iterations of a dynamic loop. Guard them with
+  // scf.if(pred); result-producing operations
   // yield poison on the inactive path because their consumers are predicated
   // by the same pipeline-stage condition.
   //
@@ -225,8 +249,9 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   // those are masked in place and never need the scf.if wrapper. An nvws load
   // arriving here would hit the "doesn't know how to predicate" error below
   // rather than being silently mishandled.
-  if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp,
-          ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
+  if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op) ||
+      isa<tt::DescriptorStoreLikeOpInterface, ttg::LocalStoreOp>(op) ||
+      isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
           ttng::AsyncTMAScatterOp, ttng::TMAStoreTokenWaitOp>(op)) {
     rewriter.setInsertionPoint(op);
     bool hasResults = op->getNumResults() > 0;
@@ -253,9 +278,28 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   }
 
-  op->emitOpError("pipeliner doesn't know how to predicate this op.");
-  llvm::report_fatal_error("Fatal pipeliner error");
-  return op;
+  // General fallback: wrap the op in an scf.if gated on the predicate.
+  rewriter.setInsertionPoint(op);
+  Location loc = op->getLoc();
+  SmallVector<Type> resultTypes(op->getResultTypes());
+  auto ifOp = scf::IfOp::create(rewriter, loc, resultTypes, pred);
+  Block *thenBlock = rewriter.createBlock(&ifOp.getThenRegion());
+  op->moveBefore(thenBlock, thenBlock->end());
+  rewriter.setInsertionPointToEnd(thenBlock);
+  scf::YieldOp::create(rewriter, loc, op->getResults());
+  Block *elseBlock = rewriter.createBlock(&ifOp.getElseRegion());
+  rewriter.setInsertionPointToEnd(elseBlock);
+  SmallVector<Value> poisonResults;
+  for (Type ty : resultTypes) {
+    poisonResults.push_back(ub::PoisonOp::create(rewriter, loc, ty));
+  }
+  scf::YieldOp::create(rewriter, loc, poisonResults);
+  for (auto [oldRes, newRes] : llvm::zip(op->getResults(), ifOp.getResults())) {
+    oldRes.replaceUsesWithIf(newRes, [&](OpOperand &use) {
+      return use.getOwner() != ifOp.thenYield();
+    });
+  }
+  return ifOp;
 }
 
 Operation *mlir::triton::wrapInMaskOp(RewriterBase &rewriter, Operation *op,
@@ -297,10 +341,10 @@ void mlir::triton::resolveMaskOp(ModuleOp moduleOp) {
   }
 }
 
-// Return true if the given ForOp has the attribute
+// Return true if the given loop has the attribute
 // `tt.disallow_acc_multi_buffer` set to true.
-bool mlir::triton::getDisallowAccMultiBuffer(scf::ForOp forOp) {
-  return forOp->hasAttr(mlir::triton::kDisallowAccMultiBufferAttrName);
+bool mlir::triton::getDisallowAccMultiBuffer(LoopLikeOpInterface loop) {
+  return loop->hasAttr(mlir::triton::kDisallowAccMultiBufferAttrName);
 }
 
 std::pair<OpResult, int64_t>
@@ -335,9 +379,14 @@ int mlir::triton::getCopyVecBytes(RankedTensorType registerTy,
   // FIXME: Here we should pass a MemDescType instead of a SharedEncodingTrait!!
   // This is currently broken for memdesc_subslice!
   auto sharedLayout = triton::gpu::toLinearLayout(shape, sharedEnc);
+  // A mixed-radix layout doesn't compose with the shared layout: copy by runs.
+  if (!regLayout.isRadix2())
+    return ttg::getMixedRadixSharedRun(regLayout, sharedLayout.pseudoinvert(),
+                                       registerTy.getElementTypeBitWidth()) *
+           registerTy.getElementTypeBitWidth() / 8;
   auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
   const int vecElems = regToSharedLayout.getNumConsecutiveInOut();
-  return vecElems * registerTy.getElementTypeBitWidth() / 8;
+  return vecElems * getIntOrFloatOrPtrBitWidth(registerTy.getElementType()) / 8;
 }
 
 bool mlir::triton::canBeConvertedToAsyncLoad(
@@ -351,11 +400,9 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
   unsigned width = 0;
   if (tensorTy) {
     auto ty = cast<tt::PointerType>(tensorTy.getElementType()).getPointeeType();
-    width = vec * ty.getIntOrFloatBitWidth();
+    width = vec * getIntOrFloatOrPtrBitWidth(ty);
   } else {
-    width = cast<tt::PointerType>(ptr.getType())
-                .getPointeeType()
-                .getIntOrFloatBitWidth();
+    width = tt::getPointeeBitWidth(ptr.getType());
   }
 
   // We do not pipeline all loads for the following reasons:
@@ -365,6 +412,22 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
   //    pressure.
   LDBG("Load " << *loadOp << " has width " << width);
   return width >= 32;
+}
+
+bool mlir::triton::canPipelineInSharedMemory(tt::LoadOp load) {
+  auto ty = dyn_cast<RankedTensorType>(load.getType());
+  if (!ty)
+    return true;
+  LinearLayout layout = ttg::toLinearLayout(ty);
+  if (layout.isRadix2())
+    return true;
+  Type type = ty;
+  for (StringRef name : {ttg::AsyncCopyGlobalToLocalOp::getOperationName(),
+                         ttg::LocalLoadOp::getOperationName()})
+    if (ttg::getNpotLayoutUnsupportedReason(
+            OperationName(name, load.getContext()), type))
+      return false;
+  return !getNpotAsyncCopyUnsupportedReason(load, layout);
 }
 
 void mlir::triton::serializeLatencies(ModuleOp module,
@@ -390,7 +453,11 @@ DenseMap<Operation *, int> mlir::triton::deserializeLatencies(Operation *op) {
   auto latencyHelper = TritonDialect::getLoaded(op)->getLatencyAttrHelper();
   op->walk([&](Operation *op) {
     if (auto attr = latencyHelper.getAttr(op)) {
-      opLatency[op] = attr.getInt();
+      // A load whose shared-memory ops can't lower its layout stays
+      // unpipelined.
+      auto load = dyn_cast<tt::LoadOp>(op);
+      if (!load || canPipelineInSharedMemory(load))
+        opLatency[op] = attr.getInt();
       latencyHelper.removeAttr(op);
     }
   });
@@ -453,9 +520,18 @@ Value mlir::triton::createAlloc(Operation *insertBefore, RankedTensorType ty,
   return alloc;
 }
 
+bool mlir::triton::canPipelineTMALoad(Operation *op) {
+  auto tensorTy = cast<RankedTensorType>(op->getResultTypes()[0]);
+  auto sharedEncoding = getSharedEncoding(op);
+  int64_t stageSizeInBits =
+      ttg::getAllocationElems(sharedEncoding, tensorTy.getShape()) *
+      getIntOrFloatOrPtrBitWidth(tensorTy.getElementType());
+  return stageSizeInBits % (ttng::TMA_ALIGN * 8) == 0;
+}
+
 bool mlir::triton::canBeAsyncLoad(Operation *op) {
   if (mlir::triton::isTMALoad(op)) {
-    return true;
+    return canPipelineTMALoad(op);
   }
   assert(isa<tt::LoadOp>(op));
   ttg::SharedEncodingTrait sharedEncoding = mlir::triton::getSharedEncoding(op);
@@ -476,7 +552,7 @@ void mlir::triton::combineRedundantWaitOps(
         createWait) {
   llvm::MapVector<Operation *, Operation *> toDelete;
   for (Operation *waitOp : waitOps) {
-    if (toDelete.count(waitOp))
+    if (toDelete.contains(waitOp))
       continue;
     StringRef waitName = waitOp->getName().getStringRef();
     auto getNum = [](Operation *op) {
@@ -641,14 +717,15 @@ Value triton::createIncrementModulo(OpBuilder &builder, Location loc,
 /////////////////////////////
 
 static void
-allocTMABuffers(scf::ForOp forOp,
+allocTMABuffers(LoopLikeOpInterface loop,
                 llvm::MapVector<Operation *, Value> &tmaBufferMapping,
                 int maxStage) {
-  IRRewriter rewriter(forOp);
+  IRRewriter rewriter(loop);
+  Block *body = &loop.getLoopRegions().back()->front();
 
   // Create a multi-buffered allocation for each MakeTensorDescOp call in the
   // loop
-  forOp.walk([&](tt::MakeTensorDescOp op) {
+  body->walk([&](tt::MakeTensorDescOp op) {
     // TODO peter: walk to loop yield to find the init value if this is a
     // loop-carried value. That would save us from allocating another buffer
     // just for the init value
@@ -669,15 +746,16 @@ static Value subviewTMADescriptor(OpBuilder &builder, Location loc, Value alloc,
 }
 
 static LogicalResult rewriteTMABufferUpdates(
-    scf::ForOp forOp,
+    LoopLikeOpInterface loop,
     const llvm::MapVector<Operation *, Value> &tmaBufferMapping,
     ArrayRef<BlockArgument> tmaCounters, int numBuffers, Value one, Value zero,
+    MutableArrayRef<OpOperand> tmaCounterYields,
     triton::CoarseSchedule &schedule) {
   assert(tmaBufferMapping.size() == tmaCounters.size());
 
-  auto auxBuilder = mlir::OpBuilder(forOp);
+  auto auxBuilder = mlir::OpBuilder(loop);
   Value numBuffersVal =
-      arith::ConstantIntOp::create(auxBuilder, forOp.getLoc(), numBuffers, 32);
+      arith::ConstantIntOp::create(auxBuilder, loop.getLoc(), numBuffers, 32);
 
   for (auto [iOp, pair] : llvm::enumerate(tmaBufferMapping)) {
     auto &[op, alloc] = pair;
@@ -705,25 +783,25 @@ static LogicalResult rewriteTMABufferUpdates(
         builder, builder.getLoc(), counter, numBuffersVal, zero, one);
 
     // If we are in a (potentially nested) if region, propagate the counter
-    // up to the main for op body scope
-    IRRewriter rewriter(forOp);
+    // up to the main loop body scope
+    IRRewriter rewriter(loop);
     nextCounter = triton::sinkValueRedefinition(rewriter, counter, nextCounter,
                                                 op->getBlock());
 
     // Finally, rewrite the loop level yield
-    auto forYield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-    forYield.setOperand(counter.getArgNumber() - 1, nextCounter);
+    tmaCounterYields[iOp].set(nextCounter);
     makeDescOp.erase();
   }
   return success();
 }
 
-scf::ForOp triton::lowerTMADescriptors(scf::ForOp forOp,
-                                       CoarseSchedule &schedule) {
+LoopLikeOpInterface triton::lowerTMADescriptors(LoopLikeOpInterface loop,
+                                                CoarseSchedule &schedule) {
   llvm::MapVector<Operation *, Value> tmaBufferMapping;
   int maxStage = schedule.getNumStages() - 1;
-  for (auto &op : forOp.getBody()->without_terminator()) {
-    if (auto wgMmaOp = dyn_cast<ttng::WarpGroupDotOp>(&op)) {
+  Block *body = &loop.getLoopRegions().back()->front();
+  for (Operation &op : body->without_terminator()) {
+    if (isa<ttng::WarpGroupDotOp>(op)) {
       // Hopper only: Add one more buffer slice if there is a WarpGroupDotOp,
       // as if it will be pipelined, we will effectively make the pipeline
       // one stage longer.
@@ -731,40 +809,56 @@ scf::ForOp triton::lowerTMADescriptors(scf::ForOp forOp,
       break;
     }
   }
-  allocTMABuffers(forOp, tmaBufferMapping, maxStage);
+  allocTMABuffers(loop, tmaBufferMapping, maxStage);
   if (tmaBufferMapping.empty())
-    return forOp;
+    return loop;
 
-  IRRewriter builder(forOp);
-  Location loc = forOp.getLoc();
+  IRRewriter builder(loop);
+  Location loc = loop.getLoc();
   Value zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
   Value one = arith::ConstantIntOp::create(builder, loc, 1, 32);
   SmallVector<Value> newOperands;
-  unsigned newOperandIndex = forOp.getBody()->getNumArguments();
   // Create one counter per TMA buffer. This allows the descriptors to be
   // updated independently without needing to write duplicate of existing tma
   // descriptors.
-  unsigned tmaCounterArgsStartIdx = newOperandIndex + newOperands.size();
   for (int i = 0; i < tmaBufferMapping.size(); ++i) {
     newOperands.push_back(zero);
   }
 
-  forOp = addIterArgsToLoop(builder, forOp, newOperands);
-
-  auto tmaCounters = ArrayRef<BlockArgument>(forOp.getBody()->getArguments())
-                         .slice(tmaCounterArgsStartIdx);
-
-  // Update yield op with temporary yield values
-  auto forYield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-  for (unsigned i = 0; i < newOperands.size(); ++i) {
-    forYield.getResultsMutable().append(newOperands[i]);
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation())) {
+    forOp = addIterArgsToLoop(builder, forOp, newOperands);
+    auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    for (Value operand : newOperands)
+      yield.getResultsMutable().append(operand);
+    loop = forOp;
+  } else {
+    auto whileOp = cast<scf::WhileOp>(loop.getOperation());
+    auto numBeforeArgs = whileOp.getBeforeArguments().size();
+    auto numAfterArgs = whileOp.getAfterArguments().size();
+    SmallVector<Type> resultTypes(newOperands.size(), builder.getI32Type());
+    auto oldWhile = whileOp;
+    whileOp = replaceWhileOpWithNewSignature(builder, whileOp, newOperands,
+                                             resultTypes);
+    oldWhile.erase();
+    for (int i = 0; i < newOperands.size(); ++i) {
+      whileOp.getConditionOp().getArgsMutable().append(
+          whileOp.getBeforeArguments()[numBeforeArgs + i]);
+      whileOp.getYieldOp().getResultsMutable().append(
+          whileOp.getAfterArguments()[numAfterArgs + i]);
+    }
+    loop = whileOp;
   }
 
-  if (failed(rewriteTMABufferUpdates(forOp, tmaBufferMapping, tmaCounters,
-                                     maxStage, one, zero, schedule))) {
+  body = &loop.getLoopRegions().back()->front();
+  auto tmaCounters = body->getArguments().take_back(tmaBufferMapping.size());
+  auto tmaCounterYields =
+      loop.getYieldedValuesMutable()->take_back(tmaBufferMapping.size());
+  if (failed(rewriteTMABufferUpdates(loop, tmaBufferMapping, tmaCounters,
+                                     maxStage, one, zero, tmaCounterYields,
+                                     schedule))) {
     llvm_unreachable("Failed to rewrite TMA ops");
   }
-  return forOp;
+  return loop;
 }
 
 DenseSet<Operation *>
@@ -812,7 +906,8 @@ static Operation *getUseOfPipelinedOp(
     topLevelUsers.insert(users.begin(), users.end());
   }
   for (Operation *topLevelUser : topLevelUsers) {
-    assert(schedule.count(topLevelUser) && "op user not found in the schedule");
+    assert(schedule.contains(topLevelUser) &&
+           "op user not found in the schedule");
     if (!selectedUser || shouldPrefer(topLevelUser, selectedUser)) {
       selectedUser = topLevelUser;
     }
@@ -883,13 +978,13 @@ bool triton::isLoopTripCountKnownPositive(scf::ForOp loop,
     if (llvm::none_of(cmp->getUsers(), isDominatingAssume))
       continue;
     bool unsignedCmp = loop.getUnsignedCmp();
-    if (cmp.getPredicate() ==
-            (unsignedCmp ? arith::CmpIPredicate::ugt : arith::CmpIPredicate::sgt) &&
+    if (cmp.getPredicate() == (unsignedCmp ? arith::CmpIPredicate::ugt
+                                           : arith::CmpIPredicate::sgt) &&
         cmp.getLhs() == loop.getUpperBound() &&
         cmp.getRhs() == loop.getLowerBound())
       return true;
-    if (cmp.getPredicate() ==
-            (unsignedCmp ? arith::CmpIPredicate::ult : arith::CmpIPredicate::slt) &&
+    if (cmp.getPredicate() == (unsignedCmp ? arith::CmpIPredicate::ult
+                                           : arith::CmpIPredicate::slt) &&
         cmp.getLhs() == loop.getLowerBound() &&
         cmp.getRhs() == loop.getUpperBound())
       return true;

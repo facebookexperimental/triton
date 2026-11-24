@@ -209,7 +209,7 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
   unsigned M = 4 * instrMNK[0];
   unsigned N = instrMNK[1];
   unsigned K = instrMNK[2];
-  bool zeroAcc = isZeroConst(c);
+  bool zeroAcc = isZeroFillConst(c);
   auto warpSize = mmaEncoding.getWarpsPerCTA();
   auto shapePerCTATile = SmallVector<unsigned>{instrMNK[0] * warpSize[0],
                                                instrMNK[1] * warpSize[1]};
@@ -223,9 +223,9 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
   SmallVector<Value> structA;
   bool transA = false;
   if (aInShared) {
-    auto loader =
-        DotOpMmaSmemLoader::build(loc, rewriter, cast<MemDescType>(aTensorTy),
-                                  baseA, {M, K}, 0, 3, false, dTensorTy);
+    auto loader = DotOpMmaSmemLoader::build(
+        loc, rewriter, cast<MemDescType>(aTensorTy), baseA, {M, K}, 0, 3,
+        hasLessRegMMA(op), /*isFp4=*/false, dTensorTy);
     if (failed(loader)) {
       return mlir::emitError(loc, "failed to find valid wgmma layout for "
                                   "operand A in shared memory ")
@@ -238,7 +238,8 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
     structA = unpackTensorElements(loc, loadedA, rewriter, aTensorTy);
   }
   auto bLoader = DotOpMmaSmemLoader::build(loc, rewriter, bTensorTy, baseB,
-                                           {K, N}, 1, 3, false, dTensorTy);
+                                           {K, N}, 1, 3, hasLessRegMMA(op),
+                                           /*isFp4=*/false, dTensorTy);
   if (failed(bLoader)) {
     return mlir::emitError(loc, "failed to find valid wgmma layout for "
                                 "operand B in shared memory ")
@@ -283,7 +284,11 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
       for (int k = 0; k < numRepK; ++k) {
         Value a;
         if (aInShared) {
-          a = aLoader.smemLoad(m * mmaSizeM, k * mmaSizeK, rewriter, loc);
+          auto loadedA =
+              aLoader.smemLoad(m * mmaSizeM, k * mmaSizeK, rewriter, loc);
+          if (failed(loadedA))
+            return failure();
+          a = *loadedA;
         } else {
           auto aDotOpEnc =
               cast<DotOperandEncodingAttr>(aTensorTy.getEncoding());
@@ -327,7 +332,10 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
               SmallVector<Type>(regA.size(), regA[0].getType()));
           a = packLLElements(loc, typeConverter, regA, rewriter, regATy);
         }
-        auto b = bLoader->smemLoad(k * mmaSizeK, n * mmaSizeN, rewriter, loc);
+        auto bOr = bLoader->smemLoad(k * mmaSizeK, n * mmaSizeN, rewriter, loc);
+        if (failed(bOr))
+          return failure();
+        auto b = *bOr;
         numLowPrecisionAcc += K;
         // If using native accumulation would cause use to do more low precion
         // accumulation than allowed do a separate allocation.

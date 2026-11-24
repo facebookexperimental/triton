@@ -1,4 +1,4 @@
-// RUN: triton-opt --verify-each=false %s -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=4 target=cuda:100 num-ctas=1 threads-per-warp=32})' | FileCheck %s
+// RUN: triton-opt --verify-each=false -split-input-file %s -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=4 target=cuda:100 num-ctas=1 threads-per-warp=32})' | FileCheck %s
 
 // The Python frontend constructs helper bodies with encoding-free tensor types.
 // A concrete call operand specializes the helper ABI during TLX fixup, so the
@@ -51,3 +51,41 @@
     "tt.return"() : () -> ()
   }) : () -> ()
 }) {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} : () -> ()
+
+// -----
+
+// Reshape can resolve a nested deferred slice to a concrete linear layout.
+// The following integer casts and helper result ABI must be repaired after
+// that inference, even though none of those values is a require_layout anchor.
+// CHECK-DAG: #[[$CONCRETE:.*]] = #ttg.linear<{register = {{\[\[0, 1\]\]}},{{.*}}>
+// CHECK-LABEL: tt.func private @scale_cast(
+// CHECK: %[[RESHAPED:.*]] = tt.reshape
+// CHECK-SAME: -> tensor<64x2xi32, #[[$CONCRETE]]>
+// CHECK: %[[BYTE:.*]] = arith.trunci %[[RESHAPED]] : tensor<64x2xi32, #[[$CONCRETE]]> to tensor<64x2xi8, #[[$CONCRETE]]>
+// CHECK: %[[WIDE:.*]] = arith.extui %[[BYTE]] : tensor<64x2xi8, #[[$CONCRETE]]> to tensor<64x2xi32, #[[$CONCRETE]]>
+// CHECK: tt.return %[[BYTE]], %[[WIDE]] : tensor<64x2xi8, #[[$CONCRETE]]>, tensor<64x2xi32, #[[$CONCRETE]]>
+// CHECK-LABEL: tt.func public @scale_cast_kernel
+// CHECK: tt.call @scale_cast
+// CHECK-SAME: -> (tensor<64x2xi8, #[[$CONCRETE]]>, tensor<64x2xi32, #[[$CONCRETE]]>)
+
+#scale_physical = #ttg.linear<{
+  register = [[0, 0, 0, 1], [0, 0, 0, 2], [0, 0, 0, 8], [0, 0, 0, 16], [0, 0, 1, 0]],
+  lane = [[0, 1, 0, 0], [0, 2, 0, 0], [0, 4, 0, 0], [0, 8, 0, 0], [0, 16, 0, 0]],
+  warp = [[1, 0, 0, 0], [0, 0, 0, 4]],
+  block = []
+}>
+#scale_slice = #ttg.slice<{dim = 3, parent = #tlx.no_verify_layout<#scale_physical>}>
+
+module {
+  tt.func private @scale_cast(%arg: tensor<2x32x2xi32, #scale_slice>) -> (tensor<64x2xi8>, tensor<64x2xi32>) {
+    %reshaped = tt.reshape %arg : tensor<2x32x2xi32, #scale_slice> -> tensor<64x2xi32>
+    %byte = arith.trunci %reshaped : tensor<64x2xi32> to tensor<64x2xi8>
+    %wide = arith.extui %byte : tensor<64x2xi8> to tensor<64x2xi32>
+    tt.return %byte, %wide : tensor<64x2xi8>, tensor<64x2xi32>
+  }
+  tt.func public @scale_cast_kernel(%arg: tensor<2x32x2xi32>) {
+    %pin = tlx.require_layout %arg : tensor<2x32x2xi32> -> tensor<2x32x2xi32, #scale_slice>
+    %byte, %wide = tt.call @scale_cast(%pin) : (tensor<2x32x2xi32, #scale_slice>) -> (tensor<64x2xi8>, tensor<64x2xi32>)
+    tt.return
+  }
+}

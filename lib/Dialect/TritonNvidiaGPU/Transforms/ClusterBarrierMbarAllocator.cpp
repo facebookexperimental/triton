@@ -1,4 +1,5 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
+#include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -23,19 +24,6 @@ namespace mlir::triton::nvidia_gpu {
 
 namespace {
 
-bool atomicNeedsClusterBarrier(Operation *op) {
-  if (isa<AtomicPollOp>(op))
-    return gpu::lookupNumCTAs(op) != 1;
-  if (!isa<AtomicCASOp, AtomicRMWOp>(op) || op->getResult(0).use_empty() ||
-      gpu::lookupNumCTAs(op) == 1)
-    return false;
-  auto tensorTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
-  if (!tensorTy)
-    return true;
-  auto kBlock = StringAttr::get(op->getContext(), "block");
-  return gpu::toLinearLayout(tensorTy).getFreeVariableMasks().lookup(kBlock);
-}
-
 struct ClusterBarrierMbarAllocatorPass
     : public impl::TritonNvidiaGPUClusterBarrierMbarAllocatorPassBase<
           ClusterBarrierMbarAllocatorPass> {
@@ -45,19 +33,6 @@ struct ClusterBarrierMbarAllocatorPass
 };
 
 } // namespace
-
-bool needsClusterBarrier(Operation *op) {
-  if (isa<ClusterBarrierOp>(op))
-    return true;
-  if (auto cvt = dyn_cast<gpu::ConvertLayoutOp>(op)) {
-    auto kBlock = StringAttr::get(op->getContext(), "block");
-    return !isCvtDimSync(gpu::toLinearLayout(cvt.getSrc().getType()),
-                         gpu::toLinearLayout(cvt.getType()), kBlock);
-  }
-  if (auto reduce = dyn_cast<ReduceOp>(op))
-    return !ReduceOpHelper(reduce).isReduceWithinCTA();
-  return atomicNeedsClusterBarrier(op);
-}
 
 void runClusterBarrierMbarAllocator(ModuleOp mod) {
   auto funcs = mod.getOps<triton::FuncOp>();
@@ -71,6 +46,7 @@ void runClusterBarrierMbarAllocator(ModuleOp mod) {
   int64_t shared = sharedAttr ? sharedAttr.getInt() : 0;
   int64_t nextOffset = llvm::alignTo(shared, int64_t{8});
   DenseMap<Region *, IntegerAttr> regionOffsets;
+  SmallVector<SharedMemoryReservation> reservations;
   Builder builder(mod.getContext());
 
   kernel.walk([&](Operation *op) {
@@ -85,6 +61,13 @@ void runClusterBarrierMbarAllocator(ModuleOp mod) {
 
     auto [it, inserted] = regionOffsets.try_emplace(region);
     if (inserted) {
+      if (regionOffsets.size() == 1 && nextOffset > shared)
+        reservations.push_back({"alignment", static_cast<size_t>(shared),
+                                static_cast<size_t>(nextOffset - shared),
+                                kernel.getOperation()});
+      reservations.push_back(
+          {"cluster_barrier", static_cast<size_t>(nextOffset),
+           kClusterBarrierMbarAllocationSize, region->getParentOp()});
       it->second = builder.getI32IntegerAttr(nextOffset);
       nextOffset += kClusterBarrierMbarAllocationSize;
     }
@@ -97,6 +80,7 @@ void runClusterBarrierMbarAllocator(ModuleOp mod) {
     mod->setAttr(kWSClusterBarrierCountAttrName,
                  builder.getI32IntegerAttr(regionOffsets.size()));
     mod->setAttr("ttg.shared", builder.getI32IntegerAttr(nextOffset));
+    appendSharedMemoryReservations(mod, reservations);
   }
 }
 

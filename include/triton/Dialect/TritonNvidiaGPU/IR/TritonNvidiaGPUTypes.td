@@ -36,6 +36,22 @@ class TTNG_TypeDef<string name, string _mnemonic, list<Trait> traits = []>
 }
 
 //===----------------------------------------------------------------------===//
+// NamedBarrierIdType
+//===----------------------------------------------------------------------===//
+
+def TTNG_NamedBarrierIdType
+    : TTNG_TypeDef<"NamedBarrierId", "named_barrier_id"> {
+  let summary = "Hardware named-barrier identifier";
+
+  let description = [{
+    A first-class wrapper around the i32 identifier consumed by NVIDIA named
+    barrier operations. User and compiler producers are represented by
+    distinct operations so compiler allocation can distinguish reservations
+    from generated IDs.
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // TensorDescIm2ColType
 //===----------------------------------------------------------------------===//
 

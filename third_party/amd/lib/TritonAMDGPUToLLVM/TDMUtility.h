@@ -1,15 +1,10 @@
-#ifndef TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_TDMUTILITY_H
-#define TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_TDMUTILITY_H
+#ifndef TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_TDMUTILITY_H_
+#define TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_TDMUTILITY_H_
 
-#include "TargetInfo.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/IR/Operation.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include <optional>
-
-using mlir::triton::AMD::TargetInfo;
-using PartitionedSharedEncodingAttr =
-    mlir::triton::gpu::PartitionedSharedEncodingAttr;
 
 namespace mlir::LLVM::AMD {
 
@@ -74,6 +69,8 @@ SmallVector<Value> createTDMDescriptor(RewriterBase &rewriter, Location loc,
 // `warpUsedHint`: see TritonAMDGPUOps.td for the axis-aligned hint rule.
 // `isPureForm`: inherit `pred` from the descriptor (group0[0]) instead of the
 // `pred` arg, and leave the barrier-enable bit untouched.
+// `descriptorOffsets`: optional signed offsets folded from an unclamped
+// descriptor update. These advance the address but do not shrink the bounds.
 void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
                        const LLVMTypeConverter *typeConverter, Type elementType,
                        SmallVector<int64_t> blockShape, int numWarps,
@@ -84,7 +81,8 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
                        const triton::LinearLayout &sharedLayout, Value ctaId,
                        bool isStore, ArrayRef<unsigned> warpsPerCTA,
                        std::optional<uint32_t> warpUsedHint = std::nullopt,
-                       bool isPureForm = false);
+                       bool isPureForm = false,
+                       ArrayRef<Value> descriptorOffsets = {});
 
 // Emit a TDM load/store for regular contiguous transfers (1D-5D).
 // PartitionedSharedEncoding aligns warps to LDS partitions; without a hint
@@ -114,6 +112,8 @@ struct TDMFusedLoadMemberInfo {
   Value multicastMask;
   SmallVector<Value> desc;
   SmallVector<Value> copyOffsets;
+  // Folded address-only update, in tensor elements and Triton dimension order.
+  SmallVector<Value> descriptorOffsets;
   SmallVector<Value> dstPtrs;
   Value pred;
 };
@@ -140,7 +140,7 @@ distributeTDMWarpsAlignToPartition(ArrayRef<int64_t> blockShape, int numWarps,
 // Calculate the number of TDM gather/scatter instructions needed using the
 // same LinearLayout analysis as emitTDMGatherScatter: broadcasts are removed
 // and contiguity is considered when batching indices per instruction.
-size_t getTDMGatherScatterInstrinsicCount(RankedTensorType indicesType);
+size_t getTDMGatherScatterIntrinsicCount(RankedTensorType indicesType);
 
 // Emit a TDM gather or scatter operation for non-contiguous row access.
 // Gather: reads from non-contiguous global rows into LDS
@@ -180,4 +180,4 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
 
 } // namespace mlir::LLVM::AMD
 
-#endif // TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_TDMUTILITY_H
+#endif // TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_TDMUTILITY_H_

@@ -62,12 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write   # create/update the rolling Release + assets
-      pages: write
-      id-token: write
       actions: read      # download-artifact
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v6
@@ -91,15 +86,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/nightly_prune.py 30
-      - name: Generate simple index from current assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/nightly_build_index.py public/nightly/simple
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: public
-      - id: deploy
-        uses: actions/deploy-pages@v4
+      # The PEP 503 index is rendered and deployed by pages.yml, which runs on
+      # this workflow's completion. Deploying it here too would replace the
+      # whole site with just the index.
 
   report-nogreen:
     needs: select

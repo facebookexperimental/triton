@@ -60,6 +60,111 @@ def NVWSAssignStagePhase : Pass<"nvws-assign-stage-phase", "mlir::ModuleOp"> {
   ];
 }
 
+def NVWSInsertSemas : Pass<"nvws-insert-semas", "mlir::ModuleOp"> {
+  let summary = "Insert semaphore ops for ownership transfer.";
+
+  let description = [{
+    Access-DAG-driven SMEM/TMEM semaphore insertion for ownership transfer
+    between warp-specialized partitions.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+
+  let options = [
+    Option<"useMetaPartitioner", "use-meta-partitioner",
+           "bool", /*default*/"false",
+           "If true, InsertSemas is running after the NVWS meta partitioner">,
+    Option<"numStages", "num-stages", "int32_t", /*default*/"3",
+           "default semaphore depth used for stage planning; must match "
+           "nvws-semaphore-optimize --num-stages">
+  ];
+}
+
+def NVWSSemaphoreOptimize
+    : Pass<"nvws-semaphore-optimize", "mlir::ModuleOp"> {
+  let summary = "Optimize NVWS semaphore topology before stage assignment.";
+
+  let description = [{
+    Combines compatible semaphore pairs and materializes the final
+    multi-buffered semaphore depth. The pass preserves semaphore IR and must
+    run before semaphore stage/phase assignment.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+
+  let options = [
+    Option<"numStages", "num-stages", "int32_t", /*default*/"3",
+           "default number of pipeline stages for semaphore multibuffering">
+  ];
+}
+
+def NVWSAssignSemaphoreStagePhase
+    : Pass<"nvws-assign-semaphore-stage-phase", "mlir::ModuleOp"> {
+  let summary = "Assign stage and phase to NVWS semaphore operations.";
+
+  let description = [{
+    Assigns the final buffer stage to semaphore acquire, buffer, and release
+    operations and the wait phase to semaphore acquire operations.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def NVWSLowerSemaphore : Pass<"nvws-lower-semaphore", "mlir::ModuleOp"> {
+  let summary = "Lower assigned NVWS semaphores to hardware barriers.";
+
+  let description = [{
+    Converts optimized semaphore IR with assigned stage/phase operands to
+    Triton NVIDIA barrier operations. This pass does not optimize semaphore
+    topology or assign stage/phase operands.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+
+  let options = [
+    Option<"numStages", "num-stages", "int32_t", /*default*/"3",
+           "default number of pipeline stages for asynchronous MMA lowering">
+  ];
+}
+
+def NVWSMetaToNVWSConvert
+    : Pass<"nvws-meta-to-nvws-convert", "mlir::ModuleOp"> {
+  let summary = "Convert Meta warp-specialization planning metadata to NVWS IR";
+
+  let description = [{
+    Mechanically converts the output of the Meta warp-specialization planning
+    prefix into the representation consumed by the NVWS mechanism passes. The
+    pass does not choose partitions, schedules, buffers, or synchronization.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def NVWSLowerAref : Pass<"nvws-lower-aref", "mlir::ModuleOp"> {
   let summary = "Convert nvws.aref.* to ttng.*barrier* ops.";
 

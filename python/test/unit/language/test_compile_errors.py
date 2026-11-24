@@ -1,6 +1,7 @@
 import contextlib
 import pytest
 import os
+import warnings
 
 import torch
 import triton
@@ -269,9 +270,12 @@ def test_global_var_access():
     def kernel():
         a = GLOBAL  # noqa
 
-    with pytest.raises(CompilationError) as e:
-        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
-    assert "global variable" in str(e.value)
+    source = triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={})
+    if triton.knobs.compilation.allow_non_constexpr_globals:
+        assert triton.compile(source) is not None
+    else:
+        with pytest.raises(CompilationError, match="Cannot access global variable"):
+            triton.compile(source)
 
 
 CONSTEXPR_ANNOTATED_GLOBAL: tl.constexpr = 42
@@ -283,12 +287,12 @@ def test_constexpr_annotated_global_var_access():
     def kernel():
         a = CONSTEXPR_ANNOTATED_GLOBAL  # noqa
 
-    # No error.
-    try:
-        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
-        assert False, "Using a constexpr annotated global variable should not be allowed"
-    except CompilationError as e:
-        assert "Cannot access global variable" in str(e)
+    source = triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={})
+    if triton.knobs.compilation.allow_non_constexpr_globals:
+        assert triton.compile(source) is not None
+    else:
+        with pytest.raises(CompilationError, match="Cannot access global variable"):
+            triton.compile(source)
 
 
 CONSTEXPR_GLOBAL = tl.constexpr(42)
@@ -333,7 +337,11 @@ def test_defaults_assign_no_err():
     def kernel(a=1, B: tl.constexpr = ""):
         pass
 
-    triton.compile(triton.compiler.ASTSource(fn=kernel, signature={'a': 'i32', 'B': 'constexpr'}, constexprs={'B': ""}))
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=r"AnnAssign\.__init__ missing .* 'simple'",
+                                category=DeprecationWarning)
+        triton.compile(
+            triton.compiler.ASTSource(fn=kernel, signature={'a': 'i32', 'B': 'constexpr'}, constexprs={'B': ""}))
 
 
 def test_where_warning(fresh_triton_cache):
@@ -379,7 +387,7 @@ def test_fp8_support(fresh_triton_cache, dtype):
     elif dtype in supported_dtypes:
         ctx = contextlib.nullcontext()
     else:
-        ctx = pytest.raises(CompilationError, match="")
+        ctx = pytest.raises(CompilationError)
 
     with ctx as e:
         triton.compile(
@@ -582,3 +590,18 @@ def test_err_nested_function_def():
     err_msg = format_exception(e.type, value=e.value, tb=e.tb)
     assert "StopIteration" not in err_msg, "nested def should not leak StopIteration"
     assert "nested function" in err_msg, "error should mention nested function"
+
+
+@pytest.mark.parametrize("ptr_ty", ["*i8", "*i16", "*i64"])
+def test_err_histogram_non_32bit_int(ptr_ty):
+
+    @triton.jit
+    def kernel(x_ptr, z_ptr, N: tl.constexpr):
+        x = tl.load(x_ptr + tl.arange(0, 8))
+        tl.store(z_ptr + tl.arange(0, N), tl.histogram(x, N))
+
+    with pytest.raises(CompilationError) as e:
+        triton.compile(
+            triton.compiler.ASTSource(fn=kernel, signature={"x_ptr": ptr_ty, "z_ptr": "*i32", "N": "constexpr"},
+                                      constexprs={"N": 4}))
+    assert "histogram only supports 32-bit integer input" in str(e.value.__cause__)

@@ -42,11 +42,11 @@ inline bool isEpilogueStoreOp(Operation *op) {
 }
 
 // A TMAStoreTokenWaitOp that waits on an async_tma_reduce / descriptor_reduce.
-// Such a wait must live in the SAME partition as its reduce (the reduction
-// partition), not the epilogue-store partition: otherwise doCodePartition
-// clones the reduce into the store partition to satisfy the mis-placed wait,
-// reducing e.g. reduce_dq into global twice (double-count / stale-staging
-// garbage). See T279388065.
+// Such a wait must live in the SAME partition as its reduce (usually the
+// reduction partition), not the epilogue-store partition: otherwise
+// doCodePartition clones the reduce into the store partition to satisfy the
+// mis-placed wait, reducing e.g. reduce_dq into global twice (double-count /
+// stale-staging garbage). See T279388065.
 inline bool isReduceTokenWait(Operation *op) {
   if (!isa<ttng::TMAStoreTokenWaitOp>(op))
     return false;
@@ -406,9 +406,12 @@ class OpCategorizer {
 public:
   OpCategorizer(LoopLikeOpInterface mainLoop, ArrayRef<Operation *> mmaOps)
       : mainLoop(mainLoop), mmas(mmaOps.begin(), mmaOps.end()) {
-    // Collect all loops (nested + main)
-    for (auto nestedLoop : getLoopBodyBlock(mainLoop)->getOps<scf::ForOp>())
-      loops.push_back(cast<LoopLikeOpInterface>(nestedLoop.getOperation()));
+    // Keep the same nearest-loop traversal used by getInitialSchedule so
+    // collective control flow does not hide an immediately nested loop.
+    getLoopBodyRegion(mainLoop).walk([&](scf::ForOp nestedLoop) {
+      if (getEnclosingSupportedLoop(nestedLoop) == mainLoop)
+        loops.push_back(cast<LoopLikeOpInterface>(nestedLoop.getOperation()));
+    });
     loops.push_back(mainLoop);
   }
 
@@ -459,6 +462,23 @@ public:
     LoopLikeOpInterface loop = mainLoop;
     return loop->walk([](triton::ReduceOp) { return WalkResult::interrupt(); })
         .wasInterrupted();
+  }
+
+  /// True when a tmem_load after the main loop reads a TMEM value it produced.
+  bool hasPostLoopTMemRead() const {
+    // Copy the lightweight op handle: getOperation() is non-const.
+    LoopLikeOpInterface loop = mainLoop;
+    Operation *loopOp = loop.getOperation();
+    for (Operation *op = loopOp->getNextNode(); op; op = op->getNextNode()) {
+      WalkResult found = op->walk([&](ttng::TMEMLoadOp load) {
+        Value dep = load.getDep();
+        return dep && dep.getDefiningOp() == loopOp ? WalkResult::interrupt()
+                                                    : WalkResult::advance();
+      });
+      if (found.wasInterrupted())
+        return true;
+    }
+    return false;
   }
 
   /// Get the shared ops (ops appearing in multiple MMA backward slices).
@@ -517,7 +537,12 @@ private:
 
     SmallVector<Operation *> loopMmas;
     for (auto mmaOp : mmas) {
-      if (mmaOp->getParentOp() == innermostLoop.getOperation())
+      // Collective control flow, such as a per-tile bounds guard, does not
+      // introduce a new scheduling scope.  Select MMAs by their nearest
+      // enclosing loop so MMAs nested in an scf.if still participate in the
+      // enclosing loop's data partitioning, while MMAs in a nested loop do
+      // not.
+      if (getEnclosingSupportedLoop(mmaOp) == innermostLoop)
         loopMmas.push_back(mmaOp);
     }
 
@@ -1037,8 +1062,14 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
     layout.gemmPartition->setType("gemm");
   }
 
+  // A post-loop TMEM read with nothing else to take it needs an epilogue
+  // partition; left unscheduled it lands in the gemm task.
+  bool hasPostLoopTMemEpilogue = !hasEpilogue && !hasCorrection &&
+                                 !hasReduction && !hasComputeAnchor &&
+                                 hasMMAv5 && categorizer.hasPostLoopTMemRead();
+
   // Epilogue partition: for non-store epilogue ops when not merging.
-  if (hasEpilogue && !options.mergeEpilogue &&
+  if ((hasEpilogue || hasPostLoopTMemEpilogue) && !options.mergeEpilogue &&
       !options.mergeEpilogueToComputation) {
     layout.epiloguePartition = schedule.addPartition(0);
     layout.epiloguePartition->setType("epilogue");
@@ -1244,7 +1275,8 @@ static Partition *scheduleUsers(LoopLikeOpInterface loop,
 
 // Schedule post-loop operations (operations outside and after the loop) into
 // the appropriate partition. Epilogue store ops and their transitive users
-// (e.g., TMAStoreTokenWaitOp) go to the epilogue partition. All other post-loop
+// (e.g., TMAStoreTokenWaitOp) go to the epilogue partition, except that a TMA
+// reduce's token wait goes to its reduce's partition. All other post-loop
 // ops (e.g., tmem_load for accumulator reads, arithmetic for normalization) go
 // to the default partition. This prevents TMEM ops from landing in the
 // epilogue, which would force it to use 4 warps (TMEM lane coverage
@@ -1323,11 +1355,12 @@ schedulePostLoopOps(LoopLikeOpInterface loop, PartitionSet &schedule,
 
   SmallVector<OpOperand *> uses;
   // For persistent kernels, seed from nested inner loop results.
-  for (auto &op : *getLoopBodyBlock(loop))
-    if (auto innerLoop = dyn_cast<scf::ForOp>(op))
+  getLoopBodyRegion(loop).walk([&](scf::ForOp innerLoop) {
+    if (getEnclosingSupportedLoop(innerLoop) == loop)
       for (OpResult result : innerLoop.getResults())
         for (OpOperand &use : result.getUses())
           uses.push_back(&use);
+  });
   for (OpResult result : loop->getResults())
     for (OpOperand &use : result.getUses())
       uses.push_back(&use);
@@ -1347,7 +1380,13 @@ schedulePostLoopOps(LoopLikeOpInterface loop, PartitionSet &schedule,
 
     { // Schedule post-loop op (override earlier phase assignments)
       Partition *target = nullptr;
-      if (isEpilogueStoreOp(user)) {
+      if (isReduceTokenWait(user)) {
+        // Keep a reduce's token_wait with its reduce (see isReduceTokenWait);
+        // this walk has already scheduled the reduce.
+        auto ids = safeGetPartitionIds(user->getOperand(0).getDefiningOp());
+        target = ids.size() == 1 ? schedule.getPartition(ids[0])
+                                 : getEpilogueTarget(user);
+      } else if (isEpilogueStoreOp(user)) {
         target = getStoreTarget(user);
       } else {
         bool hasStoreInput = false;
@@ -1425,16 +1464,21 @@ preScheduleDpOps(SmallVector<CategorizedOp> &dpOps,
 static std::optional<ScheduleResult>
 getInitialSchedule(LoopLikeOpInterface mainLoop,
                    const SchedulingOptions &schedOpts) {
-  // Check for an existing schedule.
-  if (FailureOr<PartitionSet> scheduleOr = PartitionSet::fromLoop(mainLoop);
-      succeeded(scheduleOr))
-    // Deserialized schedule: layout/options unknown, use defaults.
-    return ScheduleResult{std::move(*scheduleOr),
-                          PartitionLayout{},
-                          schedOpts,
-                          DenseMap<Operation *, unsigned>(),
-                          DenseMap<unsigned, Partition *>(),
-                          /*createComputePartitions=*/true};
+  // A bare tt.warp_specialize marks a request for PSM to create a schedule;
+  // only stages + tag identify an already serialized schedule. Do not call
+  // fromLoop (and its strict verifier) on the expected unpartitioned input IR.
+  if (mainLoop->hasAttr(kPartitionStagesAttrName) &&
+      mainLoop->hasAttr(kWarpSpecializeTagAttrName)) {
+    if (FailureOr<PartitionSet> scheduleOr = PartitionSet::fromLoop(mainLoop);
+        succeeded(scheduleOr))
+      // Deserialized schedule: layout/options unknown, use defaults.
+      return ScheduleResult{std::move(*scheduleOr),
+                            PartitionLayout{},
+                            schedOpts,
+                            DenseMap<Operation *, unsigned>(),
+                            DenseMap<unsigned, Partition *>(),
+                            /*createComputePartitions=*/true};
+  }
 
   // Modulo path is authoritative for partitioning. If the loop was modulo-
   // scheduled (carries tt.modulo_ii) but fromLoop() above found no honorable
@@ -1450,10 +1494,15 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
     return std::nullopt;
   }
 
-  // Collect all loops (nested + main)
+  // Collect loops immediately nested in the main scheduling scope, including
+  // loops wrapped in collective control flow such as a per-tile bounds guard.
+  // Use nearest-loop ownership so loops nested in another loop are still
+  // handled only by that loop's schedule.
   SmallVector<LoopLikeOpInterface> loops;
-  for (scf::ForOp nestedLoop : getLoopBodyBlock(mainLoop)->getOps<scf::ForOp>())
-    loops.push_back(cast<LoopLikeOpInterface>(nestedLoop.getOperation()));
+  getLoopBodyRegion(mainLoop).walk([&](scf::ForOp nestedLoop) {
+    if (getEnclosingSupportedLoop(nestedLoop) == mainLoop)
+      loops.push_back(cast<LoopLikeOpInterface>(nestedLoop.getOperation()));
+  });
   loops.push_back(mainLoop);
 
   // Collect all MMAs
@@ -1757,7 +1806,8 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   if (mmas.empty() && layout.epilogueStorePartition) {
     for (auto loop : loops) {
       getLoopBodyRegion(loop).walk([&](Operation *op) {
-        if (isEpilogueStoreOp(op))
+        // A reduce's token_wait stays with its reduce (isReduceTokenWait).
+        if (isEpilogueStoreOp(op) && !isReduceTokenWait(op))
           tryScheduleOp(layout.epilogueStorePartition, op);
       });
     }
@@ -3037,6 +3087,33 @@ void PartitionSchedulingMeta::runOnOperation() {
                           result->layout.defaultPartition);
       fixupScalarPartitions();
 
+      // A store whose operands are not reachable from any partition (e.g. an
+      // epilogue store of a pointer-loaded value that does not depend on the
+      // accumulator) forms a cluster with no def partitions, which
+      // propagatePartitions skips. Left unscheduled, doTaskIdPropagate never
+      // tags its operand chain: the store is dropped, or, when it inherits a
+      // task through a shared mask, its hoisted pointer splat is captured into
+      // ttg.warp_specialize as a tensor (8-byte slot, full register struct
+      // written -> shared-memory overrun). Schedule such stores with the
+      // loop's other stores so task-id propagation reaches their operands.
+      {
+        Partition *storePartition = result->layout.defaultPartition;
+        getLoopBodyRegion(loop).walk([&](StoreOp store) {
+          SetVector<int> ids = safeGetPartitionIds(store);
+          if (ids.size() != 1)
+            return WalkResult::advance();
+          storePartition = schedule.getPartition(ids.front());
+          return WalkResult::interrupt();
+        });
+        if (storePartition) {
+          // Atomics are left alone: a tile-claim atomic must keep the full
+          // partition union (or make autoWS bail out). An unscheduled store,
+          // scalar or not, is dropped.
+          getLoopBodyRegion(loop).walk(
+              [&](StoreOp store) { tryScheduleOp(storePartition, store); });
+        }
+      }
+
       // Assign partition to TMAStoreTokenWaitOp ops that have no partition.
       // These arise from early TMA reduce lowering: the wait's token comes
       // from AsyncTMAReduceOp which was categorized as TMAReduction, but
@@ -3289,6 +3366,13 @@ void PartitionSchedulingMeta::runOnOperation() {
 
       if (estimatedTotal > kMaxWarps) {
         LDBG("Warp budget exceeded. Skipping warp specialization.");
+        loop->emitWarning()
+            << "skipping warp specialization: the partition schedule needs an "
+               "estimated "
+            << estimatedTotal << " warps (" << numPartitions
+            << " partitions, default partition " << defaultNumWarps
+            << " warps), above the limit of " << kMaxWarps
+            << "; the kernel is compiled without warp specialization";
         removeWarpSpecMetadata(funcOp);
         return;
       }
