@@ -42,9 +42,28 @@ module attributes {"ttg.num-warps" = 8 : i32} {
     // CHECK-DAG: %[[ADDR2:.*]] = llvm.select %[[P2]], %{{.*}}, %[[ADDR1]]
     // CHECK-DAG: %[[P3:.*]] = llvm.icmp "eq" %[[WARPID]], %{{.*}}
     // CHECK-DAG: %[[ADDR3:.*]] = llvm.select %[[P3]], %{{.*}}, %[[ADDR2]]
-    %0 = ttg.local_alloc : () -> !ttg.memdesc<96xi32, #shared, #smem, mutable>
-    %3 = proton_gpu.segment_alloc %0 : !ttg.memdesc<96xi32, #shared, #smem, mutable> -> !proton_gpu.segment<384, #smem, warp, [0, 1, 2]>
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<96x1xi32, #shared, #smem, mutable>
+    %3 = proton_gpu.segment_alloc %0 : !ttg.memdesc<96x1xi32, #shared, #smem, mutable> -> !proton_gpu.segment<384, #smem, warp, [0, 1, 2]>
     tt.return %3 : !proton_gpu.segment<384, #smem, warp, [0, 1, 2]>
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 1 : i32} {
+  // CHECK-LABEL: event_lowering
+  llvm.func @event_lowering() {
+    // CHECK-DAG: llvm.mlir.constant(2 : i32)
+    // CHECK-COUNT-2: st.shared.v2.b32
+    %buffer = ttg.local_alloc : () -> !ttg.memdesc<256xi32, #shared, #smem, mutable>
+    %segment = proton_gpu.segment_alloc %buffer : !ttg.memdesc<256xi32, #shared, #smem, mutable> -> !proton_gpu.segment<1024, #smem, warp>
+    %clock = arith.constant 123 : i32
+    proton_gpu.circular_store start %segment, %clock {eventType = 1 : i32, scopeId = 1 : i32} : !proton_gpu.segment<1024, #smem, warp>, i32
+    %token = arith.constant 1 : i32
+    proton_gpu.circular_store end %segment, %clock, %token : !proton_gpu.segment<1024, #smem, warp>, i32
+    llvm.return
   }
 }
 
@@ -114,6 +133,28 @@ module attributes {"ttg.num-warps" = 8 : i32} {
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: convert_predicated_circular_smem_store
+  llvm.func @convert_predicated_circular_smem_store(%pred: i1) {
+    // CHECK-DAG: %[[BASE_PRED:.*]] = llvm.icmp "ne" %{{.*}}, %{{.*}} : i32
+    // CHECK-DAG: %[[WARP_STORE_PRED:.*]] = llvm.and %[[BASE_PRED]], %{{.*}} : i1
+    // CHECK-DAG: %[[STORE_PRED:.*]] = llvm.and %[[WARP_STORE_PRED]], %arg0 : i1
+    // CHECK-DAG: %[[ADVANCE_PRED:.*]] = llvm.and %[[BASE_PRED]], %arg0 : i1
+    // CHECK-DAG: %[[NEXT_IDX:.*]] = llvm.select %[[ADVANCE_PRED]], %{{.*}}, %{{.*}} : i1, i32
+    // CHECK: llvm.store %[[NEXT_IDX]], %{{.*}} : i32, !llvm.ptr
+    // CHECK: llvm.inline_asm has_side_effects{{.*}}st.shared.v2.b32{{.*}}%[[STORE_PRED]] :
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<512xi32, #shared, #smem, mutable>
+    %3 = proton_gpu.segment_alloc %0 : !ttg.memdesc<512xi32, #shared, #smem, mutable> -> !proton_gpu.segment<2048, #smem, warp, [0, 1]>
+    %8 = proton_gpu.read_counter : i32
+    proton_gpu.circular_store start %3, %8 if %pred {scopeId = 1 : i32} : !proton_gpu.segment<2048, #smem, warp, [0, 1]>, i32
+    llvm.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
 module attributes {"ttg.num-warps" = 8 : i32, ttg.profile_scratch_memory_alignment = 128 : i32, ttg.profile_scratch_memory_size = 384 : i32} {
   // CHECK-LABEL: convert_smem_initialize
   // CHECK-DAG: llvm.cond_br %{{.*}}, ^bb1, ^bb2
@@ -133,7 +174,7 @@ module attributes {"ttg.num-warps" = 8 : i32, ttg.profile_scratch_memory_alignme
   // CHECK-DAG: %[[SMID_PTR:.*]] = llvm.getelementptr %{{.*}}[%[[SMID_OFFSET]]] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>
   // CHECK-DAG: llvm.store %[[SMID]], %[[SMID_PTR]] : i32, !llvm.ptr<1>
 
-  // CHECK-DAG: %[[INIT_TIME:.*]] = llvm.call_intrinsic "llvm.nvvm.read.ptx.sreg.globaltimer"() : () -> i64
+  // CHECK-DAG: %[[INIT_TIME:.*]] = nvvm.read.ptx.sreg.globaltimer : i64
   // CHECK-DAG: %[[INIT_TIME_OFFSET:.*]] = llvm.mlir.constant(4 : i32) : i32
   // CHECK-DAG: %[[INIT_TIME_PTR:.*]] = llvm.getelementptr %{{.*}}[%[[INIT_TIME_OFFSET]]] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>
   // CHECK-DAG: llvm.store %[[INIT_TIME]], %[[INIT_TIME_PTR]] : i64, !llvm.ptr<1>
@@ -158,7 +199,7 @@ module attributes {"ttg.num-warps" = 8 : i32, ttg.profile_scratch_memory_alignme
   // CHECK: llvm.cond_br %{{.*}}, ^bb1, ^bb2
   // CHECK: ^bb1: // pred: ^bb0
   // CHECK: llvm.store %{{.*}}, %{{.*}} : i32, !llvm.ptr<1>
-  // CHECK: llvm.call_intrinsic "llvm.nvvm.read.ptx.sreg.globaltimer"() : () -> i64
+  // CHECK: nvvm.read.ptx.sreg.globaltimer : i64
   // CHECK: llvm.store %{{.*}}, %{{.*}} : i64, !llvm.ptr<1>
   // CHECK: llvm.br ^bb2
   // CHECK: ^bb2: // 2 preds: ^bb0, ^bb1
@@ -179,7 +220,7 @@ module attributes {"ttg.num-warps" = 8 : i32, ttg.profile_scratch_memory_alignme
   // CHECK: ^[[POST]]:
   // CHECK: %{{.*}} = llvm.mlir.constant(8 : i32) : i32
   // CHECK: %[[POST_FINAL_TIME_PTR:.*]] = llvm.getelementptr %{{.*}}{{\[}}%{{.*}}{{\]}} : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, i32
-  // CHECK: %[[POST_FINAL_TIME:.*]] = llvm.call_intrinsic "llvm.nvvm.read.ptx.sreg.globaltimer"() : () -> i64
+  // CHECK: %[[POST_FINAL_TIME:.*]] = nvvm.read.ptx.sreg.globaltimer : i64
   // CHECK: llvm.store %[[POST_FINAL_TIME]], %[[POST_FINAL_TIME_PTR]] : i64, !llvm.ptr<1>
   // CHECK: llvm.br ^[[RET]]
   // CHECK: ^[[RET]]:

@@ -17,12 +17,21 @@
 // branch and slots between Stage 2 and Stage 4. The CUDA-style ctas_per_cga
 // path is supported because it keeps num-ctas == 1 and assigns a distinct
 // program id to each CTA. Triton's num-ctas > 1 path remains unsupported.
+//
+// The separate upstream clc=True path below lowers clc_try_cancel_sync to
+// low-level CLC for a single, unclustered CTA. It does not use these scheduler
+// stages; it can coexist with upstream warp specialization, but not Meta
+// AutoWS.
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "third_party/nvidia/include/Dialect/NVGPU/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -35,9 +44,11 @@ namespace nvidia_gpu {
 #define GEN_PASS_DEF_TRITONNVIDIAGPUCLCSPLITPASS
 #define GEN_PASS_DEF_TRITONNVIDIAGPUCLCHOISTPASS
 #define GEN_PASS_DEF_TRITONNVIDIAGPUCLCMATERIALIZEPASS
+#define GEN_PASS_DEF_TRITONNVIDIAGPULOWERCLCPASS
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
 
 namespace ttg = triton::gpu;
+namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace {
 
@@ -70,6 +81,30 @@ Value createClcResponseAlloc(OpBuilder &b, Location loc) {
 struct CLCSplitPass
     : public impl::TritonNvidiaGPUCLCSplitPassBase<CLCSplitPass> {
   void runOnOperation() override {
+    ModuleOp mod = getOperation();
+    // clc=True runs this pass once, before ToCLC, with a one-shot marker. Do
+    // not let the upstream conversion consume a kernel that already uses any
+    // fbtriton CLC op (whether high-level or low-level). The normal split pass
+    // later in the pipeline remains unchanged for tl.clc_tile_scheduler().
+    if (mod->hasAttr("ttg.verify-clc-opt-in")) {
+      bool foundCLC = false;
+      mod.walk([&](Operation *op) {
+        if (foundCLC)
+          return;
+        if (isa<CLCTryCancelSyncOp, CLCTryCancelOp, CLCLoadResultOp,
+                CLCIsCanceledOp, CLCGetProgramIdOp, CLCAdvanceOp,
+                CLCTryCancelAsyncOp, CLCReadOp>(op)) {
+          op->emitError("clc=True cannot be combined with existing CLC ops; "
+                        "use tl.clc_tile_scheduler() instead");
+          foundCLC = true;
+        }
+      });
+      if (foundCLC)
+        return signalPassFailure();
+      mod->removeAttr("ttg.verify-clc-opt-in");
+      return;
+    }
+
     MLIRContext *ctx = &getContext();
     auto tokTy = ttg::AsyncTokenType::get(ctx);
     SmallVector<Type> readTys{
@@ -295,6 +330,143 @@ struct CLCMaterializePass
     }
 
     return success();
+  }
+};
+
+// The clc=True route is restricted to one CTA. Use the existing fbtriton
+// one-CTA layout rather than constructing cluster-distributed CLC storage.
+static ttg::MemDescType getResponseType(MLIRContext *ctx) {
+  Attribute memorySpace = ttg::SharedMemorySpaceAttr::get(ctx);
+  auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(ctx, /*rank=*/1);
+  auto encoding =
+      ttg::SwizzledSharedEncodingAttr::get(ctx, 1, 1, 1, {0}, cgaLayout);
+  return ttg::MemDescType::get({2}, IntegerType::get(ctx, 64), encoding,
+                               memorySpace, /*mutableMemory=*/true);
+}
+
+static ttg::MemDescType getBarrierType(MLIRContext *ctx) {
+  Attribute memorySpace = ttg::SharedMemorySpaceAttr::get(ctx);
+  auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(ctx, /*rank=*/1);
+  auto encoding =
+      ttg::SwizzledSharedEncodingAttr::get(ctx, 1, 1, 1, {0}, cgaLayout);
+  return ttg::MemDescType::get({1}, IntegerType::get(ctx, 64), encoding,
+                               memorySpace,
+                               /*mutableMemory=*/true);
+}
+
+static LogicalResult lowerSite(ttng::CLCTryCancelSyncOp issue) {
+  auto oldLoop = issue->getParentOfType<scf::WhileOp>();
+  if (!oldLoop)
+    return issue.emitOpError("expected to be nested in an scf.while");
+  if (!issue.getResponse().hasOneUse())
+    return issue.emitOpError(
+        "expected response to have exactly one ttg.local_alloc user");
+  auto markerAlloc =
+      dyn_cast<ttg::LocalAllocOp>(*issue.getResponse().getUsers().begin());
+  if (!markerAlloc)
+    return issue.emitOpError("expected response user to be ttg.local_alloc");
+  if (!markerAlloc.getResult().hasOneUse())
+    return issue.emitOpError(
+        "expected response marker to have exactly one ttng.clc_load_result "
+        "user");
+  auto markerLoad = dyn_cast<ttng::CLCLoadResultOp>(
+      *markerAlloc.getResult().getUsers().begin());
+  if (!markerLoad)
+    return issue.emitOpError(
+        "expected response marker user to be ttng.clc_load_result");
+  MLIRContext *ctx = oldLoop.getContext();
+  auto loc = issue.getLoc();
+  OpBuilder builder(oldLoop);
+
+  auto response = ttg::LocalAllocOp::create(builder, loc, getResponseType(ctx),
+                                            Value(), 16);
+  auto barrier = ttg::LocalAllocOp::create(builder, loc, getBarrierType(ctx));
+  ttng::InitBarrierOp::create(builder, loc, barrier, 1);
+  auto phaseZero = arith::ConstantIntOp::create(builder, loc, 0, 32);
+  auto one = arith::ConstantIntOp::create(builder, loc, 1, 32);
+  auto pred = arith::ConstantIntOp::create(builder, loc, 1, 1);
+
+  SmallVector<Value> newOperands{phaseZero};
+  SmallVector<Type> newResultTypes{builder.getI32Type()};
+  auto loop = mlir::replaceWhileOpWithNewSignature(builder, oldLoop,
+                                                   newOperands, newResultTypes);
+  oldLoop.erase();
+
+  auto beforePhase = loop.getBeforeArguments().back();
+  loop.getConditionOp().getArgsMutable().append(beforePhase);
+
+  auto afterPhase = loop.getAfterArguments().back();
+  auto yield = loop.getYieldOp();
+  builder.setInsertionPoint(yield);
+  Value nextPhase =
+      arith::XOrIOp::create(builder, yield.getLoc(), afterPhase, one);
+  yield.getResultsMutable().append(nextPhase);
+
+  builder.setInsertionPoint(issue);
+  // fromCTA is added in upstream #10926, not yet in fbtriton.
+  ttng::BarrierExpectOp::create(builder, loc, barrier, 16, pred);
+  ttng::CLCTryCancelOp::create(builder, loc, response, barrier);
+
+  builder.setInsertionPoint(markerLoad);
+  ttng::WaitBarrierOp::create(builder, markerLoad.getLoc(), barrier, afterPhase,
+                              pred);
+  markerLoad.getSrcMutable().set(response);
+
+  markerAlloc.erase();
+  issue.erase();
+
+  builder.setInsertionPointAfter(loop);
+  ttng::InvalBarrierOp::create(builder, loop.getLoc(), barrier);
+  ttg::LocalDeallocOp::create(builder, loop.getLoc(), barrier);
+  ttg::LocalDeallocOp::create(builder, loop.getLoc(), response);
+  return success();
+}
+
+class TritonNvidiaGPULowerCLCPass
+    : public impl::TritonNvidiaGPULowerCLCPassBase<
+          TritonNvidiaGPULowerCLCPass> {
+public:
+  using Base =
+      impl::TritonNvidiaGPULowerCLCPassBase<TritonNvidiaGPULowerCLCPass>;
+  using Base::Base;
+
+  void runOnOperation() override {
+    ModuleOp mod = getOperation();
+    SmallVector<ttng::CLCTryCancelSyncOp> issues;
+    mod.walk([&](ttng::CLCTryCancelSyncOp issue) { issues.push_back(issue); });
+    if (issues.empty())
+      return;
+
+    // Only the upstream-generated WS path is supported. Meta AutoWS carries
+    // partition types on its WS op, while manually authored TLX WS is marked
+    // on the module before the automatic WS pass runs.
+    auto manualWS = mod->getAttrOfType<BoolAttr>("tlx.has_warp_spec_ops");
+    bool hasUnsupportedWS = manualWS && manualWS.getValue();
+    mod.walk([&](ttg::WarpSpecializeOp ws) {
+      hasUnsupportedWS |= ws->hasAttr(kPartitionTypesAttrName);
+    });
+    if (hasUnsupportedWS) {
+      issues.front().emitError("clc=True does not support Meta AutoWS or "
+                               "manually authored warp specialization; use "
+                               "tl.clc_tile_scheduler()");
+      return signalPassFailure();
+    }
+
+    auto dims = ttg::TritonGPUDialect::getClusterDims(mod);
+    for (ttng::CLCTryCancelSyncOp issue : issues) {
+      if (ttg::lookupNumCTAs(issue) != 1) {
+        issue.emitError("clc=True supports only num_ctas=1; use "
+                        "tl.clc_tile_scheduler() for clustered CLC");
+        return signalPassFailure();
+      }
+      if (dims[0] != 1 || dims[1] != 1 || dims[2] != 1) {
+        issue.emitError("clc=True does not support a physical CTA cluster; "
+                        "use tl.clc_tile_scheduler()");
+        return signalPassFailure();
+      }
+      if (failed(lowerSite(issue)))
+        return signalPassFailure();
+    }
   }
 };
 

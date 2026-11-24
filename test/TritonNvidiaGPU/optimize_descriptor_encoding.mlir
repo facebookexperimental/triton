@@ -1,5 +1,84 @@
-// RUN: triton-opt %s -split-input-file --triton-nvidia-optimize-descriptor-encoding | FileCheck %s
-// Test that gather/scatter are assigned swizzled encodings
+// RUN: triton-opt %s -split-input-file --triton-nvidia-optimize-descriptor-encoding | FileCheck %s --check-prefixes=CHECK,FP6
+// RUN: triton-opt %s -split-input-file --pass-pipeline='builtin.module(triton-nvidia-optimize-descriptor-encoding,triton-nvidia-optimize-descriptor-encoding)' | FileCheck %s --check-prefix=FP6
+// Test descriptor layout selection for TMA.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // FP6-DAG: #[[PACKED_BYTES:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8, padding = "b6p2x16"}>
+  // FP6-DAG: #[[PLAIN_BYTES:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
+  // FP6: tt.func private @fp6_descriptor_types(
+  // FP6-SAME: !tt.tensordesc<1x128xui8, #[[PACKED_BYTES]]>
+  // FP6-SAME: !tt.tensordesc<1x128xui8, #[[PLAIN_BYTES]]>) -> !tt.tensordesc<1x128xui8, #[[PACKED_BYTES]]>
+  tt.func private @fp6_descriptor_types(%fp6: !tt.tensordesc<1x128xf6E2M3FN>, %bytes: !tt.tensordesc<1x128xui8>) -> !tt.tensordesc<1x128xf6E2M3FN> {
+    tt.return %fp6 : !tt.tensordesc<1x128xf6E2M3FN>
+  }
+}
+
+// -----
+
+// Padded FP4 MMA layouts with small K cannot be used directly by TMA.
+// Load packed bytes with a legal layout and keep the padded consumer layout.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#padded = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8, fp4Padded = true}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-DAG: #[[PACKED:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
+  // CHECK-DAG: #[[PADDED:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8, fp4Padded = true}>
+  // CHECK: tt.func @fp4_padded_small_k32
+  // CHECK-SAME: !tt.tensordesc<128x16xi8, #[[PACKED]]>
+  tt.func @fp4_padded_small_k32(%desc: !tt.tensordesc<128x16xi8>) {
+    %c0 = arith.constant 0 : i32
+    // CHECK: %[[LOAD:.*]] = tt.descriptor_load {{.*}} : !tt.tensordesc<128x16xi8, #[[PACKED]]>
+    %v = tt.descriptor_load %desc[%c0, %c0] : !tt.tensordesc<128x16xi8> -> tensor<128x16xi8, #blocked>
+    // CHECK: ttg.local_alloc %[[LOAD]] {{.*}} -> !ttg.memdesc<128x16xi8, #[[PADDED]], #smem>
+    %s = ttg.local_alloc %v : (tensor<128x16xi8, #blocked>) -> !ttg.memdesc<128x16xi8, #padded, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#padded = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8, fp4Padded = true}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-DAG: #[[PACKED64:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
+  // CHECK-DAG: #[[PADDED64:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8, fp4Padded = true}>
+  // CHECK: tt.func @fp4_padded_small_k64
+  // CHECK-SAME: !tt.tensordesc<128x32xi8, #[[PACKED64]]>
+  tt.func @fp4_padded_small_k64(%desc: !tt.tensordesc<128x32xi8>) {
+    %c0 = arith.constant 0 : i32
+    // CHECK: %[[LOAD64:.*]] = tt.descriptor_load {{.*}} : !tt.tensordesc<128x32xi8, #[[PACKED64]]>
+    %v = tt.descriptor_load %desc[%c0, %c0] : !tt.tensordesc<128x32xi8> -> tensor<128x32xi8, #blocked>
+    // CHECK: ttg.local_alloc %[[LOAD64]] {{.*}} -> !ttg.memdesc<128x32xi8, #[[PADDED64]], #smem>
+    %s = ttg.local_alloc %v : (tensor<128x32xi8, #blocked>) -> !ttg.memdesc<128x32xi8, #padded, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+// The same rejection must apply when a shared_linear consumer is matched to
+// an equivalent padded NVMMA layout.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#padded_linear = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [0, 4], [0, 0], [0, 8], [0, 16], [1, 0], [2, 8], [4, 16], [8, 0], [16, 0], [32, 0], [64, 0]]}, alignment = 512>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-DAG: #[[PACKED_LINEAR:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
+  // CHECK-DAG: #[[PADDED_LINEAR:.*]] = #ttg.shared_linear<{{.*}}alignment = 512>
+  // CHECK: tt.func @fp4_padded_small_k64_shared_linear
+  // CHECK-SAME: !tt.tensordesc<128x32xi8, #[[PACKED_LINEAR]]>
+  tt.func @fp4_padded_small_k64_shared_linear(%desc: !tt.tensordesc<128x32xi8>) {
+    %c0 = arith.constant 0 : i32
+    // CHECK: %[[LOAD_LINEAR:.*]] = tt.descriptor_load {{.*}} : !tt.tensordesc<128x32xi8, #[[PACKED_LINEAR]]>
+    %v = tt.descriptor_load %desc[%c0, %c0] : !tt.tensordesc<128x32xi8> -> tensor<128x32xi8, #blocked>
+    // CHECK: ttg.local_alloc %[[LOAD_LINEAR]] {{.*}} -> !ttg.memdesc<128x32xi8, #[[PADDED_LINEAR]], #smem>
+    %s = ttg.local_alloc %v : (tensor<128x32xi8, #blocked>) -> !ttg.memdesc<128x32xi8, #padded_linear, #smem>
+    tt.return
+  }
+}
+
+// -----
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
@@ -311,6 +390,31 @@ tt.func public @scale_descriptor_arg_from_shared_linear_use(%arg0: !tt.tensordes
   %2 = ttg.memdesc_reshape %1 : !ttg.memdesc<1x2x1x32x16xi8, #shared_linear_scale_base, #smem, mutable> -> !ttg.memdesc<2x1x32x4x4xi8, #shared_linear_scale_rs, #smem, mutable>
   %3 = ttg.memdesc_trans %2 {order = array<i32: 0, 3, 2, 1, 4>} : !ttg.memdesc<2x1x32x4x4xi8, #shared_linear_scale_rs, #smem, mutable> -> !ttg.memdesc<2x4x32x1x4xi8, #shared_linear_scale_tr, #smem, mutable>
   %4 = ttg.memdesc_reshape %3 : !ttg.memdesc<2x4x32x1x4xi8, #shared_linear_scale_tr, #smem, mutable> -> !ttg.memdesc<256x4xi8, #shared_linear_scale_final, #smem, mutable>
+  tt.return
+}
+}
+
+// -----
+
+#offset_parent = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
+#offsets = #ttg.slice<{dim = 0, parent = #offset_parent}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-LABEL: @async_tma_gather
+// CHECK: tt.make_tensor_descriptor {{.*}} : !tt.ptr<f16>, !tt.tensordesc<1x128xf16, #shared>
+// CHECK: ttng.async_tma_gather {{.*}} : !tt.tensordesc<1x128xf16, #shared>
+tt.func public @async_tma_gather(%arg0: !tt.ptr<f16>, %arg1: i32, %arg2: tensor<32xi32, #offsets>) {
+  %c1_i64 = arith.constant 1 : i64
+  %stride = arith.extsi %arg1 : i32 to i64
+  %desc = tt.make_tensor_descriptor %arg0, [%arg1, %arg1], [%stride, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<1x128xf16>
+  %result = ttg.local_alloc : () -> !ttg.memdesc<32x128xf16, #shared, #smem, mutable>
+  %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  %c0_i32 = arith.constant 0 : i32
+  %true = arith.constant true
+  ttng.async_tma_gather %desc[%arg2, %c0_i32] %result, %bar, %true : !tt.tensordesc<1x128xf16>, tensor<32xi32, #offsets>, i32, !ttg.memdesc<1xi64, #barrier, #smem, mutable>, !ttg.memdesc<32x128xf16, #shared, #smem, mutable>, i1
   tt.return
 }
 }

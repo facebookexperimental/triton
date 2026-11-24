@@ -226,7 +226,8 @@ static void threadValuesThroughWait(ttng::WarpGroupDotWaitOp wait,
   // We can't use replaceWithNewOp because we're changing the number of return
   // values in the operation.
   auto newWait = ttng::WarpGroupDotWaitOp::create(
-      builder, wait.getLoc(), llvm::to_vector(newOperands), wait.getPendings());
+      builder, wait.getLoc(), llvm::to_vector(newOperands),
+      wait.getPendingsAttr(), wait.getWarpGroupLocalAttr());
 
   auto dominatedByNewWait = [&](OpOperand &operand) {
     auto opInThisBlock =
@@ -343,6 +344,11 @@ std::vector<ttng::WarpGroupDotOp> splitRSDot(ttng::WarpGroupDotOp dotOp) {
                     .getInstrShape()[2];
   // Nothing to split
   if (origK <= instrK) {
+    return {dotOp};
+  }
+  // splitLhs's reshape/trans/split chain infers binary layouts only, so a
+  // mixed-radix A stays one RS wgmma.
+  if (ttg::toLinearLayout(a.getType()).hasNonPow2OutDim()) {
     return {dotOp};
   }
   constexpr int numSplits = 2;
@@ -674,7 +680,8 @@ static void insertAsyncWarpGroupDotWaitInLoop(
 
       OpBuilder builder((*firstUse)->getOwner());
       auto newWait = ttng::WarpGroupDotWaitOp::create(
-          builder, asyncDot->getLoc(), ArrayRef<Value>{}, 0);
+          builder, asyncDot->getLoc(), ArrayRef<Value>{}, 0,
+          /*warpGroupLocal=*/true);
 
       SmallVector<Value> users;
       for (; firstUse != uses.end(); ++firstUse) {

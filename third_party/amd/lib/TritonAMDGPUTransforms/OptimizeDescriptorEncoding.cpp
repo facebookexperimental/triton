@@ -4,6 +4,7 @@
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/Pass/PassManager.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -18,6 +19,18 @@ using mlir::triton::amdgpu::TargetFeatures;
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace {
+
+static Attribute unwrapPinnedSharedLayout(Attribute encoding) {
+  while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
+    encoding = pinned.getPinnedLayout();
+  if (auto partitioned = dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding))
+    return ttg::PartitionedSharedEncodingAttr::get(
+        encoding.getContext(), partitioned.getNumPartitions(),
+        partitioned.getNumGroups(), partitioned.getPartitionDim(),
+        cast<ttg::SharedEncodingTrait>(
+            unwrapPinnedSharedLayout(partitioned.getPartitionLayout())));
+  return encoding;
+}
 
 // If all the transitive uses of the given value have are used by a convert to
 // the same dot operand encoding, return true and get the shared encoding that
@@ -147,6 +160,38 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
   SmallVector<Value> visited;
   Attribute desiredEncoding;
 
+  auto mergeEncoding = [&](ttg::MemDescType memoryType) {
+    Attribute encoding = unwrapPinnedSharedLayout(memoryType.getEncoding());
+    // TDM lowering uses the descriptor's partition mapping to select the LDS
+    // base and distribute work across waves. Keeping only its padded child
+    // would make the descriptor and the destination disagree physically.
+    encoding = getCompatibleSharedEncoding(encoding, memoryType.getShape(),
+                                           memoryType.getElementType());
+    if (!encoding)
+      return true;
+    // Compare descriptor encodings, not allocation types. A full tile and a
+    // slice of a larger allocation may require exactly the same descriptor.
+    // The TDM verifier separately checks that the tile's physical strides
+    // agree with the preserved allocation layout.
+    auto descTy = descriptor.getType();
+    // A descriptor whose tile does not split into the allocation's partition
+    // pieces (e.g. a rank-reducing one) cannot use its layout. Leave it to the
+    // fallback encoding; the TDM verifier then reports the mismatch.
+    if (auto partitioned =
+            dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding);
+        partitioned && !ttg::isPartitionedEncodingCompatibleWithShape(
+                           partitioned, descTy.getShape()))
+      return false;
+    auto tensorTy = RankedTensorType::get(descTy.getShape(),
+                                          descTy.getElementType(), encoding);
+    encoding = ttg::updateEncodingForShape(
+        nullptr, cast<ttg::SharedEncodingTrait>(encoding), tensorTy);
+    if (desiredEncoding && desiredEncoding != encoding)
+      return false;
+    desiredEncoding = encoding;
+    return true;
+  };
+
   while (!worklist.empty()) {
     Value value = worklist.pop_back_val();
     if (llvm::is_contained(visited, value))
@@ -173,11 +218,10 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
              llvm::zip_equal(fused.getDescs(), fused.getDests())) {
           if (desc != value)
             continue;
-          auto candidate = cast<ttg::MemDescType>(dest.getType());
-          if (memoryType && memoryType != candidate)
+          if (!mergeEncoding(cast<ttg::MemDescType>(dest.getType())))
             return {};
-          memoryType = candidate;
         }
+        continue;
       } else if (auto store =
                      dyn_cast<triton::amdgpu::AsyncTDMCopyLocalToGlobalOp>(
                          user)) {
@@ -196,21 +240,8 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
       if (!memoryType)
         continue;
 
-      Attribute encoding = memoryType.getEncoding();
-      while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
-        encoding = pinned.getPinnedLayout();
-      if (auto partitioned =
-              dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding))
-        encoding = partitioned.getPartitionLayout();
-      while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
-        encoding = pinned.getPinnedLayout();
-      encoding = getCompatibleSharedEncoding(encoding, memoryType.getShape(),
-                                             memoryType.getElementType());
-      if (!encoding)
-        continue;
-      if (desiredEncoding && desiredEncoding != encoding)
+      if (!mergeEncoding(memoryType))
         return {};
-      desiredEncoding = encoding;
     }
   }
 
@@ -222,7 +253,7 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::buildFallbackSharedEncoding(
     ttg::CGAEncodingAttr cgaLayout, Type elementType) {
   auto blockShapePerCTA =
       triton::gpu::getShapePerCTA(cgaLayout.getCTASplitNum(), shape);
-  auto elemWidth = elementType.getIntOrFloatBitWidth();
+  auto elemWidth = getIntOrFloatOrPtrBitWidth(elementType);
   unsigned padAmount = 128 / elemWidth;
   // Restrict pad interval (calculated from TDM descriptor's pad
   // interval field) Fallback to swizzled encoding if the interval
@@ -240,6 +271,8 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::buildFallbackSharedEncoding(
 
 bool AMDGPUAssignDescriptorMemoryLayouts::isCompatibleSharedEncoding(
     Attribute enc) {
+  if (auto partitioned = dyn_cast<ttg::PartitionedSharedEncodingAttr>(enc))
+    return isCompatibleSharedEncoding(partitioned.getPartitionLayout());
   return isa<ttg::PaddedSharedEncodingAttr, ttg::SwizzledSharedEncodingAttr>(
       enc);
 }
@@ -265,10 +298,9 @@ bool AMDGPUAssignDescriptorMemoryLayouts::isCompatibleSharedEncoding(
 //     scf.yield %di                    ; same encoding is propagated
 //   }
 //
-class TritonAMDGPUOptimizeDescriptorEncodingPass
-    : public impl::TritonAMDGPUOptimizeDescriptorEncodingBase<
+struct TritonAMDGPUOptimizeDescriptorEncodingPass
+    : impl::TritonAMDGPUOptimizeDescriptorEncodingBase<
           TritonAMDGPUOptimizeDescriptorEncodingPass> {
-public:
   void runOnOperation() override {
     mlir::ModuleOp m = getOperation();
 

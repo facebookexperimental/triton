@@ -1,0 +1,96 @@
+name: Set up TritonBench
+description: >-
+  Prepare a GPU runner to run TritonBench against the prebuilt Triton wheel. NVIDIA runners use
+  their pre-provisioned conda environment (SETUP_SCRIPT); MI350 builds a ROCm venv and a
+  TritonBench checkout. The tests run in the calling job's own step, so a failure here reads as
+  setup, not as a test failure.
+inputs:
+  platform:
+    description: h100, b200 or mi350
+    required: true
+  wheel-url:
+    required: true
+  wheel-filename:
+    required: true
+  wheel-sha256:
+    required: true
+runs:
+  using: composite
+  steps:
+    # NVIDIA: the runner's conda environment, activated by SETUP_SCRIPT in every step.
+    - name: Tune Nvidia GPU
+      if: inputs.platform != 'mi350'
+      shell: bash
+      run: |
+        sudo nvidia-smi -pm 1
+        sudo ldconfig
+        nvidia-smi
+    - name: Install torchao
+      if: inputs.platform == 'b200'
+      uses: ./.github/actions/install-torchao
+      with:
+        platform: b200
+        setup-script: ${{ env.SETUP_SCRIPT }}
+    - name: Install prebuilt Triton
+      if: inputs.platform != 'mi350'
+      uses: ./.github/actions/install-prebuilt-triton
+      env:
+        BASH_ENV: ${{ env.SETUP_SCRIPT }}
+      with:
+        wheel-url: ${{ inputs.wheel-url }}
+        wheel-filename: ${{ inputs.wheel-filename }}
+        wheel-sha256: ${{ inputs.wheel-sha256 }}
+    - name: Export TritonBench env
+      if: inputs.platform != 'mi350'
+      shell: bash
+      run: |
+        . "${SETUP_SCRIPT}"
+        set -x
+        TRITONBENCH_TRITON_COMMIT_HASH=$(git rev-parse --verify HEAD)
+        TRITONBENCH_TRITON_REPO=$(git config --get remote.origin.url | sed -E 's|.*github.com[:/](.+)\.git|\1|')
+        TRITONBENCH_TRITON_COMMIT=${GITHUB_REF_NAME}
+        TRITONBENCH_INSTALL_DIR=${PWD}
+        cat <<EOF >> "${SETUP_SCRIPT}"
+        if [ \${CONDA_ENV} == "${CONDA_ENV}" ] ; then
+            export TRITONBENCH_TRITON_COMMIT_HASH="${TRITONBENCH_TRITON_COMMIT_HASH}"
+            export TRITONBENCH_TRITON_REPO="${TRITONBENCH_TRITON_REPO}"
+            export TRITONBENCH_TRITON_COMMIT="${TRITONBENCH_TRITON_COMMIT}"
+            export TRITONBENCH_TRITON_INSTALL_DIR="${TRITONBENCH_INSTALL_DIR}"
+        fi
+        EOF
+
+    # MI350: a fresh ROCm venv and TritonBench checkout.
+    - name: Checkout TritonBench
+      if: inputs.platform == 'mi350'
+      uses: actions/checkout@v4
+      with:
+        repository: meta-pytorch/tritonbench
+        path: tritonbench
+        submodules: recursive
+    - name: Set up test environment
+      if: inputs.platform == 'mi350'
+      uses: ./.github/actions/setup-test-env
+      with:
+        backend: rocm
+        arch: gfx950
+    - name: Install TritonBench dependencies
+      if: inputs.platform == 'mi350'
+      shell: bash
+      working-directory: tritonbench
+      run: |
+        set -eux
+        # TritonBench owns its dependency list; on HIP, --all installs its
+        # AMD dependency group, liger and aiter into the active venv, pinning
+        # torch and numpy. TritonBench itself runs from this checkout.
+        # Must run after setup-test-env: with no torch in the venv,
+        # install.py installs its default PyTorch nightly instead, with
+        # device code for every GPU architecture. Triton is installed after
+        # it, so the prebuilt wheel's files are the ones the tests use.
+        python install.py --all
+    - name: Install prebuilt Triton
+      if: inputs.platform == 'mi350'
+      uses: ./.github/actions/install-prebuilt-triton
+      with:
+        wheel-url: ${{ inputs.wheel-url }}
+        wheel-filename: ${{ inputs.wheel-filename }}
+        wheel-sha256: ${{ inputs.wheel-sha256 }}

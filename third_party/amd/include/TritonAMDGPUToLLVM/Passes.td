@@ -3,6 +3,18 @@
 
 include "mlir/Pass/PassBase.td"
 
+def TritonAMDGPUMembar : Pass<"triton-amdgpu-membar", "mlir::ModuleOp"> {
+    let summary = "Insert AMD shared-memory synchronization before lowering";
+
+    let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                             "mlir::triton::amdgpu::TritonAMDGPUDialect"];
+
+    let options = [
+        Option<"gfxArch", "gfx-arch", "std::string", /*default*/"std::string{}",
+               "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
+    ];
+}
+
 def AllocateAMDGPUSharedMemory
     : Pass<"allocate-amdgpu-shared-memory", "mlir::ModuleOp"> {
   let summary = "Add metadata for shared memory allocation";
@@ -24,7 +36,7 @@ def ConvertTritonAMDGPUToLLVM
     : Pass<"convert-triton-amdgpu-to-llvm", "mlir::ModuleOp"> {
   let summary = "Convert TritonGPU to LLVM";
   let constructor =
-      "mlir::triton::createConvertTritonAMDGPUToLLVMPass(\"\", /*ftz=*/true)";
+      "mlir::triton::createConvertTritonAMDGPUToLLVMPass(\"\", /*ftz=*/true, /*enableTreeReduction=*/false)";
 
   let dependentDialects = ["mlir::arith::ArithDialect",
                            "mlir::math::MathDialect", "mlir::gpu::GPUDialect",
@@ -41,7 +53,26 @@ def ConvertTritonAMDGPUToLLVM
        Option<"enableTreeReduction", "enable-tree-reduction",
               "bool", /*default*/ "false",
               "use tree-shaped, vectorized in-thread reductions">,
+       Option<"cuMode", "cu-mode",
+              "bool", /*default*/ "false",
+              "the kernel runs in CU rather than WGP execution mode">,
   ];
+}
+
+def FinalizeScheduledMfmaOperands
+    : Pass<"triton-amdgpu-finalize-scheduled-mfma-operands", "mlir::ModuleOp"> {
+  let summary = "Finalize ordering of scheduled MFMA operand register pins";
+  let constructor = "mlir::triton::createFinalizeScheduledMfmaOperandsPass()";
+  let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+  let description = [{
+    Keep compiler-generated persistent MFMA operand pins pure through MLIR
+    canonicalization and CSE, then make the surviving pins side-effecting before
+    LLVM translation. This retains shared operands and their register-class
+    constraints, and orders the surviving pins at their post-CSE positions
+    before LLVM scheduling.
+    Only tagged operand pins are changed. Removing the marker makes subsequent
+    runs a no-op; result pins and commit finalization remain unchanged.
+  }];
 }
 
 def ConvertBuiltinFuncToLLVM

@@ -1,6 +1,7 @@
 import numpy
 import pytest
 import torch
+import triton.language as tl
 from collections import namedtuple
 from triton._C.libtriton import native_specialize_impl
 from triton.runtime.jit import MockTensor, JITCallable
@@ -8,6 +9,7 @@ from triton._utils import canonicalize_dtype
 from triton.backends.nvidia.compiler import CUDABackend
 from triton.backends.amd.compiler import HIPBackend
 from triton.language import constexpr
+from triton.language import target_info
 from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor as GluonTensorDescriptor
 from triton.experimental.gluon.language._layouts import NVMMASharedLayout
@@ -15,6 +17,14 @@ from triton.experimental.gluon.language._layouts import NVMMASharedLayout
 
 def mock_tensor_from_tensor(tensor):
     return MockTensor(tensor.dtype, tensor.shape)
+
+
+@pytest.mark.parametrize(
+    "shape", [None, (), (0, ), (7, ), (3, 5), (2, 3, 5), (2, 64, 8192, 128), (2, 0, 4), (0, 3, 0), (1, 3, 1, 7)])
+def test_mock_tensor_contiguous_strides(shape):
+    tensor = MockTensor(torch.float32, shape)
+    reference = torch.empty(tensor.shape, device="meta")
+    assert tensor.stride() == reference.stride()
 
 
 class MockJITCallable(JITCallable):
@@ -154,6 +164,17 @@ def gluon_tensordescriptors_to_specialize():
     ]
 
 
+def test_specialize_gluon_fp4_descriptor_without_active_target(monkeypatch):
+    monkeypatch.setattr(target_info, "current_target", lambda: None)
+    tensor = torch.empty((128, 128), dtype=torch.uint8)
+    layout = NVMMASharedLayout(128, 8, fp4_padded=True)
+
+    descriptor = GluonTensorDescriptor.from_tensor(tensor, [128, 64], layout)
+
+    assert native_specialize_impl(CUDABackend, descriptor, False, True,
+                                  True) == reference_specialize_impl(CUDABackend, descriptor, False, True, True)
+
+
 def mock_tensors_to_specialize():
     return [mock_tensor_from_tensor(tensor) for tensor in tensors_to_specialize()]
 
@@ -175,3 +196,21 @@ def test_specialize_impl(input_generator, backend, is_const, specialize_value, a
         result = native_specialize_impl(backend, arg, is_const, specialize_value, align)
         expected = reference_specialize_impl(backend, arg, is_const, specialize_value, align)
         assert result == expected
+
+
+@pytest.mark.parametrize("torch_name,dtype,canonical", [
+    ("float4_e2m1fn_x2", tl.float4e2m1x2, "fp4e2m1x2"),
+    ("float8_e8m0fnu", tl.float8e8m0fnu, "fp8e8m0fnu"),
+])
+def test_native_dtype_torch_contract(torch_name, dtype, canonical):
+    torch_dtype = getattr(torch, torch_name, None)
+    if torch_dtype is None:
+        pytest.skip(f"Torch does not expose {torch_name}")
+    storage = torch.arange(32, dtype=torch.uint8)
+    native = storage.view(torch_dtype)
+    assert canonicalize_dtype(torch_dtype) == canonicalize_dtype(dtype) == canonical
+    assert dtype.itemsize == torch_dtype.itemsize == 1
+    for backend in (CUDABackend, HIPBackend):
+        for value, name in ((storage, "u8"), (native, canonical), (storage, "u8"), (native, canonical)):
+            signature, _ = native_specialize_impl(backend, value, False, True, True)
+            assert signature == "*" + name

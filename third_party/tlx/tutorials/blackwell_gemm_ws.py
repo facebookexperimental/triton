@@ -79,7 +79,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                 "BLOCK_SIZE_M": 256,
                 "BLOCK_SIZE_N": 128,
                 "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                 "NUM_SMEM_BUFFERS": 2,
                 "NUM_TMEM_BUFFERS": 2,
                 "NUM_MMA_GROUPS": 2,
@@ -99,7 +99,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 128,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 2,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -115,7 +115,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 64,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 4,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -320,7 +320,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                 "BLOCK_SIZE_M": bm,
                 "BLOCK_SIZE_N": bn,
                 "BLOCK_SIZE_K": bk,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, bm),
+                "GROUP_SIZE_M": _select_group_size_m(M, N, bm, num_ctas),
                 "NUM_SMEM_BUFFERS": num_smem_buffers,
                 "NUM_TMEM_BUFFERS": num_tmem_buffers,
                 "NUM_MMA_GROUPS": num_mma_groups,
@@ -335,7 +335,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
     return best_config
 
 
-def _select_group_size_m(M, N, block_m):
+def _select_group_size_m(M, N, block_m, num_ctas=1):
     """
     Select GROUP_SIZE_M based on the golden rule for tile scheduling.
 
@@ -349,17 +349,21 @@ def _select_group_size_m(M, N, block_m):
     - When M ~ N: Use moderate GROUP_SIZE_M for L2 locality
     """
     num_m_tiles = (M + block_m - 1) // block_m
+    # The scheduler pads M tiles to whole clusters, so this is the effective
+    # grid size that GROUP_SIZE_M must not exceed.
+    num_m_tiles = (num_m_tiles + num_ctas - 1) // num_ctas * num_ctas
     ratio = M / max(N, 1)
 
     if ratio > 10:
-        # M >> N: sweep M, reuse B
-        return 1
+        # M >> N: sweep M, reuse B. A cluster must stay inside one group.
+        group_size = 1
     elif ratio < 0.1:
         # N >> M: sweep N, reuse A
-        return min(64, num_m_tiles)
+        group_size = min(64, num_m_tiles)
     else:
         # Balanced: moderate group size for L2 locality
-        return min(8, num_m_tiles)
+        group_size = min(8, num_m_tiles)
+    return max(num_ctas, math.ceil(group_size / num_ctas) * num_ctas)
 
 
 def get_cuda_autotune_config():
@@ -425,7 +429,8 @@ def matmul_tma_set_block_size_hook(nargs):
     if SPLIT_K > 1:
         M = nargs["M"]
         N = nargs["N"]
-        workspace = torch.empty((SPLIT_K * M, N), device=nargs["c_desc"].base.device, dtype=nargs["c_desc"].base.dtype)
+        rows = SPLIT_K * (-((-M) // BLOCK_M // NUM_CTAS) * NUM_CTAS * BLOCK_M)
+        workspace = torch.empty((rows, N), device=nargs["c_desc"].base.device, dtype=nargs["c_desc"].base.dtype)
         nargs["workspace_desc"].base = workspace
         nargs["workspace_desc"].shape = list(workspace.shape)
     else:
@@ -683,7 +688,6 @@ def _process_tile_epilogue_inner(
     num_pid_m,
     num_mn_tiles,
     GROUP_SIZE_M,
-    M,
     BLOCK_SIZE_M,
     BLOCK_SIZE_N,
     EPILOGUE_SUBTILE,
@@ -711,7 +715,8 @@ def _process_tile_epilogue_inner(
     if SPLIT_K > 1:
         split_id = tile_id // num_mn_tiles
         out_desc = workspace_desc
-        row_base = split_id * M
+        # Tile-grid stride, not M; mirrors the workspace row count.
+        row_base = split_id * num_pid_m * BLOCK_SIZE_M
     else:
         out_desc = c_desc
         row_base = 0
@@ -1101,11 +1106,14 @@ def _reduce_k_kernel(
     c_ptr,
     M,
     N,
+    ROWS_PER_SPLIT,
     SPLIT_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     OUTPUT_DTYPE: tl.constexpr,
 ):
+    # Row stride between splits: padded tile-grid height, not M. Callers derive
+    # it from the allocation.
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -1115,7 +1123,7 @@ def _reduce_k_kernel(
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for s in range(SPLIT_K):
-        ws_offs = base_offs + s * M * N
+        ws_offs = base_offs + s * ROWS_PER_SPLIT * N
         partial = tl.load(workspace_ptr + ws_offs, mask=mask, other=0.0)
         acc += partial.to(tl.float32)
 
@@ -1151,6 +1159,7 @@ def reduce_post_hook(nargs, exception=None):
             c,
             M,
             N,
+            workspace.shape[0] // split_k,
             SPLIT_K=split_k,
             BLOCK_SIZE_M=32,
             BLOCK_SIZE_N=32,
@@ -1258,7 +1267,6 @@ def matmul_kernel_tma_ws_blackwell(
 
     with tlx.async_tasks(
             exclusive=True,
-            no_ending_cluster_sync=True,
             mbarrier_try_wait_suspend_ns=50000,
     ):
         with tlx.async_task("default"):  # epilogue consumer
@@ -1310,7 +1318,6 @@ def matmul_kernel_tma_ws_blackwell(
                         num_pid_m=num_pid_m,
                         num_mn_tiles=num_mn_tiles,
                         GROUP_SIZE_M=GROUP_SIZE_M,
-                        M=M,
                         BLOCK_SIZE_M=BLOCK_SIZE_M,
                         BLOCK_SIZE_N=BLOCK_SIZE_N,
                         EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
@@ -1542,7 +1549,9 @@ def matmul(a, b, config=None):
         pre_hook = config.pop("pre_hook", None)
         split_k = config.get("SPLIT_K", 1)
         if split_k > 1:
-            workspace = torch.empty((split_k * M, N), device=a.device, dtype=a.dtype)
+            bm, nc = config["BLOCK_SIZE_M"], config.get("NUM_CTAS", 1)
+            rows = split_k * (-((-M) // bm // nc) * nc * bm)
+            workspace = torch.empty((rows, N), device=a.device, dtype=a.dtype)
             workspace_desc = TensorDescriptor(workspace, workspace.shape, workspace.stride(), dummy_block)
         else:
             workspace_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
@@ -1592,6 +1601,7 @@ def matmul(a, b, config=None):
                 c,
                 M,
                 N,
+                workspace_desc.base.shape[0] // split_k,
                 SPLIT_K=split_k,
                 BLOCK_SIZE_M=32,
                 BLOCK_SIZE_N=32,
@@ -1638,6 +1648,7 @@ def matmul(a, b, config=None):
                 c,
                 M,
                 N,
+                workspace.shape[0] // split_k,
                 SPLIT_K=split_k,
                 BLOCK_SIZE_M=32,
                 BLOCK_SIZE_N=32,

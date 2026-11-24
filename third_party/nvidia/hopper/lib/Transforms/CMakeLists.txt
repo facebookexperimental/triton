@@ -20,6 +20,7 @@ add_triton_library(TritonGPUModuloCore
   LINK_LIBS PUBLIC
   TritonIR
   TritonGPUIR
+  TritonNvidiaGPUIR
   MLIRTransformUtils
 )
 
@@ -35,7 +36,8 @@ add_triton_library(NVHopperTransforms
   Analyze2CTADependencies.cpp
   Plan2CTAExchange.cpp
   Materialize2CTAExchange.cpp
-  MultiCTAReduction.cpp
+  FormMultiCTACollectives.cpp
+  LowerClusterReduceToTTGIR.cpp
   WarpSpecialization.cpp
   WarpSpecialization/CodePartitionUtility.cpp
   WarpSpecialization/WSAtomicBroadcast.cpp
@@ -82,4 +84,5 @@ add_triton_library(NVHopperTransforms
   TritonGPUIR
   MLIRTransformUtils
   TritonGPUModuloCore
+  TritonNVIDIAGPUToLLVM
 )

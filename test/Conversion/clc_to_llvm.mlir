@@ -45,10 +45,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.clu
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: clc_load_result
-  tt.func @clc_load_result(%result: !ttg.memdesc<2xi64, #shared0, #smem>) {
+  tt.func private @clc_load_result(%result: !ttg.memdesc<2xi64, #shared0, #smem>) -> i128 {
     // CHECK: llvm.load %{{.*}} : !llvm.ptr<3> -> i128
     %res = ttng.clc_load_result %result : !ttg.memdesc<2xi64, #shared0, #smem> -> i128
-    tt.return
+    tt.return %res : i128
   }
 }
 
@@ -56,10 +56,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: clc_is_canceled
-  tt.func @clc_is_canceled(%clcRes: i128) {
-    // CHECK: clusterlaunchcontrol.query_cancel.is_canceled.pred.b128
+  tt.func private @clc_is_canceled(%clcRes: i128) -> i1 {
+    // CHECK: nvvm.clusterlaunchcontrol.query.cancel query = is_canceled, %arg0 : i1
     %is_canceled = ttng.clc_is_canceled %clcRes : i128 -> i1
-    tt.return
+    tt.return %is_canceled : i1
   }
 }
 
@@ -67,11 +67,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: clc_get_program_id_x
-  tt.func @clc_get_program_id_x(%clcResult: i128) {
-    // CHECK: clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128
+  tt.func private @clc_get_program_id_x(%clcResult: i128) -> i32 {
+    // CHECK: nvvm.clusterlaunchcontrol.query.cancel query = get_first_cta_id_x, %arg0 : i32
     // CHECK-NOT: sdiv
     %ctaid = ttng.clc_get_program_id %clcResult, x : i128 -> i32
-    tt.return
+    tt.return %ctaid : i32
   }
 }
 
@@ -79,12 +79,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: clc_get_program_id_x_multicta
-  tt.func @clc_get_program_id_x_multicta(%clcResult: i128) {
-    // CHECK: %[[ctaid:[^ ]*]] = {{.*}}clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128
-    // CHECK-NEXT: %[[four:.*]] = llvm.mlir.constant(4 : i32)
+  // CHECK-DAG: %[[four:.*]] = llvm.mlir.constant(4 : i32)
+  tt.func private @clc_get_program_id_x_multicta(%clcResult: i128) -> i32 {
+    // CHECK: %[[ctaid:[^ ]*]] = nvvm.clusterlaunchcontrol.query.cancel query = get_first_cta_id_x, %arg0 : i32
     // CHECK-NEXT: llvm.sdiv %[[ctaid]], %[[four]] : i32
     %ctaid = ttng.clc_get_program_id %clcResult, x : i128 -> i32
-    tt.return
+    tt.return %ctaid : i32
   }
 }
 
@@ -92,13 +92,13 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32} {
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 3 : i32, "ttg.cluster-dim-z" = 4 : i32} {
   // CHECK-LABEL: clc_get_program_id_x_explicit_cluster
-  tt.func @clc_get_program_id_x_explicit_cluster(%clcResult: i128) {
-    // CHECK: clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128
+  tt.func private @clc_get_program_id_x_explicit_cluster(%clcResult: i128) -> i32 {
+    // CHECK: nvvm.clusterlaunchcontrol.query.cancel query = get_first_cta_id_x, %arg0 : i32
     // CHECK: nvg.cluster_id
     // CHECK: llvm.urem
     // CHECK: llvm.add
     %ctaid = ttng.clc_get_program_id %clcResult, x : i128 -> i32
-    tt.return
+    tt.return %ctaid : i32
   }
 }
 
@@ -106,14 +106,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.clu
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 3 : i32, "ttg.cluster-dim-z" = 4 : i32} {
   // CHECK-LABEL: clc_get_program_id_y_explicit_cluster
-  tt.func @clc_get_program_id_y_explicit_cluster(%clcResult: i128) {
-    // CHECK: clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128
+  tt.func private @clc_get_program_id_y_explicit_cluster(%clcResult: i128) -> i32 {
+    // CHECK: nvvm.clusterlaunchcontrol.query.cancel query = get_first_cta_id_y, %arg0 : i32
     // CHECK: nvg.cluster_id
     // CHECK: llvm.udiv
     // CHECK: llvm.urem
     // CHECK: llvm.add
     %ctaid = ttng.clc_get_program_id %clcResult, y : i128 -> i32
-    tt.return
+    tt.return %ctaid : i32
   }
 }
 
@@ -121,14 +121,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.clu
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 3 : i32, "ttg.cluster-dim-z" = 4 : i32} {
   // CHECK-LABEL: clc_get_program_id_z_explicit_cluster
-  tt.func @clc_get_program_id_z_explicit_cluster(%clcResult: i128) {
-    // CHECK: clusterlaunchcontrol.query_cancel.get_first_ctaid::z.b32.b128
+  tt.func private @clc_get_program_id_z_explicit_cluster(%clcResult: i128) -> i32 {
+    // CHECK: nvvm.clusterlaunchcontrol.query.cancel query = get_first_cta_id_z, %arg0 : i32
     // CHECK: nvg.cluster_id
     // CHECK: llvm.udiv
     // CHECK: llvm.urem
     // CHECK: llvm.add
     %ctaid = ttng.clc_get_program_id %clcResult, z : i128 -> i32
-    tt.return
+    tt.return %ctaid : i32
   }
 }
 
@@ -136,10 +136,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.clu
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: clc_get_program_id_y
-  tt.func @clc_get_program_id_y(%clcResult: i128) {
-    // CHECK: clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128
+  tt.func private @clc_get_program_id_y(%clcResult: i128) -> i32 {
+    // CHECK: nvvm.clusterlaunchcontrol.query.cancel query = get_first_cta_id_y, %arg0 : i32
     %ctaid = ttng.clc_get_program_id %clcResult, y : i128 -> i32
-    tt.return
+    tt.return %ctaid : i32
   }
 }
 
@@ -147,9 +147,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: clc_get_program_id_z
-  tt.func @clc_get_program_id_z(%clcResult: i128) {
-    // CHECK: clusterlaunchcontrol.query_cancel.get_first_ctaid::z.b32.b128
+  tt.func private @clc_get_program_id_z(%clcResult: i128) -> i32 {
+    // CHECK: nvvm.clusterlaunchcontrol.query.cancel query = get_first_cta_id_z, %arg0 : i32
     %ctaid = ttng.clc_get_program_id %clcResult, z : i128 -> i32
+    tt.return %ctaid : i32
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: llvm.func @grid_dependencies
+  tt.func @grid_dependencies() {
+    // CHECK: nvvm.griddepcontrol wait
+    tt.grid_dependency_wait
+    // CHECK-NEXT: nvvm.griddepcontrol launch_dependents
+    tt.grid_dependency_launch_dependents
     tt.return
   }
 }

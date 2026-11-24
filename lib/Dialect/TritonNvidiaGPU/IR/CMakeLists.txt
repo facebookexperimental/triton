@@ -1,5 +1,6 @@
 add_triton_library(TritonNvidiaGPUIR
   Dialect.cpp
+  NamedBarrier.cpp
   TensorMemoryUtils.cpp
   NvmmaSmemAttrs.cpp
   Ops.cpp

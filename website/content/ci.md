@@ -6,14 +6,14 @@ failures are filed as issues automatically.
 
 | Workflow | Runner | Jobs |
 |----------|--------|------|
-| [`b200.yml`](.github/workflows/b200.yml) | `nvidia-dgx-b200` | `b200-meta-triton-test`, `b200-tlx-test`, `b200-gluon-test` |
-| [`h100.yml`](.github/workflows/h100.yml) | `linux-gcp-h100` | `h100-meta-triton-test`, `h100-tlx-test` |
-| [`mi350.yml`](.github/workflows/mi350.yml) | `linux-fb-triton-mi350-1` (gfx950 / CDNA4) | `mi350-meta-triton-test`, `mi350-tlx-test`, `mi350-gluon-test` |
+| [`b200.yml`](.github/workflows/b200.yml) | `nvidia-dgx-b200` | `b200-tritonbench-test`, `b200-tlx-test`, `b200-gluon-test` |
+| [`h100.yml`](.github/workflows/h100.yml) | `linux-gcp-h100` | `h100-tritonbench-test`, `h100-tlx-test` |
+| [`mi350.yml`](.github/workflows/mi350.yml) | `linux-fb-triton-mi350-1` (gfx950 / CDNA4) | `mi350-tritonbench-test`, `mi350-tlx-test`, `mi350-gluon-test` |
 | [`torchtlx.yml`](.github/workflows/torchtlx.yml) | `nvidia-dgx-b200`, `linux-fb-triton-mi350-1` | `b200-torchtlx-test`, `mi350-torchtlx-test` |
 
 What each job class runs:
 
-- **`*-meta-triton-test`** — TritonBench performance coverage, against
+- **`*-tritonbench-test`** — TritonBench performance coverage, against
   [meta-pytorch/tritonbench](https://github.com/meta-pytorch/tritonbench).
   Skips are listed in `.ci/tritonbench/fbtriton_skip_tests.yaml`.
 - **`*-tlx-test`** — TLX unit tests (`python/test/unit/language/test_tlx_*.py`),
@@ -77,7 +77,7 @@ runner, mirroring the H100 job in [`h100.yml`](.github/workflows/h100.yml):
   plus the tutorial correctness suite
   (`third_party/tlx/tutorials/testing/test_correctness.py`). AMD and IKBO cases
   run; Hopper/Blackwell and gfx1250 cases auto-skip via the arch gates.
-- **`mi350-meta-triton-test`** — TritonBench performance coverage (the AMD perf
+- **`mi350-tritonbench-test`** — TritonBench performance coverage (the AMD perf
   scripts in [TLX &rsaquo; Testing](testing.html) are for local runs;
   perf-regression tracking lives in TritonBench).
 

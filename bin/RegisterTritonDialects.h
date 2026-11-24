@@ -1,12 +1,14 @@
 #pragma once
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "amd/include/TritonAMDGPUTransforms/Passes.h"
+#include "amd/lib/TritonAMDGPUToLLVM/TargetInfo.h"
 #ifdef TRITON_ENABLE_CPU_BACKEND
 #include "cpu/include/TritonCPU/Registration.h"
 #endif
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
+#include "nvidia/lib/TritonNVIDIAGPUToLLVM/TargetInfo.h"
 #include "proton/Dialect/include/Conversion/ProtonGPUToLLVM/Passes.h"
 #include "proton/Dialect/include/Conversion/ProtonGPUToLLVM/ProtonAMDGPUToLLVM/Passes.h"
 #include "proton/Dialect/include/Conversion/ProtonGPUToLLVM/ProtonNvidiaGPUToLLVM/Passes.h"
@@ -26,7 +28,6 @@
 // Below headers will allow registration to ROCm passes
 #include "TritonAMDGPUToLLVM/Passes.h"
 #include "TritonAMDGPUTransforms/Passes.h"
-#include "TritonAMDGPUTransforms/TritonGPUConversion.h"
 
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -74,7 +75,13 @@ void registerTestScopeIdAllocationPass();
 } // namespace test
 } // namespace mlir
 
+namespace mlir::triton::AMD {
+void registerSchedulingBarrierExternalModel(mlir::DialectRegistry &registry);
+} // namespace mlir::triton::AMD
+
 inline void registerTritonDialects(mlir::DialectRegistry &registry) {
+  mlir::triton::NVIDIA::registerTargetInfo();
+  mlir::triton::AMD::registerTargetInfo();
   mlir::registerAllPasses();
   mlir::triton::registerTritonPasses();
   mlir::triton::gpu::registerTritonGPUPasses();
@@ -100,19 +107,21 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::gpu::registerCanonicalizeLLVMIR();
   mlir::triton::registerConvertWarpSpecializeToLLVM();
   mlir::triton::registerInitializeWSClusterBarriers();
+  mlir::triton::registerTritonNvidiaGPUMembar();
   mlir::triton::registerConvertTritonGPUToLLVMPass();
   mlir::triton::registerConvertNVGPUToLLVMPass();
   mlir::triton::registerAllocateSharedMemoryNvPass();
   mlir::triton::registerCudaWarningsPass();
   mlir::registerLLVMDIScope();
   mlir::LLVM::registerInlinerInterface(registry);
-  mlir::NVVM::registerInlinerInterface(registry);
   mlir::registerLLVMDILocalVariable();
 
   // TritonAMDGPUToLLVM passes
   mlir::triton::registerAllocateAMDGPUSharedMemory();
+  mlir::triton::registerTritonAMDGPUMembar();
   mlir::triton::registerTritonAMDGPUConvertWarpSpecializeToLLVM();
   mlir::triton::registerConvertTritonAMDGPUToLLVM();
+  mlir::triton::registerFinalizeScheduledMfmaOperands();
   mlir::triton::registerConvertBuiltinFuncToLLVM();
   mlir::triton::registerConvertWarpPipeline();
 
@@ -144,10 +153,12 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerTritonAMDGPUCoalesceAsyncCopy();
   mlir::registerTritonAMDGPUCoalesceBufferOps();
   mlir::registerTritonAMDGPUUpdateAsyncWaitCount();
+  mlir::registerTritonAMDGPUPreserveWarpPipelineOwners();
+  mlir::registerTritonAMDGPUNormalizeWarpPipeline();
   mlir::registerTritonAMDGPUWarpPipeline();
   mlir::registerTritonAMDFoldTrueCmpI();
   mlir::registerTritonAMDGPUFpSanitizer();
-  mlir::triton::amdgpu::registerTritonAMDGPUOptimizeDotOperands();
+  mlir::registerTritonAMDGPUOptimizeDotOperands();
   mlir::registerConSanAMDHooks();
 
   // NVWS passes
@@ -199,4 +210,8 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
       mlir::triton::proton::ProtonDialect,
       mlir::triton::proton::gpu::ProtonGPUDialect, mlir::ROCDL::ROCDLDialect,
       mlir::triton::gluon::GluonDialect, mlir::triton::tlx::TLXDialect>();
+
+  mlir::triton::AMD::registerSchedulingBarrierExternalModel(registry);
+  mlir::triton::gpu::registerNpotTargetLegality(registry);
+  mlir::triton::amdgpu::registerNpotTargetLegality(registry);
 }

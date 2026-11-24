@@ -1,0 +1,7 @@
+{
+  "operation": "gemm",
+  "vendor": "nvidia",
+  "architecture": "blackwell",
+  "aliases": ["b200", "b200a", "gb200", "gb300", "sm100", "sm_100"],
+  "cuda_major": 10
+}

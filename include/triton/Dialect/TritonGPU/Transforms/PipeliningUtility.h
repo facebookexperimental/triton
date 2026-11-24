@@ -79,9 +79,9 @@ Operation *wrapInMaskOp(RewriterBase &rewriter, Operation *op, Value pred);
 // lowering to predicated operations
 void resolveMaskOp(ModuleOp moduleOp);
 
-// Return true if the given ForOp has the attribute
+// Return true if the given loop has the attribute
 // `tt.disallow_acc_multi_buffer` set to true.
-bool getDisallowAccMultiBuffer(scf::ForOp forOp);
+bool getDisallowAccMultiBuffer(LoopLikeOpInterface loop);
 
 // Return the definition of the given value. If the value is a loop-carried
 // dependency, return the definition and the distance to it.
@@ -100,6 +100,10 @@ int getCopyVecBytes(RankedTensorType registerTy,
 
 bool canBeConvertedToAsyncLoad(
     triton::LoadOp loadOp, triton::ModuleAxisInfoAnalysis &axisInfoAnalysis);
+
+// Whether every op that pipelining `load` through shared memory creates, an
+// async copy and a local_load, lowers its layout on its target.
+bool canPipelineInSharedMemory(triton::LoadOp load);
 
 // Serialize the latencies of the operations in the loops into the latency
 // attribute.
@@ -126,6 +130,10 @@ Value createAlloc(Operation *insertBefore, RankedTensorType ty, Location loc,
 inline bool isTMALoad(Operation *op) {
   return isa<DescriptorLoadLikeOpInterface>(op);
 }
+
+// Return true if Tensor Descriptor load can satisfy TMA's
+// shared-memory address alignment requirement.
+bool canPipelineTMALoad(Operation *op);
 
 // Determine if the operation can be lowered to an async load.
 bool canBeAsyncLoad(Operation *op);
@@ -173,7 +181,8 @@ Value createIncrementModulo(OpBuilder &builder, Location loc, Value counter,
                             Value modulus, Value zero, Value one,
                             Value *outWrapCond = nullptr);
 
-scf::ForOp lowerTMADescriptors(scf::ForOp forOp, CoarseSchedule &schedule);
+LoopLikeOpInterface lowerTMADescriptors(LoopLikeOpInterface loop,
+                                        CoarseSchedule &schedule);
 
 DenseSet<Operation *>
 getTopLevelUsersInLoop(Operation *op, scf::ForOp forOp,

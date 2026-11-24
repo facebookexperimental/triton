@@ -8,12 +8,17 @@ import ctypes
 import sys
 from pathlib import Path
 from triton import knobs
+from triton._C.libtriton.gsan_testing import PER_DEVICE_STATE_STRIDE_BYTES as GSAN_PER_DEVICE_STATE_STRIDE
+from triton._instrumentation import is_enabled
 from triton.runtime.build import compile_module_from_src
 from triton.runtime import _allocation
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import (
     GPUDriver,
+    TensorDescABI,
     decompose_descriptor,
+    expand_signature,
+    get_kernel_argument_layout,
     wrap_handle_tensordesc_impl,
 )
 
@@ -36,7 +41,6 @@ PyKernelArg = None
 ARG_CONSTEXPR = None
 ARG_KERNEL = None
 ARG_TUPLE = None
-GSAN_PER_DEVICE_STATE_STRIDE = 1 << 30
 
 
 @functools.lru_cache()
@@ -153,6 +157,7 @@ class CudaUtils(object):
         self.get_current_device = mod.get_current_device
         self.set_current_device = mod.set_current_device
         self.get_default_stream = mod.get_default_stream
+        self.is_stream_capturing = mod.is_stream_capturing
         self.get_device_capability = mod.get_device_capability
         self.get_device_properties = mod.get_device_properties
         self.cuOccupancyMaxActiveClusters = mod.cuOccupancyMaxActiveClusters
@@ -196,10 +201,11 @@ def ty_to_cpp(ty):
         "u16": "uint16_t",
         "u32": "uint32_t",
         "u64": "uint64_t",
-        "fp16": "double",
-        "bf16": "double",
-        "fp32": "double",
-        "f32": "double",
+        # Pass 16-bit floating-point scalars as raw bit patterns.
+        "fp16": "uint16_t",
+        "bf16": "uint16_t",
+        "fp32": "float",
+        "f32": "float",
         "fp64": "double",
         "nvTmaDesc": "CUtensorMap",
     }[ty]
@@ -280,69 +286,6 @@ def build_kernel_signature_from_schema(schema):
             _flatten_schema_arg_type(ty, flat_types)
 
     return triton.runtime.driver.active.utils.build_signature_metadata(flat_types)
-
-
-def expand_signature(signature, tensordesc_meta):
-    output = []
-    tensordesc_idx = 0
-    # Expand tensor descriptor arguments into either nvTmaDesc, shape and
-    # strides, or base pointer, shape and strides depending on whether the
-    # kernel was lowered to use the nvTmaDesc or not.
-    for sig in signature:
-        if isinstance(sig, str) and sig.startswith("tensordesc"):
-            meta = tensordesc_meta[tensordesc_idx] if tensordesc_meta else None
-            tensordesc_idx += 1
-
-            match = re.match("tensordesc<([^[>]*)\\[([^]]*)\\]", sig)
-            dtype = match.group(1)
-            shape = match.group(2)
-            ndim = shape.count(",") + 1
-
-            if meta is None:
-                output.append("*" + dtype)
-                # Currently the host side tensor descriptors get passed in as a
-                # tensor desc, shape, and strides. We have no way to use these
-                # shape and strides when processing tensor descriptors which is
-                # why we provide our own decomposition above. Sadly this means
-                # we have to pass the shape and strides twice.
-                for _ in range(2 * ndim):
-                    output.append("i64")
-                output.append("i1")
-                output.append("i1")
-            else:
-                output.append("nvTmaDesc")
-
-            for _ in range(ndim):
-                output.append("i32")
-            for _ in range(ndim):
-                output.append("i64")
-        else:
-            output.append(sig)
-
-    assert not tensordesc_meta or tensordesc_idx == len(tensordesc_meta)
-    return output
-
-
-def make_kernel_signature(signature):
-    """
-    Creates a kernel signature in C to be able to efficiently extract
-    arguments in the launcher.
-    """
-
-    def _flatten_signature(sig, output):
-        # Flatten tuples
-        if isinstance(sig, tuple):
-            for x in sig:
-                _flatten_signature(x, output)
-        else:
-            output.append(sig)
-
-    flat_signature = []
-    for sig in signature:
-        _flatten_signature(sig, flat_signature)
-    kernel_signature = [x for x in flat_signature if x != "constexpr"]
-
-    return triton.runtime.driver.active.utils.build_signature_metadata(kernel_signature)
 
 
 def annotate_arguments(signature):
@@ -444,33 +387,38 @@ def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
     return wrap_handle_tensordesc_impl(launcher, signature, tensordesc_meta, make_tensordesc_arg)
 
 
-def wrap_handle_gsan(launcher):
-
-    def inner(*args):
-        import triton.experimental.gsan._allocator as gsan_allocator
-
-        device = triton.runtime.driver.active.get_current_device()
-        device_rank = gsan_allocator.get_device_rank(device)
-        gsan_state_ptr = gsan_allocator.get_global_state_pointer() + device_rank * GSAN_PER_DEVICE_STATE_STRIDE
-        return launcher(*args[:-1], (*args[-1], gsan_state_ptr))
-
-    return inner
-
-
 class CudaLauncher(object):
 
     def __init__(self, src, metadata):
-        constants = src.constants if hasattr(src, "constants") else dict()
-        arg_idx = lambda x: (src.fn.arg_names.index(x), ) if isinstance(x, str) else x
-        constants = {arg_idx(idx): value for idx, value in constants.items()}
-        signature = {idx: value for idx, value in src.signature.items()}
+        signature = dict(src.signature)
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
+        tensordesc_abi = TensorDescABI.CUDA_TMA if tensordesc_meta else TensorDescABI.DECOMPOSED
 
-        launcher = triton.runtime.driver.active.utils.launch
+        self.gsan_enabled = is_enabled(metadata, "gsan")
+        self.shared = metadata.shared
+        max_occupancy = getattr(metadata, "max_occupancy", None)
+        if max_occupancy is not None:
+            # Resolve device-dependent reservations here, keeping compilation
+            # independent of the current device and driver.
+            active_driver = triton.runtime.driver.active
+            device = active_driver.get_current_device()
+            properties = active_driver.utils.get_device_properties(device)
+            # Budget for max_occupancy CTAs, including the driver reservation.
+            # Ampere and newer allocate shared memory in 128-byte units. Round
+            # down before subtracting the reservation so all CTAs still fit.
+            shared_per_cta = properties["max_shared_mem_per_multiprocessor"] // max_occupancy
+            min_shared = shared_per_cta // 128 * 128 - properties["reserved_shared_mem_per_block"]
+            self.shared = max(self.shared, min_shared)
+        if self.gsan_enabled:
+            signature["_gsan_globals_ptr"] = "*i8"
+            signature["_gsan_launch_table_ptr"] = "*i8"
+            signature["_gsan_launch_index"] = "i64"
 
+        utils = triton.runtime.driver.active.utils
+        expanded_signature = expand_signature(signature.values(), tensordesc_abi)
         # kernel_signature + arg_annotations are both derived from the object
         # signature (src.signature): expand_signature flattens tensordescs, then
-        # make_kernel_signature / annotate_arguments walk the actual argument-type
+        # get_kernel_argument_layout / annotate_arguments walk the actual argument-type
         # OBJECTS via isinstance(...). A NamedTuple *is* a tuple, so it flattens
         # structurally like any other tuple -- no reliance on str(ty). Deriving the
         # signature from the Level 0 schema's stringified types is a repr blind
@@ -479,16 +427,11 @@ class CudaLauncher(object):
         # mis-flattens it. For every non-NamedTuple case this is byte-identical to
         # the old schema path (asserted by
         # test_launch_metadata.py::test_schema_derived_signature_matches_legacy).
-        expanded_signature = expand_signature(signature.values(), tensordesc_meta)
-        gsan_enabled = "gsan" in metadata.instrumentation_mode
-        if gsan_enabled:
-            expanded_signature.append("*i8")
-        self.kernel_signature = make_kernel_signature(expanded_signature)
+        self.kernel_signature = utils.build_signature_metadata(
+            [ty for _, ty in get_kernel_argument_layout(signature.values(), tensordesc_abi)])
         self.arg_annotations = annotate_arguments(expanded_signature)
-
-        if gsan_enabled:
-            launcher = wrap_handle_gsan(launcher)
-        self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
+        self.num_ctas = getattr(metadata, "num_ctas", 1)
+        self.launch = wrap_handle_tensordesc(utils.launch, signature, tensordesc_meta)
         # Compiler-synthesized auto-TMA descriptors (PromoteLoadToTMA): the
         # launcher builds each CUtensorMap host-side from existing scalar args
         # via the launch.h recipe core and injects it (no device global scratch).
@@ -552,6 +495,22 @@ class CudaLauncher(object):
         else:
             profile_scratch = allocate_default_profile_scratch(self.profile_scratch_size, self.profile_scratch_align)
 
+        kernel_args = args
+        if self.gsan_enabled:
+            if active_driver.utils.is_stream_capturing(stream):
+                raise RuntimeError("GSan does not support CUDA graph capture")
+
+            import triton.experimental.gsan._allocator as gsan_allocator
+            import triton.experimental.gsan._stream_sync as gsan_stream_sync
+
+            device = active_driver.get_current_device()
+            device_rank = gsan_allocator.get_device_rank(device)
+            gsan_state_ptr = gsan_allocator.get_global_state_pointer() + device_rank * GSAN_PER_DEVICE_STATE_STRIDE
+            launch_table, launch_index = gsan_stream_sync.get_launch_state(device, stream, self.launch_pdl)
+            kernel_args = (*args, gsan_state_ptr, launch_table, launch_index)
+
+        num_warps, num_ctas, _, *cluster_dims = kernel_metadata
+        kernel_metadata = (num_warps, num_ctas, self.shared, *cluster_dims)
         self.launch(
             gridX,
             gridY,
@@ -569,7 +528,7 @@ class CudaLauncher(object):
             self.arg_annotations,
             self.kernel_signature,
             self.auto_tma_recipes,
-            args,
+            kernel_args,
         )
 
 

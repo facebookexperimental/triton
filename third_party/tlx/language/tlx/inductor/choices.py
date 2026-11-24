@@ -10,12 +10,16 @@ super() when TLX is disabled (mode is None).
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, TYPE_CHECKING
 
 from torch._inductor import config
 from torch._inductor.choices import InductorChoices
+from torch._inductor.scheduler import BaseSchedulerNode, Scheduler, WhyNoFuse
 from torch._inductor.select_algorithm import ExternKernelChoice
+from torch.utils._ordered_set import OrderedSet
 
+from . import mm_templates as _mm_templates  # noqa: F401
 from . import tlx_config
 
 if TYPE_CHECKING:
@@ -27,6 +31,110 @@ if TYPE_CHECKING:
     from torch._inductor.kernel_template_choice import KernelTemplateChoice
 
 log = logging.getLogger(__name__)
+
+
+# NVIDIA warp-specialized GEMM templates whose compute_epilogue/TMA path
+# redirects intermediate stores into variable assignments and materializes
+# only the final result through a single TMA descriptor store.
+_TLX_WS_GEMM_TEMPLATE_NAMES = frozenset({
+    "tlx_blackwell_gemm_ws",
+    "tlx_hopper_gemm_ws",
+})
+
+_TLX_NO_EPILOGUE_FUSION_TEMPLATE_NAMES = frozenset(
+    template.name
+    for template in vars(_mm_templates).values()
+    if getattr(template, "tlx_manual_output", False)
+)
+
+
+def _template_name_from_choice(choice: object) -> str:
+    name = getattr(choice, "name", "")
+    base, separator, suffix = name.rpartition("_")
+    if separator and suffix.isdecimal() and base.startswith("triton_"):
+        return base.removeprefix("triton_")
+    return name
+
+
+def _has_tlx_ws_gemm_candidate(
+    node1: BaseSchedulerNode,
+    node2: BaseSchedulerNode,
+) -> bool:
+    """Whether the proposed fused group contains an affected TLX GEMM candidate.
+
+    Inspects every scheduler node in both groups so an already-fused producer
+    (GEMM plus earlier epilogue pointwise ops) is still detected. During
+    fusion search template nodes still wrap MultiTemplateBuffer (finalization
+    happens after fuse_nodes), so candidates are found in
+    ``template_node.choices``; a finalized single-choice TritonTemplateBuffer
+    is detected via its template name.
+    """
+    from torch._inductor import ir
+
+    for snode in (*node1.get_nodes(), *node2.get_nodes()):
+        if not snode.is_template():
+            continue
+        template_node = snode.get_template_node()
+        if template_node is None:
+            continue
+        if _is_tlx_ws_gemm_template(template_node):
+            return True
+    return False
+
+
+def _has_tlx_no_epilogue_fusion_candidate(
+    node1: BaseSchedulerNode,
+    node2: BaseSchedulerNode,
+) -> bool:
+    from torch._inductor import ir
+
+    for snode in (*node1.get_nodes(), *node2.get_nodes()):
+        if not snode.is_template():
+            continue
+        template_node = snode.get_template_node()
+        if template_node is None:
+            continue
+        if isinstance(template_node, ir.MultiTemplateBuffer):
+            if any(
+                _template_name_from_choice(choice)
+                in _TLX_NO_EPILOGUE_FUSION_TEMPLATE_NAMES
+                for choice in template_node.choices
+            ):
+                return True
+        ktc = getattr(template_node, "annotations", {}).get("ktc")
+        template = getattr(ktc, "template", None)
+        if getattr(template, "name", None) in _TLX_NO_EPILOGUE_FUSION_TEMPLATE_NAMES:
+            return True
+    return False
+
+
+def _is_tlx_ws_gemm_template(template_node: object) -> bool:
+    """Whether an IR template buffer is backed by an affected TLX WS GEMM template.
+
+    Covers both scheduler phases: a MultiTemplateBuffer (max-autotune choice
+    not yet finalized; candidates in ``choices`` whose ChoiceCaller names embed
+    the template uid with affixes, e.g. "triton_tlx_blackwell_gemm_ws_0") and
+    a single-choice TritonTemplateBuffer (carries the originating
+    KernelTemplateChoice in ``annotations["ktc"]``, whose ``template.name`` is
+    the exact template uid).
+    """
+    from torch._inductor import ir
+
+    if isinstance(template_node, ir.MultiTemplateBuffer):
+        return any(
+            isinstance(getattr(choice, "name", ""), str)
+            and any(
+                template_name in choice.name
+                for template_name in _TLX_WS_GEMM_TEMPLATE_NAMES
+            )
+            for choice in template_node.choices
+        )
+    ktc = getattr(template_node, "annotations", {}).get("ktc")
+    template = getattr(ktc, "template", None)
+    if isinstance(getattr(template, "name", None), str):
+        return template.name in _TLX_WS_GEMM_TEMPLATE_NAMES
+    template = getattr(template_node, "template", None)
+    return getattr(template, "name", None) in _TLX_WS_GEMM_TEMPLATE_NAMES
 
 
 class TLXInductorChoices(InductorChoices):
@@ -42,6 +150,81 @@ class TLXInductorChoices(InductorChoices):
     def uuid(self) -> str:
         return "TLXInductorChoices"
 
+    def can_fuse_vertical(
+        self,
+        scheduler: Scheduler,
+        node1: BaseSchedulerNode,
+        node2: BaseSchedulerNode,
+        shared_data_score: int,
+    ) -> bool:
+        """Veto fusing consumers into a TLX WS GEMM with a live intermediate.
+
+        The TLX compute_epilogue/TMA path redirects intermediate stores into
+        variable assignments and materializes only the final result, so every
+        producer write that would cease being materialized must be removable
+        through fusion (no users outside the proposed fused group, e.g. a
+        buffer saved for backward). Otherwise the GEMM output stays
+        materialized and the pointwise work runs separately.
+
+        node2 may keep at most one live write: it becomes the single TMA store
+        target and is materialized even when it is a graph output. A second
+        live write (e.g. a GELU-backward epilogue that also recomputes gelu(x)
+        for a wgrad) would be dropped.
+
+        This hook is graph-level, not per-candidate: a proposed group
+        containing an affected TLX GEMM candidate is conservatively rejected
+        even if another candidate (extern/cuBLAS or the ordinary
+        pointer-store variant) could preserve the intermediate. That is a
+        deliberate performance tradeoff (a missed fusion, never wrong code);
+        per-choice filtering and multi-output TMA support are follow-ups.
+
+        Applies in both "allow" and "force" modes: should_force_fusion only
+        gates benchmark-time forcing, not this scheduler legality check.
+        """
+        if not super().can_fuse_vertical(scheduler, node1, node2, shared_data_score):
+            return False
+        if config.triton.tlx_mode is None:
+            return True
+        if _has_tlx_no_epilogue_fusion_candidate(node1, node2):
+            return False
+        if not _has_tlx_ws_gemm_candidate(node1, node2):
+            return True
+        from torch._inductor.dependencies import Dep
+
+        fused_node_names = OrderedSet(
+            node.get_name() for node in (*node1.get_nodes(), *node2.get_nodes())
+        )
+        live = {}
+        for node in (node1, node2):
+            live[node] = []
+            for dep in node.read_writes.writes:
+                if not isinstance(dep, Dep):
+                    continue
+                write_name = scheduler.mutation_renames.get(dep.name, dep.name)
+                if write_name not in scheduler.name_to_buf:
+                    WhyNoFuse(node1, node2)(
+                        "TLX WS GEMM epilogue would drop unknown buffer %s",
+                        write_name,
+                    )
+                    return False
+                if not scheduler.can_buffer_be_removed_through_fusion(
+                    write_name, fused_node_names
+                ):
+                    live[node].append(write_name)
+        if live[node1]:
+            WhyNoFuse(node1, node2)(
+                "TLX WS GEMM epilogue would drop live intermediate %s",
+                live[node1][0],
+            )
+            return False
+        if len(live[node2]) > 1:
+            WhyNoFuse(node1, node2)(
+                "TLX WS GEMM epilogue stores one output, not %s",
+                live[node2],
+            )
+            return False
+        return True
+
     def _finalize_template_configs(
         self,
         template_choices: dict[str, Generator[KernelTemplateChoice, None, None]],
@@ -51,14 +234,55 @@ class TLXInductorChoices(InductorChoices):
         kwarg_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> list[KernelTemplateChoice]:
         if config.triton.tlx_mode == "force":
-            # In force mode, keep only TLX templates
-            return [
+            tlx_choices = [
                 c for uid, gen in template_choices.items() if "tlx_" in uid for c in gen
             ]
+            if tlx_choices:
+                return tlx_choices
 
         return super()._finalize_template_configs(
             template_choices, kernel_inputs, templates, op_name, kwarg_overrides
         )
+
+    _GFX942_PERSISTENT_INNER_RNUMEL = 4096
+
+    @staticmethod
+    def _gfx942_persistent_override(features, cooperative_reduction: bool) -> bool:
+        from torch._inductor.runtime.hints import ReductionHint
+        from torch._inductor.virtualized import V
+
+        from .registry import _is_gfx942
+
+        if not (
+            tlx_config.gfx942_persistent_inner_reductions
+            and config.triton.tlx_mode is not None
+            and config.triton.persistent_reductions
+            and not cooperative_reduction
+            and features.get_reduction_hint() == ReductionHint.INNER
+            and _is_gfx942()
+            and V.graph.sizevars.statically_known_leq(
+                features.reduction_numel,
+                TLXInductorChoices._GFX942_PERSISTENT_INNER_RNUMEL,
+            )
+        ):
+            return False
+        rblock = features.strict_reduction_rblock()
+        if rblock is not None and not features.has_strict_multirow_reduction():
+            return V.graph.sizevars.statically_known_geq(rblock, features.reduction_numel)
+        return True
+
+    @staticmethod
+    def persistent_only_by_tlx(features, cooperative_reduction: bool) -> bool:
+        """Persistent because of the gfx942 override, where Inductor alone would loop."""
+        return TLXInductorChoices._gfx942_persistent_override(
+            features, cooperative_reduction
+        ) and not InductorChoices.should_use_persistent_reduction(features, cooperative_reduction)
+
+    @staticmethod
+    def should_use_persistent_reduction(features, cooperative_reduction: bool) -> bool:
+        if TLXInductorChoices._gfx942_persistent_override(features, cooperative_reduction):
+            return True
+        return InductorChoices.should_use_persistent_reduction(features, cooperative_reduction)
 
     def customize_fused_kernel_name(self, fused_name: str, src_code: str) -> str:
         from .fusion import maybe_add_tlx_prefix
@@ -81,11 +305,10 @@ class TLXInductorChoices(InductorChoices):
             return True
         return super()._need_to_fix_layout(adjusted_choices, op_name)
 
-    # Ops that use prefix_args (bias passed separately from mat1/mat2).
-    # The blackwell WS template only supports plain mm (2 named kernel args: A, B),
-    # so skip TLX injection for these ops. addmm IS supported: the AMD warp-pipe
-    # template handles the bias epilogue (prefix_args=1), injected via append_tlx.
-    _UNSUPPORTED_OPS = frozenset({"baddbmm"})
+    # The Blackwell template accepts only the two plain-mm inputs. baddbmm has a
+    # bias prefix argument, while scaled_mm has two additional scale arguments.
+    # AMD addmm remains supported by its warp-pipe template.
+    _UNSUPPORTED_OPS = frozenset({"baddbmm", "scaled_mm"})
 
     def get_template_configs(
         self,
@@ -100,11 +323,11 @@ class TLXInductorChoices(InductorChoices):
                 kernel_inputs, templates, op_name, kwarg_overrides
             )
 
-        from .mm_templates import append_tlx
+        from .mm_templates import append_tlx, tlx_kernel_inputs
 
         templates = list(templates)
         kwarg_overrides = kwarg_overrides or {}
-        append_tlx(templates, op_name)
+        append_tlx(templates, op_name, kernel_inputs)
 
         input_tensors = kernel_inputs.nodes()
         if len(input_tensors) < 2:
@@ -112,7 +335,8 @@ class TLXInductorChoices(InductorChoices):
 
         template_choices = {
             t.uid: self.get_ktc(
-                kernel_inputs, t, op_name, kwarg_overrides.get(t.uid, {})
+                tlx_kernel_inputs(t, kernel_inputs, op_name), t, op_name,
+                kwarg_overrides.get(t.uid, {})
             )
             for t in templates
         }
@@ -153,7 +377,7 @@ class TLXInductorChoices(InductorChoices):
     ) -> list[Any]:
         from .flex_attention_templates import append_tlx_flex
 
-        append_tlx_flex(
+        return append_tlx_flex(
             choices,
             configs,
             input_nodes,
@@ -163,7 +387,33 @@ class TLXInductorChoices(InductorChoices):
             sparse_q_block_size,
             sparse_kv_block_size,
         )
-        return choices
+
+    def append_flex_attention_backward_choices(
+        self,
+        choices: list[Any],
+        configs: list[Any],
+        input_nodes: list[Any],
+        subgraphs: list[Any],
+        layout: Any,
+        kernel_options: dict[str, Any],
+        sparse_q_block_size: int,
+        sparse_kv_block_size: int,
+        *,
+        mutated_inputs: list[Any],
+    ) -> list[Any]:
+        from .flex_attention_templates import append_tlx_flex_backward
+
+        return append_tlx_flex_backward(
+            choices,
+            configs,
+            input_nodes,
+            subgraphs,
+            layout,
+            kernel_options,
+            sparse_q_block_size,
+            sparse_kv_block_size,
+            mutated_inputs=mutated_inputs,
+        )
 
 
 def maybe_override_best_choice(
@@ -175,9 +425,17 @@ def maybe_override_best_choice(
     beats them by a meaningful margin. Short autotuning benchmarks are noisy
     and TLX can narrowly "win" but run slower in steady-state.
 
+    In "force" mode, pick the fastest TLX choice over any non-TLX winner.
+
     Returns the (possibly overridden) best choice.
     """
     from .fusion import _is_tlx_choice
+
+    if config.triton.tlx_mode == "force" and not _is_tlx_choice(best_choice):
+        # tuned_addmm adds its ATen choices in a get_template_configs call of their
+        # own, so _finalize_template_configs never sees them beside the TLX ones.
+        tlx_choices = [c for c in timings if _is_tlx_choice(c) and math.isfinite(timings[c])]
+        return min(tlx_choices, key=lambda c: timings[c]) if tlx_choices else best_choice
 
     if config.triton.tlx_mode != "allow" or not _is_tlx_choice(best_choice):
         return best_choice

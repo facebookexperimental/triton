@@ -130,6 +130,25 @@ def TritonGPUAutomaticWarpSpecialization : Pass<"tritongpu-automatic-warp-specia
   ];
 }
 
+def TritonGPUNormalizeWSWhileLoops : Pass<"tritongpu-normalize-ws-while-loops", "mlir::ModuleOp"> {
+  let summary = "normalize while loops used by warp specialization";
+
+  let description = [{
+    For CLC `scf.while` operations, promotes `tt.warp_specialize` from one or
+    more direct sibling `scf.for` operations to the enclosing loop. Then
+    normalizes every `scf.while` nested in a warp-specialized loop to use
+    matching state and result signatures.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect"
+  ];
+}
+
 def TritonGPUPartitionLoops : Pass<"tritongpu-partition-loops", "mlir::ModuleOp"> {
   let summary = "split scheduled loops into `ttg.warp_specialize`";
 
@@ -244,7 +263,8 @@ def TritonGPUAccelerateMatmul : Pass<"tritongpu-accelerate-matmul", "mlir::Modul
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
-                           "mlir::triton::TritonDialect"];
+                           "mlir::triton::TritonDialect",
+                           "mlir::math::MathDialect"];
 }
 
 def TritonGPUOptimizeDotOperands : Pass<"tritongpu-optimize-dot-operands", "mlir::ModuleOp"> {
@@ -309,9 +329,12 @@ def TritonGPURemoveLayoutConversions : Pass<"tritongpu-remove-layout-conversions
   let options = [
     Option<"smemBudget", "smem-budget", "unsigned", /*default=*/"0",
            "When nonzero, override layout choices whose convert_layout "
-           "scratch would push shared memory usage above this budget (bytes)">
+           "scratch would push shared memory usage above this budget (bytes)">,
+    Option<"disableRematSplitting", "disable-remat-splitting",
+           "bool", /*default*/"false",
+           "prevent rematerialization from splitting or duplicating "
+           "convert-layout work">
   ];
-
 }
 
 def TritonGPUOptimizeThreadLocality : Pass<"tritongpu-optimize-thread-locality", "mlir::ModuleOp"> {

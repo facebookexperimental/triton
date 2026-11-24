@@ -26,14 +26,17 @@ add_triton_library(TritonGPUTransforms
   Pipeliner/PipeliningUtility.cpp
   Pipeliner/Schedule.cpp
   Prefetch.cpp
+  PtxInterpUtils.cpp
   RemoveLayoutConversions.cpp
   ReorderInstructions.cpp
   CoalesceAsyncCopy.cpp
+  TargetInfo.cpp
   Utility.cpp
   CoalesceUtils.cpp
   LayoutPropagationUtility.cpp
   WarpSpecialization/AutomaticWarpSpecialization.cpp
   WarpSpecialization/LoadMMASpecialization.cpp
+  WarpSpecialization/NormalizeWSWhileLoops.cpp
   WarpSpecialization/Partition.cpp
   WarpSpecialization/OptimizePartitionWarps.cpp
   WarpSpecialization/PartitionBuilder.cpp

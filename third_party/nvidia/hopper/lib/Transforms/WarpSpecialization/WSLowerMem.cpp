@@ -59,7 +59,7 @@ static bool isValidTMADestEncoding(Attribute bufferEnc, Attribute descEnc) {
   return descNvmma && descNvmma.getTransposed() == nvmma.getTransposed() &&
          descNvmma.getSwizzlingByteWidth() == nvmma.getSwizzlingByteWidth() &&
          descNvmma.getElementBitWidth() == nvmma.getElementBitWidth() &&
-         descNvmma.getFp4Padded() == nvmma.getFp4Padded();
+         descNvmma.getPadding() == nvmma.getPadding();
 }
 
 static bool isScheduleRematerialization(Operation *op) {
@@ -119,6 +119,64 @@ getTMAWritableEncoding(tt::DescriptorLoadOp load, RankedTensorType tensorType,
     return loweredEnc;
 
   return std::nullopt;
+}
+
+// Scope: MMAv5 operands whose shared-memory copy is written by the MMA's own
+// partition from a descriptor load or gather.
+//  - An alloc with no async task is outside the warp-specialized loop: it is
+//    written once before the partitions start, so it cannot race.
+//  - Pointer-load (tt.load) sources are not checked. A persistent MMAv5 GEMM
+//    with pointer-load operands currently fails in code partitioning
+//    (handleOperandD asserts) before it could race; revisit this check once
+//    that compiles.
+//  - Hopper warp_group_dot is not affected: WGMMAPipeline keeps a dot
+//    synchronous (warp_group_dot_wait 0) unless its shared operands are
+//    multi-buffered or loop-invariant, so a register-staged operand is never
+//    overwritten while a wgmma still reads it.
+bool hasRegisterStagedMMAOperand(triton::FuncOp funcOp) {
+  bool found = false;
+  funcOp.walk([&](ttng::MMAv5OpInterface mma) {
+    SmallVector<AsyncTaskId> mmaTasks = getAsyncTaskIds(mma);
+    for (Value operand : {mma.getA(), mma.getB()}) {
+      while (auto trans = operand.getDefiningOp<ttg::MemDescTransOp>())
+        operand = trans.getSrc();
+      auto alloc = operand.getDefiningOp<ttg::LocalAllocOp>();
+      if (!alloc || !alloc.getSrc())
+        continue;
+      if (!llvm::any_of(getAsyncTaskIds(alloc), [&](AsyncTaskId id) {
+            return llvm::is_contained(mmaTasks, id);
+          }))
+        continue;
+      Value src = alloc.getSrc();
+      while (auto cvt = src.getDefiningOp<ttg::ConvertLayoutOp>())
+        src = cvt.getSrc();
+      // A gather is never lowered to a TMA copy into its alloc, so the alloc
+      // is always filled from registers.
+      if (src.getDefiningOp<tt::DescriptorGatherOp>()) {
+        found = true;
+        return WalkResult::interrupt();
+      }
+      auto load = src.getDefiningOp<tt::DescriptorLoadOp>();
+      if (!load)
+        continue;
+      // Mirror doConvertDescriptorLoadsToNVWS: the TMA copy lands in the alloc
+      // only when the alloc is the load's sole user and a legal destination.
+      auto tensorType = dyn_cast<RankedTensorType>(load.getType());
+      Attribute descEnc =
+          cast<tt::TensorDescType>(load.getDesc().getType()).getSharedLayout();
+      bool fused = tensorType && load->hasOneUse() &&
+                   *load->user_begin() == alloc.getOperation() &&
+                   getTMAWritableEncoding(
+                       load, tensorType,
+                       cast<ttg::MemDescType>(alloc.getType()), descEnc);
+      if (!fused) {
+        found = true;
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  return found;
 }
 
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
@@ -209,7 +267,7 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
         ttng::getDescriptorLoadBytes(cast<ttg::MemDescType>(buffer.getType()));
     auto nvwsLoad = builder.createWithAsyncTaskIds<ttnvws::DescriptorLoadOp>(
         load.getLoc(), load.getDesc(), load.getIndices(), txCount, buffer,
-        load.getCache(), load.getEvict());
+        load.getCachePolicyAttr());
     nvwsLoad->setAttrs(load->getAttrs());
 
     if (soleStore) {
@@ -227,11 +285,8 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
       // original tt.descriptor_load path kept unified (SMEM/TMEM overflow in FA
       // backward).
       builder.setAsyncTaskIdsFromValueUsers(load.getResult());
-      // A register-consumed descriptor load can feed consumers in different
-      // software-pipeline stages.  The shared local_load must be available to
-      // the earliest one; selecting an arbitrary use can delay a forwarding
-      // copy until the final compute stage and deadlock the load partition on
-      // a later single-buffer producer acquire.
+      // Schedule the shared local_load with its earliest consumer: a later
+      // stage can deadlock a forwarding copy on a single-buffer acquire.
       Operation *earliestUser = nullptr;
       auto scheduleKey = [](Operation *op) {
         auto stage = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
@@ -352,8 +407,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             Operation *headProducer, Operation *headConsumer,
                             Operation *headConsumerSameLevel,
                             ArrayRef<int> additionalConsumerTaskIds,
-                            DictionaryAttr consumerWaitConstraints,
-                            bool twoCTADirectWait) {
+                            DictionaryAttr consumerWaitConstraints) {
   // Callers group at least one load behind each fused barrier. Make the
   // precondition explicit instead of dereferencing front() blind below.
   if (tmaLoads.empty())
@@ -412,7 +466,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     auto copyOp =
         builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
             tmaLoad.getLoc(), tmaLoad.getDesc(), tmaLoad.getIndices(),
-            tmaBarrier, pipelineBuffer, pred);
+            tmaBarrier, pipelineBuffer, pred, /*multicast=*/false,
+            tmaLoad.getCachePolicyAttr());
     if (tmaLoad->hasAttr(ttng::AttrTwoCTALoadName))
       copyOp.setTwoCta(true);
     copy = copyOp;
@@ -435,18 +490,15 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
       loc, builder.getI32Type(), phase);
   Value waitPred =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
-  bool directTwoCTAWait = twoCTA && twoCTADirectWait;
   Value followerWaitPred;
   Value peerBarrier;
   if (twoCTA) {
     TwoCTAPairRank rank = buildTwoCTAPairRank(builder, loc);
     waitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
         loc, arith::CmpIPredicate::eq, rank.rankInPair, rank.zero);
-    if (!directTwoCTAWait) {
-      followerWaitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
-          loc, arith::CmpIPredicate::ne, rank.rankInPair, rank.zero);
-      peerBarrier = mapBarrierTo2CTAPeer(builder, loc, consBarrier, rank.ctaId);
-    }
+    followerWaitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::ne, rank.rankInPair, rank.zero);
+    peerBarrier = mapBarrierTo2CTAPeer(builder, loc, consBarrier, rank.ctaId);
   }
 
   // Create one WaitBarrierOp per consumer task ID.
@@ -454,7 +506,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase, waitPred, /*deps=*/ValueRange{},
       consumerWaitConstraints);
-  if (twoCTA && !directTwoCTAWait) {
+  if (twoCTA) {
     // The hardware CTA-group TMA transaction completes the leader's local
     // mbarrier. Relay that completion to the follower's corresponding local
     // barrier, then let the follower wait on it. A cluster barrier is not
@@ -473,7 +525,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
         loc, consBarrier, phase, waitPred,
         /*deps=*/ValueRange{}, consumerWaitConstraints);
-    if (twoCTA && !directTwoCTAWait) {
+    if (twoCTA) {
       builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
           loc, /*bCluster=*/false);
       builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(

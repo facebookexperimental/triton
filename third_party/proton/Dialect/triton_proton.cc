@@ -11,9 +11,11 @@
 #include "mlir/Pass/PassManager.h"
 #include "passes.h"
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
+#include <optional>
 
 namespace py = nanobind;
 using namespace mlir::triton;
@@ -72,13 +74,33 @@ void init_triton_proton(py::module_ &m) {
   });
 
   // Proton operations
-  m.def("create_proton_record",
-        [](TritonOpBuilder &opBuilder, bool isStart,
-           const std::string &name) -> void {
-          auto nameAttr = mlir::StringAttr::get(opBuilder.getContext(),
-                                                llvm::StringRef(name));
-          opBuilder.create<proton::RecordOp>(isStart, nameAttr);
-        });
+  m.def(
+      "create_proton_record",
+      [](TritonOpBuilder &opBuilder, bool isStart, const std::string &name,
+         std::optional<mlir::Value> predicate) -> void {
+        auto nameAttr = mlir::StringAttr::get(opBuilder.getContext(),
+                                              llvm::StringRef(name));
+        opBuilder.create<proton::RecordOp>(isStart, nameAttr,
+                                           predicate.value_or(mlir::Value{}));
+      },
+      py::arg("opBuilder"), py::arg("isStart"), py::arg("name"),
+      py::arg("predicate").none() = py::none());
+
+  m.def(
+      "create_proton_allocate_event",
+      [](TritonOpBuilder &opBuilder, const std::string &name) -> mlir::Value {
+        auto nameAttr = mlir::StringAttr::get(opBuilder.getContext(), name);
+        auto op = opBuilder.create<proton::AllocateEventOp>(
+            mlir::TypeRange{mlir::IntegerType::get(opBuilder.getContext(), 32)},
+            nameAttr);
+        return op.getEvent();
+      });
+
+  m.def(
+      "create_proton_event",
+      [](TritonOpBuilder &opBuilder, bool isStart, mlir::Value event) -> void {
+        opBuilder.create<proton::EventOp>(isStart, event);
+      });
 
   m.def("add_convert_proton_to_protongpu",
         [](mlir::PassManager &pm, proton::MetricType &metricType,

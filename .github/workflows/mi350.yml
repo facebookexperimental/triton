@@ -1,355 +1,314 @@
 name: Meta Triton MI350 Tests
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - 'third_party/nvidia/**'
-      - 'third_party/tlx/tutorials/blackwell-*/**'
-      - 'third_party/tlx/tutorials/blackwell-*'
-      - 'third_party/tlx/tutorials/testing/test_correctness_autows.py'
-      - 'python/test/unit/cuda/**'
-      - 'python/test/unit/language/test_tlx_tma.py'
-      - 'third_party/proton/test/**'
-  pull_request:
-    paths-ignore:
-      - 'third_party/nvidia/**'
-      - 'third_party/tlx/tutorials/blackwell-*/**'
-      - 'third_party/tlx/tutorials/blackwell-*'
-      - 'third_party/tlx/tutorials/testing/test_correctness_autows.py'
-      - 'python/test/unit/cuda/**'
-      - 'python/test/unit/language/test_tlx_tma.py'
-      - 'third_party/proton/test/**'
-  schedule:
-    # Every 6 hours at the top of the hour (00:00, 06:00, 12:00, 18:00 UTC).
-    - cron: '0 */6 * * *'
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit used to build the wheel
+        required: true
+        type: string
+      plan:
+        description: Explicit test work selected by the CPU planner
+        required: true
+        type: string
+      wheel_url:
+        required: true
+        type: string
+      wheel_filename:
+        required: true
+        type: string
+      wheel_sha256:
+        required: true
+        type: string
 
 env:
-  MAX_JOBS: 16
-  TORCH_NIGHTLY_URL: https://download-r2.pytorch.org/whl/nightly/rocm7.2/torch-2.13.0.dev20260513%2Brocm7.2-cp312-cp312-manylinux_2_28_x86_64.whl
-  # torchTLX (TLX-as-Inductor-backend) is exercised by the dedicated torchtlx.yml
-  # workflow against a fresh nightly torch. Keep it off the tritonbench job here:
-  # only "allow"/"force" enable it, so an empty value forces it off regardless of
-  # any environment default, and tritonbench runs against the pinned rocm nightly
-  # wheel above (which may predate the config.triton.tlx_mode knob).
-  TORCHINDUCTOR_TLX_MODE: ""
+  # Scopes the issue titles. Off main it names the branch, as ci-issues.yml does.
+  GPU_WORKFLOW_NAME: Meta Triton MI350 Tests${{ github.ref_name != 'main' && format(' ({0})', github.ref_name) || '' }}
+  TORCHINDUCTOR_TLX_MODE: "off"
+  # Import test files by path, not by prepending their directories to
+  # sys.path, so same-named test modules in different directories do not
+  # collide (the perf suite failed with ImportError without it, #4001).
+  PYTEST_ADDOPTS: --import-mode=importlib
 
 jobs:
-  mi350-meta-triton-test:
-    if: github.repository_owner == 'facebookexperimental'
+  mi350-tlx-test:
+    if: ${{ !cancelled() && github.repository_owner == 'facebookexperimental' && (fromJSON(inputs.plan).core.files[0] != null || fromJSON(inputs.plan).correctness.files[0] != null || fromJSON(inputs.plan).codegen.files[0] != null) }}
     runs-on: linux-fb-triton-mi350-1
-    env:
-      WORKSPACE_DIR: /workspace
-      CONDA_ENV: meta-triton
-      UV_VENV_DIR: /workspace/uv_venvs
-      SETUP_SCRIPT: /workspace/setup_instance.sh
     timeout-minutes: 240
     permissions:
-      id-token: write
       contents: read
-    outputs:
-      failures: ${{ steps.collect.outputs.failures }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          submodules: recursive
-      - name: Checkout TritonBench (Optional)
-        id: tritonbench_pr
-        if: github.event_name == 'pull_request'
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          PR_BODY_FILE="$(mktemp)"
-          printf '%s' "${PR_BODY}" > "${PR_BODY_FILE}"
-          bash ./.ci/tritonbench/checkout.sh "${PR_BODY_FILE}" --ref-only
-      - name: Checkout Tritonbench
-        uses: actions/checkout@v3
-        with:
-          repository: meta-pytorch/tritonbench
-          path: tritonbench
-          ref: ${{ steps.tritonbench_pr.outputs.ref }}
-          submodules: recursive
-      - name: Setup Tritonbench environment
-        working-directory: tritonbench
-        run: |
-          set -eux
-          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}"
-      - name: Run TritonBench
-        id: tritonbench
-        env:
-          TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
-          TRITONBENCH_ROOT: ${{ github.workspace }}/tritonbench
-        run: |
-          . "${SETUP_SCRIPT}"
-          bash ./.ci/tritonbench/test-gpu.sh
-      - name: Collect nightly failure (TritonBench)
-        id: collect
-        if: always() && github.event_name == 'schedule' && failure()
-        run: |
-          # TritonBench output is not a stable per-test format, so fall back to a
-          # stable logical bucket identity for this job.
-          BUCKET="amd-tritonbench"
-          TITLE="[nightly] ${GITHUB_WORKFLOW} / mi350-meta-triton-test / ${BUCKET}"
-          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"mi350-meta-triton-test","summary":"TritonBench tests failed on MI350 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
-          echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
-
-  mi350-tlx-test:
-    if: github.repository_owner == 'facebookexperimental'
-    runs-on: linux-fb-triton-mi350-1
-    env:
-      WORKSPACE_DIR: /workspace
-      CONDA_ENV: pytorch
-      UV_VENV_DIR: /workspace/uv_venvs
-      SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 120
-    permissions:
-      id-token: write
-      contents: read
+      actions: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
-          submodules: recursive
-      - name: Checkout Tritonbench
-        uses: actions/checkout@v3
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Set up test environment
+        timeout-minutes: 30
+        uses: ./.github/actions/setup-test-env
         with:
-          repository: meta-pytorch/tritonbench
-          path: tritonbench
-          submodules: recursive
-      - name: Setup Tritonbench environment
-        working-directory: tritonbench
-        run: |
-          set -eux
-          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}"
-      - name: Install torchao
-        run: |
-          . "${SETUP_SCRIPT}"
-          uv pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/rocm7.2
-          python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
-      - name: Run TLX unit tests
-        id: run_unit_tests
-        timeout-minutes: 5
-        run: |
-          set -eux
-          . "${SETUP_SCRIPT}"
-          uv pip install pytest
-          # TLX-only: the test_tlx_*.py glob covers manual TLX (tlx.async_tasks)
-          # and structurally excludes the autoWS suites (test_autows_*.py,
-          # test_warp_specialization.py, test_tutorial09_warp_specialization.py),
-          # which are never collected here and are tested separately.
-          pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
+          backend: rocm
+          arch: gfx950
+      - name: Check AMD GPU
+        id: gpu_health
+        # A runner whose GPU stopped responding fails here instead of hanging a later step.
+        timeout-minutes: 4
+        run: timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
+      - name: Run TLX core tests
+        id: run_core_tests
+        if: fromJSON(inputs.plan).core.files[0] != null
+        timeout-minutes: 90
+        uses: ./.github/actions/run-selected-tests
+        with:
+          suite: ${{ toJSON(fromJSON(inputs.plan).core) }}
+          workers: "12"
+          junit: /tmp/tlx-core.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
+        if: fromJSON(inputs.plan).correctness.files[0] != null
         timeout-minutes: 30
-        run: |
-          set -eux
-          . "${SETUP_SCRIPT}"
-          # Report the slowest cases so future changes can reduce the runtime
-          # without relying on brittle test-name filters.
-          pytest third_party/tlx/tutorials/testing/test_correctness.py -v --durations=25 --junitxml=/tmp/tlx-correctness.xml
-      - name: Collect nightly failures (TLX)
+        uses: ./.github/actions/run-selected-tests
+        with:
+          suite: ${{ toJSON(fromJSON(inputs.plan).correctness) }}
+          workers: "12"
+          junit: /tmp/tlx-correctness.xml
+      - name: Parse test failures (TLX)
         id: parse
-        if: always() && github.event_name == 'schedule'
-        run: |
-          . "${SETUP_SCRIPT}"
-          FAILED_FLAG=""
-          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
-            FAILED_FLAG="--failed --bucket mi350-tlx-job-failed"
-          fi
-          python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml \
-            --workflow "${GITHUB_WORKFLOW}" \
-            --job "mi350-tlx-test" \
-            ${FAILED_FLAG}
+        if: always()
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ env.GPU_WORKFLOW_NAME }}
+          job: mi350-tlx-test
+          completed-junit: ${{ (steps.run_core_tests.outcome == 'success' || steps.run_core_tests.outcome == 'failure') && '/tmp/tlx-core.xml' || '' }} ${{ (steps.run_correctness_tests.outcome == 'success' || steps.run_correctness_tests.outcome == 'failure') && '/tmp/tlx-correctness.xml' || '' }}
+          failed: ${{ job.status != 'success' }}
+          bucket: mi350-tlx-job-failed
+          junit: ${{ fromJSON(inputs.plan).core.files[0] != null && '/tmp/tlx-core.xml' || '' }} ${{ fromJSON(inputs.plan).correctness.files[0] != null && '/tmp/tlx-correctness.xml' || '' }}
+          budget: /tmp/tlx-core.xml=90 /tmp/tlx-correctness.xml=30
+          gpu-unhealthy: ${{ steps.gpu_health.outcome == 'failure' }}
 
-  mi350-gluon-test:
-    if: github.repository_owner == 'facebookexperimental'
+  mi350-torchtlx-test:
+    # Temporarily disabled because the TorchTLX environment is brittle.
+    if: ${{ false }}
     runs-on: linux-fb-triton-mi350-1
     env:
-      WORKSPACE_DIR: /workspace
-      CONDA_ENV: pytorch
-      UV_VENV_DIR: /workspace/uv_venvs
-      SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 60
+      TORCHINDUCTOR_TLX_MODE: "allow"
+      TORCHTLX_ARCH: gfx950
+      # This job builds Triton from source.
+      MAX_JOBS: 16
+      CCACHE_DIR: /tmp/fbtriton-ccache
+      CCACHE_MAXSIZE: 2G
+      # This job has always run with pytest's default import mode.
+      PYTEST_ADDOPTS: ""
+    timeout-minutes: 180
     permissions:
-      id-token: write
       contents: read
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
-          submodules: recursive
-      - name: Checkout Tritonbench
-        uses: actions/checkout@v3
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
         with:
-          repository: meta-pytorch/tritonbench
-          path: tritonbench
-          submodules: recursive
-      - name: Setup Tritonbench environment
-        working-directory: tritonbench
+          enable-cache: false
+      - name: Create isolated TorchTLX environment
         run: |
           set -eux
-          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}" --install-torch-wheel "${TORCH_NIGHTLY_URL}"
-      - name: Run Gluon tests (python/test/gluon)
-        id: run_gluon
+          BASE_PYTHON="$(command -v python3)"
+          TORCHTLX_VENV="${RUNNER_TEMP}/torchtlx-venv"
+          uv venv --python "${BASE_PYTHON}" "${TORCHTLX_VENV}"
+          TORCHTLX_PYTHON="${TORCHTLX_VENV}/bin/python"
+
+          # Force the freshest floating ROCm nightly. A stable release sorts
+          # above a nightly with the same version in a pre-existing environment;
+          # this clean job-local venv has no installed release to outrank it.
+          uv pip install --python "${TORCHTLX_PYTHON}" --pre torch \
+            --index-url https://download.pytorch.org/whl/nightly/rocm7.2
+          "${TORCHTLX_PYTHON}" - <<'PY'
+          import torch
+          from torch._inductor import config
+
+          print(f"torch -> {torch.__version__} ({torch.__file__})")
+          if not hasattr(config.triton, "tlx_mode"):
+              raise RuntimeError(
+                  "the ROCm PyTorch nightly has no TorchTLX Inductor support "
+                  "(torch._inductor.config.triton.tlx_mode)"
+              )
+          PY
+      - name: Compile Triton
+        run: |
+          set -eux
+          TORCHTLX_PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
+          uv pip install --python "${TORCHTLX_PYTHON}" \
+            -r python/requirements.txt -r python/test-requirements.txt
+          uv pip uninstall --python "${TORCHTLX_PYTHON}" \
+            pytorch-triton pytorch-triton-rocm triton-rocm triton || true
+          for attempt in 1 2 3; do
+            if uv pip install --python "${TORCHTLX_PYTHON}" --reinstall --no-deps \
+              -e . --no-build-isolation; then
+              break
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              exit 1
+            fi
+            echo "Triton build failed; retrying so partial dependency downloads can resume"
+          done
+          "${TORCHTLX_PYTHON}" - <<'PY'
+          import torch
+          import triton
+
+          print(f"torch  -> {torch.__version__} ({torch.__file__})")
+          print(f"triton -> {triton.__file__}")
+          PY
+      - name: Run TorchTLX template + fusion tests
+        id: run_torchtlx_tests
+        timeout-minutes: 120
+        run: |
+          export PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
+          bash scripts/run_torchtlx_tests.sh --junitxml=/tmp/torchtlx.xml
+      - name: Run TorchTLX L2 perf
+        id: run_torchtlx_perf
+        if: always() && github.event_name == 'schedule'
         timeout-minutes: 50
         run: |
-          set -eux
-          . "${SETUP_SCRIPT}"
-          uv pip install pytest expecttest
-          # Full Gluon unit-test coverage: every python/test/gluon/test_*.py. This spans
-          # the compile-only frontend tests plus the GPU-execution suites (core, lowerings,
-          # consan, fpsan, layout_format_view). Known-failing cases and their root causes
-          # are tracked in README.md ("Gluon support" -> TODO gluon-ci).
-          pytest python/test/gluon/ -v --junitxml=/tmp/gluon.xml
-      - name: Collect nightly failures (Gluon)
-        id: parse
+          export PYTHON="${RUNNER_TEMP}/torchtlx-venv/bin/python"
+          bash scripts/run_torchtlx_tests.sh --perf \
+            --junitxml=/tmp/torchtlx_perf.xml
+      - name: Upload TorchTLX perf artifacts
         if: always() && github.event_name == 'schedule'
-        run: |
-          . "${SETUP_SCRIPT}"
-          FAILED_FLAG=""
-          if [[ "${{ steps.run_gluon.outcome }}" != "success" ]]; then
-            FAILED_FLAG="--failed --bucket mi350-gluon-job-failed"
-          fi
-          python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/gluon.xml \
-            --workflow "${GITHUB_WORKFLOW}" \
-            --job "mi350-gluon-test" \
-            ${FAILED_FLAG}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi350-torchtlx-gemm-perf
+          path: /tmp/tlx_benchmark/*_torchtlx.gfx950.json
+          if-no-files-found: ignore
+      - name: Parse test failures (TorchTLX)
+        id: parse
+        if: always()
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ env.GPU_WORKFLOW_NAME }}
+          job: mi350-torchtlx-test
+          failed: ${{ steps.run_torchtlx_tests.outcome != 'success' || steps.run_torchtlx_perf.outcome != 'success' }}
+          bucket: mi350-torchtlx-job-failed
+          junit: /tmp/torchtlx.xml /tmp/torchtlx_perf.xml
 
-  # ----- Nightly issue filing (schedule only) -----
-  report-mi350-tritonbench:
-    needs: mi350-meta-triton-test
-    if: always() && github.event_name == 'schedule' && needs.mi350-meta-triton-test.outputs.failures != '' && needs.mi350-meta-triton-test.outputs.failures != '[]'
+  mi350-gluon-test:
+    if: ${{ !cancelled() && github.repository_owner == 'facebookexperimental' && (fromJSON(inputs.plan).gluon.files[0] != null) }}
+    runs-on: linux-fb-triton-mi350-1
+    timeout-minutes: 60
     permissions:
       contents: read
-      issues: write
       actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        item: ${{ fromJSON(needs.mi350-meta-triton-test.outputs.failures) }}
-    uses: ./.github/workflows/report-nightly-failure.yml
-    with:
-      issue_title: ${{ matrix.item.issue_title }}
-      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
-      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
-      job_name: ${{ matrix.item.job_name }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
-      event_name: ${{ github.event_name }}
-      run_attempt: ${{ github.run_attempt }}
-      summary: ${{ matrix.item.summary }}
-      repro: ${{ matrix.item.repro }}
-      external_dep: ${{ matrix.item.external_dep }}
-      external_dep_reason: ${{ matrix.item.external_dep_reason }}
-      platform: mi350
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+      recovery: ${{ steps.parse.outputs.recovery }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Set up test environment
+        timeout-minutes: 30
+        uses: ./.github/actions/setup-test-env
+        with:
+          backend: rocm
+          arch: gfx950
+          packages: numpy pytest expecttest
+      - name: Check AMD GPU
+        id: gpu_health
+        # A runner whose GPU stopped responding fails here instead of hanging a later step.
+        timeout-minutes: 4
+        run: timeout 180 python -c 'import torch; torch.zeros(1, device="cuda"); torch.cuda.synchronize()'
+      - name: Install prebuilt Triton
+        uses: ./.github/actions/install-prebuilt-triton
+        with:
+          wheel-url: ${{ inputs.wheel_url }}
+          wheel-filename: ${{ inputs.wheel_filename }}
+          wheel-sha256: ${{ inputs.wheel_sha256 }}
+      - name: Run Gluon tests (python/test/gluon)
+        id: run_gluon
+        if: fromJSON(inputs.plan).gluon.files[0] != null
+        timeout-minutes: 50
+        uses: ./.github/actions/run-selected-tests
+        with:
+          suite: ${{ toJSON(fromJSON(inputs.plan).gluon) }}
+          workers: "1"
+          junit: /tmp/gluon.xml
+      - name: Parse test failures (Gluon)
+        id: parse
+        if: always()
+        uses: ./.github/actions/parse-test-failures
+        with:
+          workflow: ${{ env.GPU_WORKFLOW_NAME }}
+          job: mi350-gluon-test
+          completed-junit: ${{ (steps.run_gluon.outcome == 'success' || steps.run_gluon.outcome == 'failure') && '/tmp/gluon.xml' || '' }}
+          failed: ${{ job.status != 'success' }}
+          bucket: mi350-gluon-job-failed
+          junit: /tmp/gluon.xml
+          budget: /tmp/gluon.xml=50
+          gpu-unhealthy: ${{ steps.gpu_health.outcome == 'failure' }}
 
-  report-mi350-tlx:
+  # File and close failure issues; ci-issues.yml decides which runs file.
+  issues-mi350-tlx:
     needs: mi350-tlx-test
-    if: always() && github.event_name == 'schedule' && needs.mi350-tlx-test.outputs.failures != '' && needs.mi350-tlx-test.outputs.failures != '[]'
+    if: always()
     permissions:
       contents: read
       issues: write
       actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        item: ${{ fromJSON(needs.mi350-tlx-test.outputs.failures) }}
-    uses: ./.github/workflows/report-nightly-failure.yml
+    uses: ./.github/workflows/ci-issues.yml
     with:
-      issue_title: ${{ matrix.item.issue_title }}
-      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
-      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
-      job_name: ${{ matrix.item.job_name }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
-      event_name: ${{ github.event_name }}
-      run_attempt: ${{ github.run_attempt }}
-      summary: ${{ matrix.item.summary }}
-      repro: ${{ matrix.item.repro }}
-      external_dep: ${{ matrix.item.external_dep }}
-      external_dep_reason: ${{ matrix.item.external_dep_reason }}
-      platform: mi350
-
-  report-mi350-gluon:
-    needs: mi350-gluon-test
-    if: always() && github.event_name == 'schedule' && needs.mi350-gluon-test.outputs.failures != '' && needs.mi350-gluon-test.outputs.failures != '[]'
-    permissions:
-      contents: read
-      issues: write
-      actions: read
-    strategy:
-      fail-fast: false
-      matrix:
-        item: ${{ fromJSON(needs.mi350-gluon-test.outputs.failures) }}
-    uses: ./.github/workflows/report-nightly-failure.yml
-    with:
-      issue_title: ${{ matrix.item.issue_title }}
-      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
-      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
-      workflow_name: ${{ github.workflow }}
-      job_name: ${{ matrix.item.job_name }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      ref: ${{ github.ref }}
-      sha: ${{ github.sha }}
-      event_name: ${{ github.event_name }}
-      run_attempt: ${{ github.run_attempt }}
-      summary: ${{ matrix.item.summary }}
-      repro: ${{ matrix.item.repro }}
-      external_dep: ${{ matrix.item.external_dep }}
-      external_dep_reason: ${{ matrix.item.external_dep_reason }}
-      platform: mi350
-
-  # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
-  reconcile-mi350-tritonbench:
-    needs: mi350-meta-triton-test
-    if: always() && github.event_name == 'schedule' && (needs.mi350-meta-triton-test.result == 'success' || needs.mi350-meta-triton-test.result == 'failure')
-    permissions:
-      contents: read
-      issues: write
-    uses: ./.github/workflows/reconcile-nightly-issues.yml
-    with:
-      workflow_name: ${{ github.workflow }}
-      job_name: mi350-meta-triton-test
-      failures: ${{ needs.mi350-meta-triton-test.outputs.failures }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-  reconcile-mi350-tlx:
-    needs: mi350-tlx-test
-    if: always() && github.event_name == 'schedule' && (needs.mi350-tlx-test.result == 'success' || needs.mi350-tlx-test.result == 'failure')
-    permissions:
-      contents: read
-      issues: write
-    uses: ./.github/workflows/reconcile-nightly-issues.yml
-    with:
-      workflow_name: ${{ github.workflow }}
-      job_name: mi350-tlx-test
+      workflow: Meta Triton MI350 Tests
+      job: mi350-tlx-test
+      result: ${{ needs.mi350-tlx-test.result }}
       failures: ${{ needs.mi350-tlx-test.outputs.failures }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      recovery: ${{ needs.mi350-tlx-test.outputs.recovery }}
+      sha: ${{ inputs.ref }}
+      platform: mi350
 
-  reconcile-mi350-gluon:
-    needs: mi350-gluon-test
-    if: always() && github.event_name == 'schedule' && (needs.mi350-gluon-test.result == 'success' || needs.mi350-gluon-test.result == 'failure')
+  issues-mi350-torchtlx:
+    needs: mi350-torchtlx-test
+    if: always()
     permissions:
       contents: read
       issues: write
-    uses: ./.github/workflows/reconcile-nightly-issues.yml
+      actions: read
+    uses: ./.github/workflows/ci-issues.yml
     with:
-      workflow_name: ${{ github.workflow }}
-      job_name: mi350-gluon-test
-      failures: ${{ needs.mi350-gluon-test.outputs.failures }}
-      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      workflow: Meta Triton MI350 Tests
+      job: mi350-torchtlx-test
+      result: ${{ needs.mi350-torchtlx-test.result }}
+      failures: ${{ needs.mi350-torchtlx-test.outputs.failures }}
+      sha: ${{ inputs.ref }}
+      platform: mi350
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
-  cancel-in-progress: true
+  issues-mi350-gluon:
+    needs: mi350-gluon-test
+    if: always()
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    uses: ./.github/workflows/ci-issues.yml
+    with:
+      workflow: Meta Triton MI350 Tests
+      job: mi350-gluon-test
+      result: ${{ needs.mi350-gluon-test.result }}
+      failures: ${{ needs.mi350-gluon-test.outputs.failures }}
+      recovery: ${{ needs.mi350-gluon-test.outputs.recovery }}
+      sha: ${{ inputs.ref }}
+      platform: mi350

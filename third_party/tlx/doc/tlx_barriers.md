@@ -97,8 +97,8 @@ Barrier operations can be classified into three categories: a)
 
 ## TLX Barriers
 
-TLX provides two categories of barriers: a) named barriers and b) memory
-barriers.
+TLX provides three categories of barriers: a) named barriers, b) memory
+barriers, and c) workgroup barriers (AMD).
 
 ### Named Barriers
 
@@ -141,6 +141,25 @@ barriers.
 |----|----|----|
 | tlx.named_barrier_wait | ttng::wait_barrier_named | [<u>bar.sync</u>](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-bar) |
 | tlx.named_barrier_arrive | ttng::arrive_barrier_named | [<u>bar.arrive</u>](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-bar) |
+
+#### Code generation: `.aligned` selection
+
+`bar.sync`/`bar.arrive` are the `.aligned` spellings of
+`barrier.sync`/`barrier.arrive`. Per NVIDIA, `.aligned` only requires
+warp-level alignment: all threads in a warp must execute the same barrier
+instruction (same barrier ID and participant count). A branch condition may
+itself be data-dependent so long as it is warp-uniform (e.g. an iteration
+count). Divergence across warps is legal -- e.g. different warp-specialize
+partitions executing the `sync` and `arrive` halves of a ping-pong phase, or
+branches on warp IDs.
+
+The backend emits `.aligned` only when it can prove this property: the
+barrier must execute in a warp-uniform control context (no reaching branches
+on thread/lane IDs or on data-dependent values that can vary by thread
+within a warp) with warp-uniform barrier-ID and count operands. Straight-line code, warp-specialize partitions, and
+branches on constants, program IDs, or warp IDs all qualify. When uniformity
+cannot be proven, the backend falls back to the non-aligned
+`barrier.sync`/`barrier.arrive` forms, which carry no uniformity requirement.
 
 #### Example (PingPong Schedule)
 
@@ -256,6 +275,7 @@ while !done:
 | Implicit arrive of an *tlx.barrier_expect_bytes* | 1 | Only one thread modifies the barrier arrival count after completion of a transaction |
 | *tlx.barrier_arrive* on NV within a *tlx.async_task* region | Number of warp groups | Only one thread per MMA group modifies the barrier arrival count on arrive |
 | *tlx.barrier_arrive* on NV outside a *tlx.async_task* region | 1 | Only tid == 0 modifies the barrier arrival count on arrive |
+| *tlx.barrier_arrive(..., per_warp=True)* on NV | Warps of the arriving task | One lane of each warp arrives after a warp-local sync |
 | *tlx.barrier_arrive* on AMD | num_warps that execute *tlx.barrier_arrive* | One thread per wave(warp) increments the barrier count |
 
 - ***tlx.barrier_expect_bytes(bar, bytes)***
@@ -286,12 +306,164 @@ while !done:
   *tlx.alloc_barrier* can be set to achieve the desired phase change
   behavior.
 
+  With *per_warp=True* (NVIDIA), each warp of the arriving task
+  synchronizes its own lanes and one of its lanes arrives with
+  *arrive_count*, instead of the whole task synchronizing before one
+  thread arrives, as FA4 does. The barrier then counts *arrive_count*
+  for each warp of the task, and per-warp and leader arrives can share a
+  barrier. Not supported on warp barriers or with *cta_mask*.
+
+  The three arrival styles:
+
+  | Style | Allocate | Arrive | Barrier counts per arrive |
+  |:---|:---|:---|:---|
+  | Leader | `tlx.alloc_barriers(n, arrive_count=N)` | `tlx.barrier_arrive(bar, c)` | c; the task synchronizes, then one thread arrives |
+  | Per warp | `tlx.alloc_barriers(n, arrive_count=N)` | `tlx.barrier_arrive(bar, c, per_warp=True)` | c * task warps; each warp synchronizes, then one lane arrives |
+  | Per thread | `tlx.alloc_warp_barrier(n, num_warps=W, num_arrivals=A)` | `tlx.barrier_arrive(bar, c)` | c * task threads; every thread arrives, the barrier counts W * 32 * A |
+
+  For leader and per-warp arrives, N is the sum over a phase of what each
+  arrive counts, times the number of CTAs for a barrier signalled from
+  every CTA of a cluster. A barrier released by a 4-warp task per warp and
+  by a leader arrive in each of two CTAs is allocated with
+  `arrive_count=(4 + 1) * 2`. All three wait with `tlx.barrier_wait`.
+
+  `tlx.async_task(..., nvptx_cmp_sink_workaround=True)` (NVIDIA) is a
+  temporary workaround for an NVPTX backend issue. It changes where leader
+  and per-warp arrives in that task compute their `tid == 0` and
+  `lane == 0` predicates, not what the arrives do. NVPTX lets
+  CodeGenPrepare sink compares into the blocks of their users, so the
+  compare of a leader arrive after a loop moves back next to the arrive
+  and keeps the 32-bit thread id live across the loop. A per-warp
+  arrive's lane predicate is instead hoisted out of the loop by LICM and
+  stays live across it. Either can perturb the ptxas schedule of a hot
+  loop: the FA forward softmax is about 3% faster with both avoided, and
+  avoiding only one gains little. With the flag, the task's per-warp
+  arrives test `%laneid` inside their own asm and its leader arrives share
+  one predicate built at the task entry. Only that task's arrives are
+  affected. Remove the flag once NVPTX stops sinking compares.
+
   | TLX [<u>barriers</u>](https://github.com/facebookexperimental/triton/blob/tlx/third_party/tlx/language/tlx/barrier.py) | MLIR | PTX |
   |----|----|----|
   | tlx.alloc_barriers | ttng::InitBarrierOp | [<u>mbarrier.init</u>](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier-init) |
   | tlx.barrier_expect_bytes | ttng::BarrierExpectOp | [<u>mbarrier.expect_tx</u>](http://mbarrier.expect_tx) |
   | tlx.barrier_wait | ttng::WaitBarrierOp | [<u>mbarrier.try_wait</u>](http://mbarrier.try_wait) |
   | tlx.barrier_arrive | ttng::ArriveBarrierOp | [<u>mbarrier.arrive</u>](http://mbarrier.arrive) |
+
+### Cluster-Scoped Initialization (NVIDIA SM90+)
+
+Use `tlx.alloc_barriers(num_barriers, arrive_count=1, scope="cluster")` when a
+barrier needs initialization visibility across CTAs. The returned object is
+still an mbarrier handle. Scope does not change its storage/layout, arrival
+count, phase protocol, or launch dimensions, and it does not create a cluster.
+The default is `scope="cta"`, which preserves legacy compiler synchronization
+for recognized remote/multicast and paired-MMA consumers.
+
+#### Compiler-Owned Initialization Region
+
+A local `mbarrier.init` is not enough for safe remote arrival: the initializing
+thread must publish initialization and the cluster must rendezvous before
+remote use. Explicit cluster scope requests that guarantee independently of
+which consumers appear in the IR. The initialization "region" is a designated
+kernel-entry prologue segment constructed by the compiler, not a new user-facing
+region API.
+
+![Compiler-owned entry initialization followed by TMEM setup and barrier use, with covered-init and WS integration](../../../website/assets/cluster-barrier-initialization.svg)
+
+With multiple physical CTAs, any eligible cluster-scoped entry initialization
+triggers a batch of all eligible entry initializations, including CTA/default
+scope. Safe dependencies and initialization operations retain their original
+block order and move before the first TMEM allocation/setup operation. The
+compiler performs this transformation before shared-memory allocation analysis,
+so liveness reflects the actual entry schedule. One initialization release
+fence and one relaxed cluster arrive/wait sequence protect the whole batch.
+A single physical CTA needs no cluster rendezvous, under either the logical or
+physical cluster model.
+
+After inlining, initialization must be unconditional in the kernel entry block
+and before effectful execution. The compiler rejects cluster initialization in
+branches, loops, or WS tasks, later-phase initialization, reinitialization, and
+dependencies that cannot be safely hoisted. It does not pull later local
+pipeline initialization into the entry batch. Barrier consumers may still be
+inside loops or WS tasks.
+
+#### Compiler Versus User Responsibility
+
+Initialization and application communication are different synchronization
+requirements. Cluster scope makes the barrier ready for remote use; it does
+not decide when application data or later barrier phases are ready.
+
+| Synchronization requirement | Owner | Guarantee or required action |
+|---|---|---|
+| Entry mbarrier initialization visibility | Compiler | `scope="cluster"` supplies the initialization fence and cluster rendezvous for multiple physical CTAs. |
+| Internal synchronization of compiler-managed cross-CTA operations and scratch dependencies | Compiler | Supported lowering and dependency analysis arrange internal synchronization; this is not a guarantee for arbitrary user-written remote accesses. |
+| Expected-byte and application data-ready publication | User | Establish the required ordering before a remote sender can start or complete its transaction. |
+| Asynchronous completion and pipeline phases | User | Arrange the arrive/expect/wait protocol. `cluster_barrier()` alone is not an asynchronous completion wait. |
+| Remote shared-memory reuse or owner exit | User | Confirm remote use has completed before reuse or exit, using a cluster rendezvous or a completion/acknowledgment protocol as needed. |
+
+For example, after setting `barrier_expect_bytes()` on a receiving CTA, an
+application may still need `cluster_barrier()` to publish that readiness before
+a peer issues an asynchronous remote store/copy. The receiver then uses
+`barrier_wait()` before consuming the data. A final cluster rendezvous or
+acknowledgment may be needed to keep remote shared-memory owners alive. Generic
+stores consumed by the asynchronous proxy still require the appropriate proxy
+fence. The relaxed initialization rendezvous replaces none of these later
+application requirements.
+
+#### Integration With Existing Compiler Infrastructure
+
+TLX owns the initialization-region boundary, batching, and placement policy.
+It expresses synchronization through existing Triton NVIDIA fence/arrive/wait
+IR and lowering, rather than calling the Gluon Python API or implementing a
+separate hardware barrier path. This does not mean upstream already provides
+the TLX scope contract or the TLX bootstrap participation scheme.
+
+The bootstrap returns an exact `coveredInitOps` set to the later allocation-backed
+`runCrossCTAMBarrierInitSyncInsertion` analysis. That analysis skips only
+initializations already protected by the entry batch and remains responsible
+for other initializations it recognizes. Independent DSM-hazard and runtime
+synchronization analysis stay active; the bootstrap does not disable them at
+module scope.
+
+For WS, the existing TLX header makes non-default worker warps contribute one
+bootstrap arrive. Default warps perform initialization, the release fence,
+arrive, and wait. Workers do not gain an additional bootstrap cluster wait.
+The module kernel-init marker enables header participation; per-operation
+`tlx.cluster_sync_bootstrap` tags identify only this initialization sequence.
+Those operations bypass ordinary all-warps synthetic-WS wrapping because
+header participation is already arranged. Wrapping again would duplicate
+worker arrivals and could deadlock. Later synchronization retains its normal
+lowering; WS-aware execution does not infer the application's communication
+protocol.
+
+### Workgroup Barriers (AMD)
+
+- **Note:** Workgroup barriers are only supported on AMD (CDNA).
+
+- Unlike the NVIDIA named/memory barriers above, these are the plain CDNA
+  workgroup rendezvous used at hand-rolled ping-pong cluster borders. They are
+  synchronous and take no phase or arrival count.
+
+#### APIs
+
+- ***tlx.workgroup_barrier()***
+  Full-workgroup barrier with an LDS (shared-memory) memory fence. Lowers to a
+  local `s_barrier` bracketed by scheduler barriers so instructions cannot be
+  hoisted across it. This is the barrier used at hand-rolled ping-pong cluster
+  borders (pairs with *tlx.cond_barrier* for the phase shift).
+
+- ***tlx.cond_barrier(pred)***
+  Conditionally execute a workgroup barrier. Threads for which *pred* is true
+  participate in an `s_barrier`; the rest fall through without waiting. This
+  deliberately diverges the two halves of a workgroup to phase-shift warp groups
+  for hand-rolled block ping-pong, and sets no memory fence. The caller MUST
+  guarantee reconvergence: pair a *cond_barrier(pred)* before a loop with a
+  *cond_barrier(~pred)* after it so every thread crosses the same total number of
+  barriers.
+
+  | TLX [<u>barriers</u>](https://github.com/facebookexperimental/triton/blob/tlx/third_party/tlx/language/tlx/barrier.py) | MLIR | AMDGPU |
+  |----|----|----|
+  | tlx.workgroup_barrier | rocdl::SchedBarrier + ttg::BarrierOp (local) + rocdl::SchedBarrier | s_barrier |
+  | tlx.cond_barrier | amdgpu::CondBarrierOp | s_barrier (conditional) |
 
 ### Examples
 

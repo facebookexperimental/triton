@@ -1,0 +1,7 @@
+{
+  "operation": "vector_add",
+  "vendor": "host",
+  "architecture": "host",
+  "aliases": ["cpu"],
+  "cuda_major": null
+}

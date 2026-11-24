@@ -1,12 +1,20 @@
 #include "Utility.h"
 
+#include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
+#include "amd/lib/TritonAMDGPUToLLVM/TargetInfo.h"
+#include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 #include <limits>
 
@@ -19,25 +27,60 @@ namespace {
 int deduceMinCountInBlock(Block &block,
                           const std::function<int(Operation *)> &countFunc);
 
+// Count the minimum over entry-to-exit paths through single-block regions.
+// Region successors may skip a region or select mutually exclusive regions.
+// Cycles and unstructured control flow contribute zero conservatively.
+int deduceMinCountInRegions(RegionBranchOpInterface branch,
+                            const std::function<int(Operation *)> &countFunc) {
+  llvm::SmallPtrSet<Region *, 4> activeRegions;
+  llvm::DenseMap<Region *, int> regionCounts;
+  auto visit = [&](auto &&visit,
+                   RegionBranchPoint point) -> std::optional<int> {
+    SmallVector<RegionSuccessor> successors;
+    branch.getSuccessorRegions(point, successors);
+    if (successors.empty())
+      return std::nullopt;
+
+    int minCount = std::numeric_limits<int>::max();
+    for (RegionSuccessor successor : successors) {
+      if (successor.isOperation()) {
+        minCount = 0;
+        continue;
+      }
+      Region *region = successor.getSuccessor();
+      if (auto it = regionCounts.find(region); it != regionCounts.end()) {
+        minCount = std::min(minCount, it->second);
+        continue;
+      }
+      if (!region->hasOneBlock() || !activeRegions.insert(region).second)
+        return std::nullopt;
+      llvm::scope_exit guard([&] { activeRegions.erase(region); });
+      auto terminator = dyn_cast<RegionBranchTerminatorOpInterface>(
+          region->front().getTerminator());
+      if (!terminator)
+        return std::nullopt;
+      auto suffixCount = visit(visit, RegionBranchPoint(terminator));
+      if (!suffixCount)
+        return std::nullopt;
+      int count =
+          deduceMinCountInBlock(region->front(), countFunc) + *suffixCount;
+      regionCounts[region] = count;
+      minCount = std::min(minCount, count);
+    }
+    return minCount;
+  };
+  return visit(visit, RegionBranchPoint::parent()).value_or(0);
+}
+
 // Returns the minimum found when accumulating countFunc(op) between begin and
 // end (inclusive)
-int deduceMinCountBetweeOps(Operation *beginOp, Operation *endOp,
-                            const std::function<int(Operation *)> &countFunc) {
+int deduceMinCountBetweenOps(Operation *beginOp, Operation *endOp,
+                             const std::function<int(Operation *)> &countFunc) {
   assert(beginOp && endOp);
   assert(beginOp == endOp || beginOp->isBeforeInBlock(endOp));
   int count = 0;
   for (auto op = beginOp; op != endOp; op = op->getNextNode()) {
-    if (auto ifOp = llvm::dyn_cast<scf::IfOp>(op)) {
-      if (ifOp.getElseRegion().empty())
-        continue;
-
-      assert(!ifOp.getThenRegion().empty() && !ifOp.getElseRegion().empty());
-      auto minThen =
-          deduceMinCountInBlock(ifOp.getThenRegion().front(), countFunc);
-      auto minElse =
-          deduceMinCountInBlock(ifOp.getElseRegion().front(), countFunc);
-      count += std::min(minThen, minElse);
-    } else if (auto forOp = llvm::dyn_cast<scf::ForOp>(op)) {
+    if (auto forOp = llvm::dyn_cast<scf::ForOp>(op)) {
       if (std::optional<APInt> tripCount = forOp.getStaticTripCount()) {
         uint64_t tcVal = 0;
         if (forOp.getUnsignedCmp() && tripCount->ugt(0))
@@ -47,6 +90,8 @@ int deduceMinCountBetweeOps(Operation *beginOp, Operation *endOp,
         if (tcVal > 0)
           count += tcVal * deduceMinCountInBlock(*forOp.getBody(), countFunc);
       }
+    } else if (auto branch = dyn_cast<RegionBranchOpInterface>(op)) {
+      count += deduceMinCountInRegions(branch, countFunc);
     } else {
       count += countFunc(op);
     }
@@ -60,68 +105,90 @@ int deduceMinCountInBlock(Block &block,
                           const std::function<int(Operation *)> &countFunc) {
   if (block.empty())
     return 0;
-  return deduceMinCountBetweeOps(&block.front(), &block.back(), countFunc);
+  return deduceMinCountBetweenOps(&block.front(), &block.back(), countFunc);
 }
 
 int deduceMinCountOnDefChain(Value defValue, Operation *consumerOp,
                              const std::function<int(Operation *)> &countFunc,
+                             llvm::SmallDenseSet<Value> &activeTokens,
                              int pathSum, int foundMin) {
   // If the value is not defined in the same region as the consumer we need to
   // peel the parent region of consumer until we arrive at value's region
   while (consumerOp->getParentRegion() != defValue.getParentRegion()) {
-    pathSum += deduceMinCountBetweeOps(&consumerOp->getBlock()->front(),
-                                       consumerOp, countFunc);
+    pathSum += deduceMinCountBetweenOps(&consumerOp->getBlock()->front(),
+                                        consumerOp, countFunc);
     consumerOp = consumerOp->getParentOp();
   }
 
-  // Break recursion if we arrive at the producer updating the path based on the
-  // ops between producer and consumer
-  if (Operation *defOp = defValue.getDefiningOp()) {
+  // A forwarded token may be defined in a different, dominating block of the
+  // same region. We cannot scan between blocks without traversing the CFG.
+  if (defValue.getParentBlock() != consumerOp->getBlock())
+    return 0;
+
+  auto result = dyn_cast<OpResult>(defValue);
+  Operation *owner =
+      result ? result.getOwner() : defValue.getParentRegion()->getParentOp();
+  auto branch = dyn_cast<RegionBranchOpInterface>(owner);
+  if (result) {
     pathSum +=
-        deduceMinCountBetweeOps(defOp->getNextNode(), consumerOp, countFunc);
-    foundMin = std::min(foundMin, pathSum);
-    return foundMin;
-  }
-  // If value is a loop carried argument (BlockArgument) we need to look at
-  // initial arguments of the loop and the previous iteration
-  if (auto arg = mlir::dyn_cast<BlockArgument>(defValue)) {
-    Block *block = arg.getOwner();
-    auto forOp = dyn_cast<scf::ForOp>(block->getParentOp());
-
-    // Failed to track, return 0 conservatively.
-    if (!forOp || forOp.getBody()->empty()) {
+        deduceMinCountBetweenOps(owner->getNextNode(), consumerOp, countFunc);
+    if (!branch)
+      return std::min(foundMin, pathSum);
+  } else {
+    if (!branch || !defValue.getParentRegion()->hasOneBlock())
       return 0;
-    }
-
-    Operation *firstOpInLoop = &*forOp.getBody()->begin();
-    pathSum += deduceMinCountBetweeOps(firstOpInLoop, consumerOp, countFunc);
-
-    // Break recursion early if we exceed previous min
-    if (pathSum >= foundMin)
-      return foundMin;
-
-    Value incomingVal = forOp.getInitArgs()[arg.getArgNumber() - 1];
-    int countLoopInit = deduceMinCountOnDefChain(incomingVal, forOp, countFunc,
-                                                 pathSum, foundMin);
-
-    Operation *yieldOp = block->getTerminator();
-    Value prevVal = yieldOp->getOperand(arg.getArgNumber() - 1);
-    int countPreviousIter = deduceMinCountOnDefChain(
-        prevVal, yieldOp, countFunc, pathSum, foundMin);
-
-    return std::min(std::min(countLoopInit, countPreviousIter), foundMin);
+    pathSum += deduceMinCountBetweenOps(
+        &defValue.getParentRegion()->front().front(), consumerOp, countFunc);
   }
 
-  // Unsupported value, return 0 conservatively.
-  return 0;
+  // Region results and entry arguments are successor inputs. Trace each
+  // incoming operand from its predecessor, counting only that path's copies.
+  // A result/argument index need not be its index among successor inputs.
+  if (llvm::any_of(owner->getRegions(), [](Region &region) {
+        return !region.empty() && !region.hasOneBlock();
+      }))
+    return 0;
+  if (!activeTokens.insert(defValue).second)
+    return 0;
+  llvm::scope_exit guard([&] { activeTokens.erase(defValue); });
+  if (pathSum >= foundMin)
+    return foundMin;
+
+  RegionSuccessor successor = result
+                                  ? RegionSuccessor(branch.getOperation())
+                                  : RegionSuccessor(defValue.getParentRegion());
+  ValueRange inputs = branch.getSuccessorInputs(successor);
+  auto input = llvm::find(inputs, defValue);
+  if (input == inputs.end())
+    return 0;
+  unsigned index = std::distance(inputs.begin(), input);
+  SmallVector<RegionBranchPoint> predecessors;
+  branch.getPredecessors(successor, predecessors);
+  if (predecessors.empty())
+    return 0;
+  for (RegionBranchPoint predecessor : predecessors) {
+    auto terminator = predecessor.getTerminatorPredecessorOrNull();
+    OperandRange operands = predecessor.isParent()
+                                ? branch.getEntrySuccessorOperands(successor)
+                                : terminator.getSuccessorOperands(successor);
+    if (index >= operands.size())
+      return 0;
+    Operation *endpoint =
+        predecessor.isParent() ? owner : terminator.getOperation();
+    foundMin = std::min(
+        foundMin, deduceMinCountOnDefChain(operands[index], endpoint, countFunc,
+                                           activeTokens, pathSum, foundMin));
+  }
+  return foundMin;
 }
 
 } // namespace
 
 int deduceMinCountOnDefChain(Value defValue, Operation *consumerOp,
                              llvm::function_ref<int(Operation *)> countFunc) {
-  return deduceMinCountOnDefChain(defValue, consumerOp, countFunc, 0,
-                                  std::numeric_limits<int>::max());
+  llvm::SmallDenseSet<Value> activeTokens;
+  return deduceMinCountOnDefChain(defValue, consumerOp, countFunc, activeTokens,
+                                  0, std::numeric_limits<int>::max());
 }
 
 // On GFX9, lanes in a warp have to write contiguously to shared memory which
@@ -238,7 +305,9 @@ ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
     padding = elemsPer8Bytes;
   }
 
-  unsigned contigLanes = contigDim / vecSize;
+  // Clamped to [1, warpSize]: a row wider than a warp still counts as one row
+  // per warp below, and a row narrower than a vector cannot make it zero.
+  unsigned contigLanes = std::clamp(contigDim / vecSize, 1u, warpSize);
   unsigned wrap = std::min(contigDim, elemPerBankRow) / padding;
   // wrap == 0 means padding > contigDim, which is not a valid configuration
   if (wrap == 0) {
@@ -357,7 +426,7 @@ ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
 
 // LDS padding strategy for TDM (descriptor) loads.
 //
-// Currently only invoked for gfx1250 TDM loads (via
+// Currently only invoked for CDNA5 TDM loads (via
 // getSharedEncIfAllUsersAreDotEncPadded in LowerLoops.cpp when useTDM is
 // true).
 //
@@ -414,7 +483,7 @@ composePaddedLayoutWMMA(int opIdx, unsigned vecWidth,
   bool loadTransposed = (order[0] != (1 - opIdx));
 
   // Fallback: assume padding to match widest load width
-  unsigned typeWidthInBit = srcTy.getElementType().getIntOrFloatBitWidth();
+  unsigned typeWidthInBit = getIntOrFloatOrPtrBitWidth(srcTy.getElementType());
   unsigned padAmount = 128 / typeWidthInBit;
   if (loadTransposed) {
     // Transposed path: pad by twice the elements-per-lane of the transposed
@@ -440,7 +509,7 @@ composePaddedLayoutWMMA(int opIdx, unsigned vecWidth,
     //   MFMA 32x32x2 f32 (kWidth=2): pad=2 → conflict-free
     //
     // For sub-dword elements (fp16/fp8): keep pad = 128/elemBits (4 dwords).
-    // On architectures with dual-address LDS loads (e.g. gfx1250
+    // On architectures with dual-address LDS loads (e.g. CDNA5
     // ds_load_2addr_b64 for fp8), two addresses are served simultaneously,
     // requiring the full 4-dword stride separation to avoid cross-address
     // bank conflicts.
@@ -486,7 +555,7 @@ composePaddedLayout(const TargetFeatures &targetFeatures, int opIdx,
                                                 targetFeatures.getWarpSize());
   }
 
-  if (targetFeatures.isGFX1250()) {
+  if (targetFeatures.isCDNA5()) {
     if (!srcTy.getElementType().isIntOrFloat())
       return {};
     return composePaddedLayoutWMMA(opIdx, vecWidth, srcTy, sharedOrder,
@@ -516,6 +585,103 @@ getTDMGatherScatterIndexEncoding(Operation *op, RankedTensorType indicesType) {
   auto parentEnc = ttg::BlockedEncodingAttr::get(ctx, sizePerThread, tPerWarp,
                                                  warpsPerCTA, order, cgaLayout);
   return ttg::SliceEncodingAttr::get(ctx, /*dim=*/0, parentEnc);
+}
+
+SmallVector<unsigned> getLoadSharedOrder(ttg::TensorOrMemDesc srcTy,
+                                         const tt::AMD::TargetInfo &targetInfo,
+                                         bool useAsyncCopy) {
+  auto order = ttg::getOrderForMemory(srcTy);
+  if (useAsyncCopy && !targetInfo.supportsDirectToLdsScatter()) {
+    // For architectures that don't support scattering into LDS we must
+    // ensure that each warp writes a contiguous memory chunk. This requires
+    // the shared memory order to follow the thread order, while preserving
+    // the fastest dimension from the memory order if it's contiguous > 1 to
+    // keep vectorization.
+    auto srcTensorTy = cast<RankedTensorType>(srcTy);
+    auto regOrder = triton::gpu::getOrder(srcTensorTy);
+    auto threadOrder = triton::gpu::getThreadOrder(srcTensorTy);
+
+    SetVector<unsigned> orderSet;
+
+    auto regContig = triton::gpu::getContigPerThread(srcTensorTy)[regOrder[0]];
+    unsigned elemBitWidth = srcTy.getElementType().getIntOrFloatBitWidth();
+    unsigned finalRegContig = tt::AMD::fitToValidDirectToLdsVecSize(
+        regContig, elemBitWidth, targetInfo);
+    // We only apply the order change if we find a vector size which works
+    // for async copy.
+    if (finalRegContig > 0) {
+      // Preserve the fastest reg dim for contig > 1 to keep vectorization.
+      if (finalRegContig > 1)
+        orderSet.insert(order[0]);
+      orderSet.insert(threadOrder.begin(), threadOrder.end());
+      order = orderSet.takeVector();
+    }
+  }
+  return order;
+}
+
+ttg::SharedEncodingTrait getDotOperandSharedEncoding(
+    const TargetFeatures &targetFeatures, ttg::TensorOrMemDesc srcTy,
+    ArrayRef<unsigned> order, ttg::DotOperandEncodingAttr dotOpEnc,
+    bool canUseAsyncCopy) {
+  unsigned bitWidth = srcTy.getElementType().getIntOrFloatBitWidth();
+  SmallVector<unsigned> sharedOrder;
+  int rank = order.size();
+  // TODO rework this when shared -> dotOperand conversions support
+  // arbitrary shared memory ordering
+  if (rank == 3) {
+    // Move the batch dimension (dim #0) to be the last so that it will be
+    // the slowest varying dimension.
+    for (unsigned i = 0; i < rank; ++i)
+      if (order[i] != 0)
+        sharedOrder.emplace_back(order[i]);
+    sharedOrder.emplace_back(0);
+  } else {
+    sharedOrder = llvm::to_vector(order);
+  }
+  ttg::SharedEncodingTrait sharedEnc = composePaddedLayout(
+      targetFeatures, dotOpEnc.getOpIdx(), dotOpEnc.getKWidth(), srcTy,
+      sharedOrder, dotOpEnc, canUseAsyncCopy);
+  if (!sharedEnc) {
+    sharedEnc = ttg::SwizzledSharedEncodingAttr::get(
+        srcTy.getContext(), dotOpEnc, srcTy.getShape(), sharedOrder,
+        ttg::getCGALayout(srcTy.getEncoding()), bitWidth, /*needTrans=*/false);
+  }
+  return sharedEnc;
+}
+
+bool canLoadDirectToLdsInPipeline(RankedTensorType srcTy,
+                                  ttg::SharedEncodingTrait sharedEnc,
+                                  const tt::AMD::TargetInfo &targetInfo) {
+  // Compute the final vecSize we can use for the combination of
+  // sourceEncoding and sharedEncoding. We can only use AsyncCopy if the
+  // target supports the requested or a smaller vecSize because we cannot
+  // stride when loading directly to lds on GFX9
+  auto regLayout = triton::gpu::toLinearLayout(srcTy);
+  // It's the allocation so we trim the multibuffer dimension
+  auto srcShape = srcTy.getShape();
+  if (!regLayout.isRadix2()) {
+    unsigned elemBitWidth = tt::getPointeeBitWidth(srcTy);
+    unsigned vecSize = std::max(128u / elemBitWidth, 1u);
+    return !LLVM::AMD::getNpotDirectToLdsUnsupportedReason(
+        targetInfo, regLayout, elemBitWidth, sharedEnc, srcShape, vecSize);
+  }
+  triton::LinearLayout sharedLayout;
+  auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(sharedEnc);
+  if (paddedEnc) {
+    sharedLayout = paddedEnc.getLinearComponent();
+  } else {
+    sharedLayout = triton::gpu::toLinearLayout(srcShape, sharedEnc);
+  }
+  auto regToSharedLayout = regLayout.invertAndCompose(sharedLayout);
+
+  unsigned elemBitWidth = tt::getPointeeBitWidth(srcTy);
+  unsigned vecSize = regToSharedLayout.getNumConsecutiveInOut();
+  if (paddedEnc)
+    vecSize = std::min(vecSize, paddedEnc.getMinInterval());
+
+  return tt::AMD::fitToValidDirectToLdsVecSize(vecSize, elemBitWidth,
+                                               targetInfo) != 0;
 }
 
 ttg::SharedEncodingTrait getEncodingFromDescriptor(Operation *op,

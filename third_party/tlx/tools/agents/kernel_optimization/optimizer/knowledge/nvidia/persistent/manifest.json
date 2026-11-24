@@ -1,0 +1,18 @@
+{
+  "priority": 30,
+  "backends": ["cuda", "nvidia"],
+  "architectures": [
+    "hopper",
+    "h100",
+    "sm90",
+    "sm_90",
+    "blackwell",
+    "sm100",
+    "sm_100",
+    "b200",
+    "b200a",
+    "gb200",
+    "gb300"
+  ],
+  "documents": ["persistent-pipeline-efficiency.md"]
+}

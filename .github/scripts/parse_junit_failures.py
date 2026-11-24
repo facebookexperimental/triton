@@ -13,6 +13,10 @@ collapse into a single issue, e.g.
     foo/test_tlx.py::test_bar[param_b]
         => foo/test_tlx.py::test_bar
 
+A still-passing step whose runtime is closing on its ``timeout-minutes`` is also
+reported, as a ``slow-step:<name>`` item, so it can be fixed before it starts
+failing outright. Pass ``--budget <xml>=<minutes>`` to enable it.
+
 The result is written to ``$GITHUB_OUTPUT`` as ``failures=<json>`` (a JSON array
 of objects), defaulting to ``[]`` when there are no failures. Each object has:
     normalized_failure_id, raw_failure_ids, issue_title, job_name, summary
@@ -22,13 +26,18 @@ import argparse
 import json
 import os
 import re
+import signal
 import sys
 import xml.etree.ElementTree as ET
 
 from classify_failure import classify
+from test_results import encode_recovery
 
 # Matches a single trailing bracketed parametrization suffix: test_x[a-b] -> test_x
 PARAM_SUFFIX = re.compile(r"\[.*\]$")
+
+# Fraction of a step's timeout budget at which a still-passing suite is reported.
+SLOW_THRESHOLD = 0.8
 
 
 def normalize(node_id: str) -> str:
@@ -139,6 +148,124 @@ def build_missing_junit_item(missing_paths, workflow, job):
     }
 
 
+def crash_cause(exit_code):
+    """What ended pytest, from its exit status: the signal name for 128 + N, else the status itself."""
+    if exit_code is None:
+        return "crash"
+    if exit_code > 128:
+        try:
+            return signal.Signals(exit_code - 128).name
+        except ValueError:
+            pass
+    return f"exit {exit_code}"
+
+
+def build_crash_item(node_id, cause, workflow, job):
+    """The test that was running when pytest died, reported under its own identity."""
+    module, _, name = node_id.partition("::")
+    rid = f"{module.removesuffix('.py').replace('/', '.')}::{name}"
+    summary = f"pytest died ({cause}) while running {node_id}, before writing JUnit XML."
+    is_external, reason = classify(summary)
+    return {
+        "normalized_failure_id": rid,
+        "raw_failure_ids": rid,
+        "issue_title": f"[nightly] {workflow} / {job} / {cause} in {rid}",
+        "job_name": job,
+        "summary": summary,
+        "repro": f"python -m pytest '{node_id}' -v -s",
+        # No JUnit XML from this run -> reconcile must not close anything on it.
+        "fallback": True,
+        "external_dep": is_external,
+        "external_dep_reason": reason,
+    }
+
+
+def build_gpu_unhealthy_item(workflow, job):
+    """Build the job-level item for a runner whose GPU failed the health check before any test ran."""
+    norm = "gpu-unhealthy"
+    return {
+        "normalized_failure_id": norm,
+        "raw_failure_ids": "",
+        "issue_title": f"[nightly] {workflow} / {job} / {norm}",
+        "job_name": job,
+        "summary": "The runner's GPU failed the health check in the Tune Nvidia GPU step; no test ran.",
+        "repro": "",
+        # No test ran -> reconcile must not close.
+        "fallback": True,
+        "external_dep": True,
+        "external_dep_reason": "GPU unresponsive on the runner (runner infra)",
+    }
+
+
+def parse_budget(spec):
+    """Parse a ``--budget`` pair, ``<junit-xml-path>=<timeout-minutes>``."""
+    path, sep, minutes = spec.rpartition("=")
+    if not sep:
+        raise argparse.ArgumentTypeError(f"expected <path>=<minutes>, got {spec!r}")
+    try:
+        return path, float(minutes)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"bad minutes in {spec!r}") from None
+
+
+def suite_seconds(path):
+    """Total test-session seconds recorded in a JUnit XML, or None if unusable."""
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    suites = list(root.iter("testsuite"))
+    if not suites:
+        return None
+    total = 0.0
+    for suite in suites:
+        try:
+            total += float(suite.get("time") or 0.0)
+        except ValueError:
+            continue
+    return total
+
+
+def build_slow_items(budgets, threshold, workflow, job):
+    """Report each still-passing step whose runtime is closing on its timeout."""
+    items = []
+    for path, budget_min in budgets:
+        seconds = suite_seconds(path)
+        if seconds is None or budget_min <= 0:
+            continue
+        used_min = seconds / 60.0
+        frac = used_min / budget_min
+        if frac < threshold:
+            continue
+        name = os.path.basename(path)
+        norm = f"slow-step:{name[:-4] if name.endswith('.xml') else name}"
+        items.append({
+            "normalized_failure_id":
+            norm,
+            "raw_failure_ids":
+            "",
+            "issue_title":
+            f"[nightly] {workflow} / {job} / {norm}",
+            "job_name":
+            job,
+            "summary": (f"{name}: {used_min:.1f} min of a {budget_min:g} min budget ({frac:.0%}). This is "
+                        f"test-session time only, excluding collection, so the step is slower still. "
+                        f"Speed the suite up or raise timeout-minutes before it starts timing out."),
+            # No repro: this is a whole suite, not one test. An empty repro also
+            # tells report-nightly-failure.yml to skip deep bisection.
+            "repro":
+            "",
+            # Real, per-step signal: safe for reconcile to close once it speeds up.
+            "fallback":
+            False,
+            "external_dep":
+            False,
+            "external_dep_reason":
+            "",
+        })
+    return items
+
+
 def build_bucket_item(bucket, workflow, job):
     """Build a stable job-level fallback item when the job failed but no test failures can be parsed."""
     return {
@@ -156,9 +283,43 @@ def build_bucket_item(bucket, workflow, job):
     }
 
 
+def recovery_results(paths, expected, budgets, threshold, failed, bucket):
+    passed, not_passed, resolved = set(), set(), []
+    roots = {}
+    for path in paths:
+        try:
+            roots[path] = ET.parse(path).getroot()
+        except (OSError, ET.ParseError):
+            continue
+        for tc in roots[path].iter("testcase"):
+            rid = raw_id(tc.get("classname", ""), tc.get("name", ""))
+            if tc.find("failure") is not None or tc.find("error") is not None or tc.find("skipped") is not None:
+                not_passed.add(rid)
+            else:
+                passed.add(rid)
+    passed -= not_passed
+    for path, minutes in budgets:
+        if path not in roots or minutes <= 0:
+            continue
+        cases = list(roots[path].iter("testcase"))
+        seconds = suite_seconds(path)
+        if cases and any(raw_id(tc.get("classname", ""), tc.get("name", "")) in passed for tc in cases):
+            if any(tc.find("failure") is not None or tc.find("error") is not None for tc in cases):
+                continue
+            if seconds is not None and seconds < threshold * minutes * 60:
+                name = os.path.basename(path).removesuffix(".xml")
+                resolved.append(f"slow-step:{name}")
+    complete = bool(expected) and set(roots) == set(expected) and all(
+        list(root.iter("testcase")) for root in roots.values())
+    if complete and not failed and passed:
+        resolved.extend([bucket, "pytest-junit-missing", "gpu-unhealthy"])
+    return encode_recovery(passed, resolved, bool(complete))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--junit", nargs="+", required=True, help="JUnit XML file(s)")
+    parser.add_argument("--completed-junit", nargs="*", default=[], help="XML from completed test steps only")
     parser.add_argument("--workflow", required=True, help="Workflow name (for title)")
     parser.add_argument("--job", required=True, help="Job name (for title)")
     parser.add_argument("--output-name", default="failures", help="GITHUB_OUTPUT key to write")
@@ -173,24 +334,57 @@ def main():
         default="job-failed-no-parseable-failures",
         help="Stable bucket id for the fallback item emitted when --failed is set.",
     )
+    parser.add_argument(
+        "--gpu-unhealthy",
+        action="store_true",
+        help="The GPU health check failed: report the runner instead of parsing test output.",
+    )
+    parser.add_argument(
+        "--budget",
+        action="append",
+        default=[],
+        metavar="XML=MINUTES",
+        help=("Step timeout budget for a JUnit XML, e.g. /tmp/tlx-core.xml=30. "
+              "Repeatable. Enables near-timeout reporting for that file."),
+    )
+    parser.add_argument("--crashed-test", default="", help="node id pytest_plugins/running_test.py left set")
+    parser.add_argument("--exit-code", type=int, help="pytest's exit status, to name the signal that killed it")
+    parser.add_argument(
+        "--slow-threshold",
+        type=float,
+        default=SLOW_THRESHOLD,
+        help="Fraction of the budget at which a passing-but-slow step is reported.",
+    )
     args = parser.parse_args()
 
-    failures, missing_paths = collect_failures(args.junit)
-    items = build_items(failures, args.workflow, args.job)
-    if not items and missing_paths:
-        items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
-    if not items and args.failed:
-        items.append(build_bucket_item(args.bucket, args.workflow, args.job))
+    if args.gpu_unhealthy:
+        items = [build_gpu_unhealthy_item(args.workflow, args.job)]
+    else:
+        failures, missing_paths = collect_failures(args.junit)
+        items = build_items(failures, args.workflow, args.job)
+        if not items and missing_paths:
+            if args.crashed_test:
+                items.append(build_crash_item(args.crashed_test, crash_cause(args.exit_code), args.workflow, args.job))
+            else:
+                items.append(build_missing_junit_item(missing_paths, args.workflow, args.job))
+        if not items and args.failed:
+            items.append(build_bucket_item(args.bucket, args.workflow, args.job))
+        # Appended after the fallback guards: a slow-step item must not suppress the
+        # job-level fallback that a genuine failure needs.
+        items += build_slow_items([parse_budget(b) for b in args.budget], args.slow_threshold, args.workflow, args.job)
     payload = json.dumps(items)
 
     # TODO(scuba): in a follow-up, also emit a metrics row per failure
     # ({workflow, job, normalized_id, status, sha, run_id}) to a Scuba table.
     # Feasible on the self-hosted GPU runners (scribe reachable); skip on the
     # GitHub-hosted ubuntu-latest LIT job, which has no Scuba access.
+    recovery = recovery_results(args.completed_junit, args.junit, [parse_budget(b)
+                                                                   for b in args.budget], args.slow_threshold,
+                                args.failed, args.bucket) if not args.gpu_unhealthy else encode_recovery()
     out_path = os.environ.get("GITHUB_OUTPUT")
     if out_path:
         with open(out_path, "a", encoding="utf-8") as fh:
-            fh.write(f"{args.output_name}={payload}\n")
+            fh.write(f"{args.output_name}={payload}\nrecovery={recovery}\n")
     # Always echo to stdout for log visibility / local debugging.
     print(payload)
 

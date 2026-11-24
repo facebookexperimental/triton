@@ -36,6 +36,15 @@ struct WSBarrierAttr {
   // Set during insertAsyncComm.
   IntegerAttr dstTask;
 
+  // Buffer IDs (planner `buffer.id` values) of the data buffers whose access
+  // protocol this barrier participates in. Stamped at endpoint creation from
+  // the creating channel's buffer, unioned across channels sharing the
+  // barrier allocation (their phase protocols interact through it). Absent
+  // means unknown: consumers must treat a missing key conservatively.
+  // Same storage always shares an ID, so disjoint ID sets imply disjoint
+  // storage; the converse does not hold (one ID may cover several slots).
+  DenseI32ArrayAttr guardedBufferIds;
+
   // Task IDs reachable from the destination through the channel adjacency
   // graph (excluding the source). Set after code partitioning via
   // buildChannelGraph() + injectChannelGraph().
@@ -71,6 +80,9 @@ struct WSBarrierAttr {
       entries.emplace_back(StringAttr::get(ctx, "minRegionId"), minRegionId);
     if (maxRegionId)
       entries.emplace_back(StringAttr::get(ctx, "maxRegionId"), maxRegionId);
+    if (guardedBufferIds)
+      entries.emplace_back(StringAttr::get(ctx, "guardedBufferIds"),
+                           guardedBufferIds);
     if (entries.empty())
       return {};
     auto wsBarrier = DictionaryAttr::get(ctx, entries);
@@ -93,6 +105,8 @@ struct WSBarrierAttr {
     attr.parentId = wsBarrier.getAs<IntegerAttr>("parentId");
     attr.minRegionId = wsBarrier.getAs<IntegerAttr>("minRegionId");
     attr.maxRegionId = wsBarrier.getAs<IntegerAttr>("maxRegionId");
+    attr.guardedBufferIds =
+        wsBarrier.getAs<DenseI32ArrayAttr>("guardedBufferIds");
     return attr;
   }
 
@@ -108,6 +122,18 @@ struct WSBarrierAttr {
     WSBarrierAttr attr = forDstTask(ctx, taskId);
     attr.direction = StringAttr::get(ctx, direction);
     return attr;
+  }
+
+  // Chainable: attach the guarded buffer set. The set is sorted and
+  // deduplicated; an empty set leaves the field absent (unknown).
+  WSBarrierAttr &withGuardedBufferIds(MLIRContext *ctx, ArrayRef<int> ids) {
+    if (!ids.empty()) {
+      SmallVector<int> sorted(ids.begin(), ids.end());
+      llvm::sort(sorted);
+      sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+      guardedBufferIds = DenseI32ArrayAttr::get(ctx, sorted);
+    }
+    return *this;
   }
 };
 

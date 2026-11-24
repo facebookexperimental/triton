@@ -51,6 +51,11 @@ struct MakeTensorDescOpConversion
   LogicalResult
   matchAndRewrite(triton::MakeTensorDescOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (op.getPadding() != PaddingOption::PAD_ZERO) {
+      return op.emitError()
+             << "Padding with non-zero in TDM is not supported on CDNA5.";
+    }
+
     auto loc = op.getLoc();
     auto basePtr = adaptor.getBase();
     auto tensorShape = adaptor.getShape();

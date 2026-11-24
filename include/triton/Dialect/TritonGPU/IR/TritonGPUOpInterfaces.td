@@ -4,9 +4,10 @@
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 
-def UpcastFpOpInterface : OpInterface<"UpcastFpOpInterface"> {
+def CastFpOpInterface : OpInterface<"CastFpOpInterface"> {
     let description = [{
-        This interface is for operations that upcast floating-point numbers.
+        This interface is for operations that cast floating-point numbers,
+        either upcasting or downcasting.
     }];
 
     let cppNamespace = "::mlir::triton::gpu";
@@ -49,6 +50,10 @@ def MBarrierOpInterface : OpInterface<"MBarrierOpInterface"> {
     backend-agnostic barrier identification without direct dialect dependencies.
   }];
 
+  let verify = [{
+    return ::mlir::triton::gpu::verifyMBarrierOpInterface($_op);
+  }];
+
   let cppNamespace = "::mlir::triton::gpu";
 
   let methods = [
@@ -73,8 +78,33 @@ def MBarrierOpInterface : OpInterface<"MBarrierOpInterface"> {
           return {barrier};
         return {};
       }]
+    >,
+    InterfaceMethod<
+      /*desc=*/"Whether each warp publishes its prior effects through its own arrival.",
+      /*retType=*/"bool",
+      /*methodName=*/"isPerWarp",
+      /*args=*/(ins),
+      /*methodBody=*/[{}],
+      /*defaultImplementation=*/[{
+        return false;
+      }]
     >
   ];
+}
+
+def SchedulingBarrierOpInterface : OpInterface<"SchedulingBarrierOpInterface"> {
+  let description = [{
+    Marker interface for scheduling-only fence operations that carry no
+    cross-wave memory semantics (e.g. the AMD rocdl.sched.barrier /
+    rocdl.sched.group.barrier that bracket the real ttg.barrier a
+    tlx.workgroup_barrier interposes). The Membar analysis looks THROUGH ops
+    carrying this interface when scanning forward for a sync point; treating one
+    as a stopping point would make it insert a redundant workgroup barrier.
+    Backends attach this to their ops via an external model, so the core
+    analysis stays free of any backend-dialect dependency.
+  }];
+
+  let cppNamespace = "::mlir::triton::gpu";
 }
 
 #endif // TRITONGPU_OP_INTERFACES

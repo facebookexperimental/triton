@@ -1,9 +1,6 @@
 // RUN: triton-opt %s --nvgpu-test-ws-buffer-allocation | FileCheck %s
 
-// A descriptor load with consumers in different software-pipeline stages is
-// lowered through one shared local_load.  Give that load the earliest
-// consumer's schedule so a forwarding consumer can publish the value before a
-// later producer acquire blocks the load task.
+// The shared local_load takes its earliest consumer's schedule.
 
 // CHECK-LABEL: @tma_multi_consumer_schedule
 // CHECK: nvws.descriptor_load

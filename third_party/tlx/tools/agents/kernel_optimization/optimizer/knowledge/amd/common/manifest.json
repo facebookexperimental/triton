@@ -1,0 +1,6 @@
+{
+  "priority": 10,
+  "backends": ["amd", "hip", "rocm"],
+  "architectures": [],
+  "documents": ["amd-kernel-optimization.md"]
+}

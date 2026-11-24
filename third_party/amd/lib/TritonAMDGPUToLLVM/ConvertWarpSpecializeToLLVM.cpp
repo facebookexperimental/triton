@@ -42,16 +42,14 @@ enum BarrierIndex {
 
 class AMDWarpSpecializeBarrierHelper : public WarpSpecializeBarrierHelper {
 public:
-  AMDWarpSpecializeBarrierHelper(ModuleOp module,
-                                 const AMD::TargetInfo &targetInfo)
-      : module(module), targetInfo(targetInfo) {}
+  explicit AMDWarpSpecializeBarrierHelper(ModuleOp module) : module(module) {}
 
   bool isBarrierOp(Operation *op) const override {
     return isa<ROCDL::BarrierOp, ROCDL::SBarrierOp>(op);
   }
 
   Type getBarrierHandleType(MLIRContext *ctx) const override {
-    return LLVM::LLVMPointerType::get(ctx, targetInfo.getSharedAddressSpace());
+    return LLVM::LLVMPointerType::get(ctx, kNamedBarrierAddressSpace);
   }
 
   FailureOr<Value>
@@ -82,7 +80,7 @@ public:
       nbarGV = LLVM::GlobalOp::create(
           b, uloc, nbarTy, /*isConstant=*/false, LLVM::Linkage::Internal,
           nbarAttr.getValue(), /*value=*/Attribute(), /*alignment=*/0,
-          targetInfo.getSharedAddressSpace());
+          kNamedBarrierAddressSpace);
       // Add initializer region that returns 'poison'
       Block *initBlock = b.createBlock(&nbarGV.getInitializerRegion());
       b.setInsertionPointToStart(initBlock);
@@ -98,17 +96,14 @@ public:
   void createBarrier(TritonLLVMIRRewriter &b, unsigned numWarps,
                      Value handle) override {
     Location loc = b.getLoc();
-    auto nbarTy = LLVM::LLVMTargetExtType::get(b.getContext(),
-                                               "amdgcn.named.barrier", {}, {0});
-    auto smemObj = SharedMemoryObject(handle, nbarTy, 1, loc, b);
-    ROCDL::BarrierJoinOp::create(b, loc, smemObj.getBase());
-    ROCDL::BarrierSignalVarOp::create(b, loc, smemObj.getBase(), numWarps);
+    ROCDL::BarrierJoinOp::create(b, loc, handle);
+    ROCDL::BarrierSignalVarOp::create(b, loc, handle, numWarps);
     ROCDL::BarrierWaitOp::create(b, loc, 1);
   }
 
 private:
   ModuleOp module;
-  const AMD::TargetInfo &targetInfo;
+  static constexpr unsigned kNamedBarrierAddressSpace = 15;
 };
 
 //===----------------------------------------------------------------------===//
@@ -435,8 +430,8 @@ struct TritonAMDGPUConvertWarpSpecializeToLLVM
     }
 
     AMD::TargetInfo targetInfo(archStr.c_str());
-    if (targetInfo.getISAFamily() != triton::amdgpu::ISAFamily::GFX1250) {
-      mod.emitError("Warp specialization is only supported on gfx1250, got ")
+    if (targetInfo.getISAFamily() != triton::amdgpu::ISAFamily::CDNA5) {
+      mod.emitError("Warp specialization is only supported on CDNA5, got ")
           << archStr;
       return signalPassFailure();
     }
@@ -454,7 +449,7 @@ struct TritonAMDGPUConvertWarpSpecializeToLLVM
     if (failed(runPipeline(pm, mod)))
       return signalPassFailure();
 
-    AMDWarpSpecializeBarrierHelper barrierHelper(mod, targetInfo);
+    AMDWarpSpecializeBarrierHelper barrierHelper(mod);
     if (failed(lowerWarpSpecializeBarriers(mod, barrierHelper)))
       return signalPassFailure();
 

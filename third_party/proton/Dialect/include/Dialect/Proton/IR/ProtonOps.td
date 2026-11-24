@@ -36,10 +36,54 @@ def PT_RecordOp : PT_Op<"record", [
   }];
   let arguments = (
     ins UnitAttr: $isStart,
-    StrAttr: $name
+    StrAttr: $name,
+    Optional<I1>: $predicate
   );
 
-  let assemblyFormat = "(`start` $isStart^):(`end`)? $name attr-dict";
+  let builders = [
+    OpBuilder<(ins "bool":$isStart, "StringAttr":$name), [{
+      build($_builder, $_state, isStart, name,
+            /*predicate=*/static_cast<mlir::Value>(nullptr));
+    }]>,
+    OpBuilder<(ins "UnitAttr":$isStart, "StringAttr":$name), [{
+      build($_builder, $_state, isStart, name,
+            /*predicate=*/static_cast<mlir::Value>(nullptr));
+    }]>
+  ];
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "(`start` $isStart^):(`end`)? $name (`if` $predicate^)? attr-dict";
+}
+
+def PT_EventOp : PT_Op<"event", [
+  MemoryEffects<[MemRead<DefaultResource>, MemWrite<DefaultResource>]>
+]> {
+  let summary = "Record an asynchronous event";
+  let description = [{
+    Record the timestamp at which an asynchronous transaction starts or ends.
+    The event identifies the corresponding endpoints even when they execute in
+    different regions.
+  }];
+  let arguments = (ins UnitAttr:$isStart, I32:$event);
+  let assemblyFormat = [{
+    (`start` $isStart^):(`end`)? $event attr-dict `:` type($event)
+  }];
+}
+
+def PT_AllocateEventOp : PT_Op<"allocate_event", [
+  MemoryEffects<[MemWrite<DefaultResource>]>
+]> {
+  let summary = "Allocate a named asynchronous event";
+  let description = [{
+    Allocate a static correlation identity for an asynchronous event without
+    recording a timestamp. Each event operation remains distinct even when
+    names are reused; its write effect prevents common-subexpression
+    elimination from merging those identities.
+  }];
+  let arguments = (ins StrAttr:$name);
+  let results = (outs I32:$event);
+  let assemblyFormat = "$name attr-dict `:` type($event)";
 }
 
 #endif // PROTON_OPS
