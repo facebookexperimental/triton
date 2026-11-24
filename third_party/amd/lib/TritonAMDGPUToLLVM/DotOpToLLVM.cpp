@@ -7,7 +7,6 @@
 using namespace mlir;
 
 using ::mlir::triton::gpu::AMDWmmaEncodingAttr;
-using ::mlir::triton::gpu::getShapePerCTA;
 using ::mlir::triton::gpu::isPermutationMatrixLayout;
 using ::mlir::triton::gpu::toLinearLayout;
 
@@ -159,7 +158,6 @@ struct ScheduledMfmaScaledTypedOpConversion
 namespace mlir::triton::AMD {
 void populateDotOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                  RewritePatternSet &patterns,
-                                 ModuleAxisInfoAnalysis &axisInfoAnalysis,
                                  const TargetInfo &targetInfo,
                                  PatternBenefit benefit) {
   patterns.add<DotOpConversion>(typeConverter, targetInfo, benefit);
