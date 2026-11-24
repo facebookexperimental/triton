@@ -54,6 +54,7 @@ AutoWS inventory.
 | `merge_epilogue` / `merge_epilogue_to_computation` / `merge_correction` | `tt.merge_*` | `PartitionSchedulingMeta` (`SchedulingOptions`) | epilogue/correction routing |
 | `separate_epilogue_store` | `tt.separate_epilogue_store` | `PartitionSchedulingMeta` | epilogue store gets own partition |
 | `tmem_alloc_algo` / `smem_alloc_algo` / `smem_budget` / `smem_circular_reuse` | `tt.{tmem,smem}_alloc_algo`, `tt.smem_budget`, `tt.smem_circular_reuse` | `WSMemoryPlanner` | allocation heuristics |
+| `smem_operand_ring_first` | `tt.smem_operand_ring_first` | `WSMemoryPlanner` | grow outer-loop staging only after the MMA operand ring (opt-in; see TMAStoreWaitPipeline.md) |
 | `lhs_buffer_depth` / `rhs_buffer_depth` | `tt.lhs_buffer_depth` / `tt.rhs_buffer_depth` | `AssignLatencies`, `WSMemoryPlanner` | exact per-MMA-operand TMA/SMEM ring depths |
 | `list_schedule_pick` / `mem_plan_pick` | `tt.list_schedule_pick` / `tt.mem_plan_pick` | list scheduler / `WSMemoryPlanner` | ranked schedule and memory-plan selection |
 | `disable_licm` | `llvm.loop_annotation` | LLVM LICM (not `triton-licm`) | suppress hoisting; see [below](#loop_unroll_factor-and-disable_licm) |
