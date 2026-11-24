@@ -55,6 +55,7 @@ def _gemm_mxfp6_native_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr = 1,
 ):
     # Native scaled-MFMA path (manual 96-byte packed K, 128 logical values): load each dense 96-byte
     # tile, unpack its 128 codes in-kernel, and feed unpacked codes to
@@ -76,21 +77,29 @@ def _gemm_mxfp6_native_kernel(
     offs_sk = tl.arange(0, BLOCK_SIZE_K // 32)
     valid_m = offs_m < M
     valid_n = offs_n < N
+    num_k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    if SPLIT_K > 1:
+        pid_k = tl.program_id(axis=1)
+        first_k_tile = pid_k * num_k_tiles // SPLIT_K
+        last_k_tile = (pid_k + 1) * num_k_tiles // SPLIT_K
+        k_start = first_k_tile * BLOCK_SIZE_K
+        num_k_tiles = last_k_tile - first_k_tile
+    else:
+        k_start = 0
 
     # Per-segment packed loads: slot j holds dense byte
     # (j // 32) * 24 + (j % 32) (24 packed bytes + 8 bytes the
     # lowering ignores per 32-code segment, matching the kWidth=32
     # fragment). No byte->code unpack / code->byte repack.
-    byte_offs = (offs_k // 32) * 24 + (offs_k % 32)
+    byte_offs = k_start * 3 // 4 + (offs_k // 32) * 24 + (offs_k % 32)
     a_bptrs = a_ptr + offs_m[:, None] * K + byte_offs[None, :]
     b_bptrs = b_ptr + offs_n[None, :] * K + byte_offs[:, None]
-    as_ptrs = as_ptr + offs_m[:, None] * (K // 32) + offs_sk[None, :]
-    bs_ptrs = bs_ptr + offs_n[:, None] * (K // 32) + offs_sk[None, :]
+    as_ptrs = as_ptr + offs_m[:, None] * (K // 32) + k_start // 32 + offs_sk[None, :]
+    bs_ptrs = bs_ptr + offs_n[:, None] * (K // 32) + k_start // 32 + offs_sk[None, :]
 
     # Manual staging: at most two tiles live (the compiler pipeliner
     # kept three and spilled), so compiler pipelining is off.
-    k_offset = 0
-    num_k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    k_offset = k_start
     a_codes, b_codes, sa, sb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, valid_m, valid_n, K, k_offset,
                                           BLOCK_SIZE_K)
 
@@ -128,8 +137,20 @@ def _gemm_mxfp6_native_kernel(
         a_codes, b_codes, sa, sb = na_codes, nb_codes, nsa, nsb
     acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc, fp6_packed=True)
 
-    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
-    tl.store(c_ptrs, acc.to(tl.bfloat16), mask=valid_m[:, None] & valid_n[None, :])
+    c_ptrs = c_ptr + offs_m.to(tl.int64)[:, None] * N + offs_n[None, :]
+    if SPLIT_K > 1:
+        tl.store(c_ptrs + pid_k.to(tl.int64) * M * N, acc, mask=valid_m[:, None] & valid_n[None, :])
+    else:
+        tl.store(c_ptrs, acc.to(tl.bfloat16), mask=valid_m[:, None] & valid_n[None, :])
+
+
+@triton.jit
+def _reduce_split_k(partials_ptr, out_ptr, MN, SPLIT_K: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    splits = tl.arange(0, SPLIT_K)
+    partials = tl.load(partials_ptr + splits.to(tl.int64)[:, None] * MN + offsets[None, :], mask=offsets[None, :] < MN,
+                       other=0)
+    tl.store(out_ptr + offsets, tl.sum(partials, axis=0).to(tl.bfloat16), mask=offsets < MN)
 
 
 def _full_configs():
@@ -166,21 +187,21 @@ def _full_configs():
     return configs
 
 
-_kernel_full = triton.autotune(configs=_full_configs(), key=["M", "N", "K"])(_gemm_mxfp6_native_kernel)
+_kernel_full = triton.autotune(configs=_full_configs(), key=["M", "N", "K", "SPLIT_K"])(_gemm_mxfp6_native_kernel)
 
 
-def _launch_full(a, a_scale, b, b_scale, out):
+def _launch_full(a, a_scale, b, b_scale, out, split_k=1):
     M, K = a.shape
     N = b.shape[0]
 
     def grid(meta):
-        return (triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]), )
+        return (triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]), split_k)
 
-    _kernel_full[grid](a, b, out, a_scale, b_scale, M, N, K)
+    _kernel_full[grid](a, b, out, a_scale, b_scale, M, N, K, SPLIT_K=split_k)
     return out
 
 
-def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full"):
+def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="full", split_k=1):
     """``a @ b.T`` for pre-quantized MXFP6 operands on gfx950, as BF16.
 
     ``a`` is E2M3 and ``b`` is E3M2, both dense-packed uint8 (groups
@@ -189,6 +210,9 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
     by ``tlx.ops.mm_mxfp6``. ``space`` is "full" (autotune, the
     default) or "heuristic" (one shape-picked config). Only the
     "natural" scale layout is supported on this backend.
+
+    ``split_k`` partitions whole MFMA K tiles. FP32 partials are
+    reduced before the single BF16 conversion.
     """
     if sf_layout != "natural":
         raise InvalidInput(f"gfx950 mm_mxfp6 only supports sf_layout='natural'; got {sf_layout!r}")
@@ -196,14 +220,19 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
         raise InvalidInput(f"unsupported space {space!r}; expected 'heuristic' or 'full'")
     M, K = a.shape
     N = b.shape[0]
+    block_k = 128 if K % 128 == 0 else 64
+    if not isinstance(split_k, int) or split_k not in (1, 2, 4, 8, 16) or split_k > K // block_k:
+        raise InvalidInput("split_k must be one of (1, 2, 4, 8, 16) and not exceed the number of K tiles")
+    if space == "full" and K % 128:
+        raise InvalidInput("space='full' requires K to be a multiple of 128")
     if out is None:
         out = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     with torch.cuda.device(a.device):
+        target = torch.empty((split_k, M, N), device=a.device, dtype=torch.float32) if split_k > 1 else out
         if space == "heuristic":
             # Default from the MI350 warp sweep: 128x128x128 at 4
             # warps spills zero and beats the 256-wide tile; K=64
             # shapes keep the 64-deep tile (whole 32x32x64 steps).
-            block_k = 128 if K % 128 == 0 else 64
             meta = {
                 "BLOCK_SIZE_M": 128,
                 "BLOCK_SIZE_N": 128,
@@ -211,11 +240,11 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
                 "GROUP_SIZE_M": 8,
                 "num_warps": 4,
             }
-            grid = (triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]), )
+            grid = (triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]), split_k)
             _gemm_mxfp6_native_kernel[grid](
                 a,
                 b,
-                out,
+                target,
                 a_scale,
                 b_scale,
                 M,
@@ -225,8 +254,12 @@ def mm_mxfp6(a, a_scale, b, b_scale, *, out=None, sf_layout="natural", space="fu
                 BLOCK_SIZE_N=meta["BLOCK_SIZE_N"],
                 BLOCK_SIZE_K=meta["BLOCK_SIZE_K"],
                 GROUP_SIZE_M=meta["GROUP_SIZE_M"],
+                SPLIT_K=split_k,
                 num_warps=meta["num_warps"],
                 num_stages=1,
             )
-            return out
-        return _launch_full(a, a_scale, b, b_scale, out)
+        else:
+            _launch_full(a, a_scale, b, b_scale, target, split_k)
+        if split_k > 1:
+            _reduce_split_k[(triton.cdiv(M * N, 1024), )](target, out, M * N, split_k, 1024)
+        return out
