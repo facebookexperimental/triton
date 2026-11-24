@@ -619,10 +619,12 @@ def test_compile_only_dot_mxfp6_sm100(block_k: int, monkeypatch) -> None:
 
 @pytest.mark.parametrize("nonkdim", [16, 32])
 def test_compile_only_dot_mxfp6_gfx950(nonkdim: int) -> None:
-    # MXFP6 decomposes to a plain bf16 dot on gfx950: native
-    # v_mfma_scale_*_f8f6f4 cannot tile the factor-3 packed K. The kernel must
-    # still reach plain v_mfma_f32 instructions. Storage is dense (4 values
-    # per 3 bytes); BLOCK_K is the logical width.
+    # MXFP6 stays native on gfx950 for blocked K=128 tiles: the kernel
+    # unpacks its dense factor-3-packed K in-register and feeds the
+    # unpacked codes to `tl.dot_scaled`, which lowers to native
+    # v_mfma_scale_*_f8f6f4 instead of decomposing to a plain bf16 dot.
+    # Storage is dense (4 values per 3 bytes); BLOCK_K is the logical
+    # width.
 
     k = triton.compile(
         triton.compiler.ASTSource(
@@ -643,8 +645,8 @@ def test_compile_only_dot_mxfp6_gfx950(nonkdim: int) -> None:
         options={"matrix_instr_nonkdim": nonkdim},
     )
     amdgcn = k.asm["amdgcn"]
-    assert re.search(r"v_mfma_f32_", amdgcn), "The AMDGCN does not contain plain v_mfma_f32 instructions."
-    assert "f8f6f4" not in amdgcn, "The AMDGCN unexpectedly uses the native f8f6f4 instruction."
+    assert re.search(r"v_mfma_scale_f32_", amdgcn), "The AMDGCN does not contain scaled v_mfma_scale_f32 instructions."
+    assert not re.search(r"v_mfma_f32_", amdgcn), "The AMDGCN unexpectedly contains plain v_mfma_f32 instructions."
 
 
 def test_compile_only_dot_mxfp6_gfx1250(monkeypatch) -> None:
