@@ -1091,7 +1091,7 @@ std::optional<BarrierPlan> getBarrierPlan(BarrierCandidate &candidate) {
 
   for (const auto &use : candidate.arrives) {
     ttng::ArriveBarrierOp arrive = use.op;
-    if (arrive.getPerThread() || arrive.isMulticast() ||
+    if (arrive.getPerThread() || arrive.getPerWarp() || arrive.isMulticast() ||
         !isAlwaysTrue(arrive.getPred()) || !isWarpUniform(arrive))
       return std::nullopt;
   }
