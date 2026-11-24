@@ -1210,7 +1210,8 @@ def test_mxgemm_bench_defaults_and_overrides():
     # four-stage static loop with the merged handoff barrier, static cluster
     # steps, two C slots, and the overlap peel. FP32 at K=4096 keeps three
     # stages with the overlap peel, and K=32768 uses a four-stage ring with two
-    # C slots. MX8xMX4 splits cluster barriers and starts C stores early.
+    # C slots. MX8xMX4 splits cluster barriers, starts C stores early, and
+    # queues WMMAs (SCHED_MODE[2]).
     _, shapes, variants = bench.parse_benchmark_args(["--dry-run"])
     assert [(variant, args.out_dtype) for variant, _, args in variants] == [("mx8xmx8", "fp32"), ("mx8xmx8", "fp16"),
                                                                             ("mx8xmx4", "fp32"), ("mx8xmx4", "fp16")]
@@ -1233,7 +1234,8 @@ def test_mxgemm_bench_defaults_and_overrides():
             assert ("--overlap_peel" in cmd) == (merged or (a8w8 and not four_stage))
             assert "--scale_layout" not in cmd
             assert ("--no-cross_tile_prefetch" in cmd) == (not a8w8)
-            assert ("--split_cluster_barrier" in cmd) == ("--early_c_stores" in cmd) == (not a8w8)
+            assert ("--split_cluster_barrier" in cmd) == ("--early_c_stores" in cmd) == ("--enable_wmma_queuing"
+                                                                                         in cmd) == (not a8w8)
             assert (cmd[cmd.index("--out_dtype") + 1] if "--out_dtype" in cmd else "fp32") == args.out_dtype
 
     _, shapes, variants = bench.parse_benchmark_args(
@@ -1243,6 +1245,11 @@ def test_mxgemm_bench_defaults_and_overrides():
         cmd = bench._command(bench._case_args(args, shapes[0]), shapes[0], dtype_b)
         assert cmd[cmd.index("--cluster_layout") + 1] == "2x2"
         assert cmd[cmd.index("--xcd_remap") + 1] == "none"
+
+    # --no-enable-wmma-queuing turns off MX8xMX4's WMMA queuing.
+    _, shapes, variants = bench.parse_benchmark_args(["--variant", "mx8xmx4", "--no-enable-wmma-queuing", "--dry-run"])
+    for _, dtype_b, args in variants:
+        assert "--enable_wmma_queuing" not in bench._command(bench._case_args(args, shapes[0]), shapes[0], dtype_b)
 
     # wave256 scales apply to MX8xMX8 only; opting out of the merged barrier
     # restores the three-stage FP16 schedule with six C slots.
