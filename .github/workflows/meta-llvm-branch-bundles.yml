@@ -1,0 +1,112 @@
+name: Meta LLVM branch bundles
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: LLVM branches to check
+        type: choice
+        default: all
+        options: [all, core, amd]
+  pull_request:
+    paths:
+      - .github/scripts/select_meta_llvm_branches.py
+      - .github/scripts/meta_llvm_assets.py
+      - .github/scripts/meta_llvm_ready.py
+      - .github/scripts/test_meta_llvm_bump.py
+      - .github/workflows/meta-llvm-branch-bundles.yml
+      - .github/workflows/meta-llvm-build.yml
+      - .github/workflows/llvm-build.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - run: python3 -m pip install pytest
+      - run: python3 -m pytest -s --tb=short .github/scripts/test_meta_llvm_bump.py
+
+  select:
+    if: github.event_name != 'pull_request' && github.repository == 'facebookexperimental/triton'
+    runs-on: ubuntu-latest
+    outputs:
+      requests: ${{ steps.requests.outputs.requests }}
+      candidates: ${{ steps.requests.outputs.candidates }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - run: python3 -m pip install PyYAML
+      - name: Select unpublished branch bundles
+        id: requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ inputs.kind || 'all' }}
+        run: python3 .github/scripts/select_meta_llvm_branches.py
+
+  build:
+    name: Build ${{ matrix.request.kind }} branch bundle
+    needs: select
+    if: needs.select.outputs.requests != '[]'
+    permissions:
+      contents: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        request: ${{ fromJSON(needs.select.outputs.requests) }}
+    uses: ./.github/workflows/meta-llvm-build.yml
+    with:
+      kind: ${{ matrix.request.kind }}
+      llvm_sha: ${{ matrix.request.llvm_sha }}
+      build_number: ${{ matrix.request.build_number }}
+      publish: true
+
+  ready-issues:
+    name: File validated bundle readiness issues
+    needs: [select, build]
+    if: ${{ !cancelled() && needs.select.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    concurrency:
+      group: meta-llvm-ready-issues
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - run: python3 -m pip install PyYAML
+      - name: Ensure each ready candidate has a tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATES: ${{ needs.select.outputs.candidates }}
+        shell: python
+        run: |
+          import json, os, subprocess
+          failures = []
+          for candidate in json.loads(os.environ['CANDIDATES']):
+              env = dict(os.environ, CANDIDATE=json.dumps(candidate))
+              result = subprocess.run(['python3', '.github/scripts/meta_llvm_ready.py', 'issue'], env=env)
+              if result.returncode:
+                  failures.append(candidate['kind'])
+          if failures:
+              raise RuntimeError('Readiness notification failed for ' + ', '.join(failures))

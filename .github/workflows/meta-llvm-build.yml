@@ -58,6 +58,7 @@ jobs:
       short_sha: ${{ steps.revision.outputs.short_sha }}
       prefix: ${{ steps.revision.outputs.prefix }}
       platforms: ${{ steps.missing.outputs.platforms }}
+      validation_platforms: ${{ steps.missing.outputs.validation_platforms }}
       repairs: ${{ steps.missing.outputs.repairs }}
       source_needed: ${{ steps.missing.outputs.source_needed }}
       source_json: ${{ steps.source.outputs.content }}
@@ -127,7 +128,9 @@ jobs:
           path: .llvm-workflow
           ref: ${{ github.sha }}
           persist-credentials: false
-          sparse-checkout: .github/workflows
+          sparse-checkout: |
+            .github/workflows
+            .github/scripts
 
       - name: Set up workflow parser Python
         uses: actions/setup-python@v7
@@ -161,36 +164,45 @@ jobs:
           SOURCE_DIGEST: ${{ steps.source.outputs.digest }}
           SOURCE_NAME: ${{ steps.revision.outputs.source_name }}
           BUILD_CONFIGS: ${{ steps.recipe.outputs.configs }}
-        shell: bash
+        shell: python
         run: |
-          if release_id="$(gh api "repos/${GH_REPO}/releases/tags/${LLVM_RELEASE_TAG}" --jq '.id' 2>/dev/null)"; then
-            assets="$(gh api "repos/${GH_REPO}/releases/${release_id}/assets?per_page=100" --paginate --slurp | jq -c 'add')"
-          else
-            assets='[]'
-          fi
-          jq -e 'all(.[]; .digest != null)' <<< "$assets" >/dev/null || {
-            echo 'Published assets are missing GitHub digests' >&2
-            exit 1
-          }
-          existing_source="$(jq -r --arg name "$SOURCE_NAME" '.[] | select(.name == $name) | .digest' <<< "$assets")"
-          if [[ -n "$existing_source" ]]; then
-            [[ "$existing_source" == "$SOURCE_DIGEST" ]] || {
-              echo 'Existing LLVM source provenance differs' >&2
-              exit 1
-            }
-          fi
-          echo "source_needed=$([[ -z "$existing_source" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          plan="$(jq -cn --argjson assets "$assets" --argjson configs "$BUILD_CONFIGS" --arg p "$PREFIX" --arg s "$SHORT_SHA" --arg n "$BUILD_NUMBER" '
-            $configs
-            | map(. as $config
-                  | ("\($p)-\($s)-\(.["target-os"])-\(.arch)-\($n).tar.gz") as $name
-                  | {config: $config, name: $name, asset: ([$assets[] | select(.name == $name)] | first)}) as $platforms
-            | {platforms: [$platforms[] | select(.asset == null) | .config],
-               repairs: [$platforms[] | select(.asset != null) | .name as $name
-                         | select(any($assets[]; .name == $name + ".sha256") | not)
-                         | {name: .name, digest: .asset.digest}]}')"
-          echo "platforms=$(jq -c '.platforms' <<< "$plan")" >> "$GITHUB_OUTPUT"
-          echo "repairs=$(jq -c '.repairs' <<< "$plan")" >> "$GITHUB_OUTPUT"
+          import json, os, re, sys
+          sys.path.insert(0, '.llvm-workflow/.github/scripts')
+          from meta_llvm_assets import published_assets, release_assets
+
+          _, raw_assets = release_assets(os.environ['GH_REPO'], os.environ['LLVM_RELEASE_TAG'])
+          assets = published_assets(raw_assets)
+          configs = json.loads(os.environ['BUILD_CONFIGS'])
+          source_name = os.environ['SOURCE_NAME']
+          stem = f"{os.environ['PREFIX']}-{os.environ['SHORT_SHA']}"
+          number = os.environ['BUILD_NUMBER']
+          names = {source_name}
+          for config in configs:
+              name = f"{stem}-{config['target-os']}-{config['arch']}-{number}.tar.gz"
+              names.update((name, name + '.sha256'))
+          for name in names:
+              if name in assets and re.fullmatch(r'sha256:[0-9a-f]{64}', assets[name].get('digest') or '') is None:
+                  raise RuntimeError(f'{name}: published asset is missing a GitHub digest')
+          source = assets.get(source_name)
+          if source is not None and source['digest'] != os.environ['SOURCE_DIGEST']:
+              raise RuntimeError('Existing LLVM source provenance differs')
+          platforms, repairs = [], []
+          for config in configs:
+              name = f"{stem}-{config['target-os']}-{config['arch']}-{number}.tar.gz"
+              if name not in assets:
+                  platforms.append(config)
+              elif name + '.sha256' not in assets:
+                  repairs.append({'name': name, 'digest': assets[name]['digest']})
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('source_needed=' + str(source is None).lower() + '\n')
+              output.write('platforms=' + json.dumps(platforms) + '\n')
+              output.write('repairs=' + json.dumps(repairs) + '\n')
+              validation = []
+              for config in configs:
+                  name = f"{stem}-{config['target-os']}-{config['arch']}-{number}.tar.gz"
+                  digest = assets[name]['digest'] if name in assets else ''
+                  validation.append(dict(config, archive_digest=digest))
+              output.write('validation_platforms=' + json.dumps(validation) + '\n')
 
       - name: Define worker inputs
         id: build_call
@@ -230,16 +242,18 @@ jobs:
   validate:
     name: Validate ${{ matrix.config['target-os'] }}-${{ matrix.config.arch }} SDK
     needs: [prepare, build]
-    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.platforms != '[]' }}
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     runs-on: ${{ matrix.config.runs_on }}
     container: ${{ matrix.config.container }}
     strategy:
       fail-fast: false
       matrix:
-        config: ${{ fromJSON(needs.prepare.outputs.platforms) }}
+        config: ${{ fromJSON(needs.prepare.outputs.validation_platforms) }}
     env:
       LLVM_PACKAGE: ${{ needs.prepare.outputs.prefix }}
       LLVM_INSTALL_DIR: ${{ needs.prepare.outputs.prefix }}-${{ needs.prepare.outputs.short_sha }}-${{ matrix.config['target-os'] }}-${{ matrix.config.arch }}-${{ inputs.build_number }}
+      SOURCE_JSON: ${{ needs.prepare.outputs.source_json }}
+      SDK_PLATFORM: ${{ matrix.config['target-os'] }}-${{ matrix.config.arch }}
     steps:
       - name: Install validation toolchain on AlmaLinux
         if: matrix.config.target-os == 'almalinux'
@@ -269,11 +283,52 @@ jobs:
       - name: Install consumer build tools
         run: python3 -m pip install cmake ninja
 
-      - name: Download SDK
+      - name: Select SDK download source
+        id: sdk
+        env:
+          BUILD_PLATFORMS: ${{ needs.prepare.outputs.platforms }}
+          TARGET_OS: ${{ matrix.config['target-os'] }}
+          ARCH: ${{ matrix.config.arch }}
+        shell: 'python3 {0}'
+        run: |
+          import json, os
+          built = any(c['target-os'] == os.environ['TARGET_OS'] and c['arch'] == os.environ['ARCH']
+                      for c in json.loads(os.environ['BUILD_PLATFORMS']))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('built=' + str(built).lower() + '\n')
+
+      - name: Download new SDK
+        if: steps.sdk.outputs.built == 'true'
         uses: actions/download-artifact@v8.0.1
         with:
           name: ${{ needs.prepare.outputs.prefix }}-${{ matrix.config['target-os'] }}-${{ matrix.config.arch }}
           path: dist
+
+      - name: Download published SDK
+        if: steps.sdk.outputs.built != 'true'
+        shell: 'python3 {0}'
+        run: |
+          import os, shutil, urllib.request
+          from pathlib import Path
+          archive = os.environ['LLVM_INSTALL_DIR'] + '.tar.gz'
+          Path('dist').mkdir(exist_ok=True)
+          url = 'https://github.com/facebookexperimental/triton/releases/download/meta-llvm/' + archive
+          with urllib.request.urlopen(url, timeout=300) as response, open('dist/' + archive, 'wb') as output:
+              shutil.copyfileobj(response, output)
+
+      - name: Verify published SDK download
+        if: steps.sdk.outputs.built != 'true'
+        env:
+          ARCHIVE_DIGEST: ${{ matrix.config.archive_digest }}
+        shell: 'python3 {0}'
+        run: |
+          import hashlib, os
+          digest = hashlib.sha256()
+          with open('dist/' + os.environ['LLVM_INSTALL_DIR'] + '.tar.gz', 'rb') as file:
+              for block in iter(lambda: file.read(1024 * 1024), b''):
+                  digest.update(block)
+          if 'sha256:' + digest.hexdigest() != os.environ['ARCHIVE_DIGEST']:
+              raise RuntimeError('Published SDK download digest differs')
 
       - name: Check relocated SDK consumer
         shell: bash
@@ -283,21 +338,50 @@ jobs:
           bash "$GITHUB_WORKSPACE/.github/scripts/validate_llvm_sdk.sh"
           sha256sum "${LLVM_INSTALL_DIR}.tar.gz" > "${LLVM_INSTALL_DIR}.tar.gz.sha256"
 
+      - name: Record SDK validation provenance
+        shell: 'python3 {0}'
+        run: |
+          import json, os
+          from pathlib import Path
+          archive = os.environ['LLVM_INSTALL_DIR'] + '.tar.gz'
+          checksum = Path('dist/' + archive + '.sha256').read_text().split()[0]
+          record = {'schema_version': 1, 'source': json.loads(os.environ['SOURCE_JSON']),
+                    'platform': os.environ['SDK_PLATFORM'], 'sha256': checksum,
+                    'run': 'https://github.com/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID'],
+                    'attempt': int(os.environ['GITHUB_RUN_ATTEMPT']), 'workflow_sha': os.environ['GITHUB_SHA']}
+          Path('dist/' + archive + '.validation.json').write_text(json.dumps(record, sort_keys=True) + '\n')
+
       - name: Upload validation checksum
         uses: actions/upload-artifact@v7
         with:
           name: validated-${{ needs.prepare.outputs.prefix }}-${{ matrix.config['target-os'] }}-${{ matrix.config.arch }}
-          path: dist/*.tar.gz.sha256
+          path: |
+            dist/*.tar.gz.sha256
+            dist/*.validation.json
           retention-days: 7
 
   release:
     name: Publish GitHub Release
     needs: [prepare, build, validate]
-    if: ${{ inputs.publish && !cancelled() && needs.prepare.result == 'success' && (needs.prepare.outputs.platforms != '[]' || needs.prepare.outputs.repairs != '[]' || needs.prepare.outputs.source_needed == 'true') }}
+    if: ${{ inputs.publish && !cancelled() && needs.prepare.result == 'success' && needs.validate.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - name: Checkout release helpers
+        uses: actions/checkout@v6.0.2
+        with:
+          path: .llvm-release
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+            .github/workflows
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
       - name: Download build archives
         if: needs.prepare.outputs.platforms != '[]'
         uses: actions/download-artifact@v8.0.1
@@ -307,7 +391,6 @@ jobs:
           merge-multiple: true
 
       - name: Download validation checksums
-        if: needs.prepare.outputs.platforms != '[]'
         uses: actions/download-artifact@v8.0.1
         with:
           pattern: validated-${{ needs.prepare.outputs.prefix }}-*
@@ -329,7 +412,8 @@ jobs:
           TRITON_SHA: ${{ github.sha }}
         shell: bash
         run: |
-          mkdir -p dist
+          mkdir -p dist validated
+          cp dist/*.tar.gz.sha256 dist/*.validation.json validated/
           while IFS=$'\t' read -r name digest; do
             printf '%s  %s\n' "${digest#sha256:}" "$name" > "dist/${name}.sha256"
           done < <(jq -r '.[] | [.name, .digest] | @tsv' <<< "$REPAIRS")
@@ -338,19 +422,43 @@ jobs:
           ((${#sidecars[@]} > 0)) || [[ "$PLATFORMS" == '[]' ]]
           printf '%s\n' "$SOURCE_JSON" > "dist/$SOURCE_NAME"
           tag="$LLVM_RELEASE_TAG"
-          exists=false
-          existing_assets='[]'
-          if gh release view "$tag" >/dev/null 2>&1; then
-            exists=true
-            release_id="$(gh api "repos/${GH_REPO}/releases/tags/${tag}" --jq '.id')"
-            existing_assets="$(gh api "repos/${GH_REPO}/releases/${release_id}/assets?per_page=100" --paginate --slurp | jq -c 'add')"
-          fi
+          python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, '.llvm-release/.github/scripts')
+          from meta_llvm_assets import release_assets
+          release, assets = release_assets(os.environ['GH_REPO'], os.environ['LLVM_RELEASE_TAG'])
+          state = {'exists': release is not None, 'assets': assets}
+          Path('.llvm-release-assets.json').write_text(json.dumps(state))
+          PY
+          exists="$(jq -r '.exists' .llvm-release-assets.json)"
           for sidecar in "${sidecars[@]}"; do
             archive="${sidecar%.sha256}"
-            name="${archive##*/}"
             if [[ -f "$archive" ]]; then
               (cd dist && sha256sum --check "${sidecar##*/}")
             fi
+          done
+          python3 - "$SOURCE_NAME" "${sidecars[@]}" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, '.llvm-release/.github/scripts')
+          from meta_llvm_assets import published_assets, recover_starters
+          names = {sys.argv[1]}
+          for path in map(Path, sys.argv[2:]):
+              names.add(path.name)
+              archive = path.with_suffix('')
+              if archive.is_file():
+                  names.add(archive.name)
+          state_file = Path('.llvm-release-assets.json')
+          state = json.loads(state_file.read_text())
+          assets = recover_starters(os.environ['GH_REPO'], state['assets'], names)
+          state['published'] = list(published_assets(assets).values())
+          state_file.write_text(json.dumps(state))
+          PY
+          existing_assets="$(jq -c '.published' .llvm-release-assets.json)"
+          for sidecar in "${sidecars[@]}"; do
+            archive="${sidecar%.sha256}"
+            name="${archive##*/}"
             if jq -e --arg name "$name" 'any(.[]; .name == $name)' <<< "$existing_assets" >/dev/null; then
               digest="$(jq -r --arg name "$name" '.[] | select(.name == $name) | .digest // empty' <<< "$existing_assets")"
               [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -397,3 +505,14 @@ jobs:
             done
           done
           gh release view "$tag" --json url --jq '.url'
+
+      - name: Publish validated bundle completion record
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_JSON: ${{ needs.prepare.outputs.source_json }}
+          VALIDATED_DIR: ${{ github.workspace }}/validated
+        shell: bash
+        run: |
+          cd .llvm-release
+          python3 -m pip install PyYAML
+          python3 .github/scripts/meta_llvm_ready.py publish
