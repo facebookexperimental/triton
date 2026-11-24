@@ -245,6 +245,32 @@ def test_mm_mxfp_gfx950_long_k_split12():
     _check_sample(out, inputs, scale_bytes)
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1024, 1024, 159744),
+        (1024, 6144, 159744),
+        (2048, 6144, 159744),
+        (2048, 3072, 12416),
+        (1024, 1024, 24576),
+        (2048, 1024, 24576),
+        (1024, 3072, 15360),
+        (2048, 3072, 15360),
+        (1024, 6144, 22656),
+        (2048, 6144, 22656),
+    ],
+)
+def test_mm_mxfp_gfx950_blocked_scale_routes(shape):
+    from triton.tlx.ops import mm_mxfp
+
+    inputs, scale_bytes = _inputs(*shape, sf_layout="cublas_blocked")
+    out = mm_mxfp(*inputs, sf_layout="cublas_blocked")
+    assert torch.isfinite(out).all()
+    for rows, cols in ((slice(0, 256), slice(0, 128)), (slice(-256, None), slice(-128, None))):
+        reference = _reference_slice(inputs, scale_bytes, rows, cols)
+        torch.testing.assert_close(out[rows, cols].float(), reference, rtol=0.03, atol=0.5)
+
+
 def test_mm_mxfp_gfx950_compact_blocked_route():
     from triton.tlx.ops import mm_mxfp
 
