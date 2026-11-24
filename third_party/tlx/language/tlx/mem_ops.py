@@ -1598,8 +1598,10 @@ def async_descriptor_load(
         f"eviction_policy must be '', 'evict_first', or 'evict_last', got '{eviction_policy}'")
     ndim = len(desc.block_shape)
     assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
-    # 1D TMA doesn't use swizzling, so request unswizzled NVMMASharedEncoding.
-    swizzled = ndim > 1
+    # 1D TMA doesn't use swizzling, so request unswizzled NVMMASharedEncoding. An explicitly unswizzled NVMMA
+    # destination is kept as is.
+    layout = result.type.layout
+    swizzled = ndim > 1 and not (isinstance(layout, tlx.nv_mma_shared_layout_encoding) and not layout.swizzled)
     result_handle = require_nv_mma_shared_layout(result, swizzled, _semantic.builder)
     multicast_targets = _semantic._convert_to_ir_values(multicast_targets, require_i64=False)
     offsets = _semantic._convert_to_ir_values(offsets, require_i64=False)
