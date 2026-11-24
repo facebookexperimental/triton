@@ -639,10 +639,11 @@ cleanup:
   return NULL;
 }
 
+// On AMD, Triton allocates all shared memory (LDS) statically in the kernel
+// binary, so every launch below requests 0 bytes of dynamic shared memory.
 static void _launch(int gridX, int gridY, int gridZ, int num_warps,
-                    int num_ctas, int launch_cooperative_grid,
-                    int shared_memory, int warp_size, hipStream_t stream,
-                    hipFunction_t function, void **params) {
+                    int num_ctas, int launch_cooperative_grid, int warp_size,
+                    hipStream_t stream, hipFunction_t function, void **params) {
   if (gridX == 0 || gridY == 0 || gridZ == 0)
     return;
   if (num_ctas > 1) {
@@ -667,7 +668,7 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps,
     HIP_LAUNCH_CONFIG config = {
         gridX * num_ctas,      gridY,  gridZ,        // Grid size
         warp_size * num_warps, 1,      1,            // Block size
-        shared_memory,         stream, attributes, 2 // Number of attributes
+        /*sharedMemBytes=*/0,  stream, attributes, 2 // Number of attributes
     };
     HIP_CHECK(
         hipSymbolTable.hipDrvLaunchKernelEx(&config, function, params, 0));
@@ -675,12 +676,12 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps,
   } else if (launch_cooperative_grid) {
     HIP_CHECK(hipSymbolTable.hipModuleLaunchCooperativeKernel(
         function, gridX, gridY, gridZ, warp_size * num_warps, 1, 1,
-        shared_memory, stream, params, 0));
+        /*sharedMemBytes=*/0, stream, params, 0));
     return;
   } else {
     HIP_CHECK(hipSymbolTable.hipModuleLaunchKernel(
         function, gridX, gridY, gridZ, warp_size * num_warps, 1, 1,
-        shared_memory, stream, params, 0));
+        /*sharedMemBytes=*/0, stream, params, 0));
   }
 }
 
@@ -1131,9 +1132,10 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     goto cleanup;
   }
 
+  // `shared_memory` is not forwarded: on AMD all shared memory is allocated
+  // statically, so it is not requested as dynamic shared memory at launch.
   _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid,
-          shared_memory, warp_size, (hipStream_t)_stream,
-          (hipFunction_t)_function, params);
+          warp_size, (hipStream_t)_stream, (hipFunction_t)_function, params);
 
   if (!launchHook(launch_exit_hook, launch_metadata)) {
     goto cleanup;
@@ -1156,7 +1158,7 @@ cleanup:
 typedef struct {
   PyObject_HEAD vectorcallfunc vectorcall;
   hipFunction_t function;
-  int num_warps, num_ctas, shared_memory, warp_size;
+  int num_warps, num_ctas, warp_size;
   int cooperative, physical_cluster_x;
   Py_ssize_t global_size, global_align, profile_size, profile_align;
   PyObject *signature, *allocator, *profile_allocator;
@@ -1206,7 +1208,7 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
     Py_ssize_t fallback;
   } fields[] = {{"num_warps", &self->num_warps, 0},
                 {"num_ctas", &self->num_ctas, 1},
-                {"shared_mem", &self->shared_memory, 0},
+                {"shared_mem", NULL, 0},
                 {"warp_size", &self->warp_size, 0},
                 {"launch_cooperative_grid", &self->cooperative, 0},
                 {"physical_cluster_x", &self->physical_cluster_x, 0}};
@@ -1218,7 +1220,8 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
       PyErr_SetString(PyExc_ValueError, "Invalid HIP launch metadata");
       goto fail;
     }
-    *fields[i].target = (int)value;
+    if (fields[i].target)
+      *fields[i].target = (int)value;
   }
   if (self->num_warps == 0 || self->warp_size == 0 || self->num_ctas == 0 ||
       self->num_warps > INT_MAX / self->warp_size) {
@@ -1352,8 +1355,8 @@ static PyObject *TritonDispatcher_vectorcall(PyObject *object,
       !extractPointer(params[count + 1], profile) || PyErr_Occurred())
     goto cleanup;
   _launch(launch_x, grid[1], grid[2], self->num_warps, self->num_ctas,
-          self->cooperative, self->shared_memory, self->warp_size,
-          (hipStream_t)stream, self->function, params);
+          self->cooperative, self->warp_size, (hipStream_t)stream,
+          self->function, params);
 cleanup:
   Py_XDECREF(global);
   Py_XDECREF(profile);
