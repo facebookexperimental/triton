@@ -360,6 +360,12 @@
 - **Fix**: before `doTaskIdPropagate`, if the function has any `ttg.partition`/`async_task_id` tag but some `tt.warp_specialize` loop has none, bail out of WS for the whole function. Placing the skipped loop in a single partition is not safe either, since nothing orders it after the other partitions' writes.
 - **Lit test**: `ws-skip-unpartitioned-second-loop.mlir` (register GEMM loop + pointer-load/TMA-reduce loop through PSM and WS): one `tt.descriptor_reduce`, no `ttg.warp_specialize`. Without the fix the reduce appears 3 times.
 
+### 50. Buffer with multiple cross-partition producers: release builds keep one and miscompile (2026-11-17, fixed)
+- **Symptom**: debug builds abort with `Multiple cross-partition producers encountered` in `createAllocChannel`; release builds keep the last producer and produce wrong values (2.7-4.7% NaN elements in the register-MMA reduction-epilogue E2E of #4843 on main).
+- **Root cause** (`WSCodePartition.cpp`, `createLocalAlloc`): the `local_store` for a register channel takes the task ids of the channel source's defining op. For an `scf.for` result (a register-MMA K loop feeding a reduction epilogue in a separate partition) that is every task, so several non-consumer tasks write the buffer. `createAllocChannel` runs after the irreversible `doConvertDescriptorLoadsToNVWS`, so it cannot bail out there.
+- **Fix**: `hasMultipleCrossPartitionProducers` predicts those stores (same channels and grouping as `createBuffer`) right before the descriptor-load rewrite; on a hit, emit a warning and bail out of WS. The assert is now `report_fatal_error`, so unmodeled cases crash instead of miscompiling. Known gap: a user `local_alloc` with a tensor source carrying several task ids is not modeled.
+- **Lit test**: `ws-bail-multiple-cross-partition-producers.mlir` (aborts without the fix; the `tt.merge_epilogue` variant still specializes).
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
