@@ -53,4 +53,4 @@ Without `--version`, AMD FA perf runs `simple`, `prefetch`, and `persistent`; se
 
 gfx1250:
 
-`third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_mxfp_gemm_perf.py [--transpose-b]`
+`third_party/tlx/denoise.sh python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py [--dry-run]`  (MXFP GEMM)

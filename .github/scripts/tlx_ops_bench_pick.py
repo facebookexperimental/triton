@@ -10,7 +10,6 @@ import os
 import re
 import subprocess
 import urllib.parse
-from zoneinfo import ZoneInfo
 
 PLATFORMS = ("b200", "h100", "mi350")
 VERDICTS = ("success", "failure", "timed_out")
@@ -49,9 +48,6 @@ def main():
     event = os.environ["EVENT_NAME"]
     platforms = [p for p in PLATFORMS if p not in os.environ.get("SKIP_PLATFORMS", "")]
     now = datetime.datetime.now(datetime.timezone.utc)
-    if event == "schedule" and now.astimezone(ZoneInfo("America/Los_Angeles")).hour not in (0, 1):
-        print("Outside the Pacific midnight window; nothing to bench.")
-        return
     date = os.environ.get("INPUT_DATE") or now.strftime("%Y%m%d")
     if not re.fullmatch(r"\d{8}", date):
         raise SystemExit(f"not a YYYYMMDD date: {date}")

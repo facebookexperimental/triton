@@ -60,4 +60,4 @@ FailureOr<triton::LinearLayout> deduceRegLayoutFromPaddedShared(
 
 } // namespace mlir::triton::AMD
 
-#endif
+#endif // TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_ASYNCUTILITY_H_

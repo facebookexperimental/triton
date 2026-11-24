@@ -387,13 +387,14 @@ static TwoCTAPairRank buildTwoCTAPairRank(OpBuilderWithAsyncTaskIds &builder,
 
 // True when the only readers of the buffer `load` writes (its whole
 // multi-buffered allocation, looking through memdesc views) are A or B
-// operands of 2-CTA MMAs. The leader issues those MMAs alone, so the follower
-// never reads the tile itself.
+// operands of 2-CTA MMAs, and there is at least one. The leader issues those
+// MMAs alone, so the follower never reads the tile itself.
 static bool onlyFeedsTwoCTAMMAs(ttnvws::DescriptorLoadOp load) {
   Value root = load.getResult();
   if (auto view = root.getDefiningOp<ttg::MemDescIndexOp>())
     root = view.getSrc();
   SmallVector<Value> worklist{root};
+  bool sawMMA = false;
   while (!worklist.empty()) {
     Value v = worklist.pop_back_val();
     for (Operation *user : v.getUsers()) {
@@ -408,9 +409,10 @@ static bool onlyFeedsTwoCTAMMAs(ttnvws::DescriptorLoadOp load) {
       auto mma = dyn_cast<ttng::MMAv5OpInterface>(user);
       if (!mma || !mma.getTwoCtas() || (mma.getA() != v && mma.getB() != v))
         return false;
+      sawMMA = true;
     }
   }
-  return true;
+  return sawMMA;
 }
 
 Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,

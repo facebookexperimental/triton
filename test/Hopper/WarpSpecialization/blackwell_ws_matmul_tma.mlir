@@ -536,4 +536,3 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return
   }
 }
-
