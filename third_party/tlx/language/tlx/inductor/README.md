@@ -20,6 +20,38 @@ TorchTLX templates are jinja-based kernel definitions that encode our best-perfo
 
 Our performance strategy operates on two parallel tracks: improving standalone TLX kernels upstream and closing any remaining gap when running through the Inductor template path.
 
+### gfx950 FlexAttention backward
+
+`gfx950_flex_attention_bwd` is an opt-in gfx950-only BF16 candidate for
+FlexAttention backward when Q, K, and V have equal head dimensions of 64 or
+128. It uses the backward `BlockMask` metadata in both orientations:
+KV/FULL_KV for dQ and Q/FULL_Q for dK/dV, including elementwise `mask_mod` for
+partial blocks. The initial configuration is
+`(BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2) = (32, 128, 128, 32)` with four
+warps; it uses LDS async loads and scheduled CDNA4 MFMA for dQ.
+
+`TORCHINDUCTOR_TLX_MODE=allow` adds the eligible candidate beside stock choices;
+`force` uses it only when eligible, otherwise retains the stock choice. The
+PyTorch backward lowering must call `append_flex_attention_backward_choices`
+and provide the complete `mutated_inputs` list; without that hook contract, no
+backward TLX candidate is registered. TLX also declares its required HIP
+template options (`matrix_instr_nonkdim`, `waves_per_eu`, and `kpack`) through
+the optional `tlx_only_hip_options` integration hook.
+
+### sm90 FlexAttention backward
+
+`sm90_flex_attention_bwd` is a Hopper candidate for FlexAttention backward with
+short queries: Q_LEN <= 64, equal head dimensions of 64, 80, 96 or 128, no GQA,
+and a single sparse Q and KV block (`mask_mod` and `score_mod` still apply
+elementwise). One CTA per (batch, head) reads K/V once and keeps the query
+block and dQ on chip, instead of the stock split into dK/dV and dQ programs.
+It joins the candidates through `append_flex_attention_backward_choices`.
+
+With `tlx_config.sdpa_to_flex`, a routed SDPA backward whose dK and dV only
+meet in one add requests `TLX_KV_SUM`: the template writes dK + dV once and
+the lowering returns zeros for dV. The stock template cannot honor that
+contract, so those calls keep only the TLX choice.
+
 ## Naming Conventions
 
 Names carry the architecture, because in this codebase "which GPU" is the question
@@ -125,9 +157,10 @@ Second, it scales better than manual agentic kernel authoring. There is growing 
 
 ## Knob
 
-`TORCHINDUCTOR_TLX_MODE` (unset by default)
-- unset / any other value - TLX not considered (standard inductor behavior; the config value is `None`)
+`TORCHINDUCTOR_TLX_MODE`
+- unset - use the active Triton build default (`allow` in FBTriton)
+- off / default - TLX not considered (standard Inductor behavior; the config value is `None`)
 - allow - TLX added to candidates, competes via autotuning
 - force - TLX templates enabled + forced epilogue fusion
 
-Only `allow` and `force` engage TLX; every other value (including an unset env var or a legacy `default`) maps to `None`, leaving TLX off. TLX is additionally a no-op unless the active Triton is the fbtriton fork.
+The environment variable takes precedence over the build default. TLX is additionally a no-op unless the active Triton ships the torchTLX integration.

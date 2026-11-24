@@ -14,16 +14,16 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
   // CHECK-DAG: [[C64:%.*]] = llvm.mlir.constant(64 : i32)
   // CHECK-DAG: [[C128:%.*]] = llvm.mlir.constant(128 : i32)
 
-  // CHECK: nvvm.barrier id = [[C2]] number_of_threads = [[C128]]
-  // CHECK: nvvm.barrier id = [[C3]] number_of_threads = [[C64]]
+  // CHECK: nvvm.barrier id = [[C2]] number_of_threads = [[C128]] aligned = false
+  // CHECK: nvvm.barrier id = [[C3]] number_of_threads = [[C64]] aligned = false
   // CHECK: bar.warp.sync
 
   // CHECK: bb{{[0-9]+}}:
-  // CHECK-NEXT: nvvm.barrier id = [[C0]] number_of_threads = [[C128]]
+  // CHECK-NEXT: nvvm.barrier id = [[C0]] number_of_threads = [[C128]] aligned = false
   nvvm.barrier
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 10>}
   default {
-    // CHECK: nvvm.barrier id = [[C0]] number_of_threads = [[C128]]
+    // CHECK: nvvm.barrier id = [[C0]] number_of_threads = [[C128]] aligned = false
     nvvm.barrier
     ttg.warp_yield
   }
@@ -39,7 +39,7 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
     nvvm.barrier
     ttg.warp_return
   } : () -> ()
-  // CHECK: nvvm.barrier id = [[C0]] number_of_threads = [[C128]]
+  // CHECK: nvvm.barrier id = [[C0]] number_of_threads = [[C128]] aligned = false
   nvvm.barrier
   llvm.return
 }
@@ -232,21 +232,21 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 11 : i32, 
 llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
 
 // AMD-LABEL: @rewrite_barriers
-// AMD-DAG: llvm.mlir.global internal @nbar1
-// AMD-DAG: llvm.mlir.global internal @nbar2
-// AMD-DAG: llvm.mlir.global internal @nbar3
-// AMD-DAG: llvm.mlir.global internal @nbar4
+// AMD-DAG: llvm.mlir.global internal @nbar1() {addr_space = 15 : i32}
+// AMD-DAG: llvm.mlir.global internal @nbar2() {addr_space = 15 : i32}
+// AMD-DAG: llvm.mlir.global internal @nbar3() {addr_space = 15 : i32}
+// AMD-DAG: llvm.mlir.global internal @nbar4() {addr_space = 15 : i32}
 
 llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
   // AMD: bb{{[0-9]+}}:
   // AMD-NEXT: rocdl.barrier
 
   // Check that named barriers are used and that we have the correct counts:
-  // AMD-DAG-COUNT-6: rocdl.s.barrier.join
-  // AMD-DAG-COUNT-4: rocdl.s.barrier.signal.var {{.*}}, 4
-  // AMD-DAG-COUNT-1: rocdl.s.barrier.signal.var {{.*}}, 2
-  // AMD-DAG-COUNT-1: rocdl.s.barrier.signal.var {{.*}}, 1
-  // AMD-DAG-COUNT-6: rocdl.s.barrier.wait 1
+  // AMD-DAG-COUNT-6: rocdl.s.barrier.join {{.*}} : !llvm.ptr<15>
+  // AMD-DAG-COUNT-4: rocdl.s.barrier.signal.var {{.*}} member_cnt = 4
+  // AMD-DAG-COUNT-1: rocdl.s.barrier.signal.var {{.*}} member_cnt = 2
+  // AMD-DAG-COUNT-1: rocdl.s.barrier.signal.var {{.*}} member_cnt = 1
+  // AMD-DAG-COUNT-6: rocdl.s.barrier.wait id = 1
 
   rocdl.barrier
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 10>}
@@ -274,14 +274,17 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
 
 // -----
 
-module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 11 : i32} {
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 11 : i32, "ttng.warp_specialize_barrier_ids" = array<i32: 2, 4, 5>} {
 
 llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
 
 // CHECK: llvm.func internal @inner_func_nw4_ws(%arg0: i32)
 llvm.func internal @inner_func_nw4() attributes {"ws_num_warps" = 4 : i32} {
   // CHECK: [[C128:%.*]] = llvm.mlir.constant(128 : i32)
-  // CHECK: nvvm.barrier id = %arg0 number_of_threads = [[C128]]
+  // CHECK: "use.barrier_id"(%arg0) : (i32) -> ()
+  %barrier_id = nvg.warp_group_barrier_id
+  "use.barrier_id"(%barrier_id) : (i32) -> ()
+  // CHECK: nvvm.barrier id = %arg0 number_of_threads = [[C128]] aligned = false
   // CHECK: llvm.call @inner_func_nw4_ws(%arg0) : (i32) -> ()
   nvvm.barrier
   llvm.call @inner_func_nw4() : () -> ()
@@ -291,7 +294,7 @@ llvm.func internal @inner_func_nw4() attributes {"ws_num_warps" = 4 : i32} {
 // CHECK: llvm.func internal @inner_func_nw2_ws(%arg0: f32 {some.attr = "some_value"}, %arg1: i32)
 llvm.func internal @inner_func_nw2(%arg0: f32 {some.attr = "some_value"}) attributes {"ws_num_warps" = 2 : i32} {
   // CHECK: [[C64:%.*]] = llvm.mlir.constant(64 : i32)
-  // CHECK: nvvm.barrier id = %arg1 number_of_threads = [[C64]]
+  // CHECK: nvvm.barrier id = %arg1 number_of_threads = [[C64]] aligned = false
   nvvm.barrier
   llvm.return
 }
@@ -310,8 +313,8 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
   // CHECK-DAG: [[CST:%.*]] = llvm.mlir.constant({{.*}}) : f32
   // CHECK-DAG: [[C0:%.*]] = llvm.mlir.constant(0 : i32)
   // CHECK-DAG: [[C2:%.*]] = llvm.mlir.constant(2 : i32)
-  // CHECK-DAG: [[C3:%.*]] = llvm.mlir.constant(3 : i32)
   // CHECK-DAG: [[C4:%.*]] = llvm.mlir.constant(4 : i32)
+  // CHECK-DAG: [[C5:%.*]] = llvm.mlir.constant(5 : i32)
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 10>}
   default {
     llvm.call @inner_func_nw4() : () -> ()
@@ -325,13 +328,13 @@ llvm.func @rewrite_barriers() attributes {allocation.offset = 32 : i32} {
     ttg.warp_return
   }
   partition1() num_warps(2) {
-    // CHECK: call @inner_func_nw2_ws([[CST]], [[C3]]) : (f32, i32) -> ()
+    // CHECK: call @inner_func_nw2_ws([[CST]], [[C4]]) : (f32, i32) -> ()
     %cst = llvm.mlir.constant(4.2 : f32) : f32
     llvm.call @inner_func_nw2(%cst) : (f32) -> ()
     ttg.warp_return
   }
   partition2() num_warps(1) {
-    // CHECK: call @inner_func_nw1_ws([[C4]]) : (i32) -> ()
+    // CHECK: call @inner_func_nw1_ws([[C5]]) : (i32) -> ()
     llvm.call @inner_func_nw1() : () -> ()
     ttg.warp_return
   } : () -> ()
@@ -373,7 +376,7 @@ llvm.func @generate_switch_loop() attributes {allocation.offset = 32 : i32} {
   // CHECK-NEXT: llvm.cond_br [[IS_DEFAULT]] weights([4, 7]), [[BODY:\^.*]], [[SWITCH_LOOP:\^.*]]
 
   // CHECK: [[SWITCH_LOOP]]:
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: [[SMEM_BASE:%.*]] = llvm.getelementptr [[SMEM_ADDR]][32] : (!llvm.ptr<3>) -> !llvm.ptr<3>, i8
   // CHECK-NEXT: [[REL_WID:%.*]] = llvm.sub [[WARP_ID]], [[C4]]
 
@@ -386,29 +389,29 @@ llvm.func @generate_switch_loop() attributes {allocation.offset = 32 : i32} {
   // CHECK-NEXT: 3: [[EXIT:\^.*]]
 
   // CHECK: [[DEFAULT]]:
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
-  // CHECK-NEXT: llvm.br [[SWITCH_LOOP]] {loop_annotation = #llvm.loop_annotation<licm = <disable = true>>}
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
+  // CHECK-NEXT: llvm.br [[SWITCH_LOOP]] loop_annotation = <licm = <disable = true>>
 
   // CHECK: [[EXIT]]:
   // CHECK-NEXT: llvm.return
 
   // CHECK: [[PARTITION0]]:
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: "partition0"
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: llvm.br [[SWITCH_LOOP]]
 
   // CHECK: [[PARTITION1]]:
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: "partition1"
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: llvm.br [[SWITCH_LOOP]]
 
   // CHECK: [[PARTITION2]]:
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: "partition2"
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: llvm.br [[SWITCH_LOOP]]
 
   // CHECK: [[BODY]]:
@@ -431,12 +434,12 @@ llvm.func @generate_switch_loop() attributes {allocation.offset = 32 : i32} {
   // CHECK-NEXT: [[PTR:%.*]] = llvm.getelementptr [[SMEM_BASE]][6]
   // CHECK-NEXT: llvm.store [[C2_i8]], [[PTR]]
 
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: llvm.br [[DEFAULT_PARTITION:\^.*]]
   // CHECK: [[DEFAULT_PARTITION]]:
   // CHECK-NEXT: "default"
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: llvm.br [[AFTER:\^.*]]
 
   // AMD: [[WID:%.*]] = rocdl.wave.id : i32
@@ -459,7 +462,7 @@ llvm.func @generate_switch_loop() attributes {allocation.offset = 32 : i32} {
   // AMD: [[DEFAULT]]:
   // AMD-NEXT: rocdl.barrier
   // AMD-NEXT: rocdl.barrier
-  // AMD-NEXT: llvm.br [[SWITCH_LOOP]] {loop_annotation = #llvm.loop_annotation<licm = <disable = true>>}
+  // AMD-NEXT: llvm.br [[SWITCH_LOOP]] loop_annotation = <licm = <disable = true>>
 
   // AMD: [[EXIT]]:
   // AMD-NEXT: llvm.return
@@ -546,7 +549,7 @@ llvm.func @generate_switch_loop() attributes {allocation.offset = 32 : i32} {
   // CHECK-NEXT: llvm.store [[C3_i8]], [[PTR]]
   // CHECK-NEXT: [[PTR:%.*]] = llvm.getelementptr [[SMEM_BASE]][6]
   // CHECK-NEXT: llvm.store [[C3_i8]], [[PTR]]
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: llvm.return
 
   // AMD: [[AFTER:\^bb[0-9]+]]:
@@ -590,27 +593,27 @@ llvm.func @pass_captures() attributes {allocation.offset = 32 : i32} {
 
   // CHECK: ^bb4:
   // CHECK-NEXT: [[ARG0_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 0] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // CHECK-NEXT: [[ARG0:%.*]] = llvm.load [[ARG0_PTR]] {alignment = 1 : i64}
+  // CHECK-NEXT: [[ARG0:%.*]] = llvm.load [[ARG0_PTR]] <alignment = 1>
   // CHECK-NEXT: [[ARG1_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 1] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // CHECK-NEXT: [[ARG1:%.*]] = llvm.load [[ARG1_PTR]] {alignment = 1 : i64}
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: [[ARG1:%.*]] = llvm.load [[ARG1_PTR]] <alignment = 1>
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: "use"([[ARG0]], [[ARG1]])
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
 
   // CHECK: ^bb5:
   // CHECK: [[INS:%.*]]:2 = "produce"()
   // CHECK: [[ARG0_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 0] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // CHECK-NEXT: llvm.store [[INS]]#0, [[ARG0_PTR]] {alignment = 1 : i64}
+  // CHECK-NEXT: llvm.store [[INS]]#0, [[ARG0_PTR]] <alignment = 1>
   // CHECK-NEXT: [[ARG1_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 1] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // CHECK-NEXT: llvm.store [[INS]]#1, [[ARG1_PTR]] {alignment = 1 : i64}
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: llvm.store [[INS]]#1, [[ARG1_PTR]] <alignment = 1>
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
 
   // AMD: ^bb4:
   // AMD-NEXT: [[ARG0_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 0] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // AMD-NEXT: [[ARG0:%.*]] = llvm.load [[ARG0_PTR]] {alignment = 1 : i64}
+  // AMD-NEXT: [[ARG0:%.*]] = llvm.load [[ARG0_PTR]] <alignment = 1>
   // AMD-NEXT: [[ARG1_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 1] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // AMD-NEXT: [[ARG1:%.*]] = llvm.load [[ARG1_PTR]] {alignment = 1 : i64}
+  // AMD-NEXT: [[ARG1:%.*]] = llvm.load [[ARG1_PTR]] <alignment = 1>
   // AMD-NEXT: rocdl.barrier
   // AMD-NEXT: "use"([[ARG0]], [[ARG1]])
   // AMD-NEXT: rocdl.barrier
@@ -618,9 +621,9 @@ llvm.func @pass_captures() attributes {allocation.offset = 32 : i32} {
   // AMD: ^bb5:
   // AMD: [[INS:%.*]]:2 = "produce"()
   // AMD: [[ARG0_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 0] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // AMD-NEXT: llvm.store [[INS]]#0, [[ARG0_PTR]] {alignment = 1 : i64}
+  // AMD-NEXT: llvm.store [[INS]]#0, [[ARG0_PTR]] <alignment = 1>
   // AMD-NEXT: [[ARG1_PTR:%.*]] = llvm.getelementptr [[SMEM_ADDR]][0, 1] : (!llvm.ptr<3>) -> !llvm.ptr<3>, !llvm.struct<packed (i32, i64)>
-  // AMD-NEXT: llvm.store [[INS]]#1, [[ARG1_PTR]] {alignment = 1 : i64}
+  // AMD-NEXT: llvm.store [[INS]]#1, [[ARG1_PTR]] <alignment = 1>
   // AMD-NEXT: rocdl.barrier
   // AMD-NEXT: rocdl.barrier
 
@@ -719,6 +722,31 @@ llvm.func @partition_warpid_order() attributes {allocation.offset = 32 : i32} {
 
 // -----
 
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 5 : i32} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @warpid_one_warp_partition
+llvm.func @warpid_one_warp_partition() attributes {allocation.offset = 32 : i32} {
+  // CHECK: [[C0:%.*]] = llvm.mlir.constant(0 : i32) : i32
+  // CHECK-NOT: ttg.warp_id
+  // CHECK: "use"([[C0]]) : (i32) -> ()
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(1) {
+    %0 = ttg.warp_id
+    "use"(%0) : (i32) -> ()
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+
+}
+
+// -----
+
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 12 : i32} {
 
 llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
@@ -773,7 +801,7 @@ llvm.func @multiple_specialize() attributes {allocation.offset = 32 : i32} {
   // CHECK-NEXT: llvm.store [[C2_i8]], [[PTR]]
   // CHECK-NEXT: [[PTR:%.*]] = llvm.getelementptr %{{[0-9]+}}[7]
   // CHECK-NEXT: llvm.store [[Cn1_i8]], [[PTR]]
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
   // CHECK: "ws0_default"
 
   // AMD: llvm.switch
@@ -851,7 +879,7 @@ llvm.func @multiple_specialize() attributes {allocation.offset = 32 : i32} {
   // CHECK-NEXT: llvm.store [[C3_i8]], [[PTR]]
   // CHECK-NEXT: [[PTR:%.*]] = llvm.getelementptr %{{[0-9]+}}[7]
   // CHECK-NEXT: llvm.store [[C3_i8]], [[PTR]]
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
   // CHECK: "ws1_default"
 
   // AMD: getelementptr
@@ -903,7 +931,7 @@ llvm.func @multiple_specialize() attributes {allocation.offset = 32 : i32} {
   // CHECK-NEXT: llvm.store [[Cn1_i8]], [[PTR]]
   // CHECK-NEXT: [[PTR:%.*]] = llvm.getelementptr %{{[0-9]+}}[7]
   // CHECK-NEXT: llvm.store [[Cn1_i8]], [[PTR]]
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
   // CHECK: "ws2_default"
 
   // AMD: getelementptr
@@ -947,7 +975,7 @@ llvm.func @multiple_specialize() attributes {allocation.offset = 32 : i32} {
   // CHECK-NEXT: llvm.store [[C5_i8]], [[PTR]]
   // CHECK-NEXT: [[PTR:%.*]] = llvm.getelementptr %{{[0-9]+}}[7]
   // CHECK-NEXT: llvm.store [[C5_i8]], [[PTR]]
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
   // CHECK: "ws3_default"
 
   // AMD: getelementptr
@@ -999,29 +1027,29 @@ llvm.func @cfg() attributes {allocation.offset = 32 : i32} {
   // COMMON-NEXT: 1: [[EXIT:\^.*]]
 
   // CHECK: [[PARTITION]]:
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: "something"()[[[A:\^.*]], [[B:\^.*]]]
   // CHECK: [[A]]:
   // CHECK-NEXT: "A"
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: llvm.br [[SWITCH_LOOP]]
   // CHECK: [[B]]:
   // CHECK-NEXT: "B"
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: llvm.br [[SWITCH_LOOP]]
 
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK: llvm.br [[DEFAULT:\^.*]]
   // CHECK: [[DEFAULT]]:
   // CHECK-NEXT: "something"()[[[A:\^.*]], [[B:\^.*]]]
   // CHECK: [[A]]:
   // CHECK-NEXT: "A"
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: llvm.br [[AFTER:\^.*]]
   // CHECK: [[B]]:
   // CHECK-NEXT: "B"
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: llvm.br [[AFTER]]
 
   // AMD: [[PARTITION]]:
@@ -1176,13 +1204,13 @@ llvm.func @trivial_remat() attributes {allocation.offset = 0 : i32} {
   }
   partition0(%arg0: i32, %arg1: !llvm.ptr<3>) num_warps(1) {
   // CHECK: ^bb4:
-    // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+    // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
     // CHECK-NEXT: "use"([[CAP0]], [[CAP1]])
   // AMD: ^bb4:
     // AMD-NEXT: rocdl.barrier
     // AMD-NEXT: "use"([[CAP0]], [[CAP1]])
     "use"(%arg0, %arg1) : (i32, !llvm.ptr<3>) -> ()
-    // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+    // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
     // AMD-NEXT: rocdl.barrier
     ttg.warp_return
   } : (i32, !llvm.ptr<3>) -> ()
@@ -1205,7 +1233,7 @@ llvm.func @remat_subgraph(%arg0: i32, %arg1: i32) attributes {allocation.offset 
   }
   partition0(%arg2: !llvm.ptr<3>, %arg3: i32) num_warps(1) {
   // CHECK: ^bb4:
-    // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+    // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
     // CHECK-NEXT: [[ADD:%.*]] = llvm.add %arg0, %arg1 : i32
     // CHECK-NEXT: [[MUL:%.*]] = llvm.mul [[ADD]], %arg1 : i32
     // CHECK-NEXT: [[UREM:%.*]] = llvm.urem [[ADD]], [[MUL]] : i32
@@ -1219,7 +1247,7 @@ llvm.func @remat_subgraph(%arg0: i32, %arg1: i32) attributes {allocation.offset 
     // AMD-NEXT: [[PTR:%.*]] = llvm.getelementptr [[ADDR]][%arg0]
     // AMD-NEXT: "use"([[PTR]], [[UREM]])
     "use"(%arg2, %arg3) : (!llvm.ptr<3>, i32) -> ()
-    // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+    // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
     // AMD-NEXT: rocdl.barrier
     ttg.warp_return
   } : (!llvm.ptr<3>, i32) -> ()
@@ -1242,7 +1270,7 @@ llvm.func @dynamic_register_reallocation() attributes {allocation.offset = 0 : i
 
   // CHECK: [[SWITCH_LOOP]]:
   // CHECK-NEXT: nvvm.setmaxregister decrease 24
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK: llvm.switch
   // CHECK-NEXT: 0: [[PARTITION0:\^.*]],
   // CHECK-NEXT: 1: [[PARTITION1:\^.*]],
@@ -1251,33 +1279,33 @@ llvm.func @dynamic_register_reallocation() attributes {allocation.offset = 0 : i
 
   // CHECK: [[PARTITION0]]:
   // CHECK-NEXT: nvvm.setmaxregister increase 80
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: "partition0"()
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: nvvm.setmaxregister decrease 24
 
   // CHECK: [[PARTITION1]]:
   // CHECK-NEXT: nvvm.setmaxregister increase 48
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: "partition1"()
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: nvvm.setmaxregister decrease 24
 
   // CHECK: [[PARTITION2]]:
   // CHECK-NEXT: nvvm.setmaxregister increase 128
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: "partition2"()
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: nvvm.setmaxregister decrease 24
 
   // CHECK: [[ENTRY]]:
   // CHECK-NEXT: nvvm.setmaxregister increase 248
 
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: setmaxregister decrease 152
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK: "default"
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: setmaxregister increase 248
 
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 12>, actualRegisters = array<i32: 152, 80, 48, 128>}
@@ -1316,7 +1344,7 @@ llvm.func @dynamic_register_reallocation_overalloc() attributes {allocation.offs
 
   // CHECK: [[SWITCH_LOOP]]:
   // CHECK-NEXT: nvvm.setmaxregister decrease 80
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK: llvm.switch
   // CHECK-NEXT: 0: [[PARTITION0:\^.*]],
   // CHECK-NEXT: 1: [[PARTITION1:\^.*]],
@@ -1325,33 +1353,33 @@ llvm.func @dynamic_register_reallocation_overalloc() attributes {allocation.offs
 
   // CHECK: [[PARTITION0]]:
   // CHECK-NEXT: nvvm.setmaxregister decrease 24
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: "partition0"()
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: nvvm.setmaxregister increase 80
 
   // CHECK: [[PARTITION1]]:
   // CHECK-NEXT: nvvm.setmaxregister increase 192
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: "partition1"()
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: nvvm.setmaxregister decrease 80
 
   // CHECK: [[PARTITION2]]:
   // CHECK-NEXT: nvvm.setmaxregister increase 192
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: "partition2"()
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: nvvm.setmaxregister decrease 80
 
   // CHECK: [[ENTRY]]:
   // CHECK-NEXT: nvvm.setmaxregister increase 256
 
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: setmaxregister decrease 104
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK-NEXT: nvvm.barrier id = [[C1]] aligned = false
   // CHECK: "default"
-  // CHECK: "llvm.nvvm.barrier.cta.sync.all"([[C1]])
+  // CHECK: nvvm.barrier id = [[C1]] aligned = false
   // CHECK-NEXT: setmaxregister increase 256
 
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 12>, actualRegisters = array<i32: 104, 24, 192, 192>}
@@ -1391,13 +1419,13 @@ llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 :
 
 // default warps keep arrive/wait after bar init
 // CHECK: mbarrier.init.shared::cta.b64
-// CHECK-NEXT: nvvm.cluster.arrive {aligned}
-// CHECK-NEXT: nvvm.cluster.wait {aligned}
+// CHECK-NEXT: nvvm.cluster.arrive aligned
+// CHECK-NEXT: nvvm.cluster.wait aligned
 
 llvm.func @paired_cta_cluster_sync(%a: !llvm.ptr<3>, %b: i1) attributes {allocation.offset = 0 : i32} {
   %c = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "@$0 mbarrier.init.shared::cta.b64 [$1], 2;", "b,r" %b, %a : (i1, !llvm.ptr<3>) -> !llvm.void
-  nvvm.cluster.arrive {aligned}
-  nvvm.cluster.wait {aligned}
+  nvvm.cluster.arrive aligned
+  nvvm.cluster.wait aligned
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
   default {
     ttg.warp_yield
@@ -1428,7 +1456,7 @@ llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 :
 
 llvm.func @explicit_cluster_sync_no_ws_arrive(%a: !llvm.ptr<3>, %b: i1) attributes {allocation.offset = 0 : i32} {
   %c = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "@$0 mbarrier.init.shared::cta.b64 [$1], 2;", "b,r" %b, %a : (i1, !llvm.ptr<3>) -> !llvm.void
-  nvvm.cluster.wait {aligned}
+  nvvm.cluster.wait aligned
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
   default {
     ttg.warp_yield
@@ -1461,18 +1489,18 @@ llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 :
 
 // Cleanup: non-default warps arrive at partition end before looping back
 // CHECK: "use"
-// CHECK: nvvm.cluster.arrive {aligned}
+// CHECK: nvvm.cluster.arrive aligned
 // CHECK-NEXT: llvm.br
 
 // Default warps: arrive/wait after bar init
 // CHECK: mbarrier.init.shared::cta.b64
-// CHECK-NEXT: nvvm.cluster.arrive {aligned}
-// CHECK-NEXT: nvvm.cluster.wait {aligned}
+// CHECK-NEXT: nvvm.cluster.arrive aligned
+// CHECK-NEXT: nvvm.cluster.wait aligned
 
 llvm.func @cluster_sync_init_and_cleanup(%a: !llvm.ptr<3>, %b: i1) attributes {allocation.offset = 0 : i32} {
   %c = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "@$0 mbarrier.init.shared::cta.b64 [$1], 2;", "b,r" %b, %a : (i1, !llvm.ptr<3>) -> !llvm.void
-  nvvm.cluster.arrive {aligned}
-  nvvm.cluster.wait {aligned}
+  nvvm.cluster.arrive aligned
+  nvvm.cluster.wait aligned
   ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
   default {
     ttg.warp_yield
@@ -1584,7 +1612,7 @@ llvm.func @single_ws_no_end_realloc() attributes {allocation.offset = 0 : i32} {
   // A partition restores its registers on entry, then ends with just a branch:
   // no trailing barrier and no setmaxregister restore.
   // CHECK: nvvm.setmaxregister increase 80
-  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"
+  // CHECK-NEXT: nvvm.barrier id = %{{[0-9]+}} aligned = false
   // CHECK-NEXT: "partition0"
   // CHECK-NEXT: llvm.br
 

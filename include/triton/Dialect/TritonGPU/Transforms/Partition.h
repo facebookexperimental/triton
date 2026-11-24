@@ -3,7 +3,6 @@
 
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -13,6 +12,10 @@ class Operation;
 class OpOperand;
 class OpResult;
 class Region;
+namespace scf {
+class ForOp;
+class WhileOp;
+} // namespace scf
 } // namespace mlir
 
 static constexpr char kPartitionTypesAttrName[] = "ttg.partition.types";
@@ -57,6 +60,8 @@ public:
   // previous iterations, including the distance in the past.
   void iterateDefs(LoopLikeOpInterface loop,
                    function_ref<void(OpResult, unsigned)> callback) const;
+  void iterateDefs(scf::WhileOp loop,
+                   function_ref<void(OpResult, unsigned)> callback) const;
   // Iterate the uses of all outputs of the partition in the current iteration
   // and in future iterations, including the distance in the future.
   void iterateUses(
@@ -99,8 +104,8 @@ public:
   // Get the number of partitions.
   unsigned getNumPartitions() const { return partitions.size(); }
 
-  // Deserialize a partition set from a supported loop using the attributes
-  // tagged on operations in its scheduled body.
+  // Deserialize a partition set from an `scf.for` or `scf.while` using the
+  // attributes tagged on operations in its regions.
   static FailureOr<PartitionSet> fromLoop(LoopLikeOpInterface loop);
 
   // Serialize the partition set to the loop attributes.

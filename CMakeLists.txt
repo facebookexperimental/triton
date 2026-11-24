@@ -8,9 +8,9 @@ endif()
 
 project(triton CXX C)
 include(CTest)
-include(GNUInstallDirs)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -20,11 +20,14 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 option(TRITON_BUILD_PYTHON_MODULE "Build Python Triton bindings" OFF)
 option(TRITON_BUILD_PROTON "Build the Triton Proton profiler" ON)
+option(TRITON_BUILD_NVIDIA_GSAN_RUNTIME
+       "Build the CUDA/NVPTX GSan device runtime for the NVIDIA backend" ON)
+option(TRITON_STABLE_ABI "Build with Python Stable ABI (abi3) for Python 3.12+" OFF)
 option(TRITON_BUILD_UT "Build C++ Triton Unit Tests" ON)
 option(TRITON_BUILD_WITH_CCACHE "Build with ccache (if available)" ON)
 option(TRITON_BUILD_TLX "Build Triton TLX" ON)
 option(TRITON_OFFLINE_BUILD "Build without downloading dependencies" OFF)
-option(TRITON_EXT_ENABLED "Build with default visibility for Triton+LLVM symbol exposure to plugin extensions" OFF)
+option(TRITON_EXT_ENABLED "Build with default visibility for Triton+LLVM symbol exposure to plugin extensions" ON)
 option(TRITON_ENABLE_Z3_JOINT_SOLVER "Enable the native Z3 joint modulo scheduler" OFF)
 set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
 set(TRITON_VERSION "" CACHE STRING "Triton version string (passed from setup.py)")
@@ -33,8 +36,8 @@ set(TRITON_CACHE_PATH "" CACHE PATH "Path to triton cache")
 set(TRITON_LLVM_SYSTEM_SUFFIX "" CACHE STRING "Path to LLVM system suffix")
 set(LLVM_SYSPATH "" CACHE PATH "Path to system LLVM installation")
 set(JSON_SYSPATH "" CACHE PATH "Path to system nlohmann/json headers")
+set(TRITON_AMD_CODEGEN_PATH "" CACHE FILEPATH "Path override for AMD code-generation library")
 set(TRITON_PTXAS_PATH "" CACHE FILEPATH "Path override for ptxas")
-set(TRITON_PTXAS_BLACKWELL_PATH "" CACHE FILEPATH "Path override for ptxas-blackwell")
 set(TRITON_CUOBJDUMP_PATH "" CACHE FILEPATH "Path override for cuobjdump")
 set(TRITON_NVDISASM_PATH "" CACHE FILEPATH "Path override for nvdisasm")
 set(TRITON_CUDACRT_PATH "" CACHE PATH "Path to CUDA CRT headers.")
@@ -60,11 +63,11 @@ endif()
 if(NOT "${JSON_SYSPATH}" STREQUAL "")
   list(APPEND TRITON_BUILD_HELPER_COMMON_ARGS --json-syspath "${JSON_SYSPATH}")
 endif()
+if(NOT "${TRITON_AMD_CODEGEN_PATH}" STREQUAL "")
+  list(APPEND TRITON_BUILD_HELPER_COMMON_ARGS --triton-amd-codegen-path "${TRITON_AMD_CODEGEN_PATH}")
+endif()
 if(NOT "${TRITON_PTXAS_PATH}" STREQUAL "")
   list(APPEND TRITON_BUILD_HELPER_COMMON_ARGS --triton-ptxas-path "${TRITON_PTXAS_PATH}")
-endif()
-if(NOT "${TRITON_PTXAS_BLACKWELL_PATH}" STREQUAL "")
-  list(APPEND TRITON_BUILD_HELPER_COMMON_ARGS --triton-ptxas-blackwell-path "${TRITON_PTXAS_BLACKWELL_PATH}")
 endif()
 if(NOT "${TRITON_CUOBJDUMP_PATH}" STREQUAL "")
   list(APPEND TRITON_BUILD_HELPER_COMMON_ARGS --triton-cuobjdump-path "${TRITON_CUOBJDUMP_PATH}")
@@ -118,6 +121,8 @@ set_property(
   PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/python/build_helpers.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/llvm-info.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/meta-llvm-info.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/python/meta_llvm.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/json-version.txt"
 )
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -142,6 +147,12 @@ if(TRITON_BUILD_PYTHON_MODULE)
     APPEND
     PROPERTY CMAKE_CONFIGURE_DEPENDS
       "${CMAKE_CURRENT_SOURCE_DIR}/python/build_helpers.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/amd-llvm-info.json"
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/meta-amd-llvm-info.json"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/amd/backend/codegen/CMakeLists.txt"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/amd/backend/codegen/amdgpu_codegen.cc"
+      "${CMAKE_CURRENT_SOURCE_DIR}/include/triton/Tools/LLVMOptions.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/lib/Tools/LLVMOptions.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/cmake/nvidia-toolchain-version.json"
   )
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -210,7 +221,7 @@ endif()
 # Compiler flags
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(NOT MSVC)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__STDC_FORMAT_MACROS  -fPIC -std=gnu++17")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__STDC_FORMAT_MACROS  -fPIC")
 else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__STDC_FORMAT_MACROS")
 endif()
@@ -288,13 +299,25 @@ if(NOT MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DTRITON_EXT_ENABLED=1")
   endif()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wno-covered-switch-default ")
+  # MLIR still supports attribute-dictionary builders during the properties
+  # migration. Keep their deprecation warnings visible but non-fatal.
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=deprecated-declarations")
+  # GCC 15 cannot rule out the null-storage branch of
+  # Operation::getPropertiesStorage() in MLIR's inline Properties setters and
+  # reports a write to address zero (-Wstringop-overflow). Keep these false
+  # positives visible but non-fatal.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+     CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=stringop-overflow")
+  endif()
 else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4244 /wd4624 /wd4715 /wd4530")
 endif()
 
 include_directories(".")
-include_directories(${MLIR_INCLUDE_DIRS})
-include_directories(${LLVM_INCLUDE_DIRS})
+# LLVM/MLIR range comparisons can trigger -Wambiguous-reversed-operator in
+# C++20. Treat these external headers as system includes.
+include_directories(SYSTEM ${MLIR_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include) # Tablegen'd files
 include_directories(${PROJECT_SOURCE_DIR}/third_party)
@@ -324,6 +347,9 @@ if(TRITON_BUILD_PYTHON_MODULE)
   # nanobind expects find_package(Python) which sets Python::Module target
   # and Python_* variables. Triton uses find_package(Python3) instead.
   # Bridge the two by aliasing the target and forwarding variables.
+  if(NOT TARGET Python::Interpreter)
+    add_executable(Python::Interpreter ALIAS Python3::Interpreter)
+  endif()
   if(NOT TARGET Python::Module)
     add_library(Python::Module ALIAS Python3::Module)
     set(Python_EXECUTABLE "${Python3_EXECUTABLE}")
@@ -338,6 +364,9 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
   find_package(nanobind CONFIG REQUIRED HINTS "${Python3_SITELIB}")
   nanobind_build_library(nanobind-static)
+  if(TRITON_STABLE_ABI)
+    target_compile_definitions(nanobind-static PUBLIC Py_LIMITED_API=0x030C0000)
+  endif()
   target_link_libraries(nanobind-static PRIVATE Python3::Module)
 
   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
@@ -400,6 +429,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
     MLIRUBToLLVM
 
     # LLVM
+    LLVMBitWriter
     LLVMPasses
     LLVMNVPTXCodeGen
     LLVMAMDGPUCodeGen
@@ -430,6 +460,10 @@ if(TRITON_BUILD_PYTHON_MODULE)
                   ${PYTHON_SRC_PATH}/llvm.cc
                   ${PYTHON_SRC_PATH}/bitequiv.cc
                   ${PYTHON_SRC_PATH}/specialize.cc)
+
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(triton PRIVATE -Wno-array-bounds)
+  endif()
 
   # Link triton with its dependencies
   target_link_libraries(triton PRIVATE ${TRITON_LIBRARIES})
@@ -463,13 +497,18 @@ if(TRITON_BUILD_PYTHON_MODULE)
     endif()
     file(GENERATE OUTPUT "${TRITON_EXPORT_SYMBOLS_FILE}"
       CONTENT "${TRITON_EXPORT_SYMBOLS_FILE_CONTENT}")
+  elseif(UNIX AND NOT APPLE)
+    # Extensions use the Triton and LLVM symbols libtriton exports. Put them all
+    # under a TRITON symbol version, so that neither libtriton nor an extension
+    # linked against it binds to another LLVM in the process, such as a
+    # libLLVM.so loaded RTLD_GLOBAL (ROCm's, which torch preloads, versions its
+    # symbols LLVM_<major>). Not available on macOS or Windows.
+    set(TRITON_EXPORT_SYMBOLS_FILE "${CMAKE_CURRENT_BINARY_DIR}/triton.exports")
+    file(GENERATE OUTPUT "${TRITON_EXPORT_SYMBOLS_FILE}"
+      CONTENT "TRITON {\n  global:\n    *;\n};\n")
+    target_link_options(triton PRIVATE
+      "LINKER:--version-script,${TRITON_EXPORT_SYMBOLS_FILE}")
   endif()
-
-  install(TARGETS triton
-    COMPONENT libraries
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  )
 
   if (NOT DEFINED LLVM_SYSPATH)
       message(FATAL_ERROR "LLVM_SYSPATH must be set.")
@@ -483,6 +522,28 @@ if(TRITON_BUILD_PYTHON_MODULE)
     "${LLVM_SYSPATH}/bin/FileCheck"
     "${TRITON_WHEEL_DIR}/FileCheck"
     COPYONLY)
+
+  # Install Triton headers and TableGen definitions into the wheel staging
+  # directory so that downstream projects can use Triton as a C++ library
+  # without a separate cmake --install step.
+  set(_TRITON_WHEEL_INCLUDE "${TRITON_WHEEL_DIR}/include")
+  install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/
+    COMPONENT wheel_headers
+    DESTINATION "${_TRITON_WHEEL_INCLUDE}"
+    FILES_MATCHING PATTERN "*.h")
+  install(DIRECTORY ${PROJECT_BINARY_DIR}/include/
+    COMPONENT wheel_headers
+    DESTINATION "${_TRITON_WHEEL_INCLUDE}"
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.h.inc")
+  install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/
+    COMPONENT wheel_headers
+    DESTINATION "${_TRITON_WHEEL_INCLUDE}"
+    FILES_MATCHING PATTERN "*.td")
+  install(DIRECTORY ${PROJECT_SOURCE_DIR}/python/
+    COMPONENT wheel_headers
+    DESTINATION "${_TRITON_WHEEL_INCLUDE}/python"
+    FILES_MATCHING PATTERN "*.h"
+    PATTERN "triton" EXCLUDE)
 
   # Build plugins when building libtriton since they depend on libtriton.
   if(TRITON_EXT_ENABLED)
@@ -524,24 +585,3 @@ if(TRITON_BUILD_UT)
     USES_TERMINAL
   )
 endif()
-
-################################################################################
-# Header installation
-################################################################################
-
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/
-  COMPONENT headers
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-  FILES_MATCHING PATTERN "*.h")
-install(DIRECTORY ${PROJECT_BINARY_DIR}/include/
-  COMPONENT headers
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-  FILES_MATCHING PATTERN "*.h" PATTERN "*.h.inc")
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/
-  COMPONENT headers
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-  FILES_MATCHING PATTERN "*.td")
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/python/
-  COMPONENT headers
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/python
-  FILES_MATCHING PATTERN "*.h")

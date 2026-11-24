@@ -4,13 +4,11 @@
 |---|---|
 | TLX tutorial kernels | `pytest third_party/tlx/tutorials/testing/test_correctness.py` |
 | TLX language | `pytest python/test/unit/language/test_tlx_*.py` |
-| AutoWS | `pytest python/test/unit/language/test_autows_*.py` |
 | TorchTLX | `pytest python/test/unit/language/test_torchtlx_*.py` |
 
 Every suite is arch-gated, so cases that do not apply to the GPU you are on skip
-rather than fail. The `test_tlx_*.py` glob covers manual TLX (`tlx.async_tasks`)
-and structurally excludes the AutoWS suites, which are tested separately. Which
-of these run in CI, and on which runners, is described under [CI](ci.html).
+rather than fail. The `test_tlx_*.py` glob covers manual TLX (`tlx.async_tasks`).
+Which of these run in CI, and on which runners, is described under [CI](ci.html).
 
 ## Correctness
 
@@ -30,7 +28,7 @@ cases run and the rest skip. To run just the AMD/IKBO cases:
 
 `third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py [--version {ws|pipelined}]`
 
-`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]`
+`third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version ws_pipelined_pingpong]`
 
 `third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_gemm_perf.py [--version {ws|pipelined|clc|2cta}]`
 
@@ -55,4 +53,4 @@ Without `--version`, AMD FA perf runs `simple`, `prefetch`, and `persistent`; se
 
 gfx1250:
 
-`third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_mxfp_gemm_perf.py [--transpose-b]`
+`third_party/tlx/denoise.sh python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py [--dry-run]`  (MXFP GEMM)

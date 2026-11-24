@@ -3,8 +3,8 @@
 Ping-pong scheduling enforces mutual exclusion around "expensive" GPU
 operations across warp partitions. When two consumer partitions both execute
 expensive ops on shared hardware resources (tensor cores on Hopper, SFU on
-Blackwell), they alternate execution via named barrier synchronization rather
-than competing simultaneously.
+Blackwell), they alternate execution via mbarrier synchronization rather than
+competing simultaneously.
 
 ## Pipeline Integration
 
@@ -25,7 +25,7 @@ Identification is architecture-dependent (`CriticalRegionManager::isExpensiveOp`
 | Architecture | Expensive Ops | Rationale |
 |-------------|--------------|-----------|
 | Hopper (SM90) | `WarpGroupDotOp` (wgmma) | Shared tensor core resources |
-| Blackwell (SM100) | `math::ExpOp`, `math::Exp2Op` (rank > 1 tensors only) | SFU bottleneck for large tensors |
+| Blackwell (SM100) | `math::{Exp,Exp2,Sin,Cos,Tanh,Sqrt,Rsqrt}Op`, pure `tt.elementwise_inline_asm` containing an SFU `.approx` mnemonic (`sin`/`cos`/`ex2`/`lg2`/`tanh`/`rcp`/`rsqrt`/`sqrt`/`div`) and no barrier/memory/control/collective ops (rank > 1 tensors only) | SFU bottleneck for large tensors |
 
 Expensive ops are further classified as:
 - **NonReorderable** (e.g., `WarpGroupDotOp`): has memory effects, so the
@@ -33,18 +33,21 @@ Expensive ops are further classified as:
   SMEM-operand read) marks the op's own boundary; it must **not** be treated as
   an intervening memory effect when deciding whether two expensive ops can be
   grouped (see Step 1), otherwise consecutive WGMMAs never group.
-- **PureArithmetic** (e.g., `math::ExpOp`): memory-effect-free, so the
-  boundary extends forward to the next op with memory effects.
+- **PureArithmetic** (e.g., `math::ExpOp`, pure SFU `.approx` inline
+  asm): memory-effect-free, so the boundary extends forward to the next op
+  with memory effects.
 
-## Named Barrier Allocation
+## Barrier Allocation
 
-Named barriers use indices **7 through 15** (indices 0-6 are reserved for
-producer-consumer mbarriers and warp group sync). Each ping-pong region
-consumes **two** barrier indices — one for "ping" and one for "pong".
+Each ping-pong region allocates a two-element mbarrier group in shared memory.
+Both barriers are initialized with one arrival credit, threaded into the two
+warp-specialization partitions, invalidated, and deallocated after the
+specialized region. Wait phases are derived from the normalized, linearized
+iteration count of the enclosing loops.
 
-Maximum concurrent ping-pong regions: **(15 - 7 + 1) / 2 = 4** (pairs
-`{7,8}`, `{9,10}`, `{11,12}`, `{13,14}`). If barriers are exhausted, the
-region is silently skipped.
+The disabled-by-default mbarrier-to-named-barrier pass may later promote the
+whole pair when two compiler IDs are available. If promotion is disabled or
+the pool is exhausted, PingPong remains correct using the original mbarriers.
 
 ## `doPingPongPrep` Algorithm
 
@@ -88,8 +91,8 @@ After code partitioning, walk `WarpSpecializeOp` regions and insert barriers.
 
 ### Step 1: Discover Regions
 
-Scan partition regions for ops with `pingpong_id` attributes. Allocate a barrier
-pair for each region.
+Scan partition regions for ops with `pingpong_id` attributes. Allocate and
+initialize an mbarrier pair for each region.
 
 ### Step 2: Compute Boundaries
 
@@ -132,5 +135,7 @@ pump — it allows the pong partition's first `wait(pongBarrier)` to proceed
 immediately, since pong goes first by definition. Without this, pong would
 deadlock on the first iteration.
 
-The concrete ops inserted are `NamedBarrierArriveOp` and `NamedBarrierWaitOp`,
-with the thread count set to `(numWarps_ping + numWarps_pong) * 32`.
+The concrete ops inserted are `ArriveBarrierOp` and `WaitBarrierOp`. Each
+arrival is a leader arrival with count one. When promotion is enabled, the pair
+is rewritten atomically to `NamedBarrierArriveOp` and `NamedBarrierWaitOp`, with
+the participant count derived from both partitions.

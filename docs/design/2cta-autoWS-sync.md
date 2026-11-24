@@ -13,11 +13,10 @@
 2. [Problem Statement](#problem-statement)
 3. [Design](#design)
 4. [Implementation](#implementation)
-5. [Generated TTGIR Example](#generated-ttgir-example)
-6. [Files Changed](#files-changed)
-7. [How to Test](#how-to-test)
-8. [Known Limitations and Future Work](#known-limitations-and-future-work)
-9. [Auto-WS + 2-CTA Integration](#auto-ws--2-cta-integration)
+5. [Files Changed](#files-changed)
+6. [How to Test](#how-to-test)
+7. [Known Limitations and Future Work](#known-limitations-and-future-work)
+8. [Auto-WS + 2-CTA Integration](#auto-ws--2-cta-integration)
 
 ---
 
@@ -207,19 +206,18 @@ When `dotOp.getTwoCtas()` is true, AccelerateMatmul takes the user-driven path:
 if (dotOp.getTwoCtas()) {
     // User-driven 2-CTA (ctas_per_cga): no splitBOperand needed.
     // Transform2CTALoads will handle B splitting later.
-    if (clusterDimX < 2 || blockM < 128) {
-        // Unsupported or unsafe for the current compiler implementation.
+    if (clusterDimX < 2 || blockM < 64) {
         // Warn and lower as a normal 1-CTA MMA instead of failing compilation.
         useTwoCTAs = false;
     } else {
         useTwoCTAs = true;
+        if (blockM == 64)
+            tmemCTAMode = TensorMemoryCTAMode::TwoCTA_RHS;
     }
 } else {
-    // Compiler-driven 2-CTA (PlanCTA heuristic): split B at IR level.
-    useTwoCTAs = canUseTwoCTAs(dotOp);
-    if (useTwoCTAs) {
-        b = splitBOperand(b, rewriter);
-    }
+    // Compiler-driven 2-CTA is disabled: PTX requires one CTA mode for every
+    // tcgen05 instruction in a kernel.
+    useTwoCTAs = false;
 }
 // ...
 mma.setTwoCtas(useTwoCTAs);  // Propagates to TCGen5MMAOp
@@ -444,10 +442,13 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
 
 ### Current Limitations
 
-1. **Single phase bit per per-MMA barrier**: `Insert2CTASync` uses one barrier
-   slot per MMA with `phase = (iv - lb) % 2`. This is enough for the current
-   pipeline pattern, but deeper or more complex pipelines may need
-   multi-buffered cross-CTA barriers.
+1. **Rendezvous depth is tied to the operand pipeline**: `Insert2CTASync`
+   multi-buffers the per-MMA barrier to the depth of the MMA's SMEM operand
+   buffers (`getOperandPipelineDepth`) and indexes it with the same slot/phase,
+   so a follower CTA that runs ahead lands on a distinct slot instead of lapping
+   a single barrier's phase bit. Follower drift is therefore bounded by operand
+   buffer availability. A schedule that let the follower advance past its own
+   operand pipeline would still lap the barrier.
 
 2. **Pair-aligned tile scheduler requirement**: In 2-CTA mode, CTAs launch in
    pairs and the paired CTAs must map to compatible logical tiles. For the
@@ -457,15 +458,21 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    boundary and break the B-sharing contract. The compiler currently cannot
    prove arbitrary user tile schedulers are pair-aligned.
 
-3. **`BLOCK_M < 128` falls back to 1-CTA**: When `BLOCK_M < 128`, the TMEM
-   instruction shape is 64, which requires `TensorMemoryCTAMode::TwoCTA_LHS` or
-   `TensorMemoryCTAMode::TwoCTA_RHS` instead of `DEFAULT`. The compiler currently
-   emits a warning and falls back to 1-CTA MMA if `two_ctas=True` with
-   `BLOCK_M < 128`.
+3. **`BLOCK_M < 64` falls back to 1-CTA**: `BlockedToMMAv5` in
+   `AccelerateMatmul.cpp` emits a warning ("two_ctas=True with BLOCK_M < 64 is
+   not supported") and falls back to 1-CTA MMA if `two_ctas=True` with
+   `BLOCK_M < 64`. For `BLOCK_M = 64` the TMEM instruction shape is 64, and the
+   compiler selects `TensorMemoryCTAMode::TwoCTA_RHS` instead of `DEFAULT`.
 
-4. **`TCGen5MMAScaledOp` is not handled by the load transform**: The current
-   `Transform2CTALoads` implementation handles `TCGen5MMAOp`. The scaled variant
-   still needs explicit support before scaled MMA can use this 2-CTA path.
+4. **Scaled 2-CTA MMA does not support dependent chains**: `Transform2CTALoads`
+   and `Insert2CTASync` both reach `TCGen5MMAScaledOp` through
+   `MMAv5OpInterface`, so a standalone scaled MMA can use this 2-CTA path.
+   `Transform2CTALoads` halves the B operand but deliberately keeps the B scale
+   full width per CTA, because the block-scale MMA addresses each CTA's N-half
+   out of the full scale. The dependent-chain machinery has no scaled support:
+   `Analyze2CTADependencies` and `Plan2CTAExchange` walk only `TCGen5MMAOp`, so
+   `CheckMatmulTwoCTAs` rejects a dependent chain involving a scaled dot when
+   `allowDependentChains=false`.
 
 5. **Mixed 2-CTA per kernel is impossible**: The PTX ISA requires all tcgen05
    instructions in a kernel to use the same `cta_group`. FA with selective 2-CTA
@@ -570,28 +577,24 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    established, warn and fall back to 1-CTA instead of compiling an unsafe 2-CTA
    kernel.
 
-3. **Support `BLOCK_M < 128`**: Plumb the required
-   `TensorMemoryCTAMode::TwoCTA_LHS` / `TwoCTA_RHS` mode for the m=64
-   instruction shape instead of falling back to 1-CTA.
-
-4. **Evaluate `.cta_group::2` TMA loads**: D96323995 added `.cta_group::2`
+3. **Evaluate `.cta_group::2` TMA loads**: D96323995 added `.cta_group::2`
    support for TMA loads, which routes barrier arrivals to the leader CTA in
    hardware. A future optimization could use this on B-operand TMA loads and
    potentially eliminate the explicit cross-CTA sync inserted by `Insert2CTASync`.
 
-5. **Support larger even-X CGAs**: `two_ctas=True` should be compatible with
+4. **Support larger even-X CGAs**: `two_ctas=True` should be compatible with
    larger even-sized CGA-X shapes such as `ctas_per_cga=(4,1,1)`. Requiring
    Y/Z == 1 is reasonable, but extending beyond `(2,1,1)` remains future work.
 
-6. **Improve diagnostics**: Replace internal asserts for unsupported 2-CTA
+5. **Improve diagnostics**: Replace internal asserts for unsupported 2-CTA
    patterns with user-facing compiler diagnostics if those cases can be reached
    from normal user code.
 
-7. **Improve pointer-store epilogue support**: Either expand Meta WS
+6. **Improve pointer-store epilogue support**: Either expand Meta WS
    `isEpilogueStoreOp` to recognize pointer stores, or handle the same-partition
    producer case gracefully.
 
-8. **Evaluate the `BtAt` transposed-matmul trick**: The current `AB` 2-CTA path
+7. **Evaluate the `BtAt` transposed-matmul trick**: The current `AB` 2-CTA path
    pairs CTAs along original output rows: same `pid_n`, adjacent `pid_m`.
    Computing `AB` as `(B^T A^T)^T` would transpose the logical output tile grid,
    so the safe pairing would need to become same original `pid_m`, adjacent
@@ -687,7 +690,11 @@ Key properties:
 - The barrier is allocated in the **leader CTA's SMEM** with `InitBarrierOp(count=2)`
 - Both CTAs arrive via `MapToRemoteBufferOp` (PTX `mapa` instruction)
 - Only the leader waits (predicated on `ctaRank % 2 == 0`)
-- The barrier is **single-buffered** with `phase = (iv - lb) / step % 2`
+- The barrier is **multi-buffered** to the MMA's operand pipeline depth `D`. For
+  the linearized loop iteration `i` (`computeLinearBarrierIter`), the slot is
+  `i % D` and the phase is `(i / D) & 1`. At `D == 1` the slot is elided and the
+  phase is the raw parity `i % 2`, so single-buffered kernels emit the same IR
+  as before multi-buffering
 - This barrier is completely separate from the WS pipeline barriers
 
 #### B-Empty Signaling Across CTAs

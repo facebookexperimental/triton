@@ -1,11 +1,27 @@
 import triton.language.core as tl
 from . import types as tlx
 from .mem_ops import remote_view
-from .utility import is_hip
+from .utility import cuda_parse_arch, is_hip
+
+
+def _physical_num_ctas(_semantic):
+    """Number of CTAs that physically execute in a cluster."""
+    cluster_dims = _semantic.builder.options.cluster_dims
+    physical_num_ctas = cluster_dims[0] * cluster_dims[1] * cluster_dims[2]
+    if physical_num_ctas > 1:
+        return physical_num_ctas
+    return _semantic.builder.options.num_ctas
 
 
 def _make_mbarrier_layout_handle(_semantic):
+    # Barrier layouts follow the logical distributed-program model. A
+    # ctas_per_cga cluster keeps each CTA's barrier local, so num_ctas remains 1.
     layout = tlx.layout(tlx.swizzled_layout.make_default(rank=1))
+    num_ctas = _semantic.builder.options.num_ctas
+    if num_ctas > 1:
+        layout.numCTAs = [num_ctas]
+        layout.numCTAsPerCGA = [num_ctas]
+        layout.numCTASplit = [num_ctas]
     layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
         layout.vectorSize,
         layout.perPhase,
@@ -20,7 +36,71 @@ def _make_mbarrier_layout_handle(_semantic):
 
 @tl.builtin
 def cluster_barrier(_semantic=None):
-    _semantic.builder.create_cluster_barrier()
+    """Synchronize all threads in all CTAs of the cluster.
+
+    On AMD, synchronize each workgroup before signaling the cluster barrier.
+    All participating CTAs must execute the same sequence of barriers.
+    """
+    if _semantic.builder.options.backend_name == "hip":
+        _semantic.builder.create_workgroup_barrier()
+        _semantic.builder.create_amd_cluster_barrier()
+    else:
+        _semantic.builder.create_cluster_barrier()
+
+
+@tl.builtin
+def amd_cluster_arrive(_semantic=None):
+    """Signal the AMD cluster barrier without waiting.
+
+    This does not synchronize the workgroup or fence its memory accesses.
+    Pair each arrival with :func:`amd_cluster_wait` before another arrival.
+    All threads and all CTAs in the cluster must execute the same sequence.
+    Independent computation can execute between arrival and wait.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_cluster_arrive is only supported on AMD (HIP) backends")
+    _semantic.builder.create_amd_cluster_arrive()
+
+
+@tl.builtin
+def amd_cluster_wait(_semantic=None):
+    """Wait for the preceding :func:`amd_cluster_arrive` on AMD.
+
+    This does not replace workgroup synchronization or memory completion
+    waits. Use :func:`cluster_barrier` for a full cluster synchronization.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_cluster_wait is only supported on AMD (HIP) backends")
+    _semantic.builder.create_amd_cluster_wait()
+
+
+@tl.builtin
+def cond_barrier(pred: tl.tensor, _semantic=None):
+    """
+    Conditionally execute a workgroup barrier (AMD only).
+
+    Threads for which `pred` is true participate in an `s_barrier`; the rest fall
+    through without waiting. This deliberately diverges the two halves of a
+    workgroup and is the primitive used to phase-shift warp groups for
+    hand-rolled block ping-pong.
+
+    The caller MUST guarantee all threads reconverge: pair a `cond_barrier(pred)`
+    before a loop with a `cond_barrier(~pred)` after it so every thread crosses
+    the same total number of barriers. This op sets no memory fence.
+    """
+    _semantic.builder.create_cond_barrier(pred.handle)
+
+
+@tl.builtin
+def workgroup_barrier(_semantic=None):
+    """
+    Full-workgroup barrier with an LDS memory fence (AMD).
+
+    Lowers to a local (shared-memory-fenced) `s_barrier` bracketed by scheduler
+    barriers so instructions cannot be hoisted across it. Synchronizes threads
+    within the current workgroup.
+    """
+    _semantic.builder.create_workgroup_barrier()
 
 
 @tl.builtin
@@ -40,6 +120,8 @@ def alloc_barriers(
         num_barriers: tl.constexpr,
         arrive_count: tl.constexpr = tl.constexpr(1),
         _semantic=None,
+        *,
+        scope: tl.constexpr = tl.constexpr("cta"),
 ) -> tlx.mbarrier:
     """
     Allocates a buffer in shared memory and initializes mbarriers with arrive counts.
@@ -47,11 +129,34 @@ def alloc_barriers(
     Input:
     - `num_barriers`: The number of barriers to allocate.
     - `arrive_count`: The number of threads that need to arrive at the barrier before it can be released.
+    - `scope`: Compile-time initialization scope, "cta" (default) or "cluster".
+      On NVIDIA sm90+, "cluster" requests compiler-owned initialization fencing
+      and a cluster rendezvous. With multiple physical CTAs, if any entry
+      barrier has cluster scope, all eligible entry barrier initializations
+      (including CTA scope) are batched
+      before TMEM allocation, followed by one fence and rendezvous. Allocate
+      these barriers unconditionally at kernel entry, before use. This does not
+      change arrival counts, storage layout, or launch dimensions, and does not
+      synchronize later pipeline phases.
+      A single physical CTA needs no cluster rendezvous. The default preserves
+      existing behavior, including legacy compiler-inserted synchronization.
     """
+
+    scope = tl._unwrap_if_constexpr(scope)
+    assert isinstance(scope, str) and scope in ("cta", "cluster"), "scope must be 'cta' or 'cluster'"
+    if scope == "cluster":
+        assert _semantic.builder.options.backend_name == "cuda", "cluster barrier scope requires NVIDIA sm90+"
+        assert cuda_parse_arch(_semantic.builder.options.arch) >= 90, "cluster barrier scope requires NVIDIA sm90+"
 
     layout, layout_handle = _make_mbarrier_layout_handle(_semantic)
     return tlx.mbarrier(
-        _semantic.builder.create_alloc_barriers(num_barriers.value, arrive_count.value, layout_handle),
+        _semantic.builder.create_alloc_barriers(
+            num_barriers.value,
+            arrive_count.value,
+            layout_handle,
+            _semantic.builder.options.num_ctas,
+            scope == "cluster",
+        ),
         num_barriers,
         layout,
     )
@@ -82,7 +187,12 @@ def alloc_warp_barrier(
     arrive_count = num_warps.value * 32 * num_arrivals.value
     layout, layout_handle = _make_mbarrier_layout_handle(_semantic)
     return tlx.mbarrier(
-        _semantic.builder.create_alloc_barriers(num_barriers.value, arrive_count, layout_handle),
+        _semantic.builder.create_alloc_barriers(
+            num_barriers.value,
+            arrive_count,
+            layout_handle,
+            _semantic.builder.options.num_ctas,
+        ),
         num_barriers,
         layout,
         is_warp_barrier=True,
@@ -145,6 +255,8 @@ def barrier_arrive(
     arrive_count: tl.constexpr = tl.constexpr(1),
     remote_cta_rank: tl.tensor = None,
     pred: tl.tensor = None,
+    cta_mask: tl.constexpr = None,
+    per_warp: tl.constexpr = False,
     _semantic=None,
 ) -> None:
     """
@@ -152,10 +264,20 @@ def barrier_arrive(
 
     Args:
         bar: The mbarrier to signal. Can be a local mbarrier or a remote view of mbarrier.
-        arrive_count: The number of arrivals to signal.
+        arrive_count: The number of arrivals to signal: from the task, from each thread of a warp
+                      barrier, or from each warp with `per_warp`.
         remote_cta_rank: If provided, the barrier will be mapped to the remote CTA's shared memory
                          before signaling. This allows signaling a barrier in another CTA.
         pred: Optional predicate. If provided, the arrive is only performed when pred is true.
+        cta_mask: Optional compile-time CTA-dimension mask for cluster multicast arrival.
+                  Cannot be combined with remote_cta_rank or a warp barrier.
+        per_warp: If True, each warp of the calling task synchronizes its own lanes and then one of
+                  its lanes arrives with `arrive_count`, instead of the whole task synchronizing
+                  before a single thread arrives. The barrier then counts `arrive_count` times the
+                  task's warp count for this arrive, so a barrier signalled by a 4-warp task this
+                  way is allocated with 4 arrivals per CTA. Per-warp and leader arrives can share a
+                  barrier. `pred` must be the same in all lanes of a warp. Not supported for warp
+                  barriers, with `cta_mask`, or on AMD.
     """
     assert bar.type.storage == tlx.storage_kind.smem, (
         "barrier_arrive does not allow users to pass a remote_view of mbarrier. Remote view is done inside barrier_arrive"
@@ -165,6 +287,27 @@ def barrier_arrive(
     # Capture is_warp_barrier before remote_view, which doesn't preserve it.
     is_warp_bar = getattr(bar, 'is_warp_barrier', False)
 
+    per_warp = tl._unwrap_if_constexpr(per_warp)
+    if per_warp:
+        assert not is_warp_bar, "per_warp is not supported for warp barriers, where every thread arrives"
+        assert cta_mask is None, "per_warp cannot be combined with cta_mask"
+        assert not is_hip(), "per_warp is only supported on NVIDIA GPUs"
+
+    cta_mask_value = None
+    if cta_mask is not None:
+        cta_mask_value = tl._unwrap_if_constexpr(cta_mask)
+        assert isinstance(cta_mask_value,
+                          int) and not isinstance(cta_mask_value, bool), ("cta_mask must be a compile-time integer")
+        assert 0 < cta_mask_value <= 0xFFFFFFFF, "cta_mask must be in the range [1, 2^32 - 1]"
+        assert remote_cta_rank is None, "cta_mask cannot be combined with remote_cta_rank"
+        assert not is_warp_bar, "cta_mask is not supported for warp barriers"
+        assert not is_hip(), "cta_mask is only supported on NVIDIA GPUs"
+        num_ctas = _physical_num_ctas(_semantic)
+        assert num_ctas > 1, "cta_mask requires more than one CTA per cluster"
+        assert (num_ctas & (num_ctas - 1)) == 0, ("cta_mask requires a power-of-two physical cluster size")
+        assert all((cta_rank | cta_mask_value) < num_ctas
+                   for cta_rank in range(num_ctas)), ("cta_mask selects a CTA outside the physical cluster")
+
     if remote_cta_rank is not None:
         bar = remote_view(bar, remote_cta_rank, _semantic=_semantic)
 
@@ -172,8 +315,20 @@ def barrier_arrive(
 
     if is_warp_bar:
         _semantic.builder.create_warp_barrier_arrive(bar.handle, arrive_count.value, pred_handle)
+    elif per_warp:
+        from triton.language.extra.tlx.compiler.code_generator import get_current_num_warps
+        num_warps = get_current_num_warps(_semantic.builder)
+        assert num_warps, "per_warp requires the task's num_warps"
+        # The IR counts what the whole task contributes and lowering splits it across the warps.
+        _semantic.builder.create_warp_barrier_arrive(bar.handle, arrive_count.value * num_warps, pred_handle, per_warp)
     else:
-        _semantic.builder.create_barrier_arrive(bar.handle, arrive_count.value, pred_handle)
+        _semantic.builder.create_barrier_arrive(
+            bar.handle,
+            arrive_count.value,
+            pred_handle,
+            cta_mask_value,
+            list(_semantic.builder.options.cluster_dims),
+        )
 
 
 @tl.builtin
@@ -186,12 +341,28 @@ def named_barrier_wait(
     Wait until the total participant count reaches the specified named barrier.
 
     Arguments:
-        bar (tl.constexpr): Identifier for the named barrier (e.g. from a buffer view).
-        arrive_count (tl.constexpr): Total number of threads required to flip the
+        bar (int): Hardware named-barrier identifier. A statically known value must be
+            in the range [0, 15]; ID 0 is reserved for the compiler and IDs 1 and 2 are
+            reserved for special lowering. A dynamic value is accepted but cannot be
+            validated, and its presence stops the compiler from allocating named
+            barriers of its own, since it cannot prove which IDs are free.
+        arrive_count (int): Total number of threads required to flip the
             barrier phase, including threads executing both `named_barrier_wait`
             and `named_barrier_arrive`. Both calls must use the same count.
+
+    On AMD, only gfx1250 and only the workgroup barrier are supported:
+    ``bar`` must be 0 and ``arrive_count`` must cover every thread of the
+    workgroup. An arrive followed by a wait forms a split workgroup barrier:
+    shared-memory accesses before the arrive are visible after the wait, and
+    independent work between them overlaps the rendezvous. The pair must be in
+    the same block with no shared-memory access or other barrier between them.
     """
 
+    if _semantic.builder.options.backend_name == "hip":
+        _validate_amd_workgroup_barrier(bar, arrive_count, _semantic)
+        _semantic.builder.create_amd_workgroup_barrier_wait()
+        return
+    _validate_named_barrier_id(bar)
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
     arrive_count_handle = _semantic._convert_elem_to_ir_value(arrive_count, require_i64=False)
     _semantic.builder.create_named_barrier_wait(bar_handle, arrive_count_handle)
@@ -199,22 +370,68 @@ def named_barrier_wait(
 
 @tl.builtin
 def named_barrier_arrive(
-    bar: tl.constexpr,
-    arrive_count: tl.constexpr,
+    bar: int,
+    arrive_count: int,
     _semantic=None,
 ) -> None:
     """
     Signal arrival at a named mbarrier.
 
     Arguments:
-        bar (tl.constexpr): Identifier for the named barrier (e.g. from a buffer view).
-        arrive_count (tl.constexpr): Total number of threads required to flip the
+        bar (int): Hardware named-barrier identifier. A statically known value must be
+            in the range [0, 15]; ID 0 is reserved for the compiler and IDs 1 and 2 are
+            reserved for special lowering. A dynamic value is accepted but cannot be
+            validated, and its presence stops the compiler from allocating named
+            barriers of its own, since it cannot prove which IDs are free.
+        arrive_count (int): Total number of threads required to flip the
             barrier phase, including threads executing both `named_barrier_wait`
             and `named_barrier_arrive`. Both calls must use the same count.
+
+    On AMD, only gfx1250 and only the workgroup barrier are supported:
+    ``bar`` must be 0 and ``arrive_count`` must cover every thread of the
+    workgroup. An arrive followed by a wait forms a split workgroup barrier:
+    shared-memory accesses before the arrive are visible after the wait, and
+    independent work between them overlaps the rendezvous. The pair must be in
+    the same block with no shared-memory access or other barrier between them.
     """
+    if _semantic.builder.options.backend_name == "hip":
+        _validate_amd_workgroup_barrier(bar, arrive_count, _semantic)
+        _semantic.builder.create_amd_workgroup_barrier_signal()
+        return
+    _validate_named_barrier_id(bar)
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
     arrive_count_handle = _semantic._convert_elem_to_ir_value(arrive_count, require_i64=False)
     _semantic.builder.create_named_barrier_arrive(bar_handle, arrive_count_handle)
+
+
+def _validate_amd_workgroup_barrier(bar, arrive_count, _semantic) -> None:
+    barrier_id = tl._unwrap_if_constexpr(bar)
+    count = tl._unwrap_if_constexpr(arrive_count)
+    options = _semantic.builder.options
+    # Older AMD targets have no s_barrier_signal / s_barrier_wait. The arch
+    # string can carry target features (e.g. "gfx1250:sramecc+:xnack-"), so
+    # compare only the processor name before the first ":".
+    arch = options.arch.split(":", 1)[0]
+    if arch != "gfx1250":
+        raise ValueError(f"tlx.named_barrier_arrive / named_barrier_wait require gfx1250 on AMD, got {arch}; "
+                         "use tlx.workgroup_barrier() for a full workgroup barrier")
+    num_threads = options.num_warps * options.warp_size
+    if not isinstance(barrier_id, int) or barrier_id != 0:
+        raise ValueError("AMD named barriers only support the workgroup barrier (ID 0)")
+    if not isinstance(count, int) or count != num_threads:
+        raise ValueError(f"AMD workgroup barrier arrive_count must be the workgroup size ({num_threads})")
+
+
+def _validate_named_barrier_id(bar) -> None:
+    barrier_id = tl._unwrap_if_constexpr(bar)
+    if not isinstance(barrier_id, int):
+        return
+    if barrier_id < 0 or barrier_id > 15:
+        raise ValueError("named barrier ID must be in the range [0, 15]")
+    if barrier_id == 0:
+        raise ValueError("named barrier ID 0 is reserved for the compiler")
+    if barrier_id in (1, 2):
+        raise ValueError("named barrier IDs 1 and 2 are reserved for special lowering")
 
 
 @tl.builtin
@@ -231,3 +448,53 @@ def amd_sched_barrier(mask: tl.constexpr = 0, _semantic=None):
     assert isinstance(mask, int), f"mask must be a constexpr integer, got {type(mask).__name__}"
     assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
     _semantic.builder.create_amd_sched_barrier(mask)
+
+
+@tl.builtin
+def amd_sched_group_barrier(mask: tl.constexpr, size: tl.constexpr, sync_id: tl.constexpr = 0, _semantic=None):
+    """Constrain the relative order of AMD instruction groups.
+
+    Markers with the same ``sync_id`` describe a sequence of groups. Each
+    group contains up to ``size`` instructions matching the LLVM AMDGPU
+    scheduling-class ``mask``; for example, 0x8 selects MFMA/WMMA and 0x100
+    selects LDS reads. Data dependencies still take precedence.
+
+    This emits ``llvm.amdgcn.sched.group.barrier`` and adds no runtime fence
+    or synchronization between waves. Do not combine it with ``amd_iglp_opt``
+    in the same scheduling region.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_sched_group_barrier is only supported on AMD (HIP) backends")
+    mask, size, sync_id = (tl._unwrap_if_constexpr(value) for value in (mask, size, sync_id))
+    for name, value in (("mask", mask), ("size", size), ("sync_id", sync_id)):
+        assert isinstance(value, int) and not isinstance(value, bool), f"{name} must be a constexpr integer"
+    assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
+    assert 0 <= size < 1 << 31, "size must be a non-negative signed 32-bit integer"
+    assert 0 <= sync_id < 1 << 31, "sync_id must be a non-negative signed 32-bit integer"
+    _semantic.builder.create_amd_sched_group_barrier(mask, size, sync_id)
+
+
+@tl.builtin
+def amd_iglp_opt(variant: tl.constexpr, _semantic=None):
+    """Emit LLVM's ``llvm.amdgcn.iglp.opt`` scheduling hint for AMD GPUs.
+
+    The variant meanings are defined by LLVM's AMDGPU instruction scheduler.
+    Variants 0 and 1 interleave LDS and MFMA operations for small GEMMs, with
+    variant 1 targeting a single wave. Variants 2 and 3 interleave transcendental
+    and MFMA operations for attention; variant 2 also interleaves their VALU and
+    LDS predecessors.
+
+    Use at most one hint per LLVM scheduling region. The region must not also
+    contain :func:`amd_sched_barrier` or ``llvm.amdgcn.sched.group.barrier``.
+    Strategies are experimental and may change with LLVM versions. This hint
+    adds no memory or workgroup synchronization.
+
+    See `LLVM AMDGPU intrinsics
+    <https://llvm.org/docs/AMDGPUUsage.html#llvm-ir-intrinsics>`_.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_iglp_opt is only supported on AMD (HIP) backends")
+    variant = tl._unwrap_if_constexpr(variant)
+    assert isinstance(variant, int) and not isinstance(variant, bool), "variant must be a constexpr integer"
+    assert 0 <= variant <= 3, f"variant must be one of 0, 1, 2, or 3, got {variant}"
+    _semantic.builder.create_amd_iglp_opt(variant)

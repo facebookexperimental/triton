@@ -1,0 +1,954 @@
+"""TLX barriers tests -- Hopper and newer."""
+import pytest
+import torch
+import re
+import triton
+import triton.language as tl
+from triton._C.libtriton import ir
+from triton._filecheck import run_parser
+from triton._internal_testing import is_blackwell_ultra, is_hip, is_hip_cdna5, is_hopper_or_newer
+from triton.backends.compiler import GPUTarget
+from triton.compiler import ASTSource
+from triton.compiler.compiler import make_backend
+import triton.language.extra.tlx as tlx
+
+
+@triton.jit
+def tlx_square_ws(
+    x_ptr,
+    z_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    EXPECTED_ARRIVAL_COUNT: tl.constexpr,
+):
+    # prologue
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+
+    # mbarrier ops
+    bars = tlx.alloc_barriers(num_barriers=2, arrive_count=EXPECTED_ARRIVAL_COUNT)  # create
+    b0 = tlx.local_view(bars, 0)
+    b1 = tlx.local_view(bars, 1)
+
+    phase = 0
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            tlx.barrier_wait(bar=b1, phase=phase ^ 1)
+
+            # Placeholder block to do something
+
+            tlx.barrier_arrive(bar=b0)  # Release
+
+        with tlx.async_task(num_warps=4):
+            tlx.barrier_wait(bar=b0, phase=phase)  # Wait
+
+            # Some arith ops TODO. add WS
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            x = tl.load(x_ptr + offsets, mask=mask)
+            z = x * x
+            tl.store(z_ptr + offsets, z, mask=mask)
+
+            tlx.barrier_arrive(bar=b0)  # Wait
+
+
+@triton.jit
+def tlx_square_non_ws(
+    x_ptr,
+    z_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    EXPECTED_ARRIVAL_COUNT: tl.constexpr,
+):
+    """
+    Test pairs of arrive/wait using different phases
+    with a few random misc operations interleaved between them.
+
+    To learn more about mbarrier phase, refer to:
+    https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-asynchronous-copy-completion-mechanisms-mbarrier
+
+    Following patterns will cause mbarrier deadlock.
+    TODO. add unit tests demonstrating mbarrier deadlock
+
+    Case 1:
+    arrive => wait(phase=1)
+
+    Case 2:
+    arrive => arrive => wait(phase=0)
+
+    Case 3:
+    wait(phase=0) => arrive
+    """
+
+    # prologue
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    # mbarrier ops
+
+    bars = tlx.alloc_barriers(num_barriers=1, arrive_count=EXPECTED_ARRIVAL_COUNT)  # create
+    bar = tlx.local_view(bars, 0)
+
+    x = tl.load(x_ptr + offsets, mask=mask)  # Do something
+
+    p = 0
+    tlx.barrier_arrive(bar=bar)  # Release
+    tlx.barrier_wait(bar=bar, phase=p)  # Wait (proceed immediately)
+
+    z = x * x  # Do something
+
+    p = p ^ 1
+    tlx.barrier_arrive(bar=bar)  # Release
+    tlx.barrier_wait(bar=bar, phase=p)  # Wait (proceed immediately)
+
+    tl.store(z_ptr + offsets, z, mask=mask)  # Do something
+
+    p = p ^ 1
+    tlx.barrier_arrive(bar=bar)  # Release
+    tlx.barrier_wait(bar=bar, phase=0)  # Wait (proceed immediately)
+
+
+@triton.jit
+def tlx_promotable_mbarrier(output_ptr, USE_NAMED_BARRIER: tl.constexpr):
+    bars = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    bar = tlx.local_view(bars, 0)
+
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            pass
+        with tlx.async_task(num_warps=1):
+            if USE_NAMED_BARRIER:
+                tlx.named_barrier_arrive(9, 64)
+            tlx.barrier_arrive(bar)
+        with tlx.async_task(num_warps=1):
+            if USE_NAMED_BARRIER:
+                tlx.named_barrier_wait(9, 64)
+            tlx.barrier_wait(bar, 0)
+            offsets = tl.arange(0, 32)
+            tl.store(output_ptr + offsets, offsets)
+
+
+@triton.jit
+def tlx_multi_partition_mbarrier(output_ptr):
+    bars = tlx.alloc_barriers(num_barriers=1, arrive_count=2)
+    bar = tlx.local_view(bars, 0)
+
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            tlx.barrier_wait(bar, 0)
+            offsets = tl.arange(0, 32)
+            tl.store(output_ptr + offsets, offsets)
+        with tlx.async_task(num_warps=1):
+            tlx.barrier_arrive(bar)
+        with tlx.async_task(num_warps=1):
+            tlx.barrier_arrive(bar)
+
+
+def run_tlx_square(func, BLOCK_SIZE, device, expected_arrival_count=1):
+    # prepare inputs
+    torch.manual_seed(0)
+    size = 98432
+    x = torch.rand(size, device=device)
+    z = torch.empty_like(x)
+    z_ref = torch.empty_like(x)
+
+    n_elements = x.numel()
+
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+
+    kernel = func[grid](x, z, n_elements, BLOCK_SIZE, expected_arrival_count)
+
+    z_ref = x * x
+
+    torch.testing.assert_close(z, z_ref, check_dtype=False)
+    return kernel
+
+
+# Unit test for arrive/wait
+@pytest.mark.skipif(not (is_hip_cdna5() or is_hopper_or_newer()), reason="Need Hopper or newer or AMD CDNA5")
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+def test_wait_arrive_non_ws(BLOCK_SIZE, device):
+    expected_arrival_count = 4 if is_hip() else 1
+    kernel = run_tlx_square(tlx_square_non_ws, BLOCK_SIZE, device, expected_arrival_count=expected_arrival_count)
+    # ASSERT in ttgir
+    ttgir = kernel.asm["ttgir"]
+    if is_hip():
+        assert ((ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase") == 3)
+                and (ttgir.count("amdgpu.arrive_barrier") == 3)), f"TTGIR {ttgir}"
+    else:
+        assert ((ttgir.count("ttng.init_barrier") == 1) and (ttgir.count("ttng.wait_barrier") == 3)
+                and (ttgir.count("ttng.barrier_expect") == 0)
+                and (ttgir.count("ttng.arrive_barrier") == 3)), f"TTGIR {ttgir}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+def test_wait_arrive_ws(BLOCK_SIZE, device):
+    kernel = run_tlx_square(tlx_square_ws, BLOCK_SIZE, device)
+
+    # ASSERT in ttgir
+    ttgir = kernel.asm["ttgir"]
+    assert ((ttgir.count("ttng.init_barrier") == 2) and (ttgir.count("ttng.wait_barrier") == 2)
+            and (ttgir.count("ttng.barrier_expect") == 0) and (ttgir.count("ttng.arrive_barrier") == 2)
+            and (ttgir.count("default {") == 1) and (ttgir.count("partition0") == 1)), f"TTGIR {ttgir}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("promote", [False, True])
+def test_tlx_mbarrier_promotion(promote, device):
+    output = torch.empty(32, dtype=torch.int32, device=device)
+    tlx_promotable_mbarrier.device_caches.clear()
+    with triton.knobs.nvidia.scope(), triton.knobs.compilation.scope():
+        triton.knobs.nvidia.promote_mbarrier_to_named_barrier = promote
+        triton.knobs.compilation.always_compile = True
+        kernel = tlx_promotable_mbarrier[(1, )](output, False, num_warps=4)
+
+    torch.testing.assert_close(output, torch.arange(32, dtype=torch.int32, device=device))
+    ttgir = kernel.asm["ttgir"]
+    ptx = kernel.asm["ptx"]
+    # TLX-marked modules skip mbarrier promotion entirely (the source marker
+    # survives lowering that erases TLX dialect ops), so the knob has no effect
+    # here either way: the mbarrier survives and no compiler barrier ID appears.
+    assert "ttng.init_barrier" in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.wait_barrier " in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.arrive_barrier " in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.compiler_named_barrier_id" not in ttgir, f"TTGIR {ttgir}"
+    assert "mbarrier.init.shared::cta.b64" in ptx, f"PTX {ptx}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_tlx_mbarrier_promotion_avoids_user_named_barrier(device):
+    output = torch.empty(32, dtype=torch.int32, device=device)
+    tlx_promotable_mbarrier.device_caches.clear()
+    with triton.knobs.nvidia.scope(), triton.knobs.compilation.scope():
+        triton.knobs.nvidia.promote_mbarrier_to_named_barrier = True
+        triton.knobs.compilation.always_compile = True
+        kernel = tlx_promotable_mbarrier[(1, )](output, True, num_warps=4)
+
+    torch.testing.assert_close(output, torch.arange(32, dtype=torch.int32, device=device))
+    ttgir = kernel.asm["ttgir"]
+    # TLX-marked modules skip mbarrier promotion entirely, so the explicit
+    # user barrier is preserved while no compiler barrier ID is allocated.
+    assert "ttng.init_barrier" in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.compiler_named_barrier_id" not in ttgir, f"TTGIR {ttgir}"
+    # Tie each constant to the barrier-id op that consumes it: a bare
+    # `arith.constant` substring also matches unrelated constants.
+    user_id = re.search(r"ttng\.user_named_barrier_id (%\S+)", ttgir)
+    assert user_id, f"TTGIR {ttgir}"
+    assert re.search(re.escape(user_id.group(1)) + r" = arith\.constant 9 : i32", ttgir), f"TTGIR {ttgir}"
+    ptx = kernel.asm["ptx"]
+    assert re.search(r"bar\.sync\s+9,\s*64;", ptx), f"PTX {ptx}"
+    assert re.search(r"bar\.arrive\s+9,\s*64;", ptx), f"PTX {ptx}"
+    assert "mbarrier.init.shared::cta.b64" in ptx, f"PTX {ptx}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_tlx_multi_partition_mbarrier_promotion(device):
+    output = torch.empty(32, dtype=torch.int32, device=device)
+    tlx_multi_partition_mbarrier.device_caches.clear()
+    with triton.knobs.nvidia.scope(), triton.knobs.compilation.scope():
+        triton.knobs.nvidia.promote_mbarrier_to_named_barrier = True
+        triton.knobs.compilation.always_compile = True
+        kernel = tlx_multi_partition_mbarrier[(1, )](output, num_warps=4)
+
+    torch.testing.assert_close(output, torch.arange(32, dtype=torch.int32, device=device))
+    ttgir = kernel.asm["ttgir"]
+    # TLX-marked modules skip mbarrier promotion entirely: the mbarriers
+    # survive in every partition and no compiler barrier ID is allocated.
+    assert "ttng.init_barrier" in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.compiler_named_barrier_id" not in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.arrive_barrier " in ttgir, f"TTGIR {ttgir}"
+    assert "ttng.wait_barrier " in ttgir, f"TTGIR {ttgir}"
+    ptx = kernel.asm["ptx"]
+    assert "mbarrier.init.shared::cta.b64" in ptx, f"PTX {ptx}"
+
+
+@triton.jit
+def tlx_square_warp_barrier(
+    x_ptr,
+    z_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+):
+    """
+    Warp-specialized kernel demonstrating perThread barrier arrives with SMEM.
+    Producer loads global → stores SMEM → arrives (perThread, no bar.sync).
+    Consumer waits → loads SMEM → computes z=x*x → stores global → arrives.
+
+    This mirrors the GEMM epilogue pattern where local_load from shared memory
+    is followed by barrier_arrive to signal the buffer is consumed.
+    """
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+
+    # Warp barriers: each thread arrives independently (no leader sync)
+    bars = tlx.alloc_warp_barrier(num_barriers=2, num_warps=NUM_WARPS)
+    b0 = tlx.local_view(bars, 0)
+    b1 = tlx.local_view(bars, 1)
+
+    # Shared memory buffer for producer-consumer data transfer
+    buf = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
+    smem = tlx.local_view(buf, 0)
+
+    phase = 0
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            tlx.barrier_wait(bar=b1, phase=phase ^ 1)
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+
+            # Producer: load from global, store to SMEM
+            x = tl.load(x_ptr + offsets, mask=mask)
+            tlx.local_store(smem, x)
+            # KEY PATTERN: SMEM write → perThread arrive (no bar.sync)
+            tlx.barrier_arrive(bar=b0)
+
+        with tlx.async_task(num_warps=4):
+            tlx.barrier_wait(bar=b0, phase=phase)
+
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            # Consumer: load from SMEM, compute, store to global
+            data = tlx.local_load(smem)
+            z = data * data
+            tl.store(z_ptr + offsets, z, mask=mask)
+            # KEY PATTERN: SMEM read → perThread arrive (no bar.sync)
+            tlx.barrier_arrive(bar=b0)
+
+
+def _run_kernel_diverge_both_1warp(result_queue):
+    """Subprocess target: runs the deadlocking kernel and reports back."""
+    try:
+        import torch
+        import triton
+        import triton.language as tl
+        import triton.language.extra.tlx as tlx
+
+        @triton.jit
+        def _kernel_diverge_both_1warp(output_ptr):
+            """1-warp task, divergence on both sides -> DEADLOCKS."""
+            with tlx.async_tasks():
+                with tlx.async_task(num_warps=1):
+                    if tlx.thread_id(axis=0) % 32 == 0:
+                        tl.store(output_ptr + 1, 99)  # divergence BEFORE
+                    tlx.named_barrier_wait(14, 32)
+                    if tlx.thread_id(axis=0) % 32 == 0:
+                        tl.store(output_ptr + 0, 5)  # divergence AFTER
+                with tlx.async_task("default"):
+                    pass
+
+        output = torch.zeros(2, dtype=torch.int32, device="cuda")
+        _kernel_diverge_both_1warp[(1, )](output, num_warps=4)
+        torch.cuda.synchronize()
+        result_queue.put(("PASS", output.cpu().tolist()))
+    except Exception as e:
+        result_queue.put(("ERROR", str(e)))
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+@pytest.mark.parametrize("num_warps", [4])
+def test_alloc_warp_barrier(BLOCK_SIZE, num_warps, device):
+    torch.manual_seed(0)
+    size = 98432
+    x = torch.rand(size, device=device)
+    z = torch.empty_like(x)
+    n_elements = x.numel()
+
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = tlx_square_warp_barrier[grid](
+        x,
+        z,
+        n_elements,
+        BLOCK_SIZE,
+        num_warps,
+        num_warps=num_warps,
+    )
+
+    z_ref = x * x
+    torch.testing.assert_close(z, z_ref, check_dtype=False)
+
+    # Verify TTGIR: warp-specialized with perThread arrives
+    ttgir = kernel.asm["ttgir"]
+    assert "perThread" in ttgir, f"Expected perThread attrs in TTGIR:\n{ttgir}"
+    assert "ttng.arrive_barrier" in ttgir, f"Expected arrive_barrier in TTGIR:\n{ttgir}"
+
+    # Verify LLIR: perThread arrives use per-thread lowering (no leader predicate)
+    llir = kernel.asm["llir"]
+    # Per-thread arrive emits unpredicated: mbarrier.arrive.shared::cta.b64 _, [$0]
+    assert "mbarrier.arrive.shared::cta.b64 _, [$0]" in llir, (
+        f"Expected unpredicated per-thread mbarrier.arrive in LLIR:\n{llir}")
+    # Leader pattern would emit predicated: @$0 mbarrier.arrive
+    assert "@$0 mbarrier.arrive" not in llir, f"Unexpected leader-predicated mbarrier.arrive in LLIR:\n{llir}"
+    # No bar.sync immediately before mbarrier.arrive (membar pass should skip
+    # perThread arrives for both full-range and per-buffer SMEM hazards).
+    # Other bar.sync may exist (e.g. before wait_barrier) — that's fine.
+
+    assert not re.search(r"barrier\.cta\.sync.*\n.*mbarrier\.arrive",
+                         llir), (f"Unexpected bar.sync before mbarrier.arrive in LLIR:\n{llir}")
+
+
+@triton.jit
+def _arrive_per_warp(bar):
+    # Called from tasks with different warp counts; each must count its own warps.
+    tlx.barrier_arrive(bar, per_warp=True)
+
+
+@triton.jit
+def tlx_square_per_warp_arrive(
+    x_ptr,
+    z_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+    CONSUMER_WARPS: tl.constexpr,
+    WORKAROUND: tl.constexpr = False,
+):
+    """
+    Producer and consumer hand an SMEM buffer over with per-warp arrives: each warp
+    syncs its own lanes and one of them arrives, so neither task syncs all its warps.
+    The buffer is released by the consumer's warps and a 1-warp task's leader arrive.
+    WORKAROUND sets nvptx_cmp_sink_workaround on the two non-default tasks.
+    """
+    full = tlx.local_view(tlx.alloc_barriers(num_barriers=1, arrive_count=NUM_WARPS), 0)
+    empty = tlx.local_view(tlx.alloc_barriers(num_barriers=1, arrive_count=CONSUMER_WARPS + 1), 0)
+    smem = tlx.local_view(tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1), 0)
+
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            tlx.local_store(smem, tl.load(x_ptr + offsets, mask=offsets < n_elements))
+            _arrive_per_warp(full)
+            tlx.barrier_wait(empty, 0)
+
+        with tlx.async_task(num_warps=CONSUMER_WARPS, nvptx_cmp_sink_workaround=WORKAROUND):
+            tlx.barrier_wait(full, 0)
+            offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            data = tlx.local_load(smem)
+            tl.store(z_ptr + offsets, data * data, mask=offsets < n_elements)
+            _arrive_per_warp(empty)
+
+        with tlx.async_task(num_warps=1, nvptx_cmp_sink_workaround=WORKAROUND):
+            tlx.barrier_wait(full, 0)
+            tlx.barrier_arrive(empty)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_barrier_arrive_per_warp(device):
+    torch.manual_seed(0)
+    x = torch.rand(98432, device=device)
+    z = torch.empty_like(x)
+    BLOCK_SIZE, NUM_WARPS, CONSUMER_WARPS = 1024, 4, 2
+    grid = (triton.cdiv(x.numel(), BLOCK_SIZE), )
+    kernel = tlx_square_per_warp_arrive[grid](x, z, x.numel(), BLOCK_SIZE, NUM_WARPS, CONSUMER_WARPS,
+                                              num_warps=NUM_WARPS)
+    torch.testing.assert_close(z, x * x)
+
+    # Each task's arrive counts its own warps, though both go through one helper.
+    ttgir = kernel.asm["ttgir"]
+    assert re.search(rf"ttng\.arrive_barrier %\S+, {NUM_WARPS} {{per_warp}}", ttgir), ttgir
+    assert re.search(rf"ttng\.arrive_barrier %\S+, {CONSUMER_WARPS} {{per_warp}}", ttgir), ttgir
+    # Each per-warp arrive comes from one lane after a warp sync, with no CTA barrier in front of it.
+    lines = [line.strip() for line in kernel.asm["ptx"].split("\n") if not re.match(r"\s*(\.loc\b|//|$)", line)]
+    arrives = [i for i, line in enumerate(lines) if "mbarrier.arrive" in line]
+    assert len(arrives) == 3, "\n".join(lines)
+    for i in arrives:
+        assert lines[i].startswith("@%p"), lines[i]
+        sync = next(line for line in reversed(lines[:i]) if re.match(r"(bar|barrier)(\.cta)?\.(warp\.)?sync", line))
+        assert sync.startswith("bar.warp.sync"), f"expected bar.warp.sync before {lines[i]}, got {sync}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_nvptx_cmp_sink_workaround(device):
+    # TEMPORARY NVPTX workaround: in the flagged tasks, per-warp arrives test %laneid in their own
+    # asm and leader arrives use a predicate built at the task entry. The default task is not flagged.
+    torch.manual_seed(0)
+    x = torch.rand(98432, device=device)
+    z = torch.empty_like(x)
+    BLOCK_SIZE, NUM_WARPS, CONSUMER_WARPS = 1024, 4, 2
+    grid = (triton.cdiv(x.numel(), BLOCK_SIZE), )
+    kernel = tlx_square_per_warp_arrive[grid](x, z, x.numel(), BLOCK_SIZE, NUM_WARPS, CONSUMER_WARPS, True,
+                                              num_warps=NUM_WARPS)
+    torch.testing.assert_close(z, x * x)
+
+    assert "tlx.nvptx_cmp_sink_workaround = array<i32: 0, 1>" in kernel.asm["ttgir"]
+    lines = [line.strip() for line in kernel.asm["ptx"].split("\n") if not re.match(r"\s*(\.loc\b|//|$)", line)]
+    arrives = [line for line in lines if "mbarrier.arrive" in line]
+    assert len(arrives) == 3, "\n".join(lines)
+    # The default task's per-warp arrive and the consumer's: only the consumer's tests %laneid itself.
+    assert sum("%laneid" in line for line in arrives) == 1, "\n".join(arrives)
+    # The 1-warp task's leader arrive uses the setp built at the task entry.
+    assert sum(line.startswith("setp.eq.u32 %p") for line in lines) == 1, "\n".join(lines)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_barrier_arrive_per_warp_remote(device):
+
+    @triton.jit
+    def kernel(output_ptr):
+        # Both CTAs arrive once per warp on CTA 0's barrier: 4 warps * 2 CTAs.
+        bar = tlx.local_view(tlx.alloc_barriers(num_barriers=1, arrive_count=4 * 2), 0)
+        tlx.fence_mbarrier_init_cluster()
+        tlx.cluster_barrier()
+        tlx.barrier_arrive(bar, remote_cta_rank=0, per_warp=True)
+        if tlx.cluster_cta_rank() == 0:
+            tlx.barrier_wait(bar, phase=0)
+        if tlx.thread_id(0) == 0:
+            pid = tl.program_id(0)
+            tl.store(output_ptr + pid, pid + 1)
+
+    output = torch.zeros(2, dtype=torch.int32, device=device)
+    compiled = kernel[(2, )](output, num_warps=4, ctas_per_cga=(2, 1, 1))
+    torch.testing.assert_close(output, torch.tensor([1, 2], dtype=torch.int32, device=device))
+
+    ptx = compiled.asm["ptx"]
+    assert re.findall(r"mbarrier\.init\.shared::cta\.b64 \[[^\]]+\], (\d+);", ptx) == ["8"], ptx
+    lines = [line.strip() for line in ptx.split("\n") if not re.match(r"\s*(\.loc\b|//|$)", line)]
+    arrive = next(i for i, line in enumerate(lines) if "mbarrier.arrive" in line and "shared::cluster" in line)
+    sync = next(line for line in reversed(lines[:arrive]) if re.match(r"(bar|barrier)(\.cta)?\.(warp\.)?sync", line))
+    assert sync.startswith("bar.warp.sync"), f"expected bar.warp.sync before {lines[arrive]}, got {sync}"
+
+
+def test_barrier_arrive_per_warp_rejects_warp_barrier():
+
+    @triton.jit
+    def kernel():
+        bars = tlx.alloc_warp_barrier(num_barriers=tl.constexpr(1), num_warps=4)
+        tlx.barrier_arrive(tlx.local_view(bars, 0), per_warp=True)
+
+    with pytest.raises(triton.CompilationError, match="per_warp is not supported for warp barriers"):
+        run_parser(kernel, target=GPUTarget("cuda", 100, 32))
+
+
+def test_barrier_arrive_per_warp_rejects_cta_mask():
+
+    @triton.jit
+    def kernel():
+        bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=4)
+        tlx.barrier_arrive(tlx.local_view(bars, 0), cta_mask=1, per_warp=True)
+
+    with pytest.raises(triton.CompilationError, match="per_warp cannot be combined with cta_mask"):
+        run_parser(
+            kernel,
+            kwargs={"ctas_per_cga": (2, 1, 1)},
+            target=GPUTarget("cuda", 103, 32),
+        )
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_barrier_live_range(device):
+
+    @triton.jit
+    def bar_live_kernel():
+        # an intentional early return here to check that we're considering dominance when inserting inval bar ops
+        pid = tl.program_id(axis=0)
+        if pid == 258:
+            return
+
+        # use bars1 after bars2/3 init
+        bars1 = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
+
+        bars2 = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=2)
+        tlx.barrier_arrive(bars2[0])
+        # No-op wait to avoid pruning.
+        tlx.barrier_wait(bar=bars2[0], phase=1)
+
+        bars3 = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=3)
+        tlx.barrier_arrive(bars3[0])
+        # No-op wait to avoid pruning.
+        tlx.barrier_wait(bar=bars3[0], phase=1)
+
+        # bars1 and bars2 should both be live here
+        tlx.barrier_arrive(bars1[0])
+        # No-op wait to avoid pruning.
+        tlx.barrier_wait(bar=bars1[0], phase=0)
+
+    torch.manual_seed(0)
+    kernel = bar_live_kernel[(2, 1)]()
+    ptx = kernel.asm["ptx"]
+
+    # e.g. extract %1 from "mbarrier.init.shared::cta.b64 [%r1], 1;". Per-warp arrival may raise an
+    # init count to the warp count, so identify the three barriers by their init instructions.
+    pattern = r"mbarrier\.init\..*\.b64 \[(%r\d+)\], (\d+);"
+    matches = re.findall(pattern, ptx)
+    assert len(matches) == 3, f"Expected 3 mbarrier init, got ptx: \n{ptx}"
+    # Make sure they all have different registers (different SMEM addresses)
+    assert len({reg for reg, _ in matches}) == 3, f"invalid reuse of SMEM, full ptx: \n{ptx}"
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.parametrize("BLOCK_SIZE", [(1024)])
+def test_named_wait_arrive(BLOCK_SIZE, device):
+
+    @triton.jit
+    def add2_warp_specialized_pingpong_kernel(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks():
+            with tlx.async_task("default"):
+                tlx.named_barrier_wait(9, 256)
+                tlx.named_barrier_arrive(10, 256)
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask)
+                y = tl.load(y_ptr + offsets, mask=mask)
+                output = x + y
+                tl.store(z_ptr + offsets, output, mask=mask)
+            with tlx.async_task(num_warps=4, registers=96):
+                tlx.named_barrier_arrive(9, 256)
+                tlx.named_barrier_wait(10, 256)
+                offsets = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < n_elements
+                a = tl.load(a_ptr + offsets, mask=mask)
+                b = tl.load(b_ptr + offsets, mask=mask)
+                output = a + b
+                tl.store(c_ptr + offsets, output, mask=mask)
+
+    def dual_add(x, y, a, b):
+        return x + y, a + b
+
+    torch.manual_seed(0)
+    size = 98432
+    x = torch.rand(size, device=device)
+    y = torch.rand(size, device=device)
+    a = torch.rand(size, device=device)
+    b = torch.rand(size, device=device)
+
+    output1 = torch.empty_like(x)
+    output2 = torch.empty_like(a)
+    n_elements = output1.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+    kernel = add2_warp_specialized_pingpong_kernel[grid](x, y, output1, a, b, output2, n_elements, BLOCK_SIZE)
+    ttgir = kernel.asm["ttgir"]
+    # Resolve each barrier op back to its source-level ID through the wrapper's
+    # SSA name rather than textual adjacency, so the test still pins both the ID
+    # and the first-class TTNG representation without depending on IR layout.
+    # The wrappers are `Pure`, so CSE may merge or hoist one away from its use,
+    # and SSA name suffixes (e.g. %c10_i32 vs %c10_i32_0) are unstable across
+    # compiler pass changes.
+    wrapper_ids = {
+        name: int(barrier_id)
+        for name, barrier_id in re.findall(
+            r"(%[\w$._-]+) = ttng\.user_named_barrier_id %c(\d+)_i32(?:_\d+)? : i32",
+            ttgir,
+        )
+    }
+    named_barrier_uses = [(op, wrapper_ids[name]) for op, name in re.findall(
+        r"ttng\.(wait_barrier_named|arrive_barrier_named) (%[\w$._-]+), "
+        r"%c256_i32(?:_\d+)? : !ttng\.named_barrier_id, i32",
+        ttgir,
+    ) if name in wrapper_ids]
+
+    assert named_barrier_uses.count(("wait_barrier_named", 9)) == 1
+    assert named_barrier_uses.count(("arrive_barrier_named", 10)) == 1
+    assert named_barrier_uses.count(("arrive_barrier_named", 9)) == 1
+    assert named_barrier_uses.count(("wait_barrier_named", 10)) == 1
+
+    ref_out1, ref_out2 = dual_add(x, y, a, b)
+    torch.testing.assert_close(output1, ref_out1, check_dtype=False)
+    torch.testing.assert_close(output2, ref_out2, check_dtype=False)
+
+
+@pytest.mark.parametrize("use_wait", [False, True])
+@pytest.mark.parametrize(
+    ("barrier_id", "message"),
+    [
+        (-1, "named barrier ID must be in the range [0, 15]"),
+        (0, "named barrier ID 0 is reserved for the compiler"),
+        (1, "named barrier IDs 1 and 2 are reserved for special lowering"),
+        (2, "named barrier IDs 1 and 2 are reserved for special lowering"),
+        (16, "named barrier ID must be in the range [0, 15]"),
+    ],
+)
+def test_named_barrier_id_validation(use_wait, barrier_id, message):
+
+    @triton.jit
+    def kernel(BARRIER_ID: tl.constexpr, USE_WAIT: tl.constexpr):
+        if USE_WAIT:
+            tlx.named_barrier_wait(BARRIER_ID, 32)
+        else:
+            tlx.named_barrier_arrive(BARRIER_ID, 32)
+
+    with pytest.raises(triton.CompilationError, match=re.escape(message)):
+        run_parser(kernel, args=(barrier_id, use_wait), target=GPUTarget("cuda", 90, 32))
+
+
+def test_named_barrier_dynamic_user_id():
+
+    @triton.jit
+    def kernel(barrier_id):
+        tlx.named_barrier_wait(barrier_id, 32)
+
+    module = run_parser(kernel, args=(3, ), target=GPUTarget("cuda", 90, 32))
+    assert "ttng.user_named_barrier_id" in str(module)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_barrier_wait_no_remote_view(device):
+    """Test that barrier_wait does not allow remote_view of mbarrier."""
+
+    @triton.jit
+    def barrier_wait_remote_view_kernel():
+        bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
+        bar = tlx.local_view(bars, 0)
+        # Get remote view of the barrier
+        remote_bar = tlx.remote_view(bar, 0)
+        # This should raise an assertion error because barrier_wait does not support remote_view
+        tlx.barrier_wait(remote_bar, phase=0)
+
+    grid = lambda meta: (1, )
+    with pytest.raises(triton.CompilationError) as e:
+        barrier_wait_remote_view_kernel[grid](ctas_per_cga=(2, 1, 1))
+    exc_msg = str(e.value)
+    assert "barrier_wait" in exc_msg, f"Expected error about barrier_wait, but got: {exc_msg}"
+
+
+@triton.jit
+def _cta_mask_barrier_kernel():
+    bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
+    bar = tlx.local_view(bars, 0)
+    tlx.barrier_arrive(bar, cta_mask=1)
+    tlx.barrier_wait(bar, phase=0)
+
+
+def _compile_cta_mask_barrier(capability, cluster_option="ctas_per_cga"):
+    source = ASTSource(fn=_cta_mask_barrier_kernel, signature={}, constexprs={})
+    target = GPUTarget("cuda", capability, 32)
+    backend = make_backend(target)
+    options = backend.parse_options({
+        "num_warps": 4,
+        cluster_option: (2, 1, 1),
+        **source.parse_options(),
+    })
+    context = ir.context()
+    ir.load_dialects(context)
+    backend.load_dialects(context)
+    module = source.make_ir(
+        target,
+        options,
+        backend.get_codegen_implementation(options),
+        backend.get_module_map(),
+        context,
+    )
+    metadata = {"target": target, **options.__dict__}
+    stages = {}
+    backend.add_stages(stages, options, source.language)
+    artifacts = {}
+    for stage_name, compile_stage in stages.items():
+        module = compile_stage(module, metadata)
+        artifacts[stage_name] = module if isinstance(module, str) else str(module)
+        if stage_name == "ptx":
+            break
+    return artifacts
+
+
+@pytest.mark.parametrize("capability,ptx_target", [(103, "sm_103a"), (107, "sm_107a")])
+def test_barrier_arrive_cta_mask_lowers_on_sm103up(capability, ptx_target):
+    compiled = _compile_cta_mask_barrier(capability)
+    assert '"ttg.num-ctas" = 1 : i32' in compiled["ttgir"]
+    assert '"ttg.cluster-dim-x" = 2 : i32' in compiled["ttgir"]
+    assert "multicastCTA = 1" in compiled["ttgir"]
+    assert ".version 9.4" in compiled["ptx"]
+    assert f".target {ptx_target}" in compiled["ptx"]
+    if capability == 107:
+        assert compiled["ptx"].count("mbarrier.arrive.shared::cluster.multicast::cluster::32b") == 1
+        assert re.search(r"mov\.b32\s+%r\d+, 3;", compiled["ptx"])
+    else:
+        assert "multicast::cluster::32b" not in compiled["ptx"]
+        assert compiled["ptx"].count("mapa.shared::cluster.u32") == 2
+        assert compiled["ptx"].count("mbarrier.arrive.shared::cluster.b64") == 2
+
+
+def test_barrier_arrive_cta_mask_accepts_cluster_dims_alias():
+    compiled = _compile_cta_mask_barrier(103, cluster_option="cluster_dims")
+    assert '"ttg.num-ctas" = 1 : i32' in compiled["ttgir"]
+    assert '"ttg.cluster-dim-x" = 2 : i32' in compiled["ttgir"]
+
+
+@pytest.mark.skipif(not is_blackwell_ultra(), reason="Need Blackwell Ultra")
+def test_barrier_arrive_cta_mask_executes_on_sm103(device):
+
+    @triton.jit
+    def kernel(output_ptr):
+        bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=2)
+        bar = tlx.local_view(bars, 0)
+        tlx.fence_mbarrier_init_cluster()
+        tlx.cluster_barrier()
+        tlx.barrier_arrive(bar, cta_mask=1)
+        tlx.barrier_wait(bar, phase=0)
+        if tlx.thread_id(0) == 0:
+            pid = tl.program_id(0)
+            tl.store(output_ptr + pid, pid + 1)
+
+    output = torch.zeros(2, dtype=torch.int32, device=device)
+    compiled = kernel[(2, )](output, num_warps=4, ctas_per_cga=(2, 1, 1))
+
+    torch.testing.assert_close(output, torch.tensor([1, 2], dtype=torch.int32, device=device))
+    assert "multicast::cluster::32b" not in compiled.asm["ptx"]
+    assert compiled.asm["ptx"].count("mapa.shared::cluster.u32") == 2
+    assert compiled.asm["ptx"].count("mbarrier.arrive.shared::cluster.b64") == 2
+
+
+@pytest.mark.parametrize(
+    "cta_mask,message",
+    [
+        (0, "cta_mask must be in the range"),
+        (1 << 32, "cta_mask must be in the range"),
+        (True, "cta_mask must be a compile-time integer"),
+    ],
+)
+def test_barrier_arrive_cta_mask_value_validation(cta_mask, message):
+
+    @triton.jit
+    def kernel(CTA_MASK: tl.constexpr):
+        bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_arrive(bar, cta_mask=CTA_MASK)
+
+    with pytest.raises(triton.CompilationError, match=message):
+        run_parser(
+            kernel,
+            args=(cta_mask, ),
+            kwargs={"ctas_per_cga": (2, 1, 1)},
+            target=GPUTarget("cuda", 103, 32),
+        )
+
+
+@pytest.mark.parametrize(
+    "ctas_per_cga,cta_mask,message",
+    [
+        ((2, 1, 1), 2, "outside the physical cluster"),
+        ((2, 1, 3), 1, "power-of-two physical cluster size"),
+    ],
+)
+def test_barrier_arrive_cta_mask_rejects_unsupported_cluster_or_mask(ctas_per_cga, cta_mask, message):
+
+    @triton.jit
+    def kernel(CTA_MASK: tl.constexpr):
+        bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_arrive(bar, cta_mask=CTA_MASK)
+
+    with pytest.raises(triton.CompilationError, match=message):
+        run_parser(
+            kernel,
+            args=(cta_mask, ),
+            kwargs={"ctas_per_cga": ctas_per_cga},
+            target=GPUTarget("cuda", 103, 32),
+        )
+
+
+def test_barrier_arrive_cta_mask_rejects_dynamic_value():
+
+    @triton.jit
+    def kernel(cta_mask):
+        bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_arrive(bar, cta_mask=cta_mask)
+
+    with pytest.raises(triton.CompilationError, match="cta_mask must be a compile-time integer"):
+        run_parser(
+            kernel,
+            args=(2, ),
+            kwargs={"ctas_per_cga": (2, 1, 1)},
+            target=GPUTarget("cuda", 103, 32),
+        )
+
+
+def test_barrier_arrive_cta_mask_rejects_remote_rank():
+
+    @triton.jit
+    def kernel():
+        bars = tlx.alloc_barriers(num_barriers=tl.constexpr(1), arrive_count=1)
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_arrive(bar, remote_cta_rank=0, cta_mask=1)
+
+    with pytest.raises(triton.CompilationError, match="cta_mask cannot be combined with remote_cta_rank"):
+        run_parser(
+            kernel,
+            kwargs={"ctas_per_cga": (2, 1, 1)},
+            target=GPUTarget("cuda", 103, 32),
+        )
+
+
+def test_barrier_arrive_cta_mask_rejects_warp_barrier():
+
+    @triton.jit
+    def kernel():
+        bars = tlx.alloc_warp_barrier(num_barriers=tl.constexpr(1), num_warps=4)
+        bar = tlx.local_view(bars, 0)
+        tlx.barrier_arrive(bar, cta_mask=1)
+
+    with pytest.raises(triton.CompilationError, match="cta_mask is not supported for warp barriers"):
+        run_parser(
+            kernel,
+            kwargs={"ctas_per_cga": (2, 1, 1)},
+            target=GPUTarget("cuda", 103, 32),
+        )
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_named_barrier_wait_1warp_async_deadlock(device):
+    """Test that named_barrier_wait(14, 32) in 1-warp async_task deadlocks.
+
+    This test demonstrates a known deadlock scenario where a named barrier
+    with divergent code on both sides deadlocks inside an async_task.
+    The kernel is run in a subprocess with a timeout so a deadlock doesn't
+    hang the entire test suite.
+    """
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(target=_run_kernel_diverge_both_1warp, args=(result_queue, ))
+    proc.start()
+    proc.join(timeout=15)
+
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=10)
+        pytest.xfail("Kernel deadlocked as expected (known issue: named_barrier_wait "
+                     "with divergent code on both sides inside async_task)")
+    elif result_queue.empty():
+        pytest.fail("Subprocess exited without producing a result")
+    else:
+        status, detail = result_queue.get()
+        if status == "PASS":
+            # If this passes, the bug has been fixed!
+            pass
+        else:
+            pytest.fail(f"Kernel raised an error: {detail}")
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_named_barrier_wait_1warp_async_deadlock_single_proc(device):
+    """Same as test_named_barrier_wait_1warp_async_deadlock but runs in the
+    current process for easier IR debugging. WARNING: will hang if the bug
+    is present — use with a timeout (e.g. ``pytest --timeout=15``)."""
+
+    @triton.jit
+    def _kernel_diverge_both_1warp_sp(output_ptr):
+        if tlx.thread_id(axis=0) % 32 == 0:
+            tl.store(output_ptr + 1, 99)  # divergence BEFORE
+        tlx.named_barrier_wait(14, 32)
+        if tlx.thread_id(axis=0) % 32 == 0:
+            tl.store(output_ptr + 0, 5)  # divergence AFTER
+
+    output = torch.zeros(2, dtype=torch.int32, device=device)
+    _kernel_diverge_both_1warp_sp[(1, )](output, num_warps=4)
+    torch.cuda.synchronize()
+    result = output.cpu().tolist()
+    assert result[0] == 5, f"Expected output[0]=5, got {result[0]}"
+    assert result[1] == 99, f"Expected output[1]=99, got {result[1]}"

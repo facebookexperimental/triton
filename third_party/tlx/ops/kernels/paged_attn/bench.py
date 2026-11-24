@@ -1,0 +1,493 @@
+import argparse
+import math
+import os
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+import triton
+
+from triton.tlx.ops.kernels.paged_attn.gfx950_decode import (
+    allocate_pa_decode_workspace as _allocate_pa_decode_workspace,
+    pa_decode_tlx as _pa_decode_tlx,
+    build_inputs as _build_inputs,
+    get_pa_decode_config as _get_pa_decode_config,
+    ref_decode as _ref_decode,
+)
+
+from triton._internal_testing import is_hip, is_hip_cdna4
+
+pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP backend")
+DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+# Fixed decode problem geometry (GQA, bf16 KV), matching the paged-decode
+# correctness case. The sweep varies batch x context x query_length.
+NUM_KV_HEADS = 8
+QUERY_GROUP_SIZE = 8
+NUM_Q_HEADS = NUM_KV_HEADS * QUERY_GROUP_SIZE
+HEAD_DIM = 64
+PAGE_SIZE = 16
+
+
+def _check_aiter_available():
+    try:
+        import aiter  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+_AITER_AVAILABLE = _check_aiter_available()
+DECODE_METHODS = (
+    "aiter_common",
+    "aiter_unified",
+    "sglang",
+    "sglang_tlx",
+    "aiter_gluon",
+    "tlx_5d",
+    "tlx_5d_streaming",
+    "tlx_gluon_compat",
+    "tlx",
+    "tlx_nhd",
+    "tlx_nhd_rmsnorm_gate",
+    "tlx_nhd_out_gate",
+)
+# Providers that read SGLang's page-major token pool, [blocks, page, kv_heads, dim].
+NHD_METHODS = ("aiter_unified", "tlx_nhd", "tlx_nhd_rmsnorm_gate", "tlx_nhd_out_gate")
+# PR #2306 target comparison: standalone AITER common/HIP, SGLang's actual
+# vectorized-5D wrapper (which calls AITER Gluon), and native TLX 5D.
+DEFAULT_DECODE_VERSIONS = ["aiter_common", "sglang", "tlx_5d"] if _AITER_AVAILABLE else ["tlx_5d"]
+CORRECTNESS_METHODS = ("tlx", "tlx_nhd", "aiter_gluon", "aiter_unified") if _AITER_AVAILABLE else ("tlx", "tlx_nhd")
+
+
+def _cache_layout(provider):
+    return "4d" if provider == "tlx" else "nhd" if provider in NHD_METHODS else "5d"
+
+
+def _make_decode_fn(
+    provider,
+    out,
+    q,
+    kc,
+    vc,
+    ctx,
+    bt,
+    sm_scale,
+    qlen,
+    max_context_len,
+    num_kv_heads,
+    query_group_size,
+    head_dim,
+    sliding_window=0,
+):
+    expected_ndim = 5 if _cache_layout(provider) == "5d" else 4
+    assert kc.ndim == vc.ndim == expected_ndim
+    if provider in ("tlx", "tlx_nhd", "tlx_5d", "tlx_5d_streaming", "tlx_gluon_compat"):
+        streaming_kv = True if provider == "tlx_5d_streaming" else None
+        # None lets the production TLX provider select its tuned B1 path;
+        # True retains an explicit provider for controlled comparisons.
+        gluon_compat = True if provider == "tlx_gluon_compat" else None
+        kv_layout = "NHD" if provider == "tlx_nhd" else "HND"
+        config = _get_pa_decode_config(
+            q,
+            kc,
+            vc,
+            bt,
+            query_length=qlen,
+            max_context_len=max_context_len,
+            streaming_kv=streaming_kv,
+            gluon_compat=gluon_compat,
+            sliding_window=sliding_window,
+            kv_layout=kv_layout,
+        )
+        workspace = _allocate_pa_decode_workspace(q, kc, config)
+
+        def _run_tlx():
+            return _pa_decode_tlx(
+                out,
+                q,
+                kc,
+                vc,
+                ctx,
+                bt,
+                sm_scale,
+                query_length=qlen,
+                max_context_len=max_context_len,
+                streaming_kv=streaming_kv,
+                gluon_compat=gluon_compat,
+                workspace=workspace,
+                config=config,
+                sliding_window=sliding_window,
+                kv_layout=kv_layout,
+            )
+
+        return _run_tlx
+
+    if provider in ("tlx_nhd_rmsnorm_gate", "tlx_nhd_out_gate"):
+        # Attention plus the output RMSNorm x sigmoid gate (head_dim 64): tlx.ops.rmsnorm_gate after the decode, or
+        # out_gate, which applies it in the split-K reduce.
+        from triton.tlx.ops import paged_attention_decode, paged_attention_decode_workspace, rmsnorm_gate
+
+        tokens = q.shape[0]
+        gate = torch.randn(tokens, q.shape[1] * head_dim, device=q.device, dtype=torch.bfloat16)
+        plan = dict(query_length=qlen, sliding_window=sliding_window, max_context_len=max_context_len, kv_layout="NHD")
+        workspace = paged_attention_decode_workspace(q, kc, vc, bt, norm_gate=True, **plan)
+        kwargs = dict(plan, sm_scale=sm_scale, out=out, workspace=workspace)
+        if provider == "tlx_nhd_out_gate":
+            return lambda: paged_attention_decode(q, kc, vc, ctx, bt, out_gate=gate, **kwargs)
+        normed = torch.empty_like(gate)
+        return lambda: rmsnorm_gate(
+            paged_attention_decode(q, kc, vc, ctx, bt, **kwargs).view(tokens, -1), gate, out=normed)
+
+    if not _AITER_AVAILABLE:
+        return None
+
+    num_seqs = q.shape[0] // qlen
+    if provider == "aiter_unified":
+        # SGLang's aiter backend decode and target-verify call.
+        from aiter.ops.triton.attention.unified_attention import unified_attention
+
+        cu_seqlens_q = torch.arange(0, num_seqs + 1, dtype=torch.int32, device=q.device) * qlen
+        window_size = (sliding_window - 1, 0) if sliding_window else (-1, -1)
+        return lambda: unified_attention(q=q, k=kc, v=vc, out=out, cu_seqlens_q=cu_seqlens_q, max_seqlen_q=qlen,
+                                         seqused_k=ctx, max_seqlen_k=bt.shape[1] * kc.shape[1], softmax_scale=sm_scale,
+                                         causal=True, window_size=window_size, block_table=bt, softcap=0.0, q_descale=
+                                         None, k_descale=None, v_descale=None, sinks=None)
+    if sliding_window:
+        raise ValueError(f"{provider} is benchmarked without a sliding window")
+
+    context_partition_size = 256
+    max_context_partition_num = math.ceil(int(ctx.max().item()) / context_partition_size)
+
+    if provider in ("sglang", "sglang_tlx"):
+        if qlen != 1:
+            raise ValueError("SGLang's vectorized_5d decode wrapper only supports query_length=1")
+
+        from sglang.srt.layers.attention.aiter_utils import forward_decode_vectorized_5d
+
+        # Use the real SGLang wrapper, including its recommended split count,
+        # ps=True kernel selection, metadata handling, and per-call workspaces.
+        backend = SimpleNamespace(
+            input_dtype=q.dtype,
+            kv_cache_dtype=kc.dtype,
+            k_scale=None,
+            v_scale=None,
+            forward_metadata=SimpleNamespace(
+                kv_indices=bt,
+                swa_page_table=None,
+                max_kv_len=max_context_len,
+            ),
+        )
+        layer = SimpleNamespace(
+            tp_k_head_num=num_kv_heads,
+            tp_q_head_num=q.shape[1],
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+            scaling=sm_scale,
+            sliding_window_size=None,
+            k_scale=None,
+            v_scale=None,
+        )
+        forward_batch = SimpleNamespace(batch_size=num_seqs, seq_lens=ctx)
+
+        os.environ["SGLANG_AITER_5D_DECODE_BACKEND"] = "tlx" if provider == "sglang_tlx" else "gluon"
+        return lambda: forward_decode_vectorized_5d(backend, q, layer, forward_batch, kc, vc, out, None)
+
+    if provider == "aiter_gluon":
+        from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+
+        equivalent_group_size = qlen * query_group_size
+        workspace_shape = (
+            num_seqs,
+            num_kv_heads,
+            max_context_partition_num,
+            equivalent_group_size,
+        )
+        exp_sums = torch.empty(workspace_shape, dtype=torch.float32, device=q.device)
+        max_logits = torch.empty_like(exp_sums)
+        temporary_output = torch.empty((*workspace_shape, head_dim), dtype=q.dtype, device=q.device)
+
+        return lambda: pa_decode_gluon(
+            output=out,
+            query=q,
+            key_cache=kc,
+            value_cache=vc,
+            context_lengths=ctx,
+            block_tables=bt,
+            softmax_scale=sm_scale,
+            query_length=qlen,
+            max_context_partition_num=max_context_partition_num,
+            context_partition_size=context_partition_size,
+            compute_type=q.dtype,
+            exp_sums=exp_sums,
+            max_logits=max_logits,
+            temporary_output=temporary_output,
+            sliding_window=0,
+            ps=False,
+        )
+
+    # This is the path used by vLLM when shuffled KV cache is enabled. AITER
+    # dispatches to its HIP kernel for D=64 and may select hand-written ASM for
+    # D=128 when the launched head count is large enough.
+    from aiter import paged_attention_common
+
+    num_q_heads = q.shape[1]
+    tmp_out = torch.empty(
+        (num_seqs, num_q_heads, max_context_partition_num, head_dim),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    exp_sums = torch.empty(
+        (num_seqs, num_q_heads, max_context_partition_num),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    max_logits = torch.empty_like(exp_sums)
+    scale = torch.ones(1, dtype=torch.float32, device=q.device)
+
+    return lambda: paged_attention_common(
+        Q=q,
+        K=kc,
+        V=vc,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        tmp_out=tmp_out,
+        block_tables=bt,
+        context_lens=ctx,
+        block_tables_stride0=bt.stride(0),
+        scale=sm_scale,
+        max_qlen=qlen,
+        max_seq_len=max_context_len,
+        K_QScale_hip=scale,
+        V_QScale_hip=scale,
+        K_QScale_asm=scale,
+        V_QScale_asm=scale,
+        out_=out,
+        kv_cache_dtype="auto",
+    )
+
+
+def get_x_values():
+    # (BATCH, N_CTX)
+    x_vals = [
+        (1, 8192),
+        (8, 8192),
+        (32, 8192),
+        (128, 8192),
+        (1, 32768),
+        (8, 32768),
+        (32, 32768),
+        (8, 131072),
+    ]
+
+    return x_vals
+
+
+def create_benchmark(
+    versions,
+    qlen,
+    head_dim,
+    page_size,
+    warmup_ms=100,
+    rep_ms=200,
+    shared_page_pool=False,
+    num_kv_heads=NUM_KV_HEADS,
+    sliding_window=0,
+):
+    if qlen != 1 and any(provider in versions for provider in ("sglang", "sglang_tlx")):
+        raise ValueError("SGLang's vectorized_5d decode wrapper only supports query_length=1")
+    line_vals = list(versions)
+    line_names = list(versions)
+
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["BATCH", "N_CTX"],
+            x_vals=get_x_values(),
+            line_arg="provider",
+            line_vals=line_vals,
+            line_names=line_names,
+            ylabel="TB/s (effective HBM read)",
+            plot_name=(f"paged-decode-performance-bf16-d{head_dim}-p{page_size}-qlen{qlen}-kvh{num_kv_heads}" +
+                       (f"-w{sliding_window}" if sliding_window else "") +
+                       ("-shared-pool" if shared_page_pool else "")),
+            args={},
+        ))
+    def benchmark(BATCH, N_CTX, provider):
+        sm_scale = 1.0 / (head_dim**0.5)
+        num_q_heads = num_kv_heads * QUERY_GROUP_SIZE
+        # Give each sequence distinct physical pages. A small shared page pool
+        # unrealistically turns a long-context decode benchmark into an L2 test.
+        pool_pages = None
+        if shared_page_pool:
+            # Reproduce PR #2306 exactly: enough physical pages for roughly
+            # four sequences, reused modulo the pool at larger batch sizes.
+            pool_pages = 4 * ((N_CTX + page_size - 1) // page_size) + 16
+        q, kc, vc, ctx, bt = _build_inputs(
+            BATCH,
+            [N_CTX] * BATCH,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            query_length=qlen,
+            device=DEVICE,
+            pool_pages=pool_pages,
+            cache_layout=_cache_layout(provider),
+        )
+        out = torch.empty_like(q)
+        fn = _make_decode_fn(
+            provider,
+            out,
+            q,
+            kc,
+            vc,
+            ctx,
+            bt,
+            sm_scale,
+            qlen,
+            N_CTX,
+            num_kv_heads,
+            QUERY_GROUP_SIZE,
+            head_dim,
+            sliding_window,
+        )
+        if fn is None:
+            return float("nan"), float("nan"), float("nan")
+        quantiles = [0.5, 0.2, 0.8]
+        ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles, warmup=warmup_ms, rep=rep_ms)
+
+        # Decode reads each attended key and value once (bf16): report effective
+        # HBM read bandwidth, the meaningful metric for this memory-bound op.
+        # Use actual tensor sizes as the cap: with pool_pages sharing, multiple
+        # sequences map to the same physical pages, so BATCH*N_CTX overcounts.
+        keys = min(N_CTX, sliding_window + qlen - 1) if sliding_window else N_CTX
+        kv_bytes = min((kc.numel() + vc.numel()) * kc.element_size(),
+                       2 * BATCH * keys * num_kv_heads * head_dim * kc.element_size())
+        tbps = lambda ms: kv_bytes * 1e-12 / (ms * 1e-3)
+        return tbps(ms), tbps(max_ms), tbps(min_ms)
+
+    return benchmark
+
+
+@pytest.mark.parametrize("provider", CORRECTNESS_METHODS)
+@pytest.mark.parametrize("query_length", [1, 2, 3, 4, 8], ids=lambda q: f"qlen{q}")
+@pytest.mark.parametrize("batch, n_ctx", get_x_values())
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_correctness(batch, n_ctx, query_length, provider):
+    if provider == "aiter_gluon" and query_length > 4:
+        pytest.skip("pa_decode_gluon is compared at MTP query lengths only")
+    sm_scale = 1.0 / (HEAD_DIM**0.5)
+    ctx_lens = [n_ctx] * batch
+    cache_layout = _cache_layout(provider)
+    query, key_cache, value_cache, context_lens, block_tables = _build_inputs(
+        batch,
+        ctx_lens,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        PAGE_SIZE,
+        query_length=query_length,
+        device=DEVICE,
+        cache_layout=cache_layout,
+    )
+    out = torch.empty_like(query)
+    fn = _make_decode_fn(
+        provider,
+        out,
+        query,
+        key_cache,
+        value_cache,
+        context_lens,
+        block_tables,
+        sm_scale,
+        query_length,
+        n_ctx,
+        NUM_KV_HEADS,
+        QUERY_GROUP_SIZE,
+        HEAD_DIM,
+    )
+    if fn is None:
+        pytest.skip(f"{provider} not available")
+    fn()
+    ref = _ref_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale, NUM_Q_HEADS, NUM_KV_HEADS,
+                      query_length, kv_layout="NHD" if cache_layout == "nhd" else "HND")
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Benchmark TLX AMD paged-attention decode")
+    parser.add_argument(
+        "--version",
+        type=str,
+        nargs="+",
+        choices=list(DECODE_METHODS),
+        help=f"Run only the specified version(s). Choices: {list(DECODE_METHODS)}",
+    )
+    parser.add_argument(
+        "--qlens",
+        type=int,
+        nargs="+",
+        default=[1],
+        help="Query lengths to sweep (1 decode, 2-8 speculative verification).",
+    )
+    parser.add_argument("--warmup-ms", type=int, default=100, help="Warmup time per benchmark point.")
+    parser.add_argument("--rep-ms", type=int, default=200, help="Measurement time per benchmark point.")
+    parser.add_argument("--head-dims", type=int, nargs="+", default=[64])
+    parser.add_argument("--page-sizes", type=int, nargs="+", default=[16])
+    parser.add_argument("--kv-heads", type=int, default=NUM_KV_HEADS, help="KV heads, with 8 query heads each.")
+    parser.add_argument("--sliding-window", type=int, default=0, help="Keys per query row; 0 is full attention.")
+    parser.add_argument(
+        "--shared-page-pool",
+        "--use_cache_pool",
+        dest="shared_page_pool",
+        action="store_true",
+        help="Reproduce PR #2306 page reuse; large-batch results measure substantial L2 reuse.",
+    )
+    args = parser.parse_args()
+
+    if is_hip():
+        versions = args.version if args.version else DEFAULT_DECODE_VERSIONS
+        print(f"Running paged-decode benchmarks for: {versions}, qlens={args.qlens}, "
+              f"head_dims={args.head_dims}, page_sizes={args.page_sizes}")
+        for head_dim in args.head_dims:
+            for page_size in args.page_sizes:
+                for qlen in args.qlens:
+                    print(f"\n=== head_dim={head_dim}, page_size={page_size}, "
+                          f"query_length={qlen} ===")
+                    report = create_benchmark(
+                        versions,
+                        qlen,
+                        head_dim,
+                        page_size,
+                        args.warmup_ms,
+                        args.rep_ms,
+                        args.shared_page_pool,
+                        args.kv_heads,
+                        args.sliding_window,
+                    )
+                    if len(versions) > 1:
+                        df = report.run(return_df=True)
+                        ylabel = "TB/s (effective HBM read)"
+                        baseline = f"tlx_5d ({ylabel})"
+                        if "tlx" in versions and "tlx_5d" in versions:
+                            df["tlx_5d/tlx speedup"] = (df[baseline] / df[f"tlx ({ylabel})"])
+                        if "tlx_nhd_rmsnorm_gate" in versions and "tlx_nhd_out_gate" in versions:
+                            df["out_gate/rmsnorm_gate speedup"] = (df[f"tlx_nhd_out_gate ({ylabel})"] /
+                                                                   df[f"tlx_nhd_rmsnorm_gate ({ylabel})"])
+                        if "aiter_unified" in versions and "tlx_nhd" in versions:
+                            df["tlx_nhd/aiter_unified speedup"] = (df[f"tlx_nhd ({ylabel})"] /
+                                                                   df[f"aiter_unified ({ylabel})"])
+                        aiter_col = f"aiter_common ({ylabel})"
+                        if "aiter_common" in versions and "tlx_5d" in versions:
+                            df["tlx_5d/aiter_common speedup"] = (df[baseline] / df[aiter_col])
+                        if "aiter_common" in versions and "sglang" in versions:
+                            df["sglang/aiter_common speedup"] = (df[f"sglang ({ylabel})"] / df[aiter_col])
+                        print(f"paged-decode-performance-bf16-d{head_dim}-"
+                              f"p{page_size}-qlen{qlen}:")
+                        print(df.to_string())
+                    else:
+                        report.run(print_data=True)
+    else:
+        print("Skipping benchmarks, no AMD GPU found.")

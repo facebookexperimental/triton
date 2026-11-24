@@ -1,6 +1,7 @@
 import expecttest
 import importlib.util
 import itertools
+import multiprocessing
 import os
 import re
 import gc
@@ -9,14 +10,48 @@ import pathlib
 import subprocess
 import sys
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
+from contextlib import ExitStack
 
 import pytest
 import torch
 
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hip
+from triton._internal_testing import is_hip, is_cpu
 from triton.runtime.cache import FileCacheManager, RemoteCacheManager
+
+
+def test_ast_source_hash_distinguishes_optional_constexpr_positions():
+    from triton.compiler import ASTSource
+
+    @triton.jit
+    def kernel(out, FIRST: tl.constexpr = False, SECOND: tl.constexpr = False):
+        tl.store(out, 1 if FIRST else (2 if SECOND else 0))
+
+    def source(constants):
+        return ASTSource(kernel, signature={"out": "*i32"}, constexprs=constants)
+
+    # Both sources supply one True and omit the other argument's default,
+    # but they select different stores. A cache hit must distinguish them.
+    assert source({"FIRST": True}).hash() != source({"SECOND": True}).hash()
+    assert source({(1, ): True}).hash() == source({"FIRST": True}).hash()
+    assert source({"FIRST": True, "SECOND": False}).hash() == source({"SECOND": False, "FIRST": True}).hash()
+    assert source({(1, 0): True}).hash() != source({(1, 1): True}).hash()
+
+
+def test_ast_source_hash_distinguishes_constexprs_that_print_alike():
+    from triton.compiler import ASTSource
+
+    @triton.jit
+    def kernel(out, A: tl.constexpr, B: tl.constexpr):
+        tl.store(out, 1 if A == "x-y" else 2)
+
+    def source(a, b):
+        return ASTSource(kernel, signature={"out": "*i32"}, constexprs={"A": a, "B": b})
+
+    # Joined with "-", both argument lists read "x-y-z" although they select
+    # different stores (triton-lang/triton#12429).
+    assert source("x-y", "z").hash() != source("x", "y-z").hash()
 
 
 def test_file_cache_manager_writes_utf8_under_ascii_locale(tmp_path):
@@ -42,6 +77,26 @@ assert Path(path).read_text(encoding="utf-8") == text
     subprocess.run([sys.executable, "-c", script], check=True, env=env)
 
 
+@pytest.mark.parametrize("backend, options_type, arch", [
+    ("amd", "HIPOptions", "gfx950"),
+    ("nvidia", "CUDAOptions", "sm90"),
+])
+def test_extern_libs_hash_contents(backend, options_type, arch, tmp_path):
+    compiler = importlib.import_module(f"triton.backends.{backend}.compiler")
+    library = tmp_path / "custom.bc"
+    library.write_bytes(b"original library")
+    options = getattr(compiler, options_type)(arch=arch, extern_libs={"custom": str(library)})
+    try:
+        original = options.hash()
+        assert options.hash() == original
+        library.write_bytes(b"modified library")
+        # File hashes are memoized per process. Start cold, as in a new invocation.
+        compiler.file_hash.cache_clear()
+        assert options.hash() != original
+    finally:
+        compiler.file_hash.cache_clear()
+
+
 def test_file_cache_manager_get_group_rejects_missing_child(fresh_knobs, tmp_path):
     fresh_knobs.cache.dir = str(tmp_path)
     manager = FileCacheManager("key")
@@ -59,6 +114,27 @@ def test_file_cache_manager_get_group_rejects_missing_child(fresh_knobs, tmp_pat
 
     os.remove(artifact_path)
     assert manager.get_group("kernel.json") is None
+
+
+def test_file_cache_manager_get_group_relocated_dir(fresh_knobs, tmp_path):
+    original, copy = tmp_path / "original", tmp_path / "copy"
+    fresh_knobs.cache.dir = str(original)
+    manager = FileCacheManager("key")
+    metadata_path = manager.put("{}", "kernel.json", binary=False)
+    artifact_path = manager.put("binary", "kernel.cubin", binary=False)
+    manager.put_group("kernel.json", {
+        "kernel.json": metadata_path,
+        "kernel.cubin": artifact_path,
+    })
+
+    shutil.copytree(original, copy)
+    shutil.rmtree(original)
+    fresh_knobs.cache.dir = str(copy)
+    manager = FileCacheManager("key")
+    assert manager.get_group("kernel.json") == {
+        "kernel.json": os.path.join(manager.cache_dir, "kernel.json"),
+        "kernel.cubin": os.path.join(manager.cache_dir, "kernel.cubin"),
+    }
 
 
 def test_remote_cache_manager_get_group_rejects_missing_child(fresh_knobs, tmp_path):
@@ -151,14 +227,14 @@ def kernel_with_combine_fn(X, BLOCK: tl.constexpr):
 
 
 def apply_src_change(target, old, new, to_modify):
-    kernel.hash = None
-    function_0.hash = None
-    function_1.hash = None
-    function_2.hash = None
-    to_modify._unsafe_update_src(to_modify.src.replace(old, new))
-    ret = target.cache_key
-    to_modify._unsafe_update_src(to_modify.src.replace(new, old))
-    return ret
+    with ExitStack() as cleanup:
+        # Restoring a dependency's source also invalidates its callers' hashes.
+        for function in (kernel, function_0, function_1, function_2, target):
+            function.hash = None
+            cleanup.callback(setattr, function, "hash", None)
+        cleanup.callback(to_modify._unsafe_update_src, to_modify.src)
+        to_modify._unsafe_update_src(to_modify.src.replace(old, new))
+        return target.cache_key
 
 
 def test_nochange():
@@ -171,18 +247,33 @@ def test_toplevel_change():
     baseline = kernel.cache_key
     updated = apply_src_change(kernel, 'i + 1', 'i + 2', function_1)
     assert baseline != updated
+    assert kernel.cache_key == baseline
+
+
+def test_keyword_only_default_dependency_change():
+
+    @triton.jit
+    def with_default(i, *, function_1: tl.constexpr = function_1):
+        return function_1(i)
+
+    baseline = with_default.cache_key
+    updated = apply_src_change(with_default, 'i + 1', 'i + 2', function_1)
+    assert baseline != updated
+    assert with_default.cache_key == baseline
 
 
 def test_nested1_change():
     baseline = kernel.cache_key
     updated = apply_src_change(kernel, 'i + 1', 'i + 2', function_2)
     assert baseline != updated
+    assert kernel.cache_key == baseline
 
 
 def test_nested2_change():
     baseline = kernel.cache_key
     updated = apply_src_change(kernel, 'i + 1', 'i + 2', function_0)
     assert baseline != updated
+    assert kernel.cache_key == baseline
 
 
 ORDER_DEPENDENT_CONSTEXPR = tl.constexpr(42)
@@ -308,6 +399,7 @@ def test_invalid_constexpr_fn():
 
 
 def write_and_load_module(temp_file: pathlib.Path, code, num_extra_lines):
+    temp_file.parent.mkdir(parents=True, exist_ok=True)
     temp_file.write_text(('# extra line\n' * num_extra_lines) + code)
     spec = importlib.util.spec_from_file_location("module.name", str(temp_file))
     module = importlib.util.module_from_spec(spec)
@@ -315,22 +407,51 @@ def write_and_load_module(temp_file: pathlib.Path, code, num_extra_lines):
     return module
 
 
-def test_changed_line_numbers_invalidate_cache(tmp_path: pathlib.Path):
-    from textwrap import dedent
-    code = dedent("""
-        import triton
-        @triton.jit
-        def test_kernel(i):
-            i = i + 1
-    """)
-    temp_file0 = tmp_path / "test_changed_line_numbers_invalidate_cache0.py"
-    orig_mod = write_and_load_module(temp_file0, code, 0)
-    orig_cache_key = orig_mod.test_kernel.cache_key
+@pytest.mark.parametrize("change_line_info", [False, True])
+@pytest.mark.parametrize("filename, extra_lines, decorators, indentation", [
+    ("kernel.py", 0, 1, 4),
+    ("other.py", 0, 1, 4),
+    ("kernel.py", 1, 1, 4),
+    ("kernel.py", 0, 2, 4),
+    ("kernel.py", 0, 1, 8),
+], ids=["unchanged", "file", "line", "decorator", "column"])
+def test_source_locations_invalidate_cache(tmp_path: pathlib.Path, fresh_knobs, fresh_triton_cache, change_line_info,
+                                           filename, extra_lines, decorators, indentation):
+    from textwrap import dedent, indent
 
-    temp_file1 = tmp_path / "test_changed_line_numbers_invalidate_cache1.py"
-    updated_mod = write_and_load_module(temp_file1, code, 1)
-    updated_cache_key = updated_mod.test_kernel.cache_key
-    assert orig_cache_key != updated_cache_key
+    fresh_knobs.compilation.disable_line_info = False
+
+    def load_kernel(filename="kernel.py", extra_lines=0, decorators=1, indentation=4):
+        code = dedent("""\
+            import triton
+            import triton.language as tl
+            def identity(fn):
+                return fn
+            def make_kernel():
+        """)
+        body = "@identity\n" * decorators + dedent("""\
+            @triton.jit
+            def test_kernel(X):
+                tl.store(X, 1)
+            return test_kernel
+        """)
+        code += indent(body, " " * indentation) + "test_kernel = make_kernel()\n"
+        return write_and_load_module(tmp_path / filename, code, extra_lines).test_kernel
+
+    original = load_kernel()
+    original_key = original.cache_key
+    original_compiled = triton.compile(triton.compiler.ASTSource(original, {"X": "*i32"}))
+
+    fresh_knobs.compilation.disable_line_info = change_line_info
+    updated = load_kernel(filename, extra_lines, decorators, indentation)
+    updated_compiled = triton.compile(triton.compiler.ASTSource(updated, {"X": "*i32"}))
+    source_changed = (filename, extra_lines, decorators, indentation) != ("kernel.py", 0, 1, 4)
+    assert original.src == updated.src
+    assert (original_key != updated.cache_key) == source_changed
+    # Column-only changes may produce identical binary bytes.
+    assert (original_compiled.hash != updated_compiled.hash) == (source_changed or change_line_info)
+    if change_line_info:
+        assert original_compiled.kernel != updated_compiled.kernel
 
 
 def test_reuse(device, fresh_triton_cache):
@@ -442,6 +563,18 @@ def test_local_shadows_global():
     kernel[(1, )]()
     GLOBAL = 43
     kernel[(1, )]()
+
+
+def test_keyword_only_shadows_global(monkeypatch):
+    monkeypatch.setitem(globals(), "GLOBAL", 42)
+
+    @triton.jit
+    def kernel(*, GLOBAL: tl.constexpr):
+        tl.static_assert(GLOBAL == 1)
+
+    kernel[(1, )](GLOBAL=1)
+    monkeypatch.setitem(globals(), "GLOBAL", 43)
+    kernel[(1, )](GLOBAL=1)
 
 
 CONSTEXPR_GLOBAL = tl.constexpr(42)
@@ -562,6 +695,40 @@ def test_cache_closure():
         closure[(1, )]()
 
     assert "cst has changed since we compiled this kernel, from constexpr[42] to constexpr[43]" in str(e.value)
+
+
+CLOSURE_SHADOW_GLOBAL = tl.constexpr(3)
+
+
+def test_cache_closure_shadows_global():
+
+    def make_closure(value):
+        CLOSURE_SHADOW_GLOBAL = value
+
+        @triton.jit
+        def closure():
+            return CLOSURE_SHADOW_GLOBAL
+
+        return closure
+
+    first = make_closure(tl.constexpr(7))
+    second = make_closure(tl.constexpr(9))
+    same_as_first = make_closure(tl.constexpr(7))
+    captures_none = make_closure(None)
+
+    first_key = first.cache_key
+    second_key = second.cache_key
+    same_as_first_key = same_as_first.cache_key
+    captures_none.cache_key
+
+    def tracked_values(fn):
+        return {name: value for (name, _), (value, _) in fn.used_global_vals.items()}
+
+    assert first_key != second_key
+    assert first_key == same_as_first_key
+    assert tracked_values(first)["CLOSURE_SHADOW_GLOBAL"].value == 7
+    assert tracked_values(second)["CLOSURE_SHADOW_GLOBAL"].value == 9
+    assert "CLOSURE_SHADOW_GLOBAL" not in tracked_values(captures_none)
 
 
 @triton.jit
@@ -1013,19 +1180,25 @@ def test_async_compile_error(fresh_triton_cache):
     def fn(x: tl.constexpr):
         tl.static_assert(x == 2)
 
-    with pytest.raises(triton.compiler.errors.CompileTimeAssertionFailure):
-        with (
-                ThreadPoolExecutor(2) as pool,
-                triton.AsyncCompileMode(pool),
-        ):
-            assert triton.runtime._async_compile.active_mode.get() is not None
-            fn.warmup(1, grid=(1, ))
+    with (
+            ThreadPoolExecutor(2) as pool,
+            triton.AsyncCompileMode(pool),
+    ):
+        assert triton.runtime._async_compile.active_mode.get() is not None
+        fn.warmup(1, grid=(1, ))
 
-            assert len(fn.device_caches[0][0]) == 1
+        assert len(fn.device_caches[0][0]) == 1
+        # Resolving the queued kernel reports the compilation failure. The
+        # mode must not resolve the failed FutureKernel again on exit.
+        with pytest.raises(triton.compiler.errors.CompileTimeAssertionFailure):
+            fn[(1, )](1)
 
     # After the AsyncCompileMode context manager exits, the active mode should
     # be set to None again, even if there was an error.
     assert triton.runtime._async_compile.active_mode.get() is None
+    # A failed Future would otherwise retain its exception traceback and the
+    # compiler objects reachable through it.
+    assert len(fn.device_caches[0][0]) == 0
 
 
 def test_higher_order_kernel(device, fresh_triton_cache, capsys):
@@ -1226,6 +1399,8 @@ def test_preload_higher_order_kernels(device, fresh_triton_cache) -> None:
 
 
 def test_module_load_unload(device, fresh_knobs):
+    if is_cpu():
+        pytest.xfail("Requires CUDA; unclear whether applicable to CPU backend")
 
     @triton.jit
     def kernel(out_ptr, val) -> None:
@@ -1233,9 +1408,11 @@ def test_module_load_unload(device, fresh_knobs):
 
     # we should hit the kernel unload call to decrese the counter from 1 to 0
     counter = 1
+    owner_pid = os.getpid()
 
     def kernel_unload(*args, **kwargs):
         nonlocal counter
+        assert os.getpid() == owner_pid
         counter -= 1
 
     # turn off python garbage collector, so the callback is not called
@@ -1249,9 +1426,91 @@ def test_module_load_unload(device, fresh_knobs):
 
     assert counter == 1
     assert pre_compile.module is not None
+
+    if "fork" in multiprocessing.get_all_start_methods():
+        child = multiprocessing.get_context("fork").Process(target=pre_compile.__del__)
+        child.start()
+        child.join()
+        assert child.exitcode == 0
+        assert counter == 1
+
     pre_compile.__del__()
 
     assert counter == 0
     assert pre_compile.module is None
     # turn on garbage collector
     gc.enable()
+
+
+def test_module_unload_uses_loading_driver(monkeypatch, fresh_knobs):
+    from types import SimpleNamespace
+    from triton.compiler import compiler
+
+    module = object()
+    function = object()
+    loading_driver_unloads = []
+    current_driver_unloads = []
+
+    loading_driver = SimpleNamespace(
+        get_current_device=lambda: 0,
+        get_current_target=lambda: SimpleNamespace(warp_size=32),
+        launcher_cls=lambda src, metadata: object(),
+        utils=SimpleNamespace(
+            load_binary=lambda *args: (module, function, 0, 0, 1024),
+            unload_module=loading_driver_unloads.append,
+        ),
+    )
+    current_driver = SimpleNamespace(utils=SimpleNamespace(unload_module=current_driver_unloads.append), )
+
+    compiled = object.__new__(compiler.CompiledKernel)
+    compiled.src = object()
+    # fbtriton-only: _build_dispatcher reads metadata.target.
+    compiled.metadata = SimpleNamespace(shared=0, num_warps=1, target=None, warp_size=32)
+    compiled.metadata_group = {}
+    compiled.hash = "hash"
+    compiled.name = "kernel"
+    compiled.kernel = b"binary"
+    compiled.module = None
+    compiled.function = None
+    compiled._run = None
+
+    monkeypatch.setattr(compiler, "_max_shared_mem", lambda device, driver_utils: 1024)
+    monkeypatch.setattr(compiler.driver, "_active", loading_driver)
+
+    compiled._init_handles()
+    compiler.driver.set_active(current_driver)
+    compiled.__del__()
+
+    assert loading_driver_unloads == [module]
+    assert current_driver_unloads == []
+    assert compiled.module is None
+
+
+def test_max_shared_mem_cache_is_driver_specific(monkeypatch):
+    from types import SimpleNamespace
+    from triton.compiler import compiler
+
+    class DriverUtils:
+
+        def __init__(self, value):
+            self.value = value
+            self.calls = 0
+
+        def get_device_properties(self, device):
+            self.calls += 1
+            return {"max_shared_mem": self.value}
+
+    cpu_utils = DriverUtils(0)
+    gpu_utils = DriverUtils(65536)
+    compiler._max_shared_mem.cache_clear()
+
+    monkeypatch.setattr(compiler.driver, "_active", SimpleNamespace(utils=cpu_utils))
+    assert compiler.max_shared_mem(0) == 0
+    compiler.driver.set_active(SimpleNamespace(utils=gpu_utils))
+    assert compiler.max_shared_mem(0) == 65536
+    compiler.driver.set_active(SimpleNamespace(utils=cpu_utils))
+    assert compiler.max_shared_mem(0) == 0
+    assert cpu_utils.calls == 1
+    assert gpu_utils.calls == 1
+
+    compiler._max_shared_mem.cache_clear()

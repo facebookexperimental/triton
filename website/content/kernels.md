@@ -7,8 +7,6 @@
 
 [Warp-specialized MXFP8 GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_ws_mxfp8.py)
 
-[Grouped GEMM on Blackwell](third_party/tlx/tutorials/blackwell-grouped-gemm_test.py)
-
 [Pipelined GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_pipelined.py)
 
 [CLC GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_clc.py)
@@ -31,7 +29,7 @@
 
 [Persistent Flash Attention fwd — XCD zig-zag, cross-attention / decode](third_party/tlx/tutorials/amd_fa_persistent.py)
 
-[Rotated 4-cluster Flash Attention fwd](third_party/tlx/tutorials/amd_fa_cluster.py)
+[Rotated 4-cluster Flash Attention fwd/bwd](third_party/tlx/ops/kernels/flash_attn/gfx950.py)
 
 [Fused addmm + GLU (Gated Linear Unit: out = x + x*y, x = A@B + bias)](third_party/tlx/tutorials/amd_addmm_glu.py)
 
@@ -43,4 +41,4 @@
 
 [TDM-pipelined GEMM](third_party/tlx/tutorials/amd_tdm_gemm_pipelined.py)
 
-[MXFP TDM-pipelined GEMM](third_party/tlx/tutorials/amd_mxfp_gemm_tdm_pipelined.py)
+[MXFP TDM-pipelined GEMM](third_party/tlx/ops/kernels/mm_mxfp/gfx1250.py)

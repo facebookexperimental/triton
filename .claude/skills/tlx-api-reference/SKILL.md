@@ -18,6 +18,7 @@ description: >
 | `tlx.async_task([task_ids])` | Assign code to specific task IDs (e.g., `[0]` = producer, `[1,2]` = consumers) | Both |
 | `tlx.async_task(num_warps=N, num_regs=R)` | Explicit warp/register allocation for a task | Both |
 | `tlx.async_task("default", num_regs=R)` | Default task for code outside explicit tasks | Both |
+| `tlx.async_task(..., nvptx_cmp_sink_workaround=True)` | TEMPORARY NVPTX workaround: the task's per-warp arrives test `%laneid` in their own asm and its leader arrives share one predicate built at the task entry, so neither a sunk `tid == 0` compare nor a hoisted lane predicate leaves an extra value live across a hot loop. See `tlx_barriers.md` | NVIDIA |
 | `tlx.async_task_replica_id()` | Returns replica ID inside an async region | Both |
 
 ### Warp specialization skeleton
@@ -36,21 +37,86 @@ with tlx.async_tasks():
 
 | Function | Description | Arch |
 |---|---|---|
-| `tlx.alloc_barriers(num_barriers, arrive_count=1)` | Allocate SMEM barriers and initialize with arrive count | Both |
+| `tlx.alloc_barriers(num_barriers, arrive_count=1)` | Allocate ordinary SMEM barriers. Software arrivals use leader-based lowering, which may synchronize participating threads before the leader arrives. | Both |
+| `tlx.alloc_warp_barrier(num_barriers, num_warps=1, num_arrivals=1)` | Allocate SMEM barriers whose software arrivals are performed independently by every participating thread. The initialized count is `num_warps * 32 * num_arrivals`. | NVIDIA |
 | `tlx.barrier_expect_bytes(bar, bytes, pred=None)` | Set expected transaction byte count on barrier | Both |
 | `tlx.barrier_wait(bar, phase, pred=None)` | Wait until barrier phase flips (LOCAL mbarrier only) | Both |
-| `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None)` | Signal arrival at barrier. `remote_cta_rank` signals a barrier in a remote CTA — **only valid when ctas_per_cga > 1**, causes "Unexpected buffer remote view in 1cta mode" otherwise. Guard with `if USE_2CTA:` when kernel supports both modes. | Both |
+| `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None, per_warp=False)` | Signal arrival at barrier. `remote_cta_rank` signals a barrier in a remote CTA — **only valid when ctas_per_cga > 1**, causes "Unexpected buffer remote view in 1cta mode" otherwise. Guard with `if USE_2CTA:` when kernel supports both modes. `per_warp=True` (NVIDIA, not on warp barriers): each warp syncs its own lanes and one lane arrives with `arrive_count`, so the barrier counts `arrive_count * task warps` for it. | Both |
 | `tlx.cluster_barrier()` | Full cluster-wide synchronization barrier | Both |
 
-**arrive_count rules:**
-- `arrive_count` controls how many times `barrier_expect_bytes` must be called
-  before the barrier can complete a phase. It is NOT a count of `barrier_arrive` calls.
-- For TMA barriers where only the leader CTA calls `barrier_expect_bytes`:
-  use `arrive_count=1` (default).
-- For barriers arrived by software from both CTAs (via `barrier_arrive` with
-  `remote_cta_rank`), use `arrive_count=NUM_CTAS`.
-- `barrier_arrive` inside `tlx.async_task`: `arrive_count` = number of warp groups
-- `barrier_arrive` outside `tlx.async_task`: `arrive_count=1` (only tid==0 arrives)
+**Ordinary barrier count rules:**
+- `alloc_barriers(..., arrive_count=N)` initializes the number of logical arrivals
+  required to complete a phase. Transaction bytes registered with
+  `barrier_expect_bytes` are an additional completion condition; do not infer the
+  software arrival topology from the transaction byte count.
+- For TMA full/data-ready barriers where one task registers the transaction, use
+  `arrive_count=1` unless the surrounding protocol explicitly requires additional
+  software arrivals.
+- For local software barriers shared by replicated `tlx.async_task` consumers, the
+  ordinary count is typically the number of consumer replicas that arrive once per
+  phase.
+- For cross-CTA software arrivals using `remote_cta_rank`, derive the count from the
+  exact CTA protocol. Do not assume the local-task rule applies.
+
+### Warp-barrier semantics and safe conversion
+
+`alloc_warp_barrier` changes the physical arrival protocol, not merely the spelling
+of the allocation. With an ordinary barrier, TLX selects a leader to perform the
+arrival and may synchronize the participating threads first. With a warp barrier,
+every participating thread performs its own arrival, avoiding that leader-path
+synchronization but issuing more mbarrier arrival operations.
+
+The initialized count is:
+
+```text
+expected arrivals per phase = num_warps * 32 * num_arrivals
+```
+
+`barrier_arrive(..., per_warp=True)` on an ordinary `alloc_barriers` barrier is the
+FA4-style middle ground: each warp syncs only its own lanes and one lane arrives, so
+the task-wide sync of a leader arrive goes away with one mbarrier arrival per warp
+instead of per thread. The barrier counts `arrive_count` for each warp of the
+arriving task, and per-warp and leader arrives can share a barrier: a barrier
+released by a 4-warp task per warp and by a leader arrive counts `4 + 1` per CTA.
+
+Here `num_warps` is the number of warps in each participating task replica, and
+`num_arrivals` is the number of such all-thread arrival events targeting the same
+barrier in one phase. For example, two replicated four-warp consumers that each
+release one shared buffer slot use `num_warps=4, num_arrivals=2`, for 256 arrivals.
+A consumer-owned slot released by one four-warp replica uses
+`num_warps=4, num_arrivals=1`, for 128 arrivals. Keep the corresponding
+`barrier_arrive` calls at their original final-use points and normally use the
+default unit arrival count.
+
+Before converting an ordinary barrier, classify its role and arrival source:
+
+| Barrier role | Warp-barrier candidate? | Rule |
+|---|---|---|
+| Local software empty/reuse notification | Yes, after proving the topology | Every expected lane must arrive exactly once per declared arrival event, after its final read of the protected storage. |
+| Local software data-ready notification | Sometimes | Safe only when readiness is produced by the same statically known all-thread topology; benchmark because per-thread arrivals are not universally faster. |
+| TMA transaction/full barrier | No | Keep an ordinary barrier so transaction completion remains tracked through `barrier_expect_bytes` and the TMA operation. |
+| MMA/tensor-core completion barrier | No automatic conversion | Preserve the completion mechanism required by the MMA API. |
+| Named scheduling barrier | No | Preserve the named-barrier ID, participant count, direction, and phase protocol. |
+| Remote, multicast, or cross-CTA barrier | No automatic conversion | Keep the established protocol unless backend support and the complete cluster-wide arrival topology are explicitly proven. |
+| Divergently predicated arrival | No | A missing lane leaves the phase incomplete; use a warp barrier only when every counted lane is guaranteed to execute the required arrivals. |
+
+Safe-conversion checklist:
+
+1. Identify the protected buffer and confirm the barrier is signaled by explicit
+   software `barrier_arrive` calls rather than TMA, MMA, multicast, or remote
+   completion.
+2. Enumerate every task replica, warp, lane, predicate, and arrival call that targets
+   the barrier during one phase.
+3. Verify `num_warps * 32 * num_arrivals` equals the exact number of unit arrivals.
+4. Prove every counted lane reaches the arrival after its final access to the buffer,
+   including prologue, tail, and persistent-loop iterations.
+5. Preserve buffer indices, phase calculations, wait sites, and arrival sites; change
+   only the allocator for the first A/B experiment.
+6. Keep full/TMA barriers ordinary even when the paired empty/reuse barriers are
+   converted.
+7. Run correctness and benchmark both forms. Warp barriers trade additional
+   per-thread arrivals for removal of leader-path synchronization, so conversion is
+   an optimization candidate, not a universal rule.
 
 ### Named barriers (hardware-allocated, indices 0–15)
 
@@ -180,18 +246,37 @@ For 2-CTA mode: set `multi_ctas=True` (uses "arrive remote, wait local" pattern)
 ### Producer-consumer with mbarrier (pipelined GEMM)
 
 ```python
-bars_full = tlx.alloc_barriers(num_stages, arrive_count=1)   # TMA arrives implicitly
-bars_empty = tlx.alloc_barriers(num_stages, arrive_count=num_consumers)
+# Full/data-ready barriers track TMA transaction completion and remain ordinary.
+bars_full = tlx.alloc_barriers(num_stages, arrive_count=1)
 
-# Producer: TMA load → signal full
+# Ordinary software-release form: one logical arrival per consumer replica.
+bars_empty = tlx.alloc_barriers(
+    num_stages,
+    arrive_count=num_consumers,
+)
+
+# Optional optimized form when each consumer replica has four warps and every lane
+# is statically guaranteed to execute one unit arrival after its final buffer read.
+bars_empty_warp = tlx.alloc_warp_barrier(
+    num_barriers=num_stages,
+    num_warps=4,
+    num_arrivals=num_consumers,
+)
+
+# Producer: wait for reuse, then start TMA load tracked by the ordinary full barrier.
+tlx.barrier_wait(bar_empty, empty_phase)
 tlx.barrier_expect_bytes(bar_full, nbytes)
 tlx.async_descriptor_load(desc, indices, barrier=bar_full)
 
-# Consumer: wait full → MMA → signal empty
-tlx.barrier_wait(bar_full, phase)
-tlx.async_dot(A, B, acc)
+# Consumer: wait for TMA completion, consume the buffer, then release it.
+tlx.barrier_wait(bar_full, full_phase)
+acc = tlx.async_dot(A, B, acc)
+acc = tlx.async_dot_wait(0, acc)  # Prove the final buffer read completed.
 tlx.barrier_arrive(bar_empty)
 ```
+
+When evaluating the optimized form, substitute `bars_empty_warp` for `bars_empty` at
+both the producer wait and consumer arrival sites. Do not convert `bars_full`.
 
 ### PingPong with named barriers
 

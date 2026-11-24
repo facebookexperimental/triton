@@ -1,8 +1,8 @@
 //===----------------------------------------------------------------------===//
 // PingPong Barrier Insertion Pass
 //
-// Enforce pingpong around expensive ops (warp_group_dot, math.exp)
-// across warp partitions by inserting named barriers.
+// Enforce pingpong around expensive ops (warp_group_dot, math.exp,
+// tanh.approx inline asm) across warp partitions by inserting mbarriers.
 //
 // Two passes:
 //   1. doPingPongPrep: Preprocess to group expensive ops that
@@ -12,7 +12,7 @@
 //      into pingpong regions and assign a unique pingpong_id.
 //
 //   2. doPingPongSync: For each pingpong region, identify start and end
-//      boundaries, and insert arrive/wait named barriers to the IR.
+//      boundaries, and insert arrive/wait mbarriers to the IR.
 //
 // Barrier pattern:
 //   Ping: arrive(pong) at entry, wait(ping) before op, arrive(pong) after op
@@ -20,7 +20,8 @@
 //
 // Critical op types:
 //   - NonReorderable (warp_group_dot): has memory effects, boundary is the op
-//   - PureArithmetic (math.exp): boundary extends to next memory op
+//   - PureArithmetic (math.exp, tanh.approx inline asm): boundary extends to
+//     next memory op
 //===----------------------------------------------------------------------===//
 
 #include "Utility.h"
@@ -34,9 +35,11 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PartitionBuilder.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/ADT/STLExtras.h"
 
 #define DEBUG_TYPE "nvgpu-ping-pong-sync"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -48,23 +51,92 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
 namespace { // anonymous namespace
+/// SFU-backed math ops. On NVPTX, exp2 lowers directly to ex2.approx;
+/// sin/cos/tanh lower to their .approx forms when approximations are allowed
+/// (else MUFU-seeded libdevice); sqrt/rsqrt lower through rsqrt.approx (plus
+/// refinement unless approximations are allowed). Deliberately excludes log2
+/// (libdevice does not use lg2.approx; the approx lowering is disabled by
+/// default) and erf (no approx path).
+static bool isSFUMathOp(Operation *op) {
+  return isa<math::ExpOp, math::Exp2Op, math::SinOp, math::CosOp, math::TanhOp,
+             math::SqrtOp, math::RsqrtOp>(op);
+}
+
+/// SFU-backed inline asm: pure elementwise asm blocks invoking PTX
+/// instructions that execute on the special-function unit. Per the PTX ISA
+/// (floating-point §9.7.3 and half-precision §9.7.4 instructions), the
+/// single-precision transcendental/reciprocal approximations -- sin, cos,
+/// ex2, lg2, tanh, rcp, rsqrt, sqrt and div .approx -- lower to SFU/MUFU
+/// hardware at a fraction of FFMA throughput. Deliberately excludes the
+/// correctly-rounded/full-range spellings (div.full, .rn), which lower
+/// differently. Matches the asm template text since the op carries no finer
+/// opcode.
+///
+/// The template must also be straight-line register arithmetic of the kind
+/// TLX kernels emit (e.g. tanh.approx, f32x2 fma/mul blocks): any barrier,
+/// synchronization, memory, control-flow or collective operation in the
+/// template disqualifies the whole op, since the ping-pong region must not
+/// wrap such effects. Tokens are matched as instruction prefixes (e.g.
+/// "bar." covers bar.sync/bar.warp.sync/bar.cluster.*) rather than
+/// enumerating every PTX variant. Matching is intentionally conservative and
+/// may reject on comments; conversely, unlisted spellings may slip through,
+/// so prefer prefix tokens when extending this list.
+static bool isSFUInlineAsmOp(Operation *op) {
+  auto asmOp = dyn_cast<tt::ElementwiseInlineAsmOp>(op);
+  if (!asmOp || !asmOp.getPure())
+    return false;
+  StringRef asmStr = asmOp.getAsmString();
+  static constexpr StringRef kSFUApproxMnemonics[] = {
+      "sin.approx", "cos.approx",   "ex2.approx",  "lg2.approx", "tanh.approx",
+      "rcp.approx", "rsqrt.approx", "sqrt.approx", "div.approx"};
+  bool hasSFU = llvm::any_of(kSFUApproxMnemonics, [&](StringRef mnemonic) {
+    return asmStr.contains(mnemonic);
+  });
+  if (!hasSFU)
+    return false;
+  static constexpr StringRef kUnsafeSubstrings[] = {
+      // Barriers and synchronization.
+      "bar.",
+      "barrier",
+      "mbarrier",
+      // Memory ordering.
+      "fence",
+      "membar",
+      // Memory access.
+      "ld.",
+      "st.",
+      "cp.",
+      "atom.",
+      "red.",
+      "prefetch",
+      // Control flow ("bra " matches branches, not identifiers like bravo).
+      "bra ",
+      "bra\t",
+      "bra.",
+      "call",
+      "ret;",
+      "exit",
+      "trap",
+      // Async / collective operations.
+      "wgmma",
+      "tcgen05",
+      "shfl",
+      "vote",
+  };
+  return !llvm::any_of(kUnsafeSubstrings, [&](StringRef substr) {
+    return asmStr.contains(substr);
+  });
+}
+
+/// Any op that exercises the SFU on NVIDIA GPUs.
+static bool isSFUOp(Operation *op) {
+  return isSFUMathOp(op) || isSFUInlineAsmOp(op);
+}
+
 /// Manages expensive operations for critical region identification and
 /// assigns unique barrier IDs to each operation type.
 class CriticalRegionManager {
-private:
-  /// Barrier ID range constants
-  /// This pass only uses named barriers 7 - 15 and reserves 0 - 6 for other
-  /// uses.
-  static constexpr unsigned MIN_BARRIER_ID = 7;
-  static constexpr unsigned MAX_BARRIER_ID = 15;
-
 public:
-  /// Current barrier ID to assign (range [MIN_BARRIER_ID, MAX_BARRIER_ID])
-  unsigned barrierId = MIN_BARRIER_ID;
-
-  /// Map from pingpong region id to its barrier ID
-  llvm::DenseMap<int, std::pair<unsigned, unsigned>> pingpongIdToBarrierId;
-
   /// Map from pingpong region id to its critical operations
   llvm::DenseMap<int, SmallVector<Operation *>> pingpongIdToKeyOps;
 
@@ -72,9 +144,6 @@ public:
   /// the critical region's start and end
   llvm::DenseMap<int, SmallVector<Operation *>> pingpongIdToPingBoundaryOps;
   llvm::DenseMap<int, SmallVector<Operation *>> pingpongIdToPongBoundaryOps;
-
-  /// Map from pingpong region id to the participating thread number
-  llvm::DenseMap<int, int> pingpongIdToThreadNum;
 
   CriticalRegionManager() = default;
 
@@ -92,10 +161,10 @@ public:
       }
       break;
     case 100: // Blackwell
-      // On Blackwell, exp/exp2 uses SFU which can be expensive for multi-dim
-      // tensors Blackwell increases performance for GEMM which is no longer a
+      // On Blackwell, SFU-backed ops are expensive for multi-dim tensors.
+      // Blackwell increases performance for GEMM which is no longer a
       // bottleneck
-      if (isa<math::ExpOp, math::Exp2Op>(op)) {
+      if (isSFUOp(op)) {
         LDBG("Encounter a " << op->getName() << " op on Blackwell.");
         Type resultType = op->getResult(0).getType();
         if (auto tensorTy = dyn_cast<RankedTensorType>(resultType))
@@ -104,36 +173,6 @@ public:
       break;
     }
     return false;
-  }
-
-  /// Assign barrier IDs for a pingpong region.
-  /// Sets barrier IDs to -1 if we have exhausted available barriers.
-  void assignBarrierId(int pingpongId) {
-    if (pingpongIdToBarrierId.count(pingpongId) > 0) {
-      LDBG("Barrier ID {" << pingpongIdToBarrierId[pingpongId].first << ", "
-                          << pingpongIdToBarrierId[pingpongId].second
-                          << "} already assigned for pingpong region '"
-                          << pingpongId << "'.");
-      return;
-    }
-
-    // Assign barrier ID to the pingpong region
-    unsigned barrierId = this->barrierId;
-    unsigned barrierId_1 = this->barrierId + 1;
-
-    // Check if we would exceed the maximum barrier ID
-    if (this->barrierId + 1 > MAX_BARRIER_ID) {
-      LDBG("Barrier IDs exhausted for pingpong region '" << pingpongId << "'.");
-      return;
-    }
-
-    pingpongIdToBarrierId[pingpongId] = {barrierId, barrierId_1};
-    LDBG("Assigned barrier ID {" << barrierId << ", " << barrierId_1
-                                 << "} to pingpong region '" << pingpongId
-                                 << "'.");
-
-    // Increment the barrier ID counter
-    this->barrierId = barrierId + 2;
   }
 
   bool hasPingPongBoundary(int pingpongRegionId) const {
@@ -178,6 +217,122 @@ static unsigned getLoopDepth(Operation *op) {
     pOp = pOp->getParentOfType<scf::ForOp>();
   }
   return depth;
+}
+
+// Thread a 0-based iteration counter through `nest` (innermost first, as
+// collected by `collectDirectLoopNest`) and return the value visible inside
+// the innermost loop. The innermost loop advances it, each enclosing loop
+// carries out what its inner loop produced, and each inner loop resumes from
+// the value its parent is carrying -- so the count runs across the whole nest
+// rather than restarting.
+//
+// This replaces deriving the count from the induction variables. Doing that
+// arithmetically needs the loop bounds to cooperate: it divides `iv - lb`
+// unsigned (wrong for the negative step `scf.for` permits) and multiplies by a
+// trip count read once (wrong when an inner bound depends on an outer
+// induction variable, as in a causal/triangular nest). A carried counter is
+// exact for any bounds, and it is what the rest of warp specialization already
+// does -- see `getAccumCount` in `CodePartitionUtility.cpp`, which reads its
+// count out of a loop-carried argument for exactly this reason.
+static Value createIterationCounter(SmallVector<scf::ForOp> nest) {
+  if (nest.empty())
+    return {};
+  std::reverse(nest.begin(), nest.end());
+
+  // Give every loop a counter, seeded with zero for now. Rewriting a loop
+  // moves its body rather than cloning it, so the inner entries stay valid.
+  SmallVector<BlockArgument> counters;
+  for (scf::ForOp &loop : nest) {
+    OpBuilder builder(loop);
+    Value zero = arith::ConstantIntOp::create(builder, loop.getLoc(), 0, 32);
+    loop = addIterArgsToLoop(builder, loop, {zero});
+    counters.push_back(loop.getRegionIterArgs().back());
+  }
+
+  // Now wire the counters together, innermost first: only the innermost loop
+  // increments, and an inner loop's starting value is its parent's counter.
+  for (int i = nest.size() - 1; i >= 0; --i) {
+    scf::ForOp loop = nest[i];
+    if (i + 1 == static_cast<int>(nest.size())) {
+      OpBuilder builder(loop.getBody()->getTerminator());
+      Value one = arith::ConstantIntOp::create(builder, loop.getLoc(), 1, 32);
+      appendToForOpYield(loop, {arith::AddIOp::create(builder, loop.getLoc(),
+                                                      counters[i], one)});
+    } else {
+      appendToForOpYield(loop, {nest[i + 1].getResults().back()});
+    }
+    if (i > 0)
+      loop.getInitArgsMutable()[loop.getInitArgs().size() - 1].set(
+          counters[i - 1]);
+  }
+  return counters.back();
+}
+
+// The mbarrier flips once per arrival, and each iteration arrives once, so the
+// phase a wait expects is the parity of the iteration count.
+static Value getBarrierPhase(OpBuilder &builder, Location loc, Value counter) {
+  Value one = arith::ConstantIntOp::create(builder, loc, 1, 32);
+  return arith::AndIOp::create(builder, loc, counter, one);
+}
+
+static unsigned captureInPartitions(ttg::WarpSpecializeOp wsOp, Value value) {
+  ttg::WarpSpecializePartitionsOp partitions = wsOp.getPartitionOp();
+  unsigned captureIdx = partitions.getNumOperands();
+  for (auto [idx, capture] :
+       llvm::enumerate(partitions.getExplicitCaptures())) {
+    if (capture == value) {
+      captureIdx = idx;
+      break;
+    }
+  }
+  if (captureIdx == partitions.getNumOperands()) {
+    partitions->insertOperands(captureIdx, value);
+    for (Region *region : wsOp.getPartitionRegions())
+      region->addArgument(value.getType(), value.getLoc());
+  }
+  return captureIdx;
+}
+
+static Region *getPartitionRegion(Operation *op) {
+  for (Region *region = op->getParentRegion(); region;) {
+    Operation *parent = region->getParentOp();
+    // A top-level region has no parent op.
+    if (!parent)
+      return nullptr;
+    if (isa<ttg::WarpSpecializePartitionsOp>(parent))
+      return region;
+    region = parent->getParentRegion();
+  }
+  return nullptr;
+}
+
+// The scf.for loops enclosing `op`, innermost first. Empty when no loop
+// encloses `op`, when the chain crosses the partition region boundary, or
+// when any enclosing region op is not a loop: a guard can skip arrivals on
+// one side, and threading a counter through it can violate dominance.
+static SmallVector<scf::ForOp> collectDirectLoopNest(Operation *op) {
+  Region *partition = getPartitionRegion(op);
+  if (!partition)
+    return {};
+  for (Operation *parent = op->getParentOp();
+       parent != partition->getParentOp(); parent = parent->getParentOp()) {
+    if (!isa<scf::ForOp>(parent))
+      return {};
+  }
+  SmallVector<scf::ForOp> nest;
+  for (auto loop = op->getParentOfType<scf::ForOp>(); loop;
+       loop = loop->getParentOfType<scf::ForOp>())
+    nest.push_back(loop);
+  if (nest.empty())
+    return nest;
+  for (size_t i = 1; i < nest.size(); ++i)
+    if (nest[i - 1]->getBlock() != nest[i].getBody())
+      return {};
+  // The nest must stay inside the partition region, which is isolated from
+  // above: a loop outside it cannot carry a counter into it.
+  if (getPartitionRegion(nest.back()) != partition)
+    return {};
+  return nest;
 }
 
 /// Return a map of loop depth to the loop ops in the partition.
@@ -441,9 +596,10 @@ int arrivesFirst(
 }
 
 /// Process a WarpSpecializeOp to insert pingpong barriers for critical regions.
-/// Finds ops with pingpong_id attributes, computes their boundaries, assigns
-/// named barrier IDs, and inserts arrive/wait barriers to enforce mutual
-/// exclusion between ping and pong partitions.
+/// Finds ops with pingpong_id attributes, computes their boundaries, allocates
+/// an mbarrier pair, derives wait phases from the enclosing loops, and inserts
+/// mbarrier arrive/wait ops to enforce mutual exclusion between ping and pong
+/// partitions.
 static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
   // Get the function op
   auto funcOp = wsOp->getParentOfType<triton::FuncOp>();
@@ -502,7 +658,6 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
                          << pingpongId);
         // Prepare CriticalRegionManager for this pingpong region
         crManager.pingpongIdToKeyOps[pingpongId].push_back(op);
-        crManager.assignBarrierId(pingpongId);
       }
     });
   }
@@ -514,9 +669,6 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     // Map from the ping and pong partition id to the start and end ops
     llvm::DenseMap<int, SmallVector<Operation *>> startOps;
     llvm::DenseMap<int, SmallVector<Operation *>> endOps;
-
-    // Map from the ping and pong partition id to its number of warps
-    llvm::DenseMap<int, int> numWarps;
 
     // Find the start and end ops for each key operation in the pingpong region
     bool foundNullEndOp = false;
@@ -532,12 +684,6 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
         }
         startOps[partitionId].push_back(startOp);
         endOps[partitionId].push_back(endOp);
-        // Look up the number of warps for each partition
-        if (numWarps.count(partitionId) == 0) {
-          numWarps[partitionId] = ttg::lookupNumWarps(keyOp);
-          LDBG("numWarps of " << partitionId << " is "
-                              << numWarps[partitionId]);
-        }
         // Get the first partition id from the attribute
         if (auto attr = keyOp->getAttrOfType<IntegerAttr>(
                 "pingpong_first_partition_id")) {
@@ -554,12 +700,11 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     }
     LDBG("arrivesFirstPartitionId " << arrivesFirstPartitionId);
 
-    if (startOps.size() != 2 || endOps.size() != 2 || numWarps.size() != 2) {
+    if (startOps.size() != 2 || endOps.size() != 2) {
       LDBG("pingpong ops are not in two partitions");
       continue;
     }
 
-    int numberOfThreads = 0;
     for (auto [partitionId, startOp] : startOps) {
       // The start and end ops are unioned for each partition to find the
       // boundary ops
@@ -576,15 +721,6 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
             unionStartOp);
         crManager.pingpongIdToPongBoundaryOps[pingpongId].push_back(unionEndOp);
       }
-      // The number of participating threads is summed up from ping and pong
-      // partitions
-      numberOfThreads += numWarps[partitionId] * 32; // 32 threads per warp
-      LDBG("numberOfThreads " << numberOfThreads);
-    }
-
-    if (crManager.pingpongIdToThreadNum.count(pingpongId) == 0) {
-      crManager.pingpongIdToThreadNum[pingpongId] = numberOfThreads;
-      LDBG("pingpongId " << pingpongId << " has " << numberOfThreads);
     }
 
     crManager.dumpBoundaryOps();
@@ -598,74 +734,84 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
     const SmallVector<Operation *> &pongBoundOps =
         crManager.pingpongIdToPongBoundaryOps[pingpongId];
 
-    if (crManager.pingpongIdToBarrierId.count(pingpongId) == 0) {
-      LDBG("Named barriers have run out for the pingpong region " << pingpongId
-                                                                  << ".");
-      continue;
-    }
-
-    auto [pingBarrierId, pongBarrierId] =
-        crManager.pingpongIdToBarrierId[pingpongId];
-
-    int numThreads = crManager.pingpongIdToThreadNum[pingpongId];
-
     // Insert barriers for the ping partition
     Operation *pingStart = pingBoundOps[0];
     Operation *pingEnd = pingBoundOps[1];
-    Region *pingRegion = pingStart->getParentRegion();
-    // walk up to the partition region of the warp_spec op
-    while (pingRegion) {
-      Operation *parentOp = pingRegion->getParentOp();
-      if (isa<ttg::WarpSpecializePartitionsOp>(parentOp)) {
-        break;
-      }
-      pingRegion = parentOp->getParentRegion();
-    }
+    Region *pingRegion = getPartitionRegion(pingStart);
     if (!pingRegion) {
       LDBG("No region found for ping partition.");
       continue;
     }
     Block &pingRegionBlock = pingRegion->front();
-    OpBuilder builder(&pingRegionBlock, pingRegionBlock.begin());
-    auto pingRegionLoc = pingRegionBlock.front().getLoc();
-    // Prepare values
-    Value pingBarrier =
-        arith::ConstantIntOp::create(builder, pingRegionLoc, pingBarrierId, 32);
-    Value pongBarrier =
-        arith::ConstantIntOp::create(builder, pingRegionLoc, pongBarrierId, 32);
-    Value pingNumThreads =
-        arith::ConstantIntOp::create(builder, pingRegionLoc, numThreads, 32);
-    // Insert arrive barrier for the ping partition to allow the initial entry
-    ttng::NamedBarrierArriveOp::create(builder, pingRegionLoc, pongBarrier,
-                                       pingNumThreads);
-    builder.setInsertionPoint(pingStart);
-    ttng::NamedBarrierWaitOp::create(builder, pingStart->getLoc(), pingBarrier,
-                                     pingNumThreads);
-    // Insert AFTER the pingEnd op
-    builder.setInsertionPointAfter(pingEnd);
-    ttng::NamedBarrierArriveOp::create(builder, pingEnd->getLoc(), pongBarrier,
-                                       pingNumThreads);
-
-    // Insert barriers for the pong partition
     Operation *pongStart = pongBoundOps[0];
     Operation *pongEnd = pongBoundOps[1];
-    Region *pongRegion = pongStart->getParentRegion();
+    Region *pongRegion = getPartitionRegion(pongStart);
+    if (!pongRegion) {
+      LDBG("No region found for pong partition.");
+      continue;
+    }
+
+    // Both phases come from a loop-carried counter, so both sides need a
+    // directly-nested loop chain inside their partition to carry it. Check
+    // that before touching anything: everything below mutates the IR, and
+    // bailing partway would leave a half-built rendezvous.
+    SmallVector<scf::ForOp> pingNest = collectDirectLoopNest(pingStart);
+    SmallVector<scf::ForOp> pongNest = collectDirectLoopNest(pongStart);
+    if (pingNest.empty() || pongNest.empty()) {
+      LDBG("No directly-nested enclosing loop for the ping-pong region.");
+      continue;
+    }
+    // Exact counters on each side are not enough if one side executes fewer
+    // iterations: the other side would eventually wait on a missing arrival.
+    if (!ttg::haveEquivalentWarpSpecializeLoopNests(pingNest, pongNest)) {
+      LDBG("Ping-pong partitions have different enclosing loop nests.");
+      continue;
+    }
+    // Thread the counters first -- this rewrites the loops, and everything
+    // below inserts into them.
+    Value pingCounter = createIterationCounter(pingNest);
+    Value pongCounter = createIterationCounter(pongNest);
+
+    Value barrierAlloc = triton::createBarrierAlloc(wsOp, 2, 1);
+    OpBuilder allocBuilder(wsOp);
+    Value pingBarrier =
+        triton::createSingleBufferView(allocBuilder, barrierAlloc, 0);
+    Value pongBarrier =
+        triton::createSingleBufferView(allocBuilder, barrierAlloc, 1);
+    unsigned pingBarrierIdx = captureInPartitions(wsOp, pingBarrier);
+    unsigned pongBarrierIdx = captureInPartitions(wsOp, pongBarrier);
+    Value pingBarrierInPing = pingRegion->getArgument(pingBarrierIdx);
+    Value pongBarrierInPing = pingRegion->getArgument(pongBarrierIdx);
+    Value pingBarrierInPong = pongRegion->getArgument(pingBarrierIdx);
+    Value pongBarrierInPong = pongRegion->getArgument(pongBarrierIdx);
+
+    OpBuilder builder(&pingRegionBlock, pingRegionBlock.begin());
+    auto pingRegionLoc = pingRegionBlock.front().getLoc();
+    // Insert arrive barrier for the ping partition to allow the initial entry
+    ttng::ArriveBarrierOp::create(builder, pingRegionLoc, pongBarrierInPing,
+                                  1u);
+    builder.setInsertionPoint(pingStart);
+    Value pingPhase =
+        getBarrierPhase(builder, pingStart->getLoc(), pingCounter);
+    ttng::WaitBarrierOp::create(builder, pingStart->getLoc(), pingBarrierInPing,
+                                pingPhase);
+    // Insert AFTER the pingEnd op
+    builder.setInsertionPointAfter(pingEnd);
+    ttng::ArriveBarrierOp::create(builder, pingEnd->getLoc(), pongBarrierInPing,
+                                  1u);
+
+    // Insert barriers for the pong partition
     Block &pongRegionBlock = pongRegion->front();
     OpBuilder builder2(&pongRegionBlock, pongRegionBlock.begin());
-    auto pongRegionLoc = pongRegionBlock.front().getLoc();
-    Value pingBarrier2 = arith::ConstantIntOp::create(builder2, pongRegionLoc,
-                                                      pingBarrierId, 32);
-    Value pongBarrier2 = arith::ConstantIntOp::create(builder2, pongRegionLoc,
-                                                      pongBarrierId, 32);
-    Value pingNumThreads2 =
-        arith::ConstantIntOp::create(builder2, pongRegionLoc, numThreads, 32);
     builder2.setInsertionPoint(pongStart);
-    ttng::NamedBarrierWaitOp::create(builder2, pongStart->getLoc(),
-                                     pongBarrier2, pingNumThreads2);
+    Value pongPhase =
+        getBarrierPhase(builder2, pongStart->getLoc(), pongCounter);
+    ttng::WaitBarrierOp::create(builder2, pongStart->getLoc(),
+                                pongBarrierInPong, pongPhase);
     // Insert AFTER the pongEnd op
     builder2.setInsertionPointAfter(pongEnd);
-    ttng::NamedBarrierArriveOp::create(builder2, pongEnd->getLoc(),
-                                       pingBarrier2, pingNumThreads2);
+    ttng::ArriveBarrierOp::create(builder2, pongEnd->getLoc(),
+                                  pingBarrierInPong, 1u);
   }
 }
 } // anonymous namespace

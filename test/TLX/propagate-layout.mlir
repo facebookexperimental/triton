@@ -1,4 +1,5 @@
 // RUN: triton-opt -split-input-file --tlx-propagate-layout %s | FileCheck %s
+// RUN: triton-opt -split-input-file --tlx-propagate-layout --tlx-resolve-placeholder-layouts %s | FileCheck %s --check-prefix=LOWERED
 
 // -----
 
@@ -33,6 +34,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // Require scales layout for use - this propagates TensorMemoryScalesEncodingAttr to the lattice
     %scale_req = tlx.require_layout %scale_tmem_indexed : !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x8xi8, #scales_encoding, #tmem, mutable>
 
+    tt.return
+  }
+}
+
+// -----
+
+// An explicit downstream scale layout must take precedence over TMEMCopyOp's
+// default scale-layout inference.
+
+#rhs_source_linear = #ttg.shared_linear<{offset = [[0, 0, 0, 0, 1], [0, 0, 0, 0, 2], [0, 0, 0, 0, 4], [0, 0, 0, 0, 8], [0, 0, 0, 0, 16], [0, 0, 0, 0, 32], [0, 0, 0, 0, 64], [0, 0, 0, 0, 128], [0, 0, 0, 1, 0]], block = []}, alignment = 128>
+// CHECK-DAG: #[[$RHS_TMEM_SCALES:.*]] = #ttng.tensor_memory_scales_encoding<ctaMode = twocta_rhs>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory
+#dummy_tmem_layout = #tlx.dummy_tmem_layout<>
+#rhs_scales_encoding = #ttng.tensor_memory_scales_encoding<ctaMode = twocta_rhs>
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tmem_copy_prefers_explicit_rhs_scale_layout
+  tt.func public @tmem_copy_prefers_explicit_rhs_scale_layout() {
+    %c0_i32 = arith.constant 0 : i32
+    %scale_smem = ttg.local_alloc : () -> !ttg.memdesc<1x1x1x2x256xf8E4M3FN, #rhs_source_linear, #smem, mutable>
+    // CHECK: ttng.tmem_alloc : () -> !ttg.memdesc<2x128x4xi8, #[[$RHS_TMEM_SCALES]], #ttng.tensor_memory, mutable>
+    %scale_tmem = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x4xi8, #dummy_tmem_layout, #tmem, mutable>
+    %copy_view = ttg.memdesc_index %scale_tmem[%c0_i32] : !ttg.memdesc<2x128x4xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x4xi8, #dummy_tmem_layout, #tmem, mutable>
+    %require_view = ttg.memdesc_index %scale_tmem[%c0_i32] : !ttg.memdesc<2x128x4xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x4xi8, #dummy_tmem_layout, #tmem, mutable>
+    ttng.tmem_copy %scale_smem, %copy_view : !ttg.memdesc<1x1x1x2x256xf8E4M3FN, #rhs_source_linear, #smem, mutable>, !ttg.memdesc<128x4xi8, #dummy_tmem_layout, #tmem, mutable>
+    %scale_req = tlx.require_layout %require_view : !ttg.memdesc<128x4xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x4xi8, #rhs_scales_encoding, #tmem, mutable>
     tt.return
   }
 }
@@ -226,7 +254,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %scale_tmem_indexed = ttg.memdesc_index %scale_tmem[%c0_i32] : !ttg.memdesc<1x128x16xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x16xi8, #dummy_tmem_layout, #tmem, mutable>
 
     // CHECK: ttng.tmem_subslice {{.*}} : !ttg.memdesc<128x16xi8, #tmem_scales, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x8xi8, #tmem_scales, #ttng.tensor_memory, mutable{{.*}}>
-    %scale_slice = ttng.tmem_subslice %scale_tmem_indexed {N = 8 : i32} : !ttg.memdesc<128x16xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable, 128x16>
+    %scale_slice = ttng.tmem_subslice %scale_tmem_indexed {offset = 8 : i32} : !ttg.memdesc<128x16xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable, 128x16>
 
     %scale_req = tlx.require_layout %scale_slice : !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable, 128x16> -> !ttg.memdesc<128x8xi8, #scales_encoding, #tmem, mutable, 128x16>
     ttng.tmem_copy %scale_smem, %scale_req : !ttg.memdesc<1x1x2x2x256xi8, #shared_unswizzled, #smem, mutable>, !ttg.memdesc<128x8xi8, #scales_encoding, #tmem, mutable, 128x16>
@@ -392,7 +420,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
       // CHECK: %[[WARP_GROUP_DOT_WAIT:.*]] = ttng.warp_group_dot_wait {{.*}} {pendings = 1 : i32} : tensor<128x256xf32, #mma>
       // CHECK: ttg.convert_layout %[[WARP_GROUP_DOT_WAIT]] : tensor<128x256xf32, #mma> -> tensor<128x256xf32, #blocked>
       %120 = ttng.warp_group_dot_wait %115#0 {pendings = 1 : i32} : tensor<128x256xf32, #mma>
-      %121 = tlx.release_layout %120 : tensor<128x256xf32, #mma> -> tensor<128x256xf32, #blocked>
+      %121 = tlx.release_layout %120 {relaxed = true} : tensor<128x256xf32, #mma> -> tensor<128x256xf32, #blocked>
       %122 = arith.muli %116, %c64_i32 : i32
       %123 = arith.subi %arg5, %122 : i32
       %124 = tt.splat %123 : i32 -> tensor<1x64xi32, #blocked2>
@@ -609,10 +637,41 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1x64x64xf32, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0 [%c0_i32] : !ttg.memdesc<1x64x64xf32, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
     %2 = ttg.local_load %1 : !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> tensor<64x64xf32, #blocked1>
+    // An unpinned requirement is soft: it lowers to an ordinary conversion
+    // that later layout optimization may rewrite or remove.
     // CHECK-NOT: tlx.require_layout
+    // CHECK-NOT: ttg.require_layout
     // CHECK: ttg.convert_layout %{{.*}} : tensor<64x64xf32, #blocked1> -> tensor<64x64xf32, #blocked>
     %3 = tlx.require_layout %2 : tensor<64x64xf32, #blocked1> -> tensor<64x64xf32, #blocked>
     tt.return %3 : tensor<64x64xf32, #blocked>
+  }
+}
+
+// -----
+
+// A pinned requirement carries #tlx.user_layout and must remain a hard
+// ttg.require_layout boundary for RemoveLayoutConversions.
+
+#pinned_src = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#pinned_dst = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>
+#pinned_user = #tlx.no_verify_layout<#tlx.user_layout<#pinned_dst>>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-DAG: #[[$PINNED_DST:.*]] = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>
+  // CHECK-DAG: #[[$PINNED_USER:.*]] = #tlx.user_layout<#[[$PINNED_DST]]>
+  // CHECK-LABEL: @pinned_require_layout_on_tensor
+  // LOWERED-NOT: #tlx.user_layout
+  // LOWERED-NOT: #tlx.no_verify_layout
+  // LOWERED-LABEL: @pinned_require_layout_on_tensor
+  // LOWERED-NOT: tlx.preserve_layout
+  // LOWERED: ttg.require_layout %{{.*}} : tensor<64x64xf32, #{{.*}}> -> tensor<64x64xf32, #{{.*}}>
+  // LOWERED-NOT: tlx.preserve_layout
+  // LOWERED: tt.return
+  // CHECK-NOT: ttg.convert_layout
+  // CHECK: ttg.require_layout %{{.*}} : tensor<64x64xf32, #{{.*}}> -> tensor<64x64xf32, #tlx.no_verify_layout<#[[$PINNED_USER]]>>
+  tt.func public @pinned_require_layout_on_tensor(%arg0: tensor<64x64xf32, #pinned_src>) -> tensor<64x64xf32, #pinned_user> attributes {noinline = false} {
+    %required = tlx.require_layout %arg0 : tensor<64x64xf32, #pinned_src> -> tensor<64x64xf32, #pinned_user>
+    tt.return %required : tensor<64x64xf32, #pinned_user>
   }
 }
 
@@ -1097,10 +1156,10 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
             %84 = ttg.memdesc_index %result[%c0_i32] : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
             ttng.wait_barrier %39, %83, %true : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
             // CHECK: ttng.tmem_subslice {{.*}} : !ttg.memdesc<128x128xf32, #[[$TMEM]], {{.*}} -> !ttg.memdesc<128x64xf32, #[[$TMEM2]]
-            %85 = ttng.tmem_subslice %84 {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+            %85 = ttng.tmem_subslice %84 {offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
             %result_5 = ttng.tmem_load %85 : !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #blocked1>
             %86 = tlx.release_layout %result_5 : tensor<128x64xf32, #blocked1> -> tensor<128x64xf32, #blocked>
-            %87 = ttng.tmem_subslice %84 {N = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+            %87 = ttng.tmem_subslice %84 {offset = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
             %result_6 = ttng.tmem_load %87 : !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #blocked1>
             %88 = tlx.release_layout %result_6 : tensor<128x64xf32, #blocked1> -> tensor<128x64xf32, #blocked>
             %89 = tt.elementwise_inline_asm "\0A        {\0A            .reg .b64 ra, rb, rc;\0A            mov.b64 ra, { $2, $3 };\0A            mov.b64 rb, { $4, $5 };\0A            mul.f32x2 rc, ra, rb;\0A            mov.b64 { $0, $1 }, rc;\0A        }\0A        " {constraints = "=r,=r,r,r,r,r", packed_element = 2 : i32, pure = true} %86, %86 : tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
@@ -1109,12 +1168,13 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
             %92 = tt.elementwise_inline_asm "\0A        {\0A            .reg .b64 ra, rb, rc;\0A            mov.b64 ra, { $2, $3 };\0A            mov.b64 rb, { $4, $5 };\0A            mul.f32x2 rc, ra, rb;\0A            mov.b64 { $0, $1 }, rc;\0A        }\0A        " {constraints = "=r,=r,r,r,r,r", packed_element = 2 : i32, pure = true} %88, %88 : tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
             %93 = tt.elementwise_inline_asm "\0A        {\0A            .reg .b64 ra, rb, rc, rd;\0A            mov.b64 ra, { $2, $3 };\0A            mov.b64 rb, { $4, $5 };\0A            mov.b64 rc, { $6, $7 };\0A            fma.rn.f32x2 rd, ra, rb, rc;\0A            mov.b64 { $0, $1 }, rd;\0A        }\0A        " {constraints = "=r,=r,r,r,r,r,r,r", packed_element = 2 : i32, pure = true} %cst_0, %92, %cst : tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
             %94 = tt.elementwise_inline_asm "\0A        {\0A            .reg .b64 ra, rb, rc;\0A            mov.b64 ra, { $2, $3 };\0A            mov.b64 rb, { $4, $5 };\0A            mul.f32x2 rc, ra, rb;\0A            mov.b64 { $0, $1 }, rc;\0A        }\0A        " {constraints = "=r,=r,r,r,r,r", packed_element = 2 : i32, pure = true} %93, %88 : tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
-            ttng.wait_barrier_named %c9_i32, %c128_i32 : i32, i32
+            %user_barrier_9 = ttng.user_named_barrier_id %c9_i32 : i32
+            ttng.wait_barrier_named %user_barrier_9, %c128_i32 : !ttng.named_barrier_id, i32
             %95 = tt.elementwise_inline_asm "\0A            tanh.approx.f32 $0, $1;\0A            " {constraints = "=r,r", packed_element = 1 : i32, pure = true} %91 : tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
             %96 = tt.elementwise_inline_asm "\0A        {\0A            .reg .b64 ra, rb, rc, rd;\0A            mov.b64 ra, { $2, $3 };\0A            mov.b64 rb, { $4, $5 };\0A            mov.b64 rc, { $6, $7 };\0A            fma.rn.f32x2 rd, ra, rb, rc;\0A            mov.b64 { $0, $1 }, rd;\0A        }\0A        " {constraints = "=r,=r,r,r,r,r,r,r", packed_element = 2 : i32, pure = true} %86, %95, %86 : tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
             %97 = arith.truncf %96 : tensor<128x64xf32, #blocked> to tensor<128x64xbf16, #blocked>
             %98 = ttg.memdesc_index %18[%c0_i32] : !ttg.memdesc<1x128x128xbf16, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory, mutable>
-            %99 = ttng.tmem_subslice %98 {N = 0 : i32} : !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xbf16, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+            %99 = ttng.tmem_subslice %98 {offset = 0 : i32} : !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xbf16, #tmem1, #ttng.tensor_memory, mutable, 128x128>
             // CHECK-NOT: tlx.require_layout
             %100 = tlx.require_layout %97 : tensor<128x64xbf16, #blocked> -> tensor<128x64xbf16, #blocked1>
             ttng.tmem_store %100, %99, %true : tensor<128x64xbf16, #blocked1> -> !ttg.memdesc<128x64xbf16, #tmem1, #ttng.tensor_memory, mutable, 128x128>
@@ -1122,11 +1182,12 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
             %102 = tt.elementwise_inline_asm "\0A        {\0A            .reg .b64 ra, rb, rc, rd;\0A            mov.b64 ra, { $2, $3 };\0A            mov.b64 rb, { $4, $5 };\0A            mov.b64 rc, { $6, $7 };\0A            fma.rn.f32x2 rd, ra, rb, rc;\0A            mov.b64 { $0, $1 }, rd;\0A        }\0A        " {constraints = "=r,=r,r,r,r,r,r,r", packed_element = 2 : i32, pure = true} %88, %101, %88 : tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
             %103 = arith.truncf %102 : tensor<128x64xf32, #blocked> to tensor<128x64xbf16, #blocked>
             // CHECK: ttng.tmem_subslice {{.*}} : !ttg.memdesc<128x128xbf16, #[[$TMEM]], {{.*}} -> !ttg.memdesc<128x64xbf16, #[[$TMEM2]]
-            %104 = ttng.tmem_subslice %98 {N = 64 : i32} : !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xbf16, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+            %104 = ttng.tmem_subslice %98 {offset = 64 : i32} : !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xbf16, #tmem1, #ttng.tensor_memory, mutable, 128x128>
             %105 = tlx.require_layout %103 : tensor<128x64xbf16, #blocked> -> tensor<128x64xbf16, #blocked1>
             ttng.tmem_store %105, %104, %true : tensor<128x64xbf16, #blocked1> -> !ttg.memdesc<128x64xbf16, #tmem1, #ttng.tensor_memory, mutable, 128x128>
             ttng.arrive_barrier %37, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-            ttng.arrive_barrier_named %c10_i32, %c128_i32 : i32, i32
+            %user_barrier_10 = ttng.user_named_barrier_id %c10_i32 : i32
+            ttng.arrive_barrier_named %user_barrier_10, %c128_i32 : !ttng.named_barrier_id, i32
             %106 = arith.addi %arg26, %c1_i32 : i32
             scf.yield %106 : i32
           }
@@ -1160,7 +1221,8 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
       %c0_i32_11 = arith.constant 0 : i32
       %c9_i32_12 = arith.constant 9 : i32
       %c128_i32_13 = arith.constant 128 : i32
-      ttng.arrive_barrier_named %c9_i32_12, %c128_i32_13 : i32, i32
+      %user_barrier_9 = ttng.user_named_barrier_id %c9_i32_12 : i32
+      ttng.arrive_barrier_named %user_barrier_9, %c128_i32_13 : !ttng.named_barrier_id, i32
       %52:3 = scf.for %arg59 = %c0_i32_11 to %arg57 step %c1_i32_10 iter_args(%arg60 = %arg56, %arg61 = %c0_i32_11, %arg62 = %c0_i32_11) -> (i32, i32, i32)  : i32 {
         %53 = arith.remsi %arg60, %arg35 : i32
         %54 = arith.divsi %arg60, %arg35 : i32
@@ -1189,10 +1251,10 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
             %89 = ttg.memdesc_index %arg44[%c0_i32_11] : !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
             ttng.wait_barrier %89, %87, %true_8 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
             // CHECK: ttng.tmem_subslice {{.*}} : !ttg.memdesc<128x128xf32, #[[$TMEM]], {{.*}} -> !ttg.memdesc<128x64xf32, #[[$TMEM2]]
-            %90 = ttng.tmem_subslice %88 {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+            %90 = ttng.tmem_subslice %88 {offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
             %result_15 = ttng.tmem_load %90 : !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #blocked1>
             %91 = tlx.release_layout %result_15 : tensor<128x64xf32, #blocked1> -> tensor<128x64xf32, #blocked>
-            %92 = ttng.tmem_subslice %88 {N = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+            %92 = ttng.tmem_subslice %88 {offset = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
             %result_16 = ttng.tmem_load %92 : !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #blocked1>
             %93 = tlx.release_layout %result_16 : tensor<128x64xf32, #blocked1> -> tensor<128x64xf32, #blocked>
             %94 = tt.elementwise_inline_asm "\0A        {\0A            .reg .b64 ra, rb, rc;\0A            mov.b64 ra, { $2, $3 };\0A            mov.b64 rb, { $4, $5 };\0A            mul.f32x2 rc, ra, rb;\0A            mov.b64 { $0, $1 }, rc;\0A        }\0A        " {constraints = "=r,=r,r,r,r,r", packed_element = 2 : i32, pure = true} %91, %91 : tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
@@ -1201,12 +1263,13 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
             %97 = tt.elementwise_inline_asm "\0A        {\0A            .reg .b64 ra, rb, rc;\0A            mov.b64 ra, { $2, $3 };\0A            mov.b64 rb, { $4, $5 };\0A            mul.f32x2 rc, ra, rb;\0A            mov.b64 { $0, $1 }, rc;\0A        }\0A        " {constraints = "=r,=r,r,r,r,r", packed_element = 2 : i32, pure = true} %93, %93 : tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
             %98 = tt.elementwise_inline_asm "\0A        {\0A            .reg .b64 ra, rb, rc, rd;\0A            mov.b64 ra, { $2, $3 };\0A            mov.b64 rb, { $4, $5 };\0A            mov.b64 rc, { $6, $7 };\0A            fma.rn.f32x2 rd, ra, rb, rc;\0A            mov.b64 { $0, $1 }, rd;\0A        }\0A        " {constraints = "=r,=r,r,r,r,r,r,r", packed_element = 2 : i32, pure = true} %cst_5, %97, %cst_4 : tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
             %99 = tt.elementwise_inline_asm "\0A        {\0A            .reg .b64 ra, rb, rc;\0A            mov.b64 ra, { $2, $3 };\0A            mov.b64 rb, { $4, $5 };\0A            mul.f32x2 rc, ra, rb;\0A            mov.b64 { $0, $1 }, rc;\0A        }\0A        " {constraints = "=r,=r,r,r,r,r", packed_element = 2 : i32, pure = true} %98, %93 : tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
-            ttng.wait_barrier_named %c10_i32_7, %c128_i32_13 : i32, i32
+            %user_barrier_10 = ttng.user_named_barrier_id %c10_i32_7 : i32
+            ttng.wait_barrier_named %user_barrier_10, %c128_i32_13 : !ttng.named_barrier_id, i32
             %100 = tt.elementwise_inline_asm "\0A            tanh.approx.f32 $0, $1;\0A            " {constraints = "=r,r", packed_element = 1 : i32, pure = true} %96 : tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
             %101 = tt.elementwise_inline_asm "\0A        {\0A            .reg .b64 ra, rb, rc, rd;\0A            mov.b64 ra, { $2, $3 };\0A            mov.b64 rb, { $4, $5 };\0A            mov.b64 rc, { $6, $7 };\0A            fma.rn.f32x2 rd, ra, rb, rc;\0A            mov.b64 { $0, $1 }, rd;\0A        }\0A        " {constraints = "=r,=r,r,r,r,r,r,r", packed_element = 2 : i32, pure = true} %91, %100, %91 : tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
             %102 = arith.truncf %101 : tensor<128x64xf32, #blocked> to tensor<128x64xbf16, #blocked>
             %103 = ttg.memdesc_index %arg40[%c0_i32_11] : !ttg.memdesc<1x128x128xbf16, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory, mutable>
-            %104 = ttng.tmem_subslice %103 {N = 0 : i32} : !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xbf16, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+            %104 = ttng.tmem_subslice %103 {offset = 0 : i32} : !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xbf16, #tmem1, #ttng.tensor_memory, mutable, 128x128>
             // CHECK-NOT: tlx.require_layout
             %105 = tlx.require_layout %102 : tensor<128x64xbf16, #blocked> -> tensor<128x64xbf16, #blocked1>
             ttng.tmem_store %105, %104, %true_8 : tensor<128x64xbf16, #blocked1> -> !ttg.memdesc<128x64xbf16, #tmem1, #ttng.tensor_memory, mutable, 128x128>
@@ -1214,12 +1277,13 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
             %107 = tt.elementwise_inline_asm "\0A        {\0A            .reg .b64 ra, rb, rc, rd;\0A            mov.b64 ra, { $2, $3 };\0A            mov.b64 rb, { $4, $5 };\0A            mov.b64 rc, { $6, $7 };\0A            fma.rn.f32x2 rd, ra, rb, rc;\0A            mov.b64 { $0, $1 }, rd;\0A        }\0A        " {constraints = "=r,=r,r,r,r,r,r,r", packed_element = 2 : i32, pure = true} %93, %106, %93 : tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #blocked>
             %108 = arith.truncf %107 : tensor<128x64xf32, #blocked> to tensor<128x64xbf16, #blocked>
             // CHECK: ttng.tmem_subslice {{.*}} : !ttg.memdesc<128x128xbf16, #[[$TMEM]], {{.*}} -> !ttg.memdesc<128x64xbf16, #[[$TMEM2]]
-            %109 = ttng.tmem_subslice %103 {N = 64 : i32} : !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xbf16, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+            %109 = ttng.tmem_subslice %103 {offset = 64 : i32} : !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xbf16, #tmem1, #ttng.tensor_memory, mutable, 128x128>
             %110 = tlx.require_layout %108 : tensor<128x64xbf16, #blocked> -> tensor<128x64xbf16, #blocked1>
             ttng.tmem_store %110, %109, %true_8 : tensor<128x64xbf16, #blocked1> -> !ttg.memdesc<128x64xbf16, #tmem1, #ttng.tensor_memory, mutable, 128x128>
             %111 = ttg.memdesc_index %arg48[%c0_i32_11] : !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
             ttng.arrive_barrier %111, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-            ttng.arrive_barrier_named %c9_i32_12, %c128_i32_13 : i32, i32
+            %user_barrier_9_inner = ttng.user_named_barrier_id %c9_i32_12 : i32
+            ttng.arrive_barrier_named %user_barrier_9_inner, %c128_i32_13 : !ttng.named_barrier_id, i32
             %112 = arith.addi %arg64, %c1_i32_10 : i32
             scf.yield %112 : i32
           }

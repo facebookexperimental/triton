@@ -163,6 +163,13 @@ isTransparentDotUserBeforeConstraintMaterialization(Operation *op,
   if (auto dotOp = dyn_cast<tt::DotOp>(op))
     return operandIndex < 2 && operandIndex < dotOp->getNumOperands();
 
+  if (auto requireOp = dyn_cast<ttg::RequireLayoutOp>(op)) {
+    assert(operandIndex == 0 && "RequireLayoutOp only has one operand");
+    auto resultType = dyn_cast<RankedTensorType>(requireOp.getType());
+    return resultType &&
+           isSupportedDotConstraintEncoding(resultType.getEncoding());
+  }
+
   return isa<ttg::ConvertLayoutOp>(op) || isTransparentLayoutCarrierOp(op);
 }
 
@@ -178,6 +185,14 @@ public:
           !isTrackedDotValue(cvt.getResult()))
         return;
       unionLatticeAnchors<DotRewriteLattice>(cvt.getSrc(), cvt.getResult());
+    });
+    top->walk([&](ttg::RequireLayoutOp requireOp) {
+      auto resultType = dyn_cast<RankedTensorType>(requireOp.getType());
+      if (!isTrackedDotValue(requireOp.getSrc()) || !resultType ||
+          !isSupportedDotConstraintEncoding(resultType.getEncoding()))
+        return;
+      unionLatticeAnchors<DotRewriteLattice>(requireOp.getSrc(),
+                                             requireOp.getResult());
     });
   }
 
@@ -289,7 +304,7 @@ static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
       auto targetFeatures = amdgpu::TargetFeatures::fromModuleOp(
           localLoadOp->getParentOfType<ModuleOp>());
       using amdgpu::ISAFamily;
-      if (llvm::is_contained({ISAFamily::CDNA4, ISAFamily::GFX1250},
+      if (llvm::is_contained({ISAFamily::CDNA4, ISAFamily::CDNA5},
                              targetFeatures.getISAFamily())) {
         // A subview retains the parent allocation shape in its MemDescType.
         // Build inferred padding against that allocation, because the padded
@@ -513,30 +528,82 @@ static amdgpu::BufferLoadToLocalOp findBufferProducer(Value memdesc) {
   return nullptr;
 }
 
+// Direct-to-LDS can preserve the inferred offset layout through views that do
+// not reorder the destination. Static subslices are required by packed GEMM
+// staging, where several narrow global-load windows populate one wider LDS
+// allocation.
+static bool isSupportedBufferView(Value dest, Value root) {
+  Value current = dest;
+  while (current != root) {
+    if (auto index = current.getDefiningOp<ttg::MemDescIndexOp>()) {
+      current = index.getSrc();
+      continue;
+    }
+    if (auto require = current.getDefiningOp<tlx::RequireLayoutOp>()) {
+      current = require.getSrc();
+      continue;
+    }
+    if (auto subslice = current.getDefiningOp<ttg::MemDescSubsliceOp>()) {
+      current = subslice.getSrc();
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 // For a buffer_load_to_local into a user-pinned padded_shared dst, derive and
 // pin the offset tensor's #linear so the direct-to-LDS write is coalesced (via
 // deduceRegLayoutFromPaddedShared), sparing the author from hand-writing it.
-// Idempotent; only fires for user-pinned padded dsts.
-static void pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
-                                          triton::ModuleAxisInfoAnalysis &axis,
-                                          OpBuilder &builder) {
-  if (buf.getOffsets().getDefiningOp<tlx::RequireLayoutOp>())
-    return;
+// Contiguity hints greater than one are trusted by lowering, so fail unless the
+// layout can be hard-pinned. The default hint keeps the legacy best-effort
+// behavior.
+static LogicalResult
+pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
+                              triton::ModuleAxisInfoAnalysis &axis,
+                              OpBuilder &builder) {
+  bool mustPin = buf.getContiguity() > 1;
+  auto failOrSkip = [&](StringRef reason) -> LogicalResult {
+    if (!mustPin)
+      return success();
+    return buf.emitOpError()
+           << "contiguity > 1 requires a supported view of a user-pinned "
+              "padded_shared destination; "
+           << reason;
+  };
+  bool hasExplicitOffsetLayout =
+      !!buf.getOffsets().getDefiningOp<tlx::RequireLayoutOp>();
+  if (!mustPin && hasExplicitOffsetLayout)
+    return success();
 
   auto destTy = dyn_cast<ttg::MemDescType>(buf.getDest().getType());
-  if (!destTy)
-    return;
-  auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(destTy.getEncoding());
-  if (!pinned)
-    return;
-  auto paddedEnc =
-      dyn_cast_or_null<ttg::PaddedSharedEncodingAttr>(pinned.getPinnedLayout());
+  Value root = findMemDescRoot(buf.getDest());
+  auto rootTy = dyn_cast<ttg::MemDescType>(root.getType());
+  if (!destTy || !rootTy)
+    return failOrSkip("destination is not a shared-memory memdesc");
+  if (!isa_and_nonnull<ttg::PinnedEncodingTrait>(rootTy.getEncoding()))
+    return failOrSkip("the root allocation is not user-pinned");
+  if (!isSupportedBufferView(buf.getDest(), root))
+    return failOrSkip(
+        "only memdesc_index, require_layout, and static subslice views are "
+        "supported");
+  // An authored offset layout already describes the physical write into a
+  // packed subslice. It may target either padded_shared or shared_linear LDS.
+  // The generic inference below only sees the logical view shape, so it cannot
+  // reconstruct bases that span the wider allocation. Final Direct-to-LDS
+  // lowering still checks that the authored layout and requested width form a
+  // legal coalesced write.
+  if (hasExplicitOffsetLayout)
+    return success();
+  auto paddedEnc = dyn_cast_or_null<ttg::PaddedSharedEncodingAttr>(
+      tlx::getEffectiveEncoding(destTy.getEncoding()));
   if (!paddedEnc)
-    return;
+    return failOrSkip(
+        "the destination view does not retain a padded_shared layout");
 
   auto offsetsTy = cast<RankedTensorType>(buf.getOffsets().getType());
   if (!offsetsTy.getEncoding())
-    return;
+    return failOrSkip("the offsets do not have a concrete layout");
   auto *ctx = buf.getContext();
   auto mod = buf->getParentOfType<ModuleOp>();
 
@@ -545,42 +612,93 @@ static void pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
   using amdgpu::ISAFamily;
   if (!llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4},
                           targetFeatures.getISAFamily()))
-    return;
+    return failOrSkip("offset-layout inference is unsupported on this target");
 
-  // loadContig = the per-thread direct-to-LDS width the global reads support,
-  // clamped to a hardware-legal vector size (same signal the async coalescer /
-  // stock AMD buffer path use).
+  // Derive the width from semantic address contiguity, not the offsets'
+  // current per-thread layout. This function is selecting a replacement
+  // layout, so clamping by the old layout's sizePerThread would make a scalar
+  // seed layout impossible to vectorize.
   unsigned elemBitWidth = destTy.getElementTypeBitWidth();
-  unsigned loadContig =
-      mlir::LLVM::AMD::getContiguity(buf.getPtr(), buf.getOffsets(), axis);
+  auto *offsetInfo = axis.getAxisInfo(buf.getOffsets());
+  auto *ptrInfo = axis.getAxisInfo(buf.getPtr());
+  auto paddedOrder = paddedEnc.getOrder();
+  if (paddedOrder.empty() ||
+      paddedOrder.front() >= static_cast<unsigned>(offsetsTy.getRank()))
+    return failOrSkip("the destination padded layout has an invalid order");
+  unsigned dim = paddedOrder.front();
+  unsigned loadContig = 1;
+  if (offsetInfo && ptrInfo) {
+    unsigned offsetContig = offsetInfo->getContiguity(dim);
+    unsigned offsetAlign = offsetInfo->getDivisibility(dim);
+    unsigned elemByteWidth = std::max(elemBitWidth / 8, 1u);
+    unsigned ptrAlign =
+        std::max<unsigned>(ptrInfo->getDivisibility(0) / elemByteWidth, 1);
+    loadContig = std::min(ptrAlign, std::min(offsetContig, offsetAlign));
+    if (Value mask = buf.getMask()) {
+      auto *maskInfo = axis.getAxisInfo(mask);
+      loadContig = maskInfo
+                       ? std::min<unsigned>(
+                             loadContig,
+                             std::max<int64_t>(maskInfo->getConstancy(dim), 1))
+                       : 1;
+    }
+  }
+  unsigned trustedContig = buf.getContiguity();
+  loadContig = std::max(loadContig, trustedContig);
+  unsigned maxPaddedVec = paddedEnc.getMinInterval();
+  if (!targetInfo.supportsDirectToLdsScatter())
+    maxPaddedVec /= targetInfo.getWarpSize();
+  loadContig = std::min(loadContig, maxPaddedVec);
   loadContig = triton::AMD::fitToValidDirectToLdsVecSize(
       loadContig, elemBitWidth, targetInfo);
-  if (loadContig == 0)
-    return;
+  if (loadContig == 0 || loadContig < trustedContig)
+    return failOrSkip(
+        "the requested width is not legal for the destination and target");
 
   unsigned threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
   unsigned numWarps = ttg::lookupNumWarps(buf);
-
   auto regLayout = triton::AMD::deduceRegLayoutFromPaddedShared(
       paddedEnc.getLinearComponent(), loadContig, threadsPerWarp, numWarps,
       offsetsTy.getShape(), ttg::getCGALayout(offsetsTy.getEncoding()), ctx);
   if (failed(regLayout)) {
+    if (mustPin)
+      return failOrSkip(
+          "no compatible offset layout can be derived from the destination");
     buf->emitRemark() << "could not infer a coalesced direct-to-LDS offset "
                          "layout from the pinned padded shared layout; check "
                          "that the pinned shared layout is directly loadable";
-    return;
+    return success();
   }
 
   // Pin it (wrap as #tlx.user_layout) so the downstream layout passes anchor it
   // and never rewrite it.
   auto linearEnc = ttg::LinearEncodingAttr::get(ctx, std::move(*regLayout));
-  auto newOffsetsTy =
-      RankedTensorType::get(offsetsTy.getShape(), offsetsTy.getElementType(),
-                            tlx::wrapUserLayout(linearEnc));
+  auto ptrTensorTy = RankedTensorType::get(offsetsTy.getShape(),
+                                           buf.getPtr().getType(), linearEnc);
+  unsigned legalVec = loadContig;
+  if (!mlir::LLVM::AMD::canLoadDirectToLDS(targetInfo, ptrTensorTy, paddedEnc,
+                                           destTy.getAllocShape(), legalVec) ||
+      legalVec != loadContig)
+    return failOrSkip(
+        "the inferred offset layout cannot write directly to the destination");
+  auto pinnedLinearEnc = tlx::wrapUserLayout(linearEnc);
   builder.setInsertionPoint(buf);
-  auto requireOp = tlx::RequireLayoutOp::create(builder, buf.getLoc(),
-                                                newOffsetsTy, buf.getOffsets());
-  buf.getOffsetsMutable().assign(requireOp.getResult());
+  auto pinOperand = [&](Value operand) -> Value {
+    auto type = cast<RankedTensorType>(operand.getType());
+    if (type.getEncoding() == pinnedLinearEnc)
+      return operand;
+    auto pinnedType = RankedTensorType::get(
+        type.getShape(), type.getElementType(), pinnedLinearEnc);
+    return tlx::RequireLayoutOp::create(builder, buf.getLoc(), pinnedType,
+                                        operand)
+        .getResult();
+  };
+  buf.getOffsetsMutable().assign(pinOperand(buf.getOffsets()));
+  if (Value mask = buf.getMask())
+    buf.getMaskMutable().assign(pinOperand(mask));
+  if (Value other = buf.getOther())
+    buf.getOtherMutable().assign(pinOperand(other));
+  return success();
 }
 
 // The identity padded-layout ORDER for a buffer_load_to_local-fed dot operand,
@@ -666,6 +784,14 @@ static void materializeTensorRequireLayout(tt::DotOp dotOp,
   auto dstType = dyn_cast<RankedTensorType>(cvt.getType());
   if (!dstType || !isSupportedDotConstraintEncoding(dstType.getEncoding()))
     return;
+  // The verifier accepted this convert's NPOT plan but rejects the same exact
+  // mixed-radix layouts on a require_layout, so keep the convert.
+  Type types[] = {cvt.getSrc().getType(), dstType};
+  if (ttg::getNpotLayoutUnsupportedReason(
+          OperationName(tlx::RequireLayoutOp::getOperationName(),
+                        dotOp.getContext()),
+          types))
+    return;
 
   builder.setInsertionPoint(cvt);
   auto requireOp = tlx::RequireLayoutOp::create(builder, cvt.getLoc(),
@@ -694,7 +820,7 @@ static void materializeDotUserTensorConstraints(ModuleOp m,
 // default `local_alloc(...)` (no explicit `layout=`), the alloc's encoding
 // is the generic non-swizzled `SwizzledSharedEncoding(maxPhase=1)` — which
 // the TDM op verifier accepts but which produces wrong LDS data on real
-// gfx1250 hardware. We anchor a `tlx.require_layout` on the buffer operand
+// CDNA5 hardware. We anchor a `tlx.require_layout` on the buffer operand
 // of every TDM copy so `tlx-propagate-layout` rewrites the source
 // `local_alloc` (and any subview / loop-carrier chain) to the
 // descriptor-compatible encoding.
@@ -883,9 +1009,10 @@ static std::optional<DotConsumerInfo> findDotConsumer(Value buffer,
 // the WMMA-tuned `composePaddedLayout` when the buffer feeds a `tt.dot`
 // (correct for both the TDM op and the local_load -> tt.dot lowering).
 // For TDM stores, the hardware verifier requires
-// `padInterval == innermost block dim`, ruling out the WMMA-tuned form
-// (which sets `padInterval = max(innerDim, bankWrapInterval)`); always
-// fall back to the descriptor-shape-only default.
+// `padInterval == innermost block dim`, ruling out the WMMA-tuned form. Reuse
+// an existing descriptor encoding when present, otherwise use the
+// descriptor-shape-only padded default. Descriptor assignment then propagates
+// the selected encoding to the descriptor type.
 //
 // Using a dot-tuned encoding for loads is safe because the AMD
 // `OptimizeDescriptorEncoding` pass walks TDM ops and propagates this
@@ -897,6 +1024,45 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
                                       tt::TensorDescType descTy,
                                       bool allowDotAware,
                                       DataFlowSolver &solver) {
+  // The root determines whether the allocation is pinned, but the constraint
+  // must use the operand's encoding: transpose/reshape views may have a
+  // different order, shape, or rank than their allocation.
+  Attribute bufEncoding = bufType.getEncoding();
+  bool isExplicit =
+      isa<ttg::PinnedEncodingTrait>(bufEncoding) || isUserPinnedMemDesc(buf);
+  while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(bufEncoding))
+    bufEncoding = pinned.getPinnedLayout();
+  // Partitioned TDM buffers retain the physical partition mapping while the
+  // descriptor pass derives padding (including an unpadded layout) from the
+  // per-partition encoding.
+  Attribute innerEncoding = bufEncoding;
+  if (auto partitioned =
+          dyn_cast<ttg::PartitionedSharedEncodingAttr>(bufEncoding))
+    innerEncoding = partitioned.getPartitionLayout();
+  if (isa<ttg::PaddedSharedEncodingAttr>(innerEncoding))
+    return bufEncoding;
+
+  if (isExplicit) {
+    // maxPhase=1 is an unpadded layout supported by TDM, including the
+    // fallback for tiles wider than the descriptor's padding interval limit.
+    // Only preserve it when pinned; generic default allocations still need
+    // the descriptor-compatible encoding selected below.
+    if (auto swizzled =
+            dyn_cast<ttg::SwizzledSharedEncodingAttr>(innerEncoding)) {
+      if (swizzled.getMaxPhase() == 1)
+        return bufEncoding;
+    }
+    tdmOp->emitError()
+        << "TDM operand requires a padded, partitioned padded, or non-swizzled "
+           "shared encoding, "
+           "but the view carries "
+        << bufEncoding
+        << ". Pass `layout=tlx.padded_shared_layout_encoding(...)` to "
+           "`tlx.local_alloc`, or omit `layout=` to let the compiler pick "
+           "a descriptor-compatible encoding.";
+    return Attribute();
+  }
+
   ArrayRef<int64_t> shape = descTy.getBlockType().getShape();
   Type elementType = descTy.getBlockType().getElementType();
   unsigned rank = shape.size();
@@ -916,41 +1082,35 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
                                      info->dotEnc, /*useAsyncCopy=*/false);
     }
   }
+  if (!encoding && !allowDotAware && descTy.getSharedLayout())
+    encoding = descTy.getSharedLayout();
   if (!encoding) {
-    // For loads, use the padded descriptor encoding. For stores, the TDM
-    // store verifier rejects padded encoding (it requires the descriptor
-    // and memdesc to agree, and without an alignTDMDescriptorEncodings
-    // pass the descriptor stays with its original encoding). Use a plain
-    // swizzled encoding for stores until that pass is ported.
-    if (allowDotAware)
-      encoding = buildDefaultTDMDescriptorEncoding(
-          buf.getContext(), shape, order, cgaLayout, elementType);
-    else
-      encoding = ttg::SwizzledSharedEncodingAttr::get(buf.getContext(), 1, 1, 1,
-                                                      order, cgaLayout);
+    encoding = buildDefaultTDMDescriptorEncoding(buf.getContext(), shape, order,
+                                                 cgaLayout, elementType);
   }
   return encoding;
 }
 
 // Insert `tlx.require_layout` between `buf` and `tdmOp`'s memdesc operand,
-// rewriting it to a descriptor-compatible padded encoding. Idempotent: if
+// rewriting it to a descriptor-compatible shared encoding. Idempotent: if
 // the buffer is already produced by a `require_layout`, leave it alone.
+// Returns failure after diagnosing an unsupported explicit TDM layout.
 template <typename TDMOp>
-static void anchorTDMRequireLayout(TDMOp tdmOp, Value buf,
-                                   MutableOperandRange operandToRewire,
-                                   bool allowDotAware, OpBuilder &builder,
-                                   DataFlowSolver &solver) {
+static LogicalResult
+anchorTDMRequireLayout(TDMOp tdmOp, Value buf,
+                       MutableOperandRange operandToRewire, bool allowDotAware,
+                       OpBuilder &builder, DataFlowSolver &solver) {
   if (buf.getDefiningOp<tlx::RequireLayoutOp>())
-    return;
+    return success();
   auto bufType = dyn_cast<ttg::MemDescType>(buf.getType());
   if (!bufType)
-    return;
+    return success();
   auto descTy = cast<tt::TensorDescType>(tdmOp.getDesc().getType());
 
   Attribute encoding =
       chooseTDMBufEncoding(tdmOp, buf, bufType, descTy, allowDotAware, solver);
   if (!encoding)
-    return;
+    return failure();
 
   builder.setInsertionPoint(tdmOp);
   auto newType = ttg::MemDescType::get(
@@ -960,16 +1120,19 @@ static void anchorTDMRequireLayout(TDMOp tdmOp, Value buf,
   auto requireOp =
       tlx::RequireLayoutOp::create(builder, tdmOp.getLoc(), newType, buf);
   operandToRewire.assign(requireOp.getResult());
+  return success();
 }
 
-static void materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
-                                      DataFlowSolver &solver) {
-  m.walk([&](Operation *op) {
-    if (auto load = dyn_cast<amdgpu::AsyncTDMCopyGlobalToLocalOp>(op))
-      anchorTDMRequireLayout(load, load.getResult(), load.getResultMutable(),
-                             /*allowDotAware=*/true, builder, solver);
-    else if (auto fused =
-                 dyn_cast<amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(op)) {
+static LogicalResult materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
+                                               DataFlowSolver &solver) {
+  WalkResult walk = m.walk([&](Operation *op) -> WalkResult {
+    if (auto load = dyn_cast<amdgpu::AsyncTDMCopyGlobalToLocalOp>(op)) {
+      if (failed(anchorTDMRequireLayout(
+              load, load.getResult(), load.getResultMutable(),
+              /*allowDotAware=*/true, builder, solver)))
+        return WalkResult::interrupt();
+    } else if (auto fused =
+                   dyn_cast<amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(op)) {
       for (size_t i = 0; i < fused.getDescs().size(); ++i) {
         Value dest = fused.getDests()[i];
         if (dest.getDefiningOp<tlx::RequireLayoutOp>())
@@ -981,7 +1144,7 @@ static void materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
         Attribute encoding = chooseTDMBufEncoding(
             fused, dest, destType, descType, /*allowDotAware=*/true, solver);
         if (!encoding)
-          continue;
+          return WalkResult::interrupt();
         builder.setInsertionPoint(fused);
         auto requiredType = ttg::MemDescType::get(
             destType.getShape(), destType.getElementType(), encoding,
@@ -991,10 +1154,15 @@ static void materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
                                                      requiredType, dest);
         fused.getDestsMutable()[i].assign(required.getResult());
       }
-    } else if (auto store = dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(op))
-      anchorTDMRequireLayout(store, store.getSrc(), store.getSrcMutable(),
-                             /*allowDotAware=*/false, builder, solver);
+    } else if (auto store = dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(op)) {
+      if (failed(anchorTDMRequireLayout(
+              store, store.getSrc(), store.getSrcMutable(),
+              /*allowDotAware=*/false, builder, solver)))
+        return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
   });
+  return walk.wasInterrupted() ? failure() : success();
 }
 
 } // namespace
@@ -1087,16 +1255,21 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   // Infer & pin the direct-to-LDS offset layout for buffer_load_to_local ops
   // whose destination alloc is a user-pinned padded_shared layout, so authors
   // pin only the shared layout and the matching offset layout is derived.
-  m.walk([&](amdgpu::BufferLoadToLocalOp buf) {
-    pinInferredBufferOffsetLayout(buf, axisInfo, builder);
+  WalkResult bufferLayoutResult = m.walk([&](amdgpu::BufferLoadToLocalOp buf) {
+    if (failed(pinInferredBufferOffsetLayout(buf, axisInfo, builder)))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
   });
+  if (bufferLayoutResult.wasInterrupted())
+    return failure();
 
   materializeDotUserTensorConstraints(m, builder);
 
   // Anchor `tlx.require_layout` on AMD TDM copy buffer operands so
   // tlx-propagate-layout rewrites the source `local_alloc` to a
   // descriptor-compatible encoding.
-  materializeTDMConstraints(m, builder, solver);
+  if (failed(materializeTDMConstraints(m, builder, solver)))
+    return failure();
 
   return success();
 }

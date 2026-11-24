@@ -1,0 +1,10 @@
+{
+  "priority": 20,
+  "backends": ["amd", "hip", "rocm"],
+  "architectures": [],
+  "selection": "analyze-amd-ir-live-ranges",
+  "documents": [
+    "amd-ir-live-range-analysis.md",
+    "references/live-range-interpretation.md"
+  ]
+}

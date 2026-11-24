@@ -14,7 +14,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from nightly_select import select  # noqa: E402
+from nightly_select import canonical_check_name, select  # noqa: E402
 
 REQUIRED = ["LIT Tests", "h100-tlx-test", "mi350-tlx-test", "b200-tlx-test"]
 # Publish target (releases + latest.json): the repo running this workflow.
@@ -56,11 +56,18 @@ def new_commits(boundary):
 
 
 def fetch(sha):
-    data = gh_json(f"repos/{SIGNAL_REPO}/commits/{sha}/check-runs?per_page=100") or {}
     by_check = {}
-    for cr in data.get("check_runs", []):
-        by_check.setdefault(cr["name"],
-                            []).append({"completed_at": cr.get("completed_at"), "conclusion": cr.get("conclusion")})
+    page = 1
+    while True:
+        data = gh_json(f"repos/{SIGNAL_REPO}/commits/{sha}/check-runs?per_page=100&page={page}") or {}
+        checks = data.get("check_runs", [])
+        for cr in checks:
+            name = canonical_check_name(cr["name"])
+            by_check.setdefault(name,
+                                []).append({"completed_at": cr.get("completed_at"), "conclusion": cr.get("conclusion")})
+        if len(checks) < 100:
+            break
+        page += 1
     return by_check
 
 
@@ -72,7 +79,7 @@ def emit(**kv):
 
 def base_version():
     m = re.search(r'^TRITON_VERSION = "([0-9]+\.[0-9]+\.[0-9]+)"', open("setup.py").read(), re.M)
-    return m.group(1) if m else "3.8.0"
+    return m.group(1) if m else "3.9.0"
 
 
 def main():

@@ -1,0 +1,159 @@
+"""gfx950 coverage for ``tlx.ops.mm_mxfp6``.
+
+Catalog and validation coverage runs anywhere; kernel numerics require
+a gfx950 (CDNA4) device.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+from triton._internal_testing import is_hip_cdna4
+
+
+def test_mm_mxfp6_gfx950_catalog_entry():
+    from triton.tlx.ops._catalog import CATALOG, has_impl
+
+    specs = [spec for spec in CATALOG if spec.op == "mm_mxfp6" and spec.arch == "gfx950"]
+    assert len(specs) == 1
+    assert specs[0].impl == "triton.tlx.ops.kernels.mm_mxfp6.gfx950:mm_mxfp6"
+    assert has_impl("mm_mxfp6", "gfx950")
+
+
+def test_mm_mxfp6_gfx950_catalog_resolves_implementation():
+    from triton.tlx.ops._catalog import impl_for
+
+    impl, spec = impl_for("mm_mxfp6", arch="gfx950")
+    assert impl.__name__ == "mm_mxfp6"
+    assert spec.arch == "gfx950"
+
+
+def test_mm_mxfp6_gfx950_rejects_blocked_scales_and_bad_space():
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6
+
+    a = torch.zeros((128, 128), dtype=torch.uint8)
+    b = torch.zeros((128, 128), dtype=torch.uint8)
+    scale = torch.zeros((128, 4), dtype=torch.float8_e8m0fnu)
+    with pytest.raises(ValueError, match="only supports sf_layout='natural'"):
+        mm_mxfp6(a, scale, b, scale, sf_layout="cublas_blocked")
+    with pytest.raises(ValueError, match="unsupported space"):
+        mm_mxfp6(a, scale, b, scale, space="bogus")
+
+
+def _pack_fp6_dense(codes):
+    rows, K = codes.shape
+    quads = codes.reshape(rows, K // 4, 4).to(torch.int64)
+    v0, v1, v2, v3 = (quads[..., i] for i in range(4))
+    triples = torch.stack([v0 | ((v1 & 3) << 6), ((v1 >> 2) & 15) | ((v2 & 15) << 4), ((v2 >> 4) & 3) | (v3 << 2)],
+                          dim=-1).reshape(rows, -1)
+    packed = torch.zeros((rows, K), dtype=torch.uint8, device=codes.device)
+    packed[:, :triples.shape[-1]] = triples.to(torch.uint8)
+    return packed
+
+
+def _packed_ones(rows, K, code, device):
+    return _pack_fp6_dense(torch.full((rows, K), code, dtype=torch.uint8, device=device))
+
+
+def _decode_fp6(codes, ebits, bias):
+    mbits = 5 - ebits
+    sign = (codes >> 5) & 1
+    exponent = (codes >> mbits) & ((1 << ebits) - 1)
+    mantissa = (codes & ((1 << mbits) - 1)).to(torch.float64) / 2**mbits
+    normal = (1.0 + mantissa) * torch.exp2(exponent.to(torch.float64) - bias)
+    denormal = mantissa * 2.0**(1 - bias)
+    magnitude = torch.where(exponent == 0, denormal, normal)
+    return torch.where(sign == 1, -magnitude, magnitude)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("space", ["heuristic", "full"])
+def test_mm_mxfp6_gfx950_ones(space):
+    from triton.tlx import ops
+
+    device = "cuda"
+    M = N = K = 128
+    # E2M3 code 8 and E3M2 code 12 both decode to 1.0; E8M0 127 is 1.0.
+    a = _packed_ones(M, K, 8, device)
+    b = _packed_ones(N, K, 12, device)
+    scales_a = torch.full((M, K // 32), 127, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu)
+    scales_b = torch.full((N, K // 32), 127, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu)
+    out = ops.mm_mxfp6(a, scales_a, b, scales_b, space=space)
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), torch.full((M, N), float(K), device=device))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("M, N", [(128, 128), (128, 256), (256, 128), (256, 256), (384, 384)])
+def test_mm_mxfp6_gfx950_full_ones_preserves_output_guard(M, N):
+    from triton.tlx import ops
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import _kernel_full
+
+    _kernel_full.cache.clear()
+    device = "cuda"
+    K = 128
+    a = _packed_ones(M, K, 8, device)
+    b = _packed_ones(N, K, 12, device)
+    scales_a = torch.full((M, K // 32), 127, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu)
+    scales_b = torch.full((N, K // 32), 127, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu)
+    backing = torch.full((M + 256, N), -17, dtype=torch.bfloat16, device=device)
+    out = backing[:M]
+    assert ops.mm_mxfp6(a, scales_a, b, scales_b, out=out, space="full") is out
+    torch.testing.assert_close(out.float(), torch.full((M, N), float(K), device=device))
+    torch.testing.assert_close(backing[M:], torch.full_like(backing[M:], -17), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("M, N, K", [
+    (128, 128, 128),
+    (128, 384, 256),
+    (384, 128, 384),
+    (384, 384, 1024),
+    (1152, 128, 128),
+    (13, 29, 64),
+    (13, 29, 192),
+    (13, 29, 320),
+])
+def test_mm_mxfp6_gfx950_all_configs_partial_tiles(M, N, K):
+    import triton
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import _full_configs, _gemm_mxfp6_native_kernel
+
+    generator = torch.Generator().manual_seed(0)
+    a_codes = torch.randint(16, (M, K), dtype=torch.uint8, generator=generator)
+    b_codes = torch.randint(16, (N, K), dtype=torch.uint8, generator=generator)
+    a_codes |= torch.randint(2, (M, K), dtype=torch.uint8, generator=generator) << 5
+    b_codes |= torch.randint(2, (N, K), dtype=torch.uint8, generator=generator) << 5
+    a_scale_bytes = torch.randint(126, 129, (M, K // 32), dtype=torch.uint8, generator=generator)
+    b_scale_bytes = torch.randint(126, 129, (N, K // 32), dtype=torch.uint8, generator=generator)
+    a_ref = _decode_fp6(a_codes, 2, 1) * torch.exp2(a_scale_bytes.to(torch.float64) - 127).repeat_interleave(32, dim=1)
+    b_ref = _decode_fp6(b_codes, 3, 3) * torch.exp2(b_scale_bytes.to(torch.float64) - 127).repeat_interleave(32, dim=1)
+    expected = (a_ref @ b_ref.T).to(device="cuda", dtype=torch.bfloat16)
+    a = _pack_fp6_dense(a_codes).cuda()
+    b = _pack_fp6_dense(b_codes).cuda()
+    a_scale = a_scale_bytes.cuda().view(torch.float8_e8m0fnu)
+    b_scale = b_scale_bytes.cuda().view(torch.float8_e8m0fnu)
+
+    for config in _full_configs():
+        backing = torch.full((M + 256, N), -17, dtype=torch.bfloat16, device="cuda")
+        out = backing[:M]
+        grid = (triton.cdiv(M, config.kwargs["BLOCK_SIZE_M"]) * triton.cdiv(N, config.kwargs["BLOCK_SIZE_N"]), )
+        _gemm_mxfp6_native_kernel[grid](a, b, out, a_scale, b_scale, M, N, K, **config.all_kwargs())
+        torch.testing.assert_close(out, expected, rtol=0, atol=0, msg=lambda message: f"{config}\n{message}")
+        torch.testing.assert_close(backing[M:], torch.full_like(backing[M:], -17), rtol=0, atol=0,
+                                   msg=lambda message: f"{config}\n{message}")
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
+@pytest.mark.parametrize("K", [64, 128, 192, 256, 320, 384, 1024])
+def test_mm_mxfp6_gfx950_native_ones(K):
+    from triton.tlx.ops.kernels.mm_mxfp6.gfx950 import mm_mxfp6
+
+    device = "cuda"
+    M = N = 128
+    a = _packed_ones(M, K, 8, device)
+    b = _packed_ones(N, K, 12, device)
+    scales_a = torch.full((M, K // 32), 127, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu)
+    scales_b = torch.full((N, K // 32), 127, dtype=torch.uint8, device=device).view(torch.float8_e8m0fnu)
+    out = mm_mxfp6(a, scales_a, b, scales_b, space="heuristic")
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), torch.full((M, N), float(K), device=device))

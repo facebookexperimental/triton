@@ -65,12 +65,16 @@ SegmentObject SegmentObject::fromStruct(Location loc, Value segmentStruct,
 namespace triton {
 namespace proton::gpu {
 
-CircularStoreDataPack
-lowerCircularStoreOpHelper(CircularStoreOp op, Value segmentStruct,
-                           ConversionPatternRewriter &rewriter) {
+CircularStoreDataPack lowerCircularStore(CircularStoreOp op,
+                                         Value segmentStruct, Value counter,
+                                         Value dynamicScopeId, Value predicate,
+                                         ConversionPatternRewriter &rewriter) {
   auto loc = op.getLoc();
-  auto mod = op.getOperation()->getParentOfType<ModuleOp>();
+  auto mod = op->getParentOfType<ModuleOp>();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
+  Value scopeId = dynamicScopeId;
+  if (!scopeId)
+    scopeId = b.i32_val(op.getScopeIdAttr().getInt());
   const int bytesPerEntry = proton::gpu::getBytesPerClockEntry();
   const int wordsPerEntry = bytesPerEntry / 4; // 1 word = 4 bytes
 
@@ -106,17 +110,20 @@ lowerCircularStoreOpHelper(CircularStoreOp op, Value segmentStruct,
   // tag and upper clock (4 bytes):
   // 31: start or end (1 bit)
   // 30:23 scope id (8 bits)
-  // 22:11 reserved (12 bits)
+  // 22: async event (1 bit)
+  // 21:11 reserved (11 bits)
   // 10:0  64-bit clock bit 32:42 (11 bits)
   // =======================================
   // lower clock (4 bytes):
   // 31:0 64-bit clock bit 0:31
   // =======================================
-  Value clock = op.getCounter();
+  Value clock = counter;
   auto clkTy = mlir::cast<IntegerType>(clock.getType());
-  uint32_t maskedScopeId = op.getScopeId() & 0xff;
-  Value tag = op.getIsStart() ? b.i32_val(maskedScopeId << 23)
-                              : b.i32_val(1 << 31 | maskedScopeId << 23);
+  Value maskedScopeId = b.and_(scopeId, b.i32_val(0xff));
+  Value tag = b.or_(b.shl(maskedScopeId, b.i32_val(23)),
+                    b.i32_val(op.getIsStart() ? 0u : (1u << 31)));
+  if (dynamicScopeId)
+    tag = b.or_(tag, b.i32_val(1u << 22));
   Value valsVec;
   if (clkTy.getWidth() == 64) {
     auto clkVecTy = vec_ty(i32_ty, 2);
@@ -135,12 +142,13 @@ lowerCircularStoreOpHelper(CircularStoreOp op, Value segmentStruct,
   Value isWarpMaster =
       b.icmp_eq(b.urem(curThreadId, b.i32_val(warpSize)), b.i32_val(0));
   Value isWriter;
+  Value shouldAdvance;
 
-  Value idxToStore = newIdx;
   auto granularity = segmentType.getGranularity();
   if (selectedIds.empty()) {
     if (granularity == proton::gpu::Granularity::WARP) {
       isWriter = isWarpMaster;
+      shouldAdvance = b.true_val();
     } else {
       llvm::report_fatal_error(
           "segment address specialization not implemented yet");
@@ -148,9 +156,15 @@ lowerCircularStoreOpHelper(CircularStoreOp op, Value segmentStruct,
   } else {
     Value isCurWarpEnabled = b.icmp_ne(segmentBase, b.i32_val(-1));
     isWriter = b.and_(isCurWarpEnabled, isWarpMaster);
-    idxToStore = b.select(isCurWarpEnabled, newIdx, curIdx);
+    shouldAdvance = isCurWarpEnabled;
   }
 
+  if (Value userPredicate = predicate) {
+    isWriter = b.and_(isWriter, userPredicate);
+    shouldAdvance = b.and_(shouldAdvance, userPredicate);
+  }
+
+  Value idxToStore = b.select(shouldAdvance, newIdx, curIdx);
   b.store(idxToStore, indexPtr);
 
   uint32_t addrSpace =

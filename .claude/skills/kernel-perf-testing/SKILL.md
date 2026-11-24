@@ -31,7 +31,7 @@ Wrap benchmarks with `denoise.sh` (locks clocks/power) for stable results.
 
 ```bash
 CUDA_VISIBLE_DEVICES=<gpu_id> third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py [--version {ws|pipelined}]
-CUDA_VISIBLE_DEVICES=<gpu_id> third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]
+CUDA_VISIBLE_DEVICES=<gpu_id> third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version ws_pipelined_pingpong]
 ```
 
 ### Blackwell GPU
@@ -64,7 +64,7 @@ CUDA_VISIBLE_DEVICES=<gpu_id> third_party/tlx/denoise.sh python third_party/tlx/
 ### gfx1250
 
 ```bash
-CUDA_VISIBLE_DEVICES=<gpu_id> third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_mxfp_gemm_perf.py [--version {tdm_pipelined}] [--transpose-b]
+CUDA_VISIBLE_DEVICES=<gpu_id> third_party/tlx/denoise.sh python third_party/tlx/ops/kernels/mm_mxfp/bench_gfx1250.py [--variant {mx8xmx8|mx8xmx4}] [--dry-run]  # MXFP GEMM (tlx.ops)
 ```
 
 Each script self-gates (`is_hip`, `is_hip_cdna4`, or `is_hip_gfx1250`) and prints
