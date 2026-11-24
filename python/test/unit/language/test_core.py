@@ -6370,7 +6370,8 @@ def _fp6_dot_kernel(a_base, stride_a0, stride_a1, a_scale, b_base, stride_b0, st
 
 @pytest.mark.interpreter
 @pytest.mark.parametrize("M, N, K", [(64, 64, 64), (64, 64, 128), (128, 128, 64), (128, 128, 128)])
-@pytest.mark.parametrize("type_a, type_b", [("e2m3", "e2m3"), ("e3m2", "e3m2"), ("e2m3", "e3m2")])
+@pytest.mark.parametrize("type_a", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("type_b", ["e2m3", "e3m2"])
 @pytest.mark.parametrize("mma", [16, 32] if is_hip() else [16])
 def test_scaled_dot_fp6(M, N, K, type_a, type_b, mma, device):
     if is_cuda():
