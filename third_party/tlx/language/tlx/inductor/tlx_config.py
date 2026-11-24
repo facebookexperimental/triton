@@ -9,35 +9,26 @@ import os
 from contextlib import contextmanager
 from typing import Generator
 
-
 # Use shape-based heuristic rules to pick a single GEMM config.
 # When False, falls back to iterating base configs from mm_configs.
-use_heuristic_config: bool = (
-    os.environ.get("TORCHINDUCTOR_TLX_USE_HEURISTIC_CONFIG", "1") == "1"
-)
+use_heuristic_config: bool = (os.environ.get("TORCHINDUCTOR_TLX_USE_HEURISTIC_CONFIG", "1") == "1")
 
 # Use TMA (asynchronous descriptor) stores for the GEMM epilogue.
 # Matches upstream TLX behavior; the tl.store path is incompatible with
 # NUM_CTAS=2 (MultiCTAReduction pass can't distribute direct stores across CTAs).
-tma_epilogue_store: bool = (
-    os.environ.get("TORCHINDUCTOR_TLX_TMA_EPILOGUE_STORE", "1") == "1"
-)
+tma_epilogue_store: bool = (os.environ.get("TORCHINDUCTOR_TLX_TMA_EPILOGUE_STORE", "1") == "1")
 
 # When True, yield both TMA_EPILOGUE_STORE=0 and TMA_EPILOGUE_STORE=1 variants
 # so autotuning can pick the faster path. When False, always prefer TMA=1 if it
 # fits in SMEM and fall back to TMA=0 otherwise (single variant, no autotuning).
-autotune_tma_epilogue_store: bool = (
-    os.environ.get("TORCHINDUCTOR_TLX_AUTOTUNE_TMA_EPILOGUE_STORE", "0") == "1"
-)
+autotune_tma_epilogue_store: bool = (os.environ.get("TORCHINDUCTOR_TLX_AUTOTUNE_TMA_EPILOGUE_STORE", "0") == "1")
 
 # In "allow" mode, minimum speedup TLX must achieve over the best extern
 # kernel (cublas) to be selected. Below this threshold, the extern kernel wins.
 # Autotune times each candidate alone at one sample shape; on the H100 OneFeed
 # merge net, TLX GEMMs that won it by under 10% ran 1.15-1.25x slower than
 # cuBLAS in serving.
-allow_min_speedup: float = float(
-    os.environ.get("TORCHINDUCTOR_TLX_ALLOW_MIN_SPEEDUP", "1.1")
-)
+allow_min_speedup: float = float(os.environ.get("TORCHINDUCTOR_TLX_ALLOW_MIN_SPEEDUP", "1.1"))
 
 # Lower eligible SDPA flash-attention calls (see sdpa_to_flex.eligible) through the
 # flex-attention lowering so flex templates can serve SDPA callers. Read at forward
@@ -45,10 +36,14 @@ allow_min_speedup: float = float(
 # toggling it around a compile call pairs a flex forward with an FA2 backward.
 sdpa_to_flex: bool = os.environ.get("TORCHINDUCTOR_TLX_SDPA_TO_FLEX", "0") == "1"
 
-# Experimental: extends every gfx942 INNER reduction's persistent threshold.
-# Coverage so far is limited to the SwishWithNorm fusion benchmarks.
+# Lower eligible (K, 1) convolutions to GEMMs and fused pointwise ops (see
+# conv1d_to_mm). Read at forward and backward compile, so set it process-wide.
+conv1d_to_mm: bool = os.environ.get("TORCHINDUCTOR_TLX_CONV1D_TO_MM", "1") == "1"
+
+# Extends the persistent threshold of gfx942 INNER reductions under tlx_mode;
+# each such reduction is timed against its looped kernel. Set to 0 to opt out.
 gfx942_persistent_inner_reductions: bool = (
-    os.environ.get("TORCHINDUCTOR_TLX_GFX942_PERSISTENT_INNER_REDUCTIONS", "0") == "1"
+    os.environ.get("TORCHINDUCTOR_TLX_GFX942_PERSISTENT_INNER_REDUCTIONS", "1") == "1"
 )
 
 @contextmanager

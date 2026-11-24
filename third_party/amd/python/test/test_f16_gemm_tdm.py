@@ -3,15 +3,15 @@ import torch
 
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hip_gfx1250
+from triton._internal_testing import is_hip_cdna5
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-pytestmark = pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
+pytestmark = pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 
 
 def supports_tensor_descriptor():
     # AMD GPUs with tensor ops support
-    return is_hip_gfx1250() and hasattr(tl, "make_tensor_descriptor")
+    return is_hip_cdna5() and hasattr(tl, "make_tensor_descriptor")
 
 
 @triton.jit

@@ -18,6 +18,7 @@ description: >
 | `tlx.async_task([task_ids])` | Assign code to specific task IDs (e.g., `[0]` = producer, `[1,2]` = consumers) | Both |
 | `tlx.async_task(num_warps=N, num_regs=R)` | Explicit warp/register allocation for a task | Both |
 | `tlx.async_task("default", num_regs=R)` | Default task for code outside explicit tasks | Both |
+| `tlx.async_task(..., nvptx_cmp_sink_workaround=True)` | TEMPORARY NVPTX workaround: the task's per-warp arrives test `%laneid` in their own asm and its leader arrives share one predicate built at the task entry, so neither a sunk `tid == 0` compare nor a hoisted lane predicate leaves an extra value live across a hot loop. See `tlx_barriers.md` | NVIDIA |
 | `tlx.async_task_replica_id()` | Returns replica ID inside an async region | Both |
 
 ### Warp specialization skeleton

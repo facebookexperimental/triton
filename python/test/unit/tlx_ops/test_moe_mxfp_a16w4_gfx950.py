@@ -4,7 +4,10 @@ import pytest
 import torch
 
 from triton._internal_testing import is_hip_cdna4
-from triton.tlx.ops.kernels.moe_mxfp.gfx950_a16w4 import moe_mxfp4_a16w4, pick_config
+from triton.tlx.ops.kernels.moe.gfx950 import _align
+from triton.tlx.ops.kernels.moe_mxfp import gfx950_a16w4_decode as decode
+from triton.tlx.ops.kernels.moe_mxfp.gfx950_a16w4 import (DECODE_MAX_TOKENS, _launch, moe_mxfp4_a16w4, pick_config,
+                                                          pick_down_config)
 
 requires_gfx950 = pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950")
 
@@ -154,6 +157,189 @@ def test_moe_mxfp4_a16w4_graph_replay(T):
             assert torch.equal(out, torch.zeros_like(out))
         else:
             _assert_close(out, x, wts, ids, weights, norm)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("T", [1, 2, 7, 16, DECODE_MAX_TOKENS])
+@pytest.mark.parametrize("start,use_norm", [(0, False), (16, True)])
+def test_moe_mxfp4_a16w4_decode_engine_matches_dot_scaled(T, start, use_norm):
+    """Up to DECODE_MAX_TOKENS the op runs the register-weight decode engine; it must give the bits of the
+    tl.dot_scaled engine (forced here through ``cfg``) on the same inputs."""
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    x, wts, ids, weights, norm = _problem(T, gen, use_norm)
+    kw = dict(expert_start=start, post_norm_weight=norm, post_norm_eps=1e-8, post_norm_gain=1.0)
+    got = moe_mxfp4_a16w4(x, wts, ids, *weights, **kw)
+    want = moe_mxfp4_a16w4(x, wts, ids, *weights, cfg=pick_config(T * _TOPK), **kw)
+    assert torch.equal(got, want)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("T", [1, 16])
+def test_moe_mxfp4_a16w4_decode_engine_model_shape(T):
+    """The decode engine at the served model's per-rank shape (H = I = K = 4096), bitwise against tl.dot_scaled."""
+    K = I = H = 4096
+    E, E_total = 4, 32
+    gen = torch.Generator(device="cuda").manual_seed(6)
+    w13, s13 = _random_weights(E, 2 * I, K, gen)
+    w2, s2 = _random_weights(E, H, I, gen)
+    norm = (torch.randn(H, device="cuda", generator=gen) * 0.05).to(torch.bfloat16)
+    x = torch.randn(T, K, device="cuda", generator=gen).to(torch.bfloat16)
+    ids = torch.rand(T, E_total, device="cuda", generator=gen).argsort(dim=1)[:, :_TOPK].to(torch.int32)
+    ids[:, 0] = torch.arange(T, device="cuda") % E
+    wts = torch.softmax(torch.randn(T, _TOPK, device="cuda", generator=gen), -1)
+    kw = dict(post_norm_weight=norm, post_norm_eps=1e-8, post_norm_gain=1.0)
+    got = moe_mxfp4_a16w4(x, wts, ids, w13, s13, w2, s2, **kw)
+    want = moe_mxfp4_a16w4(x, wts, ids, w13, s13, w2, s2, cfg=pick_config(T * _TOPK), **kw)
+    assert torch.equal(got, want)
+    _assert_close(got, x, wts, ids, (w13, s13, w2, s2), norm)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("T", [2, 4, 8])
+def test_moe_mxfp4_a16w4_decode_engine_expert_tp_shape(T):
+    """The decode engine on an expert-TP8 slice of the served model (I = 512, every expert local), whose configs
+    differ from the full-width ones, bitwise against tl.dot_scaled."""
+    K = H = 4096
+    I, E = 512, 32
+    assert decode.pick_config(T, I) != decode.pick_config(T)
+    gen = torch.Generator(device="cuda").manual_seed(10)
+    w13, s13 = _random_weights(E, 2 * I, K, gen)
+    w2, s2 = _random_weights(E, H, I, gen)
+    norm = (torch.randn(H, device="cuda", generator=gen) * 0.05).to(torch.bfloat16)
+    x = torch.randn(T, K, device="cuda", generator=gen).to(torch.bfloat16)
+    ids = torch.rand(T, E, device="cuda", generator=gen).argsort(dim=1)[:, :_TOPK].to(torch.int32)
+    wts = torch.softmax(torch.randn(T, _TOPK, device="cuda", generator=gen), -1)
+    kw = dict(post_norm_weight=norm, post_norm_eps=1e-8, post_norm_gain=1.0)
+    got = moe_mxfp4_a16w4(x, wts, ids, w13, s13, w2, s2, **kw)
+    want = moe_mxfp4_a16w4(x, wts, ids, w13, s13, w2, s2, cfg=pick_config(T * _TOPK), **kw)
+    assert torch.equal(got, want)
+    _assert_close(got, x, wts, ids, (w13, s13, w2, s2), norm)
+
+
+def _padded(t, experts=False, rows=0, cols=0):
+    """``t``'s values as a view into a larger zero tensor: every other expert, and/or ``rows`` extra rows and ``cols``
+    extra bytes per row after the real ones."""
+    E, N, C = t.shape
+    big = torch.zeros(2 * E if experts else E, N + rows, C + cols, dtype=t.dtype, device=t.device)
+    view = big[::2 if experts else 1, :N, :C]
+    view.copy_(t)
+    return view
+
+
+def _strided_views(weights, kind):
+    """The same weight values as views whose strides are not those of a contiguous tensor: every other expert of a
+    larger tensor, rows of wider rows in extra-tall experts (as an expert-TP slice of a full weight would be), or a w2
+    row stride that is not a multiple of four bytes."""
+    w13, s13, w2, s2 = weights
+    if kind == "experts":
+        views = tuple(_padded(t, experts=True) for t in weights)
+    elif kind == "rows":
+        views = (_padded(w13, rows=64, cols=128), _padded(s13, rows=64, cols=8), _padded(w2,
+                                                                                         cols=128), _padded(s2, cols=8))
+    else:
+        views = (w13, s13, _padded(w2, cols=2), s2)
+        assert views[2].stride(1) % 4 == 2
+    for v, t in zip(views, weights):
+        assert torch.equal(v, t)
+    return views
+
+
+def _spy_decode(monkeypatch):
+    """Records the weights of every decode-engine launch."""
+    calls = []
+    launch = decode.launch
+
+    def spy(*args, **kwargs):
+        calls.append(args[1])
+        return launch(*args, **kwargs)
+
+    monkeypatch.setattr(decode, "launch", spy)
+    return calls
+
+
+@requires_gfx950
+@pytest.mark.parametrize("T", [1, 5, 16, DECODE_MAX_TOKENS])
+@pytest.mark.parametrize("kind", ["experts", "rows", "unaligned"])
+def test_moe_mxfp4_a16w4_strided_weights(T, kind, monkeypatch):
+    """Weight and scale views with expert and row strides of their own (the op accepts any layout that is contiguous
+    along K) give the bits of contiguous weights. The decode engine reads them through their strides; a w2 row stride
+    that is not a whole number of 32-bit words falls back to the tl.dot_scaled engine."""
+    calls = _spy_decode(monkeypatch)
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    x, wts, ids, weights, norm = _problem(T, gen, use_norm=True)
+    # Every token hits a local expert other than 0, whose offset would not depend on the expert stride.
+    e = torch.arange(T, device="cuda", dtype=torch.int32) % (_E - 1) + 1
+    ids[:, 0] = torch.where((ids == e[:, None]).any(1), ids[:, 0], e)
+    views = _strided_views(weights, kind)
+    assert not all(v.is_contiguous() for v in views)
+    got = _run(x, wts, ids, views, norm)
+    assert len(calls) == (0 if kind == "unaligned" else 2)
+    assert torch.equal(got, _run(x, wts, ids, weights, norm, pick_config(T * _TOPK)))
+    _assert_close(got, x, wts, ids, weights, norm)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("T", [1, 4, 16])
+def test_moe_mxfp4_a16w4_strided_weights_expert_tp_shape(T, monkeypatch):
+    """An expert-TP8 slice (I = 512, every expert local) taken as a view of wider weights, at the slice tiles."""
+    calls = _spy_decode(monkeypatch)
+    K = H = 4096
+    I, E = 512, 32
+    gen = torch.Generator(device="cuda").manual_seed(12)
+    w13, s13 = _random_weights(E, 2 * I, K, gen)
+    w2, s2 = _random_weights(E, H, I, gen)
+    weights = (w13, s13, w2, s2)
+    views = _strided_views(weights, "rows")
+    norm = (torch.randn(H, device="cuda", generator=gen) * 0.05).to(torch.bfloat16)
+    x = torch.randn(T, K, device="cuda", generator=gen).to(torch.bfloat16)
+    ids = torch.rand(T, E, device="cuda", generator=gen).argsort(dim=1)[:, :_TOPK].to(torch.int32)
+    wts = torch.softmax(torch.randn(T, _TOPK, device="cuda", generator=gen), -1)
+    got = _run(x, wts, ids, views, norm)
+    assert len(calls) == 2
+    assert torch.equal(got, _run(x, wts, ids, weights, norm, pick_config(T * _TOPK)))
+    _assert_close(got, x, wts, ids, weights, norm)
+
+
+@requires_gfx950
+def test_moe_mxfp4_a16w4_prefill_down_tile_same_bits():
+    """Past 8192 slots the down GEMM runs 256-wide N tiles; the output must equal the single-config run."""
+    gen = torch.Generator(device="cuda").manual_seed(9)
+    x, wts, ids, weights, norm = _problem(1100, gen, use_norm=True)
+    assert pick_down_config(1100 * _TOPK, pick_config(1100 * _TOPK)) != pick_config(1100 * _TOPK)
+    got = _run(x, wts, ids, weights, norm)
+    assert torch.equal(got, _run(x, wts, ids, weights, norm, pick_config(1100 * _TOPK)))
+    _assert_close(got, x, wts, ids, weights, norm)
+
+
+@requires_gfx950
+def test_moe_mxfp4_a16w4_decode_engine_gate_up_bits():
+    """The gate/up stage of both engines on 4M intermediate values (every token on all eight experts), compared
+    before the down GEMM can hide a difference: SiLU's 1-ulp rounding choices show up only every few 1e6 values."""
+    T, E, I, K, topk = DECODE_MAX_TOKENS, 8, 8192, 512, 8
+    gen = torch.Generator(device="cuda").manual_seed(8)
+    w13, s13 = _random_weights(E, 2 * I, K, gen)
+    x = torch.randn(T, K, device="cuda", generator=gen).to(torch.bfloat16)
+    ids = torch.rand(T, E, device="cuda", generator=gen).argsort(dim=1).to(torch.int32)
+    num_valid = T * topk
+    sorted_ids, expert_ids, num_post = _align(ids, E, 0, 16)
+    ours = torch.empty(num_valid, I, device="cuda", dtype=torch.bfloat16)
+    c1, _ = decode.pick_config(T)
+    decode.launch(x, w13, s13, ours, sorted_ids, expert_ids, num_post, num_valid, I, K, topk, True, c1, 16)
+    theirs = torch.empty(sorted_ids.numel(), I, device="cuda", dtype=torch.bfloat16)
+    _launch(x, w13, s13, theirs, sorted_ids, expert_ids, num_post, num_valid, I, K, topk, True,
+            dict(pick_config(num_valid), BLOCK_M=16))
+    rows = torch.nonzero(sorted_ids < num_valid).flatten()
+    assert rows.numel() == num_valid
+    assert torch.equal(ours[sorted_ids[rows].long()], theirs[rows])
+
+
+@requires_gfx950
+@pytest.mark.parametrize("T", [DECODE_MAX_TOKENS, DECODE_MAX_TOKENS + 1])
+def test_moe_mxfp4_a16w4_engine_switch(T):
+    """Both sides of the token-count switch against the reference."""
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    x, wts, ids, weights, norm = _problem(T, gen, use_norm=True)
+    _assert_close(_run(x, wts, ids, weights, norm), x, wts, ids, weights, norm)
 
 
 def test_moe_mxfp4_a16w4_rejects_bad_inputs():
