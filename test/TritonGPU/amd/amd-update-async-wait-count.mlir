@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file --tritonamdgpu-update-async-wait-count=gfx-arch=gfx1250 | FileCheck %s
+// RUN: triton-opt %s -split-input-file --tritonamdgpu-warp-pipeline --tritonamdgpu-update-async-wait-count=gfx-arch=gfx1250 | FileCheck %s
 
 // Simple case without any branching
 
@@ -40,10 +41,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: simple_buffer_load_to_local_waitcnt
   tt.func public @simple_buffer_load_to_local_waitcnt(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg1: tensor<128x16xi32, #blocked> {tt.contiguity = dense<16> : tensor<2xi32>, tt.divisibility = dense<16> : tensor<2xi32>}, %arg2: !tt.ptr<f16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}, %arg3: tensor<16x256xi32, #blocked1> {tt.contiguity = dense<16> : tensor<2xi32>, tt.divisibility = dense<16> : tensor<2xi32>}, %arg4: !ttg.memdesc<128x16xf16, #shared, #smem, mutable>, %arg5: !ttg.memdesc<16x256xf16, #shared1, #smem, mutable>) {
     // Emits 1 direct to lds instruction
-    %0 = amdg.buffer_load_to_local %arg0[%arg1] into %arg4 : <f16>[tensor<128x16xi32, #blocked>]  -> <128x16xf16, #shared, #smem, mutable>
+    %0 = amdg.buffer_load_to_local %arg0[%arg1] into %arg4 : !tt.ptr<f16>[tensor<128x16xi32, #blocked>]  -> <128x16xf16, #shared, #smem, mutable>
     %1 = ttg.async_commit_group tokens %0
     // Emits 2 direct to lds instructions
-    %2 = amdg.buffer_load_to_local %arg2[%arg3] into %arg5 : <f16>[tensor<16x256xi32, #blocked1>]  -> <16x256xf16, #shared1, #smem, mutable>
+    %2 = amdg.buffer_load_to_local %arg2[%arg3] into %arg5 : !tt.ptr<f16>[tensor<16x256xi32, #blocked1>]  -> <16x256xf16, #shared1, #smem, mutable>
     %3 = ttg.async_commit_group tokens %2
     // Wait on token %1: 2 instructions outstanding (second buffer_load emits 2)
     // CHECK: amdg.async_wait {{.*}} {num_inst = 2
@@ -454,7 +455,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// Test async_copy_local_to_global on GFX1250
+// Test async_copy_local_to_global on CDNA5
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 8, perPhase = 8, maxPhase = 2, order = [1, 0]}>
@@ -504,7 +505,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// Test mixing async_copy_global_to_local and async_copy_local_to_global on GFX1250
+// Test mixing async_copy_global_to_local and async_copy_local_to_global on CDNA5
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 8, perPhase = 8, maxPhase = 2, order = [1, 0]}>
@@ -691,7 +692,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %ptr: !tt.ptr<i32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
       %offsets: tensor<64xi32, #linear_warp_free>,
       %dest: !ttg.memdesc<64xi32, #shared_simple, #smem, mutable>) {
-    %0 = amdg.buffer_load_to_local %ptr[%offsets] into %dest : <i32>[tensor<64xi32, #linear_warp_free>]  -> <64xi32, #shared_simple, #smem, mutable>
+    %0 = amdg.buffer_load_to_local %ptr[%offsets] into %dest : !tt.ptr<i32>[tensor<64xi32, #linear_warp_free>]  -> <64xi32, #shared_simple, #smem, mutable>
     %1 = ttg.async_commit_group
 
     // The load above contributes 0 instructions, so waitcnt should be 0
@@ -714,7 +715,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %ptr: !tt.ptr<i32> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
       %offsets: tensor<256xi32, #linear_reg_zero>,
       %dest: !ttg.memdesc<256xi32, #shared_simple2, #smem, mutable>) {
-    %0 = amdg.buffer_load_to_local %ptr[%offsets] into %dest : <i32>[tensor<256xi32, #linear_reg_zero>]  -> <256xi32, #shared_simple2, #smem, mutable>
+    %0 = amdg.buffer_load_to_local %ptr[%offsets] into %dest : !tt.ptr<i32>[tensor<256xi32, #linear_reg_zero>]  -> <256xi32, #shared_simple2, #smem, mutable>
     %1 = ttg.async_commit_group
     // Without zero-base removal, register dim size is 2 which would give
     // num_inst = 2. With zero-base removal, it correctly gives num_inst = 1.
@@ -753,6 +754,315 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // Nothing in between => count = 0
     // CHECK: amdg.async_tdm_intrinsic_wait {{.*}} {count = 0
     %w2 = amdg.async_tdm_wait %2 {num = 0 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tdm_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // Forming warp stages must not hide the second outstanding copy when the
+  // first copy's commit token becomes a stage result. Both RUN lines agree.
+  // CHECK-LABEL: @warp_pipeline_token_wait
+  tt.func @warp_pipeline_token_wait(%src: tensor<128x!tt.ptr<f32>, #blocked>, %buf0: !ttg.memdesc<128xf32, #shared, #smem, mutable>, %buf1: !ttg.memdesc<128xf32, #shared, #smem, mutable>, %out: !tt.ptr<f32>, %n: index) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    scf.for %i = %c0 to %n step %c1 {
+      rocdl.sched.barrier none {triton.warp_pipeline.stage_begin = "load"}
+      %copy0 = ttg.async_copy_global_to_local %src, %buf0 : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %group0 = ttg.async_commit_group tokens %copy0
+      %copy1 = ttg.async_copy_global_to_local %src, %buf1 : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %group1 = ttg.async_commit_group tokens %copy1
+      rocdl.sched.barrier none {triton.warp_pipeline.border = "load"}
+      // CHECK: amdg.async_wait {{.*}} {num_inst = 1 : i32
+      %wait0 = ttg.async_wait %group0 {num = 1 : i32}
+      rocdl.sched.barrier none {triton.warp_pipeline.stage_begin = "compute"}
+      %value = tt.load %out : !tt.ptr<f32>
+      tt.store %out, %value : !tt.ptr<f32>
+      rocdl.sched.barrier none {triton.warp_pipeline.border = "compute"}
+      // CHECK: amdg.async_wait {{.*}} {num_inst = 0 : i32
+      %wait1 = ttg.async_wait %group1 {num = 0 : i32}
+    }
+    tt.return
+  }
+
+  // Follow nested, nonzero result indices to their corresponding yields.
+  // Copies after the producer inside both regions must be counted once.
+  // CHECK-LABEL: @execute_region_nested_results
+  tt.func @execute_region_nested_results(%src: tensor<128x!tt.ptr<f32>, #blocked>, %buf: !ttg.memdesc<128xf32, #shared, #smem, mutable>) {
+    %outer:2 = scf.execute_region -> (!ttg.async.token, !ttg.async.token) {
+      %inner:2 = scf.execute_region -> (!ttg.async.token, !ttg.async.token) {
+        %copy0 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+        %group0 = ttg.async_commit_group tokens %copy0
+        %copy1 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+        %group1 = ttg.async_commit_group tokens %copy1
+        scf.yield %group1, %group0 : !ttg.async.token, !ttg.async.token
+      }
+      scf.execute_region {
+        %copy2 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+        scf.yield
+      }
+      scf.yield %inner#0, %inner#1 : !ttg.async.token, !ttg.async.token
+    }
+    // CHECK: amdg.async_wait {{.*}} {num_inst = 2 : i32
+    %wait0 = ttg.async_wait %outer#1 {num = 0 : i32}
+    // CHECK: amdg.async_wait {{.*}} {num_inst = 1 : i32
+    %wait1 = ttg.async_wait %outer#0 {num = 0 : i32}
+    // Multiple tokens use the minimum count.
+    // CHECK: amdg.async_wait {{.*}} {num_inst = 1 : i32
+    %wait2 = ttg.async_wait %outer#1, %outer#0 {num = 0 : i32}
+    tt.return
+  }
+
+  // Count intervening regions, retaining the minimum over conditional paths.
+  // Forwarding an external token through a yield must not double-count the
+  // region. Also exercise a wait nested in a separate execute_region.
+  // CHECK-LABEL: @execute_region_forwarded_token
+  tt.func @execute_region_forwarded_token(%src: tensor<128x!tt.ptr<f32>, #blocked>, %buf: !ttg.memdesc<128xf32, #shared, #smem, mutable>, %cond: i1) {
+    %copy0 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+    %group0 = ttg.async_commit_group tokens %copy0
+    %forwarded = scf.execute_region -> !ttg.async.token {
+      scf.if %cond {
+        %copy1 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      } else {
+        %copy2 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+        %copy3 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      }
+      scf.execute_region {
+        %copy4 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+        scf.yield
+      }
+      scf.yield %group0 : !ttg.async.token
+    }
+    scf.execute_region {
+      %copy5 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      // CHECK: amdg.async_wait {{.*}} {num_inst = 3 : i32
+      %wait0 = ttg.async_wait %group0 {num = 0 : i32}
+      // CHECK: amdg.async_wait {{.*}} {num_inst = 3 : i32
+      %wait1 = ttg.async_wait %forwarded {num = 0 : i32}
+      scf.yield
+    }
+    tt.return
+  }
+
+  // Follow stage results on both the initial and loop-backedge token paths.
+  // CHECK-LABEL: @execute_region_loop_carried_token
+  tt.func @execute_region_loop_carried_token(%src: tensor<128x!tt.ptr<f32>, #blocked>, %buf: !ttg.memdesc<128xf32, #shared, #smem, mutable>, %n: index) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %initial = scf.execute_region -> !ttg.async.token {
+      %copy0 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %group0 = ttg.async_commit_group tokens %copy0
+      %copy1 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      scf.yield %group0 : !ttg.async.token
+    }
+    %result = scf.for %i = %c0 to %n step %c1 iter_args(%token = %initial) -> !ttg.async.token {
+      scf.execute_region {
+        %copy2 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+        scf.yield
+      }
+      // CHECK: amdg.async_wait {{.*}} {num_inst = 2 : i32
+      %wait = ttg.async_wait %token {num = 0 : i32}
+      %next = scf.execute_region -> !ttg.async.token {
+        %copy3 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+        %group1 = ttg.async_commit_group tokens %copy3
+        %copy4 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+        scf.yield %group1 : !ttg.async.token
+      }
+      scf.yield %next : !ttg.async.token
+    }
+    tt.return
+  }
+
+  // A stage may pass a token back unchanged. Traversing the resulting def-use
+  // cycle must terminate even when the loop contains no new async operations.
+  // CHECK-LABEL: @execute_region_loop_forwarding_cycle
+  tt.func @execute_region_loop_forwarding_cycle(%src: tensor<128x!tt.ptr<f32>, #blocked>, %buf: !ttg.memdesc<128xf32, #shared, #smem, mutable>, %n: index) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %copy0 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+    %group0 = ttg.async_commit_group tokens %copy0
+    %copy1 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+    %result = scf.for %i = %c0 to %n step %c1 iter_args(%token = %group0) -> !ttg.async.token {
+      // CHECK: amdg.async_wait {{.*}} {num_inst = 0 : i32
+      %wait = ttg.async_wait %token {num = 0 : i32}
+      %next = scf.execute_region -> !ttg.async.token {
+        scf.yield %token : !ttg.async.token
+      }
+      scf.yield %next : !ttg.async.token
+    }
+    tt.return
+  }
+
+  // Multi-block execute regions remain unsupported: do not assume that every
+  // block executes or that the first block has a yield for each result.
+  // CHECK-LABEL: @execute_region_multiblock_conservative
+  tt.func @execute_region_multiblock_conservative(%src: tensor<128x!tt.ptr<f32>, #blocked>, %buf: !ttg.memdesc<128xf32, #shared, #smem, mutable>, %cond: i1) {
+    %copy0 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+    %group0 = ttg.async_commit_group tokens %copy0
+    %token = scf.execute_region -> !ttg.async.token {
+      cf.cond_br %cond, ^bb1, ^bb2
+    ^bb1:
+      %copy1 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %group1 = ttg.async_commit_group tokens %copy1
+      scf.yield %group1 : !ttg.async.token
+    ^bb2:
+      scf.yield %group0 : !ttg.async.token
+    }
+    // CHECK: amdg.async_wait {{.*}} {num_inst = 0 : i32
+    %wait0 = ttg.async_wait %token {num = 0 : i32}
+    %copy2 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+    // Only the unconditional copy after the region can be counted.
+    // CHECK: amdg.async_wait {{.*}} {num_inst = 1 : i32
+    %wait1 = ttg.async_wait %group0 {num = 0 : i32}
+    tt.return
+  }
+
+  // A single-block region can forward a token from a dominating block in its
+  // enclosing region. Tracing it must fall back before scanning across blocks.
+  // CHECK-LABEL: @execute_region_multiblock_forwarded_token
+  tt.func @execute_region_multiblock_forwarded_token(%src: tensor<128x!tt.ptr<f32>, #blocked>, %buf: !ttg.memdesc<128xf32, #shared, #smem, mutable>) {
+    scf.execute_region {
+      %copy0 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %group0 = ttg.async_commit_group tokens %copy0
+      cf.br ^next
+    ^next:
+      %forwarded = scf.execute_region -> !ttg.async.token {
+        scf.yield %group0 : !ttg.async.token
+      }
+      // CHECK: amdg.async_wait {{.*}} {num_inst = 0 : i32
+      %wait0 = ttg.async_wait %forwarded {num = 0 : i32}
+      // Waiting directly on a token from another block is also conservative.
+      // CHECK: amdg.async_wait {{.*}} {num_inst = 0 : i32
+      %wait1 = ttg.async_wait %group0 {num = 0 : i32}
+
+      // Same-block scans still work within a multi-block region.
+      %copy1 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %group1 = ttg.async_commit_group tokens %copy1
+      %copy2 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      // CHECK: amdg.async_wait {{.*}} {num_inst = 1 : i32
+      %wait2 = ttg.async_wait %group1 {num = 0 : i32}
+      scf.yield
+    }
+    tt.return
+  }
+
+  // TDM token waits share the same traversal, but count only TDM instructions.
+  // CHECK-LABEL: @execute_region_tdm_tokens
+  tt.func @execute_region_tdm_tokens(%desc: !tt.tensordesc<128x16xf16>, %tdm_buf: !ttg.memdesc<128x16xf16, #tdm_shared, #smem, mutable>, %src: tensor<128x!tt.ptr<f32>, #blocked>, %buf: !ttg.memdesc<128xf32, #shared, #smem, mutable>) {
+    %tokens:2 = scf.execute_region -> (!ttg.async.token, !ttg.async.token) {
+      %tdm0 = amdg.async_tdm_copy_global_to_local %desc into %tdm_buf : !tt.tensordesc<128x16xf16> -> !ttg.memdesc<128x16xf16, #tdm_shared, #smem, mutable>
+      %tdm1 = amdg.async_tdm_copy_global_to_local %desc into %tdm_buf : !tt.tensordesc<128x16xf16> -> !ttg.memdesc<128x16xf16, #tdm_shared, #smem, mutable>
+      scf.yield %tdm0, %tdm1 : !ttg.async.token, !ttg.async.token
+    }
+    scf.execute_region {
+      %copy = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %tdm2 = amdg.async_tdm_copy_global_to_local %desc into %tdm_buf : !tt.tensordesc<128x16xf16> -> !ttg.memdesc<128x16xf16, #tdm_shared, #smem, mutable>
+      scf.yield
+    }
+    // CHECK: amdg.async_tdm_intrinsic_wait {{.*}} {count = 2 : i32
+    %wait0 = amdg.async_tdm_wait %tokens#0 {num = 0 : i32}
+    // CHECK: amdg.async_tdm_intrinsic_wait {{.*}} {count = 1 : i32
+    %wait1 = amdg.async_tdm_wait %tokens#1 {num = 0 : i32}
+    tt.return
+  }
+
+  // Each result maps to a different incoming token on each branch. Count the
+  // suffix after that token, then take the minimum across the two branches.
+  // CHECK-LABEL: @if_result_tokens
+  tt.func @if_result_tokens(%src: tensor<128x!tt.ptr<f32>, #blocked>, %buf: !ttg.memdesc<128xf32, #shared, #smem, mutable>, %cond: i1) {
+    %tokens:2 = scf.if %cond -> (!ttg.async.token, !ttg.async.token) {
+      %copy0 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %group0 = ttg.async_commit_group tokens %copy0
+      %copy1 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %group1 = ttg.async_commit_group tokens %copy1
+      scf.yield %group1, %group0 : !ttg.async.token, !ttg.async.token
+    } else {
+      %copy2 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %group2 = ttg.async_commit_group tokens %copy2
+      %copy3 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %copy4 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %group4 = ttg.async_commit_group tokens %copy4
+      scf.yield %group4, %group2 : !ttg.async.token, !ttg.async.token
+    }
+    // CHECK: amdg.async_wait {{.*}} {num_inst = 1 : i32
+    %wait0 = ttg.async_wait %tokens#1 {num = 0 : i32}
+    // CHECK: amdg.async_wait {{.*}} {num_inst = 0 : i32
+    %wait1 = ttg.async_wait %tokens#0 {num = 0 : i32}
+    tt.return
+  }
+
+  // Forwarded external tokens count the selected branch once, including copies
+  // in nested regions, and retain the common suffix after the conditional.
+  // CHECK-LABEL: @if_forwarded_token
+  tt.func @if_forwarded_token(%src: tensor<128x!tt.ptr<f32>, #blocked>, %buf: !ttg.memdesc<128xf32, #shared, #smem, mutable>, %cond: i1) {
+    %copy0 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+    %group0 = ttg.async_commit_group tokens %copy0
+    %token = scf.if %cond -> !ttg.async.token {
+      scf.execute_region {
+        %copy1 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+        scf.yield
+      }
+      scf.yield %group0 : !ttg.async.token
+    } else {
+      %copy2 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %copy3 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      scf.yield %group0 : !ttg.async.token
+    }
+    %copy4 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+    // CHECK: amdg.async_wait {{.*}} {num_inst = 2 : i32
+    %wait0 = ttg.async_wait %token {num = 0 : i32}
+    // CHECK: amdg.async_wait {{.*}} {num_inst = 2 : i32
+    %wait1 = ttg.async_wait %group0 {num = 0 : i32}
+    tt.return
+  }
+
+  // scf.condition's predicate is not a forwarded operand. The before and after
+  // regions have different argument lists, so their raw argument indices cannot
+  // be used as yield/condition operand indices.
+  // CHECK-LABEL: @while_region_token_mapping
+  tt.func @while_region_token_mapping(%src: tensor<128x!tt.ptr<f32>, #blocked>, %buf: !ttg.memdesc<128xf32, #shared, #smem, mutable>, %cond: i1) {
+    %false = arith.constant false
+    %copy0 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+    %group0 = ttg.async_commit_group tokens %copy0
+    %copy1 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+    %result = scf.while (%pred = %cond, %token = %group0) : (i1, !ttg.async.token) -> !ttg.async.token {
+      // CHECK: amdg.async_wait {{.*}} {num_inst = 1 : i32
+      %wait0 = ttg.async_wait %token {num = 0 : i32}
+      scf.condition(%pred) %token : !ttg.async.token
+    } do {
+    ^bb0(%token: !ttg.async.token):
+      %copy2 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      %group2 = ttg.async_commit_group tokens %copy2
+      %copy3 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      scf.yield %false, %group2 : i1, !ttg.async.token
+    }
+    // CHECK: amdg.async_wait {{.*}} {num_inst = 1 : i32
+    %wait1 = ttg.async_wait %result {num = 0 : i32}
+    tt.return
+  }
+
+  // Intervening cyclic region graphs fall back to zero, while known copies
+  // outside them are still counted. Static scf.for counts are tested above.
+  // CHECK-LABEL: @while_intervening_count_conservative
+  tt.func @while_intervening_count_conservative(%src: tensor<128x!tt.ptr<f32>, #blocked>, %buf: !ttg.memdesc<128xf32, #shared, #smem, mutable>, %cond: i1) {
+    %false = arith.constant false
+    %copy0 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+    %group0 = ttg.async_commit_group tokens %copy0
+    %result = scf.while (%pred = %cond) : (i1) -> i1 {
+      %copy1 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+      scf.condition(%pred) %pred : i1
+    } do {
+    ^bb0(%pred: i1):
+      scf.yield %false : i1
+    }
+    %copy2 = ttg.async_copy_global_to_local %src, %buf : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+    // CHECK: amdg.async_wait {{.*}} {num_inst = 1 : i32
+    %wait = ttg.async_wait %group0 {num = 0 : i32}
     tt.return
   }
 }

@@ -124,7 +124,8 @@ are unaffected. Mechanics:
   gated step anchors in-loop epilogue store ops — the TMA store **and** its
   `async_tma_store_token_wait` — to `epilogue_store` *before* Phase 4. The
   staging `local_alloc` stays in reduction, forming the reduction→store SMEM
-  channel.
+  channel. A TMA reduce's token wait (`isReduceTokenWait`) is not anchored: it
+  stays in the partition of its reduce.
 - **Scalar-offset fixup**: before serialization, a no-MMA gated fixpoint assigns
   each still-unannotated value-producing op (e.g. `offs = i * 64`) the union of
   its partitioned users' ids (`muli` feeding both load and store gets both).
@@ -367,6 +368,10 @@ before `propagatePartitions`):
 
 - **Epilogue store ops** → `epilogue_store` partition (when it exists), else
   follow the same routing as regular epilogue ops.
+- **TMA reduce token waits** (`isReduceTokenWait`) → the partition of the
+  reduce whose token they consume, not `epilogue_store`. A wait placed apart
+  from its reduce makes `doCodePartition` clone the reduce into the wait's
+  partition, so the value is reduced into global memory twice.
 - **Epilogue ops** (non-store) → routing depends on tuning knobs:
   - `mergeEpilogueToComputation`: → computation[dpId] directly
   - `mergeEpilogue`: → correction (if exists) → reduction → computation[dpId]

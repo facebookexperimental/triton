@@ -9,6 +9,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "llvm/Support/Debug.h"
@@ -95,7 +96,7 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
     auto tokenType = ttg::AsyncTokenType::get(ctx);
     auto tmaStore = builder.create<ttng::AsyncTMACopyLocalToGlobalOp>(
         loc, tokenType, desc, storeOp.getIndices(), alloc,
-        tt::EvictionPolicy::NORMAL);
+        /*cachePolicy=*/Attribute{});
     copyLoopScheduleAttrs(storeOp, tmaStore);
 
     // Wait for this specific TMA store to finish reading from SMEM.
@@ -195,7 +196,6 @@ struct NVGPUWSTMAStoreLoweringPass
 static constexpr const char *kCanRotateByBufferCount =
     "can_rotate_by_buffer_count";
 static constexpr const char *kCLCPersistentLoop = "ttg.clc_persistent";
-static constexpr const char *kPlannedPendingCount = "planned_pending_count";
 
 static bool isTMAStoreLikeOp(Operation *op) {
   return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(op);
@@ -302,17 +302,6 @@ static bool sameMemDescValue(Value lhs, Value rhs) {
   return true;
 }
 
-static Value findMemDescBase(Value value) {
-  while (Operation *def = value.getDefiningOp()) {
-    if (!isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp,
-             ttg::MemDescReinterpretOp, ttg::MemDescTransOp,
-             ttg::MemDescReshapeOp>(def))
-      break;
-    value = def->getOperand(0);
-  }
-  return value;
-}
-
 // Only a distinct local allocation proves two memory descriptors cannot
 // overlap. A block argument does not: two memdesc arguments of the same
 // function, or two loop iter args, may both be views of one allocation.
@@ -324,8 +313,8 @@ static bool isKnownMemDescBase(Value value) {
 }
 
 static bool memDescMayAlias(Value lhs, Value rhs) {
-  Value lhsBase = findMemDescBase(lhs);
-  Value rhsBase = findMemDescBase(rhs);
+  Value lhsBase = mlir::getMemDescRoot(lhs);
+  Value rhsBase = mlir::getMemDescRoot(rhs);
   if (lhsBase == rhsBase)
     return true;
   return !(isKnownMemDescBase(lhsBase) && isKnownMemDescBase(rhsBase));
@@ -362,7 +351,7 @@ findLocalStoreWritingBuffer(scf::ForOp forOp, Value buffer, Operation *before,
     if (&op == beforeInBody)
       break;
     auto localStore = dyn_cast<ttg::LocalStoreOp>(&op);
-    if (!localStore || !schedule.count(&op))
+    if (!localStore || !schedule.contains(&op))
       continue;
     if (!memDescMayAlias(localStore.getDst(), buffer))
       continue;
@@ -466,14 +455,14 @@ void doValidateTMAStoreAnnotations(triton::FuncOp funcOp) {
     auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
     if (!tmaOp) {
       waitOp->removeAttr(kCanRotateByBufferCount);
-      waitOp->removeAttr(kPlannedPendingCount);
+      waitOp->removeAttr(ttng::kPlannedPendingCount);
       return;
     }
 
     auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
     if (!allocOp) {
       waitOp->removeAttr(kCanRotateByBufferCount);
-      waitOp->removeAttr(kPlannedPendingCount);
+      waitOp->removeAttr(ttng::kPlannedPendingCount);
       return;
     }
   });
@@ -495,7 +484,7 @@ findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
       Operation *candidate = &*revIt;
       if (candidate == stopOp)
         return nullptr;
-      if (isa<ttng::WaitBarrierOp>(candidate) && schedule.count(candidate))
+      if (isa<ttng::WaitBarrierOp>(candidate) && schedule.contains(candidate))
         return candidate;
     }
     return nullptr;
@@ -514,7 +503,7 @@ findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
     Operation *candidate = &*revIt;
     if (isTMAStoreLikeOp(candidate))
       return nullptr;
-    if (isa<ttng::WaitBarrierOp>(candidate) && schedule.count(candidate))
+    if (isa<ttng::WaitBarrierOp>(candidate) && schedule.contains(candidate))
       return candidate;
   }
 
@@ -545,7 +534,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
   SmallVector<std::pair<scf::WhileOp, Attribute>> whileDrains;
   funcOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
     if (waitOp->hasAttr(kCanRotateByBufferCount))
-      waitOp->removeAttr(kPlannedPendingCount);
+      waitOp->removeAttr(ttng::kPlannedPendingCount);
 
     Operation *parentLoop = waitOp->getParentOfType<LoopLikeOpInterface>();
     auto whileOp = dyn_cast_or_null<scf::WhileOp>(parentLoop);
@@ -556,13 +545,10 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
     if (!whileOp)
       return;
 
-    auto rotateBy =
-        waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
+    auto rotateBy = waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
     if (!rotateBy || rotateBy.getInt() <= 0)
       return;
-    waitOp->setAttr(kPlannedPendingCount,
-                    IntegerAttr::get(IntegerType::get(funcOp.getContext(), 32),
-                                     rotateBy.getInt() - 1));
+    waitOp.trySetPlannedPendingCount(rotateBy.getInt() - 1);
     if (rotateBy.getInt() == 1)
       return;
     Attribute taskIds = waitOp->getAttr(kAsyncTaskIdAttrName);
@@ -622,6 +608,90 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
       waitOp->moveBefore(localStore);
       break;
     }
+  }
+
+  // A barrierful wait in a CLC while (separate_epilogue_store) has no planned
+  // pending count and no pipeline schedule, so it would serialize every TMA
+  // store. Rotate it in program order: just before the wait_barrier guarding
+  // the K-th later store (the earliest that can reuse its slot), or after the
+  // iteration's last store if that store is in the next iteration.
+  DenseMap<Block *, Operation *> lastTailWait;
+  for (ttng::TMAStoreTokenWaitOp waitOp : straightLineWaits) {
+    auto whileOp = dyn_cast<scf::WhileOp>(waitOp->getParentOp());
+    if (!whileOp || waitOp->getBlock() != whileOp.getAfterBody() ||
+        (waitOp.getBarriers().empty() && waitOp.getNvwsTokens().empty()))
+      continue;
+    auto rotateBy = waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
+    if (!rotateBy || rotateBy.getInt() <= 1)
+      continue;
+    Operation *tmaStore = waitOp.getToken().getDefiningOp();
+    if (!tmaStore || !isTMAStoreLikeOp(tmaStore) ||
+        tmaStore->getBlock() != waitOp->getBlock())
+      continue;
+    Block *body = waitOp->getBlock();
+    SmallVector<Operation *> stores;
+    for (Operation &op : *body)
+      if (isTMAStoreLikeOp(&op))
+        stores.push_back(&op);
+    // Nested TMA stores would be miscounted.
+    bool nestedStore = false;
+    for (Operation &op : *body)
+      if (op.getNumRegions() != 0)
+        op.walk([&](Operation *nested) {
+          if (nested != &op && isTMAStoreLikeOp(nested))
+            nestedStore = true;
+        });
+    if (nestedStore)
+      continue;
+    // The stores into one ring are a subsequence of all stores, so the K-th
+    // later store is the earliest that can reuse this slot.
+    auto *it = llvm::find(stores, tmaStore);
+    size_t idx = std::distance(stores.begin(), it);
+    size_t targetIdx = idx + rotateBy.getInt();
+    Operation *target = targetIdx < stores.size() ? stores[targetIdx] : nullptr;
+    Operation *prevStore = target ? stores[targetIdx - 1] : nullptr;
+    Operation *insertBefore = nullptr;
+    if (target) {
+      // The other partition refills a slot behind a wait_barrier between the
+      // previous store and the store reading it; releasing before the first
+      // one there is safe since the wait already covers this store.
+      for (Operation *op = prevStore->getNextNode(); op != target;
+           op = op->getNextNode()) {
+        if (isa<ttng::WaitBarrierOp>(op)) {
+          insertBefore = op;
+          break;
+        }
+      }
+      if (!insertBefore) {
+        LDBG("no wait_barrier guards the TMA store reusing the slot in CLC "
+             "loop at "
+             << whileOp.getLoc() << "; leaving TMA store wait unchanged");
+        continue;
+      }
+    } else {
+      // Keep tail waits in their original order, below their operands' defs.
+      Operation *prevTail = lastTailWait.lookup(body);
+      Operation *anchor = prevTail ? prevTail : stores.back();
+      for (Value operand : waitOp->getOperands())
+        if (Operation *def = operand.getDefiningOp())
+          if (def->getBlock() == body && anchor->isBeforeInBlock(def))
+            anchor = def;
+      insertBefore = anchor->getNextNode();
+    }
+    if (insertBefore == waitOp.getOperation()) {
+      waitOp->removeAttr(kCanRotateByBufferCount);
+      if (!target)
+        lastTailWait[body] = waitOp;
+      continue;
+    }
+    if (!insertBefore || insertBefore->isBeforeInBlock(waitOp))
+      continue;
+    if (!operandsDominate(waitOp, insertBefore))
+      continue;
+    if (!target)
+      lastTailWait[body] = waitOp;
+    waitOp->moveBefore(insertBefore);
+    waitOp->removeAttr(kCanRotateByBufferCount);
   }
 
   // CLC epilogues live directly in an scf.while rather than an scf.for. Their
@@ -691,7 +761,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
       if (!attr)
         continue;
       int k = attr.getInt();
-      waitOp->removeAttr(kPlannedPendingCount);
+      waitOp->removeAttr(ttng::kPlannedPendingCount);
 
       // Find the defining TMA store op.
       Value buffer;
@@ -700,7 +770,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
         continue;
 
       // The defining op must be in the schedule for the LinearizedIterator.
-      if (!schedule.count(tmaStore))
+      if (!schedule.contains(tmaStore))
         continue;
 
       // Walk the linearized schedule from the TMA store, counting K
@@ -832,9 +902,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
 
       if (!erasedWait) {
         waitOp->removeAttr(kCanRotateByBufferCount);
-        waitOp->setAttr(
-            kPlannedPendingCount,
-            IntegerAttr::get(IntegerType::get(funcOp.getContext(), 32), k - 1));
+        waitOp.trySetPlannedPendingCount(k - 1);
       }
       changed = true;
     }
@@ -1075,7 +1143,8 @@ computePendingsFromToken(Value token, ttng::TMAStoreTokenWaitOp waitOp,
 // pendings = number of TMA store-like ops issued after the token's defining
 // store and before this wait, in program execution order.
 static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
-  if (auto planned = waitOp->getAttrOfType<IntegerAttr>(kPlannedPendingCount))
+  if (auto planned =
+          waitOp->getAttrOfType<IntegerAttr>(ttng::kPlannedPendingCount))
     return planned.getInt();
 
   ConditionContext context = getConditionContext(waitOp);

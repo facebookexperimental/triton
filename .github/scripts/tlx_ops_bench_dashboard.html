@@ -1,0 +1,1889 @@
+<!doctype html>
+<!-- Rendered by .github/scripts/tlx_ops_bench_dashboard.py render; edit that script's template, not the output. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tlx.ops nightly performance</title>
+<style>
+.viz-root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface-1: #fcfcfb; --text-primary: #0b0b0b; --text-secondary: #52514e;
+  --muted: #898781; --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
+  --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100; --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b; --good-text: #006300;
+  --banner: var(--surface-1);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface-1: #1a1a19; --text-primary: #ffffff; --text-secondary: #c3c2b7;
+    --muted: #898781; --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500; --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767; --good-text: #0ca30c; --banner: var(--surface-1);
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface-1: #1a1a19; --text-primary: #ffffff; --text-secondary: #c3c2b7;
+  --muted: #898781; --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+  --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500; --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767; --good-text: #0ca30c; --banner: var(--surface-1);
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+.viz-root { background: var(--page); color: var(--text-primary); min-height: 100vh;
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1120px; margin: 0 auto; padding: 24px; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+h2 { font-size: 15px; margin: 0 0 2px; }
+.sub { color: var(--text-secondary); margin: 0; }
+a { color: var(--series-1); }
+.banner { background: var(--banner); border: 1px solid var(--ring); border-radius: 8px; padding: 8px 12px; margin: 16px 0;
+  color: var(--text-secondary); }
+.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 16px 0; }
+/* Same tinted, sticky filter bar as /ci/, so the filters stay in reach while scrolling. */
+.filterbar { position: sticky; top: 0; z-index: 6; padding: 8px 12px; border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--series-1) 35%, var(--ring));
+  background: color-mix(in srgb, var(--series-1) 12%, var(--page)); box-shadow: 0 2px 6px rgba(0,0,0,.08); }
+label.ctl { color: var(--text-secondary); display: flex; gap: 6px; align-items: center; }
+select, button { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--axis);
+  border-radius: 6px; padding: 4px 8px; }
+button { cursor: pointer; }
+.tabbar { display: flex; align-items: center; gap: 12px; margin: 24px 0 20px; border-bottom: 1px solid var(--grid); }
+.tablist { display: flex; gap: 24px; }
+.tablist button { border: 0; border-radius: 0; background: none; padding: 10px 0; margin-bottom: -1px;
+  border-bottom: 3px solid transparent; color: var(--text-secondary); font-weight: 600; }
+.tablist button[aria-selected="true"] { border-bottom-color: var(--series-1); color: var(--text-primary); }
+.tablist button:focus-visible { outline: 2px solid var(--series-1); outline-offset: 3px; }
+.tabbar > button { margin-left: auto; font-size: 12px; }
+[role="tabpanel"][hidden] { display: none; }
+.spacer { flex: 1; }
+.tiles { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 16px; }
+.tile { background: var(--surface-1); border: 1px solid var(--ring); border-radius: 8px; padding: 12px; }
+.tile .k { color: var(--text-secondary); font-size: 12px; }
+.tile .v { font-size: 26px; font-weight: 600; }
+.card { background: var(--surface-1); border: 1px solid var(--ring); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.card .sub { font-size: 12px; margin-bottom: 8px; }
+.overview-image { display: block; width: 100%; max-width: 1080px; height: auto; margin: 12px auto 0; background: #fff; }
+.overview-sources { margin: 8px 0; padding-left: 20px; color: var(--text-secondary); font-size: 12px; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); margin: 4px 0 8px; }
+.legend button { border: none; background: none; padding: 2px 4px; color: var(--text-secondary); display: flex; gap: 6px; align-items: center; }
+.legend button[aria-pressed="false"] { opacity: 0.4; }
+.key { width: 16px; height: 2px; display: inline-block; border-radius: 1px; }
+svg { display: block; width: 100%; overflow: visible; }
+svg text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+svg .direct { fill: var(--text-secondary); font-size: 12px; }
+.chart { position: relative; }
+/* The trend keeps a fixed width per night and scrolls sideways past that, with its y axis pinned over the left edge. */
+.chart .scroll { overflow-x: auto; overflow-y: hidden; }
+.chart .yaxis { position: absolute; left: 0; top: 0; pointer-events: none; }
+.tip { position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--ring);
+  border-radius: 6px; padding: 8px 10px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); font-size: 12px; display: none; min-width: 180px; z-index: 5; }
+.tip .h { color: var(--text-secondary); margin-bottom: 4px; }
+.tip .r { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.tip .r b { font-variant-numeric: tabular-nums; }
+.tip .nm { color: var(--text-secondary); display: flex; gap: 6px; align-items: center; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+th { color: var(--text-secondary); font-weight: 600; cursor: pointer; user-select: none; white-space: nowrap; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.st { display: inline-flex; gap: 4px; align-items: center; font-weight: 600; white-space: nowrap; }
+.st i { font-style: normal; display: inline-block; width: 16px; height: 16px; border-radius: 50%; color: #fff;
+  font-size: 11px; line-height: 16px; text-align: center; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chips button[aria-pressed="true"] { border-color: var(--text-primary); }
+.more { margin-top: 8px; }
+.note { color: var(--muted); font-size: 12px; }
+.fold summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px; }
+.fold summary::-webkit-details-marker { display: none; }
+.fold summary::before { content: "▸"; color: var(--muted); font-size: 12px; transition: transform 0.15s; }
+.fold[open] summary::before { transform: rotate(90deg); }
+.fold summary h2 { margin: 0; }
+.fold[open] summary { margin-bottom: 6px; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 8px 0 12px; }
+.kv dt { color: var(--text-secondary); }
+.kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+.step { margin: 12px 0; }
+.step h3 { font-size: 13px; margin: 0 0 4px; }
+.step p { margin: 0 0 6px; color: var(--text-secondary); font-size: 13px; }
+.code { position: relative; }
+.code pre { background: var(--page); border: 1px solid var(--ring); border-radius: 6px; padding: 10px 12px; margin: 0;
+  overflow-x: auto; white-space: pre; }
+.code button { position: absolute; top: 6px; right: 6px; font-size: 12px; padding: 2px 8px; }
+.inputs { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 8px 0 10px; padding: 6px 10px;
+  background: var(--page); border: 1px solid var(--ring); border-radius: 6px; font-size: 13px; }
+.inputs .fixed { color: var(--muted); font-size: 12px; }
+@media (max-width: 800px) { .tiles { grid-template-columns: repeat(3, 1fr); } }
+.ev-open .ev-dim { color: var(--text-secondary); font-size: 12.5px; }
+.ev-op .ev-col { border-left: 1px solid var(--grid); padding-left: 10px; }
+.ev-op tr.ev-units th { text-align: center; font-size: 11.5px; color: var(--text-secondary); padding-bottom: 0; border-bottom: 0; }
+.ev-op tr.ev-units th:first-child { border-left: 0; }
+.ev-op tr.ev-grp td { padding-top: 10px; border-bottom: 1px solid var(--grid); font-size: 12px; white-space: normal; }
+.ev-op tr.ev-grp .ev-dim { margin-left: 4px; }
+.ev-delta { font-size: 11.5px; margin-left: 6px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.ev-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.ev-g { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 18px; padding: 0 5px; border-radius: 4px;
+  font-size: 11.5px; font-weight: 600; font-style: normal; white-space: nowrap; border: 1px solid transparent; }
+.ev-g.ev-bad { background: var(--critical); color: #fff; }
+.ev-g.ev-good { background: var(--good); color: #fff; }
+.ev-g.ev-env { color: var(--warning); border-color: var(--warning); background: var(--surface-1); }
+.ev-g.ev-suite { background: var(--series-7); color: #fff; }
+.ev-g.ev-unc.ev-bad { background: var(--surface-1); color: var(--critical); border: 1.5px dashed var(--critical); }
+.ev-g.ev-unc.ev-good { background: var(--surface-1); color: var(--good); border: 1.5px dashed var(--good); }
+.chart svg :focus { outline: none; }
+.chart svg :focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+.ev-legend { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--text-secondary); margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--grid); }
+.ev-legend span { display: inline-flex; gap: 5px; align-items: center; }
+#ev-card { padding: 0; overflow: hidden; }
+#ev-card > h2, #ev-card > p { padding: 0 16px; } #ev-card > h2 { padding-top: 14px; } #ev-card > p { padding-bottom: 12px; }
+.ev-ch { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; padding: 12px 16px; border-bottom: 1px solid var(--grid); }
+.ev-ch h2 { margin: 0; }
+.ev-sec { display: grid; grid-template-columns: 110px 1fr; gap: 12px; padding: 10px 16px; border-top: 1px solid var(--grid); font-size: 13px; }
+.ev-sec:first-of-type { border-top: 0; }
+.ev-h { color: var(--text-secondary); font-weight: 600; font-size: 12.5px; }
+.ev-op { margin-bottom: 12px; } .ev-op:last-child { margin-bottom: 0; }
+.ev-oph { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+.ev-pill { font-size: 11.5px; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--axis); color: var(--text-secondary); }
+.ev-pill.ev-host { border-color: var(--warning); }
+.ev-pill.ev-uncp { border-style: dashed; }
+.ev-op table { font-size: 12.5px; } .ev-op th, .ev-op td { padding: 3px 8px 3px 0; cursor: default; white-space: nowrap; }
+.ev-badt { color: var(--critical); } .ev-goodt { color: var(--good-text); }
+.ev-op summary { cursor: pointer; color: var(--series-1); font-size: 12.5px; margin: 2px 0 4px; }
+.ev-sus { display: grid; grid-template-columns: 18px 130px 92px 1fr; gap: 6px; padding: 2px 0; align-items: baseline; }
+.ev-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.ev-area { font-size: 11px; padding: 0 6px; border-radius: 3px; border: 1px solid var(--axis); color: var(--text-secondary); justify-self: start; }
+.ev-a-dispatch, .ev-a-harness { border-color: var(--warning); }
+.ev-a-kernel, .ev-a-shapes { border-color: var(--critical); color: var(--critical); }
+/* Episodes: one card per op·GPU·direction, holding the episodes that began on one night. */
+.ep-tiles { grid-template-columns: repeat(3, 1fr); }
+button.tile { display: block; width: 100%; text-align: left; cursor: pointer; }
+button.tile[aria-pressed="true"] { border-color: var(--series-1); box-shadow: inset 0 0 0 1px var(--series-1); }
+.ep-in input { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--axis);
+  border-radius: 6px; padding: 4px 8px; min-width: 180px; }
+.ep-sec { margin: 0 0 28px; }
+.ep-sec > h2 { font-size: 17px; }
+.ep-sec > p.sub { font-size: 12.5px; margin-bottom: 10px; }
+.ep-card { background: var(--surface-1); border: 1px solid var(--ring); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+.ep-cardh { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.ep-cardh b { font-size: 14px; }
+.ep-ep { display: flex; gap: 14px; align-items: flex-start; border-top: 1px solid var(--grid); margin-top: 10px; padding-top: 10px; }
+.ep-card > .ep-ep:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
+.ep-main { flex: 1; min-width: 0; }
+.ep-hd { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.ep-plot { width: 250px; flex: none; }
+.ep-plot .note { font-size: 11px; margin: 2px 0 0; }
+@media (max-width: 800px) { .ep-ep { flex-wrap: wrap; } .ep-plot { width: 100%; }
+  .ep-tiles { grid-template-columns: repeat(3, 1fr); gap: 6px; } .ep-tile { padding: 8px; }
+  .ep-tile .k { font-size: 11px; } .ep-tile .v { font-size: 22px; } }
+.ep-b { display: inline-flex; align-items: center; font-size: 11.5px; font-weight: 600; padding: 1px 8px; border-radius: 10px;
+  border: 1px solid transparent; white-space: nowrap; }
+.ep-b-reg { background: var(--critical); color: #fff; }
+.ep-b-lift { background: var(--good); color: #fff; }
+.ep-b-rec { background: var(--surface-1); color: var(--series-1); border-color: var(--series-1); }
+.ep-b-warn { background: var(--surface-1); color: var(--text-secondary); border-color: var(--warning); }
+.ep-b-unc { background: var(--surface-1); color: var(--text-secondary); border-color: var(--axis); border-style: dashed; }
+.ep-dim { color: var(--text-secondary); font-size: 12.5px; }
+.ep-tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 8px 0 4px; }
+.ep-det summary { cursor: pointer; color: var(--series-1); font-size: 12.5px; margin-top: 8px; }
+.ep-det table { font-size: 12.5px; }
+.ep-det th, .ep-det td { padding: 3px 8px 3px 0; white-space: nowrap; }
+.ep-det td.ep-case { white-space: normal; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.ep-pager { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; font-size: 12.5px; color: var(--text-secondary); }
+.ep-pager button[disabled] { opacity: 0.45; cursor: default; }
+.ep-op-summary { display: flex; align-items: center; justify-content: space-between; gap: 14px; cursor: pointer; list-style: none; }
+.ep-op-summary::-webkit-details-marker { display: none; }
+.ep-op-summary > div:first-child { min-width: 0; }
+.ep-expand { color: var(--series-1); font-size: 12px; }
+.ep-expand::before { content: "▸ "; }
+.ep-card[open] > summary .ep-expand::before { content: "▾ "; }
+.ep-table-scroll { overflow-x: auto; }
+.ep-sort-button { border: 0; background: none; padding: 0; color: var(--text-secondary); font-weight: 600; }
+.ep-sort-button:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+@media (max-width: 800px) { .ep-op-summary { flex-wrap: wrap; } }
+</style>
+</head>
+<body>
+<div class="viz-root">
+<main>
+  <h1>tlx.ops performance</h1>
+  <p class="sub">TLX kernels compared with each operation's reference.
+    <a href="../">FBTriton site</a></p>
+  <div class="tabbar">
+    <div class="tablist" role="tablist" aria-label="Performance views">
+      <button id="tab-overview" type="button" role="tab" aria-selected="true" aria-controls="overview" tabindex="0">Overview</button>
+      <button id="tab-trending" type="button" role="tab" aria-selected="false" aria-controls="trending" tabindex="-1">Trending</button>
+      <button id="tab-episodes" type="button" role="tab" aria-selected="false" aria-controls="episodes" tabindex="-1">Episodes</button>
+    </div>
+    <button id="theme" type="button">Toggle theme</button>
+  </div>
+
+  <section class="card" id="overview" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
+    <h2 id="overview-title">Latest measured performance</h2>
+    <p class="sub">Each platform's latest published benchmark results, grouped by operation and direction. Geometric means include noisy measurements and exclude errors or missing references.
+      <a href="tlx_ops_bench_overview.svg" target="_blank" rel="noopener">Open full-size diagram</a></p>
+    <ul class="overview-sources" id="overview-sources"></ul>
+    <a href="tlx_ops_bench_overview.svg" target="_blank" rel="noopener">
+      <img class="overview-image" src="tlx_ops_bench_overview.svg"
+        alt="Latest published TLX performance by platform, operation and direction, with references, compared case counts and geometric mean speedups.">
+    </a>
+  </section>
+
+  <section id="trending" role="tabpanel" aria-labelledby="tab-trending" tabindex="0" hidden>
+  <p class="sub">Nightly performance on the fbtriton wheel. A case under 0.9× is PIP.</p>
+  <div class="banner" id="banner"></div>
+  <div id="trending-content">
+  <div class="row filterbar" role="group" aria-label="Filters">
+    <label class="ctl">Nights <select id="range"><option value="7">Last 7</option><option value="14">Last 14</option>
+      <option value="30" selected>Last 30</option><option value="60">Last 60</option></select></label>
+    <label class="ctl">Platform <select id="platform"></select></label>
+    <label class="ctl">Op <select id="op"></select></label>
+    <label class="ctl">Direction <select id="dir"><option value="all">fwd + bwd</option><option value="fwd">fwd</option>
+      <option value="bwd">bwd</option></select></label>
+    <label class="ctl">Dtype <select id="dtype"></select></label>
+    <label class="ctl">Group by <select id="group"></select></label>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section class="card">
+    <h2 id="trend-title"></h2>
+    <p class="sub" id="trend-sub"></p>
+    <div class="inputs-slot"></div>
+    <div class="legend" id="trend-legend"></div>
+    <div class="chart" id="trend"><div class="tip"></div></div>
+    <div class="ev-legend" id="ev-legend">
+      <span><i class="ev-g ev-bad">▼3</i> slower</span><span><i class="ev-g ev-good">▲2</i> faster</span>
+      <span><i class="ev-g ev-bad ev-unc">▼3</i> unconfirmed · awaits next night</span>
+      <span><i class="ev-g ev-env">◆</i> environment</span><span><i class="ev-g ev-suite">▦</i> suite changed</span>
+      <span><svg width="22" height="6" style="display:inline;width:22px"><line x1="0" x2="22" y1="3" y2="3" stroke="var(--text-secondary)" stroke-width="2" stroke-dasharray="5 4"/></svg> step across a suite change</span></div>
+  </section>
+
+  <section class="card" id="ev-card"></section>
+
+  <section class="card">
+    <h2 id="dist-title"></h2>
+    <p class="sub" id="dist-sub"></p>
+    <div class="inputs-slot"></div>
+    <div class="chart" id="dist"><div class="tip"></div></div>
+  </section>
+
+  <section class="card" id="cases-card">
+    <h2 id="cases-title"></h2>
+    <p class="sub" id="cases-sub"></p>
+    <div class="inputs-slot"></div>
+    <div class="row" style="margin: 4px 0 8px"><div class="legend" id="cases-legend" style="margin: 0"></div><span class="spacer"></span>
+      <label class="ctl">Sort by <select id="cases-sort"><option value="r">reference TF/s</option><option value="t">TLX TF/s</option>
+        <option value="x">speedup</option><option value="in">input</option></select></label></div>
+    <div class="chart" id="cases"><div class="tip"></div></div>
+  </section>
+
+  <section class="card">
+    <h2 id="summary-title"></h2>
+    <p class="sub" id="summary-sub"></p>
+    <div class="inputs-slot"></div>
+    <div id="summary"></div>
+  </section>
+
+  <section class="card">
+    <h2 id="table-title"></h2>
+    <div class="inputs-slot"></div>
+    <div class="row" style="margin: 8px 0"><div class="chips" id="chips"></div></div>
+    <div id="table"></div>
+  </section>
+
+  <details class="card fold">
+    <summary><h2>Version info</h2></summary>
+    <p class="sub" id="ver-sub"></p>
+    <dl class="kv" id="ver-kv"></dl>
+    <div id="ver-ops"></div>
+  </details>
+
+  <details class="card fold">
+    <summary><h2>Run it yourself</h2></summary>
+    <p class="sub" id="howto-sub"></p>
+    <div id="howto"></div>
+  </details>
+  </div>
+  </section>
+
+  <section id="episodes" role="tabpanel" aria-labelledby="tab-episodes" tabindex="0" hidden>
+  <p class="sub">Sustained movements of a case against its own baseline, across every GPU and op.</p>
+  <div class="banner" id="ep-banner"></div>
+  <div id="ep-content">
+  <div class="row filterbar" role="group" aria-label="Episode filters">
+    <label class="ctl">Nights <select id="ep-range"><option value="7">Last 7</option><option value="14">Last 14</option>
+      <option value="30" selected>Last 30</option><option value="60">Last 60</option></select></label>
+    <label class="ctl">GPU <select id="ep-gpu"></select></label>
+    <label class="ctl">Op <select id="ep-op"></select></label>
+    <label class="ctl">Direction <select id="ep-dir"><option value="all">fwd + bwd</option><option value="fwd">fwd</option>
+      <option value="bwd">bwd</option></select></label>
+    <label class="ctl">Dtype <select id="ep-dtype"></select></label>
+    <label class="ctl">Sort <select id="ep-sort"><option value="date">onset date</option><option value="mag">magnitude</option>
+      <option value="dur">duration</option></select></label>
+    <label class="ctl ep-in">Search <input id="ep-q" type="search" placeholder="op, GPU, input"></label>
+    <span class="spacer"></span>
+    <button id="ep-clear" type="button">Clear</button>
+  </div>
+
+  <div class="tiles ep-tiles" id="ep-tiles"></div>
+  <div id="ep-sections"></div>
+  </div>
+  </section>
+</main>
+</div>
+<script>
+(() => {
+  const FLOOR = 0.9;
+  const PLATFORMS = [["b200", "B200"], ["h100", "H100"], ["mi350", "MI350"]];
+
+  const RAW = /*__DATA__*/null;
+  const STATUS_OF = {o: "ok", n: "noisy", p: "pip", e: "error"};
+  // Expand the compact data (see page_data() in tlx_ops_bench_dashboard.py) into per-night case lists.
+  function decode(raw) {
+    const platforms = {};
+    let date = null;
+    for (const [name, p] of Object.entries((raw && raw.platforms) || {})) {
+      const describe = (op, i) => {
+        const [params, d, dt] = p.ops[op].cases[i];
+        return {p: params, l: Object.entries(params).map(([k, v]) => `${k}=${v}`).join(" "), d, dt};
+      };
+      const history = p.nights.map((night) => ({date: night.date, ops: Object.fromEntries(Object.keys(p.ops).map((op) =>
+        [op, {cases: (night.ops[op] || []).flatMap((cell, i) => (cell
+          ? [{...describe(op, i), s: STATUS_OF[cell[0]], x: cell[1], t: cell[2], r: cell[3], n: cell[4] || ""}] : []))}]))}));
+      const last = history[history.length - 1];
+      platforms[name] = {...p, history, latest: Object.fromEntries(Object.entries(p.ops).map(([op, o]) =>
+        [op, {ref: o.ref, space: o.space, cold: o.cold, reason: o.reason, cases: last.ops[op].cases}]))};
+      if (!date || last.date > date) date = last.date;
+    }
+    return {platforms, date, repo: (raw && raw.repo) || "facebookexperimental/triton", tag: (raw && raw.tag) || "tlx-ops-bench",
+            threshold: raw && raw.threshold};
+  }
+  const DATA = decode(RAW);
+  const BENCH = {
+    mm: "bench_mm.py", addmm: "bench_addmm.py", flash_attn: "bench_flash_attn.py", flash_attn_mxfp8: "bench_flash_attn_mxfp8.py",
+    hstu_attn_dev: "bench_hstu_attn.py", kimi_delta_attention: "bench_kda.py", kda_paged_prefill: "bench_kda_prefill.py",
+    kda_recurrent_decode: "bench_kda_decode.py",
+  };
+  const REPO = `https://github.com/${DATA.repo}`;
+  const [OWNER, NAME] = DATA.repo.split("/");
+  const STATUS = {
+    ok: {label: "ok", icon: "✓", color: "var(--good)"},
+    noisy: {label: "noisy", icon: "~", color: "var(--warning)"},
+    pip: {label: "PIP", icon: "▼", color: "var(--serious)"},
+    error: {label: "ERROR", icon: "✕", color: "var(--critical)"},
+  };
+  const state = {tab: "overview", platform: PLATFORMS.map(([k]) => k).find((k) => DATA.platforms[k]) || Object.keys(DATA.platforms)[0], op: "all", dir: "all", dtype: "all", inputs: {}, group: "op", range: 30, trendScroll: null, hidden: new Set(), statuses: new Set(Object.keys(STATUS)),
+                 sort: {key: null, dir: 1}, sortSum: {key: null, dir: 1}, rows: 50, ev: null, casesSort: "r",
+                 ep: {range: 30, gpu: "all", op: "all", dir: "all", dtype: "all", q: "", sort: "date", sec: null,
+                      page: {reg: 1, lift: 1, rec: 1}, open: new Set(), det: {}, cards: {}}};
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, attrs = {}, text) => {
+    const n = document.createElementNS(tag === "svg" || attrs.svg ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml", tag);
+    for (const [k, v] of Object.entries(attrs)) if (k !== "svg") n.setAttribute(k, v);
+    if (text !== undefined) n.textContent = text;
+    return n;
+  };
+  const s = (tag, attrs) => el(tag, {...attrs, svg: true});
+  const fmt = (v, d = 3, suf = "") => (v === null || v === undefined ? "–" : v.toFixed(d) + suf);
+  const fmtTf = (v) => fmt(v, v < 10 ? 3 : 0);
+  const fmtDate = (d) => `${d.slice(4, 6)}/${d.slice(6)}`;
+  // Round tick step near raw: 1, 2, 2.5 or 5 times a power of ten.
+  const niceStep = (raw) => { const mag = 10 ** Math.floor(Math.log10(raw)); return mag * [1, 2, 2.5, 5, 10].find((f) => f * mag >= raw); };
+  const geomean = (xs) => { xs = xs.filter((x) => x > 0); return xs.length ? Math.exp(xs.reduce((a, x) => a + Math.log(x), 0) / xs.length) : null; };
+
+  const plat = () => DATA.platforms[state.platform];
+  // Color follows the op, never its rank: fixed by the op's position among ops with a reference.
+  const speedupOps = () => Object.keys(plat().latest).filter((n) => plat().latest[n].ref);
+  // Input filters only exist with one op selected: each op has its own parameters.
+  const matches = (c) => (state.dir === "all" || c.d === state.dir) && (state.dtype === "all" || c.dt === state.dtype)
+    && (state.op === "all" || Object.entries(state.inputs).every(([k, v]) => c.p[k] === v));
+  // Geomeans over the cases the direction and dtype filters keep; errored cases have no trustworthy timing.
+  function aggOf(cases) {
+    const kept = cases.filter(matches), timed = kept.filter((c) => c.s !== "error");
+    return {n: kept.length, speedup: geomean(timed.filter((c) => c.x).map((c) => c.x)), tflops: geomean(timed.map((c) => c.t))};
+  }
+  const hasReference = (cases) => cases.some((c) => matches(c) && c.s !== "error" && c.x > 0);
+  const sliceName = () => [state.dir !== "all" ? state.dir : "", state.dtype !== "all" ? state.dtype : "",
+    ...(state.op === "all" ? [] : Object.entries(state.inputs).map(([k, v]) => `${k}=${v}`))].filter(Boolean).join(" · ");
+  const colorOf = (op) => `var(--series-${Math.max(0, speedupOps().indexOf(op)) + 1})`;
+
+  // ---- group by: the trend, the latest-night bars and the summary table split the slice by one key.
+  const OTHER = "other", MAX_GROUPS = 8;
+  const groupLabel = (g = state.group) => ({op: "op", none: "op", dir: "direction", dtype: "dtype"})[g] || g.slice(3);
+  const byValue = (a, b) => (isNaN(a) || isNaN(b) ? String(a).localeCompare(String(b)) : a - b);
+  const scopeOps = () => (state.op === "all" ? Object.keys(plat().latest) : [state.op]);
+  function groupOptions() {
+    if (state.op === "all") return ["op", "dir", "dtype"];
+    const cases = plat().latest[state.op].cases;
+    const keys = [...new Set(cases.flatMap((c) => Object.keys(c.p)))].filter((k) => new Set(cases.map((c) => c.p[k])).size > 1);
+    return ["none", "dir", "dtype", ...keys.map((k) => `in.${k}`)];
+  }
+  function groupOf(c, op) {
+    const g = state.group;
+    return g === "op" || g === "none" ? op : g === "dir" ? c.d : g === "dtype" ? c.dt : c.p[g.slice(3)];
+  }
+  // Groups in a fixed order (ops in catalog order, values sorted), from the unfiltered latest night, so a group keeps
+  // its color while the filters change. Past MAX_GROUPS the smallest share one "other" series.
+  function groupList(withoutRef = false) {
+    const L = plat().latest;
+    if (state.group === "op" || state.group === "none") return state.op !== "all" ? [state.op] : withoutRef ? Object.keys(L) : speedupOps();
+    const all = [...new Set(scopeOps().flatMap((op) => L[op].cases.map((c) => groupOf(c, op))))].filter((v) => v !== undefined).sort(byValue);
+    if (all.length <= MAX_GROUPS) return all;
+    const size = (v) => scopeOps().reduce((n, op) => n + L[op].cases.filter((c) => groupOf(c, op) === v).length, 0);
+    const keep = new Set([...all].sort((a, b) => size(b) - size(a)).slice(0, MAX_GROUPS - 1));
+    return [...all.filter((v) => keep.has(v)), OTHER];
+  }
+  // One night's cases in group g (filters are applied by aggOf / matches, not here).
+  function groupCases(ops, g, groups) {
+    return scopeOps().flatMap((op) => (ops[op] ? ops[op].cases : []).filter((c) => {
+      const v = groupOf(c, op);
+      return g === OTHER ? !groups.includes(v) : v === g;
+    }));
+  }
+  const groupName = (g) => (g === OTHER ? "other" : state.group.startsWith("in.") ? `${state.group.slice(3)}=${g}` : g);
+  const colorOfGroup = (g, groups) => (g === OTHER ? "var(--muted)"
+    : state.group === "op" || state.group === "none" ? colorOf(g) : `var(--series-${groups.indexOf(g) + 1})`);
+
+  function statusBadge(st) {
+    const m = STATUS[st];
+    const span = el("span", {class: "st"});
+    const i = el("i", {"aria-hidden": "true"}, m.icon);
+    i.style.background = m.color;
+    span.append(i, document.createTextNode(m.label));
+    return span;
+  }
+
+  function banner() {
+    const b = $("banner");
+    b.textContent = "";
+    const link = (href, text) => { const a = el("a", {href}, text); return a; };
+    const p = plat();
+    b.append(document.createTextNode(`Latest: fbtriton ${p.version} on ${state.platform.toUpperCase()}. Produced by the `),
+             link(`${REPO}/actions/workflows/nightly-tlx-ops-bench.yml`, "Nightly TLX.ops Bench"),
+             document.createTextNode(" workflow; per-night summaries are on the "),
+             link(`${REPO}/releases/tag/${DATA.tag}`, DATA.tag), document.createTextNode(" release."));
+    for (const op of scopeOps()) {
+      const reason = p.latest[op].reason;
+      if (reason) b.append(el("p", {class: "note"}, `${op}: no benchmark data. ${reason}.`));
+    }
+  }
+
+  function controls() {
+    const ps = $("platform");
+    ps.textContent = "";
+    for (const [k, v] of PLATFORMS) {
+      const o = el("option", {value: k}, DATA.platforms[k] ? v : `${v} (no data)`);
+      if (!DATA.platforms[k]) o.disabled = true;
+      ps.append(o);
+    }
+    ps.value = state.platform;
+    // Filters carry across platform and op switches; drop only the ones the new view cannot apply.
+    if (state.op !== "all" && !plat().latest[state.op]) state.op = "all";
+    const cases = state.op === "all" ? [] : plat().latest[state.op].cases;
+    for (const [k, v] of Object.entries(state.inputs)) {
+      const vals = new Set(cases.map((c) => c.p[k]));
+      if (vals.size < 2 || !vals.has(v)) delete state.inputs[k];
+    }
+    if (state.ev && !(plat().events && evNight(state.ev))) state.ev = null;
+    const os = $("op");
+    os.textContent = "";
+    os.append(el("option", {value: "all"}, "All ops"));
+    for (const [n, o] of Object.entries(plat().latest)) os.append(el("option", {value: n}, o.reason ? `${n} (no data)` : n));
+    os.value = state.op;
+    const dts = [...new Set(scopeOps().flatMap((n) => plat().latest[n].cases.map((c) => c.dt)))].sort();
+    if (state.dtype !== "all" && !dts.includes(state.dtype)) state.dtype = "all";
+    const ds = $("dtype");
+    ds.textContent = "";
+    ds.append(el("option", {value: "all"}, "all"));
+    for (const d of dts) ds.append(el("option", {value: d}, d));
+    ds.value = state.dtype;
+    if (state.dir !== "all" && !scopeOps().some((n) => plat().latest[n].cases.some((c) => c.d === state.dir))) state.dir = "all";
+    $("dir").value = state.dir;
+    const opts = groupOptions();
+    if (!opts.includes(state.group)) state.group = opts[0];
+    const gs = $("group");
+    gs.textContent = "";
+    for (const g of opts) gs.append(el("option", {value: g}, g === "none" ? "none" : groupLabel(g)));
+    gs.value = state.group;
+  }
+
+  function latestCases() {
+    const L = plat().latest;
+    return (state.op === "all" ? Object.keys(L) : [state.op]).flatMap((n) => L[n].cases.filter(matches).map((c) => ({...c, op: n})));
+  }
+
+  function inputBar() {
+    const bar = el("div", {class: "inputs", role: "group", "aria-label": "Input filters"});
+    const cases = plat().latest[state.op].cases;
+    const keys = [...new Set(cases.flatMap((c) => Object.keys(c.p)))];
+    const values = (k) => [...new Set(cases.map((c) => c.p[k]))].sort((a, b) => (isNaN(a) || isNaN(b) ? a.localeCompare(b) : a - b));
+    const varying = keys.filter((k) => values(k).length > 1);
+    bar.append(el("span", {class: "ctl"}, "Inputs"));
+    for (const k of varying) {
+      const lab = el("label", {class: "ctl"}, k + " ");
+      const sel = el("select");
+      sel.append(el("option", {value: ""}, "all"));
+      for (const v of values(k)) sel.append(el("option", {value: v}, v));
+      sel.value = state.inputs[k] ?? "";
+      sel.onchange = () => { if (sel.value) state.inputs[k] = sel.value; else delete state.inputs[k]; state.rows = 50; render(); };
+      lab.append(sel);
+      bar.append(lab);
+    }
+    const fixed = keys.filter((k) => !varying.includes(k));
+    if (fixed.length) bar.append(el("span", {class: "fixed"}, "fixed: " + fixed.map((k) => `${k}=${values(k)[0]}`).join(" ")));
+    if (Object.keys(state.inputs).length) {
+      const b = el("button", {type: "button"}, "Clear");
+      b.onclick = () => { state.inputs = {}; render(); };
+      bar.append(el("span", {class: "spacer"}), b);
+    }
+    return bar;
+  }
+
+  // Every chart and table carries the same input controls, so the slice is visible next to the numbers it shapes.
+  function inputs() {
+    for (const slot of document.querySelectorAll(".inputs-slot")) {
+      slot.textContent = "";
+      if (state.op !== "all") slot.append(inputBar());
+    }
+  }
+
+  function tiles() {
+    const cs = latestCases();
+    const count = (st) => cs.filter((c) => c.s === st).length;
+    const sp = state.op === "all" ? geomean(cs.filter((c) => c.s !== "error" && c.x).map((c) => c.x))
+                                  : aggOf(plat().latest[state.op].cases).speedup;
+    const t = $("tiles");
+    t.textContent = "";
+    const add = (k, v, st) => {
+      const d = el("div", {class: "tile"});
+      const kk = el("div", {class: "k"});
+      if (st) kk.append(statusBadge(st)); else kk.textContent = k;
+      d.append(kk, el("div", {class: "v"}, v));
+      t.append(d);
+    };
+    // Count changes vs the previous night, over the same slice.
+    const H = plat().history;
+    const before = H.length > 1 ? scopeOps().flatMap((n) => (H[H.length - 2].ops[n] || {cases: []}).cases.filter(matches)) : null;
+    const change = (k, now, prev) => {
+      if (before === null) return;
+      const diff = now - prev;
+      const d = el("div", {class: "k"}, diff ? `${diff > 0 ? "+" : "−"}${Math.abs(diff)} vs previous night` : "no change vs previous night");
+      if (diff && (EV_UP_GOOD[k] || EV_UP_BAD[k])) d.style.color = (diff > 0) === !!EV_UP_GOOD[k] ? "var(--good-text)" : "var(--critical)";
+      t.lastChild.append(d);
+    };
+    add("Cases (latest night)", String(cs.length));
+    change("cases", cs.length, before && before.length);
+    for (const st of Object.keys(STATUS)) {
+      add("", String(count(st)), st);
+      change(st, count(st), before && before.filter((c) => c.s === st).length);
+    }
+    add("Geomean speedup", sp ? sp.toFixed(3) + "×" : "–");
+    // Night-over-night change, for a single op (the all-ops figure mixes ops of very different size).
+    if (state.op !== "all" && sp && H.length > 1) {
+      const prev = aggOf(H[H.length - 2].ops[state.op].cases).speedup;
+      if (prev) {
+        const pct = (sp / prev - 1) * 100;
+        const d = el("div", {class: "k"}, `${pct >= 0 ? "▲" : "▼"} ${Math.abs(pct).toFixed(1)}% vs previous night`);
+        d.style.color = pct >= 0 ? "var(--good-text)" : "var(--critical)";
+        t.lastChild.append(d);
+      }
+    }
+  }
+
+  // ---- trend: one line per op, crosshair tooltip listing every series at the hovered night.
+  function trend() {
+    const box = $("trend"), tip = box.querySelector(".tip");
+    box.querySelectorAll(".scroll, .yaxis, .note").forEach((n) => n.remove());
+    const H = plat().history.slice(-state.range);
+    const single = state.op !== "all";
+    const byTflops = single && !H.some((n) => hasReference(n.ops[state.op].cases));
+    const metric = byTflops ? "tflops" : "speedup";
+    // Per-night aggregates for each group of this slice; a group with nothing in the slice has no line.
+    const groups = groupList();
+    const val = (n, g) => aggOf(groupCases(n.ops, g, groups))[metric];
+    const ops = groups.filter((g) => H.some((n) => val(n, g)));
+    const by = state.group === "op" || state.group === "none" ? "" : `, by ${groupLabel()}`;
+    $("trend-title").textContent = (byTflops ? `${state.op}: TLX TFLOP/s per night` : "Geomean speedup per night") + by;
+    const unavailable = single && plat().latest[state.op].reason;
+    $("trend-sub").textContent = unavailable ? "No benchmark measurements were recorded."
+      : byTflops ? "These cases have no reference, so throughput is the number to track."
+                : "Solid line: parity with the reference. Dashed line: the 0.9× PIP floor.";
+    const legend = $("trend-legend");
+    legend.textContent = "";
+    if (ops.length > 1) {
+      for (const op of ops) {
+        const b = el("button", {type: "button", "aria-pressed": String(!state.hidden.has(op))});
+        const k = el("span", {class: "key"}); k.style.background = colorOfGroup(op, groups);
+        b.append(k, document.createTextNode(groupName(op)));
+        b.onclick = () => { state.hidden.has(op) ? state.hidden.delete(op) : state.hidden.add(op); render(); };
+        legend.append(b);
+      }
+    }
+    const shown = ops.filter((o) => !state.hidden.has(o));
+    if (!shown.length) {
+      box.prepend(el("p", {class: "note"}, ops.length ? "Every series is hidden; click one in the legend." : `No cases match ${sliceName()}.`));
+      return;
+    }
+    // Past ~20 nights the plot widens instead of squeezing, at the same scale as W0: each night gets at least 44
+    // viewBox units, or more when its event badges need it, so neighbouring nights' badges never overlap.
+    const W0 = 1040, NIGHT_W = Math.max(44, evWidest(H) + 12), Hh = 260, m = {l: 48, r: 150, t: 12, b: 28};
+    const W = Math.max(W0, m.l + m.r + NIGHT_W * (H.length - 1));
+    const vals = shown.flatMap((o) => H.map((n) => val(n, o))).filter((v) => v);
+    let lo = Math.min(...vals), hi = Math.max(...vals);
+    if (!byTflops) { lo = Math.min(lo, 0.8); hi = Math.max(hi, 1.05); }
+    else if (lo === hi) lo = 0;
+    const step = niceStep((hi - lo) / 4 || 1);
+    lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step;
+    const x = (i) => m.l + (W - m.l - m.r) * (i / Math.max(H.length - 1, 1));
+    const y = (v) => m.t + (Hh - m.t - m.b) * (hi - v) / (hi - lo);
+    const svg = s("svg", {viewBox: `0 0 ${W} ${Hh}`, role: "img", "aria-label": $("trend-title").textContent});
+    svg.style.width = `${W / W0 * 100}%`;
+    // Tick labels live in their own svg over the left edge, so they stay put while the plot scrolls under them.
+    const yaxis = s("svg", {class: "yaxis", viewBox: `0 0 ${m.l} ${Hh - m.b + 6}`, "aria-hidden": "true"});
+    yaxis.style.width = `${m.l / W0 * 100}%`;
+    yaxis.append(s("rect", {x: 0, y: 0, width: m.l, height: Hh - m.b + 6, fill: "var(--surface-1)"}));
+    for (let v = lo; v <= hi + step / 2; v += step) {
+      svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1}));
+      yaxis.append(el("text", {svg: 1, x: m.l - 6, y: y(v) + 4, "text-anchor": "end"}, byTflops ? String(+v.toPrecision(4)) : v.toFixed(2) + "×"));
+    }
+    if (!byTflops) {
+      svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(1), y2: y(1), stroke: "var(--axis)", "stroke-width": 1.5}));
+      svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(FLOOR), y2: y(FLOOR), stroke: "var(--critical)", "stroke-width": 1, "stroke-dasharray": "4 4"}));
+    }
+    // Date labels counted back from the latest night, so the newest one is always labelled.
+    const every = Math.ceil(H.length / Math.max(8, Math.floor((W - m.l - m.r) / 105)));
+    H.forEach((n, i) => { if ((H.length - 1 - i) % every === 0)
+      svg.append(el("text", {svg: 1, x: x(i), y: Hh - 8, "text-anchor": "middle"}, fmtDate(n.date))); });
+    const ends = [];
+    for (const op of shown) {
+      const pts = H.map((n, i) => [i, val(n, op)]).filter(([, v]) => v);
+      // A step into a night whose suite changed for this op compares different case sets: draw it dashed.
+      const changed = (i) => state.group === "op" && !!(evNight(H[i].date) || {suite: {}}).suite[op];
+      const runs = [];
+      pts.forEach((pt, k) => {
+        if (k > 0 && changed(pt[0])) runs.push({dashed: true, pts: [pts[k - 1], pt]}, {dashed: false, pts: [pt]});
+        else if (!runs.length) runs.push({dashed: false, pts: [pt]});
+        else runs[runs.length - 1].pts.push(pt);
+      });
+      for (const r of runs) if (r.pts.length > 1)
+        svg.append(s("polyline", {points: r.pts.map(([i, v]) => `${x(i)},${y(v)}`).join(" "), fill: "none",
+                                  stroke: colorOfGroup(op, groups), "stroke-width": 2, "stroke-linejoin": "round",
+                                  ...(r.dashed ? {"stroke-dasharray": "5 4", opacity: 0.8} : {})}));
+      const [li, lv] = pts[pts.length - 1];
+      svg.append(s("circle", {cx: x(li), cy: y(lv), r: 4, fill: colorOfGroup(op, groups),
+                              stroke: "var(--surface-1)", "stroke-width": 2}));
+      ends.push({op, y: y(lv), v: lv});
+    }
+    // Direct labels at the line ends, nudged apart so they never collide.
+    ends.sort((a, b) => a.y - b.y);
+    for (let k = 1; k < ends.length; k++) ends[k].y = Math.max(ends[k].y, ends[k - 1].y + 15);
+    // ...then back up from the bottom, so a crowded stack stays inside the plot instead of spilling onto the dates.
+    for (let k = ends.length - 1; k >= 0; k--) ends[k].y = Math.min(ends[k].y, k === ends.length - 1 ? Hh - m.b : ends[k + 1].y - 15);
+    for (const e of ends)
+      svg.append(el("text", {svg: 1, class: "direct", x: W - m.r + 10, y: e.y + 4},
+                    `${groupName(e.op)}  ${byTflops ? fmtTf(e.v) : e.v.toFixed(3) + "×"}`));
+    const hair = s("line", {y1: m.t, y2: Hh - m.b, stroke: "var(--muted)", "stroke-width": 1, visibility: "hidden"});
+    svg.append(hair);
+    const hit = s("rect", {x: m.l, y: 0, width: W - m.l - m.r, height: Hh, fill: "transparent", tabindex: 0});
+    svg.append(hit);
+    const show = (i) => {
+      hair.setAttribute("x1", x(i)); hair.setAttribute("x2", x(i)); hair.setAttribute("visibility", "visible");
+      const n = H[i];
+      tip.textContent = "";
+      tip.append(el("div", {class: "h"}, `${n.date.slice(0, 4)}-${n.date.slice(4, 6)}-${n.date.slice(6)}`));
+      for (const op of shown) {
+        const r = el("div", {class: "r"});
+        const nm = el("span", {class: "nm"}); const k = el("span", {class: "key"});
+        k.style.background = colorOfGroup(op, groups);
+        nm.append(k, document.createTextNode(groupName(op)));
+        const v = val(n, op);
+        r.append(el("b", {}, byTflops ? fmtTf(v) + " TF/s" : fmt(v, 3, "×")), nm);
+        tip.append(r);
+      }
+      // Position against the box, not the svg: the svg may be scrolled partly out of view.
+      const bb = svg.getBoundingClientRect(), bx = box.getBoundingClientRect();
+      const px = bb.left - bx.left + x(i) / W * bb.width;
+      tip.style.display = "block";
+      tip.style.left = (px + 14 + tip.offsetWidth > bx.width ? px - tip.offsetWidth - 14 : px + 14) + "px";
+      tip.style.top = "20px";
+    };
+    let cur = H.length - 1;
+    hit.addEventListener("pointermove", (ev) => {
+      const bb = svg.getBoundingClientRect(), vx = (ev.clientX - bb.left) / bb.width * W;
+      cur = Math.max(0, Math.min(H.length - 1, Math.round((vx - m.l) / (W - m.l - m.r) * (H.length - 1))));
+      show(cur);
+    });
+    hit.addEventListener("focus", () => show(cur));
+    hit.addEventListener("keydown", (ev) => {
+      if (ev.key === "ArrowLeft") cur = Math.max(0, cur - 1);
+      else if (ev.key === "ArrowRight") cur = Math.min(H.length - 1, cur + 1); else return;
+      show(cur); ev.preventDefault();
+    });
+    const hide = () => { tip.style.display = "none"; hair.setAttribute("visibility", "hidden"); };
+    hit.addEventListener("pointerleave", hide); hit.addEventListener("blur", hide);
+    hit.addEventListener("click", () => evOpenNight(H[cur].date, false));
+    svg.setAttribute("viewBox", `0 0 ${W} ${evLane(svg, H, x, W, Hh, m, hit)}`);
+    const scroll = el("div", {class: "scroll"});
+    scroll.append(svg);
+    box.prepend(scroll, yaxis);
+    // Opens on the latest night; once the reader scrolls back, re-renders keep their place until they return to the end.
+    // Applied again after layout, since the first render can run before the card has a width.
+    const place = () => { scroll.scrollLeft = state.trendScroll ?? scroll.scrollWidth; };
+    place(); requestAnimationFrame(place);
+    scroll.addEventListener("scroll", () => {
+      state.trendScroll = scroll.scrollLeft + scroll.clientWidth >= scroll.scrollWidth - 2 ? null : scroll.scrollLeft;
+    });
+  }
+
+  // ---- latest night: per-op bars (all ops) or per-case dots sorted by speedup (one op).
+  function dist() {
+    const box = $("dist"), tip = box.querySelector(".tip");
+    box.querySelectorAll("svg, .note").forEach((n) => n.remove());
+    const L = plat().latest;
+    const W = 1040;
+    const svg = s("svg", {role: "img"});
+    const place = (ev, nodes) => {
+      tip.textContent = ""; nodes.forEach((n) => tip.append(n));
+      const bb = box.getBoundingClientRect();
+      tip.style.display = "block";
+      let lx = ev.clientX - bb.left + 14; if (lx + tip.offsetWidth > bb.width) lx -= tip.offsetWidth + 28;
+      tip.style.left = lx + "px"; tip.style.top = (ev.clientY - bb.top + 14) + "px";
+    };
+    const hide = () => { tip.style.display = "none"; };
+    const single = state.op !== "all", grouped = !single || state.group !== "none";
+    const noRef = single && !hasReference(L[state.op].cases);
+    if (grouped) {
+      // Bars: one per group, the same groups and colors as the trend.
+      const metric = noRef ? "tflops" : "speedup";
+      const groups = groupList(), agg = Object.fromEntries(groups.map((g) => [g, aggOf(groupCases(L, g, groups))]));
+      const bars = groups.filter((g) => agg[g][metric]);
+      $("dist-title").textContent = single ? `${state.op}: latest night by ${groupLabel()}, then every case`
+                                           : `Latest night: geomean speedup by ${groupLabel()}`;
+      $("dist-sub").textContent = noRef ? "No reference, so bars show TLX TFLOP/s."
+        : !single && state.group === "op" ? "Ops without a reference have no speedup and are listed in the table below." : "";
+      if (!bars.length) { box.prepend(el("p", {class: "note"}, `No timed cases match ${sliceName()}.`)); if (!single) return; }
+      else {
+        const bsvg = s("svg", {role: "img", "aria-label": $("dist-title").textContent});
+        const rowH = 34, m = {l: 170, r: 80, t: noRef ? 8 : 22, b: 24}, Hh = m.t + m.b + rowH * bars.length;
+        const vmax = Math.max(noRef ? 0 : 1.2, ...bars.map((g) => agg[g][metric])) * 1.05;
+        const x = (v) => m.l + (W - m.l - m.r) * v / vmax;
+        bsvg.setAttribute("viewBox", `0 0 ${W} ${Hh}`);
+        const tickStep = noRef ? 10 ** Math.floor(Math.log10(vmax / 2)) * ([1, 2, 5].find((f) => f * 10 ** Math.floor(Math.log10(vmax / 2)) * 4 >= vmax) || 10) : 0.5;
+        for (let v = 0; v <= vmax; v += tickStep) {
+          bsvg.append(s("line", {x1: x(v), x2: x(v), y1: m.t, y2: Hh - m.b, stroke: "var(--grid)"}));
+          bsvg.append(el("text", {svg: 1, x: x(v), y: Hh - 6, "text-anchor": "middle"}, noRef ? String(+v.toPrecision(4)) : v + "×"));
+        }
+        bars.forEach((g, k) => {
+          const v = agg[g][metric], y0 = m.t + k * rowH + 6, h = rowH - 12;
+          bsvg.append(el("text", {svg: 1, class: "direct", x: m.l - 10, y: y0 + h / 2 + 4, "text-anchor": "end"}, groupName(g)));
+          const bar = s("rect", {x: x(0), y: y0, width: Math.max(0, x(v) - x(0)), height: h, rx: 4, fill: colorOfGroup(g, groups), tabindex: 0});
+          const info = (ev) => place(ev, [el("div", {class: "h"}, groupName(g)), el("div", {}, (noRef ? `${fmtTf(v)} TF/s` : `${v.toFixed(3)}×`)
+            + ` geomean over ${groupCases(L, g, groups).filter((c) => matches(c) && c.s !== "error" && c[noRef ? "t" : "x"] > 0).length} measured cases`)]);
+          bar.addEventListener("pointermove", info); bar.addEventListener("pointerleave", hide);
+          bsvg.append(bar);
+          bsvg.append(el("text", {svg: 1, class: "direct", x: x(v) + 8, y: y0 + h / 2 + 4}, noRef ? fmtTf(v) : v.toFixed(3) + "×"));
+        });
+        if (!noRef) {
+          bsvg.append(s("line", {x1: x(FLOOR), x2: x(FLOOR), y1: m.t, y2: Hh - m.b, stroke: "var(--critical)", "stroke-dasharray": "4 4"}));
+          bsvg.append(el("text", {svg: 1, x: x(FLOOR), y: m.t - 8, "text-anchor": "middle"}, "0.9× floor"));
+        }
+        box.prepend(bsvg);
+      }
+      if (!single) return;
+    }
+    {
+      const cs = L[state.op].cases.filter((c) => matches(c) && c.s !== "error" && c.x);
+      const errs = L[state.op].cases.filter((c) => matches(c) && c.s === "error").length;
+      const uncompared = L[state.op].cases.filter((c) => matches(c) && c.s !== "error" && !c.x).length;
+      if (!L[state.op].cases.some(matches)) {
+        if (!grouped) { $("dist-title").textContent = `${state.op}: every case, latest night`; $("dist-sub").textContent = ""; }
+        box.prepend(el("p", {class: "note"}, `${state.op} has no ${sliceName()} cases.`));
+        return;
+      }
+      if (!grouped) $("dist-title").textContent = `${state.op}: every case, latest night`;
+      if (noRef) {
+        if (!grouped) $("dist-sub").textContent = "No reference, so no speedup: see TLX TFLOP/s per case in the table.";
+        box.append(el("p", {class: "note"}, `${L[state.op].cases.filter(matches).length} cases; per-case TFLOP/s are in the table.`));
+        return;
+      }
+      const dotsNote = `Dots: every compared case, sorted by speedup; color and icon give the status.${errs ? ` ${errs} errored case(s) have no speedup and appear only in the table.` : ""}${uncompared ? ` ${uncompared} case(s) have no reference; their throughput is in the chart and table below.` : ""}`;
+      $("dist-sub").textContent = grouped ? `${$("dist-sub").textContent} ${dotsNote}`.trim() : dotsNote.replace("Dots: every compared case, sorted", "Sorted");
+      cs.sort((a, b) => a.x - b.x);
+      const Hh = 240, m = {l: 48, r: 16, t: 12, b: 20};
+      const hi = Math.max(1.2, ...cs.map((c) => c.x)) * 1.05;
+      const x = (k) => m.l + (W - m.l - m.r) * (cs.length === 1 ? 0.5 : k / (cs.length - 1));
+      const y = (v) => m.t + (Hh - m.t - m.b) * (hi - v) / hi;
+      svg.setAttribute("viewBox", `0 0 ${W} ${Hh}`);
+      for (const v of [0, 0.5, 1, 1.5, 2].filter((v) => v <= hi)) {
+        svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: "var(--grid)"}));
+        svg.append(el("text", {svg: 1, x: m.l - 6, y: y(v) + 4, "text-anchor": "end"}, v + "×"));
+      }
+      svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(FLOOR), y2: y(FLOOR), stroke: "var(--critical)", "stroke-dasharray": "4 4"}));
+      const r = cs.length > 150 ? 3 : 5;
+      cs.forEach((c, k) => {
+        const g = s("g", {tabindex: 0});
+        g.append(s("circle", {cx: x(k), cy: y(c.x), r, fill: STATUS[c.s].color, stroke: "var(--surface-1)", "stroke-width": 1.5}));
+        // Hit area wider than the dot.
+        g.append(s("rect", {x: x(k) - Math.max(6, (W - m.l - m.r) / cs.length / 2), y: m.t, width: Math.max(12, (W - m.l - m.r) / cs.length),
+                            height: Hh - m.t - m.b, fill: "transparent"}));
+        const info = (ev) => {
+          const head = el("div", {class: "h"}); head.append(statusBadge(c.s), document.createTextNode(` ${c.d} · ${c.dt}`));
+          place(ev, [head, el("div", {}, c.l), el("div", {}, `${c.x.toFixed(3)}× · TLX ${fmt(c.t, 0)} vs ref ${fmt(c.r, 0)} TF/s`)]
+            .concat(c.n ? [el("div", {class: "note"}, c.n)] : []));
+        };
+        g.addEventListener("pointermove", info); g.addEventListener("pointerleave", hide);
+        svg.append(g);
+      });
+    }
+    box.insertBefore(svg, box.querySelector(".tip"));
+  }
+
+  // ---- cases: absolute TFLOP/s of every case, reference and TLX side by side. Shown with one op selected.
+  function cases() {
+    const card = $("cases-card"), box = $("cases"), tip = box.querySelector(".tip");
+    box.querySelectorAll(".scroll, .yaxis, .note").forEach((n) => n.remove());
+    card.hidden = state.op === "all";
+    if (card.hidden) return;
+    const o = plat().latest[state.op], all = o.cases.filter(matches), hasRef = hasReference(all);
+    const cs = all.filter((c) => c.s !== "error" && c.t);
+    const sort = hasRef || state.casesSort !== "r" && state.casesSort !== "x" ? state.casesSort : "t";
+    $("cases-sort").value = sort;
+    [...$("cases-sort").options].forEach((op) => { op.disabled = !hasRef && (op.value === "r" || op.value === "x"); });
+    $("cases-title").textContent = (hasRef ? `${state.op}: TLX vs reference TFLOP/s per case, latest night` : `${state.op}: TLX TFLOP/s per case, latest night`);
+    const skipped = all.length - cs.length;
+    $("cases-sub").textContent = o.reason ? "No throughput measurements were recorded."
+      : (hasRef ? `Each pair is one case: ${o.ref} next to TLX. ` : "No reference, so one TLX bar per case. ")
+      + (hasRef ? "Hover a case for its inputs and speedup." : "Hover a case for its inputs.") + (skipped ? ` ${skipped} errored case(s) have no timing and appear only in the table.` : "");
+    // Bar labels: the inputs that vary across this op's cases and are short enough to read, joined by ×.
+    const keys = groupOptions().filter((g) => g.startsWith("in.")).map((g) => g.slice(3))
+      .filter((k) => o.cases.every((c) => String(c.p[k] ?? "").length <= 8));
+    const label = (c) => keys.map((k) => c.p[k]).join("×");
+    const series = [...(hasRef ? [{k: "r", name: o.ref, color: "var(--muted)"}] : []), {k: "t", name: "TLX", color: "var(--series-1)"}];
+    const legend = $("cases-legend");
+    legend.textContent = "";
+    if (series.length > 1) for (const sr of series) {
+      const sp = el("span", {class: "nm", style: "display:flex;gap:6px;align-items:center"});
+      const k = el("span", {class: "key"}); k.style.background = sr.color; k.style.height = "10px"; k.style.width = "10px";
+      sp.append(k, document.createTextNode(sr.name));
+      legend.append(sp);
+    }
+    if (!cs.length) { box.prepend(el("p", {class: "note"}, `No timed ${state.op} cases match ${sliceName() || "these filters"}.`)); return; }
+    const byInput = (a, b) => keys.reduce((d, k) => d || byValue(a.p[k], b.p[k]), 0) || a.l.localeCompare(b.l);
+    cs.sort(sort === "in" ? byInput : (a, b) => (a[sort] ?? 0) - (b[sort] ?? 0) || byInput(a, b));
+    // Each case gets a fixed-width slot; past what fits, the plot widens and scrolls under a pinned y axis, like the trend.
+    const GAP = 2, SLOT = series.length * 7 + (series.length - 1) * GAP + 6;
+    const longest = Math.max(...cs.map((c) => label(c).length));
+    // Labels are rotated 50°, so each one reaches ~5.2 units down and ~4.4 units left per character (11px text).
+    const W0 = 1040, Hh0 = 280, m = {l: 48, r: 12, t: 12, b: Math.min(170, 24 + longest * 5.2)}, Hh = Hh0 + m.b;
+    const W = Math.max(W0, m.l + m.r + SLOT * cs.length);
+    let slot = (W - m.l - m.r) / cs.length;
+    // Inset the first slot far enough that its label clears the pinned y axis.
+    const inset = Math.max(0, longest * 4.4 - slot / 2);
+    slot = (W - m.l - m.r - inset) / cs.length;
+    const x0of = (i) => m.l + inset + i * slot;
+    // Bars widen with the slot when few cases match, up to a cap, so a filtered view isn't a row of hairlines.
+    const BAR = Math.min(24, (slot * 0.7 - (series.length - 1) * GAP) / series.length);
+    const vmax = Math.max(...cs.flatMap((c) => series.map((sr) => c[sr.k] || 0)));
+    const step = niceStep(vmax / 4), hi = Math.ceil(vmax / step) * step;
+    const y = (v) => m.t + (Hh - m.t - m.b) * (hi - v) / hi;
+    const svg = s("svg", {viewBox: `0 0 ${W} ${Hh}`, role: "img", "aria-label": $("cases-title").textContent});
+    svg.style.width = `${W / W0 * 100}%`;
+    const yaxis = s("svg", {class: "yaxis", viewBox: `0 0 ${m.l} ${Hh - m.b + 6}`, "aria-hidden": "true"});
+    yaxis.style.width = `${m.l / W0 * 100}%`;
+    yaxis.append(s("rect", {x: 0, y: 0, width: m.l, height: Hh - m.b + 6, fill: "var(--surface-1)"}));
+    for (let v = 0; v <= hi + step / 2; v += step) {
+      svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1}));
+      yaxis.append(el("text", {svg: 1, x: m.l - 6, y: y(v) + 4, "text-anchor": "end"}, String(+v.toPrecision(6))));
+    }
+    svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(0), y2: y(0), stroke: "var(--axis)", "stroke-width": 1}));
+    const grp = series.length * BAR + (series.length - 1) * GAP;
+    const show = (ev, c) => {
+      tip.textContent = "";
+      const head = el("div", {class: "h"}); head.append(statusBadge(c.s), document.createTextNode(` ${c.d} · ${c.dt}`));
+      tip.append(head, el("div", {}, c.l));
+      for (const sr of series) {
+        if (!c[sr.k]) continue;
+        const r = el("div", {class: "r"}), nm = el("span", {class: "nm"}), k = el("span", {class: "key"});
+        k.style.background = sr.color; nm.append(k, document.createTextNode(sr.name));
+        r.append(el("b", {}, fmtTf(c[sr.k]) + " TF/s"), nm);
+        tip.append(r);
+      }
+      if (hasRef && c.x) tip.append(el("div", {}, `speedup ${fmt(c.x, 3, "×")}`));
+      if (c.n) tip.append(el("div", {class: "note"}, c.n));
+      const bx = box.getBoundingClientRect();
+      tip.style.display = "block";
+      let lx = ev.clientX - bx.left + 14; if (lx + tip.offsetWidth > bx.width) lx -= tip.offsetWidth + 28;
+      tip.style.left = lx + "px"; tip.style.top = "20px";
+    };
+    const hide = () => { tip.style.display = "none"; };
+    cs.forEach((c, i) => {
+      const x0 = x0of(i) + (slot - grp) / 2, g = s("g", {tabindex: 0});
+      series.forEach((sr, j) => {
+        const v = c[sr.k];
+        if (!v) return;
+        g.append(s("rect", {x: x0 + j * (BAR + GAP), y: y(v), width: BAR, height: Math.max(0, y(0) - y(v)), rx: 1.5, fill: sr.color}));
+      });
+      const lx = x0of(i) + slot / 2;
+      g.append(el("text", {svg: 1, x: lx, y: y(0) + 10, "text-anchor": "end",
+                           transform: `rotate(-50 ${lx} ${y(0) + 10})`}, label(c)));
+      // Hit area: the whole slot, top to bottom, so a short bar is as easy to hover as a tall one.
+      g.append(s("rect", {x: x0of(i), y: m.t, width: slot, height: Hh - m.t - m.b, fill: "transparent"}));
+      g.addEventListener("pointermove", (ev) => show(ev, c)); g.addEventListener("pointerleave", hide);
+      g.addEventListener("focus", () => { const bb = g.getBoundingClientRect(); show({clientX: bb.right}, c); });
+      g.addEventListener("blur", hide);
+      svg.append(g);
+    });
+    const scroll = el("div", {class: "scroll"});
+    scroll.append(svg);
+    box.prepend(scroll, yaxis);
+  }
+
+  // ---- table: the accessible view of everything above.
+  function sortableTable(box, cols, rows, sortKey, redraw) {
+    const {key, dir} = state[sortKey];
+    if (key && cols.some(([k]) => k === key))
+      rows = [...rows].sort((a, b) => ((a[key] ?? -Infinity) > (b[key] ?? -Infinity) ? 1 : -1) * dir);
+    const tb = el("table");
+    const hr = el("tr");
+    for (const [k, name, num] of cols) {
+      const th = el("th", num ? {class: "num"} : {}, name + (key === k ? (dir > 0 ? " ▲" : " ▼") : ""));
+      th.onclick = () => { state[sortKey] = {key: k, dir: state[sortKey].key === k ? -state[sortKey].dir : 1}; redraw(); };
+      hr.append(th);
+    }
+    tb.append(hr);
+    for (const r of rows.slice(0, sortKey === "sort" ? state.rows : rows.length)) {
+      const tr = el("tr");
+      for (const [k, , num] of cols) {
+        const td = el("td", num ? {class: "num"} : {});
+        const v = r[k];
+        if (k === "s") td.append(statusBadge(v));
+        else if (k === "speedup" || k === "x") td.textContent = fmt(v, 3, "×");
+        else if (k === "tflops" || k === "t" || k === "r") td.textContent = fmt(v, 0);
+        else td.textContent = String(v ?? "–");
+        evDelta(td, k, r);
+        tr.append(td);
+      }
+      tb.append(tr);
+    }
+    box.textContent = "";
+    box.append(tb);
+    if (!rows.length) box.append(el("p", {class: "note"}, "No cases match these filters."));
+    return rows.length;
+  }
+
+  function table() {
+    const L = plat().latest;
+    const opNames = state.op === "all" ? Object.keys(L) : [state.op];
+    const slice = sliceName() ? ` · ${sliceName()}` : "";
+
+    $("summary-title").textContent = `Latest night by ${groupLabel()}${slice}`;
+    const byOp = state.group === "op" || state.group === "none";
+    const groups = groupList(true);
+    const sumRows = groups.map((g) => {
+      const cases = groupCases(L, g, groups), kept = cases.filter(matches), a = aggOf(cases);
+      const c = (st) => kept.filter((x) => x.s === st).length;
+      return {op: groupName(g), ref: byOp ? L[g].ref || "–" : "", n: kept.length, ok: c("ok"), noisy: c("noisy"), pip: c("pip"),
+              error: c("error"), tflops: a.tflops, speedup: a.speedup, reason: byOp ? L[g].reason || "" : "", ...evCompare(g, groups)};
+    }).filter((r) => r.n || r.reason);
+    sortableTable($("summary"), [["op", groupLabel()], ...(byOp ? [["ref", "reference"], ["reason", "no data reason"]] : []), ["n", "cases", 1], ["ok", "ok", 1],
+      ["noisy", "noisy", 1], ["pip", "PIP", 1], ["error", "ERROR", 1], ["tflops", "TLX TF/s", 1], ["speedup", "speedup", 1]],
+      sumRows, "sortSum", table);
+    const H = plat().history;
+    $("summary-sub").textContent = H.length > 1 ? `Small figures: change vs ${fmtDate(H[H.length - 2].date)}. Case counts compare all cases; `
+      + "TF/s and speedup compare only cases timed on both nights (hover for how many), so added or removed cases don't read as a perf change." : "";
+
+    $("table-title").textContent = `${state.op === "all" ? "All ops" : state.op}: cases, latest night${slice}`;
+    const chips = $("chips");
+    chips.textContent = "";
+    for (const st of Object.keys(STATUS)) {
+      const b = el("button", {type: "button", "aria-pressed": String(state.statuses.has(st))});
+      b.append(statusBadge(st));
+      b.onclick = () => { state.statuses.has(st) ? state.statuses.delete(st) : state.statuses.add(st); state.rows = 50; table(); };
+      chips.append(b);
+    }
+    const cols = [["l", "input"], ["d", "dir"], ["dt", "dtype"], ["s", "status"], ["x", "speedup", 1], ["t", "TLX TF/s", 1],
+                  ["r", "ref TF/s", 1], ["n", "notes"]];
+    if (state.op === "all") cols.unshift(["op", "op"]);
+    const rows = opNames.flatMap((op) => L[op].cases.filter((c) => matches(c) && state.statuses.has(c.s)).map((c) => ({...c, op})));
+    const n = sortableTable($("table"), cols, rows, "sort", table);
+    if (n > state.rows) {
+      const b = el("button", {type: "button", class: "more"}, `Show more (${n - state.rows} hidden)`);
+      b.onclick = () => { state.rows += 100; table(); };
+      $("table").append(b);
+    }
+  }
+
+  // ---- episodes: sustained movements of a case against its own frozen baseline, across every GPU and op. Rows
+  // carry their own baseline, confirmation, recovery and last comparable measurement; night cells are read only
+  // for the mini plot and to tell a noisy latest measurement from a clean one.
+  const EP_POLICY = {threshold: 0.1, recovery: 0.05, confirmation: 2, ...((RAW && RAW.episode_policy) || {})};
+  const EP_SECTIONS = [["reg", "In regression"], ["lift", "Lifts"], ["rec", "Recovered episodes"]];
+  const EP_PCT = (v) => (v * 100).toFixed(0) + "%";
+  const EP_SECT_SUB = {
+    reg: "At least one affected input has not recovered. Missing data or a changed measurement context leaves it unresolved. Open episodes stay visible outside the history window.",
+    lift: "A sustained higher level. Pending candidates and lifts no longer measured are labeled separately.",
+    rec: "Every affected input recovered against its pre-regression baseline. Expand for individual recovery dates.",
+  };
+  const EP_CARDS = 8, EP_ROWS = [25, 50], EP_SORTS = ["date", "mag", "dur"];
+  const EP_CLEAN = {o: 1, p: 1};
+  const epIsClean = (c) => !!c && !!EP_CLEAN[c[0]] && Number.isFinite(c[2]) && c[2] > 0;
+  const epSet = (v) => v !== null && v !== undefined;
+  const epDate = (d) => (d ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6)}` : "–");
+  const epPct = (v) => (epSet(v) ? `${v >= 0 ? "+" : "−"}${Math.abs(v * 100).toFixed(1)}%` : "–");
+  const epPlatName = (k) => { const m = PLATFORMS.find(([p]) => p === k); return m ? m[1] : k.toUpperCase(); };
+  const epAny = () => Object.values(DATA.platforms).some((p) => Array.isArray(p.episodes));
+  function epCell(pd, op, ni, i) {
+    if (ni < 0 || !epSet(i)) return undefined;
+    const night = pd.nights[i], row = night && night.ops[op];
+    return row ? row[ni] : undefined;
+  }
+
+  // A recovery, a measurement that no longer compares, an unconfirmed onset, or a confirmed current measurement.
+  function epRowState(kind, r) {
+    if (r.context_changed) return ["warn", "unresolved · context changed"];
+    if (epSet(r.recovered)) return ["rec", `recovered ${epDate(r.recoveredDate)}`];
+    if (kind === "lift" && epSet(r.end)) return ["unc", `ended ${epDate(r.endDate)}`];
+    if (r.noisy) return ["warn", "latest measurement noisy"];
+    if (r.gone) return ["unc", "unavailable"];
+    if (r.stale) return ["unc", `stale · last ${epDate(r.lastDate)}`];
+    if (!epSet(r.confirmed)) return ["unc", "pending confirmation"];
+    if (kind === "lift") return r.ratio < 1 + EP_POLICY.threshold
+      ? ["unc", "latest below lift level · awaiting confirmation"] : ["lift", "above prior baseline"];
+    if (r.ratio >= 1 - EP_POLICY.recovery) return ["unc", "pending recovery confirmation"];
+    return ["reg", "still low"];
+  }
+
+  // One group per episode: the inputs that began moving on the exact same night.
+  function epBuild() {
+    const groups = [];
+    for (const [pk, pd] of Object.entries(DATA.platforms)) {
+      if (state.ep.gpu !== "all" && pk !== state.ep.gpu) continue;
+      const nights = pd.nights || [], eps = pd.episodes || [];
+      if (!nights.length || !eps.length) continue;
+      const lastIdx = nights.length - 1, from = Math.max(0, nights.length - state.ep.range);
+      const dateAt = (i) => (epSet(i) && nights[i] ? nights[i].date : null);
+      for (const e of eps) {
+        if (state.ep.op !== "all" && e.op !== state.ep.op) continue;
+        if (state.ep.dir !== "all" && e.direction !== state.ep.dir) continue;
+        const cat = (pd.episode_cases || {})[e.op] || [], rows = [];
+        for (const r of e.rows || []) {
+          const c = cat[r.case];
+          if (!c || (state.ep.dtype !== "all" && c[2] !== state.ep.dtype)) continue;
+          const ni = r.case;
+          const cell = epCell(pd, e.op, ni, lastIdx);
+          const label = Object.entries(c[0] || {}).map(([k, v]) => `${k}=${v}`).join(" ");
+          const row = {...r, ni, key: c[3], label, low: label.toLowerCase(), dtype: c[2],
+            baseDate: dateAt(r.base), lastDate: dateAt(r.last), recoveredDate: dateAt(r.recovered),
+            endDate: dateAt(r.end), stale: r.last < lastIdx, gone: !cell || cell[0] === "e", noisy: !!cell && cell[0] === "n",
+            ratio: r.baseline > 0 && r.value > 0 ? r.value / r.baseline : null,
+            ext: e.kind === "lift" ? r.peak : r.worst};
+          [row.cls, row.st] = epRowState(e.kind, row);
+          rows.push(row);
+        }
+        if (!rows.length) continue;
+        const open = rows.filter((r) => !epSet(r.recovered));
+        const recovered = e.kind === "regression" && !open.length;
+        // An open regression stays listed however old its onset; anything resolved is scoped to the window.
+        if (e.start < from && !(e.kind === "regression" && !recovered)) continue;
+        const closed = e.kind === "regression" ? recovered : rows.every((r) => epSet(r.end));
+        const endIdx = !closed ? lastIdx
+          : Math.max(...rows.map((r) => (e.kind === "regression" ? r.recovered : r.end)));
+        const mag = e.kind === "lift"
+          ? Math.max(0, ...rows.map((r) => (typeof r.peak === "number" ? r.peak : 1) - 1))
+          : Math.max(0, ...rows.map((r) => 1 - (typeof r.worst === "number" ? r.worst : 1)));
+        groups.push({key: `${pk}|${e.op}|${e.direction}|${e.kind}|${e.start}`, card: `${pk}|${e.op}|${e.direction}`,
+          platform: pk, op: e.op, dir: e.direction, kind: e.kind,
+          sect: e.kind === "lift" ? "lift" : recovered ? "rec" : "reg",
+          start: e.start, startDate: dateAt(e.start), endDate: closed ? dateAt(endIdx) : null, closed,
+          lastIdx, plotEnd: closed ? Math.max(...rows.map((r) => r.last)) : lastIdx, from, rows, mag,
+          dur: Math.max(0, endIdx - e.start), older: e.start < from,
+          nRec: rows.length - open.length, nCtx: open.filter((r) => r.context_changed).length,
+          nStale: open.filter((r) => !r.context_changed && !r.noisy && (r.stale || r.gone)).length,
+          nNoisy: open.filter((r) => !r.context_changed && r.noisy).length,
+          nPend: rows.filter((r) => !epSet(r.confirmed)).length,
+          current: rows.every((r) => r.last === lastIdx)});
+      }
+    }
+    return groups;
+  }
+
+  // The group list only changes with the window, direction and dtype; search, sort and paging reuse it.
+  let epCache = null;
+  function epAll() {
+    const k = `${state.ep.range}|${state.ep.gpu}|${state.ep.op}|${state.ep.dir}|${state.ep.dtype}`;
+    if (!epCache || epCache.k !== k) epCache = {k, groups: epBuild()};
+    return epCache.groups;
+  }
+  function epMatch(g, q) {
+    if (!q) return true;
+    if (`${g.op} ${g.platform} ${epPlatName(g.platform)} ${g.dir} ${g.kind} ${g.startDate}`.toLowerCase().includes(q)) return true;
+    return g.rows.some((r) => r.low.includes(q) || r.dtype.toLowerCase().includes(q));
+  }
+  const EP_ORDER = {date: (g) => g.startDate, mag: (g) => g.mag, dur: (g) => g.dur};
+  const epCmp = (a, b) => {
+    const f = EP_ORDER[state.ep.sort] || EP_ORDER.date, va = f(a), vb = f(b);
+    return (va < vb ? 1 : va > vb ? -1 : 0) || a.card.localeCompare(b.card) || b.start - a.start;
+  };
+
+  const epBadge = (cls, text) => el("span", {class: `ep-b ep-b-${cls}`}, text);
+  function epChips(g) {
+    const out = [], n = g.rows.length, plural = n === 1 ? "" : "s";
+    if (g.kind === "regression") {
+      if (g.sect === "rec") out.push(["rec", `all ${n} input${plural} recovered`]);
+      else {
+        out.push(["reg", `${n - g.nRec} of ${n} input${plural} not recovered`]);
+        if (g.nRec) out.push(["rec", `${g.nRec} recovered`]);
+      }
+    } else {
+      out.push(g.nPend ? ["unc", "lift candidate"] : ["lift", g.closed ? `ended ${epDate(g.endDate)}`
+        : g.current && g.rows.every((r) => r.ratio >= 1 + EP_POLICY.threshold) ? "above prior baseline through latest night" : "historical confirmed lift"]);
+      if (!g.closed && g.current && g.rows.some((r) => r.ratio < 1 + EP_POLICY.threshold))
+        out.push(["unc", "latest downturn · awaiting confirmation"]);
+    }
+    if (g.nCtx) out.push(["warn", `${g.nCtx} unresolved · context changed`]);
+    if (g.nStale) out.push(["unc", `${g.nStale} not measured on the latest night`]);
+    if (g.nNoisy) out.push(["warn", `${g.nNoisy} latest measurement noisy`]);
+    if (g.nPend) out.push(["unc", g.nPend === n ? `pending confirmation · needs ${EP_POLICY.confirmation} clean nights`
+      : `${g.nPend} pending confirmation`]);
+    return out;
+  }
+
+  // Mini plot: this group's own affected inputs, each divided by its own baseline, one geometric mean per night.
+  // A night where any of them has no clean measurement is a gap, never a carried-forward or substituted value.
+  function epPlot(g) {
+    const box = el("div", {class: "ep-plot"});
+    const pd = DATA.platforms[g.platform], vals = [];
+    const i0 = Math.max(Math.min(g.from, Math.max(0, g.start - 1)), ...g.rows.map((r) => r.base));
+    for (let i = i0; i <= g.plotEnd; i++) {
+      let sum = 0, n = 0, full = true;
+      for (const r of g.rows) {
+        const cell = epCell(pd, g.op, r.ni, i);
+        if (i > r.last || !epIsClean(cell) || !(r.baseline > 0)) { full = false; break; }
+        sum += Math.log(cell[2] / r.baseline); n++;
+      }
+      vals.push(full && n ? Math.exp(sum / n) : null);
+    }
+    const seen = vals.filter((v) => v !== null), n = g.rows.length;
+    const note = (t) => box.append(el("p", {class: "note"}, t));
+    if (!seen.length) {
+      note(`No night in this window measured all ${n} affected input${n === 1 ? "" : "s"} together.`);
+      return box;
+    }
+    const W = 250, Hh = 62, m = {l: 4, r: 4, t: 8, b: 12};
+    const band = g.kind === "lift" ? 1 + EP_POLICY.threshold : 1 - EP_POLICY.threshold;
+    let lo = Math.min(1, band, ...seen), hi = Math.max(1, band, ...seen);
+    const pad = (hi - lo) * 0.12 || 0.05;
+    lo -= pad; hi += pad;
+    const x = (i) => m.l + (W - m.l - m.r) * (vals.length === 1 ? 0.5 : i / (vals.length - 1));
+    const y = (v) => m.t + (Hh - m.t - m.b) * (hi - v) / (hi - lo);
+    const col = g.sect === "reg" ? "var(--critical)" : g.sect === "lift" ? "var(--good)" : "var(--series-1)";
+    const last = vals.reduce((k, v, i) => (v === null ? k : i), -1);
+    const svg = s("svg", {viewBox: `0 0 ${W} ${Hh}`, role: "img", "aria-label":
+      `${g.op} ${g.dir} on ${epPlatName(g.platform)}: throughput against baseline over ${seen.length} fully measured `
+      + `night(s) from ${epDate(vals.length ? (pd.nights[i0] || {}).date : null)}; latest ${epPct(seen[seen.length - 1] - 1)}`});
+    svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(1), y2: y(1), stroke: "var(--axis)", "stroke-width": 1, "stroke-dasharray": "4 3"}));
+    svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(band), y2: y(band), stroke: col, "stroke-width": 1,
+                          "stroke-dasharray": "3 3", opacity: 0.6}));
+    const ox = x(g.start - i0);
+    svg.append(s("line", {x1: ox, x2: ox, y1: m.t, y2: Hh - m.b, stroke: "var(--muted)", "stroke-width": 1,
+                          "stroke-dasharray": "2 2"}));
+    let run = [];
+    const flush = () => {
+      if (run.length > 1)
+        svg.append(s("polyline", {points: run.map(([i, v]) => `${x(i)},${y(v)}`).join(" "), fill: "none", stroke: col,
+                                  "stroke-width": 1.6, "stroke-linejoin": "round"}));
+      else if (run.length === 1) svg.append(s("circle", {cx: x(run[0][0]), cy: y(run[0][1]), r: 1.8, fill: col}));
+      run = [];
+    };
+    vals.forEach((v, i) => (v === null ? flush() : run.push([i, v])));
+    flush();
+    svg.append(s("circle", {cx: x(last), cy: y(vals[last]), r: 2.6, fill: col, stroke: "var(--surface-1)", "stroke-width": 1}));
+    const tick = (xx, anchor, text) => {
+      const t = el("text", {svg: 1, x: xx, y: Hh - 2, "text-anchor": anchor}, text);
+      t.setAttribute("style", "font-size:9px");
+      svg.append(t);
+    };
+    tick(m.l, "start", fmtDate((pd.nights[i0] || {}).date || ""));
+    if (vals.length > 1) tick(W - m.r, "end", fmtDate((pd.nights[g.plotEnd] || {}).date || ""));
+    box.append(svg);
+    note(`${seen.length} of ${vals.length} nights compare all ${n} input${n === 1 ? "" : "s"} · `
+      + `last joint point ${epDate(pd.nights[i0 + last].date)}: ${epPct(seen[seen.length - 1] - 1)}`);
+    return box;
+  }
+
+  // Inputs, only once the group is expanded: searchable, sortable, paged at 25 or 50 rows.
+  const EP_COLS = [["label", "input"], ["dtype", "dtype"], ["baseline", "baseline TF/s", 1], ["value", "last TF/s", 1],
+                   ["lastDate", "last measured"], ["ratio", "vs baseline", 1], ["ext", "worst / peak", 1], ["st", "status"]];
+  function epDetail(g, host) {
+    const d = (state.ep.det[g.key] ||= {q: "", sort: {key: "ext", dir: g.kind === "lift" ? -1 : 1}, rows: EP_ROWS[0], page: 1});
+    host.textContent = "";
+    const tools = el("div", {class: "ep-tools"});
+    const lab = el("label", {class: "ctl ep-in"}, "Filter ");
+    const q = el("input", {type: "search", placeholder: "input or dtype", "aria-label": "Filter inputs"});
+    q.value = d.q;
+    lab.append(q);
+    const rows = el("select", {"aria-label": "Rows per page"});
+    for (const n of EP_ROWS) rows.append(el("option", {value: n}, `${n} rows`));
+    rows.value = String(d.rows);
+    tools.append(lab, rows);
+    const body = el("div");
+    const draw = () => {
+      body.textContent = "";
+      const needle = d.q.trim().toLowerCase();
+      let list = needle ? g.rows.filter((r) => r.low.includes(needle) || r.dtype.toLowerCase().includes(needle)) : g.rows;
+      const {key, dir} = d.sort;
+      list = [...list].sort((a, b) => ((a[key] ?? -Infinity) > (b[key] ?? -Infinity) ? 1 : -1) * dir);
+      const page = epPager(list.length, d.rows, d.page, (p) => { d.page = p; draw(); },
+                           `input${list.length === 1 ? "" : "s"}`, `input-${g.key}`);
+      d.page = page.page;
+      const tb = el("table");
+      const hr = el("tr");
+      for (const [k, name, num] of EP_COLS) {
+        const th = el("th", num ? {class: "num"} : {});
+        th.setAttribute("aria-sort", key === k ? (dir > 0 ? "ascending" : "descending") : "none");
+        const button = el("button", {type: "button", class: "ep-sort-button"}, name + (key === k ? (dir > 0 ? " ▲" : " ▼") : ""));
+        button.onclick = () => {
+          const focused = document.activeElement === button;
+          d.sort = {key: k, dir: d.sort.key === k ? -d.sort.dir : 1}; d.page = 1; draw();
+          if (focused) body.querySelectorAll(".ep-sort-button")[EP_COLS.findIndex(([column]) => column === k)]?.focus();
+        };
+        th.append(button);
+        hr.append(th);
+      }
+      tb.append(hr);
+      for (const r of list.slice(page.from, page.from + d.rows)) {
+        const tr = el("tr");
+        tr.append(el("td", {class: "ep-case", title: r.key}, r.label), el("td", {}, r.dtype),
+                  el("td", {class: "num"}, fmtTf(r.baseline)), el("td", {class: "num"}, fmtTf(r.value)),
+                  el("td", {}, epDate(r.lastDate)));
+        const pct = el("td", {class: "num"}, epPct(epSet(r.ratio) ? r.ratio - 1 : null));
+        if (epSet(r.ratio)) pct.style.color = r.ratio >= 1 ? "var(--good-text)" : "var(--critical)";
+        const ext = el("td", {class: "num"}, epPct(typeof r.ext === "number" ? r.ext - 1 : null));
+        const st = el("td");
+        st.append(epBadge(r.cls, r.st));
+        tr.append(pct, ext, st);
+        tb.append(tr);
+      }
+      const scroll = el("div", {class: "ep-table-scroll"});
+      scroll.append(tb);
+      body.append(scroll);
+      if (!list.length) body.append(el("p", {class: "note"}, "No input matches this filter."));
+      body.append(page.bar);
+      body.append(el("p", {class: "note"},
+        "Each input's baseline is its own normal level, a median of up to three clean samples and then frozen, not "
+        + 'the throughput of any one night. "Last TF/s" is the last measurement that still compares with that '
+        + "baseline, which is not always the latest night."));
+    };
+    q.oninput = () => { d.q = q.value; d.page = 1; draw(); };
+    rows.onchange = () => { d.rows = Number(rows.value); d.page = 1; draw(); };
+    host.append(tools, body);
+    draw();
+  }
+
+  // Fixed pages for both cards and input rows, never a list that grows as it is clicked.
+  function epPager(total, per, page, go, unit, identity = unit) {
+    const pages = Math.max(1, Math.ceil(total / per));
+    page = Math.min(Math.max(1, page), pages);
+    const pagerId = `ep-page-${encodeURIComponent(identity)}`;
+    const bar = el("div", {class: "ep-pager", id: pagerId});
+    if (pages > 1) {
+      const btn = (text, to, off) => {
+        const b = el("button", {type: "button", "data-page-action": text}, text);
+        b.disabled = off;
+        b.onclick = () => {
+          const focused = document.activeElement === b;
+          go(to);
+          if (focused) {
+            const replacement = document.getElementById(pagerId);
+            if (replacement) (replacement.querySelector(`[data-page-action="${text}"]:not(:disabled)`) || replacement.querySelector("button:not(:disabled)"))?.focus();
+          }
+        };
+        return b;
+      };
+      bar.append(btn("Previous", page - 1, page === 1), el("span", {}, `Page ${page} of ${pages} · ${total} ${unit}`),
+                 btn("Next", page + 1, page === pages));
+    } else bar.append(el("span", {}, `${total} ${unit}`));
+    return {bar, page, from: (page - 1) * per};
+  }
+
+  function epGroupNode(g) {
+    const wrap = el("div", {class: "ep-ep"}), main = el("div", {class: "ep-main"}), hd = el("div", {class: "ep-hd"});
+    hd.append(epBadge(g.sect, g.sect === "rec" ? "recovered" : g.sect === "lift" ? "lift" : "in regression"),
+              el("b", {}, `onset ${epDate(g.startDate)}`));
+    if (g.older) hd.append(el("span", {class: "ep-dim"}, "onset before this window"));
+    hd.append(el("span", {class: "ep-dim"},
+      `${g.kind === "lift" ? "peak" : "worst"} ${epPct(g.kind === "lift" ? g.mag : -g.mag)} · `
+      + (g.dur ? `${g.dur} night${g.dur === 1 ? "" : "s"}${g.closed ? "" : " and counting"}` : "first night")));
+    if (g.closed && g.endDate) hd.append(el("span", {class: "ep-dim"}, `${g.kind === "regression" ? "recovered" : "ended"} ${epDate(g.endDate)}`));
+    main.append(hd);
+    const evidence = el("div", {class: "ep-hd"});
+    const night = DATA.platforms[g.platform].events[g.start];
+    if (night && night.compare) evidence.append(el("a", {href: night.compare, target: "_blank", rel: "noopener"}, "Commit comparison"));
+    for (const date of [...new Set([g.startDate, ...g.rows.map((r) => r.lastDate)])])
+      evidence.append(el("a", {href: `${REPO}/releases/download/${DATA.tag}/${date}.${g.platform}.json`, target: "_blank", rel: "noopener"}, `${epDate(date)} results`));
+    main.append(evidence);
+    const chips = el("div", {class: "ep-hd", style: "margin-top:4px"});
+    for (const [cls, text] of epChips(g)) chips.append(epBadge(cls, text));
+    main.append(chips);
+    const det = el("details");
+    det.className = "ep-det";
+    const body = el("div");
+    det.append(el("summary", {}, `Inputs (${g.rows.length})`), body);
+    det.open = state.ep.open.has(g.key);
+    if (det.open) epDetail(g, body);
+    det.addEventListener("toggle", () => {
+      if (det.open) { state.ep.open.add(g.key); if (!body.childNodes.length) epDetail(g, body); }
+      else { state.ep.open.delete(g.key); body.textContent = ""; }
+    });
+    main.append(det);
+    wrap.append(main, epPlot(g));
+    return wrap;
+  }
+
+  function epSectionNode(k, title, groups) {
+    const sec = el("section", {class: "ep-sec", id: `ep-sec-${k}`});
+    const h = el("div", {class: "ep-cardh"});
+    h.append(el("h2", {}, title), el("span", {class: "ep-dim"},
+      `${groups.length} episode${groups.length === 1 ? "" : "s"}`));
+    sec.append(h, el("p", {class: "sub"}, EP_SECT_SUB[k]));
+    if (!groups.length) {
+      sec.append(el("p", {class: "note"}, "Nothing here under these filters."));
+      return sec;
+    }
+    const cards = new Map();
+    for (const g of [...groups].sort(epCmp)) {
+      if (!cards.has(g.card)) cards.set(g.card, []);
+      cards.get(g.card).push(g);
+    }
+    const names = [...cards.keys()];
+    const page = epPager(names.length, EP_CARDS, state.ep.page[k], (p) => { state.ep.page[k] = p; render(); },
+                         `op group${names.length === 1 ? "" : "s"}`, `op-${k}`);
+    state.ep.page[k] = page.page;
+    state.ep.cards ||= {};
+    for (const name of names.slice(page.from, page.from + EP_CARDS)) {
+      const [pk, op, dir] = name.split("|"), gs = cards.get(name);
+      const st = state.ep.cards[`${k}|${name}`] ||= {open: false, page: 1};
+      const box = el("details", {class: "ep-card"}), summary = el("summary", {class: "ep-op-summary"});
+      const left = el("div"), head = el("div", {class: "ep-cardh"});
+      head.append(el("b", {}, op), el("span", {class: "ev-pill"}, epPlatName(pk)), el("span", {class: "ev-pill"}, dir),
+                  el("span", {class: "ep-dim"}, `${gs.length} episode${gs.length === 1 ? "" : "s"}`));
+      const affected = new Set(gs.flatMap((g) => g.rows.map((r) => r.case))).size;
+      const total = DATA.platforms[pk].episode_cases[op].filter((c) => c[1] === dir && (state.ep.dtype === "all" || c[2] === state.ep.dtype)).length;
+      left.append(head, el("div", {class: "ep-dim"}, `${affected} / ${total} catalogued inputs · shown onset ${epDate(gs[0].startDate)}`));
+      const badges = el("div", {class: "ep-hd"});
+      badges.append(epBadge(k, `${k === "lift" ? "peak input" : "worst input"} ${epPct(k === "lift" ? gs[0].mag : -gs[0].mag)}`));
+      for (const [cls, text] of epChips(gs[0])) badges.append(epBadge(cls, text));
+      left.append(badges, el("span", {class: "ep-expand"}, "Episodes"));
+      summary.append(left, epPlot(gs[0]));
+      const body = el("div", {class: "ep-op-body"});
+      const draw = () => {
+        body.textContent = "";
+        const paging = epPager(gs.length, EP_CARDS, st.page, (p) => { st.page = p; draw(); }, "episodes", `cohort-${k}-${name}`);
+        st.page = paging.page;
+        for (const g of gs.slice(paging.from, paging.from + EP_CARDS)) body.append(epGroupNode(g));
+        body.append(paging.bar);
+      };
+      box.append(summary, body);
+      box.open = st.open;
+      if (box.open) draw();
+      box.addEventListener("toggle", () => {
+        st.open = box.open;
+        if (box.open) { if (!body.childNodes.length) draw(); }
+        else body.textContent = "";
+      });
+      sec.append(box);
+    }
+    sec.append(page.bar);
+    return sec;
+  }
+
+  function epTiles(shown) {
+    const t = $("ep-tiles");
+    t.textContent = "";
+    for (const [k, title] of EP_SECTIONS) {
+      const gs = shown.filter((g) => g.sect === k);
+      const inputs = new Set(gs.flatMap((g) => g.rows.map((r) => `${g.platform}|${g.op}|${r.case}`))).size;
+      const b = el("button", {type: "button", class: "tile ep-tile", "aria-pressed": String(state.ep.sec === k)});
+      b.append(el("div", {class: "k"}, title), el("div", {class: "v"}, String(gs.length)),
+               el("div", {class: "k"}, `${inputs} input${inputs === 1 ? "" : "s"} · `
+                 + `${new Set(gs.map((g) => g.op)).size} op(s) · ${new Set(gs.map((g) => g.platform)).size} GPU(s)`));
+      b.onclick = () => { state.ep.sec = state.ep.sec === k ? null : k; render(); };
+      t.append(b);
+    }
+  }
+
+  function epControls() {
+    const ps = Object.keys(DATA.platforms);
+    const names = [...new Set(ps.flatMap((p) => Object.keys(DATA.platforms[p].episode_cases || {})))].sort();
+    for (const [id, value, options, label] of [["ep-gpu", state.ep.gpu, ps, "All GPUs"], ["ep-op", state.ep.op, names, "All ops"]]) {
+      const control = $(id);
+      control.textContent = "";
+      control.append(el("option", {value: "all"}, label));
+      for (const option of options) control.append(el("option", {value: option}, id === "ep-gpu" ? epPlatName(option) : option));
+      control.value = value;
+    }
+    const dts = [...new Set(Object.values(DATA.platforms).flatMap((p) => Object.values(p.episode_cases || {})
+      .flatMap((cs) => cs.map((c) => c[2]))))].sort();
+    if (state.ep.dtype !== "all" && !dts.includes(state.ep.dtype)) state.ep.dtype = "all";
+    const ds = $("ep-dtype");
+    ds.textContent = "";
+    ds.append(el("option", {value: "all"}, "all"));
+    for (const d of dts) ds.append(el("option", {value: d}, d));
+    ds.value = state.ep.dtype;
+    $("ep-range").value = String(state.ep.range);
+    $("ep-dir").value = state.ep.dir;
+    $("ep-sort").value = state.ep.sort;
+    const q = $("ep-q");
+    if (q.value !== state.ep.q) q.value = state.ep.q;  // never move the caret while the reader is typing
+  }
+
+  function episodes() {
+    const bn = $("ep-banner"), host = $("ep-sections");
+    bn.textContent = "";
+    $("ep-content").hidden = !epAny();
+    if (!epAny()) { bn.textContent = "This build carries no episode data."; return; }
+    epControls();
+    const q = state.ep.q.trim().toLowerCase();
+    const shown = epAll().filter((g) => epMatch(g, q));
+    bn.textContent = `Major change ≥${EP_PCT(EP_POLICY.threshold)}; recovery ≥${EP_PCT(1 - EP_POLICY.recovery)} of the pre-regression baseline. `
+      + `Both require ${EP_POLICY.confirmation} consecutive clean measurements. Missing or noisy data cannot confirm recovery. Only retained history is shown.`;
+    epTiles(shown);
+    host.textContent = "";
+    for (const [k, title] of EP_SECTIONS) {
+      if (state.ep.sec && state.ep.sec !== k) continue;
+      host.append(epSectionNode(k, title, shown.filter((g) => g.sect === k)));
+    }
+  }
+
+  // The view lives in the URL hash, so a link reopens exactly what the sender saw.
+  const TABS = ["overview", "trending", "episodes"];
+  const params = new URLSearchParams(location.hash.slice(1));
+  if (params.has("tab")) state.tab = TABS.includes(params.get("tab")) ? params.get("tab") : "overview";
+  else if ([...params.keys()].some((k) => k.startsWith("ep."))) state.tab = "episodes";
+  else if (params.has("platform") || params.has("op") || params.has("ev")) state.tab = "trending";
+  if (DATA.platforms[params.get("platform")]) state.platform = params.get("platform");
+  if (state.platform && params.get("op") && DATA.platforms[state.platform].latest[params.get("op")]) state.op = params.get("op");
+  if (["7", "14", "30", "60"].includes(params.get("nights"))) state.range = Number(params.get("nights"));
+  if (/^\d{8}$/.test(params.get("ev") || "")) state.ev = params.get("ev");
+  if (["fwd", "bwd"].includes(params.get("dir"))) state.dir = params.get("dir");
+  if (params.get("dtype")) state.dtype = params.get("dtype");
+  state.group = params.get("group") || (state.op === "all" ? "op" : "none");  // controls() falls back if not offered
+  for (const [k, v] of params) if (k.startsWith("in.") && state.op !== "all") state.inputs[k.slice(3)] = v;  // controls() drops a dtype this platform lacks
+  if (["light", "dark"].includes(params.get("theme"))) document.documentElement.dataset.theme = params.get("theme");
+  // Episodes reads its own ep.* parameters, each validated against what the page offers.
+  if (["7", "14", "30", "60"].includes(params.get("ep.nights"))) state.ep.range = Number(params.get("ep.nights"));
+  if (DATA.platforms[params.get("ep.gpu")]) state.ep.gpu = params.get("ep.gpu");
+  if (Object.values(DATA.platforms).some((p) => (p.episode_cases || {})[params.get("ep.op")])) state.ep.op = params.get("ep.op");
+  if (["fwd", "bwd"].includes(params.get("ep.dir"))) state.ep.dir = params.get("ep.dir");
+  if (params.get("ep.dtype")) state.ep.dtype = params.get("ep.dtype");  // epControls() drops a dtype with no episodes
+  if (params.get("ep.q")) state.ep.q = params.get("ep.q");
+  if (EP_SORTS.includes(params.get("ep.sort"))) state.ep.sort = params.get("ep.sort");
+  if (EP_SECTIONS.some(([k]) => k === params.get("ep.sec"))) state.ep.sec = params.get("ep.sec");
+  $("range").value = String(state.range);
+  const saveHash = () => {
+    const p = new URLSearchParams();
+    p.set("tab", state.tab);
+    if (state.platform) p.set("platform", state.platform);
+    if (state.op !== "all") p.set("op", state.op);
+    if (state.range !== 30) p.set("nights", state.range);
+    if (state.ev) p.set("ev", state.ev);
+    if (state.dir !== "all") p.set("dir", state.dir);
+    if (state.dtype !== "all") p.set("dtype", state.dtype);
+    if (state.group !== (state.op === "all" ? "op" : "none")) p.set("group", state.group);
+    if (state.op !== "all") for (const [k, v] of Object.entries(state.inputs)) p.set(`in.${k}`, v);
+    if (state.ep.range !== 30) p.set("ep.nights", state.ep.range);
+    if (state.ep.gpu !== "all") p.set("ep.gpu", state.ep.gpu);
+    if (state.ep.op !== "all") p.set("ep.op", state.ep.op);
+    if (state.ep.dir !== "all") p.set("ep.dir", state.ep.dir);
+    if (state.ep.dtype !== "all") p.set("ep.dtype", state.ep.dtype);
+    if (state.ep.q.trim()) p.set("ep.q", state.ep.q.trim());
+    if (state.ep.sort !== "date") p.set("ep.sort", state.ep.sort);
+    if (state.ep.sec) p.set("ep.sec", state.ep.sec);
+    if (document.documentElement.dataset.theme) p.set("theme", document.documentElement.dataset.theme);
+    history.replaceState(null, "", p.toString() ? "#" + p : location.pathname);
+  };
+
+  // ---- version info: what the latest night ran on.
+  function versions() {
+    const p = plat();
+    $("ver-sub").textContent = `Latest night (${DATA.date.slice(0, 4)}-${DATA.date.slice(4, 6)}-${DATA.date.slice(6)}) on `
+      + `${state.platform.toUpperCase()}.`;
+    const kv = $("ver-kv");
+    kv.textContent = "";
+    const rows = [
+      ["Version", p.version],
+      ["triton.__version__", p.triton],
+      ["Commit", null],
+      ["TLX tests on commit", p.ci ? undefined : "not recorded"],
+      ["PyTorch", p.torch],
+      ["GPU runtime", p.runtime || "–"],
+      ["Driver", p.driver || "–"],
+      ["GPU", p.gpu || state.platform.toUpperCase()],
+      ["Governing", (p.governed || []).join(" · ") || "none recorded"],
+      ["Timing", p.timing ? `${p.timing.latency_mode}, ${p.timing.replicates} replicate(s), ≥500 samples per case` : "–"],
+      ["Gate", `PIP below ${FLOOR}× speedup; noisy above 3% CV (reported, never failing)`],
+    ];
+    for (const [k, v] of rows) {
+      kv.append(el("dt", {}, k));
+      const dd = el("dd");
+      if (v === null) {
+        const a = el("a", {href: `${REPO}/commit/${p.sha}`});
+        a.append(el("code", {}, p.sha.slice(0, 12)));
+        dd.append(a);
+      } else if (v === undefined) {
+        dd.append(p.ci.run ? el("a", {href: p.ci.run, target: "_blank", rel: "noopener"}, p.ci.tlx_test) : p.ci.tlx_test);
+        if (p.ci.tlx_test !== "success") dd.style.color = "var(--critical)";
+      } else dd.textContent = v;
+      kv.append(dd);
+    }
+    const tb = el("table");
+    const hr = el("tr");
+    for (const h of ["op", "bench script", "reference", "autotune space", "cold compile timed"]) hr.append(el("th", {}, h));
+    tb.append(hr);
+    for (const [op, o] of Object.entries(p.latest)) {
+      const script = BENCH[op] || "–", space = o.space || "–", cold = o.cold;
+      const tr = el("tr");
+      const c = el("td"); c.append(el("code", {}, script));
+      tr.append(el("td", {}, op), c, el("td", {}, o.ref || (o.reason ? "not measured" : "none (TFLOP/s only)")), el("td", {}, space),
+                el("td", {}, {all: "every case", first: "first case per direction", none: "not timed"}[cold] || "–"));
+      tb.append(tr);
+    }
+    const box = $("ver-ops");
+    box.textContent = "";
+    box.append(tb);
+  }
+
+  // ---- how to run it: the same commands the nightly job runs, filled in for the current filters.
+  function copyable(text) {
+    const wrap = el("div", {class: "code"});
+    const pre = el("pre", {}, text);
+    const b = el("button", {type: "button"}, "Copy");
+    b.onclick = async () => {
+      try { await navigator.clipboard.writeText(text); }
+      catch {  // file:// pages may not get the async clipboard
+        const r = document.createRange(); r.selectNodeContents(pre);
+        const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); document.execCommand("copy"); sel.removeAllRanges();
+      }
+      b.textContent = "Copied"; setTimeout(() => { b.textContent = "Copy"; }, 1200);
+    };
+    wrap.append(pre, b);
+    return wrap;
+  }
+
+  function howto() {
+    const p = plat();
+    const amd = state.platform === "mi350";
+    const op = state.op !== "all" ? state.op : Object.keys(p.latest)[0];
+    const script = BENCH[op] || "bench_<op>.py";
+    // Direction has a CLI flag; dtype does not, so the dtype filter only narrows what the page shows.
+    const dirFlag = state.dir === "all" ? "" : ` --${state.dir}-only`;
+    const pageOnly = [state.dtype !== "all" ? "dtype" : "", state.op !== "all" && Object.keys(state.inputs).length ? "input" : ""]
+      .filter(Boolean).join(" and ");
+    $("howto-sub").textContent = `Commands for ${state.platform.toUpperCase()}${state.op !== "all" ? ` and ${op}` : ""}; `
+      + "change the filters above and they follow. Step 3b is exactly what the nightly job runs."
+      + (pageOnly ? ` The ${pageOnly} filters only narrow this page; the scripts run every shape in the op's suites.` : "");
+    const steps = [
+      ["1. Install the nightly wheel", "A clean Python 3.13 venv. torch pulls in its own Triton, which ships the same triton "
+        + "package, so remove it before installing fbtriton.",
+        `uv venv --python 3.13 .venv-bench && source .venv-bench/bin/activate
+uv pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/${amd ? "rocm7.2" : "cu130"}
+uv pip uninstall triton pytorch-triton pytorch-triton-rocm
+uv pip install --pre --no-deps fbtriton==${p.version} \\
+  --index-url https://${OWNER}.github.io/${NAME}/nightly/simple/
+uv pip install pytest numpy
+uv pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/${amd ? "rocm7.2" : "cu134"}`],
+      ["2. Check out the suite at the wheel's commit", "The bench scripts must match the wheel: shape suites and kernels move together.",
+        `git clone ${REPO}.git fbtriton && cd fbtriton
+git checkout ${p.sha}`],
+      [`3a. One op: ${op}`, "Picks the least-used GPU and locks its clocks itself (needs passwordless sudo; otherwise it says "
+        + "what it skipped). Exits 1 if any case is PIP or ERROR.",
+        `python python/test/tlx_benchmark/${script}${dirFlag}
+python python/test/tlx_benchmark/${script} --head 5${dirFlag || " --fwd-only"}   # quick look
+python python/test/tlx_benchmark/${script} --list-suites         # shape suites for this op`],
+      ["3b. Every op, as the nightly job runs it", "Ops with no kernel for this GPU are skipped. TorchTLX benches need Meta's "
+        + "patched PyTorch and run in the *-torchtlx-test jobs instead.",
+        `python -m pytest python/test/tlx_benchmark/test_ops_perf.py -k "not torchtlx" -v -s${dirFlag} \\
+  --junitxml=tlx-ops-bench.xml
+# --gpu N pins a GPU; --head N, --fwd-only and --bwd-only work here too`],
+      ["4. Results", "Tables print to the terminal. One JSON artifact per op is what this page is built from.",
+        `ls /tmp/tlx_benchmark/            # <op>.<arch>.json
+python .github/scripts/tlx_ops_bench_dashboard.py summarize /tmp/tlx_benchmark \\
+  --platform ${state.platform} --version ${p.version} --sha ${p.sha.slice(0, 8)} --out rel/${DATA.date}.${state.platform}.json
+python .github/scripts/tlx_ops_bench_dashboard.py render site --from rel   # preview the page`],
+    ];
+    const box = $("howto");
+    box.textContent = "";
+    for (const [title, note, cmd] of steps) {
+      const d = el("div", {class: "step"});
+      d.append(el("h3", {}, title), el("p", {}, note), copyable(cmd));
+      box.append(d);
+    }
+  }
+
+  // ---- events: per night, what changed since the night before (environment, suite, perf) and which commits could
+  // explain a perf change. Built by events() in tlx_ops_bench_dashboard.py; drawn as a lane under the trend and a card.
+  const evEsc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+  const evPct = (v) => (v > 0 ? "+" : "") + (v * 100).toFixed(1) + "%";
+  const evNum = (v) => v == null ? "–" : v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v >= 1 ? v.toFixed(2) : v.toFixed(3);
+  // Changed cases by time per call on the base night (launch and host included): the shorter the call, the larger
+  // the share of launch and timer noise.
+  const EV_TIME = [[100, "short calls · < 100 µs", "noisiest: a few µs of launch, host or timer jitter is a large share"],
+                   [1000, "medium calls · 100 µs – 1 ms", ""], [Infinity, "long calls · ≥ 1 ms", ""]];
+  function evRows(n, rows) {
+    const us = (v) => v == null ? "–" : evNum(v);
+    const row = ([c, r]) => `<tr><td class="ev-mono">${evEsc(r.key)}</td>`
+      + `<td class="num ev-col">${evNum(r.base)}</td><td class="num">${evNum(r.now)}</td><td class="num">${evNum(r.next)}</td>`
+      + `<td class="num ev-${c}t">${evPct(r.dt)}</td>`
+      + `<td class="num ev-col">${us(r.us)}</td><td class="num">${us(r.us_now)}</td>`
+      + `<td class="num">${r.dus == null ? "–" : (r.dus > 0 ? "+" : "") + r.dus.toFixed(1)}</td></tr>`;
+    const head = `<tr class="ev-units"><th></th><th colspan="4" class="ev-col">TLX TF/s</th><th colspan="3" class="ev-col">µs per call</th></tr>`
+      + `<tr><th>case</th><th class="num ev-col">${fmtDate(n.prev)}</th><th class="num">${fmtDate(n.date)}</th><th class="num">next night</th>`
+      + `<th class="num">Δ</th><th class="num ev-col">${fmtDate(n.prev)}</th><th class="num">${fmtDate(n.date)}</th><th class="num">Δ</th></tr>`;
+    if (!rows.some(([, r]) => r.us != null)) return head + rows.map(row).join("");
+    return head + EV_TIME.map(([hi, label, hint], i) => {
+      const lo = i ? EV_TIME[i - 1][0] : 0, g = rows.filter(([, r]) => r.us != null && r.us >= lo && r.us < hi);
+      if (!g.length) return "";
+      const count = (c, sym) => { const k = g.filter(([x]) => x === c).length; return k ? `<span class="ev-${c}t">${sym}${k}</span> ` : ""; };
+      return `<tr class="ev-grp"><td colspan="8"><b>${label}</b> ${count("bad", "▼")}${count("good", "▲")}${hint ? `<span class="ev-dim">${hint}</span>` : ""}</td></tr>`
+        + g.map(row).join("");
+    }).join("") + rows.filter(([, r]) => r.us == null).map(row).join("");
+  }
+  const evPr = (pr) => pr ? ` <a href="${REPO}/pull/${pr}" target="_blank" rel="noreferrer">#${pr}</a>` : "";
+  const evSha = (sha) => `<a class="ev-mono" href="${REPO}/commit/${sha}" target="_blank" rel="noreferrer">${sha}</a>`;
+  const evNight = (date) => (plat().events || []).find((n) => n.date === date);
+  const evOps = () => (state.op === "all" ? Object.keys(plat().latest) : [state.op]);
+  const evSuiteText = (s) => [s.added && `+${s.added}`, s.removed && `−${s.removed}`, s.broke && `${s.broke} now error`,
+    s.fixed && `${s.fixed} now measured`].filter(Boolean).join(" ");
+
+  // One night's glyphs over `ops`: slower and faster case counts, then environment and suite changes.
+  function evGlyphs(n, ops) {
+    const perf = {bad: null, good: null};
+    for (const op of ops) {
+      const p = n.perf[op];
+      if (!p) continue;
+      for (const [k, count] of [["bad", p.n_slower], ["good", p.n_faster]]) {
+        if (!count) continue;
+        const g = perf[k] ||= {kind: k, n: 0, unconfirmed: false};
+        g.n += count; g.unconfirmed ||= p.unconfirmed;
+      }
+    }
+    const out = Object.values(perf).filter(Boolean);
+    if (n.env.length) out.push({kind: "env"});
+    if (Object.keys(n.suite).some((o) => ops.includes(o))) out.push({kind: "suite"});
+    return out;
+  }
+  const evText = (g) => g.kind === "bad" ? "▼" + g.n : g.kind === "good" ? "▲" + g.n : g.kind === "env" ? "◆" : "▦";
+  const evChip = (g) => `<i class="ev-g ev-${g.kind}${g.unconfirmed ? " ev-unc" : ""}">${evText(g)}</i>`;
+
+  function evOpenNight(date, scroll) {
+    state.ev = date;
+    render();
+    if (scroll) $("ev-card").scrollIntoView({behavior: "smooth", block: "start"});
+  }
+
+  // Lane under the trend's x axis, drawn with trend()'s own geometry so glyphs line up with nights. Returns the
+  // chart's new height.
+  const EV_LANE = 54;
+  // Event badges for one night, as two rows: perf changes, then environment and suite changes.
+  const evBadgeRows = (n) => {
+    const gs = evGlyphs(n, evOps());
+    return [gs.filter((g) => g.kind === "bad" || g.kind === "good"), gs.filter((g) => g.kind === "env" || g.kind === "suite")];
+  };
+  const evBadgeW = (g) => 8 + evText(g).length * 6.4;
+  const evRowW = (items) => items.reduce((a, g) => a + evBadgeW(g), 0) + Math.max(items.length - 1, 0) * 3;
+  // The widest badge row across these nights: trend() spaces nights at least this far apart.
+  function evWidest(H) {
+    if (!plat().events) return 0;
+    return Math.max(0, ...H.map((night) => evNight(night.date)).filter(Boolean).flatMap((n) => evBadgeRows(n).map(evRowW)));
+  }
+
+  function evLane(svg, H, x, W, Hh, m, hit) {
+    if (!plat().events) return Hh;
+    const colW = (W - m.l - m.r) / Math.max(H.length - 1, 1);
+    const y0 = Hh + 2, pad = colW / 2 - 3;
+    svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y0, y2: y0, stroke: "var(--grid)"}));
+    svg.append(el("text", {svg: 1, x: m.l - 18, y: y0 + 16, "text-anchor": "end"}, "events"));
+    const COLOR = {bad: "var(--critical)", good: "var(--good)", env: "var(--warning)", suite: "var(--series-7)"};
+    H.forEach((night, i) => {
+      const n = evNight(night.date);
+      if (!n) return;
+      if (n.date === state.ev)
+        svg.insertBefore(s("rect", {x: x(i) - pad, y: m.t, width: 2 * pad, height: y0 + EV_LANE - 10 - m.t, rx: 4,
+                                    fill: "var(--series-1)", opacity: 0.08}), svg.firstChild);
+      evBadgeRows(n).forEach((items, r) => {
+        const ws = items.map(evBadgeW);
+        let gx = x(i) - evRowW(items) / 2;
+        items.forEach((g, j) => {
+          const c = COLOR[g.kind], solid = g.kind !== "env" && !g.unconfirmed;
+          svg.append(s("rect", {x: gx, y: y0 + 4 + r * 20, width: ws[j], height: 16, rx: 4, fill: solid ? c : "var(--surface-1)",
+                                stroke: c, "stroke-width": g.unconfirmed ? 1.5 : 1, ...(g.unconfirmed ? {"stroke-dasharray": "3 2"} : {})}));
+          const t = el("text", {svg: 1, x: gx + ws[j] / 2, y: y0 + 16 + r * 20, "text-anchor": "middle"}, evText(g));
+          t.setAttribute("style", `fill:${solid ? "#fff" : c};font-weight:600;font-size:11px`);
+          svg.append(t);
+          gx += ws[j] + 3;
+        });
+      });
+      const tgt = s("rect", {x: x(i) - colW / 2, y: y0, width: colW, height: EV_LANE - 10, fill: "transparent", style: "cursor:pointer"});
+      tgt.addEventListener("click", () => evOpenNight(night.date, true));
+      svg.append(tgt);
+    });
+    hit.style.cursor = "pointer";
+    return Hh + EV_LANE;
+  }
+
+  function evCard() {
+    const box = $("ev-card");
+    const n = plat().events && state.ev && evNight(state.ev);
+    box.hidden = !plat().events;
+    if (box.hidden) return;
+    const where = `${state.platform.toUpperCase()} · ${state.ev ? fmtDate(state.ev) : ""}`;
+    if (!n) { box.innerHTML = `<h2>Night details</h2><p class="sub">Click a night on the trend for what changed since the night before, and which commits could explain it.</p>`; return; }
+    if (!n.prev) { box.innerHTML = `<h2>${where}</h2><p class="sub">First night kept; nothing to compare against.</p>`; return; }
+    const ops = evOps(), perfOps = ops.filter((o) => n.perf[o]);
+    let perf = "", sus = "";
+    for (const op of perfOps) {
+      const p = n.perf[op], rows = [...p.slower.map((r) => ["bad", r]), ...p.faster.map((r) => ["good", r])];
+      const hidden = p.n_slower + p.n_faster - rows.length;
+      perf += `<div class="ev-op"><div class="ev-oph"><b>${op}</b>
+        ${p.n_slower ? evChip({kind: "bad", n: p.n_slower, unconfirmed: p.unconfirmed}) : ""}${p.n_faster ? evChip({kind: "good", n: p.n_faster, unconfirmed: p.unconfirmed}) : ""}
+        <span class="ev-dim">of ${p.compared} cases timed on both nights</span>
+        ${p.signature === "host" ? `<span class="ev-pill ev-host">host-side · median ${p.median_dus > 0 ? "+" : ""}${p.median_dus.toFixed(1)} µs per call regardless of size</span>`
+          : p.signature === "kernel" ? `<span class="ev-pill">kernel-side · similar % across sizes</span>` : ""}
+        ${p.unconfirmed ? `<span class="ev-pill ev-uncp">unconfirmed · awaits next night</span>` : ""}</div>
+        <details${rows.length <= 8 ? " open" : ""}><summary>${p.n_slower + p.n_faster} changed case${p.n_slower + p.n_faster > 1 ? "s" : ""}</summary>
+        <table>${evRows(n, rows)}
+        </table><p class="note">A case counts when its TF/s moves ≥${DATA.threshold * 100}% and the next night holds it.${hidden ? ` ${hidden} more not listed.` : ""}</p></details></div>`;
+      if (p.suspects.length)
+        sus += `<div class="ev-op"><div class="ev-oph"><b>${op}</b><span class="ev-dim">ranked by the most relevant file each commit touches on ${state.platform.toUpperCase()}${p.signature === "host" ? "; host-side, so dispatch and harness first" : ""}</span></div>` +
+          p.suspects.map((c, i) => `<div class="ev-sus"><span class="ev-dim">${i + 1}</span><span>${evSha(c.sha)}${evPr(c.pr)}</span><span class="ev-area ev-a-${c.area.split(" ")[0]}">${c.area}</span><span class="ev-title" title="${evEsc(c.title)}">${evEsc(c.title)}</span></div>`).join("") +
+          (p.more ? `<p class="note">+${p.more} lower-ranked commits</p>` : "") + "</div>";
+    }
+    const env = n.env.length ? n.env.map((e) => `<div><b>${e.field}</b> ${evEsc(e.from)} <span class="ev-dim">→</span> ${evEsc(e.to)}</div>`).join("")
+      : `<span class="ev-dim">unchanged · ${evEsc(n.numa || "–")} · driver ${evEsc(n.driver || "–")} · torch ${evEsc(n.torch || "–")}</span>`;
+    const so = Object.entries(n.suite).filter(([o]) => ops.includes(o));
+    const suite = so.length ? so.map(([o, s]) => `<div><b>${o}</b> ${s.new ? `new op, ${s.total} cases` : s.gone ? "no longer reported"
+      : `${evSuiteText(s)} <span class="ev-dim">(${s.total} cases now)</span>`}${n.breaks.includes(o) && !s.new && !s.gone ? ' <span class="ev-dim">· no cases in common with the previous night</span>' : ""}</div>`).join("")
+      : '<span class="ev-dim">unchanged</span>';
+    const nosus = n.commits === null ? "commit history unavailable in this checkout"
+      : perfOps.length ? "no commit in range touches files relevant here" : "ranked only for ops with a perf change";
+    const link = new URLSearchParams(location.hash.slice(1)); link.set("ev", n.date);
+    box.innerHTML = `<div class="ev-ch"><h2>${state.platform.toUpperCase()} · ${fmtDate(n.date)} vs ${fmtDate(n.prev)}${state.op !== "all" ? " · " + state.op : ""}</h2>
+      <span class="ev-dim">wheel <span class="ev-mono">${n.range}</span>${n.commits === null ? "" : ` · ${n.commits} commits`} · <a href="${n.compare}" target="_blank" rel="noreferrer">compare</a> · <a href="#${link}">link</a> ·
+      <a href="#" id="ev-close">close</a></span></div>
+      <div class="ev-sec"><div class="ev-h">Performance</div><div>${perf || `<span class="ev-dim">no case moved ≥${DATA.threshold * 100}% and held</span>`}</div></div>
+      <div class="ev-sec"><div class="ev-h">Environment</div><div>${env}</div></div>
+      <div class="ev-sec"><div class="ev-h">Suite</div><div>${suite}</div></div>
+      <div class="ev-sec"><div class="ev-h">Suspects</div><div>${sus || `<span class="ev-dim">${nosus}</span>`}</div></div>`;
+    $("ev-close").onclick = (e) => { e.preventDefault(); state.ev = null; render(); };
+  }
+
+  // Summary-table comparison with the previous night. Counts compare the group's cases on both nights; TF/s and
+  // speedup compare like for like, over cases timed on both nights, so a suite change never reads as a perf change.
+  function evCompare(g, groups) {
+    const H = plat().history;
+    if (H.length < 2) return {};
+    const A = H[H.length - 2], B = H[H.length - 1], key = (c) => `${c.l}|${c.d}|${c.dt}`;
+    const before = groupCases(A.ops, g, groups).filter(matches), after = groupCases(B.ops, g, groups).filter(matches);
+    const cnt = (cs, st) => cs.filter((c) => c.s === st).length;
+    const sp = [], tf = [];
+    for (const op of scopeOps()) {
+      const prev = new Map((A.ops[op] ? A.ops[op].cases : []).map((c) => [key(c), c]));
+      for (const c of B.ops[op] ? B.ops[op].cases : []) {
+        const v = groupOf(c, op), p = prev.get(key(c));
+        if ((g === OTHER ? groups.includes(v) : v !== g) || !p || !matches(c) || c.s === "error" || p.s === "error") continue;
+        if (c.t && p.t) tf.push(c.t / p.t);
+        if (c.x && p.x) sp.push(c.x / p.x);
+      }
+    }
+    return {_m: tf.length, _d: {n: after.length - before.length, ok: cnt(after, "ok") - cnt(before, "ok"),
+      noisy: cnt(after, "noisy") - cnt(before, "noisy"), pip: cnt(after, "pip") - cnt(before, "pip"),
+      error: cnt(after, "error") - cnt(before, "error"),
+      tflops: tf.length ? geomean(tf) - 1 : null, speedup: sp.length ? geomean(sp) - 1 : null}};
+  }
+  // Append a row's change to its cell: absolute for counts, % for TF/s and speedup. Up is good only for ok, TF/s, speedup.
+  const EV_UP_GOOD = {ok: 1, tflops: 1, speedup: 1}, EV_UP_BAD = {noisy: 1, pip: 1, error: 1};
+  function evDelta(td, k, r) {
+    if (!r._d || !(k in r._d) || r[k] === null || r[k] === undefined) return;
+    const v = r._d[k], pct = k === "tflops" || k === "speedup";
+    if (!pct && !v) return;
+    const d = el("span", {class: "ev-delta"}, v === null ? "–"
+      : pct ? `${v >= 0 ? "+" : "−"}${Math.abs(v * 100).toFixed(1)}%` : `${v > 0 ? "+" : "−"}${Math.abs(v)}`);
+    if (v !== null && (pct ? Math.abs(v) >= 0.02 : true) && (EV_UP_GOOD[k] || EV_UP_BAD[k]))
+      d.style.color = (v > 0) === !!EV_UP_GOOD[k] ? "var(--good-text)" : "var(--critical)";
+    if (pct) td.title = `${r._m} of ${r.n} cases timed on both nights`;
+    td.append(d);
+  }
+
+  function render() {
+    for (const name of TABS) {
+      const selected = state.tab === name, tab = $(`tab-${name}`);
+      tab.setAttribute("aria-selected", String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+      $(name).hidden = !selected;
+    }
+    if (state.tab === "trending") {
+      $("trending-content").hidden = !state.platform;
+      if (state.platform) {
+        controls(); banner(); inputs(); tiles(); trend(); evCard(); dist(); cases(); table(); versions(); howto();
+      } else $("banner").textContent = "No nightly results published yet.";
+    } else if (state.tab === "episodes") episodes();
+    saveHash();
+  }
+  for (const [i, name] of TABS.entries()) {
+    const tab = $(`tab-${name}`);
+    tab.onclick = () => { state.tab = name; render(); };
+    tab.onkeydown = (e) => {
+      const next = {ArrowRight: (i + 1) % TABS.length, ArrowLeft: (i + TABS.length - 1) % TABS.length,
+        Home: 0, End: TABS.length - 1}[e.key];
+      if (next === undefined) return;
+      e.preventDefault();
+      state.tab = TABS[next];
+      render();
+      $(`tab-${state.tab}`).focus();
+    };
+  }
+  $("platform").onchange = (e) => { state.platform = e.target.value; state.trendScroll = null; state.hidden.clear(); render(); };
+  $("range").onchange = (e) => { state.range = Number(e.target.value); state.trendScroll = null; render(); };
+  $("dir").onchange = (e) => { state.dir = e.target.value; state.rows = 50; render(); };
+  $("dtype").onchange = (e) => { state.dtype = e.target.value; state.rows = 50; render(); };
+  $("group").onchange = (e) => { state.group = e.target.value; state.hidden.clear(); state.sortSum = {key: null, dir: 1}; render(); };
+  $("op").onchange = (e) => {
+    state.op = e.target.value;
+    state.hidden.clear();
+    state.rows = 50; state.sort = {key: null, dir: 1}; render(); };
+  $("theme").onclick = () => {
+    const r = document.documentElement;
+    const dark = r.dataset.theme ? r.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    r.dataset.theme = dark ? "light" : "dark";
+    saveHash();
+  };
+  window.addEventListener("resize", () => {
+    if (state.tab === "trending" && state.platform) { trend(); dist(); cases(); }
+  });
+  $("cases-sort").onchange = (e) => { state.casesSort = e.target.value; cases(); };
+  // A changed window, direction or dtype rebuilds the groups, so paging and expansion reset.
+  const epReset = () => { state.ep.page = {reg: 1, lift: 1, rec: 1}; state.ep.open.clear(); state.ep.det = {}; state.ep.cards = {}; };
+  $("ep-gpu").onchange = (e) => { state.ep.gpu = e.target.value; epReset(); render(); };
+  $("ep-op").onchange = (e) => { state.ep.op = e.target.value; epReset(); render(); };
+  $("ep-range").onchange = (e) => { state.ep.range = Number(e.target.value); epReset(); render(); };
+  $("ep-dir").onchange = (e) => { state.ep.dir = e.target.value; epReset(); render(); };
+  $("ep-dtype").onchange = (e) => { state.ep.dtype = e.target.value; epReset(); render(); };
+  $("ep-sort").onchange = (e) => { state.ep.sort = e.target.value; state.ep.page = {reg: 1, lift: 1, rec: 1}; render(); };
+  $("ep-q").oninput = (e) => { state.ep.q = e.target.value; state.ep.page = {reg: 1, lift: 1, rec: 1}; render(); };
+  $("ep-clear").onclick = () => {
+    state.ep.range = 30; state.ep.gpu = "all"; state.ep.op = "all"; state.ep.dir = "all"; state.ep.dtype = "all"; state.ep.q = ""; state.ep.sort = "date";
+    state.ep.sec = null; epReset(); render();
+  };
+  for (const p of (RAW && RAW.overview) || []) {
+    const item = el("li"), date = p.date;
+    item.append(el("a", {href: p.source, target: "_blank", rel: "noopener"},
+      `${p.platform.toUpperCase()} · ${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6)} · source JSON`),
+      document.createTextNode(` · ${p.version || ""} · `),
+      el("a", {href: `${REPO}/commit/${p.sha}`, target: "_blank", rel: "noopener"}, p.sha.slice(0, 12)));
+    $("overview-sources").append(item);
+  }
+  render();
+})();
+</script>
+</body>
+</html>

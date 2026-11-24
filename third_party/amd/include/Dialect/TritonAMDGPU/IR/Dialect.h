@@ -41,6 +41,10 @@ struct L2Cache : public SideEffects::Resource::Base<L2Cache> {
 } // namespace mlir::triton::amd
 
 namespace mlir::triton::amdgpu {
+/// Unit attribute on a scaled dot whose FP6 operands are already packed per
+/// 32-code segment: 24 packed bytes followed by 8 padding bytes per lane.
+constexpr llvm::StringLiteral kFp6PackedAttrName = "amdg.fp6_packed";
+
 /// Returns the number of dwords for a TDM tensor descriptor based on rank.
 /// 2D tensors: group0 (4) + group1 (8) = 12 dwords
 /// 3D-5D tensors: group0 (4) + group1 (8) + group2 (4) + group3 (4) = 20 dwords
@@ -48,6 +52,15 @@ inline int getTensorDescNumDwords(triton::TensorDescType type) {
   auto shape = type.getShape();
   return (shape.size() > 2) ? (4 + 8 + 4 + 4) : (4 + 8);
 }
+
+/// Derives the scale layout an fp4 scaled upcast requires from the layout of
+/// its output. `scaleShape` must have the same rank as the output and match it
+/// on every dimension but `axis`, where it must divide the output extent. The
+/// result is canonical: broadcast (zero) register bases are dropped so a thread
+/// keeps one register per distinct scale value.
+FailureOr<triton::LinearLayout> inferScaledUpcastFp4ScaleLayout(
+    const triton::LinearLayout &outputLL, ArrayRef<int64_t> scaleShape,
+    int64_t axis, function_ref<InFlightDiagnostic()> emitError = nullptr);
 } // namespace mlir::triton::amdgpu
 
 // clang-format off

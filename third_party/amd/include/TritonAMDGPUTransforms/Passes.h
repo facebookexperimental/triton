@@ -22,12 +22,16 @@ namespace mlir::triton::amdgpu {
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
 void registerTritonAMDGPUOptimizeDotOperands();
+
+// Attaches NpotTargetLegality to TritonAMDGPUDialect when it loads.
+void registerNpotTargetLegality(DialectRegistry &registry);
 } // namespace mlir::triton::amdgpu
 
 namespace mlir {
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION
 #include "TritonAMDGPUTransforms/Passes.h.inc"
+
 } // namespace mlir
 
 #endif // TRITON_THIRD_PARTY_AMD_INCLUDE_TRITONAMDGPUTRANSFORMS_PASSES_H_

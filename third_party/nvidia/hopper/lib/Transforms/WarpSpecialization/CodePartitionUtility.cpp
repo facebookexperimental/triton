@@ -8,6 +8,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/Support/JSON.h"
 #include <list>
 #include <unordered_set>
@@ -21,39 +22,6 @@ namespace mlir {
 #define DEBUG_TYPE "nvgpu-ws-utility"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
-
-SmallVector<bool> getAutoWSBooleanFlags(triton::FuncOp funcOp,
-                                        ArrayRef<StringRef> keys) {
-  SmallVector<bool> flags(keys.size(), false);
-  unsigned pending = keys.size();
-  if (pending == 0)
-    return flags;
-  funcOp.walk([&](Operation *op) {
-    auto attr = op->getAttrOfType<StringAttr>(tt::kAutoWSAnnotationAttrName);
-    if (!attr)
-      return WalkResult::advance();
-    auto parsed = llvm::json::parse(attr.getValue());
-    if (!parsed) {
-      llvm::consumeError(parsed.takeError());
-      return WalkResult::advance();
-    }
-    auto *object = parsed->getAsObject();
-    if (!object)
-      return WalkResult::advance();
-    for (unsigned i = 0; i < keys.size(); ++i) {
-      if (flags[i] || !object->getBoolean(keys[i]).value_or(false))
-        continue;
-      flags[i] = true;
-      --pending;
-    }
-    return pending == 0 ? WalkResult::interrupt() : WalkResult::advance();
-  });
-  return flags;
-}
-
-bool getAutoWSBooleanFlag(triton::FuncOp funcOp, StringRef key) {
-  return getAutoWSBooleanFlags(funcOp, {key}).front();
-}
 
 void removeWarpSpecMetadata(triton::FuncOp funcOp) {
   // The canonical set of attributes AutoWS stamps on ops/loops. `removeAttr` is
@@ -919,19 +887,9 @@ int channelInReuseGroup(Channel *channel, ReuseConfig *config,
 // flows into another", used by both the memory planner (hasPotentialReuse) and
 // code partitioning (hasDependencyChain).  A memory hop is needed for chains
 // that pass through a shared buffer, e.g. dpT -> dsT (stored to smem) -> read
-// by the dq MMA. Climb memdesc view ops (index/subslice/reinterpret/trans) to
-// the underlying buffer value, so different slots/views of one multi-buffered
-// alloc share a root.
-static Value getRootBuffer(Value v) {
-  while (auto *def = v.getDefiningOp()) {
-    if (isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp,
-            ttg::MemDescReinterpretOp, ttg::MemDescTransOp>(def))
-      v = def->getOperand(0);
-    else
-      break;
-  }
-  return v;
-}
+// by the dq MMA. Climb allocation-preserving memdesc view ops via
+// MemDescViewTrait to the underlying buffer value, so different slots/views of
+// one multi-buffered alloc share a root.
 
 bool dependsThroughMemory(Operation *srcOp, Operation *dstOp,
                           bool followBufferReuse) {
@@ -962,7 +920,8 @@ bool dependsThroughMemory(Operation *srcOp, Operation *dstOp,
     if (isa<ttg::LocalStoreOp, ttng::TMEMStoreOp>(op))
       for (auto operand : op->getOperands())
         if (isa<ttg::MemDescType>(operand.getType())) {
-          Value buf = followBufferReuse ? getRootBuffer(operand) : operand;
+          Value buf =
+              followBufferReuse ? mlir::getMemDescRoot(operand) : operand;
           for (auto *user : buf.getUsers())
             if (user != op && visited.insert(user).second)
               worklist.push_back(user);
@@ -1101,12 +1060,8 @@ static bool tmemReuseGroupOverlaps(ReuseGroup *group) {
     auto *allocOp = ch->getAllocOp();
     if (!allocOp)
       return false;
-    auto memDescType = cast<ttg::MemDescType>(allocOp->getResult(0).getType());
-    int64_t numCols = ttng::getTmemAllocSizes(memDescType).numCols;
-    int64_t off = 0;
-    if (auto a = allocOp->getAttrOfType<IntegerAttr>("buffer.offset"))
-      off = a.getInt();
-    ranges.push_back({off, off + numCols});
+    auto [lo, hi] = getTmemColumnRange(allocOp);
+    ranges.push_back({lo, hi});
   }
   for (unsigned i = 0; i < ranges.size(); ++i)
     for (unsigned j = i + 1; j < ranges.size(); ++j)
@@ -1368,6 +1323,38 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
   return true;
 }
 
+int64_t getTmemBufferOffset(Operation *allocOp) {
+  assert(allocOp && "TMEM column queries require an allocation");
+  if (auto attr = allocOp->getAttrOfType<IntegerAttr>("buffer.offset"))
+    return attr.getInt();
+  return 0;
+}
+
+std::pair<int64_t, int64_t> getTmemColumnRange(Operation *allocOp) {
+  assert(allocOp && "TMEM column queries require an allocation");
+  auto memDescType = cast<ttg::MemDescType>(allocOp->getResult(0).getType());
+  int64_t offset = getTmemBufferOffset(allocOp);
+  int64_t numCols = ttng::getTmemAllocSizes(memDescType).numCols;
+  return {offset, offset + numCols};
+}
+
+std::pair<int64_t, int64_t> getTmemColumnRange(Channel *channel) {
+  assert(channel && "TMEM column queries require a channel");
+  Operation *allocOp = channel->getAllocOp();
+  assert(allocOp && "TMEM reuse channel must have an allocation");
+  return getTmemColumnRange(allocOp);
+}
+
+bool tmemColumnRangesOverlap(std::pair<int64_t, int64_t> rangeA,
+                             std::pair<int64_t, int64_t> rangeB) {
+  return rangeA.first < rangeB.second && rangeB.first < rangeA.second;
+}
+
+bool tmemColumnRangesOverlap(Operation *allocA, Operation *allocB) {
+  return tmemColumnRangesOverlap(getTmemColumnRange(allocA),
+                                 getTmemColumnRange(allocB));
+}
+
 bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh) {
   if (!ownerCh)
     return false;
@@ -1416,46 +1403,16 @@ bool verifyReuseGroupCrossPartition(ReuseGroup *group) {
   return !orderReuseGroupChain(group).empty();
 }
 
-// Returns the (possibly reuse-group staggered) accumulation count for `ch` at
-// `op`: `accumCnt` for the representative channel (or when there is no reuse
-// group), or `accumCnt + theIdx` for a channel at position `theIdx` within its
-// reuse group. This is the raw count from which bufferIdx (% numBuffers) and
-// phase (/ numBuffers & 1) are derived.
-//
-// Note: subtiled-region reuse members no longer flow through here for their
-// staging-buffer slot -- that index (and the shared barrier's bufferIdx/phase)
-// is computed inside the tile body from the op's builtin tileIdx (see
-// insertAsyncComm in WSCodePartition.cpp and docs/SubtileOperator.md).
-static Value
-getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
-                     const DenseSet<Operation *> &regionsWithChannels,
-                     ReuseConfig *config, int reuseGroupIdx, Channel *ch) {
-  Value accumCnt =
-      getAccumCount(builder, op, regionsWithChannels, config, reuseGroupIdx);
-  if (reuseGroupIdx < 0)
-    return accumCnt;
-  // op is a user of the channel. accumCnt is the corresponding argument of the
-  // parentForOp.
-  // Go through chList in the parentForOp, assume ch is directly in parentForOp.
-  // FIXME: handle the case where ch is inside in IfOp.
+// Position of `ch`'s consumer group within `group`, walking the body of the
+// enclosing control region: `theIdx` indexes the body ops that are dstOps of
+// the group's channels, with `targetOccurrence` disambiguating several channels
+// that share one dstOp but belong to different consumer groups.
+static int getReuseGroupPositionInRegion(ReuseGroup *group,
+                                         Operation *parentRegion, Channel *ch) {
   SmallVector<Operation *> chList;
-  // The enclosing loop holding the reuse-group channels can be an scf.for or,
-  // for a static persistent while-loop kernel, an scf.while (the channels live
-  // directly in the while's after region). Using getParentOfType<scf::ForOp>()
-  // alone would be null for the while case and crash getReuseChannels.
-  Operation *parentLoop = op->getParentOfType<scf::ForOp>();
-  if (!parentLoop)
-    parentLoop = op->getParentOfType<scf::WhileOp>();
-  getReuseChannels(config->getGroup(reuseGroupIdx), parentLoop, chList);
+  getReuseChannels(group, parentRegion, chList);
   assert(chList.size() >= 1);
 
-  // When multiple channels in the reuse group share the same getDstOp() but
-  // belong to different consumer groups (different consumer task IDs or
-  // different full consumer sets), getReuseChannels pushes one chList entry
-  // per channel. We must find the correct entry by counting how many
-  // *distinct consumer groups* with the same getDstOp() appear before ch's
-  // consumer group in the reuse group's channel list.
-  auto *group = config->getGroup(reuseGroupIdx);
   int targetOccurrence = 0;
   SmallVector<Channel *> seenGroups;
   for (auto *grpCh : group->channels) {
@@ -1477,17 +1434,79 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     }
   }
 
-  int vecIdx = 0, theIdx = -1, matchNum = 0;
+  int vecIdx = 0, matchNum = 0;
   for (auto *tCh : chList) {
     if (tCh == ch->getDstOp()) {
-      if (matchNum == targetOccurrence) {
-        theIdx = vecIdx;
-        break;
-      }
+      if (matchNum == targetOccurrence)
+        return vecIdx;
       matchNum++;
     }
     ++vecIdx;
   }
+  return -1;
+}
+
+// Same position, for an `op` with no enclosing control region at all (the
+// epilogue of a non-persistent kernel). getReuseChannels needs a region body to
+// walk and there is none, but `group->channels` is in the same program order
+// that walk would have produced, so the member's position is still well
+// defined. The members must occupy distinct slots even with no iteration to
+// count: they share one circular buffer and one barrier array, so collapsing
+// them onto slot 0 makes the second member arrive on a barrier nobody waits on
+// and the full/empty parity never recovers.
+static int getReuseGroupPositionNoRegion(ReuseGroup *group, Channel *ch) {
+  int pos = 0;
+  SmallVector<Channel *> seenGroups;
+  for (auto *grpCh : group->channels) {
+    if (sameConsumerGroup(grpCh, ch))
+      return pos;
+    bool alreadySeen = false;
+    for (auto *seen : seenGroups) {
+      if (sameConsumerGroup(seen, grpCh)) {
+        alreadySeen = true;
+        break;
+      }
+    }
+    if (!alreadySeen) {
+      seenGroups.push_back(grpCh);
+      ++pos;
+    }
+  }
+  return -1;
+}
+
+// Returns the (possibly reuse-group staggered) accumulation count for `ch` at
+// `op`: `accumCnt` for the representative channel (or when there is no reuse
+// group), or `accumCnt + theIdx` for a channel at position `theIdx` within its
+// reuse group. This is the raw count from which bufferIdx (% numBuffers) and
+// phase (/ numBuffers & 1) are derived.
+//
+// Note: subtiled-region reuse members no longer flow through here for their
+// staging-buffer slot -- that index (and the shared barrier's bufferIdx/phase)
+// is computed inside the tile body from the op's builtin tileIdx (see
+// insertAsyncComm in WSCodePartition.cpp and docs/SubtileOperator.md).
+static Value
+getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+                     const DenseSet<Operation *> &regionsWithChannels,
+                     ReuseConfig *config, int reuseGroupIdx, Channel *ch) {
+  Value accumCnt =
+      getAccumCount(builder, op, regionsWithChannels, config, reuseGroupIdx);
+  if (reuseGroupIdx < 0)
+    return accumCnt;
+  // op is a user of the channel. accumCnt is the corresponding argument of the
+  // enclosing control region. Order reuse members in the nearest control
+  // region so channels directly inside a collective IfOp are not collapsed to
+  // the IfOp entry in an enclosing loop's channel list. An op with no enclosing
+  // region at all (the epilogue of a non-persistent kernel) has no body to
+  // walk, so its position comes from the group's channel order instead.
+  auto *group = config->getGroup(reuseGroupIdx);
+  Operation *parentRegion = op->getParentOp();
+  while (parentRegion &&
+         !isa<scf::ForOp, scf::IfOp, scf::WhileOp>(parentRegion))
+    parentRegion = parentRegion->getParentOp();
+  int theIdx = parentRegion
+                   ? getReuseGroupPositionInRegion(group, parentRegion, ch)
+                   : getReuseGroupPositionNoRegion(group, ch);
   assert(theIdx >= 0);
   // Early-TMA *same-partition* staging buffers (buffer.tmaStaging > 0 AND the
   // channel producer and consumer are in the same warp task): the
@@ -3695,10 +3714,15 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
           producerTaskId, consumerTaskIds, allocOp, channels.size()));
       channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
       auto *post = static_cast<AllocChannel *>(channels.back().get());
-      // Cache the resolved producer op so getSrcOp() survives a sibling
-      // subtiled-region channel's lowering. Skip the direct alloc-with-src case
-      // (producerOp == allocOp), where getSrcOp() intentionally returns null.
-      if (producerOp != allocOp)
+      // Fix the regression introduced by 401386fae8: cache only
+      // subtiled-region producers, whose template store survives sibling
+      // channel lowering. Ordinary TMA producers are replaced and erased by
+      // optimizeTMALoads, so caching them would leave a dangling pointer;
+      // getSrcOp() must rediscover their replacement from alloc users.
+      bool isSubtiledProducer =
+          producerOp && (isa<ttng::SubtiledRegionOp>(producerOp) ||
+                         producerOp->getParentOfType<ttng::SubtiledRegionOp>());
+      if (producerOp != allocOp && isSubtiledProducer)
         post->cachedSrcOp = producerOp;
     }
   }

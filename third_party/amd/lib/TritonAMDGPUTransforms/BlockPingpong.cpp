@@ -9,7 +9,8 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
-#include "third_party/amd/lib/TritonAMDGPUTransforms/PipelineUtility.h"
+#include "third_party/amd/lib/TritonAMDGPUTransforms/Pipeliner/PipelineUtility.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -28,8 +29,6 @@ namespace mlir {
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
 namespace {
-
-using SchedGroupMask = ROCDL::SchedGroupMask;
 
 static LLVM::FenceOp createLocalMMRAFence(OpBuilder &builder, Location loc,
                                           LLVM::AtomicOrdering ordering) {
@@ -144,7 +143,7 @@ private:
   template <typename T>
   size_t countIfMemoryOps(scf::IfOp ifOp, bool assumeNotTaken);
   template <typename T>
-  size_t estimateNonDotMemoryImpact(T *start, T *end, bool assumeNotTaken);
+  size_t estimateNonDotMemoryImpact(ArrayRef<T> ops, bool assumeNotTaken);
   void determineDotMemoryOps(tt::DotOp dotOp,
                              DenseSet<tt::LoadOp> &dotGlobalLoads,
                              DenseSet<ttg::LocalLoadOp> &dotLocalLoads,
@@ -221,7 +220,7 @@ SmallVector<Operation *> Pingponger::genClusterBarrier(OpBuilder &builder,
   auto barrierOp = triton::gpu::BarrierOp::create(
       builder, loc, triton::gpu::AddrSpace::Local);
   auto schedBarrierOp =
-      ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none);
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none);
   return {barrierOp, schedBarrierOp};
 }
 void Pingponger::appendClusterBarrier(OpBuilder &builder, Location loc) {
@@ -351,12 +350,12 @@ size_t Pingponger::countIfMemoryOps(scf::IfOp ifOp, bool assumeNotTaken) {
 // rounded to an integer. This is used to determine any possible
 // influence on cluster setup.
 template <typename T>
-size_t Pingponger::estimateNonDotMemoryImpact(T *start, T *end,
+size_t Pingponger::estimateNonDotMemoryImpact(ArrayRef<T> ops,
                                               bool assumeNotTaken) {
   DenseSet<Operation *> visitedParents;
   size_t count = 0;
-  for (auto it = start; it != end; it++) {
-    auto parent = (*it)->getParentOp();
+  for (T op : ops) {
+    auto parent = op->getParentOp();
     if (parent == nullptr)
       continue;
     if (parent == forOp)
@@ -433,7 +432,7 @@ void Pingponger::transformOnePPClusters(OpBuilder &builder, Location loc) {
   // sched barrier to prevent memory ops from cross but leave other ops to be
   // scheduled across the barrier.
   auto preDotBar = ROCDL::SchedBarrier::create(
-      builder, loc, SchedGroupMask::non_mem_non_sideeffect);
+      builder, loc, ROCDL::SchedGroupMask::non_mem_non_sideeffect);
   updateOpInsertion(dotLoc);
   appendOp(preDotBar);
 
@@ -441,7 +440,8 @@ void Pingponger::transformOnePPClusters(OpBuilder &builder, Location loc) {
   updateOpInsertion(lLoadOps[0]);
   appendOp(ROCDL::SetPrioOp::create(builder, loc, highPriority));
   moveOpAndPredecessorsUpSameBlock(gLoadOps[0]);
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   moveOpAndPredecessorsUpSameBlock(lLoadOps[1]);
   appendOp(ROCDL::SetPrioOp::create(builder, loc, lowPriority));
   moveOpAndPredecessorsUpSameBlock(gLoadOps[1]);
@@ -483,8 +483,22 @@ LogicalResult Pingponger::genLocalSlice(OpBuilder &builder, Value v,
   // Each slice cannot be smaller than the smallest supported mfma width.
   if (sliceWidth < 16)
     return failure();
+  int64_t sliceKWidth = kWidth;
+  auto arch = getAMDArch(forOp->getParentOfType<ModuleOp>());
+  if (arch && arch->split(':').first == "gfx942") {
+    // A K slice must not retain a layout whose minimal K tile is wider than
+    // the slice. Otherwise the layout duplicates operands, and the small-K
+    // correction in MFMA lowering also scales the incoming accumulator of the
+    // chained dot. Limit this packing correction to the validated gfx942 path.
+    auto mfmaEncoding = cast<ttg::AMDMfmaEncodingAttr>(dotEncoding);
+    int64_t layoutK = mfmaEncoding.getInstrShapeForOperand(kWidth, opIdx)[kIdx];
+    sliceKWidth = std::min<int64_t>(kWidth, kWidth * sliceWidth / layoutK);
+    if (sliceKWidth <
+        std::max<int64_t>(32 / elementType.getIntOrFloatBitWidth(), 1))
+      return failure();
+  }
   auto dotOperandEnc = ttg::DotOperandEncodingAttr::get(
-      builder.getContext(), opIdx, dotEncoding, kWidth);
+      builder.getContext(), opIdx, dotEncoding, sliceKWidth);
   auto subviewDescType = ttg::MemDescType::get(
       shape, elementType, type.getEncoding(), type.getMemorySpace(),
       type.getMutableMemory(), type.getAllocShape());
@@ -644,18 +658,18 @@ LogicalResult Pingponger::transformTwoPPClusters(OpBuilder &builder,
   // cycles, sched.barrier prevents backend from canceling the interleaved order
   updateOpInsertion(gLoadOps[1]);
   appendSlicedLoadAB(/*slice=*/0);
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   appendOp(gLoadOps[0]);
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   appendSlicedLoadAB(/*slice=*/1);
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   appendOp(gLoadOps[1]);
-  // The first cluster just fits into the two cluster pingpong and cannot
-  // include wait of the local_load inserted by the ttg.barrier, using s.barrier
-  // instead. backend will schedule the local memory fences later in the dot0
-  // cluster.
-  appendOp(ROCDL::SBarrierOp::create(builder, loc));
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  // Ensure all local loads complete before the other warp group can overwrite
+  // the shared-memory buffer for the next iteration.
+  appendClusterBarrier(builder, loc);
 
   // dot0 (1/2)
   appendOpWithPrio(builder, dotSliceOps[0], loc);
@@ -702,9 +716,11 @@ LogicalResult Pingponger::transformTwoClusterWithAsyncAndAll(OpBuilder &builder,
   for (auto glop : gLoadOps)
     moveOpAndPredecessorsUpSameBlock(glop);
 
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   appendOp(ROCDL::SBarrierOp::create(builder, loc));
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
 
   // all other ops are placed in the second cluster
   // set unit attr, so it can trigger the second step in the ttg to llvm
@@ -717,7 +733,7 @@ LogicalResult Pingponger::transformTwoClusterWithAsyncAndAll(OpBuilder &builder,
 // For ChainedDots with num_stage==4 the pipeliner already places ops in the
 // correct order to allow for efficient pingpong. The loop contains 2 pairs of
 // compute and memory clusters so we only have to place barriers/sched.barriers
-// at the bounaries and give higher priority to memory clusters.
+// at the boundaries and give higher priority to memory clusters.
 // See ScheduleLoops.cpp:ChainedDotSchedule for details about the schedule.
 //
 // Notes
@@ -817,16 +833,19 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
   // ComputeCluster 1
   updateOpInsertion(dotLikeOps[0].getOperation());
   prependOp(ROCDL::SBarrierOp::create(builder, loc), false);
-  prependOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none),
-            false);
+  prependOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none),
+      false);
 
   // MemoryCluster 1
   updateOpInsertion(memoryClusterStartOps[0]);
-  prependOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none),
-            false);
+  prependOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none),
+      false);
   if (llvm::isa<ttg::AsyncWaitOp>(memoryClusterStartOps[0])) {
     // Only append a sched barrier because membar adds a barrier after asyncwait
-    appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+    appendOp(
+        ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   } else {
     prependOp(triton::gpu::BarrierOp::create(builder, loc,
                                              triton::gpu::AddrSpace::Local),
@@ -851,24 +870,28 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
   //
   // Check note 2 and 3 for details.
   updateOpInsertion(dotLikeOps[1].getOperation());
-  prependOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none),
-            false);
+  prependOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none),
+      false);
   prependOp(ROCDL::SetPrioOp::create(builder, loc, lowPriority), false);
   prependOp(createLocalMMRAFence(builder, loc, LLVM::AtomicOrdering::release),
             false);
   prependOp(ROCDL::SBarrierOp::create(builder, loc), false);
   prependOp(createLocalMMRAFence(builder, loc, LLVM::AtomicOrdering::acquire),
             false);
-  prependOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none),
-            false);
+  prependOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none),
+      false);
 
   // MemoryCluster2
   updateOpInsertion(memoryClusterStartOps[1]);
-  prependOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none),
-            false);
+  prependOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none),
+      false);
   if (llvm::isa<ttg::AsyncWaitOp>(memoryClusterStartOps[1])) {
     // Only append a sched barrier because membar adds a barrier after asyncwait
-    appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+    appendOp(
+        ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   } else {
     prependOp(triton::gpu::BarrierOp::create(builder, loc,
                                              triton::gpu::AddrSpace::Local),
@@ -890,8 +913,9 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
   // them into the compute cluster. Instead, we insert s_barrier
   // at the beginning of the loop.
   updateOpInsertion(lastInsertedOp->getBlock()->getTerminator());
-  prependOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none),
-            false);
+  prependOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none),
+      false);
   prependOp(ROCDL::SetPrioOp::create(builder, loc, lowPriority), false);
   prependOp(createLocalMMRAFence(builder, loc, LLVM::AtomicOrdering::release),
             false);
@@ -935,7 +959,8 @@ Pingponger::transformTwoClusterWithLocalLoadAndAll(OpBuilder &builder,
 
   moveOpAndPredecessorsUpSameBlock(lLoadOps[0]);
   moveOpAndPredecessorsUpSameBlock(lLoadOps[1]);
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
 
   appendOp(asyncCopyOps[0]);
   appendOp(asyncCommitOps[0]);
@@ -943,30 +968,34 @@ Pingponger::transformTwoClusterWithLocalLoadAndAll(OpBuilder &builder,
   // The last point we need to guarantee async_copy has been completed.
   // w0 : local_load 0 - Dot 0                 - local_load 1
   // w1 :              - local_load 0 (*wait 1)- Dot 0
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   appendOp(newAsyncWaitOp);
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
 
   // Give hint to backend so it can interleave instructions better.
   // This tries to interleave 3 SALU instructions per each MFMA
-  appendOp(ROCDL::SchedGroupBarrier::create(builder, loc,
-                                            SchedGroupMask::mfma_wmma, 1u, 0u));
-  appendOp(ROCDL::SchedGroupBarrier::create(builder, loc, SchedGroupMask::salu,
-                                            3u, 0u));
-  appendOp(ROCDL::SchedGroupBarrier::create(builder, loc,
-                                            SchedGroupMask::mfma_wmma, 1u, 0u));
-  appendOp(ROCDL::SchedGroupBarrier::create(builder, loc, SchedGroupMask::salu,
-                                            3u, 0u));
-  appendOp(ROCDL::SchedGroupBarrier::create(builder, loc,
-                                            SchedGroupMask::mfma_wmma, 1u, 0u));
+  appendOp(ROCDL::SchedGroupBarrier::create(
+      builder, loc, ROCDL::SchedGroupMask::mfma_wmma, 1u, 0u));
+  appendOp(ROCDL::SchedGroupBarrier::create(
+      builder, loc, ROCDL::SchedGroupMask::salu, 3u, 0u));
+  appendOp(ROCDL::SchedGroupBarrier::create(
+      builder, loc, ROCDL::SchedGroupMask::mfma_wmma, 1u, 0u));
+  appendOp(ROCDL::SchedGroupBarrier::create(
+      builder, loc, ROCDL::SchedGroupMask::salu, 3u, 0u));
+  appendOp(ROCDL::SchedGroupBarrier::create(
+      builder, loc, ROCDL::SchedGroupMask::mfma_wmma, 1u, 0u));
 
   appendOp(asyncCopyOps[1]);
   appendOp(asyncCommitOps[1]);
   moveOpAndPredecessorsUpSameBlock(dotOps[0]);
 
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
   appendOp(ROCDL::SBarrierOp::create(builder, loc));
-  appendOp(ROCDL::SchedBarrier::create(builder, loc, SchedGroupMask::none));
+  appendOp(
+      ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none));
 
   return success();
 }
@@ -1106,7 +1135,7 @@ void Pingponger::getDotPingponged() {
     auto scaledDotType = scaledDotOps[0].getType();
     auto scaledDotShape = scaledDotType.getShape();
     auto aType = scaledDotOps[0].getA().getType();
-    auto elemWidth = aType.getElementTypeBitWidth();
+    unsigned elemWidth = getIntOrFloatOrPtrBitWidth(aType.getElementType());
 
     // MxN = 256x256
     if (scaledDotShape[0] == 256 && scaledDotShape[1] == 256 &&
@@ -1133,7 +1162,7 @@ void Pingponger::getDotPingponged() {
   auto dotShape = dotType.getShape();
   auto aType = dotOps[0].getA().getType();
   auto aShape = aType.getShape();
-  auto elemWidth = aType.getElementTypeBitWidth();
+  unsigned elemWidth = getIntOrFloatOrPtrBitWidth(aType.getElementType());
   int64_t tileSize = dotShape[0] * dotShape[1] * aShape[1] * elemWidth;
 
   const int64_t minTile = 262144;      // e.g. 32x128x64x16bit
@@ -1184,27 +1213,27 @@ void Pingponger::getDotPingponged() {
   // Prune Memory operations that may be moved to only those involved in dot
   // computation. To understand the "cluster assumptions" we also estimate
   // the impact of any additional loads/stores.
-  auto gLoadIt = std::stable_partition(
-      gLoadOps.begin(), gLoadOps.end(),
-      [&dotGlobalLoads](tt::LoadOp op) { return dotGlobalLoads.contains(op); });
-  auto lLoadIt = std::stable_partition(lLoadOps.begin(), lLoadOps.end(),
-                                       [&dotLocalLoads](ttg::LocalLoadOp op) {
-                                         return dotLocalLoads.contains(op);
-                                       });
-  auto lStoreIt =
-      std::stable_partition(lStoreOps.begin(), lStoreOps.end(),
-                            [&dotLocalStores](ttg::LocalStoreOp op) {
-                              return dotLocalStores.contains(op);
-                            });
-  if (estimateNonDotMemoryImpact<tt::LoadOp>(gLoadIt, gLoadOps.end(),
-                                             assumeNotTaken) != 0) {
+  auto nonDotGLoads =
+      std::ranges::stable_partition(gLoadOps, [&dotGlobalLoads](tt::LoadOp op) {
+        return dotGlobalLoads.contains(op);
+      });
+  auto nonDotLLoads = std::ranges::stable_partition(
+      lLoadOps, [&dotLocalLoads](ttg::LocalLoadOp op) {
+        return dotLocalLoads.contains(op);
+      });
+  auto nonDotLStores = std::ranges::stable_partition(
+      lStoreOps, [&dotLocalStores](ttg::LocalStoreOp op) {
+        return dotLocalStores.contains(op);
+      });
+  if (estimateNonDotMemoryImpact<tt::LoadOp>(nonDotGLoads, assumeNotTaken) !=
+      0) {
     std::stringstream message;
     message << "Unable to match ping pong scheduling pattern. Details: "
             << "Non-dot global loads found in non-persistent GEMM";
     LDBG(message.str());
     return;
   }
-  if (estimateNonDotMemoryImpact<ttg::LocalLoadOp>(lLoadIt, lLoadOps.end(),
+  if (estimateNonDotMemoryImpact<ttg::LocalLoadOp>(nonDotLLoads,
                                                    assumeNotTaken) != 0) {
     std::stringstream message;
     message << "Unable to match ping pong scheduling pattern. Details: "
@@ -1212,7 +1241,7 @@ void Pingponger::getDotPingponged() {
     LDBG(message.str());
     return;
   }
-  if (estimateNonDotMemoryImpact<ttg::LocalStoreOp>(lStoreIt, lStoreOps.end(),
+  if (estimateNonDotMemoryImpact<ttg::LocalStoreOp>(nonDotLStores,
                                                     assumeNotTaken) != 0) {
     std::stringstream message;
     message << "Unable to match ping pong scheduling pattern. Details: "
@@ -1222,9 +1251,9 @@ void Pingponger::getDotPingponged() {
   }
 
   // Remove non-dot memory operations.
-  gLoadOps.erase(gLoadIt, gLoadOps.end());
-  lLoadOps.erase(lLoadIt, lLoadOps.end());
-  lStoreOps.erase(lStoreIt, lStoreOps.end());
+  gLoadOps.erase(nonDotGLoads.begin(), nonDotGLoads.end());
+  lLoadOps.erase(nonDotLLoads.begin(), nonDotLLoads.end());
+  lStoreOps.erase(nonDotLStores.begin(), nonDotLStores.end());
   // All PingPong Scheduler assumes there are 2 movable global loads and 2
   // movable local loads.
   if (gLoadOps.size() != 2 || lLoadOps.size() != 2) {

@@ -1,5 +1,41 @@
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 | FileCheck %s
 
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: single_cta_cluster_barrier
+  tt.func @single_cta_cluster_barrier() {
+    // CHECK-NOT: rocdl.s.barrier
+    // CHECK: llvm.return
+    amdg.cluster_barrier_arrive
+    amdg.cluster_barrier_wait
+    tt.return
+  }
+}
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.cluster-dim-x" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: single_physical_cta_cluster_barrier
+  tt.func @single_physical_cta_cluster_barrier() {
+    // CHECK-NOT: rocdl.s.barrier
+    // CHECK: llvm.return
+    amdg.cluster_barrier_arrive
+    amdg.cluster_barrier_wait
+    tt.return
+  }
+}
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.cluster-dim-x" = 4 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: independent_cta_cluster_barrier
+  tt.func @independent_cta_cluster_barrier() {
+    // CHECK: rocdl.s.barrier.signal id = -3
+    // CHECK: rocdl.s.barrier.wait id = -3
+    amdg.cluster_barrier_arrive
+    amdg.cluster_barrier_wait
+    tt.return
+  }
+}
+// -----
+
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: cluster_barrier_arrive
   tt.func @cluster_barrier_arrive() {
@@ -15,6 +51,35 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
   tt.func @cluster_barrier_wait() {
     // CHECK: rocdl.s.barrier.wait id = -3
     amdg.cluster_barrier_wait
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: atomic_cluster_barrier
+  tt.func @atomic_cluster_barrier(%ptr: !tt.ptr<i32>, %cmp: i32, %val: i32) {
+    // CHECK-NOT: rocdl.s.barrier
+    // CHECK: llvm.cmpxchg {{.*}} syncscope("agent") acquire monotonic
+    // CHECK: rocdl.s.barrier.signal id = -3
+    // CHECK: rocdl.s.barrier.wait id = -3
+    // CHECK-NOT: rocdl.s.barrier
+    %old = tt.atomic_cas acquire, gpu, %ptr, %cmp, %val : (!tt.ptr<i32>, i32, i32) -> i32
+    tt.return
+  }
+}
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: split_workgroup_barrier
+  tt.func @split_workgroup_barrier() {
+    // CHECK: llvm.fence syncscope("workgroup") release {llvm.mmra = #mmra_tag}
+    // CHECK-NEXT: rocdl.s.barrier.signal id = -1
+    // CHECK-NEXT: rocdl.s.barrier.wait id = -1
+    // CHECK-NEXT: llvm.fence syncscope("workgroup") acquire {llvm.mmra = #mmra_tag}
+    amdg.workgroup_barrier_signal
+    amdg.workgroup_barrier_wait
     tt.return
   }
 }

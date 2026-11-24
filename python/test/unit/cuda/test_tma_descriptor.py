@@ -3,6 +3,9 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from triton._internal_testing import fp6_values, pack_fp6, is_cuda
+from triton.backends.nvidia.compiler import get_ptx_version_from_options
+from triton.language.extra.cuda import to_fp6
 from triton.tools.ragged_tma import create_ragged_descriptor, atomic_add_ragged, load_ragged, store_ragged
 from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -113,30 +116,46 @@ def test_ragged_tma(dtype):
     assert [res0, res1, res2, res3] == [True, True, True, True]
 
 
-def test_tma_descriptor_round_f32_to_tf32():
+@triton.jit
+def _fp6_desc_store(src, dst, raw, desc, FORMAT: tl.constexpr, BLOCK_M: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_M * 128)
+    codes = to_fp6(tl.load(src + offsets), FORMAT)
+    tl.static_assert(codes.dtype == tl.uint8)
+    tl.store(raw + offsets, codes)
+    if desc is None:
+        desc = tl.make_tensor_descriptor(dst, [BLOCK_M + 2, 256], [192, 1], [BLOCK_M, 128], fp6_format=FORMAT)
+    desc.store([1, 128], codes.reshape(BLOCK_M, 128))
 
-    @triton.jit
-    def kernel(desc, out_ptr):
-        block = desc.load([0, 0])
-        idx = tl.arange(0, 16)[None, :]
-        tl.store(out_ptr + idx, block)
 
-    def round_to_tf32(x: torch.Tensor) -> torch.Tensor:
-        bits = x.view(torch.int32)
-        bits_i64 = bits.to(torch.int64) & 0xFFFFFFFF
-        exp_mask = 0x7F800000
-        is_special = (bits_i64 & exp_mask) == exp_mask
-        round_bias = ((bits_i64 >> 13) & 1) + 0x00000FFF
-        rounded = (bits_i64 + round_bias) & 0xFFFFE000
-        out_bits = torch.where(is_special, bits_i64, rounded)
-        return (out_bits & 0xFFFFFFFF).to(torch.int32).view(torch.float32)
-
-    device = "cuda"
-    torch.manual_seed(17)
-    inp = torch.randn((1, 16), device=device, dtype=torch.float32)
-    out = torch.empty_like(inp)
-    desc = TensorDescriptor.from_tensor(inp, [1, 16], round_f32_to_tf32=True)
-    kernel[(1, )](desc, out)
-
-    expected = round_to_tf32(inp)
-    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+@pytest.mark.parametrize("block_m", [1, 2, 16, 128, 256])
+@pytest.mark.parametrize("fmt", ["e2m3", "e3m2"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("host", [False, True], ids=["device", "host"])
+def test_fp6_tma_store_padded_bytes(block_m, fmt, dtype, host, with_allocator):
+    if not is_cuda() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("FP6 stores require SM100 or SM103")
+    codes = torch.randint(0, 64, (block_m * 128, ), device="cuda", dtype=torch.int32)
+    codes[:128] = torch.arange(128, device="cuda") % 64
+    x = fp6_values(fmt, codes).to(dtype)
+    # Check the halfway tie and the next representable input above it.
+    midpoint = x[1] / 2
+    x[0], x[2] = midpoint, torch.nextafter(midpoint, x[1])
+    x[1], x[32] = 100, -0.0
+    codes[1], codes[2] = 31, 1
+    initial = torch.randint(0, 64, (block_m + 2, 256), device="cuda", dtype=torch.int32)
+    buf = pack_fp6(initial)
+    initial[1:-1, 128:] = codes.reshape(block_m, 128)
+    desc = TensorDescriptor.from_tensor(buf, [block_m, 128], fp6_format=fmt) if host else None
+    raw = torch.empty_like(codes, dtype=torch.uint8)
+    kernel = _fp6_desc_store[(1, )](x, buf, raw, desc, fmt, block_m)
+    torch.testing.assert_close(raw, codes.byte())
+    torch.testing.assert_close(buf, pack_fp6(initial))
+    assert f"!tt.tensordesc<{block_m}x128xf6{fmt.upper()}FN>" in kernel.asm["ttir"]
+    assert f"!tt.tensordesc<{block_m}x128xui8," in kernel.asm["ttgir"]
+    src = "f32"
+    if get_ptx_version_from_options(kernel.metadata, kernel.metadata.target.arch) >= 91:
+        src = {torch.float16: "f16x2", torch.bfloat16: "bf16x2", torch.float32: "f32"}[dtype]
+    assert f"cvt.rn.satfinite.{fmt}x2.{src}" in kernel.asm["ptx"]
+    assert "cp.async.bulk.tensor.2d.global.shared" in kernel.asm["ptx"]
+    if host:
+        assert kernel.metadata.global_scratch_size == 0

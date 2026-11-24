@@ -11,6 +11,8 @@
 // Include shared C-compatible TDM utilities
 #include "../../backend/include/TDMCommon.h"
 
+using mlir::triton::gpu::PartitionedSharedEncodingAttr;
+
 namespace mlir::LLVM::AMD {
 
 namespace {
@@ -23,21 +25,50 @@ Value vecSet(TritonLLVMOpBuilder &b, Value vec, int idx, Value val) {
   return b.insert_element(vec, val, b.i32_val(idx));
 }
 
+// Keep the carried group0 descriptor in one SGPR tuple across consecutive TDM
+// instructions. LLVM's AMDGPU DAG combiner otherwise expands each
+// insertelement from a shared BUILD_VECTOR into an independent REG_SEQUENCE,
+// so every chunk gets a separate tuple and copies the invariant descriptor
+// lanes. The empty side-effecting asm sequences each update after the previous
+// TDM intrinsic; tying its output to its input makes it instruction-free while
+// preventing that BUILD_VECTOR expansion.
+Value sequenceGroup0(RewriterBase &rewriter, Location loc, Value group0) {
+  auto *ctx = rewriter.getContext();
+  return LLVM::InlineAsmOp::create(
+             rewriter, loc, group0.getType(), ValueRange{group0},
+             /*asm_string=*/"", /*constraints=*/"=s,0",
+             /*has_side_effects=*/true, /*is_align_stack=*/false,
+             LLVM::TailCallKind::None, /*convergent=*/false,
+             LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT),
+             /*operand_attrs=*/ArrayAttr::get(ctx, {}))
+      .getRes();
+}
+
+// Read the 64-bit global address from dwords 2-3 of descriptor group 0.
+Value getTDMGlobalAddr(RewriterBase &rewriter, TritonLLVMOpBuilder &b,
+                       Value group0) {
+  // Build each half in its own statement: argument evaluation order is
+  // unspecified, so nested calls would emit these ops in a compiler-dependent
+  // order.
+  Value lo = b.zext(i64_ty, vecGet(b, group0, 2));
+  Value hi = b.zext(i64_ty, vecGet(b, group0, 3));
+  return b.or_(lo, b.shl(hi, b.i64_val(32)));
+}
+
 // Add `byteOffset` to the 64-bit global address held in group0 dwords [2:3], in
-// place.  Viewing group0 as <2 x i64> and adding to lane 1 is a single i64 add
-// (the i32<->i64 bitcasts are free), saving the scalar-ALU a per-dword
-// decode/repack would cost in the loop.  Adding over the whole word (valid bit
-// included) is safe: the address always stays within the HW-addressable range,
-// so the add never disturbs the valid bit.
+// place, as a single i64 add; the zext/shl/or join and the trunc/lshr split
+// fold into the 64-bit add, so there is no per-dword decode/repack. Adding
+// over the whole word (valid bit included) is safe: the address always stays
+// within the HW-addressable range, so the add never disturbs the valid bit.
+// Scalar dword operations, unlike a <2 x i64> bitcast of the whole group, let
+// LLVM follow the address through later inserts and selects, e.g. to hoist a
+// loop-invariant base address out of a fused load's descriptor selection.
 void advanceGlobalAddr(RewriterBase &rewriter, TritonLLVMOpBuilder &b,
                        Value &group0, Value byteOffset) {
-  auto v2i64 = VectorType::get({2}, i64_ty);
-  auto v4i32 = VectorType::get({4}, i32_ty);
-  Value g0AsI64 = b.bitcast(group0, v2i64);
-  Value addr = b.extract_element(g0AsI64, b.i32_val(1));
+  Value addr = getTDMGlobalAddr(rewriter, b, group0);
   addr = b.add(addr, byteOffset);
-  g0AsI64 = b.insert_element(g0AsI64, addr, b.i32_val(1));
-  group0 = b.bitcast(g0AsI64, v4i32);
+  group0 = vecSet(b, group0, 2, b.trunc(i32_ty, addr));
+  group0 = vecSet(b, group0, 3, b.trunc(i32_ty, b.lshr(addr, b.i64_val(32))));
 }
 
 // Helper to decode a value spanning two 32-bit words
@@ -67,9 +98,9 @@ SmallVector<unsigned> distributeTDMWarps(ArrayRef<int64_t> blockShape,
 //   1. Start with numLogicalPieces warps along partitionDim (one per piece).
 //      If numWarps < numLogicalPieces, use all warps and emit multiple TDM
 //      instructions.
-//   2. Subdivide partition pieces along partitionDim (adding more warps), but
-//      ONLY when partitionDim is not the innermost dimension.
-//   3. Distribute remaining warps to non-partition, non-inner dimensions.
+//   2. Distribute the remaining warps outermost-first over the non-inner
+//      dimensions, subdividing partition pieces along partitionDim in turn,
+//      so that each warp's chunk is contiguous within its piece.
 //
 // The innermost dimension (numDims-1) is never subdivided beyond the initial
 // partition assignment.  TDM writes data as a linear element stream with LDS
@@ -84,8 +115,6 @@ std::pair<SmallVector<unsigned>, unsigned> distributeTDMWarpsAlignToPartition(
   unsigned numDims = blockShape.size();
   unsigned partitionDim = partitionedEnc.getPartitionDim();
   unsigned numLogicalPieces = partitionedEnc.getNumLogicalPieces();
-  int64_t pieceSize =
-      blockShape[partitionDim] / static_cast<int64_t>(numLogicalPieces);
   unsigned innerDim = numDims - 1;
 
   assert(partitionDim < numDims && "partitionDim out of range");
@@ -97,28 +126,20 @@ std::pair<SmallVector<unsigned>, unsigned> distributeTDMWarpsAlignToPartition(
   unsigned numTDMInstructions =
       llvm::divideCeil(numLogicalPieces, warpsAlongPartition);
 
-  // Subdivide partition pieces to absorb more warps, but only when
-  // partitionDim != innerDim.  Subdividing the innermost dimension would
-  // make the per-warp row width narrower than the inner layout row,
-  // misaligning TDM's linear padding with the shared memory row structure.
-  int remainingWarps = numWarps / warpsAlongPartition;
-  if (partitionDim != innerDim) {
-    while (remainingWarps >= 2 &&
-           pieceSize % ((warpsAlongPartition / numLogicalPieces) * 2) == 0 &&
-           static_cast<int64_t>(warpsAlongPartition * 2) <=
-               blockShape[partitionDim]) {
-      warpsAlongPartition *= 2;
-      remainingWarps /= 2;
-    }
-  }
-
   SmallVector<unsigned> warps(numDims, 1);
   warps[partitionDim] = warpsAlongPartition;
 
-  // Distribute remaining warps to non-partition, non-inner dimensions.
-  for (unsigned i = 0; i < numDims && remainingWarps > 1; ++i) {
-    if (i == partitionDim || i == innerDim)
-      continue;
+  // Spread the remaining warps outermost-first, as distributeTDMWarps does.
+  // TDM writes each warp's tile as one contiguous run in its partition piece,
+  // so a dimension may only be split once every outer dimension is down to
+  // one element per warp. Splitting the partition dimension first would give
+  // a warp rows from several outer slices of the piece, e.g. both groups of a
+  // [G, P * r, K] tile partitioned along dim 1, and write them contiguously.
+  // Never split the innermost dimension beyond the initial partition
+  // assignment: the per-warp row width would no longer match the inner
+  // layout's rows, misaligning TDM's linear padding.
+  int remainingWarps = numWarps / warpsAlongPartition;
+  for (unsigned i = 0; i < innerDim && remainingWarps > 1; ++i) {
     while (remainingWarps > 1 &&
            static_cast<int64_t>(warps[i] * 2) <= blockShape[i]) {
       warps[i] *= 2;
@@ -130,7 +151,7 @@ std::pair<SmallVector<unsigned>, unsigned> distributeTDMWarpsAlignToPartition(
 }
 
 // Shared layout analysis for TDM gather/scatter, used by both
-// getTDMGatherScatterInstrinsicCount (wait-count pass) and
+// getTDMGatherScatterIntrinsicCount (wait-count pass) and
 // emitTDMGatherScatter (lowering) so the instruction-count logic
 // cannot get out of sync.
 //
@@ -764,9 +785,12 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
                        Value barrierPtr,
                        const triton::LinearLayout &sharedLayout, Value ctaId,
                        bool isStore, ArrayRef<unsigned> warpsPerCTA,
-                       std::optional<uint32_t> warpUsedHint, bool isPureForm) {
+                       std::optional<uint32_t> warpUsedHint, bool isPureForm,
+                       ArrayRef<Value> descriptorOffsets) {
   size_t numDims = offset.size();
   assert(numDims >= 1 && numDims <= 5 && "TDM supports 1D to 5D tensors.");
+  assert((descriptorOffsets.empty() || descriptorOffsets.size() == numDims) &&
+         "descriptor offsets must match the tensor rank");
   assert(!dstPtrs.empty() && "dstPtrs cannot be empty");
   assert(warpsPerCTA.size() == numDims &&
          "warpsPerCTA must have one entry per tensor dim");
@@ -825,9 +849,25 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
   }
 
   Value baseOffset = b.i64_val(0);
+  Value innerDescriptorOffset;
   for (size_t i = 0; i < numDims; ++i) {
     Value dimOffset = b.mul(b.zext(i64_ty, offset[i]), tensorStride[i]);
     baseOffset = b.add(baseOffset, dimOffset);
+    // A folded update advances the address without changing bounds. Keep its
+    // signed i32 offsets separate from the per-warp offsets until after
+    // extension to i64: adding in i32 would change overflow/negative offsets.
+    if (descriptorOffsets.empty())
+      continue;
+    Value descOffset =
+        b.mul(b.sext(i64_ty, descriptorOffsets[i]), tensorStride[i]);
+    // The innermost offset is applied by a separate, final address add (see
+    // below), so members of a fused load that advance by the same inner
+    // offset (e.g. K) end in the same add, which LLVM can factor out of the
+    // per-wave descriptor selection.
+    if (i == numDims - 1)
+      innerDescriptorOffset = descOffset;
+    else
+      baseOffset = b.add(baseOffset, descOffset);
   }
 
   auto tdmToShared = tdmLayout.invertAndCompose(sharedLayout);
@@ -902,7 +942,6 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
 
   // Update group0 with addresses
   Value ldsAddr = b.ptrtoint(i32_ty, dstPtr);
-
   if (!pred)
     pred = vecGet(b, groups[0], 0);
 
@@ -930,15 +969,19 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
   }
   Value &group0 = groups[0];
   Value &group1 = groups[1];
+  // Advance global_addr by the per-warp byte offset before inserting the LDS
+  // address, which changes with the ring slot, so the advanced address does
+  // not depend on it.
+  Value elementBytes = b.i64_val(elementType.getIntOrFloatBitWidth() / 8);
+  advanceGlobalAddr(rewriter, b, group0, b.mul(baseOffset, elementBytes));
+  if (innerDescriptorOffset)
+    advanceGlobalAddr(rewriter, b, group0,
+                      b.mul(innerDescriptorOffset, elementBytes));
   // Skip re-writing pred when it is exactly the descriptor's existing
   // group0[0].
   if (!predIsInherited)
     group0 = vecSet(b, group0, 0, pred);
   group0 = vecSet(b, group0, 1, ldsAddr);
-  // Advance global_addr by the per-warp byte offset.
-  Value byteOffset =
-      b.mul(baseOffset, b.i64_val(elementType.getIntOrFloatBitWidth() / 8));
-  advanceGlobalAddr(rewriter, b, group0, byteOffset);
 
   // Update group1 with tensor shapes
   Value g1_0 = vecGet(b, group1, 0);
@@ -1039,9 +1082,9 @@ static void prepareGatherScatterDescriptorBase(
   Value cgaColOffset = b.mul(b.zext(i64_ty, cgaColOffsetElem), tensorStride[1]);
   globalPtr = b.gep(globalPtrTy, elementType, globalPtr, cgaColOffset);
 
-  // tensorShape[1] is the OOB extent carried by the descriptor (set once via
-  // update_tensor_descriptor set_bounds / clamp_bounds, like the contiguous
-  // copy).  No per-call column clamp here.
+  // The descriptor has the OOB extent relative to its base. We need to clamp
+  // based on the CTA's column offset.
+  tensorShape[1] = clampTensorDimByOffset(b, tensorShape[1], cgaColOffsetElem);
 
   // For scatter with padding (store-from-LDS): clamp tensor_dim0 to the
   // original column width so OOB checking drops padding elements before they
@@ -1208,6 +1251,10 @@ int64_t computePerPartitionSliceStride(
 }
 
 // Emit the raw TDM intrinsic call from already-filled descriptor groups.
+// Pads the group operands to the fixed 4 x <4xi32> + 1 x <8xi32> ABI, appends
+// the aux-bits operand, and selects the load/store intrinsic name.  Both the
+// standalone and fused emitters go through here so the intrinsic operand ABI
+// is defined in one place.
 void emitTDMRawIntrinsic(RewriterBase &rewriter, Location loc,
                          ArrayRef<Value> inputGroups, bool isLoad,
                          int32_t auxBits) {
@@ -1215,9 +1262,10 @@ void emitTDMRawIntrinsic(RewriterBase &rewriter, Location loc,
   auto v4i32Ty = VectorType::get(4, rewriter.getI32Type());
   auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
   SmallVector<Value, 6> groups(inputGroups.begin(), inputGroups.end());
+  // Pad to 4 vector groups (intrinsic always takes 4 group operands).
   while (groups.size() < 4)
     groups.push_back(LLVM::ZeroOp::create(rewriter, loc, v4i32Ty));
-  groups.push_back(LLVM::ZeroOp::create(rewriter, loc, v8i32Ty));
+  groups.push_back(LLVM::ZeroOp::create(rewriter, loc, v8i32Ty)); // group4
   groups.push_back(b.i32_val(auxBits));
   const char *intrinsicName = isLoad ? "llvm.amdgcn.tensor.load.to.lds"
                                      : "llvm.amdgcn.tensor.store.from.lds";
@@ -1326,9 +1374,7 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
       ctx, numPartitions, numGroupsInSlice, partitionedEnc.getPartitionDim(),
       partitionedEnc.getPartitionLayout());
   triton::LinearLayout sliceLayout =
-      triton::gpu::isPaddedEncoding(sliceEncoding)
-          ? triton::gpu::paddedLinearLayout(sliceShape, sliceEncoding)
-          : triton::gpu::toLinearLayout(sliceShape, sliceEncoding);
+      triton::gpu::toLinearLayoutIgnoringPadding(sliceShape, sliceEncoding);
 
   // Per-partition LDS stride between slices (accounts for padding).
   int64_t elementsPerSlice = computePerPartitionSliceStride(
@@ -1363,7 +1409,7 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
   }
 }
 
-size_t getTDMGatherScatterInstrinsicCount(RankedTensorType indicesType) {
+size_t getTDMGatherScatterIntrinsicCount(RankedTensorType indicesType) {
   if (!indicesType.getEncoding()) {
     size_t maxIndicesPerInstr =
         indicesType.getElementType().getIntOrFloatBitWidth() == 32 ? 8 : 16;
@@ -1464,8 +1510,12 @@ emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
       baseGroup0, baseGroup1, pred, multicastMask, barrierPtr, cgaLayout, ctaId,
       use32BitIndices, isGather);
 
+  // Carry group0 forward so each chunk updates the descriptor produced for the
+  // preceding chunk rather than independently rebuilding it from the base.
+  Value g0 = baseGroup0;
   // Issue multiple TDM instructions if needed
   for (size_t instrIdx = 0; instrIdx < analysis.numInstructions; ++instrIdx) {
+    g0 = sequenceGroup0(rewriter, loc, g0);
     size_t startIdx = instrIdx * maxIndicesPerInstr;
     size_t endIdx = std::min(startIdx + maxIndicesPerInstr, numIndicesPerWarp);
 
@@ -1473,7 +1523,6 @@ emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
     SmallVector<Value> batchIndices(effectiveRowIndices.begin() + startIdx,
                                     effectiveRowIndices.begin() + endIdx);
 
-    Value g0 = baseGroup0;
     Value g1 = baseGroup1;
     Value g2 = group2Zero;
     Value g3 = group3Zero;
@@ -1547,7 +1596,7 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
   // need bounds checks. We currently only guard based on the whole tensor
   // extent, so some prefetched chunks might never be used if masking trims
   // inner dimensions. To add inner-dimension bounds checks we would need to
-  // expose the CTA offsets from the tensor descriptor, which is currenlty
+  // expose the CTA offsets from the tensor descriptor, which is currently
   // directly applied to the base pointer.
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   int numDims = blockShape.size();
@@ -1576,7 +1625,8 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
       b.mul(b.zext(i64_ty, tensorShape[0]), tensorStride[0]);
 
   // Calculate maximum allowed offset from tilePtr before going out of bounds
-  Value maxOffsetFromTile = b.sub(linearTensorSize, tileOffset);
+  Value maxInBoundsLocalOffset =
+      b.sub(b.sub(linearTensorSize, tileOffset), b.i64_val(1));
 
   // Prefetches 256 bytes into L2
   const int bytesPerPrefetch = 256;
@@ -1609,7 +1659,7 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
                                         {kBlock, ctaId}});
 
   constexpr int cacheScope = 8; // (8) = L2 scope
-  const int hintValue = cacheScope | static_cast<int>(isSpeculative);
+  const int hintValue = cacheScope | static_cast<int>(!isSpeculative);
   IntegerAttr hint = rewriter.getI32IntegerAttr(hintValue);
 
   // Iterate over each register and emit a prefetch intrinsic
@@ -1629,30 +1679,21 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
     // Compute the local offset from tile ptr for this prefetch based on the
     // computed indices
     Value localOffset = dot64(indices, scaledStride);
-    Value prefetchPtr = b.gep(globalPtrTy, elementType, tilePtr, localOffset);
 
     // Mask the prefetch if the offset is out of bounds
-    Value inBounds = b.icmp_slt(localOffset, maxOffsetFromTile);
+    Value inBounds = b.icmp_sle(localOffset, maxInBoundsLocalOffset);
     // Only predicate based in inBounds for non-speculative prefetches.
     Value combinedPred = isSpeculative ? pred : b.and_(pred, inBounds);
 
     // Predicate and emit prefetch
-    Block *currentBlock = rewriter.getInsertionBlock();
-    Block *afterPrefetch =
-        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
-    Block *prefetchBlock = rewriter.createBlock(afterPrefetch);
-    rewriter.setInsertionPointToEnd(currentBlock);
-    LLVM::CondBrOp::create(rewriter, loc, combinedPred, prefetchBlock,
-                           afterPrefetch);
-
-    rewriter.setInsertionPointToStart(prefetchBlock);
+    // For OOB/pred we clamp the address to the last valid address
+    Value clampedLocalOffset =
+        b.select(combinedPred, localOffset, maxInBoundsLocalOffset);
+    Value prefetchPtr =
+        b.gep(globalPtrTy, elementType, tilePtr, clampedLocalOffset);
 
     ROCDL::GlobalPrefetchOp::create(rewriter, loc, prefetchPtr, hint, {}, {},
                                     {});
-
-    rewriter.setInsertionPointToEnd(prefetchBlock);
-    LLVM::BrOp::create(rewriter, loc, afterPrefetch);
-    rewriter.setInsertionPointToStart(afterPrefetch);
 
     // We return the offsets for unit testing
     offsets[reg] =
@@ -1684,7 +1725,8 @@ fillFusedTDMDescriptorMember(RewriterBase &rewriter, Location loc,
                     member.padAmount, filled, offsets, member.dstPtrs,
                     member.pred, member.multicastMask,
                     /*barrierPtr=*/Value(), member.sharedLayout, ctaId,
-                    /*isStore=*/false, warpsPerCTA, hint);
+                    /*isStore=*/false, warpsPerCTA, hint,
+                    /*isPureForm=*/false, member.descriptorOffsets);
   return filled;
 }
 
@@ -1725,6 +1767,31 @@ void emitTDMLoadFused(RewriterBase &rewriter, Location loc,
 
   SmallVector<Value, 6> selectedGroups(numGroups);
   for (size_t group = 0; group < numGroups; ++group) {
+    if (group == 0) {
+      // Select group 0's control word, LDS address and 64-bit global address
+      // separately. In a loop the LDS address changes while each member's
+      // base address is invariant; with a whole-vector select LLVM cannot
+      // hoist the invariant part or factor a common advance such as K out of
+      // select(c, a + k, b + k).
+      Value last = filledPerMember[numMembers - 1][0];
+      Value control = vecGet(b, last, 0);
+      Value ldsAddr = vecGet(b, last, 1);
+      Value globalAddr = getTDMGlobalAddr(rewriter, b, last);
+      for (size_t i = numMembers - 1; i-- > 0;) {
+        Value member = filledPerMember[i][0];
+        control = b.select(memberActive[i], vecGet(b, member, 0), control);
+        ldsAddr = b.select(memberActive[i], vecGet(b, member, 1), ldsAddr);
+        globalAddr = b.select(
+            memberActive[i], getTDMGlobalAddr(rewriter, b, member), globalAddr);
+      }
+      Value selected = b.undef(vec_ty(i32_ty, 4));
+      selected = vecSet(b, selected, 0, control);
+      selected = vecSet(b, selected, 1, ldsAddr);
+      selected = vecSet(b, selected, 2, b.trunc(i32_ty, globalAddr));
+      selectedGroups[0] = vecSet(
+          b, selected, 3, b.trunc(i32_ty, b.lshr(globalAddr, b.i64_val(32))));
+      continue;
+    }
     Value selected = filledPerMember[numMembers - 1][group];
     for (size_t i = numMembers - 1; i-- > 0;)
       selected = b.select(memberActive[i], filledPerMember[i][group], selected);
@@ -1733,4 +1800,5 @@ void emitTDMLoadFused(RewriterBase &rewriter, Location loc,
 
   emitTDMRawIntrinsic(rewriter, loc, selectedGroups, /*isLoad=*/true, auxBits);
 }
+
 } // namespace mlir::LLVM::AMD

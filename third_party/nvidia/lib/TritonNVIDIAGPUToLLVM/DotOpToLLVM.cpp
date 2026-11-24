@@ -44,6 +44,14 @@ struct ScaledDotOpConversion
   LogicalResult
   matchAndRewrite(triton::DotScaledOp op, triton::DotScaledOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // The target's NpotTargetLegality rejects exact NPOT dots it can't lower.
+    if (FailureOr<LinearLayout> ll = triton::gpu::getExactNpotOperandLayout(op);
+        succeeded(ll))
+      if (std::optional<std::string> reason =
+              triton::getNpotDotUnsupportedReason(
+                  op, *ll, triton::getModuleTarget(op),
+                  triton::gpu::lookupNumWarps(op), /*nonKDim=*/0))
+        return op.emitError(*reason);
     auto rty = cast<RankedTensorType>(op.getResult().getType());
     if (!isPermutationMatrixLayout(
             toLinearLayout(rty.getShape(), rty.getEncoding())))
@@ -140,17 +148,11 @@ struct WarpGroupDotWaitOpConversion
   using ConvertOpToLLVMPattern<
       triton::nvidia_gpu::WarpGroupDotWaitOp>::ConvertOpToLLVMPattern;
 
-  LogicalResult
-  matchAndRewrite(triton::nvidia_gpu::WarpGroupDotWaitOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto pendings = op.getPendings();
-    Location loc = op.getLoc();
-    ValueRange inputs = adaptor.getInputs();
-    if (inputs.size() == 1) {
-      rewriter.replaceOpWithNewOp<triton::nvgpu::WGMMAWaitGroupOp>(
-          op, inputs.front(), pendings);
-      return success();
-    }
+  static FailureOr<Value> packInputs(Location loc, RewriterBase &rewriter,
+                                     ValueRange inputs) {
+    if (inputs.size() == 1)
+      return inputs.front();
+
     SmallVector<Type> types;
     // Pack the inputs into a single struct.
     for (Type type : inputs.getTypes()) {
@@ -171,12 +173,20 @@ struct WarpGroupDotWaitOpConversion
                                              value, outputStructIndex++);
       }
     }
-    Value packedOutput = triton::nvgpu::WGMMAWaitGroupOp::create(
-        rewriter, loc, packed, pendings);
-    // Unpack the output into the original struct types.
+    return packed;
+  }
+
+  static SmallVector<Value> unpackOutput(Location loc, RewriterBase &rewriter,
+                                         Value packedOutput, TypeRange types) {
     SmallVector<Value> outputs;
-    outputStructIndex = 0;
-    for (Type type : inputs.getTypes()) {
+    if (types.size() == 1) {
+      outputs.push_back(packedOutput);
+      return outputs;
+    }
+
+    // Unpack the output into the original struct types.
+    unsigned outputStructIndex = 0;
+    for (Type type : types) {
       auto structType = cast<LLVM::LLVMStructType>(type);
       Value unpacked = LLVM::UndefOp::create(rewriter, loc, structType);
       for (auto [i, type] : llvm::enumerate(structType.getBody())) {
@@ -187,6 +197,22 @@ struct WarpGroupDotWaitOpConversion
       }
       outputs.push_back(unpacked);
     }
+    return outputs;
+  }
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::WarpGroupDotWaitOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    ValueRange inputs = adaptor.getInputs();
+    auto packed = packInputs(loc, rewriter, inputs);
+    if (failed(packed))
+      return failure();
+
+    auto wait = triton::nvgpu::WGMMAWaitGroupOp::create(rewriter, loc, *packed,
+                                                        op.getPendings());
+    auto outputs =
+        unpackOutput(loc, rewriter, wait.getResult(), inputs.getTypes());
     rewriter.replaceOp(op, outputs);
     return success();
   }

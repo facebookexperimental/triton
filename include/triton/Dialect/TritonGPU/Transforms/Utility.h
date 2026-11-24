@@ -1,15 +1,20 @@
 #ifndef TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
 #define TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/MathExtras.h"
 #include <algorithm>
+#include <functional>
 #include <numeric>
+#include <optional>
+#include <string>
 #include <utility>
 
 namespace mlir {
@@ -23,7 +28,21 @@ class StoreOp;
 class FuncOp;
 namespace gpu {
 class SwizzledSharedEncodingAttr;
+
+// Prove that two partition-local loop nests execute the same iterations.
+// Both arrays are ordered innermost first. Compare from the outside in so
+// corresponding induction variables can stand in for one another in inner
+// bounds, including triangular nests; resolve warp-specialize captures.
+bool haveEquivalentWarpSpecializeLoopNests(ArrayRef<scf::ForOp> lhs,
+                                           ArrayRef<scf::ForOp> rhs);
+
+// True when `op` implements EfficientLayoutOpInterface and has pinned its
+// result layout.
+inline bool hasEfficientLayout(Operation *op) {
+  auto iface = dyn_cast_if_present<EfficientLayoutOpInterface>(op);
+  return iface && iface.getEfficientLayout();
 }
+} // namespace gpu
 } // namespace triton
 
 // Return a tuple of two or three entries representing the shape of the
@@ -31,15 +50,23 @@ class SwizzledSharedEncodingAttr;
 // Version = 1: <m, n>
 // Version = 2: <1, m, n>
 // Version = 3: <m, n, k>
-SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
-                                                const ArrayRef<int64_t> &shape,
-                                                Type type, int numWarps);
+// For version 3, isLegalN (if set) picks the largest n the operands can be
+// tiled by, falling back to the unfiltered pick when there is none.
+SmallVector<unsigned, 3>
+mmaVersionToInstrShape(int version, const ArrayRef<int64_t> &shape, Type type,
+                       int numWarps,
+                       function_ref<bool(unsigned)> isLegalN = nullptr);
 
-// Gets the order of a tensor from its contiguity. Places the dimensions with
-// the largest contiguity as the inner most dimension. If the contiguity is
-// all ones, returns the order {dim - 1, dim - 2, ..., 0}
-SmallVector<unsigned, 4>
-getOrderFromContiguity(const SmallVector<int64_t> &contiguity);
+// Under TRITON_ALLOW_NPOT, whether MMAv3's warpgroups go on N: splitting an
+// NPOT M would leave a warpgroup a share that is not a multiple of 64.
+bool hasMmaV3WarpgroupsOnN(ArrayRef<int64_t> shape, int numWarps);
+
+// Why `warps` of `instrShape` can't sit on each dim's power-of-two part, as
+// the mixed-radix layout puts them, or std::nullopt.
+std::optional<std::string>
+getWarpPlacementUnsupportedReason(ArrayRef<int64_t> shape,
+                                  ArrayRef<unsigned> warps,
+                                  ArrayRef<unsigned> instrShape);
 
 // Return the operand used to access the memory in the operation
 Value getMemAccessPtr(Operation *op);
@@ -91,17 +118,26 @@ inline bool npotSafeForLinearLayout(Attribute encoding) {
   return false;
 }
 
-// Whether both layouts support modular conversion.
-inline bool npotCvtSafe(RankedTensorType srcTy, RankedTensorType dstTy) {
-  if (!hasNpotShape(srcTy) && !hasNpotShape(dstTy)) {
-    return true;
-  }
-  return npotSafeForLinearLayout(srcTy.getEncoding()) &&
-         npotSafeForLinearLayout(dstTy.getEncoding());
-}
-
 // Returns whether the op is a "view op", i.e. doesn't move any data
 bool isView(Operation *op);
+
+// Returns whether `op` reinterprets a memdesc without changing the underlying
+// allocation, i.e. carries MemDescViewTrait. Using the trait rather than an
+// `isa<>` list keeps the answer from drifting as view ops are added.
+// `ttng.map_to_remote_buffer` also carries the trait but names another CTA's
+// copy of the buffer, so it is excluded: a walker asking "which allocation is
+// this" must not cross a CTA boundary.
+bool isMemDescView(Operation *op);
+
+// Walks `v` back through memdesc view ops to the value they ultimately view.
+// Different slots and views of one multi-buffered allocation share a root.
+Value getMemDescRoot(Value v);
+
+// Returns the nearest `ttg.memdesc_index` selecting `v`'s buffer, looking
+// through the other view ops. Null when `v` is not a view into a buffer array.
+// Unlike getMemDescRoot this stops at the index instead of crossing it, because
+// callers use it to recover the buffer array itself (e.g. its depth).
+triton::gpu::MemDescIndexOp getMemDescBufferIndex(Value v);
 
 // Returns whether the op is a "noop op", i.e. has one input and one output
 // and lowers to llvm as the identity function (returns the input)
@@ -185,8 +221,13 @@ bool isExpensiveLoadOrStore(Operation *op);
 
 bool isExpensiveLocalLoad(Operation *op);
 
-// Return true if the op can use the target encoding for its result.
-bool canUseResultEncoding(Operation *op, Attribute targetEncoding);
+// Return true if an operation may be cloned by layout rematerialization.
+bool canBeRematerialized(Operation *op);
+
+// Return the operands whose layouts must remain fixed for the op to use the
+// target result encoding, or nullopt if the encoding is incompatible.
+std::optional<SmallVector<OpOperand *>>
+canUseResultEncoding(Operation *op, Attribute targetEncoding);
 
 // Replace ForOp with a new ForOp with extra operands. The YieldOp is not
 // updated and needs to be updated separately for the loop to be correct.
@@ -208,6 +249,9 @@ scf::WhileOp replaceWhileOpWithNewSignature(OpBuilder &rewriter,
                                             scf::WhileOp loop,
                                             ValueRange newIterOperands,
                                             TypeRange newResultTypes);
+[[nodiscard]] scf::WhileOp addIterArgsToLoop(OpBuilder &rewriter,
+                                             scf::WhileOp loop,
+                                             ValueRange newIterOperands);
 
 // Replace IfOp with a new IfOp with extra results operands. The YieldOp is not
 // updated and needs to be updated separately for the bodies to be correct.
@@ -322,6 +366,15 @@ void populateForOpDeadArgumentElimination(
     RewritePatternSet &patterns,
     const DenseSet<Operation *> &opsCanBeTriviallyDead = {});
 
+/// Like getConvertBackwardSlice, but requires the resulting slice to be
+/// non-empty and fully rematerializable.
+LogicalResult getRematerializableSlice(
+    OpOperand &root, SetVector<Value> &slice, Attribute rootEncoding,
+    DenseMap<Value, Attribute> &layout,
+    std::function<bool(Operation *)> stopPropagation = nullptr,
+    std::function<Value(OpOperand &, Attribute)> getExistingConversion =
+        nullptr);
+
 /// Run a dataflow analysis over \p top to identify block arguments to loops
 /// that are dead, and replace their usage with the corresponding init value.
 void runDeadIterArgElimination(Operation *top);
@@ -353,11 +406,29 @@ int getNVIDIAComputeCapability(Operation *module);
 // Read the amd target from the module attributes
 std::optional<StringRef> getAMDArch(Operation *module);
 
+// Return true when a global load may legally use a vector instruction whose
+// base address is aligned only to the element size. The caller must still
+// enforce contiguity, logical-extent, and vector-width limits. For masked
+// loads, it must also clamp the width to mask constancy along the pointer's
+// vectorized axis.
+bool canUseUnalignedVectorizedLoad(Operation *op);
+bool canUseUnalignedVectorizedLoad(Operation *op, StringRef targetArch);
+
 std::optional<mlir::triton::gpu::SwizzledSharedEncodingAttr>
 getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible);
 
+// Replace the CGA layout while preserving intra-CTA layout choices and
+// recursing through Slice and DotOperand parents. For example, a blocked
+// layout with threadsPerWarp=[1, 32] keeps that value under the new CGA layout.
+FailureOr<Attribute> cloneWithCGALayout(RankedTensorType tensorTy,
+                                        triton::gpu::CGAEncodingAttr cgaLayout);
+
+// Whether the operand follows the operation's distributed data encoding.
+// Descriptor gather/scatter offsets have an independent encoding.
+bool isDistributedOpEncodingOperand(OpOperand &operand);
+
 // Convert \param op to use \param encoding attribute.
-// Skips operands if they're in shared encoding.
+// Leaves descriptor indices and non-tensor operands unchanged.
 Operation *convertDistributedOpEncoding(Attribute encoding, Operation *op);
 
 // Returns the original memory allocation for a memdesc value
@@ -424,12 +495,13 @@ bool comesFromLoadOrBlockArg(Value v);
 // `resultIdx`th result.
 SmallVector<Value> getTiedArgs(Operation *op, int resultIdx);
 
-// Verifies the provided memory descriptor type used for barrier allocation
-LogicalResult verifyBarrierType(Operation *op,
-                                mlir::triton::gpu::MemDescType barrierType);
-
 // Get a boolean if the Value is an arith::ConstantOp
 std::optional<bool> getBoolFromConstant(Value cst);
+
+// The descriptor load a tensor-level value comes from, walking back
+// through convert_layout and single-operand view ops, or null. A 2-CTA
+// MMA's B must trace to one: Transform2CTALoads splits only that load.
+DescriptorLoadOp getTwoCTADescriptorLoad(Value value);
 
 } // namespace mlir::triton
 

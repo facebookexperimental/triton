@@ -1331,6 +1331,7 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
 def _attn_bwd_preprocess(
     O,
     DO,  #
+    DQ,
     Delta,  #
     H,
     N_CTX,  #
@@ -1356,6 +1357,7 @@ def _attn_bwd_preprocess(
     o = tl.load(O + o_offsets, mask=o_mask, other=0.0)
     do = tl.load(DO + o_offsets, mask=o_mask, other=0.0).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
+    tl.store(DQ + o_offsets, 0.0, mask=o_mask, eviction_policy="evict_first")
     tl.store(Delta + base + off_m, delta, mask=off_m < N_CTX)
 
 
@@ -1427,7 +1429,7 @@ mxfp8_bwd_configs = [
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "EPILOGUE_SUBTILE": 2,
-            "DQ_REDUCE_NCOL": 64,
+            "DQ_REDUCE_NCOL": 32,
         },
         num_warps=8,
         num_stages=1,
@@ -1581,8 +1583,11 @@ def _softmax_recompute_quantization_iter(
             tlx.barrier_arrive(dp_empties[0])
 
         dsT = _mul_f32x2(pT_slices[subtile_id], _sub_f32x2(dpT, Di[None, :]))
-        # NaN sanitization (boundary tiles)
-        dsT = tl.where(dsT == dsT, dsT, 0.0)
+        # Masked causal tiles can manufacture NaNs at inactive positions. The
+        # non-causal path is fully tiled and has no inactive lanes, so keep the
+        # compare/select off its steady-state dS critical path.
+        if MASK:
+            dsT = tl.where(dsT == dsT, dsT, 0.0)
         # Quantize dS twice: dK consumes dS^T, while dQ consumes dS
         # with the opposite reduction axis and therefore needs a
         # separate blockscaled encoding.
@@ -2153,7 +2158,7 @@ def _attn_bwd_mxf8_ws(
     NUM_DKV_STORE_BUFFERS: tl.constexpr = 1
     dkv_store_buf = tlx.local_alloc((BLOCK_N1, slice_size_alloc), tl.bfloat16, NUM_DKV_STORE_BUFFERS)
     DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
-    DQ_REDUCE_STAGES: tl.constexpr = 2
+    DQ_REDUCE_STAGES: tl.constexpr = DQ_REDUCE_ITERS
     dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
     sM_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, M_STAGE)
     sD_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, D_STAGE)
@@ -2346,7 +2351,7 @@ def _attn_bwd_mxf8_ws(
             tlx.async_descriptor_store_wait(0)
 
         # ----- Reduction warp: TMA atomic-reduce-add of dQ to GMEM -----
-        with tlx.async_task(num_warps=4, registers=112):
+        with tlx.async_task(num_warps=4, registers=80):
             tile_idx = tile_idx_start
             blk_idx = 0
             for _i in range(tiles_per_sm):
@@ -2373,7 +2378,7 @@ def _attn_bwd_mxf8_ws(
                         dq = tlx.local_load(dq_slice)
                         if slice_id == (DQ_REDUCE_ITERS - 1):
                             tlx.barrier_arrive(dq_empties[0])
-                        dq = dq * sm_scale
+                        dq = _mul_f32x2(dq, sm_scale)
                         tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1)
                         tlx.local_store(
                             dq_store_buf[dq_smem_idx],
@@ -2388,6 +2393,7 @@ def _attn_bwd_mxf8_ws(
                                 curr_m,
                                 slice_id * DQ_REDUCE_NCOL,
                             ],
+                            eviction_policy="evict_last",
                             store_reduce="add",
                         )
 
@@ -2808,15 +2814,7 @@ def _attn_bwd_mxf8_ws(
                     do_scale_smem[do_buf_id],
                     [sf_off_seq_h, do_scale_m, 0, 0, 0],
                     do_fulls[do_buf_id],
-                )
-                d_buf_id, d_phase = get_bufidx_phase(blk_idx, D_STAGE)
-                tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
-                tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
-                tlx.async_descriptor_load(
-                    desc_delta,
-                    sD_tiles[d_buf_id],
-                    [(base_q + curr_m).to(tl.int32)],
-                    d_fulls[d_buf_id],
+                    eviction_policy="evict_last",
                 )
                 tlx.barrier_wait(do_dv_empties[do_buf_id], do_phase ^ 1)
                 tlx.barrier_expect_bytes(
@@ -2834,6 +2832,16 @@ def _attn_bwd_mxf8_ws(
                     do_scale_dv_smem[do_buf_id],
                     [sf_off_seq_h, 0, do_scale_m, 0, 0],
                     do_dv_fulls[do_buf_id],
+                    eviction_policy="evict_last",
+                )
+                d_buf_id, d_phase = get_bufidx_phase(blk_idx, D_STAGE)
+                tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
+                tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
+                tlx.async_descriptor_load(
+                    desc_delta,
+                    sD_tiles[d_buf_id],
+                    [(base_q + curr_m).to(tl.int32)],
+                    d_fulls[d_buf_id],
                 )
                 tlx.barrier_wait(k_dq_empties[kv_buf_id], kv_phase ^ 1)
                 tlx.barrier_expect_bytes(
@@ -2888,6 +2896,55 @@ def _attn_bwd_mxf8_ws(
                         [(base_q + curr_m).to(tl.int32)],
                         m_fulls[m_buf_id],
                     )
+                    tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
+                    tlx.barrier_expect_bytes(
+                        do_fulls[do_buf_id],
+                        (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
+                    )
+                    tlx.async_descriptor_load(
+                        desc_do,
+                        do_smem[do_buf_id],
+                        [off_z, off_h, curr_m, 0],
+                        do_fulls[do_buf_id],
+                    )
+                    tlx.async_descriptor_load(
+                        desc_do_scale,
+                        do_scale_smem[do_buf_id],
+                        [sf_off_seq_h, do_scale_m, 0, 0, 0],
+                        do_fulls[do_buf_id],
+                        eviction_policy="evict_last",
+                    )
+                    tlx.barrier_wait(do_dv_empties[do_buf_id], do_phase ^ 1)
+                    tlx.barrier_expect_bytes(
+                        do_dv_fulls[do_buf_id],
+                        (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
+                    )
+                    tlx.async_descriptor_load(
+                        desc_do_dv,
+                        do_dv_smem[do_buf_id],
+                        [off_z, off_h, curr_m, 0],
+                        do_dv_fulls[do_buf_id],
+                    )
+                    tlx.async_descriptor_load(
+                        desc_do_dv_scale,
+                        do_scale_dv_smem[do_buf_id],
+                        [sf_off_seq_h, 0, do_scale_m, 0, 0],
+                        do_dv_fulls[do_buf_id],
+                        eviction_policy="evict_last",
+                    )
+                    d_buf_id, d_phase = get_bufidx_phase(blk_idx, D_STAGE)
+                    tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
+                    tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
+                    tlx.async_descriptor_load(
+                        desc_delta,
+                        sD_tiles[d_buf_id],
+                        [(base_q + curr_m).to(tl.int32)],
+                        d_fulls[d_buf_id],
+                    )
+                    # Q-for-dK is consumed after the current Q, dO, and Delta
+                    # paths. Defer its reuse wait so it cannot prevent those
+                    # critical-path TMA requests from being issued. The same
+                    # empty/full phase still protects the single staging slot.
                     tlx.barrier_wait(q_dk_empties[prev_q_buf_id], prev_q_phase ^ 1)
                     tlx.barrier_expect_bytes(
                         q_dk_fulls[prev_q_buf_id],
@@ -2906,50 +2963,6 @@ def _attn_bwd_mxf8_ws(
                         q_dk_scale_smem[prev_q_buf_id],
                         [sf_off_seq_h, 0, (prev_m // 128) * REP_M, 0, 0],
                         q_dk_fulls[prev_q_buf_id],
-                    )
-
-                    tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
-                    tlx.barrier_expect_bytes(
-                        do_fulls[do_buf_id],
-                        (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
-                    )
-                    tlx.async_descriptor_load(
-                        desc_do,
-                        do_smem[do_buf_id],
-                        [off_z, off_h, curr_m, 0],
-                        do_fulls[do_buf_id],
-                    )
-                    tlx.async_descriptor_load(
-                        desc_do_scale,
-                        do_scale_smem[do_buf_id],
-                        [sf_off_seq_h, do_scale_m, 0, 0, 0],
-                        do_fulls[do_buf_id],
-                    )
-                    d_buf_id, d_phase = get_bufidx_phase(blk_idx, D_STAGE)
-                    tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
-                    tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
-                    tlx.async_descriptor_load(
-                        desc_delta,
-                        sD_tiles[d_buf_id],
-                        [(base_q + curr_m).to(tl.int32)],
-                        d_fulls[d_buf_id],
-                    )
-                    tlx.barrier_wait(do_dv_empties[do_buf_id], do_phase ^ 1)
-                    tlx.barrier_expect_bytes(
-                        do_dv_fulls[do_buf_id],
-                        (DO_BYTES * BLOCK_M1 * HEAD_DIM) + SCALE_BYTES,
-                    )
-                    tlx.async_descriptor_load(
-                        desc_do_dv,
-                        do_dv_smem[do_buf_id],
-                        [off_z, off_h, curr_m, 0],
-                        do_dv_fulls[do_buf_id],
-                    )
-                    tlx.async_descriptor_load(
-                        desc_do_dv_scale,
-                        do_scale_dv_smem[do_buf_id],
-                        [sf_off_seq_h, 0, do_scale_m, 0, 0],
-                        do_dv_fulls[do_buf_id],
                     )
                     curr_m += BLOCK_M1
                     blk_idx += 1
@@ -3032,7 +3045,10 @@ def attention_bwd(
 
     y_dim = Z * H * N_CTX
 
-    # Compute Delta = rowsum(O * dO) into an [Z, H, N_CTX] FP32 buffer.
+    # Fuse dQ initialization into the Delta preprocess launch.
+    dq = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+    dk = torch.empty(k.shape, device=k.device, dtype=torch.bfloat16)
+    dv = torch.empty(v.shape, device=v.device, dtype=torch.bfloat16)
     delta = torch.empty_like(M)
 
     PRE_BLOCK_M = 32
@@ -3041,17 +3057,13 @@ def attention_bwd(
     _attn_bwd_preprocess[preproc_grid](
         o,
         do_preproc,
+        dq,
         delta,
         H,
         N_CTX,
         HEAD_DIM=HEAD_DIM,
         BLOCK_M=PRE_BLOCK_M,
     )
-
-    # Allocate outputs. dQ is FP32 (TMA reduce-add accumulation target).
-    dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
-    dk = torch.zeros(k.shape, device=k.device, dtype=torch.bfloat16)
-    dv = torch.zeros(v.shape, device=v.device, dtype=torch.bfloat16)
 
     dummy_block = [1, 1, 1, 1]
     dummy_5d = [1, 1, 1, 1, 1]
@@ -3071,13 +3083,16 @@ def attention_bwd(
     desc_m = TensorDescriptor(M, shape=[y_dim], strides=[1], block_shape=[1])
     desc_delta = TensorDescriptor(delta, shape=[y_dim], strides=[1], block_shape=[1])
 
-    desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_5d)
-    desc_q_dk_scale = TensorDescriptor.from_tensor(q_dk_scale, block_shape=dummy_5d)
-    desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_5d)
-    desc_k_dq_scale = TensorDescriptor.from_tensor(k_dq_scale, block_shape=dummy_5d)
-    desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_5d)
-    desc_do_scale = TensorDescriptor.from_tensor(do_scale, block_shape=dummy_5d)
-    desc_do_dv_scale = TensorDescriptor.from_tensor(do_dv_scale, block_shape=dummy_5d)
+    # E8M0 scale bits must travel as u8 bytes: the packed-scale tmem_copy path
+    # only recognizes i8/u8 tiles. Do not simplify back to fp8 descriptors
+    # until that packing path supports fp8.
+    desc_q_scale = TensorDescriptor.from_tensor(q_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_q_dk_scale = TensorDescriptor.from_tensor(q_dk_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_k_scale = TensorDescriptor.from_tensor(k_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_k_dq_scale = TensorDescriptor.from_tensor(k_dq_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_v_scale = TensorDescriptor.from_tensor(v_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_do_scale = TensorDescriptor.from_tensor(do_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_do_dv_scale = TensorDescriptor.from_tensor(do_dv_scale.view(torch.uint8), block_shape=dummy_5d)
 
     def alloc_fn(size: int, _align: int, _):
         return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -3180,9 +3195,12 @@ class _attention(torch.autograd.Function):
         assert (k_scale is not None and v_scale is not None
                 and q_scale is not None), "All scales must be provided for MXFP8"
         dummy_block_shape = [1, 1, 1, 1, 1]
-        desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_block_shape)
-        desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_block_shape)
-        desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_block_shape)
+        # E8M0 scale bits must travel as u8 bytes: the packed-scale tmem_copy path
+        # only recognizes i8/u8 tiles. Do not simplify back to fp8 descriptors
+        # until that packing path supports fp8.
+        desc_q_scale = TensorDescriptor.from_tensor(q_scale.view(torch.uint8), block_shape=dummy_block_shape)
+        desc_k_scale = TensorDescriptor.from_tensor(k_scale.view(torch.uint8), block_shape=dummy_block_shape)
+        desc_v_scale = TensorDescriptor.from_tensor(v_scale.view(torch.uint8), block_shape=dummy_block_shape)
 
         def alloc_fn(size: int, _align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -3390,9 +3408,12 @@ def attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, config=None)
     desc_m = TensorDescriptor(m_tensor, shape=[y_dim], strides=[1], block_shape=[1])
 
     dummy_block_shape = [1, 1, 1, 1, 1]
-    desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_block_shape)
-    desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_block_shape)
-    desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_block_shape)
+    # E8M0 scale bits must travel as u8 bytes: the packed-scale tmem_copy path
+    # only recognizes i8/u8 tiles. Do not simplify back to fp8 descriptors
+    # until that packing path supports fp8.
+    desc_q_scale = TensorDescriptor.from_tensor(q_scale.view(torch.uint8), block_shape=dummy_block_shape)
+    desc_k_scale = TensorDescriptor.from_tensor(k_scale.view(torch.uint8), block_shape=dummy_block_shape)
+    desc_v_scale = TensorDescriptor.from_tensor(v_scale.view(torch.uint8), block_shape=dummy_block_shape)
 
     # Apply pre_hook to set block shapes
     nargs = {

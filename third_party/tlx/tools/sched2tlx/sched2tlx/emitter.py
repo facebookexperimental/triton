@@ -1707,9 +1707,18 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
     loop_tag = "inner" if not loop.is_outer else "outer"
     signal_only = _signal_only_buffer_ids(loop)
     # Track the FIRST allocated variable for each merge_group_id so subsequent
-    # buffers in the same group emit `reuse=<first_var>` (Step 4.5 says they
-    # have disjoint lifetimes — same physical bytes, different time slots).
+    # buffers in the same group share its bytes (Step 4.5 says they have
+    # disjoint lifetimes — same physical bytes, different time slots).
+    # Multi-member groups of plain (non-partitioned) buffers share via a
+    # `storage_alias_spec`; equal-count groups also get an explicit shared
+    # overlap below, anything else keeps a bare spec or legacy
+    # `reuse=<first_var>` emission.
     merge_group_owner: dict[int, str] = {}
+    merge_group_spec: dict[int, str] = {}
+    # spec var -> [(member var, emitted count)]: members share bytes (disjoint
+    # lifetimes). Equal-count groups get an explicit shared overlap below;
+    # unequal counts keep a bare spec (shared would mis-size the backing).
+    merge_group_spec_vars: dict[str, list[tuple[str, int]]] = {}
     # Alias-safety verdict per SMEM merge group: guardable groups get alias
     # waits at their producers (_alias_wait_stmts); unguardable multi-member
     # groups have their reuse dropped right here. Stashed on rctx for the
@@ -1718,6 +1727,30 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
     if not hasattr(rctx, "_alias_group_safety"):
         rctx._alias_group_safety = {}
     rctx._alias_group_safety[loop.loop_id] = alias_safety
+
+    def _emitted_mgid(bb) -> int | None:
+        mg = bb.merge_group_id
+        if mg is None or bb.id in signal_only or bb.kind == "barrier":
+            return None
+        if bb.kind == "smem" and not alias_safety.get(mg, True):
+            return None
+        return mg
+
+    _group_members: dict[int, list] = {}
+    for _bb in loop.schedule.buffers:
+        _mg = _emitted_mgid(_bb)
+        if _mg is not None:
+            _group_members.setdefault(_mg, []).append(_bb)
+
+    def _group_uses_spec(mg: int) -> bool:
+        members = _group_members.get(mg, [])
+        if len(members) < 2:
+            return False
+        assert all(m.kind == members[0].kind for m in members), (
+            f"merge group {mg} mixes SMEM and TMEM members; no single "
+            "storage_alias_spec can back both"
+        )
+        return all(m.partition_count <= 1 for m in members)
     for b in loop.schedule.buffers:
         # Signal-only loop-carry-release buffer: no data, so no alloc (the
         # handshake uses its own named barrier, not this buffer). Skips the 64 KB
@@ -1780,10 +1813,25 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
                 origin += f"; merge group {mgid} reuse DROPPED (unsynchronizable alias)"
                 mgid = None
             reuse = ""
-            if mgid is not None and mgid in merge_group_owner:
+            spec_decl: str | None = None
+            if mgid is not None and _group_uses_spec(mgid):
+                spec = merge_group_spec.get(mgid)
+                if spec is None:
+                    spec = f"L{loop.loop_id}_smem_mg_{mgid}"
+                    merge_group_spec[mgid] = spec
+                    spec_decl = (
+                        f"{spec} = tlx.storage_alias_spec("
+                        "storage=tlx.storage_kind.smem)"
+                    )
+                reuse = f", reuse={spec}"
+                merge_group_spec_vars.setdefault(spec, []).append((var, b.count))
+                origin += f"; shares {spec} (group {mgid})"
+            elif mgid is not None and mgid in merge_group_owner:
                 reuse = f", reuse={merge_group_owner[mgid]}"
                 origin += f"; reuses {merge_group_owner[mgid]} (group {mgid})"
             lines += f"# {loop_tag}-loop buf {b.id}: SMEM count={b.count} ({origin})"
+            if spec_decl is not None:
+                lines += spec_decl
             if b.partition_count > 1:
                 # Pass A.5: emit N SMEM allocs, each (mSize, *trailing).
                 # Per-group shape replaces the partition_dim (M=0) with mSize.
@@ -1843,7 +1891,21 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
             mgid = b.merge_group_id
             reuse = ""
             origin_suffix = ""
-            if mgid is not None and mgid in merge_group_owner:
+            spec_decl: str | None = None
+            spec_var: str | None = None
+            if mgid is not None and _group_uses_spec(mgid):
+                spec = merge_group_spec.get(mgid)
+                if spec is None:
+                    spec = f"L{loop.loop_id}_tmem_mg_{mgid}"
+                    merge_group_spec[mgid] = spec
+                    spec_decl = (
+                        f"{spec} = tlx.storage_alias_spec("
+                        "storage=tlx.storage_kind.tmem)"
+                    )
+                reuse = f", reuse={spec}"
+                spec_var = spec
+                origin_suffix = f"; shares {spec} (group {mgid})"
+            elif mgid is not None and mgid in merge_group_owner:
                 reuse = f", reuse={merge_group_owner[mgid]}"
                 origin_suffix = f"; reuses {merge_group_owner[mgid]} (group {mgid})"
             count = b.count
@@ -1855,6 +1917,12 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
                 f"# {loop_tag}-loop buf {b.id}: TMEM count={count} "
                 f"(producer→consumer pipelining across iters{origin_suffix})"
             )
+            if spec_decl is not None:
+                lines += spec_decl
+            if spec_var is not None:
+                merge_group_spec_vars.setdefault(spec_var, []).append(
+                    (var, count)
+                )
             lines += (
                 f"{var} = tlx.local_alloc(({shape}), {dtype}, "
                 f"{count}, tlx.storage_kind.tmem{reuse})"
@@ -1867,6 +1935,17 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
         elif b.kind == "barrier":
             # Barriers are emitted later (paired with their data buffer).
             continue
+    # Explicit per-index sharing for equal-count merge groups (all members
+    # have disjoint lifetimes, so slot i of each member shares group i).
+    for spec, members in merge_group_spec_vars.items():
+        if len(members) >= 2 and all(
+            c == members[0][1] for _, c in members
+        ):
+            names = ", ".join(v for v, _ in members)
+            lines += (
+                f"{spec}.set_buffer_overlap(tlx.reuse_group({names}, "
+                "group_type=tlx.reuse_group_type.shared))"
+            )
     # Function-scope allocs (e.g., the accumulator TMEM for case1, or the
     # per-tile-resident Q SMEM for non-persistent FA) live in the preamble.
     # Hoist them up here so MMAs can reference them by name. Pre-sort the

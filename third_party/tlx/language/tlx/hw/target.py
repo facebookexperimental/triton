@@ -187,17 +187,12 @@ def _device_smem_bytes(props, rocm: bool) -> int | None:
     return None
 
 
-@functools.lru_cache(maxsize=1)
-def current_target() -> Target:
-    """The current GPU target, cached.
-
-    Call ``current_target.cache_clear()`` to re-resolve (tests that monkeypatch
-    device properties need this).
-    """
+def target_for_device(device: torch.device | int | str | None) -> Target:
+    """Resolve the target for ``device`` without caching it."""
     rocm = is_rocm()
 
     try:
-        props = torch.cuda.get_device_properties(0)
+        props = torch.cuda.get_device_properties(device)
     except Exception:
         # No visible device (CPU-only build host, or a driver that failed to
         # initialize). Fall back to the reference arch so the pure-Python
@@ -257,3 +252,14 @@ def current_target() -> Target:
         smem_bytes=smem_bytes,
         tmem_columns=spec.tmem_columns() if has_tmem(spec) else None,
     )
+
+
+@functools.lru_cache(maxsize=1)
+def current_target() -> Target:
+    """The device-0 GPU target, cached.
+
+    Call ``current_target.cache_clear()`` to re-resolve (tests that monkeypatch
+    device properties need this). Codegen paths compiling for an explicit
+    graph device should use :func:`target_for_device` instead.
+    """
+    return target_for_device(0)

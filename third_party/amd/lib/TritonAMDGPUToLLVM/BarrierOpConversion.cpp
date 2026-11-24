@@ -119,12 +119,10 @@ struct ReadBarrierPhaseOpConversion
 
     auto res = b.load(i32_ty, phaseBaseAddr);
 
-    GCNBuilder phaseReadBuilder;
-    MLIRContext *ctx = rewriter.getContext();
-    auto &wait_cnt = *phaseReadBuilder.create("s_waitcnt lgkmcnt(0)");
-    wait_cnt();
-    phaseReadBuilder.launch(rewriter, loc, void_ty(ctx),
-                            true /*hasSideEffects*/);
+    // gfx12 uses a separate LDS counter; let the target-specific lowering
+    // select s_wait_dscnt instead of the legacy s_waitcnt instruction.
+    triton::amdgpu::MemoryCounterWaitOp::create(rewriter, loc, nullptr, nullptr,
+                                                rewriter.getI32IntegerAttr(0));
     rewriter.replaceOp(op, res);
     return success();
   }

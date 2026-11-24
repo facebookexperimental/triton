@@ -12,7 +12,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
         // CHECK: llvm.inttoptr %[[uniform]] : i64 to !llvm.ptr<1>
         // CHECK: rocdl.raw.ptr.buffer.load
         %ptr = amdg.assume_uniform %arg0 : !tt.ptr<f32>
-        %ret = amdg.buffer_load %ptr[%offset] : tensor<128xf32, #blocked0>
+        %ret = amdg.buffer_load %ptr[%offset] : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         tt.return
   }
 }
@@ -28,7 +28,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     // CHECK-NOT: rocdl.readfirstlane
     // CHECK: rocdl.raw.ptr.buffer.load
     tt.func @no_assume_no_readfirstlane(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %offset : tensor<128xi32, #blocked0> {tt.divisibility=16:i32}) {
-        %ret = amdg.buffer_load %arg0[%offset] : tensor<128xf32, #blocked0>
+        %ret = amdg.buffer_load %arg0[%offset] : !tt.ptr<f32> -> tensor<128xf32, #blocked0>
         tt.return
   }
 }

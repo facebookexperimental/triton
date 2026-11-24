@@ -24,6 +24,23 @@ def _is_power_of_two(i):
 
 _get_int_dtype = constexpr_function(core.get_int_dtype)
 
+
+@constexpr_function
+def _next_power_of_two(i):
+    return 1 << (i - 1).bit_length()
+
+
+@constexpr_function
+def _sort_pad(dtype, descending):
+    # A value that sorts after every other.
+    if dtype.is_floating():
+        return float("-inf") if descending else float("inf")
+    bits = dtype.primitive_bitwidth
+    if dtype.is_int_signed():
+        return -(1 << (bits - 1)) if descending else (1 << (bits - 1)) - 1
+    return 0 if descending else (1 << bits) - 1
+
+
 # -----------------------
 # Standard library
 # -----------------------
@@ -50,17 +67,43 @@ def sigmoid(x):
     return 1 / (1 + math.exp(-x))
 
 
+@constexpr_function
+def _softmax_keep_dims_warning():
+    import warnings
+
+    warnings.warn(
+        "The keep_dims argument to tl.softmax is deprecated and ignored; softmax always preserves the input shape.",
+        stacklevel=2)
+
+
 @core._tensor_member_fn
 @jit
-@math._add_math_1arg_docstr("softmax")
-def softmax(x, dim=None, keep_dims=False, ieee_rounding=False):
+def softmax(x, dim=None, *, keep_dims=None, ieee_rounding=False):
+    """
+    Computes the softmax of :code:`x` along the given axis.
+
+    :param x: the input values
+    :type x: Block
+    :param dim: the axis along which to normalize. Defaults to 0 -- note that
+        this is *not* the last axis, unlike :code:`torch.softmax`.
+    :type dim: int | None
+    :param keep_dims: deprecated and ignored. Softmax always preserves the input shape.
+        Defaults to :code:`None`; any other value emits a warning.
+        Must be passed by keyword.
+    :type keep_dims: bool | None
+    :param ieee_rounding: whether the final division uses IEEE-compliant rounding.
+        Must be passed by keyword.
+    :type ieee_rounding: bool
+    """
+    if keep_dims is not None:
+        _softmax_keep_dims_warning()
     if dim is None:
         _dim: core.constexpr = 0
     else:
         _dim: core.constexpr = dim
-    z = x - max(x, _dim, keep_dims=keep_dims)
+    z = x - max(x, _dim, keep_dims=True)
     num = math.exp(z)
-    den = sum(num, _dim, keep_dims=keep_dims)
+    den = sum(num, _dim, keep_dims=True)
     return math.fdiv(num, den, ieee_rounding)
 
 
@@ -144,54 +187,69 @@ def zeros_like(input):
 
 
 @jit
-def _argmax_combine(value1, index1, value2, index2, tie_break_left):
-    if tie_break_left:
-        tie = value1 == value2 and index1 < index2
-    else:
-        tie = False
-    gt = value1 > value2 or tie
-    v_ret = core.where(gt, value1, value2)
-    i_ret = core.where(gt, index1, index2)
-    return v_ret, i_ret
+def _elementwise_max_ignore_nan(a, b):
+    return core.maximum(a, b, propagate_nan=core.PropagateNan.NONE)
 
 
 @jit
-def _argmax_combine_tie_break_left(value1, index1, value2, index2):
-    return _argmax_combine(value1, index1, value2, index2, True)
+def _elementwise_max_propagate_nan(a, b):
+    return core.maximum(a, b, propagate_nan=core.PropagateNan.ALL)
 
 
 @jit
-def _argmax_combine_tie_break_fast(value1, index1, value2, index2):
-    return _argmax_combine(value1, index1, value2, index2, False)
+def _argminmax_index(input, value, axis, keep_dims):
+    rank: core.constexpr = len(input.shape)
+    dim: core.constexpr = 0 if axis is None else axis % rank
+    if axis is None:
+        input = core.reshape(input, [input.numel])
+        value = core.reshape(value, [])
+    elif not keep_dims:
+        value = core.expand_dims(value, dim)
 
-
-@jit
-def _elementwise_max(a, b):
-    return core.maximum(a, b)
+    matches = input == value
+    if core.constexpr(input.dtype.is_floating()):
+        # Also match NaNs, including an all-NaN input in ignore-NaN mode.
+        matches = core.where(value == value, matches, input != input)
+    indices = core.arange(0, input.shape[dim])
+    for other_dim in core.static_range(len(input.shape)):
+        if other_dim != dim:
+            indices = core.expand_dims(indices, other_dim)
+    indices = core.where(matches, indices, 0x7fffffff)
+    index = core.reduce(indices, dim, _elementwise_min_ignore_nan, keep_dims=keep_dims)
+    if axis is None and keep_dims:
+        index = core.reshape(index, [1] * rank)
+    return index
 
 
 @core._tensor_member_fn
 @jit
 @core._add_reduction_docstr("maximum", return_indices_arg="return_indices",
-                            tie_break_arg="return_indices_tie_break_left", reduction_ordering_arg="reduction_ordering")
+                            tie_break_arg="return_indices_tie_break_left", reduction_ordering_arg="reduction_ordering",
+                            multi_cta_arg="multi_cta")
 def max(input, axis=None, return_indices=False, return_indices_tie_break_left=True, keep_dims=False,
-        reduction_ordering: core.constexpr = None):
-    input = core._promote_bfloat16_to_float32(input)
-    if return_indices:
-        if return_indices_tie_break_left:
-            return core._reduce_with_indices(input, axis, _argmax_combine_tie_break_left, keep_dims=keep_dims,
-                                             reduction_ordering=reduction_ordering)
-        else:
-            return core._reduce_with_indices(input, axis, _argmax_combine_tie_break_fast, keep_dims=keep_dims,
-                                             reduction_ordering=reduction_ordering)
-    else:
+        reduction_ordering: core.constexpr = None, multi_cta: core.constexpr = False,
+        propagate_nan: core.constexpr = core.PropagateNan.NONE):
+    core.static_assert(isinstance(propagate_nan, core.PropagateNan), "propagate_nan must be a PropagateNan enum value")
+    # Reduce matching indices with min to enable native redux instructions.
+    # This selects the leftmost match, which is valid for either tie-breaking mode.
+    if not return_indices:
         if core.constexpr(input.dtype.primitive_bitwidth) < core.constexpr(32):
             if core.constexpr(input.dtype.is_floating()):
                 input = input.to(core.float32)
             else:
                 assert input.dtype.is_int(), "Expecting input to be integer type"
                 input = input.to(core.int32)
-        return core.reduce(input, axis, _elementwise_max, keep_dims=keep_dims, reduction_ordering=reduction_ordering)
+    if propagate_nan == core.PropagateNan.ALL:
+        value = core.reduce(input, axis, _elementwise_max_propagate_nan, keep_dims=keep_dims,
+                            reduction_ordering=reduction_ordering, multi_cta=multi_cta)
+    else:
+        value = core.reduce(input, axis, _elementwise_max_ignore_nan, keep_dims=keep_dims,
+                            reduction_ordering=reduction_ordering, multi_cta=multi_cta)
+    if return_indices:
+        core.static_assert(not multi_cta, "multi_cta does not support indexed reductions")
+        return value, _argminmax_index(input, value, axis, keep_dims)
+    else:
+        return value
 
 
 @core._tensor_member_fn
@@ -208,54 +266,44 @@ def argmax(input, axis, tie_break_left=True, keep_dims=False, reduction_ordering
 
 
 @jit
-def _argmin_combine(value1, index1, value2, index2, tie_break_left):
-    if tie_break_left:
-        tie = value1 == value2 and index1 < index2
-    else:
-        tie = False
-    lt = value1 < value2 or tie
-    value_ret = core.where(lt, value1, value2)
-    index_ret = core.where(lt, index1, index2)
-    return value_ret, index_ret
+def _elementwise_min_ignore_nan(a, b):
+    return core.minimum(a, b, propagate_nan=core.PropagateNan.NONE)
 
 
 @jit
-def _argmin_combine_tie_break_left(value1, index1, value2, index2):
-    return _argmin_combine(value1, index1, value2, index2, True)
-
-
-@jit
-def _argmin_combine_tie_break_fast(value1, index1, value2, index2):
-    return _argmin_combine(value1, index1, value2, index2, False)
-
-
-@jit
-def _elementwise_min(a, b):
-    return core.minimum(a, b)
+def _elementwise_min_propagate_nan(a, b):
+    return core.minimum(a, b, propagate_nan=core.PropagateNan.ALL)
 
 
 @core._tensor_member_fn
 @jit
 @core._add_reduction_docstr("minimum", return_indices_arg="return_indices",
-                            tie_break_arg="return_indices_tie_break_left", reduction_ordering_arg="reduction_ordering")
+                            tie_break_arg="return_indices_tie_break_left", reduction_ordering_arg="reduction_ordering",
+                            multi_cta_arg="multi_cta")
 def min(input, axis=None, return_indices=False, return_indices_tie_break_left=True, keep_dims=False,
-        reduction_ordering: core.constexpr = None):
-    input = core._promote_bfloat16_to_float32(input)
-    if return_indices:
-        if return_indices_tie_break_left:
-            return core._reduce_with_indices(input, axis, _argmin_combine_tie_break_left, keep_dims=keep_dims,
-                                             reduction_ordering=reduction_ordering)
-        else:
-            return core._reduce_with_indices(input, axis, _argmin_combine_tie_break_fast, keep_dims=keep_dims,
-                                             reduction_ordering=reduction_ordering)
-    else:
+        reduction_ordering: core.constexpr = None, multi_cta: core.constexpr = False,
+        propagate_nan: core.constexpr = core.PropagateNan.NONE):
+    core.static_assert(isinstance(propagate_nan, core.PropagateNan), "propagate_nan must be a PropagateNan enum value")
+    # Reduce matching indices with min to enable native redux instructions.
+    # This selects the leftmost match, which is valid for either tie-breaking mode.
+    if not return_indices:
         if core.constexpr(input.dtype.primitive_bitwidth) < 32:
             if core.constexpr(input.dtype.is_floating()):
                 input = input.to(core.float32)
             else:
                 assert input.dtype.is_int(), "Expecting input to be integer type"
                 input = input.to(core.int32)
-        return core.reduce(input, axis, _elementwise_min, keep_dims=keep_dims, reduction_ordering=reduction_ordering)
+    if propagate_nan == core.PropagateNan.ALL:
+        value = core.reduce(input, axis, _elementwise_min_propagate_nan, keep_dims=keep_dims,
+                            reduction_ordering=reduction_ordering, multi_cta=multi_cta)
+    else:
+        value = core.reduce(input, axis, _elementwise_min_ignore_nan, keep_dims=keep_dims,
+                            reduction_ordering=reduction_ordering, multi_cta=multi_cta)
+    if return_indices:
+        core.static_assert(not multi_cta, "multi_cta does not support indexed reductions")
+        return value, _argminmax_index(input, value, axis, keep_dims)
+    else:
+        return value
 
 
 @core._tensor_member_fn
@@ -266,6 +314,45 @@ def argmin(input, axis, tie_break_left=True, keep_dims=False, reduction_ordering
     _, ret = min(input, axis, return_indices=True, return_indices_tie_break_left=tie_break_left, keep_dims=keep_dims,
                  reduction_ordering=reduction_ordering)
     return ret
+
+
+# logical reductions
+
+
+@core._tensor_member_fn
+@jit
+def all(input, axis=None, keep_dims=False):
+    """
+    Returns whether all elements in :code:`input` are nonzero along the provided :code:`axis`.
+
+    The result has dtype :code:`int1`. NaN and infinity are treated as nonzero.
+
+    :param input: the input values
+    :type input: Tensor
+    :param axis: the dimension to reduce. If None, reduce all dimensions
+    :type axis: int | None
+    :param keep_dims: if true, keep the reduced dimensions with length 1
+    :type keep_dims: bool
+    """
+    return core.reduce(input.to(core.int1), axis, _elementwise_min_ignore_nan, keep_dims=keep_dims)
+
+
+@core._tensor_member_fn
+@jit
+def any(input, axis=None, keep_dims=False):
+    """
+    Returns whether any element in :code:`input` is nonzero along the provided :code:`axis`.
+
+    The result has dtype :code:`int1`. NaN and infinity are treated as nonzero.
+
+    :param input: the input values
+    :type input: Tensor
+    :param axis: the dimension to reduce. If None, reduce all dimensions
+    :type axis: int | None
+    :param keep_dims: if true, keep the reduced dimensions with length 1
+    :type keep_dims: bool
+    """
+    return core.reduce(input.to(core.int1), axis, _elementwise_max_ignore_nan, keep_dims=keep_dims)
 
 
 @jit
@@ -283,34 +370,24 @@ def _pick_sum_dtype(in_dtype, dtype):
 
     # For integer bitwidths less than 32, pick int32 with the same sign to
     # avoid overflow.
-    out_dtype = None
-    if in_dtype.is_int_signed():
-        out_dtype = core.int32 if in_dtype.int_bitwidth < 32 else None
-    elif in_dtype.is_int_unsigned():
-        out_dtype = core.uint32 if in_dtype.int_bitwidth < 32 else None
-    return out_dtype
+    if in_dtype.is_int_signed() and in_dtype.int_bitwidth < 32:
+        return core.int32
+    if in_dtype.is_int_unsigned() and in_dtype.int_bitwidth < 32:
+        return core.uint32
+    return in_dtype
 
 
 @core._tensor_member_fn
 @jit
-@core._add_reduction_docstr("sum", dtype_arg="dtype", reduction_ordering_arg="reduction_ordering")
-def sum(input, axis=None, keep_dims=False, dtype: core.constexpr = None, reduction_ordering: core.constexpr = None):
+@core._add_reduction_docstr("sum", dtype_arg="dtype", reduction_ordering_arg="reduction_ordering",
+                            multi_cta_arg="multi_cta")
+def sum(input, axis=None, keep_dims=False, dtype: core.constexpr = None, reduction_ordering: core.constexpr = None,
+        multi_cta: core.constexpr = False):
     # Pick a default dtype for the reduction if one was not specified.
     out_dtype: core.constexpr = _pick_sum_dtype(input.dtype, dtype)
-
-    if out_dtype is not None:
-        input = input.to(out_dtype)
-
-    # Facebook. begin
-    input = core._promote_bfloat16_to_float32(input)
-    # Both torch.sum and Triton default promote bfloat16 to float32 before reduce
-    # and PTX does `add.f32` while Triton Beta generates `add.bf16x2`.
-    # The latter one makes more sense to me while this patch keeps Triton Beta
-    # consistent with Triton default first. More details are discussed at
-    # https://fb.workplace.com/groups/1405155842844877/posts/24616028937997573/?comment_id=24616575671276233&reply_comment_id=24617223141211486
-    # Facebook. end
-
-    return core.reduce(input, axis, _sum_combine, keep_dims=keep_dims, reduction_ordering=reduction_ordering)
+    input = input.to(out_dtype)
+    return core.reduce(input, axis, _sum_combine, keep_dims=keep_dims, reduction_ordering=reduction_ordering,
+                       multi_cta=multi_cta)
 
 
 @jit
@@ -351,16 +428,10 @@ def reduce_or(input, axis, keep_dims=False):
 @core._tensor_member_fn
 @jit
 @core._add_scan_docstr("cumsum", dtype_arg="dtype")
-def cumsum(input, axis=0, reverse=False, dtype: core.constexpr = None):
-    # todo rename this to a generic function name
-
-    input = core._promote_bfloat16_to_float32(input)
+def cumsum(input, axis=0, reverse=False, dtype: core.constexpr = None, reduction_ordering: core.constexpr = None):
     out_dtype: core.constexpr = _pick_sum_dtype(input.dtype, dtype)
-
-    if out_dtype is not None:
-        input = input.to(out_dtype)
-
-    return core.associative_scan(input, axis, _sum_combine, reverse)
+    input = input.to(out_dtype)
+    return core.associative_scan(input, axis, _sum_combine, reverse, reduction_ordering=reduction_ordering)
 
 
 # cumprod
@@ -373,11 +444,11 @@ def _prod_combine(a, b):
 
 @core._tensor_member_fn
 @jit
-@core._add_scan_docstr("cumprod")
-def cumprod(input, axis=0, reverse=False):
-    # todo rename this to a generic function name
-    input = core._promote_bfloat16_to_float32(input)
-    return core.associative_scan(input, axis, _prod_combine, reverse)
+@core._add_scan_docstr("cumprod", dtype_arg="dtype")
+def cumprod(input, axis=0, reverse=False, dtype: core.constexpr = None, reduction_ordering: core.constexpr = None):
+    out_dtype: core.constexpr = _pick_sum_dtype(input.dtype, dtype)
+    input = input.to(out_dtype)
+    return core.associative_scan(input, axis, _prod_combine, reverse, reduction_ordering=reduction_ordering)
 
 
 # sort
@@ -405,7 +476,7 @@ def _compare_and_swap(x, flip, i: core.constexpr):
     is_right = _indicator(n_dims, i)
 
     # conditional swap:
-    ret = core.where((x > y) != (flip ^ is_right), y, x)
+    ret = core.where((x > y) != (flip ^ is_right).to(core.int1), y, x)
     return ret
 
 
@@ -457,26 +528,49 @@ def sort_impl(x, k: core.constexpr = None, dim: core.constexpr = None, descendin
     _dim: core.constexpr = len(x.shape) - 1 if dim is None else dim
     core.static_assert(_dim == len(x.shape) - 1, "only minor dimension is currently supported")
 
+    if k is not None:
+        core.static_assert(k > 0, "topk: k must be greater than 0")
+        core.static_assert(_is_power_of_two(k), "topk: k must be a power of two")
+        core.static_assert(k <= x.shape[_dim], "topk: k must not exceed the size of the selected dimension")
+
+    # An NPOT dim is sorted padded to the next power of two.
+    n: core.constexpr = x.shape[_dim]
+    core.static_assert(_is_power_of_two(x.numel // n), "sort over an NPOT dim other than the sorted one is unsupported")
+    if not _is_power_of_two(n):
+        p: core.constexpr = _next_power_of_two(n)
+        lanes = core.arange(0, p)
+        idx = core.broadcast_to(core.reshape(core.minimum(lanes, n - 1), [1] * _dim + [p]), x.shape[:-1] + [p])
+        pad = core.full(idx.shape, _sort_pad(x.dtype, descending), x.dtype)
+        x = core.where(lanes < n, core.gather(x, idx, _dim), pad)
+
     log_n: core.constexpr = _log2(x.shape[_dim])
     log_k: core.constexpr = log_n if k is None else _log2(k)
 
-    n_dims: core.constexpr = _log2(x.numel)
+    if log_k == 0:
+        # k == 1 (or a length-1 dim): the general path below would reduce the
+        # hypercube to a 0-d scalar, so emit a plain reduce instead.
+        x = max(x, axis=_dim, keep_dims=True) if descending else min(x, axis=_dim, keep_dims=True)
+    else:
+        n_dims: core.constexpr = _log2(x.numel)
 
-    # reshape to hypercube:
-    h = core.reshape(x, [2] * n_dims if n_dims else [1])
+        # reshape to hypercube:
+        h = core.reshape(x, [2] * n_dims if n_dims else [1])
 
-    # run first log_k bitonic sort iterations:
-    for i in core.static_range(1, log_k + 1):
-        h = _bitonic_merge_hypercube(h, i, 2 if i < log_n else descending)
+        # run first log_k bitonic sort iterations:
+        for i in core.static_range(1, log_k + 1):
+            h = _bitonic_merge_hypercube(h, i, 2 if i < log_n else descending)
 
-    # select top k elements using bitonic top-k
-    # https://www.doc.ic.ac.uk/~hlgr/pdfs/MassivelyParallelTopK.pdf
-    for i in core.static_range(log_k + 1, log_n + 1):
-        h = max(h, axis=(_log2(h.numel) - 1 - log_k)) if descending else min(h, axis=(_log2(h.numel) - 1 - log_k))
-        h = _bitonic_merge_hypercube(h, log_k, 2 if i < log_n else descending)
+        # select top k elements using bitonic top-k
+        # https://www.doc.ic.ac.uk/~hlgr/pdfs/MassivelyParallelTopK.pdf
+        for i in core.static_range(log_k + 1, log_n + 1):
+            h = max(h, axis=(_log2(h.numel) - 1 - log_k)) if descending else min(h, axis=(_log2(h.numel) - 1 - log_k))
+            h = _bitonic_merge_hypercube(h, log_k, 2 if i < log_n else descending)
 
-    # reshape back:
-    x = core.reshape(h, x.shape[:-1] + [2**log_k])
+        # reshape back:
+        x = core.reshape(h, x.shape[:-1] + [2**log_k])
+    if k is None and not _is_power_of_two(n):
+        idx = core.broadcast_to(core.reshape(core.arange(0, n), [1] * _dim + [n]), x.shape[:-1] + [n])
+        x = core.gather(x, idx, _dim)
     return x
 
 
@@ -494,7 +588,7 @@ def topk(x, k: core.constexpr, dim: core.constexpr = None, descending: core.cons
 
     :param x: The input tensor.
     :type x: Tensor
-    :param k: The number of top elements to return. Must be a power of two.
+    :param k: The number of top elements to return. Must be a positive power of two no larger than the selected dimension.
     :type k: int
     :param dim: The dimension along which to find the top k elements.
                 If None, uses the last dimension. Currently only the last dimension is supported.
@@ -546,13 +640,14 @@ def flip(x, dim=None):
     core.static_assert(0 <= _dim and _dim < len(x.shape), "flip: dim must be None or in [-rank, rank)")
     core.static_assert(_is_power_of_two(x.shape[_dim]))
     steps: core.constexpr = _log2(x.shape[_dim])
-
-    # reshape the swap dimension to (2, 2, ..., 2)
-    idtype = _get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
-    y = core.reshape(x.to(idtype, bitcast=True), x.shape[:_dim] + [2] * steps + x.shape[_dim + 1:])
-    for i in core.static_range(steps):
-        y = y ^ xor_sum(y, _dim + i, True)
-    x = core.reshape(y, x.shape).to(x.dtype, bitcast=True)
+    # Flipping a dimension of size 1 is a no-op.
+    if steps > 0:
+        # reshape the swap dimension to (2, 2, ..., 2)
+        idtype = _get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
+        y = core.reshape(x.to(idtype, bitcast=True), x.shape[:_dim] + [2] * steps + x.shape[_dim + 1:])
+        for i in core.static_range(steps):
+            y = y ^ xor_sum(y, _dim + i, True)
+        x = core.reshape(y, x.shape).to(x.dtype, bitcast=True)
     return x
 
 
@@ -591,8 +686,10 @@ def squeeze(x, dim: core.constexpr):
     :param dim: the index of the dimension to remove
     :type dim: int
     """
-    core.static_assert(x.shape[dim] == 1)
-    return x.reshape(x.shape[:dim] + x.shape[dim + 1:])
+    core.static_assert(-len(x.shape) <= dim and dim < len(x.shape))
+    _dim: core.constexpr = dim + len(x.shape) if dim < 0 else dim
+    core.static_assert(x.shape[_dim] == 1)
+    return x.reshape(x.shape[:_dim] + x.shape[_dim + 1:])
 
 
 @jit
@@ -607,4 +704,7 @@ def unsqueeze(x, dim: core.constexpr):
     :param dim: the index at which the new dimension is inserted
     :type dim: int
     """
-    return x.reshape(x.shape[:dim] + (1, ) + x.shape[dim:])
+    ndim: core.constexpr = len(x.shape) + 1
+    core.static_assert(-ndim <= dim and dim < ndim)
+    _dim: core.constexpr = dim + ndim if dim < 0 else dim
+    return x.reshape(x.shape[:_dim] + (1, ) + x.shape[_dim:])

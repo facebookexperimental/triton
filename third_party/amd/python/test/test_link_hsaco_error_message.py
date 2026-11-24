@@ -10,6 +10,8 @@ def is_hip():
 
 
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP backend")
+
+
 def test_nonexistent_input_reports_lld_error_details():
     """Verify that lld linker errors are captured and surfaced in exceptions.
 

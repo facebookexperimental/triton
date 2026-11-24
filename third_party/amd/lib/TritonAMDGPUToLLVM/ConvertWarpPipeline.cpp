@@ -24,6 +24,7 @@
 #include "TargetInfo.h"
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
+#include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -88,9 +89,17 @@ static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
 // isPipelineIgnorable in WarpPipeliner.cpp plus the ROCDL-lowered forms that
 // can appear after intermediate passes.
 static bool isWarpPipelineIgnorableBarrier(Operation *op) {
-  return isa<ROCDL::BarrierOp, gpu::BarrierOp, triton::gpu::AsyncWaitOp,
-             triton::amdgpu::AsyncWaitOp, triton::amdgpu::AsyncTDMWait,
+  return isa<ROCDL::BarrierOp, gpu::BarrierOp, triton::gpu::BarrierOp,
+             triton::gpu::AsyncWaitOp, triton::amdgpu::AsyncWaitOp,
+             triton::amdgpu::AsyncTDMWait,
              triton::amdgpu::AsyncTDMIntrinsicWait>(op);
+}
+
+// True if `op` reads or writes memory (a load / store / async-copy).
+static bool readsOrWritesMemory(Operation *op) {
+  auto mei = dyn_cast<MemoryEffectOpInterface>(op);
+  return mei && (mei.hasEffect<MemoryEffects::Read>() ||
+                 mei.hasEffect<MemoryEffects::Write>());
 }
 
 // True if `exec` is a stage created by the warp-pipeline frontend.
@@ -103,6 +112,11 @@ static bool isPipelineStage(scf::ExecuteRegionOp exec) {
 static scf::ExecuteRegionOp getPipelineStage(Operation *op) {
   auto exec = dyn_cast_or_null<scf::ExecuteRegionOp>(op);
   return isPipelineStage(exec) ? exec : nullptr;
+}
+
+static scf::ExecuteRegionOp getFlatPipelineStage(Operation *op) {
+  auto exec = getPipelineStage(op);
+  return exec && exec->hasAttr("triton.warp_pipeline.flat") ? exec : nullptr;
 }
 
 // Validate the body of a `pipelined_for` loop.  After WarpPipeliner the body
@@ -121,7 +135,7 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
             "non-warp-pipeline scf.execute_region inside pipelined_for body");
       ++numClusters;
     } else if (isWarpPipelineIgnorableBarrier(&op)) {
-      if (existingBarrierMap.count(numClusters))
+      if (existingBarrierMap.contains(numClusters))
         return op.emitError("multiple pre-existing barriers between pipeline "
                             "stages; insert a dummy stage instead");
       existingBarrierMap[numClusters] = &op;
@@ -136,7 +150,8 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
   if (numClusters < 2)
     return forOp.emitError(
         "pipelined_for body must contain at least two pipeline stages");
-  if (existingBarrierMap.count(0) && existingBarrierMap.count(numClusters))
+  if (existingBarrierMap.contains(0) &&
+      existingBarrierMap.contains(numClusters))
     return forOp.emitError("pipelined_for body has both top-of-loop and "
                            "bottom-of-loop pre-existing barriers");
   return success();
@@ -202,6 +217,15 @@ static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
   const int N = clusterInfo.size();
   const int maxDist = circular ? N : N - 1;
 
+  // A descriptor can change between iterations. Preserve same-iteration
+  // disjointness proofs only for pairs that do not wrap around the loop.
+  SmallVector<BlockInfo> previousIterationInfo;
+  if (circular) {
+    previousIterationInfo.assign(clusterInfo.begin(), clusterInfo.end());
+    for (BlockInfo &info : previousIterationInfo)
+      info.invalidateIterationInfo();
+  }
+
   // Modular wrap; a no-op in linear mode where indices stay in range.
   auto wrap = [&](int i) -> int { return circular ? (i % N + N) % N : i; };
 
@@ -228,7 +252,9 @@ static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
       const int barrierLoc = (dist == 1) ? dst : wrap(dst - 1);
       if (isCovered(src, barrierLoc))
         continue;
-      if (!clusterInfo[src].isIntersected(
+      const BlockInfo &sourceInfo =
+          src + dist >= N ? previousIterationInfo[src] : clusterInfo[src];
+      if (!sourceInfo.isIntersected(
               clusterInfo[dst], mlir::triton::AMD::membarFilter, allocation))
         continue;
       bars[barrierLoc] = true;
@@ -258,19 +284,57 @@ static void emitClusterPriority(OpBuilder &r, Location loc,
   }
 }
 
-// Wrap a pre-existing barrier op (e.g. async_wait) with sched_barriers so the
-// backend scheduler cannot move ops across it, and emit the cluster's
-// priority just before the barrier.  Used in place of inserting a fresh
-// cluster barrier when one already exists at the cluster boundary.
+// Fence a pre-existing cluster-boundary barrier or wait and emit the cluster's
+// priority before it. Group waits also need an explicit local rendezvous.
 static void wrapExistingBarrier(OpBuilder &b, Location loc,
                                 Operation *clusterOp,
-                                Operation *existingBarrier,
-                                bool anyHasPriority) {
+                                Operation *existingBarrier, bool anyHasPriority,
+                                bool emitPriority = true) {
   b.setInsertionPoint(existingBarrier);
-  emitClusterPriority(b, loc, clusterOp, anyHasPriority);
+  if (emitPriority)
+    emitClusterPriority(b, loc, clusterOp, anyHasPriority);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
   b.setInsertionPointAfter(existingBarrier);
+  // Group waits lower to per-thread completion waits. Place the rendezvous
+  // here so Membar cannot defer it into the next stage. The trailing scheduling
+  // fence also prevents ScheduleMembar from moving it to a global-load use.
+  if (isa<triton::gpu::AsyncWaitOp, triton::amdgpu::AsyncWaitOp>(
+          existingBarrier))
+    triton::gpu::BarrierOp::create(b, loc, triton::gpu::AddrSpace::Local);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
+}
+
+static bool hasDotOp(Block *block) {
+  bool foundDot = false;
+  block->walk([&](triton::DotOp) {
+    foundDot = true;
+    return WalkResult::interrupt();
+  });
+  return foundDot;
+}
+
+// On CDNA4 four-stage pingpong attention kernels benefit from placing the
+// cluster-0 wraparound barrier at the loop head, while keeping the `setprio` at
+// section ends.  We limit this to matching on CDNA4 without explicit barrier
+// placement in the source, and with the four-stage pingpong design.
+static bool shouldPlaceBackedgeBarrierAtHead(
+    triton::amdgpu::ISAFamily isaFamily, ArrayRef<Operation *> clusterOps,
+    ArrayRef<Block *> clusterBlocks, ArrayRef<bool> bars, bool hasTopBarrier,
+    bool hasBottomBarrier) {
+  if (isaFamily != triton::amdgpu::ISAFamily::CDNA4 || hasTopBarrier ||
+      hasBottomBarrier || clusterOps.size() != 4 || bars.empty() || !bars[0])
+    return false;
+
+  for (auto [i, clusterOp] : llvm::enumerate(clusterOps)) {
+    auto priority =
+        clusterOp->getAttrOfType<IntegerAttr>("triton.warp_pipeline.priority");
+    int expectedPriority = (i % 2 == 0) ? 0 : 1;
+    if (!priority || priority.getInt() != expectedPriority)
+      return false;
+    if (expectedPriority == 0 && !hasDotOp(clusterBlocks[i]))
+      return false;
+  }
+  return true;
 }
 
 // Emit pre-barrier, thread-ID partitioning, and phase-shift cond_barrier.
@@ -300,7 +364,11 @@ emitPipelinePrelude(OpBuilder &b, Location loc, int threadsPerPipelineGroup) {
 
 // Emit priority reset and reconverge cond_barrier after a pipeline.
 static void emitPipelinePostlude(OpBuilder &b, Location loc,
-                                 bool anyHasPriority, Value warpLow) {
+                                 bool anyHasPriority, Value warpLow,
+                                 bool emitPostludeBarrier = false,
+                                 bool needLocal = false) {
+  if (emitPostludeBarrier)
+    emitClusterBarrier(b, loc, needLocal);
   if (anyHasPriority)
     ROCDL::SetPrioOp::create(b, loc, 0);
   mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpLow);
@@ -309,10 +377,12 @@ static void emitPipelinePostlude(OpBuilder &b, Location loc,
 class ConvertPipelinedForPattern : public OpRewritePattern<scf::ForOp> {
 public:
   ConvertPipelinedForPattern(MLIRContext *ctx, ModuleAllocation &moduleAlloc,
-                             int threadsPerPipelineGroup)
+                             int threadsPerPipelineGroup,
+                             triton::amdgpu::ISAFamily isaFamily)
       : OpRewritePattern<scf::ForOp>(ctx, /*benefit=*/2),
         moduleAllocation(moduleAlloc),
-        threadsPerPipelineGroup(threadsPerPipelineGroup) {}
+        threadsPerPipelineGroup(threadsPerPipelineGroup), isaFamily(isaFamily) {
+  }
 
   LogicalResult matchAndRewrite(scf::ForOp forOp,
                                 PatternRewriter &rewriter) const override {
@@ -377,9 +447,9 @@ private:
 
     // Normally, we don't expect a pipelined loop begins with a barrier
     // but sometimes required by memory prefetching pattern.
-    auto topBar = existingBarrierMap.find(0);
     auto bottomBar = existingBarrierMap.find(numClusters);
-    bool hasTopBarrier = topBar != existingBarrierMap.end();
+    bool hasTopBarrier = existingBarrierMap.contains(0);
+    bool hasBottomBarrier = bottomBar != existingBarrierMap.end();
     if (bottomBar != existingBarrierMap.end()) {
       // validatePipelinedForBody guarantees we cannot have both top and
       // bottom barriers, so rotating bottom -> 0 is unambiguous.
@@ -392,6 +462,9 @@ private:
     // 3. Circular dependency analysis (wrap-around for loop pipelines).
     analyzePipelineDependencies(clusterInfo, bars, allocation,
                                 /*circular=*/true);
+    if (shouldPlaceBackedgeBarrierAtHead(isaFamily, clusterOps, clusterBlocks,
+                                         bars, hasTopBarrier, hasBottomBarrier))
+      hasTopBarrier = true;
 
     // 4. Materializing final cluster-scope barriers.  For each cluster index:
     //  • If there is a pre-existing barrier at that location, we wrap it with
@@ -405,41 +478,54 @@ private:
     //    the first cluster barrier must be inserted just before the loop’s
     //    terminator, forming the wrap-around dependency.
     for (int i = 0; i < numClusters; i++) {
-      if (i == 0 && !hasTopBarrier) {
-        // Prime the first iteration's priority.  The loop-carried cluster-0
-        // barrier sits at the bottom of the loop body, so it only controls
-        // the next iteration.
+      if (i == 0) {
+        // Prime the first iteration's priority.  Subsequent iterations switch
+        // to cluster 0 at the loop tail.
         b.setInsertionPoint(forOp);
         emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
       }
 
-      if (auto exBar = existingBarrierMap.find(i);
-          exBar != existingBarrierMap.end()) {
-        // FIXME: If bars[i] is true, wrapping a non-LOCAL pre-existing
-        // barrier is not enough to satisfy LDS ordering.  For now we rely on
-        // the producer to place such barriers only where no local fence is
-        // needed.
-        wrapExistingBarrier(b, loc, clusterOps[i], exBar->second,
-                            anyHasPriority);
-      } else {
-        b.setInsertionPoint(clusterOps[i]);
-        // The first one wraps back to the last of the loop
-        if (i == 0 && !hasTopBarrier) {
-          // inserts just before yield (=End of the loop).
+      bool emitPriorityAtBoundary = true;
+      if (i == 0) {
+        if (hasTopBarrier) {
+          // The top barrier represents the loop backedge, so keep cluster-0
+          // priority at the loop tail for the next iteration.
+          b.setInsertionPoint(terminatorOp);
+          emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+          b.setInsertionPoint(clusterOps[i]);
+          emitPriorityAtBoundary = false;
+        } else {
+          // Insert just before yield (= end of the loop).
           b.setInsertionPoint(terminatorOp);
         }
-        emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+      } else {
+        b.setInsertionPoint(clusterOps[i]);
+      }
+
+      if (auto exBar = existingBarrierMap.find(i);
+          exBar != existingBarrierMap.end()) {
+        // FIXME: Non-LOCAL barriers other than group waits do not acquire
+        // a local fence in wrapExistingBarrier. They must occur only where
+        // no local fence is needed.
+        wrapExistingBarrier(b, loc, clusterOps[i], exBar->second,
+                            anyHasPriority, emitPriorityAtBoundary);
+      } else {
+        if (emitPriorityAtBoundary)
+          emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
         emitClusterBarrier(b, loc, /*needLocal=*/bars[i]);
       }
     }
 
     // 5. Post-loop priority reset and reconverge.
     b.setInsertionPointAfter(forOp);
-    emitPipelinePostlude(b, loc, anyHasPriority, warpLow);
+    bool emitPostludeBarrier = hasTopBarrier;
+    emitPipelinePostlude(b, loc, anyHasPriority, warpLow, emitPostludeBarrier,
+                         /*needLocal=*/bars[0]);
   }
 
   ModuleAllocation &moduleAllocation;
   int threadsPerPipelineGroup;
+  triton::amdgpu::ISAFamily isaFamily;
 };
 
 class InlineWarpPipelineExecuteRegionPattern
@@ -470,6 +556,20 @@ public:
 
     // Inline region.
     Block *block = &reg.front();
+
+    // Preserve the existing source-order policy unless the frontend explicitly
+    // allows the backend scheduler to reorder a stage's memory operations.
+    if (!exec->hasAttr("triton.warp_pipeline.allow_memory_reorder")) {
+      for (Operation &op : llvm::make_early_inc_range(*block)) {
+        if (!readsOrWritesMemory(&op))
+          continue;
+        rewriter.setInsertionPointAfter(&op);
+        ROCDL::SchedBarrier::create(
+            rewriter, op.getLoc(),
+            ROCDL::SchedGroupMask::non_mem_non_sideeffect);
+      }
+    }
+
     Operation *terminator = block->getTerminator();
     ValueRange results = terminator->getOperands();
     rewriter.inlineBlockBefore(block, exec, {});
@@ -575,18 +675,25 @@ static void processUnrolledPipelineRegions(ModuleOp m,
     if (!allocation)
       return;
 
-    // NOTE: We only iterate the function's top-level blocks; flat-pipeline
-    // execute_regions inside nested non-loop regions (e.g. scf.if bodies)
-    // are not collected.  WarpPipeliner's flat-pipeline frontend has the
-    // same scope, so the two stay in sync.
-    for (Block &block : funcOp.getBody()) {
+    // Flat pipelines can be nested in an enclosing persistent loop when their
+    // original owner loop was fully unrolled. The explicit flat attribute
+    // distinguishes those stages from stages owned by a pipelined_for loop.
+    SmallVector<Block *> blocks;
+    funcOp.walk([&](Block *block) { blocks.push_back(block); });
+    for (Block *block : blocks) {
       // Collect contiguous sequences of flat warp-pipeline execute_regions,
       // splitting at any non-ignorable, non-pipeline op.
       SmallVector<SmallVector<scf::ExecuteRegionOp>> sequences;
       SmallVector<scf::ExecuteRegionOp> current;
 
-      for (auto &op : block) {
-        if (auto exec = getPipelineStage(&op)) {
+      bool isFunctionBody = block->getParentOp() == funcOp;
+      for (auto &op : *block) {
+        auto exec = getPipelineStage(&op);
+        // Before flat stages were explicitly tagged, the frontend only
+        // produced them in the function body. Keep accepting that legacy
+        // form there; nested stages must carry the flat tag so stages owned
+        // by pipelined_for are not converted twice.
+        if (exec && (isFunctionBody || getFlatPipelineStage(&op))) {
           current.push_back(exec);
           continue;
         }
@@ -939,6 +1046,9 @@ public:
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
+    // Reject before the ModuleAllocation below, as the allocation passes do.
+    if (failed(mlir::triton::gpu::verifyNpotTypesSupported(m)))
+      return signalPassFailure();
 
     mlir::triton::AMD::TargetInfo targetInfo(gfxArch.getValue());
     size_t partitionSize = targetInfo.getSharedMemoryPartitionSize();
@@ -948,7 +1058,8 @@ public:
     };
     ModuleAllocation moduleAllocation(m, allocationFn, partitionSize);
 
-    if (targetInfo.getISAFamily() == triton::amdgpu::ISAFamily::Unknown) {
+    auto isaFamily = targetInfo.getISAFamily();
+    if (isaFamily == triton::amdgpu::ISAFamily::Unknown) {
       m.emitError("unsupported target: '") << gfxArch.getValue() << "'";
       return signalPassFailure();
     }
@@ -974,8 +1085,8 @@ public:
 
     RewritePatternSet patternFor(&getContext());
     RewritePatternSet patternInline(&getContext());
-    patternFor.add<ConvertPipelinedForPattern>(&getContext(), moduleAllocation,
-                                               threadsPerPipelineGroup);
+    patternFor.add<ConvertPipelinedForPattern>(
+        &getContext(), moduleAllocation, threadsPerPipelineGroup, isaFamily);
     patternInline.add<InlineWarpPipelineExecuteRegionPattern>(&getContext());
 
     if (failed(applyPatternsGreedily(m, std::move(patternFor))))

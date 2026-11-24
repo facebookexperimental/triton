@@ -1,0 +1,3304 @@
+"""TLX AMD tests -- CDNA4 (gfx950)."""
+import gc
+import math
+import os
+import re
+import statistics
+import subprocess
+import sys
+
+import pytest
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+import triton.language.extra.tlx as tlx
+import traceback
+from triton._internal_testing import is_hip_cdna4
+from triton.backends.compiler import GPUTarget
+from triton.tlx.ops.kernels.flash_attn.gfx950 import (
+    _cluster_causal_query_tile as _amd_fa_cluster_causal_query_tile,
+    _cluster_direct_workgroup_window as _amd_fa_cluster_direct_workgroup_window,
+    attention as _amd_fa_cluster_attention,
+    persistent_attention as _amd_fa_cluster_persistent_attention,
+)
+from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.bench import (
+    generate_mxfp4_inputs as _generate_a4w4_inputs,
+    launch_matmul as _launch_a4w4,
+    torch_reference as _a4w4_reference,
+)
+from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel import (
+    BLOCK_M as _A4W4_INTER_WAVE_BLOCK_M,
+    BLOCK_N as _A4W4_INTER_WAVE_BLOCK_N,
+    MIN_K as _A4W4_INTER_WAVE_MIN_K,
+    matmul as _a4w4_inter_wave_matmul,
+    matmul_merged_scales as _a4w4_inter_wave_matmul_merged_scales,
+    matmul_preshuffled as _a4w4_inter_wave_matmul_preshuffled,
+    preshuffle_mxfp4_a_scales as _preshuffle_a4w4_a_scales,
+    preshuffle_mxfp4_b_scales as _preshuffle_a4w4_b_scales,
+    preshuffle_mxfp4_scales as _preshuffle_a4w4_scales,
+    select_matmul_path as _select_a4w4_inter_wave_path,
+)
+
+
+@triton.jit
+def _amd_fa_cluster_causal_query_order_kernel(output, N_CTX: tl.constexpr, BLOCK_M: tl.constexpr):
+    raw_pid_m = tl.program_id(0)
+    pid_m = _amd_fa_cluster_causal_query_tile(raw_pid_m, N_CTX, BLOCK_M)
+    tl.store(output + raw_pid_m, pid_m)
+
+
+@triton.jit
+def _amd_fa_cluster_workgroup_order_kernel(
+    output,
+    H: tl.constexpr,
+    N_CTX: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    USE_24_HEAD_WINDOW: tl.constexpr,
+    USE_FACTORED_24: tl.constexpr,
+):
+    raw_off_h = tl.program_id(0)
+    raw_pid_m = tl.program_id(1)
+    off_h, pid_m = _amd_fa_cluster_direct_workgroup_window(
+        raw_off_h,
+        raw_pid_m,
+        H,
+        N_CTX,
+        BLOCK_M,
+        IS_CAUSAL,
+        USE_24_HEAD_WINDOW,
+        USE_FACTORED_24,
+    )
+    if IS_CAUSAL:
+        pid_m = _amd_fa_cluster_causal_query_tile(pid_m, N_CTX, BLOCK_M)
+    num_m_blocks: tl.constexpr = (N_CTX + BLOCK_M - 1) // BLOCK_M
+    raw_linear = raw_off_h + raw_pid_m * H
+    mapped_linear = off_h + pid_m * H
+    tl.store(output + raw_linear, mapped_linear, mask=raw_pid_m < num_m_blocks)
+
+
+_AMD_FA_CLUSTER_REGRESSION_WORKER = "TRITON_TLX_AMD_FA_CLUSTER_REGRESSION_WORKER"
+_AMD_FA_CLUSTER_MIN_SNR_DB = 35.0
+_AMD_FA_CLUSTER_REFERENCE_TFLOPS = 1010.5
+_AMD_FA_CLUSTER_MIN_TFLOPS = 925.0
+_AMD_FA_CLUSTER_CASES = tuple(
+    (dtype, 16384 // seq_len, 64, seq_len, 128, causal)
+    for dtype in (torch.float16, torch.bfloat16)
+    for causal in (False, True)
+    for seq_len in (512, 1024, 2048, 4096, 8192, 16384)) + tuple(
+        (dtype, 16, 64, 1024, 64, causal) for dtype in (torch.float16, torch.bfloat16) for causal in (False, True))
+
+
+def _amd_fa_cluster_sample_indices(size):
+    return tuple(dict.fromkeys((0, size // 2, size - 1)))
+
+
+def _amd_fa_cluster_sampled_fp32(actual, q, k, v, scale, causal):
+    query_indices = _amd_fa_cluster_sample_indices(q.shape[2])
+    query_positions = torch.tensor(query_indices, device=q.device)
+    key_positions = torch.arange(k.shape[2], device=q.device)
+    actual_rows = []
+    reference_rows = []
+    for batch in _amd_fa_cluster_sample_indices(q.shape[0]):
+        for head in _amd_fa_cluster_sample_indices(q.shape[1]):
+            q_rows = q[batch, head, query_positions].float()
+            k_rows = k[batch, head].float()
+            v_rows = v[batch, head].float()
+            scores = torch.matmul(q_rows, k_rows.transpose(0, 1)) * scale
+            if causal:
+                scores.masked_fill_(key_positions[None, :] > query_positions[:, None], float("-inf"))
+            reference_rows.append(torch.matmul(torch.softmax(scores, dim=-1), v_rows))
+            actual_rows.append(actual[batch, head, query_positions].float())
+    return torch.cat(actual_rows), torch.cat(reference_rows)
+
+
+def _amd_fa_cluster_snr_db(actual, expected):
+    actual = actual.float()
+    expected = expected.float()
+    signal = torch.linalg.vector_norm(expected)
+    noise = torch.linalg.vector_norm(actual - expected)
+    if noise.item() == 0.0:
+        return float("inf")
+    if signal.item() == 0.0:
+        return float("-inf")
+    return float(20.0 * torch.log10(signal / noise))
+
+
+def _run_amd_fa_cluster_regression_isolated(test_name):
+    if os.environ.get(_AMD_FA_CLUSTER_REGRESSION_WORKER) == test_name:
+        assert os.environ.get("DISABLE_LLVM_OPT") == "disable-machine-sink"
+        return False
+
+    env = os.environ.copy()
+    env[_AMD_FA_CLUSTER_REGRESSION_WORKER] = test_name
+    env["DISABLE_LLVM_OPT"] = "disable-machine-sink"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--import-mode=importlib", "-s", "--tb=short", f"{__file__}::{test_name}"],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(f"isolated Flash Attention cluster regression {test_name} failed:\n"
+                    f"stdout:\n{result.stdout}\n"
+                    f"stderr:\n{result.stderr}")
+    print(result.stdout)
+    return True
+
+
+@triton.jit
+def _warp_predicate_update(lhs, rhs, increment, side_ptr, offsets):
+    tl.store(side_ptr + offsets, lhs)
+    return lhs + increment, rhs - increment
+
+
+@triton.jit
+def _warp_predicate_kernel(x_ptr, lhs_ptr, rhs_ptr, side_ptr, size: tl.constexpr):
+    offsets = tl.arange(0, size)
+    lhs = tl.load(x_ptr + offsets)
+    rhs = lhs * 2.0
+    predicate = (offsets >= 64) & (offsets < 128) & (offsets % 5 < 2)
+    lhs, rhs = tlx.warp_predicate(
+        predicate,
+        (lhs, rhs),
+        _warp_predicate_update,
+        args=(3.0, side_ptr, offsets),
+    )
+    tl.store(lhs_ptr + offsets, lhs)
+    tl.store(rhs_ptr + offsets, rhs)
+
+
+@triton.jit
+def _warp_predicate_warp_local_reduce(value):
+    row_sum = tl.sum(value, axis=1)
+    return value + row_sum[:, None]
+
+
+@triton.jit
+def _warp_predicate_warp_local_reduce_kernel(x_ptr, output_ptr):
+    offsets = tl.arange(0, 256)
+    value = tl.reshape(tl.load(x_ptr + offsets), (4, 64))
+    wave = tlx.thread_id(0) // 64
+    predicate = wave >= 2
+    value = tlx.warp_predicate(predicate, value, _warp_predicate_warp_local_reduce, wave_uniform=True)
+    tl.store(output_ptr + offsets, tl.reshape(value, (256, )))
+
+
+@triton.jit
+def _warp_vote_kernel(x_ptr, all_ptr, any_ptr, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    predicate = tl.load(x_ptr + offsets) != 0
+    all_value = tlx.warp_all(predicate).to(tl.int32)
+    any_value = tlx.warp_any(predicate).to(tl.int32)
+    tl.store(all_ptr + offsets, all_value)
+    tl.store(any_ptr + offsets, any_value)
+
+
+@triton.jit
+def _concrete_predicate_scale(value, scale):
+    return value * scale
+
+
+@triton.jit
+def _concrete_dot_control_flow_helper(a, b, condition, predicate, MMA: tl.constexpr, DOT0: tl.constexpr,
+                                      DOT1: tl.constexpr):
+    a = tlx.require_layout(a, DOT0, pin=False)
+    b = tlx.require_layout(b, DOT1, pin=False)
+    acc = tlx.require_layout(tl.zeros((16, 64), tl.float32), MMA, pin=False)
+    result = tl.dot(a, b, acc)
+    if condition:
+        result = result * 2.0
+    else:
+        result = result + 1.0
+    return tlx.warp_predicate(predicate, result, _concrete_predicate_scale, args=(0.5, ))
+
+
+@triton.jit
+def _concrete_helper_release_kernel(a_ptr, b_ptr, output_ptr, condition):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 64)
+    a = tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
+    predicate = (rows[:, None] < 8) & (cols[None, :] >= 0)
+    concrete = _concrete_dot_control_flow_helper(a, b, condition, predicate, mma, dot0, dot1)
+
+    offsets = rows[:, None] * 64 + cols[None, :]
+    # Fixup must specialize this pointer use when the helper result acquires
+    # its concrete MFMA layout.
+    tl.store(output_ptr + offsets, concrete)
+    # The call result is still encoding-free while the Python frontend builds
+    # this operation. The release remains as a deliberate layout-domain edge
+    # after helper-ABI specialization and lets this store choose a fresh layout.
+    generic = tlx.release_layout(concrete)
+    tl.store(output_ptr + 1024 + offsets, generic)
+
+
+@triton.jit
+def _async_load_kernel(
+    x_ptr,
+    y_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+
+    buffers = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 2)
+
+    buf0 = tlx.local_view(buffers, 0)
+    buf1 = tlx.local_view(buffers, 1)
+    tok_x = tlx.async_load(x_ptr + offs, buf0, mask=mask)
+    tok_y = tlx.async_load(y_ptr + offs, buf1, mask=mask)
+    tlx.async_load_commit_group([tok_x, tok_y])
+    tlx.async_load_wait_group(0)
+
+    x = tlx.local_load(buf0)
+    y = tlx.local_load(buf1)
+    tl.store(output_ptr + offs, x + y, mask=mask)
+
+
+@triton.jit
+def _extract_slice_dot1_kernel(
+    x_ptr,
+    y_ptr,
+    ROW_OFFSET: tl.constexpr,
+    COL_OFFSET: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 256)
+    cols = tl.arange(0, 128)
+    values = tl.load(x_ptr + rows[:, None] * 128 + cols[None, :])
+    values = tlx.require_layout(values, dot1, pin=False)
+    band = tlx.extract_slice(values, [32, 64], [ROW_OFFSET, COL_OFFSET])
+    band_rows = tl.arange(0, 32)
+    band_cols = tl.arange(0, 64)
+    out_ptrs = y_ptr + band_rows[:, None] * 64 + band_cols[None, :]
+    out_ptrs = tlx.require_layout(out_ptrs, dot1, pin=False)
+    tl.store(out_ptrs, band)
+
+
+@triton.jit
+def _extract_slice_mfma_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    BAND: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 256)
+    cols = tl.arange(0, 64)
+    a = tl.load(a_ptr + rows[:, None] * 256 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
+    a = tlx.require_layout(a, dot0, pin=False)
+    b = tlx.require_layout(b, dot1, pin=False)
+    a_band = tlx.extract_slice(a, [16, 32], [0, BAND * 32])
+    b_band = tlx.extract_slice(b, [32, 64], [BAND * 32, 0])
+    acc = tlx.zeros((16, 64), tl.float32, layout=mma)
+    result = tl.dot(a_band, b_band, acc)
+    output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
+    output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
+    tl.store(output_offsets, result)
+
+
+@triton.jit
+def _amd_register_class_anchor_kernel(x_ptr, y_ptr, REGISTER_CLASS: tl.constexpr):
+    offsets = tl.arange(0, 2048)
+    values = tl.load(x_ptr + offsets)
+    values = tlx.amd_register_class_anchor(values, register_class=REGISTER_CLASS)
+    tl.store(y_ptr + offsets, values)
+
+
+@triton.jit
+def _amd_scheduled_mfma_kernel(a_ptr, b_ptr, output_ptr, K_WIDTH: tl.constexpr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=K_WIDTH)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=K_WIDTH)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 64)
+    a = tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
+    a = tlx.require_layout(a, dot0, pin=False)
+    b = tlx.require_layout(b, dot1, pin=False)
+    b = tlx.amd_register_resident(b, register_class="agpr", registers_per_group=4)
+    acc = tl.full((16, 64), 7.0, tl.float32)
+    acc = tlx.require_layout(acc, mma, pin=False)
+    result = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        acc,
+        resident_operand=1,
+        accumulator_role="transient",
+        initialize=True,
+    )
+    result, _ = tlx.amd_mfma_commit(result, b)
+    output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
+    output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
+    tl.store(output_offsets, result)
+
+
+@triton.jit
+def _amd_scheduled_mfma_wave_batch_kernel(
+    A,
+    B,
+    Out,
+    M: tl.constexpr,
+    INSTR_M: tl.constexpr,
+    WARPS: tl.constexpr,
+    ROLE: tl.constexpr,
+    INITIALIZE: tl.constexpr,
+    COLUMN_SUBTILE: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[INSTR_M, INSTR_M, 512 // INSTR_M],
+        transposed=True,
+        warps_per_cta=WARPS,
+    )
+    lhs: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    rhs: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    batch = tl.arange(0, 2)
+    m = tl.arange(0, M)
+    k = tl.arange(0, 32)
+    width: tl.constexpr = INSTR_M * WARPS[2] if COLUMN_SUBTILE else 128
+    column_base: tl.constexpr = width if COLUMN_SUBTILE else 0
+    n = column_base + tl.arange(0, width)
+    a = tl.load(A + batch[:, None, None] * M * 32 + m[None, :, None] * 32 + k[None, None, :])
+    b = tl.load(B + batch[:, None, None] * 32 * 128 + k[None, :, None] * 128 + n[None, None, :])
+    a = tlx.require_layout(a, lhs, pin=False)
+    b = tlx.require_layout(b, rhs, pin=False)
+    b = tlx.amd_register_resident(b, register_class="agpr", registers_per_group=4)
+    acc = tlx.zeros((2, M, width), tl.float32, layout=mma) + 7.0
+    result = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        acc,
+        accumulator_role=ROLE,
+        resident_operand=1,
+        initialize=INITIALIZE,
+    )
+    if ROLE == "transient":
+        result, _ = tlx.amd_mfma_commit(result, b)
+    else:
+        result = tlx.amd_mfma_commit(result)
+    offsets = batch[:, None, None] * M * 128 + m[None, :, None] * 128 + n[None, None, :]
+    offsets = tlx.require_layout(offsets, mma, pin=False)
+    tl.store(Out + offsets, result)
+
+
+@triton.jit
+def _amd_scheduled_mfma_chain_kernel(a_ptr, b_ptr, output_ptr, BANDS: tl.constexpr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 256)
+    cols = tl.arange(0, 64)
+    a = tl.load(a_ptr + rows[:, None] * 256 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
+    a = tlx.require_layout(a, dot0, pin=False)
+    b = tlx.require_layout(b, dot1, pin=False)
+    b = tlx.amd_register_resident(b, register_class="agpr", registers_per_group=32)
+    acc = tlx.zeros((16, 64), tl.float32, layout=mma)
+
+    for band in tl.static_range(BANDS):
+        a_band = tlx.extract_slice(a, [16, 32], [0, band * 32])
+        b_band = tlx.extract_slice(b, [32, 64], [band * 32, 0])
+        acc = tlx.amd_scheduled_mfma(
+            a_band,
+            b_band,
+            acc,
+            resident_operand=1,
+            accumulator_role="transient",
+            initialize=band == 0,
+        )
+    acc, _ = tlx.amd_mfma_commit(acc, b_band)
+    output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
+    output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
+    tl.store(output_offsets, acc)
+
+
+@triton.jit
+def _amd_scheduled_mfma_persistent_acc_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    USE_VGPR: tl.constexpr,
+    COMMIT: tl.constexpr,
+    INITIALIZE: tl.constexpr = True,
+    FULL_K: tl.constexpr = False,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 64)
+    cols = tl.arange(0, 64)
+    a = tl.load(a_ptr + rows[:, None] * 64 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
+    a = tlx.require_layout(a, dot0, pin=False)
+    b = tlx.require_layout(b, dot1, pin=False)
+    acc = tl.full((16, 64), 7.0, tl.float32)
+    acc = tlx.require_layout(acc, mma, pin=False)
+    if FULL_K:
+        # Exercise both K fragments inside one scheduled operation.
+        acc = tlx.amd_scheduled_mfma(
+            a,
+            b,
+            acc,
+            accumulator_role="persistent",
+            accumulator_register_class="vgpr" if USE_VGPR else None,
+            initialize=INITIALIZE,
+        )
+    else:
+        a0 = tlx.extract_slice(a, [16, 32], [0, 0])
+        b0 = tlx.extract_slice(b, [32, 64], [0, 0])
+        acc = tlx.amd_scheduled_mfma(
+            a0,
+            b0,
+            acc,
+            accumulator_role="persistent",
+            accumulator_register_class="vgpr" if USE_VGPR else None,
+            initialize=INITIALIZE,
+        )
+        a1 = tlx.extract_slice(a, [16, 32], [0, 32])
+        b1 = tlx.extract_slice(b, [32, 64], [32, 0])
+        acc = tlx.amd_scheduled_mfma(
+            a1,
+            b1,
+            acc,
+            accumulator_role="persistent",
+            accumulator_register_class="vgpr" if USE_VGPR else None,
+        )
+    if COMMIT:
+        acc = tlx.amd_mfma_commit(acc)
+    output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
+    output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
+    tl.store(output_offsets, acc)
+
+
+@triton.jit
+def _amd_scheduled_mfma_opaque_consumer_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    iterations,
+    CONSUMER: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=False,
+        warps_per_cta=[1, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 16)
+    a = tlx.require_layout(tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]), dot0, pin=False)
+    b = tlx.require_layout(tl.load(b_ptr + reduction[:, None] * 16 + cols[None, :]), dot1, pin=False)
+    acc = tlx.zeros((16, 16), tl.float32, layout=mma)
+    if CONSUMER == "if":
+        if iterations != 0:
+            acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr",
+                                         initialize=True)
+    elif CONSUMER == "loop":
+        for _ in range(iterations):
+            acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr")
+    else:
+        acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr",
+                                     initialize=True)
+
+    if CONSUMER == "layout":
+        acc = tlx.require_layout(tlx.release_layout(acc), mma, pin=False)
+    elif CONSUMER == "reshape":
+        acc = tl.reshape(tlx.release_layout(acc), [256])
+
+    # An opaque instruction reads the native MFMA result without an explicit
+    # commit. The compiler must complete the result before this consumer.
+    if CONSUMER == "native":
+        acc = acc + 1.0
+    else:
+        acc = tl.inline_asm_elementwise("v_add_f32 $0, $1, 1.0", constraints="=v,v", args=[acc], dtype=tl.float32,
+                                        is_pure=False, pack=1)
+
+    if CONSUMER == "reshape":
+        tl.store(output_ptr + tl.arange(0, 256), acc)
+    else:
+        output_offsets = tlx.require_layout(output_ptr + rows[:, None] * 16 + cols[None, :], mma, pin=False)
+        tl.store(output_offsets, acc)
+
+
+@triton.jit
+def _amd_scheduled_mfma_dead_result_writer_kernel(
+    output_ptr,
+    INSTR_M: tl.constexpr,
+    INSTR_K: tl.constexpr,
+    WRITER: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[INSTR_M, INSTR_M, INSTR_K],
+        transposed=False,
+        warps_per_cta=[1, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    BLOCK_N: tl.constexpr = INSTR_M * (2 if WRITER == "partial" else 1)
+    a = tlx.require_layout(tl.full((INSTR_M, INSTR_K), 1.0, tl.bfloat16), dot0, pin=False)
+    b = tl.full((INSTR_K, BLOCK_N), 1.0, tl.bfloat16)
+    if WRITER == "partial":
+        b = (b + (tl.arange(0, BLOCK_N)[None, :] >= INSTR_M)).to(tl.bfloat16)
+    b = tlx.require_layout(b, dot1, pin=False)
+    zero = tlx.zeros((INSTR_M, BLOCK_N), tl.float32, layout=mma)
+    result = tlx.amd_scheduled_mfma(a, b, zero, accumulator_role="persistent", accumulator_register_class="vgpr",
+                                    initialize=True)
+    if WRITER == "commit":
+        tlx.amd_mfma_commit(result)
+
+    # Discarding the result lets the opaque writer reuse an MFMA destination
+    # register while the instruction may still have writes in flight.
+    if WRITER == "native":
+        written = zero + 1.0
+    else:
+        written = tl.inline_asm_elementwise("v_mov_b32 $0, 1.0", constraints="=v,v", args=[zero], dtype=tl.float32,
+                                            is_pure=WRITER == "pure", pack=1)
+    offsets = output_ptr + tl.arange(0, INSTR_M)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+    tl.store(tlx.require_layout(offsets, mma, pin=False), written)
+    if WRITER == "partial":
+        live = tlx.extract_slice(result, [INSTR_M, INSTR_M], [0, 0])
+        live_offsets = (output_ptr + INSTR_M * BLOCK_N + tl.arange(0, INSTR_M)[:, None] * INSTR_M +
+                        tl.arange(0, INSTR_M)[None, :])
+        tl.store(tlx.require_layout(live_offsets, mma, pin=False), live)
+
+
+@triton.jit
+def _amd_scheduled_mfma_forked_chain_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 128)
+    cols = tl.arange(0, 64)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 128 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tlx.require_layout(
+        tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    a0 = tlx.extract_slice(a, [16, 32], [0, 0])
+    a1 = tlx.extract_slice(a, [16, 32], [0, 32])
+    a2 = tlx.extract_slice(a, [16, 32], [0, 64])
+    b0 = tlx.extract_slice(b, [32, 64], [0, 0])
+    b1 = tlx.extract_slice(b, [32, 64], [32, 0])
+    b2 = tlx.extract_slice(b, [32, 64], [64, 0])
+    zero = tlx.zeros((16, 64), tl.float32, layout=mma)
+    root = tlx.amd_scheduled_mfma(
+        a0,
+        b0,
+        zero,
+        accumulator_role="persistent",
+        initialize=True,
+    )
+    left = tlx.amd_scheduled_mfma(
+        a1,
+        b1,
+        root,
+        accumulator_role="persistent",
+    )
+    right = tlx.amd_scheduled_mfma(
+        a2,
+        b2,
+        root,
+        accumulator_role="persistent",
+    )
+    left, right = tlx.amd_mfma_commit((left, right))
+    output_offsets = tlx.require_layout(
+        output_ptr + rows[:, None] * 64 + cols[None, :],
+        mma,
+        pin=False,
+    )
+    tl.store(output_offsets, left)
+    tl.store(output_offsets + 16 * 64, right)
+
+
+@triton.jit
+def _amd_scheduled_mfma_lds_loop_kernel(a_ptr, b_ptr, output_ptr, iterations):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 64)
+    a = tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
+    a_local = tlx.local_alloc((16, 32), tl.bfloat16, 1)
+    b_local = tlx.local_alloc((32, 64), tl.bfloat16, 1)
+    tlx.local_store(tlx.local_view(a_local, 0), a)
+    tlx.local_store(tlx.local_view(b_local, 0), b)
+    tl.debug_barrier()
+    a = tlx.local_load(tlx.local_view(a_local, 0), layout=dot0)
+    b = tlx.local_load(tlx.local_view(b_local, 0), layout=dot1)
+    acc = tlx.zeros((16, 64), tl.float32, layout=mma)
+    for _ in tl.range(0, iterations, num_stages=1):
+        acc = tlx.amd_scheduled_mfma(
+            a,
+            b,
+            acc,
+            accumulator_role="persistent",
+        )
+    acc = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        acc,
+        accumulator_role="persistent",
+    )
+    acc = tlx.amd_mfma_commit(acc)
+    output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
+    output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
+    tl.store(output_offsets, acc)
+
+
+@triton.jit
+def _amd_scheduled_mfma_lds_operand_wait_kernel(a_ptr, b_ptr, output_ptr, RESIDENT: tl.constexpr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 64)
+    cols = tl.arange(0, 64)
+    a = tl.load(a_ptr + rows[:, None] * 64 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
+    a_local = tlx.local_alloc((16, 64), tl.bfloat16, 1)
+    b_local = tlx.local_alloc((64, 64), tl.bfloat16, 1)
+    tlx.local_store(tlx.local_view(a_local, 0), a)
+    tlx.local_store(tlx.local_view(b_local, 0), b)
+    tl.debug_barrier()
+    # Chain X reads register-resident operands; it is independent work that
+    # can hide chain Y's LDS loads.
+    xa = tlx.local_load(tlx.local_slice(tlx.local_view(a_local, 0), [0, 0], [16, 32]), layout=dot0, relaxed=True)
+    xb = tlx.local_load(tlx.local_slice(tlx.local_view(b_local, 0), [0, 0], [32, 64]), layout=dot1, relaxed=True)
+    xa = tlx.amd_register_resident(xa, register_class="vgpr", registers_per_group=4)
+    xb = tlx.amd_register_resident(xb, register_class="vgpr", registers_per_group=4)
+    tl.debug_barrier()
+    ya = tlx.local_load(tlx.local_slice(tlx.local_view(a_local, 0), [0, 32], [16, 32]), layout=dot0, relaxed=True)
+    yb = tlx.local_load(tlx.local_slice(tlx.local_view(b_local, 0), [32, 0], [32, 64]), layout=dot1, relaxed=True)
+    acc_x = tlx.zeros((16, 64), tl.float32, layout=mma)
+    for _ in tl.static_range(4):
+        acc_x = tlx.amd_scheduled_mfma(xa, xb, acc_x, accumulator_role="transient")
+    acc_y = tlx.zeros((16, 64), tl.float32, layout=mma)
+    acc_y = tlx.amd_scheduled_mfma(ya, yb, acc_y, accumulator_role="persistent", resident_operand=RESIDENT)
+    acc_x, acc_y = tlx.amd_mfma_commit((acc_x, acc_y))
+    output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
+    output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
+    tl.store(output_offsets, acc_x + acc_y)
+
+
+@triton.jit
+def _amd_scheduled_mfma_persistent_32x32_kernel(a_ptr, b_ptr, output_ptr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[32, 32, 16],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 128)
+    reduction = tl.arange(0, 16)
+    cols = tl.arange(0, 32)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 16 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tlx.require_layout(
+        tl.load(b_ptr + reduction[:, None] * 32 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    acc = tlx.zeros((128, 32), tl.float32, layout=mma)
+    result = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        acc,
+        accumulator_role="persistent",
+        initialize=True,
+    )
+    result = tlx.amd_mfma_commit(result)
+    offsets = tlx.require_layout(
+        output_ptr + rows[:, None] * 32 + cols[None, :],
+        mma,
+        pin=False,
+    )
+    tl.store(offsets, result)
+
+
+@triton.jit
+def _amd_scheduled_mfma_fragmented_nd_kernel(a_ptr, b_ptr, output_ptr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[32, 32, 16],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 256)
+    reduction = tl.arange(0, 16)
+    cols = tl.arange(0, 128)
+    a = tl.load(a_ptr + rows[:, None] * 16 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 128 + cols[None, :])
+    a = tlx.require_layout(a, dot0, pin=False)
+    b = tlx.require_layout(b, dot1, pin=False)
+
+    a_lo = tlx.extract_slice(a, [128, 16], [0, 0])
+    a_hi = tlx.extract_slice(a, [128, 16], [128, 0])
+    b0 = tlx.extract_slice(b, [16, 32], [0, 0])
+    b1 = tlx.extract_slice(b, [16, 32], [0, 32])
+    b2 = tlx.extract_slice(b, [16, 32], [0, 64])
+    b3 = tlx.extract_slice(b, [16, 32], [0, 96])
+    acc = tlx.zeros((256, 128), tl.float32, layout=mma)
+    c00 = tlx.extract_slice(acc, [128, 32], [0, 0])
+    c10 = tlx.extract_slice(acc, [128, 32], [128, 0])
+    c01 = tlx.extract_slice(acc, [128, 32], [0, 32])
+    c11 = tlx.extract_slice(acc, [128, 32], [128, 32])
+    c02 = tlx.extract_slice(acc, [128, 32], [0, 64])
+    c12 = tlx.extract_slice(acc, [128, 32], [128, 64])
+    c03 = tlx.extract_slice(acc, [128, 32], [0, 96])
+    c13 = tlx.extract_slice(acc, [128, 32], [128, 96])
+
+    tl.debug_barrier()
+    c00 = tlx.amd_scheduled_mfma(a_lo, b0, c00, accumulator_role="transient", initialize=True)
+    c10 = tlx.amd_scheduled_mfma(a_hi, b0, c10, accumulator_role="transient", initialize=True)
+    c01 = tlx.amd_scheduled_mfma(a_lo, b1, c01, accumulator_role="transient", initialize=True)
+    c11 = tlx.amd_scheduled_mfma(a_hi, b1, c11, accumulator_role="transient", initialize=True)
+    c02 = tlx.amd_scheduled_mfma(a_lo, b2, c02, accumulator_role="transient", initialize=True)
+    c12 = tlx.amd_scheduled_mfma(a_hi, b2, c12, accumulator_role="transient", initialize=True)
+    c03 = tlx.amd_scheduled_mfma(a_lo, b3, c03, accumulator_role="transient", initialize=True)
+    c13 = tlx.amd_scheduled_mfma(a_hi, b3, c13, accumulator_role="transient", initialize=True)
+    c00, _ = tlx.amd_mfma_commit(c00, b3)
+    c10, _ = tlx.amd_mfma_commit(c10, b3)
+    c01, _ = tlx.amd_mfma_commit(c01, b3)
+    c11, _ = tlx.amd_mfma_commit(c11, b3)
+    c02, _ = tlx.amd_mfma_commit(c02, b3)
+    c12, _ = tlx.amd_mfma_commit(c12, b3)
+    c03, _ = tlx.amd_mfma_commit(c03, b3)
+    c13, _ = tlx.amd_mfma_commit(c13, b3)
+
+    fragment_rows = tl.arange(0, 128)
+    fragment_cols = tl.arange(0, 32)
+    out00 = output_ptr + fragment_rows[:, None] * 128 + fragment_cols[None, :]
+    out10 = out00 + 128 * 128
+    out01 = out00 + 32
+    out11 = out10 + 32
+    out02 = out00 + 64
+    out12 = out10 + 64
+    out03 = out00 + 96
+    out13 = out10 + 96
+    tl.store(tlx.require_layout(out00, mma, pin=False), c00)
+    tl.store(tlx.require_layout(out10, mma, pin=False), c10)
+    tl.store(tlx.require_layout(out01, mma, pin=False), c01)
+    tl.store(tlx.require_layout(out11, mma, pin=False), c11)
+    tl.store(tlx.require_layout(out02, mma, pin=False), c02)
+    tl.store(tlx.require_layout(out12, mma, pin=False), c12)
+    tl.store(tlx.require_layout(out03, mma, pin=False), c03)
+    tl.store(tlx.require_layout(out13, mma, pin=False), c13)
+
+
+@triton.jit
+def _amd_scheduled_mfma_fragmented_nd_update_kernel(
+    a0_ptr,
+    b0_ptr,
+    a1_ptr,
+    b1_ptr,
+    output_ptr,
+    DIRECT_STORE: tl.constexpr,
+):
+    """Match the GQA dK path: a full update, then eight persistent updates."""
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[32, 32, 16],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 256)
+    reduction = tl.arange(0, 16)
+    cols = tl.arange(0, 128)
+    a0 = tlx.require_layout(
+        tl.load(a0_ptr + rows[:, None] * 16 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b0 = tlx.require_layout(
+        tl.load(b0_ptr + reduction[:, None] * 128 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    a1 = tlx.require_layout(
+        tl.load(a1_ptr + rows[:, None] * 16 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b1 = tlx.require_layout(
+        tl.load(b1_ptr + reduction[:, None] * 128 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+
+    acc = tlx.zeros((256, 128), tl.float32, layout=mma)
+    acc = tl.dot(a0, b0, acc)
+    tl.debug_barrier()
+
+    lhs0 = tlx.extract_slice(a1, [128, 16], [0, 0])
+    lhs1 = tlx.extract_slice(a1, [128, 16], [128, 0])
+    rhs0 = tlx.extract_slice(b1, [16, 32], [0, 0])
+    rhs1 = tlx.extract_slice(b1, [16, 32], [0, 32])
+    rhs2 = tlx.extract_slice(b1, [16, 32], [0, 64])
+    rhs3 = tlx.extract_slice(b1, [16, 32], [0, 96])
+    c00 = tlx.extract_slice(acc, [128, 32], [0, 0])
+    c10 = tlx.extract_slice(acc, [128, 32], [128, 0])
+    c01 = tlx.extract_slice(acc, [128, 32], [0, 32])
+    c11 = tlx.extract_slice(acc, [128, 32], [128, 32])
+    c02 = tlx.extract_slice(acc, [128, 32], [0, 64])
+    c12 = tlx.extract_slice(acc, [128, 32], [128, 64])
+    c03 = tlx.extract_slice(acc, [128, 32], [0, 96])
+    c13 = tlx.extract_slice(acc, [128, 32], [128, 96])
+
+    c00 = tlx.amd_scheduled_mfma(lhs0, rhs0, c00, accumulator_role="persistent")
+    c10 = tlx.amd_scheduled_mfma(lhs1, rhs0, c10, accumulator_role="persistent")
+    c01 = tlx.amd_scheduled_mfma(lhs0, rhs1, c01, accumulator_role="persistent")
+    c11 = tlx.amd_scheduled_mfma(lhs1, rhs1, c11, accumulator_role="persistent")
+    c02 = tlx.amd_scheduled_mfma(lhs0, rhs2, c02, accumulator_role="persistent")
+    c12 = tlx.amd_scheduled_mfma(lhs1, rhs2, c12, accumulator_role="persistent")
+    c03 = tlx.amd_scheduled_mfma(lhs0, rhs3, c03, accumulator_role="persistent")
+    c13 = tlx.amd_scheduled_mfma(lhs1, rhs3, c13, accumulator_role="persistent")
+
+    if DIRECT_STORE:
+        fragment_rows = tl.arange(0, 128)
+        fragment_cols = tl.arange(0, 32)
+        out00 = output_ptr + fragment_rows[:, None] * 128 + fragment_cols[None, :]
+        out10 = out00 + 128 * 128
+        out01 = out00 + 32
+        out11 = out10 + 32
+        out02 = out00 + 64
+        out12 = out10 + 64
+        out03 = out00 + 96
+        out13 = out10 + 96
+        tl.store(tlx.require_layout(out00, mma, pin=False), c00)
+        tl.store(tlx.require_layout(out10, mma, pin=False), c10)
+        tl.store(tlx.require_layout(out01, mma, pin=False), c01)
+        tl.store(tlx.require_layout(out11, mma, pin=False), c11)
+        tl.store(tlx.require_layout(out02, mma, pin=False), c02)
+        tl.store(tlx.require_layout(out12, mma, pin=False), c12)
+        tl.store(tlx.require_layout(out03, mma, pin=False), c03)
+        tl.store(tlx.require_layout(out13, mma, pin=False), c13)
+    else:
+        row0 = tl.cat(
+            tl.cat(c00, c01, dim=1),
+            tl.cat(c02, c03, dim=1),
+            dim=1,
+        )
+        row1 = tl.cat(
+            tl.cat(c10, c11, dim=1),
+            tl.cat(c12, c13, dim=1),
+            dim=1,
+        )
+        result = tlx.require_layout(tl.cat(row0, row1, dim=0), mma, pin=False)
+        offsets = tlx.require_layout(
+            output_ptr + rows[:, None] * 128 + cols[None, :],
+            mma,
+            pin=False,
+        )
+        tl.store(offsets, result)
+
+
+@triton.jit
+def _amd_scheduled_mfma_interleaved_chains_kernel(a_ptr, b_ptr, output_ptr, BANDS: tl.constexpr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 256)
+    cols = tl.arange(0, 128)
+    a = tl.load(a_ptr + rows[:, None] * 256 + reduction[None, :])
+    b = tl.load(b_ptr + reduction[:, None] * 128 + cols[None, :])
+    a = tlx.require_layout(a, dot0, pin=False)
+    b = tlx.require_layout(b, dot1, pin=False)
+    b = tlx.amd_register_resident(b, register_class="agpr", registers_per_group=32)
+    acc0 = tlx.zeros((16, 64), tl.float32, layout=mma)
+    acc1 = tlx.zeros((16, 64), tl.float32, layout=mma)
+
+    for band in tl.static_range(BANDS):
+        a_band = tlx.extract_slice(a, [16, 32], [0, band * 32])
+        b0 = tlx.extract_slice(b, [32, 64], [band * 32, 0])
+        b1 = tlx.extract_slice(b, [32, 64], [band * 32, 64])
+        acc0 = tlx.amd_scheduled_mfma(
+            a_band,
+            b0,
+            acc0,
+            resident_operand=1,
+            accumulator_role="transient",
+            initialize=band == 0,
+        )
+        acc1 = tlx.amd_scheduled_mfma(
+            a_band,
+            b1,
+            acc1,
+            resident_operand=1,
+            accumulator_role="transient",
+            initialize=band == 0,
+        )
+    acc0, acc1, b1 = tlx.amd_mfma_commit((acc0, acc1), b1)
+    half_cols = tl.arange(0, 64)
+    output_offsets0 = output_ptr + rows[:, None] * 128 + half_cols[None, :]
+    output_offsets1 = output_offsets0 + 64
+    output_offsets0 = tlx.require_layout(output_offsets0, mma, pin=False)
+    output_offsets1 = tlx.require_layout(output_offsets1, mma, pin=False)
+    tl.store(output_offsets0, acc0)
+    tl.store(output_offsets1, acc1)
+
+
+@triton.jit
+def _amd_scheduled_mfma_split_resident_chains_kernel(
+    a_ptr,
+    b_ptr,
+    v_ptr,
+    output_ptr,
+    v_output_ptr,
+    USE_LOCAL: tl.constexpr,
+    EXACT_LOCAL_LAYOUT: tl.constexpr,
+    FULL_COMMIT: tl.constexpr,
+):
+    """Match dQ's 128+64+32+32 resident-K decomposition."""
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    v_mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    v_layout: tl.constexpr = tlx.dot_operand_layout(0, v_mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 256)
+    cols = tl.arange(0, 128)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 256 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tl.load(b_ptr + reduction[:, None] * 128 + cols[None, :])
+    if USE_LOCAL:
+        if EXACT_LOCAL_LAYOUT:
+            b_smem_layout: tl.constexpr = (tlx.shared_linear_layout_encoding(
+                offset_bases=[
+                    [0, 1],
+                    [0, 2],
+                    [0, 4],
+                    [0, 8],
+                    [0, 64],
+                    [1, 0],
+                    [2, 0],
+                    [4, 0],
+                    [8, 64],
+                    [0, 16],
+                    [0, 32],
+                    [16, 0],
+                    [32, 0],
+                    [64, 0],
+                    [128, 0],
+                ],
+                block_bases=[],
+                alignment=16,
+            ))
+            b_buffers = tlx.local_alloc(
+                (256, 128),
+                tl.bfloat16,
+                1,
+                layout=b_smem_layout,
+            )
+        else:
+            b_buffers = tlx.local_alloc((256, 128), tl.bfloat16, 1)
+        b_buffer = tlx.local_view(b_buffers, 0)
+        tlx.local_store(b_buffer, b)
+        tl.debug_barrier()
+        b_lo = tlx.local_load(
+            tlx.local_slice(b_buffer, [0, 0], [128, 128]),
+            layout=dot1,
+            relaxed=True,
+        )
+        b_mid = tlx.local_load(
+            tlx.local_slice(b_buffer, [128, 0], [64, 128]),
+            layout=dot1,
+            relaxed=True,
+        )
+        b6 = tlx.local_load(
+            tlx.local_slice(b_buffer, [192, 0], [32, 128]),
+            layout=dot1,
+            relaxed=True,
+        )
+        b7 = tlx.local_load(
+            tlx.local_slice(b_buffer, [224, 0], [32, 128]),
+            layout=dot1,
+            relaxed=True,
+        )
+    else:
+        b = tlx.require_layout(b, dot1, pin=False)
+        b_lo = tlx.extract_slice(b, [128, 128], [0, 0])
+        b_mid = tlx.extract_slice(b, [64, 128], [128, 0])
+        b6 = tlx.extract_slice(b, [32, 128], [192, 0])
+        b7 = tlx.extract_slice(b, [32, 128], [224, 0])
+
+    acc0 = tlx.zeros((16, 64), tl.float32, layout=mma)
+    acc1 = tlx.zeros((16, 64), tl.float32, layout=mma)
+    for band in tl.static_range(4):
+        a_band = tlx.extract_slice(a, [16, 32], [0, band * 32])
+        b0 = tlx.extract_slice(b_lo, [32, 64], [band * 32, 0])
+        b1 = tlx.extract_slice(b_lo, [32, 64], [band * 32, 64])
+        acc0 = tlx.amd_scheduled_mfma(
+            a_band,
+            b0,
+            acc0,
+            resident_operand=1,
+            accumulator_role="transient",
+            initialize=band == 0,
+        )
+        acc1 = tlx.amd_scheduled_mfma(
+            a_band,
+            b1,
+            acc1,
+            resident_operand=1,
+            accumulator_role="transient",
+            initialize=band == 0,
+        )
+    for band in tl.static_range(2):
+        a_band = tlx.extract_slice(a, [16, 32], [0, (band + 4) * 32])
+        b0 = tlx.extract_slice(b_mid, [32, 64], [band * 32, 0])
+        b1 = tlx.extract_slice(b_mid, [32, 64], [band * 32, 64])
+        acc0 = tlx.amd_scheduled_mfma(
+            a_band,
+            b0,
+            acc0,
+            resident_operand=1,
+            accumulator_role="transient",
+        )
+        acc1 = tlx.amd_scheduled_mfma(
+            a_band,
+            b1,
+            acc1,
+            resident_operand=1,
+            accumulator_role="transient",
+        )
+    a_band6 = tlx.extract_slice(a, [16, 32], [0, 192])
+    b60 = tlx.extract_slice(b6, [32, 64], [0, 0])
+    b61 = tlx.extract_slice(b6, [32, 64], [0, 64])
+    acc0 = tlx.amd_scheduled_mfma(
+        a_band6,
+        b60,
+        acc0,
+        resident_operand=1,
+        accumulator_role="transient",
+    )
+    acc1 = tlx.amd_scheduled_mfma(
+        a_band6,
+        b61,
+        acc1,
+        resident_operand=1,
+        accumulator_role="transient",
+    )
+    a_band7 = tlx.extract_slice(a, [16, 32], [0, 224])
+    b70 = tlx.extract_slice(b7, [32, 64], [0, 0])
+    b71 = tlx.extract_slice(b7, [32, 64], [0, 64])
+    acc0 = tlx.amd_scheduled_mfma(
+        a_band7,
+        b70,
+        acc0,
+        resident_operand=1,
+        accumulator_role="transient",
+    )
+    acc1 = tlx.amd_scheduled_mfma(
+        a_band7,
+        b71,
+        acc1,
+        resident_operand=1,
+        accumulator_role="transient",
+    )
+    if FULL_COMMIT:
+        v_resident = tlx.require_layout(
+            tl.load(v_ptr + reduction[:, None] * 128 + cols[None, :]),
+            v_layout,
+            pin=False,
+        )
+        acc0, acc1, v_resident = tlx.amd_mfma_commit((acc0, acc1), v_resident)
+        v_offsets = tlx.require_layout(
+            v_output_ptr + reduction[:, None] * 128 + cols[None, :],
+            v_layout,
+            pin=False,
+        )
+        tl.store(v_offsets, v_resident)
+    else:
+        acc0, acc1, b71 = tlx.amd_mfma_commit((acc0, acc1), b71)
+    half_cols = tl.arange(0, 64)
+    output_offsets0 = tlx.require_layout(
+        output_ptr + rows[:, None] * 128 + half_cols[None, :],
+        mma,
+        pin=False,
+    )
+    output_offsets1 = tlx.require_layout(
+        output_ptr + rows[:, None] * 128 + half_cols[None, :] + 64,
+        mma,
+        pin=False,
+    )
+    tl.store(output_offsets0, acc0)
+    tl.store(output_offsets1, acc1)
+
+
+@triton.jit
+def _warp_pipe_bmm_kernel(
+    A,
+    B,
+    C,
+    M,
+    N,
+    K,
+    sab,
+    sam,
+    sak,
+    sbb,
+    sbn,
+    sbk,
+    scb,
+    scm,
+    scn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,
+):
+    """C[b] = A[b] @ B[b]; B fed [b, N, K] (K-contiguous) + local_trans; 64-bit batch base."""
+    bid = tl.program_id(1)
+    pid = tl.program_id(0)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+    # 64-bit base: batch offset can exceed 2**31 for the production shape.
+    a_base = bid.to(tl.int64) * sab + offs_m[:, None].to(tl.int64) * sam
+    b_base = bid.to(tl.int64) * sbb + offs_n[:, None].to(tl.int64) * sbn
+    K_ITERS = tl.cdiv(K, BLOCK_K)
+
+    smemA = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(A), NUM_BUFFERS)
+    smemB = tlx.local_alloc((BLOCK_N, BLOCK_K), tlx.dtype_of(B), NUM_BUFFERS)
+
+    for i in tl.range(0, NUM_BUFFERS, loop_unroll_factor=NUM_BUFFERS):
+        ks = i * BLOCK_K
+        m = offs_k[None, :] < K - ks  # partial-K mask (folds away when K % BLOCK_K == 0)
+        ta = tlx.async_load(A + a_base + (ks + offs_k[None, :]) * sak, tlx.local_view(smemA, i), mask=m, other=0.0)
+        tb = tlx.async_load(B + b_base + (ks + offs_k[None, :]) * sbk, tlx.local_view(smemB, i), mask=m, other=0.0)
+        tlx.async_load_commit_group([ta, tb])
+
+    tlx.async_load_wait_group(NUM_BUFFERS - 2)
+    a_tile = tlx.local_load(tlx.local_view(smemA, 0))
+    b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, 0)))
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for tile_id in tl.range(0, K_ITERS - NUM_BUFFERS):
+        pf = (tile_id % NUM_BUFFERS).to(tl.int32)
+        nb = ((tile_id + 1) % NUM_BUFFERS).to(tl.int32)
+        kpf = (tile_id + NUM_BUFFERS) * BLOCK_K
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            m = offs_k[None, :] < K - kpf
+            ta = tlx.async_load(A + a_base + (kpf + offs_k[None, :]) * sak, tlx.local_view(smemA, pf), mask=m,
+                                other=0.0)
+            tb = tlx.async_load(B + b_base + (kpf + offs_k[None, :]) * sbk, tlx.local_view(smemB, pf), mask=m,
+                                other=0.0)
+            tlx.async_load_commit_group([ta, tb])
+            a_tile = tlx.local_load(tlx.local_view(smemA, nb))
+            b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, nb)))
+        tlx.async_load_wait_group(NUM_BUFFERS - 2)
+
+    acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+    tlx.async_load_wait_group(0)
+    for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
+        buf = ((K_ITERS - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS).to(tl.int32)
+        a_tile = tlx.local_load(tlx.local_view(smemA, buf))
+        b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, buf)))
+        acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+
+    ocm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    ocn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptr = C + bid.to(tl.int64) * scb + scm * ocm[:, None].to(tl.int64) + scn * ocn[None, :]
+    tl.store(c_ptr, acc.to(tlx.dtype_of(C)), mask=(ocm[:, None] < M) & (ocn[None, :] < N))
+
+
+def _run_warp_pipe_bmm(device, bt, M, N, K):
+    """Build fp16 operands and launch the warp-pipe bmm (B fed [bt, N, K] for local_trans)."""
+    BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS = 128, 64, 64, 2
+    a = torch.randn((bt, M, K), device=device, dtype=torch.float16) * 0.1
+    b = torch.randn((bt, K, N), device=device, dtype=torch.float16) * 0.1
+    bT = b.transpose(1, 2).contiguous()  # [bt, N, K], K-contiguous
+    c = torch.empty((bt, M, N), device=device, dtype=torch.float16)
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), bt)
+    _warp_pipe_bmm_kernel[grid](
+        a,
+        bT,
+        c,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        a.stride(2),
+        bT.stride(0),
+        bT.stride(1),
+        bT.stride(2),
+        c.stride(0),
+        c.stride(1),
+        c.stride(2),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        NUM_BUFFERS=NUM_BUFFERS,
+        num_warps=8,
+        num_stages=1,
+        matrix_instr_nonkdim=16,
+    )
+    return a, b, c
+
+
+@triton.jit
+def _row_stride_async_load_kernel(a_ptr, out_ptr, stride_am, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs = offs_m[:, None] * stride_am + offs_k[None, :]
+    smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), 1)
+    tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0))  # unmasked -- full tile
+    tlx.async_load_commit_group([tok])
+    tlx.async_load_wait_group(0)
+    t = tlx.local_load(tlx.local_view(smem, 0))
+    tl.store(out_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :], t)
+
+
+@triton.jit
+def _noncontiguous_gather_async_load_kernel(V, out_ptr, stride_b, stride_po, stride_d, stride_x, N: tl.constexpr,
+                                            HEAD_DIM: tl.constexpr, PAGE: tl.constexpr):
+    n = tl.arange(0, N)
+    d = tl.arange(0, HEAD_DIM)
+    page = n // PAGE
+    token = n % PAGE
+    # V is laid out [block, page // 8, head_dim, 8]. Reconstructing the logical
+    # [token, head_dim] tile makes the async-load pointer tensor non-contiguous
+    # (a gather: sizePerThread=[1,1]).
+    ptrs = (V + page[:, None] * stride_b + (token[:, None] // 8) * stride_po + d[None, :] * stride_d +
+            (token[:, None] % 8) * stride_x)
+    smem = tlx.local_alloc((N, HEAD_DIM), tlx.dtype_of(V), 2)
+    tok = tlx.async_load(ptrs, tlx.local_view(smem, 0))
+    tlx.async_load_commit_group([tok])
+    tlx.async_load_wait_group(0)
+    value = tlx.local_load(tlx.local_view(smem, 0))
+    tl.store(out_ptr + n[:, None] * HEAD_DIM + d[None, :], value)
+
+
+@triton.jit
+def _async_load_gather_transpose_kernel(v_ptr, output_ptr):
+    n = tl.arange(0, 128)
+    d = tl.arange(0, 64)
+    n_u32 = n.to(tl.uint32)
+    page = (n_u32 // 64).to(tl.int32)
+    token_u32 = n_u32 % 64
+    token_group = (token_u32 // 8).to(tl.int32)
+    token_in_group = (token_u32 % 8).to(tl.int32)
+    ptrs = (v_ptr + page[:, None] * 4096 + token_group[:, None] * 512 + d[None, :] * 8 + token_in_group[:, None])
+
+    buffers = tlx.local_alloc((128, 64), tl.bfloat16, 2)
+    view = tlx.local_view(buffers, 0)
+    token = tlx.async_load(ptrs, view)
+    tlx.async_load_commit_group([token])
+    tlx.async_load_wait_group(0)
+    value = tlx.local_load(view)
+    tl.store(output_ptr + n[:, None] * 64 + d[None, :], value)
+
+
+@triton.jit
+def _local_load_kernel(
+    x_ptr,
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+
+    buf = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
+    buf0 = tlx.local_view(buf, 0)
+    tok = tlx.async_load(x_ptr + offs, buf0, mask=mask)
+    tlx.async_load_commit_group([tok])
+    tlx.async_load_wait_group(0)
+
+    x = tlx.local_load(buf0)
+    tl.store(output_ptr + offs, x, mask=mask)
+
+
+@triton.jit
+def _local_slice_runtime_offset_kernel(x_ptr, output_ptr, row):
+    value_layout: tl.constexpr = tlx.layout(
+        shape=((8, 32), (2, )),
+        stride=((64, 2), (1, )),
+    )
+    smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [1, 0],
+            [2, 8],
+            [4, 16],
+        ],
+        block_bases=[],
+        alignment=8,
+    )
+    rows = tl.arange(0, 8)
+    cols = tl.arange(0, 64)
+    offsets = rows[:, None] * 64 + cols[None, :]
+    offsets = tlx.require_layout(offsets, value_layout, pin=False)
+    values = tl.load(x_ptr + offsets)
+    buffers = tlx.local_alloc((8, 64), tl.float32, 1, layout=smem_layout)
+    buffer = tlx.local_view(buffers, 0)
+    tlx.local_store(buffer, values)
+    tl.debug_barrier()
+    view = tlx.local_slice(buffer, [row, 0], [1, 64])
+    selected = tl.reshape(tlx.local_load(view, relaxed=True), (64, ))
+    tl.store(output_ptr + cols, selected)
+
+
+@triton.jit
+def _assume_uniform_ptr_kernel(ptr_array, out_ptr, BLOCK: tl.constexpr):
+    # A pointer loaded from memory is not provably uniform, so the backend would
+    # otherwise waterfall every buffer access built on it.
+    base = tl.load(ptr_array).to(tl.pointer_type(tl.float32))
+    base = tlx.assume_uniform(base)
+    offs = tl.arange(0, BLOCK).to(tl.int32)
+    tlx.buffer_store(tlx.buffer_load(base, offs), out_ptr, offs)
+
+
+@triton.jit
+def _async_load_1d_kernel(
+    src_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    OTHER_VAL: tl.constexpr,
+    HAS_WRITE_MASK: tl.constexpr,
+    INITIALIZE_LOCAL: tl.constexpr,
+):
+    """Load via async_load (pointer-tensor path) and write result to output."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+    buf = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
+    if INITIALIZE_LOCAL:
+        val = tl.zeros((BLOCK_SIZE, ), tl.float32)
+        tlx.local_store(tlx.local_view(buf, 0), val)
+    tok = tlx.async_load(src_ptr + offs, tlx.local_view(buf, 0), mask=mask, other=OTHER_VAL)
+    tlx.async_load_commit_group([tok])
+    tlx.async_load_wait_group(0)
+    val = tlx.local_load(tlx.local_view(buf, 0))
+    write_mask = offs < n_elements if HAS_WRITE_MASK else None
+    tl.store(out_ptr + offs, val, mask=write_mask)
+
+
+@triton.jit
+def _buffer_load_to_local_1d_kernel(
+    src_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    OTHER_VAL: tl.constexpr,
+    HAS_WRITE_MASK: tl.constexpr,
+    INITIALIZE_LOCAL: tl.constexpr,
+):
+    """Load via buffer_load_to_local (scalar-ptr + offsets path) and write result to output."""
+    pid = tl.program_id(0)
+    offs = (pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(tl.int32)
+    mask = offs < n_elements
+    buf = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
+    if INITIALIZE_LOCAL:
+        val = tl.zeros((BLOCK_SIZE, ), tl.float32)
+        tlx.local_store(tlx.local_view(buf, 0), val)
+    tlx.buffer_load_to_local(tlx.local_view(buf, 0), src_ptr, offs, mask=mask, other=OTHER_VAL)
+    tlx.async_load_commit_group()
+    tlx.async_load_wait_group(0)
+    val = tlx.local_load(tlx.local_view(buf, 0))
+    write_mask = offs < n_elements if HAS_WRITE_MASK else None
+    tl.store(out_ptr + offs, val, mask=write_mask)
+
+
+def _run_load_to_local_1d(device, kernel_fn, size, n_valid, other_val, block_size=256, has_write_mask=True,
+                          init_local=False):
+    """Helper: run a 1D load-to-local kernel and return the output tensor.
+
+    Uses float32 with block_size=256 and num_warps=4 so each thread handles
+    exactly one 32-bit element.  This gives per-element mask granularity that
+    is compatible with the 32-bit minimum direct-to-LDS width on CDNA4.
+    """
+    x = torch.randn(size, dtype=torch.float32, device=device)
+    out = torch.full((size, ), float("nan"), dtype=torch.float32, device=device)
+    grid = (triton.cdiv(size, block_size), )
+    kernel_fn[grid](
+        x,
+        out,
+        n_valid,
+        BLOCK_SIZE=block_size,
+        OTHER_VAL=other_val,
+        HAS_WRITE_MASK=has_write_mask,
+        INITIALIZE_LOCAL=init_local,
+        num_warps=4,
+        num_stages=1,
+    )
+    return x, out
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_fa_cluster_numerical_matrix_gfx950():
+    test_name = "test_amd_fa_cluster_numerical_matrix_gfx950"
+    if _run_amd_fa_cluster_regression_isolated(test_name):
+        return
+
+    for dtype, batch, heads, seq_len, head_dim, causal in _AMD_FA_CLUSTER_CASES:
+        torch.manual_seed(42)
+        shape = (batch, heads, seq_len, head_dim)
+        q = torch.randn(shape, dtype=dtype, device="cuda")
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        scale = 1.0 / math.sqrt(head_dim)
+
+        out = _amd_fa_cluster_attention(q, k, v, scale, causal)
+        reference = F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=scale)
+        assert torch.isfinite(out).all(), (dtype, batch, seq_len, head_dim, causal)
+        measured_snr = _amd_fa_cluster_snr_db(out, reference)
+        assert measured_snr >= _AMD_FA_CLUSTER_MIN_SNR_DB, (
+            dtype,
+            batch,
+            seq_len,
+            head_dim,
+            causal,
+            measured_snr,
+        )
+        actual_rows, reference_rows = _amd_fa_cluster_sampled_fp32(out, q, k, v, scale, causal)
+        torch.testing.assert_close(actual_rows, reference_rows, atol=2e-2, rtol=2e-2)
+
+        del q, k, v, out, reference, actual_rows, reference_rows
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.skip(reason="TODO: move performance coverage out of the L1 test suite")
+def test_amd_fa_cluster_performance_gfx950():
+    test_name = "test_amd_fa_cluster_performance_gfx950"
+    if _run_amd_fa_cluster_regression_isolated(test_name):
+        return
+
+    batch, heads, seq_len, head_dim = 1, 64, 16384, 128
+    torch.manual_seed(42)
+    shape = (batch, heads, seq_len, head_dim)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    scale = 1.0 / math.sqrt(head_dim)
+    run = lambda: _amd_fa_cluster_attention(q, k, v, scale, False)
+
+    out = run()
+    reference = F.scaled_dot_product_attention(q, k, v, is_causal=False, scale=scale)
+    assert torch.isfinite(out).all()
+    measured_snr = _amd_fa_cluster_snr_db(out, reference)
+    assert measured_snr >= _AMD_FA_CLUSTER_MIN_SNR_DB, measured_snr
+    actual_rows, reference_rows = _amd_fa_cluster_sampled_fp32(out, q, k, v, scale, False)
+    torch.testing.assert_close(actual_rows, reference_rows, atol=2e-2, rtol=2e-2)
+
+    latencies_ms = [triton.testing.do_bench(run, warmup=500, rep=500, return_mode="median") for _ in range(3)]
+    median_ms = statistics.median(latencies_ms)
+    flops = 4.0 * batch * heads * seq_len * seq_len * head_dim
+    measured_tflops = flops * 1e-12 / (median_ms * 1e-3)
+    print(f"TLX AMD FA cluster: windows_ms={latencies_ms}, median_ms={median_ms:.4f}, "
+          f"throughput={measured_tflops:.1f} TFLOP/s, reference={_AMD_FA_CLUSTER_REFERENCE_TFLOPS:.1f} TFLOP/s")
+    assert math.isfinite(measured_tflops) and measured_tflops > 0.0
+    assert measured_tflops >= _AMD_FA_CLUSTER_MIN_TFLOPS, (
+        f"PERF REGRESSION: {measured_tflops:.1f} TFLOP/s < "
+        f"{_AMD_FA_CLUSTER_MIN_TFLOPS:.1f} TFLOP/s floor "
+        f"({_AMD_FA_CLUSTER_REFERENCE_TFLOPS:.1f} TFLOP/s reference)")
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "config,match",
+    [
+        ({"NUM_XCDS": 0}, "NUM_XCDS must be positive"),
+        ({"NUM_XCDS": 8, "NUM_SMS": 4}, "NUM_SMS .* must be >= NUM_XCDS"),
+        ({"NUM_XCDS": 4, "NUM_SMS": 10}, "NUM_SMS .* must be divisible by NUM_XCDS"),
+    ],
+    ids=["zero-xcds", "too-few-sms", "nondivisible-sms"],
+)
+def test_amd_fa_cluster_rejects_invalid_persistent_scheduler(config, match):
+    q = torch.empty((1, 1, 8, 64), device="cuda", dtype=torch.float16)
+    with pytest.raises(ValueError, match=match):
+        _amd_fa_cluster_persistent_attention(q, q, q, 1.0, False, config=config)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("N_CTX,BLOCK_M", [(1024, 256), (1025, 256)])
+def test_amd_fa_cluster_causal_query_order_gfx950(N_CTX, BLOCK_M):
+    num_m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    actual = torch.empty(num_m_blocks, device="cuda", dtype=torch.int32)
+    _amd_fa_cluster_causal_query_order_kernel[(num_m_blocks, )](
+        actual,
+        N_CTX=N_CTX,
+        BLOCK_M=BLOCK_M,
+        num_warps=1,
+    )
+    expected = torch.arange(num_m_blocks - 1, -1, -1, device="cuda", dtype=torch.int32)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "H,N_CTX,BLOCK_M,IS_CAUSAL,USE_24_HEAD_WINDOW,USE_FACTORED_24,CHECK_INDEX,EXPECTED_MAPPED",
+    [
+        (64, 4096, 256, False, False, False, 64, 512),
+        (64, 4096, 256, True, False, False, 0, 960),
+        (64, 16384, 256, True, True, False, 3072, 4080),
+        (64, 16384, 256, True, True, True, 3072, 4080),
+        (4, 1025, 256, True, False, False, 0, 16),
+    ],
+)
+def test_amd_fa_cluster_workgroup_window_is_bijective_gfx950(
+    H,
+    N_CTX,
+    BLOCK_M,
+    IS_CAUSAL,
+    USE_24_HEAD_WINDOW,
+    USE_FACTORED_24,
+    CHECK_INDEX,
+    EXPECTED_MAPPED,
+):
+    num_m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    num_workgroups = H * num_m_blocks
+    actual = torch.empty(num_workgroups, device="cuda", dtype=torch.int32)
+    _amd_fa_cluster_workgroup_order_kernel[(H, num_m_blocks)](
+        actual,
+        H=H,
+        N_CTX=N_CTX,
+        BLOCK_M=BLOCK_M,
+        IS_CAUSAL=IS_CAUSAL,
+        USE_24_HEAD_WINDOW=USE_24_HEAD_WINDOW,
+        USE_FACTORED_24=USE_FACTORED_24,
+        num_warps=1,
+    )
+    expected = torch.arange(num_workgroups, device="cuda", dtype=torch.int32)
+    torch.testing.assert_close(actual.sort().values, expected)
+    assert actual[CHECK_INDEX].item() == EXPECTED_MAPPED
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_warp_predicate_scalar_warp_local_reduce_gfx950():
+    source = torch.arange(256, device="cuda", dtype=torch.float32).reshape(4, 64)
+    output = torch.empty_like(source)
+    _warp_predicate_warp_local_reduce_kernel[(1, )](source, output, num_warps=4)
+    row_sum = source.sum(axis=1)
+    active_wave = torch.arange(4, device="cuda") >= 2
+    expected = torch.where(active_wave[:, None], source + row_sum[:, None], source)
+    torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_warp_predicate_false_lanes_keep_inits_gfx950():
+    size = 256
+    source = torch.arange(size, device="cuda", dtype=torch.float32)
+    lhs = torch.empty_like(source)
+    rhs = torch.empty_like(source)
+    side = torch.full_like(source, -1.0)
+    _warp_predicate_kernel[(1, )](
+        source,
+        lhs,
+        rhs,
+        side,
+        size=size,
+        num_warps=4,
+    )
+
+    offsets = torch.arange(size, device="cuda")
+    predicate = (offsets >= 64) & (offsets < 128) & (offsets % 5 < 2)
+    torch.testing.assert_close(lhs, torch.where(predicate, source + 3.0, source))
+    torch.testing.assert_close(rhs, torch.where(predicate, source * 2.0 - 3.0, source * 2.0))
+    torch.testing.assert_close(side, torch.where(predicate, source, torch.full_like(source, -1.0)))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_warp_votes_correct_gfx950():
+    values = torch.ones(64, device="cuda", dtype=torch.int32)
+    all_output = torch.empty_like(values)
+    any_output = torch.empty_like(values)
+
+    _warp_vote_kernel[(1, )](values, all_output, any_output, BLOCK=64, num_warps=1)
+    torch.testing.assert_close(all_output, torch.ones_like(values))
+    torch.testing.assert_close(any_output, torch.ones_like(values))
+
+    values[17] = 0
+    _warp_vote_kernel[(1, )](values, all_output, any_output, BLOCK=64, num_warps=1)
+    torch.testing.assert_close(all_output, torch.zeros_like(values))
+    torch.testing.assert_close(any_output, torch.ones_like(values))
+
+    values.zero_()
+    _warp_vote_kernel[(1, )](values, all_output, any_output, BLOCK=64, num_warps=1)
+    torch.testing.assert_close(all_output, torch.zeros_like(values))
+    torch.testing.assert_close(any_output, torch.zeros_like(values))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("condition", [False, True])
+def test_concrete_helper_release_preserves_values_gfx950(condition):
+    torch.manual_seed(0)
+    a = torch.randn((16, 32), device="cuda", dtype=torch.float16)
+    b = torch.randn((32, 64), device="cuda", dtype=torch.float16)
+    output = torch.empty(2048, device="cuda", dtype=torch.float32)
+    _concrete_helper_release_kernel[(1, )](
+        a,
+        b,
+        output,
+        condition,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+
+    concrete = output[:1024].reshape(16, 64)
+    released = output[1024:].reshape(16, 64)
+    assert torch.isfinite(concrete).all()
+    expected = a.float() @ b.float()
+    expected = expected * 2.0 if condition else expected + 1.0
+    expected[:8] *= 0.5
+    torch.testing.assert_close(concrete, expected, atol=5e-2, rtol=1e-2)
+    # release_layout changes only the register distribution, so its generic
+    # store must preserve the concrete store's logical tensor exactly.
+    torch.testing.assert_close(released, concrete, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_pinned_buffer_load_layout_correctness_gfx950(device):
+    from triton.tlx.ops.kernels.flash_attn.gfx950_bwd import (
+        _attn_bwd_dq_native_convert_kernel, )
+
+    m = torch.arange(128, device=device, dtype=torch.int64)[:, None]
+    d = torch.arange(128, device=device, dtype=torch.int64)[None, :]
+    expected = ((m * 131 + d * 7) % 2048).to(torch.bfloat16)
+    local_m = m & 15
+    tile_m = m - local_m
+    d_swizzled = ((d & 1) | ((d & 2) << 6) | ((d & 12) << 3) | ((d & 48) << 5) | ((d & 64) << 2))
+    physical = tile_m * 128 + (local_m << 1) + d_swizzled
+    native = torch.empty(128 * 128, device=device, dtype=torch.bfloat16)
+    native[physical.flatten()] = expected.flatten()
+    actual = torch.empty_like(expected)
+
+    _attn_bwd_dq_native_convert_kernel[(1, 1)](
+        native,
+        actual,
+        N=128,
+        D=128,
+        BLOCK_M=128,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_async_load_correctness(device):
+    """async_load produces correct results on gfx950 hardware."""
+    size = 256
+    x = torch.rand(size, dtype=torch.float32, device=device)
+    y = torch.rand(size, dtype=torch.float32, device=device)
+    output = torch.empty_like(x)
+    grid = (triton.cdiv(size, 64), )
+    _async_load_kernel[grid](x, y, output, size, BLOCK_SIZE=64)
+    torch.testing.assert_close(x + y, output)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_extract_slice_dot1_correct_gfx950():
+    x = torch.arange(256 * 128, device="cuda", dtype=torch.float32).reshape(256, 128).to(torch.bfloat16)
+    actual = torch.empty((32, 64), device="cuda", dtype=torch.bfloat16)
+    for row in range(0, 256, 32):
+        for col in (0, 64):
+            _extract_slice_dot1_kernel[(1, )](
+                x,
+                actual,
+                ROW_OFFSET=row,
+                COL_OFFSET=col,
+                num_warps=4,
+                matrix_instr_nonkdim=16,
+            )
+            torch.testing.assert_close(actual, x[row:row + 32, col:col + 64])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_extract_slice_mfma_correct_gfx950():
+    torch.manual_seed(0)
+    a = torch.randn((16, 256), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((256, 64), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
+    for band in range(8):
+        _extract_slice_mfma_kernel[(1, )](
+            a,
+            b,
+            actual,
+            BAND=band,
+            num_warps=4,
+            matrix_instr_nonkdim=16,
+        )
+        expected = (a[:, band * 32:(band + 1) * 32].float() @ b[band * 32:(band + 1) * 32].float())
+        torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("register_class", ["vgpr", "agpr"])
+def test_amd_register_class_anchor_correct_gfx950(register_class):
+    x = torch.arange(2048, device="cuda", dtype=torch.float32)
+    actual = torch.empty_like(x)
+    _amd_register_class_anchor_kernel[(1, )](x, actual, register_class, num_warps=4)
+    torch.testing.assert_close(actual, x)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("k_width", [8, 4])
+def test_amd_scheduled_mfma_correct_gfx950(k_width):
+    torch.manual_seed(0)
+    a = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((32, 64), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_kernel[(1, )](
+        a,
+        b,
+        actual,
+        K_WIDTH=k_width,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    torch.testing.assert_close(actual, a.float() @ b.float(), atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("m,instr_m,warps", [(16, 16, (2, 1, 4)), (64, 32, (2, 2, 2)), (64, 16, (2, 4, 1))])
+@pytest.mark.parametrize("role", ["transient", "persistent"])
+@pytest.mark.parametrize("initialize", [False, True])
+@pytest.mark.parametrize("column_subtile", [False, True], ids=["full", "column-subtile"])
+def test_amd_scheduled_mfma_wave_batch_correct_gfx950(m, instr_m, warps, role, initialize, column_subtile):
+    torch.manual_seed(3605)
+    a = torch.randn((2, m, 32), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((2, 32, 128), device="cuda", dtype=torch.bfloat16)
+    actual = torch.full((2, m, 128), 7.0, device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_wave_batch_kernel[(1, )](
+        a,
+        b,
+        actual,
+        m,
+        instr_m,
+        warps,
+        role,
+        initialize,
+        column_subtile,
+        num_warps=8,
+        matrix_instr_nonkdim=instr_m,
+    )
+    expected = a.float() @ b.float()
+    if not initialize:
+        expected += 7.0
+    if column_subtile:
+        # The explicit subtile spans one instruction tile across the N waves.
+        width = instr_m * warps[2]
+        expected[:, :, :width] = 7.0
+        expected[:, :, 2 * width:] = 7.0
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_chain_correct_gfx950():
+    torch.manual_seed(0)
+    a = torch.randn((16, 256), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((256, 64), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_chain_kernel[(1, )](
+        a,
+        b,
+        actual,
+        BANDS=8,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    expected = a.float() @ b.float()
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("use_vgpr", [False, True], ids=["agpr", "vgpr"])
+@pytest.mark.parametrize("initialize", [False, True], ids=["preserve_c", "initialize"])
+@pytest.mark.parametrize("commit", [False, True], ids=["direct", "commit"])
+@pytest.mark.parametrize("full_k", [False, True], ids=["split_k", "full_k"])
+def test_amd_scheduled_mfma_persistent_acc_correct_gfx950(use_vgpr, initialize, full_k, commit):
+    torch.manual_seed(0)
+    a = torch.randn((16, 64), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((64, 64), device="cuda", dtype=torch.bfloat16)
+    actual = torch.full((16, 64), float("nan"), device="cuda", dtype=torch.float32)
+    expected = a.float() @ b.float()
+    if not initialize:
+        expected += 7.0
+    _amd_scheduled_mfma_persistent_acc_kernel[(1, )](
+        a,
+        b,
+        actual,
+        USE_VGPR=use_vgpr,
+        COMMIT=commit,
+        INITIALIZE=initialize,
+        FULL_K=full_k,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "consumer,iterations",
+    [("direct", 0), ("layout", 0), ("reshape", 0), ("if", 0), ("if", 2), ("loop", 0), ("loop", 2), ("native", 0)],
+)
+def test_amd_scheduled_mfma_opaque_consumer_correct_gfx950(consumer, iterations):
+    for seed in range(3):
+        torch.manual_seed(seed)
+        a = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
+        b = torch.randn((32, 16), device="cuda", dtype=torch.bfloat16)
+        actual = torch.full((16, 16), float("nan"), device="cuda", dtype=torch.float32)
+        _amd_scheduled_mfma_opaque_consumer_kernel[(1, )](a, b, actual, iterations, CONSUMER=consumer, num_warps=1,
+                                                          matrix_instr_nonkdim=16)
+        expected = a.float() @ b.float()
+        if consumer == "if":
+            expected *= iterations != 0
+        elif consumer == "loop":
+            expected *= iterations
+        torch.testing.assert_close(actual, expected + 1.0, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("instr_m,instr_k", [(16, 32), (32, 16)], ids=["16x16", "32x32"])
+@pytest.mark.parametrize("writer", ["opaque", "pure", "partial", "commit", "native"])
+def test_amd_scheduled_mfma_dead_result_writer_correct_gfx950(instr_m, instr_k, writer):
+    elements = instr_m * instr_m
+    expected = torch.ones((elements * (3 if writer == "partial" else 1), ), device="cuda", dtype=torch.float32)
+    if writer == "partial":
+        # The saved first fragment is an all-ones matrix product. The other
+        # fragment is unused and must not corrupt the opaque writer's ones.
+        expected[2 * elements:] = instr_k
+    for _ in range(3):
+        actual = torch.full_like(expected, float("nan"))
+        _amd_scheduled_mfma_dead_result_writer_kernel[(1, )](actual, INSTR_M=instr_m, INSTR_K=instr_k, WRITER=writer,
+                                                             num_warps=1, matrix_instr_nonkdim=instr_m)
+        # Values written by the opaque instruction are always exactly 1.
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("pointer_cast", [False, True], ids=["private", "private_to_generic"])
+@pytest.mark.parametrize("commit", [False, True], ids=["no_commit", "full_commit"])
+def test_amd_scheduled_mfma_private_forward_correct_gfx950(tmp_path, pointer_cast, commit):
+    pointer = "%slot = llvm.alloca %count x f32 : (i32) -> !llvm.ptr<5>"
+    pointer_type = "!llvm.ptr<5>"
+    if pointer_cast:
+        pointer = """%allocation = llvm.alloca %count x f32 : (i32) -> !llvm.ptr<5>
+    %slot = llvm.addrspacecast %allocation : !llvm.ptr<5> to !llvm.ptr"""
+        pointer_type = "!llvm.ptr"
+    boundary = "%committed = amdg.mfma_commit %result : tensor<16x16xf32, #mma>" if commit else ""
+    result = "%committed" if commit else "%result"
+    source = tmp_path / "private_forward.ttgir"
+    source.write_text(f"""
+#mma = #ttg.amd_mfma<{{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = false}}>
+#lhs = #ttg.dot_op<{{opIdx = 0, parent = #mma, kWidth = 8}}>
+#rhs = #ttg.dot_op<{{opIdx = 1, parent = #mma, kWidth = 8}}>
+module attributes {{"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32}} {{
+  tt.func public @private_forward(%out: !tt.ptr<f32>) {{
+    %a = arith.constant dense<1.0> : tensor<16x32xbf16, #lhs>
+    %b = arith.constant dense<1.0> : tensor<32x16xbf16, #rhs>
+    %zero = arith.constant dense<0.0> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %zero
+        resident "none" accumulator "persistent" register_class "vgpr" initialize true
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    {boundary}
+    %pack = builtin.unrealized_conversion_cast {result} : tensor<16x16xf32, #mma> to !llvm.struct<(f32, f32, f32, f32)>
+    %x = llvm.extractvalue %pack[0] : !llvm.struct<(f32, f32, f32, f32)>
+    %count = llvm.mlir.constant(1 : i32) : i32
+    {pointer}
+    llvm.store %x, %slot : f32, {pointer_type}
+    %reloaded = llvm.load %slot : {pointer_type} -> f32
+    %read = llvm.inline_asm has_side_effects "v_add_f32 $0, $1, 1.0", "=v,v" %reloaded : (f32) -> f32
+    %ptr = builtin.unrealized_conversion_cast %out : !tt.ptr<f32> to !llvm.ptr<1>
+    %lane = rocdl.workitem.id.x : i32
+    %dst = llvm.getelementptr %ptr[%lane] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+    llvm.store %read, %dst : f32, !llvm.ptr<1>
+    tt.return
+  }}
+}}
+""")
+    compiled = triton.compile(str(source), target=GPUTarget("hip", "gfx950", 64), options={"num_warps": 1})
+    # Each lane reads one element of an all-ones 16x32 @ 32x16 product,
+    # then adds one in opaque asm after LLVM forwards the private store/load.
+    expected = torch.full((64, ), 33.0, device="cuda", dtype=torch.float32)
+    for _ in range(3):
+        actual = torch.full((64, ), float("nan"), device="cuda", dtype=torch.float32)
+        compiled[(1, 1, 1)](actual)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_forked_chain_correct_gfx950():
+    torch.manual_seed(0)
+    a = torch.randn((16, 128), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((128, 64), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((2, 16, 64), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_forked_chain_kernel[(1, )](
+        a,
+        b,
+        actual,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    common = a[:, :32].float() @ b[:32, :].float()
+    expected = torch.stack((
+        common + a[:, 32:64].float() @ b[32:64, :].float(),
+        common + a[:, 64:96].float() @ b[64:96, :].float(),
+    ))
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_inferred_lds_loop_correct_gfx950():
+    torch.manual_seed(0)
+    a = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((32, 64), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_lds_loop_kernel[(1, )](
+        a,
+        b,
+        actual,
+        2,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    torch.testing.assert_close(actual, 3.0 * (a.float() @ b.float()), atol=6e-4, rtol=6e-4)
+
+
+def _vgprs(operand):
+    """Return the VGPR numbers named by one ISA operand such as v8 or v[8:11]."""
+    match = re.fullmatch(r"v(\d+)|v\[(\d+):(\d+)\]", operand)
+    if match is None:
+        return set()
+    if match.group(1) is not None:
+        return {int(match.group(1))}
+    return set(range(int(match.group(2)), int(match.group(3)) + 1))
+
+
+def _early_lds_waits(amdgcn):
+    """Count LDS waits issued before an MFMA that reads no LDS-loaded register.
+
+    Only the region after the last barrier before the final MFMA is examined.
+    """
+    lines = [line.strip() for line in amdgcn.splitlines()]
+    lines = [line for line in lines if line and not line.startswith((";", "."))]
+    last_mfma = max(i for i, line in enumerate(lines) if line.startswith("v_mfma"))
+    start = max(i for i, line in enumerate(lines[:last_mfma]) if line.startswith("s_barrier")) + 1
+    loaded = set()
+    early = 0
+    pending_wait = False
+    for line in lines[start:last_mfma + 1]:
+        opcode, _, rest = line.partition(" ")
+        operands = [operand.strip() for operand in rest.split(",")]
+        if opcode.startswith("ds_read"):
+            loaded |= _vgprs(operands[0])
+        elif opcode == "s_waitcnt" and "lgkmcnt" in rest:
+            pending_wait = True
+        elif opcode.startswith("v_mfma") and pending_wait:
+            sources = _vgprs(operands[1]) | _vgprs(operands[2])
+            early += not (sources & loaded)
+            pending_wait = False
+    return early
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_unconstrained_lds_operand_wait_gfx950():
+    """An unconstrained persistent MFMA waits for its LDS operands at the MFMA.
+
+    Pinned inputs are consumed by their pins, so LLVM waits for the loads
+    before independent MFMAs. The pinned case is a control for the detector.
+    """
+    torch.manual_seed(0)
+    a = torch.randn((16, 64), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((64, 64), device="cuda", dtype=torch.bfloat16)
+    expected = 4.0 * (a[:, :32].float() @ b[:32].float()) + a[:, 32:].float() @ b[32:].float()
+    early_waits = {}
+    for resident in (None, "unconstrained"):
+        actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
+        compiled = _amd_scheduled_mfma_lds_operand_wait_kernel[(1, )](
+            a,
+            b,
+            actual,
+            RESIDENT=resident,
+            num_warps=4,
+            matrix_instr_nonkdim=16,
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+        early_waits[resident] = _early_lds_waits(compiled.asm["amdgcn"])
+    assert early_waits[None] > 0
+    assert early_waits["unconstrained"] == 0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_persistent_32x32_correct_gfx950():
+    torch.manual_seed(0)
+    a = torch.randn((128, 16), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((128, 32), device="cuda", dtype=torch.float32)
+    compiled = _amd_scheduled_mfma_persistent_32x32_kernel[(1, )](
+        a,
+        b,
+        actual,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    torch.testing.assert_close(actual, a.float() @ b.float(), atol=2e-4, rtol=2e-4)
+    amdgcn = "\n".join(line.strip() for line in compiled.asm["amdgcn"].splitlines())
+    assert "s_nop 15\ns_nop 3" in amdgcn
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_fragmented_nd_correct_gfx950():
+    torch.manual_seed(0)
+    a = torch.randn((256, 16), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((16, 128), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((256, 128), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_fragmented_nd_kernel[(1, )](
+        a,
+        b,
+        actual,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    expected = a.float() @ b.float()
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("direct_store", [True, False])
+def test_amd_scheduled_mfma_fragmented_nd_update_correct_gfx950(direct_store, ):
+    torch.manual_seed(0)
+    a0 = torch.randn((256, 16), device="cuda", dtype=torch.bfloat16)
+    b0 = torch.randn((16, 128), device="cuda", dtype=torch.bfloat16)
+    a1 = torch.randn((256, 16), device="cuda", dtype=torch.bfloat16)
+    b1 = torch.randn((16, 128), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((256, 128), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_fragmented_nd_update_kernel[(1, )](
+        a0,
+        b0,
+        a1,
+        b1,
+        actual,
+        DIRECT_STORE=direct_store,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    expected = a0.float() @ b0.float() + a1.float() @ b1.float()
+    torch.testing.assert_close(actual, expected, atol=4e-4, rtol=4e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_interleaved_chains_correct_gfx950():
+    torch.manual_seed(0)
+    a = torch.randn((16, 256), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((256, 128), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((16, 128), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_interleaved_chains_kernel[(1, )](
+        a,
+        b,
+        actual,
+        BANDS=8,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    expected = a.float() @ b.float()
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "exact_local_layout,full_commit",
+    [(False, False), (True, False), (True, True)],
+)
+def test_amd_scheduled_mfma_split_resident_chains_correct_gfx950(
+    exact_local_layout,
+    full_commit,
+):
+    torch.manual_seed(0)
+    a = torch.randn((16, 256), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((256, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((256, 128), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((16, 128), device="cuda", dtype=torch.float32)
+    v_actual = torch.empty_like(v)
+    _amd_scheduled_mfma_split_resident_chains_kernel[(1, )](
+        a,
+        b,
+        v,
+        actual,
+        v_actual,
+        USE_LOCAL=True,
+        EXACT_LOCAL_LAYOUT=exact_local_layout,
+        FULL_COMMIT=full_commit,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    expected = a.float() @ b.float()
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+    if full_commit:
+        torch.testing.assert_close(v_actual, v)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_warp_pipe_bmm_aligned_k_gfx950(device):
+    """Warp-pipe bmm with K a multiple of BLOCK_K compiles + runs correctly (positive control)."""
+    a, b, c = _run_warp_pipe_bmm(device, bt=8, M=256, N=256, K=2560)  # 2560 % 64 == 0
+    torch.testing.assert_close(c.float(), torch.bmm(a.float(), b.float()), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_warp_pipe_bmm_partial_k_gfx950(device):
+    """Warp-pipe bmm with a partial-K tail (K not a multiple of BLOCK_K).
+
+    Same kernel and config as the aligned-K positive control; only K differs (prime 2309, the
+    production compression-bmm K). The partial-K mask makes the async_load un-lowerable as a
+    direct-to-LDS copy on CDNA4 (vec=1 -> 16-bit); CoalesceAsyncCopy now falls back to a
+    synchronous tt.load + ttg.local_store so it compiles and runs correctly.
+    Previously this aborted make_llir with an unrealized_conversion_cast.
+    """
+    a, b, c = _run_warp_pipe_bmm(device, bt=8, M=256, N=256, K=2309)  # 2309 % 64 == 5
+    torch.testing.assert_close(c.float(), torch.bmm(a.float(), b.float()), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("K", [2320, 2309, 2312, 1956])
+def test_async_load_row_stride_gfx950(device, K):
+    """Unmasked full-tile async_load with a non-16-aligned global row stride (T280910119).
+
+    A row stride not a multiple of 16 elements collapses the direct-to-LDS vector width
+    below a supported bitwidth (fp16 -> 16-bit) on CDNA4, so the copy cannot be lowered as
+    a direct-to-LDS load (its swizzled dst hits loadContig == 0). CoalesceAsyncCopy now
+    falls back to a synchronous tt.load + ttg.local_store for both swizzled and padded
+    dsts, so it compiles and runs correctly. Previously K % 16 != 0 aborted make_llir with
+    an unrealized_conversion_cast. K=2320 (% 16 == 0) is the positive control and keeps the
+    fast direct-to-LDS path.
+    """
+    BLOCK_M, BLOCK_K = 128, 64
+    a = torch.randn((BLOCK_M, K), device=device, dtype=torch.float16)
+    out = torch.empty((BLOCK_M, BLOCK_K), device=device, dtype=torch.float16)
+    _row_stride_async_load_kernel[(1, )](a, out, a.stride(0), BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K)
+    torch.testing.assert_close(out, a[:, :BLOCK_K])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_async_load_noncontiguous_gather_gfx950(device):
+    """Non-contiguous gather-pointer async_load in bf16 (P2440272260).
+
+    A third way (besides a partial-K mask or a non-16-aligned row stride) to collapse the
+    direct-to-LDS vector width to 16-bit on CDNA4: a genuinely non-contiguous pointer tensor.
+    The gather offsets force the async src blocked layout to sizePerThread=[1,1] (vec=1), so
+    bf16 -> 16-bit, canLoadDirectToLDS() rejects it (loadContig == 0), and CoalesceAsyncCopy
+    falls back to a synchronous tt.load + ttg.local_store. Previously this aborted make_llir
+    with an unrealized_conversion_cast. Uses bfloat16 -- the other 16-bit dtype; the mask and
+    row-stride tests cover fp16.
+    """
+    N, HEAD_DIM, PAGE = 128, 64, 64
+    v = torch.randn((2, 8, HEAD_DIM, 8), device=device, dtype=torch.bfloat16)
+    out = torch.empty((N, HEAD_DIM), device=device, dtype=torch.bfloat16)
+    _noncontiguous_gather_async_load_kernel[(1, )](v, out, *v.stride(), N=N, HEAD_DIM=HEAD_DIM, PAGE=PAGE, num_warps=4)
+    n = torch.arange(N, device=device)
+    page = n // PAGE
+    token = n % PAGE
+    ref = v[page, token // 8, :, token % 8]
+    torch.testing.assert_close(out, ref)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_async_load_gather_transpose_correctness_gfx950(device):
+    """The direct gather-transpose produces the logical [token, head_dim] view."""
+    v = torch.arange(2 * 8 * 64 * 8, device=device, dtype=torch.float32)
+    v = v.reshape(2, 8, 64, 8).to(torch.bfloat16)
+    output = torch.empty((128, 64), device=device, dtype=torch.bfloat16)
+    _async_load_gather_transpose_kernel[(1, )](v, output, num_warps=4)
+    expected = v.permute(0, 1, 3, 2).reshape(128, 64)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("row", [0, 3, 7])
+def test_local_slice_runtime_offset_correct_gfx950(row):
+    x = torch.arange(8 * 64, device="cuda", dtype=torch.float32).reshape(8, 64)
+    actual = torch.empty(64, device="cuda", dtype=torch.float32)
+    _local_slice_runtime_offset_kernel[(1, )](x, actual, row, num_warps=4)
+    torch.testing.assert_close(actual, x[row], atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_local_load_correctness(device):
+    """local_load after async_wait produces correct results on gfx950 hardware."""
+    size = 256
+    x = torch.rand(size, dtype=torch.float32, device=device)
+    output = torch.empty_like(x)
+    grid = (triton.cdiv(size, 64), )
+    _local_load_kernel[grid](x, output, size, BLOCK_SIZE=64)
+    torch.testing.assert_close(x, output)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
+    m = n = 256
+    for k in (1024, 1536):
+        a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+        actual = _launch_a4w4(a, b, a_scales, b_scales)
+        expected = _a4w4_reference(a, b, a_scales, b_scales)
+        torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+
+
+@pytest.mark.parametrize("k, split_k", [(1024, 1), (4096, 2)])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_inter_wave_preshuffled_scale_correctness_gfx950(device, k, split_k):
+    m = n = 256
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    a_scales_preshuffled = _preshuffle_a4w4_a_scales(a_scales)
+    b_scales_preshuffled = _preshuffle_a4w4_b_scales(b_scales)
+    actual = _a4w4_inter_wave_matmul_preshuffled(a, b, a_scales_preshuffled, b_scales_preshuffled, SPLIT_K=split_k)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("k, split_k", [(1024, 1), (4096, 2)])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_inter_wave_merged_scale_correctness_gfx950(device, k, split_k):
+    m = n = 256
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    scales = _preshuffle_a4w4_scales(a_scales, b_scales)
+    actual = _a4w4_inter_wave_matmul_merged_scales(a, b, scales, SPLIT_K=split_k)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    "k, expected_path",
+    [(1536, "intra_wave_256x256"), (2048, "inter_wave_256x256")],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_inter_wave_large_grid_dispatch_correctness_gfx950(device, k, expected_path):
+    # A 2x33 grid exceeds the skinny threshold. K=1536 selects the measured
+    # lower-overhead 4-wave path; K=2048 selects the 8-wave pipeline.
+    m, n = 512, 8448
+    assert _select_a4w4_inter_wave_path(m, n, k) == expected_path
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+
+
+@pytest.mark.parametrize("m, n", [(256, 16640), (512, 8448)])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_short_k_dispatch_stress_gfx950(device, m, n):
+    # Both public shapes exceed the skinny threshold by the smallest possible
+    # grid margins. K=1024 must dispatch to the measured 4-wave path.
+    k = _A4W4_INTER_WAVE_MIN_K
+    grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
+    assert grid_mn in (65, 66)
+    assert _select_a4w4_inter_wave_path(m, n, k) == "intra_wave_256x256"
+    assert k == 1024
+
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    for launch in range(500):
+        actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
+        torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0, msg=f"failed on launch {launch}")
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_inter_wave_skinny_correctness_gfx950(device):
+    # 512x256x1536 -> 256-tile grid = 2*1 = 2 <= NUM_CU/32, so the dispatcher takes
+    # the occupancy-starved 128x128 + split-K TLX path (and its fp32 reduce).
+    m = 512
+    n = 256
+    k = 1536
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_assume_uniform_correctness_gfx950(device):
+    """assume_uniform returns its argument unchanged."""
+    size = 64
+    x = torch.rand(size, dtype=torch.float32, device=device)
+    out = torch.empty_like(x)
+    ptr_array = torch.tensor([x.data_ptr()], dtype=torch.int64, device=device)
+    _assume_uniform_ptr_kernel[(1, )](ptr_array, out, BLOCK=size)
+    torch.testing.assert_close(out, x)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_buffer_load_to_local_no_mask(device, monkeypatch):
+    # set env var AMDGCN_USE_BUFFER_OPS=0 to ensure async_load to be lowered to global_load
+    # so can compare behaviors of global_load and buffer_load
+    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", 0)
+    """buffer_load_to_local without mask matches async_load without mask."""
+    size = 256
+    torch.manual_seed(42)
+    x_a, out_a = _run_load_to_local_1d(device, _async_load_1d_kernel, size, size, None)
+    torch.manual_seed(42)
+    x_b, out_b = _run_load_to_local_1d(device, _buffer_load_to_local_1d_kernel, size, size, None)
+    torch.testing.assert_close(out_a, out_b)
+    torch.testing.assert_close(out_a, x_a)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_buffer_load_to_local_masked_other_none(device, monkeypatch):
+    # set env var AMDGCN_USE_BUFFER_OPS=0 to ensure async_load to be lowered to global_load
+    # so can compare behaviors of global_load and buffer_load
+    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", 0)
+    """buffer_load_to_local with mask and other=None zero-fills masked elements, matching async_load."""
+    size = 256
+    n_valid = 128
+    torch.manual_seed(42)
+    x_a, out_a = _run_load_to_local_1d(device, _async_load_1d_kernel, size, n_valid, None, has_write_mask=False,
+                                       init_local=True)
+    torch.manual_seed(42)
+    x_b, out_b = _run_load_to_local_1d(device, _buffer_load_to_local_1d_kernel, size, n_valid, None,
+                                       has_write_mask=False, init_local=True)
+    # Valid region must match the source data.
+    torch.testing.assert_close(out_a[:n_valid], x_a[:n_valid])
+    torch.testing.assert_close(out_b[:n_valid], x_b[:n_valid])
+    # Masked region must be nan in both paths.
+    assert torch.all(out_a[n_valid:] == 0)
+    assert torch.all(out_b[n_valid:] == 0)
+    # Overall outputs must be identical.
+    torch.testing.assert_close(out_a, out_b, equal_nan=True)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_buffer_load_to_local_masked_other_zero(device, monkeypatch):
+    # set env var AMDGCN_USE_BUFFER_OPS=0 to ensure async_load to be lowered to global_load
+    # so can compare behaviors of global_load and buffer_load
+    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", 0)
+    """buffer_load_to_local with mask and other=0.0 zero-fills masked elements, matching async_load."""
+    size = 256
+    n_valid = 128
+    torch.manual_seed(42)
+    x_a, out_a = _run_load_to_local_1d(device, _async_load_1d_kernel, size, n_valid, 0.0, has_write_mask=False)
+    torch.manual_seed(42)
+    x_b, out_b = _run_load_to_local_1d(device, _buffer_load_to_local_1d_kernel, size, n_valid, 0.0,
+                                       has_write_mask=False)
+    torch.testing.assert_close(out_a[:n_valid], x_a[:n_valid])
+    torch.testing.assert_close(out_b[:n_valid], x_b[:n_valid])
+    torch.testing.assert_close(out_b[n_valid:], torch.zeros(size - n_valid, dtype=torch.float32, device=device))
+    torch.testing.assert_close(out_a[n_valid:], torch.zeros(size - n_valid, dtype=torch.float32, device=device))
+    torch.testing.assert_close(out_a, out_b)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("n_valid", [128, 200], ids=["half", "near_full"])
+def test_buffer_load_to_local_masked_other_none_boundary(device, n_valid, monkeypatch):
+    # set env var AMDGCN_USE_BUFFER_OPS=0 to ensure async_load to be lowered to global_load
+    # so can compare behaviors of global_load and buffer_load
+    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", 0)
+    """buffer_load_to_local with other=None at various mask boundaries."""
+    size = 256
+    torch.manual_seed(42)
+    x_a, out_a = _run_load_to_local_1d(device, _async_load_1d_kernel, size, n_valid, None)
+    torch.manual_seed(42)
+    x_b, out_b = _run_load_to_local_1d(device, _buffer_load_to_local_1d_kernel, size, n_valid, None)
+    torch.testing.assert_close(out_a[:n_valid], x_a[:n_valid])
+    torch.testing.assert_close(out_b[:n_valid], x_b[:n_valid])
+    torch.testing.assert_close(out_a, out_b, equal_nan=True)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_buffer_load_to_local_multi_cta_masked_other_none(device, monkeypatch):
+    # set env var AMDGCN_USE_BUFFER_OPS=0 to ensure async_load to be lowered to global_load
+    # so can compare behaviors of global_load and buffer_load
+    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", 0)
+    """buffer_load_to_local with mask, other=None, and multiple CTAs (partial last tile)."""
+    # Two CTAs: first full (256 elements), second partial (128 valid out of 256).
+    size = 512
+    n_valid = 384  # First CTA fully valid, second CTA half masked.
+    block_size = 256
+    torch.manual_seed(42)
+    x_a, out_a = _run_load_to_local_1d(device, _async_load_1d_kernel, size, n_valid, None, block_size=block_size)
+    torch.manual_seed(42)
+    x_b, out_b = _run_load_to_local_1d(device, _buffer_load_to_local_1d_kernel, size, n_valid, None,
+                                       block_size=block_size)
+    torch.testing.assert_close(out_a[:n_valid], x_a[:n_valid])
+    torch.testing.assert_close(out_b[:n_valid], x_b[:n_valid])
+    torch.testing.assert_close(out_a, out_b, equal_nan=True)
+
+
+@triton.jit
+def _workgroup_barrier_sum_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    # One workgroup, BLOCK lanes across several warps. Each lane publishes its input
+    # into its own LDS slot, then every lane sums the WHOLE buffer -- so each lane
+    # must observe every other (cross-warp) lane's store. workgroup_barrier provides
+    # the LDS fence + rendezvous; without it the sum races and drops cross-warp
+    # stores.
+    off = tl.arange(0, BLOCK)
+    smem = tlx.local_alloc((BLOCK, ), tl.int32, 1)
+    buf = tlx.local_view(smem, 0)
+    tlx.local_store(buf, tl.load(x_ptr + off))
+    tlx.workgroup_barrier()
+    total = tl.sum(tlx.local_load(buf))
+    tl.store(out_ptr + off, total + tl.zeros((BLOCK, ), tl.int32))
+
+
+@triton.jit
+def _cond_barrier_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    # Exercise the cond_barrier phase-shift bracket (cond_barrier(wg != 0) ...
+    # cond_barrier(wg == 0), the split-M ping-pong pattern) around a
+    # workgroup_barrier. The payload is a per-lane copy -- independent of the
+    # (deliberately out-of-phase) barriers -- so the assertion checks what a unit
+    # test can: the paired bracket compiles and RECONVERGES without deadlock (a
+    # broken barrier-count contract would hang or drop the stores). cond_barrier's
+    # cross-warp phase-shift correctness is covered by the grouped-gemm integration.
+    off = tl.arange(0, BLOCK)
+    wg = tlx.thread_id(0) // 256
+    tlx.cond_barrier(wg != 0)
+    tlx.workgroup_barrier()
+    tlx.cond_barrier(wg == 0)
+    tl.store(out_ptr + off, tl.load(x_ptr + off))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_workgroup_barrier(device):
+    BLOCK = 256  # 4 warps x 64 lanes -> exercises cross-warp LDS visibility
+    x = torch.randint(-(2**20), 2**20, (BLOCK, ), device=device, dtype=torch.int32)
+    out = torch.empty_like(x)
+    compiled = _workgroup_barrier_sum_kernel[(1, )](x, out, BLOCK=BLOCK, num_warps=4)
+    torch.cuda.synchronize()
+    expected = torch.full((BLOCK, ), int(x.sum().item()), device=device, dtype=torch.int32)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    # Lowers to a fenced ttg.barrier bracketed by rocdl.sched.barrier fences.
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count("ttg.barrier") >= 1, f"TTGIR {ttgir}"
+    assert ttgir.count("rocdl.sched.barrier") >= 2, f"TTGIR {ttgir}"
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_cond_barrier(device):
+    BLOCK = 512  # 8 warps -> two 256-lane warp-groups for the cond_barrier phase shift
+    x = torch.randint(-(2**20), 2**20, (BLOCK, ), device=device, dtype=torch.int32)
+    out = torch.empty_like(x)
+    compiled = _cond_barrier_kernel[(1, )](x, out, BLOCK=BLOCK, num_warps=8)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, x, atol=0, rtol=0)
+    # The paired bracket lowers to two amdg.cond_barrier ops.
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count("amdg.cond_barrier") == 2, f"TTGIR {ttgir}"
+
+
+@triton.jit
+def _test_get_fp8_format_name_kernel(
+    output_ptr,
+    DTYPE: tl.constexpr,
+    EXPECTED: tl.constexpr,
+):
+    result: tl.constexpr = tlx.get_fp8_format_name(DTYPE)
+    if result == EXPECTED:
+        tl.store(output_ptr, 1)
+    else:
+        tl.store(output_ptr, 0)
+
+
+@triton.jit
+def _test_get_fp8_format_name_unsupported_kernel(
+    output_ptr,
+    DTYPE: tl.constexpr,
+):
+    result: tl.constexpr = tlx.get_fp8_format_name(DTYPE)
+    tl.store(output_ptr, result == "e5m2")
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_thread_id_gfx950(device):
+
+    @triton.jit
+    def store_from_thread_0_kernel(
+        output_ptr,
+        value,
+        n_elements,
+        axis: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        tid = tlx.thread_id(axis)
+        if tid == 0:
+            tl.store(output_ptr + offsets, value, mask=mask)
+
+    output = torch.zeros(32, dtype=torch.int32, device=device)
+    n_elements = output.numel()
+    value = 42
+    store_from_thread_0_kernel[(1, )](output, value, n_elements, 0, 32, num_warps=1)
+    torch.cuda.synchronize()
+    expected_output = torch.zeros(32, dtype=torch.int32, device=device)
+    expected_output[0] = value
+    torch.testing.assert_close(output, expected_output)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_loop_carry_var_check_gfx950(device):
+
+    @triton.jit
+    def loop_carry_shadow():
+        x = tlx.local_alloc((16, 16), tl.int16, tl.constexpr(2))
+        y = x
+        for _ in range(0, 128):
+            zeros = tl.zeros((16, 16), dtype=tl.int16)
+            # shadow x with different type
+            x = tlx.local_view(y, 0)
+            tlx.local_store(x, zeros)
+
+    grid = lambda meta: (1, 1)
+
+    with pytest.raises(triton.CompilationError) as e:
+        loop_carry_shadow[grid]()
+    list_msg = traceback.format_exception(e.type, e.value, e.tb, chain=True)
+    assert "Please make sure that the type stays consistent" in "\n".join(list_msg)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_size_of_gfx950(device):
+
+    @triton.jit
+    def size_of_kernel(output_ptr):
+        # Test size_of for various dtypes
+        size_fp32 = tlx.size_of(tl.float32)
+        size_fp16 = tlx.size_of(tl.float16)
+        size_int32 = tlx.size_of(tl.int32)
+        size_int8 = tlx.size_of(tl.int8)
+        size_int64 = tlx.size_of(tl.int64)
+
+        # Store results
+        tl.store(output_ptr + 0, size_fp32)
+        tl.store(output_ptr + 1, size_fp16)
+        tl.store(output_ptr + 2, size_int32)
+        tl.store(output_ptr + 3, size_int8)
+        tl.store(output_ptr + 4, size_int64)
+
+    # Expected sizes in bytes
+    expected_sizes = torch.tensor([4, 2, 4, 1, 8], dtype=torch.int32, device=device)
+    output = torch.zeros(5, dtype=torch.int32, device=device)
+
+    grid = lambda meta: (1, )
+    size_of_kernel[grid](output)
+
+    torch.testing.assert_close(output, expected_sizes)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_size_of_constexpr_gfx950(device):
+
+    @triton.jit
+    def size_of_constexpr_kernel(output_ptr, DTYPE: tl.constexpr):
+        # Test size_of with constexpr dtype argument
+        size = tlx.size_of(DTYPE)
+        tl.store(output_ptr, size)
+
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+
+    # Test with float32 (4 bytes)
+    grid = lambda meta: (1, )
+    size_of_constexpr_kernel[grid](output, tl.float32)
+    assert output.item() == 4, f"Expected 4 for float32, got {output.item()}"
+
+    # Test with float16 (2 bytes)
+    size_of_constexpr_kernel[grid](output, tl.float16)
+    assert output.item() == 2, f"Expected 2 for float16, got {output.item()}"
+
+    # Test with int8 (1 byte)
+    size_of_constexpr_kernel[grid](output, tl.int8)
+    assert output.item() == 1, f"Expected 1 for int8, got {output.item()}"
+
+    # Test with int64 (8 bytes)
+    size_of_constexpr_kernel[grid](output, tl.int64)
+    assert output.item() == 8, f"Expected 8 for int64, got {output.item()}"
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "dtype,expected",
+    [
+        (tl.float8e5, "e5m2"),
+        (tl.float8e4nv, "e4m3"),
+    ],
+)
+def test_get_fp8_format_name_gfx950(dtype, expected, device):
+    """Test that FP8 dtypes return correct format strings."""
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+    _test_get_fp8_format_name_kernel[(1, )](output, DTYPE=dtype, EXPECTED=expected)
+    assert output.item() == 1
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        tl.float32,
+        tl.float16,
+        tl.int32,
+    ],
+)
+def test_get_fp8_format_name_unsupported_dtype_raises_error_gfx950(dtype, device):
+    """Test that non-FP8 dtypes raise a CompilationError during compilation."""
+    output = torch.zeros(1, dtype=torch.int32, device=device)
+    with pytest.raises(triton.CompilationError) as exc_info:
+        _test_get_fp8_format_name_unsupported_kernel[(1, )](output, DTYPE=dtype)
+    # Check that the underlying cause mentions the supported types
+    assert "only supports tl.float8e5" in str(exc_info.value.__cause__)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_clock64_gfx950(device):
+
+    @triton.jit
+    def clock64_from_thread_0_kernel(
+        output_ptr,
+        elapsed_ptr,
+        value,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        tid = tlx.thread_id(0)
+        if pid == 0 and tid == 0:
+            start = tlx.clock64()
+            tl.store(output_ptr + offsets, value, mask=mask)
+            end = tlx.clock64()
+            tl.store(elapsed_ptr, end - start)
+
+    output = torch.zeros(32, dtype=torch.int32, device=device)
+    elapsed = torch.zeros(1, dtype=torch.int64, device=device)
+    n_elements = output.numel()
+    value = 42
+    kernel = clock64_from_thread_0_kernel[(1, )](output, elapsed, value, n_elements, 32, num_warps=1)
+    assert kernel.asm["ttgir"].count("ttg.clock64") == 2
+    assert kernel.asm["amdgcn"].count("s_memtime") == 2
+    assert elapsed.item() > 0
+
+
+_PARTIAL_MASK_BLOCK_M = 128
+_PARTIAL_MASK_BLOCK_K = 64
+
+
+@triton.jit
+def _partial_mask_async_load_kernel(
+    a_ptr,
+    out_ptr,
+    VALID_K: tl.constexpr,
+    USE_MASK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs = offs_m[:, None] * BLOCK_K + offs_k[None, :]
+    smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), 1)
+    if USE_MASK:
+        # Ensure masked lanes must be overwritten rather than relying on
+        # freshly allocated shared memory happening to contain zero.
+        poison = tl.full((BLOCK_M, BLOCK_K), 7.0, tlx.dtype_of(a_ptr))
+        tlx.local_store(tlx.local_view(smem, 0), poison)
+        tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0), mask=offs_k[None, :] < VALID_K)
+    else:
+        tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0))
+    tlx.async_load_commit_group([tok])
+    tlx.async_load_wait_group(0)
+    t = tlx.local_load(tlx.local_view(smem, 0))
+    tl.store(out_ptr + offs, t)
+
+
+@triton.jit
+def _partial_mask_sync_load_kernel(
+    a_ptr,
+    out_ptr,
+    VALID_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # The "sync-load the tail" fix: a masked *synchronous* tl.load lowers fine, so a
+    # partial K-tile is handled by tl.load instead of tlx.async_load.
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs = offs_m[:, None] * BLOCK_K + offs_k[None, :]
+    t = tl.load(a_ptr + offs, mask=offs_k[None, :] < VALID_K, other=0.0)
+    tl.store(out_ptr + offs, t)
+
+
+def _partial_mask_a_out(device):
+    a = torch.randn(_PARTIAL_MASK_BLOCK_M, _PARTIAL_MASK_BLOCK_K, device=device, dtype=torch.float16)
+    return a, torch.zeros_like(a)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_async_load_no_mask_ok_gfx950(device):
+    a, out = _partial_mask_a_out(device)
+    _partial_mask_async_load_kernel[(1, )](
+        a,
+        out,
+        VALID_K=_PARTIAL_MASK_BLOCK_K,
+        USE_MASK=False,
+        BLOCK_M=_PARTIAL_MASK_BLOCK_M,
+        BLOCK_K=_PARTIAL_MASK_BLOCK_K,
+        num_warps=4,
+    )
+    torch.testing.assert_close(out, a)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_async_load_all_true_mask_ok_gfx950(device):
+    # mask present but all-true (like an ALIGNED K, where every K-tile is full).
+    a, out = _partial_mask_a_out(device)
+    _partial_mask_async_load_kernel[(1, )](
+        a,
+        out,
+        VALID_K=_PARTIAL_MASK_BLOCK_K,
+        USE_MASK=True,
+        BLOCK_M=_PARTIAL_MASK_BLOCK_M,
+        BLOCK_K=_PARTIAL_MASK_BLOCK_K,
+        num_warps=4,
+    )
+    torch.testing.assert_close(out, a)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_async_load_partial_mask_ok_gfx950(device):
+    a, out = _partial_mask_a_out(device)
+    _partial_mask_async_load_kernel[(1, )](
+        a,
+        out,
+        VALID_K=5,
+        USE_MASK=True,
+        BLOCK_M=_PARTIAL_MASK_BLOCK_M,
+        BLOCK_K=_PARTIAL_MASK_BLOCK_K,
+        num_warps=4,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out[:, :5], a[:, :5])
+    torch.testing.assert_close(out[:, 5:], torch.zeros_like(out[:, 5:]))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_sync_load_partial_mask_fix_ok_gfx950(device):
+    # THE FIX: the same partial mask via a synchronous tl.load compiles and is correct.
+    a, out = _partial_mask_a_out(device)
+    _partial_mask_sync_load_kernel[(1, )](
+        a,
+        out,
+        VALID_K=5,
+        BLOCK_M=_PARTIAL_MASK_BLOCK_M,
+        BLOCK_K=_PARTIAL_MASK_BLOCK_K,
+        num_warps=4,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out[:, :5], a[:, :5])
+
+
+@triton.jit
+def _plain_unaligned_vector_load_kernel(
+    x_ptr,
+    y_ptr,
+    OFFSET: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    values = tl.load(x_ptr + OFFSET + offsets)
+    tl.store(y_ptr + offsets, values)
+
+
+@triton.jit
+def _masked_unaligned_vector_load_kernel(
+    x_ptr,
+    y_ptr,
+    OFFSET: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    VALID_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < VALID_SIZE
+    values = tl.load(x_ptr + OFFSET + offsets, mask=mask, other=0)
+    tl.store(y_ptr + offsets, values)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "dtype,block_size",
+    [
+        (torch.float16, 1024),
+        (torch.float16, 2048),
+        (torch.uint8, 4096),
+    ],
+)
+@pytest.mark.parametrize("offset", [1, 2, 3, 7])
+def test_plain_unaligned_vector_load_correctness_gfx950(device, offset, dtype, block_size):
+    """Exercise several naturally aligned but non-vector-aligned addresses."""
+    x = torch.arange(block_size + 8, device=device, dtype=dtype)
+    actual = torch.empty(block_size, device=device, dtype=dtype)
+    _plain_unaligned_vector_load_kernel[(1, )](
+        x,
+        actual,
+        OFFSET=offset,
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+    torch.testing.assert_close(actual, x[offset:offset + block_size], atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_masked_unaligned_vector_load_correctness_gfx950(device):
+    block_size = 2048
+    valid_size = block_size - 8
+    x = torch.arange(block_size + 1, device=device, dtype=torch.float16)
+    actual = torch.empty(block_size, device=device, dtype=torch.float16)
+    compiled = _masked_unaligned_vector_load_kernel[(1, )](
+        x,
+        actual,
+        OFFSET=1,
+        BLOCK_SIZE=block_size,
+        VALID_SIZE=valid_size,
+        num_warps=4,
+    )
+    expected = torch.zeros_like(actual)
+    expected[:valid_size] = x[1:1 + valid_size]
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+    assert "buffer_load_dwordx4" in compiled.asm["amdgcn"]
+
+
+@triton.jit
+def _amd_packed_dot2_correctness_kernel(
+    lhs_ptr,
+    rhs_ptr,
+    acc_ptr,
+    output_ptr,
+    N: tl.constexpr,
+    INPUT_DTYPE: tl.constexpr,
+):
+    offsets = tl.arange(0, N)
+    lhs = tl.load(lhs_ptr + offsets).to(tl.uint32)
+    rhs = tl.load(rhs_ptr + offsets).to(tl.uint32)
+    acc = tl.load(acc_ptr + offsets)
+    result = tlx.amd_packed_dot2(lhs, rhs, acc, input_dtype=INPUT_DTYPE)
+    tl.store(output_ptr + offsets, result)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("dtype,input_dtype", [(torch.float16, tl.float16), (torch.bfloat16, tl.bfloat16)])
+def test_amd_packed_dot2_correctness_gfx950(device, dtype, input_dtype):
+    lhs = torch.tensor(
+        [[16.0, 1 / 16], [-16.0, 1 / 16], [2.0, -3.0], [0.5, 4.0]],
+        device=device,
+        dtype=dtype,
+    )
+    rhs = torch.tensor(
+        [[1.0, 2.0], [1.0, 2.0], [-4.0, 5.0], [8.0, -0.5]],
+        device=device,
+        dtype=dtype,
+    )
+    acc = torch.tensor([0.25, -0.25, 7.0, -2.0], device=device)
+    output = torch.empty_like(acc)
+    _amd_packed_dot2_correctness_kernel[(1, )](
+        lhs.view(torch.int32),
+        rhs.view(torch.int32),
+        acc,
+        output,
+        N=lhs.shape[0],
+        INPUT_DTYPE=input_dtype,
+        num_warps=1,
+    )
+    expected = (lhs.float() * rhs.float()).sum(dim=1) + acc
+    torch.testing.assert_close(output, expected, atol=0.0, rtol=0.0)
+
+
+@triton.jit
+def _amd_scaled_downcast_fp8_rounding_kernel(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(X + offsets, offsets < N, 0.0)
+    result = tlx.amd_scaled_downcast_fp8(values, 256.0)
+    tl.store(Y + offsets, result, offsets < N)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("block", [128, 256, 512])
+def test_amd_scaled_downcast_fp8_rounding_gfx950(device, block):
+    levels = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+    midpoints = (levels[:-1] + levels[1:]) * (0.5 / 256.0)
+    neighbors = torch.cat((torch.nextafter(midpoints, torch.full_like(midpoints, -float("inf"))), midpoints,
+                           torch.nextafter(midpoints, torch.full_like(midpoints, float("inf")))))
+    # 1.8125 * 256 = 464 is the midpoint above 448 and rounds down to it.
+    positive = torch.cat((levels / 256.0, neighbors, torch.tensor([1.75, 1.8125])))
+    # Values beyond the E4M3 range are not clamped; they convert to NaN.
+    overflow = torch.tensor([2.0, 1.0e30, float("nan")])
+    values = torch.cat((positive, -positive, overflow, -overflow)).to(torch.float32)
+    finite = torch.cat((torch.ones(2 * positive.numel(),
+                                   dtype=torch.bool), torch.zeros(2 * overflow.numel(), dtype=torch.bool)))
+    expected = (values[finite] * 256.0).to(torch.float8_e4m3fn)
+    inputs = values.to(device)
+    actual = torch.empty(values.numel(), device=device, dtype=torch.float8_e4m3fn)
+    _amd_scaled_downcast_fp8_rounding_kernel[(triton.cdiv(values.numel(), block), )](inputs, actual, values.numel(),
+                                                                                     block, num_warps=2)
+    actual = actual.cpu()
+    torch.testing.assert_close(actual.view(torch.uint8)[finite], expected.view(torch.uint8), atol=0, rtol=0)
+    assert torch.isnan(actual.float()[~finite]).all()
+
+
+@triton.jit
+def _amd_scheduled_mfma_column_subtiles_kernel(
+    a_ptr,
+    b_ptr,
+    initial_ptr,
+    partial_output_ptr,
+    full_output_ptr,
+    INITIALIZE: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 16)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 32)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tlx.require_layout(
+        tl.load(b_ptr + reduction[:, None] * 32 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    initial = tlx.require_layout(
+        tl.load(initial_ptr + rows[:, None] * 32 + cols[None, :]),
+        mma,
+        pin=False,
+    )
+
+    b0 = tlx.extract_slice(b, [32, 16], [0, 0])
+    b1 = tlx.extract_slice(b, [32, 16], [0, 16])
+    initial0 = tlx.extract_slice(initial, [16, 16], [0, 0])
+    initial1 = tlx.extract_slice(initial, [16, 16], [0, 16])
+    first = tlx.amd_scheduled_mfma(
+        a,
+        b0,
+        initial0,
+        accumulator_role="persistent",
+        initialize=INITIALIZE,
+    )
+    second = tlx.amd_scheduled_mfma(
+        a,
+        b1,
+        initial1,
+        accumulator_role="persistent",
+        initialize=INITIALIZE,
+    )
+    first, second = tlx.amd_mfma_commit((first, second))
+    partial = tlx.require_layout(tl.cat(first, second, dim=1), mma, pin=False)
+
+    full = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        initial,
+        accumulator_role="persistent",
+        initialize=INITIALIZE,
+    )
+    full = tlx.amd_mfma_commit(full)
+
+    output_offsets = tlx.require_layout(
+        rows[:, None] * 32 + cols[None, :],
+        mma,
+        pin=False,
+    )
+    tl.store(partial_output_ptr + output_offsets, partial)
+    tl.store(full_output_ptr + output_offsets, full)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("initialize", [False, True], ids=["update", "initialize"])
+def test_amd_scheduled_mfma_column_subtiles_correct_gfx950(initialize):
+    torch.manual_seed(0)
+    a = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((32, 32), device="cuda", dtype=torch.bfloat16)
+    initial = torch.randn((16, 32), device="cuda", dtype=torch.float32)
+    partial = torch.empty_like(initial)
+    full = torch.empty_like(initial)
+    _amd_scheduled_mfma_column_subtiles_kernel[(1, )](
+        a,
+        b,
+        initial,
+        partial,
+        full,
+        INITIALIZE=initialize,
+        num_warps=1,
+        matrix_instr_nonkdim=16,
+    )
+    expected = a.float() @ b.float()
+    if not initialize:
+        expected += initial
+    torch.testing.assert_close(partial, expected, atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(partial, full, atol=0.0, rtol=0.0)
+
+
+@triton.jit
+def _amd_scheduled_mfma_single_subtile_kernel(
+    a_ptr,
+    b_ptr,
+    initial_ptr,
+    output_ptr,
+    INITIALIZE: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    rows = tl.arange(0, 32)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 32)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tlx.require_layout(
+        tl.load(b_ptr + reduction[:, None] * 32 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    initial = tlx.require_layout(
+        tl.load(initial_ptr + rows[:, None] * 32 + cols[None, :]),
+        mma,
+        pin=False,
+    )
+    a_subtile = tlx.extract_slice(a, [16, 32], [16, 0])
+    b_subtile = tlx.extract_slice(b, [32, 16], [0, 0])
+    initial_subtile = tlx.extract_slice(initial, [16, 16], [16, 0])
+    result = tlx.amd_scheduled_mfma(
+        a_subtile,
+        b_subtile,
+        initial_subtile,
+        accumulator_role="persistent",
+        initialize=INITIALIZE,
+    )
+    result = tlx.amd_mfma_commit(result)
+    output_offsets = tlx.require_layout(
+        (16 + tl.arange(0, 16))[:, None] * 32 + tl.arange(0, 16)[None, :],
+        mma,
+        pin=False,
+    )
+    tl.store(output_ptr + output_offsets, result)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("initialize", [False, True], ids=["update", "initialize"])
+def test_amd_scheduled_mfma_single_subtile_mapping_gfx950(initialize):
+    torch.manual_seed(17)
+    a = torch.randn((32, 32), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((32, 32), device="cuda", dtype=torch.bfloat16)
+    initial = torch.randn((32, 32), device="cuda", dtype=torch.float32)
+    actual = initial.clone()
+    _amd_scheduled_mfma_single_subtile_kernel[(1, )](
+        a,
+        b,
+        initial,
+        actual,
+        INITIALIZE=initialize,
+        num_warps=1,
+        matrix_instr_nonkdim=16,
+    )
+
+    # Only the explicitly sliced bottom-left tile is updated. The remaining
+    # output tiles retain their original values, including during initialize.
+    expected = initial.clone()
+    selected = a.float()[16:32, :] @ b.float()[:, 0:16]
+    if not initialize:
+        selected += initial[16:32, 0:16]
+    expected[16:32, 0:16] = selected
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+@triton.jit
+def _stoch_round_kernel_gfx950(x_ptr, rbits_ptr, y_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offsets)
+    rbits = tl.load(rbits_ptr + offsets)
+    y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)
+    tl.store(y_ptr + offsets, y)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize(
+    "dst_dtype, expected_inst",
+    [
+        ("float8_e5m2", "v_cvt_sr_bf8_f32"),
+        ("float8_e4m3fn", "v_cvt_sr_fp8_f32"),
+        ("float16", "v_cvt_sr_f16_f32"),
+        ("bfloat16", "v_cvt_sr_bf16_f32"),
+    ],
+)
+def test_stoch_round_gfx950(dst_dtype, expected_inst):
+    dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float8_e5m2": torch.float8_e5m2,
+        "float8_e4m3fn": torch.float8_e4m3fn,
+    }
+    dst_dtype_torch = dtype_map[dst_dtype]
+
+    SIZE = 256
+    a = torch.randn([SIZE], dtype=torch.float32, device="cuda")
+    rbits = ((torch.arange(SIZE, device="cuda", dtype=torch.int64) * 2654435761) % 2**32).to(torch.int32)
+    b = torch.empty([SIZE], dtype=torch.float32, device="cuda").to(dst_dtype_torch)
+    kernel = _stoch_round_kernel_gfx950[(1, )](a, rbits, b, BLOCK_SIZE=SIZE, num_warps=1)
+    assert expected_inst in kernel.asm["amdgcn"]
+
+    a_f32 = a.float()
+    b_back = b.float()
+    assert not torch.isnan(b_back).any(), "Stochastic rounding produced NaN"
+    assert not torch.isinf(b_back).any(), "Stochastic rounding produced Inf"
+
+    exact_mask = b_back == a_f32
+    if exact_mask.any():
+        b_ref = a_f32.to(dst_dtype_torch)
+        assert torch.equal(b[exact_mask], b_ref[exact_mask])
+
+    needs_rounding = ~exact_mask
+    if needs_rounding.any():
+        # Stochastic rounding returns one of the two representable neighbors
+        # of the source, so the error must stay below one ulp of the
+        # destination at the source magnitude.
+        mantissa_bits = {"float8_e5m2": 2, "float8_e4m3fn": 3, "float16": 10, "bfloat16": 7}[dst_dtype]
+        min_step = {
+            "float8_e5m2": 2.0**-16,
+            "float8_e4m3fn": 2.0**-9,
+            "float16": 2.0**-24,
+            "bfloat16": 2.0**-133,
+        }[dst_dtype]
+        exponent = torch.floor(torch.log2(torch.abs(a_f32[needs_rounding]).clamp(min=1e-30)))
+        ulp = torch.ldexp(torch.ones_like(exponent), (exponent - mantissa_bits).to(torch.int32))
+        ulp = torch.maximum(ulp, torch.tensor(min_step, device=ulp.device, dtype=ulp.dtype))
+        diff = torch.abs(b_back[needs_rounding] - a_f32[needs_rounding])
+        assert (diff <= ulp).all(), (f"Stochastic rounding error exceeds one ulp: max diff = {diff.max()}, "
+                                     f"max ulp = {ulp.max()}")

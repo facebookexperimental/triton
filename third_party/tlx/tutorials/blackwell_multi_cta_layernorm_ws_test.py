@@ -67,7 +67,6 @@ import triton.language.extra.tlx as tlx
 from torch._inductor.runtime.triton_compat import libdevice
 from triton._internal_testing import is_blackwell
 
-
 pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100)")
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 NUM_SMS = (torch.cuda.get_device_properties(0).multi_processor_count if torch.cuda.is_available() else 0)
@@ -360,7 +359,6 @@ def _torch_layernorm_impl(x, weight, bias, eps=1e-5):
     return torch.nn.functional.layer_norm(x, (x.shape[-1], ), weight, bias, eps)
 
 
-torch_layernorm = torch.compile(_torch_layernorm_impl)
 @pytest.mark.parametrize("M,N", [(4, 16384), (1152, 16384), (1024, 16384), (1024, 32768)])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_op(M, N, dtype):
@@ -370,7 +368,8 @@ def test_op(M, N, dtype):
     bias = torch.randn(N, device=DEVICE, dtype=dtype)
     eps = 1e-5
 
-    output_torch = torch_layernorm(x, weight, bias, eps)
+    # Keep correctness validation independent of PT2 compiler-cache availability.
+    output_torch = _torch_layernorm_impl(x, weight, bias, eps)
     output_triton, _, _ = multi_cta_layernorm_ws(x, weight, bias, eps)
 
     rtol = atol = 1e-2 if dtype == torch.float16 else 1e-3

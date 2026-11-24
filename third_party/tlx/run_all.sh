@@ -1,8 +1,5 @@
 #!/bin/bash
 
-echo "Hello! (Facebook-only)"
-
-# Build
 ask() {
     retval=""
     while true; do
@@ -15,59 +12,20 @@ ask() {
     done
     echo "$retval"
 }
-if [ "$(ask "Need to build triton in this script? {y|n}")" == "yes" ]; then
-    pip install -e . --no-build-isolation
-fi
 
-# Run LIT
 if [ "$(ask "Run all LITs? {y|n}")" == "yes" ]; then
     echo "Running LITs"
-    pushd build/cmake.linux-x86_64-cpython-3.13/
+    pushd build/cmake.linux-x86_64-cpython-3.13/ || exit 1
     lit test -a
-    popd
+    popd || exit 1
 fi
 
-
-# Run core triton unit tests
-if [ "$(ask "Run core Triton python unit tests? {y|n}")" == "yes" ]; then
-    echo "Running core Triton python unit tests"
-    pytest python/test/unit/language/*.py
-    pytest python/test/unit/runtime/*.py
-    pytest python/test/unit/cuda/*.py
-    pytest python/test/unit/tools/*.py
-    pytest python/test/unit/instrumentation/*.py
-    pytest python/test/unit/*.py
-    pytest python/test/regression/*.py
-    pytest python/test/backend/test_device_backend.py
+if [ "$(ask "Run all TLX core tests (unit + tlx.ops)? {y|n}")" == "yes" ]; then
+    echo "Running TLX core tests"
+    pytest python/test/unit/language/test_tlx_*.py python/test/unit/tlx_ops/
 fi
 
-
-# Run TLX unit tests
-if [ "$(ask "Run all TLX unit tests? {y|n}")" == "yes" ]; then
-    echo "Running TLX Unit Tests"
-    pytest python/test/unit/language/test_tlx_*.py
+if [ "$(ask "Verify correctness of TLX tutorial kernels? {y|n}")" == "yes" ]; then
+    echo "Verifying correctness of TLX tutorial kernels"
+    pytest third_party/tlx/tutorials/testing/test_correctness.py
 fi
-
-echo "Run TLX tutorial kernels (correctness|performance|no)? {c|p|n}"
-read user_choice
-
-case $user_choice in
-    c)
-        echo "Verifying correctness of TLX tutorial kernels"
-        pytest third_party/tlx/tutorials/testing/test_correctness.py
-        ;;
-    p)
-        echo "Measuring performance of TLX tutorial kernels"
-        third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_blackwell_gemm_perf.py
-        third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_blackwell_fa_perf.py
-        third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_blackwell_fa_mxfp8_perf.py
-        third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py
-        third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_hopper_fa_perf.py
-        ;;
-    n)
-        break
-        ;;
-    *)
-        echo "Invalid choice. "
-        ;;
-esac

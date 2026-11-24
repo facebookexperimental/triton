@@ -74,6 +74,274 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// A loop-invariant mask bit guards target-overlapping K/V tiles. Such a tile
+// remains fully masked; a target-free tile takes the peeled causal path. The
+// outer condition is created after physical code partitioning, so it does not
+// duplicate producer partitions or their channels.
+
+#blocked_target = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @peel_scalar_invariant_force_mask
+  // CHECK: ttg.warp_specialize
+  // CHECK: partition0
+  // CHECK: %[[MASKED:.*]] = arith.constant 1 : i32
+  // CHECK: %[[UNMASKED:.*]] = arith.constant 2 : i32
+  // CHECK: scf.if %[[FORCE:.*]]
+  // The force-mask arm keeps a single fully masked loop.
+  // CHECK: scf.for
+  // CHECK: tt.store %{{.*}}, %[[MASKED]]
+  // CHECK: } else {
+  // The target-free arm peels one masked tile and leaves an unmasked loop.
+  // CHECK: %[[HAS_FIRST:.*]] = arith.cmpi slt
+  // CHECK: scf.if %[[HAS_FIRST]]
+  // CHECK: tt.store %{{.*}}, %[[MASKED]]
+  // CHECK: %[[REMAINDER_LB:.*]] = arith.addi
+  // CHECK: scf.for %{{.*}} = %[[REMAINDER_LB]]
+  // CHECK: tt.store %{{.*}}, %[[UNMASKED]]
+  // CHECK: }
+  tt.func public @peel_scalar_invariant_force_mask(
+      %lb: i32, %ub: i32, %force_mask: i1, %out: !tt.ptr<i32>) {
+    ttg.warp_specialize(%lb, %ub, %force_mask, %out) attributes {requestedRegisters = array<i32: -1>, ttg.partition.types = ["computation"]}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%part_lb: i32, %part_ub: i32,
+               %part_force_mask: i1,
+               %part_out: !tt.ptr<i32>) num_warps(4) {
+      %c64 = arith.constant 64 : i32
+      %masked = arith.constant 1 : i32
+      %unmasked = arith.constant 2 : i32
+      %boundary = arith.addi %part_lb, %c64 : i32
+      scf.for %m = %part_lb to %part_ub step %c64 : i32 {
+        %causal_prefix = arith.cmpi slt, %m, %boundary : i32
+        %needs_mask = arith.ori %causal_prefix, %part_force_mask : i1
+        %value = scf.if %needs_mask -> (i32) {
+          scf.yield %masked : i32
+        } else {
+          scf.yield %unmasked : i32
+        }
+        tt.store %part_out, %value : !tt.ptr<i32>
+      }
+      ttg.warp_return
+    } : (i32, i32, i1, !tt.ptr<i32>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// A source-level scalar guard can state the masked-prefix boundary directly
+// when the tensor predicate contains application-specific transforms that the
+// generic causal-mask matcher cannot safely rediscover.  The boundary spans
+// two loop steps here, so both guarded iterations must be peeled.
+
+#blocked_scalar = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @peel_scalar_two_tiles
+  // CHECK: ttg.warp_specialize
+  // CHECK: partition0
+  // CHECK: %[[HAS_FIRST:.*]] = arith.cmpi slt
+  // CHECK: scf.if %[[HAS_FIRST]]
+  // CHECK: tt.store
+  // CHECK: %[[SECOND_IV:.*]] = arith.addi
+  // CHECK: %[[HAS_SECOND:.*]] = arith.cmpi slt, %[[SECOND_IV]], %{{.*}} : i32
+  // CHECK: scf.if %[[HAS_SECOND]]
+  // CHECK: tt.store
+  // CHECK: %[[REMAINDER_LB:.*]] = arith.addi
+  // CHECK: scf.for %{{.*}} = %[[REMAINDER_LB]]
+  // CHECK-NOT: scf.if
+  // CHECK: tt.store
+  // CHECK: }
+  tt.func public @peel_scalar_two_tiles(%lb: i32, %ub: i32,
+                                        %out: !tt.ptr<i32>) {
+    ttg.warp_specialize(%lb, %ub, %out) attributes {requestedRegisters = array<i32: -1>, ttg.partition.types = ["computation"]}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%part_lb: i32, %part_ub: i32,
+               %part_out: !tt.ptr<i32>) num_warps(4) {
+      %c64 = arith.constant 64 : i32
+      %c2 = arith.constant 2 : i32
+      %masked = arith.constant 1 : i32
+      %unmasked = arith.constant 2 : i32
+      %distance = arith.muli %c64, %c2 : i32
+      %boundary = arith.addi %part_lb, %distance : i32
+      scf.for %m = %part_lb to %part_ub step %c64 : i32 {
+        %needs_mask = arith.cmpi slt, %m, %boundary : i32
+        %value = scf.if %needs_mask -> (i32) {
+          scf.yield %masked : i32
+        } else {
+          scf.yield %unmasked : i32
+        }
+        tt.store %part_out, %value : !tt.ptr<i32>
+      }
+      ttg.warp_return
+    } : (i32, i32, !tt.ptr<i32>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// Preserve the original one-iteration scalar match for loops whose step is
+// dynamic. Only generalized K-step and folded-offset matching needs a constant
+// step.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @peel_scalar_dynamic_step
+  // CHECK: ttg.warp_specialize
+  // CHECK: partition0
+  // CHECK: %[[HAS_FIRST:.*]] = arith.cmpi slt
+  // CHECK: scf.if %[[HAS_FIRST]]
+  // CHECK: tt.store
+  // CHECK: %[[REMAINDER_LB:.*]] = arith.addi
+  // CHECK: scf.for %{{.*}} = %[[REMAINDER_LB]] to %{{.*}} step %{{.*}}
+  // CHECK-NOT: scf.if
+  // CHECK: tt.store
+  // CHECK: }
+  tt.func public @peel_scalar_dynamic_step(%lb: i32, %ub: i32, %step: i32,
+                                            %out: !tt.ptr<i32>) {
+    ttg.warp_specialize(%lb, %ub, %step, %out) attributes {requestedRegisters = array<i32: -1>, ttg.partition.types = ["computation"]}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%part_lb: i32, %part_ub: i32, %part_step: i32,
+               %part_out: !tt.ptr<i32>) num_warps(4) {
+      %masked = arith.constant 1 : i32
+      %unmasked = arith.constant 2 : i32
+      %boundary = arith.addi %part_lb, %part_step : i32
+      scf.for %m = %part_lb to %part_ub step %part_step : i32 {
+        %needs_mask = arith.cmpi slt, %m, %boundary : i32
+        %value = scf.if %needs_mask -> (i32) {
+          scf.yield %masked : i32
+        } else {
+          scf.yield %unmasked : i32
+        }
+        tt.store %part_out, %value : !tt.ptr<i32>
+      }
+      ttg.warp_return
+    } : (i32, i32, i32, !tt.ptr<i32>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// When N % step == 1, only ceil((N - 1) / step) iterations need the mask.
+// N=128 and step=127 therefore peel one iteration, not two.
+
+#blocked_exact = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @peel_causal_exact_iteration_count
+  // CHECK: ttg.warp_specialize
+  // CHECK: partition0
+  // CHECK: %[[HAS_FIRST:.*]] = arith.cmpi slt
+  // CHECK: scf.if %[[HAS_FIRST]]
+  // CHECK: arith.select
+  // No optional second peeled iteration may precede the remainder.
+  // CHECK-NOT: scf.if
+  // CHECK: %[[REMAINDER_LB:.*]] = arith.addi
+  // CHECK: scf.for %{{.*}} = %[[REMAINDER_LB]]
+  // CHECK-NOT: arith.select
+  // CHECK: tt.store
+  // CHECK: }
+  tt.func public @peel_causal_exact_iteration_count(%lb: i32, %ub: i32,
+                                                     %out: !tt.ptr<f32>) {
+    ttg.warp_specialize(%lb, %ub, %out) attributes {requestedRegisters = array<i32: -1>, ttg.partition.types = ["computation"]}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%part_lb: i32, %part_ub: i32,
+               %part_out: !tt.ptr<f32>) num_warps(4) {
+      %c127 = arith.constant 127 : i32
+      %range_m = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked_exact>
+      %range_n = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked_exact>
+      %zero_f32 = arith.constant dense<0.000000e+00> : tensor<128xf32, #blocked_exact>
+      %one_f32 = arith.constant dense<1.000000e+00> : tensor<128xf32, #blocked_exact>
+      %ptrs = tt.splat %part_out : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked_exact>
+      scf.for %m = %part_lb to %part_ub step %c127 : i32 {
+        %m_base = tt.splat %m : i32 -> tensor<128xi32, #blocked_exact>
+        %m_offsets = arith.addi %m_base, %range_m : tensor<128xi32, #blocked_exact>
+        %n_base = tt.splat %part_lb : i32 -> tensor<128xi32, #blocked_exact>
+        %n_offsets = arith.addi %n_base, %range_n : tensor<128xi32, #blocked_exact>
+        %causal_mask = arith.cmpi sge, %m_offsets, %n_offsets : tensor<128xi32, #blocked_exact>
+        %masked = arith.select %causal_mask, %one_f32, %zero_f32 : tensor<128xi1, #blocked_exact>, tensor<128xf32, #blocked_exact>
+        tt.store %ptrs, %masked : tensor<128x!tt.ptr<f32>, #blocked_exact>
+      }
+      ttg.warp_return
+    } : (i32, i32, !tt.ptr<f32>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// BLOCK_M can be smaller than BLOCK_N. In that case more than one M tile is
+// partially masked, and all of those prefix iterations must be peeled before
+// the unmasked remainder. This is the production HSTU backward shape:
+// BLOCK_M=64 and BLOCK_N=128.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#m_slice = #ttg.slice<{dim = 0, parent = #blocked}>
+#n_slice = #ttg.slice<{dim = 1, parent = #blocked}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @peel_causal_two_tiles
+  // CHECK: ttg.warp_specialize
+  // CHECK: partition0
+  // The first masked tile is unconditional inside the non-empty-loop guard.
+  // CHECK: scf.if
+  // CHECK: arith.select
+  // The second masked tile is guarded because the dynamic trip count may be 1.
+  // CHECK: %[[SECOND_IV:.*]] = arith.addi
+  // CHECK: %[[HAS_SECOND:.*]] = arith.cmpi slt, %[[SECOND_IV]], %{{.*}} : i32
+  // CHECK: scf.if %[[HAS_SECOND]]
+  // CHECK: arith.select
+  // The remainder starts at lb + 2 * 64 and has no tensor predicate.
+  // CHECK: %[[REMAINDER_LB:.*]] = arith.addi %{{.*}}, %{{.*}} : i32
+  // CHECK: scf.for %{{.*}} = %[[REMAINDER_LB]]
+  // CHECK-NOT: arith.select
+  // CHECK: tt.store
+  // CHECK-NOT: arith.select
+  // CHECK: }
+  tt.func public @peel_causal_two_tiles(%lb: i32, %ub: i32,
+                                        %out: !tt.ptr<f32>) {
+    ttg.warp_specialize(%lb, %ub, %out) attributes {requestedRegisters = array<i32: -1>, ttg.partition.types = ["computation"]}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%part_lb: i32, %part_ub: i32,
+               %part_out: !tt.ptr<f32>) num_warps(4) {
+      %c64 = arith.constant 64 : i32
+      %range_m = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #m_slice>
+      %range_n = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #n_slice>
+      %zero_f32 = arith.constant dense<0.000000e+00> : tensor<128x64xf32, #blocked>
+      %one_f32 = arith.constant dense<1.000000e+00> : tensor<128x64xf32, #blocked>
+      %ptrs = tt.splat %part_out : !tt.ptr<f32> -> tensor<128x64x!tt.ptr<f32>, #blocked>
+      scf.for %m = %part_lb to %part_ub step %c64 : i32 {
+        %m_base = tt.splat %m : i32 -> tensor<64xi32, #m_slice>
+        %m_offsets = arith.addi %m_base, %range_m : tensor<64xi32, #m_slice>
+        %n_base = tt.splat %part_lb : i32 -> tensor<128xi32, #n_slice>
+        %n_offsets = arith.addi %n_base, %range_n : tensor<128xi32, #n_slice>
+        %m_expanded = tt.expand_dims %m_offsets {axis = 0 : i32} : tensor<64xi32, #m_slice> -> tensor<1x64xi32, #blocked>
+        %n_expanded = tt.expand_dims %n_offsets {axis = 1 : i32} : tensor<128xi32, #n_slice> -> tensor<128x1xi32, #blocked>
+        %m_matrix = tt.broadcast %m_expanded : tensor<1x64xi32, #blocked> -> tensor<128x64xi32, #blocked>
+        %n_matrix = tt.broadcast %n_expanded : tensor<128x1xi32, #blocked> -> tensor<128x64xi32, #blocked>
+        %causal_mask = arith.cmpi sge, %m_matrix, %n_matrix : tensor<128x64xi32, #blocked>
+        %masked = arith.select %causal_mask, %one_f32, %zero_f32 : tensor<128x64xi1, #blocked>, tensor<128x64xf32, #blocked>
+        tt.store %ptrs, %masked : tensor<128x64x!tt.ptr<f32>, #blocked>
+      }
+      ttg.warp_return
+    } : (i32, i32, !tt.ptr<f32>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
 // The same causal mask after canonicalization folds the eq/sgt disjunction into
 // a single m >= n comparison.  Peeling must recognize that spelling too, so the
 // pattern does not depend on which passes ran before it.

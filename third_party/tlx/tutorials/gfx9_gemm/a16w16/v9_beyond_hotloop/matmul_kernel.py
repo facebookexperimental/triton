@@ -34,8 +34,7 @@ def _swz_offset_bases(shape, contig_dim):
     contig_bits = int(shape[contig_dim]).bit_length() - 1
     free_bits = int(shape[free_dim]).bit_length() - 1
     contig = [basis(contig_dim, i) for i in range(contig_bits)]
-    free = ([basis(free_dim, i) for i in range(4, free_bits)] +
-            [basis(free_dim, i) for i in range(min(4, free_bits))])
+    free = ([basis(free_dim, i) for i in range(4, free_bits)] + [basis(free_dim, i) for i in range(min(4, free_bits))])
     return contig + free
 
 
@@ -114,10 +113,8 @@ def v9_beyond_hotloop(
     # Pin the padded-shared offset bases instead of relying on layout inference.
     # The explicit row/column bit permutation avoids LDS bank conflicts and keeps
     # the direct-to-LDS buffer loads coalesced for the fixed 256x256x64 tile.
-    a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [(512, 16)], _A_LDS_BASES, [BLOCK_M, BLOCK_K])
-    b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [(512, 16)], _B_LDS_BASES, [BLOCK_K, HALF_N])
+    a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], _A_LDS_BASES, [BLOCK_M, BLOCK_K])
+    b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], _B_LDS_BASES, [BLOCK_K, HALF_N])
     smem_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, 2, layout=a_shared)
     smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
     smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
@@ -161,20 +158,20 @@ def v9_beyond_hotloop(
     # ── Main loop: step 2, four regions per body (identical to v8) ──
     for k in tl.range(0, iterMax - 2, 2, num_stages=1):
         # ──── Region 0 ────
+        tlx.async_load_wait_group(2)
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc_left = tl.dot(a, b_left, acc_left)
         with tlx.warp_pipeline_stage("mem", priority=1):
-            tlx.async_load_wait_group(2)
             b_right = tlx.local_load(smem_b_right[0], relaxed=True)
             tlx.buffer_load_to_local(smem_a[0], a_ptr, a_off + a_k)
             tlx.buffer_load_to_local(smem_b_left[0], b_ptr, bl_off + b_k)
             tlx.async_load_commit_group()
 
         # ──── Region 1 ────
+        tlx.async_load_wait_group(2)
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc_right = tl.dot(a, b_right, acc_right)
         with tlx.warp_pipeline_stage("mem", priority=1):
-            tlx.async_load_wait_group(2)
             a = tlx.local_load(smem_a[1], relaxed=True)
             b_left = tlx.local_load(smem_b_left[1], relaxed=True)
             tlx.buffer_load_to_local(smem_b_right[0], b_ptr, br_off + b_k)
@@ -183,20 +180,20 @@ def v9_beyond_hotloop(
             b_k += BLOCK_K * stride_bk
 
         # ──── Region 2 ────
+        tlx.async_load_wait_group(2)
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc_left = tl.dot(a, b_left, acc_left)
         with tlx.warp_pipeline_stage("mem", priority=1):
-            tlx.async_load_wait_group(2)
             b_right = tlx.local_load(smem_b_right[1], relaxed=True)
             tlx.buffer_load_to_local(smem_a[1], a_ptr, a_off + a_k)
             tlx.buffer_load_to_local(smem_b_left[1], b_ptr, bl_off + b_k)
             tlx.async_load_commit_group()
 
         # ──── Region 3 ────
+        tlx.async_load_wait_group(2)
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc_right = tl.dot(a, b_right, acc_right)
         with tlx.warp_pipeline_stage("mem", priority=1):
-            tlx.async_load_wait_group(2)
             a = tlx.local_load(smem_a[0], relaxed=True)
             b_left = tlx.local_load(smem_b_left[0], relaxed=True)
             tlx.buffer_load_to_local(smem_b_right[1], b_ptr, br_off + b_k)
@@ -251,6 +248,7 @@ def v9_beyond_hotloop(
         mask=(offs_cm[:, None] < M) & (offs_cn_right[None, :] < N),
     )
 
+
 def matmul(a, b):
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
@@ -282,6 +280,5 @@ def matmul(a, b):
         num_warps=8,
         num_stages=1,
         matrix_instr_nonkdim=16,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return c

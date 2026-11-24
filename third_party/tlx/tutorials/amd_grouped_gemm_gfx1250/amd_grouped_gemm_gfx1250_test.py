@@ -1,0 +1,1132 @@
+"""Grouped GEMM kernels for AMD/gfx1250.
+
+The phase-0 baseline accepts fully ragged FP16 A_i @ B_i products with
+row-major inputs and masked tails. The optimized TDM entry points share a
+persistent ragged-M pipeline: grouped_gemm_tdm takes packed tensors, while
+grouped_gemm_tdm_list accepts lists of row-major A and column-major B views.
+Both optimized paths require common N/K. The list path also supports M/N tails.
+
+The shared TDM implementation, the list kernel, and the gfx950-compatible host
+interface live in ``triton.tlx.ops.kernels.grouped_gemm.gfx1250``, which backs
+``tlx.ops.grouped_gemm`` on gfx1250; this module imports them.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import pytest
+import torch
+
+import triton
+import triton.language as tl
+from triton._internal_testing import is_hip_cdna5
+from triton.tlx.ops.kernels.grouped_gemm.gfx1250 import (
+    XCD_REMAP_MODES,
+    grouped_gemm_enable_wmma_queuing,
+    grouped_gemm_tdm_impl,
+    grouped_gemm_tdm_list_kernel,
+    make_grouped_gemm_tdm_list_args,
+    validate_grouped_gemm_cluster_config,
+)
+
+
+def _active_num_cus(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _grouped_gemm_tflops(ms: float, m_list: list[int], n: int, k: int) -> float:
+    total_flops = sum(2 * m * n * k for m in m_list)
+    return total_flops / (ms * 1e-3) / 1e12
+
+
+# Tile-selection weights relative to the 256x256 configuration.
+_GROUPED_GEMM_CONFIGS = (
+    dict(name="256x256-alias", block_m=256, block_n=256, block_k=128, group_m=4, tdm_pipeline_depth=2, c_staging_mode=0,
+         cross_tile_prefetch=False, relative_rate=1.0),
+    dict(name="128x256-dedicated", block_m=128, block_n=256, block_k=128, group_m=4, tdm_pipeline_depth=2,
+         c_staging_mode=1, cross_tile_prefetch=True, relative_rate=0.995),
+    dict(name="256x128-dedicated", block_m=256, block_n=128, block_k=128, group_m=4, tdm_pipeline_depth=2,
+         c_staging_mode=1, cross_tile_prefetch=True, relative_rate=0.98),
+    dict(name="128x128-alias", block_m=128, block_n=128, block_k=128, group_m=4, tdm_pipeline_depth=2, c_staging_mode=0,
+         cross_tile_prefetch=False, relative_rate=0.90),
+)
+
+
+def _rank_grouped_gemm_configs(m_list: list[int], n: int, k: int, num_sms: int, *, allow_mn_tails=False):
+    num_sms = max(1, int(num_sms))
+    useful = sum(m * n * k for m in m_list)
+    ranked = []
+    for seed in _GROUPED_GEMM_CONFIGS:
+        cfg = dict(seed)
+        bm = int(cfg["block_m"])
+        bn = int(cfg["block_n"])
+        bk = int(cfg["block_k"])
+        if k % bk != 0 or (not allow_mn_tails and (n % bn != 0 or any(m % bm != 0 for m in m_list))):
+            continue
+
+        group_tiles = [triton.cdiv(m, bm) * triton.cdiv(n, bn) for m in m_list]
+        total_tiles = sum(group_tiles)
+        if total_tiles == 0:
+            continue
+        launch_programs = min(num_sms, total_tiles)
+        slots = triton.cdiv(total_tiles, num_sms) * num_sms
+        utilization = total_tiles / slots
+        padded = sum(triton.cdiv(m, bm) * bm * triton.cdiv(n, bn) * bn * k for m in m_list)
+        padding_efficiency = useful / padded
+
+        cross_tile_prefetch = bool(cfg["cross_tile_prefetch"])
+        cross_tile_prefetch &= (k // bk) % int(cfg["tdm_pipeline_depth"]) == 0
+        cross_tile_prefetch &= any(tiles > launch_programs for tiles in group_tiles)
+        if cfg["cross_tile_prefetch"] and not cross_tile_prefetch:
+            # The asymmetric weight accounts for cross-tile overlap.
+            cfg["relative_rate"] = float(cfg["relative_rate"]) / 1.02
+        cfg["cross_tile_prefetch"] = cross_tile_prefetch
+
+        score = float(cfg["relative_rate"]) * utilization * padding_efficiency
+        intensity = bm * bn / (bm + bn)
+        ranked.append((score, intensity, utilization, cfg))
+    ranked.sort(key=lambda entry: (entry[0], entry[1], entry[2]), reverse=True)
+    return ranked
+
+
+def _pick_grouped_gemm_config(m_list: list[int], n: int, k: int, num_sms: int, *, allow_mn_tails=False):
+    ranked = _rank_grouped_gemm_configs(m_list, n, k, num_sms, allow_mn_tails=allow_mn_tails)
+    if not ranked:
+        raise ValueError("no validated gfx1250 grouped GEMM config supports these shapes")
+    top_score = ranked[0][0]
+    near_top = [entry for entry in ranked if entry[0] >= 0.9 * top_score]
+    return dict(max(near_top, key=lambda entry: (entry[1], entry[2]))[3])
+
+
+def _remap_program_id_reference(pid: int, num_programs: int, mode: str, num_xcds: int, chunk_size: int) -> int:
+    if mode == "none" or num_xcds == 1:
+        return pid
+    xcd = pid % num_xcds
+    local_pid = pid // num_xcds
+    if mode == "balanced":
+        min_per_xcd = num_programs // num_xcds
+        extra = num_programs % num_xcds
+        return xcd * min_per_xcd + min(xcd, extra) + local_pid
+    aligned = (num_programs // (num_xcds * chunk_size)) * (num_xcds * chunk_size)
+    if pid >= aligned:
+        return pid
+    return ((local_pid // chunk_size) * num_xcds * chunk_size + xcd * chunk_size + (local_pid % chunk_size))
+
+
+@triton.jit
+def grouped_gemm_phase0_kernel(
+    # Device tensors of per-group matrix base pointers.
+    group_a_ptrs,
+    group_b_ptrs,
+    group_c_ptrs,
+    # Flattened [group_size, 3] metadata: [M, N, K] per group.
+    group_gemm_sizes,
+    # Flattened [group_size, 3] metadata: [lda, ldb, ldc] per group.
+    group_lds,
+    group_size,
+    NUM_PROGRAMS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    tile_idx = tl.program_id(0)
+    last_problem_end = 0
+
+    for g in range(group_size):
+        gm = tl.load(group_gemm_sizes + g * 3 + 0)
+        gn = tl.load(group_gemm_sizes + g * 3 + 1)
+        gk = tl.load(group_gemm_sizes + g * 3 + 2)
+
+        num_m_tiles = tl.cdiv(gm, BLOCK_M)
+        num_n_tiles = tl.cdiv(gn, BLOCK_N)
+        num_tiles = num_m_tiles * num_n_tiles
+
+        while tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
+            lda = tl.load(group_lds + g * 3 + 0)
+            ldb = tl.load(group_lds + g * 3 + 1)
+            ldc = tl.load(group_lds + g * 3 + 2)
+
+            a_ptr = tl.load(group_a_ptrs + g).to(tl.pointer_type(tl.float16))
+            b_ptr = tl.load(group_b_ptrs + g).to(tl.pointer_type(tl.float16))
+            c_ptr = tl.load(group_c_ptrs + g).to(tl.pointer_type(tl.float16))
+
+            tile_idx_in_gemm = tile_idx - last_problem_end
+            tile_m_idx = tile_idx_in_gemm // num_n_tiles
+            tile_n_idx = tile_idx_in_gemm % num_n_tiles
+
+            offs_m = tile_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+            offs_n = tile_n_idx * BLOCK_N + tl.arange(0, BLOCK_N)
+            offs_k = tl.arange(0, BLOCK_K)
+
+            a_ptrs = a_ptr + offs_m[:, None] * lda + offs_k[None, :]
+            b_ptrs = b_ptr + offs_k[:, None] * ldb + offs_n[None, :]
+
+            row_mask = offs_m[:, None] < gm
+            col_mask = offs_n[None, :] < gn
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+            for kk in range(0, tl.cdiv(gk, BLOCK_K)):
+                k_remaining = gk - kk * BLOCK_K
+                k_mask = offs_k < k_remaining
+
+                a = tl.load(a_ptrs, mask=row_mask & k_mask[None, :], other=0.0)
+                b = tl.load(b_ptrs, mask=k_mask[:, None] & col_mask, other=0.0)
+                acc += tl.dot(a, b)
+
+                a_ptrs += BLOCK_K
+                b_ptrs += BLOCK_K * ldb
+
+            c = acc.to(tl.float16)
+            c_ptrs = c_ptr + offs_m[:, None] * ldc + offs_n[None, :]
+            tl.store(c_ptrs, c, mask=row_mask & col_mask)
+
+            tile_idx += NUM_PROGRAMS
+
+        last_problem_end += num_tiles
+
+
+def grouped_gemm_phase0(
+    group_a: list[torch.Tensor],
+    group_b: list[torch.Tensor],
+    group_c: Optional[list[torch.Tensor]] = None,
+    *,
+    block_m: int = 64,
+    block_n: int = 64,
+    block_k: int = 64,
+    num_programs: Optional[int] = None,
+) -> list[torch.Tensor]:
+    """Compute a fully ragged group of FP16 row-major GEMMs.
+
+    ``group_a[i]`` has shape ``[M_i, K_i]`` and ``group_b[i]`` has shape
+    ``[K_i, N_i]``.  The returned ``group_c[i]`` has shape ``[M_i, N_i]``.
+    """
+    group_size = len(group_a)
+    assert len(group_b) == group_size
+    if group_c is not None:
+        assert len(group_c) == group_size
+    if group_size == 0:
+        return []
+
+    device = group_a[0].device
+    dtype = group_a[0].dtype
+    assert dtype == torch.float16, "baseline currently supports FP16"
+
+    a_addrs: list[int] = []
+    b_addrs: list[int] = []
+    c_addrs: list[int] = []
+    sizes: list[int] = []
+    lds: list[int] = []
+    out: list[torch.Tensor] = []
+    total_tiles = 0
+
+    for i, (a, b) in enumerate(zip(group_a, group_b)):
+        assert a.device == device and b.device == device, "all inputs must be on the same device"
+        assert a.dtype == dtype and b.dtype == dtype, "all inputs must have the same dtype"
+        assert a.dim() == 2 and b.dim() == 2
+        assert a.shape[1] == b.shape[0], f"K mismatch in group {i}: {tuple(a.shape)} x {tuple(b.shape)}"
+        assert a.stride(1) == 1 and b.stride(1) == 1, "A and B must have inner stride 1"
+
+        m, k = a.shape
+        _, n = b.shape
+        c = group_c[i] if group_c is not None else torch.empty((m, n), device=device, dtype=dtype)
+        assert c.device == device and c.dtype == dtype
+        assert c.shape == (m, n)
+        assert c.stride(1) == 1, "C must have inner stride 1"
+
+        a_addrs.append(a.data_ptr())
+        b_addrs.append(b.data_ptr())
+        c_addrs.append(c.data_ptr())
+        sizes += [m, n, k]
+        lds += [a.stride(0), b.stride(0), c.stride(0)]
+        out.append(c)
+        total_tiles += triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
+
+    if total_tiles == 0:
+        return out
+
+    if num_programs is None:
+        num_programs = _active_num_cus(device)
+    num_programs = max(1, min(int(num_programs), total_tiles))
+
+    d_a_ptrs = torch.tensor(a_addrs, device=device, dtype=torch.int64)
+    d_b_ptrs = torch.tensor(b_addrs, device=device, dtype=torch.int64)
+    d_c_ptrs = torch.tensor(c_addrs, device=device, dtype=torch.int64)
+    d_sizes = torch.tensor(sizes, device=device, dtype=torch.int32)
+    d_lds = torch.tensor(lds, device=device, dtype=torch.int32)
+
+    grouped_gemm_phase0_kernel[(num_programs, )](
+        d_a_ptrs,
+        d_b_ptrs,
+        d_c_ptrs,
+        d_sizes,
+        d_lds,
+        group_size,
+        NUM_PROGRAMS=num_programs,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    return out
+
+    # At kernel exit, rely on s_endpgm to drain the final async TDM
+    # local-to-global store. Keep the explicit wait here as a marker in case
+    # target semantics require restoring it.
+    # tlx.async_amd_descriptor_wait(0)
+
+
+@triton.jit
+def grouped_gemm_tdm_kernel(
+    a_packed,
+    b_t,
+    c_packed,
+    group_offsets,
+    group_size,
+    N,
+    stride_am,
+    stride_bg,
+    stride_bn,
+    stride_cm,
+    K: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,
+    L2_PREFETCH_DISTANCE: tl.constexpr,
+    C_STAGING_MODE: tl.constexpr,
+    CROSS_TILE_PREFETCH: tl.constexpr,
+    XCD_REMAP_MODE: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    XCD_CHUNK: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr = 1,
+    CLUSTER_MULTICAST: tl.constexpr = True,
+):
+    """Original packed entry point; the pointer-table path is compiled out."""
+    grouped_gemm_tdm_impl(
+        a_packed,
+        b_t,
+        c_packed,
+        group_offsets,
+        group_size,
+        N,
+        stride_am,
+        stride_bg,
+        stride_bn,
+        stride_cm,
+        K,
+        NUM_PROGRAMS,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        GROUP_M,
+        NUM_BUFFERS,
+        L2_PREFETCH_DISTANCE,
+        C_STAGING_MODE,
+        CROSS_TILE_PREFETCH,
+        XCD_REMAP_MODE,
+        NUM_XCDS,
+        XCD_CHUNK,
+        CLUSTER_SIZE,
+        CLUSTER_MULTICAST,
+        POINTER_TABLES=False,
+    )
+
+
+def grouped_gemm_tdm(
+    a_packed: torch.Tensor,
+    b_t: torch.Tensor,
+    group_offsets: torch.Tensor,
+    c_packed: Optional[torch.Tensor] = None,
+    *,
+    block_m: int = 128,
+    block_n: int = 128,
+    block_k: int = 128,
+    group_m: int = 4,
+    tdm_pipeline_depth: int = 2,
+    l2_prefetch_distance: int = 0,
+    num_programs: Optional[int] = None,
+    benchmark: Optional[str] = None,
+    benchmark_num_iters: int = 32,
+    c_staging_mode: int = 0,
+    cross_tile_prefetch: bool = False,
+    auto_config: bool = False,
+    xcd_remap_mode: str = "none",
+    num_xcds: int = 8,
+    xcd_chunk: int = 2,
+    cluster_size: int = 1,
+    cluster_multicast: bool = True,
+) -> torch.Tensor:
+    """Compute packed ragged-M grouped GEMM with gfx1250 TDM.
+
+    ``a_packed`` is ``[sum(M_g), K]`` and ``b_t`` is ``[G, N, K]``.  The
+    current TDM path is full-tile only: every ``M_g`` must be divisible by
+    ``block_m``, and ``N``/``K`` must be divisible by ``block_n``/``block_k``.
+    The default 128x128x128 shape follows the larger f16 gfx1250 GEMM tile
+    family and exposes enough static WMMAs to make scheduler gaps visible.
+    ``tdm_pipeline_depth`` maps to the TDM LDS ring-buffer depth; the f16 and
+    MXFP gfx1250 kernels use the same 2/3/4-buffer tuning space.
+    ``cross_tile_prefetch`` recycles the final two K-loop slots for the next
+    tile. With ``c_staging_mode=0``, the 256x256 hybrid prefetches within a
+    group and pipelines TDM output stores through two small dedicated slots.
+    With dedicated C staging, the square schedule also prefetches across
+    groups; smaller tiles use dedicated LDS for C within each group.
+    ``auto_config`` scores the validated tile seeds using saturated rate, CU
+    utilization, and padding efficiency.
+    ``cluster_size=2|4`` groups independent workgroups for TDM multicast.
+    Pairs share B; four workgroups share A and B across a two-by-two tile
+    region. ``cluster_multicast=False`` keeps the same cluster synchronization
+    while each workgroup loads its own inputs.
+    """
+    assert a_packed.dtype == torch.float16 and b_t.dtype == torch.float16
+    assert a_packed.device == b_t.device == group_offsets.device
+    assert a_packed.dim() == 2 and b_t.dim() == 3
+    assert a_packed.stride(1) == 1 and b_t.stride(2) == 1
+    assert group_offsets.dtype == torch.int32
+    assert xcd_remap_mode in XCD_REMAP_MODES
+    assert num_xcds >= 1 and xcd_chunk >= 1
+    if cluster_size not in (1, 2, 4):
+        raise ValueError("cluster_size must be 1, 2, or 4")
+
+    group_size, n, k = b_t.shape
+    total_m, a_k = a_packed.shape
+    assert a_k == k
+    assert group_offsets.numel() == group_size + 1
+
+    offsets_host = group_offsets.detach().cpu().tolist()
+    assert offsets_host[0] == 0 and offsets_host[-1] == total_m
+    m_list = [end - start for start, end in zip(offsets_host, offsets_host[1:])]
+
+    model_sms = max(1, int(num_programs)) if num_programs is not None else _active_num_cus(a_packed.device)
+    if auto_config:
+        selected = _pick_grouped_gemm_config(m_list, n, k, model_sms)
+        block_m = int(selected["block_m"])
+        block_n = int(selected["block_n"])
+        block_k = int(selected["block_k"])
+        group_m = int(selected["group_m"])
+        tdm_pipeline_depth = int(selected["tdm_pipeline_depth"])
+        c_staging_mode = int(selected["c_staging_mode"])
+        cross_tile_prefetch = bool(selected["cross_tile_prefetch"])
+
+    assert block_k == 128, "first TDM schedule requires BLOCK_K=128"
+    assert tdm_pipeline_depth in (2, 3, 4), "tdm_pipeline_depth must be 2, 3, or 4"
+    assert c_staging_mode in (0, 1)
+    assert (not cross_tile_prefetch or c_staging_mode == 1
+            or (block_m == 256 and block_n == 256)), "alias-C cross-tile prefetch requires a 256x256 tile"
+    assert (not cross_tile_prefetch or tdm_pipeline_depth == 2), "cross_tile_prefetch currently requires depth 2"
+    assert n % block_n == 0 and k % block_k == 0
+    assert k // block_k >= tdm_pipeline_depth
+    assert (not cross_tile_prefetch or (k // block_k) % tdm_pipeline_depth
+            == 0), "cross_tile_prefetch requires an even number of K blocks so K0 maps back to ring slot 0"
+
+    total_tiles = 0
+    for i, m in enumerate(m_list):
+        assert m >= 0, "group_offsets must be monotonically increasing"
+        assert m % block_m == 0, f"group {i} M={m} must be divisible by block_m={block_m}"
+        total_tiles += (m // block_m) * (n // block_n)
+
+    if c_packed is None:
+        c_packed = torch.empty((total_m, n), device=a_packed.device, dtype=a_packed.dtype)
+    assert c_packed.device == a_packed.device and c_packed.dtype == a_packed.dtype
+    assert c_packed.shape == (total_m, n)
+    assert c_packed.stride(1) == 1
+
+    if total_tiles == 0:
+        return c_packed
+
+    if num_programs is None:
+        num_programs = _active_num_cus(a_packed.device)
+    num_programs = max(1, min(int(num_programs), total_tiles))
+
+    if cluster_size > 1:
+        validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=block_m, block_n=block_n, block_k=block_k,
+                                             group_m=group_m, tdm_pipeline_depth=tdm_pipeline_depth,
+                                             l2_prefetch_distance=l2_prefetch_distance, c_staging_mode=c_staging_mode,
+                                             cross_tile_prefetch=cross_tile_prefetch, auto_config=auto_config,
+                                             xcd_remap_mode=xcd_remap_mode, num_xcds=num_xcds, xcd_chunk=xcd_chunk)
+
+    # The group count is known from B's shape. Specializing the square
+    # cross-tile schedule removes unused boundary-refill state for small groups.
+    kernel_group_size = (tl.constexpr(group_size)
+                         if cross_tile_prefetch and block_m == 256 and block_n == 256 else group_size)
+
+    def run_kernel():
+        return grouped_gemm_tdm_kernel[(num_programs, )](
+            a_packed,
+            b_t,
+            c_packed,
+            group_offsets,
+            kernel_group_size,
+            n,
+            a_packed.stride(0),
+            b_t.stride(0),
+            b_t.stride(1),
+            c_packed.stride(0),
+            K=k,
+            NUM_PROGRAMS=num_programs,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            GROUP_M=group_m,
+            NUM_BUFFERS=tdm_pipeline_depth,
+            L2_PREFETCH_DISTANCE=l2_prefetch_distance,
+            C_STAGING_MODE=c_staging_mode,
+            CROSS_TILE_PREFETCH=cross_tile_prefetch,
+            XCD_REMAP_MODE=XCD_REMAP_MODES[xcd_remap_mode],
+            NUM_XCDS=num_xcds,
+            XCD_CHUNK=xcd_chunk,
+            CLUSTER_SIZE=cluster_size,
+            CLUSTER_MULTICAST=cluster_multicast,
+            num_warps=4,
+            waves_per_eu=1,
+            enable_wmma_queuing=grouped_gemm_enable_wmma_queuing(block_m, block_n, tdm_pipeline_depth, c_staging_mode,
+                                                                 cross_tile_prefetch),
+            ctas_per_cga=(cluster_size, 1, 1),
+        )
+
+    if benchmark == "graph":
+        ms = triton.testing.do_bench_cudagraph(run_kernel, rep=benchmark_num_iters)
+        print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
+    elif benchmark == "eager":
+        ms = triton.testing.do_bench(run_kernel, warmup=30, rep=benchmark_num_iters)
+        print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
+    else:
+        run_kernel()
+    return c_packed
+
+
+def grouped_gemm_tdm_list(
+    group_a: list[torch.Tensor],
+    group_b: list[torch.Tensor],
+    group_c: Optional[list[torch.Tensor]] = None,
+    *,
+    block_m: int = 128,
+    block_n: int = 128,
+    block_k: int = 128,
+    group_m: int = 4,
+    tdm_pipeline_depth: int = 2,
+    l2_prefetch_distance: int = 0,
+    num_programs: Optional[int] = None,
+    benchmark: Optional[str] = None,
+    benchmark_num_iters: int = 32,
+    c_staging_mode: int = 0,
+    cross_tile_prefetch: bool = False,
+    auto_config: bool = False,
+    xcd_remap_mode: str = "none",
+    num_xcds: int = 8,
+    xcd_chunk: int = 2,
+    cluster_size: int = 1,
+    cluster_multicast: bool = True,
+) -> list[torch.Tensor]:
+    """Compute FP16 A[g] @ B[g] using the optimized TDM list kernel.
+
+    A[g] is row-major [M_g, K] and B[g] is a column-major [K, N] view.
+    N and K must be shared by all groups. Matrices can have independent
+    allocations; only their pointers and gfx950-style size/stride tables are
+    copied to device. Call grouped_gemm_tdm_list_kernel directly to reuse
+    already-prepared device tables and outputs without allocating metadata.
+    M/N may be smaller than a tile or have tails; K must still cover full
+    tiles and fill the pipeline. Tails require cluster_size=1. Aligned shapes
+    automatically use the full-tile specialization. Tile sizes are unchanged.
+    Benchmarking measures the kernel launch after metadata and output setup.
+    """
+    args = make_grouped_gemm_tdm_list_args(group_a, group_b, group_c)
+    a_ptrs, b_ptrs, c_ptrs, group_sizes, group_lds, outputs, m_list, n, k = args
+    device = group_a[0].device
+    model_sms = max(1, int(num_programs)) if num_programs is not None else _active_num_cus(device)
+    if auto_config:
+        selected = _pick_grouped_gemm_config(m_list, n, k, model_sms, allow_mn_tails=True)
+        block_m, block_n, block_k = (int(selected[key]) for key in ("block_m", "block_n", "block_k"))
+        group_m = int(selected["group_m"])
+        tdm_pipeline_depth = int(selected["tdm_pipeline_depth"])
+        c_staging_mode = int(selected["c_staging_mode"])
+        cross_tile_prefetch = bool(selected["cross_tile_prefetch"])
+
+    if block_m <= 0 or block_n <= 0 or block_k != 128 or group_m <= 0:
+        raise ValueError("TDM requires positive M/N tile sizes and group_m, and block_k=128")
+    if tdm_pipeline_depth not in (2, 3, 4) or c_staging_mode not in (0, 1):
+        raise ValueError("TDM requires pipeline depth 2/3/4 and c_staging_mode 0/1")
+    if k % block_k:
+        raise ValueError("TDM requires full K tiles: K must be divisible by block_k")
+    allow_mn_tails = bool(n % block_n or any(m % block_m for m in m_list))
+    if k // block_k < tdm_pipeline_depth:
+        raise ValueError("K must contain enough blocks to fill the TDM pipeline")
+    if cross_tile_prefetch:
+        if tdm_pipeline_depth != 2 or (k // block_k) % 2:
+            raise ValueError("cross-tile prefetch requires depth 2 and an even number of K blocks")
+        if c_staging_mode == 0 and (block_m, block_n) != (256, 256):
+            raise ValueError("alias-C cross-tile prefetch requires a 256x256 tile")
+    if xcd_remap_mode not in XCD_REMAP_MODES or num_xcds < 1 or xcd_chunk < 1:
+        raise ValueError("invalid XCD remapping configuration")
+    if cluster_size not in (1, 2, 4):
+        raise ValueError("cluster_size must be 1, 2, or 4")
+    if allow_mn_tails and cluster_size != 1:
+        raise ValueError("M/N tails require cluster_size=1")
+    total_tiles = sum(triton.cdiv(m, block_m) * triton.cdiv(n, block_n) for m in m_list)
+    if total_tiles == 0:
+        return outputs
+    num_programs = max(1, min(model_sms, total_tiles))
+    if cluster_size > 1:
+        validate_grouped_gemm_cluster_config(m_list, n, num_programs, block_m=block_m, block_n=block_n, block_k=block_k,
+                                             group_m=group_m, tdm_pipeline_depth=tdm_pipeline_depth,
+                                             l2_prefetch_distance=l2_prefetch_distance, c_staging_mode=c_staging_mode,
+                                             cross_tile_prefetch=cross_tile_prefetch, auto_config=auto_config,
+                                             xcd_remap_mode=xcd_remap_mode, num_xcds=num_xcds, xcd_chunk=xcd_chunk)
+    group_size = len(group_a)
+    kernel_group_size = (tl.constexpr(group_size)
+                         if cross_tile_prefetch and block_m == 256 and block_n == 256 else group_size)
+
+    def run_kernel():
+        return grouped_gemm_tdm_list_kernel[(num_programs, )](
+            a_ptrs,
+            b_ptrs,
+            c_ptrs,
+            group_sizes,
+            group_lds,
+            kernel_group_size,
+            K=k,
+            NUM_PROGRAMS=num_programs,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            GROUP_M=group_m,
+            NUM_BUFFERS=tdm_pipeline_depth,
+            L2_PREFETCH_DISTANCE=l2_prefetch_distance,
+            C_STAGING_MODE=c_staging_mode,
+            CROSS_TILE_PREFETCH=cross_tile_prefetch,
+            XCD_REMAP_MODE=XCD_REMAP_MODES[xcd_remap_mode],
+            NUM_XCDS=num_xcds,
+            XCD_CHUNK=xcd_chunk,
+            CLUSTER_SIZE=cluster_size,
+            CLUSTER_MULTICAST=cluster_multicast,
+            ALLOW_MN_TAILS=allow_mn_tails,
+            num_warps=4,
+            waves_per_eu=1,
+            enable_wmma_queuing=grouped_gemm_enable_wmma_queuing(block_m, block_n, tdm_pipeline_depth, c_staging_mode,
+                                                                 cross_tile_prefetch),
+            ctas_per_cga=(cluster_size, 1, 1),
+        )
+
+    with torch.cuda.device(device):
+        if benchmark == "graph":
+            ms = triton.testing.do_bench_cudagraph(run_kernel, rep=benchmark_num_iters)
+            print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
+        elif benchmark == "eager":
+            ms = triton.testing.do_bench(run_kernel, warmup=30, rep=benchmark_num_iters)
+            print(f"execution time: {ms} ms, {_grouped_gemm_tflops(ms, m_list, n, k):.2f} TFLOPS")
+        else:
+            run_kernel()
+    return outputs
+
+
+def _make_groups(shapes: list[tuple[int, int, int]], device: torch.device):
+    group_a = []
+    group_b = []
+    for m, n, k in shapes:
+        group_a.append(torch.randn((m, k), device=device, dtype=torch.float16))
+        group_b.append(torch.randn((k, n), device=device, dtype=torch.float16))
+    return group_a, group_b
+
+
+def _make_packed_ragged_m(m_list: list[int], n: int, k: int, device: torch.device):
+    group_a = [torch.randn((m, k), device=device, dtype=torch.float16) for m in m_list]
+    b_t = torch.randn((len(m_list), n, k), device=device, dtype=torch.float16)
+    a_packed = torch.cat(group_a, dim=0).contiguous()
+    group_offsets = torch.tensor([0] + list(torch.tensor(m_list).cumsum(0).tolist()), device=device, dtype=torch.int32)
+    return a_packed, b_t, group_offsets, group_a
+
+
+def _grouped_gemm_tdm_compile_signature() -> dict[str, str]:
+    return {
+        "a_packed": "*fp16",
+        "b_t": "*fp16",
+        "c_packed": "*fp16",
+        "group_offsets": "*i32",
+        "group_size": "i32",
+        "N": "i32",
+        "stride_am": "i32",
+        "stride_bg": "i32",
+        "stride_bn": "i32",
+        "stride_cm": "i32",
+    }
+
+
+def _grouped_gemm_tdm_compile_attrs() -> dict[tuple[int, ...], list[list[int | str]]]:
+    # Match runtime specialization for this packed contiguous benchmark shape:
+    # D+S for pointers and D for aligned integer shape/stride arguments.
+    names = grouped_gemm_tdm_kernel.arg_names
+    attrs: dict[tuple[int, ...], list[list[int | str]]] = {}
+    for name in ("a_packed", "b_t", "c_packed", "group_offsets"):
+        attrs[(names.index(name), )] = [["tt.divisibility", 16], ["tt.pointer_range", 32]]
+    for name in ("N", "stride_am", "stride_bg", "stride_bn", "stride_cm"):
+        attrs[(names.index(name), )] = [["tt.divisibility", 16]]
+    return attrs
+
+
+def _grouped_gemm_tdm_list_compile_signature() -> dict[str, str]:
+    return {
+        "group_a_ptrs": "*i64",
+        "group_b_ptrs": "*i64",
+        "group_c_ptrs": "*i64",
+        "group_gemm_sizes": "*i32",
+        "g_lds": "*i32",
+        "group_size": "i32",
+    }
+
+
+def _grouped_gemm_tdm_list_compile_attrs() -> dict[tuple[int, ...], list[list[int | str]]]:
+    names = grouped_gemm_tdm_list_kernel.arg_names
+    attrs = {(names.index(name), ): [["tt.divisibility", 16], ["tt.pointer_range", 32]]
+             for name in ("group_a_ptrs", "group_b_ptrs", "group_c_ptrs", "group_gemm_sizes", "g_lds")}
+    return attrs
+
+
+@pytest.mark.parametrize("mode", ["none", "balanced", "chunked"])
+@pytest.mark.parametrize("num_programs", [4, 10, 32, 37])
+def test_grouped_gemm_xcd_remap_is_permutation(mode, num_programs):
+    mapped = [
+        _remap_program_id_reference(pid, num_programs, mode, num_xcds=8, chunk_size=2) for pid in range(num_programs)
+    ]
+    assert sorted(mapped) == list(range(num_programs))
+
+
+def test_grouped_gemm_cost_model_selects_large_saturated_tile():
+    cfg = _pick_grouped_gemm_config([4096] * 16, n=4096, k=4096, num_sms=256)
+    assert (cfg["block_m"], cfg["block_n"]) == (256, 256)
+
+
+def test_grouped_gemm_cost_model_selects_small_m_tile():
+    cfg = _pick_grouped_gemm_config([128] * 16, n=4096, k=4096, num_sms=256)
+    assert (cfg["block_m"], cfg["block_n"]) == (128, 256)
+
+
+@pytest.mark.parametrize("BLOCK_SIZE,TDM_PIPELINE_DEPTH", [(128, 2), (128, 3), (128, 4), (256, 2)])
+def test_grouped_gemm_tdm_compiles_gfx1250(BLOCK_SIZE, TDM_PIPELINE_DEPTH):
+    """The packed ragged-M path should lower to gfx1250 TDM ops."""
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler.compiler import ASTSource, compile as triton_compile
+
+    src = ASTSource(
+        fn=grouped_gemm_tdm_kernel,
+        signature=_grouped_gemm_tdm_compile_signature(),
+        constexprs={
+            "NUM_PROGRAMS": 8,
+            "BLOCK_M": BLOCK_SIZE,
+            "CLUSTER_SIZE": 1,
+            "CLUSTER_MULTICAST": False,
+            "BLOCK_N": BLOCK_SIZE,
+            "BLOCK_K": 128,
+            "GROUP_M": 4,
+            "NUM_BUFFERS": TDM_PIPELINE_DEPTH,
+            "L2_PREFETCH_DISTANCE": 0,
+            "C_STAGING_MODE": 0,
+            "CROSS_TILE_PREFETCH": False,
+            "XCD_REMAP_MODE": 0,
+            "NUM_XCDS": 8,
+            "XCD_CHUNK": 2,
+            "K": 2048,
+        },
+        attrs=_grouped_gemm_tdm_compile_attrs(),
+    )
+    compiled = triton_compile(
+        src, target=GPUTarget("hip", "gfx1250", 32), options=dict(
+            num_warps=4, enable_wmma_queuing=grouped_gemm_enable_wmma_queuing(BLOCK_SIZE, BLOCK_SIZE,
+                                                                              TDM_PIPELINE_DEPTH, 0, False)))
+
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert ("amdg.async_tdm_wait" in ttgir) or ("amdg.async_tdm_intrinsic_wait" in ttgir)
+    assert "tt.dot" in ttgir
+
+    amdgcn = compiled.asm["amdgcn"]
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn
+    assert amdgcn.count("v_wmma_f32_16x16x32_f16") >= 64
+
+
+def test_grouped_gemm_tdm_asymmetric_alias_compiles_gfx1250():
+    """Asymmetric C tiles should pick a legal reuse buffer for local aliasing."""
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler.compiler import ASTSource, compile as triton_compile
+
+    src = ASTSource(
+        fn=grouped_gemm_tdm_kernel,
+        signature=_grouped_gemm_tdm_compile_signature(),
+        constexprs={
+            "NUM_PROGRAMS": 8,
+            "BLOCK_M": 128,
+            "CLUSTER_SIZE": 1,
+            "CLUSTER_MULTICAST": False,
+            "BLOCK_N": 256,
+            "BLOCK_K": 128,
+            "GROUP_M": 4,
+            "NUM_BUFFERS": 3,
+            "L2_PREFETCH_DISTANCE": 0,
+            "C_STAGING_MODE": 0,
+            "CROSS_TILE_PREFETCH": False,
+            "XCD_REMAP_MODE": 0,
+            "NUM_XCDS": 8,
+            "XCD_CHUNK": 2,
+            "K": 2048,
+        },
+        attrs=_grouped_gemm_tdm_compile_attrs(),
+    )
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options={"num_warps": 4})
+
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "tt.dot" in ttgir
+
+
+@pytest.mark.parametrize("BLOCK_M,BLOCK_N", [(128, 256), (256, 128)])
+def test_grouped_gemm_tdm_asymmetric_dedicated_c_compiles_gfx1250(BLOCK_M, BLOCK_N):
+    """Asymmetric depth-2 tiles should fit a full C buffer without aliasing A."""
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler.compiler import ASTSource, compile as triton_compile
+
+    src = ASTSource(
+        fn=grouped_gemm_tdm_kernel,
+        signature=_grouped_gemm_tdm_compile_signature(),
+        constexprs={
+            "NUM_PROGRAMS": 4,
+            "BLOCK_M": BLOCK_M,
+            "CLUSTER_SIZE": 1,
+            "CLUSTER_MULTICAST": False,
+            "BLOCK_N": BLOCK_N,
+            "BLOCK_K": 128,
+            "GROUP_M": 4,
+            "NUM_BUFFERS": 2,
+            "L2_PREFETCH_DISTANCE": 0,
+            "C_STAGING_MODE": 1,
+            "CROSS_TILE_PREFETCH": False,
+            "XCD_REMAP_MODE": 0,
+            "NUM_XCDS": 8,
+            "XCD_CHUNK": 2,
+            "K": 2048,
+        },
+        attrs=_grouped_gemm_tdm_compile_attrs(),
+    )
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32), options={"num_warps": 4})
+
+    assert compiled.metadata.shared < 320 * 1024
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "tt.dot" in ttgir
+
+
+@pytest.mark.parametrize("XCD_REMAP_MODE", [0, 1, 2])
+@pytest.mark.parametrize("BLOCK_M,C_STAGING_MODE", [(128, 1), (256, 1), (256, 0)])
+@pytest.mark.parametrize("L2_PREFETCH_DISTANCE", [0, 2])
+def test_grouped_gemm_tdm_cross_tile_prefetch_compiles_gfx1250(XCD_REMAP_MODE, BLOCK_M, C_STAGING_MODE,
+                                                               L2_PREFETCH_DISTANCE):
+    """The peeled depth-2 tail should retain the next-tile TDM load path."""
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler.compiler import ASTSource, compile as triton_compile
+
+    src = ASTSource(
+        fn=grouped_gemm_tdm_kernel,
+        signature=_grouped_gemm_tdm_compile_signature(),
+        constexprs={
+            "NUM_PROGRAMS": 32,
+            "BLOCK_M": BLOCK_M,
+            "CLUSTER_SIZE": 1,
+            "CLUSTER_MULTICAST": False,
+            "BLOCK_N": 256,
+            "BLOCK_K": 128,
+            "GROUP_M": 4,
+            "NUM_BUFFERS": 2,
+            "L2_PREFETCH_DISTANCE": L2_PREFETCH_DISTANCE,
+            "C_STAGING_MODE": C_STAGING_MODE,
+            "CROSS_TILE_PREFETCH": True,
+            "XCD_REMAP_MODE": XCD_REMAP_MODE,
+            "NUM_XCDS": 8,
+            "XCD_CHUNK": 2,
+            "K": 2048,
+            **({"group_size": 4} if BLOCK_M == 256 else {}),
+        },
+        attrs=_grouped_gemm_tdm_compile_attrs(),
+    )
+    compiled = triton_compile(
+        src, target=GPUTarget("hip", "gfx1250", 32),
+        options=dict(num_warps=4,
+                     enable_wmma_queuing=grouped_gemm_enable_wmma_queuing(BLOCK_M, 256, 2, C_STAGING_MODE, True)))
+
+    assert compiled.metadata.shared < 320 * 1024
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count("amdg.async_tdm_fused_copy_global_to_local") >= 4
+    assert "tt.dot" in ttgir
+
+    amdgcn = compiled.asm["amdgcn"]
+    assert amdgcn.count("tensor_load_to_lds") >= 4
+    if BLOCK_M == 256:
+        if C_STAGING_MODE == 0:
+            # The hybrid pipelines eight row chunks through two small slots.
+            assert amdgcn.count("tensor_store_from_lds") == 8
+            assert "buffer_store_b128" not in amdgcn
+            assert "global_store_b128" not in amdgcn
+        else:
+            # The cross-group schedule retains direct stores; a full
+            # dedicated C tile would exceed the LDS budget at this size.
+            assert "buffer_store_b128" in amdgcn
+            assert "tensor_store_from_lds" not in amdgcn
+    else:
+        assert "amdg.async_tdm_copy_local_to_global" in ttgir
+        assert "tensor_store_from_lds" in amdgcn
+        last_dot = ttgir.rfind("tt.dot")
+        late_barrier = ttgir.find("rocdl.sched.barrier", last_dot)
+        # SSA names depend on whether line information is enabled.
+        late_c_desc = ttgir.find("amdg.update_tensor_descriptor", late_barrier)
+        closing_barrier = ttgir.find("rocdl.sched.barrier", late_c_desc)
+        assert last_dot < late_barrier < late_c_desc < closing_barrier
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+def test_grouped_gemm_phase0_ragged_gfx1250():
+    device = triton.runtime.driver.active.get_active_torch_device()
+    torch.manual_seed(0)
+
+    shapes = [
+        (17, 33, 31),
+        (64, 70, 64),
+        (95, 128, 96),
+        (128, 65, 129),
+    ]
+    group_a, group_b = _make_groups(shapes, device)
+
+    actual = grouped_gemm_phase0(group_a, group_b, block_m=32, block_n=32, block_k=32)
+    expected = [a @ b for a, b in zip(group_a, group_b)]
+
+    for ref, out in zip(expected, actual):
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+@pytest.mark.parametrize("BLOCK_SIZE,TDM_PIPELINE_DEPTH,K", [(128, 2, 512), (128, 3, 512), (128, 4, 512), (256, 2, 256),
+                                                             (256, 2, 384), (256, 2, 512)])
+def test_grouped_gemm_tdm_packed_ragged_m_gfx1250(BLOCK_SIZE, TDM_PIPELINE_DEPTH, K):
+    device = triton.runtime.driver.active.get_active_torch_device()
+    torch.manual_seed(0)
+
+    # The square tile also exercises repeated C/A alias reuse and empty groups.
+    m_list = [0, 256, 512, 0, 768] if BLOCK_SIZE == 256 else [128, 256, 384]
+    n = 2 * BLOCK_SIZE
+    k = K
+    a_packed, b_t, group_offsets, group_a = _make_packed_ragged_m(m_list, n, k, device)
+
+    actual = grouped_gemm_tdm(
+        a_packed,
+        b_t,
+        group_offsets,
+        block_m=BLOCK_SIZE,
+        block_n=BLOCK_SIZE,
+        block_k=128,
+        group_m=4,
+        tdm_pipeline_depth=TDM_PIPELINE_DEPTH,
+        l2_prefetch_distance=0,
+        num_programs=2 if BLOCK_SIZE == 256 else None,
+    )
+
+    start = 0
+    for i, m in enumerate(m_list):
+        ref = group_a[i] @ b_t[i].T
+        torch.testing.assert_close(actual[start:start + m], ref, atol=1e-2, rtol=1e-2)
+        start += m
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+def test_grouped_gemm_tdm_asymmetric_depth3_gfx1250():
+    device = triton.runtime.driver.active.get_active_torch_device()
+    torch.manual_seed(0)
+
+    m_list = [128, 256]
+    n = 512
+    k = 384
+    a_packed, b_t, group_offsets, group_a = _make_packed_ragged_m(m_list, n, k, device)
+
+    actual = grouped_gemm_tdm(
+        a_packed,
+        b_t,
+        group_offsets,
+        block_m=128,
+        block_n=256,
+        block_k=128,
+        group_m=4,
+        tdm_pipeline_depth=3,
+        l2_prefetch_distance=0,
+    )
+
+    start = 0
+    for i, m in enumerate(m_list):
+        ref = group_a[i] @ b_t[i].T
+        torch.testing.assert_close(actual[start:start + m], ref, atol=1e-2, rtol=1e-2)
+        start += m
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+@pytest.mark.parametrize("block_m,c_staging_mode,k", [(128, 1, 256), (128, 1, 512), (256, 1, 256), (256, 1, 512),
+                                                      (256, 0, 256), (256, 0, 512), (256, 0, 4096)])
+@pytest.mark.parametrize("m_tiles", [[2, 0, 1, 0], [0, 1, 0, 0, 0, 2, 0, 1, 0]])
+def test_grouped_gemm_tdm_cross_tile_prefetch_gfx1250(block_m, c_staging_mode, k, m_tiles):
+    device = triton.runtime.driver.active.get_active_torch_device()
+    torch.manual_seed(0)
+
+    # Exercise within-group reuse, leading/trailing empty groups, and a gap
+    # that requires scanning beyond the four-boundary metadata window.
+    m_list = [tiles * block_m for tiles in m_tiles]
+    n = 512
+    a_packed, b_t, group_offsets, group_a = _make_packed_ragged_m(m_list, n, k, device)
+
+    actual = grouped_gemm_tdm(
+        a_packed,
+        b_t,
+        group_offsets,
+        block_m=block_m,
+        block_n=256,
+        block_k=128,
+        group_m=4,
+        tdm_pipeline_depth=2,
+        l2_prefetch_distance=0,
+        num_programs=2,
+        c_staging_mode=c_staging_mode,
+        cross_tile_prefetch=True,
+    )
+
+    start = 0
+    for i, m in enumerate(m_list):
+        ref = group_a[i] @ b_t[i].T
+        torch.testing.assert_close(actual[start:start + m], ref, atol=1e-2, rtol=1e-2)
+        start += m
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+@pytest.mark.parametrize("XCD_REMAP_MODE", ["balanced", "chunked"])
+def test_grouped_gemm_tdm_xcd_remap_gfx1250(XCD_REMAP_MODE):
+    device = triton.runtime.driver.active.get_active_torch_device()
+    torch.manual_seed(0)
+
+    m_list = [1024]
+    n = 512
+    k = 512
+    a_packed, b_t, group_offsets, group_a = _make_packed_ragged_m(m_list, n, k, device)
+    actual = grouped_gemm_tdm(
+        a_packed,
+        b_t,
+        group_offsets,
+        block_m=128,
+        block_n=256,
+        block_k=128,
+        num_programs=16,
+        c_staging_mode=1,
+        xcd_remap_mode=XCD_REMAP_MODE,
+        num_xcds=8,
+        xcd_chunk=2,
+    )
+    torch.testing.assert_close(actual, group_a[0] @ b_t[0].T, atol=1e-2, rtol=1e-2)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    if not is_hip_cdna5():
+        raise SystemExit("Requires CDNA5 hardware")
+
+    parser = argparse.ArgumentParser(description="Benchmark the TLX AMD f16 grouped GEMM TDM kernel")
+    parser.add_argument("--kernel", choices=("packed", "list"), default="packed",
+                        help="select the packed or pointer-table TDM kernel")
+    parser.add_argument("--m_list", type=str, default="512,512,512,512", help="Comma-separated M sizes per group")
+    parser.add_argument("-N", type=int, default=1024, help="problem N size")
+    parser.add_argument("-K", type=int, default=2048, help="problem K size")
+    parser.add_argument("-BM", type=int, default=256, help="BLOCK_M")
+    parser.add_argument("-BN", type=int, default=256, help="BLOCK_N")
+    parser.add_argument("-BK", type=int, default=128, help="BLOCK_K")
+    parser.add_argument("--group_m", type=int, default=4, help="GROUP_M launch-order swizzle")
+    parser.add_argument("--tdm_pipeline_depth", type=int, default=2, choices=[2, 3, 4],
+                        help="TDM LDS ring-buffer depth")
+    parser.add_argument("--l2_prefetch_distance", type=int, default=0)
+    parser.add_argument("--num_programs", type=int, default=None,
+                        help="persistent program count; defaults to the active CU count")
+    parser.add_argument("--dedicated_c_buffer", action=argparse.BooleanOptionalAction, default=False,
+                        help="keep C separate from the A ring (direct stores for 256x256 cross-tile)")
+    parser.add_argument("--cross_tile_prefetch", action=argparse.BooleanOptionalAction, default=False,
+                        help="prefetch the next tile; alias-C uses the 256x256 within-group hybrid")
+    parser.add_argument("--auto_config", action=argparse.BooleanOptionalAction, default=False,
+                        help="select a validated tile config using the host cost model")
+    parser.add_argument("--xcd_remap", choices=tuple(XCD_REMAP_MODES), default="none",
+                        help="persistent program-id mapping across gfx1250 XCDs")
+    parser.add_argument("--num_xcds", type=int, default=8)
+    parser.add_argument("--xcd_chunk", type=int, default=2)
+    parser.add_argument("--cluster_size", type=int, choices=(1, 2, 4), default=1,
+                        help="workgroups per multicast cluster (default: 1)")
+    parser.add_argument("--cluster_multicast", action=argparse.BooleanOptionalAction, default=True,
+                        help="share inputs within a cluster; disable for a synchronization-only control")
+    parser.add_argument("--benchmark_mode", choices=["eager", "graph", "none"], default="eager")
+    parser.add_argument("--benchmark_num_iters", type=int, default=32)
+    parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    m_list = [int(x) for x in args.m_list.split(",") if x]
+    if not m_list:
+        raise SystemExit("--m_list must contain at least one group")
+
+    device = triton.runtime.driver.active.get_active_torch_device()
+    torch.manual_seed(args.seed)
+    if args.check:
+        a_packed, b_t, group_offsets, group_a = _make_packed_ragged_m(m_list, args.N, args.K, device)
+    else:
+        total_m = sum(m_list)
+        a_packed = torch.randn((total_m, args.K), device=device, dtype=torch.float16)
+        b_t = torch.randn((len(m_list), args.N, args.K), device=device, dtype=torch.float16)
+        group_offsets = torch.tensor([0] + list(torch.tensor(m_list).cumsum(0).tolist()), device=device,
+                                     dtype=torch.int32)
+        group_a = None
+
+    if args.auto_config:
+        model_sms = args.num_programs if args.num_programs is not None else _active_num_cus(device)
+        selected = _pick_grouped_gemm_config(m_list, args.N, args.K, model_sms, allow_mn_tails=args.kernel == "list")
+        print("selected config:", selected["name"], f"BM={selected['block_m']}", f"BN={selected['block_n']}",
+              f"cross_tile_prefetch={selected['cross_tile_prefetch']}")
+
+    benchmark = None if args.benchmark_mode == "none" else args.benchmark_mode
+    launch_options = dict(
+        block_m=args.BM,
+        block_n=args.BN,
+        block_k=args.BK,
+        group_m=args.group_m,
+        tdm_pipeline_depth=args.tdm_pipeline_depth,
+        l2_prefetch_distance=args.l2_prefetch_distance,
+        num_programs=args.num_programs,
+        c_staging_mode=int(args.dedicated_c_buffer),
+        cross_tile_prefetch=args.cross_tile_prefetch,
+        auto_config=args.auto_config,
+        xcd_remap_mode=args.xcd_remap,
+        num_xcds=args.num_xcds,
+        xcd_chunk=args.xcd_chunk,
+        cluster_size=args.cluster_size,
+        cluster_multicast=args.cluster_multicast,
+        benchmark=benchmark,
+        benchmark_num_iters=args.benchmark_num_iters,
+    )
+    if args.kernel == "packed":
+        out = grouped_gemm_tdm(a_packed, b_t, group_offsets, **launch_options)
+        group_out = list(out.split(m_list))
+    else:
+        if group_a is None:
+            group_a = list(a_packed.split(m_list))
+        group_out = grouped_gemm_tdm_list(group_a, [weight.T for weight in b_t.unbind()], **launch_options)
+
+    if args.check:
+        assert group_a is not None
+        max_diff = 0.0
+        for i, actual in enumerate(group_out):
+            ref = group_a[i] @ b_t[i].T
+            diff = (actual - ref).abs().max().item()
+            max_diff = max(max_diff, diff)
+            torch.testing.assert_close(actual, ref, atol=1e-2, rtol=1e-2)
+        print(f"max abs diff: {max_diff:.4f}")

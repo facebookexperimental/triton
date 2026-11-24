@@ -1,11 +1,14 @@
 #include "triton/Dialect/TritonInstrument/IR/Utility.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "triton/Analysis/BufferRegion.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/IR/FunctionBuilder.h"
@@ -15,6 +18,8 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+
+#include <algorithm>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -76,55 +81,6 @@ ValueType createBufferDescriptorsTensor(ImplicitLocOpBuilder &builder,
           tensorType};
 }
 
-SmallVector<SmallVector<uint8_t>>
-createAliasingMatrix(ArrayRef<BufferRegion> regions) {
-  SmallVector<SmallVector<uint8_t>> matrix;
-  size_t numRegions = regions.size();
-  matrix.resize(numRegions);
-  for (size_t i = 0; i < numRegions; ++i)
-    matrix[i].assign(numRegions, /*Value=*/0);
-
-  for (size_t i = 0; i < numRegions; ++i) {
-    uint64_t startI = regions[i].baseOffset;
-    uint64_t endI = startI + regions[i].length;
-    if (regions[i].length == 0)
-      continue;
-    // Include self-aliasing
-    for (size_t j = i; j < numRegions; ++j) {
-      uint64_t startJ = regions[j].baseOffset;
-      uint64_t endJ = startJ + regions[j].length;
-      if (regions[j].length == 0)
-        continue;
-      bool alias = (startI < endJ) && (startJ < endI);
-      if (alias) {
-        matrix[i][j] = 1;
-        matrix[j][i] = 1;
-      }
-    }
-  }
-  return matrix;
-}
-
-bool hasCrossBufferAliasing(ArrayRef<BufferRegion> regions) {
-  size_t numRegions = regions.size();
-  for (size_t i = 0; i < numRegions; ++i) {
-    if (regions[i].length == 0)
-      continue;
-    uint64_t startI = regions[i].baseOffset;
-    uint64_t endI = startI + regions[i].length;
-    for (size_t j = i + 1; j < numRegions; ++j) {
-      if (regions[j].length == 0)
-        continue;
-      uint64_t startJ = regions[j].baseOffset;
-      uint64_t endJ = startJ + regions[j].length;
-      if ((startI < endJ) && (startJ < endI)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 ValueType createInitStateTensor(ImplicitLocOpBuilder &b,
                                 ArrayRef<int64_t> shape, int bitWidth,
                                 int64_t initialValue,
@@ -165,30 +121,6 @@ ValueType createZeroInitStateTensor(ImplicitLocOpBuilder &b,
                                     ArrayRef<int64_t> shape, int bitWidth,
                                     FunctionBuilder &funcBuilder) {
   return createInitStateTensor(b, shape, bitWidth, 0, funcBuilder);
-}
-
-TypedValue<RankedTensorType>
-createAliasMatrixTensor(ImplicitLocOpBuilder &b,
-                        ArrayRef<SmallVector<uint8_t>> matrix, Region *region) {
-  size_t rows = matrix.size();
-  if (rows == 0)
-    return {};
-  size_t cols = matrix.front().size();
-  for (const auto &row : matrix)
-    assert(row.size() == cols && "Expected square alias matrix");
-
-  auto type = getIntTensorType(
-      region, {static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
-      /*bitWidth=*/1);
-  SmallVector<APInt> values;
-  values.reserve(rows * cols);
-  for (const auto &row : matrix)
-    for (uint8_t v : row)
-      values.emplace_back(/*numBits=*/1, v);
-
-  auto denseAttr = DenseElementsAttr::get(type, values);
-  Value constValue = arith::ConstantOp::create(b, b.getLoc(), type, denseAttr);
-  return cast<TypedValue<RankedTensorType>>(constValue);
 }
 
 bool hasCpAsync(ModuleOp module) {
@@ -249,7 +181,8 @@ static Value createCurrentCTAMask(OpBuilder &b, Location loc,
 uint32_t getMemDescLength(Value buf) {
   auto memDescType = cast<MemDescType>(buf.getType());
   if (isa<SharedEncodingTrait>(memDescType.getEncoding())) {
-    unsigned elSize = memDescType.getElementType().getIntOrFloatBitWidth() / 8;
+    unsigned elSize =
+        getIntOrFloatOrPtrBitWidth(memDescType.getElementType()) / 8;
     return static_cast<uint32_t>(product(getShapePerCTA(memDescType)) * elSize);
   }
   if (isa<TensorMemorySpaceAttr>(memDescType.getMemorySpace())) {
@@ -383,7 +316,8 @@ Value reshapeAndBroadcast(OpBuilder &b, Location loc, Value tensor,
 }
 
 static Value createPointerTensor(OpBuilder &b, Location loc, Value base,
-                                 RankedTensorType tensorType) {
+                                 RankedTensorType tensorType,
+                                 ArrayRef<int64_t> explicitStrides = {}) {
   auto encoding = cast<DistributedEncodingTrait>(tensorType.getEncoding());
   Value ptrTensor = SplatOp::create(
       b, loc,
@@ -391,10 +325,16 @@ static Value createPointerTensor(OpBuilder &b, Location loc, Value base,
       base);
   auto offsetsType =
       RankedTensorType::get(tensorType.getShape(), b.getI32Type(), encoding);
-  SmallVector<int> strides(tensorType.getRank());
-  strides[0] = 1;
-  for (int i = 1; i < tensorType.getRank(); ++i) {
-    strides[i] = strides[i - 1] * tensorType.getShape()[i - 1];
+  assert(
+      (explicitStrides.empty() ||
+       explicitStrides.size() == static_cast<size_t>(tensorType.getRank())) &&
+      "expected one stride per scratch tensor dimension");
+  SmallVector<int64_t> strides(explicitStrides.begin(), explicitStrides.end());
+  if (strides.empty()) {
+    strides.resize(tensorType.getRank());
+    strides[0] = 1;
+    for (int i = 1; i < tensorType.getRank(); ++i)
+      strides[i] = strides[i - 1] * tensorType.getShape()[i - 1];
   }
   for (int i = 0; i < tensorType.getRank(); ++i) {
     auto arangeType = getSlicedTensorType(tensorType, {i}, b.getI32Type());
@@ -429,7 +369,8 @@ static Value createCurrentCTAMask(OpBuilder &b, Location loc,
 
 Operation *createStoreScratchMemory(OpBuilder &b, Location loc, Value alloc,
                                     Value tensor, RankedTensorType tensorType,
-                                    bool currentCTAOnly) {
+                                    bool currentCTAOnly, Value storeMask,
+                                    ArrayRef<int64_t> strides) {
   if (currentCTAOnly) {
     assert(tensorType.getRank() >= 1 &&
            "expected currentCTAOnly tensor to have a leading CTA dimension");
@@ -437,23 +378,30 @@ Operation *createStoreScratchMemory(OpBuilder &b, Location loc, Value alloc,
     assert(tensorType.getShape()[0] == numCTAs &&
            "expected leading dimension to match numCTAs");
     if (numCTAs > 1) {
-      Value oldTensor = createLoadScratchMemory(b, loc, alloc, tensorType);
       Value currentCTAMask = createCurrentCTAMask(b, loc, tensorType);
-      tensor =
-          arith::SelectOp::create(b, loc, currentCTAMask, tensor, oldTensor);
+      if (storeMask) {
+        storeMask = arith::AndIOp::create(b, loc, storeMask, currentCTAMask);
+      } else {
+        storeMask = currentCTAMask;
+      }
     }
   }
-  auto ptrTensor = createPointerTensor(b, loc, alloc, tensorType);
-  return StoreOp::create(b, loc, ptrTensor, tensor, Value(),
-                         CacheModifier::NONE, EvictionPolicy::NORMAL,
+  auto ptrTensor = createPointerTensor(b, loc, alloc, tensorType, strides);
+  return StoreOp::create(b, loc, ptrTensor, tensor, storeMask,
                          /*ignore_cta=*/true);
 }
 
 Value createLoadScratchMemory(OpBuilder &b, Location loc, Value alloc,
-                              RankedTensorType tensorType) {
-  auto ptrTensor = createPointerTensor(b, loc, alloc, tensorType);
-  return LoadOp::create(b, loc, ptrTensor, CacheModifier::NONE,
-                        EvictionPolicy::NORMAL, false);
+                              RankedTensorType tensorType,
+                              ArrayRef<int64_t> strides) {
+  auto ptrTensor = createPointerTensor(b, loc, alloc, tensorType, strides);
+  Value value = LoadOp::create(b, loc, ptrTensor);
+  // Finish replicated reads before another thread can update the scratch.
+  auto freeVarMasks = toLinearLayout(tensorType).getFreeVariableMasks();
+  if (freeVarMasks.lookup(b.getStringAttr("lane")) ||
+      freeVarMasks.lookup(b.getStringAttr("warp")))
+    BarrierOp::create(b, loc, AddrSpace::GlobalRead);
+  return value;
 }
 
 FuncOp getEntryPoint(ModuleOp module) {
@@ -463,22 +411,22 @@ FuncOp getEntryPoint(ModuleOp module) {
   return publicFuncs.front();
 }
 
-AuxDataMap::ThreadLayout getThreadLayout(ModuleOp module,
+AuxDataMap::ThreadLayout getThreadLayout(FuncOp entryPoint,
                                          const ConSanTargetHooks &hooks) {
   AuxDataMap::ThreadLayout layout;
   bool hasTMA = false;
   bool hasTC = false;
   bool hasCLC = false;
 
-  module.walk([&](Operation *op) {
+  entryPoint.walk([&](Operation *op) {
     if (auto wsOp = dyn_cast<WarpSpecializeOp>(op))
       layout.numBaseThreads = std::max<int>(
           layout.numBaseThreads, wsOp.getPartitionRegions().size() + 1);
     if (auto wsOp = dyn_cast<WarpSpecializePartitionsOp>(op))
       layout.numBaseThreads = std::max<int>(
           layout.numBaseThreads, wsOp.getPartitionRegions().size() + 1);
-    hasTMA |= hooks.isTMAOp(op);
-    hasTC |= isa<MMAv5OpInterface, TCGen5CommitOp, TMEMCopyOp>(op);
+    hasTMA |= hooks.isTMAOp(op) || isa<AsyncCopyMbarrierArriveOp>(op);
+    hasTC |= isa<MMAv5OpInterface, TCGen5CommitOp, TMEMCopyOp, TMEMShiftOp>(op);
     hasCLC |= hooks.isCLCOp(op);
   });
 
@@ -543,22 +491,27 @@ Region *AuxDataMap::RegionToValueMap::getEnclosingParitionOrFunctionRegion(
   return nullptr;
 }
 
-LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
-    ModuleOp module, FunctionBuilder &fb, const ConSanTargetHooks &hooks) {
-  SmallVector<SmallVector<BufferRegion>, numMemTypes> bufRegions(numMemTypes);
+LogicalResult
+AuxDataMap::populateAndPassToWarpSpecialize(ModuleOp module, FuncOp entryPoint,
+                                            FunctionBuilder &fb,
+                                            const ConSanTargetHooks &hooks) {
+  SmallVector<SmallVector<BufferRegion>, numMemTypes> descriptorRegions(
+      numMemTypes);
   SmallVector<BufferRegion> barrierRegions;
-  if (failed(getBuffersAndBarriers(module, bufRegions, barrierRegions, hooks)))
+  if (failed(getBuffersAndBarriers(module, entryPoint, descriptorRegions,
+                                   barrierRegions, hooks)))
     return failure();
   int numCTAs = lookupNumCTAs(module);
-  threadLayout = getThreadLayout(module, hooks);
+  threadLayout = getThreadLayout(entryPoint, hooks);
+  entryPoint.walk(
+      [&](AsyncCopyMbarrierArriveOp) { hasAsyncCopyMbarriers = true; });
+  int frontierBitWidth = threadLayout.totalNumThreads <= 32 ? 32 : 64;
   hasAsyncProxyFenceTracking =
       hooks.needsAsyncProxyFenceTracking(module) &&
       bufferStatePlans[(int)MemType::SHARED_MEM].numLanes != 0;
   int captureCounter = 0;
   int64_t captureBytes = 0;
 
-  FuncOp entryPoint = getEntryPoint(module);
-  assert(entryPoint);
   Region *entryRegion = &entryPoint.getBody();
 
   int numMBarriers = barrierRegions.size();
@@ -586,43 +539,23 @@ LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
 
     int numBufs = llvm::NextPowerOf2(bufferStatePlans[iMemType].numLanes - 1);
 
-    // Preserve beta's descriptor-based FunctionBuilder API while Reactor uses
-    // the state-lane plan below for sanitizer instrumentation.
-    if (!bufRegions[iMemType].empty()) {
-      buffers[iMemType].insert(
-          entryRegion,
-          createBufferDescriptorsTensor(b, memType, bufRegions[iMemType]));
+    // Preserve beta's packed-descriptor FunctionBuilder API separately from
+    // the canonical, unpadded regions used by the state-lane plan.
+    if (!descriptorRegions[iMemType].empty()) {
+      buffers[iMemType].insert(entryRegion,
+                               createBufferDescriptorsTensor(
+                                   b, memType, descriptorRegions[iMemType]));
       createInWarpSpecialize(entryPoint, buffers[iMemType],
                              [&](ImplicitLocOpBuilder &nestedBuilder) {
                                return createBufferDescriptorsTensor(
                                    nestedBuilder, memType,
-                                   bufRegions[iMemType]);
+                                   descriptorRegions[iMemType]);
                              });
-
-      hasNonTrivialAliasing[iMemType] =
-          hasCrossBufferAliasing(bufRegions[iMemType]);
-      if (hasNonTrivialAliasing[iMemType]) {
-        auto aliasMatrixData = createAliasingMatrix(bufRegions[iMemType]);
-        if (!aliasMatrixData.empty()) {
-          auto aliasTensor =
-              createAliasMatrixTensor(b, aliasMatrixData, entryRegion);
-          aliasMatrices[iMemType].insert(entryRegion,
-                                         {aliasTensor, aliasTensor.getType()});
-          createInWarpSpecialize(
-              entryPoint, aliasMatrices[iMemType],
-              [aliasMatrixData](ImplicitLocOpBuilder &nestedBuilder) {
-                Region *region = nestedBuilder.getInsertionBlock()->getParent();
-                auto tensor = createAliasMatrixTensor(nestedBuilder,
-                                                      aliasMatrixData, region);
-                return ValueType{tensor, tensor.getType()};
-              });
-        }
-      }
     }
 
     writeVisibility[iMemType].insert(
-        entryRegion,
-        createZeroInitStateTensor(b, {numCTAs, numBufs, numCTAs}, 64, fb));
+        entryRegion, createZeroInitStateTensor(b, {numCTAs, numBufs, numCTAs},
+                                               frontierBitWidth, fb));
     passValueToWarpSpecialize(writeVisibility[iMemType].at(entryRegion),
                               writeVisibility[iMemType]);
     readVisibility[iMemType].insert(
@@ -630,7 +563,7 @@ LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
         createZeroInitStateTensor(
             b,
             {numCTAs, numBufs, numCTAs, threadLayout.numThreadSlots, numCTAs},
-            64, fb));
+            frontierBitWidth, fb));
     passValueToWarpSpecialize(readVisibility[iMemType].at(entryRegion),
                               readVisibility[iMemType]);
     if (memType == MemType::SHARED_MEM && hasAsyncProxyFenceTracking) {
@@ -682,13 +615,14 @@ LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
         writeTracking[iMemType].insert(
             entryRegion,
             createZeroInitStateTensor(
-                b, {numCTAs, numBufs, numCTAs, numBarriers}, 8, fb));
+                b, {numCTAs, numBufs, numCTAs, numBarriers, 2}, 8, fb));
         passValueToWarpSpecialize(writeTracking[iMemType].at(entryRegion),
                                   writeTracking[iMemType]);
         readTracking[iMemType].insert(
             entryRegion,
             createZeroInitStateTensor(
-                b, {numCTAs, numBufs, numCTAs, numBarriers, numCTAs}, 64, fb));
+                b, {numCTAs, numBufs, numCTAs, numBarriers, numCTAs, 2},
+                frontierBitWidth, fb));
         passValueToWarpSpecialize(readTracking[iMemType].at(entryRegion),
                                   readTracking[iMemType]);
       }
@@ -700,7 +634,7 @@ LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
       proxyAccessTracking.insert(
           entryRegion,
           createZeroInitStateTensor(
-              b, {numCTAs, numBufs, numCTAs, numBarriers, numCTAs}, 64, fb));
+              b, {numCTAs, numBufs, numCTAs, numBarriers, numCTAs, 2}, 64, fb));
       passValueToWarpSpecialize(proxyAccessTracking.at(entryRegion),
                                 proxyAccessTracking);
     }
@@ -716,8 +650,11 @@ LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
       arith::CmpIOp::create(b, arith::CmpIPredicate::eq, ctaId, zero);
   ExperimentalLockReleaseOp::create(b, lockVal, isCTA0);
   if (numCTAs > 1) {
-    auto clusterBarrier = ClusterBarrierOp::create(b, b.getLoc());
-    internalClusterBarriers.push_back(clusterBarrier.getOperation());
+    SmallVector<Operation *> clusterBarriers =
+        hooks.createInitClusterBarrier(b);
+    assert(!clusterBarriers.empty() &&
+           "target must provide a cluster initialization barrier");
+    llvm::append_range(internalClusterBarriers, clusterBarriers);
   } else {
     BarrierOp::create(b, b.getLoc(), AddrSpace::Local);
   }
@@ -769,9 +706,11 @@ LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
 }
 
 LogicalResult AuxDataMap::getBuffersAndBarriers(
-    ModuleOp module, SmallVector<SmallVector<BufferRegion>, 2> &bufRegions,
+    ModuleOp module, FuncOp entryPoint,
+    SmallVector<SmallVector<BufferRegion>, 2> &descriptorRegions,
     SmallVector<BufferRegion> &barrierRegions, const ConSanTargetHooks &hooks) {
-  // Collect shared memory buffers allocated in the module
+  // Run dataflow over the module so call edges resolve, then collect only the
+  // entrypoint regions that this ConSan invocation will instrument.
   std::unique_ptr<DataFlowSolver> solver = createDataFlowSolver();
   triton::BufferRegionAnalysis *analysis =
       solver->load<triton::BufferRegionAnalysis>();
@@ -781,36 +720,51 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
   SmallVector<std::pair<Value, RegionInfo>> candidates[numMemTypes];
   DenseSet<Value> seenValues;
   auto collectCandidates = [&](Value value) {
-    if (!seenValues.insert(value).second)
-      return;
-    auto type = dyn_cast<MemDescType>(value.getType());
-    if (!type)
-      return;
-    std::optional<MemType> memType;
-    if (isa<SharedMemorySpaceAttr>(type.getMemorySpace()))
-      memType = MemType::SHARED_MEM;
-    else if (isa<TensorMemorySpaceAttr>(type.getMemorySpace()))
-      memType = MemType::TENSOR_MEM;
-    if (!memType)
-      return;
-    candidates[static_cast<int>(*memType)].push_back(
-        {value, analysis->getLatticeElement(value)->getValue()});
+    SmallVector<Value> pending = {value};
+    while (!pending.empty()) {
+      Value current = pending.pop_back_val();
+      if (!seenValues.insert(current).second)
+        continue;
+      auto type = dyn_cast<MemDescType>(current.getType());
+      if (!type)
+        continue;
+      std::optional<MemType> memType;
+      if (isa<SharedMemorySpaceAttr>(type.getMemorySpace()))
+        memType = MemType::SHARED_MEM;
+      else if (isa<TensorMemorySpaceAttr>(type.getMemorySpace()))
+        memType = MemType::TENSOR_MEM;
+      if (!memType)
+        continue;
+      candidates[static_cast<int>(*memType)].push_back(
+          {current, analysis->getLatticeElement(current)->getValue()});
+      if (auto select = current.getDefiningOp<arith::SelectOp>())
+        pending.append({select.getTrueValue(), select.getFalseValue()});
+    }
   };
-  module.walk([&](Operation *op) {
-    auto info = hooks.getMemEffectsOpInfo(op);
+  SmallVector<BufferRegion> staticSharedRegions;
+  unsigned numCTAs = lookupNumCTAs(module);
+  entryPoint.walk([&](Operation *op) {
+    for (const MemoryAccess &access : getMemoryAccesses(op))
+      collectCandidates(access.value);
+
+    auto info = getConSanMemEffectsOpInfo(hooks, op);
     if (!info)
       return;
     if (info->trackingKind == MemEffectsOpInfo::TrackingKind::CommitCount &&
         info->commitKind == CommitKind::AsyncCp)
       hasAsyncCopyReads |= llvm::any_of(
-          info->operandEffects, [](const MemEffectsOpInfo::Effects &e) {
-            return e.rw == MemEffectsOpInfo::Effects::Read;
-          });
+          info->operandEffects,
+          [](const MemEffectsOpInfo::Effects &e) { return e.rw == RW::Read; });
+    for (const auto &barrier : info->barriers)
+      collectCandidates(barrier.barrier);
     for (const auto &effect : info->operandEffects)
-      collectCandidates(effect.buf);
+      if (auto *buffer =
+              std::get_if<MemEffectsOpInfo::Effects::StaticSharedBuffer>(
+                  &effect.buffer))
+        staticSharedRegions.push_back(buffer->getRegion(numCTAs));
   });
 
-  analysis->calculateUsedBufferRegions(module);
+  analysis->calculateUsedBufferRegions(entryPoint);
   barrierRegions = analysis->getAllUsedBufferRegions(
       BufferRegionAnalysis::RegionType::BARRIER);
 
@@ -821,13 +775,28 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
                           : BufferRegionAnalysis::TENSOR_MEMORY;
     SmallVector<BufferRegion> regions =
         analysis->getAllUsedBufferRegions(regionType);
-    bufRegions[iMemType] = regions;
+    if (memType == MemType::SHARED_MEM)
+      llvm::append_range(regions, staticSharedRegions);
+    llvm::sort(regions);
+    regions.erase(std::unique(regions.begin(), regions.end()), regions.end());
     bool hasUnknown = analysis->hasUnknownUsedBufferRegions(regionType);
+
     if (regions.empty() && !hasUnknown)
       continue;
 
+    descriptorRegions[iMemType] = regions;
+    bufferRegions[iMemType] = regions;
     bufferStatePlans[iMemType] =
-        triton::createBufferStatePlan(regions, hasUnknown);
+        triton::createBufferStatePlan(bufferRegions[iMemType], hasUnknown);
+
+    if (memType == MemType::SHARED_MEM) {
+      for (const BufferRegion &barrier : barrierRegions) {
+        auto it = llvm::lower_bound(regions, barrier);
+        unsigned id = std::distance(regions.begin(), it);
+        barrierBufferMasks.push_back(
+            bufferStatePlans[iMemType].regionMasks[id]);
+      }
+    }
 
     for (const auto &[value, regionInfo] : candidates[iMemType]) {
       BufferStateCandidates stateCandidates;
@@ -848,7 +817,8 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
 
         auto existing = llvm::find_if(
             stateCandidates.cases, [&](const BufferStateCandidate &state) {
-              return state.baseOffset == candidate.baseOffset;
+              return state.baseOffset == candidate.baseOffset &&
+                     state.ctaMask == ctaMask;
             });
         if (existing == stateCandidates.cases.end()) {
           stateCandidates.cases.push_back(
@@ -856,15 +826,19 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
                ctaMask});
         } else {
           existing->mask |= bufferStatePlans[iMemType].regionMasks[id];
-          existing->ctaMask |= ctaMask;
         }
       }
+      // Hash-table iteration must not determine the order of emitted cases.
+      llvm::sort(stateCandidates.cases, [](const auto &lhs, const auto &rhs) {
+        return std::tie(lhs.baseOffset, lhs.ctaMask) <
+               std::tie(rhs.baseOffset, rhs.ctaMask);
+      });
       bufferCandidates[iMemType].try_emplace(value, std::move(stateCandidates));
     }
 
-    if (!bufRegions[iMemType].empty())
-      bufRegions[iMemType].resize(
-          llvm::NextPowerOf2(bufRegions[iMemType].size() - 1),
+    if (!descriptorRegions[iMemType].empty())
+      descriptorRegions[iMemType].resize(
+          llvm::NextPowerOf2(descriptorRegions[iMemType].size() - 1),
           BufferRegion{0, 0});
   }
   return success();

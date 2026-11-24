@@ -17,6 +17,7 @@ add_triton_ut(
   LIBS
     MLIRParser
     TritonGPUIR
+    TritonGPUToLLVM
     TritonGPUTransforms
     TritonNvidiaGPUTransforms
 )

@@ -349,8 +349,8 @@ def test_op(M, N, dtype):
     bias = torch.randn(N, device=DEVICE, dtype=dtype)
     eps = 1e-5
 
-    # PyTorch reference
-    output_torch = torch_layernorm(x, weight, bias, eps)
+    # Keep correctness validation independent of PT2 compiler-cache availability.
+    output_torch = _torch_layernorm_impl(x, weight, bias, eps)
 
     # TLX implementation
     output_triton, _, _ = multi_cta_layernorm(x, weight, bias, eps)

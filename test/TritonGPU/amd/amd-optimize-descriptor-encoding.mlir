@@ -1,4 +1,46 @@
 // RUN: triton-opt %s -split-input-file --tritonamdgpu-optimize-descriptor-encoding | FileCheck %s
+
+// Reusing a descriptor across differently sized allocations preserves the
+// common non-default padding. The slice has the same physical tile strides.
+#large = #ttg.padded_shared<[256:+8] {order = [1, 0], shape = [64, 128]}>
+#tile = #ttg.padded_shared<[256:+8] {order = [1, 0], shape = [32, 128]}>
+#smem = #ttg.shared_memory
+// CHECK-DAG: #[[$REUSE_LOAD:.*]] = #ttg.padded_shared<[256:+8] {order = [1, 0], shape = [32, 128]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_load_reused_descriptor
+  // CHECK-SAME: !tt.tensordesc<32x128xf16, #[[$REUSE_LOAD]]>
+  tt.func @tdm_load_reused_descriptor(%desc: !tt.tensordesc<32x128xf16>) {
+    %large = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #large, #smem, mutable>
+    %small = ttg.local_alloc : () -> !ttg.memdesc<32x128xf16, #tile, #smem, mutable>
+    %slice = ttg.memdesc_subslice %large[0, 0] : !ttg.memdesc<64x128xf16, #large, #smem, mutable> -> !ttg.memdesc<32x128xf16, #large, #smem, mutable, 64x128>
+    %token0 = amdg.async_tdm_copy_global_to_local %desc into %slice : !tt.tensordesc<32x128xf16> -> !ttg.memdesc<32x128xf16, #large, #smem, mutable, 64x128>
+    %token1 = amdg.async_tdm_copy_global_to_local %desc into %small : !tt.tensordesc<32x128xf16> -> !ttg.memdesc<32x128xf16, #tile, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Reusing a descriptor across differently sized allocations preserves the
+// common non-default padding. The slice has the same physical tile strides.
+#large = #ttg.padded_shared<[256:+8] {order = [1, 0], shape = [64, 128]}>
+#tile = #ttg.padded_shared<[256:+8] {order = [1, 0], shape = [32, 128]}>
+#smem = #ttg.shared_memory
+// CHECK-DAG: #[[$REUSE_FUSED:.*]] = #ttg.padded_shared<[256:+8] {order = [1, 0], shape = [32, 128]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_fused_reused_descriptor
+  // CHECK-SAME: !tt.tensordesc<32x128xf16, #[[$REUSE_FUSED]]>
+  tt.func @tdm_fused_reused_descriptor(%desc: !tt.tensordesc<32x128xf16>) {
+    %large = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #large, #smem, mutable>
+    %small = ttg.local_alloc : () -> !ttg.memdesc<32x128xf16, #tile, #smem, mutable>
+    %slice = ttg.memdesc_subslice %large[0, 0] : !ttg.memdesc<64x128xf16, #large, #smem, mutable> -> !ttg.memdesc<32x128xf16, #large, #smem, mutable, 64x128>
+    %token = amdg.async_tdm_fused_copy_global_to_local %desc, %desc into %slice, %small {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<32x128xf16>, !tt.tensordesc<32x128xf16> -> !ttg.memdesc<32x128xf16, #large, #smem, mutable, 64x128>, !ttg.memdesc<32x128xf16, #tile, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 // Test that gather/scatter are assigned padded encodings
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
@@ -269,15 +311,16 @@ tt.func public @tdm_store_pinned_allocation_encoding(%desc: !tt.tensordesc<32x32
 // -----
 // Pins nested inside a partitioned layout are normalized before descriptor
 // assignment and verification as well.
-#padded = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+#padded = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [64, 32]}>
 #pinned_inner = #tlx.user_layout<#padded>
 #partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #pinned_inner}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
-// CHECK-DAG: #[[$PARTITIONED_TDM_PADDED:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-DAG: #[[$PARTITIONED_TDM_PADDED:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [64, 32]}>
+// CHECK-DAG: #[[$PARTITIONED_TDM:.*]] = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #[[$PARTITIONED_TDM_PADDED]]}>
 // CHECK-LABEL: @tdm_load_partitioned_pinned_inner_encoding
 tt.func public @tdm_load_partitioned_pinned_inner_encoding(%desc: !tt.tensordesc<128x32xf16>) {
-  // CHECK-SAME: %[[PARTITIONED_DESC:.*]]: !tt.tensordesc<128x32xf16, #[[$PARTITIONED_TDM_PADDED]]>
+  // CHECK-SAME: %[[PARTITIONED_DESC:.*]]: !tt.tensordesc<128x32xf16, #[[$PARTITIONED_TDM]]>
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<128x32xf16, #partitioned, #smem, mutable>
   // CHECK: amdg.async_tdm_copy_global_to_local %[[PARTITIONED_DESC]] into
   %token = amdg.async_tdm_copy_global_to_local %desc into %alloc : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #partitioned, #smem, mutable>
@@ -307,4 +350,18 @@ tt.func public @fused_tdm_allocation_encodings(
   %token = amdg.async_tdm_fused_copy_global_to_local %pa, %pb into %da, %db {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x32xf16>, !tt.tensordesc<32x64xf16> -> !ttg.memdesc<64x32xf16, #padded_a, #smem, mutable>, !ttg.memdesc<32x64xf16, #padded_b, #smem, mutable>
   tt.return
 }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+// CHECK: #[[$FP4_PADDED:.*]] = #ttg.padded_shared<[32:+16] {order = [1, 0], shape = [32, 32]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, ttg.target = "hip:gfx1250"} {
+  // CHECK-LABEL: native_fp4_descriptor_fallback
+  tt.func @native_fp4_descriptor_fallback(%desc: !tt.tensordesc<32x32x!tt.fp4e2m1x2>) -> tensor<32x32x!tt.fp4e2m1x2, #blocked> {
+    %zero = arith.constant 0 : i32
+    // CHECK: tt.descriptor_load {{.*}} : !tt.tensordesc<32x32x!tt.fp4e2m1x2, #[[$FP4_PADDED]]>
+    %value = tt.descriptor_load %desc[%zero, %zero] : !tt.tensordesc<32x32x!tt.fp4e2m1x2> -> tensor<32x32x!tt.fp4e2m1x2, #blocked>
+    tt.return %value : tensor<32x32x!tt.fp4e2m1x2, #blocked>
+  }
 }

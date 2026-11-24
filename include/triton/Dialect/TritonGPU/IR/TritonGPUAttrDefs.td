@@ -177,7 +177,7 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
                        "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
                        "CGAEncodingAttr":$CGALayout, "Type":$eltTy),
                    [{
-      unsigned bitwidth = eltTy.getIntOrFloatBitWidth();
+      unsigned bitwidth = ::mlir::getIntOrFloatOrPtrBitWidth(eltTy);
       return get(context, dotOpEnc, shape, order, CGALayout, bitwidth);
     }]>,
 
@@ -186,10 +186,14 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
                        "CGAEncodingAttr":$CGALayout, "Type":$eltTy,
                        "bool":$needTrans),
                    [{
-      unsigned bitwidth = eltTy.getIntOrFloatBitWidth();
+      unsigned bitwidth = ::mlir::getIntOrFloatOrPtrBitWidth(eltTy);
       return get(context, dotOpEnc, shape, order, CGALayout, bitwidth, needTrans);
     }]>,
   ];
+
+  let extraClassDeclaration = [{
+    LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
+  }];
 
   let hasCustomAssemblyFormat = 1;
   let genVerifyDecl = 1;
@@ -309,6 +313,8 @@ For identity mappings a short form based on order and shape is used to increase 
     // Returns the total number of elements including padding given the input
     // tensor shape.
     int64_t getPaddedSize(ArrayRef<int64_t> shape) const;
+
+    LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
   }];
   let hasCustomAssemblyFormat = 1;
   let genVerifyDecl = 1;
@@ -370,6 +376,8 @@ def PartitionedSharedEncodingAttr
     unsigned getNumLogicalPieces() const {
       return getNumPartitions() * getNumGroups();
     }
+
+    LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
   }];
 
   let hasCustomAssemblyFormat = 1;
@@ -434,43 +442,74 @@ def NVMMASharedEncodingAttr
   // operand in MMAv5 scaled dot, which needs to be in the special padded layout
   // as described in
   // https://docs.nvidia.com/cuda/parallel-thread-execution/#packing-format-used-for-matrix-a-and-b-by-kind-mxf8f6f4-in-shared-memory
+  // FP6 shapes and coordinates count logical values. B6x16P32 is an opaque
+  // MMA tile whose 16-byte containers hold 16 packed FP6 values and padding.
+  // B6P2x16 exposes one low-six-bit code per byte for compacting TMA stores.
   let parameters = (ins "unsigned":$swizzlingByteWidth, "bool":$transposed,
-      "unsigned":$elementBitWidth, "bool":$fp4Padded,
+      "unsigned":$elementBitWidth, "NVMmaPadding":$padding,
       "CGAEncodingAttr":$CGALayout);
 
-  let builders = [AttrBuilder<
-      (ins "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
-          "CGAEncodingAttr":$CGALayout, "Type":$eltTy, "bool":$fp4Padded),
-      [{
-        auto shapePerCTA = getShapePerCTA(CGALayout.getCTASplitNum(), shape);
-        int32_t swizzlingByteWidth = 0;
-        unsigned eleBitWidth = eltTy.getIntOrFloatBitWidth();
-        int packingFactor = fp4Padded ? 2 : 1;
-
-        // get proper shared memory swizzling mode from the contiguous dimension
-        // size of the origin blocked layout.
-        auto contigDimSizeInByte = shapePerCTA[order[0]] * packingFactor * eleBitWidth / 8;
-        if (contigDimSizeInByte >= 128 && contigDimSizeInByte % 128 == 0) {
-          swizzlingByteWidth = 128;
-        } else if (contigDimSizeInByte >= 64 && contigDimSizeInByte % 64 == 0) {
-          swizzlingByteWidth = 64;
-        } else if (contigDimSizeInByte >= 32 && contigDimSizeInByte % 32 == 0) {
-          swizzlingByteWidth = 32;
-        } else {
-          swizzlingByteWidth = 0;
-        }
-        int flattenOutterDim = 1;
-        for (int i = 1; i < shapePerCTA.size(); i++) {
-          flattenOutterDim *= shapePerCTA[order[i]];
-        }
-        if (shapePerCTA.size() < 2 || flattenOutterDim < 8) {
-          swizzlingByteWidth = 0;
-        }
-        bool transposed = order.size() > 1 && order[0] == 0;
-        return $_get(context, swizzlingByteWidth, transposed, eleBitWidth, fp4Padded, CGALayout);
+  let skipDefaultBuilders = 1;
+  let builders =
+      [AttrBuilder<(ins "unsigned":$swizzlingByteWidth, "bool":$transposed,
+                       "unsigned":$elementBitWidth, "NVMmaPadding":$padding,
+                       "CGAEncodingAttr":$CGALayout),
+                   [{
+      return $_get(context, swizzlingByteWidth, transposed, elementBitWidth,
+                   padding, CGALayout);
+    }]>,
+       AttrBuilder<(ins "unsigned":$swizzlingByteWidth, "bool":$transposed,
+                       "unsigned":$elementBitWidth, "bool":$fp4Padded,
+                       "CGAEncodingAttr":$CGALayout,
+                       CArg<"bool", "false">:$fp6Padded),
+                   [{
+      assert(!(fp4Padded && fp6Padded));
+      auto padding = fp4Padded ? NVMmaPadding::Fp4
+                   : fp6Padded ? NVMmaPadding::B6x16P32
+                               : NVMmaPadding::None;
+      return get(context, swizzlingByteWidth, transposed, elementBitWidth,
+                 padding, CGALayout);
+    }]>,
+       AttrBuilder<(ins "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
+                       "CGAEncodingAttr":$CGALayout, "Type":$eltTy,
+                       "NVMmaPadding":$padding),
+                   [{
+      unsigned eleBitWidth = ::mlir::getIntOrFloatOrPtrBitWidth(eltTy);
+      unsigned swizzlingByteWidth = getDefaultSwizzlingByteWidth(
+          shape, order, CGALayout, eleBitWidth, padding == NVMmaPadding::Fp4);
+      bool transposed = order.size() > 1 && order[0] == 0;
+      return get(context, swizzlingByteWidth, transposed, eleBitWidth, padding,
+                 CGALayout);
+    }]>,
+       AttrBuilder<(ins "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
+                       "CGAEncodingAttr":$CGALayout, "Type":$eltTy,
+                       "bool":$fp4Padded, CArg<"bool", "false">:$fp6Padded),
+                   [{
+      assert(!(fp4Padded && fp6Padded));
+      auto padding = fp4Padded ? NVMmaPadding::Fp4
+                   : fp6Padded ? NVMmaPadding::B6x16P32
+                               : NVMmaPadding::None;
+      return get(context, shape, order, CGALayout, eltTy, padding);
     }]>];
 
   let extraClassDeclaration = extraBaseClassDeclaration#[{
+    /// Choose the largest swizzle supported by the shape and element bit width,
+    /// or zero for shapes that cannot use swizzling.
+    static unsigned getDefaultSwizzlingByteWidth(
+        ArrayRef<int64_t> shape, ArrayRef<unsigned> order,
+        CGAEncodingAttr cgaLayout, unsigned elementBitWidth, bool fp4Padded);
+
+    bool getFp4Padded() const { return isPaddedFp4(); }
+    bool getFp6Padded() const { return getPadding() == NVMmaPadding::B6x16P32; }
+    bool isPaddedFp4() const { return getPadding() == NVMmaPadding::Fp4; }
+    bool isPaddedFp6() const {
+      return getPadding() == NVMmaPadding::B6x16P32 || getPadding() == NVMmaPadding::B6P2x16;
+    }
+    static bool isPackedFp6(Attribute encoding) {
+      auto mma = llvm::dyn_cast_if_present<NVMMASharedEncodingAttr>(encoding);
+      return mma && mma.getPadding() == NVMmaPadding::B6x16P32;
+    }
+
     int getPerPhase() const;
     int getMaxPhase() const;
     int getVec() const;
@@ -570,6 +609,9 @@ Swizzling examples (matrix is filled with numbers 0, 1, 2, .. columns*rows-1):
       "unsigned":$maxPhase, ArrayRefParameter<"unsigned">:$order,
       "CGAEncodingAttr":$CGALayout);
 
+  let extraClassDeclaration = [{
+    LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
+  }];
   let hasCustomAssemblyFormat = 1;
 }
 
@@ -831,7 +873,7 @@ for
       // (the modular LinearLayout). Flooring a pow2 is a no-op, so pow2 shapes
       // are byte-identical.
       static const bool allowNpot =
-          mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+          mlir::triton::tools::isNpotAllowed();
       auto pow2Floor = [&](unsigned x) -> unsigned {
         return allowNpot ? (1u << llvm::Log2_32(std::max<unsigned>(x, 1))) : x;
       };
@@ -898,7 +940,6 @@ available on AMD Instinct GPUs of CDNA architectures.
 
 It is characterized by the following parameters:
 - `version`: The GPU architecture:
-  - 1: gfx908: CDNA1
   - 2: gfx90a: CDNA2
   - 3: gfx942: CDNA3
   - 4: gfx950: CDNA4
@@ -1037,9 +1078,11 @@ w2 w2 w3 w3
     SmallVector<int64_t> getInstrShapeForOperand(int kWidth, int opIdx) const;
     SmallVector<int64_t> getRepForOperand(ArrayRef<int64_t> operandShape, int kWidth, int opIdx) const;
     SmallVector<unsigned> getRepOrderForOperand(int opIdx) const;
+    LinearLayout dotOperandToLinearLayout(Attribute dotOp, ArrayRef<int64_t> shape) const;
 
     // Check if tilesPerWarp is 1 in every dimension.
     bool hasUnitTilesPerWarp() const;
+    bool hasMixedRadixLayout() const;
 
     // Returns a swizzled shared layout matching this MFMA layout for the
     // dot operand at the given |operandIdx| with |operandShape|.
@@ -1067,7 +1110,7 @@ It is characterized by the following parameters:
 - `version` indicates the GPU architecture:
   - 1: RDNA3; e.g., gfx1100, gfx1101
   - 2: RDNA4; e.g., gfx1200, gfx1201
-  - 3: gfx1250
+  - 3: CDNA5; e.g., gfx1250
 - `ctaLayout` indicates the warp layout in the block. This is a generalization
    compared to previous warp layout representation using warpsPerCTA and tilesPerWarp
    parameters.
@@ -1197,7 +1240,7 @@ warpsPerCTA  = [2, 2], tilesPerWarp = [2, 2]
 but with a different ordering of repetitions.
 
 The motivation for this broader formulation comes from the need to describe swizzled warp
-layouts, which help avoid LDS partition conflicts on architectures such as gfx1250.
+layouts, which help avoid LDS partition conflicts on architectures such as CDNA5.
 A valid example of such swizzled configuration is:
 
 ctaLayout = {reg = [[2, 0]], warps = [[2, 1], [1, 0]]}
@@ -1226,6 +1269,7 @@ This simplifies both WMMA and dotOperand layouts lowering to linear layout.
 
   let extraClassDeclaration = extraDistributedDeclaration#[{
     SmallVector<unsigned> getRepOrderForOperand(int opIdx) const;
+    LinearLayout dotOperandToLinearLayout(Attribute dotOp, ArrayRef<int64_t> shape) const;
     LinearLayout getTileLayout(unsigned rank) const;
     static SmallVector<unsigned, 3> getDefaultInstrShape() {
       return {16, 16, 16};
@@ -1259,48 +1303,13 @@ An encoding for tensors that have been produced by tensor cores.
 It is characterized by two parameters:
 - A 'versionMajor' which specifies the generation the tensor cores
   whose output is being partitioned:
-  - 1 for first-gen tensor cores (Volta), and
-  - 2 for second-gen tensor cores (Turing/Ampere).
+  - 2 for second-gen tensor cores (Turing/Ampere), and
+  - 3 for Hopper tensor cores.
+  First-gen tensor cores (Volta, versionMajor = 1) are no longer supported
+  and are rejected by the attribute verifier.
 - A 'versionMinor' which indicates the specific layout of a tensor core
-  generation, e.g. for Volta, there might be multiple kinds of layouts
-  annotated by 0,1,2 and so on.
+  generation.
 - A `blockTileSize` to indicate how data should be partitioned between warps.
-
-// -------------------------------- version = 1 --------------------------- //
-
-For first-gen tensor cores, the implicit warpTileSize is [16, 16].
-Note: the layout is different from the recommended in PTX ISA
-https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
-(mma.884 section, FP32 accumulator).
-
-For example, when versionMinor=1, the matrix L corresponding to
-blockTileSize=[32,16] is:
-
-                               warp 0
---------------------------------/\-------------------------------
-[ 0   0   2   2   8   8   10  10   0   0   2   2   8   8   10  10 ]
-[ 1   1   3   3   9   9   11  11   1   1   3   3   9   9   11  11 ]
-[ 0   0   2   2   8   8   10  10   0   0   2   2   8   8   10  10 ]
-[ 1   1   3   3   9   9   11  11   1   1   3   3   9   9   11  11 ]
-[ 4   4   6   6   12  12  14  14   4   4   6   6   12  12  14  14 ]
-[ 5   5   7   7   13  13  15  15   5   5   7   7   13  13  15  15 ]
-[ 4   4   6   6   12  12  14  14   4   4   6   6   12  12  14  14 ]
-[ 5   5   7   7   13  13  15  15   5   5   7   7   13  13  15  15 ]
-[ 16  16  18  18  20  20  22  22   16  16  18  18  20  20  22  22 ]
-[ 17  17  19  19  21  21  23  23   17  17  19  19  21  21  23  23 ]
-[ 16  16  18  18  20  20  22  22   16  16  18  18  20  20  22  22 ]
-[ 17  17  19  19  21  21  23  23   17  17  19  19  21  21  23  23 ]
-[ 24  24  26  26  28  28  30  30   24  24  26  26  28  28  30  30 ]
-[ 25  25  27  27  29  29  31  31   25  25  27  27  29  29  31  31 ]
-[ 24  24  26  26  28  28  30  30   24  24  26  26  28  28  30  30 ]
-[ 25  25  27  27  29  29  31  31   25  25  27  27  29  29  31  31 ]
-
-                          warp 1 = warp0 + 32
---------------------------------/\-------------------------------
-[ 32  32  34  34  40  40  42  42   32  32  34  34  40  40  42  42 ]
-[ 33  33  35  35  41  41  43  43   33  33  35  35  41  41  43  43 ]
-[ ............................................................... ]
-
 
 // -------------------------------- version = 2 --------------------------- //
 
@@ -1338,18 +1347,23 @@ For example, the matrix L corresponding to blockTileSize=[32,16] is:
       ArrayRefParameter<"unsigned">:$warpsPerCTA, "CGAEncodingAttr":$CGALayout,
       ArrayRefParameter<"unsigned">:$instrShape);
 
+  let genVerifyDecl = 1;
+
   let extraClassDeclaration = extraDistributedDeclaration#[{
     bool isVolta() const;
     bool isTuring() const;
     bool isAmpere() const;
     bool isHopper() const;
+    bool hasMixedRadixLayout() const;
 
     SmallVector<int64_t> getRepForOperand(ArrayRef<int64_t> shape,
                                           int bitwidth, int kWidth,
                                           int opIdx) const;
     SmallVector<unsigned> getRepOrderForOperand(int opIdx) const;
+    LinearLayout dotOperandToLinearLayout(Attribute dotOp, ArrayRef<int64_t> shape) const;
   }];
 
+  let genVerifyDecl = 1;
   let hasCustomAssemblyFormat = 1;
 }
 
@@ -1448,14 +1462,16 @@ vecIdx (index of the element in the quad; this is always along the k-dim)
       if (!parentAttr || (!parentAttr.isAmpere() && !parentAttr.isHopper()))
         return $_get(context, opIdx, parent, 0);
       // For MMAV2 and V3
-      unsigned bitwidth = eltTy.getIntOrFloatBitWidth();
+      unsigned bitwidth = ::mlir::getIntOrFloatOrPtrBitWidth(eltTy);
       unsigned kWidth = std::max(32 / bitwidth, 1u);
       return $_get(context, opIdx, parent, kWidth);
     }]>];
 
   let assemblyFormat = "`<` `{` struct(params) `}` `>`";
   let genVerifyDecl = 1;
-  let extraClassDeclaration = extraDistributedDeclaration;
+  let extraClassDeclaration = extraDistributedDeclaration#[{
+    bool hasMixedRadixLayout() const;
+  }];
 }
 
 def TTG_SharedMemorySpace : AttrDef<TritonGPU_Dialect, "SharedMemorySpace"> {

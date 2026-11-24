@@ -33,13 +33,108 @@ include "mlir/Interfaces/ViewLikeInterface.td"
 include "triton/Dialect/Triton/IR/TritonTypes.td"
 include "triton/Dialect/Triton/IR/TritonAttrDefs.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
+include "triton/Dialect/TritonGPU/IR/TritonGPUMemoryEffects.td"
 include "NVWSDialect.td"
 include "NVWSTypes.td"
 include "NVWSAttrDefs.td"
 include "NVWSOpInterfaces.td"
 
-class NVWS_Op<string mnemonic, list<Trait> traits = []> :
-    Op<NVWS_Dialect, mnemonic, traits>;
+class NVWS_Op<string mnemonic, list<Trait> traits = []>
+    : Op<NVWS_Dialect, mnemonic, traits>;
+
+def NVWS_SemaphoreCreateOp : NVWS_Op<"semaphore.create", [
+    RangedTypesMatchWith<"input types match Semaphore output type",
+                         "result", "buffers",
+                         "::llvm::cast<SemaphoreType>($_self).getBaseType()">]> {
+  let summary = "Create a semaphore guarding a multi-buffered allocation.";
+  let description = [{
+    `released_mask` defines the initial state of each physical buffer stage.
+    Bit `i` set to one means stage `i` starts released; a zero bit means it
+    starts blocked. When the mask is omitted, every stage starts blocked.
+  }];
+  let arguments = (ins Variadic<TTG_MemDescType>:$buffers,
+                       OptionalAttr<I32Attr>:$released_mask,
+                       OptionalAttr<I32Attr>:$pending_count);
+  let results = (outs NVWS_SemaphoreType:$result);
+  let assemblyFormat = [{
+    $buffers (`released` `=` $released_mask^)? attr-dict `:` type($result)
+  }];
+  let builders = [
+    OpBuilder<(ins "Type":$result, "ValueRange":$buffers), [{
+      build($_builder, $_state, result, buffers,
+            /*released_mask=*/IntegerAttr(),
+            /*pending_count=*/IntegerAttr());
+    }]>,
+    OpBuilder<(ins "Type":$result, "ValueRange":$buffers,
+                   "uint32_t":$released_mask), [{
+      build($_builder, $_state, result, buffers,
+            released_mask ? $_builder.getI32IntegerAttr(released_mask)
+                          : IntegerAttr(),
+            /*pending_count=*/IntegerAttr());
+    }]>
+  ];
+  let extraClassDeclaration = [{
+    static void build(OpBuilder &, OperationState &, Type, ValueRange,
+                      bool) = delete;
+  }];
+  let hasVerifier = 1;
+}
+
+def NVWS_SemaphoreAcquireOp : NVWS_Op<"semaphore.acquire", [
+    AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<NVWS_SemaphoreStageInterface>]> {
+  let summary = "Acquire a semaphore. Returns a token proving ownership.";
+  let arguments = (ins NVWS_SemaphoreType:$semaphore,
+                       Optional<I32>:$stage,
+                       Optional<I32>:$phase);
+  let results = (outs TTG_AsyncToken:$token);
+  let hasCustomAssemblyFormat = 1;
+  let builders = [
+    OpBuilder<(ins "Value":$semaphore, "Type":$tokenType), [{
+      build($_builder, $_state, tokenType, semaphore, Value(), Value());
+    }]>
+  ];
+}
+
+def NVWS_SemaphoreReleaseOp : NVWS_Op<"semaphore.release", [
+    DeclareOpInterfaceMethods<NVWS_SemaphoreStageInterface>]> {
+  let summary = "Release a semaphore, signaling the next partition.";
+  let arguments = (ins NVWS_SemaphoreType:$semaphore,
+                       TTG_AsyncToken:$token,
+                       Optional<I32>:$stage,
+                       NVWS_AsyncOpArrayAttr:$async_ops,
+                       OptionalAttr<I32Attr>:$arrive_count);
+  let assemblyFormat = [{
+    $semaphore (`[` $stage^ `]`)? `,` $token $async_ops attr-dict
+    `:` type($semaphore) `,` type($token)
+  }];
+  let builders = [
+    OpBuilder<(ins "Value":$semaphore, "Value":$token, "ArrayAttr":$async_ops), [{
+      build($_builder, $_state, semaphore, token, Value(), async_ops,
+            /*arrive_count=*/IntegerAttr());
+    }]>
+  ];
+  let hasVerifier = 1;
+}
+
+def NVWS_SemaphoreBufferOp : NVWS_Op<"semaphore.buffer", [
+    DeclareOpInterfaceMethods<NVWS_SemaphoreStageInterface>]> {
+  let summary = "Get buffer view from semaphore at a given stage.";
+  let arguments = (ins NVWS_SemaphoreType:$semaphore,
+                       TTG_AsyncToken:$token,
+                       Optional<I32>:$stage);
+  let results = (outs Variadic<TTG_MemDescType>:$buffers);
+  let assemblyFormat = [{
+    $semaphore (`[` $stage^ `]`)? `,` $token attr-dict
+    `:` type($semaphore) `,` type($token) `->` type(results)
+  }];
+  let builders = [
+    OpBuilder<(ins "Value":$semaphore, "TypeRange":$bufferTypes, "Value":$token), [{
+      build($_builder, $_state, bufferTypes, semaphore, token, Value());
+    }]>
+  ];
+  let hasVerifier = 1;
+}
 
 def NVWS_ArefCreateOp : NVWS_Op<"aref.create", [
     RangedTypesMatchWith<"input types match Aref output type",
@@ -58,6 +153,21 @@ def NVWS_ArefCreateOp : NVWS_Op<"aref.create", [
   let results = (outs NVWS_ArefType:$result);
 
   let assemblyFormat = [{$buffers attr-dict `:` type($result)}];
+  let hasVerifier = 1;
+}
+
+def NVWS_ArefPhiOp : NVWS_Op<"aref.phi", [Pure, SameOperandsAndResultType]> {
+  let summary = "Select a local or remote aref value by partition";
+  let description = [{
+    Joins exactly two SSA values with disjoint partition ownership.  The
+    partition owning a physical clone selects the operand whose defining value
+    owns that partition.  Partition-loop construction resolves this operation
+    to the selected operand and emits no instruction.
+  }];
+
+  let arguments = (ins AnyType:$local, AnyType:$remote);
+  let results = (outs AnyType:$result);
+  let assemblyFormat = "$local `,` $remote attr-dict `:` type($result)";
   let hasVerifier = 1;
 }
 
@@ -319,7 +429,22 @@ def NVWS_ConsumerReleaseOp : NVWS_Op<"consumer_release"> {
 }
 
 def GlobalMemory : Resource<"::mlir::triton::GlobalMemory">;
-def SharedMemory : Resource<"::mlir::triton::gpu::SharedMemory">;
+
+def NVWS_CLCTryCancelOp : NVWS_Op<"clc_try_cancel"> {
+  let summary = "Issue a cluster launch control cancellation request";
+  let description = [{
+    Issues CLC cancellation request whose raw 16-byte response
+    is written into the supplied shared-memory buffer.
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", AsyncSharedWrite>:$result
+  );
+
+  let assemblyFormat = [{
+    $result attr-dict `:` qualified(type($result))
+  }];
+}
 
 def NVWS_DescriptorLoadOp : NVWS_Op<"descriptor_load", [NVWS_DescriptorLoadOpInterface]> {
   let summary = "Load from descriptor and store into shared memory";
@@ -331,17 +456,12 @@ def NVWS_DescriptorLoadOp : NVWS_Op<"descriptor_load", [NVWS_DescriptorLoadOpInt
     Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
     Variadic<I32>:$indices,
     I32Attr:$txCount,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
-    DefaultValuedAttr<TT_CacheModifierAttr, "::mlir::triton::CacheModifier::NONE">:$cache,
-    DefaultValuedAttr<TT_EvictionPolicyAttr, "::mlir::triton::EvictionPolicy::NORMAL">:$evict
+    Arg<TTG_MemDescType, "", GenericSharedWrite>:$result,
+    OptionalAttr<AnyAttr>:$cachePolicy
   );
 
   let assemblyFormat = [{
     $desc `[` $indices `]` $txCount $result
-    oilist(
-      `cacheModifier` `=` $cache |
-      `evictionPolicy` `=` $evict
-    )
     attr-dict `:` type(operands)
   }];
 }
@@ -358,7 +478,7 @@ def NVWS_DescriptorGatherOp : NVWS_Op<"descriptor_gather", [NVWS_DescriptorLoadO
     RankedTensorOf<[I32]>:$x_offsets,
     I32:$y_offset,
     I32Attr:$txCount,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result
+    Arg<TTG_MemDescType, "", GenericSharedWrite>:$result
   );
 
   let assemblyFormat = [{

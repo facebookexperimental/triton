@@ -52,6 +52,53 @@ bool hasAutoWSOutputChannel(Operation *op) {
 // assignLatencies
 //===----------------------------------------------------------------------===//
 
+bool hasLoopCarriedAccumulatorCycle(ttng::MMAv5OpInterface mma,
+                                    scf::ForOp forOp) {
+  Value start = mma.getAccDep();
+  Value target = mma.getToken();
+  if (!start || !target)
+    return false;
+
+  // Follow the accumulator dependency backwards, mapping loop block arguments
+  // to their yielded values. A cross-MMA cycle is found when the recurrence
+  // returns to this MMA through another MMA.
+  SmallVector<std::pair<Value, bool>> worklist = {{start, false}};
+  // Following all operands may reach the same value along paths that differ in
+  // whether another MMA was crossed. Track those states separately so that a
+  // visit before crossing another MMA does not suppress a visit after crossing
+  // one.
+  DenseSet<Value> seenBeforeAnotherMMA;
+  DenseSet<Value> seenAfterAnotherMMA;
+  while (!worklist.empty()) {
+    auto [current, crossedAnotherMMA] = worklist.pop_back_val();
+    DenseSet<Value> &seen =
+        crossedAnotherMMA ? seenAfterAnotherMMA : seenBeforeAnotherMMA;
+    if (!seen.insert(current).second)
+      continue;
+    if (current == target) {
+      if (crossedAnotherMMA)
+        return true;
+      continue;
+    }
+
+    if (auto arg = dyn_cast<BlockArgument>(current)) {
+      if (arg.getOwner() == forOp.getBody() && arg.getArgNumber() > 0)
+        worklist.emplace_back(forOp.getYieldedValues()[arg.getArgNumber() - 1],
+                              crossedAnotherMMA);
+      continue;
+    }
+
+    Operation *def = current.getDefiningOp();
+    if (!def || !forOp->isAncestor(def))
+      continue;
+    crossedAnotherMMA |=
+        isa<ttng::MMAv5OpInterface>(def) && def != mma.getOperation();
+    for (Value operand : getNestedOperands(def))
+      worklist.emplace_back(operand, crossedAnotherMMA);
+  }
+  return false;
+}
+
 // Return true if the preconditions for pipelining the loop are met.
 bool preCondition(scf::ForOp forOp) {
   // Skip loop with distance > 1 for now.
@@ -128,6 +175,8 @@ private:
 
 public:
   static bool canHaveSharedEncoding(tt::LoadOp op) {
+    if (!canPipelineInSharedMemory(op))
+      return false;
     // If used by an user with DotOp encoding, all the uses must be compatible.
     bool incompatible = false;
     getSharedEncIfAllUsersAreDotEnc(op.getResult(), incompatible);
@@ -144,8 +193,16 @@ public:
         return false;
       }
     }
-    if (isa<tt::DescriptorLoadLikeOpInterface>(op))
+    if (auto loadOp = dyn_cast<tt::DescriptorLoadLikeOpInterface>(op)) {
+      auto descTy = cast<tt::TensorDescType>(loadOp.getDesc().getType());
+      if (descTy.getSharedLayout() && !canPipelineTMALoad(op)) {
+        LDBG("TMA load " << *op
+                         << " has a per-stage allocation that is not aligned "
+                            "for pipelining");
+        return false;
+      }
       return true;
+    }
     if (!canHaveSharedEncoding(cast<tt::LoadOp>(op))) {
       LDBG("Load " << *op << " cannot have shared encoding");
       return false;
@@ -185,6 +242,82 @@ public:
   }
 };
 
+static void
+collectDescriptorLoads(Value value, scf::ForOp forOp, DenseSet<Value> &visited,
+                       SmallVectorImpl<tt::DescriptorLoadOp> &loads) {
+  if (!visited.insert(value).second)
+    return;
+  Operation *def = value.getDefiningOp();
+  if (!def || !forOp->isAncestor(def))
+    return;
+  if (auto load = dyn_cast<tt::DescriptorLoadOp>(def)) {
+    loads.push_back(load);
+    return;
+  }
+  for (Value operand : getNestedOperands(def))
+    collectDescriptorLoads(operand, forOp, visited, loads);
+}
+
+static LogicalResult
+assignOperandBufferDepths(scf::ForOp forOp, int numStages, bool useMetaWS,
+                          DenseMap<Operation *, int> &opLatency) {
+  auto lhsDepth =
+      forOp->getAttrOfType<IntegerAttr>(tt::kLhsBufferDepthAttrName);
+  auto rhsDepth =
+      forOp->getAttrOfType<IntegerAttr>(tt::kRhsBufferDepthAttrName);
+  if (!lhsDepth && !rhsDepth)
+    return success();
+  if (!lhsDepth || !rhsDepth)
+    return forOp.emitError(
+        "lhs_buffer_depth and rhs_buffer_depth must be specified together");
+  if (!useMetaWS)
+    return forOp.emitError(
+        "operand buffer depths require Meta warp specialization");
+
+  int64_t depths[] = {lhsDepth.getInt(), rhsDepth.getInt()};
+  for (int64_t depth : depths) {
+    if (depth <= 0)
+      return forOp.emitError("operand buffer depths must be positive");
+    if (depth > numStages)
+      return forOp.emitError("operand buffer depth ")
+             << depth << " exceeds num_stages=" << numStages;
+  }
+
+  SmallVector<ttng::MMAv5OpInterface> mmas;
+  for (Operation &op : forOp.getBody()->without_terminator())
+    if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(&op))
+      mmas.push_back(mma);
+  if (mmas.size() != 1)
+    return forOp.emitError("operand buffer depths require exactly one MMA in "
+                           "the annotated loop; found ")
+           << mmas.size();
+
+  SmallVector<tt::DescriptorLoadOp> operandLoads[2];
+  Value operands[] = {mmas.front().getA(), mmas.front().getB()};
+  for (unsigned operand = 0; operand < 2; ++operand) {
+    DenseSet<Value> visited;
+    collectDescriptorLoads(operands[operand], forOp, visited,
+                           operandLoads[operand]);
+    if (operandLoads[operand].size() != 1)
+      return forOp.emitError("could not resolve exactly one descriptor-backed "
+                             "SMEM channel for MMA ")
+             << (operand == 0 ? "lhs" : "rhs") << "; found "
+             << operandLoads[operand].size() << " descriptor loads";
+  }
+  if (operandLoads[0].front() == operandLoads[1].front())
+    return forOp.emitError(
+        "MMA lhs and rhs resolve to the same descriptor-backed SMEM channel");
+
+  auto i32 = IntegerType::get(forOp.getContext(), 32);
+  for (unsigned operand = 0; operand < 2; ++operand) {
+    auto load = operandLoads[operand].front();
+    load->setAttr(tt::kRequestedBufferDepthAttrName,
+                  IntegerAttr::get(i32, depths[operand]));
+    opLatency[load] = depths[operand] - 1;
+  }
+  return success();
+}
+
 class AssignMMALatencies {
 public:
   AssignMMALatencies(scf::ForOp forOp, DenseMap<Operation *, int> &opLatency,
@@ -195,7 +328,7 @@ public:
     DenseMap<Operation *, int> mmaSelfLatency;
     // Check if the load op (mma operand) is pipelineable.
     auto isLoadToBePipelined = [&](Operation *op) {
-      return opLatency.count(op) && opLatency[op] > 0;
+      return opLatency.contains(op) && opLatency[op] > 0;
     };
     for (auto &op : forOp.getBody()->without_terminator()) {
       // If the acc can not be multibuffered, do not pipeline the uses of
@@ -276,6 +409,8 @@ public:
                                  cantWarpSpec)))
                 mmaSelfLatency[mma] = 0;
             }
+            if (hasLoopCarriedAccumulatorCycle(mma, forOp))
+              opLatency.erase(&op);
           }
         }
         // An AutoWS opndD channel already synchronizes MMA completion and
@@ -330,7 +465,8 @@ private:
 // requested number of stages assign the latencies in a way that cover all the
 // stages with the sum of latencies in the chain from the first load to the
 // final dot op.
-void assignLatencies(ModuleOp moduleOp, int defaultNumStages, bool useMetaWS) {
+LogicalResult assignLatencies(ModuleOp moduleOp, int defaultNumStages,
+                              bool useMetaWS) {
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) {
     // Bail out for loops with num_stage <= 1.
@@ -339,7 +475,7 @@ void assignLatencies(ModuleOp moduleOp, int defaultNumStages, bool useMetaWS) {
       loops.push_back(forOp);
   });
   if (loops.empty())
-    return;
+    return success();
 
   DenseMap<Operation *, int> opLatency;
   for (auto forOp : loops) {
@@ -352,9 +488,13 @@ void assignLatencies(ModuleOp moduleOp, int defaultNumStages, bool useMetaWS) {
     }
     int numStages = getNumStagesOrDefault(forOp, defaultNumStages);
     AssignLoadLatencies(forOp, numStages, opLatency).run();
+    if (failed(
+            assignOperandBufferDepths(forOp, numStages, useMetaWS, opLatency)))
+      return failure();
     AssignMMALatencies(forOp, opLatency, useMetaWS).run();
   }
   serializeLatencies(moduleOp, opLatency);
+  return success();
 }
 
 } // namespace
@@ -374,7 +514,7 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
 
   std::function<void(Operation *, Operation *, int)> dfs =
       [&](Operation *op, Operation *finalUser, int distance) {
-        if (!seen.insert(op).second || excluded.count(op))
+        if (!seen.insert(op).second || excluded.contains(op))
           return;
         if (isa<tt::LoadOp, tt::DescriptorLoadLikeOpInterface>(op)) {
           if (!AssignLoadLatencies::isPipeliningBeneficial(
@@ -384,7 +524,7 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
           // TODO: Support user provided non-zero latency for loads.
           if (opLatency.count(op))
             return;
-          if (loadOpToIndLevel.count(op)) {
+          if (loadOpToIndLevel.contains(op)) {
             int level = loadOpToIndLevel[op].first;
             if (level != distance) {
               // If we have multiple uses at different distances, we don't
@@ -462,7 +602,8 @@ struct AssignLatencies
   using TritonGPUAssignLatenciesBase::TritonGPUAssignLatenciesBase;
 
   void runOnOperation() override {
-    assignLatencies(getOperation(), numStages, useMetaWS);
+    if (failed(assignLatencies(getOperation(), numStages, useMetaWS)))
+      signalPassFailure();
   }
 };
 

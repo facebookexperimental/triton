@@ -5,7 +5,6 @@ import triton.language as tl
 import pytest
 
 import pathlib
-import uuid
 from triton._internal_testing import is_cuda, is_hip_cdna2, is_rubin
 from triton.backends.amd.compiler import HIPBackend
 from triton.backends.compiler import GPUTarget
@@ -25,6 +24,100 @@ def do_bench(kernel_call, quantiles, use_cuda_graph=False):
 )
 def test_entropy_warmup_sample_budget(probe_ms, expected):
     assert _autotuner._entropy_warmup_sample_limit(probe_ms, 250) == expected
+
+
+@pytest.mark.parametrize(
+    "rep_ms, sampling_wall_s, n_sampling_launches, kernel_avg_ms, expected",
+    [
+        # Wall-clock denominator: 0.06s over 550 sampling launches ~= 0.109ms/iter.
+        # The kernel average (0.027ms) must NOT be used here: the old formula
+        # sized 100/0.027 = 3703 repeats, overshooting the rep budget ~4x.
+        (100, 0.06, 550, 0.027, 916),
+        # No sampling launches: fall back to the kernel average.
+        (100, 0.0, 0, 0.027, 3703),
+        # Non-positive denominator: fixed fallback count.
+        (100, 0.0, 10, 0.0, 100),
+        # Floor of 10 repeats for slow kernels.
+        (100, 2.0, 10, 50.0, 10),
+        # Ceiling of 10000 repeats for tiny per-iteration costs (bounds the
+        # 2*n_repeat event pre-allocation in _timed_measurement).
+        (100, 0.001, 1000, 0.027, 10000),
+    ],
+)
+def test_entropy_repeat_uses_wall_clock_denominator(rep_ms, sampling_wall_s, n_sampling_launches, kernel_avg_ms,
+                                                    expected):
+    assert (_autotuner._entropy_repeat_count(rep_ms, sampling_wall_s, n_sampling_launches, kernel_avg_ms) == expected)
+
+
+def test_entropy_sampling_syncs_tail_on_early_convergence(monkeypatch):
+    # Fast convergence stops consuming partway through a 50-launch batch, but
+    # all 50 launches were issued and count toward the repeat denominator, so
+    # the final event must be synchronized before returning: otherwise the
+    # caller's wall-clock span excludes the tail's GPU time while the
+    # denominator includes it, underestimating per-iteration cost.
+    created = []
+    synced = []
+
+    class FakeEvent:
+
+        def __init__(self, enable_timing=True):
+            created.append(self)
+
+        def record(self):
+            pass
+
+        def synchronize(self):
+            synced.append(self)
+
+        def elapsed_time(self, other):
+            return 0.027
+
+    class FakeCuda:
+        Event = FakeEvent
+
+    class FakeTorch:
+        cuda = FakeCuda
+
+    monkeypatch.setattr(_autotuner._EntropyCriterion, "is_finished", lambda self: self.total_samples >= 20)
+
+    counter, avg_ms, launched = _autotuner._entropy_sampling(lambda: None, lambda: None, FakeTorch)
+
+    assert counter == 20
+    assert launched == 50
+    assert avg_ms == pytest.approx(0.027)
+    # 20 in-loop syncs plus the final tail event; the skipped middle events
+    # need no sync since the last event orders the whole batch on the stream.
+    assert len(synced) == 21
+    assert synced[-1] is created[-1]
+
+
+def test_cpu_backend_skips_cuda_entropy_benchmark(monkeypatch, fresh_knobs):
+    expected = [1.0, 0.5, 1.5]
+    calls = []
+
+    def fixed_benchmarker(kernel_call, **kwargs):
+        calls.append(kwargs)
+        return expected
+
+    class FakeCPUDriver:
+        is_cpu_backend = True
+
+        def get_benchmarker(self):
+            return fixed_benchmarker
+
+        def get_empty_cache_for_benchmark(self):
+            raise AssertionError("CPU autotuning must not use the CUDA entropy benchmarker")
+
+    monkeypatch.setattr(_autotuner.driver, "_active", FakeCPUDriver())
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    fresh_knobs.autotuning.use_entropy = True
+
+    autotuner = object.__new__(_autotuner.Autotuner)
+    autotuner._do_bench = None
+    result = autotuner.do_bench(lambda: None, quantiles=(0.5, 0.2, 0.8))
+
+    assert result == expected
+    assert len(calls) == 1
 
 
 def test_config_backend_options():
@@ -341,6 +434,121 @@ def test_prune_configs_fractional_top_k_keeps_one(device: str):
     torch.testing.assert_close(src, dst)
 
 
+def test_prune_configs_fractional_top_k_after_early_prune():
+    configs = [triton.Config(kwargs={'BLOCK_SIZE': block_size}) for block_size in range(1, 11)]
+    estimated = []
+    launched = []
+    benchmarked = []
+
+    class Kernel:
+
+        def __init__(self):
+            self.fn = lambda: None
+
+        def run(self, **kwargs):
+            launched.append(kwargs['BLOCK_SIZE'])
+
+    def do_bench(kernel_call, quantiles):
+        kernel_call()
+        benchmarked.append(launched[-1])
+        return [launched[-1]] * 3
+
+    def early_config_prune(configs, named_args, **kwargs):
+        return configs[:6]
+
+    def perf_model(*args, **kwargs):
+        estimated.append(kwargs['BLOCK_SIZE'])
+        return kwargs['BLOCK_SIZE']
+
+    tuner = triton.runtime.Autotuner(
+        Kernel(),
+        arg_names=[],
+        configs=configs,
+        key=[],
+        reset_to_zero=None,
+        restore_value=None,
+        do_bench=do_bench,
+        prune_configs_by={
+            'early_config_prune': early_config_prune,
+            'perf_model': perf_model,
+            'top_k': 0.5,
+        },
+    )
+
+    tuner.run()
+
+    assert estimated == list(range(1, 7))
+    assert benchmarked == [1, 2, 3]
+
+
+def test_unknown_key_name_is_rejected():
+    # `key` is documented as a list of argument names. An unknown name used to be
+    # dropped from the tuning key by run(), so the kernel tuned once and then reused
+    # that config no matter how the real argument changed.
+    class Kernel:
+
+        def __init__(self):
+            self.fn = lambda: None
+
+        def run(self, **kwargs):
+            pass
+
+    for param in ("key", "reset_to_zero", "restore_value"):
+        with pytest.raises(ValueError, match="not kernel arguments"):
+            triton.runtime.Autotuner(
+                Kernel(),
+                arg_names=["n"],
+                configs=[triton.Config(kwargs={"BLOCK_SIZE": 32})],
+                key=["N"] if param == "key" else [],
+                reset_to_zero=["N"] if param == "reset_to_zero" else None,
+                restore_value=["N"] if param == "restore_value" else None,
+            )
+
+
+def test_restore_value_with_user_pre_hook():
+    # A user-supplied pre_hook replaces the default one that populates restore_copies,
+    # but the default post_hook that reads it stays installed, so running the autotuner
+    # used to raise AttributeError instead of benchmarking.
+    launched = []
+
+    class Kernel:
+
+        def __init__(self):
+            self.fn = lambda: None
+
+        def run(self, **kwargs):
+            launched.append(kwargs["BLOCK_SIZE"])
+
+    def do_bench(kernel_call, quantiles):
+        kernel_call()
+        return [1.0, 1.0, 1.0]
+
+    tuner = triton.runtime.Autotuner(
+        Kernel(),
+        arg_names=["x"],
+        configs=[triton.Config(kwargs={"BLOCK_SIZE": 32}),
+                 triton.Config(kwargs={"BLOCK_SIZE": 64})],
+        key=[],
+        reset_to_zero=None,
+        restore_value=["x"],
+        pre_hook=lambda kwargs, reset_only=False: None,
+        do_bench=do_bench,
+    )
+
+    tuner.run(x=None)
+
+    # Both configs get benchmarked, then the winner is launched for real.
+    assert launched[:2] == [32, 64]
+
+
+def test_config_ir_override_changes_disk_cache_key():
+    # Autotuner derives persisted result-cache keys from Config.__str__().
+    first = triton.Config(kwargs={"BLOCK_SIZE": 32}, ir_override="first.ttir")
+    second = triton.Config(kwargs={"BLOCK_SIZE": 32}, ir_override="second.ttir")
+
+    assert str(first) != str(second)
+
+
 @pytest.mark.parametrize("prune_kind", ["early_config_prune", "perf_model"])
 def test_pruned_single_config_skips_benchmark(prune_kind: str, device: str, fresh_knobs):
     N = 1024
@@ -425,7 +633,7 @@ def test_pruned_single_config_preserves_ir_pruning(device: str):
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
                     reason="Requires compute capability >= 9 for NV")
-def test_override_ttir(device):
+def test_override_ttir(device, tmp_path: pathlib.Path):
     N = 1024
     src = torch.randn(N, device=device)
     dst = torch.empty(N, device=device)
@@ -453,7 +661,7 @@ module {
   }
 }
     """
-    temp_file = pathlib.Path(f"/tmp/test_override_{str(uuid.uuid4())}.ttir")
+    temp_file = tmp_path / "test_override.ttir"
     temp_file.write_text(ir_src)
 
     configs = [triton.Config(kwargs={'BLOCK_SIZE': 32, 'ir_override': str(temp_file)})]
@@ -474,7 +682,7 @@ module {
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
                     reason="Requires compute capability >= 9 for NV")
-def test_override_ttgir(device):
+def test_override_ttgir(device, tmp_path: pathlib.Path):
     N = 1024
     src = torch.randn(N, device=device)
     dst = torch.empty(N, device=device)
@@ -503,7 +711,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
     """
-    temp_file = pathlib.Path(f"/tmp/test_override_{str(uuid.uuid4())}.ttgir")
+    temp_file = tmp_path / "test_override.ttgir"
     temp_file.write_text(ir_src)
 
     configs = [triton.Config(kwargs={'BLOCK_SIZE': 32, 'ir_override': str(temp_file)})]
@@ -524,7 +732,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] != 9,
                     reason="PTX file in this unit test is only for SM90")
-def test_override_ptx(device):
+def test_override_ptx(device, tmp_path: pathlib.Path):
     N = 1024
     src = torch.randn(N, device=device)
     dst = torch.empty(N, device=device)
@@ -600,7 +808,7 @@ $L__func_end0:
                                         // -- End function
 }
     """
-    temp_file = pathlib.Path(f"/tmp/test_override_{str(uuid.uuid4())}.ptx")
+    temp_file = tmp_path / "test_override.ptx"
     temp_file.write_text(ir_src)
 
     configs = [triton.Config(kwargs={'BLOCK_SIZE': 32, 'ir_override': str(temp_file)})]
@@ -633,7 +841,7 @@ def test_exceed_tmem(device):
         if exception is not None:
             exception_out_of_resource = exception
 
-    @triton.autotune(configs=configs, key=['N'], do_bench=do_bench, pre_hook=None, post_hook=_post_hook)
+    @triton.autotune(configs=configs, key=[], do_bench=do_bench, pre_hook=None, post_hook=_post_hook)
     @triton.jit
     def dot_kernel(dst, BLOCK_SIZE: tl.constexpr):
         a = tl.full((BLOCK_SIZE, BLOCK_SIZE), 0.0, tl.float16)
@@ -893,19 +1101,27 @@ def test_generate_wave_quant_candidates_appends_npot_and_noop():
     assert npot, "expected wave-quant NPOT candidates for a bad tail"
 
 
-def test_npot_runtime_error_prunable_gating():
-    pow2_cfg = triton.Config(kwargs={'BLOCK_M': 128})
-    npot_cfg = _autotuner._clone_config(pow2_cfg, BLOCK_M=96)
-    # A pow2 config must re-raise even a device error (never be masked).
-    assert _autotuner._npot_runtime_error_prunable(pow2_cfg, RuntimeError("Triton Error [CUDA]: out of memory"),
-                                                   allow_npot=True) is False
-    # An NPOT config under the flag is prunable on a device failure -- case-insensitively and across
-    # both backends (CUDA and HIP).
-    for msg in ("Triton Error [CUDA]: misaligned address", "Triton Error [HIP]: out of memory range.", "Out Of Memory",
-                "an illegal memory access was encountered"):
-        assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError(msg), allow_npot=True) is True
-    # Flag off, or a non-device RuntimeError -> re-raise.
-    assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError("Triton Error [CUDA]: x"),
-                                                   allow_npot=False) is False
-    assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError("invalid config value"),
-                                                   allow_npot=True) is False
+def _autotune_with_failing_block(fail_block):
+    # A real compile failure: the reshape needs BLOCK to be a multiple of 64, which only 128 is.
+    @triton.autotune(configs=[triton.Config({'BLOCK': fail_block}),
+                              triton.Config({'BLOCK': 128})], key=['n'], do_bench=do_bench)
+    @triton.jit
+    def _kernel(x_ptr, n, BLOCK: tl.constexpr):
+        offs = tl.arange(0, BLOCK)
+        x = tl.reshape(tl.load(x_ptr + offs, mask=offs < n), (BLOCK // 64, 64))
+        tl.store(x_ptr + offs, tl.reshape(x, (BLOCK, )), mask=offs < n)
+
+    return _kernel
+
+
+def test_autotune_skips_npot_config_that_fails_to_compile(fresh_knobs, device):
+    fresh_knobs.language.allow_npot = True
+    kernel = _autotune_with_failing_block(96)
+    kernel[(1, )](torch.randn(128, device=device), 128)
+    assert kernel.best_config.kwargs['BLOCK'] == 128
+
+
+def test_autotune_raises_when_pow2_config_fails_to_compile(fresh_knobs, device):
+    fresh_knobs.language.allow_npot = True
+    with pytest.raises(triton.CompilationError):
+        _autotune_with_failing_block(32)[(1, )](torch.randn(128, device=device), 128)

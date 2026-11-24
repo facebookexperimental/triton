@@ -13,6 +13,8 @@ from .schedule import (
     DynamicPersistent1DScheduler,
 )
 from .standard import (
+    all,
+    any,
     argmax,
     argmin,
     bitonic_merge,
@@ -60,10 +62,12 @@ from .core import (
     atomic_add,
     atomic_and,
     atomic_cas,
+    atomic_load,
     atomic_max,
     atomic_min,
     atomic_or,
     atomic_poll,
+    atomic_store,
     atomic_xchg,
     atomic_xor,
     bfloat16,
@@ -87,6 +91,8 @@ from .core import (
     float16,
     float32,
     float64,
+    float4e2m1x2,
+    float8e8m0fnu,
     float8e4b15,
     float8e4nv,
     float8e4b8,
@@ -126,6 +132,7 @@ from .core import (
     static_print,
     static_range,
     store,
+    sr_store,
     sub,
     tensor,
     to_tensor,
@@ -174,6 +181,8 @@ __all__ = [
     "add",
     "aggregate_replace",
     "advance",
+    "all",
+    "any",
     "arange",
     "argmax",
     "argmin",
@@ -190,10 +199,12 @@ __all__ = [
     "atomic_add",
     "atomic_and",
     "atomic_cas",
+    "atomic_load",
     "atomic_max",
     "atomic_min",
     "atomic_or",
     "atomic_poll",
+    "atomic_store",
     "atomic_xchg",
     "atomic_xor",
     "bfloat16",
@@ -230,6 +241,8 @@ __all__ = [
     "float16",
     "float32",
     "float64",
+    "float4e2m1x2",
+    "float8e8m0fnu",
     "float8e4b15",
     "float8e4nv",
     "float8e4b8",
@@ -296,6 +309,7 @@ __all__ = [
     "static_print",
     "static_range",
     "store",
+    "sr_store",
     "sub",
     "sum",
     "swizzle2d",
@@ -355,7 +369,8 @@ def str_to_ty(name, c):
             rest = rest[:rank_match.start()] + rest[rank_match.end():]
         layout_str = rest.lstrip(",")
         is_gluon = len(layout_str)
-        dtype = str_to_ty(dtype, None)
+        fp6_format = dtype[3:] if dtype in ("fp6e2m3", "fp6e3m2") else None
+        dtype = uint8 if fp6_format else str_to_ty(dtype, None)
         # For im2col with tensor_rank, use it for shape/stride types; otherwise use block_shape ndim
         ndim = tensor_rank if (is_im2col and tensor_rank is not None) else len(block_shape)
         shape_type = tuple_type([int32] * ndim)
@@ -366,7 +381,7 @@ def str_to_ty(name, c):
             from triton.experimental.gluon.language._layouts import NVMMASharedLayout, PaddedSharedLayout, SwizzledSharedLayout
             from triton.experimental.gluon.language.nvidia.hopper.tma import tensor_descriptor_type as nvidia_tensor_descriptor_type
             from triton.experimental.gluon.language.nvidia.hopper.tma import tensor_descriptor_im2col_type as nvidia_tensor_descriptor_im2col_type
-            from triton.experimental.gluon.language.amd.gfx1250.tdm import tensor_descriptor_type as amd_tensor_descriptor_type
+            from triton.experimental.gluon.language.amd.cdna5.tdm import tensor_descriptor_type as amd_tensor_descriptor_type
             layout = eval(
                 layout_str,
                 dict(NVMMASharedLayout=NVMMASharedLayout, PaddedSharedLayout=PaddedSharedLayout,
@@ -377,7 +392,7 @@ def str_to_ty(name, c):
                 return nvidia_tensor_descriptor_type(block, shape_type, stride_type, layout)
             else:
                 return amd_tensor_descriptor_type(block, shape_type, stride_type, layout)
-        return tensor_descriptor_type(block, shape_type, stride_type)
+        return tensor_descriptor_type(block, shape_type, stride_type, fp6_format)
 
     if name.startswith("nvTmaDesc"):
         return nv_tma_desc_type()
@@ -386,6 +401,8 @@ def str_to_ty(name, c):
         return constexpr_type(c)
 
     tys = {
+        "fp4e2m1x2": float4e2m1x2,
+        "fp8e8m0fnu": float8e8m0fnu,
         "fp8e4nv": float8e4nv,
         "fp8e4b8": float8e4b8,
         "fp8e5": float8e5,

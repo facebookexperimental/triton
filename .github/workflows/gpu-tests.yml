@@ -1,0 +1,172 @@
+name: Meta Triton GPU Tests
+#
+#   select ──► build ──┬─► h100       (h100.yml)
+#                      ├─► b200       (b200.yml)
+#                      └─► mi350      (mi350.yml)
+#   all of the above ──► GPU tests  (fails if any job failed or was cancelled; on PRs, also hands the
+#                                    wheel to tlx-codegen-trace.yml, which starts after this run succeeds)
+#
+# Downstream workflows (each reads this workflow by name or file; update them when renaming either):
+#   tlx-codegen-trace.yml  starts on this run's completion (workflow_run) and reads its follow-up manifest
+#   ci-health.yml          collects these runs for the /ci/ dashboard (ci_health.py, ci_health_rules.py)
+#
+# select picks the platforms and tests for this change; build makes one wheel that every test job installs.
+# Changes only to docs, Markdown outside .github/, LIT tests (compiler.yml runs those) or agent instructions do not
+# start this workflow; every path the trigger skips is one the selector already skips on all platforms.
+# Each platform shows up as its own check. To stop one platform, for example while its runners are offline,
+# set the repository variable GPU_CI_SKIP_PLATFORMS (for example "b200" or "b200,mi350"); its check then shows
+# as skipped.
+
+on:
+  pull_request:
+    # Order matters: a later rule overrides an earlier one. Markdown under .github/ is re-included because
+    # the selector still tests some of it (for example a README in a test action).
+    paths: &trigger
+      - '**'
+      - '!**/*.md'
+      - '!docs/**'
+      - '!website/**'
+      - '!test/**'
+      - '!.agents/**'
+      - '!.claude/**'
+      - '!.llms/**'
+      - '!third_party/tlx/tools/agents/skills/**'
+      - '.github/**'
+  push:
+    branches: [main]
+    paths: *trigger
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Comma-separated platform list: h100,b200,mi350; blank keeps normal selection'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+# A new push to a PR cancels its older run; pushes to main and scheduled runs always finish.
+concurrency:
+  group: gpu-tests-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  select:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read  # a bump PR looks up its head's push run
+    outputs:
+      sha: ${{ steps.select.outputs.sha }}
+      build: ${{ steps.select.outputs.build }}
+      h100: ${{ steps.select.outputs.h100 }}
+      b200: ${{ steps.select.outputs.b200 }}
+      mi350: ${{ steps.select.outputs.mi350 }}
+      h100_plan: ${{ steps.select.outputs.h100_plan }}
+      b200_plan: ${{ steps.select.outputs.b200_plan }}
+      mi350_plan: ${{ steps.select.outputs.mi350_plan }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select test work
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GPU_CI_SKIP_PLATFORMS: ${{ vars.GPU_CI_SKIP_PLATFORMS }}
+        run: python3 .github/scripts/gpu_test_selection.py
+
+  build:
+    needs: select
+    if: needs.select.outputs.build == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.select.outputs.sha }}
+
+  # Each platform runs when select picked it and GPU_CI_SKIP_PLATFORMS does not name it.
+  # Test jobs run the change's code with read-only tokens; only the issue reporters inside write.
+  h100:
+    needs: [select, build]
+    if: needs.select.outputs.h100 == 'true' && !contains(vars.GPU_CI_SKIP_PLATFORMS, 'h100')
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    uses: ./.github/workflows/h100.yml
+    with:
+      plan: ${{ needs.select.outputs.h100_plan }}
+      ref: ${{ needs.select.outputs.sha }}
+      wheel_url: ${{ needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+
+  b200:
+    needs: [select, build]
+    if: needs.select.outputs.b200 == 'true' && !contains(vars.GPU_CI_SKIP_PLATFORMS, 'b200')
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    uses: ./.github/workflows/b200.yml
+    with:
+      plan: ${{ needs.select.outputs.b200_plan }}
+      ref: ${{ needs.select.outputs.sha }}
+      wheel_url: ${{ needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+
+  mi350:
+    needs: [select, build]
+    if: needs.select.outputs.mi350 == 'true' && !contains(vars.GPU_CI_SKIP_PLATFORMS, 'mi350')
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    uses: ./.github/workflows/mi350.yml
+    with:
+      plan: ${{ needs.select.outputs.mi350_plan }}
+      ref: ${{ needs.select.outputs.sha }}
+      wheel_url: ${{ needs.build.outputs.wheel_url }}
+      wheel_filename: ${{ needs.build.outputs.wheel_filename }}
+      wheel_sha256: ${{ needs.build.outputs.wheel_sha256 }}
+
+  gpu-tests:
+    name: GPU tests
+    needs: [select, build, h100, b200, mi350]
+    if: always() && github.repository_owner == 'facebookexperimental'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any job failed or was cancelled
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      # tlx-codegen-trace.yml starts after this run succeeds and takes the PR's wheel from this manifest.
+      - uses: actions/checkout@v6
+        if: github.event_name == 'pull_request' && needs.build.result == 'success'
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - name: Write the follow-up manifest
+        if: github.event_name == 'pull_request' && needs.build.result == 'success'
+        id: followup
+        env:
+          WHEEL: ${{ needs.build.outputs.wheel }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/fast_followup.py manifest --out "${RUNNER_TEMP}/followup/fast-followup.json"
+      - name: Upload the follow-up manifest
+        if: steps.followup.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.followup.outputs.name }}
+          path: ${{ runner.temp }}/followup/fast-followup.json
+          if-no-files-found: error
