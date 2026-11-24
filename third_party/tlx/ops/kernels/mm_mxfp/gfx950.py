@@ -1683,9 +1683,12 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                 reverse_local_assignment=m == 2048,
                 sink_insts_to_avoid_spills=True,
                 mfma_vgpr_form=False,
+                ROTATE=8,
+                ROT_STRIDE=2 if m == 1024 else 0,
             )
             reduce_n = 256 if m == 2048 else 128
-            _reduce_split_k[(m // 32, n // reduce_n)](workspace, out, m, n, split_k, 32, reduce_n, num_warps=8)
+            _reduce_split_k[(m // 32, n // reduce_n)](workspace, out, m, n, split_k, 32, reduce_n, STREAMING=m == 2048,
+                                                      num_warps=8)
             return out
         if ((m, n, k) in {(1024, 1024, 24576), (2048, 1024, 24576)} and sf_layout in {"natural", "cublas_blocked"}
                 and (any(tensor.data_ptr() % 16 for tensor in (a, b, out)) or any(tensor.data_ptr() % 8
@@ -1707,10 +1710,11 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                 disable_unclustered_high_rp_reschedule=True,
             )
             return out
-        if ((m, n, k) == (1024, 1024, 159744) and sf_layout == "cublas_blocked"
+        long_k_256x256_split = {(1024, 1024, 159744): 16, (1024, 6144, 159744): 8, (2048, 6144, 159744): 4}
+        if ((m, n, k) in long_k_256x256_split and sf_layout == "cublas_blocked"
                 and all(tensor.data_ptr() % 16 == 0 for tensor in (a, b, out))
                 and all(tensor.data_ptr() % 8 == 0 for tensor in (a_scale, b_scale))):
-            split_k = 12
+            split_k = long_k_256x256_split[(m, n, k)]
             workspace = _allocate_split_workspace(a, split_k, m, n)
             _gemm_native_256x256_split16[(m // 256 * (n // 256) * split_k, )](
                 a,
@@ -1727,6 +1731,7 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                 2,
                 split_k,
                 BALANCED_G2L_CADENCE=True,
+                FLY_CADENCE=True,
                 num_warps=4,
                 num_stages=1,
                 matrix_instr_nonkdim=32,
@@ -1765,6 +1770,7 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                 2,
                 1,
                 SCALES_SHUFFLED=sf_layout == "mfma_preshuffled",
+                FLY_CADENCE=(m, n, k) in {(2048, 32768, 6144), (2048, 8192, 3072)} and sf_layout == "cublas_blocked",
                 BALANCED_G2L_CADENCE=(m, n, k) in {
                     (1024, 32768, 6144),
                     (2048, 32768, 6144),
@@ -1772,6 +1778,8 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                     (2048, 15360, 3584),
                 },
                 STREAMING_STORE=(m, n, k) in {
+                    (1024, 32768, 6144),
+                    (2048, 8192, 3072),
                     (2048, 23040, 1792),
                     (2048, 22464, 1024),
                 },
@@ -1785,6 +1793,7 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                 sink_insts_to_avoid_spills=True,
                 regclass_priority_trumps_globalness=True,
                 mfma_vgpr_form=False,
+                llvm_fn_attrs=((("amdgpu-post-sched-strategy", "nop"), ) if (m, n, k) == (1024, 32768, 6144) else ()),
             )
             return out
         if ((m, n, k) == (2048, 3584, 25600) and sf_layout == "cublas_blocked"):
@@ -1864,9 +1873,6 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                 (m, n, k) == (2048, 3072, 12416) and sf_layout in {"cublas_blocked", "mfma_preshuffled"})
         if native_128x192:
             scales_shuffled = sf_layout == "mfma_preshuffled"
-            if ((m, n, k) == (2048, 3072, 12416) and sf_layout == "cublas_blocked"):
-                a_scale, b_scale = _pack_mfma_scale_pair_from_blocked(a_scale, b_scale, m, n, k, 2, 3)
-                scales_shuffled = True
             return _gemm_native_cadence_128x192[(m // 128 * (n // 192), )](
                 a,
                 b,
@@ -1890,6 +1896,7 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                 reverse_local_assignment=False,
                 sink_insts_to_avoid_spills=True,
                 mfma_vgpr_form=False,
+                ROTATE=4 if (m, n, k) == (2048, 3072, 12416) else 0,
             )
         if mi32_256x192_shape and (sf_layout == "cublas_blocked" or mfma_preshuffled_256x192):
             if (m, n, k) in {
@@ -1908,6 +1915,11 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                     (2048, 3584, 25600),
                 } else 2
                 workspace = _allocate_split_workspace(a, split_k, m, n)
+                split2_rotation = {
+                    (1024, 3072, 15360): dict(ROTATE=8, ROT_STRIDE=2),
+                    (2048, 3072, 15360): dict(ROTATE=16),
+                    (1024, 6144, 22656): dict(ROTATE=16),
+                }
                 _gemm_native_cadence_split2[(m // 256 * triton.cdiv(n, 192) * split_k, )](
                     a,
                     b,
@@ -1939,11 +1951,13 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                     }),
                     sink_insts_to_avoid_spills=True,
                     mfma_vgpr_form=False,
+                    **split2_rotation.get((m, n, k), {}),
                 )
                 if (m, n) == (1024, 6144):
                     _reduce_split_k[(m // 16, n // 64)](workspace, out, m, n, split_k, 16, 64, num_warps=4)
                 else:
-                    _reduce_split_k[(m // 32, n // 128)](workspace, out, m, n, split_k, 32, 128, num_warps=8)
+                    _reduce_split_k[(m // 32, n // 128)](workspace, out, m, n, split_k, 32, 128,
+                                                         STREAMING=(m, n, k) == (1024, 3072, 15360), num_warps=8)
                 return out
             if (m, n, k) in {
                 (1024, 36864, 1024),
@@ -1975,20 +1989,26 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                     GROUP_M=(8 if (m, n, k) in {
                         (1024, 24576, 6144),
                         (2048, 6144, 159744),
-                    } else 4),
+                    } else (2 if (m, n, k) == (1024, 36864, 1024) else 4)),
                     A_SHUFFLED=a_shuffled,
                     B_SHUFFLED=b_shuffled,
                     num_warps=4,
                     num_stages=1,
                     matrix_instr_nonkdim=32,
-                    enable_sched_group_barrier_scheduler=not (mfma_preshuffled_256x192 and
-                                                              (m, n, k) == (2048, 6144, 67584)),
+                    enable_sched_group_barrier_scheduler=not ((mfma_preshuffled_256x192 and
+                                                               (m, n, k) == (2048, 6144, 67584)) or
+                                                              (m, n, k) == (1024, 36864, 1024)),
                     sched_group_barrier_mfma_per_dwordx4=4,
                     disable_unclustered_high_rp_reschedule=True,
                     reverse_local_assignment=False,
                     sink_insts_to_avoid_spills=True,
                     mfma_vgpr_form=False,
                     schedule_hint="mfma-schedule" if (m, n, k) == (2048, 6144, 39936) else "",
+                    ROTATE=4 if (m, n, k) == (2048, 6144, 22656) else 0,
+                    llvm_fn_attrs=((
+                        ("amdgpu-sched-strategy", "max-ilp"),
+                        ("amdgpu-post-sched-strategy", "nop"),
+                    ) if (m, n, k) == (1024, 36864, 1024) else ()),
                 )
             split_k = (1 if k in {1024, 6144} or (m, k) == (2048, 39936) else (4 if (m, k) == (1024, 12416) else
                                                                                (1 if (m, k) == (2048, 22656) else 2)))
@@ -1998,7 +2018,7 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
             workspace = (_allocate_split_workspace(a, split_k, m, n) if split_k > 1 else out)
             _gemm_mi32_256x192[(m // 256 * (n // 192) * split_k, )](
                 a, b, out, workspace, a_scale.view(torch.uint8), b_scale.view(torch.uint8), m, n, k, k_tiles, split_k,
-                (8 if (m, n, k) == (2048, 36864, 1024) else (2 if k in {6144, 12416} else 4)),
+                (3 if (m, n, k) == (2048, 36864, 1024) else (2 if k in {6144, 12416} else 4)),
                 HAS_TAIL=k_tiles * split_k != k // 128, STREAMING_STORE=(k == 1024 or (m, n, k) in {
                     (1024, 24576, 6144),
                 }), num_warps=4, num_stages=1, matrix_instr_nonkdim=32, waves_per_eu=(0 if (m, n, k) in {
@@ -2015,10 +2035,15 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                 schedule_hint=("" if (m, n, k) in {
                     (1024, 36864, 1024),
                     (2048, 36864, 1024),
-                } else "mfma-schedule"), llvm_fn_attrs=(("amdgpu-sched-strategy", "iterative-minreg"), ) if
-                (m, n, k) == (1024, 6144, 39936) else "")
+                    (1024, 3072, 12416),
+                } else "mfma-schedule"), llvm_fn_attrs={
+                    (1024, 6144, 39936): (("amdgpu-sched-strategy", "iterative-minreg"), ),
+                    (2048, 36864, 1024): (("amdgpu-sched-strategy", "iterative-maxocc"), ),
+                    (1024, 3072, 12416): (("amdgpu-sched-strategy", "max-ilp"), ),
+                }.get((m, n, k), ""))
             if split_k > 1:
-                _reduce_split_k[(m // 32, n // 128)](workspace, out, m, n, split_k, 32, 128, num_warps=8)
+                _reduce_split_k[(m // 32, n // 128)](workspace, out, m, n, split_k, 32, 128,
+                                                     STREAMING=(m, n, k) == (1024, 3072, 12416), num_warps=8)
             return out
         if ((m, n, k) == (1024, 8192, 3072) and sf_layout == "cublas_blocked"
                 and all(tensor.data_ptr() % 16 == 0 for tensor in (a, b, out))
@@ -2162,6 +2187,8 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                 (2048, 159744, 1024),
             }:
                 group_m = 7
+            elif (m, n, k) == (2048, 24576, 6144):
+                group_m = 3
             else:
                 group_m = 8 if model_linear and n >= 153600 else 4
             workspace = (_allocate_split_workspace(a, split_k, m, n) if split_k > 1 else out)
@@ -2181,8 +2208,10 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
             _gemm_interwave[(m // 256 * (n // 256) * split_k, )](
                 a, b, out, workspace, locks, sa, sb, m, n, k // 128 // split_k, k, split_k, group_m,
                 sf_layout == "cublas_blocked", model_xcd, num_warps=8, num_stages=1, K_MAJOR=k_major,
-                UNEVEN_SPLIT=uneven_split, LLVM_MFMA_SCHED=use_mfma_schedule,
-                LOOP_UNROLL_FACTOR=(3 if (m, n, k) == (1024, 6144, 39936) else (2 if (m, n, k) in {
+                UNEVEN_SPLIT=uneven_split, LLVM_MFMA_SCHED=use_mfma_schedule and (m, n, k) not in {
+                    (1024, 153600, 1024),
+                    (2048, 159744, 1024),
+                }, LOOP_UNROLL_FACTOR=(3 if (m, n, k) == (1024, 6144, 39936) else (2 if (m, n, k) in {
                     (1024, 6144, 22656),
                     (2048, 6144, 22656),
                 } else 1)), WINDOWED_K64=(m, n, k) == (2048, 1024, 24576), FUSED_SPLIT_REDUCE=fused_split_reduce,
@@ -2206,7 +2235,11 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                     (2048, 6144, 22656),
                 } else 0), disable_unclustered_high_rp_reschedule=(not prepacked_k_major
                                                                    and (m, n, k) != (1024, 64512, 1024)),
-                reverse_local_assignment=((k != 1024 or (m, n) == (2048, 64512)) and (m, n, k) not in {
+                reverse_local_assignment=((k != 1024 or (m, n) in {
+                    (2048, 64512),
+                    (2048, 153600),
+                    (2048, 159744),
+                }) and (m, n, k) not in {
                     (1024, 24576, 6144),
                     (1024, 32768, 6144),
                     (1024, 1024, 24576),
@@ -2216,13 +2249,21 @@ def _launch(a, a_scale, b, b_scale, out, *, sf_layout):
                     (2048, 32768, 6144),
                     (2048, 6144, 22656),
                 }), sink_insts_to_avoid_spills=(m, n, k) == (2048, 1024, 24576),
-                enable_sched_group_barrier_scheduler=(k == 6144 or (m, n, k) in {
+                enable_sched_group_barrier_scheduler=((k == 6144 and (m, n, k) != (2048, 24576, 6144)) or (m, n, k) in {
                     (1024, 64512, 1024),
+                    (1024, 153600, 1024),
                     (2048, 8192, 3072),
-                }), schedule_hint="mfma-schedule" if use_mfma_schedule else "",
-                regclass_priority_trumps_globalness=(m, n, k) == (2048, 1024, 24576),
-                llvm_fn_attrs=((("amdgpu-sched-strategy", "iterative-ilp"), ) if (m, n, k) == (2048, 3072, 15360) else
-                               ()))
+                    (2048, 159744, 1024),
+                }), sched_group_barrier_mfma_per_dwordx4=2 if (m, n, k) == (2048, 159744, 1024) else 4,
+                schedule_hint="mfma-schedule" if use_mfma_schedule else "",
+                regclass_priority_trumps_globalness=(m, n, k) in {
+                    (1024, 153600, 1024),
+                    (2048, 1024, 24576),
+                }, llvm_fn_attrs={
+                    (2048, 3072, 15360): (("amdgpu-sched-strategy", "iterative-ilp"), ),
+                    (2048, 24576, 6144): (("amdgpu-post-sched-strategy", "nop"), ),
+                }.get((m, n, k), ()), llvm_cl_opts=(("amdgpu-use-amdgpu-trackers", "false"),
+                                                    ("greedy-compact-slot-indexes", "false")))
             if split_k > 1 and not fused_split_reduce:
                 _reduce_split_k[(m // 32, n // 128)](workspace, out, m, n, split_k, 32, 128, STREAMING=(m, n, k) in {
                     (1024, 6144, 22656),
@@ -2885,72 +2926,6 @@ def _n256x192_packed_scale_word(low, high):
 
 
 @triton.jit
-def _pack_mfma_scale_operand_from_blocked(source, output, rows: tl.constexpr, panels: tl.constexpr,
-                                          repeat: tl.constexpr, atom, lane):
-    blocks_per_chunk: tl.constexpr = triton.cdiv(repeat, 2)
-    chunks: tl.constexpr = triton.cdiv(rows, repeat * 32)
-    atoms: tl.constexpr = chunks * blocks_per_chunk * panels
-    block = atom // panels
-    panel = atom % panels
-    pair = block % blocks_per_chunk
-    low_row = block // blocks_per_chunk * repeat * 32 + pair * 64 + lane
-    high_row = low_row + 32
-    low_offset = (low_row // 128 * panels * 128 + panel * 128 + low_row % 32 * 4 + low_row % 128 // 32)
-    high_offset = (high_row // 128 * panels * 128 + panel * 128 + high_row % 32 * 4 + high_row % 128 // 32)
-    low = tl.load(
-        source.to(tl.pointer_type(tl.uint32)) + low_offset,
-        mask=(atom < atoms) & (low_row < rows),
-        other=0x7F7F7F7F,
-    )
-    high = tl.load(
-        source.to(tl.pointer_type(tl.uint32)) + high_offset,
-        mask=(atom < atoms) & (pair * 2 + 1 < repeat) & (high_row < rows),
-        other=0x7F7F7F7F,
-    )
-    output_offset = atom * 64 + lane
-    tl.store(
-        output.to(tl.pointer_type(tl.uint32)) + output_offset,
-        _n256x192_packed_scale_permute(low, high, tl.full(low.shape, 0x06020400, tl.uint32)),
-        mask=atom < atoms,
-    )
-    tl.store(
-        output.to(tl.pointer_type(tl.uint32)) + output_offset + 32,
-        _n256x192_packed_scale_permute(low, high, tl.full(low.shape, 0x07030501, tl.uint32)),
-        mask=atom < atoms,
-    )
-
-
-@triton.jit
-def _pack_mfma_scale_pair_from_blocked_kernel(A, B, OA, OB, A_ROWS: tl.constexpr, B_ROWS: tl.constexpr,
-                                              PANELS: tl.constexpr, A_REPEAT: tl.constexpr, B_REPEAT: tl.constexpr,
-                                              ATOMS_PER_CTA: tl.constexpr):
-    word_id = tl.arange(0, 32 * ATOMS_PER_CTA)
-    atom = tl.program_id(0) * ATOMS_PER_CTA + word_id // 32
-    lane = word_id % 32
-    _pack_mfma_scale_operand_from_blocked(A, OA, A_ROWS, PANELS, A_REPEAT, atom, lane)
-    _pack_mfma_scale_operand_from_blocked(B, OB, B_ROWS, PANELS, B_REPEAT, atom, lane)
-
-
-def _pack_mfma_scale_pair_from_blocked(a_scale, b_scale, m, n, k, a_repeat, b_repeat):
-    panels = k // 128
-    a_blocks = triton.cdiv(m, a_repeat * 32) * triton.cdiv(a_repeat, 2)
-    b_blocks = triton.cdiv(n, b_repeat * 32) * triton.cdiv(b_repeat, 2)
-    a_out = torch.empty(a_blocks * panels * 256, dtype=torch.uint8, device=a_scale.device)
-    b_out = torch.empty(b_blocks * panels * 256, dtype=torch.uint8, device=b_scale.device)
-    atoms_per_cta = 16
-    atoms = max(a_blocks, b_blocks) * panels
-    _pack_mfma_scale_pair_from_blocked_kernel[(triton.cdiv(atoms,
-                                                           atoms_per_cta), )](a_scale.view(torch.uint8),
-                                                                              b_scale.view(torch.uint8), a_out, b_out,
-                                                                              m, n, panels, a_repeat, b_repeat,
-                                                                              atoms_per_cta, num_warps=4)
-    return (
-        a_out.view(torch.float8_e8m0fnu).reshape(-1, 512),
-        b_out.view(torch.float8_e8m0fnu).reshape(-1, 512),
-    )
-
-
-@triton.jit
 def _n256x192_packed_scale_a_finish(a_pairs):
     return tl.tuple([_n256x192_packed_scale_word(pair.to(tl.uint32), (pair >> 32).to(tl.uint32)) for pair in a_pairs])
 
@@ -3125,7 +3100,10 @@ def _n256x192_cadence_read_at(a_stage, b_stage, a, b, INDEX: tl.constexpr, dot_a
 def _n256x192_cadence_compute(A, B, SA, SB, pm, pn, panel, a_current, b_current, a_next, b_next, a, b, sa, sb, acc,
                               mma: tl.constexpr, dot_a: tl.constexpr, dot_b: tl.constexpr, M: tl.constexpr,
                               N: tl.constexpr, K: tl.constexpr, LOAD_FUTURE: tl.constexpr, LOAD_NEXT: tl.constexpr,
-                              A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False):
+                              A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False, first_panel=0, rot=0,
+                              PIECE: tl.constexpr = 0):
+    next_panel = _rotated_panel(panel + 1, first_panel, rot, PIECE)
+    future_panel = _rotated_panel(panel + 2, first_panel, rot, PIECE)
     a_pairs = tl.tuple([])
     b_pairs = tl.tuple([])
     a_words = sa
@@ -3137,26 +3115,26 @@ def _n256x192_cadence_compute(A, B, SA, SB, pm, pn, panel, a_current, b_current,
                 if A_SHUFFLED:
                     if index == 0:
                         tlx.amd_sched_barrier(0)
-                        a_words = _n256x192_packed_scale_a_shuffled(SA, pm, panel + 1, K)
+                        a_words = _n256x192_packed_scale_a_shuffled(SA, pm, next_panel, K)
                         tlx.amd_sched_barrier(0)
                 elif M % 256 == 0:
                     if index == 0:
                         tlx.amd_sched_barrier(0)
-                        a_pairs = _n256x192_packed_scale_a_pairs(SA, pm * 256, panel + 1, M, K)
+                        a_pairs = _n256x192_packed_scale_a_pairs(SA, pm * 256, next_panel, M, K)
                         tlx.amd_sched_barrier(0)
                 else:
                     tlx.amd_sched_barrier(0)
-                    a_pairs += tl.tuple([_n256x192_packed_scale_pair(SA, pm * 256, panel + 1, True, index, M, K)])
+                    a_pairs += tl.tuple([_n256x192_packed_scale_pair(SA, pm * 256, next_panel, True, index, M, K)])
                     tlx.amd_sched_barrier(0)
             elif index < 4:
                 if B_SHUFFLED:
                     if index == 2:
                         tlx.amd_sched_barrier(0)
-                        b_words = _n256x192_packed_scale_b_shuffled(SB, pn, panel + 1, K)
+                        b_words = _n256x192_packed_scale_b_shuffled(SB, pn, next_panel, K)
                         tlx.amd_sched_barrier(0)
                 else:
                     tlx.amd_sched_barrier(0)
-                    b_pairs += tl.tuple([_n256x192_packed_scale_pair(SB, pn * 192, panel + 1, False, index - 2, N, K)])
+                    b_pairs += tl.tuple([_n256x192_packed_scale_pair(SB, pn * 192, next_panel, False, index - 2, N, K)])
                     tlx.amd_sched_barrier(0)
     else:
         for index in tl.static_range(5):
@@ -3165,15 +3143,15 @@ def _n256x192_cadence_compute(A, B, SA, SB, pm, pn, panel, a_current, b_current,
     for chunk in tl.static_range(12):
         if LOAD_FUTURE:
             with tlx.warp_pipeline_stage("cadence_g2l", scope="intra_wave", pair=chunk):
-                _n256x192_cadence_publish_chunk(A, B, pm, pn, panel + 2, a_current, b_current, chunk, M, N, K)
+                _n256x192_cadence_publish_chunk(A, B, pm, pn, future_panel, a_current, b_current, chunk, M, N, K)
             with tlx.warp_pipeline_stage("cadence_mfma", scope="intra_wave", pair=chunk):
                 acc = _n256x192_cadence_dot_at(acc, a, b, sa, sb, chunk + 5, mma, dot_a, dot_b)
         else:
             acc = _n256x192_cadence_dot_at(acc, a, b, sa, sb, chunk + 5, mma, dot_a, dot_b)
     if LOAD_FUTURE:
         with tlx.warp_pipeline_stage("cadence_g2l_last", scope="intra_wave", pair=12):
-            _n256x192_cadence_publish_chunk(A, B, pm, pn, panel + 2, a_current, b_current, 12, M, N, K)
-            _n256x192_cadence_publish_chunk(A, B, pm, pn, panel + 2, a_current, b_current, 13, M, N, K)
+            _n256x192_cadence_publish_chunk(A, B, pm, pn, future_panel, a_current, b_current, 12, M, N, K)
+            _n256x192_cadence_publish_chunk(A, B, pm, pn, future_panel, a_current, b_current, 13, M, N, K)
             tlx.async_load_commit_group()
         with tlx.warp_pipeline_stage("cadence_mfma_last", scope="intra_wave", pair=12):
             acc = _n256x192_cadence_dot_at(acc, a, b, sa, sb, 17, mma, dot_a, dot_b)
@@ -3207,18 +3185,19 @@ def _n256x192_fly_layout_step(A, B, SA, SB, pm, pn, panel, a_current, b_current,
                               words_a, words_b, acc, mma: tl.constexpr, dot_a: tl.constexpr, dot_b: tl.constexpr,
                               M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, LOAD_FUTURE: tl.constexpr,
                               LOAD_NEXT: tl.constexpr, A_SHUFFLED: tl.constexpr = False,
-                              B_SHUFFLED: tl.constexpr = False):
+                              B_SHUFFLED: tl.constexpr = False, first_panel=0, rot=0, PIECE: tl.constexpr = 0):
     tlx.workgroup_barrier()
     return _n256x192_cadence_compute(A, B, SA, SB, pm, pn, panel, a_current, b_current, a_next, b_next, operands_a,
                                      operands_b, words_a, words_b, acc, mma, dot_a, dot_b, M, N, K, LOAD_FUTURE,
-                                     LOAD_NEXT, A_SHUFFLED, B_SHUFFLED)
+                                     LOAD_NEXT, A_SHUFFLED, B_SHUFFLED, first_panel, rot, PIECE)
 
 
 @triton.jit
 def _gemm_native_cadence_256x192(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
                                  BM: tl.constexpr, BN: tl.constexpr, WARPS_M: tl.constexpr, SPLIT_K: tl.constexpr,
                                  GROUP_M: tl.constexpr = 4, A_SHUFFLED: tl.constexpr = False,
-                                 B_SHUFFLED: tl.constexpr = False):
+                                 B_SHUFFLED: tl.constexpr = False, ROTATE: tl.constexpr = 0,
+                                 ROT_STRIDE: tl.constexpr = 0):
     tl.static_assert(BM == 256 and BN == 192 and WARPS_M == 2 and SPLIT_K == 1)
     tl.static_assert(K % 128 == 0 and M % 128 == 0 and N % 192 == 0)
     gm: tl.constexpr = triton.cdiv(M, 256)
@@ -3236,6 +3215,8 @@ def _gemm_native_cadence_256x192(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N:
     pn = pid % (GROUP_M * gn) // group_m
     tl.assume((pm >= 0) & (pm < gm))
     tl.assume((pn >= 0) & (pn < gn))
+    piece: tl.constexpr = K // 128 if ROTATE > 0 else 0
+    rot = (pm * gn + pn) % ROTATE * (ROT_STRIDE if ROT_STRIDE > 0 else (K // 128) // ROTATE) if ROTATE > 0 else 0
     mma: tl.constexpr = tlx.amd_mfma_layout(4, [32, 32, 64], False, [4, 1, 1])
     dot_a: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=16)
     dot_b: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=16)
@@ -3253,14 +3234,17 @@ def _gemm_native_cadence_256x192(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N:
     b1 = tlx.local_alloc((1, 64, 128), tlx.dtype_of(B), 3, layout=b_shared)
     a_stages = tl.tuple([a0, a1])
     b_stages = tl.tuple([b0, b1])
-    _n256x192_fly_layout_publish(A, B, pm, pn, 0, a0, b0, M, N, K)
-    words_a, words_b = _n256x192_packed_scale_initial(SA, SB, pm, pn, M, N, K, A_SHUFFLED, B_SHUFFLED)
+    _n256x192_fly_layout_publish(A, B, pm, pn, rot, a0, b0, M, N, K)
+    if ROTATE > 0:
+        words_a, words_b = _ns2_packed_scale_initial_split2(SA, SB, pm, pn, rot, M, N, K, A_SHUFFLED, B_SHUFFLED)
+    else:
+        words_a, words_b = _n256x192_packed_scale_initial(SA, SB, pm, pn, M, N, K, A_SHUFFLED, B_SHUFFLED)
     tlx.async_load_wait_group(0)
     tlx.workgroup_barrier()
     operands_a = tl.tuple([_n256x192_fly_layout_read_a(a0, index % 4, index // 4, dot_a) for index in range(8)])
     operands_b = tl.tuple([_n256x192_fly_layout_read_b(b0, index % 3, index // 3, dot_b) for index in range(6)])
     if K // 128 > 1:
-        _n256x192_fly_layout_publish(A, B, pm, pn, 1, a1, b1, M, N, K)
+        _n256x192_fly_layout_publish(A, B, pm, pn, _rotated_panel(1, 0, rot, piece), a1, b1, M, N, K)
     acc = tl.tuple([tlx.zeros((4, 32, 32), tl.float32, layout=mma) for _ in range(12)])
     loop_end: tl.constexpr = max(((K // 128 - 2) // 2) * 2, 0)
     if loop_end > 0:
@@ -3268,18 +3252,18 @@ def _gemm_native_cadence_256x192(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N:
             acc, operands_a, operands_b, words_a, words_b = _n256x192_fly_layout_step(
                 A, B, SA, SB, pm, pn, stage, a_stages[stage], b_stages[stage], a_stages[1 - stage], b_stages[1 - stage],
                 operands_a, operands_b, words_a, words_b, acc, mma, dot_a, dot_b, M, N, K, True, True, A_SHUFFLED,
-                B_SHUFFLED)
+                B_SHUFFLED, 0, rot, piece)
         for panel in tl.range(2, loop_end, 2, num_stages=1):
             for stage in tl.static_range(2):
                 acc, operands_a, operands_b, words_a, words_b = _n256x192_fly_layout_step(
                     A, B, SA, SB, pm, pn, panel + stage, a_stages[stage], b_stages[stage], a_stages[1 - stage],
                     b_stages[1 - stage], operands_a, operands_b, words_a, words_b, acc, mma, dot_a, dot_b, M, N, K,
-                    True, True, A_SHUFFLED, B_SHUFFLED)
+                    True, True, A_SHUFFLED, B_SHUFFLED, 0, rot, piece)
     for panel in tl.static_range(loop_end, K // 128):
         acc, operands_a, operands_b, words_a, words_b = _n256x192_fly_layout_step(
             A, B, SA, SB, pm, pn, panel, a_stages[panel % 2], b_stages[panel % 2], a_stages[1 - panel % 2],
             b_stages[1 - panel % 2], operands_a, operands_b, words_a, words_b, acc, mma, dot_a, dot_b, M, N, K,
-            panel + 2 < K // 128, panel + 1 < K // 128, A_SHUFFLED, B_SHUFFLED)
+            panel + 2 < K // 128, panel + 1 < K // 128, A_SHUFFLED, B_SHUFFLED, 0, rot, piece)
     acc = tlx.amd_mfma_commit(acc)
     wave = tl.arange(0, 4)[:, None, None]
     rows32 = tl.arange(0, 32)[None, :, None]
@@ -3767,7 +3751,10 @@ def _ns8_cadence_read_at(a_stage, b_stage, a, b, INDEX: tl.constexpr, dot_a: tl.
 def _ns8_cadence_compute(A, B, SA, SB, pm, pn, panel, a_current, b_current, a_next, b_next, a, b, sa, sb, acc,
                          mma: tl.constexpr, dot_a: tl.constexpr, dot_b: tl.constexpr, M: tl.constexpr, N: tl.constexpr,
                          K: tl.constexpr, LOAD_FUTURE: tl.constexpr, LOAD_NEXT: tl.constexpr,
-                         A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False):
+                         A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False, first_panel=0, rot=0,
+                         PIECE: tl.constexpr = 0):
+    next_panel = _rotated_panel(panel + 1, first_panel, rot, PIECE)
+    future_panel = _rotated_panel(panel + 2, first_panel, rot, PIECE)
     a_pairs = tl.tuple([])
     b_pairs = tl.tuple([])
     a_words = sa
@@ -3778,19 +3765,19 @@ def _ns8_cadence_compute(A, B, SA, SB, pm, pn, panel, a_current, b_current, a_ne
             if index == 0:
                 tlx.amd_sched_barrier(0)
                 if A_SHUFFLED:
-                    a_words = _ns8_packed_scale_shuffled(SA, pm, panel + 1, True, 1, K)
+                    a_words = _ns8_packed_scale_shuffled(SA, pm, next_panel, True, 1, K)
                 else:
-                    a_pairs += tl.tuple([_ns8_packed_scale_pair(SA, pm * 128, panel + 1, True, 0, M, K)])
+                    a_pairs += tl.tuple([_ns8_packed_scale_pair(SA, pm * 128, next_panel, True, 0, M, K)])
                 tlx.amd_sched_barrier(0)
             elif index < 3:
                 if B_SHUFFLED:
                     if index == 1:
                         tlx.amd_sched_barrier(0)
-                        b_words = _ns8_packed_scale_shuffled(SB, pn, panel + 1, False, 2, K)
+                        b_words = _ns8_packed_scale_shuffled(SB, pn, next_panel, False, 2, K)
                         tlx.amd_sched_barrier(0)
                 else:
                     tlx.amd_sched_barrier(0)
-                    b_pairs += tl.tuple([_ns8_packed_scale_pair(SB, pn * 256, panel + 1, False, index - 1, N, K)])
+                    b_pairs += tl.tuple([_ns8_packed_scale_pair(SB, pn * 256, next_panel, False, index - 1, N, K)])
                     tlx.amd_sched_barrier(0)
     else:
         for index in tl.static_range(5):
@@ -3799,8 +3786,8 @@ def _ns8_cadence_compute(A, B, SA, SB, pm, pn, panel, a_current, b_current, a_ne
     for group in tl.static_range(6):
         if LOAD_FUTURE:
             with tlx.warp_pipeline_stage("cadence_g2l", scope="intra_wave", pair=group):
-                _ns8_cadence_publish_chunk(A, B, pm, pn, panel + 2, a_current, b_current, group * 2, M, N, K)
-                _ns8_cadence_publish_chunk(A, B, pm, pn, panel + 2, a_current, b_current, group * 2 + 1, M, N, K)
+                _ns8_cadence_publish_chunk(A, B, pm, pn, future_panel, a_current, b_current, group * 2, M, N, K)
+                _ns8_cadence_publish_chunk(A, B, pm, pn, future_panel, a_current, b_current, group * 2 + 1, M, N, K)
                 if group == 5:
                     tlx.async_load_commit_group()
             with tlx.warp_pipeline_stage("cadence_mfma", scope="intra_wave", pair=group):
@@ -3831,14 +3818,22 @@ def _ns8_cadence_compute(A, B, SA, SB, pm, pn, panel, a_current, b_current, a_ne
 
 
 @triton.jit
+def _rotated_panel(panel, first_panel, rot, PIECE: tl.constexpr):
+    if PIECE == 0:
+        return panel
+    return first_panel + (panel - first_panel + rot) % PIECE
+
+
+@triton.jit
 def _ns8_fly_layout_step(A, B, SA, SB, pm, pn, panel, a_current, b_current, a_next, b_next, operands_a, operands_b,
                          words_a, words_b, acc, mma: tl.constexpr, dot_a: tl.constexpr, dot_b: tl.constexpr,
                          M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, LOAD_FUTURE: tl.constexpr,
-                         LOAD_NEXT: tl.constexpr, A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False):
+                         LOAD_NEXT: tl.constexpr, A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False,
+                         first_panel=0, rot=0, PIECE: tl.constexpr = 0):
     tlx.workgroup_barrier()
     return _ns8_cadence_compute(A, B, SA, SB, pm, pn, panel, a_current, b_current, a_next, b_next, operands_a,
                                 operands_b, words_a, words_b, acc, mma, dot_a, dot_b, M, N, K, LOAD_FUTURE, LOAD_NEXT,
-                                A_SHUFFLED, B_SHUFFLED)
+                                A_SHUFFLED, B_SHUFFLED, first_panel, rot, PIECE)
 
 
 @triton.jit
@@ -3860,7 +3855,8 @@ def _ns8_split_major_tile(raw_pid, gm: tl.constexpr, gn: tl.constexpr, SPLIT_K: 
 @triton.jit
 def _gemm_native_split8(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, BM: tl.constexpr,
                         BN: tl.constexpr, WARPS_M: tl.constexpr, SPLIT_K: tl.constexpr,
-                        A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False):
+                        A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False, ROTATE: tl.constexpr = 0,
+                        ROT_STRIDE: tl.constexpr = 0):
     tl.static_assert(BM == 128 and BN == 256 and WARPS_M == 2 and (SPLIT_K == 1 or SPLIT_K == 8))
     tl.static_assert(K % (128 * SPLIT_K) == 0 and M % 128 == 0 and N % 128 == 0)
     piece_panels: tl.constexpr = K // (128 * SPLIT_K)
@@ -3872,6 +3868,8 @@ def _gemm_native_split8(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: tl.const
     first_panel = split_id * piece_panels
     tl.assume((pm >= 0) & (pm < gm))
     tl.assume((pn >= 0) & (pn < gn))
+    piece: tl.constexpr = piece_panels if ROTATE > 0 else 0
+    rot = (pm * gn + pn) % ROTATE * (ROT_STRIDE if ROT_STRIDE > 0 else piece_panels // ROTATE) if ROTATE > 0 else 0
     mma: tl.constexpr = tlx.amd_mfma_layout(4, [32, 32, 64], False, [4, 1, 1])
     dot_a: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=16)
     dot_b: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=16)
@@ -3889,14 +3887,15 @@ def _gemm_native_split8(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: tl.const
     b1 = tlx.local_alloc((1, 64, 128), tlx.dtype_of(B), 4, layout=b_shared)
     a_stages = tl.tuple([a0, a1])
     b_stages = tl.tuple([b0, b1])
-    _ns8_fly_layout_publish(A, B, pm, pn, first_panel, a0, b0, M, N, K)
-    words_a, words_b = _ns8_packed_scale_initial(SA, SB, pm, pn, first_panel, M, N, K, A_SHUFFLED, B_SHUFFLED)
+    start_panel = _rotated_panel(first_panel, first_panel, rot, piece)
+    _ns8_fly_layout_publish(A, B, pm, pn, start_panel, a0, b0, M, N, K)
+    words_a, words_b = _ns8_packed_scale_initial(SA, SB, pm, pn, start_panel, M, N, K, A_SHUFFLED, B_SHUFFLED)
     tlx.async_load_wait_group(0)
     tlx.workgroup_barrier()
     operands_a = tl.tuple([_ns4_fly_layout_read_a(a0, index % 2, index // 2, dot_a) for index in range(4)])
     operands_b = tl.tuple([_ns8_fly_layout_read_b(b0, index % 4, index // 4, dot_b) for index in range(8)])
     if piece_panels > 1:
-        _ns8_fly_layout_publish(A, B, pm, pn, first_panel + 1, a1, b1, M, N, K)
+        _ns8_fly_layout_publish(A, B, pm, pn, _rotated_panel(first_panel + 1, first_panel, rot, piece), a1, b1, M, N, K)
     acc = tl.tuple([tlx.zeros((4, 32, 32), tl.float32, layout=mma) for _ in range(8)])
     loop_end: tl.constexpr = max(((piece_panels - 2) // 2) * 2, 0)
     if loop_end > 0:
@@ -3904,18 +3903,19 @@ def _gemm_native_split8(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: tl.const
             acc, operands_a, operands_b, words_a, words_b = _ns8_fly_layout_step(
                 A, B, SA, SB, pm, pn, first_panel + stage, a_stages[stage], b_stages[stage], a_stages[1 - stage],
                 b_stages[1 - stage], operands_a, operands_b, words_a, words_b, acc, mma, dot_a, dot_b, M, N, K, True,
-                True, A_SHUFFLED, B_SHUFFLED)
+                True, A_SHUFFLED, B_SHUFFLED, first_panel, rot, piece)
         for panel in tl.range(2, loop_end, 2, num_stages=1):
             for stage in tl.static_range(2):
                 acc, operands_a, operands_b, words_a, words_b = _ns8_fly_layout_step(
                     A, B, SA, SB, pm, pn, first_panel + panel + stage, a_stages[stage], b_stages[stage],
                     a_stages[1 - stage], b_stages[1 - stage], operands_a, operands_b, words_a, words_b, acc, mma, dot_a,
-                    dot_b, M, N, K, True, True, A_SHUFFLED, B_SHUFFLED)
+                    dot_b, M, N, K, True, True, A_SHUFFLED, B_SHUFFLED, first_panel, rot, piece)
     for panel in tl.static_range(loop_end, piece_panels):
         acc, operands_a, operands_b, words_a, words_b = _ns8_fly_layout_step(
             A, B, SA, SB, pm, pn, first_panel + panel, a_stages[panel % 2], b_stages[panel % 2],
             a_stages[1 - panel % 2], b_stages[1 - panel % 2], operands_a, operands_b, words_a, words_b, acc, mma, dot_a,
-            dot_b, M, N, K, panel + 2 < piece_panels, panel + 1 < piece_panels, A_SHUFFLED, B_SHUFFLED)
+            dot_b, M, N, K, panel + 2 < piece_panels, panel + 1 < piece_panels, A_SHUFFLED, B_SHUFFLED, first_panel,
+            rot, piece)
     acc = tlx.amd_mfma_commit(acc)
     target = C if SPLIT_K == 1 else WORKSPACE + split_id * M * N
     wave = tl.arange(0, 4)[:, None, None]
@@ -4239,7 +4239,10 @@ def _n128x192_read_at_128(a_stage, b_stage, a, b, index: tl.constexpr, dot_a: tl
 def _n128x192_step_128x192(A, B, SA, SB, pm, pn, panel, current_a, current_b, next_a, next_b, operands_a, operands_b,
                            scales_a, scales_b, acc, mma: tl.constexpr, dot_a: tl.constexpr, dot_b: tl.constexpr,
                            M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, load_future: tl.constexpr,
-                           load_next: tl.constexpr, A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False):
+                           load_next: tl.constexpr, A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False,
+                           rot=0, PIECE: tl.constexpr = 0):
+    next_panel = _rotated_panel(panel + 1, 0, rot, PIECE)
+    future_panel = _rotated_panel(panel + 2, 0, rot, PIECE)
     tlx.workgroup_barrier()
     if load_next:
         if A_SHUFFLED and B_SHUFFLED:
@@ -4247,20 +4250,20 @@ def _n128x192_step_128x192(A, B, SA, SB, pm, pn, panel, current_a, current_b, ne
                 acc = _n128x192_dot_at_128(acc, operands_a, operands_b, scales_a, scales_b, index, mma, dot_a, dot_b)
             acc = _n128x192_dot_at_128(acc, operands_a, operands_b, scales_a, scales_b, 2, mma, dot_a, dot_b)
             tlx.amd_sched_barrier(0)
-            next_scales_a, next_scales_b = _n128x192_packed_scales_128(SA, SB, pm, pn, panel + 1, M, N, K, True, True)
+            next_scales_a, next_scales_b = _n128x192_packed_scales_128(SA, SB, pm, pn, next_panel, M, N, K, True, True)
             tlx.amd_sched_barrier(0)
         else:
             acc = _n128x192_dot_at_128(acc, operands_a, operands_b, scales_a, scales_b, 0, mma, dot_a, dot_b)
             tlx.amd_sched_barrier(0)
-            next_a_pair = _n128x192_packed_scale_a_128(SA, pm * 128, panel + 1, M, K)
+            next_a_pair = _n128x192_packed_scale_a_128(SA, pm * 128, next_panel, M, K)
             tlx.amd_sched_barrier(0)
             acc = _n128x192_dot_at_128(acc, operands_a, operands_b, scales_a, scales_b, 1, mma, dot_a, dot_b)
             tlx.amd_sched_barrier(0)
-            next_b0 = _n256x192_packed_scale_pair(SB, pn * 192, panel + 1, False, 0, N, K)
+            next_b0 = _n256x192_packed_scale_pair(SB, pn * 192, next_panel, False, 0, N, K)
             tlx.amd_sched_barrier(0)
             acc = _n128x192_dot_at_128(acc, operands_a, operands_b, scales_a, scales_b, 2, mma, dot_a, dot_b)
             tlx.amd_sched_barrier(0)
-            next_b1 = _n256x192_packed_scale_pair(SB, pn * 192, panel + 1, False, 1, N, K)
+            next_b1 = _n256x192_packed_scale_pair(SB, pn * 192, next_panel, False, 1, N, K)
             tlx.amd_sched_barrier(0)
             next_scales_a, next_scales_b = scales_a, scales_b
     else:
@@ -4272,30 +4275,25 @@ def _n128x192_step_128x192(A, B, SA, SB, pm, pn, panel, current_a, current_b, ne
         if load_future:
             with tlx.warp_pipeline_stage("cadence128_g2l", scope="intra_wave", pair=group):
                 if group == 0:
-                    _n128x192_publish_chunk_128x192(A, B, pm, pn, panel + 2, current_a, current_b, 0, M, N, K)
-                    _n128x192_publish_chunk_128x192(A, B, pm, pn, panel + 2, current_a, current_b, 1, M, N, K)
-                    _n128x192_publish_chunk_128x192(A, B, pm, pn, panel + 2, current_a, current_b, 2, M, N, K)
+                    _n128x192_publish_chunk_128x192(A, B, pm, pn, future_panel, current_a, current_b, 0, M, N, K)
+                    _n128x192_publish_chunk_128x192(A, B, pm, pn, future_panel, current_a, current_b, 1, M, N, K)
+                    _n128x192_publish_chunk_128x192(A, B, pm, pn, future_panel, current_a, current_b, 2, M, N, K)
                 elif group == 1:
-                    _n128x192_publish_chunk_128x192(A, B, pm, pn, panel + 2, current_a, current_b, 3, M, N, K)
-                    _n128x192_publish_chunk_128x192(A, B, pm, pn, panel + 2, current_a, current_b, 4, M, N, K)
-                    _n128x192_publish_chunk_128x192(A, B, pm, pn, panel + 2, current_a, current_b, 5, M, N, K)
+                    _n128x192_publish_chunk_128x192(A, B, pm, pn, future_panel, current_a, current_b, 3, M, N, K)
+                    _n128x192_publish_chunk_128x192(A, B, pm, pn, future_panel, current_a, current_b, 4, M, N, K)
+                    _n128x192_publish_chunk_128x192(A, B, pm, pn, future_panel, current_a, current_b, 5, M, N, K)
                 elif group == 2:
-                    _n128x192_publish_chunk_128x192(A, B, pm, pn, panel + 2, current_a, current_b, 6, M, N, K)
-                    _n128x192_publish_chunk_128x192(A, B, pm, pn, panel + 2, current_a, current_b, 7, M, N, K)
+                    _n128x192_publish_chunk_128x192(A, B, pm, pn, future_panel, current_a, current_b, 6, M, N, K)
+                    _n128x192_publish_chunk_128x192(A, B, pm, pn, future_panel, current_a, current_b, 7, M, N, K)
                 else:
-                    _n128x192_publish_chunk_128x192(A, B, pm, pn, panel + 2, current_a, current_b, 8, M, N, K)
-                    _n128x192_publish_chunk_128x192(A, B, pm, pn, panel + 2, current_a, current_b, 9, M, N, K)
+                    _n128x192_publish_chunk_128x192(A, B, pm, pn, future_panel, current_a, current_b, 8, M, N, K)
+                    _n128x192_publish_chunk_128x192(A, B, pm, pn, future_panel, current_a, current_b, 9, M, N, K)
                     tlx.async_load_commit_group()
             with tlx.warp_pipeline_stage("cadence128_mfma", scope="intra_wave", pair=group):
                 acc = _n128x192_dot_at_128(acc, operands_a, operands_b, scales_a, scales_b, group + 3, mma, dot_a,
                                            dot_b)
         else:
             acc = _n128x192_dot_at_128(acc, operands_a, operands_b, scales_a, scales_b, group + 3, mma, dot_a, dot_b)
-        if load_next and not A_SHUFFLED and not B_SHUFFLED:
-            if group == 0:
-                next_scales_a = _n256x192_packed_scale_a_finish(tl.tuple([next_a_pair]))
-            elif group == 1:
-                next_scales_b = _n256x192_packed_scale_b_finish(tl.tuple([next_b0, next_b1]))
 
     next_operands_a, next_operands_b = operands_a, operands_b
     if load_next:
@@ -4309,6 +4307,9 @@ def _n128x192_step_128x192(A, B, SA, SB, pm, pn, panel, current_a, current_b, ne
                                                                      group * 2 + 1, dot_a, dot_b)
             if group + 1 < 5:
                 tlx.amd_sched_barrier(0)
+        if not A_SHUFFLED and not B_SHUFFLED:
+            next_scales_a = _n256x192_packed_scale_a_finish(tl.tuple([next_a_pair]))
+            next_scales_b = _n256x192_packed_scale_b_finish(tl.tuple([next_b0, next_b1]))
     else:
         for index in tl.static_range(7, 12):
             acc = _n128x192_dot_at_128(acc, operands_a, operands_b, scales_a, scales_b, index, mma, dot_a, dot_b)
@@ -4348,7 +4349,7 @@ def _n128x192_store_acc_128x192(value, C, pm, pn, mi: tl.constexpr, ni: tl.const
 def _gemm_native_cadence_128x192(A, B, SA, SB, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
                                  GROUP_M: tl.constexpr, STREAMING_STORE: tl.constexpr = False,
                                  MODEL_XCD: tl.constexpr = True, A_SHUFFLED: tl.constexpr = False,
-                                 B_SHUFFLED: tl.constexpr = False):
+                                 B_SHUFFLED: tl.constexpr = False, ROTATE: tl.constexpr = 0):
     tl.static_assert(K % 128 == 0 and M % 128 == 0 and N % 192 == 0)
     gm: tl.constexpr = M // 128
     gn: tl.constexpr = N // 192
@@ -4412,10 +4413,12 @@ def _gemm_native_cadence_128x192(A, B, SA, SB, C, M: tl.constexpr, N: tl.constex
     b1 = tlx.local_alloc((1, 64, 128), tlx.dtype_of(B), 3, layout=b_shared)
     a_stages = tl.tuple([a0, a1])
     b_stages = tl.tuple([b0, b1])
-    _n128x192_publish_128x192(A, B, pm, pn, 0, a0, b0, M, N, K)
-    scales_a, scales_b = _n128x192_packed_scales_128(SA, SB, pm, pn, 0, M, N, K, A_SHUFFLED, B_SHUFFLED)
+    piece: tl.constexpr = K // 128 if ROTATE > 0 else 0
+    rot = (pm * gn + pn) % ROTATE * (K // 128) // ROTATE if ROTATE > 0 else 0
+    _n128x192_publish_128x192(A, B, pm, pn, rot, a0, b0, M, N, K)
+    scales_a, scales_b = _n128x192_packed_scales_128(SA, SB, pm, pn, rot, M, N, K, A_SHUFFLED, B_SHUFFLED)
     if K // 128 > 1:
-        _n128x192_publish_128x192(A, B, pm, pn, 1, a1, b1, M, N, K)
+        _n128x192_publish_128x192(A, B, pm, pn, _rotated_panel(1, 0, rot, piece), a1, b1, M, N, K)
     tlx.async_load_wait_group(1 if K // 128 > 1 else 0)
     tlx.workgroup_barrier()
     operands_a = tl.tuple([_n128x192_read_a_128(a0, index % 2, index // 2, dot_a) for index in range(4)])
@@ -4427,18 +4430,18 @@ def _gemm_native_cadence_128x192(A, B, SA, SB, C, M: tl.constexpr, N: tl.constex
             acc, operands_a, operands_b, scales_a, scales_b = _n128x192_step_128x192(
                 A, B, SA, SB, pm, pn, stage, a_stages[stage], b_stages[stage], a_stages[1 - stage], b_stages[1 - stage],
                 operands_a, operands_b, scales_a, scales_b, acc, mma, dot_a, dot_b, M, N, K, True, True, A_SHUFFLED,
-                B_SHUFFLED)
+                B_SHUFFLED, rot, piece)
         for panel in tl.range(2, loop_end, 2, num_stages=1):
             for stage in tl.static_range(2):
                 acc, operands_a, operands_b, scales_a, scales_b = _n128x192_step_128x192(
                     A, B, SA, SB, pm, pn, panel + stage, a_stages[stage], b_stages[stage], a_stages[1 - stage],
                     b_stages[1 - stage], operands_a, operands_b, scales_a, scales_b, acc, mma, dot_a, dot_b, M, N, K,
-                    True, True, A_SHUFFLED, B_SHUFFLED)
+                    True, True, A_SHUFFLED, B_SHUFFLED, rot, piece)
     for panel in tl.static_range(loop_end, K // 128):
         acc, operands_a, operands_b, scales_a, scales_b = _n128x192_step_128x192(
             A, B, SA, SB, pm, pn, panel, a_stages[panel % 2], b_stages[panel % 2], a_stages[1 - panel % 2],
             b_stages[1 - panel % 2], operands_a, operands_b, scales_a, scales_b, acc, mma, dot_a, dot_b, M, N, K,
-            panel + 2 < K // 128, panel + 1 < K // 128, A_SHUFFLED, B_SHUFFLED)
+            panel + 2 < K // 128, panel + 1 < K // 128, A_SHUFFLED, B_SHUFFLED, rot, piece)
     acc = tlx.amd_mfma_commit(acc)
     for ni in tl.static_range(3):
         for mi in tl.static_range(2):
@@ -4661,10 +4664,72 @@ def _n256x256_cadence_read_at(a_stage, b_stage, a, b, INDEX: tl.constexpr, dot_a
 
 
 @triton.jit
+def _n256x256_fly_cadence_compute(A, B, SA, SB, pm, pn, panel, a_current, b_current, a_next, b_next, a, b, sa, sb, acc,
+                                  mma: tl.constexpr, dot_a: tl.constexpr, dot_b: tl.constexpr, M: tl.constexpr,
+                                  N: tl.constexpr, K: tl.constexpr, LOAD_FUTURE: tl.constexpr, LOAD_NEXT: tl.constexpr,
+                                  SCALES_SHUFFLED: tl.constexpr = False):
+    # Scale loads in MFMAs 0-3, then the WAR barrier, global-to-LDS chunks in MFMAs 4-23, the RAW wait, and two
+    # operand tiles refilled after each of MFMAs 24-31.
+    a_pairs = tl.tuple([])
+    b_pairs = tl.tuple([])
+    next_sa = sa
+    next_sb = sb
+    for index in tl.static_range(4):
+        acc = _n256x256_cadence_dot_at(acc, a, b, sa, sb, index, mma, dot_a, dot_b)
+        if LOAD_NEXT and index == 0:
+            tlx.amd_sched_barrier(0)
+            if SCALES_SHUFFLED:
+                next_sa = _n256x192_packed_scale_a_shuffled(SA, pm, panel + 1, K)
+            else:
+                a_pairs = _n256x256_packed_scale_pairs(SA, pm * 256, panel + 1, True, M, K)
+            tlx.amd_sched_barrier(0)
+        elif LOAD_NEXT and index == 2:
+            tlx.amd_sched_barrier(0)
+            if SCALES_SHUFFLED:
+                next_sb = _n256x192_packed_scale_b_shuffled(SB, pn, panel + 1, K)
+            else:
+                b_pairs = _n256x256_packed_scale_pairs(SB, pn * 256, panel + 1, False, N, K)
+            tlx.amd_sched_barrier(0)
+    tlx.workgroup_barrier()
+    chunk_at: tl.constexpr = (0, 1, 2, 3, 4, 5, 6, 7, -1, 8, -1, 9, 10, -1, 11, 12, 13, -1, 14, 15)
+    for index in tl.static_range(4, 24):
+        acc = _n256x256_cadence_dot_at(acc, a, b, sa, sb, index, mma, dot_a, dot_b)
+        if LOAD_FUTURE and chunk_at[index - 4] >= 0:
+            tlx.amd_sched_barrier(0)
+            _n256x256_cadence_publish_chunk(A, B, pm, pn, panel + 2, a_current, b_current, chunk_at[index - 4], M, N, K)
+            if chunk_at[index - 4] == 15:
+                tlx.async_load_commit_group()
+            tlx.amd_sched_barrier(0)
+    next_a, next_b = a, b
+    if LOAD_NEXT:
+        tlx.async_load_wait_group(1 if LOAD_FUTURE else 0)
+        for index in tl.static_range(24, 32):
+            acc = _n256x256_cadence_dot_at(acc, a, b, sa, sb, index, mma, dot_a, dot_b)
+            tlx.amd_sched_barrier(0)
+            next_a, next_b = _n256x256_cadence_read_at(a_next, b_next, next_a, next_b, (index - 24) * 2, dot_a, dot_b)
+            next_a, next_b = _n256x256_cadence_read_at(a_next, b_next, next_a, next_b, (index - 24) * 2 + 1, dot_a,
+                                                       dot_b)
+            if index < 31:
+                tlx.amd_sched_barrier(0)
+        if not SCALES_SHUFFLED:
+            next_sa, next_sb = _n256x256_packed_scale_finish(a_pairs, b_pairs)
+    else:
+        for index in tl.static_range(24, 32):
+            acc = _n256x256_cadence_dot_at(acc, a, b, sa, sb, index, mma, dot_a, dot_b)
+        tlx.async_load_wait_group(0)
+    return acc, next_a, next_b, next_sa, next_sb
+
+
+@triton.jit
 def _n256x256_cadence_compute(A, B, SA, SB, pm, pn, panel, a_current, b_current, a_next, b_next, a, b, sa, sb, acc,
                               mma: tl.constexpr, dot_a: tl.constexpr, dot_b: tl.constexpr, M: tl.constexpr,
                               N: tl.constexpr, K: tl.constexpr, LOAD_FUTURE: tl.constexpr, LOAD_NEXT: tl.constexpr,
-                              SCALES_SHUFFLED: tl.constexpr = False, BALANCED_G2L_CADENCE: tl.constexpr = False):
+                              SCALES_SHUFFLED: tl.constexpr = False, BALANCED_G2L_CADENCE: tl.constexpr = False,
+                              FLY_CADENCE: tl.constexpr = False):
+    if FLY_CADENCE:
+        return _n256x256_fly_cadence_compute(A, B, SA, SB, pm, pn, panel, a_current, b_current, a_next, b_next, a, b,
+                                             sa, sb, acc, mma, dot_a, dot_b, M, N, K, LOAD_FUTURE, LOAD_NEXT,
+                                             SCALES_SHUFFLED)
     a_pairs = tl.tuple([])
     b_pairs = tl.tuple([])
     next_sa = sa
@@ -4769,20 +4834,21 @@ def _n256x256_fly_layout_step(A, B, SA, SB, pm, pn, panel, a_current, b_current,
                               words_a, words_b, acc, mma: tl.constexpr, dot_a: tl.constexpr, dot_b: tl.constexpr,
                               M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, LOAD_FUTURE: tl.constexpr,
                               LOAD_NEXT: tl.constexpr, SCALES_SHUFFLED: tl.constexpr = False,
-                              BALANCED_G2L_CADENCE: tl.constexpr = False):
-    tlx.workgroup_barrier()
+                              BALANCED_G2L_CADENCE: tl.constexpr = False, FLY_CADENCE: tl.constexpr = False):
+    if not FLY_CADENCE:
+        tlx.workgroup_barrier()
     return _n256x256_cadence_compute(A, B, SA, SB, pm, pn, panel, a_current, b_current, a_next, b_next, operands_a,
                                      operands_b, words_a, words_b, acc, mma, dot_a, dot_b, M, N, K, LOAD_FUTURE,
-                                     LOAD_NEXT, SCALES_SHUFFLED, BALANCED_G2L_CADENCE)
+                                     LOAD_NEXT, SCALES_SHUFFLED, BALANCED_G2L_CADENCE, FLY_CADENCE)
 
 
 @triton.jit
 def _gemm_native_256x256_split16(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
                                  BM: tl.constexpr, BN: tl.constexpr, WARPS_M: tl.constexpr, SPLIT_K: tl.constexpr,
                                  SCALES_SHUFFLED: tl.constexpr = False, BALANCED_G2L_CADENCE: tl.constexpr = False,
-                                 STREAMING_STORE: tl.constexpr = False):
-    tl.static_assert(BM == 256 and BN == 256 and WARPS_M == 2
-                     and (SPLIT_K == 1 or SPLIT_K == 2 or SPLIT_K == 12 or SPLIT_K == 16))
+                                 STREAMING_STORE: tl.constexpr = False, FLY_CADENCE: tl.constexpr = False):
+    tl.static_assert(BM == 256 and BN == 256 and WARPS_M == 2 and
+                     (SPLIT_K == 1 or SPLIT_K == 2 or SPLIT_K == 4 or SPLIT_K == 8 or SPLIT_K == 12 or SPLIT_K == 16))
     tl.static_assert(K % (128 * SPLIT_K) == 0 and M % 256 == 0)
     piece_panels: tl.constexpr = K // (128 * SPLIT_K)
     tl.static_assert(piece_panels >= 2 and piece_panels % 2 == 0)
@@ -4837,18 +4903,19 @@ def _gemm_native_256x256_split16(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N:
             acc, operands_a, operands_b, words_a, words_b = _n256x256_fly_layout_step(
                 A, B, SA, SB, pm, pn, first_panel + stage, a_stages[stage], b_stages[stage], a_stages[1 - stage],
                 b_stages[1 - stage], operands_a, operands_b, words_a, words_b, acc, mma, dot_a, dot_b, M, N, K, True,
-                True, SCALES_SHUFFLED, BALANCED_G2L_CADENCE)
+                True, SCALES_SHUFFLED, BALANCED_G2L_CADENCE, FLY_CADENCE)
         for panel in tl.range(2, loop_end, 2, num_stages=1):
             for stage in tl.static_range(2):
                 acc, operands_a, operands_b, words_a, words_b = _n256x256_fly_layout_step(
                     A, B, SA, SB, pm, pn, first_panel + panel + stage, a_stages[stage], b_stages[stage],
                     a_stages[1 - stage], b_stages[1 - stage], operands_a, operands_b, words_a, words_b, acc, mma, dot_a,
-                    dot_b, M, N, K, True, True, SCALES_SHUFFLED, BALANCED_G2L_CADENCE)
+                    dot_b, M, N, K, True, True, SCALES_SHUFFLED, BALANCED_G2L_CADENCE, FLY_CADENCE)
     for panel in tl.static_range(loop_end, piece_panels):
         acc, operands_a, operands_b, words_a, words_b = _n256x256_fly_layout_step(
             A, B, SA, SB, pm, pn, first_panel + panel, a_stages[panel % 2], b_stages[panel % 2],
             a_stages[1 - panel % 2], b_stages[1 - panel % 2], operands_a, operands_b, words_a, words_b, acc, mma, dot_a,
-            dot_b, M, N, K, panel + 2 < piece_panels, panel + 1 < piece_panels, SCALES_SHUFFLED, BALANCED_G2L_CADENCE)
+            dot_b, M, N, K, panel + 2 < piece_panels, panel + 1 < piece_panels, SCALES_SHUFFLED, BALANCED_G2L_CADENCE,
+            FLY_CADENCE)
     acc = tlx.amd_mfma_commit(acc)
     target = C if SPLIT_K == 1 else WORKSPACE + split_id * M * N
     wave = tl.arange(0, 4)[:, None, None]
@@ -4906,7 +4973,8 @@ def _ns2_packed_scale_initial_split2(SA, SB, pm, pn, first_panel, M: tl.constexp
 @triton.jit
 def _gemm_native_cadence_split2(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
                                 BM: tl.constexpr, BN: tl.constexpr, WARPS_M: tl.constexpr, SPLIT_K: tl.constexpr,
-                                A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False):
+                                A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False,
+                                ROTATE: tl.constexpr = 0, ROT_STRIDE: tl.constexpr = 0):
     tl.static_assert(BM == 256 and BN == 192 and WARPS_M == 2 and (SPLIT_K == 2 or SPLIT_K == 4))
     tl.static_assert(K % 128 == 0 and M % 256 == 0 and N % 128 == 0)
     total_panels: tl.constexpr = K // 128
@@ -4932,6 +5000,9 @@ def _gemm_native_cadence_split2(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: 
     pn = pid % (4 * gn) // group_m
     tl.assume((pm >= 0) & (pm < gm))
     tl.assume((pn >= 0) & (pn < gn))
+    piece: tl.constexpr = piece_panels if ROTATE > 0 else 0
+    rot = (pm * gn + pn) % ROTATE * (ROT_STRIDE if ROT_STRIDE > 0 else piece_panels // ROTATE) if ROTATE > 0 else 0
+    start_panel = _rotated_panel(first_panel, first_panel, rot, piece)
     mma: tl.constexpr = tlx.amd_mfma_layout(4, [32, 32, 64], False, [4, 1, 1])
     dot_a: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=16)
     dot_b: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=16)
@@ -4949,14 +5020,15 @@ def _gemm_native_cadence_split2(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: 
     b1 = tlx.local_alloc((1, 64, 128), tlx.dtype_of(B), 3, layout=b_shared)
     a_stages = tl.tuple([a0, a1])
     b_stages = tl.tuple([b0, b1])
-    _n256x192_fly_layout_publish(A, B, pm, pn, first_panel, a0, b0, M, N, K)
-    words_a, words_b = _ns2_packed_scale_initial_split2(SA, SB, pm, pn, first_panel, M, N, K, A_SHUFFLED, B_SHUFFLED)
+    _n256x192_fly_layout_publish(A, B, pm, pn, start_panel, a0, b0, M, N, K)
+    words_a, words_b = _ns2_packed_scale_initial_split2(SA, SB, pm, pn, start_panel, M, N, K, A_SHUFFLED, B_SHUFFLED)
     tlx.async_load_wait_group(0)
     tlx.workgroup_barrier()
     operands_a = tl.tuple([_n256x192_fly_layout_read_a(a0, index % 4, index // 4, dot_a) for index in range(8)])
     operands_b = tl.tuple([_n256x192_fly_layout_read_b(b0, index % 3, index // 3, dot_b) for index in range(6)])
     if piece_panels > 1:
-        _n256x192_fly_layout_publish(A, B, pm, pn, first_panel + 1, a1, b1, M, N, K)
+        _n256x192_fly_layout_publish(A, B, pm, pn, _rotated_panel(first_panel + 1, first_panel, rot, piece), a1, b1, M,
+                                     N, K)
     acc = tl.tuple([tlx.zeros((4, 32, 32), tl.float32, layout=mma) for _ in range(12)])
     loop_end: tl.constexpr = max(((piece_panels - 2) // 2) * 2, 0)
     if loop_end > 0:
@@ -4964,18 +5036,19 @@ def _gemm_native_cadence_split2(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: 
             acc, operands_a, operands_b, words_a, words_b = _n256x192_fly_layout_step(
                 A, B, SA, SB, pm, pn, first_panel + stage, a_stages[stage], b_stages[stage], a_stages[1 - stage],
                 b_stages[1 - stage], operands_a, operands_b, words_a, words_b, acc, mma, dot_a, dot_b, M, N, K, True,
-                True, A_SHUFFLED, B_SHUFFLED)
+                True, A_SHUFFLED, B_SHUFFLED, first_panel, rot, piece)
         for panel in tl.range(2, loop_end, 2, num_stages=1):
             for stage in tl.static_range(2):
                 acc, operands_a, operands_b, words_a, words_b = _n256x192_fly_layout_step(
                     A, B, SA, SB, pm, pn, first_panel + panel + stage, a_stages[stage], b_stages[stage],
                     a_stages[1 - stage], b_stages[1 - stage], operands_a, operands_b, words_a, words_b, acc, mma, dot_a,
-                    dot_b, M, N, K, True, True, A_SHUFFLED, B_SHUFFLED)
+                    dot_b, M, N, K, True, True, A_SHUFFLED, B_SHUFFLED, first_panel, rot, piece)
     for panel in tl.static_range(loop_end, piece_panels):
         acc, operands_a, operands_b, words_a, words_b = _n256x192_fly_layout_step(
             A, B, SA, SB, pm, pn, first_panel + panel, a_stages[panel % 2], b_stages[panel % 2],
             a_stages[1 - panel % 2], b_stages[1 - panel % 2], operands_a, operands_b, words_a, words_b, acc, mma, dot_a,
-            dot_b, M, N, K, panel + 2 < piece_panels, panel + 1 < piece_panels, A_SHUFFLED, B_SHUFFLED)
+            dot_b, M, N, K, panel + 2 < piece_panels, panel + 1 < piece_panels, A_SHUFFLED, B_SHUFFLED, first_panel,
+            rot, piece)
     if extra_splits > 0:
         if split_id < extra_splits:
             tail_panel = first_panel + piece_panels
@@ -5536,7 +5609,8 @@ def _gemm_native_short_m(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: tl.cons
 @triton.jit
 def _gemm_native_split4_wide(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
                              BM: tl.constexpr, BN: tl.constexpr, WARPS_M: tl.constexpr, SPLIT_K: tl.constexpr,
-                             A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False):
+                             A_SHUFFLED: tl.constexpr = False, B_SHUFFLED: tl.constexpr = False,
+                             ROTATE: tl.constexpr = 0, ROT_STRIDE: tl.constexpr = 0):
     tl.static_assert(BM == 128 and BN == 256 and WARPS_M == 2 and SPLIT_K == 4)
     tl.static_assert(K % (128 * SPLIT_K) == 0 and M % 128 == 0 and N % 128 == 0)
     piece_panels: tl.constexpr = K // (128 * SPLIT_K)
@@ -5546,6 +5620,8 @@ def _gemm_native_split4_wide(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: tl.
     raw_pid = tl.program_id(0)
     pm, pn, split_id = _ns8_split_major_tile(raw_pid, gm, gn, SPLIT_K)
     first_panel = split_id * piece_panels
+    piece: tl.constexpr = piece_panels if ROTATE > 0 else 0
+    rot = (pm * gn + pn) % ROTATE * (ROT_STRIDE if ROT_STRIDE > 0 else piece_panels // ROTATE) if ROTATE > 0 else 0
     tl.assume((pm >= 0) & (pm < gm))
     tl.assume((pn >= 0) & (pn < gn))
     mma: tl.constexpr = tlx.amd_mfma_layout(4, [32, 32, 64], False, [4, 1, 1])
@@ -5565,14 +5641,15 @@ def _gemm_native_split4_wide(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: tl.
     b1 = tlx.local_alloc((1, 64, 128), tlx.dtype_of(B), 4, layout=b_shared)
     a_stages = tl.tuple([a0, a1])
     b_stages = tl.tuple([b0, b1])
-    _ns8_fly_layout_publish(A, B, pm, pn, first_panel, a0, b0, M, N, K)
-    words_a, words_b = _ns8_packed_scale_initial(SA, SB, pm, pn, first_panel, M, N, K, A_SHUFFLED, B_SHUFFLED)
+    start_panel = _rotated_panel(first_panel, first_panel, rot, piece)
+    _ns8_fly_layout_publish(A, B, pm, pn, start_panel, a0, b0, M, N, K)
+    words_a, words_b = _ns8_packed_scale_initial(SA, SB, pm, pn, start_panel, M, N, K, A_SHUFFLED, B_SHUFFLED)
     tlx.async_load_wait_group(0)
     tlx.workgroup_barrier()
     operands_a = tl.tuple([_ns4_fly_layout_read_a(a0, index % 2, index // 2, dot_a) for index in range(4)])
     operands_b = tl.tuple([_ns8_fly_layout_read_b(b0, index % 4, index // 4, dot_b) for index in range(8)])
     if piece_panels > 1:
-        _ns8_fly_layout_publish(A, B, pm, pn, first_panel + 1, a1, b1, M, N, K)
+        _ns8_fly_layout_publish(A, B, pm, pn, _rotated_panel(first_panel + 1, first_panel, rot, piece), a1, b1, M, N, K)
     acc = tl.tuple([tlx.zeros((4, 32, 32), tl.float32, layout=mma) for _ in range(8)])
     loop_end: tl.constexpr = max(((piece_panels - 2) // 2) * 2, 0)
     if loop_end > 0:
@@ -5580,18 +5657,19 @@ def _gemm_native_split4_wide(A, B, SA, SB, C, WORKSPACE, M: tl.constexpr, N: tl.
             acc, operands_a, operands_b, words_a, words_b = _ns8_fly_layout_step(
                 A, B, SA, SB, pm, pn, first_panel + stage, a_stages[stage], b_stages[stage], a_stages[1 - stage],
                 b_stages[1 - stage], operands_a, operands_b, words_a, words_b, acc, mma, dot_a, dot_b, M, N, K, True,
-                True, A_SHUFFLED, B_SHUFFLED)
+                True, A_SHUFFLED, B_SHUFFLED, first_panel, rot, piece)
         for panel in tl.range(2, loop_end, 2, num_stages=1):
             for stage in tl.static_range(2):
                 acc, operands_a, operands_b, words_a, words_b = _ns8_fly_layout_step(
                     A, B, SA, SB, pm, pn, first_panel + panel + stage, a_stages[stage], b_stages[stage],
                     a_stages[1 - stage], b_stages[1 - stage], operands_a, operands_b, words_a, words_b, acc, mma, dot_a,
-                    dot_b, M, N, K, True, True, A_SHUFFLED, B_SHUFFLED)
+                    dot_b, M, N, K, True, True, A_SHUFFLED, B_SHUFFLED, first_panel, rot, piece)
     for panel in tl.static_range(loop_end, piece_panels):
         acc, operands_a, operands_b, words_a, words_b = _ns8_fly_layout_step(
             A, B, SA, SB, pm, pn, first_panel + panel, a_stages[panel % 2], b_stages[panel % 2],
             a_stages[1 - panel % 2], b_stages[1 - panel % 2], operands_a, operands_b, words_a, words_b, acc, mma, dot_a,
-            dot_b, M, N, K, panel + 2 < piece_panels, panel + 1 < piece_panels, A_SHUFFLED, B_SHUFFLED)
+            dot_b, M, N, K, panel + 2 < piece_panels, panel + 1 < piece_panels, A_SHUFFLED, B_SHUFFLED, first_panel,
+            rot, piece)
     acc = tlx.amd_mfma_commit(acc)
     target = WORKSPACE + split_id * M * N
     wave = tl.arange(0, 4)[:, None, None]

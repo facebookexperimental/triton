@@ -253,6 +253,8 @@ Copy and wait handling are implemented in the
 |---|---|
 | `buffer_load`, `buffer_store` | AMD resource-descriptor global access; see [global memory access](global-memory.html) |
 | `buffer_atomic_add` | FP16/BF16/FP32/FP64/int32/int64 lowering; 16-bit atomics require contiguous pairs and a pair-uniform mask |
+| `amd_scaled_upcast_fp4` | Packed E2M1 (FP4) × E8M0 scales to BF16/F16 with `v_cvt_scale_pk8_*_fp4`, eight values per instruction; each scale covers a multiple of 8 values (32 for MXFP4) |
+| `amd_scaled_downcast_fp4` | FP32/BF16/F16 ÷ E8M0 scales packed to E2M1 with `v_cvt_scalef32_pk8_fp4_*`; round to nearest even, saturating at 6 |
 | `extract_slice`, `rematerialized_range` | AMD slice/range lowering, not gfx950-only APIs |
 | `amd_register_resident`, `amd_register_class_anchor` | Register-allocation annotations; use VGPR for gfx1250, without assuming CDNA AGPR behavior |
 | `cond_barrier` | Conditional workgroup barrier; callers must obey its wave-participation contract |
