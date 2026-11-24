@@ -2724,6 +2724,7 @@ def dot_scaled(
     rhs_k_pack=True,
     out_dtype=float32,
     two_ctas=False,
+    fp6_packed=False,
     _semantic=None,
 ):
     """
@@ -2760,6 +2761,9 @@ def dot_scaled(
     :param two_ctas: If True, use a 2-CTA collective scaled matmul on Blackwell. Launch with
       ``ctas_per_cga=(2, 1, 1)`` and BLOCK_M >= 128; the compiler splits B across the pair.
     :type two_ctas: bool
+    :param fp6_packed: On AMD, FP6 operands contain per-segment native fragments:
+      24 packed bytes followed by 8 padding bytes per 32 logical values.
+    :type fp6_packed: bool
     """
     lhs_format = _unwrap_if_constexpr(lhs_format)
     rhs_format = _unwrap_if_constexpr(rhs_format)
@@ -2769,6 +2773,7 @@ def dot_scaled(
     lhs_k_pack = _unwrap_if_constexpr(lhs_k_pack)
     rhs_k_pack = _unwrap_if_constexpr(rhs_k_pack)
     two_ctas = _unwrap_if_constexpr(two_ctas)
+    fp6_packed = _unwrap_if_constexpr(fp6_packed)
     assert out_dtype == float32, "Only float32 is supported for out_dtype at the moment"
     return _semantic.dot_scaled(
         lhs,
@@ -2783,6 +2788,7 @@ def dot_scaled(
         rhs_k_pack,
         out_dtype,
         two_ctas,
+        fp6_packed,
     )
 
 
