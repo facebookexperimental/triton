@@ -226,6 +226,10 @@ def _gemm_mxfp6_interwave(A, B, C, SA, SB, M: tl.constexpr, N: tl.constexpr, K: 
     program = tl.program_id(0)
     split_id = program // grid_mn
     pid = program % grid_mn
+    if grid_mn % 8 == 0:
+        # Consecutive programs are dispatched round-robin to the eight XCDs. Give each XCD
+        # a contiguous run of tiles so the grouped order below shares panels within one L2.
+        pid = (pid % 8) * (grid_mn // 8) + pid // 8
     first_m = pid // (GROUP_M * (N // 256)) * GROUP_M
     group_m = tl.minimum(M // 256 - first_m, GROUP_M)
     pm = first_m + pid % (GROUP_M * (N // 256)) % group_m
