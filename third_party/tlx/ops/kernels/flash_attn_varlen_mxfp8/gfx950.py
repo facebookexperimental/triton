@@ -27,8 +27,10 @@ that map a workgroup to its item (``_build_metadata``).
 
 The tables are cached per pair of offset tensors and rebuilt when PyTorch
 records an in-place change to either tensor. A change it does not record
-(through ``.data``, or written by a kernel) leaves the old tables in use, and
-a ``kv_state`` is only valid for the key offsets it was prepared with.
+(through ``.data``, or written by a kernel) leaves the old tables in use.
+Prepared Q and K/V states (``prepare_q``, ``prepare_kv``) are checked the same
+way: they are rejected with any other offset tensor, or after a recorded
+change to theirs.
 """
 
 from __future__ import annotations
@@ -971,12 +973,42 @@ def _build_metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad)
     }
 
 
+class PreparedState(tuple):
+    """Tensors laid out per sequence by ``prepare_q`` or ``prepare_kv``.
+
+    Unpacks like the tuple of its tensors. It is only valid with the offset
+    tensor it was prepared from, unchanged since, and with as many rows as it
+    was prepared from; ``check`` raises otherwise."""
+
+    def __new__(cls, tensors, offsets, rows, what):
+        state = super().__new__(cls, tensors)
+        state._offsets = weakref.ref(offsets)
+        state._version = offsets._version
+        state.rows = rows
+        state._what = what
+        return state
+
+    def check(self, offsets, rows):
+        if self._offsets() is not offsets or offsets._version != self._version:
+            raise ValueError(f"The prepared {self._what} state was made for other sequence offsets, or they changed "
+                             "in place since; prepare it again")
+        if rows != self.rows:
+            raise ValueError(f"The prepared {self._what} state was made from {self.rows} rows, not {rows}")
+
+
+def _check_state(state, what, offsets, rows):
+    if not isinstance(state, PreparedState):
+        raise ValueError(f"Pass the {what} state returned by prepare_{what.lower()}")
+    state.check(offsets, rows)
+
+
 def prepare_kv(k, v, cu_seqlens_k, meta=None):
     """Quantize packed K and V into the core's padded head-major layouts.
 
-    Returns ``(k8, k_scales, v8, v_scales)``, the ``kv_state`` that ``forward``
-    accepts. ``meta`` is optional for callers preparing a reusable K/V state
-    directly.
+    Returns the ``kv_state`` that ``forward`` and ``forward_prequantized``
+    accept, a ``PreparedState`` of ``(k8, k_scales, v8, v_scales)`` tied to
+    ``cu_seqlens_k``. ``meta`` is optional for callers preparing a reusable
+    K/V state directly.
     """
     if meta is None:
         dummy_cu_q = torch.zeros_like(cu_seqlens_k)
@@ -1006,7 +1038,7 @@ def prepare_kv(k, v, cu_seqlens_k, meta=None):
         num_stages=1,
         llvm_fn_attrs=(("amdgpu-waves-per-eu", "2,2"), ),
     )
-    return k8, ks, v8, vs
+    return PreparedState((k8, ks, v8, vs), cu_seqlens_k, k.shape[0], "KV")
 
 
 def _check_offsets(offsets, device):
@@ -1058,7 +1090,8 @@ def _prepare_q_forward(Q, Q8, QS, CuQ, HEADS: tl.constexpr):
 def prepare_q(q, cu_seqlens_q):
     """Prepare packed E4M3 Q and row-wise E8M0 scales.
 
-    Returns ``(q8, q_scales)`` for ``forward_prequantized``: E4M3
+    Returns the ``q_state`` that ``forward_prequantized`` accepts, a
+    ``PreparedState`` of ``(q8, q_scales)`` tied to ``cu_seqlens_q``: E4M3
     ``[tokens, 4, 128]`` and uint8 ``[tokens, 4, 4]``."""
     if (q.ndim != 3 or q.shape[1:] != (_HEADS, _HEAD_DIM) or q.dtype != torch.bfloat16 or not q.is_contiguous()):
         raise ValueError("Requires contiguous BF16 [tokens, 4, 128] Q")
@@ -1074,55 +1107,34 @@ def prepare_q(q, cu_seqlens_q):
         num_warps=1,
         num_stages=1,
     )
-    return q8, scales
+    return PreparedState((q8, scales), cu_seqlens_q, q.shape[0], "Q")
 
 
 def forward_prequantized(
-    q8,
-    q_scales,
-    k8,
-    k_scales,
-    v8,
-    v_scales,
+    q_state,
+    kv_state,
     cu_seqlens_q,
     cu_seqlens_k,
     sm_scale,
     *,
-    total_kv,
     fast_exp=None,
 ):
     """Return output and natural-log LSE from prepared MXFP8 inputs.
 
-    ``q8`` and ``q_scales`` are ``prepare_q``'s outputs, the K/V payloads and
-    scales ``prepare_kv``'s, and ``total_kv`` is the number of key rows before
-    padding. ``fast_exp`` is as in ``forward``."""
-    if (q8.ndim != 3 or q8.shape[1:] != (_HEADS, _HEAD_DIM) or q8.dtype != torch.float8_e4m3fn
-            or not q8.is_contiguous()):
-        raise ValueError("Requires contiguous E4M3 [tokens, 4, 128] Q")
+    ``q_state`` and ``kv_state`` are what ``prepare_q`` and ``prepare_kv``
+    returned for these offset tensors. ``fast_exp`` is as in ``forward``."""
+    q8, q_scales = q_state
+    k8, k_scales, v8, v_scales = kv_state
     device = q8.device
     _check_offsets(cu_seqlens_q, device)
     _check_offsets(cu_seqlens_k, device)
     if cu_seqlens_q.shape != cu_seqlens_k.shape:
         raise ValueError("Query and key sequence offsets must have the same shape")
-    if (not isinstance(total_kv, int) or total_kv < 0 or not math.isfinite(sm_scale)):
-        raise ValueError("total_kv must be nonnegative and sm_scale must be finite")
-    meta = _metadata(cu_seqlens_q, cu_seqlens_k, q8.shape[0], total_kv, _BLOCK_M)
-    npad = meta["npad"]
-    tensors = (
-        (q_scales, (q8.shape[0], _HEADS, 4), torch.uint8),
-        (k8, (_HEADS, npad, _HEAD_DIM), torch.float8_e4m3fn),
-        (
-            v8,
-            (_HEADS, npad // 64, _HEAD_DIM, 64),
-            torch.float8_e4m3fn,
-        ),
-        (k_scales, (_HEADS, npad, 4), torch.uint8),
-        (v_scales, (_HEADS, npad, 4), torch.uint8),
-    )
-    for tensor, shape, dtype in tensors:
-        if (tensor.shape != shape or tensor.dtype != dtype or not tensor.is_contiguous() or tensor.device != device):
-            raise ValueError("Prepared payloads and scales must match the documented "
-                             "shapes, dtypes, and device")
+    _check_state(q_state, "Q", cu_seqlens_q, q8.shape[0])
+    _check_state(kv_state, "KV", cu_seqlens_k, kv_state.rows)
+    if not math.isfinite(sm_scale):
+        raise ValueError("sm_scale must be finite")
+    meta = _metadata(cu_seqlens_q, cu_seqlens_k, q8.shape[0], kv_state.rows, _BLOCK_M)
     return _launch_extended_forward(
         q8,
         q_scales,
@@ -1134,7 +1146,7 @@ def forward_prequantized(
         cu_seqlens_k,
         sm_scale,
         meta,
-        total_kv,
+        kv_state.rows,
         fast_exp,
         True,
     )
@@ -1167,9 +1179,9 @@ def forward(
     Query tiles have 128 rows on four warps. ``fast_exp`` selects the
     approximate exponential; left as None, it is used when the sequences
     average at least 4096 keys. Sequences with no keys get zero
-    output rows and -inf LSE. A ``kv_state`` is only valid for the key
-    offsets it was prepared with; see the module docstring for in-place
-    changes to the offset tensors."""
+    output rows and -inf LSE. A ``kv_state`` from ``prepare_kv`` is only
+    accepted with the key-offset tensor it was prepared from, unchanged
+    since."""
     # With a given kv_state, K and V only supply their shape.
     _check(q, k, v, sm_scale, kv_contiguous=kv_state is None)
     _check_offsets(cu_seqlens_q, q.device)
@@ -1179,7 +1191,9 @@ def forward(
     meta = _metadata(cu_seqlens_q, cu_seqlens_k, q.shape[0], k.shape[0], _BLOCK_M)
     if kv_state is None:
         kv_state = prepare_kv(k, v, cu_seqlens_k, meta)
-    k8, ks, v8, vs = kv_state[:4]
+    else:
+        _check_state(kv_state, "KV", cu_seqlens_k, k.shape[0])
+    k8, ks, v8, vs = kv_state
     out, lse = _launch_extended_forward(
         q,
         None,

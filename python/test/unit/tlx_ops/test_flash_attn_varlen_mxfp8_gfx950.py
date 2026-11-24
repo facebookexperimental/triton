@@ -90,20 +90,9 @@ def test_flash_attn_varlen_mxfp8_prequantized():
     cu_q, cu_k = _cu(lens_q), _cu(lens_k)
     scale = 128**-0.5
 
-    q8, q_scales = gfx950.prepare_q(q, cu_q)
-    k8, k_scales, v8, v_scales = gfx950.prepare_kv(k, v, cu_k)
-    out_pre, lse_pre = gfx950.forward_prequantized(
-        q8,
-        q_scales,
-        k8,
-        k_scales,
-        v8,
-        v_scales,
-        cu_q,
-        cu_k,
-        scale,
-        total_kv=k.shape[0],
-    )
+    q_state = gfx950.prepare_q(q, cu_q)
+    kv_state = gfx950.prepare_kv(k, v, cu_k)
+    out_pre, lse_pre = gfx950.forward_prequantized(q_state, kv_state, cu_q, cu_k, scale)
     out, lse, _ = gfx950.forward(q, k, v, cu_q, cu_k, scale)
     ref, ref_lse = _reference(q, k, v, cu_q, cu_k, scale)
 
@@ -135,6 +124,46 @@ def test_flash_attn_varlen_mxfp8_default_fast_exp(lens_k, fast):
         assert torch.equal(out, out_e) == (explicit == fast)
     torch.testing.assert_close(flash_attn_varlen_mxfp8(q, k, v, cu_q, cu_k, max(lens_q), max(lens_k)), out, atol=0,
                                rtol=0)
+    ref, ref_lse = _reference(q, k, v, cu_q, cu_k, scale)
+    torch.testing.assert_close(out.float(), ref, atol=0.08, rtol=0.08)
+    torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
+
+
+def test_flash_attn_varlen_mxfp8_prepared_state_follows_offsets():
+    """Prepared Q and K/V states are reused with the offset tensors they were
+    made from, and rejected with any other one, even one holding the same
+    values, after an in-place change to theirs, or as plain tuples."""
+    from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
+
+    torch.manual_seed(20)
+    scale = 128**-0.5
+    lens_q, lens_k = [200, 64, 300], [300, 700, 90]
+    q = torch.randn(sum(lens_q), 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(lens_k), 4, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    cu_q, cu_k = _cu(lens_q), _cu(lens_k)
+    q_state = gfx950.prepare_q(q, cu_q)
+    kv_state = gfx950.prepare_kv(k, v, cu_k)
+
+    out, lse, _ = gfx950.forward(q, k, v, cu_q, cu_k, scale, kv_state=kv_state)
+    ref, ref_lse = _reference(q, k, v, cu_q, cu_k, scale)
+    torch.testing.assert_close(out.float(), ref, atol=0.08, rtol=0.08)
+    torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
+    gfx950.forward_prequantized(q_state, kv_state, cu_q, cu_k, scale)
+
+    with pytest.raises(ValueError, match="other sequence offsets"):
+        gfx950.forward(q, k, v, cu_q, cu_k.clone(), scale, kv_state=kv_state)
+    with pytest.raises(ValueError, match="other sequence offsets"):
+        gfx950.forward_prequantized(q_state, kv_state, cu_q.clone(), cu_k, scale)
+    with pytest.raises(ValueError, match="rows"):
+        gfx950.forward(q, k[:-1], v[:-1], cu_q, cu_k, scale, kv_state=kv_state)
+    with pytest.raises(ValueError, match="returned by prepare_kv"):
+        gfx950.forward(q, k, v, cu_q, cu_k, scale, kv_state=tuple(kv_state))
+
+    cu_k.copy_(_cu([700, 90, 300]))
+    with pytest.raises(ValueError, match="other sequence offsets"):
+        gfx950.forward(q, k, v, cu_q, cu_k, scale, kv_state=kv_state)
+    out, lse, _ = gfx950.forward(q, k, v, cu_q, cu_k, scale, kv_state=gfx950.prepare_kv(k, v, cu_k))
     ref, ref_lse = _reference(q, k, v, cu_q, cu_k, scale)
     torch.testing.assert_close(out.float(), ref, atol=0.08, rtol=0.08)
     torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
