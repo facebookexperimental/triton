@@ -354,6 +354,12 @@
 - **Fix**: `hoistsStagingWriteAcrossTMAOp` — a `local_alloc` with a source whose users include an `AsyncTMACopyLocalToGlobalOp`/`AsyncTMAReduceOp` is never hoisted across any TMA store or reduce; such a write stays where it is (a write with no TMA op in the way still hoists). Bounding the hoist by K instead was not chosen: K is only known after the memory planner.
 - **Lit test**: `ws_buffer_allocation_staging_write_order.mlir` (two-pass, two subtiles, TMA store and TMA reduce forms): the second subtile's `local_store` follows the first subtile's TMA op and wait. Fails with the guard disabled.
 
+### 49. A skipped second WS loop is cloned into every partition → its side effects run once per partition (2026-11-17, fixed)
+- **Symptom**: In a function with two `tt.warp_specialize` loops where partition scheduling assigns partitions to one and skips the other (e.g. no descriptor load and no MMA), the skipped loop appears in every `ttg.warp_specialize` region. A TMA reduce or atomic in it is applied once per partition (3x with load/epilogue/epilogue_store).
+- **Root cause** (`WarpSpecialization.cpp`): the no-partition gate of #22 is function-wide, so it does not fire when another loop has partitions. `doTaskIdPropagate` then tags the skipped loop with every task id, and code partitioning clones it into each partition.
+- **Fix**: before `doTaskIdPropagate`, if the function has any `ttg.partition`/`async_task_id` tag but some `tt.warp_specialize` loop has none, bail out of WS for the whole function. Placing the skipped loop in a single partition is not safe either, since nothing orders it after the other partitions' writes.
+- **Lit test**: `ws-skip-unpartitioned-second-loop.mlir` (register GEMM loop + pointer-load/TMA-reduce loop through PSM and WS): one `tt.descriptor_reduce`, no `ttg.warp_specialize`. Without the fix the reduce appears 3 times.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
