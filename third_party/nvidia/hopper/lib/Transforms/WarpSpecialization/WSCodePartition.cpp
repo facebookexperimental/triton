@@ -5794,6 +5794,58 @@ static void foldDescriptorLoadMmaBridge(triton::FuncOp funcOp) {
   }
 }
 
+bool hasMultipleCrossPartitionProducers(triton::FuncOp funcOp) {
+  // Predict the stores doBufferAllocation will create for register channels.
+  // createLocalAlloc gives that store the task ids of the defining op of the
+  // channel's source value. When the value is the result of a control-flow op
+  // (e.g. an inner K loop whose accumulator is consumed by an epilogue in
+  // another partition), that op carries every task id of its body, so the
+  // store does too, and createAllocChannel later finds several producer tasks
+  // that are not consumers. Group channels the way createBuffer does (by
+  // source value and consumer block); each group shares one buffer.
+  SmallVector<std::unique_ptr<Channel>> channels;
+  collectAsyncChannels(channels, funcOp, 1 /*numBuffers*/);
+  int cc = getNVIDIAComputeCapability(funcOp->getParentOfType<ModuleOp>());
+  llvm::MapVector<std::pair<Value, Block *>, SmallVector<AsyncTaskId>>
+      consumersOfBuffer;
+  for (const auto &channel : channels) {
+    if (channel->channelKind != DataChannelKind::REG)
+      continue;
+    Value srcValue = channel->getSrcOperand();
+    auto tensorType = dyn_cast<RankedTensorType>(srcValue.getType());
+    if (!tensorType)
+      continue;
+    // createBuffer routes 1-D values on Blackwell to TMEM, whose producer is
+    // the channel's single producer task rather than a store. Keep this in
+    // sync with createBuffer's `useTMEM` condition. (Its converted
+    // descriptor-load exception cannot apply yet: no nvws.descriptor_load
+    // exists before doConvertDescriptorLoadsToNVWS.)
+    if (cc >= 100 && tensorType.getShape().size() == 1 &&
+        tensorType.getElementType().isIntOrFloat())
+      continue;
+    auto &consumers =
+        consumersOfBuffer[{srcValue, channel->getDstOp()->getBlock()}];
+    for (AsyncTaskId id : getAsyncTaskIds(channel->getDstOp()))
+      if (!llvm::is_contained(consumers, id))
+        consumers.push_back(id);
+  }
+  for (auto &[key, consumers] : consumersOfBuffer) {
+    Operation *srcOp = key.first.getDefiningOp();
+    if (!srcOp)
+      continue;
+    SmallVector<AsyncTaskId> producerTaskIds = getAsyncTaskIds(srcOp);
+    if (producerTaskIds.size() > 1 &&
+        failed(selectCrossPartitionProducerTask(producerTaskIds, consumers))) {
+      srcOp->emitWarning()
+          << "warp specialization disabled: this value would be written to "
+             "shared memory by more than one partition, which the "
+             "producer/consumer channels cannot express";
+      return true;
+    }
+  }
+  return false;
+}
+
 LogicalResult doBufferAllocation(triton::FuncOp funcOp) {
   // Step 0: Swap transposed local_alloc + memdesc_trans patterns so that
   // allocs that share the same source value can also share a buffer.

@@ -52,6 +52,11 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
                               unsigned smemBudget,
                               const MemoryPlannerOptions &options = {});
 
+// True when doBufferAllocation would create a buffer that more than one
+// partition writes for a consumer in another partition. Code partitioning
+// cannot express such a channel, so the caller must reject warp specialization
+// before rewriting anything (emits a warning on the offending op).
+bool hasMultipleCrossPartitionProducers(triton::FuncOp funcOp);
 LogicalResult doBufferAllocation(triton::FuncOp funcOp);
 // Whether an MMAv5 operand is a descriptor load TMA cannot write in the MMA's
 // layout, or a descriptor gather, so it would be staged through registers in
