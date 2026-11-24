@@ -4624,7 +4624,7 @@ def test_dense_bwd_diagonal_groups_scales_gfx950(shape, sm_scale, monkeypatch):
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 @pytest.mark.parametrize("shape,split_q,expected_spills", [
     pytest.param((16, 16, 16, 4096, 128), None, 33, id="mha-4k"),
-    pytest.param((16, 16, 16, 8192, 128), None, 55, id="mha-8k"),
+    pytest.param((16, 16, 16, 8192, 128), None, 49, id="mha-8k"),
     pytest.param((16, 16, 16, 16384, 128), None, 0, id="mha-16k"),
     pytest.param((16, 64, 8, 8192, 128), None, 0, id="gqa-8k"),
     pytest.param((15, 64, 8, 16384, 128), None, 0, id="gqa-16k"),
