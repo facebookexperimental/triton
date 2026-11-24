@@ -35,7 +35,10 @@ and `matmul` is its config-dictionary form.
   [`grouped_gemm_mxfp/gfx1250.py`](third_party/tlx/ops/kernels/grouped_gemm_mxfp/gfx1250.py).
 - `mxgemm_tdm_persistent_kernel` is a persistent kernel for 256x256 output
   tiles with FP8 E4M3 A and FP8 E4M3 (A8W8) or FP4 E2M1 (A8W4) B. It backs
-  `mm_mxfp` and is described below.
+  `mm_mxfp` and is described below. With `NUM_GROUPS > 0` it also runs the
+  A8W8 and A8W4 grouped GEMMs whose groups average more than 128 rows; smaller
+  groups stream the weights through `mxgemm_grouped_stream_kernel` in
+  [`grouped_gemm_mxfp/gfx1250.py`](third_party/tlx/ops/kernels/grouped_gemm_mxfp/gfx1250.py).
 
 `TILES_PER_WARP=(M, N)` (`--tiles_per_warp M N` on the command line) selects
 the WMMA tiles per warp, `2 2` by default.
