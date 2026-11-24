@@ -255,7 +255,7 @@ def candidate_text(kind, old, source, validation_run, base_sha):
         '```',
         '',
         *_job_block([('Published SDK validation', validation_run), ('Triton correctness', 'Not run'),
-                     ('A/B performance', 'Not run'), ('Source-base equivalence', 'Not verified')]),
+                     ('A/B performance', 'Not run')]),
         '',
         'Source comparison: ' + compare_url('facebookexperimental/llvm-project', old['llvm_hash'], sha) + '.',
         '',
@@ -277,7 +277,7 @@ def candidate_text(kind, old, source, validation_run, base_sha):
         '',
         command,
         test,
-        'Consumer correctness, performance and source-base checks have not run.',
+        'Consumer correctness and performance checks have not run.',
     ])
     return title, commit, body
 

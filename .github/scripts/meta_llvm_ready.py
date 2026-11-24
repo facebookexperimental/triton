@@ -215,12 +215,10 @@ def ensure_candidate_pr(repo, candidate, platforms, base):
     kind, sha, build = candidate['kind'], candidate['llvm_sha'], int(candidate['build_number'])
     path = 'cmake/meta-amd-llvm-info.json' if kind == 'amd' else 'cmake/meta-llvm-info.json'
     old = read_manifest(repo, path, base)
-    oai = read_manifest(repo, 'cmake/amd-llvm-info.json' if kind == 'amd' else 'cmake/llvm-info.json', base)
-    if old['based_on_oai_llvm_hash'] != oai['llvm_hash']:
-        raise ValueError('The baseline manifest is inconsistent with its upstream selector')
     new = dict(old, llvm_hash=sha, build_number=build,
                release_base_url=f'https://github.com/{repo}/releases/download/meta-llvm',
                sha256sum=receipt['sha256sum'])
+    new.pop('based_on_oai_llvm_hash', None)
     if new == old:
         return 'The baseline already selects this bundle'
     content = json.dumps(new, indent=2) + '\n'
