@@ -49,5 +49,9 @@
 
     # A pointer store: a TMA store would need its descriptor built on the
     # device (Inductor has no host-side descriptors for outputs), which costs
-    # this one-tile kernel more than the store saves.
-    {{store_output(("offs_m", "offs_n"), "acc", indent_width=4, val_shape=("BLOCK_M", "BLOCK_N"), block_indexing=True)}}
+    # this one-tile kernel more than the store saves. A fused row-reduction
+    # epilogue needs index tensors and a mask; otherwise the block store is kept.
+    idx_m = (offs_m + tl.arange(0, BLOCK_M))[:, None]
+    idx_n = (offs_n + tl.arange(0, BLOCK_N))[None, :]
+    mask = (idx_m < M) & (idx_n < N)
+    {{reduction_store_output(("idx_m", "idx_n"), "acc", "mask", partial_index="pid_n", partial_columns="BLOCK_N", indent_width=4, val_shape=("BLOCK_M", "BLOCK_N"), unfused={"indices": ("offs_m", "offs_n"), "block_indexing": True})}}

@@ -382,7 +382,7 @@ struct SqrtOpConversion
     }
 
     // llvm.amdgcn.sqrt.f32 provides direct access to v_sqrt_f32, which provides
-    // 1ULP accuracy and flushs denorms.
+    // 1ULP accuracy and flushes denorms.
     Value intrinsicsOutput =
         ROCDL::ROCDLSqrt::create(rewriter, loc, elemTy, scaledSrc);
 
@@ -485,16 +485,16 @@ void populateElementwiseOpToLLVMPatterns(
   patterns.add<ElementwiseOpConversion<triton::PreciseSqrtOp, LLVM::SqrtOp>>(
       typeConverter, axisInfoAnalysis, benefit);
 
-  if (targetInfo.getISAFamily() == ISAFamily::GFX1250) {
-    auto gfx1250Benefit = benefit.getBenefit() + 1;
+  if (targetInfo.getISAFamily() == ISAFamily::CDNA5) {
+    auto cdna5Benefit = benefit.getBenefit() + 1;
     patterns.add<PackedArithOpConversion<arith::SubFOp, LLVM::FSubOp>>(
-        typeConverter, axisInfoAnalysis, gfx1250Benefit);
+        typeConverter, axisInfoAnalysis, cdna5Benefit);
     patterns.add<PackedArithOpConversion<arith::AddFOp, LLVM::FAddOp>>(
-        typeConverter, axisInfoAnalysis, gfx1250Benefit);
+        typeConverter, axisInfoAnalysis, cdna5Benefit);
     patterns.add<PackedArithOpConversion<arith::MulFOp, LLVM::FMulOp>>(
-        typeConverter, axisInfoAnalysis, gfx1250Benefit);
+        typeConverter, axisInfoAnalysis, cdna5Benefit);
     patterns.add<PackedArithOpConversion<math::FmaOp, LLVM::FMAOp>>(
-        typeConverter, axisInfoAnalysis, gfx1250Benefit);
+        typeConverter, axisInfoAnalysis, cdna5Benefit);
   }
 
   patterns.add<ElementwiseOpConversion<arith::DivFOp, LLVM::FDivOp>>(

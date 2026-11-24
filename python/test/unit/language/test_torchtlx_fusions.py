@@ -1591,6 +1591,86 @@ class TestGfx942ReductionEpilogue(TestCase):
         self.assertIn("triton_red_", source)
 
 
+def _layernorm_bwd_dx(grad_out, weight, grad_residual, x_hat, rstd, ln_weight):
+    g = (torch.mm(grad_out, weight) + grad_residual).float() * ln_weight.float()
+    x_hat = x_hat.float()
+    dx = rstd * (g - g.mean(-1, keepdim=True) - x_hat * (g * x_hat).mean(-1, keepdim=True))
+    return dx.to(torch.bfloat16)
+
+
+@unittest.skipIf(
+    not (has_tlx() and torch.cuda.is_available() and torch.version.hip is None
+         and torch.cuda.get_device_capability() == (9, 0)), "Need TLX on H100")
+@instantiate_parametrized_tests
+class TestSm90ReductionEpilogue(TestCase):
+    """Row-reduction epilogues fused into the sm90 small-K GEMM template."""
+
+    _CONFIG = {
+        "triton.tlx_mode": "force",
+        "force_disable_caches": True,
+        "max_autotune": True,
+        "max_autotune_gemm_backends": "TRITON",
+        "enable_caching_generated_triton_templates": False,
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        import triton.language.extra.tlx.inductor.registry  # noqa: F401
+
+        torch._dynamo.reset()
+        env = mock.patch.dict(os.environ, {"TORCHINDUCTOR_TLX_REDUCTION_EPILOGUE": "force"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _check(self, fn, inputs, overrides=None):
+        with torch.no_grad():
+            expected = fn(*inputs)
+            with config.patch({**self._CONFIG, **(overrides or {})}):
+                actual, code = run_and_get_code(torch.compile(fn, fullgraph=True), *inputs)
+        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        source = "\n".join(code)
+        # Fused: the GEMM template reduces the rows (in the tile, or through partials and a consumer).
+        self.assertIn("tlx_red0_", source)
+        self.assertNotIn("triton_per_fused", source)
+        self.assertNotIn("triton_red_fused", source)
+        return source
+
+    @parametrize("norm_kind", ("layernorm", "rmsnorm"))
+    # M == N: an [N] gamma also has a row-input shape.
+    @parametrize("m,k,n", [(16384, 128, 128), (4099, 96, 200), (128, 128, 128)])
+    def test_addmm_norm(self, norm_kind, m, k, n):
+        bf16 = {"device": GPU_TYPE, "dtype": torch.bfloat16}
+        x, weight = torch.randn((m, k), **bf16), torch.randn((n, k), **bf16)
+        vectors = [torch.randn((n, ), **bf16) for _ in range(3)]
+        inputs = (x, weight, *vectors)
+
+        def fn(x, weight, gemm_bias, scale, norm_bias):
+            return _normalize(torch.addmm(gemm_bias, x, weight.t()), scale, norm_bias, norm_kind)
+
+        self._check(fn, inputs)
+
+    def _layernorm_bwd_dx(self, m, k, n, overrides=None):
+        bf16 = {"device": GPU_TYPE, "dtype": torch.bfloat16}
+        grad_out, weight = torch.randn((m, k), **bf16), torch.randn((k, n), **bf16) / 16
+        grad_residual, x_hat = torch.randn((m, n), **bf16), torch.randn((m, n), **bf16)
+        rstd = torch.rand((m, 1), device=GPU_TYPE) + 0.5
+        inputs = (grad_out, weight, grad_residual, x_hat, rstd, torch.randn((n, ), **bf16))
+        source = self._check(_layernorm_bwd_dx, inputs, overrides)
+        full_row = "_row_consumer" not in source
+        # The row statistics are never materialized; a full-row tile also drops the raw GEMM output.
+        self.assertNotIn(f"empty_strided_cuda(({m}, 1), ", source)
+        self.assertEqual(source.count(f"empty_strided_cuda(({m}, {n}), "), 1 if full_row else 2)
+        return full_row
+
+    @parametrize("m,k,n", [(16384, 128, 128), (4099, 96, 200)])
+    def test_layernorm_bwd_dx(self, m, k, n):
+        self._layernorm_bwd_dx(m, k, n)
+
+    def test_layernorm_bwd_dx_full_row(self):
+        # Without max_autotune, force mode takes the heuristic tile: at M = 32768 that is 64x128, so BLOCK_N = N.
+        self.assertTrue(self._layernorm_bwd_dx(32768, 128, 128, {"max_autotune": False}))
+
+
 @instantiate_parametrized_tests
 class TestReductionEpilogueGuards(TestCase):
 
