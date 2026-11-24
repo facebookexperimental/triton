@@ -464,43 +464,32 @@ def _kda_ws_fwd_kernel(  # noqa: C901
     SORT_WORK: tl.constexpr,
     BETA_IN_PRODUCER: tl.constexpr,
     FUSE_A_AQK: tl.constexpr,
-    PRODUCER_REGISTERS: tl.constexpr,
-    COMPUTE_REGISTERS: tl.constexpr,
-    EPILOGUE_REGISTERS: tl.constexpr,
 ):
-    # Persistent kernel: grid=(NUM_SMS,). Each of the 3 warp-spec tasks
-    # grid-strides over the (seq, head) work-items and keeps its own running
-    # chunk counter `it` — since all three tasks visit the same work-items in
-    # the same order, their `it` values (and hence the get_bufidx_phase buffer
-    # index/phase) stay in lock-step, preserving the producer->consumer->epilogue
-    # handshake across sequence boundaries. This removes the launch wave-tail on
-    # uniform batches and load-balances jagged batches over the fixed SM pool.
+    # Two four-warp tasks grid-stride over the same (sequence, head) work
+    # items. Their running chunk counters keep all barrier phases in sync,
+    # including across empty sequences and work-item boundaries.
     #
-    # How the chunk is split across the tasks follows its dependency graph rather
-    # than a producer/consumer convention:
-    #   * producer (1 warp)  -- TMA loads of q/k/v/g.
-    #   * compute  (8 warps) -- gate scaling, the carried state, the residual, and
-    #     the two accumulating dots: everything on the S recurrence.
-    #   * epilogue (4 warps) -- the WY triangular inverse and the output drain.
-    #     Neither depends on S, and the inverse is five dependent TMEM round trips
-    #     that nothing in the chunk's own algebra can overlap, so running it on a
-    #     second warp group puts it in the shadow of the state readout instead of
-    #     in series with it.
+    # The first task loads inputs, stages the carried state, computes the WY
+    # inverse, and drains outputs. It prefetches the next chunk before starting
+    # the inverse, once compute has released the current input buffers. The
+    # second task scales gates and computes the state readout and recurrence,
+    # overlapping that work with the inverse's dependent TMEM round trips.
+    # Eight total warps leave enough registers per thread without reallocation.
+    # Optional saved outputs add live values; reuse the shared triangular mask
+    # in those specializations instead of keeping inverse masks in registers.
+    SHARED_INVERSE_MASKS: tl.constexpr = OUTPUT_FINAL_STATE or SAVE_BETA_U or PACKED_SCRATCH or not SAVE_INTERMEDIATE
     _KDA_BETA_ROW_LAYOUT: tl.constexpr = _make_layout_cf(
-        shape=((4, 8, 4, 2), (2, 2, 8)),
-        stride=((2, 0, 0, 0), (1, 0, 8)),
+        shape=((4, 8, 4), (2, 2, 8)),
+        stride=((2, 0, 0), (1, 0, 8)),
     )
-    _KDA_DOT_LAYOUT: tl.constexpr = _make_layout_cf(
-        shape=((16, 2, 4, 2), (32, )),
-        stride=((128, 32, 2048, 64), (1, )),
-    )
-    _KDA_DOT_LAYOUT_D64: tl.constexpr = _make_layout_cf(
-        shape=((16, 2, 4, 2), (16, )),
-        stride=((64, 32, 1024, 16), (1, )),
+    # Layout for the [BT, BT] inverse masks, independent of head dimension.
+    _KDA_INVERSE_MASK_LAYOUT: tl.constexpr = _make_layout_cf(
+        shape=((16, 2, 4), (16, 2)),
+        stride=((64, 32, 1024), (1, 16)),
     )
     _KDA_GATE_INPUT_LAYOUT: tl.constexpr = _make_layout_cf(
-        shape=((4, 8, 4, 2), (2, 2, 8)),
-        stride=((256, 1, 32, 16), (128, 8, 1024)),
+        shape=((4, 8, 4), (2, 2, 8, 2)),
+        stride=((256, 1, 32), (128, 8, 1024, 16)),
     )
     # D=64 decay check: one channel per producer thread (two warps repeat the
     # other two) and 16 rows in registers, so the sum never leaves the thread.
@@ -602,18 +591,20 @@ def _kda_ws_fwd_kernel(  # noqa: C901
     QK_BYTES: tl.constexpr = BT * D * 2  # bf16 q/k/v/g tile
 
     with tlx.async_tasks():
-        # ---- producer: TMA loads + the carried state ----
-        # Four warps rather than one: the partition warp count is rounded up to a
-        # multiple of four regardless, so a 1-warp producer cost three warps of
-        # pure padding. Widened, those warps reach all 128 TMEM lanes and can own
-        # the state staging. That takes the staging off the compute task, whose A
-        # dot -- the head of the WY chain that task later waits on -- then issues
-        # a full staging earlier. This task is otherwise idle: it spends the whole
-        # chunk parked on `empty`.
-        with tlx.async_task(num_warps=4, registers=PRODUCER_REGISTERS):
+        # Input/state staging and inverse/output share one four-warp task.
+        with tlx.async_task(num_warps=4):
             DQ: tl.constexpr = D // 4
             b_state_p = mma_b_state[0]
             it = 0
+            out_tmem = tlx.subslice(mma_state_reads[0], BT, BT)
+            lhs_small = mma_lhs_small[0]
+            save_t_buf = mma_aqk_b[0]
+            b_work_x = tlx.local_slice(mma_b_work[0], [0, 0], [BT, BT])
+            b_work_t = tlx.local_slice(mma_b_work[0], [0, BT], [BT, BT])
+            acc_small1 = tlx.subslice(mma_u[0], 0, BT)
+            offs_t = tl.arange(0, BT)
+            BTH: tl.constexpr = BT // 2
+            extra_steps = 0
             for wid in tl.range(pid, n_work, nprog):
                 pid_s = wid // H
                 if SORT_WORK:
@@ -631,11 +622,9 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                 prev_decay = tl.full([D], 1.0, tl.float32)
                 decay_unsafe = tl.zeros([D], tl.int32)
                 beta_unsafe = tl.zeros([BT], tl.int32)
-                # Per-sequence descriptors: base at this sequence's start and use
-                # shape=[T, HD] so the TMA globalDim is the seqlen (<= ~14000), not
-                # the packed total_len (which exceeds the TMA globalDim limit at
-                # prod). Rows are indexed relative (row = c*BT); the [T, HD] bound
-                # also clamps the last partial chunk.
+                # Bound descriptors by this sequence rather than packed total
+                # length, which can exceed TMA's globalDim limit. TMA also
+                # zero-fills the last partial chunk without register masking.
                 sob = seq_beg.to(tl.int64) * HD
                 q_desc = tl.make_tensor_descriptor(Q + sob, shape=[T, HD], strides=[HD, 1], block_shape=[BT, D])
                 k_desc = tl.make_tensor_descriptor(K + sob, shape=[T, HD], strides=[HD, 1], block_shape=[BT, D])
@@ -652,14 +641,31 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                         block_shape=[D, D],
                     )
                 col = pid_h * D
-                for c in tl.range(0, num_chunks):
+                o_desc = tl.make_tensor_descriptor(O + sob, shape=[T, HD], strides=[HD, 1], block_shape=[BT, D])
+                if SAVE_BETA_U:
+                    beta_u_desc = tl.make_tensor_descriptor(
+                        SavedBetaU + sob,
+                        shape=[T, HD],
+                        strides=[HD, 1],
+                        block_shape=[BT, D],
+                    )
+                if SAVE_INTERMEDIATE:
+                    st_desc = tl.make_tensor_descriptor(
+                        SaveT + st_base * BT * BT,
+                        shape=[num_chunks * BT, BT],
+                        strides=[BT, 1],
+                        block_shape=[BT, BT],
+                    )
+                col = (pid_h * D).to(tl.int32)
+                inverse_unsafe = tl.zeros([BT], tl.int32)
+                # Prime the first chunk. Later loads overlap the inverse and
+                # state recurrence after compute releases q/k/v/g below.
+                if num_chunks > 0:
                     bufidx, phase = get_bufidx_phase(it, NBUF)
                     tlx.barrier_wait(empty[bufidx], phase ^ 1)
-                    row = c * BT  # relative to this sequence's descriptor base
-                    # Two arrivals, not one: the compute task only needs g and k
-                    # to run the cumsum and the whole gate branch, so gating that
-                    # on half the chunk's bytes lets it start while q/v are still
-                    # landing. q/v are waited on just before they are read.
+                    # Separate arrivals let the cumsum start from G/K while
+                    # Q/V are still landing.
+                    row = 0  # relative to this sequence's descriptor base
                     tlx.barrier_expect_bytes(full[bufidx], 2 * QK_BYTES)
                     tlx.async_descriptor_load(g_desc, g_buf[bufidx], [row, col], full[bufidx])
                     tlx.async_descriptor_load(k_desc, k_buf[bufidx], [row, col], full[bufidx])
@@ -676,6 +682,9 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                         tlx.local_store(beta_buf[bufidx], beta_values)
                         tlx.fence_async_shared()
                         tlx.barrier_arrive(beta_ready[bufidx], 1)
+                for c in tl.range(0, num_chunks):
+                    bufidx, phase = get_bufidx_phase(it, NBUF)
+                    row = c * BT
                     if D == 64:
                         # Fast-path regime: centered gate exponents stay within
                         # 60 nats when sum_t |g| <= 120. The legacy TMEM lowering
@@ -689,8 +698,8 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                             )
                             chunk_decay += tl.sum(tl.abs(g_rows.to(tl.float32)), axis=0)
                         decay_unsafe |= (~(chunk_decay <= 120.0)).to(tl.int32)
-                    # The fast VJP divides by beta; zero and tiny values take
-                    # the bounded recurrence. Masked rows read as 1.
+                    # The fast VJP divides by beta. Zero/tiny values require
+                    # the bounded recurrence; masked rows read as one.
                     beta_rows = row + tl.arange(0, BT)
                     beta_check = tl.load(
                         Beta + (seq_beg + beta_rows) * stride_bt_tok + pid_h * stride_bt_h,
@@ -698,16 +707,12 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                         other=1.0,
                     ).to(tl.float32)
                     beta_unsafe |= (~(beta_check >= 8.673617379884035e-19)).to(tl.int32)
-                    # --- carried state: bf16 copy for the readout, decay in place ---
-                    # The accumulator carries R = S_mid + (beta k_hat)^T U of the
-                    # previous chunk, with gates centered at half the chunk total.
-                    # This chunk's centered state is exp(Gamma_prev/2) R
-                    # exp(Gamma/2). Quartered because a [D, D] fp32 tile is 128
-                    # registers per thread on four warps.
+                    # Center the carried state with this and the previous
+                    # chunk's half-decay. Quarter tiles keep the FP32 state
+                    # out of registers until each slice is needed.
                     tlx.barrier_wait(mma_state_full[0], phase ^ 1)
-                    # This chunk's per-channel gate total also scales the state.
-                    # Read before releasing the compute task: the cumsum tile aliases
-                    # the readout accumulator, which its state-read dot overwrites.
+                    # Gamma aliases the readout accumulator: finish these reads
+                    # before state_ready releases the compute task's state dot.
                     tlx.barrier_wait(mma_gamma_p[0], phase)
                     if D == 64:
                         # The legacy TMEM lowering cannot load one column from
@@ -727,7 +732,7 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                             tlx.local_load(tlx.subslice(mma_gamma[0], BT - 1, 1)),
                             [D],
                         )
-                    chunk_shift = tl.exp2(_mul_f32x2(gamma_total, 0.7213475204444817))
+                    chunk_shift = tl.exp2(gamma_total * 0.7213475204444817)
                     if D == 128:
                         # Fast-path regime: centered gate exponents stay within
                         # 60 nats when sum_t |g| <= 120. One channel per TMEM lane:
@@ -761,13 +766,8 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                         for h in tl.static_range(4):
                             # Two multiplies: the combined factor can underflow
                             # FP32 while R and the centered state stay in range.
-                            s_h = _mul_f32x2(
-                                _mul_f32x2(
-                                    tlx.local_load(tlx.subslice(mma_state[0], h * DQ, DQ)),
-                                    prev_decay[:, None],
-                                ),
-                                chunk_shift[:, None],
-                            )
+                            s_h = (tlx.local_load(tlx.subslice(mma_state[0], h * DQ, DQ)) *
+                                   prev_decay[:, None]) * chunk_shift[:, None]
                             tlx.local_store(
                                 tlx.local_slice(b_state_p, [0, h * DQ], [D, DQ]),
                                 s_h.to(dtype),
@@ -782,11 +782,175 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                         # chunk rewrites b_state_p, so this task moves straight on
                         # to the next chunk's loads.
                         tlx.async_descriptor_store(ss_desc, b_state_p, [c * D, 0])
+                    bufidx, phase = get_bufidx_phase(it, NBUF)
+                    # NBUF=1: compute must consume Q and V before these loads
+                    # may overwrite the shared input tiles (and beta buffer).
+                    if c + 1 < num_chunks:
+                        next_bufidx, next_phase = get_bufidx_phase(it + 1, NBUF)
+                        tlx.barrier_wait(empty[next_bufidx], next_phase ^ 1)
+                        row = (c + 1) * BT  # relative to this sequence's descriptor base
+                        tlx.barrier_expect_bytes(full[next_bufidx], 2 * QK_BYTES)
+                        tlx.async_descriptor_load(g_desc, g_buf[next_bufidx], [row, col], full[next_bufidx])
+                        tlx.async_descriptor_load(k_desc, k_buf[next_bufidx], [row, col], full[next_bufidx])
+                        tlx.barrier_expect_bytes(full_qv[next_bufidx], 2 * QK_BYTES)
+                        tlx.async_descriptor_load(q_desc, q_buf[next_bufidx], [row, col], full_qv[next_bufidx])
+                        tlx.async_descriptor_load(v_desc, v_buf[next_bufidx], [row, col], full_qv[next_bufidx])
+                        if BETA_IN_PRODUCER:
+                            beta_rows = row + tl.arange(0, BT)
+                            beta_values = tl.load(
+                                Beta + (seq_beg + beta_rows) * stride_bt_tok + pid_h * stride_bt_h,
+                                mask=beta_rows < T,
+                                other=0.0,
+                            ).to(tl.float32)
+                            tlx.local_store(beta_buf[next_bufidx], beta_values)
+                            tlx.fence_async_shared()
+                            tlx.barrier_arrive(beta_ready[next_bufidx], 1)
+                    tlx.barrier_wait(mma_small0_full[0], phase)
+                    if FUSE_A_AQK:
+                        A = tl.trans(tlx.local_load(acc_small1))
+                    else:
+                        A = tlx.local_load(mma_small0[0])
+                    lower_strict = offs_t[:, None] > offs_t[None, :]
+                    if SHARED_INVERSE_MASKS:
+                        A = tl.where(tlx.local_load(tlx.local_trans(mma_lmat[0])) == 0, A, 0.0)
+                    else:
+                        A = tl.where(lower_strict, A, 0.0)
+                    X = (-A).to(dtype)
+                    if not SHARED_INVERSE_MASKS:
+                        eye_b = tl.where(offs_t[:, None] == offs_t[None, :], 1.0, 0.0).to(dtype)
+                    Tinv = (tlx.local_load(mma_lmat[0], layout=_KDA_INVERSE_MASK_LAYOUT) *
+                            tlx.local_load(tlx.local_trans(mma_lmat[0]), layout=_KDA_INVERSE_MASK_LAYOUT)
+                            if SHARED_INVERSE_MASKS else eye_b) + X
+                    Xn = X
+                    tlx.local_store(b_work_x, Xn)
+                    tlx.fence_async_shared()
+                    tlx.async_dot(
+                        b_work_x,
+                        b_work_x,
+                        acc_small1,
+                        use_acc=False,
+                        force_async=True,
+                        mBarriers=[mma_inv_b[0]],
+                    )
+                    row_sum = tl.sum(tl.abs(A), axis=1)
+                    inverse_unsafe |= (~(row_sum <= 0.5)).to(tl.int32)
+                    extra_phase = extra_steps & 1
+                    tlx.barrier_wait(mma_inv_b[0], phase)
+                    Xn = tlx.local_load(acc_small1).to(dtype)
+                    for i in tl.static_range(1, 3):
+                        if i == 1:
+                            # The four warps must agree on the fourth factor. A
+                            # generic max adds three barriers per chunk; here
+                            # each row posts its warp's max, and the barrier
+                            # ahead of this step's dots publishes the posts.
+                            tlx.local_store(
+                                row_max[0],
+                                tlx.warp_redux(
+                                    tlx.require_layout(row_sum, _KDA_TILE_ROW_LAYOUT),
+                                    "max",
+                                ),
+                            )
+                        tlx.local_store(
+                            lhs_small,
+                            (tlx.local_load(mma_lmat[0], layout=_KDA_INVERSE_MASK_LAYOUT) *
+                             tlx.local_load(tlx.local_trans(mma_lmat[0]), layout=_KDA_INVERSE_MASK_LAYOUT)
+                             if SHARED_INVERSE_MASKS else eye_b) + Xn,
+                        )
+                        tlx.local_store(b_work_t, Tinv)
+                        tlx.local_store(b_work_x, Xn)
+                        tlx.fence_async_shared()
+                        tlx.async_dot(
+                            lhs_small,
+                            b_work_t,
+                            mma_small0[0],
+                            use_acc=False,
+                            force_async=True,
+                            mBarriers=[mma_inv_a[i]],
+                        )
+                        if i == 1:
+                            tlx.async_dot(
+                                b_work_x,
+                                b_work_x,
+                                acc_small1,
+                                use_acc=False,
+                                force_async=True,
+                                mBarriers=[mma_inv_b[i]],
+                            )
+                            extra = (tl.max(
+                                tlx.local_load(row_max[0], layout=_KDA_WARP_ROWS_LAYOUT),
+                                axis=0,
+                            ) > 0.25)
+                        else:
+                            if extra:
+                                tlx.async_dot(
+                                    b_work_x,
+                                    b_work_x,
+                                    acc_small1,
+                                    use_acc=False,
+                                    force_async=True,
+                                    mBarriers=[mma_inv_b[i]],
+                                )
+                        tlx.barrier_wait(mma_inv_a[i], phase)
+                        Tinv = tlx.local_load(mma_small0[0]).to(dtype)
+                        if i == 1:
+                            tlx.barrier_wait(mma_inv_b[i], phase)
+                            Xn = tlx.local_load(acc_small1).to(dtype)
+                    if extra:
+                        # Factor (I + X^8).
+                        tlx.barrier_wait(mma_inv_b[2], extra_phase)
+                        Xn = tlx.local_load(acc_small1).to(dtype)
+                        tlx.local_store(
+                            lhs_small,
+                            (tlx.local_load(mma_lmat[0], layout=_KDA_INVERSE_MASK_LAYOUT) *
+                             tlx.local_load(tlx.local_trans(mma_lmat[0]), layout=_KDA_INVERSE_MASK_LAYOUT)
+                             if SHARED_INVERSE_MASKS else eye_b) + Xn,
+                        )
+                        tlx.local_store(b_work_t, Tinv)
+                        tlx.fence_async_shared()
+                        tlx.async_dot(
+                            lhs_small,
+                            b_work_t,
+                            mma_small0[0],
+                            use_acc=False,
+                            force_async=True,
+                            mBarriers=[mma_inv_a[3]],
+                        )
+                        tlx.barrier_wait(mma_inv_a[3], extra_phase)
+                        Tinv = tlx.local_load(mma_small0[0]).to(dtype)
+                        extra_steps += 1
+                    tlx.local_store(lhs_small, Tinv)
+                    tlx.fence_async_shared()
+                    tlx.barrier_arrive(tinv_ready[0], 1)
+                    tlx.barrier_wait(mma_out_full[0], phase)
+                    if SAVE_INTERMEDIATE:
+                        # The output dot has finished reading Aqk. Reuse its
+                        # shared-memory tile as the SaveT source, and keep the
+                        # next chunk behind o_empty until both stores are issued.
+                        tlx.local_store(save_t_buf, tlx.local_load(lhs_small).to(dtype))
+                        tlx.fence_async_shared()
+                        tlx.async_descriptor_store(st_desc, save_t_buf, [c * BT, 0])
+                    for j in tl.static_range(2):
+                        o_h = tl.trans(tlx.local_load(tlx.subslice(out_tmem, j * BTH, BTH)))
+                        tlx.local_store(
+                            tlx.local_slice(o_buf[bufidx], [j * BTH, 0], [BTH, D]),
+                            o_h.to(dtype),
+                        )
+                    tlx.fence_async_shared()
+                    row = (c * BT).to(tl.int32)  # relative to this sequence's base
+                    tlx.async_descriptor_store(o_desc, o_buf[bufidx], [row, col])
+                    tlx.barrier_arrive(o_empty[bufidx], 1)
+                    if SAVE_BETA_U:
+                        tlx.barrier_wait(beta_u_full[0], phase)
+                        tlx.async_descriptor_store(beta_u_desc, beta_u_buf[0], [row, col])
+                    tlx.async_descriptor_store_wait(0)
+                    if SAVE_INTERMEDIATE:
+                        tlx.barrier_arrive(save_t_empty[0], 1)
+                    if SAVE_BETA_U:
+                        tlx.barrier_arrive(beta_u_empty[0], 1)
                     it += 1
                 if SAVE_INTERMEDIATE:
                     # The next work item rebuilds this sequence's descriptor.
                     tlx.async_descriptor_store_wait(0)
-
                 if OUTPUT_FINAL_STATE:
                     # mma_state holds R = S_mid + (beta*k_hat)^T @ U after the
                     # last chunk. The next chunk normally applies the other half
@@ -800,12 +964,9 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                     if num_chunks > 0:
                         tlx.barrier_wait(mma_state_full[0], (it - 1) & 1)
                         for h in tl.static_range(4):
-                            s_h = _mul_f32x2(
-                                tlx.local_load(tlx.subslice(mma_state[0], h * DQ, DQ)),
-                                prev_decay[:, None],
-                            )
+                            s_h = tlx.local_load(tlx.subslice(mma_state[0], h * DQ, DQ)) * prev_decay[:, None]
                             tl.store(
-                                FinalS + state_base + state_rows * D + state_cols + h * DQ,
+                                FinalS + state_base + (state_rows * D + state_cols + h * DQ),
                                 s_h,
                             )
                     else:
@@ -813,16 +974,19 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                         # at zero and have no state-update dot to wait for.
                         for h in tl.static_range(4):
                             tl.store(
-                                FinalS + state_base + state_rows * D + state_cols + h * DQ,
+                                FinalS + state_base + (state_rows * D + state_cols + h * DQ),
                                 tl.full((D, DQ), 0.0, tl.float32),
                             )
                 tl.store(
                     UnsafeFlags + 2 * (pid_s * H + pid_h),
                     tl.maximum(tl.max(decay_unsafe, axis=0), tl.max(beta_unsafe, axis=0)),
                 )
+                tl.store(
+                    UnsafeFlags + 2 * (pid_s * H + pid_h) + 1,
+                    tl.max(inverse_unsafe, axis=0),
+                )
 
-        # ---- consumer: chunkwise KDA compute ----
-        with tlx.async_task("default", registers=COMPUTE_REGISTERS):
+        with tlx.async_task("default"):
             lhs_state_reads = mma_lhs_state_reads[0]
             lhs_wide = tlx.local_slice(lhs_state_reads, [0, 0], [BT, D])
             lhs_tail = tlx.local_slice(lhs_state_reads, [BT, 0], [BT, D])
@@ -898,7 +1062,6 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                     bufidx, phase = get_bufidx_phase(it, NBUF)
                     rows = c * BT + offs_t
                     row_mask = rows < T
-                    full_chunk = (c + 1) * BT <= T
                     # Issued ahead of the gate wait: this gather is the only
                     # global load left on the compute path, so its DRAM latency
                     # is spent while the cumsum is still running.
@@ -921,26 +1084,20 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                         )
                     else:
                         beta_tile = beta_column
+                    # TMA zero-fills rows outside the sequence for Q/K/V/G.
+                    # Delay Q and V loads until their register operands are used.
                     k_a = tlx.local_load(k_buf[bufidx])
-                    if not full_chunk:
-                        k_a = tl.where(row_mask[:, None], k_a, tl.zeros_like(k_a))
                     tlx.barrier_wait(mma_gamma_full[0], phase)
                     tlx.barrier_wait(full_qv[bufidx], phase)
-                    q = tlx.local_load(q_buf[bufidx])
-                    if D == 128:
-                        v = tlx.local_load(v_buf[bufidx], layout=_KDA_DOT_LAYOUT)
-                    else:
-                        v = tlx.local_load(v_buf[bufidx], layout=_KDA_DOT_LAYOUT_D64)
-                    tlx.barrier_arrive(empty[bufidx], 1)
-                    if not full_chunk:
-                        q = tl.where(row_mask[:, None], q, tl.zeros_like(q))
-                        v = tl.where(row_mask[:, None], v, 0.0)
                     gamma_values = tlx.local_load(mma_gamma[0])
-                    gamma_center = 0.5 * tl.sum(tl.where(offs_t[None, :] == BT - 1, gamma_values, 0.0), axis=1)
-                    gamma_a = _mul_f32x2(
-                        tl.trans(gamma_values) - gamma_center[None, :],
-                        1.4426950408889634,
-                    )
+                    if D == 128:
+                        gamma_center = 0.5 * tl.reshape(tlx.local_load(tlx.subslice(mma_gamma[0], BT - 1, 1)), [D])
+                    else:
+                        gamma_center = 0.5 * tl.sum(tl.where(offs_t[None, :] == BT - 1, gamma_values, 0.0), axis=1)
+                    # Keep the TMEM-derived register layout through elementwise
+                    # arithmetic. Packed inline asm forces SMEM round trips to
+                    # rearrange these tiles, increasing shared-memory contention.
+                    gamma_a = (tl.trans(gamma_values) - gamma_center[None, :]) * 1.4426950408889634
                     k_hat_a = (k_a * tl.exp2(-gamma_a).to(dtype)).to(dtype)
                     exp_gamma = tl.exp2(gamma_a).to(dtype)
                     k_bar_a = (k_a * exp_gamma).to(dtype)
@@ -960,6 +1117,7 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                             force_async=True,
                             mBarriers=[mma_small0_full[0]],
                         )
+                    q = tlx.local_load(q_buf[bufidx])
                     q_bar = (q * (exp_gamma * scale).to(dtype)).to(dtype)
                     tlx.local_store(lhs_tail, q_bar)
                     if FUSE_A_AQK:
@@ -977,6 +1135,11 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                             mBarriers=[mma_small0_full[0], mma_aqk_full[0]],
                         )
 
+                    # Match the residual's register layout rather than forcing
+                    # a dot-operand layout that needs another SMEM conversion.
+                    v = tlx.local_load(v_buf[bufidx])
+                    tlx.barrier_arrive(empty[bufidx], 1)
+
                     # Both state-dependent dots are queued ahead of the WY chain.
                     # Neither depends on T, so the readout->rhs and Aqk register
                     # work they unblock is what fills the doubling chain's stalls;
@@ -993,7 +1156,7 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                         force_async=True,
                         mBarriers=[mma_wide_full[0]],
                     )
-                    # The WY inverse runs on the epilogue task (below); what is
+                    # The WY inverse runs on the input/output task; what is
                     # left here is the state-side work that fills its shadow, plus
                     # one wait on the result.
                     # rhs = v - k_bar @ S. k_bar's tile is dead once the readout
@@ -1001,7 +1164,7 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                     # of the solve.
                     tlx.barrier_wait(mma_wide_full[0], 0)
                     state_readout = tl.trans(tlx.local_load(state_readout_tmem))
-                    rhs = _add_f32x2(v.to(tl.float32), -state_readout)
+                    rhs = v.to(tl.float32) - state_readout
                     tlx.local_store(lhs_wide, rhs.to(dtype))
                     if not FUSE_A_AQK:
                         tlx.async_dot(
@@ -1017,7 +1180,7 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                         Aqk = tl.trans(tlx.local_load(acc_aqk))
                     else:
                         Aqk = tlx.local_load(acc_aqk)
-                    Aqk = tl.where(lower_incl, Aqk, 0.0).to(dtype)
+                    Aqk = tl.where(tlx.local_load(mma_lmat[0]) != 0, Aqk, 0.0).to(dtype)
                     if SAVE_INTERMEDIATE:
                         tlx.barrier_wait(save_t_empty[0], phase ^ 1)
                     tlx.local_store(aqk_b, Aqk)
@@ -1064,7 +1227,15 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                         # rounded beta*U for the backward without extending
                         # the state recurrence or waiting on the TMA store.
                         tlx.barrier_wait(beta_u_empty[0], phase ^ 1)
-                        tlx.local_store(beta_u_buf[0], U.to(dtype) * beta_column.to(dtype))
+                        # The producer has prefetched the next chunk's beta.
+                        # Reload this chunk here instead of keeping beta_column
+                        # live through the full compute pipeline.
+                        saved_beta = tl.load(
+                            Beta + (seq_beg + rows) * stride_bt_tok + pid_h * stride_bt_h,
+                            mask=row_mask,
+                            other=0.0,
+                        ).to(dtype)
+                        tlx.local_store(beta_u_buf[0], U.to(dtype) * saved_beta[:, None])
                         tlx.fence_async_shared()
                         tlx.barrier_arrive(beta_u_full[0], 1)
                     if c + 1 < num_chunks:
@@ -1079,205 +1250,6 @@ def _kda_ws_fwd_kernel(  # noqa: C901
                             mBarriers=[mma_gamma_full[0], mma_gamma_p[0]],
                         )
                     it += 1
-
-        # ---- epilogue: drain the output accumulator and TMA-store it ----
-        # Four warps (one per TMEM lane quarter) so this task can read the
-        # accumulator itself. Draining it here instead of on the compute task
-        # takes the whole O-dot wait -> TMEM read -> transpose -> SMEM store tail
-        # off the compute critical path; it now runs against the next chunk's
-        # gate math, and the only thing the compute task waits for is the
-        # accumulator being free again.
-        with tlx.async_task(num_warps=4, registers=EPILOGUE_REGISTERS):
-            out_tmem = tlx.subslice(mma_state_reads[0], BT, BT)
-            lhs_small = mma_lhs_small[0]
-            save_t_buf = mma_aqk_b[0]
-            b_work_x = tlx.local_slice(mma_b_work[0], [0, 0], [BT, BT])
-            b_work_t = tlx.local_slice(mma_b_work[0], [0, BT], [BT, BT])
-            acc_small1 = tlx.subslice(mma_u[0], 0, BT)
-            offs_t = tl.arange(0, BT)
-            lower_strict = offs_t[:, None] > offs_t[None, :]
-            eye_b = tl.where(offs_t[:, None] == offs_t[None, :], 1.0, 0.0).to(dtype)
-            BTH: tl.constexpr = BT // 2
-            # Fourth-factor barriers fire only on chunks that need that factor,
-            # so their wait parity follows this count instead of the chunk.
-            extra_steps = 0
-            it = 0
-            for wid in tl.range(pid, n_work, nprog):
-                pid_s = wid // H
-                if SORT_WORK:
-                    pid_s = tl.load(WorkOrder + pid_s)
-                pid_h = wid % H
-                seq_beg = tl.load(cu_seqlens + pid_s).to(tl.int32)
-                seq_end = tl.load(cu_seqlens + pid_s + 1).to(tl.int32)
-                T = seq_end - seq_beg
-                num_chunks = tl.cdiv(T, BT)
-                sob = seq_beg.to(tl.int64) * HD
-                if PACKED_SCRATCH:
-                    chunk_prefix = tl.load(WorkOrder + n_seq + pid_s)
-                    st_base = (chunk_prefix * H + pid_h * num_chunks).to(tl.int64)
-                else:
-                    st_base = (pid_s * H + pid_h).to(tl.int64) * max_chunks
-                o_desc = tl.make_tensor_descriptor(O + sob, shape=[T, HD], strides=[HD, 1], block_shape=[BT, D])
-                if SAVE_BETA_U:
-                    beta_u_desc = tl.make_tensor_descriptor(
-                        SavedBetaU + sob,
-                        shape=[T, HD],
-                        strides=[HD, 1],
-                        block_shape=[BT, D],
-                    )
-                if SAVE_INTERMEDIATE:
-                    st_desc = tl.make_tensor_descriptor(
-                        SaveT + st_base * BT * BT,
-                        shape=[num_chunks * BT, BT],
-                        strides=[BT, 1],
-                        block_shape=[BT, BT],
-                    )
-                col = (pid_h * D).to(tl.int32)
-                inverse_unsafe = tl.zeros([BT], tl.int32)
-                for c in tl.range(0, num_chunks):
-                    bufidx, phase = get_bufidx_phase(it, NBUF)
-                    # --- WY triangular inverse  T = (I + A)^{-1}  [C,C] ---
-                    tlx.barrier_wait(mma_small0_full[0], phase)
-                    if FUSE_A_AQK:
-                        A = tl.trans(tlx.local_load(acc_small1))
-                    else:
-                        A = tlx.local_load(mma_small0[0])
-                    A = tl.where(lower_strict, A, 0.0)
-                    X = (-A).to(dtype)
-                    Tinv = eye_b + X
-                    Xn = X
-                    tlx.local_store(b_work_x, Xn)
-                    tlx.fence_async_shared()
-                    tlx.async_dot(
-                        b_work_x,
-                        b_work_x,
-                        acc_small1,
-                        use_acc=False,
-                        force_async=True,
-                        mBarriers=[mma_inv_b[0]],
-                    )
-                    # (I + A)^-1 = prod_k (I + X^(2^k)) truncates to the powers
-                    # below 2^K after K factors; the omitted tail is
-                    # rho^(2^K) / (1 - rho) times the solve's input, rho =
-                    # ||A||_inf. ||A||_inf <= 1/2 bounds ||(I + A)^-1||_inf by 2
-                    # and is the fast-path condition (any non-finite row fails
-                    # it too). Three factors keep the tail below 2.1e-5 when
-                    # rho <= 1/4; a fourth keeps it below 3.1e-5 up to 1/2.
-                    row_sum = tl.sum(tl.abs(A), axis=1)
-                    inverse_unsafe |= (~(row_sum <= 0.5)).to(tl.int32)
-                    extra_phase = extra_steps & 1
-                    tlx.barrier_wait(mma_inv_b[0], phase)
-                    Xn = tlx.local_load(acc_small1).to(dtype)
-                    # Factors (I + X^2) and (I + X^4); X^4 and X^8 alongside.
-                    for i in tl.static_range(1, 3):
-                        if i == 1:
-                            # The four warps must agree on the fourth factor. A
-                            # generic max adds three barriers per chunk; here
-                            # each row posts its warp's max, and the barrier
-                            # ahead of this step's dots publishes the posts.
-                            tlx.local_store(
-                                row_max[0],
-                                tlx.warp_redux(
-                                    tlx.require_layout(row_sum, _KDA_TILE_ROW_LAYOUT),
-                                    "max",
-                                ),
-                            )
-                        tlx.local_store(lhs_small, eye_b + Xn)
-                        tlx.local_store(b_work_t, Tinv)
-                        tlx.local_store(b_work_x, Xn)
-                        tlx.fence_async_shared()
-                        tlx.async_dot(
-                            lhs_small,
-                            b_work_t,
-                            mma_small0[0],
-                            use_acc=False,
-                            force_async=True,
-                            mBarriers=[mma_inv_a[i]],
-                        )
-                        if i == 1:
-                            tlx.async_dot(
-                                b_work_x,
-                                b_work_x,
-                                acc_small1,
-                                use_acc=False,
-                                force_async=True,
-                                mBarriers=[mma_inv_b[i]],
-                            )
-                            extra = (tl.max(
-                                tlx.local_load(row_max[0], layout=_KDA_WARP_ROWS_LAYOUT),
-                                axis=0,
-                            ) > 0.25)
-                        else:
-                            if extra:
-                                tlx.async_dot(
-                                    b_work_x,
-                                    b_work_x,
-                                    acc_small1,
-                                    use_acc=False,
-                                    force_async=True,
-                                    mBarriers=[mma_inv_b[i]],
-                                )
-                        tlx.barrier_wait(mma_inv_a[i], phase)
-                        Tinv = tlx.local_load(mma_small0[0]).to(dtype)
-                        if i == 1:
-                            tlx.barrier_wait(mma_inv_b[i], phase)
-                            Xn = tlx.local_load(acc_small1).to(dtype)
-                    if extra:
-                        # Factor (I + X^8).
-                        tlx.barrier_wait(mma_inv_b[2], extra_phase)
-                        Xn = tlx.local_load(acc_small1).to(dtype)
-                        tlx.local_store(lhs_small, eye_b + Xn)
-                        tlx.local_store(b_work_t, Tinv)
-                        tlx.fence_async_shared()
-                        tlx.async_dot(
-                            lhs_small,
-                            b_work_t,
-                            mma_small0[0],
-                            use_acc=False,
-                            force_async=True,
-                            mBarriers=[mma_inv_a[3]],
-                        )
-                        tlx.barrier_wait(mma_inv_a[3], extra_phase)
-                        Tinv = tlx.local_load(mma_small0[0]).to(dtype)
-                        extra_steps += 1
-                    tlx.local_store(lhs_small, Tinv)
-                    tlx.fence_async_shared()
-                    tlx.barrier_arrive(tinv_ready[0], 1)
-
-                    # --- drain the output accumulator and TMA-store it ---
-                    # In [D, C/2] halves: the whole fp32 tile is 64 registers per
-                    # thread on this 4-warp task, which spilled the WY chain.
-                    tlx.barrier_wait(mma_out_full[0], phase)
-                    if SAVE_INTERMEDIATE:
-                        # The output dot has finished reading Aqk. Reuse its
-                        # shared-memory tile as the SaveT source, and keep the
-                        # next chunk behind o_empty until both stores are issued.
-                        tlx.local_store(save_t_buf, tlx.local_load(lhs_small).to(dtype))
-                        tlx.fence_async_shared()
-                        tlx.async_descriptor_store(st_desc, save_t_buf, [c * BT, 0])
-                    for j in tl.static_range(2):
-                        o_h = tl.trans(tlx.local_load(tlx.subslice(out_tmem, j * BTH, BTH)))
-                        tlx.local_store(
-                            tlx.local_slice(o_buf[bufidx], [j * BTH, 0], [BTH, D]),
-                            o_h.to(dtype),
-                        )
-                    tlx.fence_async_shared()
-                    row = (c * BT).to(tl.int32)  # relative to this sequence's base
-                    tlx.async_descriptor_store(o_desc, o_buf[bufidx], [row, col])
-                    tlx.barrier_arrive(o_empty[bufidx], 1)
-                    if SAVE_BETA_U:
-                        tlx.barrier_wait(beta_u_full[0], phase)
-                        tlx.async_descriptor_store(beta_u_desc, beta_u_buf[0], [row, col])
-                    tlx.async_descriptor_store_wait(0)
-                    if SAVE_INTERMEDIATE:
-                        tlx.barrier_arrive(save_t_empty[0], 1)
-                    if SAVE_BETA_U:
-                        tlx.barrier_arrive(beta_u_empty[0], 1)
-                    it += 1
-                tl.store(
-                    UnsafeFlags + 2 * (pid_s * H + pid_h) + 1,
-                    tl.max(inverse_unsafe, axis=0),
-                )
 
 
 @triton.jit
@@ -1353,9 +1325,10 @@ def _kda_bwd_kernel(  # noqa: C901
     held in registers; the register-resident form of this kernel spilled roughly
     800KB per chunk to local memory.
     """
-    # Persistent kernel: grid-striding over the (seq, head) work-items. No
-    # separate producer warp: at NBUF=1 its transfers did not overlap the next
-    # chunk, so all registers can serve the 8 compute warps (4 in compact D64).
+    # D128 assigns one sequence/head chain to each CTA. Rotating equal-sized
+    # shared buffers shortens address live ranges through the reverse scan;
+    # one chain also releases descriptor-construction inputs before the scan.
+    # D64 retains the persistent schedule and its existing storage layout.
     pid = tl.program_id(0)
     nprog = tl.num_programs(0)
     n_work = n_seq * H
@@ -1364,14 +1337,27 @@ def _kda_bwd_kernel(  # noqa: C901
     L2E: tl.constexpr = 1.4426950408889634  # log2(e): rebase gate exps to ex2
     dtype = Q.dtype.element_ty
 
+    if D == 128:
+        _DBETA_LAYOUT: tl.constexpr = _make_layout_cf(
+            shape=((16, 2, 4, 2), (32, )),
+            stride=((D, 32, 16 * D, 64), (1, )),
+        )
+    STATE_BUFFERS: tl.constexpr = 2 if D == 128 else NBUF
+
     # --- SMEM (D128 ~225KB, compact D64 ~115KB at BT=64) -------------------
     # qk_buf: TMA lands q in rows [0,C) and k in rows [C,2C); the gate scaling
     # rewrites both halves in place (each thread stores back exactly the elements
     # it loaded), turning the tile into [q_bar; k_bar] with no second allocation.
-    qk_buf = tlx.local_alloc((BT2, D), dtype, NBUF)
-    r_buf = tlx.local_alloc((BT2, D), dtype, NBUF)  # do (TMA) | dKS
+    if D == 128:
+        # Q/K and do/dKS have identical extents. Swap their physical slots
+        # between chunks without adding shared memory.
+        qk_buf = tlx.local_alloc((BT2, D), dtype, 2)
+        r_buf = qk_buf
+    else:
+        qk_buf = tlx.local_alloc((BT2, D), dtype, NBUF)
+        r_buf = tlx.local_alloc((BT2, D), dtype, NBUF)
     s_buf_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
-    s_buf = tlx.local_alloc((D, D), dtype, NBUF, reuse=s_buf_storage_alias)  # S_in (TMA)
+    s_buf = tlx.local_alloc((D, D), dtype, STATE_BUFFERS, reuse=s_buf_storage_alias)  # S_in (TMA)
     g_buf_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
     g_buf = tlx.local_alloc((BT, D), dtype, NBUF, reuse=g_buf_storage_alias)  # g (TMA)
     # k_hat overwrites g: g's only reader is the cumsum MMA, so the MMA's
@@ -1388,7 +1374,10 @@ def _kda_bwd_kernel(  # noqa: C901
     # D64 can use the unused upper half of r_buf for dU/dq. Recycle the state
     # tile for dv after the state dots retire, then for dk after dv is stored.
     # This saves one [C,D] shared tile, allowing two 4-warp CTAs per SM.
-    if COMPACT_D64:
+    if D == 128:
+        # S_in/dG and decayed dS/dq/dk likewise exchange slots each chunk.
+        sd_buf = s_buf
+    elif COMPACT_D64:
         sd_buf = tlx.local_alloc((BT, D), dtype, 1)
     else:
         sd_buf = tlx.local_alloc((BT2, D), dtype, 1)
@@ -1406,7 +1395,7 @@ def _kda_bwd_kernel(  # noqa: C901
     # tile (32 of the 128 registers per thread, held across the whole
     # epilogue), five masked global stores and their convergences; TMA's own
     # bounds clipping also replaces the row mask on the partial chunk.
-    dg_buf = tlx.local_alloc((BT, D), tl.float32, 1, reuse=s_buf_storage_alias)
+    dg_buf = tlx.local_alloc((BT, D), tl.float32, STATE_BUFFERS, reuse=s_buf_storage_alias)
     s_buf_storage_alias.set_buffer_overlap(tlx.reuse_group(s_buf, dg_buf))
     # D128 stages Zk separately so the gate branch can be prefetched after
     # group F; D64 recycles the idle Tinv slot once its last dot has retired.
@@ -1423,7 +1412,14 @@ def _kda_bwd_kernel(  # noqa: C901
         one_buf = tlx.local_alloc((BT, BT), dtype, 1)
         lm_buf_storage_alias.set_buffer_overlap(tlx.reuse_group(lm_buf))
 
-    # --- TMEM (512 cols: 128 for the carried dS + 3 reused [C,D] accumulators) ---
+    if D == 128:
+        # Keep the rounded gates across the scan's dot groups in TMEM.
+        # The epilogue reloads only the columns it is currently consuming.
+        saved_egb = tlx.local_alloc((BT, D), dtype, 1, tlx.storage_kind.tmem)
+        saved_engb = tlx.local_alloc((BT, D), dtype, 1, tlx.storage_kind.tmem)
+        saved_egs = tlx.local_alloc((BT, D), dtype, 1, tlx.storage_kind.tmem)
+
+    # --- TMEM: carried dS and reused dot accumulators ---------------------
     acc_ds = tlx.local_alloc((D, D), tl.float32, 1, tlx.storage_kind.tmem)
     acc_a = tlx.local_alloc((BT, D), tl.float32, 1, tlx.storage_kind.tmem)
     acc_b = tlx.local_alloc((BT, D), tl.float32, 1, tlx.storage_kind.tmem)
@@ -1441,6 +1437,10 @@ def _kda_bwd_kernel(  # noqa: C901
     # dk_hat needs a target of its own: its two K halves become ready a chunk
     # stage apart, and acc_c_lo is rewritten by the dA dot in between.
     acc_kh = tlx.local_alloc((BT, D), tl.float32, 1, tlx.storage_kind.tmem)
+    # The standard D128 path can read Z from dk_hat's accumulator before
+    # either A-matrix contribution updates it. Keep the other specializations'
+    # allocation and schedule unchanged to preserve their register usage.
+    acc_z = acc_kh if D == 128 and not HAS_SAVED_BETA_U else acc_a
     # Transposed cumsum lands here so exp(Gamma) can be read out as a TMEM
     # column instead of an axis-0 reduction. It shares acc_c with the A-matrix
     # accumulator, whose first write is a chunk stage later.
@@ -1480,18 +1480,6 @@ def _kda_bwd_kernel(  # noqa: C901
     tlx.local_store(lm_buf[0], lower_incl.to(dtype))
     if not HAS_FINAL_STATE_GRAD:
         tlx.local_store(one_buf[0], tl.full([BT, BT], 1.0, dtype))
-    z_view = tlx.local_slice(sd_buf[0], [0, 0], [BT, D])
-    if COMPACT_D64:
-        du_view = tlx.local_slice(r_buf[0], [BT, 0], [BT, D])
-        dv_view = z_view
-    else:
-        du_view = tlx.local_slice(sd_buf[0], [BT, 0], [BT, D])
-        dv_view = du_view
-    # D128 uses the entire state tile; D64 consumes only its first C rows.
-    if D == 64:
-        state_view = z_view
-    else:
-        state_view = sd_buf[0]
     p_lo = tlx.local_slice(p_buf[0], [0, 0], [BT, BT])
     p_hi = tlx.local_slice(p_buf[0], [BT, 0], [BT, BT])
     acc_aa = tlx.local_alloc(
@@ -1505,7 +1493,9 @@ def _kda_bwd_kernel(  # noqa: C901
     acc_c_lo = acc_c[0]
 
     it = 0
-    for wid in tl.range(pid, n_work, nprog):
+    work_end = pid + 1 if D == 128 else n_work
+    work_step = 1 if D == 128 else nprog
+    for wid in tl.range(pid, work_end, work_step):
         if HAS_FINAL_STATE_GRAD or COMPACT_D64:
             # The previous work item finishes with ones in the shared tile.
             tlx.local_store(lm_buf[0], lower_incl.to(dtype))
@@ -1594,6 +1584,23 @@ def _kda_bwd_kernel(  # noqa: C901
             c = num_chunks - 1 - ci
             bufidx, phase = get_bufidx_phase(it, NBUF)
             tidx = it % 2
+            qkidx = (it & 1) if D == 128 else bufidx
+            ridx = (qkidx ^ 1) if D == 128 else bufidx
+            sidx = qkidx if D == 128 else bufidx
+            sdidx = (sidx ^ 1) if D == 128 else 0
+            dgidx = sidx if D == 128 else 0
+            z_view = tlx.local_slice(sd_buf[sdidx], [0, 0], [BT, D])
+            if COMPACT_D64:
+                du_view = tlx.local_slice(r_buf[ridx], [BT, 0], [BT, D])
+                dv_view = z_view
+            else:
+                du_view = tlx.local_slice(sd_buf[sdidx], [BT, 0], [BT, D])
+                dv_view = du_view
+            # D128 uses the entire state tile; D64 consumes only its first C rows.
+            if D == 64:
+                state_view = z_view
+            else:
+                state_view = sd_buf[sdidx]
             if COMPACT_D64:
                 # The next chunk's Tinv lands here only after mb[8] retires
                 # the dGamma dot that reads Zk.
@@ -1616,13 +1623,13 @@ def _kda_bwd_kernel(  # noqa: C901
                 tlx.async_descriptor_load(g_desc, g_buf[bufidx], [grow, col], full[bufidx])
                 tlx.async_descriptor_load(
                     q_desc,
-                    tlx.local_slice(qk_buf[bufidx], [0, 0], [BT, D]),
+                    tlx.local_slice(qk_buf[qkidx], [0, 0], [BT, D]),
                     [grow, col],
                     full[bufidx],
                 )
                 tlx.async_descriptor_load(
                     k_desc,
-                    tlx.local_slice(qk_buf[bufidx], [BT, 0], [BT, D]),
+                    tlx.local_slice(qk_buf[qkidx], [BT, 0], [BT, D]),
                     [grow, col],
                     full[bufidx],
                 )
@@ -1633,7 +1640,7 @@ def _kda_bwd_kernel(  # noqa: C901
                 tlx.async_descriptor_load(v_desc, wa_buf[bufidx], [row, col], full_s[bufidx])
             tlx.async_descriptor_load(
                 do_desc,
-                tlx.local_slice(r_buf[bufidx], [0, 0], [BT, D]),
+                tlx.local_slice(r_buf[ridx], [0, 0], [BT, D]),
                 [row, col],
                 full_s[bufidx],
             )
@@ -1644,7 +1651,7 @@ def _kda_bwd_kernel(  # noqa: C901
             # at the end of the previous chunk hides it behind the loads
             # already in flight; measured at 1.2% when left exposed.
             tlx.async_descriptor_store_wait(0)
-            tlx.async_descriptor_load(s_desc, s_buf[bufidx], [c * D, 0], full_s[bufidx])
+            tlx.async_descriptor_load(s_desc, s_buf[sidx], [c * D, 0], full_s[bufidx])
             # === group A: gamma = cumsum_t(g) as a triangular matmul ===
             # g feeds the MMA straight from its TMA buffer, no cross-thread
             # tl.cumsum. Only the first chunk of a work item issues its own
@@ -1674,10 +1681,10 @@ def _kda_bwd_kernel(  # noqa: C901
                     force_async=True,
                     mBarriers=[mb[0]],
                 )
-            qk_lo = tlx.local_slice(qk_buf[bufidx], [0, 0], [BT, D])
-            qk_hi = tlx.local_slice(qk_buf[bufidx], [BT, 0], [BT, D])
-            r_lo = tlx.local_slice(r_buf[bufidx], [0, 0], [BT, D])
-            r_hi = tlx.local_slice(r_buf[bufidx], [BT, 0], [BT, D])
+            qk_lo = tlx.local_slice(qk_buf[qkidx], [0, 0], [BT, D])
+            qk_hi = tlx.local_slice(qk_buf[qkidx], [BT, 0], [BT, D])
+            r_lo = tlx.local_slice(r_buf[ridx], [0, 0], [BT, D])
+            r_hi = tlx.local_slice(r_buf[ridx], [BT, 0], [BT, D])
 
             rows = c * BT + offs_t
             rmask = rows < T
@@ -1737,6 +1744,10 @@ def _kda_bwd_kernel(  # noqa: C901
             tlx.local_store(qk_lo, q_raw * egs)
             tlx.local_store(qk_hi, k_raw * egb)
             tlx.local_store(kh_buf[bufidx], k_raw * engb)
+            if D == 128:
+                tlx.local_store(saved_egb[0], egb)
+                tlx.local_store(saved_engb[0], engb)
+                tlx.local_store(saved_egs[0], egs)
             if STAGE_EGB:
                 egb_even, egb_odd = tl.split(tl.reshape(egb, (BT, D // 2, 2)))
                 # L is no longer an MMA operand after mb[0] retires. Keep
@@ -1750,7 +1761,7 @@ def _kda_bwd_kernel(  # noqa: C901
             # stall bucket in the SASS sampling.
             tlx.fence_async_shared()
             tlx.async_dot(  # [Aqk ; A0] = [q_bar ; k_bar] @ k_hat^T
-                qk_buf[bufidx],
+                qk_buf[qkidx],
                 tlx.local_trans(kh_buf[bufidx]),
                 acc_aa[0],
                 use_acc=False,
@@ -1769,7 +1780,7 @@ def _kda_bwd_kernel(  # noqa: C901
                 )
                 tlx.local_store(strip, ds_s)
                 tlx.local_store(
-                    tlx.local_slice(sd_buf[0], [0, hs * BT], [D, BT]),
+                    tlx.local_slice(sd_buf[sdidx], [0, hs * BT], [D, BT]),
                     ds_s.to(dtype),
                 )
 
@@ -1777,7 +1788,7 @@ def _kda_bwd_kernel(  # noqa: C901
             if not HAS_SAVED_BETA_U:
                 tlx.async_dot(  # k_bar @ S_in
                     qk_hi,
-                    s_buf[bufidx],
+                    s_buf[sidx],
                     acc_b[0],
                     use_acc=False,
                     force_async=True,
@@ -1835,8 +1846,8 @@ def _kda_bwd_kernel(  # noqa: C901
             r1 = tl.zeros([D], dtype=tl.float32)
             for hs in tl.static_range(D // BT):
                 r1 += tl.sum(
-                    (tlx.local_load(tlx.local_slice(sd_buf[0], [0, hs * BT], [D, BT])) *
-                     tlx.local_load(tlx.local_slice(s_buf[bufidx], [0, hs * BT], [D, BT]))).to(tl.float32),
+                    (tlx.local_load(tlx.local_slice(sd_buf[sdidx], [0, hs * BT], [D, BT])) *
+                     tlx.local_load(tlx.local_slice(s_buf[sidx], [0, hs * BT], [D, BT]))).to(tl.float32),
                     axis=1,
                 )
             if not HAS_SAVED_BETA_U:
@@ -1854,23 +1865,24 @@ def _kda_bwd_kernel(  # noqa: C901
                 use_acc=False,
                 force_async=True,
             )
-            tlx.async_dot(  # Z = betaU @ dS_s^T == dk_tilde * exp(Gamma)
+            # Z = betaU @ dS_s^T. On the standard D128 path, this also
+            # seeds dk_hat; read it for dGamma before the two later updates.
+            tlx.async_dot(
                 wa_buf[bufidx],
                 tlx.local_trans(state_view),
-                acc_a[0],
+                acc_z[0],
                 use_acc=False,
                 force_async=True,
                 mBarriers=[mb[10]],
             )
-            # The same product seeds dk_hat's accumulator, so the epilogue reads
-            # dk_hat + Z directly instead of carrying Z in FP32 registers.
-            tlx.async_dot(
-                wa_buf[bufidx],
-                tlx.local_trans(state_view),
-                acc_kh[0],
-                use_acc=False,
-                force_async=True,
-            )
+            if D != 128 or HAS_SAVED_BETA_U:
+                tlx.async_dot(
+                    wa_buf[bufidx],
+                    tlx.local_trans(state_view),
+                    acc_kh[0],
+                    use_acc=False,
+                    force_async=True,
+                )
             tlx.async_dot(  # dbetaU = Aqk^T @ do ...
                 tlx.local_trans(p_lo),
                 r_lo,
@@ -1900,7 +1912,7 @@ def _kda_bwd_kernel(  # noqa: C901
             # register lifetime here.
             tlx.local_store(
                 zk_view,
-                (tlx.local_load(acc_a[0]) * tlx.local_load(kh_buf[bufidx]).to(tl.float32)).to(dtype),
+                (tlx.local_load(acc_z[0]) * tlx.local_load(kh_buf[bufidx]).to(tl.float32)).to(dtype),
             )
             # dAqk takes the A0 half: nothing reads A0 here, while the dbetaU dot
             # may still be reading Aqk from p_lo.
@@ -1935,12 +1947,11 @@ def _kda_bwd_kernel(  # noqa: C901
                 mBarriers=[mb[4]],
             )
             tlx.barrier_wait(mb[4], phase)
-            # do and S_in have both been resident since the top of the chunk and
-            # acc_a was drained by the Z readout, so this dot owes nothing to the
-            # solve -- it is issued before dv has even been formed.
+            # do and S_in have been resident since the top of the chunk and
+            # acc_a is free, so this dot can issue before dv has been formed.
             tlx.async_dot(  # dq_bar = do @ S_in^T
                 r_lo,
-                tlx.local_trans(s_buf[bufidx]),
+                tlx.local_trans(s_buf[sidx]),
                 acc_a[0],
                 use_acc=False,
                 force_async=True,
@@ -1963,7 +1974,7 @@ def _kda_bwd_kernel(  # noqa: C901
             )
             tlx.async_dot(  # dk_bar = dKS @ S_in^T
                 r_hi,
-                tlx.local_trans(s_buf[bufidx]),
+                tlx.local_trans(s_buf[sidx]),
                 acc_b[0],
                 use_acc=False,
                 force_async=True,
@@ -1971,7 +1982,10 @@ def _kda_bwd_kernel(  # noqa: C901
             # dbeta = sum_d(betaU * drhs) / beta^2, reduced while group F runs.
             # wa_buf still holds betaU until dgamma replaces it.
             safe_beta = tl.where(bb > 0.0, bb, 1.0).to(tl.float32)
-            dbeta = tl.sum(tlx.local_load(wa_buf[bufidx]).to(tl.float32) * drhs, axis=1) / (safe_beta * safe_beta)
+            dbeta_product = tlx.local_load(wa_buf[bufidx]).to(tl.float32) * drhs
+            if D == 128:
+                dbeta_product = tlx.require_layout(dbeta_product, _DBETA_LAYOUT)
+            dbeta = tl.sum(dbeta_product, axis=1) / (safe_beta * safe_beta)
             tl.store(DBeta + tok * stride_bt_tok + pid_h * stride_bt_h, dbeta, mask=rmask)
             tlx.barrier_wait(mb[5], phase)
             # dA0 is dA*beta and dA is dA_raw/beta, so the two cancel: the
@@ -2035,41 +2049,74 @@ def _kda_bwd_kernel(  # noqa: C901
             # costs 2-5% because the store has not been issued long enough.
             tlx.async_descriptor_store_wait(0)
             tlx.barrier_wait(mb[11], phase)
-            # dgamma's three terms cancel and dk sums two gate products, so
-            # both are formed in FP32; dq is a single gate product. Each
-            # accumulator is consumed as soon as it is read to bound the live
-            # FP32 tiles.
-            dk_hat_total = tlx.local_load(acc_kh[0])
-            dgamma = -(dk_hat_total * tlx.local_load(kh_buf[bufidx]).to(tl.float32))
-            dk_out = dk_hat_total * engb.to(tl.float32)
-            if STAGE_EGB:
-                egb_grad = tl.interleave(egb_even, tlx.local_load(lm_buf[0]))
+            if D == 128:
+                # Consume 32 columns at a time so the three FP32 gradient
+                # accumulators do not coexist as full register tiles.
+                tlx.barrier_wait(mb[6], phase)
+                for part in tl.static_range(D // 32):
+                    dk_hat_total = tlx.local_load(tlx.subslice(acc_kh[0], part * 32, 32))
+                    kh = tlx.local_load(tlx.local_slice(kh_buf[bufidx], [0, part * 32], [BT, 32])).to(tl.float32)
+                    dgamma = -(dk_hat_total * kh)
+                    gate_inv = tlx.local_load(tlx.subslice(saved_engb[0], part * 32, 32)).to(tl.float32)
+                    dk_out = dk_hat_total * gate_inv
+                    gate_k = tlx.local_load(tlx.subslice(saved_egb[0], part * 32, 32)).to(tl.float32)
+                    dk_bar = tlx.local_load(tlx.subslice(acc_b[0], part * 32, 32))
+                    kbar = tlx.local_load(tlx.local_slice(qk_buf[qkidx], [BT, part * 32], [BT, 32])).to(tl.float32)
+                    dgamma += dk_bar * kbar
+                    tlx.local_store(
+                        tlx.local_slice(sd_buf[sdidx], [0, part * 32], [BT, 32]),
+                        (dk_out + dk_bar * gate_k).to(dtype),
+                    )
+                    dq_bar = tlx.local_load(tlx.subslice(acc_a[0], part * 32, 32))
+                    qbar = tlx.local_load(tlx.local_slice(qk_buf[qkidx], [0, part * 32], [BT, 32])).to(tl.float32)
+                    dgamma += dq_bar * qbar
+                    gate_q = tlx.local_load(tlx.subslice(saved_egs[0], part * 32, 32))
+                    tlx.local_store(
+                        tlx.local_slice(sd_buf[sdidx], [BT, part * 32], [BT, 32]),
+                        dq_bar.to(dtype) * gate_q,
+                    )
+                    tlx.local_store(tlx.local_slice(wa_buf[bufidx], [0, part * 32], [BT, 32]), dgamma.to(dtype))
             else:
-                egb_grad = egb
-            tlx.barrier_wait(mb[6], phase)
-            dk_bar = tlx.local_load(acc_b[0])
-            dgamma += dk_bar * tlx.local_load(qk_hi).to(tl.float32)
-            tlx.local_store(z_view, (dk_out + dk_bar * egb_grad.to(tl.float32)).to(dtype))
-            dq_bar = tlx.local_load(acc_a[0])
-            dgamma += dq_bar * tlx.local_load(qk_lo).to(tl.float32)
-            tlx.local_store(du_view, dq_bar.to(dtype) * egs)
-            tlx.local_store(wa_buf[bufidx], dgamma.to(dtype))
+                # dgamma's three terms cancel and dk sums two gate products, so
+                # both are formed in FP32; dq is a single gate product. Each
+                # accumulator is consumed as soon as it is read to bound the live
+                # FP32 tiles.
+                dk_hat_total = tlx.local_load(acc_kh[0])
+                dgamma = -(dk_hat_total * tlx.local_load(kh_buf[bufidx]).to(tl.float32))
+                dk_out = dk_hat_total * engb.to(tl.float32)
+                if STAGE_EGB:
+                    egb_grad = tl.interleave(egb_even, tlx.local_load(lm_buf[0]))
+                else:
+                    egb_grad = egb
+                tlx.barrier_wait(mb[6], phase)
+                dk_bar = tlx.local_load(acc_b[0])
+                dgamma += dk_bar * tlx.local_load(qk_hi).to(tl.float32)
+                tlx.local_store(z_view, (dk_out + dk_bar * egb_grad.to(tl.float32)).to(dtype))
+                dq_bar = tlx.local_load(acc_a[0])
+                dgamma += dq_bar * tlx.local_load(qk_lo).to(tl.float32)
+                tlx.local_store(du_view, dq_bar.to(dtype) * egs)
+                tlx.local_store(wa_buf[bufidx], dgamma.to(dtype))
+            if D == 128:
+                # The successor's Q/K land in this chunk's do/dKS slot.
+                # Finish the state update's last read before reusing it.
+                tlx.barrier_wait(mb[7], phase)
             if ci + 1 < num_chunks:
                 # q_bar/k_bar and k_hat have no readers left, so the successor's
                 # gate branch -- 49KB, otherwise fully exposed at the top of the
                 # next chunk -- transfers under the rest of this epilogue.
+                next_qkidx = (qkidx ^ 1) if D == 128 else bufidx
                 grow = row - BT
                 tlx.barrier_expect_bytes(full[bufidx], GATE_BYTES)
                 tlx.async_descriptor_load(g_desc, g_buf[bufidx], [grow, col], full[bufidx])
                 tlx.async_descriptor_load(
                     q_desc,
-                    tlx.local_slice(qk_buf[bufidx], [0, 0], [BT, D]),
+                    tlx.local_slice(qk_buf[next_qkidx], [0, 0], [BT, D]),
                     [grow, col],
                     full[bufidx],
                 )
                 tlx.async_descriptor_load(
                     k_desc,
-                    tlx.local_slice(qk_buf[bufidx], [BT, 0], [BT, D]),
+                    tlx.local_slice(qk_buf[next_qkidx], [BT, 0], [BT, D]),
                     [grow, col],
                     full[bufidx],
                 )
@@ -2137,7 +2184,7 @@ def _kda_bwd_kernel(  # noqa: C901
                 # next beta*U load then has a separate SMEM source; S_in is
                 # reloaded after the store-wait in the next chunk.
                 if STAGE_DG_IN_S:
-                    dg_source = tlx.local_slice(s_buf[bufidx], [0, 0], [BT, D])
+                    dg_source = tlx.local_slice(s_buf[sidx], [0, 0], [BT, D])
                 else:
                     dg_source = wa_buf[bufidx]
                 if SPLIT_DG_EPILOGUE:
@@ -2160,9 +2207,9 @@ def _kda_bwd_kernel(  # noqa: C901
                 tlx.fence_async_shared()
                 tlx.async_descriptor_store(dg_desc, dg_source, [row, col])
             else:
-                tlx.local_store(dg_buf[0], _add_f32x2(tlx.local_load(acc_a[0]), r1t))
+                tlx.local_store(dg_buf[dgidx], _add_f32x2(tlx.local_load(acc_a[0]), r1t))
                 tlx.fence_async_shared()
-                tlx.async_descriptor_store(dg_desc, dg_buf[0], [row, col])
+                tlx.async_descriptor_store(dg_desc, dg_buf[dgidx], [row, col])
             # The successor's cumsum pair is issued here, once acc_a and acc_gt
             # have been drained, so the next chunk's gate branch starts on a
             # result that is already in flight.
@@ -2214,6 +2261,10 @@ def _sequence_work_order(
     if n_seq * heads <= num_sms and not pack_chunk_offsets:
         return None
     lengths = cpu_offsets[1:] - cpu_offsets[:-1]
+    # Uniform sequences already have the stable sorted order. Avoid creating
+    # an identity work list and copying it to CUDA during graph capture.
+    if not pack_chunk_offsets and bool((lengths == lengths[0]).all()):
+        return None
     if n_seq * heads <= num_sms:
         order = torch.arange(n_seq, dtype=torch.int32)
     else:
@@ -2344,16 +2395,6 @@ def kimi_delta_attention_ws_fwd(  # noqa: C901
     # Launch up to eight programs per SM so uneven jagged sequence lengths do not
     # leave one long (seq, head) holding up the entire grid-strided tail.
     # Each program still handles a disjoint set of (seq, head) work-items.
-    register_budget = (56, 168, 104)
-    if (save_intermediate and os.environ.get("KDA_WS_EXPERIMENT_FWD_EPILOGUE_REGISTERS") == "1"):
-        # Keep the same total CTA register budget while giving the dependent
-        # inverse/output drain more room than the compute task needs. D64's
-        # smaller state tile lets the epilogue retain a larger budget.
-        register_budget = (64, 152, 128) if D == 128 else (56, 136, 168)
-        if fuse_a_aqk:
-            # Give the inverse/output drain more registers without increasing
-            # the fused CTA's total register allocation.
-            register_budget = (56, 152, 152)
     n_work = n_seq * H
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
     grid = (min(8 * num_sms, n_work), )
@@ -2388,15 +2429,11 @@ def kimi_delta_attention_ws_fwd(  # noqa: C901
         PACKED_SCRATCH=pack_saved_chunks,
         OUTPUT_FINAL_STATE=output_final_state,
         SORT_WORK=work_order is not None,
-        BETA_IN_PRODUCER=(D == 128 and os.environ.get("KDA_WS_EXPERIMENT_BETA_PRODUCER") == "1"),
+        BETA_IN_PRODUCER=True,
         FUSE_A_AQK=fuse_a_aqk,
-        PRODUCER_REGISTERS=register_budget[0],
-        COMPUTE_REGISTERS=register_budget[1],
-        EPILOGUE_REGISTERS=register_budget[2],
-        # The explicit dot layout covers all 8 warps: producer 1 + epilogue 1
-        # + compute 6. Additional compiler stages do not help this manual
-        # mbarrier pipeline.
-        num_warps=8,
+        # Four compute warps plus four input/inverse/output warps. Additional
+        # compiler stages do not help this manual mbarrier pipeline.
+        num_warps=4,
         num_stages=1,
     )
     stable_config = (
@@ -2568,8 +2605,9 @@ def kimi_delta_attention_ws_bwd(
     beta2 = beta.view(T, H)
     dbeta2 = dbeta.view(T, H)
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    # Match the forward grid's larger work queue for variable sequence lengths.
-    grid = (min(8 * num_sms, n_seq * H), )
+    # D128 releases per-work-item setup values before its single reverse scan.
+    # D64 retains the forward-sized persistent work queue for jagged batches.
+    grid = (n_seq * H if D == 128 else min(8 * num_sms, n_seq * H), )
     compact_d64 = (D == 64 and d_final_state is None and os.environ.get("KDA_WS_EXPERIMENT_D64_TWO_CTA") == "1")
     # The bounded VJP below handles every head that seeds dS_end, and every
     # head the forward routed to its bounded recurrence; it overwrites the
