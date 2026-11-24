@@ -907,6 +907,25 @@ def test_gfx1250_grouped_mxfp_stream_tile_maps(tile_map):
 
 @pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
 @pytest.mark.parametrize("w_dtype", ["e4m3", "e2m1"])
+def test_gfx1250_grouped_mxfp_rejects_tile_map_for_other_split_sizes(w_dtype):
+    # (64, 192) and (192, 64) have the same total rows but different maps.
+    # A map from another tensor is always rejected; after an in-place update
+    # of the map's own tensor, only validate=True detects the change.
+    x, x_scale, w, w_scale, _ = _grouped_a8_inputs((64, 192), 512, 1024, w_dtype)
+    x, x_scale, w, w_scale = x.cuda(), x_scale.cuda(), w.cuda(), w_scale.cuda()
+    split_sizes = torch.tensor([64, 192], dtype=torch.int32, device="cuda")
+    tile_map = _gfx1250_grouped_mxfp_op.prepare_grouped_gemm_mxfp(split_sizes, 256, "e4m3", w_dtype)
+    kwargs = dict(x_dtype="e4m3", w_dtype=w_dtype, tile_map=tile_map)
+    with pytest.raises(ValueError, match="different split_sizes tensor"):
+        _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(x, x_scale, w, w_scale, split_sizes.clone(), **kwargs)
+    _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(x, x_scale, w, w_scale, split_sizes, validate=True, **kwargs)
+    split_sizes.copy_(torch.tensor([192, 64], dtype=torch.int32))
+    with pytest.raises(ValueError, match="does not match the current split_sizes"):
+        _gfx1250_grouped_mxfp_op.grouped_gemm_mxfp(x, x_scale, w, w_scale, split_sizes, validate=True, **kwargs)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5 hardware")
+@pytest.mark.parametrize("w_dtype", ["e4m3", "e2m1"])
 @pytest.mark.parametrize("config", [(256, 256, 3), (128, 128, 6)])
 @pytest.mark.parametrize("num_programs", [3, 5])
 def test_gfx1250_grouped_mxfp_stream_ring_phase(w_dtype, config, num_programs):

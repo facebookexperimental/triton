@@ -401,7 +401,7 @@ def _block_m(gm, groups, x_dtype, w_dtype):
 
 
 class GroupedTileMap(NamedTuple):
-    """Device tile map built by ``prepare_grouped_gemm_mxfp`` for one total row count."""
+    """Device tile map built by ``prepare_grouped_gemm_mxfp`` from one ``split_sizes`` tensor's values."""
 
     tile_meta0: torch.Tensor
     tile_meta1: torch.Tensor
@@ -411,13 +411,19 @@ class GroupedTileMap(NamedTuple):
     # Tiles per group and in total are multiples of these (cluster rows and M groups).
     group_align: int = 1
     total_align: int = 1
+    # (device, data_ptr, numel) of the split_sizes the map was built from; None skips the check.
+    split_sizes_key: tuple | None = None
 
 
 def prepare_grouped_gemm_mxfp(split_sizes, gm, x_dtype="e2m1", w_dtype="e2m1"):
-    """Build a reusable tile map for ``gm`` total rows from device ``split_sizes``, with no host readback.
+    """Build a tile map for ``gm`` total rows from device ``split_sizes``, with no host readback.
 
-    The map uses the BLOCK_M that ``grouped_gemm_mxfp`` picks for ``gm`` rows in ``split_sizes.numel()`` groups of
-    ``x_dtype`` x ``w_dtype``, and records both, so the op can reject a map built for another problem.
+    The map holds each tile's group and rows for the values ``split_sizes`` has when the map is built. It stays
+    valid while those values do not change; after an in-place update, build a new map. The map uses the BLOCK_M
+    that ``grouped_gemm_mxfp`` picks for ``gm`` rows in ``split_sizes.numel()`` groups of ``x_dtype`` x
+    ``w_dtype``. It records ``gm``, BLOCK_M and which ``split_sizes`` tensor it came from, so the op rejects a map
+    built for another row count or from another tensor; ``validate=True`` also compares its entries with the
+    current ``split_sizes`` values.
     """
     groups = split_sizes.numel()
     block_m = _block_m(gm, groups, x_dtype, w_dtype)
@@ -445,7 +451,45 @@ def _tile_map(split_sizes, gm, block_m, group_align=1, total_align=1):
             GROUP_ALIGN=group_align,
             TOTAL_ALIGN=total_align,
         )
-    return GroupedTileMap(tile_meta0, tile_meta1, tile_count, gm, block_m, group_align, total_align)
+    return GroupedTileMap(tile_meta0, tile_meta1, tile_count, gm, block_m, group_align, total_align,
+                          _split_sizes_key(split_sizes))
+
+
+def _split_sizes_key(split_sizes):
+    return (split_sizes.device, split_sizes.data_ptr(), split_sizes.numel())
+
+
+def _expected_tile_map(sizes, block_m, group_align, total_align):
+    # Host copy of _build_grouped_tile_map: the map entries, tile count and total rows for these group sizes.
+    meta0, meta1, row = [], [], 0
+    for group, rows in enumerate(sizes):
+        tiles = triton.cdiv(triton.cdiv(rows, block_m), group_align) * group_align
+        meta0 += [row | (rows << 32)] * tiles
+        meta1 += [group | (local << 32) for local in range(tiles)]
+        row += rows
+    count = triton.cdiv(len(meta0), total_align) * total_align
+    pad = count - len(meta0)
+    return meta0 + [0] * pad, meta1 + [0] * pad, count, row
+
+
+def _check_tile_map(tile_map, split_sizes, gm, validate):
+    """Reject a tile map built from another split_sizes tensor; with validate, also one built from other values."""
+    if tile_map.split_sizes_key is not None and tile_map.split_sizes_key != _split_sizes_key(split_sizes):
+        raise ValueError("tile_map was built from a different split_sizes tensor; build it with "
+                         "prepare_grouped_gemm_mxfp from the split_sizes passed here")
+    if not validate:
+        return
+    if split_sizes.is_cuda and torch.cuda.is_current_stream_capturing():
+        raise ValueError("validate=True reads split_sizes on the host and cannot run under graph capture")
+    sizes = split_sizes.tolist()
+    if tile_map.gm != gm or sum(sizes) != gm or min(sizes, default=0) < 0:
+        # The row-count and split_sizes checks report these.
+        return
+    meta0, meta1, count, rows = _expected_tile_map(sizes, tile_map.block_m, tile_map.group_align, tile_map.total_align)
+    if (tile_map.tile_count.tolist() != [count, rows] or tile_map.tile_meta0[:count].tolist() != meta0
+            or tile_map.tile_meta1[:count].tolist() != meta1):
+        raise ValueError("tile_map does not match the current split_sizes values; rebuild it with "
+                         "prepare_grouped_gemm_mxfp after split_sizes changes")
 
 
 def _tile_map_entries(gm, groups, block_m, group_align, total_align):
@@ -802,14 +846,19 @@ def grouped_gemm_mxfp(
     divisible by 128 and K by 512, which A8W8 requires. Without ``w_scale_preshuffled`` the weight scales are
     preshuffled on every call. A ``tile_map`` from ``prepare_grouped_gemm_mxfp(split_sizes, gm, x_dtype, w_dtype)``
     is used whenever given; otherwise one is built (for W4A4 and preshuffled A8W4 weights only for
-    256 < GM <= 4096). ``uniform_grouped`` and ``w_kstep_major`` are caller promises that every group has 64 rows;
-    ``validate=True`` checks ``split_sizes`` on the host at the cost of a device sync.
+    256 < GM <= 4096). A given ``tile_map`` must come from this ``split_sizes`` tensor and reflect its current
+    values: the op rejects a map from another tensor or row count, but only ``validate=True`` detects values that
+    changed after the map was built. ``uniform_grouped`` and ``w_kstep_major`` are caller promises that every group
+    has 64 rows; ``validate=True`` checks ``split_sizes`` and a given ``tile_map`` on the host at the cost of a device
+    sync.
     """
     gm, groups, n, k = _check_inputs(x, x_scale, w, w_scale, split_sizes, out, w_scale_preshuffled, x_dtype, w_dtype)
     if out is None:
         out = torch.empty((gm, n), dtype=torch.bfloat16, device=x.device)
     if gm == 0:
         return out
+    if tile_map is not None:
+        _check_tile_map(tile_map, split_sizes, gm, validate)
     x_scale_u8 = x_scale.view(torch.uint8)
     w_scale_u8 = w_scale.view(torch.uint8)
     stream_config = stream_block_m = None
