@@ -808,3 +808,35 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32,
     tt.return
   }
 }
+
+// -----
+
+tt.func @rs_without_entropy(%x: f32) {
+  // expected-error @+1 {{stochastic rounding requires an rbits operand}}
+  %y = tt.fp_to_fp %x, rounding = rs : f32 -> bf16
+  tt.return
+}
+
+// -----
+
+tt.func @entropy_without_rs(%x: f32, %r: i32) {
+  // expected-error @+1 {{rbits is only allowed with stochastic rounding}}
+  %y = tt.fp_to_fp %x, rbits = %r : i32, rounding = rtne : f32 -> bf16
+  tt.return
+}
+
+// -----
+
+tt.func @rs_wrong_entropy_type(%x: f32, %r: i64) {
+  // expected-error @+1 {{operand #1 must be}}
+  %y = tt.fp_to_fp %x, rbits = %r : i64, rounding = rs : f32 -> bf16
+  tt.return
+}
+
+// -----
+
+tt.func @rs_wrong_entropy_shape(%x: tensor<32xf32>, %r: tensor<16xi32>) {
+  // expected-error @+1 {{same shape}}
+  %y = tt.fp_to_fp %x, rbits = %r : tensor<16xi32>, rounding = rs : tensor<32xf32> -> tensor<32xbf16>
+  tt.return
+}

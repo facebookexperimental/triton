@@ -6,9 +6,9 @@ import sys
 import pytest
 import torch
 
-from triton._internal_testing import is_hip_gfx1250
+from triton._internal_testing import is_hip_cdna5
 
-requires_gfx1250 = pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
+requires_gfx1250 = pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
 
 
 def _make_groups(m_list, n, k, *, device="cuda"):
