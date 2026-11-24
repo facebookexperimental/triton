@@ -7,7 +7,7 @@ import torch
 
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hopper_or_newer, is_interpreter
+from triton._internal_testing import is_cuda, is_hopper_or_newer, is_interpreter
 from triton._filecheck import run_filecheck
 
 
@@ -583,3 +583,51 @@ def test_while_block_arg_carries_init_handle_loc(fresh_triton_cache):
 @pytest.fixture(autouse=True)
 def with_line_info(fresh_knobs):
     fresh_knobs.compilation.disable_line_info = False
+
+
+@pytest.mark.parametrize("preserve", ["0", "1"])
+def test_ptx_source_paths(monkeypatch, preserve: str, fresh_triton_cache):
+    if is_interpreter() or not is_cuda():
+        pytest.skip("PTX source path virtualization is NVIDIA-only")
+
+    monkeypatch.setenv("TRITON_PRESERVE_PTX_SOURCE_PATHS", preserve)
+    kernel_single.device_caches.clear()
+    kernel_info = kernel_single.warmup(torch.float32, torch.float32, BLOCK=128, grid=(1, ))
+    file_directives = [line for line in kernel_info.asm["ptx"].splitlines() if line.lstrip().startswith(".file")]
+    expected = f'"{__file__}"' if preserve == "1" else '"<source>/test_line_info.py", 0, 0'
+    assert any(expected in line for line in file_directives), file_directives
+    kernel_single.device_caches.clear()
+
+
+@triton.jit
+def kernel_multiline_inline_asm(X, Y, BLOCK: tl.constexpr):
+    x = tl.load(X + tl.arange(0, BLOCK))
+    y = tl.inline_asm_elementwise("{\n.reg .b32 t;\nadd.u32 t, $1, 1;\nadd.u32 $0, t, 1;\n}", "=r,r", [x],
+                                  dtype=tl.int32, is_pure=True, pack=1)
+    tl.store(Y + tl.arange(0, BLOCK), y)
+
+
+def test_inline_asm_line_info(fresh_triton_cache):
+    if is_interpreter() or not is_cuda():
+        pytest.skip("inline asm line info is NVIDIA-only")
+
+    # NVPTX attributes the instructions of a multi-line inline asm to
+    # `call line + line index in the asm string`. Every asm instruction must
+    # instead map to the line of the inline asm call.
+    kernel_info = kernel_multiline_inline_asm.warmup(torch.int32, torch.int32, BLOCK=128, grid=(1, ))
+    src_lines, start = inspect.getsourcelines(kernel_multiline_inline_asm.fn)
+    asm_line = start + next(i for i, line in enumerate(src_lines) if "tl.inline_asm_elementwise(" in line)
+    in_asm = False
+    loc_line = None
+    add_lines = []
+    for line in kernel_info.asm["ptx"].splitlines():
+        line = line.strip()
+        if line.startswith("// begin inline asm"):
+            in_asm = True
+        elif line.startswith("// end inline asm"):
+            in_asm = False
+        elif line.startswith(".loc"):
+            loc_line = int(line.split()[2])
+        elif in_asm and line.startswith("add.u32"):
+            add_lines.append(loc_line)
+    assert add_lines == [asm_line, asm_line]
