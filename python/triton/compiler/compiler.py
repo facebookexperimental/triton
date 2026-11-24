@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import functools
 import hashlib
 import json
@@ -94,7 +95,14 @@ class ASTSource:
 
     def make_ir(self, target: GPUTarget, options, codegen_fns, module_map, context):
         from .code_generator import ast_to_ttir
-        module = ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+        src = self
+        if getattr(options, "sr_mode", "") == "enabled":
+            # The JIT reuses `attrs` after compilation, so launch values go on a copy.
+            src = copy.copy(self)
+            src.attrs = {path: list(specs) for path, specs in self.attrs.items()}
+            for name, value in options.sr_launch:
+                src.attrs.setdefault((self.fn.arg_names.index(name), ), []).append(("tt.sr_value", value))
+        module = ast_to_ttir(self.fn, src, context=context, options=options, codegen_fns=codegen_fns,
                              module_map=module_map)
         if post_ast_lowering := codegen_fns.get("post_ast_lowering"):
             post_ast_lowering(module)
@@ -390,6 +398,8 @@ def compile(src, target=None, options=None, _env_vars=None):
     module_map = backend.get_module_map()
     try:
         module = src.make_ir(target, options, codegen_fns, module_map, context)
+        if not isinstance(module, str):
+            module.validate_stochastic_rounding(target.backend)
     except Exception as e:
         filter_traceback(e)
         raise
@@ -633,7 +643,9 @@ class CompiledKernel:
         # not enough shared memory to run the kernel
         max_shared = max_shared_mem(device)
         if shared > max_shared:
-            raise_(OutOfResources(shared, max_shared, "shared memory"))
+            raise_(
+                OutOfResources(shared, max_shared, "shared memory",
+                               getattr(self.metadata, "shared_memory_breakdown", None)))
         if hasattr(self.metadata, "tmem_size") and self.metadata.tmem_size is not None:
             # Use blackwell max tmem size for now, this should be moved in device properties
             max_tmem_size = 512  # tmem size in number of columns
