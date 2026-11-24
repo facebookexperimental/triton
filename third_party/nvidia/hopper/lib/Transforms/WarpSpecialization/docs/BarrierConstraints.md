@@ -283,7 +283,13 @@ before the existing tmem_load sinking. Four steps:
 
 4. **`optimizeWSBarrierLocations`** — After sinking, relocate each barrier
    back to an optimal position right next to its associated memory op
-   (arrives after, waits before), respecting SSA dominance.
+   (arrives after, waits before), respecting SSA dominance. The associated
+   memory op is only the nearest one before sinking, so a wait moving down
+   stops at the first op on the same buffer (same memdesc root) that
+   originally followed it, and an arrive moving up stops at the last op on the
+   same buffer that originally preceded it. This keeps a subtile that is read
+   twice, with the reads sunk by different amounts, inside the wait/arrive
+   pair, while barriers still move freely past accesses to other buffers.
 
 5. **`triton-nvidia-unify-ws-barrier-locations`** — In the following pass,
    identify AutoWS TMA-ready and TMEM-ready waits whose load chains meet at the
