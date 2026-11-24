@@ -411,17 +411,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.targ
 
 // -----
 
-// Manual K=96 blocked FP6 (TLX native kernel feeds unpacked codes in a
-// K=128 tile): stays a native scaled dot instead of decomposing.
+// Manual K=96 blocked FP6 (TLX native kernel feeds per-segment packed bytes
+// in a K=128 tile): stays a native scaled dot instead of decomposing, and
+// keeps the explicit packed-operand marker.
 // CHECK-LABEL: mfma_dot_scaled_fp6_native_k96
 // CHECK-NOT: tt.fp_to_fp
-// CHECK: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2
+// CHECK: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2 {amdg.fp6_packed, fastMath = false}
 // CHECK-SAME: #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 32}>
 // CHECK-SAME: #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 32}>
 // CHECK-NOT: tt.dot {{.*}}xbf16
 // MFMA16-LABEL: mfma_dot_scaled_fp6_native_k96
 // MFMA16-NOT: tt.fp_to_fp
-// MFMA16: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2
+// MFMA16: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2 {amdg.fp6_packed, fastMath = false}
 // MFMA16-SAME: #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 32}>
 // MFMA16-SAME: #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 32}>
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [2, 2], order = [1, 0]}>
@@ -435,7 +436,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %arg4: tensor<128x128x!tt.ptr<f32>, #blocked>
       ) {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
-    %1 = tt.dot_scaled %arg0 scale %arg2, %arg1 scale %arg3, %cst lhs = e2m3 rhs = e3m2 {fastMath = false} : tensor<128x128xi8, #blocked>, tensor<128x4xi8, #blocked1> * tensor<128x128xi8, #blocked>, tensor<128x4xi8, #blocked1> -> tensor<128x128xf32, #blocked>
+    %1 = tt.dot_scaled %arg0 scale %arg2, %arg1 scale %arg3, %cst lhs = e2m3 rhs = e3m2 {amdg.fp6_packed, fastMath = false} : tensor<128x128xi8, #blocked>, tensor<128x4xi8, #blocked1> * tensor<128x128xi8, #blocked>, tensor<128x4xi8, #blocked1> -> tensor<128x128xf32, #blocked>
     tt.store %arg4, %1 : tensor<128x128x!tt.ptr<f32>, #blocked>
     tt.return
   }
@@ -445,10 +446,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // BF16-default tile (256x256x64) FP6 also stays native at the
 // default instruction size (forced-16 has no K=64 scaled shape and
-// decomposes, as before).
+// decomposes, as before). An unmarked FP6 dot is not inferred to be packed.
 // CHECK-LABEL: mfma_dot_scaled_fp6_native_k64
 // CHECK-NOT: tt.fp_to_fp
-// CHECK: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2
+// CHECK: tt.dot_scaled {{.*}} lhs = e2m3 rhs = e3m2 {fastMath = false}
 // CHECK-SAME: #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 32}>
 // CHECK-SAME: #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 32}>
 // MFMA16-LABEL: mfma_dot_scaled_fp6_native_k64
