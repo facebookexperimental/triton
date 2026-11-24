@@ -234,4 +234,18 @@ def TritonNpotPad : Pass<"triton-npot-pad", "mlir::ModuleOp"> {
   ];
 }
 
+def TritonMaterializeStochasticRounding : Pass<"triton-materialize-stochastic-rounding", "mlir::ModuleOp"> {
+  let summary = "Validate and materialize one FP32 to BF16 SR store";
+  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
+  let options = [
+    Option<"mode", "mode", "std::string", "\"\"", "plain or enabled variant">,
+    Option<"site", "site", "std::string", "\"\"", "Required semantic site name">,
+    Option<"rounds", "rounds", "int32_t", "10", "Philox round count">,
+    Option<"computeCapability", "compute-capability", "int32_t", "0", "NVIDIA architecture">,
+    Option<"ptxVersion", "ptx-version", "int32_t", "0", "PTX version">,
+    Option<"ownership", "ownership", "std::string", "\"checked\"", "checked or declared output ownership">,
+    Option<"entropyMode", "entropy", "std::string", "\"element\"", "element or packed8 entropy mapping">
+  ];
+}
+
 #endif

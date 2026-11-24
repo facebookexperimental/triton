@@ -311,16 +311,17 @@ def _moe_mxfp4_small_kernel(
             tl.store(c_ptr + slot[:, None] * N + BLOCK_N + offs_n[None, :], accs2[i].to(tl.bfloat16), mask=valid)
 
 
-def pick_config(num_valid: int) -> dict:
-    """Keyed on T * topk (no host sync, graph-capturable); cutoffs measured at EP4 (64 of 256 experts local) on a
-    clock-locked MI350X (third_party/tlx/denoise.sh). Rows per local expert scale with T * topk / local experts, so a
-    different expert split, hidden size or GPU may move the crossovers: pass one of these dicts as ``moe_mxfp4``'s
-    ``cfg`` to pin an engine."""
-    if num_valid <= 2048:
+def pick_config(num_valid: int, num_experts: int = 64) -> dict:
+    """Keyed on the expected rows per expert, T * topk / num_experts (no host sync, graph-capturable), so one rule
+    holds for any expert split. Cutoffs measured with 32 and 64 local experts at H = I = 4096 under HIP graph replay
+    on MI350X; another hidden size or GPU may move them: pass one of these dicts as ``moe_mxfp4``'s ``cfg`` to pin an
+    engine."""
+    rows = num_valid / num_experts
+    if rows <= 16:
         return dict(BLOCK_M=32, WN=8, A_LDS=False)
-    if num_valid <= 8192:
-        return dict(BLOCK_M=64, WN=4, A_LDS=True)
-    if num_valid <= 32768:
+    if rows <= 128:
+        return dict(BLOCK_M=128, GROUP_M=4, QUAD=True)
+    if rows <= 384:
         return dict(BLOCK_M=128, GROUP_M=1, QUAD=True)
     return dict(BLOCK_M=256, GROUP_M=1, QUAD=True)
 
@@ -750,15 +751,18 @@ def _moe_mxfp4_quad_kernel(
             stride=((32, 64, 128, 256, 512, 1024, 2048, 4096, 8192), (1, 2, 4, 8, 16)),
         )
     else:
-        # Lanes must fill consecutive 16-byte LDS slots: lane bits = LDS address bits 4..9 of ``a_tile``.
+        # Lanes must fill consecutive 16-byte LDS slots: lane bits = LDS address bits 4..9 of ``a_tile``. Rows go in
+        # the 128-row tile's order, with row 16 in its row-64 slot: rows 1, 32, 16 share a 1 KiB padding interval and
+        # rows 2, 4, 8 sit in separate ones, so the padding staggers the banks of the rows one MFMA operand read
+        # touches. With row 2 inside the first interval instead, 31% of LDS cycles were bank conflicts; now 8%.
         a_load_layout: tl.constexpr = tlx.layout(
             shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
-            stride=((16, 32, 64, 128, 4096, 256, 512, 1024, 2048), (1, 2, 4, 8)),
+            stride=((16, 32, 64, 128, 4096, 2048, 256, 512, 1024), (1, 2, 4, 8)),
         )
         a_tile: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
             [[1024, 32]],
-            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [32, 0], [2, 0], [4, 0], [8, 0],
-             [16, 0]],
+            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [32, 0], [16, 0], [2, 0], [4, 0],
+             [8, 0]],
             [HALF_M, HALF_K],
         )
         shared_a_scales: tl.constexpr = tlx.shared_linear_layout_encoding(
@@ -946,9 +950,11 @@ def _launch(a, a_s, b, b_s, c, c_s, sorted_ids, expert_ids, num_post, N, K, num_
 
 
 def moe_mxfp4(x, topk_weights, topk_ids, w13, w13_scale, w2, w2_scale, expert_start=0, post_norm_weight=None,
-              post_norm_eps=1e-6, post_norm_gain=0.0, out=None, cfg=None):
+              post_norm_eps=1e-6, post_norm_gain=0.0, out=None, cfg=None, num_experts=None):
     """Weights come from ``prepare_w13`` / ``prepare_w2``: w13 [E, 2I, K/2] gate/up interleaved in 128-row
-    blocks, w2 [E, H, I/2], both pre-shuffled, with packed scales [E, K/512, 2I, 16] and [E, I/512, H, 16]."""
+    blocks, w2 [E, H, I/2], both pre-shuffled, with packed scales [E, K/512, 2I, 16] and [E, I/512, H, 16].
+    ``num_experts`` is how many experts ``topk_ids`` route over (all of them under expert parallelism); it only
+    picks the engine and defaults to the E local experts."""
     T, K = x.shape
     E, two_i, _ = w13.shape
     I = two_i // 2
@@ -966,7 +972,7 @@ def moe_mxfp4(x, topk_weights, topk_ids, w13, w13_scale, w2, w2_scale, expert_st
     if T == 0:
         return out
 
-    cfg = cfg or pick_config(num_valid)
+    cfg = cfg or pick_config(num_valid, num_experts or E)
     ids = topk_ids.contiguous()
     scores32 = topk_weights.to(torch.float32).contiguous()
     has_norm = post_norm_weight is not None
