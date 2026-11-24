@@ -299,15 +299,6 @@ def _add_f32x2(a, b):
 
 
 @triton.jit
-def _rowsum_into_pairs(acc, x):
-    # Accumulate adjacent column pairs in order so each packed add can issue as soon as its two exp2 results exist.
-    pairs = _split_n_2D(x, x.shape[1] // 2)
-    for k in tl.static_range(0, x.shape[1] // 2):
-        acc = _add_f32x2(acc, pairs[k])
-    return acc
-
-
-@triton.jit
 def _ex2_emu_f32x2(x):
     # FA4's exp2 emulation (flash_attn/cute/utils.py ex2_emulation_2) on the FMA pipe: split x into
     # floor + fraction with a round-down add, evaluate a degree-3 polynomial for 2^frac, and add the
@@ -437,51 +428,66 @@ def _softmax_inner_loop(
         else:
             qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
         # Publish P in chunks of 1/2, 1/4 and 1/4 so the MMA warp starts the PV on the first half and only the last
-        # quarter's MMAs trail the last exp2. The emulated columns and the row-sum order match the two halves.
+        # quarter's MMAs trail the last exp2. P is computed and stored a quarter at a time, the first chunk as two
+        # stores: ptxas keeps the alpha named-barrier arrive above in front of the first P store, so a 32-column first
+        # store hands alpha to the correction after a quarter's exp2s rather than half of them. With the cross-stage
+        # alpha release (see the correction), the softmax waits on that hand-off.
         tl.static_assert(NUM_MMA_SLICES == 2)
         qk_lo, qk_hi = _split_n_2D(qk, 2)
+        qk_q0, qk_q1 = _split_n_2D(qk_lo, 2)
         qk_q2, qk_q3 = _split_n_2D(qk_hi, 2)
-        qks = (qk_lo, qk_q2, qk_q3)
+        qks = (qk_q0, qk_q1, qk_q2, qk_q3)
         p_slices = ()
-        for k in tl.static_range(0, 3):
+        for k in tl.static_range(0, 4):
             if EX2_EMU_FREQ != 0 and STAGE != 2:
                 # FA4's apply_exp2_convert split: in 32-column fragments, the first EX2_EMU_START_FRG
                 # and the last fragment stay on MUFU; the rest emulate the last 4 of every
                 # EX2_EMU_FREQ columns. Each register's column is a compile-time constant, so the
                 # select folds away.
-                cols = (0 if k == 0 else BLOCK_N // 4 *
-                        (k + 1)) + tl.arange(0, BLOCK_N // 2 if k == 0 else BLOCK_N // 4)
+                cols = BLOCK_N // 4 * k + tl.arange(0, BLOCK_N // 4)
                 frg = cols // 32
                 emu = (frg >= EX2_EMU_START_FRG) & (frg < BLOCK_N // 32 - 1) & (cols % 32 % EX2_EMU_FREQ
                                                                                 >= EX2_EMU_FREQ - 4)
                 p_i = tl.where(emu[None, :], _ex2_emu_f32x2(qks[k]), tl.math.exp2(qks[k]))
             else:
                 p_i = tl.math.exp2(qks[k])
-            if k == 0:
-                tlx.local_store(tlx.local_view(p_tiles, qk_buf * NUM_MMA_SLICES), p_i.to(out_dtype))
-                p_bar = tlx.local_view(acc_fulls, qk_buf)
-            else:
-                tlx.local_store(
-                    tlx.subslice(tlx.local_view(p_tiles, qk_buf * NUM_MMA_SLICES + 1), BLOCK_N // 4 * (k - 1),
-                                 BLOCK_N // 4), p_i.to(out_dtype))
-                p_bar = tlx.local_view(p_fulls, qk_buf * 3 + k)
-            # As in FA4, each warp publishes its rows of P as soon as it has stored them, without waiting for the
-            # other softmax warps. A warp barrier already has every thread arrive.
-            if USE_2CTA:
-                # The TMEM store completes before this readiness token; it does
-                # not publish ordinary SMEM to the peer CTA.
-                tlx.barrier_arrive(p_bar, 1, remote_cta_rank=0, per_warp=not USE_WARP_BARRIER)
-            else:
-                tlx.barrier_arrive(p_bar, per_warp=not USE_WARP_BARRIER)
+            # Quarters 0 and 1 fill p_tiles[2 * qk_buf] and then signal acc_fulls; quarters 2 and 3 fill the halves of
+            # p_tiles[2 * qk_buf + 1] and signal p_fulls[3 * qk_buf + 1] and p_fulls[3 * qk_buf + 2].
+            tlx.local_store(
+                tlx.subslice(tlx.local_view(p_tiles, qk_buf * NUM_MMA_SLICES + k // 2), BLOCK_N // 4 * (k % 2),
+                             BLOCK_N // 4), p_i.to(out_dtype))
+            if k != 0:
+                if k == 1:
+                    p_bar = tlx.local_view(acc_fulls, qk_buf)
+                else:
+                    p_bar = tlx.local_view(p_fulls, qk_buf * 3 + k - 1)
+                # As in FA4, each warp publishes its rows of P as soon as it has stored them, without waiting for the
+                # other softmax warps. A warp barrier already has every thread arrive.
+                if USE_2CTA:
+                    # The TMEM store completes before this readiness token; it does
+                    # not publish ordinary SMEM to the peer CTA.
+                    tlx.barrier_arrive(p_bar, 1, remote_cta_rank=0, per_warp=not USE_WARP_BARRIER)
+                else:
+                    tlx.barrier_arrive(p_bar, per_warp=not USE_WARP_BARRIER)
             p_slices = p_slices + (p_i, )
 
         # As in FA4, acquire the alpha buffer for the next iteration here, off the S -> P path,
-        # and do the row sum behind the wait.
+        # and do the row sum behind the wait. With the cross-stage release, S is usually ready by the time the sum
+        # ends, so its latency counts: sum in FA4's fadd_reduce order, column pair g into accumulator g % 4, which
+        # gives four 16-deep chains instead of one 64-deep chain.
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), alpha_phase)
-        l_pairs = tl.zeros([l_i.shape[0], 2], tl.float32)
-        for k in tl.static_range(0, 3):
-            l_pairs = _rowsum_into_pairs(l_pairs, p_slices[k])
-        l_i += tl.sum(l_pairs, 1)
+        l_0 = tl.zeros([l_i.shape[0], 2], tl.float32)
+        l_1 = tl.zeros([l_i.shape[0], 2], tl.float32)
+        l_2 = tl.zeros([l_i.shape[0], 2], tl.float32)
+        l_3 = tl.zeros([l_i.shape[0], 2], tl.float32)
+        for k in tl.static_range(0, 4):
+            pairs = _split_n_2D(p_slices[k], BLOCK_N // 8)
+            for g in tl.static_range(0, BLOCK_N // 8, 4):
+                l_0 = _add_f32x2(l_0, pairs[g])
+                l_1 = _add_f32x2(l_1, pairs[g + 1])
+                l_2 = _add_f32x2(l_2, pairs[g + 2])
+                l_3 = _add_f32x2(l_3, pairs[g + 3])
+        l_i += tl.sum(_add_f32x2(_add_f32x2(l_0, l_1), _add_f32x2(l_2, l_3)), 1)
         m_i = m_ij
         accum_cnt_qk += 1
 
@@ -1382,7 +1388,15 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         # -- update output accumulator --
                         tlx.named_barrier_wait(ALPHA_BAR_ID + cid, 256)
                         alpha_1 = tlx.local_load(alpha_smem[cid])
-                        tlx.barrier_arrive(alpha_empties[cid])
+                        # As in FA4's cross-stage stats release (NOTE [softmax stats release order]), the alpha
+                        # slot of group 1 - cid is freed after O[cid] is rescaled below, not each slot right after it
+                        # is read. Each softmax group's end-of-iteration alpha_empties wait then follows the other
+                        # group, which keeps the two groups about half an iteration apart, so their exp2 bursts
+                        # alternate on the MUFU they share. The first iteration has nothing to rescale and frees slot
+                        # 0 here; the loop below frees slot 1's last alpha.
+                        if cid == 0:
+                            if start_n == lo:
+                                tlx.barrier_arrive(alpha_empties[0])
                         # The first PV of a tile overwrites O (use_acc=False), so there is nothing to rescale.
                         if start_n != lo:
                             # Each warp decides for its own 32 rows, as FA4 does: rescale only if some row's alpha
@@ -1426,6 +1440,9 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                             )
                         else:
                             tlx.barrier_arrive(acc_fulls[cid])
+                        if start_n != lo:
+                            tlx.barrier_arrive(alpha_empties[1 - cid])
+                tlx.barrier_arrive(alpha_empties[1])
 
                 for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
                     group_id = cid * NUM_CTAS + cluster_cta_rank
@@ -1470,11 +1487,8 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                 clc_phase_consumer ^= 1
 
         # softmax groups
-        # nvptx_cmp_sink_workaround: TEMPORARY. Keeps the CLC arrive's `tid == 0` predicate before the softmax loop
-        # (NVPTX would sink it after the loop) and the P arrives' lane-0 test inside it (LICM would hoist it). ptxas
-        # schedules the softmax loop about 3% faster with both.
         with tlx.async_task(num_warps=4, registers=256 if (USE_2CTA and HEAD_DIM >= 256) else 184,
-                            replicate=NUM_GROUPS_PER_CTA, nvptx_cmp_sink_workaround=True):
+                            replicate=NUM_GROUPS_PER_CTA):
             accum_cnt_qk = 0
             tile_count = 0
             tile_id = start_pid
