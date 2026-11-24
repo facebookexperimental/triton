@@ -216,6 +216,20 @@ N-blocks.
 - MMA `mBarriers` with `two_ctas=True`: hardware signals when input reads
   complete. The TMEM output write may still be in-flight.
 
+### Barrier allocation before TMEM allocation (any multi-CTA cluster)
+
+Allocate all barriers before any SMEM/TMEM allocation in the kernel prologue.
+With more than one physical CTA, entry-block barrier inits must precede the
+first TMEM alloc so the compiler can insert the init fence and cluster
+rendezvous between them. This applies whenever the kernel has a remote barrier
+arrive (`remote_cta_rank`, `async_remote_shmem_store(..., barrier=)`, multicast
+TMA, CLC), a multicast arrive, paired MMA (`two_ctas=True`), or a
+`scope="cluster"` barrier — not only 2-CTA MMA (e.g. a K-split cluster
+reducing onto rank 0's barrier). The compiler hoists inits it can move, but
+errors with "Barrier init is not before TMEM allocation" when a dependency
+cannot be hoisted. Single-CTA kernels are exempt. See
+`third_party/tlx/doc/tlx_barriers.md` ("Default-Scope Triggers").
+
 
 **input_precision options:** `tf32`, `tf32x3`, `ieee`
 

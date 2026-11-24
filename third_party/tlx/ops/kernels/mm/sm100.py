@@ -1041,6 +1041,33 @@ def matmul_kernel_tma_ws_blackwell(
     N_TAIL2: tl.constexpr = _n_piece(BLOCK_SIZE_N, 2)
     tl.static_assert(_n_piece(BLOCK_SIZE_N, 3) == 0)
     tl.static_assert(N_TAIL == 0 or not INTERLEAVE_EPILOGUE)
+    slice_size: tl.constexpr = BLOCK_N0 // EPILOGUE_SUBTILE
+
+    # Allocate all barriers before any TMEM allocation. With NUM_CTAS == 2 (paired MMA), entry-block barrier inits
+    # must precede the first TMEM alloc so a cluster sync fits between them; the compiler hoists them and errors if
+    # it cannot. Not required for NUM_CTAS == 1.
+    # Each subtile needs its own barriers: NUM_SMEM_BUFFERS barriers per subtile.
+    A_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
+    A_smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
+    if NUM_MMA_GROUPS == 1:
+        # A and B TMA loads share the same transaction-byte-counted barrier.
+        B_smem_full_bars = A_smem_full_bars
+    else:
+        B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
+    # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
+    # One arrival per stored slice, the N tail pieces' slices included.
+    tmem_empty_arrivals: tl.constexpr = BLOCK_SIZE_N // slice_size * NUM_CTAS
+    if USE_WARP_BARRIER:
+        tmem_empty_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, num_warps=4,
+                                                 num_arrivals=tmem_empty_arrivals)
+    else:
+        tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
+                                             arrive_count=tmem_empty_arrivals)
+
+    # Each of the three async tasks consumes CLC responses on both cluster CTAs.
+    clc_context = tlx.clc_create_context(num_consumers=3 * NUM_CTAS, num_stages=NUM_CLC_STAGES)
+
     # allocate NUM_SMEM_BUFFERS buffers
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
     if not A_ROW_MAJOR:
@@ -1103,7 +1130,6 @@ def matmul_kernel_tma_ws_blackwell(
     # Allocate SMEM buffers for epilogue TMA store (at least 2 for multi-buffering).
     # workspace_desc is fp32 for split-K and aliases c_desc otherwise.
     NUM_EPILOGUE_SMEM_BUFFERS: tl.constexpr = NUM_MMA_GROUPS if NUM_MMA_GROUPS > 2 else 2
-    slice_size: tl.constexpr = BLOCK_N0 // EPILOGUE_SUBTILE
     c_smem_buffers = tlx.local_alloc(
         (BLOCK_M_SPLIT, slice_size),
         tlx.dtype_of(workspace_desc),
@@ -1115,29 +1141,6 @@ def matmul_kernel_tma_ws_blackwell(
         cluster_cta_rank = tlx.cluster_cta_rank()
     else:
         cluster_cta_rank = 0
-
-    # allocate barriers - each subtile needs its own barriers
-    # NUM_SMEM_BUFFERS barriers per subtile for synchronization
-    A_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
-    A_smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
-    if NUM_MMA_GROUPS == 1:
-        # A and B TMA loads share the same transaction-byte-counted barrier.
-        B_smem_full_bars = A_smem_full_bars
-    else:
-        B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
-    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
-    # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
-    # One arrival per stored slice, the N tail pieces' slices included.
-    tmem_empty_arrivals: tl.constexpr = BLOCK_SIZE_N // slice_size * NUM_CTAS
-    if USE_WARP_BARRIER:
-        tmem_empty_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, num_warps=4,
-                                                 num_arrivals=tmem_empty_arrivals)
-    else:
-        tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
-                                             arrive_count=tmem_empty_arrivals)
-
-    # Each of the three async tasks consumes CLC responses on both cluster CTAs.
-    clc_context = tlx.clc_create_context(num_consumers=3 * NUM_CTAS, num_stages=NUM_CLC_STAGES)
 
     with tlx.async_tasks(
             exclusive=True,
