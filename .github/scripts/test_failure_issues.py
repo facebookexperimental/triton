@@ -1,7 +1,9 @@
 """Tests for CI failure episodes and verified recovery."""
 import json
+import os
 import re
 import subprocess
+import sys
 from urllib.parse import parse_qs, urlsplit
 import xml.etree.ElementTree as ET
 
@@ -129,6 +131,30 @@ def test_a_skipped_or_unselected_case_does_not_prove_recovery(tmp_path):
         assert api.writes == []
 
 
+def test_valid_subtest_reports_allow_only_explicitly_passed_ids_to_recover(tmp_path):
+    path = xml(tmp_path, [("t::test_a[one]", "passed")])
+    tree = ET.parse(path)
+    tree.getroot().set("tests", "3")
+    tree.write(path)
+    unselected = dict(issue(8, title=PREFIX + "t::other"), body=body(ids=("t::other", ), norm="t::other"))
+    api = FakeApi([issue(7), unselected])
+    assert fi.reconcile(api, REPO, PREFIX, LABELS, "[]", RUN + "150", 150, parsed_recovery([path])) == [7]
+    assert api.issues[7]["state"] == "closed" and api.issues[8]["state"] == "open"
+
+
+def test_subtest_counts_do_not_override_contradictory_target_results(tmp_path):
+    passed = xml(tmp_path, [("t::test_a[one]", "passed")], name="passed.xml")
+    for status in ("failure", "error", "skipped"):
+        path = xml(tmp_path, [("t::test_a[one]", status)])
+        tree = ET.parse(path)
+        tree.getroot().set("tests", "3")
+        tree.write(path)
+        api = FakeApi([issue(7)])
+        proof = parsed_recovery([passed, path])
+        assert fi.reconcile(api, REPO, PREFIX, LABELS, "[]", RUN + "150", 150, proof) == []
+        assert api.writes == []
+
+
 def test_every_previously_failing_parameter_must_pass(tmp_path):
     both = dict(issue(7), body=body(ids=("t::test_a[one]", "t::test_a[two]")))
     for second, expected in (("skipped", []), ("passed", [7])):
@@ -142,8 +168,9 @@ def test_missing_malformed_or_unfinished_results_do_not_close_issues(tmp_path):
     missing = str(tmp_path / "missing.xml")
     malformed = tmp_path / "malformed.xml"
     malformed.write_text("<testsuite>")
-    for expected, completed in (([path, missing], [path]), ([path, str(malformed)], [path,
-                                                                                     str(malformed)]), ([path], [])):
+    empty = xml(tmp_path, [], name="empty.xml")
+    for expected, completed in (([path, missing], [path]), ([path, str(malformed)], [path, str(malformed)]),
+                                ([path], []), ([empty], [empty])):
         api = FakeApi([issue(7)])
         assert fi.reconcile(api, REPO, PREFIX, LABELS, "[]", RUN + "150", 150, parsed_recovery(completed,
                                                                                                expected)) == []
@@ -175,6 +202,38 @@ def test_a_job_level_fallback_is_not_a_pass():
     assert reconcile(api, [{"issue_title": PREFIX + "bucket", "fallback": True}], passed=["t::test_a[one]"]) == []
     assert fi.reconcile(api, REPO, PREFIX, LABELS, "not json", RUN + "150", 150) == []
     assert api.writes == []
+
+
+def test_a_crash_is_reported_against_the_test_that_was_running(tmp_path, monkeypatch, capsys):
+    # A crash keeps pytest from writing JUnit XML; the report must still name the test pytest was running and the
+    # signal, even when the test's own -s output looks like a node id.
+    pytest_plugins = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pytest_plugins")
+    (tmp_path / "test_ops.py").write_text("\n".join([
+        "import os, signal",
+        "def test_ok(): pass",
+        "def test_crash():",
+        "    print('\\nfake/test_other.py::test_wrong', flush=True)",
+        "    os.kill(os.getpid(), signal.SIGSEGV)",
+        "def test_after(): pass",
+    ]))
+    outputs = tmp_path / "github_output"
+    env = dict(os.environ, GITHUB_OUTPUT=str(outputs), PYTHONPATH=pytest_plugins)
+    status = subprocess.run(
+        [sys.executable, "-m", "pytest", "test_ops.py", "-p", "running_test", "-p", "no:cacheprovider", "-v", "-s"],
+        cwd=tmp_path, env=env, capture_output=True).returncode
+    # GitHub Actions keeps the last value written for a key.
+    running = [line.split("=", 1)[1] for line in outputs.read_text().splitlines() if line.startswith("running_test=")]
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    monkeypatch.setattr("sys.argv", [
+        "parse", "--junit",
+        str(tmp_path / "missing.xml"), "--workflow", "W", "--job", "j", "--failed", "--crashed-test", running[-1],
+        "--exit-code",
+        str(128 - status if status < 0 else status)
+    ])
+    junit.main()
+    [item] = json.loads(capsys.readouterr().out)
+    assert item["issue_title"] == "[nightly] W / j / SIGSEGV in test_ops::test_crash"
+    assert item["fallback"] is True
 
 
 def test_slow_steps_need_a_completed_passing_suite_under_budget(tmp_path):

@@ -22,6 +22,7 @@
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/AMDGPUAddrSpace.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
 #include <type_traits>
 
 using mlir::triton::amdgpu::ISAFamily;
@@ -55,7 +56,7 @@ static Value createDsReadTr(Operation *op, RewriterBase &rewriter, Location loc,
   const auto numElemsI32 = (vTy.getNumElements() * physicalBitWidth / 32);
   const auto vTyI32 = VectorType::get(numElemsI32, i32_ty);
 
-  // GFX1250 uses opaque LLVM intrinsic calls; their results cannot be cast to
+  // CDNA5 uses opaque LLVM intrinsic calls; their results cannot be cast to
   // AliasAnalysisOpInterface, so no no-alias scope is attached.
   auto callIntrinsic = [&](StringRef name, VectorType retTy) -> Value {
     return LLVM::createLLVMIntrinsicCallOp(rewriter, loc, name, {retTy},
@@ -64,7 +65,7 @@ static Value createDsReadTr(Operation *op, RewriterBase &rewriter, Location loc,
   };
 
   switch (isaFamily) {
-  case ISAFamily::GFX1250:
+  case ISAFamily::CDNA5:
     if (logicalBitWidth == 16)
       return callIntrinsic("llvm.amdgcn.ds.load.tr16.b128", vTy);
     if (logicalBitWidth == 8)
@@ -291,7 +292,7 @@ LogicalResult lowerDsReadTr(
     // source lane issuing the load. For ds_read_tr* the hardware shuffles
     // data across lanes, so the two differ: we need to remap.
     //
-    // Example: ds_load_tr8_b64 on gfx1250, from the test
+    // Example: ds_load_tr8_b64 on CDNA5, from the test
     // `ds_transpose_partitioned_remaps_lane`.
     //
     //  fullTile:
@@ -2339,7 +2340,13 @@ public:
   LogicalResult
   matchAndRewrite(triton::gpu::BarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.isWarp() || !mlir::triton::amdgpu::isCDNA(targetInfo.getISAFamily()))
+    // A local-only fence omits the vector cache invalidate. This is safe only
+    // when all waves share one L0, so an acquire in one wave covers the others.
+    auto isaFamily = targetInfo.getISAFamily();
+    bool workgroupSharesOneL0 =
+        mlir::triton::amdgpu::isCDNA(isaFamily) ||
+        (mlir::triton::amdgpu::isRDNA(isaFamily) && targetInfo.isCuMode());
+    if (op.isWarp() || !workgroupSharesOneL0)
       return failure();
     // Check no other memory addrspaces are selected.
     // TensorRead/Write are allowed but noop.
@@ -2546,7 +2553,7 @@ struct MemoryCounterWaitOpConversion
   matchAndRewrite(amdgpu::MemoryCounterWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     // amdgpu::MemoryCounterWaitOp supports gfx9 onwards
-    auto isaVersion = targetInfo.getIsaVersion();
+    auto isaVersion = llvm::AMDGPU::getIsaVersion(targetInfo.getArch());
 
     /// If major version >= gfx12, lower to
     ///   * ROCDL::WaitDscntOp if ds is present
