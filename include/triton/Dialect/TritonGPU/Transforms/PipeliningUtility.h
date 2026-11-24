@@ -203,8 +203,8 @@ bool requestsMetaWarpSpecialization(Operation *op);
 bool isMetaWarpSpecializedFunc(triton::FuncOp funcOp);
 
 // Whether the module requests Meta AutoWS or is already warp-specialized (e.g.
-// TLX ttg.warp_specialize regions). With TRITON_USE_META_WS on, a module that is
-// neither compiles as with the knob off.
+// TLX ttg.warp_specialize regions). With TRITON_USE_META_WS on, a module that
+// is neither compiles as with the knob off.
 bool requestsMetaWarpSpecialization(ModuleOp mod);
 
 // Whether `op`'s module compiles with Meta AutoWS: the module's ttg.use_meta_ws
