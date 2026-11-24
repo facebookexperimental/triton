@@ -439,6 +439,10 @@ LogicalResult verifyBarrierType(Operation *op,
 // Get a boolean if the Value is an arith::ConstantOp
 std::optional<bool> getBoolFromConstant(Value cst);
 
+// True for TLX modules and warp-pipelined modules, which place their LDS
+// buffers and stages explicitly; plain Triton leaves that to the compiler.
+bool placesLdsByHand(ModuleOp mod);
+
 } // namespace mlir::triton
 
 #endif // TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
