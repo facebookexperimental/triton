@@ -1840,3 +1840,58 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %hist, %next : tensor<512xi32, #histSplit>, tensor<512xi32, #histBroadcast>
   }
 }
+
+// -----
+
+#remote_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0], CGALayout = [[0, 0]]}>
+#remote_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 0]]}>
+#remote_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // A st.async into a peer CTA completes bytes on the peer's mbarrier, so the
+  // peer must initialize it first: the pass inserts the barrier-init bootstrap.
+  // CHECK-LABEL: @remote_shmem_store_barrier_init_sync
+  // CHECK: ttng.init_barrier
+  // CHECK-NEXT: ttng.fence_mbarrier_init_release_cluster
+  // CHECK-NEXT: ttng.cluster_arrive {relaxed = true, tlx.cluster_sync_bootstrap}
+  // CHECK-NEXT: ttng.cluster_wait {tlx.cluster_sync_bootstrap}
+  // CHECK: ttg.async_remote_shmem_store
+  tt.func @remote_shmem_store_barrier_init_sync(%vals: tensor<4x32xf32, #remote_blocked>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<4x32xf32, #remote_shared, #smem, mutable>
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #remote_bar, #smem, mutable>
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #remote_bar, #smem, mutable>
+    ttg.async_remote_shmem_store %vals, rank %c1, %buf barrier %bar : tensor<4x32xf32, #remote_blocked> -> !ttg.memdesc<4x32xf32, #remote_shared, #smem, mutable> barrier_ty !ttg.memdesc<1xi64, #remote_bar, #smem, mutable>
+    ttng.wait_barrier %bar, %c0 : !ttg.memdesc<1xi64, #remote_bar, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#remote_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 0]]}>
+#remote_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // A bulk copy into a peer CTA likewise completes on the peer's mbarrier.
+  // CHECK-LABEL: @remote_shmem_copy_barrier_init_sync
+  // CHECK: ttng.init_barrier
+  // CHECK-NEXT: ttng.fence_mbarrier_init_release_cluster
+  // CHECK-NEXT: ttng.cluster_arrive {relaxed = true, tlx.cluster_sync_bootstrap}
+  // CHECK-NEXT: ttng.cluster_wait {tlx.cluster_sync_bootstrap}
+  // CHECK: ttg.async_remote_shmem_copy
+  tt.func @remote_shmem_copy_barrier_init_sync() {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %src = ttg.local_alloc : () -> !ttg.memdesc<4x32xf32, #remote_shared, #smem, mutable>
+    %dst = ttg.local_alloc : () -> !ttg.memdesc<4x32xf32, #remote_shared, #smem, mutable>
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #remote_bar, #smem, mutable>
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #remote_bar, #smem, mutable>
+    ttg.async_remote_shmem_copy %src, rank %c1, %dst barrier %bar : !ttg.memdesc<4x32xf32, #remote_shared, #smem, mutable> -> !ttg.memdesc<4x32xf32, #remote_shared, #smem, mutable> barrier_ty !ttg.memdesc<1xi64, #remote_bar, #smem, mutable>
+    ttng.wait_barrier %bar, %c0 : !ttg.memdesc<1xi64, #remote_bar, #smem, mutable>
+    tt.return
+  }
+}

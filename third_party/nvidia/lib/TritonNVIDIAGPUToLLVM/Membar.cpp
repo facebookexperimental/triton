@@ -227,6 +227,19 @@ private:
       llvm::SetVector<Value> bars;
       bars.insert(mapaOp.getResult());
       return bars;
+    } else if (auto remoteStore =
+                   llvm::dyn_cast<triton::gpu::AsyncRemoteShmemStoreOp>(op)) {
+      // st.async / red.async into a peer CTA complete bytes on the peer's
+      // mbarrier, which the lowering maps from the local barrier operand.
+      llvm::SetVector<Value> bars;
+      bars.insert(remoteStore.getBarrier());
+      return bars;
+    } else if (auto remoteCopy =
+                   llvm::dyn_cast<triton::gpu::AsyncRemoteShmemCopyOp>(op)) {
+      // cp.async.bulk into a peer CTA likewise completes on its mbarrier.
+      llvm::SetVector<Value> bars;
+      bars.insert(remoteCopy.getBarrier());
+      return bars;
     } else if (auto tmaLoadOp =
                    llvm::dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
       // If it's a TMA load with multicast, the mbar signal is multicasted too
