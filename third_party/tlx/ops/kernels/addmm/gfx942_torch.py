@@ -19,10 +19,8 @@ def _compiled(mode):
 
 def addmm(bias, a, b, *, mode="allow"):
     """Run ``torch.addmm`` with the gfx942 TorchTLX template enabled."""
-    settings = {"triton.tlx_mode": mode, "max_autotune": True}
-    if mode == "force":
-        settings["max_autotune_gemm_backends"] = "TRITON"
-    with config.patch(settings):
+    # torchTLX is independent of max_autotune; force mode drops the ATen choice.
+    with config.patch({"triton.tlx_mode": mode, "max_autotune": False, "max_autotune_gemm": False}):
         return _compiled(mode)(bias, a, b)
 
 
