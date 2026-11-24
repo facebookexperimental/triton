@@ -850,3 +850,145 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return %y : f32
   }
 }
+
+// -----
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 8 : i32, "ttg.num-ctas" = 1 : i32} {
+// CHECK-LABEL: no_barrier_between_tdm_copies_with_mbarrier
+// TDM copies that carry an mbarrier operand send an LDS atomic arrive on
+// completion, so the mbarrier already orders them across the workgroup and a
+// ttg.barrier between them synchronizes nothing.
+tt.func @no_barrier_between_tdm_copies_with_mbarrier(
+    %in: !tt.tensordesc<128x128xf16, #shared>,
+    %out: !tt.tensordesc<128x128xf16, #shared>) {
+  %c0_i32 = arith.constant 0 : i32
+  %smem = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+  %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+  amdg.init_barrier %bar, 8 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: amdg.async_tdm_copy_global_to_local
+  %token = amdg.async_tdm_copy_global_to_local %in into %smem, barrier = %bar : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: amdg.wait_barrier
+  amdg.wait_barrier %bar, %c0_i32 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: amdg.async_tdm_copy_local_to_global
+  amdg.async_tdm_copy_local_to_global %out from %smem, barrier = %bar : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !tt.tensordesc<128x128xf16, #shared>
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: tt.return
+  tt.return
+}
+}
+
+// -----
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 8 : i32, "ttg.num-ctas" = 1 : i32} {
+// CHECK-LABEL: must_barrier_tdm_copy_without_mbarrier
+// The store carries no mbarrier operand, so it is not part of the mbarrier
+// synchronization and the RAW on the tile is not covered by wait_barrier for
+// accesses issued by other waves. The barrier must stay.
+tt.func @must_barrier_tdm_copy_without_mbarrier(
+    %in: !tt.tensordesc<128x128xf16, #shared>,
+    %out: !tt.tensordesc<128x128xf16, #shared>) {
+  %c0_i32 = arith.constant 0 : i32
+  %smem = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+  %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+  amdg.init_barrier %bar, 8 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+  %token = amdg.async_tdm_copy_global_to_local %in into %smem, barrier = %bar : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+  // CHECK: amdg.wait_barrier
+  amdg.wait_barrier %bar, %c0_i32 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: amdg.async_tdm_copy_local_to_global
+  amdg.async_tdm_copy_local_to_global %out from %smem : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<128x128xf16, #shared>
+  tt.return
+}
+}
+
+// -----
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 8 : i32, "ttg.num-ctas" = 1 : i32} {
+// CHECK-LABEL: no_barrier_tdm_mbarrier_in_loop
+// Collective shape: load a tile, wait, fan it out to several descriptors, wait
+// again at the back edge. Both the in-body RAW and the loop-carried WAR are
+// ordered by the mbarriers, so no barrier is needed in the loop body.
+tt.func @no_barrier_tdm_mbarrier_in_loop(
+    %in: !tt.tensordesc<128x128xf16, #shared>,
+    %o0: !tt.tensordesc<128x128xf16, #shared>,
+    %o1: !tt.tensordesc<128x128xf16, #shared>,
+    %ub: i32) {
+  %c0_i32 = arith.constant 0 : i32
+  %c1_i32 = arith.constant 1 : i32
+  %smem = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+  %barL = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+  %barS = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+  // A TDM copy arrives once per warp, so the expected count is num-warps times
+  // the number of copies on that barrier: one load on barL, two stores on barS.
+  amdg.init_barrier %barL, 8 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+  amdg.init_barrier %barS, 16 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+  // CHECK: cf.br
+  scf.for %i = %c0_i32 to %ub step %c1_i32 : i32 {
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: amdg.async_tdm_copy_global_to_local
+    %t = amdg.async_tdm_copy_global_to_local %in into %smem, barrier = %barL : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    amdg.wait_barrier %barL, %c0_i32 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: amdg.async_tdm_copy_local_to_global
+    amdg.async_tdm_copy_local_to_global %o0 from %smem, barrier = %barS : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !tt.tensordesc<128x128xf16, #shared>
+    amdg.async_tdm_copy_local_to_global %o1 from %smem, barrier = %barS : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !tt.tensordesc<128x128xf16, #shared>
+    amdg.wait_barrier %barS, %c0_i32 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    // CHECK-NOT: ttg.barrier local
+  }
+  // CHECK: tt.return
+  tt.return
+}
+}
+
+// -----
+
+// AMD membar keeps ttg.warp_predicate bodies opaque (see the TODO in
+// AMDMembarAnalysis), so LDS accesses inside them add no barrier on either
+// side; AMD kernels synchronize them themselves. NVIDIA membar walks in.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: warp_predicate_read_then_store
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.warp_predicate
+  // CHECK-NOT: ttg.barrier
+  // CHECK: ttg.local_store
+  tt.func @warp_predicate_read_then_store(%pred: i1, %v: tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked> {
+    %buf = ttg.local_alloc %v : (tensor<256xf32, #blocked>) -> !ttg.memdesc<256xf32, #shared, #smem, mutable>
+    ttg.barrier local
+    %r = ttg.warp_predicate %pred (%v) {
+      %x = ttg.local_load %buf : !ttg.memdesc<256xf32, #shared, #smem, mutable> -> tensor<256xf32, #blocked>
+      ttg.predicate_yield %x : tensor<256xf32, #blocked>
+    } {wave_uniform} : (i1, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    ttg.local_store %v, %buf : tensor<256xf32, #blocked> -> !ttg.memdesc<256xf32, #shared, #smem, mutable>
+    tt.return %r : tensor<256xf32, #blocked>
+  }
+
+  // CHECK-LABEL: warp_predicate_store_then_read
+  // CHECK: ttg.local_store
+  // CHECK-NEXT: ttg.warp_predicate
+  // CHECK-NOT: ttg.barrier
+  // CHECK: ttg.predicate_yield
+  tt.func @warp_predicate_store_then_read(%pred: i1, %v: tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked> {
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<256xf32, #shared, #smem, mutable>
+    ttg.local_store %v, %buf : tensor<256xf32, #blocked> -> !ttg.memdesc<256xf32, #shared, #smem, mutable>
+    %r = ttg.warp_predicate %pred (%v) {
+      %x = ttg.local_load %buf : !ttg.memdesc<256xf32, #shared, #smem, mutable> -> tensor<256xf32, #blocked>
+      ttg.predicate_yield %x : tensor<256xf32, #blocked>
+    } {wave_uniform} : (i1, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return %r : tensor<256xf32, #blocked>
+  }
+}

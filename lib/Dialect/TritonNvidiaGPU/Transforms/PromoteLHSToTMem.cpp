@@ -124,8 +124,7 @@ public:
     auto cgaLayout = triton::gpu::getCGALayout(srcLayout);
     // TMem encoding for A operand is the same as for D (Acc), with colStride 1,
     // i.e. densely packed in TMEM.
-    unsigned elemBitWidth =
-        lhs.getType().getElementType().getIntOrFloatBitWidth();
+    unsigned elemBitWidth = lhs.getType().getElementTypeBitWidth();
     if (!llvm::is_contained({8, 16, 32}, elemBitWidth)) {
       return failure();
     }
@@ -165,8 +164,7 @@ public:
     // The accumulator and the promoted A are both live at the MMA, so they
     // must fit in TMEM together (576 columns on sm_107, as the launch check).
     auto target = tcGen5MMAOp->template getParentOfType<ModuleOp>()
-                      ->template getAttrOfType<StringAttr>(
-                          ttg::AttrTargetName);
+                      ->template getAttrOfType<StringAttr>(ttg::AttrTargetName);
     unsigned maxTmemCols =
         target && target.getValue() == "cuda:107" ? 576 : 512;
     unsigned accCols = getTmemAllocSizes(tcGen5MMAOp.getD().getType()).numCols;
