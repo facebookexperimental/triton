@@ -3083,13 +3083,16 @@ def attention_bwd(
     desc_m = TensorDescriptor(M, shape=[y_dim], strides=[1], block_shape=[1])
     desc_delta = TensorDescriptor(delta, shape=[y_dim], strides=[1], block_shape=[1])
 
-    desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_5d)
-    desc_q_dk_scale = TensorDescriptor.from_tensor(q_dk_scale, block_shape=dummy_5d)
-    desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_5d)
-    desc_k_dq_scale = TensorDescriptor.from_tensor(k_dq_scale, block_shape=dummy_5d)
-    desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_5d)
-    desc_do_scale = TensorDescriptor.from_tensor(do_scale, block_shape=dummy_5d)
-    desc_do_dv_scale = TensorDescriptor.from_tensor(do_dv_scale, block_shape=dummy_5d)
+    # E8M0 scale bits must travel as u8 bytes: the packed-scale tmem_copy path
+    # only recognizes i8/u8 tiles. Do not simplify back to fp8 descriptors
+    # until that packing path supports fp8.
+    desc_q_scale = TensorDescriptor.from_tensor(q_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_q_dk_scale = TensorDescriptor.from_tensor(q_dk_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_k_scale = TensorDescriptor.from_tensor(k_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_k_dq_scale = TensorDescriptor.from_tensor(k_dq_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_v_scale = TensorDescriptor.from_tensor(v_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_do_scale = TensorDescriptor.from_tensor(do_scale.view(torch.uint8), block_shape=dummy_5d)
+    desc_do_dv_scale = TensorDescriptor.from_tensor(do_dv_scale.view(torch.uint8), block_shape=dummy_5d)
 
     def alloc_fn(size: int, _align: int, _):
         return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -3192,9 +3195,12 @@ class _attention(torch.autograd.Function):
         assert (k_scale is not None and v_scale is not None
                 and q_scale is not None), "All scales must be provided for MXFP8"
         dummy_block_shape = [1, 1, 1, 1, 1]
-        desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_block_shape)
-        desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_block_shape)
-        desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_block_shape)
+        # E8M0 scale bits must travel as u8 bytes: the packed-scale tmem_copy path
+        # only recognizes i8/u8 tiles. Do not simplify back to fp8 descriptors
+        # until that packing path supports fp8.
+        desc_q_scale = TensorDescriptor.from_tensor(q_scale.view(torch.uint8), block_shape=dummy_block_shape)
+        desc_k_scale = TensorDescriptor.from_tensor(k_scale.view(torch.uint8), block_shape=dummy_block_shape)
+        desc_v_scale = TensorDescriptor.from_tensor(v_scale.view(torch.uint8), block_shape=dummy_block_shape)
 
         def alloc_fn(size: int, _align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -3402,9 +3408,12 @@ def attention(q, k, v, q_scale, k_scale, v_scale, sm_scale, causal, config=None)
     desc_m = TensorDescriptor(m_tensor, shape=[y_dim], strides=[1], block_shape=[1])
 
     dummy_block_shape = [1, 1, 1, 1, 1]
-    desc_q_scale = TensorDescriptor.from_tensor(q_scale, block_shape=dummy_block_shape)
-    desc_k_scale = TensorDescriptor.from_tensor(k_scale, block_shape=dummy_block_shape)
-    desc_v_scale = TensorDescriptor.from_tensor(v_scale, block_shape=dummy_block_shape)
+    # E8M0 scale bits must travel as u8 bytes: the packed-scale tmem_copy path
+    # only recognizes i8/u8 tiles. Do not simplify back to fp8 descriptors
+    # until that packing path supports fp8.
+    desc_q_scale = TensorDescriptor.from_tensor(q_scale.view(torch.uint8), block_shape=dummy_block_shape)
+    desc_k_scale = TensorDescriptor.from_tensor(k_scale.view(torch.uint8), block_shape=dummy_block_shape)
+    desc_v_scale = TensorDescriptor.from_tensor(v_scale.view(torch.uint8), block_shape=dummy_block_shape)
 
     # Apply pre_hook to set block shapes
     nargs = {

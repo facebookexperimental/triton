@@ -4,6 +4,8 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Matchers.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -146,6 +148,32 @@ bool requiresCrossCTAMBarrierInitSync(
                    : WalkResult::advance();
       })
       .wasInterrupted();
+}
+
+bool arrivesFromEveryThread(Operation *op) {
+  auto arrive = dyn_cast<ArriveBarrierOp>(op);
+  return arrive && arrive.getPerThread() &&
+         (!arrive.getPred() || matchPattern(arrive.getPred(), m_One()));
+}
+
+bool countsEveryThread(Operation *op) {
+  Value numThreads;
+  if (auto arrive = dyn_cast<NamedBarrierArriveOp>(op))
+    numThreads = arrive.getNumThreads();
+  else if (auto wait = dyn_cast<NamedBarrierWaitOp>(op))
+    numThreads = wait.getNumThreads();
+  else
+    return false;
+  APInt count;
+  if (!matchPattern(numThreads, m_ConstantInt(&count)))
+    return false;
+  std::optional<int> numWarps = ttg::maybeLookupNumWarps(op);
+  auto mod = op->getParentOfType<ModuleOp>();
+  if (!numWarps || !mod)
+    return false;
+  int64_t regionThreads =
+      int64_t(*numWarps) * ttg::TritonGPUDialect::getThreadsPerWarp(mod);
+  return count.getSExtValue() >= regionThreads;
 }
 
 } // namespace mlir::triton::nvidia_gpu
