@@ -3,6 +3,15 @@
 from __future__ import annotations
 
 
+def _site(access: dict) -> str:
+    """The access's function and location, the function once when the location
+    is its SASS site ``function+offset``."""
+    location = access["location"]
+    if location.startswith(f"{access['function']}+"):
+        return location
+    return f"{access['function']} {location}"
+
+
 def render(results: list[dict], kernel: str | None, cmd: list[str]) -> str:
     lines = [
         "## CUTracer compute-sanitizer",
@@ -27,6 +36,6 @@ def render(results: list[dict], kernel: str | None, cmd: list[str]) -> str:
         lines += ["```"]
         for finding in result.get("findings", []):
             marker = "in kernel" if finding["in_kernel"] else "other kernel"
-            sites = "; ".join(f"{a['role']} {a['type']} {a['function']} {a['location']}" for a in finding["accesses"])
+            sites = "; ".join(f"{a['role']} {a['type']} {_site(a)}" for a in finding["accesses"])
             lines.append(f"- {finding['severity']} ({marker}): {sites}")
     return "\n".join(lines) + "\n"

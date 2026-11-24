@@ -13,7 +13,7 @@ datatypes. Tags follow [tlx.md](tlx.html).
 | `mm_bias_grad` | ws_wgrad_bias | `mm_bias_grad/sm100.py:mm_bias_grad` | — | tma, tmem | no | Horizontally fused GEMM weight-gradient + bias-grad rowsum sharing `dout` tiles; TMEM-drain epilogue; fused split-K+bias reduce. |
 | `addmm` | tma_ws | `addmm/sm100.py:addmm` | float16 | — | no | Persistent WS GEMM+bias with TMA stores, `tcgen05` commit tracking, CLC-coordinated producers; direct-load baseline included. |
 | `grouped_gemm` | ws | `grouped_gemm/sm100.py:grouped_gemm` | — | tma, tmem | no | One persistent WS kernel over all groups with per-group TMA descriptors built on-device. |
-| `mm_mxfp8` | ws_mxfp8 | `mm_mxfp8/sm100.py:mm_mxfp8` | — | tma, tmem | no | MXFP8 GEMM: B-resident overlap, scaled `tcgen05` MMA, TMEM scales via `tmem_copy`, LDS aliasing across phases. |
+| `mm_mxfp` | ws_mxfp8 | `mm_mxfp/sm100.py:mm_mxfp` | — | tma, tmem | no | MXFP8 GEMM: B-resident overlap, scaled `tcgen05` MMA, TMEM scales via `tmem_copy`, LDS aliasing across phases. |
 | `grouped_gemm_mxfp8` | ws_persistent_mxfp8 | `grouped_gemm_mxfp8/sm100.py:grouped_gemm_mxfp8` | — | tma, tmem | no | Persistent grouped MXFP8 pipeline with explicit fetch/wait/signal tile protocol; scaled MMA throughout. |
 | `mm_torchtlx` | inductor_blackwell_gemm_ws | `inductor/sm100_torch:mm` | float16 | tma, tmem | no | Inductor template entry for the Blackwell WS GEMM. |
 | `flash_attn` | ws_pipelined_persistent | `flash_attn/sm100.py:flash_attn` | float16 | tma, tmem | yes | FA4-style attention: TMEM accumulators, 1CTA/2CTA MMA paths, TMA multicast, CLC, ballot-built causal masks. |

@@ -1,4 +1,5 @@
 """isort:skip_file"""
+
 __version__ = '3.9.0+fb'
 
 # ---------------------------------------
@@ -26,6 +27,14 @@ from .runtime._allocation import set_allocator
 from . import language
 from . import testing
 from . import tools
+from .runtime.stochastic_rounding import (
+    SRStoreSpec,
+    StochasticRoundingSpec,
+    StochasticRoundingState,
+    set_stochastic_rounding_provider,
+    stochastic_rounding,
+    triton_stochastic_rounding,
+)
 from . import knobs as _knobs
 
 if _knobs.compilation.compile_trace:
@@ -58,6 +67,12 @@ __all__ = [
     "reinterpret",
     "runtime",
     "set_allocator",
+    "SRStoreSpec",
+    "StochasticRoundingSpec",
+    "StochasticRoundingState",
+    "set_stochastic_rounding_provider",
+    "stochastic_rounding",
+    "triton_stochastic_rounding",
     "TensorWrapper",
     "TritonError",
     "testing",
