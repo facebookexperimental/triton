@@ -62,6 +62,9 @@ constexpr static char AttrClusterDimZ[] = "ttg.cluster-dim-z";
 // diverge behavior in the warp specialization lowering to LLVM.
 constexpr static char AttrSingleWarpSpecializeName[] =
     "ttg.single-warp-specialize";
+// Set on a `ttg.warp_specialize` op whose following code touches memory, so the
+// single-WS lowering has to join the partitions before that code runs.
+constexpr static char AttrWarpSpecializeJoinName[] = "ttg.warp_specialize.join";
 
 // Find the contextual number of warps on which this operation is executed.
 int lookupNumWarps(Operation *op);

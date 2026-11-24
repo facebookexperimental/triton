@@ -1640,3 +1640,68 @@ llvm.func @single_ws_no_end_realloc() attributes {allocation.offset = 0 : i32} {
 }
 
 }
+
+// -----
+
+// Code after a single-WS warp_specialize op marked for a join reads what the
+// partitions wrote, so every region ends with a barrier that joins the warps
+// before it runs.
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 8 : i32, "ttg.single-warp-specialize" = true} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @single_ws_join_before_post_ws_code
+llvm.func @single_ws_join_before_post_ws_code() attributes {allocation.offset = 0 : i32} {
+  // CHECK: "partition0"
+  // CHECK-NEXT: nvvm.barrier id = {{.*}} aligned = false
+  // CHECK-NEXT: llvm.br
+  // CHECK: "default"
+  // CHECK-NEXT: nvvm.barrier id = {{.*}} aligned = false
+  // CHECK-NEXT: llvm.br
+  // CHECK: "post_ws"
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>, ttg.warp_specialize.join}
+  default {
+    "default"() : () -> ()
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    "partition0"() : () -> ()
+    ttg.warp_return
+  } : () -> ()
+  "post_ws"() : () -> ()
+  llvm.return
+}
+
+}
+
+// -----
+
+// Without a join mark, kernel-exit code the NVGPU lowering puts after the
+// warp_specialize op (the TMEM dealloc tail) does not add a join barrier.
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 8 : i32, "ttg.single-warp-specialize" = true} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @single_ws_no_join_before_tmem_dealloc_tail
+llvm.func @single_ws_no_join_before_tmem_dealloc_tail() attributes {allocation.offset = 0 : i32} {
+  // CHECK: "partition0"
+  // CHECK-NEXT: llvm.br
+  // CHECK: "default"
+  // CHECK-NEXT: llvm.br
+  // CHECK: "bar.sync 0;"
+  // CHECK: "tcgen05.dealloc"
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>}
+  default {
+    "default"() : () -> ()
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    "partition0"() : () -> ()
+    ttg.warp_return
+  } : () -> ()
+  llvm.inline_asm has_side_effects asm_dialect = att "bar.sync 0;", ""  : () -> !llvm.void
+  "tcgen05.dealloc"() : () -> ()
+  llvm.return
+}
+
+}

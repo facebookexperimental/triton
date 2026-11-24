@@ -380,6 +380,14 @@ static void disableLICM(LLVM::BrOp latchBr) {
 // lowerWarpSpecializeCommon
 //===----------------------------------------------------------------------===//
 
+// Single-WS partitions exit without rejoining the default warps, so code after
+// the warp_specialize op needs a barrier to see the partitions' writes.
+// AllocateWarpGroups decides this on TTGIR, before kernel-exit code such as the
+// TMEM dealloc is added after the op.
+static bool needsSingleWarpSpecializeJoin(WarpSpecializeOp ws) {
+  return ws->hasAttr(AttrWarpSpecializeJoinName);
+}
+
 static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
                                     const TargetInfoBase &targetInfo,
                                     const WarpSpecializeCallbacks &callbacks,
@@ -421,6 +429,7 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
     callbacks.createAllBarrier(b, switchLoopBarrierIdx);
 
     bool hasClusterSyncKernelCleanup = tlx::hasClusterSyncKernelCleanup(ws);
+    bool needsJoin = needsSingleWarpSpecializeJoin(ws);
 
     // Rewrite all warp returns.
     partition->walk([&](WarpReturnOp op) {
@@ -441,6 +450,8 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
                                       UnitAttr::get(b.getContext()));
       }
       if (hasSingleWarpSpecialize(mod)) {
+        if (needsJoin)
+          callbacks.createAllBarrier(b, switchLoopBarrierIdx);
         // directly jump to exit/ret instead of going back to switchLoop
         b.replaceOpWithNewOp<LLVM::BrOp>(op, exitBlock);
       } else {
@@ -603,6 +614,7 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
   for (size_t i = 0; i < wsOps.size(); ++i) {
     WarpSpecializeOp ws = wsOps[i];
     auto &stateMap = warpToState[i];
+    bool needsJoin = needsSingleWarpSpecializeJoin(ws);
     Block *before = ws->getBlock();
     Block *after = before->splitBlock(ws->getIterator());
     TritonLLVMIRRewriter b(ws.getLoc(), OpBuilder::atBlockEnd(before));
@@ -649,6 +661,8 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
         callbacks.createAllBarrier(b, switchLoopBarrierIdx);
         callbacks.reallocRegisters(
             b, ws, RegisterReallocPhase::DefaultPartitionEnd, 0);
+      } else if (needsJoin) {
+        callbacks.createAllBarrier(b, switchLoopBarrierIdx);
       }
       b.replaceOpWithNewOp<LLVM::BrOp>(op, op.getOperands(), after);
     });

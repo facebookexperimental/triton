@@ -1862,6 +1862,28 @@ bool atomicResultHasCTABroadcast(Operation *op) {
   return gpu::toLinearLayout(tensorTy).getFreeVariableMasks().lookup(kBlock);
 }
 
+static bool mayHaveMemoryEffect(Operation *op, bool writesOnly) {
+  return op
+      ->walk([&](Operation *nested) {
+        if (nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
+          return WalkResult::advance();
+        auto iface = dyn_cast<MemoryEffectOpInterface>(nested);
+        if (!iface || iface.hasEffect<MemoryEffects::Write>() ||
+            (!writesOnly && iface.hasEffect<MemoryEffects::Read>()))
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+bool mayReadOrWriteMemory(Operation *op) {
+  return mayHaveMemoryEffect(op, /*writesOnly=*/false);
+}
+
+bool mayWriteMemory(Operation *op) {
+  return mayHaveMemoryEffect(op, /*writesOnly=*/true);
+}
+
 } // namespace triton
 
 namespace triton::nvidia_gpu {
