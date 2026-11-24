@@ -3524,6 +3524,8 @@ selectCrossPartitionProducerTask(ArrayRef<AsyncTaskId> producerTaskIds,
       return failure();
     producerTaskId = id;
   }
+  // Still -1 here means every producer is also a consumer, so no
+  // cross-partition channel is needed.
   return producerTaskId;
 }
 

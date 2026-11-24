@@ -182,7 +182,7 @@ The frontend lowers these APIs to `ttng.packed_arith`; the SM107 backend then em
     Prefer these semantic reductions when code only needs an all/any result.
     They do not expose a hardware ballot bit mask.
 
-- `tlx.warp_predicate(predicate, inits, body, args=(), wave_uniform=False)` **[AMD]**
+- `tlx.warp_predicate(predicate, inits, body, args=(), wave_uniform=False)` **[sm100, AMD]**
 
     Executes `body(*inits, *args)` with the hardware execution mask restricted
     to lanes where `predicate` is true. Active lanes receive the values returned
@@ -213,8 +213,26 @@ The frontend lowers these APIs to `ttng.packed_arith`; the SM107 backend then em
     no cross-wave synchronization. Reductions, dots, and layout shuffles are
     allowed only with `wave_uniform=True`, which asserts that every lane in a
     wave observes the same predicate. Cross-warp reductions, nested dynamic
-    control flow, and other nested regions are unsupported. This operation is
-    currently lowered only by the AMD backend.
+    control flow, and other nested regions are unsupported.
+
+    On NVIDIA, the predicate must be a scalar with `wave_uniform=True`, such
+    as the result of `tlx.warp_any`, and `inits` must be empty, so each warp
+    runs or skips the whole body for its effects on tensor memory. The body
+    may contain register math and tensor memory loads and stores; anything
+    else, including mbarrier arrives and waits, is rejected. So is a body
+    that would need a CTA barrier, for example because two warps access the
+    same tensor memory words. A per-warp rescale of a tensor memory
+    accumulator looks like this:
+
+    ```python
+    @triton.jit
+    def rescale(acc, alpha):
+        tlx.local_store(acc, tlx.local_load(acc) * alpha[:, None])
+
+    # Each warp rescales its rows if any of them needs it.
+    tlx.warp_predicate(tlx.warp_any(alpha < 1.0), (), rescale,
+                       args=(acc, alpha), wave_uniform=True)
+    ```
 
 - `tlx.prefetch(pointer, level="L2", mask=None, tensormap=False)` **[sm90+]** issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements `tlx.async_descriptor_prefetch_tensor` (which works on TMA tensor descriptors) by supporting raw pointer tensors.
   Additionally, if `tensormap` is specified to `True`, the API instead does a prefetch of tensor map object (TMA descriptor) and ignores other parameters other than `pointer`.

@@ -1,11 +1,11 @@
 """Blackwell (sm100) MXFP6 GEMM -- the ``tlx.ops.mm_mxfp6`` implementation.
 
 TODO(T296778064): parameterize one kernel on constexpr formats and a
-packed-bytes ratio instead of mirroring ``mm_mxfp8``, so MXFP8 fixes
+packed-bytes ratio instead of mirroring ``mm_mxfp``, so MXFP8 fixes
 (including the 2-CTA cluster-size divisibility issue) do not need to
 be applied twice.
 
-Mirrored from ``kernels/mm_mxfp8/sm100.py``: same warp-specialized structure
+Mirrored from ``kernels/mm_mxfp/sm100.py``: same warp-specialized structure
 (TMA producer, scaled-MMA consumer accumulating in TMEM, BF16 epilogue over a
 static persistent tile schedule) and the same config families
 (``COLLAB_2CTA``, split-K with FP32 partials, ``OVERLAP_ACC``, ``B_RESIDENT`` +

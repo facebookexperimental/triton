@@ -76,30 +76,21 @@ def mfma_config(T: int, E: int, K: int):
 
 
 @triton.jit
-def _gemv_kernel(X, W, OUT, stride_x, N: tl.constexpr, K: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                 ROW64: tl.constexpr):
-    pid_n = tl.program_id(0)
-    row = tl.program_id(1).to(tl.int64) if ROW64 else tl.program_id(1)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+def gemv_tile(X, W, row, offs_n, stride_x, K: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    """The logits of the experts ``offs_n`` for one row: whole fp32 weight rows reduced with fp32 FMAs."""
     acc = tl.zeros([BLOCK_N], dtype=tl.float32)
     for k0 in tl.static_range(0, K, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         w = tl.load(W + offs_n[:, None] * K + offs_k[None, :])
         x = tl.load(X + row * stride_x + offs_k).to(tl.float32)
         acc += tl.sum(w * x[None, :], axis=1)
-    tl.store(OUT + row * N + offs_n, acc)
+    return acc
 
 
 @triton.jit
-def _mfma_kernel(X, W, P, M, stride_x, N: tl.constexpr, K: tl.constexpr, K_PER_SPLIT: tl.constexpr,
-                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ROW64: tl.constexpr):
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
-    pid_m = tl.program_id(2)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    m_mask = offs_m < M
-    rows = offs_m.to(tl.int64) if ROW64 else offs_m
+def mfma_tile(X, W, rows, m_mask, offs_n, pid_k, stride_x, K: tl.constexpr, K_PER_SPLIT: tl.constexpr,
+              BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    """Split ``pid_k``'s partial logits of a row tile: three exact bf16 products per weight element on the MFMA."""
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
     for kk in range(0, K_PER_SPLIT, BLOCK_K):
         offs_k = pid_k * K_PER_SPLIT + kk + tl.arange(0, BLOCK_K)
@@ -112,6 +103,29 @@ def _mfma_kernel(X, W, P, M, stride_x, N: tl.constexpr, K: tl.constexpr, K_PER_S
         acc = tl.dot(a, hi, acc)
         acc = tl.dot(a, mid, acc)
         acc = tl.dot(a, lo, acc)
+    return acc
+
+
+@triton.jit
+def _gemv_kernel(X, W, OUT, stride_x, N: tl.constexpr, K: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                 ROW64: tl.constexpr):
+    pid_n = tl.program_id(0)
+    row = tl.program_id(1).to(tl.int64) if ROW64 else tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    tl.store(OUT + row * N + offs_n, gemv_tile(X, W, row, offs_n, stride_x, K, BLOCK_N, BLOCK_K))
+
+
+@triton.jit
+def _mfma_kernel(X, W, P, M, stride_x, N: tl.constexpr, K: tl.constexpr, K_PER_SPLIT: tl.constexpr,
+                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ROW64: tl.constexpr):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    pid_m = tl.program_id(2)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+    rows = offs_m.to(tl.int64) if ROW64 else offs_m
+    acc = mfma_tile(X, W, rows, m_mask, offs_n, pid_k, stride_x, K, K_PER_SPLIT, BLOCK_M, BLOCK_N, BLOCK_K)
     out_rows = (pid_k * M + rows).to(tl.int64) if ROW64 else pid_k * M + rows
     tl.store(P + out_rows[:, None] * N + offs_n[None, :], acc, mask=m_mask[:, None])
 
@@ -128,6 +142,27 @@ def _reduce_splits_kernel(P, OUT, MN, SPLITS: tl.constexpr, BLOCK: tl.constexpr,
     tl.store(OUT + offs, acc, mask=mask)
 
 
+def router_gemm_partials(x, weight, out=None):
+    """The MFMA kernel's output for ``T > GEMV_MAX_TOKENS``: ``(out, 1)`` when the bucket does not split K, else
+    ``(partials, splits)`` with ``partials`` fp32 ``(splits, T, E)``, to be added in split order."""
+    T, K = x.shape
+    E = weight.shape[0]
+    block_m, block_n, block_k, splits, num_warps, num_stages = mfma_config(T, E, K)
+    grid = (E // block_n, splits, triton.cdiv(T, block_m))
+    row64 = (T - 1) * x.stride(0) + K >= INT32_OFFSETS
+    if splits == 1:
+        if out is None:
+            out = torch.empty(T, E, device=x.device, dtype=torch.float32)
+        _mfma_kernel[grid](x, weight, out, T, x.stride(0), E, K, K, block_m, block_n, block_k, row64,
+                           num_warps=num_warps, num_stages=num_stages)
+        return out, 1
+    partials = torch.empty(splits, T, E, device=x.device, dtype=torch.float32)
+    row64 = row64 or splits * T * E >= INT32_OFFSETS
+    _mfma_kernel[grid](x, weight, partials, T, x.stride(0), E, K, K // splits, block_m, block_n, block_k, row64,
+                       num_warps=num_warps, num_stages=num_stages)
+    return partials, splits
+
+
 def router_gemm(x, weight, out):
     T, K = x.shape
     E = weight.shape[0]
@@ -140,16 +175,10 @@ def router_gemm(x, weight, out):
         block_n, block_k, num_warps = gemv_config(T, E, K)
         _gemv_kernel[(E // block_n, T)](x, weight, out, x.stride(0), E, K, block_n, block_k, row64, num_warps=num_warps)
         return out
-    block_m, block_n, block_k, splits, num_warps, num_stages = mfma_config(T, E, K)
-    grid = (E // block_n, splits, triton.cdiv(T, block_m))
+    partials, splits = router_gemm_partials(x, weight, out)
     if splits == 1:
-        _mfma_kernel[grid](x, weight, out, T, x.stride(0), E, K, K, block_m, block_n, block_k, row64,
-                           num_warps=num_warps, num_stages=num_stages)
         return out
-    partials = torch.empty(splits, T, E, device=x.device, dtype=torch.float32)
     row64 = row64 or splits * T * E >= INT32_OFFSETS
-    _mfma_kernel[grid](x, weight, partials, T, x.stride(0), E, K, K // splits, block_m, block_n, block_k, row64,
-                       num_warps=num_warps, num_stages=num_stages)
     block = 1024
     _reduce_splits_kernel[(triton.cdiv(T * E, block), )](partials, out, T * E, splits, block, row64, num_warps=4)
     return out
