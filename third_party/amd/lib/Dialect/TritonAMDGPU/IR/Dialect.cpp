@@ -386,6 +386,26 @@ LogicalResult verifyRegisterConsecutiveGroups(Operation *op,
   return success();
 }
 
+// Layout inference must not produce an output layout that splits a
+// v_cvt_scale*_pk8 group: the first `groupSize` registers must step one element
+// at a time along the scaled axis.
+bool keepsPk8GroupsAlongAxis(ArrayRef<int64_t> shape, Attribute enc, int axis,
+                             int64_t groupSize) {
+  auto layoutEnc = dyn_cast_or_null<gpu::LayoutEncodingTrait>(enc);
+  if (!layoutEnc)
+    return false;
+  LinearLayout layout = gpu::toLinearLayout(shape, layoutEnc);
+  auto kRegister = StringAttr::get(enc.getContext(), "register");
+  int32_t numBases = llvm::Log2_64(groupSize);
+  if (layout.getInDimSizeLog2(kRegister) < numBases)
+    return false;
+  for (int32_t i = 0; i < numBases; ++i)
+    for (auto [dim, v] : llvm::enumerate(layout.getBasis(kRegister, i)))
+      if (v != (static_cast<int>(dim) == axis ? (1 << i) : 0))
+        return false;
+  return true;
+}
+
 std::optional<TargetFeatures> getScaledUpcastTarget(Operation *op) {
   auto module = op->getParentOfType<ModuleOp>();
   if (!module)
@@ -1030,11 +1050,18 @@ Attribute ScaledUpcastFp4Op::inferDstEncoding(unsigned opIdx,
       iface->inferFp4ToFpOpEncoding(shape, getAxis(), srcEnc, dstEnc,
                                     /*fwdInference*/ true, std::nullopt);
   assert(succeeded(result));
+  if (getScaledUpcastTarget(*this) &&
+      !keepsPk8GroupsAlongAxis(shape, dstEnc, getAxis(), /*groupSize=*/8))
+    return {};
   return dstEnc;
 }
 
 Attribute ScaledUpcastFp4Op::inferSrcEncoding(unsigned opIdx,
                                               Attribute dstEnc) {
+  if (getScaledUpcastTarget(*this) &&
+      !keepsPk8GroupsAlongAxis(getOutput().getType().getShape(), dstEnc,
+                               getAxis(), /*groupSize=*/8))
+    return {};
   // The layout of scale is either identical to the output or a quotient along
   // the scaled axis (compact scales).
   if (opIdx == 1) {
@@ -1091,7 +1118,9 @@ Attribute ScaledDowncastFp4Op::inferDstEncoding(unsigned opIdx,
           .getRegisteredInterface<triton::DialectInferLayoutInterface>();
   if (succeeded(iface->inferFp4ToFpOpEncoding(shape, getAxis(), srcEnc, dstEnc,
                                               /*fwdInference=*/false,
-                                              std::nullopt))) {
+                                              std::nullopt)) &&
+      keepsPk8GroupsAlongAxis(getOutput().getType().getShape(), dstEnc,
+                              getAxis(), /*groupSize=*/4)) {
     return dstEnc;
   }
   return {};
@@ -1099,6 +1128,9 @@ Attribute ScaledDowncastFp4Op::inferDstEncoding(unsigned opIdx,
 
 Attribute ScaledDowncastFp4Op::inferSrcEncoding(unsigned opIdx,
                                                 Attribute dstEnc) {
+  if (!keepsPk8GroupsAlongAxis(getOutput().getType().getShape(), dstEnc,
+                               getAxis(), /*groupSize=*/4))
+    return {};
   // The scale layout is a quotient of the output along the scaled axis
   if (opIdx == 1) {
     if (auto scaleEnc = inferScaledDowncastScaleEncoding(*this, dstEnc)) {

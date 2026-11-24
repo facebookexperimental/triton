@@ -3025,3 +3025,86 @@ def test_attention_backward_occ1_tail_correctness(shape, packed_dq, monkeypatch)
             repeat = tuple(x.clone() for x in actual[1:])
         if packed_dq:
             assert all(torch.equal(x, e) for x, e in zip(actual[1:], repeat))
+
+
+_E2M1_VALUES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+
+
+def _e2m1_dequant(packed, scale, sf):
+    lut = torch.tensor(_E2M1_VALUES, device=packed.device)
+    v = torch.stack([lut[(packed & 0xF).long()], lut[(packed >> 4).long()]], -1).flatten(-2)
+    return v * torch.exp2(scale.float() - 127).repeat_interleave(sf, -1)
+
+
+@triton.jit
+def _scaled_upcast_fp4_kernel(X, S, Y, M: tl.constexpr, K: tl.constexpr, SF: tl.constexpr, F16: tl.constexpr):
+    rows = tl.arange(0, M)[:, None]
+    x = tl.load(X + rows * (K // 2) + tl.arange(0, K // 2)[None, :])
+    s = tl.load(S + rows * (K // SF) + tl.arange(0, K // SF)[None, :])
+    y = tlx.amd_scaled_upcast_fp4(x, s, tl.float16 if F16 else tl.bfloat16, axis=1)
+    tl.store(Y + rows * K + tl.arange(0, K)[None, :], y)
+
+
+@triton.jit
+def _scaled_downcast_fp4_kernel(X, S, Y, M: tl.constexpr, K: tl.constexpr, SF: tl.constexpr):
+    rows = tl.arange(0, M)[:, None]
+    v = tl.load(X + rows * K + tl.arange(0, K)[None, :])
+    s = tl.load(S + rows * (K // SF) + tl.arange(0, K // SF)[None, :])
+    tl.store(Y + rows * (K // 2) + tl.arange(0, K // 2)[None, :], tlx.amd_scaled_downcast_fp4(v, s, axis=1))
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("sf", [32, 8])
+@pytest.mark.parametrize("K", [64, 256])
+def test_amd_scaled_upcast_fp4(K, sf, dtype):
+    M = 32
+    gen = torch.Generator(device="cuda").manual_seed(K + sf)
+    x = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device="cuda", generator=gen)
+    s = torch.randint(120, 135, (M, K // sf), dtype=torch.uint8, device="cuda", generator=gen)
+    y = torch.empty((M, K), dtype=dtype, device="cuda")
+    pgm = _scaled_upcast_fp4_kernel[(1, )](x, s, y, M, K, sf, dtype == torch.float16, num_warps=4)
+    assert f"v_cvt_scale_pk8_{'f16' if dtype == torch.float16 else 'bf16'}_fp4" in pgm.asm["amdgcn"]
+    assert torch.equal(y, _e2m1_dequant(x, s, sf).to(dtype))
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("K", [64, 256])
+def test_amd_scaled_downcast_fp4_round_trip(K, dtype):
+    """Values that are exactly E2M1 times their scale pack back to the same bytes."""
+    M, sf = 32, 32
+    gen = torch.Generator(device="cuda").manual_seed(K)
+    packed = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device="cuda", generator=gen)
+    # E2M1 -0 (nibble 8) dequantizes to -0.0; keep the canonical +0 so the round trip is unique.
+    lo, hi = packed & 0xF, packed >> 4
+    packed = torch.where(lo == 8, 0, lo) | (torch.where(hi == 8, 0, hi) << 4)
+    s = torch.randint(120, 135, (M, K // sf), dtype=torch.uint8, device="cuda", generator=gen)
+    x = _e2m1_dequant(packed, s, sf).to(dtype)
+    y = torch.empty((M, K // 2), dtype=torch.uint8, device="cuda")
+    _scaled_downcast_fp4_kernel[(1, )](x, s, y, M, K, sf, num_warps=4)
+    assert torch.equal(y, packed)
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
+def test_amd_scaled_downcast_fp4_rounding():
+    """Arbitrary values round to nearest even and saturate at 6 after dividing by the scale (MXFP4 quantization)."""
+    M, K, sf = 32, 256, 32
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.randn((M, K), device="cuda", generator=gen) * 3
+    x[0, :8] = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 7.0])
+    s = torch.full((M, K // sf), 127, dtype=torch.uint8, device="cuda")
+    s[1:] = torch.randint(124, 131, (M - 1, K // sf), dtype=torch.uint8, device="cuda", generator=gen)
+    y = torch.empty((M, K // 2), dtype=torch.uint8, device="cuda")
+    _scaled_downcast_fp4_kernel[(1, )](x, s, y, M, K, sf, num_warps=4)
+    q = (x / torch.exp2(s.float() - 127).repeat_interleave(sf, -1)).abs()
+    code = torch.zeros_like(q, dtype=torch.long)
+    for t, ties_up in [(0.25, False), (0.75, True), (1.25, False), (1.75, True), (2.5, False), (3.5, True),
+                       (5.0, False)]:
+        code += (q >= t if ties_up else q > t).long()
+    code |= (x < 0).long() << 3
+    ref = (code[:, 0::2] | (code[:, 1::2] << 4)).to(torch.uint8)
+    # A negative value that rounds to zero may encode as -0 (nibble 8); compare magnitudes there.
+    got_lo, got_hi, ref_lo, ref_hi = y & 0xF, y >> 4, ref & 0xF, ref >> 4
+    canon = lambda n: torch.where(n == 8, 0, n)  # noqa: E731
+    assert torch.equal(canon(got_lo), canon(ref_lo)) and torch.equal(canon(got_hi), canon(ref_hi))

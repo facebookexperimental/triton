@@ -24,6 +24,8 @@
 #
 # Remove / trim this file after the Gluon frontend re-sync and re-enable the suites.
 
+from pathlib import Path
+
 import pytest
 
 # Whole files that require the newer Gluon frontend (pointer load/store distributed
@@ -34,7 +36,9 @@ _VERSION_SKEW_FILES = {
     "test_lowerings.py",
     "test_consan.py",
 }
-collect_ignore = sorted(_VERSION_SKEW_FILES)
+# FP6 cases use buffer_load/store with explicit distributed layouts.
+_COMPATIBLE_CORE_TESTS = {"test_amd_mfma_scaled_fp6", "test_amd_mfma_scaled_fp6_packed", "test_fp6_tma_store_contiguous", "test_fp6_tma_mma_operand"}
+collect_ignore = sorted(_VERSION_SKEW_FILES - {"test_core.py"})
 
 # Individual frontend/layout cases that don't pass on the pinned build:
 #  - nv_tma_descriptor_{load,store} and amd mfma/wmma_scaled emit IR that
@@ -63,11 +67,16 @@ def pytest_collection_modifyitems(config, items):
     skew = pytest.mark.skip(reason=_SKEW_REASON)
     known = pytest.mark.skip(reason=_KNOWN_FAIL_REASON)
     for item in items:
+        if item.path.parent != Path(__file__).parent:
+            continue
         filename = item.path.name
-        if filename == "test_core.py" and item.name.split("[", 1)[0] in (
-            "test_fp6_tma_store_contiguous",
-            "test_fp6_tma_mma_operand",
-        ):
+        # FP6 cases use buffer_load/store with explicit distributed layouts, so they
+        # pass on the pinned frontend where pointer-layout tests cannot. Run them
+        # (still applying the known-fail check) instead of version-skew-skipping
+        # all of test_core.py.
+        if filename == "test_core.py" and getattr(item, "originalname", item.name) in _COMPATIBLE_CORE_TESTS:
+            if any(sub in item.nodeid for sub in _KNOWN_FAIL_SUBSTRINGS):
+                item.add_marker(known)
             continue
         if filename in _VERSION_SKEW_FILES:
             # Exemption: test_standard_scan (upstream #12007) exercises only core
