@@ -5794,6 +5794,33 @@ static void foldDescriptorLoadMmaBridge(triton::FuncOp funcOp) {
   }
 }
 
+// Returns a register value feeding consumers in different partitions through
+// separate channels in one block; createBuffer cannot reload it in each
+// partition. createBuffer groups channels by source value and consumer block,
+// so channels in different blocks get separate buffers and are fine. Channel
+// topology does not depend on numBuffers (it only sets the buffer depth), so
+// collecting with 1 finds the same channels as doBufferAllocation.
+Value findTensorChannelWithMixedConsumerTasks(triton::FuncOp funcOp) {
+  SmallVector<std::unique_ptr<Channel>> channelsOrigin;
+  collectAsyncChannels(channelsOrigin, funcOp, 1 /*numBuffers*/);
+  DenseMap<std::pair<Value, Block *>, Channel *> firstChannel;
+  for (const auto &channel : channelsOrigin) {
+    Value src = channel->getSrcOperand();
+    if (!isa<RankedTensorType>(src.getType()))
+      continue;
+    // doConvertDescriptorLoadsToNVWS turns a register-consumed descriptor load
+    // into a local_load tagged with every consumer partition, which forms no
+    // register channel, so createBuffer never sees it.
+    if (src.getDefiningOp<tt::DescriptorLoadOp>())
+      continue;
+    auto [it, inserted] = firstChannel.try_emplace(
+        {src, channel->getDstOp()->getBlock()}, channel.get());
+    if (!inserted && it->second->relation.second != channel->relation.second)
+      return src;
+  }
+  return Value();
+}
+
 LogicalResult doBufferAllocation(triton::FuncOp funcOp) {
   // Step 0: Swap transposed local_alloc + memdesc_trans patterns so that
   // allocs that share the same source value can also share a buffer.
@@ -5821,6 +5848,12 @@ LogicalResult doBufferAllocation(triton::FuncOp funcOp) {
     channels.push_back(c.get());
   }
   if (!channels.empty()) {
+    if (Value src = findTensorChannelWithMixedConsumerTasks(funcOp)) {
+      return emitError(
+          src.getLoc(),
+          "meta autoWS does not support a register value used by consumers "
+          "in different partitions");
+    }
     // Step 2: Reorder ops based on channel information.
     reorderEpilogOps(channels, funcOp);
 
