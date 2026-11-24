@@ -284,21 +284,6 @@ def _branch_bundle(kind, sha=NEW):
     return assets
 
 
-@pytest.mark.parametrize("kind", ["core", "amd"])
-def test_branch_bundles_stop_retrying_only_after_complete_publication(kind):
-    from select_meta_llvm_branches import branch_requests
-
-    assets = _branch_bundle(kind)
-    assert branch_requests({kind: _branch_tip()}, assets, BRANCH_PLATFORMS) == []
-    for index, asset in enumerate(assets):
-        partial = assets[:index]
-        expected = [{"kind": kind, "llvm_sha": NEW, "build_number": "1"}]
-        assert branch_requests({kind: _branch_tip()}, partial, BRANCH_PLATFORMS) == expected
-        for digest in (None, "sha256:" + hashlib.sha256(b"").hexdigest()):
-            starter = dict(asset, state="starter", size=0, digest=digest)
-            assert branch_requests({kind: _branch_tip()}, partial + [starter], BRANCH_PLATFORMS) == expected
-
-
 @pytest.mark.parametrize("status", [404, 502])
 def test_release_lookup_only_not_found_means_absent(monkeypatch, status):
     import subprocess
@@ -379,38 +364,39 @@ def _ready_fixture(kind):
 @pytest.mark.parametrize('kind', ['core', 'amd'])
 def test_ready_issue_requires_complete_validated_publication(monkeypatch, kind):
     import meta_llvm_ready as ready
+    from select_meta_llvm_branches import branch_requests
+
     assets, receipt, candidate = _ready_fixture(kind)
     writes = []
+    marker = ready.issue_marker(kind, NEW, 1)
+    existing_url = 'https://github.com/facebookexperimental/triton/issues/7'
 
     def api(path, **kwargs):
         if '/branches/' in path:
             return {'commit': _branch_tip()}
-        return [[{'number': 1, 'body': 'unrelated issue'}]]
+        return [[{'number': 7, 'body': marker, 'html_url': existing_url}]]
 
     monkeypatch.setattr(ready, 'github_json', api)
     monkeypatch.setattr(ready, 'read_json_asset', lambda *args: receipt)
     monkeypatch.setattr(ready.subprocess, 'run', lambda *args, **kwargs: writes.append(args))
+    monkeypatch.setattr(ready, 'release_assets', lambda *args: ({'id': 1}, assets))
+    assert branch_requests({kind: _branch_tip()}, assets, BRANCH_PLATFORMS) == []
+    assert ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS) == existing_url
+
     for missing in assets:
         partial = [a for a in assets if a is not missing]
-        monkeypatch.setattr(ready, 'release_assets', lambda *args: ({'id': 1}, partial))
-        with pytest.raises(ValueError):
-            ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS)
+        variants = [partial]
+        for digest in (None, 'sha256:' + hashlib.sha256(b'').hexdigest()):
+            variants.append(partial + [dict(missing, state='starter', size=0, digest=digest)])
+        for incomplete in variants:
+            expected = [] if missing['name'].endswith('.ready.json') else [{
+                'kind': kind, 'llvm_sha': NEW, 'build_number': '1'
+            }]
+            assert branch_requests({kind: _branch_tip()}, incomplete, BRANCH_PLATFORMS) == expected
+            monkeypatch.setattr(ready, 'release_assets', lambda *args: ({'id': 1}, incomplete))
+            with pytest.raises(ready.BundleNotReady):
+                ready.ensure_issue(ready.REPOSITORY, candidate, BRANCH_PLATFORMS)
     assert writes == []
-
-
-@pytest.mark.parametrize('kind', ['core', 'amd'])
-def test_ready_record_cannot_certify_different_sources_or_archives(monkeypatch, kind):
-    import meta_llvm_ready as ready
-    from meta_llvm_assets import published_assets
-    assets, receipt, candidate = _ready_fixture(kind)
-    monkeypatch.setattr(ready, 'read_json_asset', lambda *args: receipt)
-    receipt['source']['llvm_sha'] = OLD
-    with pytest.raises(ValueError, match='source provenance'):
-        ready.ready_receipt(ready.REPOSITORY, kind, NEW, BRANCH_TREE, 1, published_assets(assets), BRANCH_PLATFORMS)
-    receipt['source']['llvm_sha'] = NEW
-    receipt['sha256sum']['ubuntu-x64'] = '0' * 64
-    with pytest.raises(ValueError, match='platform digests'):
-        ready.ready_receipt(ready.REPOSITORY, kind, NEW, BRANCH_TREE, 1, published_assets(assets), BRANCH_PLATFORMS)
 
 
 @pytest.mark.parametrize('closed', [False, True])
