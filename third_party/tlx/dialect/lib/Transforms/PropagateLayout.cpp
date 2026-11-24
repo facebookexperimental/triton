@@ -3,6 +3,7 @@
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
+#include "tlx/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -872,6 +873,8 @@ public:
   }
 
   void runOnOperation() override {
+    if (onlyHandPlacedLds && !placesLdsByHand(getOperation()))
+      return;
     getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });
 
     MLIRContext *context = &getContext();
