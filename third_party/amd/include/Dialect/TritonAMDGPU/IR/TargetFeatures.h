@@ -59,6 +59,7 @@ public:
   bool isGFX1250Strict() const;
 
   int getWarpSize() const;
+  unsigned getCoalescingSectorBytes() const;
   bool supportsWaveId() const;
   int getSharedMemorySize() const;
   size_t getSharedMemoryPartitionSize() const;

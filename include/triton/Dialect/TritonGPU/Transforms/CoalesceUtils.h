@@ -12,8 +12,10 @@ namespace mlir::triton::gpu {
 class CoalescedEncodingAnalysis {
 public:
   explicit CoalescedEncodingAnalysis(ModuleAxisInfoAnalysis &axisInfoAnalysis,
-                                     unsigned maxVecBits = 128)
-      : axisInfoAnalysis(axisInfoAnalysis), maxVecBits(maxVecBits) {}
+                                     unsigned maxVecBits = 128,
+                                     unsigned sectorBytes = 0)
+      : axisInfoAnalysis(axisInfoAnalysis), maxVecBits(maxVecBits),
+        sectorBytes(sectorBytes) {}
 
   BlockedEncodingAttr getEncoding(Operation *op, int numWarps,
                                   int threadsPerWarp, CGAEncodingAttr cgaLayout,
@@ -30,6 +32,7 @@ private:
   void computeSliceInfo(FunctionOpInterface func);
   ModuleAxisInfoAnalysis &axisInfoAnalysis;
   unsigned maxVecBits;
+  unsigned sectorBytes;
   DenseMap<Operation *, unsigned> elementsPerThread;
 };
 } // namespace mlir::triton::gpu

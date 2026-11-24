@@ -32,6 +32,7 @@ add_triton_library(TritonGPUTransforms
   CoalesceAsyncCopy.cpp
   TargetInfo.cpp
   Utility.cpp
+  CoalesceSectorUtils.cpp
   CoalesceUtils.cpp
   LayoutPropagationUtility.cpp
   WarpSpecialization/AutomaticWarpSpecialization.cpp
