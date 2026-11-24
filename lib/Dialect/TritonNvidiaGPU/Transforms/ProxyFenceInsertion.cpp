@@ -55,6 +55,7 @@ bool isAsyncProxyRead(Operation *op) {
              triton::nvidia_gpu::MMAv5OpInterface,
              triton::nvidia_gpu::TMEMCopyOp,
              triton::nvidia_gpu::TMAStoreLikeOpInterface,
+             triton::nvidia_gpu::AsyncStoreOp,
              triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(op);
 }
 
@@ -75,6 +76,9 @@ bool isAsyncProxyReadSource(Operation *op, Value value) {
   }
   if (auto tmemCopyOp = dyn_cast<triton::nvidia_gpu::TMEMCopyOp>(op)) {
     return value == tmemCopyOp.getSrc();
+  }
+  if (auto asyncStore = dyn_cast<triton::nvidia_gpu::AsyncStoreOp>(op)) {
+    return value == asyncStore.getSrc();
   }
   return false;
 }
