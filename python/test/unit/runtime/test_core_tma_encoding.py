@@ -69,3 +69,28 @@ def test_core_recipe_matches_fill_tma_tiled(shape, block, elem_size, host_dtype)
         pytest.fail(f"diverged at {len(diffs)} of 128 bytes; first offsets={diffs[:12]}\n"
                     f"proven[:32]={proven_bytes[:32].hex()}\n"
                     f"core[:32]  ={core_bytes[:32].hex()}")
+
+
+@pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+                    reason="Requires SM100 or SM103")
+@pytest.mark.parametrize("width", [64, 128])
+def test_core_recipe_fp6_host_map(width):
+    mod = triton.runtime.driver.active.utils
+    storage = torch.empty((4, width * 3 // 4), device="cuda", dtype=torch.uint8)
+    block, shape, strides = [2, width], [4, width], list(storage.stride())
+    host_dtype = 15  # CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B
+
+    def host_map():
+        return mod.fill_tma_descriptor_tiled(storage.data_ptr(), 0, 1, host_dtype, block, shape, strides, 0)
+
+    def core_map():
+        return mod._test_construct_tma_desc(storage.data_ptr(), 2, host_dtype, 1, 0, block, shape, strides, 0, 0)
+
+    if width == 64 and torch.cuda.get_device_capability() != (10, 3):
+        with pytest.raises(ValueError, match="64-value FP6 TMA stores require SM103"):
+            host_map()
+        with pytest.raises(RuntimeError, match="triton_construct_tma_desc failed"):
+            core_map()
+        return
+
+    assert core_map() == mod._tma_desc_bytes(host_map())

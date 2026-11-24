@@ -653,6 +653,25 @@ static PyObject *fillTMADescriptorTiled(PyObject *self, PyObject *args) {
   Py_DECREF(stridesFast);
   stridesFast = NULL;
 
+  if (elemType == CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B &&
+      blockSizeInt[0] == 64) {
+    CUresult status = triton_encode_fp6_store_box64(
+        &desc->tensorMap, global_address, rank, swizzle, padding, elemSize,
+        shapeInt, stridesLL, blockSizeInt);
+    if (status == CUDA_ERROR_NOT_SUPPORTED) {
+      PyErr_SetString(PyExc_ValueError,
+                      "64-value FP6 TMA stores require SM103");
+      goto cleanup;
+    }
+    if (status == CUDA_ERROR_INVALID_VALUE) {
+      PyErr_SetString(PyExc_ValueError, "invalid SM103 FP6 store tensor map");
+      goto cleanup;
+    }
+    if (!gpuAssert(status, __FILE__, __LINE__))
+      goto cleanup;
+    return (PyObject *)desc;
+  }
+
   CUtensorMapFloatOOBfill fill =
       (padding == 1) ? CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
                      : CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;

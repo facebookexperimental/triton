@@ -1117,10 +1117,10 @@ static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
   if (nvmma.getRank() != memDesc.getRank())
     return op->emitOpError("TMA shared memory and layout ranks must match");
   auto descBlockEnc = desc.getSharedLayout();
+  auto descEnc = dyn_cast_if_present<NVMMASharedEncodingAttr>(descBlockEnc);
   // If the descriptor has no encoding yet (e.g., before
   // optimize-descriptor-encoding pass), skip the match check.
   if (descBlockEnc) {
-    auto descEnc = dyn_cast<NVMMASharedEncodingAttr>(descBlockEnc);
     // NOTE: Cannot do descEnc != enc as the encodings may differ in rank for
     // rank-reducing loads
     if (!descEnc || descEnc.getTransposed() != nvmma.getTransposed() ||
@@ -1146,8 +1146,14 @@ static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
       return op->emitOpError(
           "FP6 only supports tiled TMA loads and stores with byte storage");
     auto swizzle = nvmma.getSwizzlingByteWidth();
-    auto width = gpu::getShapePerCTA(nvmma, desc.getShape()).back();
-    if (width < 128 || (swizzle ? swizzle : width) != 128)
+    auto shape = desc.getShape();
+    auto width = gpu::getShapePerCTA(nvmma, shape).back();
+    if (width == 64) {
+      if (!store || swizzle || shape.size() != 2 || shape.back() != width ||
+          memDesc.getShape() != shape || nvmma != descEnc)
+        return op->emitOpError(
+            "64-value FP6 TMA requires a matching unswizzled [M, 64] store");
+    } else if (width < 128 || (swizzle ? swizzle : width) != 128)
       return op->emitOpError("FP6 TMA requires a 128-value box");
   }
   if (nvmma.getTransposed())
