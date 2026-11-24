@@ -30,6 +30,16 @@ doTaskPartition          (Hopper only; skipped on Blackwell)
   → SoftwarePipeliner::expandLoops
 ```
 
+`TRITON_USE_META_WS` is decided per module. `make_ttgir` enables the Meta WS
+pipeline only for a module that requests warp specialization (a
+`tt.warp_specialize` loop, an op with a partition or async task id, or an
+existing `ttg.warp_specialize` region), or that uses the modulo, joint or LLM
+scheduler, and records the result as the module's `ttg.use_meta_ws`
+attribute. C++ passes read that attribute through `isMetaWSEnabled` and fall
+back to the environment variable only when it is absent. Because the decision
+is per module, a kernel with a warp-specialized loop also gets the Meta WS
+pipeline choices on its other, non-warp-specialized loops.
+
 On Blackwell, task assignments are expected to come from an earlier partition
 scheduling pass (`PartitionSchedulingMeta`) rather than `doTaskPartition`.
 Data partitioning is not Hopper-only; it can run as the separate
