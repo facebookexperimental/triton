@@ -12,7 +12,7 @@ import triton
 import triton.language as tl
 from triton import knobs
 
-from triton._internal_testing import (is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_gfx1250, is_hip_rdna3,
+from triton._internal_testing import (is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_cdna5, is_hip_rdna3,
                                       is_hip_rdna4, is_hip_rdna4m)
 from triton.compiler.errors import CompilationError
 
@@ -584,7 +584,7 @@ def test_npot_dot_scaled(K):
         if cc < (8, 9):
             pytest.skip("float8e4nv not supported on CUDA < 8.9")
     if is_hip() and not (is_hip_cdna3() or is_hip_cdna4() or is_hip_rdna3() or is_hip_rdna4m() or is_hip_rdna4()
-                         or is_hip_gfx1250()):
+                         or is_hip_cdna5()):
         pytest.skip("scaled_dot(e4m3, e4m3) only implemented for CDNA3, CDNA4, RDNA3, RDNA4, and above")
 
     @triton.jit
