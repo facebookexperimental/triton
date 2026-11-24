@@ -58,6 +58,11 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
                               const MemoryPlannerOptions &options = {});
 
 LogicalResult doBufferAllocation(triton::FuncOp funcOp);
+// Whether an MMAv5 operand is a descriptor load TMA cannot write in the MMA's
+// layout, or a descriptor gather, so it would be staged through registers in
+// the MMA's own partition.
+bool hasRegisterStagedMMAOperand(triton::FuncOp funcOp);
+
 // Returns the shared memory that the software pipeliner and layout conversions
 // will add to a kernel with an MMA operand written in the MMA's own task, or 0
 // when there is no such operand. Must be called before doBufferAllocation.

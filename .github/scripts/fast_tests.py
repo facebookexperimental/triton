@@ -487,11 +487,14 @@ def main():
                 if platform not in platforms:
                     selected[platform] = False
                     plans[platform] = {key: [] for key in plans[platform]}
-        selected["b200"] = False
-        plans["b200"] = {key: [] for key in plans["b200"]}
+        skipped = [platform for platform in plans if platform in os.environ.get("GPU_CI_SKIP_PLATFORMS", "")]
+        for platform in skipped:
+            selected[platform] = False
+            plans[platform] = {key: [] for key in plans[platform]}
         selected["build"] = any(selected[platform] for platform in plans)
-        disabled_note = "B200 temporarily disabled: runner offline; this run does not cover B200."
-        print(f"::warning::{disabled_note}")
+        skip_note = f"GPU_CI_SKIP_PLATFORMS skips {','.join(skipped)}; this run does not cover them." if skipped else ""
+        if skip_note:
+            print(f"::warning::{skip_note}")
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             for key, value in selected.items():
                 output.write(f"{key}={str(value).lower()}\n")
@@ -501,7 +504,8 @@ def main():
         if summary:
             with open(summary, "a") as output:
                 output.write("## Baseline plus touched tests\n\n")
-                output.write(disabled_note + "\n\n")
+                if skip_note:
+                    output.write(skip_note + "\n\n")
                 if platforms is not None:
                     output.write(f"Manual platform list: {','.join(platforms)}. "
                                  "Other platforms are not covered by this run.\n\n")
