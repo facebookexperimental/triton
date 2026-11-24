@@ -1412,6 +1412,10 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("src"), py::arg("newElementType"), py::arg("newShape"),
           py::arg("newEncoding") = std::nullopt)
+      .def("get_dense_i32_array_attr",
+           [](TritonOpBuilder &self, std::vector<int32_t> values) -> Attribute {
+             return self.getBuilder().getDenseI32ArrayAttr(values);
+           })
       .def("get_memdesc_type",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding,

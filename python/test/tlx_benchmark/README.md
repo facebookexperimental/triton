@@ -13,15 +13,16 @@ python python/test/tlx_benchmark/bench_{op}.py
 
 `{op}` is one of `norm`, `mm`, `torchtlx_mm`, `torchtlx_addmm`, `torchtlx_bmm`,
 `flash_attn`, `flash_attn_mxfp8`, `flash_attn_varlen`, `hstu_attn`, `hstu_cross_attn`, `kda`,
-`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, `router_gemm`,
+`kda_prefill`, `kda_decode`, `mla_window_attn`, `swiglu_ffn`, `rmsnorm_cat`, `moe`, `moe_routing`, `moe_finalize`, `router_gemm`,
 or one of the fused operators or collectives below.
 
 Fused operators (`tlx/ops/kernels/fused/`) run steps that would otherwise be separate kernels in one launch:
 `addmm_mul_add` and `linear_rowscale` fuse an elementwise epilogue into a GEMM, `norm_residual_norm`
 fuses the post-norm, gated residual add and pre-norm of a residual-stream boundary,
 `qk_norm_rope_kv_cache` fuses the q/k head norm, RoPE, FP8 quantization and paged KV cache write,
-`rmsnorm_gate` fuses a per-head RMSNorm with a sigmoid output gate, and `moe_router_topk_align` fuses the router
-GEMM, sigmoid top-k and expert-aligned slot sort of an MoE layer.
+`rmsnorm_gate` fuses a per-head RMSNorm with a sigmoid output gate, `moe_router_topk_align` fuses the router
+GEMM, sigmoid top-k and expert-aligned slot sort of an MoE layer, and `moe_mxfp4_sort_quant` fuses the expert-aligned
+slot sort, MXFP4 activation quantization and scale sort in front of an A4W4 MoE.
 
 Collectives (`tlx/ops/kernels/collectives/`) are multi-GPU ops. `collectives/all_reduce/` holds `all_reduce`, and
 `collectives/fused/` holds the collectives fused with the op that consumes their result: `all_reduce_norm_residual_norm`
@@ -65,7 +66,7 @@ options:
 | op | reference | gate | default space |
 |----|-----------|------|---------------|
 | `mm` | `torch.matmul` | speedup >= 0.9x | heuristic |
-| `mm_mxfp8` | `torch.mm` on pre-dequantized BF16 inputs | reports ratio only; non-equivalent reference | heuristic |
+| `mm_mxfp` | `torch.mm` on pre-dequantized BF16 inputs | reports ratio only; non-equivalent reference | heuristic |
 | `addmm` | `torch.addmm` | speedup >= 0.9x | heuristic |
 | `mm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
 | `addmm_torchtlx` | `torch.compile` with TLX off | speedup >= 0.9x | heuristic |
@@ -84,6 +85,7 @@ options:
 | `moe` | none (FlyDSL's Muse MoE ships with aiter) | absolute floor, currently unset -> reports only | heuristic |
 | `moe_routing` | `torch.compile` of the eager routing | speedup >= 0.9x | heuristic |
 | `router_gemm` | `F.linear` on the fp32 upcast (hipBLASLt fp32) | speedup >= 0.9x | heuristic |
+| `moe_finalize` | unfused Triton finalize; backward: `torch.compile` of the eager finalize | speedup >= 0.9x | heuristic |
 
 ### Fused operators
 
@@ -93,6 +95,7 @@ options:
 | `linear_rowscale` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 | `norm_residual_norm` | `torch.compile` of the unfused module sequence | speedup >= 0.9x | heuristic |
 | `moe_router_topk_align` | `router_gemm` + `moe_routing` + the `moe` slot sort (separate launches) | speedup >= 0.9x | heuristic |
+| `moe_mxfp4_sort_quant` | `torch.compile` of the slot sort, MXFP4 row quantization and scale sort | speedup >= 0.9x | heuristic |
 | `qk_norm_rope_kv_cache` | `torch.compile` of the eager norm, RoPE and cache scatter | speedup >= 0.9x | heuristic |
 | `rmsnorm_gate` | `torch.compile` of the eager expression | speedup >= 0.9x | heuristic |
 
@@ -156,6 +159,21 @@ different amounts of work do not belong in one TFLOP/s column. `--fwd-only` /
    the autotune winner. An op launching several autotuned kernels gets one entry
    per kernel, `name: config` separated by `|`; a kernel that is not autotuned
    reports `-`. Recorded by the harness, so every op has the column.
+
+The raw artifact and published summary also retain an `autotune` list per case.
+Each entry identifies the kernel, preparation or warmup phase, runtime cache key,
+selected compiler options and selection type: `tuned`, `cached`, `fixed` or
+`unobserved`. The config includes launch options such as CTA count and register
+caps, not just the compact best-config label. `ir_override` records only whether
+an override is present, never its private file path.
+`selected_by_case` names the case whose tuning was observed; it is null for an
+unknown origin, such as an existing disk cache or tuning in the cold-compile
+pass outside this recorder. Candidate `timings_ms` are copied only from a genuine
+tuning event. Cached cases never repeat an earlier case's timings as new
+measurements. Non-finite candidate values are null, not zero. This recorder is
+removed before correctness checks and performance timing. A recording failure
+adds an `unobserved` entry with a `recording_error` type, without discarding the
+performance measurement. Older artifacts have no decision records.
 
 ### Common vs op-specific metrics
 

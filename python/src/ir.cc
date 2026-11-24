@@ -251,7 +251,7 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
           ttng::getTMABlockShape(descTy, /*packedSize=*/false, tmaMode);
       metadata["swizzle"] = *swizzle;
       metadata["elem_size"] =
-          descTy.getElementType().getIntOrFloatBitWidth() / 8;
+          getIntOrFloatOrPtrBitWidth(descTy.getElementType()) / 8;
       metadata["elem_type"] = *elemType;
       metadata["block_size"] =
           std::vector<int>(blockSize.begin(), blockSize.end());
@@ -261,7 +261,8 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
       auto blockShape = descTy.getShape();
       metadata["block_size"] =
           std::vector<int>(blockShape.begin(), blockShape.end());
-      metadata["elem_bits"] = descTy.getElementType().getIntOrFloatBitWidth();
+      metadata["elem_bits"] =
+          getIntOrFloatOrPtrBitWidth(descTy.getElementType());
 
       if (auto paddedEnc =
               dyn_cast_if_present<ttg::PaddedSharedEncodingAttr>(encoding)) {
@@ -1047,13 +1048,36 @@ void init_triton_ir(py::module_ &m) {
       py::arg("rhsFormat"), py::arg("rhsKPack"));
 
   py::class_<FuncOp, OpState>(m, "function")
-      // .def_prop_ro("attrs", &ir::function::attrs)
-      // .def("add_attr", &ir::function::add_attr);
       .def("args",
            [](FuncOp &self, unsigned idx) -> BlockArgument {
              if (idx >= self.getNumArguments())
                throw py::index_error("Function argument index out of range");
              return self.getArgument(idx);
+           })
+      .def("get_arg_str_attr",
+           [](FuncOp &self, unsigned idx,
+              const std::string &name) -> py::object {
+             if (idx >= self.getNumArguments())
+               throw py::index_error("Function argument index out of range");
+             FunctionOpInterface funcOpIF(self);
+             auto attr = dyn_cast_if_present<StringAttr>(
+                 funcOpIF.getArgAttr(idx, name));
+             if (!attr)
+               return py::none();
+             auto s = attr.getValue().str();
+             return py::str(s.c_str(), s.size());
+           })
+      .def("get_arg_int_attr",
+           [](FuncOp &self, unsigned idx,
+              const std::string &name) -> py::object {
+             if (idx >= self.getNumArguments())
+               throw py::index_error("Function argument index out of range");
+             FunctionOpInterface funcOpIF(self);
+             auto attr = dyn_cast_if_present<IntegerAttr>(
+                 funcOpIF.getArgAttr(idx, name));
+             if (!attr)
+               return py::none();
+             return py::int_(attr.getInt());
            })
       .def("get_num_args", &FuncOp::getNumArguments)
       .def(
@@ -1276,6 +1300,14 @@ void init_triton_ir(py::module_ &m) {
       .def("get_int128_ty",
            [](TritonOpBuilder &self) -> Type {
              return self.getBuilder().getIntegerType(128);
+           })
+      .def("get_fp4e2m1x2_ty",
+           [](TritonOpBuilder &self) -> Type {
+             return self.getBuilder().getType<PackedFloat4E2M1Type>();
+           })
+      .def("get_fp8e8m0fnu_ty",
+           [](TritonOpBuilder &self) -> Type {
+             return self.getBuilder().getType<Float8E8M0FNUType>();
            })
       .def("get_fp8e4nv_ty",
            [](TritonOpBuilder &self) -> Type {
@@ -1833,12 +1865,23 @@ void init_triton_ir(py::module_ &m) {
           },
           py::arg("ptrs"), py::arg("val"), py::arg("mask"),
           py::arg("cachePolicy"))
-      .def("create_tensor_descriptor_type",
-           [](TritonOpBuilder &self, Type blockTy, bool isSigned) -> Type {
-             auto rtt = cast<RankedTensorType>(blockTy);
-             return triton::TensorDescType::get(rtt.getShape(),
-                                                rtt.getElementType(), isSigned);
-           })
+      .def(
+          "create_tensor_descriptor_type",
+          [](TritonOpBuilder &self, Type blockTy, bool isSigned,
+             std::optional<std::string> fp6Format) -> Type {
+            auto rtt = cast<RankedTensorType>(blockTy);
+            Type elemTy = rtt.getElementType();
+            if (fp6Format == "e2m3")
+              elemTy = Float6E2M3FNType::get(self.getContext());
+            else if (fp6Format == "e3m2")
+              elemTy = Float6E3M2FNType::get(self.getContext());
+            else if (fp6Format)
+              throw py::value_error("unknown FP6 descriptor format");
+            return triton::TensorDescType::get(rtt.getShape(), elemTy,
+                                               isSigned);
+          },
+          py::arg("block_type"), py::arg("is_signed"),
+          py::arg("fp6_format") = py::none())
       .def("create_reinterpret_tensor_descriptor",
            [](TritonOpBuilder &self, Value desc_ptr, Type blockTy) -> Value {
              auto rtt = cast<RankedTensorType>(blockTy);
@@ -2258,6 +2301,13 @@ void init_triton_ir(py::module_ &m) {
              }
            })
       // Make a tensor descriptor
+      .def("create_make_tensor_descriptor",
+           [](TritonOpBuilder &self, Type descTy, Value base,
+              std::vector<Value> &shape, std::vector<Value> &strides,
+              PaddingOption padding) -> Value {
+             return self.create<MakeTensorDescOp>(descTy, base, shape, strides,
+                                                  /*descPtr=*/Value(), padding);
+           })
       .def("create_make_tensor_descriptor",
            [](TritonOpBuilder &self, Value &base, std::vector<Value> &shape,
               std::vector<Value> &strides, std::vector<int32_t> &tensorShape,
