@@ -1,5 +1,6 @@
 """gfx950 correctness coverage for ``tlx.ops.mm``."""
 
+import re
 import time
 
 import pytest
@@ -1164,6 +1165,97 @@ def test_mm_large_2d_streamk_grid_uses_wide_locality_band():
     # Stream-K families where it was measured to regress.
     assert _gfx950._iw_streamk_mapping(896, 117136, 8192, 256, 256) == (4, 8)
     assert _gfx950._iw_streamk_mapping(7088, 5552, 32768, 256, 256) == (4, 8)
+
+
+def _record_streamk_launches(monkeypatch):
+    compiled = []
+    kernel = _gfx950._iw_streamk_kernel
+
+    class StreamKRecorder:
+
+        def __getitem__(self, grid):
+
+            def launch(*args, **kwargs):
+                compiled.append(kernel.run(*args, grid=grid, warmup=False, **kwargs))
+                return compiled[-1]
+
+            return launch
+
+    monkeypatch.setattr(_gfx950, "_iw_streamk_kernel", StreamKRecorder())
+    return compiled
+
+
+@pytest.mark.parametrize(
+    "m,n,k,tile",
+    [(1024, 1024, 8192, (128, 128)), (4096, 4352, 8192, (256, 256)), (4096, 5120, 8192, (256, 256))],
+    ids=["mt128-owner-fixup", "mt256-owner-fixup", "mt256-distributed-fixup"],
+)
+def test_mm_streamk_publish_waits_for_every_wave_partial_stores(m, n, k, tile, monkeypatch):
+    """Every wave completes its partial-tile stores before the barrier that precedes the ready flag.
+
+    The ``.wt`` partial stores lower to ``buffer_store ... sc0 sc1`` with no completion wait, and ``s_barrier`` does
+    not wait for global stores. Without ``s_waitcnt vmcnt(0)`` in every wave before the barrier, the flag that wave 0
+    stores after it can become visible before another wave's partial lines, and the reducing program adds stale data
+    to the tile.
+    """
+    assert _gfx950._iw_choose_streamk_tile(m, n) == tile
+    compiled = _record_streamk_launches(monkeypatch)
+    torch.manual_seed(m + n + k)
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.float16).T
+    torch.testing.assert_close(_gfx950._iw_streamk_matmul(a, b), torch.matmul(a, b), atol=2e-2, rtol=2e-2)
+    assert len(compiled) == 1
+    asm = compiled[0].asm["amdgcn"].splitlines()
+    partial_stores = [i for i, line in enumerate(asm) if re.match(r"\s+buffer_store_dwordx4\s.*\bsc0 sc1\b", line)]
+    flag_stores = [i for i, line in enumerate(asm) if re.match(r"\s+global_store_dword\s.*\bsc0 sc1\b", line)]
+    publishes = []
+    for flag in flag_stores:
+        earlier_partial_stores = [i for i in partial_stores if i < flag]
+        if earlier_partial_stores:
+            publishes.append((earlier_partial_stores[-1], flag))
+    assert publishes, "expected write-through partial-tile stores followed by the ready-flag store"
+    for last_partial, flag in publishes:
+        barrier = next((i for i in range(last_partial, flag) if re.match(r"\s+s_barrier\b", asm[i])), None)
+        assert barrier is not None, "expected a barrier between the partial-tile stores and the ready-flag store"
+        assert any(re.match(r"\s+s_waitcnt\s+vmcnt\(0\)", line) for line in asm[last_partial + 1:barrier]), (
+            "the waves do not complete their partial-tile stores before the barrier that precedes the ready flag:\n" +
+            "\n".join(asm[last_partial:flag + 1]))
+
+
+def test_mm_streamk_fixup_never_reads_unpublished_partials(monkeypatch):
+    """A reducing program never reads a partial tile before every wave's stores of it have landed.
+
+    The partial workspace is NaN-filled on every call, so a partial line read too early shows up as NaN in the
+    output. The MT128 owner-fixup build with a cross-XCD handoff mapping and a concurrent copy on a side stream is
+    where the unordered publish was observed, in about 1e-4 to 8e-4 of calls on MI350X.
+    """
+    m, n, k, calls = 1024, 1024, 8192, 50000
+    assert _gfx950._iw_choose_streamk_tile(m, n) == (128, 128)
+    assert _gfx950._iw_streamk_schedule(m, n, k, block_m=128, block_n=128)["HAS_STREAMK"]
+    empty = torch.empty
+    partials_shape = (_gfx950._iw_NUM_CU, 128, 128)
+
+    def poisoned_empty(*size, **kwargs):
+        tensor = empty(*size, **kwargs)
+        if tensor.shape == partials_shape and tensor.dtype == torch.float32:
+            tensor.fill_(float("nan"))
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", poisoned_empty)
+    generator = torch.Generator(device="cuda").manual_seed(2026)
+    inputs = [(torch.randn((m, k), device="cuda", dtype=torch.float16, generator=generator),
+               torch.randn((n, k), device="cuda", dtype=torch.float16, generator=generator).T) for _ in range(4)]
+    copy_src = torch.randn((64 << 20, ), device="cuda", generator=generator)
+    copy_dst = torch.empty_like(copy_src)
+    side_stream = torch.cuda.Stream()
+    bad_calls = torch.zeros((), device="cuda", dtype=torch.int64)
+    for call in range(calls):
+        with torch.cuda.stream(side_stream):
+            copy_dst.copy_(copy_src)
+        a, b = inputs[call % len(inputs)]
+        bad_calls += torch.isnan(_gfx950._iw_streamk_matmul(a, b, _num_xcds=1)).any()
+    torch.cuda.synchronize()
+    assert bad_calls.item() == 0, f"{bad_calls.item()} of {calls} calls read a partial tile before it was published"
 
 
 @pytest.mark.parametrize(
