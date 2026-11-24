@@ -1,3 +1,4 @@
+#include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "TritonAMDGPUTransforms/WmmaGroup.h"
@@ -1420,6 +1421,9 @@ public:
     auto newDot = triton::DotScaledOp::create(
         rewriter, dotOp.getLoc(), newRetType, a, b, newAcc, newAScale,
         newBScale, aElemType, bElemType, dotOp.getFastMath());
+    if (dotOp->hasAttr(triton::amdgpu::kFp6PackedAttrName))
+      newDot->setAttr(triton::amdgpu::kFp6PackedAttrName,
+                      rewriter.getUnitAttr());
 
     rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(dotOp, oldRetType,
                                                       newDot);
