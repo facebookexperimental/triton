@@ -51,6 +51,18 @@
 
 namespace py = nanobind;
 
+// NOTE (sync-train merge of #11911): 4-arg overload uniting enableTreeReduction
+// with upstream cuMode. Declared locally because Passes.h (outside this
+// conflict's scope) only declares the 3-arg factory.
+// TODO: fold this declaration into Passes.h.
+namespace mlir {
+namespace triton {
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonAMDGPUToLLVMPass(::llvm::StringRef gfxArch, bool ftz,
+                                    bool enableTreeReduction, bool cuMode);
+} // namespace triton
+} // namespace mlir
+
 namespace {
 llvm::Triple getAMDTargetTriple(const std::string &arch) {
   llvm::AMDGPU::GPUKind gpuKind = llvm::AMDGPU::parseArchAMDGCN(arch);
@@ -64,14 +76,10 @@ llvm::Triple getAMDTargetTriple(const std::string &arch) {
 
 void init_triton_amd_passes_ttgpuir(py::module_ &m) {
   using namespace mlir::triton;
-  m.def("add_to_llvmir",
-        [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
-          pm.addPass(createConvertTritonAMDGPUToLLVMPass(arch, ftz));
-        });
   m.def("add_to_llvmir", [](mlir::PassManager &pm, const std::string &arch,
-                            bool ftz, bool enableTreeReduction) {
-    pm.addPass(
-        createConvertTritonAMDGPUToLLVMPass(arch, ftz, enableTreeReduction));
+                            bool ftz, bool enableTreeReduction, bool cuMode) {
+    pm.addPass(createConvertTritonAMDGPUToLLVMPass(
+        arch, ftz, enableTreeReduction, cuMode));
   });
   ADD_PASS_OPTION_WRAPPER_1("add_membar", createTritonAMDGPUMembar,
                             const std::string &);
@@ -97,10 +105,9 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
   ADD_PASS_OPTION_WRAPPER_1("add_warp_pipeline_conversion",
                             mlir::triton::AMD::createConvertWarpPipelinePass,
                             const std::string &);
-  ADD_PASS_OPTION_WRAPPER_1(
-      "add_optimize_dot_operands",
-      mlir::triton::amdgpu::createTritonAMDGPUOptimizeDotOperands,
-      const std::string &);
+  ADD_PASS_OPTION_WRAPPER_1("add_optimize_dot_operands",
+                            mlir::createTritonAMDGPUOptimizeDotOperands,
+                            const std::string &);
   m.def("add_hoist_layout_conversions", [](mlir::PassManager &pm) {
     pm.addNestedPass<mlir::triton::FuncOp>(
         mlir::createTritonAMDGPUHoistLayoutConversions());
@@ -623,13 +630,10 @@ void init_triton_amd(py::module_ &m) {
       // hold the GIL meanwhile.
       py::call_guard<py::gil_scoped_release>());
 
-  m.def("add_scalarize_packed_fops_llvm_pass", [](llvm::Function *fn) {
-    mlir::triton::AMD::runScalarizePackedFOpsPass(*fn);
-  });
-
-  m.def("add_mfma_schedule_pass", [](llvm::Function *fn) -> bool {
-    return mlir::triton::AMD::runMFMASchedulePass(*fn);
-  });
+  m.def("add_mfma_schedule_pass",
+        [](llvm::Function *fn, const std::string &arch) -> bool {
+          return mlir::triton::AMD::runMFMASchedulePass(*fn, arch);
+        });
 
   auto hipBlas = m.def_submodule("hipblas");
   py::class_<HipblasLtInstance>(hipBlas, "HipblasLt")

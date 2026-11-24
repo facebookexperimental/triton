@@ -201,6 +201,9 @@ def test_module_walk(device):
     ttir_module = src.make_ir(target, options, codegen_fns, module_map, context)
     ttir_module.walk(walk_fn)
 
+    k = ttir_module.get_function("add_kernel")
+    k.get_arg_int_attr(0, "tt.divisibility")
+
 
 def test_python_func_in_visit_call(device):
 
@@ -223,3 +226,44 @@ def test_python_func_in_visit_call(device):
     x = torch.randn(4, device=device)
     out = torch.zeros_like(x)
     test_py_call_const_kernel[(4, )](x, out, 4, 4)
+
+
+# ttg.shared_memory_breakdown module attribute roundtrip. The C++ side attaches
+# breakdown JSON as a StringAttr; module.get_str_attr exposes it to backends.
+
+_BREAKDOWN_ATTR = "ttg.shared_memory_breakdown"
+
+
+def _parse_test_module(tmp_path, name):
+    from triton._C.libtriton import ir
+
+    source = tmp_path / name
+    source.write_text("module {\n  tt.func public @k() { tt.return }\n}\n")
+    context = ir.context()
+    ir.load_dialects(context)
+    return context, ir.parse_mlir_module(str(source), context)
+
+
+def test_module_get_str_attr_contract(tmp_path):
+    from triton._C.libtriton import ir
+
+    context, module = _parse_test_module(tmp_path, "breakdown.mlir")
+    assert module.get_str_attr(_BREAKDOWN_ATTR) is None
+    module.set_attr(_BREAKDOWN_ATTR, ir.builder(context).get_int32_attr(7))
+    assert module.get_str_attr(_BREAKDOWN_ATTR) is None
+    module.set_attr(_BREAKDOWN_ATTR, ir.builder(context).get_string_attr('{"version": 1}'))
+    assert module.get_str_attr(_BREAKDOWN_ATTR) == '{"version": 1}'
+
+
+def test_breakdown_raw_roundtrip_through_module(tmp_path):
+    import json
+
+    from triton._C.libtriton import ir
+    from triton.runtime.errors import attach_shared_memory_breakdown
+
+    raw = json.dumps({"version": 1, "reserved_bytes": 1024, "functions": [], "reservations": []})
+    context, module = _parse_test_module(tmp_path, "roundtrip.mlir")
+    module.set_attr(_BREAKDOWN_ATTR, ir.builder(context).get_string_attr(raw))
+    metadata = {}
+    attach_shared_memory_breakdown(module, metadata)
+    assert metadata["shared_memory_breakdown"] == raw

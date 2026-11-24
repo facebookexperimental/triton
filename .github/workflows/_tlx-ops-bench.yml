@@ -37,6 +37,16 @@ on:
         description: "Commit the wheel was built from; the suite is checked out at it"
         required: true
         type: string
+      ci_status:
+        description: "Conclusion of this platform's TLX tests on sha, recorded in the summary"
+        required: false
+        type: string
+        default: ""
+      ci_run:
+        description: "The gpu-tests.yml run ci_status comes from"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -108,8 +118,15 @@ jobs:
           # structured-trace logger, so every torch.compile builds trace payloads
           # nobody reads. After the earlier benches that stalls each
           # torch.compile bench for about 40 minutes on the H100 runner.
-          python -m pytest python/test/tlx_benchmark/test_ops_perf.py --import-mode=importlib -p no:logging \
-            -k "not torchtlx" -v -s --timeout=2700 --junitxml="${RUNNER_TEMP}/tlx-ops-bench.xml"
+          # If a crash keeps pytest from writing JUnit XML, the running_test output and the exit status name the
+          # bench and the signal.
+          set +e
+          PYTHONPATH=.ci/.github/scripts/pytest_plugins python -m pytest python/test/tlx_benchmark/test_ops_perf.py \
+            --import-mode=importlib -p running_test -p no:logging -k "not torchtlx" -v -s --timeout=2700 \
+            --junitxml="${RUNNER_TEMP}/tlx-ops-bench.xml"
+          status=$?
+          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
+          exit "${status}"
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
@@ -133,6 +150,8 @@ jobs:
           junit: ${{ runner.temp }}/tlx-ops-bench.xml
           completed-junit: ${{ (steps.run_bench.outcome == 'success' || steps.run_bench.outcome == 'failure') && format('{0}/tlx-ops-bench.xml', runner.temp) || '' }}
           budget: ${{ runner.temp }}/tlx-ops-bench.xml=120
+          crashed-test: ${{ steps.run_bench.outputs.running_test }}
+          exit-code: ${{ steps.run_bench.outputs.exit_code }}
       # Records the kernel specializations the suite compiles, for the CPU codegen trace on PRs
       # (tlx-codegen-trace.yml). Runs after the results are uploaded, so a failure here loses nothing.
       - name: Record the codegen corpus
@@ -176,7 +195,8 @@ jobs:
           [[ -n "${DATE}" ]] || { echo "no .devYYYYMMDD in ${VERSION}"; exit 1; }
           SUMMARY="${DATE}.${{ inputs.platform }}.json"
           python3 .github/scripts/tlx_ops_bench_dashboard.py summarize raw \
-            --platform "${{ inputs.platform }}" --version "${VERSION}" --sha "${{ inputs.sha }}" --out "${SUMMARY}"
+            --platform "${{ inputs.platform }}" --version "${VERSION}" --sha "${{ inputs.sha }}" --out "${SUMMARY}" \
+            --ci "${{ inputs.ci_status }}" --ci-run "${{ inputs.ci_run }}"
           # The three platforms publish concurrently; whichever loses the create race finds it made.
           gh release view tlx-ops-bench >/dev/null 2>&1 \
             || gh release create tlx-ops-bench --prerelease --latest=false --title "tlx.ops nightly perf" \
@@ -205,6 +225,13 @@ jobs:
           gh release download tlx-ops-bench --pattern '*.${{ inputs.platform }}.json' --dir history
           python3 .github/scripts/tlx_ops_bench_regressions.py history \
             --platform '${{ inputs.platform }}' --date "${DATE}" --out regressions.json --file-issues
+      - name: Write the run summary
+        if: always()
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 .github/scripts/tlx_ops_bench_dashboard.py report "${VERSION##*.dev}.${{ inputs.platform }}.json" \
+            --regressions regressions.json >> "$GITHUB_STEP_SUMMARY"
       - name: Upload regression evidence
         if: always()
         uses: actions/upload-artifact@v4

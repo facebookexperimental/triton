@@ -372,6 +372,39 @@ def test_bench_card_shows_the_latest_run_per_gpu():
     assert (v["B200"]["passed_7"], v["B200"]["runs_7"]) == (0, 2) and set(v) == {"B200"}
 
 
+@pytest.mark.parametrize("workflow", ["gpu-tests-nightly.yml", "nightly-tlx-ops-bench.yml"])
+def test_finished_platform_results_survive_another_platform_waiting(workflow):
+    if workflow == r.BENCH_WF:
+        first = bench_run(1, "mi350")
+        failed = bench_run(2, "mi350", "test_op_perf[bench_mm]")
+        waiting = job("b200 / bench")
+    else:
+        first = nightly(1, tb("mi350"))
+        failed = nightly(2, tb("mi350", "gemm"))
+        waiting = tb("b200")
+    waiting.update(status="queued", conclusion=None, completed_at=None, steps=[])
+    failed.update(status="queued", conclusion=None)
+    failed["jobs"].append(waiting)
+    view = r.gpu_nightly_view([first, failed], stamp(23), workflow)
+    assert view["MI350"]["result"] == "test"
+    assert view["MI350"]["t"] == stamp(2)
+    assert view["MI350"]["fails"]
+    assert view["MI350"]["runs_7"] == 2
+
+
+@pytest.mark.parametrize("setup", [False, True])
+def test_pr_finished_failure_survives_another_platform_waiting(setup):
+    failed = job("mi350 / mi350-tlx-test", step("Install prebuilt Triton", "failure")) if setup else tlx(
+        "test_signal", gpu="mi350")
+    waiting = {**tlx(), "status": "queued", "conclusion": None, "completed_at": None, "steps": []}
+    pending = run(2, [failed, waiting], event="pull_request", status="queued")
+    view = r.pr_view([pending], stamp(23), main([]))[0]
+    assert view["result"] == ("setup" if setup else "tests")
+    assert view["pending"] is True
+    assert view["gpus"] == ["MI350"]
+    assert view["n_failed"] == (0 if setup else 1)
+
+
 def test_bench_step_maps_to_a_group():
     """A failed bench is a test result, not a setup failure, so the bench workflow's step needs a group."""
     import os
@@ -641,6 +674,27 @@ def test_grid_marks_gpus_skipped_by_selection_and_runs_in_progress():
     assert [p["cells"]["H100"] for p in v["pushes"]] == ["na", "skip", "running"]
 
 
+def test_each_gpu_of_a_push_in_progress_shows_its_own_jobs():
+    h100 = tlx(gpu="h100")
+    queued = {**tlx(), "status": "queued", "conclusion": None, "steps": []}
+    running = {**tlx(gpu="mi350"), "status": "in_progress", "conclusion": None}
+    stuck = push(1, h100, queued, running, status="in_progress", conclusion=None)
+    stuck["select"] = {"h100": True, "b200": True, "mi350": True, "build": True}
+    never_ran = {**tlx(), "conclusion": "cancelled", "steps": []}
+    skipped = push(2, tlx(gpu="h100"), never_ran, conclusion="cancelled")
+    skipped["select"] = {"h100": True, "b200": False, "mi350": False, "build": True}
+    v = main([stuck, skipped])
+    assert [p["cells"]
+            for p in v["pushes"]] == [{"H100": "pass", "B200": "waiting", "MI350": "running", "CPU": "running"},
+                                      {"H100": "pass", "B200": "norunner", "MI350": "skip", "CPU": "na"}]
+
+
+def test_a_gpu_job_that_never_got_a_runner_keeps_its_known_failures():
+    never_ran = {**tlx(), "conclusion": "cancelled", "steps": []}
+    v = main([push(1, tlx("t1")), push(2, tlx("t1")), push(3, never_ran, conclusion="cancelled")])
+    assert v["gpus"]["B200"]["verdict"] == "known" and items(v, "B200", "known") == {("t1", "01")}
+
+
 def test_lit_run_in_progress_shows_as_running():
     v = r.lit_view([lit(1), run(2, [], wf="compiler.yml", status="in_progress", conclusion=None)], stamp(23))
     assert [p["cell"] for p in v["pushes"]] == ["pass", "running"] and v["verdict"] == "passing"
@@ -718,6 +772,32 @@ def test_concurrency_stops_at_a_run_whose_jobs_are_not_stored_yet():
     c = r.concurrency_view([push(1, span("b200", 10, 0, 10, 30)), pending], "2026-10-12T23:00:00Z")
     hours = {x["day"]: x for x in c["hours"]}
     assert hours["2026-10-12 10:00"]["B200"]["peak"] == 1 and hours["2026-10-12 21:00"]["B200"]["peak"] is None
+
+
+@pytest.mark.parametrize("workflow", [
+    "gpu-tests.yml",
+    "fast-gpu-tests.yml",
+    "gpu-tests-nightly.yml",
+    "nightly-tlx-ops-bench.yml",
+])
+def test_unavailable_gpu_does_not_hide_other_gpus_or_report_queued_jobs_as_running(workflow):
+    queued = span("b200", 10, 0, 10, 30)
+    queued.update(status="queued", conclusion=None, completed_at=None, steps=[])
+    active = span("h100", 22, 30, 23, 0)
+    active.update(status="in_progress", conclusion=None, completed_at=None)
+    pending = run(10, [queued, active, span("mi350", 22, 10, 22, 20)], wf=workflow, status="in_progress")
+    now = stamp(23)
+    occupancy = r.occupancy_view([pending], now)
+    end = r.t(occupancy["t0"]) + r.dt.timedelta(minutes=len(occupancy["gpus"]["MI350"]["run"]) * r.OCC_CELL_MIN)
+    assert end == r.t(now)
+    assert sum(occupancy["gpus"]["MI350"]["busy"]) == 10
+    assert occupancy["gpus"]["B200"]["run"][-1] == 0
+    assert occupancy["gpus"]["B200"]["wpart"][-1] == 15
+    assert occupancy["gpus"]["H100"]["run"][-1] == 1
+    hour = r.concurrency_view([pending], now)["hours"][-2]
+    assert hour["B200"] == {"peak": 0, "mean": 0.0, "wait_peak": 1}
+    assert hour["MI350"]["peak"] == 1
+    assert hour["H100"]["peak"] == 1 and hour["H100"]["mean"] == 0.5
 
 
 def test_page_data_shares_concurrency_across_branches():
