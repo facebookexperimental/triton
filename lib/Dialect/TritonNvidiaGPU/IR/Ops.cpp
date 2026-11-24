@@ -922,8 +922,13 @@ TypedValue<MemDescType> WaitBarrierOp::getBarrier() { return getAlloc(); }
 LogicalResult ArriveBarrierOp::verify() {
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
-  if (getPerWarp() && gpu::lookupNumWarps(*this) <= 1)
-    return emitOpError("per_warp requires multiple warps");
+  // Frontends can set per_warp before the op is placed under a warp count, so
+  // only check it once the count is known.
+  if (getPerWarp()) {
+    std::optional<int> numWarps = gpu::maybeLookupNumWarps(*this);
+    if (numWarps && *numWarps <= 1)
+      return emitOpError("per_warp requires multiple warps");
+  }
   if (isMulticast()) {
     if (getPerThread())
       return emitOpError("multicast arrive does not support perThread");
@@ -2312,7 +2317,7 @@ static LogicalResult verifyScaledLHSOperand(Operation *op, Type elementType,
   }
 
   if (aType == ScaleDotElemType::E2M1) {
-    if (!elementType.isInteger(8))
+    if (!elementType.isInteger(8) && !isa<PackedFloat4E2M1Type>(elementType))
       return op->emitOpError("expected e2m1 LHS operand to have i8 storage");
     if (encoding.getFp4Padded() &&
         !llvm::is_contained({ScaleDotElemType::E4M3, ScaleDotElemType::E5M2},
@@ -2946,7 +2951,7 @@ LogicalResult TMEMCopyOp::verify() {
       return emitOpError("Source layout should be swizzled.");
     }
     // When we lift this, we should make sure we handle unpacked cleanly
-    if (srcTy.getElementType().getIntOrFloatBitWidth() != 32) {
+    if (getIntOrFloatOrPtrBitWidth(srcTy.getElementType()) != 32) {
       return emitOpError("Source element type should be 32-bit.");
     }
     auto tmemLl = toLinearLayout(dstTy);
@@ -3009,14 +3014,6 @@ LogicalResult TMEMSubSliceOp::verify() {
         dstTmemEncoding.getColStride() != encoding.getColStride())
       return emitOpError("The destination must have the same block size and "
                          "CTASplit size as the source.");
-    // A BLOCK_M=64 2-CTA accumulator keeps the right half of each blockN
-    // block in TMEM rows 64-127, so only whole blockN blocks are column
-    // ranges of the buffer.
-    if (encoding.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS &&
-        (dstTy.getShape().back() % encoding.getBlockN() != 0 ||
-         getOffset() % encoding.getBlockN() != 0))
-      return emitOpError("cannot take an N subslice of a two-CTA (twocta_rhs) "
-                         "accumulator");
   } else if (auto scaleEncoding =
                  dyn_cast<TensorMemoryScalesEncodingAttr>(srcEncoding)) {
     auto dstScaleEncoding =
@@ -3062,6 +3059,16 @@ LogicalResult TMEMSubSliceOp::verify() {
   if (offset < 0 || int64_t(offset) + dstShape[sliceDim] > srcShape[sliceDim]) {
     return emitError("The split offset may not exceed the source shape");
   }
+  // A BLOCK_M=64 2-CTA accumulator keeps the right half of each blockN block
+  // in TMEM rows 64-127, so only whole blockN blocks are column ranges of the
+  // buffer.
+  if (auto encoding = dyn_cast<TensorMemoryEncodingAttr>(srcEncoding);
+      encoding && encoding.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS &&
+      sliceDim == srcTy.getRank() - 1 &&
+      (dstShape[sliceDim] % encoding.getBlockN() != 0 ||
+       offset % encoding.getBlockN() != 0))
+    return emitOpError("cannot take an N subslice of a two-CTA (twocta_rhs) "
+                       "accumulator");
 
   if (isa<triton::tlx::DummyTMEMLayoutAttr>(srcEncoding))
     return success();

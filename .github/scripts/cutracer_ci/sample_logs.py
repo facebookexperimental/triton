@@ -18,6 +18,14 @@ child process output may be interleaved
 ========= Target application returned an error
 ========= RACECHECK SUMMARY: 7 hazards displayed (6 errors, 1 warning)
 """
+# CUDA 13 prints no "in file:line" for a kernel built without line info.
+RACECHECK_HAZARD_NO_LINE_INFO = """\
+========= COMPUTE-SANITIZER
+========= Error: Race reported between Read access at kernel_a+0x5960
+=========     and Write access at kernel_a+0x2340 [116 hazards]
+=========
+========= RACECHECK SUMMARY: 1 hazard displayed (1 error, 0 warnings)
+"""
 RACECHECK_CLEAN = """\
 ========= COMPUTE-SANITIZER
 7 passed in 5.01s

@@ -472,3 +472,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 }
+
+// A pipeline-dim slice of a two-CTA BLOCK_M=64 accumulator is not an N slice.
+#tmem_2cta_rhs = #ttng.tensor_memory_encoding<blockM = 64, blockN = 256, colStride = 1, twoCTAs = true, ctaMode = twocta_rhs>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-LABEL: @tmem_subslice_twocta_rhs_stage
+  // CHECK: ttng.tmem_subslice %{{.+}} {dim = 0 : i32, offset = 1 : i32}
+  tt.func @tmem_subslice_twocta_rhs_stage(%arg0: !ttg.memdesc<2x64x256xf32, #tmem_2cta_rhs, #ttng.tensor_memory, mutable>) {
+    %sub = ttng.tmem_subslice %arg0 {offset = 1 : i32, dim = 0 : i32} : !ttg.memdesc<2x64x256xf32, #tmem_2cta_rhs, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x64x256xf32, #tmem_2cta_rhs, #ttng.tensor_memory, mutable, 2x64x256>
+    tt.return
+  }
+}

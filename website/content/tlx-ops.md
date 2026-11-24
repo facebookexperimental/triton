@@ -37,8 +37,8 @@ Implemented today:
 ```
 mm/sm100.py
 mm_bias_grad/sm100.py
-mm_mxfp8/sm100.py
-mm_mxfp8/gfx1250.py
+mm_mxfp/sm100.py
+mm_mxfp/gfx1250.py
 mm_mxfp6/sm100.py
 mm_mxfp6/gfx950.py
 grouped_gemm/gfx1250.py
@@ -59,7 +59,7 @@ Current kernel selections for the rest of the catalog:
 kernels/
     mm/                   sm90.py  sm100.py  gfx942.py  gfx950.py
     mm_bias_grad/         sm100.py
-    mm_mxfp8/             sm100.py  gfx950.py  gfx1250.py
+    mm_mxfp/              sm100.py  gfx950.py  gfx1250.py
     mm_mxfp6/             sm100.py  gfx950.py
     addmm/                gfx942.py
     bmm/                  gfx942.py
@@ -72,6 +72,7 @@ kernels/
     kda/                  sm100.py
     gdpa/                 sm100.py  gfx950.py
     grouped_gemm/         sm100.py  gfx950.py  gfx1250.py
+    grouped_gemm_mxfp/    gfx1250.py
     grouped_gemm_mxfp8/   sm100.py  gfx950.py
     addmm_glu/            gfx950.py
     paged_decode/         gfx950.py
@@ -157,7 +158,7 @@ Run them from `fbsource/fbcode`:
 CUDA_VISIBLE_DEVICES=1 buck2 run @mode/opt -m ovr_config//triton:beta \
   -c fbcode.nvcc_arch=b200a -m ovr_config//third-party/cuda/constraints:12.8 \
   --agent-context direct_call=true --agent-context reason="Check fused weight and bias gradients" \
-  fbsource//third-party/triton/beta/triton:py_tlx_mm_bias_grad_test -- -s --tb=short -v
+  fbsource//third-party/triton/beta/triton:py_tlx_ops_blackwell_test -- -s --tb=short -v
 ```
 
 ### Benchmark against unfused PT2
@@ -258,19 +259,23 @@ configuration for this shape; the large-K policy uses
 ordinary-launch autotuning. All reports retain the selected configurations,
 individual timing samples and compiler diagnostics.
 
-## MXFP8 GEMM
+## MXFP GEMM
 
 ```python
-out = triton.tlx.ops.mm_mxfp8(a, a_scale, b, b_scale, out=None, sf_layout="natural", space="full")
+out = triton.tlx.ops.mm_mxfp(a, a_scale, b, b_scale, a_dtype="e4m3", b_dtype="e4m3", out=None, sf_layout="natural",
+                             space="full")
 ```
 
+`a_dtype` and `b_dtype` name the MX element formats; every backend supports
+only `"e4m3"` today, and other formats raise `UnsupportedOp`.
 Computes `a @ b.T` from contiguous E4M3 `a` `[M, K]` and `b` `[N, K]` with one
 E8M0 scale per 32 K values, returning contiguous BF16 `[M, N]`. `M`, `N` and
 `K` must be multiples of 128. This is a forward-only SM100 operation promoted
 from `tutorials/blackwell_gemm_ws_mxfp8.py`.
 On gfx1250, `M` and `N` must be multiples of 256 and `K` at least 256; that
-implementation is promoted from `tutorials/amd_mxfp_gemm_gfx1250` and has one
-shape-picked schedule, so `space="full"` and `"heuristic"` are the same.
+implementation has one shape-picked schedule, so `space="full"` and
+`"heuristic"` are the same. Its module also holds the general TDM-pipelined
+MXFP kernel (see the gfx1250 page).
 
 - `sf_layout="natural"`: `a_scale` is `[M, K // 32]` and `b_scale` is
   `[N, K // 32]`; they are packed into the blocked layout on every call.
@@ -298,7 +303,7 @@ Computes `a @ b.T` from contiguous dense-packed E2M3 `a` `[M, K]` and E3M2 `b`
 to the unpacked width) with one E8M0 scale per 32 K values, returning contiguous BF16 `[M, N]`.
 `M`, `N` and `K` must be multiples of 128. This is a forward-only operation
 with one registered backend: on SM100 it is mirrored from
-`kernels/mm_mxfp8/sm100.py` with the `mxf8f6f4` MMA kind. A gfx950
+`kernels/mm_mxfp/sm100.py` with the `mxf8f6f4` MMA kind. A gfx950
 decompose backend exists in `kernels/mm_mxfp6/gfx950.py` but is not
 registered yet (numerics are not correct at this revision), so MI350
 callers get `UnsupportedOp` instead of silent wrong results.

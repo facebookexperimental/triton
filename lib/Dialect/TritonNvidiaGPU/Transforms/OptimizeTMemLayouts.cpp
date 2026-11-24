@@ -8,6 +8,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
 
 namespace ttg = mlir::triton::gpu;
 
@@ -17,6 +18,85 @@ namespace nvidia_gpu {
 
 #define GEN_PASS_DEF_TRITONNVIDIAGPUOPTIMIZETMEMLAYOUTSPASS
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
+
+// Strip away all intermediate ttg.convert_layout ops to reach the true
+// producer, collecting them into `cvts`.
+static Value stripConvertLayout(Value v,
+                                SmallVectorImpl<ttg::ConvertLayoutOp> &cvts) {
+  while (auto cvt = v.getDefiningOp<ttg::ConvertLayoutOp>()) {
+    cvts.push_back(cvt);
+    v = cvt.getSrc();
+  }
+  return v;
+}
+
+// The TMEM encoding a split chain loads from: its tmem_load's, or for a nested
+// split, the encoding of the tmem_load the outer chains start from (their
+// subslices keep the source's TwoCTA_RHS mode and do not grow blockN).
+static TensorMemoryEncodingAttr getSplitChainTMemEncoding(Value reshapeSrc) {
+  SmallVector<ttg::ConvertLayoutOp> cvts;
+  for (int depth = 0; depth < 4; ++depth) {
+    if (auto load = reshapeSrc.getDefiningOp<TMEMLoadOp>())
+      return dyn_cast<TensorMemoryEncodingAttr>(
+          load.getSrc().getType().getEncoding());
+    auto split = reshapeSrc.getDefiningOp<SplitOp>();
+    auto trans =
+        split
+            ? stripConvertLayout(split.getSrc(), cvts).getDefiningOp<TransOp>()
+            : TransOp();
+    auto reshape =
+        trans ? trans.getSrc().getDefiningOp<ReshapeOp>() : ReshapeOp();
+    if (!reshape)
+      return {};
+    reshapeSrc = stripConvertLayout(reshape.getSrc(), cvts);
+  }
+  return {};
+}
+
+std::optional<TMemSplitLoadMatch> matchTMemSplitLoad(SplitOp splitOp) {
+  TMemSplitLoadMatch match;
+  // Starting from the split source, peel off convert_layouts if any.
+  Value src = stripConvertLayout(splitOp.getSrc(), match.cvts);
+  match.trans = src.getDefiningOp<TransOp>();
+  if (!match.trans || match.trans.getOrder() != ArrayRef<int>({0, 2, 1}))
+    return std::nullopt;
+  match.reshape = match.trans.getSrc().getDefiningOp<ReshapeOp>();
+  if (!match.reshape)
+    return std::nullopt;
+
+  // Peel off convert_layouts *below* the reshape as well.  This is required
+  // for the recursive case where the producer of the reshape is the result
+  // of an earlier optimisation pass (i.e. a convert_layout of a previous
+  // tmem_load).
+  match.reshapeSrc = stripConvertLayout(match.reshape.getSrc(), match.cvts);
+  auto shape = match.reshape.getResult().getType().getShape();
+  // Ensure M dimension is preserved by the reshape.
+  if (shape[0] !=
+      cast<RankedTensorType>(match.reshapeSrc.getType()).getShape()[0])
+    return std::nullopt;
+  match.splitNSize = shape[2];
+  if (match.splitNSize < 8)
+    return std::nullopt;
+  match.tmemLoad = match.reshapeSrc.getDefiningOp<TMEMLoadOp>();
+  if (match.tmemLoad) {
+    int mDim = getShapePerCTA(match.tmemLoad.getSrc().getType())[0];
+    if (mDim != 64 && mDim != 128)
+      return std::nullopt;
+  }
+  // A TwoCTA_RHS slice narrower than blockN is not a column window (see
+  // TMEMSubSliceOp::verify); the split stays in registers. A nested split is
+  // checked too, so callers matching it before the outer rewrite agree.
+  auto tmemEnc = getSplitChainTMemEncoding(match.reshapeSrc);
+  if (tmemEnc && tmemEnc.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS &&
+      match.splitNSize % tmemEnc.getBlockN() != 0)
+    return std::nullopt;
+  return match;
+}
+
+bool isTMemSplitLoadNumWarps(int numWarps) {
+  // The TMEM load-layout helper needs a power-of-two warp count >= 4.
+  return numWarps >= 4 && llvm::isPowerOf2_32(numWarps);
+}
 
 namespace {
 
@@ -49,13 +129,6 @@ namespace {
 // subslices.
 //
 // clang-format on
-// Strip away all intermediate ttg.convert_layout ops to reach the true
-// producer.
-static Value stripConvertLayout(Value v) {
-  while (auto cvt = v.getDefiningOp<ttg::ConvertLayoutOp>())
-    v = cvt.getSrc();
-  return v;
-}
 
 class TMemSplitLoadPattern : public OpRewritePattern<SplitOp> {
 public:
@@ -75,47 +148,16 @@ public:
     //        |       |        +-- tmemLoad
     // -----------------------------------------------------------------------
 
-    // Starting from the split source, peel off convert_layouts if any.
-    Value src = stripConvertLayout(splitOp.getSrc());
-    auto transOp = src.getDefiningOp<TransOp>();
-    if (!transOp || transOp.getOrder() != ArrayRef<int>({0, 2, 1}))
+    auto match = matchTMemSplitLoad(splitOp);
+    if (!match || !match->tmemLoad)
       return failure();
-    auto reshapeOp = transOp.getSrc().getDefiningOp<ReshapeOp>();
-    if (!reshapeOp)
-      return failure();
-
-    // Peel off convert_layouts *below* the reshape as well.  This is required
-    // for the recursive case where the producer of the reshape is the result
-    // of an earlier optimisation pass (i.e. a convert_layout of a previous
-    // tmem_load).
-    Value reshapeSrc = stripConvertLayout(reshapeOp.getSrc());
-    auto tmemLoad = reshapeSrc.getDefiningOp<TMEMLoadOp>();
-    if (!tmemLoad)
-      return failure();
-
-    auto shape = reshapeOp.getResult().getType().getShape();
-    // Ensure M dimension is preserved by the reshape.
-    if (shape[0] != cast<RankedTensorType>(reshapeSrc.getType()).getShape()[0])
-      return failure();
-    int mDim = getShapePerCTA(tmemLoad.getSrc().getType())[0];
-    if (mDim != 64 && mDim != 128)
-      return failure();
-    int splitNSize = shape[2];
-    // A TwoCTA_RHS slice narrower than blockN is not a column window (see
-    // TMEMSubSliceOp::verify); split in registers instead.
-    auto tmemEnc = dyn_cast<TensorMemoryEncodingAttr>(
-        tmemLoad.getSrc().getType().getEncoding());
-    if (tmemEnc && tmemEnc.getCtaMode() == TensorMemoryCTAMode::TwoCTA_RHS &&
-        splitNSize % tmemEnc.getBlockN() != 0)
-      return failure();
-    if (splitNSize < 8)
-      return failure();
+    TMEMLoadOp tmemLoad = match->tmemLoad;
+    int splitNSize = match->splitNSize;
 
     // Create the two TMEM subslices and their corresponding loads.
     Value tmem = tmemLoad.getSrc(); // Could itself be a subslice.
     int numWarps = ttg::lookupNumWarps(tmemLoad);
-    // The TMEM load-layout helper needs a power-of-two warp count >= 4.
-    if (numWarps < 4 || !llvm::isPowerOf2_32(numWarps))
+    if (!isTMemSplitLoadNumWarps(numWarps))
       return failure();
     rewriter.setInsertionPoint(tmemLoad);
 

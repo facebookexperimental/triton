@@ -44,6 +44,10 @@ void init_triton_passes_common(py::module_ &m) {
 
 void init_triton_passes_ttir(py::module_ &m) {
   using namespace mlir::triton;
+  ADD_PASS_OPTION_WRAPPER_7("add_materialize_stochastic_rounding",
+                            createTritonMaterializeStochasticRounding,
+                            const std::string &, const std::string &, int, int,
+                            int, const std::string &, const std::string &);
   ADD_PASS_WRAPPER_0("add_combine", createTritonCombineOps);
   ADD_PASS_WRAPPER_0("add_reorder_broadcast", createTritonReorderBroadcast);
   ADD_PASS_WRAPPER_0("add_rewrite_tensor_descriptor_to_pointer",
