@@ -1355,6 +1355,8 @@ class CUDABackend(BaseBackend):
 
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
         passes.ttgpuir.add_allocate_warp_groups(pm, is_enabled(options, "consan"))
+        # Must run on structured IR: TMA store token-wait lowering runs after scf-to-cf.
+        nvidia.passes.hopper.add_tma_store_token_wait_annotate_pendings(pm)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
         if is_enabled(options, "consan"):

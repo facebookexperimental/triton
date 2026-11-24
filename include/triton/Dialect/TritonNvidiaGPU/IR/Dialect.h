@@ -86,6 +86,10 @@ unsigned getPackedArithFp4Axis(PackedArithOp op);
 constexpr static char AttrTwoCTAsName[] = "ttng.two-ctas";
 constexpr static char AttrTwoCTALoadName[] = "two_cta_load";
 constexpr static char kPlannedPendingCount[] = "planned_pending_count";
+// Program-order pendings of a TMAStoreTokenWaitOp, recorded on structured IR
+// before scf-to-cf (where loop-carried tokens can no longer be traced).
+constexpr static char kProgramOrderPendingCount[] =
+    "program_order_pending_count";
 // tcgen05.mma collector usage for operand A ("fill" / "use" / "lastuse"), set
 // by the MMA collector reuse pass on single-instruction MMAs.
 constexpr static char kCollectorAAttrName[] = "ttng.collector_a";
