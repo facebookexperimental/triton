@@ -106,7 +106,7 @@ def test_gemm_fixed_split_k():
 def test_vocabularies():
     assert invariant_vocab_for("mm") == GEMM_VOCAB
     assert invariant_vocab_for("addmm") == GEMM_VOCAB
-    assert invariant_vocab_for("mm_mxfp8") == GEMM_VOCAB
+    assert invariant_vocab_for("mm_mxfp") == GEMM_VOCAB
     assert invariant_vocab_for("flash_attn") == frozenset({"B", "H", "SQ", "SKV", "D"})
     assert invariant_vocab_for("flash_attn_mxfp8") == frozenset({"B", "H", "SQ", "SKV", "D"})
     assert invariant_vocab_for("flash_attn_varlen") == frozenset({"TQ", "TKV", "H", "D"})
