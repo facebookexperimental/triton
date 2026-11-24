@@ -314,7 +314,7 @@ def _fp8_inputs(m, *, d=256, i=256, h=256, e=4, topk=2, seed=0):
     return x, weights.softmax(1), ids.to(torch.int32), w13, w2
 
 
-def _fp8_reference(x, weights, ids, w13, w2, scales=FP8_SCALES, expert_start=0):
+def _fp8_reference(x, weights, ids, w13, w2, scales=FP8_SCALES, expert_start=0, round_division=True):
     """Independent native FP8 GEMMs; preserve the API's BF16 and slot-order boundaries."""
     m, topk = ids.shape
     e, two_i, _ = w13.shape
@@ -334,7 +334,11 @@ def _fp8_reference(x, weights, ids, w13, w2, scales=FP8_SCALES, expert_start=0):
         if not token.numel():
             continue
         gu = mm(x.float()[token].to(x.dtype), w13[expert], sx, sw13)
-        hidden = (torch.nn.functional.silu(gu[:, :i]) * gu[:, i:] / sh).to(x.dtype)
+        hidden = torch.nn.functional.silu(gu[:, :i]) * gu[:, i:]
+        # The kernel uses gl.div_rn. Scalar torch division can multiply by a
+        # rounded reciprocal, changing an FP8 tie for non-power-of-two scales.
+        # Evaluate the quotient in FP64, then round to the declared FP32 point.
+        hidden = ((hidden.double() / sh).float() if round_division else hidden / sh).to(x.dtype)
         y = mm(hidden, w2[expert], sh, sw2).to(torch.bfloat16).float()
         expert_output[token, slot] = y
     output = torch.zeros(m, h, device=x.device)
@@ -355,7 +359,8 @@ def test_catalog_entry_fp8_gfx1250():
 
 
 @requires_gfx1250
-@pytest.mark.parametrize("m", [0, 1, 17, 63, 64, 65, 127, 128, 129, 511, 512, 513, 2048, 8192])
+@pytest.mark.parametrize(
+    "m", [0, 1, 17, 63, 64, 65, 127, 128, 129, 511, 512, 513, 2047, 2048, 2049, 4095, 4096, 4097, 8191, 8192])
 @pytest.mark.parametrize("topk", [2, 4])
 def test_fp8_public_matches_reference(m, topk):
     x, weights, ids, w13, w2 = _fp8_inputs(m, topk=topk)
@@ -400,18 +405,19 @@ def test_fp8_public_dimensions(dims):
 
 @requires_gfx1250
 @pytest.mark.parametrize("sh", [.0625, .09375])
-def test_fp8_public_graph_changed_inputs_and_weights(sh):
-    values = _fp8_inputs(129)
+@pytest.mark.parametrize("m", [129, 4096, 8192, 16384])
+def test_fp8_public_graph_changed_inputs_and_weights(sh, m):
+    values = _fp8_inputs(m)
     x, weights, ids, w13, w2 = values
     scales = (.5, .25, sh, .125)
-    out = torch.empty(129, 256, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(m, 256, device="cuda", dtype=torch.bfloat16)
     for _ in range(3):
         tlx_moe(*values, fp8_scales=scales, out=out)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         result = tlx_moe(*values, fp8_scales=scales, out=out)
     for seed in [101, 509, 701, 907]:
-        for dst, src in zip(values, _fp8_inputs(129, seed=seed)):
+        for dst, src in zip(values, _fp8_inputs(m, seed=seed)):
             dst.copy_(src)
         if seed == 509:
             ids[::2] = -1
@@ -470,3 +476,51 @@ def test_fp8_public_registered_shapes(shape):
     assert norm is None
     got = tlx_moe(x, weights, ids, w13, w2, fp8_scales=FP8_SCALES)
     assert torch.equal(got, _fp8_reference(x, weights, ids, w13, w2))
+
+
+@requires_gfx1250
+@pytest.mark.parametrize("m,topk,experts", [(4095, 2, 4), (4096, 2, 4), (4097, 2, 4), (8191, 2, 4), (8192, 2, 4),
+                                            (8193, 2, 4), (16384, 2, 4), (2047, 4, 8), (2048, 4, 8), (2049, 4, 8),
+                                            (4096, 2, 1), (4096, 2, 3), (8192, 2, 8), (8192, 2, 16)])
+@pytest.mark.parametrize("pattern", ["random", "remote", "mixed", "duplicate"])
+def test_fp8_large_routing_metadata(m, topk, experts, pattern):
+    """Stable grouping, full gather padding and tile maps against a CPU specification."""
+    from triton.tlx.ops.kernels.moe import gfx1250
+    gen = torch.Generator().manual_seed(31 + m + experts)
+    ids = torch.randint(experts, (m, topk), generator=gen, dtype=torch.int64)
+    if pattern == "remote":
+        ids.fill_(-1)
+    elif pattern == "mixed":
+        ids[::2] = (1 << 32) + 8
+        ids[1::3] = -(1 << 63)
+    elif pattern == "duplicate":
+        ids.zero_()
+    # Nonnegative local IDs shift by 8; sentinels must retain their original meaning.
+    local = (ids >= 0) & (ids < experts)
+    ids[local] += 8
+    r = ids.numel()
+    pad, cap = triton.cdiv(r, 64) * 64 + 64, triton.cdiv(r, 64) + experts
+    expected_gather = torch.zeros(pad, dtype=torch.int32)
+    expected_inverse = torch.full((r, ), -1, dtype=torch.int32)
+    expected_tiles = torch.full((cap + 1, 4), -1, dtype=torch.int32)
+    start = tile = 0
+    for e in range(experts):
+        selected = torch.where(ids.flatten() == e + 8)[0]
+        count = len(selected)
+        expected_gather[start:start + count] = (selected // topk).int()
+        expected_inverse[selected] = torch.arange(start, start + count, dtype=torch.int32)
+        for first in range(0, count, 64):
+            expected_tiles[tile] = torch.tensor([e, start, count, first])
+            tile += 1
+        start += count
+    expected_tiles[cap, 0] = start
+    ids = ids.cuda()
+    gather = torch.full((pad, ), -777, device="cuda", dtype=torch.int32)
+    inverse = torch.full((r, ), -777, device="cuda", dtype=torch.int32)
+    tiles = torch.full((cap + 1, 4), -777, device="cuda", dtype=torch.int32)
+    gfx1250._chunked_routes(ids, gather, inverse, tiles, experts, 8, chunk_size=128 if r <= 16384 else 256)
+    assert torch.equal(gather.cpu(), expected_gather)
+    assert torch.equal(inverse.cpu(), expected_inverse)
+    actual_tiles = tiles.cpu()
+    assert torch.equal(actual_tiles[:tile], expected_tiles[:tile])
+    assert torch.equal(actual_tiles[tile:, 0], expected_tiles[tile:, 0])

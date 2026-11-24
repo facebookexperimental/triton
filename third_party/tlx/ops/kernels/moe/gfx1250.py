@@ -56,6 +56,78 @@ def _route(Ids, Gather, Inverse, Tiles, R: tl.constexpr, TOPK: tl.constexpr, E: 
         tl.store(Tiles + tiles * 4, -1, tail)
 
 
+@triton.jit
+def _route_counts(Ids, Counts, R: tl.constexpr, E: tl.constexpr, START: tl.constexpr, BLOCK: tl.constexpr,
+                  HIST: tl.constexpr):
+    chunk = tl.program_id(0)
+    slots = chunk * BLOCK + tl.arange(0, BLOCK)
+    ids = tl.load(Ids + slots, slots < R, other=-1).to(tl.int64) - START
+    local = (slots < R) & (ids >= 0) & (ids < E)
+    hist = tl.histogram(tl.where(local, ids, E).to(tl.int32), HIST)
+    experts = tl.arange(0, HIST)
+    tl.store(Counts + chunk * HIST + experts, hist)
+
+
+@triton.jit
+def _route_scatter(Ids, Counts, Gather, Inverse, Tiles, R: tl.constexpr, TOPK: tl.constexpr, E: tl.constexpr,
+                   START: tl.constexpr, PAD: tl.constexpr, CAP: tl.constexpr, BLOCK: tl.constexpr, HIST: tl.constexpr,
+                   CHUNKS: tl.constexpr, CHUNK_BLOCK: tl.constexpr, TILE_BLOCK: tl.constexpr):
+    chunk = tl.program_id(0)
+    expert = tl.program_id(1)
+    chunks = tl.arange(0, CHUNK_BLOCK)
+    experts = tl.arange(0, HIST)
+    counts = tl.load(Counts + chunks[:, None] * HIST + experts[None, :], chunks[:, None] < CHUNKS, other=0)
+    hist = tl.sum(counts, axis=0)
+    start = tl.sum(tl.where(experts < expert, hist, 0))
+    total = tl.sum(tl.where(experts < E, hist, 0))
+    count = tl.sum(tl.where(experts == expert, hist, 0))
+    chunk_prefix = tl.sum(tl.sum(tl.where((chunks[:, None] < chunk) & (experts[None, :] == expert), counts, 0), axis=0),
+                          axis=0)
+    slots = chunk * BLOCK + tl.arange(0, BLOCK)
+    ids = tl.load(Ids + slots, slots < R, other=-1).to(tl.int64) - START
+    local = (slots < R) & (ids >= 0) & (ids < E)
+    mask = local & (ids == expert)
+    within = tl.cumsum(mask.to(tl.int32)) - 1
+    row = start + chunk_prefix + within
+    tl.store(Gather + row, slots // TOPK, mask)
+    tl.store(Inverse + slots, row, mask)
+    if expert == 0:
+        tl.store(Inverse + slots, -1, (slots < R) & ~local)
+        # Cover padding in parallel, including the extra gather tile.
+        rows = chunk * BLOCK + tl.arange(0, BLOCK)
+        tl.store(Gather + rows, 0, (rows >= total) & (rows < PAD))
+        if chunk == CHUNKS - 1:
+            tail_rows = CHUNKS * BLOCK + tl.arange(0, BLOCK)
+            tl.store(Gather + tail_rows, 0, (tail_rows >= total) & (tail_rows < PAD))
+            tl.store(Tiles + CAP * 4, total)
+    if chunk == 0:
+        blocks = tl.cdiv(hist, 64)
+        tile_start = tl.sum(tl.where(experts < expert, blocks, 0))
+        tile_total = tl.sum(tl.where(experts < E, blocks, 0))
+        tiles = tl.arange(0, TILE_BLOCK)
+        valid = tiles < tl.cdiv(count, 64)
+        base = Tiles + (tile_start + tiles) * 4
+        tl.store(base, expert, valid)
+        tl.store(base + 1, start, valid)
+        tl.store(base + 2, count, valid)
+        tl.store(base + 3, tiles * 64, valid)
+        if expert == 0:
+            tl.store(Tiles + tiles * 4, -1, (tiles >= tile_total) & (tiles < CAP))
+
+
+def _chunked_routes(ids, gather, inverse, tiles, experts, expert_start, *, chunk_size=128):
+    """Stable expert grouping: chunk histograms, then prefix-based scatter without atomics."""
+    routes = ids.numel()
+    hist = triton.next_power_of_2(experts + 1)
+    chunks = triton.cdiv(routes, chunk_size)
+    counts = torch.empty((chunks, hist), device=ids.device, dtype=torch.int32)
+    _route_counts[(chunks, )](ids, counts, routes, experts, expert_start, chunk_size, hist, num_warps=4)
+    cap = tiles.shape[0] - 1
+    _route_scatter[(chunks, experts)](ids, counts, gather, inverse, tiles, routes, ids.shape[1], experts, expert_start,
+                                      gather.numel(), cap, chunk_size, hist, chunks, triton.next_power_of_2(chunks),
+                                      triton.next_power_of_2(cap), num_warps=4)
+
+
 @gluon.jit
 def _loads(XDesc, WDesc, XBuf, WBuf, GatherRows, Index, PRED, GATHER: gl.constexpr):
     if GATHER:
@@ -173,8 +245,15 @@ def moe(x, weights, ids, w13, w2, *, expert_start, fp8_scales, out):
     gather = torch.empty(pad, device=x.device, dtype=torch.int32)
     inverse = torch.empty(routes, device=x.device, dtype=torch.int32)
     tiles = torch.empty((cap + 1, 4), device=x.device, dtype=torch.int32)
-    _route[(e, )](ids, gather, inverse, tiles, routes, topk, e, expert_start, pad, cap, triton.next_power_of_2(routes),
-                  triton.next_power_of_2(e + 1), triton.next_power_of_2(cap), num_warps=4)
+    if routes >= 8192:
+        # The extra launch pays off from 8192 route slots. Smaller chunks bound
+        # prefix-scan state; larger expert/count tables favor 256-slot chunks.
+        _chunked_routes(ids, gather, inverse, tiles, e, expert_start, chunk_size=256 if
+                        (routes > 16384 or e > 8 or (e == 8 and routes >= 16384)) else 128)
+    else:
+        _route[(e, )](ids, gather, inverse, tiles, routes, topk, e, expert_start, pad, cap,
+                      triton.next_power_of_2(routes), triton.next_power_of_2(e + 1), triton.next_power_of_2(cap),
+                      num_warps=4)
     # Gate/up pairs share an epilogue lane; byte permutation preserves FP8 payloads.
     interleaved = (w13.view(torch.uint8).reshape(e, 2, i,
                                                  d).transpose(1, 2).contiguous().reshape(e, two_i,
