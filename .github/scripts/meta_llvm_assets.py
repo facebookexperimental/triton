@@ -1,5 +1,16 @@
 import json
 import subprocess
+import hashlib
+
+
+def read_json_asset(repo, asset):
+    if asset.get("state") != "uploaded" or asset.get("size", 0) <= 0:
+        raise ValueError(f"{asset['name']}: asset is not completely uploaded")
+    content = subprocess.check_output(
+        ["gh", "api", f"repos/{repo}/releases/assets/{asset['id']}", "-H", "Accept: application/octet-stream"])
+    if asset.get("digest") != "sha256:" + hashlib.sha256(content).hexdigest():
+        raise ValueError(f"{asset['name']}: asset digest differs")
+    return json.loads(content)
 
 
 def github_json(path, *, missing_ok=False, paginate=False, method=None):

@@ -14,30 +14,30 @@ FORK = "facebookexperimental/llvm-project"
 BUILD_NUMBER = 1
 
 
-def source_digest(kind, sha, tree):
+def source_digest(kind, sha, tree, build=BUILD_NUMBER):
     source = {
         "schema_version": 1,
         "kind": kind,
         "llvm_repository": FORK,
         "llvm_sha": sha,
         "llvm_tree": tree,
-        "build_number": BUILD_NUMBER,
+        "build_number": build,
     }
     content = json.dumps(source, sort_keys=True, separators=(",", ":")) + "\n"
     return "sha256:" + hashlib.sha256(content.encode()).hexdigest()
 
 
-def bundle_complete(kind, sha, tree, assets, platforms):
+def bundle_complete(kind, sha, tree, assets, platforms, build=BUILD_NUMBER):
     prefix = "llvm" if kind == "core" else "amd-llvm"
     stem = f"{prefix}-{sha[:8]}"
-    source_name = f"{stem}-{BUILD_NUMBER}.source.json"
+    source_name = f"{stem}-{build}.source.json"
     source = assets.get(source_name)
     if source is None:
         return False
-    if source.get("digest") != source_digest(kind, sha, tree):
+    if source.get("digest") != source_digest(kind, sha, tree, build):
         raise ValueError(f"{source_name}: published LLVM source provenance differs")
     for platform in platforms:
-        name = f"{stem}-{platform}-{BUILD_NUMBER}.tar.gz"
+        name = f"{stem}-{platform}-{build}.tar.gz"
         archive = assets.get(name)
         checksum = assets.get(f"{name}.sha256")
         if archive is None or checksum is None:
@@ -79,9 +79,22 @@ def main():
     repo = os.environ["GITHUB_REPOSITORY"]
     _, assets = release_assets(repo, "meta-llvm")
     requests = branch_requests(tips, assets, platforms)
+    from meta_llvm_ready import ready_receipt
+    published = published_assets(assets)
+    requested = {request['kind'] for request in requests}
+    for selected_kind, tip in tips.items():
+        if selected_kind not in requested and ready_receipt(repo, selected_kind, tip['sha'],
+                                                            tip['commit']['tree']['sha'], BUILD_NUMBER, published,
+                                                            platforms) is None:
+            requests.append({'kind': selected_kind, 'llvm_sha': tip['sha'], 'build_number': str(BUILD_NUMBER)})
+    candidates = [{
+        'kind': selected_kind, 'llvm_sha': tip['sha'], 'llvm_tree': tip['commit']['tree']['sha'], 'build_number':
+        str(BUILD_NUMBER)
+    } for selected_kind, tip in tips.items()]
     print(json.dumps(requests))
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write("requests=" + json.dumps(requests) + "\n")
+        output.write("candidates=" + json.dumps(candidates) + "\n")
 
 
 if __name__ == "__main__":

@@ -58,6 +58,7 @@ jobs:
       short_sha: ${{ steps.revision.outputs.short_sha }}
       prefix: ${{ steps.revision.outputs.prefix }}
       platforms: ${{ steps.missing.outputs.platforms }}
+      validation_platforms: ${{ steps.missing.outputs.validation_platforms }}
       repairs: ${{ steps.missing.outputs.repairs }}
       source_needed: ${{ steps.missing.outputs.source_needed }}
       source_json: ${{ steps.source.outputs.content }}
@@ -196,6 +197,12 @@ jobs:
               output.write('source_needed=' + str(source is None).lower() + '\n')
               output.write('platforms=' + json.dumps(platforms) + '\n')
               output.write('repairs=' + json.dumps(repairs) + '\n')
+              validation = []
+              for config in configs:
+                  name = f"{stem}-{config['target-os']}-{config['arch']}-{number}.tar.gz"
+                  digest = assets[name]['digest'] if name in assets else ''
+                  validation.append(dict(config, archive_digest=digest))
+              output.write('validation_platforms=' + json.dumps(validation) + '\n')
 
       - name: Define worker inputs
         id: build_call
@@ -235,16 +242,18 @@ jobs:
   validate:
     name: Validate ${{ matrix.config['target-os'] }}-${{ matrix.config.arch }} SDK
     needs: [prepare, build]
-    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.platforms != '[]' }}
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     runs-on: ${{ matrix.config.runs_on }}
     container: ${{ matrix.config.container }}
     strategy:
       fail-fast: false
       matrix:
-        config: ${{ fromJSON(needs.prepare.outputs.platforms) }}
+        config: ${{ fromJSON(needs.prepare.outputs.validation_platforms) }}
     env:
       LLVM_PACKAGE: ${{ needs.prepare.outputs.prefix }}
       LLVM_INSTALL_DIR: ${{ needs.prepare.outputs.prefix }}-${{ needs.prepare.outputs.short_sha }}-${{ matrix.config['target-os'] }}-${{ matrix.config.arch }}-${{ inputs.build_number }}
+      SOURCE_JSON: ${{ needs.prepare.outputs.source_json }}
+      SDK_PLATFORM: ${{ matrix.config['target-os'] }}-${{ matrix.config.arch }}
     steps:
       - name: Install validation toolchain on AlmaLinux
         if: matrix.config.target-os == 'almalinux'
@@ -274,11 +283,52 @@ jobs:
       - name: Install consumer build tools
         run: python3 -m pip install cmake ninja
 
-      - name: Download SDK
+      - name: Select SDK download source
+        id: sdk
+        env:
+          BUILD_PLATFORMS: ${{ needs.prepare.outputs.platforms }}
+          TARGET_OS: ${{ matrix.config['target-os'] }}
+          ARCH: ${{ matrix.config.arch }}
+        shell: 'python3 {0}'
+        run: |
+          import json, os
+          built = any(c['target-os'] == os.environ['TARGET_OS'] and c['arch'] == os.environ['ARCH']
+                      for c in json.loads(os.environ['BUILD_PLATFORMS']))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('built=' + str(built).lower() + '\n')
+
+      - name: Download new SDK
+        if: steps.sdk.outputs.built == 'true'
         uses: actions/download-artifact@v8.0.1
         with:
           name: ${{ needs.prepare.outputs.prefix }}-${{ matrix.config['target-os'] }}-${{ matrix.config.arch }}
           path: dist
+
+      - name: Download published SDK
+        if: steps.sdk.outputs.built != 'true'
+        shell: 'python3 {0}'
+        run: |
+          import os, shutil, urllib.request
+          from pathlib import Path
+          archive = os.environ['LLVM_INSTALL_DIR'] + '.tar.gz'
+          Path('dist').mkdir(exist_ok=True)
+          url = 'https://github.com/facebookexperimental/triton/releases/download/meta-llvm/' + archive
+          with urllib.request.urlopen(url, timeout=300) as response, open('dist/' + archive, 'wb') as output:
+              shutil.copyfileobj(response, output)
+
+      - name: Verify published SDK download
+        if: steps.sdk.outputs.built != 'true'
+        env:
+          ARCHIVE_DIGEST: ${{ matrix.config.archive_digest }}
+        shell: 'python3 {0}'
+        run: |
+          import hashlib, os
+          digest = hashlib.sha256()
+          with open('dist/' + os.environ['LLVM_INSTALL_DIR'] + '.tar.gz', 'rb') as file:
+              for block in iter(lambda: file.read(1024 * 1024), b''):
+                  digest.update(block)
+          if 'sha256:' + digest.hexdigest() != os.environ['ARCHIVE_DIGEST']:
+              raise RuntimeError('Published SDK download digest differs')
 
       - name: Check relocated SDK consumer
         shell: bash
@@ -288,17 +338,32 @@ jobs:
           bash "$GITHUB_WORKSPACE/.github/scripts/validate_llvm_sdk.sh"
           sha256sum "${LLVM_INSTALL_DIR}.tar.gz" > "${LLVM_INSTALL_DIR}.tar.gz.sha256"
 
+      - name: Record SDK validation provenance
+        shell: 'python3 {0}'
+        run: |
+          import json, os
+          from pathlib import Path
+          archive = os.environ['LLVM_INSTALL_DIR'] + '.tar.gz'
+          checksum = Path('dist/' + archive + '.sha256').read_text().split()[0]
+          record = {'schema_version': 1, 'source': json.loads(os.environ['SOURCE_JSON']),
+                    'platform': os.environ['SDK_PLATFORM'], 'sha256': checksum,
+                    'run': 'https://github.com/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID'],
+                    'attempt': int(os.environ['GITHUB_RUN_ATTEMPT']), 'workflow_sha': os.environ['GITHUB_SHA']}
+          Path('dist/' + archive + '.validation.json').write_text(json.dumps(record, sort_keys=True) + '\n')
+
       - name: Upload validation checksum
         uses: actions/upload-artifact@v7
         with:
           name: validated-${{ needs.prepare.outputs.prefix }}-${{ matrix.config['target-os'] }}-${{ matrix.config.arch }}
-          path: dist/*.tar.gz.sha256
+          path: |
+            dist/*.tar.gz.sha256
+            dist/*.validation.json
           retention-days: 7
 
   release:
     name: Publish GitHub Release
     needs: [prepare, build, validate]
-    if: ${{ inputs.publish && !cancelled() && needs.prepare.result == 'success' && (needs.prepare.outputs.platforms != '[]' || needs.prepare.outputs.repairs != '[]' || needs.prepare.outputs.source_needed == 'true') }}
+    if: ${{ inputs.publish && !cancelled() && needs.prepare.result == 'success' && needs.validate.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -309,7 +374,13 @@ jobs:
           path: .llvm-release
           ref: ${{ github.sha }}
           persist-credentials: false
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            .github/workflows
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
 
       - name: Download build archives
         if: needs.prepare.outputs.platforms != '[]'
@@ -320,7 +391,6 @@ jobs:
           merge-multiple: true
 
       - name: Download validation checksums
-        if: needs.prepare.outputs.platforms != '[]'
         uses: actions/download-artifact@v8.0.1
         with:
           pattern: validated-${{ needs.prepare.outputs.prefix }}-*
@@ -342,7 +412,8 @@ jobs:
           TRITON_SHA: ${{ github.sha }}
         shell: bash
         run: |
-          mkdir -p dist
+          mkdir -p dist validated
+          cp dist/*.tar.gz.sha256 dist/*.validation.json validated/
           while IFS=$'\t' read -r name digest; do
             printf '%s  %s\n' "${digest#sha256:}" "$name" > "dist/${name}.sha256"
           done < <(jq -r '.[] | [.name, .digest] | @tsv' <<< "$REPAIRS")
@@ -434,3 +505,14 @@ jobs:
             done
           done
           gh release view "$tag" --json url --jq '.url'
+
+      - name: Publish validated bundle completion record
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_JSON: ${{ needs.prepare.outputs.source_json }}
+          VALIDATED_DIR: ${{ github.workspace }}/validated
+        shell: bash
+        run: |
+          cd .llvm-release
+          python3 -m pip install PyYAML
+          python3 .github/scripts/meta_llvm_ready.py publish
