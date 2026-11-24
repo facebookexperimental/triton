@@ -391,6 +391,16 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset(),
     ),
     OpSpec(
+        op="moe",
+        arch="gfx1250",
+        variant="tdm_grouped",
+        impl="triton.tlx.ops.kernels.moe.gfx1250:moe",
+        dtypes=_BF16,
+        # Tiles have no K/N tail; BLOCK_K, 256-wide N tiles and the TDM ring shrink when they do not divide K, I or H.
+        accepts=lambda d: all(d[dim] > 0 and d[dim] % 128 == 0 for dim in ("K", "I", "H")),
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="moe_finalize",
         arch="sm100",
         variant="slot_tile",
