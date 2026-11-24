@@ -140,31 +140,41 @@ def test_flash_attn_varlen_mxfp8_default_fast_exp(lens_k, fast):
     torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
 
 
-def test_flash_attn_varlen_mxfp8_graph_capture_new_offsets():
-    """Offsets first seen while capturing a CUDA graph give the eager result
-    on replay."""
+@pytest.mark.parametrize("seen_before", [False, True])
+def test_flash_attn_varlen_mxfp8_graph_replay_follows_offsets(seen_before):
+    """A captured CUDA graph follows offsets that change in place between
+    replays, whether or not the capture is their first use, and leaves an
+    eager call made before its first replay correct."""
     from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
 
     torch.manual_seed(20)
     scale = 128**-0.5
+    first = ([64, 300, 200], [700, 90, 300])
+    second = ([200, 64, 300], [300, 700, 90])
+    q = torch.randn(sum(first[0]), 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(first[1]), 4, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
 
-    def inputs(lens_q, lens_k):
-        q = torch.randn(sum(lens_q), 4, 128, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(sum(lens_k), 4, 128, device="cuda", dtype=torch.bfloat16)
-        return q, k, torch.randn_like(k), _cu(lens_q), _cu(lens_k)
+    def check(out, lse):
+        ref, ref_lse = _reference(q, k, v, cu_q, cu_k, scale)
+        torch.testing.assert_close(out.float(), ref, atol=0.08, rtol=0.08)
+        torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
 
-    # Compile every kernel on other offsets with the same totals.
-    gfx950.forward(*inputs([200, 64, 300], [300, 700, 90]), scale)
-    q, k, v, cu_q, cu_k = inputs([64, 300, 200], [700, 90, 300])
+    # Compile every kernel on other offset tensors.
+    gfx950.forward(q, k, v, _cu(second[0]), _cu(second[1]), scale)
+    cu_q, cu_k = _cu(first[0]), _cu(first[1])
+    if seen_before:
+        gfx950.forward(q, k, v, cu_q, cu_k, scale)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out, lse, _ = gfx950.forward(q, k, v, cu_q, cu_k, scale)
+    check(*gfx950.forward(q, k, v, cu_q, cu_k, scale)[:2])
     graph.replay()
-    torch.cuda.synchronize()
-
-    ref, ref_lse = _reference(q, k, v, cu_q, cu_k, scale)
-    torch.testing.assert_close(out.float(), ref, atol=0.08, rtol=0.08)
-    torch.testing.assert_close(lse, ref_lse, atol=0.25, rtol=0.05)
+    check(out, lse)
+    cu_q.copy_(_cu(second[0]))
+    cu_k.copy_(_cu(second[1]))
+    graph.replay()
+    check(out, lse)
 
 
 @pytest.mark.parametrize("batch", [37, 300])
@@ -203,7 +213,8 @@ def test_flash_attn_varlen_mxfp8_dispatch_order(batch):
 
 
 def test_flash_attn_varlen_mxfp8_rejects_invalid_inputs():
-    """Mismatched K/V shapes and empty offset tensors raise InvalidInput."""
+    """Mismatched K/V shapes and empty offset tensors raise InvalidInput, and
+    the kernel entry point rejects offsets of another dtype or shape."""
     from triton.tlx.ops import InvalidInput, flash_attn_varlen_mxfp8
 
     q = torch.randn(8, 4, 128, device="cuda", dtype=torch.bfloat16)
@@ -216,3 +227,10 @@ def test_flash_attn_varlen_mxfp8_rejects_invalid_inputs():
     empty_offsets = torch.empty(0, device="cuda", dtype=torch.int32)
     with pytest.raises(InvalidInput, match="sequence offsets"):
         flash_attn_varlen_mxfp8(q, k, k, empty_offsets, empty_offsets, 8, 16)
+
+    from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
+
+    with pytest.raises(ValueError, match="sequence offsets"):
+        gfx950.forward(q, k, k, cu_q.long(), cu_k, 128**-0.5)
+    with pytest.raises(ValueError, match="same shape"):
+        gfx950.forward(q, k, k, cu_q, _cu([8, 8]), 128**-0.5)

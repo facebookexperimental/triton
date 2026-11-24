@@ -866,6 +866,11 @@ _METADATA: dict[tuple[Any, ...], tuple[Any, Any, dict[str, Any]]] = {}
 def _metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad=_PAD):
     """Device tables: padded key offsets, prep tiles, and the query tiles in
     dispatch order."""
+    # A CUDA graph gets its own tables. Capturing launches nothing, so they
+    # hold no values until a replay, and each replay rebuilds them from the
+    # offsets as they are then.
+    if torch.cuda.is_current_stream_capturing():
+        return _build_metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad)
     key = (
         id(cu_seqlens_q),
         cu_seqlens_q._version,
@@ -1149,6 +1154,10 @@ def forward(
     modified in place while their prepared metadata is reused."""
     # With a given kv_state, K and V only supply their shape.
     _check(q, k, v, sm_scale, kv_contiguous=kv_state is None)
+    _check_offsets(cu_seqlens_q, q.device)
+    _check_offsets(cu_seqlens_k, q.device)
+    if cu_seqlens_q.shape != cu_seqlens_k.shape:
+        raise ValueError("Query and key sequence offsets must have the same shape")
     meta = _metadata(cu_seqlens_q, cu_seqlens_k, q.shape[0], k.shape[0], _BLOCK_M)
     if kv_state is None:
         kv_state = prepare_kv(k, v, cu_seqlens_k, meta)
