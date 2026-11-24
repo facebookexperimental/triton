@@ -478,6 +478,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, "ttng.tw
                        %pred: i1,
                        %barrier: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>,
                        %barrierPred: i1) {
+    // CHECK: nvvm.cluster.arrive
     // CHECK: tcgen05.mma.cta_group::2.kind::f16
     // CHECK: tcgen05.mma.cta_group::2.kind::f16
     // CHECK: tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64
@@ -2167,6 +2168,40 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %value = tt.load %ptrs : tensor<256x!tt.ptr<f32>, #blocked>
     %sum = arith.addf %value, %value : tensor<256xf32, #blocked>
     tt.store %ptrs, %sum : tensor<256x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// No cluster barrier for a 2-CTA MMA in a warp_specialize default region (would hang).
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16, CGALayout = [[0, 1]]}>
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CGALayout = [[1, 0]], twoCTAs = true>
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttng.two-ctas" = true} {
+  // CHECK-LABEL: @tc_gen5_mma_2ctas_ws_default_region
+  // CHECK-NOT: cluster.arrive
+  // CHECK: tcgen05.mma.cta_group::2.kind::f16
+  tt.func @tc_gen5_mma_2ctas_ws_default_region(%a: !ttg.memdesc<256x32xf16, #shared, #ttg.shared_memory>,
+                       %b: !ttg.memdesc<32x128xf16, #shared1, #ttg.shared_memory>,
+                       %c: !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+                       %useAcc: i1,
+                       %pred: i1,
+                       %barrier: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>,
+                       %barrierPred: i1) {
+    ttg.warp_specialize()
+    default {
+      ttng.tc_gen5_mma %a, %b, %c, %useAcc, %pred, %barrier[%barrierPred] {is_async, two_ctas} :
+         !ttg.memdesc<256x32xf16, #shared, #ttg.shared_memory>,
+         !ttg.memdesc<32x128xf16, #shared1, #ttg.shared_memory>,
+         !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+         !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>
+      ttg.warp_yield
+    }
+    partition0() num_warps(1) {
+      ttg.warp_return
+    } : () -> ()
     tt.return
   }
 }
