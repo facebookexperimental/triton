@@ -126,6 +126,7 @@ struct BLoadTrace {
   ttg::LocalAllocOp localAlloc;
   ttg::MemDescTransOp memDescTrans;
   tt::TransOp trans;
+  arith::TruncFOp trunc;
   unsigned splitDim = 1;
 };
 
@@ -177,6 +178,16 @@ static FailureOr<BLoadTrace> traceToDescriptorLoad(Value bMemDesc) {
   while (auto cvt = tensor.getDefiningOp<ttg::ConvertLayoutOp>())
     tensor = cvt.getSrc();
 
+  // Keep an explicit rounding of B, but redo it after the per-CTA split so
+  // each CTA converts only its N half.
+  arith::TruncFOp trunc;
+  if (auto truncOp = tensor.getDefiningOp<arith::TruncFOp>()) {
+    trunc = truncOp;
+    tensor = trunc.getIn();
+    while (auto cvt = tensor.getDefiningOp<ttg::ConvertLayoutOp>())
+      tensor = cvt.getSrc();
+  }
+
   tt::TransOp trans;
   if (auto transOp = tensor.getDefiningOp<tt::TransOp>()) {
     trans = transOp;
@@ -194,12 +205,15 @@ static FailureOr<BLoadTrace> traceToDescriptorLoad(Value bMemDesc) {
   if (!descLoad)
     return failure();
 
-  return BLoadTrace{descLoad, localAlloc, memDescTrans, trans, splitDim};
+  return BLoadTrace{descLoad, localAlloc, memDescTrans, trans, trunc, splitDim};
 }
 
 struct Transform2CTALoads
     : public impl::NVGPU2CTATransformLoadsBase<Transform2CTALoads> {
   DenseMap<Value, tt::TensorDescType> originalDescTypes;
+  // B operands (local_alloc / memdesc_trans results) already split by an
+  // earlier MMA that shares them.
+  DenseSet<Value> splitBOperands;
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
@@ -234,7 +248,8 @@ struct Transform2CTALoads
     DenseSet<Operation *> splitTransformedMMAs;
     for (auto mma : twoCTAMMAOps) {
       Operation *op = mma.getOperation();
-      if (splitTransformedMMAs.contains(op))
+      if (splitTransformedMMAs.contains(op) ||
+          splitBOperands.contains(mma.getB()))
         continue;
       // Both paths halve the B descriptor; they differ in how many MMAs consume
       // the load. transformSplitBLoad handles a source-level tt.split feeding
@@ -245,9 +260,36 @@ struct Transform2CTALoads
         if (succeeded(transformSplitBLoad(plain, splitTransformedMMAs)))
           continue;
       }
-      if (failed(transformBLoad(mma.getB(), op)))
-        LDBG("Skipped MMA at " << op->getLoc()
-                               << " (B not from descriptor load)");
+      if (succeeded(transformBLoad(mma.getB(), op)))
+        continue;
+      // A 2-CTA MMA reads half of B from each CTA of the pair. Leaving the
+      // full B tile in both CTAs silently computes with the wrong half.
+      op->emitError("two_ctas dot: cannot split the B operand across the CTA "
+                    "pair (B must be a descriptor load, optionally transposed, "
+                    "with BLOCK_N / 2 >= 16)");
+      signalPassFailure();
+      return;
+    }
+
+    // Host-side descriptor arguments are retyped to the half-width block in
+    // place. Any load of such an argument that was not replaced by a
+    // half-width load would read the wrong tile.
+    bool unsplitHostLoad = false;
+    moduleOp.walk([&](tt::DescriptorLoadOp descLoad) {
+      auto desc = descLoad.getDesc();
+      if (desc.getDefiningOp())
+        return;
+      auto orig = originalDescTypes.lookup(desc);
+      if (orig && orig != desc.getType() && !descLoad->hasAttr("two_cta_b")) {
+        descLoad.emitError("two_ctas dot: this load shares a descriptor "
+                           "argument with a 2-CTA B operand that was split "
+                           "across the CTA pair, but is not split itself");
+        unsplitHostLoad = true;
+      }
+    });
+    if (unsplitHostLoad) {
+      signalPassFailure();
+      return;
     }
 
     // A 2-CTA TMA load is issued by both CTAs as one hardware CTA-group
@@ -455,6 +497,7 @@ struct Transform2CTALoads
     auto localAlloc = trace->localAlloc;
     auto memDescTrans = trace->memDescTrans;
     auto trans = trace->trans;
+    auto trunc = trace->trunc;
     unsigned splitDim = trace->splitDim;
 
     // Use the descriptor's original type. Host-side TMA descriptor arguments
@@ -509,6 +552,13 @@ struct Transform2CTALoads
       // and creates the CuTensorMap with the correct half-width box_dim.
       // This follows the same pattern as Data Partitioning (WSDataPartition).
       auto descVal = descLoad.getDesc();
+      // Retyping a shared host descriptor would also change its other loads.
+      if (trunc && !descVal.hasOneUse()) {
+        mma->emitError(
+            "2-CTA truncated B requires an unshared host descriptor");
+        signalPassFailure();
+        return failure();
+      }
       descVal.setType(newDescType);
       newDesc = descVal;
       // Update the function signature to match.
@@ -565,14 +615,27 @@ struct Transform2CTALoads
       allocSrc = tt::TransOp::create(builder, trans.getLoc(), allocSrc,
                                      trans.getOrder());
     }
+    if (trunc) {
+      builder.setInsertionPoint(localAlloc);
+      auto srcType = cast<RankedTensorType>(allocSrc.getType());
+      auto oldResultType = cast<RankedTensorType>(trunc.getOut().getType());
+      auto truncType = RankedTensorType::get(srcType.getShape(),
+                                             oldResultType.getElementType(),
+                                             srcType.getEncoding());
+      auto newTrunc = arith::TruncFOp::create(
+          builder, trunc.getLoc(), truncType, allocSrc,
+          trunc.getRoundingmodeAttr(), trunc.getFastmathAttr());
+      allocSrc = newTrunc;
+    }
 
     auto origMemDescType = cast<ttg::MemDescType>(localAlloc.getType());
     auto allocSrcType = cast<RankedTensorType>(allocSrc.getType());
     auto newMemDescEncoding = shrinkSwizzleForShape(
         origMemDescType.getEncoding(), allocSrcType.getShape());
     auto newMemDescType = ttg::MemDescType::get(
-        allocSrcType.getShape(), elemType, newMemDescEncoding,
-        origMemDescType.getMemorySpace(), origMemDescType.getMutableMemory());
+        allocSrcType.getShape(), allocSrcType.getElementType(),
+        newMemDescEncoding, origMemDescType.getMemorySpace(),
+        origMemDescType.getMutableMemory());
 
     builder.setInsertionPoint(localAlloc);
     auto newLocalAlloc = ttg::LocalAllocOp::create(builder, localAlloc.getLoc(),
@@ -586,14 +649,19 @@ struct Transform2CTALoads
       newMemDescTrans->setAttrs(memDescTrans->getAttrs());
       memDescTrans.getResult().replaceAllUsesWith(newMemDescTrans.getResult());
       memDescTrans.erase();
+      splitBOperands.insert(newMemDescTrans.getResult());
       if (localAlloc.getResult().use_empty())
         localAlloc.erase();
     } else {
       localAlloc.getResult().replaceAllUsesWith(newLocalAlloc.getResult());
+      splitBOperands.insert(newLocalAlloc.getResult());
       localAlloc.erase();
     }
 
-    // Clean up old transpose if no other users.
+    // Erase downstream first: a dead truncation would keep the old chain alive.
+    if (trunc && trunc.getResult().use_empty())
+      trunc.erase();
+
     if (trans && trans.getResult().use_empty())
       trans.erase();
 
