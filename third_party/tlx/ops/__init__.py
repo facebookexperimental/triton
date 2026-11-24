@@ -1473,9 +1473,10 @@ def flash_attn_varlen_mxfp8(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     four heads. ``max_seqlen_q`` and ``max_seqlen_k`` are accepted for API
     parity. ``sm_scale`` defaults to ``128**-0.5`` and ``fast_exp`` selects the
     approximate exponentiation path; by default it is used when the sequences
-    average at least 4096 keys. The cumulative sequence-offset tensors must not
-    be modified in place while reused. Returns the BF16 output only (no
-    log-sum-exp); query rows of a sequence with no keys are zero.
+    average at least 4096 keys. In-place changes to the offset tensors are
+    picked up when PyTorch records them; writes through ``.data`` are not.
+    Returns the BF16 output only (no log-sum-exp); query rows of a sequence
+    with no keys are zero.
     """
     import torch
 

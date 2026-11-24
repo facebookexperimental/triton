@@ -1,8 +1,9 @@
 """L2 performance coverage for ``tlx.ops.flash_attn_varlen_mxfp8``.
 
-K/V preparation is reusable state and stays outside the measured closure.
-Correctness is covered by the op's L1 tests; this benchmark tracks the prepared
-attention core without a reference provider.
+K/V preparation and the dispatch tables are reusable state and stay outside
+the measured closure: every measured call passes the same offset tensors, so
+it runs the attention kernel alone. Correctness is covered by the op's L1
+tests; this benchmark has no reference provider.
 """
 
 from __future__ import annotations

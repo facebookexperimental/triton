@@ -11,8 +11,10 @@ in registers, or ahead of time for ``forward_prequantized``. The padding sits
 at both ends of a span (see ``_front``), so only an item's first and last
 128-key tiles hold padding keys, which get scores of -1e30 or less.
 
-Work items are 128-row query-tile/head pairs, one per workgroup. The grid is
-an upper bound from the token totals, and device kernels build the tables
+Work items are 128-row query-tile/head pairs, one per workgroup. Their number
+depends on every sequence's length, so the launch grid is an upper bound of
+it, computed from the total number of query rows and the batch size; the
+workgroups past the last item exit at once. Device kernels build the tables
 that map a workgroup to its item (``_build_metadata``).
 
 - Workgroups go round-robin to the 8 XCDs. Each XCD takes one head of half
@@ -23,8 +25,10 @@ that map a workgroup to its item (``_build_metadata``).
   goes by descending keys: an XCD starts its longest items first, which keeps
   the last ones to finish short.
 
-The sequence-offset tensors must not be modified in place while their prepared
-metadata is reused.
+The tables are cached per pair of offset tensors and rebuilt when PyTorch
+records an in-place change to either tensor. A change it does not record
+(through ``.data``, or written by a kernel) leaves the old tables in use, and
+a ``kv_state`` is only valid for the key offsets it was prepared with.
 """
 
 from __future__ import annotations
@@ -892,8 +896,21 @@ def _metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad=_PAD):
 
 
 def _build_metadata(cu_seqlens_q, cu_seqlens_k, total_q, total_kv, block_m, pad):
-    """Build _metadata's tables on the device. The table sizes are upper
-    bounds from the totals."""
+    """Launch the kernels that fill the lookup tables of the K/V preparation
+    and attention kernels, and return the tables:
+
+    - ``cu_pad``: where each sequence's keys start in the padded K/V buffers.
+    - ``tile_sequence``: the sequence that owns each 64-key block of those
+      buffers.
+    - ``q_tile_start``: each sequence's first position in the dispatch order,
+      then the number of query tiles in each of the two classes.
+    - ``item_tile``: the sequence of the query tile at each position of the
+      dispatch order.
+
+    Each tensor is allocated for the largest count the token totals allow, so
+    its entries past the actual count are unused. ``tile_capacity``,
+    ``class_capacity`` and ``npad`` are those largest counts of 64-key blocks,
+    query tiles per class, and padded keys."""
     batch = cu_seqlens_k.numel() - 1
     device = cu_seqlens_k.device
     tile_capacity = total_kv // _PREP_ROWS + batch * pad // _PREP_ROWS
@@ -1150,8 +1167,9 @@ def forward(
     Query tiles have 128 rows on four warps. ``fast_exp`` selects the
     approximate exponential; left as None, it is used when the sequences
     average at least 4096 keys. Sequences with no keys get zero
-    output rows and -inf LSE. The sequence-offset tensors must not be
-    modified in place while their prepared metadata is reused."""
+    output rows and -inf LSE. A ``kv_state`` is only valid for the key
+    offsets it was prepared with; see the module docstring for in-place
+    changes to the offset tensors."""
     # With a given kv_state, K and V only supply their shape.
     _check(q, k, v, sm_scale, kv_contiguous=kv_state is None)
     _check_offsets(cu_seqlens_q, q.device)

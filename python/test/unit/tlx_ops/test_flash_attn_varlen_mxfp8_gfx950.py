@@ -142,9 +142,11 @@ def test_flash_attn_varlen_mxfp8_default_fast_exp(lens_k, fast):
 
 @pytest.mark.parametrize("seen_before", [False, True])
 def test_flash_attn_varlen_mxfp8_graph_replay_follows_offsets(seen_before):
-    """A captured CUDA graph follows offsets that change in place between
-    replays, whether or not the capture is their first use, and leaves an
-    eager call made before its first replay correct."""
+    """A CUDA graph is captured once, then replayed after the offset tensors
+    are overwritten with another batch's offsets: the replay must give that
+    batch's result. Run with and without an earlier call on the same offset
+    tensors. A call made between the capture and the first replay must be
+    correct as well."""
     from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
 
     torch.manual_seed(20)
@@ -179,9 +181,11 @@ def test_flash_attn_varlen_mxfp8_graph_replay_follows_offsets(seen_before):
 
 @pytest.mark.parametrize("batch", [37, 300])
 def test_flash_attn_varlen_mxfp8_dispatch_order(batch):
-    """The device-built dispatch order lists every query tile once, the two
-    classes carry equal costs, and each class runs its longest items first:
-    the sequences with the most keys."""
+    """The dispatch tables built on the device. Every query tile of every
+    sequence appears exactly once in the queue. The queue's two halves, the
+    classes that the XCDs share out, carry about the same work. Each half
+    lists its sequences by decreasing number of keys, so the longest work
+    items start first."""
     from triton.tlx.ops.kernels.flash_attn_varlen_mxfp8 import gfx950
 
     generator = torch.Generator().manual_seed(batch)

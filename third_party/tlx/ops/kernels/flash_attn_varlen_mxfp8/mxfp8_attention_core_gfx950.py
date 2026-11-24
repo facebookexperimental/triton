@@ -27,10 +27,11 @@ from ..flash_attn_mxfp8.gfx950 import (
     _to_e4m3,
 )
 
-# The softmax helpers below follow flash_attn_mxfp8.gfx950's score convention,
-# described at its _score_scale: they see t = (x - m_i + OFF) * C, x the
-# log2-domain logit and m_i the stale row max, with C = _score_scale and
-# OFF = _score_offset, and P = 2**(x - m_i + 4).
+# Units of the scores ``s`` that the softmax helpers below take, shared with
+# flash_attn_mxfp8.gfx950 (explained at its _score_scale): a score is
+# t = (x - m_i + OFF) * C, with x the logit in the log2 domain, m_i the row max
+# over the earlier tiles, C = _score_scale and OFF = _score_offset. The
+# probability is then P = 2**(x - m_i + 4).
 
 
 @triton.jit
