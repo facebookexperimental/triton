@@ -825,6 +825,26 @@ CATALOG: tuple[OpSpec, ...] = (
     ),
     OpSpec(
         op="paged_attention_decode",
+        arch="sm100",
+        variant="swapped_fp8_tcgen05_ws",
+        impl="triton.tlx.ops.kernels.paged_attn_fp8.sm100_decode:paged_attention_decode",
+        dtypes=_BF16,
+        invariant_vocab=_VARLEN_DIMS,
+        # A page is one 64- or 128-row tcgen05 operand (tokens are the MMA's M).
+        accepts=lambda d: _paged_decode_packed_fp8_accepts(d) and d.get("PAGE_SIZE") in (64, 128),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        op="paged_attention_decode_workspace",
+        arch="sm100",
+        variant="swapped_fp8_tcgen05_ws",
+        impl="triton.tlx.ops.kernels.paged_attn_fp8.sm100_decode:paged_attention_decode_workspace",
+        dtypes=_BF16,
+        accepts=lambda d: _paged_decode_packed_fp8_accepts(d) and d.get("PAGE_SIZE") in (64, 128),
+        requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        op="paged_attention_decode",
         arch="gfx950",
         variant="split_k_mfma",
         impl="triton.tlx.ops.kernels.paged_attn.gfx950_decode:paged_attention_decode",

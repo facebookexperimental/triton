@@ -2458,7 +2458,7 @@ def paged_attention_decode_fp8(query, key_cache, value_cache, context_lens, bloc
     K is ``[blocks, kv_heads, D/16, page_size, 16]`` and V is
     ``[blocks, kv_heads, page_size/16, D, 16]``, contiguous E4M3FN.
     ``page_size`` counts cached tokens per physical KV block and is a positive
-    multiple of 16; the inner 16 is a separate packing factor. ``block_tables``
+    multiple of 16 (64 or 128 on sm100); the inner 16 is a separate packing factor. ``block_tables``
     maps each sequence's logical page to a physical block id: token t uses
     entry ``t // page_size`` and within-page offset ``t % page_size``.
     Separate FP32 ``k_scale``/``v_scale`` vectors have one multiplier per KV
@@ -2533,9 +2533,11 @@ def paged_attention_decode_fp8_workspace(query, key_cache, value_cache, block_ta
     """Allocate reusable opaque FP32 split buffers, or None for a single split.
 
     Planning arguments must match ``paged_attention_decode_fp8``. Returned
-    capacity shapes are ``[tokens, query_heads, splits, D]`` for partial values
-    and ``[tokens, query_heads, splits]`` for log-sum-exp. Both partial values
-    and log-sum-exp retain FP32 precision; treat their contents as opaque.
+    capacity shapes are ``[tokens, query_heads, S, D]`` for partial values
+    and ``[tokens, query_heads, S]`` for log-sum-exp, where S is at least the
+    plan's split count and is chosen by the implementation, so allocate
+    workspaces with this call. Both partial values and log-sum-exp retain FP32
+    precision; treat their contents as opaque.
     No device metadata values are read back and no quantization or attention
     is run. Allocate this workspace and output before graph capture.
     """

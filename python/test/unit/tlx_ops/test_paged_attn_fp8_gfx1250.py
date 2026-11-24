@@ -397,7 +397,7 @@ def test_fp8_decode_is_unified_in_catalog():
     from triton.tlx.ops._catalog import CATALOG
     assert not [s for s in CATALOG if s.op.startswith('paged_attention_decode_fp8')]
     for op in ['paged_attention_decode', 'paged_attention_decode_workspace']:
-        assert {'gfx950', 'gfx1250'} <= {s.arch for s in CATALOG if s.op == op}
+        assert {'gfx950', 'gfx1250', 'sm100'} <= {s.arch for s in CATALOG if s.op == op}
 
 
 def _decode_dims(**change):
