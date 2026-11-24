@@ -496,6 +496,34 @@ class TestTLXTemplates(TestCase):
         code_str = "\n".join(code)
         self.assertIn("triton_tem", code_str)
 
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe bmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("dynamic", (False, True))
+    def test_tlx_bmm_warppipe_zero_stride(self, dynamic: bool):
+        """Broadcast A (strides [0, 0, 1]) must not fault or miscompute (T298853186).
+
+        The template used to assume every stride > 0; a false tl.assume on stride_am == 0 caused
+        HSA_STATUS_ERROR_EXCEPTION 0x1016 (static) or wrong results (dynamic).
+        """
+        a = torch.randn(1, 1, 3, device=GPU_TYPE, dtype=torch.float16).as_strided((3072, 1, 3), (0, 0, 1))
+        b = torch.randn(3, 3072, 2048, device=GPU_TYPE, dtype=torch.float16).permute(1, 0, 2)
+
+        with (config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+        }), ):
+            c_actual, code = run_and_get_code(torch.compile(lambda x, y: torch.bmm(x, y), dynamic=dynamic), a, b)
+
+        c_expected = torch.bmm(a.float(), b.float()).half()
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("triton_tem", "\n".join(code))
+
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_bmm_warppipe_dual_path_source(self):
         """The non-persistent bmm template carries BOTH branches: the async_load direct-to-LDS path
@@ -507,6 +535,91 @@ class TestTLXTemplates(TestCase):
         self.assertIn("USE_ASYNC", src)  # dual-path selector constexpr
         self.assertIn("tlx.async_load", src)  # aligned-K async path
         self.assertIn("a_reg = tl.load", src)  # register-path fallback load
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_amd_warppipe_refill_wait_source(self):
+        """Each warp-pipe K loop waits before its MFMA stage, not at the loop tail. The wait is
+        also the cross-wave sync that keeps a slot's LDS reads ahead of its refill. Source check --
+        no GPU needed."""
+        from triton.language.extra.tlx.inductor.mm_templates import load_tlx_template
+
+        head_wait = re.compile(r"async_load_wait_group\(NUM_BUFFERS - 2\)\s*\n"
+                               r"\s*with tlx\.warp_pipeline_stage\(\"mfma\"")
+        for name in ("amd_bmm_warppipe", "amd_addmm_warppipe", "amd_addmm_persistent_warppipe"):
+            self.assertIsNotNone(head_wait.search(load_tlx_template(name)), name)
+
+    def _assert_pinned_warppipe_stable(self, heuristic, pinned, fn, args, expected):
+        """Pin one async warp-pipe config, then check the first result and 100 re-launches."""
+        get_configs = heuristic._get_template_configs_impl
+        keys = ("BLOCK_M", "BLOCK_N", "BLOCK_K", "GROUP_M", "num_warps", "NUM_BUFFERS")
+
+        def _pinned_only(instance, kernel_inputs, op_name):
+            for template_kwargs in get_configs(instance, kernel_inputs, op_name):
+                if tuple(template_kwargs[k] for k in keys) == pinned:
+                    yield template_kwargs
+
+        with (
+                mock.patch.object(heuristic, "_get_template_configs_impl", _pinned_only),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }),
+        ):
+            compiled = torch.compile(fn)
+            actual, code = run_and_get_code(compiled, *args)
+            torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+            for launch in range(100):
+                with self.subTest(launch=launch):
+                    torch.testing.assert_close(compiled(*args), expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("tlx.async_load", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe bmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_bmm_warppipe_refill_wait_prevents_lds_race(self):
+        """Every wave must read an LDS slot before the leading wave refills it (bmm async path)."""
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        torch.manual_seed(0)
+        a = torch.randn(7, 1024, 128, device=GPU_TYPE, dtype=torch.bfloat16)
+        b = torch.randn(7, 128, 384, device=GPU_TYPE, dtype=torch.bfloat16)
+        self._assert_pinned_warppipe_stable(
+            _tlx_registry.ROCmBMMWarpPipeTemplateConfigHeuristic,
+            (128, 128, 32, 8, 8, 3),
+            torch.bmm,
+            (a, b),
+            torch.bmm(a.float(), b.float()).to(torch.bfloat16),
+        )
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_addmm_warppipe_refill_wait_prevents_lds_race(self):
+        """Every wave must read an LDS slot before the leading wave refills it (addmm async path)."""
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        torch.manual_seed(0)
+        a = torch.randn(512, 256, device=GPU_TYPE, dtype=torch.float16)
+        w = torch.randn(256, 256, device=GPU_TYPE, dtype=torch.float16)
+        bias = torch.randn(256, device=GPU_TYPE, dtype=torch.float16)
+
+        def addmm(bias, a, w):
+            return torch.addmm(bias, a, w.t())
+
+        self._assert_pinned_warppipe_stable(
+            _tlx_registry.ROCmAddMMWarpPipeTemplateConfigHeuristic,
+            (64, 64, 64, 8, 8, 3),
+            addmm,
+            (bias, a, w),
+            (a.float() @ w.t().float() + bias.float()).to(torch.float16),
+        )
 
     @unittest.skipIf(
         not is_gfx950(),
