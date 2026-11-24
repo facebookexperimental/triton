@@ -46,7 +46,15 @@ def TlxPropagateLayout : Pass<"tlx-propagate-layout", "mlir::ModuleOp"> {
 
     Tensor and memdesc constraints are either folded away when propagation
     successfully retags the producer, or lowered to an explicit TTGIR boundary.
+
+    With `only-hand-placed-lds`, the pass leaves modules alone unless they
+    place their LDS buffers by hand: TLX modules and warp-pipelined modules.
   }];
+
+  let options = [Option<"onlyHandPlacedLds", "only-hand-placed-lds", "bool",
+                        /*default*/ "false",
+                        "skip modules that leave LDS placement to the "
+                        "compiler">];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
