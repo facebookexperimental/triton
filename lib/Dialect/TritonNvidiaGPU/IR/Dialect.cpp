@@ -607,8 +607,10 @@ LogicalResult impl::verifyMMAv5Op(Operation *op) {
                nvmma.getSwizzlingByteWidth() == 0;
       return true;
     };
-    if ((aAttrs && aAttrs->transposed && needsAtomicity(aType)) ||
-        (bAttrs && !bAttrs->transposed && needsAtomicity(bType)))
+    if ((aAttrs && aAttrs->transposed && !aAttrs->swizzleAtom32B &&
+         needsAtomicity(aType)) ||
+        (bAttrs && !bAttrs->transposed && !bAttrs->swizzleAtom32B &&
+         needsAtomicity(bType)))
       return op->emitOpError(
           "transposed float32 shared-memory operands require "
           "unsupported 32-byte swizzle atomicity");

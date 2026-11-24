@@ -59,6 +59,10 @@ inline SmallVector<int64_t> getTMABlockShape(triton::TensorDescInterface ty,
   return getTMABlockShape(ty.getSharedLayout(), shapePerCTA, packedSize, mode);
 }
 
+// Value of CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B, returned by getTMASwizzleMode
+// for a 128B swizzle with 32-byte atomicity.
+constexpr int kTMASwizzle128BAtom32B = 4;
+
 FailureOr<int> getTMASwizzleMode(Location loc, triton::TensorDescInterface ty);
 FailureOr<int> getTMAElementType(Location loc, triton::TensorDescInterface ty);
 

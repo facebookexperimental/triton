@@ -209,10 +209,24 @@ struct TensormapCreateOpConversion
         NVVM::TensormapInterleaveLayoutAttr::get(
             ctx, static_cast<NVVM::TensormapInterleaveLayout>(
                      op.getInterleaveLayout())));
-    tensormap_replace_attr(
-        loc, ctx, rewriter, NVVM::TensormapField::SWIZZLE_MODE, descAddr,
-        NVVM::TensormapSwizzleModeAttr::get(
-            ctx, static_cast<NVVM::TensormapSwizzleMode>(op.getSwizzleMode())));
+    // Swizzle mode 4 means CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B here (PTX's
+    // own value 4 is the 96B swizzle, which Triton never emits).
+    if (op.getSwizzleMode() == 4) {
+      tensormap_replace_attr(loc, ctx, rewriter,
+                             NVVM::TensormapField::SWIZZLE_MODE, descAddr,
+                             NVVM::TensormapSwizzleModeAttr::get(
+                                 ctx, NVVM::TensormapSwizzleMode::B128));
+      tensormap_replace_attr(loc, ctx, rewriter,
+                             NVVM::TensormapField::SWIZZLE_ATOMICITY, descAddr,
+                             NVVM::TensormapSwizzleAtomicityAttr::get(
+                                 ctx, NVVM::TensormapSwizzleAtomicity::B32));
+    } else {
+      tensormap_replace_attr(
+          loc, ctx, rewriter, NVVM::TensormapField::SWIZZLE_MODE, descAddr,
+          NVVM::TensormapSwizzleModeAttr::get(
+              ctx,
+              static_cast<NVVM::TensormapSwizzleMode>(op.getSwizzleMode())));
+    }
     tensormap_replace_attr(
         loc, ctx, rewriter, NVVM::TensormapField::FILL_MODE, descAddr,
         NVVM::TensormapFillModeAttr::get(

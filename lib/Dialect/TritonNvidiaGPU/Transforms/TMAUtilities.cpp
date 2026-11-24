@@ -90,6 +90,10 @@ FailureOr<int> getTMASwizzleMode(Location loc, tt::TensorDescInterface ty) {
   int32_t swizzleMode = 0;
   if (swizzleBytes == 128) {
     swizzleMode = 3;
+    // CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B; the tensormap.replace lowering
+    // splits it into swizzle_mode 3 and swizzle_atomicity 1.
+    if (mmaEncoding.getSwizzleAtom32B())
+      swizzleMode = kTMASwizzle128BAtom32B;
   } else if (swizzleBytes == 64) {
     swizzleMode = 2;
   } else if (swizzleBytes == 32) {

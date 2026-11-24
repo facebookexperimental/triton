@@ -219,11 +219,16 @@ struct EncodingInfo {
   // use case
   SmallVector<int64_t> shape;
   bool forcedToDefault = false;
+  // The descriptor may be built on the host (a kernel argument or a
+  // reinterpreted global descriptor), where its swizzle can come from the
+  // block shape alone and cannot express 32-byte swizzle atomicity.
+  bool hostBuilt = false;
 
   bool operator==(const EncodingInfo &other) const {
     return desiredEncoding == other.desiredEncoding &&
            cgaLayout == other.cgaLayout &&
-           forcedToDefault == other.forcedToDefault && shape == other.shape;
+           forcedToDefault == other.forcedToDefault && shape == other.shape &&
+           hostBuilt == other.hostBuilt;
   }
 };
 
@@ -233,7 +238,7 @@ template <> struct std::hash<EncodingInfo> {
   size_t operator()(const EncodingInfo &einfo) const {
     return llvm::hash_combine(einfo.desiredEncoding, einfo.cgaLayout,
                               einfo.forcedToDefault,
-                              ArrayRef<int64_t>(einfo.shape));
+                              ArrayRef<int64_t>(einfo.shape), einfo.hostBuilt);
   }
 };
 
@@ -304,6 +309,7 @@ EncodingInfo combineEncodings(const EncodingInfo &lhs, const EncodingInfo &rhs,
   EncodingInfo result;
   // Always propagate forcedToDefault
   result.forcedToDefault = lhs.forcedToDefault || rhs.forcedToDefault;
+  result.hostBuilt = lhs.hostBuilt || rhs.hostBuilt;
 
   if (result.forcedToDefault)
     return result;
@@ -537,8 +543,18 @@ LogicalResult assignMemoryLayouts(FuncOp &func) {
   auto isKernel = triton::isKernel(func);
   for (auto blockArg : func.getBlocks().front().getArguments())
     if (auto desc = dyn_cast<TypedValue<TensorDescType>>(blockArg))
-      updateEncoding({desc},
-                     EncodingInfo{{}, {}, {}, /*forcedToDefault=*/!isKernel});
+      updateEncoding({desc}, EncodingInfo{{},
+                                          {},
+                                          {},
+                                          /*forcedToDefault=*/!isKernel,
+                                          /*hostBuilt=*/true});
+  func.walk([&](ttng::ReinterpretTensorDescOp op) {
+    updateEncoding({op.getResult()}, EncodingInfo{{},
+                                                  {},
+                                                  {},
+                                                  /*forcedToDefault=*/false,
+                                                  /*hostBuilt=*/true});
+  });
 
   func.walk([&](Operation *op) {
     if (auto info = getUseInfo(op)) {
@@ -649,6 +665,16 @@ LogicalResult assignMemoryLayouts(FuncOp &func) {
     }
   }
 
+  auto withoutAtom32B = [](Attribute enc) -> Attribute {
+    auto nvmma = dyn_cast_or_null<ttg::NVMMASharedEncodingAttr>(enc);
+    if (!nvmma || !nvmma.getSwizzleAtom32B())
+      return enc;
+    return ttg::NVMMASharedEncodingAttr::get(
+        nvmma.getContext(), nvmma.getSwizzlingByteWidth(),
+        nvmma.getTransposed(), nvmma.getElementBitWidth(), nvmma.getPadding(),
+        nvmma.getCGALayout());
+  };
+
   // 4. Transfer propagated encodings into the graph
   auto ctx = func.getContext();
   auto numCTAs = gpu::lookupNumCTAs(func);
@@ -672,6 +698,8 @@ LogicalResult assignMemoryLayouts(FuncOp &func) {
                                                 einfo->shape, numCTAs);
       }
     }
+    if (einfo->hostBuilt)
+      newEncoding = withoutAtom32B(newEncoding);
     desc.setType(getTensorDescTypeWithEncoding(desc.getDefiningOp(),
                                                desc.getType(), newEncoding));
   }

@@ -418,3 +418,31 @@ tt.func public @async_tma_gather(%arg0: !tt.ptr<f16>, %arg1: i32, %arg2: tensor<
   tt.return
 }
 }
+
+// -----
+
+// A TF32 operand staged with 32-byte swizzle atomicity propagates to a
+// descriptor built in the kernel. A kernel-argument descriptor keeps the
+// plain 128B swizzle, since host code may fill it from the block shape alone.
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#atom = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32, swizzleAtom32B = true}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // CHECK-DAG: #[[PLAIN:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+  // CHECK-DAG: #[[ATOM:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32, swizzleAtom32B = true}>
+  // CHECK: tt.func public @tf32_swizzle_atom32b_descriptors
+  // CHECK-SAME: !tt.tensordesc<32x128xf32, #[[PLAIN]]>
+  tt.func public @tf32_swizzle_atom32b_descriptors(%host: !tt.tensordesc<32x128xf32>, %ptr: !tt.ptr<f32>, %k: i32, %n: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1_i64 = arith.constant 1 : i64
+    %n_i64 = arith.extsi %n : i32 to i64
+    // CHECK: tt.make_tensor_descriptor {{.*}} : !tt.ptr<f32>, !tt.tensordesc<32x128xf32, #[[ATOM]]>
+    %dev = tt.make_tensor_descriptor %ptr, [%k, %n], [%n_i64, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<32x128xf32>
+    %a = tt.descriptor_load %dev[%c0, %c0] : !tt.tensordesc<32x128xf32> -> tensor<32x128xf32, #blocked>
+    %sa = ttg.local_alloc %a : (tensor<32x128xf32, #blocked>) -> !ttg.memdesc<32x128xf32, #atom, #smem>
+    // CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<32x128xf32, #[[PLAIN]]>
+    %b = tt.descriptor_load %host[%c0, %c0] : !tt.tensordesc<32x128xf32> -> tensor<32x128xf32, #blocked>
+    %sb = ttg.local_alloc %b : (tensor<32x128xf32, #blocked>) -> !ttg.memdesc<32x128xf32, #atom, #smem>
+    tt.return
+  }
+}

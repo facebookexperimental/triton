@@ -445,9 +445,11 @@ def NVMMASharedEncodingAttr
   // FP6 shapes and coordinates count logical values. B6x16P32 is an opaque
   // MMA tile whose 16-byte containers hold 16 packed FP6 values and padding.
   // B6P2x16 exposes one low-six-bit code per byte for compacting TMA stores.
+  // swizzleAtom32B: 128-byte swizzling with 32-byte atomicity, the only swizzle
+  // tcgen05.mma accepts for an MN-major TF32 operand.
   let parameters = (ins "unsigned":$swizzlingByteWidth, "bool":$transposed,
       "unsigned":$elementBitWidth, "NVMmaPadding":$padding,
-      "CGAEncodingAttr":$CGALayout);
+      "CGAEncodingAttr":$CGALayout, "bool":$swizzleAtom32B);
 
   let skipDefaultBuilders = 1;
   let builders =
@@ -456,7 +458,14 @@ def NVMMASharedEncodingAttr
                        "CGAEncodingAttr":$CGALayout),
                    [{
       return $_get(context, swizzlingByteWidth, transposed, elementBitWidth,
-                   padding, CGALayout);
+                   padding, CGALayout, /*swizzleAtom32B=*/false);
+    }]>,
+       AttrBuilder<(ins "unsigned":$swizzlingByteWidth, "bool":$transposed,
+                       "unsigned":$elementBitWidth, "NVMmaPadding":$padding,
+                       "CGAEncodingAttr":$CGALayout, "bool":$swizzleAtom32B),
+                   [{
+      return $_get(context, swizzlingByteWidth, transposed, elementBitWidth,
+                   padding, CGALayout, swizzleAtom32B);
     }]>,
        AttrBuilder<(ins "unsigned":$swizzlingByteWidth, "bool":$transposed,
                        "unsigned":$elementBitWidth, "bool":$fp4Padded,
