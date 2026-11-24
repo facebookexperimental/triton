@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448" | FileCheck %s
+// RUN: env TRITON_WS_SMEM_PLAN_SEARCH=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448" 2>&1 | FileCheck %s --check-prefix=SEARCH
 
 // Persistent addmm with a single K tile whose epilogue adds a 32-wide bf16
 // bias read with a 1-D TMA load. The tile loop is the innermost loop, so the
@@ -6,8 +7,19 @@
 // multi-buffer. TMA needs a 128-byte aligned destination and copy i starts at
 // base + 64 * i, so the buffer must stay single-buffered.
 
+// Circular reuse is on (tt.smem_circular_reuse). A and B keep their three
+// copies and separate buffer ids: dropping the bias from Phase 4 must not turn
+// them into the two-buffer circular reuse group.
+
 // CHECK-LABEL: @kernel
+// CHECK: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[#AID:]] : i32} : () -> !ttg.memdesc<3x128x64xbf16
+// CHECK: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[#AID+1]] : i32} : () -> !ttg.memdesc<3x32x64xbf16
 // CHECK: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32} : () -> !ttg.memdesc<1x32xbf16
+
+// The plan search does not model the cap, so it hands the whole kernel to the
+// heuristic planner and says so.
+// SEARCH: remark: SMEM plan-search: TMA landing buffer "bias" (64B) is not a multiple of its TMA alignment
+// SEARCH: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32} : () -> !ttg.memdesc<1x32xbf16
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [8], order = [0]}>
@@ -15,7 +27,7 @@
 #blocked3 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [8, 1], order = [1, 0]}>
 #blocked4 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 4], warpsPerCTA = [8, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0], [0, 16]], block = []}>
-#loc = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":14:1)
+#loc = loc("repro_triton.py":14:1)
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 16, rank = 1}>
 #shared2 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
@@ -97,42 +109,42 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %13 = ttng.async_tma_copy_local_to_global %out_desc_1[%8, %offs_cn] %out_desc_staging {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 0>} : !tt.tensordesc<128x32xbf16, #shared2>, !ttg.memdesc<128x32xbf16, #shared2, #smem, mutable> -> !ttg.async.token loc(#loc32)
       ttng.async_tma_store_token_wait %13   {loop.cluster = 0 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 0>} : !ttg.async.token loc(#loc32)
       scf.yield %tile_id_c_12, %acc_24 : i32, !ttg.async.token loc(#loc2)
-    } {tt.scheduled_max_stage = 2 : i32, tt.separate_epilogue_store = true, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["epilogue", "gemm", "epilogue_store", "load", "computation"], ttg.warp_specialize.tag = 0 : i32} loc(#loc52)
+    } {tt.scheduled_max_stage = 2 : i32, tt.separate_epilogue_store = true, tt.smem_circular_reuse = true, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["epilogue", "gemm", "epilogue_store", "load", "computation"], ttg.warp_specialize.tag = 0 : i32} loc(#loc52)
     tt.return loc(#loc)
   } loc(#loc)
 } loc(#loc)
 #loc1 = loc(unknown)
-#loc2 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":26:5)
-#loc3 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":24:24)
-#loc4 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":21:5)
-#loc5 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":17:16)
-#loc6 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":16:17)
-#loc7 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":20:17)
-#loc8 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":25:17)
-#loc9 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":32:20)
-#loc10 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":8:16)
-#loc11 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":27:24)
-#loc12 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":9:19)
-#loc13 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":10:19)
-#loc14 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":10:15)
-#loc15 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":11:27)
-#loc16 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":11:12)
-#loc17 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":11:48)
-#loc18 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":11:47)
-#loc19 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":30:30)
-#loc20 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":30:17)
-#loc21 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":31:30)
-#loc22 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":31:17)
-#loc23 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":32:30)
-#loc24 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":33:9)
-#loc25 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":34:24)
-#loc26 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":35:19)
-#loc27 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":39:29)
-#loc28 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":39:20)
-#loc29 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":42:25)
-#loc30 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":42:53)
-#loc31 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":42:52)
-#loc32 = loc("/data/users/jananisriram/agent_space/bias_tma/repro_triton.py":42:9)
+#loc2 = loc("repro_triton.py":26:5)
+#loc3 = loc("repro_triton.py":24:24)
+#loc4 = loc("repro_triton.py":21:5)
+#loc5 = loc("repro_triton.py":17:16)
+#loc6 = loc("repro_triton.py":16:17)
+#loc7 = loc("repro_triton.py":20:17)
+#loc8 = loc("repro_triton.py":25:17)
+#loc9 = loc("repro_triton.py":32:20)
+#loc10 = loc("repro_triton.py":8:16)
+#loc11 = loc("repro_triton.py":27:24)
+#loc12 = loc("repro_triton.py":9:19)
+#loc13 = loc("repro_triton.py":10:19)
+#loc14 = loc("repro_triton.py":10:15)
+#loc15 = loc("repro_triton.py":11:27)
+#loc16 = loc("repro_triton.py":11:12)
+#loc17 = loc("repro_triton.py":11:48)
+#loc18 = loc("repro_triton.py":11:47)
+#loc19 = loc("repro_triton.py":30:30)
+#loc20 = loc("repro_triton.py":30:17)
+#loc21 = loc("repro_triton.py":31:30)
+#loc22 = loc("repro_triton.py":31:17)
+#loc23 = loc("repro_triton.py":32:30)
+#loc24 = loc("repro_triton.py":33:9)
+#loc25 = loc("repro_triton.py":34:24)
+#loc26 = loc("repro_triton.py":35:19)
+#loc27 = loc("repro_triton.py":39:29)
+#loc28 = loc("repro_triton.py":39:20)
+#loc29 = loc("repro_triton.py":42:25)
+#loc30 = loc("repro_triton.py":42:53)
+#loc31 = loc("repro_triton.py":42:52)
+#loc32 = loc("repro_triton.py":42:9)
 #loc45 = loc("num_pid_in_group"(#loc3))
 #loc46 = loc("grid_m"(#loc4))
 #loc47 = loc("out_desc"(#loc5))

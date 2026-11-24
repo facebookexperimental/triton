@@ -930,7 +930,7 @@ static std::optional<unsigned> getChannelAnnotationOperandIdx(StringRef name) {
     return 0;
   if (name == "opndB")
     return 1;
-  if (name == tt::kAutoWSOperandDTag)
+  if (name == "opndD")
     return 2;
   // In TCGen5MMAScaledOp, acc_dep is operand 3, so scales are operands 4/5.
   if (name == "opndAScale" || name == "opndA_scale")
@@ -952,9 +952,9 @@ parseChannelAnnotations(Operation *parentOp) {
   std::map<unsigned, std::pair<unsigned, Operation *>> bufferIdToInfo;
 
   parentOp->walk([&](Operation *op) {
-    if (!op->hasAttr(tt::kAutoWSAnnotationAttrName))
+    if (!op->hasAttr("tt.autows"))
       return;
-    auto attr = op->getAttrOfType<StringAttr>(tt::kAutoWSAnnotationAttrName);
+    auto attr = op->getAttrOfType<StringAttr>("tt.autows");
     if (!attr)
       return;
     auto parsed = llvm::json::parse(attr.getValue());
@@ -965,7 +965,7 @@ parseChannelAnnotations(Operation *parentOp) {
     auto *obj = parsed->getAsObject();
     if (!obj)
       return;
-    auto *channelsArr = obj->getArray(tt::kAutoWSChannelsKey);
+    auto *channelsArr = obj->getArray("channels");
     if (!channelsArr)
       return;
     for (auto &elem : *channelsArr) {
@@ -1042,8 +1042,7 @@ parseChannelAnnotations(Operation *parentOp) {
       }
 
       // Check for operand D annotated as SMEM (always TMEM).
-      if (StringRef(ann.operand) == tt::kAutoWSOperandDTag &&
-          ann.memType != "tmem") {
+      if (ann.operand == "opndD" && ann.memType != "tmem") {
         LDBG("WARNING: opndD must be tmem, got '" << ann.memType
                                                   << "' — correcting to tmem");
         ann.memType = "tmem";
@@ -1884,17 +1883,10 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
     // Pick the target with the lowest order (earliest last consumer).
     // Tiebreak: within the same linearOrder, prefer the target whose last
     // consumer appears earlier in program order (its SMEM is free sooner).
-    // Seed an unknown-order search only for TMA store staging.  Its consumers
-    // are outside the pipelined inner loop and therefore intentionally have no
-    // loop.stage; the code partitioner supplies the cross-tile WAR edge needed
-    // by allocation.reuseTarget.  Ordinary buffers still require a known
-    // order: allowing them through this fallback can create unsynchronized
-    // reuse chains and make the planner under-count their physical storage.
-    bool isBetter = best == nullptr &&
-                    (effectiveOrder != INT_MAX || candidate.tmaStaging != 0);
-    if (!isBetter && effectiveOrder < bestOrder.linearOrder) {
+    bool isBetter = false;
+    if (effectiveOrder < bestOrder.linearOrder) {
       isBetter = true;
-    } else if (!isBetter && effectiveOrder == bestOrder.linearOrder &&
+    } else if (effectiveOrder == bestOrder.linearOrder &&
                bestOrder.linearOrder != INT_MAX && order.lastOp &&
                bestOrder.lastOp &&
                order.lastOp->getBlock() == bestOrder.lastOp->getBlock() &&
@@ -2199,6 +2191,7 @@ static unsigned allocateSmemBuffersViaSearch(
   // output-store staging is single-store, instead of deferring the whole
   // kernel.
   bool needsFallback = !allocToAnnotation.empty();
+  Operation *unalignedTMALoadSlot = nullptr;
   funcOp->walk([&](Operation *op) {
     if (isa<ttng::SubtiledRegionOp>(op))
       needsFallback = true;
@@ -2215,10 +2208,23 @@ static unsigned allocateSmemBuffersViaSearch(
       // A TMA landing buffer that is not a multiple of 128 bytes must stay
       // single-buffered (see isUnalignedTMALoadSlot); the search does not
       // model that cap.
-      if (isUnalignedTMALoadSlot(alloc, getSmemAllocSizeBytes(alloc), channels))
+      if (!unalignedTMALoadSlot &&
+          isUnalignedTMALoadSlot(alloc, getSmemAllocSizeBytes(alloc),
+                                 channels)) {
+        unalignedTMALoadSlot = alloc;
         needsFallback = true;
+      }
     }
   });
+  // This disables the search for the whole kernel, not just this buffer, so
+  // say so instead of changing the plan quietly.
+  if (unalignedTMALoadSlot)
+    unalignedTMALoadSlot->emitRemark()
+        << "SMEM plan-search: TMA landing buffer \""
+        << getLocName(unalignedTMALoadSlot) << "\" ("
+        << getSmemAllocSizeBytes(cast<ttg::LocalAllocOp>(unalignedTMALoadSlot))
+        << "B) is not a multiple of its TMA alignment and stays "
+           "single-buffered; using the heuristic planner for this kernel";
   if (needsFallback) {
     LDBG("SMEM plan-search: unmodeled feature present, falling back to "
          "heuristic");
@@ -5540,6 +5546,20 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
     LLVM_DEBUG(funcOp.dump());
     LLVM_DEBUG(planner.dumpBuffers());
   }
+
+  // Phase 4 keeps unaligned TMA landing buffers single-buffered, but a floor or
+  // annotation (or the original algorithm) can still give one several copies;
+  // every odd copy is then misaligned. Say so at compile time.
+  funcOp->walk([&](ttg::LocalAllocOp alloc) {
+    auto copies = alloc->getAttrOfType<IntegerAttr>("buffer.copy");
+    if (copies && copies.getInt() > 1 &&
+        isUnalignedTMALoadSlot(alloc, getSmemAllocSizeBytes(alloc), channels))
+      alloc.emitWarning()
+          << "TMA landing buffer \"" << getLocName(alloc) << "\" ("
+          << getSmemAllocSizeBytes(alloc) << "B) has " << copies.getInt()
+          << " copies but is not a multiple of its TMA alignment; copies "
+             "after the first are misaligned";
+  });
 
   // Dump combined key ops + channel graph (side by side visualization)
   // Note: Placed before MemoryPlannerTmem to visualize state even if TMEM
