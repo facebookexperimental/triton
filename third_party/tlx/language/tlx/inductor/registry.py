@@ -199,6 +199,16 @@ def _warppipe_operands_fit_int32(kernel_inputs, *, per_batch: bool) -> bool:
     return _guard_int32_spans(V.graph.sizevars, (a_span, b_span), (*a_stride, *b_stride))
 
 
+def _mm_allow_tf32(kernel_inputs: MMKernelInputs) -> bool:
+    """Whether Inductor runs this FP32 GEMM as TF32, as its own templates decide."""
+    try:
+        from torch._inductor.template_heuristics.triton import mm_allow_tf32
+    except ImportError:
+        return torch.backends.cuda.matmul.allow_tf32
+    m, n, k = kernel_inputs.mnk_symbolic()
+    return mm_allow_tf32(m, n, k, kernel_inputs.device_type)
+
+
 @dataclasses.dataclass
 class TlxGemmConfig(GemmConfig):
     """
@@ -409,37 +419,11 @@ def _warppipe_tile_fits(
     return resources.AMD_WARP_PIPE.validate(cfg, smem_margin=margin)
 
 
-def _select_group_size_m(M: int, N: int, block_m: int) -> int:
-    """
-    Select GROUP_SIZE_M based on the golden rule for tile scheduling.
-
-    GROUP_SIZE_M controls how tiles are traversed:
-    - GROUP_SIZE_M = 1: Column-major (sweep M first), reuses B tiles
-    - GROUP_SIZE_M = large: Row-major (sweep N first), reuses A tiles
-
-    Golden rule:
-    - When M >> N: Use small GROUP_SIZE_M to reuse B (smaller dimension)
-    - When N >> M: Use large GROUP_SIZE_M to reuse A (smaller dimension)
-    - When M ~ N: Use moderate GROUP_SIZE_M for L2 locality
-    """
-    num_m_tiles = (M + block_m - 1) // block_m
-    ratio = M / max(N, 1)
-
-    if ratio > 10:
-        # M >> N: sweep M, reuse B
-        return 1
-    elif ratio < 0.1:
-        # N >> M: sweep N, reuse A
-        return min(64, num_m_tiles)
-    else:
-        # Balanced: moderate group size for L2 locality
-        return min(8, num_m_tiles)
-
-
 def _is_config_valid(
     config: dict[str, Any],
     tma_epilogue_store: bool = False,
     smem_margin: int = 0,
+    elem_bytes: int = resources.OPERAND_ELEM_BYTES,
     out_elem_bytes: int = resources.OPERAND_ELEM_BYTES,
 ) -> bool:
     """Check if a config is valid based on hardware constraints.
@@ -448,7 +432,8 @@ def _is_config_valid(
     ``out_elem_bytes`` per element; see ``resources.estimate_smem``.
     """
     return validate_config(
-        dataclasses.replace(BlackwellWSGemmConfig.from_dict(config), out_elem_bytes=out_elem_bytes),
+        dataclasses.replace(BlackwellWSGemmConfig.from_dict(config), elem_bytes=elem_bytes,
+                            out_elem_bytes=out_elem_bytes),
         charge_epilogue=tma_epilogue_store,
         split_k=config.get("SPLIT_K", 1),
         smem_margin=smem_margin,
@@ -498,12 +483,14 @@ def get_heuristic_config(
     Select optimal GEMM config based on problem shape characteristics.
 
     This implements heuristic rules for TLX Blackwell GEMM kernel configuration.
-    Rules are evaluated in order (first match wins).
+    Rules are evaluated in order (first match wins). Rules 1b (AI <= 1.5), 3, 4
+    and 7 come from tlx.ops ``sm100.get_heuristic_config``; the rest are torchTLX
+    overlays on it.
 
     Heuristic Rules Index:
     ----------------------
     Rule 0: Fallback (Candidate Scoring)
-        - Condition: No single-config rule matches, or block size validation fails
+        - Condition: Block size or resource validation fails
         - Config: Selected via _candidate_scorer_evaluate()
         - Use case: Edge cases and shapes not covered by explicit rules
 
@@ -551,6 +538,8 @@ def get_heuristic_config(
         dict: Configuration parameters for the TLX GEMM kernel,
         or None if no valid config can be determined.
     """
+    from triton.tlx.ops.kernels.mm import sm100
+
     if num_sms is None:
         num_sms = current_target().num_sms
 
@@ -592,12 +581,12 @@ def get_heuristic_config(
             elif N < 1024 and N % 256 != 0:
                 use_alt_tiling = True
 
-        # Rule 1a/1b: Tall-M Low-AI, or high-AI with suboptimal BN=256
-        if arithmetic_intensity <= 1.5 or use_alt_tiling:
+        # Rule 1a/1b: high-AI with suboptimal BN=256. AI <= 1.5 is tlx.ops Rule 1b.
+        if use_alt_tiling:
             m_tiles_256 = _math.ceil(M / 256)
             # Rule 1a: Moderate-M — use BM=128 1-CTA to avoid 2-CTA
             # coordination overhead and improve tile granularity.
-            if use_alt_tiling and m_tiles_256 <= num_sms // 2:
+            if m_tiles_256 <= num_sms // 2:
                 config = {
                     "BLOCK_SIZE_M": 128,
                     "BLOCK_SIZE_N": 256,
@@ -624,34 +613,6 @@ def get_heuristic_config(
                     "SPLIT_K": 1,
                     "INTERLEAVE_EPILOGUE": 1,
                 }
-        # Rule 3: Tall-M High-AI, K > N*2 — large BLOCK_K for fewer K-iterations
-        elif K > N * 2:
-            config = {
-                "BLOCK_SIZE_M": 256,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 128,
-                "NUM_SMEM_BUFFERS": 2,
-                "NUM_TMEM_BUFFERS": 1,
-                "NUM_MMA_GROUPS": 2,
-                "EPILOGUE_SUBTILE": 4,
-                "NUM_CTAS": 2,
-                "SPLIT_K": 1,
-                "INTERLEAVE_EPILOGUE": 0,
-            }
-        # Rule 4: Tall-M High-AI, K <= N*2 — more SMEM buffers, interleaved epilogue
-        else:
-            config = {
-                "BLOCK_SIZE_M": 256,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 64,
-                "NUM_SMEM_BUFFERS": 4,
-                "NUM_TMEM_BUFFERS": 1,
-                "NUM_MMA_GROUPS": 2,
-                "EPILOGUE_SUBTILE": 4,
-                "NUM_CTAS": 2,
-                "SPLIT_K": 1,
-                "INTERLEAVE_EPILOGUE": 1,
-            }
 
     # Characteristic 2: Undersaturated shapes — use split-K to improve parallelism.
     # The template writes fp32 partials to a workspace; a separate reduction
@@ -696,27 +657,13 @@ def get_heuristic_config(
             "INTERLEAVE_EPILOGUE": 1,
         }
 
-    # Rule 7: GPU-Saturated General (Wide-N)
-    elif gpu_saturated:
-        config = {
-            "BLOCK_SIZE_M": 256,
-            "BLOCK_SIZE_N": 256,
-            "BLOCK_SIZE_K": 64,
-            "NUM_SMEM_BUFFERS": 3,
-            "NUM_TMEM_BUFFERS": 1,
-            "NUM_MMA_GROUPS": 2,
-            "EPILOGUE_SUBTILE": 4,
-            "NUM_CTAS": 1,
-            "SPLIT_K": 1,
-            "INTERLEAVE_EPILOGUE": 1,
-        }
-
-    # Rule 0: Fallback (Candidate Scoring)
+    # Rules 1b (AI <= 1.5), 3, 4 and 7: every remaining shape is saturated, so
+    # tlx.ops returns one of these rules and never reaches its own scorer.
     if config is None:
-        config = _candidate_scorer_evaluate(M, N, K, num_sms)
-
-    if config is None:
-        return None
+        config = sm100.get_heuristic_config(M, N, K, num_sms)
+        if config is None:
+            return None
+        config.pop("pre_hook", None)
 
     # Validate block sizes don't exceed problem dimensions
     block_n = config["BLOCK_SIZE_N"]
@@ -741,12 +688,8 @@ def get_heuristic_config(
     # Post-process: add GROUP_SIZE_M and ctas_per_cga
     block_m = config["BLOCK_SIZE_M"]
     num_ctas = config["NUM_CTAS"]
-    config["GROUP_SIZE_M"] = _select_group_size_m(M, N, block_m)
-    # GROUP_SIZE_M must be a multiple of NUM_CTAS so that consecutive
-    # tile_ids (paired CTAs in a cluster) map to the same pid_n.
-    if num_ctas > 1:
-        gsm = config["GROUP_SIZE_M"]
-        config["GROUP_SIZE_M"] = ((gsm + num_ctas - 1) // num_ctas) * num_ctas
+    # A multiple of NUM_CTAS, so paired CTAs in a cluster map to the same pid_n.
+    config["GROUP_SIZE_M"] = sm100.select_group_size_m(M, N, block_m, num_ctas)
     config["ctas_per_cga"] = (num_ctas, 1, 1) if num_ctas > 1 else None
 
     return config
@@ -1005,8 +948,11 @@ def _host_tma_operands(kernel_inputs) -> dict[str, bool]:
         return {"HOST_SIDE_TMA": False, "HOST_TMA_A": False, "HOST_TMA_B": False}
     launch_dims = getattr(triton_heuristics, "HOST_TMA_SYMBOLIC_DIMS", False) and not V.graph.cpp_wrapper
     dim_types = (int, sympy.Integer, sympy.Symbol) if launch_dims else (int, sympy.Integer)
-    a_host, b_host = (all(isinstance(dim, dim_types)
-                          for dim in (*mat.get_size(), *mat.get_stride()))
+    # The prologue offsets an input with a storage offset (`B = arg_B + 96`), which a
+    # host descriptor cannot take, so build that one on the device.
+    a_host, b_host = (mat.get_layout().offset == 0
+                      and all(isinstance(dim, dim_types)
+                              for dim in (*mat.get_size(), *mat.get_stride()))
                       for mat in kernel_inputs.mat1mat2())
     return {"HOST_SIDE_TMA": a_host or b_host, "HOST_TMA_A": a_host, "HOST_TMA_B": b_host}
 
@@ -1115,6 +1061,15 @@ class HopperGemmWSConfigHeuristic(TMATemplateConfigMixin, CUDAConfigHeuristic):
 @register_template_heuristic(hopper_gemm_ws_template.uid, "cuda", register=not IS_ROCM, op_name="addmm")
 class HopperGemmWSAddMMConfigHeuristic(AddMMConfigMixin, HopperGemmWSConfigHeuristic):
     """addmm on the SM90 WS template; the bias rides the template's epilogue."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        # The bias is loaded through the same per-slice SMEM scratch as a fused
+        # epilogue input, which the deepest rings (e.g. 128x256 at 4 stages) do
+        # not leave room for: they fail to launch with OutOfResources.
+        for meta in super()._get_template_configs_impl(kernel_inputs, op_name):
+            if meta["SPLIT_K"] == 1:
+                meta["NUM_STAGES"] = _hopper_ws_fused_epilogue_stages(meta)
+            yield meta
 
 
 @register_template_heuristic(hopper_gemm_small_k_template.uid, "cuda", register=not IS_ROCM, op_name="mm")
@@ -1244,18 +1199,24 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
         num_mma_groups: int,
         num_ctas: int,
         epilogue_subtile: int,
+        elem_bytes: int = resources.OPERAND_ELEM_BYTES,
+        out_elem_bytes: int = resources.OPERAND_ELEM_BYTES,
     ) -> bool:
         """Validate the final tile's structural rules and SMEM with a safety margin."""
         return validate_config(
-            cls._tile(
-                block_m,
-                block_n,
-                block_k,
-                num_smem_buffers,
-                num_tmem_buffers,
-                num_mma_groups,
-                num_ctas,
-                epilogue_subtile,
+            dataclasses.replace(
+                cls._tile(
+                    block_m,
+                    block_n,
+                    block_k,
+                    num_smem_buffers,
+                    num_tmem_buffers,
+                    num_mma_groups,
+                    num_ctas,
+                    epilogue_subtile,
+                ),
+                elem_bytes=elem_bytes,
+                out_elem_bytes=out_elem_bytes,
             ),
             charge_epilogue=True,
             smem_margin=cls._SMEM_SAFETY_MARGIN,
@@ -1274,6 +1235,21 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             "A_ROW_MAJOR": mat1_inner_dim == 1,
             "B_ROW_MAJOR": mat2_inner_dim == 1,
         }
+
+    @staticmethod
+    def _has_unsupported_fp32_operands(kernel_inputs: KernelInputs) -> bool:
+        """FP32 runs as TF32, and tcgen05.mma rejects transposed FP32 SMEM operands,
+        so FP32 needs TF32 allowed and K-inner A and B (the template loads operands as stored)."""
+        if not isinstance(kernel_inputs, MMKernelInputs):
+            return False
+        idxs = (kernel_inputs._mat1_idx, kernel_inputs._mat2_idx)
+        if all(kernel_inputs.dtype(idx) != torch.float32 for idx in idxs):
+            return False
+        if not _mm_allow_tf32(kernel_inputs):
+            return True
+        strides = kernel_inputs.strides_hinted()
+        return not (tma_inner_dim(strides[kernel_inputs._mat1_idx]) == 1
+                    and tma_inner_dim(strides[kernel_inputs._mat2_idx]) == 0)
 
     @staticmethod
     def _has_unsupported_layout(kernel_inputs: KernelInputs) -> bool:
@@ -1310,6 +1286,9 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
         m, n, k = kernel_inputs.mnk_hinted()
         num_sms = get_num_sms()
         is_allow_mode = config.triton.tlx_mode == "allow"
+        # The config pool and the heuristic are sized for 2-byte operands.
+        elem_bytes = kernel_inputs.dtype(kernel_inputs._mat1_idx).itemsize
+        wide_operands = elem_bytes != resources.OPERAND_ELEM_BYTES
         out_elem_bytes = kernel_inputs.out_dtype().itemsize
 
         # Try heuristic config selection first (matches tlx_matmul_ws behavior).
@@ -1361,7 +1340,9 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             # config — autotuning configs provide fallback if this is skipped.
             # In force mode, always yield since it's the only config.
             BLOCK_K = template_kwargs["BLOCK_K"]
-            skip_heuristic = is_allow_mode and not self._is_valid_config_with_margin(
+            # A wide-operand heuristic config that cannot launch falls through to
+            # the pool in force mode too.
+            skip_heuristic = (is_allow_mode or wide_operands) and not self._is_valid_config_with_margin(
                 BLOCK_M,
                 BLOCK_N,
                 BLOCK_K,
@@ -1370,6 +1351,8 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                 heuristic_config["NUM_MMA_GROUPS"],
                 NUM_CTAS,
                 heuristic_config["EPILOGUE_SUBTILE"],
+                elem_bytes,
+                out_elem_bytes,
             )
             heuristic_yielded = False
             if skip_heuristic:
@@ -1392,7 +1375,7 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                     yield template_kwargs
                     heuristic_yielded = True
                 else:
-                    for tma_kwargs in self._yield_tma_variants(template_kwargs, out_elem_bytes):
+                    for tma_kwargs in self._yield_tma_variants(template_kwargs, elem_bytes, out_elem_bytes):
                         yield tma_kwargs
                         heuristic_yielded = True
 
@@ -1458,6 +1441,8 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                     NUM_MMA_GROUPS,
                     NUM_CTAS,
                     EPILOGUE_SUBTILE,
+                    elem_bytes,
+                    out_elem_bytes,
             ):
                 continue
 
@@ -1469,11 +1454,12 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                 }
 
             # Yield TMA epilogue store variant(s)
-            yield from self._yield_tma_variants(template_kwargs, out_elem_bytes)
+            yield from self._yield_tma_variants(template_kwargs, elem_bytes, out_elem_bytes)
 
     @staticmethod
     def _yield_tma_variants(
         template_kwargs: dict[str, Any],
+        elem_bytes: int = resources.OPERAND_ELEM_BYTES,
         out_elem_bytes: int = resources.OPERAND_ELEM_BYTES,
     ) -> Generator[dict[str, Any], None, None]:
         """Yield TMA_EPILOGUE_STORE=1 (preferred) or TMA=0 fallback.
@@ -1505,13 +1491,14 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             # but can fail after fusion adds SMEM in the final codegen.
             _TMA_SMEM_MARGIN = 8192
             if _is_config_valid(config_dict, tma_epilogue_store=True, smem_margin=_TMA_SMEM_MARGIN,
-                                out_elem_bytes=out_elem_bytes):
+                                elem_bytes=elem_bytes, out_elem_bytes=out_elem_bytes):
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 1}
             else:
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 0}
         else:
             # 2-CTA requires TMA (tl.store incompatible with MultiCTAReduction)
-            if _is_config_valid(config_dict, tma_epilogue_store=True, out_elem_bytes=out_elem_bytes):
+            if _is_config_valid(config_dict, tma_epilogue_store=True, elem_bytes=elem_bytes,
+                                out_elem_bytes=out_elem_bytes):
                 yield {**template_kwargs, "TMA_EPILOGUE_STORE": 1}
 
 
@@ -2686,7 +2673,6 @@ class Gfx950MMPersistentTemplateConfigHeuristic(_Gfx950TLXModeMixin, ROCmMMTempl
             BLOCK_M=256,
             BLOCK_N=block_n,
             BLOCK_K=64,
-            K_BLOCKS=k // 64,
             NUM_PROGRAMS=256,
             matrix_instr_nonkdim=16,
             enable_sched_group_barrier_scheduler=True,
@@ -3202,6 +3188,9 @@ class BlackwellGemmWSConfigHeuristic(BlackwellGemmWSConfigMixin, CUDAConfigHeuri
         """
         if self._has_unsupported_layout(inputs):
             log.debug("TLX blackwell_gemm_ws declined: unsupported TMA layout")
+            return False
+        if self._has_unsupported_fp32_operands(inputs):
+            log.debug("TLX blackwell_gemm_ws declined: FP32 operands need TF32 and K-major layouts")
             return False
         if config.triton.tlx_mode in ("allow", "force"):
             return True
@@ -4203,7 +4192,7 @@ _BLACKWELL_WS_META_KEYS = frozenset({
 _BLACKWELL_WS_FUSED_SMEM_MARGIN = 4096
 
 
-def _blackwell_ws_tma_smem(meta: dict[str, Any], out_elem_bytes: int) -> int:
+def _blackwell_ws_tma_smem(meta: dict[str, Any], elem_bytes: int, out_elem_bytes: int) -> int:
     """SMEM of a Blackwell WS config whose TMA epilogue stages ``out_elem_bytes`` outputs."""
     tile = BlackwellWSGemmConfig(
         block_m=meta["BLOCK_M"],
@@ -4214,6 +4203,7 @@ def _blackwell_ws_tma_smem(meta: dict[str, Any], out_elem_bytes: int) -> int:
         num_mma_groups=meta["NUM_MMA_GROUPS"],
         num_ctas=meta["NUM_CTAS"],
         epilogue_subtile=meta["EPILOGUE_SUBTILE"],
+        elem_bytes=elem_bytes,
         out_elem_bytes=out_elem_bytes,
     )
     return resources.BlackwellWSGemmModel.estimate_smem(tile, charge_epilogue=True)
@@ -4237,9 +4227,11 @@ def _maybe_fit_blackwell_ws_fused_epilogue(  # type: ignore[no-untyped-def]
     out_bytes = V.graph.get_dtype(out_name).itemsize
     if out_bytes <= template_node.node.get_dtype().itemsize:
         return
+    # A (after any addmm bias prefix input) sets the operand ring's element size.
+    elem_bytes = kernel.input_nodes[getattr(kernel, "prefix_args", 0)].get_dtype().itemsize
     fitted = dict(meta)
     limit = BLACKWELL_LIMITS.on_chip_bytes - _BLACKWELL_WS_FUSED_SMEM_MARGIN
-    while _blackwell_ws_tma_smem(fitted, out_bytes) > limit:
+    while _blackwell_ws_tma_smem(fitted, elem_bytes, out_bytes) > limit:
         # A 32-wide fp32 slice is the narrowest 128-byte TMA box.
         if fitted["slice_size"] >= 64:
             fitted["EPILOGUE_SUBTILE"] *= 2
@@ -4253,7 +4245,7 @@ def _maybe_fit_blackwell_ws_fused_epilogue(  # type: ignore[no-untyped-def]
         return
     # These reach the kernel only through their constexpr defines; meta is
     # shared with the unfused renders of this choice, so copy it.
-    if _blackwell_ws_tma_smem(fitted, out_bytes) > BLACKWELL_LIMITS.on_chip_bytes:
+    if _blackwell_ws_tma_smem(fitted, elem_bytes, out_bytes) > BLACKWELL_LIMITS.on_chip_bytes:
         log.warning("tlx_blackwell_gemm_ws: fused %d-byte epilogue output does not fit in SMEM", out_bytes)
     for key in changed:
         kernel.defines, count = re.subn(rf"^{key} : tl\.constexpr = \d+$", f"{key} : tl.constexpr = {fitted[key]}",
@@ -4547,24 +4539,23 @@ TritonScheduling.create_kernel_choices = _tlx_create_kernel_choices  # type: ign
 # which times each template with its epilogue fused against the unfused best,
 # only under max_autotune. Without it a vendor GEMM can win on GEMM-only time
 # and leave the epilogue as a separate pass. TorchTLX does not depend on
-# max_autotune, so take the deferred path on Blackwell whenever TLX is on, and
-# on gfx942 whenever a TLX template is racing in allow mode.
+# max_autotune, so take the deferred path whenever TLX is on (allow or force)
+# on an arch with TLX GEMM templates.
 # ---------------------------------------------------------------------------
 
 _orig_algorithm_selector_call = AlgorithmSelectorCache.__call__
 
 
-def _tlx_defers_selection(choices) -> bool:
+def _tlx_defers_selection() -> bool:
     if config.triton.tlx_mode is None:
         return False
-    if current_target().is_blackwell:
-        return True
-    return config.triton.tlx_mode == "allow" and _is_gfx942() and any(_is_tlx_choice(c) for c in choices)
+    target = current_target()
+    return target.is_blackwell or target.is_hopper or target.is_gfx942 or target.is_gfx950
 
 
 def _tlx_algorithm_selector_call(self, name, choices, *args, **kwargs):
     if (kwargs.get("return_multi_template") and not (config.max_autotune or config.max_autotune_gemm)
-            and _tlx_defers_selection(choices)):
+            and _tlx_defers_selection()):
         with config.patch(max_autotune_gemm=True):
             return _orig_algorithm_selector_call(self, name, choices, *args, **kwargs)
     return _orig_algorithm_selector_call(self, name, choices, *args, **kwargs)
@@ -4824,3 +4815,8 @@ install_reduction_epilogue()
 # tlx_config.sdpa_to_flex is on (no-op otherwise).
 
 register_sdpa_to_flex()
+
+# Lower eligible (K, 1) convolutions to GEMMs when tlx_config.conv1d_to_mm is on.
+from .conv1d_to_mm import register_conv1d_to_mm  # noqa: E402
+
+register_conv1d_to_mm()

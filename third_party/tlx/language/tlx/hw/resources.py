@@ -302,6 +302,8 @@ class BlackwellWSGemmConfig:
     num_mma_groups: int
     num_ctas: int
     epilogue_subtile: int
+    #: Bytes per element of the A/B operands.
+    elem_bytes: int = OPERAND_ELEM_BYTES
     #: Bytes per element of the epilogue staging buffer (the stored output).
     out_elem_bytes: int = OPERAND_ELEM_BYTES
 
@@ -365,8 +367,8 @@ class BlackwellWSGemmModel:
         ``split_k > 1`` adds the fp32 partials workspace, which is torchTLX
         specific -- upstream stages split-K partials in the output dtype.
         """
-        smem_a = (tile.block_m * tile.block_k * OPERAND_ELEM_BYTES * tile.num_smem_buffers)
-        smem_b = (tile.block_k * (tile.block_n // tile.num_ctas) * OPERAND_ELEM_BYTES * tile.num_smem_buffers)
+        smem_a = (tile.block_m * tile.block_k * tile.elem_bytes * tile.num_smem_buffers)
+        smem_b = (tile.block_k * (tile.block_n // tile.num_ctas) * tile.elem_bytes * tile.num_smem_buffers)
         # The template double-buffers the staging tile even with one MMA group.
         smem_epilog = (max(tile.num_mma_groups, 2) * tile.block_m_per_group * tile.slice_size *
                        tile.out_elem_bytes if charge_epilogue else 0)
