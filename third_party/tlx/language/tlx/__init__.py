@@ -96,7 +96,7 @@ from .mma_ops import (
     release_layout,
     tcgen05_commit,
 )
-from .packed_arith import packed_add4, packed_fma4, packed_mul4, packed_sub4
+from .packed_arith import packed_add2, packed_add4, packed_exp2, packed_fma4, packed_mul4, packed_sub4
 from .types import (
     async_token,
     buffered_tensor,
@@ -136,7 +136,9 @@ from .types import (
     TMemCTAMode,
 )
 from .utility import (
+    amd_scaled_downcast_fp4,
     amd_scaled_downcast_fp8,
+    amd_scaled_upcast_fp4,
     async_task_replica_id,
     clock64,
     cluster_cta_rank,
@@ -158,6 +160,8 @@ __all__ = [
     "async_tasks",
     "async_task",
     # packed arithmetic
+    "packed_add2",
+    "packed_exp2",
     "packed_add4",
     "packed_sub4",
     "packed_mul4",
@@ -283,7 +287,9 @@ __all__ = [
     "release_layout",
     "tcgen05_commit",
     # utility
+    "amd_scaled_downcast_fp4",
     "amd_scaled_downcast_fp8",
+    "amd_scaled_upcast_fp4",
     "cluster_cta_rank",
     "cluster_size_1d",
     "thread_id",
