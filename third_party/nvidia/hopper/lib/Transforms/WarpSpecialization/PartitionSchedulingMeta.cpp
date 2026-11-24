@@ -113,6 +113,8 @@ inline Operation *getAccumulatorBuffer(Operation *op) {
   return nullptr;
 }
 
+static bool isScalarOp(Operation *op);
+
 static void dropWarpSpec(LoopLikeOpInterface loop) {
   loop->removeAttr(triton::kWarpSpecializeAttrName);
   loop->removeAttr(kPartitionStagesAttrName);
@@ -1897,9 +1899,14 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   SmallVector<
       std::tuple<Operation *, LoopLikeOpInterface, SetVector<Operation *>>>
       nonMMALoads;
-  if (defaultPartition &&
+  bool scheduleLoadUsers =
+      defaultPartition &&
       (!layout.reductionPartition || defaultPartition != reductionPartition ||
-       mmas.empty())) {
+       mmas.empty());
+  // Without a default partition (e.g. a persistent GEMM laid out as gemm, load
+  // and computation) load users are left to propagatePartitions, but non-MMA
+  // loads are still recorded for the accumulator join below.
+  if (scheduleLoadUsers || (!defaultPartition && !mmas.empty())) {
     for (Operation *loadOrAlloc : loadsAndAllocs) {
       LoopLikeOpInterface parentLoop = getEnclosingSupportedLoop(loadOrAlloc);
       if (!parentLoop) {
@@ -1922,7 +1929,8 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
           continue;
         }
       }
-      scheduleUsers(parentLoop, schedule, defaultPartition, loadOrAlloc);
+      if (scheduleLoadUsers)
+        scheduleUsers(parentLoop, schedule, defaultPartition, loadOrAlloc);
     }
   }
 
@@ -2216,7 +2224,9 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   // input with an accumulator: a scheduled op in the load's slice that also
   // uses an accumulator read (tmem_load, or a WarpGroupDot result). If no such
   // op exists, or the input meets accumulators in more than one partition
-  // (data partitioning), the users keep the default route.
+  // (data partitioning), the users keep the default route. With no default
+  // partition, an input that meets only unplaced accumulator ops joins them
+  // in a new computation partition.
   if (!nonMMALoads.empty()) {
     SetVector<Operation *> accSlice;
     mainLoop->walk([&](Operation *op) {
@@ -2226,20 +2236,40 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
         accSlice.insert(op);
       }
     });
+    Partition *unplacedAccPartition = nullptr;
     for (auto &[load, loop, slice] : nonMMALoads) {
       SetVector<Partition *> dests;
+      bool meetsUnplacedAcc = false;
       for (Operation *op : slice) {
         if (!accSlice.contains(op))
           continue;
         auto ids = safeGetPartitionIds(op);
+        if (ids.empty() && !isScalarOp(op))
+          meetsUnplacedAcc = true;
         if (ids.size() != 1)
           continue;
         Partition *p = schedule.getPartition(ids.front());
         if (p && p != layout.loadPartition)
           dests.insert(p);
       }
+      // Left alone, propagatePartitions gives these users to the load partition
+      // (their only def), which forces an fp32 accumulator handoff (plus a
+      // transposed copy for column reductions) through SMEM every tile.
+      if (!defaultPartition && dests.empty() && meetsUnplacedAcc) {
+        if (!unplacedAccPartition) {
+          unplacedAccPartition = schedule.addPartition(0);
+          unplacedAccPartition->setType("computation");
+        }
+        for (Operation *op : accSlice)
+          if (!op->hasTrait<OpTrait::IsTerminator>() && loop->isAncestor(op) &&
+              op->getParentRegion() == load->getParentRegion())
+            tryScheduleOp(unplacedAccPartition, op);
+        dests.insert(unplacedAccPartition);
+      }
       if (dests.size() != 1) {
-        scheduleUsers(loop, schedule, defaultPartition, load);
+        // With no default partition, leave them to propagatePartitions.
+        if (defaultPartition)
+          scheduleUsers(loop, schedule, defaultPartition, load);
         continue;
       }
       for (Operation *op : slice)
