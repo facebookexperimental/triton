@@ -761,3 +761,21 @@ def test_pinned_rank_changing_reinterpret_feeds_mma(device):
     a_desc = TensorDescriptor(a_packed, [K // 8, M, 8], [M * 8, 8, 1], [K // 8, M, 8])
     _interleaved_a_mma_kernel[(1, )](a_desc, b, c, M, N, K, (K // 8, M, 8), _interleaved_kmajor_layout(M, K, 8), None)
     torch.testing.assert_close(c, (a.float() @ b.float()).half(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_async_descriptor_load_keeps_unswizzled_nvmma_dst(device):
+    """A TMA box with 256-byte rows lands unswizzled when its buffer asks for it, so the bytes keep the global order."""
+    M, N, K = 128, 64, 64
+    rows = M * K * 2 // 256
+    torch.manual_seed(0)
+    a = torch.randn((M, K), device=device, dtype=torch.float16)
+    b = torch.randn((K, N), device=device, dtype=torch.float16)
+    c = torch.empty((M, N), device=device, dtype=torch.float16)
+    a_packed = a.reshape(M, K // 8, 8).permute(1, 0, 2).contiguous().view(1, rows, 128)
+    a_desc = TensorDescriptor(a_packed, [1, rows, 128], [rows * 128, 128, 1], [1, rows, 128])
+    box = (1, rows, 128)
+    unswizzled = tlx.nv_mma_shared_layout_encoding(box, [2, 1, 0], tl.float16, [1] * 3, [1] * 3, [2, 1, 0], False,
+                                                   False)
+    _interleaved_a_mma_kernel[(1, )](a_desc, b, c, M, N, K, box, _interleaved_kmajor_layout(M, K, 8), unswizzled)
+    torch.testing.assert_close(c, (a.float() @ b.float()).half(), atol=1e-2, rtol=1e-2)
