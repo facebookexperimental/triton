@@ -18,6 +18,7 @@
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
@@ -730,6 +731,75 @@ static SmallVector<Operation *> topologicalSort(ArrayRef<Operation *> opList) {
   return sortedOpList;
 }
 
+// True if running `a` after `b` instead of before it may change what either
+// one reads or writes. Kernel pointer arguments may alias (in-place kernels
+// are legal and nothing marks them noalias), so any pair of memory accesses
+// where one writes counts as a conflict.
+static bool mayConflict(Operation *a, Operation *b) {
+  return tt::mayReadOrWriteMemory(a) && tt::mayReadOrWriteMemory(b) &&
+         (tt::mayWriteMemory(a) || tt::mayWriteMemory(b));
+}
+
+// Untagged ops after the warp-specialized loop read what the loop wrote, so
+// they have to run after the partitions finish: move them after `wsOp`. An
+// untagged op has to stay ahead of `wsOp` when a specialized op depends on it
+// (directly or through other untagged ops), or when moving it past a later
+// specialized op, or past a later untagged op that has to stay ahead, may
+// reorder their memory accesses. The walk runs back to front, so the ops after
+// `op` are all decided by the time `op` is. Warn if such an op touches memory,
+// since it then runs before the loop's writes land.
+static void moveUntaggedPostLoopOps(Block *block, ttg::WarpSpecializeOp wsOp,
+                                    const DenseSet<Operation *> &opsInList) {
+  auto loopIt = llvm::find_if(*block, [](Operation &op) {
+    return op
+        .walk([](Operation *nested) {
+          return nested->hasAttr(tt::kWarpSpecializeAttrName)
+                     ? WalkResult::interrupt()
+                     : WalkResult::advance();
+        })
+        .wasInterrupted();
+  });
+  if (loopIt == block->end() || &*loopIt == wsOp.getOperation())
+    return;
+
+  SmallVector<Operation *> postLoopOps;
+  for (Operation &op :
+       llvm::make_range(std::next(loopIt), wsOp->getIterator())) {
+    if (!opsInList.count(&op))
+      postLoopOps.push_back(&op);
+  }
+
+  DenseSet<Operation *> pinned;
+  for (Operation *op : llvm::reverse(postLoopOps)) {
+    bool neededBySpecializedOp =
+        llvm::any_of(op->getUsers(), [&](Operation *u) {
+          Operation *user = block->findAncestorOpInBlock(*u);
+          return user && (opsInList.count(user) || pinned.count(user));
+        });
+    bool conflictsWithLaterPinnedOrSpecializedOp = llvm::any_of(
+        llvm::make_range(std::next(op->getIterator()), wsOp->getIterator()),
+        [&](Operation &later) {
+          return (opsInList.count(&later) || pinned.count(&later)) &&
+                 mayConflict(op, &later);
+        });
+    if (neededBySpecializedOp || conflictsWithLaterPinnedOrSpecializedOp)
+      pinned.insert(op);
+  }
+
+  for (Operation *op : postLoopOps) {
+    if (!pinned.count(op)) {
+      op->moveBefore(block->getTerminator());
+      continue;
+    }
+    if (tt::mayReadOrWriteMemory(op))
+      op->emitWarning("this op runs after the warp-specialized loop but a "
+                      "later op (warp-specialized, or itself kept ahead of the "
+                      "partitions) depends on it or may access the same "
+                      "memory, so it stays ahead of the partitions and may "
+                      "not see the loop's writes");
+  }
+}
+
 } // namespace
 
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
@@ -785,6 +855,8 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   impB.setInsertionPoint(returnOp);
   auto wsOp = ttg::WarpSpecializeOp::create(impB, dummyTypes, partitionNumWarps,
                                             nTaskIds.size() - 1);
+
+  moveUntaggedPostLoopOps(lastBlock, wsOp, opsInList);
 
   // Copy partition types attribute from the loop to the WarpSpecializeOp.
   // This is needed by OptimizePartitionWarps for type-aware warp assignment.
