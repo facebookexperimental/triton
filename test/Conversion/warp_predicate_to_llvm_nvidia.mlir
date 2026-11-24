@@ -12,7 +12,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: llvm.cond_br %arg0, ^[[BODY:bb[0-9]+]], ^[[MERGE:bb[0-9]+]]
   // CHECK: ^[[BODY]]:
   // CHECK-NOT: nvvm.barrier
-  // CHECK: tcgen05.ld.sync.aligned
+  // CHECK: nvvm.tcgen05.ld {{.*}}shape = shape_32x32b : vector<128xi32>
   // CHECK-NOT: nvvm.barrier
   // CHECK: nvvm.tcgen05.wait <load>
   // CHECK-NOT: nvvm.barrier

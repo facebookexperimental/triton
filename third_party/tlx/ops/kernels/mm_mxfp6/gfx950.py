@@ -29,21 +29,27 @@ def _fp6_codes_from_bytes(b0, b1, b2):
 
 
 @triton.jit
-def _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-               BLOCK_SIZE_K: tl.constexpr):
-    a0 = tl.load(a_bptrs)
-    a1 = tl.load(a_bptrs + 1)
-    a2 = tl.load(a_bptrs + 2)
+def _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, valid_m, valid_n, K, k_offset, BLOCK_SIZE_M: tl.constexpr,
+               BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+    valid_k = k_offset + 4 * tl.arange(0, BLOCK_SIZE_K // 4) < K
+    valid_sk = k_offset + 32 * tl.arange(0, BLOCK_SIZE_K // 32) < K
+    a_mask = valid_m[:, None] & valid_k[None, :]
+    b_mask = valid_k[:, None] & valid_n[None, :]
+    a0 = tl.load(a_bptrs, mask=a_mask, other=0)
+    a1 = tl.load(a_bptrs + 1, mask=a_mask, other=0)
+    a2 = tl.load(a_bptrs + 2, mask=a_mask, other=0)
     av0, av1, av2, av3 = _fp6_codes_from_bytes(a0, a1, a2)
     a_codes = tl.reshape(tl.join(tl.join(av0, av1), tl.join(av2, av3)), (BLOCK_SIZE_M, BLOCK_SIZE_K)).to(tl.uint8)
-    b0 = tl.load(b_bptrs)
-    b1 = tl.load(b_bptrs + 1)
-    b2 = tl.load(b_bptrs + 2)
+    b0 = tl.load(b_bptrs, mask=b_mask, other=0)
+    b1 = tl.load(b_bptrs + 1, mask=b_mask, other=0)
+    b2 = tl.load(b_bptrs + 2, mask=b_mask, other=0)
     bv0, bv1, bv2, bv3 = _fp6_codes_from_bytes(b0, b1, b2)
     b_codes = tl.reshape(tl.permute(tl.join(tl.join(bv0, bv1), tl.join(bv2, bv3)), (0, 2, 3, 1)),
                          (BLOCK_SIZE_K, BLOCK_SIZE_N)).to(tl.uint8)
-    sa = tl.load(as_ptrs)
-    sb = tl.load(bs_ptrs)
+    # E8M0 byte 127 encodes 1.0, the neutral scale for zero-padded codes.
+    unit_scale = tl.full((), 127, tl.uint8).to(tl.float8e8m0fnu, bitcast=True)
+    sa = tl.load(as_ptrs, mask=valid_m[:, None] & valid_sk[None, :], other=unit_scale)
+    sb = tl.load(bs_ptrs, mask=valid_n[:, None] & valid_sk[None, :], other=unit_scale)
     return a_codes, b_codes, sa, sb
 
 
@@ -80,6 +86,8 @@ def _gemm_mxfp6_native_kernel(
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_t = tl.arange(0, BLOCK_SIZE_K // 4)
     offs_sk = tl.arange(0, BLOCK_SIZE_K // 32)
+    valid_m = offs_m < M
+    valid_n = offs_n < N
 
     a_bptrs = a_ptr + offs_m[:, None] * K + (3 * offs_t)[None, :]
     b_bptrs = b_ptr + offs_n[None, :] * K + (3 * offs_t)[:, None]
@@ -88,41 +96,47 @@ def _gemm_mxfp6_native_kernel(
 
     # Manual staging: at most two tiles live (the compiler pipeliner
     # kept three and spilled), so compiler pipelining is off.
-    a_codes, b_codes, sa, sb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
+    k_offset = 0
+    num_k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    a_codes, b_codes, sa, sb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, valid_m, valid_n, K, k_offset,
+                                          BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     # Manual unroll x2: two staged steps per body, plus at most one
     # remainder step; the final tile dots after the loop.
-    for _ in tl.range(1, K // BLOCK_SIZE_K - 1, 2, num_stages=1):
+    for _ in tl.range(1, num_k_tiles - 1, 2, num_stages=1):
         a_bptrs += BLOCK_SIZE_K * 3 // 4
         b_bptrs += BLOCK_SIZE_K * 3 // 4
         as_ptrs += BLOCK_SIZE_K // 32
         bs_ptrs += BLOCK_SIZE_K // 32
-        na_codes, nb_codes, nsa, nsb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, BLOCK_SIZE_M, BLOCK_SIZE_N,
-                                                  BLOCK_SIZE_K)
+        k_offset += BLOCK_SIZE_K
+        na_codes, nb_codes, nsa, nsb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, valid_m, valid_n, K, k_offset,
+                                                  BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
         acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc)
         a_codes, b_codes, sa, sb = na_codes, nb_codes, nsa, nsb
         a_bptrs += BLOCK_SIZE_K * 3 // 4
         b_bptrs += BLOCK_SIZE_K * 3 // 4
         as_ptrs += BLOCK_SIZE_K // 32
         bs_ptrs += BLOCK_SIZE_K // 32
-        na_codes, nb_codes, nsa, nsb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, BLOCK_SIZE_M, BLOCK_SIZE_N,
-                                                  BLOCK_SIZE_K)
+        k_offset += BLOCK_SIZE_K
+        na_codes, nb_codes, nsa, nsb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, valid_m, valid_n, K, k_offset,
+                                                  BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
         acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc)
         a_codes, b_codes, sa, sb = na_codes, nb_codes, nsa, nsb
-    if (K // BLOCK_SIZE_K - 1) % 2 == 1:
+    if (num_k_tiles - 1) % 2 == 1:
         a_bptrs += BLOCK_SIZE_K * 3 // 4
         b_bptrs += BLOCK_SIZE_K * 3 // 4
         as_ptrs += BLOCK_SIZE_K // 32
         bs_ptrs += BLOCK_SIZE_K // 32
-        na_codes, nb_codes, nsa, nsb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, BLOCK_SIZE_M, BLOCK_SIZE_N,
-                                                  BLOCK_SIZE_K)
+        k_offset += BLOCK_SIZE_K
+        na_codes, nb_codes, nsa, nsb = _load_tile(a_bptrs, b_bptrs, as_ptrs, bs_ptrs, valid_m, valid_n, K, k_offset,
+                                                  BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
         acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc)
         a_codes, b_codes, sa, sb = na_codes, nb_codes, nsa, nsb
     acc = tl.dot_scaled(a_codes, sa, "e2m3", b_codes, sb, "e3m2", acc)
 
     c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
-    tl.store(c_ptrs, acc.to(tl.bfloat16))
+    tl.store(c_ptrs, acc.to(tl.bfloat16), mask=valid_m[:, None] & valid_n[None, :])
 
 
 def _full_configs():

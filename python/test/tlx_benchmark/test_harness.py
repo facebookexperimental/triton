@@ -843,11 +843,13 @@ def test_focus_suite_can_union_other_suites():
         "triton.tlx.ops.kernels.kda._decode_shapes",
         "triton.tlx.ops.kernels.fused.linear_rowscale._shapes",
         "triton.tlx.ops.kernels.fused.moe_router_topk_align._shapes",
+        "triton.tlx.ops.kernels.fused.moe_mxfp4_sort_quant._shapes",
         "triton.tlx.ops.kernels.fused.norm_residual_norm._shapes",
         "triton.tlx.ops.kernels.fused.rmsnorm_gate._shapes",
         "triton.tlx.ops.kernels.mla_window_attn._shapes",
         "triton.tlx.ops.kernels.mm._shapes",
         "triton.tlx.ops.kernels.moe._routing_shapes",
+        "triton.tlx.ops.kernels.moe_finalize._shapes",
         "triton.tlx.ops.kernels.norm._shapes",
         "triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache._shapes",
         "triton.tlx.ops.kernels.router_gemm._shapes",
@@ -916,7 +918,9 @@ def test_operator_focus_suite_names_and_host_defaults_are_stable():
             "gfx942": ("gfx942_all", ),
         },
         "triton.tlx.ops.kernels.fused.moe_router_topk_align._shapes": {"gfx950": ("gfx950_all", )},
+        "triton.tlx.ops.kernels.fused.moe_mxfp4_sort_quant._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.moe._routing_shapes": {"gfx950": ("gfx950_all", )},
+        "triton.tlx.ops.kernels.moe_finalize._shapes": {"sm100": ("sm100_all", )},
         "triton.tlx.ops.kernels.fused.qk_norm_rope_kv_cache._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.router_gemm._shapes": {"gfx950": ("gfx950_all", )},
         "triton.tlx.ops.kernels.swiglu_ffn._shapes": {"sm90": ("sm90_1", )},
@@ -1018,9 +1022,11 @@ BENCH_MODULES = (
     "bench_linear_rowscale",
     "bench_mla_window_attn",
     "bench_mm",
-    "bench_mm_mxfp8",
+    "bench_mm_mxfp",
     "bench_moe_router_topk_align",
+    "bench_moe_mxfp4_sort_quant",
     "bench_moe_routing",
+    "bench_moe_finalize",
     "bench_norm_residual_norm",
     "bench_norm",
     "bench_qk_norm_rope_kv_cache",
@@ -1058,10 +1064,10 @@ def test_synthetic_cases_are_well_formed_without_a_gpu(module_name):
         assert case.key.count("/") >= 3
 
 
-def test_mm_mxfp8_benchmark_covers_both_public_scale_layouts(monkeypatch):
+def test_mm_mxfp_benchmark_covers_both_public_scale_layouts(monkeypatch):
     import importlib
 
-    bench = importlib.import_module("bench_mm_mxfp8")
+    bench = importlib.import_module("bench_mm_mxfp")
     monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
     cases = bench.cases(synthetic=True)
     assert {case.shape[-1] for case in cases} == {"natural", "cublas_blocked"}
@@ -1070,8 +1076,8 @@ def test_mm_mxfp8_benchmark_covers_both_public_scale_layouts(monkeypatch):
     assert all("'sf_layout':" in case.label for case in cases)
 
 
-def test_mm_mxfp8_benchmark_reports_logical_k_for_padded_shapes():
-    from triton.tlx.ops.kernels.mm_mxfp8._shapes import flops, label
+def test_mm_mxfp_benchmark_reports_logical_k_for_padded_shapes():
+    from triton.tlx.ops.kernels.mm_mxfp._shapes import flops, label
 
     rendered = label(85, 3584, 25600, "natural")
     assert "'K': '25536'" in rendered
@@ -1079,10 +1085,10 @@ def test_mm_mxfp8_benchmark_reports_logical_k_for_padded_shapes():
     assert flops(85, 3584, 25600) == 2 * 85 * 3584 * 25536
 
 
-def test_mm_mxfp8_default_uses_preshuffled_contract_where_supported(monkeypatch):
+def test_mm_mxfp_default_uses_preshuffled_contract_where_supported(monkeypatch):
     import importlib
 
-    bench = importlib.import_module("bench_mm_mxfp8")
+    bench = importlib.import_module("bench_mm_mxfp")
     monkeypatch.setattr(bench.driver, "arch", lambda: "gfx950")
     model_cases = [case for case in bench.cases() if case.shape[:3] in bench.MODEL_LINEAR_SHAPE_SET]
     assert len(model_cases) == 30
@@ -1244,6 +1250,186 @@ def test_every_autotuned_kernel_a_case_launches_is_recorded(monkeypatch):
                                                                             num_stages=2)))
     assert Autotuner.run is stub, "the patch must not outlive the launch"
     assert driver._render_configs(captured) == "attn_fwd: BM=64 w4 s2 | attn_bwd: BM=64 w8 s2"
+
+
+def test_autotune_records_keep_the_tuning_origin_without_reusing_old_timings(monkeypatch):
+    from triton import knobs
+    from triton.runtime.autotuner import Autotuner
+    from _harness import driver
+
+    class Tuner:
+
+        def kernel():
+            pass
+
+        base_fn = staticmethod(kernel)
+        configs = [triton.Config({"BLOCK_M": 128}, num_ctas=2, maxnreg=96), triton.Config({"BLOCK_M": 64})]
+
+        def __init__(self):
+            self.cache = {(8, ): self.configs[1]}
+            self.configs_timings = None
+
+    previous_events = []
+
+    def previous_listener(**event):
+        previous_events.append(event)
+
+    monkeypatch.setattr(knobs.autotuning, "listener", previous_listener)
+
+    def launch(self, key, winner):
+        self._last_key = (key, )
+        if self._last_key not in self.cache:
+            self.cache[self._last_key] = self.configs[winner]
+            self.configs_timings = ({self.configs[0]: [0.03, 0.029, 0.031], self.configs[1]: float("inf")}
+                                    if winner == 0 else {self.configs[0]: float("inf"), self.configs[1]: [0.029]})
+            knobs.autotuning.listener(fn=self.base_fn, key=self._last_key, best_config=self.cache[self._last_key],
+                                      configs_timings=self.configs_timings, cache_hit=False, duration=1.0)
+        self.best_config = self.cache[self._last_key]
+
+    monkeypatch.setattr(Autotuner, "run", launch)
+    tuner = Tuner()
+    records = {}
+    with driver._record_configs({}, case_key="Z37", decisions=records):
+        Autotuner.run(tuner, 64, 0)
+    tuned = next(iter(records.values()))
+    assert tuned["selection"] == "tuned" and tuned["selected_by_case"] == "Z37"
+    assert tuned["config"]["num_ctas"] == 2 and tuned["config"]["maxnreg"] == 96
+    assert tuned["candidates"][1]["timings_ms"] == [None]
+    assert len(previous_events) == 1
+
+    inherited = {}
+    with driver._record_configs({}, case_key="Z40", decisions=inherited):
+        Autotuner.run(tuner, 64, 1)
+    cached = next(iter(inherited.values()))
+    assert cached["key"] == ["64"] and cached["selection"] == "cached"
+    assert cached["config"] == tuned["config"] and cached["selected_by_case"] == "Z37"
+    assert cached["candidates"] == []
+    assert len(previous_events) == 1
+
+    tuner.cache.clear()
+    retuned = {}
+    with driver._record_configs({}, case_key="Z43", decisions=retuned):
+        Autotuner.run(tuner, 64, 1)
+    assert next(iter(retuned.values()))["selected_by_case"] == "Z43"
+    assert Autotuner.run is launch and knobs.autotuning.listener is previous_listener
+    result = Result(case=_case(), autotune=list(inherited.values()))
+    assert json.loads(json.dumps(result.to_dict(), allow_nan=False))["autotune"] == list(inherited.values())
+
+
+@pytest.mark.parametrize("single_config", [False, True])
+def test_unobserved_autotune_choices_do_not_invent_a_tuning_origin(monkeypatch, single_config):
+    from triton.runtime.autotuner import Autotuner
+    from _harness import driver
+
+    class Tuner:
+
+        def kernel():
+            pass
+
+        base_fn = staticmethod(kernel)
+        configs = [triton.Config({"BLOCK_M": 64})] * (1 if single_config else 2)
+        best_config = configs[0]
+        cache = {(64, ): best_config}
+        _last_key = (64, )
+        configs_timings = {best_config: [99.0]}
+
+    monkeypatch.setattr(Autotuner, "run", lambda self: None)
+    records = {}
+    with driver._record_configs({}, case_key="Z40", decisions=records):
+        Autotuner.run(Tuner())
+    row = next(iter(records.values()))
+    assert row["selection"] == ("fixed" if single_config else "cached")
+    assert row["selected_by_case"] is None and row["candidates"] == []
+    assert row["key"] == (None if single_config else ["64"])
+
+
+def test_autotune_observers_are_restored_when_warmup_raises(monkeypatch):
+    from triton import knobs
+    from triton.runtime.autotuner import Autotuner
+    from _harness import driver
+
+    previous = knobs.autotuning.listener
+
+    def failed(self):
+        raise RuntimeError("warmup failed")
+
+    monkeypatch.setattr(Autotuner, "run", failed)
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        with driver._record_configs({}, case_key="Z37", decisions={}):
+            Autotuner.run(type("Tuner", (), {"cache": {}})())
+    assert Autotuner.run is failed and knobs.autotuning.listener is previous
+
+
+@pytest.mark.parametrize("recording_fails", [False, True])
+def test_autotune_recording_preserves_measurement_and_best_config(monkeypatch, recording_fails):
+    import types
+    import torch
+    from triton import knobs
+    from triton.runtime.autotuner import Autotuner
+    from _harness import driver
+
+    class Tuner:
+
+        def kernel():
+            pass
+
+        base_fn = staticmethod(kernel)
+
+        def __init__(self, tile):
+            self.cache = {}
+            self.configs = [triton.Config({"BLOCK_M": tile})]
+            self.best_config = self.configs[0]
+
+    prepare_tuner, tlx_tuner, ref_tuner = (Tuner(tile) for tile in (32, 64, 128))
+
+    def prepare_kernel():
+        pass
+
+    def tlx_kernel():
+        pass
+
+    def reference_kernel():
+        pass
+
+    prepare_tuner.base_fn, tlx_tuner.base_fn, ref_tuner.base_fn = prepare_kernel, tlx_kernel, reference_kernel
+
+    def launch(self):
+        return None
+
+    monkeypatch.setattr(Autotuner, "run", launch)
+    previous_listener = knobs.autotuning.listener
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(driver, "host_overhead_us", lambda fn: 0.0)
+    measured = []
+
+    def measure(fn, **kwargs):
+        assert Autotuner.run is launch and knobs.autotuning.listener is previous_listener
+        fn()
+        measured.append(fn)
+        return summarize([10.0])
+
+    monkeypatch.setattr(driver, "measure", measure)
+    if recording_fails:
+
+        def fail(config):
+            raise TypeError("unsupported recording value")
+
+        monkeypatch.setattr(driver, "_config_spec", fail)
+
+    def prepare(case, space):
+        Autotuner.run(prepare_tuner)
+        return driver.Prepared(tlx_fn=lambda: Autotuner.run(tlx_tuner), ref_fn=lambda: Autotuner.run(ref_tuner),
+                               flop_count=1)
+
+    result = driver.run_case(types.SimpleNamespace(prepare=prepare), _case(), space="full", cold=False)
+    assert result.status == Status.OK and result.tlx.mean == 10.0 and len(measured) == 2
+    assert result.best_config == driver._fmt_config(tlx_tuner.best_config)
+    assert {row["phase"] for row in result.autotune} == {"prepare", "warmup", "reference"}
+    if recording_fails:
+        assert all(row.get("recording_error") == "TypeError" for row in result.autotune)
+    else:
+        assert all(row["selection"] == "fixed" for row in result.autotune)
 
 
 def test_an_op_whose_kernels_are_not_autotuned_reports_no_config():
