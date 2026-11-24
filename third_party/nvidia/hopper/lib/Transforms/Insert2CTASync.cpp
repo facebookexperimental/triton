@@ -22,6 +22,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
@@ -95,8 +96,10 @@ static Value computeLoopTripCount(OpBuilder &builder, Location loc,
 // iteration. AutoWS adds such an accumulation counter to persistent loops.
 // The condition can forward only an ordered subset of the before-region
 // arguments, so map the after argument back through scf.condition before
-// looking up its corresponding scf.yield operand.
-static Value findWhileIterationCounter(scf::WhileOp whileOp) {
+// looking up its corresponding scf.yield operand. With `requireZeroInit`, the
+// counter must also start at 0.
+static Value findWhileIterationCounter(scf::WhileOp whileOp,
+                                       bool requireZeroInit = false) {
   auto forwarded = whileOp.getConditionOp().getArgs();
   auto yielded = whileOp.getYieldedValues();
   for (BlockArgument afterArg : whileOp.getAfterArguments()) {
@@ -106,6 +109,9 @@ static Value findWhileIterationCounter(scf::WhileOp whileOp) {
     auto beforeArg = dyn_cast<BlockArgument>(forwarded[afterIdx]);
     if (!beforeArg || beforeArg.getOwner() != whileOp.getBeforeBody() ||
         beforeArg.getArgNumber() >= yielded.size())
+      continue;
+    if (requireZeroInit &&
+        !matchPattern(whileOp.getInits()[beforeArg.getArgNumber()], m_Zero()))
       continue;
 
     auto add = yielded[beforeArg.getArgNumber()].getDefiningOp<arith::AddIOp>();
@@ -125,14 +131,146 @@ static Value findWhileIterationCounter(scf::WhileOp whileOp) {
   return {};
 }
 
+static Value computeClampedTripCount(OpBuilder &builder, Location loc,
+                                     scf::ForOp forOp) {
+  Value tripCount = computeLoopTripCount(builder, loc, forOp);
+  Value nonEmpty =
+      arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::slt,
+                            forOp.getLowerBound(), forOp.getUpperBound());
+  Value zero = arith::ConstantIntOp::create(builder, loc, 0, 64);
+  return arith::SelectOp::create(builder, loc, nonEmpty, tripCount, zero);
+}
+
+// Replaces `whileOp`; returns the new after-region argument.
+static BlockArgument appendWhileCounter(
+    scf::WhileOp whileOp,
+    function_ref<Value(OpBuilder &, Location, BlockArgument)> next) {
+  Location loc = whileOp.getLoc();
+  OpBuilder builder(whileOp);
+  Value zero = arith::ConstantIntOp::create(builder, loc, 0, 64);
+  SmallVector<Value> inits(whileOp.getInits());
+  inits.push_back(zero);
+  SmallVector<Type> resultTypes(whileOp.getResultTypes());
+  resultTypes.push_back(builder.getI64Type());
+  auto newWhile = scf::WhileOp::create(builder, loc, resultTypes, inits);
+  newWhile->setAttrs(whileOp->getAttrs());
+  newWhile.getBefore().takeBody(whileOp.getBefore());
+  newWhile.getAfter().takeBody(whileOp.getAfter());
+  BlockArgument beforeArg =
+      newWhile.getBeforeBody()->addArgument(builder.getI64Type(), loc);
+  newWhile.getConditionOp().getArgsMutable().append(beforeArg);
+  BlockArgument afterArg =
+      newWhile.getAfterBody()->addArgument(builder.getI64Type(), loc);
+  scf::YieldOp yield = newWhile.getYieldOp();
+  builder.setInsertionPoint(yield);
+  yield.getResultsMutable().append(next(builder, loc, afterArg));
+  whileOp.replaceAllUsesWith(newWhile.getResults().drop_back());
+  whileOp.erase();
+  return afterArg;
+}
+
+static bool isDefinedInside(Value v, Operation *loop) {
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    def = cast<BlockArgument>(v).getOwner()->getParentOp();
+  return loop->isAncestor(def);
+}
+
+// Persistent split-K tiles run different numbers of MMA-loop iterations, so
+// the linearized index drifts from the barrier phase and the CTA pair
+// deadlocks. Carry a running i64 count of MMA-loop iterations through the
+// enclosing persistent loop; returns its block-argument number, or nullopt
+// when the trip count is invariant or the nest is unsupported. Replaces the
+// persistent scf.for, so run it before collecting ops.
+static std::optional<unsigned> addRunningIterCount(scf::ForOp inner) {
+  Operation *outer = inner->getParentOp();
+  if (!isa<scf::ForOp, scf::WhileOp>(outer))
+    return std::nullopt;
+  if (auto whileOp = dyn_cast<scf::WhileOp>(outer))
+    if (inner->getParentRegion() != &whileOp.getAfter())
+      return std::nullopt;
+  if (!llvm::any_of(ValueRange{inner.getLowerBound(), inner.getUpperBound(),
+                               inner.getStep()},
+                    [&](Value v) { return isDefinedInside(v, outer); }))
+    return std::nullopt;
+  // The barrier lives outside the warp_specialize op, or at kernel entry
+  // without warp specialization (see runOnOperation), so the persistent loop
+  // must be the only loop between it and the MMA loop.
+  for (Operation *parent = outer->getParentOp();
+       parent && !isa<ttg::WarpSpecializeOp, triton::FuncOp>(parent);
+       parent = parent->getParentOp())
+    if (isa<scf::ForOp, scf::WhileOp>(parent))
+      return std::nullopt;
+
+  if (auto forOp = dyn_cast<scf::ForOp>(outer)) {
+    OpBuilder builder(outer);
+    Value zero = arith::ConstantIntOp::create(builder, inner.getLoc(), 0, 64);
+    IRRewriter rewriter(forOp);
+    auto newLoop = cast<scf::ForOp>(*forOp.replaceWithAdditionalYields(
+        rewriter, zero, /*replaceInitOperandUsages=*/false,
+        [&](OpBuilder &b, Location loc, ArrayRef<BlockArgument> newArgs) {
+          Value tripCount = computeClampedTripCount(b, loc, inner);
+          return SmallVector<Value>{
+              arith::AddIOp::create(b, loc, newArgs[0], tripCount)};
+        }));
+    return newLoop.getRegionIterArgs().back().getArgNumber();
+  }
+
+  BlockArgument afterArg = appendWhileCounter(
+      cast<scf::WhileOp>(outer),
+      [&](OpBuilder &b, Location loc, BlockArgument arg) -> Value {
+        Value tripCount = computeClampedTripCount(b, loc, inner);
+        return arith::AddIOp::create(b, loc, arg, tripCount);
+      });
+  return afterArg.getArgNumber();
+}
+
+// Without warp specialization the cross-CTA barrier lives for the whole
+// kernel, so every scf.while around a 2-CTA MMA contributes to its phase.
+// AutoWS gives persistent while loops an iteration counter; add one where it
+// is missing.
+static void addWhileIterationCounters(Operation *mma) {
+  for (Operation *parent = mma->getParentOp();
+       parent && !isa<triton::FuncOp>(parent); parent = parent->getParentOp()) {
+    auto whileOp = dyn_cast<scf::WhileOp>(parent);
+    if (!whileOp ||
+        findWhileIterationCounter(whileOp, /*requireZeroInit=*/true))
+      continue;
+    BlockArgument counter = appendWhileCounter(
+        whileOp, [](OpBuilder &b, Location loc, BlockArgument arg) -> Value {
+          Value one = arith::ConstantIntOp::create(b, loc, 1, 64);
+          return arith::AddIOp::create(b, loc, arg, one);
+        });
+    parent = counter.getOwner()->getParentOp();
+  }
+}
+
+// MMA loop -> block argument number of its running iteration count in the
+// enclosing persistent loop body (see addRunningIterCount).
+using RunningIterCounts = DenseMap<Operation *, unsigned>;
+
 // Linearized iteration index across the loops that execute within the lifetime
 // of the barrier. phaseScope is the operation containing the barrier
 // allocation; loops outside it reinitialize the barrier and must not
 // contribute. Returns null when no enclosing loop contributes an index.
-static Value computeLinearBarrierIter(OpBuilder &builder, Location loc,
-                                      Operation *mma, Operation *phaseScope) {
+// With `requireExact`, refuse nests where the index can miss rendezvous
+// instead of leaving them to a best-effort index.
+static FailureOr<Value>
+computeLinearBarrierIter(OpBuilder &builder, Location loc, Operation *mma,
+                         Operation *phaseScope, const RunningIterCounts &counts,
+                         bool requireExact) {
+  if (auto inner = dyn_cast<scf::ForOp>(mma->getParentOp())) {
+    auto it = counts.find(inner);
+    if (it != counts.end() && phaseScope->isProperAncestor(inner)) {
+      Value base = inner->getBlock()->getArgument(it->second);
+      Value iter = computeLoopIterIndex(builder, loc, inner);
+      return Value(arith::AddIOp::create(builder, loc, base, iter));
+    }
+  }
   Value linearIter;
   Value stride = arith::ConstantIntOp::create(builder, loc, 1, 64);
+  // The scf.for whose trip count is the current stride.
+  scf::ForOp strideLoop;
   for (Operation *parent = mma->getParentOp(); parent && parent != phaseScope;
        parent = parent->getParentOp()) {
     Value iter;
@@ -141,24 +279,63 @@ static Value computeLinearBarrierIter(OpBuilder &builder, Location loc,
       iter = computeLoopIterIndex(builder, loc, forOp);
       tripCount = computeLoopTripCount(builder, loc, forOp);
     } else if (auto whileOp = dyn_cast<scf::WhileOp>(parent)) {
-      Value counter = findWhileIterationCounter(whileOp);
+      Value counter = findWhileIterationCounter(whileOp, requireExact);
       if (!counter) {
+        if (requireExact)
+          return mma->emitError(
+              "2-CTA MMA sync: no iteration counter in an enclosing scf.while; "
+              "the cross-CTA barrier phase cannot be derived");
         LDBG("Could not derive persistent while iteration for MMA at " << loc);
         break;
       }
       iter = castToI64(builder, loc, counter);
     } else {
+      // A conditional region inside a loop can skip rendezvous that the
+      // loop's iteration index still counts.
+      if (requireExact && parent->getNumRegions() != 0) {
+        for (Operation *above = parent->getParentOp();
+             above && above != phaseScope; above = above->getParentOp())
+          if (isa<scf::ForOp, scf::WhileOp>(above))
+            return mma->emitError(
+                "2-CTA MMA sync: a conditional region inside an enclosing "
+                "loop can skip rendezvous; the cross-CTA barrier phase cannot "
+                "be derived");
+      }
       continue;
     }
+
+    // iter * stride counts the earlier rendezvous only if the inner loop runs
+    // the same number of iterations in every iteration of this loop. A
+    // varying count gives a wrong phase and a deadlocked CTA pair, so refuse
+    // the nests addRunningIterCount does not handle.
+    if (strideLoop &&
+        llvm::any_of(ValueRange{strideLoop.getLowerBound(),
+                                strideLoop.getUpperBound(),
+                                strideLoop.getStep()},
+                     [&](Value v) { return isDefinedInside(v, parent); }))
+      return mma->emitError(
+          "2-CTA MMA sync: the trip count of an enclosing loop changes "
+          "between iterations of an outer loop in an unsupported loop nest; "
+          "the cross-CTA barrier phase cannot be derived");
 
     Value contribution = arith::MulIOp::create(builder, loc, iter, stride);
     linearIter = linearIter ? arith::AddIOp::create(builder, loc, contribution,
                                                     linearIter)
                                   .getResult()
                             : contribution;
-    if (!tripCount)
+    if (!tripCount) {
+      // A while loop has no trip count to scale the outer loops by.
+      if (requireExact)
+        for (Operation *above = parent->getParentOp();
+             above && above != phaseScope; above = above->getParentOp())
+          if (isa<scf::ForOp, scf::WhileOp>(above))
+            return mma->emitError(
+                "2-CTA MMA sync: an scf.while nested in another loop; the "
+                "cross-CTA barrier phase cannot be derived");
       break;
+    }
     stride = arith::MulIOp::create(builder, loc, stride, tripCount);
+    strideLoop = cast<scf::ForOp>(parent);
   }
 
   return linearIter;
@@ -239,9 +416,10 @@ static unsigned getOperandPipelineDepth(ttng::MMAv5OpInterface mma) {
 // Insert the "arrive remote, wait local" cross-CTA sync ops before a 2-CTA
 // MMA. The barrier must be allocated externally (before the containing loop
 // if the MMA is in a loop).
-static void insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
-                                Operation *phaseScope, unsigned baseIdx,
-                                unsigned depth) {
+static LogicalResult
+insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
+                    Operation *phaseScope, unsigned baseIdx, unsigned depth,
+                    const RunningIterCounts &counts, bool requireExact) {
   MLIRContext *ctx = mma->getContext();
   Location loc = mma->getLoc();
   OpBuilder builder(mma);
@@ -252,7 +430,11 @@ static void insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
   // slot instead of lapping a single barrier's phase bit.
   // A null iteration means no enclosing loop contributes an index, so there is
   // a single rendezvous: slot 0, phase 0.
-  Value linearIter = computeLinearBarrierIter(builder, loc, mma, phaseScope);
+  FailureOr<Value> maybeLinearIter = computeLinearBarrierIter(
+      builder, loc, mma, phaseScope, counts, requireExact);
+  if (failed(maybeLinearIter))
+    return failure();
+  Value linearIter = *maybeLinearIter;
   SlotAndPhase sp = computeSlotAndPhase(builder, loc, linearIter, depth);
   Value idx = arith::ConstantIntOp::create(builder, loc, baseIdx, 32);
   idx = arith::AddIOp::create(builder, loc, idx, sp.slot);
@@ -296,6 +478,29 @@ static void insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
   ttng::WaitBarrierOp::create(builder, loc, barrierView, sp.phase, isLeader);
 
   LDBG("Inserted cross-CTA sync before MMA at " << loc);
+  return success();
+}
+
+// The peer CTA arrives on these barriers remotely, so they must be initialized
+// before the kernel-entry cluster rendezvous: an init next to the MMA can race
+// the peer's first remote arrival, which is then lost (deadlock).
+static Value createEntryBarrierAlloc(Operation *anyOp, unsigned numBarriers) {
+  auto funcOp = anyOp->getParentOfType<triton::FuncOp>();
+  Block &entry = funcOp.getBody().front();
+  ImplicitLocOpBuilder rewriter(funcOp.getLoc(), &entry, entry.begin());
+  Value barrierAlloc =
+      triton::createScalarAlloc(rewriter, rewriter.getI64Type(), numBarriers);
+  for (unsigned i = 0; i < numBarriers; ++i) {
+    Value view = triton::createSingleBufferView(rewriter, barrierAlloc, i);
+    ttng::InitBarrierOp::create(rewriter, view, /*arriveCount=*/2);
+  }
+  rewriter.setInsertionPoint(entry.getTerminator());
+  for (unsigned i = 0; i < numBarriers; ++i) {
+    Value view = triton::createSingleBufferView(rewriter, barrierAlloc, i);
+    ttng::InvalBarrierOp::create(rewriter, view);
+  }
+  ttg::LocalDeallocOp::create(rewriter, barrierAlloc);
+  return barrierAlloc;
 }
 
 struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
@@ -320,6 +525,22 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
 
     if (twoCTAMMAOps.empty())
       return;
+
+    // Rewrite persistent loops before anything below keys ops by loop.
+    RunningIterCounts counts;
+    for (auto mma : twoCTAMMAOps) {
+      auto inner = dyn_cast<scf::ForOp>(mma->getParentOp());
+      if (!inner || counts.count(inner))
+        continue;
+      if (std::optional<unsigned> argNo = addRunningIterCount(inner))
+        counts[inner] = *argNo;
+    }
+    for (auto mma : twoCTAMMAOps) {
+      if (mma->getParentOfType<ttg::WarpSpecializeOp>() ||
+          counts.count(mma->getParentOp()))
+        continue;
+      addWhileIterationCounters(mma);
+    }
 
     LDBG("Found " << twoCTAMMAOps.size() << " 2-CTA MMA ops");
 
@@ -365,10 +586,10 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
       }
       auto wsOp = forOp->getParentOfType<ttg::WarpSpecializeOp>();
       if (!wsOp) {
-        // Pre-WS path: standard alloc before the for loop.
-        barrierAlloc =
-            triton::createBarrierAlloc(forOp, numBarriers, /*arriveCount=*/2);
-        phaseScope = forOp->getParentOp();
+        // No warp specialization: allocate at kernel entry (see
+        // createEntryBarrierAlloc), so the phase counts every enclosing loop.
+        barrierAlloc = createEntryBarrierAlloc(forOp, numBarriers);
+        phaseScope = forOp->getParentOfType<triton::FuncOp>();
       } else if (isInDefaultRegion(mmas[0], wsOp)) {
         // Post-WS path, MMA in default region: The default region can
         // implicitly capture values defined before the WarpSpecializeOp,
@@ -432,7 +653,9 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
       unsigned baseIdx = 0;
       for (auto [mma, depth] : llvm::zip(mmas, depths)) {
         LDBG("  MMA slots [" << baseIdx << ", " << baseIdx + depth << ")");
-        insertSyncBeforeMMA(mma, barrierAlloc, phaseScope, baseIdx, depth);
+        if (failed(insertSyncBeforeMMA(mma, barrierAlloc, phaseScope, baseIdx,
+                                       depth, counts, /*requireExact=*/!wsOp)))
+          return signalPassFailure();
         baseIdx += depth;
       }
     }
@@ -472,12 +695,13 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
           barrierAlloc = capturedBarrier;
         }
       } else {
-        barrierAlloc = triton::createBarrierAlloc(mma, /*numBarriers=*/1,
-                                                  /*arriveCount=*/2);
-        phaseScope = mma->getParentOp();
+        barrierAlloc = createEntryBarrierAlloc(mma, /*numBarriers=*/1);
+        phaseScope = mma->getParentOfType<triton::FuncOp>();
       }
-      insertSyncBeforeMMA(mma, barrierAlloc, phaseScope, /*baseIdx=*/0,
-                          /*depth=*/1);
+      if (failed(insertSyncBeforeMMA(mma, barrierAlloc, phaseScope,
+                                     /*baseIdx=*/0, /*depth=*/1, counts,
+                                     /*requireExact=*/!wsOp)))
+        return signalPassFailure();
     }
   }
 };
