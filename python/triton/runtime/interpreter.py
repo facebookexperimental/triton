@@ -601,6 +601,41 @@ class InterpreterBuilder:
         mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)
         return self.create_masked_store(ptr, val, mask, cache_policy)
 
+    def create_sr_store(self, ptr, value, index, mask, site, cache, eviction, satfinite):
+        from ._sr_reference import bf16_bits, random_bits
+        from .stochastic_rounding import _interpreter_launch, _PHILOX_ROUNDS
+
+        launch = _interpreter_launch.get()
+        if launch is None:
+            raise ValueError("sr_store requires the stochastic rounding decorator")
+        spec, state, written = launch
+        declaration = next((entry for entry in spec.store_specs if entry.name == site), None)
+        if declaration is None:
+            raise ValueError(f"undeclared SR site: {site}")
+        if mask is None:
+            mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)
+        target = ptr.get_element_ty()
+        if state.enabled:
+            addresses = ptr.data[mask.data].flatten().tolist()
+            if len(set(addresses)) != len(addresses) or any(address in written for address in addresses):
+                raise ValueError("SR interpreter requires non-overlapping writes")
+            written.update(addresses)
+        if state.enabled and value.dtype == tl.float32 and target == tl.bfloat16:
+            bits = value.data.view(np.uint32).flatten()
+            indices = index.data.flatten()
+            step = int(state.dynamic_seed.item())
+            rounded = [
+                bf16_bits(
+                    int(value),
+                    random_bits(int(logical), state.base_seed, step, state.invocation_offset, _PHILOX_ROUNDS[spec.prng],
+                                declaration.site_id, entropy=spec.entropy), spec.overflow)
+                for value, logical in zip(bits, indices)
+            ]
+            value = TensorHandle(np.array(rounded, dtype=np.uint16).reshape(value.data.shape), target)
+        else:
+            value = self.cast_impl(value, target)
+        return self.create_masked_store(ptr, value, mask, None)
+
     def create_masked_load(self, ptrs, mask, other, cache_policy, is_volatile):
         dtype_tt = ptrs.get_element_ty()
         dtype_np = _get_np_dtype(dtype_tt)
@@ -616,13 +651,30 @@ class InterpreterBuilder:
     def cast_impl(self, src, dst_type, rounding_mode=None):
         src_element_type = src.dtype.scalar
         dst_element_type = dst_type.scalar
-        if (src_element_type == tl.bfloat16 and dst_element_type == tl.float32) or \
-           (src_element_type == tl.float32 and dst_element_type == tl.bfloat16):
-            data = _convert_float(src.data, src_element_type, dst_element_type,
-                                  rounding_mode).view(_get_np_dtype(dst_type))
-            return TensorHandle(data, dst_type.scalar)
+        data = src.data
+        dst_np_dtype = _get_np_dtype(dst_type)
+        if src_element_type.is_floating() and np.issubdtype(data.dtype, np.integer) and dst_element_type.is_int():
+            data = _convert_float(data, src_element_type, tl.float32, None).view(np.float32)
+            src_element_type = tl.float32
+        elif src_element_type.is_int() and dst_element_type.is_floating() and np.issubdtype(dst_np_dtype, np.integer):
+            data = data.astype(np.float64)
+            if src_element_type.int_bitwidth == 64:
+                # int64 to fp8/bf16 is not exact, round to odd first
+                magnitude = src.data.astype(np.uint64)
+                if src_element_type.is_int_signed():
+                    magnitude = np.where(src.data < 0, -magnitude, magnitude)
+                shift = np.maximum(np.frexp(data)[1] - 53, 0).astype(np.uint64)
+                significand = magnitude >> shift
+                discarded = magnitude & ((np.uint64(1) << shift) - np.uint64(1))
+                significand |= (discarded != 0).astype(np.uint64)
+                data = np.copysign(np.ldexp(significand.astype(np.float64), shift.astype(np.int32)), data)
+            src_element_type = tl.float64
+            rounding_mode = _ir.ROUNDING_MODE.RTNE
+        if src_element_type.is_floating() and dst_element_type.is_floating():
+            data = _convert_float(data, src_element_type, dst_element_type, rounding_mode).view(dst_np_dtype)
         else:
-            return TensorHandle(src.data.astype(_get_np_dtype(dst_type)), dst_type.scalar)
+            data = data.astype(dst_np_dtype)
+        return TensorHandle(data, dst_element_type)
 
     create_si_to_fp = lambda self, src, dst_type: self.cast_impl(src, dst_type)
     create_ui_to_fp = lambda self, src, dst_type: self.cast_impl(src, dst_type)
@@ -630,20 +682,15 @@ class InterpreterBuilder:
     create_fp_to_ui = lambda self, src, dst_type: self.cast_impl(src, dst_type)
     create_fp_ext = lambda self, src, dst_type: self.cast_impl(src, dst_type)
     create_fp_trunc = lambda self, src, dst_type: self.cast_impl(src, dst_type, _ir.ROUNDING_MODE.RTNE)
+    create_fp_to_fp = lambda self, src, dst_type, rounding_mode: self.cast_impl(src, dst_type, rounding_mode)
     create_int_cast = lambda self, src, dst_type, is_signed: self.cast_impl(src, dst_type)
-
-    def create_fp_to_fp(self, src, dst_type, rounding_mode):
-        src_element_type = src.dtype.scalar
-        dst_element_type = dst_type.scalar
-        data = _convert_float(src.data, src_element_type, dst_element_type, rounding_mode).view(_get_np_dtype(dst_type))
-        return TensorHandle(data, dst_type.scalar)
 
     def create_bitcast(self, src, dst_type):
         return TensorHandle(src.data.view(_get_np_dtype(dst_type)), dst_type.scalar)
 
     # binary operators
-    def binary_op(self, lhs, rhs, op):
-        tl_dtype = lhs.dtype.scalar
+    def binary_op(self, lhs, rhs, op, ret_type=None):
+        tl_dtype = lhs.dtype.scalar if ret_type is None else ret_type
 
         if lhs.data.dtype == np.bool_ and rhs.data.dtype == np.bool_:
             # numpy uses logical/saturating semantics for bool arithmetic
@@ -659,6 +706,9 @@ class InterpreterBuilder:
             output = output.astype(_get_np_dtype(tl_dtype))
 
         return TensorHandle(output, tl_dtype)
+
+    def comparison_op(self, lhs, rhs, op):
+        return self.binary_op(lhs, rhs, op, tl.int1)
 
     create_fadd = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.add)
     create_fmul = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.multiply)
@@ -686,28 +736,28 @@ class InterpreterBuilder:
     create_maxui = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.maximum)
     create_maximumf = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.maximum)
     create_maxnumf = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.fmax)
-    create_icmpSLE = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.less_equal)
-    create_icmpSLT = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.less)
-    create_icmpSGE = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.greater_equal)
-    create_icmpSGT = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.greater)
-    create_icmpULE = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.less_equal)
-    create_icmpULT = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.less)
-    create_icmpUGE = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.greater_equal)
-    create_icmpUGT = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.greater)
-    create_icmpEQ = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.equal)
-    create_icmpNE = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.not_equal)
-    create_fcmpOLT = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.less)
-    create_fcmpOGT = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.greater)
-    create_fcmpOLE = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.less_equal)
-    create_fcmpOGE = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.greater_equal)
-    create_fcmpOEQ = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.equal)
-    create_fcmpONE = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.not_equal)
-    create_fcmpULT = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.less)
-    create_fcmpUGT = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.greater)
-    create_fcmpULE = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.less_equal)
-    create_fcmpUGE = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.greater_equal)
-    create_fcmpUEQ = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.equal)
-    create_fcmpUNE = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.not_equal)
+    create_icmpSLE = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.less_equal)
+    create_icmpSLT = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.less)
+    create_icmpSGE = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.greater_equal)
+    create_icmpSGT = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.greater)
+    create_icmpULE = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.less_equal)
+    create_icmpULT = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.less)
+    create_icmpUGE = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.greater_equal)
+    create_icmpUGT = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.greater)
+    create_icmpEQ = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.equal)
+    create_icmpNE = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.not_equal)
+    create_fcmpOLT = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.less)
+    create_fcmpOGT = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.greater)
+    create_fcmpOLE = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.less_equal)
+    create_fcmpOGE = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.greater_equal)
+    create_fcmpOEQ = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.equal)
+    create_fcmpONE = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.not_equal)
+    create_fcmpULT = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.less)
+    create_fcmpUGT = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.greater)
+    create_fcmpULE = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.less_equal)
+    create_fcmpUGE = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.greater_equal)
+    create_fcmpUEQ = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.equal)
+    create_fcmpUNE = lambda self, lhs, rhs: self.comparison_op(lhs, rhs, np.not_equal)
     create_and = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.bitwise_and)
     create_xor = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.bitwise_xor)
     create_or = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.bitwise_or)
@@ -964,11 +1014,25 @@ class InterpreterBuilder:
         # Triton's barrier applies to each program in a grid, so it's a no-op in the interpreter
         pass
 
-    def create_make_tensor_descriptor(self, base: TensorHandle, shape: List[TensorHandle], strides: List[TensorHandle],
-                                      tensor_shape: List[int], is_signed: bool, padding: str = "zero"):
-        desc = TensorDescHandle(base, shape, strides, tensor_shape, padding)
+    def create_tensor_descriptor_type(self, block_type, is_signed, fp6_format=None):
+        elem_ty = block_type.element_ty
+        if elem_ty.is_int() and elem_ty.is_int_signed() != is_signed:
+            block_type = block_type.with_element_ty(tl.core.get_int_dtype(elem_ty.primitive_bitwidth, is_signed))
+        return tl.core.tensor_descriptor_base_type(block_type, fp6_format)
+
+    def create_make_tensor_descriptor(self, *args, **kwargs):
+        if args and isinstance(args[0], tl.core.tensor_descriptor_base_type):
+            desc_ty, base, shape, strides, *padding = args
+            desc = TensorDescHandle(base, shape, strides, desc_ty.block_type.shape, *padding, **kwargs)
+        else:
+            desc = self._make_tensor_descriptor_from_shape(*args, **kwargs)
         desc.validate()
         return desc
+
+    def _make_tensor_descriptor_from_shape(self, base: TensorHandle, shape: List[TensorHandle],
+                                           strides: List[TensorHandle], tensor_shape: List[int], is_signed: bool,
+                                           padding: str = "zero"):
+        return TensorDescHandle(base, shape, strides, tensor_shape, padding)
 
     def create_descriptor_load(self, desc: TensorDescHandle, indices: List[TensorHandle], cache_policy, multicast=None):
         assert isinstance(desc, TensorDescHandle)
@@ -987,7 +1051,10 @@ class InterpreterBuilder:
             result = TensorHandle(_round_f32_to_tf32(result.data), dtype_tt)
         return result
 
-    def create_descriptor_store(self, desc: TensorDescHandle, value: TensorHandle, indices: List[TensorHandle]):
+    def create_descriptor_store(self, desc: TensorDescHandle, value: TensorHandle, indices: List[TensorHandle],
+                                reduce_kind=_ir.DESCRIPTOR_REDUCE_KIND.NONE):
+        if reduce_kind != _ir.DESCRIPTOR_REDUCE_KIND.NONE:
+            raise NotImplementedError("descriptor store reductions are not supported by the interpreter")
         ptrs, mask = desc.materialize_pointers(indices)
         return self.create_masked_store(ptrs, value, mask, None)
 
@@ -1145,17 +1212,13 @@ class ReduceOps(ReduceScanOpInterface):
         self.keep_dims = keep_dims
 
     def unravel(self, input, axis):
-        ret = []
-        for data in input:
-            if axis is not None:
-                ret.append(data)
-            else:
-                axis = 0
-                ret.append(self.to_tensor(data.handle.data.flatten(), data.dtype))
-        return tuple(ret), axis
+        if axis is not None:
+            return input, axis
+        return tuple(self.to_tensor(data.handle.data.flatten(), data.dtype) for data in input), 0
 
     def generic_reduce(self, input):
         original_axis = self.axis
+        original_ndim = len(input[0].handle.data.shape)
         input, axis = self.unravel(input, self.axis)
         input_data = []
         output_data = []
@@ -1188,7 +1251,7 @@ class ReduceOps(ReduceScanOpInterface):
                 if original_axis is not None:
                     data = np.expand_dims(data, axis)
                 else:
-                    for _ in range(len(input_shape)):
+                    for _ in range(original_ndim):
                         data = np.expand_dims(data, 0)
 
             elif original_axis is None:
@@ -1197,42 +1260,21 @@ class ReduceOps(ReduceScanOpInterface):
             ret.append(self.to_tensor(data, input[i].dtype))
         return ret
 
-    def min_max(self, input, val_reduce_op, idx_reduce_op=None):
-        # If input is a tuple, it must be (val, index), and we only take val
-        input = input[0] if isinstance(input, tuple) else input
-        val = None
-        idx = None
-        if val_reduce_op:
-            val = self.to_tensor(val_reduce_op(input.handle.data, axis=self.axis, keepdims=self.keep_dims), input.dtype)
-        if idx_reduce_op:
-            idx = self.to_tensor(idx_reduce_op(input.handle.data, axis=self.axis, keepdims=self.keep_dims), tl.int32)
-        if val is not None and idx is not None:
-            return val, idx
-        elif val is not None:
-            return val
-        elif idx is not None:
-            return idx
-        else:
-            raise ValueError("val_reduce_op and idx_reduce_op are both None")
+    def min_max(self, input, reduce_op):
+        return self.to_tensor(reduce_op(input.handle.data, axis=self.axis, keepdims=self.keep_dims), input.dtype)
 
     def sum(self, input):
         return self.to_tensor(np.sum(input.handle.data, axis=self.axis, keepdims=self.keep_dims), input.dtype)
 
     def apply_impl(self, input):
-        # Note: np.nanargmin/np.nanargmax always return the leftmost index
-        # for equal values, whereas tie_break_fast on hardware returns an
-        # arbitrary index. This is a known remaining divergence between the
-        # interpreter and JIT for inputs with equal non-NaN elements.
-        if (self.combine_fn is tl.standard._argmin_combine_tie_break_left
-                or self.combine_fn is tl.standard._argmin_combine_tie_break_fast):
-            return self.min_max(input[0], val_reduce_op=np.nanmin, idx_reduce_op=np.nanargmin)
-        elif (self.combine_fn is tl.standard._argmax_combine_tie_break_left
-              or self.combine_fn is tl.standard._argmax_combine_tie_break_fast):
-            return self.min_max(input[0], val_reduce_op=np.nanmax, idx_reduce_op=np.nanargmax)
-        elif self.combine_fn is tl.standard._elementwise_max:
-            return self.min_max(input[0], val_reduce_op=np.nanmax, idx_reduce_op=None)
-        elif self.combine_fn is tl.standard._elementwise_min:
-            return self.min_max(input[0], val_reduce_op=np.nanmin, idx_reduce_op=None)
+        if self.combine_fn is tl.standard._elementwise_max_ignore_nan:
+            return self.min_max(input[0], np.nanmax)
+        elif self.combine_fn is tl.standard._elementwise_min_ignore_nan:
+            return self.min_max(input[0], np.nanmin)
+        elif self.combine_fn is tl.standard._elementwise_max_propagate_nan:
+            return self.min_max(input[0], np.max)
+        elif self.combine_fn is tl.standard._elementwise_min_propagate_nan:
+            return self.min_max(input[0], np.min)
         elif self.combine_fn is tl.standard._sum_combine:
             return self.sum(input[0])
         else:
@@ -1489,7 +1531,7 @@ def _implicit_cvt(arg):
         desc = interpreter_semantic.make_tensor_descriptor(base=_implicit_cvt(arg.base),
                                                            shape=[_implicit_cvt(s) for s in arg.shape], strides=strides,
                                                            block_shape=[tl.constexpr(b) for b in arg.block_shape],
-                                                           padding_option=arg.padding)
+                                                           padding_option=arg.padding, fp6_format=arg.fp6_format)
         desc.handle.round_f32_to_tf32 = arg.round_f32_to_tf32
         return desc
     return arg
@@ -1533,6 +1575,7 @@ class GridExecutor:
                     arg.block_shape,
                     arg.padding,
                     arg.round_f32_to_tf32,
+                    arg.fp6_format,
                 )
             elif not hasattr(arg, "data_ptr"):
                 return arg

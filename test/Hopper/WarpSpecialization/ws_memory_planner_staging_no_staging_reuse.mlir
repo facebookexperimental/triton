@@ -1,12 +1,12 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=1 smem-budget=232448" | FileCheck %s
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=1 smem-budget=232448" --nvgpu-test-ws-code-partition="num-buffers=1" | FileCheck %s --check-prefix=PART
 
-// Real pre-planner IR (MRS e92): the two TMA staging buffers must reuse distinct
+// Real pre-planner IR: the two TMA staging buffers must reuse distinct
 // operand hosts, never each other, and both reuses get the cross-tile WAR token.
 // CHECK-DAG: allocation.reuseTarget = 9 : i32, allocation.shareGroup = 4 : i32, buffer.copy = 1 : i32, buffer.id = 4 : i32, buffer.tmaStaging = 1 : i32
 // CHECK-DAG: allocation.reuseTarget = 12 : i32, allocation.shareGroup = 5 : i32, buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.tmaStaging = 1 : i32
 
-// PART-LABEL: tt.func public @e92_fused_kernel
+// PART-LABEL: tt.func public @fused_two_acc_shared_desc
 // PART-NOT: ttg.local_alloc
 // PART: nvws.create_token {loadType = 3 : i32, numBuffers = 1 : i32} : tensor<1x!nvws.token>
 // PART-DAG: ttg.memdesc_reinterpret {{.*}}buffer.id = 4 : i32
@@ -24,7 +24,7 @@
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 128, colStride = 1>
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.early_tma_store_lowering = true, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @e92_fused_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg3: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg4: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg5: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg6: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg7: i32 {tt.divisibility = 16 : i32}, %arg8: i32, %arg9: i32, %arg10: i32 {tt.divisibility = 16 : i32}, %arg11: i32 {tt.divisibility = 16 : i32}, %arg12: i32 {tt.divisibility = 16 : i32}, %arg13: f32) attributes {noinline = false} {
+  tt.func public @fused_two_acc_shared_desc(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg3: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg4: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg5: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg6: !tt.ptr<i32> {tt.divisibility = 16 : i32}, %arg7: i32 {tt.divisibility = 16 : i32}, %arg8: i32, %arg9: i32, %arg10: i32 {tt.divisibility = 16 : i32}, %arg11: i32 {tt.divisibility = 16 : i32}, %arg12: i32 {tt.divisibility = 16 : i32}, %arg13: f32) attributes {noinline = false} {
     %c8_i32 = arith.constant {async_task_id = array<i32: 2, 3>} 8 : i32
     %c1_i32 = arith.constant {async_task_id = array<i32: 0, 1, 2, 3>} 1 : i32
     %c127_i32 = arith.constant {async_task_id = array<i32: 0, 1, 2, 3>} 127 : i32

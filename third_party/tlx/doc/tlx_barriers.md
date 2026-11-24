@@ -327,6 +327,21 @@ while !done:
   by a leader arrive in each of two CTAs is allocated with
   `arrive_count=(4 + 1) * 2`. All three wait with `tlx.barrier_wait`.
 
+  `tlx.async_task(..., nvptx_cmp_sink_workaround=True)` (NVIDIA) is a
+  temporary workaround for an NVPTX backend issue. It changes where leader
+  and per-warp arrives in that task compute their `tid == 0` and
+  `lane == 0` predicates, not what the arrives do. NVPTX lets
+  CodeGenPrepare sink compares into the blocks of their users, so the
+  compare of a leader arrive after a loop moves back next to the arrive
+  and keeps the 32-bit thread id live across the loop. A per-warp
+  arrive's lane predicate is instead hoisted out of the loop by LICM and
+  stays live across it. Either can perturb the ptxas schedule of a hot
+  loop: the FA forward softmax is about 3% faster with both avoided, and
+  avoiding only one gains little. With the flag, the task's per-warp
+  arrives test `%laneid` inside their own asm and its leader arrives share
+  one predicate built at the task entry. Only that task's arrives are
+  affected. Remove the flag once NVPTX stops sinking compares.
+
   | TLX [<u>barriers</u>](https://github.com/facebookexperimental/triton/blob/tlx/third_party/tlx/language/tlx/barrier.py) | MLIR | PTX |
   |----|----|----|
   | tlx.alloc_barriers | ttng::InitBarrierOp | [<u>mbarrier.init</u>](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier-init) |
