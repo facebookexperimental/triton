@@ -723,10 +723,39 @@ static bool hasSyncPointBeforeMemoryEffect(Operation *op,
   return false;
 }
 
+// An elected op that signals an mbarrier (an MMA with completion barriers or a
+// tcgen05 commit) right after a wait on an mbarrier in the same block: without
+// a rendezvous, the elected warp can release a slot whose next phase completes
+// before the other warps have observed the current one, and they then wait on
+// the wrong parity forever. Returns true when such a wait precedes `op` with no
+// barrier in between (the narrow form of upstream Membar's MBarrierWait rule).
+static bool hasUnsyncedWaitBeforeNotification(Operation *op) {
+  bool notifies = isa<triton::nvidia_gpu::TCGen5CommitOp>(op);
+  if (auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(op))
+    notifies = !mma.getCompletionBarriers().empty();
+  if (!notifies || triton::gpu::lookupNumWarps(op) <= 1)
+    return false;
+  for (Operation *prev = op->getPrevNode(); prev; prev = prev->getPrevNode()) {
+    if (isa<triton::gpu::BarrierOp, triton::nvidia_gpu::ClusterBarrierOp>(prev))
+      return false;
+    if (auto arrive = dyn_cast<triton::nvidia_gpu::ArriveBarrierOp>(prev))
+      if (!arrive.getPerThread())
+        return false;
+    if (isa<triton::nvidia_gpu::WaitBarrierOp>(prev))
+      return true;
+  }
+  return false;
+}
+
 void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                             FuncMapT *funcMap, OpBuilder *builder) {
   // Replace any provisional decision whenever this operation is revisited.
   scratchSyncOps.erase(op);
+  if (hasUnsyncedWaitBeforeNotification(op)) {
+    builder->setInsertionPoint(op);
+    insertBarrier(op, builder);
+    blockInfo->sync();
+  }
   if (isa<CallOpInterface>(op))
     *blockInfo = blockInfo->mapSlices(
         [](const AllocationSlice &slice) { return slice.forgetStageLoop(); });
