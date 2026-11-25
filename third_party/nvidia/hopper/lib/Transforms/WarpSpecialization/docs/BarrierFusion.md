@@ -115,7 +115,7 @@ unmarked.
 | Completion barrier | The CTA's own ready barrier | The pair leader's ready barrier (`mapBarrierTo2CTALeader`; leader = even cluster rank) |
 | `BarrierExpectOp` | Every CTA expects its own bytes | Only the leader expects, and it expects `2 ×` the summed `txCount` |
 | TMA copy | `AsyncTMACopyGlobalToLocalOp` | Same op with `twoCta` set: `cp.async.bulk.tensor ... .shared::cluster ... .cta_group::2` |
-| Consumer wait | One `WaitBarrierOp` per consumer task | Leader waits. It then relays to the follower with `FenceAsyncSharedOp` plus an `ArriveBarrierOp` on the follower's barrier (`mapBarrierTo2CTAPeer`), and the follower waits on its own barrier. |
+| Consumer wait | One `WaitBarrierOp` per consumer task | Leader waits. It then relays to the follower with `FenceAsyncSharedOp` plus an `ArriveBarrierOp` on the follower's barrier (`mapBarrierTo2CTAPeer`), and the follower waits on its own barrier. When the loaded buffers only feed 2-CTA MMA operands (which the leader issues alone), the relay is tagged `ttng.two_cta_relay`. |
 
 **The knob.** If `TRITON_DISABLE_2CTA_COOPERATIVE_LOADS` is set,
 `Transform2CTALoads` skips the marking step entirely, so every load in the
@@ -128,7 +128,7 @@ module takes the per-CTA column. The B-halving transform itself still runs.
 | Default | Unset: cooperative loads are on for every 2-CTA module. |
 | Granularity | Whole module. There is no per-load or per-config control. |
 | Cache key | Listed in `CACHE_INVALIDATING_ENV_VARS` (`include/triton/Tools/Sys/GetEnv.h`). |
-| Resources | No SMEM, TMEM, warp, or barrier-count change. The cooperative path adds the leader-to-follower relay instructions (fence, remote arrive, extra wait) in each consumer partition. |
+| Resources | No SMEM, TMEM, warp, or barrier-count change. The cooperative path adds the leader-to-follower relay instructions (fence, remote arrive, extra wait) in each consumer partition. When `Insert2CTASync` can move its cross-CTA rendezvous to once per K-loop entry (unscaled 2-CTA MMAs whose A and B come only from cooperative loads, in a persistent `scf.for`), it also drops the tagged relay. |
 
 Both protocols are correct; cooperative marking is a performance choice. The
 cross-CTA MMA rendezvous that `Insert2CTASync`

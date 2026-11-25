@@ -385,6 +385,36 @@ static TwoCTAPairRank buildTwoCTAPairRank(OpBuilderWithAsyncTaskIds &builder,
   return rank;
 }
 
+// True when the only readers of the buffer `load` writes (its whole
+// multi-buffered allocation, looking through memdesc views) are A or B
+// operands of 2-CTA MMAs, and there is at least one. The leader issues those
+// MMAs alone, so the follower never reads the tile itself.
+static bool onlyFeedsTwoCTAMMAs(ttnvws::DescriptorLoadOp load) {
+  Value root = load.getResult();
+  if (auto view = root.getDefiningOp<ttg::MemDescIndexOp>())
+    root = view.getSrc();
+  SmallVector<Value> worklist{root};
+  bool sawMMA = false;
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    for (Operation *user : v.getUsers()) {
+      if (isa<ttnvws::DescriptorLoadOp, ttng::AsyncTMACopyGlobalToLocalOp,
+              ttg::LocalDeallocOp>(user))
+        continue;
+      if (isa<ttg::MemDescTransOp, ttg::MemDescReshapeOp,
+              ttg::MemDescSubsliceOp, ttg::MemDescIndexOp>(user)) {
+        worklist.push_back(user->getResult(0));
+        continue;
+      }
+      auto mma = dyn_cast<ttng::MMAv5OpInterface>(user);
+      if (!mma || !mma.getTwoCtas() || (mma.getA() != v && mma.getB() != v))
+        return false;
+      sawMMA = true;
+    }
+  }
+  return sawMMA;
+}
+
 Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<ttnvws::DescriptorLoadOp> &tmaLoads,
                             Value barrierAlloc, Value bufferIdx,
@@ -477,6 +507,11 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
   Value followerWaitPred;
   Value peerBarrier;
+  // The leader's barrier already counts both CTAs' bytes, so when the leader's
+  // 2-CTA MMA is the only reader the relay below only gates the follower for
+  // Insert2CTASync's per-step rendezvous. Tag it so that pass can drop it.
+  bool mmaOnlyRelay = twoCTA && additionalConsumerTaskIds.empty() &&
+                      llvm::all_of(tmaLoads, onlyFeedsTwoCTAMMAs);
   if (twoCTA) {
     TwoCTAPairRank rank = buildTwoCTAPairRank(builder, loc);
     waitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
@@ -497,13 +532,18 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     // barrier, then let the follower wait on it. A cluster barrier is not
     // valid here: only this warp-specialized consumer partition executes the
     // handoff, while cluster barriers require participation from every warp.
-    builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
-        loc, /*bCluster=*/false);
-    builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
-        loc, peerBarrier, /*count=*/1, waitPred);
-    builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
-        loc, consBarrier, phase, followerWaitPred, /*deps=*/ValueRange{},
-        consumerWaitConstraints);
+    Operation *relay[] = {
+        builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
+            loc, /*bCluster=*/false),
+        builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
+            loc, peerBarrier, /*count=*/1, waitPred),
+        builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+            loc, consBarrier, phase, followerWaitPred, /*deps=*/ValueRange{},
+            consumerWaitConstraints)};
+    if (mmaOnlyRelay)
+      for (Operation *op : relay)
+        op->setAttr(ttng::AttrTwoCTARelayName,
+                    UnitAttr::get(builder.getContext()));
   }
   for (int extraTaskId : additionalConsumerTaskIds) {
     builder.setAsynTaskIdsFromArray({extraTaskId});

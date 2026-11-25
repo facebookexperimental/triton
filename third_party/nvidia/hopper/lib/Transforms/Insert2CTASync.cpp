@@ -23,6 +23,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
@@ -413,16 +414,132 @@ static unsigned getOperandPipelineDepth(ttng::MMAv5OpInterface mma) {
   return depth;
 }
 
+// The warp_specialize-wide set of values aliasing `base`: the value itself,
+// or, for a partition argument, the capture and every partition's argument.
+static SmallVector<Value> getCaptureAliases(Value base) {
+  if (auto arg = dyn_cast<BlockArgument>(base))
+    if (auto partOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(
+            arg.getOwner()->getParentOp())) {
+      unsigned n = arg.getArgNumber();
+      SmallVector<Value> aliases{partOp.getExplicitCaptures()[n]};
+      for (Region &region : partOp.getPartitionRegions())
+        aliases.push_back(region.getArgument(n));
+      return aliases;
+    }
+  return {base};
+}
+
+// True when the barrier `bar` waits on completes cooperative 2-CTA TMA
+// copies, i.e. it is the leader-side readiness barrier of an operand ring.
+static bool isCooperativeTMABarrier(Value bar) {
+  Value base = bar;
+  if (auto view = base.getDefiningOp<ttg::MemDescIndexOp>())
+    base = view.getSrc();
+  SmallVector<Value> worklist = getCaptureAliases(base);
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    for (OpOperand &use : v.getUses()) {
+      Operation *user = use.getOwner();
+      if (isa<ttg::MemDescIndexOp, ttng::MapToRemoteBufferOp>(user)) {
+        worklist.push_back(user->getResult(0));
+        continue;
+      }
+      if (auto copy = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(user))
+        if (copy.getBarrier() == v && copy.getTwoCta())
+          return true;
+    }
+  }
+  return false;
+}
+
+// True when the buffer behind a 2-CTA MMA operand is written only by
+// cooperative 2-CTA TMA copies. Their transaction completes on the leader's
+// barrier with both CTAs' bytes, so the leader's own wait already proves the
+// follower's half has landed. Captures into warp_specialize partitions are
+// followed into every partition's view of the same buffer.
+static bool fedOnlyByCooperativeTMA(Value operand) {
+  Value base = operand;
+  while (Operation *def = base.getDefiningOp()) {
+    if (!isa<ttg::MemDescTransOp, ttg::MemDescReshapeOp, ttg::MemDescSubsliceOp,
+             ttg::MemDescIndexOp>(def))
+      break;
+    base = def->getOperand(0);
+  }
+  if (auto arg = dyn_cast<BlockArgument>(base))
+    if (!isa<ttg::WarpSpecializePartitionsOp>(arg.getOwner()->getParentOp()))
+      return false;
+  SmallVector<Value> worklist = getCaptureAliases(base);
+  DenseSet<Value> visited(worklist.begin(), worklist.end());
+  bool sawWriter = false;
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    for (OpOperand &use : v.getUses()) {
+      Operation *user = use.getOwner();
+      if (isa<ttg::MemDescTransOp, ttg::MemDescReshapeOp,
+              ttg::MemDescSubsliceOp, ttg::MemDescIndexOp>(user)) {
+        worklist.push_back(user->getResult(0));
+        continue;
+      }
+      if (auto copy = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(user)) {
+        if (copy.getResult() != v || !copy.getTwoCta())
+          return false;
+        sawWriter = true;
+        continue;
+      }
+      // A buffer captured into the partitions is also written through each
+      // partition's block argument; check those writers too.
+      if (auto partOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
+        unsigned n = use.getOperandNumber();
+        for (Region &region : partOp.getPartitionRegions())
+          if (visited.insert(region.getArgument(n)).second)
+            worklist.push_back(region.getArgument(n));
+        continue;
+      }
+      if (isa<ttng::MMAv5OpInterface, ttg::LocalDeallocOp>(user))
+        continue;
+      return false;
+    }
+  }
+  return sawWriter;
+}
+
+// True when `v` has the same value in every iteration of `loop`: it is defined
+// outside, or computed inside only by pure ops from such values.
+static bool isLoopInvariant(Value v, scf::ForOp loop) {
+  if (!isDefinedInside(v, loop))
+    return true;
+  Operation *def = v.getDefiningOp();
+  if (!def || def->getNumRegions() != 0 || !isMemoryEffectFree(def))
+    return false;
+  return llvm::all_of(def->getOperands(), [&](Value operand) {
+    return isLoopInvariant(operand, loop);
+  });
+}
+
+// True when the MMA's accumulator buffer is the same for the whole `loop`, so
+// the wait that frees it comes before the loop.
+static bool accumulatorChosenOutside(ttng::MMAv5OpInterface mma,
+                                     scf::ForOp loop) {
+  Value acc = mma.getAccumulator();
+  if (auto view = acc.getDefiningOp<ttg::MemDescIndexOp>())
+    return isLoopInvariant(view.getSrc(), loop) &&
+           isLoopInvariant(view.getIndex(), loop);
+  return !isDefinedInside(acc, loop);
+}
+
 // Insert the "arrive remote, wait local" cross-CTA sync ops before a 2-CTA
-// MMA. The barrier must be allocated externally (before the containing loop
-// if the MMA is in a loop).
+// MMA, or before `anchor` when given. The barrier must be allocated
+// externally (before the containing loop if the MMA is in a loop).
 static LogicalResult
 insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
                     Operation *phaseScope, unsigned baseIdx, unsigned depth,
-                    const RunningIterCounts &counts, bool requireExact) {
+                    const RunningIterCounts &counts, bool requireExact,
+                    Operation *anchor = nullptr) {
   MLIRContext *ctx = mma->getContext();
   Location loc = mma->getLoc();
-  OpBuilder builder(mma);
+  if (!anchor)
+    anchor = mma;
+  OpBuilder builder(anchor);
   auto i32Ty = builder.getI32Type();
 
   // This MMA owns `depth` consecutive slots starting at baseIdx, rotating with
@@ -431,7 +548,7 @@ insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
   // A null iteration means no enclosing loop contributes an index, so there is
   // a single rendezvous: slot 0, phase 0.
   FailureOr<Value> maybeLinearIter = computeLinearBarrierIter(
-      builder, loc, mma, phaseScope, counts, requireExact);
+      builder, loc, anchor, phaseScope, counts, requireExact);
   if (failed(maybeLinearIter))
     return failure();
   Value linearIter = *maybeLinearIter;
@@ -585,6 +702,56 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
         numBarriers += d;
       }
       auto wsOp = forOp->getParentOfType<ttg::WarpSpecializeOp>();
+      // When every MMA in the K loop is an unscaled MMA reading only
+      // cooperative TMA tiles, the operand handoff needs no rendezvous. One per
+      // K loop entry (tile) of a K loop nested in an scf.for still orders the
+      // leader's MMAs after the follower's accumulator is free, so the
+      // accumulator must be selected outside the K loop.
+      bool perTile = wsOp &&
+                     isa_and_nonnull<scf::ForOp>(forOp->getParentOp()) &&
+                     llvm::all_of(mmas, [&](ttng::MMAv5OpInterface mma) {
+                       return isa<ttng::TCGen5MMAOp>(mma.getOperation()) &&
+                              mma->getParentOp() == forOp &&
+                              accumulatorChosenOutside(mma, forOp) &&
+                              fedOnlyByCooperativeTMA(mma.getA()) &&
+                              fedOnlyByCooperativeTMA(mma.getB());
+                     });
+      // Every wait in the K loop must be an operand-readiness wait (or the
+      // tagged relay): any other one, such as an accumulator wait, would sit
+      // after the per-tile rendezvous. WS gives each channel its own barrier
+      // array, so checking the barrier's allocation is enough. An untagged
+      // remote arrive is a relay that still needs the per-step rendezvous.
+      if (perTile)
+        forOp.walk([&](Operation *op) {
+          if (op->hasAttr(ttng::AttrTwoCTARelayName))
+            return;
+          if (auto wait = dyn_cast<ttng::WaitBarrierOp>(op))
+            if (!isCooperativeTMABarrier(wait.getAlloc()))
+              perTile = false;
+          if (auto arrive = dyn_cast<ttng::ArriveBarrierOp>(op))
+            if (isa<ttng::SharedClusterMemorySpaceAttr>(
+                    arrive.getAlloc().getType().getMemorySpace()))
+              perTile = false;
+        });
+      // AutoWS's tagged relay must sit directly in this K loop; a peeled or
+      // nested copy would keep a per-step rendezvous that relies on it.
+      if (perTile) {
+        Region *region = forOp->getParentRegion();
+        while (!isa<ttg::WarpSpecializePartitionsOp, ttg::WarpSpecializeOp>(
+            region->getParentOp()))
+          region = region->getParentOp()->getParentRegion();
+        region->walk([&](Operation *op) {
+          if (op->hasAttr(ttng::AttrTwoCTARelayName) &&
+              op->getParentOp() != forOp)
+            perTile = false;
+        });
+      }
+      // The follower arrives for a tile once its own accumulator buffer is
+      // free, so it can run ahead of the leader by the accumulator depth.
+      if (perTile)
+        for (auto mma : mmas)
+          numBarriers =
+              std::max({numBarriers, 2u, getAllocDepth(mma.getAccumulator())});
       if (!wsOp) {
         // No warp specialization: allocate at kernel entry (see
         // createEntryBarrierAlloc), so the phase counts every enclosing loop.
@@ -648,6 +815,24 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
         assert(capturedBarrier && "MMA not found in any partition region");
         barrierAlloc = capturedBarrier;
         phaseScope = wsOp->getParentOp();
+      }
+
+      if (perTile) {
+        LDBG("  cooperative operands: one rendezvous per K loop entry");
+        // AutoWS's per-step relay only gated the follower for the per-step
+        // rendezvous; without it the follower needs no readiness signal.
+        SmallVector<Operation *> relay;
+        for (Operation &op : forOp.getBody()->without_terminator())
+          if (op.hasAttr(ttng::AttrTwoCTARelayName))
+            relay.push_back(&op);
+        for (Operation *op : relay)
+          op->erase();
+        if (failed(insertSyncBeforeMMA(mmas.front(), barrierAlloc, phaseScope,
+                                       /*baseIdx=*/0, /*depth=*/numBarriers,
+                                       RunningIterCounts(),
+                                       /*requireExact=*/false, forOp)))
+          return signalPassFailure();
+        continue;
       }
 
       unsigned baseIdx = 0;
