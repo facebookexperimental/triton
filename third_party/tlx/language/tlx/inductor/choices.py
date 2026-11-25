@@ -181,6 +181,10 @@ class TLXInductorChoices(InductorChoices):
         Applies in both "allow" and "force" modes: should_force_fusion only
         gates benchmark-time forcing, not this scheduler legality check.
         """
+        from .fusion import tma_epilogue_store_fusion_unsupported
+
+        if tma_epilogue_store_fusion_unsupported(node1, node2):
+            return False
         if not super().can_fuse_vertical(scheduler, node1, node2, shared_data_score):
             return False
         if config.triton.tlx_mode is None:
