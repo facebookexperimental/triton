@@ -32,13 +32,12 @@ Records of mi350/b200/h100.yml from before #3875 may remain in the store; the
 rules ignore them.
 
 bump.json, rewritten whole by each collection:
-  {lines: {<tracked branch>: {fork_branch, pinned: {tag, llvm_hash, base} | null,
+  {lines: {<tracked branch>: {fork_branch, pinned: {tag, llvm_hash} | null,
    newest: {tag, llvm_hash, published_at} | null, pending: [fork change],
    pr: {number, title, url, author, created_at} | null, issues: [{number, title, url, created_at}],
    history: [{sha, t, title, pr, tag, llvm_hash, prev_hash | null}]}}}
   fork change: {sha, title, pr}, a fork commit with its fork PR number. pending is
-  what newest adds over pinned; base is the upstream (OAI) LLVM commit the pin
-  is built on; history is the pin's last changes on the branch,
+  what newest adds over pinned; history is the pin's last changes on the branch,
   newest first, each with the llvm_hash it replaced (null for the first pin).
 """
 import argparse
@@ -412,10 +411,7 @@ def _meta(get, ref):
     except subprocess.CalledProcessError:  # no cmake/meta-llvm-info.json at ref
         return None
     meta = json.loads(base64.b64decode(data["content"]))
-    return {
-        "tag": meta["release_base_url"].rsplit("/", 1)[-1], "llvm_hash": meta["llvm_hash"], "base":
-        meta.get("based_on_oai_llvm_hash")
-    }
+    return {"tag": meta["release_base_url"].rsplit("/", 1)[-1], "llvm_hash": meta["llvm_hash"]}
 
 
 def _pr_of(title):
